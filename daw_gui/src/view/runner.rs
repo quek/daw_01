@@ -45,7 +45,16 @@ pub struct RunnerInit {
     pub build_app: Box<dyn FnOnce(EventLoopProxy<AppEvent>) -> AppData + Send>,
 }
 
-pub fn run(init: RunnerInit) -> Result<(), winit::error::EventLoopError> {
+/// r.md #61: 終了シーケンス中の再評価間隔。子プロセスの exit はイベントを
+/// 伴わない (終了中は `ChildDisconnected` を合成しない) ので、`WaitUntil` で
+/// 定期的に起きて `try_wait` する。「終了処理中… (N 秒)」の経過表示もこの周期。
+const SHUTDOWN_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// event loop を回し、終了時のプロセス終了コードを返す。
+///
+/// r.md #61: 終了コードは `AppEvent::Quit` に載って来る (`--smoke-test` が
+/// 判定結果を返すため)。通常の終了は常に 0。
+pub fn run(init: RunnerInit) -> Result<RunnerOutcome, winit::error::EventLoopError> {
     let event_loop = winit::event_loop::EventLoop::<AppEvent>::with_user_event().build()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
@@ -62,7 +71,29 @@ pub fn run(init: RunnerInit) -> Result<(), winit::error::EventLoopError> {
         fps_window_start: Instant::now(),
         fps_window_frames: 0,
     };
-    event_loop.run_app(&mut runner)
+    event_loop.run_app(&mut runner)?;
+    // `state` は `run_app` から戻っても runner が保持したまま (winit は
+    // ApplicationHandler を drop しない)。結果はここから取り出す。
+    Ok(runner.state.as_ref().map_or(
+        RunnerOutcome {
+            exit_code: 0,
+            drained: false,
+        },
+        |s| RunnerOutcome {
+            exit_code: s.app.shutdown.exit_code(),
+            drained: s.app.shutdown.is_finished(),
+        },
+    ))
+}
+
+/// event loop の結末。
+pub struct RunnerOutcome {
+    /// プロセスの終了コード (`--smoke-test` の判定結果)。通常終了は 0。
+    pub exit_code: u8,
+    /// 終了シーケンスが完走した (= 子の exit を `DRAIN_TIMEOUT` ぶん待ち切った)。
+    /// `false` なら event loop がエラーで落ちた等でシーケンスを通っていない。
+    /// `Bootstrap::shutdown` はこれを見て待ちを二重にしないか決める。
+    pub drained: bool,
 }
 
 struct RunnerState {
@@ -742,6 +773,10 @@ impl Runner {
     /// 自動停止判定・オートメーション録音の分解能・再生追従スクロールも自動的に
     /// 30Hz を保つ。
     fn refresh_activity(state: &mut RunnerState, now: Instant) -> bool {
+        // r.md #61: WNDPROC (= `WM_QUERYENDSESSION`) は `AppData` を借用できないので、
+        // 「未保存か」をここでミラーしておく (`activity.awake` と同じ idiom)。
+        #[cfg(windows)]
+        crate::session_end::set_dirty(state.app.song_doc.is_dirty());
         let keep = state.app.should_keep_rendering(now);
         state
             .app
@@ -782,6 +817,12 @@ impl ApplicationHandler<AppEvent> for Runner {
         let app = {
             let mut app = app;
             app.ui_ephemeral.main_window_hwnd = dwin.hwnd_isize();
+            // r.md #61: winit は WM_QUERYENDSESSION / WM_ENDSESSION を扱わないので、
+            // メインウィンドウの WNDPROC を差し替えて自分で拾う (Windows の
+            // サインアウト / シャットダウンでも未保存確認と graceful teardown を通す)。
+            if let Some(hwnd) = app.ui_ephemeral.main_window_hwnd {
+                crate::session_end::install(hwnd, self.proxy.clone());
+            }
             app
         };
 
@@ -828,6 +869,10 @@ impl ApplicationHandler<AppEvent> for Runner {
         if due {
             self.attempt_gpu_recovery(event_loop);
         }
+        // r.md #61: 終了シーケンスの待ちも `WaitUntil` 駆動。子プロセスの exit は
+        // イベントを伴わない (pipe が閉じても shutdown 中は `ChildDisconnected` を
+        // 合成しない) ので、時間で必ず起きるこの口が無いと期限まで固まる。
+        self.drive_shutdown(event_loop);
     }
 
     fn window_event(
@@ -853,13 +898,14 @@ impl ApplicationHandler<AppEvent> for Runner {
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested");
-                // 未保存変更があれば確認モーダルを開き、 終了を保留する。
-                // 変更が無ければ `request_close` が即 `should_quit` を立て、
-                // 下の `quit_if_requested` が cleanup + exit する。
+                // r.md #61: ✕ / Alt+F4 / システムメニュー / タスクバーはすべて
+                // ここに来る (winit の win32 backend が WM_CLOSE をこの 1 つに
+                // 畳む)。未保存変更があれば確認モーダルを開いて終了を保留し、
+                // 無ければ即シャットダウンシーケンスに入る。
                 if let Some(state) = self.state.as_mut() {
                     state.app.request_close();
                 }
-                self.quit_if_requested(event_loop);
+                self.drive_shutdown(event_loop);
             }
             WindowEvent::Resized(size) => {
                 self.dispatch_platform_event(PlatformEvent::Resized(PhysicalSize {
@@ -961,6 +1007,10 @@ impl ApplicationHandler<AppEvent> for Runner {
                 {
                     rs.window.request_redraw();
                 }
+                // r.md #61: 「保存して終了」の同期保存など、この frame の
+                // `ui.frame` 内で終了シーケンスが始まることがある。`render_frame`
+                // は `state` を borrow するので、手放したここで 1 段進める。
+                self.drive_shutdown(event_loop);
             }
             _ => {}
         }
@@ -1034,20 +1084,25 @@ impl ApplicationHandler<AppEvent> for Runner {
             state.app.flush_song_sync();
         }
         // 背景スレッド (IPC bridge) 経由の event で、 plugin state 取得待ちの
-        // 非同期保存が完了して `should_quit` が立つことがある (= 「保存して
+        // 非同期保存が完了して終了シーケンスが始まることがある (= 「保存して
         // 終了」 で plugin 有り project)。 ここで終了を拾う。
-        self.quit_if_requested(event_loop);
+        self.drive_shutdown(event_loop);
     }
 
     /// EventLoop 終了直前 (= 通常 close 経路、 process kill 以外で呼ばれる)。
     /// メインウィンドウの geometry を `%LOCALAPPDATA%\daw_01\window_state.json`
     /// に永続化して次回起動で復元する。 失敗は log のみ (起動を妨げない)。
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // r.md #61: WNDPROC の差し替えと ShutdownBlockReason を先に外す
+        // (窓が消えた後では触れない)。
+        #[cfg(windows)]
+        crate::session_end::uninstall();
         let Some(state) = self.state.as_ref() else { return };
         save_main_window_state(&state.window, state.app.ui_prefs.app_dirs.as_ref());
     }
 }
 
+/// メインウィンドウの geometry を `window_state.json` に書く。
 fn save_main_window_state(
     window: &WinitWindow,
     app_dirs: Option<&common::app_dirs::AppDirs>,
@@ -1070,15 +1125,38 @@ fn save_main_window_state(
 }
 
 impl Runner {
-    /// `AppData.should_quit` が立っていたら cleanup (recovery file 削除) して
-    /// event loop を抜ける。 not-dirty close / 「保存せず終了」 / 保存完了の
-    /// いずれかで立つ。 close 確認をキャンセルした場合は立たないので no-op。
-    fn quit_if_requested(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(state) = self.state.as_ref() else { return };
-        if state.app.ui_ephemeral.should_quit {
-            state.app.on_shutdown();
-            event_loop.exit();
+    /// r.md #61: 終了シーケンスを 1 段進める。**終了に関する唯一の口**。
+    ///
+    /// 旧実装は「`should_quit` を見て `on_shutdown()` + `exit()`」の 2 行が
+    /// `quit_if_requested` と `render_frame` の 2 箇所にコピーされていた
+    /// (借用都合で helper を介せなかった)。ここに一本化する。
+    ///
+    /// - `Draining` … 子の exit を観測 (`poll_shutdown`)。まだなら
+    ///   `ControlFlow::WaitUntil(deadline)` を張って期限で必ず起き直し、
+    ///   再描画を要求して「終了処理中…」の経過表示を回す。
+    /// - `Finished` … `event_loop.exit()`。cleanup (recovery file 削除) は
+    ///   `begin_shutdown` が済ませている。
+    /// - `Running` … no-op (close 確認をキャンセルした場合など)。
+    fn drive_shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else { return };
+        if !state.app.shutdown.is_shutting_down() {
+            return;
         }
+        state.app.poll_shutdown();
+        if state.app.shutdown.is_finished() {
+            if let Some(msg) = state.app.shutdown_forced_message() {
+                tracing::warn!(message = %msg, "shutdown fell back to the backstop");
+            }
+            event_loop.exit();
+            return;
+        }
+        // まだ待っている。期限で起き直す予約 + 経過表示のための再描画。
+        if let Some(deadline) = state.app.shutdown.deadline() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                deadline.min(Instant::now() + SHUTDOWN_TICK),
+            ));
+        }
+        state.window.request_redraw();
     }
 
     /// r.md #42: device lost を検出した。 復旧シーケンスを開始する (既に進行中なら no-op)。
@@ -1358,14 +1436,11 @@ impl Runner {
         // (scrub / MIDI-CC flood 等) は 1 回の LoadSong に構造的に coalesce される。
         state.app.flush_song_sync();
 
-        // close 確認モーダルの「保存して終了」(同期保存) /「保存せず終了」 は
-        // この frame の `ui.frame` 内で Edit が適用され `should_quit` が立つ。
-        // `state` を borrow 中なので helper を介さず直接 cleanup + exit する。
-        if state.app.ui_ephemeral.should_quit {
-            state.app.on_shutdown();
-            event_loop.exit();
-            return false;
-        }
+        // (r.md #61) 「保存して終了」(同期保存) /「保存せず終了」 はこの frame の
+        // `ui.frame` 内で Edit が適用されて終了シーケンスを始める。完了判定
+        // (= 子の exit 待ち) は `drive_shutdown` 一本に集約したので、ここでは
+        // 何もしない — `state` の borrow を手放した `RedrawRequested` の末尾で
+        // 1 段進める。
 
         if gpu_live {
             match state.renderer.render(&state.scene) {

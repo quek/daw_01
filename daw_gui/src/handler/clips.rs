@@ -38,7 +38,9 @@ impl AppData {
         new_length_beats: f64,
         stretch: bool,
     ) {
-        let new_length_beats = new_length_beats.max(0.0625);
+        // r.md #68: 下限は widget の drag preview と共有する (`MIN_CLIP_LEN_BEATS`)。
+        // 別リテラルにすると最小長付近で「ゴーストより短く確定する」 ずれが出る。
+        let new_length_beats = new_length_beats.max(common::model::MIN_CLIP_LEN_BEATS);
         let new_start_beat = new_start_beat.max(0.0);
         let Some(Some((content_id, prev_start_beat, prev_length_beats, new_offset))) =
             self.edit_song(|song| {

@@ -10,12 +10,18 @@
 //!
 //! global / context-sensitive の両立 (M14 Phase 57 で整備):
 //! `Ui::set_typing_focus(true)` (text_input が focus 中に呼ぶ) が立った **次の**
-//! フレームから、`is_typing_only_shortcut(name)` が true な name (`select_all` /
-//! `delete` / `cut` / `copy` / `paste`) は shortcut layer で消費されず、
-//! `keyboard_events` に残る。`Ui::take_typing_shortcut(name)` で focused widget が
+//! フレームから、`ShortcutMap::is_typing_only(name)` が true な name は shortcut layer で
+//! 消費されず、`keyboard_events` に残る。`Ui::take_typing_shortcut(name)` で focused widget が
 //! 拾う。これで「text_input focused 中に Delete 打鍵 → piano_roll の note 削除に
 //! 流れてしまう」誤反応を防ぐ。undo/redo / tab navigation / escape は典型テキスト
 //! エディタでも global なので除外。
+//!
+//! **typing-only / repeatable は binding の属性であって library の知識ではない**
+//! (daw_01 r.md #67)。 旧実装は `is_typing_only_shortcut(name)` という自由関数が
+//! `"piano_roll.edit_lyric"` / `"daw.goto_timeline_home"` のような **アプリ固有の name** を
+//! ハードコードしていた (= 汎用 UI library がドメイン知識を持つ SSoT 違反)。 いまは
+//! [`ShortcutMap::set_typing_only`] / [`ShortcutMap::set_repeatable`] で **登録側が宣言** し、
+//! library は宣言を引くだけになっている。
 
 use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey};
 
@@ -182,15 +188,24 @@ fn parse_key_token(p: &str) -> Result<PhysicalKey, String> {
 ///
 /// 登録順 (= `bind` の順) を保持し、同じ Shortcut が複数登録された場合は **先勝ち**
 /// (= 先に `bind` した name が `matches` で返る)。
+///
+/// キーの属性 (typing-only / repeatable) も name 単位でここが持つ。 どちらも
+/// **binding を宣言する側 (アプリ) が決めるもの** で、 library が name を知っていては
+/// いけない (daw_01 r.md #67)。
 #[derive(Debug, Default, Clone)]
 pub struct ShortcutMap {
     entries: Vec<(Shortcut, &'static str)>,
+    /// typing 中 (前フレームに `Ui::set_typing_focus(true)`) は global 消費せず
+    /// `keyboard_events` に残す name。
+    typing_only: std::collections::HashSet<&'static str>,
+    /// OS auto-repeat (押しっぱなし) でも shortcut として発火してよい name。
+    repeatable: std::collections::HashSet<&'static str>,
 }
 
 impl ShortcutMap {
     #[must_use]
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self::default()
     }
 
     /// DAW で慣用される shortcut を一括登録した map。
@@ -213,13 +228,15 @@ impl ShortcutMap {
     ///
     /// **note**: 修飾キーなしの矢印 (`Up` / `Down` / `Left` / `Right`) は **default binding せず**。
     /// shortcut layer は frame 頭で keyboard_events から consume するため、bind すると text_input
-    /// 等の内部矢印キー処理 (cursor 移動) を奪ってしまう。M14 Phase 57 で typing_focus 対応
-    /// path が整備され、`select_all` / `delete` / `cut` / `copy` / `paste` のような
-    /// **テキスト編集中に widget 内に届くべき shortcut** は `is_typing_only_shortcut` が
-    /// true を返し、typing_focus 中は keyboard_events に残るようになった。
+    /// 等の内部矢印キー処理 (cursor 移動) を奪ってしまう。矢印を bind したいアプリは
+    /// [`ShortcutMap::set_typing_only`] を必ず併せて宣言すること (typing 中は text_input へ譲る)。
     #[must_use]
     pub fn with_default_bindings() -> Self {
         let mut m = Self::new();
+        // typing 中はテキスト編集側に譲る 5 つ (Ctrl+A / Delete / Ctrl+X / Ctrl+C / Ctrl+V)。
+        for name in ["select_all", "delete", "cut", "copy", "paste"] {
+            m.set_typing_only(name);
+        }
         m.bind("undo", "Ctrl+Z");
         m.bind("redo", "Ctrl+Shift+Z");
         m.bind("redo", "Ctrl+Y");
@@ -243,6 +260,49 @@ impl ShortcutMap {
     /// `name` に `spec` で記述された shortcut を割り当てる。同 name が既登録でも追加 (multi-bind)。
     pub fn bind(&mut self, name: &'static str, spec: &str) {
         self.entries.push((Shortcut::parse(spec), name));
+    }
+
+    /// `name` を **typing-only** に宣言する: 前フレームに `Ui::set_typing_focus(true)` が
+    /// 立っていたフレームでは shortcut layer が消費せず `keyboard_events` に残し、
+    /// focus 中の text widget が [`crate::ui::Ui::take_typing_shortcut`] で拾えるようにする。
+    ///
+    /// 立てるべきなのは「テキスト編集中は編集側の意味になるキー」。
+    /// - `Ctrl+A` / `Delete` / `Ctrl+X` / `Ctrl+C` / `Ctrl+V` (既定 binding で宣言済)
+    /// - `Home` / `End` / 矢印のような **非 char のカーソル移動キー** —
+    ///   `bare_char_key` 判定に該当しないので、宣言しないと typing 中も global 発火して
+    ///   text_input のカーソル移動が死ぬ。
+    /// - 素キーの mode-toggle (daw_01 の `L` = 歌詞編集) — typing 中は文字として届く必要がある。
+    ///
+    /// 立てないもの: `undo` / `redo` / `Tab` / `Escape` / `Ctrl+S` 等、 典型テキスト
+    /// エディタでも document 全体に効くもの。
+    pub fn set_typing_only(&mut self, name: &'static str) {
+        self.typing_only.insert(name);
+    }
+
+    /// `name` を **repeatable** に宣言する: OS の auto-repeat (押しっぱなし) でも
+    /// shortcut として発火させる。
+    ///
+    /// 既定は非 repeatable。 shortcut は Delete / 複製のような **離散コマンド** に
+    /// bind されるので、 repeat で連射されると「Delete 長押しでトラックが次々消える」
+    /// 類の破壊的挙動になる (daw_01 r.md #43)。 連続適用が自然な nudge 系
+    /// (矢印でノートを 1 グリッドずつ動かす等、 daw_01 r.md #67) だけ立てる。
+    ///
+    /// 1 フレームに複数回届いた repeat は [`crate::ui::Ui::take_shortcut_count`] で
+    /// まとめて取り出す (取りこぼすと押しっぱなしの移動量が zoom / FPS で変わる)。
+    pub fn set_repeatable(&mut self, name: &'static str) {
+        self.repeatable.insert(name);
+    }
+
+    /// [`Self::set_typing_only`] で宣言済か。
+    #[must_use]
+    pub fn is_typing_only(&self, name: &str) -> bool {
+        self.typing_only.contains(name)
+    }
+
+    /// [`Self::set_repeatable`] で宣言済か。
+    #[must_use]
+    pub fn allows_repeat(&self, name: &str) -> bool {
+        self.repeatable.contains(name)
     }
 
     /// `name` の登録を全て削除。
@@ -278,41 +338,6 @@ impl ShortcutMap {
         let (sc, _) = self.entries.iter().find(|(_, n)| *n == name)?;
         Some(format_shortcut(*sc))
     }
-}
-
-/// shortcut name が「typing 中の text widget に渡すべき」(= typing_focus が立っている
-/// フレームでは shortcut layer で消費せず keyboard_events に残す) か判定する。
-///
-/// 含まれる name:
-/// - `"select_all"` (Ctrl+A): typing 中は text_input の全選択
-/// - `"delete"` (Delete): typing 中は cursor 後 1 char 削除 / 範囲削除
-/// - `"cut"` (Ctrl+X) / `"copy"` (Ctrl+C) / `"paste"` (Ctrl+V): typing 中は OS clipboard 経由のテキスト編集
-/// - `"piano_roll.edit_lyric"` (default `L`): 歌詞編集モード中は text_input に `'l'` 文字として
-///   届かないと困る (M14 Phase 59 / daw_01 #017)。modeless mode-toggle key は
-///   typing-only の典型 (= typing 中は global suppression、それ以外は global 発火)。
-/// - `"daw.goto_timeline_home"` (Home) / `"daw.goto_timeline_end"` (End): 非 char キーなので
-///   `bare_char_key` に該当せず、放置すると typing 中も global 発火してプレイヘッドが
-///   飛ぶ (BPM / 名前 / picker query 入力中に Home を押すと seek してしまう)。typing-only に
-///   することで typing 中は text_input の行頭/行末カーソル移動になる (daw_01 r.md #10)。
-///
-/// 含めないもの (典型テキストエディタでも global なので、typing 中も global のまま):
-/// - `undo` / `redo` (Word/VSCode 等もテキスト編集中の Ctrl+Z は document 全体の undo)
-/// - `tab_next` / `tab_prev` (typing 中も次の入力欄へ移動)
-/// - `escape` (typing 中も modal close)
-/// - `save` / `save_as` / `open` / `new` / `debug_overlay_toggle`
-#[must_use]
-pub fn is_typing_only_shortcut(name: &str) -> bool {
-    matches!(
-        name,
-        "select_all"
-            | "delete"
-            | "cut"
-            | "copy"
-            | "paste"
-            | "piano_roll.edit_lyric"
-            | "daw.goto_timeline_home"
-            | "daw.goto_timeline_end"
-    )
 }
 
 /// `Shortcut` を表記文字列に戻す ("Ctrl+Shift+Z" 形式)。

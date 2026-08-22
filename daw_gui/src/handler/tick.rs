@@ -12,6 +12,10 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     pub(crate) fn on_tick(&mut self, playhead_samples: u64) {
+        // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
+        // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
+        self.expire_nudge_audition(false);
+
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
@@ -106,14 +110,14 @@ impl AppData {
 
         // 再生追従スクロール (Alt+F で off/scroll/page)。 playhead 反映直後に follow
         // mode に応じて arrange_scroll_beat を更新する。 canvas 幅は前フレーム描画値
-        // (last_arrange_canvas_size.0)。 手動スクロール / ズームで follow が Off に落ちる
+        // (last_arrange_lanes_size.0)。 手動スクロール / ズームで follow が Off に落ちる
         // のは各 view 操作 handler 側 (cancel_follow_on_manual_view_change)。 follow が
         // 直接 arrange_scroll_beat を書く (= SetArrangeScroll event を経由しない) ので
         // 自分自身で Off に落ちることはない。
         if self.transport.is_playing
             && let Some(ph) = self.transport.playhead_beat
         {
-            let visible_beats = self.ui_ephemeral.last_arrange_canvas_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);
+            let visible_beats = self.ui_ephemeral.last_arrange_lanes_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);
             if let Some(new_scroll) = Self::follow_scroll_beat(
                 self.ui_prefs.arrange_follow,
                 ph,

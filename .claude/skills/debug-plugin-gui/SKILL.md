@@ -32,23 +32,33 @@ daw_gui (UI 側)
                                           daw_plugin_host (tokio recv → PluginCommand)
                                           ↓                     plugin-main std::thread
                                           ↓                     ├ gui_create_embedded
-                                          ↓                     ├ gui_get_size (pre-attach)
-                                          ↓                     ├ EditorWindow::create  ← 窓は B 所有
+                                          ↓                     ├ can_resize / gui_get_size (pre-attach)
+                                          ↓                     ├ EditorWindow::create  ← 窓は B 所有・**非表示**
+                                          ↓                     ├ editor.attach_sizer   ← attach より前
                                           ↓                     ├ gui_set_parent_hwnd(editor.hwnd)
                                           ↓                     ├ pump_pending_messages
                                           ↓                     ├ gui_show
-                                          ↓                     ├ gui_get_size (post-attach 再取得)
+                                          ↓                     ├ can_resize 再 query → set_resizable
                                           ↓                     ├ editor.set_client_size
-                                          ↓                     └ editor.set_foreground
-                                          ↓ ChildToMain::SlotGuiOpened { w, h } ◀──
-daw_gui: on_gui_opened は no-op (窓は B が sizing 済み)
+                                          ↓                     └ editor.show_and_focus ← 表示 + 前面化はここ 1 回
+                                          ↓ PluginEvent::SlotGuiGeometry { geometry } ◀──
+daw_gui: on_gui_geometry が窓の位置/サイズを記録 (ViewState に保存 → 次回 open で復元)
 ```
+
+**r.md #65**: 窓は attach が終わるまで見せない。早く見せると activation を 2 回動かすことに
+なり、`AllowSetForegroundWindow` のワンショット許可を使い切って「タイトルバーが一瞬
+アクティブ色になってすぐ戻る」が出る。詳細は `docs/plan_plugin_editor_topwindow.md` §窓契約 1。
 
 - **✕ クローズ**: B の WNDPROC が `WM_CLOSE` で close フラグ → ループが poll →
   `close_slot_gui` (plugin.gui_destroy → DestroyWindow) → `SlotGuiClosed` を B が送る。
   **daw_gui は close を poll しない**（旧 30Hz tick poll は撤去）。
-- **リサイズ**: plugin の `request_resize` / `resizeView` は B 内の `gui_resize` チャネルに
-  入り、ループが editor 窓 resize + onSize。**IPC 往復なし**。
+- **リサイズ (r.md #65)**: 2 経路とも B 内完結・**IPC 往復なし**。
+  - *plugin 起点* (`resizeView` / `request_resize`) は `editor_window::plugin_requested_resize` が
+    **同じコールスタックで** 窓を resize → `WM_SIZE` → `onSize` / `set_size` まで済ませる。
+    VST3 は "in the same callstack" が仕様 (`iplugview.h`)。非同期にすると Redux が view を
+    owned popup へ逃がす。窓が無い / 別スレッド発だけ `HostNotify::Resize` へ落ちる。
+  - *ユーザー起点* (枠ドラッグ) は `WM_SIZING` で `checkSizeConstraint` / `adjust_size` 矯正 →
+    OS が resize → `WM_SIZE` で通知。`canResize()==false` の窓には `WS_THICKFRAME` を出さない。
 - **削除/降格でエディタ追従**: `editor_windows` は close/resize は `(track,slot)` keyed だが、
   **削除は安定 `plugin_id` で照合**（slot ずれ耐性）。降格は `DemoteInstrumentToGenerator`
   でライブ移動し editor 窓を同 HWND のまま維持。詳細は memory `project-plugin-slot-rekey`。
@@ -107,9 +117,14 @@ daw_gui: on_gui_opened は no-op (窓は B が sizing 済み)
 
 ### ⑧ リサイズが反映されない / 一部しか見えない
 - コンテナの *client* 領域が plugin の希望サイズと合っているか。`SetWindowPos` は **outer rect**
-  (`AdjustWindowRectEx(WS_OVERLAPPEDWINDOW, false, 0)` で client→outer 変換)。
-- 動的リサイズは B 内完結: `request_resize`/`resizeView` → `gui_resize` チャネル → ループが
-  `editor.set_client_size` + `gui_set_size` (onSize)。daw_gui を経由しない。
+  (`AdjustWindowRectExForDpi` で client→outer 変換。style は窓から読む = SSoT)。
+- 動的リサイズは B 内完結で **同期** (上の「リサイズ」節)。daw_gui を経由しない。
+- 枠でリサイズできない場合、まず `plugin gui initial size ... resizable=false` のログを見る。
+  `canResize()==false` なら**仕様どおり固定枠**で、プラグイン自身のグリップ経由
+  (`resizeView`) でしか変わらない。
+- `RUST_LOG=info,editor_win=trace` で `WM_SIZING` / `WM_SIZE` / `WM_NCACTIVATE` などを
+  相手 HWND の PID/TID/クラス名つきで採れる。daw_gui 抜きの最小再現は
+  `daw_plugin_host --editor-selftest "<path>.vst3"`。
 
 ### ⑨ プラグインが panic / 不正終了 / ハング
 - すべての CLAP/VST3 呼び出しが **plugin-main std::thread 上で直列化**されているか (tokio に混ぜない)。
@@ -128,6 +143,8 @@ daw_gui: on_gui_opened は no-op (窓は B が sizing 済み)
 - `daw_plugin_host/src/main.rs` — plugin-main thread / open_gui / close_slot_gui / Demote / 各 re-key
 - `daw_plugin_host/src/clap_plugin.rs` / `vst3_plugin.rs` — gui_* メソッド群
 - `daw_plugin_host/src/clap_host.rs` — `clap_host_gui` 実装
-- `daw_gui/src/app.rs` — open_slot_gui / on_gui_opened / on_gui_closed / open_plugin_guis
+- `daw_gui/src/handler/devices.rs` — open_slot_gui / on_gui_geometry / on_gui_closed / open_plugin_guis
+- `docs/plan_plugin_editor_topwindow.md` §窓契約 — r.md #65 の窓契約 (スタイル / 双方向 resize /
+  フォーカス転送 / modal ループ / ジオメトリ永続化) の正本
 - `docs/plan_plugin_editor_topwindow.md` — FIXME #31 の根本原因と設計
 - CLAP 仕様: `/tmp/clap/include/clap/ext/gui.h` 先頭コメント / JUCE #401 (サブメニュー foreground 判定)

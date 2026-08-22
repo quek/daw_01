@@ -36,6 +36,46 @@ use crate::widgets::time_grid::{TimeGridExt, TimeRulerStyle};
 /// これを超える source (5.1 等) は Vec フォールバックで全 plane を描く。
 const MAX_WAVEFORM_CHANNELS: usize = 2;
 
+/// r.md #70: event ループ中に確定した「ドラッグ中の予告」 を溜めておく箱。
+///
+/// レンダラは call order = z-order (`ui/crates/renderer/src/scene.rs`) なので、
+/// event ループの中で ghost を push すると **後続 index の event の波形 / 選択枠 /
+/// slice マーカーがその上に描かれる** (= 右隣の event に重なると ghost が隠れる)。
+/// Arranger のセクション帯 (r.md #70 本体) と完全同型なので、 同じ「base を全部
+/// 描いてから ghost」 規律に揃える。 同時にアクティブなドラッグは 1 本なので
+/// `Option` 1 つで足りる。
+enum PendingGhost {
+    /// 中央 drag = event 移動 (矩形の予告)。
+    Move { event_rect: Rect, dx: f32 },
+    /// 端 trim = 掴んでいる端の縦線。
+    Trim { event_rect: Rect, dx: f32, is_left: bool },
+    /// warp marker 移動 = 現在ポインタ位置の縦線。
+    WarpMarker { event_rect: Rect, x: f32 },
+}
+
+impl PendingGhost {
+    fn emit(self, ui: &mut Ui<'_, AppData>, wf_area: Rect) {
+        match self {
+            Self::Move { event_rect, dx } => push_move_ghost(ui, event_rect, wf_area, dx),
+            Self::Trim { event_rect, dx, is_left } => {
+                push_trim_ghost(ui, event_rect, wf_area, dx, is_left);
+            }
+            Self::WarpMarker { event_rect, x } => {
+                let ghost = ui.palette().loop_band.with_alpha(0.6);
+                ui.push_lines(LineBatch {
+                    segments: Arc::from(vec![LineSegment {
+                        a: [x, event_rect.y],
+                        b: [x, event_rect.y + event_rect.h],
+                        color: ghost,
+                    }]),
+                    line_width_px: 1.5,
+                    clip_rect: Some(wf_area),
+                });
+            }
+        }
+    }
+}
+
 /// PR-D 段階 3: 中央 drag 中の event ghost (rectangle outline)。 dx は
 /// drag.delta.0 (px)。 描画は wf_area で clip。
 fn push_move_ghost(ui: &mut Ui<'_, AppData>, event_rect: Rect, wf_area: Rect, dx: f32) {
@@ -409,6 +449,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // SongTempo automation 込みで engine と同じ tempo 写像を得る (native rate 再生は
     // current_bpm に依存する)。 lane が無ければ定数 = 従来と同コスト。
     let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
+    // r.md #70: ドラッグ中の予告はループ内で push せず、 全 event を描き終えてから
+    // 最前面に出す (`PendingGhost` の doc 参照)。
+    let mut pending_ghost: Option<PendingGhost> = None;
     for (idx, event) in audio.events.iter().enumerate() {
         let Some(buffer) = app.media.audio_source_cache.get(event.source_id) else {
             // 当該 event は decode 待ち / missing source → 透けて見える
@@ -736,7 +779,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
                 }));
             } else if kind == DragKind::Continuing {
-                push_trim_ghost(ui, event_rect, wf_area, dx, true);
+                pending_ghost =
+                    Some(PendingGhost::Trim { event_rect, dx, is_left: true });
             } else if kind == DragKind::Released && dx.abs() >= 1.0 {
                 // 0px release (= grip を click しただけ) は no-op trim を commit
                 // しない (undo 汚染 + 再同期を避ける。 実 drag は 1px から反映)。
@@ -764,7 +808,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
                 }));
             } else if kind == DragKind::Continuing {
-                push_trim_ghost(ui, event_rect, wf_area, dx, false);
+                pending_ghost =
+                    Some(PendingGhost::Trim { event_rect, dx, is_left: false });
             } else if kind == DragKind::Released && dx.abs() >= 1.0 {
                 // 0px release (= grip を click しただけ) は no-op trim を commit
                 // しない (undo 汚染 + 再同期を避ける。 実 drag は 1px から反映)。
@@ -809,16 +854,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             } else if drag.kind == DragKind::Continuing {
                 // ghost: 現在ポインタ位置に縦線。
-                let gx = drag.current.0;
-                ui.push_lines(LineBatch {
-                    segments: Arc::from(vec![LineSegment {
-                        a: [gx, event_rect.y],
-                        b: [gx, event_rect.y + event_rect.h],
-                        color: p.loop_band.with_alpha(0.6),
-                    }]),
-                    line_width_px: 1.5,
-                    clip_rect: Some(wf_area),
-                });
+                pending_ghost =
+                    Some(PendingGhost::WarpMarker { event_rect, x: drag.current.0 });
             } else if drag.kind == DragKind::Released {
                 // release x → event-local beat (clip 相対 - event 開始)。
                 let clip_beat =
@@ -915,7 +952,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.selection.audio_editor_anchor = Some(idx);
                 }));
             } else if kind == DragKind::Continuing && dx.abs() > 1.0 {
-                push_move_ghost(ui, event_rect, wf_area, dx);
+                pending_ghost = Some(PendingGhost::Move { event_rect, dx });
             } else if kind == DragKind::Released && dx.abs() >= 4.0 {
                 // 4px 未満は click (選択のみ) に格下げ — delta≈0 の
                 // SetAudioEventStart を commit すると選択クリックのたびに
@@ -963,6 +1000,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             },
         );
+    }
+
+    // r.md #70: ここが drag パス。 全 event を描き終えたあとに ghost を出すので、
+    // 右隣の event に重なっても隠れない。
+    if let Some(g) = pending_ghost {
+        g.emit(ui, wf_area);
     }
 
     // ----- 矩形選択 (lasso) -----------------------------------------

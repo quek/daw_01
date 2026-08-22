@@ -151,6 +151,68 @@ pub struct HostCallbacks {
     /// (`common::protocol::VocalSynthFailure`)。
     pub on_vocal_synth_status:
         Arc<dyn Fn(bool, common::protocol::VocalSynthFailure) + Send + Sync>,
+    /// r.md #65: このインスタンスのエディタ**コンテナ窓の HWND** (`0` = 未 open)。
+    ///
+    /// **`on_request_resize` (非同期 channel) では VST3 の契約を満たせない**ので置く。
+    /// `iplugview.h` の "Sizing of a view" は「`IPlugFrame::resizeView` の後、
+    /// **同じコールスタックで** ホストが窓をリサイズして `IPlugView::onSize` を呼ぶ」
+    /// と規定していて、次周回に回すと `getSize` が旧サイズを返し続ける。実測では
+    /// Renoise Redux がこれを見て **自分の view をコンテナから切り離し WS_POPUP の
+    /// owned top-level に変える** (2026-08-22、`--editor-selftest` で確認)。
+    ///
+    /// 書き込むのは `gui_set_parent_hwnd` / `gui_destroy` の 1 対だけ (= 「今どの窓に
+    /// attach しているか」がそのまま値になる = SSoT)。読むのは `Vst3PlugFrame` /
+    /// CLAP `Host` の resize callback。窓の所有は plugin-main の `EditorWindow` のまま。
+    pub editor_hwnd: Arc<AtomicU64>,
+}
+
+/// CLAP `clap_gui_resize_hints` 相当 (`clap/ext/gui.h` L91-103)。VST3 に対応 API は
+/// 無いので `None` を返す。
+///
+/// `preserve_aspect_ratio` は **両軸ともリサイズ可のときだけ**意味を持ち、`false` の
+/// ときは 2 つの ratio 値は未使用 (= 読んではいけない) — ヘッダのコメントどおり。
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeHints {
+    pub can_resize_horizontally: bool,
+    pub can_resize_vertically: bool,
+    pub preserve_aspect_ratio: bool,
+    pub aspect_ratio_width: u32,
+    pub aspect_ratio_height: u32,
+}
+
+/// エディタ窓の WNDPROC が **同じコールスタックで** プラグインへ問い合わせる口
+/// (r.md #65)。
+///
+/// なぜ必要か: ホスト起点 (ユーザーのドラッグ) もプラグイン起点 (`resizeView` /
+/// `request_resize`) も、両フォーマットが **同期**のシーケンスを規定している
+/// (`iplugview.h` "Sizing of a view" / `clap/ext/gui.h` L35-45)。窓メッセージを
+/// channel 経由で plugin-main の次周回へ回すと live resize が 1 周期遅れ、
+/// modal size ループ中は永久に遅れる。
+///
+/// # 所有と生存
+///
+/// 実装は **borrowed な FFI ポインタしか持たない**。view / plugin instance の所有は
+/// [`LoadedPlugin`] 側にあり (SSoT — `ComPtr` を二重に AddRef して WNDPROC 側にも
+/// 持たせると `gui_destroy` の `removed()` と競合して UAF になる)。
+/// `gui_destroy` は **先頭で** `alive` を落とす契約で、以後 [`Self::is_alive`] が
+/// `false` を返し WNDPROC は一切 FFI を呼ばない。`pump_pending_messages` 由来の
+/// nested dispatch で `gui_destroy` 実行中に WM_SIZE が再入しても、この 1 点で塞がる。
+pub trait EditorSizer: Send {
+    /// ユーザーのドラッグ矩形 (client px) を、プラグインが受け入れるサイズへ矯正する。
+    /// VST3 `IPlugView::checkSizeConstraint` / CLAP `clap_plugin_gui.adjust_size`。
+    /// 矯正できなければ入力をそのまま返す。**ホスト起点ドラッグ専用** —
+    /// プラグイン起点の resize には掛けない (どちらのシーケンス図にも出てこない)。
+    fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32);
+    /// プラグインが今表示している client サイズ (VST3 `getSize` / CLAP `get_size`)。
+    fn current_client_size(&self) -> Option<(u32, u32)>;
+    /// 確定した client サイズを通知する (VST3 `onSize` / CLAP `set_size`)。
+    fn notify_client_size(&self, w: u32, h: u32);
+    /// ユーザーが窓枠でリサイズしてよいか (VST3 `canResize` / CLAP `can_resize`)。
+    fn can_resize(&self) -> bool;
+    /// CLAP `get_resize_hints` 相当。VST3 は `None`。
+    fn resize_hints(&self) -> Option<ResizeHints>;
+    /// `gui_destroy` 済みなら `false`。`false` の間は他のメソッドを呼んではいけない。
+    fn is_alive(&self) -> bool;
 }
 
 impl HostCallbacks {
@@ -169,6 +231,7 @@ impl HostCallbacks {
             on_param_value: Arc::new(|_, _| {}),
             on_param_gesture_end: Arc::new(|_| {}),
             on_vocal_synth_status: Arc::new(|_, _| {}),
+            editor_hwnd: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -433,12 +496,21 @@ pub trait LoadedPlugin: Send {
     fn gui_create_embedded(&mut self) -> Result<()>;
     fn gui_get_size(&self) -> Option<(u32, u32)>;
     fn gui_set_scale(&self, scale: f64) -> Result<bool>;
-    fn gui_can_resize(&self) -> bool;
     fn gui_set_parent_hwnd(&self, hwnd: u64) -> Result<()>;
     fn gui_show(&self) -> Result<bool>;
     fn gui_hide(&self) -> Result<()>;
-    fn gui_set_size(&self, width: u32, height: u32) -> Result<()>;
     fn gui_destroy(&mut self);
+    /// r.md #65: エディタ窓の WNDPROC がサイズ交渉に使う借用ハンドル
+    /// ([`EditorSizer`])。`gui_create_embedded` 済みでないと `None`。
+    /// builtin / VOICEVOX は GUI を持たないので常に `None`。
+    ///
+    /// 旧 `gui_can_resize` / `gui_set_size` はここへ吸収した: 「サイズ交渉」の
+    /// FFI 面が trait と WNDPROC の 2 箇所に割れていると、ホスト起点とプラグイン
+    /// 起点で別々の実装が育つ (実際に `checkSizeConstraint` を掛ける / 掛けないが
+    /// 食い違っていた)。
+    fn gui_sizer(&self) -> Option<Box<dyn EditorSizer>> {
+        None
+    }
 }
 
 /// Loads a plugin at `path` using the backend selected by `format`.

@@ -21,7 +21,7 @@ use crate::app::{AppData, ClipRef};
 use crate::view::snap;
 use crate::view::track_color;
 
-use super::{Note, NoteId, NoteStyle, PianoRollScale, PianoRollScaleMode, PianoRollStyle, PianoRollView};
+use super::{Note, NoteId, NoteStyle, PianoRollStyle, PianoRollView};
 
 /// 鍵盤レーンの幅 (px)。
 pub(super) const KEYBOARD_W: f32 = 56.0;
@@ -93,7 +93,13 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     };
 
     // 複数表示 (2 つ以上) のとき右側に legend パネルを出し、widget 本体をその分狭める。
-    let multi = shown.len() >= 2;
+    //
+    // r.md #64: legend を出すかどうかは **ロックが効くトラック行の有無** から導く。
+    // `AppData::pianoroll_lock_rows_in` はロックの効力判定
+    // (`is_pianoroll_clip_locked_in`) と同じ 1 式なので、「ロックが効いている ⟺ 解除ボタンが
+    // 見えている」 が構造的に保たれる (片方だけ条件が変わる事故が起きない)。
+    let lock_rows = AppData::pianoroll_lock_rows_in(&shown);
+    let multi = !lock_rows.is_empty();
     let (body, legend_rect) = if multi {
         let lw = LEGEND_W.min(body_full.w * 0.4);
         (
@@ -140,16 +146,9 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     let clip_origin_beat = target_clip.map_or(0.0, common::model::Clip::content_origin_beat);
     let clip_window_start_beat = target_clip.map_or(0.0, |c| c.start_beat);
     // 編集中 clip の start_beat 位置の scale を採用 (単一 view 内で動的に scale が変わらない)。
-    let scale = app.song_doc.song().scale_at(clip_window_start_beat).map(|sc| PianoRollScale {
-        root: sc.root,
-        in_scale_mask: sc.scale.pitch_class_mask(),
-        mode: if app.ui_prefs.piano_roll_fold {
-            PianoRollScaleMode::Fold
-        } else {
-            PianoRollScaleMode::Highlight
-        },
-        prefer_flats: common::scale::prefers_flats(sc.root, sc.scale),
-    });
+    // r.md #67: 導出は `AppData::pianoroll_scale` が SSoT — カーソルキーの ↑/↓ (handler 側) が
+    // 同じ関数を読むので、「画面は Fold なのにキーは半音で動く」 食い違いが起きない。
+    let scale = app.pianoroll_scale();
 
     // 複数表示は song-absolute scroll (`multi_clip_view`)、左下限は最早クリップ開始拍。
     // 単一表示は clip-local scroll + 対象クリップ開始位置。
@@ -258,7 +257,8 @@ pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipRef], target_track:
         let color = track_color::to_renderer(track_color::effective_track_color(track));
         // トラック基準の dim: 編集対象トラック以外のノートを淡色に。
         let dimmed = Some(r.track) != target_track;
-        let locked = app.is_pianoroll_clip_locked(r);
+        // r.md #64: 効力は「凡例に行がある」 ∧ 「ロック集合に居る」 の派生値。
+        let locked = app.is_pianoroll_clip_locked_in(shown, r);
         // r.md #44: note は content-local なので song-absolute 化は content 原点基準
         // (左端 trim した clip でも note は song 上の同じ位置に描かれる)。
         let clip_start = clip.content_origin_beat();

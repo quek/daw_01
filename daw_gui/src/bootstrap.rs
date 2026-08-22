@@ -18,8 +18,11 @@
 //! `protocol_fingerprint` を [`PROTOCOL_FINGERPRINT`] と照合し、 ビルド
 //! 世代の混在 (silent misdecode) を接続時に検出する。
 //!
-//! `Bootstrap` を Drop すると、 keep-alive で握っている子プロセス /
-//! Handle / shmem 群が一斉に解放される (Job Object 経由で子も kill される)。
+//! (r.md #61) 解体は [`Bootstrap::shutdown`] が順序を書き下して行う。
+//! 正常終了ではその前に [`crate::shutdown`] のシーケンスが子へ
+//! `Shutdown` を送り、子が自分でプラグインを畳んで exit し終えている。
+//! Job Object はそこに間に合わなかったもの (crash / hang / VOICEVOX engine)
+//! を回収する **backstop** で、正常終了の主経路ではない。
 
 use std::sync::Arc;
 
@@ -76,9 +79,8 @@ impl std::fmt::Display for FingerprintMismatch {
 impl std::error::Error for FingerprintMismatch {}
 
 /// 子プロセス起動 + IPC + shmem 全部を保持するセッション。 GUI mode と
-/// script mode が共通で受け取る。 drop すると JobObject 経由で子プロセス
-/// も auto-kill される (`JobHandle::new` で `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-/// を立てているため)。
+/// script mode が共通で受け取る。 解体は [`Bootstrap::shutdown`] を呼ぶ
+/// (drop 任せにすると解体順が宣言順という暗黙知に依存する — r.md #61)。
 pub struct Bootstrap {
     /// daw_audio への IPC 送信 channel。
     pub audio_tx: UnboundedSender<AudioCommand>,
@@ -106,12 +108,13 @@ pub struct Bootstrap {
     /// r.md #50 のマスター出力サンプルリング。daw_audio が `render_master_buffer`
     /// の出力を毎バッファ書き、テレメトリポーラの `MasterAnalyzer` が読む。
     pub scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
-    /// VOICEVOX engine 等の子プロセスを kill-on-close するための Job Object。
+    /// 取りこぼした子プロセス (crash / hang / VOICEVOX engine) を回収する
+    /// **backstop** の Job Object。正常終了の主経路ではない ([`JobHandle`] の doc)。
     pub job: Arc<JobHandle>,
     /// 起動時に読み込んだ plugin database (CLAP / VST3 enumeration)。
     pub plugin_db: Option<Arc<PluginDatabase>>,
-    /// 子プロセス kill のために生かす tokio runtime + 子プロセス Handle。
-    /// drop 順序が大事 (children → runtime の順)。
+    /// pipe loop task と子プロセス Handle を生かす tokio runtime。
+    /// 解体順 (children → runtime) は [`Bootstrap::shutdown`] が保証する。
     pub rt: Runtime,
     /// 子プロセス自動再起動用 supervisor。 pipe loop が break して
     /// `AudioEvent::ChildDisconnected` / `PluginEvent::ChildDisconnected` を
@@ -228,6 +231,18 @@ pub struct ChildSupervisor {
     pid: u32,
     rt_handle: tokio::runtime::Handle,
     job: Arc<JobHandle>,
+    /// (r.md #61) 終了シーケンスに入ったか。**pipe loop と共有**する。
+    ///
+    /// 子が自力で正常 exit すると pipe は **子側から先に閉じる**ので、
+    /// reader が EOF を拾って crash とまったく同じ `ChildDisconnected` を
+    /// 合成し、`handle_child_disconnected` が respawn を始めてしまう
+    /// (「終了しようとしているのに子が生き返る」)。writer 側にだけあった
+    /// 「意図的 teardown」の意図表現を reader にも通すためのフラグ。
+    ///
+    /// `tokio::select!` は writer / reader のどちらが先に完了するか非決定なので、
+    /// 「tx を drop して writer を先に終わらせる」作戦では塞げない
+    /// (子が先に exit すると reader が勝つ) — **reader 側の抑止が本質**。
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// 現在の session。 audio respawn で新 Hello の `device_sample_rate` を
     /// 採用して更新される (= 以後の plugin respawn も新レートで Session を
     /// 受ける)。
@@ -242,6 +257,88 @@ pub struct ChildSupervisor {
 }
 
 impl ChildSupervisor {
+    /// (r.md #61) 終了シーケンスの開始を pipe loop / respawn 経路へ伝える。
+    /// 以後 pipe が切れても `ChildDisconnected` は合成されない。
+    pub fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 子プロセスの生死を **非ブロッキング** で観測し、まだ生きている子を返す
+    /// (空 = 全員 exit した)。
+    ///
+    /// 終了シーケンスの完了判定はこれ。返信 event ではなく **プロセスの exit
+    /// そのもの** を真実源にするのは、「返事を書けた」と「DLL を unload し
+    /// 終えた」が別の事実だから。
+    ///
+    /// `tokio::process::Child::try_wait` は同期・非ブロッキング・runtime
+    /// context 不要なので GUI メインスレッドから毎フレーム叩いてよい。
+    /// exit を観測した子は slot を空にする — `try_wait` が `Some` を返すと
+    /// tokio は内部を `FusedChild::Done` に遷移させ、以後 `raw_handle()` が
+    /// `None` になる (= その `Child` は二度と `assign` できない) ため、
+    /// 「観測済みの死骸」を持ち回らない。
+    pub fn poll_live_children(&self) -> Vec<ChildKind> {
+        let mut live = Vec::new();
+        for (kind, slot) in [
+            (ChildKind::Audio, &self.audio_child),
+            (ChildKind::PluginHost, &self.plugin_child),
+        ] {
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(child) = guard.as_mut() else {
+                continue; // 既に観測済み / respawn で手放した。
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::info!(?kind, ?status, "child process exited");
+                    *guard = None;
+                }
+                Ok(None) => live.push(kind),
+                Err(e) => {
+                    // 観測できない子を「生きている」と報告し続けると deadline
+                    // まで無駄に待つので、諦めて backstop に委ねる。
+                    tracing::warn!(error = ?e, ?kind, "try_wait failed; giving up on observing this child");
+                    *guard = None;
+                }
+            }
+        }
+        live
+    }
+
+    /// (r.md #61) 全子プロセスの exit を **有界に** 待つ (blocking)。frame loop を
+    /// 持たない経路 (script mode) 用。GUI は `AppData::poll_shutdown` が frame
+    /// ごとに非ブロッキングで同じ判定をする — 「何を送るか」の policy は
+    /// `AppData::begin_shutdown` 1 箇所、ここは待ち方だけが違う。
+    ///
+    /// 戻り値 = 期限内に終わらなかった子 (空 = 全員 clean に exit)。
+    pub fn wait_for_children_exit(&self, deadline: std::time::Instant) -> Vec<ChildKind> {
+        loop {
+            let live = self.poll_live_children();
+            if live.is_empty() {
+                return live;
+            }
+            if std::time::Instant::now() >= deadline {
+                return live;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// (r.md #61) 期限内に終われなかった子を強制終了する (backstop)。
+    /// `start_kill` は非同期を待たずに返る — 直後に `JobHandle::close` が
+    /// 走るので、取りこぼしはそちらが確実に回収する。
+    pub fn kill_remaining(&self) {
+        for (kind, slot) in [
+            (ChildKind::Audio, &self.audio_child),
+            (ChildKind::PluginHost, &self.plugin_child),
+        ] {
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut child) = guard.take() {
+                tracing::warn!(?kind, "child did not exit in time; killing");
+                let _ = child.start_kill();
+            }
+        }
+    }
+
     /// 現在の session snapshot (sample_rate は respawn で更新されうる)。
     pub fn current_session(&self) -> AudioSession {
         self.session
@@ -296,7 +393,12 @@ impl ChildSupervisor {
 
         let (tx, rx) = unbounded_channel::<AudioCommand>();
         let incoming_tx = self.incoming_tx.clone();
-        self.rt_handle.spawn(audio_pipe_loop(server, rx, incoming_tx));
+        self.rt_handle.spawn(audio_pipe_loop(
+            server,
+            rx,
+            incoming_tx,
+            Arc::clone(&self.shutting_down),
+        ));
 
         if let Ok(mut guard) = self.audio_child.lock() {
             *guard = Some(child);
@@ -333,7 +435,12 @@ impl ChildSupervisor {
 
         let (tx, rx) = unbounded_channel::<PluginCommand>();
         let incoming_tx = self.incoming_tx.clone();
-        self.rt_handle.spawn(plugin_pipe_loop(server, rx, incoming_tx));
+        self.rt_handle.spawn(plugin_pipe_loop(
+            server,
+            rx,
+            incoming_tx,
+            Arc::clone(&self.shutting_down),
+        ));
 
         if let Ok(mut guard) = self.plugin_child.lock() {
             *guard = Some(child);
@@ -358,11 +465,9 @@ impl ChildSupervisor {
             ChildKind::PluginHost => &self.plugin_child,
         };
         if let Ok(mut guard) = child_slot.lock()
-            && let Some(mut c) = guard.take()
+            && let Some(c) = guard.take()
         {
-            // start_kill は async ではないので即返る。 status は最後に
-            // wait されないが、 Job Object 経由でも回収される。
-            let _ = c.start_kill();
+            retire_child(&self.rt_handle, kind, c);
         }
 
         let pipe = pipe_path(self.pid, kind);
@@ -417,6 +522,48 @@ impl ChildSupervisor {
             anyhow::Ok((server, child, device_sample_rate))
         })
     }
+}
+
+/// respawn で置き換えられた古い child に与える graceful exit の猶予。
+/// [`crate::shutdown::DRAIN_TIMEOUT`] より短くして、終了シーケンス中に
+/// respawn が絡んでも先に収束するようにする。
+const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// (r.md #61 同件) 置き換えられた古い child を **有界に待ってから** 強制終了する。
+///
+/// `ChildDisconnected` は「子の死」だけでなく **writer task の死**
+/// (`write_msg` 失敗 = 16MB 超 encode 等) でも合成される。後者では子は
+/// **生きていて active な plugin を抱えている**ので、旧実装の無条件
+/// `start_kill()` は「強制 kill が正規経路になっている」という r.md #61 の
+/// 指摘がそのまま当てはまる 2 つ目の箇所だった (プラグインの deactivate /
+/// destroy が走らないまま TerminateProcess)。
+///
+/// pipe loop が抜けた時点で親側の pipe half は read/write とも drop 済みなので、
+/// 子は EOF を見て自分でプラグインを畳んで exit する。その猶予を与え、期限を
+/// 過ぎたものだけ kill する。**GUI スレッドは待たない** (detached task)。
+///
+/// 猶予中は新旧の子が一瞬共存するが、worker pool の named event は
+/// `rotate_worker_pool` が世代を bump し、shmem 名も incarnation 込みなので
+/// 名前空間は衝突しない (`common::plugin_ref` の poisoning contract)。
+fn retire_child(rt: &tokio::runtime::Handle, kind: ChildKind, mut child: Child) {
+    rt.spawn(async move {
+        match tokio::time::timeout(RETIRE_GRACE, child.wait()).await {
+            Ok(Ok(status)) => {
+                tracing::info!(?kind, ?status, "retired child exited on its own");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = ?e, ?kind, "failed to wait for retired child");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    ?kind,
+                    grace_ms = RETIRE_GRACE.as_millis() as u64,
+                    "retired child did not exit in time; killing"
+                );
+                let _ = child.start_kill();
+            }
+        }
+    });
 }
 
 /// 子プロセスを spawn → handshake → Session / OpenWorkerPool 配信 →
@@ -490,8 +637,20 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     let (audio_tx, audio_rx) = unbounded_channel::<AudioCommand>();
     let (plugin_tx, plugin_rx) = unbounded_channel::<PluginCommand>();
     let (incoming_tx, incoming_rx) = unbounded_channel::<ChildEvent>();
-    rt.spawn(audio_pipe_loop(audio_server, audio_rx, incoming_tx.clone()));
-    rt.spawn(plugin_pipe_loop(plugin_server, plugin_rx, incoming_tx.clone()));
+    // (r.md #61) 終了シーケンスの合図。pipe loop / supervisor が共有する。
+    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    rt.spawn(audio_pipe_loop(
+        audio_server,
+        audio_rx,
+        incoming_tx.clone(),
+        Arc::clone(&shutting_down),
+    ));
+    rt.spawn(plugin_pipe_loop(
+        plugin_server,
+        plugin_rx,
+        incoming_tx.clone(),
+        Arc::clone(&shutting_down),
+    ));
 
     let plugin_db = load_or_build_plugin_db();
 
@@ -506,6 +665,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         incoming_tx,
         audio_child: std::sync::Mutex::new(Some(audio_child)),
         plugin_child: std::sync::Mutex::new(Some(plugin_child)),
+        shutting_down,
     });
 
     Ok(Bootstrap {
@@ -530,6 +690,85 @@ impl Bootstrap {
     /// 直接 poll する (= take せず option として残す)。
     pub fn take_incoming_rx(&mut self) -> Option<UnboundedReceiver<ChildEvent>> {
         self.incoming_rx.take()
+    }
+
+    /// (r.md #61) 明示的な解体。
+    ///
+    /// 旧実装は `drop(bootstrap)` 1 行で、実際に子が kill されるのは
+    /// **`Arc<JobHandle>` の最後の 1 本が落ちた瞬間** (owner は
+    /// `Bootstrap.job` / `ChildSupervisor.job` / `Win32JobDispatcher` の 3 つ) と
+    /// いう暗黙知に依存していた。さらにフィールド宣言順の解体は doc の主張
+    /// (「children → runtime の順」) と逆で、実際は `rt` が `supervisor` より
+    /// 先に落ちていた。ここで順序を書き下して依存を消す。
+    ///
+    /// 正常終了ではここに来る時点で子は既に自力 exit 済み (= `shutdown`
+    /// シーケンスが待ち合わせている) なので、kill も Job close も空振りする。
+    /// `already_drained` = 呼び出し側が既に子の exit を有界に待ち切っている。
+    ///
+    /// GUI (`crate::shutdown` のシーケンス) と script mode はどちらも
+    /// `DRAIN_TIMEOUT` ぶん待ってからここへ来るので `true` を渡す。ここで
+    /// **もう一度**新しい `DRAIN_TIMEOUT` を張ると、応答しないプラグインを
+    /// 抱えた終了が合計 10 秒かかり、しかも後半 5 秒は event loop が止まった
+    /// あとなのでメインウィンドウが凍ったまま画面に残る (Windows に「応答なし」
+    /// 扱いされる)。`false` を渡すのは **シーケンスを通らずに来た経路**
+    /// (event loop のエラー / `--script` の early return) だけ。
+    pub fn shutdown(self, already_drained: bool) {
+        let Bootstrap {
+            audio_tx,
+            plugin_tx,
+            incoming_rx,
+            bridge,
+            metrics,
+            scope,
+            job,
+            plugin_db,
+            rt,
+            supervisor,
+            _worker_bridge,
+            sample_rate: _,
+        } = self;
+
+        // (1) 親側の pipe half を閉じる。sender を落とすと writer task が
+        //     「rx closed = 意図的 teardown」で抜け、reader も畳まれる。
+        //     子がまだ生きていれば EOF を見て自力 teardown に入る。
+        supervisor.begin_shutdown();
+        drop(audio_tx);
+        drop(plugin_tx);
+        drop(incoming_rx);
+
+        // (2) シーケンスを通らずに来た経路だけ、子の exit を有界に待つ。
+        //     いきなり強制 kill せず、pipe EOF 経由の graceful teardown に
+        //     猶予を与えるため。既に待ち切っている場合は 1 回観測するだけ。
+        let stragglers = if already_drained {
+            supervisor.poll_live_children()
+        } else {
+            let deadline = std::time::Instant::now() + crate::shutdown::DRAIN_TIMEOUT;
+            supervisor.wait_for_children_exit(deadline)
+        };
+
+        // (3) 期限内に終われなかった子を強制終了 (backstop の 1 段目)。
+        if !stragglers.is_empty() {
+            let names: Vec<&str> = stragglers.iter().map(|k| k.as_str()).collect();
+            tracing::warn!(?names, "children still alive at bootstrap teardown; killing");
+        }
+        supervisor.kill_remaining();
+        drop(supervisor);
+
+        // (4) Job を閉じる (backstop の 2 段目)。取りこぼした子と、
+        //     handle を `std::mem::forget` している VOICEVOX engine の
+        //     唯一の停止手段。`&self` なので Arc の refcount に依存しない。
+        job.close();
+        drop(job);
+
+        // (5) shmem / worker bridge を解放してから runtime を落とす。
+        //     Runtime の drop は blocking task の完了を待ちうるので最後。
+        drop(bridge);
+        drop(metrics);
+        drop(scope);
+        drop(plugin_db);
+        drop(_worker_bridge);
+        drop(rt);
+        tracing::info!("bootstrap shutdown complete");
     }
 }
 
@@ -696,10 +935,17 @@ async fn handshake_plugin(mut server: NamedPipeServer) -> Result<(PluginEvent, N
 /// 差し替え / shutdown)」 を false で返す。 前者のみ `ChildDisconnected` を
 /// 合成する — 従来は read 断しか検知せず、 writer task 死 (16MB 超 encode
 /// 失敗等) が沈黙のゾンビになっていた (`docs/plan_arch_refactor.md` §3)。
+///
+/// (r.md #61) `shutting_down` が立っていたら **どちらの切れ方でも合成しない**。
+/// 終了シーケンス中は子が自力 exit して pipe が **子側から先に閉じる**ので、
+/// reader が EOF を拾って crash と同じ切断イベントを作り、respawn が走って
+/// しまう。`tokio::select!` は writer / reader のどちらが先に完了するか非決定
+/// なので、「tx を drop して writer を先に終わらせる」だけでは塞げない。
 async fn audio_pipe_loop(
     pipe: NamedPipeServer,
     mut rx: UnboundedReceiver<AudioCommand>,
     incoming_tx: UnboundedSender<ChildEvent>,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // read/write half を別タスクに分けて read を絶対 cancel しない
     // (詳細は plugin_pipe_loop / daw_plugin_host::pipe_loop)。旧 select! 構造は
@@ -741,7 +987,7 @@ async fn audio_pipe_loop(
             r.unwrap_or(true)
         }
     };
-    if disconnected {
+    if disconnected && !shutting_down.load(std::sync::atomic::Ordering::Acquire) {
         // 子プロセス側 (or 自前 write) が die / decode 失敗で抜けたケース。
         // 上位 (AppData::handle_event) で respawn + state restore に拾ってもらう。
         let _ = incoming_tx.send(ChildEvent::Audio(AudioEvent::ChildDisconnected));
@@ -753,6 +999,7 @@ async fn plugin_pipe_loop(
     pipe: NamedPipeServer,
     mut rx: UnboundedReceiver<PluginCommand>,
     incoming_tx: UnboundedSender<ChildEvent>,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // read_msg / write_msg (wire.rs の read_exact / write_all) は
     // cancellation-unsafe。旧構造の `select! { read_msg, rx.recv()=>write_msg }`
@@ -797,7 +1044,7 @@ async fn plugin_pipe_loop(
             r.unwrap_or(true)
         }
     };
-    if disconnected {
+    if disconnected && !shutting_down.load(std::sync::atomic::Ordering::Acquire) {
         let _ = incoming_tx.send(ChildEvent::Plugin(PluginEvent::ChildDisconnected));
     }
     tracing::info!("plugin pipe loop ended");

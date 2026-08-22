@@ -45,6 +45,11 @@ impl AppData {
             || self.loudness.phase.is_busy()
             || self.ipc.is_rescanning
             || self.voicevox_animating(now)
+            // r.md #61: 終了処理中は「プラグインを解放しています… (N 秒)」の
+            // 経過表示が動いている。窓が非アクティブなまま終了する経路
+            // (OS のサインアウト / プラグインエディタにフォーカスがある状態の
+            // Ctrl+Q) でも表示が凍らないよう、他の進捗表示と同じ扱いにする。
+            || self.shutdown.is_draining()
     }
 
     /// transport が走っているか (再生 or 録音)。

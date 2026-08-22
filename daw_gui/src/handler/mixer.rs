@@ -148,6 +148,7 @@ impl AppData {
         }
         self.voicevox.voicevox_launch_attempted = true;
         let job = Arc::clone(&self.voicevox.voicevox_job);
+        let slot = Arc::clone(&self.voicevox.spawned_engine);
         std::thread::spawn(move || {
             if crate::voicevox_engine::is_running() {
                 return;
@@ -164,13 +165,33 @@ impl AppData {
             };
             tracing::info!(?engine, "lazy spawn VOICEVOX engine for builtin plugin");
             match crate::voicevox_engine::spawn_engine(&engine) {
-                Ok(child) => {
-                    if let Err(e) = job.assign_std(&child) {
-                        tracing::warn!(error = ?e, "failed to attach VOICEVOX to job");
+                Ok(mut child) => {
+                    // (r.md #61) handle を保持する。旧実装は `std::mem::forget`
+                    // で捨てており、停止手段が Job Object の CloseHandle しか
+                    // 無かった (= 終了シーケンスが engine の停止を所有できない)。
+                    //
+                    // **slot を取ってから attach する**。`is_running()` の HTTP
+                    // タイムアウト (最大 1 秒) を待っている間に終了シーケンスが
+                    // 走り切って `JobHandle::close()` まで到達していると、Job にも
+                    // 入らず kill もされない孤児が残るため、その場で殺す。
+                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.shutting_down {
+                        tracing::warn!(
+                            "VOICEVOX engine finished spawning after shutdown began; killing it"
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
                     }
-                    // child を drop しても std::process::Child は wait
-                    // しない (Windows)。 JobObject 経由で auto-kill される。
-                    std::mem::forget(child);
+                    if let Err(e) = job.assign_std(&child) {
+                        // Job に入れられないと backstop が効かない。孤児を作るより
+                        // 起動しなかったことにする方が安全 (次回起動でやり直せる)。
+                        tracing::error!(error = ?e, "failed to attach VOICEVOX to job; killing it");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
+                    guard.child = Some(child);
                 }
                 Err(e) => {
                     tracing::error!(error = ?e, ?engine, "failed to spawn VOICEVOX engine");

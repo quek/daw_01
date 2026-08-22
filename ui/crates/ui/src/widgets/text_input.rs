@@ -74,6 +74,11 @@ pub(crate) struct TextInputState {
     /// ので、直後に押す **意図的な submit Enter は抑制されない** (daw_01 提案の単純 1-frame bool
     /// だと batched 後の submit Enter まで誤抑制する欠陥があったため refine)。
     composing_last_frame: bool,
+    /// 横スクロール量 (px)。 欄より長いテキストを打ったとき、 **cursor が常に見えるよう**
+    /// 内容を左へずらす量 (0 で先頭表示)。 widget は横スクロールバーを持たず、 テキストは
+    /// rect で clip するので、 これが無いと欄からはみ出した入力が単に見えなくなる。
+    /// focus を失ったら 0 に戻して先頭から見せる。
+    scroll_x: f32,
 }
 
 /// `text` の `from` 位置から左方向に直近の char 境界を返す (`from` が境界ならそのまま返す)。
@@ -106,6 +111,39 @@ fn delete_range(working: &mut String, cursor: &mut usize, anchor: &mut usize) ->
     *cursor = lo;
     *anchor = lo;
     true
+}
+
+/// `text_input_at` のタイポグラフィと内側余白。
+///
+/// **色は持たない**: 入力欄の面 / 枠 / 文字色は palette が SSoT で、 caller ごとに
+/// 変える理由が無い (r.md #48 の「テーマ色を読む Default を作らない」 に抵触しない)。
+/// 逆に **font_size / pad_x は caller が持たないと成立しない**: 旧実装はこの 2 つを
+/// `draw_text_input` に 14.0 / 8.0 で埋め込んでいたため、
+/// (a) `scrubable_number_at` が `style.font_size` を渡していても **編集モードに入った瞬間
+///     文字が 14px に跳ねる** (inspector の 11px 欄で実際に起きていた)、
+/// (b) mixer strip のような **狭い欄に入力を置けない** (`8 + "L100"@14px = 37px` 必要)、
+/// という 2 つの欠陥があった。 widget のタイポグラフィは widget instance の属性。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextInputStyle {
+    /// 文字と cursor 計測の font size (px)。
+    pub font_size: f32,
+    /// rect 左端からテキスト開始までの内側余白 (px)。 cursor / 選択矩形 / IME 候補位置も
+    /// この原点から測る。
+    pub pad_x: f32,
+}
+
+impl Default for TextInputStyle {
+    fn default() -> Self {
+        Self { font_size: 14.0, pad_x: 8.0 }
+    }
+}
+
+impl TextInputStyle {
+    /// 1 行の高さ (= `font_size * 1.2`)。 テキストの縦センタリングと cursor 高の SSoT。
+    #[must_use]
+    fn line_height(self) -> f32 {
+        self.font_size * 1.2
+    }
 }
 
 // `focused` / `committed` / `nav_up` / `nav_down` は **意味の異なる 1 frame edge** で、
@@ -146,12 +184,14 @@ pub struct TextInputResponse {
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 矩形指定で 1 行 text_input を描画 + キー入力処理。
     /// 編集が起きたら `on_change(new_text)` を Edit 列に積む。
+    /// `style` は font_size / 内側余白 ([`TextInputStyle`])。
     #[allow(clippy::too_many_lines)]
     pub fn text_input_at<F>(
         &mut self,
         id: impl Hash,
         rect: Rect,
         text: &str,
+        style: &TextInputStyle,
         on_change: F,
     ) -> TextInputResponse
     where
@@ -378,7 +418,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         // Home / End (daw_01 r.md #10): 単一行なので行頭 (offset 0) /
                         // 行末 (len) へカーソル移動。 Shift で anchor 固定の選択拡張
                         // (ArrowLeft/Right と同 idiom)。 text は変えないので changed 無し。
-                        // これらは `is_typing_only_shortcut` で typing 中 global seek を
+                        // これらは `ShortcutMap::set_typing_only` 宣言で typing 中 global seek を
                         // 抑止した上で widget に届く (抑止しないとプレイヘッドが飛ぶ)。
                         PhysicalKey::Home => {
                             cursor = 0;
@@ -519,6 +559,38 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             )
         };
 
+        // 横スクロール: cursor が欄の内側に収まるよう最小限だけずらす (= OS / ブラウザの
+        // 1 行入力欄と同じ規則)。 非 focus では 0 に戻して先頭を見せる。 テキストは rect で
+        // clip されるので、 これが無いと欄より長い入力が「打っているのに見えない」 になる
+        // (piano_roll の note 幅 lyric 欄 / mixer strip の 30px pan 欄)。
+        //
+        // **非 focus では一切 measure しない**: text_input は picker の検索欄のように
+        // 「常に描かれているが focus されていない」 使い方が普通で、 そこで毎フレーム
+        // shape を走らせるのは無駄 (scroll は focus 中の cursor 追従にしか要らない)。
+        let scroll_x = if was_focused {
+            let preedit_w = self.measure_text(&preedit_for_draw, style.font_size);
+            let caret_rel = self.measure_text(
+                displayed_text.get(..cursor_byte_for_draw).unwrap_or(""),
+                style.font_size,
+            ) + preedit_w;
+            let total_w = self.measure_text(&displayed_text, style.font_size) + preedit_w;
+            let visible_w = (rect.w - style.pad_x * 2.0).max(1.0);
+            let state: &mut TextInputState = self.widget_state(wid);
+            let mut sx = state.scroll_x;
+            if caret_rel < sx {
+                sx = caret_rel;
+            } else if caret_rel > sx + visible_w {
+                sx = caret_rel - visible_w;
+            }
+            // 末尾を消した後に空白だけが見えている状態を作らない。
+            state.scroll_x = sx.clamp(0.0, (total_w - visible_w).max(0.0));
+            state.scroll_x
+        } else {
+            let state: &mut TextInputState = self.widget_state(wid);
+            state.scroll_x = 0.0;
+            0.0
+        };
+
         // 描画。M4 Phase 11: with_widget_node で input_hash キャッシュ。
         // text / cursor / anchor / preedit / focused が同じなら描画スキップ可。
         let input_hash = hash_inputs((
@@ -532,9 +604,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             anchor_byte_for_draw as u64,
             preedit_for_draw.as_str(),
             was_focused,
+            // tuple の Hash impl は 12 要素までなので、 タイポグラフィ系はまとめて畳む。
+            (style.font_size.to_bits(), style.pad_x.to_bits(), scroll_x.to_bits()),
         ));
         let preedit_str = preedit_for_draw.clone();
         let displayed_for_draw = displayed_text.clone();
+        let style_copy = *style;
         self.with_widget_node(wid, input_hash, |ui| {
             draw_text_input(
                 ui,
@@ -544,21 +619,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 cursor_byte_for_draw,
                 anchor_byte_for_draw,
                 &preedit_str,
+                style_copy,
+                scroll_x,
             );
         });
 
         // フォーカス中なら IME 候補ウィンドウ位置を要求する (cursor 直下)。
         if was_focused {
-            let pad_x = 8.0;
-            let font_size = 14.0;
+            let pad_x = style.pad_x;
+            let font_size = style.font_size;
             let prefix = displayed_text.get(..cursor_byte_for_draw).unwrap_or("");
-            let cursor_x = rect.x
-                + pad_x
+            let cursor_x = rect.x + pad_x - scroll_x
                 + self.measure_text(prefix, font_size)
                 + self.measure_text(&preedit_for_draw, font_size);
-            let cursor_y_top = rect.y + 4.0;
-            let cursor_h = (rect.h - 8.0).max(1.0);
-            let caret = Rect { x: cursor_x, y: cursor_y_top, w: 1.0, h: cursor_h };
+            // 描画側 (`draw_text_input`) と同じ caret 幾何 (= 行の高さを rect 中央に置く)。
+            let caret = caret_rect(rect, *style, cursor_x);
             self.request_ime(caret);
             // M15: text store (TSF) に text + selection + caret を publish。rtry のまぜ書き
             // GetText / MS-IME 再変換がアプリのテキストを読めるようにする。preedit 中は selection
@@ -569,7 +644,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // (O(n)、focused field のみ)、再変換の単語選択には十分。
             let char_boundaries = {
                 let mut bounds = Vec::with_capacity(displayed_text.len() + 1);
-                let mut x = rect.x + pad_x;
+                let mut x = rect.x + pad_x - scroll_x;
                 let mut byte = 0usize;
                 bounds.push((x, byte));
                 let mut buf = [0u8; 4];
@@ -630,7 +705,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: self.cursor.w - pad * 2.0,
             h,
         };
-        let resp = self.text_input_at(id, rect, text, on_change);
+        let resp = self.text_input_at(id, rect, text, &TextInputStyle::default(), on_change);
         self.next_y += h + pad;
         resp
     }
@@ -653,6 +728,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         rect: Rect,
         text: &str,
+        style: &TextInputStyle,
         on_change: F,
     ) -> TextInputResponse
     where
@@ -672,10 +748,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut TextInputState = self.widget_state(wid);
             state.last_focused = false;
         }
-        self.text_input_at(id, rect, text, on_change)
+        self.text_input_at(id, rect, text, style, on_change)
     }
 }
 
+/// cursor (キャレット) の矩形。 **行の高さをそのまま rect 中央に置く** ので、
+/// font_size を小さくしても「文字より短い / はみ出す」 が起きない (旧実装の
+/// `rect.h - 8.0` は font 14 / 高さ 22-28px の欄でしか成立しない固定値だった)。
+/// 描画 (`draw_text_input`) と IME 候補位置要求が同じ写像を共有する。
+fn caret_rect(rect: Rect, style: TextInputStyle, cursor_x: f32) -> Rect {
+    let h = style.line_height().min(rect.h - 2.0).max(1.0);
+    Rect { x: cursor_x, y: rect.y + (rect.h - h) * 0.5, w: 1.0, h }
+}
+
+// text / focus / cursor / anchor / preedit / style / scroll は各々独立した描画入力で、
+// struct にまとめても呼び出しが 1 段深くなるだけ (`draw_scrubable_number` と同じ判断)。
+#[allow(clippy::too_many_arguments)]
 fn draw_text_input<M: ?Sized + 'static>(
     ui: &mut Ui<'_, M>,
     rect: Rect,
@@ -684,6 +772,8 @@ fn draw_text_input<M: ?Sized + 'static>(
     cursor_byte: usize,
     anchor_byte: usize,
     preedit: &str,
+    style: TextInputStyle,
+    scroll_x: f32,
 ) {
     // 背景。 palette の寿命は host の `'a` なので、 以下の `ui.push_*` (= `&mut`) と衝突しない。
     let p = ui.palette();
@@ -699,10 +789,11 @@ fn draw_text_input<M: ?Sized + 'static>(
     });
 
     // テキスト + preedit。preedit は cursor 位置に挿入して表示する。
-    let pad_x = 8.0;
-    let font_size = 14.0;
-    let line_h = font_size * 1.2;
-    let tx = rect.x + pad_x;
+    let pad_x = style.pad_x;
+    let font_size = style.font_size;
+    let line_h = style.line_height();
+    // 横スクロール分だけ内容を左へ。 rect で clip するので欄の外へは出ない。
+    let tx = rect.x + pad_x - scroll_x;
     let ty = rect.y + (rect.h - line_h) * 0.5;
 
     // M14 Phase 58: prefix / preedit の x advance を **glyphon と同じ shape** で実測。
@@ -755,15 +846,20 @@ fn draw_text_input<M: ?Sized + 'static>(
             font_size,
             line_height: line_h,
             color: p.text,
-            clip_rect: None,
+            // 欄に収まらない長さを打ったとき、 グリフを欄の外へ流さない (この widget は
+            // 横スクロールを持たないので溢れた分は見えなくなる)。 mixer strip のような
+            // 狭い欄では、 溢れたグリフが隣の strip の上に重なって描かれてしまう。
+            clip_rect: Some(rect),
             ..GlyphArea::default()
         });
     }
 
-    // preedit の下線 (位置は実 measure)。
+    // preedit の下線 (位置は実 measure)。 縦位置は **テキスト行の下端** に置く
+    // (旧 `rect.h - 4.0` は font 14 / 高さ 28px の欄前提で、 font を下げると
+    // 下線が文字の上に重なる)。
     if !preedit.is_empty() {
         let pre_x = tx + prefix_w;
-        let underline_y = rect.y + rect.h - 4.0;
+        let underline_y = (ty + line_h - 1.0).min(rect.y + rect.h - 1.0);
         ui.push_lines(LineBatch {
             segments: vec![LineSegment {
                 a: [pre_x, underline_y],
@@ -780,13 +876,11 @@ fn draw_text_input<M: ?Sized + 'static>(
 
     // カーソル (フォーカス中のみ、preedit があれば末尾)。
     if focused {
-        let cursor_x = tx + prefix_w + preedit_w;
-        let cursor_y = rect.y + 4.0;
-        let cursor_h = (rect.h - 8.0).max(1.0);
+        let caret = caret_rect(rect, style, tx + prefix_w + preedit_w);
         ui.push_lines(LineBatch {
             segments: vec![LineSegment {
-                a: [cursor_x, cursor_y],
-                b: [cursor_x, cursor_y + cursor_h],
+                a: [caret.x, caret.y],
+                b: [caret.x, caret.y + caret.h],
                 color: p.text,
             }]
             .into(),
@@ -806,7 +900,7 @@ mod tests {
     use daw_ui_platform::PhysicalSize;
     use daw_ui_renderer::{Rect, Scene};
 
-    use super::TextInputResponse;
+    use super::{TextInputResponse, TextInputStyle};
     use crate::edit::Edit;
     use crate::id::WidgetId;
     use crate::input::FrameInput;
@@ -829,6 +923,7 @@ mod tests {
                 "rename",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -837,6 +932,49 @@ mod tests {
             host.focused_widget(),
             Some(text_input_wid("rename")),
             "初回 show でキーボードフォーカスを取得"
+        );
+    }
+
+    /// r.md #62: 欄より長いテキストでも **cursor が欄の内側に留まる** (= 横スクロール)。
+    /// テキストは rect で clip するので、 スクロールが無いと「打っているのに見えない」 に
+    /// なる (piano_roll の note 幅 lyric 欄 / mixer strip の 30px pan 欄)。
+    #[test]
+    fn long_text_scrolls_horizontally_to_keep_caret_visible() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // 欄より確実に長い文字列。 focus 取得で cursor は末尾に置かれる。
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let style = TextInputStyle { font_size: 10.0, pad_x: 4.0 };
+        let rect = Rect { x: 10.0, y: 10.0, w: 30.0, h: 16.0 };
+
+        let mut total_w = 0.0_f32;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            total_w = ui.measure_text(long, style.font_size);
+            ui.text_input_at_focused("scroll", rect, long, &style, |_new| Edit::mutate(|()| {}));
+        });
+
+        let glyph = scene
+            .iter_glyphs()
+            .find(|g| g.text.as_ref() == long)
+            .expect("テキストが描画される");
+        assert!(
+            total_w > rect.w,
+            "前提: テキスト幅 {total_w}px は欄幅 {}px より長い",
+            rect.w
+        );
+        // cursor は末尾 = tx + total_w。 これが欄の内側 (右 pad の内) に収まる。
+        let caret_x = glyph.left + total_w;
+        assert!(
+            caret_x <= rect.x + rect.w - style.pad_x + 0.01,
+            "cursor ({caret_x}) が欄の右端 ({}) の内側に留まる",
+            rect.x + rect.w - style.pad_x
+        );
+        assert!(
+            glyph.left < rect.x + style.pad_x,
+            "内容が左へスクロールしている (left={} / 非スクロール時 {})",
+            glyph.left,
+            rect.x + style.pad_x
         );
     }
 
@@ -856,6 +994,7 @@ mod tests {
                 "rename",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -869,6 +1008,7 @@ mod tests {
                 "rename",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -895,6 +1035,7 @@ mod tests {
                 "rename",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -915,6 +1056,7 @@ mod tests {
                 "rename",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -945,6 +1087,7 @@ mod tests {
                 "ti",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -966,6 +1109,7 @@ mod tests {
                     "ti",
                     Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                     "abc",
+                    &TextInputStyle::default(),
                     |_new| Edit::mutate(|()| {}),
                 );
                 committed.set(resp.committed);
@@ -990,6 +1134,7 @@ mod tests {
                 "ti",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -1010,6 +1155,7 @@ mod tests {
                     "ti",
                     Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                     "abc",
+                    &TextInputStyle::default(),
                     |_new| Edit::mutate(|()| {}),
                 );
                 committed.set(resp.committed);
@@ -1072,6 +1218,7 @@ mod tests {
                 "ti",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 text,
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
         });
@@ -1094,6 +1241,7 @@ mod tests {
                 "ti",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 text,
+                &TextInputStyle::default(),
                 |new| {
                     *observed_capt.lock().unwrap() = Some(new);
                     Edit::mutate(|()| {})
@@ -1352,6 +1500,7 @@ mod tests {
                     "ti",
                     Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                     "abc",
+                    &TextInputStyle::default(),
                     |new| {
                         // 反映しない (controlled caller の最小形): on_change が呼ばれたら不正。
                         panic!("ArrowUp で on_change が呼ばれた (text={new})");
@@ -1378,6 +1527,7 @@ mod tests {
                     "ti",
                     Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                     "abc",
+                    &TextInputStyle::default(),
                     |new| panic!("ArrowDown で on_change が呼ばれた (text={new})"),
                 );
                 nav_up.set(resp.nav_up);
@@ -1417,6 +1567,7 @@ mod tests {
                     "ti",
                     Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                     "abc",
+                    &TextInputStyle::default(),
                     |_new| Edit::mutate(|()| {}),
                 );
             },
@@ -1439,6 +1590,7 @@ mod tests {
                     "ti",
                     Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                     "abc",
+                    &TextInputStyle::default(),
                     |_new| Edit::mutate(|()| {}),
                 );
                 nav_up.set(resp.nav_up);
@@ -1552,6 +1704,7 @@ mod tests {
                 "ti",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 "abc",
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
             committed.set(resp.committed);
@@ -1678,6 +1831,7 @@ mod tests {
                 "ti",
                 Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
                 text,
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|()| {}),
             );
             *capt.lock().unwrap() = resp;

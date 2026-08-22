@@ -54,6 +54,11 @@ pub mod midi_import;
 // feature 有効時のみコンパイルする (default ビルドのコールド時間短縮)。
 #[cfg(feature = "script")]
 pub mod script;
+/// r.md #61: Windows のサインアウト / シャットダウン (`WM_QUERYENDSESSION`)。
+#[cfg(windows)]
+pub mod session_end;
+/// r.md #61: 終了シーケンスの状態機械 (全終了経路の合流点)。
+pub mod shutdown;
 pub mod single_instance;
 pub mod state;
 #[cfg(windows)]

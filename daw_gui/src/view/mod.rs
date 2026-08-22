@@ -9,6 +9,8 @@ pub mod audio_editor;
 pub mod bottom_panel;
 pub mod dirty_guard_modal;
 pub mod export_overlay;
+/// r.md #61: 終了処理中オーバーレイ。
+pub mod shutdown_overlay;
 pub mod export_range_modal;
 pub mod font_picker;
 pub mod load_overlay;

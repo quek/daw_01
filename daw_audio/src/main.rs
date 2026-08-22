@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
     // plan §4: RT からは pipe に書けない (I/O 禁止) ので、 quarantine / pool
     // stall / MMCSS 失敗のフラグを 100ms 周期で poll して GUI へ通知する
     // 専用スレッド。 dedup は per-entry / per-rig の AtomicBool swap。
-    spawn_notify_thread(
+    let notify = spawn_notify_thread(
         Arc::clone(&engine_shared),
         out_tx.clone(),
         Arc::clone(&shared),
@@ -189,9 +189,43 @@ async fn main() -> Result<()> {
         decode_tx,
         bundle_tx,
         bundle_recycle_rx,
-        park,
+        Arc::clone(&park),
     )
     .await;
+
+    // (r.md #61) ここから graceful teardown。順序が意味を持つ:
+    //   1. notify thread を止めて join する — この thread が `park` の Arc clone を
+    //      持っている間は `cpal::Stream::drop` が走らない (旧実装の Arc リーク)。
+    //   2. stream を明示 pause してデバイスを解放する。
+    //   3. `park` の最後の Arc を落として `cpal::Stream` を drop する。
+    // 待ちはどれも有界 (join は poll 周期 100ms が上限)。
+    if let Some(notify) = notify {
+        notify.stop_and_join();
+    }
+    {
+        let mut driver = park
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        driver.stop_for_shutdown();
+    }
+    // 不変条件: ここで `park` の Arc は 1 本だけ (notify thread と recv_loop の
+    // clone は上で落ちている)。残っていると `cpal::Stream::drop` が走らず
+    // デバイスが解放されない = r.md #61 で直した Arc リークの再発。
+    // panic ではなく error ログにするのは、**この時点でプロセスは終わるだけ**で、
+    // 落として exit code を汚し log flush を飛ばすより、リークの事実を記録して
+    // 静かに終わる方が診断に役立つため (探しに行く先はまさにこのログ)。
+    let remaining = Arc::strong_count(&park);
+    if remaining != 1 {
+        tracing::error!(
+            remaining,
+            "Park の Arc が他に残っている — cpal::Stream::drop が走らずデバイスが解放されない"
+        );
+    }
+    // ここで `cpal::Stream::drop` が run thread を畳み、WASAPI デバイスが
+    // 実際に解放される。**「解放できた」を表すのはこの行** (`stop_for_shutdown`
+    // の pause は要求をキューに積んだだけ)。
+    drop(park);
+    tracing::info!("audio stream released");
     tracing::info!("daw_audio exiting");
     Ok(())
 }
@@ -386,12 +420,54 @@ impl ParkDriver {
             ),
         }
     }
+
+    /// (r.md #61) プロセス終了に向けて stream の停止を要求する。
+    ///
+    /// `apply` と違って「今の状態」を見ずに **必ず** 要求する。
+    ///
+    /// **これは「停止した」ではなく「停止を要求した」**。cpal 0.17 の wasapi
+    /// backend では `Stream::pause` は `Command::PauseStream` をキューに積んで
+    /// 即 `Ok(())` を返すだけで (`host/wasapi/stream.rs`)、実際の
+    /// `IAudioClient::Stop` は run thread の `process_commands` が後から実行し、
+    /// その失敗は `error_callback` へ行ってこの `Result` には現れない。
+    /// デバイスが実際に解放されるのは `Stream::drop` が run thread を畳んだ
+    /// 時点なので、確認したいログは後段の `audio stream released`。
+    fn stop_for_shutdown(&mut self) {
+        match self.stream.pause() {
+            Ok(()) => tracing::info!("requested audio stream pause for shutdown"),
+            Err(e) => tracing::warn!(error = %e, "failed to queue the audio stream pause"),
+        }
+        self.parked = true;
+    }
 }
 
 // `cpal::Stream` は wasapi backend で `Send + Sync`
 // (`cpal-0.17.1/src/host/wasapi/stream.rs:40,49`)。Mutex 越しに 2 スレッドから
 // pause / play を出すのはこの保証に依存している。
 type Park = Arc<std::sync::Mutex<ParkDriver>>;
+
+/// (r.md #61) notify thread の停止ハンドル。
+///
+/// 旧実装は脱出条件の無い `loop` で、`park: Park` の `Arc` clone を**永久に
+/// 保持**していた。そのため `main` が return しても strong count が 0 にならず、
+/// `cpal::Stream::drop` (= WASAPI デバイスの解放) が **原理的に走らなかった**。
+/// 「recv_loop を break する」だけでは直らない ので、停止フラグ + join を持つ。
+struct NotifyThread {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    join: std::thread::JoinHandle<()>,
+}
+
+impl NotifyThread {
+    /// 停止を要求して join する。thread は poll 周期 (100ms) の頭でフラグを
+    /// 見るので、待ちは高々その 1 周期 (= 有界)。
+    fn stop_and_join(self) {
+        self.stop.store(true, Ordering::Release);
+        match self.join.join() {
+            Ok(()) => tracing::info!("audio notify thread joined"),
+            Err(_) => tracing::warn!("audio notify thread panicked"),
+        }
+    }
+}
 
 /// `park_requested` が指す状態へ stream を寄せる (reconciler)。notify thread が
 /// 100ms ごとに呼ぶ。
@@ -434,11 +510,16 @@ fn spawn_notify_thread(
     out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     shared: Arc<SharedState>,
     park: Park,
-) {
-    let _ = std::thread::Builder::new()
+) -> Option<NotifyThread> {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let join = std::thread::Builder::new()
         .name("audio-notify".to_string())
         .spawn(move || {
-            loop {
+            // (r.md #61) `park` の Arc clone をこの thread が持つので、
+            // **抜ける条件が無いと `cpal::Stream::drop` が永久に走らない**。
+            // `stop` を見て抜け、clone をここで落とす。
+            while !stop_for_thread.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 // r.md #49: stream の状態をコールバックの park 要求へ追従させる。
                 // pause 側 (アイドル検出) も play 側 (要求の取り下げ) もここが拾う。
@@ -475,7 +556,17 @@ fn spawn_notify_thread(
                     let _ = out_tx.send(AudioEvent::WorkerPoolStalled);
                 }
             }
+            tracing::info!("audio notify thread exiting");
         });
+    match join {
+        Ok(join) => Some(NotifyThread { stop, join }),
+        Err(e) => {
+            // spawn 失敗はアイドル park と quarantine 通知を失うだけで、
+            // 音は鳴り続ける。終了時に join するものが無いだけなので None。
+            tracing::error!(error = ?e, "failed to spawn audio notify thread");
+            None
+        }
+    }
 }
 
 /// forward ring への bundle 送出 (drop-oldest 化)。 rtrb の producer は
@@ -1672,6 +1763,13 @@ async fn recv_loop(
                         frames: 0,
                     });
                 }
+            }
+            // (r.md #61) daw_gui の終了シーケンスからの正常終了要求。
+            // 親 crash の pipe EOF (下の `Err` 枝) と同じ出口へ合流し、
+            // 呼び出し元 `main` が stream / notify thread を畳む。
+            Ok(AudioCommand::Shutdown) => {
+                tracing::info!("received Shutdown");
+                break;
             }
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");

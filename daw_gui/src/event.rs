@@ -34,6 +34,14 @@ pub enum AppEvent {
     /// ガードモーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
     /// 操作を取りやめてアプリに戻る。
     DirtyGuardCancel,
+    /// r.md #61: **アプリ終了要求の唯一の event**。File > 終了 / `Ctrl+Q` /
+    /// `--smoke-test` の判定完了 / Windows のセッション終了がここに合流する
+    /// (✕ / Alt+F4 は `WindowEvent::CloseRequested` → `AppData::request_close`
+    /// から同じ `request_quit` に入る)。
+    ///
+    /// 未保存なら確認モーダルを挟み、通れば子プロセスの graceful teardown を
+    /// 待つシーケンス (`crate::shutdown`) に入る。
+    Quit(crate::shutdown::QuitRequest),
     /// 別の daw_gui を起動しようとした (single-instance)。 2 つ目の
     /// プロセスが既存インスタンスにこれを送って前面化を要求する。 window 操作
     /// なので runner の `user_event` が直接処理し、 `handle_event` には届かない。
@@ -723,6 +731,17 @@ pub enum AppEvent {
     /// 凡例で **トラック** の「ロック (参照専用)」を反転。ロック中はそのトラックの
     /// 表示 note を widget が hit 除外し、編集 handler も飛ばす (淡色のまま掴めない)。非永続。
     TogglePianoRollTrackLock(u32),
+    /// r.md #67: ←/→ で選択ノートを時間軸に移動。`steps` の符号が方向 (負 = 左)、
+    /// 絶対値は「このフレームに届いたキーリピート回数」。 1 ステップの拍数は
+    /// [`NudgeStep`] とピアノロールの現在のスナップ設定から導く。
+    /// 選択が空 / 対象面がノートでないときは発火しない (dispatch 側で gate)。
+    NudgeSelectedNoteTime { step: NudgeStep, steps: i32 },
+    /// r.md #67: Ctrl+←/→ で選択ノートの長さを伸縮。`steps` は [`Self::NudgeSelectedNoteTime`] と同じ。
+    NudgeSelectedNoteLength { step: NudgeStep, steps: i32 },
+    /// r.md #67: ↑/↓ (`octave = false`) / Shift+↑/↓ (`octave = true`) で選択ノートの音程を変更。
+    /// `steps` の符号が方向 (負 = 下)。スケール表示 (Fold) 中・Snap on Draw 中は
+    /// 半音ではなく **スケール音 1 つ** 単位で動く。
+    NudgeSelectedNotePitch { octave: bool, steps: i32 },
 
     // -------- Plugin picker / chain ---------------------------------------
     OpenPluginPicker,
@@ -1642,8 +1661,12 @@ impl AppEvent {
 
             // ---- ノート ----
             E::AddNote { .. } => "ノート追加",
-            E::SetNotePositions(..) => "ノート移動",
-            E::ResizeNote { .. } | E::ResizeNotes(..) => "ノート長さ変更",
+            E::SetNotePositions(..)
+            | E::NudgeSelectedNoteTime { .. }
+            | E::NudgeSelectedNotePitch { .. } => "ノート移動",
+            E::ResizeNote { .. }
+            | E::ResizeNotes(..)
+            | E::NudgeSelectedNoteLength { .. } => "ノート長さ変更",
             E::DeleteSelectedNotes => "ノート削除",
             E::DuplicateSelectedNotes | E::CopyNotes(..) => "ノート複製",
             E::SetNoteVelocity { .. } | E::SetNoteVelocities(..) => "ベロシティ変更",
@@ -1826,6 +1849,23 @@ impl AppEvent {
             _ => "編集",
         }
     }
+}
+
+/// r.md #67: カーソルキー 1 押しでノートが動く / 伸びる量。
+///
+/// 実際の拍数は [`crate::app::AppData::nudge_beat_unit`] がピアノロールの現在の
+/// スナップ設定と拍子から導く (= グリッド設定を変えれば移動量も追従する)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeStep {
+    /// グリッド 1 つ分 (無修飾 ←/→)。スナップ OFF のときは `Fine` に倒れる
+    /// (「グリッド」 が定義できないため、 Ableton Live / Bitwig と同じ扱い)。
+    Grid,
+    /// 1 小節分 (Shift+←/→)。`time_sig` から算出 (4/4 なら 4 拍)。
+    /// 音程軸の Shift = 1 オクターブ と「大きいステップ」 で意味を揃えたもの。
+    Bar,
+    /// スナップ無効の微移動 (Alt+←/→)。グリッド 1 つの 1/16
+    /// (daw_01 全体の「Alt = スナップ一時無効」 規約に沿う)。
+    Fine,
 }
 
 /// Phase 7 B5: `QuantizePitchesToScale` の対象スコープ。

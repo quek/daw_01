@@ -370,7 +370,15 @@ debug feature `rt-assert` で worker body を `assert_no_alloc!` で wrap、CI �
 6. **Vocal track 再生**: VOICEVOX cache 経由 WAV を Vocal track にセット → 再生で音
 7. **WAV export**: File → Export WAV、書き出した WAV が DAW 内再生と一致
 8. **stress**: 5 分連続再生 / 停止 / track 切替、`tracing::warn!` 無し、worker join デッドロック無し
-9. **GUI 終了**: ウィンドウ閉じる → JobObject 経由 全プロセス終了、handle leak 無し
+9. **GUI 終了**: ~~ウィンドウ閉じる → JobObject 経由 全プロセス終了、handle leak 無し~~
+   → **r.md #61 で反転** (`docs/plan_shutdown.md`)。JobObject の強制 kill は
+   crash / hang / 期限超過の **backstop** に格下げし、正常終了は
+   「`Shutdown` を送る → 子が自分でプラグインを畳んで exit する → 親が
+   `try_wait` で観測する (5s で有界)」になった。当時の基準は plugin host が
+   成熟する前のもので、TerminateProcess ではプラグインの `deactivate` /
+   `destroy` / `entry.deinit` が一度も走らない (CLAP spec 違反)。
+   受け入れ基準は「ウィンドウ閉じる → `%LOCALAPPDATA%\daw_01\logs` に
+   `daw_plugin_host exiting` / `daw_audio exiting` が出る、handle leak 無し」。
 
 ### 性能
 - 1 track baseline 比、4 track 並列で latency 1.2x 以下が目標

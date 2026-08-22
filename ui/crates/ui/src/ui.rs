@@ -33,7 +33,7 @@ use crate::id::WidgetId;
 use crate::input::{DroppedFiles, FrameInput, ImeEvent, PointerFrame};
 use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
-use crate::shortcut::{self, ShortcutMap};
+use crate::shortcut::ShortcutMap;
 use crate::text_metrics::TextMetrics;
 use crate::theme::Palette;
 use crate::widgets::WidgetState;
@@ -161,8 +161,8 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// (右ボタン UP で飛ぶ)。`docs/plan_selection_modifiers.md` §4.1。
     secondary_press_pos: Option<(f32, f32)>,
     /// M14 Phase 57: 前フレームに `Ui::set_typing_focus(true)` が立ったか。立っていた場合、
-    /// 今フレーム冒頭の shortcut layer は `is_typing_only_shortcut(name)` (= `select_all`
-    /// `delete` `cut` `copy` `paste`) を `pending_shortcuts` に積まず `keyboard_events`
+    /// 今フレーム冒頭の shortcut layer は `ShortcutMap::is_typing_only(name)` な name を
+    /// `pending_shortcuts` に積まず `keyboard_events`
     /// に残し、focused widget が `Ui::take_typing_shortcut(name)` で拾えるようにする。
     last_typing_focus: bool,
     /// daw_01 r.md #36: **キーボードイベントを伴わずに** 次フレームで発火させる shortcut 名。
@@ -625,9 +625,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // M8 Phase 30 / M14 Phase 57: shortcut layer (frame 頭)。keyboard_events を
         // `shortcut_map.matches` で走査、マッチした events を取り除いて name を
         // `pending_shortcuts` に積む。**前フレームに `set_typing_focus(true)` が立って
-        // いれば**、`is_typing_only_shortcut(name)` が true な name (`select_all` /
-        // `delete` / `cut` / `copy` / `paste`) は global 消費を抑制し、`keyboard_events`
-        // に残して focused widget が `take_typing_shortcut(name)` で拾えるようにする。
+        // いれば**、`ShortcutMap::is_typing_only(name)` な name は global 消費を抑制し、
+        // `keyboard_events` に残して focused widget が `take_typing_shortcut(name)` で拾える
+        // ようにする。
         // text_input が後で `take_keyboard_events_if_focused` で取るのは shortcut 後の残り。
         let modifiers = pointer.modifiers;
         let typing_lock = self.last_typing_focus;
@@ -639,15 +639,17 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // (text_input が `take_typing_shortcut("paste")` で受け取る前に provider から取り出す)。
         let mut typing_paste_pending = false;
         keyboard_events.retain(|ev| {
-            // OS auto-repeat (押しっぱなし) は **global shortcut にしない**。 shortcut は
-            // Delete / D / E のような離散コマンドに bind されるので、 repeat で連射されると
-            // 「Delete 長押しでトラックが次々消える」 類の破壊的挙動になる (daw_01 r.md #43)。
-            // event は `keyboard_events` に残すので、 focused な text_input は従来どおり
-            // Backspace / 矢印の長押しリピートを受け取れる (= 抑止は shortcut 層のみ)。
-            if ev.repeat {
-                return true;
-            }
             if let Some(name) = self.shortcut_map.matches(ev, modifiers) {
+                // OS auto-repeat (押しっぱなし) は **原則 global shortcut にしない**。 shortcut は
+                // Delete / D / E のような離散コマンドに bind されるので、 repeat で連射されると
+                // 「Delete 長押しでトラックが次々消える」 類の破壊的挙動になる (daw_01 r.md #43)。
+                // 例外は `ShortcutMap::set_repeatable` で明示宣言した name だけ (矢印での
+                // nudge のように連続適用が自然なもの、 daw_01 r.md #67)。
+                // 非 repeatable の repeat は `keyboard_events` に残すので、 focused な text_input は
+                // 従来どおり Backspace / 矢印の長押しリピートを受け取れる (= 抑止は shortcut 層のみ)。
+                if ev.repeat && !self.shortcut_map.allows_repeat(name) {
+                    return true;
+                }
                 // (daw_01 #056) typing 中は command 修飾 (Ctrl/Alt/Logo) を持たない printable
                 // 文字キー (英数字 / Space、Shift だけ付きも含む) に bind された shortcut を global
                 // 消費せず、text_input に文字として届ける。daw_01 は R/D/V/... を素キーに bind する
@@ -659,7 +661,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
                 ) && !modifiers.ctrl
                     && !modifiers.alt
                     && !modifiers.logo;
-                if typing_lock && (shortcut::is_typing_only_shortcut(name) || bare_char_key) {
+                if typing_lock && (self.shortcut_map.is_typing_only(name) || bare_char_key) {
                     if name == "paste" {
                         typing_paste_pending = true;
                     }
@@ -1905,6 +1907,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.take_shortcut_raw(name)
     }
 
+    /// このフレームに `name` の shortcut が **何回** triggered されたか (全部 consume)。
+    ///
+    /// `ShortcutMap::set_repeatable` を宣言した shortcut は OS auto-repeat でも発火するため、
+    /// 1 フレームに複数回積まれうる。 [`Self::take_shortcut`] は 1 回しか消費しないので、
+    /// 押しっぱなしの適用量が **フレームレート次第で目減りする** (60fps なら repeat の
+    /// 一部を取りこぼす)。 nudge のように「届いた回数ぶん適用する」 操作はこちらを使う
+    /// (daw_01 r.md #67)。 非 repeatable な shortcut では戻り値は 0 か 1。
+    pub fn take_shortcut_count(&mut self, name: &'static str) -> usize {
+        if self.keyboard_blocked_by_modal() {
+            return 0;
+        }
+        let before = self.pending_shortcuts.len();
+        self.pending_shortcuts.retain(|n| *n != name);
+        before - self.pending_shortcuts.len()
+    }
+
     /// guard なしの shortcut 消費 (library 内部の Tab / arrow focus traversal 用)。
     /// `take_shortcut` の真のモーダル guard をバイパスする (traversal の対象 focusable は
     /// `focusable` 側で既に modal panel 内のみに絞られているため、guard は不要)。
@@ -1934,7 +1952,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// event を `keyboard_events` から remove して true を返す。同じ name を続けて呼ぶと
     /// 2 度目以降は false (`take_shortcut` と同じ pull モデル)。
     ///
-    /// `is_typing_only_shortcut(name)` が false な name (例: `undo`) を渡しても false を返す。
+    /// `ShortcutMap::is_typing_only(name)` が false な name (例: `undo`) を渡しても false を返す。
     /// これは「typing-only に分類されない shortcut は global path で `take_shortcut(name)`
     /// から取るべき」というポリシー強制のため。
     pub fn take_typing_shortcut(&mut self, name: &'static str) -> bool {
@@ -1942,7 +1960,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if self.keyboard_blocked_by_modal() {
             return false;
         }
-        if !shortcut::is_typing_only_shortcut(name) {
+        if !self.shortcut_map.is_typing_only(name) {
             return false;
         }
         let mods = self.pointer.modifiers;

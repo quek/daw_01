@@ -7,12 +7,13 @@
 //! 各 strip:
 //!   - トラック名
 //!   - M (mute) / S (solo) toggle
-//!   - Pan knob
+//!   - Pan knob + その右の数値欄 (drag / 打ち込みで編集可)
 //!   - Volume fader (縦) + L/R peak meter
 
 use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
 use daw_ui_core::{
-    Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButtonStyle, Ui,
+    Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, ScrubableNumberStyle,
+    ToggleButtonStyle, Ui,
 };
 
 use common::automation::{norm_to_plain, plain_to_norm};
@@ -41,10 +42,26 @@ const NAME_BAND_H: f32 = 24.0;
 const DISCLOSURE_ZONE_W: f32 = 22.0;
 const TOGGLE_H: f32 = 22.0;
 const KNOB_SIZE: f32 = 32.0;
-/// Pan ノブ下の数値表示 (`"L50"` / `"C"` / `"R100"`) の font size / 行高 (px)。
+/// Pan ノブ **右** の数値欄 (`"L50"` / `"C"` / `"R100"`) の font size (px)。
 /// send 行のラベル (10px) と同格の副次情報サイズ。
 const PAN_READOUT_FONT: f32 = 10.0;
-const PAN_READOUT_H: f32 = 12.0;
+/// Pan 数値欄の高さ (px)。 ノブ (32px) と縦センタで揃える。 font 10 の行 (12px) に
+/// 上下 2px の余白を足した最小の入力欄。
+const PAN_READOUT_H: f32 = 16.0;
+/// Pan ノブと数値欄の間隔 (px)。
+const PAN_READOUT_GAP: f32 = 4.0;
+/// Pan 数値欄の幅 (px)。 最長表記 `"L100"` が `ScrubableNumberStyle::pad_x` の左右余白
+/// 込みで省略なしに収まる幅 (回帰テスト `pan_readout_fits_field_width` で固定)。
+/// **値によって幅を変えない**: 幅を実測に追随させるとノブが値ごとに左右へ動く。
+const PAN_READOUT_W: f32 = 30.0;
+/// pan 行 (= `[ノブ][gap][数値欄]`) の合計幅 (px)。 この 1 行を strip 中央に寄せる。
+const PAN_ROW_W: f32 = KNOB_SIZE + PAN_READOUT_GAP + PAN_READOUT_W;
+/// Pan 数値欄の内側左右余白 (px)。 `ScrubableNumberStyle::pad_x` の既定 (広い欄向け) より
+/// 詰める理由は無いが、 `PAN_READOUT_W` の根拠になるのでここで名前を付けて共有する。
+const PAN_READOUT_PAD_X: f32 = 4.0;
+/// Pan 数値欄の scrub 感度 (units_per_pixel、 pan は plain -1..=1)。 inspector の
+/// Pan 欄 (`track_inspector::scrub_style`) と同値 = 同じ param は同じ手応え。
+const PAN_READOUT_SENSITIVITY: f32 = 0.004;
 const FADER_W: f32 = 18.0;
 const METER_GAP: f32 = 2.0;
 /// scale 付きステレオメーターの box 幅 (px)。 widget が内部で
@@ -547,9 +564,18 @@ fn draw_strip(
         );
         y += TOGGLE_H + 6.0;
 
-        // Pan knob (plain -1..1 ⇔ knob の正規化 0..1)。 写像は手書きしず
+        // Pan 行 = `[ノブ 32][gap 4][数値欄 30]` を **1 行のまとまり** として strip
+        // 中央に寄せる (r.md #62)。 旧レイアウトはノブの真下に数値行 (12 + 間隔 2px) を
+        // 積んでいて、 strip 1 本あたり縦 14px を数値だけに費やしていた。 横に並べれば
+        // 行高 = ノブ径のままなので、 その 14px はそのまま fader / メーター高に回る。
+        // 参照 DAW (Ardour / Bitwig Mix view / REAPER MCP) はいずれも pan に数値専用の
+        // 行を割かない。 左が「つまみ」・右が「その値」 の並びは、 本プロジェクトの
+        // インスペクタ (ラベル左・値右) とも一致する。
+        //
+        // ノブ本体は plain -1..1 ⇔ 正規化 0..1 の写像を手書きせず、
         // `common::automation` の plain⇔norm SSoT を使う (同じ式を 3 本書かない)。
-        let knob_x = rect.x + (rect.w - KNOB_SIZE) * 0.5;
+        let pan_row_x = rect.x + (rect.w - PAN_ROW_W) * 0.5;
+        let knob_x = pan_row_x;
         let track_idx_for_pan = track_idx;
         // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
         // #109): Pan を音でドラッグ変調する Bitwig 流。knob は値が 0..=1 正規化なので
@@ -581,36 +607,77 @@ fn draw_strip(
             },
             Some(pan_mod.modulation()),
         );
+        push_mod_drag_resync(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
+
+        // Pan の数値欄 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
+        // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
+        // `automation_value` の PAN_FORMAT が SSoT で、 inspector / automation lane と同一。
+        //
+        // **読むだけでなく編集できる**: 従来 daw_01 には pan を数値で正確に指定する手段が
+        // どこにも無く、 ノブのドラッグだけだった。 Ardour はミキサーの数値欄について
+        // 「its precise value is shown in a text field ... that doubles as a way to type in a
+        // numeric value」 と明記している。 ここは `scrubable_number_at` (drag で微調整 /
+        // click で打ち込み / dblclick でセンタへリセット) をそのまま使う = inspector /
+        // automation lane header / export range と同じ idiom (bespoke な編集バッファを作らない)。
+        //
+        // 値は **knob の `displayed_value`** から取る: knob を drag / dblclick reset している
+        // 間は model より widget の preview が先行するので、 app 側の pan を読むと数値だけ
+        // 1 frame 遅れる (逆に数値欄を drag している間は widget 自身の preview が優先される)。
+        let pan_desc = automation_value_display(&pan_target, None);
+        let pan_plain = norm_to_plain(&pan_target, pan_resp.displayed_value);
+        let readout_style = ScrubableNumberStyle {
+            // hover は窪みの既定ではなく 1 段持ち上げた `control`。 80px strip では
+            // 「いまどの欄を掴んでいるか」 が面から離れて見えないと読めない (inspector と同じ判断)。
+            bg_color_hovered: p.control,
+            // scrub 中の帯は accent の electric azure ではなく控えめな `scrub_drag_bg`
+            // (transport のテンポだけが暖色版を使う)。
+            bg_color_dragging: p.scrub_drag_bg,
+            font_size: PAN_READOUT_FONT,
+            pad_x: PAN_READOUT_PAD_X,
+            sensitivity: PAN_READOUT_SENSITIVITY,
+            range: Some(pan_desc.range),
+            ..ScrubableNumberStyle::from_palette(p)
+        };
+        let readout_resp = ui.scrubable_number_at(
+            ("mixer_strip_pan_value", layout_idx),
+            Rect {
+                x: pan_row_x + KNOB_SIZE + PAN_READOUT_GAP,
+                y: y + (KNOB_SIZE - PAN_READOUT_H) * 0.5,
+                w: PAN_READOUT_W,
+                h: PAN_READOUT_H,
+            },
+            pan_plain,
+            // dblclick reset = センタ (`"C"`)。 ノブの dblclick (正規化 0.5) と同じ着地点。
+            0.0,
+            pan_desc.format,
+            &readout_style,
+            move |v| {
+                // 範囲は widget が `style.range` で clamp 済だが、 表示レンジの SSoT
+                // (`AutomationValueDisplay`) を通してから model 単位へ落とす。
+                #[allow(clippy::cast_possible_truncation)]
+                let pan = pan_desc.clamp_plain(v) as f32;
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetTrackPan { track: track_idx_for_pan, pan })
+                })
+            },
+            None,
+            // modulation の表示・depth ドラッグ面は **ノブ 1 つに集約** する
+            // (同じ param の変調を 2 箇所で編集できる状態を作らない)。
+            None,
+        );
+        // gesture (= undo 1 step + オートメーション記録) は **ノブと数値欄で 1 本**。
+        // 同じ `(track, Pan)` を key にするので、 どちらの drag でも Begin / End は
+        // 1 回ずつになるよう OR を取ってから edge 検知に渡す。 text 打ち込みは 1 回の
+        // `SetTrackPan` で完結する (= それ自体が 1 undo step) ので gesture にしない。
         push_param_gesture_edges(
             ui,
             track_idx,
             AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
             "Pan",
             was_dragging_pan,
-            pan_resp.dragging,
+            pan_resp.dragging || readout_resp.dragging,
         );
-        push_mod_drag_resync(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
         y += KNOB_SIZE + 2.0;
-
-        // Pan の数値表示 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
-        // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
-        // `automation_value` の PAN_FORMAT が SSoT で、 inspector / automation lane と同一。
-        //
-        // 値は **knob の `displayed_value`** から取る: drag / dblclick reset 中は model より
-        // widget の preview が先行するので、 app 側の pan を読むと数値だけ 1 frame 遅れる。
-        let pan_plain = norm_to_plain(&pan_target, pan_resp.displayed_value);
-        let pan_text = automation_value_display(&pan_target, None).format_number(pan_plain);
-        let pan_text_w = ui.measure_text(&pan_text, PAN_READOUT_FONT);
-        ui.label_at(
-            ("mixer_strip_pan_value", layout_idx),
-            &pan_text,
-            rect.x + (rect.w - pan_text_w) * 0.5,
-            y,
-            PAN_READOUT_FONT,
-            // drag 中は明色で「今触っている値」を強調 (fader の % 表示と同 idiom)。
-            if pan_resp.dragging { p.text } else { p.text_dim },
-        );
-        y += PAN_READOUT_H + 2.0;
     }
 
     // 縦 fader + L/R peak meter。 Sends セクションを持つ strip では、 その
@@ -706,15 +773,15 @@ fn sends_band_height(n_sends: usize) -> f32 {
 /// Sends band 側を縮めて (= band 内を縦スクロールさせて) 守る。
 const MIN_FADER_H: f32 = 28.0;
 
-/// strip 上部 (pad + 名前 + M/S + pan knob + pan 数値 + fader 上マージン) が固定で食う高さ。
+/// strip 上部 (pad + 名前 + M/S + pan 行 + fader 上マージン) が固定で食う高さ。
 /// `draw_strip` の y 積み上げと一致させること (`debug_assert` で固定)。
+/// r.md #62 で pan 数値をノブの右へ移したので、 pan 行の高さ = ノブ径のみ (旧実装は
+/// ここに数値行 `PAN_READOUT_H + 2.0` が積まれていて strip 1 本あたり 14px 高かった)。
 const STRIP_FADER_TOP_OFFSET: f32 = 6.0
     + TOP_LABEL_H
     + TOGGLE_H
     + 6.0
     + KNOB_SIZE
-    + 2.0
-    + PAN_READOUT_H
     + 2.0
     + 4.0;
 /// fader 下端から strip 下端までの固定余白 (`draw_strip` の `pad + 12.0`)。
@@ -1003,10 +1070,11 @@ mod tests {
         );
     }
 
-    /// Pan の数値表示 (r.md #47) は最長表記でも strip 幅に収まる。 `label_at` は clip も
-    /// ellipsis も持たないので、 溢れると隣の strip 背景へグリフが漏れる (#13 と同じ症状)。
+    /// Pan の数値欄 (r.md #62 でノブの右へ移設) は、 最長表記 `"L100"` が欄の内側
+    /// (左右 `pad_x`) に省略なく収まり、 かつ `[ノブ][gap][欄]` の 1 行が strip の内側幅に
+    /// 収まる。 欄幅は値によらず固定なので、 ここが破れるとノブ位置ごと崩れる。
     #[test]
-    fn pan_readout_fits_strip_width() {
+    fn pan_readout_fits_field_width() {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
@@ -1018,15 +1086,23 @@ mod tests {
             w = ui.measure_text(&widest, PAN_READOUT_FONT);
         });
 
-        let avail = STRIP_WIDTH - 6.0 * 2.0; // draw_strip の pad = 6.0
+        // 欄の文字領域 = 幅 − 左右 pad (= 表示と text input 双方の内側余白)。
+        let text_avail = PAN_READOUT_W - PAN_READOUT_PAD_X * 2.0;
         assert_eq!(widest, "L100", "最長 pan 表記");
         assert!(
-            w <= avail,
-            "'{widest}' ({w}px @ {PAN_READOUT_FONT}pt) は strip 内側幅 {avail}px に収まる"
+            w <= text_avail,
+            "'{widest}' ({w}px @ {PAN_READOUT_FONT}pt) は数値欄の文字領域 {text_avail}px に収まる"
+        );
+
+        let inner_w = STRIP_WIDTH - 6.0 * 2.0; // draw_strip の pad = 6.0
+        assert!(
+            PAN_ROW_W <= inner_w,
+            "pan 行 [ノブ+gap+数値欄] {PAN_ROW_W}px は strip 内側幅 {inner_w}px に収まる"
         );
     }
 
-    /// strip の y 積み上げと `STRIP_FADER_TOP_OFFSET` の一致 (pan 数値行を足したので更新済)。
+    /// strip の y 積み上げと `STRIP_FADER_TOP_OFFSET` の一致。 r.md #62 で pan 数値を
+    /// ノブの右へ移したので、 pan 行は **ノブ径のみ** を消費する (旧実装比 14px 短縮)。
     /// `draw_strip` 側は debug_assert でしか守られていないため、 定数側をここで固定する。
     #[test]
     fn strip_fader_top_offset_matches_stack() {
@@ -1034,10 +1110,8 @@ mod tests {
             + TOP_LABEL_H
             + TOGGLE_H
             + 6.0 // M/S 行の下マージン
-            + KNOB_SIZE
-            + 2.0 // knob → pan 数値
-            + PAN_READOUT_H
-            + 2.0 // pan 数値 → fader 上マージン
+            + KNOB_SIZE // pan 行 = ノブ径 (数値欄は横並びなので行高を増やさない)
+            + 2.0 // pan 行 → fader 上マージン
             + 4.0; // fader_top の +4.0
         assert!(
             (STRIP_FADER_TOP_OFFSET - stack).abs() < 1e-6,

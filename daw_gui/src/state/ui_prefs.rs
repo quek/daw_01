@@ -98,6 +98,14 @@ pub struct UiPrefs {
     /// トラックの (表示中) note は淡色ゴーストで描画され、hit-test / 選択 / 編集から除外される。
     /// 凡例がトラック単位なのでロックもトラック単位 (そのトラックの表示クリップ全部に効く)。
     /// session 内 transient (非永続)。legend のロックトグルで増減。
+    ///
+    /// **これは「ユーザーの意思」 であって効力ではない** (r.md #64)。 実際に効くのは
+    /// `AppData::is_pianoroll_clip_locked_in` = 「凡例に行が出ているトラック
+    /// (`AppData::pianoroll_lock_rows_in`)」 ∧ 「この集合に居る」 の派生値。 凡例は複数クリップ
+    /// 同時表示のときだけ出るので、 単一表示に絞ると **ロックは自動的に効かなくなり**、
+    /// 複数表示に戻すと元どおり効く。 こうしないと「ロック中トラックのクリップを 1 つだけ開くと
+    /// ゴーストのまま編集できず、解除ボタンも画面に無い」 詰みが起きる。
+    /// 効力を毎回導出することで『効いている ⟺ 解除ボタンが見えている』 が構造的に保たれる。
     pub locked_pr_tracks: std::collections::HashSet<u32>,
     /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
     /// ノートの長さ (拍)。次の新規追加時のデフォルト長として使う。session 内
@@ -183,6 +191,15 @@ pub struct UiPrefs {
     /// state (project save しない)。 Highlight mode が前提 (Fold mode は
     /// widget 側で既に in-scale pitch を push する)。
     pub snap_on_draw: bool,
+    /// r.md #65: プラグインエディタ窓の位置 / client サイズ (device_id → geometry)。
+    /// 窓を所有するのは daw_plugin_host なので、値の一次情報は
+    /// `PluginEvent::SlotGuiGeometry` (open 時 + ドラッグ確定時 + close 直前) だけ。
+    /// ここは **その最新値のキャッシュ**で、`ViewState.plugin_editor_windows` として
+    /// プロジェクトに保存され、次に開くときに `OpenSlotGuiEmbedded` へ載って復元される。
+    /// 「見方の都合」なので更新しても dirty は立てない (memory `project_dirty_flag_rule`)。
+    pub plugin_editor_windows:
+        std::collections::HashMap<u64, common::model::EditorWindowGeometry>,
+
     /// Phase 7 B5 (`docs/plan_scale.html` §4.4): piano_roll が Fold mode か。
     /// `true` で out-of-scale 行を非表示 (Ableton K キー Fold to Scale 相当)、
     /// `false` で Highlight mode (root 行強調 + in-scale 通常 + out 行 dim)。

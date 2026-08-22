@@ -876,7 +876,10 @@ mod tests {
     use crate::model::{
         Clip, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
     };
-    use crate::model::{AudioEditorViewState, ClipKey, FollowMode, PianoRollViewState, ViewState};
+    use crate::model::{
+        AudioEditorViewState, ClipKey, EditorWindowGeometry, FollowMode, PianoRollViewState,
+        ViewState,
+    };
     use tempfile::tempdir;
 
     /// per-clip view + globals を含む代表的な `ViewState`。
@@ -919,6 +922,10 @@ mod tests {
                 ClipKey { track_id: 3, clip_id: 7 },
                 AudioEditorViewState { start_beat: 1.5, len_beats: 8.0 },
             )],
+            plugin_editor_windows: vec![
+                (7, EditorWindowGeometry { x: 240, y: 160, width: 880, height: 162 }),
+                (11, EditorWindowGeometry { x: -40, y: 900, width: 1105, height: 687 }),
+            ],
         }
     }
 

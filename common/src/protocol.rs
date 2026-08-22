@@ -378,6 +378,18 @@ pub enum AudioCommand {
     /// Drop the `ProcessData` mapping for `device_id` after the plugin
     /// instance is being torn down.
     ClosePluginShmem { device_id: u64 },
+    /// (r.md #61) **プロセスを正常終了しろ**。daw_gui の終了シーケンス
+    /// (`daw_gui::shutdown`) だけが送る。
+    ///
+    /// 受け側は receive loop を抜け、CPAL stream を明示的に pause + drop
+    /// (= WASAPI デバイスの解放) してから `main` を return する。
+    /// 「終わった」の真実源は **プロセスの exit そのもの**で、返信 event は
+    /// 用意しない — 「返事を書けた」と「デバイスを解放し終えた」は別の事実で、
+    /// 親が欲しいのは後者だけだから (親は `Child::try_wait` で観測する)。
+    ///
+    /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流するので、
+    /// 「終わり方」の実装は 1 つしかない。
+    Shutdown,
 }
 
 // =====================================================================
@@ -509,7 +521,18 @@ pub enum PluginCommand {
     RequestAllStates,
     /// Open the plugin editor (top-level window は plugin-host プロセス所有)。
     /// `title` is the window caption daw_gui composed.
-    OpenSlotGuiEmbedded { device_id: u64, title: String },
+    ///
+    /// r.md #65: `geometry` は前回このプロジェクトで閉じたときの窓の位置 /
+    /// client サイズ (`ViewState.plugin_editor_windows` 由来、`None` = 初回)。
+    /// 位置は常に復元し、**サイズはプラグインが `canResize` / `can_resize` で
+    /// リサイズ可と答えたときだけ**復元する (固定サイズ GUI に前回のサイズを
+    /// 押し付けない)。CLAP の GUI 手順 9 「resizable かつ前回セッションのサイズが
+    /// 分かっているときだけ `set_size`」と同じ規約。
+    OpenSlotGuiEmbedded {
+        device_id: u64,
+        title: String,
+        geometry: Option<crate::model::EditorWindowGeometry>,
+    },
     CloseSlotGui { device_id: u64 },
     /// r.md #55: **開いているエディタ窓を全部閉じる** (`Ctrl+Shift+W`)。
     ///
@@ -562,6 +585,23 @@ pub enum PluginCommand {
         device_id: u64,
         regions: Vec<AraRegionUpdate>,
     },
+    /// (r.md #61) **プロセスを正常終了しろ**。daw_gui の終了シーケンス
+    /// (`daw_gui::shutdown`) だけが送る。
+    ///
+    /// これは「全 plugin の unload + worker pool 停止 + プロセス終了」の
+    /// **合成**であり、unload の実装は [`PluginCommand::UnloadAllPlugins`] と
+    /// **同じ 1 本** (`PluginHost::unload_all_devices` → `teardown_device` →
+    /// `teardown_plugin`) を通る。列挙元も同じく plugin_host 自身の
+    /// `instances` なので、daw_gui の帳簿には一切依存しない
+    /// (`UnloadAllPlugins` の doc 参照)。「全部畳め」の実装が 2 つに割れないよう、
+    /// このコマンドは *追加で何をするか* (pool 停止 + exit) だけを足す。
+    ///
+    /// 完了の真実源は **プロセスの exit そのもの**で、返信 event は用意しない
+    /// — 「返事を書けた」と「DLL を unload し終えた」は別の事実で、親が欲しい
+    /// 保証は後者だけだから (親は `Child::try_wait` で観測する)。
+    ///
+    /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流する。
+    Shutdown,
 }
 
 // =====================================================================
@@ -634,11 +674,20 @@ pub enum PluginEvent {
     },
     /// Reply to `RequestAllStates`: one entry per loaded device.
     AllPluginStates { entries: Vec<SlotState> },
-    /// GUI opened at the requested size.
-    SlotGuiOpened {
+    /// r.md #65: エディタ窓のジオメトリが確定した。open 直後と、以後
+    /// **ユーザーのドラッグが終わった / プラグイン起点のリサイズが済んだ**
+    /// たびに送る (ドラッグ中は送らない — `WM_EXITSIZEMOVE` で 1 回)。
+    ///
+    /// 窓を所有するのは plugin_host なので、位置 / サイズの一次情報はここにしか
+    /// 無い。daw_gui はこれを `ui_prefs.plugin_editor_windows` に貯め、保存時に
+    /// `ViewState` へ書き出して次回 open で復元する。
+    ///
+    /// 旧 `SlotGuiOpened { width, height }` はこれに置き換えた: 受け手
+    /// (`on_gui_opened`) が空実装で「開いた」以上の意味を運んでおらず、
+    /// 同じ内容を 2 つの message で表す方が SSoT を割る。
+    SlotGuiGeometry {
         device_id: u64,
-        width: u32,
-        height: u32,
+        geometry: crate::model::EditorWindowGeometry,
     },
     /// Plugin-initiated close (X button handled by plugin, or `closed`).
     SlotGuiClosed { device_id: u64 },
@@ -854,6 +903,34 @@ mod tests {
             generation: 9,
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// r.md #65: エディタ窓のジオメトリは wire を渡って往復する
+    /// (daw_gui → plugin_host が復元値、plugin_host → daw_gui が観測値)。
+    /// 位置は **マルチモニタで負値になり得る**ので、そこも往復させる。
+    #[test]
+    fn editor_window_geometry_roundtrips_both_directions() {
+        let geometry = crate::model::EditorWindowGeometry {
+            x: -1920,
+            y: -8,
+            width: 1105,
+            height: 687,
+        };
+        let open = PluginCommand::OpenSlotGuiEmbedded {
+            device_id: 42,
+            title: "Plugin — Renoise Redux".to_string(),
+            geometry: Some(geometry),
+        };
+        assert_eq!(roundtrip(&open), open);
+        // 初回 open (保存値なし)。
+        let fresh = PluginCommand::OpenSlotGuiEmbedded {
+            device_id: 42,
+            title: "Plugin — Test".to_string(),
+            geometry: None,
+        };
+        assert_eq!(roundtrip(&fresh), fresh);
+        let report = PluginEvent::SlotGuiGeometry { device_id: 42, geometry };
+        assert_eq!(roundtrip(&report), report);
     }
 
     #[test]

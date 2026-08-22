@@ -51,6 +51,9 @@ mod draw;
 use draw::*;
 mod geometry;
 use geometry::*;
+/// r.md #67: 「選択集合に共通の delta を端で縮める」 規則は drag (widget) と
+/// カーソルキー nudge (handler) の共有 SSoT。
+pub(crate) use geometry::{clamp_shared_delta, clamp_shared_pitch_delta};
 mod run;
 pub use run::piano_roll;
 
@@ -912,6 +915,15 @@ struct NoteDragAnchor {
     start_beat: f64,
     pitch: u8,
     len_beats: f64,
+    /// この note が **content-local 拍 0** に来る song-absolute 拍
+    /// (= 所属クリップの content 原点、`PrContent.clip_starts[clip_slot]`)。
+    ///
+    /// r.md #67 の集合クランプの下限。 note は共有 content への相対位置で保存され、
+    /// model 側 (`set_note_positions`) が content-local 拍を 0 で clamp するので、
+    /// widget が song-absolute 0 で clamp すると「widget では動いたのに handler で
+    /// 潰れる」 ずれになる (小節 5 から始まるクリップで顕著)。 複数クリップ同時表示では
+    /// note ごとに原点が違うので anchor 単位で持つ。
+    min_start_beat: f64,
 }
 
 /// 1 度の note drag セッション (move / resize / 複数同時)。
@@ -948,10 +960,11 @@ struct NoteDragSession {
 /// 左方向も対象 (左ドラッグで既定長より短く作るとき右へ振る手間を不要にする)。
 const NOTE_CREATE_DRAG_PX: f32 = 4.0;
 
-/// ドラッグで決める note 長の下限 (拍)。snap unit 無効時の floor。
-/// daw_01 add_note 側が更に `0.0625` (1/16) に clamp するが、 widget preview と commit を
-/// 一致させるため widget でも下限を設ける (resize の `0.05` floor と同値)。
-const NOTE_CREATE_MIN_LEN: f64 = 0.05;
+/// r.md #68 同件: ノート長の下限は **model と共有** する
+/// (`AppData::add_note` / `resize_notes` / `resize_note` の clamp と同じ値)。
+/// widget 側だけ別リテラル (旧: `0.05`) を持つと、 snap off (Alt) の端 drag /
+/// ドラッグ作成で「ゴーストより長く確定する」 = preview ≠ commit になる。
+const MIN_NOTE_LEN: f64 = common::model::MIN_NOTE_LEN_BEATS;
 
 /// 空白ダブルクリック作成 session (Bitwig 流の「ダブルクリックのボタンを放さず
 /// 左右ドラッグで note 長を決める」)。

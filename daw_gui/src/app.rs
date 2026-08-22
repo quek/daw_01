@@ -249,6 +249,9 @@ impl AppData {
                 singers: Vec::new(),
                 talk_speakers: Vec::new(),
                 voicevox_job,
+                spawned_engine: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::state::voicevox::VoicevoxEngineSlot::default(),
+                )),
                 voicevox_launch_attempted: false,
                 lipsync_gen: 0,
                 lipsync_inflight: std::collections::HashSet::new(),
@@ -280,6 +283,7 @@ impl AppData {
                 recording_last_beat: std::collections::HashMap::new(),
                 last_sent_recording_lanes: std::collections::HashSet::new(),
                 preview_note: None,
+                nudge_audition: None,
                 midi_input_label: String::new(),
                 step_cursor_beat: 0.0,
                 step_size_beats: DEFAULT_NOTE_DURATION,
@@ -302,6 +306,7 @@ impl AppData {
                 arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
                 arrange_header_w: 160.0,
                 piano_roll_views: std::collections::HashMap::new(),
+                plugin_editor_windows: std::collections::HashMap::new(),
                 multi_clip_view: common::model::PianoRollViewState::default(),
                 multi_clip_view_key: Vec::new(),
                 locked_pr_tracks: std::collections::HashSet::new(),
@@ -372,19 +377,20 @@ impl AppData {
                 home_toggle_at_first: false,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
-                arrange_primary_lane_content_top: None,
                 arrange_hover_content: None,
                 arrange_dragging_track_volume: None,
                 arrange_default_scrub_active: None,
                 arrange_hovered_automation_lane: None,
                 piano_roll_lyric_editing: false,
+                pianoroll_viewport: None,
                 audio_editor_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 inspector_body_h: 800.0,
                 inspector_device_panel_h: 0.0,
                 last_pianoroll_grid_size: (0.0, 0.0),
                 pending_pianoroll_fit: false,
-                last_arrange_canvas_size: (0.0, 0.0),
+                last_arrange_lanes_size: (0.0, 0.0),
+                last_arrange_rows: Vec::new(),
                 resource_panel_open: false,
                 undo_history_follow_pos: 0,
                 plugin_picker_entries,
@@ -434,7 +440,6 @@ impl AppData {
                 recovery_candidates,
                 show_recovery_modal,
                 dirty_guard: None,
-                should_quit: false,
                 guard_after_save: None,
                 guard_pending_action: None,
                 export_dialog_open: false,
@@ -449,6 +454,8 @@ impl AppData {
                 main_focused: true,
                 ..Default::default()
             },
+            // r.md #61: 起動直後は `Running`。終了要求で `Draining` に入る。
+            shutdown: crate::shutdown::ShutdownState::default(),
             // r.md #50: メーター設定の初期値は app_config から。`active` は
             // 「パネルが描かれているか」で、view が毎フレーム同期する。
             meter_control: std::sync::Arc::new(std::sync::Mutex::new(
@@ -512,6 +519,24 @@ impl AppData {
     /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
     /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
     pub fn handle_event(&mut self, event: AppEvent) {
+        // (r.md #61) 終了シーケンス中は **全 event を捨てる**。
+        //
+        // `Draining` は「子プロセスの teardown を待つ間もイベントループが回り
+        // 続ける」という新しい窓で、旧実装 (`should_quit` を立てた同じフレームで
+        // `exit()`) には存在しなかった。ここを開けたままにすると、
+        //   - 「終了処理中…」の下に残った picker のクリックが通る
+        //     (= 畳ませた plugin host へ `SetSlotPlugin` が飛ぶ)
+        //   - 30 秒周期の `AutosaveTick` が recovery ファイルを書き直す
+        // といった「もう終わると決めた後の副作用」が起きる。
+        //
+        // export gate と違って **allow-list ではなく全遮断**にできるのは、
+        // 終了が必ず `DRAIN_TIMEOUT` で終端するから — 「落としすぎて永久ロック」
+        // という export gate の失敗モードが原理的に存在しない。完了判定
+        // (`poll_shutdown`) は event ではなく `try_wait` で回っている。
+        if self.shutdown.is_shutting_down() {
+            tracing::debug!(?event, "event dropped during shutdown");
+            return;
+        }
         // この event の ambient undo scope を確定する (1 event 内の複数 edit_song は
         // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
         // 同時に、 この event が snapshot を積んだときの履歴リスト用ラベル
@@ -560,6 +585,8 @@ impl AppData {
             AppEvent::Plugin(ev) => self.dispatch_plugin_event(ev),
             // New / Open は現在のプロジェクトを破棄するので、 dirty なら
             // 先に保存確認ダイアログを挟む (clean なら即実行)。
+            // r.md #61: 全終了経路の合流点。
+            AppEvent::Quit(req) => self.request_quit(req),
             AppEvent::New => self.request_guarded_action(DirtyGuardAction::New),
             AppEvent::Open => self.request_guarded_action(DirtyGuardAction::Open),
             AppEvent::Save => {
@@ -1272,7 +1299,8 @@ impl AppData {
                         .and_then(|t| t.clips.get(r.clip as usize))
                         .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.duration_beats))
                     {
-                        self.ui_prefs.last_note_duration_beats = dur.max(0.0625);
+                        self.ui_prefs.last_note_duration_beats =
+                            dur.max(common::model::MIN_NOTE_LEN_BEATS);
                     }
                 }
             }
@@ -1287,6 +1315,15 @@ impl AppData {
             }
             AppEvent::TogglePianoRollTrackLock(track_id) => {
                 self.toggle_pianoroll_track_lock(track_id);
+            }
+            AppEvent::NudgeSelectedNoteTime { step, steps } => {
+                self.nudge_selected_notes_time(step, steps);
+            }
+            AppEvent::NudgeSelectedNoteLength { step, steps } => {
+                self.nudge_selected_notes_length(step, steps);
+            }
+            AppEvent::NudgeSelectedNotePitch { octave, steps } => {
+                self.nudge_selected_notes_pitch(octave, steps);
             }
             AppEvent::OpenPluginPicker => {
                 self.ui_ephemeral.plugin_picker_query.clear();
@@ -1339,10 +1376,10 @@ impl AppData {
             AppEvent::SetArrangeTrackRowH(h) => {
                 // 上限は viewport 高に近いところまで広げる (1 トラックを画面いっぱいに
                 // 表示できるようにする)。 viewport 高はここでは未知なので大きめに取り、
-                // 実描画時は area.h と min を取って絶対に visible 数 0 にならない構造で
-                // 描画側 (`tracks_visible = ((area.h - RULER_H) / row_h).max(1.0)`) が
-                // 吸収する。
-                self.ui_prefs.arrange_track_row_h = h.clamp(16.0, 2000.0);
+                // 実描画時は lanes 高さと min を取って絶対に visible 数 0 にならない構造で
+                // 描画側 (`view_build` の `tracks_visible`) が吸収する。
+                self.ui_prefs.arrange_track_row_h =
+                    h.clamp(MIN_ARRANGE_ROW_H, MAX_ARRANGE_ROW_H);
             }
             AppEvent::SetArrangeHeaderW(w) => {
                 // track 名が読める下限と lanes を潰さない上限で clamp。 widget は

@@ -30,6 +30,10 @@ pub(super) fn render_arrangement_heavy(
     // **`viewport_key_hash` の材料にしてはいけない** (hover でアレンジ全体が再構築される)。
     hovered_clip: Option<ClipKey>,
     clip_content: HashMap<ClipKey, ClipContentDraw>,
+    // r.md #68: Shift + 端 drag のときだけ入る「伸縮済みの中身」。 空のときは
+    // ゴーストも `clip_content` をそのまま描く (トリム / 移動では確定後の中身が
+    // base と同一 = 中身は 1px も動かない)。
+    stretch_ghost_content: HashMap<ClipKey, ClipContentDraw>,
     selected_set: HashSet<ClipKey>,
     selected_tracks_for_heavy: Vec<u32>,
     selected_automation_clips_set_for_heavy: HashSet<AutomationClipKey>,
@@ -132,7 +136,7 @@ pub(super) fn render_arrangement_heavy(
                             draw_clip_fade_curves(
                                 hctx,
                                 r,
-                                c.len_beats,
+                                content_map(c, view_copy, lanes),
                                 &c.fades,
                                 clip_effective_fill(c, t.kind, &style_copy),
                                 &style_copy,
@@ -247,13 +251,16 @@ pub(super) fn render_arrangement_heavy(
                             continue;
                         }
                         let is_selected = selected_set.contains(&key);
+                        // r.md #68: 中身の x 写像は content 原点 + ビューのズームだけ
+                        // (clip の表示幅は分母に入らない = 端 drag しても中身は動かない)。
+                        let map = content_map(c, view_copy, lanes);
                         match content {
                             ClipContentDraw::Audio { events } => {
                                 draw_clip_waveform_inner(
                                     hctx,
                                     key,
                                     r,
-                                    c.len_beats,
+                                    map,
                                     events,
                                     is_selected,
                                     lanes,
@@ -264,7 +271,7 @@ pub(super) fn render_arrangement_heavy(
                                     "audio_clip_wf",
                                 );
                             }
-                            ClipContentDraw::Midi { notes, len_beats } => {
+                            ClipContentDraw::Midi { notes } => {
                                 // r.md #20: ノート色のコントラストは **実際に塗られる背景色** で計算する。
                                 // 選択でも fill は clip 本来の色のまま (draw_selection_overlay はリングのみ)
                                 // なので、 旧来の is_selected → clip_selected_fill(黄) 前提は誤り
@@ -274,7 +281,7 @@ pub(super) fn render_arrangement_heavy(
                                     hctx,
                                     r,
                                     notes,
-                                    *len_beats,
+                                    map,
                                     clip_bg,
                                     &style_copy,
                                     lanes.x,
@@ -328,186 +335,14 @@ pub(super) fn render_arrangement_heavy(
                     &style_copy,
                 );
             });
-            if let Some((nd, bd, td)) = drag_overlay_clone {
-                draw_drag_preview(
-                    hctx,
-                    &nd,
-                    &tracks_owned,
-                    &tops_owned_for_heavy,
-                    view_copy,
-                    lanes,
-                    &style_copy,
-                    tracks_owned.len(),
-                    bd,
-                    td,
-                    drag_overlay_min_len,
-                    &clip_content,
-                );
-            }
-            // M14 Phase 63k (#025): audio_drag ghost overlay (drag 中の dB / fade preview + label)。
-            // commit-by-release のため clip_rect_anchor + 計算済 outcome から preview rect / line を
-            // 描き直す。 cached 外なので 1 frame 1 描画 (drag 中のみ)、 release frame で session が
-            // take されてから次 frame は ghost 消滅。 base 描画 (cached 内) も同 frame 表示されるが、
-            // ghost が上に重なって最新値を user に見せる。
-            if let Some(ad) = audio_drag_overlay {
-                draw_audio_drag_ghost(hctx, &ad, beat_per_px, &style_copy);
-            }
-            // M14 Phase 63n-2 (#028): automation_point_drag ghost (新位置の point dot を半透明で重ねる)。
-            // anchor 固定の `body_rect_anchor` / `clip_rect_anchor` で beat_to_px / y 軸を計算 (drag
-            // 中の view scroll 耐性)。 release commit と同じ式で next position を出すため SSoT を
-            // 共有 (commit と overlay が同一値で確定)。 alt は session の `last_alt` を真値とする。
-            if let Some(pd) = point_drag_overlay {
-                let dx = pd.last_mouse.0 - pd.anchor_mouse.0;
-                let dy = pd.last_mouse.1 - pd.anchor_mouse.1;
-                let beat_to_px =
-                    f64::from(pd.body_rect_anchor.w) / view_copy.len_beats.max(1e-6);
-                let raw_dt = f64::from(dx) / beat_to_px;
-                let raw_abs = pd.clip_start_beat + pd.anchor_time_beat + raw_dt;
-                let snapped_abs =
-                    view_copy.snap.snap_beat(raw_abs, pd.last_alt, zoom_x_px_per_beat);
-                let next_local =
-                    (snapped_abs - pd.clip_start_beat).clamp(0.0, pd.clip_len_beats.max(0.0));
-                let next_value = (pd.anchor_value_norm
-                    - dy / pd.clip_rect_anchor.h.max(1.0))
-                .clamp(0.0, 1.0);
-                let abs_beat = pd.clip_start_beat + next_local;
-                #[allow(clippy::cast_possible_truncation)]
-                let px = pd.body_rect_anchor.x
-                    + ((abs_beat - view_copy.start_beat) * beat_to_px) as f32;
-                let py = pd.clip_rect_anchor.y + (1.0 - next_value) * pd.clip_rect_anchor.h;
-                let r = style_copy.automation_point_radius_px;
-                hctx.push_rect(RectCommand {
-                    rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
-                    fill: style_copy.clip_selected_fill,
-                    // 枠が乗るのは automation lane 面 (パレット自身のクローム面) と
-                    // `clip_selected_fill` なので、極性固定インクではなくテーマ従属の `text`
-                    // (ライトでは暗くなり、明るい lane / 黄 dot の双方で縁が立つ)。
-                    border: p.text,
-                    border_width: 1.5,
-                    radius: [r; 4],
-                    clip_rect: Some(pd.body_rect_anchor),
-                });
-            }
-            // M14 Phase 63n-3 (#028): automation_clip_drag ghost (drag 中の preview rect、 cross-lane
-            // drop 解決込み)。 fill / border / badge は MIDI clip drag preview と完全対称。
-            if let Some(acd) = automation_clip_drag_overlay {
-                let is_move_clone =
-                    matches!(acd.kind, ClipDragKind::Move) && acd.last_ctrl;
-                let (fill, border, badge_glyph) = if is_move_clone {
-                    if acd.last_shift {
-                        (
-                            style_copy.clip_clone_indep_fill,
-                            style_copy.clip_clone_indep_border,
-                            Some('+'),
-                        )
-                    } else {
-                        (
-                            style_copy.clip_clone_linked_fill,
-                            style_copy.clip_clone_linked_border,
-                            Some('⇌'),
-                        )
-                    }
-                } else {
-                    (
-                        style_copy.clip_selected_fill,
-                        style_copy.clip_selected_border,
-                        None,
-                    )
-                };
-                // beat_to_px は現在フレームの lanes.w から算出 (全 lane body は幅 lanes.w で同一、
-                // for_each_visible_lane 参照)。 press 時の anchor 幅でなく現幅を使うことで drag 中の
-                // window / header resize に追従する。
-                let beat_to_px = f64::from(lanes.w) / view_copy.len_beats.max(1e-6);
-                let raw_beat_delta = if beat_to_px > 1e-9 {
-                    f64::from(acd.last_mouse.0 - acd.anchor_mouse.0) / beat_to_px
-                } else {
-                    0.0
-                };
-                // snap pivot = anchors[0] (= 掴んだ clip)、 release commit と同 SSoT。
-                let beat_delta = compute_automation_clip_drag_beat_delta(
-                    &acd,
-                    raw_beat_delta,
-                    &view_copy.snap,
-                    zoom_x_px_per_beat,
-                );
-                let min_len = if view_copy.snap.is_active(acd.last_alt) {
-                    view_copy
-                        .snap
-                        .beat_unit(zoom_x_px_per_beat)
-                        .map_or(0.05, |u| u.max(0.05))
-                } else {
-                    0.05
-                };
-                // #071: 単一選択は cursor で cross-lane drop を preview、 複数選択は各 anchor の自 lane に
-                // 留め horizontal time-shift を preview (release commit の cross-lane policy と一致)。
-                let single = acd.anchors.len() == 1;
-                let pad = style_copy.automation_clip_v_pad_px;
-                for a in &acd.anchors {
-                    let (g_start, g_len) = match acd.kind {
-                        ClipDragKind::Move => ((a.start_beat + beat_delta).max(0.0), a.len_beats),
-                        ClipDragKind::ResizeRight => {
-                            (a.start_beat, (a.len_beats + beat_delta).max(min_len))
-                        }
-                        ClipDragKind::ResizeLeft => {
-                            let max_start = a.start_beat + a.len_beats - min_len;
-                            let new_start = (a.start_beat + beat_delta).clamp(0.0, max_start);
-                            let actual = new_start - a.start_beat;
-                            (new_start, (a.len_beats - actual).max(min_len))
-                        }
-                    };
-                    let target_body = if single && matches!(acd.kind, ClipDragKind::Move) {
-                        automation_lane_key_at_y(
-                            &tracks_owned,
-                            &tops_owned_for_heavy,
-                            view_copy.track_row_h,
-                            header_pane_copy.x,
-                            header_pane_copy.w,
-                            lanes.x,
-                            lanes.w,
-                            &style_copy,
-                            acd.last_mouse.1,
-                        )
-                        .map_or(a.body_rect, |(_, body)| body)
-                    } else {
-                        a.body_rect
-                    };
-                    let g_clip_y = target_body.y + pad;
-                    let g_clip_h = (target_body.h - pad * 2.0).max(2.0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let g_x =
-                        target_body.x + ((g_start - view_copy.start_beat) * beat_to_px) as f32;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let g_w = ((g_len * beat_to_px) as f32).max(2.0);
-                    let ghost_rect = Rect { x: g_x, y: g_clip_y, w: g_w, h: g_clip_h };
-                    if ghost_rect.x + ghost_rect.w >= lanes.x
-                        && ghost_rect.x <= lanes.x + lanes.w
-                    {
-                        hctx.push_rect(RectCommand {
-                            rect: ghost_rect,
-                            fill,
-                            border,
-                            border_width: style_copy.clip_selected_border_w,
-                            radius: [style_copy.clip_radius; 4],
-                            clip_rect: Some(lanes),
-                        });
-                        if let Some(g) = badge_glyph
-                            && ghost_rect.w > style_copy.clip_clone_badge_size + 4.0
-                            && ghost_rect.h > style_copy.clip_clone_badge_size + 2.0
-                        {
-                            hctx.push_text(GlyphArea {
-                                text: Arc::from(g.to_string()),
-                                left: ghost_rect.x + 4.0,
-                                top: ghost_rect.y + 2.0,
-                                font_size: style_copy.clip_clone_badge_size,
-                                line_height: style_copy.clip_clone_badge_size * 1.2,
-                                color: style_copy.clip_clone_badge_color,
-                                clip_rect: Some(ghost_rect),
-                                ..GlyphArea::default()
-                            });
-                        }
-                    }
-                }
-            }
+            // r.md #70: **静的 overlay 群 → 全ドラッグ ghost → lasso** の順に揃える。
+            // レンダラは call order = z-order なので、 automation 面の静的 overlay (選択済 point /
+            // curve handle) を ghost より後に描いていると、 掴んでいる point が静止した dot / handle に
+            // 隠れる。 clip / track 並べ替え / fade と同じ「base を全部描いてから ghost」 規律へ。
+            //
+            // ※ 2 ブロック目 (curve handle) は純粋な静的 overlay では**なく** curve param drag の
+            //    live preview を内包する。 point drag と curve param drag は排他ジェスチャなので前出し
+            //    しても実害は無いが、 「静的だから前」 という理由では**ない**。
             // M14 Phase 63n-8 (#033): selected automation points overlay (cached 外、 selection 変化のみで
             // 全 lane 再キャッシュは走らない設計)。 base draw (cached 内) は selection 不問の通常 dot を
             // 描く、 ここで selected な点だけを白色 + 大 dot で上書き (= base dot を完全に覆って差し替え)。
@@ -735,6 +570,187 @@ pub(super) fn render_arrangement_heavy(
                             }
                         }
                         lane_y += lh;
+                    }
+                }
+            }
+            if let Some((nd, bd, td)) = drag_overlay_clone {
+                draw_drag_preview(
+                    hctx,
+                    &nd,
+                    &tracks_owned,
+                    &tops_owned_for_heavy,
+                    view_copy,
+                    lanes,
+                    &style_copy,
+                    tracks_owned.len(),
+                    bd,
+                    td,
+                    drag_overlay_min_len,
+                    &clip_content,
+                    &stretch_ghost_content,
+                );
+            }
+            // M14 Phase 63k (#025): audio_drag ghost overlay (drag 中の dB / fade preview + label)。
+            // commit-by-release のため clip_rect_anchor + 計算済 outcome から preview rect / line を
+            // 描き直す。 cached 外なので 1 frame 1 描画 (drag 中のみ)、 release frame で session が
+            // take されてから次 frame は ghost 消滅。 base 描画 (cached 内) も同 frame 表示されるが、
+            // ghost が上に重なって最新値を user に見せる。
+            if let Some(ad) = audio_drag_overlay {
+                draw_audio_drag_ghost(hctx, &ad, beat_per_px, &style_copy);
+            }
+            // M14 Phase 63n-2 (#028): automation_point_drag ghost (新位置の point dot を半透明で重ねる)。
+            // anchor 固定の `body_rect_anchor` / `clip_rect_anchor` で beat_to_px / y 軸を計算 (drag
+            // 中の view scroll 耐性)。 release commit と同じ式で next position を出すため SSoT を
+            // 共有 (commit と overlay が同一値で確定)。 alt は session の `last_alt` を真値とする。
+            if let Some(pd) = point_drag_overlay {
+                let dx = pd.last_mouse.0 - pd.anchor_mouse.0;
+                let dy = pd.last_mouse.1 - pd.anchor_mouse.1;
+                let beat_to_px =
+                    f64::from(pd.body_rect_anchor.w) / view_copy.len_beats.max(1e-6);
+                let raw_dt = f64::from(dx) / beat_to_px;
+                let raw_abs = pd.clip_start_beat + pd.anchor_time_beat + raw_dt;
+                let snapped_abs =
+                    view_copy.snap.snap_beat(raw_abs, pd.last_alt, zoom_x_px_per_beat);
+                let next_local =
+                    (snapped_abs - pd.clip_start_beat).clamp(0.0, pd.clip_len_beats.max(0.0));
+                let next_value = (pd.anchor_value_norm
+                    - dy / pd.clip_rect_anchor.h.max(1.0))
+                .clamp(0.0, 1.0);
+                let abs_beat = pd.clip_start_beat + next_local;
+                #[allow(clippy::cast_possible_truncation)]
+                let px = pd.body_rect_anchor.x
+                    + ((abs_beat - view_copy.start_beat) * beat_to_px) as f32;
+                let py = pd.clip_rect_anchor.y + (1.0 - next_value) * pd.clip_rect_anchor.h;
+                let r = style_copy.automation_point_radius_px;
+                hctx.push_rect(RectCommand {
+                    rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
+                    fill: style_copy.clip_selected_fill,
+                    // 枠が乗るのは automation lane 面 (パレット自身のクローム面) と
+                    // `clip_selected_fill` なので、極性固定インクではなくテーマ従属の `text`
+                    // (ライトでは暗くなり、明るい lane / 黄 dot の双方で縁が立つ)。
+                    border: p.text,
+                    border_width: 1.5,
+                    radius: [r; 4],
+                    clip_rect: Some(pd.body_rect_anchor),
+                });
+            }
+            // M14 Phase 63n-3 (#028): automation_clip_drag ghost (drag 中の preview rect、 cross-lane
+            // drop 解決込み)。 fill / border / badge は MIDI clip drag preview と完全対称。
+            if let Some(acd) = automation_clip_drag_overlay {
+                let is_move_clone =
+                    matches!(acd.kind, ClipDragKind::Move) && acd.last_ctrl;
+                let (fill, border, badge_glyph) = if is_move_clone {
+                    if acd.last_shift {
+                        (
+                            style_copy.clip_clone_indep_fill,
+                            style_copy.clip_clone_indep_border,
+                            Some('+'),
+                        )
+                    } else {
+                        (
+                            style_copy.clip_clone_linked_fill,
+                            style_copy.clip_clone_linked_border,
+                            Some('⇌'),
+                        )
+                    }
+                } else {
+                    (
+                        style_copy.clip_selected_fill,
+                        style_copy.clip_selected_border,
+                        None,
+                    )
+                };
+                // beat_to_px は現在フレームの lanes.w から算出 (全 lane body は幅 lanes.w で同一、
+                // for_each_visible_lane 参照)。 press 時の anchor 幅でなく現幅を使うことで drag 中の
+                // window / header resize に追従する。
+                let beat_to_px = f64::from(lanes.w) / view_copy.len_beats.max(1e-6);
+                let raw_beat_delta = if beat_to_px > 1e-9 {
+                    f64::from(acd.last_mouse.0 - acd.anchor_mouse.0) / beat_to_px
+                } else {
+                    0.0
+                };
+                // snap pivot = anchors[0] (= 掴んだ clip)、 release commit と同 SSoT。
+                let beat_delta = compute_automation_clip_drag_beat_delta(
+                    &acd,
+                    raw_beat_delta,
+                    &view_copy.snap,
+                    zoom_x_px_per_beat,
+                );
+                let min_len = if view_copy.snap.is_active(acd.last_alt) {
+                    view_copy
+                        .snap
+                        .beat_unit(zoom_x_px_per_beat)
+                        .map_or(0.05, |u| u.max(0.05))
+                } else {
+                    0.05
+                };
+                // #071: 単一選択は cursor で cross-lane drop を preview、 複数選択は各 anchor の自 lane に
+                // 留め horizontal time-shift を preview (release commit の cross-lane policy と一致)。
+                let single = acd.anchors.len() == 1;
+                let pad = style_copy.automation_clip_v_pad_px;
+                for a in &acd.anchors {
+                    let (g_start, g_len) = match acd.kind {
+                        ClipDragKind::Move => ((a.start_beat + beat_delta).max(0.0), a.len_beats),
+                        ClipDragKind::ResizeRight => {
+                            (a.start_beat, (a.len_beats + beat_delta).max(min_len))
+                        }
+                        ClipDragKind::ResizeLeft => {
+                            let max_start = a.start_beat + a.len_beats - min_len;
+                            let new_start = (a.start_beat + beat_delta).clamp(0.0, max_start);
+                            let actual = new_start - a.start_beat;
+                            (new_start, (a.len_beats - actual).max(min_len))
+                        }
+                    };
+                    let target_body = if single && matches!(acd.kind, ClipDragKind::Move) {
+                        automation_lane_key_at_y(
+                            &tracks_owned,
+                            &tops_owned_for_heavy,
+                            view_copy.track_row_h,
+                            header_pane_copy.x,
+                            header_pane_copy.w,
+                            lanes.x,
+                            lanes.w,
+                            &style_copy,
+                            acd.last_mouse.1,
+                        )
+                        .map_or(a.body_rect, |(_, body)| body)
+                    } else {
+                        a.body_rect
+                    };
+                    let g_clip_y = target_body.y + pad;
+                    let g_clip_h = (target_body.h - pad * 2.0).max(2.0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let g_x =
+                        target_body.x + ((g_start - view_copy.start_beat) * beat_to_px) as f32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let g_w = ((g_len * beat_to_px) as f32).max(2.0);
+                    let ghost_rect = Rect { x: g_x, y: g_clip_y, w: g_w, h: g_clip_h };
+                    if ghost_rect.x + ghost_rect.w >= lanes.x
+                        && ghost_rect.x <= lanes.x + lanes.w
+                    {
+                        hctx.push_rect(RectCommand {
+                            rect: ghost_rect,
+                            fill,
+                            border,
+                            border_width: style_copy.clip_selected_border_w,
+                            radius: [style_copy.clip_radius; 4],
+                            clip_rect: Some(lanes),
+                        });
+                        if let Some(g) = badge_glyph
+                            && ghost_rect.w > style_copy.clip_clone_badge_size + 4.0
+                            && ghost_rect.h > style_copy.clip_clone_badge_size + 2.0
+                        {
+                            hctx.push_text(GlyphArea {
+                                text: Arc::from(g.to_string()),
+                                left: ghost_rect.x + 4.0,
+                                top: ghost_rect.y + 2.0,
+                                font_size: style_copy.clip_clone_badge_size,
+                                line_height: style_copy.clip_clone_badge_size * 1.2,
+                                color: style_copy.clip_clone_badge_color,
+                                clip_rect: Some(ghost_rect),
+                                ..GlyphArea::default()
+                            });
+                        }
                     }
                 }
             }

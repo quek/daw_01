@@ -34,10 +34,13 @@
 //!    `GetDIBits` to read the BGRA pixel data out.
 //! 4. A histogram-based assertion (`validate_pixels`) flags blank /
 //!    uniform / mostly-black captures.
-//! 5. Pass → `std::process::exit(0)`. Fail → `tracing::error!` with the
-//!    specific failure mode + `std::process::exit(1)`. We deliberately
-//!    skip graceful shutdown — a smoke-test failure is a development
-//!    signal, not a clean-exit path.
+//! 5. Pass / Fail どちらも `AppEvent::Quit` を投げて **通常の終了シーケンス**
+//!    (`crate::shutdown`) を通し、判定結果をプロセスの終了コードで返す
+//!    (r.md #61)。旧実装は `std::process::exit` で即死しており、`Bootstrap` の
+//!    解体もプラグインの unload も tracing の flush も走らなかった。smoke test は
+//!    常用の検証経路なので、ここが終了シーケンスを通らないと「終了時にプラグインを
+//!    解放できているか」を smoke で守れない。event loop が既に死んでいる場合だけ
+//!    `std::process::exit` に落ちる。
 //!
 //! # Why `PrintWindow` and not `BitBlt`
 //!
@@ -50,8 +53,6 @@
 //! <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-printwindow>.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -134,10 +135,9 @@ pub fn spawn_orchestrator(fixture: PathBuf, proxy: EventLoopProxy<AppEvent>) {
     }
 
     let started = Instant::now();
-    let cancel = Arc::new(AtomicBool::new(false));
-    // Safety net: if any send_event or capture stalls, kill the process
-    // after 30s instead of hanging the CI runner forever.
-    spawn_watchdog(cancel.clone());
+    // Safety net: シナリオ / capture / 終了シーケンスのどこかが詰まっても
+    // CI runner を無限に掴まないよう、30s で強制終了する。
+    spawn_watchdog();
 
     thread::Builder::new()
         .name("smoke-test-orchestrator".to_string())
@@ -192,7 +192,8 @@ pub fn spawn_orchestrator(fixture: PathBuf, proxy: EventLoopProxy<AppEvent>) {
             );
             let result = capture_and_validate(&TESTSRC_THRESHOLDS);
 
-            cancel.store(true, Ordering::Release);
+            // r.md #61: watchdog はここで解除しない。終了シーケンス
+            // (子プロセスの teardown 待ち) までを含めて 30s で覆う。
             match result {
                 Ok(stats) => {
                     tracing::info!(
@@ -202,12 +203,12 @@ pub fn spawn_orchestrator(fixture: PathBuf, proxy: EventLoopProxy<AppEvent>) {
                         height = stats.height,
                         "smoke test PASSED"
                     );
-                    std::process::exit(0);
+                    finish(&proxy, 0);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "smoke test FAILED");
                     eprintln!("smoke test FAILED: {e}");
-                    std::process::exit(1);
+                    finish(&proxy, 1);
                 }
             }
         })
@@ -221,8 +222,7 @@ pub fn spawn_orchestrator(fixture: PathBuf, proxy: EventLoopProxy<AppEvent>) {
 /// 78 (GlyphArea text effects) landing 後の runtime regression 検知用。
 pub fn spawn_text_overlay_orchestrator(proxy: EventLoopProxy<AppEvent>) {
     let started = Instant::now();
-    let cancel = Arc::new(AtomicBool::new(false));
-    spawn_watchdog(cancel.clone());
+    spawn_watchdog();
 
     thread::Builder::new()
         .name("smoke-test-text-orchestrator".to_string())
@@ -295,7 +295,7 @@ pub fn spawn_text_overlay_orchestrator(proxy: EventLoopProxy<AppEvent>) {
             );
             let result = capture_and_validate(&TEXT_OVERLAY_THRESHOLDS);
 
-            cancel.store(true, Ordering::Release);
+            // r.md #61: 上と同じ — watchdog は終了シーケンスまで覆う。
             match result {
                 Ok(stats) => {
                     tracing::info!(
@@ -305,36 +305,57 @@ pub fn spawn_text_overlay_orchestrator(proxy: EventLoopProxy<AppEvent>) {
                         height = stats.height,
                         "text overlay smoke test PASSED"
                     );
-                    std::process::exit(0);
+                    finish(&proxy, 0);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "text overlay smoke test FAILED");
                     eprintln!("text overlay smoke test FAILED: {e}");
-                    std::process::exit(1);
+                    finish(&proxy, 1);
                 }
             }
         })
         .expect("spawn smoke-test-text-orchestrator");
 }
 
-/// Watchdog: if the orchestrator doesn't `cancel.store(true)` within
-/// 30s, force-exit. Prevents a stuck IPC / WMF / wgpu call from
-/// hanging a CI runner indefinitely.
-fn spawn_watchdog(cancel: Arc<AtomicBool>) {
+/// Watchdog: シナリオ実行から **終了シーケンス完了まで** を 30s で覆う backstop。
+/// 詰まった IPC / WMF / wgpu / プラグインの `deactivate` が CI runner を
+/// 無限に掴むのを防ぐ。
+///
+/// (r.md #61) 旧実装は「orchestrator が判定を出したら `cancel` を立てて watchdog を
+/// 解除 → 直後に `std::process::exit`」だった。判定後は終了シーケンス
+/// (子プロセスの teardown 待ち) が続くようになったので、そこも覆えるよう
+/// 解除の口を持たない単純な締切にする。正常系ではプロセス終了と同時にこの
+/// スレッドも消える。
+fn spawn_watchdog() {
     thread::Builder::new()
         .name("smoke-test-watchdog".to_string())
         .spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline {
-                if cancel.load(Ordering::Acquire) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-            eprintln!("smoke test watchdog: orchestrator hung > 30s, killing process");
+            thread::sleep(Duration::from_secs(30));
+            eprintln!("smoke test watchdog: run did not finish within 30s, killing process");
             std::process::exit(2);
         })
         .expect("spawn smoke-test-watchdog");
+}
+
+/// (r.md #61) 判定結果を持って **通常の終了シーケンス**へ入る。
+///
+/// `AppEvent::Quit` は未保存確認を飛ばす (`automated`) — smoke test は fixture を
+/// import して dirty になっており、答える人間が居ない。以後はプロセスが畳まれるのを
+/// 待つだけ (終了コードは event loop 側が `main` へ返す)。event loop が既に死んで
+/// いれば従来どおり即 exit する。
+fn finish(proxy: &EventLoopProxy<AppEvent>, code: u8) -> ! {
+    if proxy
+        .send_event(AppEvent::Quit(crate::shutdown::QuitRequest::automated(code)))
+        .is_err()
+    {
+        eprintln!("smoke test: event loop already closed; exiting directly");
+        std::process::exit(i32::from(code));
+    }
+    // event loop が `Bootstrap::shutdown` まで走り切ってプロセスを終わらせる。
+    // ここでは何もしない (watchdog が 30s の backstop)。
+    loop {
+        thread::park();
+    }
 }
 
 #[inline]

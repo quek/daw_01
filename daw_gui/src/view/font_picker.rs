@@ -10,7 +10,7 @@
 //! テキストクリップがキャンバス上で即ライブプレビューされ、 確定で固定・Esc /
 //! 外クリックで元に戻る (復元は `AppData::close_font_picker`)。
 
-use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
+use daw_ui_core::{Edit, ListViewStyle, ModalStyle, TextInputStyle, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{GlyphArea, Rect};
 
@@ -80,6 +80,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 "fp_search",
                 search_rect,
                 &app.ui_ephemeral.font_picker_query,
+                &TextInputStyle::default(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetFontPickerQuery(new.clone()))

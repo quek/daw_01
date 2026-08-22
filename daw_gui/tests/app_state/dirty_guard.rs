@@ -17,6 +17,7 @@ use common::protocol::{PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction};
+use daw_gui::shutdown::QuitRequest;
 
 use super::support::{self, load_instrument};
 
@@ -38,7 +39,7 @@ fn not_dirty_close_quits_immediately() {
 
     app.request_close();
 
-    assert!(app.ui_ephemeral.should_quit, "clean project closes immediately");
+    assert!(app.shutdown.is_shutting_down(), "clean project closes immediately");
     assert!(app.ui_ephemeral.dirty_guard.is_none(), "no confirm modal when clean");
 }
 
@@ -51,10 +52,10 @@ fn dirty_close_opens_confirm_modal() {
 
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
-        Some(DirtyGuardAction::Quit),
+        Some(DirtyGuardAction::Quit(QuitRequest::USER)),
         "dirty project opens confirm modal for Quit"
     );
-    assert!(!app.ui_ephemeral.should_quit, "must not quit before user decides");
+    assert!(!app.shutdown.is_shutting_down(), "must not quit before user decides");
 }
 
 #[test]
@@ -65,7 +66,7 @@ fn discard_quits_without_saving() {
 
     app.handle_event(AppEvent::DirtyGuardDiscard);
 
-    assert!(app.ui_ephemeral.should_quit, "discard quits");
+    assert!(app.shutdown.is_shutting_down(), "discard quits");
     assert!(app.ui_ephemeral.dirty_guard.is_none(), "modal closed after discard");
     assert!(app.song_doc.is_dirty(), "discard does not save (still dirty)");
 }
@@ -78,7 +79,7 @@ fn cancel_keeps_app_running() {
 
     app.handle_event(AppEvent::DirtyGuardCancel);
 
-    assert!(!app.ui_ephemeral.should_quit, "cancel keeps running");
+    assert!(!app.shutdown.is_shutting_down(), "cancel keeps running");
     assert!(app.ui_ephemeral.dirty_guard.is_none(), "modal closed after cancel");
     assert!(app.song_doc.is_dirty(), "cancel does not save");
 }
@@ -97,7 +98,7 @@ fn save_without_plugins_saves_synchronously_then_quits() {
 
     assert!(path.exists(), "project file written: {}", path.display());
     assert!(!app.song_doc.is_dirty(), "is_dirty cleared after save");
-    assert!(app.ui_ephemeral.should_quit, "sync save quits immediately");
+    assert!(app.shutdown.is_shutting_down(), "sync save quits immediately");
     assert!(app.ui_ephemeral.dirty_guard.is_none(), "modal closed");
     assert!(app.ui_ephemeral.guard_after_save.is_none(), "no async wait needed");
 }
@@ -119,10 +120,10 @@ fn save_with_plugins_waits_for_states_then_quits() {
 
     // 「保存して終了」: plugin 有りなので save は非同期 (state 取得待ち)。
     app.handle_event(AppEvent::DirtyGuardSave);
-    assert!(!app.ui_ephemeral.should_quit, "must wait for plugin states before quitting");
+    assert!(!app.shutdown.is_shutting_down(), "must wait for plugin states before quitting");
     assert_eq!(
         app.ui_ephemeral.guard_after_save,
-        Some(DirtyGuardAction::Quit),
+        Some(DirtyGuardAction::Quit(QuitRequest::USER)),
         "marked to quit after async save"
     );
     assert!(app.ui_ephemeral.dirty_guard.is_none(), "modal closed");
@@ -133,7 +134,7 @@ fn save_with_plugins_waits_for_states_then_quits() {
 
     assert!(path.exists(), "project saved after states arrive");
     assert!(!app.song_doc.is_dirty(), "is_dirty cleared after async save");
-    assert!(app.ui_ephemeral.should_quit, "quits after async save completes");
+    assert!(app.shutdown.is_shutting_down(), "quits after async save completes");
     assert!(app.ui_ephemeral.guard_after_save.is_none(), "async-quit intent cleared");
 }
 
@@ -410,14 +411,18 @@ fn manual_save_ignored_while_guard_modal_open() {
 /// `guard_after_save` を Some のまま残し、 以後 New/Open/終了(✕) が
 /// `request_guarded_action` の早期 return で恒久ロックされた。 修正後は disconnect
 /// で stuck state を破棄し、 ガードが再び機能する。
+///
+/// (r.md #61) **終了意図だけは捨てずに聞き直す**。破棄系 (New / Open) は
+/// 保存が成立していない状態で project を差し替えると未保存変更を失うので実行
+/// しないが、終了は song を触らないので「保存して終了しますか」を最新状態で
+/// 問い直すのが正しい (黙って消すと ✕ が効かなかったようにしか見えない)。
 #[test]
-fn plugin_host_disconnect_unblocks_dirty_guard() {
-    
-
+fn plugin_host_disconnect_reasks_quit_and_unblocks_dirty_guard() {
     let (mut app, _rx) = build_app();
     // 非同期 round-trip 待ちで両方の deferred ガード state が立った状況を模す。
-    app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit);
+    app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit(QuitRequest::USER));
     app.ui_ephemeral.guard_pending_action = Some(DirtyGuardAction::New);
+    app.song_doc.normalize(|_| {});
 
     app.handle_event(AppEvent::Plugin(PluginEvent::ChildDisconnected));
 
@@ -433,9 +438,15 @@ fn plugin_host_disconnect_unblocks_dirty_guard() {
         app.ipc.pending_state_queue.is_empty(),
         "stale state-request queue drained"
     );
+    assert_eq!(
+        app.ui_ephemeral.dirty_guard,
+        Some(DirtyGuardAction::Quit(QuitRequest::USER)),
+        "quit intent survives the disconnect and is re-asked"
+    );
+    assert!(!app.shutdown.is_shutting_down(), "does not quit silently");
 
-    // 以後ふたたびガードが開ける (= ロックされていない)。
-    app.song_doc.normalize(|_| {});
+    // 聞き直しに答えれば、 以後ふたたびガードが開ける (= ロックされていない)。
+    app.handle_event(AppEvent::DirtyGuardCancel);
     app.handle_event(AppEvent::New);
     assert_eq!(
         app.ui_ephemeral.dirty_guard,

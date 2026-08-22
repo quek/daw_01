@@ -50,7 +50,8 @@ use vst3::{
 };
 
 use crate::plugin_instance::{
-    AudioHalf, AudioProcessorHalf, HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent,
+    AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
+    TimedNoteEvent,
 };
 use crate::process_scaffold::{
     self, TransportBlock, alloc_planar, alloc_planar_ports, copy_aux_inputs_planar,
@@ -460,6 +461,14 @@ pub struct Vst3Plugin {
     /// Plug-frame used to relay resize requests back to the host.
     plug_frame: ComWrapper<Vst3PlugFrame>,
     gui_attached: std::cell::Cell<bool>,
+    /// r.md #65: `view` の生ポインタを WNDPROC へ貸してよいか。
+    /// `gui_create_embedded` で立て、**`gui_destroy` の先頭**で落とす。
+    /// [`Vst3Sizer`] はこれを見て `removed()` 済みの view を二度と触らない
+    /// (view の所有はこの struct 1 箇所 = SSoT のまま、AddRef を増やさない)。
+    view_alive: Arc<AtomicBool>,
+    /// r.md #65: attach 中のエディタコンテナ HWND (`0` = 未 attach)。
+    /// `Vst3PlugFrame::resizeView` が同期で窓を直すために読む。
+    editor_hwnd: Arc<std::sync::atomic::AtomicU64>,
 
     /// Audio half (shared with the worker registry via `audio_half()`).
     /// Its Drop never calls into the DLL (non-owning processor pointer),
@@ -707,6 +716,8 @@ impl Vst3Plugin {
             view: None,
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
+            view_alive: Arc::new(AtomicBool::new(false)),
+            editor_hwnd: Arc::clone(&callbacks.editor_hwnd),
             audio_half,
             _library: library,
         })
@@ -1095,14 +1106,12 @@ impl Drop for Vst3Plugin {
             }
             self.ara = None;
         }
-        if self.gui_attached.get()
-            && let Some(view) = self.view.as_ref()
-        {
-            unsafe {
-                let _ = view.removed();
-            }
-        }
-        self.view = None;
+        // r.md #65: **`gui_destroy` を通す**。手書きで `removed()` だけ呼ぶと
+        // (a) `view_alive` / `editor_hwnd` が落ちず、`InstanceRecord` の drop 順
+        // (plugin → editor) の隙間で `Vst3Sizer` が「alive なのに dangling」な
+        // `*mut IPlugView` を指し、(b) `setFrame(nullptr)` → `removed()` の順序も
+        // 踏めない。CLAP 側 (`ClapPlugin::drop`) と同じく契約を 1 箇所に集約する。
+        LoadedPlugin::gui_destroy(self);
         if self.processing {
             unsafe {
                 self.audio.setProcessing(0);
@@ -1509,6 +1518,9 @@ impl LoadedPlugin for Vst3Plugin {
         );
         let _ = unsafe { ComPtr::<vst3::Steinberg::IPlugFrame>::from_raw(frame_ptr) };
         self.view = Some(view);
+        // r.md #65: ここから `gui_destroy` までの間だけ、WNDPROC は view の
+        // 生ポインタを借りてよい。
+        self.view_alive.store(true, Ordering::Release);
         // The editor view now exists — push the current ARA selection so the
         // plug-in's editor displays the track's regions.
         if let Some(session) = self.ara.as_ref() {
@@ -1548,11 +1560,12 @@ impl LoadedPlugin for Vst3Plugin {
         Ok(res == kResultOk)
     }
 
-    fn gui_can_resize(&self) -> bool {
-        let Some(view) = self.view.as_ref() else {
-            return false;
-        };
-        unsafe { view.canResize() == kResultTrue }
+    fn gui_sizer(&self) -> Option<Box<dyn EditorSizer>> {
+        let view = self.view.as_ref()?;
+        Some(Box::new(Vst3Sizer {
+            view: view.as_ptr(),
+            alive: Arc::clone(&self.view_alive),
+        }))
     }
 
     fn gui_set_parent_hwnd(&self, hwnd: u64) -> Result<()> {
@@ -1560,6 +1573,10 @@ impl LoadedPlugin for Vst3Plugin {
             .view
             .as_ref()
             .context("gui not created — call gui_create_embedded first")?;
+        // **`attached` の前**に窓を公開する。`attached` の doc は
+        // *"Note that in this call the plug-in could call a IPlugFrame::resizeView ()!"*
+        // と明記していて、attach の内側から来る resize もここで同期処理できねばならない。
+        self.editor_hwnd.store(hwnd, Ordering::Release);
         let res = unsafe { view.attached(hwnd as *mut c_void, kPlatformTypeHWND) };
         tracing::info!(
             plugin = %self.name,
@@ -1596,24 +1613,19 @@ impl LoadedPlugin for Vst3Plugin {
         Ok(())
     }
 
-    fn gui_set_size(&self, width: u32, height: u32) -> Result<()> {
-        let view = self.view.as_ref().context("no view to resize")?;
-        let mut rect = ViewRect {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
-        };
-        let _ = unsafe { view.checkSizeConstraint(&mut rect) };
-        let res = unsafe { view.onSize(&mut rect) };
-        anyhow::ensure!(res == kResultOk, "IPlugView::onSize -> {:#x}", res);
-        Ok(())
-    }
-
     fn gui_destroy(&mut self) {
+        // **先頭で** alive を落とす (r.md #65): これ以降 `Vst3Sizer` は FFI を
+        // 呼ばない。`pump_pending_messages` 由来の nested dispatch で
+        // `gui_destroy` の途中に WM_SIZE が再入しても、ここで塞がる。
+        self.view_alive.store(false, Ordering::Release);
+        self.editor_hwnd.store(0, Ordering::Release);
         if let Some(view) = self.view.take() {
             if self.gui_attached.get() {
                 unsafe {
+                    // editorhost `WindowController::closePlugView` と同じ順:
+                    // frame を外してから `removed()`。逆だと `removed()` の中から
+                    // 飛んでくる resizeView が、もう窓を持たない frame に届く。
+                    let _ = view.setFrame(std::ptr::null_mut());
                     let _ = view.removed();
                 }
                 self.gui_attached.set(false);
@@ -1622,6 +1634,109 @@ impl LoadedPlugin for Vst3Plugin {
             drop(view);
         }
     }
+}
+
+/// [`EditorSizer`] の VST3 実装 (r.md #65)。
+///
+/// `IPlugView*` を **AddRef せずに借用**する。所有は [`Vst3Plugin::view`] 1 箇所の
+/// ままで、`alive` が false になった後は一切触らない (`gui_destroy` が先頭で落とす)。
+/// 自前 AddRef して持つと view の所有者が 2 箇所になり、`removed()` → release と
+/// 競合したときに UAF になる。
+struct Vst3Sizer {
+    view: *mut IPlugView,
+    alive: Arc<AtomicBool>,
+}
+
+// plugin-main スレッド専用。`EditorWindow` と同じ理由で `Send` を宣言する
+// (`EditorSizer: Send` を満たすためだけで、実際にスレッドを跨がない)。
+unsafe impl Send for Vst3Sizer {}
+
+impl Vst3Sizer {
+    /// 生きている view への **借用** (`ComRef` は refcount を触らない)。
+    /// `gui_destroy` 後は `None`。
+    fn view(&self) -> Option<ComRef<'_, IPlugView>> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: `alive` が true の間は [`Vst3Plugin::view`] が `ComPtr` を保持して
+        // いるので生きている (所有はあちら 1 箇所 = SSoT)。`ComRef` は AddRef も
+        // Release もしないので、借用が所有権と競合しない。
+        unsafe { ComRef::from_raw(self.view) }
+    }
+}
+
+impl EditorSizer for Vst3Sizer {
+    fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32) {
+        let Some(view) = self.view() else { return (w, h) };
+        let before = ViewRect {
+            left: 0,
+            top: 0,
+            right: clamp_view_dim(w),
+            bottom: clamp_view_dim(h),
+        };
+        let mut rect = before;
+        // **戻り値では分岐しない**。`iplugview.h` は `checkSizeConstraint` の戻り値を
+        // 一切規定しておらず (規定しているのは「不可なら rect を許容サイズへ直す」だけ)、
+        // dev portal のシーケンス図は実プラグインが `kResultTrue (always)` を返すと
+        // 注記している。editorhost は `!= kResultTrue` のときだけ採用する実装だが、
+        // それだと丸めが常に捨てられる。JUCE と同じく **呼び出し前後の rect 比較**で判定する。
+        let _ = unsafe { view.checkSizeConstraint(&mut rect) };
+        let (nw, nh) = (rect.right - rect.left, rect.bottom - rect.top);
+        if nw > 0 && nh > 0 && (nw, nh) != (before.right, before.bottom) {
+            (nw as u32, nh as u32)
+        } else {
+            (w, h)
+        }
+    }
+
+    fn current_client_size(&self) -> Option<(u32, u32)> {
+        let view = self.view()?;
+        let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+        if unsafe { view.getSize(&mut rect) } != kResultOk {
+            return None;
+        }
+        let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+        (w > 0 && h > 0).then_some((w as u32, h as u32))
+    }
+
+    fn notify_client_size(&self, w: u32, h: u32) {
+        let Some(view) = self.view() else { return };
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: clamp_view_dim(w),
+            bottom: clamp_view_dim(h),
+        };
+        let res = unsafe { view.onSize(&mut rect) };
+        // `kResultFalse` (0x1) は失敗ではない。`iplugview.h` は `onSize` の戻り値を
+        // 規定しておらず、editorhost も JUCE も見ていない。以前ここを
+        // `ensure!(res == kResultOk)` にしていたため、正常動作している VST3 が
+        // 軒並み WARN を吐いていた。
+        if res != kResultOk {
+            tracing::debug!(res = format!("{res:#x}"), w, h, "IPlugView::onSize returned non-ok");
+        }
+    }
+
+    fn can_resize(&self) -> bool {
+        self.view()
+            .is_some_and(|view| unsafe { view.canResize() } == kResultTrue)
+    }
+
+    fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {
+        // VST3 に軸別可否 / アスペクト比の API は無い (`checkSizeConstraint` が
+        // 丸めて返してくるのに任せる)。
+        None
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+
+/// `ViewRect` へ入れる前に plugin 由来の寸法を健全な範囲へ切る
+/// (`editor_window::clamp_dim` と同じ意図: `u32` → `i32` の折り返し防止)。
+fn clamp_view_dim(v: u32) -> i32 {
+    v.clamp(1, 16_384) as i32
 }
 
 fn encode_event(te: &TimedNoteEvent) -> Event {

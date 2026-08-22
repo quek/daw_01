@@ -8,7 +8,9 @@
 //! (Track.id / Clip.id) と index の変換層を担う。
 
 use crate::widgets::arrangement::{clip_key_to_ref, ClipKey};
-use daw_ui_core::{ColorPickerStyle, Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
+use daw_ui_core::{
+    ColorPickerStyle, Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
+};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, ImportTrackTarget};
@@ -40,7 +42,10 @@ fn track_index_at_y(
 
 // track header 幅は固定定数ではなく `AppData.arrange_header_w` を SSoT
 // とし (default 160.0)、 gui_01 widget の右端 splitter drag で可変。
-const RULER_H: f32 = 20.0;
+//
+// r.md #63: ruler / Arranger 帯 / lanes の縦分割は **widget が唯一の所有者**なので、
+// ここに定数を持たない。 領域が要るときは `ArrangementResponse` の実 rect
+// (`ruler_rect` / `arranger_rect` / `lanes_rect`) を使う。
 const TOOLBAR_H: f32 = 24.0;
 
 /// Snap toolbar の toggle スタイル。 面 / 枠 / 文字 / ON 色 (accent) はすべて
@@ -93,25 +98,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if hover_lane != app.ui_ephemeral.arrange_hovered_automation_lane {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.ui_ephemeral.arrange_hovered_automation_lane = hover_lane;
-        }));
-    }
-
-    // primary 選択 automation clip のレーンの「実描画 content-Y 上端」を
-    // widget の実 lane rect から算出して次フレームへ mirror。 `Z` 縦ズームがレイアウトを
-    // 複製せず「レーンを viewport 上端へ」 scroll する基準にする (lanes pane 上端 =
-    // `area.y + RULER_H`、 content 絶対 y = 現 scroll + 画面オフセット)。 変化時のみ Edit。
-    let lanes_pane_top = area.y + RULER_H;
-    let cur_track_top = app.ui_prefs.arrange_track_top;
-    let primary_lane_top = app.selection.selected_automation_clips.last().and_then(|k| {
-        let lane_key = k.lane_key();
-        resp.automation_lane_rects.iter().find_map(|(rk, rect)| {
-            (rk.track == lane_key.track && rk.lane == lane_key.lane)
-                .then_some((lane_key, cur_track_top + (rect.y - lanes_pane_top)))
-        })
-    });
-    if primary_lane_top != app.ui_ephemeral.arrange_primary_lane_content_top {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.arrange_primary_lane_content_top = primary_lane_top;
         }));
     }
 
@@ -254,6 +240,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ("clip_rename", key.track, key.clip),
                 input_rect,
                 &app.ui_ephemeral.clip_rename_text,
+                &TextInputStyle::default(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::RenameClipChanged(new.clone()));
@@ -386,6 +373,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ),
                 input_rect,
                 &prefill,
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|_| {}),
             );
             if edit_resp.committed || edit_resp.blurred {
@@ -642,6 +630,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ("track_rename", track_id),
                 input_rect,
                 &app.ui_ephemeral.track_rename_text,
+                &TextInputStyle::default(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::RenameTrackChanged(new.clone()));
@@ -679,6 +668,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     ("section_rename", *sid),
                     input_rect,
                     &app.ui_ephemeral.section_rename_text,
+                    &TextInputStyle::default(),
                     |new| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::RenameSectionChanged(new.clone()));
@@ -707,13 +697,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 操作なので「範囲の上で右クリック」 が第一導線 (Ardour の Range メニューと同じ)。
     render_ruler_menu_overlay(ui, resp.ruler_rect);
 
-    // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。
-    let canvas_area = Rect {
-        x: area.x + app.ui_prefs.arrange_header_w,
-        y: area.y + RULER_H,
-        w: area.w - app.ui_prefs.arrange_header_w,
-        h: area.h - RULER_H,
-    };
+    // file drop の hint frame は widget の上に被せる。track lanes のみ受け付ける。
+    // r.md #63: 範囲は widget が分割した実 rect。 以前は `area.y + RULER_H` から下全部を
+    // 対象にしていたため Arranger (section) 帯の上の drop も受理してしまい、 帯には
+    // track header rect が無いので `track_index_at_y` が `None` → 「意図しない新規トラックが
+    // 末尾に作られる」 機能バグになっていた。
+    let canvas_area = resp.lanes_rect;
     // S4b: widget が内部で構築する view 相当の pixel→beat 変換パラメータを AppData から直接再導出
     // (file drop / Split hover 用)。widget と同じ SSoT (`arrange_scroll_beat` / `arrange_zoom_x` /
     // `arrange_snap_config`) を読むので座標変換は完全一致する。
@@ -722,7 +711,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let zoom = app.ui_prefs.arrange_zoom_x.max(1.0);
     let scroll_beat = crate::widgets::arrangement::pixel_snapped_scroll_beat(
         f64::from(app.ui_prefs.arrange_scroll_beat),
-        (area.w - app.ui_prefs.arrange_header_w).max(1.0),
+        canvas_area.w.max(1.0),
         zoom,
     );
     let arr_snap = snap::arrange_snap_config(app);

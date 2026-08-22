@@ -279,6 +279,17 @@ impl AppData {
             .map(|(k, v)| (*k, *v))
             .collect();
         audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
+        // r.md #65: エディタ窓のジオメトリ。per-clip view と同じく **現存する
+        // device の分だけ**を書き出し (削除済み device の orphan を溜めない)、
+        // device_id 昇順で並べて save 差分を安定させる。
+        let mut plugin_editor_windows: Vec<(u64, common::model::EditorWindowGeometry)> = self
+            .ui_prefs
+            .plugin_editor_windows
+            .iter()
+            .filter(|(id, _)| find_device_by_id(self.song_doc.song(), **id).is_some())
+            .map(|(id, g)| (*id, *g))
+            .collect();
+        plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
         common::model::ViewState {
             arrange_zoom_x: self.ui_prefs.arrange_zoom_x,
             arrange_scroll_beat: self.ui_prefs.arrange_scroll_beat,
@@ -310,6 +321,7 @@ impl AppData {
                 .collect(),
             piano_roll_views,
             audio_editor_views,
+            plugin_editor_windows,
         }
     }
 
@@ -331,6 +343,8 @@ impl AppData {
     ) {
         self.ui_prefs.piano_roll_views.clear();
         self.ui_prefs.audio_editor_views.clear();
+        // r.md #65: 別プロジェクトの窓位置が漏れないよう per-clip view と同様に先にクリア。
+        self.ui_prefs.plugin_editor_windows.clear();
         self.set_loop_region(loop_region);
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
@@ -338,7 +352,8 @@ impl AppData {
         self.ui_prefs.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
         self.ui_prefs.arrange_follow = v.arrange_follow;
         self.ui_prefs.arrange_track_top = v.arrange_track_top.max(0.0);
-        self.ui_prefs.arrange_track_row_h = v.arrange_track_row_h.clamp(16.0, 2000.0);
+        self.ui_prefs.arrange_track_row_h =
+            v.arrange_track_row_h.clamp(MIN_ARRANGE_ROW_H, MAX_ARRANGE_ROW_H);
         self.ui_prefs.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
         self.ui_prefs.track_row_overrides = v
             .track_row_overrides
@@ -378,6 +393,23 @@ impl AppData {
             }
             av.len_beats = av.len_beats.max(0.0);
             self.ui_prefs.audio_editor_views.insert(k, av);
+        }
+        // r.md #65: エディタ窓のジオメトリ。現存しない device の stale entry は捨てる。
+        // 位置 (`x`/`y`) は **clamp しない** — マルチモニタでは負値が正当で、
+        // 画面外かどうかの判定はモニタ構成を知る plugin-host 側が open 時に行う。
+        // サイズ 0 の entry は **1 へ clamp せず捨てる**: 0 は「最小化中に採られた
+        // 縮退値」を意味し、1 に昇格させると「有効な 1×1 の窓サイズ」に化けて
+        // 次回 open で 1×1 のエディタが出る。上限だけ健全域へ丸める。
+        for (device_id, mut g) in v.plugin_editor_windows {
+            if g.width == 0
+                || g.height == 0
+                || find_device_by_id(self.song_doc.song(), device_id).is_none()
+            {
+                continue;
+            }
+            g.width = g.width.min(16_384);
+            g.height = g.height.min(16_384);
+            self.ui_prefs.plugin_editor_windows.insert(device_id, g);
         }
     }
 
@@ -526,7 +558,7 @@ impl AppData {
         }
         for (slot, items) in groups {
             let Some(&r) = shown.get(slot) else { continue };
-            if self.is_pianoroll_clip_locked(r) {
+            if self.is_pianoroll_clip_locked_in(&shown, r) {
                 continue;
             }
             per_clip(self, slot, r, &items);
@@ -565,16 +597,130 @@ impl AppData {
             .collect()
     }
 
-    /// そのクリップが乗っている **トラック** がピアノロールで「ロック (参照専用)」
-    /// かどうか。ロックはトラック単位 (凡例がトラック単位なので)。
+    /// ピアノロールが今そのスケールで動いているか (`None` = スケール未設定)。
+    ///
+    /// 判定基準は **対象 (target) クリップの窓の開始拍のスケール** で、view と handler の
+    /// 両方がここを読む (r.md #67)。 view 側だけで導出していると、カーソルキーの
+    /// ↑/↓ が「画面では Fold 表示なのに半音単位で動く」 ように食い違う。
+    ///
+    /// `mode` は Fold トグルに従う (`Fold` = out-of-scale 行を畳んだ表示)。
+    #[must_use]
+    pub fn pianoroll_scale(&self) -> Option<crate::widgets::piano_roll::PianoRollScale> {
+        use crate::widgets::piano_roll::{PianoRollScale, PianoRollScaleMode};
+        let target = self.pianoroll_target_clip()?;
+        let clip = self
+            .song_doc
+            .song()
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))?;
+        let sc = self.song_doc.song().scale_at(clip.start_beat)?;
+        Some(PianoRollScale {
+            root: sc.root,
+            in_scale_mask: sc.scale.pitch_class_mask(),
+            mode: if self.ui_prefs.piano_roll_fold {
+                PianoRollScaleMode::Fold
+            } else {
+                PianoRollScaleMode::Highlight
+            },
+            prefer_flats: common::scale::prefers_flats(sc.root, sc.scale),
+        })
+    }
+
+    /// そのトラックがピアノロールの凡例に **行を持つか**
+    /// (`shown` = [`Self::shown_pianoroll_clips`] の結果)。
+    ///
+    /// **これがロックの効力範囲の SSoT** (r.md #64)。 凡例パネルは複数クリップ表示
+    /// (`shown.len() >= 2`) のときだけ出るので、単一表示では空 = ロックは効かない。
+    ///
+    /// 旧実装は「効力 = `locked_pr_tracks` を直接読む (常時)」 と「解除 UI = 複数表示のとき
+    /// だけ描く」 が別々に書かれていた。 ロックしたトラックのクリップを 1 つだけ開くと
+    /// **ゴースト表示のまま掴めず、解除ボタンも画面に無い** = プロジェクトを開き直す以外に
+    /// 復帰できない詰みになる。 効力を凡例行から導出すれば
+    /// 「ロックが効いている ⟺ 解除ボタンが見えている」 が構造的な不変条件になる
+    /// (`locked_pr_tracks` は「ユーザーの意思」 の生データとして残り、効力は毎回導出)。
+    ///
+    /// 「選択が変わった瞬間に `locked_pr_tracks` を prune する」 方式は採らない:
+    /// `selected_clips` の書き込み点は 10 箇所以上に散っていてチョークポイントが無く、
+    /// 「参照を貼り替える補償コード」 (アーキテクチャ不変条件 1 が禁じるパターン) になる。
+    #[must_use]
+    pub fn has_pianoroll_lock_row(shown: &[ClipRef], track: u32) -> bool {
+        // 凡例パネルは複数クリップ表示のときだけ出て、行は表示クリップのトラック 1 つにつき 1 行。
+        shown.len() >= 2 && shown.iter().any(|r| r.track == track)
+    }
+
+    /// [`Self::has_pianoroll_lock_row`] が真になるトラック index を **初出順** で列挙する
+    /// (凡例パネルの行そのもの)。 行の集合が要る描画側が使う。 判定 1 件だけなら
+    /// alloc しない述語版 (`has_pianoroll_lock_row`) を使うこと。
+    #[must_use]
+    pub fn pianoroll_lock_rows_in(shown: &[ClipRef]) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for r in shown {
+            if Self::has_pianoroll_lock_row(shown, r.track) && !out.contains(&r.track) {
+                out.push(r.track);
+            }
+        }
+        out
+    }
+
+    /// 単発版 (内部で `shown_pianoroll_clips()` を 1 度計算)。凡例の描画側が使う。
+    #[must_use]
+    pub fn pianoroll_lock_rows(&self) -> Vec<u32> {
+        Self::pianoroll_lock_rows_in(&self.shown_pianoroll_clips())
+    }
+
+    /// そのクリップが乗っている **トラック** のロックが *いま効いているか*
+    /// (r.md #64)。 `shown` は [`Self::shown_pianoroll_clips`] の結果
+    /// (呼び出し側で 1 度作って使い回す、`decode_note_id_in` と同じイディオム)。
+    ///
+    /// 効力 = 「凡例に行がある」 ∧ 「そのトラックがロック集合に入っている」。
+    /// 前者が [`Self::pianoroll_lock_rows_in`] = 解除 UI の描画条件そのものなので、
+    /// 解除できないロックが存在しえない。
+    #[must_use]
+    pub fn is_pianoroll_clip_locked_in(&self, shown: &[ClipRef], r: ClipRef) -> bool {
+        Self::has_pianoroll_lock_row(shown, r.track)
+            && self
+                .song_doc
+                .song()
+                .tracks
+                .get(r.track as usize)
+                .is_some_and(|t| self.ui_prefs.locked_pr_tracks.contains(&t.id))
+    }
+
+    /// 単発版 (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の clip を捌く
+    /// ハンドラでは `shown` を 1 度作って `is_pianoroll_clip_locked_in` を使う。
+    #[must_use]
     pub fn is_pianoroll_clip_locked(&self, r: ClipRef) -> bool {
-        self.song_doc.song()
+        self.is_pianoroll_clip_locked_in(&self.shown_pianoroll_clips(), r)
+    }
+
+    /// ロック中クリップへの **書き込み** を拒否する共通ゲート (r.md #64)。
+    ///
+    /// ロックは既存ノートの編集経路 (`for_each_note_clip_group`) では効いていたが、
+    /// **新規ノートを生む経路** (鉛筆 / Insert / 貼り付け / ステップ入力) はロックを
+    /// まったく見ていなかった。 結果「既存ノートは掴めないのに新しいノートは描ける」
+    /// という、生む経路と触る経路で判定が食い違う状態になっていた。
+    ///
+    /// 拒否したときは理由をステータスバーに出す (何も起きないと故障に見えるため)。
+    /// 戻り値 `true` = 拒否した (呼び出し側は即 return)。
+    pub(crate) fn reject_write_if_pianoroll_locked(&mut self, r: ClipRef) -> bool {
+        if !self.is_pianoroll_clip_locked(r) {
+            return false;
+        }
+        let name = self
+            .song_doc
+            .song()
             .tracks
             .get(r.track as usize)
-            .is_some_and(|t| self.ui_prefs.locked_pr_tracks.contains(&t.id))
+            .map_or_else(String::new, |t| format!("「{}」 ", t.name));
+        self.ui_ephemeral.status_message =
+            format!("{name}トラックはロック中です (凡例の L で解除)");
+        true
     }
 
     /// トラック id がピアノロールでロック中か (凡例のロックトグル状態表示用)。
+    /// **効力ではなくユーザーの意思**を返す — 凡例が出ている行にしか使わないので、
+    /// その文脈では [`Self::is_pianoroll_clip_locked_in`] と必ず一致する。
     pub fn is_pianoroll_track_locked(&self, track_id: u32) -> bool {
         self.ui_prefs.locked_pr_tracks.contains(&track_id)
     }
@@ -851,7 +997,7 @@ impl AppData {
         let shown = self.shown_pianoroll_clips();
         let mut out = Vec::new();
         for (slot, &r) in shown.iter().enumerate() {
-            if self.is_pianoroll_clip_locked(r) {
+            if self.is_pianoroll_clip_locked_in(&shown, r) {
                 continue;
             }
             let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
@@ -1101,7 +1247,7 @@ impl AppData {
     }
 
     /// 再生追従スクロールの新しい `arrange_scroll_beat` を計算する純関数 (テスト可能)。
-    /// `scroll` は現在の左端拍、 `visible_beats` は可視拍数 (canvas_w / zoom)、
+    /// `scroll` は現在の左端拍、 `visible_beats` は可視拍数 (lanes_w / zoom)、
     /// `playhead` は現在の再生位置 (拍)。 view を動かす必要が無ければ `None`。
     ///
     /// - `Page`: プレイヘッドが可視範囲 `[scroll, scroll+visible)` の外 (右端到達 or
@@ -1161,54 +1307,37 @@ impl AppData {
         }
     }
 
-    /// 全 track の全 clip が arrangement canvas に収まるよう zoom_x / scroll_beat /
+    /// 全 track の全 clip が arrangement の lanes 領域に収まるよう zoom_x / scroll_beat /
     /// track_row_h を自動調整する。clip 0 個なら song.length_beats でフォールバック。
+    ///
+    /// 縦は「全行の高さ合計 == lanes 高さ」 を **厳密に** 成立させる (= 最下段の行の下端が
+    /// 画面下端にぴったり揃い、 余白もはみ出しも残らない)。 Ardour の Fit Selection
+    /// (`Editor::fit_tracks`, gtk2_ardour/editor_ops.cc) と同じく行高に上限は設けない
+    /// (下限だけ。 Ardour も `h < preset_height(HeightSmall)` のときだけ警告して最小に張り付く)。
     pub(crate) fn fit_arrange_to_content(&mut self) {
         // X (fit) は明示的な view 操作なので再生中は追従を解除する (= follow が
         // 次 tick で fit を上書きして戻すのを防ぐ)。
         self.cancel_follow_on_manual_view_change();
-        let (canvas_w, canvas_h) = self.ui_ephemeral.last_arrange_canvas_size;
-        if canvas_w < 16.0 || canvas_h < 16.0 {
+        let (lanes_w, lanes_h) = self.ui_ephemeral.last_arrange_lanes_size;
+        if lanes_w < 16.0 || lanes_h < 16.0 {
             return;
         }
-        // 行高は widget が canvas_h に描く行数で割る: 常に先頭へ prepend される
-        // master 行 (arrangement_view.rs が常時 `Some(&master_row)`) + 可視 track 数。
-        // collapsed group 配下の子は widget 側 `is_visible_track` で描画されないので、
-        // ここでも親 chain に collapsed があれば除外して同じ可視集合を数える
-        // (`compute_track_depth` と同じ parent_group_id walk、 32 hop で cycle 安全)。
-        let visible_track_count = self
-            .song_doc.song()
-            .tracks
+        // 収める行は widget が前フレームに実際に積んだ行そのもの (master 行 + 可視 track 行 +
+        // 展開中の可視 automation lane 行)。 可視集合をモデルから再導出すると、 widget 側の
+        // lane 除外条件が 1 つ増えただけで silent に fit がズレる。
+        let fit_lane_keys: Vec<common::model::AutomationLaneKey> = self
+            .ui_ephemeral
+            .last_arrange_rows
             .iter()
-            .filter(|t| !self.is_hidden_under_collapsed_group(t.id))
-            .count();
-        // 展開中の automation lane も viewport を占める行なので、 行数に
-        // 数え、 後で各 lane を同じ fit 行高へ scale する。 数えないと (旧挙動) lane
-        // ぶんの高さが余計に積まれて content が溢れ、 かつ lane は model height_px の
-        // ままなので「track だけ縮んで automation レーンが高いまま」 になる (ユーザー報告)。
-        // master 行 (`MASTER_TRACK_ID`) の song_lanes も同様。 collapsed track / collapsed
-        // automation / 非 visible lane は widget が描かないので除外。
-        let mut fit_lane_keys: Vec<common::model::AutomationLaneKey> = Vec::new();
-        for t in &self.song_doc.song().tracks {
-            if self.is_hidden_under_collapsed_group(t.id)
-                || !self.ui_prefs.expanded_automation_tracks.contains(&t.id)
-            {
-                continue;
-            }
-            for l in t.automation_lanes.iter().filter(|l| l.visible) {
-                fit_lane_keys.push(common::model::AutomationLaneKey { track: t.id, lane: l.id });
-            }
+            .filter_map(|r| match r.key {
+                crate::widgets::arrangement::ArrangementRowKey::Lane(k) => Some(k),
+                crate::widgets::arrangement::ArrangementRowKey::Track(_) => None,
+            })
+            .collect();
+        let row_count = self.ui_ephemeral.last_arrange_rows.len();
+        if row_count == 0 {
+            return;
         }
-        if self.ui_prefs.master_row_automation_expanded {
-            for l in self.song_doc.song().song_lanes.iter().filter(|l| l.visible) {
-                fit_lane_keys.push(common::model::AutomationLaneKey {
-                    track: common::model::MASTER_TRACK_ID,
-                    lane: l.id,
-                });
-            }
-        }
-        // +1 は master 行 (widget が visible_tracks[0] に常時 prepend する)。
-        let row_count = (visible_track_count + fit_lane_keys.len() + 1).max(1);
 
         let (min_beat, max_beat) = self
             .song_doc.song()
@@ -1226,8 +1355,27 @@ impl AppData {
 
         let span_beats = (max_beat - min_beat + 4.0).max(4.0);
         self.ui_prefs.arrange_scroll_beat = (min_beat - 2.0).max(0.0) as f32;
-        self.ui_prefs.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
-        let row_h = (canvas_h / row_count as f32).clamp(16.0, 96.0);
+        self.ui_prefs.arrange_zoom_x = (f64::from(lanes_w) / span_beats).clamp(2.0, 400.0) as f32;
+        // 全行を等高で lanes_h に敷き詰める。 automation lane の行高は u16 (整数 px) しか
+        // 持てないので、 まず理想高を整数へ丸めて lane に配り、 **端数を f32 の track 行高が
+        // 吸収する**。 これで `n_track * row_h + n_lane * lane_px == lanes_h` が厳密に成立し、
+        // 最下段の行の下端が lanes の下端にぴったり揃う (lane 行に丸めた分を配らないと
+        // 最大 `0.5 × lane 数` px はみ出す)。 行が lanes に収まりきらない (= 1 行 16px 未満に
+        // なる) ときだけ下限に張り付いて溢れ、 縦スクロールで見る (Ardour fit_tracks と同じ)。
+        let lane_count = fit_lane_keys.len();
+        let track_row_count = row_count - lane_count;
+        #[allow(clippy::cast_precision_loss)]
+        let ideal_row_h = lanes_h / row_count as f32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let lane_px = (ideal_row_h.max(MIN_ARRANGE_ROW_H).round() as u16).max(1);
+        #[allow(clippy::cast_precision_loss)]
+        let row_h = if track_row_count == 0 {
+            // 起こらない (master 行が必ず居る) が、 0 除算だけは構造的に塞ぐ。
+            ideal_row_h.max(MIN_ARRANGE_ROW_H)
+        } else {
+            ((lanes_h - f32::from(lane_px) * lane_count as f32) / track_row_count as f32)
+                .max(MIN_ARRANGE_ROW_H)
+        };
         self.ui_prefs.arrange_track_row_h = row_h;
         // 「全 track / lane を上端から収める」 のが fit の定義なので:
         //   - 縦スクロールを 0 に戻す (怠ると row 高だけ縮んで track_top が残り、
@@ -1245,8 +1393,6 @@ impl AppData {
         self.ui_ephemeral.arrange_zoom_history.clear();
         self.ui_ephemeral.arrange_zoom_anchor = None;
         self.ui_prefs.automation_lane_row_overrides.clear();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let lane_px = (row_h.round() as u16).max(1);
         for k in fit_lane_keys {
             self.ui_prefs.automation_lane_row_overrides.insert(k, lane_px);
         }
@@ -1299,8 +1445,8 @@ impl AppData {
         let Some((min_start, max_end)) = self.arrange_selection_beat_span(automation) else {
             return false;
         };
-        let (canvas_w, _) = self.ui_ephemeral.last_arrange_canvas_size;
-        if canvas_w < 16.0 {
+        let (lanes_w, _) = self.ui_ephemeral.last_arrange_lanes_size;
+        if lanes_w < 16.0 {
             return false;
         }
         // fresh な横ズームは新しい zoom セッションの起点。 前セッションの lane 拡大
@@ -1316,7 +1462,7 @@ impl AppData {
         let pad = (span * 0.04).max(0.5);
         self.ui_prefs.arrange_scroll_beat = (min_start - pad).max(0.0) as f32;
         self.ui_prefs.arrange_zoom_x =
-            (f64::from(canvas_w) / (span + pad * 2.0)).clamp(2.0, 400.0) as f32;
+            (f64::from(lanes_w) / (span + pad * 2.0)).clamp(2.0, 400.0) as f32;
         true
     }
 
@@ -1325,42 +1471,77 @@ impl AppData {
     /// 群を viewport に収める。 適用したら `true`、 lanes 過小 / 対象解決不能なら
     /// `false` (view 不変)。
     pub(crate) fn zoom_arrange_vertical(&mut self, automation: bool) -> bool {
-        let lanes_h = self.ui_ephemeral.last_arrange_canvas_size.1;
+        use crate::widgets::arrangement::ArrangementRowKey;
+        let lanes_h = self.ui_ephemeral.last_arrange_lanes_size.1;
         if lanes_h < 16.0 {
             return false;
         }
         // 対象面が automation clip なら、 そのレーンを viewport 高いっぱいに拡大する
-        // (= MIDI track の縦ズームの「レーン版」)。 primary レーンの実 content-Y は
-        // view が widget の実 rect から算出済 (`arrange_primary_lane_content_top`)。
+        // (= MIDI track の縦ズームの「レーン版」)。 レーンの content-Y 上端は widget が
+        // 積んだ行そのもの (`last_arrange_rows`) から引く。
         if automation
-            && let Some((lane_key, content_top)) = self.ui_ephemeral.arrange_primary_lane_content_top
-            && self
-                .selection.selected_automation_clips
+            && let Some(lane_key) = self
+                .selection
+                .selected_automation_clips
+                .last()
+                .map(|k| k.lane_key())
+            && let Some(row) = self
+                .ui_ephemeral
+                .last_arrange_rows
                 .iter()
-                .any(|k| k.lane_key() == lane_key)
+                .find(|r| r.key == ArrangementRowKey::Lane(lane_key))
         {
+            let content_top = row.content_top;
             let snap = self.capture_arrange_view();
             self.ui_ephemeral.arrange_zoom_history.push(snap);
             // レーン高 = viewport 高 (u16 へ saturating)。 レーンより上の行高は
             // 変わらないので content_top はそのままレーン上端の絶対 y。
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let lane_px = lanes_h.clamp(16.0, f32::from(u16::MAX)) as u16;
+            let lane_px = lanes_h.clamp(MIN_ARRANGE_ROW_H, f32::from(u16::MAX)) as u16;
             self.ui_prefs.automation_lane_row_overrides.insert(lane_key, lane_px);
             self.ui_prefs.arrange_track_top = content_top.max(0.0);
             return true;
         }
-        // 通常 clip 選択: 選択 track 群が viewport いっぱいになるよう uniform 行高 +
-        // 先頭行へ scroll (master 行を行 0 とする統一行 index 空間)。
-        let Some((r_min, r_max)) = self.selected_tracks_visible_row_span(automation) else {
+        // 通常 clip 選択: 選択 track 群 (と、 その track が展開している automation lane) が
+        // viewport いっぱいになるよう track 行を uniform 行高にし、 先頭行へ scroll する。
+        //
+        // lane 行の高さは据え置き、 **残りを track 行で割る** (Ardour `Editor::fit_tracks` の
+        // `child_heights` と同じ扱い — 選択 track の子レーンぶんを viewport 高から先に引く)。
+        // 行の高さも content-Y も widget が積んだ行から引くので、 選択 track の上に展開中の
+        // レーンがあっても scroll 位置がズレない (一様行高の掛け算で再導出すると外れる)。
+        let Some((first, last)) = self.selected_row_span(automation) else {
             return false;
         };
+        let rows = &self.ui_ephemeral.last_arrange_rows;
+        let span = &rows[first..=last];
+        let lane_h_in_span: f32 = span
+            .iter()
+            .filter(|r| matches!(r.key, ArrangementRowKey::Lane(_)))
+            .map(|r| r.height)
+            .sum();
+        let track_rows_in_span =
+            span.iter().filter(|r| matches!(r.key, ArrangementRowKey::Track(_))).count();
+        if track_rows_in_span == 0 {
+            return false;
+        }
+        // fit と同じく上限は設けない (viewport 高さそのものが実質の上限)。
+        #[allow(clippy::cast_precision_loss)]
+        let row_h =
+            ((lanes_h - lane_h_in_span) / track_rows_in_span as f32).max(MIN_ARRANGE_ROW_H);
+        // 新しい行高で数え直した「先頭行より上の高さ合計」 が scroll 位置
+        // (track 行は全部 row_h に、 lane 行は現在高のまま)。
+        let track_top: f32 = rows[..first]
+            .iter()
+            .map(|r| match r.key {
+                ArrangementRowKey::Track(_) => row_h,
+                ArrangementRowKey::Lane(_) => r.height,
+            })
+            .sum();
         let snap = self.capture_arrange_view();
         self.ui_ephemeral.arrange_zoom_history.push(snap);
-        let rows = (r_max - r_min + 1) as f32;
-        let row_h = (lanes_h / rows).clamp(16.0, 2000.0);
         self.ui_prefs.track_row_overrides.clear();
         self.ui_prefs.arrange_track_row_h = row_h;
-        self.ui_prefs.arrange_track_top = (r_min as f32) * row_h;
+        self.ui_prefs.arrange_track_top = track_top;
         true
     }
 
@@ -1381,26 +1562,21 @@ impl AppData {
         self.capture_arrange_view() == *snap
     }
 
-    /// 対象面 (`automation`) の選択素材が乗っている track 群の、 arrangement の可視行
-    /// 並びにおける行 index 範囲 `(min, max)`。 行 0 は常時先頭に描かれる master 行、
-    /// 行 `n` (n>=1) は可視 track の `n-1` 番目 (collapsed group 配下は除外 = widget の
-    /// `is_visible_track` と一致)。 master 行に乗る automation clip
-    /// (`AutomationClipKey.track == MASTER_TRACK_ID`) は行 0 に対応する。 選択無し /
-    /// どれも不可視なら `None`。 縦ズーム (automation はレーン拡大不能時の fallback、
-    /// clip は track 群を収める) の「収める行範囲」 算出に使う。
-    pub(crate) fn selected_tracks_visible_row_span(&self, automation: bool) -> Option<(usize, usize)> {
-        // 対象 track id を対象面の選択から集める。 master 行 automation clip は
-        // song.tracks に無いので別フラグで持つ。
+    /// r.md #63: 対象面 (`automation`) の選択素材が乗っている track 群を、 widget が積んだ行
+    /// (`last_arrange_rows`) の index 範囲 `(first, last)` (両端含む) で返す。
+    ///
+    /// `first` は最初の選択 track の **track 行**、 `last` は最後の選択 track の行群の末尾
+    /// (= その track が展開している automation lane 行まで含む。 Ardour `Editor::fit_tracks` が
+    /// 選択 track の `child_heights` を viewport 高さから先に引くのと同じ範囲)。 選択と選択の
+    /// 間に挟まる非選択 track の行も範囲に入る (画面上そこに居るので収める対象)。
+    /// master 行に乗る automation clip (`track == MASTER_TRACK_ID`) は master 行に対応する。
+    /// 選択無し / どれも可視行に居ない / widget 未描画なら `None`。
+    pub(crate) fn selected_row_span(&self, automation: bool) -> Option<(usize, usize)> {
+        use crate::widgets::arrangement::ArrangementRowKey;
+        // 対象 track id を対象面の選択から集める (master 行は `MASTER_TRACK_ID` で表現)。
         let mut track_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut include_master = false;
         if automation {
-            for k in &self.selection.selected_automation_clips {
-                if k.track == common::model::MASTER_TRACK_ID {
-                    include_master = true;
-                } else {
-                    track_ids.insert(k.track);
-                }
-            }
+            track_ids.extend(self.selection.selected_automation_clips.iter().map(|k| k.track));
         } else {
             track_ids.extend(self.selection.selected_clips.iter().map(|k| k.track_id));
             if track_ids.is_empty()
@@ -1409,27 +1585,27 @@ impl AppData {
                 track_ids.insert(k.track_id);
             }
         }
-        if track_ids.is_empty() && !include_master {
+        if track_ids.is_empty() {
             return None;
         }
-        let (mut r_min, mut r_max) = (usize::MAX, 0usize);
-        if include_master {
-            r_min = 0;
-            r_max = 0;
-        }
-        // 行 0 = master、 可視 track の i 番目は行 i+1。
-        let mut vi = 1usize;
-        for t in &self.song_doc.song().tracks {
-            if self.is_hidden_under_collapsed_group(t.id) {
+        let (mut first, mut last) = (None, None);
+        for (i, r) in self.ui_ephemeral.last_arrange_rows.iter().enumerate() {
+            let owner = match r.key {
+                ArrangementRowKey::Track(id) => id,
+                ArrangementRowKey::Lane(k) => k.track,
+            };
+            if !track_ids.contains(&owner) {
                 continue;
             }
-            if track_ids.contains(&t.id) {
-                r_min = r_min.min(vi);
-                r_max = r_max.max(vi);
+            // 起点は必ず track 行 (lane 行だけ選択されている track の途中から始めない)。
+            if first.is_none() && matches!(r.key, ArrangementRowKey::Track(_)) {
+                first = Some(i);
             }
-            vi += 1;
+            if first.is_some() {
+                last = Some(i);
+            }
         }
-        (r_min != usize::MAX).then_some((r_min, r_max))
+        first.zip(last)
     }
 
     /// 対象面 (`automation`) の選択素材の bounding beat 範囲。 通常 clip と automation

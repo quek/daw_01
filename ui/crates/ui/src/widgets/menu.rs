@@ -64,17 +64,41 @@ pub enum MenuEntry<'a, M: ?Sized + 'static> {
         label: &'a str,
         entries: Vec<MenuEntry<'a, M>>,
     },
+    /// グループ区切りの水平線。hover もクリックも受けず、幅にも寄与しない。
+    /// 高さだけが [`MENU_ITEM_H`] と異なるので、popup のレイアウトは
+    /// 「index × 固定高」ではなく **累積オフセット** で計算する。
+    Separator,
 }
 
 impl<'a, M: ?Sized + 'static> MenuEntry<'a, M> {
     fn label(&self) -> &'a str {
         match self {
             MenuEntry::Item { label, .. } | MenuEntry::SubMenu { label, .. } => label,
+            MenuEntry::Separator => "",
+        }
+    }
+
+    /// この entry が入力 (hover / click) を受けるか。
+    fn is_interactive(&self) -> bool {
+        !matches!(self, MenuEntry::Separator)
+    }
+
+    fn height(&self) -> f32 {
+        match self {
+            MenuEntry::Separator => MENU_SEPARATOR_H,
+            _ => MENU_ITEM_H,
         }
     }
 }
 
+/// entries を縦に積んだときの popup 全体の高さ。
+pub(crate) fn entries_height<M: ?Sized + 'static>(entries: &[MenuEntry<'_, M>]) -> f32 {
+    entries.iter().map(MenuEntry::height).sum()
+}
+
 const MENU_ITEM_H: f32 = 24.0;
+/// 区切り線 1 本ぶんの高さ (線 1px + 上下の余白)。
+const MENU_SEPARATOR_H: f32 = 9.0;
 const MENU_PAD_X: f32 = 12.0;
 pub(crate) const MENU_FONT: f32 = 14.0;
 /// popup 幅の**下限** (項目が短くても最低これだけ広げる)。
@@ -116,7 +140,7 @@ pub(crate) fn entries_popup_width<'a, M: ?Sized + 'static>(
                 ui.measure_text(h, MENU_FONT) + MENU_PAD_X
             }
             MenuEntry::SubMenu { .. } => MENU_FONT + MENU_PAD_X,
-            MenuEntry::Item { .. } => 0.0,
+            MenuEntry::Item { .. } | MenuEntry::Separator => 0.0,
         };
         widest = widest.max(label_w + right);
     }
@@ -247,6 +271,22 @@ impl<'a, M: ?Sized + 'static> MenuBuilder<'a, M> {
         self
     }
 
+    /// グループ区切りの水平線を追加する。hover / click は受けない。
+    ///
+    /// File メニューのように性質の違う操作が並ぶメニューでは、区切りが無いと
+    /// 全項目が 1 つの塊に見える (Ardour / Cubase / Windows の File メニューは
+    /// いずれもグループごとに区切りを持つ)。
+    ///
+    /// ```ignore
+    /// menu.item("Save", ..);
+    /// menu.separator();
+    /// menu.item("Quit", ..);
+    /// ```
+    pub fn separator(&mut self) -> &mut Self {
+        self.entries.push(MenuEntry::Separator);
+        self
+    }
+
     /// sub-menu を追加。hover で sub-popup が開く (DAW 標準挙動)。再帰的に sub_menu を入れ子可。
     pub fn sub_menu<F>(&mut self, label: &'a str, f: F) -> &mut Self
     where
@@ -323,18 +363,29 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     let arrow_color = p.text_dim;
     let entries_len = entries.len();
 
+    // entry ごとに高さが違う (Separator) ので、`i * MENU_ITEM_H` ではなく
+    // **累積オフセット** で矩形を確定する。hover 判定・描画・sub-popup の
+    // アンカーが同じ矩形を見るよう、先に 1 度だけ作る。
+    let item_rects: Vec<Rect> = {
+        let mut rects = Vec::with_capacity(entries_len);
+        let mut y = popup_rect.y;
+        for entry in entries.iter() {
+            let h = entry.height();
+            rects.push(Rect { x: popup_rect.x, y, w: popup_rect.w, h });
+            y += h;
+        }
+        rects
+    };
+
     // 兄弟 sub-popup 排他 (daw_01 #037 fix): hover している item を loop 前に確定し、
     // 他 sibling の sub-popup を全 close する。 loop 内で close すると i=0 の
     // popup_layer 描画が i=1 の close より先に走り cascade が重なるため、 loop 前に
     // 一括処理する。
     let hovered_index: Option<usize> = (0..entries_len).find(|&i| {
-        let item_rect = Rect {
-            x: popup_rect.x,
-            y: popup_rect.y + i as f32 * MENU_ITEM_H,
-            w: popup_rect.w,
-            h: MENU_ITEM_H,
-        };
-        pointer.pos.is_some_and(|(px, py)| item_rect.contains(px, py))
+        entries[i].is_interactive()
+            && pointer
+                .pos
+                .is_some_and(|(px, py)| item_rects[i].contains(px, py))
     });
     if let Some(idx) = hovered_index {
         for j in 0..entries_len {
@@ -345,12 +396,24 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     }
 
     for (i, entry) in entries.iter_mut().enumerate() {
-        let item_rect = Rect {
-            x: popup_rect.x,
-            y: popup_rect.y + i as f32 * MENU_ITEM_H,
-            w: popup_rect.w,
-            h: MENU_ITEM_H,
-        };
+        let item_rect = item_rects[i];
+        if matches!(entry, MenuEntry::Separator) {
+            // 左右に padding を空けた 1px の水平線。hover もクリックも受けない。
+            ui.push_rect(RectCommand {
+                rect: Rect {
+                    x: item_rect.x + MENU_PAD_X,
+                    y: (item_rect.y + (item_rect.h - 1.0) * 0.5).round(),
+                    w: (item_rect.w - MENU_PAD_X * 2.0).max(0.0),
+                    h: 1.0,
+                },
+                fill: p.border,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: None,
+            });
+            continue;
+        }
         let hovered = pointer
             .pos
             .is_some_and(|(px, py)| item_rect.contains(px, py));
@@ -361,7 +424,8 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             MenuEntry::Item { enabled, shortcut_hint, .. } => {
                 (*enabled, shortcut_hint.as_deref())
             }
-            MenuEntry::SubMenu { .. } => (true, None),
+            // Separator は上で `continue` 済み。
+            MenuEntry::SubMenu { .. } | MenuEntry::Separator => (true, None),
         };
 
         // hover highlight (enabled な item のみ; disabled / sub-menu は別)
@@ -394,7 +458,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         ui.push_text(GlyphArea {
             text: label_display.as_ref().into(),
             left: item_rect.x + MENU_PAD_X,
-            top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
+            top: item_rect.y + (item_rect.h - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
             line_height: MENU_FONT * 1.2,
             color: text_color,
@@ -411,7 +475,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             ui.push_text(GlyphArea {
                 text: hint.into(),
                 left: item_rect.x + item_rect.w - MENU_PAD_X - hint_w,
-                top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
+                top: item_rect.y + (item_rect.h - MENU_FONT * 1.2) * 0.5,
                 font_size: MENU_FONT,
                 line_height: MENU_FONT * 1.2,
                 color: arrow_color,
@@ -424,7 +488,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             ui.push_text(GlyphArea {
                 text: "▶".into(),
                 left: item_rect.x + item_rect.w - MENU_PAD_X - MENU_FONT,
-                top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
+                top: item_rect.y + (item_rect.h - MENU_FONT * 1.2) * 0.5,
                 font_size: MENU_FONT,
                 line_height: MENU_FONT * 1.2,
                 color: arrow_color,
@@ -444,6 +508,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
                     return_action = Some(a);
                 }
             }
+            MenuEntry::Separator => unreachable!("Separator は描画直後に continue する"),
             MenuEntry::SubMenu { entries: sub_entries, .. } => {
                 let sub_id = format!("{id_path}/{i}");
                 let sub_popup_rect = Rect {
@@ -452,7 +517,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
                     // 中身に合わせて伸ばす (Open Recent の長いファイル名が枠外に
                     // 出ていた)。 上限を超えたら item 側の ellipsis が効く。
                     w: entries_popup_width(ui, sub_entries),
-                    h: (sub_entries.len() as f32) * MENU_ITEM_H,
+                    h: entries_height(sub_entries),
                 };
                 let sub_anchor = union_rect(item_rect, sub_popup_rect);
 
@@ -632,7 +697,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut anchors: Vec<Rect> = Vec::with_capacity(menus.len());
         for (i, (_label, entries)) in menus.iter().enumerate() {
             let label_rect = label_rects[i];
-            let popup_h = (entries.len() as f32) * MENU_ITEM_H;
+            let popup_h = entries_height(entries);
             let popup_w = if open_idx == Some(i) || hovered_idx == Some(i) {
                 entries_popup_width(self, entries)
             } else {
@@ -1623,5 +1688,61 @@ mod tests {
         });
         let texts: Vec<&str> = scene.iter_popup_glyphs().map(|g| g.text.as_ref()).collect();
         assert!(texts.is_empty(), "anchor 外の右クリックで popup が閉じる: {texts:?}");
+    }
+
+    /// (daw_01 r.md #69) `separator()` を挟んだ menu の hit-test。
+    ///
+    /// 区切り線は高さが item と違う (9px vs 24px) ので、popup のレイアウトを
+    /// 「index × 固定高」から **累積オフセット** に変えた。守りたいのは 2 つ:
+    /// (a) 区切り線自身は click を受けない、(b) その **下** の item が
+    /// ずれた位置で正しく当たる (旧計算のままだと 1 段ぶん上を指す)。
+    #[test]
+    fn separator_is_inert_and_shifts_the_items_below_it() {
+        #[derive(Default)]
+        struct M {
+            fired: Vec<&'static str>,
+        }
+        let mut host: UiHost<M> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let mut model = M::default();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+
+        let build = |bar: &mut MenuBarBuilder<'_, M>| {
+            bar.menu("File", |menu| {
+                menu.item("New", |ui| {
+                    ui.push_edit(Edit::mutate(|m: &mut M| m.fired.push("New")));
+                });
+                menu.separator();
+                menu.item("Quit", |ui| {
+                    ui.push_edit(Edit::mutate(|m: &mut M| m.fired.push("Quit")));
+                });
+            });
+        };
+        let mut frame = |host: &mut UiHost<M>, model: &mut M, pos: (f32, f32), click: bool| {
+            host.frame(
+                model,
+                &mut scene,
+                screen,
+                FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some(pos),
+                        primary_just_released: click,
+                        ..PointerFrame::default()
+                    },
+                    ..Default::default()
+                },
+                |_, ui| ui.menu_bar(bar_rect, build),
+            );
+        };
+
+        // popup を開く。以後 popup は y=32 から: New [32,56)、区切り [56,65)、Quit [65,89)。
+        frame(&mut host, &mut model, (20.0, 16.0), true);
+        // 区切り線の帯を click しても何も起きない。
+        frame(&mut host, &mut model, (20.0, 60.0), true);
+        assert!(model.fired.is_empty(), "区切り線は click を受けない: {:?}", model.fired);
+        // 区切りのぶん下へずれた Quit が当たる (旧計算だと y=56 を指していた)。
+        frame(&mut host, &mut model, (20.0, 77.0), true);
+        assert_eq!(model.fired, vec!["Quit"], "区切りの下の item が正しい位置で当たる");
     }
 }

@@ -108,6 +108,15 @@ pub struct RecordingState {
     /// (glissando / release で stuck note を防ぐ)。 `None` で発音なし。
     /// session-only (project save には含めない)。
     pub preview_note: Option<(u32, u8)>,
+    /// r.md #67: カーソルキー (↑/↓) で音程を変えたときに短く鳴らす試聴音
+    /// `(track_id, pitch, 消音予定時刻)`。
+    ///
+    /// 鍵盤レーンの [`Self::preview_note`] とは **別枠**。 あちらは「押している間ずっと
+    /// 鳴らす」 held-value で、 widget が毎フレーム差分して note-off を送るため、
+    /// キー操作由来の発音を載せると 1 フレームで消えてしまう。 こちらは時間で自動消音する
+    /// one-shot (`AppData::expire_nudge_audition` が `on_tick` から回収)。
+    /// session-only / Undo 対象外。
+    pub nudge_audition: Option<(u32, u8, std::time::Instant)>,
     pub midi_input_label: String,
 
     pub step_cursor_beat: f64,

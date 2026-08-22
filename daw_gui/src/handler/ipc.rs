@@ -270,12 +270,11 @@ impl AppData {
             PluginEvent::AllPluginStates { entries } => {
                 self.on_all_states_from_child(entries);
             }
-            PluginEvent::SlotGuiOpened {
+            PluginEvent::SlotGuiGeometry {
                 device_id,
-                width,
-                height,
+                geometry,
             } => {
-                self.on_gui_opened(device_id, width, height);
+                self.on_gui_geometry(device_id, geometry);
             }
             PluginEvent::SlotGuiClosed { device_id } => {
                 self.on_gui_closed(device_id);

@@ -263,6 +263,26 @@ pub struct ProjectFile {
     pub view: Option<ViewState>,
 }
 
+/// プラグインエディタ窓 1 枚分の位置とサイズ (r.md #65)。
+///
+/// `x` / `y` は **screen 座標の窓左上**、`width` / `height` は **client 領域**の
+/// サイズ。どちらも physical pixels — VST3 `ViewRect` も CLAP `gui` も Windows では
+/// physical px を使う契約なので (iplugview.h "Coordinates" 節 /
+/// `CLAP_WINDOW_API_WIN32` の "uses physical size")、DPI スケールを掛け直さない。
+///
+/// **`Song` ではなく [`ViewState`] 側に置く**: 窓をどこに出すかは「作った中身」では
+/// なく「見方の都合」なので、動かしても `*` (dirty) は付かない
+/// (memory `project_dirty_flag_rule`、ズーム / スクロール / ループ範囲と同じ扱い)。
+/// device 単位に持つので key は安定 id (`PluginInstance.id`) — 並べ替えで貼り替えが
+/// 要る positional index は使わない (アーキテクチャ不変条件 #1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct EditorWindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// piano roll 1 クリップ分の表示状態。`AppData.piano_roll_views`
 /// (live SSoT) と `ViewState.piano_roll_views` (永続化) の両方で `ClipKey` 単位に
 /// 保持する。`Default` は `AppData::new` / `fit_piano_roll_to_clip` の既定と一致。
@@ -457,6 +477,12 @@ pub struct ViewState {
     pub piano_roll_views: Vec<(ClipKey, PianoRollViewState)>,
     #[serde(default)]
     pub audio_editor_views: Vec<(ClipKey, AudioEditorViewState)>,
+    // ---- プラグインエディタ窓のジオメトリ (r.md #65) ----
+    /// device_id → 最後に観測したエディタ窓の位置 / client サイズ。
+    /// save 時に **現存する device の分だけ**を device_id 昇順で書き出す
+    /// (per-clip view と同じ orphan GC + 決定的順序の idiom)。
+    #[serde(default)]
+    pub plugin_editor_windows: Vec<(u64, EditorWindowGeometry)>,
 }
 
 /// Arranger セクション (曲のパート =

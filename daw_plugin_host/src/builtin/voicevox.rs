@@ -959,10 +959,6 @@ impl LoadedPlugin for VoicevoxBuiltin {
         Ok(false)
     }
 
-    fn gui_can_resize(&self) -> bool {
-        false
-    }
-
     fn gui_set_parent_hwnd(&self, _hwnd: u64) -> Result<()> {
         Ok(())
     }
@@ -972,10 +968,6 @@ impl LoadedPlugin for VoicevoxBuiltin {
     }
 
     fn gui_hide(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn gui_set_size(&self, _width: u32, _height: u32) -> Result<()> {
         Ok(())
     }
 

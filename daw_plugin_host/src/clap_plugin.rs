@@ -13,6 +13,7 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use clap_sys::audio_buffer::clap_audio_buffer;
@@ -32,7 +33,8 @@ use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
 };
 use clap_sys::ext::gui::{
-    CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_plugin_gui, clap_window, clap_window_handle,
+    CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_gui_resize_hints, clap_plugin_gui, clap_window,
+    clap_window_handle,
 };
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
@@ -58,7 +60,8 @@ use libloading::{Library, Symbol};
 
 use crate::clap_host::Host;
 use crate::plugin_instance::{
-    AudioHalf, AudioProcessorHalf, HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent,
+    AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
+    TimedNoteEvent,
 };
 use crate::process_scaffold::{
     self, TransportBlock, alloc_planar, alloc_planar_ports, copy_aux_inputs_planar,
@@ -441,7 +444,9 @@ impl AudioProcessorHalf for ClapAudioHalf {
 pub struct ClapPlugin {
     entry: *const clap_plugin_entry,
     plugin: *const clap_plugin,
-    _host: Box<Host>,
+    /// CLAP host 実装。`host_data` としてプラグインが握る生ポインタの寿命を持つ。
+    /// r.md #65 以降は `host.callbacks.editor_hwnd` (エディタ窓の公開先) も参照する。
+    host: Box<Host>,
     /// Stable `clap_plugin_descriptor.id` of the loaded descriptor.
     id: String,
     /// ARA session bound to this instance, if any.
@@ -459,6 +464,10 @@ pub struct ClapPlugin {
     paraout_port_count: usize,
     gui_ext: Option<*const clap_plugin_gui>,
     gui_created: bool,
+    /// r.md #65: `plugin` / `gui_ext` の生ポインタをエディタ窓の WNDPROC へ
+    /// 貸してよいか。`gui_create_embedded` で立て、**`gui_destroy` の先頭**で落とす。
+    /// [`ClapSizer`] はこれを見て destroy 済みの GUI を二度と触らない。
+    gui_alive: Arc<AtomicBool>,
     state_ext: Option<*const clap_plugin_state>,
     latency_ext: Option<*const clap_plugin_latency>,
     params_ext: Option<*const clap_plugin_params>,
@@ -701,7 +710,7 @@ impl ClapPlugin {
         Ok(Some(Self {
             entry: entry_ptr,
             plugin: plugin_ptr,
-            _host: host,
+            host,
             id,
             ara: None,
             last_activate: None,
@@ -712,6 +721,7 @@ impl ClapPlugin {
             paraout_port_count,
             gui_ext,
             gui_created: false,
+            gui_alive: Arc::new(AtomicBool::new(false)),
             state_ext,
             latency_ext,
             params_ext,
@@ -1040,6 +1050,9 @@ impl LoadedPlugin for ClapPlugin {
             "gui.create returned false"
         );
         self.gui_created = true;
+        // r.md #65: ここから `gui_destroy` までの間だけ、WNDPROC は plugin /
+        // gui 拡張の生ポインタを借りてよい。
+        self.gui_alive.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1068,16 +1081,25 @@ impl LoadedPlugin for ClapPlugin {
         Ok(unsafe { f(self.plugin, scale) })
     }
 
-    fn gui_can_resize(&self) -> bool {
-        let Some(gui) = self.gui_ref() else { return false };
-        let Some(f) = gui.can_resize else { return false };
-        unsafe { f(self.plugin) }
+    fn gui_sizer(&self) -> Option<Box<dyn EditorSizer>> {
+        if !self.gui_created {
+            return None;
+        }
+        let gui = self.gui_ext?;
+        Some(Box::new(ClapSizer {
+            plugin: self.plugin,
+            gui,
+            alive: Arc::clone(&self.gui_alive),
+        }))
     }
 
     /// Embed into the given host Win32 HWND (passed as a raw `u64` pointer).
     fn gui_set_parent_hwnd(&self, hwnd: u64) -> Result<()> {
         let gui = self.gui_ref().context("plugin has no gui extension")?;
         let f = gui.set_parent.context("gui.set_parent is null")?;
+        // `set_parent` の内側から `request_resize` を投げるプラグインがあるので、
+        // 窓は呼ぶ前に公開しておく (VST3 `attached` と同じ理由)。
+        self.host.callbacks.editor_hwnd.store(hwnd, Ordering::Release);
         let window = clap_window {
             api: CLAP_WINDOW_API_WIN32.as_ptr(),
             specific: clap_window_handle {
@@ -1110,19 +1132,12 @@ impl LoadedPlugin for ClapPlugin {
         Ok(())
     }
 
-    fn gui_set_size(&self, width: u32, height: u32) -> Result<()> {
-        let gui = self.gui_ref().context("plugin has no gui extension")?;
-        let f = gui.set_size.context("gui.set_size is null")?;
-        anyhow::ensure!(
-            unsafe { f(self.plugin, width, height) },
-            "gui.set_size returned false"
-        );
-        Ok(())
-    }
-
     /// Tear down the GUI. Safe to call even if `gui_create_embedded` was not
     /// called (no-op). Idempotent.
     fn gui_destroy(&mut self) {
+        // **先頭で** alive を落とす (r.md #65)。以後 `ClapSizer` は FFI を呼ばない。
+        self.gui_alive.store(false, Ordering::Release);
+        self.host.callbacks.editor_hwnd.store(0, Ordering::Release);
         if !self.gui_created {
             return;
         }
@@ -1132,6 +1147,94 @@ impl LoadedPlugin for ClapPlugin {
             unsafe { f(self.plugin) };
         }
         self.gui_created = false;
+    }
+}
+
+/// [`EditorSizer`] の CLAP 実装 (r.md #65)。手順は `clap/ext/gui.h` L41-45 の
+/// *"Resizing the window (drag, if embedded)"* に一致させる:
+/// `can_resize()` → `adjust_size(new_size)` → `set_size(working_size)`。
+///
+/// VST3 版と同じく **borrowed なポインタしか持たない**。`plugin` / `gui` の所有は
+/// [`ClapPlugin`] にあり、`gui_destroy` が先頭で `alive` を落とす。
+struct ClapSizer {
+    plugin: *const clap_plugin,
+    gui: *const clap_plugin_gui,
+    alive: Arc<AtomicBool>,
+}
+
+// plugin-main スレッド専用 (`EditorSizer: Send` を満たすためだけの宣言)。
+unsafe impl Send for ClapSizer {}
+
+impl ClapSizer {
+    fn gui(&self) -> Option<&clap_plugin_gui> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: `alive` が true の間は `ClapPlugin` が plugin instance を保持して
+        // いるので、そこから取った拡張ポインタも有効。
+        unsafe { self.gui.as_ref() }
+    }
+}
+
+impl EditorSizer for ClapSizer {
+    fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32) {
+        let Some(gui) = self.gui() else { return (w, h) };
+        let Some(f) = gui.adjust_size else { return (w, h) };
+        let (mut aw, mut ah) = (w, h);
+        // ヘッダは *"Returns true if the plugin could adjust the given size."* と
+        // 戻り値を **明示的に規定している**ので、VST3 と違いここは戻り値で分岐してよい。
+        if unsafe { f(self.plugin, &mut aw, &mut ah) } && aw > 0 && ah > 0 {
+            (aw, ah)
+        } else {
+            (w, h)
+        }
+    }
+
+    fn current_client_size(&self) -> Option<(u32, u32)> {
+        let gui = self.gui()?;
+        let f = gui.get_size?;
+        let (mut w, mut h) = (0u32, 0u32);
+        (unsafe { f(self.plugin, &mut w, &mut h) } && w > 0 && h > 0).then_some((w, h))
+    }
+
+    fn notify_client_size(&self, w: u32, h: u32) {
+        let Some(gui) = self.gui() else { return };
+        let Some(f) = gui.set_size else { return };
+        if !unsafe { f(self.plugin, w, h) } {
+            tracing::debug!(w, h, "clap gui.set_size returned false");
+        }
+    }
+
+    fn can_resize(&self) -> bool {
+        self.gui()
+            .and_then(|gui| gui.can_resize)
+            .is_some_and(|f| unsafe { f(self.plugin) })
+    }
+
+    fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {
+        let gui = self.gui()?;
+        let f = gui.get_resize_hints?;
+        let mut hints = clap_gui_resize_hints {
+            can_resize_horizontally: false,
+            can_resize_vertically: false,
+            preserve_aspect_ratio: false,
+            aspect_ratio_width: 0,
+            aspect_ratio_height: 0,
+        };
+        if !unsafe { f(self.plugin, &mut hints) } {
+            return None;
+        }
+        Some(crate::plugin_instance::ResizeHints {
+            can_resize_horizontally: hints.can_resize_horizontally,
+            can_resize_vertically: hints.can_resize_vertically,
+            preserve_aspect_ratio: hints.preserve_aspect_ratio,
+            aspect_ratio_width: hints.aspect_ratio_width,
+            aspect_ratio_height: hints.aspect_ratio_height,
+        })
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
