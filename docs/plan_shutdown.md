@@ -101,13 +101,15 @@ Windows のサインアウト / シャットダウン      ─┘        │ 未
    │ 3. PluginCommand::Shutdown   全 device を teardown → pool 停止 │
    │ 4. AudioCommand::Shutdown    stream pause+drop → exit          │
    │ 5. VOICEVOX engine kill (我々が spawn したものだけ)            │
-   │ 6. recovery ファイル削除                                       │
+   │ 6. 開いている picker / help を畳む                             │
    └────────────────────────────────────────────────────────────────┘
                                                        ↓
                           Draining: 子の exit を try_wait で観測 (最大 5s)
                                     UI は「終了処理中…」だけ
+                                    **以後 event は全部落とす** (§2.4)
                                                        ↓
-                          Finished → event_loop.exit() → Bootstrap::shutdown()
+                          Finished → recovery ファイル削除 (§2.5)
+                                   → event_loop.exit() → Bootstrap::shutdown()
                                                        ↓
                           残っている子を kill → JobHandle::close() (backstop)
 ```
@@ -143,7 +145,38 @@ unload の実装は 1 本 (`PluginHost::shutdown` → `teardown_device` →
 
 `AudioCommand::Shutdown` も同様に「recv_loop を抜けて stream を畳んで exit」だけ。
 
-### 2.3 respawn 抑止は必須
+### 2.3 `Draining` は「アプリが動き続ける窓」なので、event を全部落とす
+
+旧実装は `should_quit` を立てた **同じフレーム**で `exit()` まで走り切っていたので、
+「終了を決めた後」という時間が存在しなかった。子の teardown を待つようにすると
+0〜5 秒のあいだイベントループが回り続け、そこに副作用が入り込む:
+
+- 「終了処理中…」の下に残った picker のクリックが通る (畳ませた plugin host へ
+  `SetSlotPlugin` が飛ぶ)
+- 30 秒周期の `AutosaveTick` が recovery ファイルを書き直す
+
+`AppData::handle_event` の冒頭で **`Draining` 中は全 event を捨てる**。
+export gate (positive-default + block-list) と違って **allow-list ではなく全遮断**
+にできるのは、終了が必ず `DRAIN_TIMEOUT` で終端するから — 「落としすぎて永久ロック」
+という export gate の失敗モードが原理的に存在しない。完了判定 (`poll_shutdown`) は
+event ではなく `try_wait` で回っている。
+
+### 2.4 recovery ファイルを消すのは「本当に終わる瞬間」
+
+`Draining` の開始時に消すと、teardown に数秒かかる間に OS へ強制終了された場合
+「まだ終われていないのに復旧候補だけ消えている」状態になる。`Finished` へ遷移する
+`finish_shutdown` で消す (期限超過の backstop 経路もここを通る)。
+
+### 2.5 待ちを二重に張らない
+
+`Bootstrap::shutdown(already_drained)` は、シーケンスが既に `DRAIN_TIMEOUT` ぶん
+待ち切っている場合は待ち直さない。待ち直すと応答しないプラグインを抱えた終了が
+合計 10 秒になり、しかも後半 5 秒は `event_loop.exit()` の後なので、winit の
+`Window::drop` が `PostMessageW` でしか窓を壊せず**メインウィンドウが凍ったまま
+画面に残る** (Windows に「応答なし」扱いされる)。待ち直すのは **シーケンスを
+通らずに来た経路** (event loop のエラー / `--script` の early return) だけ。
+
+### 2.6 respawn 抑止は必須
 
 子が自力 exit すると pipe は **子側から先に閉じる**ので、daw_gui の reader task が
 EOF を拾って crash とまったく同じ `ChildDisconnected` を合成し、
@@ -151,13 +184,19 @@ EOF を拾って crash とまったく同じ `ChildDisconnected` を合成し、
 生き返る)。`tokio::select!` は writer / reader のどちらが先に完了するか非決定
 なので、「tx を drop して writer を先に終わらせる」だけでは塞げない。
 
-ガードは 2 段:
+ガードは 3 段:
 
 1. **発生源**: `ChildSupervisor.shutting_down: Arc<AtomicBool>` を pipe loop と
    共有し、立っていたら `ChildDisconnected` を合成しない。
 2. **最終防波堤**: `AppData::handle_child_disconnected` の入口。呼び出し口は 3 つ
    (`AudioEvent::ChildDisconnected` / `PluginEvent::ChildDisconnected` /
    `WorkerPoolStalled` からの合成) あるので、呼び出し側に撒くと必ず漏れる。
+3. **respawn の直前でもう一度**。入口のガードは「この関数の実行中に phase は
+   変わらない」を前提にしていたが、関数の途中の `abort_state_roundtrip` が
+   §3.4 の「終了意図を聞き直す」経路を通って **同期的に** `begin_shutdown` まで
+   走り切ることがある。見逃すと、終了シーケンスの直後に新しい plugin host を
+   spawn して全プラグインをロードし直し、5 秒後にそれを強制 kill する — 本件で
+   消したはずの症状がそのまま再現する。
 
 ---
 
@@ -197,12 +236,21 @@ bootstrap 前なので問題無い。
 `std::mem::forget(child)` して handle ごと捨てており、停止手段が Job Object の
 `CloseHandle` しか無かった (= 終了シーケンスが engine の停止を所有できない)。
 
-修正: `VoicevoxState.spawned_engine: Arc<Mutex<Option<Child>>>` に保持し、
+修正: `VoicevoxState.spawned_engine: Arc<Mutex<VoicevoxEngineSlot>>` に保持し、
 終了シーケンスが `kill()` + `wait()` する。**ユーザーが自分で立ち上げていた
-engine は `spawned_engine` が `None` のままなので触らない**
+engine は `child` が `None` のままなので触らない**
 (`ensure_voicevox_engine` は `is_running()` が false のときしか spawn しない)。
 engine は状態を持たない HTTP サーバで graceful shutdown のエンドポイントを
 持たないため、`kill` が正しい終わり方 (プラグインのような「畳む手順」が無い)。
+
+**spawn と停止のレースも塞ぐ**。`is_running()` は localhost:50021 への HTTP GET
+(タイムアウト 1 秒) なので、launcher スレッドが待っている間に終了シーケンスが
+`JobHandle::close()` まで走り切ることがある。その後に spawn が成功すると
+**Job にも入らず kill もされない engine** がポート 50021 と GPU メモリを掴んだまま
+残り、次回起動では `is_running()` が true になるので **二度と回収されない**。
+`VoicevoxEngineSlot { child, shutting_down }` として、停止側が先に旗を立て、
+launcher は spawn 後にそれを見て自分で kill する。`assign_std` が失敗した場合も
+握り潰さず kill する (Job に入れられないなら backstop が効かない)。
 
 ### 3.4 「保存して終了」の途中で子が落ちたとき終了意図が消えていた
 
@@ -231,41 +279,70 @@ winit 0.30.13 は `WM_QUERYENDSESSION` / `WM_ENDSESSION` を **一切扱わな�
   全メッセージ処理に使っており (`WM_NCDESTROY` で 0 に戻す)、奪うと winit が壊れる。
   `daw_plugin_host::editor_window` の idiom (`GWLP_USERDATA` に `Arc` を leak) は
   **自分で `RegisterClassExW` した窓専用**。
-- `GWLP_WNDPROC` は winit が触らない (WNDPROC はクラス登録時に固定、
+- `GWLP_WNDPROC` は winit が触らない (WNDPROC はクラス登録時に固定し、
   `set_window_long` は `GWL_USERDATA` / `GWL_STYLE` のみ) ので競合しない。
 - comctl32 の `SetWindowSubclass` でも良いが、`Win32_UI_Shell` feature
   (57k 行) を丸ごと有効化することになるので採らない。
+- 失敗判定は `SetLastError(0)` してから呼んで `GetLastError()` を見る
+  (`SetWindowLongPtrW` の 0 は「直前の値が 0 だった」かもしれないので、
+  戻り値だけでは失敗と断定できない)。
 
 ### 4.2 WNDPROC から `AppData` は触れない
 
 `WM_QUERYENDSESSION` は winit の pump の `DispatchMessageW` から **同期に**
 呼ばれる。つまり `ApplicationHandler::window_event` のスタックの内側で発火し、
 その時点で `RunnerState.app` は上位フレームに `&mut` で借用されている。
-よって判断は event loop 側に投げ、WNDPROC が持つのは最小限の材料だけ
-(HWND / `EventLoopProxy` / 窓 / `AppDirs` / 未保存かの `AtomicBool` ミラー)。
-ミラーの更新は `refresh_activity` と同じ場所 (毎フレーム)。
+よってここから `AppData` には**原理的に触れない**。WNDPROC が持つのは
+HWND / `EventLoopProxy` / 未保存かの `AtomicBool` ミラーだけ。
 
-### 4.3 応答
+### 4.3 応答 — MSDN の指定どおり
 
-Microsoft のガイダンス (Vista 以降) は **「`WM_QUERYENDSESSION` でダイアログを
-出してはいけない」** (OS の猶予は既定 5 秒)。時間が要るアプリは
-`ShutdownBlockReasonCreate` で理由を登録して `FALSE` を返し、片付いたら自分で
-終了する。シャットダウン画面にはその理由が表示され、ユーザーは「キャンセル」で
-戻って未保存確認に答えられる。
+**`WM_QUERYENDSESSION` は即答する。0 (FALSE) は未保存のときだけ返す。**
 
-よって **常に**理由を登録して `FALSE` を返し、通常の終了シーケンスを
-`AppEvent::Quit` で起こすだけにする。理由文は未保存かで出し分ける
-(「未保存の変更があります」/「終了処理中です」)。
+> Applications should respect the user's intentions and return **TRUE**. …
+> Each application should return TRUE or FALSE immediately upon receiving this
+> message, and **defer any cleanup operations until it receives the WM_ENDSESSION
+> message**.
 
-- `WM_ENDSESSION(wParam != 0)` … 本当に終わる。まだ書けていない window geometry
-  だけ同期で残す (recovery ファイルの削除は終了シーケンスが済ませている)。
-- `WM_ENDSESSION(wParam == 0)` … 取り消された。ブロック理由を消して通常運転へ。
+0 を返すのは重い応答である:
 
-**この WNDPROC の中で子プロセスを畳む実装は書かない**。書くと `AppData` を
-触れないぶん別実装になり、「終わり方」が 2 つに割れる。
+> **If any application returns zero, the session is not ended. The system stops
+> sending WM_QUERYENDSESSION messages as soon as one application returns zero.**
+
+つまり FALSE はセッション終了を取り消すだけでなく、**まだ聞かれていない他の
+アプリに WM_QUERYENDSESSION が届かなくなる** — 隣で開いている未保存の Word が
+保存確認を出す機会を奪う。加えて Vista 以降のガイダンスは
+"**Applications should not block shutdown.**" と明示している。
+
+したがって:
+
+| 状態 | 応答 |
+|---|---|
+| 未保存の変更あり | `ShutdownBlockReasonCreate` 済みの状態で **FALSE**。同時に `AppEvent::Quit` を投げて確認モーダルを出す (ユーザーはシャットダウン画面の「キャンセル」で戻って答えられる) |
+| clean | **TRUE**。ユーザーの意図を尊重し、後始末は `WM_ENDSESSION` で |
+
+**`WM_ENDSESSION` でも WNDPROC の中で子プロセスを畳む実装は書かない**。書けば
+`AppData` を触れないぶん別実装になり、「終わり方」が 2 つに割れる。
+`AppEvent::Quit` を投げて **通常の終了シーケンス** に任せ、即 return する。
+その後もイベントループは回り続けるのでシーケンスが完走してプロセスが終わり、
+`window_state.json` の保存も通常どおり `Runner::exiting` が担う。Windows は
+アプリの exit を待つ (待ちきれなければブロッカー画面を出す = 事実がそのまま
+表示されるだけ)。
+
+### 4.4 ブロック理由の登録は WNDPROC の中ではない
+
+> Applications should call this function **as they begin an operation that
+> cannot be interrupted**, such as burning a CD or DVD.
+
+daw_01 にとってのそれは「未保存の変更を抱えている」なので、dirty ミラーの更新
+(`session_end::set_dirty`、runner が毎フレーム呼ぶ) がそのまま
+`ShutdownBlockReasonCreate` / `Destroy` の維持になる。WNDPROC の中で登録するのは
+仕様の使い方ではない (あちらは即答すべき場所)。
 
 参照:
 - <https://learn.microsoft.com/en-us/windows/win32/shutdown/wm-queryendsession>
+- <https://learn.microsoft.com/en-us/windows/win32/shutdown/wm-endsession>
+- <https://learn.microsoft.com/en-us/windows/win32/shutdown/shutdown-changes-for-windows-vista>
 - <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-shutdownblockreasoncreate>
 
 ---
@@ -316,9 +393,14 @@ Microsoft のガイダンス (Vista 以降) は **「`WM_QUERYENDSESSION` でダ
    `shutdown: tearing down all devices` → `plugin destroyed` /
    `VST3 plugin destroyed` が device 数ぶん → `plugin-main thread exiting` →
    `daw_plugin_host exiting` が出ること。
-2. `daw_audio.*` に `audio stream paused for shutdown` →
-   `audio notify thread joined` → `daw_audio exiting` が出ること。
+2. `daw_audio.*` に `requested audio stream pause for shutdown` →
+   `audio notify thread joined` → **`audio stream released`** → `daw_audio exiting`
+   が出ること。デバイスが実際に解放された証拠は `audio stream released` の方
+   (`pause` はコマンドをキューに積むだけで、実際の `IAudioClient::Stop` は
+   cpal の run thread が後から実行する)。
 3. `tasklist` で daw_audio / daw_plugin_host / VOICEVOX engine が残っていないこと。
-4. `shutdown /s /t 60` → シャットダウン画面に理由が出ること → `shutdown /a` で中止。
+4. `shutdown /s /t 60` → **未保存のとき**だけシャットダウン画面に
+   「未保存の変更があります」が出て止まること (保存済みならそのまま進むこと) →
+   `shutdown /a` で中止。
 5. 未保存の状態で ✕ → 確認モーダル → 「保存して終了」/「保存せず終了」/
    「キャンセル」の 3 分岐。
