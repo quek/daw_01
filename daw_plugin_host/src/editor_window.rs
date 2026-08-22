@@ -1119,6 +1119,69 @@ fn describe_owned_popup(hwnd: HWND) -> String {
         .join(" ;; ")
 }
 
+/// **プラグインの view 窓を、列挙に依存せず直接見る** (r.md #65)。
+///
+/// `attach` 直後に控えた HWND (`view_baseline`) をそのまま使う。
+/// 列挙 (`EnumWindows` + `GW_OWNER`) は「逃げた view」を拾えないことが実測で
+/// 分かっており、観測を列挙に依存させたこと自体が誤りだった。
+///
+/// # 何を判別できるか
+///
+/// プラグインが `SetWindowLong` で `WS_CHILD` を落としただけで `SetParent(NULL)` を
+/// 伴わなかった場合、窓は「スタイル上は top-level だが階層上はまだ子」という
+/// 中途半端な状態になる。この状態は次の 2 つが**同時に成り立つ**ことで見分けられる:
+///
+/// - `GetParent` は owner を返す (`GetParent` は子なら親、`WS_POPUP` なら owner を
+///   返す **曖昧な** API なので、これだけでは判別できない)
+/// - `GetAncestor(GA_PARENT)` は *"Retrieves the parent window. **This does not
+///   include the owner**, as it does with the GetParent function."* — つまり
+///   **これがコンテナを返したら、まだ本当に子**。デスクトップを返したら本物の top-level。
+/// - `GetAncestor(GA_ROOT)` は *"Retrieves the root window by walking the chain of
+///   parent windows."* — **自分自身を返せば top-level、コンテナを返せばまだ子**。
+///
+/// 階層上まだ子なら、その窓の Z 順は「コンテナ内の兄弟に対する順序」であって
+/// デスクトップ上の順序ではない。だから前面に持ち上がらない。
+fn describe_plugin_view(container: HWND, shared: &EditorShared) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_PARENT, GA_ROOT, GA_ROOTOWNER, GW_OWNER, GetAncestor, GetDesktopWindow, GetParent,
+        IsChild,
+    };
+    let (raw, _) = shared.view_baseline.get();
+    if raw == 0 {
+        return "not recorded (gui not attached yet)".to_string();
+    }
+    let view = HWND(raw as *mut core::ffi::c_void);
+    if !unsafe { IsWindow(Some(view)) }.as_bool() {
+        return format!("{raw:#x} (destroyed)");
+    }
+    let desktop = unsafe { GetDesktopWindow() };
+    let ga_parent = unsafe { GetAncestor(view, GA_PARENT) };
+    let ga_root = unsafe { GetAncestor(view, GA_ROOT) };
+    let verdict = if ga_root == view && ga_parent == desktop {
+        "TOP-LEVEL (real)"
+    } else if ga_root == container || ga_parent == container {
+        "STILL A CHILD of the container (style says popup, hierarchy says child)"
+    } else {
+        "UNCLEAR"
+    };
+    format!(
+        "{:#x} style={:#010x} verdict=\"{verdict}\" \
+         GetParent={:#x} GA_PARENT={:#x} GA_ROOT={:#x} GA_ROOTOWNER={:#x} GW_OWNER={:#x} \
+         desktop={:#x} is_child_of_container={} {} above=[{}]",
+        view.0 as usize,
+        unsafe { GetWindowLongPtrW(view, GWL_STYLE) } as u32,
+        unsafe { GetParent(view) }.unwrap_or_default().0 as usize,
+        ga_parent.0 as usize,
+        ga_root.0 as usize,
+        unsafe { GetAncestor(view, GA_ROOTOWNER) }.0 as usize,
+        unsafe { GetWindow(view, GW_OWNER) }.unwrap_or_default().0 as usize,
+        desktop.0 as usize,
+        unsafe { IsChild(container, view) }.as_bool(),
+        describe_rect_and_visibility(view),
+        describe_windows_above(view, 4),
+    )
+}
+
 /// **観測そのものの自己検査** (r.md #65)。
 ///
 /// 今回 `owned_popup` が壊れていたのに、同じログ行の `active=` / `focus=` には
@@ -1207,6 +1270,9 @@ fn check_view_escaped(hwnd: HWND, shared: &EditorShared) {
         style_after = format!("{style:#010x}"),
         still_child = unsafe { windows::Win32::UI::WindowsAndMessaging::IsChild(hwnd, view) }
             .as_bool(),
+        // 逃げた**瞬間**の階層状態。`SetWindowLong` だけで `SetParent` を伴わない
+        // 「スタイルは top-level・階層は子」を、ここで確定させる。
+        hierarchy = %describe_plugin_view(hwnd, shared),
         "plugin view style changed since attach (did it escape the container?)"
     );
 }
@@ -1793,6 +1859,9 @@ unsafe extern "system" fn editor_wnd_proc(
                     target: RESIZE_TARGET,
                     hwnd = format!("{:#x}", hwnd.0 as usize),
                     app_active,
+                    // r.md #65: **列挙に依存しない**直接観測。逃げた view は
+                    // `EnumWindows` に出てこないので、控えた HWND から直接見る。
+                    plugin_view = %describe_plugin_view(hwnd, shared),
                     owned_popup = %describe_owned_popup(hwnd),
                     last_active_popup = %describe_last_active_popup(hwnd),
                     container = %describe_rect_and_visibility(hwnd),
