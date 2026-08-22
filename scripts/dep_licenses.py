@@ -152,11 +152,21 @@ def allowed_licenses() -> set[str]:
     return set(allow)
 
 
-def cargo_metadata(target: str) -> dict:
-    out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--filter-platform", target, "--locked"],
-        cwd=ROOT, check=True, capture_output=True,
-    ).stdout
+def cargo_metadata(target: str, all_features: bool = False) -> dict:
+    """`all_features=True` は **feature で隠れている依存も含める**。
+
+    既定の feature 集合だけを見ていると、optional dependency のライセンスを丸ごと
+    取りこぼす。実際 `assert_no_alloc` (BSD-1-Clause、daw_audio の `rt-assert` feature、
+    `make test-rt` で使う) がこれで検査から漏れていて、cargo-deny を入れて初めて
+    発覚した (2026-08-22)。**許可リストの検査は必ず all-features で行う** —
+    「実際に配布するか」ではなく「このリポジトリがビルドしうるコード」が対象。
+    THIRD-PARTY-NOTICES.md の一覧のほうは既定 feature (= 実際に配る exe の中身) で作る。
+    """
+    cmd = ["cargo", "metadata", "--format-version", "1",
+           "--filter-platform", target, "--locked"]
+    if all_features:
+        cmd.append("--all-features")
+    out = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True).stdout
     return json.loads(out)
 
 
@@ -334,16 +344,19 @@ def main() -> int:
         ap.error("--self-test / --check / --write のいずれかを指定してください")
 
     allowed = allowed_licenses()
-    md = cargo_metadata(args.target)
-    external, kinds = reachable_packages(md)
 
+    # 一覧 (NOTICES) は既定 feature = 実際に配る exe の中身で作る。
+    external, kinds = reachable_packages(cargo_metadata(args.target))
+    text = render(external, kinds, args.target, args.embed_texts)
+
+    # **許可リストの検査は all-features で行う。** optional dependency のライセンスを
+    # 取りこぼさないため (assert_no_alloc / BSD-1-Clause がこれで漏れていた)。
+    audited, _ = reachable_packages(cargo_metadata(args.target, all_features=True))
     violations = [
         f"{p['name']} {p['version']}: {p.get('license') or '(宣言なし)'}"
-        for p in external
+        for p in audited
         if not (p.get("license") and satisfied_by(p["license"], allowed))
     ]
-
-    text = render(external, kinds, args.target, args.embed_texts)
 
     if args.write:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -372,7 +385,10 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        print(f"dep-licenses: ok — {len(external)} crates, all satisfiable by deny.toml allow-list.")
+        print(
+            f"dep-licenses: ok — NOTICES {len(external)} crates (既定 feature) / "
+            f"許可リスト検査 {len(audited)} crates (all-features)."
+        )
 
     return 1 if violations else 0
 

@@ -24,6 +24,81 @@
 # cargo-deny 0.16 で削除されたキー (unlicensed / deny / copyleft / allow-osi-fsf-free /
 # default) は書かない (書くとエラーになる)。「allow に無いものは全部 deny」が現行の既定。
 
+# 依存クレートの脆弱性 / 供給網攻撃の検査 (`make audit`)。
+#
+# なぜ入れたか — 2026-08-20 の実例:
+# crates.io の **arrayref 0.3.10** が汚染された (RUSTSEC-2026-0260)。typosquat の
+# `proc-macro1` への依存が足され、その build script が **コンパイル中にリモートの
+# バイナリを取得して実行**する。同じ攻撃者が 23 分の間に internment 0.8.7 と
+# append-only-vec 0.1.9 も汚染。このリポジトリが無事だったのは Cargo.lock を commit
+# していて迂闊な `cargo update` を走らせなかったからで、検査は存在しなかった。
+#
+# **`make audit` は cargo-deny が無ければ明示エラーで落ちる。**「未インストールにつき
+# skip」の緑は作らない (ライセンス検査と違い、advisories には自前の代替が無い —
+# semver range の自前実装は間違えたときに false green になるので書かない)。
+# 範囲を要さない厳密な検査 (lock の追跡 / manifest との同期 / 既知汚染リリースの
+# 完全一致) は scripts/lockfile_guard.py が **ネットワーク無しで必ず** 走る。
+[advisories]
+# RustSec advisory DB にある脆弱性は既定で deny (0.16 以降、`vulnerability` キーは廃止され
+# 「見つかったらエラー」が既定)。
+#
+# yanked = 取り下げられた版を使っていたら落とす。今回まさに、汚染の巻き添えで正規版まで
+# yank された。「手元の lock が指す版が上流から消えた」は供給網事故の強いシグナルなので deny。
+yanked = "deny"
+#
+# unmaintained は cargo-deny 0.20 では lint level ではなく **対象範囲**
+# ("all" / "workspace" / "transitive" / "none") で、範囲に入ったものはエラーになる。
+#
+# **"workspace" を選ぶ**: 自分が直接選んだ依存の保守停止だけを止める。
+# 実測 (2026-08-22) — all=4件 / transitive=3件 / workspace=1件 / none=0件。
+# transitive の 3 件は paste (macro 経由) / rustybuzz / ttf-parser (cosmic-text → wgpu 系の
+# フォント整形) で、**こちらでは版を選べない**。これで日常的にビルドを落とすと
+# 「赤を無視する習慣」がつき、本物の脆弱性を見落とす方が高くつく。
+# 直接依存なら乗り換え先を検討できるので止める価値がある。
+# **vulnerability / unsound / yanked は範囲に関係なく全部エラー**なので、実害のある
+# 事象は transitive でも止まる。
+unmaintained = "workspace"
+#
+# **例外は必ず「何を / なぜ / どうなったら見直すか」をここに書く。無言の ignore は禁止。**
+# 再評価は **イベントで書く。時間期限は書かない** —「3 ヶ月後に再検討」は誰も見ないので嘘になる。
+#
+# 2026-08-22 の triage (詳細は docs/dependency_audit.md): 検出 9 件のうち 5 件は
+# `cargo update -p <crate>` で解消済み (anyhow / crossbeam-epoch / h2 / quick-xml ×2)。
+# 残る 2 件は **上げ先が存在しない**ので、根拠を書いたうえで例外にする。
+ignore = [
+    # --- bincode 2.0.1 (RUSTSEC-2025-0141, unmaintained) ---
+    # 開発チームが doxxing / harassment を受けて開発を恒久停止した、という informational
+    # advisory。**CVE も CVSS も「こう壊れる」という記述も無い** (脆弱性ではない)。
+    # **上げ先が無い**: crates.io の bincode 3.0.0 は墓標リリースで、lib.rs の中身は
+    # `compile_error!` 1 行。上げるとビルドが即死するので絶対に上げてはいけない。
+    # 露出の評価: 用途は (1) 名前付きパイプ経由の IPC (相手は自分で spawn した子プロセス)、
+    # (2) builtin VOICEVOX の state 復元 — プロジェクトファイル由来の任意バイト列が
+    # デコーダに届く唯一の経路。bincode 2.0.1 は safe Rust の逐次デコーダで長さ claim
+    # ガードを持ち、state_load の失敗も握りつぶさず daw_gui へ返す。踏むべき欠陥が無い。
+    # wincode への移行は、technical failure mode が無いのに IPC の中核を差し替えることに
+    # なり、common/build.rs の WIRE_SOURCES fingerprint 機構との整合も未検証。churn。
+    # **見直しトリガ**: bincode 2.x に informational でない advisory が出たとき /
+    #                   edition や serde の破壊的更新でコンパイル不能になったとき。
+    "RUSTSEC-2025-0141",
+
+    # --- rusty_ffmpeg 0.16.5+ffmpeg.7.1 (yanked) ---
+    # yank の理由は **セキュリティではなく feature gate の誤り**。0.16.5 が
+    # `channel_layout` (AVChannelLayout 定数) を **無条件で** 公開したため、ffmpeg6
+    # feature が OFF のビルドで存在しないシンボルを参照してコンパイルエラーになる。
+    # PR #147 "fix(avutil): correct FFmpeg version of ch_layout" が
+    # `#[cfg(feature = "ffmpeg6")]` を付けて修正し、0.16.5 / 0.16.6 が yank、0.16.7 が後継。
+    # **daw_01 では起こり得ない**: cargo tree -e features で実測したところ
+    # rusty_ffmpeg の ffmpeg5 / ffmpeg6 / ffmpeg7 はすべて有効
+    # (daw_gui → rsmpeg/default → ffmpeg7 → ffmpeg6)。失敗条件そのものが成立しない。
+    # また yank は「新規に解決されなくなる」だけで、lock 済みの既存ビルドは動く。
+    # **上げ先が無い**: 後継の 0.16.6/0.16.7 は `+ffmpeg.8` 系で、こちらは 7.1 ABI に
+    # 固定している (daw_gui/ffmpeg/binding_ffmpeg_7.1.rs と third_party/ffmpeg の pin)。
+    # 7.1 系で yank されていない最後は 0.16.4 だが、それは AVChannelLayout 追加より前の版。
+    # **見直しトリガ**: FFmpeg の pin を 8.x 系へ上げるとき (docs/ffmpeg_mirror.md の
+    #                   版更新と同時に rusty_ffmpeg も 0.16.7+ / rsmpeg 0.17.0+ffmpeg.8.1 へ)。
+    "rusty_ffmpeg@0.16.5+ffmpeg.7.1",
+]
+
 [licenses]
 # askalono の判定信頼度しきい値 (0.0-1.0、既定 0.8)。上げると曖昧な LICENSE 実ファイルを
 # 通さない。
@@ -32,15 +107,18 @@ confidence-threshold = 0.93
 # 2026-08-22 時点で依存グラフ (normal + build、x86_64-pc-windows-msvc) に実在する ID のみ。
 # 使われていない ID を置くと cargo-deny が unused-allowed-license 警告を出すので、
 # 「一覧の網羅」ではなく「実在するものの列挙」に保つ。
+# 自作クレート (GPL-3.0-or-later / daw_gui の LGPL-2.1-or-later) は
+# `[licenses.private] ignore = true` で検査対象外なので、ここには **書かない**。
+# 書くと「allow にあるのに依存グラフで一度も出てこない」= unused-allowed-license 警告になる。
 allow = [
-    # --- 自作クレート (private.ignore で除外されるが、明示しておく) ---
-    "GPL-3.0-or-later",
-    # daw_gui は package 内に FFmpeg ヘッダ由来の bindgen 出力を持つ (REUSE.toml 参照)。
-    "LGPL-2.1-or-later",
-
-    # --- 依存クレート ---
     "0BSD",
     "Apache-2.0",       # GPLv3 とのみ互換 (GPLv2 とは非互換 = v2 に後退できない)
+    # BSD-1-Clause: assert_no_alloc (daw_audio の `rt-assert` feature、make test-rt で使う)。
+    # 著作権表示の保持 + 無保証のみの最も弱い BSD で、BSD-2-Clause より条件が少ない
+    # (広告条項も追加制限も無い) ため GPLv3 と互換。**この 1 件は optional dependency
+    # だったせいで既定 feature の検査から漏れていた** — 以後 dep_licenses.py は
+    # all-features で許可リストを見る。
+    "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",

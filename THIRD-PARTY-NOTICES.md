@@ -50,7 +50,7 @@ crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / V
 | adler2 | 2.0.1 | `0BSD OR MIT OR Apache-2.0` | link | <https://github.com/oyvindln/adler2> |
 | aho-corasick | 1.1.4 | `Unlicense OR MIT` | link | <https://github.com/BurntSushi/aho-corasick> |
 | allocator-api2 | 0.2.21 | `MIT OR Apache-2.0` | link | <https://github.com/zakarumych/allocator-api2> |
-| anyhow | 1.0.102 | `MIT OR Apache-2.0` | link | <https://github.com/dtolnay/anyhow> |
+| anyhow | 1.0.104 | `MIT OR Apache-2.0` | link | <https://github.com/dtolnay/anyhow> |
 | arboard | 3.6.1 | `MIT OR Apache-2.0` | link | <https://github.com/1Password/arboard> |
 | arc-swap | 1.9.1 | `MIT OR Apache-2.0` | link | <https://github.com/vorner/arc-swap> |
 | arrayref | 0.3.9 | `BSD-2-Clause` | link | <https://github.com/droundy/arrayref> |
@@ -92,7 +92,7 @@ crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / V
 | crc32fast | 1.5.0 | `MIT OR Apache-2.0` | link | <https://github.com/srijs/rust-crc32fast> |
 | crossbeam-channel | 0.5.15 | `MIT OR Apache-2.0` | link | <https://github.com/crossbeam-rs/crossbeam> |
 | crossbeam-deque | 0.8.6 | `MIT OR Apache-2.0` | link | <https://github.com/crossbeam-rs/crossbeam> |
-| crossbeam-epoch | 0.9.18 | `MIT OR Apache-2.0` | link | <https://github.com/crossbeam-rs/crossbeam> |
+| crossbeam-epoch | 0.9.20 | `MIT OR Apache-2.0` | link | <https://github.com/crossbeam-rs/crossbeam> |
 | crossbeam-utils | 0.8.21 | `MIT OR Apache-2.0` | link | <https://github.com/crossbeam-rs/crossbeam> |
 | crypto-common | 0.1.7 | `MIT OR Apache-2.0` | link | <https://github.com/RustCrypto/traits> |
 | cursor-icon | 1.2.0 | `MIT OR Apache-2.0 OR Zlib` | link | <https://github.com/rust-windowing/cursor-icon> |
@@ -148,7 +148,7 @@ crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / V
 | gpu-descriptor | 0.3.2 | `MIT OR Apache-2.0` | link | <https://github.com/zakarumych/gpu-descriptor> |
 | gpu-descriptor-types | 0.2.0 | `MIT OR Apache-2.0` | link | <https://github.com/zakarumych/gpu-descriptor> |
 | grid | 1.0.1 | `MIT` | link | <https://github.com/becheran/grid> |
-| h2 | 0.4.13 | `MIT` | link | <https://github.com/hyperium/h2> |
+| h2 | 0.4.18 | `MIT` | link | <https://github.com/hyperium/h2> |
 | half | 2.7.1 | `MIT OR Apache-2.0` | link | <https://github.com/VoidStarKat/half-rs> |
 | harfrust | 0.5.2 | `MIT` | link | <https://github.com/harfbuzz/harfrust> |
 | hashbrown | 0.15.5 | `MIT OR Apache-2.0` | link | <https://github.com/rust-lang/hashbrown> |

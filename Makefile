@@ -1,4 +1,4 @@
-.PHONY: help build run test test-rt clippy license-check clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
+.PHONY: help build run test test-rt clippy license-check audit clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
 # `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
@@ -59,7 +59,8 @@ help:
 	@echo "  make test          テストを持つ package のみ実行 (TEST_PKGS、#[test]0個の examples 等は除外)"
 	@echo "  make test-rt       RT (audio thread) の無確保検査 (rt-assert feature、make test から呼ばれる)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
-	@echo "  make license-check ライセンス表示の検査 (SPDX ヘッダ / REUSE / 依存の GPLv3 互換性)"
+	@echo "  make license-check ライセンス表示の検査 (REUSE 準拠 / 依存の GPLv3 互換性)"
+	@echo "  make audit         依存の脆弱性 / 供給網攻撃の検査 (network 要、cargo-deny 必須)"
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
 	@echo "  make fmt           cargo fmt"
 	@echo "  make fetch-ffmpeg  third_party/ffmpeg を取得 (無ければ DL、各マシン 1 回)"
@@ -145,6 +146,27 @@ license-check:
 	else \
 		echo "note: cargo-deny 未インストール (cargo install --locked cargo-deny) — 自前検査のみで続行"; \
 	fi
+
+# 依存の脆弱性 / 供給網攻撃の検査 (r.md #60 追補)。**license-check とは分ける**
+# (advisory DB の取得にネットワークが要る / 回す頻度が違う)。
+#
+# 2026-08-20、crates.io の arrayref 0.3.10 が汚染された (RUSTSEC-2026-0260)。typosquat の
+# proc-macro1 への依存が足され、その build script が **コンパイル中にリモートのバイナリを
+# 取得して実行**する。このリポジトリが無事だったのは Cargo.lock を commit していて迂闊な
+# `cargo update` を走らせなかったからで、検査は存在しなかった。それを埋める。
+#
+# **cargo-deny が無ければ明示エラーで落とす。「未インストールにつき skip」の緑は作らない。**
+# ライセンス検査は Python の自前実装が同じ不変条件を見ているので skip しても穴が開かないが、
+# advisories には自前の代替が無い。semver range の判定を自前で書くと、間違えたときに
+# 「緑に見えて素通し」= false green になる — 守ろうとしているものそのものを壊す。
+# 範囲判定を要さない厳密な検査 (lock が追跡下か / manifest と同期しているか / 既知の汚染
+# リリースが入っていないか) だけ scripts/lockfile_guard.py が **ネットワーク無しで必ず** 走る。
+audit:
+	@[ -n "$(PYTHON)" ] || { echo "ERROR: python が見つかりません。make audit PYTHON=/path/to/python3" >&2; exit 1; }
+	"$(PYTHON)" scripts/lockfile_guard.py --self-test
+	"$(PYTHON)" scripts/lockfile_guard.py
+	@command -v cargo-deny >/dev/null 2>&1 || { 		echo "ERROR: cargo-deny が入っていません。advisories の検査は skip しません。" >&2; 		echo "       インストール: cargo install --locked cargo-deny" >&2; 		exit 1; 	}
+	cargo deny --all-features check advisories
 
 # アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
 # docs/plan_arch_refactor.md §11)。違反は列挙のみ (exit 0)。
