@@ -33,9 +33,19 @@ impl AppData {
     pub(crate) fn on_gui_closed(&mut self, device_id: u64) {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
-        if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
+        let slot = find_device_by_id(self.song_doc.song(), device_id);
+        if let Some((track, index)) = slot {
             self.ipc.open_plugin_guis.remove(&(track, index));
         }
+        // r.md #65: エディタの open / close は **2 プロセスに跨って往復する**ので、
+        // 片側のログだけでは「誰が閉じて誰が開き直したか」が決まらない。
+        // 頻度は人の操作と同じなので info で常設する。
+        tracing::info!(
+            device_id,
+            slot = ?slot,
+            still_open = self.ipc.open_plugin_guis.len(),
+            "plugin editor closed (SlotGuiClosed from plugin-host)"
+        );
     }
 
     // Args mirror the `SlotPluginLoadedFromChild` AppEvent (= the IPC
@@ -518,7 +528,12 @@ impl AppData {
         // open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
-        if self.ipc.open_plugin_guis.contains(&(track_id, index)) {
+        let is_open = self.ipc.open_plugin_guis.contains(&(track_id, index));
+        // r.md #65: 「GUI ボタンが押された」を 1 行で残す。押すたびに open / close が
+        // 交互になるので、**このログが 2 行連続で出れば人が 2 回押した**と確定する
+        // (= 自動で開き直っているのではない)。
+        tracing::info!(track_id, index, is_open, "toggle_slot_gui (GUI button)");
+        if is_open {
             if let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) {
                 self.send_plugin(PluginCommand::CloseSlotGui { device_id });
             }
@@ -531,7 +546,19 @@ impl AppData {
     /// window で開く。既に開いていれば何もしない (重複 open 防止)。Windows 専用
     /// (他 OS では no-op)。`toggle_slot_gui` (手動トグル) と plugin 追加時の自動
     /// open の両方から使う。
+    #[track_caller]
     pub(crate) fn open_slot_gui(&mut self, track_id: u32, index: u32) {
+        // r.md #65: **呼び出し元を値の中に入れる。** 「開き直った」を見たとき、
+        // 呼んだのが `toggle_slot_gui` (= ユーザーが GUI ボタンを押した) なのか
+        // `drain_pending_gui_opens` (= plugin load 完了の自動 open) なのかで
+        // 原因がまったく別になるのに、ログからは区別できなかった。
+        tracing::info!(
+            track_id,
+            index,
+            already_open = self.ipc.open_plugin_guis.contains(&(track_id, index)),
+            caller = %std::panic::Location::caller(),
+            "open_slot_gui"
+        );
         #[cfg(windows)]
         {
             if self.ipc.open_plugin_guis.contains(&(track_id, index)) {

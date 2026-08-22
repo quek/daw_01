@@ -1323,6 +1323,170 @@ fn describe_owned_popup(hwnd: HWND) -> String {
 ///
 /// 階層上まだ子なら、その窓の Z 順は「コンテナ内の兄弟に対する順序」であって
 /// デスクトップ上の順序ではない。だから前面に持ち上がらない。
+/// プラグイン view の位置 / サイズ指定が **どの空間で解釈されるか**。
+///
+/// # なぜ型にするのか
+///
+/// `SetWindowPos` の座標は「子窓なら親のクライアント座標、そうでなければスクリーン座標」。
+/// この「子窓か」を **style ビット (`WS_CHILD`) で判定すると必ず間違える**。
+/// Redux は `SetWindowLong` で `WS_CHILD` を落として `WS_POPUP` を立てるが
+/// **`SetParent` を呼ばない**ので、`GA_PARENT` はコンテナのままだからだ。
+/// style を見て「popup だからスクリーン座標」と決めると、まさに今日 `above=` で
+/// 踏んだのと同じ「測っている空間の取り違え」になる。
+///
+/// **判定は親リンク (`GA_PARENT`) だけで行う。** style は一切見ない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewCoordSpace {
+    /// `GA_PARENT` がコンテナ = 座標は**コンテナのクライアント座標**。
+    /// 通常の埋め込み view も、Redux の「style だけ popup」な view もこちら。
+    ParentClient,
+    /// `GA_PARENT` がデスクトップ = 本物の top-level = 座標は**スクリーン座標**。
+    Screen,
+}
+
+fn view_coord_space(view: HWND) -> ViewCoordSpace {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_PARENT, GetAncestor, GetDesktopWindow};
+    let parent = unsafe { GetAncestor(view, GA_PARENT) };
+    let desktop = unsafe { GetDesktopWindow() };
+    if parent.0.is_null() || parent == desktop {
+        ViewCoordSpace::Screen
+    } else {
+        ViewCoordSpace::ParentClient
+    }
+}
+
+/// `onSize` / `set_size` に **従わなかった**プラグインの view 窓を、ホスト側から
+/// コンテナのクライアント領域へ合わせる (r.md #65)。
+///
+/// # 既定では何もしない — これは仕様上プラグインの責務だから
+///
+/// `iplugview.h` の "Sizing of a view" は
+/// *"**Please only resize the platform representation of the view when
+/// IPlugView::onSize () is called.**"* と、**view の platform 窓を動かすのは
+/// プラグイン側**だと明記している。ホスト側の規定は
+/// *"The host then resizes the window to this rect and has to call
+/// IPlugView::onSize ()"* で、"the window" はホストが用意したコンテナのこと。
+///
+/// OSS ホストにも view の HWND を動かす前例は無い。JUCE の
+/// `HWNDComponent::updateHWNDBounds` が `SetWindowPos` する相手は **JUCE 自身の
+/// peer HWND (= コンテナ)** であってプラグインの view ではないし
+/// (juce_HWNDComponent_windows.cpp L69 / juce_VST3PluginFormat.cpp L427)、
+/// SDK の editorhost も自分の窓しか動かさない。
+///
+/// # だから「効いたか」を測ってからだけ動かす
+///
+/// Redux は view を `WS_POPUP` に化けさせた状態で `onSize` を無視する
+/// (実測: `plugin_size_before == plugin_size_after == (1274,639)` に対し
+/// コンテナは 2560x1417)。一方 Scaler 2 は正しく追従する
+/// (実測: `(1000,700)` → `(2560,1417)`)。
+///
+/// **「呼んだ」と「効いた」は別の事実**なので、`notify_client_size` の直後に
+/// `plugin_view_size()` を読み直して**従わなかったときだけ**補正する。
+/// これで従うプラグインには二重適用されない (= Scaler 2 を壊さない)。
+/// プラグイン起点リサイズの経路でも、プラグインは既に自分の view を目的の
+/// サイズにしてから `resizeView` を出すので一致し、補正は走らない (= 振動しない)。
+///
+/// 戻り値はログ用の結末。
+fn enforce_view_size_if_ignored(
+    container: HWND,
+    sizer: &dyn EditorSizer,
+    want_w: u32,
+    want_h: u32,
+) -> &'static str {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+
+    if sizer.plugin_view_size() == Some((want_w, want_h)) {
+        // プラグインが自分で追従した = 仕様どおり。触らない。
+        return "plugin followed onSize";
+    }
+    let view = unsafe { GetWindow(container, GW_CHILD) }.unwrap_or_default();
+    if view.0.is_null() {
+        return "no view window to correct";
+    }
+
+    let space = view_coord_space(view);
+    // 空間ごとに **原点の意味が違う**。ここを取り違えると窓が画面外へ飛ぶ。
+    let (x, y) = match space {
+        ViewCoordSpace::ParentClient => (0, 0),
+        ViewCoordSpace::Screen => {
+            let mut origin = POINT { x: 0, y: 0 };
+            if unsafe { ClientToScreen(container, &raw mut origin) }.as_bool() {
+                (origin.x, origin.y)
+            } else {
+                return "could not resolve the container client origin";
+            }
+        }
+    };
+    let Ok(w) = i32::try_from(want_w) else { return "width out of range" };
+    let Ok(h) = i32::try_from(want_h) else { return "height out of range" };
+
+    let result = unsafe {
+        SetWindowPos(view, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE)
+    };
+
+    // **効いたことを検証する** (r.md #65 の教訓: 「呼んだ」で満足しない)。
+    // 期待値はスクリーン座標で持つ — 空間に依らず 1 つの物差しで測れるので、
+    // 上の分岐そのものが正しかったかまで検査できる。
+    let mut expected = RECT { left: 0, top: 0, right: w, bottom: h };
+    if space == ViewCoordSpace::ParentClient {
+        let mut origin = POINT { x: 0, y: 0 };
+        if unsafe { ClientToScreen(container, &raw mut origin) }.as_bool() {
+            expected.left = origin.x;
+            expected.top = origin.y;
+            expected.right = origin.x + w;
+            expected.bottom = origin.y + h;
+        }
+    } else {
+        expected.left = x;
+        expected.top = y;
+        expected.right = x + w;
+        expected.bottom = y + h;
+    }
+    let mut got = RECT::default();
+    let read_back = unsafe { GetWindowRect(view, &raw mut got) }.is_ok();
+    let landed = read_back
+        && got.left == expected.left
+        && got.top == expected.top
+        && got.right == expected.right
+        && got.bottom == expected.bottom;
+
+    tracing::info!(
+        target: RESIZE_TARGET,
+        container = format!("{:#x}", container.0 as usize),
+        view = format!("{:#x}", view.0 as usize),
+        // **どの空間で動かしたか**を値の中に残す (style ではなく親リンクで決めている)。
+        space = ?space,
+        want_w,
+        want_h,
+        set_ok = result.is_ok(),
+        error = ?result.as_ref().err(),
+        expected_screen = format!(
+            "({},{} {}x{})",
+            expected.left,
+            expected.top,
+            expected.right - expected.left,
+            expected.bottom - expected.top
+        ),
+        got_screen = if read_back {
+            format!(
+                "({},{} {}x{})",
+                got.left,
+                got.top,
+                got.right - got.left,
+                got.bottom - got.top
+            )
+        } else {
+            "(GetWindowRect failed)".to_string()
+        },
+        landed,
+        plugin_size_after_correction = ?sizer.plugin_view_size(),
+        "plugin ignored onSize — host moved the view window itself"
+    );
+    if landed { "corrected by host" } else { "correction did not land" }
+}
+
 fn describe_plugin_view(container: HWND, shared: &EditorShared) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{
         GA_PARENT, GA_ROOT, GA_ROOTOWNER, GW_OWNER, GetAncestor, GetDesktopWindow, GetParent,
@@ -1596,11 +1760,16 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
     let size_events_after = shared.size_events.get();
     // `SetWindowPos` が WM_SIZE を出さなかった (= サイズが変わらなかった) ケースの保険。
     let mut fallback_notify = false;
+    let mut enforce_outcome = "not needed";
     if let Some(sizer) = shared.sizer()
         && sizer.plugin_view_size() != Some((width, height))
     {
         sizer.notify_client_size(width, height);
         fallback_notify = true;
+        // r.md #65 同件: ここも「`onSize` を呼んだ = 効いた」を暗黙に仮定していた。
+        // `WM_SIZE` 経路と**同じ検証つき補正**を通す (片方だけ直すと、
+        // `SetWindowPos` が `WM_SIZE` を出さなかったときだけ view が取り残される)。
+        enforce_outcome = enforce_view_size_if_ignored(hwnd, sizer, width, height);
     }
     shared.in_plugin_resize.set(false);
     // `geometry_dirty` はここで立てない: サイズが実際に変わったなら
@@ -1620,6 +1789,7 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
         client_after = format!("{}x{}", client_after.0, client_after.1),
         wm_size_delivered = size_events_after - size_events_before,
         fallback_notify,
+        enforce_outcome,
         outcome = ?PluginResizeOutcome::Applied,
         "plugin requested resize (applied)"
     );
@@ -1844,13 +2014,20 @@ unsafe extern "system" fn editor_wnd_proc(
                     let current = sizer.plugin_view_size();
                     if cw > 0 && ch > 0 && current != Some((cw, ch)) {
                         sizer.notify_client_size(cw, ch);
+                        let after = sizer.plugin_view_size();
+                        // r.md #65: **「呼んだ」と「効いた」は別の事実。**
+                        // ここは VST3 (`onSize`) と CLAP (`set_size`) の
+                        // **共通の下流**なので、補正も 1 箇所で済む
+                        // (format ごとに書くと片方だけ直す事故になる)。
+                        let outcome = enforce_view_size_if_ignored(hwnd, sizer, cw, ch);
                         tracing::info!(
                             target: RESIZE_TARGET,
                             hwnd = format!("{:#x}", hwnd.0 as usize),
                             client_w = cw,
                             client_h = ch,
                             plugin_size_before = ?current,
-                            plugin_size_after = ?sizer.plugin_view_size(),
+                            plugin_size_after = ?after,
+                            outcome,
                             "WM_SIZE -> notified plugin (onSize / set_size)"
                         );
                     }
@@ -2067,9 +2244,25 @@ unsafe extern "system" fn editor_wnd_proc(
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
-            if let Some(shared) = shared_of(hwnd) {
+            let flagged = if let Some(shared) = shared_of(hwnd) {
                 shared.close_requested.set(true);
-            }
+                true
+            } else {
+                false
+            };
+            // r.md #65: **✕ が「押された」ことと「閉じた」ことは別の事実**。
+            // `WM_CLOSE` は trace テーブルに入っておらず (= 落ちても痕跡が残らない)、
+            // 実際「Redux の ✕ で閉じられない」の切り分けで
+            // 「来ていないのか / 来ているが後段が動かないのか」を区別できなかった。
+            // 頻度は「窓 1 枚につき最大 1 回」なので info で常設してよい。
+            tracing::info!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                // false = `GWLP_USERDATA` から状態を取り戻せなかった
+                // (= このあと poll しても閉じない)。
+                flagged,
+                "WM_CLOSE received (editor caption close button)"
+            );
             return LRESULT(0);
         }
         _ => {}
