@@ -189,18 +189,40 @@ make audit          # 依存の脆弱性 / yanked / 供給網攻撃の検査 (ne
 
 ### プラグインエディタ窓と Win32（Windows）
 
-- **エディタ窓は daw_plugin_host が所有する owner 無しの top-level**
+- **エディタ窓は daw_plugin_host が作る top-level で、owner は daw_gui の本体窓**
   (`daw_plugin_host/src/editor_window.rs`)。plugin-main スレッドで `CreateWindowExW` し、
   同じスレッドで CLAP `clap_plugin_gui.set_parent` / VST3 `IPlugView::attached(kPlatformTypeHWND)`
   を呼んでプラグイン側を子ウィンドウ化する。設計正本は `docs/plan_plugin_editor_topwindow.md`
-- **daw_gui を owner にしてはいけない**。`GetAncestor(.., GA_ROOTOWNER)` が daw_gui に解決すると、
-  JUCE (Scaler 2 等) が cascade サブメニューを `Process::isForegroundProcess()` 判定で即 dismiss
-  する。旧実装 (daw_gui が窓を作り HWND を IPC で子プロセスへ渡す) がこれを踏んでいた (FIXME #31)
-- 上の帰結として **HWND は IPC を渡らない**。protocol に HWND の field は無い。
-  `gui_set_parent_hwnd(u64)` の `u64` は plugin format 非依存にするためのプロセス内表現で、
-  プロセス境界とは無関係 (`HWND` は `windows` crate で `HWND(*mut c_void)`)。
-  daw_gui 内で HWND を持ち回る箇所 (preview 窓の owner / file dialog の owner-modal 化) も
-  すべて同一プロセス内
+- **daw_gui がエディタ窓を「作って」はいけない** (窓が daw_gui のプロセスに属してはいけない)。
+  JUCE は `Process::isForegroundProcess()` = `GetForegroundWindow()` の **プロセス ID** を
+  `GetCurrentProcessId()` と比べる。窓が daw_gui のものだと、プラグイン (= daw_plugin_host で
+  動く) から見て false になり、cascade サブメニューが即 dismiss される。旧実装
+  (daw_gui が窓を作り HWND を子プロセスへ渡す) がこれを踏んでいた (FIXME #31)。
+  **禁止されるのは「窓の所属プロセス」であって「所有関係」ではない。**
+  現行実装は daw_plugin_host が作るので前面窓は常に自プロセスのものになり、この枝で通る。
+- **owner に daw_gui の本体窓を指定すること自体は安全** (2026-08-22 に一次情報で確認し、
+  それ以前の「daw_gui を owner にしてはいけない」という記述を撤回した)。根拠:
+  JUCE のメニューが使う述語は
+  `Process::isForegroundProcess() || isEmbeddedInForegroundProcess(c)`
+  (`juce_gui_basics/detail/juce_WindowingHelpers.h`) で、**`GA_ROOTOWNER` を見るのは
+  `||` の右側 = 救済パス**。判定を緩める方向にしか効かないので、`GA_ROOTOWNER` が daw_gui に
+  解決することが dismiss を引き起こすことは原理的に無い。しかも左辺が true (前面窓は
+  daw_plugin_host のもの) なので短絡し、右辺は評価すらされない。
+- **owner を付ける目的**は REAPER と同じ体験 (エディタ窓が本体窓の後ろに回らない /
+  Alt+Tab の一覧に出ない)。Win32 の規定に丸ごと乗る:
+  「owner を持つ窓は常に owner より上の Z 順」「owner が破棄されると owned も破棄される」
+  「owner が最小化されると owned は隠れる」。`WS_EX_TOOLWINDOW` が Alt+Tab とタスクバーから
+  外す。**この 2 つは必ずセットで、owner が先**。`WS_EX_TOOLWINDOW` だけ先に入れると、
+  一覧から消えたのに潜れる = 戻す手段が無い状態になり、現状より悪化する。
+- owner は **`CreateWindowExW` の `hWndParent` で作成時に決める**。
+  `SetWindowLongPtr(GWLP_HWNDPARENT)` で後から付け替えない
+  (Learn は "cannot transfer ownership of the window to another window" と
+  "GWLP_HWNDPARENT ... Sets a new owner" が矛盾している。作成時指定なら矛盾を踏まない)。
+- 上の帰結として **owner の HWND は IPC を渡る**。`u64` の platform window handle として
+  protocol に載せる (`HWND` は `windows` crate で `HWND(*mut c_void)`、macOS なら `NSView*`
+  相当が入る想定の platform 非依存 field)。**PID を渡して窓を探す方式は採らない** —
+  「見つからなければ owner 無しに落ちる」発見方式は、fetch-ffmpeg で原理的に対応できないと
+  判明したのと同じ形 ([[project_ffmpeg_fetch_n71_gone]])。所有者は 1 か所で決まるべき。
 - **エディタ窓を操作している間、daw_gui は非フォーカスどころか foreground プロセスですらない**
   (上記のとおり意図的)。「アプリ全体がアクティブか」は daw_gui 内の情報だけでは原理的に
   判定できないので、エディタ窓の WNDPROC が `WM_ACTIVATEAPP` を拾い
