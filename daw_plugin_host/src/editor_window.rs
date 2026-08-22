@@ -74,7 +74,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WA_INACTIVE, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_MOVE, WM_NCACTIVATE, WM_PAINT,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_MOVE, WM_NCACTIVATE,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_SYSCOMMAND,
     WM_SIZE, WM_SIZING,
     WM_TIMER, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
     WNDCLASSEXW,
@@ -201,7 +202,7 @@ fn trace_enabled() -> bool {
 /// 有効でなければ即 return (相手 HWND の問い合わせもしない)。
 fn trace_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_CAPTURECHANGED, WM_KILLFOCUS, WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCLBUTTONDOWN,
+        WM_CAPTURECHANGED, WM_KILLFOCUS, WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCHITTEST,
         WM_SETFOCUS, WM_SHOWWINDOW, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     };
     if !trace_enabled() {
@@ -218,6 +219,10 @@ fn trace_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         WM_WINDOWPOSCHANGING => "WM_WINDOWPOSCHANGING",
         WM_WINDOWPOSCHANGED => "WM_WINDOWPOSCHANGED",
         WM_CAPTURECHANGED => "WM_CAPTURECHANGED",
+        // r.md #65: ✕ が効かない件。`WM_NCLBUTTONDOWN` が来ないとき、そもそも
+        // hit-test すら我々に届いていないのかを見分ける最後の 1 段。マウス移動の
+        // たびに来るので **trace のみ** (info に上げてはいけない)。
+        WM_NCHITTEST => "WM_NCHITTEST",
         WM_SHOWWINDOW => "WM_SHOWWINDOW",
         WM_ENTERSIZEMOVE => "WM_ENTERSIZEMOVE",
         WM_EXITSIZEMOVE => "WM_EXITSIZEMOVE",
@@ -1323,6 +1328,73 @@ fn describe_owned_popup(hwnd: HWND) -> String {
 ///
 /// 階層上まだ子なら、その窓の Z 順は「コンテナ内の兄弟に対する順序」であって
 /// デスクトップ上の順序ではない。だから前面に持ち上がらない。
+/// `WM_NCHITTEST` / `WM_NCLBUTTONDOWN` の hit-test コードを名前に (r.md #65)。
+///
+/// 生値のままログに出すと、`HTCLOSE` (= ✕ の上) なのか `HTCAPTION` (= キャプションの
+/// 空き) なのかを読むたびに人が変換することになり、その場で読み違える。
+fn hit_test_name(ht: u32) -> &'static str {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
+        HTMENU, HTMINBUTTON, HTNOWHERE, HTRIGHT, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+        HTTRANSPARENT,
+    };
+    match ht {
+        HTNOWHERE => "HTNOWHERE",
+        HTCLIENT => "HTCLIENT",
+        HTCAPTION => "HTCAPTION",
+        HTSYSMENU => "HTSYSMENU",
+        HTMENU => "HTMENU",
+        HTMINBUTTON => "HTMINBUTTON",
+        HTMAXBUTTON => "HTMAXBUTTON",
+        HTCLOSE => "HTCLOSE",
+        HTLEFT => "HTLEFT",
+        HTRIGHT => "HTRIGHT",
+        HTTOP => "HTTOP",
+        HTTOPLEFT => "HTTOPLEFT",
+        HTTOPRIGHT => "HTTOPRIGHT",
+        HTBOTTOM => "HTBOTTOM",
+        HTBOTTOMLEFT => "HTBOTTOMLEFT",
+        HTBOTTOMRIGHT => "HTBOTTOMRIGHT",
+        // `HTTRANSPARENT` だけ windows crate での型が `i32` (値は -1)。
+        x if x == HTTRANSPARENT.cast_unsigned() => "HTTRANSPARENT",
+        _ => "HT?",
+    }
+}
+
+/// `WM_SYSCOMMAND` のコマンドを名前に (下位 4bit は呼び出し側で落としてから渡す)。
+fn sys_command_name(sc: u32) -> &'static str {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SC_CLOSE, SC_KEYMENU, SC_MAXIMIZE, SC_MINIMIZE, SC_MOUSEMENU, SC_MOVE, SC_RESTORE, SC_SIZE,
+    };
+    match sc {
+        SC_CLOSE => "SC_CLOSE",
+        SC_MOVE => "SC_MOVE",
+        SC_SIZE => "SC_SIZE",
+        SC_MINIMIZE => "SC_MINIMIZE",
+        SC_MAXIMIZE => "SC_MAXIMIZE",
+        SC_RESTORE => "SC_RESTORE",
+        SC_KEYMENU => "SC_KEYMENU",
+        SC_MOUSEMENU => "SC_MOUSEMENU",
+        _ => "SC?",
+    }
+}
+
+/// いまマウスキャプチャを握っている窓を 1 行で (r.md #65)。
+///
+/// **`GetCapture` はこのスレッドの窓しか返さない** — *"GetCapture returns NULL if
+/// the mouse is not captured **by a window in the current thread**"*。
+/// プラグイン view は同じ plugin-main スレッドで作られているので、この用途では足りる。
+/// 値の中にその前提を書いておく (別スレッドの窓が握っていても null に見えるため)。
+fn describe_capture() -> String {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    let cap = unsafe { GetCapture() };
+    if cap.0.is_null() {
+        "none(this-thread-only)".to_string()
+    } else {
+        format!("{}(this-thread-only)", describe_hwnd(cap))
+    }
+}
+
 /// プラグイン view の位置 / サイズ指定が **どの空間で解釈されるか**。
 ///
 /// # なぜ型にするのか
@@ -2238,6 +2310,42 @@ unsafe extern "system" fn editor_wnd_proc(
             }
             // 既定動作 (フォーカス周りの内部処理) は潰さずそのまま流す。
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+
+        // r.md #65: **✕ が効かないのはクリックがどこで消えているからか**を測る。
+        // 実測で「view が逃げたあとは `WM_CLOSE` が 1 度も来ない」ところまでは
+        // 判っているが、その手前のどこで切れているかが判らない。キャプションの
+        // ✕ は Win32 では
+        //   WM_NCHITTEST(HTCLOSE) -> WM_NCLBUTTONDOWN -> WM_SYSCOMMAND(SC_CLOSE) -> WM_CLOSE
+        // と 4 段で降りてくるので、途中 2 段を info で常設して「どこまで来たか」を
+        // 1 往復で確定できるようにする。**ユーザーの操作でしか出ない**ので頻度は問題ない。
+        //
+        // どちらの arm も `return` しない (DefWindowProc に落として既定動作を残す)。
+        WM_NCLBUTTONDOWN | WM_SYSCOMMAND => {
+            let what = if msg == WM_NCLBUTTONDOWN {
+                format!("WM_NCLBUTTONDOWN ht={}", hit_test_name(wparam.0 as u32))
+            } else {
+                // 下位 4bit は内部用途に予約されているので落としてから比較する
+                // (MSDN WM_SYSCOMMAND: "the four low-order bits ... are used
+                //  internally by the system").
+                format!("WM_SYSCOMMAND cmd={}", sys_command_name(wparam.0 as u32 & 0xFFF0))
+            };
+            tracing::info!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                msg = %what,
+                // マウスキャプチャを持っている窓。プラグインの popup が握っていれば
+                // キャプション上のクリックもそちらへ吸われる。
+                capture = %describe_capture(),
+                // 無効化されていれば Win32 はクリックを黙って捨てる。
+                enabled = unsafe {
+                    windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd)
+                }
+                .as_bool(),
+                container = %describe_rect_and_visibility(hwnd),
+                plugin_child = %describe_plugin_child(hwnd),
+                "editor caption input"
+            );
         }
 
         WM_CLOSE => {
