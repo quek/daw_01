@@ -163,6 +163,31 @@ pub struct HostCallbacks {
     pub editor_hwnd: Arc<AtomicU64>,
 }
 
+/// `canResize` / `can_resize` の問い合わせ結果**と、その根拠** (r.md #65)。
+///
+/// 生の戻り値を捨てて `bool` だけ返すと、ログには「false と判定した」しか残らず
+/// **「プラグインが本当に不可と答えた」のか「そもそも問い合わせられなかった」のか**が
+/// 区別できない。実際 Renoise Redux は REAPER では枠リサイズできるのに daw_01 では
+/// `resizable=false` になっており、どちらなのかログから判定できなかった。
+#[derive(Debug, Clone, Copy)]
+pub struct ResizableProbe {
+    /// ホストの判定 (窓スタイルに使う値)。
+    pub verdict: bool,
+    /// プラグインへ実際に問い合わせられたか。`false` = view / gui 拡張が無く
+    /// 呼べていない (= `verdict` は「不可」ではなく「不明」の既定値)。
+    pub queried: bool,
+    /// 生の戻り値。VST3 は `tresult` (`kResultTrue == kResultOk == 0`)、
+    /// CLAP は `bool` を `0` / `1` で入れる。`queried == false` なら無意味。
+    pub raw: i32,
+}
+
+impl ResizableProbe {
+    /// 問い合わせられなかった (view / gui 拡張が無い)。
+    pub const fn unavailable() -> Self {
+        Self { verdict: false, queried: false, raw: 0 }
+    }
+}
+
 /// CLAP `clap_gui_resize_hints` 相当 (`clap/ext/gui.h` L91-103)。VST3 に対応 API は
 /// 無いので `None` を返す。
 ///
@@ -205,7 +230,9 @@ pub trait EditorSizer: Send {
     /// 確定した client サイズを通知する (VST3 `onSize` / CLAP `set_size`)。
     fn notify_client_size(&self, w: u32, h: u32);
     /// ユーザーが窓枠でリサイズしてよいか (VST3 `canResize` / CLAP `can_resize`)。
-    fn can_resize(&self) -> bool;
+    /// **生の戻り値ごと**返す ([`ResizableProbe`]) — 「false だった」ではなく
+    /// 「なぜ false になったか」をログに残せるようにするため。
+    fn can_resize(&self) -> ResizableProbe;
     /// CLAP `get_resize_hints` 相当。VST3 は `None`。
     fn resize_hints(&self) -> Option<ResizeHints>;
     /// `gui_destroy` 済みなら `false`。`false` の間は他のメソッドを呼んではいけない。

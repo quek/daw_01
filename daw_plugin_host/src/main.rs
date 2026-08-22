@@ -319,7 +319,7 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
         "plugin does not support an embedded win32 GUI"
     );
     plugin.gui_create_embedded()?;
-    let resizable = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+    let resizable = plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict);
     let size = plugin
         .gui_get_size()
         .filter(|&(w, h)| w > 0 && h > 0)
@@ -343,7 +343,7 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
     plugin.gui_set_parent_hwnd(editor.hwnd_u64())?;
     pump_pending_messages();
     let shown = plugin.gui_show()?;
-    let resizable_now = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+    let resizable_now = plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict);
     if resizable_now != resizable {
         editor.set_resizable(resizable_now);
     }
@@ -1676,7 +1676,23 @@ impl PluginHost {
 
         // pre-attach の可否。attach 後に再 query して貼り替える (Arturia 系は
         // attach 前に答えられない)。
-        let resizable = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+        // **生の戻り値ごとログする** (r.md #65): 「false だった」だけだと、
+        // プラグインが不可と答えたのか view が無くて問い合わせられなかったのかを
+        // 区別できない。`phase` で pre/post を必ず分けて出す (post の行が本当に
+        // 再 query の結果なのか、pre の値の再掲なのかもログから判る)。
+        let probe = plugin
+            .gui_sizer()
+            .map_or_else(plugin_instance::ResizableProbe::unavailable, |s| s.can_resize());
+        let resizable = probe.verdict;
+        tracing::info!(
+            target: "editor_resize",
+            plugin = %plugin.name(),
+            phase = "pre-attach",
+            verdict = probe.verdict,
+            queried = probe.queried,
+            raw = format!("{:#x}", probe.raw),
+            "canResize / can_resize probed"
+        );
         // Default to a sane size when the pre-attach query is missing or
         // 0×0 (some VST3 editors only know their size after `attached`).
         let size = plugin
@@ -1738,6 +1754,11 @@ impl PluginHost {
         // from inside set_parent — pump once before show.
         pump_pending_messages();
 
+        // r.md #65: attach 直後の view (HWND + style) を基準値として控える。
+        // 以後 `WM_ACTIVATE` のたびに突き合わせ、「view がコンテナから外れて
+        // top-level popup に化けた」瞬間を **ログだけで** 特定できるようにする。
+        editor.record_view_baseline();
+
         match plugin.gui_show() {
             Ok(true) => {}
             Ok(false) => {
@@ -1756,7 +1777,20 @@ impl PluginHost {
 
         // attach 後の可否でスタイルを貼り替える (pre-attach 値の焼き込みは
         // 「attach 後にしか答えないプラグインが恒久的に固定枠になる」退行を作る)。
-        let resizable_now = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+        let probe_now = plugin
+            .gui_sizer()
+            .map_or_else(plugin_instance::ResizableProbe::unavailable, |s| s.can_resize());
+        let resizable_now = probe_now.verdict;
+        tracing::info!(
+            target: "editor_resize",
+            plugin = %plugin.name(),
+            phase = "post-attach",
+            verdict = probe_now.verdict,
+            queried = probe_now.queried,
+            raw = format!("{:#x}", probe_now.raw),
+            changed_from_pre_attach = resizable_now != resizable,
+            "canResize / can_resize probed"
+        );
         if resizable_now != resizable {
             editor.set_resizable(resizable_now);
         }

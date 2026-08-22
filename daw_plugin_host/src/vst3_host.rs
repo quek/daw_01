@@ -410,7 +410,18 @@ impl IPlugFrameTrait for Vst3PlugFrame {
         }
         use crate::editor_window::PluginResizeOutcome;
         let hwnd = self.callbacks.editor_hwnd.load(Ordering::Acquire);
-        match crate::editor_window::plugin_requested_resize(hwnd, w, h) {
+        // r.md #65: **この経路が無記録だったせいで**、実ログから「Redux が
+        // `resizeView` を呼んでいない」のか「呼んだがホストが握りつぶした」のかを
+        // 区別できなかった。常設の info ログにする (発火はユーザーの resize 操作時だけ)。
+        tracing::info!(
+            target: "editor_resize",
+            want_w = w,
+            want_h = h,
+            editor_hwnd = format!("{hwnd:#x}"),
+            "VST3 IPlugFrame::resizeView"
+        );
+        let outcome = crate::editor_window::plugin_requested_resize(hwnd, w, h);
+        let res = match outcome {
             PluginResizeOutcome::Applied => kResultTrue,
             // 再入拒否。**非同期経路へ積み直さない** — 「拒否」と伝えたリサイズが
             // 1 周期後に実行されると、プラグインの内部状態と窓サイズが食い違う。
@@ -420,6 +431,15 @@ impl IPlugFrameTrait for Vst3PlugFrame {
                 (self.callbacks.on_request_resize)(w, h);
                 kResultTrue
             }
-        }
+        };
+        tracing::info!(
+            target: "editor_resize",
+            want_w = w,
+            want_h = h,
+            ?outcome,
+            returned = format!("{res:#x}"),
+            "VST3 IPlugFrame::resizeView returned"
+        );
+        res
     }
 }
