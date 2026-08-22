@@ -24,6 +24,43 @@ pub fn visible_track_row_tops(
     tops
 }
 
+/// r.md #63: visible track 群 (先頭に master 行が prepend 済) が縦に積む行を **描画順** に列挙する。
+///
+/// `visible_track_row_tops` が track 単位の prefix sum なのに対し、 こちらは track 行と展開中の
+/// automation lane 行を 1 行ずつ展開する。 高さの計算元は同じ (`effective_track_row_h` +
+/// `visible_automation_lanes` の `height_px`) なので、 `tops[i+1] - tops[i]` と
+/// 「track i の行群の高さ合計」 は常に一致する。
+///
+/// `content_top` は content 空間 (先頭行の上端 = `0.0`、 縦スクロール `track_top` を含まない)。
+/// 画面 y に直すのは caller の責務 (`lanes.y - track_top + content_top`)。
+#[must_use]
+pub fn arrangement_row_layout(
+    visible_tracks: &[ArrangementTrack],
+    track_row_h: f32,
+) -> Vec<ArrangementRow> {
+    let lane_rows: usize = visible_tracks.iter().map(|t| visible_automation_lanes(t).count()).sum();
+    let mut rows = Vec::with_capacity(visible_tracks.len() + lane_rows);
+    let mut y = 0.0f32;
+    for t in visible_tracks {
+        let h = effective_track_row_h(t, track_row_h);
+        rows.push(ArrangementRow { key: ArrangementRowKey::Track(t.id), content_top: y, height: h });
+        y += h;
+        for (_, lane) in visible_automation_lanes(t) {
+            let lh = f32::from(lane.height_px);
+            rows.push(ArrangementRow {
+                key: ArrangementRowKey::Lane(common::model::AutomationLaneKey {
+                    track: t.id,
+                    lane: lane.id,
+                }),
+                content_top: y,
+                height: lh,
+            });
+            y += lh;
+        }
+    }
+    rows
+}
+
 /// r.md #53: 水平スクロールの原点をデバイスピクセル境界に載せる。**時間軸で唯一の丸め点**。
 ///
 /// 追従スクロール (`FollowMode::Scroll`) は playhead を連続値で追うので、素のままだと
@@ -999,17 +1036,11 @@ pub(super) fn for_each_visible_lane<F>(
     F: FnMut(usize, usize, &ArrangementAutomationLane, Rect, Rect),
 {
     for (i, t) in visible_tracks.iter().enumerate() {
-        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
-            continue;
-        }
         let track_row_top = tops[i];
         // M14 Phase 63n-6 (#031): per-track row 高さ override 反映 (lane y 起点 = row_top + effective row_h)。
         let mut lane_y = track_row_top + effective_track_row_h(t, track_row_h);
         let header_indent = f32::from(t.depth) * style.indent_px;
-        for (j, lane) in t.automation_lanes.iter().enumerate() {
-            if !lane.visible {
-                continue;
-            }
+        for (j, lane) in visible_automation_lanes(t) {
             let lh = f32::from(lane.height_px);
             let header_rect = Rect {
                 x: header_pane_x + header_indent,

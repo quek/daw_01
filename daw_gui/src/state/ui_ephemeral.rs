@@ -168,13 +168,6 @@ pub struct UiEphemeral {
     /// `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
     /// 次の Z で選択 or view が食い違えば段階 0 (横) から仕切り直す。 session-only。
     pub(crate) arrange_zoom_anchor: Option<ArrangeZoomAnchor>,
-    /// primary 選択 automation clip のレーンの「実描画 content-Y 上端」
-    /// (= scroll 空間の絶対 y、 `arrange_track_top` をこれにすればレーンが viewport
-    /// 上端に来る)。 arrangement view が毎フレーム widget の実 `automation_lane_rects`
-    /// から算出してここに格納し、 `Z` 縦ズームがレイアウトを複製せず参照する。
-    /// 選択 automation clip 無し / レーンが画面外なら `None`。 session-only。
-    pub arrange_primary_lane_content_top:
-        Option<(common::model::AutomationLaneKey, f32)>,
     /// inspector の param セクション (title 下〜chain 上) の実描画高さ
     /// (px)。 immediate-mode なので「前フレームに測った高さ」を `scroll_area` の
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
@@ -195,8 +188,18 @@ pub struct UiEphemeral {
     /// これが無いと「Piano Roll タブ未表示で clip を選択 → タブを開いても fit
     /// されない、 2 回目以降のみ fit」 という初回 fit 喪失バグになる。
     pub pending_pianoroll_fit: bool,
-    /// 同様に arrangement の lanes 領域サイズ (px)。
-    pub last_arrange_canvas_size: (f32, f32),
+    /// r.md #63: arrangement widget が分割した **`lanes` Rect の実寸** (px)。
+    /// ruler と Arranger (section) 帯を除いた、 track 行が実際に描かれ scissor される領域。
+    /// `last_pianoroll_grid_size` と同じ「レイアウト SSoT が返した実 rect を記録する」 idiom で、
+    /// widget が毎フレーム書き込む。 `0.0` は「未測定」 (auto-fit を skip)。
+    ///
+    /// **式で再導出しないこと**。 以前は widget 側が `area.h - RULER_H` と独立に計算しており、
+    /// Arranger 帯 18px を引き忘れて `X` の全体表示が常に下へはみ出していた。
+    pub last_arrange_lanes_size: (f32, f32),
+    /// r.md #63: arrangement widget がこのフレームに縦へ積んだ行の一覧 (描画順、 culling 前)。
+    /// `X` の全体表示 / `Z` の縦ズームが行数・行高・行の content-Y を引く唯一の根拠
+    /// (= 可視 track / 展開 lane の集合をモデルから再導出しない)。 widget 未描画なら空。
+    pub last_arrange_rows: Vec<crate::widgets::arrangement::ArrangementRow>,
     /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
     pub resource_panel_open: bool,
     /// r.md #48: 設定画面に出すテーマ一覧のキャッシュ (session-only)。
