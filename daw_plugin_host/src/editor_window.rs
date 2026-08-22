@@ -369,14 +369,45 @@ unsafe fn resize_client_area(hwnd: HWND, w: u32, h: u32) {
     }
 }
 
-/// 窓のスタイルを `resizable` から決める。
+/// r.md #65: **プラグインの `canResize` 申告に関わらずリサイズ枠を出すか**という方針。
 ///
-/// VST3 SDK editorhost (`window.cpp` L107-131) は
-/// `WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN|WS_CLIPSIBLINGS` を基本に、resizable の
-/// ときだけ `WS_SIZEBOX|WS_MAXIMIZEBOX` を足す。clap-wrapper の standalone も
-/// *"We can't resize, so disable WS_THICKFRAME and WS_MAXIMIZEBOX"* と同じ結論。
-/// `WS_MINIMIZEBOX` は仕様上どちらでもよいが、DAW の窓としては最小化できるほうが
-/// 自然なので常に付ける (従来の `WS_OVERLAPPEDWINDOW` からの挙動維持でもある)。
+/// # なぜ申告を尊重しないのか (実測に基づく判断)
+///
+/// Renoise Redux は `IPlugView::canResize()` に `kResultFalse` (raw `0x1`) を返す
+/// — これは実機ログで確定した (`queried=true raw=0x1`、attach 前後で不変)。
+/// にもかかわらず **REAPER では窓枠ドラッグでリサイズでき、Redux の UI も追従する**
+/// (ユーザーの実機確認)。つまり Redux の申告は実態と食い違っており、
+/// 申告を尊重すると **ユーザーが実際にできるはずのことができなくなる**。
+///
+/// VST3 SDK の editorhost / JUCE / clap-wrapper は申告を尊重する実装だが、
+/// `iplugview.h` の `canResize` は *"Is view sizable by user."* という**記述**で
+/// あって「false なら枠を出すな」という**規範ではない**。ホストが枠を出したうえで
+/// `checkSizeConstraint` に丸めさせる設計は spec の範囲内で、実際
+/// `checkSizeConstraint` は *"On live resize this is called to check if the view
+/// can be resized to the given rect, **if not adjust the rect to the allowed
+/// size**"* と、まさにそのための API として規定されている。
+///
+/// ユーザーの要件は「Redux でリサイズしたい」。参照 DAW も REAPER。よって
+/// **既定は「常に枠を出す」**とし、本当に固定サイズのプラグインは
+/// `checkSizeConstraint` が丸めることで守られる (丸めないプラグインでは
+/// コンテナに余白が出るが、REAPER も同じ挙動)。
+///
+/// **申告値そのものは捨てていない** — `ResizableProbe` としてログに残しており、
+/// 将来「申告を尊重する」設定を足すときはこの関数 1 箇所を分岐させればよい。
+#[must_use]
+pub fn should_offer_resize_frame(plugin_can_resize: bool) -> bool {
+    // 申告が true ならもちろん出す。false でも出す (上記の理由)。
+    let _ = plugin_can_resize;
+    true
+}
+
+/// 窓のスタイルを「リサイズ枠を出すか」から決める。
+///
+/// 枠を出すかの **方針**は [`should_offer_resize_frame`] が持つ。ここは純粋な
+/// スタイル写像で、`WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN|WS_CLIPSIBLINGS` を
+/// 基本に、枠ありのとき `WS_THICKFRAME|WS_MAXIMIZEBOX` を足す
+/// (VST3 SDK editorhost `window.cpp` L107-131 と同じ組み合わせ)。
+/// `WS_MINIMIZEBOX` は DAW の窓としては最小化できるほうが自然なので常に付ける。
 ///
 /// `WS_CLIPCHILDREN` はプラグインの子 HWND の領域を親が描かないためのもので必須。
 #[must_use]
@@ -468,7 +499,7 @@ impl EditorSizer for NoopSizer {
     fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32) {
         (w, h)
     }
-    fn current_client_size(&self) -> Option<(u32, u32)> {
+    fn plugin_view_size(&self) -> Option<(u32, u32)> {
         None
     }
     fn notify_client_size(&self, _w: u32, _h: u32) {}
@@ -1011,11 +1042,24 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
     let Some(sizer) = shared.sizer() else {
         return log(PluginResizeOutcome::NotApplicable, "no live sizer (gui not attached)");
     };
-    let before = sizer.current_client_size();
-    if before == Some((width, height)) {
-        return log(PluginResizeOutcome::Applied, "already at the requested size");
-    }
+    let before = sizer.plugin_view_size();
     let client_before = unsafe { client_size(hwnd) };
+    // 早期リターンは **コンテナ窓の client サイズ**で判定する。
+    //
+    // ここで「プラグインの view サイズ」を見てはいけない (r.md #65 で実際にやって
+    // いたバグ)。VST3 spec は *"if the host calls IPlugView::getSize () before
+    // calling IPlugView::onSize (), it will get the current (old) size not the
+    // wanted one!!"* と規定しており、
+    //   - 規定どおりのプラグイン → 常に不一致になるので判定に使えない
+    //   - 規定に反して先に自分の view を新サイズへ更新するプラグイン
+    //     (Renoise Redux) → **常に一致し、窓を 1px も動かさずに成功を返す**
+    // のどちらかにしかならない。実測は後者で、Redux の Editor が
+    // 1538x736 を要求しているのにコンテナは 880x162 のままだった。
+    //
+    // 我々が変更を頼まれているのはコンテナ窓なので、判定もコンテナ窓で行う。
+    if client_before == (clamp_dim(width), clamp_dim(height)) {
+        return log(PluginResizeOutcome::Applied, "container already at the requested size");
+    }
     let size_events_before = shared.size_events.get();
 
     shared.in_plugin_resize.set(true);
@@ -1025,7 +1069,7 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
     // `SetWindowPos` が WM_SIZE を出さなかった (= サイズが変わらなかった) ケースの保険。
     let mut fallback_notify = false;
     if let Some(sizer) = shared.sizer()
-        && sizer.current_client_size() != Some((width, height))
+        && sizer.plugin_view_size() != Some((width, height))
     {
         sizer.notify_client_size(width, height);
         fallback_notify = true;
@@ -1043,7 +1087,7 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
         want_w = width,
         want_h = height,
         plugin_size_before = ?before,
-        plugin_size_after = ?shared.sizer().and_then(EditorSizer::current_client_size),
+        plugin_size_after = ?shared.sizer().and_then(EditorSizer::plugin_view_size),
         client_before = format!("{}x{}", client_before.0, client_before.1),
         client_after = format!("{}x{}", client_after.0, client_after.1),
         wm_size_delivered = size_events_after - size_events_before,
@@ -1268,7 +1312,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     let ch = ((lparam.0 >> 16) & 0xFFFF) as u32;
                     // 縮退サイズ (0x0) をプラグインへ流さない — サイズ依存の描画が
                     // 0 次元で走る。
-                    let current = sizer.current_client_size();
+                    let current = sizer.plugin_view_size();
                     if cw > 0 && ch > 0 && current != Some((cw, ch)) {
                         sizer.notify_client_size(cw, ch);
                         tracing::info!(
@@ -1277,7 +1321,7 @@ unsafe extern "system" fn editor_wnd_proc(
                             client_w = cw,
                             client_h = ch,
                             plugin_size_before = ?current,
-                            plugin_size_after = ?sizer.current_client_size(),
+                            plugin_size_after = ?sizer.plugin_view_size(),
                             "WM_SIZE -> notified plugin (onSize / set_size)"
                         );
                     }
@@ -1410,12 +1454,27 @@ unsafe extern "system" fn editor_wnd_proc(
 mod tests {
     use super::*;
 
-    /// r.md #65: `canResize()` が false のプラグイン (Renoise Redux 等) の窓は
-    /// **ユーザーがリサイズできてはいけない**。VST3 SDK editorhost も
-    /// clap-wrapper も「不可なら `WS_THICKFRAME` / `WS_MAXIMIZEBOX` を出さない」で
-    /// 一致しており、これがこの項目のユーザー決定でもある。
+    /// r.md #65: **`canResize()` が false でもリサイズ枠を出す**。
+    ///
+    /// Renoise Redux は `canResize()` に `kResultFalse` を返すのに REAPER では
+    /// 窓枠でリサイズでき UI も追従する (実機で確定)。申告を尊重すると
+    /// 「ユーザーが実際にできるはずのことができない」窓になるため、方針として
+    /// 常に枠を出す。固定サイズのプラグインは `checkSizeConstraint` が丸めて守る。
+    ///
+    /// このテストは**方針そのもの**を固定する: 将来「申告を尊重する」設定を
+    /// 足すなら、ここが落ちて意識的に更新することになる。
     #[test]
-    fn non_resizable_editor_has_no_resize_frame() {
+    fn resize_frame_is_offered_even_when_the_plugin_declines() {
+        assert!(should_offer_resize_frame(true));
+        assert!(
+            should_offer_resize_frame(false),
+            "canResize()==false でも枠を出す (Redux が REAPER でリサイズできる事実に合わせる)"
+        );
+    }
+
+    /// スタイル写像そのもの (方針とは分離してある)。
+    #[test]
+    fn editor_window_style_maps_resize_frame_to_thickframe() {
         let fixed = editor_window_style(false);
         assert_eq!(fixed & WS_THICKFRAME, WINDOW_STYLE(0));
         assert_eq!(fixed & WS_MAXIMIZEBOX, WINDOW_STYLE(0));

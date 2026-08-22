@@ -319,7 +319,9 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
         "plugin does not support an embedded win32 GUI"
     );
     plugin.gui_create_embedded()?;
-    let resizable = plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict);
+    let resizable = editor_window::should_offer_resize_frame(
+        plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict),
+    );
     let size = plugin
         .gui_get_size()
         .filter(|&(w, h)| w > 0 && h > 0)
@@ -343,7 +345,9 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
     plugin.gui_set_parent_hwnd(editor.hwnd_u64())?;
     pump_pending_messages();
     let shown = plugin.gui_show()?;
-    let resizable_now = plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict);
+    let resizable_now = editor_window::should_offer_resize_frame(
+        plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict),
+    );
     if resizable_now != resizable {
         editor.set_resizable(resizable_now);
     }
@@ -1683,7 +1687,9 @@ impl PluginHost {
         let probe = plugin
             .gui_sizer()
             .map_or_else(plugin_instance::ResizableProbe::unavailable, |s| s.can_resize());
-        let resizable = probe.verdict;
+        // r.md #65: 枠を出すかは **方針** (`should_offer_resize_frame`) が決める。
+        // 申告値は捨てずにログへ (`verdict` / `queried` / `raw`)。
+        let resizable = editor_window::should_offer_resize_frame(probe.verdict);
         tracing::info!(
             target: "editor_resize",
             plugin = %plugin.name(),
@@ -1691,6 +1697,7 @@ impl PluginHost {
             verdict = probe.verdict,
             queried = probe.queried,
             raw = format!("{:#x}", probe.raw),
+            resize_frame = resizable,
             "canResize / can_resize probed"
         );
         // Default to a sane size when the pre-attach query is missing or
@@ -1780,7 +1787,7 @@ impl PluginHost {
         let probe_now = plugin
             .gui_sizer()
             .map_or_else(plugin_instance::ResizableProbe::unavailable, |s| s.can_resize());
-        let resizable_now = probe_now.verdict;
+        let resizable_now = editor_window::should_offer_resize_frame(probe_now.verdict);
         tracing::info!(
             target: "editor_resize",
             plugin = %plugin.name(),
@@ -1788,6 +1795,7 @@ impl PluginHost {
             verdict = probe_now.verdict,
             queried = probe_now.queried,
             raw = format!("{:#x}", probe_now.raw),
+            resize_frame = resizable_now,
             changed_from_pre_attach = resizable_now != resizable,
             "canResize / can_resize probed"
         );

@@ -225,8 +225,21 @@ pub trait EditorSizer: Send {
     /// 矯正できなければ入力をそのまま返す。**ホスト起点ドラッグ専用** —
     /// プラグイン起点の resize には掛けない (どちらのシーケンス図にも出てこない)。
     fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32);
-    /// プラグインが今表示している client サイズ (VST3 `getSize` / CLAP `get_size`)。
-    fn current_client_size(&self) -> Option<(u32, u32)>;
+    /// **プラグインの view が今名乗っているサイズ** (VST3 `getSize` /
+    /// CLAP `get_size`)。**コンテナ窓の client 領域ではない。**
+    ///
+    /// 用途は 1 つだけ: 「プラグインへ `onSize` / `set_size` を通知する必要があるか」
+    /// (= 既に同じサイズを知っているなら通知しない) の判定。**窓を動かすかどうかの
+    /// 判定に使ってはいけない** — VST3 spec は *"if the host calls
+    /// IPlugView::getSize () before calling IPlugView::onSize (), it will get the
+    /// current (old) size not the wanted one!!"* と規定しており、
+    /// 規定どおりなら古い値、規定に反して先に自分を更新するプラグイン
+    /// (Renoise Redux) なら新しい値が返る。**どちらにせよ窓の実寸とは無関係**。
+    ///
+    /// 窓の寸法が要るときは `GetClientRect` を見ること
+    /// (r.md #65: ここを取り違えて、コンテナが 880x162 のまま 1538x736 の要求に
+    /// 「既にそのサイズ」と答え、窓を 1px も動かさず成功を返していた)。
+    fn plugin_view_size(&self) -> Option<(u32, u32)>;
     /// 確定した client サイズを通知する (VST3 `onSize` / CLAP `set_size`)。
     fn notify_client_size(&self, w: u32, h: u32);
     /// ユーザーが窓枠でリサイズしてよいか (VST3 `canResize` / CLAP `can_resize`)。
