@@ -452,8 +452,12 @@ fn run_worker(
         tracing::warn!("audio worker: MMCSS join (Pro Audio) failed");
     }
     loop {
+        // 仕事が来るまでの park。不変条件 4 が禁じているのは「**他プロセスの完了待ち**を
+        // 無限にすること」で、この wake は同一プロセスの sequencer が SetEvent で起こす。
+        // RT deadline を握らない (起きなければ何も走らないだけ) ので INFINITE でよい。
+        // 完了待ちの側は bounded: `POOL_WAIT_TIMEOUT_MS` (= DISPATCH_TIMEOUT_MS * 2)。
         unsafe {
-            WaitForSingleObject(wake.0, INFINITE);
+            WaitForSingleObject(wake.0, INFINITE); // arch-lint: allow-infinite
         }
         if shutdown.load(Ordering::Acquire) {
             break;

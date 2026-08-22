@@ -355,7 +355,9 @@ pub struct VideoFxEngine {
     /// 遅延初期化 (最初の `apply_chain` で device から作る)。
     common: Option<CommonGpu>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
-    pool: HashMap<(u32, u32), SizePool>,
+    /// key は target の **(width, height)**。device/slot の positional 参照ではないので
+    /// 不変条件 1 (安定 id addressing) の対象外。寸法が同じ target を使い回すための pool。
+    pool: HashMap<(u32, u32), SizePool>, // arch-lint: allow-positional-key
     /// chain_key (= track id / master) ごとの前フレーム出力 target (feedback history)。
     /// `apply_chain` が needs_history チェーンで維持・bind する (B9 feedback / r.md #8)。
     history_targets: HashMap<u64, HistoryTarget>,
