@@ -9,6 +9,10 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     pub(crate) fn on_tick(&mut self, playhead_samples: u64) {
+        // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
+        // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
+        self.expire_nudge_audition(false);
+
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、

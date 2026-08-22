@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{Edit, InputAccumulator, UiHost};
+use daw_ui_core::{Edit, InputAccumulator, TextInputStyle, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, Renderer, Scene};
 use winit::window::WindowAttributes;
@@ -95,7 +95,7 @@ impl App {
             );
 
             let field = Rect { x: 20.0, y: 64.0, w: (screen.width as f32 - 40.0).max(120.0), h: 32.0 };
-            let resp = ui.text_input_at_focused("field", field, &m.text, |new| {
+            let resp = ui.text_input_at_focused("field", field, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(move |m: &mut Model| m.text = new)
             });
             if let Some(committed) = resp.committed_text {

@@ -277,6 +277,7 @@ impl AppData {
                 recording_last_beat: std::collections::HashMap::new(),
                 last_sent_recording_lanes: std::collections::HashSet::new(),
                 preview_note: None,
+                nudge_audition: None,
                 midi_input_label: String::new(),
                 step_cursor_beat: 0.0,
                 step_size_beats: DEFAULT_NOTE_DURATION,
@@ -373,6 +374,7 @@ impl AppData {
                 arrange_default_scrub_active: None,
                 arrange_hovered_automation_lane: None,
                 piano_roll_lyric_editing: false,
+                pianoroll_viewport: None,
                 audio_editor_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 inspector_body_h: 800.0,
@@ -1277,6 +1279,15 @@ impl AppData {
             }
             AppEvent::TogglePianoRollTrackLock(track_id) => {
                 self.toggle_pianoroll_track_lock(track_id);
+            }
+            AppEvent::NudgeSelectedNoteTime { step, steps } => {
+                self.nudge_selected_notes_time(step, steps);
+            }
+            AppEvent::NudgeSelectedNoteLength { step, steps } => {
+                self.nudge_selected_notes_length(step, steps);
+            }
+            AppEvent::NudgeSelectedNotePitch { octave, steps } => {
+                self.nudge_selected_notes_pitch(octave, steps);
             }
             AppEvent::OpenPluginPicker => {
                 self.ui_ephemeral.plugin_picker_query.clear();

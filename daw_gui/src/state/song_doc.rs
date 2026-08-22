@@ -55,6 +55,11 @@ pub enum StreamGesture {
     MidiCc,
     /// Touch/Latch/Write mode の automation 録音 (playhead 追従の point 書込)。
     AutomationRecord,
+    /// r.md #67: カーソルキーによるノートの移動 / 音程変更。 押しっぱなしのキーリピートも
+    /// 単発の連打も、 1 秒空くまでは 1 undo step に畳む (100 回押して 100 step は誤り)。
+    NoteNudgeMove,
+    /// r.md #67: カーソルキーによるノート長の伸縮 (移動とは別 step にする)。
+    NoteNudgeLength,
 }
 
 /// undo / redo スタックの 1 要素。 過去 (または未来) の Song snapshot と、
@@ -463,6 +468,17 @@ impl SongDoc {
             entry.1 = now;
         }
         EditScope::Gesture(self.stream_gestures[&key].0)
+    }
+
+    /// 現在 dispatch 中 event の ambient scope を [`Self::stream_scope`] に差し替える。
+    ///
+    /// `begin_event` が張った「1 event = 1 undo step」 の scope を、 連続入力用の
+    /// gesture へ **上書き** する。 handler 冒頭で 1 度呼べば、 その event 内の
+    /// `edit_song` の入れ子もすべて同じ gesture に入るので、 同じ key の編集が
+    /// [`STREAM_GESTURE_GAP`] 以内に続く限り 1 undo step に畳まれる (r.md #67 の
+    /// カーソルキー nudge)。 1 秒空けば次は新しい step。
+    pub fn use_stream_scope(&mut self, key: StreamGesture) {
+        self.event_scope = self.stream_scope(key);
     }
 
     fn alloc_gesture(&mut self) -> u64 {

@@ -86,6 +86,26 @@ widget 本体 (`ui.piano_roll` に渡す body) は右パネル幅 (LEGEND_W≈15
 - 配置安定性 (implement skill 5.5): 固定幅。開閉で他コントロールを動かさない。grid 幅は右パネル分を引く。
 単一表示時は legend 非表示 = body 全幅 = 既存レイアウト不変。
 
+> **2026-08-22 (r.md #64) の追加不変条件 — ロックの効力は legend 行から導く**
+>
+> 当初はロックの効力 (`locked_pr_tracks` を読む) と legend の描画条件 (`shown.len() >= 2`) が
+> 別々に書かれていた。 その結果 **「ロックしたトラックのクリップを 1 つだけ開く」** と、
+> ノートはゴーストのまま掴めず、 解除する L トグルは画面に存在しない = プロジェクトを
+> 開き直す以外に復帰できない詰みになっていた。
+>
+> いまは `AppData::pianoroll_lock_rows_in(shown)` が **legend に行が出るトラック** を返す
+> 唯一の定義で、 legend の描画 (`view_build` の `legend_rect` / `run.rs` の行列挙) も
+> ロックの効力 (`is_pianoroll_clip_locked_in`) もそこから導出する。 よって
+> **「ロックが効いている ⟺ 解除ボタンが見えている」** が構造的に保たれる。
+> 単一表示に絞るとロックは自動的に効かなくなり、 複数表示に戻すと元どおり効く
+> (`locked_pr_tracks` は「ユーザーの意思」 の生データとして保持したままなので、
+> 選択が変わるたびに集合を prune する補償コードは要らない = アーキ不変条件 1)。
+>
+> 併せて **新規ノートを生む経路** (鉛筆 / Insert / 貼り付け / ステップ入力 / 歌詞編集) も
+> `AppData::reject_write_if_pianoroll_locked` で塞いだ。 「既存ノートは掴めないのに新規は
+> 描ける」 という、生む経路と触る経路で判定が食い違う状態を消すため
+> (拒否時はステータスバーに理由を出す)。
+
 ### 7. preview / playback
 keyboard レーン preview・ノート作成時の試聴は **対象クリップの track** の instrument。
 ノートクリック時の clip 切替で track も追従。
@@ -96,6 +116,7 @@ keyboard レーン preview・ノート作成時の試聴は **対象クリップ
 - 空の対象 clip (note 0) → legend で対象選択でき、新規ノートが入る。
 - 異 clip の note が同 pitch/time で重なる → 全描画 (非対象 dim)、対象を最前面。
 - locked clip の note → 描画されるが掴めない (hit 除外)。drag/delete/velocity 対象外。
+  ただし **legend が出ていない (= 単一表示) 間は効力なし** (上の §6 追加不変条件、r.md #64)。
 - shown セット変更 → `selected_notes` clear (不変条件)。
 
 ## テスト (高レイヤ; model/command 層)

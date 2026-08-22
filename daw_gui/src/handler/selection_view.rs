@@ -524,7 +524,7 @@ impl AppData {
         }
         for (slot, items) in groups {
             let Some(&r) = shown.get(slot) else { continue };
-            if self.is_pianoroll_clip_locked(r) {
+            if self.is_pianoroll_clip_locked_in(&shown, r) {
                 continue;
             }
             per_clip(self, slot, r, &items);
@@ -563,16 +563,130 @@ impl AppData {
             .collect()
     }
 
-    /// そのクリップが乗っている **トラック** がピアノロールで「ロック (参照専用)」
-    /// かどうか。ロックはトラック単位 (凡例がトラック単位なので)。
+    /// ピアノロールが今そのスケールで動いているか (`None` = スケール未設定)。
+    ///
+    /// 判定基準は **対象 (target) クリップの窓の開始拍のスケール** で、view と handler の
+    /// 両方がここを読む (r.md #67)。 view 側だけで導出していると、カーソルキーの
+    /// ↑/↓ が「画面では Fold 表示なのに半音単位で動く」 ように食い違う。
+    ///
+    /// `mode` は Fold トグルに従う (`Fold` = out-of-scale 行を畳んだ表示)。
+    #[must_use]
+    pub fn pianoroll_scale(&self) -> Option<crate::widgets::piano_roll::PianoRollScale> {
+        use crate::widgets::piano_roll::{PianoRollScale, PianoRollScaleMode};
+        let target = self.pianoroll_target_clip()?;
+        let clip = self
+            .song_doc
+            .song()
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))?;
+        let sc = self.song_doc.song().scale_at(clip.start_beat)?;
+        Some(PianoRollScale {
+            root: sc.root,
+            in_scale_mask: sc.scale.pitch_class_mask(),
+            mode: if self.ui_prefs.piano_roll_fold {
+                PianoRollScaleMode::Fold
+            } else {
+                PianoRollScaleMode::Highlight
+            },
+            prefer_flats: common::scale::prefers_flats(sc.root, sc.scale),
+        })
+    }
+
+    /// そのトラックがピアノロールの凡例に **行を持つか**
+    /// (`shown` = [`Self::shown_pianoroll_clips`] の結果)。
+    ///
+    /// **これがロックの効力範囲の SSoT** (r.md #64)。 凡例パネルは複数クリップ表示
+    /// (`shown.len() >= 2`) のときだけ出るので、単一表示では空 = ロックは効かない。
+    ///
+    /// 旧実装は「効力 = `locked_pr_tracks` を直接読む (常時)」 と「解除 UI = 複数表示のとき
+    /// だけ描く」 が別々に書かれていた。 ロックしたトラックのクリップを 1 つだけ開くと
+    /// **ゴースト表示のまま掴めず、解除ボタンも画面に無い** = プロジェクトを開き直す以外に
+    /// 復帰できない詰みになる。 効力を凡例行から導出すれば
+    /// 「ロックが効いている ⟺ 解除ボタンが見えている」 が構造的な不変条件になる
+    /// (`locked_pr_tracks` は「ユーザーの意思」 の生データとして残り、効力は毎回導出)。
+    ///
+    /// 「選択が変わった瞬間に `locked_pr_tracks` を prune する」 方式は採らない:
+    /// `selected_clips` の書き込み点は 10 箇所以上に散っていてチョークポイントが無く、
+    /// 「参照を貼り替える補償コード」 (アーキテクチャ不変条件 1 が禁じるパターン) になる。
+    #[must_use]
+    pub fn has_pianoroll_lock_row(shown: &[ClipRef], track: u32) -> bool {
+        // 凡例パネルは複数クリップ表示のときだけ出て、行は表示クリップのトラック 1 つにつき 1 行。
+        shown.len() >= 2 && shown.iter().any(|r| r.track == track)
+    }
+
+    /// [`Self::has_pianoroll_lock_row`] が真になるトラック index を **初出順** で列挙する
+    /// (凡例パネルの行そのもの)。 行の集合が要る描画側が使う。 判定 1 件だけなら
+    /// alloc しない述語版 (`has_pianoroll_lock_row`) を使うこと。
+    #[must_use]
+    pub fn pianoroll_lock_rows_in(shown: &[ClipRef]) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for r in shown {
+            if Self::has_pianoroll_lock_row(shown, r.track) && !out.contains(&r.track) {
+                out.push(r.track);
+            }
+        }
+        out
+    }
+
+    /// 単発版 (内部で `shown_pianoroll_clips()` を 1 度計算)。凡例の描画側が使う。
+    #[must_use]
+    pub fn pianoroll_lock_rows(&self) -> Vec<u32> {
+        Self::pianoroll_lock_rows_in(&self.shown_pianoroll_clips())
+    }
+
+    /// そのクリップが乗っている **トラック** のロックが *いま効いているか*
+    /// (r.md #64)。 `shown` は [`Self::shown_pianoroll_clips`] の結果
+    /// (呼び出し側で 1 度作って使い回す、`decode_note_id_in` と同じイディオム)。
+    ///
+    /// 効力 = 「凡例に行がある」 ∧ 「そのトラックがロック集合に入っている」。
+    /// 前者が [`Self::pianoroll_lock_rows_in`] = 解除 UI の描画条件そのものなので、
+    /// 解除できないロックが存在しえない。
+    #[must_use]
+    pub fn is_pianoroll_clip_locked_in(&self, shown: &[ClipRef], r: ClipRef) -> bool {
+        Self::has_pianoroll_lock_row(shown, r.track)
+            && self
+                .song_doc
+                .song()
+                .tracks
+                .get(r.track as usize)
+                .is_some_and(|t| self.ui_prefs.locked_pr_tracks.contains(&t.id))
+    }
+
+    /// 単発版 (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の clip を捌く
+    /// ハンドラでは `shown` を 1 度作って `is_pianoroll_clip_locked_in` を使う。
+    #[must_use]
     pub fn is_pianoroll_clip_locked(&self, r: ClipRef) -> bool {
-        self.song_doc.song()
+        self.is_pianoroll_clip_locked_in(&self.shown_pianoroll_clips(), r)
+    }
+
+    /// ロック中クリップへの **書き込み** を拒否する共通ゲート (r.md #64)。
+    ///
+    /// ロックは既存ノートの編集経路 (`for_each_note_clip_group`) では効いていたが、
+    /// **新規ノートを生む経路** (鉛筆 / Insert / 貼り付け / ステップ入力) はロックを
+    /// まったく見ていなかった。 結果「既存ノートは掴めないのに新しいノートは描ける」
+    /// という、生む経路と触る経路で判定が食い違う状態になっていた。
+    ///
+    /// 拒否したときは理由をステータスバーに出す (何も起きないと故障に見えるため)。
+    /// 戻り値 `true` = 拒否した (呼び出し側は即 return)。
+    pub(crate) fn reject_write_if_pianoroll_locked(&mut self, r: ClipRef) -> bool {
+        if !self.is_pianoroll_clip_locked(r) {
+            return false;
+        }
+        let name = self
+            .song_doc
+            .song()
             .tracks
             .get(r.track as usize)
-            .is_some_and(|t| self.ui_prefs.locked_pr_tracks.contains(&t.id))
+            .map_or_else(String::new, |t| format!("「{}」 ", t.name));
+        self.ui_ephemeral.status_message =
+            format!("{name}トラックはロック中です (凡例の L で解除)");
+        true
     }
 
     /// トラック id がピアノロールでロック中か (凡例のロックトグル状態表示用)。
+    /// **効力ではなくユーザーの意思**を返す — 凡例が出ている行にしか使わないので、
+    /// その文脈では [`Self::is_pianoroll_clip_locked_in`] と必ず一致する。
     pub fn is_pianoroll_track_locked(&self, track_id: u32) -> bool {
         self.ui_prefs.locked_pr_tracks.contains(&track_id)
     }
@@ -849,7 +963,7 @@ impl AppData {
         let shown = self.shown_pianoroll_clips();
         let mut out = Vec::new();
         for (slot, &r) in shown.iter().enumerate() {
-            if self.is_pianoroll_clip_locked(r) {
+            if self.is_pianoroll_clip_locked_in(&shown, r) {
                 continue;
             }
             let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
