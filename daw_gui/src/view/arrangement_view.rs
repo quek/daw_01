@@ -5,7 +5,9 @@
 //! (Track.id / Clip.id) と index の変換層を担う。
 
 use crate::widgets::arrangement::{clip_key_to_ref, ClipKey};
-use daw_ui_core::{ColorPickerStyle, Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
+use daw_ui_core::{
+    ColorPickerStyle, Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
+};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, ImportTrackTarget};
@@ -251,6 +253,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ("clip_rename", key.track, key.clip),
                 input_rect,
                 &app.ui_ephemeral.clip_rename_text,
+                &TextInputStyle::default(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::RenameClipChanged(new.clone()));
@@ -383,6 +386,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ),
                 input_rect,
                 &prefill,
+                &TextInputStyle::default(),
                 |_new| Edit::mutate(|_| {}),
             );
             if edit_resp.committed || edit_resp.blurred {
@@ -639,6 +643,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ("track_rename", track_id),
                 input_rect,
                 &app.ui_ephemeral.track_rename_text,
+                &TextInputStyle::default(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::RenameTrackChanged(new.clone()));
@@ -676,6 +681,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     ("section_rename", *sid),
                     input_rect,
                     &app.ui_ephemeral.section_rename_text,
+                    &TextInputStyle::default(),
                     |new| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::RenameSectionChanged(new.clone()));

@@ -9,7 +9,7 @@ mod modulation_rack;
 
 use daw_ui_core::{
     Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
-    ScrubableNumberStyle, ToggleButtonStyle, Ui,
+    ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::Rect;
 
@@ -1667,6 +1667,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "inspector_text_content_input",
             Rect { x: input_x, y, w: string_input_w, h: input_h },
             &app.ui_ephemeral.clip_text_content_edit_text,
+            &TextInputStyle::default(),
             |s| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ClipTextContentEditChanged(s))
@@ -2210,6 +2211,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     h: 22.0,
                 },
                 &app.ui_ephemeral.clip_text_content_edit_text,
+                &TextInputStyle::default(),
                 |s| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::ClipTextContentEditChanged(s))
