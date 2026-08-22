@@ -18,16 +18,6 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         let master_row: Option<&ArrangementMasterRow> = Some(&built.master_row);
         let rect = area;
         let id = "arrangement";
-        // auto-fit (X キー / Fit ボタン) 用に現フレームの canvas (lanes) サイズを記録 (旧 draw() 冒頭)。
-        let canvas_size = (
-            (area.w - app.ui_prefs.arrange_header_w).max(0.0),
-            (area.h - view_build::RULER_H).max(0.0),
-        );
-        if app.ui_ephemeral.last_arrange_canvas_size != canvas_size {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.last_arrange_canvas_size = canvas_size;
-            }));
-        }
         let wid = WidgetId::ROOT.child((b"arrangement_widget", &id));
         let pointer = ui.pointer();
 
@@ -108,6 +98,29 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // `is_group_track(id, visible_tracks)` だと collapsed で children が filter outされ false 化する罠を回避。
         let is_group_set: HashSet<u32> =
             tracks.iter().filter_map(|t| t.parent_id).collect();
+
+        // ---- r.md #63: auto-fit (`X` / Fit ボタン) と縦ズーム (`Z`) 用に、 このフレームの
+        // **実レイアウト** を記録する。 lanes サイズは上で分割した `lanes` Rect そのもの
+        // (= 描画 / hit-test が scissor に使う矩形と同一)。 以前は rect 分割より前に
+        // `area.h - RULER_H` と独立に再導出しており、 Arranger 帯 (`arranger_lane_h`) を引き忘れて
+        // 全体表示が常に帯のぶん (18px) 下へはみ出していた。 行の一覧も同様にモデルから
+        // 再導出せず、 widget が積んだ行そのものを渡す。
+        let lanes_size = (lanes.w, lanes.h);
+        if app.ui_ephemeral.last_arrange_lanes_size != lanes_size {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.ui_ephemeral.last_arrange_lanes_size = lanes_size;
+            }));
+        }
+        let rows = arrangement_row_layout(&visible_tracks, view.track_row_h);
+        if app.ui_ephemeral.last_arrange_rows != rows {
+            let next = rows.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.ui_ephemeral.last_arrange_rows = next;
+            }));
+        }
+        response.arranger_rect = arranger_rect;
+        response.lanes_rect = lanes;
+        response.rows = rows;
 
         // ---- press 振り分け: audio_drag / clip_drag / loop_drag / playhead_drag を state に積む ----
         // M14 Phase 63j (#024): ruler の plain click は press frame で `SetPlayheadBeat` を 1 度

@@ -107,14 +107,14 @@ impl AppData {
 
         // 再生追従スクロール (Alt+F で off/scroll/page)。 playhead 反映直後に follow
         // mode に応じて arrange_scroll_beat を更新する。 canvas 幅は前フレーム描画値
-        // (last_arrange_canvas_size.0)。 手動スクロール / ズームで follow が Off に落ちる
+        // (last_arrange_lanes_size.0)。 手動スクロール / ズームで follow が Off に落ちる
         // のは各 view 操作 handler 側 (cancel_follow_on_manual_view_change)。 follow が
         // 直接 arrange_scroll_beat を書く (= SetArrangeScroll event を経由しない) ので
         // 自分自身で Off に落ちることはない。
         if self.transport.is_playing
             && let Some(ph) = self.transport.playhead_beat
         {
-            let visible_beats = self.ui_ephemeral.last_arrange_canvas_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);
+            let visible_beats = self.ui_ephemeral.last_arrange_lanes_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);
             if let Some(new_scroll) = Self::follow_scroll_beat(
                 self.ui_prefs.arrange_follow,
                 ph,
