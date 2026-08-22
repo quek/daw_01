@@ -120,6 +120,22 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
   実装は `let demote = matches!(nd.kind, ClipDragKind::Move) && !nd.last_alt && dist < 4.0;`。 user 視点で「drag したら反映される」 を保証しつつ jitter は ignore できる。
 - **隣接 resize widget の共有境界は in-rect 優先 (後勝ち + 外側拡張ハンドルは内側を奪う)**: clip / note のように左右端 resize ハンドルを rect の **内外 ±handle_px** に張る widget は、 隣接要素 (`A.right == B.left`、 連続同音 note / 接触 clip) があると B の左端外側ハンドル `[B.left-px, B.left)` が **A の rect 内部に食い込む**。 hit-test を「visible 走査で match ごとに後勝ち上書き」 で書くと、 cursor が A の rect 内 (`A.right-px ≤ cx < A.right`) でも後ろの B が常に勝ち **A の右端を一切掴めない** (piano_roll #053 / M14 Phase 82)。 **正しい設計**: match を「rect 内部 (in-rect)」 と「外側拡張のみ (outer)」 の 2 tier に分け **in-rect を outer に無条件優先** (同 tier は resize edge への水平距離が近い方、 同距離は後勝ち)。 各 widget が「自分の rect 側ハンドル px を所有」 し、 共有境界は半開区間で後者 (B) 内側になる。 piano_roll は `note_hit` / `note_hover_cursor` 共有の internal `note_hit_in` で実装済 (hover カーソルが指す要素 = drag で掴む要素 を構造保証)。 **arrangement の `clip_hit` も M14 Phase 125 (#101) で同じ in-rect 優先ループに統一済** (旧「後勝ち上書き」 で隣接 clip の A 右端が B に奪われていた bug を解消)。 今後 左右端 resize ハンドルを内外に張る新 widget を足すときは、 この 2 tier (in-rect 無条件優先 / 同 tier は edge 距離) を最初から踏襲する。
 
+### line pipeline: **sub-pixel の quad は rasterizer が落とす**
+
+`push_lines` の 1 segment は cap を持たない素の quad (`pipelines/line.wgsl` は `along` が
+0/1 のみで線方向へは 1px も伸ばさない)。 **長さが 1px を切る segment は pixel 中心を掴めず
+描かれない**。 円弧を折れ線近似するときに固定角度で刻むとこれを踏む: 半径 14px の knob を
+2° 刻みにすると 1 segment の弦長が `14 × 0.035 = 0.49px` で、 弧のあちこちに穴が空く。
+
+- 値弧のように「下地が同じ色の面」 の上に描く分には斑点として微かに出るだけだが、
+  **下地を隠す目的で描く弧では致命的** (daw_01: knob の可動範囲外を面の色で塗り潰しても、
+  穴から本体の縁と枠が漏れてリングが切れて見えなかった)。
+- 対処は `widgets/knob.rs` の `push_arc`: 刻みを **半径に反比例** させて弦長を
+  `ARC_CHORD_PX` 前後に保ち、 さらに span を **均等割り** する (単純な足し込みだと最後に
+  「余り」 の短い segment が 1 本出て、 そこだけ sub-pixel になる)。 joint は butt 継ぎなので
+  各 segment の終端を半 step 重ねて楔形の隙間も潰す。 副次的に instance 数も 1/6 に減る。
+- 新しく円弧 / 曲線を折れ線化する widget を足すときは、 **角度ではなく弦長で刻む**。
+
 ### TSF (Windows IME / `ITextStoreACP` — M15)
 text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP) のまぜ書き `GetText` / MS-IME 再変換を成立させる経路 (`crates/platform/src/tsf/`、Windows 限定)。設計は [docs/plan_tsf_ime.html](docs/plan_tsf_ime.html)。
 - **`AssociateFocus` 必須 (`SetFocus` だけでは不可)**: `ITfThreadMgr::SetFocus(doc_mgr)` は thread の focus doc を設定するだけで **document を HWND に束縛しない**。window が OS focus を得ると msctf は CUAS の既定 document を使い、TIP の編集が我々の `ITextStoreACP` に届かない。症状: rtry ログ `ShiftStart(-10) shifted=0` / `TSF read failed, using postbuf fallback`、まぜ書きが postbuf の backspace 再現で「ねこ→ね」 のようにズレる (= store が空に見えている)。`ITfThreadMgr::AssociateFocus(hwnd, doc_mgr)` で束縛して解決。focus 取得時に `AssociateFocus` + `SetFocus` の両方を呼ぶ (前者は次の focus 変化で効くため後者で即時反映)。

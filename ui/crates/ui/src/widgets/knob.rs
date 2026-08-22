@@ -39,6 +39,15 @@ const SWEEP: f32 = 5.0 * PI / 3.0;
 const ARC_WIDTH_PX: f32 = 4.0;
 /// 起点 notch の線幅 (px)。 値弧より細く、 指針より細い「パネル刻印」の太さ。
 const NOTCH_WIDTH_PX: f32 = 1.5;
+/// 弧を折れ線近似するときの 1 segment の目標弦長 (px)。 **1px を下回らせない** ことが要点
+/// (line pipeline の quad が sub-pixel になると rasterizer が拾い落として弧に穴が空く)。
+/// 均等割りで実際の弦長はこの値の 1/2 〜 1 倍に収まるので、 3px なら最悪でも 1.5px。
+const ARC_CHORD_PX: f32 = 3.0;
+/// 弧の角度刻みの下限 (大半径で刻みが細かくなり過ぎて instance 数が膨らむのを防ぐ)。
+const ARC_STEP_MIN: f32 = 2.0 * PI / 180.0;
+/// 弧の角度刻みの上限 (小半径で粗くなり過ぎないように)。 15° 刻みでも半径 7px の
+/// 弦の反り (sagitta) は 0.06px で、 目に見える多角形化は起きない。
+const ARC_STEP_MAX: f32 = 15.0 * PI / 180.0;
 /// 起点 notch がリング内側へ食い込む長さ (px、 弧の内縁からさらに内側へ)。
 const NOTCH_INNER_PX: f32 = 3.0;
 /// 起点と現在値の差がこれ未満なら値弧を描かない (正規化値の dead band)。 丸め誤差で pan が
@@ -125,14 +134,25 @@ pub struct KnobStyle {
     /// (`_normal = c->internal_to_interface(c->normal())` = param の既定値)。 modulation depth
     /// の drag には効かない (depth は base と別ドメインで、 Ardour にも対応概念が無い)。
     pub detent: bool,
+    /// この knob が **載っている面** の色。
+    ///
+    /// 可動範囲 (300°) の外側にあたる下の 60° を この色のリングで塗り、 円本体の縁と枠を
+    /// くり抜いて **「リングが下で切れている」** ように見せる。 これが無いと、 その 60° では
+    /// 円本体の塗り (`control`) と 1px の枠 (`border`) がそのまま見えるため、 リングが
+    /// 途切れず 1 周しているように読めてしまい、 「どこまで回るのか」 が分からない。
+    ///
+    /// `None` で palette の `panel` (elevation-1 = 主要 panel / strip 本体 =
+    /// knob が載る既定の面)。 **面が既定と違う場所** に置く caller だけ `Some` を渡す
+    /// (widget は自分が何色の上に描かれているかを知り得ないため、 そこだけは caller の責務)。
+    pub surface: Option<Color>,
 }
 
 impl KnobStyle {
     /// 片極性: 弧は最小値 (7 時) から伸びる。 吸着なし。 送り量 / dry-wet など。
-    pub const UNIPOLAR: Self = Self { arc_origin: 0.0, detent: false };
+    pub const UNIPOLAR: Self = Self { arc_origin: 0.0, detent: false, surface: None };
     /// 双極性: 弧は中央 (12 時) から左右へ伸び、 中央に目印が付き、 中央 (= `default_value`)
     /// に吸着する。 pan / balance など。
-    pub const BIPOLAR: Self = Self { arc_origin: 0.5, detent: true };
+    pub const BIPOLAR: Self = Self { arc_origin: 0.5, detent: true, surface: None };
 }
 
 /// 零点吸着 (detent) の写像。 ドラッグ座標 (raw) と値の間に「`target` で平らな区間」を挟む
@@ -413,9 +433,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             arc_origin.to_bits(),
             dragging,
             hovered_rect,
+            // 可動範囲外をくり抜く面の色。 palette 由来の色は set_palette が
+            // scene cache ごと捨てるので hash 不要だが、 これは **caller が渡す色** なので
+            // 畳まないと「同じ knob を別の面へ移した」 変化が cache に映らない。
+            style.surface.map(|c| (c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits())),
         ));
+        let surface = style.surface;
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_knob(ui, rect, displayed_value, arc_origin, dragging, pointer);
+            draw_knob(ui, rect, displayed_value, arc_origin, surface, dragging, pointer);
         });
 
         // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
@@ -512,11 +537,14 @@ fn value_angle(v: f32) -> f32 {
     (v.clamp(0.0, 1.0) - 0.5) * SWEEP
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_knob<M: ?Sized + 'static>(
     ui: &mut Ui<'_, M>,
     rect: Rect,
     value: f32,
     arc_origin: f32,
+    // この knob が載っている面の色 (`KnobStyle::surface`)。 None で palette の `panel`。
+    surface: Option<Color>,
     dragging: bool,
     pointer: crate::input::PointerFrame,
 ) {
@@ -531,7 +559,8 @@ fn draw_knob<M: ?Sized + 'static>(
 
     // Ableton 流: 中立な `control` の円 + 円周上に `accent` の arc。
     // arc は「起点値の角度」から value_angle までを円周 (radius = r) 上に描画。
-    // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外で arc は届かない (= "切れている")。
+    // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外なので、 面の色で塗って
+    // リングを物理的に切る (下の「0.」 を参照)。
     let base = p.control;
     let hover_c = p.control_hover;
     let press_c = p.accent;
@@ -561,12 +590,36 @@ fn draw_knob<M: ?Sized + 'static>(
     let active_color = p.accent;
     let inactive_color = p.inset_bg;
 
+    // 0. 可動範囲 **外** の 60° (5時 → 6時 → 7時) を「この knob が載っている面」の色で塗り、
+    //    円本体の縁 (control) と 1px 枠 (border) をその区間だけくり抜く。
+    //
+    //    これが無いと、 可動範囲外でも円本体の縁と枠が見えているせいで **リングが途切れず
+    //    1 周しているように読め**、 「ノブがどこまで回るのか」 が分からない (ユーザー報告:
+    //    「パンのノブがそこまで回転しない場合の弧の色はミキサーの背景色と同じにしてください」)。
+    //    面の色は widget からは知り得ないので caller が `KnobStyle::surface` で渡す。
+    //    既定 (`None`) は `panel` = knob が載る標準的な面。
+    //
+    //    角度は end (+150°) → start + 360° (+210°) の **値弧・track 弧が通らない側**。
+    //    線幅を ARC_WIDTH_PX に揃えるので、 くり抜きの内外縁が他の 2 本と一致する
+    //    (揃っていないと「切り欠き」でなく「別の帯」に見える)。
+    let surface_color = surface.unwrap_or(p.panel);
+    push_arc(
+        ui,
+        cx,
+        cy,
+        arc_radius,
+        end_angle,
+        start_angle + 2.0 * PI,
+        surface_color,
+        ARC_WIDTH_PX,
+    );
+
     // 1-2. 弧は 2 色で可動範囲 300° を **過不足なく 1 周** 分だけ描く:
     //   - 値弧 (accent) = 起点値 → 現在値。 unipolar (起点 0.0) では 7 時から伸び、
     //     bipolar (起点 0.5) では中央 12 時から左右どちらへも伸びる。 起点 == 現在値
     //     (dead band 内) なら 1 本も描かれない (= pan センタで塗りが消える)。
     //   - track (暗グレー) = 残りの可動範囲。 値弧が覆う区間は描かない。
-    // 6時付近の 60° (5時 → 7時) は範囲外なので空白 = "弧が切れて見える"。
+    // 6時付近の 60° (5時 → 7時) は上の「0.」 が面の色で塗り済み = "弧が切れて見える"。
     //
     // Ardour / iced_audio は track を全 span 描いてから値弧を上書きするが、 こちらは弧を
     // polygon 近似 (2° 刻み) するので、 全 span 重ね描きは segment 数が最悪 2 倍になる
@@ -656,17 +709,35 @@ fn push_arc<M: ?Sized + 'static>(
     if hi - lo < 1e-4 {
         return;
     }
-    let step = 2.0_f32 * PI / 180.0;
-    let mut segs: Vec<LineSegment> = Vec::new();
-    let mut a = lo;
-    while a < hi {
-        let b = (a + step).min(hi);
+    // 刻みは **半径に反比例** させて 1 segment の弦長を `ARC_CHORD_PX` 前後に保つ。
+    //
+    // 旧実装は半径によらず固定 2° だった。 半径 14px の knob では 1 segment の弦長が
+    // `14 × 2° = 0.49px` = **1 pixel 未満の細切れ quad** になり、 rasterizer が
+    // pixel 中心を拾えず **弧に穴が空く**。 値弧 / track 弧では下地が同じ knob 本体なので
+    // 斑点として微かに出るだけだったが、 可動範囲外を面の色で塗り潰す用途では
+    // その穴から本体の縁と枠が漏れて「切れて見えない」 という実害になった。
+    //
+    // 刻みは span を **均等割り** する (`span / ceil(span / target)`)。 単純に target を
+    // 足し込むと最後に「余り」の短い segment が 1 本出て、 そこだけ sub-pixel になる。
+    let span = hi - lo;
+    let target = (ARC_CHORD_PX / radius.max(1.0)).clamp(ARC_STEP_MIN, ARC_STEP_MAX);
+    let n = (span / target).ceil().max(1.0);
+    let step = span / n;
+    // line pipeline の quad は cap を持たない butt 継ぎなので、 joint では外側に
+    // 微小な楔形の隙間が残る。 各 segment の終端を半 step 伸ばして重ね、 隙間を無くす
+    // (不透明色では完全に不可視、 半透明弧でも 1px 未満の重なりに収まる)。
+    let overlap = step * 0.5;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let count = n as usize; // span <= 2π / target >= 2° より高々 180
+    let mut segs: Vec<LineSegment> = Vec::with_capacity(count);
+    for i in 0..count {
+        let a = lo + step * i as f32;
+        let b = (a + step + overlap).min(hi);
         segs.push(LineSegment {
             a: [cx + a.sin() * radius, cy - a.cos() * radius],
             b: [cx + b.sin() * radius, cy - b.cos() * radius],
             color,
         });
-        a = b;
     }
     if !segs.is_empty() {
         ui.push_lines(LineBatch { segments: segs.into(), line_width_px, clip_rect: None });
@@ -840,6 +911,81 @@ mod tests {
             primary_just_released: true,
             ..PointerFrame::default()
         }
+    }
+
+    /// 指定 size の knob を 1 フレーム描き、 描かれた線分をすべて集める。
+    fn draw_to_scene(size: f32, value: f32, style: &KnobStyle) -> (Scene, f32, f32, f32) {
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
+        let model = PanModel { value };
+        let mut scene = Scene::new();
+        let rect = Rect { x: 0.0, y: 0.0, w: size, h: size };
+        host.frame_to_edits(
+            &model,
+            &mut scene,
+            PhysicalSize { width: 200, height: 200 },
+            FrameInput::default(),
+            |_, ui| {
+                ui.knob_at("test", rect, value, 0.5, style, |v| {
+                    Edit::mutate(move |m: &mut PanModel| m.value = v)
+                }, None);
+            },
+        );
+        let r = (size * 0.5 - 2.0).max(2.0);
+        (scene, size * 0.5, size * 0.5, r)
+    }
+
+    /// 弧の折れ線近似は **1 segment を 1px 未満にしない**。
+    ///
+    /// 旧実装は半径によらず固定 2° 刻みで、 半径 7px (= mixer の send ミニ knob 18px) では
+    /// 1 segment の弦長が 0.24px しかなかった。 line pipeline の quad は cap を持たない
+    /// 素の矩形なので、 sub-pixel の quad は rasterizer が pixel 中心を拾えず **弧に穴が空く**
+    /// (可動範囲外を面の色で塗る用途では、 その穴から本体の縁と枠が漏れる)。
+    #[test]
+    fn arc_segments_never_go_below_one_pixel() {
+        // 18px = mixer の send ミニ knob (半径 7px)、 32px = pan knob (半径 14px)。
+        for size in [18.0_f32, 32.0] {
+            let (scene, ..) = draw_to_scene(size, 0.8, &KnobStyle::BIPOLAR);
+            let mut shortest = f32::INFINITY;
+            for batch in scene.iter_lines() {
+                for seg in batch.segments.iter() {
+                    let len = (seg.b[0] - seg.a[0]).hypot(seg.b[1] - seg.a[1]);
+                    shortest = shortest.min(len);
+                }
+            }
+            assert!(
+                shortest >= 1.0,
+                "size {size}px: 最短の線分が {shortest}px (1px 未満の quad は rasterize で落ちる)"
+            );
+        }
+    }
+
+    /// 可動範囲 (300°) の **外側** 60° が `KnobStyle::surface` の色で塗られ、 その色が
+    /// 可動範囲の内側には一切乗らないこと。 これが無いと下の 60° に円本体の縁と枠が
+    /// 見えたままで、 リングが 1 周しているように読める (daw_01: pan ノブの可動範囲が
+    /// 分からない、 という報告)。
+    #[test]
+    fn out_of_range_span_is_filled_with_the_surface_color() {
+        // palette に無い識別色。 これで塗られた線分 = くり抜きの弧。
+        let surface = Color::rgb(0.123, 0.456, 0.789);
+        let style = KnobStyle { surface: Some(surface), ..KnobStyle::BIPOLAR };
+        let (scene, cx, cy, _r) = draw_to_scene(32.0, 0.8, &style);
+
+        let mut found = 0;
+        for batch in scene.iter_lines() {
+            for seg in batch.segments.iter().filter(|s| s.color == surface) {
+                found += 1;
+                for pt in [seg.a, seg.b] {
+                    // widget の角度写像 (x = sin, y = -cos) の逆。
+                    let theta = (pt[0] - cx).atan2(-(pt[1] - cy));
+                    assert!(
+                        theta.abs() >= 0.5 * SWEEP - 1e-3,
+                        "くり抜きの弧が可動範囲の内側 ({}°) に入っている",
+                        theta.to_degrees()
+                    );
+                }
+            }
+        }
+        assert!(found > 0, "surface 色の弧が 1 本も描かれていない");
     }
 
     #[test]

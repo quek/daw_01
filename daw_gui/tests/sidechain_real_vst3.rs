@@ -20,18 +20,39 @@
 //!   bus arrangement / clap_audio_buffer で setBusArrangements が
 //!   通り、 export が正常に完了すること)
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-const MCOMPRESSOR_PATH: &str =
-    "C:/Program Files/Common Files/VST3/MeldaProduction/Dynamics/MCompressor.vst3";
+/// 実 VST3 の場所を渡す環境変数 (対象は **MeldaProduction MCompressor**)。
+///
+/// **開発機の絶対パスを既定値にしない** — 理由は `pdc_real_vst3.rs` の同名定数と同じ。
+const MCOMPRESSOR_ENV: &str = "DAW01_TEST_VST3_MCOMPRESSOR";
+
+/// 環境変数から実 VST3 の絶対パスを解決する。 未設定 / 不在なら **理由を stderr に出して**
+/// `None` (= テストは SKIP)。 商用プラグインなので clone した人の環境にも CI にも無いのが
+/// 普通で、 黙って通ると「なぜ何も検証されていないのか」 が分からなくなる。
+fn vst3_from_env(var: &str, product: &str) -> Option<PathBuf> {
+    let Some(raw) = std::env::var_os(var) else {
+        eprintln!(
+            "SKIP: {var} が未設定です。{product} (VST 3) の .vst3 パスを \
+             {var} に入れて実行すると、このテストが走ります。"
+        );
+        return None;
+    };
+    let path = PathBuf::from(raw);
+    if !path.exists() {
+        eprintln!("SKIP: {var} が指す {} が存在しません。", path.display());
+        return None;
+    }
+    Some(path)
+}
 
 #[test]
 #[ignore = "PR-V4: pdc_real_mcenter と同様、 setGeneratedAudio 経路廃止で click inject の書き直しが必要。 別 PR で test 用 inject path を整備"]
 fn sidechain_real_mcompressor_pipeline_does_not_crash() {
-    if !Path::new(MCOMPRESSOR_PATH).exists() {
-        eprintln!("SKIP: {MCOMPRESSOR_PATH} not installed");
+    // プラグインの場所が渡されていなければ SKIP (理由は helper が stderr に出す)。
+    let Some(plugin) = vst3_from_env(MCOMPRESSOR_ENV, "MeldaProduction MCompressor") else {
         return;
-    }
+    };
 
     let exe = env!("CARGO_BIN_EXE_daw_gui");
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -47,6 +68,8 @@ fn sidechain_real_mcompressor_pipeline_does_not_crash() {
     drop(tmp);
 
     // wireSidechain=true で実行 (sidechain pipeline 全体を経由)。
+    // プラグインの場所は script にも渡す (JS 側にも絶対パスを持たせない)。
+    let plugin_arg = format!("plugin={}", plugin.display());
     let status = std::process::Command::new(exe)
         .args([
             "--script",
@@ -55,6 +78,8 @@ fn sidechain_real_mcompressor_pipeline_does_not_crash() {
             out_path.to_str().unwrap(),
             "--arg",
             "wireSidechain=true",
+            "--arg",
+            &plugin_arg,
         ])
         .status()
         .expect("spawn daw_gui");

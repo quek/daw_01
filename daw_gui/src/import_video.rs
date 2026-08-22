@@ -561,6 +561,9 @@ pub fn project_filename(src: &Path, hash8: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 公開前整備: fixture 用 ffmpeg の解決とエンコーダ指定は `crate::test_ffmpeg` が SSoT。
+    // 以前は 3 モジュールが同じ helper を各自に持ち、いずれも PATH の ffmpeg を探していた。
+    use crate::test_ffmpeg::{locate_ffmpeg, skip_reason, H264_ENCODER};
     use std::path::PathBuf;
 
     #[test]
@@ -589,9 +592,7 @@ mod tests {
     #[test]
     fn extract_metadata_reads_h264_mp4_fixture() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!(
-                "extract_metadata_reads_h264_mp4_fixture: ffmpeg not on PATH, skipping"
-            );
+            eprintln!("{}", skip_reason("extract_metadata_reads_h264_mp4_fixture"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -600,7 +601,7 @@ mod tests {
             .args([
                 "-f", "lavfi",
                 "-i", "testsrc=duration=1:size=320x240:rate=30",
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-pix_fmt", "yuv420p",
                 "-y",
                 mp4.to_str().unwrap(),
@@ -627,14 +628,6 @@ mod tests {
         assert_eq!(md.codec, "h264", "codec");
     }
 
-    fn locate_ffmpeg() -> Option<std::path::PathBuf> {
-        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(exe))
-                .find(|p| p.is_file())
-        })
-    }
 
     /// End-to-end check for the audio extract path: build a 1-second
     /// mp4 containing a 440Hz sine via the ffmpeg CLI, ask WMF to
@@ -644,7 +637,7 @@ mod tests {
     #[test]
     fn extract_audio_to_wav_writes_pcm_float() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("extract_audio_to_wav: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("extract_audio_to_wav"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -660,7 +653,7 @@ mod tests {
                 "-i", "testsrc=duration=1:size=160x120:rate=30",
                 "-f", "lavfi",
                 "-i", "sine=frequency=440:duration=1:sample_rate=48000",
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-c:a", "aac",
                 "-pix_fmt", "yuv420p",
                 "-shortest",
@@ -700,7 +693,7 @@ mod tests {
     #[test]
     fn import_one_video_copies_into_samples_and_decodes_audio() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("import_one_video: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("import_one_video"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -715,7 +708,7 @@ mod tests {
                 "-i", "testsrc=duration=1:size=160x120:rate=30",
                 "-f", "lavfi",
                 "-i", "sine=frequency=220:duration=1:sample_rate=48000",
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-c:a", "aac",
                 "-pix_fmt", "yuv420p",
                 "-shortest",
@@ -775,7 +768,7 @@ mod tests {
     #[test]
     fn extract_thumbnail_reads_first_frame_as_rgba() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("extract_thumbnail: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("extract_thumbnail"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -784,7 +777,7 @@ mod tests {
             .args([
                 "-f", "lavfi",
                 "-i", "color=c=red:size=160x120:duration=1:rate=30",
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-pix_fmt", "yuv420p",
                 "-y",
                 mp4.to_str().unwrap(),
@@ -802,8 +795,8 @@ mod tests {
 
         // The center pixel should be near-red (R ~ 0xFF, G ~ 0x00,
         // B ~ 0x00) regardless of YUV→RGB rounding error. Pick a
-        // sample away from the frame edges where libx264 sometimes
-        // leaves a couple of ringing rows after the keyframe.
+        // sample away from the frame edges where a lossy H.264 encoder
+        // sometimes leaves a couple of ringing rows after the keyframe.
         let center = (60 * 160 + 80) * 4;
         let r = thumb.rgba[center];
         let g = thumb.rgba[center + 1];
@@ -818,7 +811,7 @@ mod tests {
     #[test]
     fn extract_audio_returns_none_for_video_only_mp4() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("extract_audio_returns_none: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("extract_audio_returns_none"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -830,7 +823,7 @@ mod tests {
             .args([
                 "-f", "lavfi",
                 "-i", "testsrc=duration=1:size=160x120:rate=30",
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-pix_fmt", "yuv420p",
                 "-an",
                 "-y",

@@ -58,7 +58,7 @@ use libloading::{Library, Symbol};
 use crate::clap_host::Host;
 use crate::plugin_instance::{
     AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
-    TimedNoteEvent,
+    ResizableProbe, TimedNoteEvent,
 };
 use crate::process_scaffold::{
     self, TransportBlock, alloc_planar, alloc_planar_ports, copy_aux_inputs_planar,
@@ -1197,15 +1197,20 @@ impl EditorSizer for ClapSizer {
     fn notify_client_size(&self, w: u32, h: u32) {
         let Some(gui) = self.gui() else { return };
         let Some(f) = gui.set_size else { return };
-        if !unsafe { f(self.plugin, w, h) } {
-            tracing::debug!(w, h, "clap gui.set_size returned false");
-        }
+        // r.md #65: VST3 の `onSize` と同じく戻り値を info で残す
+        // (「呼んだ」と「受け入れられた」は別の事実)。
+        let accepted = unsafe { f(self.plugin, w, h) };
+        tracing::info!(target: "editor_resize", accepted, w, h, "CLAP gui.set_size");
     }
 
-    fn can_resize(&self) -> bool {
-        self.gui()
-            .and_then(|gui| gui.can_resize)
-            .is_some_and(|f| unsafe { f(self.plugin) })
+    fn can_resize(&self) -> ResizableProbe {
+        // gui 拡張が無い / `can_resize` が null = 問い合わせられない。
+        // 「プラグインが不可と答えた」のとは別の事実なので区別して残す。
+        let Some(f) = self.gui().and_then(|gui| gui.can_resize) else {
+            return ResizableProbe::unavailable();
+        };
+        let verdict = unsafe { f(self.plugin) };
+        ResizableProbe { verdict, queried: true, raw: i32::from(verdict) }
     }
 
     fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {

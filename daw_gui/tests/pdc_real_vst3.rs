@@ -9,21 +9,46 @@
 //! 4. ここで WAV を読み戻し、 master の peak 位置を検出
 //! 5. PDC が効いていれば L/R 両方が同位置に peak を持つ (=「音ずれ」 無し)
 //!
-//! MCenter 不在環境では SKIP (`return` で test pass)。
+//! プラグイン未指定 / 不在の環境では SKIP (`return` で test pass)。
+//!
+//! 対象は **MeldaProduction MCenter** (VST 3)。 レイテンシを申告する実プラグインなら
+//! 原理的には何でもよいが、 期待値 (PDC 後に L/R の peak が揃う) はこれで確認している。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-const MCENTER_PATH: &str =
-    "C:/Program Files/Common Files/VST3/MeldaProduction/Stereo/MCenter.vst3";
+/// 実 VST3 の場所を渡す環境変数。
+///
+/// **開発機の絶対パスを既定値にしない**。 商用プラグインの標準インストール先はマシンごとに
+/// 違ううえ、 既定値として書くと個人の環境がリポジトリに焼き付く (README や bench に同じ形で
+/// 混入した前例がある)。 走らせたい人が自分のパスを渡す。
+const MCENTER_ENV: &str = "DAW01_TEST_VST3_MCENTER";
+
+/// 環境変数から実 VST3 の絶対パスを解決する。 未設定 / 不在なら **理由を stderr に出して**
+/// `None` (= テストは SKIP)。 商用プラグインなので clone した人の環境にも CI にも無いのが
+/// 普通で、 黙って通ると「なぜ何も検証されていないのか」 が分からなくなる。
+fn vst3_from_env(var: &str, product: &str) -> Option<PathBuf> {
+    let Some(raw) = std::env::var_os(var) else {
+        eprintln!(
+            "SKIP: {var} が未設定です。{product} (VST 3) の .vst3 パスを \
+             {var} に入れて実行すると、このテストが走ります。"
+        );
+        return None;
+    };
+    let path = PathBuf::from(raw);
+    if !path.exists() {
+        eprintln!("SKIP: {var} が指す {} が存在しません。", path.display());
+        return None;
+    }
+    Some(path)
+}
 
 #[test]
 #[ignore = "PR-V4: setGeneratedAudio 経路廃止に伴い、 click signal の inject path を audio clip + import_audio に置き換える書き直しが必要。 PDC ロジック自体は不変なので、 test 復活は別 PR (= test 用 WAV を generate + ImportAudio で audio_source 登録 + audio clip events 経由で再生)"]
 fn pdc_real_mcenter_aligns_master_output() {
-    // 1. MCenter 不在なら SKIP
-    if !Path::new(MCENTER_PATH).exists() {
-        eprintln!("SKIP: {MCENTER_PATH} not installed");
+    // 1. プラグインの場所が渡されていなければ SKIP (理由は helper が stderr に出す)
+    let Some(plugin) = vst3_from_env(MCENTER_ENV, "MeldaProduction MCenter") else {
         return;
-    }
+    };
 
     // 2. tempfile に WAV を書き出す
     let tmp = tempfile::Builder::new()
@@ -39,12 +64,16 @@ fn pdc_real_mcenter_aligns_master_output() {
         .join("tests")
         .join("scripts")
         .join("pdc_mcenter.js");
+    // プラグインの場所は script にも渡す (JS 側にも絶対パスを持たせない)。
+    let plugin_arg = format!("plugin={}", plugin.display());
     let status = std::process::Command::new(exe)
         .args([
             "--script",
             script.to_str().unwrap(),
             "--output",
             out_path.to_str().unwrap(),
+            "--arg",
+            &plugin_arg,
         ])
         .status()
         .expect("spawn daw_gui");

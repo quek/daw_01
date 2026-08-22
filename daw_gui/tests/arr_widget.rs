@@ -648,3 +648,128 @@ fn video_clip_thumbnails_tile_across_the_visible_range() {
         assert!(right >= WIDGET_RECT.w, "{what}: 右端まで届く: got {right}");
     }
 }
+
+/// r.md #71 (ユーザー報告そのもの): 「Break を 2 まで D&D しても元に戻ってしまいます。
+/// その先の C まで D&D すると Break と 2 が入れかわります。」
+///
+/// 帯を **右隣の帯の位置** まで引っ張ったら、その場で入れかわること (1 つ先まで
+/// 引っ張らないと届かない = 1 セクションぶんのズレが無いこと)。 併せて
+/// **ドラッグ中に見えていた位置と確定後の位置が一致する** (overlay == commit) ことも見る。
+#[test]
+fn section_drag_onto_next_band_swaps_and_lands_where_previewed() {
+    let (mut app, _a, _p) = build_app();
+    let colors = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    app.edit_song(|song| {
+        song.sections.clear();
+        // Break[0,4) = 赤 / 2[4,8) = 緑 / C[8,12) = 青。1 拍 = 64px。
+        for (i, (id, start)) in [(1_u32, 0.0_f64), (2, 4.0), (3, 8.0)].into_iter().enumerate() {
+            song.sections.push(Section {
+                id,
+                name: format!("S{id}"),
+                color: colors[i],
+                start_beat: start,
+                len_beats: 4.0,
+            });
+        }
+    });
+    let band_rect = |scene: &Scene, rgb: [f32; 3]| -> Option<Rect> {
+        let want = Color::rgb(rgb[0], rgb[1], rgb[2]);
+        scene.primitives.iter().find_map(|p| match p {
+            Primitive::Rect(c)
+                if c.fill.r == want.r
+                    && c.fill.g == want.g
+                    && c.fill.b == want.b
+                    && c.fill.a == want.a =>
+            {
+                Some(c.rect)
+            }
+            _ => None,
+        })
+    };
+    let starts = |app: &AppData| -> Vec<(u32, f64)> {
+        app.song_doc.song().sections.iter().map(|s| (s.id, s.start_beat)).collect()
+    };
+
+    let mut host = UiHost::no_redraw();
+    // Break の中央 (x=128) を掴んで、2 の中央 (x=384) まで運ぶ = +4 拍。
+    drive(&mut host, &mut app, press(128.0, SEC_Y, no_mods()));
+    let scene = drive_scene(&mut host, &mut app, hold(384.0, SEC_Y, no_mods()));
+    let previewed = band_rect(&scene, colors[0]).expect("ドラッグ中の帯 (赤) が描かれている");
+    assert!(
+        (previewed.x - 256.0).abs() < 1.0,
+        "ゴーストは 2 の位置 (拍 4 = x256) に見えている: got {}",
+        previewed.x
+    );
+
+    drive(&mut host, &mut app, release(384.0, SEC_Y, no_mods()));
+    assert_eq!(
+        starts(&app),
+        vec![(2, 0.0), (1, 4.0), (3, 8.0)],
+        "Break と 2 が入れかわる (元に戻らない / 1 つ先へ飛ばない)"
+    );
+
+    // overlay == commit: 確定後に描かれる赤帯が、ドラッグ中に見えていた位置と同じ。
+    let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+    let committed = band_rect(&scene, colors[0]).expect("確定後の帯 (赤)");
+    assert!(
+        (committed.x - previewed.x).abs() < 1.0 && (committed.w - previewed.w).abs() < 1.0,
+        "見えていた位置に落ちる: preview={previewed:?} committed={committed:?}"
+    );
+}
+
+/// r.md #71: 帯に **食い込む** 位置まで引っ張ったときも、ゴーストは「実際に着地する位置」 を
+/// 見せる (= overlay == commit)。 解決を commit 側だけに入れると、見えていた位置と違う所に
+/// 落ちるという別のバグになる。
+#[test]
+fn section_drag_preview_shows_the_resolved_landing_position() {
+    let (mut app, _a, _p) = build_app();
+    let red = [1.0_f32, 0.0, 0.0];
+    app.edit_song(|song| {
+        song.sections.clear();
+        for (id, start, color) in [
+            (1_u32, 0.0_f64, red),
+            (2, 4.0, [0.0, 1.0, 0.0]),
+            (3, 8.0, [0.0, 0.0, 1.0]),
+        ] {
+            song.sections.push(Section {
+                id,
+                name: format!("S{id}"),
+                color,
+                start_beat: start,
+                len_beats: 4.0,
+            });
+        }
+    });
+    let red_x = |scene: &Scene| -> Option<f32> {
+        let want = Color::rgb(red[0], red[1], red[2]);
+        scene.primitives.iter().find_map(|p| match p {
+            Primitive::Rect(c)
+                if c.fill.r == want.r && c.fill.g == want.g && c.fill.b == want.b =>
+            {
+                Some(c.rect.x)
+            }
+            _ => None,
+        })
+    };
+
+    let mut host = UiHost::no_redraw();
+    // Break の中央を +5 拍 (320px) 引っ張る。素の落とし先 (拍 5) は C の位置に食い込むので、
+    // 近い方の境界 (拍 4) へ解決される。
+    drive(&mut host, &mut app, press(128.0, SEC_Y, no_mods()));
+    let scene = drive_scene(&mut host, &mut app, hold(448.0, SEC_Y, no_mods()));
+    let previewed = red_x(&scene).expect("ドラッグ中の帯 (赤)");
+    assert!(
+        (previewed - 256.0).abs() < 1.0,
+        "ゴーストは解決後の位置 (拍 4 = x256) に出る (拍 5 = x320 ではない): got {previewed}"
+    );
+
+    drive(&mut host, &mut app, release(448.0, SEC_Y, no_mods()));
+    let landed = app.song_doc.song().sections.iter().find(|s| s.id == 1).map(|s| s.start_beat);
+    assert_eq!(landed, Some(4.0), "見えていた拍 4 に落ちる");
+    let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+    let committed = red_x(&scene).expect("確定後の帯 (赤)");
+    assert!(
+        (committed - previewed).abs() < 1.0,
+        "overlay == commit: preview={previewed} committed={committed}"
+    );
+}

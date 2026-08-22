@@ -61,6 +61,9 @@ pub mod state;
 #[cfg(windows)]
 pub mod smoke_test;
 pub mod subprocess;
+/// テスト fixture 用 `ffmpeg` CLI の解決とエンコーダ指定 (テストビルドのみ)。
+#[cfg(test)]
+pub mod test_ffmpeg;
 pub mod theme;
 pub mod video_fx;
 pub mod view;

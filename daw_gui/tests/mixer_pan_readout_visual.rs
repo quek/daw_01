@@ -40,6 +40,13 @@ const KNOB_SIZE: f32 = 32.0;
 /// `pad 6 + 名前 18 + M/S 22 + 余白 6` で pan 行 (= ノブ 32px) が始まり、 数値欄 (16px) は
 /// ノブと縦センタなので `+8`、 その中で 1 行 (font 10 → 12px) が縦センタなので `+2`。
 const READOUT_TOP_IN_STRIP: f32 = 6.0 + 18.0 + 22.0 + 6.0 + 8.0 + 2.0;
+/// strip 上端から pan 行 (= ノブの rect 上端) までの距離 (px)。
+const KNOB_TOP_IN_STRIP: f32 = 6.0 + 18.0 + 22.0 + 6.0;
+/// strip 左端から pan 行の左端 (= ノブの rect 左端) までの距離 (px)。
+/// `(STRIP_WIDTH - PAN_ROW_W) / 2` = `(80 - 66) / 2`。
+const KNOB_LEFT_IN_STRIP: f32 = 7.0;
+/// ノブのリング半径 (px)。 `draw_knob` の `size * 0.5 - 2.0` (= 32 / 2 - 2)。
+const KNOB_RING_RADIUS: f32 = 14.0;
 
 fn build_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
@@ -91,6 +98,19 @@ fn frame(app: &AppData, scene: &mut Scene) {
     host.frame_to_edits(app, scene, screen, FrameInput::default(), |app, ui| {
         daw_gui::view::root::build_root(app, ui, screen);
     });
+}
+
+/// RGBA バッファから 1 pixel の RGB を取る (座標は f32 → 最近傍)。
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn px(rgba: &[u8], x: f32, y: f32) -> [u8; 3] {
+    let (xi, yi) = (x.round().max(0.0) as u32, y.round().max(0.0) as u32);
+    let i = ((yi.min(H - 1) * W + xi.min(W - 1)) * 4) as usize;
+    [rgba[i], rgba[i + 1], rgba[i + 2]]
+}
+
+/// sRGB 8bit で各チャンネル 4 以内なら同色とみなす (レンダラのディザ / 端数を許容)。
+fn near(a: [u8; 3], b: [u8; 3]) -> bool {
+    (0..3).all(|i| a[i].abs_diff(b[i]) <= 4)
 }
 
 /// strip 背景 panel の `(x, y)` を左から順に。 幅 = `STRIP_WIDTH` の縦長 rect で拾う。
@@ -177,6 +197,47 @@ fn pan_readout_sits_on_the_knob_row_not_below_it() {
         (offset - READOUT_TOP_IN_STRIP).abs() < 0.01,
         "pan 数値は strip 上端から {READOUT_TOP_IN_STRIP}px (= ノブと同じ行) に出る。 got {offset}"
     );
+}
+
+/// ノブの **可動範囲外 (下の 60°)** が strip の背景と同色に塗られ、 リングが下で
+/// 切れて見えること。 旧実装ではその 60° に円本体の縁 (`control`) と 1px 枠 (`border`) が
+/// そのまま見えていて、 リングが途切れず 1 周しているように読めていた
+/// (ユーザー報告:「パンのノブがそこまで回転しない場合の弧の色はミキサーの背景色と同じに」)。
+///
+/// 6 時 (可動範囲外) のリング上 pixel が strip 背景と一致し、 3 時 (可動範囲内) の
+/// リング上 pixel が背景と **一致しない** ことの両方を見る。 前者だけだと「リング全体が
+/// 消えた」 バグを通してしまう。 dark / light 両方で確認する。
+#[test]
+fn knob_out_of_range_arc_matches_the_strip_background() {
+    let Ok(mut renderer) = OffscreenRenderer::new(W, H) else {
+        eprintln!("skip knob out-of-range visual test: no GPU adapter/device");
+        return;
+    };
+    for theme in ["dark", "light"] {
+        let app = app_with_three_pans_themed(theme);
+        let mut scene = Scene::new();
+        frame(&app, &mut scene);
+        let (strip_x, strip_y) = strip_rects(&scene)[0];
+        let rgba = renderer.render_to_rgba(&scene).expect("offscreen render");
+
+        let cx = strip_x + KNOB_LEFT_IN_STRIP + KNOB_SIZE * 0.5;
+        let cy = strip_y + KNOB_TOP_IN_STRIP + KNOB_SIZE * 0.5;
+        // strip の素の背景 (M/S 行と pan 行の間の 6px の余白、 左右中央)。
+        let bg = px(&rgba, strip_x + STRIP_WIDTH * 0.5, strip_y + KNOB_TOP_IN_STRIP - 3.0);
+        // 6 時 = 可動範囲外 (300° sweep の外)。
+        let bottom = px(&rgba, cx, cy + KNOB_RING_RADIUS);
+        // 3 時 = 可動範囲内 (track 弧か値弧が必ず乗る)。
+        let right = px(&rgba, cx + KNOB_RING_RADIUS, cy);
+
+        assert!(
+            near(bottom, bg),
+            "{theme}: ノブ 6 時 (可動範囲外) は strip 背景と同色 (got {bottom:?} / bg {bg:?})"
+        );
+        assert!(
+            !near(right, bg),
+            "{theme}: ノブ 3 時 (可動範囲内) にはリングが乗っている (got {right:?} / bg {bg:?})"
+        );
+    }
 }
 
 /// 目視確認用の PNG を残す + 「pan 数値欄が一様塗りに潰れていない」 ことを pixel で確認。

@@ -730,6 +730,9 @@ fn resolve_video_source_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 公開前整備: fixture 用 ffmpeg の解決とエンコーダ指定は `crate::test_ffmpeg` が SSoT。
+    // 以前は 3 モジュールが同じ helper を各自に持ち、いずれも PATH の ffmpeg を探していた。
+    use crate::test_ffmpeg::{locate_ffmpeg, skip_reason, H264_ENCODER};
 
     /// r.md #32 回帰: 書き出し窓は `length_beats` を超えるループ / 範囲もそのまま
     /// 尊重し、audio 側と同じ窓を返す。旧実装は end を `length_beats` に clamp して
@@ -802,7 +805,7 @@ mod tests {
             .args([
                 "-f", "lavfi",
                 "-i", &lavfi,
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-pix_fmt", "yuv420p",
                 "-y",
                 src_mp4.to_str().unwrap(),
@@ -881,7 +884,7 @@ mod tests {
     #[test]
     fn render_mp4_video_only_smoke() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("render_mp4"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -926,7 +929,7 @@ mod tests {
     #[test]
     fn render_mp4_range_past_length_beats_renders_full_range() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("render_mp4"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -961,7 +964,7 @@ mod tests {
     #[test]
     fn render_mp4_honors_output_resolution_and_fps_override() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("render_mp4"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -994,13 +997,5 @@ mod tests {
         assert_eq!(md.codec, "h264");
     }
 
-    fn locate_ffmpeg() -> Option<std::path::PathBuf> {
-        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(exe))
-                .find(|p| p.is_file())
-        })
-    }
 
 }

@@ -48,7 +48,7 @@ use vst3::{
 
 use crate::plugin_instance::{
     AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
-    TimedNoteEvent,
+    ResizableProbe, TimedNoteEvent,
 };
 use crate::process_scaffold::{
     self, TransportBlock, alloc_planar, alloc_planar_ports, copy_aux_inputs_planar,
@@ -1709,14 +1709,27 @@ impl EditorSizer for Vst3Sizer {
         // 規定しておらず、editorhost も JUCE も見ていない。以前ここを
         // `ensure!(res == kResultOk)` にしていたため、正常動作している VST3 が
         // 軒並み WARN を吐いていた。
-        if res != kResultOk {
-            tracing::debug!(res = format!("{res:#x}"), w, h, "IPlugView::onSize returned non-ok");
-        }
+        //
+        // r.md #65: 戻り値は**捨てずに info で残す**。「onSize を呼んだ」ことと
+        // 「プラグインが受け入れた」ことは別の事実で、後者が分からないと
+        // 「Applied なのに窓が変わらない」の切り分けができない。
+        tracing::info!(
+            target: "editor_resize",
+            res = format!("{res:#x}"),
+            w,
+            h,
+            "VST3 IPlugView::onSize"
+        );
     }
 
-    fn can_resize(&self) -> bool {
-        self.view()
-            .is_some_and(|view| unsafe { view.canResize() } == kResultTrue)
+    fn can_resize(&self) -> ResizableProbe {
+        let Some(view) = self.view() else {
+            // view が無い = `gui_create_embedded` 前 / `gui_destroy` 後。
+            // 「プラグインが不可と答えた」のとは**別の事実**なので区別して残す。
+            return ResizableProbe::unavailable();
+        };
+        let raw = unsafe { view.canResize() };
+        ResizableProbe { verdict: raw == kResultTrue, queried: true, raw }
     }
 
     fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {
