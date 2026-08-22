@@ -136,7 +136,15 @@ gh release upload vendor-ffmpeg-n7.1.5-16-g9a4bb2c579 \
     dist/ffmpeg-mirror/gpl-3.0.txt \
     dist/ffmpeg-mirror/lgpl-3.0.txt \
     dist/ffmpeg-mirror/README.txt \
+    dist/ffmpeg-mirror/RELEASE_NOTES.md \
     dist/ffmpeg-mirror/SHA256SUMS
+```
+
+> `RELEASE_NOTES.md` は `--notes-file` で release 本文にもなるが、**asset としても上げる**。
+> `SHA256SUMS` がこれを含んでいるので、上げないと利用者の `sha256sum -c SHA256SUMS` が
+> 1 件だけ落ちる (2026-08-22 に実際の公開手順で発覚)。`.work/` は中間生成物なので上げない。
+
+```bash
 
 # 5. フォールバックが実際に効くことを確かめる (一次 URL をわざと壊す)
 /usr/bin/bash scripts/fetch_ffmpeg.sh --dest /tmp/ffcheck \
