@@ -18,7 +18,7 @@ use crate::view::track_color;
 use super::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementCurveKind, ArrangementMasterRow, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, AutomationPointKey, ClipView, ClipViewAudioEdit, ClipKey,
+    AutomationClipKey, AutomationPointKey, ClipThumbnail, ClipView, ClipViewAudioEdit, ClipKey,
     ClipEventFade, SectionView, TrackKind, pixel_snapped_scroll_beat, view_len_beats,
 };
 
@@ -161,6 +161,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         id: c.id,
                         start_beat: c.start_beat,
                         len_beats: c.length_beats,
+                        // r.md #68: 中身 (波形 / MIDI / fade / thumbnail) の x 写像は
+                        // `start_beat - content_offset_beats` (= content 原点) を原点に、
+                        // ビューのズーム 1 本で決まる (`geometry::content_map`)。
+                        content_offset_beats: c.content_offset_beats,
                         name: labels
                             .content_labels
                             .get(&c.content_id)
@@ -185,39 +189,51 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                             .map(|ev| ClipViewAudioEdit { gain_db: ev.gain_db }),
                         // r.md #38: fade は content 種別に依らず全 event ぶん渡す
                         // (音声だけ / first event だけ だった旧実装を置換)。
-                        // r.md #44: widget の座標系は **clip の窓ローカル** なので、
-                        // content-local な `start_in_clip_beats` から窓の offset を引く
-                        // (widget は content の存在を知らないままでよい)。
+                        // r.md #68: 座標系は **content-local のまま素通し**。 r.md #44 で
+                        // 窓ローカルへ畳んでいたが、 それだと中身の原点が窓と一緒に動き、
+                        // 端 drag の preview が「クリップ幅 ÷ クリップ長」 のスケールに頼る
+                        // ことになる。 窓の offset は `ClipView::content_offset_beats` が持ち、
+                        // 換算は `geometry::content_map` 1 本に集約した。
                         fades: content.map_or_else(Vec::new, |ct| {
                             ct.event_fades()
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, mut fade)| {
-                                    fade.start_in_clip_beats -= c.content_offset_beats;
-                                    ClipEventFade {
-                                        event_index: u32::try_from(i).unwrap_or(u32::MAX),
-                                        fade,
-                                    }
+                                .map(|(i, fade)| ClipEventFade {
+                                    event_index: u32::try_from(i).unwrap_or(u32::MAX),
+                                    fade,
                                 })
                                 .collect()
                         }),
+                        // r.md #68: thumbnail も「中身」 なので、 それが表す event の
+                        // content-local 開始拍を添える (widget は content 原点基準で置き、
+                        // clip 矩形で切り抜く = 端 drag しても絵が動かない)。
                         thumbnail: {
                             content
                                 .and_then(|ct| ct.video_events())
                                 .and_then(|events| events.first())
                                 .and_then(|ev| {
-                                    let handle =
+                                    let texture =
                                         *app.ui_ephemeral.video_texture_cache.get(&ev.source_id)?;
                                     let src = app.song_doc.song().media.video_sources.get(&ev.source_id)?;
-                                    Some((handle, src.width, src.height))
+                                    Some(ClipThumbnail {
+                                        texture,
+                                        width: src.width,
+                                        height: src.height,
+                                        start_in_content_beats: ev.event_start_in_clip_beats,
+                                    })
                                 })
                                 .or_else(|| {
                                     let events = content?.image_events()?;
                                     let ev = events.first()?;
-                                    let handle =
+                                    let texture =
                                         *app.ui_ephemeral.image_texture_cache.get(&ev.source_id)?;
                                     let src = app.song_doc.song().media.image_sources.get(&ev.source_id)?;
-                                    Some((handle, src.width, src.height))
+                                    Some(ClipThumbnail {
+                                        texture,
+                                        width: src.width,
+                                        height: src.height,
+                                        start_in_content_beats: ev.event_start_in_clip_beats,
+                                    })
                                 })
                         },
                     }
@@ -261,7 +277,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         scroll_beat_raw,
         len_beats: view_len_beats(lanes_w, zoom),
         track_top: app.ui_prefs.arrange_track_top,
-        tracks_visible: ((area.h - RULER_H) / row_h).max(1.0),
+        // r.md #63: 分母は「行が実際に描かれる高さ」 = ruler と Arranger 帯を除いた lanes 高さ。
+        // ここは heavy cache キーにしか使わないが、 `area.h - RULER_H` のままだと同じ誤式の
+        // 3 つ目のコピーとして残り、 次に誰かが「lanes の高さ」 としてコピーする種になる。
+        tracks_visible: ((area.h - RULER_H - SECTION_LANE_H) / row_h).max(1.0),
         track_row_h: row_h,
         header_w: app.ui_prefs.arrange_header_w,
         ruler_h: RULER_H,

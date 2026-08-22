@@ -9,6 +9,7 @@ use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, EditSurface};
+use crate::event::NudgeStep;
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
     shutdown_overlay,
@@ -622,6 +623,77 @@ fn paste_noop(ui: &mut Ui<'_, AppData>) {
     }));
 }
 
+/// r.md #67: カーソルキーで選択ノートを動かす / 伸縮する / 音程を変える。
+///
+/// **対象面が `Notes` のときだけ消費する**。 面の解決は copy / cut / delete と同じ
+/// [`AppData::edit_surface`] (last-selection-wins) なので、「アレンジでクリップを選び直した
+/// 直後に矢印を押してもノートは動かない」 が既存規則どおりに保証され、 マウス位置にも依存しない。
+/// ノートを 1 つも選んでいなければ `edit_surface` が `Notes` を返さないので何も起きない。
+///
+/// 各キーは [`Ui::take_shortcut_count`] で **届いた回数ぶん** 取り出す。 矢印は repeatable
+/// 宣言なので押しっぱなしで 1 フレームに複数回積まれることがあり、 1 回しか消費しないと
+/// 移動量がフレームレート次第で目減りする。
+///
+/// 修飾キーの規約 (daw_01 全体と共通): 無修飾 = 位置 / Ctrl = そのノート自身の量 (長さ) /
+/// Shift = 大きいステップ / Alt = スナップ一時無効。
+fn dispatch_note_nudge(ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    if !matches!(surface, Some(EditSurface::Notes)) {
+        return;
+    }
+    // 1 フレームに積める repeat 数の上限。 OS のリピート速度 (最速でも ~30/s) に対して
+    // 十分過大なので実用上ここに当たることは無いが、 `dir * n` の符号反転で i32 が
+    // オーバーフローしない (= debug で panic しない) ことを構造的に保証する。
+    const MAX_REPEATS_PER_FRAME: usize = 64;
+    let take = |ui: &mut Ui<'_, AppData>, name: &'static str| -> i32 {
+        i32::try_from(ui.take_shortcut_count(name).min(MAX_REPEATS_PER_FRAME)).unwrap_or(0)
+    };
+    // (shortcut 名, 発行する event を作る関数)。`steps` の符号が方向。
+    let time: [(&'static str, NudgeStep, i32); 6] = [
+        ("daw.nudge_note_left", NudgeStep::Grid, -1),
+        ("daw.nudge_note_right", NudgeStep::Grid, 1),
+        ("daw.nudge_note_left_bar", NudgeStep::Bar, -1),
+        ("daw.nudge_note_right_bar", NudgeStep::Bar, 1),
+        ("daw.nudge_note_left_fine", NudgeStep::Fine, -1),
+        ("daw.nudge_note_right_fine", NudgeStep::Fine, 1),
+    ];
+    for (name, step, dir) in time {
+        let n = take(ui, name);
+        if n > 0 {
+            let steps = dir * n;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::NudgeSelectedNoteTime { step, steps });
+            }));
+        }
+    }
+    for (name, dir) in [("daw.nudge_note_shorter", -1), ("daw.nudge_note_longer", 1)] {
+        let n = take(ui, name);
+        if n > 0 {
+            let steps = dir * n;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::NudgeSelectedNoteLength {
+                    step: NudgeStep::Grid,
+                    steps,
+                });
+            }));
+        }
+    }
+    let pitch: [(&'static str, bool, i32); 4] = [
+        ("daw.nudge_note_up", false, 1),
+        ("daw.nudge_note_down", false, -1),
+        ("daw.nudge_note_octave_up", true, 1),
+        ("daw.nudge_note_octave_down", true, -1),
+    ];
+    for (name, octave, dir) in pitch {
+        let n = take(ui, name);
+        if n > 0 {
+            let steps = dir * n;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::NudgeSelectedNotePitch { octave, steps });
+            }));
+        }
+    }
+}
+
 /// `ShortcutMap` ルックアップで判定済みの shortcut name を pull して AppEvent / undo
 /// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
 /// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
@@ -835,7 +907,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     }
 
     // Home / End: プレイヘッドをタイムラインの端へ移動 (r.md #10)。 typing 中は
-    // `is_typing_only_shortcut` で抑止され text_input のカーソル移動になるので、
+    // `typing_only` 宣言で抑止され text_input のカーソル移動になるので、
     // ここに来るのは非 typing 時のみ。 seek は handler が停止/再生とも面倒を見る。
     if ui.take_shortcut("daw.goto_timeline_home") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
@@ -1026,6 +1098,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             }
         }
     }
+
+    // ----- r.md #67: カーソルキーでノートを移動 / 伸縮 / 音程変更 -----
+    dispatch_note_nudge(ui, surface);
 
     // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09) -----
     // マウス位置で対象を判定する (選択前なので Delete の「非空セット」判定は
@@ -1353,7 +1428,7 @@ mod tests {
 
     use common::protocol::{AudioCommand, PluginCommand};
     use daw_ui_core::{FrameInput, UiHost};
-    use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+    use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey};
     use daw_ui_renderer::Scene;
     use tokio::sync::mpsc;
 
@@ -1402,6 +1477,115 @@ mod tests {
         for e in edits {
             e.apply(app);
         }
+    }
+
+    /// r.md #67: 矢印キー 1 押しを 1 フレーム流し、`dispatch_shortcuts` が push した
+    /// Edit を app に適用する。`daw_shortcut_map` を使うので **本番と同じキー定義**
+    /// (typing_only / repeatable 含む) を通る。`repeat` 件数で auto-repeat を模す。
+    fn dispatch_arrow(app: &mut AppData, physical_key: PhysicalKey, mods: Modifiers, count: usize) {
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+        *host.shortcut_map_mut() = crate::view::shortcuts::daw_shortcut_map();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 1280, height: 720 };
+        let bottom_rect = Rect { x: 0.0, y: 400.0, w: 1280.0, h: 320.0 };
+        let keyboard: Vec<KeyEvent> = (0..count)
+            .map(|i| KeyEvent {
+                state: ElementState::Pressed,
+                text: None,
+                physical_key,
+                // 2 件目以降を OS auto-repeat とみなす (repeatable 宣言の検証)。
+                repeat: i > 0,
+            })
+            .collect();
+        let input = FrameInput {
+            keyboard,
+            pointer: daw_ui_core::PointerFrame { modifiers: mods, ..Default::default() },
+            ..FrameInput::default()
+        };
+        let edits = host.frame_to_edits(app, &mut scene, screen, input, |app, ui| {
+            dispatch_shortcuts(app, ui, bottom_rect);
+        });
+        for e in edits {
+            e.apply(app);
+        }
+    }
+
+    /// note を 1 つ持つ MIDI クリップを 1 本置き、その note を選択した状態にする。
+    fn app_with_selected_note(start_beat: f64) -> AppData {
+        let mut app = build_app();
+        app.edit_song(move |song| {
+            song.tracks.clear();
+            let cid = song.alloc_content_id();
+            song.clip_contents.insert(
+                cid,
+                common::model::ClipContent::Midi(common::model::MidiContent {
+                    notes: vec![common::model::Note {
+                        pitch: 60,
+                        start_beat,
+                        duration_beats: 1.0,
+                        velocity: 100,
+                        ..common::model::Note::default()
+                    }],
+                    ..common::model::MidiContent::default()
+                }),
+            );
+            song.tracks.push(crate::app::track_with(|t| {
+                t.id = 1;
+                t.clips = vec![common::model::Clip {
+                    id: 10,
+                    content_id: cid,
+                    start_beat: 0.0,
+                    length_beats: 32.0,
+                    ..common::model::Clip::default()
+                }];
+            }));
+        });
+        let key = common::model::ClipKey { track_id: 1, clip_id: 10 };
+        app.selection.selected_clip = Some(key);
+        app.selection.selected_clips = vec![key];
+        app.ui_prefs.pianoroll_snap_enabled = true;
+        app.ui_prefs.pianoroll_snap_choice = crate::view::snap::CHOICE_PIANOROLL_DEFAULT; // 1/16
+        app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
+        app
+    }
+
+    fn note_start(app: &AppData) -> f64 {
+        let song = app.song_doc.song();
+        song.clip_notes(&song.tracks[0].clips[0])[0].start_beat
+    }
+
+    /// キー → shortcut → AppEvent の配線 (矢印が本番のキー定義で届き、ノートが動く)。
+    #[test]
+    fn arrow_key_nudges_the_selected_note() {
+        let mut app = app_with_selected_note(4.0);
+        dispatch_arrow(&mut app, PhysicalKey::ArrowRight, Modifiers::empty(), 1);
+        assert!((note_start(&app) - 4.25).abs() < 1e-9, "→ で 1/16 拍 右へ: got {}", note_start(&app));
+        let shift = Modifiers { shift: true, ..Modifiers::empty() };
+        dispatch_arrow(&mut app, PhysicalKey::ArrowLeft, shift, 1);
+        assert!((note_start(&app) - 0.25).abs() < 1e-9, "Shift+← で 1 小節 左へ: got {}", note_start(&app));
+    }
+
+    /// 押しっぱなし (auto-repeat) が **回数ぶん** 適用される。1 回しか消費しないと
+    /// 移動量がフレームレート次第で目減りする (`take_shortcut_count` の検証)。
+    #[test]
+    fn held_arrow_applies_every_repeat_in_the_frame() {
+        let mut app = app_with_selected_note(4.0);
+        dispatch_arrow(&mut app, PhysicalKey::ArrowRight, Modifiers::empty(), 3);
+        assert!(
+            (note_start(&app) - 4.75).abs() < 1e-9,
+            "1 フレームに 3 回届いたら 3 ステップ動く: got {}",
+            note_start(&app)
+        );
+    }
+
+    /// ノートを選んでいなければ矢印は何もしない (ユーザー決定: 再生位置移動等に割り当てない)。
+    #[test]
+    fn arrow_does_nothing_without_a_note_selection() {
+        let mut app = app_with_selected_note(4.0);
+        app.handle_event(AppEvent::ClearNoteSelection);
+        app.selection.last_edit_select = None;
+        dispatch_arrow(&mut app, PhysicalKey::ArrowRight, Modifiers::empty(), 1);
+        assert!((note_start(&app) - 4.0).abs() < 1e-9, "選択が無ければ動かない");
     }
 
     /// piano_roll の歌詞 inline 編集中の Esc は global の `dispatch_shortcuts`

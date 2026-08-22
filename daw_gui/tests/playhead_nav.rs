@@ -167,7 +167,7 @@ fn end_moves_to_content_end() {
 fn home_end_scroll_arrange_to_reveal_target() {
     let (mut app, _a, _p) = app_with_clips(); // clips at 4, 12
     // 可視 4 拍 (200px / 50px-per-beat) にして端寄せを観測可能にする。
-    app.ui_ephemeral.last_arrange_canvas_size = (200.0, 400.0);
+    app.ui_ephemeral.last_arrange_lanes_size = (200.0, 400.0);
     app.ui_prefs.arrange_zoom_x = 50.0;
     let (first, end) = bounds(&app);
     assert!(end - first > 4.0, "content が可視幅(4拍)より広い前提");

@@ -57,6 +57,7 @@ use crate::app::{
 };
 
 pub(crate) mod view_build;
+mod content_build;
 mod draw;
 use draw::*;
 mod geometry;
@@ -171,8 +172,14 @@ pub struct ClipViewAudioEdit {
 /// `event_length_beats` / `fade_*_beats` / `fade_*_curve` を同じ意味で持ち、 適用側も
 /// 全部 `common::audio_render::fade_curve_at` を通るため。
 ///
-/// caller は `ClipContent::event_fades()` をそのまま写して渡す。 `event_index` は
+/// caller は `ClipContent::event_fades()` を **そのまま** 写して渡す。 `event_index` は
 /// clip 内の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等) の宛先になる。
+///
+/// r.md #68: `fade.start_in_clip_beats` は **content-local 拍** (model の値そのもの)。
+/// r.md #44 で一旦「窓ローカル」 (= `content_offset_beats` を引いた値) に畳んでいたが、
+/// それだと中身の原点が窓と一緒に動いてしまい、 端 drag の preview で
+/// 「クリップ幅 ÷ クリップ長」 のスケールに頼らざるを得なくなる。 換算は
+/// [`geometry::ContentMap`] (content 原点 + ビューのズーム) 1 本に集約した。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipEventFade {
     /// clip 内の event index。 fade の編集はこの 1 event だけに効く
@@ -206,12 +213,41 @@ pub enum TrackKind {
     Video,
 }
 
+/// M14 Phase 72 (daw_01 #044) / r.md #68: video / image clip の 1 枚 thumbnail。
+///
+/// `(width, height)` は texture の native size (= [`daw_ui_renderer::Renderer::texture_size`]
+/// と同じ値)。 widget が Renderer 参照を持たない設計と整合させるため caller が同梱で渡す
+/// (daw_01 は decode 時の `VideoFrame.width/height` を流用すれば boilerplate ゼロ)。
+///
+/// r.md #68: `start_in_content_beats` (= この thumbnail が表す event の content-local
+/// 開始拍) を持つのは、 **thumbnail も「中身」 だから**。 clip 矩形にフィットさせると
+/// 端 drag のたびに絵が動いてしまう (旧 `aspect_fit_rect` は clip 矩形中央に letterbox
+/// 配置していたので、 右端を伸ばすとサムネイルが右へ滑っていた)。 中身は content 原点に
+/// 固定し、 はみ出す分を clip 矩形で切り抜く。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipThumbnail {
+    pub texture: TextureHandle,
+    pub width: u32,
+    pub height: u32,
+    /// この thumbnail が表す event の content-local 開始拍 (= 絵の左端が乗る拍)。
+    pub start_in_content_beats: f64,
+}
+
 /// 1 つの clip。`Arc<str>` で複数 clip 間の name 共有可能。
 #[derive(Clone, Debug)]
 pub struct ClipView {
     pub id: u32,
     pub start_beat: f64,
     pub len_beats: f64,
+    /// r.md #44 / #68: clip の左端が content の **どの拍に当たるか**
+    /// (= `common::model::Clip::content_offset_beats` の素通し)。
+    ///
+    /// 中身 (波形 / MIDI ノート / fade / thumbnail) の位置は
+    /// `start_beat - content_offset_beats` (= content 原点) を原点とする
+    /// [`geometry::ContentMap`] 1 本で決まる。 この値を持たずに「窓ローカル座標」 へ
+    /// 畳んで渡していた頃は、 端 drag のゴーストが `clip_rect.w / clip_len_beats` を
+    /// スケールに使わざるを得ず、 トリムなのに中身が伸縮していた (r.md #68)。
+    pub content_offset_beats: f64,
     pub name: Arc<str>,
     pub color: Option<Color>,
     /// M14 Phase 63e (#019) / Phase 114 (#086): 共有 (linked) clip の **リンク識別フラグ兼 hue**。
@@ -244,14 +280,10 @@ pub struct ClipView {
     /// (a) 音声クリップにしか線が出ず、 (b) 複数 event を持つクリップでは 1 本目の
     /// fade しか描かれなかった。
     pub fades: Vec<ClipEventFade>,
-    /// M14 Phase 72 (daw_01 #044): video clip 用 thumbnail。 `Some((handle, width, height))` で
-    /// widget が clip rect 内に texture を aspect-fit (黒帯 letterbox) で描画する。 `(width, height)`
-    /// は texture の native size (= [`daw_ui_renderer::Renderer::texture_size`] と同じ値)。 widget が
-    /// Renderer 参照を持たない設計と整合させるため caller が同梱で渡す前提
-    /// (daw_01 は ffmpeg-next decode 時の `VideoFrame.width/height` を流用すれば boilerplate ゼロ)。
+    /// M14 Phase 72 (daw_01 #044) / r.md #68: video / image clip 用 thumbnail。
     /// `None` のときは `track.kind == Video` なら [`ArrangementStyle::video_clip_loading`] 単色 rect
     /// 描画、 `Audio` なら field 自体が無視される (= caller が kind と clip 種別を一致させる責任)。
-    pub thumbnail: Option<(TextureHandle, u32, u32)>,
+    pub thumbnail: Option<ClipThumbnail>,
     /// M14 Phase 96 (daw_01 #068) / Phase 114 (#086): 共有グループ「連動ハイライト」フラグ。 `true` の
     /// とき widget が selection (黄塗り) とは **別レイヤ** の強調 (glow wash + bright thick border) を
     /// 重ねる (= 「今アクティブな共有グループの member」)。 M14 Phase 114 (#086) で強調色は hue 由来から
@@ -720,6 +752,30 @@ pub use crate::widgets::select_modifier::SelectModifier;
 pub(crate) use crate::widgets::select_modifier::{RangeItem, range_block, range_ordered};
 
 
+/// r.md #63: arrangement が縦方向に積む「行」の識別子。
+///
+/// 行は master 行 / 可視 track 行 / 展開中の可視 automation lane 行の 3 種で、
+/// `Track` は master 行を `MASTER_TRACK_ID` で表す (widget が `visible_tracks[0]` に
+/// synthetic track として prepend するのと同じ扱い)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArrangementRowKey {
+    /// track 行 (master 行は `MASTER_TRACK_ID`)。
+    Track(u32),
+    /// 展開中の automation lane 行。
+    Lane(common::model::AutomationLaneKey),
+}
+
+/// r.md #63: widget がこのフレームにレイアウトした行 1 つ。
+///
+/// `content_top` は **content 空間** (= `ui_prefs.arrange_track_top` と同じ原点、
+/// 先頭行の上端が `0.0`) の行上端。 画面 y は `lanes.y - track_top + content_top`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrangementRow {
+    pub key: ArrangementRowKey,
+    pub content_top: f32,
+    pub height: f32,
+}
+
 /// `Ui::arrangement` の戻り値。
 #[derive(Clone, Debug)]
 pub struct ArrangementResponse {
@@ -745,6 +801,16 @@ pub struct ArrangementResponse {
     /// - 部分的にカリングされた clip は full rect を返す (clip_to_rect 結果そのまま)
     pub clip_rects: Vec<(ClipKey, Rect)>,
     pub ruler_rect: Rect,
+    /// r.md #63: Arranger (section) レーン帯の実 rect (ruler の直下、 track lanes の上)。
+    pub arranger_rect: Rect,
+    /// r.md #63: track lanes 領域の実 rect (ruler と Arranger 帯を除いた残り)。 描画 / hit-test の
+    /// scissor もこの rect なので、 **「lanes の高さ」 を式で再導出してはいけない** (`area.h - RULER_H`
+    /// のような再導出が Arranger 帯 18px を引き忘れ、 全体表示で最下段 track が画面下へはみ出していた)。
+    pub lanes_rect: Rect,
+    /// r.md #63: このフレームに縦へ積んだ行の一覧 (描画順、 **culling 前** = 画面外の行も含む)。
+    /// `X` の全体表示 / `Z` の縦ズームが「行がいくつあり、 どこから始まるか」 の唯一の根拠にする
+    /// (= モデルから可視 track / lane 集合を再導出しない)。
+    pub rows: Vec<ArrangementRow>,
     /// M10 Phase 46: drag 中の track id (`Some` なら header reorder drag セッションが進行中)。
     pub reordering: Option<u32>,
     /// M10 Phase 47b: drag 中の track id (`Some` なら header volume slider drag セッションが進行中)。
@@ -834,6 +900,9 @@ impl Default for ArrangementResponse {
             track_header_rects: Vec::new(),
             clip_rects: Vec::new(),
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            arranger_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            lanes_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            rows: Vec::new(),
             reordering: None,
             dragging_track_volume: None,
             automation_point_rects: Vec::new(),
@@ -1412,54 +1481,35 @@ pub fn effective_track_row_h(track: &ArrangementTrack, default_row_h: f32) -> f3
     track.row_h.map_or(default_row_h, f32::from)
 }
 
+/// r.md #63: track が **行として描く** automation lane を `(元 index, lane)` で列挙する。
+/// 「lane が行を占めるか」 の判定はここが唯一の定義で、 高さ合計 (`automation_lanes_total_h`)・
+/// 行レイアウト (`arrangement_row_layout`)・描画 / hit-test (`for_each_visible_lane`) が共有する。
+/// 条件を各所にコピーすると「合計高さは数えたが行は描かれない」 のような silent なズレを生む。
+pub fn visible_automation_lanes(
+    track: &ArrangementTrack,
+) -> impl Iterator<Item = (usize, &ArrangementAutomationLane)> {
+    let collapsed = track.automation_lanes_collapsed;
+    track
+        .automation_lanes
+        .iter()
+        .enumerate()
+        .filter(move |(_, l)| !collapsed && l.visible)
+}
+
 /// M14 Phase 63n-1 (#028): track の expanded 状態の visible automation lane 高さ合計 (px)。
 /// `collapsed` または lane なしで `0.0`。
 #[must_use]
 pub fn automation_lanes_total_h(track: &ArrangementTrack) -> f32 {
-    if track.automation_lanes_collapsed || track.automation_lanes.is_empty() {
-        return 0.0;
-    }
-    track
-        .automation_lanes
-        .iter()
-        .filter(|l| l.visible)
-        .map(|l| f32::from(l.height_px))
+    visible_automation_lanes(track)
+        .map(|(_, l)| f32::from(l.height_px))
         .sum()
 }
 
-/// M14 Phase 63n-10 (#034): master row の effective row body 高さ (px、 lane 部含まない)。
-/// `master.height_px_override.map_or(default_row_h, f32::from)` の thin wrapper。 通常 track の
-/// `effective_track_row_h` と同 idiom (daw_01 #034 §Q3 (A) で確定)。
-#[inline]
-#[must_use]
-pub fn effective_master_row_h(master: &ArrangementMasterRow, default_row_h: f32) -> f32 {
-    master.height_px_override.map_or(default_row_h, f32::from)
-}
-
-/// M14 Phase 63n-10 (#034): master row の expanded 状態の visible automation lane 高さ合計 (px)。
-/// `automation_lanes_collapsed` または lane なし / 全 invisible で `0.0`。 通常 track の
-/// `automation_lanes_total_h` と同 idiom (daw_01 #034 §Q2 (A) で確定 — visible 0 個でも disclosure
-/// state は触らず、 単に行が「effective_h だけ」 に潰れる)。
-#[must_use]
-pub fn master_row_lanes_total_h(master: &ArrangementMasterRow) -> f32 {
-    if master.automation_lanes_collapsed || master.automation_lanes.is_empty() {
-        return 0.0;
-    }
-    master
-        .automation_lanes
-        .iter()
-        .filter(|l| l.visible)
-        .map(|l| f32::from(l.height_px))
-        .sum()
-}
-
-/// M14 Phase 63n-10 (#034): master row の expanded 総高さ (= effective + lanes 合計)。
-/// 通常 track の `track_row_height` と同 idiom。 lanes_y の shift 量 / hit-test の y 範囲決定 / 縦
-/// scroll 計算で参照する SSoT。 `master = None` の caller は 0.0 を使う想定 (= `lanes.y` shift なし)。
-#[must_use]
-pub fn master_row_total_h(master: &ArrangementMasterRow, default_row_h: f32) -> f32 {
-    effective_master_row_h(master, default_row_h) + master_row_lanes_total_h(master)
-}
+// r.md #63: master 行専用の高さ helper (`effective_master_row_h` / `master_row_lanes_total_h` /
+// `master_row_total_h`) は撤去した。 master 行は `synthesize_master_track` で通常 `ArrangementTrack`
+// に変換してから `track_row_height` / `visible_automation_lanes` を通るので呼び出し元が 1 つも無く、
+// うち `master_row_lanes_total_h` は lane の可視条件の 3 つ目のコピーだった (= 誰かがそれを写して
+// 条件が枝分かれする罠)。 master 行の高さが要るときは synthetic track に対して通常 helper を使う。
 
 /// M14 Phase 63n-10 (#034): master row を synthetic `ArrangementTrack` に変換 (widget 内部の `visible_tracks[0]`
 /// として prepend する用)。 既存 hit-test / 描画 / row 高さ helper を **そのまま reuse** するための adapter で、
@@ -1648,10 +1698,14 @@ struct AudioDragSession {
     /// drag 開始時の clip rect (release 時にも参照、 view scroll 中も安定 — track 並び替えや
     /// scroll で「rect が動いて」 も anchor の dB 0 ライン位置を変えない)。
     clip_rect_anchor: Rect,
-    /// drag 開始時の clip len_beats。 **fade 長の clamp には使わない** (それは event 長 =
-    /// `anchor_fade.fade.len_beats`)。 ghost 描画で clip rect から event 矩形を切り出す
-    /// ための px/beat スケール算出にだけ使う。
-    clip_len_beats_anchor: f64,
+    /// drag 開始時の content 写像 (content-local 拍 → 画面 x)。 ghost 描画で clip rect から
+    /// event 矩形を切り出すのに使う。 **fade 長の clamp には使わない** (それは event 長 =
+    /// `anchor_fade.fade.len_beats`)。
+    ///
+    /// r.md #68: 以前は `clip_len_beats_anchor: f64` を持ち、 `clip_rect.w / clip_len` を
+    /// スケールにしていた。 それだと同じ clip の上で波形 (インセット込みの分母) と
+    /// fade (インセット無しの分母) が最大 2px ずつずれる。 写像そのものを anchor する。
+    content_map_anchor: ContentMap,
     /// r.md #46: drag 開始時の clip 実塗り色。 ghost の fade envelope も base 描画と
     /// 同じ auto-contrast で色を選ぶ (単層の固定色だと明るい clip 上で消える)。
     clip_bg_anchor: Color,
@@ -2165,17 +2219,25 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h = h.wrapping_mul(PRIME);
             h ^= c.len_beats.to_bits();
             h = h.wrapping_mul(PRIME);
+            // r.md #68: content 原点 (= start - offset) が cached 層の中身描画
+            // (thumbnail / fade カーブ) の x 写像を決めるので、 offset 単独の変化
+            // (bounce / paste / audio editor の窓調整) でも cache を無効化する。
+            h ^= c.content_offset_beats.to_bits();
+            h = h.wrapping_mul(PRIME);
             // muted は cached 内の fill dim + 斜線ハッチ描画に効く (review — widget 契約
             // #011 「clip 個別変化は widget が吸収」 に合わせ caller hash に頼らない)。
             h ^= u64::from(c.muted);
             h = h.wrapping_mul(PRIME);
             // video thumbnail の decode 完了 (None→Some) / 差し替えを検知 (review)。
             // handle raw 値 + サイズで十分 (内容は immutable texture)。
-            let thumb_marker = c.thumbnail.map_or(u64::MAX, |(handle, w, hgt)| {
+            let thumb_marker = c.thumbnail.map_or(u64::MAX, |t| {
                 let mut a: u64 = 0x7157_B00B_5EED_F00D;
-                a ^= u64::from(handle.raw_id().get());
+                a ^= u64::from(t.texture.raw_id().get());
                 a = a.wrapping_mul(PRIME);
-                a ^= (u64::from(w) << 32) | u64::from(hgt);
+                a ^= (u64::from(t.width) << 32) | u64::from(t.height);
+                a = a.wrapping_mul(PRIME);
+                // r.md #68: 絵の左端が乗る拍 (= 描画位置) も cache key の一部。
+                a ^= t.start_in_content_beats.to_bits();
                 a
             });
             h ^= thumb_marker;

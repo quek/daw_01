@@ -1,4 +1,5 @@
 use super::*;
+use crate::widgets::text_input::TextInputStyle;
 use daw_ui_renderer::Color;
 use std::sync::Arc;
 
@@ -394,7 +395,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
             ..Default::default()
         },
         |_, ui| {
-            ui.text_input_at("ti", rect, "", |new| {
+            ui.text_input_at("ti", rect, "", &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -419,7 +420,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -444,7 +445,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -499,7 +500,7 @@ fn text_input_ime_preedit_then_commit() {
             ..Default::default()
         },
         |_, ui| {
-            ui.text_input_at("ti", rect, "", |new| {
+            ui.text_input_at("ti", rect, "", &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -522,7 +523,7 @@ fn text_input_ime_preedit_then_commit() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -542,7 +543,7 @@ fn text_input_ime_preedit_then_commit() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -666,6 +667,7 @@ fn typing_focus_blocks_global_delete_shortcut() {
                 h: 24.0,
             },
             "x",
+            &TextInputStyle::default(),
             |_| Edit::mutate(|()| {}),
         );
     });
@@ -698,6 +700,7 @@ fn typing_focus_blocks_global_delete_shortcut() {
                     h: 24.0,
                 },
                 "x",
+                &TextInputStyle::default(),
                 |_| Edit::mutate(|()| {}),
             );
         },
@@ -795,6 +798,7 @@ fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
                 h: 24.0,
             },
             "x",
+            &TextInputStyle::default(),
             |_| Edit::mutate(|()| {}),
         );
     });
@@ -825,6 +829,7 @@ fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
                     h: 24.0,
                 },
                 "x",
+                &TextInputStyle::default(),
                 |_| Edit::mutate(|()| {}),
             );
         },
@@ -832,6 +837,106 @@ fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
     assert!(
         !got_shortcut.get(),
         "typing 中は素の文字キー shortcut が発火しない (文字が text_input に届く)"
+    );
+}
+
+/// (daw_01 r.md #67) OS の auto-repeat は既定では shortcut にしない (r.md #43 の
+/// 「Delete 長押しでトラックが次々消える」 保護)。 `set_repeatable` を宣言した name だけが
+/// repeat でも発火し、 1 フレームに届いた回数は `take_shortcut_count` でまとめて取れる。
+#[test]
+fn repeat_fires_only_for_declared_repeatable_shortcuts() {
+    use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    host.shortcut_map_mut().bind("test.nudge", "Right");
+    host.shortcut_map_mut().set_repeatable("test.nudge");
+    host.shortcut_map_mut().bind("test.discrete", "Left");
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 800, height: 600 };
+
+    let repeat_key = |pk| KeyEvent {
+        state: ElementState::Pressed,
+        text: None,
+        physical_key: pk,
+        repeat: true,
+    };
+    let nudge_count = std::cell::Cell::new(0_usize);
+    let discrete = std::cell::Cell::new(true);
+    host.frame_to_edits(
+        &(),
+        &mut scene,
+        screen,
+        FrameInput {
+            keyboard: vec![
+                repeat_key(PhysicalKey::ArrowRight),
+                repeat_key(PhysicalKey::ArrowRight),
+                repeat_key(PhysicalKey::ArrowRight),
+                repeat_key(PhysicalKey::ArrowLeft),
+            ],
+            ..Default::default()
+        },
+        |(), ui| {
+            nudge_count.set(ui.take_shortcut_count("test.nudge"));
+            discrete.set(ui.take_shortcut("test.discrete"));
+        },
+    );
+    assert_eq!(nudge_count.get(), 3, "repeatable は届いた回数ぶん取れる");
+    assert!(!discrete.get(), "非 repeatable な shortcut は auto-repeat で発火しない");
+}
+
+/// (daw_01 r.md #67) 矢印のような **非 char キー** を shortcut に bind すると、
+/// 宣言しない限り typing 中も global 消費されて text_input のカーソル移動が死ぬ
+/// (`bare_char_key` の逃がしに該当しないため)。 `set_typing_only` の宣言でそれを防ぐ。
+#[test]
+fn typing_focus_blocks_declared_typing_only_arrow() {
+    use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    host.shortcut_map_mut().bind("test.arrow_typing_only", "Right");
+    host.shortcut_map_mut().set_typing_only("test.arrow_typing_only");
+    host.shortcut_map_mut().bind("test.arrow_global", "Left");
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 800, height: 600 };
+    let ti_rect = Rect { x: 10.0, y: 10.0, w: 100.0, h: 24.0 };
+
+    // Frame 1: text_input に focus (frame 末尾で last_typing_focus = true)。
+    host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        ui.text_input_at_focused("ti", ti_rect, "x", &TextInputStyle::default(), |_| {
+            Edit::mutate(|()| {})
+        });
+    });
+
+    let key = |pk| KeyEvent {
+        state: ElementState::Pressed,
+        text: None,
+        physical_key: pk,
+        repeat: false,
+    };
+    let typing_only_fired = std::cell::Cell::new(true);
+    let global_fired = std::cell::Cell::new(false);
+    host.frame_to_edits(
+        &(),
+        &mut scene,
+        screen,
+        FrameInput {
+            keyboard: vec![key(PhysicalKey::ArrowRight), key(PhysicalKey::ArrowLeft)],
+            ..Default::default()
+        },
+        |(), ui| {
+            typing_only_fired.set(ui.take_shortcut("test.arrow_typing_only"));
+            global_fired.set(ui.take_shortcut("test.arrow_global"));
+            ui.text_input_at_focused("ti", ti_rect, "x", &TextInputStyle::default(), |_| {
+            Edit::mutate(|()| {})
+        });
+        },
+    );
+    assert!(
+        !typing_only_fired.get(),
+        "typing_only 宣言した矢印は typing 中 global 発火しない (text_input のカーソル移動になる)"
+    );
+    assert!(
+        global_fired.get(),
+        "宣言していない矢印は typing 中でも global 発火してしまう (= 宣言が必要な理由の対)"
     );
 }
 

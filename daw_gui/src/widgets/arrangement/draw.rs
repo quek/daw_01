@@ -169,30 +169,89 @@ pub(super) fn fade_colors_for(
     }
 }
 
-/// M14 Phase 72 (daw_01 #044): `rect` 内に `(tex_w, tex_h)` の native aspect を保ったまま
-/// 中央 letterbox 配置した sub-rect を返す。 余白 (黒帯) は呼び出し側の base fill (= video
-/// clip では `video_clip_loading`) で見える。
+/// 1 つの clip に敷くサムネイルタイルの上限。
+///
+/// 可視域カリング後の枚数なので通常は 2 桁に収まる (16:9 / 行高 46px なら 1 枚 82px、
+/// lanes 幅 1920px でも 24 枚)。 上限に当たるのは「極端に縦長のソース × 高ズーム」
+/// だけで、 そのとき残りはタイルを描かず base fill のまま残る (= 黙って全部描くのを
+/// やめる代わりに、 描けた分は正しい位相で並ぶ)。
+pub(super) const MAX_THUMBNAIL_TILES: u32 = 512;
+
+/// M14 Phase 72 (daw_01 #044) / r.md #68: video / image clip のサムネイル敷き詰め方。
+///
+/// **clip 矩形にフィットさせない**。 サムネイルも clip の「中身」 なので、
+/// (a) 1 枚の寸法は **行高 × native aspect** で決まり clip の長さには一切依存しない、
+/// (b) 並べる位相は **content 原点**に固定する、 (c) はみ出す分は clip 矩形で切り抜く。
+///
+/// 旧実装 (`aspect_fit_rect`) は clip 矩形の中央に 1 枚を letterbox 配置していたため、
+/// (a) clip を伸ばすとサムネイルが水平に滑り、 (b) 細い clip では拡大縮小し、
+/// (c) 長い clip を横スクロールして先頭が画面外に出ると 1 枚も見えなくなっていた。
+///
+/// 敷き詰めは REAPER の **Preferences → Video/REX/Misc → still image thumbnail
+/// display mode = "Center/tile image"** と同じ流儀 (同じ 1 枚を隙間なく繰り返す)。
+/// 位相を clip の左端ではなく content 原点に取るのが肝で、 これにより
+/// 「トリムしてもタイルの絶対時間位置が変わらない」 = 絵が滑らない が成り立つ
+/// (左端 trim は `start_beat` と `content_offset_beats` が同量動くので content 原点は不変)。
+///
+/// `visible_x0` / `visible_x1` は描画対象の可視域 (= `clip_rect ∩ lanes` の x 範囲)。
+/// ここでカリングするので、 長い clip でもタイル数は画面幅で頭打ちになる。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ThumbnailTiling {
+    /// 可視域に掛かる **1 枚目** の左端 x (content 原点からの整数枚目)。
+    pub first_x: f32,
+    /// タイル 1 枚の幅 px (= 行高 × native aspect)。
+    pub tile_w: f32,
+    /// 高さ px (= clip 矩形の高さ)。
+    pub tile_h: f32,
+    /// 描く枚数 ([`MAX_THUMBNAIL_TILES`] で頭打ち)。
+    pub count: u32,
+    /// 上限で打ち切ったか (= 可視域を覆いきれていない)。
+    pub truncated: bool,
+}
+
+/// r.md #68: サムネイルの敷き詰め幾何。 可視域が無い / 退化した寸法では `None`。
 ///
 /// - `tex_w` / `tex_h` = 0 は 1 に clamp (`u32` の 0 を許容しつつ ZeroDiv を回避)
-/// - `rect.h` 0 近傍も 0.001 に clamp (= rect 自身が 0 px 高さの異常 case で fit_h を 0 に押さえる)
+/// - `clip_rect.h` 0 近傍も 0.001 に clamp (= 0px 高さの異常 case で幅を 0 に押さえる)
 #[must_use]
-pub(super) fn aspect_fit_rect(rect: Rect, tex_width: u32, tex_height: u32) -> Rect {
-    #[allow(clippy::cast_precision_loss)]
-    let texture_width = tex_width.max(1) as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let texture_height = tex_height.max(1) as f32;
-    let tex_aspect = texture_width / texture_height;
-    let rect_aspect = (rect.w / rect.h.max(0.001)).max(0.001);
-    let (fit_w, fit_h) = if tex_aspect > rect_aspect {
-        // texture が rect より横長 → 上下 letterbox
-        (rect.w, rect.w / tex_aspect)
-    } else {
-        // texture が rect より縦長 (or 同 aspect) → 左右 letterbox
-        (rect.h * tex_aspect, rect.h)
-    };
-    let fit_x = rect.x + (rect.w - fit_w) * 0.5;
-    let fit_y = rect.y + (rect.h - fit_h) * 0.5;
-    Rect::new(fit_x, fit_y, fit_w, fit_h)
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+pub(super) fn thumbnail_tiling(
+    clip_rect: Rect,
+    visible_x0: f32,
+    visible_x1: f32,
+    map: ContentMap,
+    thumb: ClipThumbnail,
+) -> Option<ThumbnailTiling> {
+    if visible_x1 <= visible_x0 {
+        return None;
+    }
+    let texture_width = thumb.width.max(1) as f32;
+    let texture_height = thumb.height.max(1) as f32;
+    let tile_h = clip_rect.h.max(0.001);
+    let tile_w = tile_h * (texture_width / texture_height);
+    if !tile_w.is_finite() || tile_w <= 0.0 {
+        return None;
+    }
+    // 位相の原点 = この thumbnail が表す event の content 上の開始拍。
+    let origin_x = map.x(thumb.start_in_content_beats);
+    // 可視域に掛かる最初の整数枚目 (原点より左でも負の index で正しく続く)。
+    let k0 = ((visible_x0 - origin_x) / tile_w).floor();
+    let first_x = origin_x + k0 * tile_w;
+    let span = visible_x1 - first_x;
+    // 壊れた project (NaN の start_beat 等) で NaN 座標の quad を積まない。
+    // `NaN <= 0.0` は false をすり抜けるので、 有限性を明示的に見る。
+    if !first_x.is_finite() || !span.is_finite() || span <= 0.0 {
+        return None;
+    }
+    let needed = (span / tile_w).ceil().max(1.0);
+    let cap = f32::from(u16::try_from(MAX_THUMBNAIL_TILES).unwrap_or(u16::MAX));
+    Some(ThumbnailTiling {
+        first_x,
+        tile_w,
+        tile_h,
+        count: if needed >= cap { MAX_THUMBNAIL_TILES } else { needed as u32 },
+        truncated: needed > cap,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +280,7 @@ pub(super) fn clip_content_inset_top(style: &ArrangementStyle) -> f32 {
 #[derive(Clone, Copy)]
 pub(super) struct MidiNoteDraw {
     pub(super) pitch: u8,
+    /// **content-local** 開始拍 (r.md #68。 窓の offset は [`ContentMap`] が持つ)。
     pub(super) start_beat: f64,
     pub(super) duration_beats: f64,
     pub(super) velocity: u8,
@@ -238,7 +298,10 @@ pub(super) struct AudioEventDraw {
     /// LOD ピラミッドはこの id で frame を跨いで保持されるので、 decode 完了で
     /// 描画対象の並びが変わっても入れ替わらない安定値でなければならない。
     pub(super) key: u64,
-    /// clip 先頭からの event 開始拍 (複数 event / 分割 clip に対応)。
+    /// event の **content-local** 開始拍 (複数 event / 分割 clip に対応)。
+    /// r.md #68: 窓ローカルではなく content-local (= model の
+    /// `AudioEvent::event_start_in_clip_beats` そのもの)。 窓の offset は
+    /// [`ContentMap`] の原点側が持つ。
     pub(super) start_in_clip_beats: f64,
     /// event の長さ (拍)。 span が張られていない末尾 (= 鳴り終わったあと) を
     /// 無音ベースラインで示すのに使う。
@@ -253,7 +316,11 @@ pub(super) enum ClipContentDraw {
     /// clip 内の **全** audio event (旧実装は先頭 1 件だけを描いており、 分割 / glue で
     /// 複数 event になった clip は 2 件目以降が見えなかった)。
     Audio { events: Vec<AudioEventDraw> },
-    Midi { notes: Vec<MidiNoteDraw>, len_beats: f64 },
+    /// r.md #68: `len_beats` (= clip の長さ) は持たない。 ノートの x 写像に clip 長を
+    /// 使っていたのが「トリムなのに中身がストレッチ表示される」 の主因だった
+    /// (ゴーストは drag 後の矩形 × drag 前の長さで描いていたので、 ちょうど
+    /// `stretch_remap` と pixel 一致する time-stretch の絵になっていた)。
+    Midi { notes: Vec<MidiNoteDraw> },
 }
 
 /// clip 名 + (share clip なら) 名前左の link glyph を描く共通 helper (audio / video 経路で共有)。
@@ -298,18 +365,24 @@ pub(super) fn draw_clip_label<M: ?Sized + 'static>(
 /// widget 内版)。 `inset_top` はラベル帯と共有する [`clip_content_inset_top`] の値。
 ///
 /// r.md #41: clip 内の **全 audio event** を、 それぞれ
-/// [`common::audio_render::event_wave_spans`] が返す span 列で描く。 「clip 拍 → x」 は
-/// `clip_len_beats` からの単純な線形写像 1 本で、 mode 別の分岐は持たない
+/// [`common::audio_render::event_wave_spans`] が返す span 列で描く。 「content 拍 → x」 は
+/// `map` 1 本で、 mode 別の分岐は持たない
 /// (Slice のスライス配置 / gap、 warp 区間、 逆再生はすべて span 側の情報)。
 /// span の無い区間 (= 無音) には薄いベースラインを引き、 Slice はスライス頭に
 /// 区切り線を出す。
+///
+/// r.md #68: x 写像は [`ContentMap`] (= ビューのズーム) のみ。 旧実装は
+/// `content.w / clip_len_beats` = 「インセット済み表示幅 ÷ クリップ長」 で、
+/// (a) 波形がルーラーのグリッドと 2px ずれ、 (b) 原点が窓の左端だったため左端 drag で
+/// 波形が掴んだ端に付いて滑っていた (確定時は `content_offset_beats += δ` で絶対時間に
+/// 留まるので preview ≠ commit)。 clip 矩形は縦レイアウトと切り抜きにだけ使う。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     key: ClipKey,
     clip_rect: Rect,
-    // この rect が表す clip の長さ (拍)。 波形の x 写像 = `content.w / clip_len_beats`。
-    clip_len_beats: f64,
+    // content-local 拍 → 画面 x (clip の表示幅には依存しない)。
+    map: ContentMap,
     events: &[AudioEventDraw],
     is_selected: bool,
     lanes: Rect,
@@ -335,8 +408,8 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     };
     if content.w <= 0.0
         || content.h <= 0.0
-        || !clip_len_beats.is_finite()
-        || clip_len_beats <= 0.0
+        || !map.px_per_beat.is_finite()
+        || map.px_per_beat <= 0.0
         || events.is_empty()
     {
         return;
@@ -352,7 +425,6 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     }
     let scissor = Rect { x: cx0, y: cy0, w: cx1 - cx0, h: cy1 - cy0 };
 
-    let px_per_beat = f64::from(content.w) / clip_len_beats;
     // r.md #45: 波形色は clip の実塗り色からの auto-contrast (固定ブルーだと
     // 明るい clip 色の上で消えていた)。 alpha は従来どおり選択で少し濃く。
     let (base_fg, fg_clipped) = waveform_colors_for(p, clip_bg, style.bg, is_selected);
@@ -383,9 +455,7 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
 
     hctx.with_clip_rect(scissor, |hctx| {
         for ev in events {
-            let x_at = |beat: f64| {
-                content.x + ((ev.start_in_clip_beats + beat) * px_per_beat) as f32
-            };
+            let x_at = |beat: f64| map.x(ev.start_in_clip_beats + beat);
             let ev_x0 = x_at(0.0);
             let mut segs: Vec<WaveformSegment> = Vec::with_capacity(ev.spans.len());
             let show_dividers = ev.spans.len() > 1
@@ -506,12 +576,17 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
 /// S4b Phase C: 1 つの MIDI clip rect 内にノートプレビューを描く (旧 app 側
 /// 旧 app 側 clip MIDI overlay の widget 内版、 共有 `inset_top`)。`clip_bg` は clip の実効塗り色
 /// (selected なら `clip_selected_fill`)、 ノート色は背景輝度から auto-contrast で選ぶ。
+///
+/// r.md #68: 横方向の写像は [`ContentMap`] (= ビューのズーム) だけ。 clip 矩形は
+/// (a) 縦レイアウト (pitch レンジ) と (b) 左右の切り抜きにしか使わない。 旧実装の
+/// `view_rect.w / clip_len_beats` は「表示幅 ÷ クリップ長」 そのもので、 ドラッグ
+/// ゴーストがこれに drag 前の長さを渡していたためトリム中に time-stretch の絵になっていた。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_clip_midi_inner<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
     notes: &[MidiNoteDraw],
-    clip_len_beats: f64,
+    map: ContentMap,
     clip_bg: Color,
     style: &ArrangementStyle,
     lanes_x: f32,
@@ -556,11 +631,9 @@ pub(super) fn draw_clip_midi_inner<M: ?Sized + 'static>(
     // r.md #48: ノートが乗るのはユーザー着色の clip = 可変背景なので、テーマ従属の `text`
     // ではなく極性固定インク (`ink_for`)。 ライトテーマでも「明 clip には暗ノート」 が保たれる。
     let base_fill = p.ink_for(effective_bg);
-    let clip_len = clip_len_beats.max(0.0001) as f32;
-    let px_per_beat = view_rect.w / clip_len;
     for n in notes {
-        let nx = view_rect.x + (n.start_beat as f32) * px_per_beat;
-        let nw = ((n.duration_beats as f32) * px_per_beat).max(1.0);
+        let nx = map.x(n.start_beat);
+        let nw = map.w(n.duration_beats).max(1.0);
         let drawn_x = nx.max(visible_left);
         let drawn_x_end = (nx + nw).min(visible_right);
         if drawn_x_end <= drawn_x {
@@ -766,12 +839,36 @@ pub(super) fn draw_sections_lane<M: ?Sized + 'static>(
 
     let beat_per_px = view.len_beats / f64::from(arranger.w.max(1.0));
     hctx.with_clip_rect(arranger, |hctx| {
-        // 各 section 帯 (drag 対象は preview geometry)。
-        for s in sections {
+        // r.md #70: **base パス → drag パス** の 2 パス。 掴んでいる帯を base ループから
+        // 除いて最後に描く。
+        //
+        // レンダラは call order = z-order (`ui/crates/renderer/src/scene.rs`: 要素単位の z
+        // 指定は無い)。 `sections` は `Song::normalize_sections` が `start_beat` 昇順に
+        // 正規化した順なので、 帯を右へ動かす / 右端を右へ伸ばすと、 重なる相手 (= より
+        // 後に始まる帯) が **後から** 不透明 fill で描かれ、 掴んでいる帯を食っていた
+        // (`draw_section_band` は帯名を preview rect にクリップするので、 最初に消えるのは
+        // 帯名)。 clip / track 並べ替え / fade の各 drag は既に 2 パス構造なので、 それに揃える。
+        let dragged_id = section_drag
+            .filter(|sd| sd.kind != SectionGesture::Create)
+            .map(|sd| sd.section_id);
+        let draw_band = |hctx: &mut HeavyCtx<'_, '_, M>, s: &SectionView| {
             let (start, len) =
                 section_preview_start_len(s, section_drag, beat_per_px, snap, zoom_x_px_per_beat);
             let r = section_rect_from(start, len, view, arranger);
             draw_section_band(hctx, &s.name, s.color, r, s.selected, style);
+        };
+        // base パス: drag 対象以外を元の並び順で。
+        for s in sections {
+            if Some(s.id) == dragged_id {
+                continue;
+            }
+            draw_band(hctx, s);
+        }
+        // drag パス: 掴んでいる帯を最前面に。
+        if let Some(id) = dragged_id
+            && let Some(s) = sections.iter().find(|s| s.id == id)
+        {
+            draw_band(hctx, s);
         }
         let Some(sd) = section_drag else {
             return;
@@ -806,8 +903,11 @@ pub(super) fn draw_sections_lane<M: ?Sized + 'static>(
 ///
 /// 描画順:
 /// 1. base fill: 常に `clip.color` (未指定 None なら `video_clip_loading` =
-///    letterbox の黒帯背景としても兼用)。 選択でも fill は潰さない。
-/// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
+///    絵が覆わない余白の背景としても兼用)。 選択でも fill は潰さない。
+/// 2. thumbnail = Some なら [`content_thumbnail_rect`] で texture overlay
+///    (`HeavyCtx::push_textured_quad`)。 r.md #68 で **clip 矩形への aspect-fit を
+///    やめ、 content 原点に固定して clip 矩形で切り抜く** ように変えた (端 drag で
+///    絵が滑る / 細い clip で縮む のが video 版の #68 だった)。
 /// 3. name + (share clip なら) link glyph 描画 (`draw_clip_label`、 audio 経路と共通)
 ///
 /// 選択表示 (2 重リング) はこの関数では描かない。 `draw_selection_overlay` が cache + content
@@ -824,12 +924,15 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
     clip: &ClipView,
     style: &ArrangementStyle,
     lanes: Rect,
+    // r.md #68: thumbnail も「中身」 なので content 原点基準で置く (clip 矩形にフィット
+    // させると端 drag で絵が滑る)。
+    map: ContentMap,
 ) {
     let has_link = clip.share_group_color.is_some();
     // M14 Phase 114 (daw_01 #086): video clip も `clip.color` を唯一の fill source にする
     // (`share_group_color` は fill / border を上書きしない)。 `color` 未指定 (None) のときは従来の
-    // letterbox / loading 背景 `video_clip_loading` を使う (= 既存の非 share video clip と互換)。
-    // thumbnail があればその上に aspect-fit で texture を重ねる (fill は letterbox の黒帯として残る)。
+    // 余白 / loading 背景 `video_clip_loading` を使う (= 既存の非 share video clip と互換)。
+    // thumbnail があればその上に敷き詰めた texture を重ねる (fill は覆われない余白に残る)。
     // リンク識別は ⇌ glyph + #068 hover 強調が担う (track kind に依らず share マークが出る、 #080 不変)。
     // fill は常に clip 本来の色 (選択でも潰さない)。 選択表示 (2 重リング) は `draw_selection_overlay`
     // が cache + content の上に別レイヤで重ねるので、 ここでは選択を扱わない (r.md #20)。
@@ -848,18 +951,31 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
         radius: [style.clip_radius; 4],
         clip_rect: Some(lanes),
     });
-    if let Some((handle, tex_w_u, tex_h_u)) = clip.thumbnail {
-        hctx.push_textured_quad(TexturedQuad {
-            rect: aspect_fit_rect(r, tex_w_u, tex_h_u),
-            texture: handle,
-            alpha: 1.0,
-            uv_min: (0.0, 0.0),
-            uv_max: (1.0, 1.0),
-            // clip rect 内に閉じる (= drag 中の lanes 端で thumbnail がはみ出ない)。
-            clip_rect: Some(r.intersect(lanes)),
-            rotation_radians: 0.0,
-            rotation_pivot: None,
-        });
+    // r.md #68: サムネイルは content 原点を位相に **敷き詰める** (REAPER の
+    // "Center/tile image" と同じ)。 clip 矩形からはみ出した分は **窓で切り抜く**
+    // (縮小しない)。 可視域は `clip_rect ∩ lanes` で、 ここでカリングするので
+    // 長い clip でもタイル数は画面幅で頭打ちになる。
+    if let Some(thumb) = clip.thumbnail {
+        let visible = r.intersect(lanes);
+        if let Some(t) = thumbnail_tiling(r, visible.x, visible.x + visible.w, map, thumb) {
+            for k in 0..t.count {
+                hctx.push_textured_quad(TexturedQuad {
+                    rect: Rect::new(
+                        t.first_x + t.tile_w * k as f32,
+                        r.y,
+                        t.tile_w,
+                        t.tile_h,
+                    ),
+                    texture: thumb.texture,
+                    alpha: 1.0,
+                    uv_min: (0.0, 0.0),
+                    uv_max: (1.0, 1.0),
+                    clip_rect: Some(visible),
+                    rotation_radians: 0.0,
+                    rotation_pivot: None,
+                });
+            }
+        }
     }
     // muted は thumbnail の上に斜線ハッチを重ねる (label の下)。
     if clip.muted {
@@ -883,6 +999,8 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     style: &ArrangementStyle,
     lanes: Rect,
     track_kind: TrackKind,
+    // r.md #68: video / image clip の thumbnail 配置に使う (audio / MIDI clip では未使用)。
+    view: ArrangementView,
 ) {
     if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
         return;
@@ -891,7 +1009,7 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     // M14 Phase 108 (daw_01 #080): share_group_color は video clip でも honor する (Text / Image clip
     // の共有マーク)。 audio_edit のみ無視 (video clip では意味を持たない、 caller 責任)。
     if matches!(track_kind, TrackKind::Video) {
-        draw_video_clip(hctx, r, clip, style, lanes);
+        draw_video_clip(hctx, r, clip, style, lanes, content_map(clip, view, lanes));
         return;
     }
     // M14 Phase 114 (daw_01 #086): 静的な fill / border は **`clip.color` を唯一の source** にする。
@@ -954,7 +1072,7 @@ pub(super) fn draw_clips<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, view, lanes);
-            draw_clip(hctx, r, c, style, lanes, t.kind);
+            draw_clip(hctx, r, c, style, lanes, t.kind, view);
         }
     }
 }
@@ -1104,16 +1222,17 @@ pub(super) fn drag_preview_geometry(
             let new_idx_u = new_idx.max(0) as usize;
             (new_start, anchor.len_beats, new_idx_u)
         }
-        ClipDragKind::ResizeRight => (
-            anchor.start_beat,
-            (anchor.len_beats + beat_delta).max(min_len),
-            anchor.track_index,
-        ),
-        ClipDragKind::ResizeLeft => {
-            let max_start = anchor.start_beat + anchor.len_beats - min_len;
-            let new_start = (anchor.start_beat + beat_delta).clamp(0.0, max_start);
-            let actual_delta = new_start - anchor.start_beat;
-            (new_start, (anchor.len_beats - actual_delta).max(min_len), anchor.track_index)
+        // 端 drag は `resize_preview_start_len` が SSoT (release commit / ゴーストの
+        // 中身も同じ関数を通る)。 track は動かない。
+        ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => {
+            let (start, len) = resize_preview_start_len(
+                anchor.start_beat,
+                anchor.len_beats,
+                kind,
+                beat_delta,
+                min_len,
+            );
+            (start, len, anchor.track_index)
         }
     }
 }
@@ -1131,8 +1250,14 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
     beat_delta: f64,
     track_delta: i32,
     min_len: f64,
-    // r.md #24: preview に中身 (波形 / MIDI) を描くための content map (content path と同じ SSoT)。
+    // r.md #24: ゴーストに描く中身 (波形 / MIDI)。 base 描画と同じ map。
     clip_content: &std::collections::HashMap<ClipKey, ClipContentDraw>,
+    // r.md #68: Shift + 端 drag (= time-stretch) のときだけ入る「伸縮済みの中身」。
+    // caller (`run.rs`) が commit と同じ `stretch_remap` で content を写像し、 audio は
+    // engine と同じ `event_wave_spans` で span を引き直しているので、 プレビューと確定結果が
+    // Slice / Raw→Stretch 昇格まで含めて一致する。 トリム / 移動では確定後の中身が base と
+    // 同一なので空で、 ゴーストも `clip_content` をそのまま描く (= 中身は 1px も動かない)。
+    stretch_ghost_content: &std::collections::HashMap<ClipKey, ClipContentDraw>,
 ) {
     // r.md #24: drag preview は **掴んだ clip の中身入り半透明コピー** を描く (旧: 中身の無い不透明
     // ghost が元 clip を覆い隠し、 press / drag 中に名前 / 波形 / MIDI が消える #24 の主因だった)。
@@ -1184,10 +1309,24 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         // (share clip 等) なら更に薄くなるよう alpha を乗算する。
         let preview_fill = src_color.with_alpha(src_color.a * DRAG_PREVIEW_FILL_ALPHA);
         let src_kind = src.map_or(TrackKind::Audio, |(k, _)| k);
+        // r.md #68: ゴーストの **content 原点** を確定後と一致させる。
+        // - Move: 窓ごと動く = offset 据え置き (原点も同じだけ動く)。
+        // - ResizeLeft / ResizeRight: `resize_clip` が `content_offset_beats += Δstart` を
+        //   行うので原点は不動 (`stretch_clip_content` も offset を同量進めるので stretch でも同じ)。
+        // これで「トリムしても中身は 1px も動かない」 が式として成り立ち、 中身は
+        // ゴースト矩形で切り抜かれるだけになる。
+        let src_offset = src.map_or(0.0, |(_, c)| c.content_offset_beats);
+        let preview_offset = match nd.kind {
+            ClipDragKind::Move => src_offset,
+            ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => {
+                src_offset + (start - a.start_beat)
+            }
+        };
         let preview_clip = ClipView {
             id: a.key.clip,
             start_beat: start,
             len_beats: len,
+            content_offset_beats: preview_offset,
             name: src.map_or_else(|| Arc::from(""), |(_, c)| c.name.clone()),
             color: Some(preview_fill),
             // 共有マーク / 連動ハイライトは transient な preview では出さない (元 clip 側で描画済)。
@@ -1206,21 +1345,24 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
             continue;
         }
         // (1) clip クローム (半透明 fill + border + 名前 + video thumbnail) を base 描画と同じ経路で。
-        draw_clip(hctx, r, &preview_clip, style, lanes, src_kind);
+        draw_clip(hctx, r, &preview_clip, style, lanes, src_kind, view);
         // (2) 中身 (波形 / MIDI) を上に重ねる。 波形は ghost 専用 id で LOD state 衝突を避ける
         //     (元 clip の波形と同一フレームに 2 度描くため。 `draw_clip_waveform_inner` 参照)。
-        match clip_content.get(&a.key) {
+        //
+        // r.md #68: x 写像は base 描画とまったく同じ `content_map` (= ビューのズーム)。
+        // ゴースト矩形の幅は一切分母に入らないので、 トリム中は中身が動かず、
+        // Shift ストレッチ中は `ghost_content` 側が既に伸縮済みの中身を持っている。
+        let ghost_map = content_map(&preview_clip, view, lanes);
+        match stretch_ghost_content.get(&a.key).or_else(|| clip_content.get(&a.key)) {
             Some(ClipContentDraw::Audio { events }) => {
-                // preview の長さ (resize drag 中は変化する) で x 写像を作るので、
-                // ghost の中身は base 描画と同じ経路のまま preview rect に追従する。
                 draw_clip_waveform_inner(
-                    hctx, a.key, r, len, events, true, lanes, inset, preview_fill, style,
+                    hctx, a.key, r, ghost_map, events, true, lanes, inset, preview_fill, style,
                     "drag_ghost_wf",
                 );
             }
-            Some(ClipContentDraw::Midi { notes, len_beats }) => {
+            Some(ClipContentDraw::Midi { notes }) => {
                 // ノート色コントラストは実際に塗る preview_fill (半透明) を背景として計算 (#20 と同 idiom)。
-                draw_clip_midi_inner(hctx, r, notes, *len_beats, preview_fill, style, lanes.x, inset);
+                draw_clip_midi_inner(hctx, r, notes, ghost_map, preview_fill, style, lanes.x, inset);
             }
             None => {}
         }
@@ -1281,7 +1423,8 @@ pub(super) fn db_to_handle_y(rect: Rect, gain_db: f32, style: &ArrangementStyle)
 pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
-    clip_len_beats: f64,
+    // r.md #68: content-local 拍 → x (clip の表示幅に依存しない写像)。
+    map: ContentMap,
     fade: &ClipEventFade,
     edge: FadeEdge,
     // r.md #46: この clip が実際に塗られている色 (`clip_effective_fill`)。
@@ -1289,8 +1432,8 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     style: &ArrangementStyle,
 ) {
     // 正方形 → カーブの順 (= 分割前と同じ z 順。 カーブの線が正方形の上に乗る)。
-    draw_fade_handle(hctx, clip_rect, clip_len_beats, fade, edge, clip_bg, style);
-    draw_fade_curve(hctx, clip_rect, clip_len_beats, fade, edge, clip_bg, style);
+    draw_fade_handle(hctx, clip_rect, map, fade, edge, clip_bg, style);
+    draw_fade_curve(hctx, clip_rect, map, fade, edge, clip_bg, style);
 }
 
 /// 掴む正方形だけを描く (hit zone と同じ rect = `fade_geometry` が SSoT)。
@@ -1302,13 +1445,14 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
 pub(super) fn draw_fade_handle<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
-    clip_len_beats: f64,
+    // r.md #68: content-local 拍 → x (clip の表示幅に依存しない写像)。
+    map: ContentMap,
     fade: &ClipEventFade,
     edge: FadeEdge,
     clip_bg: Color,
     style: &ArrangementStyle,
 ) {
-    let g = fade_geometry(clip_rect, clip_len_beats, fade, edge, style);
+    let g = fade_geometry(clip_rect, map, fade, edge, style);
     if g.event_rect.w <= 0.0 || g.event_rect.h <= 0.0 {
         return;
     }
@@ -1339,7 +1483,8 @@ pub(super) fn draw_fade_handle<M: ?Sized + 'static>(
 pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
-    clip_len_beats: f64,
+    // r.md #68: content-local 拍 → x (clip の表示幅に依存しない写像)。
+    map: ContentMap,
     fade: &ClipEventFade,
     edge: FadeEdge,
     clip_bg: Color,
@@ -1347,7 +1492,7 @@ pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
 ) {
     use daw_ui_renderer::{LineBatch, LineSegment};
 
-    let g = fade_geometry(clip_rect, clip_len_beats, fade, edge, style);
+    let g = fade_geometry(clip_rect, map, fade, edge, style);
     if g.event_rect.w <= 0.0 || g.event_rect.h <= 0.0 {
         return;
     }
@@ -1434,7 +1579,8 @@ pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
 pub(super) fn draw_clip_fade_curves<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
-    clip_len_beats: f64,
+    // r.md #68: content-local 拍 → x (clip の表示幅に依存しない写像)。
+    map: ContentMap,
     fades: &[ClipEventFade],
     // r.md #46: この clip が実際に塗られている色 (`clip_effective_fill`)。
     clip_bg: Color,
@@ -1442,7 +1588,7 @@ pub(super) fn draw_clip_fade_curves<M: ?Sized + 'static>(
 ) {
     for f in fades {
         for edge in [FadeEdge::In, FadeEdge::Out] {
-            draw_fade_curve(hctx, clip_rect, clip_len_beats, f, edge, clip_bg, style);
+            draw_fade_curve(hctx, clip_rect, map, f, edge, clip_bg, style);
         }
     }
 }
@@ -1511,7 +1657,7 @@ pub(super) fn draw_fade_handle_overlay<M: ?Sized + 'static>(
                     edges.swap(0, 1);
                 }
                 for edge in edges {
-                    draw_fade_handle(hctx, r, c.len_beats, f, edge, bg, style);
+                    draw_fade_handle(hctx, r, content_map(c, view, lanes), f, edge, bg, style);
                 }
             }
         }
@@ -1570,7 +1716,7 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
                     FadeEdge::In => preview.fade.fade_in_beats = next_beats,
                     FadeEdge::Out => preview.fade.fade_out_beats = next_beats,
                 }
-                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, clip_bg, style);
+                draw_fade_envelope(hctx, r, ad.content_map_anchor, &preview, edge, clip_bg, style);
             }
             None
         }
@@ -1582,7 +1728,7 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
                     FadeEdge::In => preview.fade.fade_in_curve = next_curve,
                     FadeEdge::Out => preview.fade.fade_out_curve = next_curve,
                 }
-                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, clip_bg, style);
+                draw_fade_envelope(hctx, r, ad.content_map_anchor, &preview, edge, clip_bg, style);
             }
             Some(format!("Curve: {}", next_curve.name()))
         }

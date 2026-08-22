@@ -53,7 +53,9 @@ pub(super) fn commit_releases(
 
         // ---- clip drag release → MoveClips / ResizeClips ----
         // M9 Phase 60: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
-        // 同 delta 適用。 Resize の min_len は snap unit に合わせる (snap_unit < 0.05 なら 0.05)。
+        // 同 delta 適用。 Resize の min_len は snap unit に合わせる。 下限は model の
+        // `MIN_CLIP_LEN_BEATS` (= `resize_clip` の clamp と同じ 1/16。 r.md #68: overlay 側と
+        // 揃えないと最小長付近で preview ≠ commit)。
         // **alt は drag 中の最終 `nd.last_alt` を真値とする** — release frame の `pointer.modifiers.alt`
         // は OS event 順序 (ModifiersChanged が MouseInput(Released) より先に届く) によって false に
         // 化けることがあるため信用しない。 `last_alt` は continuation frame で更新され release frame
@@ -77,10 +79,13 @@ pub(super) fn commit_releases(
                 let td = compute_clip_drag_track_delta(&nd, press_tops);
                 (snapped, td)
             };
+            let min_clip_len = common::model::MIN_CLIP_LEN_BEATS;
             let min_len = if view.snap.is_active(release_alt) {
-                view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+                view.snap
+                    .beat_unit(zoom_x_px_per_beat)
+                    .map_or(min_clip_len, |u| u.max(min_clip_len))
             } else {
-                0.05
+                min_clip_len
             };
             match nd.kind {
                 ClipDragKind::Move => {
@@ -167,32 +172,20 @@ pub(super) fn commit_releases(
                         ui.push_edit(req);
                     }
                 }
-                ClipDragKind::ResizeRight => {
+                // r.md #68: 端 drag の (start, len) は **preview と同じ関数** で出す
+                // (`resize_preview_start_len` = ゴーストの矩形 / ゴーストの中身 /
+                // ここ の 3 箇所の SSoT)。 以前は左右で別々に同じ式を写経していて、
+                // 片方の clamp を直すと preview ≠ commit に割れる構造だった。
+                ClipDragKind::ResizeRight | ClipDragKind::ResizeLeft => {
                     let mut deltas: Vec<ResizeClipDelta> = Vec::new();
                     for a in &nd.anchors {
-                        let new_len = (a.len_beats + beat_delta).max(min_len);
-                        if (new_len - a.len_beats).abs() > 1e-6 {
-                            deltas.push(ResizeClipDelta {
-                                key: a.key,
-                                prev_start: a.start_beat,
-                                prev_len: a.len_beats,
-                                next_start: a.start_beat,
-                                next_len: new_len,
-                                stretch: nd.last_shift,
-                            });
-                        }
-                    }
-                    if !deltas.is_empty() {
-                        ui.push_edit({ let v_d = deltas; Edit::mutate(move |app: &mut AppData| { for d in &v_d { if let Some(target) = clip_key_to_ref(app, d.key) { app.handle_event(AppEvent::ResizeClip { target, start_beat: d.next_start, length: d.next_len, stretch: d.stretch }); } } }) });
-                    }
-                }
-                ClipDragKind::ResizeLeft => {
-                    let mut deltas: Vec<ResizeClipDelta> = Vec::new();
-                    for a in &nd.anchors {
-                        let max_start = a.start_beat + a.len_beats - min_len;
-                        let new_start = (a.start_beat + beat_delta).clamp(0.0, max_start);
-                        let actual = new_start - a.start_beat;
-                        let new_len = (a.len_beats - actual).max(min_len);
+                        let (new_start, new_len) = resize_preview_start_len(
+                            a.start_beat,
+                            a.len_beats,
+                            nd.kind,
+                            beat_delta,
+                            min_len,
+                        );
                         if (new_start - a.start_beat).abs() > 1e-6
                             || (new_len - a.len_beats).abs() > 1e-6
                         {
