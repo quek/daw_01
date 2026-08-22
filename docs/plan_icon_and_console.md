@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: アプリアイコン (#47) + DOS 窓抑制 (#48)
 
 `docs/FIXME.md` #47 / #48 の実装計画。FIXME.md は編集禁止のため進捗はここで追う。

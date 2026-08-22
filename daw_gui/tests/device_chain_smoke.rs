@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 単一デバイスチェーン (`docs/plan_linear_chain.md`) の end-to-end JS smoke test。
 //!
 //! flow:

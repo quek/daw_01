@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_fixme_33 — cut / copy / paste (C-x / C-c / C-v) 統一クリップボード
 
 FIXME #33「一般的な DAW と同様に C-x, C-c, C-v での cut, copy, paste を実装」。

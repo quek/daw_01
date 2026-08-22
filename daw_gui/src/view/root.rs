@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! ルート view: 画面全体を Transport / Inspector / Arrangement / BottomPanel /
 //! StatusBar に分割し、各 sub view を呼ぶ。Plugin picker / help は modal overlay。
 //!
@@ -11,7 +14,7 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::event::NudgeStep;
 use crate::view::{
-    arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
+    about, arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
     shutdown_overlay,
     font_picker, load_overlay, loudness_report, master_panel, plugin_picker, recovery_modal,
     resource_monitor,
@@ -192,9 +195,13 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 同期。最前面に出すため他の modal / overlay より後に描く。
     shortcuts_help::draw(app, ui, screen);
 
+    // Overlay: ヘルプ > バージョン情報 (r.md #60)。app.ui_prefs.is_about_open と同期。
+    about::draw(app, ui, screen);
+
     // r.md #61: Overlay:「終了処理中…」。子プロセスがプラグインを畳んで exit
     // するのを待っている間だけ出す。**最後に描く** — 終了に入ったら他の
     // modal / overlay より前面で、下の操作を全部塞ぐ。
+    // (バージョン情報を開いたまま終了しても、終了オーバーレイが手前に来る。)
     shutdown_overlay::draw(app, ui, screen);
 }
 
@@ -379,9 +386,6 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     app.handle_event(AppEvent::CloseAllPluginEditors)
                 }));
             });
-            m.item("Toggle Help", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
-            });
             m.item("Toggle Video Preview", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::TogglePreviewWindow)
@@ -410,6 +414,21 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.item("ラウドネスレポートを開く", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleLoudnessReport)
+                }));
+            });
+        });
+        // r.md #60: GPLv3 §0 は Appropriate Legal Notices を「便利かつ目立つ形で」出せと
+        // 要求し、「メニュー等のリストなら目立つ項目 1 つで基準を満たす」と明記している。
+        // なので奥のサブメニューではなく **トップレベルの Help メニュー**に置く。
+        // ショートカット一覧 (F1) も Ardour / Cubase と同じくここへ集約した
+        // (以前は View > Toggle Help にあった)。
+        mb.menu("Help", |m| {
+            m.item("ショートカット一覧 (F1)", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
+            });
+            m.item("バージョン情報", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleAbout)
                 }));
             });
         });

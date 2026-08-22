@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # 選択修飾キーの統一 (r.md #35)
 
 クリップ / ノート / オートメーション / オーディオイベントの Shift+click・Ctrl+click を

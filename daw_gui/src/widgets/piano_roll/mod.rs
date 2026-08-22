@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `piano_roll` widget — DAW piano roll (鍵盤 / ruler / grid / velocity lane / note 編集) を
 //! 1 widget で扱う library widget (M9 Phase 41e)。
 //!

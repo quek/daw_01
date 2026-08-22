@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! OS の text store (Windows TSF) と widget の間でやり取りする **中立データ型**。
 //!
 //! - [`TextDocument`]: focus 中の編集可能テキストの 1 フレーム snapshot。UI → OS へ publish。

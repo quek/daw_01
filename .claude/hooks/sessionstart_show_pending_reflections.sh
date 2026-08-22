@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SessionStart hook: surface pending reflection candidates written by the Stop
 # hook (stop_session_reflect.sh) in previous sessions, and clean up per-session
 # event logs. Ported from gui_01's AHE — this is the loop-closer: without it the

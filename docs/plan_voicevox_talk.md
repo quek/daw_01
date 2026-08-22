@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: VOICEVOX トーク(読み上げ)機能 + 字幕デバイス化
 
 `/grill-me` (2026-06-20) で設計確定。M2 送りにしていた `/audio_query` → `/synthesis`

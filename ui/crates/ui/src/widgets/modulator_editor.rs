@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! モジュレーター用グラフィカルエディタ (daw_01 / Bitwig 同等)。
 //!
 //! 3 つの widget を提供する。すべて **model 非依存** (no-Clone 不変条件を守り、

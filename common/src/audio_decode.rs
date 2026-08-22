@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Cross-platform audio-file decoder — the **single** decode engine for
 //! imported audio sources.
 //!

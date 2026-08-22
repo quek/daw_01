@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # クリップの内容ウィンドウ (r.md #44)
 
 リンクしたクリップ (= `content_id` 共有) でも **開始・終了は clip ごとに独立** という

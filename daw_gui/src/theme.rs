@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! daw_gui の theme — ui-core 汎用パレット + DAW 固有トークンの合成、およびテーマの読み込み。
 //!
 //! 汎用 UI トークン (chrome / meter / waveform / curve / selection / grid) は

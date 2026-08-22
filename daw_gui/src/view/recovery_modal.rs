@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Crash recovery modal。 起動時 (or Open 時) に検出された autosave 候補を
 //! 一覧表示し、 各候補ごとに「復元」 / 「破棄」 をユーザーに選ばせる。
 //!

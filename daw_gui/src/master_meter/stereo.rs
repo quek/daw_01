@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! ステレオ表示 — ゴニオメーター / 位相相関 / ステレオ幅 / 左右バランス (r.md #50)。
 //!
 //! 相関は Fons Adriaensen の `stcorrdsp` (jmeters / x42 meters.lv2) をそのまま

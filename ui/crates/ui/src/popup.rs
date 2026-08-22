@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `popup_layer` — modal な popup / menu / dropdown / context_menu の共通基盤 (M7 Phase 25)。
 //!
 //! 設計:

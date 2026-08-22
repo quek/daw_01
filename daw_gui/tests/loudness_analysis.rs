@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 範囲ラウドネス解析 (r.md #54) のイベント層の回帰テスト。
 //!
 //! 検証する挙動:

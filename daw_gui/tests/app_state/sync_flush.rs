@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S3b-i (docs/plan_arch_refactor.md §7.5「sync 一本化」): 子プロセス sync を
 //! epoch ベースの pull 型に一本化した挙動を検証する。 実機では runner が frame 末に
 //! `flush_song_sync` を 1 回呼ぶ; headless test はその frame 境界を明示的に模す。

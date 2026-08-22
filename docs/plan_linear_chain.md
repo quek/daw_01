@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: 単一デバイスチェーンへの作り直し（役割の位置導出）
 
 2026-06-11 開始。FIXME #32 の振り返りで「役割をデータ構造に焼き込むモデルでは

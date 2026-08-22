@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #ifndef _ARA_SHIM_STDDEF_H
 #define _ARA_SHIM_STDDEF_H
 /* Minimal freestanding stddef.h shim for parsing ARAInterface.h with a

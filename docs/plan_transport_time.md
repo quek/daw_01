@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_transport_time — トランスポートに bar.beat + 時間 を併記する
 
 FIXME #4。「普通の DAW みたいに再生時間を表示したい」。

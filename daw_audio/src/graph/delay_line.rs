@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Sample-accurate stereo delay line for plugin-delay compensation
 //! (PR3). Capacity is fixed at construction time; the audio thread
 //! never resizes the underlying ring buffer.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4c Phase B-E: piano_roll widget の描画 helper 群 (heavy/cached 内の背景・note・
 //! 歌詞・selection overlay・drag preview・velocity lane・鍵盤ラベル)。
 //! `HeavyCtx` は `<M: ?Sized>` 汎用のまま (描画は Model 型に依存しない = arrangement と同idiom)。

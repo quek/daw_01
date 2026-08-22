@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `loudness_meter` widget — EBU Tech 3341 の LU 目盛りバー (daw_01 r.md #50)。
 //!
 //! 測定 (K-weighting / ゲート / LRA) はオーディオ側の責務。この widget は

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Stop hook: detect learnable signals from the latest assistant turn and stage
 # them as reflection candidates for the next session. Ported from gui_01's AHE
 # (daw_01 #AHE): the previous PowerShell reflect.ps1 only flagged Edit/Read/Bash

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4b Phase D: arrangement widget の描画 helper 群 (heavy 内で呼ぶ pure draw fn)。
 //! private fn に触れる子モジュールとして分離。 型・幾何 helper は `use super::*` で参照。
 

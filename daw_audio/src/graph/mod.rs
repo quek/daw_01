@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Routing graph for the audio engine.
 //!
 //! [`Schedule`] is an immutable, RT-safe execution plan compiled from the

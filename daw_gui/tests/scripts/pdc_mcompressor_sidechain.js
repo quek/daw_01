@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // PR4 sidechain integration test (wired version): MCompressor with
 // sidechain hooked from Track 1 (impulse) into Track 2 (constant DC).
 // 期待される観測: Track 2 の出力は MCompressor が Track 1 の impulse を

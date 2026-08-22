@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Export WAV / Video / ラウドネス解析の前に出す「範囲」 ピッカーモーダル。
 //!
 //! r.md #54 で「ループ範囲 / 選択範囲 / セクション / 曲全体」 のワンクリック

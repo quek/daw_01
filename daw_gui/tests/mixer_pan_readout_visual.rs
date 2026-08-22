@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #62: mixer strip の **pan 数値がノブの右に並ぶ** ことの regression。
 //!
 //! レイアウトは build / test / clippy を全部すり抜けて壊れる (CLAUDE.md

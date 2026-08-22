@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Build script for `ara-sys`.
 //!
 //! By default this does nothing but declare rerun triggers — normal builds use

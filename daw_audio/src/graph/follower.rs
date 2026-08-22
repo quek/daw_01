@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Per-source envelope follower (docs/plan_modulation.md §3).
 //!
 //! RT-safe: no alloc / lock / IO. One [`FollowerSlot`] per `ModSource`,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::sync — host sync (pull 型 LoadSong) + ARA document/region 同期 + port 解決
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

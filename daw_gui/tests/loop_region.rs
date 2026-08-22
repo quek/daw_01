@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 再生ループ (ON/OFF + 範囲) を「dirty は立てないが保存される」 session state
 //! (`common::model::LoopRegion`) へ移したことの回帰テスト。
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S3b-1: AppData state group (UiPrefs)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 
@@ -152,6 +155,11 @@ pub struct UiPrefs {
     pub meter_settings: crate::master_meter::settings::MeterSettings,
 
     pub is_help_open: bool,
+
+    /// r.md #60: ヘルプ > バージョン情報 (About) が開いているか。
+    /// GPLv3 §0 の Appropriate Legal Notices を表示する画面。 `is_help_open` と同じく
+    /// セッション内だけの状態で、 app_config には永続しない (起動のたびに開いても困る)。
+    pub is_about_open: bool,
 
     /// per-user データディレクトリ (recent / recent_saved / recovery /
     /// window_state の永続化先) の **Single Source of Truth**。 production は

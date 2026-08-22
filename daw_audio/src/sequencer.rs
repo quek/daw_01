@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Walks the song's clips/notes and emits MIDI transitions for the next
 //! audio buffer. Owned by daw_audio; called from each track's worker
 //! before handing events off to the plugin host.

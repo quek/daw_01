@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! プラットフォーム層 — ウィンドウとイベントの中立抽象。
 //!
 //! 設計目的:

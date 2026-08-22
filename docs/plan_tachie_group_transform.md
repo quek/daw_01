@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # 立ち絵 group transform（親グループトラックで立ち絵パーツをまとめて動かす）
 
 ## 0. ゴール

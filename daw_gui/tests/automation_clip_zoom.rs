@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! arrangement の「選択素材へのズーム / ループ」 (`Z` / `R`) が
 //! automation clip を第一級の選択面として扱うことの回帰テスト。
 //!

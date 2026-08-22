@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `goniometer` / `correlation_meter` widget — ステレオの広がりと位相 (daw_01 r.md #50)。
 //!
 //! ゴニオは Lissajous を -45° 回した標準の向き (`x = (R-L)/√2`, `y = (L+R)/√2`) で、

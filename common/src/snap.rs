@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Beat 単位の grid snap 計算。
 //!
 //! piano_roll / arrangement widget の drag overlay と commit 値を grid に吸着させるため

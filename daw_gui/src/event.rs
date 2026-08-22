@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `AppEvent` とその周辺 marker enum (app.rs から機械分割)。
 //!
 //! dispatch (`AppData::handle_event`) は app.rs、各 variant の処理本体は
@@ -590,6 +593,11 @@ pub enum AppEvent {
     CancelRenameClip,
     ToggleHelp,
     CloseHelp,
+    /// r.md #60: ヘルプ > バージョン情報 (About)。GPLv3 §0 の Appropriate Legal
+    /// Notices (著作権表示 / 無保証 / 再頒布可 / ライセンス本文の閲覧方法) と、
+    /// FFmpeg legal.html が求める LGPL 表記をここで満たす。
+    ToggleAbout,
+    CloseAbout,
     OpenRecent(PathBuf),
     AutosaveTick,
     /// Recovery modal で「復元」 を押した。 候補 .autosave.daw を読み込み、

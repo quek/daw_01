@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! In-process libav (rsmpeg) encoder backend for video export
 //! (`docs/plan_video_export_libav.md`).
 //!

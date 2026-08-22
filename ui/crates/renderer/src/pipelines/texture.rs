@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Instanced textured-quad パイプライン (M14 Phase 71 / daw_01 #043)。
 //!
 //! 入力: `TexturedQuad` (位置・UV・alpha・texture handle) を VertexBuffer (per-instance) で渡す。

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! ITU-R BS.1770-5 Annex 2 のトゥルーピーク測定。
 //!
 //! [`crate::loudness`] と同じく daw_gui のライブメーターと daw_audio の

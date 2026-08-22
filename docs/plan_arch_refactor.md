@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_arch_refactor — 全体アーキテクチャ改修 (2026-07-03)
 
 6 系統の並列アーキテクチャ分析 (daw_gui app / common / daw_audio / daw_plugin_host / ui /

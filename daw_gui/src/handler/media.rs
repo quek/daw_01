@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::media — audio/video/image/text/MIDI の import
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

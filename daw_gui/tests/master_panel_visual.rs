@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #50: マスターパネルの **visual regression**。
 //!
 //! メーターは「値は正しいのに何も描かれていない」「一様塗りに潰れている」という

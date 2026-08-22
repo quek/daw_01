@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4c: piano_roll widget を `AppData` 直結・`Edit<AppData>` 直発行に移設した後の
 //! interaction 回帰テスト (旧 in-file `TestModel` + `PianoRollEditRequest` 記録方式を置換)。
 //!

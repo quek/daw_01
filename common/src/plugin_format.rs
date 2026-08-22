@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Plugin format tag shared between host-side crates.
 //!
 //! CLAP and VST3 descriptors have disjoint identifier schemes (CLAP uses

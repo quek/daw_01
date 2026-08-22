@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Format 非依存の process() 骨格 (`docs/plan_arch_refactor.md` §6 B8)。
 //!
 //! CLAP / VST3 の `process()` はどちらも「入力 copy → aux 入力 copy →

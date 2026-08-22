@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Text Overlay / Title Generator 計画 — 動画 / 画像の上にテキストを重ねる
 
 ステータス: **完了** (2026-05-26)。 全 phase landing + gui_01 #049 (Phase

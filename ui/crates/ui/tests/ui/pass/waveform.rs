@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `Ui::waveform` が `Clone`/`PartialEq`/`Hash`/`Default` 不要の Model に対して、
 //! `SampleSlices` の **3 variant すべて** (Mono / Planar / Interleaved) でコンパイルする
 //! ことを確認する。

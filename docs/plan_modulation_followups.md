@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_modulation_followups.md — モジュレーション残作業 (Pre-FX タップ + プラグイン param 表示精度)
 
 > [plan_modulation.md](plan_modulation.md) / [plan_modulation_routing_redesign.md](plan_modulation_routing_redesign.md)

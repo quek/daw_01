@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Phase 4 Step B / Phase 5 Step 5.1 follow-up: knob / fader / scrubable_number
 //! の drag edge を見て `ParamGestureBegin / End` を `Ui::push_edit` する共通
 //! helper。 mixer_strips / transport / 今後の inspector knob 等で再利用。

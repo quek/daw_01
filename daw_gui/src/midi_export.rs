@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Phase 7 B4 Step E (2026-05-13): MIDI export — `Song` を SMF format 1
 //! の `.mid` ファイルとして書き出す。 全 MIDI track を 1 つの SMF 内に
 //! 並列 track として出力 (= track 0 = tempo / time_sig meta-only、 track

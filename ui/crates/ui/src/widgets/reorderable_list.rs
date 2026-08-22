@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `reorderable_list` ウィジェット — `scroll_area` 上に drag&drop reorder を内蔵した list (M11 Phase 51)。
 //!
 //! daw_01 conversation `#012 [Replied]` で確定した API。`list_view` と完全平行な API

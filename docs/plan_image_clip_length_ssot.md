@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_image_clip_length_ssot — 画像/動画 clip は「clip 長 = 表示長」を不変条件にする
 
 FIXME #6。「20260512.daw で 9bar (= beat32) 以降、口以外の画像と動画が表示

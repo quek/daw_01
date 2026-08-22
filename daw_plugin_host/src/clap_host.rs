@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::Ordering;

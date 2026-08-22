@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M8 Phase 31: clipboard 抽象。
 //!
 //! `ClipboardProvider` trait は OS clipboard との interaction を library から切り離す。

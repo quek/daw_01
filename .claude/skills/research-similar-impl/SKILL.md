@@ -11,6 +11,11 @@ argument-hint: "[調査対象の機能名]"
 allowed-tools: Bash(git clone *), Bash(git pull *), Read, Grep, Glob, WebSearch, WebFetch, Agent
 ---
 
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # 類似プロダクト & API リファレンス調査
 
 $ARGUMENTS に関する調査を行い、daw_01 での実装方針を立てるためのレポートを出力する。
@@ -39,15 +44,15 @@ $ARGUMENTS に関する調査を行い、daw_01 での実装方針を立てる�
 - `--depth 1` で軽量クローン
 - 既存ならスキップ
 
-gui_01 (daw-ui) は **`F:\dev\gui_01`** に置いてある同梱プロジェクトなので、追加クローン不要。
+gui_01 (daw-ui) は **`ui/`** に置いてある同梱プロジェクトなので、追加クローン不要。
 
 ### 3. 自プロジェクトの参照
 
-- gui_01 のサンプル: `F:\dev\gui_01\crates\examples\{mixer, arrangement, piano_roll, automation,
+- gui_01 のサンプル: `ui/crates/examples/{mixer, arrangement, piano_roll, automation,
   embedded_host, sample_editor, ...}` — daw_01 に近い使い方の reference
-- gui_01 のコア: `F:\dev\gui_01\crates\{platform,renderer,ui}/src/` — Widget API、scene 構造、
+- gui_01 のコア: `ui/crates/{platform,renderer,ui}/src/` — Widget API、scene 構造、
   HeavyCtx、LayoutPass の挙動を確認
-- 前作 sing_like_coding (`F:\dev\sing_like_coding`) — IPC / CLAP ホスト / オーディオエンジン
+- 前作 sing_like_coding (作者ローカルの別リポジトリ) — IPC / CLAP ホスト / オーディオエンジン
 
 ### 4. 並列調査（Agent を並列起動）
 
@@ -80,7 +85,7 @@ gui_01 (daw-ui) は **`F:\dev\gui_01`** に置いてある同梱プロジェク�
 ### 5. clap-sys / windows crate / gui_01 の API 確認
 
 `~/.cargo/registry/src/` 内のソースを Grep して実際の Rust シグネチャを確認する。
-gui_01 は `F:\dev\gui_01\crates\` を直接 Grep / Read。
+gui_01 は `ui/crates/` を直接 Grep / Read。
 
 確認ポイント:
 - `clap-sys` の型定義（関数ポインタのシグネチャ、`*const`/`*mut`、配列長フィールド）
@@ -95,7 +100,7 @@ gui_01 は `F:\dev\gui_01\crates\` を直接 Grep / Read。
 API が違うことがある。**main だけ見てレポートすると誤った設計判断になる**。
 
 対策手順:
-1. `F:\dev\daw_01\Cargo.lock` で実際に solver が選んだバージョンを確認
+1. `Cargo.lock` で実際に solver が選んだバージョンを確認
 2. `~/.cargo/registry/src/index.crates.io-*/<crate>-<version>/` の実ファイルを必ず Read / Grep
 3. `/tmp/<crate>` の情報と食い違ったら **crates.io 側（実際にビルドされる方）を信じる**
 4. Agent に指示するときは「crates.io の `<crate> = \"X.Y.Z\"` を基準に調査」と明示
@@ -116,5 +121,5 @@ API が違うことがある。**main だけ見てレポートすると誤った
 - CLAP 仕様に関わる機能では `clap-host` と `clap` 本体を最優先で参照する
 - Rust 設計パターンは `clack` / `nih-plug` を参照する
 - 自プロジェクト前作 (`sing_like_coding`) の既存パターンも参照する
-- gui_01 関連は `F:\dev\gui_01\crates\examples\` と `F:\dev\gui_01\crates\ui\src\` を参照
+- gui_01 関連は `ui/crates/examples/` と `ui/crates/ui/src/` を参照
 - windows crate / clap-sys / gui_01 の API 確認は省略しない

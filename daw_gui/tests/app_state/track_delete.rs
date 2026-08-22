@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #43: トラックを選択して Delete で削除できること、 および
 //! **クリップを Delete した直後の 2 回目の Delete でトラックが消えないこと**。
 //!

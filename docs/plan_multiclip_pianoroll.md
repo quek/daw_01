@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # FIXME #93 — 複数選択クリップの同時ピアノロール表示・編集
 
 「Ctrl+Click などで複数選択したクリップを同時にピアノロールに表示し編集」する。よくある DAW の機能。

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: menu_bar の cascade (sub_menu) item click 後に cascade popup が閉じない (重大)
 
 ## 症状 (実機確認済 `20260512.daw`)

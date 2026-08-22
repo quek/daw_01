@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `SnapConfig` / `SnapMode` の単位 test。
 //!
 //! Default は `Adaptive ON`。 純データ型なので common に置き、 GUI ライブラリ

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 [workspace]
 resolver = "3"
 members = [
@@ -20,7 +23,14 @@ edition = "2024"
 # 旧 gui_01 crate (ui/crates/*) が rust-version / license / publish を
 # *.workspace = true で継承するため、 統合に伴いここに集約する。
 rust-version = "1.95"
-license = "MIT OR Apache-2.0"
+# r.md #60: GPLv3 公開。 ここが workspace 全体のライセンス SSoT で、 各 crate は
+# `license.workspace = true` で継承する。 **vendored な第三者コードを package
+# ディレクトリ内に抱える 3 crate だけは継承せず、 複合 SPDX 式を自分で書く**
+# (ara-sys = Apache-2.0 / signalsmith-sys = MIT / daw_gui = LGPL-2.1-or-later の
+# FFmpeg binding)。 帰属の一覧は NOTICE、 依存クレートは THIRD-PARTY-NOTICES.md。
+authors = ["Tahara Yoshinori"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/quek/daw_01"
 publish = false
 
 [workspace.dependencies]

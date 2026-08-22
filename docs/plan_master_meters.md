@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # マスターパネルと各種メーター (r.md #50)
 
 Mixer 右端にあった MASTER ストリップを、画面右端にフル高で常駐する **マスターパネル** へ移設し、

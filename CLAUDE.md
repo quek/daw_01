@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # daw_01
 
 VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。詳細は [DESIGN.md](DESIGN.md)。
@@ -56,8 +61,19 @@ scoping と矛盾しない、むしろ更に絞り込む方向)。避けるべ�
 
 - `third_party/ffmpeg`（BtbN n7.1 win64 LGPL shared）は **gitignore** で checkout には入らない。
   fresh なマシン（main checkout 自身）では **`make fetch-ffmpeg`** で取得する（idempotent。`make build` /
-  `test` / `check` の前提条件にも入れてある。BtbN の asset 名変更に耐えるよう URL 固定でなく
-  latest リリースの asset 一覧から n7.1 lgpl-shared を発見して DL する）。
+  `test` / `check` の前提条件にも入れてある）。
+- **取得は「latest から発見」ではなく URL + sha256 固定**（2026-08-22 に方針を反転）。
+  旧方針は「BtbN の asset 名変更に耐えるよう URL を固定しない」だったが、実際に起きたのは
+  **asset 名の変更ではなく asset の消滅**だった（latest に残るのは master / n8.1 / n9.0 だけで
+  n7.1 系はゼロ）。発見方式は「見つからなければ落ちる」ので原理的に対応できず、
+  third_party を持たないマシンが何もビルドできない状態になっていた。
+  BtbN の保持ポリシーは「月末ビルドは 2 年、日次は直近 14 本」なので、固定した URL もいずれ
+  404 になる。よって **固定 + 自前ミラーへのフォールバック**をセットで持つ。
+  実装は `scripts/fetch_ffmpeg.sh`（pin の SSoT。Makefile に URL を二重化しない）、
+  ミラーの作り方と LGPL 上の義務は `docs/ffmpeg_mirror.md`。
+  ミラーに置くのはバイナリだけでなく **対応するソース一式**（FFmpeg 本体 + BtbN のビルド
+  レシピ + DLL に静的リンクされる外部ライブラリ）。GPL-3.0 §6(d) の義務で、`make ffmpeg-mirror`
+  が用意する（**アップロードは自動化しない。外部に出る操作は人がやる**）。
 - **Claude Code の worktree（`--worktree` / EnterWorktree / subagent）は自動コピー**: リポジトリ直下の
   `.worktreeinclude`（`/third_party/`）により、新 worktree 作成時に main checkout から ffmpeg が
   **実コピー**される（junction ではない）。よって Claude が作る worktree では `make fetch-ffmpeg` は不要。
@@ -383,5 +399,6 @@ commit 前にこれを通す**。 詳細は `daw_gui/src/smoke_test.rs`。
 - `ui/` — 自作 GUI ライブラリ daw-ui (旧 gui_01, 統合済み)。同一 workspace・同一セッションで
   直接編集する。API は crate doc-comments、サンプルは `ui/crates/examples/{mixer, arrangement,
   piano_roll, ...}`、UI 固有の技術ガイド・既知の罠は `ui/CLAUDE.md`、設計正本は `ui/docs/plan.html`。
-- `F:\dev\sing_like_coding` — 前作 Rust DAW。IPC, CLAP ホスト, オーディオエンジンの参照実装
-- `%APPDATA%\REAPER\Scripts\yoshino\voicevox\` — VOICEVOX API 統合の参照実装 (Lua)
+- `sing_like_coding` (作者ローカルの別リポジトリ) — 前作 Rust DAW。IPC, CLAP ホスト,
+  オーディオエンジンの参照実装
+- `%APPDATA%\REAPER\Scripts\<user>\voicevox\` (作者ローカル) — VOICEVOX API 統合の参照実装 (Lua)

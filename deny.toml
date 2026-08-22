@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# 依存クレートのライセンス許可リスト (r.md #60)。
+#
+# **この allow が「GPL-3.0-or-later と結合してよいライセンス」の SSoT**。2 つの検査が
+# 同じこのリストを読む:
+#
+#   1. `python scripts/dep_licenses.py --check` … stdlib のみ。cargo-deny が無い環境でも
+#      必ず走る (= 検査を skip して false green にしない)。THIRD-PARTY-NOTICES.md の
+#      鮮度も同時に検証する。
+#   2. `cargo deny --all-features check licenses` … 入っていれば追加で走る
+#      (`cargo install --locked cargo-deny`)。askalono による LICENSE 実ファイル照合まで行う。
+#
+# どちらも `make license-check` から呼ばれる。
+#
+# 何を足してよいか: **GPLv3 と互換なライセンスだけ**。FSF の判定表
+# https://www.gnu.org/licenses/license-list.html を根拠にすること。ここに ID を足す前に、
+# 「GPLv3 の成果物に取り込めるか」を一次情報で確認する。
+#
+# 意図的に **入れていない** もの:
+#   - GPL-2.0-only / GPL-2.0-or-later … GPLv3 と非互換 (v2-only)。`self_cell` が
+#     `Apache-2.0 OR GPL-2.0-only` を宣言しているが、OR の左 (Apache-2.0) を選択するので
+#     許可リストに GPL-2.0-only を足す必要は無い。足すと非互換の混入を見逃す。
+#   - CDDL / SSPL / EPL / 独自プロプライエタリ … いずれも GPLv3 非互換。
+#
+# cargo-deny 0.16 で削除されたキー (unlicensed / deny / copyleft / allow-osi-fsf-free /
+# default) は書かない (書くとエラーになる)。「allow に無いものは全部 deny」が現行の既定。
+
+[licenses]
+# askalono の判定信頼度しきい値 (0.0-1.0、既定 0.8)。上げると曖昧な LICENSE 実ファイルを
+# 通さない。
+confidence-threshold = 0.93
+
+# 2026-08-22 時点で依存グラフ (normal + build、x86_64-pc-windows-msvc) に実在する ID のみ。
+# 使われていない ID を置くと cargo-deny が unused-allowed-license 警告を出すので、
+# 「一覧の網羅」ではなく「実在するものの列挙」に保つ。
+allow = [
+    # --- 自作クレート (private.ignore で除外されるが、明示しておく) ---
+    "GPL-3.0-or-later",
+    # daw_gui は package 内に FFmpeg ヘッダ由来の bindgen 出力を持つ (REUSE.toml 参照)。
+    "LGPL-2.1-or-later",
+
+    # --- 依存クレート ---
+    "0BSD",
+    "Apache-2.0",       # GPLv3 とのみ互換 (GPLv2 とは非互換 = v2 に後退できない)
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    # MPL-2.0 は §3.3 Secondary License 条項で GPL と結合できる。symphonia 一式 (14) と
+    # option-ext が該当し、いずれも Exhibit B (Incompatible With Secondary Licenses) の
+    # 適用が無いことをソースで確認済み。
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# 自作クレート (publish = false) はライセンス検査の対象外にする。ライセンスの正しさは
+# Cargo.toml の license フィールド + REUSE.toml + scripts/reuse_lint.py が担保する。
+[licenses.private]
+ignore = true

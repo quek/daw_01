@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # r.md #49 — アイドル時の省電力 (停止中 + 非アクティブでオーディオと描画を止める)
 
 ## 0. 決定事項 (grill-me で確定)

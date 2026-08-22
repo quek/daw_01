@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! VOICEVOX HTTP client — `/singers` `/speakers` fetch + 口パク (lip-sync) phoneme query。
 //!
 //! arch-refactor S5-2 で common::voicevox から分離した (reqwest を要する GUI 側の責務)。

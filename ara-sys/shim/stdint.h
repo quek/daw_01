@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #ifndef _ARA_SHIM_STDINT_H
 #define _ARA_SHIM_STDINT_H
 /* Minimal stdint.h shim (win64 / LLP64 widths) for ARAInterface.h. */

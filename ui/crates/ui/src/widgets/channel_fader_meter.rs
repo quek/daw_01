@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `channel_fader_meter` widget — fader + ステレオ level meter を **単一の dB→ピクセル y 写像**
 //! で統合した mixer 用複合 widget (M14 Phase 111 / daw_01 #083)。
 //!

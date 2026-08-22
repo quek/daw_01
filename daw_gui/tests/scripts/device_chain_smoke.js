@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // 単一デバイスチェーン (`docs/plan_linear_chain.md`) を end-to-end で検証する JS
 // smoke test。`daw_gui --script` で headless 実行。exit 0 で pass、JS error で 1。
 //

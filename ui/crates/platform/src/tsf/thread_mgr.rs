@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `TsfManager` — TSF client 側のライフサイクル管理。
 //!
 //! `CoInitializeEx(STA)` → `CoCreateInstance(CLSID_TF_ThreadMgr)` → `Activate` →

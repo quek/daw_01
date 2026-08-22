@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: IME composition 確定 Enter を text_input commit から隔離する
 
 ## 主訴 (ユーザー報告 2026-06-01)

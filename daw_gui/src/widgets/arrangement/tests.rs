@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4b: arrangement widget の pure-fn 単体テスト (geometry / hit-test / draw primitive helpers)。
 //! private fn に触るため親モジュールの submodule ファイルとして分離 (`use super::*`)。
 

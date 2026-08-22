@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Offline WAV render. Drives the same worker rig and per-plugin
 //! `ProcessData` shmem the live audio thread uses, but freewheels through
 //! the song as fast as the plugin chain allows. The CPAL callback

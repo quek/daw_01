@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Audio file import: hash-based dedup, project-dir copy, audio decode.
 //!
 //! Pipeline (spec `docs/plan_audio_clip.md` §3.1.1, §7):

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Plugin Picker 絞り込み後のカーソル選択 (type-ahead picker)
 
 プラグインピッカー (`daw_gui/src/view/plugin_picker.rs`) で検索ボックスに入力して絞り込んだ

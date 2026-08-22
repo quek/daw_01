@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::automation_lanes — image/group/text automation lane + inspector param + plugin param 編集 + child-disconnect
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

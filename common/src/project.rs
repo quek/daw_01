@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1389,8 +1392,11 @@ mod tests {
             ..Clip::default()
         });
         song.tracks.push(track);
-        let path = Path::new(r"F:\dev\daw_01\target\talk_fixture.daw");
-        save(path, &song).unwrap();
+        // workspace の target/ (= `common/target` ではない)。test の cwd は package root
+        // なので相対 "target/..." だと存在しないディレクトリを指す。r.md #60 で
+        // マシン固有の絶対パスを外したときにここを踏んだ。
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/talk_fixture.daw");
+        save(&path, &song).unwrap();
         eprintln!("wrote talk fixture: {}", path.display());
     }
 

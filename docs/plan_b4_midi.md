@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # B4: MIDI 録音 / MIDI export 計画
 
 ステータス: **着手中** (2026-05-13)。 Phase 7 (M2) B4 の minimum スコープを

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Image Automation (x/y/w/h/opacity 自動化) 計画
 
 ステータス: **設計確定** (2026-05-26)、 着手前。

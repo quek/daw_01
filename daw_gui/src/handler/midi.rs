@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::midi — MIDI 入力 / learn / binding / step & realtime 録音
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

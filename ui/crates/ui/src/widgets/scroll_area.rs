@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `scroll_area` widget — overflow をクリップし scrollbar + wheel/drag scroll を提供する。
 //!
 //! M7 Phase 22 (基本 widget 拡張)。`Ui::with_clip_rect` + `Ui::take_scroll_in_rect` の上に組む。

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M4 Phase 12: scenegraph cache の効果を計測するベンチ。
 //!
 //! 1000 ボタンの UI を 1 フレーム描画する CPU コストを、

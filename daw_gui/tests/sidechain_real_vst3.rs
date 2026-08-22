@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! PR4 sidechain integration smoke test: 実 VST3 plugin (MeldaProduction
 //! MCompressor) を sidechain 入力付きでロードした状態でも export pipeline
 //! 全体が落ちずに WAV を生成することを確認する。

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # FIXME #90: VOICEVOX wav / 口パク 生成状態の可視化
 
 ユーザー要望: 「voicevox で wav やロパク(口パク)の生成状態を可視化したい。プログレスバーを

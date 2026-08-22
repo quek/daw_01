@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Audio Editor (Phase 2 PR6 minimal viewer)。
 //!
 //! audio clip ダブルクリックで bottom_panel の Piano Roll タブの代わりに

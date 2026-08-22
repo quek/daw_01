@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::shutdown — r.md #61: 終了シーケンスの実行 (`AppData` 側)。
 //!
 //! 状態機械そのものは [`crate::shutdown`]。ここはその状態遷移に伴う

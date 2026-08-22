@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `knob` ウィジェット — 回転ノブ。ドラッグで値編集 (上下ドラッグ、上 = 増)。
 //!
 //! - 値範囲: `0.0..=1.0`

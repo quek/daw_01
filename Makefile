@@ -1,4 +1,12 @@
-.PHONY: help build run test test-rt clippy clean release run-release fmt check fetch-ffmpeg worktree-rm worktree-rm-merged
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+.PHONY: help build run test test-rt clippy license-check clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
+
+# ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
+# `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
+# 明示したいときは `make license-check PYTHON=/usr/bin/python3.12`。
+PYTHON ?= $(shell command -v python 2>/dev/null || command -v python3 2>/dev/null)
 
 .DEFAULT_GOAL := release
 
@@ -39,11 +47,10 @@ TEST_PKGS := -p common -p daw_gui -p daw_audio -p daw_plugin_host \
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)
 # を維持すること (vendored binding daw_gui/ffmpeg/binding_ffmpeg_7.1.rs と一致させるため)。
-# BtbN は asset 名に版サフィックスを付け替えるので URL は固定せず latest リリースの
-# asset 一覧から n7.1 win64 LGPL shared を探して取得する。
-FFMPEG_DIR := third_party/ffmpeg
-FFMPEG_API := https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest
-FFMPEG_MATCH := n7\.1.*win64-lgpl-shared
+# 取得元の pin (URL / sha256) と取得ロジックは scripts/fetch_ffmpeg.sh が SSoT。
+# ここに URL を二重化しない。ミラーの用意は scripts/prepare_ffmpeg_mirror.sh、
+# 置き場所と手順は docs/ffmpeg_mirror.md。
+# (取得先ディレクトリも script 側の既定。上書きは FFMPEG_DIR 環境変数で。)
 
 help:
 	@echo "daw_01 makefile targets (cargo ラッパー):"
@@ -55,38 +62,31 @@ help:
 	@echo "  make test          テストを持つ package のみ実行 (TEST_PKGS、#[test]0個の examples 等は除外)"
 	@echo "  make test-rt       RT (audio thread) の無確保検査 (rt-assert feature、make test から呼ばれる)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
+	@echo "  make license-check ライセンス表示の検査 (SPDX ヘッダ / REUSE / 依存の GPLv3 互換性)"
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
 	@echo "  make fmt           cargo fmt"
 	@echo "  make fetch-ffmpeg  third_party/ffmpeg を取得 (無ければ DL、各マシン 1 回)"
+	@echo "  make fetch-ffmpeg-force  third_party/ffmpeg を取り直す"
+	@echo "  make ffmpeg-mirror ミラー用の成果物を dist/ffmpeg-mirror/ に用意 (上げはしない)"
 	@echo "  make clean         target/ を削除"
 	@echo "  make worktree-rm NAME=<name>   マージ済み worktree を安全に削除 (junction 安全 + ロック解除 + branch 削除)"
 	@echo "  make worktree-rm-merged       マージ済み worktree を全部削除"
 
 # third_party/ffmpeg を取得する (gitignore なので checkout では入らない)。
-# avcodec.lib があれば skip (idempotent)。再取得は: rm -rf third_party/ffmpeg && make fetch-ffmpeg
+# 実体は scripts/fetch_ffmpeg.sh (URL 固定 + sha256 検証 + ミラーへのフォールバック)。
+# avcodec.lib があれば skip (idempotent)。取り直しは make fetch-ffmpeg-force。
 fetch-ffmpeg:
-	@if [ -f "$(FFMPEG_DIR)/lib/avcodec.lib" ]; then \
-		echo "FFmpeg present: $(FFMPEG_DIR)"; \
-	else \
-		set -e; \
-		echo "Resolving asset from $(FFMPEG_API)"; \
-		url=$$(curl -fsSL "$(FFMPEG_API)" | grep -oE 'https://[^"]+\.zip' | grep -iE '$(FFMPEG_MATCH)' | head -n1); \
-		[ -n "$$url" ] || { echo "ERROR: n7.1 win64 lgpl-shared asset not found in BtbN latest release"; exit 1; }; \
-		tmp="$(FFMPEG_DIR)_dl_tmp"; \
-		rm -rf "$$tmp"; mkdir -p "$$tmp"; \
-		echo "Downloading $$url"; \
-		curl -fL -o "$$tmp/ffmpeg.zip" "$$url"; \
-		echo "Extracting"; \
-		unzip -q "$$tmp/ffmpeg.zip" -d "$$tmp"; \
-		inner=$$(find "$$tmp" -maxdepth 1 -type d -name 'ffmpeg-*' | head -n1); \
-		[ -n "$$inner" ] || { echo "ERROR: extracted ffmpeg-* folder not found"; exit 1; }; \
-		rm -rf "$(FFMPEG_DIR)"; \
-		mkdir -p "$(FFMPEG_DIR)"; \
-		cp -r "$$inner/bin" "$$inner/lib" "$$inner/include" "$(FFMPEG_DIR)/"; \
-		rm -rf "$$tmp"; \
-		[ -f "$(FFMPEG_DIR)/lib/avcodec.lib" ] || { echo "ERROR: avcodec.lib missing after fetch"; exit 1; }; \
-		echo "FFmpeg fetched into $(FFMPEG_DIR)"; \
-	fi
+	@$(BASH) "$(CURDIR)/scripts/fetch_ffmpeg.sh"
+
+# 既存の third_party/ffmpeg を取り直す (pin を上げたときなど)。
+# 新しい方が展開・検証できてから入れ替えるので、失敗しても既存を壊さない。
+fetch-ffmpeg-force:
+	$(BASH) "$(CURDIR)/scripts/fetch_ffmpeg.sh" --force
+
+# ミラー用の成果物 (BtbN バイナリ + 対応するソース) を dist/ffmpeg-mirror/ に用意する。
+# **アップロードはしない**。手順は docs/ffmpeg_mirror.md。
+ffmpeg-mirror:
+	$(BASH) "$(CURDIR)/scripts/prepare_ffmpeg_mirror.sh"
 
 build: fetch-ffmpeg
 	cargo build $(RUN_PKGS)
@@ -124,6 +124,31 @@ test-rt:
 
 clippy:
 	cargo clippy --workspace -- -D warnings
+
+# ライセンス表示の機械検査 (r.md #60)。clippy / arch-lint と同格の常設ゲート。
+#   1. SPDX 式の評価器の自己検査 — ここが壊れると 4 が静かに false green になる
+#   2. REUSE Specification 3.3 適合 (全ファイルに著作権 + ライセンス表示があるか)
+#   3. SPDX ヘッダの取りこぼし (新規ファイルを足したら必ずここで気付く)
+#   4. 依存クレートが deny.toml の allow で満たせるか + THIRD-PARTY-NOTICES.md の鮮度
+# 1-4 は Python stdlib だけで動くので **どの環境でも必ず走る** (検査を skip して
+# 「緑に見えるが表示が壊れている」状態を作らない)。公式ツール (reuse / cargo-deny) は
+# 入っていれば追加で走らせる = より厳しい検査に上書きされることはあっても緩まない。
+license-check:
+	@[ -n "$(PYTHON)" ] || { echo "ERROR: python が見つかりません。make license-check PYTHON=/path/to/python3" >&2; exit 1; }
+	"$(PYTHON)" scripts/dep_licenses.py --self-test
+	"$(PYTHON)" scripts/reuse_lint.py
+	"$(PYTHON)" scripts/add_spdx_headers.py --check
+	"$(PYTHON)" scripts/dep_licenses.py --check
+	@if command -v reuse >/dev/null 2>&1; then \
+		echo "--- reuse lint ---"; reuse lint; \
+	else \
+		echo "note: reuse 未インストール (pipx install reuse) — 自前検査のみで続行"; \
+	fi
+	@if command -v cargo-deny >/dev/null 2>&1; then \
+		echo "--- cargo deny check licenses ---"; cargo deny --all-features check licenses; \
+	else \
+		echo "note: cargo-deny 未インストール (cargo install --locked cargo-deny) — 自前検査のみで続行"; \
+	fi
 
 # アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
 # docs/plan_arch_refactor.md §11)。違反は列挙のみ (exit 0)。

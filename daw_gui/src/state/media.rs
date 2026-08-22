@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S3b-1: AppData state group (MediaState)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 

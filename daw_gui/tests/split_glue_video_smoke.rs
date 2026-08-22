@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! docs/plan_video.md P6.4: Video clip の Split / Glue smoke test。
 //!
 //! `tests/scripts/split_glue_video_smoke.js` を `daw_gui --script` で

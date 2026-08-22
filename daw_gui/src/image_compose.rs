@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Image overlay composite helpers (`docs/plan_image_overlay.md` §P3).
 //!
 //! OS-neutral (= image clips have no decoder dependency; the `image`

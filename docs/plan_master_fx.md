@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_master_fx — master トラックに fx を挿せるようにする
 
 作成: 2026-05-31 / status: daw_01 側実装済み (gui_01 #061 landing 待ち)

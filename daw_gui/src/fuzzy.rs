@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! プラグインピッカー等の絞り込み用ファジー検索。
 //!
 //! 連続部分文字列ではなく **subsequence (部分列) マッチ**。 入力文字が対象

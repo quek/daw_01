@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Integration test: プラグインピッカーの上下キーカーソル選択 (daw_01 #057 wire / gui_01 Phase 86)。
 //!
 //! 検証する model 操作:

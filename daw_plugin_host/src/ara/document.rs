@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! ARA document controller lifecycle.
 //!
 //! Given an [`ARAFactory`] obtained from a plug-in (via the CLAP/VST3 companion

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: text clip 生成を「空きレーン右クリック」に統一（File→Add Text Clip 廃止）
 
 ## 主訴（ユーザー報告 2026-06-03）

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Bitwig-style DAW GUI state.
 //!
 //! 状態は 3 つに分けて持つ:
@@ -334,6 +337,7 @@ impl AppData {
                 master_panel_sections: app_config.master_panel_sections,
                 meter_settings: app_config.meter,
                 is_help_open: false,
+                is_about_open: false,
                 app_dirs,
                 recent_files,
                 recent_saved,
@@ -1154,6 +1158,12 @@ impl AppData {
             }
             AppEvent::CloseHelp => {
                 self.ui_prefs.is_help_open = false;
+            }
+            AppEvent::ToggleAbout => {
+                self.ui_prefs.is_about_open = !self.ui_prefs.is_about_open;
+            }
+            AppEvent::CloseAbout => {
+                self.ui_prefs.is_about_open = false;
             }
             AppEvent::OpenRecent(path) => {
                 // Open Recent も「プロジェクトを開く」 = 現プロジェクト破棄

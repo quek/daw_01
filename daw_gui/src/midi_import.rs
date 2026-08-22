@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MIDI (SMF) import — `.mid` / `.midi` / `.smf` / `.kar` / `.rmi` を読んで
 //! daw_01 の `ClipContent::Midi` に入る形へ変換する (r.md #66)。
 //! 設計正本は [`docs/plan_midi_import.md`](../../docs/plan_midi_import.md)、

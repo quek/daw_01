@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Schedule + NodeOp + BufRef.
 //!
 //! A `Schedule` is the compiled execution plan that the audio thread

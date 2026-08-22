@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::Result;

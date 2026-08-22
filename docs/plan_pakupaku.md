@@ -1,8 +1,14 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_pakupaku — 口パク (lip-sync) 画像自動生成
 
 VOICEVOX の phoneme タイミングから、立ち絵の口画像を歌唱に合わせて
 自動配置する機能。REAPER 版スクリプト
-(`%APPDATA%\REAPER\Scripts\yoshino\voicevox\pakupaku.lua`) の daw_01 移植。
+(`%APPDATA%\REAPER\Scripts\<user>\voicevox\pakupaku.lua`、作者ローカルの
+自作 Lua) の daw_01 移植。
 
 ## 1. 概要 / 目的
 

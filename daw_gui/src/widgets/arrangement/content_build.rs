@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! clip の **中身** (波形 / MIDI ノート) を model + audio cache から 1 フレーム分だけ
 //! 集める層。 `run.rs` から分離 (god file budget)。
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 画面下端のステータスバー: ファイルパス / MIDI 入力 / status_message +
 //! resource monitor (r.md #3) の常駐メーター (DSP / CPU / FPS / xrun)。
 

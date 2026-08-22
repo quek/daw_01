@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: Video export を in-process libav (rsmpeg + NVENC) に置き換える
 
 最終更新: 2026-06-06。根拠リサーチ: `~/.claude/.../wf_f3b6750f-6b4`（5 agent、引用付き）。

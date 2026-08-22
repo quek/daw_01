@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! daw_gui ライブラリ (binary `daw_gui` と integration test 共通)。
 //!
 //! `cargo test --test <name>` で `tests/` 配下の integration test が

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `label` ウィジェット — テキスト 1 行を表示するだけ。
 
 use daw_ui_renderer::{Color, GlyphArea, Rect};

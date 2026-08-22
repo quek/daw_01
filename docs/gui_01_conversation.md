@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # gui_01 ↔ daw_01 conversation
 
 daw_01 Claude Code から gui_01 Claude Code への要望・バグ報告・API 質問と、

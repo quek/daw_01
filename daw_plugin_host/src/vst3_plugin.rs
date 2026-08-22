@@ -1,5 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! VST3 plugin wrapper.
 //!
 //! Split-half (`docs/plan_arch_refactor.md` §6): [`Vst3Plugin`] is the
