@@ -135,7 +135,7 @@ fn window_icon() -> Option<Icon> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let _log_guard = common::logging::init_tracing_for("daw_gui");
     tracing::info!("daw_gui starting");
 
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
                 tracing::info!(
                     "daw_gui already running; brought the existing window to front, exiting"
                 );
-                return Ok(());
+                return Ok(std::process::ExitCode::SUCCESS);
             }
             Ok(daw_gui::single_instance::SingleInstance::Primary(g)) => {
                 singleton_primary = true;
@@ -173,7 +173,8 @@ fn main() -> Result<()> {
     if let Some(script_path) = cli.script.as_ref() {
         tracing::info!(script = %script_path.display(), "headless script mode");
         #[cfg(feature = "script")]
-        return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra);
+        return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra)
+            .map(|()| std::process::ExitCode::SUCCESS);
         // boa_engine (JS エンジン) は default ビルドのコールド時間短縮のため除外している。
         // --script を使う headless テストは `--features script` を付けてビルドすること。
         #[cfg(not(feature = "script"))]
@@ -181,7 +182,7 @@ fn main() -> Result<()> {
             // output / extra は script モード専用。feature off では未使用なので明示的に
             // 読んで dead_code を回避しつつ、bootstrap (子プロセス所有) を畳んでから返す。
             let _ = (cli.output.as_ref(), cli.extra.len());
-            drop(bootstrap);
+            bootstrap.shutdown(false);
             anyhow::bail!(
                 "--script requires building daw_gui with `--features script` \
                  (the JS test driver / boa_engine is gated out of default builds to keep them fast)"
@@ -190,7 +191,8 @@ fn main() -> Result<()> {
     }
 
     // `_singleton` は run_gui (= event loop) が返るまで保持し、 mutex を握り続ける。
-    run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text, singleton_primary)
+    let code = run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text, singleton_primary)?;
+    Ok(std::process::ExitCode::from(code))
 }
 
 fn run_gui(
@@ -198,14 +200,14 @@ fn run_gui(
     smoke_test_fixture: Option<PathBuf>,
     #[cfg_attr(not(windows), allow(unused_variables))] smoke_test_text: bool,
     singleton_primary: bool,
-) -> Result<()> {
+) -> Result<u8> {
     tracing::info!("opening main window");
 
     // GUI mode で必要な channel/handle を `Bootstrap` から取り出す。
     // private keep-alive (子プロセス / Win32 Handle / shmem) は `bootstrap`
     // 自身が握ったまま、 この関数 stack で `run_runner` 終了まで生かす。
-    // Bootstrap drop で `JobHandle` も drop され、 Job Object 経由で
-    // 子プロセスが kill される — 正しい shutdown 順序。
+    // r.md #61: 解体は `Bootstrap::shutdown()` (明示順序)。event loop を抜けた
+    // 時点で子プロセスは既に自力 exit 済み (終了シーケンスが待ち合わせている)。
     let audio_tx = bootstrap.audio_tx.clone();
     let plugin_tx = bootstrap.plugin_tx.clone();
     let incoming_rx = bootstrap
@@ -324,12 +326,21 @@ fn run_gui(
         }),
     };
 
-    if let Err(e) = run_runner(init) {
-        tracing::error!(error = ?e, "event loop error");
-    }
-    drop(bootstrap);
-    tracing::info!("daw_gui exiting");
-    Ok(())
+    let outcome = match run_runner(init) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // シーケンスを通っていないので `drained: false` — `Bootstrap::shutdown`
+            // 側で子に graceful exit の猶予を与えてもらう。
+            tracing::error!(error = ?e, "event loop error");
+            daw_gui::view::runner::RunnerOutcome {
+                exit_code: 1,
+                drained: false,
+            }
+        }
+    };
+    bootstrap.shutdown(outcome.drained);
+    tracing::info!(exit_code = outcome.exit_code, "daw_gui exiting");
+    Ok(outcome.exit_code)
 }
 
 // ----- 背景スレッド (GUI mode 専用) -----------------------------------------

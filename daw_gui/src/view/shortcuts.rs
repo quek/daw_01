@@ -103,6 +103,14 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "save", keys: &["Ctrl+S"], category: ShortcutCategory::File, description: "保存", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
     ShortcutDef { name: "save_as", keys: &["Ctrl+Shift+S"], category: ShortcutCategory::File, description: "名前を付けて保存", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.export_wav", keys: &["Ctrl+E"], category: ShortcutCategory::File, description: "WAV 書き出し", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // r.md #61: 終了。3 つの bool はいずれも **立てない**:
+    // - `forward_from_external_window`: プラグインエディタにフォーカスがある状態の
+    //   Ctrl+Q はそのプラグイン自身の binding である可能性が高く、DAW ごと終了する
+    //   のは驚きが大きすぎる (Ctrl+S = 保存とは破壊性が違う)。
+    // - `typing_only`: Ctrl+Q はテキスト編集の意味を持たないので、入力欄に focus が
+    //   あるときだけ text_input へ譲る理由が無い。
+    // - `repeatable`: 終了は離散コマンド。押しっぱなしで連発する意味が無い。
+    ShortcutDef { name: "quit", keys: &["Ctrl+Q"], category: ShortcutCategory::File, description: "終了", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // ----- 編集 -----
     ShortcutDef { name: "undo", keys: &["Ctrl+Z"], category: ShortcutCategory::Edit, description: "元に戻す", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "redo", keys: &["Ctrl+Shift+Z", "Ctrl+Y"], category: ShortcutCategory::Edit, description: "やり直し", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
@@ -206,6 +214,21 @@ pub fn daw_shortcut_map() -> ShortcutMap {
         }
     }
     m
+}
+
+/// メニュー項目の右端に出すキーバインドヒント (`MenuItemSpec::shortcut_hint`)。
+/// [`SHORTCUTS`] の **主表記** (= `keys` の先頭) を返す。表に無い名前は `None`。
+///
+/// 「どのキーが割り当たっているか」の SSoT は [`SHORTCUTS`] なので、メニュー側に
+/// "Ctrl+Q" のような文字列を焼き込まない (将来キーバインドを設定可能にしたとき、
+/// 表示だけ古いまま残るのを防ぐ)。
+#[must_use]
+pub fn shortcut_hint(name: &str) -> Option<String> {
+    SHORTCUTS
+        .iter()
+        .find(|d| d.name == name)
+        .and_then(|d| d.keys.first())
+        .map(|k| (*k).to_string())
 }
 
 /// r.md #36: `forward_from_external_window` が立った行を

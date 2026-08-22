@@ -407,10 +407,6 @@ pub struct UiEphemeral {
     /// `action` を実行する。 `request_guarded_action` で is_dirty なら立てる。
     /// 旧 `show_close_confirm` (bool, 終了専用) を一般化した。
     pub dirty_guard: Option<DirtyGuardAction>,
-    /// Runner が毎フレーム監視し、 `true` になったら cleanup して
-    /// event loop を抜ける終了フラグ。 not-dirty close / 「保存せず終了」 /
-    /// 保存完了 (sync or async) のいずれかで立つ。
-    pub should_quit: bool,
     /// ガードモーダルで「保存して続行」 を選んだが plugin state 取得待ちで
     /// save が非同期 (`PendingStateRequest::Save`) になっている間
     /// `Some(action)`。 `on_all_states_from_child` で save が完了

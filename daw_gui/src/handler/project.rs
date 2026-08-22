@@ -1351,10 +1351,11 @@ impl AppData {
         }
     }
 
-    /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested`) のエントリ。
-    /// New / Open と一本化したガードの「終了」 ケース。
+    /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested` = ✕ / Alt+F4 /
+    /// システムメニュー / タスクバー) のエントリ。 r.md #61 で終了経路が
+    /// 増えたので、実体は [`AppData::request_quit`] (全経路の合流点)。
     pub fn request_close(&mut self) {
-        self.request_guarded_action(DirtyGuardAction::Quit);
+        self.request_quit(crate::shutdown::QuitRequest::USER);
     }
 
     /// 現在のプロジェクトを破棄する操作 (終了 / New / Open /
@@ -1364,7 +1365,7 @@ impl AppData {
     pub fn request_guarded_action(&mut self, action: DirtyGuardAction) {
         // 既に終了確定 / 保存後アクション待ち / queue drain 待ち / モーダル表示中
         // なら、 連打で多重に処理しない (= 二重操作の無視 / ユーザーの判断待ち)。
-        if self.ui_ephemeral.should_quit
+        if self.shutdown.is_shutting_down()
             || self.ui_ephemeral.guard_after_save.is_some()
             || self.ui_ephemeral.guard_pending_action.is_some()
             || self.ui_ephemeral.dirty_guard.is_some()
@@ -1409,7 +1410,9 @@ impl AppData {
             return;
         }
         match action {
-            DirtyGuardAction::Quit => self.ui_ephemeral.should_quit = true,
+            // r.md #61: 「終了する」で即 exit するのではなく、子プロセスの
+            // graceful teardown を待つシーケンスへ入る。
+            DirtyGuardAction::Quit(req) => self.begin_shutdown(req),
             DirtyGuardAction::New => self.action_new(),
             DirtyGuardAction::Open => self.action_open(),
             DirtyGuardAction::OpenPath(path) => self.action_open_path(path),
@@ -1643,17 +1646,41 @@ impl AppData {
     /// 保留していた破棄系操作 (New/Open) を **実行しない** のは、 保存が成立して
     /// いない状態で project を差し替えると未保存変更を失う / 別 project を破壊する
     /// ため (autosave があるのでデータ自体は失われない)。
+    ///
+    /// (r.md #61) ただし **終了 (`Quit`) だけは意図を捨てずに再評価する**。
+    /// 旧実装は Quit も黙って捨てていたので、「保存して終了」の途中で
+    /// plugin host が死ぬと warn ログ 1 行だけ残して終了意図が消え、
+    /// ユーザーからは「✕ が効かなかった」ようにしか見えなかった。かといって
+    /// そのまま終了させるのも誤り — 保存が成立していないので未保存変更を失う。
+    /// 正しいのは「queue が空になった最新状態でガードをやり直す」ことで、これは
+    /// `on_all_states_from_child` 末尾の正常系とまったく同じ扱い。
     pub(crate) fn abort_state_roundtrip(&mut self) {
         self.ipc.pending_state_queue.clear();
         self.ipc.state_request_sent_at = None;
         // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
-        let had_after_save = self.ui_ephemeral.guard_after_save.take().is_some();
-        let had_pending = self.ui_ephemeral.guard_pending_action.take().is_some();
-        if had_after_save || had_pending {
-            tracing::warn!(
+        let after_save = self.ui_ephemeral.guard_after_save.take();
+        let pending = self.ui_ephemeral.guard_pending_action.take();
+        if after_save.is_none() && pending.is_none() {
+            return;
+        }
+        // 終了意図は片方にしか載らない (両方に載る経路は無い) が、拾い漏らさない
+        // よう両方を見る。
+        let quit = [after_save, pending]
+            .into_iter()
+            .flatten()
+            .find(|a| matches!(a, DirtyGuardAction::Quit(_)));
+        match quit {
+            Some(action) => {
+                tracing::warn!(
+                    "aborted an in-flight plugin-state round-trip while quitting; \
+                     re-asking with the current (unsaved) state"
+                );
+                self.request_guarded_action(action);
+            }
+            None => tracing::warn!(
                 "aborted an in-flight plugin-state round-trip; \
                  dropping the deferred dirty-guard action"
-            );
+            ),
         }
     }
 
