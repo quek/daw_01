@@ -46,11 +46,46 @@ make test        # テストを持つ package のみ実行 (TEST_PKGS、examples
 make clippy      # clippy をエラー扱いで (--workspace、examples のコンパイル検証も兼ねる)
 make check       # cargo check --workspace (型検査のみ、ビルド不要)
 make arch-lint   # アーキテクチャ不変条件の機械検査 (下記「アーキテクチャ不変条件」節)
+make license-check # ライセンス表示の機械検査 (REUSE 準拠 / 依存の GPLv3 互換性)
+make audit       # 依存の脆弱性 / 供給網攻撃の検査 (network 要。下記「依存の脆弱性」節)
 ```
 
 特定 crate/test だけを素早く確認したいときは `cargo check -p <crate>` /
 `cargo test -p <crate> --test <name>` 等のピンポイント指定を使ってよい (これは Makefile の
 scoping と矛盾しない、むしろ更に絞り込む方向)。避けるべきは `--workspace` の無条件多用。
+
+### 依存の脆弱性 / 供給網攻撃 (`make audit`)
+
+**`Cargo.lock` を commit していることが供給網攻撃に対する一次防御**である。lock を追跡して
+いなければ、上流が汚染された瞬間に次のビルドで取り込む。だから `cargo update` は
+「更新したい理由があるとき」だけ意図的に打ち、打ったら必ず `make audit` を通す。
+
+実例 (2026-08-20): crates.io の **arrayref 0.3.10** が汚染された (**RUSTSEC-2026-0260**)。
+typosquat の `proc-macro1` への依存が足され、その build script が **コンパイル中にリモートの
+バイナリを取得して実行**する。同じ攻撃者が 23 分の間に `internment` 0.8.7 と
+`append-only-vec` 0.1.9 も汚染。Rust Security Response Team は作者の端末 / 資格情報の侵害と
+見ている。**daw_01 は無事だった** — lock の arrayref が 0.3.9 のままで、`cargo update` を
+走らせていなかったから。運が良かっただけで検査は無かったので、`make audit` を足した。
+
+```bash
+make audit          # 依存の脆弱性 / yanked / 供給網攻撃の検査 (network 要)
+```
+
+- `scripts/lockfile_guard.py` … **ネットワーク不要・常に走る**。lock が git 追跡下か /
+  `cargo metadata --locked` が通るか (lock と manifest の乖離) / **既知の汚染リリースが
+  完全一致で入っていないか**。範囲 (semver) 判定を要さないものだけを厳密に見る。
+- `cargo deny --all-features check advisories` … RustSec advisory DB との突き合わせ。
+  **cargo-deny が無ければ `make audit` は明示エラーで落ちる。**「未インストールにつき skip」
+  の緑は作らない — ライセンス検査と違い advisories には自前の代替が無く、semver range を
+  自前実装すると間違えたときに false green になる (守ろうとしているものを壊す)。
+  `cargo install --locked cargo-deny`。
+- 方針は `deny.toml` の `[advisories]`。vulnerability / unsound / yanked は全部エラー、
+  `unmaintained` は `"workspace"` (自分が直接選んだ依存だけ止める)。
+  **`ignore` を足すときは必ず「RUSTSEC-ID: 理由 / 見直し期限」をコメントで書く。**
+  無言の ignore は禁止。
+
+新しい汚染事件を知ったら `scripts/lockfile_guard.py` の `KNOWN_COMPROMISED` に
+`(name, version, 出典)` を 1 行足す (完全一致なので誤判定が無い)。
 
 ### vendored FFmpeg（fresh machine / 手動 worktree で必須）
 
