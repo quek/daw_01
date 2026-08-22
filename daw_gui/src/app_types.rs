@@ -1083,6 +1083,16 @@ pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 
 pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 
+/// arrangement の 1 行 (track 行 / automation lane 行) の最小高さ (px)。
+/// Alt+wheel の縦ズームも `X`/`Z` の自動フィットもここで下げ止まる。
+/// **上限は設けない** — 「全体表示」 は viewport を埋めるのが定義で、 上限があると
+/// 行数が少ないとき下半分が空く (Ardour `Editor::fit_tracks` も下限のみ)。
+pub const MIN_ARRANGE_ROW_H: f32 = 16.0;
+
+/// arrangement の 1 行の最大高さ (px)。 UI 操作 (`SetArrangeTrackRowH`) の暴走ガードで、
+/// 自動フィットは viewport 高さそのものが上限になるので使わない。
+pub const MAX_ARRANGE_ROW_H: f32 = 2000.0;
+
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
@@ -1724,8 +1734,9 @@ pub(crate) fn merge_lipsync_events_by_priority(mut events: Vec<(f64, f64, u32, u
 /// Open Recent を一本化する (= 同じ「破棄する前に確認」 セマンティクス)。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DirtyGuardAction {
-    /// ウィンドウを閉じる (= アプリ終了)。
-    Quit,
+    /// アプリを終了する (✕ / Alt+F4 / File > 終了 / Ctrl+Q / OS のセッション終了)。
+    /// 終了コードは `QuitRequest` から運ばれる (smoke test が判定結果を載せる)。
+    Quit(crate::shutdown::QuitRequest),
     /// 新規プロジェクト (`action_new`)。
     New,
     /// プロジェクトを開く (ファイル選択 dialog、 `action_open`)。

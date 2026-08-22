@@ -149,6 +149,14 @@ pub struct UiEphemeral {
     /// キャンセルする)。 ミラーは 1 frame 遅延だが、 編集モードは L 押下〜Esc 押下まで
     /// 複数フレーム持続するので調停に支障はない。
     pub piano_roll_lyric_editing: bool,
+    /// r.md #67: ピアノロールの note grid の表示範囲 `(拍数, 半音数)`。
+    /// `piano_roll` widget が毎フレーム mirror する session-only 値 (project save に含めない)。
+    ///
+    /// 表示範囲は grid の px サイズ ÷ zoom で決まるので **view しか知らない**。 一方、
+    /// カーソルキーで動かしたノートを画面内に追う処理は handler 側にある
+    /// (`AppData::nudge_selected_notes_*`)。 そのために「今どれだけ見えているか」 だけを
+    /// mirror する。 `None` = ピアノロールがまだ 1 度も描かれていない (追従しない)。
+    pub pianoroll_viewport: Option<(f64, f32)>,
     /// `Some(target)` で Audio Editor (= clip ダブルクリックで開く波形
     /// 編集 view) が開いている。 bottom_panel の Piano Roll タブが
     /// audio_editor view に切り替わる (`docs/plan_audio_clip.md` §3.10
@@ -168,13 +176,6 @@ pub struct UiEphemeral {
     /// `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
     /// 次の Z で選択 or view が食い違えば段階 0 (横) から仕切り直す。 session-only。
     pub(crate) arrange_zoom_anchor: Option<ArrangeZoomAnchor>,
-    /// primary 選択 automation clip のレーンの「実描画 content-Y 上端」
-    /// (= scroll 空間の絶対 y、 `arrange_track_top` をこれにすればレーンが viewport
-    /// 上端に来る)。 arrangement view が毎フレーム widget の実 `automation_lane_rects`
-    /// から算出してここに格納し、 `Z` 縦ズームがレイアウトを複製せず参照する。
-    /// 選択 automation clip 無し / レーンが画面外なら `None`。 session-only。
-    pub arrange_primary_lane_content_top:
-        Option<(common::model::AutomationLaneKey, f32)>,
     /// inspector の param セクション (title 下〜chain 上) の実描画高さ
     /// (px)。 immediate-mode なので「前フレームに測った高さ」を `scroll_area` の
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
@@ -195,8 +196,18 @@ pub struct UiEphemeral {
     /// これが無いと「Piano Roll タブ未表示で clip を選択 → タブを開いても fit
     /// されない、 2 回目以降のみ fit」 という初回 fit 喪失バグになる。
     pub pending_pianoroll_fit: bool,
-    /// 同様に arrangement の lanes 領域サイズ (px)。
-    pub last_arrange_canvas_size: (f32, f32),
+    /// r.md #63: arrangement widget が分割した **`lanes` Rect の実寸** (px)。
+    /// ruler と Arranger (section) 帯を除いた、 track 行が実際に描かれ scissor される領域。
+    /// `last_pianoroll_grid_size` と同じ「レイアウト SSoT が返した実 rect を記録する」 idiom で、
+    /// widget が毎フレーム書き込む。 `0.0` は「未測定」 (auto-fit を skip)。
+    ///
+    /// **式で再導出しないこと**。 以前は widget 側が `area.h - RULER_H` と独立に計算しており、
+    /// Arranger 帯 18px を引き忘れて `X` の全体表示が常に下へはみ出していた。
+    pub last_arrange_lanes_size: (f32, f32),
+    /// r.md #63: arrangement widget がこのフレームに縦へ積んだ行の一覧 (描画順、 culling 前)。
+    /// `X` の全体表示 / `Z` の縦ズームが行数・行高・行の content-Y を引く唯一の根拠
+    /// (= 可視 track / 展開 lane の集合をモデルから再導出しない)。 widget 未描画なら空。
+    pub last_arrange_rows: Vec<crate::widgets::arrangement::ArrangementRow>,
     /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
     pub resource_panel_open: bool,
     /// r.md #48: 設定画面に出すテーマ一覧のキャッシュ (session-only)。
@@ -396,10 +407,6 @@ pub struct UiEphemeral {
     /// `action` を実行する。 `request_guarded_action` で is_dirty なら立てる。
     /// 旧 `show_close_confirm` (bool, 終了専用) を一般化した。
     pub dirty_guard: Option<DirtyGuardAction>,
-    /// Runner が毎フレーム監視し、 `true` になったら cleanup して
-    /// event loop を抜ける終了フラグ。 not-dirty close / 「保存せず終了」 /
-    /// 保存完了 (sync or async) のいずれかで立つ。
-    pub should_quit: bool,
     /// ガードモーダルで「保存して続行」 を選んだが plugin state 取得待ちで
     /// save が非同期 (`PendingStateRequest::Save`) になっている間
     /// `Some(action)`。 `on_all_states_from_child` で save が完了

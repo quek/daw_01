@@ -3,7 +3,7 @@
 //! root.rs から常時呼ばれる。app.ui_ephemeral.is_plugin_picker_open == true のときに
 //! modal を開き、ESC / outside click / Close ボタンで閉じる。
 
-use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
+use daw_ui_core::{Edit, ListViewStyle, ModalStyle, TextInputStyle, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;
 
@@ -88,6 +88,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 "pp_search",
                 search_rect,
                 &app.ui_ephemeral.plugin_picker_query,
+                &TextInputStyle::default(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetPluginPickerQuery(new.clone()))

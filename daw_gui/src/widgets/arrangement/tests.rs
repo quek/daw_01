@@ -22,6 +22,7 @@
             id,
             start_beat: start,
             len_beats: len,
+            content_offset_beats: 0.0,
             name: Arc::from(name),
             color: None,
             share_group_color: None,
@@ -30,6 +31,24 @@
             thumbnail: None,
             in_active_group: false,
             muted: false,
+        }
+    }
+
+    /// r.md #68: 「clip 矩形いっぱいに `clip_len` 拍が載る」 写像 (= 既存の fade 幾何
+    /// テストが前提にしていた縮尺)。 本番は `content_map` が `lanes.w / view.len_beats`
+    /// から同じ値を作る。
+    fn test_content_map(clip_rect: Rect, clip_len: f64) -> ContentMap {
+        ContentMap { origin_x: clip_rect.x, px_per_beat: f64::from(clip_rect.w) / clip_len }
+    }
+
+    /// r.md #68: 16:9 の test thumbnail (`start_in_content_beats` だけ可変)。
+    fn test_thumbnail(start_in_content_beats: f64) -> ClipThumbnail {
+        use std::num::NonZeroU32;
+        ClipThumbnail {
+            texture: TextureHandle::from_raw(NonZeroU32::new(7).unwrap()),
+            width: 1920,
+            height: 1080,
+            start_in_content_beats,
         }
     }
 
@@ -64,6 +83,7 @@
             id,
             start_beat: start,
             len_beats: len,
+            content_offset_beats: 0.0,
             name: Arc::from(name),
             color: None,
             share_group_color: None,
@@ -259,6 +279,60 @@
         let tracks = vec![t1];
         let tops = make_tops(&tracks, lanes, view);
         assert_eq!(tops, vec![0.0, 32.0]); // invisible lane = legacy と同じ
+    }
+
+    /// r.md #63: 行レイアウト (`X` の全体表示 / `Z` の縦ズームが唯一の根拠にする) は
+    /// track 行と展開 lane 行を描画順に並べ、 `content_top` は prefix sum。
+    /// lane の可視条件は `visible_track_row_tops` (高さ合計) と同一でなければならない
+    /// — ここがズレると「行数は数えたが実際には描かれない」 で fit が外れる。
+    #[test]
+    fn arrangement_row_layout_lists_track_and_expanded_lane_rows() {
+        let view = test_view();
+        let lane = |id: u32, visible: bool, height_px: u16| ArrangementAutomationLane {
+            id,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible,
+            height_px,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        };
+        // t1: 展開 (可視 lane 60 + 不可視 lane は行にならない)、 t2: 畳んでいるので lane 無し、
+        // t3: per-track 行高 override 48。
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = false;
+        t1.automation_lanes = vec![lane(11, true, 60), lane(12, false, 40)];
+        let mut t2 = track(2, "t2", vec![]);
+        t2.automation_lanes_collapsed = true;
+        t2.automation_lanes = vec![lane(21, true, 70)];
+        let mut t3 = track(3, "t3", vec![]);
+        t3.row_h = Some(48);
+        let tracks = vec![t1, t2, t3];
+
+        let rows = arrangement_row_layout(&tracks, view.track_row_h);
+        let expect = |key, content_top: f32, height: f32| ArrangementRow { key, content_top, height };
+        assert_eq!(
+            rows,
+            vec![
+                expect(ArrangementRowKey::Track(1), 0.0, 32.0),
+                expect(
+                    ArrangementRowKey::Lane(common::model::AutomationLaneKey { track: 1, lane: 11 }),
+                    32.0,
+                    60.0,
+                ),
+                expect(ArrangementRowKey::Track(2), 92.0, 32.0),
+                expect(ArrangementRowKey::Track(3), 124.0, 48.0),
+            ],
+        );
+
+        // 行の高さ合計 == track 単位の prefix sum (= 描画 / hit-test が使う tops) と一致する。
+        let tops = make_tops(&tracks, test_lanes(), view);
+        assert_eq!(
+            rows.last().map(|r| r.content_top + r.height),
+            tops.last().copied(),
+        );
     }
 
     #[test]
@@ -465,45 +539,141 @@
         assert_eq!(TrackKind::default(), TrackKind::Audio);
     }
 
+    // ============================================================
+    // r.md #68: 中身の時間写像 (ContentMap) — クリップ幅を分母に入れない
+    // ============================================================
+
+    /// **これが #68 の本体**。 clip の長さを変えても、 中身の同じ拍は画面の同じ x に
+    /// 落ちる。 旧実装は `clip_rect.w / clip_len_beats` を縮尺にしていたので、 ドラッグ
+    /// ゴーストが `len_new / len_old` 倍の time-stretch した絵を描いていた。
     #[test]
-    fn aspect_fit_rect_letterbox_for_wide_texture() {
-        // 100x100 rect に 16:9 (= 1920x1080) texture → fit_w=100, fit_h=100*(9/16)=56.25
-        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 100.0), 1920, 1080);
-        assert!((fit.w - 100.0).abs() < 1e-3);
-        assert!((fit.h - 56.25).abs() < 1e-3);
-        // 中央 letterbox: 上下に (100-56.25)/2 = 21.875 px の黒帯
-        assert!((fit.x - 0.0).abs() < 1e-3);
-        assert!((fit.y - 21.875).abs() < 1e-3);
+    fn content_map_is_independent_of_clip_length() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let short = clip(1, 8.0, 4.0, "c");
+        let long = ClipView { len_beats: 32.0, ..clip(1, 8.0, 4.0, "c") };
+        assert_eq!(
+            content_map(&short, view, lanes),
+            content_map(&long, view, lanes),
+            "clip 長は中身の縮尺にも原点にも影響してはいけない"
+        );
     }
 
+    /// 左端トリム = `start_beat` と `content_offset_beats` が同量動く (`resize_clip`)。
+    /// このとき content 原点は不動なので、 中身は掴んだ端に付いてこない
+    /// (旧実装は原点が窓の左端だったので波形が端に張り付いて滑っていた)。
     #[test]
-    fn aspect_fit_rect_letterbox_for_tall_texture() {
-        // 100x100 rect に 9:16 (= 1080x1920) texture → fit_w=100*(9/16)=56.25, fit_h=100
-        let fit = aspect_fit_rect(Rect::new(10.0, 20.0, 100.0, 100.0), 1080, 1920);
-        assert!((fit.w - 56.25).abs() < 1e-3);
-        assert!((fit.h - 100.0).abs() < 1e-3);
-        // 左右に letterbox: x = 10 + (100-56.25)/2 = 31.875
-        assert!((fit.x - 31.875).abs() < 1e-3);
-        assert!((fit.y - 20.0).abs() < 1e-3);
+    fn content_map_origin_is_invariant_under_left_trim() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let before = clip(1, 8.0, 4.0, "c");
+        let after = ClipView {
+            start_beat: 9.5,
+            len_beats: 2.5,
+            content_offset_beats: 1.5,
+            ..clip(1, 8.0, 4.0, "c")
+        };
+        assert_eq!(content_map(&before, view, lanes), content_map(&after, view, lanes));
     }
 
+    /// 中身の縮尺は `clip_to_rect` と同じ `beat_to_px`。 これが揃っていないと
+    /// 波形 / ノートがルーラーのグリッドに載らない (旧実装は 2px ずれていた)。
     #[test]
-    fn aspect_fit_rect_same_aspect_no_letterbox() {
-        // 100x50 rect に 2:1 (= 1920x960) texture → fit 全面で letterbox なし
-        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 50.0), 1920, 960);
-        assert!((fit.w - 100.0).abs() < 1e-3);
-        assert!((fit.h - 50.0).abs() < 1e-3);
-        assert!(fit.x.abs() < 1e-3);
-        assert!(fit.y.abs() < 1e-3);
+    fn content_map_scale_matches_clip_rect_scale() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let c = clip(1, 0.0, 4.0, "c");
+        let map = content_map(&c, view, lanes);
+        let r = clip_to_rect(0.0, view.track_row_h, &c, view, lanes);
+        assert!((map.x(0.0) - r.x).abs() < 1e-3, "content 拍 0 = clip 左端");
+        assert!((map.w(c.len_beats) - r.w).abs() < 1e-3, "clip 長ぶんの幅 = clip 矩形の幅");
     }
 
+    /// r.md #68: タイル 1 枚は **行高から native aspect で決まる固定サイズ**。
+    /// clip 矩形の幅には一切依存しない (= 端 drag しても大きさが変わらない)。
     #[test]
-    fn aspect_fit_rect_zero_texture_clamped_to_one() {
-        // tex_w = tex_h = 0 で panic / div-by-zero しない (1:1 aspect で正方形 fit)
-        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 200.0), 0, 0);
-        // 1:1 aspect で rect の短辺 (= 100) に合わせる → fit_w=fit_h=100、 縦に letterbox
-        assert!((fit.w - 100.0).abs() < 1e-3);
-        assert!((fit.h - 100.0).abs() < 1e-3);
+    fn thumbnail_tile_size_follows_row_height_only() {
+        // 16:9 (1920x1080)、 行高 40px → 1 枚 = 40 * 16/9 = 71.111... px
+        let map = ContentMap { origin_x: 100.0, px_per_beat: 40.0 };
+        let narrow =
+            thumbnail_tiling(Rect::new(100.0, 10.0, 20.0, 40.0), 100.0, 120.0, map, test_thumbnail(0.0))
+                .expect("visible");
+        let wide =
+            thumbnail_tiling(Rect::new(100.0, 10.0, 600.0, 40.0), 100.0, 700.0, map, test_thumbnail(0.0))
+                .expect("visible");
+        assert!((narrow.tile_w - wide.tile_w).abs() < 1e-4, "clip 幅で大きさが変わってはいけない");
+        assert!((narrow.tile_h - wide.tile_h).abs() < 1e-4);
+        assert!((narrow.tile_w - 40.0 * 16.0 / 9.0).abs() < 1e-3, "got {}", narrow.tile_w);
+    }
+
+    /// r.md #68 の核心: 敷き詰めの **位相は content 原点**。 左端をトリムしても
+    /// (= `start_beat` と `content_offset_beats` が同量動く) タイルの絶対位置は 1px も
+    /// 動かない。 「クリップ左端から px 単位で繰り返す」 実装だとここが滑る。
+    #[test]
+    fn thumbnail_tiles_keep_phase_when_clip_is_trimmed() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let before = ClipView { thumbnail: Some(test_thumbnail(0.0)), ..clip(1, 2.0, 8.0, "v") };
+        // 左端を 1 拍ぶんトリム (start 3.0 / offset 1.0)。 content 原点は 2.0 のまま。
+        let after = ClipView {
+            start_beat: 3.0,
+            len_beats: 7.0,
+            content_offset_beats: 1.0,
+            ..before.clone()
+        };
+        let tiling = |c: &ClipView| {
+            let r = clip_to_rect(0.0, view.track_row_h, c, view, lanes);
+            let vis = r.intersect(lanes);
+            thumbnail_tiling(r, vis.x, vis.x + vis.w, content_map(c, view, lanes), c.thumbnail.unwrap())
+                .expect("visible")
+        };
+        let (a, b) = (tiling(&before), tiling(&after));
+        assert!((a.tile_w - b.tile_w).abs() < 1e-4, "1 枚の幅は不変");
+        // 可視域の始まりが変わるので「1 枚目」 の index はずれるが、 位相
+        // (= タイル境界の絶対位置) は保たれる = 差はタイル幅の整数倍。
+        let shift = (b.first_x - a.first_x) / a.tile_w;
+        assert!(
+            (shift - shift.round()).abs() < 1e-3,
+            "タイル境界がタイル幅の整数倍でしかずれない: shift={shift}"
+        );
+    }
+
+    /// 敷き詰めは可視域を覆う (= 長い clip を横スクロールして先頭が画面外に出ても
+    /// タイルは見え続ける。 旧実装は 1 枚しか置かなかったので消えていた)。
+    #[test]
+    fn thumbnail_tiles_cover_the_visible_range() {
+        let map = ContentMap { origin_x: 0.0, px_per_beat: 40.0 };
+        // 可視域 [500, 900)、 1 枚 = 40 * 16/9 ≈ 71.1px。
+        let t = thumbnail_tiling(Rect::new(0.0, 0.0, 4000.0, 40.0), 500.0, 900.0, map, test_thumbnail(0.0))
+            .expect("visible");
+        assert!(t.first_x <= 500.0 && t.first_x + t.tile_w > 500.0, "1 枚目が可視域左端を跨ぐ");
+        let covered = t.first_x + t.tile_w * f32::from(u16::try_from(t.count).unwrap());
+        assert!(covered >= 900.0, "可視域右端まで届く: covered={covered}");
+        assert!(!t.truncated);
+    }
+
+    /// texture サイズ 0 で div-by-zero / panic しない (1:1 aspect に degrade)。
+    #[test]
+    fn thumbnail_tiling_zero_texture_clamped_to_one() {
+        let map = ContentMap { origin_x: 0.0, px_per_beat: 40.0 };
+        let thumb = ClipThumbnail { width: 0, height: 0, ..test_thumbnail(0.0) };
+        let t = thumbnail_tiling(Rect::new(0.0, 0.0, 100.0, 30.0), 0.0, 100.0, map, thumb)
+            .expect("visible");
+        assert!((t.tile_w - 30.0).abs() < 1e-3);
+        assert!((t.tile_h - 30.0).abs() < 1e-3);
+    }
+
+    /// 極端に縦長のソース × 高ズームでもタイル数は上限で頭打ち (= 無限に quad を
+    /// 積まない)。 打ち切ったことは `truncated` で表に出す。
+    #[test]
+    fn thumbnail_tiling_caps_tile_count() {
+        let map = ContentMap { origin_x: 0.0, px_per_beat: 40.0 };
+        // 1 x 4000 の極端なソース → 1 枚 = 40 * (1/4000) = 0.01px。
+        let thumb = ClipThumbnail { width: 1, height: 4000, ..test_thumbnail(0.0) };
+        let t = thumbnail_tiling(Rect::new(0.0, 0.0, 2000.0, 40.0), 0.0, 2000.0, map, thumb)
+            .expect("visible");
+        assert_eq!(t.count, MAX_THUMBNAIL_TILES);
+        assert!(t.truncated, "上限に当たったことを隠さない");
     }
 
     #[test]
@@ -530,25 +700,11 @@
 
     #[test]
     fn arrangement_clip_thumbnail_field_round_trip() {
-        use std::num::NonZeroU32;
-        let h = TextureHandle::from_raw(NonZeroU32::new(7).unwrap());
-        let c = ClipView {
-            id: 1,
-            start_beat: 0.0,
-            len_beats: 4.0,
-            name: Arc::from("v_clip"),
-            color: None,
-            share_group_color: None,
-            audio_edit: None,
-            fades: Vec::new(),
-            thumbnail: Some((h, 1920, 1080)),
-            in_active_group: false,
-            muted: false,
-        };
-        let (got_h, w, ht) = c.thumbnail.unwrap();
-        assert_eq!(got_h.raw(), 7);
-        assert_eq!(w, 1920);
-        assert_eq!(ht, 1080);
+        let c = ClipView { thumbnail: Some(test_thumbnail(0.0)), ..clip(1, 0.0, 4.0, "v_clip") };
+        let t = c.thumbnail.unwrap();
+        assert_eq!(t.texture.raw(), 7);
+        assert_eq!(t.width, 1920);
+        assert_eq!(t.height, 1080);
     }
 
     #[test]
@@ -1627,7 +1783,7 @@
             anchor_gain_db: audio.gain_db,
             anchor_fade: None,
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 25.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (50.0, 14.0),
             // dy = -20 (上に 20 px) → next_db = 0 + (-(-20) * 0.25) = +5.0
@@ -1654,7 +1810,7 @@
             anchor_gain_db: audio.gain_db,
             anchor_fade: None,
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 25.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (50.0, 14.0),
             last_mouse: (50.0, -186.0),
@@ -1683,7 +1839,7 @@
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 40.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (40.0, 0.0),
@@ -1713,7 +1869,7 @@
                 fade: ev_fade(4.0, 0.0, 0.5, FadeCurve::Linear, FadeCurve::Linear),
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 40.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (160.0, 0.0),
             last_mouse: (120.0, 0.0), // dx = -40
@@ -1745,7 +1901,7 @@
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 40.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (400.0, 0.0),
@@ -1775,7 +1931,7 @@
                 fade: ev_fade(1.0, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 40.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (400.0, 0.0), // +10 beat 相当
@@ -1880,7 +2036,7 @@
             event_index: 0,
             fade: ev_fade(4.0, 1.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
         };
-        let g = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        let g = fade_geometry(r, test_content_map(r, 4.0), &f, FadeEdge::In, &style);
         // r.md #46: fade は clip 名の帯を避けて中身領域 (上インセット 14px) に描く。
         let content_top = r.y + clip_content_inset_top(&style);
         assert!((g.anchor[0] - r.x).abs() < 1e-4, "無音端は event 左端");
@@ -1900,7 +2056,7 @@
             event_index: 0,
             fade: ev_fade(4.0, 0.0, 1.0, FadeCurve::Linear, FadeCurve::Linear),
         };
-        let g = fade_geometry(r, 4.0, &f, FadeEdge::Out, &style);
+        let g = fade_geometry(r, test_content_map(r, 4.0), &f, FadeEdge::Out, &style);
         let content_top = r.y + clip_content_inset_top(&style);
         assert!((g.anchor[0] - (r.x + r.w)).abs() < 1e-4, "無音端は event 右端");
         assert!((g.anchor[1] - (r.y + r.h)).abs() < 1e-4, "無音端は下端");
@@ -1918,9 +2074,9 @@
             fade: ev_fade(4.0, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
         };
         let corner = style.audio_fade_corner_size_px;
-        let g_in = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        let g_in = fade_geometry(r, test_content_map(r, 4.0), &f, FadeEdge::In, &style);
         assert!((g_in.handle_rect.x - r.x).abs() < 1e-4);
-        let g_out = fade_geometry(r, 4.0, &f, FadeEdge::Out, &style);
+        let g_out = fade_geometry(r, test_content_map(r, 4.0), &f, FadeEdge::Out, &style);
         assert!((g_out.handle_rect.x - (r.x + r.w - corner)).abs() < 1e-4);
     }
 
@@ -1941,7 +2097,7 @@
                 fade_out_curve: FadeCurve::Linear,
             },
         };
-        let g = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        let g = fade_geometry(r, test_content_map(r, 4.0), &f, FadeEdge::In, &style);
         assert!((g.event_rect.x - 40.0).abs() < 1e-3, "got {}", g.event_rect.x);
         assert!((g.event_rect.w - 80.0).abs() < 1e-3, "got {}", g.event_rect.w);
         assert!((g.anchor[0] - 40.0).abs() < 1e-3, "無音端は event 左端 (clip 左端ではない)");
@@ -2003,7 +2159,7 @@
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 40.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (0.0, -20.0),
@@ -2032,7 +2188,7 @@
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
-            clip_len_beats_anchor: 4.0,
+            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 40.0 },
             clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (3.0, 4.0), // < threshold 10 px

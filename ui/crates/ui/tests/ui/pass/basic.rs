@@ -6,7 +6,7 @@
 
 use daw_ui_core::{
     ColorPickerStyle, Edit, KnobStyle, ReorderableListEditRequest,
-    ReorderableListStyle, ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
+    ReorderableListStyle, ScrubableNumberFormat, ScrubableNumberStyle, TextInputStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, Rect, Scene};
@@ -103,6 +103,7 @@ fn main() {
                 "title",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 28.0 },
                 &m.title,
+                &TextInputStyle::default(),
                 |new| Edit::mutate(move |m: &mut Model| m.title = new),
             );
             let _ = ui.text_input("title2", &m.title, |new| {
@@ -114,6 +115,7 @@ fn main() {
                 "rename",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 28.0 },
                 &m.title,
+                &TextInputStyle::default(),
                 |new| Edit::mutate(move |m: &mut Model| m.title = new),
             );
             // M9 Phase 43: debug_overlay も non-Clone Model でコンパイルする。

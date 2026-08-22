@@ -50,6 +50,10 @@ pub struct AppData {
     pub ui_ephemeral: UiEphemeral,
     /// r.md #49: アプリの窓がアクティブか (省電力判定の材料)。
     pub activity: ActivityState,
+    /// r.md #61: 終了シーケンス。全終了経路 (✕ / Alt+F4 / File > 終了 /
+    /// Ctrl+Q / smoke test / OS のセッション終了) がここに合流し、子プロセスの
+    /// graceful teardown を有界に待ってから `event_loop.exit()` する。
+    pub shutdown: crate::shutdown::ShutdownState,
     /// r.md #54: 範囲ラウドネス解析の進行とレポート (session-only)。
     pub loudness: LoudnessState,
     /// r.md #50: テレメトリスレッドの `MasterAnalyzer` へ渡す設定とリセット要求。

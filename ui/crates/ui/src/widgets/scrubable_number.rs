@@ -28,6 +28,7 @@ use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::theme::Palette;
 use crate::ui::{Ui, hovered};
+use crate::widgets::text_input::TextInputStyle;
 
 /// ダブルクリック判定の時間しきい値 (ms)。 knob/fader と統一。
 const DOUBLE_CLICK_MS: u128 = 300;
@@ -109,6 +110,10 @@ pub struct ScrubableNumberStyle {
     pub radius: f32,
     /// 数値テキストの font size (px)。
     pub font_size: f32,
+    /// 欄左端から数値テキストまでの内側余白 (px)。 **表示と、 click で入る text input
+    /// モードの両方がこれを使う** ので、 編集に入っても文字が横にずれない。 狭い欄
+    /// (mixer strip の pan 等) では詰め、 広い欄では広げる。
+    pub pad_x: f32,
     /// scrub sensitivity: **`units_per_pixel`** (daw_01 #035 Q1 = (B) 確定)。
     /// 例: BPM 入力で `sensitivity = 0.5` なら `1 px drag = 0.5 BPM 変化`。 Ctrl 押下時は
     /// この値 × `FINE_DRAG_SCALE` (= 0.1) で 10 倍精細に。 `range` の有無に依存しない absolute scale。
@@ -136,6 +141,7 @@ impl ScrubableNumberStyle {
             border_width: 1.0,
             radius: 3.0,
             font_size: 14.0,
+            pad_x: 4.0,
             sensitivity: 0.5,
             range: None,
         }
@@ -660,10 +666,16 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             let value_str = format_value(value, format);
             // inner text_input の id は outer id を hash 化した seed で unique 化 (= `Clone` 要求回避)。
             let inner_id = ("scrubable_number_inner", id_seed);
+            // 編集モードのタイポグラフィは **表示と同一** にする (`style` の font_size /
+            // pad_x)。 旧実装は text_input が font 14 / pad 8 固定だったため、
+            // click した瞬間に文字サイズと位置が跳ね、 狭い欄では入力が欄からはみ出していた。
+            let inner_style =
+                TextInputStyle { font_size: style.font_size, pad_x: style.pad_x };
             let inner_resp = self.text_input_at_focused(
                 inner_id,
                 rect,
                 &value_str,
+                &inner_style,
                 |_new: String| -> Edit<M> {
                     // typing per-frame では Edit 発火しない (= commit でまとめて発火する設計)。
                     Edit::mutate(|_: &mut M| {})
@@ -723,6 +735,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 dragging_now,
                 hovered(rect, pointer),
                 style.font_size.to_bits(),
+                style.pad_x.to_bits(),
                 // **描画する文字列そのもの** を fold する。 値だけを hash すると (a) 同 id で
                 // `format` を差し替えたとき cache HIT で旧表記が残り (同値でも `Decimal(2)` の
                 // "-0.50" と `SignedLabeled` の "L50" は別物)、 (b) placeholder ⇔ 数値の切替も
@@ -781,13 +794,13 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
         clip_rect: None,
     });
 
-    // 数値テキスト (rect 中央寄せ、 horizontal は left-padded 4px)。
+    // 数値テキスト (rect 中央寄せ、 horizontal は left-padded `style.pad_x`)。
     // 文字色は **実際に塗った背景の輝度** から auto-contrast で決める (r.md #48)。
     // drag 中は背景が `bg_color_dragging` に変わり、その色は caller 任意 (daw_gui は
     // `scrub_drag_bg` / `scrub_drag_bg_warm`) なので、`text_color` 固定だとテーマや
     // caller 次第で数値が読めなくなる。通常時 (= `bg_color` 塗り) はテーマの本文色をそのまま
     // 使い、ダークの見た目を変えない。
-    let pad_x = 4.0;
+    let pad_x = style.pad_x;
     let line_h = style.font_size * 1.2;
     let tx = rect.x + pad_x;
     let ty = rect.y + (rect.h - line_h) * 0.5;
@@ -1364,6 +1377,76 @@ mod tests {
         assert!(
             t.iter().any(|s| s.contains("120.0")),
             "編集開始で base value 120.0 から seed (got {t:?})"
+        );
+    }
+
+    /// r.md #62: **編集モードのタイポグラフィが表示と一致する**。 内側 `text_input` は
+    /// font 14 / pad 8 固定だったため、 `style.font_size` を下げた欄 (inspector の 11px、
+    /// mixer strip の 10px) は click した瞬間に文字サイズと開始 x が跳ね、 狭い欄では
+    /// 入力が欄からはみ出していた。 表示 frame と編集 frame の GlyphArea を突き合わせる。
+    #[test]
+    fn edit_mode_uses_style_font_and_padding() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle {
+            font_size: 10.0,
+            pad_x: 4.0,
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
+        };
+        let center = (40.0_f32, 14.0_f32);
+
+        // (1) idle 表示。
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, PointerFrame::default(), None, &mut scene,
+        );
+        let idle = scene
+            .iter_glyphs()
+            .find(|g| g.text.as_ref() == "120.0")
+            .expect("idle 表示の数値 glyph")
+            .clone();
+
+        // (2) 短 click (press → 4px 未満で release) で編集モードへ。
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+            &mut Scene::new(),
+        );
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, release_at(center), None, &mut scene,
+        );
+        let editing = scene
+            .iter_glyphs()
+            .find(|g| g.text.as_ref() == "120.0")
+            .expect("編集モードの数値 glyph")
+            .clone();
+
+        assert!(
+            (idle.font_size - style.font_size).abs() < 1e-6,
+            "表示は style.font_size ({}) で描く (got {})",
+            style.font_size,
+            idle.font_size
+        );
+        assert!(
+            (editing.font_size - style.font_size).abs() < 1e-6,
+            "編集モードも style.font_size ({}) で描く (got {})",
+            style.font_size,
+            editing.font_size
+        );
+        assert!(
+            (editing.left - idle.left).abs() < 1e-6,
+            "編集モードで文字の開始 x が動かない (idle {} / editing {})",
+            idle.left,
+            editing.left
+        );
+        assert!(
+            (idle.left - (rect.x + style.pad_x)).abs() < 1e-6,
+            "文字の開始 x は rect.x + style.pad_x (got {})",
+            idle.left
         );
     }
 

@@ -203,8 +203,8 @@ impl AppData {
         // 端に貼り付けず少し余白を残す。
         const MARGIN_BEATS: f32 = 1.0;
         let beat = beat.max(0.0) as f32;
-        let canvas_w = self.ui_ephemeral.last_arrange_canvas_size.0;
-        let visible = canvas_w / self.ui_prefs.arrange_zoom_x.max(1.0); // canvas_w 0 → 0
+        let lanes_w = self.ui_ephemeral.last_arrange_lanes_size.0;
+        let visible = lanes_w / self.ui_prefs.arrange_zoom_x.max(1.0); // lanes_w 0 → 0
         let scroll = if at_start || visible <= 0.0 {
             beat - MARGIN_BEATS
         } else {
