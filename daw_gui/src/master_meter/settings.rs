@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! マスターパネルのメーター設定 (r.md #50)。
 //!
 //! 各メーターを右クリックして出るメニューから変更し、`app_config.json` に

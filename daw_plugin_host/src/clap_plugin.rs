@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! CLAP plugin wrapper.
 //!
 //! Split-half (`docs/plan_arch_refactor.md` §6): [`ClapPlugin`] is the

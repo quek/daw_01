@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! UTF-16 ACP (application character position) ⇔ UTF-8 byte offset の純粋マッピング。
 //!
 //! Windows TSF (`ITextStoreACP`) は文字位置を **UTF-16 code-unit offset** (= ACP) で扱うが、

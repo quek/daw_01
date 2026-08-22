@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Per-control modulation widget glue (docs/plan_modulation_routing_redesign.md §6).
 //!
 //! Bitwig 流「コントロールを音でドラッグ変調」を全 `scrubable_number_at`

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! WidgetId が 64-bit FNV-1a で 1M 件の child 生成で衝突しないことを担保。
 //!
 //! plan.md M4 の "input hash 衝突テスト: ランダムなウィジェット入力 1M 件で衝突 0" 仕様。

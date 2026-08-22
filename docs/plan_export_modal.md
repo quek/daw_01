@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: Video export を「真のモーダル」にする
 
 ## §0 目的

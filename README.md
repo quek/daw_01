@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # daw_01
 
 VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。クリップベースのタイムライン、CLAP / VST 3
@@ -68,12 +63,13 @@ daw_01 は **GNU General Public License version 3 or later (GPL-3.0-or-later)** 
 
 [REUSE Specification 3.3](https://reuse.software/spec-3.3/) に従う。
 
-- 自作ファイルは先頭に 2 行の SPDX ヘッダを持つ
-  (`SPDX-FileCopyrightText` / `SPDX-License-Identifier`)。ファイル単体で他プロジェクトに
-  コピーされてもライセンスの痕跡が消えない、という GNU の
-  [gpl-howto](https://www.gnu.org/licenses/gpl-howto.html) の要求を機械可読な形で満たす。
-- コメントを書けない / 書いてはいけないファイル (第三者の vendored コード、bindgen 出力、
-  JSON、バイナリ) の帰属は [REUSE.toml](REUSE.toml) が宣言する。
+- **著作権表示は [REUSE.toml](REUSE.toml) の一括宣言 1 箇所に集約する。ファイル先頭には
+  書かない。** GPL-3.0 §4 が求めるのは「**各コピー**に適切な著作権表示を掲示する」ことで、
+  この "each copy" はプログラム 1 本ごとであってファイルごとではない。ルートの
+  [LICENSE](LICENSE) / この README / [NOTICE](NOTICE) と REUSE.toml の宣言で満たされる。
+- **第三者コード** (vendored ヘッダ、bindgen 出力) は REUSE.toml の**個別宣言**で
+  別のライセンスとして宣言する。一括宣言は先頭に置き、個別宣言を後ろに置く
+  (REUSE spec は「同じファイルに当たったら**最後にマッチした宣言**を使う」)。
 - 使っているライセンスの全文は [`LICENSES/`](LICENSES) に SPDX 識別子の名前で置く。
 - 第三者コンポーネントの帰属は [NOTICE](NOTICE)、依存クレートの一覧は
   [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (生成物)。
@@ -82,15 +78,17 @@ daw_01 は **GNU General Public License version 3 or later (GPL-3.0-or-later)** 
 だけで**必ず**走るので、「ツールが無いから skip」で表示が壊れることはない。
 
 1. SPDX 式評価器の自己検査 (`scripts/dep_licenses.py --self-test`)
-2. REUSE 適合 (`scripts/reuse_lint.py`)
-3. SPDX ヘッダの取りこぼし (`scripts/add_spdx_headers.py --check`)
-4. 依存クレートが [deny.toml](deny.toml) の許可リストで満たせるか +
+2. REUSE 適合 (`scripts/reuse_lint.py`)。一括宣言が全ファイルを覆っているか、一括宣言が
+   **先頭**にあるか、`vendor/` 配下や「自分以外の著作権表示を持つファイル」が個別宣言で
+   覆われているか — つまり **第三者のコードを GPL と誤表示していないか**を見る
+3. 依存クレートが [deny.toml](deny.toml) の許可リストで満たせるか +
    THIRD-PARTY-NOTICES.md の鮮度 (`scripts/dep_licenses.py --check`)
 
 `reuse` (`pipx install reuse`) と `cargo-deny` (`cargo install --locked cargo-deny`) が
 入っていれば、それらも追加で走る。
 
-新しいファイルを足したら `python scripts/add_spdx_headers.py`、依存を変えたら
+新しいファイルを足しても**何もしなくてよい** (一括宣言が覆う)。第三者のコードを
+持ち込んだときだけ REUSE.toml に個別宣言を足す。依存を変えたら
 `python scripts/dep_licenses.py --write` を実行する。
 
 ## 第三者コンポーネント

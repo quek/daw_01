@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ラウドネスレポート window (r.md #54)。
 //!
 //! 範囲を freewheel で走査して得た EBU R128 の測定値を出す **移動・リサイズ可能な

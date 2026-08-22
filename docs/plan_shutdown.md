@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # 終了シーケンス (r.md #61)
 
 対象: 「Alt-F4 で閉じたときもプラグインのアンロードなど行っていますか。」

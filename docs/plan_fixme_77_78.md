@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # FIXME #77 / #78 実装計画
 
 理想とベストプラクティスを追求する。実装コストは無視して大胆に破壊して作り直す。

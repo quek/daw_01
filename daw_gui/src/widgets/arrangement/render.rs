@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! S4b Phase D: arrangement widget の heavy (cached + overlay) 描画パス。
 //! `arrangement()` の `ui.heavy(...)` closure body を抽出。 大量の per-frame capture を
 //! 明示引数で受ける (immediate-mode の描画状態は 1 フレーム限りの値渡し)。

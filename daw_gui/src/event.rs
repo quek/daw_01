@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `AppEvent` とその周辺 marker enum (app.rs から機械分割)。
 //!
 //! dispatch (`AppData::handle_event`) は app.rs、各 variant の処理本体は

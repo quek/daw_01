@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """REUSE Specification 3.3 の適合検査 (stdlib のみ、cross-platform、外部ツール不要)。
 
 なぜ自前で書くのか
@@ -30,6 +26,20 @@ SPDX ライセンス一覧の取得を要しないものすべて):
 
   https://reuse.software/spec-3.3/
   https://github.com/fsfe/reuse-tool  (src/reuse/report.py の is_compliant)
+
+per-file ヘッダ廃止に伴う追加検査 (2026-08-22)
+----------------------------------------------
+著作権表示は `REUSE.toml` の一括宣言 (`path = "**"`) 1 箇所に集約し、ファイル先頭の
+SPDX ヘッダは全部撤去した。これで「新規ファイルにヘッダを入れ忘れる」経路は消えたが、
+代わりに **一括宣言が第三者のファイルまで巻き込んで GPL と誤表示する**という別の穴が開く。
+ヘッダ投入スクリプトを消して検査が緩くならないよう、その穴を塞ぐ検査を足してある:
+
+  10. blanket_declaration     … `path = "**"` の一括宣言が存在し、かつ **先頭**にあるか
+                                (spec は「最後にマッチした table を使う」ので、一括宣言が
+                                 後ろにあると第三者の個別宣言を上書きしてしまう)
+  11. undeclared_third_party  … 自分以外の著作権表示を持つファイルなのに、個別宣言
+                                (一括宣言以外の [[annotations]]) で覆われていない
+  12. undeclared_vendor_path  … `vendor/` / `third_party/` 配下なのに個別宣言が無い
 
 使い方:  python scripts/reuse_lint.py   (違反あれば exit 1)
 """
@@ -72,8 +82,26 @@ DEPRECATED_IDS = {
 
 SPDX_OPERATORS = {"AND", "OR", "WITH", "and", "or", "with"}
 COPYRIGHT_RE = re.compile(r"SPDX-FileCopyrightText:|Copyright\s|©|\(c\)", re.IGNORECASE)
-# **行頭**のタグだけを拾う。タグを文字列リテラルとして含むソース (本スクリプト自身や
-# add_spdx_headers.py) の regex / f-string を、ライセンス宣言と誤読しないため。
+
+# --- per-file ヘッダ廃止後の不変条件 (REUSE.toml が唯一の帰属宣言) ----------
+BLANKET_GLOB = "**"
+COPYRIGHT_HOLDER = "Tahara Yoshinori"
+COPYRIGHT_HOLDER_LINE = f"Copyright (C) 2026 {COPYRIGHT_HOLDER}"
+PROJECT_LICENSE = "GPL-3.0-or-later"
+VENDOR_DIRS = {"vendor", "third_party", "3rdparty", "external"}
+
+# ファイル先頭に「自分以外の著作権表示」があるかを見るための行パターン。
+# 行頭 (コメント接頭辞は許す) の Copyright 行だけを拾う。散文中の「Copyright」や
+# ライセンス全文の引用を誤検出しないよう、**先頭 40 行**に限る。
+COPYRIGHT_LINE_RE = re.compile(
+    r"^[ \t]*(?://+|#+|/\*+|\*|<!--|;+|--)?[ \t]*"
+    r"(?:SPDX-FileCopyrightText:[ \t]*)?"
+    r"(?:Copyright|\(c\)|©)[ \t]*(?:\(c\)|©)?[ \t]*(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+THIRD_PARTY_SCAN_LINES = 40
+# **行頭**のタグだけを拾う。タグを文字列リテラルとして含むソース (本スクリプト自身)
+# の regex / f-string を、ライセンス宣言と誤読しないため。
 LICENSE_TAG_RE = re.compile(
     r"^\s*(?://+|#+|<!--)?\s*SPDX-License-Identifier:\s*(.+?)\s*(?:-->)?$", re.MULTILINE
 )
@@ -134,9 +162,51 @@ def main() -> int:
         "deprecated_licenses": [],
         "read_errors": [],
         "untracked_covered_files": [],
+        "blanket_declaration": [],
+        "undeclared_third_party": [],
+        "undeclared_vendor_path": [],
     }
 
     annotations = reuse_toml_annotations()
+
+    # --- 10. 一括宣言が存在し、かつ先頭にあること ---------------------------
+    # spec 3.3: "If a Covered File is covered by multiple [[annotations]] tables in the
+    # same REUSE.toml file, then exclusively the last matching table in the file is used."
+    # → 一括宣言が後ろにあると第三者コードの個別宣言を上書きして GPL と誤表示する。
+    blanket_idx = next(
+        (i for i, a in enumerate(annotations) if BLANKET_GLOB in ([a["path"]] if isinstance(a["path"], str) else a["path"])),
+        None,
+    )
+    if blanket_idx is None:
+        problems["blanket_declaration"].append(
+            f'path = "{BLANKET_GLOB}" の一括宣言が REUSE.toml に無い'
+            " (per-file ヘッダを撤去したので、これが唯一の帰属宣言)"
+        )
+    elif blanket_idx != 0:
+        problems["blanket_declaration"].append(
+            f"一括宣言が {blanket_idx} 番目にある。**先頭**でなければ後続の第三者宣言を"
+            "上書きしてしまう (最後にマッチした table が勝つ)"
+        )
+    else:
+        b = annotations[0]
+        if b.get("SPDX-FileCopyrightText") != COPYRIGHT_HOLDER_LINE:
+            problems["blanket_declaration"].append(
+                f"一括宣言の SPDX-FileCopyrightText が想定と違う: {b.get('SPDX-FileCopyrightText')!r}"
+            )
+        if b.get("SPDX-License-Identifier") != PROJECT_LICENSE:
+            problems["blanket_declaration"].append(
+                f"一括宣言の SPDX-License-Identifier が想定と違う: {b.get('SPDX-License-Identifier')!r}"
+            )
+
+    def specific_annotation(posix: str) -> dict | None:
+        """一括宣言**以外**でこのファイルを覆う宣言。第三者コードの判定に使う。"""
+        for i, a in enumerate(reversed(annotations)):
+            if blanket_idx is not None and len(annotations) - 1 - i == blanket_idx:
+                continue
+            if annotation_matches(posix, a):
+                return a
+        return None
+
     referenced: set[str] = set()
 
     for rel in tracked_files():
@@ -144,6 +214,12 @@ def main() -> int:
             continue
         posix = rel.as_posix()
         ann = next((a for a in reversed(annotations) if annotation_matches(posix, a)), None)
+        specific = specific_annotation(posix)
+
+        # --- 12. vendor / third_party 配下は必ず個別宣言で覆う ---------------
+        # 一括宣言に任せると「他人のコードを GPL と誤表示」になる。
+        if specific is None and any(p in VENDOR_DIRS for p in rel.parts[:-1]):
+            problems["undeclared_vendor_path"].append(posix)
 
         # 全体を UTF-8 で読めるかでテキスト / バイナリを判定する (先頭 N バイトだけを
         # 切ると多バイト文字の途中で切れて偽の decode エラーになる)。ヘッダ探索自体は
@@ -170,6 +246,24 @@ def main() -> int:
             problems["files_without_licenses"].append(posix)
         else:
             referenced.update(ids_in_expression(expr))
+
+        # --- 11. 自分以外の著作権表示を持つのに個別宣言が無い -----------------
+        # per-file ヘッダを撤去した以上、「新しく持ち込んだ第三者ファイルが
+        # 一括宣言に飲まれて GPL と誤表示される」のが唯一の現実的な事故経路。
+        # ファイル自身が名乗っている著作権者を見て、自分でなければ個別宣言を要求する。
+        if specific is None:
+            for line in head.splitlines()[:THIRD_PARTY_SCAN_LINES]:
+                m = COPYRIGHT_LINE_RE.match(line)
+                if not m:
+                    continue
+                rest = m.group("rest")
+                if COPYRIGHT_HOLDER in rest:
+                    continue
+                # 年だけの行や「Copyright notice」のような散文は無視する。
+                if not re.search(r"[A-Za-z]{3}", re.sub(r"\b(19|20)\d{2}\b", "", rest)):
+                    continue
+                problems["undeclared_third_party"].append(f"{posix}: {line.strip()[:100]}")
+                break
 
     # LICENSES/ ディレクトリの検査。
     if not LICENSES_DIR.is_dir():
@@ -211,7 +305,7 @@ def main() -> int:
         if len(values) > 40:
             print(f"  ... and {len(values) - 40} more")
     print(f"\nreuse-lint: NOT compliant — {total} issue(s).", file=sys.stderr)
-    print("ヘッダ不足なら: python scripts/add_spdx_headers.py", file=sys.stderr)
+    print("帰属の宣言は REUSE.toml 1 箇所です (per-file ヘッダは置きません)。", file=sys.stderr)
     return 1
 
 

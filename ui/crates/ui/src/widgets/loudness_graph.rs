@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `loudness_graph` / `loudness_histogram` widget — 時系列ラウドネスの表示
 //! (daw_01 r.md #54)。
 //!

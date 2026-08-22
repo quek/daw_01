@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Integration test: plugin_host で `SetSlotPlugin` の load が失敗したとき、
 //! daw_gui が `pending_plugin_loads` を解放し、 queue 中の Play を flush
 //! する流れを検証する。 failure 通知 (= `SlotPluginLoadFailed`) が来ない

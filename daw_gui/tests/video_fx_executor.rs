@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! docs/plan_video_fx.md: GPU 効果実行基盤 ([`daw_gui::video_fx::VideoFxEngine`])
 //! の end-to-end pixel verify。
 //!

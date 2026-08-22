@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `mseg_editor` / `step_grid` のジェスチャを headless で検証する。
 //! `UiHost::frame_to_edits` に `PointerFrame` を流し、発行された `Edit` を model に適用して
 //! 観測する (automation_point_edit.rs と同 pattern)。

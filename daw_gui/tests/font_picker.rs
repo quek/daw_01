@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Integration test: フォントピッカーの絞り込み + デフォルト行 + カーソル
 //! (`docs/plan_font_picker.md`)。
 //!

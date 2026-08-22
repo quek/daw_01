@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Clip 名の共有 + 共有グループの識別/一括選択 仕様
 
 `docs/plan_clip_share_clone.md` で導入した「共有コピー (linked clip)」の続き。

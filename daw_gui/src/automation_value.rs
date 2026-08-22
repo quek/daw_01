@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! automation 値の **人間可読単位** 表示/入力の SSoT。
 //!
 //! オートメーション点の値・レーンのデフォルト値・ドラッグ中の現値表示は

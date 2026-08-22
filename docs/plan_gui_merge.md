@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # gui_01 → daw_01 統合プラン (monorepo 化)
 
 最終更新: 2026-06-14 / 状態: **プラン確定・実行待ち (in-flight worktree 完了が前提)**

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #51: 録音とトランスポートの一本化 — AppData 側 headless 回帰。
 //!
 //! 検証するのは「Rec を押してから止めるまで」の状態遷移と IPC で、

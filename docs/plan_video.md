@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Video 編集機能 計画 (REAPER 流 multi-track + GPU composite + FFmpeg)
 
 ステータス: **設計完了** (2026-05-25)、 着手前。 grilling session

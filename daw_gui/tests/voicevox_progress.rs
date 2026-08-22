@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! VOICEVOX wav 合成 / 口パク生成の進行状態可視化の回帰テスト。
 //!
 //! 検証する `AppData` 状態機械:

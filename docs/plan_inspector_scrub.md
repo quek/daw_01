@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_inspector_scrub — インスペクタの数値入力をドラッグ編集可能にする
 
 FIXME #15。「インスペクタに表示する値入力は BPM のようにマウスドラッグでも値を変えられる

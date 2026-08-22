@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 pub mod app_dirs;
 pub mod audio_bridge;
 pub mod audio_decode;

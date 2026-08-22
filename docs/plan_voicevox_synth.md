@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # VOICEVOX 合成の builtin instrument plugin 化 計画
 
 ステータス: **着手中** (2026-05-08、 PR-V1 完了)。 `plan_audio_followup.md`

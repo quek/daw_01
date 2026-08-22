@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M14 Phase 78 (daw_01 #049): text effect compositor。
 //!
 //! `GlyphArea` の outline / shadow / blur / rotation を組み合わせた最終 RGBA texture を

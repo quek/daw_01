@@ -8,11 +8,6 @@ description: |
 allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(./target/debug/*)
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # GUI デバッグワークフロー (gui_01 / daw-ui ベース)
 
 GUI のイベント（キー入力・ボタンクリック・ショートカット）が動作不明なときに、

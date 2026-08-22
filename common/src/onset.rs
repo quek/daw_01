@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Onset (transient) detection for `StretchMode::Slice` (r.md #8 B1).
 //!
 //! [`AudioEvent::onsets`](crate::model::AudioEvent::onsets) holds the source

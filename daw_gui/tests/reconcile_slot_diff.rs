@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `compute_slot_reconcile_actions` の device-level diff を unit test で
 //! 固定する。
 //!

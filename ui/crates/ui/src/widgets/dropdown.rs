@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `dropdown` widget — combobox 風の値選択 UI (M7 Phase 25)。
 //!
 //! `popup_layer` + `menu::draw_items_popup` を再利用。クリックで items を popup 表示、

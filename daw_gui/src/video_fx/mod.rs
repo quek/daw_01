@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! GPU 映像効果 実行基盤 (docs/plan_video_fx.md §1, §8)。
 //!
 //! [`common::video_fx`] の宣言的カタログ ([`VideoFxDef`]) を受け取り、トラックの

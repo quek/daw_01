@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! S4b Phase D: arrangement widget の本体 (`arrangement()` fn — press/drag/release state
 //! machine + heavy 描画 dispatch)。 helper・型は `use super::*` で親から継承する。
 

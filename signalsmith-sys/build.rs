@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Build script for `signalsmith-sys`.
 //!
 //! Compiles the C ABI shim (`shim/stretch_shim.cpp`) against the vendored

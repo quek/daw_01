@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! arrangement widget の入力ビュー構築 (S4b: 旧 `arrangement_view.rs` の mirror
 //! 構築 + label / lane 派生を widget 内へ移設)。
 //!

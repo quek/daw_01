@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! recent-files 永続化先が `AppData` に注入された [`AppDirs`] から解決される
 //! ことの回帰テスト。
 //!

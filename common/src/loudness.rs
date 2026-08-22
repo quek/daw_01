@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ITU-R BS.1770-5 / EBU Tech 3341 / Tech 3342 準拠のラウドネス測定。
 //!
 //! **測定器はプロセスをまたいで 1 つ** (r.md #54)。daw_gui のライブメーター

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ウィジェット ID — 親パスのハッシュと組み合わせて一意性を担保する。
 //!
 //! ユーザの Model 型に `Hash` を要求しないため、ID 生成は ID として渡された値の

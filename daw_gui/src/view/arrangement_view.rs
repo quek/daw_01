@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Arrangement view (track headers / ruler / lanes / clip drag) を gui_01 の
 //! `Ui::arrangement` widget 1 呼び出しに集約。
 //!

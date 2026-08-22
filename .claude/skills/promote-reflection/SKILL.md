@@ -10,11 +10,6 @@ description: |
 allowed-tools: Read, Write, Edit, Glob, Grep
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # AHE reflection 昇格ワークフロー
 
 session metrics から検出された再発パターン (backlog の 1 行) を、**実際にハーネスを変える

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! PDC integration test: 実 VST3 plugin (MeldaProduction MCenter) を
 //! load して、 track 間の位相揃いを WAV 出力で確認する。
 //!

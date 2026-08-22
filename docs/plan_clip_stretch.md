@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # クリップ ストレッチ / 再生範囲 整理 (FIXME #61)
 
 ステータス: **実装完了・実機検証待ち**（2026-06-15）。worktree `clip-stretch`。

@@ -11,11 +11,6 @@ argument-hint: "[重点サブシステム (省略可: 全体)]"
 allowed-tools: Read, Grep, Glob, Bash(bash scripts/arch_lint.sh*), Bash(git log *), Bash(git diff *), Bash(find *), Bash(wc *), Agent
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # アーキテクチャ監査 (daw_01)
 
 対象: $ARGUMENTS (未指定なら全体)。**分析のみ、編集禁止。**

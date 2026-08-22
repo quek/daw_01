@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `DocState` — TSF text store の **キャッシュ snapshot + 編集キュー** (COM 非依存の純粋ロジック)。
 //!
 //! Windows TSF の `ITextStoreACP` は長命 COM オブジェクトで、IME (rtry / MS-IME) が

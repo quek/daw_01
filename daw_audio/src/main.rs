@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // release ではコンソール窓を出さない (windows-subsystem)。 debug は console の
 // まま (standalone 起動時に stdout/tracing が見える)。 docs/plan_icon_and_console.md (#48)。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

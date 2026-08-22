@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! plugin host が crash でなく **hang** した (プロセス・パイプは生存の
 //! まま `state_save` 等で停止) とき、 `RequestAllStates` の応答 (`AllStatesReceived`)
 //! が永久に来ず、 `pending_state_queue` が drain しないため保存 / New / Open /

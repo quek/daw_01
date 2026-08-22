@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Font picker (modal overlay)。Text クリップのフォントを「プラグインピッカーと
 //! 同じように」検索付きモーダルで選ぶ (`docs/plan_font_picker.md`)。
 //!

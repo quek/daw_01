@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `AppData` の event handler 群 (domain 別)。 app.rs の god-file を
 //! docs/plan_arch_refactor.md §7 に沿って分割したもの。 dispatch は
 //! app.rs の `handle_event`、 各 arm の本体がここのメソッド。

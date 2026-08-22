@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! プロジェクト (Song) 非依存の、 アプリ全体の永続化設定 —
 //! `%LOCALAPPDATA%\daw_01\app_config.json`。 現状は resource monitor の常駐
 //! 表示 on/off のみ。 `window_state` と同じ load/save 流儀だが、 設定は常に

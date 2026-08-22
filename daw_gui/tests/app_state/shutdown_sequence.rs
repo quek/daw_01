@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #61: 終了シーケンスの回帰テスト。
 //!
 //! 守りたい不変条件は 4 つ。どれも「実機で ✕ を押す」でしか見えなかったものを

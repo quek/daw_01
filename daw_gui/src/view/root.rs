@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ルート view: 画面全体を Transport / Inspector / Arrangement / BottomPanel /
 //! StatusBar に分割し、各 sub view を呼ぶ。Plugin picker / help は modal overlay。
 //!

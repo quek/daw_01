@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! handler::loudness — 範囲ラウドネス解析の起動・進捗・完了 (r.md #54)。
 //!
 //! 解析は **WAV 書き出しとまったく同じ手順**で走る: 再生停止 → 最新 song を

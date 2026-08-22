@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M14 Phase 63l: caller 側 view 用 rect-based pointer hit-test API。
 //!
 //! `Ui::take_primary_press_in_rect(rect)` と `Ui::take_drag_in_rect(id, rect)` の

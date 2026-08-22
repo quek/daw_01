@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // M14 Phase 78 (daw_01 #049): separable gaussian blur (5-tap linear-sample 最適化)。
 // horizontal pass / vertical pass で texel direction を変える 2 entry。
 // caller (TextEffectCompositor) が同じ shader module を 2 pipeline で使い分ける。

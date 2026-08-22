@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # vendored FFmpeg の固定とミラー
 
 `make fetch-ffmpeg` が取ってくる FFmpeg を **URL 固定 + sha256 検証**にし、上流が消えても

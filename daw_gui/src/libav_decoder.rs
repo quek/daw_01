@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! In-process libav (rsmpeg) software video decoder — the **single** decode
 //! engine for both preview and export (`docs/plan_video_decode_unify.md`).
 //!

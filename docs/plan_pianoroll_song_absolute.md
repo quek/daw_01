@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_pianoroll_song_absolute — piano roll を song-absolute 座標系に統一する
 
 FIXME #3。「MIDI エディタのルーラが 5bar から始まるクリップでも常に 1bar から

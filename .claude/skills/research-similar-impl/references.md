@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # 調査対象プロジェクト
 
 | プロジェクト | 言語 | 特徴 | クローン先 / パス | URL |

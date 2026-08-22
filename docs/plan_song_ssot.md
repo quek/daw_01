@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_song_ssot.md — `Song` を 3 プロセス重複から canonical + cache へ
 
 ## 動機

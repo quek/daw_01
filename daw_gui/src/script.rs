@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! JavaScript scripting host (boa_engine) — production binary を CLI
 //! `daw_gui --script <file.js>` で headless に駆動するためのモジュール。
 //!

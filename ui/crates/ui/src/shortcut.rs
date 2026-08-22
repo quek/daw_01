@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M8 Phase 30: keyboard shortcut。
 //!
 //! `Shortcut::parse("Ctrl+Shift+Z")` で文字列から構築できる。`ShortcutMap` に

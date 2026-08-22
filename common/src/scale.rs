@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Scale & Root: 楽曲のキー (root + scale) を時間軸 event として保持する。
 //! 設計は `docs/plan_scale.html`。 SSoT は `Song.scale_changes` 1 本のタイムラインで、
 //! 「`beat = 0` から最初の event」 → 「次の event でルート変更」 と表現する。

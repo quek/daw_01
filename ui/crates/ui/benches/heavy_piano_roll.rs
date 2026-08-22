@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M5 Phase 14: heavy() + cached(viewport_key) の効果を 100k notes ピアノロールで計測。
 //!
 //! - `cached_viewport_100k`: viewport_key 固定 → 全 cache hit、draw_fn は warm-up 後 0 回実行

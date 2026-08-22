@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 設定 window (r.md #48): アプリ全体の設定。現状はテーマ選択。
 //!
 //! **常駐する移動・リサイズ可能な floating window** として実装する (grill-me 2026-08-15 で確定):

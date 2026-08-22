@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! daw_01-bundled instrument / FX plugins.
 //!
 //! Builtin plugins implement [`crate::plugin_instance::LoadedPlugin`] (+

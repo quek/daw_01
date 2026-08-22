@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! NVENC / libav export smoke (`docs/plan_video_export_libav.md`).
 //!
 //! Phase 1: verify encoder availability.

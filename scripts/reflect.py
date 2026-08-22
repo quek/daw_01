@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """Stop hook: close the AHE loop by AUTO-ESCALATING guards (cross-platform, no PowerShell).
 
 This replaces reflect.ps1. The old script only flagged Edit/Read/Bash *count

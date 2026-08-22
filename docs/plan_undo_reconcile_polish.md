@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Undo/Redo plugin sync polish 計画
 
 ステータス: **着手中** (2026-05-14)。 [`plan.html`](plan.html) §「Undo/Redo plugin

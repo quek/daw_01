@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! VST3 plugin discovery on Windows.
 //!
 //! The VST3 SDK (since 3.6.10) specifies that plugins ship as bundles —

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! マスター出力サンプルの共有メモリリング (r.md #50)。
 //!
 //! `AudioBridge` / `MetricsBridge` と同じ流儀で daw_gui (親) が `create`、

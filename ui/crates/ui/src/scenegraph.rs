@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 内部 scenegraph データ構造 (M4 Phase 10-11)。
 //!
 //! Phase 10: `Scenegraph` / `SceneNode` / `record` / `unchanged` の API を導入。

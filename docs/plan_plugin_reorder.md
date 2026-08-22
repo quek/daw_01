@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: プラグイン D&D 並び替えの音追従（別セッション対応）
 
 FIXME #31 セッション (2026-06-10) の調査メモ。実装は別セッションで行う。

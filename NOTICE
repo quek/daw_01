@@ -19,9 +19,11 @@ THIRD-PARTY COMPONENTS
 
 This file collects the attribution notices for third-party components that are
 vendored into this repository or linked by the built programs.  The complete,
-machine-generated inventory of Rust crate dependencies (398 packages) is in
-THIRD-PARTY-NOTICES.md; per-file licensing is declared by SPDX headers and by
-REUSE.toml, following the REUSE Specification.
+machine-generated inventory of Rust crate dependencies (389 packages) is in
+THIRD-PARTY-NOTICES.md.  Licensing is declared in one place -- REUSE.toml, following
+the REUSE Specification -- rather than repeated in a header on every file: a blanket
+declaration covers this project's own files, and per-path declarations after it carry
+the third-party material to its own terms.
 
 
 ### FFmpeg — GNU Lesser General Public License v3 (dynamically linked)

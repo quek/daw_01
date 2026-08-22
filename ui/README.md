@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # daw-ui
 
 Rust DAW シェル UI 向けの GUI ライブラリ (実装中)。

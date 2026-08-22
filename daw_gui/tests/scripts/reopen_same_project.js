@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // 同じプロジェクトを続けて N 回開いても、毎回すべての device が plugin_host に
 // load できることを検証する headless 回帰スクリプト。
 //

@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
 #
 # vendored FFmpeg (BtbN win64 LGPL shared) を取得する。`make fetch-ffmpeg` の実体。
 #

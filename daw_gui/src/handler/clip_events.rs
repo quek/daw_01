@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! handler::clip_events — clip 内 audio/image/text event の field 編集 + font picker
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

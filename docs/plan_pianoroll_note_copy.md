@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Piano Roll ノート複製 (Ctrl+drag copy / D duplicate)
 
 ピアノロールで選択ノートを複製する 2 経路を実装する。

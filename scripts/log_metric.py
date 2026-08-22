@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """PostToolUse hook: append one jsonl line per tool call (cross-platform, no PowerShell).
 
 Port of the retired log_metric.ps1. stdin = Claude Code JSON

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `TimeMapping` — sample / bar / beat / SMPTE 間の双方向変換 (M7 Phase 27)。
 //!
 //! piano_roll / arrangement / time_ruler が共通で使う時間軸モデル。

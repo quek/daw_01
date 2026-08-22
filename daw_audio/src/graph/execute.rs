@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Schedule 実行 (per-buffer render 経路)。engine.rs から分離
 //! (`docs/plan_arch_refactor.md` §5)。
 //!

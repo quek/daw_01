@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #9 の contract: **保存済みプロジェクトを開いただけでは `*` (未保存マーク) が
 //! 付かない**。
 //!

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // r.md #51: audio engine 側のトランスポート契約を実プロセスで検証する。
 //
 //   cargo run -p daw_gui --features script -- \

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! daw_01 のキーボードショートカット定義 (SSoT)。
 //!
 //! 全ショートカットは [`SHORTCUTS`] テーブル 1 箇所で `(name, keys, category,

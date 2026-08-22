@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """依存クレートのライセンス検査 + THIRD-PARTY-NOTICES.md の生成 (r.md #60)。
 
 なぜ自前で書くのか
@@ -219,11 +215,8 @@ def render(external: list[dict], kinds: dict[str, set[str]], target: str, embed_
         by_license.setdefault(p.get("license") or "(宣言なし)", []).append(p)
 
     out: list[str] = []
-    out.append("<!--")
-    out.append("SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori")
-    out.append("SPDX-License-Identifier: GPL-3.0-or-later")
-    out.append("-->")
-    out.append("")
+    # 著作権 / ライセンス表示はファイルごとに書かない。REUSE.toml の一括宣言が
+    # このファイルも含めて被覆する (r.md #60、per-file ヘッダは 2026-08-22 に撤去)。
     out.append("# Third-party crate notices")
     out.append("")
     out.append("**このファイルは生成物です。手で編集しないでください。**")

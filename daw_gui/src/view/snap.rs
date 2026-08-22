@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Grid snap UI ヘルパ。
 //!
 //! Phase A の暫定実装は M14 Phase 60 で gui_01 (`daw_ui_core::SnapConfig`) に移行した。

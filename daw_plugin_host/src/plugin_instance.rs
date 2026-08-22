@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Format-agnostic plugin interfaces (`docs/plan_arch_refactor.md` §6).
 //!
 //! Split-half design (clack 方式): 1 つのロード済み plugin は 2 つの Rust

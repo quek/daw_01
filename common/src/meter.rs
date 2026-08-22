@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Master-output level meter primitives shared between daw_audio (which
 //! computes the raw per-block peak) and daw_gui (which converts to dB and
 //! runs the visual decay).

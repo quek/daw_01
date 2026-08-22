@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! winit を `WindowBackend` / イベント駆動に橋渡しするバックエンド。
 
 use std::sync::Arc;

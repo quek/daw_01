@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #64 (MIDI エディタの編集ロック) + r.md #67 (カーソルキーでノート編集) の回帰テスト。
 //!
 //! どちらも `AppData::handle_event` (= コマンド層) で完結するので widget を回さずに検証する。

@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: 複数選択クリップのインスペクタ一括編集 (FIXME #46)
 
 ## ゴール

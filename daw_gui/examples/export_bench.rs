@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Time a real video export through the new libav/NVENC backend
 //! (`docs/plan_video_export_libav.md`). Loads a `.daw` project (JSON `Song`),
 //! renders **video only** (no audio WAV) so the measurement isolates the

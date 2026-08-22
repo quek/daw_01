@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # audio clip フォローアップ計画
 
 ステータス: **着手中** (2026-05-08)。 Phase 2 (PR1-9 + #025 wire) で audio

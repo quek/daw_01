@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! examples/sample_edit_ops — M6 Phase 21 動作確認サンプル。
 //!
 //! 波形編集 (trim / linear fade in / linear fade out) の destructive edit サンプル。

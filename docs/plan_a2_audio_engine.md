@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Plan: A2 — daw_audio へ責務移管 + track-parallel スレッドプール化
 
 ## Context

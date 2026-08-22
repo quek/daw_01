@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! glyphon 統合 — テキスト描画パイプライン。
 //!
 //! Buffer は (text, font_size, line_height) の hash キーで `cache` に保持し、

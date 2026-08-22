@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Renoise 風 mixer strip。draw(...) を呼ぶと指定 area 内に N 本のチャンネル
 //! ストリップが横並びで描画される。
 //!

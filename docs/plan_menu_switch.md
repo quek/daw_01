@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: menu bar の top-level menu 切り替え（open 中に別 menu へ hover / click で切り替わる）
 
 ## 主訴（ユーザー報告 2026-06-03）

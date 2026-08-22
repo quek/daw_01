@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M14 Phase 93 (daw_01 #063) + Phase 92 (#064) の GPU pixel verify。
 //!
 //! `OffscreenRenderer::composite_scene_to_texture` で焼いた GPU 常駐 texture を `TexturedQuad`

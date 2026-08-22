@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Shared-memory layout for the audio-engine ↔ plugin-host worker pool
 //! handshake.
 //!

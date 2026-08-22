@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Windows TSF (Text Services Framework) 連携。
 //!
 //! gui_01 の `text_input` を TSF `ITextStoreACP` document store として OS IME に公開し、

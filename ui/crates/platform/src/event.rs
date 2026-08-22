@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 中立イベント型。winit / baseview のどちらでも、外部プラットフォーム層がここに変換する。
 
 use std::path::PathBuf;

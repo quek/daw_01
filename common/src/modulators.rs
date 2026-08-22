@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Generator modulator evaluation (LFO / Random / MSEG / Steps).
 //!
 //! `docs/plan_fixme_56_modulators.md`. これらは envelope follower と違い **audio

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M14 Phase 133 (daw_01 #111): 映像効果フレームワーク用 texture interop primitive の GPU pixel verify。
 //!
 //! daw_01 が映像効果チェーンで使う 2 primitive を、 **実際に自前の effect pipeline を組んで** 合成し

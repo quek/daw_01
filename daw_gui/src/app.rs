@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Bitwig-style DAW GUI state.
 //!
 //! 状態は 3 つに分けて持つ:

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ARA host controller interfaces serviced by `daw_plugin_host`.
 //!
 //! These are the `#[repr(C)]` function-pointer tables the plug-in calls back

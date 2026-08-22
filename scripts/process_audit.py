@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """Flatten the adversarial-audit workflow result and adjudicate every candidate
 against the REAL guard engine (sandboxed). Prints confirmed mismatches only.
 

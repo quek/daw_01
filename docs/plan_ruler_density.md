@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_ruler_density.md
 
 ルーラ (`Ui::time_ruler`) と bar/beat grid (`Ui::bar_beat_grid`) を、

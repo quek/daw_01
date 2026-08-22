@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Piano Roll 鍵盤レーン クリックでピッチプレビュー再生
 
 ピアノロール左の鍵盤レーン (keyboard lane, `KEYBOARD_W` 領域) のキーをクリックすると、

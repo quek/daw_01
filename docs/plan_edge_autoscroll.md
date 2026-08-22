@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # FIXME #89 — ドラッグ端オートスクロール (edge auto-scroll)
 
 普通の DAW のように、トラック / クリップ / リージョン / ノート等をドラッグ中、ポインタが

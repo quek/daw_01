@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #12 / #15 の回帰テスト (clip rename の dirty セマンティクス)。
 //!
 //! - #12: リネーム前後で名前が同じなら **dirty マークを付けない**

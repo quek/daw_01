@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! オシロスコープの波形取り込み (r.md #50)。
 //!
 //! 表示窓 (既定 20ms) のぶんだけリングから切り出し、列ごとの min/max にする。

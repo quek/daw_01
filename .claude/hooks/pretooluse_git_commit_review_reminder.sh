@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 # PreToolUse hook on Bash: remind, around git commit, to
 #   (1) run the /review skill,
 #   (2) do a 同件 (sibling-occurrence) check -- when this is a bug fix, search for

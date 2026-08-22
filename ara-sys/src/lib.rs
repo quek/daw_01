@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `ara-sys` — vendored Rust bindings to the ARA (Audio Random Access) C API.
 //!
 //! These are *pure type definitions*: ARA exposes no linkable symbols, so there

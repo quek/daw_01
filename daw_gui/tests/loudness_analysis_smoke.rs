@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #54: 範囲ラウドネス解析の **プロセス横断** end-to-end smoke test。
 //!
 //! flow:

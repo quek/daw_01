@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #27 / #28 回帰: Transform (立ち絵 group transform) 等の非 vocal 編集が
 //! (a) builtin VOICEVOX の再合成を trigger しないこと (#27)、(b) 1 回の drag が
 //! undo 履歴を 1 step だけ増やすこと (#28) を検証する。

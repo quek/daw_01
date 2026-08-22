@@ -1,10 +1,4 @@
 <?xml version="1.0" encoding="UTF-8"?>
-
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 <!--
   daw_01 application icon (SSoT, vector).
   build.rs rasterizes this at 16/32/48/256 px via resvg into a multi-res .ico

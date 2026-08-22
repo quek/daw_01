@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `modal` ウィジェット — 半透明 overlay + 画面中央 panel + ESC / outside click で
 //! close できる project 内ダイアログ (M9 Phase 45d)。
 //!
