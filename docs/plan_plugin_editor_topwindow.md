@@ -284,8 +284,45 @@ plugin-main の周回で **同じ `plugin_requested_resize` へ合流**させる
 
 ## 5. ジオメトリの永続化
 
-`PluginEvent::SlotGuiGeometry { device_id, geometry }` を open 直後 / `WM_EXITSIZEMOVE` /
-`WM_MOVE` / プラグイン起点 resize 完了 / close 直前に送る (ドラッグ**中**は送らない)。
+`PluginEvent::SlotGuiGeometry { device_id, geometry }` を open 直後 / **rect が変化したとき** /
+close 直前に送る (ドラッグ**中**は poll が回らないので、確定後に 1 回だけ届く)。
+
+### 5.1 rect の変化を漏れなく捕捉する不変条件
+
+`geometry_dirty` を立てるのは **`WM_MOVE` と `WM_SIZE` の 2 箇所だけ**。漏れが無いことは
+ジェスチャを数え上げるのではなく Win32 の構造から出る:
+
+- 窓の rect が変わる唯一の入口は `WM_WINDOWPOSCHANGED` で、その既定処理
+  (`DefWindowProc`) が **位置が変われば `WM_MOVE`、サイズが変われば `WM_SIZE`** を送る。
+- このコンテナ窓は `WM_WINDOWPOSCHANGED` を**自前で処理していない** (トレースだけして
+  `DefWindowProcW` に落とす) ので、その既定処理は必ず走る。
+
+よって「rect が変わった ⟹ `WM_MOVE` か `WM_SIZE` の少なくとも一方が届く」。個別に挙げると:
+
+| 経路 | 通るメッセージ |
+|---|---|
+| キャプションのドラッグ (移動) | `WM_MOVE` |
+| サイズ枠のドラッグ | `WM_SIZE` (+ 上/左辺なら `WM_MOVE`) |
+| 最大化 / 復元 / Aero Snap | `WM_SIZE` (+ 位置が変われば `WM_MOVE`) |
+| 枠の縦最大化 (上下端ダブルクリック) | `WM_SIZE` のみ ← **旧実装が取りこぼしていた形** |
+| プラグイン起点 resize (`resizeView` / `request_resize`) | `SetWindowPos` → `WM_SIZE` |
+| `set_resizable` のスタイル貼り替え後の外形再構築 | `SetWindowPos` → `WM_SIZE` |
+| 最小化からの復元 | `WM_SIZE` + `WM_MOVE` |
+| DPI 変更 (awareness を上げた後の `WM_DPICHANGED`) | `SetWindowPos` → `WM_MOVE` + `WM_SIZE` |
+
+逆に **`WM_EXITSIZEMOVE` では立てない**。ドラッグで動いたなら上の 2 つが既に立てているし、
+動いていないなら送るものが無い。ジェスチャ単位のトリガを足すと「どのジェスチャを拾い忘れたか」を
+数え続けることになる。同じ理由で `plugin_requested_resize` の末尾でも立てない。
+
+意図的に捨てているものが 2 つ:
+- **最小化中** (`(-32000,-32000)` / `0×0`) は `persistable_geometry()` が弾く。
+- `CreateWindowExW` の内側で来る `WM_SIZE` / `WM_MOVE` は `GWLP_USERDATA` 未設定で
+  `shared_of` が `None` を返す (open 時は `open_gui` が明示的に 1 回送り、その際
+  `take_geometry_change()` で dirty を食べて二重送信を避ける)。
+
+**プロセス終了時 (`teardown_device`) では emit しない**。上の 3 点で全ての変化が既に届いて
+おり、終了時の emit は 4 つ目の重複になるうえ、daw_gui は `Shutdown` を送った後 drain に
+入っているので**届く保証が無い** (「たまに効く」経路を足すことになる)。
 daw_gui は `ui_prefs.plugin_editor_windows` に貯め、`ViewState.plugin_editor_windows` として
 プロジェクトに保存する。**`Song` ではなく `ViewState`** = 窓の位置は「見方の都合」なので
 動かしても `*` は付かない (memory `project_dirty_flag_rule`)。key は安定 id

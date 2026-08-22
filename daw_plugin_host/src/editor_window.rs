@@ -553,8 +553,34 @@ impl EditorWindow {
         self.shared.close_requested.replace(false)
     }
 
-    /// 位置 / サイズが確定していれば現在のジオメトリを返して dirty を落とす。
+    /// 位置 / サイズが変化していれば現在のジオメトリを返して dirty を落とす。
     /// plugin-main の pump が毎周回で呼び、変化分だけ daw_gui へ流す。
+    ///
+    /// # ジオメトリ捕捉の不変条件 (r.md #65)
+    ///
+    /// **`geometry_dirty` を立てるのは `WM_MOVE` と `WM_SIZE` の 2 箇所だけ**。
+    /// これで漏れが無いことは、経路を数え上げるのではなく Win32 の構造から出る:
+    ///
+    /// - 窓の rect が変わる唯一の入口は `WM_WINDOWPOSCHANGED` で、その既定処理
+    ///   (`DefWindowProc`) が **位置が変われば `WM_MOVE`、サイズが変われば
+    ///   `WM_SIZE`** を送る。
+    /// - この窓は `WM_WINDOWPOSCHANGED` を**自前で処理していない** (トレースだけして
+    ///   `DefWindowProcW` に落とす) ので、この既定処理は必ず走る。
+    ///
+    /// よって「rect が変わった ⟹ `WM_MOVE` か `WM_SIZE` の少なくとも一方が届く」。
+    /// ユーザーのドラッグ / 最大化 / 復元 / Aero Snap / 枠の縦最大化 (下端
+    /// ダブルクリック) / プラグイン起点 resize (`SetWindowPos`) / スタイル貼り替え後の
+    /// 外形再構築 / DPI 変更 — どれも個別に列挙する必要が無い。
+    ///
+    /// 逆に **`WM_EXITSIZEMOVE` では立てない**: ドラッグで動いたなら上の 2 つが既に
+    /// 立てているし、動いていないなら送るものが無い。ジェスチャ単位のトリガを足すと
+    /// 「どのジェスチャを拾い忘れたか」を数え続けることになる。
+    ///
+    /// 例外は 2 つとも **意図的に捨てている**もの:
+    /// - 最小化中 (`(-32000,-32000)` / `0×0`) は [`Self::persistable_geometry`] が弾く。
+    /// - `CreateWindowExW` の内側で来る `WM_SIZE` / `WM_MOVE` は `GWLP_USERDATA` が
+    ///   未設定なので `shared_of` が `None` を返す (open 時は `open_gui` が明示的に
+    ///   1 回送る)。
     pub fn take_geometry_change(&self) -> Option<EditorWindowGeometry> {
         if !self.shared.geometry_dirty.replace(false) {
             return None;
@@ -820,7 +846,9 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
         sizer.notify_client_size(width, height);
     }
     shared.in_plugin_resize.set(false);
-    shared.geometry_dirty.set(true);
+    // `geometry_dirty` はここで立てない: サイズが実際に変わったなら
+    // `resize_client_area` の `SetWindowPos` が `WM_SIZE` を出して立てているし、
+    // 変わっていないなら送るものが無い (§ジオメトリ捕捉の不変条件)。
     PluginResizeOutcome::Applied
 }
 
@@ -1024,16 +1052,20 @@ unsafe extern "system" fn editor_wnd_proc(
         WM_SIZE => {
             if wparam.0 as u32 != SIZE_MINIMIZED
                 && let Some(shared) = shared_of(hwnd)
-                && let Some(sizer) = shared.sizer()
             {
-                #[allow(clippy::cast_possible_truncation)]
-                let cw = (lparam.0 & 0xFFFF) as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let ch = ((lparam.0 >> 16) & 0xFFFF) as u32;
-                // 縮退サイズ (0x0) をプラグインへ流さない — サイズ依存の描画が
-                // 0 次元で走る。
-                if cw > 0 && ch > 0 && sizer.current_client_size() != Some((cw, ch)) {
-                    sizer.notify_client_size(cw, ch);
+                // **サイズが変わった = 保存対象が変わった** (下の `WM_MOVE` と対で
+                // 「rect の変化」を漏れなく捕捉する。§ジオメトリ捕捉の不変条件)。
+                shared.geometry_dirty.set(true);
+                if let Some(sizer) = shared.sizer() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let cw = (lparam.0 & 0xFFFF) as u32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ch = ((lparam.0 >> 16) & 0xFFFF) as u32;
+                    // 縮退サイズ (0x0) をプラグインへ流さない — サイズ依存の描画が
+                    // 0 次元で走る。
+                    if cw > 0 && ch > 0 && sizer.current_client_size() != Some((cw, ch)) {
+                        sizer.notify_client_size(cw, ch);
+                    }
                 }
             }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
@@ -1047,12 +1079,12 @@ unsafe extern "system" fn editor_wnd_proc(
             unsafe { SetTimer(Some(hwnd), SIZEMOVE_TICK_ID, SIZEMOVE_TICK_MS, None) };
             return LRESULT(0);
         }
+        // ここで `geometry_dirty` は立てない。ドラッグで rect が動いたなら
+        // 既に `WM_MOVE` / `WM_SIZE` が立てているし、動いていないなら送るものが無い
+        // (§ジオメトリ捕捉の不変条件)。
         WM_EXITSIZEMOVE => {
             unsafe {
                 let _ = KillTimer(Some(hwnd), SIZEMOVE_TICK_ID);
-            }
-            if let Some(shared) = shared_of(hwnd) {
-                shared.geometry_dirty.set(true);
             }
             return LRESULT(0);
         }
@@ -1060,8 +1092,7 @@ unsafe extern "system" fn editor_wnd_proc(
             crate::pump_host_during_modal_loop();
             return LRESULT(0);
         }
-        // ドラッグ終了で位置が変わっていれば拾う (`WM_EXITSIZEMOVE` が来ない
-        // プログラム移動もここで捕まえる)。値は pump が `GetWindowRect` で読む。
+        // **位置が変わった = 保存対象が変わった** (上の `WM_SIZE` と対)。
         // 最小化中は位置が `(-32000, -32000)` になるので dirty を立てない
         // (`WM_SIZE` が `SIZE_MINIMIZED` を弾くのと同じ理由)。
         WM_MOVE => {
