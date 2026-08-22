@@ -58,8 +58,8 @@ checkout's slug) -- nothing is hardcoded to one machine. Each rule:
               they are RELATIONS -- target vs session cwd, question count -- that no
               single-field regex can express; the rule row supplies only action/msg.
               See the cwd-aware block in main())
-    file_glob optional fnmatch glob on tool_input.file_path (forward-slash
-              normalized); rule skipped if it does not match
+    file_glob optional fnmatch glob (or list of globs) on tool_input.file_path
+              (forward-slash normalized); rule skipped unless one of them matches
     all       list of regex; ALL must match the field text for the rule to fire
     none      optional list of regex; if ANY matches, the rule is suppressed
               (sanctioned-exception escape hatch, e.g. "git -C" for the cd guard)
@@ -392,8 +392,10 @@ def main():
             continue
 
         glob = rule.get("file_glob")
-        if glob and not fnmatch.fnmatch(file_path_norm, str(glob)):
-            continue
+        if glob:
+            gs = glob if isinstance(glob, list) else [glob]
+            if not any(fnmatch.fnmatch(file_path_norm, str(g)) for g in gs if g):
+                continue
 
         glob_not = rule.get("file_glob_not")
         if glob_not:

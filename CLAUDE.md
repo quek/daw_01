@@ -364,6 +364,16 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 
 2026-07-03 の全体改修 (`docs/plan_arch_refactor.md`) で確立。**`make arch-lint` が機械検査**し、
 `/arch-review` skill が定期監査する。これらに触れる変更は plan_arch_refactor.md を先に読む。
+書く瞬間の強制は `.claude/guards.jsonl` の `arch-*` ルール (plan §11 の 5 件: INFINITE /
+positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToChild 復活)。
+**「何を違反とみなすか」の SSoT は `scripts/arch_lint.sh`**、ガードはその write-time ミラー。
+
+> **arch-lint のパターンにバックスラッシュを使わないこと。** make (MSYS2) 経由だと
+> grep/sed へ渡す引数のバックスラッシュが落ち、`\( \s \b \[` を含むパターンが無言で
+> 別物になる。2026-08-22 に発覚 — 8 チェック中 6 つが無効化され、違反 7 行を抱えたまま
+> 「OK (違反なし)」を出していた。POSIX ブラケット式 (`[(]` `[]]` `[[:space:]]`) と
+> `grep -w` で書く。arch_lint.sh は冒頭に canary を持ち、検査器自身が効いていなければ
+> exit 1 する (違反ゼロの報告を無条件に信じない)。
 
 1. **安定 id addressing**: プロセス境界・イベント・永続参照に positional index を使わない。
    device = `PluginInstance.id` (u64、shmem 名・worker dispatch・plugin host bookkeeping も同じ id)、

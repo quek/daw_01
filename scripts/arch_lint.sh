@@ -15,10 +15,38 @@ strip_comments() { grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'; }
 
 rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 
+# --- 正規表現にバックスラッシュを使わない (2026-08-22 発覚の偽グリーン対策) ---
+# MSYS2 の make は `/usr/bin/bash` を **MSYS2 側の bash** に解決する (実測:
+# make 経由 5.2.37(2) / 素のシェル 5.2.37(1) = Git for Windows 版)。その bash から
+# **別ランタイムの** Git の grep を起動すると argv のバックスラッシュが落ちる。実測:
+#     素のシェル : argv[2]=[HashMap<\(u32,\s*u32\)]
+#     make 経由  : argv[2]=[HashMap<(u32,s*u32)]
+# 結果 `\( \s \b \[` を含むパターンが全部別物になり、8 チェック中 6 つが無言で無効化され、
+# 違反 7 行を抱えたまま「OK (違反なし)」を出していた。**シェル経由でも壊れない表記**
+# (POSIX ブラケット式 `[(]` `[)]` `[[]` `[]]` `[[:space:]]`、単語境界は grep -w) だけを使い、
+# 下の canary で毎回「検査器が実際に効いているか」を確かめる。
+canary_ok=1
+printf 'HashMap<(u32, u32)>\n' | grep -qE 'HashMap<[(]u32,[[:space:]]*u32[)]' || canary_ok=0
+printf 'x #[serde(untagged)]\n' | grep -qE '#[[]serde[(]untagged[)][]]' || canary_ok=0
+printf 'use MainToChild;\n' | grep -qwE '(MainToChild|ChildToMain)' || canary_ok=0
+if [ "$canary_ok" -ne 1 ]; then
+    printf 'arch-lint: [SELF-BROKEN] 検査器の正規表現が効いていません。\n' >&2
+    printf '  この環境の grep に既知のパターンが通りませんでした。違反ゼロの報告は信用できません。\n' >&2
+    printf '  grep=%s / %s\n' "$(command -v grep)" "$(grep --version | head -1)" >&2
+    exit 1
+fi
+# 上の canary はバックスラッシュを使わないので、argv 破壊そのものは検出できない。
+# 「この環境ではバックスラッシュが落ちる」を名指しで検出して、パターンを足す人に見せる。
+if ! printf 'a(b\n' | grep -qE 'a\(b' 2>/dev/null; then
+    printf 'arch-lint: [NOTE] この環境では正規表現のバックスラッシュが argv で落ちます\n'
+    printf '  (MSYS2 make -> MSYS2 bash -> Git の grep のクロスランタイム起動)。\n'
+    printf '  パターンにバックスラッシュを使わないこと。現在の全パターンは対応済みです。\n'
+fi
+
 # 1. RT 境界の無限待ち (plugin_ref.rs poisoning contract / 不変条件 4)。
 #    正当な待ち (worker の idle wake 等、RT deadline を握らないもの) は同一行に
 #    「arch-lint: allow-infinite」コメントを付けて明示する。
-hits=$(grep -rnE 'WaitForSingleObject\([^,]*,\s*INFINITE' \
+hits=$(grep -rnE 'WaitForSingleObject[(][^,]*,[[:space:]]*INFINITE' \
     daw_audio/src common/src/plugin_ref.rs daw_plugin_host/src 2>/dev/null \
     | grep -v 'arch-lint: allow-infinite' | strip_comments || true)
 if [ -n "$hits" ]; then
@@ -28,14 +56,14 @@ fi
 
 # 2. positional pair キー (不変条件 1)。device/slot の bookkeeping は安定
 #    device_id (u64) 一本。 (track,index) tuple キーの map を作らない。
-hits=$(grep -rnE 'HashMap<\(u32,\s*u32\)' $rs_dirs 2>/dev/null | strip_comments || true)
+hits=$(grep -rnE 'HashMap<[(]u32,[[:space:]]*u32[)]' $rs_dirs 2>/dev/null | strip_comments || true)
 if [ -n "$hits" ]; then
     warn POSITIONAL-KEY "positional (u32,u32) キーの map。安定 id (device_id: u64 等) でキーする:"
     printf '%s\n' "$hits"
 fi
 
 # 3. 旧単一 protocol enum の復活 (不変条件 3)。
-hits=$(grep -rnE '\b(MainToChild|ChildToMain)\b' --include='*.rs' \
+hits=$(grep -rnwE '(MainToChild|ChildToMain)' --include='*.rs' \
     common daw_gui daw_audio daw_plugin_host ui 2>/dev/null | strip_comments || true)
 if [ -n "$hits" ]; then
     warn LEGACY-PROTOCOL "MainToChild/ChildToMain の参照が残存。宛先型 (AudioCommand/AudioEvent/PluginCommand/PluginEvent) を使う:"
@@ -48,7 +76,7 @@ fi
 #    anchor し、doc-comment 中の `#[serde(untagged)]` 言及 (移行の経緯説明) を誤カウント
 #    しないよう実属性だけを数える。
 untagged_baseline=0
-untagged_re='^[[:space:]]*#\[serde\(untagged\)\]'
+untagged_re='^[[:space:]]*#[[]serde[(]untagged[)][]]'
 n=$(grep -rnE "$untagged_re" --include='*.rs' common/src 2>/dev/null | wc -l)
 if [ "$n" -gt "$untagged_baseline" ]; then
     warn UNTAGGED "serde(untagged) が baseline($untagged_baseline) を超過 ($n)。新規 untagged enum を作らない:"
@@ -56,7 +84,7 @@ if [ "$n" -gt "$untagged_baseline" ]; then
 fi
 
 # 5. protocol への bulk blob 直載せ (不変条件 2)。
-hits=$(grep -HnE 'Vec<f32>|Arc<\[u8\]>' common/src/protocol.rs 2>/dev/null | strip_comments || true)
+hits=$(grep -HnE 'Vec<f32>|Arc<[[]u8[]]>' common/src/protocol.rs 2>/dev/null | strip_comments || true)
 if [ -n "$hits" ]; then
     warn BLOB-IN-PROTOCOL "protocol.rs に bulk 型。blob は専用 message / WAV materialize で運ぶ:"
     printf '%s\n' "$hits"
@@ -74,7 +102,7 @@ fi
 
 # 7. common の依存縮退 (plan §9): common = model + protocol + wire/shmem + 純関数。
 #    HTTP / GUI / スキャナ系の重量依存を持たない。
-hits=$(grep -nE '^(reqwest|rfd|image|winit|wgpu)\b' common/Cargo.toml 2>/dev/null || true)
+hits=$(grep -nE '^(reqwest|rfd|image|winit|wgpu)[^A-Za-z0-9_-]' common/Cargo.toml 2>/dev/null || true)
 if [ -n "$hits" ]; then
     warn COMMON-DEPS "common に域外依存 (GUI/HTTP へ移設する):"
     printf '%s\n' "$hits"

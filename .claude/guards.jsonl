@@ -73,9 +73,27 @@
 {"id":"plan-location","source":"feedback_plan_location","tool":["Write"],"field":"file_path","all":["(?:[\\\\/]\\.claude[\\\\/]plans[\\\\/]|docs[\\\\/]plan_[^\\\\/]*\\.md$)"],"action":"warn","escalate":false,"msg":"実装計画は docs/plan_<topic>.html に置く。~/.claude/plans (プロジェクト横断のグローバル領域) は使わない。新規 plan は HTML (既存 plan_*.md は歴史的記録としてそのまま)。"}
 
 # ---------------------------------------------------------------- アーキテクチャ不変条件
-# source は CLAUDE.md「アーキテクチャ不変条件」節と docs/plan_arch_refactor.md。
-# escalate:false — ファイル内容の substring マッチなので、RT パス以外の正当な編集にも当たる。
+# 出典は **docs/plan_arch_refactor.md:469** が名指しで列挙している 5 件:
+#   「guards.jsonl 追記 (承認不要の主経路): INFINITE / positional tuple key /
+#     push_undo_snapshot 直呼び / untagged 追加 / MainToChild 復活 の warn ルール」
+# 対応する不変条件は CLAUDE.md「アーキテクチャ不変条件」節 (1 / 3 / 4 / 5) と plan §10。
+#
+# **arch-lint との関係 (二重実装にしない)**: 同じ 5 件のうち 4 件は `make arch-lint`
+# (scripts/arch_lint.sh の check 1/2/3/4) も検査する。役割が違うので両方持つのは plan の
+# 指示どおりだが、**判定が割れないよう「何を違反とみなすか」の SSoT は arch_lint.sh 側**に
+# 置く。ここはその write-time ミラーで、次の 2 点だけを arch-lint に合わせてある:
+#   - パターンの anchor (untagged は実属性のみ / positional key は HashMap<(u32,u32)>)
+#   - **コメント行を違反に数えない** (arch_lint.sh の strip_comments と同じ。撤去の
+#     経緯説明が doc comment に大量に残っており、数えると全部誤検知になる)
+# 表記が違うのは意図的: arch-lint は shell 由来の argv 破壊を避けるためバックスラッシュを
+# 使わない POSIX 表記、こちらは Python re なので通常表記。**意味は同じ**。
+# `push_undo_snapshot` 直呼びだけは arch-lint に無く、このガード固有。
+#
+# escalate:false — 編集テキストの行マッチなので、既存違反の行に触れただけでも当たる。
 # 「止める」ためではなく「不変条件を思い出す」ための nudge。
-{"id":"arch-no-new-untagged","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*common/src/*","all":["\\b(?:track|device|clip|send|plugin|slot|row|note|point)_(?:index|idx)\\b"],"action":"warn","escalate":false,"msg":"不変条件 1: プロセス境界・イベント・永続参照に positional index を使わない。安定 id (PluginInstance.id / Send.id / 要素 id) で addressing すること。『削除や並べ替えで参照を貼り替える補償コード』を書き始めたら設計が誤り。"}
-{"id":"arch-rt-no-infinite-wait","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*daw_audio/src/*","all":["(?:\\.recv\\(\\)|Condvar|\\.join\\(\\)|thread::sleep)"],"action":"warn","escalate":false,"msg":"不変条件 4: RT スレッドは無限待ち・確保・解放をしない。他プロセスの完了待ちは有界 (DISPATCH_TIMEOUT_MS) + quarantine。重い構築は off-thread で作って rtrb ring で swap すること。"}
-{"id":"arch-rt-no-infinite-wait-ph","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*daw_plugin_host/src/*","all":["(?:\\.recv\\(\\)|Condvar|\\.join\\(\\)|thread::sleep)"],"action":"warn","escalate":false,"msg":"不変条件 4 (plugin host 側): process() に至るパスで無限待ちをしない。CLAP の @[main-thread] 呼び出しは plugin-main スレッドで直列化し、待ちは有界にすること。"}
+{"id":"arch-no-new-untagged","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*common/src/*","all":["(?m)^[ \\t]*#\\[serde\\(untagged\\)\\]"],"action":"warn","escalate":false,"msg":"plan §10: 新しい #[serde(untagged)] を作らない (baseline 0)。判別が field 集合の pairwise 非交差に依存し、variant 追加で silent misparse リスクが 2 乗成長する。明示 tag (#[serde(tag = \"type\")]) にして、旧ファイルは project.rs の load 時 JSON 前処理で移行すること。"}
+{"id":"arch-no-positional-tuple-key","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":["*common/src/*","*daw_gui/src/*","*daw_audio/src/*","*daw_plugin_host/src/*","*ui/crates/*"],"all":["(?m)^(?![ \\t]*//).*HashMap<\\(u32,[ \\t]*u32\\)"],"action":"warn","escalate":false,"msg":"不変条件 1: device/slot の bookkeeping に positional な (track, index) tuple キーを使わない。安定 id (PluginInstance.id / Send.id / 要素 id) 一本で addressing すること。『削除や並べ替えで参照を貼り替える補償コード』を書き始めたら設計が誤り。※ サイズ (width, height) のような座標キーは対象外なので、その場合はこの警告を無視してよい。"}
+{"id":"arch-no-direct-undo-snapshot","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":["*daw_gui/src/*","*common/src/*"],"all":["(?m)^(?![ \\t]*//).*\\bpush_undo_snapshot\\b"],"action":"warn","escalate":false,"msg":"不変条件 5: Song 編集の副作用は edit_song() チョークポイント一本。undo snapshot / dirty / epoch / 子プロセス sync 予約はそこが無条件で担う。手動 push_undo_snapshot・is_undoable whitelist・view からの song 直接可変参照を足さないこと (旧 whitelist 102 variants は撤去済)。"}
+{"id":"arch-no-legacy-protocol-enum","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":["*common/src/*","*daw_gui/src/*","*daw_audio/src/*","*daw_plugin_host/src/*","*ui/crates/*"],"all":["(?m)^(?![ \\t]*//).*\\b(?:MainToChild|ChildToMain)\\b"],"action":"warn","escalate":false,"msg":"不変条件 3: 宛先は型で表現する。AudioCommand / AudioEvent / PluginCommand / PluginEvent の 4 分割に戻さない。単一 enum (MainToChild / ChildToMain) を復活させると『相手が無視する variant の no-op arm』が生えて分割が壊れる。"}
+{"id":"arch-rt-no-infinite-wait","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":["*daw_audio/src/*","*common/src/plugin_ref.rs"],"all":["(?m)^(?![ \\t]*//).*WaitForSingleObject\\([^,\\n]*,[ \\t]*INFINITE"],"none":["arch-lint: allow-infinite"],"action":"warn","escalate":false,"msg":"不変条件 4: RT 境界で無限待ちをしない。他プロセスの完了待ちは有界 (DISPATCH_TIMEOUT_MS) + quarantine (common/src/plugin_ref.rs の poisoning contract)。RT deadline を握らない正当な待ち (worker の idle wake 等) なら、同一行に `arch-lint: allow-infinite` コメントを付けて明示すること。"}
+{"id":"arch-rt-no-infinite-wait-ph","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*daw_plugin_host/src/*","all":["(?m)^(?![ \\t]*//).*WaitForSingleObject\\([^,\\n]*,[ \\t]*INFINITE"],"none":["arch-lint: allow-infinite"],"action":"warn","escalate":false,"msg":"不変条件 4 (plugin host 側): process() に至るパスで無限待ちをしない。CLAP の @[main-thread] 呼び出しは plugin-main スレッドで直列化し、待ちは有界にすること。RT deadline を握らない正当な待ちなら同一行に `arch-lint: allow-infinite` を付ける。"}
