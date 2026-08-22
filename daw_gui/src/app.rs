@@ -1264,7 +1264,8 @@ impl AppData {
                         .and_then(|t| t.clips.get(r.clip as usize))
                         .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.duration_beats))
                     {
-                        self.ui_prefs.last_note_duration_beats = dur.max(0.0625);
+                        self.ui_prefs.last_note_duration_beats =
+                            dur.max(common::model::MIN_NOTE_LEN_BEATS);
                     }
                 }
             }

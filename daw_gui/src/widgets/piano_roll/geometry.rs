@@ -65,15 +65,25 @@ pub(crate) fn clamp_shared_pitch_delta(
     delta.max(min_delta).min(max_delta)
 }
 
-/// resize の長さ下限 (拍)。snap 有効なら grid 1 つ (ただし `0.05` 未満にはしない)。
-/// drag overlay / release commit / 集合クランプが **同じ値** を使うための SSoT
+/// ドラッグで決まる note 長の下限 (拍)。snap 有効なら grid 1 つ
+/// (ただし [`MIN_NOTE_LEN`] 未満にはしない)。
+///
+/// r.md #64: drag overlay / release commit / 集合クランプが **同じ値** を使うための SSoT
 /// (別々に書くと overlay と確定値がずれる)。
+/// r.md #68 同件: 下限そのものも **model と共有** する (`MIN_NOTE_LEN` =
+/// `common::model::MIN_NOTE_LEN_BEATS`)。 ここが `0.05` だった頃は、 handler 側
+/// (`AppData::resize_notes` / `resize_note` / `add_note`) が `0.0625` に clamp するため、
+/// snap off (Alt) で 1/16 未満まで縮めるとゴーストより長く確定していた。
+/// `ResizeLeft` では start だけ見えたとおりに確定して長さが伸ばされるので、
+/// **固定していたはずの右端が動く**。 ドラッグ作成 ([`note_create_geometry`]) も同じ値を使う。
 #[must_use]
 pub(super) fn drag_min_len(view: PianoRollView, alt: bool, zoom_x_px_per_beat: f32) -> f64 {
     if view.snap.is_active(alt) {
-        view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+        view.snap
+            .beat_unit(zoom_x_px_per_beat)
+            .map_or(MIN_NOTE_LEN, |u| u.max(MIN_NOTE_LEN))
     } else {
-        0.05
+        MIN_NOTE_LEN
     }
 }
 
@@ -495,18 +505,15 @@ pub(super) fn note_create_geometry(
     beat_per_px: f64,
     zoom_x_px_per_beat: f32,
 ) -> (f64, f64, u8) {
-    let default_len = view.default_note_len_beats.max(0.0625);
+    let default_len = view.default_note_len_beats.max(MIN_NOTE_LEN);
     let len = if nc.dragged {
         let raw_delta = f64::from(nc.last_mouse.0 - nc.anchor_mouse.0) * beat_per_px;
         let pivot = nc.start_beat + default_len;
         let right = view.snap.snap_beat(pivot + raw_delta, nc.last_alt, zoom_x_px_per_beat);
-        let min_len = if view.snap.is_active(nc.last_alt) {
-            view.snap
-                .beat_unit(zoom_x_px_per_beat)
-                .map_or(NOTE_CREATE_MIN_LEN, |u| u.max(NOTE_CREATE_MIN_LEN))
-        } else {
-            NOTE_CREATE_MIN_LEN
-        };
+        // r.md #68 同件: 下限は端 drag と **同じ `drag_min_len`** (= model と共有)。
+        // ここだけ `0.05` が残っていたので、 snap off (Alt) で 1/16 未満まで縮めた
+        // ドラッグ作成は「ゴーストより長い note が出来る」 = preview ≠ commit だった。
+        let min_len = drag_min_len(view, nc.last_alt, zoom_x_px_per_beat);
         (right - nc.start_beat).max(min_len)
     } else {
         default_len

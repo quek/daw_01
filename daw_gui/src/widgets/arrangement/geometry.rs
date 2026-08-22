@@ -117,6 +117,90 @@ pub fn clip_to_rect(
     Rect { x, y: track_row_top + 2.0, w, h }
 }
 
+/// r.md #68: clip の **中身** (波形 / MIDI ノート / fade / thumbnail) の
+/// 「content-local 拍 → 画面 x」 写像。
+///
+/// **クリップの表示幅を分母に入れない**のがこの型の存在意義。 旧実装は
+/// `clip_rect.w / clip_len_beats` (= 表示幅 ÷ クリップ長) をスケールにしていたため、
+/// 端 drag のゴーストが中身を `len_new / len_old` 倍に描き、 トリムなのに
+/// time-stretch した絵になっていた (r.md #68 の報告そのもの)。 縮尺は
+/// **ビューのズーム 1 本** (`clip_to_rect` と同じ `lanes.w / view.len_beats`) で決まり、
+/// クリップ矩形は中身を切り抜く**窓**にすぎない。
+///
+/// 原点は clip の **content 原点** (`start_beat - content_offset_beats`、
+/// `common::model::Clip::content_origin_beat` と同じ量)。 トリム (start と offset が
+/// 同量動く) でも time-stretch (`stretch_clip_content` が offset を同量進める) でも
+/// 不変なので、 「長さがどう変わっても中身は動かない」 が式として成り立つ。
+///
+/// automation lane (`draw_automation_lane`) は元からこの形なので、 これで
+/// arrangement 内の時間写像が 1 つに揃う。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ContentMap {
+    /// content-local 拍 0 の画面 x。
+    pub origin_x: f32,
+    /// 1 拍あたりの px。 clip 長には一切依存しない。
+    pub px_per_beat: f64,
+}
+
+impl ContentMap {
+    /// content-local 拍 → 画面 x。
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) fn x(self, content_beat: f64) -> f32 {
+        self.origin_x + (content_beat * self.px_per_beat) as f32
+    }
+
+    /// 拍長 → px 幅 (位置に依らない = 中身の密度が一定であることの表明)。
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) fn w(self, beats: f64) -> f32 {
+        (beats * self.px_per_beat) as f32
+    }
+}
+
+/// r.md #68: clip の content 原点を基準にした [`ContentMap`]。
+/// `beat_to_px` は `clip_to_rect` と **同一の式**なので、 中身は必ずルーラーの
+/// グリッドに載る (旧実装のインセット混入による 2px ずれも同時に消える)。
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub(super) fn content_map(clip: &ClipView, view: ArrangementView, lanes: Rect) -> ContentMap {
+    let px_per_beat = f64::from(lanes.w) / view.len_beats.max(1e-6);
+    let origin_beat = clip.start_beat - clip.content_offset_beats;
+    ContentMap {
+        origin_x: lanes.x + ((origin_beat - view.start_beat) * px_per_beat) as f32,
+        px_per_beat,
+    }
+}
+
+/// 端 drag (`ResizeLeft` / `ResizeRight`) の preview `(start, len)`。
+///
+/// **overlay の矩形 / ゴーストの中身 / release commit の 3 箇所がこの 1 本を通る**。
+/// 以前は同じ式が `draw::drag_preview_geometry` (ゴースト矩形) と `release.rs`
+/// (確定) に写経されていて、片方の clamp を直すと preview ≠ commit に割れる構造
+/// だった (r.md #68 の `min_len` 不一致がまさにそれ)。
+///
+/// `Move` は端を動かさないので anchor をそのまま返す。
+#[must_use]
+pub(super) fn resize_preview_start_len(
+    anchor_start: f64,
+    anchor_len: f64,
+    kind: ClipDragKind,
+    beat_delta: f64,
+    min_len: f64,
+) -> (f64, f64) {
+    match kind {
+        ClipDragKind::Move => (anchor_start, anchor_len),
+        ClipDragKind::ResizeRight => (anchor_start, (anchor_len + beat_delta).max(min_len)),
+        ClipDragKind::ResizeLeft => {
+            // 左端は「右端を固定して左へ伸ばす / 右へ縮める」。 0 未満と最小長は
+            // clamp してから、実際に動いた量ぶんだけ長さを補う。
+            let max_start = anchor_start + anchor_len - min_len;
+            let new_start = (anchor_start + beat_delta).clamp(0.0, max_start);
+            (new_start, (anchor_len - (new_start - anchor_start)).max(min_len))
+        }
+    }
+}
+
 /// r.md #38: 1 event の 1 辺ぶんの fade 幾何。 **描画と hit-test の SSoT**
 /// (= 見えている handle がそのまま掴める場所)。
 ///
@@ -140,24 +224,25 @@ pub(super) struct FadeGeometry {
 }
 
 /// r.md #38: clip 矩形 + event の fade 情報 + 辺 → 描画/hit-test 共通の幾何。
+///
+/// r.md #68: event の横位置は [`ContentMap`] (= ビューのズーム) だけで決まる。
+/// 旧実装は `clip_rect.w / clip_len_beats` を使っており、 波形 (インセット込みの
+/// `(clip_rect.w - 4) / clip_len_beats`) と **同じ clip の上で最大 2px ずつ端が
+/// ずれていた**。 clip 矩形は event 矩形の高さと右端クランプにだけ使う。
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub(super) fn fade_geometry(
     clip_rect: Rect,
-    clip_len_beats: f64,
+    map: ContentMap,
     fade: &ClipEventFade,
     edge: FadeEdge,
     style: &ArrangementStyle,
 ) -> FadeGeometry {
-    // event 矩形: clip 矩形を event の clip 内位置 / 長さで切り出す。 clip 全体を覆う
+    // event 矩形: clip 矩形を event の content 内位置 / 長さで切り出す。 clip 全体を覆う
     // 単一 event (最頻) では clip 矩形そのものになる。
-    let px_per_beat = if clip_len_beats > 1e-9 {
-        f64::from(clip_rect.w) / clip_len_beats
-    } else {
-        0.0
-    };
-    let ex = clip_rect.x + (fade.fade.start_in_clip_beats * px_per_beat) as f32;
-    let ew = ((fade.fade.len_beats * px_per_beat) as f32)
+    let ex = map.x(fade.fade.start_in_clip_beats);
+    let ew = map
+        .w(fade.fade.len_beats)
         .max(0.0)
         .min(clip_rect.x + clip_rect.w - ex);
     // r.md #46: fade は clip 名の帯を避けて **中身の領域** (波形 / MIDI プレビューと
@@ -178,7 +263,7 @@ pub(super) fn fade_geometry(
         FadeEdge::In => fade.fade.fade_in_beats,
         FadeEdge::Out => fade.fade.fade_out_beats,
     };
-    let width_px = ((fade_beats * px_per_beat) as f32).clamp(0.0, event_rect.w);
+    let width_px = map.w(fade_beats).clamp(0.0, event_rect.w);
 
     let corner = style.audio_fade_corner_size_px;
     let (anchor, handle, handle_x) = match edge {
@@ -267,7 +352,7 @@ pub(super) fn audio_grip_hit(
             (FadeEdge::In, AudioGripHit::FadeCornerIn { event_index: f.event_index }),
             (FadeEdge::Out, AudioGripHit::FadeCornerOut { event_index: f.event_index }),
         ] {
-            let g = fade_geometry(r, clip.len_beats, f, edge, style);
+            let g = fade_geometry(r, content_map(clip, view, lanes), f, edge, style);
             if !g.handle_rect.contains(cx, cy) {
                 continue;
             }

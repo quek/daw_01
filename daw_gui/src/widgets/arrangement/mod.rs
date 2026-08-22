@@ -57,6 +57,7 @@ use crate::app::{
 };
 
 pub(crate) mod view_build;
+mod content_build;
 mod draw;
 use draw::*;
 mod geometry;
@@ -171,8 +172,14 @@ pub struct ClipViewAudioEdit {
 /// `event_length_beats` / `fade_*_beats` / `fade_*_curve` を同じ意味で持ち、 適用側も
 /// 全部 `common::audio_render::fade_curve_at` を通るため。
 ///
-/// caller は `ClipContent::event_fades()` をそのまま写して渡す。 `event_index` は
+/// caller は `ClipContent::event_fades()` を **そのまま** 写して渡す。 `event_index` は
 /// clip 内の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等) の宛先になる。
+///
+/// r.md #68: `fade.start_in_clip_beats` は **content-local 拍** (model の値そのもの)。
+/// r.md #44 で一旦「窓ローカル」 (= `content_offset_beats` を引いた値) に畳んでいたが、
+/// それだと中身の原点が窓と一緒に動いてしまい、 端 drag の preview で
+/// 「クリップ幅 ÷ クリップ長」 のスケールに頼らざるを得なくなる。 換算は
+/// [`geometry::ContentMap`] (content 原点 + ビューのズーム) 1 本に集約した。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipEventFade {
     /// clip 内の event index。 fade の編集はこの 1 event だけに効く
@@ -206,12 +213,41 @@ pub enum TrackKind {
     Video,
 }
 
+/// M14 Phase 72 (daw_01 #044) / r.md #68: video / image clip の 1 枚 thumbnail。
+///
+/// `(width, height)` は texture の native size (= [`daw_ui_renderer::Renderer::texture_size`]
+/// と同じ値)。 widget が Renderer 参照を持たない設計と整合させるため caller が同梱で渡す
+/// (daw_01 は decode 時の `VideoFrame.width/height` を流用すれば boilerplate ゼロ)。
+///
+/// r.md #68: `start_in_content_beats` (= この thumbnail が表す event の content-local
+/// 開始拍) を持つのは、 **thumbnail も「中身」 だから**。 clip 矩形にフィットさせると
+/// 端 drag のたびに絵が動いてしまう (旧 `aspect_fit_rect` は clip 矩形中央に letterbox
+/// 配置していたので、 右端を伸ばすとサムネイルが右へ滑っていた)。 中身は content 原点に
+/// 固定し、 はみ出す分を clip 矩形で切り抜く。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipThumbnail {
+    pub texture: TextureHandle,
+    pub width: u32,
+    pub height: u32,
+    /// この thumbnail が表す event の content-local 開始拍 (= 絵の左端が乗る拍)。
+    pub start_in_content_beats: f64,
+}
+
 /// 1 つの clip。`Arc<str>` で複数 clip 間の name 共有可能。
 #[derive(Clone, Debug)]
 pub struct ClipView {
     pub id: u32,
     pub start_beat: f64,
     pub len_beats: f64,
+    /// r.md #44 / #68: clip の左端が content の **どの拍に当たるか**
+    /// (= `common::model::Clip::content_offset_beats` の素通し)。
+    ///
+    /// 中身 (波形 / MIDI ノート / fade / thumbnail) の位置は
+    /// `start_beat - content_offset_beats` (= content 原点) を原点とする
+    /// [`geometry::ContentMap`] 1 本で決まる。 この値を持たずに「窓ローカル座標」 へ
+    /// 畳んで渡していた頃は、 端 drag のゴーストが `clip_rect.w / clip_len_beats` を
+    /// スケールに使わざるを得ず、 トリムなのに中身が伸縮していた (r.md #68)。
+    pub content_offset_beats: f64,
     pub name: Arc<str>,
     pub color: Option<Color>,
     /// M14 Phase 63e (#019) / Phase 114 (#086): 共有 (linked) clip の **リンク識別フラグ兼 hue**。
@@ -244,14 +280,10 @@ pub struct ClipView {
     /// (a) 音声クリップにしか線が出ず、 (b) 複数 event を持つクリップでは 1 本目の
     /// fade しか描かれなかった。
     pub fades: Vec<ClipEventFade>,
-    /// M14 Phase 72 (daw_01 #044): video clip 用 thumbnail。 `Some((handle, width, height))` で
-    /// widget が clip rect 内に texture を aspect-fit (黒帯 letterbox) で描画する。 `(width, height)`
-    /// は texture の native size (= [`daw_ui_renderer::Renderer::texture_size`] と同じ値)。 widget が
-    /// Renderer 参照を持たない設計と整合させるため caller が同梱で渡す前提
-    /// (daw_01 は ffmpeg-next decode 時の `VideoFrame.width/height` を流用すれば boilerplate ゼロ)。
+    /// M14 Phase 72 (daw_01 #044) / r.md #68: video / image clip 用 thumbnail。
     /// `None` のときは `track.kind == Video` なら [`ArrangementStyle::video_clip_loading`] 単色 rect
     /// 描画、 `Audio` なら field 自体が無視される (= caller が kind と clip 種別を一致させる責任)。
-    pub thumbnail: Option<(TextureHandle, u32, u32)>,
+    pub thumbnail: Option<ClipThumbnail>,
     /// M14 Phase 96 (daw_01 #068) / Phase 114 (#086): 共有グループ「連動ハイライト」フラグ。 `true` の
     /// とき widget が selection (黄塗り) とは **別レイヤ** の強調 (glow wash + bright thick border) を
     /// 重ねる (= 「今アクティブな共有グループの member」)。 M14 Phase 114 (#086) で強調色は hue 由来から
@@ -1666,10 +1698,14 @@ struct AudioDragSession {
     /// drag 開始時の clip rect (release 時にも参照、 view scroll 中も安定 — track 並び替えや
     /// scroll で「rect が動いて」 も anchor の dB 0 ライン位置を変えない)。
     clip_rect_anchor: Rect,
-    /// drag 開始時の clip len_beats。 **fade 長の clamp には使わない** (それは event 長 =
-    /// `anchor_fade.fade.len_beats`)。 ghost 描画で clip rect から event 矩形を切り出す
-    /// ための px/beat スケール算出にだけ使う。
-    clip_len_beats_anchor: f64,
+    /// drag 開始時の content 写像 (content-local 拍 → 画面 x)。 ghost 描画で clip rect から
+    /// event 矩形を切り出すのに使う。 **fade 長の clamp には使わない** (それは event 長 =
+    /// `anchor_fade.fade.len_beats`)。
+    ///
+    /// r.md #68: 以前は `clip_len_beats_anchor: f64` を持ち、 `clip_rect.w / clip_len` を
+    /// スケールにしていた。 それだと同じ clip の上で波形 (インセット込みの分母) と
+    /// fade (インセット無しの分母) が最大 2px ずつずれる。 写像そのものを anchor する。
+    content_map_anchor: ContentMap,
     /// r.md #46: drag 開始時の clip 実塗り色。 ghost の fade envelope も base 描画と
     /// 同じ auto-contrast で色を選ぶ (単層の固定色だと明るい clip 上で消える)。
     clip_bg_anchor: Color,
@@ -2183,17 +2219,25 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h = h.wrapping_mul(PRIME);
             h ^= c.len_beats.to_bits();
             h = h.wrapping_mul(PRIME);
+            // r.md #68: content 原点 (= start - offset) が cached 層の中身描画
+            // (thumbnail / fade カーブ) の x 写像を決めるので、 offset 単独の変化
+            // (bounce / paste / audio editor の窓調整) でも cache を無効化する。
+            h ^= c.content_offset_beats.to_bits();
+            h = h.wrapping_mul(PRIME);
             // muted は cached 内の fill dim + 斜線ハッチ描画に効く (review — widget 契約
             // #011 「clip 個別変化は widget が吸収」 に合わせ caller hash に頼らない)。
             h ^= u64::from(c.muted);
             h = h.wrapping_mul(PRIME);
             // video thumbnail の decode 完了 (None→Some) / 差し替えを検知 (review)。
             // handle raw 値 + サイズで十分 (内容は immutable texture)。
-            let thumb_marker = c.thumbnail.map_or(u64::MAX, |(handle, w, hgt)| {
+            let thumb_marker = c.thumbnail.map_or(u64::MAX, |t| {
                 let mut a: u64 = 0x7157_B00B_5EED_F00D;
-                a ^= u64::from(handle.raw_id().get());
+                a ^= u64::from(t.texture.raw_id().get());
                 a = a.wrapping_mul(PRIME);
-                a ^= (u64::from(w) << 32) | u64::from(hgt);
+                a ^= (u64::from(t.width) << 32) | u64::from(t.height);
+                a = a.wrapping_mul(PRIME);
+                // r.md #68: 絵の左端が乗る拍 (= 描画位置) も cache key の一部。
+                a ^= t.start_in_content_beats.to_bits();
                 a
             });
             h ^= thumb_marker;
