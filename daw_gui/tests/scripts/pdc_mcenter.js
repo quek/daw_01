@@ -62,11 +62,18 @@ const song = {
 };
 daw.loadSongFromObject(song);
 
+// プラグインの絶対パスは呼び出し側 (pdc_real_vst3.rs) が --arg plugin=... で渡す。
+// 開発機のパスをここに書かない (別マシンでは必ず外れ、個人の環境が repo に焼き付く)。
+const pluginPath = daw.scriptArgs.plugin;
+if (!pluginPath) {
+  throw new Error("pdc_mcenter.js: --arg plugin=<MCenter.vst3 のパス> が必要です");
+}
+
 daw.setSlotPlugin(
   2,
   0, // device index (末尾 append、 単一デバイスチェーン)
   "vst3",
-  "C:/Program Files/Common Files/VST3/MeldaProduction/Stereo/MCenter.vst3",
+  pluginPath,
   "",
 );
 daw.waitForPluginLoaded(2, 0, 30000);
