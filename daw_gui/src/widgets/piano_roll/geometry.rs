@@ -365,17 +365,20 @@ pub(super) fn note_create_geometry(
     beat_per_px: f64,
     zoom_x_px_per_beat: f32,
 ) -> (f64, f64, u8) {
-    let default_len = view.default_note_len_beats.max(common::model::MIN_NOTE_LEN_BEATS);
+    let default_len = view.default_note_len_beats.max(MIN_NOTE_LEN);
     let len = if nc.dragged {
         let raw_delta = f64::from(nc.last_mouse.0 - nc.anchor_mouse.0) * beat_per_px;
         let pivot = nc.start_beat + default_len;
         let right = view.snap.snap_beat(pivot + raw_delta, nc.last_alt, zoom_x_px_per_beat);
+        // r.md #68 同件: 下限は model と共有する (`AppData::add_note` の clamp と同じ)。
+        // ここだけ `0.05` が残っていたので、 snap off (Alt) で 1/16 未満まで縮めた
+        // ドラッグ作成は「ゴーストより長い note が出来る」 = preview ≠ commit だった。
         let min_len = if view.snap.is_active(nc.last_alt) {
             view.snap
                 .beat_unit(zoom_x_px_per_beat)
-                .map_or(NOTE_CREATE_MIN_LEN, |u| u.max(NOTE_CREATE_MIN_LEN))
+                .map_or(MIN_NOTE_LEN, |u| u.max(MIN_NOTE_LEN))
         } else {
-            NOTE_CREATE_MIN_LEN
+            MIN_NOTE_LEN
         };
         (right - nc.start_beat).max(min_len)
     } else {

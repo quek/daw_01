@@ -2068,6 +2068,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         let stretch_ghost_content = content_build::build_stretch_ghost_content(
             app,
             &tempo_map,
+            &visible_tracks,
             clip_drag_overlay.as_ref(),
             drag_overlay_min_len,
         );

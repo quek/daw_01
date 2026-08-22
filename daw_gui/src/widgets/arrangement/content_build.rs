@@ -91,6 +91,8 @@ pub(super) fn build_clip_content(
 pub(super) fn build_stretch_ghost_content(
     app: &AppData,
     tempo_map: &TempoMap,
+    // base の `clip_content` と **同じ定義域** にするために必要 (下の guard 参照)。
+    visible_tracks: &[ArrangementTrack],
     drag: Option<&(ClipDragSession, f64, i32)>,
     min_len: f64,
 ) -> HashMap<ClipKey, ClipContentDraw> {
@@ -106,6 +108,16 @@ pub(super) fn build_stretch_ghost_content(
     }
     let mut spans: Vec<WaveSpan> = Vec::new();
     for a in &nd.anchors {
+        // **base と定義域を揃える**。 ゴーストの content 原点は描画側が
+        // `visible_tracks` から引いた `ClipView::content_offset_beats` で決まるので、
+        // ここだけ model から直接引いて中身を出すと、 drag 中に track がスクロールで
+        // 見えなくなった瞬間に「中身はあるのに原点が 0 扱い」 になり、 伸縮した中身が
+        // ゴースト枠に対して `content_offset_beats` ぶんずれる。
+        if !visible_tracks.iter().any(|t| {
+            t.id == a.key.track && t.clips.iter().any(|c| c.id == a.key.clip)
+        }) {
+            continue;
+        }
         let Some(mt) = app
             .song_doc
             .song()

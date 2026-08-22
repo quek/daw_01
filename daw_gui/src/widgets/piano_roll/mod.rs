@@ -945,10 +945,11 @@ struct NoteDragSession {
 /// 左方向も対象 (左ドラッグで既定長より短く作るとき右へ振る手間を不要にする)。
 const NOTE_CREATE_DRAG_PX: f32 = 4.0;
 
-/// ドラッグで決める note 長の下限 (拍)。snap unit 無効時の floor。
-/// daw_01 add_note 側が更に `0.0625` (1/16) に clamp するが、 widget preview と commit を
-/// 一致させるため widget でも下限を設ける (resize の `0.05` floor と同値)。
-const NOTE_CREATE_MIN_LEN: f64 = 0.05;
+/// r.md #68 同件: ノート長の下限は **model と共有** する
+/// (`AppData::add_note` / `resize_notes` / `resize_note` の clamp と同じ値)。
+/// widget 側だけ別リテラル (旧: `0.05`) を持つと、 snap off (Alt) の端 drag /
+/// ドラッグ作成で「ゴーストより長く確定する」 = preview ≠ commit になる。
+const MIN_NOTE_LEN: f64 = common::model::MIN_NOTE_LEN_BEATS;
 
 /// 空白ダブルクリック作成 session (Bitwig 流の「ダブルクリックのボタンを放さず
 /// 左右ドラッグで note 長を決める」)。

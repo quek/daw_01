@@ -17,11 +17,6 @@ use crate::view::snap::{self, SNAP_LABELS};
 use crate::view::track_color;
 use crate::widgets::select_modifier::{RangeItem, SelectModifier, range_block};
 
-/// r.md #68 同件: ノート長の下限は **model と共有** する (`AppData::resize_notes` /
-/// `resize_note` の clamp と同じ値)。 widget 側だけ別リテラル (旧: `0.05`) を持つと、
-/// snap off (Alt) の端 drag でゴーストより長く確定する = preview ≠ commit。
-const MIN_NOTE_LEN: f64 = common::model::MIN_NOTE_LEN_BEATS;
-
 /// Snap toolbar / legend の小さめトグル (標準の角丸 6px・14px 文字より 1 段小さい)。
 /// 色は毎フレームのパレットから引く (r.md #48: `const` はテーマ切替に追従できない)。
 fn snap_toggle_style(p: &Palette) -> ToggleButtonStyle {
