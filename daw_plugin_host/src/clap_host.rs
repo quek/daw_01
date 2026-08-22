@@ -248,12 +248,21 @@ unsafe extern "C" fn gui_request_resize(
     if width == 0 || height == 0 {
         return false;
     }
+    use crate::editor_window::PluginResizeOutcome;
     let hwnd = this.callbacks.editor_hwnd.load(Ordering::Acquire);
-    if hwnd != 0 && crate::editor_window::plugin_requested_resize(hwnd, width, height) {
-        return true;
+    match crate::editor_window::plugin_requested_resize(hwnd, width, height) {
+        PluginResizeOutcome::Applied => true,
+        // ヘッダ: *"If the host returns false, the new size is rejected."*
+        // 再入拒否は **非同期経路へ積み直さない** (拒否と伝えた値が後から効くのを防ぐ)。
+        PluginResizeOutcome::Rejected => false,
+        // GUI 未 open / main-thread 以外からの呼び出し。ヘッダが明示的に許す非同期 ack:
+        // *"if not called from the main thread, then a return value simply means that the
+        // host acknowledged the request and will process it asynchronously."*
+        PluginResizeOutcome::NotApplicable => {
+            (this.callbacks.on_request_resize)(width, height);
+            true
+        }
     }
-    (this.callbacks.on_request_resize)(width, height);
-    true
 }
 
 unsafe extern "C" fn gui_request_show(host: *const clap_host) -> bool {

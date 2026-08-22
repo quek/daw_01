@@ -1796,11 +1796,13 @@ impl PluginHost {
     fn close_slot_gui(&mut self, device_id: u64) {
         // r.md #65: 窓を壊す前に最後のジオメトリを送る (次回 open で復元する)。
         // ドラッグ確定時にも送っているが、閉じる直前の 1 発が「最後に見た形」を確定させる。
+        // **最小化したまま閉じた場合は送らない** (`persistable_geometry` が None) —
+        // `(-32000,-32000)` / `0×0` を保存すると次回 1×1 の窓で開いてしまう。
         let last_geometry = self
             .instances
             .get(&device_id)
             .and_then(|rec| rec.editor.as_ref())
-            .map(editor_window::EditorWindow::geometry);
+            .and_then(editor_window::EditorWindow::persistable_geometry);
         if let Some(geometry) = last_geometry {
             self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
         }
@@ -1841,8 +1843,9 @@ impl PluginHost {
                     // プラグインの `get_size` を読んで正しいサイズで作る)。
                     return;
                 };
-                if !editor_window::plugin_requested_resize(win.hwnd_u64(), w, h) {
-                    tracing::debug!(device_id, w, h, "deferred plugin resize was rejected");
+                let outcome = editor_window::plugin_requested_resize(win.hwnd_u64(), w, h);
+                if outcome != editor_window::PluginResizeOutcome::Applied {
+                    tracing::debug!(device_id, w, h, ?outcome, "deferred plugin resize not applied");
                 }
             }
             HostNotify::Closed(device_id) => {
@@ -1982,6 +1985,19 @@ thread_local! {
     static IN_MODAL_PUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// [`IN_MODAL_PUMP`] を **Drop で必ず**降ろすためのガード。
+///
+/// 素の `set(true) ... set(false)` だと、`pump_modal` が呼ぶ ARA プラグインの
+/// コードが unwind した瞬間にフラグが true に貼り付き、以後 modal ドラッグ中の
+/// 周期処理が二度と回らなくなる (Melodyne の解析が窓ドラッグ後に永久停止する等)。
+struct ModalPumpGuard;
+
+impl Drop for ModalPumpGuard {
+    fn drop(&mut self) {
+        IN_MODAL_PUMP.set(false);
+    }
+}
+
 /// エディタ窓の WNDPROC (modal move/size ループ中の `WM_TIMER`) から呼ぶ。
 /// 借用口が立っていない / 既に pump 中なら何もしない。
 pub fn pump_host_during_modal_loop() {
@@ -1993,11 +2009,11 @@ pub fn pump_host_during_modal_loop() {
         return;
     }
     IN_MODAL_PUMP.set(true);
+    let _guard = ModalPumpGuard;
     // SAFETY: `ptr` は `plugin_main_loop` が `DispatchMessageW` の直前に自分の
     // `host` から作り、直後に null へ戻す。その区間で `host` への参照は 1 つも
     // 生きておらず、`IN_MODAL_PUMP` が再入も塞ぐので `&mut` は一意。
     unsafe { (*ptr).pump_modal() };
-    IN_MODAL_PUMP.set(false);
 }
 
 /// `DispatchMessageW` の呼び出しを [`MODAL_PUMP_HOST`] の設定で挟む。

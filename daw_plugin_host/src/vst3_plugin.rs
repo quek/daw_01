@@ -1103,14 +1103,12 @@ impl Drop for Vst3Plugin {
             }
             self.ara = None;
         }
-        if self.gui_attached.get()
-            && let Some(view) = self.view.as_ref()
-        {
-            unsafe {
-                let _ = view.removed();
-            }
-        }
-        self.view = None;
+        // r.md #65: **`gui_destroy` を通す**。手書きで `removed()` だけ呼ぶと
+        // (a) `view_alive` / `editor_hwnd` が落ちず、`InstanceRecord` の drop 順
+        // (plugin → editor) の隙間で `Vst3Sizer` が「alive なのに dangling」な
+        // `*mut IPlugView` を指し、(b) `setFrame(nullptr)` → `removed()` の順序も
+        // 踏めない。CLAP 側 (`ClapPlugin::drop`) と同じく契約を 1 箇所に集約する。
+        LoadedPlugin::gui_destroy(self);
         if self.processing {
             unsafe {
                 self.audio.setProcessing(0);

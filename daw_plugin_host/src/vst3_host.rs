@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use com_scrape_types::Class;
 use vst3::Steinberg::{
-    FIDString, IPlugFrame, IPlugFrameTrait, IPlugView, TUID, ViewRect, kInternalError,
-    kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
+    FIDString, IPlugFrame, IPlugFrameTrait, IPlugView, TUID, ViewRect, kInvalidArgument,
+    kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
     Vst::{
         IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandlerTrait,
         IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, ParamID, ParamValue,
@@ -408,18 +408,18 @@ impl IPlugFrameTrait for Vst3PlugFrame {
         if w == 0 || h == 0 {
             return kInvalidArgument;
         }
+        use crate::editor_window::PluginResizeOutcome;
         let hwnd = self.callbacks.editor_hwnd.load(Ordering::Acquire);
-        if hwnd != 0 && crate::editor_window::plugin_requested_resize(hwnd, w, h) {
-            return kResultTrue;
+        match crate::editor_window::plugin_requested_resize(hwnd, w, h) {
+            PluginResizeOutcome::Applied => kResultTrue,
+            // 再入拒否。**非同期経路へ積み直さない** — 「拒否」と伝えたリサイズが
+            // 1 周期後に実行されると、プラグインの内部状態と窓サイズが食い違う。
+            PluginResizeOutcome::Rejected => kResultFalse,
+            // GUI 未 open / 窓が別スレッド所有。plugin-main の周回で同じ関数へ合流させる。
+            PluginResizeOutcome::NotApplicable => {
+                (self.callbacks.on_request_resize)(w, h);
+                kResultTrue
+            }
         }
-        // 窓が無い (GUI 未 open) / 別スレッドから呼ばれた / 再入中。
-        // 前 2 者は非同期経路 (plugin-main の `HostNotify::Resize`) へ落として、
-        // 窓が現れ次第 / 次周回で同じ処理を行う。
-        if hwnd == 0 {
-            (self.callbacks.on_request_resize)(w, h);
-            return kInternalError;
-        }
-        (self.callbacks.on_request_resize)(w, h);
-        kResultFalse
     }
 }

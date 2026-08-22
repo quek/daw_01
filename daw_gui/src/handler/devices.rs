@@ -22,6 +22,11 @@ impl AppData {
         device_id: u64,
         geometry: common::model::EditorWindowGeometry,
     ) {
+        // 縮退サイズは記録しない (plugin-host 側の `persistable_geometry` が既に
+        // 弾いているが、境界でも塞ぐ — 0 を保存すると次回 open で 1×1 の窓になる)。
+        if geometry.width == 0 || geometry.height == 0 {
+            return;
+        }
         self.ui_prefs.plugin_editor_windows.insert(device_id, geometry);
     }
 

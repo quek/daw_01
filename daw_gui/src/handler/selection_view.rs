@@ -393,13 +393,18 @@ impl AppData {
         // r.md #65: エディタ窓のジオメトリ。現存しない device の stale entry は捨てる。
         // 位置 (`x`/`y`) は **clamp しない** — マルチモニタでは負値が正当で、
         // 画面外かどうかの判定はモニタ構成を知る plugin-host 側が open 時に行う。
-        // サイズだけは `clamp_dim` と同じ健全域へ丸めて壊れた保存値を吸収する。
+        // サイズ 0 の entry は **1 へ clamp せず捨てる**: 0 は「最小化中に採られた
+        // 縮退値」を意味し、1 に昇格させると「有効な 1×1 の窓サイズ」に化けて
+        // 次回 open で 1×1 のエディタが出る。上限だけ健全域へ丸める。
         for (device_id, mut g) in v.plugin_editor_windows {
-            if find_device_by_id(self.song_doc.song(), device_id).is_none() {
+            if g.width == 0
+                || g.height == 0
+                || find_device_by_id(self.song_doc.song(), device_id).is_none()
+            {
                 continue;
             }
-            g.width = g.width.clamp(1, 16_384);
-            g.height = g.height.clamp(1, 16_384);
+            g.width = g.width.min(16_384);
+            g.height = g.height.min(16_384);
             self.ui_prefs.plugin_editor_windows.insert(device_id, g);
         }
     }

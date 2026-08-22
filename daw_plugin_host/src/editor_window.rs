@@ -68,7 +68,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_CHILD, GWLP_USERDATA, GWL_STYLE,
     GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HICON, HMENU, HWND_TOP, IDC_ARROW, IsWindow, KillTimer, LoadCursorW, PostMessageW,
+    HICON, HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, KillTimer, LoadCursorW, PostMessageW,
     RegisterClassExW, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WA_INACTIVE, WINDOW_EX_STYLE,
@@ -553,10 +553,10 @@ impl EditorWindow {
     /// 位置 / サイズが確定していれば現在のジオメトリを返して dirty を落とす。
     /// plugin-main の pump が毎周回で呼び、変化分だけ daw_gui へ流す。
     pub fn take_geometry_change(&self) -> Option<EditorWindowGeometry> {
-        self.shared
-            .geometry_dirty
-            .replace(false)
-            .then(|| self.geometry())
+        if !self.shared.geometry_dirty.replace(false) {
+            return None;
+        }
+        self.persistable_geometry()
     }
 
     /// 現在の窓位置 (screen 座標) と client サイズ。
@@ -573,6 +573,21 @@ impl EditorWindow {
             width: cw.max(0) as u32,
             height: ch.max(0) as u32,
         }
+    }
+
+    /// **保存してよい**ジオメトリ。最小化中は `None`。
+    ///
+    /// 最小化された窓の `GetWindowRect` は `(-32000, -32000)`、`GetClientRect` は
+    /// `0×0` を返す (`WM_SIZE` の lParam が 0 になるのと同じ理由)。これを永続化すると
+    /// 次回 open で 1×1 のエディタ窓になる — 復元側で 0 を 1 に clamp すると
+    /// **縮退値が有効値に化ける**ので、源泉で捨てるのが正しい。
+    #[must_use]
+    pub fn persistable_geometry(&self) -> Option<EditorWindowGeometry> {
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            return None;
+        }
+        let g = self.geometry();
+        (g.width > 0 && g.height > 0).then_some(g)
     }
 
     /// attach 後に判明した `canResize` / `can_resize` を窓スタイルへ反映する。
@@ -763,33 +778,35 @@ fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
 /// 渡す値がずれて `kResultFalse` を返される (実ログで全 VST3 に `onSize -> 0x1` の
 /// WARN が出ていた原因)。
 ///
-/// `hwnd_u64` が別スレッド所有 / 無効なら `false` を返す。呼び出し側は非同期経路
-/// (`HostCallbacks::on_request_resize`) にフォールバックする。
+/// 結果は 3 状態。**`Rejected` と `NotApplicable` を混ぜてはいけない**: 再入拒否を
+/// 非同期経路へ積み直すと、プラグインには「拒否」と伝えたリサイズが 1 周期後に
+/// 実行され、プラグインの内部状態と窓サイズが食い違う (editorhost の
+/// `resizeViewRecursionGard` は拒否したら何も残さない)。
 #[must_use]
-pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> bool {
+pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> PluginResizeOutcome {
     let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
     if hwnd.0.is_null() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        return false;
+        return PluginResizeOutcome::NotApplicable;
     }
     // 窓メッセージを扱えるのは窓を作ったスレッドだけ。CLAP の `request_resize` は
     // `[thread-safe]` なので任意スレッドから来る。
     if unsafe { GetWindowThreadProcessId(hwnd, None) } != unsafe { GetCurrentThreadId() } {
-        return false;
+        return PluginResizeOutcome::NotApplicable;
     }
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const EditorShared;
     if raw.is_null() {
-        return false;
+        return PluginResizeOutcome::NotApplicable;
     }
     // SAFETY: `EditorWindow` が生きている間だけ非 null (Drop が 0 に戻す)。
     let shared = unsafe { &*raw };
     if shared.in_plugin_resize.get() {
-        return false; // 再入 = 拒否
+        return PluginResizeOutcome::Rejected;
     }
     let Some(sizer) = shared.sizer() else {
-        return false;
+        return PluginResizeOutcome::NotApplicable;
     };
     if sizer.current_client_size() == Some((width, height)) {
-        return true; // 既に同じ = 何もしないのが正
+        return PluginResizeOutcome::Applied; // 既に同じ = 何もしないのが正
     }
     shared.in_plugin_resize.set(true);
     unsafe { resize_client_area(hwnd, width, height) };
@@ -801,7 +818,20 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> bool {
     }
     shared.in_plugin_resize.set(false);
     shared.geometry_dirty.set(true);
-    true
+    PluginResizeOutcome::Applied
+}
+
+/// [`plugin_requested_resize`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginResizeOutcome {
+    /// 窓を直し、`onSize` / `set_size` まで済ませた。
+    Applied,
+    /// **再入中なので拒否した**。呼び出し側はプラグインに拒否を伝えるだけで、
+    /// 非同期経路へ積み直してはいけない。
+    Rejected,
+    /// この窓では処理できない (GUI 未 open / 窓が別スレッド所有 / sizer 未 attach)。
+    /// 呼び出し側は非同期経路 (`HostCallbacks::on_request_resize`) へ回してよい。
+    NotApplicable,
 }
 
 // --- Win32 class registration --------------------------------------------
@@ -1029,8 +1059,12 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         // ドラッグ終了で位置が変わっていれば拾う (`WM_EXITSIZEMOVE` が来ない
         // プログラム移動もここで捕まえる)。値は pump が `GetWindowRect` で読む。
+        // 最小化中は位置が `(-32000, -32000)` になるので dirty を立てない
+        // (`WM_SIZE` が `SIZE_MINIMIZED` を弾くのと同じ理由)。
         WM_MOVE => {
-            if let Some(shared) = shared_of(hwnd) {
+            if !unsafe { IsIconic(hwnd) }.as_bool()
+                && let Some(shared) = shared_of(hwnd)
+            {
                 shared.geometry_dirty.set(true);
             }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
