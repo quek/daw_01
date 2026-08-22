@@ -10,12 +10,24 @@ use common::protocol::{AudioCommand, PluginCommand, SlotState};
 impl AppData {
     // -------- Plugin GUI bridge --------------------------------------------
 
-    pub(crate) fn on_gui_opened(&mut self, _device_id: u64, _width: u32, _height: u32) {
-        // the editor window is created, sized, and owned by the
-        // plugin-host process. daw_gui only records open state (done in
-        // `open_slot_gui` when the request is sent), so there's nothing to do
-        // on the opened confirmation. Plugin-initiated resize is likewise
-        // handled entirely in the plugin-host process now.
+    /// r.md #65: エディタ窓のジオメトリが確定した (open 直後 / ユーザーのドラッグ
+    /// 終了 / プラグイン起点リサイズ完了 / close 直前)。
+    ///
+    /// 窓を所有するのは plugin-host なので daw_gui は **記録するだけ**。値は
+    /// `snapshot_view_state` でプロジェクトへ書き出され、次の `OpenSlotGuiEmbedded`
+    /// に載って復元される。「見方の都合」なので dirty は立てない
+    /// (memory `project_dirty_flag_rule`)。
+    pub(crate) fn on_gui_geometry(
+        &mut self,
+        device_id: u64,
+        geometry: common::model::EditorWindowGeometry,
+    ) {
+        // 縮退サイズは記録しない (plugin-host 側の `persistable_geometry` が既に
+        // 弾いているが、境界でも塞ぐ — 0 を保存すると次回 open で 1×1 の窓になる)。
+        if geometry.width == 0 || geometry.height == 0 {
+            return;
+        }
+        self.ui_prefs.plugin_editor_windows.insert(device_id, geometry);
     }
 
     pub(crate) fn on_gui_closed(&mut self, device_id: u64) {
@@ -565,6 +577,9 @@ impl AppData {
             self.send_plugin(PluginCommand::OpenSlotGuiEmbedded {
                 device_id,
                 title: format!("Plugin — {label}"),
+                // r.md #65: 前回このプロジェクトで閉じたときの窓の位置 / サイズ。
+                // 位置は常に、サイズは plugin が resizable のときだけ plugin-host が使う。
+                geometry: self.ui_prefs.plugin_editor_windows.get(&device_id).copied(),
             });
             // r.md #36: 「キーを全部プラグインに送る」 の現在値を open のたびに同期する
             // (plugin-host は再起動で状態を失う / device_id は open まで意味を持たない)。

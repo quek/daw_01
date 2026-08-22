@@ -14,12 +14,13 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use com_scrape_types::Class;
 use vst3::Steinberg::{
     FIDString, IPlugFrame, IPlugFrameTrait, IPlugView, TUID, ViewRect, kInvalidArgument,
-    kNotImplemented, kResultFalse, kResultOk, tresult,
+    kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
     Vst::{
         IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandlerTrait,
         IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, ParamID, ParamValue,
@@ -379,17 +380,46 @@ impl Class for Vst3PlugFrame {
 }
 
 impl IPlugFrameTrait for Vst3PlugFrame {
+    /// r.md #65: **同じコールスタックで** 窓をリサイズして `onSize` まで済ませる。
+    ///
+    /// `iplugview.h` の "Sizing of a view" が正本:
+    /// > *"The plug-in can call IPlugFrame::resizeView () and cause the host to resize
+    /// > the window. Afterwards, **in the same callstack**, the host has to call
+    /// > IPlugView::onSize () if a resize is needed... Note that if the host calls
+    /// > IPlugView::getSize () before calling IPlugView::onSize (), it will get the
+    /// > current (old) size not the wanted one!!"*
+    ///
+    /// 旧実装は channel に投げて即 `kResultOk` を返すだけで、窓も直さず `onSize` も
+    /// 呼んでいなかった。実測では Renoise Redux がこれを見て **自分の view を
+    /// コンテナから切り離し WS_POPUP の owned top-level に作り替える** ため、
+    /// コンテナ窓が空になり activation が popup へ飛んでタイトルバーが点滅した
+    /// (2026-08-22 `--editor-selftest` + `EnumChildWindows` で確認)。
+    ///
+    /// 戻り値はヘッダ未規定なので editorhost / JUCE の実装合意に合わせる:
+    /// 成功 = `kResultTrue`、引数不正 = `kInvalidArgument`、窓が無い / 別スレッド =
+    /// `kInternalError`、再入中 = `kResultFalse`。
     unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
         if new_size.is_null() {
-            return kResultOk;
+            return kInvalidArgument;
         }
         let rect = *new_size;
         let w = (rect.right - rect.left).max(0) as u32;
         let h = (rect.bottom - rect.top).max(0) as u32;
-        (self.callbacks.on_request_resize)(w, h);
-        // daw_gui will reply with a `ResizeSlotGui` that ends up calling
-        // `IPlugView::onSize` on this view. Returning kResultOk tells the
-        // plugin the host accepted the hint.
-        kResultOk
+        if w == 0 || h == 0 {
+            return kInvalidArgument;
+        }
+        use crate::editor_window::PluginResizeOutcome;
+        let hwnd = self.callbacks.editor_hwnd.load(Ordering::Acquire);
+        match crate::editor_window::plugin_requested_resize(hwnd, w, h) {
+            PluginResizeOutcome::Applied => kResultTrue,
+            // 再入拒否。**非同期経路へ積み直さない** — 「拒否」と伝えたリサイズが
+            // 1 周期後に実行されると、プラグインの内部状態と窓サイズが食い違う。
+            PluginResizeOutcome::Rejected => kResultFalse,
+            // GUI 未 open / 窓が別スレッド所有。plugin-main の周回で同じ関数へ合流させる。
+            PluginResizeOutcome::NotApplicable => {
+                (self.callbacks.on_request_resize)(w, h);
+                kResultTrue
+            }
+        }
     }
 }

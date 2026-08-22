@@ -61,7 +61,7 @@ plugin-main thread running
 ```bash
 grep -iE "<確認したいイベント>" target/verify_run.log | sed -E 's/\x1b\[[0-9;]*m//g' | tail -40
 ```
-- 例: プラグイン GUI なら `OpenSlotGuiEmbedded|SlotGuiOpened|editor window destroyed|SetSlotPlugin`。
+- 例: プラグイン GUI なら `OpenSlotGuiEmbedded|SlotGuiGeometry|editor window destroyed|SetSlotPlugin`。
   オーディオ経路なら `OpenPluginShmem|LoadSong|plugin_refs`。
 
 ### 6. UI 操作が要る検証はユーザーへ

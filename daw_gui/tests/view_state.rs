@@ -141,6 +141,52 @@ fn view_state_snapshot_restore_roundtrips() {
     );
 }
 
+/// r.md #65: プラグインエディタ窓のジオメトリはプロジェクト単位で往復し、
+/// **既に存在しない device の entry は保存時に捨てる** (orphan を溜めない)。
+/// 開き直しで「窓が前回の場所とサイズで出る」ための経路そのもの。
+#[test]
+fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
+    use common::model::{EditorWindowGeometry, PluginInstance};
+    use common::plugin_format::PluginFormat;
+
+    let (mut app, _rx) = build_two_clip_app();
+    // track 0 に device を 1 つ載せて id を確定させる (id 採番は edit_song 経由)。
+    app.edit_song(|song| {
+        let mut dev = PluginInstance::new("test.plugin".into(), PluginFormat::Clap);
+        dev.id = 42;
+        song.tracks[0].devices.push(dev);
+    });
+
+    let live = EditorWindowGeometry { x: 300, y: 180, width: 880, height: 162 };
+    let orphan = EditorWindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+    app.ui_prefs.plugin_editor_windows.insert(42, live);
+    // 削除済み device の残骸 (song に居ない id)。
+    app.ui_prefs.plugin_editor_windows.insert(9999, orphan);
+
+    let snap = app.snapshot_view_state();
+    assert_eq!(
+        snap.plugin_editor_windows,
+        vec![(42, live)],
+        "現存 device の分だけが保存され、削除済み device の残骸は捨てられる"
+    );
+
+    // 別プロジェクトを開いた想定で壊してから復元。
+    app.ui_prefs.plugin_editor_windows.clear();
+    app.ui_prefs.plugin_editor_windows.insert(7, orphan);
+    let loop_region = snap.loop_region;
+    app.restore_view_state(Some(snap), loop_region);
+
+    assert_eq!(
+        app.ui_prefs.plugin_editor_windows.get(&42).copied(),
+        Some(live),
+        "窓の位置とサイズが復元される"
+    );
+    assert!(
+        !app.ui_prefs.plugin_editor_windows.contains_key(&7),
+        "前プロジェクトの窓位置は漏れない"
+    );
+}
+
 /// `restore_view_state(None)` (= 旧ファイル) は per-clip map をクリアしつつ
 /// globals は触らない (= 従来の fit-to-content / 既定値挙動にフォールバック)。
 #[test]

@@ -518,7 +518,18 @@ pub enum PluginCommand {
     RequestAllStates,
     /// Open the plugin editor (top-level window は plugin-host プロセス所有)。
     /// `title` is the window caption daw_gui composed.
-    OpenSlotGuiEmbedded { device_id: u64, title: String },
+    ///
+    /// r.md #65: `geometry` は前回このプロジェクトで閉じたときの窓の位置 /
+    /// client サイズ (`ViewState.plugin_editor_windows` 由来、`None` = 初回)。
+    /// 位置は常に復元し、**サイズはプラグインが `canResize` / `can_resize` で
+    /// リサイズ可と答えたときだけ**復元する (固定サイズ GUI に前回のサイズを
+    /// 押し付けない)。CLAP の GUI 手順 9 「resizable かつ前回セッションのサイズが
+    /// 分かっているときだけ `set_size`」と同じ規約。
+    OpenSlotGuiEmbedded {
+        device_id: u64,
+        title: String,
+        geometry: Option<crate::model::EditorWindowGeometry>,
+    },
     CloseSlotGui { device_id: u64 },
     /// r.md #55: **開いているエディタ窓を全部閉じる** (`Ctrl+Shift+W`)。
     ///
@@ -660,11 +671,20 @@ pub enum PluginEvent {
     },
     /// Reply to `RequestAllStates`: one entry per loaded device.
     AllPluginStates { entries: Vec<SlotState> },
-    /// GUI opened at the requested size.
-    SlotGuiOpened {
+    /// r.md #65: エディタ窓のジオメトリが確定した。open 直後と、以後
+    /// **ユーザーのドラッグが終わった / プラグイン起点のリサイズが済んだ**
+    /// たびに送る (ドラッグ中は送らない — `WM_EXITSIZEMOVE` で 1 回)。
+    ///
+    /// 窓を所有するのは plugin_host なので、位置 / サイズの一次情報はここにしか
+    /// 無い。daw_gui はこれを `ui_prefs.plugin_editor_windows` に貯め、保存時に
+    /// `ViewState` へ書き出して次回 open で復元する。
+    ///
+    /// 旧 `SlotGuiOpened { width, height }` はこれに置き換えた: 受け手
+    /// (`on_gui_opened`) が空実装で「開いた」以上の意味を運んでおらず、
+    /// 同じ内容を 2 つの message で表す方が SSoT を割る。
+    SlotGuiGeometry {
         device_id: u64,
-        width: u32,
-        height: u32,
+        geometry: crate::model::EditorWindowGeometry,
     },
     /// Plugin-initiated close (X button handled by plugin, or `closed`).
     SlotGuiClosed { device_id: u64 },
@@ -880,6 +900,34 @@ mod tests {
             generation: 9,
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// r.md #65: エディタ窓のジオメトリは wire を渡って往復する
+    /// (daw_gui → plugin_host が復元値、plugin_host → daw_gui が観測値)。
+    /// 位置は **マルチモニタで負値になり得る**ので、そこも往復させる。
+    #[test]
+    fn editor_window_geometry_roundtrips_both_directions() {
+        let geometry = crate::model::EditorWindowGeometry {
+            x: -1920,
+            y: -8,
+            width: 1105,
+            height: 687,
+        };
+        let open = PluginCommand::OpenSlotGuiEmbedded {
+            device_id: 42,
+            title: "Plugin — Renoise Redux".to_string(),
+            geometry: Some(geometry),
+        };
+        assert_eq!(roundtrip(&open), open);
+        // 初回 open (保存値なし)。
+        let fresh = PluginCommand::OpenSlotGuiEmbedded {
+            device_id: 42,
+            title: "Plugin — Test".to_string(),
+            geometry: None,
+        };
+        assert_eq!(roundtrip(&fresh), fresh);
+        let report = PluginEvent::SlotGuiGeometry { device_id: 42, geometry };
+        assert_eq!(roundtrip(&report), report);
     }
 
     #[test]

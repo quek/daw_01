@@ -206,10 +206,6 @@ impl LoadedPlugin for Silence {
         Ok(false)
     }
 
-    fn gui_can_resize(&self) -> bool {
-        false
-    }
-
     fn gui_set_parent_hwnd(&self, _hwnd: u64) -> Result<()> {
         bail!("Silence builtin has no GUI")
     }
@@ -219,10 +215,6 @@ impl LoadedPlugin for Silence {
     }
 
     fn gui_hide(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn gui_set_size(&self, _width: u32, _height: u32) -> Result<()> {
         Ok(())
     }
 

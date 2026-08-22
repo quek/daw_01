@@ -303,6 +303,7 @@ impl AppData {
                 arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
                 arrange_header_w: 160.0,
                 piano_roll_views: std::collections::HashMap::new(),
+                plugin_editor_windows: std::collections::HashMap::new(),
                 multi_clip_view: common::model::PianoRollViewState::default(),
                 multi_clip_view_key: Vec::new(),
                 locked_pr_tracks: std::collections::HashSet::new(),
