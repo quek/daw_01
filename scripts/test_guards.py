@@ -199,7 +199,7 @@ CASES = [
     ("ps1-file/pos", "Write", {"file_path": "scripts/foo.ps1", "content": "x"}, 2, {"no-ps1-file"}, set()),
     ("ps1-file/neg", "Write", {"file_path": "scripts/foo.py", "content": "x"}, 0, set(), {"no-ps1-file"}),
     # no-command-chaining
-    ("chain/pos", "Bash", {"command": "cargo build && cargo test"}, 0, {"no-command-chaining"}, set()),
+    ("chain/pos", "Bash", {"command": "cargo build && cargo test"}, 2, {"no-command-chaining"}, set()),
     ("chain/neg", "Bash", {"command": "cargo build"}, 0, set(), {"no-command-chaining"}),
     # launch-no-tail-pipe
     ("tail/pos", "Bash", {"command": "cargo run -p daw_gui | tail -f log"}, 2, {"launch-no-tail-pipe"}, set()),
@@ -214,7 +214,7 @@ CASES = [
     ("dup/pos-run", "Bash", {"command": "cargo run -p daw_gui"}, 0, {"no-duplicate-app-launch"}, set()),
     ("dup/pos-exe", "Bash", {"command": "./target/debug/daw_gui.exe"}, 0, {"no-duplicate-app-launch"}, set()),
     ("dup/none-suppress", "Bash", {"command": "tasklist | grep daw_gui ; ./target/debug/daw_gui.exe"},
-     0, set(), {"no-duplicate-app-launch"}),
+     2, set(), {"no-duplicate-app-launch"}),   # exit 2 は連結ガード由来
     ("dup/neg-build", "Bash", {"command": "cargo build -p daw_gui"}, 0, set(), {"no-duplicate-app-launch"}),
     # git-add-broad
     ("add/pos-A", "Bash", {"command": "git add -A"}, 0, {"git-add-broad"}, set()),
@@ -359,9 +359,9 @@ CASES = [
     ("gap/pwsh-shebang", "Write",
      {"file_path": "scripts/release.sh", "content": "#!/usr/bin/env pwsh\nWrite-Host build\n"}, 2,
      {"no-pwsh-shebang"}, set()),
-    ("gap/chain-semicolon", "Bash", {"command": "git add a.rs ; git status"}, 0,
+    ("gap/chain-semicolon", "Bash", {"command": "git add a.rs ; git status"}, 2,
      {"no-command-chaining"}, set()),
-    ("gap/chain-or", "Bash", {"command": "cargo build || echo failed"}, 0,
+    ("gap/chain-or", "Bash", {"command": "cargo build || echo failed"}, 2,
      {"no-command-chaining"}, set()),
     ("gap/launch-pipe-head", "Bash", {"command": "cargo run -p daw_gui 2>&1 | head -30"}, 2,
      {"launch-no-tail-pipe"}, set()),
@@ -401,6 +401,47 @@ CASES = [
      {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md",
       "content": "## 要望: track 名の自動コントラスト 2026-06-15\n"},
      0, {"gui-conv-entry-format"}, set()),
+    # ---- no-command-chaining の絞り込み (メモリが許容している形は発火しない) ----
+    # メモリ feedback_no_command_chaining は「**独立した**コマンドの連結」を禁じ、
+    # 「シェル変数の共有や順序依存がある場合のみ連結を検討」と明示的に許容している。
+    # block へ上げた以上、許容形で誤爆すると正当な作業が止まるので全部固定する。
+    ("chain/neg-for-loop", "Bash", {"command": "for f in a b; do echo $f; done"}, 0,
+     set(), {"no-command-chaining"}),
+    ("chain/neg-if-then", "Bash", {"command": "if [ -f x ]; then echo y; fi"}, 0,
+     set(), {"no-command-chaining"}),
+    # 制御構文はキーワード単体ではなく対で判定する。単体だと `echo done` の done に当たって
+    # 「done を含む連結コマンド」が丸ごと素通りする (実装時に踏んだ)。
+    ("chain/pos-done-as-word", "Bash", {"command": "echo done ; echo more"}, 2,
+     {"no-command-chaining"}, set()),
+    ("chain/neg-fallback-true", "Bash", {"command": "cargo build || true"}, 0,
+     set(), {"no-command-chaining"}),
+    ("chain/neg-pipe-only", "Bash", {"command": "ls -la | head -5"}, 0,
+     set(), {"no-command-chaining"}),
+    ("chain/neg-varshare-single", "Bash", {"command": 'SP="/tmp/x"; ls "$SP"'}, 0,
+     set(), {"no-command-chaining"}),
+    ("chain/pos-varshare-multi", "Bash", {"command": 'SP="/tmp/x"; ls "$SP"; echo done'}, 2,
+     {"no-command-chaining"}, set()),
+    ("chain/neg-declared", "Bash", {"command": "DAW01_CHAIN=1 rm -rf x && mkdir x"}, 0,
+     set(), {"no-command-chaining"}),
+    # ---- 検査系が自分自身を検査対象にしてしまう問題 (fixture の自己発火) ----
+    # compromise-smell の検出語は、この harness の fixture とレジストリ本体に必ず出てくる。
+    # 除外が将来外れたら気付けるよう、除外側と **肯定側 (対照)** を対にして固定する。
+    # 肯定側が無いと「常に発火しない実装」でも緑になり、検査の証明にならない。
+    ("selfref/neg-harness-fixture", "Write",
+     {"file_path": "scripts/test_guards.py", "content": '("x", "Edit", {"new_string": "low-risk hack"})'},
+     0, set(), {"compromise-smell-en"}),
+    ("selfref/neg-registry", "Write",
+     {"file_path": ".claude/guards.jsonl", "content": '{"id":"x","all":["妥協|実装コスト"]}'},
+     0, set(), {"compromise-smell-ja"}),
+    ("selfref/neg-engine", "Write",
+     {"file_path": "scripts/guard_engine.py", "content": "# 検出語: low-risk / pragmatic\n"},
+     0, set(), {"compromise-smell-en"}),
+    ("selfref/pos-control-en", "Write",   # 対照: 同じ文字列でも通常のファイルなら発火する
+     {"file_path": "daw_gui/src/view/root.rs", "content": "// low-risk hack\n"},
+     0, {"compromise-smell-en"}, set()),
+    ("selfref/pos-control-ja", "Write",
+     {"file_path": "docs/plan_x.html", "content": "実装コストが低いのでこちらにする\n"},
+     0, {"compromise-smell-ja"}, set()),
     # ---- 「起動しない」つもりの検証コマンドが実際には起動する経路 ----
     ("testrun/pos-tests", "Bash", {"command": "cargo test -p daw_gui --tests"}, 2,
      {"no-bulk-test-run"}, set()),
@@ -806,11 +847,11 @@ def check_cd_guard():
         ("cd/pos-sibling-worktree", f'cd {SYN_ROOT}/.claude/worktrees/bar && ls', WT, 2, True),
         ("cd/pos-backslash", f'cd {SYN_ROOT_BS}\\.claude\\worktrees\\foo && ls', WT, 2, True),
         ("cd/pos-same-in-main-session", f'cd {SYN_ROOT} && git status', SYN_ROOT, 2, True),
-        ("cd/neg-elsewhere", "cd /tmp && ls", WT, 0, False),
-        ("cd/neg-subdir", "cd daw_gui && cargo build", WT, 0, False),
-        ("cd/neg-own-subdir-abs", f"cd {WT}/daw_gui && cargo build", WT, 0, False),
+        ("cd/neg-elsewhere", "cd /tmp", WT, 0, False),
+        ("cd/neg-subdir", "cd daw_gui", WT, 0, False),
+        ("cd/neg-own-subdir-abs", f"cd {WT}/daw_gui", WT, 0, False),
         ("cd/neg-not-a-cd", "cargo build", WT, 0, False),
-        ("cd/neg-no-cwd", f"cd {WT} && ls", None, 0, False),
+        ("cd/neg-no-cwd", f"cd {WT}", None, 0, False),
     ]
     for label, cmd, cwd, exp_exit, should in CCASES:
         rc, out = run_engine("Bash", {"command": cmd}, cwd=cwd)

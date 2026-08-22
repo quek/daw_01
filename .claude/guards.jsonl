@@ -27,9 +27,21 @@
 {"id":"no-pwsh-shebang","source":"feedback_no_powershell_cross_platform","tool":["Write","Edit","MultiEdit"],"field":"text","all":["(?m)^#!.*\\b(?:pwsh|powershell)\\b"],"action":"block","msg":"拡張子が .sh でも shebang が pwsh なら PowerShell スクリプト。#!/usr/bin/env bash か python にすること。"}
 
 # ---------------------------------------------------------------- Bash の使い方
-# escalate:false — `;` や `&&` は substring マッチなので、block にすると正当な複合コマンドまで
-# 取り消してしまう。nudge に留める。
-{"id":"no-command-chaining","source":"feedback_no_command_chaining","tool":["Bash"],"field":"command_code","all":["(?:&&|\\|\\||;)"],"action":"warn","escalate":false,"msg":"独立したコマンドを && / ; / || で連結しない。別々の Bash 呼び出しに分ける (必要なら並列)。連結すると承認の粒度が粗くなり、どこで失敗したかも分からなくなる。"}
+# 2026-08-22: warn (escalate:false) から **block** へ。実測に基づく判断:
+#   - この session の Bash 557 件のうち **88.5% が旧パターンに当たっていた**。
+#     永久 warn = 11% 前後の呼び出しに system-reminder を注入し続ける状態で、
+#     「無視される warn」は他のガードの注意喚起力まで削る。
+#   - 内訳を分類したところ **旧パターンの発火の約半分は違反ではなかった**:
+#     制御構文 (for/if は 1 論理コマンド) / `|| true` の握り潰し /
+#     `SP=...; cmd` の変数共有 — メモリは「シェル変数の共有や順序依存がある場合のみ
+#     連結を検討」と**明示的に許容**している。→ まず none で絞った。
+#   - 絞り込んでも残る分は、メモリが禁じている「独立したコマンドの連結」そのもの
+#     (`ls ... ; echo --- ; ls ...` の類) だった。守られていない正しい規則なので強制する。
+# 旧 escalate:false の理由 (「コミットメッセージ中の && で誤爆する」) は command_code の
+# masking で既に解決済み。前提が変わったので opt-out も外す。
+# 順序依存で本当に連結が要るときは `DAW01_CHAIN=1` を頭に付けて宣言する
+# (メモリが許容している形を、regex では判別できないため)。
+{"id":"no-command-chaining","source":"feedback_no_command_chaining","tool":["Bash"],"field":"command_code","all":["(?:&&|\\|\\||;)"],"none":["\\b(?:for|while|until)\\b[^\\n]*;[ \\t]*do\\b|\\bif\\b[^\\n]*;[ \\t]*then\\b|\\bcase\\b[^\\n]*\\bin\\b","\\|\\|\\s*(?:true|:)\\s*$","\\A[ \\t]*[A-Za-z_][A-Za-z0-9_]*=(?:(?!;|&&|\\|\\|).)*(?:;|&&)(?:(?!;|&&|\\|\\|).)*\\Z","\\bDAW01_CHAIN=1\\b"],"action":"block","msg":"独立したコマンドを && / ; / || で連結しない。別々の Bash 呼び出しに分ける (必要なら並列)。連結すると承認の粒度が粗くなり、どこで失敗したかも分からなくなる。制御構文 (for/if/case) と `|| true` と『変数代入 + 1 コマンド』は対象外。順序依存で本当に連結が要るなら DAW01_CHAIN=1 を頭に付けて宣言すること。"}
 {"id":"no-cd-prefix","source":"feedback_no_cd_prefix","tool":["Bash"],"field":"cd_redundant","all":["."],"action":"block","msg":"その cd は不要。Bash ツールは既にそのディレクトリで動いている (worktree セッションなら worktree で)。cd 先が main checkout や別 worktree の場合は、並行セッションのファイルを壊す経路そのもの。パスは作業ディレクトリ相対で書くこと。"}
 {"id":"no-full-disk-find","source":"feedback_no_full_disk_find","tool":["Bash"],"field":"command_code","all":["\\bfind\\s+(?:/|~|[A-Za-z]:[\\\\/])(?:\\s|$)"],"none":["-maxdepth"],"action":"block","msg":"ルートからの全ディスク走査は CPU とディスク I/O を長時間占有する。Glob / Grep ツールか既知パスを直接見る。どうしても find が要るなら -maxdepth + 具体的な起点に絞る。run_in_background でも同じ。"}
 
