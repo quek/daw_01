@@ -173,6 +173,24 @@ text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP
 - **テキストは rect で clip する**。横スクロールを持たない widget なので、欄からはみ出した
   グリフは隣の widget の上に重なって描かれてしまう (mixer strip の 30px 欄で顕在化)。
 
+### shortcut の属性は **登録側が宣言** する (`set_typing_only` / `set_repeatable`)
+
+- **非 char キー (矢印 / Home / End) を shortcut に bind したら `ShortcutMap::set_typing_only`
+  を必ず併せて宣言する**。 shortcut 層は frame 頭で `keyboard_events` から consume するので、
+  宣言しないと typing 中も global 消費され **全 text_input のカーソル移動と、矢印で候補を
+  選ぶ picker (`nav_up` / `nav_down`) が丸ごと死ぬ**。 素の文字キーは `bare_char_key` 判定で
+  自動的に typing 中 suppress されるが、矢印はそこに該当しない (daw_01 r.md #67)。
+- **OS の auto-repeat (押しっぱなし) は既定では shortcut にしない**。 shortcut は Delete /
+  複製のような離散コマンドに bind されるので、 repeat で連射されると「Delete 長押しで
+  トラックが次々消える」 類の破壊的挙動になる (daw_01 r.md #43)。 連続適用が自然な nudge 系
+  だけ `ShortcutMap::set_repeatable` を宣言する。 宣言した shortcut は 1 フレームに複数回
+  積まれうるので、 `Ui::take_shortcut(name)` (1 回だけ消費) ではなく
+  **`Ui::take_shortcut_count(name)`** で受けること — 前者だと押しっぱなしの適用量が
+  フレームレート次第で目減りする。
+- 旧実装は `is_typing_only_shortcut(name)` という自由関数が `"piano_roll.edit_lyric"` /
+  `"daw.goto_timeline_home"` のような **アプリ固有 name** をハードコードしていた
+  (= 汎用 UI ライブラリがドメイン知識を持つ)。 属性は binding の性質なので登録側が持つ。
+
 ### text_input の buffer 動作 (M14 Phase 59 で uncontrolled 化)
 - **`text_input_at` は `was_focused == true` 中は `TextInputState.buffer_text` を source-of-truth にする** (uncontrolled mode)。`text` 引数は **gained_focus 時の初期値** としてのみ使われ、 focus 中の typing は buffer を mutate する (毎フレーム reset しない)。 これにより piano_roll の歌詞 inline 編集 (#017) など「commit するまで model に書かない」 UX が caller boilerplate なしで実現可能。
 - **focus 中に外部から `text` 引数が変わっても buffer は反映しない** (= ユーザの typing が消えない)。 controlled 動作 (per-keystroke の model 更新) を望むなら caller が on_change で model 更新する既存パターンで OK (text == buffer なので挙動完全互換)。

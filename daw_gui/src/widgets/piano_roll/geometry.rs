@@ -6,21 +6,112 @@
 
 use super::*;
 
+/// **選択集合に共通の delta** を、集合のどれか 1 つが `[lo, hi]` を出る分だけ縮める
+/// (r.md #67)。
+///
+/// note の一括編集で `値 + delta` を **1 つずつ** clamp すると、 和音を拍 0 や
+/// pitch 0/127 に押し付けたときに端の音だけ止まって **相対位置が潰れる** (団子になる)。
+/// さらに逆方向に戻しても元に戻らない (可逆でない)。 delta 側を縮めれば集合の形は
+/// 常に保たれ、 端で止まったあと逆キーを押せば必ず元の配置へ戻る。
+///
+/// 空集合 / 非有限値しか無いときは `delta` をそのまま返す (defensive)。
+#[must_use]
+pub(crate) fn clamp_shared_delta(
+    values: impl IntoIterator<Item = f64>,
+    delta: f64,
+    lo: f64,
+    hi: f64,
+) -> f64 {
+    let mut min_delta = f64::NEG_INFINITY;
+    let mut max_delta = f64::INFINITY;
+    for v in values {
+        if !v.is_finite() {
+            continue;
+        }
+        min_delta = min_delta.max(lo - v);
+        max_delta = max_delta.min(hi - v);
+    }
+    // `f64::clamp` は lo > hi で panic するので min/max を順に当てる
+    // (既に下限を割っている degenerate な集合でも落ちない)。
+    delta.max(min_delta).min(max_delta)
+}
+
+/// [`clamp_shared_delta`] の pitch 版 (r.md #67)。
+///
+/// `fold_scale` が `Some` のときは **scale degree 空間** で clamp する
+/// (Fold 表示 / Snap on Draw では 1 ステップ = スケール音 1 つなので、
+/// 半音空間で clamp すると端の判定がずれる)。degree の上限は
+/// 「MIDI 127 以下で最も高い in-scale 音の degree」。
+#[must_use]
+pub(crate) fn clamp_shared_pitch_delta(
+    pitches: impl IntoIterator<Item = u8>,
+    delta: i32,
+    fold_scale: Option<PianoRollScale>,
+) -> i32 {
+    let (lo, hi) = match fold_scale {
+        Some(sc) => (0, sc.pitch_to_scale_degree(127)),
+        None => (0, 127),
+    };
+    let mut min_delta = i32::MIN;
+    let mut max_delta = i32::MAX;
+    for p in pitches {
+        let v = match fold_scale {
+            Some(sc) => sc.pitch_to_scale_degree(p),
+            None => i32::from(p),
+        };
+        min_delta = min_delta.max(lo - v);
+        max_delta = max_delta.min(hi - v);
+    }
+    delta.max(min_delta).min(max_delta)
+}
+
+/// resize の長さ下限 (拍)。snap 有効なら grid 1 つ (ただし `0.05` 未満にはしない)。
+/// drag overlay / release commit / 集合クランプが **同じ値** を使うための SSoT
+/// (別々に書くと overlay と確定値がずれる)。
+#[must_use]
+pub(super) fn drag_min_len(view: PianoRollView, alt: bool, zoom_x_px_per_beat: f32) -> f64 {
+    if view.snap.is_active(alt) {
+        view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+    } else {
+        0.05
+    }
+}
+
 /// (M14 Phase 70 / daw_01 #042) drag dy (px) から pitch delta (i32) を計算する mode-aware helper。
 ///
 /// - Linear / Highlight: 旧式 `dy * (pitch_visible / grid.h)` = 半音単位 delta。
 /// - Fold: `dy / row_h` = scale degree 単位 delta (= 可視 in-scale 行の数で割る)。
 ///
+/// 求めた delta は **集合クランプ** ([`clamp_shared_pitch_delta`]) を通してから返す
+/// (r.md #67 同件: 旧実装は `apply_pitch_drag_delta` が 1 音ずつ 0..=127 に clamp
+/// していたため、 和音を上端 / 下端へドラッグすると潰れて団子になっていた)。
+///
 /// 返り値は `apply_pitch_drag_delta` で anchor pitch に適用される。
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub(super) fn compute_pitch_drag_delta(view: PianoRollView, grid: Rect, dy: f32) -> i32 {
-    if matches!(view.scale.map(|s| s.mode), Some(PianoRollScaleMode::Fold)) {
+pub(super) fn compute_pitch_drag_delta(
+    nd: &NoteDragSession,
+    view: PianoRollView,
+    grid: Rect,
+    dy: f32,
+) -> i32 {
+    let fold = matches!(view.scale.map(|s| s.mode), Some(PianoRollScaleMode::Fold));
+    let raw = if fold {
         let geom = RowGeometry::compute(view, grid);
-        return (-(dy / geom.row_h.max(1.0))).round() as i32;
+        (-(dy / geom.row_h.max(1.0))).round() as i32
+    } else {
+        let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
+        (-(dy * pitch_per_px)).round() as i32
+    };
+    // pitch が動くのは Move のみ (resize は pitch 据え置き)。
+    if !matches!(nd.kind, NoteDragKind::Move) {
+        return raw;
     }
-    let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
-    (-(dy * pitch_per_px)).round() as i32
+    clamp_shared_pitch_delta(
+        nd.anchors.iter().map(|a| a.pitch),
+        raw,
+        if fold { view.scale } else { None },
+    )
 }
 
 /// (M14 Phase 70 / daw_01 #042 + 70b follow-up) anchor pitch に drag delta を適用、 新 pitch を
@@ -291,11 +382,19 @@ pub(super) fn velocity_bar_hit(
 /// anchor 0 の編集対象端 (Move=start / ResizeRight=end / ResizeLeft=start) の絶対位置を
 /// snap → その差分を全 anchor に適用 (相対関係維持 + anchor 0 が grid に着地)。 anchors が
 /// 空のときは raw を返す (defensive)。
+///
+/// 最後に **集合クランプ** ([`clamp_shared_delta`]) を通す (r.md #67 同件)。 旧実装は
+/// commit 側で 1 音ずつ `.max(0.0)` / `.max(min_len)` していたため、 和音を左端や最短長へ
+/// 押し付けると相対位置 / 相対長が潰れ、 逆方向へ戻しても元に戻らなかった。
+/// 位置の下限は **各 note の content-local 0** (`anchor.min_start_beat`) — model 側
+/// (`set_note_positions`) が content-local 拍を 0 で clamp するので、 widget の下限も
+/// song-absolute 0 ではなくそこに合わせないと handler 側で結局潰れる。
 pub(super) fn compute_note_drag_beat_delta(
     nd: &NoteDragSession,
     raw_beat_delta: f64,
     snap: &SnapConfig,
     zoom_x_px_per_beat: f32,
+    min_len: f64,
 ) -> f64 {
     let Some(a0) = nd.anchors.first() else {
         return raw_beat_delta;
@@ -306,7 +405,38 @@ pub(super) fn compute_note_drag_beat_delta(
     };
     let snapped_pivot =
         snap.snap_beat(pivot + raw_beat_delta, nd.last_alt, zoom_x_px_per_beat);
-    snapped_pivot - pivot
+    let delta = snapped_pivot - pivot;
+    match nd.kind {
+        // start + delta >= min_start ⟺ (start - min_start) + delta >= 0
+        NoteDragKind::Move => clamp_shared_delta(
+            nd.anchors.iter().map(|a| a.start_beat - a.min_start_beat),
+            delta,
+            0.0,
+            f64::INFINITY,
+        ),
+        // len + delta >= min_len
+        NoteDragKind::ResizeRight => clamp_shared_delta(
+            nd.anchors.iter().map(|a| a.len_beats),
+            delta,
+            min_len,
+            f64::INFINITY,
+        ),
+        // 左端を動かすので start は下限、 len (= -delta ぶん縮む) は最短長の 2 条件。
+        NoteDragKind::ResizeLeft => {
+            let d = clamp_shared_delta(
+                nd.anchors.iter().map(|a| a.start_beat - a.min_start_beat),
+                delta,
+                0.0,
+                f64::INFINITY,
+            );
+            -clamp_shared_delta(
+                nd.anchors.iter().map(|a| a.len_beats),
+                -d,
+                min_len,
+                f64::INFINITY,
+            )
+        }
+    }
 }
 
 /// drag preview の shifted note geometry を計算 (drag 中の表示用、元 Note は不変)。
