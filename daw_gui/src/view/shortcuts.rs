@@ -386,8 +386,8 @@ mod tests {
     /// (エディタ窓を全部閉じる) の 3 つだけ。
     ///
     /// 素の英数字キー (P / R / F / S / D / …) を足すとプラグイン自身のショートカットと
-    /// 衝突する。 Home / End / Delete / Ctrl+X / Ctrl+C / Ctrl+V / Ctrl+A は
-    /// `is_typing_only_shortcut` が既に「テキスト入力へ譲る」 と宣言している集合なので
+    /// 衝突する。 Home / End / Delete / Ctrl+X / Ctrl+C / Ctrl+V / Ctrl+A / 矢印は
+    /// `typing_only` 宣言で既に「テキスト入力へ譲る」 と決めている集合なので
     /// 外部窓からも奪わない。 Esc / Tab / F1 はプラグイン自身のポップアップ閉じ /
     /// フォーカス移動 / ヘルプ。 この境界が緩むのを防ぐ。
     ///

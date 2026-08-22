@@ -1,4 +1,5 @@
 use super::*;
+use crate::widgets::text_input::TextInputStyle;
 use daw_ui_renderer::Color;
 use std::sync::Arc;
 
@@ -394,7 +395,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
             ..Default::default()
         },
         |_, ui| {
-            ui.text_input_at("ti", rect, "", |new| {
+            ui.text_input_at("ti", rect, "", &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -419,7 +420,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -444,7 +445,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -499,7 +500,7 @@ fn text_input_ime_preedit_then_commit() {
             ..Default::default()
         },
         |_, ui| {
-            ui.text_input_at("ti", rect, "", |new| {
+            ui.text_input_at("ti", rect, "", &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -522,7 +523,7 @@ fn text_input_ime_preedit_then_commit() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -542,7 +543,7 @@ fn text_input_ime_preedit_then_commit() {
             ..Default::default()
         },
         |m, ui| {
-            ui.text_input_at("ti", rect, &m.text, |new| {
+            ui.text_input_at("ti", rect, &m.text, &TextInputStyle::default(), |new| {
                 Edit::mutate(|m: &mut Doc| m.text = new)
             });
         },
@@ -666,6 +667,7 @@ fn typing_focus_blocks_global_delete_shortcut() {
                 h: 24.0,
             },
             "x",
+            &TextInputStyle::default(),
             |_| Edit::mutate(|()| {}),
         );
     });
@@ -698,6 +700,7 @@ fn typing_focus_blocks_global_delete_shortcut() {
                     h: 24.0,
                 },
                 "x",
+                &TextInputStyle::default(),
                 |_| Edit::mutate(|()| {}),
             );
         },
@@ -795,6 +798,7 @@ fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
                 h: 24.0,
             },
             "x",
+            &TextInputStyle::default(),
             |_| Edit::mutate(|()| {}),
         );
     });
@@ -825,6 +829,7 @@ fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
                     h: 24.0,
                 },
                 "x",
+                &TextInputStyle::default(),
                 |_| Edit::mutate(|()| {}),
             );
         },
@@ -896,7 +901,9 @@ fn typing_focus_blocks_declared_typing_only_arrow() {
 
     // Frame 1: text_input に focus (frame 末尾で last_typing_focus = true)。
     host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
-        ui.text_input_at_focused("ti", ti_rect, "x", |_| Edit::mutate(|()| {}));
+        ui.text_input_at_focused("ti", ti_rect, "x", &TextInputStyle::default(), |_| {
+            Edit::mutate(|()| {})
+        });
     });
 
     let key = |pk| KeyEvent {
@@ -918,7 +925,9 @@ fn typing_focus_blocks_declared_typing_only_arrow() {
         |(), ui| {
             typing_only_fired.set(ui.take_shortcut("test.arrow_typing_only"));
             global_fired.set(ui.take_shortcut("test.arrow_global"));
-            ui.text_input_at_focused("ti", ti_rect, "x", |_| Edit::mutate(|()| {}));
+            ui.text_input_at_focused("ti", ti_rect, "x", &TextInputStyle::default(), |_| {
+            Edit::mutate(|()| {})
+        });
         },
     );
     assert!(
