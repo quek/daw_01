@@ -1686,7 +1686,7 @@ impl EditorSizer for Vst3Sizer {
         }
     }
 
-    fn current_client_size(&self) -> Option<(u32, u32)> {
+    fn plugin_view_size(&self) -> Option<(u32, u32)> {
         let view = self.view()?;
         let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
         if unsafe { view.getSize(&mut rect) } != kResultOk {

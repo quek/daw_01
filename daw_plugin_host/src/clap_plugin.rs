@@ -1187,7 +1187,7 @@ impl EditorSizer for ClapSizer {
         }
     }
 
-    fn current_client_size(&self) -> Option<(u32, u32)> {
+    fn plugin_view_size(&self) -> Option<(u32, u32)> {
         let gui = self.gui()?;
         let f = gui.get_size?;
         let (mut w, mut h) = (0u32, 0u32);
