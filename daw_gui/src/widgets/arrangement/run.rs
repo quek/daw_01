@@ -263,7 +263,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                         anchor_gain_db: c.audio_edit.map_or(0.0, |a| a.gain_db),
                         anchor_fade,
                         clip_rect_anchor: r_anchor,
-                        clip_len_beats_anchor: c.len_beats,
+                        content_map_anchor: content_map(c, view, lanes),
                         clip_bg_anchor: draw::clip_effective_fill(c, t.kind, style),
                         anchor_mouse: (px, py),
                         last_mouse: (px, py),
@@ -1944,16 +1944,20 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // M14 Phase 63n-9 (#033): curve param drag session の overlay clone (cached 外で handle + preview
         // curve segment を描画、 drag 中のみ true value で live update)。
         let curve_param_overlay = automation_curve_param_session;
-        // M9 Phase 45f: drag overlay の Resize min_len は snap unit (snap_unit < 0.05 なら 0.05)。
+        // M9 Phase 45f: drag overlay の Resize min_len は snap unit。 下限は model の
+        // `MIN_CLIP_LEN_BEATS` (= `resize_clip` の clamp と同じ 1/16)。 r.md #68: ここが
+        // 0.05 だったので、 snap off (Alt) で 1/16 未満までゴーストが縮み、 release で
+        // 1/16 に戻る = preview ≠ commit だった。
         // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う
         // (overlay と release commit が必ず同一 unit で確定する)。 overlay 不在時 (drag していない)
         // は min_len 自体使われないので、 alt = false で適当な値で初期化しておけばよい。
+        const MIN_CLIP_LEN: f64 = common::model::MIN_CLIP_LEN_BEATS;
         let drag_overlay_alt =
             clip_drag_overlay.as_ref().is_some_and(|(nd, _, _)| nd.last_alt);
         let drag_overlay_min_len: f64 = if view.snap.is_active(drag_overlay_alt) {
-            view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+            view.snap.beat_unit(zoom_x_px_per_beat).map_or(MIN_CLIP_LEN, |u| u.max(MIN_CLIP_LEN))
         } else {
-            0.05
+            MIN_CLIP_LEN
         };
         let loop_preview_clone = loop_drag_preview_range;
         let header_pane_copy = header_pane;
@@ -2049,97 +2053,24 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // heavy() closure は `'static` 要求なので id を hash 化して move capture。
         let id_for_inner: u64 = hash_inputs(id);
 
-        // S4b Phase C: 波形 / MIDI プレビューの中身を model + audio cache から 1 フレーム分だけ
-        // 集めて closure に move する (`Arc<AudioSourceBuffer>` は refcount clone で安価)。 visible
-        // clip のみ (`visible_tracks`)。 描画は下の non-cached 領域で共有 inset を使って行う。
-        let clip_content: HashMap<ClipKey, ClipContentDraw> = {
-            let mut map: HashMap<ClipKey, ClipContentDraw> = HashMap::new();
-            // SongTempo automation を持つ曲だけ曲線評価になる (無ければ定数 = 従来と同コスト)。
-            let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
-            for t in &visible_tracks {
-                if t.id == MASTER_TRACK_ID {
-                    continue;
-                }
-                let Some(mt) = app.song_doc.song().tracks.iter().find(|mt| mt.id == t.id) else {
-                    continue;
-                };
-                for c in &t.clips {
-                    let Some(mc) = mt.clips.iter().find(|mc| mc.id == c.id) else {
-                        continue;
-                    };
-                    let Some(content) = app.song_doc.song().clip_contents.get(&mc.content_id) else {
-                        continue;
-                    };
-                    let key = ClipKey { track: t.id, clip: c.id };
-                    if let Some(audio_events) = content.audio_events() {
-                        // r.md #41: clip 内の **全** audio event を、 engine と同じ時間写像
-                        // (`event_wave_spans`) が返す span 列で描く。 Slice はスライスの
-                        // trigger 位置と gap、 Stretch は warp 区間、 逆再生は反転が
-                        // そのまま span に乗るので、 描画側に mode 分岐は要らない。
-                        // tempo は SongTempo automation 込みで engine と同じ写像を得る
-                        // (native rate 再生は current_bpm に依存する)。
-                        let mut spans = Vec::new();
-                        let mut events: Vec<AudioEventDraw> = Vec::new();
-                        for (ev_i, ev) in audio_events.iter().enumerate() {
-                            let Some(buffer) = app.media.audio_source_cache.get(ev.source_id) else {
-                                // decode 待ち / missing source は skip (他 event は描く)。
-                                continue;
-                            };
-                            common::audio_render::event_wave_spans(
-                                ev,
-                                buffer.sample_rate,
-                                &tempo_map,
-                                // r.md #44: event の song 位置は content 原点基準
-                                // (tempo 曲線の評価位置に使う)。
-                                mc.content_to_song_beat(ev.event_start_in_clip_beats),
-                                &mut spans,
-                            );
-                            if spans.is_empty() {
-                                continue;
-                            }
-                            events.push(AudioEventDraw {
-                                buffer,
-                                source_id: ev.source_id,
-                                // 波形 widget の LOD state キー。 `AudioEvent.id` は
-                                // 安定 id (undo / 並べ替えを跨ぐ) なので decode 完了で
-                                // 詰め方が変わっても pyramid が入れ替わらない。 未採番
-                                // (0 sentinel) の古い song だけ model index に degrade。
-                                key: if ev.id != 0 {
-                                    u64::from(ev.id)
-                                } else {
-                                    u64::MAX - ev_i as u64
-                                },
-                                // widget は **clip の窓ローカル** 座標で描くので、
-                                // content-local な event 位置から窓 offset を引く。
-                                start_in_clip_beats: ev.event_start_in_clip_beats
-                                    - mc.content_offset_beats,
-                                len_beats: ev.event_length_beats,
-                                stretch_mode: ev.stretch_mode,
-                                spans: std::mem::take(&mut spans),
-                            });
-                        }
-                        if !events.is_empty() {
-                            map.insert(key, ClipContentDraw::Audio { events });
-                        }
-                    } else if let Some(notes) = content.notes()
-                        && !notes.is_empty()
-                    {
-                        let nd: Vec<MidiNoteDraw> = notes
-                            .iter()
-                            .map(|n| MidiNoteDraw {
-                                pitch: n.pitch,
-                                // 窓ローカル座標 (r.md #44)。
-                                start_beat: n.start_beat - mc.content_offset_beats,
-                                duration_beats: n.duration_beats,
-                                velocity: n.velocity,
-                            })
-                            .collect();
-                        map.insert(key, ClipContentDraw::Midi { notes: nd, len_beats: mc.length_beats });
-                    }
-                }
-            }
-            map
-        };
+        // S4b Phase C / r.md #68: 波形 / MIDI プレビューの中身を model + audio cache から
+        // 1 フレーム分だけ集めて closure に move する (`Arc<AudioSourceBuffer>` は refcount
+        // clone で安価)。 visible clip のみ。 座標は **content-local 拍** で、 画面 x への
+        // 換算は widget 側の `content_map` (content 原点 + ビューのズーム) が 1 本で行う。
+        // SongTempo automation を持つ曲だけ曲線評価になる (無ければ定数 = 従来と同コスト)。
+        // base とゴーストで **同じ写像** を使う (engine と同じ `event_wave_spans` の入力)。
+        let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
+        let clip_content = content_build::build_clip_content(app, &tempo_map, &visible_tracks);
+        // r.md #68: Shift + 端 drag (= time-stretch) のときだけ、 ゴーストの中身を
+        // commit と同じ `stretch_remap` + `event_wave_spans` で組み直す (Slice 配置 /
+        // Raw→Stretch 昇格まで含めてプレビュー = 確定結果)。 トリム / 移動では確定後の
+        // 中身が base と同一なので空 = 描画側が `clip_content` をそのまま使う。
+        let stretch_ghost_content = content_build::build_stretch_ghost_content(
+            app,
+            &tempo_map,
+            clip_drag_overlay.as_ref(),
+            drag_overlay_min_len,
+        );
 
         let viewport_key_hash: u64 = hash_inputs(viewport_key);
         // r.md #58: フェードの掴む正方形を出す clip。 `response.hovered_clip` は上の
@@ -2148,7 +2079,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // `viewport_key` にも `fold_arrangement_clip_hash` にも入れないこと。
         let hovered_clip_for_heavy: Option<ClipKey> = response.hovered_clip;
         ui.heavy(("arrangement_inner", &id), move |hctx| {
-            render::render_arrangement_heavy(hctx, tracks_owned, view_copy, style_copy, lanes, ruler, header_pane, header_pane_copy, arranger_rect_copy, arranger_header_rect_copy, arranger_lane_h_copy, beat_per_px, zoom_x_px_per_beat, id_for_inner, viewport_key_hash, hovered_clip_for_heavy, clip_content, selected_set, selected_tracks_for_heavy, selected_automation_clips_set_for_heavy, selected_automation_points_for_heavy, mapping, sample_viewport, grid_style, ruler_style, drag_overlay_clone, drag_overlay_min_len, audio_drag_overlay, point_drag_overlay, automation_clip_drag_overlay, curve_param_overlay, lasso_overlay, section_drag_overlay, sections_for_draw, reorder_overlay, loop_preview_clone);
+            render::render_arrangement_heavy(hctx, tracks_owned, view_copy, style_copy, lanes, ruler, header_pane, header_pane_copy, arranger_rect_copy, arranger_header_rect_copy, arranger_lane_h_copy, beat_per_px, zoom_x_px_per_beat, id_for_inner, viewport_key_hash, hovered_clip_for_heavy, clip_content, stretch_ghost_content, selected_set, selected_tracks_for_heavy, selected_automation_clips_set_for_heavy, selected_automation_points_for_heavy, mapping, sample_viewport, grid_style, ruler_style, drag_overlay_clone, drag_overlay_min_len, audio_drag_overlay, point_drag_overlay, automation_clip_drag_overlay, curve_param_overlay, lasso_overlay, section_drag_overlay, sections_for_draw, reorder_overlay, loop_preview_clone);
         });
 
         release::commit_releases(ui, wid, &mut response, pointer, view, style, master_row, sections, selected_clips, selected_automation_clips, selected_automation_points, &visible_tracks, &press_tops, lanes, ruler, header_pane, arranger_rect, lanes_h, arranger_lane_h, beat_per_px, zoom_x_px_per_beat, clip_drag_release, clip_short_click_pos, audio_drag_release, point_drag_release, automation_clip_drag_release, automation_curve_param_release, automation_lasso_release, lane_resize_drag_release, section_drag_release, loop_drag_release, track_volume_release, pending_drop);

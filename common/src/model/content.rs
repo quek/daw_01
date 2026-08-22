@@ -8,6 +8,24 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+/// Clip の最小長 (拍) = 1/16。端 drag の trim / stretch はこの値まで縮められる。
+///
+/// r.md #68: **drag preview と commit の共通下限**。widget 側 (`arrangement` の
+/// resize preview) と handler 側 (`AppData::resize_clip`) が別々のリテラルを持って
+/// いると、最小長付近でゴーストと確定結果がずれる (snap off = Alt drag のときだけ
+/// 露呈する類のずれ)。両方ここを参照する。
+pub const MIN_CLIP_LEN_BEATS: f64 = 0.0625;
+
+/// Note の最小長 (拍) = 1/16。ピアノロールの端 drag / 新規ノート作成はこの値まで縮められる。
+///
+/// r.md #68 同件: [`MIN_CLIP_LEN_BEATS`] と同じ理由で **preview と commit の共通下限**。
+/// widget 側 (`piano_roll` の resize preview) が `0.05`、handler 側
+/// (`AppData::resize_notes` / `resize_note`) が `0.0625` と割れていたため、
+/// snap off (Alt) で 1/16 未満まで縮めるとゴーストより長く確定していた。
+/// `ResizeLeft` ではさらに悪く、start は見えたとおりに確定するのに長さだけ伸ばされる
+/// ので、**固定していたはずの右端が動く**。
+pub const MIN_NOTE_LEN_BEATS: f64 = 0.0625;
+
 /// A clip is a free-time container of notes positioned along the song
 /// timeline. `start_beat` and `length_beats` define where the clip lives;
 /// the actual notes are stored in `Song.clip_contents` keyed by
@@ -883,10 +901,18 @@ pub struct VideoEvent {
     pub source_id: VideoSourceId,
     /// Clip-local beat at which the event starts.
     pub event_start_in_clip_beats: f64,
-    /// Duration of the event in clip-local beats. The source range
-    /// (`source_end_micros - source_start_micros`) maps onto this
-    /// duration at project tempo; tempo changes are not interpolated
-    /// for MVP (= CFR assumption).
+    /// Duration of the event in clip-local beats = **how long the event is
+    /// visible**, not a time-stretch factor.
+    ///
+    /// r.md #68: the source advances at **1:1 real time** —
+    /// `source_micros = source_start_micros + elapsed_real_micros`, clamped to
+    /// `source_end_micros` (`daw_gui::video_playback::active_video_frames` /
+    /// `render_video`). Lengthening the event therefore does *not* slow the
+    /// footage down; it freezes on the last frame once the source range is
+    /// exhausted, and shortening it simply cuts playback early. (The doc here
+    /// used to claim the source range is mapped onto `event_length_beats` at
+    /// project tempo, which no implementation has ever done — it misled the
+    /// #68 diagnosis into predicting that trimming a video clip stretches it.)
     pub event_length_beats: f64,
     /// Source-relative start position in microseconds (libav
     /// `AV_TIME_BASE` units). Disjoint from `AudioEvent`'s

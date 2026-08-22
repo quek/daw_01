@@ -17,6 +17,11 @@ use crate::view::snap::{self, SNAP_LABELS};
 use crate::view::track_color;
 use crate::widgets::select_modifier::{RangeItem, SelectModifier, range_block};
 
+/// r.md #68 同件: ノート長の下限は **model と共有** する (`AppData::resize_notes` /
+/// `resize_note` の clamp と同じ値)。 widget 側だけ別リテラル (旧: `0.05`) を持つと、
+/// snap off (Alt) の端 drag でゴーストより長く確定する = preview ≠ commit。
+const MIN_NOTE_LEN: f64 = common::model::MIN_NOTE_LEN_BEATS;
+
 /// Snap toolbar / legend の小さめトグル (標準の角丸 6px・14px 文字より 1 段小さい)。
 /// 色は毎フレームのパレットから引く (r.md #48: `const` はテーマ切替に追従できない)。
 fn snap_toggle_style(p: &Palette) -> ToggleButtonStyle {
@@ -320,7 +325,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let pitch = (geom.y_to_pitch_f(py).ceil() as i32).clamp(0, 127) as u8;
             // warp 先 = 既定長ノートの右端の screen x (Ableton Live 流)。
             // カーソルをここへ動かし、 anchor をここに置く = カーソル＝掴んでいる右端が一致。
-            let default_len = view.default_note_len_beats.max(0.0625);
+            let default_len = view.default_note_len_beats.max(MIN_NOTE_LEN);
             #[allow(clippy::cast_possible_truncation)]
             let warp_x = grid.x + ((start_beat + default_len - view.start_beat) / beat_per_px) as f32;
             ui.warp_cursor(warp_x, py);
@@ -1022,15 +1027,19 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         let selected_set: HashSet<NoteId> = selected.iter().copied().collect();
         let drag_overlay_clone = drag_overlay.clone();
         let lyric_editing_for_draw = lyric_editing;
-        // M9 Phase 45f: drag overlay の Resize min_len は snap unit に合わせる
-        // (snap_unit < 0.05 なら 0.05)。 release 側 min_len と同じ計算で一貫性確保。 alt 真値は
+        // M9 Phase 45f: drag overlay の Resize min_len は snap unit に合わせる。 下限は
+        // model の `MIN_NOTE_LEN_BEATS` (= `resize_notes` の clamp と同じ 1/16。 r.md #68 同件:
+        // ここが 0.05 だと snap off で「ゴーストより長く確定する」)。
+        // release 側 min_len と同じ計算で一貫性確保。 alt 真値は
         // drag session の `last_alt` (overlay と release commit が必ず同一 unit で確定する)。
         // overlay 不在時 (drag していない) は min_len 自体使われないので alt = false で適当に初期化。
         let drag_overlay_alt = drag_overlay.as_ref().is_some_and(|(nd, _, _)| nd.last_alt);
         let drag_overlay_min_len: f64 = if view.snap.is_active(drag_overlay_alt) {
-            view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+            view.snap
+                .beat_unit(zoom_x_px_per_beat)
+                .map_or(MIN_NOTE_LEN, |u| u.max(MIN_NOTE_LEN))
         } else {
-            0.05
+            MIN_NOTE_LEN
         };
         // (M14 Phase 64 / daw_01 #018) velocity drag preview: drag 中なら target_ids の bar を
         // current pointer.y → 絶対 velocity の値で描画 override。 None のときは note.velocity 通常描画。
@@ -1123,6 +1132,23 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     &style_copy,
                 );
             }
+            // M14 Phase 59: lyric 描画 (selection overlay より後 = 黄色 fill に隠れない、
+            // 編集中 note は text_input overlay に譲る)。 font_size は note 高さスケール。
+            //
+            // r.md #70: **ドラッグ preview より前** に描く。 歌詞は静止ノート
+            // (`visible_owned` = 未シフト) のものなので、 ghost の後に描くと掴んで
+            // 動かしているノートの上に他ノートの歌詞が乗る (Arranger のセクション帯と
+            // 同じ「base を全部描いてから ghost」 違反)。 selection overlay の直後なので
+            // Phase 59 の意図 (黄色 fill に歌詞を隠されない) は保たれる。
+            draw_lyrics(
+                hctx,
+                &visible_owned,
+                view_copy,
+                grid,
+                style_copy.lyric_color,
+                style_copy.lyric_font_px,
+                lyric_editing_for_draw,
+            );
             // drag preview (drag 中の shifted rect)
             if let Some((nd, bd, pd)) = drag_overlay_clone {
                 draw_drag_preview(
@@ -1158,17 +1184,6 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     });
                 }
             }
-            // M14 Phase 59: lyric 描画 (selection overlay より後 = 黄色 fill に隠れない、
-            // 編集中 note は text_input overlay に譲る)。 font_size は note 高さスケール。
-            draw_lyrics(
-                hctx,
-                &visible_owned,
-                view_copy,
-                grid,
-                style_copy.lyric_color,
-                style_copy.lyric_font_px,
-                lyric_editing_for_draw,
-            );
             // (M14 Phase 69 / daw_01 #041) loop band overlay (ruler 上、 cached の外で毎 frame 描画)。
             // drag preview range があれば preview を、 無ければ `view.loop_range` を描画。 ruler_h <= 0
             // のときは `ruler.h = 0` なので描画 helper 内で band_w = 0 となり no-op (= 旧 API 互換)。
@@ -1238,7 +1253,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
             // 長さは caller の既定長 (= last_note_duration_beats) に統一。下限 1/16。widget は
             // song-absolute → model は clip-local (clip_origin_beat を引く)。id は handler が採番。
-            let insert_len = view.default_note_len_beats.max(0.0625);
+            let insert_len = view.default_note_len_beats.max(MIN_NOTE_LEN);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::AddNote {
                     track: target.track,
@@ -1352,10 +1367,13 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // 1 scale degree なので、 ここだけ半音換算 (dy × pitch_per_px) にすると
             // ghost で見た位置と別の pitch に commit してしまう。
             let pitch_delta = compute_pitch_drag_delta(view, grid, dy);
+            // r.md #68 同件: overlay と同じ下限 (model の `MIN_NOTE_LEN_BEATS`)。
             let min_len = if view.snap.is_active(release_alt) {
-                view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+                view.snap
+                    .beat_unit(zoom_x_px_per_beat)
+                    .map_or(MIN_NOTE_LEN, |u| u.max(MIN_NOTE_LEN))
             } else {
-                0.05
+                MIN_NOTE_LEN
             };
 
             match nd.kind {

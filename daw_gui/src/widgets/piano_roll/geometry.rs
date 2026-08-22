@@ -365,7 +365,7 @@ pub(super) fn note_create_geometry(
     beat_per_px: f64,
     zoom_x_px_per_beat: f32,
 ) -> (f64, f64, u8) {
-    let default_len = view.default_note_len_beats.max(0.0625);
+    let default_len = view.default_note_len_beats.max(common::model::MIN_NOTE_LEN_BEATS);
     let len = if nc.dragged {
         let raw_delta = f64::from(nc.last_mouse.0 - nc.anchor_mouse.0) * beat_per_px;
         let pivot = nc.start_beat + default_len;

@@ -294,7 +294,7 @@ impl AppData {
         pitch: u8,
     ) {
         let start_beat = start_beat.max(0.0);
-        let duration = duration.max(0.0625);
+        let duration = duration.max(common::model::MIN_NOTE_LEN_BEATS);
         // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw。
         // scale_changes が空なら scale_at が None → unwrap_or で raw pitch
         // 維持 = 機能 OFF と同じ挙動。
@@ -413,7 +413,8 @@ impl AppData {
                     for (local, start, duration) in updates {
                         if let Some(note) = notes.get_mut(local) {
                             note.start_beat = start.max(0.0);
-                            note.duration_beats = duration.max(0.0625);
+                            note.duration_beats =
+                                duration.max(common::model::MIN_NOTE_LEN_BEATS);
                             winners.push(local as u32);
                         }
                     }
@@ -422,7 +423,8 @@ impl AppData {
             },
         );
         if let Some(&(_, _, duration)) = entries.last() {
-            self.ui_prefs.last_note_duration_beats = duration.max(0.0625);
+            self.ui_prefs.last_note_duration_beats =
+                duration.max(common::model::MIN_NOTE_LEN_BEATS);
         }
     }
 
@@ -517,7 +519,7 @@ impl AppData {
         note_idx: u32,
         new_duration: f64,
     ) {
-        let new_duration = new_duration.max(0.0625);
+        let new_duration = new_duration.max(common::model::MIN_NOTE_LEN_BEATS);
         let remap = self
             .edit_song(|song| {
                 let notes = song.notes_in_clip_mut(track_idx as usize, clip_idx as usize)?;
