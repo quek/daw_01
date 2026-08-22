@@ -7,6 +7,8 @@
 //!
 //! すべて blocking (background thread / `cx.spawn` worker で呼ぶ前提)。
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 
 use common::model::{Note, TalkParams};
@@ -14,6 +16,18 @@ use common::voicevox::{
     FRAME_RATE, Phoneme, QUERY_SPEAKER, VOICEVOX_URL, build_sing_query, talk_pre_silence_frames,
     urlencoding_encode,
 };
+
+/// このファイルの HTTP はすべて **query 系** (声一覧の取得 / 口パク用の phoneme タイミング
+/// 取得) の timeout。 音声 **合成** は呼ばないので軽く、5 秒で足りる
+/// (合成は daw_plugin_host 側の責務で、あちらは数十秒かかり得るため
+/// `SYNTH_HTTP_TIMEOUT_SECS = 120` を別に持つ)。
+///
+/// **3 つの client すべてがこの 1 つを参照すること。** 以前は数値をリテラルで書いており、
+/// `query_phonemes` だけ timeout の指定が漏れていた (`Client::new()`)。engine が応答を
+/// 返さないと口パク生成の背景スレッドが永久に待ち、`lipsync_inflight` が解けず
+/// 「口パク生成中」 のオーバーレイとクリップ上スピナーが点いたままになる
+/// (2026-06-06 コードレビュー High #5 の同件、2026-08-22 修正)。
+const QUERY_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `/singers` レスポンスの 1 entry。 1 キャラクターと、 そのスタイル (= sing 用 style id 群)。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -47,7 +61,7 @@ pub fn fetch_speakers() -> anyhow::Result<Vec<VoiceVoxSinger>> {
 /// `[{name, styles:[{id, name}]}]` の同型レスポンスを返す。blocking、5 秒 timeout。
 fn fetch_voices(path: &str) -> anyhow::Result<Vec<VoiceVoxSinger>> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(QUERY_HTTP_TIMEOUT)
         .build()?;
     let resp = client.get(format!("{VOICEVOX_URL}{path}")).send()?;
     let body = resp.text()?;
@@ -84,7 +98,9 @@ fn fetch_voices(path: &str) -> anyhow::Result<Vec<VoiceVoxSinger>> {
 /// 戻り値は先頭/末尾の `REST_FRAMES` 分の `pau` も含む VOICEVOX 生の phoneme 列 (frame 0 起点)。
 /// beat への配置は `common::lipsync` 側で行う。
 pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(QUERY_HTTP_TIMEOUT)
+        .build()?;
     let query = build_sing_query(notes, bpm);
     let url = format!("{VOICEVOX_URL}/sing_frame_audio_query?speaker={QUERY_SPEAKER}");
     let resp = client
@@ -134,7 +150,7 @@ pub fn query_talk_phonemes(
     scales: &TalkParams,
 ) -> Result<Vec<Phoneme>> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(QUERY_HTTP_TIMEOUT)
         .build()?;
     let url = format!(
         "{}/audio_query?speaker={}&text={}",
