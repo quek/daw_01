@@ -546,8 +546,12 @@ fn run_worker(
     let mut warned_missing: Option<u64> = None;
 
     loop {
+        // 仕事が来るまでの park。不変条件 4 が禁じているのは「**他プロセスの完了待ち**を
+        // 無限にすること」で、この wake は同一プロセス内の dispatch 側が起こす。
+        // RT deadline を握らない (起きなければ何も走らないだけ)。audio 側から見た
+        // この worker の完了待ちは daw_audio が DISPATCH_TIMEOUT_MS で bounded にしている。
         unsafe {
-            WaitForSingleObject(wake.0, INFINITE);
+            WaitForSingleObject(wake.0, INFINITE); // arch-lint: allow-infinite
         }
         if shutdown.load(Ordering::Acquire) {
             break;
