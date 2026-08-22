@@ -25,10 +25,36 @@ rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 # 違反 7 行を抱えたまま「OK (違反なし)」を出していた。**シェル経由でも壊れない表記**
 # (POSIX ブラケット式 `[(]` `[)]` `[[]` `[]]` `[[:space:]]`、単語境界は grep -w) だけを使い、
 # 下の canary で毎回「検査器が実際に効いているか」を確かめる。
+
+# 検査パターンは **1 箇所で定義**して canary と本体で同じものを使う。別々に書くと
+# 「canary は通るが本体は壊れている」が成立してしまい、canary が証明にならない。
+INFINITE_RE='WaitForSingleObject[(][^,]*,[[:space:]]*INFINITE'
+POSKEY_RE='HashMap<[(]u32,[[:space:]]*u32[)]'
+UNTAGGED_RE='^[[:space:]]*#[[]serde[(]untagged[)][]]'
+PROTOCOL_RE='(MainToChild|ChildToMain)'
+
+# 個別に正当化された箇所を落とす。**行内マーカー**にしているのは、除外の理由を
+# その場に書かせるため (パターン側で広く除外すると、次に同じ形が入っても気付けない)。
+strip_allowed() { grep -v "arch-lint: allow-$1"; }
+
 canary_ok=1
-printf 'HashMap<(u32, u32)>\n' | grep -qE 'HashMap<[(]u32,[[:space:]]*u32[)]' || canary_ok=0
-printf 'x #[serde(untagged)]\n' | grep -qE '#[[]serde[(]untagged[)][]]' || canary_ok=0
-printf 'use MainToChild;\n' | grep -qwE '(MainToChild|ChildToMain)' || canary_ok=0
+# (1) 肯定側 — 検査が実際に違反を捕まえること。絞り込みが「常に何も検出しない」へ
+#     退化したらここで落ちる。
+printf 'HashMap<(u32, u32), SlotInfo>\n' | grep -qE "$POSKEY_RE" || canary_ok=0
+printf 'WaitForSingleObject(h, INFINITE);\n' | grep -qE "$INFINITE_RE" || canary_ok=0
+# UNTAGGED_RE は行頭 anchor 付き (doc comment の言及を数えないため) なので、
+# canary の入力も実際の属性行と同じ形にする。**パターンを共有した瞬間に、
+# 旧 canary が anchor 無しの別パターンを試していたことが露見した** — 検査対象と
+# 別物を試す canary は証明にならない、という実例。
+printf '    #[serde(untagged)]\n' | grep -qE "$UNTAGGED_RE" || canary_ok=0
+printf 'use MainToChild;\n' | grep -qwE "$PROTOCOL_RE" || canary_ok=0
+# doc comment 中の言及は数えないこと (撤去の経緯説明が common/src に 40 行残っている)
+printf '/// 旧 #[serde(untagged)] は撤去済み\n' | grep -qE "$UNTAGGED_RE" && canary_ok=0
+# (2) 否定側 — 除外マーカーが実際に効くこと。効かなければ正当な箇所を毎回報告し続ける。
+printf 'WaitForSingleObject(h, INFINITE); // arch-lint: allow-infinite\n' \
+    | grep -E "$INFINITE_RE" | strip_allowed infinite | grep -q . && canary_ok=0
+printf 'p: HashMap<(u32, u32), SizePool>, // arch-lint: allow-positional-key\n' \
+    | grep -E "$POSKEY_RE" | strip_allowed positional-key | grep -q . && canary_ok=0
 if [ "$canary_ok" -ne 1 ]; then
     printf 'arch-lint: [SELF-BROKEN] 検査器の正規表現が効いていません。\n' >&2
     printf '  この環境の grep に既知のパターンが通りませんでした。違反ゼロの報告は信用できません。\n' >&2
@@ -46,9 +72,9 @@ fi
 # 1. RT 境界の無限待ち (plugin_ref.rs poisoning contract / 不変条件 4)。
 #    正当な待ち (worker の idle wake 等、RT deadline を握らないもの) は同一行に
 #    「arch-lint: allow-infinite」コメントを付けて明示する。
-hits=$(grep -rnE 'WaitForSingleObject[(][^,]*,[[:space:]]*INFINITE' \
+hits=$(grep -rnE "$INFINITE_RE" \
     daw_audio/src common/src/plugin_ref.rs daw_plugin_host/src 2>/dev/null \
-    | grep -v 'arch-lint: allow-infinite' | strip_comments || true)
+    | strip_allowed infinite | strip_comments || true)
 if [ -n "$hits" ]; then
     warn RT-INFINITE "RT 境界に無限待ち。有界 dispatch + quarantine (DISPATCH_TIMEOUT_MS) が不変条件:"
     printf '%s\n' "$hits"
@@ -56,14 +82,15 @@ fi
 
 # 2. positional pair キー (不変条件 1)。device/slot の bookkeeping は安定
 #    device_id (u64) 一本。 (track,index) tuple キーの map を作らない。
-hits=$(grep -rnE 'HashMap<[(]u32,[[:space:]]*u32[)]' $rs_dirs 2>/dev/null | strip_comments || true)
+hits=$(grep -rnE "$POSKEY_RE" $rs_dirs 2>/dev/null \
+    | strip_allowed positional-key | strip_comments || true)
 if [ -n "$hits" ]; then
     warn POSITIONAL-KEY "positional (u32,u32) キーの map。安定 id (device_id: u64 等) でキーする:"
     printf '%s\n' "$hits"
 fi
 
 # 3. 旧単一 protocol enum の復活 (不変条件 3)。
-hits=$(grep -rnwE '(MainToChild|ChildToMain)' --include='*.rs' \
+hits=$(grep -rnwE "$PROTOCOL_RE" --include='*.rs' \
     common daw_gui daw_audio daw_plugin_host ui 2>/dev/null | strip_comments || true)
 if [ -n "$hits" ]; then
     warn LEGACY-PROTOCOL "MainToChild/ChildToMain の参照が残存。宛先型 (AudioCommand/AudioEvent/PluginCommand/PluginEvent) を使う:"
@@ -76,11 +103,10 @@ fi
 #    anchor し、doc-comment 中の `#[serde(untagged)]` 言及 (移行の経緯説明) を誤カウント
 #    しないよう実属性だけを数える。
 untagged_baseline=0
-untagged_re='^[[:space:]]*#[[]serde[(]untagged[)][]]'
-n=$(grep -rnE "$untagged_re" --include='*.rs' common/src 2>/dev/null | wc -l)
+n=$(grep -rnE "$UNTAGGED_RE" --include='*.rs' common/src 2>/dev/null | wc -l)
 if [ "$n" -gt "$untagged_baseline" ]; then
     warn UNTAGGED "serde(untagged) が baseline($untagged_baseline) を超過 ($n)。新規 untagged enum を作らない:"
-    grep -rnE "$untagged_re" --include='*.rs' common/src
+    grep -rnE "$UNTAGGED_RE" --include='*.rs' common/src
 fi
 
 # 5. protocol への bulk blob 直載せ (不変条件 2)。
