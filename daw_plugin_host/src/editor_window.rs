@@ -1000,6 +1000,49 @@ fn point_on_a_monitor(x: i32, y: i32) -> bool {
     !unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
+/// この窓へホストがキーボードフォーカスを**転送してよいか**を判定する (r.md #65)。
+///
+/// # 判定基準は `WS_CHILD` スタイル。親リンクではない
+///
+/// **同じ「逃げたか」でも、目的によって見るべきものが違う**:
+///
+/// | 目的 | 見るもの | 理由 |
+/// |---|---|---|
+/// | 位置指定の座標空間 ([`view_coord_space`]) | `GA_PARENT` | 座標の解釈は階層で決まる |
+/// | フォーカス転送の可否 (この関数) | `WS_CHILD` | アクティブ化の扱いは style で決まる |
+///
+/// 根拠は `SetFocus` の Remarks そのもの:
+///
+/// > *"It also activates **either the window that receives the focus or the parent of
+/// > the window that receives the focus**."*
+///
+/// つまり `SetFocus` は必ずどちらかをアクティブ化する。本物の子窓 (`WS_CHILD`) なら
+/// **親** = コンテナがアクティブ化されるので無害。`WS_CHILD` が落ちた窓は
+/// *"Only a top-level window can be an active window"* (window-features) の意味で
+/// **それ自身がアクティブ化の対象**になるので、コンテナが得たばかりのアクティブ状態が
+/// その窓へ移り、**コンテナが即座に非アクティブへ戻る**。
+/// 実測ではその巻き添えで、キャプションの `WM_NCLBUTTONDOWN` が配送されなくなり
+/// ✕ が効かなくなっていた:
+///
+/// ```text
+///   WM_NCHITTEST → WM_MOUSEACTIVATE → WM_NCACTIVATE/WM_ACTIVATE/WM_SETFOCUS
+///     → "focus forwarded to plugin child"          ← ここでアクティブを手放す
+///     → WM_NCACTIVATE/WM_ACTIVATE/WM_KILLFOCUS
+///     → WM_NCLBUTTONDOWN は **一度も来ない**
+/// ```
+///
+/// **`is_escaped()` のような一語の述語を作って両方に使い回してはいけない。**
+/// 基準が違うので、必ずどちらかが壊れる。
+///
+/// なお本物の子窓 (`WS_CHILD` あり) は自分でキーボードフォーカスを取れないので、
+/// 転送は**必要**。だからこの関数は「転送をやめる」のではなく
+/// **「規則の適用範囲を本来の対象に絞る」**もの。
+fn accepts_forwarded_focus(view: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::WS_CHILD;
+    let style = unsafe { GetWindowLongPtrW(view, GWL_STYLE) } as u32;
+    style & WS_CHILD.0 != 0
+}
+
 /// プラグインが作った子窓へキーボードフォーカスを渡す。
 ///
 /// `DefWindowProc` は `WM_ACTIVATE` でフォーカスを **アクティブ化された窓自身** に
@@ -1013,6 +1056,7 @@ fn point_on_a_monitor(x: i32, y: i32) -> bool {
 ///   仮定できない)。
 /// - `SetFocus` は窓が呼び出しスレッドのキューに属していないと **NULL を返して黙って
 ///   失敗する**ので、失敗はログに出す。
+/// - **`WS_CHILD` が落ちた窓には転送しない** ([`accepts_forwarded_focus`])。
 fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
     unsafe {
         let remembered = HWND(shared.last_focus.get() as *mut core::ffi::c_void);
@@ -1022,9 +1066,27 @@ fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
         {
             remembered
         } else {
+            // `remembered` 側は `IsChild` を使うので、逃げた view (WS_CHILD が落ちて
+            // いる) では必ず false になり、ここへ落ちてくる。そして `GW_CHILD` は
+            // **階層上まだ子である逃げた view を返す**。だから判定は
+            // **どちらの枝から来た target にも**掛ける (下)。
             GetWindow(hwnd, GW_CHILD).unwrap_or_default()
         };
         let before = GetFocus();
+        if !target.0.is_null() && !accepts_forwarded_focus(target) {
+            // r.md #65: 「子として見えるが子ではない」窓。転送するとコンテナが
+            // アクティブを手放し、キャプションのクリックが死ぬ。
+            tracing::info!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                child = format!("{:#x}", target.0 as usize),
+                child_style = format!("{:#010x}", GetWindowLongPtrW(target, GWL_STYLE) as u32),
+                focus = format!("{:#x}", before.0 as usize),
+                "focus forward skipped: view is not a WS_CHILD window \
+                 (it takes activation for itself)"
+            );
+            return;
+        }
         if target.0.is_null() {
             // 観測 (r.md #65): **子が 1 枚も無い**のは「プラグインが view を
             // コンテナから外して自前の top-level にした」ことの直接の証拠になる。
@@ -1045,6 +1107,10 @@ fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
             target: RESIZE_TARGET,
             hwnd = format!("{:#x}", hwnd.0 as usize),
             child = format!("{:#x}", target.0 as usize),
+            // r.md #65: **なぜ転送したのか**が読めるように判定材料を値に入れる。
+            // これが無かったせいで「逃げた view へ転送していた」ことがログから
+            // 見えず、✕ が効かない原因の特定が 1 往復遅れた。
+            child_style = format!("{:#010x}", GetWindowLongPtrW(target, GWL_STYLE) as u32),
             focus_before = format!("{:#x}", before.0 as usize),
             focus_after = format!("{:#x}", GetFocus().0 as usize),
             error = ?err,

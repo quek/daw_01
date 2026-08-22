@@ -348,6 +348,35 @@ plugin-main の周回で **同じ `plugin_requested_resize` へ合流**させる
   「どの子がフォーカスを持っていたか」を覚え、再アクティブ化で戻す。`GetFocus() != target` の
   ガードで子が親へ返し送りする場合の往復を 1 回で断つ。**`WM_KILLFOCUS` の中では触らない**
   (MSDN が明示的に禁止: *"do not make any function calls that display or activate a window"*)。
+- **転送先は `WS_CHILD` を持つ窓に限る** (`accepts_forwarded_focus`)。`WS_CHILD` が落ちた窓は
+  階層上まだ子でも **activation を自分で取る**ので、そこへ `SetFocus` するとコンテナが
+  得たばかりのアクティブ状態を手放し、キャプションの `WM_NCLBUTTONDOWN` が配送されなくなる
+  (= ✕ が効かない。r.md #65 実測)。転送の規則自体は本物の子窓に対しては正しく、
+  **適用範囲を本来の対象へ絞る**のがこの修正。
+
+### 4-1. 「逃げたか」の判定基準は目的ごとに違う (r.md #65)
+
+Redux は `SetWindowLong` で `WS_CHILD` を落として `WS_POPUP` を立てるが `SetParent` を
+呼ばないので、**style と階層が食い違う**中間状態になる。この状態を扱うとき、
+**見るべきものは目的によって違う**:
+
+| 目的 | 見るもの | 理由 |
+|---|---|---|
+| 位置 / サイズ指定の座標空間 (`view_coord_space`) | `GA_PARENT` | 座標の解釈は**階層**で決まる |
+| フォーカス転送の可否 (`accepts_forwarded_focus`) | `WS_CHILD` | アクティブ化の扱いは**style**で決まる |
+
+**`is_escaped()` のような一語の述語を 1 つ作って両方に使い回してはいけない。**
+基準が違うので必ずどちらかが壊れる。関数名と doc に「何を見ているか」を書くこと。
+
+なお `GetWindow(GW_CHILD)` は **逃げた view も返す** (階層上はまだ子だから)。
+用途ごとに、返ってきた窓が目的に合うかを別途判定する:
+
+| 呼び出し元 | 逃げた view を掴んでよいか |
+|---|---|
+| `record_view_baseline` | **よい** (逃げたことの検出が目的) |
+| `enforce_view_size_if_ignored` | **よい** (動かす対象そのもの) |
+| `describe_plugin_child` | **よい** (診断) |
+| `focus_plugin_child` | **だめ** (上の理由。`accepts_forwarded_focus` で弾く) |
 - `EditorSizer` (`plugin_instance.rs`) は WNDPROC がプラグインを同期で叩くための口。実装は
   **borrowed な FFI ポインタしか持たない**。view / plugin instance の所有は `LoadedPlugin` 側
   1 箇所のまま (ComPtr を二重 AddRef して WNDPROC にも持たせると `removed()` と競合して UAF)。
