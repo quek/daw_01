@@ -4,8 +4,8 @@
 Why this module exists
 ----------------------
 guard_engine.py / reflect.py / log_metric.py / check_destructive_delete.py all
-need the same two roots, and all five used to HARDCODE the string
-"F--dev-daw-01". That is this machine's path slugified: anyone who clones the
+need the same two roots, and all five used to HARDCODE one literal project-slug
+string -- the original author's checkout path, slugified. Anyone who clones the
 repo somewhere else gets a directory that does not exist, and the guard engine
 then fails open and dies silently (exactly the outage found on 2026-08-22, where
 guards.jsonl had been gone for five days without a single visible symptom).
@@ -28,11 +28,12 @@ Two roots, deliberately different in KIND:
               guard_state.json / metrics/ / ahe_backlog.md
 
 The slug is Claude Code's own project-directory naming rule: take the absolute
-path and replace every character outside [A-Za-z0-9-] with '-'. Verified against
-the real directories under ~/.claude/projects:
-
-    F:\\dev\\daw_01                                  -> F--dev-daw-01
-    F:\\dev\\daw_01\\.claude\\worktrees\\rmd-60-license -> F--dev-daw-01--claude-worktrees-rmd-60-license
+path and replace every character outside [A-Za-z0-9-] with '-'. For example
+"C:\\src\\my_app" becomes "C--src-my-app", and a worktree of it keeps the parent's
+prefix. Deliberately NOT illustrated with this machine's real paths: the rule is
+cross-checked against whatever ~/.claude/projects actually contains on the host
+that runs scripts/test_guards.py, which is stronger evidence than a baked-in
+example and does not leak a checkout location into a public repository.
 
 Every function is total: callers are hooks that must never raise.
 """

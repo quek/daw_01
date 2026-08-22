@@ -52,10 +52,10 @@ SYN_ROOT = "X:/proj" if os.name == "nt" else "/proj"
 # On POSIX the drive-letter form is not absolute, so keep the leading "/" there and vary
 # only the separators.
 SYN_ROOT_BS = SYN_ROOT.replace("/", "\\") if os.name == "nt" else SYN_ROOT
-# A user-dir path OUTSIDE the repo (guards/memory live there). "F--dev-daw-01" is the
-# Claude Code project slug that guard_engine.py / reflect.py hardcode, so it stays.
+# A user-dir path OUTSIDE the repo (memory / runtime state live there). The project
+# slug is derived at runtime now, so nothing here needs a real one.
 SYN_USER_PROJ = ("Y:/home/u" if os.name == "nt" else "/home/u") + \
-    "/.claude/projects/F--dev-daw-01"
+    "/.claude/projects/proj-slug"
 
 PASS, FAIL = [], []
 
@@ -483,23 +483,47 @@ def check_registry_defect_is_reported():
 
 # ------------------------------------------------------------- path/slug derivation
 def check_paths():
-    """The slug rule must reproduce Claude Code's real project directory names.
-    Hardcoding "F--dev-daw-01" is what made every non-default checkout fail open."""
+    """The slug rule must reproduce Claude Code's project-directory naming.
+    Hardcoding one machine's slug is what made every other checkout fail open.
+
+    Two layers: synthetic cases pin the RULE (and carry no real path, since this
+    file ships in a public repo), then a live cross-check confirms the rule still
+    matches what Claude Code actually created on this host."""
+    # slug() runs abspath first, and abspath is host-dependent: on Windows a
+    # POSIX-rooted path gets the current drive prepended ("/src" -> "F:\\src"), and on
+    # POSIX a drive-letter path is treated as relative. So the synthetic root has to be
+    # absolute FOR THIS HOST, exactly like SYN_ROOT above.
+    if os.name == "nt":
+        root_in, root_out, alt_in = "C:\\src\\my_app", "C--src-my-app", "C:/src/my_app"
+    else:
+        root_in, root_out, alt_in = "/src/my_app", "-src-my-app", "/src/my_app"
+    wt_in = root_in + os.sep.join(["", ".claude", "worktrees", "feature-x"])
     cases = [
-        ("F:\\dev\\daw_01", "F--dev-daw-01"),
-        ("F:/dev/daw_01", "F--dev-daw-01"),
-        ("F:\\dev\\daw_01\\.claude\\worktrees\\rmd-60-license",
-         "F--dev-daw-01--claude-worktrees-rmd-60-license"),
+        (root_in, root_out),
+        (alt_in, root_out),
+        (wt_in, root_out + "--claude-worktrees-feature-x"),
     ]
     for path, expect in cases:
         got = ahe_paths.slug(path)
         ok("paths:slug(%s)" % path) if got == expect else \
             bad("paths:slug(%s)" % path, "got %r want %r" % (got, expect))
     # a worktree must resolve to the MAIN checkout, so all worktrees share one state dir
-    wt = "F:\\dev\\daw_01\\.claude\\worktrees\\rmd-60-license"
-    got = ahe_paths.slug(ahe_paths.main_checkout(wt))
-    ok("paths:worktree-shares-main-state") if got == "F--dev-daw-01" else \
-        bad("paths:worktree-shares-main-state", "got %r" % got)
+    got = ahe_paths.slug(ahe_paths.main_checkout(wt_in))
+    ok("paths:worktree-shares-main-state") if got == root_out else \
+        bad("paths:worktree-shares-main-state", "got %r want %r" % (got, root_out))
+
+    # live cross-check: this harness runs from inside a Claude Code checkout, so the
+    # directory our rule derives for THIS repo must be one Claude Code really made.
+    projects = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    if os.path.isdir(projects):
+        derived = os.path.join(projects, ahe_paths.slug(ahe_paths.REPO_ROOT))
+        ok("paths:slug-matches-live-dir") if os.path.isdir(derived) else \
+            bad("paths:slug-matches-live-dir",
+                "導出した %r が実在しない = slug 規則が Claude Code とズレている" % derived)
+    else:
+        # Not a hidden skip: the name says exactly what was and was not verified.
+        ok("paths:slug-live-crosscheck-unavailable(~/.claude/projects なし)")
+
     # the registry is repo-relative and tracked
     if os.path.isfile(REAL_GUARDS):
         ok("paths:registry-tracked-in-repo")
