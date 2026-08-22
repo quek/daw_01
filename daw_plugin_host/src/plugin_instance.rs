@@ -179,12 +179,60 @@ pub struct ResizableProbe {
     /// 生の戻り値。VST3 は `tresult` (`kResultTrue == kResultOk == 0`)、
     /// CLAP は `bool` を `0` / `1` で入れる。`queried == false` なら無意味。
     pub raw: i32,
+    /// **その format の仕様が、窓枠ドラッグを `verdict` の前提条件として
+    /// 規定しているか。**
+    ///
+    /// 一次情報で 2 フォーマットの扱いが違う (2026-08-22 調査):
+    /// - **CLAP は規定している** (`clap/ext/gui.h` L41-45):
+    ///   *"Resizing the window (drag, if embedded): 1. **Only possible if**
+    ///   clap_plugin_gui->can_resize() returns true"* → `true`
+    /// - **VST3 は規定していない** (`iplugview.h` L102-124)。`canResize` が
+    ///   `kResultTrue` のときホストがどうするかの**記述**があるだけで、
+    ///   `kResultFalse` のときの禁止 (must not / shall not) はヘッダのどこにも無い。
+    ///   同じ段落がホストに対して *"has to call IPlugView::onSize ()"* と義務語を
+    ///   使い分けている以上、書かれていないのは未規定であって禁止ではない。
+    ///   Steinberg 自身の適合性検査 (host-checker) も `canResize` は呼び出しの
+    ///   有無を INFO ログするだけで、false の view をリサイズさせるホストを
+    ///   エラーにしない → `false`
+    pub drag_requires_verdict: bool,
 }
 
 impl ResizableProbe {
     /// 問い合わせられなかった (view / gui 拡張が無い)。
+    /// 仕様の前提条件は保守的に「有り」として扱う (未知のときに枠を出さない)。
     pub const fn unavailable() -> Self {
-        Self { verdict: false, queried: false, raw: 0 }
+        Self { verdict: false, queried: false, raw: 0, drag_requires_verdict: true }
+    }
+}
+
+/// r.md #65: プラグインの申告と format の仕様から、**窓枠でのリサイズを許すか**を決める。
+///
+/// 方針をここ 1 箇所に閉じ込める。format ごとに答えが違うのは気分ではなく、
+/// **一次情報の規範性が実際に違う**から ([`ResizableProbe::drag_requires_verdict`]):
+///
+/// - **CLAP**: ヘッダが「drag は `can_resize()` が true のときだけ可能」と前提条件を
+///   明示している。申告を尊重する。
+/// - **VST3**: 禁止規定が無い。Renoise Redux は `canResize()` に `kResultFalse` を
+///   返すのに **REAPER では窓枠でリサイズでき UI も追従する** (ユーザーの実機確認)。
+///   申告を尊重すると「ユーザーが実際にできるはずのことができない窓」になるので、
+///   枠を出して `checkSizeConstraint` に丸めさせる (同 API が
+///   *"if not adjust the rect to the allowed size"* とまさにその用途で規定されている)。
+///
+/// **これは多数派の選択ではない**: VST3 SDK の editorhost / JUCG / Ardour / ossia score は
+/// いずれも申告を尊重して枠を出さない (Qtractor は枠を出すがプラグインへ伝えない、
+/// Carla は `canResize` を見ない)。「枠を出して追従もさせる」OSS ホストは見つかっていない。
+/// spec 違反ではないが慣習からは外れる選択で、`onSize` に追従しないプラグインでは
+/// 枠だけ伸びて中身が残るリスクをホストが引き受ける。ユーザーの要件
+/// (「Redux でリサイズしたい」/ 参照 DAW が REAPER) を優先した判断。
+///
+/// **申告値は捨てていない** — `ResizableProbe` はログに残るので、将来
+/// 「VST3 でも申告を尊重する」設定を足すならこの関数だけを分岐させればよい。
+#[must_use]
+pub fn should_offer_resize_frame(probe: &ResizableProbe) -> bool {
+    if probe.drag_requires_verdict {
+        probe.verdict
+    } else {
+        true
     }
 }
 
@@ -547,6 +595,38 @@ pub trait LoadedPlugin: Send {
     /// 食い違っていた)。
     fn gui_sizer(&self) -> Option<Box<dyn EditorSizer>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod resize_frame_policy_tests {
+    use super::{ResizableProbe, should_offer_resize_frame};
+
+    /// r.md #65: **format ごとに一次情報の規範性が違う**ので、方針も分かれる。
+    /// このテストはその判断そのものを固定する (将来変えるなら意識的に更新される)。
+    #[test]
+    fn frame_policy_follows_each_formats_spec() {
+        let vst3 = |verdict| ResizableProbe { verdict, queried: true, raw: 0, drag_requires_verdict: false };
+        let clap = |verdict| ResizableProbe { verdict, queried: true, raw: 0, drag_requires_verdict: true };
+
+        // VST3: 禁止規定が無いので、申告が false でも枠を出す
+        // (Renoise Redux は canResize=false なのに REAPER で枠リサイズできる)。
+        assert!(should_offer_resize_frame(&vst3(true)));
+        assert!(
+            should_offer_resize_frame(&vst3(false)),
+            "VST3 は canResize=false でも枠を出す (iplugview.h に禁止規定が無い)"
+        );
+
+        // CLAP: gui.h が「drag は can_resize()==true のときだけ可能」と
+        // **前提条件として**規定しているので申告を尊重する。
+        assert!(should_offer_resize_frame(&clap(true)));
+        assert!(
+            !should_offer_resize_frame(&clap(false)),
+            "CLAP は can_resize()==false なら枠を出さない (gui.h L41-45 が前提条件を明示)"
+        );
+
+        // 問い合わせられなかったときは保守的に枠を出さない。
+        assert!(!should_offer_resize_frame(&ResizableProbe::unavailable()));
     }
 }
 

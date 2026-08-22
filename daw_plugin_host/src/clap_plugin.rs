@@ -1210,7 +1210,16 @@ impl EditorSizer for ClapSizer {
             return ResizableProbe::unavailable();
         };
         let verdict = unsafe { f(self.plugin) };
-        ResizableProbe { verdict, queried: true, raw: i32::from(verdict) }
+        ResizableProbe {
+            verdict,
+            queried: true,
+            raw: i32::from(verdict),
+            // CLAP は `gui.h` L41-45 で
+            // *"Resizing the window (drag, if embedded): 1. Only possible if
+            // clap_plugin_gui->can_resize() returns true"* と **前提条件として**
+            // 規定している。VST3 と違い申告を尊重する。
+            drag_requires_verdict: true,
+        }
     }
 
     fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {

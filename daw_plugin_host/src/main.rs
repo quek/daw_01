@@ -319,9 +319,9 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
         "plugin does not support an embedded win32 GUI"
     );
     plugin.gui_create_embedded()?;
-    let resizable = editor_window::should_offer_resize_frame(
-        plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict),
-    );
+    let resizable = plugin
+        .gui_sizer()
+        .is_some_and(|s| plugin_instance::should_offer_resize_frame(&s.can_resize()));
     let size = plugin
         .gui_get_size()
         .filter(|&(w, h)| w > 0 && h > 0)
@@ -345,9 +345,9 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
     plugin.gui_set_parent_hwnd(editor.hwnd_u64())?;
     pump_pending_messages();
     let shown = plugin.gui_show()?;
-    let resizable_now = editor_window::should_offer_resize_frame(
-        plugin.gui_sizer().is_some_and(|s| s.can_resize().verdict),
-    );
+    let resizable_now = plugin
+        .gui_sizer()
+        .is_some_and(|s| plugin_instance::should_offer_resize_frame(&s.can_resize()));
     if resizable_now != resizable {
         editor.set_resizable(resizable_now);
     }
@@ -1689,7 +1689,7 @@ impl PluginHost {
             .map_or_else(plugin_instance::ResizableProbe::unavailable, |s| s.can_resize());
         // r.md #65: 枠を出すかは **方針** (`should_offer_resize_frame`) が決める。
         // 申告値は捨てずにログへ (`verdict` / `queried` / `raw`)。
-        let resizable = editor_window::should_offer_resize_frame(probe.verdict);
+        let resizable = plugin_instance::should_offer_resize_frame(&probe);
         tracing::info!(
             target: "editor_resize",
             plugin = %plugin.name(),
@@ -1787,7 +1787,7 @@ impl PluginHost {
         let probe_now = plugin
             .gui_sizer()
             .map_or_else(plugin_instance::ResizableProbe::unavailable, |s| s.can_resize());
-        let resizable_now = editor_window::should_offer_resize_frame(probe_now.verdict);
+        let resizable_now = plugin_instance::should_offer_resize_frame(&probe_now);
         tracing::info!(
             target: "editor_resize",
             plugin = %plugin.name(),
