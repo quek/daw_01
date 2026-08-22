@@ -74,7 +74,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WA_INACTIVE, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_MOVE, WM_PAINT, WM_SIZE, WM_SIZING,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_MOVE, WM_NCACTIVATE, WM_PAINT,
+    WM_SIZE, WM_SIZING,
     WM_TIMER, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
     WNDCLASSEXW,
     WS_CAPTION, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
@@ -225,6 +226,10 @@ fn trace_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         // modal move/size ループ中の pump。どちらも要の経路なのに不可視だった。
         WM_MOVE => "WM_MOVE",
         WM_TIMER => "WM_TIMER",
+        // r.md #65: 「前面なのに見えない」の切り分け。コンテナに描画要求が
+        // 来ているか (= 塞がれていないか) の手掛かりになる。
+        WM_PAINT => "WM_PAINT",
+        WM_ERASEBKGND => "WM_ERASEBKGND",
         _ => return,
     };
     // 相手 HWND の在り処はメッセージごとに違う。
@@ -369,14 +374,13 @@ unsafe fn resize_client_area(hwnd: HWND, w: u32, h: u32) {
     }
 }
 
-/// 窓のスタイルを `resizable` から決める。
+/// 窓のスタイルを「リサイズ枠を出すか」から決める。
 ///
-/// VST3 SDK editorhost (`window.cpp` L107-131) は
-/// `WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN|WS_CLIPSIBLINGS` を基本に、resizable の
-/// ときだけ `WS_SIZEBOX|WS_MAXIMIZEBOX` を足す。clap-wrapper の standalone も
-/// *"We can't resize, so disable WS_THICKFRAME and WS_MAXIMIZEBOX"* と同じ結論。
-/// `WS_MINIMIZEBOX` は仕様上どちらでもよいが、DAW の窓としては最小化できるほうが
-/// 自然なので常に付ける (従来の `WS_OVERLAPPEDWINDOW` からの挙動維持でもある)。
+/// 枠を出すかの **方針**は [`should_offer_resize_frame`] が持つ。ここは純粋な
+/// スタイル写像で、`WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN|WS_CLIPSIBLINGS` を
+/// 基本に、枠ありのとき `WS_THICKFRAME|WS_MAXIMIZEBOX` を足す
+/// (VST3 SDK editorhost `window.cpp` L107-131 と同じ組み合わせ)。
+/// `WS_MINIMIZEBOX` は DAW の窓としては最小化できるほうが自然なので常に付ける。
 ///
 /// `WS_CLIPCHILDREN` はプラグインの子 HWND の領域を親が描かないためのもので必須。
 #[must_use]
@@ -423,6 +427,22 @@ struct EditorShared {
     view_baseline: Cell<(isize, u32)>,
     /// view が逃げたことを既に報告済みか (ログを 1 回に絞る)。
     escape_reported: Cell<bool>,
+    /// r.md #65: キャプションを**アクティブ色に固定している**か。
+    ///
+    /// 固定を入れたら **対になる解除を同じ精度で持つ**こと。プラグインが view を
+    /// 所有 popup へ逃がすと、以後アクティブ窓は popup になりコンテナには
+    /// `WM_ACTIVATE` / `WM_NCACTIVATE` が **一切来なくなる** (実測: 別アプリ切替と
+    /// Alt+Tab の 55 秒間、届いたのは `WM_ACTIVATEAPP` だけ)。固定だけ入れて
+    /// 解除の契機を作らないと、**アプリを離れてもキャプションがアクティブのまま**に
+    /// なる (実際そうなった)。解除は `WM_ACTIVATEAPP(FALSE)` で行う。
+    caption_forced_active: Cell<bool>,
+    /// r.md #65: 直近に観測した `canResize` の生値 (`i32::MIN` = 未観測)。
+    ///
+    /// ユーザーの仮説「Redux は Editor クリックで canResize が変わるのでは」を
+    /// 検証するための観測点。open 時にしか問い合わせていなかったので**検証不能**
+    /// だった。値が**変わったときだけ** 1 行出す (毎回出すと resize ドラッグ中に
+    /// 溢れる)。
+    last_can_resize_raw: Cell<i32>,
     /// r.md #65: これまでに受けた `WM_SIZE` (非最小化) の回数。
     ///
     /// **診断のための観測点**。[`plugin_requested_resize`] が `SetWindowPos` の前後で
@@ -442,6 +462,8 @@ impl EditorShared {
             last_focus: Cell::new(0),
             view_baseline: Cell::new((0, 0)),
             escape_reported: Cell::new(false),
+            caption_forced_active: Cell::new(false),
+            last_can_resize_raw: Cell::new(i32::MIN),
             size_events: Cell::new(0),
         }
     }
@@ -468,7 +490,7 @@ impl EditorSizer for NoopSizer {
     fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32) {
         (w, h)
     }
-    fn current_client_size(&self) -> Option<(u32, u32)> {
+    fn plugin_view_size(&self) -> Option<(u32, u32)> {
         None
     }
     fn notify_client_size(&self, _w: u32, _h: u32) {}
@@ -866,6 +888,286 @@ fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
     }
 }
 
+/// `canResize` を**再問い合わせ**し、前回と値が変わったときだけ 1 行出す (r.md #65)。
+///
+/// ユーザーの仮説「Redux は Editor クリックで `canResize` が変わるのでは」を
+/// 検証するための観測点。open 時 (pre-attach / post-attach) にしか問い合わせて
+/// いなかったので、**変わるのかどうかを確かめる手段が無かった**。
+///
+/// 呼ぶ場所は「変わり得る契機」= view の style が変わったとき / プラグインが
+/// resize を要求したとき / `WM_SIZE` を受けたとき。毎回ログすると resize ドラッグ中に
+/// 溢れるので、差分だけ出す。
+fn probe_can_resize_change(shared: &EditorShared, occasion: &str) {
+    let Some(sizer) = shared.sizer() else { return };
+    let probe = sizer.can_resize();
+    if !probe.queried {
+        return;
+    }
+    let previous = shared.last_can_resize_raw.replace(probe.raw);
+    if previous == probe.raw {
+        return;
+    }
+    if previous == i32::MIN {
+        // 初回は基準値を控えるだけ。ここで CHANGED を出すと「値は同じなのに
+        // 変わったと言う」ノイズになる (実機ログで 1 回出てしまった)。
+        return;
+    }
+    tracing::info!(
+        target: RESIZE_TARGET,
+        occasion,
+        verdict = probe.verdict,
+        raw_before = format!("{previous:#x}"),
+        raw_after = format!("{:#x}", probe.raw),
+        "canResize CHANGED since last observation"
+    );
+}
+
+/// この窓が所有する top-level 窓 (= プラグインがコンテナから逃がした view 窓) を
+/// **全部**列挙する。
+///
+/// # なぜ `GW_ENABLEDPOPUP` を使わないか (r.md #65 の観測バグ)
+///
+/// 最初は `GetWindow(hwnd, GW_ENABLEDPOPUP)` で書いたが、**実機で常に「無し」を
+/// 返していた** — 同じログ行の `active=` / `focus=` には owner がコンテナの
+/// Redux 窓がはっきり写っているのに。
+///
+/// 原因は MSDN の記述どおり: *"The retrieved handle identifies the enabled popup
+/// window owned by the specified window (**the search uses the first such window
+/// found using GW_HWNDNEXT**)"*。`GW_HWNDNEXT` は **Z 順で下方向**の探索だが、
+/// 所有窓は常に owner の**上**にいる。つまりこの API では原理的に見つからない。
+///
+/// 所有関係は Z 順に依存しないので、**top-level を列挙して `GW_OWNER` を突き合わせる**。
+/// 呼ぶのは activation 時だけなので列挙コストは問題にならない。
+fn owned_top_levels(hwnd: HWND) -> Vec<HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GW_OWNER};
+
+    struct Ctx {
+        owner: isize,
+        found: Vec<HWND>,
+    }
+    unsafe extern "system" fn cb(w: HWND, lp: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `lp` は直下の `EnumWindows` 呼び出しが渡した `&mut Ctx`。
+        let ctx = unsafe { &mut *(lp.0 as *mut Ctx) };
+        let owner = unsafe { GetWindow(w, GW_OWNER) }.unwrap_or_default();
+        if owner.0 as isize == ctx.owner {
+            ctx.found.push(w);
+        }
+        true.into()
+    }
+
+    let mut ctx = Ctx { owner: hwnd.0 as isize, found: Vec::new() };
+    let _ = unsafe { EnumWindows(Some(cb), LPARAM(std::ptr::from_mut(&mut ctx) as isize)) };
+    ctx.found
+}
+
+/// 所有 top-level のうち代表 1 枚 (可視を優先)。
+///
+/// **キャプションの判定には使わない** — そちらは「いまアクティブな窓が自分の
+/// グループか」を直接聞く ([`belongs_to_this_editor`])。列挙に依存させると、
+/// 列挙が壊れたときに判定ごと壊れる (r.md #65 で実際に起きた)。
+#[allow(dead_code)]
+fn owned_popup(hwnd: HWND) -> Option<HWND> {
+    let owned = owned_top_levels(hwnd);
+    owned
+        .iter()
+        .copied()
+        .find(|w| unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*w) }.as_bool())
+        .or_else(|| owned.first().copied())
+}
+
+/// キャプションのアクティブ表示を `active` に**明示的に**設定する (r.md #65)。
+///
+/// プラグインが view を所有 popup へ逃がすと、以後アクティブ窓は popup になり、
+/// コンテナには `WM_NCACTIVATE` が **一切来なくなる**。つまり
+/// 「`WM_NCACTIVATE` を読み替える」だけでは *固定* しかできず、*解除* する契機が
+/// 無い。そこで表示状態そのものを我々が持ち (`caption_forced_active`)、
+/// 変化したときだけ `DefWindowProc` へ直接 `WM_NCACTIVATE` を渡して描き替える。
+///
+/// MSDN: *"The DefWindowProc function draws the title bar or icon title in its
+/// active colors when the wParam parameter is TRUE and in its inactive colors
+/// when wParam is FALSE."* / lParam に `-1` を渡すと**再描画されない**ので、
+/// 描き替えたいここでは `0` を渡す。
+///
+/// `SendMessage` ではなく `DefWindowProcW` を直接呼ぶ: 自分の WNDPROC を経由すると
+/// 上の読み替えハンドラに再入する。
+fn set_caption_active(hwnd: HWND, shared: &EditorShared, active: bool) {
+    if shared.caption_forced_active.replace(active) == active {
+        return;
+    }
+    unsafe {
+        let _ = DefWindowProcW(
+            hwnd,
+            WM_NCACTIVATE,
+            WPARAM(usize::from(active)),
+            LPARAM(0),
+        );
+    }
+    tracing::info!(
+        target: RESIZE_TARGET,
+        hwnd = format!("{:#x}", hwnd.0 as usize),
+        active,
+        "caption active state forced"
+    );
+}
+
+/// `GetLastActivePopup` の結果を 1 行で (r.md #65 の Alt+Tab 観測)。
+///
+/// MSDN: *"The return value is the same as the hWnd parameter, if ... The window
+/// identified by hWnd does not own any pop-up windows."* — つまり自分自身が
+/// 返ったら「所有 popup が無い / 自分が最後にアクティブだった」。
+/// **owner 窓をアクティブ化するとき、シェルが実際に前面化する窓**はこれ。
+fn describe_last_active_popup(hwnd: HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetLastActivePopup;
+    let p = unsafe { GetLastActivePopup(hwnd) };
+    if p == hwnd {
+        "self (no owned popup was more recently active)".to_string()
+    } else {
+        format!("{:#x}", p.0 as usize)
+    }
+}
+
+/// 窓の矩形 + それが**実際に見える場所にあるか**を 1 行で (r.md #65)。
+///
+/// 「Win32 上は前面なのに視覚的に見えない」の切り分け用。画面外 / 極小 /
+/// 別モニタ / 最小化 / 透明 (layered) を全部ここで潰す。
+fn describe_rect_and_visibility(w: HWND) -> String {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetLayeredWindowAttributes, IsWindowVisible, WS_EX_LAYERED,
+    };
+    let mut r = RECT::default();
+    let ok = unsafe { GetWindowRect(w, &mut r) }.is_ok();
+    let on_monitor = ok && !unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_invalid();
+    let ex = unsafe { GetWindowLongPtrW(w, GWL_EXSTYLE) } as u32;
+    let layered = ex & WS_EX_LAYERED.0 != 0;
+    let alpha = if layered {
+        let mut key = windows::Win32::Foundation::COLORREF(0);
+        let mut a = 0u8;
+        let mut flags = windows::Win32::UI::WindowsAndMessaging::LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+        if unsafe { GetLayeredWindowAttributes(w, Some(&mut key), Some(&mut a), Some(&mut flags)) }
+            .is_ok()
+        {
+            format!(" alpha={a} lwa_flags={:#x}", flags.0)
+        } else {
+            " alpha=?".to_string()
+        }
+    } else {
+        String::new()
+    };
+    format!(
+        "rect=({},{} {}x{}) on_monitor={on_monitor} visible={} iconic={} layered={layered}{alpha}",
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+        unsafe { IsWindowVisible(w) }.as_bool(),
+        unsafe { IsIconic(w) }.as_bool(),
+    )
+}
+
+/// `w` より **Z 順で上にある窓**を数個たどって列挙する (r.md #65)。
+///
+/// 「前面なのに見えない」なら、何かが上に載っている可能性がある。別プロセスの窓
+/// (daw_gui 本体など) もここに出るので、覆っている犯人が特定できる。
+fn describe_windows_above(w: HWND, limit: usize) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, IsWindowVisible};
+    let mut out = Vec::new();
+    let mut cur = w;
+    for _ in 0..limit {
+        let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else { break };
+        if prev.0.is_null() {
+            break;
+        }
+        cur = prev;
+        // 不可視の窓は視界を塞がないので飛ばす (数だけ膨らむので)。
+        if !unsafe { IsWindowVisible(cur) }.as_bool() {
+            continue;
+        }
+        out.push(describe_hwnd(cur));
+    }
+    if out.is_empty() {
+        "(topmost among visible windows)".to_string()
+    } else {
+        out.join(" | ")
+    }
+}
+
+/// 所有 popup の現況を 1 行で (r.md #65 の Alt+Tab 観測)。
+///
+/// 「コンテナはアクティブになったのに、プラグインの実体である popup が視覚的に
+/// 見えない」を **ログだけで**判定できるようにする。
+fn describe_owned_popup(hwnd: HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let owned = owned_top_levels(hwnd);
+    if owned.is_empty() {
+        return "none".to_string();
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    owned
+        .iter()
+        .map(|&p| {
+            format!(
+                "{:#x} is_foreground={} style={:#010x} {} above=[{}]",
+                p.0 as usize,
+                fg == p,
+                unsafe { GetWindowLongPtrW(p, GWL_STYLE) } as u32,
+                describe_rect_and_visibility(p),
+                describe_windows_above(p, 4),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ;; ")
+}
+
+/// **観測そのものの自己検査** (r.md #65)。
+///
+/// 今回 `owned_popup` が壊れていたのに、同じログ行の `active=` / `focus=` には
+/// owner がコンテナの窓が写っていた — つまり **矛盾はログの中に既に出ていた**のに、
+/// 突き合わせる仕組みが無いので気付けなかった。以後は機械に見つけさせる。
+///
+/// 「アクティブ / フォーカス窓の root owner が自分なのに、所有窓の列挙が空」を
+/// 検出したら警告する。観測が嘘をついている状態そのものを可視化する。
+fn warn_if_observation_inconsistent(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetFocus};
+    if !owned_top_levels(hwnd).is_empty() {
+        return;
+    }
+    for (name, w) in [
+        ("active", unsafe { GetActiveWindow() }),
+        ("focus", unsafe { GetFocus() }),
+    ] {
+        if w.0.is_null() || w == hwnd {
+            continue;
+        }
+        if belongs_to_this_editor(hwnd, w) {
+            tracing::warn!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                which = name,
+                window = %describe_hwnd(w),
+                "OBSERVATION INCONSISTENT: owned-window enumeration is empty but this \
+                 window belongs to our group — the enumeration is lying"
+            );
+            return;
+        }
+    }
+}
+
+/// `target` が**この窓のグループ**に属するか (子 or こちらが root owner の窓)。
+///
+/// `WM_NCACTIVATE` で「アクティブが自分の所有 popup へ移るだけ」を判定するのに使う。
+fn belongs_to_this_editor(hwnd: HWND, target: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor, IsChild};
+    if target.0.is_null() || !unsafe { IsWindow(Some(target)) }.as_bool() {
+        return false;
+    }
+    if target == hwnd || unsafe { IsChild(hwnd, target) }.as_bool() {
+        return true;
+    }
+    let root_owner = unsafe { GetAncestor(target, GA_ROOTOWNER) };
+    root_owner == hwnd
+}
+
 /// プラグインの view が **コンテナから外れて top-level に化けていないか**を検査し、
 /// 変化した瞬間に 1 度だけ info で報告する (r.md #65)。
 ///
@@ -894,6 +1196,9 @@ fn check_view_escaped(hwnd: HWND, shared: &EditorShared) {
         return;
     }
     shared.escape_reported.set(true);
+    // ユーザーの仮説「Editor クリックで canResize が変わるのでは」の検証点。
+    // view の style が変わった = Editor を開いた瞬間なので、ここで聞き直す。
+    probe_can_resize_change(shared, "view style changed");
     tracing::info!(
         target: RESIZE_TARGET,
         container = format!("{:#x}", hwnd.0 as usize),
@@ -1011,11 +1316,25 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
     let Some(sizer) = shared.sizer() else {
         return log(PluginResizeOutcome::NotApplicable, "no live sizer (gui not attached)");
     };
-    let before = sizer.current_client_size();
-    if before == Some((width, height)) {
-        return log(PluginResizeOutcome::Applied, "already at the requested size");
-    }
+    probe_can_resize_change(shared, "plugin requested resize");
+    let before = sizer.plugin_view_size();
     let client_before = unsafe { client_size(hwnd) };
+    // 早期リターンは **コンテナ窓の client サイズ**で判定する。
+    //
+    // ここで「プラグインの view サイズ」を見てはいけない (r.md #65 で実際にやって
+    // いたバグ)。VST3 spec は *"if the host calls IPlugView::getSize () before
+    // calling IPlugView::onSize (), it will get the current (old) size not the
+    // wanted one!!"* と規定しており、
+    //   - 規定どおりのプラグイン → 常に不一致になるので判定に使えない
+    //   - 規定に反して先に自分の view を新サイズへ更新するプラグイン
+    //     (Renoise Redux) → **常に一致し、窓を 1px も動かさずに成功を返す**
+    // のどちらかにしかならない。実測は後者で、Redux の Editor が
+    // 1538x736 を要求しているのにコンテナは 880x162 のままだった。
+    //
+    // 我々が変更を頼まれているのはコンテナ窓なので、判定もコンテナ窓で行う。
+    if client_before == (clamp_dim(width), clamp_dim(height)) {
+        return log(PluginResizeOutcome::Applied, "container already at the requested size");
+    }
     let size_events_before = shared.size_events.get();
 
     shared.in_plugin_resize.set(true);
@@ -1025,7 +1344,7 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
     // `SetWindowPos` が WM_SIZE を出さなかった (= サイズが変わらなかった) ケースの保険。
     let mut fallback_notify = false;
     if let Some(sizer) = shared.sizer()
-        && sizer.current_client_size() != Some((width, height))
+        && sizer.plugin_view_size() != Some((width, height))
     {
         sizer.notify_client_size(width, height);
         fallback_notify = true;
@@ -1043,7 +1362,7 @@ pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> Plugin
         want_w = width,
         want_h = height,
         plugin_size_before = ?before,
-        plugin_size_after = ?shared.sizer().and_then(EditorSizer::current_client_size),
+        plugin_size_after = ?shared.sizer().and_then(EditorSizer::plugin_view_size),
         client_before = format!("{}x{}", client_before.0, client_before.1),
         client_after = format!("{}x{}", client_after.0, client_after.1),
         wm_size_delivered = size_events_after - size_events_before,
@@ -1261,6 +1580,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 // 観測 (r.md #65): `plugin_requested_resize` が「`SetWindowPos` の
                 // 後に WM_SIZE が実際に来たか」を差分で判定するためのカウンタ。
                 shared.size_events.set(shared.size_events.get().wrapping_add(1));
+                probe_can_resize_change(shared, "WM_SIZE");
                 if let Some(sizer) = shared.sizer() {
                     #[allow(clippy::cast_possible_truncation)]
                     let cw = (lparam.0 & 0xFFFF) as u32;
@@ -1268,7 +1588,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     let ch = ((lparam.0 >> 16) & 0xFFFF) as u32;
                     // 縮退サイズ (0x0) をプラグインへ流さない — サイズ依存の描画が
                     // 0 次元で走る。
-                    let current = sizer.current_client_size();
+                    let current = sizer.plugin_view_size();
                     if cw > 0 && ch > 0 && current != Some((cw, ch)) {
                         sizer.notify_client_size(cw, ch);
                         tracing::info!(
@@ -1277,7 +1597,7 @@ unsafe extern "system" fn editor_wnd_proc(
                             client_w = cw,
                             client_h = ch,
                             plugin_size_before = ?current,
-                            plugin_size_after = ?sizer.current_client_size(),
+                            plugin_size_after = ?sizer.plugin_view_size(),
                             "WM_SIZE -> notified plugin (onSize / set_size)"
                         );
                     }
@@ -1315,6 +1635,56 @@ unsafe extern "system" fn editor_wnd_proc(
                 && let Some(shared) = shared_of(hwnd)
             {
                 shared.geometry_dirty.set(true);
+            }
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+
+        // --- キャプションのアクティブ表示を保つ (r.md #65 症状 A) ----------
+        //
+        // Renoise Redux は内部 Editor を開くと自分の view をコンテナから外して
+        // **コンテナを owner とする top-level popup** に化ける (実測:
+        // `owner == root_owner == コンテナ`)。以後クリックのたびにアクティブが
+        // popup へ移るので、コンテナは `WM_NCACTIVATE(FALSE)` を受けて
+        // キャプションを非アクティブ色に塗り直す。実ログではアクティブ色に塗った
+        // **0.25ms 後**に非アクティブ色へ戻っており、これが「一瞬濃くなってすぐ
+        // 薄く戻る」の正体。
+        //
+        // ユーザーから見れば popup もコンテナも **同じ 1 つのプラグインエディタ**
+        // なので、グループ内でアクティブが移っただけならキャプションは
+        // アクティブのまま描くのが正しい (ダイアログを持つアプリと同じ扱い)。
+        //
+        // MSDN の規定 (WM_NCACTIVATE):
+        // - *"If an active title bar or icon is to be drawn, the wParam parameter
+        //   is TRUE."* → `DefWindowProc` に **TRUE** で渡せばアクティブ色で描かれる。
+        // - lParam は *"if wParam is FALSE, this parameter is a handle to the
+        //   window that is going to be activated. This parameter can be NULL if
+        //   the window ... is from another application."* → **別アプリへ移るときは
+        //   NULL** なので、「NULL でない かつ 自分のグループ」のときだけ読み替える。
+        //   `-1` は `DefWindowProc` の「再描画するな」sentinel なので手を出さない。
+        // - *"an application should return TRUE to indicate that the system should
+        //   proceed with the default processing, or ... FALSE to prevent the
+        //   change."* → **必ず TRUE を返す**。FALSE はアクティブ窓の変更自体を
+        //   阻害してしまう (見た目のために使ってはいけない)。
+        WM_NCACTIVATE if wparam.0 == 0 && lparam.0 != -1 => {
+            let target = HWND(lparam.0 as *mut core::ffi::c_void);
+            if belongs_to_this_editor(hwnd, target) {
+                tracing::info!(
+                    target: RESIZE_TARGET,
+                    hwnd = format!("{:#x}", hwnd.0 as usize),
+                    going_to = format!("{:#x}", target.0 as usize),
+                    "WM_NCACTIVATE(FALSE) to our own owned popup — keeping the caption active"
+                );
+                if let Some(shared) = shared_of(hwnd) {
+                    set_caption_active(hwnd, shared, true);
+                } else {
+                    let _ = unsafe { DefWindowProcW(hwnd, msg, WPARAM(1), lparam) };
+                }
+                // アクティブ窓の変更自体は妨げない。
+                return LRESULT(1);
+            }
+            // グループ外へ移るなら通常どおり非アクティブ色。固定していたなら降ろす。
+            if let Some(shared) = shared_of(hwnd) {
+                shared.caption_forced_active.set(false);
             }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
@@ -1364,6 +1734,15 @@ unsafe extern "system" fn editor_wnd_proc(
                 minimized,
                 other = format!("{:#x}", lparam.0),
                 child = %describe_plugin_child(hwnd),
+                // r.md #65: Alt+Tab の観測点。所有 popup (= プラグインが逃がした
+                // view) が居るなら、その可視性と z 順・前面かどうかを残す。
+                //
+                // ユーザー報告「Alt+Tab で Redux に切替えても前面に表示されない」の
+                // 切り分けに要る: 所有 popup は `WS_EX_APPWINDOW` が無い限り
+                // Alt+Tab に独立エントリを持たないので、ユーザーが選んでいるのは
+                // **コンテナ窓**のはず。コンテナがアクティブになったのに popup が
+                // 前面に来ていないなら、こちらから持ち上げる必要がある。
+                owned_popup = %describe_owned_popup(hwnd),
                 "WM_ACTIVATE"
             );
             // 既定処理を必ず通す (これを止めるとアクティブ化そのものが壊れる)。
@@ -1386,7 +1765,44 @@ unsafe extern "system" fn editor_wnd_proc(
         // 「プラグインエディタを触っている間もアプリはアクティブ」をこちらから報告する。
         // `wparam != 0` = このスレッドの窓が activation を得た。
         WM_ACTIVATEAPP => {
-            store_windows_active(wparam.0 != 0);
+            let app_active = wparam.0 != 0;
+            store_windows_active(app_active);
+            if let Some(shared) = shared_of(hwnd) {
+                // r.md #65: **プラグインが view を所有 popup へ逃がすと、以後
+                // コンテナには `WM_ACTIVATE` / `WM_NCACTIVATE` が来なくなる**
+                // (アクティブ窓は popup で、コンテナではないため)。実測でも
+                // 別アプリ切替と Alt+Tab の 55 秒間に届いたのは
+                // `WM_ACTIVATEAPP` だけだった。
+                //
+                // よってキャプションの**解除**はここでしかできない。固定
+                // (`WM_NCACTIVATE` の読み替え) と対にして、
+                //   「このプロセスが前面 かつ グループ内の窓がアクティブ」
+                // のときだけアクティブ色、という 1 つの規則に揃える。
+                // 条件は **`WM_NCACTIVATE` 側と同じ述語**で書く (SSoT)。
+                // 以前は「所有 popup が居るか」を列挙で判定していたが、その列挙が
+                // 壊れていて常に false になり、この経路が丸ごと死んでいた。
+                // 「いまアクティブな窓が自分のグループか」を直接聞けば列挙は要らない。
+                let active =
+                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow() };
+                let group_active = belongs_to_this_editor(hwnd, active);
+                set_caption_active(hwnd, shared, app_active && group_active);
+
+                // r.md #65: Alt+Tab の観測点。**発火するメッセージ側に付ける**
+                // (`WM_ACTIVATE` に付けていたが、逃げた後は来ないので空振りだった)。
+                tracing::info!(
+                    target: RESIZE_TARGET,
+                    hwnd = format!("{:#x}", hwnd.0 as usize),
+                    app_active,
+                    owned_popup = %describe_owned_popup(hwnd),
+                    last_active_popup = %describe_last_active_popup(hwnd),
+                    container = %describe_rect_and_visibility(hwnd),
+                    container_above = %describe_windows_above(hwnd, 4),
+                    state = %describe_input_state(),
+                    "WM_ACTIVATEAPP"
+                );
+                // 観測が嘘をついていないかを機械に検査させる (r.md #65)。
+                warn_if_observation_inconsistent(hwnd);
+            }
             // 既定動作 (フォーカス周りの内部処理) は潰さずそのまま流す。
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
@@ -1410,12 +1826,9 @@ unsafe extern "system" fn editor_wnd_proc(
 mod tests {
     use super::*;
 
-    /// r.md #65: `canResize()` が false のプラグイン (Renoise Redux 等) の窓は
-    /// **ユーザーがリサイズできてはいけない**。VST3 SDK editorhost も
-    /// clap-wrapper も「不可なら `WS_THICKFRAME` / `WS_MAXIMIZEBOX` を出さない」で
-    /// 一致しており、これがこの項目のユーザー決定でもある。
+    /// スタイル写像そのもの (方針は `plugin_instance::should_offer_resize_frame`)。
     #[test]
-    fn non_resizable_editor_has_no_resize_frame() {
+    fn editor_window_style_maps_resize_frame_to_thickframe() {
         let fixed = editor_window_style(false);
         assert_eq!(fixed & WS_THICKFRAME, WINDOW_STYLE(0));
         assert_eq!(fixed & WS_MAXIMIZEBOX, WINDOW_STYLE(0));
