@@ -354,6 +354,20 @@ plugin-main の周回で **同じ `plugin_requested_resize` へ合流**させる
   (= ✕ が効かない。r.md #65 実測)。転送の規則自体は本物の子窓に対しては正しく、
   **適用範囲を本来の対象へ絞る**のがこの修正。
 
+- **窓を破棄したらアクティブを owner へ明示的に戻す** (`restore_foreground_to_owner`)。
+  Windows は戻してくれない — window-features "Destroying a Window":
+  *"If the window being destroyed is the active window ... The window that becomes the
+  active window is the next window, **as determined by the ALT+ESC key combination**."*
+  後継は **Alt+Esc 順の次の窓**であって owner ではない。
+  *"An owned window is always above its owner in the z-order"* は「上にいる」だけの保証で
+  「隣接」は保証しないので、他アプリが間に挟まっていればそちらが前面に出る (実測)。
+  - **破棄の前に**「自分のグループが foreground か」を判定する (破棄後は判定材料が消える)。
+    foreground でないなら何もしない (別アプリを触っている最中に前面を奪わない)。
+  - **plugin_host 側で実行する**。`SetForegroundWindow` の成功条件のひとつが
+    *"The calling process is the foreground process."* で、破棄の瞬間に foreground
+    プロセスなのは plugin_host。daw_gui 側から呼ぶ設計では原理的に弾かれる。
+  - 対象は `close_slot_gui` と `teardown_device` の **2 経路**。どちらも同じ述語を通す。
+
 ### 4-1. 「逃げたか」の判定基準は目的ごとに違う (r.md #65)
 
 Redux は `SetWindowLong` で `WS_CHILD` を落として `WS_POPUP` を立てるが `SetParent` を

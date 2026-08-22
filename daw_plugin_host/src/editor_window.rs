@@ -629,6 +629,9 @@ pub struct EditorWindow {
     /// 借用ポインタ。`Drop` の本体で `DestroyWindow` してからこの field が落ちるので、
     /// WNDPROC が dangling を踏むことはない。
     sizer: Option<Box<dyn EditorSizer>>,
+    /// 生成時に決めた owner 束縛 (r.md #65)。**破棄後にアクティブを誰へ戻すか**を
+    /// 知るために保持する ([`Self::owner_to_restore_if_foreground`])。
+    owner: OwnerBinding,
 }
 
 // HWND is !Send but EditorWindow is owned and used strictly on the
@@ -727,7 +730,7 @@ impl EditorWindow {
             let raw = Rc::into_raw(Rc::clone(&shared));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
         }
-        Ok(Self { hwnd, shared, sizer: None })
+        Ok(Self { hwnd, shared, sizer: None, owner })
     }
 
     pub fn hwnd_u64(&self) -> u64 {
@@ -769,6 +772,35 @@ impl EditorWindow {
     /// loop polls this to drive the close flow.
     pub fn take_close_request(&self) -> bool {
         self.shared.close_requested.replace(false)
+    }
+
+    /// この窓を破棄したあと **アクティブを戻すべき owner** を返す (r.md #65)。
+    ///
+    /// # なぜ必要か — Windows は owner へ戻してくれない
+    ///
+    /// Microsoft Learn (window-features, Destroying a Window):
+    ///
+    /// > *"If the window being destroyed is the active window, both the active and focus
+    /// > states are transferred to another window. **The window that becomes the active
+    /// > window is the next window, as determined by the ALT+ESC key combination.**"*
+    ///
+    /// つまり後継は **Alt+Esc 順の次の窓**であって、**owner ではありません**。
+    /// *"An owned window is always above its owner in the z-order"* は「上にいる」だけを
+    /// 保証するもので「隣接している」ことは保証しないので、他アプリが間に挟まっていれば
+    /// そちらがアクティブになります (実測でユーザーが踏んだのがこれ)。
+    ///
+    /// # `None` を返す条件
+    ///
+    /// **いま自分のグループが foreground でないなら何もしない。** ユーザーが既に別アプリを
+    /// 触っている最中に閉じた (例: daw_gui の GUI ボタン経由ではなく、別アプリから
+    /// `CloseAllSlotGuis` が飛んだ) 場合に前面を奪うと、割り込みになります。
+    /// owner が無い (`Standalone`) 場合も戻す先が無いので `None`。
+    pub fn owner_to_restore_if_foreground(&self) -> Option<HWND> {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let owner = self.owner.owner_hwnd()?;
+        // 「自分のグループが前面か」は既存の述語と同じもので判定する (SSoT)。
+        let fg = unsafe { GetForegroundWindow() };
+        belongs_to_this_editor(self.hwnd, fg).then_some(owner)
     }
 
     /// コンテナ窓がまだ存在するか。
@@ -998,6 +1030,37 @@ fn point_on_a_monitor(x: i32, y: i32) -> bool {
     // タイトルバーが掴める位置に居ることを見たいので、左上から少し内側を見る。
     let p = POINT { x: x + 32, y: y + 8 };
     !unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONULL) }.is_invalid()
+}
+
+/// エディタ窓を破棄したあと、アクティブを owner (daw_gui の本体窓) へ戻す (r.md #65)。
+///
+/// [`EditorWindow::owner_to_restore_if_foreground`] が返した owner を、**破棄の直後に**
+/// 渡すこと。Windows は owner へ戻してくれない (規定は Alt+Esc 順の次の窓) ので、
+/// 明示的に呼ぶ必要がある。
+///
+/// # なぜ plugin_host 側でやるのか
+///
+/// `SetForegroundWindow` が成功する条件のひとつが *"The calling process is the foreground
+/// process."* (Microsoft Learn)。**破棄の瞬間に foreground プロセスなのは
+/// daw_plugin_host** (エディタがアクティブだったのだから) であって daw_gui ではない。
+/// daw_gui 側から呼ぶ設計にすると、まさにその条件を満たさないので弾かれる。
+/// 「前面にすべき窓」を知っているのは daw_gui だが、**それを実行できる立場にあるのは
+/// plugin_host だけ**なので、owner の HWND を渡してもらってこちらで実行する。
+///
+/// 戻り値も結果も必ずログに残す — **「呼んだ」と「効いた」は別の事実**。
+pub fn restore_foreground_to_owner(owner: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let ok = unsafe { SetForegroundWindow(owner) }.as_bool();
+    tracing::info!(
+        target: RESIZE_TARGET,
+        owner = format!("{:#x}", owner.0 as usize),
+        // false = OS の foreground 制限で拒否された。条件は Microsoft Learn の
+        // SetForegroundWindow Remarks (foreground プロセスであること等)。
+        set_foreground_ok = ok,
+        // **効いたか**を別に測る。`ok=true` でも実際の前面が違うことがあり得る。
+        foreground_after = %describe_hwnd(unsafe { GetForegroundWindow() }),
+        "editor closed — handing the foreground back to the owner"
+    );
 }
 
 /// この窓へホストがキーボードフォーカスを**転送してよいか**を判定する (r.md #65)。
