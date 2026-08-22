@@ -2013,7 +2013,18 @@ impl PluginHost {
                 rec.editor.as_ref().is_some_and(|w| {
                     // `take_close_request` は副作用 (flag を落とす) があるので先に評価する。
                     let requested = w.take_close_request();
-                    if !requested && !w.is_window_alive() {
+                    if requested {
+                        // r.md #65: `WM_CLOSE` のログと対にして「✕ が押された」→
+                        // 「poll が拾った」→「破棄した」の 3 点が全部見えるようにする
+                        // (どこで切れているかを 1 往復で特定するため)。
+                        tracing::info!(
+                            target: "editor_resize",
+                            hwnd = format!("{:#x}", w.hwnd_u64()),
+                            "close request picked up by the plugin-main poll"
+                        );
+                        return true;
+                    }
+                    if !w.is_window_alive() {
                         tracing::warn!(
                             target: "editor_resize",
                             hwnd = format!("{:#x}", w.hwnd_u64()),
@@ -2022,7 +2033,7 @@ impl PluginHost {
                         );
                         return true;
                     }
-                    requested
+                    false
                 })
             })
             .map(|(&id, _)| id)
