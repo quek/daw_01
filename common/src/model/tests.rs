@@ -197,6 +197,174 @@ fn move_section_reorders_content_with_ripple() {
     assert_eq!(clips, vec![(1, 0.0), (2, 8.0), (3, 4.0)]);
 }
 
+/// r.md #71 (ユーザー報告そのもの): 「Break を 2 まで D&D しても元に戻ってしまいます。
+/// その先の C まで D&D すると Break と 2 が入れかわります。」
+///
+/// 帯を **右へ** 動かすときだけ、落とし先が 1 セクションぶん先にずれていた。
+/// 原因は `move_section` が `dest_start` を「[a,b) を ripple-close した **中間座標系**」 の
+/// 絶対拍として解釈していたこと (`dest_start - len` / 自分の元範囲内なら元の位置へ)。
+/// ユーザーが指しているのは画面で見えている位置 = **移動後の座標系**なので、
+/// 逆算を呼び出し側に強いる形が誤りだった。
+#[test]
+fn move_section_forward_swaps_with_the_band_under_the_cursor() {
+    let mk = |sections: Vec<Section>| Song {
+        length_beats: 12.0,
+        sections,
+        tracks: vec![Track {
+            id: 1,
+            clips: vec![
+                Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() },
+                Clip { id: 2, start_beat: 4.0, length_beats: 4.0, ..Default::default() },
+                Clip { id: 3, start_beat: 8.0, length_beats: 4.0, ..Default::default() },
+            ],
+            ..Track::default()
+        }],
+        ..Default::default()
+    };
+    let secs = |song: &Song| -> Vec<(u32, f64, f64)> {
+        song.sections.iter().map(|s| (s.id, s.start_beat, s.len_beats)).collect()
+    };
+    let clips = |song: &Song| -> Vec<(u32, f64)> {
+        let mut v: Vec<(u32, f64)> =
+            song.tracks[0].clips.iter().map(|c| (c.id, c.start_beat)).collect();
+        v.sort_by_key(|c| c.0);
+        v
+    };
+
+    // Break[0,4) / 2[4,8) / C[8,12)。Break を「2 の場所」 (拍 4) へ落とす。
+    let mut song = mk(vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0), mk_section(3, 8.0, 4.0)]);
+    assert!(!song.move_section(1, 4.0).is_empty(), "移動が起きる (元に戻らない)");
+    assert_eq!(
+        secs(&song),
+        vec![(2, 0.0, 4.0), (1, 4.0, 4.0), (3, 8.0, 4.0)],
+        "Break と 2 が入れかわる (C は動かない)"
+    );
+    assert_eq!(clips(&song), vec![(1, 4.0), (2, 0.0), (3, 8.0)], "clip も帯に追従する");
+
+    // その先の C (拍 8) へ落としたら **C と入れかわる** (= 1 つ先まで飛ばない)。
+    let mut song = mk(vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0), mk_section(3, 8.0, 4.0)]);
+    assert!(!song.move_section(1, 8.0).is_empty());
+    assert_eq!(
+        secs(&song),
+        vec![(2, 0.0, 4.0), (3, 4.0, 4.0), (1, 8.0, 4.0)],
+        "Break が末尾へ回り、2 と C が前へ詰まる"
+    );
+    assert_eq!(clips(&song), vec![(1, 8.0), (2, 0.0), (3, 4.0)]);
+}
+
+/// 落とし先の拍は **移動後の座標系での帯の開始位置** = ドラッグ中に見えていた位置。
+/// 前へ動かす場合は元から正しかったので、その挙動が変わっていないことも固定する
+/// (`move_section_reorders_content_with_ripple` の後方移動と対になる前方移動の確認)。
+#[test]
+fn move_section_lands_where_the_preview_showed_it() {
+    for (id, dest, want_start) in [(1_u32, 4.0_f64, 4.0_f64), (1, 8.0, 8.0), (3, 0.0, 0.0), (3, 4.0, 4.0)] {
+        let mut song = Song {
+            length_beats: 12.0,
+            sections: vec![
+                mk_section(1, 0.0, 4.0),
+                mk_section(2, 4.0, 4.0),
+                mk_section(3, 8.0, 4.0),
+            ],
+            ..Default::default()
+        };
+        assert!(!song.move_section(id, dest).is_empty(), "id={id} dest={dest}");
+        let got = song.sections.iter().find(|s| s.id == id).map(|s| s.start_beat);
+        assert_eq!(
+            got,
+            Some(want_start),
+            "id={id} を dest={dest} へ落としたら開始拍は {want_start} (見えていた位置)"
+        );
+    }
+}
+
+/// r.md #71: 他帯に **食い込む** 位置を指したら、近い方の境界へ寄せて着地する。
+///
+/// 寄せないと最後の `normalize_sections` が重なりを潰し、**帯の長さが変わって**しまう
+/// (ドラッグ中に見えていた帯と別物が出来る = overlay ≠ commit)。
+/// 合法な位置は素通しなので、通常のドラッグの感触は変わらない。
+#[test]
+fn move_section_resolves_dest_that_would_overlap_another_band() {
+    // Break[0,4) / 2[4,8) / C[8,12)。Break を抜くと 2→[0,4) / C→[4,8) に詰まる。
+    let mk = || Song {
+        length_beats: 12.0,
+        sections: vec![
+            mk_section(1, 0.0, 4.0),
+            mk_section(2, 4.0, 4.0),
+            mk_section(3, 8.0, 4.0),
+        ],
+        ..Default::default()
+    };
+    // 落とし先の拍 → 着地する開始拍。境界 (0/4/8) は素通し、内側は近い端へ。
+    for (desired, want) in [(4.0_f64, 4.0_f64), (8.0, 8.0), (6.0, 4.0), (7.0, 8.0), (1.0, 0.0), (3.0, 4.0)] {
+        let mut song = mk();
+        song.move_section(1, desired);
+        let moved = song.sections.iter().find(|s| s.id == 1).expect("帯は消えない");
+        assert!(
+            (moved.start_beat - want).abs() < 1e-9,
+            "dest={desired} → 開始拍 {want} へ寄る: got {}",
+            moved.start_beat
+        );
+        assert!(
+            (moved.len_beats - 4.0).abs() < 1e-9,
+            "帯の長さは変わらない (潰されない): dest={desired} got {}",
+            moved.len_beats
+        );
+        // 帯どうしは重なっていない (`normalize_sections` の invariant を実際に満たす)。
+        let mut spans: Vec<(f64, f64)> =
+            song.sections.iter().map(|s| (s.start_beat, s.end_beat())).collect();
+        spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0 + 1e-9, "重なりが残った: {spans:?} (dest={desired})");
+        }
+    }
+}
+
+/// `resolve_section_move_dest` は **冪等**。 preview 側で解決した値をそのまま
+/// `move_section` に渡しても二重補正にならない (合法な位置は素通し) ことの明示。
+#[test]
+fn resolve_section_move_dest_is_idempotent() {
+    let others = [(4.0_f64, 4.0_f64), (8.0, 4.0)];
+    for desired in [0.0_f64, 1.0, 3.0, 4.0, 6.0, 7.0, 8.0, 20.0] {
+        let once = resolve_section_move_dest(others.iter().copied(), 0.0, 4.0, desired);
+        let twice = resolve_section_move_dest(others.iter().copied(), 0.0, 4.0, once);
+        assert!((once - twice).abs() < 1e-9, "desired={desired}: {once} -> {twice}");
+    }
+}
+
+/// r.md #71 同件: Ctrl+drag の **複製** も、他帯に食い込む位置へ落とすと
+/// `normalize_sections` に潰されて **複製が短くなる** (ゴーストは満寸で見えているのに)。
+/// 複製は close を伴わないので障害物は「全帯を現在位置のまま」 = 元帯も含む。
+#[test]
+fn duplicate_section_resolves_dest_that_would_overlap_another_band() {
+    let mk = || Song {
+        length_beats: 8.0,
+        sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0)],
+        // 既存 id 1,2 の続き (複製の id が既存と衝突しないように)。
+        ids: IdAllocators { next_section_id: 3, ..Song::default().ids },
+        ..Default::default()
+    };
+    // 落とし先の拍 → 着地する開始拍。境界 (0/4/8) は素通し、2[4,8) の内側は近い端へ
+    // (ちょうど中点の 6 は同着なので手前 = insert-before 寄り)。
+    for (desired, want) in [(4.0_f64, 4.0_f64), (8.0, 8.0), (5.0, 4.0), (6.0, 4.0), (7.0, 8.0)] {
+        let mut song = mk();
+        let (new_id, _) = song.duplicate_section(1, desired).expect("複製される");
+        let dup = song.sections.iter().find(|s| s.id == new_id).expect("複製された帯");
+        assert!(
+            (dup.start_beat - want).abs() < 1e-9,
+            "dest={desired} → 開始拍 {want}: got {}",
+            dup.start_beat
+        );
+        assert!(
+            (dup.len_beats - 4.0).abs() < 1e-9,
+            "長さは保たれる (潰されない): dest={desired} got {}",
+            dup.len_beats
+        );
+        // 元帯も潰されていない。
+        let orig = song.sections.iter().find(|s| s.id == 1).expect("元帯");
+        assert!((orig.len_beats - 4.0).abs() < 1e-9, "元帯の長さも不変: got {}", orig.len_beats);
+    }
+}
+
 #[test]
 fn duplicate_section_inserts_linked_copy_with_ripple() {
     let mut song = Song {

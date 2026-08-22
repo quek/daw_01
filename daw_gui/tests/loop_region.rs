@@ -115,29 +115,38 @@ fn degenerate_loop_range_collapses_to_undefined() {
 fn ripple_from_section_edit_shifts_the_loop_range() {
     let (mut app, mut audio_rx, _p) = build_app();
     add_section(&mut app, 1, 0.0, 4.0);
-    app.handle_event(AppEvent::SetLoopRange { start: 16.0, end: 20.0 });
+    // ループが open の起点をまたぐように取る (close で start、open で end が動く =
+    // 2 つの ripple の**両方**が効いていないと下の期待値にならない)。
+    app.handle_event(AppEvent::SetLoopRange { start: 16.0, end: 24.0 });
     let _ = last_set_loop(&mut audio_rx);
 
-    // [0,4) の帯を beat 20 へ移動 = 「[0,4) を詰める (close: from 4, -4)」 +
-    // 「詰めた座標系の 16 に 4 拍空ける (open: from 16, +4)」。
-    // ループ 16..20 は close で 12..16、open で 12..20 になる (start は open の
-    // 起点より手前なので動かない = clip / セクションと同じ規則)。
+    // r.md #71: `move_section` の `dest_start` は **移動後の帯の開始拍**。 beat 20 を指せば
+    // 帯は [20,24) に着地する (旧契約は「[0,4) を close した中間座標系の拍」 で、 20 を
+    // 指すと帯は 16 に落ちていた = 1 セクションぶんのズレ)。
+    // 内訳は「[0,4) を詰める (close: from 4, -4)」 + 「20 に 4 拍空ける (open: from 20, +4)」。
+    // ループ 16..24 は close で 12..20、open で 12..24 になる
+    // (start は open の起点より手前なので動かない = clip / セクションと同じ規則)。
     let changed = app.edit_song_rippling(|song| song.move_section(1, 20.0));
     assert!(changed, "セクションは実際に移動する");
     assert_eq!(
+        app.song_doc.song().sections.iter().find(|s| s.id == 1).map(|s| s.start_beat),
+        Some(20.0),
+        "帯は指した拍に着地する (r.md #71)"
+    );
+    assert_eq!(
         (app.transport.loop_region.start_beat, app.transport.loop_region.end_beat),
-        (12.0, 20.0),
+        (12.0, 24.0),
         "ripple close + open がループ範囲にも同じ規則で効く"
     );
 
-    // 帯は今 [16,20)。範囲ごと削除すると close(from 20, -4) だけが効き、
-    // 20 以降だけが前へ詰まる (12 は不変、20 → 16)。
+    // 帯は今 [20,24)。範囲ごと削除すると close(from 24, -4) だけが効き、
+    // 24 以降だけが前へ詰まる (12 は不変、24 → 20)。
     let changed =
         app.edit_song_rippling(|song| song.delete_section_range(1).into_iter().collect());
     assert!(changed, "範囲削除は実際に起きる");
     assert_eq!(
         (app.transport.loop_region.start_beat, app.transport.loop_region.end_beat),
-        (12.0, 16.0),
+        (12.0, 20.0),
         "削除した 4 拍ぶんループ末尾も前へ詰まる"
     );
     assert_eq!(

@@ -782,6 +782,81 @@ pub enum BindingTarget {
     },
 }
 
+/// r.md #71: セクション帯を `desired_start` (= **移動後の座標系** = ドラッグ中に画面で
+/// 見えている開始拍) へ落とすときに、**実際に着地する開始拍**を返す。
+///
+/// [`Song::move_section`] は帯の範囲 `[a,b)` を ripple-close で詰め、落とし先に
+/// ripple-open で空けて置き直す。 open は「落とし先以降」 を右へ逃がすので、
+/// 帯と重なりうるのは **落とし先より前から始まる帯** だけ。 そこへ食い込む位置を
+/// 指していたら、近い方の境界へ寄せる (Studio One の insert-before / replace 相当)。
+/// 重ならなければ `desired_start` をそのまま返す = 通常のドラッグの感触は変わらない。
+///
+/// **preview (widget の ghost) と commit がこの 1 本を共有する**のが要件。 片方だけ
+/// 解決すると「見えていた位置と違う所に落ちる」 という別のバグになる。 また合法な位置は
+/// 素通しなので **冪等** で、 preview 側で解決済みの値を `move_section` に渡しても
+/// 二重補正にならない。
+///
+/// `others` は **移動する帯を除いた** 現在の帯の `(start_beat, len_beats)` 列
+/// (現在の座標系のまま渡す。 close 後の位置はこの関数が内部で導出する)。
+/// 帯は非重複なので食い込む相手は高々 1 つ。
+///
+/// 参考: Studio One の Arranger Track はタイムライン上の位置へドラッグして落とし、
+/// ripple が隙間を詰める。落とし先の帯を「置き換える / 前後に挿入する」 のどれになるかは
+/// ポインタ位置で決まり、タグで予告される
+/// (<https://www.soundonsound.com/techniques/studio-one-making-arrangements>)。
+#[must_use]
+pub fn resolve_section_move_dest<I>(
+    others: I,
+    moved_start: f64,
+    moved_len: f64,
+    desired_start: f64,
+) -> f64
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    if moved_len <= 0.0 {
+        return desired_start.max(0.0);
+    }
+    // close で帯を抜いたぶん、`b` 以降の帯は左へ詰まる。 それが drop 時点の配置。
+    let b = moved_start + moved_len;
+    resolve_section_drop_start(
+        others.into_iter().map(|(start, len)| {
+            (if start >= b { start - moved_len } else { start }, len)
+        }),
+        desired_start,
+    )
+}
+
+/// r.md #71: 帯を `desired_start` へ落とすときに、**実際に着地する開始拍**を返す core。
+///
+/// `existing` は **drop 時点で存在する帯**の `(start_beat, len_beats)` 列。
+/// ripple-open は「落とし先以降」 を右へ逃がすので、置いた帯と重なりうるのは
+/// **落とし先より前から始まる帯**だけ。 そこへ食い込む位置を指していたら近い方の
+/// 境界へ寄せる。 重ならなければ `desired_start` をそのまま返す (= 素通し・冪等)。
+///
+/// 移動 ([`resolve_section_move_dest`]) と複製 ([`Song::duplicate_section`]) の違いは
+/// **`existing` の中身だけ**: 移動は「自分を除き、close で詰まった位置」、
+/// 複製は「全帯を現在位置のまま」 (close しないので元帯も障害物になる)。
+#[must_use]
+pub fn resolve_section_drop_start<I>(existing: I, desired_start: f64) -> f64
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    let dest = desired_start.max(0.0);
+    for (start, len) in existing {
+        if start < dest && start + len > dest {
+            // dest がこの帯の内側 = そのままでは重なる。近い方の端へ寄せる。
+            let (lo, hi) = (start, start + len);
+            return if dest - lo <= hi - dest { lo } else { hi };
+        }
+    }
+    dest
+}
+
+/// r.md #71: 「帯が動いた / 動かなかった」 を判定する拍スケールの許容差。
+/// 落とし先は算術で導かれるので、元位置へ寄せ戻された場合でも bit 一致しない。
+const SECTION_MOVE_EPS_BEATS: f64 = 1e-9;
+
 impl Song {
     /// Allocate a new stable track id, bumping the song-level counter.
     pub fn alloc_track_id(&mut self) -> u32 {
@@ -894,8 +969,22 @@ impl Song {
     /// セクション帯を `dest_start` へ
     /// 破壊的に移動し、 曲構成を組み替える (Studio One 流の能動アレンジャー)。 帯の範囲
     /// `[a, b)` 内の全トラック clip + automation + `song_lanes` automation + `scale_changes`
-    /// を帯と一緒に取り出し、 `[a,b)` を ripple-close で詰め、 `dest_start` に ripple-open で
+    /// を帯と一緒に取り出し、 `[a,b)` を ripple-close で詰め、 落とし先に ripple-open で
     /// 空けて落とし直す。 他セクション / 他 clip は ripple で前後に流れる。
+    ///
+    /// # `dest_start` の意味 (r.md #71 で契約を変更)
+    ///
+    /// **`dest_start` は「移動後の帯の開始拍」** = ドラッグ中に画面で見えている位置。
+    /// 帯が置けない位置 (他帯に食い込む) を指していたら
+    /// [`resolve_section_move_dest`] が近い方の境界へ寄せるので、
+    /// **実際の着地位置は `resolve_section_move_dest(..)` の戻り値** になる。
+    /// preview 側も同じ関数を通すことで overlay == commit が構造的に保たれる。
+    ///
+    /// 旧契約は「`[a,b)` を close した **中間座標系** の絶対拍」 で、 前へ動かすときだけ
+    /// `dest_start - len` の逆算を呼び出し側に強いていた。 その結果
+    /// 「1 つ先の帯まで引っ張らないと届かない / 隣へ落とすと元に戻る」 という
+    /// **1 セクションぶんのズレ**になっていた (r.md #71 のユーザー報告そのもの)。
+    /// 中間座標系はこの関数の内部事情であって、 ユーザーが指しているものではない。
     ///
     /// 戻り値は適用した [`Ripple`] 列 (**空 = 移動しなかった**)。 呼び出し側は Song の外に
     /// 住む時間位置 (session state のループ範囲) をこれで追従させる。
@@ -909,8 +998,20 @@ impl Song {
         };
         let (a, len) = (sec.start_beat, sec.len_beats);
         let b = a + len;
-        let dest_start = dest_start.max(0.0);
-        if len <= 0.0 || (dest_start - a).abs() < f64::EPSILON {
+        // r.md #71: 落とし先は「移動後の帯の開始拍」。 置けない位置は境界へ寄せる。
+        // preview (widget) も同じ関数を通すので、 見えていた位置に落ちる。
+        // 既に解決済みの値を渡されても冪等 (合法な位置は素通し) なので二重補正にならない。
+        let dest_start = resolve_section_move_dest(
+            self.sections.iter().filter(|s| s.id != section_id).map(|s| (s.start_beat, s.len_beats)),
+            a,
+            len,
+            dest_start,
+        );
+        // 「動かなかった」 判定は **拍スケールの許容差**で見る。 解決後の落とし先は
+        // `start - moved_len` 等の算術で導くので、 元位置へ寄せ戻された場合でも `a` と
+        // bit 一致するとは限らない (小数拍の帯だと 1e-15 ずれる)。 `f64::EPSILON` だと
+        // それをすり抜け、 見た目 no-op の drag で clip 分割 + undo + dirty が走る。
+        if len <= 0.0 || (dest_start - a).abs() < SECTION_MOVE_EPS_BEATS {
             return Vec::new();
         }
         let in_range = |start: f64| start >= a && start < b;
@@ -980,14 +1081,15 @@ impl Song {
 
         // 2. `[a,b)` を詰める (close)。
         let close = self.ripple_timeline(b, -len);
-        // 3. 詰めた後の座標系での落とし先。
-        let dest2 = if dest_start >= b {
-            dest_start - len
-        } else if dest_start <= a {
-            dest_start
-        } else {
-            a
-        };
+        // 3. 落とし先。 r.md #71: **そのまま使う**。 close は「帯を抜いた」 だけで、
+        //    残りの帯の並びは変わらない。 続く open が `dest_start` 以降を右へ逃がすので、
+        //    帯を `dest_start` に置けば最終的な開始拍はちょうど `dest_start` になる
+        //    (= ドラッグ中に見えていた位置)。
+        //
+        //    旧実装はここで `dest_start - len` / `a` の逆算をしていた。 それは
+        //    「close 後の中間座標系での位置」 を呼び出し側に指定させる契約であり、
+        //    前へ動かすときに 1 セクションぶんズレる原因だった (r.md #71)。
+        let dest2 = dest_start;
         // 4. 落とし先に `len` ぶん空ける (open)。
         let open = self.ripple_timeline(dest2, len);
 
@@ -1051,10 +1153,17 @@ impl Song {
         let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
         let (a, len) = (sec.start_beat, sec.len_beats);
         let b = a + len;
-        let dest_start = dest_start.max(0.0);
         if len <= 0.0 {
             return None;
         }
+        // r.md #71 同件: 複製も「置けない位置」 (他帯に食い込む) を指されたら境界へ寄せる。
+        // 寄せないと `normalize_sections` が重なりを潰し、**複製だけ短くなる**
+        // (ゴーストは満寸で見えているのに、落とすと切り詰められる)。
+        // 移動と違って close しないので、障害物は **全帯を現在位置のまま** (元帯も含む)。
+        let dest_start = resolve_section_drop_start(
+            self.sections.iter().map(|s| (s.start_beat, s.len_beats)),
+            dest_start,
+        );
         let in_range = |start: f64| start >= a && start < b;
 
         // 0. 境界をまたぐ clip を a / b で分割 (move / delete-range と同じ split-at-boundary)。

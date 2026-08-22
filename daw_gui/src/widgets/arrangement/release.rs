@@ -1124,10 +1124,14 @@ pub(super) fn commit_releases(
                         ui.push_edit({ let v_id = sd.section_id; let v_mod = modifier; Edit::mutate(move |app: &mut AppData| { app.apply_select_section(v_id, v_mod); }) });
                         ui.push_edit({ let v_beat = sd.anchor_start.max(0.0); Edit::mutate(move |app: &mut AppData| { app.seek_playhead_to(v_beat); }) });
                     } else if sd.last_ctrl {
-                        let next_start = (sd.anchor_start + delta).max(0.0);
+                        // r.md #71 同件: 複製も overlay (ghost) と **同じ**
+                        // `section_duplicate_dest` を通す。 close しない ぶん障害物の集合が
+                        // 移動とは違う (全帯・現在位置のまま) だけで、解決自体は必要。
+                        let next_start = section_duplicate_dest(sections, &sd, delta);
                         ui.push_edit({ let v_id = sd.section_id; let v_dest = next_start; Edit::mutate(move |app: &mut AppData| { app.apply_duplicate_section(v_id, v_dest); }) });
                     } else {
-                        let next_start = (sd.anchor_start + delta).max(0.0);
+                        // r.md #71: overlay (ghost) と **同じ** `section_move_dest`。
+                        let next_start = section_move_dest(sections, &sd, delta);
                         ui.push_edit({ let v_id = sd.section_id; let v_ns = next_start; Edit::mutate(move |app: &mut AppData| { app.apply_move_section(v_id, v_ns); }) });
                     }
                 }
