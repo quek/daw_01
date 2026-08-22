@@ -157,16 +157,33 @@ r.md #65 の申告は 2 つ:
 1. `Vst3PlugFrame::resizeView` が窓も直さず `onSize` も呼ばずに `kResultOk` を返していた
    (実処理は channel 経由で plugin-main の次周回)。これは `iplugview.h` の
    *"Afterwards, **in the same callstack**, the host has to call IPlugView::onSize ()"* 違反。
-2. Redux は自分の内部 "Editor" ビューを開くときコンテナより大きい領域 (880x162 → 1105x687)
-   を要求する。ホストが同期で応えないので、**自分の view 窓をコンテナから切り離して
-   `WS_CHILD` → `WS_POPUP` の owned top-level に作り替える**
-   (実測: style `0x54000000` → `0x90000000`、`GetParent` はコンテナ = owner のまま、
-   `EnumChildWindows` からは消える)。
+2. Redux は自分の内部 "Editor" ビューを開くとき、**自分の view 窓の style を
+   `WS_CHILD` → `WS_POPUP` に書き換える** (実測: `0x54000000` → `0x80000000`、以後
+   `0x90000000` = +`WS_VISIBLE`)。**ただし `SetParent` は呼ばない。**
+   結果、`GetParent` / `GA_PARENT` / `GA_ROOT` / `GA_ROOTOWNER` / `GW_OWNER` がすべて
+   コンテナを指したまま = **style は popup、階層は依然として子**という中間状態になる
+   (`EnumChildWindows` と `IsChild` からは消えるので「逃げた」ように見えるが、逃げていない)。
+
+   > **注意 (2026-08-22 に訂正)**: 以前この項は「ホストが `resizeView` に同期で応えないので
+   > Redux が痺れを切らして popup 化した」と書いていた。**実ログで反証済み**。
+   > style 反転 `07:57:09.904725` → `resizeView` `07:57:10.015380` で、**反転が 111ms 先行**する。
+   > attach から反転までの間に `resizeView` は 1 本も来ていない。反転は Editor ボタンを
+   > 押した時点の Redux の無条件動作であって、ホストの応答に対する fallback ではない。
+   > 1. の修正は仕様準拠として正しいが、本症状の根治ではない。
+
 3. その結果コンテナは**空の枠**になり、タイトルバーをクリックすると Windows は
    「owner をアクティブ化 → 直後に owned popup をアクティブ化」を行う。実測ログでは
    `WM_NCACTIVATE(TRUE)` の **0.25ms 後**に `WM_NCACTIVATE(FALSE)` が来る = 症状 A の
    「一瞬濃くなってすぐ薄く戻る」そのもの。Redux の Editor を開いていない間は
    `WM_NCACTIVATE(TRUE)` の後に何も来ない (= 症状が出ない) ので「毎回ではない」も一致する。
+3b. **残っている症状の本体**は 3 とは別。中間状態の view は `SetForegroundWindow` /
+   `GetActiveWindow` の判定を通ってしまう (実測: `fg` も `active` も view) が、Z 順は
+   *"A child window is grouped with its parent in z-order."* に従って親リンク = コンテナの
+   グループに束縛される。よって **view が前面になってもコンテナごとデスクトップ上に
+   浮上しない** (実測: `container_above=Chrome_WidgetWin_1 "YouTube - Vivaldi"`)。
+   view はコンテナのクライアント領域にぴったり収まったまま (view `(128,151 1274x639)` /
+   container `(120,120 1290x678)`) なので、**見た目の位置関係は壊れておらず、
+   失われているのは「コンテナごと前に出ること」だけ**。
 
 さらに独立した欠陥として:
 
