@@ -1,14 +1,11 @@
 {
-  "permissions": {
-    "additionalDirectories": ["F:/dev/gui_01"]
-  },
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash F:/dev/daw_01/.claude/hooks/sessionstart_show_pending_reflections.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/sessionstart_show_pending_reflections.sh\"",
             "timeout": 10
           }
         ]
@@ -20,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python F:/dev/daw_01/scripts/guard_engine.py",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/guard_engine.py\"",
             "timeout": 10
           }
         ]
@@ -30,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash F:/dev/daw_01/.claude/hooks/pretooluse_git_commit_review_reminder.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pretooluse_git_commit_review_reminder.sh\"",
             "timeout": 10
           }
         ]
@@ -40,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python F:/dev/daw_01/scripts/check_destructive_delete.py",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/check_destructive_delete.py\"",
             "timeout": 5
           }
         ]
@@ -52,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python F:/dev/daw_01/scripts/log_metric.py",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/log_metric.py\"",
             "timeout": 5
           }
         ]
@@ -63,12 +60,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash F:/dev/daw_01/.claude/hooks/stop_session_reflect.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/stop_session_reflect.sh\"",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "python F:/dev/daw_01/scripts/reflect.py",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/reflect.py\"",
             "timeout": 10
           }
         ]
@@ -79,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python F:/dev/daw_01/scripts/worktree_remove_cleanup.py",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/scripts/worktree_remove_cleanup.py\"",
             "timeout": 30
           }
         ]
