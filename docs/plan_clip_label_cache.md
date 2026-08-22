@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_clip_label_cache — アレンジ/ピアノロールの再描画キャッシュキーを描画内容から導出する
 
 FIXME #10。「共有クリップをリネームできません」。実態は、F2 / 右クリック「Rename」での

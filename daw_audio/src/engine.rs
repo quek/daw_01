@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Audio engine state + per-buffer driver (CPAL コールバック側)。
 //!
 //! 役割分担 (`docs/plan_arch_refactor.md` §4/§5):

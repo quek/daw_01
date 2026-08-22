@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 対話 GUI プロセスの single-instance ゲート。
 //!
 //! 2 つ目の daw_gui を起動しようとしたら、 既に開いているウィンドウを前面化

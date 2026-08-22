@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Instanced rounded-rect shader.
 // 入力 instance: pos(left,top,w,h) / fill / border / (border_w,r_tl,r_tr,r_br) / (r_bl,pad,pad,pad)
 // 出力: 角丸 + ボーダー描画

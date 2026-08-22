@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 /target
 /.claude/settings.local.json
 /.claude/scheduled_tasks.lock
@@ -12,3 +15,5 @@
 /third_party/
 # 個人用バックログ r.md (編集禁止の作業メモ)。マシン固有なので追跡しない。
 /r.md
+# Python のバイトコードキャッシュ (scripts/*.py を import したときに出る)。
+__pycache__/

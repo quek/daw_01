@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: track header のトラック名 ellipsis 省略 (gui_01 arrangement widget)
 
 ## 背景 / 症状

@@ -1,10 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 [package]
 name = "ara-sys"
 description = "Vendored Rust bindings to the ARA (Audio Random Access) C API — host subset. Pure type definitions (no linked library); ARA is dispatched entirely through plug-in-provided function-pointer tables."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+authors.workspace = true
+# ラッパー (build.rs / wrapper.h / shim) は GPL-3.0-or-later。
+# vendor/ARA_API/** と、 そこから bindgen した src/bindings.rs は
+# Apache-2.0 (Celemony Software GmbH)。 帰属は NOTICE を参照。
+license = "GPL-3.0-or-later AND Apache-2.0"
+repository.workspace = true
 publish.workspace = true
 
 [features]

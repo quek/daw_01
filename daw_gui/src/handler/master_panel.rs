@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::master_panel — r.md #50 のマスターパネル状態と計測器の制御。
 //!
 //! UI スレッド (view / メニュー / ショートカット) からテレメトリスレッドの

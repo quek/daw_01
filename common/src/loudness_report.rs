@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 範囲ラウドネス解析のレポート型と、オフライン走査中に値を積む収集器 (r.md #54)。
 //!
 //! daw_audio の freewheel 走査 (`daw_audio::export`) が [`LoudnessCollector`] に

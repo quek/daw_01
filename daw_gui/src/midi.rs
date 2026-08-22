@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MIDI input bridge.
 //!
 //! 起動時に最初に見えた MIDI 入力ポートを開き、NoteOn/NoteOff を

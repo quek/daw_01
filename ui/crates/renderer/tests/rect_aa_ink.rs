@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #53: rect パイプラインの AA が **インク保存** であることの GPU pixel verify。
 //!
 //! 症状は「再生でオートスクロールにするとクリップの左右がチラつく」。 root cause は

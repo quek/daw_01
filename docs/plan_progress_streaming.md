@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_progress_streaming — ロードのストリーミング化 + 保存/再スキャンのノンブロック進捗
 
 FIXME #24「プロジェクトロード中などプログレスバーを表示」。grill-me（2026-06-10）で理想 =

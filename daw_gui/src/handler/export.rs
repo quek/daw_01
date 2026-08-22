@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::export — WAV/MIDI/MP4 export の range/実行 + file dialog
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

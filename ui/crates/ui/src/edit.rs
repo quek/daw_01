@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `Edit<M>` — ユーザ操作から発生する編集要求。アプリ層に渡され、apply される。
 //!
 //! 設計方針:

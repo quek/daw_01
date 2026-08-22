@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! daw_gui build script — two responsibilities:
 //!
 //! 1. **App icon (#47):** rasterize `assets/icon.svg` (vector SSoT) at build

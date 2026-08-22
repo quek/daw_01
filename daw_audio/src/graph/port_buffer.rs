@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Pre-allocated stereo buffer pool. Used (PR2 onwards) for nodes whose
 //! output doesn't naturally live in a per-track scratch — group bus
 //! inputs (sum of children before group fx), sidechain auxiliary

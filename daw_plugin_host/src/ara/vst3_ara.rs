@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Hand-written VST3 companion-API glue for ARA (`ARA_API/ARAVST3.h`).
 //!
 //! ARA's VST3 binding rides on Steinberg COM (C++ vtables), so unlike the pure-C

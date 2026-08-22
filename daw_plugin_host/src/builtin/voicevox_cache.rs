@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! VOICEVOX 合成結果 (WAV bytes) の **永続コンテンツアドレスキャッシュ**。
 //!
 //! 歌唱 wav は `build_sing_query(notes, bpm)` が作る query JSON + singer_id の、

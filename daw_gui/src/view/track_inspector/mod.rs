@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! トラック inspector (左サイドバー):
 //! - 選択トラック名
 //! - 「Chain」見出し

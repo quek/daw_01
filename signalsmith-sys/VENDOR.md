@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # vendor/ の由来
 
 `ara-sys/vendor` と同じ方針: 一次ソースをリポジトリに取り込み、外部取得

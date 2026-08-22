@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Integration test for scripts/cleanup_worktree.sh.
 #
 # Builds a throwaway git repo with one worktree per scenario, runs the REAL

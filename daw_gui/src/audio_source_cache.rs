@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! GUI-side decoded audio buffer cache.
 //!
 //! Each `AudioSource` in `Song.audio_sources` has at most one decoded

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Time a real video export through the new libav/NVENC backend
 //! (`docs/plan_video_export_libav.md`). Loads a `.daw` project (JSON `Song`),
 //! renders **video only** (no audio WAV) so the measurement isolates the
@@ -5,8 +8,8 @@
 //! prints frames + wall time.
 //!
 //! ```pwsh
-//! $env:PATH = "F:\dev\daw_01\third_party\ffmpeg\bin;$env:PATH"
-//! cargo run -p daw_gui --example export_bench -- "C:\path\to\project.daw"
+//! $env:PATH = "$PWD\third_party\ffmpeg\bin;$env:PATH"
+//! cargo run -p daw_gui --example export_bench -- "<path>\to\project.daw"
 //! ```
 
 use std::path::Path;
@@ -16,9 +19,10 @@ use common::model::Song;
 use daw_gui::render_video::{render_mp4, RenderConfig};
 
 fn main() {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Users\ancient\Documents\daw_01\scratch\20260512\20260512.daw".to_string()
-    });
+    let Some(arg) = std::env::args().nth(1) else {
+        eprintln!("usage: cargo run -p daw_gui --example export_bench -- <project.daw>");
+        std::process::exit(2)
+    };
     let daw = Path::new(&arg);
     let json = std::fs::read_to_string(daw).unwrap_or_else(|e| {
         eprintln!("read {}: {e}", daw.display());

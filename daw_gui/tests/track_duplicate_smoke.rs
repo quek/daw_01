@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #30: トラック複製 (独立 / リンク) の AppData-driven JS smoke test。
 //!
 //! flow:

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_font_picker — Text クリップのフォントを検索付きピッカーで選ぶ（行=実フォント描画 + ライブプレビュー）
 
 FIXME #25「Text クリップのフォントをプラグインピッカーと同じように選べるように」。

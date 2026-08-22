@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! NVENC / libav export smoke (`docs/plan_video_export_libav.md`).
 //!
 //! Phase 1: verify encoder availability.
@@ -9,7 +12,7 @@
 //! Run (FFmpeg bin is copied next to the exe by build.rs, but examples live in
 //! a sibling dir, so add it to PATH):
 //! ```pwsh
-//! $env:PATH = "F:\dev\daw_01\third_party\ffmpeg\bin;$env:PATH"
+//! $env:PATH = "$PWD\third_party\ffmpeg\bin;$env:PATH"
 //! cargo run -p daw_gui --example nvenc_smoke
 //! ```
 //! Then verify the printed mp4 with ffprobe + a corner-pixel colour check.

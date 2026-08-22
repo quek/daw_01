@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_video_fx.md — ビルトイン GPU 映像効果（FIXME #54）
 
 > FIXME #54: 「動画・画像に色調整や座標変換などのエフェクトをかけたい。ビルトインプラグインとして

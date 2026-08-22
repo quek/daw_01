@@ -1,10 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 [package]
 name = "signalsmith-sys"
 description = "Vendored C ABI bindings to Signalsmith Stretch (MIT) — spectral time-stretch / pitch-shift / formant-shift engine used by daw_audio's StretchMode::Stretch and the formant stage."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+authors.workspace = true
+# ラッパー (src/lib.rs / shim/*) は GPL-3.0-or-later。
+# vendor/signalsmith-{stretch,linear}/** は MIT (Geraint Luff /
+# Signalsmith Audio Ltd.)。 帰属は NOTICE を参照。
+license = "GPL-3.0-or-later AND MIT"
+repository.workspace = true
 publish.workspace = true
 
 [features]

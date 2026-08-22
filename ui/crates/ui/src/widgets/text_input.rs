@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `text_input` ウィジェット — 1 行テキスト編集 (UTF-8 / IME / OS 標準 selection)。
 //!
 //! - **Focus 取得時に全選択** (click / programmatic / `text_input_at_focused` 統一、F2 rename 標準挙動)

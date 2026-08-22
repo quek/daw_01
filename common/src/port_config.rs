@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! プラグインの port 構成。 capability（生成器/音源/エフェクト/映像効果）の
 //! **Single Source of Truth** となる bool 群を運ぶ。
 //!

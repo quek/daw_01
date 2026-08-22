@@ -1,4 +1,12 @@
-.PHONY: help build run test test-rt clippy clean release run-release fmt check fetch-ffmpeg worktree-rm worktree-rm-merged
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+.PHONY: help build run test test-rt clippy license-check clean release run-release fmt check fetch-ffmpeg worktree-rm worktree-rm-merged
+
+# ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
+# `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
+# 明示したいときは `make license-check PYTHON=/usr/bin/python3.12`。
+PYTHON ?= $(shell command -v python 2>/dev/null || command -v python3 2>/dev/null)
 
 .DEFAULT_GOAL := release
 
@@ -44,6 +52,13 @@ TEST_PKGS := -p common -p daw_gui -p daw_audio -p daw_plugin_host \
 FFMPEG_DIR := third_party/ffmpeg
 FFMPEG_API := https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest
 FFMPEG_MATCH := n7\.1.*win64-lgpl-shared
+# r.md #60: BtbN の lgpl variant は configure に --enable-version3 を付けるので、
+# 取ってくる DLL は LGPL **v3**。zip ルートの LICENSE.txt がその全文 (= FFmpeg の
+# COPYING.LGPLv3)。ここを取り込まないと third_party/ffmpeg にライセンス文書が 1 つも
+# 無い状態になり、バイナリを配った瞬間に LGPL-3.0 §4(b)「GNU GPL と本ライセンス文書の
+# 写しを同梱せよ」を満たせなくなる。既存インストールの取りこぼしはこの URL から復旧する
+# (BtbN が LICENSE.txt にコピーしているのと同一の文書)。
+FFMPEG_LGPL3_URL := https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/COPYING.LGPLv3
 
 help:
 	@echo "daw_01 makefile targets (cargo ラッパー):"
@@ -55,6 +70,7 @@ help:
 	@echo "  make test          テストを持つ package のみ実行 (TEST_PKGS、#[test]0個の examples 等は除外)"
 	@echo "  make test-rt       RT (audio thread) の無確保検査 (rt-assert feature、make test から呼ばれる)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
+	@echo "  make license-check ライセンス表示の検査 (SPDX ヘッダ / REUSE / 依存の GPLv3 互換性)"
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
 	@echo "  make fmt           cargo fmt"
 	@echo "  make fetch-ffmpeg  third_party/ffmpeg を取得 (無ければ DL、各マシン 1 回)"
@@ -83,9 +99,18 @@ fetch-ffmpeg:
 		rm -rf "$(FFMPEG_DIR)"; \
 		mkdir -p "$(FFMPEG_DIR)"; \
 		cp -r "$$inner/bin" "$$inner/lib" "$$inner/include" "$(FFMPEG_DIR)/"; \
+		[ -f "$$inner/LICENSE.txt" ] || { echo "ERROR: LICENSE.txt missing at the root of the BtbN zip"; exit 1; }; \
+		cp "$$inner/LICENSE.txt" "$(FFMPEG_DIR)/LICENSE.txt"; \
 		rm -rf "$$tmp"; \
 		[ -f "$(FFMPEG_DIR)/lib/avcodec.lib" ] || { echo "ERROR: avcodec.lib missing after fetch"; exit 1; }; \
 		echo "FFmpeg fetched into $(FFMPEG_DIR)"; \
+	fi
+	@if [ ! -f "$(FFMPEG_DIR)/LICENSE.txt" ]; then \
+		echo "FFmpeg LICENSE.txt missing (fetched before r.md #60) — restoring LGPLv3 text"; \
+		curl -fsSL --max-time 60 -o "$(FFMPEG_DIR)/LICENSE.txt" "$(FFMPEG_LGPL3_URL)" \
+			|| { rm -f "$(FFMPEG_DIR)/LICENSE.txt"; \
+			     echo "WARNING: could not fetch the LGPLv3 text. Binary releases MUST ship it"; \
+			     echo "         (LGPL-3.0 section 4(b)). Re-run 'make fetch-ffmpeg' when online."; }; \
 	fi
 
 build: fetch-ffmpeg
@@ -124,6 +149,31 @@ test-rt:
 
 clippy:
 	cargo clippy --workspace -- -D warnings
+
+# ライセンス表示の機械検査 (r.md #60)。clippy / arch-lint と同格の常設ゲート。
+#   1. SPDX 式の評価器の自己検査 — ここが壊れると 4 が静かに false green になる
+#   2. REUSE Specification 3.3 適合 (全ファイルに著作権 + ライセンス表示があるか)
+#   3. SPDX ヘッダの取りこぼし (新規ファイルを足したら必ずここで気付く)
+#   4. 依存クレートが deny.toml の allow で満たせるか + THIRD-PARTY-NOTICES.md の鮮度
+# 1-4 は Python stdlib だけで動くので **どの環境でも必ず走る** (検査を skip して
+# 「緑に見えるが表示が壊れている」状態を作らない)。公式ツール (reuse / cargo-deny) は
+# 入っていれば追加で走らせる = より厳しい検査に上書きされることはあっても緩まない。
+license-check:
+	@[ -n "$(PYTHON)" ] || { echo "ERROR: python が見つかりません。make license-check PYTHON=/path/to/python3" >&2; exit 1; }
+	"$(PYTHON)" scripts/dep_licenses.py --self-test
+	"$(PYTHON)" scripts/reuse_lint.py
+	"$(PYTHON)" scripts/add_spdx_headers.py --check
+	"$(PYTHON)" scripts/dep_licenses.py --check
+	@if command -v reuse >/dev/null 2>&1; then \
+		echo "--- reuse lint ---"; reuse lint; \
+	else \
+		echo "note: reuse 未インストール (pipx install reuse) — 自前検査のみで続行"; \
+	fi
+	@if command -v cargo-deny >/dev/null 2>&1; then \
+		echo "--- cargo deny check licenses ---"; cargo deny --all-features check licenses; \
+	else \
+		echo "note: cargo-deny 未インストール (cargo install --locked cargo-deny) — 自前検査のみで続行"; \
+	fi
 
 # アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
 # docs/plan_arch_refactor.md §11)。違反は列挙のみ (exit 0)。

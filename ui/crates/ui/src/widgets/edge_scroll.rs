@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! ドラッグ端オートスクロール (edge auto-scroll) の純粋ロジック。
 //!
 //! arrangement / piano_roll の drag 中、ポインタが表示領域の端 hot-zone に入ったとき、その frame で

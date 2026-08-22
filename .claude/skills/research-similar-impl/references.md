@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # 調査対象プロジェクト
 
 | プロジェクト | 言語 | 特徴 | クローン先 / パス | URL |
@@ -8,7 +13,7 @@
 | nih-plug | Rust | Rust 製プラグインフレームワーク (CLAP/VST3)。FFI とイベント変換の設計 | /tmp/nih-plug | https://github.com/robbert-vdh/nih-plug |
 | clap-validator | Rust | CLAP プラグインを検証するホスト。ホスト側契約の確認に有用 | /tmp/clap-validator | https://github.com/free-audio/clap-validator |
 | Meadowlark | Rust | Rust 製 DAW、RT オーディオと UI の参考 | /tmp/meadowlark | https://github.com/MeadowlarkDAW/Meadowlark |
-| **gui_01 (daw-ui)** | Rust | **本プロジェクトで採用した自作 GUI ライブラリ。daw_01 の path 依存先** | F:\dev\gui_01 | (ローカル) |
+| **gui_01 (daw-ui)** | Rust | **本プロジェクトで採用した自作 GUI ライブラリ。daw_01 の path 依存先** | ui/ | (ローカル) |
 
 全プロジェクトを調査する必要はない。機能に最も関連するものを優先する。
 
@@ -33,8 +38,8 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 
 | プロジェクト | パス | 参考ポイント |
 |---|---|---|
-| sing_like_coding | `F:\dev\sing_like_coding` | IPC (shmem.rs, protocol.rs), CLAP ホスト (clap_manager.rs), オーディオエンジン (singer.rs), コマンドパターン (command/), データモデル (model/) |
-| gui_01 サンプル | `F:\dev\gui_01\crates\examples\` | mixer / arrangement / piano_roll / automation / embedded_host / sample_editor — daw_01 の view 実装の参照 |
+| sing_like_coding | 作者ローカルの別リポジトリ | IPC (shmem.rs, protocol.rs), CLAP ホスト (clap_manager.rs), オーディオエンジン (singer.rs), コマンドパターン (command/), データモデル (model/) |
+| gui_01 サンプル | `ui/crates/examples/` | mixer / arrangement / piano_roll / automation / embedded_host / sample_editor — daw_01 の view 実装の参照 |
 
 前作 / gui_01 サンプルに類似実装がある場合、**最も信頼性の高い参照元**として最初に確認する。
 
@@ -47,7 +52,7 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 | cpal | https://docs.rs/cpal |
 | winit | https://docs.rs/winit/0.30 |
 | wgpu | https://docs.rs/wgpu/29 |
-| gui_01 (daw-ui) | `F:\dev\gui_01\crates\{platform,renderer,ui}\src\` を直接 Read |
+| gui_01 (daw-ui) | `ui/crates/{platform,renderer,ui}/src/` を直接 Read |
 | windows crate (Rust) | https://microsoft.github.io/windows-docs-rs/ |
 | Win32 API | https://learn.microsoft.com/en-us/windows/win32/api/ |
 | VOICEVOX Engine API | http://localhost:50021/docs (起動後の Swagger UI) |

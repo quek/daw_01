@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # 範囲ラウドネスのオフライン解析 (r.md #54)
 
 ループ範囲 (や任意の範囲) のラウドネスを、再生を待たずに **全速で測って** EBU R128 の

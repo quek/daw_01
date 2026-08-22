@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4c Phase B-E: piano_roll widget の本体 (`piano_roll()` エントリ — view 構築 → press/drag/
 //! release state machine → heavy 描画 → 旧 `piano_roll_view` の toolbar / legend / wheel /
 //! hover mirror 駆動)。型・helper は `use super::*` で親から継承する。

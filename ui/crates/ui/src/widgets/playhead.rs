@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Playhead 縦線描画の共通 helper (M9 Phase 45e で `piano_roll` から切り出し)。
 //!
 //! `piano_roll` (M9 Phase 45c) と `arrangement` (M9 Phase 45e) の両方が、time で動く

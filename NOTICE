@@ -1,0 +1,188 @@
+daw_01 — a Rust DAW with VOICEVOX singing-voice synthesis
+Copyright (C) 2026 Tahara Yoshinori
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.  The full text is in the file LICENSE (identical to
+LICENSES/GPL-3.0-or-later.txt).
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+Source code: https://github.com/quek/daw_01
+
+--------------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+--------------------------------------------------------------------------------
+
+This file collects the attribution notices for third-party components that are
+vendored into this repository or linked by the built programs.  The complete,
+machine-generated inventory of Rust crate dependencies (398 packages) is in
+THIRD-PARTY-NOTICES.md; per-file licensing is declared by SPDX headers and by
+REUSE.toml, following the REUSE Specification.
+
+
+### FFmpeg — GNU Lesser General Public License v3 (dynamically linked)
+
+  FFmpeg
+  Copyright (c) 2000-2026 the FFmpeg developers
+  https://ffmpeg.org/
+
+daw_01 decodes and encodes video through the FFmpeg libraries (libavcodec,
+libavformat, libavutil, libswscale, libswresample) via the rsmpeg / rusty_ffmpeg
+crates.  The libraries are **dynamically linked** as unmodified shared objects
+and are **not part of this repository** (third_party/ffmpeg is gitignored and
+fetched per machine by `make fetch-ffmpeg`).
+
+The build used is BtbN/FFmpeg-Builds `n7.1 win64-lgpl-shared`, configured
+without `--enable-gpl` and without `--enable-nonfree`, and with
+`--enable-version3`.  All GPL-only external libraries are disabled in that
+configuration (`--disable-libx264 --disable-libx265 --disable-libxavs2
+--disable-libxvid --disable-librubberband --disable-libvidstab --disable-frei0r
+--disable-avisynth`).  `--enable-version3` upgrades FFmpeg from LGPL v2.1+ to
+**LGPL v3**, which is compatible with the GPL v3 this program is licensed under.
+The exact configure line of the build in use is printed by
+`third_party/ffmpeg/bin/ffmpeg.exe -version`.
+
+Because the FFmpeg DLLs are linked dynamically and their file names are not
+changed, a user may replace them with their own build of the same ABI
+(avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5).
+
+The BtbN build statically links a number of external libraries into those DLLs.
+Their licences travel with the binaries, not with this repository; the exact set
+is printed by the same `-version` command.  Notable ones are libmp3lame, libopus,
+libvorbis, libtheora, libvpx, libwebp, libass, libfreetype, libharfbuzz,
+libfribidi, libaom, libdav1d, librav1e, libsvtav1, libzimg, libsoxr, libsnappy
+and zlib (LGPL / MIT / BSD-style), plus gmp and libaribb24 (LGPL v3) and libvmaf
+and libopencore-amr (Apache-2.0) — the last four are why `--enable-version3` is
+required for this configuration.
+
+FFmpeg also contains three files taken from the Independent JPEG Group's libjpeg
+(`libavcodec/jfdctfst.c`, `libavcodec/jfdctint_template.c`, `libavcodec/jrevdct.c`).
+Their licence asks that, when only executables are distributed, the IJG be
+credited in the accompanying documentation:
+
+    This software is based in part on the work of the Independent JPEG Group.
+
+FFmpeg source code: https://ffmpeg.org/download.html
+FFmpeg licensing:   https://ffmpeg.org/legal.html
+LGPL v3 text:       https://www.gnu.org/licenses/lgpl-3.0.html
+
+When a built copy of daw_01 is distributed, the LGPL v3 text must travel with the
+FFmpeg DLLs.  `make fetch-ffmpeg` places it at `third_party/ffmpeg/LICENSE.txt`.
+
+The file `daw_gui/ffmpeg/binding_ffmpeg_7.1.rs` in this repository is
+rust-bindgen output generated from the FFmpeg public headers.  Those headers
+carry "GNU Lesser General Public License ... version 2.1 ... or (at your option)
+any later version", so the generated file is licensed **LGPL-2.1-or-later**, not
+GPL.  See REUSE.toml.
+
+
+### ARA (Audio Random Access) SDK — Apache License 2.0
+
+  ARA Audio Random Access API
+  Copyright (c) 2012-2025, Celemony Software GmbH, All Rights Reserved.
+  Developed in cooperation with PreSonus Software Ltd.
+  https://github.com/Celemony/ARA_SDK
+
+`ara-sys/vendor/ARA_API/` contains an unmodified subset of the ARA SDK
+(ARA 2.3.0.001): ARAInterface.h, ARAVST3.h, ARACLAP.h, ARA_Version.cmake and
+LICENSE.txt.  `ara-sys/src/bindings.rs` is rust-bindgen output generated from
+those headers.  Both are licensed under the Apache License, Version 2.0
+(LICENSES/Apache-2.0.txt).
+
+Reproduced below, per Apache-2.0 section 4(d), is the part of the upstream
+NOTICE.txt that pertains to the material actually included here.  The remaining
+entries of the upstream NOTICE (cpp-base64, pugixml, ICST AudioFile, the VST3
+SDK subset, the CoreAudio Utility Classes and JUCE_ARA) cover ARA_Examples and
+optional installs that are **not** included in this repository, and are omitted
+as permitted by that clause.
+
+    This module bundles the ARA API, ARA Library and ARA Examples
+    by Celemony Software GmbH as ARA Audio Random Access SDK,
+    available under the Apache License 2.0.
+    For details, see ARA_API, ARA_Library and ARA_Examples.
+
+    THIS SOFTWARE IS PROVIDED BY CELEMONY SOFTWARE GMBH AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF NON-INFRINGEMENT, MERCHANTABILITY AND FITNESS FOR A
+    PARTICULAR PURPOSE ARE DISCLAIMED.
+    IN NO EVENT SHALL CELEMONY SOFTWARE GMBH AND/OR CONTRIBUTORS BE LIABLE FOR
+    ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+    ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+    THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+ARA is a trademark of Celemony Software GmbH.
+
+
+### Signalsmith Stretch — MIT License
+
+  Copyright (c) 2022 Geraint Luff / Signalsmith Audio Ltd.
+  https://github.com/Signalsmith-Audio/signalsmith-stretch
+
+Vendored unmodified as `signalsmith-sys/vendor/signalsmith-stretch/`.
+Full text: signalsmith-sys/vendor/signalsmith-stretch/LICENSE.txt
+           (identical terms to LICENSES/MIT.txt).
+
+
+### Signalsmith Linear — MIT License
+
+  Copyright (c) 2025 Signalsmith Audio
+  https://github.com/Signalsmith-Audio/linear
+
+Vendored unmodified as `signalsmith-sys/vendor/signalsmith-linear/`.
+Full text: signalsmith-sys/vendor/signalsmith-linear/LICENSE.txt
+
+
+### VST 3 — MIT License (SDK 3.8.0 and later)
+
+daw_01 hosts VST 3 plug-ins through the `vst3` crate (coupler-rs/vst3-rs,
+MIT OR Apache-2.0), whose bindings are generated from Steinberg's VST 3 SDK
+3.8.0.  Steinberg relicensed the VST 3 SDK to the MIT License on 2025-10-20, so
+neither the dual GPLv3/proprietary licensing of earlier SDK versions nor a
+signed Steinberg licence agreement applies.  No SDK headers are vendored in this
+repository.
+
+  VST is a trademark of Steinberg Media Technologies GmbH, registered in Europe
+  and other countries.
+
+
+### CLAP (CLever Audio Plug-in API) — MIT License
+
+daw_01 hosts CLAP plug-ins through the `clap-sys` crate (MIT OR Apache-2.0).
+The CLAP specification and reference headers are MIT-licensed.
+https://github.com/free-audio/clap
+
+
+### VOICEVOX — a separate program, not bundled
+
+daw_01 talks to a **separately installed** VOICEVOX ENGINE over HTTP
+(http://localhost:50021) and may launch its executable as a child process.  No
+VOICEVOX code, voice model, dictionary or character voice is contained in, or
+distributed with, this repository.  VOICEVOX and its characters have their own
+terms of use, which apply to any audio you generate with them:
+
+  VOICEVOX          https://voicevox.hiroshiba.jp/
+  Terms of use      https://voicevox.hiroshiba.jp/term/
+  VOICEVOX ENGINE   https://github.com/VOICEVOX/voicevox_engine
+
+
+### Rust crate dependencies
+
+398 crates are linked into the three executables.  Their names, versions,
+licenses and upstream URLs are listed in THIRD-PARTY-NOTICES.md, which is
+generated from `cargo metadata` by `scripts/dep_licenses.py`.  Every one of them
+is under a licence compatible with GPL-3.0-or-later; `make license-check`
+enforces that on every run.
+
+
+### Audio plug-ins loaded at run time
+
+daw_01 loads CLAP and VST 3 plug-ins that the user has installed.  Those
+plug-ins are separate programs, are not distributed with daw_01, and keep their
+own licences.

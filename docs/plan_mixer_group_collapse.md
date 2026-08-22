@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_mixer_group_collapse — mixer の group strip を折り畳み可能にする
 
 FIXME #7。「ミキサーのグループトラックをアレンジメントのように子を折り畳めるように

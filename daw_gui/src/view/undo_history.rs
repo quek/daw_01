@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Undo 履歴 window (r.md #29): 「よく DAW にある編集履歴リスト」。 行を click
 //! するとその state へ一発で Undo / Redo する。
 //!

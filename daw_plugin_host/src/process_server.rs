@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Audio engine ↔ plugin host worker pool の plugin host 側。 audio
 //! engine の N workers と 1:1 対応する N 個の worker thread を持つ。
 //!

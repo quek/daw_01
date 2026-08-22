@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Precomputed beat↔seconds map for the `SongTempo` automation curve, so
 //! per-frame / RT callers convert between song beats and wall time in O(log n)
 //! while honoring tempo automation — instead of an O(n) re-integration every

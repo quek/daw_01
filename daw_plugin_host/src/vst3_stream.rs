@@ -1,5 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `IBStream` wrappers used for VST3 state save/load.
 //!
 //! Save path uses `Vst3WriteStream` (a growing `Vec<u8>`); the finished

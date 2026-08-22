@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # gui_01 ↔ daw_01 conversation archive (001)
 
 `docs/gui_01_conversation.md` の `[Resolved]` エントリを保管するアーカイブ。番号順。

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Builtin plugin (`PluginFormat::Builtin`) 用の per-note metadata。
 //!
 //! 外部 CLAP / VST3 plugin の規格には「note ごとの追加情報」 (= 歌詞、
@@ -15,7 +18,8 @@
 //! `lyric` は VOICEVOX の `singing_query` API が要求する「1 note = 1
 //! 音節」 の歌詞。 通常 1 文字 (例: `あ`)、 `っ` など促音は前 note の
 //! lyric に内包する。 詳しくは
-//! `%APPDATA%\\REAPER\\Scripts\\yoshino\\voicevox\\` 参照。
+//! `%APPDATA%\\REAPER\\Scripts\\<user>\\voicevox\\` (作者ローカルの REAPER
+//! 参照実装) を参照。
 
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};

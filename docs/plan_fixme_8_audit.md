@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # r.md #8 — 後フェーズ送り / 手ぬき実装 監査 (最終形までの実装計画)
 
 「最終形まで実装する。フェーズ分けをしない」(CLAUDE.md) に違反して **後回し・手ぬきになっている箇所** を、

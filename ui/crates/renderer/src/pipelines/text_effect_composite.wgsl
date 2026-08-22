@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // M14 Phase 78 (daw_01 #049): text effect composite shader。
 // shadow (blurred separable gaussian 済) + outline (9-sample max α dilate) + fill (glyph α)
 // を 1 fragment pass で合成。

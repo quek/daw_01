@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // プロジェクトを続けて 2 つ開き、`AudioSourceId` の衝突で前 project の音源が
 // 再利用されないことを daw_audio のログで確認するスクリプト。
 //

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! winit::ApplicationHandler の実装。`AppEvent` を user event として走らせる。
 //!
 //! 役割:

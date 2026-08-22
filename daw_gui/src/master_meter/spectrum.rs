@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! リアルタイム スペクトラムアナライザ (r.md #50)。
 //!
 //! - 窓 (Hann / Blackman-Harris) → 実数 FFT → `mag = 2|y| / S1` 正規化。

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! オートメーションカーブ widget (M5.5)。
 //!
 //! cubic Bezier flatten + Catmull-Rom 自動 tangent で、ユーザは点列 `&[(f32, f32)]` を

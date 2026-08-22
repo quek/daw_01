@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4b Phase D: arrangement widget の幾何 / hit-test helper 群 (レイアウト・座標変換・
 //! automation lane hit-test)。 型・session は `use super::*` で親から継承する。
 

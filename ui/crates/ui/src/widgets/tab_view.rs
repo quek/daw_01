@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `tab_view` widget — タブで切り替え可能な複数 view (M7 Phase 26)。
 //!
 //! M9 P0-2: `tab_view_with_state(id, rect, &mut usize, ...)` を追加し、外部から
@@ -46,8 +49,12 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
         let i = self.next_index;
         self.next_index += 1;
 
-        // タブ label の rect (幅は文字数 × 8px + padding)
-        let w = (label.chars().count() as f32) * 8.0 + TAB_PAD_X * 2.0;
+        // タブ label の rect。幅は **実フォントの advance を測って** 決める。
+        // 旧実装は「文字数 × 8px」という固定係数で、日本語のような全角ラベル
+        // (14px なら 1 文字 ≈ 14px) を大幅に過小評価し、隣のタブの上に文字がはみ出して
+        // 重なっていた (daw_01 r.md #60 の About タブで発覚)。ASCII ラベルでは
+        // 従来値とほぼ同じ幅になるので既存 caller の見た目は実質不変。
+        let w = self.ui.measure_text(label, TAB_FONT) + TAB_PAD_X * 2.0;
         let tab_rect = Rect { x: self.bar_rect.x + self.next_x, y: self.bar_rect.y, w, h: TAB_BAR_H };
         self.next_x += w;
 

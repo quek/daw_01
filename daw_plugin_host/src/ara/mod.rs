@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! ARA (Audio Random Access) host layer for `daw_plugin_host`.
 //!
 //! This is the in-process side of ARA: the ARA model graph lives here, next to

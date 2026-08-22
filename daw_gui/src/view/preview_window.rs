@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Video preview window (`docs/plan_video.md` P4).
 //!
 //! Second top-level winit window dedicated to displaying the project's

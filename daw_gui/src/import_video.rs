@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Video file import via in-process libav (rsmpeg) — the same decode stack
 //! playback and export use (`docs/plan_video_decode_unify.md`). Media
 //! Foundation was removed; libav handles metadata probe, one-frame thumbnail,

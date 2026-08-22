@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Rust 2024 wants every UB operation inside an unsafe fn to be in an
 // explicit `unsafe { }` block. These files cross FFI boundaries on every
 // line; wrapping the entire fn body is the pragmatic choice.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! daw_gui 固有の library widget。
 //!
 //! daw-ui-core は Model 非依存の汎用 immediate-mode プリミティブ (button / fader /

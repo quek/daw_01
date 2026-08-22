@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_channel_fader_meter — fader と meter を単一 widget で「同一 dB→y 写像」に統一する
 
 ## Context

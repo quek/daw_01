@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_modulation_routing_redesign.md — lane 非依存・統一モジュレーション（Bitwig 流 + video 拡張）
 
 > [plan_modulation.md](plan_modulation.md) の **routing モデル**を作り直す差分プラン。

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 立ち絵 group transform の合成補助（`docs/plan_tachie_group_transform.md`）。
 //!
 //! アプローチ X: 親グループにぶら下がる立ち絵パーツ（image 子）を z 順に

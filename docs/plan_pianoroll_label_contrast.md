@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: piano roll 鍵盤オクターブラベルの可読性 (FIXME #20)
 
 ## 症状 / 最終形態

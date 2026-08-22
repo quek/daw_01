@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! プロジェクトロード / 非同期保存の進捗を画面上端中央に出す **非ブロック**
 //! overlay (`docs/plan_progress_streaming.md`)。modal ではないので
 //! 構造の操作 (スクロール / 編集) はそのまま続けられる。

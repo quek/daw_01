@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `oscilloscope` widget — 列ごとの min/max で波形を描く (daw_01 r.md #50)。
 //!
 //! 呼び出し側が「列ごとの `[Lmin, Lmax, Rmin, Rmax]`」を渡す。トリガ検出も

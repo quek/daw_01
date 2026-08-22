@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #48: テーマの **visual regression**。
 //!
 //! 色は build / test / clippy を全部すり抜ける (CLAUDE.md「Visual regression smoke test」)。

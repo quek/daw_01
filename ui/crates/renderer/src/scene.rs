@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `Scene` — 1 フレーム分の描画コマンド (DisplayList、call-order interleave)。
 //!
 //! 上位層は `Scene::push_rect` / `push_text` / `push_lines` でコマンドを積み、

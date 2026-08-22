@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `color_picker` ウィジェット — overlay popup でパレットスウォッチ + HSV (SV 矩形 + Hue
 //! バー) を選べる汎用カラーピッカー (daw_01 #058)。
 //!

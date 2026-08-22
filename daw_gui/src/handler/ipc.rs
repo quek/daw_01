@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::ipc — 子プロセス (daw_audio / daw_plugin_host) からの protocol event を
 //! 直接 dispatch する。
 //!

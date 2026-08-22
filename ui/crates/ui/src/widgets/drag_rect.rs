@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M8 Phase 33: rect drag による multi-select 共通基盤。
 //!
 //! `Ui::take_drag_rect_in_rect(wid, bounds)` で、bounds 内の primary 押下から release までを

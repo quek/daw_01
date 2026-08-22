@@ -1,0 +1,85 @@
+# REUSE Specification 3.3 — https://reuse.software/spec-3.3/
+#
+# 自作ファイルは各ファイル先頭の SPDX ヘッダが SSoT (scripts/add_spdx_headers.py が
+# 投入し、scripts/reuse_lint.py が検査する)。ここに書くのは **ヘッダを書けない / 書いては
+# いけないファイル** だけ:
+#
+#   - 第三者の著作物 (vendored ヘッダ、そこから生成した bindgen 出力)
+#     → GPL ヘッダを付けると「他人のコードを GPL と誤表示」する事故になる。
+#   - コメント構文を持たないファイル (JSON / バイナリ)。
+#   - ツールが再生成するファイル (Cargo.lock — cargo が書き戻すのでヘッダが消える)。
+#
+# ルートの LICENSE / COPYING と LICENSES/ 配下は REUSE ツールの対象外 (spec の
+# Covered File 例外)。third_party/ 等 .gitignore 済みのものも対象外。
+version = 1
+SPDX-PackageName = "daw_01"
+SPDX-PackageSupplier = "Tahara Yoshinori"
+SPDX-PackageDownloadLocation = "https://github.com/quek/daw_01"
+
+# --- ARA (Celemony) --------------------------------------------------------
+# vendor/ARA_API/** は upstream 無改変。src/bindings.rs はそのヘッダからの bindgen
+# 出力 = Apache-2.0 の派生物。GPLv3 §7 の permitted additional term として、
+# Apache-2.0 の notice 保持義務がこのサブツリーに生き続ける (NOTICE 参照)。
+[[annotations]]
+path = ["ara-sys/vendor/**", "ara-sys/src/bindings.rs"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (c) 2012-2025, Celemony Software GmbH, All Rights Reserved. Developed in cooperation with PreSonus Software Ltd."
+SPDX-License-Identifier = "Apache-2.0"
+SPDX-FileComment = "ARA SDK 2.3.0.001 の ARA_API サブセット (無改変) と、そこから生成した bindgen 出力。帰属は NOTICE、全文は ara-sys/vendor/ARA_API/LICENSE.txt と LICENSES/Apache-2.0.txt。"
+
+# --- Signalsmith ------------------------------------------------------------
+[[annotations]]
+path = "signalsmith-sys/vendor/signalsmith-stretch/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (c) 2022 Geraint Luff / Signalsmith Audio Ltd."
+SPDX-License-Identifier = "MIT"
+SPDX-FileComment = "upstream 無改変 (signalsmith-sys/VENDOR.md に commit を記録)。"
+
+[[annotations]]
+path = "signalsmith-sys/vendor/signalsmith-linear/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (c) 2025 Signalsmith Audio"
+SPDX-License-Identifier = "MIT"
+SPDX-FileComment = "upstream 無改変 (signalsmith-sys/VENDOR.md に commit を記録)。"
+
+# --- FFmpeg -----------------------------------------------------------------
+# FFmpeg の公開ヘッダから rust-bindgen が生成した 26,371 行。Doxygen コメントを
+# 逐語で含むので LGPL の carve-out (LGPL-2.1 §5 / LGPL-3.0 §3 の「数値・レイアウト・
+# アクセサ・10 行以下の inline」) を超える = ヘッダの派生物として扱う。ヘッダ本文は
+# 「LGPL 2.1 or (at your option) any later version」。リンクする BtbN のビルドは
+# --enable-version3 なので、**バイナリ側は LGPL v3** (NOTICE 参照)。
+[[annotations]]
+path = "daw_gui/ffmpeg/binding_ffmpeg_7.1.rs"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2000-2026 the FFmpeg developers"
+SPDX-License-Identifier = "LGPL-2.1-or-later"
+SPDX-FileComment = "rust-bindgen 0.71.1 output generated from the FFmpeg 7.1 public headers. See NOTICE."
+
+# --- 自作だがヘッダを書けない / 書いても消えるファイル ----------------------
+[[annotations]]
+path = "Cargo.lock"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+SPDX-FileComment = "cargo が再生成するのでヘッダを保持できない。"
+
+[[annotations]]
+path = ".claude/settings.json"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+SPDX-FileComment = "JSON はコメント構文を持たない。"
+
+[[annotations]]
+path = "NOTICE"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+SPDX-FileComment = "第三者コンポーネントの帰属をまとめた法的文書。中に引用している各社の notice はそれぞれの著作者のもの。拡張子を持たないプレーンテキストなのでコメント構文が無い。"
+
+[[annotations]]
+path = "daw_gui/tests/fixtures/smoke_test.mp4"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+SPDX-FileComment = "ffmpeg の testsrc パターンから自分で生成した 13KB のテスト用動画 (daw_gui/src/smoke_test.rs)。バイナリなのでヘッダを書けない。"

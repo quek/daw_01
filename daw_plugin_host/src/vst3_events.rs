@@ -1,5 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `IEventList` wrappers for feeding notes into the plugin and collecting
 //! whatever it emits.
 //!

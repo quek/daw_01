@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Line segment パイプライン。
 // 1 segment = 1 instance、6 頂点を頂点シェーダで quad に展開する。
 // 入力 instance: a (start), b (end), color, line_width。

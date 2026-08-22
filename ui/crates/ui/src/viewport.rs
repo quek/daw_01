@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `ViewportState1D` — 1 次元 (時間軸 / pitch / track index 等) の表示範囲 + pan/zoom 状態。
 //!
 //! M5 までは sample_editor / waveform_validation / sample_edit_ops / piano_roll / arrangement の

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! docs/plan_modulation.md §7: modulation envelope sidecar.
 //!
 //! Video export can't read the live `AudioBridge::mod_scalars` plane (the

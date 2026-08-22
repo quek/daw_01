@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: 共有クリップマークを Video-kind トラックの clip にも表示 (gui_01 arrangement widget)
 
 ## 背景 / 症状

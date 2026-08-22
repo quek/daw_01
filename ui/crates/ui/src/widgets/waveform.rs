@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 波形表示ウィジェット (`Ui::waveform` / `Ui::waveform_segments`)。
 //!
 //! 設計の要点 (詳細は `docs/plan.html`「波形表示 UI 詳細設計」):

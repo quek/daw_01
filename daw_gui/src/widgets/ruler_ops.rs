@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Ruler 上の playhead seek / loop drag セッションと helper 群。
 //!
 //! arrangement と piano_roll の双方が **完全に同じ ruler 操作 UX** (#024 / #041) を

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Clip / ClipContent とその content variant (midi/audio/video/image/text) + source/event/Note
 //!
 //! arch-refactor #9 (god-file budget) で model.rs から分割。pure code movement で

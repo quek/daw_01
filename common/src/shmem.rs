@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Named shared-memory region (cross-process) の RAII wrapper。
 //!
 //! 旧実装は `shared_memory` crate (0.12) だったが、更新停止気味の `win-sys` 0.3 経由で

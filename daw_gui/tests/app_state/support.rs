@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! app_state 配下の全サブモジュールが共有する fixture。
 //! 旧 5 ファイルがほぼ verbatim 重複していたものの一本化。
 

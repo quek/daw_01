@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Bottom panel: Mixer / Piano Roll を切り替えるタブ + 中身。
 //!
 //! gui_01 の `Ui::tab_view_with_state` を使う。selected の永続は `app.ui_prefs.bottom_panel`

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S3b-1: AppData の state group 分割 (docs/plan_arch_refactor.md §7.5)。
 //!
 //! AppData は 9 つの group struct の合成になった。 フィールドの帰属は

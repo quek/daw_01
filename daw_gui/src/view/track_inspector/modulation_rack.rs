@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! トラック inspector のモジュレーションラック描画。
 //!
 //! LFO / Random / MSEG / Steps / EnvelopeFollower の各ソースを折りたたみ行 +

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Recent-files list persisted to `%LOCALAPPDATA%\daw_01\recent.json`
 //! (or the platform equivalent via `dirs`). Plain JSON to keep the file
 //! readable / hand-editable; bincode would be overkill for ~5 paths.

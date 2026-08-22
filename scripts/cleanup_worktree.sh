@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # PowerShell-free removal of a merged daw_01 git worktree.
 #
 # Why bash (not PowerShell): `make rm-worktree` used to shell out to a .ps1, but

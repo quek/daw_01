@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Image file import (`docs/plan_image_overlay.md` P2).
 //!
 //! Pipeline (mirrors `import_audio.rs` / `import_video.rs`):

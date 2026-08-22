@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Background-thread → UI / OS 抽象。
 //!
 //! `AppData` は production も test も同じ trait object を保持する。

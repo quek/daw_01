@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! テキスト描画が抱える GPU リソースが、長時間セッションで単調増加しないことの回帰テスト
 //! (daw_01 r.md #59)。
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M5 Phase 17: heavy() + cached(viewport_key) を 500 widgets スケールで計測。
 //!
 //! - `arrangement_cached_heavy_500w`: viewport_key 固定 → 外側 cache hit、500 widgets

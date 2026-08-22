@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # 設計書
 
 VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。Clip ベースのタイムライン、CLAP/VST3

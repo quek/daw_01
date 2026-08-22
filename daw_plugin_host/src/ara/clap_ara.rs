@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Hand-written CLAP companion-API glue for ARA (`ARA_API/ARACLAP.h`).
 //!
 //! `ARACLAP.h` `#include`s both `clap/clap.h` and `ARAInterface.h`, so it is not

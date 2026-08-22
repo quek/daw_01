@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Instanced 角丸矩形パイプライン。
 //!
 //! 入力: `RectInstance` (位置・サイズ・色・ボーダー・半径) を SSBO/VertexBuffer で渡す。

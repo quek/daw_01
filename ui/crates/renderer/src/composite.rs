@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M14 Phase 93 (daw_01 #063): `Scene` を GPU 常駐の sampleable texture に合成する共通経路。
 //!
 //! 立ち絵 group transform 等で「子 quad 群を 1 枚のオフスクリーンテクスチャに焼いてから

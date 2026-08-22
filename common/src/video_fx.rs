@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 内蔵 GPU 映像効果フレームワーク (docs/plan_video_fx.md §1)。
 //!
 //! 各効果 = **WGSL fragment パス列 + 宣言的パラメータ表** (ISF/OBS 流)。本モジュールは

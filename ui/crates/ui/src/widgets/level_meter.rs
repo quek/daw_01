@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `level_meter_stereo` widget — Ableton Live 風のステレオ metering (M14 Phase 103 / daw_01 #074)。
 //!
 //! 利用者が毎フレーム L/R の `sample` (現在の音量、`-1.0..=1.0`) を渡すと、library 側で

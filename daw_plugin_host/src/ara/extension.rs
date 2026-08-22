@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Format-agnostic wrapper over an `ARAPlugInExtensionInstance` — the per-
 //! instance binding returned when a companion (CLAP/VST3) plug-in instance is
 //! attached to an ARA document controller.

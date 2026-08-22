@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MMCSS (Multimedia Class Scheduler Service) thin wrapper.
 //!
 //! Joining the "Pro Audio" task class boosts the calling thread's

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_unified_plugin_picker — 全カテゴリ混合の単一プラグインピッカー + 種別自動振り分け
 
 FIXME #26。grill-me（2026-06-10）で「1 ボタン・混合リスト・種別による自動スロット振り分け・

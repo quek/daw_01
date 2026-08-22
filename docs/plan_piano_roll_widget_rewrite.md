@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Plan: piano_roll_view.rs を gui_01 Ui::piano_roll widget で書き換え (本体実装)
 
 ## Context

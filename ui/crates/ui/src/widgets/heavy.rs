@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `HeavyCtx` — 巨大ビュー (ピアノロール / アレンジメント / 大量クリップ波形) の
 //! ViewportKey ベース粗粒度キャッシュ脱出口 (M5 Phase 13)。
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! S4b Phase D: arrangement widget の release-commit フェーズ (各 drag session の release で
 //! 1 度だけ `Edit<AppData>` を発行 + shortcut / wheel / double-click / secondary-click)。
 //! `arrangement()` から抽出。 immediate-mode の geometry / session は明示引数で受ける。

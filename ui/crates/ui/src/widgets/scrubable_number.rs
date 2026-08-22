@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `scrubable_number` ウィジェット — drag-to-edit な数値入力。
 //!
 //! Phase 64a (daw_01 #034): BPM / TimeSig num 等の transport 数値表示で「数値そのものを

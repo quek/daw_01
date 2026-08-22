@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! examples/automation — M5.5 動作確認サンプル。
 //!
 //! `Ui::automation_curve` で 1 本のオートメーションカーブ (cubic Bezier flatten +

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # Clip 共有コピー / 独立コピー 仕様
 
 REAPER pooled MIDI 寄りの「共有コピー (linked clip)」 を導入し、 既存の「独立コピー」 と並行して

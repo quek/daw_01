@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! app.rs から分割した補助 type / free fn / const 群 (view-model / inspector
 //! summary / IPC bookkeeping / pure helper)。 挙動は元と同一、 可視性のみ
 //! cross-module 用に private -> pub(crate) へ引き上げてある。

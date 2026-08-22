@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! F1 で開く「ショートカット / マウス操作 一覧」オーバーレイ。
 //!
 //! キーボードショートカットは `shortcuts::SHORTCUTS` (SSoT) をカテゴリ別に表示する。

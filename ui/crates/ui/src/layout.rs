@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! taffy ラッパ — chrome (toolbar / panel / dialog) のレイアウト計算に使う。
 //!
 //! 提供する API:

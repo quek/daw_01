@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_select_all — Ctrl+A コンテキスト全選択 + 選択 SSoT の安定 ID 化
 
 「アレンジメントで Ctrl+A で全クリップ選択」。grill-me（2026-06-09）で文脈対応・解除・

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! resource monitor 詳細パネル (r.md #3): status bar クリックで開く非モーダルな
 //! floating overlay。 全体指標 (DSP / system CPU / FPS / メモリ / xrun / buffer) +
 //! トラック別・プラグイン別の CPU 内訳。

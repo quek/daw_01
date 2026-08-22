@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #31: ファイルを「トラック一覧の下の空きスペース」にドロップしたときは、
 //! 一番上ではなく **一番下** に新規トラックを作ってクリップを貼る
 //! (`ImportTrackTarget::NewTrackBottom`)。

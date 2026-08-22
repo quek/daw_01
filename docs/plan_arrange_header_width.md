@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan: アレンジメント track header 幅の drag リサイズ (FIXME #16)
 
 ## 目的 / 最終形態

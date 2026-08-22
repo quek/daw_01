@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::devices — plugin load/gui/chain/sidechain/parallel-out + device 削除 + state round-trip
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

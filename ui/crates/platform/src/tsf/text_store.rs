@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `DocumentStore` — `#[implement(ITextStoreACP)]` の薄い COM shim。
 //!
 //! msctf (OS IME framework) が呼ぶ `ITextStoreACP` の各 method を、純粋な [`DocState`] への

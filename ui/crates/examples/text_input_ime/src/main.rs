@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! examples/text_input_ime — M15 TSF (`ITextStoreACP`) 実機検証ハーネス。
 //!
 //! 1 つの text_input を auto-focus で表示するだけの最小サンプル。**winit IMM を一切触らない**

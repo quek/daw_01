@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! r.md #10: Home / End プレイヘッド移動 — AppData 側 headless 回帰。
 //!
 //! 検証する挙動 (`handler::transport::goto_timeline_home` / `goto_timeline_end`):

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # plan_arrange_scroll_amount — アレンジ縦ホイールスクロール量を縮小する
 
 FIXME #11。「アレンジメントのマウスホイールによる縦スクロール量を小さくしてください」。

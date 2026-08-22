@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # リソースモニター (CPU / FPS / DSP load 表示) — 最終形プラン
 
 r.md #3。DAW 標準のパフォーマンスメーターを daw_01 に実装する。

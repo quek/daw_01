@@ -6,6 +6,11 @@ description: |
 allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(cargo clippy *), Bash(git diff *), Agent
 ---
 
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # リアルタイム安全性・パフォーマンス・セキュリティレビュー
 
 変更されたファイルを対象に、以下の観点でレビューし、問題があれば修正する。

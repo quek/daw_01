@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `spectrum_analyzer` widget — 対数周波数軸のスペクトラム表示 (daw_01 r.md #50)。
 //!
 //! **解析は一切しない**。呼び出し側が「対数等間隔のバンドごとの dB 値」を渡し、

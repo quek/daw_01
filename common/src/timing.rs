@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Sample / beat conversion helpers shared by `daw_plugin_host`
 //! (audio thread) and `daw_gui` (playhead rendering).
 

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
 # MIDI (SMF) ファイル取り込み — 設計正本
 
 r.md #66「MIDI ファイル D&D ができません」。`daw_gui/src/midi_export.rs` (SMF Format 1 書き出し) の

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! handler::selection_view — clip/note 選択 + view state + arrange follow/zoom + piano-roll id 変換
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

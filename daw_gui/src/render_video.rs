@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! MP4 render via Windows Media Foundation (`docs/plan_video.md` P8,
 //! `docs/plan_text_overlay.md` P2).
 //!
