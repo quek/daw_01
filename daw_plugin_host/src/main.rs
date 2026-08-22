@@ -331,9 +331,17 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
         size.0, size.1
     ));
 
-    let mut editor =
-        editor_window::EditorWindow::create(size.0, size.1, "editor-selftest", resizable, None)
-            .map_err(|e| anyhow::anyhow!("create editor window: {e}"))?;
+    // selftest は daw_gui 抜きで走るので owner になれる本体窓が無い。
+    // owner 無しなら `WS_EX_TOOLWINDOW` も付かない (`OwnerBinding` の doc 参照)。
+    let mut editor = editor_window::EditorWindow::create(
+        size.0,
+        size.1,
+        "editor-selftest",
+        resizable,
+        None,
+        editor_window::OwnerBinding::Standalone,
+    )
+    .map_err(|e| anyhow::anyhow!("create editor window: {e}"))?;
     step(&format!("container hwnd={:#x}", editor.hwnd_u64()));
     let dpi_scale = editor_window::window_dpi_scale(editor.hwnd_u64());
     let _ = plugin.gui_set_scale(dpi_scale);
@@ -1047,8 +1055,16 @@ impl PluginHost {
                 let entries = self.collect_all_states();
                 self.emit(PluginEvent::AllPluginStates { entries });
             }
-            PluginCommand::OpenSlotGuiEmbedded { device_id, title, geometry } => {
-                match self.open_gui(device_id, &title, geometry) {
+            PluginCommand::OpenSlotGuiEmbedded {
+                device_id,
+                title,
+                geometry,
+                owner_main_window,
+            } => {
+                // r.md #65: owner が取れたかで、owner と `WS_EX_TOOLWINDOW` の
+                // **両方**が決まる (片方だけ成立する経路を作らない)。
+                let owner = editor_window::OwnerBinding::resolve(owner_main_window);
+                match self.open_gui(device_id, &title, geometry, owner) {
                     Ok(Some(geometry)) => {
                         self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
                     }
@@ -1664,6 +1680,7 @@ impl PluginHost {
         device_id: u64,
         title: &str,
         saved: Option<common::model::EditorWindowGeometry>,
+        owner: editor_window::OwnerBinding,
     ) -> Result<Option<common::model::EditorWindowGeometry>> {
         let Some(rec) = self.instances.get_mut(&device_id) else {
             return Ok(None);
@@ -1715,13 +1732,17 @@ impl PluginHost {
             "plugin gui initial size"
         );
 
-        // Create the host-owned, ownerless top-level container (**hidden**).
+        // Create the host-owned top-level container (**hidden**).
+        // r.md #65: owner = daw_gui の本体窓。これで
+        // "An owned window is always above its owner in the z-order" が効き、
+        // エディタ窓が本体窓の後ろに回らなくなる (REAPER の FX 窓と同じ構成)。
         let mut editor = match editor_window::EditorWindow::create(
             size.0,
             size.1,
             title,
             resizable,
             saved.map(|g| (g.x, g.y)),
+            owner,
         ) {
             Ok(w) => w,
             Err(e) => {
@@ -1972,16 +1993,37 @@ impl PluginHost {
         }
     }
 
-    /// user が editor 窓の ✕ を押した分の close 処理 (WNDPROC が flag を
-    /// 立て、この loop が poll する)。
+    /// editor 窓が閉じられた分の close 処理。入口は 2 つある:
+    ///
+    /// 1. user が ✕ を押した (WNDPROC が flag を立て、この loop が poll する)。
+    /// 2. **窓が我々の与り知らぬところで消えた** (r.md #65)。owner を daw_gui の
+    ///    本体窓にしたので、daw_gui が異常終了すると Windows が
+    ///    *"The system automatically destroys an owned window when its owner is destroyed."*
+    ///    に従ってコンテナごと破棄する。このとき ✕ は押されないので 1. では拾えない。
+    ///
+    /// どちらも `close_slot_gui` の同じ close flow
+    /// (`gui_destroy` → editor drop → `SlotGuiClosed`) に合流させる。
+    /// **plugin に `removed()` を通す経路を飛ばさない**のが要点で、飛ばすと
+    /// `IPlugView` が attach 済みのまま残る。
     fn poll_editor_close_requests(&mut self) {
         let to_close: Vec<u64> = self
             .instances
             .iter()
             .filter(|(_, rec)| {
-                rec.editor
-                    .as_ref()
-                    .is_some_and(|w| w.take_close_request())
+                rec.editor.as_ref().is_some_and(|w| {
+                    // `take_close_request` は副作用 (flag を落とす) があるので先に評価する。
+                    let requested = w.take_close_request();
+                    if !requested && !w.is_window_alive() {
+                        tracing::warn!(
+                            target: "editor_resize",
+                            hwnd = format!("{:#x}", w.hwnd_u64()),
+                            "editor container vanished without a close request \
+                             (owner destroyed?) — running the normal close flow"
+                        );
+                        return true;
+                    }
+                    requested
+                })
             })
             .map(|(&id, _)| id)
             .collect();

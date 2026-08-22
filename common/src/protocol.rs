@@ -453,6 +453,35 @@ pub enum AudioEvent {
 // gui → daw_plugin_host
 // =====================================================================
 
+/// ホストアプリの窓を指す **platform 固有ハンドル**を、platform 非依存に運ぶ値。
+///
+/// Windows は `HWND`、macOS は `NSWindow*`、X11 は `Window` (XID) が入る想定。
+/// **wire はこれを「不透明な機械語ワード 1 つ」としてしか扱わない** — どう解釈するかは
+/// 受け手の platform コードだけが知っている。だから型名にも doc にも platform 固有の
+/// 型名を持ち込まない (`HWND` 専用の型にすると macOS 対応で作り直しになる)。
+///
+/// r.md #65: エディタコンテナ窓の **owner** を「窓の作成時に」決めるために渡す。
+/// 「HWND は IPC を渡らない」という旧不変条件は 2026-08-22 に撤回された
+/// (撤回理由は CLAUDE.md「プラグインエディタ窓と Win32」節。要約すると、旧不変条件は
+///  「daw_gui を owner にしてはいけない」から導出されていたが、その禁止自体が
+///  JUCE のソース読み違いに基づく誤りだった)。
+///
+/// **0 は「窓が無い」を表す**ので、生値からは [`Self::from_raw`] で `Option` に落とす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct PlatformWindowHandle(u64);
+
+impl PlatformWindowHandle {
+    /// platform の生ハンドルから。**0 (= 窓が無い) は `None`** になる。
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        (raw != 0).then_some(Self(raw))
+    }
+
+    /// platform コードが自分の型へ戻すための生値。
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum PluginCommand {
     /// Handshake reply to `PluginEvent::Hello`.
@@ -525,10 +554,18 @@ pub enum PluginCommand {
     /// リサイズ可と答えたときだけ**復元する (固定サイズ GUI に前回のサイズを
     /// 押し付けない)。CLAP の GUI 手順 9 「resizable かつ前回セッションのサイズが
     /// 分かっているときだけ `set_size`」と同じ規約。
+    ///
+    /// r.md #65: `owner_main_window` は **daw_gui の本体窓** (preview 窓ではない)。
+    /// plugin_host はこれをエディタコンテナ窓の **owner** にする (REAPER の FX 窓と
+    /// 同じ構成)。これで
+    /// *"An owned window is always above its owner in the z-order"* が効き、
+    /// エディタ窓が本体窓の後ろに回らなくなる。`None` = 本体窓がまだ無い / 既に閉じた
+    /// (その場合 plugin_host は owner 無しで作り、`WS_EX_TOOLWINDOW` も付けない)。
     OpenSlotGuiEmbedded {
         device_id: u64,
         title: String,
         geometry: Option<crate::model::EditorWindowGeometry>,
+        owner_main_window: Option<PlatformWindowHandle>,
     },
     CloseSlotGui { device_id: u64 },
     /// r.md #55: **開いているエディタ窓を全部閉じる** (`Ctrl+Shift+W`)。
@@ -917,17 +954,33 @@ mod tests {
             device_id: 42,
             title: "Plugin — Renoise Redux".to_string(),
             geometry: Some(geometry),
+            // r.md #65: owner は上位ビットが立った値も通る (64bit の HWND)。
+            owner_main_window: PlatformWindowHandle::from_raw(0x0000_7ff8_1234_5678),
         };
         assert_eq!(roundtrip(&open), open);
-        // 初回 open (保存値なし)。
+        // 初回 open (保存値なし) かつ本体窓もまだ無い。
         let fresh = PluginCommand::OpenSlotGuiEmbedded {
             device_id: 42,
             title: "Plugin — Test".to_string(),
             geometry: None,
+            owner_main_window: None,
         };
         assert_eq!(roundtrip(&fresh), fresh);
         let report = PluginEvent::SlotGuiGeometry { device_id: 42, geometry };
         assert_eq!(roundtrip(&report), report);
+    }
+
+    /// r.md #65: **0 は「窓が無い」**。生値からの変換で `None` に落ちること。
+    /// これを取り違えると owner に `HWND(0)` を渡してしまい、owner 無しなのに
+    /// `WS_EX_TOOLWINDOW` だけ付く唯一の悪化パターンに落ちる。
+    #[test]
+    fn platform_window_handle_treats_zero_as_absent() {
+        assert_eq!(PlatformWindowHandle::from_raw(0), None);
+        assert_eq!(PlatformWindowHandle::from_raw(1).map(|h| h.raw()), Some(1));
+        assert_eq!(
+            PlatformWindowHandle::from_raw(u64::MAX).map(|h| h.raw()),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

@@ -165,16 +165,33 @@ r.md #65 の申告は 2 つ:
 1. `Vst3PlugFrame::resizeView` が窓も直さず `onSize` も呼ばずに `kResultOk` を返していた
    (実処理は channel 経由で plugin-main の次周回)。これは `iplugview.h` の
    *"Afterwards, **in the same callstack**, the host has to call IPlugView::onSize ()"* 違反。
-2. Redux は自分の内部 "Editor" ビューを開くときコンテナより大きい領域 (880x162 → 1105x687)
-   を要求する。ホストが同期で応えないので、**自分の view 窓をコンテナから切り離して
-   `WS_CHILD` → `WS_POPUP` の owned top-level に作り替える**
-   (実測: style `0x54000000` → `0x90000000`、`GetParent` はコンテナ = owner のまま、
-   `EnumChildWindows` からは消える)。
+2. Redux は自分の内部 "Editor" ビューを開くとき、**自分の view 窓の style を
+   `WS_CHILD` → `WS_POPUP` に書き換える** (実測: `0x54000000` → `0x80000000`、以後
+   `0x90000000` = +`WS_VISIBLE`)。**ただし `SetParent` は呼ばない。**
+   結果、`GetParent` / `GA_PARENT` / `GA_ROOT` / `GA_ROOTOWNER` / `GW_OWNER` がすべて
+   コンテナを指したまま = **style は popup、階層は依然として子**という中間状態になる
+   (`EnumChildWindows` と `IsChild` からは消えるので「逃げた」ように見えるが、逃げていない)。
+
+   > **注意 (2026-08-22 に訂正)**: 以前この項は「ホストが `resizeView` に同期で応えないので
+   > Redux が痺れを切らして popup 化した」と書いていた。**実ログで反証済み**。
+   > style 反転 `07:57:09.904725` → `resizeView` `07:57:10.015380` で、**反転が 111ms 先行**する。
+   > attach から反転までの間に `resizeView` は 1 本も来ていない。反転は Editor ボタンを
+   > 押した時点の Redux の無条件動作であって、ホストの応答に対する fallback ではない。
+   > 1. の修正は仕様準拠として正しいが、本症状の根治ではない。
+
 3. その結果コンテナは**空の枠**になり、タイトルバーをクリックすると Windows は
    「owner をアクティブ化 → 直後に owned popup をアクティブ化」を行う。実測ログでは
    `WM_NCACTIVATE(TRUE)` の **0.25ms 後**に `WM_NCACTIVATE(FALSE)` が来る = 症状 A の
    「一瞬濃くなってすぐ薄く戻る」そのもの。Redux の Editor を開いていない間は
    `WM_NCACTIVATE(TRUE)` の後に何も来ない (= 症状が出ない) ので「毎回ではない」も一致する。
+3b. **残っている症状の本体**は 3 とは別。中間状態の view は `SetForegroundWindow` /
+   `GetActiveWindow` の判定を通ってしまう (実測: `fg` も `active` も view) が、Z 順は
+   *"A child window is grouped with its parent in z-order."* に従って親リンク = コンテナの
+   グループに束縛される。よって **view が前面になってもコンテナごとデスクトップ上に
+   浮上しない** (実測: `container_above=Chrome_WidgetWin_1 "YouTube - Vivaldi"`)。
+   view はコンテナのクライアント領域にぴったり収まったまま (view `(128,151 1274x639)` /
+   container `(120,120 1290x678)`) なので、**見た目の位置関係は壊れておらず、
+   失われているのは「コンテナごと前に出ること」だけ**。
 
 さらに独立した欠陥として:
 
@@ -194,10 +211,63 @@ r.md #65 の申告は 2 つ:
 
 ## 1. 窓スタイルと open シーケンス
 
-    style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
-          + (resizable ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0)
+    style = WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+          + (resizable      ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0)
+          + (owner が取れた ? 0 : WS_MINIMIZEBOX)         <- 1-1 を必ず読むこと
+    ex    = owner が取れた ? WS_EX_TOOLWINDOW : 0         <- 1-1 を必ず読むこと
+    owner = daw_gui の本体窓 (CreateWindowExW の hWndParent で **作成時に**決める)
     class = { style: CS_DBLCLKS, hCursor: IDC_ARROW, hbrBackground: NULL }
             + WM_ERASEBKGND -> TRUE / WM_PAINT -> BeginPaint+EndPaint
+
+### 1-1. owner と `WS_EX_TOOLWINDOW` は **1 つの判断から導く** (r.md #65)
+
+実装は `editor_window::OwnerBinding` (`OwnedBy(HWND)` / `Standalone`) の 1 型に閉じている。
+**この 2 つを別々の条件で分岐させてはいけない。**
+
+|              | owner あり | owner なし |
+|--------------|-----------|-----------|
+| TOOLWINDOW あり | REAPER と同じ。◎ | **唯一の悪化パターン。作ってはいけない** |
+| TOOLWINDOW なし | 安全 (Alt+Tab に残る) | 現状維持。安全 |
+
+**`WS_MINIMIZEBOX` も同じ判断から導く。** tool window は taskbar にも Alt+Tab にも出ないので、
+**最小化すると復元する手掛かりが無くなる** — 上の「作ってはいけない」欄と同じ種類の
+取り戻せない窓で、しかも **owner を導入したこと自体が新設する経路**。よって
+`OwnerBinding::OwnedBy` では `WS_MINIMIZEBOX` を落とす。REAPER の FX 窓も実測で
+`WS_MINIMIZEBOX` を持たない (style `0x94cd0044`: `WS_MAXIMIZEBOX` はあるが `WS_MINIMIZEBOX` は無い)。
+最大化は ✕ / 復元ボタンで必ず戻せるので残す。
+「エディタだけ引っ込める」操作は
+*"An owned window is hidden when its owner is minimized."* が肩代わりする
+(daw_gui 本体を最小化すれば一緒に隠れる)。
+
+- `WS_EX_TOOLWINDOW` … *"A tool window does not appear in the taskbar or in the dialog that
+  appears when the user presses ALT+TAB."* (extended-window-styles)
+- owner … *"An owned window is always above its owner in the z-order."* /
+  *"The system automatically destroys an owned window when its owner is destroyed."* /
+  *"An owned window is hidden when its owner is minimized."* (window-features)
+
+owner が無いまま TOOLWINDOW だけ付けると「他窓の下へ潜れるのに一覧から選べない」=
+**取り戻せない窓**になる。逆に owner だけなら潜れないうえ Alt+Tab にも残るので単独で安全。
+よって分岐点は「owner が取れたか」だけ。回帰テストは
+`owner_binding_never_yields_toolwindow_without_an_owner`。
+
+**owner は `CreateWindowExW` の `hWndParent` で決める。`SetWindowLongPtr(GWLP_HWNDPARENT)` で
+後から付け替えない。** Microsoft Learn が
+*"After creating an owned window, an application cannot transfer ownership of the window to
+another window."* (window-features) と
+*"GWLP_HWNDPARENT ... Sets a new owner for a top-level window."* (SetWindowLongPtr) で
+正面から矛盾しているため。作成時に渡す形なら前者が明示的に許している唯一の作り方になる。
+
+owner の HWND は `PluginCommand::OpenSlotGuiEmbedded.owner_main_window`
+(`common::protocol::PlatformWindowHandle`) で daw_gui から渡る。**preview 窓ではなく本体窓**。
+`None` / 既に破棄済みなら `Standalone` に落ちる (= TOOLWINDOW も付かない)。
+
+`WS_EX_TOOLWINDOW` はキャプションを低くするので、**`AdjustWindowRectExForDpi` にも同じ ex を
+渡すこと**。渡さないと client 領域が要求サイズからずれる。
+
+**副作用として新設される経路**: daw_gui が異常終了すると Windows がコンテナを道連れに破棄する。
+✕ は押されないので `take_close_request` では拾えない。`poll_editor_close_requests` が
+`is_window_alive()` で検出し、**通常と同じ close flow** (`gui_destroy` → drop →
+`SlotGuiClosed`) に合流させる (`removed()` を飛ばすと `IPlugView` が attach 済みで残る)。
 
 VST3 SDK editorhost (`samples/vst-hosting/editorhost/source/platform/win32/window.cpp`
 L79-131) と clap-wrapper standalone が独立に同じ結論。`CS_HREDRAW|CS_VREDRAW` は**付けない**
