@@ -250,7 +250,18 @@ unsafe extern "C" fn gui_request_resize(
     }
     use crate::editor_window::PluginResizeOutcome;
     let hwnd = this.callbacks.editor_hwnd.load(Ordering::Acquire);
-    match crate::editor_window::plugin_requested_resize(hwnd, width, height) {
+    // r.md #65: VST3 の `resizeView` と同じく **常設の info ログ**。この経路も
+    // 無記録だったので、「プラグインが要求していない」のか「握りつぶした」のかを
+    // ログから区別できなかった。
+    tracing::info!(
+        target: "editor_resize",
+        want_w = width,
+        want_h = height,
+        editor_hwnd = format!("{hwnd:#x}"),
+        "CLAP clap_host_gui.request_resize"
+    );
+    let outcome = crate::editor_window::plugin_requested_resize(hwnd, width, height);
+    let accepted = match outcome {
         PluginResizeOutcome::Applied => true,
         // ヘッダ: *"If the host returns false, the new size is rejected."*
         // 再入拒否は **非同期経路へ積み直さない** (拒否と伝えた値が後から効くのを防ぐ)。
@@ -262,7 +273,16 @@ unsafe extern "C" fn gui_request_resize(
             (this.callbacks.on_request_resize)(width, height);
             true
         }
-    }
+    };
+    tracing::info!(
+        target: "editor_resize",
+        want_w = width,
+        want_h = height,
+        ?outcome,
+        returned = accepted,
+        "CLAP clap_host_gui.request_resize returned"
+    );
+    accepted
 }
 
 unsafe extern "C" fn gui_request_show(host: *const clap_host) -> bool {

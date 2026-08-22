@@ -68,7 +68,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_CHILD, GWLP_USERDATA, GWL_STYLE,
     GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HICON, HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, KillTimer, LoadCursorW, PostMessageW,
+    HICON, HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, KillTimer,
+    LoadCursorW, PostMessageW,
     RegisterClassExW, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, WA_INACTIVE, WINDOW_EX_STYLE,
@@ -81,7 +82,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use crate::plugin_instance::EditorSizer;
+use crate::plugin_instance::{EditorSizer, ResizableProbe};
 
 /// r.md #36: コンテナ窓に返ってきた未消化キーを plugin-main ポンプへ渡すための
 /// 内部メッセージ。 `wParam` / `lParam` は元の `WM_KEYDOWN` / `WM_KEYUP` のまま。
@@ -132,11 +133,21 @@ static CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
 /// この target を `RUST_LOG` で trace にすると窓メッセージの診断が出る。
 const TRACE_TARGET: &str = "editor_win";
 
+/// r.md #65: **常設**の resize / focus 経路ログ (info)。`editor_win` (trace、
+/// 窓メッセージの生ダンプ) と違い、既定の `RUST_LOG=info` でも必ず出る。
+///
+/// この経路が無記録だったせいで、実ログから
+/// 「プラグインが `resizeView` を呼んでいない」のか「呼んだが握りつぶした」のかを
+/// 区別できず、症状の切り分けに 1 往復無駄にした。頻度は resize / activate の
+/// ユーザー操作時だけなのでログを汚さない。
+const RESIZE_TARGET: &str = "editor_resize";
+
 /// 相手 HWND を `hwnd=0x... pid=.. tid=.. class="..." title="..."` に展開する。
 /// `NULL` は `"none"`。診断専用 (有効時しか呼ばない)。
 fn describe_hwnd(hwnd: HWND) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetClassNameW, GetWindowTextW, IsWindowVisible,
+        GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, GetAncestor, GetClassNameW, GetWindowTextW,
+        IsWindowVisible,
     };
     if hwnd.0.is_null() {
         return "none".to_string();
@@ -155,9 +166,16 @@ fn describe_hwnd(hwnd: HWND) -> String {
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+    // r.md #65: **owner / root-owner を必ず出す**。プラグインが view をコンテナから
+    // 外して top-level popup に化けたとき、それが「こちらに所有された popup」なのかで
+    // 取れる対処が変わる (owner ならキャプションをアクティブに保つ定石が使えるが、
+    // owner 無しなら使えない)。style だけ見ても判定できない。
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) }.unwrap_or_default();
+    let root_owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
     format!(
-        "{:#x} pid={pid} tid={tid} class={class:?} title={title:?} style={style:#x} ex={ex_style:#x} visible={visible}",
-        hwnd.0 as usize
+        "{:#x} pid={pid} tid={tid} class={class:?} title={title:?} style={style:#x} ex={ex_style:#x} \
+         visible={visible} owner={:#x} root_owner={:#x}",
+        hwnd.0 as usize, owner.0 as usize, root_owner.0 as usize
     )
 }
 
@@ -203,6 +221,10 @@ fn trace_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         WM_EXITSIZEMOVE => "WM_EXITSIZEMOVE",
         WM_SIZING => "WM_SIZING",
         WM_SIZE => "WM_SIZE",
+        // r.md #65: `WM_MOVE` はジオメトリ捕捉の 2 本柱の片方、`WM_TIMER` は
+        // modal move/size ループ中の pump。どちらも要の経路なのに不可視だった。
+        WM_MOVE => "WM_MOVE",
+        WM_TIMER => "WM_TIMER",
         _ => return,
     };
     // 相手 HWND の在り処はメッセージごとに違う。
@@ -391,6 +413,23 @@ struct EditorShared {
     /// ここへ戻す (Raymond Chen "Dialog boxes return focus to the control that had
     /// focus when you last switched away" のパターン)。
     last_focus: Cell<isize>,
+    /// r.md #65: `attached` 直後に観測したプラグイン view の HWND と style。
+    ///
+    /// **「いつ WS_CHILD から WS_POPUP へ化けたか」を検出するための基準値**。
+    /// Renoise Redux は内部 Editor を開くと view をコンテナから外して top-level
+    /// popup にするが、それが起きた時刻と、そのとき owner が誰かが分からないと
+    /// 打てる手 (キャプションをアクティブに保つ定石が使えるか) が決まらない。
+    /// `(hwnd, style)`。`hwnd == 0` = まだ観測していない。
+    view_baseline: Cell<(isize, u32)>,
+    /// view が逃げたことを既に報告済みか (ログを 1 回に絞る)。
+    escape_reported: Cell<bool>,
+    /// r.md #65: これまでに受けた `WM_SIZE` (非最小化) の回数。
+    ///
+    /// **診断のための観測点**。[`plugin_requested_resize`] が `SetWindowPos` の前後で
+    /// この値を読み、「`SetWindowPos` は成功したのに `WM_SIZE` が来ていない」を
+    /// **ログだけで**判定できるようにする。これが無いと「プラグインが resizeView を
+    /// 呼んでいない」のか「呼んだが窓が動かなかった」のかが原理的に区別できない。
+    size_events: Cell<u32>,
 }
 
 impl EditorShared {
@@ -401,6 +440,9 @@ impl EditorShared {
             sizer: Cell::new(std::ptr::null::<NoopSizer>() as *const dyn EditorSizer),
             in_plugin_resize: Cell::new(false),
             last_focus: Cell::new(0),
+            view_baseline: Cell::new((0, 0)),
+            escape_reported: Cell::new(false),
+            size_events: Cell::new(0),
         }
     }
 
@@ -421,6 +463,7 @@ impl EditorShared {
 
 /// `Cell::new` に渡す型付き null 用のダミー (値は作られない)。
 struct NoopSizer;
+#[allow(clippy::missing_const_for_fn)]
 impl EditorSizer for NoopSizer {
     fn constrain_client_size(&self, w: u32, h: u32) -> (u32, u32) {
         (w, h)
@@ -429,8 +472,8 @@ impl EditorSizer for NoopSizer {
         None
     }
     fn notify_client_size(&self, _w: u32, _h: u32) {}
-    fn can_resize(&self) -> bool {
-        false
+    fn can_resize(&self) -> ResizableProbe {
+        ResizableProbe::unavailable()
     }
     fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {
         None
@@ -542,6 +585,27 @@ impl EditorWindow {
         let ptr: *const dyn EditorSizer = &*sizer;
         self.sizer = Some(sizer);
         self.shared.sizer.set(ptr);
+    }
+
+    /// r.md #65: `attached` / `set_parent` 直後のプラグイン view を基準値として控える。
+    /// 以後 [`check_view_escaped`] がこれと突き合わせて「view がコンテナから外れて
+    /// top-level popup に化けた」瞬間を検出する。
+    pub fn record_view_baseline(&self) {
+        unsafe {
+            let child = GetWindow(self.hwnd, GW_CHILD).unwrap_or_default();
+            let style = if child.0.is_null() {
+                0
+            } else {
+                GetWindowLongPtrW(child, GWL_STYLE) as u32
+            };
+            self.shared.view_baseline.set((child.0 as isize, style));
+            tracing::info!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", self.hwnd.0 as usize),
+                child = %describe_plugin_child(self.hwnd),
+                "plugin view baseline recorded (right after attach)"
+            );
+        }
     }
 
     /// True once if the user clicked ✕ since the last call. The plugin-main
@@ -773,17 +837,105 @@ fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
         } else {
             GetWindow(hwnd, GW_CHILD).unwrap_or_default()
         };
-        if target.0.is_null() || GetFocus() == target {
+        let before = GetFocus();
+        if target.0.is_null() {
+            // 観測 (r.md #65): **子が 1 枚も無い**のは「プラグインが view を
+            // コンテナから外して自前の top-level にした」ことの直接の証拠になる。
+            tracing::info!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                focus = format!("{:#x}", before.0 as usize),
+                child = %describe_plugin_child(hwnd),
+                "focus forward skipped: container has no child window"
+            );
             return;
         }
-        if let Err(e) = SetFocus(Some(target)) {
-            tracing::debug!(
-                child = target.0 as usize,
-                error = ?e,
-                "SetFocus to plugin child failed (window not on this thread?)"
-            );
+        if before == target {
+            return; // 既に子が持っている (往復ガード)。
         }
+        let err = SetFocus(Some(target)).err();
+        tracing::info!(
+            target: RESIZE_TARGET,
+            hwnd = format!("{:#x}", hwnd.0 as usize),
+            child = format!("{:#x}", target.0 as usize),
+            focus_before = format!("{:#x}", before.0 as usize),
+            focus_after = format!("{:#x}", GetFocus().0 as usize),
+            error = ?err,
+            "focus forwarded to plugin child"
+        );
     }
+}
+
+/// プラグインの view が **コンテナから外れて top-level に化けていないか**を検査し、
+/// 変化した瞬間に 1 度だけ info で報告する (r.md #65)。
+///
+/// Renoise Redux は内部 Editor を開くと自分の view を `WS_CHILD` → `WS_POPUP` に
+/// 変えてコンテナから外す。これが起きるとコンテナは空の枠になり、activation が
+/// popup 側へ移ってキャプションが非アクティブに塗られる。**外部プローブ無しに
+/// ログだけでこの状態と発生時刻を確定できる**ようにするための観測点。
+///
+/// `owner` が誰かも一緒に出す: こちらが所有する popup なら「WM_NCACTIVATE を
+/// TRUE に読み替えてキャプションを保つ」定石が使えるが、owner 無しなら使えない。
+/// **どちらなのかを実測しないと対処が決められない。**
+fn check_view_escaped(hwnd: HWND, shared: &EditorShared) {
+    if shared.escape_reported.get() {
+        return;
+    }
+    let (base_hwnd, base_style) = shared.view_baseline.get();
+    if base_hwnd == 0 {
+        return; // まだ attach していない。
+    }
+    let view = HWND(base_hwnd as *mut core::ffi::c_void);
+    if !unsafe { IsWindow(Some(view)) }.as_bool() {
+        return;
+    }
+    let style = unsafe { GetWindowLongPtrW(view, GWL_STYLE) } as u32;
+    if style == base_style {
+        return;
+    }
+    shared.escape_reported.set(true);
+    tracing::info!(
+        target: RESIZE_TARGET,
+        container = format!("{:#x}", hwnd.0 as usize),
+        view = %describe_hwnd(view),
+        style_before = format!("{base_style:#010x}"),
+        style_after = format!("{style:#010x}"),
+        still_child = unsafe { windows::Win32::UI::WindowsAndMessaging::IsChild(hwnd, view) }
+            .as_bool(),
+        "plugin view style changed since attach (did it escape the container?)"
+    );
+}
+
+/// コンテナの直接の子 (= プラグインの view 窓) を 1 行で説明する。
+///
+/// 観測用 (r.md #65)。Renoise Redux は内部 Editor を開くと自分の view を
+/// `WS_CHILD` → `WS_POPUP` に化けさせてコンテナから外すことがあり、そのとき
+/// `GetWindow(GW_CHILD)` が `NULL` になる。**外部プローブ無しでログだけから
+/// この状態を判定できる**ようにするための情報。
+fn describe_plugin_child(hwnd: HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_ENABLEDPOPUP, GW_OWNER, GetClassNameW, GetParent,
+    };
+    let Some(child) = (unsafe { GetWindow(hwnd, GW_CHILD) }).ok().filter(|c| !c.0.is_null())
+    else {
+        // 所有者が自分の top-level 窓 (= 外へ逃げた view) が居ないかも見る。
+        let owned = unsafe { GetWindow(hwnd, GW_ENABLEDPOPUP) }.unwrap_or_default();
+        return if owned.0.is_null() {
+            "none".to_string()
+        } else {
+            format!("none (but owns popup {:#x})", owned.0 as usize)
+        };
+    };
+    let mut class_buf = [0u16; 128];
+    let n = unsafe { GetClassNameW(child, &mut class_buf) };
+    let class = String::from_utf16_lossy(&class_buf[..n.max(0) as usize]);
+    let style = unsafe { GetWindowLongPtrW(child, GWL_STYLE) } as u32;
+    let parent = unsafe { GetParent(child) }.unwrap_or_default();
+    let owner = unsafe { GetWindow(child, GW_OWNER) }.unwrap_or_default();
+    format!(
+        "{:#x} class={class:?} style={style:#010x} parent={:#x} owner={:#x}",
+        child.0 as usize, parent.0 as usize, owner.0 as usize
+    )
 }
 
 /// プラグイン起点のリサイズ (VST3 `IPlugFrame::resizeView` / CLAP
@@ -808,44 +960,97 @@ fn focus_plugin_child(hwnd: HWND, shared: &EditorShared) {
 /// 非同期経路へ積み直すと、プラグインには「拒否」と伝えたリサイズが 1 周期後に
 /// 実行され、プラグインの内部状態と窓サイズが食い違う (editorhost の
 /// `resizeViewRecursionGard` は拒否したら何も残さない)。
+/// # 観測 (r.md #65)
+///
+/// この関数は **必ず 1 行 `info!` を出す** (`target: "editor_resize"`)。r.md #65 の
+/// 中心にある経路なのに無記録で、実ログから
+/// 「プラグインが `resizeView` を呼んでいない」のか「呼んだがホストが握りつぶした」のかを
+/// **原理的に区別できなかった**ため。頻度はユーザーが resize 操作したときだけなので
+/// ログを汚さない。
 #[must_use]
 pub fn plugin_requested_resize(hwnd_u64: u64, width: u32, height: u32) -> PluginResizeOutcome {
     let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+    let log = |outcome: PluginResizeOutcome, reason: &str| {
+        tracing::info!(
+            target: RESIZE_TARGET,
+            hwnd = format!("{hwnd_u64:#x}"),
+            want_w = width,
+            want_h = height,
+            ?outcome,
+            reason,
+            "plugin requested resize"
+        );
+        outcome
+    };
     if hwnd.0.is_null() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        return PluginResizeOutcome::NotApplicable;
+        return log(PluginResizeOutcome::NotApplicable, "no editor window (hwnd null/dead)");
     }
     // 窓メッセージを扱えるのは窓を作ったスレッドだけ。CLAP の `request_resize` は
     // `[thread-safe]` なので任意スレッドから来る。
-    if unsafe { GetWindowThreadProcessId(hwnd, None) } != unsafe { GetCurrentThreadId() } {
-        return PluginResizeOutcome::NotApplicable;
+    let owner_tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    let cur_tid = unsafe { GetCurrentThreadId() };
+    if owner_tid != cur_tid {
+        tracing::info!(
+            target: RESIZE_TARGET,
+            hwnd = format!("{hwnd_u64:#x}"),
+            owner_tid,
+            cur_tid,
+            "plugin requested resize from a foreign thread; deferring to plugin-main"
+        );
+        return log(PluginResizeOutcome::NotApplicable, "called off the window's thread");
     }
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const EditorShared;
     if raw.is_null() {
-        return PluginResizeOutcome::NotApplicable;
+        return log(PluginResizeOutcome::NotApplicable, "GWLP_USERDATA null (window torn down)");
     }
     // SAFETY: `EditorWindow` が生きている間だけ非 null (Drop が 0 に戻す)。
     let shared = unsafe { &*raw };
     if shared.in_plugin_resize.get() {
-        return PluginResizeOutcome::Rejected;
+        return log(PluginResizeOutcome::Rejected, "re-entrant (already resizing)");
     }
     let Some(sizer) = shared.sizer() else {
-        return PluginResizeOutcome::NotApplicable;
+        return log(PluginResizeOutcome::NotApplicable, "no live sizer (gui not attached)");
     };
-    if sizer.current_client_size() == Some((width, height)) {
-        return PluginResizeOutcome::Applied; // 既に同じ = 何もしないのが正
+    let before = sizer.current_client_size();
+    if before == Some((width, height)) {
+        return log(PluginResizeOutcome::Applied, "already at the requested size");
     }
+    let client_before = unsafe { client_size(hwnd) };
+    let size_events_before = shared.size_events.get();
+
     shared.in_plugin_resize.set(true);
     unsafe { resize_client_area(hwnd, width, height) };
+    let client_after = unsafe { client_size(hwnd) };
+    let size_events_after = shared.size_events.get();
     // `SetWindowPos` が WM_SIZE を出さなかった (= サイズが変わらなかった) ケースの保険。
+    let mut fallback_notify = false;
     if let Some(sizer) = shared.sizer()
         && sizer.current_client_size() != Some((width, height))
     {
         sizer.notify_client_size(width, height);
+        fallback_notify = true;
     }
     shared.in_plugin_resize.set(false);
     // `geometry_dirty` はここで立てない: サイズが実際に変わったなら
     // `resize_client_area` の `SetWindowPos` が `WM_SIZE` を出して立てているし、
     // 変わっていないなら送るものが無い (§ジオメトリ捕捉の不変条件)。
+
+    // **窓が実際に動いたか**まで残す。これが無いと「Applied を返したのに窓が
+    // 変わっていない」を切り分けられない。
+    tracing::info!(
+        target: RESIZE_TARGET,
+        hwnd = format!("{hwnd_u64:#x}"),
+        want_w = width,
+        want_h = height,
+        plugin_size_before = ?before,
+        plugin_size_after = ?shared.sizer().and_then(EditorSizer::current_client_size),
+        client_before = format!("{}x{}", client_before.0, client_before.1),
+        client_after = format!("{}x{}", client_after.0, client_after.1),
+        wm_size_delivered = size_events_after - size_events_before,
+        fallback_notify,
+        outcome = ?PluginResizeOutcome::Applied,
+        "plugin requested resize (applied)"
+    );
     PluginResizeOutcome::Applied
 }
 
@@ -1053,6 +1258,9 @@ unsafe extern "system" fn editor_wnd_proc(
                 // **サイズが変わった = 保存対象が変わった** (下の `WM_MOVE` と対で
                 // 「rect の変化」を漏れなく捕捉する。§ジオメトリ捕捉の不変条件)。
                 shared.geometry_dirty.set(true);
+                // 観測 (r.md #65): `plugin_requested_resize` が「`SetWindowPos` の
+                // 後に WM_SIZE が実際に来たか」を差分で判定するためのカウンタ。
+                shared.size_events.set(shared.size_events.get().wrapping_add(1));
                 if let Some(sizer) = shared.sizer() {
                     #[allow(clippy::cast_possible_truncation)]
                     let cw = (lparam.0 & 0xFFFF) as u32;
@@ -1060,8 +1268,18 @@ unsafe extern "system" fn editor_wnd_proc(
                     let ch = ((lparam.0 >> 16) & 0xFFFF) as u32;
                     // 縮退サイズ (0x0) をプラグインへ流さない — サイズ依存の描画が
                     // 0 次元で走る。
-                    if cw > 0 && ch > 0 && sizer.current_client_size() != Some((cw, ch)) {
+                    let current = sizer.current_client_size();
+                    if cw > 0 && ch > 0 && current != Some((cw, ch)) {
                         sizer.notify_client_size(cw, ch);
+                        tracing::info!(
+                            target: RESIZE_TARGET,
+                            hwnd = format!("{:#x}", hwnd.0 as usize),
+                            client_w = cw,
+                            client_h = ch,
+                            plugin_size_before = ?current,
+                            plugin_size_after = ?sizer.current_client_size(),
+                            "WM_SIZE -> notified plugin (onSize / set_size)"
+                        );
                     }
                 }
             }
@@ -1127,6 +1345,27 @@ unsafe extern "system" fn editor_wnd_proc(
                     }
                 }
             }
+            // r.md #65: view が逃げていないかをここで検査する (activation が動く
+            // ときは必ず通るので、逃げた直後に必ず 1 度は報告される)。
+            if let Some(shared) = shared {
+                check_view_escaped(hwnd, shared);
+            }
+            // r.md #65: 症状 A (アクティブにならない) の観測点。**常設 info**。
+            // 誰との間で activation が動いたか + プラグインの子窓が今どうなって
+            // いるか (逃げて popup 化していないか) を 1 行で残す。
+            tracing::info!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                state = match state {
+                    WA_INACTIVE => "inactive",
+                    2 => "click-active",
+                    _ => "active",
+                },
+                minimized,
+                other = format!("{:#x}", lparam.0),
+                child = %describe_plugin_child(hwnd),
+                "WM_ACTIVATE"
+            );
             // 既定処理を必ず通す (これを止めるとアクティブ化そのものが壊れる)。
             let res = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             // **DefWindowProc の後**に子へ移譲する。`DefWindowProc` は
