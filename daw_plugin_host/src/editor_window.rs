@@ -423,6 +423,15 @@ struct EditorShared {
     view_baseline: Cell<(isize, u32)>,
     /// view が逃げたことを既に報告済みか (ログを 1 回に絞る)。
     escape_reported: Cell<bool>,
+    /// r.md #65: キャプションを**アクティブ色に固定している**か。
+    ///
+    /// 固定を入れたら **対になる解除を同じ精度で持つ**こと。プラグインが view を
+    /// 所有 popup へ逃がすと、以後アクティブ窓は popup になりコンテナには
+    /// `WM_ACTIVATE` / `WM_NCACTIVATE` が **一切来なくなる** (実測: 別アプリ切替と
+    /// Alt+Tab の 55 秒間、届いたのは `WM_ACTIVATEAPP` だけ)。固定だけ入れて
+    /// 解除の契機を作らないと、**アプリを離れてもキャプションがアクティブのまま**に
+    /// なる (実際そうなった)。解除は `WM_ACTIVATEAPP(FALSE)` で行う。
+    caption_forced_active: Cell<bool>,
     /// r.md #65: 直近に観測した `canResize` の生値 (`i32::MIN` = 未観測)。
     ///
     /// ユーザーの仮説「Redux は Editor クリックで canResize が変わるのでは」を
@@ -449,6 +458,7 @@ impl EditorShared {
             last_focus: Cell::new(0),
             view_baseline: Cell::new((0, 0)),
             escape_reported: Cell::new(false),
+            caption_forced_active: Cell::new(false),
             last_can_resize_raw: Cell::new(i32::MIN),
             size_events: Cell::new(0),
         }
@@ -889,14 +899,21 @@ fn probe_can_resize_change(shared: &EditorShared, occasion: &str) {
     if !probe.queried {
         return;
     }
-    if shared.last_can_resize_raw.replace(probe.raw) == probe.raw {
+    let previous = shared.last_can_resize_raw.replace(probe.raw);
+    if previous == probe.raw {
+        return;
+    }
+    if previous == i32::MIN {
+        // 初回は基準値を控えるだけ。ここで CHANGED を出すと「値は同じなのに
+        // 変わったと言う」ノイズになる (実機ログで 1 回出てしまった)。
         return;
     }
     tracing::info!(
         target: RESIZE_TARGET,
         occasion,
         verdict = probe.verdict,
-        raw = format!("{:#x}", probe.raw),
+        raw_before = format!("{previous:#x}"),
+        raw_after = format!("{:#x}", probe.raw),
         "canResize CHANGED since last observation"
     );
 }
@@ -910,6 +927,57 @@ fn owned_popup(hwnd: HWND) -> Option<HWND> {
     use windows::Win32::UI::WindowsAndMessaging::GW_ENABLEDPOPUP;
     let p = unsafe { GetWindow(hwnd, GW_ENABLEDPOPUP) }.ok()?;
     (!p.0.is_null() && p != hwnd).then_some(p)
+}
+
+/// キャプションのアクティブ表示を `active` に**明示的に**設定する (r.md #65)。
+///
+/// プラグインが view を所有 popup へ逃がすと、以後アクティブ窓は popup になり、
+/// コンテナには `WM_NCACTIVATE` が **一切来なくなる**。つまり
+/// 「`WM_NCACTIVATE` を読み替える」だけでは *固定* しかできず、*解除* する契機が
+/// 無い。そこで表示状態そのものを我々が持ち (`caption_forced_active`)、
+/// 変化したときだけ `DefWindowProc` へ直接 `WM_NCACTIVATE` を渡して描き替える。
+///
+/// MSDN: *"The DefWindowProc function draws the title bar or icon title in its
+/// active colors when the wParam parameter is TRUE and in its inactive colors
+/// when wParam is FALSE."* / lParam に `-1` を渡すと**再描画されない**ので、
+/// 描き替えたいここでは `0` を渡す。
+///
+/// `SendMessage` ではなく `DefWindowProcW` を直接呼ぶ: 自分の WNDPROC を経由すると
+/// 上の読み替えハンドラに再入する。
+fn set_caption_active(hwnd: HWND, shared: &EditorShared, active: bool) {
+    if shared.caption_forced_active.replace(active) == active {
+        return;
+    }
+    unsafe {
+        let _ = DefWindowProcW(
+            hwnd,
+            WM_NCACTIVATE,
+            WPARAM(usize::from(active)),
+            LPARAM(0),
+        );
+    }
+    tracing::info!(
+        target: RESIZE_TARGET,
+        hwnd = format!("{:#x}", hwnd.0 as usize),
+        active,
+        "caption active state forced"
+    );
+}
+
+/// `GetLastActivePopup` の結果を 1 行で (r.md #65 の Alt+Tab 観測)。
+///
+/// MSDN: *"The return value is the same as the hWnd parameter, if ... The window
+/// identified by hWnd does not own any pop-up windows."* — つまり自分自身が
+/// 返ったら「所有 popup が無い / 自分が最後にアクティブだった」。
+/// **owner 窓をアクティブ化するとき、シェルが実際に前面化する窓**はこれ。
+fn describe_last_active_popup(hwnd: HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetLastActivePopup;
+    let p = unsafe { GetLastActivePopup(hwnd) };
+    if p == hwnd {
+        "self (no owned popup was more recently active)".to_string()
+    } else {
+        format!("{:#x}", p.0 as usize)
+    }
 }
 
 /// 所有 popup の現況を 1 行で (r.md #65 の Alt+Tab 観測)。
@@ -1459,10 +1527,17 @@ unsafe extern "system" fn editor_wnd_proc(
                     going_to = format!("{:#x}", target.0 as usize),
                     "WM_NCACTIVATE(FALSE) to our own owned popup — keeping the caption active"
                 );
-                // キャプションはアクティブ色で描かせる。
-                let _ = unsafe { DefWindowProcW(hwnd, msg, WPARAM(1), lparam) };
+                if let Some(shared) = shared_of(hwnd) {
+                    set_caption_active(hwnd, shared, true);
+                } else {
+                    let _ = unsafe { DefWindowProcW(hwnd, msg, WPARAM(1), lparam) };
+                }
                 // アクティブ窓の変更自体は妨げない。
                 return LRESULT(1);
+            }
+            // グループ外へ移るなら通常どおり非アクティブ色。固定していたなら降ろす。
+            if let Some(shared) = shared_of(hwnd) {
+                shared.caption_forced_active.set(false);
             }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
@@ -1543,7 +1618,38 @@ unsafe extern "system" fn editor_wnd_proc(
         // 「プラグインエディタを触っている間もアプリはアクティブ」をこちらから報告する。
         // `wparam != 0` = このスレッドの窓が activation を得た。
         WM_ACTIVATEAPP => {
-            store_windows_active(wparam.0 != 0);
+            let app_active = wparam.0 != 0;
+            store_windows_active(app_active);
+            if let Some(shared) = shared_of(hwnd) {
+                // r.md #65: **プラグインが view を所有 popup へ逃がすと、以後
+                // コンテナには `WM_ACTIVATE` / `WM_NCACTIVATE` が来なくなる**
+                // (アクティブ窓は popup で、コンテナではないため)。実測でも
+                // 別アプリ切替と Alt+Tab の 55 秒間に届いたのは
+                // `WM_ACTIVATEAPP` だけだった。
+                //
+                // よってキャプションの**解除**はここでしかできない。固定
+                // (`WM_NCACTIVATE` の読み替え) と対にして、
+                //   「このプロセスが前面 かつ グループ内の窓がアクティブ」
+                // のときだけアクティブ色、という 1 つの規則に揃える。
+                let owns_popup = owned_popup(hwnd).is_some();
+                set_caption_active(hwnd, shared, app_active && owns_popup);
+
+                // r.md #65: Alt+Tab の観測点。**発火するメッセージ側に付ける**
+                // (`WM_ACTIVATE` に付けていたが、逃げた後は来ないので空振りだった)。
+                tracing::info!(
+                    target: RESIZE_TARGET,
+                    hwnd = format!("{:#x}", hwnd.0 as usize),
+                    app_active,
+                    owned_popup = %describe_owned_popup(hwnd),
+                    last_active_popup = %describe_last_active_popup(hwnd),
+                    container_visible = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd)
+                    }
+                    .as_bool(),
+                    state = %describe_input_state(),
+                    "WM_ACTIVATEAPP"
+                );
+            }
             // 既定動作 (フォーカス周りの内部処理) は潰さずそのまま流す。
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
