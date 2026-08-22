@@ -38,6 +38,24 @@ MEM_DIR = os.path.join(REAL_PROJ, "memory")
 # sandbox without touching the live, all-worktree-shared guards.jsonl.
 GUARDS_SRC = sys.argv[1] if len(sys.argv) > 1 else REAL_GUARDS
 
+# Synthetic repo root for the fixtures below. Never write a real machine path here:
+# this file ships in a public repository. Nothing touches the filesystem through these
+# paths -- guard_engine.py only does string work on file_path, plus os.path.isabs.
+#
+# isabs IS platform-dependent, and the worktree guard only engages for absolute paths:
+# posixpath.isabs("X:/proj/a") is False, so a drive-letter fixture would silently turn
+# every worktree positive case into a vacuous pass on Linux. Pick a root that is
+# absolute on the host instead.
+SYN_ROOT = "X:/proj" if os.name == "nt" else "/proj"
+# Backslash variant of the same path, to exercise the engine's "\" -> "/" normalization.
+# On POSIX the drive-letter form is not absolute, so keep the leading "/" there and vary
+# only the separators.
+SYN_ROOT_BS = SYN_ROOT.replace("/", "\\") if os.name == "nt" else SYN_ROOT
+# A user-dir path OUTSIDE the repo (guards/memory live there). "F--dev-daw-01" is the
+# Claude Code project slug that guard_engine.py / reflect.py hardcode, so it stays.
+SYN_USER_PROJ = ("Y:/home/u" if os.name == "nt" else "/home/u") + \
+    "/.claude/projects/F--dev-daw-01"
+
 PASS, FAIL = [], []
 
 
@@ -186,13 +204,13 @@ CASES = [
      set(), {"compromise-smell-ja"}),
     # gui-conv-entry-format (file_glob gating)
     ("conv/neg-undated-bracket", "Write",
-     {"file_path": "F:/dev/daw_01/docs/gui_01_conversation.md", "content": "## random title [foo]\n"},
+     {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md", "content": "## random title [foo]\n"},
      0, set(), {"gui-conv-entry-format"}),
     ("conv/neg-goodheading", "Write",
-     {"file_path": "F:/dev/daw_01/docs/gui_01_conversation.md",
+     {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md",
       "content": "## #72 [Open] 2026-06-15 [request] 件名\n"}, 0, set(), {"gui-conv-entry-format"}),
     ("conv/neg-globmiss", "Write",
-     {"file_path": "F:/dev/daw_01/docs/other.md", "content": "## random title [foo]\n"},
+     {"file_path": f"{SYN_ROOT}/docs/other.md", "content": "## random title [foo]\n"},
      0, set(), {"gui-conv-entry-format"}),
     # compromise-smell-en
     ("en/pos-lowrisk", "Edit", {"file_path": "x.rs", "new_string": "// this is low-risk"}, 0,
@@ -270,17 +288,17 @@ CASES = [
      {"command": "cat > docs/migration.md <<'EOF'\n旧 hook は powershell -File x.ps1 で起動。bash へ移行済み。\nEOF"},
      0, set(), {"no-powershell-invoke", "no-ps1-via-bash"}),
     ("fix/smell-en-in-memory", "Write",
-     {"file_path": "C:/Users/x/.claude/projects/F--dev-daw-01/memory/feedback_pursue_ideal_only.md",
+     {"file_path": f"{SYN_USER_PROJ}/memory/feedback_pursue_ideal_only.md",
       "content": "検出語: low-risk / pragmatic / workaround / compromise。これらが出たら違反。"},
      0, set(), {"compromise-smell-en"}),
     ("fix/smell-ja-in-claude-md", "Edit",
-     {"file_path": "F:/dev/daw_01/CLAUDE.md", "new_string": "実装コスト/許容範囲/妥協/現実的に を禁ずる"},
+     {"file_path": f"{SYN_ROOT}/CLAUDE.md", "new_string": "実装コスト/許容範囲/妥協/現実的に を禁ずる"},
      0, set(), {"compromise-smell-ja"}),
     ("fix/smell-ja-nonai", "Edit",
-     {"file_path": "F:/dev/daw_01/DESIGN.md", "new_string": "ここは妥協のない理想実装を採る"},
+     {"file_path": f"{SYN_ROOT}/DESIGN.md", "new_string": "ここは妥協のない理想実装を採る"},
      0, set(), {"compromise-smell-ja"}),
     ("fix/conv-section-link", "Write",
-     {"file_path": "F:/dev/daw_01/docs/gui_01_conversation.md",
+     {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md",
       "content": "## 参考リンク [clap repo](https://github.com/free-audio/clap)\n"},
      0, set(), {"gui-conv-entry-format"}),
     ("fix/commit-dry-run", "Bash", {"command": "git commit --dry-run"}, 0,
@@ -336,7 +354,7 @@ CASES = [
     ("gap/wt-prune", "Bash", {"command": "git worktree prune --expire=now"}, 0,
      {"no-force-worktree-remove"}, set()),
     ("gap/wt-auto-hook", "Write",
-     {"file_path": "F:/dev/daw_01/.githooks/post-merge",
+     {"file_path": f"{SYN_ROOT}/.githooks/post-merge",
       "content": "#!/usr/bin/env bash\nbash scripts/cleanup_worktree.sh --merged --force\n"},
      0, {"no-auto-worktree-hook"}, set()),
     ("gap/smell-en-lowest", "Edit", {"file_path": "x.rs", "new_string": "// lowest-risk: clone here"},
@@ -346,7 +364,7 @@ CASES = [
     ("gap/smell-ja-tema", "Write", {"file_path": "x.md", "content": "実装の手間が大きいので見送る"},
      0, {"compromise-smell-ja"}, set()),
     ("gap/conv-dated-malformed", "Write",
-     {"file_path": "F:/dev/daw_01/docs/gui_01_conversation.md",
+     {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md",
       "content": "## 要望: track 名の自動コントラスト 2026-06-15\n"},
      0, {"gui-conv-entry-format"}, set()),
     # engine robustness
@@ -488,19 +506,19 @@ def check_escalation():
 # ------------------------------------------------- worktree-path-discipline (cwd)
 def check_worktree_guard():
     """worktree-path-discipline is a cwd-relational guard, so cases must pass cwd."""
-    WT = "F:/dev/daw_01/.claude/worktrees/foo"
-    MAIN = "F:/dev/daw_01"
+    WT = f"{SYN_ROOT}/.claude/worktrees/foo"
+    MAIN = SYN_ROOT
     # (label, file_path, cwd, expect_exit, should_fire)
     WCASES = [
-        ("wtpath/pos-main", "F:/dev/daw_01/src/x.rs", WT, 2, True),
-        ("wtpath/pos-backslash", "F:\\dev\\daw_01\\daw_gui\\src\\app.rs", WT, 2, True),
-        ("wtpath/pos-sibling", "F:/dev/daw_01/.claude/worktrees/bar/x.rs", WT, 2, True),
-        ("wtpath/neg-own-worktree", "F:/dev/daw_01/.claude/worktrees/foo/src/x.rs", WT, 0, False),
+        ("wtpath/pos-main", f"{SYN_ROOT}/src/x.rs", WT, 2, True),
+        ("wtpath/pos-backslash", f"{SYN_ROOT_BS}\\daw_gui\\src\\app.rs", WT, 2, True),
+        ("wtpath/pos-sibling", f"{SYN_ROOT}/.claude/worktrees/bar/x.rs", WT, 2, True),
+        ("wtpath/neg-own-worktree", f"{SYN_ROOT}/.claude/worktrees/foo/src/x.rs", WT, 0, False),
         ("wtpath/neg-memory-outside-repo",
-         "C:/Users/x/.claude/projects/F--dev-daw-01/memory/feedback_x.md", WT, 0, False),
+         f"{SYN_USER_PROJ}/memory/feedback_x.md", WT, 0, False),
         ("wtpath/neg-relative", "src/x.rs", WT, 0, False),
-        ("wtpath/neg-main-session", "F:/dev/daw_01/src/x.rs", MAIN, 0, False),
-        ("wtpath/neg-no-cwd", "F:/dev/daw_01/src/x.rs", None, 0, False),
+        ("wtpath/neg-main-session", f"{SYN_ROOT}/src/x.rs", MAIN, 0, False),
+        ("wtpath/neg-no-cwd", f"{SYN_ROOT}/src/x.rs", None, 0, False),
     ]
     for label, fp, cwd, exp_exit, should in WCASES:
         rc, out = run_engine("Write", {"file_path": fp, "content": "x"}, cwd=cwd)
