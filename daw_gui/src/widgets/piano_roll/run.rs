@@ -9,7 +9,7 @@
 
 use super::*;
 
-use daw_ui_core::{ButtonTextAlign, ToggleButtonStyle};
+use daw_ui_core::{ButtonTextAlign, TextInputStyle, ToggleButtonStyle};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::theme::Palette;
@@ -117,7 +117,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             state.lyric_editing
         };
         // L キー検知: lyric_editing == None かつ selected.len() == 1 のときのみ起動。
-        // `"piano_roll.edit_lyric"` は `is_typing_only_shortcut` に追加済 (M14 Phase 59)。
+        // `"piano_roll.edit_lyric"` は `SHORTCUTS` 表で typing_only 宣言済 (M14 Phase 59 / r.md #67)。
         // 編集中 (typing_focus = true) は shortcut layer を素通りして text_input に届く
         // (= `'l'` 文字としてタイプ可能)。take_shortcut は frame 頭の typing_lock 判定後
         // pending_shortcuts に積まれた name を引くので、編集中は false を返す。
@@ -194,6 +194,12 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                         start_beat: n.start_beat,
                         pitch: n.pitch,
                         len_beats: n.len_beats,
+                        // 所属クリップの content 原点 = この note の content-local 拍 0
+                        // (集合クランプの下限、r.md #67)。範囲外は 0 (defensive)。
+                        min_start_beat: clip_starts
+                            .get(AppData::note_id_clip_slot(n.id))
+                            .copied()
+                            .unwrap_or(0.0),
                     })
                 })
                 .collect();
@@ -789,8 +795,9 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     raw,
                     &view.snap,
                     zoom_x_px_per_beat,
+                    drag_min_len(view, nd.last_alt, zoom_x_px_per_beat),
                 );
-                let pitch_delta = compute_pitch_drag_delta(view, grid, dy);
+                let pitch_delta = compute_pitch_drag_delta(&nd, view, grid, dy);
                 (nd, beat_delta, pitch_delta)
             });
 
@@ -1022,20 +1029,13 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         let selected_set: HashSet<NoteId> = selected.iter().copied().collect();
         let drag_overlay_clone = drag_overlay.clone();
         let lyric_editing_for_draw = lyric_editing;
-        // M9 Phase 45f: drag overlay の Resize min_len は snap unit に合わせる。 下限は
-        // model の `MIN_NOTE_LEN_BEATS` (= `resize_notes` の clamp と同じ 1/16。 r.md #68 同件:
-        // ここが 0.05 だと snap off で「ゴーストより長く確定する」)。
-        // release 側 min_len と同じ計算で一貫性確保。 alt 真値は
-        // drag session の `last_alt` (overlay と release commit が必ず同一 unit で確定する)。
+        // M9 Phase 45f: drag overlay の Resize min_len は snap unit に合わせる。
+        // release 側 / 集合クランプと **同じ `drag_min_len`** を通す (r.md #64 の SSoT)。
+        // 下限そのものは model の `MIN_NOTE_LEN_BEATS` (r.md #68 同件、`drag_min_len` 参照)。
+        // alt 真値は drag session の `last_alt` (overlay と release commit が必ず同一 unit で確定する)。
         // overlay 不在時 (drag していない) は min_len 自体使われないので alt = false で適当に初期化。
         let drag_overlay_alt = drag_overlay.as_ref().is_some_and(|(nd, _, _)| nd.last_alt);
-        let drag_overlay_min_len: f64 = if view.snap.is_active(drag_overlay_alt) {
-            view.snap
-                .beat_unit(zoom_x_px_per_beat)
-                .map_or(MIN_NOTE_LEN, |u| u.max(MIN_NOTE_LEN))
-        } else {
-            MIN_NOTE_LEN
-        };
+        let drag_overlay_min_len: f64 = drag_min_len(view, drag_overlay_alt, zoom_x_px_per_beat);
         // (M14 Phase 64 / daw_01 #018) velocity drag preview: drag 中なら target_ids の bar を
         // current pointer.y → 絶対 velocity の値で描画 override。 None のときは note.velocity 通常描画。
         // velocity_drag は press 時に vel_area.h > 0 を gate してあるため vel_area.h > 0 が前提。
@@ -1342,7 +1342,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
 
         // ----- drag release → Move / Resize Edit 発行 -----
         // M9 Phase 60: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
-        // 同 delta 適用。 Resize の min_len は snap unit に合わせる (snap_unit < 0.05 なら 0.05)。
+        // 同 delta 適用。 Resize の min_len は snap unit に合わせる (下限は `drag_min_len` 参照)。
         // **alt は drag 中の最終 `nd.last_alt` を真値とする** — release frame の `pointer.modifiers.alt`
         // は OS event 順序 (ModifiersChanged が MouseInput(Released) より先に届く) によって false に
         // 化けることがあるため信用しない。 `last_alt` は continuation frame で更新され release frame
@@ -1356,20 +1356,13 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
             let raw = f64::from(dx) * beat_per_px;
             // 絶対位置 snap (overlay と一貫)。
+            let min_len = drag_min_len(view, release_alt, zoom_x_px_per_beat);
             let beat_delta =
-                compute_note_drag_beat_delta(&nd, raw, &view.snap, zoom_x_px_per_beat);
+                compute_note_drag_beat_delta(&nd, raw, &view.snap, zoom_x_px_per_beat, min_len);
             // pitch も overlay と同一 helper で確定する。 Fold mode では 1 行 =
             // 1 scale degree なので、 ここだけ半音換算 (dy × pitch_per_px) にすると
             // ghost で見た位置と別の pitch に commit してしまう。
-            let pitch_delta = compute_pitch_drag_delta(view, grid, dy);
-            // r.md #68 同件: overlay と同じ下限 (model の `MIN_NOTE_LEN_BEATS`)。
-            let min_len = if view.snap.is_active(release_alt) {
-                view.snap
-                    .beat_unit(zoom_x_px_per_beat)
-                    .map_or(MIN_NOTE_LEN, |u| u.max(MIN_NOTE_LEN))
-            } else {
-                MIN_NOTE_LEN
-            };
+            let pitch_delta = compute_pitch_drag_delta(&nd, view, grid, dy);
 
             match nd.kind {
                 NoteDragKind::Move => {
@@ -1661,6 +1654,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                         ("piano_roll_lyric", edit_id),
                         clipped,
                         &prefill,
+                        &TextInputStyle::default(),
                         // on_change は per-keystroke で呼ばれるが、ここでは何もしない
                         // (commit 検出で 1 度だけ SetLyrics 発行 = 1 undo)。
                         |_new_text| Edit::mutate(|_: &mut AppData| {}),
@@ -1744,6 +1738,16 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // 複数表示時のみ右側に凡例パネル (色 swatch / クリップ名 / 対象切替 / ロックトグル)。
         if let Some(legend_rect) = legend_rect {
             draw_legend(app, ui, legend_rect, &shown, target);
+        }
+
+        // r.md #67: note grid の表示範囲 (拍数, 半音数) を app へ mirror。 カーソルキーで
+        // 動かしたノートを画面内に追う処理 (handler 側) が「今どれだけ見えているか」 を知る
+        // ための唯一の口。 変化したフレームだけ Edit を発行 (毎フレーム push を避ける)。
+        let viewport_now = Some((view.len_beats, view.pitch_visible));
+        if viewport_now != app.ui_ephemeral.pianoroll_viewport {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.ui_ephemeral.pianoroll_viewport = viewport_now;
+            }));
         }
 
         // 歌詞 inline 編集中フラグを app に mirror。dispatch_shortcuts が piano_roll より前に走って
@@ -2040,12 +2044,9 @@ fn draw_legend(
         p.text_dim,
     );
     // 表示中クリップが乗っている **トラック** を初出順に列挙 (同じトラックの複数クリップは 1 行)。
-    let mut track_indices: Vec<u32> = Vec::new();
-    for &r in shown {
-        if !track_indices.contains(&r.track) {
-            track_indices.push(r.track);
-        }
-    }
+    // r.md #64: 列挙は `AppData::pianoroll_lock_rows_in` が SSoT — ロックの効力判定が読むのと
+    // 同じ 1 式なので、「ロックが効くのに行が出ない」 という不可視ロックが構造的に作れない。
+    let track_indices: Vec<u32> = AppData::pianoroll_lock_rows_in(shown);
     // 行は縦スクロール可能にする。 旧実装は viewport に入らない行を無言で break して
     // いたため、 6 トラック以上に跨るクリップを同時選択すると 6 行目以降が描画も
     // ヒットテストもされず、 そのトラックの対象切替 / L ロックが操作不能になっていた。

@@ -70,7 +70,7 @@ pub use widgets::scrubable_number::{
     ScrubableNumberStyle,
 };
 pub use widgets::button::ButtonTextAlign;
-pub use widgets::text_input::TextInputResponse;
+pub use widgets::text_input::{TextInputResponse, TextInputStyle};
 pub use widgets::toggle_button::{
     IndicatorButtonResponse, ToggleButtonResponse, ToggleButtonStyle,
 };

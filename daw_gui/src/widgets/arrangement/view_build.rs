@@ -277,7 +277,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         scroll_beat_raw,
         len_beats: view_len_beats(lanes_w, zoom),
         track_top: app.ui_prefs.arrange_track_top,
-        tracks_visible: ((area.h - RULER_H) / row_h).max(1.0),
+        // r.md #63: 分母は「行が実際に描かれる高さ」 = ruler と Arranger 帯を除いた lanes 高さ。
+        // ここは heavy cache キーにしか使わないが、 `area.h - RULER_H` のままだと同じ誤式の
+        // 3 つ目のコピーとして残り、 次に誰かが「lanes の高さ」 としてコピーする種になる。
+        tracks_visible: ((area.h - RULER_H - SECTION_LANE_H) / row_h).max(1.0),
         track_row_h: row_h,
         header_w: app.ui_prefs.arrange_header_w,
         ruler_h: RULER_H,

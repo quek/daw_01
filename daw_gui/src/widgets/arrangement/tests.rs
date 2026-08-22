@@ -281,6 +281,60 @@
         assert_eq!(tops, vec![0.0, 32.0]); // invisible lane = legacy と同じ
     }
 
+    /// r.md #63: 行レイアウト (`X` の全体表示 / `Z` の縦ズームが唯一の根拠にする) は
+    /// track 行と展開 lane 行を描画順に並べ、 `content_top` は prefix sum。
+    /// lane の可視条件は `visible_track_row_tops` (高さ合計) と同一でなければならない
+    /// — ここがズレると「行数は数えたが実際には描かれない」 で fit が外れる。
+    #[test]
+    fn arrangement_row_layout_lists_track_and_expanded_lane_rows() {
+        let view = test_view();
+        let lane = |id: u32, visible: bool, height_px: u16| ArrangementAutomationLane {
+            id,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible,
+            height_px,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        };
+        // t1: 展開 (可視 lane 60 + 不可視 lane は行にならない)、 t2: 畳んでいるので lane 無し、
+        // t3: per-track 行高 override 48。
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = false;
+        t1.automation_lanes = vec![lane(11, true, 60), lane(12, false, 40)];
+        let mut t2 = track(2, "t2", vec![]);
+        t2.automation_lanes_collapsed = true;
+        t2.automation_lanes = vec![lane(21, true, 70)];
+        let mut t3 = track(3, "t3", vec![]);
+        t3.row_h = Some(48);
+        let tracks = vec![t1, t2, t3];
+
+        let rows = arrangement_row_layout(&tracks, view.track_row_h);
+        let expect = |key, content_top: f32, height: f32| ArrangementRow { key, content_top, height };
+        assert_eq!(
+            rows,
+            vec![
+                expect(ArrangementRowKey::Track(1), 0.0, 32.0),
+                expect(
+                    ArrangementRowKey::Lane(common::model::AutomationLaneKey { track: 1, lane: 11 }),
+                    32.0,
+                    60.0,
+                ),
+                expect(ArrangementRowKey::Track(2), 92.0, 32.0),
+                expect(ArrangementRowKey::Track(3), 124.0, 48.0),
+            ],
+        );
+
+        // 行の高さ合計 == track 単位の prefix sum (= 描画 / hit-test が使う tops) と一致する。
+        let tops = make_tops(&tracks, test_lanes(), view);
+        assert_eq!(
+            rows.last().map(|r| r.content_top + r.height),
+            tops.last().copied(),
+        );
+    }
+
     #[test]
     fn clip_hit_returns_move_in_center() {
         let view = test_view();

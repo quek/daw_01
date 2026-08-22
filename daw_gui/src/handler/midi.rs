@@ -246,6 +246,11 @@ impl AppData {
         let Some(target) = self.selected_clip_ref() else {
             return;
         };
+        // r.md #64: ロック中トラックへはステップ入力でも書けない (鉛筆 / 貼り付けと同じ扱い)。
+        // MIDI **録音** (armed track への書込み) は piano roll の編集面ではないので対象外。
+        if self.reject_write_if_pianoroll_locked(target) {
+            return;
+        }
         let cursor = self.recording.step_cursor_beat;
         let step = self.recording.step_size_beats;
         let target_track_idx = target.track as usize;

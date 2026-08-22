@@ -752,6 +752,30 @@ pub use crate::widgets::select_modifier::SelectModifier;
 pub(crate) use crate::widgets::select_modifier::{RangeItem, range_block, range_ordered};
 
 
+/// r.md #63: arrangement が縦方向に積む「行」の識別子。
+///
+/// 行は master 行 / 可視 track 行 / 展開中の可視 automation lane 行の 3 種で、
+/// `Track` は master 行を `MASTER_TRACK_ID` で表す (widget が `visible_tracks[0]` に
+/// synthetic track として prepend するのと同じ扱い)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArrangementRowKey {
+    /// track 行 (master 行は `MASTER_TRACK_ID`)。
+    Track(u32),
+    /// 展開中の automation lane 行。
+    Lane(common::model::AutomationLaneKey),
+}
+
+/// r.md #63: widget がこのフレームにレイアウトした行 1 つ。
+///
+/// `content_top` は **content 空間** (= `ui_prefs.arrange_track_top` と同じ原点、
+/// 先頭行の上端が `0.0`) の行上端。 画面 y は `lanes.y - track_top + content_top`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrangementRow {
+    pub key: ArrangementRowKey,
+    pub content_top: f32,
+    pub height: f32,
+}
+
 /// `Ui::arrangement` の戻り値。
 #[derive(Clone, Debug)]
 pub struct ArrangementResponse {
@@ -777,6 +801,16 @@ pub struct ArrangementResponse {
     /// - 部分的にカリングされた clip は full rect を返す (clip_to_rect 結果そのまま)
     pub clip_rects: Vec<(ClipKey, Rect)>,
     pub ruler_rect: Rect,
+    /// r.md #63: Arranger (section) レーン帯の実 rect (ruler の直下、 track lanes の上)。
+    pub arranger_rect: Rect,
+    /// r.md #63: track lanes 領域の実 rect (ruler と Arranger 帯を除いた残り)。 描画 / hit-test の
+    /// scissor もこの rect なので、 **「lanes の高さ」 を式で再導出してはいけない** (`area.h - RULER_H`
+    /// のような再導出が Arranger 帯 18px を引き忘れ、 全体表示で最下段 track が画面下へはみ出していた)。
+    pub lanes_rect: Rect,
+    /// r.md #63: このフレームに縦へ積んだ行の一覧 (描画順、 **culling 前** = 画面外の行も含む)。
+    /// `X` の全体表示 / `Z` の縦ズームが「行がいくつあり、 どこから始まるか」 の唯一の根拠にする
+    /// (= モデルから可視 track / lane 集合を再導出しない)。
+    pub rows: Vec<ArrangementRow>,
     /// M10 Phase 46: drag 中の track id (`Some` なら header reorder drag セッションが進行中)。
     pub reordering: Option<u32>,
     /// M10 Phase 47b: drag 中の track id (`Some` なら header volume slider drag セッションが進行中)。
@@ -866,6 +900,9 @@ impl Default for ArrangementResponse {
             track_header_rects: Vec::new(),
             clip_rects: Vec::new(),
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            arranger_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            lanes_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            rows: Vec::new(),
             reordering: None,
             dragging_track_volume: None,
             automation_point_rects: Vec::new(),
@@ -1444,54 +1481,35 @@ pub fn effective_track_row_h(track: &ArrangementTrack, default_row_h: f32) -> f3
     track.row_h.map_or(default_row_h, f32::from)
 }
 
+/// r.md #63: track が **行として描く** automation lane を `(元 index, lane)` で列挙する。
+/// 「lane が行を占めるか」 の判定はここが唯一の定義で、 高さ合計 (`automation_lanes_total_h`)・
+/// 行レイアウト (`arrangement_row_layout`)・描画 / hit-test (`for_each_visible_lane`) が共有する。
+/// 条件を各所にコピーすると「合計高さは数えたが行は描かれない」 のような silent なズレを生む。
+pub fn visible_automation_lanes(
+    track: &ArrangementTrack,
+) -> impl Iterator<Item = (usize, &ArrangementAutomationLane)> {
+    let collapsed = track.automation_lanes_collapsed;
+    track
+        .automation_lanes
+        .iter()
+        .enumerate()
+        .filter(move |(_, l)| !collapsed && l.visible)
+}
+
 /// M14 Phase 63n-1 (#028): track の expanded 状態の visible automation lane 高さ合計 (px)。
 /// `collapsed` または lane なしで `0.0`。
 #[must_use]
 pub fn automation_lanes_total_h(track: &ArrangementTrack) -> f32 {
-    if track.automation_lanes_collapsed || track.automation_lanes.is_empty() {
-        return 0.0;
-    }
-    track
-        .automation_lanes
-        .iter()
-        .filter(|l| l.visible)
-        .map(|l| f32::from(l.height_px))
+    visible_automation_lanes(track)
+        .map(|(_, l)| f32::from(l.height_px))
         .sum()
 }
 
-/// M14 Phase 63n-10 (#034): master row の effective row body 高さ (px、 lane 部含まない)。
-/// `master.height_px_override.map_or(default_row_h, f32::from)` の thin wrapper。 通常 track の
-/// `effective_track_row_h` と同 idiom (daw_01 #034 §Q3 (A) で確定)。
-#[inline]
-#[must_use]
-pub fn effective_master_row_h(master: &ArrangementMasterRow, default_row_h: f32) -> f32 {
-    master.height_px_override.map_or(default_row_h, f32::from)
-}
-
-/// M14 Phase 63n-10 (#034): master row の expanded 状態の visible automation lane 高さ合計 (px)。
-/// `automation_lanes_collapsed` または lane なし / 全 invisible で `0.0`。 通常 track の
-/// `automation_lanes_total_h` と同 idiom (daw_01 #034 §Q2 (A) で確定 — visible 0 個でも disclosure
-/// state は触らず、 単に行が「effective_h だけ」 に潰れる)。
-#[must_use]
-pub fn master_row_lanes_total_h(master: &ArrangementMasterRow) -> f32 {
-    if master.automation_lanes_collapsed || master.automation_lanes.is_empty() {
-        return 0.0;
-    }
-    master
-        .automation_lanes
-        .iter()
-        .filter(|l| l.visible)
-        .map(|l| f32::from(l.height_px))
-        .sum()
-}
-
-/// M14 Phase 63n-10 (#034): master row の expanded 総高さ (= effective + lanes 合計)。
-/// 通常 track の `track_row_height` と同 idiom。 lanes_y の shift 量 / hit-test の y 範囲決定 / 縦
-/// scroll 計算で参照する SSoT。 `master = None` の caller は 0.0 を使う想定 (= `lanes.y` shift なし)。
-#[must_use]
-pub fn master_row_total_h(master: &ArrangementMasterRow, default_row_h: f32) -> f32 {
-    effective_master_row_h(master, default_row_h) + master_row_lanes_total_h(master)
-}
+// r.md #63: master 行専用の高さ helper (`effective_master_row_h` / `master_row_lanes_total_h` /
+// `master_row_total_h`) は撤去した。 master 行は `synthesize_master_track` で通常 `ArrangementTrack`
+// に変換してから `track_row_height` / `visible_automation_lanes` を通るので呼び出し元が 1 つも無く、
+// うち `master_row_lanes_total_h` は lane の可視条件の 3 つ目のコピーだった (= 誰かがそれを写して
+// 条件が枝分かれする罠)。 master 行の高さが要るときは synthetic track に対して通常 helper を使う。
 
 /// M14 Phase 63n-10 (#034): master row を synthetic `ArrangementTrack` に変換 (widget 内部の `visible_tracks[0]`
 /// として prepend する用)。 既存 hit-test / 描画 / row 高さ helper を **そのまま reuse** するための adapter で、

@@ -277,6 +277,7 @@ impl AppData {
                 recording_last_beat: std::collections::HashMap::new(),
                 last_sent_recording_lanes: std::collections::HashSet::new(),
                 preview_note: None,
+                nudge_audition: None,
                 midi_input_label: String::new(),
                 step_cursor_beat: 0.0,
                 step_size_beats: DEFAULT_NOTE_DURATION,
@@ -368,19 +369,20 @@ impl AppData {
                 home_toggle_at_first: false,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
-                arrange_primary_lane_content_top: None,
                 arrange_hover_content: None,
                 arrange_dragging_track_volume: None,
                 arrange_default_scrub_active: None,
                 arrange_hovered_automation_lane: None,
                 piano_roll_lyric_editing: false,
+                pianoroll_viewport: None,
                 audio_editor_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 inspector_body_h: 800.0,
                 inspector_device_panel_h: 0.0,
                 last_pianoroll_grid_size: (0.0, 0.0),
                 pending_pianoroll_fit: false,
-                last_arrange_canvas_size: (0.0, 0.0),
+                last_arrange_lanes_size: (0.0, 0.0),
+                last_arrange_rows: Vec::new(),
                 resource_panel_open: false,
                 undo_history_follow_pos: 0,
                 plugin_picker_entries,
@@ -1279,6 +1281,15 @@ impl AppData {
             AppEvent::TogglePianoRollTrackLock(track_id) => {
                 self.toggle_pianoroll_track_lock(track_id);
             }
+            AppEvent::NudgeSelectedNoteTime { step, steps } => {
+                self.nudge_selected_notes_time(step, steps);
+            }
+            AppEvent::NudgeSelectedNoteLength { step, steps } => {
+                self.nudge_selected_notes_length(step, steps);
+            }
+            AppEvent::NudgeSelectedNotePitch { octave, steps } => {
+                self.nudge_selected_notes_pitch(octave, steps);
+            }
             AppEvent::OpenPluginPicker => {
                 self.ui_ephemeral.plugin_picker_query.clear();
                 self.refresh_picker_visible();
@@ -1330,10 +1341,10 @@ impl AppData {
             AppEvent::SetArrangeTrackRowH(h) => {
                 // 上限は viewport 高に近いところまで広げる (1 トラックを画面いっぱいに
                 // 表示できるようにする)。 viewport 高はここでは未知なので大きめに取り、
-                // 実描画時は area.h と min を取って絶対に visible 数 0 にならない構造で
-                // 描画側 (`tracks_visible = ((area.h - RULER_H) / row_h).max(1.0)`) が
-                // 吸収する。
-                self.ui_prefs.arrange_track_row_h = h.clamp(16.0, 2000.0);
+                // 実描画時は lanes 高さと min を取って絶対に visible 数 0 にならない構造で
+                // 描画側 (`view_build` の `tracks_visible`) が吸収する。
+                self.ui_prefs.arrange_track_row_h =
+                    h.clamp(MIN_ARRANGE_ROW_H, MAX_ARRANGE_ROW_H);
             }
             AppEvent::SetArrangeHeaderW(w) => {
                 // track 名が読める下限と lanes を潰さない上限で clamp。 widget は
