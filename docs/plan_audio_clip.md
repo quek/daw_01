@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # WAV / Audio Clip 機能仕様 (Bitwig 流 + 共有コピー対応)
 
 ステータス: **Phase 1 完了** (2026-05-08)。 Phase 2 (編集機能拡張 + Audio Editor)

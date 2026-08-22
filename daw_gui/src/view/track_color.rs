@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! トラック / クリップの色 (`docs/plan_track_clip_color.md`)。
 //!
 //! model (`common`) は色値を `Option<[f32; 3]>` (RGB, 不透明) でしか持たない。

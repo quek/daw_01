@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # FIXME #29 実装プラン — トラック = 1 本の可視プラグイン列（port + 位置で役割決定）
 
 ユーザー要望: 「Scaler 2 は MIDI エフェクトにも楽器にもなる。Scaler 2 → Analog Lab V の順で刺したい」

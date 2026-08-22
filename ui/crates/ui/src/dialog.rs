@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M8 Phase 34: native file dialog (open / save)。
 //!
 //! `Ui::request_open_file_dialog(name, title, filters)` で frame 末尾に dialog を出す要求を積む。

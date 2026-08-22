@@ -1,13 +1,17 @@
 # REUSE Specification 3.3 — https://reuse.software/spec-3.3/
 #
-# 自作ファイルは各ファイル先頭の SPDX ヘッダが SSoT (scripts/add_spdx_headers.py が
-# 投入し、scripts/reuse_lint.py が検査する)。ここに書くのは **ヘッダを書けない / 書いては
-# いけないファイル** だけ:
+# **著作権 / ライセンス表示はここ 1 箇所で宣言する。ファイル先頭には書かない。**
 #
-#   - 第三者の著作物 (vendored ヘッダ、そこから生成した bindgen 出力)
-#     → GPL ヘッダを付けると「他人のコードを GPL と誤表示」する事故になる。
-#   - コメント構文を持たないファイル (JSON / バイナリ)。
-#   - ツールが再生成するファイル (Cargo.lock — cargo が書き戻すのでヘッダが消える)。
+# GPL-3.0 §4 が求めるのは「**各コピー**に適切な著作権表示を conspicuously and
+# appropriately publish する」ことで、この "each copy" は **プログラム 1 本ごと**であって
+# ファイルごとではない。ルートの LICENSE / README / NOTICE と、この宣言で満たされる。
+# per-file ヘッダは GNU の推奨 (gpl-howto) ではあるが要件ではないので置かない
+# (2026-08-22 に 580 ファイル分を撤去した)。
+#
+# 順序に意味がある: spec 3.3 は「同じ REUSE.toml 内で複数の [[annotations]] が同じ
+# ファイルに当たったら **最後にマッチしたもの** を使う」と定める。したがって
+# **全体への宣言を先頭に置き、第三者コードの個別宣言を後ろに置く**。逆にすると
+# vendored ファイルまで GPL と誤表示する。scripts/reuse_lint.py がこの順序を検査する。
 #
 # ルートの LICENSE / COPYING と LICENSES/ 配下は REUSE ツールの対象外 (spec の
 # Covered File 例外)。third_party/ 等 .gitignore 済みのものも対象外。
@@ -15,6 +19,12 @@ version = 1
 SPDX-PackageName = "daw_01"
 SPDX-PackageSupplier = "Tahara Yoshinori"
 SPDX-PackageDownloadLocation = "https://github.com/quek/daw_01"
+
+# --- 自作物すべて (以降の個別宣言が上書きする) ------------------------------
+[[annotations]]
+path = "**"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"
+SPDX-License-Identifier = "GPL-3.0-or-later"
 
 # --- ARA (Celemony) --------------------------------------------------------
 # vendor/ARA_API/** は upstream 無改変。src/bindings.rs はそのヘッダからの bindgen

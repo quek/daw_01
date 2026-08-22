@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! メトロノーム click の生成 (Phase 7 B3、engine.rs から独立 module 化 —
 //! `docs/plan_arch_refactor.md` §5)。monitoring 専用: live 再生と count-in
 //! preroll だけが呼び、offline export (`render_master_buffer`) は通さない。

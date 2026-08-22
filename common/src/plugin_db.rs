@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! CLAP plugin database.
 //!
 //! Scans system CLAP directories, enumerates every descriptor inside each

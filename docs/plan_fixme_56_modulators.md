@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_fixme_56_modulators.md — LFO / Random / MSEG / Steps モジュレーター (FIXME #56)
 
 > 「Bitwig みたいに LFO, ランダム, Mセグなどでの変調」(FIXME #56)。既存のエンベロープ

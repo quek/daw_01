@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # Image Overlay (PiP) 計画 — 静止画像を動画 preview に重ねる
 
 ステータス: **設計完了** (2026-05-26)、着手前。 grilling session 未実施

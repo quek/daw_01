@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 色ユーティリティ — WCAG relative luminance ベースの auto-contrast 判定。
 //!
 //! arrangement の clip / track 名 (#060 Phase 89) と piano_roll の鍵盤オクターブラベル

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #63: 全体表示 (`X` キー / Fit ボタン) が **Arranger 帯のぶん下へはみ出さない**
 //! ことの回帰テスト。
 //!

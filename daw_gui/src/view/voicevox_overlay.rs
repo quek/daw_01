@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! VOICEVOX の wav 合成 / 口パク生成の進行状態を見せる **非ブロック**
 //! overlay (画面上端中央)。`load_overlay` と同じ idiom (= modal でない、操作を妨げない)。
 //!

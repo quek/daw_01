@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # パラアウト (マルチ出力プラグインの個別出力ルーティング) 実装計画
 
 `docs/plan_routing_graph.md` PR4 の最後の未実装ピース。サイドチェイン (aux **入力**)

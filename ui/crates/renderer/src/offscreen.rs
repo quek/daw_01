@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `OffscreenRenderer` — wgpu surface を使わない render-to-texture + readback パス。
 //!
 //! 用途:

@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_vst3_params — VST3 パラメータ automation 一式
 
 作成: 2026-05-31 / status: 実装済み (実機 click-through 確認待ち)

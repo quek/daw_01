@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! examples/sample_editor — M5 Phase 16 動作確認サンプル。
 //!
 //! Phase 16 で実装した 3 機能を実用検証する:

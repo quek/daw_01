@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Background worker thread for video frame decode
 //! (`docs/plan_video.md` §3 P5).
 //!

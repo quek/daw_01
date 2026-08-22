@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `panel` ウィジェット — 背景塗り 1 行 helper (M9 Phase 45a)。
 //!
 //! 多くの view で同じ boilerplate (`heavy + cached + push_rect`) を書いていたのを

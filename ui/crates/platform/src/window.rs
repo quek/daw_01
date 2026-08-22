@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `WindowBackend` trait — winit / baseview を切り替えるための抽象。
 //!
 //! 上位層 (renderer, ui) はこの trait だけを介してウィンドウを扱う。

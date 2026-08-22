@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 範囲ラウドネス解析の進行状態とレポート (r.md #54)。
 //!
 //! 「どの範囲を測っているか」「走査中か」「最後の結果」を持つ session state。

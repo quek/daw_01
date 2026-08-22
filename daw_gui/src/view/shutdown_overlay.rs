@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #61: 「終了処理中…」オーバーレイ。
 //!
 //! 終了シーケンスは子プロセスに **プラグインを畳ませて exit するまで**

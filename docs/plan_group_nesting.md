@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_group_nesting — グループのグループ化で入れ子を保持する
 
 FIXME #13。「複数のグループトラックをグループ化すると元のグループが解除されて

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `checkbox` ウィジェット — bool toggle。click でチェック状態を反転する `Edit<M>` を発行。
 //!
 //! クリック判定は `button` と同じ armed-state モデル (`press_started_inside`) を使う。

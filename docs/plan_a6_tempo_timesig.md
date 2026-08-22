@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # A6: tempo / time_sig 変更 UI
 
 > 注: daw_01 の実装計画ファイルは通常 `F:/dev/daw_01/docs/plan_<feature>.md` に置く運用 (memory: "Plan files in docs/")。

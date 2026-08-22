@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `list_view` ウィジェット — `scroll_area` の上に薄く乗せた virtual list (M9 Phase 45d)。
 //!
 //! 設計:

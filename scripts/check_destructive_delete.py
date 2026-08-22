@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """PreToolUse hook (Bash | PowerShell): BLOCK a recursive/force delete whose target is a
 variable/env reference or a filesystem root -- a path whose runtime value the hook cannot
 verify, which is exactly how a wrong-tree wipe happens (2026-06-13: Remove-Item -Recurse

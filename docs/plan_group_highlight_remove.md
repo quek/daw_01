@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_group_highlight_remove — グループトラックの色ハイライトを撤去する
 
 FIXME #5。「グループトラックのハイライト表示をなくして他のトラックと同じように

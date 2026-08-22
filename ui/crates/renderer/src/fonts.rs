@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! フォント資産 ([`FontAssets`]) と、 インストール済みフォント family の列挙
 //! (M14 Phase 121 / daw_01 #096)。
 //!

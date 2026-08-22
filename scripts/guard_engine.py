@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """PreToolUse hook: GENERIC, DATA-DRIVEN guard engine (cross-platform, no PowerShell).
 
 Why this exists (the AHE gap it closes)

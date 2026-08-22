@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 # アーキテクチャ不変条件の機械検査 (docs/plan_arch_refactor.md §11、CLAUDE.md「アーキテクチャ不変条件」)。
 # 使い方: make arch-lint  /  bash scripts/arch_lint.sh
 # 既定は違反を列挙して exit 0 (開発中の進捗トラッカーを兼ねる)。

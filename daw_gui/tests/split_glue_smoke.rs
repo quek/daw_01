@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Phase 1 PR7 follow-up: Split / Glue の AppData-driven JS smoke test。
 //!
 //! flow:

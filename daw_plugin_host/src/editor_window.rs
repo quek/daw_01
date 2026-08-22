@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Plugin-host-owned Win32 top-level window that hosts a plugin's editor.
 //!
 //! Previously daw_gui (the GUI process) created the editor's

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! AppData ステートマシン系 integration test の統合バイナリ。
 //!
 //! 旧来は dirty_guard / pending_state_queue / group_track_lifecycle /

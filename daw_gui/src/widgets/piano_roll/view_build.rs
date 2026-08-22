@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! S4c Phase B-E: piano_roll widget の入力ビュー構築 (旧 `view/piano_roll_view.rs::draw`
 //! の view 構築部を widget 内へ移設)。
 //!

@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 .PHONY: help build run test test-rt clippy license-check clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
@@ -126,18 +123,17 @@ clippy:
 	cargo clippy --workspace -- -D warnings
 
 # ライセンス表示の機械検査 (r.md #60)。clippy / arch-lint と同格の常設ゲート。
-#   1. SPDX 式の評価器の自己検査 — ここが壊れると 4 が静かに false green になる
-#   2. REUSE Specification 3.3 適合 (全ファイルに著作権 + ライセンス表示があるか)
-#   3. SPDX ヘッダの取りこぼし (新規ファイルを足したら必ずここで気付く)
-#   4. 依存クレートが deny.toml の allow で満たせるか + THIRD-PARTY-NOTICES.md の鮮度
-# 1-4 は Python stdlib だけで動くので **どの環境でも必ず走る** (検査を skip して
+#   1. SPDX 式の評価器の自己検査 — ここが壊れると 3 が静かに false green になる
+#   2. REUSE Specification 3.3 適合 (REUSE.toml の一括宣言が全ファイルを覆っているか、
+#      一括宣言が先頭にあるか、第三者コードが個別宣言で覆われているか)
+#   3. 依存クレートが deny.toml の allow で満たせるか + THIRD-PARTY-NOTICES.md の鮮度
+# 1-3 は Python stdlib だけで動くので **どの環境でも必ず走る** (検査を skip して
 # 「緑に見えるが表示が壊れている」状態を作らない)。公式ツール (reuse / cargo-deny) は
 # 入っていれば追加で走らせる = より厳しい検査に上書きされることはあっても緩まない。
 license-check:
 	@[ -n "$(PYTHON)" ] || { echo "ERROR: python が見つかりません。make license-check PYTHON=/path/to/python3" >&2; exit 1; }
 	"$(PYTHON)" scripts/dep_licenses.py --self-test
 	"$(PYTHON)" scripts/reuse_lint.py
-	"$(PYTHON)" scripts/add_spdx_headers.py --check
 	"$(PYTHON)" scripts/dep_licenses.py --check
 	@if command -v reuse >/dev/null 2>&1; then \
 		echo "--- reuse lint ---"; reuse lint; \

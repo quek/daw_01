@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `toggle_button` ウィジェット — ON/OFF state を持つ矩形 button (M9 Phase 45b)。
 //!
 //! `checkbox` との違い:

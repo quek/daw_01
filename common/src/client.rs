@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 子プロセス側の pipe 接続 + handshake (`docs/plan_arch_refactor.md` §3)。
 //!
 //! channel は宛先別に型付けされる: daw_audio は `AudioEvent` を送り

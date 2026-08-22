@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #11: フェーダーを 0dB (unity) より上げても 0 に戻らない — トラック音量 /
 //! マスターゲインが +6dB (`MAX_TRACK_GAIN` = amp 2.0) まで保持され、 それ以上は
 //! 上限 clamp されることの headless 回帰。 旧実装は `clamp(0.0, 1.0)` で unity 超を

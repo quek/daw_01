@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // 「曲を開いて再生すると先頭 track しか鳴らない」の end-to-end 検証用スクリプト。
 //
 // GUI の File→Open と同じ経路 (loadSongFile) で実プロジェクトを開き、そのまま

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `Ui::automation_curve` (M5.5) が `Clone`/`PartialEq`/`Hash`/`Default` 不要の Model に
 //! 対してコンパイルすることを確認する。
 //!

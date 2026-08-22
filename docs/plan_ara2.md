@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # ARA2 ホスト実装プラン (r.md #5)
 
 VOICEVOX 歌声 DAW daw_01 に ARA2 (Audio Random Access 2, Celemony) のホスト側サポートを

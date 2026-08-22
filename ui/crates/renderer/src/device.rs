@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `Renderer` — wgpu のデバイス・キュー・サーフェス・パイプラインを束ねる入口。
 //!
 //! ライフタイム方針:

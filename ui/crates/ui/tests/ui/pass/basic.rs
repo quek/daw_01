@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 基本 API (label / button / fader / Edit / frame) が **`Clone` も `PartialEq` も
 //! `Hash` も `Default` も持たない Model 型** でコンパイルすることを確認する。
 //!

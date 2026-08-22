@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! VOICEVOX 音声 **合成** — `frame_synthesis` (sing) / `synthesis` (talk) HTTP + WAV decode。
 //!
 //! arch-refactor S5-2 で common::voicevox から分離した (合成は builtin plugin = plugin-host

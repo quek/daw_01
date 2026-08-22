@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_pianoroll_ruler
 
 > **座標系の決定は改訂 (2026-06-08)**: 本 plan の「`start_beat` / notes は

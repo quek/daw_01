@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `time_ruler` + `bar_beat_grid` widget — DAW で頻出する時間軸 UI (M7 Phase 27)。
 //!
 //! piano_roll / arrangement で個別実装していた grid + ruler 描画を library 化。

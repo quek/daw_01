@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #49: 「daw_01 の窓がアクティブか」の SSoT と、そこから導く省電力判定。
 //!
 //! アクティブ判定を 1 箇所に集めるのは、材料が **3 つの別々の経路**から届くため:

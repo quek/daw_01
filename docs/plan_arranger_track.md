@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: Arranger Track（曲のパート / セクション）— FIXME #53
 
 アレンジビューに「曲のパート（Intro / Aメロ / サビ …）」を表す **能動アレンジャー** を実装する。

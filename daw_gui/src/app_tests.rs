@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! app.rs から分割した unit test 群 (元は各 free fn / associated fn と同一
 //! module に居たので、 テスト対象を `crate::app` / `crate::app_types` へ再指定)。
 #![cfg(test)]

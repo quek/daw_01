@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Text overlay composite helpers (`docs/plan_text_overlay.md` §4 P3).
 //!
 //! Mirrors `image_compose` for `ClipContent::Text`. Walks the song

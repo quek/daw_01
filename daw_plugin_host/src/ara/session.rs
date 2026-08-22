@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Per-plug-in-instance ARA session: the orchestrator that ties the document
 //! controller, host model objects, and the bound plug-in extension together.
 //!

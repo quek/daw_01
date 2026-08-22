@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Audio-engine worker pool. Pairs 1:1 with the plugin host's worker
 //! pool: each audio worker `i` dispatches plugin work to plugin-host
 //! worker `i` via `SyncSlot[i]`.

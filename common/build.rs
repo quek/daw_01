@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `PROTOCOL_FINGERPRINT` の焼き込み (`docs/plan_arch_refactor.md` §3)。
 //!
 //! wire (named pipe の bincode / shmem の repr(C) レイアウト) を渡る型を定義

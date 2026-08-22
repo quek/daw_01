@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
 use std::sync::Mutex;

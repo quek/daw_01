@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! プラグイン DLL scan — CLAP/VST3 の descriptor 列挙 (`--scan-plugins` one-shot モード)。
 //!
 //! arch-refactor S5-3 で `common::plugin_db` から移設した。DLL 実ロード

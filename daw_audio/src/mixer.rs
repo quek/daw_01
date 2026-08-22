@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Per-track scratch buffers used by the audio worker.
 //!
 //! The audio engine's worker pool reuses one `TrackScratch` per track every

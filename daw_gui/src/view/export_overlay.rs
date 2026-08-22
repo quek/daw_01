@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Export 中の進捗オーバーレイ。
 //!
 //! 2 種類の export を 1 つの modal で見せる:

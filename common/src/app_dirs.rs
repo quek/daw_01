@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! daw_01 のper-user データディレクトリと、その下に永続化する全ファイルの
 //! **Single Source of Truth**。
 //!

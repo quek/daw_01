@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 (終了 / New /
 //! Open / Open Recent) をしようとしたときの保存確認ガードの回帰テスト。
 //!

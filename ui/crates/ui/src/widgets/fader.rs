@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `fader` ウィジェット — 垂直スライダ。
 //!
 //! `scale = None` のとき値範囲は `0.0..=1.0` (従来どおり)。

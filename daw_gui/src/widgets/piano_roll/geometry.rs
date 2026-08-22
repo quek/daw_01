@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! S4c Phase B-E: piano_roll widget の幾何 / hit-test / drag geometry helper 群。
 //! 型・session・`RowGeometry` は `use super::*` で親 (mod.rs) から継承する
 //! (privacy: 子モジュールは親の private item / struct field を参照できる)。

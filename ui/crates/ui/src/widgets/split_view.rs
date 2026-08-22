@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `split_view` widget — 縦/横分割で 2 つの pane を持つ (M7 Phase 26)。
 //!
 //! 中央の handle (6px) を drag で分割比率を調整。各 pane は `with_clip_rect` で overflow が切られる。

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Integration test: 楽器立て → 再生 → group 化 → group へ Bitcrush+Delay
 //! 追加 → Bitcrush 削除 → ungroup の一連シーケンスを通しで検証する。
 //!

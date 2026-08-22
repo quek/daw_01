@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // r.md #30: トラック複製 (独立 / リンク) の headless smoke test。
 // `daw_gui --script` で AppData を直接駆動し、 production の右クリック「複製」/
 // D・Alt+D と同じ AppEvent 経路 (`daw.duplicateTracks`) を通して結果を検証する。

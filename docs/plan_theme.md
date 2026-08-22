@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # r.md #48 — テーマ (ダーク / ライト / ユーザー追加)
 
 ## ゴール

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! S4b: arrangement widget を `AppData` 直結・`Edit<AppData>` 直発行に移設した後の
 //! interaction 回帰テスト (旧 `arr_*.rs` の mirror + EditRequest 記録方式を置換)。
 //!

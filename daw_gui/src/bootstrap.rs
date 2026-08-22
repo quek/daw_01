@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Subprocess + IPC + shmem bootstrap、 GUI mode と script mode で共通化。
 //!
 //! `bootstrap_subprocess()` は daw_audio / daw_plugin_host を spawn し、

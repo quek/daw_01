@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """WorktreeRemove hook: Windows のファイルロックで消し残った worktree dir を回収する。
 
 Claude Code が worktree を削除する (session 終了 / ExitWorktree / subagent 完了) とき、

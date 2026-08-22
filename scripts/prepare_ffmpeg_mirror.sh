@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
 #
 # ミラー release に上げる成果物を `dist/ffmpeg-mirror/` に用意する。
 # **このスクリプトはアップロードしない。** ファイルを揃えるところまで。

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Plugin picker (modal overlay)。`Ui::modal` + `Ui::list_view` で構築。
 //!
 //! root.rs から常時呼ばれる。app.ui_ephemeral.is_plugin_picker_open == true のときに

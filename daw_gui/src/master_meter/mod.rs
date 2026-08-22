@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! マスター出力の計測 (r.md #50)。
 //!
 //! daw_audio が共有メモリのリング (`common::scope_bridge`) へ書いたマスター

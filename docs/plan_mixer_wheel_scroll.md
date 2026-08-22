@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_mixer_wheel_scroll — ミキサーを縦ホイールで横スクロールする
 
 FIXME #12。「ミキサーをマウスホイールで横スクロールするようにしてください」。

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! User Model 型が `Clone`/`PartialEq`/`Hash`/`Default` を一切実装しなくても
 //! `daw-ui-core` の公開 API がコンパイル可能であることを `trybuild` で固定する。
 //!

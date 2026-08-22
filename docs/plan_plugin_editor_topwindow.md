@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: plugin editor を plugin-host プロセス所有のトップレベル窓へ移す (FIXME #31)
 
 ## 背景 / 根本原因 (一次情報で検証済み, 確度: 高)

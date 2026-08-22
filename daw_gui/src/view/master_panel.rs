@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #50: 画面右端に常駐するマスターパネル。
 //!
 //! Mixer 右端にあった MASTER ストリップをここへ移設し、アレンジでも Mixer でも

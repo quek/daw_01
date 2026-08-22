@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Send 宛先トラックピッカー (modal overlay)。`plugin_picker.rs` を踏襲した
 //! `Ui::modal` + `Ui::list_view` 構成。
 //!

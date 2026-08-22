@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 """Verification harness for the AHE guard layer (cross-platform, stdlib only).
 
 Runs the REAL guard scripts against hand-crafted positive/negative tool calls and

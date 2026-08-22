@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_modulation.md — 統合 sidechain + エンベロープフォロワー・モジュレーション
 
 > FIXME #54（キック追従の映像効果）の基盤。ただし**映像専用ではなく音声 param も同じ仕組みで

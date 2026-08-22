@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! handler::automation — instrument track 追加 + automation lane/point/clip の中核操作
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

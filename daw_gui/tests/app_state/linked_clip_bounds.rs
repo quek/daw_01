@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #44 の回帰テスト: **リンクしたクリップでも開始・終了は個別**。
 //!
 //! clip は共有 content への「窓」 (`Clip::content_offset_beats` +

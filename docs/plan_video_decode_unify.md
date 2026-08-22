@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: 動画デコードの libav 一本化 — Media Foundation 全撤去
 
 ## 背景 / 動機

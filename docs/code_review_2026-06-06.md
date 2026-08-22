@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # daw_01 全体コードレビュー (2026-06-06)
 
 手法: 20 ユニット (66,584 行) をレンズ別 (RT安全性/FFI/perf/correctness) に並列レビュー →

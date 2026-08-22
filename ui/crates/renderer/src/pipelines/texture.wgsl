@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // Instanced textured-quad shader (M14 Phase 71 / daw_01 #043, Phase 76 で rotation 拡張,
 // Phase 92 / daw_01 #064 で任意 pivot 拡張)。
 // 入力 instance: pos(left,top,w,h) / uv(uv_min.x, uv_min.y, uv_max.x, uv_max.y)

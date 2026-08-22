@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Phase 18 Example — `OffscreenRenderer` でプラグイン UI 埋め込み環境を模擬。
 //!
 //! - `EmbeddedHostWindow` は **外部 crate での `WindowBackend` 自前実装** の例。

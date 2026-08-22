@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Audio-side automation playback. Walks the song's automation lanes,
 //! evaluates curves at sample resolution, and fills the per-track
 //! `volume_per_sample` / `pan_per_sample` ramps for the buffer.

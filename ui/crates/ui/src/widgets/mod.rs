@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ウィジェット実装。
 //! M1: label / button。
 //! M2: waveform (波形表示、line strip パイプラインを使う)。

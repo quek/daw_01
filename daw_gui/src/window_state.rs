@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Persisted main window geometry — `%LOCALAPPDATA%\daw_01\window_state.json`。
 //! 起動時に位置 / サイズ / maximized を復元し、 終了時に最新値を保存する。
 

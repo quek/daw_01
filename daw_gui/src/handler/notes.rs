@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! handler::notes — note 編集 + scale + clip voice/talk param + lyric + note clipboard
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

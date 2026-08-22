@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! handler::audio_editor — Audio Editor の view + event 編集 + auto fade/crossfade
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

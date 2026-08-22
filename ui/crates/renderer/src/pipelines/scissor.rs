@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! float の clip 矩形 → 整数 scissor 矩形への **唯一の** 変換 (r.md #53)。
 //!
 //! GPU の scissor は整数ピクセル単位なので、 論理座標 (float) の clip 矩形は必ずどこかで

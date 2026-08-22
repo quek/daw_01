@@ -8,11 +8,6 @@ description: |
 allowed-tools: Read, Grep, Glob, Bash, PowerShell
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # daw_01 実機検証ワークフロー
 
 `cargo test` で拾えない GUI / オーディオ / プラグイン GUI / IPC 挙動を、実際に daw_gui を

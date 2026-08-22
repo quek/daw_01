@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! wgpu パイプライン群 + run dispatch 共通ヘルパ。
 //!
 //! M1: rect (instanced 角丸矩形), glyph (テキスト)。

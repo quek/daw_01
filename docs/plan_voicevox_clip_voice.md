@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: VOICEVOX シンガー/スタイルを「クリップ単位」で選ぶ (FIXME #36)
 
 ## 目的

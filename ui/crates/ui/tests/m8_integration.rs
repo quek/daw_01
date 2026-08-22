@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M8 Integration Tests
 //!
 //! Phase 30-34 の機能を `UiHost::frame` 経由で end-to-end に検証する:

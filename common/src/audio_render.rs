@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Audio rendering の純粋関数 helper (Phase 2 PR-A)。
 //!
 //! `daw_audio::audio_clip_renderer` (live audio thread の per-buffer mix

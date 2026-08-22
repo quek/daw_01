@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `tab_view` widget — タブで切り替え可能な複数 view (M7 Phase 26)。
 //!
 //! M9 P0-2: `tab_view_with_state(id, rect, &mut usize, ...)` を追加し、外部から

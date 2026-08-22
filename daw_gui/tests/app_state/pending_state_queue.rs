@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `pending_state_queue` のシリアライズを test で固定する。
 //!
 //! Risk B (plan_undo_reconcile_polish.md):

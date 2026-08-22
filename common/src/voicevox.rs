@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! VOICEVOX — HTTP を持たない共有部分 (config const / Phoneme 型 / sing query builder /
 //! urlencoding / 歌詞のモーラ分割)。
 //!

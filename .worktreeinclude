@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-# SPDX-License-Identifier: GPL-3.0-or-later
-
 # Claude Code が新しい worktree (--worktree / EnterWorktree / subagent / desktop 並列) を
 # 作るとき、main checkout から「gitignore されているファイル」を自動コピーする設定。
 # .gitignore 構文で書き、gitignore されていて かつ ここに match したものだけがコピーされる。

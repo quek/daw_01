@@ -8,11 +8,6 @@ description: |
 allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(cargo run *), Bash(cargo test *)
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # UI デバッグワークフロー (gui_01)
 
 GUI のイベント (クリック / ドラッグ / キー / focus / IME) が動作不明なとき、どの層で

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #60: ヘルプ > バージョン情報 (About) の **visual regression**。
 //!
 //! この画面は GPLv3 §0 の Appropriate Legal Notices を満たすための法的な表示面なので、

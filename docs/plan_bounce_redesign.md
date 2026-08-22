@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan: Bounce In Place / Bounce (with FX) 再設計 (FIXME #42)
 
 ## ゴール

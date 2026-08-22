@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // headless export-range "head bleed" harness.
 //   --arg play=1|0    roll the transport past bar 3.1 before exporting
 //                     (reproduces a synth holding a LIVE voice). default 1.

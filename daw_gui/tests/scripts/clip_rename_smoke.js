@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // clip rename smoke: dispatchRenameClip の commit ロジックを検証。
 // `daw_gui --script` で headless 実行。 exit code 0 で pass。
 //

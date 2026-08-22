@@ -10,11 +10,6 @@ description: |
 allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(./target/debug/*)
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # プラグイン GUI デバッグワークフロー
 
 daw_plugin_host のプラグイン GUI が動かないとき、どの層で止まっているかを切り分ける。

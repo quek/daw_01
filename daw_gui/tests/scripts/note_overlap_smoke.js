@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // MIDI ノート非重なりの AppData-driven JS smoke test。
 // `daw_gui --script` で headless 実行。exit code 0 で pass。
 //

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! テーマ — 汎用 UI クローム + 汎用 widget パレットの **Single Source of Truth**。
 //!
 //! renderer は `Color` 型と演算のみを持ち、意味を持つ色トークンはここ (ui-core) に置く。

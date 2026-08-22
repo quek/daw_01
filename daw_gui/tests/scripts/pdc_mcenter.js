@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // PDC integration test: 実 VST3 (MCenter) をロードして 2 track 間の
 // 位相揃いを WAV 出力で検証する。 daw_gui --script で headless 実行。
 //

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! ヘルプ > バージョン情報 (About) オーバーレイ (r.md #60)。
 //!
 //! GPLv3 §0 の "Appropriate Legal Notices" は、対話的 UI に

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `TextureStore` — `TextureHandle` ↔ `wgpu::Texture` + `BindGroup` の管理 (M14 Phase 71 / daw_01 #043)。
 //!
 //! - **Renderer-local**: `Renderer<W>` / `OffscreenRenderer` 各 instance が独自の Store を持つ

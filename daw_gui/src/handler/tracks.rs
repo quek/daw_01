@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! handler::tracks — track lifecycle (add/delete/copy/paste/reorder/rename/ensure)
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。

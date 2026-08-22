@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Builtin plugin (`PluginFormat::Builtin`) 用の per-note metadata。
 //!
 //! 外部 CLAP / VST3 plugin の規格には「note ごとの追加情報」 (= 歌詞、

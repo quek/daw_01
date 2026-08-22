@@ -8,11 +8,6 @@ argument-hint: "[実装したい機能の説明]"
 allowed-tools: Read, Grep, Glob, Edit, Write, Bash(cargo test *), Bash(cargo build *), Bash(cargo clippy *), Bash(cargo run *), Bash(git add *), Bash(git commit *), Bash(git status *), Bash(git diff *), Agent, Skill, Workflow
 ---
 
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # 機能実装ワークフロー (daw_01)
 
 $ARGUMENTS を実装する。

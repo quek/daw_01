@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_pakupaku — 口パク (lip-sync) 画像自動生成
 
 VOICEVOX の phoneme タイミングから、立ち絵の口画像を歌唱に合わせて

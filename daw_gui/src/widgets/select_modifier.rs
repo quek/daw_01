@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 選択面 (クリップ / ノート / オートメーション / トラック / セクション / オーディオイベント)
 //! に共通する **修飾キー付き click の選択遷移** を 1 箇所に集約する (`docs/plan_selection_modifiers.md`)。
 //!

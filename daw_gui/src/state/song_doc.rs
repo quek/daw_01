@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! S3b-1: Song 文書 (SongDoc) — Song 編集の**単一チョークポイント**。
 //!
 //! `song` field は private。 `&mut Song` を得る手段は [`SongDoc::edit`] のみで、

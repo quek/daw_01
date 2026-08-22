@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 入力状態 — `AppEvent` を蓄積してフレーム毎に Ui に渡す形にする。
 
 use std::path::PathBuf;

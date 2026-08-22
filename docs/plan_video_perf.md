@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_video_perf.md — Preview window 30fps 達成計画 (zero-copy GPU pipeline)
 
 related: [plan_video.md](plan_video.md)、 [gui_01_conversation.md #045](gui_01_conversation.md)

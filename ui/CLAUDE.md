@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # daw-ui (旧 gui_01) — daw_01/ui/
 
 Rust 製・モデルを Clone しない immediate-mode GUI ライブラリ。GUI のみを扱い、audio / IPC には

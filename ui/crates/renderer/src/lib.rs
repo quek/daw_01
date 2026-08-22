@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! レンダラ — wgpu の上に組む自前パイプライン群。
 //!
 //! 提供:

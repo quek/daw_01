@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! 口パク (lip-sync) 生成ロジック。docs/plan_pakupaku.md §6。
 //!
 //! VOICEVOX の phoneme 列 (各 `frame_length` 付き) を、口形状画像の `ImageEvent`

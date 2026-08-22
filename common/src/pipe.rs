@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 use crate::protocol::ChildKind;
 
 pub fn pipe_path(parent_pid: u32, kind: ChildKind) -> String {

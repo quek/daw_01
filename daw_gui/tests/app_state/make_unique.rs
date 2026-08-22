@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! r.md #14 の回帰テスト: Make Unique が **選択した全 clip** を独立化する。
 //!
 //! 右クリックした clip が現在の複数選択に含まれるなら選択全体を、 含まれない

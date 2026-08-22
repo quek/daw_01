@@ -10,12 +10,6 @@ description: |
 argument-hint: "[調査対象の機能名]"
 allowed-tools: Bash(git clone *), Bash(git pull *), Read, Grep, Glob, WebSearch, WebFetch, Agent
 ---
-
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # 類似プロダクト & API リファレンス調査
 
 $ARGUMENTS に関する調査を行い、daw_01 での実装方針を立てるためのレポートを出力する。

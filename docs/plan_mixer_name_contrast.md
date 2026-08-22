@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-SPDX-License-Identifier: GPL-3.0-or-later
--->
-
 # plan_mixer_name_contrast — ミキサーのトラック名のコントラストを上げる
 
 FIXME #14。「ミキサーのトラック名のコントラストが低くて読みにくいです」。

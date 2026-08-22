@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! `button` ウィジェット — クリックされると `Edit<M>` を発行する。
 //!
 //! クリック判定: **press 開始位置を記憶**するモデル。

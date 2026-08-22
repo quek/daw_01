@@ -1,8 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Host-side `IParameterChanges` / `IParamValueQueue` for feeding parameter
 //! automation into a VST3 plugin's `process()` (`ProcessData.
 //! inputParameterChanges`).

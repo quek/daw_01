@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! M14 Phase 58: text_input の cursor / selection x 位置を **glyphon と同じレイアウト** で
 //! pixel-accurate に計算するための shape ユーティリティ。
 //!

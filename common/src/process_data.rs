@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Shared-memory layout for a single plugin instance's `process()` call.
 //!
 //! `daw_audio` writes the inputs (frames, events, buffer_in), signals the

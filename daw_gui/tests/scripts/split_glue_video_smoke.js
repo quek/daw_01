@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 // docs/plan_video.md P6.4: Video clip の Split / Glue smoke test。
 // 既存 split_glue_smoke.js の audio 版を踏襲、 ClipContent::Video +
 // VideoEvent + Song.video_sources で同等の flow を流す。
