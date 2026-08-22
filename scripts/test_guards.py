@@ -401,6 +401,39 @@ CASES = [
      {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md",
       "content": "## 要望: track 名の自動コントラスト 2026-06-15\n"},
      0, {"gui-conv-entry-format"}, set()),
+    # ---- 「起動しない」つもりの検証コマンドが実際には起動する経路 ----
+    ("testrun/pos-tests", "Bash", {"command": "cargo test -p daw_gui --tests"}, 2,
+     {"no-bulk-test-run"}, set()),
+    ("testrun/pos-all-targets", "Bash", {"command": "cargo test --workspace --all-targets"}, 2,
+     {"no-bulk-test-run"}, set()),
+    ("testrun/pos-bare-daw_gui", "Bash", {"command": "cargo test -p daw_gui"}, 2,
+     {"no-bulk-test-run"}, set()),
+    ("testrun/pos-launching-target", "Bash",
+     {"command": "cargo test -p daw_gui --features daw_gui/script --test clip_rename_smoke"}, 2,
+     {"no-app-launching-test-target"}, set()),
+    # 名前に smoke が付かないのに起動する = 名前判定では捕まらない 2 件
+    ("testrun/pos-vst3-no-smoke-in-name", "Bash",
+     {"command": "cargo test -p daw_gui --test pdc_real_vst3"}, 2,
+     {"no-app-launching-test-target"}, set()),
+    ("testrun/pos-sidechain-vst3", "Bash",
+     {"command": "cargo test -p daw_gui --test sidechain_real_vst3"}, 2,
+     {"no-app-launching-test-target"}, set()),
+    ("testrun/neg-named-safe-targets", "Bash",
+     {"command": "cargo test -p daw_gui --test arr_widget --test pr_widget"}, 0,
+     set(), {"no-bulk-test-run", "no-app-launching-test-target"}),
+    ("testrun/neg-check-all-targets", "Bash", {"command": "cargo check --workspace --all-targets"},
+     0, set(), {"no-bulk-test-run"}),
+    ("testrun/neg-clippy-all-targets", "Bash",
+     {"command": "cargo clippy --workspace --all-targets -- -D warnings"}, 0,
+     set(), {"no-bulk-test-run"}),
+    ("testrun/neg-other-crate", "Bash", {"command": "cargo test -p common"}, 0,
+     set(), {"no-bulk-test-run"}),
+    ("testrun/neg-other-crate-named", "Bash",
+     {"command": "cargo test -p common --test model_roundtrip"}, 0,
+     set(), {"no-bulk-test-run", "no-app-launching-test-target"}),
+    ("testrun/neg-mention-in-commit-msg", "Bash",
+     {"command": "git commit -m 'chore: cargo test --all-targets をやめる'"}, 0,
+     set(), {"no-bulk-test-run"}),
     # ---- architecture invariants (docs/plan_arch_refactor.md:469) ----
     # Every negative below is a REAL line taken from the current tree
     # (`git grep -n untagged/push_undo_snapshot/MainToChild -- '*.rs'`). The removal of
@@ -796,9 +829,62 @@ def check_cd_guard():
             ok("cdguard:%s" % label)
 
 
+# --------------------------------------- app-launching test targets stay in sync
+def check_launching_targets_list():
+    """The registry enumerates the daw_gui test targets that spawn the app. That list
+    must be DERIVED from the tree, never guessed from names: pdc_real_vst3 and
+    sidechain_real_vst3 launch without "smoke" in the name, and arr_widget / pr_widget /
+    font_picker do not launch at all. The criterion is whether the target builds
+    CARGO_BIN_EXE_daw_gui. Regenerate it here so a new target cannot silently escape the
+    guard (a hand-written list is exactly how the first version of this got it wrong)."""
+    tests_dir = os.path.join(ahe_paths.REPO_ROOT, "daw_gui", "tests")
+    if not os.path.isdir(tests_dir):
+        bad("launchtargets:tests-dir", "daw_gui/tests が無い: %s" % tests_dir)
+        return
+    actual = set()
+    for name in os.listdir(tests_dir):
+        if not name.endswith(".rs"):
+            continue
+        try:
+            with open(os.path.join(tests_dir, name), "r", encoding="utf-8", errors="replace") as fh:
+                if "CARGO_BIN_EXE_daw_gui" in fh.read():
+                    actual.add(name[:-3])
+        except Exception as e:
+            bad("launchtargets:read(%s)" % name, str(e))
+            return
+
+    declared = set()
+    with open(GUARDS_SRC, "r", encoding="utf-8") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            try:
+                r = json.loads(s)
+            except Exception:
+                continue
+            if r.get("id") != "no-app-launching-test-target":
+                continue
+            pat = " ".join(r.get("all") or [])
+            m = re.search(r"--test\\s\+\(\?:([^)]*)\)", pat)
+            if m:
+                declared = {t for t in m.group(1).split("|") if t}
+
+    if not declared:
+        bad("launchtargets:rule-present", "no-app-launching-test-target が読めない")
+    elif declared == actual:
+        ok("launchtargets:in-sync(%d)" % len(actual))
+    else:
+        bad("launchtargets:in-sync",
+            "レジストリと実際の target がズレています。"
+            "抜け=%s / 余分=%s (基準: grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs)"
+            % (sorted(actual - declared), sorted(declared - actual)))
+
+
 def main():
     check_paths()
     check_registry()
+    check_launching_targets_list()
     check_engine()
     check_engine_robustness()
     check_registry_defect_is_reported()

@@ -48,6 +48,22 @@
 # 2 つのガードが互いの回避策を禁じる形になるので、これは nudge に留める。
 {"id":"no-duplicate-app-launch","source":"feedback_no_duplicate_app_launch","tool":["Bash"],"field":"command_code","all":["(?:cargo\\s+run\\s[^|]*-p\\s+daw_gui|(?:\\./)?target[\\\\/]debug[\\\\/]daw_gui(?:\\.exe)?|\\bmake\\s+run\\b)"],"none":["(?i)\\btasklist\\b","(?i)\\bGet-Process\\b","--smoke-test"],"action":"warn","escalate":false,"msg":"起動前に既存インスタンスを確認すること。daw_gui を二重起動すると 2 つが同じ shared memory + セマフォを奪い合い、後発ウィンドウが入力を受け付けなくなる。起動中ならユーザーに閉じてもらう。"}
 
+# 「起動しない」つもりの検証コマンドが実際には起動する経路 (2026-08-22 に並列セッションが踏んだ)。
+# daw_gui/tests/*_smoke.rs 等は CARGO_BIN_EXE_daw_gui を `--script` で subprocess 起動し、
+# それが daw_audio / daw_plugin_host まで spawn する。`--script` 自体は headless なので窓は
+# 出ないが、IPC を張るのでユーザーが実機確認中だと二重起動の当たり判定に入る。
+# **`cargo check --all-targets` / `cargo clippy --all-targets` はビルドするだけなので対象外** —
+# だから `cargo test` を all に入れて区別している。
+{"id":"no-bulk-test-run","source":"feedback_cargo_tests_launches_app","tool":["Bash"],"field":"command_code","all":["\\bcargo\\s+test\\b[^\\n]*(?:--all-targets\\b|--tests\\b|--workspace\\b|-p\\s+daw_gui\\b)"],"none":["--test\\s"],"action":"block","msg":"daw_gui を対象にした一括テスト実行は、script モードの smoke test 経由で daw_gui (と daw_audio / daw_plugin_host) を暗黙に起動する。子プロセスを起動しない target を名指しで回すこと: cargo test -p daw_gui --test arr_widget --test pr_widget。ビルドだけなら cargo check --all-targets を使う。"}
+# **名前で判定しないこと。** 判定基準は `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。
+# pdc_real_vst3 / sidechain_real_vst3 は名前に smoke が付かないのに起動し、逆に
+# arr_widget / pr_widget / font_picker / plugin_picker_cursor / mixer_pan_readout_visual は
+# 起動しない。名前ベースの網は「今はたまたま一致する」だけで、target が増えた瞬間に破れる。
+# 下の一覧はその基準から機械的に生成したもの (2026-08-22 実測、11 件)。
+# **scripts/test_guards.py の check_launching_targets_list() が毎回リポジトリから再生成して
+# 突き合わせる**ので、target が増減したらテストが落ちてここを直すことになる。
+{"id":"no-app-launching-test-target","source":"feedback_cargo_tests_launches_app","tool":["Bash"],"field":"command_code","all":["\\bcargo\\s+test\\b[^\\n]*--test\\s+(?:clip_label_display_smoke|clip_rename_smoke|device_chain_smoke|loudness_analysis_smoke|note_overlap_smoke|pdc_real_vst3|scale_smoke|sidechain_real_vst3|split_glue_smoke|split_glue_video_smoke|track_duplicate_smoke)\\b"],"action":"block","msg":"この target は CARGO_BIN_EXE_daw_gui を `--script` で起動する = daw_gui と daw_audio / daw_plugin_host が立ち上がり audio device を開く。--script は窓を出さず single-instance gate も素通りするので、ユーザーが実機確認中でも気付かれずに競合する。回す前に許可を得ること。"}
+
 # ---------------------------------------------------------------- worktree
 {"id":"worktree-path-discipline","source":"feedback_worktree_path_discipline","tool":["Edit","Write","MultiEdit"],"field":"worktree_outside","all":["."],"action":"block","msg":"worktree セッションから worktree 外 (main checkout / 別 worktree) の絶対パスを書こうとしている。編集が別ブランチの作業ツリーに入り、並行セッションと衝突する。パスは作業ディレクトリ相対か worktree 絶対パスにすること。"}
 {"id":"no-force-worktree-remove","source":"feedback_no_auto_worktree_delete","tool":["Bash"],"field":"command_code","all":["(?:\\bgit\\s+worktree\\s+(?:remove\\b[^\\n]*?(?:--force|\\s-f\\b)|prune\\b)|cleanup_worktree\\.sh[^\\n]*--force)"],"action":"warn","escalate":false,"msg":"git worktree remove --force は、ロックで dir を消せなくても先に登録解除するので孤立 dir を残す。並行 agent の worktree を壊した実績がある (2026-06-15)。削除は明示的・対象限定で、掴まれていないことを確認してから。"}
