@@ -2201,7 +2201,7 @@
     #[test]
     fn fold_arrangement_clip_hash_changes_on_gain_db() {
         let audio_a = ClipViewAudioEdit { gain_db: 0.0 };
-        let audio_b = ClipViewAudioEdit { gain_db: 3.0, ..audio_a };
+        let audio_b = ClipViewAudioEdit { gain_db: 3.0 };
         let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
         let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
         assert_ne!(

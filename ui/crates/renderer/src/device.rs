@@ -1108,10 +1108,15 @@ mod tests {
 
         // 回数が足りない (= 一瞬の blip) では昇格しない。
         assert!(!surface_failure_escalates(count - 1, enough));
-        assert!(!surface_failure_escalates(1, Duration::from_secs(60)));
+        assert!(!surface_failure_escalates(1, Duration::from_mins(1)));
 
         // 時間が足りない (= 高フレームレートで一気に数が伸びただけ) では昇格しない。
-        assert!(!surface_failure_escalates(count, enough - Duration::from_millis(1)));
+        // `saturating_sub`: `enough` が 1ms 未満に変わっても panic ではなく
+        // `ZERO` になる (閾値の定義が変わったときテストが落ちる先を assert に寄せる)。
+        assert!(!surface_failure_escalates(
+            count,
+            enough.saturating_sub(Duration::from_millis(1))
+        ));
         assert!(!surface_failure_escalates(1000, Duration::ZERO));
 
         // モニタ切替 / 解像度変更のような正当な過渡状態 (~1 秒) を巻き込まない。

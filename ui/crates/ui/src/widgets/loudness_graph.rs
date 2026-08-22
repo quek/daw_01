@@ -402,7 +402,8 @@ mod tests {
         let cols = to_columns(&[f32::NEG_INFINITY, -10.0], 4);
         assert!(cols[0].is_infinite());
         assert!(cols[1].is_infinite());
-        assert_eq!(cols[2], -10.0);
+        // 入力値をそのまま運ぶ列なので厳密一致で見る (平均や補間が混ざったら落ちてほしい)。
+        assert_eq!(cols[2].to_bits(), (-10.0f32).to_bits());
     }
 
     #[test]

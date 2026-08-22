@@ -1787,8 +1787,10 @@ mod tests {
     fn master_gain_round_trips_and_defaults_to_unity_for_old_files() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("gain.daw");
-        let mut song = Song::default();
-        song.master_gain = 0.5;
+        let song = Song {
+            master_gain: 0.5,
+            ..Default::default()
+        };
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap().master_gain, 0.5);
 

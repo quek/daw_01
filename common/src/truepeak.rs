@@ -316,7 +316,7 @@ mod tests {
     fn the_filter_fill_transient_never_overreads_nor_loses_the_sample_peak() {
         let mut m = TruePeakMeter::new(48_000);
         // いきなり 1.0 の DC を入れる = 無音からの段差 (過渡の最悪ケース)。
-        m.process(&vec![[1.0, 1.0]; TAPS]);
+        m.process(&[[1.0, 1.0]; TAPS]);
         let db = m.max_dbtp();
         assert!(db <= 1e-4, "充填の過渡で過大に読んでいる: {db} dBTP");
         assert!(db >= -1e-4, "サンプルピーク (0 dBFS) を下回っている: {db} dBTP");

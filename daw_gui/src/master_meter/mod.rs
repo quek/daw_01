@@ -754,9 +754,10 @@ mod tests {
         let after_300ms = a.snapshot().vu[0];
         assert!(peak_10ms > 0.9, "peak should be instant, got {peak_10ms}");
         assert!(after_10ms < after_300ms * 0.5, "VU rose too fast: {after_10ms} -> {after_300ms}");
-        // snapshot の vu は**線形振幅** (peak と同じ次元) なので、
-        // 平均二乗 0.5 の 99% = sqrt(0.495) ≒ 0.7036 が期待値。
-        let expected = 0.7071_f32;
+        // snapshot の vu は**線形振幅** (peak と同じ次元) なので、平均二乗 0.5 の
+        // 平方根 = 1/sqrt(2) が定常値。300ms では 99% までしか寄っていない
+        // (sqrt(0.495) ≒ 0.7036) が、下の 3% の許容に収まる。
+        let expected = std::f32::consts::FRAC_1_SQRT_2;
         assert!(
             (after_300ms - expected).abs() / expected < 0.03,
             "VU at 300ms = {after_300ms}, expected ~{expected}"

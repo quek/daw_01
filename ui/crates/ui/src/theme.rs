@@ -574,7 +574,9 @@ mod tests {
         );
         // 色相 (緑が最大チャンネル) は保つ = カテゴリ識別性が失われない。
         assert!(out.g > out.r && out.g > out.b, "色相を保つ: {out:?}");
-        assert!(out.a == pastel.a, "alpha は保つ");
+        // alpha は計算せず**そのまま複製する**契約なので、厳密一致で確かめる
+        // (許容誤差で比べると「わずかに変えている」実装を見逃す)。
+        assert_eq!(out.a.to_bits(), pastel.a.to_bits(), "alpha は保つ");
     }
 
     #[test]

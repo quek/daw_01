@@ -52,12 +52,13 @@ fn add_clip(app: &mut AppData, track_id: u32) -> u32 {
             .find(|t| t.id == track_id)
             .expect("track exists");
         let clip_id = track.clips.iter().map(|c| c.id + 1).max().unwrap_or(1);
-        let mut clip = Clip::default();
-        clip.id = clip_id;
-        clip.start_beat = 0.0;
-        clip.length_beats = 4.0;
-        clip.content_id = cid;
-        track.clips.push(clip);
+        track.clips.push(Clip {
+            id: clip_id,
+            start_beat: 0.0,
+            length_beats: 4.0,
+            content_id: cid,
+            ..Default::default()
+        });
         clip_id
     })
     .expect("edit_song")

@@ -148,8 +148,13 @@ test-nolaunch: test-rt
 test-rt:
 	cargo test -p daw_audio --features rt-assert
 
+# `--all-targets` = lib / bin に加えて **test / bench / example** も lint する。
+# これが無いと `#[cfg(test)]` がコンパイルされず、テストコードの lint が
+# ゲートを素通りする (2026-08-22 に発覚。実際 11 件が溜まっていた)。
+# ビルドはするが**実行はしない**ので、daw_gui を起動する test target を持つ
+# crate でもアプリは立ち上がらない。
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # ライセンス表示の機械検査 (r.md #60)。clippy / arch-lint と同格の常設ゲート。
 #   1. SPDX 式の評価器の自己検査 — ここが壊れると 3 が静かに false green になる

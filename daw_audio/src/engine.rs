@@ -1461,6 +1461,9 @@ mod bundle_install_tests {
     use crate::graph::compile_schedule;
     use common::model::{Song, Track};
 
+    // `Track { id, ..Default::default() }` は E0451 (private field) で書けない。
+    // clippy はそれを知らないので、ここだけ抑制する。
+    #[allow(clippy::field_reassign_with_default)]
     fn track(id: u32) -> Track {
         // Track の legacy migration fields は common に pub(crate) で閉じて
         // いるため、 default + mutate で構築する (E0451 回避)。

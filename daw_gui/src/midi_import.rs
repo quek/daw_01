@@ -1254,12 +1254,13 @@ mod tests {
     /// 選ばれる。伴奏が拍頭ぴったりでも、歌詞と 1:1 に対応する方を選ぶ。
     #[test]
     fn humanize_されたメロディが歌のパートに選ばれる() {
-        let mut events = vec![];
         // ch1 = ベース: 2 分音符 2 個 (拍頭ぴったり)。
-        events.push(note_on(0, 1, 40, 100));
-        events.push(note_off(960, 1, 40));
-        events.push(note_on(0, 1, 40, 100));
-        events.push(note_off(960, 1, 40));
+        let mut events = vec![
+            note_on(0, 1, 40, 100),
+            note_off(960, 1, 40),
+            note_on(0, 1, 40, 100),
+            note_off(960, 1, 40),
+        ];
         // ch3 = メロディ: 4 分音符 4 個を 5 tick 遅らせて配置 + 各音の直前に歌詞。
         let mut t = 0u32;
         for (i, key) in [60u8, 62, 64, 65].into_iter().enumerate() {
