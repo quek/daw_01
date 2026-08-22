@@ -43,12 +43,35 @@ UI ライブラリ daw-ui は `ui/` に統合済み (旧 sibling repo gui_01)。
 make build       # 実行 3 exe (daw_gui/daw_audio/daw_plugin_host) をビルド (debug)
 make run         # daw_gui をビルド × 起動 (Audio/Plugin プロセスを子プロセスとして起動)
 make test        # テストを持つ package のみ実行 (TEST_PKGS、examples 等 #[test]0個は除外)
+make test-nolaunch # 上のうち **daw_gui を起動しない target だけ**を実行 (下記)
 make clippy      # clippy をエラー扱いで (--workspace、examples のコンパイル検証も兼ねる)
 make check       # cargo check --workspace (型検査のみ、ビルド不要)
 make arch-lint   # アーキテクチャ不変条件の機械検査 (下記「アーキテクチャ不変条件」節)
 make license-check # ライセンス表示の機械検査 (REUSE 準拠 / 依存の GPLv3 互換性)
 make audit       # 依存の脆弱性 / 供給網攻撃の検査 (network 要。下記「依存の脆弱性」節)
 ```
+
+### `make test` は daw_gui を起動する (2026-08-22 に判明)
+
+`daw_gui/tests/` の一部は **daw_gui 本体を `--script` で subprocess 起動**し、それが
+daw_audio / daw_plugin_host まで spawn して audio device を開く。`--script` は窓を出さず
+single-instance gate も素通りするので、**起動したことに誰も気付けない**。実機を触っている
+最中に回すと、開いているプロジェクトの再生を壊す。
+
+- **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。
+  **名前で判断しない** — `pdc_real_vst3` / `sidechain_real_vst3` は smoke が付かないのに
+  起動し、`arr_widget` / `pr_widget` / `font_picker` は起動しない。
+  `--test` で名指ししても、この基準に当たる target なら起動する。
+- **`make test` / `make run` / `make run-release` は前提条件で止まる**
+  (`scripts/preflight_no_running_app.sh`)。daw_gui が起動していたら明示エラー。
+  ユーザーが手で打っても効く。迂回は `DAW01_SKIP_PREFLIGHT=1`(理由は同スクリプト冒頭)。
+- **起動を伴わない検証だけなら `make test-nolaunch`**。対象 target は Makefile が上の基準から
+  機械的に導く (手書きの列挙にしない)。
+- Claude 向けには `.claude/guards.jsonl` の `no-bulk-test-run` /
+  `no-app-launching-test-target` が書く瞬間に block する。許可を得たうえで回すときは
+  `DAW01_ALLOW_LAUNCH=1` を頭に付けて意図を明示する。
+- 列挙が陳腐化しないよう、`scripts/test_guards.py` の `check_launching_targets_list()` が
+  **毎回リポジトリから基準を再適用**して、ガードと Makefile のズレを検出する。
 
 特定 crate/test だけを素早く確認したいときは `cargo check -p <crate>` /
 `cargo test -p <crate> --test <name>` 等のピンポイント指定を使ってよい (これは Makefile の
@@ -220,15 +243,39 @@ PreToolUse hook。従来はメモリを hook 化するのに bespoke スクリ�
 （例: cd-prefix 再発は guard 経路が無く dismiss され続けた）。
 
 **解決 = データ駆動の汎用ガードエンジン (Python・追加依存なし・cross-platform)**:
-- `guards.jsonl`（per-project user dir、全 worktree 共有・git 外）に 1 行 1 ルール。各行は feedback
-  メモリ 1 件の能動的強制（`source` でメモリへ逆リンク = SSoT）。
+- **`.claude/guards.jsonl`（リポジトリ追跡下）** に 1 行 1 ルール。各行は feedback メモリ 1 件の
+  能動的強制（`source` でメモリへ逆リンク = SSoT）。
 - `scripts/guard_engine.py`（PreToolUse）が全ルールを適用。**一度だけ** settings.json に登録すれば、
   以後ガード追加は **guards.jsonl に 1 行追記するだけ**（新規スクリプトも settings 編集も承認も不要
   = classifier ブロック回避）。これが loop 自律化の鍵。`warn`=stdout/exit0、`block`=stderr/exit2（取消）。
 - 発火は `guard_hits.jsonl` に記録 → `reflect.py` が **warn ガードが 3 つ以上の異なる session で発火したら
-  自動で warn→block に昇格**（人手 triage 不要で actuate）。
+  自動で warn→block に昇格**（人手 triage 不要で actuate）。昇格状態は
+  **`<state>/guard_state.json`（git 外の overlay）** に書き、**追跡ファイルは一切書き換えない**。
 - 正規表現 1 本で表せない security block（`check_destructive_delete.py` の per-statement 分割）は
   code hook のまま。**pattern guard は data、logic guard は code** の分離。
+  cwd との関係でしか判定できないもの（`worktree_outside` / `cd_redundant` / `ask_multi`）も
+  engine 側の logic field で、ルール行は action/msg だけを供給する。
+
+#### なぜ追跡下なのか（2026-08-22 の消失事故）
+
+`guards.jsonl` は元々 user dir にあった。理由は「reflect.py が昇格をこのファイルに書き戻すので、
+git に入れると全 worktree が毎 Stop で dirty になる」。つまり **性質の違う 2 つ（人が書いたルール
+本体 ＝ 恒久的なプロジェクト知識 / 昇格状態 ＝ 実行時状態）が 1 ファイルに同居**していて、
+可変な方が恒久的な方をバージョン管理の外へ引きずり出していた。
+
+結果、レジストリが丸ごと消えた。`guard_hits.jsonl` の最終発火が 08-17、発覚が 08-22。
+**5 日間、全セッションでパターンガードが 1 件も効いていなかったのに症状がゼロ**だった
+（engine が `if not isfile: return 0` の fail-open で、「無い」と「該当しない」が区別できなかった）。
+
+対処は分離:
+- ルール本体 → `.claude/guards.jsonl`（追跡。CLAUDE.md や `.claude/hooks/` と同じ class）
+- 昇格状態 → `<state>/guard_state.json`（git 外。消えても `guard_hits.jsonl` から再計算できる）
+- レジストリ不在・空・全行 parse 失敗は **session ごとに 1 回、目に見える警告**を出す（黙って通さない）
+- パス導出は `scripts/ahe_paths.py` に集約。repo root は `__file__` から、state dir は
+  **main checkout の slug** から導出する（マシン固有パスをハードコードしない）
+
+**`escalate: false` を外さないこと。** substring レベルのマッチャは nudge としては妥当でも、
+block にすると正当な作業まで取り消す。理由は各ルールの直前にコメントで書いてある。
 
 ループ構造（observe → reflect → **actuate** → close）:
 1. `PostToolUse` で `scripts/log_metric.py` が metrics jsonl に追記し、`scripts/guard_engine.py` が
@@ -340,6 +387,16 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 
 2026-07-03 の全体改修 (`docs/plan_arch_refactor.md`) で確立。**`make arch-lint` が機械検査**し、
 `/arch-review` skill が定期監査する。これらに触れる変更は plan_arch_refactor.md を先に読む。
+書く瞬間の強制は `.claude/guards.jsonl` の `arch-*` ルール (plan §11 の 5 件: INFINITE /
+positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToChild 復活)。
+**「何を違反とみなすか」の SSoT は `scripts/arch_lint.sh`**、ガードはその write-time ミラー。
+
+> **arch-lint のパターンにバックスラッシュを使わないこと。** make (MSYS2) 経由だと
+> grep/sed へ渡す引数のバックスラッシュが落ち、`\( \s \b \[` を含むパターンが無言で
+> 別物になる。2026-08-22 に発覚 — 8 チェック中 6 つが無効化され、違反 7 行を抱えたまま
+> 「OK (違反なし)」を出していた。POSIX ブラケット式 (`[(]` `[]]` `[[:space:]]`) と
+> `grep -w` で書く。arch_lint.sh は冒頭に canary を持ち、検査器自身が効いていなければ
+> exit 1 する (違反ゼロの報告を無条件に信じない)。
 
 1. **安定 id addressing**: プロセス境界・イベント・永続参照に positional index を使わない。
    device = `PluginInstance.id` (u64、shmem 名・worker dispatch・plugin host bookkeeping も同じ id)、

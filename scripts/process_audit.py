@@ -18,16 +18,22 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENGINE = os.path.join(HERE, "guard_engine.py")
-REAL_GUARDS = os.path.join(os.path.expanduser("~"), ".claude", "projects",
-                           "F--dev-daw-01", "guards.jsonl")
-# optional 2nd arg: adjudicate against a candidate registry (e.g. guards.proposed.jsonl).
-GUARDS_SRC = sys.argv[2] if len(sys.argv) > 2 else REAL_GUARDS
+sys.path.insert(0, HERE)
+import ahe_paths  # noqa: E402  (sibling module, resolved from this file's dir)
 
+# optional 2nd arg: adjudicate against a candidate registry (e.g. guards.proposed.jsonl).
+GUARDS_SRC = sys.argv[2] if len(sys.argv) > 2 else ahe_paths.guards_file()
+
+# The engine resolves its registry from its OWN location, so the sandbox is a
+# throwaway repo: scripts/ copies + .claude/guards.jsonl. HOME points here too, so
+# adjudication never appends to the live guard_hits.jsonl (which feeds escalation).
 sandbox = tempfile.mkdtemp(prefix="guard_proc_")
-proj = os.path.join(sandbox, ".claude", "projects", "F--dev-daw-01")
-os.makedirs(proj, exist_ok=True)
-shutil.copyfile(GUARDS_SRC, os.path.join(proj, "guards.jsonl"))
+os.makedirs(os.path.join(sandbox, "scripts"), exist_ok=True)
+os.makedirs(os.path.join(sandbox, ".claude"), exist_ok=True)
+for _name in ("guard_engine.py", "ahe_paths.py"):
+    shutil.copyfile(os.path.join(HERE, _name), os.path.join(sandbox, "scripts", _name))
+shutil.copyfile(GUARDS_SRC, os.path.join(sandbox, ".claude", "guards.jsonl"))
+ENGINE = os.path.join(sandbox, "scripts", "guard_engine.py")
 ENV = dict(os.environ)
 ENV.update(USERPROFILE=sandbox, HOME=sandbox, HOMEDRIVE="", HOMEPATH=sandbox)
 
