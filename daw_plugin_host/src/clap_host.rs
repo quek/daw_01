@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::atomic::Ordering;
 
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency};
@@ -224,6 +225,18 @@ unsafe extern "C" fn gui_resize_hints_changed(_host: *const clap_host) {
     tracing::info!("host callback: resize_hints_changed");
 }
 
+/// CLAP `clap_host_gui.request_resize` (`gui.h` L219-227)。
+///
+/// > *"Return true if the new size is accepted... **The host doesn't have to call
+/// > set_size().** Note: if not called from the main thread, then a return value
+/// > simply means that the host acknowledged the request and will process it
+/// > asynchronously."*
+///
+/// r.md #65: main-thread から来たものは **同じコールスタックで**窓をリサイズする
+/// (VST3 と違い `set_size` の呼び返し義務は無い — 窓を直せば完了)。窓がまだ無い /
+/// 別スレッドからの呼び出しは非同期経路へ落として ack だけ返す (ヘッダが明示的に
+/// 許している唯一の非同期ケース)。`adjust_size` は掛けない — ヘッダの手順にも
+/// clap-host / clap-wrapper の実装にも無く、プラグイン自身が出した希望値なので既に valid。
 unsafe extern "C" fn gui_request_resize(
     host: *const clap_host,
     width: u32,
@@ -232,10 +245,14 @@ unsafe extern "C" fn gui_request_resize(
     let Some(this) = (unsafe { Host::from_clap(host) }) else {
         return false;
     };
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let hwnd = this.callbacks.editor_hwnd.load(Ordering::Acquire);
+    if hwnd != 0 && crate::editor_window::plugin_requested_resize(hwnd, width, height) {
+        return true;
+    }
     (this.callbacks.on_request_resize)(width, height);
-    // We accept the hint; the actual resize is scheduled asynchronously via
-    // daw_gui → pipe → plugin-main → `plugin.gui.set_size()`. Returning
-    // `true` tells the plugin it doesn't need to call `set_size` itself.
     true
 }
 

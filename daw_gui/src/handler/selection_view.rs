@@ -276,6 +276,17 @@ impl AppData {
             .map(|(k, v)| (*k, *v))
             .collect();
         audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
+        // r.md #65: エディタ窓のジオメトリ。per-clip view と同じく **現存する
+        // device の分だけ**を書き出し (削除済み device の orphan を溜めない)、
+        // device_id 昇順で並べて save 差分を安定させる。
+        let mut plugin_editor_windows: Vec<(u64, common::model::EditorWindowGeometry)> = self
+            .ui_prefs
+            .plugin_editor_windows
+            .iter()
+            .filter(|(id, _)| find_device_by_id(self.song_doc.song(), **id).is_some())
+            .map(|(id, g)| (*id, *g))
+            .collect();
+        plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
         common::model::ViewState {
             arrange_zoom_x: self.ui_prefs.arrange_zoom_x,
             arrange_scroll_beat: self.ui_prefs.arrange_scroll_beat,
@@ -307,6 +318,7 @@ impl AppData {
                 .collect(),
             piano_roll_views,
             audio_editor_views,
+            plugin_editor_windows,
         }
     }
 
@@ -328,6 +340,8 @@ impl AppData {
     ) {
         self.ui_prefs.piano_roll_views.clear();
         self.ui_prefs.audio_editor_views.clear();
+        // r.md #65: 別プロジェクトの窓位置が漏れないよう per-clip view と同様に先にクリア。
+        self.ui_prefs.plugin_editor_windows.clear();
         self.set_loop_region(loop_region);
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
@@ -375,6 +389,18 @@ impl AppData {
             }
             av.len_beats = av.len_beats.max(0.0);
             self.ui_prefs.audio_editor_views.insert(k, av);
+        }
+        // r.md #65: エディタ窓のジオメトリ。現存しない device の stale entry は捨てる。
+        // 位置 (`x`/`y`) は **clamp しない** — マルチモニタでは負値が正当で、
+        // 画面外かどうかの判定はモニタ構成を知る plugin-host 側が open 時に行う。
+        // サイズだけは `clamp_dim` と同じ健全域へ丸めて壊れた保存値を吸収する。
+        for (device_id, mut g) in v.plugin_editor_windows {
+            if find_device_by_id(self.song_doc.song(), device_id).is_none() {
+                continue;
+            }
+            g.width = g.width.clamp(1, 16_384);
+            g.height = g.height.clamp(1, 16_384);
+            self.ui_prefs.plugin_editor_windows.insert(device_id, g);
         }
     }
 

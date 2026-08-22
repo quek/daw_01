@@ -175,6 +175,15 @@ pub struct UiPrefs {
     /// state (project save しない)。 Highlight mode が前提 (Fold mode は
     /// widget 側で既に in-scale pitch を push する)。
     pub snap_on_draw: bool,
+    /// r.md #65: プラグインエディタ窓の位置 / client サイズ (device_id → geometry)。
+    /// 窓を所有するのは daw_plugin_host なので、値の一次情報は
+    /// `PluginEvent::SlotGuiGeometry` (open 時 + ドラッグ確定時 + close 直前) だけ。
+    /// ここは **その最新値のキャッシュ**で、`ViewState.plugin_editor_windows` として
+    /// プロジェクトに保存され、次に開くときに `OpenSlotGuiEmbedded` へ載って復元される。
+    /// 「見方の都合」なので更新しても dirty は立てない (memory `project_dirty_flag_rule`)。
+    pub plugin_editor_windows:
+        std::collections::HashMap<u64, common::model::EditorWindowGeometry>,
+
     /// Phase 7 B5 (`docs/plan_scale.html` §4.4): piano_roll が Fold mode か。
     /// `true` で out-of-scale 行を非表示 (Ableton K キー Fold to Scale 相当)、
     /// `false` で Highlight mode (root 行強調 + in-scale 通常 + out 行 dim)。

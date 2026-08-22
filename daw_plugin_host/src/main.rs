@@ -238,6 +238,35 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // one-shot editor-window self-test (r.md #65)。 プラグインを 1 つロードして
+    // **daw_gui を一切起動せずに** エディタ窓だけを開き、activation / focus 系の
+    // 窓メッセージをトレースし続ける。「アクティブにならない / すぐ非アクティブに
+    // 戻る」の犯人が daw_gui 側か、プラグイン側か、こちらの WNDPROC かを切り分ける
+    // ための最小再現環境 (`--ara-selftest` と同じ使い捨てプロセス方式)。
+    //
+    //   set RUST_LOG=info,editor_win=trace
+    //   daw_plugin_host --editor-selftest "<path>.vst3" [plugin_id] [seconds]
+    if std::env::args().nth(1).as_deref() == Some("--editor-selftest") {
+        let path = std::env::args()
+            .nth(2)
+            .context("--editor-selftest needs <path>")?;
+        let target_id = std::env::args().nth(3).unwrap_or_default();
+        let seconds: u64 = std::env::args()
+            .nth(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        let joined = std::thread::spawn(move || {
+            editor_selftest(std::path::Path::new(&path), &target_id, seconds)
+        })
+        .join();
+        match joined {
+            Ok(Ok(())) => println!("editor-selftest: SUCCESS"),
+            Ok(Err(e)) => println!("editor-selftest: ERROR {e:#}"),
+            Err(_) => println!("editor-selftest: PANIC on worker thread"),
+        }
+        return Ok(());
+    }
+
     let pipe_name = std::env::args()
         .nth(1)
         .context("expected pipe name as first argument")?;
@@ -257,6 +286,99 @@ async fn main() -> Result<()> {
     tracing::info!("daw_plugin_host shutting down");
     plugin_thread.shutdown();
     tracing::info!("daw_plugin_host exiting");
+    Ok(())
+}
+
+/// Editor-window self-test (see the `--editor-selftest` dispatch in [`main`]).
+///
+/// **daw_gui を起動しない**ので、ここで観測される activation / focus の挙動には
+/// daw_gui は一切関与しない。ここでも「クリックした瞬間だけアクティブ色になって
+/// すぐ戻る」が再現するならホスト側 (この WNDPROC or プラグイン) が原因、
+/// 再現しないなら daw_gui 側が原因、という二分になる。
+fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Result<()> {
+    use std::io::Write;
+    let step = |msg: &str| {
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "editor-selftest: {msg}");
+        let _ = out.flush();
+    };
+
+    let format = if path.extension().and_then(|e| e.to_str()) == Some("clap") {
+        PluginFormat::Clap
+    } else {
+        PluginFormat::Vst3
+    };
+    step(&format!(
+        "loading {} as {format:?} (target_id={target_id:?})",
+        path.display()
+    ));
+    let mut plugin = load_plugin(format, path, target_id, HostCallbacks::noop())
+        .context("load_plugin failed")?;
+    anyhow::ensure!(
+        plugin.gui_is_embed_supported(),
+        "plugin does not support an embedded win32 GUI"
+    );
+    plugin.gui_create_embedded()?;
+    let resizable = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+    let size = plugin
+        .gui_get_size()
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or((800, 600));
+    step(&format!(
+        "gui created: resizable={resizable} size={}x{}",
+        size.0, size.1
+    ));
+
+    let mut editor =
+        editor_window::EditorWindow::create(size.0, size.1, "editor-selftest", resizable, None)
+            .map_err(|e| anyhow::anyhow!("create editor window: {e}"))?;
+    step(&format!("container hwnd={:#x}", editor.hwnd_u64()));
+    let dpi_scale = editor_window::window_dpi_scale(editor.hwnd_u64());
+    let _ = plugin.gui_set_scale(dpi_scale);
+    // open_gui と同じ順序 (attach の直前に差し込む) を保つ — 再現環境が本番と
+    // 違う順序で動くと切り分けの意味が無くなる。
+    if let Some(sizer) = plugin.gui_sizer() {
+        editor.attach_sizer(sizer);
+    }
+    plugin.gui_set_parent_hwnd(editor.hwnd_u64())?;
+    pump_pending_messages();
+    let shown = plugin.gui_show()?;
+    let resizable_now = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+    if resizable_now != resizable {
+        editor.set_resizable(resizable_now);
+    }
+    let final_size = plugin
+        .gui_get_size()
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or(size);
+    editor.set_client_size(final_size.0, final_size.1);
+    editor.show_and_focus();
+    step(&format!(
+        "attached: show={shown} final={}x{} resizable_after_attach={resizable_now} — pumping {seconds}s",
+        final_size.0, final_size.1,
+    ));
+
+    // 窓メッセージをひたすら回す。トレースは editor_window の WNDPROC が出す。
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if editor.take_close_request() {
+            step("close requested (✕)");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    step("tearing down");
+    plugin.gui_destroy();
+    drop(editor);
+    drop(plugin);
     Ok(())
 }
 
@@ -669,6 +791,10 @@ impl PluginHost {
                     });
                 })
             },
+            // r.md #65: エディタ窓の HWND は plugin 側 (`gui_set_parent_hwnd` /
+            // `gui_destroy`) が書き込む。plugin-main は窓の所有だけを持ち、
+            // この atomic には触らない (「今どの窓に attach しているか」が SSoT)。
+            editor_hwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -911,14 +1037,10 @@ impl PluginHost {
                 let entries = self.collect_all_states();
                 self.emit(PluginEvent::AllPluginStates { entries });
             }
-            PluginCommand::OpenSlotGuiEmbedded { device_id, title } => {
-                match self.open_gui(device_id, &title) {
-                    Ok(Some((w, h))) => {
-                        self.emit(PluginEvent::SlotGuiOpened {
-                            device_id,
-                            width: w,
-                            height: h,
-                        });
+            PluginCommand::OpenSlotGuiEmbedded { device_id, title, geometry } => {
+                match self.open_gui(device_id, &title, geometry) {
+                    Ok(Some(geometry)) => {
+                        self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
                     }
                     Ok(None) => {
                         self.emit(PluginEvent::SlotGuiClosed { device_id });
@@ -1514,7 +1636,25 @@ impl PluginHost {
     /// open the plugin editor inside a top-level window THIS process owns.
     /// On success the `EditorWindow` is stored in the record. On failure the
     /// plugin GUI and the window are torn down before returning.
-    fn open_gui(&mut self, device_id: u64, title: &str) -> Result<Option<(u32, u32)>> {
+    ///
+    /// # 順序 (r.md #65)
+    ///
+    /// VST3 SDK editorhost (`window.cpp::show` + `WindowController::onShow`) と
+    /// CLAP `gui.h` L19-33 に合わせた **「窓は隠したまま作る → プラグインを attach →
+    /// 最後に 1 回だけ見せて前面化」**。
+    ///
+    /// 旧実装は `EditorWindow::create` の中で即 `ShowWindow(SW_SHOW)` していたため、
+    /// (a) 中身の無いフレームが一瞬見え、(b) その表示で得た activation を attach 中に
+    /// プラグインが作る一時 top-level に奪われ、(c) 最後の `SetForegroundWindow` は
+    /// **ワンショットの `AllowSetForegroundWindow` 許可を使い切った後**なので拒否され得た。
+    /// = 「タイトルバーが一瞬アクティブ色になってすぐ戻る」。activation を **1 回に
+    /// まとめる**のが構造的な解。
+    fn open_gui(
+        &mut self,
+        device_id: u64,
+        title: &str,
+        saved: Option<common::model::EditorWindowGeometry>,
+    ) -> Result<Option<common::model::EditorWindowGeometry>> {
         let Some(rec) = self.instances.get_mut(&device_id) else {
             return Ok(None);
         };
@@ -1524,12 +1664,13 @@ impl PluginHost {
             return Ok(None);
         }
         // CLAP embedded GUI sequence per gui.h:
-        //   create → set_scale → (can_resize info only) → get_size →
-        //   set_parent → show
+        //   create → set_scale → can_resize → get_size → set_parent → show
         // set_size は初回 open では呼ばない (VCV Rack 対策、CLAUDE.md 参照)。
         plugin.gui_create_embedded()?;
 
-        let resizable = plugin.gui_can_resize();
+        // pre-attach の可否。attach 後に再 query して貼り替える (Arturia 系は
+        // attach 前に答えられない)。
+        let resizable = plugin.gui_sizer().is_some_and(|s| s.can_resize());
         // Default to a sane size when the pre-attach query is missing or
         // 0×0 (some VST3 editors only know their size after `attached`).
         let size = plugin
@@ -1541,18 +1682,24 @@ impl PluginHost {
             resizable,
             width = size.0,
             height = size.1,
+            has_saved_geometry = saved.is_some(),
             "plugin gui initial size"
         );
 
-        // Create the host-owned, ownerless top-level container.
-        let editor = match editor_window::EditorWindow::create(size.0, size.1, title) {
+        // Create the host-owned, ownerless top-level container (**hidden**).
+        let mut editor = match editor_window::EditorWindow::create(
+            size.0,
+            size.1,
+            title,
+            resizable,
+            saved.map(|g| (g.x, g.y)),
+        ) {
             Ok(w) => w,
             Err(e) => {
                 plugin.gui_destroy();
                 return Err(anyhow::anyhow!("create editor window: {e}"));
             }
         };
-
         // C1 (r.md #8): host HWND の DPI を query して set_scale に渡す。
         let dpi_scale = editor_window::window_dpi_scale(editor.hwnd_u64());
         if let Err(e) = plugin.gui_set_scale(dpi_scale) {
@@ -1562,6 +1709,16 @@ impl PluginHost {
             && let Some((sw, sh)) = plugin.gui_get_size().filter(|&(w, h)| w > 0 && h > 0)
         {
             editor.set_client_size(sw, sh);
+        }
+
+        // sizer は **attach の直前**に差し込む。
+        // - 早すぎると (scale 反映のリサイズ等で) `attached` より前に `onSize` を
+        //   呼んでしまう。editorhost はそんな呼び方をしない。
+        // - 遅すぎると `attached` の内側から来る `resizeView` を捌けない
+        //   (`iplugview.h`: *"in this call the plug-in could call a
+        //   IPlugFrame::resizeView ()!"*)。
+        if let Some(sizer) = plugin.gui_sizer() {
+            editor.attach_sizer(sizer);
         }
 
         if let Err(e) = plugin.gui_set_parent_hwnd(editor.hwnd_u64()) {
@@ -1591,29 +1748,62 @@ impl PluginHost {
             }
         }
 
+        // attach 後の可否でスタイルを貼り替える (pre-attach 値の焼き込みは
+        // 「attach 後にしか答えないプラグインが恒久的に固定枠になる」退行を作る)。
+        let resizable_now = plugin.gui_sizer().is_some_and(|s| s.can_resize());
+        if resizable_now != resizable {
+            editor.set_resizable(resizable_now);
+        }
+
         // re-query the size AFTER attach/show (Arturia 系は attach 前 0×0)。
-        let final_size = plugin
+        let plugin_size = plugin
             .gui_get_size()
             .filter(|&(w, h)| w > 0 && h > 0)
             .unwrap_or(size);
+        // 前回セッションのサイズは **resizable のときだけ**復元する
+        // (CLAP `gui.h` の手順 9 と同じ規約)。矯正を通してからホスト起点として
+        // 適用する = `WM_SIZE` がプラグインへ `onSize` / `set_size` を届ける。
+        let target_size = match saved.filter(|_| resizable_now) {
+            Some(g) if g.width > 0 && g.height > 0 => plugin
+                .gui_sizer()
+                .map_or((g.width, g.height), |s| {
+                    s.constrain_client_size(g.width, g.height)
+                }),
+            _ => plugin_size,
+        };
+        editor.set_client_size(target_size.0, target_size.1);
 
-        editor.set_client_size(final_size.0, final_size.1);
-        editor.set_foreground();
+        // 表示 + 前面化はここ 1 回だけ。
+        editor.show_and_focus();
+        let geometry = editor.geometry();
         rec.editor = Some(editor);
 
         tracing::info!(
             plugin = %rec.plugin.name(),
-            width = final_size.0,
-            height = final_size.1,
+            width = geometry.width,
+            height = geometry.height,
+            x = geometry.x,
+            y = geometry.y,
+            resizable = resizable_now,
             "plugin gui opened"
         );
-        Ok(Some(final_size))
+        Ok(Some(geometry))
     }
 
     /// close the editor for `device_id`: tear the plugin GUI down
     /// (`gui_hide` → `gui_destroy`) BEFORE destroying the container window,
     /// then notify daw_gui. Idempotent.
     fn close_slot_gui(&mut self, device_id: u64) {
+        // r.md #65: 窓を壊す前に最後のジオメトリを送る (次回 open で復元する)。
+        // ドラッグ確定時にも送っているが、閉じる直前の 1 発が「最後に見た形」を確定させる。
+        let last_geometry = self
+            .instances
+            .get(&device_id)
+            .and_then(|rec| rec.editor.as_ref())
+            .map(editor_window::EditorWindow::geometry);
+        if let Some(geometry) = last_geometry {
+            self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
+        }
         if let Some(rec) = self.instances.get_mut(&device_id) {
             let _ = rec.plugin.gui_hide();
             rec.plugin.gui_destroy();
@@ -1636,26 +1826,37 @@ impl PluginHost {
 
     fn handle_notify(&mut self, n: HostNotify) {
         match n {
+            // r.md #65: プラグイン起点 resize の **非同期フォールバック**。
+            // 通常は `Vst3PlugFrame::resizeView` / CLAP `request_resize` が
+            // `editor_window::plugin_requested_resize` で同期処理を完了させるので
+            // ここには来ない。来るのは (a) GUI をまだ開いていない、(b) plugin-main
+            // 以外のスレッドから CLAP `request_resize` (= `[thread-safe]`) が来た、の 2 つ。
+            // **同じ関数へ合流させる**ので、経路が 2 本でも実装は 1 本 (SSoT)。
             HostNotify::Resize(device_id, w, h) => {
-                let Some(rec) = self.instances.get_mut(&device_id) else {
+                let Some(rec) = self.instances.get(&device_id) else {
                     return;
                 };
-                if let Some(win) = rec.editor.as_ref() {
-                    win.set_client_size(w, h);
-                }
-                if let Err(e) = rec.plugin.gui_set_size(w, h) {
-                    tracing::warn!(error = ?e, w, h, device_id, "gui.set_size failed");
+                let Some(win) = rec.editor.as_ref() else {
+                    // GUI 未 open。窓が無いので何もできない (次の open が
+                    // プラグインの `get_size` を読んで正しいサイズで作る)。
+                    return;
+                };
+                if !editor_window::plugin_requested_resize(win.hwnd_u64(), w, h) {
+                    tracing::debug!(device_id, w, h, "deferred plugin resize was rejected");
                 }
             }
             HostNotify::Closed(device_id) => {
                 self.close_slot_gui(device_id);
             }
+            // CLAP `clap_host_gui.request_show` / `request_hide`。
+            // r.md #65: show は `hide()` で隠した窓を **見せ直せる**ようにする
+            // (`SetForegroundWindow` だけでは非表示の窓は出てこない)。
             HostNotify::Show(device_id, show) => {
                 if let Some(rec) = self.instances.get(&device_id)
                     && let Some(win) = rec.editor.as_ref()
                 {
                     if show {
-                        win.set_foreground();
+                        win.show_and_focus();
                     } else {
                         win.hide();
                     }
@@ -1677,6 +1878,42 @@ impl PluginHost {
             HostNotify::ParamsRescan(device_id) => {
                 self.emit_param_list(device_id);
             }
+        }
+    }
+
+    /// r.md #65: エディタ窓の位置 / サイズが確定した分を daw_gui へ流す。
+    /// ドラッグ中は送らない (`WM_EXITSIZEMOVE` / プラグイン起点 resize 完了で
+    /// 1 回 dirty が立つ)。
+    fn poll_editor_geometry(&mut self) {
+        let changes: Vec<(u64, common::model::EditorWindowGeometry)> = self
+            .instances
+            .iter()
+            .filter_map(|(&id, rec)| {
+                rec.editor
+                    .as_ref()
+                    .and_then(|w| w.take_geometry_change())
+                    .map(|g| (id, g))
+            })
+            .collect();
+        for (device_id, geometry) in changes {
+            self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
+        }
+    }
+
+    /// r.md #65: modal move/size ループ (キャプション / サイズ枠のドラッグ) の
+    /// **最中に**回してよい周期処理だけを実行する。
+    ///
+    /// **command / notify の drain はここでやらない**。`CloseSlotGui` や
+    /// `HostNotify::Closed` は `DestroyWindow` に至り、いま WNDPROC が実行中の
+    /// その窓を壊してしまう (modal ループの内側からの自窓破棄)。ドラッグが終われば
+    /// `DefWindowProc` が返って外側の loop 先頭へ戻り、そこで即座に drain される
+    /// ので、遅れるだけで落ちるものは無い。
+    fn pump_modal(&mut self) {
+        // (r.md #5 ARA2) Melodyne の解析はここが止まると進まない。
+        self.notify_ara_model_updates();
+        // r.md #49: ドラッグ中に activation が変わることがある (別プロセスへ移る等)。
+        if let Some(active) = editor_window::take_activation_change() {
+            self.emit(PluginEvent::HostWindowsActive(active));
         }
     }
 
@@ -1721,6 +1958,57 @@ impl PluginHost {
         }
         self.instances.clear();
     }
+}
+
+// --- modal move/size ループ中の pump ---------------------------------------
+//
+// キャプション / サイズ枠をドラッグしている間、plugin-main は `DefWindowProc` の
+// 内側の modal ループにいて、外側の `GetMessageW` ループは回らない
+// (MSDN WM_ENTERSIZEMOVE: *"The operation is complete when DefWindowProc returns."*)。
+// エディタ窓の WNDPROC が `WM_TIMER` から [`pump_host_during_modal_loop`] を呼び、
+// **再入して安全な周期処理だけ** ([`PluginHost::pump_modal`]) を回す。
+
+thread_local! {
+    /// `DispatchMessageW` を呼ぶ **直前にだけ**立てる `PluginHost` への借用口。
+    /// その瞬間、呼び出し側フレームには `host` への Rust 参照が 1 つも生きていない
+    /// ので、WNDPROC から `&mut` を作っても aliasing しない。
+    ///
+    /// `pump_pending_messages()` (= `open_gui` が `&mut self` を握ったまま呼ぶ) の
+    /// 側では **立てない**ので、そちらから WM_TIMER が来ても null で弾かれる。
+    static MODAL_PUMP_HOST: std::cell::Cell<*mut PluginHost> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// 入れ子の pump を禁止するガード (`pump_modal` の中で更に dispatch が起きても
+    /// `&mut` は 1 本しか作らない)。
+    static IN_MODAL_PUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// エディタ窓の WNDPROC (modal move/size ループ中の `WM_TIMER`) から呼ぶ。
+/// 借用口が立っていない / 既に pump 中なら何もしない。
+pub fn pump_host_during_modal_loop() {
+    if IN_MODAL_PUMP.get() {
+        return;
+    }
+    let ptr = MODAL_PUMP_HOST.get();
+    if ptr.is_null() {
+        return;
+    }
+    IN_MODAL_PUMP.set(true);
+    // SAFETY: `ptr` は `plugin_main_loop` が `DispatchMessageW` の直前に自分の
+    // `host` から作り、直後に null へ戻す。その区間で `host` への参照は 1 つも
+    // 生きておらず、`IN_MODAL_PUMP` が再入も塞ぐので `&mut` は一意。
+    unsafe { (*ptr).pump_modal() };
+    IN_MODAL_PUMP.set(false);
+}
+
+/// `DispatchMessageW` の呼び出しを [`MODAL_PUMP_HOST`] の設定で挟む。
+/// 借用口は **この関数の中だけ**で有効。
+fn dispatch_with_modal_pump(host: &mut PluginHost, msg: &MSG) {
+    MODAL_PUMP_HOST.set(std::ptr::from_mut(host));
+    unsafe {
+        let _ = TranslateMessage(msg);
+        DispatchMessageW(msg);
+    }
+    MODAL_PUMP_HOST.set(std::ptr::null_mut());
 }
 
 // --- Plugin-main thread loop ----------------------------------------------
@@ -1774,6 +2062,9 @@ fn plugin_main_loop(
         // editor 窓の ✕ (close flag) を poll。
         host.poll_editor_close_requests();
 
+        // r.md #65: 窓の位置 / サイズが確定した分を daw_gui へ (次回 open で復元)。
+        host.poll_editor_geometry();
+
         // r.md #49: エディタ窓の activation 変化を daw_gui へ報告する。close の
         // poll より後に置く — 最後のエディタを閉じた周回で `close_slot_gui` が
         // 非アクティブを強制するので、同じ周回でそれを送り出せる。
@@ -1805,8 +2096,10 @@ fn plugin_main_loop(
                 // TranslateMessage / DispatchMessageW は呼ばない (= WM_CHAR も出ないので
                 // プラグインのテキスト欄に空白が入らない)。
             } else if msg.message != WM_COMMAND_WAKE {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+                // r.md #65: この dispatch の中でキャプション / サイズ枠のドラッグが
+                // 始まると `DefWindowProc` の modal ループへ入って戻ってこない。
+                // 借用口を立てて、WNDPROC の `WM_TIMER` から周期処理を回せるようにする。
+                dispatch_with_modal_pump(&mut host, &msg);
             }
         }
     }
