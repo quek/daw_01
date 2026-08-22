@@ -68,7 +68,7 @@ def main():
         "  3. For a single file: delete that one verified absolute path.",
         "  4. Guard first: refuse if the path is empty or shorter than ~5 chars.",
         "",
-        "(ref: ~/.claude/projects/F--dev-daw-01/memory/feedback_verify_env_var_before_use.md)",
+        "(ref: memory feedback_verify_env_var_before_use)",
     ]
     sys.stderr.buffer.write(("\n".join(lines) + "\n").encode("utf-8", "replace"))
     return 2

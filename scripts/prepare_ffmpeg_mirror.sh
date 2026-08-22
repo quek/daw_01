@@ -251,8 +251,17 @@ fetch_svn() { # $1=url $2=rev $3=destdir
         *) echo "prepare_ffmpeg_mirror:     svn クライアントが無く、SourceForge でもない: $url" >&2
            return 1 ;;
     esac
-    project="$(printf '%s' "$url" | sed -n 's#https://svn.code.sf.net/p/\([^/]*\)/svn/.*#\1#p')"
-    path="$(printf '%s' "$url" | sed -n 's#https://svn.code.sf.net/p/[^/]*/svn\(/.*\)#\1#p')"
+    # URL の分解はシェルのパラメータ展開で行う。**外部コマンドに正規表現を渡さない**:
+    # make (MSYS2) 経由でこのスクリプトが走ると、sed へ渡す引数のバックスラッシュが
+    # クロスランタイム起動で落ちることがあり、`\(...\)` グループが機能しなくなる。
+    # 実測 (2026-08-22、url = .../p/lame/svn/trunk/lame):
+    #     素のシェル : project=[lame] / make 経由 : project=[] ← 静かに空になる
+    # 現象は引数依存 (同じ sed でも fetch_ffmpeg.sh の抽出は make 下でも通る) なので、
+    # 「バックスラッシュに頼らない」方に倒す。詳細は scripts/arch_lint.sh 冒頭のコメント。
+    local rest
+    rest="${url#https://svn.code.sf.net/p/}"   # lame/svn/trunk/lame
+    project="${rest%%/*}"                      # lame
+    path="${rest#*/svn}"                       # /trunk/lame
     page="https://sourceforge.net/p/$project/svn/$rev/tarball?path=$path"
     echo "prepare_ffmpeg_mirror:     svn 無し → SourceForge snapshot API を使います" >&2
     curl -fsSL -X POST -o /dev/null "$page" || return 1

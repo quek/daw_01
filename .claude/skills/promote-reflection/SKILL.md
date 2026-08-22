@@ -42,7 +42,9 @@ artifact** に昇格させる。旧ループは「memory に save / discard」�
 - 「同じ機械的ミスを繰り返す」(= tool 入力の正規表現で表現できる) なら、**guard registry に 1 行追記する**
   だけで能動的強制力になる。`guard_engine.py` は settings.json に登録済なので、ルール追加に
   hook 登録編集 (classifier ブロック) は不要 = 自分で完結できる。
-- file: `~/.claude/projects/F--dev-daw-01/guards.jsonl` (1 行 1 JSON ルール、全 worktree 共有、git 外)。
+- file: `.claude/guards.jsonl` (1 行 1 JSON ルール、**リポジトリ追跡下**。2026-08-22 に user dir から
+  移設 — 追跡外に置いていたせいでレジストリが丸ごと消えた。CLAUDE.md「なぜ追跡下なのか」参照)。
+  warn→block の自動昇格状態だけが git 外の overlay (`<state>/guard_state.json`) にある。
 - ルール形:
   `{"id":<slug>,"source":<feedback メモリ slug>,"tool":["Bash"]|["Edit","Write","MultiEdit"],`
   `"field":"command"|"text"|"file_path","file_glob":<任意>,"all":[<正規表現…全 match>],`
@@ -52,6 +54,10 @@ artifact** に昇格させる。旧ループは「memory に save / discard」�
     で全行パースを必ず確認 (printf で追記するとバックスラッシュが潰れて不正 JSON になる前科あり → Write/Edit で書く)。
   - `block` は誤検知で tool 呼び出しを取り消すので **高精度 (複数トークン / アンカー) のときだけ**。
     曖昧なら `warn`。warn は 3 つの異なる session で発火すると reflect.py が自動で block に昇格する。
+  - **昇格したら困る warn には `"escalate": false` を必ず付け、理由を直前のコメント行に書く。**
+    substring レベルのマッチャ (任意の散文に当たるもの / 抑止条件を満たすと別ガードに抵触するもの /
+    sanctioned な正規手順まで巻き込むもの) は block にすると正当な作業を取り消す。既存 12 件の
+    判断理由が `.claude/guards.jsonl` のコメントにあるので、書き方はそれに倣う。
   - 既存 guard と重複しないか確認 (同 `source` / 同パターン)。
 - 検証: `echo '{"tool_name":"Bash","tool_input":{"command":"…"}}' | python scripts/guard_engine.py` で
   発火 (warn=stdout / block=exit2) を目視。

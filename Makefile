@@ -1,4 +1,4 @@
-.PHONY: help build run test test-rt clippy license-check audit clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
+.PHONY: help build run test test-nolaunch test-rt preflight-no-app clippy license-check audit clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
 # `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
@@ -37,9 +37,23 @@ RUN_PKGS := -p daw_gui -p daw_audio -p daw_plugin_host
 # common / daw-ui-platform / daw-ui-renderer は RUN_PKGS には無いが実テストを持つので必須
 # (欠かすとカバレッジが静かに落ちる)。ara-sys は #[test] 0 個なので対象外。
 # 新規 member 追加/初めて #[test] を足すときはこの列挙も更新すること。
-TEST_PKGS := -p common -p daw_gui -p daw_audio -p daw_plugin_host \
-             -p daw-ui-platform -p daw-ui-renderer -p daw-ui-core \
-             -p daw-ui-example-sample-edit-ops
+TEST_PKG_NAMES := common daw_gui daw_audio daw_plugin_host \
+                  daw-ui-platform daw-ui-renderer daw-ui-core \
+                  daw-ui-example-sample-edit-ops
+TEST_PKGS := $(patsubst %,-p %,$(TEST_PKG_NAMES))
+TEST_PKGS_NO_GUI := $(patsubst %,-p %,$(filter-out daw_gui,$(TEST_PKG_NAMES)))
+
+# ---- daw_gui を起動しない test target (test-nolaunch 用) ----
+# **手書きの列挙にしない。** 判定基準は 1 つだけ:
+#   grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs
+# これに当たる target は daw_gui 本体を `--script` で subprocess 起動し、daw_audio /
+# daw_plugin_host まで spawn して audio device を開く。名前は基準ではない
+# (pdc_real_vst3 / sidechain_real_vst3 は smoke が付かないのに起動し、arr_widget /
+# pr_widget / font_picker は起動しない)。ここは grep -L (= 当たらない側) で反転して取る。
+# 同じ基準を .claude/guards.jsonl の no-app-launching-test-target が列挙しており、
+# scripts/test_guards.py の check_launching_targets_list() が両者のズレを検出する。
+DAW_GUI_SAFE_TESTS := $(patsubst %,--test %,$(basename $(notdir \
+    $(shell grep -L CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs 2>/dev/null))))
 
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)
@@ -89,14 +103,19 @@ ffmpeg-mirror:
 build: fetch-ffmpeg
 	cargo build $(RUN_PKGS)
 
-run: build
+run: preflight-no-app build
 	cargo run -p daw_gui
 
 release: fetch-ffmpeg
 	cargo build --release $(RUN_PKGS)
 
-run-release: release
+run-release: preflight-no-app release
 	cargo run -p daw_gui --release
+
+# 実行系 target の前提条件。daw_gui が起動していたら明示エラーで止める
+# (詳細と迂回方法は scripts/preflight_no_running_app.sh の冒頭コメント)。
+preflight-no-app:
+	@$(BASH) "$(CURDIR)/scripts/preflight_no_running_app.sh" "$(MAKECMDGOALS)"
 
 # daw_gui/script を有効化して --script 系 smoke テスト (required-features 宣言済み) も
 # 含めて全件回す。TEST_PKGS 以外 (#[test] 0 個の examples + ara-sys) はスキップする。
@@ -104,8 +123,17 @@ run-release: release
 # daw_plugin_host.exe を子プロセス起動する。`cargo test` はこれら runtime バイナリの
 # 生成を保証しない (テストハーネス版のみ) ので、クリーンな target では build なしだと
 # 「daw_audio.exe が見つかりません」で落ちる (2026-07-03 の cargo clean 後に発覚)。
-test: build test-rt
+# preflight は **prerequisite に置く**。recipe の 1 行目に置くと build / test-rt が先に
+# 走ってしまい、実機が動いている最中に 40 秒ビルドしてから止まる (2026-08-22 に実測)。
+# build 自体も daw_gui 起動中は ERROR 5 で落ちうるので、先に止めるのが正しい。
+test: preflight-no-app build test-rt
 	cargo test $(TEST_PKGS) --features daw_gui/script
+
+# 起動を伴わない検証だけを回す。`make test` が前提条件で止まる状況 (実機を触っている
+# 最中) でも安全に通せる。対象 target は上の DAW_GUI_SAFE_TESTS が基準から導く。
+test-nolaunch: test-rt
+	cargo test $(TEST_PKGS_NO_GUI)
+	cargo test -p daw_gui --features daw_gui/script --lib --bins $(DAW_GUI_SAFE_TESTS)
 
 # RT (audio thread) の無確保検査。 `rt-assert` は非 default feature なので、
 # 上の `test` の feature 集合ではテストが **コンパイルすらされない**。
