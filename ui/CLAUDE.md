@@ -159,6 +159,20 @@ text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP
 ### widget state の downcast
 - `state: HashMap<WidgetId, Box<dyn WidgetState>>` から型復元するとき、`Box<dyn WidgetState>` 自身に WidgetState の blanket impl が当たって外側 Box の TypeId を返すバグに注意。`&mut **entry` で明示的に deref してから `as_any_mut().downcast_mut::<S>()` する (M2 で修正、回帰テスト済)。
 
+### text_input のタイポグラフィは caller が持つ (`TextInputStyle`)
+
+- **`text_input_at` / `text_input_at_focused` は `&TextInputStyle` (font_size / pad_x) を取る**。
+  旧実装はこの 2 つを `draw_text_input` に 14.0 / 8.0 で埋め込んでいたため、
+  (a) `scrubable_number_at` が `style.font_size` を渡していても **click で編集モードに入った
+  瞬間だけ文字が 14px に跳ねる** (inspector の 11px 欄で実際に起きていた)、(b) 狭い欄に入力を
+  置けない (`pad 8 + "L100"@14px = 37px` 必要)、という 2 つの欠陥があった。色は palette が SSoT
+  なので style には入れない (r.md #48)。
+- **cursor 高は `font_size * 1.2` を rect 中央に置く** (`caret_rect`)。旧 `rect.h - 8.0` は
+  font 14 / 高さ 22-28px の欄でしか成立せず、小さい欄では文字より短い caret になる。描画と
+  IME 候補位置要求 (`request_ime`) が同じ helper を共有する。
+- **テキストは rect で clip する**。横スクロールを持たない widget なので、欄からはみ出した
+  グリフは隣の widget の上に重なって描かれてしまう (mixer strip の 30px 欄で顕在化)。
+
 ### text_input の buffer 動作 (M14 Phase 59 で uncontrolled 化)
 - **`text_input_at` は `was_focused == true` 中は `TextInputState.buffer_text` を source-of-truth にする** (uncontrolled mode)。`text` 引数は **gained_focus 時の初期値** としてのみ使われ、 focus 中の typing は buffer を mutate する (毎フレーム reset しない)。 これにより piano_roll の歌詞 inline 編集 (#017) など「commit するまで model に書かない」 UX が caller boilerplate なしで実現可能。
 - **focus 中に外部から `text` 引数が変わっても buffer は反映しない** (= ユーザの typing が消えない)。 controlled 動作 (per-keystroke の model 更新) を望むなら caller が on_change で model 更新する既存パターンで OK (text == buffer なので挙動完全互換)。
