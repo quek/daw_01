@@ -1729,7 +1729,14 @@ impl EditorSizer for Vst3Sizer {
             return ResizableProbe::unavailable();
         };
         let raw = unsafe { view.canResize() };
-        ResizableProbe { verdict: raw == kResultTrue, queried: true, raw }
+        ResizableProbe {
+            verdict: raw == kResultTrue,
+            queried: true,
+            raw,
+            // VST3 は `canResize()==false` のときホストが枠を出すことを禁じていない
+            // (`iplugview.h` に must not / shall not が無い)。
+            drag_requires_verdict: false,
+        }
     }
 
     fn resize_hints(&self) -> Option<crate::plugin_instance::ResizeHints> {

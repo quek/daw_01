@@ -369,38 +369,6 @@ unsafe fn resize_client_area(hwnd: HWND, w: u32, h: u32) {
     }
 }
 
-/// r.md #65: **プラグインの `canResize` 申告に関わらずリサイズ枠を出すか**という方針。
-///
-/// # なぜ申告を尊重しないのか (実測に基づく判断)
-///
-/// Renoise Redux は `IPlugView::canResize()` に `kResultFalse` (raw `0x1`) を返す
-/// — これは実機ログで確定した (`queried=true raw=0x1`、attach 前後で不変)。
-/// にもかかわらず **REAPER では窓枠ドラッグでリサイズでき、Redux の UI も追従する**
-/// (ユーザーの実機確認)。つまり Redux の申告は実態と食い違っており、
-/// 申告を尊重すると **ユーザーが実際にできるはずのことができなくなる**。
-///
-/// VST3 SDK の editorhost / JUCE / clap-wrapper は申告を尊重する実装だが、
-/// `iplugview.h` の `canResize` は *"Is view sizable by user."* という**記述**で
-/// あって「false なら枠を出すな」という**規範ではない**。ホストが枠を出したうえで
-/// `checkSizeConstraint` に丸めさせる設計は spec の範囲内で、実際
-/// `checkSizeConstraint` は *"On live resize this is called to check if the view
-/// can be resized to the given rect, **if not adjust the rect to the allowed
-/// size**"* と、まさにそのための API として規定されている。
-///
-/// ユーザーの要件は「Redux でリサイズしたい」。参照 DAW も REAPER。よって
-/// **既定は「常に枠を出す」**とし、本当に固定サイズのプラグインは
-/// `checkSizeConstraint` が丸めることで守られる (丸めないプラグインでは
-/// コンテナに余白が出るが、REAPER も同じ挙動)。
-///
-/// **申告値そのものは捨てていない** — `ResizableProbe` としてログに残しており、
-/// 将来「申告を尊重する」設定を足すときはこの関数 1 箇所を分岐させればよい。
-#[must_use]
-pub fn should_offer_resize_frame(plugin_can_resize: bool) -> bool {
-    // 申告が true ならもちろん出す。false でも出す (上記の理由)。
-    let _ = plugin_can_resize;
-    true
-}
-
 /// 窓のスタイルを「リサイズ枠を出すか」から決める。
 ///
 /// 枠を出すかの **方針**は [`should_offer_resize_frame`] が持つ。ここは純粋な
@@ -1454,25 +1422,7 @@ unsafe extern "system" fn editor_wnd_proc(
 mod tests {
     use super::*;
 
-    /// r.md #65: **`canResize()` が false でもリサイズ枠を出す**。
-    ///
-    /// Renoise Redux は `canResize()` に `kResultFalse` を返すのに REAPER では
-    /// 窓枠でリサイズでき UI も追従する (実機で確定)。申告を尊重すると
-    /// 「ユーザーが実際にできるはずのことができない」窓になるため、方針として
-    /// 常に枠を出す。固定サイズのプラグインは `checkSizeConstraint` が丸めて守る。
-    ///
-    /// このテストは**方針そのもの**を固定する: 将来「申告を尊重する」設定を
-    /// 足すなら、ここが落ちて意識的に更新することになる。
-    #[test]
-    fn resize_frame_is_offered_even_when_the_plugin_declines() {
-        assert!(should_offer_resize_frame(true));
-        assert!(
-            should_offer_resize_frame(false),
-            "canResize()==false でも枠を出す (Redux が REAPER でリサイズできる事実に合わせる)"
-        );
-    }
-
-    /// スタイル写像そのもの (方針とは分離してある)。
+    /// スタイル写像そのもの (方針は `plugin_instance::should_offer_resize_frame`)。
     #[test]
     fn editor_window_style_maps_resize_frame_to_thickframe() {
         let fixed = editor_window_style(false);
