@@ -880,6 +880,29 @@ def check_launching_targets_list():
             "抜け=%s / 余分=%s (基準: grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs)"
             % (sorted(actual - declared), sorted(declared - actual)))
 
+    # Makefile の test-nolaunch も **同じ基準から**導いていること。ガードと Makefile が
+    # 別々の判定を持つと片方だけ通る状態ができる (これは実行時と書く瞬間の二重化であって、
+    # 判定の二重化ではない)。
+    mk = os.path.join(ahe_paths.REPO_ROOT, "Makefile")
+    try:
+        with open(mk, "r", encoding="utf-8", errors="replace") as fh:
+            mk_text = fh.read()
+    except Exception as e:
+        bad("launchtargets:makefile-read", str(e))
+        return
+    ok("launchtargets:makefile-derives-from-criterion") if "CARGO_BIN_EXE_daw_gui" in mk_text else \
+        bad("launchtargets:makefile-derives-from-criterion",
+            "Makefile が基準 CARGO_BIN_EXE_daw_gui から導いていません (手書き列挙の疑い)")
+    # コメント行は数えない (なぜ名前で判定してはいけないかの説明に target 名が出るため。
+    # arch_lint.sh の strip_comments / arch-* ガードと同じ扱い)。
+    mk_code = "\n".join(ln for ln in mk_text.splitlines() if not ln.lstrip().startswith("#"))
+    handwritten = sorted(t for t in actual if t in mk_code)
+    if handwritten:
+        bad("launchtargets:makefile-no-handwritten-list",
+            "Makefile に起動する target 名が直書きされています (基準から導くこと): %s" % handwritten)
+    else:
+        ok("launchtargets:makefile-no-handwritten-list")
+
 
 def main():
     check_paths()

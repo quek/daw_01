@@ -43,12 +43,35 @@ UI ライブラリ daw-ui は `ui/` に統合済み (旧 sibling repo gui_01)。
 make build       # 実行 3 exe (daw_gui/daw_audio/daw_plugin_host) をビルド (debug)
 make run         # daw_gui をビルド × 起動 (Audio/Plugin プロセスを子プロセスとして起動)
 make test        # テストを持つ package のみ実行 (TEST_PKGS、examples 等 #[test]0個は除外)
+make test-nolaunch # 上のうち **daw_gui を起動しない target だけ**を実行 (下記)
 make clippy      # clippy をエラー扱いで (--workspace、examples のコンパイル検証も兼ねる)
 make check       # cargo check --workspace (型検査のみ、ビルド不要)
 make arch-lint   # アーキテクチャ不変条件の機械検査 (下記「アーキテクチャ不変条件」節)
 make license-check # ライセンス表示の機械検査 (REUSE 準拠 / 依存の GPLv3 互換性)
 make audit       # 依存の脆弱性 / 供給網攻撃の検査 (network 要。下記「依存の脆弱性」節)
 ```
+
+### `make test` は daw_gui を起動する (2026-08-22 に判明)
+
+`daw_gui/tests/` の一部は **daw_gui 本体を `--script` で subprocess 起動**し、それが
+daw_audio / daw_plugin_host まで spawn して audio device を開く。`--script` は窓を出さず
+single-instance gate も素通りするので、**起動したことに誰も気付けない**。実機を触っている
+最中に回すと、開いているプロジェクトの再生を壊す。
+
+- **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。
+  **名前で判断しない** — `pdc_real_vst3` / `sidechain_real_vst3` は smoke が付かないのに
+  起動し、`arr_widget` / `pr_widget` / `font_picker` は起動しない。
+  `--test` で名指ししても、この基準に当たる target なら起動する。
+- **`make test` / `make run` / `make run-release` は前提条件で止まる**
+  (`scripts/preflight_no_running_app.sh`)。daw_gui が起動していたら明示エラー。
+  ユーザーが手で打っても効く。迂回は `DAW01_SKIP_PREFLIGHT=1`(理由は同スクリプト冒頭)。
+- **起動を伴わない検証だけなら `make test-nolaunch`**。対象 target は Makefile が上の基準から
+  機械的に導く (手書きの列挙にしない)。
+- Claude 向けには `.claude/guards.jsonl` の `no-bulk-test-run` /
+  `no-app-launching-test-target` が書く瞬間に block する。許可を得たうえで回すときは
+  `DAW01_ALLOW_LAUNCH=1` を頭に付けて意図を明示する。
+- 列挙が陳腐化しないよう、`scripts/test_guards.py` の `check_launching_targets_list()` が
+  **毎回リポジトリから基準を再適用**して、ガードと Makefile のズレを検出する。
 
 特定 crate/test だけを素早く確認したいときは `cargo check -p <crate>` /
 `cargo test -p <crate> --test <name>` 等のピンポイント指定を使ってよい (これは Makefile の
