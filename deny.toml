@@ -59,14 +59,45 @@ yanked = "deny"
 # 事象は transitive でも止まる。
 unmaintained = "workspace"
 #
-# 例外 (ignore) は現在ゼロ。**入れるときは必ず「RUSTSEC-ID: 理由 / 見直し条件」を
-# コメントで書くこと。** 無言の ignore は禁止 (何を許したのか誰も分からなくなる)。
+# **例外は必ず「何を / なぜ / どうなったら見直すか」をここに書く。無言の ignore は禁止。**
+# 再評価は **イベントで書く。時間期限は書かない** —「3 ヶ月後に再検討」は誰も見ないので嘘になる。
 #
-# 2026-08-22 時点で 7 件が残っていて `make audit` は RED。全件を一次情報で triage 済みで
-# **daw_01 の使い方ではどれも露出しない**が、5 件は `cargo update -p <crate>` (lockfile の
-# semver 互換更新) で消えるので、ignore で塗り潰さずに残してある。
-# 各件の素性・消し方・判断が要る 2 件 (bincode / rusty_ffmpeg) は docs/dependency_audit.md。
-ignore = []
+# 2026-08-22 の triage (詳細は docs/dependency_audit.md): 検出 9 件のうち 5 件は
+# `cargo update -p <crate>` で解消済み (anyhow / crossbeam-epoch / h2 / quick-xml ×2)。
+# 残る 2 件は **上げ先が存在しない**ので、根拠を書いたうえで例外にする。
+ignore = [
+    # --- bincode 2.0.1 (RUSTSEC-2025-0141, unmaintained) ---
+    # 開発チームが doxxing / harassment を受けて開発を恒久停止した、という informational
+    # advisory。**CVE も CVSS も「こう壊れる」という記述も無い** (脆弱性ではない)。
+    # **上げ先が無い**: crates.io の bincode 3.0.0 は墓標リリースで、lib.rs の中身は
+    # `compile_error!` 1 行。上げるとビルドが即死するので絶対に上げてはいけない。
+    # 露出の評価: 用途は (1) 名前付きパイプ経由の IPC (相手は自分で spawn した子プロセス)、
+    # (2) builtin VOICEVOX の state 復元 — プロジェクトファイル由来の任意バイト列が
+    # デコーダに届く唯一の経路。bincode 2.0.1 は safe Rust の逐次デコーダで長さ claim
+    # ガードを持ち、state_load の失敗も握りつぶさず daw_gui へ返す。踏むべき欠陥が無い。
+    # wincode への移行は、technical failure mode が無いのに IPC の中核を差し替えることに
+    # なり、common/build.rs の WIRE_SOURCES fingerprint 機構との整合も未検証。churn。
+    # **見直しトリガ**: bincode 2.x に informational でない advisory が出たとき /
+    #                   edition や serde の破壊的更新でコンパイル不能になったとき。
+    "RUSTSEC-2025-0141",
+
+    # --- rusty_ffmpeg 0.16.5+ffmpeg.7.1 (yanked) ---
+    # yank の理由は **セキュリティではなく feature gate の誤り**。0.16.5 が
+    # `channel_layout` (AVChannelLayout 定数) を **無条件で** 公開したため、ffmpeg6
+    # feature が OFF のビルドで存在しないシンボルを参照してコンパイルエラーになる。
+    # PR #147 "fix(avutil): correct FFmpeg version of ch_layout" が
+    # `#[cfg(feature = "ffmpeg6")]` を付けて修正し、0.16.5 / 0.16.6 が yank、0.16.7 が後継。
+    # **daw_01 では起こり得ない**: cargo tree -e features で実測したところ
+    # rusty_ffmpeg の ffmpeg5 / ffmpeg6 / ffmpeg7 はすべて有効
+    # (daw_gui → rsmpeg/default → ffmpeg7 → ffmpeg6)。失敗条件そのものが成立しない。
+    # また yank は「新規に解決されなくなる」だけで、lock 済みの既存ビルドは動く。
+    # **上げ先が無い**: 後継の 0.16.6/0.16.7 は `+ffmpeg.8` 系で、こちらは 7.1 ABI に
+    # 固定している (daw_gui/ffmpeg/binding_ffmpeg_7.1.rs と third_party/ffmpeg の pin)。
+    # 7.1 系で yank されていない最後は 0.16.4 だが、それは AVChannelLayout 追加より前の版。
+    # **見直しトリガ**: FFmpeg の pin を 8.x 系へ上げるとき (docs/ffmpeg_mirror.md の
+    #                   版更新と同時に rusty_ffmpeg も 0.16.7+ / rsmpeg 0.17.0+ffmpeg.8.1 へ)。
+    "rusty_ffmpeg@0.16.5+ffmpeg.7.1",
+]
 
 [licenses]
 # askalono の判定信頼度しきい値 (0.0-1.0、既定 0.8)。上げると曖昧な LICENSE 実ファイルを
