@@ -226,6 +226,10 @@ fn trace_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         // modal move/size ループ中の pump。どちらも要の経路なのに不可視だった。
         WM_MOVE => "WM_MOVE",
         WM_TIMER => "WM_TIMER",
+        // r.md #65: 「前面なのに見えない」の切り分け。コンテナに描画要求が
+        // 来ているか (= 塞がれていないか) の手掛かりになる。
+        WM_PAINT => "WM_PAINT",
+        WM_ERASEBKGND => "WM_ERASEBKGND",
         _ => return,
     };
     // 相手 HWND の在り処はメッセージごとに違う。
@@ -918,15 +922,57 @@ fn probe_can_resize_change(shared: &EditorShared, occasion: &str) {
     );
 }
 
-/// この窓が所有する有効な popup (= プラグインがコンテナから逃がした view 窓)。
+/// この窓が所有する top-level 窓 (= プラグインがコンテナから逃がした view 窓) を
+/// **全部**列挙する。
 ///
-/// `GW_ENABLEDPOPUP` は *"the enabled popup window owned by the specified window
-/// ...; otherwise ... the retrieved handle is that of the specified window"* なので、
-/// 自分自身が返ってきたら「popup 無し」と読み替える。
+/// # なぜ `GW_ENABLEDPOPUP` を使わないか (r.md #65 の観測バグ)
+///
+/// 最初は `GetWindow(hwnd, GW_ENABLEDPOPUP)` で書いたが、**実機で常に「無し」を
+/// 返していた** — 同じログ行の `active=` / `focus=` には owner がコンテナの
+/// Redux 窓がはっきり写っているのに。
+///
+/// 原因は MSDN の記述どおり: *"The retrieved handle identifies the enabled popup
+/// window owned by the specified window (**the search uses the first such window
+/// found using GW_HWNDNEXT**)"*。`GW_HWNDNEXT` は **Z 順で下方向**の探索だが、
+/// 所有窓は常に owner の**上**にいる。つまりこの API では原理的に見つからない。
+///
+/// 所有関係は Z 順に依存しないので、**top-level を列挙して `GW_OWNER` を突き合わせる**。
+/// 呼ぶのは activation 時だけなので列挙コストは問題にならない。
+fn owned_top_levels(hwnd: HWND) -> Vec<HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GW_OWNER};
+
+    struct Ctx {
+        owner: isize,
+        found: Vec<HWND>,
+    }
+    unsafe extern "system" fn cb(w: HWND, lp: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `lp` は直下の `EnumWindows` 呼び出しが渡した `&mut Ctx`。
+        let ctx = unsafe { &mut *(lp.0 as *mut Ctx) };
+        let owner = unsafe { GetWindow(w, GW_OWNER) }.unwrap_or_default();
+        if owner.0 as isize == ctx.owner {
+            ctx.found.push(w);
+        }
+        true.into()
+    }
+
+    let mut ctx = Ctx { owner: hwnd.0 as isize, found: Vec::new() };
+    let _ = unsafe { EnumWindows(Some(cb), LPARAM(std::ptr::from_mut(&mut ctx) as isize)) };
+    ctx.found
+}
+
+/// 所有 top-level のうち代表 1 枚 (可視を優先)。
+///
+/// **キャプションの判定には使わない** — そちらは「いまアクティブな窓が自分の
+/// グループか」を直接聞く ([`belongs_to_this_editor`])。列挙に依存させると、
+/// 列挙が壊れたときに判定ごと壊れる (r.md #65 で実際に起きた)。
+#[allow(dead_code)]
 fn owned_popup(hwnd: HWND) -> Option<HWND> {
-    use windows::Win32::UI::WindowsAndMessaging::GW_ENABLEDPOPUP;
-    let p = unsafe { GetWindow(hwnd, GW_ENABLEDPOPUP) }.ok()?;
-    (!p.0.is_null() && p != hwnd).then_some(p)
+    let owned = owned_top_levels(hwnd);
+    owned
+        .iter()
+        .copied()
+        .find(|w| unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*w) }.as_bool())
+        .or_else(|| owned.first().copied())
 }
 
 /// キャプションのアクティブ表示を `active` に**明示的に**設定する (r.md #65)。
@@ -980,30 +1026,131 @@ fn describe_last_active_popup(hwnd: HWND) -> String {
     }
 }
 
+/// 窓の矩形 + それが**実際に見える場所にあるか**を 1 行で (r.md #65)。
+///
+/// 「Win32 上は前面なのに視覚的に見えない」の切り分け用。画面外 / 極小 /
+/// 別モニタ / 最小化 / 透明 (layered) を全部ここで潰す。
+fn describe_rect_and_visibility(w: HWND) -> String {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetLayeredWindowAttributes, IsWindowVisible, WS_EX_LAYERED,
+    };
+    let mut r = RECT::default();
+    let ok = unsafe { GetWindowRect(w, &mut r) }.is_ok();
+    let on_monitor = ok && !unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_invalid();
+    let ex = unsafe { GetWindowLongPtrW(w, GWL_EXSTYLE) } as u32;
+    let layered = ex & WS_EX_LAYERED.0 != 0;
+    let alpha = if layered {
+        let mut key = windows::Win32::Foundation::COLORREF(0);
+        let mut a = 0u8;
+        let mut flags = windows::Win32::UI::WindowsAndMessaging::LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+        if unsafe { GetLayeredWindowAttributes(w, Some(&mut key), Some(&mut a), Some(&mut flags)) }
+            .is_ok()
+        {
+            format!(" alpha={a} lwa_flags={:#x}", flags.0)
+        } else {
+            " alpha=?".to_string()
+        }
+    } else {
+        String::new()
+    };
+    format!(
+        "rect=({},{} {}x{}) on_monitor={on_monitor} visible={} iconic={} layered={layered}{alpha}",
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+        unsafe { IsWindowVisible(w) }.as_bool(),
+        unsafe { IsIconic(w) }.as_bool(),
+    )
+}
+
+/// `w` より **Z 順で上にある窓**を数個たどって列挙する (r.md #65)。
+///
+/// 「前面なのに見えない」なら、何かが上に載っている可能性がある。別プロセスの窓
+/// (daw_gui 本体など) もここに出るので、覆っている犯人が特定できる。
+fn describe_windows_above(w: HWND, limit: usize) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, IsWindowVisible};
+    let mut out = Vec::new();
+    let mut cur = w;
+    for _ in 0..limit {
+        let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else { break };
+        if prev.0.is_null() {
+            break;
+        }
+        cur = prev;
+        // 不可視の窓は視界を塞がないので飛ばす (数だけ膨らむので)。
+        if !unsafe { IsWindowVisible(cur) }.as_bool() {
+            continue;
+        }
+        out.push(describe_hwnd(cur));
+    }
+    if out.is_empty() {
+        "(topmost among visible windows)".to_string()
+    } else {
+        out.join(" | ")
+    }
+}
+
 /// 所有 popup の現況を 1 行で (r.md #65 の Alt+Tab 観測)。
 ///
-/// 「コンテナはアクティブになったのに、プラグインの実体である popup が前面に
-/// 来ていない」を **ログだけで**判定できるようにする。
+/// 「コンテナはアクティブになったのに、プラグインの実体である popup が視覚的に
+/// 見えない」を **ログだけで**判定できるようにする。
 fn describe_owned_popup(hwnd: HWND) -> String {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible};
-    let Some(popup) = owned_popup(hwnd) else {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let owned = owned_top_levels(hwnd);
+    if owned.is_empty() {
         return "none".to_string();
-    };
-    let visible = unsafe { IsWindowVisible(popup) }.as_bool();
-    let fg = unsafe { GetForegroundWindow() };
-    // popup がコンテナより手前 (Z 順で上) に居るか。`GetNextWindow` を辿らず、
-    // 「コンテナの直上の窓」を 1 段だけ見る安価な判定。
-    let above_container = unsafe {
-        GetWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV)
     }
-    .unwrap_or_default();
-    format!(
-        "{:#x} visible={visible} is_foreground={} prev_in_z={:#x} style={:#010x}",
-        popup.0 as usize,
-        fg == popup,
-        above_container.0 as usize,
-        unsafe { GetWindowLongPtrW(popup, GWL_STYLE) } as u32,
-    )
+    let fg = unsafe { GetForegroundWindow() };
+    owned
+        .iter()
+        .map(|&p| {
+            format!(
+                "{:#x} is_foreground={} style={:#010x} {} above=[{}]",
+                p.0 as usize,
+                fg == p,
+                unsafe { GetWindowLongPtrW(p, GWL_STYLE) } as u32,
+                describe_rect_and_visibility(p),
+                describe_windows_above(p, 4),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ;; ")
+}
+
+/// **観測そのものの自己検査** (r.md #65)。
+///
+/// 今回 `owned_popup` が壊れていたのに、同じログ行の `active=` / `focus=` には
+/// owner がコンテナの窓が写っていた — つまり **矛盾はログの中に既に出ていた**のに、
+/// 突き合わせる仕組みが無いので気付けなかった。以後は機械に見つけさせる。
+///
+/// 「アクティブ / フォーカス窓の root owner が自分なのに、所有窓の列挙が空」を
+/// 検出したら警告する。観測が嘘をついている状態そのものを可視化する。
+fn warn_if_observation_inconsistent(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetFocus};
+    if !owned_top_levels(hwnd).is_empty() {
+        return;
+    }
+    for (name, w) in [
+        ("active", unsafe { GetActiveWindow() }),
+        ("focus", unsafe { GetFocus() }),
+    ] {
+        if w.0.is_null() || w == hwnd {
+            continue;
+        }
+        if belongs_to_this_editor(hwnd, w) {
+            tracing::warn!(
+                target: RESIZE_TARGET,
+                hwnd = format!("{:#x}", hwnd.0 as usize),
+                which = name,
+                window = %describe_hwnd(w),
+                "OBSERVATION INCONSISTENT: owned-window enumeration is empty but this \
+                 window belongs to our group — the enumeration is lying"
+            );
+            return;
+        }
+    }
 }
 
 /// `target` が**この窓のグループ**に属するか (子 or こちらが root owner の窓)。
@@ -1631,8 +1778,14 @@ unsafe extern "system" fn editor_wnd_proc(
                 // (`WM_NCACTIVATE` の読み替え) と対にして、
                 //   「このプロセスが前面 かつ グループ内の窓がアクティブ」
                 // のときだけアクティブ色、という 1 つの規則に揃える。
-                let owns_popup = owned_popup(hwnd).is_some();
-                set_caption_active(hwnd, shared, app_active && owns_popup);
+                // 条件は **`WM_NCACTIVATE` 側と同じ述語**で書く (SSoT)。
+                // 以前は「所有 popup が居るか」を列挙で判定していたが、その列挙が
+                // 壊れていて常に false になり、この経路が丸ごと死んでいた。
+                // 「いまアクティブな窓が自分のグループか」を直接聞けば列挙は要らない。
+                let active =
+                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow() };
+                let group_active = belongs_to_this_editor(hwnd, active);
+                set_caption_active(hwnd, shared, app_active && group_active);
 
                 // r.md #65: Alt+Tab の観測点。**発火するメッセージ側に付ける**
                 // (`WM_ACTIVATE` に付けていたが、逃げた後は来ないので空振りだった)。
@@ -1642,13 +1795,13 @@ unsafe extern "system" fn editor_wnd_proc(
                     app_active,
                     owned_popup = %describe_owned_popup(hwnd),
                     last_active_popup = %describe_last_active_popup(hwnd),
-                    container_visible = unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd)
-                    }
-                    .as_bool(),
+                    container = %describe_rect_and_visibility(hwnd),
+                    container_above = %describe_windows_above(hwnd, 4),
                     state = %describe_input_state(),
                     "WM_ACTIVATEAPP"
                 );
+                // 観測が嘘をついていないかを機械に検査させる (r.md #65)。
+                warn_if_observation_inconsistent(hwnd);
             }
             // 既定動作 (フォーカス周りの内部処理) は潰さずそのまま流す。
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
