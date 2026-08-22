@@ -1430,6 +1430,14 @@ impl PluginHost {
         self.detach_and_quiesce(device_id);
         // (3) editor を先に取り出しておく (drop は plugin teardown の後)。
         let editor = rec.editor.take();
+        // r.md #65 同件: `close_slot_gui` と同じく、**アクティブな窓を破棄すると
+        // アクティブは owner ではなく Alt+Esc 順の次の窓へ移る**。判定は drop の
+        // 前に取る。この経路 (device 削除 / 差し替え / track 削除 / shutdown) は
+        // 通常 daw_gui 発なので前面は daw_gui = 自分のグループではなく、述語が
+        // `None` を返して何もしない。エディタを触っている最中に消えた場合だけ効く。
+        let restore_foreground = editor
+            .as_ref()
+            .and_then(editor_window::EditorWindow::owner_to_restore_if_foreground);
         // (4) plugin-main thread で teardown + drop。
         //     **teardown 順序を守ること**: stop_processing → deactivate →
         //     gui_destroy → drop (kHs 系 VST3 の Drop crash 防止)。
@@ -1437,6 +1445,9 @@ impl PluginHost {
         // (5) container window の破棄 (gui_destroy の後) + GUI 開状態の同期。
         if editor.is_some() {
             drop(editor);
+            if let Some(owner) = restore_foreground {
+                editor_window::restore_foreground_to_owner(owner);
+            }
             // r.md #49: `close_slot_gui` と同じ理由 — 窓が尽きたら非アクティブへ落とす。
             if self.instances.values().all(|r| r.editor.is_none()) {
                 editor_window::clear_windows_active();
@@ -1879,11 +1890,23 @@ impl PluginHost {
         if let Some(geometry) = last_geometry {
             self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
         }
+        // r.md #65: 破棄すると **アクティブは owner ではなく Alt+Esc 順の次の窓**へ
+        // 移る (window-features "Destroying a Window")。前面が自分のグループだった
+        // ときだけ、破棄後に owner (daw_gui 本体窓) へ明示的に戻す。判定は破棄の
+        // **前**に取る (破棄後では自分の窓がもう無く、判定材料が消えている)。
+        let restore_foreground = self
+            .instances
+            .get(&device_id)
+            .and_then(|rec| rec.editor.as_ref())
+            .and_then(editor_window::EditorWindow::owner_to_restore_if_foreground);
         if let Some(rec) = self.instances.get_mut(&device_id) {
             let _ = rec.plugin.gui_hide();
             rec.plugin.gui_destroy();
             // Drop = DestroyWindow, run after gui_destroy detached the child.
             rec.editor = None;
+        }
+        if let Some(owner) = restore_foreground {
+            editor_window::restore_foreground_to_owner(owner);
         }
         // r.md #36: 窓を壊すと対応する key-up はもう届かない (`editor_device_of` が
         // None を返す) ので、 横取り中の記録をここで捨てる。 残すと次に別のキーの
