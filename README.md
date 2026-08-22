@@ -118,9 +118,16 @@ GPLv2 系へ後退させることはできない**。
 `make fetch-ffmpeg` が取得するのは
 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) の `n7.1 win64-lgpl-shared`
 ビルド (`--enable-version3` 付き、`--enable-gpl` / `--enable-nonfree` なし)。実際の
-configure 行は `third_party/ffmpeg/bin/ffmpeg.exe -version` で確認できる。DLL は
-改名せずそのまま使うので、同じ ABI (avcodec-61 / avformat-61 / avutil-59 / swscale-8 /
-swresample-5) の自前ビルドに差し替えられる。
+configure 行は `third_party/ffmpeg/bin/ffmpeg.exe -version` と、アプリ内の
+**ヘルプ > バージョン情報** で確認できる (後者は実行中のライブラリに問い合わせた実測値)。
+DLL は改名せずそのまま使うので、同じ ABI (avcodec-61 / avformat-61 / avutil-59 /
+swscale-8 / swresample-5) の自前ビルドに差し替えられる。
+
+取得は **URL + sha256 固定**で、上流 (BtbN は日次ビルドを約 2 週間で削除する) が消えたら
+このリポジトリの release に置いたミラーへ自動でフォールバックする。ミラーには**対応する
+ソース一式**も併置している (GPL-3.0 §6(d))。設計と手順は
+[docs/ffmpeg_mirror.md](docs/ffmpeg_mirror.md)、成果物の用意は `make ffmpeg-mirror`
+(アップロードは自動化していない)。
 
 **ビルド済みバイナリを配布するときは** FFmpeg の DLL に加えて
 `third_party/ffmpeg/LICENSE.txt` (LGPL v3 全文) と GPL v3 全文を同梱し、対応する FFmpeg の

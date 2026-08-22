@@ -17,3 +17,5 @@
 /r.md
 # Python のバイトコードキャッシュ (scripts/*.py を import したときに出る)。
 __pycache__/
+# ミラー用の成果物 (make ffmpeg-mirror)。60MB 超のバイナリなので追跡しない。
+/dist/

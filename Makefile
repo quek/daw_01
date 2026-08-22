@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Tahara Yoshinori
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-.PHONY: help build run test test-rt clippy license-check clean release run-release fmt check fetch-ffmpeg worktree-rm worktree-rm-merged
+.PHONY: help build run test test-rt clippy license-check clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
 # `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
@@ -47,18 +47,10 @@ TEST_PKGS := -p common -p daw_gui -p daw_audio -p daw_plugin_host \
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)
 # を維持すること (vendored binding daw_gui/ffmpeg/binding_ffmpeg_7.1.rs と一致させるため)。
-# BtbN は asset 名に版サフィックスを付け替えるので URL は固定せず latest リリースの
-# asset 一覧から n7.1 win64 LGPL shared を探して取得する。
-FFMPEG_DIR := third_party/ffmpeg
-FFMPEG_API := https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest
-FFMPEG_MATCH := n7\.1.*win64-lgpl-shared
-# r.md #60: BtbN の lgpl variant は configure に --enable-version3 を付けるので、
-# 取ってくる DLL は LGPL **v3**。zip ルートの LICENSE.txt がその全文 (= FFmpeg の
-# COPYING.LGPLv3)。ここを取り込まないと third_party/ffmpeg にライセンス文書が 1 つも
-# 無い状態になり、バイナリを配った瞬間に LGPL-3.0 §4(b)「GNU GPL と本ライセンス文書の
-# 写しを同梱せよ」を満たせなくなる。既存インストールの取りこぼしはこの URL から復旧する
-# (BtbN が LICENSE.txt にコピーしているのと同一の文書)。
-FFMPEG_LGPL3_URL := https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/COPYING.LGPLv3
+# 取得元の pin (URL / sha256) と取得ロジックは scripts/fetch_ffmpeg.sh が SSoT。
+# ここに URL を二重化しない。ミラーの用意は scripts/prepare_ffmpeg_mirror.sh、
+# 置き場所と手順は docs/ffmpeg_mirror.md。
+# (取得先ディレクトリも script 側の既定。上書きは FFMPEG_DIR 環境変数で。)
 
 help:
 	@echo "daw_01 makefile targets (cargo ラッパー):"
@@ -74,44 +66,27 @@ help:
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
 	@echo "  make fmt           cargo fmt"
 	@echo "  make fetch-ffmpeg  third_party/ffmpeg を取得 (無ければ DL、各マシン 1 回)"
+	@echo "  make fetch-ffmpeg-force  third_party/ffmpeg を取り直す"
+	@echo "  make ffmpeg-mirror ミラー用の成果物を dist/ffmpeg-mirror/ に用意 (上げはしない)"
 	@echo "  make clean         target/ を削除"
 	@echo "  make worktree-rm NAME=<name>   マージ済み worktree を安全に削除 (junction 安全 + ロック解除 + branch 削除)"
 	@echo "  make worktree-rm-merged       マージ済み worktree を全部削除"
 
 # third_party/ffmpeg を取得する (gitignore なので checkout では入らない)。
-# avcodec.lib があれば skip (idempotent)。再取得は: rm -rf third_party/ffmpeg && make fetch-ffmpeg
+# 実体は scripts/fetch_ffmpeg.sh (URL 固定 + sha256 検証 + ミラーへのフォールバック)。
+# avcodec.lib があれば skip (idempotent)。取り直しは make fetch-ffmpeg-force。
 fetch-ffmpeg:
-	@if [ -f "$(FFMPEG_DIR)/lib/avcodec.lib" ]; then \
-		echo "FFmpeg present: $(FFMPEG_DIR)"; \
-	else \
-		set -e; \
-		echo "Resolving asset from $(FFMPEG_API)"; \
-		url=$$(curl -fsSL "$(FFMPEG_API)" | grep -oE 'https://[^"]+\.zip' | grep -iE '$(FFMPEG_MATCH)' | head -n1); \
-		[ -n "$$url" ] || { echo "ERROR: n7.1 win64 lgpl-shared asset not found in BtbN latest release"; exit 1; }; \
-		tmp="$(FFMPEG_DIR)_dl_tmp"; \
-		rm -rf "$$tmp"; mkdir -p "$$tmp"; \
-		echo "Downloading $$url"; \
-		curl -fL -o "$$tmp/ffmpeg.zip" "$$url"; \
-		echo "Extracting"; \
-		unzip -q "$$tmp/ffmpeg.zip" -d "$$tmp"; \
-		inner=$$(find "$$tmp" -maxdepth 1 -type d -name 'ffmpeg-*' | head -n1); \
-		[ -n "$$inner" ] || { echo "ERROR: extracted ffmpeg-* folder not found"; exit 1; }; \
-		rm -rf "$(FFMPEG_DIR)"; \
-		mkdir -p "$(FFMPEG_DIR)"; \
-		cp -r "$$inner/bin" "$$inner/lib" "$$inner/include" "$(FFMPEG_DIR)/"; \
-		[ -f "$$inner/LICENSE.txt" ] || { echo "ERROR: LICENSE.txt missing at the root of the BtbN zip"; exit 1; }; \
-		cp "$$inner/LICENSE.txt" "$(FFMPEG_DIR)/LICENSE.txt"; \
-		rm -rf "$$tmp"; \
-		[ -f "$(FFMPEG_DIR)/lib/avcodec.lib" ] || { echo "ERROR: avcodec.lib missing after fetch"; exit 1; }; \
-		echo "FFmpeg fetched into $(FFMPEG_DIR)"; \
-	fi
-	@if [ ! -f "$(FFMPEG_DIR)/LICENSE.txt" ]; then \
-		echo "FFmpeg LICENSE.txt missing (fetched before r.md #60) — restoring LGPLv3 text"; \
-		curl -fsSL --max-time 60 -o "$(FFMPEG_DIR)/LICENSE.txt" "$(FFMPEG_LGPL3_URL)" \
-			|| { rm -f "$(FFMPEG_DIR)/LICENSE.txt"; \
-			     echo "WARNING: could not fetch the LGPLv3 text. Binary releases MUST ship it"; \
-			     echo "         (LGPL-3.0 section 4(b)). Re-run 'make fetch-ffmpeg' when online."; }; \
-	fi
+	@$(BASH) "$(CURDIR)/scripts/fetch_ffmpeg.sh"
+
+# 既存の third_party/ffmpeg を取り直す (pin を上げたときなど)。
+# 新しい方が展開・検証できてから入れ替えるので、失敗しても既存を壊さない。
+fetch-ffmpeg-force:
+	$(BASH) "$(CURDIR)/scripts/fetch_ffmpeg.sh" --force
+
+# ミラー用の成果物 (BtbN バイナリ + 対応するソース) を dist/ffmpeg-mirror/ に用意する。
+# **アップロードはしない**。手順は docs/ffmpeg_mirror.md。
+ffmpeg-mirror:
+	$(BASH) "$(CURDIR)/scripts/prepare_ffmpeg_mirror.sh"
 
 build: fetch-ffmpeg
 	cargo build $(RUN_PKGS)

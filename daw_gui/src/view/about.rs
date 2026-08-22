@@ -83,6 +83,11 @@ fn overview_lines() -> Vec<String> {
         "この製品は FFmpeg プロジェクトのライブラリを LGPL v3 の下で利用しています".to_string(),
         "(https://www.gnu.org/licenses/lgpl-3.0.html)。FFmpeg のソースは".to_string(),
         "https://ffmpeg.org/download.html から入手できます。".to_string(),
+        // FFmpeg legal.html は「ソースの入手先を示せ」と要求する。上流の一般 URL だけでなく、
+        // **この exe が実際にリンクしているビルドに対応するソース** の在処も出す
+        // (docs/ffmpeg_mirror.md。バイナリと同じ release に併置してある)。
+        format!("同梱ビルドに対応するソースは {SOURCE_URL}/releases のミラー"),
+        "(tag: vendor-ffmpeg-…) にバイナリと併置しています。".to_string(),
         String::new(),
         "VOICEVOX は別個のプログラムです。daw_01 には VOICEVOX のコード・音声モデル・".to_string(),
         "キャラクター音声は一切含まれません。生成した音声の利用は VOICEVOX と各".to_string(),
