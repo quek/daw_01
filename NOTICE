@@ -64,10 +64,16 @@ The BtbN build statically links a number of external libraries into those DLLs.
 Their licences travel with the binaries, not with this repository; the exact set
 is printed by the same `-version` command.  Notable ones are libmp3lame, libopus,
 libvorbis, libtheora, libvpx, libwebp, libass, libfreetype, libharfbuzz,
-libfribidi, libaom, libdav1d, librav1e, libsvtav1, libzimg, libsoxr, libsnappy
-and zlib (LGPL / MIT / BSD-style), plus gmp and libaribb24 (LGPL v3) and libvmaf
-and libopencore-amr (Apache-2.0) — the last four are why `--enable-version3` is
-required for this configuration.
+libfribidi, libaom, libdav1d, librav1e, libsvtav1, libopenh264, libzimg, libsoxr,
+libsnappy and zlib (LGPL / MIT / BSD-style), plus gmp and libaribb24 (LGPL v3) and
+libvmaf and libopencore-amr (Apache-2.0) — the last four are why
+`--enable-version3` is required for this configuration.
+
+libopenh264 (Cisco, BSD 2-Clause) is the H.264 *encoder* of this configuration,
+`libx264` being disabled.  It is what generates the test fixture
+`daw_gui/tests/fixtures/smoke_test.mp4` and the temporary clips that the video
+tests encode at runtime, so that everything this repository produces comes out of
+the same LGPL build it declares.
 
 FFmpeg also contains three files taken from the Independent JPEG Group's libjpeg
 (`libavcodec/jfdctfst.c`, `libavcodec/jfdctint_template.c`, `libavcodec/jrevdct.c`).

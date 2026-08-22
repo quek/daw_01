@@ -444,6 +444,9 @@ unsafe fn bgra_to_rgba_ssse3(src: &[u8], dst: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 公開前整備: fixture 用 ffmpeg の解決とエンコーダ指定は `crate::test_ffmpeg` が SSoT。
+    // 以前は 3 モジュールが同じ helper を各自に持ち、いずれも PATH の ffmpeg を探していた。
+    use crate::test_ffmpeg::{locate_ffmpeg, skip_reason, H264_ENCODER};
     use common::model::{
         AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
         AutomationTarget, Clip, ClipContent, Song, VideoContent, VideoEvent, VideoSource,
@@ -593,7 +596,7 @@ mod tests {
     #[test]
     fn decode_at_returns_bgra_frame_at_target_micros() {
         let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("decode_at: ffmpeg not on PATH, skipping");
+            eprintln!("{}", skip_reason("decode_at"));
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -604,7 +607,7 @@ mod tests {
             .args([
                 "-f", "lavfi",
                 "-i", "color=c=green:size=320x240:duration=2:rate=30",
-                "-c:v", "libx264",
+                "-c:v", H264_ENCODER,
                 "-pix_fmt", "yuv420p",
                 "-y",
                 mp4.to_str().unwrap(),
@@ -717,14 +720,6 @@ mod tests {
         assert_eq!(simd_out, scalar_out, "SIMD and scalar paths must agree");
     }
 
-    fn locate_ffmpeg() -> Option<std::path::PathBuf> {
-        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(exe))
-                .find(|p| p.is_file())
-        })
-    }
 
     // ====================================================================
     // P7: multi-clip composite (active_sources_at) + per-event alpha.
