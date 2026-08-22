@@ -129,8 +129,16 @@ Bespoke/Logic/Live)。
   作るとメッセージが孤立する。
 - teardown 順: plugin.gui_destroy (view.removed() = プラグインが子窓を detach) → editor.destroy
   (DestroyWindow 親)。逆順だと子が attached のまま親破棄。
-- editor 窓を A の本体窓の owner にしては **いけない** (GA_ROOTOWNER が A に解決して再発)。
-  owner なしの独立トップレベルにする。
+- ~~editor 窓を A の本体窓の owner にしては **いけない** (GA_ROOTOWNER が A に解決して再発)。
+  owner なしの独立トップレベルにする。~~
+  **2026-08-22 撤回。** JUCE のメニューが使う述語は
+  `Process::isForegroundProcess() || isEmbeddedInForegroundProcess(c)` で、
+  `GA_ROOTOWNER` を見るのは `||` の**右側 = 救済パス**。判定を緩める方向にしか効かないので、
+  `GA_ROOTOWNER` が A に解決することが dismiss を引き起こすことは原理的に無い。
+  #31 を踏んだ真因は「A が窓を**作って**いた」= 窓が A のプロセスに属し
+  `Process::isForegroundProcess()` (前面窓の **プロセス ID** 比較) が false になったこと。
+  **editor 窓は B が作り、owner は A の本体窓**にする (r.md #65。REAPER と同じ構成)。
+  詳細は CLAUDE.md「プラグインエディタ窓と Win32」節。
 - 既存 GetMessageW ポンプ / WM_COMMAND_WAKE drain は残す (JUCE async menu が依存)。
 - builtin / voicevox は `gui_is_embed_supported()==false` で open_gui が早期 return、窓を作らない。
 
