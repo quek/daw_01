@@ -48,6 +48,9 @@ mod draw;
 use draw::*;
 mod geometry;
 use geometry::*;
+/// r.md #67: 「選択集合に共通の delta を端で縮める」 規則は drag (widget) と
+/// カーソルキー nudge (handler) の共有 SSoT。
+pub(crate) use geometry::{clamp_shared_delta, clamp_shared_pitch_delta};
 mod run;
 pub use run::piano_roll;
 
@@ -909,6 +912,15 @@ struct NoteDragAnchor {
     start_beat: f64,
     pitch: u8,
     len_beats: f64,
+    /// この note が **content-local 拍 0** に来る song-absolute 拍
+    /// (= 所属クリップの content 原点、`PrContent.clip_starts[clip_slot]`)。
+    ///
+    /// r.md #67 の集合クランプの下限。 note は共有 content への相対位置で保存され、
+    /// model 側 (`set_note_positions`) が content-local 拍を 0 で clamp するので、
+    /// widget が song-absolute 0 で clamp すると「widget では動いたのに handler で
+    /// 潰れる」 ずれになる (小節 5 から始まるクリップで顕著)。 複数クリップ同時表示では
+    /// note ごとに原点が違うので anchor 単位で持つ。
+    min_start_beat: f64,
 }
 
 /// 1 度の note drag セッション (move / resize / 複数同時)。

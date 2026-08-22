@@ -149,6 +149,14 @@ pub struct UiEphemeral {
     /// キャンセルする)。 ミラーは 1 frame 遅延だが、 編集モードは L 押下〜Esc 押下まで
     /// 複数フレーム持続するので調停に支障はない。
     pub piano_roll_lyric_editing: bool,
+    /// r.md #67: ピアノロールの note grid の表示範囲 `(拍数, 半音数)`。
+    /// `piano_roll` widget が毎フレーム mirror する session-only 値 (project save に含めない)。
+    ///
+    /// 表示範囲は grid の px サイズ ÷ zoom で決まるので **view しか知らない**。 一方、
+    /// カーソルキーで動かしたノートを画面内に追う処理は handler 側にある
+    /// (`AppData::nudge_selected_notes_*`)。 そのために「今どれだけ見えているか」 だけを
+    /// mirror する。 `None` = ピアノロールがまだ 1 度も描かれていない (追従しない)。
+    pub pianoroll_viewport: Option<(f64, f32)>,
     /// `Some(target)` で Audio Editor (= clip ダブルクリックで開く波形
     /// 編集 view) が開いている。 bottom_panel の Piano Roll タブが
     /// audio_editor view に切り替わる (`docs/plan_audio_clip.md` §3.10
