@@ -28,14 +28,15 @@ import tempfile
 import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENGINE = os.path.join(HERE, "guard_engine.py")
-DESTRUCT = os.path.join(HERE, "check_destructive_delete.py")
-REFLECT = os.path.join(HERE, "reflect.py")
-REAL_PROJ = os.path.join(os.path.expanduser("~"), ".claude", "projects", "F--dev-daw-01")
-REAL_GUARDS = os.path.join(REAL_PROJ, "guards.jsonl")
-MEM_DIR = os.path.join(REAL_PROJ, "memory")
+sys.path.insert(0, HERE)
+import ahe_paths  # noqa: E402  (the module under test for slug/path derivation)
+
+DESTRUCT = os.path.join(HERE, "check_destructive_delete.py")  # registry-independent
+HOOK_SCRIPTS = ("guard_engine.py", "reflect.py", "ahe_paths.py")
+REAL_GUARDS = ahe_paths.guards_file()          # <repo>/.claude/guards.jsonl (tracked)
+MEM_DIR = os.path.join(ahe_paths.state_dir(), "memory")
 # optional arg: validate a candidate registry (e.g. scripts/guards.proposed.jsonl) in the
-# sandbox without touching the live, all-worktree-shared guards.jsonl.
+# sandbox without touching the tracked one.
 GUARDS_SRC = sys.argv[1] if len(sys.argv) > 1 else REAL_GUARDS
 
 # Synthetic repo root for the fixtures below. Never write a real machine path here:
@@ -68,10 +69,40 @@ def bad(name, detail):
 
 
 # ---------------------------------------------------------------- sandbox setup
-_sandbox = tempfile.mkdtemp(prefix="guard_test_")
-_sb_proj = os.path.join(_sandbox, ".claude", "projects", "F--dev-daw-01")
-os.makedirs(_sb_proj, exist_ok=True)
-shutil.copyfile(GUARDS_SRC, os.path.join(_sb_proj, "guards.jsonl"))
+# The hooks resolve their registry from THEIR OWN location (<repo>/scripts/x.py ->
+# <repo>/.claude/guards.jsonl), so a sandbox is a throwaway REPO: scripts/ copies of
+# the real hooks plus a registry. HOME points at the same dir, so guard_hits.jsonl and
+# guard_state.json land inside the sandbox and the live ones are never touched (a
+# stray hit could otherwise trip reflect.py's warn->block escalation for real).
+def make_sandbox(prefix, guards_src=GUARDS_SRC):
+    sb = tempfile.mkdtemp(prefix=prefix)
+    os.makedirs(os.path.join(sb, "scripts"), exist_ok=True)
+    os.makedirs(os.path.join(sb, ".claude"), exist_ok=True)
+    for name in HOOK_SCRIPTS:
+        shutil.copyfile(os.path.join(HERE, name), os.path.join(sb, "scripts", name))
+    if guards_src is not None:
+        shutil.copyfile(guards_src, os.path.join(sb, ".claude", "guards.jsonl"))
+    return sb
+
+
+def sb_script(sandbox, name):
+    return os.path.join(sandbox, "scripts", name)
+
+
+def sb_registry(sandbox):
+    return os.path.join(sandbox, ".claude", "guards.jsonl")
+
+
+def sb_proj(sandbox):
+    """The state dir the sandboxed hooks will use (HOME == sandbox root)."""
+    return os.path.join(sandbox, ".claude", "projects", ahe_paths.slug(sandbox))
+
+
+def sb_state(sandbox):
+    return os.path.join(sb_proj(sandbox), "guard_state.json")
+
+
+_sandbox = make_sandbox("guard_test_")
 
 
 def _sandbox_env(home):
@@ -83,15 +114,17 @@ def _sandbox_env(home):
     return env
 
 
-def run_engine(tool_name, tool_input, home=None, cwd=None):
+def run_engine(tool_name, tool_input, sandbox=None, cwd=None):
+    sb = sandbox or _sandbox
     payload_obj = {"session_id": "TEST_SESSION", "tool_name": tool_name,
                    "tool_input": tool_input}
     if cwd is not None:
         payload_obj["cwd"] = cwd
     payload = json.dumps(payload_obj)
-    p = subprocess.run([sys.executable, ENGINE], input=payload.encode("utf-8"),
+    p = subprocess.run([sys.executable, sb_script(sb, "guard_engine.py")],
+                       input=payload.encode("utf-8"),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       env=_sandbox_env(home or _sandbox))
+                       env=_sandbox_env(sb))
     out = (p.stdout + p.stderr).decode("utf-8", "replace")
     return p.returncode, out
 
@@ -133,7 +166,8 @@ def check_registry():
             if r.get("action") not in ("warn", "block"):
                 bad("registry:%s-action" % rid, "action=%r" % r.get("action"))
             if r.get("field") not in ("command", "command_code", "text", "file_path",
-                                      "ask_options", "worktree_outside", "ask_multi", None):
+                                      "ask_options", "worktree_outside", "cd_redundant",
+                                      "ask_multi", None):
                 bad("registry:%s-field" % rid, "field=%r" % r.get("field"))
             pats = []
             for key in ("all", "none"):
@@ -392,24 +426,85 @@ def check_engine():
 
 
 def check_engine_robustness():
+    engine = sb_script(_sandbox, "guard_engine.py")
     # empty stdin
-    p = subprocess.run([sys.executable, ENGINE], input=b"", stdout=subprocess.PIPE,
+    p = subprocess.run([sys.executable, engine], input=b"", stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, env=_sandbox_env(_sandbox))
     ok("robust:empty-stdin") if p.returncode == 0 else bad("robust:empty-stdin", "exit=%d" % p.returncode)
     # malformed json
-    p = subprocess.run([sys.executable, ENGINE], input=b"{not json", stdout=subprocess.PIPE,
+    p = subprocess.run([sys.executable, engine], input=b"{not json", stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, env=_sandbox_env(_sandbox))
     ok("robust:bad-json") if p.returncode == 0 else bad("robust:bad-json", "exit=%d" % p.returncode)
-    # missing guards file -> must not crash (point at empty sandbox)
-    empty = tempfile.mkdtemp(prefix="guard_empty_")
-    rc, out = run_engine("Bash", {"command": "cd /foo"}, home=empty)
-    ok("robust:no-guards-file") if rc == 0 else bad("robust:no-guards-file", "exit=%d" % rc)
-    shutil.rmtree(empty, ignore_errors=True)
     # field selection: MultiEdit edits[].new_string
     rc, out = run_engine("MultiEdit", {"file_path": "x.rs",
                                        "edits": [{"old_string": "a", "new_string": "low-risk hack"}]})
     ok("robust:multiedit-field") if "compromise-smell-en" in fired_ids(out) else \
         bad("robust:multiedit-field", "edits[].new_string not scanned | %s" % sorted(fired_ids(out)))
+
+
+# ------------------------------------------------- registry defects are NOT silent
+# The 2026-08-22 outage: guards.jsonl had been gone for five days and produced no
+# symptom at all, because the engine did `if not isfile: return 0`. A broken registry
+# must be VISIBLE (stdout + exit 0 -- loud, but never wedging the session that is
+# trying to repair it).
+def check_registry_defect_is_reported():
+    cases = [
+        ("missing", None, "レジストリが存在しません"),
+        ("empty", "", "ルールが 1 件もありません"),
+        ("comments-only", "# only a comment\n\n", "ルールが 1 件もありません"),
+        ("unparseable", "{not json\nalso not json\n", "JSON として読めません"),
+    ]
+    for label, content, expect in cases:
+        sb = make_sandbox("guard_defect_", guards_src=None)
+        if content is not None:
+            with open(sb_registry(sb), "w", encoding="utf-8") as fh:
+                fh.write(content)
+        rc, out = run_engine("Bash", {"command": "git add -A"}, sandbox=sb)
+        problems = []
+        if rc != 0:
+            problems.append("exit=%d want 0 (fail-open)" % rc)
+        if expect not in out:
+            problems.append("警告文に %r が無い | out=%r" % (expect, out[:160]))
+        if fired_ids(out):
+            problems.append("ルールが無いのに発火 %s" % sorted(fired_ids(out)))
+        if problems:
+            bad("defect:%s" % label, "; ".join(problems))
+        else:
+            ok("defect:%s" % label)
+        # ...and the warning is once per session, not on every single tool call
+        rc2, out2 = run_engine("Bash", {"command": "git add -A"}, sandbox=sb)
+        if rc2 == 0 and expect not in out2:
+            ok("defect:%s-once-per-session" % label)
+        else:
+            bad("defect:%s-once-per-session" % label,
+                "2 回目も警告が出た (exit=%d)" % rc2)
+        shutil.rmtree(sb, ignore_errors=True)
+
+
+# ------------------------------------------------------------- path/slug derivation
+def check_paths():
+    """The slug rule must reproduce Claude Code's real project directory names.
+    Hardcoding "F--dev-daw-01" is what made every non-default checkout fail open."""
+    cases = [
+        ("F:\\dev\\daw_01", "F--dev-daw-01"),
+        ("F:/dev/daw_01", "F--dev-daw-01"),
+        ("F:\\dev\\daw_01\\.claude\\worktrees\\rmd-60-license",
+         "F--dev-daw-01--claude-worktrees-rmd-60-license"),
+    ]
+    for path, expect in cases:
+        got = ahe_paths.slug(path)
+        ok("paths:slug(%s)" % path) if got == expect else \
+            bad("paths:slug(%s)" % path, "got %r want %r" % (got, expect))
+    # a worktree must resolve to the MAIN checkout, so all worktrees share one state dir
+    wt = "F:\\dev\\daw_01\\.claude\\worktrees\\rmd-60-license"
+    got = ahe_paths.slug(ahe_paths.main_checkout(wt))
+    ok("paths:worktree-shares-main-state") if got == "F--dev-daw-01" else \
+        bad("paths:worktree-shares-main-state", "got %r" % got)
+    # the registry is repo-relative and tracked
+    if os.path.isfile(REAL_GUARDS):
+        ok("paths:registry-tracked-in-repo")
+    else:
+        bad("paths:registry-tracked-in-repo", "missing %s" % REAL_GUARDS)
 
 
 # ---------------------------------------------------------------- 3. destructive
@@ -435,71 +530,94 @@ def check_destruct():
 
 
 # ---------------------------------------------------------------- 4. escalation
-def check_escalation():
-    """Seed a sandbox where a warn guard fired in 3 sessions; reflect.py must flip it to block."""
-    sb = tempfile.mkdtemp(prefix="guard_escal_")
-    proj = os.path.join(sb, ".claude", "projects", "F--dev-daw-01")
-    os.makedirs(proj, exist_ok=True)
-    rule = {"id": "test-escalate", "source": "feedback_no_command_chaining", "tool": ["Bash"],
-            "field": "command", "all": ["&&"], "action": "warn", "msg": "test"}
-    with open(os.path.join(proj, "guards.jsonl"), "w", encoding="utf-8") as fh:
+RULE_ESCALATE = {"id": "test-escalate", "source": "feedback_no_command_chaining",
+                 "tool": ["Bash"], "field": "command", "all": ["&&"],
+                 "action": "warn", "msg": "test"}
+
+
+def seed_escalation_sandbox(prefix, rule, sessions):
+    """A sandbox repo holding one warn rule plus a hit history."""
+    sb = make_sandbox(prefix, guards_src=None)
+    with open(sb_registry(sb), "w", encoding="utf-8") as fh:
         fh.write(json.dumps(rule, ensure_ascii=False) + "\n")
-    with open(os.path.join(proj, "guard_hits.jsonl"), "w", encoding="utf-8") as fh:
-        for s in ("sessA", "sessB", "sessC"):
-            fh.write(json.dumps({"ts": "t", "session": s, "guard": "test-escalate",
-                                 "source": "feedback_no_command_chaining", "tool": "Bash",
+    os.makedirs(sb_proj(sb), exist_ok=True)
+    with open(os.path.join(sb_proj(sb), "guard_hits.jsonl"), "w", encoding="utf-8") as fh:
+        for s in sessions:
+            fh.write(json.dumps({"ts": "t", "session": s, "guard": rule["id"],
+                                 "source": rule.get("source", ""), "tool": "Bash",
                                  "action": "warn"}) + "\n")
-    payload = json.dumps({"session_id": "sessD-stop"})
-    subprocess.run([sys.executable, REFLECT], input=payload.encode("utf-8"),
+    return sb
+
+
+def run_reflect(sb):
+    subprocess.run([sys.executable, sb_script(sb, "reflect.py")],
+                   input=json.dumps({"session_id": "sessD-stop"}).encode("utf-8"),
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_sandbox_env(sb))
-    with open(os.path.join(proj, "guards.jsonl"), "r", encoding="utf-8") as fh:
-        after = json.loads(fh.readline())
-    if after.get("action") == "block":
-        ok("escalate:warn->block@3sessions")
+
+
+def read_overlay(sb):
+    try:
+        with open(sb_state(sb), "r", encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("escalated") or {}
+    except Exception:
+        return {}
+
+
+def check_escalation():
+    """warn -> block must happen in the OVERLAY, leaving the tracked registry byte-identical."""
+    sb = seed_escalation_sandbox("guard_escal_", RULE_ESCALATE, ("sessA", "sessB", "sessC"))
+    before = open(sb_registry(sb), "rb").read()
+    run_reflect(sb)
+
+    # (1) the tracked registry must not have been touched -- this is the invariant that
+    #     made it safe to put the rules under version control in the first place.
+    after = open(sb_registry(sb), "rb").read()
+    ok("escalate:registry-untouched") if after == before else \
+        bad("escalate:registry-untouched", "reflect.py rewrote the tracked registry")
+
+    # (2) the overlay records the escalation
+    if read_overlay(sb).get("test-escalate") == "block":
+        ok("escalate:overlay-written@3sessions")
     else:
-        bad("escalate:warn->block@3sessions", "action stayed %r" % after.get("action"))
+        bad("escalate:overlay-written@3sessions", "overlay=%r" % read_overlay(sb))
+
+    # (3) round-trip: the engine reads the overlay back and now BLOCKS
+    rc, out = run_engine("Bash", {"command": "a && b"}, sandbox=sb)
+    if rc == 2 and "test-escalate" in fired_ids(out):
+        ok("escalate:engine-applies-overlay")
+    else:
+        bad("escalate:engine-applies-overlay", "exit=%d fired=%s" % (rc, sorted(fired_ids(out))))
+    shutil.rmtree(sb, ignore_errors=True)
 
     # control: 2 sessions must NOT escalate
-    sb2 = tempfile.mkdtemp(prefix="guard_escal2_")
-    proj2 = os.path.join(sb2, ".claude", "projects", "F--dev-daw-01")
-    os.makedirs(proj2, exist_ok=True)
-    with open(os.path.join(proj2, "guards.jsonl"), "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(rule, ensure_ascii=False) + "\n")
-    with open(os.path.join(proj2, "guard_hits.jsonl"), "w", encoding="utf-8") as fh:
-        for s in ("sessA", "sessB"):
-            fh.write(json.dumps({"ts": "t", "session": s, "guard": "test-escalate",
-                                 "action": "warn"}) + "\n")
-    subprocess.run([sys.executable, REFLECT], input=payload.encode("utf-8"),
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_sandbox_env(sb2))
-    with open(os.path.join(proj2, "guards.jsonl"), "r", encoding="utf-8") as fh:
-        after2 = json.loads(fh.readline())
-    if after2.get("action") == "warn":
+    sb2 = seed_escalation_sandbox("guard_escal2_", RULE_ESCALATE, ("sessA", "sessB"))
+    run_reflect(sb2)
+    if read_overlay(sb2).get("test-escalate") is None:
         ok("escalate:no-escalate@2sessions")
     else:
-        bad("escalate:no-escalate@2sessions", "action became %r" % after2.get("action"))
+        bad("escalate:no-escalate@2sessions", "overlay=%r" % read_overlay(sb2))
+    rc, out = run_engine("Bash", {"command": "a && b"}, sandbox=sb2)
+    ok("escalate:still-warn@2sessions") if rc == 0 else \
+        bad("escalate:still-warn@2sessions", "exit=%d" % rc)
+    shutil.rmtree(sb2, ignore_errors=True)
 
-    # opt-out: a warn rule with escalate:false must NOT escalate even at 3+ sessions
-    sb3 = tempfile.mkdtemp(prefix="guard_escal3_")
-    proj3 = os.path.join(sb3, ".claude", "projects", "F--dev-daw-01")
-    os.makedirs(proj3, exist_ok=True)
-    rule_opt = dict(rule, id="test-escalate-optout", escalate=False)
-    with open(os.path.join(proj3, "guards.jsonl"), "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(rule_opt, ensure_ascii=False) + "\n")
-    with open(os.path.join(proj3, "guard_hits.jsonl"), "w", encoding="utf-8") as fh:
-        for s in ("sessA", "sessB", "sessC", "sessD"):
-            fh.write(json.dumps({"ts": "t", "session": s, "guard": "test-escalate-optout",
-                                 "action": "warn"}) + "\n")
-    subprocess.run([sys.executable, REFLECT], input=payload.encode("utf-8"),
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_sandbox_env(sb3))
-    with open(os.path.join(proj3, "guards.jsonl"), "r", encoding="utf-8") as fh:
-        after3 = json.loads(fh.readline())
-    if after3.get("action") == "warn":
+    # opt-out: a warn rule with escalate:false must NOT escalate even at 4 sessions
+    rule_opt = dict(RULE_ESCALATE, id="test-escalate-optout", escalate=False)
+    sb3 = seed_escalation_sandbox("guard_escal3_", rule_opt,
+                                  ("sessA", "sessB", "sessC", "sessD"))
+    run_reflect(sb3)
+    if read_overlay(sb3).get("test-escalate-optout") is None:
         ok("escalate:optout-respected@4sessions")
     else:
-        bad("escalate:optout-respected@4sessions", "escalate:false rule became %r" % after3.get("action"))
+        bad("escalate:optout-respected@4sessions", "overlay=%r" % read_overlay(sb3))
 
-    shutil.rmtree(sb, ignore_errors=True)
-    shutil.rmtree(sb2, ignore_errors=True)
+    # ...and even a hand-forged overlay entry cannot resurrect an opted-out rule
+    os.makedirs(sb_proj(sb3), exist_ok=True)
+    with open(sb_state(sb3), "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "escalated": {"test-escalate-optout": "block"}}, fh)
+    rc, out = run_engine("Bash", {"command": "a && b"}, sandbox=sb3)
+    ok("escalate:optout-ignores-stale-overlay") if rc == 0 else \
+        bad("escalate:optout-ignores-stale-overlay", "exit=%d (block した)" % rc)
     shutil.rmtree(sb3, ignore_errors=True)
 
 
@@ -537,11 +655,52 @@ def check_worktree_guard():
             ok("wtguard:%s" % label)
 
 
+# ------------------------------------------------------- no-cd-prefix (cwd-relational)
+def check_cd_guard():
+    """`cd` is only a violation RELATIVE to where the session already is: cd'ing to the
+    cwd is redundant, and cd'ing from a worktree to the main checkout or a sibling is
+    the cross-agent hazard. `cd /tmp` or `cd build/` is legitimate and must stay silent
+    -- which is why this is a logic guard, not a regex on "^cd "."""
+    WT = f"{SYN_ROOT}/.claude/worktrees/foo"
+    CCASES = [
+        ("cd/pos-same", f'cd {WT} && cargo build', WT, 2, True),
+        ("cd/pos-same-quoted", f'cd "{WT}" && cargo build', WT, 2, True),
+        ("cd/pos-same-trailing-slash", f'cd {WT}/ && cargo build', WT, 2, True),
+        ("cd/pos-main-from-worktree", f'cd {SYN_ROOT} && git status', WT, 2, True),
+        ("cd/pos-sibling-worktree", f'cd {SYN_ROOT}/.claude/worktrees/bar && ls', WT, 2, True),
+        ("cd/pos-backslash", f'cd {SYN_ROOT_BS}\\.claude\\worktrees\\foo && ls', WT, 2, True),
+        ("cd/pos-same-in-main-session", f'cd {SYN_ROOT} && git status', SYN_ROOT, 2, True),
+        ("cd/neg-elsewhere", "cd /tmp && ls", WT, 0, False),
+        ("cd/neg-subdir", "cd daw_gui && cargo build", WT, 0, False),
+        ("cd/neg-own-subdir-abs", f"cd {WT}/daw_gui && cargo build", WT, 0, False),
+        ("cd/neg-not-a-cd", "cargo build", WT, 0, False),
+        ("cd/neg-no-cwd", f"cd {WT} && ls", None, 0, False),
+    ]
+    for label, cmd, cwd, exp_exit, should in CCASES:
+        rc, out = run_engine("Bash", {"command": cmd}, cwd=cwd)
+        f = fired_ids(out)
+        problems = []
+        if rc != exp_exit:
+            problems.append("exit=%d want %d" % (rc, exp_exit))
+        fired = "no-cd-prefix" in f
+        if should and not fired:
+            problems.append("expected fire")
+        if not should and fired:
+            problems.append("unexpected fire")
+        if problems:
+            bad("cdguard:%s" % label, "; ".join(problems) + " | fired=%s" % sorted(f))
+        else:
+            ok("cdguard:%s" % label)
+
+
 def main():
+    check_paths()
     check_registry()
     check_engine()
     check_engine_robustness()
+    check_registry_defect_is_reported()
     check_worktree_guard()
+    check_cd_guard()
     check_destruct()
     check_escalation()
     shutil.rmtree(_sandbox, ignore_errors=True)

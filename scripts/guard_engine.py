@@ -21,9 +21,31 @@ autonomous: a recurring friction becomes an active forcing function.
 
 Registry
 --------
-~/.claude/projects/F--dev-daw-01/guards.jsonl  (one JSON object per line).
-Per-project user dir => shared across the main repo and ALL worktrees, like
-metrics/backlog (no git churn, no merge conflict). Each rule:
+<repo>/.claude/guards.jsonl -- TRACKED, one JSON object per line.
+
+It used to live in the per-project user dir, outside git. That was wrong and it
+cost the project the whole registry: on 2026-08-22 the file was found missing,
+with the last recorded fire on 08-17, i.e. every pattern guard had been a silent
+no-op for five days. The reason it was kept out of git was that reflect.py wrote
+the auto warn->block escalation back into the same file, which would have made
+every worktree permanently dirty. So two things of DIFFERENT KIND were sharing
+one file, and the mutable one dragged the durable one out of version control.
+
+They are now separated:
+
+    <repo>/.claude/guards.jsonl        rule bodies. Hand-written project
+                                       knowledge, same class as CLAUDE.md and
+                                       .claude/hooks/ -- tracked, reviewed,
+                                       branch-aware, restorable.
+    <state>/guard_state.json           escalation overlay {rule id: "block"}.
+                                       Runtime state, git-external, shared by all
+                                       worktrees, and fully recomputable from
+                                       guard_hits.jsonl if it is ever lost.
+
+This engine reads the tracked rules and applies the overlay on top; reflect.py
+writes ONLY the overlay and never touches a tracked file. Paths come from
+scripts/ahe_paths.py (repo root from __file__, state dir from the main
+checkout's slug) -- nothing is hardcoded to one machine. Each rule:
 
     id        unique slug
     source    feedback memory slug it enforces (link back = single source of truth)
@@ -32,8 +54,10 @@ metrics/backlog (no git churn, no merge conflict). Each rule:
     field     which tool_input to scan: "command" | "command_code" (shell literals
               masked) | "text" (Edit/Write/MultiEdit new content) | "file_path" |
               "ask_options" (AskUserQuestion question+option text) | "worktree_outside"
-              / "ask_multi" (cwd-aware LOGIC fields computed in code; rule supplies
-              only action/msg, see the cwd-aware block in main())
+              / "cd_redundant" / "ask_multi" (LOGIC fields computed in code, because
+              they are RELATIONS -- target vs session cwd, question count -- that no
+              single-field regex can express; the rule row supplies only action/msg.
+              See the cwd-aware block in main())
     file_glob optional fnmatch glob on tool_input.file_path (forward-slash
               normalized); rule skipped if it does not match
     all       list of regex; ALL must match the field text for the rule to fire
@@ -57,6 +81,9 @@ import re
 import json
 import fnmatch
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ahe_paths  # noqa: E402  (sibling module, resolved from this file's dir)
 
 
 def _eprint(text):
@@ -136,6 +163,110 @@ def _mask_shell_literals(cmd):
         return cmd
 
 
+def _load_registry(guard_file):
+    """(rules, defect). defect is a human-readable string when the registry is
+    unusable -- missing, unreadable, empty, or entirely unparseable. Returning a
+    defect instead of an empty list is the whole point: the previous version did
+    `if not os.path.isfile(...): return 0`, which made "no registry" and "no rule
+    matched" indistinguishable, so a five-day outage produced zero symptoms."""
+    if not os.path.isfile(guard_file):
+        return [], "レジストリが存在しません"
+    try:
+        with open(guard_file, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except Exception as e:
+        return [], "レジストリを読めません (%s)" % e
+
+    rules = []
+    bad_lines = 0
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        try:
+            rule = json.loads(s)
+        except Exception:
+            bad_lines += 1
+            continue
+        if not rule.get("id") or not rule.get("all"):
+            bad_lines += 1
+            continue
+        rules.append(rule)
+
+    if not rules:
+        if bad_lines:
+            return [], "全 %d 行が JSON として読めません" % bad_lines
+        return [], "レジストリにルールが 1 件もありません"
+    return rules, None
+
+
+def _report_registry_defect(state_dir, guard_file, defect, session):
+    """Say it out loud, once per session (stdout + exit 0).
+
+    Not a block: a broken registry must not wedge the session that is trying to
+    repair it. Not silence either -- silence is what let the outage run for five
+    days. Once per session keeps it visible without spamming every tool call; if
+    the marker cannot be written we warn EVERY time rather than risk going quiet.
+    """
+    marker = os.path.join(state_dir, "guard_bootstrap_warned.json")
+    seen = {}
+    try:
+        with open(marker, "r", encoding="utf-8") as fh:
+            seen = json.load(fh) or {}
+    except Exception:
+        seen = {}
+    if session and seen.get(session):
+        return
+    if session:
+        try:
+            seen[session] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # keep the marker small; only recent sessions matter
+            if len(seen) > 50:
+                seen = dict(sorted(seen.items(), key=lambda kv: kv[1])[-50:])
+            os.makedirs(state_dir, exist_ok=True)
+            tmp = marker + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(seen, fh, ensure_ascii=False)
+            os.replace(tmp, marker)
+        except Exception:
+            pass  # unwritable marker => warn again next time (never go silent)
+    _oprint(
+        "[guard: レジストリが機能していません — ガードは 1 件も効いていません]\n"
+        "\n"
+        "  %s\n"
+        "  %s\n"
+        "\n"
+        "  これは fail-open です。ツール呼び出しは通しますが、フィードバックメモリ由来の\n"
+        "  ガードは全部無効です。復旧するまで、過去に指摘された同じミスを自分で見張って\n"
+        "  ください。レジストリはリポジトリ追跡下なので、git から復元できます。\n"
+        % (defect, guard_file)
+    )
+
+
+def _with_overlay(rule, overlay):
+    """warn -> block for a rule reflect.py has auto-escalated. escalate:false rules
+    are never escalated (reflect.py already skips them; re-checked here so a stale
+    overlay entry can never resurrect an opted-out rule as a block)."""
+    if (overlay.get(str(rule.get("id"))) == "block"
+            and str(rule.get("action")) == "warn"
+            and rule.get("escalate") is not False):
+        escalated = dict(rule)
+        escalated["action"] = "block"
+        return escalated
+    return rule
+
+
+def _load_overlay(path):
+    """Escalation overlay {rule id: action}. Missing/corrupt => no overlay."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    esc = data.get("escalated") if isinstance(data, dict) else None
+    return esc if isinstance(esc, dict) else {}
+
+
 def main():
     raw = sys.stdin.buffer.read().decode("utf-8", "replace")
     if not raw.strip():
@@ -151,10 +282,13 @@ def main():
     tool_input = data.get("tool_input") or {}
     session = str(data.get("session_id") or "")
 
-    proj_dir = os.path.join(os.path.expanduser("~"), ".claude", "projects", "F--dev-daw-01")
-    guard_file = os.path.join(proj_dir, "guards.jsonl")
-    if not os.path.isfile(guard_file):
+    proj_dir = ahe_paths.state_dir()
+    guard_file = ahe_paths.guards_file()
+    rules, defect = _load_registry(guard_file)
+    if defect:
+        _report_registry_defect(proj_dir, guard_file, defect, session)
         return 0
+    overlay = _load_overlay(ahe_paths.guard_state_file())
 
     # --- candidate field texts from this tool call ---
     command = str(tool_input.get("command") or "")
@@ -193,28 +327,32 @@ def main():
         if (fpl == repo_l or fpl.startswith(repo_l + "/")) and \
            not (fpl == wt_l or fpl.startswith(wt_l + "/")):
             worktree_outside = file_path_norm
+    # cd-prefix discipline: `cd <dir> && ...` where <dir> IS the session cwd is pure
+    # noise -- the Bash tool already runs there -- and from a worktree, cd'ing to the
+    # main checkout or a sibling worktree is the cross-agent contention hazard.
+    # A plain `cd /tmp` or `cd build/` is legitimate and must NOT fire, which is why
+    # this is a relational check in code and not a regex on "^cd ".
+    cd_redundant = ""
+    mcd = re.match(r"^\s*cd\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", command)
+    if mcd and cwd_norm:
+        target = (mcd.group(1) or mcd.group(2) or mcd.group(3) or "")
+        target = target.replace("\\", "/").rstrip("/").lower()
+        cwd_l = cwd_norm.rstrip("/").lower()
+        if target and target == cwd_l:
+            cd_redundant = target
+        elif target:
+            m2 = re.match(r"^(.*?)/\.claude/worktrees/[^/]+", cwd_l)
+            if m2:
+                repo_l, wt_l = m2.group(1), m2.group(0)
+                if (target == repo_l or target.startswith(repo_l + "/")) and \
+                   not (target == wt_l or target.startswith(wt_l + "/")):
+                    cd_redundant = target
     # AskUserQuestion batching: more than one question asked at once.
     _qs = tool_input.get("questions")
     ask_multi = "multi" if isinstance(_qs, list) and len([q for q in _qs if isinstance(q, dict)]) > 1 else ""
 
     fired = []
-    try:
-        with open(guard_file, "r", encoding="utf-8") as fh:
-            rule_lines = fh.readlines()
-    except Exception:
-        return 0
-
-    for line in rule_lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            rule = json.loads(line)
-        except Exception:
-            continue
-        if not rule.get("id") or not rule.get("all"):
-            continue
-
+    for rule in rules:
         tools = rule.get("tool")
         tools = tools if isinstance(tools, list) else [tools]
         if "*" not in tools and tool not in tools:
@@ -229,6 +367,8 @@ def main():
             text = file_path
         elif field == "worktree_outside":
             text = worktree_outside
+        elif field == "cd_redundant":
+            text = cd_redundant
         elif field == "ask_multi":
             text = ask_multi
         elif field == "ask_options":
@@ -277,7 +417,7 @@ def main():
         except re.error:
             pass
 
-        fired.append(rule)
+        fired.append(_with_overlay(rule, overlay))
 
     if not fired:
         return 0

@@ -1,0 +1,81 @@
+# AHE guard registry -- 1 行 1 ルール (JSONL)。`#` 始まりと空行は無視される。
+#
+# 各行は feedback メモリ 1 件の「能動的強制」。メモリは <system-reminder> の受動的背景として
+# しか効かず、ミスの瞬間には作用しない。PreToolUse hook だけが action-time に効く。
+# `source` が由来メモリへの逆リンク = SSoT。ルールを直すときは必ずメモリ側も見ること。
+#
+# スキーマは scripts/guard_engine.py の docstring、検証は `python scripts/test_guards.py`。
+#   tool     "Bash" | "Edit" | "Write" | "MultiEdit" | "PowerShell" | "AskUserQuestion" | "*"
+#   field    command / command_code (シェルリテラルをマスク) / text / file_path /
+#            ask_options / worktree_outside / cd_redundant / ask_multi
+#   all      全部マッチしたら発火 / none  1 つでもマッチしたら抑止
+#   action   "warn" (stdout, exit 0) | "block" (stderr, exit 2 = ツール呼び出し取消)
+#   escalate false を付けると reflect.py の warn->block 自動昇格から除外される
+#
+# **`escalate: false` を外すな**: substring レベルのマッチャは nudge としては妥当でも、
+# block にすると正当な作業まで取り消す (コミットメッセージ中の && で発火する
+# no-command-chaining、全 commit を止める confirm-before-commit)。reflect.py:127-131 参照。
+#
+# このファイルは **git 追跡下** (2026-08-22 に user dir から移設)。昇格状態だけが
+# <state>/guard_state.json (git 外)。分離の理由は scripts/guard_engine.py の docstring。
+
+# ---------------------------------------------------------------- PowerShell 全廃
+{"id":"no-powershell-tool","source":"feedback_no_powershell_cross_platform","tool":["PowerShell"],"field":"command","all":["."],"action":"block","msg":"PowerShell ツールは使用禁止。bash を既定とし、JSON を構造的に解析する必要があるものだけ Python (stdlib のみ) で書く。PS 5.1 の encoding 地獄 + Windows 専用を排除するため。"}
+{"id":"no-powershell-invoke","source":"feedback_no_powershell_cross_platform","tool":["Bash"],"field":"command_code","all":["(?i)(?:^|[\\s;|&(])(?:powershell(?:_ise)?|pwsh)(?:\\.exe)?\\b"],"none":["(?i)\\b(?:grep|rg|ag|ack)\\b"],"action":"block","msg":"bash から powershell / pwsh を起動しない。同じ処理を bash か Python (stdlib) で書く。Linux でも動くことが条件。"}
+{"id":"no-ps1-file","source":"feedback_no_powershell_cross_platform","tool":["Write","Edit","MultiEdit"],"field":"file_path","all":["(?i)\\.ps(?:1|m1|d1)$"],"action":"block","msg":"新規 .ps1 / .psm1 を作らない。hook・スクリプトは bash 既定、JSON 解析が要るものだけ Python (stdlib のみ)。"}
+{"id":"no-ps1-via-bash","source":"feedback_no_powershell_cross_platform","tool":["Bash"],"field":"command_code","all":["(?i)>\\s*\\S*\\.ps(?:1|m1)\\b"],"action":"block","msg":"リダイレクト / heredoc で .ps1 を書き出すのも「新規 .ps1 を作る」のと同じ。bash か Python で書くこと。"}
+{"id":"no-pwsh-shebang","source":"feedback_no_powershell_cross_platform","tool":["Write","Edit","MultiEdit"],"field":"text","all":["(?m)^#!.*\\b(?:pwsh|powershell)\\b"],"action":"block","msg":"拡張子が .sh でも shebang が pwsh なら PowerShell スクリプト。#!/usr/bin/env bash か python にすること。"}
+
+# ---------------------------------------------------------------- Bash の使い方
+# escalate:false — `;` や `&&` は substring マッチなので、block にすると正当な複合コマンドまで
+# 取り消してしまう。nudge に留める。
+{"id":"no-command-chaining","source":"feedback_no_command_chaining","tool":["Bash"],"field":"command_code","all":["(?:&&|\\|\\||;)"],"action":"warn","escalate":false,"msg":"独立したコマンドを && / ; / || で連結しない。別々の Bash 呼び出しに分ける (必要なら並列)。連結すると承認の粒度が粗くなり、どこで失敗したかも分からなくなる。"}
+{"id":"no-cd-prefix","source":"feedback_no_cd_prefix","tool":["Bash"],"field":"cd_redundant","all":["."],"action":"block","msg":"その cd は不要。Bash ツールは既にそのディレクトリで動いている (worktree セッションなら worktree で)。cd 先が main checkout や別 worktree の場合は、並行セッションのファイルを壊す経路そのもの。パスは作業ディレクトリ相対で書くこと。"}
+{"id":"no-full-disk-find","source":"feedback_no_full_disk_find","tool":["Bash"],"field":"command_code","all":["\\bfind\\s+(?:/|~|[A-Za-z]:[\\\\/])(?:\\s|$)"],"none":["-maxdepth"],"action":"block","msg":"ルートからの全ディスク走査は CPU とディスク I/O を長時間占有する。Glob / Grep ツールか既知パスを直接見る。どうしても find が要るなら -maxdepth + 具体的な起点に絞る。run_in_background でも同じ。"}
+
+# ---------------------------------------------------------------- git
+{"id":"git-add-broad","source":"feedback_git_add_one_file","tool":["Bash"],"field":"command_code","all":["\\bgit\\s+(?:add|stage)\\s+(?:-[A-Za-z]+\\s+)*(?:-A\\b|--all\\b|-u\\b|--update\\b|\\.(?=\\s|$)|:/|\\S*/(?=\\s|$))"],"action":"warn","msg":"git add はファイルパスを明示的に全列挙する。-A / . / -u / ディレクトリ指定は使わない (1 コマンドに複数ファイルを並べるのは OK)。想定外の新規ファイル混入を防ぐため。"}
+{"id":"no-commit-settings-local","source":"feedback_no_commit_local_settings","tool":["Bash"],"field":"command_code","all":["\\bgit\\s+(?:add|stage)\\b","(?:settings\\.local\\.json(?![.\\w])|\\.claude/(?:\\s|$))"],"action":"block","msg":".claude/settings.local.json は gitignore 対象。ユーザー個別の権限承認状態を含むのでコミットしない。共有したい設定は .claude/settings.json に書く。"}
+# escalate:false — block にすると「確認を取ってからの commit」まで一律に取り消してしまい、
+# 作業が進まなくなる。ゲートは人間の sign-off であって hook ではない。
+{"id":"confirm-before-commit","source":"feedback_confirm_before_commit","tool":["Bash"],"field":"command_code","all":["\\bgit\\b(?:\\s+-C\\s+\\S+)?\\s+(?:commit|merge|cherry-pick|revert|rebase)\\b"],"none":["--dry-run","--help"],"action":"warn","escalate":false,"msg":"commit / merge はユーザーの sign-off を得てから。build・clippy・test が green でも、それだけで commit しない。変更を提示して確認を待つこと。"}
+
+# ---------------------------------------------------------------- アプリの起動と停止
+{"id":"launch-no-tail-pipe","source":"feedback_launch_no_tail_pipe","tool":["Bash"],"field":"command_code","all":["(?:cargo\\s+run\\s[^|]*-p\\s+daw_gui|(?:\\./)?target[\\\\/]debug[\\\\/]daw_gui(?:\\.exe)?|\\bmake\\s+run\\b)","\\|\\s*(?:tail|head)\\b"],"action":"block","msg":"長時間稼働 + 大量ログのプロセスを | tail / | head 越しに起動しない。Windows で I/O abort → STATUS_STACK_BUFFER_OVERRUN になり「コードは正常なのに落ちた」と誤認する。run_in_background で起動し、ログは後からファイルを読む。"}
+{"id":"no-kill-running-app","source":"feedback_no_kill_running_app","tool":["Bash"],"field":"command_code","all":["(?i)\\b(?:taskkill|killall|pkill|kill)\\b","\\b(?:daw_gui|daw_audio|daw_plugin_host)\\b"],"action":"block","msg":"起動中の daw_gui / daw_audio / daw_plugin_host を勝手に kill しない。ユーザーが動作確認中の状態 (開いた plugin GUI・操作途中) が失われる。ビルドが ERROR 5 で落ちるときも「ウィンドウを閉じてください」と依頼する。"}
+# escalate:false — block にすると詰む。抑止条件 (tasklist で確認済み) を 1 コマンドで満たすには
+# `tasklist | grep daw_gui ; cargo run ...` と書くしかなく、それは no-command-chaining に当たる。
+# 2 つのガードが互いの回避策を禁じる形になるので、これは nudge に留める。
+{"id":"no-duplicate-app-launch","source":"feedback_no_duplicate_app_launch","tool":["Bash"],"field":"command_code","all":["(?:cargo\\s+run\\s[^|]*-p\\s+daw_gui|(?:\\./)?target[\\\\/]debug[\\\\/]daw_gui(?:\\.exe)?|\\bmake\\s+run\\b)"],"none":["(?i)\\btasklist\\b","(?i)\\bGet-Process\\b","--smoke-test"],"action":"warn","escalate":false,"msg":"起動前に既存インスタンスを確認すること。daw_gui を二重起動すると 2 つが同じ shared memory + セマフォを奪い合い、後発ウィンドウが入力を受け付けなくなる。起動中ならユーザーに閉じてもらう。"}
+
+# ---------------------------------------------------------------- worktree
+{"id":"worktree-path-discipline","source":"feedback_worktree_path_discipline","tool":["Edit","Write","MultiEdit"],"field":"worktree_outside","all":["."],"action":"block","msg":"worktree セッションから worktree 外 (main checkout / 別 worktree) の絶対パスを書こうとしている。編集が別ブランチの作業ツリーに入り、並行セッションと衝突する。パスは作業ディレクトリ相対か worktree 絶対パスにすること。"}
+{"id":"no-force-worktree-remove","source":"feedback_no_auto_worktree_delete","tool":["Bash"],"field":"command_code","all":["(?:\\bgit\\s+worktree\\s+(?:remove\\b[^\\n]*?(?:--force|\\s-f\\b)|prune\\b)|cleanup_worktree\\.sh[^\\n]*--force)"],"action":"warn","escalate":false,"msg":"git worktree remove --force は、ロックで dir を消せなくても先に登録解除するので孤立 dir を残す。並行 agent の worktree を壊した実績がある (2026-06-15)。削除は明示的・対象限定で、掴まれていないことを確認してから。"}
+{"id":"no-auto-worktree-hook","source":"feedback_no_auto_worktree_delete","tool":["Write","Edit","MultiEdit"],"field":"text","file_glob":"*hooks/*","all":["(?:cleanup_worktree\\.sh|\\bgit\\s+worktree\\s+remove\\b)"],"action":"warn","msg":".githooks/ は未コミットでも全 worktree で即ライブになる。merge 時の worktree 自動削除フックを入れない (別 agent のアクティブな worktree を消す)。削除は明示的・対象限定の手動操作に限ること。"}
+
+# ---------------------------------------------------------------- 妥協を選択肢に上げない
+# escalate:false — **CLAUDE.md がこの 3 件は block しないと明記している**:「これらのキーワードを
+# Edit / Write の対象 string に見つけたら、警告を emit する (block はしない、思考の中断点として
+# 作用)」。任意の散文に対する substring マッチなので、block にすると検出語を含むだけの正当な
+# 文書編集まで丸ごと取り消してしまう。
+# file_glob_not: このルール自体を説明・実装・テストしているファイル (CLAUDE.md / メモリ /
+# plan_ahe / レジストリ / ガード機構のスクリプト) は検出語を必ず含むので、自己発火を除外する。
+# 2026-08-22 に実測: test_guards.py の fixture ("low-risk hack") を編集した瞬間に
+# compromise-smell-en が発火した。
+{"id":"compromise-smell-ja","source":"feedback_pursue_ideal_only","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob_not":["*CLAUDE.md","*/memory/*","*guards.jsonl","*/docs/plan_ahe.md","*guard_engine.py","*test_guards.py","*process_audit.py","*reflect.py"],"escalate":false,"all":["(?:実装コスト|実装の手間|影響範囲が|許容範囲|現実的に|妥協|折衷|次善|やむを得)"],"none":["妥協(?:の?ない|なし|しない|せず)"],"action":"warn","msg":"「実装コスト」「影響範囲」「許容範囲」「現実的に」「妥協」が出た時点で、理想以外の選択肢を比較対象に上げている。出すべき問いは『どれが理想か』『理想を実現するには何を破壊する必要があるか』の 2 つだけ。"}
+{"id":"compromise-smell-en","source":"feedback_pursue_ideal_only","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob_not":["*CLAUDE.md","*/memory/*","*guards.jsonl","*/docs/plan_ahe.md","*guard_engine.py","*test_guards.py","*process_audit.py","*reflect.py"],"escalate":false,"all":["(?i)\\b(?:low(?:est)?-risk|pragmatic|workaround|kludge|hacky|good enough|quick win|band-?aid|compromise)\\b"],"action":"warn","msg":"low-risk / pragmatic / workaround / kludge は妥協の言い換え。理想の設計を書き、それを実現するために何を壊すかを書くこと。"}
+{"id":"compromise-smell-ask","source":"feedback_pursue_ideal_only","tool":["AskUserQuestion"],"field":"ask_options","escalate":false,"all":["(?:実装コスト|影響範囲|低リスク|手戻り|近似|簡易版|暫定|とりあえず|安全側|妥協|現実的)"],"action":"warn","msg":"妥協案をユーザーの選択肢として提示しようとしている。選択肢は理想同士の比較にすること (どちらも理想形で、設計上の分岐が違うだけ、という形)。"}
+{"id":"one-question-at-a-time","source":"feedback_one_question_at_a_time","tool":["AskUserQuestion"],"field":"ask_multi","all":["multi"],"action":"warn","msg":"質問は 1 つずつ。最も上流でブロッカーになる 1 問だけを投げ、回答が来てから次に進むこと。"}
+
+# ---------------------------------------------------------------- ドキュメントの約束
+# source は文書そのもの (メモリではないので test_guards.py の存在検査は走らない)。
+{"id":"gui-conv-entry-format","source":"docs/gui_01_conversation.md","tool":["Write","Edit","MultiEdit"],"field":"text","file_glob":"*gui_01_conversation.md","all":["(?m)^##\\s+.*\\d{4}-\\d{2}-\\d{2}"],"none":["(?m)^##\\s+#\\d+\\s+\\["],"action":"warn","escalate":false,"msg":"gui_01_conversation.md のエントリ見出しは `## #NNN [Open] YYYY-MM-DD [種別] 件名` の形式。番号・ステータス・日付・種別を順に入れること (docs/gui_01_conversation.md の「エントリテンプレート」節)。"}
+{"id":"plan-location","source":"feedback_plan_location","tool":["Write"],"field":"file_path","all":["(?:[\\\\/]\\.claude[\\\\/]plans[\\\\/]|docs[\\\\/]plan_[^\\\\/]*\\.md$)"],"action":"warn","escalate":false,"msg":"実装計画は docs/plan_<topic>.html に置く。~/.claude/plans (プロジェクト横断のグローバル領域) は使わない。新規 plan は HTML (既存 plan_*.md は歴史的記録としてそのまま)。"}
+
+# ---------------------------------------------------------------- アーキテクチャ不変条件
+# source は CLAUDE.md「アーキテクチャ不変条件」節と docs/plan_arch_refactor.md。
+# escalate:false — ファイル内容の substring マッチなので、RT パス以外の正当な編集にも当たる。
+# 「止める」ためではなく「不変条件を思い出す」ための nudge。
+{"id":"arch-no-new-untagged","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*common/src/*","all":["\\b(?:track|device|clip|send|plugin|slot|row|note|point)_(?:index|idx)\\b"],"action":"warn","escalate":false,"msg":"不変条件 1: プロセス境界・イベント・永続参照に positional index を使わない。安定 id (PluginInstance.id / Send.id / 要素 id) で addressing すること。『削除や並べ替えで参照を貼り替える補償コード』を書き始めたら設計が誤り。"}
+{"id":"arch-rt-no-infinite-wait","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*daw_audio/src/*","all":["(?:\\.recv\\(\\)|Condvar|\\.join\\(\\)|thread::sleep)"],"action":"warn","escalate":false,"msg":"不変条件 4: RT スレッドは無限待ち・確保・解放をしない。他プロセスの完了待ちは有界 (DISPATCH_TIMEOUT_MS) + quarantine。重い構築は off-thread で作って rtrb ring で swap すること。"}
+{"id":"arch-rt-no-infinite-wait-ph","source":"plan_arch_refactor","tool":["Edit","Write","MultiEdit"],"field":"text","file_glob":"*daw_plugin_host/src/*","all":["(?:\\.recv\\(\\)|Condvar|\\.join\\(\\)|thread::sleep)"],"action":"warn","escalate":false,"msg":"不変条件 4 (plugin host 側): process() に至るパスで無限待ちをしない。CLAP の @[main-thread] 呼び出しは plugin-main スレッドで直列化し、待ちは有界にすること。"}

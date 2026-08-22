@@ -220,15 +220,39 @@ PreToolUse hook。従来はメモリを hook 化するのに bespoke スクリ�
 （例: cd-prefix 再発は guard 経路が無く dismiss され続けた）。
 
 **解決 = データ駆動の汎用ガードエンジン (Python・追加依存なし・cross-platform)**:
-- `guards.jsonl`（per-project user dir、全 worktree 共有・git 外）に 1 行 1 ルール。各行は feedback
-  メモリ 1 件の能動的強制（`source` でメモリへ逆リンク = SSoT）。
+- **`.claude/guards.jsonl`（リポジトリ追跡下）** に 1 行 1 ルール。各行は feedback メモリ 1 件の
+  能動的強制（`source` でメモリへ逆リンク = SSoT）。
 - `scripts/guard_engine.py`（PreToolUse）が全ルールを適用。**一度だけ** settings.json に登録すれば、
   以後ガード追加は **guards.jsonl に 1 行追記するだけ**（新規スクリプトも settings 編集も承認も不要
   = classifier ブロック回避）。これが loop 自律化の鍵。`warn`=stdout/exit0、`block`=stderr/exit2（取消）。
 - 発火は `guard_hits.jsonl` に記録 → `reflect.py` が **warn ガードが 3 つ以上の異なる session で発火したら
-  自動で warn→block に昇格**（人手 triage 不要で actuate）。
+  自動で warn→block に昇格**（人手 triage 不要で actuate）。昇格状態は
+  **`<state>/guard_state.json`（git 外の overlay）** に書き、**追跡ファイルは一切書き換えない**。
 - 正規表現 1 本で表せない security block（`check_destructive_delete.py` の per-statement 分割）は
   code hook のまま。**pattern guard は data、logic guard は code** の分離。
+  cwd との関係でしか判定できないもの（`worktree_outside` / `cd_redundant` / `ask_multi`）も
+  engine 側の logic field で、ルール行は action/msg だけを供給する。
+
+#### なぜ追跡下なのか（2026-08-22 の消失事故）
+
+`guards.jsonl` は元々 user dir にあった。理由は「reflect.py が昇格をこのファイルに書き戻すので、
+git に入れると全 worktree が毎 Stop で dirty になる」。つまり **性質の違う 2 つ（人が書いたルール
+本体 ＝ 恒久的なプロジェクト知識 / 昇格状態 ＝ 実行時状態）が 1 ファイルに同居**していて、
+可変な方が恒久的な方をバージョン管理の外へ引きずり出していた。
+
+結果、レジストリが丸ごと消えた。`guard_hits.jsonl` の最終発火が 08-17、発覚が 08-22。
+**5 日間、全セッションでパターンガードが 1 件も効いていなかったのに症状がゼロ**だった
+（engine が `if not isfile: return 0` の fail-open で、「無い」と「該当しない」が区別できなかった）。
+
+対処は分離:
+- ルール本体 → `.claude/guards.jsonl`（追跡。CLAUDE.md や `.claude/hooks/` と同じ class）
+- 昇格状態 → `<state>/guard_state.json`（git 外。消えても `guard_hits.jsonl` から再計算できる）
+- レジストリ不在・空・全行 parse 失敗は **session ごとに 1 回、目に見える警告**を出す（黙って通さない）
+- パス導出は `scripts/ahe_paths.py` に集約。repo root は `__file__` から、state dir は
+  **main checkout の slug** から導出する（マシン固有パスをハードコードしない）
+
+**`escalate: false` を外さないこと。** substring レベルのマッチャは nudge としては妥当でも、
+block にすると正当な作業まで取り消す。理由は各ルールの直前にコメントで書いてある。
 
 ループ構造（observe → reflect → **actuate** → close）:
 1. `PostToolUse` で `scripts/log_metric.py` が metrics jsonl に追記し、`scripts/guard_engine.py` が

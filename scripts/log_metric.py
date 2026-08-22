@@ -3,13 +3,16 @@
 
 Port of the retired log_metric.ps1. stdin = Claude Code JSON
 { session_id, tool_name, tool_input, tool_response }. Output:
-~/.claude/projects/F--dev-daw-01/metrics/YYYY-MM.jsonl. Side-effect = append only;
+<state dir>/metrics/YYYY-MM.jsonl (see scripts/ahe_paths.py). Side-effect = append only;
 any failure exits 0 so a logging hiccup never blocks a tool call.
 """
 import sys
 import os
 import json
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ahe_paths  # noqa: E402  (sibling module, resolved from this file's dir)
 
 
 def main():
@@ -46,7 +49,7 @@ def main():
         "status": status,
     }
 
-    logdir = os.path.join(os.path.expanduser("~"), ".claude", "projects", "F--dev-daw-01", "metrics")
+    logdir = os.path.join(ahe_paths.state_dir(), "metrics")
     try:
         os.makedirs(logdir, exist_ok=True)
         logfile = os.path.join(logdir, datetime.now().strftime("%Y-%m") + ".jsonl")
