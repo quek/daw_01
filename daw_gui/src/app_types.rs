@@ -1724,8 +1724,9 @@ pub(crate) fn merge_lipsync_events_by_priority(mut events: Vec<(f64, f64, u32, u
 /// Open Recent を一本化する (= 同じ「破棄する前に確認」 セマンティクス)。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DirtyGuardAction {
-    /// ウィンドウを閉じる (= アプリ終了)。
-    Quit,
+    /// アプリを終了する (✕ / Alt+F4 / File > 終了 / Ctrl+Q / OS のセッション終了)。
+    /// 終了コードは `QuitRequest` から運ばれる (smoke test が判定結果を載せる)。
+    Quit(crate::shutdown::QuitRequest),
     /// 新規プロジェクト (`action_new`)。
     New,
     /// プロジェクトを開く (ファイル選択 dialog、 `action_open`)。

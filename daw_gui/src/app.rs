@@ -246,6 +246,9 @@ impl AppData {
                 singers: Vec::new(),
                 talk_speakers: Vec::new(),
                 voicevox_job,
+                spawned_engine: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::state::voicevox::VoicevoxEngineSlot::default(),
+                )),
                 voicevox_launch_attempted: false,
                 lipsync_gen: 0,
                 lipsync_inflight: std::collections::HashSet::new(),
@@ -430,7 +433,6 @@ impl AppData {
                 recovery_candidates,
                 show_recovery_modal,
                 dirty_guard: None,
-                should_quit: false,
                 guard_after_save: None,
                 guard_pending_action: None,
                 export_dialog_open: false,
@@ -445,6 +447,8 @@ impl AppData {
                 main_focused: true,
                 ..Default::default()
             },
+            // r.md #61: 起動直後は `Running`。終了要求で `Draining` に入る。
+            shutdown: crate::shutdown::ShutdownState::default(),
             // r.md #50: メーター設定の初期値は app_config から。`active` は
             // 「パネルが描かれているか」で、view が毎フレーム同期する。
             meter_control: std::sync::Arc::new(std::sync::Mutex::new(
@@ -508,6 +512,24 @@ impl AppData {
     /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
     /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
     pub fn handle_event(&mut self, event: AppEvent) {
+        // (r.md #61) 終了シーケンス中は **全 event を捨てる**。
+        //
+        // `Draining` は「子プロセスの teardown を待つ間もイベントループが回り
+        // 続ける」という新しい窓で、旧実装 (`should_quit` を立てた同じフレームで
+        // `exit()`) には存在しなかった。ここを開けたままにすると、
+        //   - 「終了処理中…」の下に残った picker のクリックが通る
+        //     (= 畳ませた plugin host へ `SetSlotPlugin` が飛ぶ)
+        //   - 30 秒周期の `AutosaveTick` が recovery ファイルを書き直す
+        // といった「もう終わると決めた後の副作用」が起きる。
+        //
+        // export gate と違って **allow-list ではなく全遮断**にできるのは、
+        // 終了が必ず `DRAIN_TIMEOUT` で終端するから — 「落としすぎて永久ロック」
+        // という export gate の失敗モードが原理的に存在しない。完了判定
+        // (`poll_shutdown`) は event ではなく `try_wait` で回っている。
+        if self.shutdown.is_shutting_down() {
+            tracing::debug!(?event, "event dropped during shutdown");
+            return;
+        }
         // この event の ambient undo scope を確定する (1 event 内の複数 edit_song は
         // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
         // 同時に、 この event が snapshot を積んだときの履歴リスト用ラベル
@@ -556,6 +578,8 @@ impl AppData {
             AppEvent::Plugin(ev) => self.dispatch_plugin_event(ev),
             // New / Open は現在のプロジェクトを破棄するので、 dirty なら
             // 先に保存確認ダイアログを挟む (clean なら即実行)。
+            // r.md #61: 全終了経路の合流点。
+            AppEvent::Quit(req) => self.request_quit(req),
             AppEvent::New => self.request_guarded_action(DirtyGuardAction::New),
             AppEvent::Open => self.request_guarded_action(DirtyGuardAction::Open),
             AppEvent::Save => {

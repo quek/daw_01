@@ -65,9 +65,12 @@ pub fn run_scripted(
         Ok(())
     })();
 
-    HOST.with_borrow_mut(|h| {
-        *h = None;
-    });
+    // (r.md #61) script mode も同じ終了シーケンスを通す。旧実装は
+    // `*h = None` の drop 任せで、子プロセスは Job Object に強制 kill され、
+    // プラグインの deactivate / destroy が走らなかった。
+    if let Some(host) = HOST.with_borrow_mut(std::option::Option::take) {
+        host.shutdown();
+    }
     result
 }
 
@@ -126,6 +129,27 @@ struct ScriptArgs {
 }
 
 impl ScriptHost {
+    /// (r.md #61) 子プロセスへ終了を伝え、有界に待ってから `Bootstrap` を
+    /// 明示解体する。GUI の `Runner::drive_shutdown` と同じ契約
+    /// (policy = `AppData::begin_shutdown`、待ち方だけが blocking)。
+    fn shutdown(mut self) {
+        // `AppData` には supervisor を渡していない (script mode は respawn しない)
+        // ので、pipe loop への「これ以降の切断は crash ではない」通知はここで直接。
+        let supervisor = Arc::clone(&self.bootstrap.supervisor);
+        supervisor.begin_shutdown();
+        self.app
+            .begin_shutdown(crate::shutdown::QuitRequest::USER);
+        let deadline = std::time::Instant::now() + crate::shutdown::DRAIN_TIMEOUT;
+        let stragglers = supervisor.wait_for_children_exit(deadline);
+        if !stragglers.is_empty() {
+            let names: Vec<&str> = stragglers.iter().map(|k| k.as_str()).collect();
+            tracing::warn!(?names, "script mode: children did not exit in time");
+        }
+        drop(supervisor);
+        // 上で `wait_for_children_exit` 済み。二重に待たせない。
+        self.bootstrap.shutdown(true);
+    }
+
     fn new(
         bootstrap: Bootstrap,
         output: Option<PathBuf>,

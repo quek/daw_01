@@ -884,6 +884,12 @@ impl PluginHost {
                     self.teardown_device(id, true);
                 }
             }
+            // (r.md #61) 終了要求は `pipe_loop` が read ループを抜けるために
+            // 消費するので、ここへは届かない。届いたら配線が壊れているので
+            // 黙って無視せず警告する (プロセスは pipe EOF で正しく畳まれる)。
+            PluginCommand::Shutdown => {
+                tracing::warn!("Shutdown reached handle_command; pipe_loop should have consumed it");
+            }
             PluginCommand::UnloadAllPlugins => {
                 // project 切替。`device_id` は Song スコープの名前なので、
                 // 残すと新 project の同 id device が旧 instance に dedup
@@ -1710,16 +1716,32 @@ impl PluginHost {
 
     /// process 終了時の teardown。worker pool を先に閉じてから plugin を
     /// drop する (順序を逆にすると UAF)。
+    ///
+    /// (r.md #61) **plugin の畳み方は [`Self::teardown_device`] 一本**。
+    /// 旧実装はここだけ `gui_destroy` + `instances.clear()` という独自順序で、
+    /// `stop_processing` / `deactivate` を通らなかった。`ClapPlugin::drop` は
+    /// ARA session がある場合しか deactivate しないので、通常の CLAP プラグインは
+    /// **active のまま `clap_plugin.destroy`** に入っていた
+    /// (CLAP `plugin.h`: `destroy` は `[main-thread & !active]`、
+    /// "It is required to deactivate the plugin prior to this call")。
+    ///
+    /// `UnloadAllPlugins` と同じ列挙 (= plugin_host 自身の `instances`) と
+    /// 同じ teardown を通すので、「全部畳め」の実装は 1 つしかない。
     fn shutdown(mut self) {
+        // (1) worker pool を先に止める。`shutdown` は全 worker thread を join
+        //     するので、以後 registry を触る RT スレッドは存在しない
+        //     (= teardown_device の `detach_and_quiesce` より強い保証)。
         if let Some(pool) = self.worker_pool.take() {
             pool.shutdown();
         }
-        // gui_destroy → (InstanceRecord の field 順で) plugin drop → editor
-        // window drop。
-        for rec in self.instances.values_mut() {
-            rec.plugin.gui_destroy();
+        // (2) 全 device を正規経路で畳む。`emit_unloaded` は false — device が
+        //     「Song から外れた」のではなくプロセスが終わるだけで、受け手の
+        //     daw_gui も同時に畳まれている。
+        let ids: Vec<u64> = self.instances.keys().copied().collect();
+        tracing::info!(count = ids.len(), "shutdown: tearing down all devices");
+        for id in ids {
+            self.teardown_device(id, false);
         }
-        self.instances.clear();
     }
 }
 
@@ -1742,25 +1764,19 @@ fn plugin_main_loop(
     // のキューに入り GetMessageW を起こす)。ARA session が居るときだけ回す。
     let mut ara_timer_active = false;
 
-    loop {
+    // (r.md #61) 抜け方は 3 通り (cmd channel 切断 / `HostMsg::Shutdown` /
+    // `GetMessageW` の WM_QUIT・エラー) あるが、**後始末は loop の直後 1 箇所**に
+    // 集約する。旧実装は 3 箇所に散っていて、Disconnected 経路だけ `KillTimer` を
+    // 呼ばない非対称があった。
+    let exit_reason = 'main: loop {
         loop {
             let msg = match cmd_rx.try_recv() {
                 Ok(m) => m,
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    host.shutdown();
-                    return;
-                }
+                Err(mpsc::TryRecvError::Disconnected) => break 'main "cmd channel disconnected",
             };
             match msg {
-                HostMsg::Shutdown => {
-                    if ara_timer_active {
-                        let _ = unsafe { KillTimer(None, ARA_NOTIFY_TIMER_ID) };
-                    }
-                    host.shutdown();
-                    tracing::info!("plugin-main thread exiting");
-                    return;
-                }
+                HostMsg::Shutdown => break 'main "Shutdown",
                 HostMsg::Cmd(cmd) => host.handle_command(cmd),
             }
         }
@@ -1795,7 +1811,7 @@ fn plugin_main_loop(
             let mut msg = MSG::default();
             let ret = GetMessageW(&mut msg, Some(HWND(std::ptr::null_mut())), 0, 0);
             if ret.0 <= 0 {
-                break;
+                break 'main "WM_QUIT";
             }
             if msg.message == WM_TIMER && msg.wParam.0 == ARA_NOTIFY_TIMER_ID {
                 // (r.md #5 ARA2) Pump every ARA document's deferred analysis.
@@ -1809,13 +1825,13 @@ fn plugin_main_loop(
                 DispatchMessageW(&msg);
             }
         }
-    }
+    };
 
     if ara_timer_active {
         let _ = unsafe { KillTimer(None, ARA_NOTIFY_TIMER_ID) };
     }
     host.shutdown();
-    tracing::info!("plugin-main thread exiting (WM_QUIT)");
+    tracing::info!(reason = exit_reason, "plugin-main thread exiting");
 }
 
 /// CLAP / VST3 spec の teardown 順 (stop_processing → deactivate →
@@ -1864,6 +1880,14 @@ async fn pipe_loop(
     });
     loop {
         match read_msg::<_, PluginCommand>(&mut read_half).await {
+            // (r.md #61) 正常終了要求。plugin-main へ転送せず **ここで loop を
+            // 抜ける** — 後段の `plugin_thread.shutdown()` が `HostMsg::Shutdown`
+            // を送って同じ teardown を走らせるので、終わり方は 1 本のまま。
+            // 親 crash 時の pipe EOF (下の `Err` 枝) もそこへ合流する。
+            Ok(PluginCommand::Shutdown) => {
+                tracing::info!("received Shutdown");
+                break;
+            }
             Ok(m) => {
                 log_command(&m);
                 plugin.send(HostMsg::Cmd(m));
@@ -1874,6 +1898,10 @@ async fn pipe_loop(
             }
         }
     }
+    // teardown 中に emit される `SlotPluginShmemReleased` 等は、送り先の
+    // daw_gui も同時に畳まれている (= Shutdown を送ったのは終了シーケンス
+    // だけ) か既に消えている (= pipe EOF) ので、ここで writer を落として
+    // よい。`emit` の `send` は receiver 消滅で失敗するが握り潰される。
     writer.abort();
 }
 

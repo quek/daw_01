@@ -31,6 +31,14 @@ pub enum AppEvent {
     /// ガードモーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
     /// 操作を取りやめてアプリに戻る。
     DirtyGuardCancel,
+    /// r.md #61: **アプリ終了要求の唯一の event**。File > 終了 / `Ctrl+Q` /
+    /// `--smoke-test` の判定完了 / Windows のセッション終了がここに合流する
+    /// (✕ / Alt+F4 は `WindowEvent::CloseRequested` → `AppData::request_close`
+    /// から同じ `request_quit` に入る)。
+    ///
+    /// 未保存なら確認モーダルを挟み、通れば子プロセスの graceful teardown を
+    /// 待つシーケンス (`crate::shutdown`) に入る。
+    Quit(crate::shutdown::QuitRequest),
     /// 別の daw_gui を起動しようとした (single-instance)。 2 つ目の
     /// プロセスが既存インスタンスにこれを送って前面化を要求する。 window 操作
     /// なので runner の `user_event` が直接処理し、 `handle_event` には届かない。

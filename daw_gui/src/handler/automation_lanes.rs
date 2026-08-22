@@ -944,6 +944,15 @@ impl AppData {
     /// 操作してもらう方が安全。
     pub(crate) fn handle_child_disconnected(&mut self, kind: common::protocol::ChildKind) {
         use common::protocol::ChildKind;
+        // (r.md #61) 終了シーケンス中の切断は crash ではなく **こちらが頼んだ
+        // 結果**。ここで respawn すると「終了しようとしているのに子が生き返る」。
+        //
+        // ガードは呼び出し側 3 箇所 (`AudioEvent::ChildDisconnected` /
+        // `PluginEvent::ChildDisconnected` / `WorkerPoolStalled` からの合成) では
+        // なく、この入口 1 箇所に置く (SSoT — 呼び出し側に撒くと必ず漏れる)。
+        if self.suppress_child_respawn(kind) {
+            return;
+        }
         let was_playing = self.transport.is_playing;
         // r.md #51: 通常 `is_playing` の writer は `on_tick` の観測だけだが、
         // 子プロセスが落ちた以上 Tick はもう来ない (= 観測が永久に止まる) ので、
@@ -1049,6 +1058,19 @@ impl AppData {
             return;
         }
 
+        // (r.md #61) **入口のガードをもう一度評価する**。この関数の途中で
+        // `abort_state_roundtrip` が「保留していた終了意図を聞き直す」経路
+        // (project.rs) を通り、clean な project なら `begin_shutdown` まで
+        // **同期的に**走り切ることがある。入口のガードは「この関数の実行中に
+        // phase は変わらない」を前提にしていたが、そこが崩れる。
+        //
+        // 見逃すと: 終了シーケンスが始まった直後に新しい daw_plugin_host を
+        // spawn してプラグインを全部ロードし直し、それを 5 秒後に
+        // `kill_remaining` が TerminateProcess する — r.md #61 で消したはずの
+        // 「deactivate / destroy を通らない強制 kill」がそのまま再現する。
+        if self.suppress_child_respawn(kind) {
+            return;
+        }
         // supervisor 経由で respawn を試みる。 supervisor が None
         // (= script / test 経路) なら通知だけで終わる。
         let Some(supervisor) = self.ipc.supervisor.clone() else {

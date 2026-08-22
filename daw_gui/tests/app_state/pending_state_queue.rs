@@ -12,6 +12,7 @@
 
 use common::protocol::{PluginCommand, PluginEvent};
 
+use daw_gui::shutdown::QuitRequest;
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
@@ -291,9 +292,9 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
 }
 
 /// 「保存して終了」 で plugin state 待ちの間に **編集が入らなかった** 場合、
-/// 非同期保存の完了 (finish_save) で should_quit が立つ。
+/// 非同期保存の完了 (finish_save) で終了シーケンスが始まる。
 #[test]
-fn save_and_quit_clean_sets_should_quit() {
+fn save_and_quit_clean_starts_shutdown() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(&mut app, 0);
@@ -310,12 +311,12 @@ fn save_and_quit_clean_sets_should_quit() {
     // (= guard_save が plugin 有り dirty project でやること)。
     app.song_doc.file_path = Some(std::env::temp_dir().join("daw01_test_quit_clean.daw"));
     app.handle_event(AppEvent::Save);
-    app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit);
+    app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit(QuitRequest::USER));
     assert!(has_pending_save(&app), "Save in-flight");
 
-    // 編集なしで応答到着 → finish_save が clean を確認して should_quit。
+    // 編集なしで応答到着 → finish_save が clean を確認して終了シーケンスへ。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
-    assert!(app.ui_ephemeral.should_quit, "clean async save-and-quit sets should_quit");
+    assert!(app.shutdown.is_shutting_down(), "clean async save-and-quit starts the shutdown sequence");
     assert!(
         app.ui_ephemeral.guard_after_save.is_none(),
         "quit intent cleared after quitting"
@@ -323,7 +324,7 @@ fn save_and_quit_clean_sets_should_quit() {
 }
 
 /// 「保存して終了」 で plugin state 待ちの間に編集が入った場合、 co-temporal
-/// snapshot は編集前なのでこの保存に編集は含まれない。 finish_save は should_quit を
+/// snapshot は編集前なのでこの保存に編集は含まれない。 finish_save は終了シーケンスを
 /// 立てず、 残った編集を確定するため再保存を enqueue して終了意図を維持する
 /// (= redesign の回帰修正: 旧コードは intent を捨ててアプリが閉じも
 /// 保存もしない状態になっていた)。
@@ -343,7 +344,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
 
     app.song_doc.file_path = Some(std::env::temp_dir().join("daw01_test_quit_window_edit.daw"));
     app.handle_event(AppEvent::Save);
-    app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit);
+    app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit(QuitRequest::USER));
     let _ = drain(&mut plugin_rx);
 
     // state 待ちの間に live を編集する (snapshot は既に凍結済みなので含まれない)。
@@ -351,10 +352,10 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
     app.edit_song(|song| song.tracks.push(extra_track));
 
     // 応答到着 → finish_save: saved baseline = 編集前 snapshot、 live は編集後で
-    // dirty。 should_quit は立たず、 再保存が enqueue され、 終了意図は維持される。
+    // dirty。 終了シーケンスには入らず、 再保存が enqueue され、 終了意図は維持される。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert!(
-        !app.ui_ephemeral.should_quit,
+        !app.shutdown.is_shutting_down(),
         "window edit during save-and-quit must NOT quit (would drop the edit)"
     );
     assert!(

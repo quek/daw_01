@@ -11,6 +11,7 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
+    shutdown_overlay,
     font_picker, load_overlay, loudness_report, master_panel, plugin_picker, recovery_modal,
     resource_monitor,
     settings, shortcuts_help, snap, status_bar, track_inspector, track_picker, transport,
@@ -189,6 +190,11 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // Overlay: F1 ショートカット / マウス操作一覧。app.ui_prefs.is_help_open と
     // 同期。最前面に出すため他の modal / overlay より後に描く。
     shortcuts_help::draw(app, ui, screen);
+
+    // r.md #61: Overlay:「終了処理中…」。子プロセスがプラグインを畳んで exit
+    // するのを待っている間だけ出す。**最後に描く** — 終了に入ったら他の
+    // modal / overlay より前面で、下の操作を全部塞ぐ。
+    shutdown_overlay::draw(app, ui, screen);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
@@ -206,51 +212,15 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
     // M9 P1-5 (gui_01 側 breaking 変更): on_click closure に &mut Ui が渡る形に。
     ui.menu_bar(rect, |mb| {
         mb.menu("File", |m| {
-            m.item("New", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::New)));
-            });
-            m.item("Open...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
-            });
-            // Open Recent: 「最近開いた」 履歴 (= AppData.recent_files)。
-            // 空のときは sub_menu を作らず disabled top-level item に置換
-            // (= cascade を出さない)。 gui_01 cascade exclusivity bug
-            // (= 兄弟 sub_menu の cascade が同時 open のまま重なる) の
-            // workaround。 空 cascade を出さなければ他の sub_menu cascade
-            // を上書きする事故も起きない。
-            if app.ui_prefs.recent_files_labels.is_empty() {
-                m.item_with(daw_ui_core::MenuItemSpec {
-                    label: "Open Recent (empty)",
-                    on_click: Box::new(|_ui| {}),
-                    enabled: false,
-                    shortcut_hint: None,
-                });
-            } else {
-                m.sub_menu("Open Recent", |sub| {
-                    for (label, path) in app
-                        .ui_prefs.recent_files_labels
-                        .iter()
-                        .zip(app.ui_prefs.recent_files.paths.iter())
-                    {
-                        let path_clone = path.clone();
-                        sub.item(label.as_str(), move |ui| {
-                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                            }));
-                        });
-                    }
-                });
-            }
-            m.item("Save", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
-            });
-            m.item("Save As...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
-            });
-            // Recently Saved: 「最近保存した」 履歴 (= AppData.recent_saved)。
-            // クリックで OpenRecent と同じ経路で開く (= 保存先 path はそのまま
-            // 開けるはず)。 同上 workaround で空のときは disabled top-level
-            // item に置換。
+            // r.md #69: 「最近保存した」「最近開いた」を **File メニューの先頭**へ。
+            // DAW を開いたら大抵は前回の続きをやるので、最も使う導線を一番上に置く
+            // (Ableton Live / Bitwig / Studio One の起動 Hub と同じ発想)。
+            // New / Open... の相対順序は変えず、2 段ずつ繰り下がるだけ。
+            //
+            // 空のときに項目ごと消さず disabled で残すのは、(a)「そういう機能がある」
+            // と気づけること、(b) 状況で項目位置が動くと誤クリックの元になること、
+            // の 2 点による。空の `sub_menu` は `h: 0` の退化 popup になるので
+            // 代わりに disabled の top-level item へ差し替える。
             if app.ui_prefs.recent_saved_labels.is_empty() {
                 m.item_with(daw_ui_core::MenuItemSpec {
                     label: "Recently Saved (empty)",
@@ -274,6 +244,44 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     }
                 });
             }
+            if app.ui_prefs.recent_files_labels.is_empty() {
+                m.item_with(daw_ui_core::MenuItemSpec {
+                    label: "Open Recent (empty)",
+                    on_click: Box::new(|_ui| {}),
+                    enabled: false,
+                    shortcut_hint: None,
+                });
+            } else {
+                m.sub_menu("Open Recent", |sub| {
+                    for (label, path) in app
+                        .ui_prefs.recent_files_labels
+                        .iter()
+                        .zip(app.ui_prefs.recent_files.paths.iter())
+                    {
+                        let path_clone = path.clone();
+                        sub.item(label.as_str(), move |ui| {
+                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
+                            }));
+                        });
+                    }
+                });
+            }
+            m.separator();
+            m.item("New", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::New)));
+            });
+            m.item("Open...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
+            });
+            m.separator();
+            m.item("Save", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
+            });
+            m.item("Save As...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
+            });
+            m.separator();
             m.item("Import Audio...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::OpenImportAudioDialog)
@@ -298,6 +306,7 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             // Text クリップは File メニューではなく、 アレンジの空きレーン右クリック →
             // "Text クリップ" で生成する (docs/plan_text_clip_creation.md)。 text トラックは
             // 存在せず、 他 clip と同じくタイムライン上で生成する。
+            m.separator();
             m.item("Export WAV...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
             });
@@ -308,6 +317,20 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             });
             m.item("Export MIDI...", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportMidi)));
+            });
+            // r.md #61: 終了導線。旧来は ✕ / Alt+F4 しか無く、メニューにも
+            // ショートカットにも終了が無かった。最下段に置くのは Windows /
+            // Ardour / Cubase の File メニュー慣習どおり。
+            m.separator();
+            m.item_with(daw_ui_core::MenuItemSpec {
+                label: "終了",
+                on_click: Box::new(|ui| {
+                    ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                        app.handle_event(AppEvent::Quit(crate::shutdown::QuitRequest::USER))
+                    }));
+                }),
+                enabled: true,
+                shortcut_hint: crate::view::shortcuts::shortcut_hint("quit"),
             });
         });
         mb.menu("Edit", |m| {
@@ -728,6 +751,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.export_wav") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ExportWav)
+        }));
+    }
+    // r.md #61: Ctrl+Q。File > 終了 / ✕ / Alt+F4 と同じ `AppEvent::Quit` に合流する。
+    if ui.take_shortcut("quit") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::Quit(crate::shutdown::QuitRequest::USER))
         }));
     }
     // ----- Edit -----

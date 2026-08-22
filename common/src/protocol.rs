@@ -375,6 +375,18 @@ pub enum AudioCommand {
     /// Drop the `ProcessData` mapping for `device_id` after the plugin
     /// instance is being torn down.
     ClosePluginShmem { device_id: u64 },
+    /// (r.md #61) **プロセスを正常終了しろ**。daw_gui の終了シーケンス
+    /// (`daw_gui::shutdown`) だけが送る。
+    ///
+    /// 受け側は receive loop を抜け、CPAL stream を明示的に pause + drop
+    /// (= WASAPI デバイスの解放) してから `main` を return する。
+    /// 「終わった」の真実源は **プロセスの exit そのもの**で、返信 event は
+    /// 用意しない — 「返事を書けた」と「デバイスを解放し終えた」は別の事実で、
+    /// 親が欲しいのは後者だけだから (親は `Child::try_wait` で観測する)。
+    ///
+    /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流するので、
+    /// 「終わり方」の実装は 1 つしかない。
+    Shutdown,
 }
 
 // =====================================================================
@@ -559,6 +571,23 @@ pub enum PluginCommand {
         device_id: u64,
         regions: Vec<AraRegionUpdate>,
     },
+    /// (r.md #61) **プロセスを正常終了しろ**。daw_gui の終了シーケンス
+    /// (`daw_gui::shutdown`) だけが送る。
+    ///
+    /// これは「全 plugin の unload + worker pool 停止 + プロセス終了」の
+    /// **合成**であり、unload の実装は [`PluginCommand::UnloadAllPlugins`] と
+    /// **同じ 1 本** (`PluginHost::unload_all_devices` → `teardown_device` →
+    /// `teardown_plugin`) を通る。列挙元も同じく plugin_host 自身の
+    /// `instances` なので、daw_gui の帳簿には一切依存しない
+    /// (`UnloadAllPlugins` の doc 参照)。「全部畳め」の実装が 2 つに割れないよう、
+    /// このコマンドは *追加で何をするか* (pool 停止 + exit) だけを足す。
+    ///
+    /// 完了の真実源は **プロセスの exit そのもの**で、返信 event は用意しない
+    /// — 「返事を書けた」と「DLL を unload し終えた」は別の事実で、親が欲しい
+    /// 保証は後者だけだから (親は `Child::try_wait` で観測する)。
+    ///
+    /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流する。
+    Shutdown,
 }
 
 // =====================================================================

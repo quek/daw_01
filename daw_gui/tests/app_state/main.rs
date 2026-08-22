@@ -23,6 +23,7 @@ mod make_unique;
 mod open_stays_clean;
 mod pending_state_queue;
 mod plugin_load_failure;
+mod shutdown_sequence;
 mod state_roundtrip_watchdog;
 mod sync_flush;
 mod track_delete;

@@ -29,6 +29,13 @@ const BTN_GAP: f32 = 8.0;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let Some(action) = app.ui_ephemeral.dirty_guard.as_ref() else {
+        // (r.md #61) `dirty_guard` がボタン以外の経路で消えることがある
+        // (自動実行の終了要求がガードごと捨てる)。ボタンの `close_modal` だけに
+        // 頼ると、その場合にモーダルが開きっぱなしになって操作不能になるので、
+        // 「開く条件が消えたら閉じる」を `export_overlay` と同じ形で書く。
+        if ui.is_modal_open("dirty_guard") {
+            ui.close_modal("dirty_guard");
+        }
         return;
     };
     if !ui.is_modal_open("dirty_guard") {
@@ -37,11 +44,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
 
     // 保留中の操作に応じた動詞。 終了は「終了」、 New / Open は「続行」。
     let verb = match action {
-        DirtyGuardAction::Quit => "終了",
+        DirtyGuardAction::Quit(_) => "終了",
         DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_) => "続行",
     };
     let question = match action {
-        DirtyGuardAction::Quit => "閉じる前に保存しますか？",
+        DirtyGuardAction::Quit(_) => "閉じる前に保存しますか？",
         DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_) => {
             "続ける前に保存しますか？"
         }

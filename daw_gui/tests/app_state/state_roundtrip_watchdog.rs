@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent, VocalSynthFailure};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use daw_gui::shutdown::QuitRequest;
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, ExportStage};
 
 use super::support::{self, drain, load_instrument};
@@ -41,9 +42,15 @@ fn far_future() -> Instant {
 }
 
 /// 「保存して終了」 で plugin state 待ちに入った直後に host が hang した場合、
-/// watchdog が round-trip を破棄して終了意図を捨て、 ガードが再び機能する。
+/// watchdog が round-trip を破棄し、 ガードが再び機能する。
+///
+/// (r.md #61) 終了意図は **捨てずに聞き直す**。旧実装は warn ログ 1 行だけ残して
+/// 黙って捨てており、ユーザーからは「✕ が effective でなかった」ようにしか見えな
+/// かった。かといって保存が成立していないまま終了させるのも誤り (未保存変更を失う)
+/// ので、queue が空になった最新状態でガードをやり直す — 正常系
+/// (`on_all_states_from_child` 末尾) とまったく同じ扱い。
 #[test]
-fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
+fn hang_during_save_and_quit_reasks_the_guard() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("proj.daw");
 
@@ -58,7 +65,7 @@ fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
     assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
     assert_eq!(
         app.ui_ephemeral.guard_after_save,
-        Some(DirtyGuardAction::Quit),
+        Some(DirtyGuardAction::Quit(QuitRequest::USER)),
         "quit-after-save intent pending"
     );
 
@@ -70,7 +77,7 @@ fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
     );
     assert_eq!(
         app.ui_ephemeral.guard_after_save,
-        Some(DirtyGuardAction::Quit),
+        Some(DirtyGuardAction::Quit(QuitRequest::USER)),
         "intent intact before timeout"
     );
 
@@ -82,20 +89,20 @@ fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
     );
     assert!(
         app.ui_ephemeral.guard_after_save.is_none(),
-        "stuck quit-after-save action dropped (not executed: no data loss)"
+        "stuck quit-after-save action is no longer pending on the round-trip"
     );
-    assert!(!app.ui_ephemeral.should_quit, "watchdog does not silently quit");
-    assert!(!app.ui_ephemeral.status_message.is_empty(), "user is notified");
-    assert!(!path.exists(), "nothing saved (host never returned state)");
-
-    // 以後ふたたびガードが開ける (= ロックされていない)。
-    app.song_doc.normalize(|_| {});
-    app.handle_event(AppEvent::New);
+    assert!(!app.shutdown.is_shutting_down(), "watchdog does not silently quit");
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
-        Some(DirtyGuardAction::New),
-        "dirty guard works again after the watchdog escape"
+        Some(DirtyGuardAction::Quit(QuitRequest::USER)),
+        "quit intent survives: the guard is re-asked with the current (unsaved) state"
     );
+    assert!(!path.exists(), "nothing saved (host never returned state)");
+
+    // 「保存せず終了」 を選べば、 hang した host を待たずに抜けられる。
+    app.handle_event(AppEvent::DirtyGuardDiscard);
+    assert!(app.shutdown.is_draining(), "discard quits without waiting for the hung host");
+    assert!(app.ui_ephemeral.dirty_guard.is_none(), "modal closed");
 }
 
 /// Deferred edit (track 削除) の round-trip 中に host が hang し、 さらにその間に
