@@ -288,9 +288,14 @@ impl App {
                         },
                     );
 
+                    // この example は strip の panel を敷かず窓の床 (= `window_bg`、
+                    // `Scene::DEFAULT_CLEAR` と同値) の上に直接 knob を置くので、
+                    // 可動範囲外のくり抜き色も `window_bg` を渡す (既定の `panel` だと
+                    // その 60° だけ一段明るい帯として浮く)。
+                    let knob_style = KnobStyle { surface: Some(ui.palette().window_bg), ..KnobStyle::BIPOLAR };
                     let kresp: KnobResponse =
                         // pan = bipolar param → 弧はセンタ (12 時) 起点 + センタ notch + センタ吸着。
-                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, &KnobStyle::BIPOLAR, move |v| {
+                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, &knob_style, move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.pans[i] = v;
                                 m.last_action =

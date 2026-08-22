@@ -368,7 +368,7 @@ fn draw_track_strip(
         was_dragging_pan,
     );
     // Sends セクションは draw_strip の fader 下端より下の band に描画する。
-    draw_sends_section(app, ui, track_id, rect, sends_band_h);
+    draw_sends_section(app, ui, track_id, rect, bg, sends_band_h);
 }
 
 /// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint
@@ -588,7 +588,12 @@ fn draw_strip(
             0.5,
             // Pan は bipolar param: 見かけの零点はセンタ (12 時)。 弧はセンタから
             // L/R 方向へ伸び、 センタでは塗りが消えてセンタ notch だけが残る (r.md #47)。
-            &KnobStyle::BIPOLAR,
+            //
+            // `surface` には **この strip の実際の背景** を渡す。 通常 / group strip は
+            // `panel` だが return strip は緑 tint (`daw.strip_return_bg`) なので、 palette の
+            // 既定 (`panel`) 任せにすると return strip だけ可動範囲外の切り欠きが
+            // 「暗い帯」 として浮く。 caller は bg を持っているので迷わず渡せる。
+            &KnobStyle { surface: Some(bg), ..KnobStyle::BIPOLAR },
             {
                 let target_for_change = pan_target.clone();
                 move |v| {
@@ -813,6 +818,9 @@ fn draw_sends_section(
     ui: &mut Ui<'_, AppData>,
     track_id: u32,
     rect: Rect,
+    // この strip の背景色。 send のミニ knob が可動範囲外をくり抜くのに使う
+    // (`KnobStyle::surface`)。 strip 本体と同じ面の上に描かれるので同値。
+    bg: Color,
     band_h: f32,
 ) {
     let pad = SEND_PAD;
@@ -843,7 +851,16 @@ fn draw_sends_section(
         band_rect,
         (band_rect.w, content_h),
         |ui, scroll_off| {
-            draw_sends_rows(app, ui, track_id, src_track, rect, band_top - scroll_off.1, scrollbar_w);
+            draw_sends_rows(
+                app,
+                ui,
+                track_id,
+                src_track,
+                rect,
+                bg,
+                band_top - scroll_off.1,
+                scrollbar_w,
+            );
         },
     );
 }
@@ -851,12 +868,14 @@ fn draw_sends_section(
 /// Sends band の中身 (send 行 + 「＋ Send」)。 `top` は band 上端 (スクロール
 /// オフセット適用済み)、 `scrollbar_w` は band にスクロールバーが出ているときの
 /// 予約幅。 `draw_sends_section` の scroll_area 内からのみ呼ぶ。
+#[allow(clippy::too_many_arguments)]
 fn draw_sends_rows(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     track_id: u32,
     src_track: &common::model::Track,
     rect: Rect,
+    bg: Color,
     top: f32,
     scrollbar_w: f32,
 ) {
@@ -935,7 +954,8 @@ fn draw_sends_rows(
             0.5,
             // 送り量は unipolar param: 零点は最小値 (7 時) で、 dblclick の戻り先が
             // unity (0.5) であることとは無関係 (弧の起点 ≠ default_value)。
-            &KnobStyle::UNIPOLAR,
+            // `surface` = strip の背景 (pan knob と同じ理由)。
+            &KnobStyle { surface: Some(bg), ..KnobStyle::UNIPOLAR },
             move |v| {
                 let gain = v * 2.0;
                 Edit::mutate(move |app: &mut AppData| {
