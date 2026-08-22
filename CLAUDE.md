@@ -391,6 +391,19 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToChild 復活)。
 **「何を違反とみなすか」の SSoT は `scripts/arch_lint.sh`**、ガードはその write-time ミラー。
 
+**`make arch-lint` の exit 0 は「違反ゼロ、または `scripts/arch_lint_baseline.txt` に記録済みの
+ものだけ」を意味する。** baseline に無い違反が 1 件でもあれば exit 1 (行単位 ratchet)。
+以前は違反があっても常に exit 0 だったので、終了コードだけ見て「OK」と報告され続けていた。
+- 既知の負債は baseline に **理由と落とし所つきで 1 行**。fingerprint は行番号ではなく
+  マッチ行の内容ハッシュ (行番号は無関係な編集でずれる)。件数 baseline にはしない
+  (「1 件直して 1 件増やす」が素通りする)。
+- 直した行は「解消」として通知されるが **ゲートは落とさない** (良い変更を止めない)。
+  baseline から削除すること。
+- **恒久的に正当な箇所は baseline ではなく行内マーカー** `// arch-lint: allow-<check>`。
+  区別しないと負債が「正当」として永久に隠れる。
+- 貼り付け用の行は `ARCH_LINT_EMIT_BASELINE=1` が出す (書き込みはしない)。
+  `ARCH_LINT_STRICT=1` は baseline 済みの負債も落とす。
+
 > **arch-lint のパターンにバックスラッシュを使わないこと。** make (MSYS2) 経由だと
 > grep/sed へ渡す引数のバックスラッシュが落ち、`\( \s \b \[` を含むパターンが無言で
 > 別物になる。2026-08-22 に発覚 — 8 チェック中 6 つが無効化され、違反 7 行を抱えたまま
