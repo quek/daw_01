@@ -598,38 +598,6 @@ pub trait LoadedPlugin: Send {
     }
 }
 
-#[cfg(test)]
-mod resize_frame_policy_tests {
-    use super::{ResizableProbe, should_offer_resize_frame};
-
-    /// r.md #65: **format ごとに一次情報の規範性が違う**ので、方針も分かれる。
-    /// このテストはその判断そのものを固定する (将来変えるなら意識的に更新される)。
-    #[test]
-    fn frame_policy_follows_each_formats_spec() {
-        let vst3 = |verdict| ResizableProbe { verdict, queried: true, raw: 0, drag_requires_verdict: false };
-        let clap = |verdict| ResizableProbe { verdict, queried: true, raw: 0, drag_requires_verdict: true };
-
-        // VST3: 禁止規定が無いので、申告が false でも枠を出す
-        // (Renoise Redux は canResize=false なのに REAPER で枠リサイズできる)。
-        assert!(should_offer_resize_frame(&vst3(true)));
-        assert!(
-            should_offer_resize_frame(&vst3(false)),
-            "VST3 は canResize=false でも枠を出す (iplugview.h に禁止規定が無い)"
-        );
-
-        // CLAP: gui.h が「drag は can_resize()==true のときだけ可能」と
-        // **前提条件として**規定しているので申告を尊重する。
-        assert!(should_offer_resize_frame(&clap(true)));
-        assert!(
-            !should_offer_resize_frame(&clap(false)),
-            "CLAP は can_resize()==false なら枠を出さない (gui.h L41-45 が前提条件を明示)"
-        );
-
-        // 問い合わせられなかったときは保守的に枠を出さない。
-        assert!(!should_offer_resize_frame(&ResizableProbe::unavailable()));
-    }
-}
-
 /// Loads a plugin at `path` using the backend selected by `format`.
 /// `plugin_id` narrows to a specific descriptor inside a multi-plugin
 /// library; empty means "pick the first descriptor".
@@ -655,5 +623,47 @@ pub fn load_plugin(
             let uri = path.to_string_lossy();
             builtin::load_builtin(&uri, callbacks)
         }
+    }
+}
+
+#[cfg(test)]
+mod resize_frame_policy_tests {
+    use super::{ResizableProbe, should_offer_resize_frame};
+
+    /// r.md #65: **format ごとに一次情報の規範性が違う**ので、方針も分かれる。
+    /// このテストはその判断そのものを固定する (将来変えるなら意識的に更新される)。
+    #[test]
+    fn frame_policy_follows_each_formats_spec() {
+        let vst3 = |verdict| ResizableProbe {
+            verdict,
+            queried: true,
+            raw: 0,
+            drag_requires_verdict: false,
+        };
+        let clap = |verdict| ResizableProbe {
+            verdict,
+            queried: true,
+            raw: 0,
+            drag_requires_verdict: true,
+        };
+
+        // VST3: 禁止規定が無いので、申告が false でも枠を出す
+        // (Renoise Redux は canResize=false なのに REAPER で枠リサイズできる)。
+        assert!(should_offer_resize_frame(&vst3(true)));
+        assert!(
+            should_offer_resize_frame(&vst3(false)),
+            "VST3 は canResize=false でも枠を出す (iplugview.h に禁止規定が無い)"
+        );
+
+        // CLAP: gui.h が「drag は can_resize()==true のときだけ可能」と
+        // **前提条件として**規定しているので申告を尊重する。
+        assert!(should_offer_resize_frame(&clap(true)));
+        assert!(
+            !should_offer_resize_frame(&clap(false)),
+            "CLAP は can_resize()==false なら枠を出さない (gui.h L41-45 が前提条件を明示)"
+        );
+
+        // 問い合わせられなかったときは保守的に枠を出さない。
+        assert!(!should_offer_resize_frame(&ResizableProbe::unavailable()));
     }
 }

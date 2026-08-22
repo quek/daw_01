@@ -5,7 +5,7 @@ use crate::state::*;
 use crate::app_types::*;
 use common::model::{InstrumentSource, Track};
 use common::plugin_format::PluginFormat;
-use common::protocol::{AudioCommand, PluginCommand, SlotState};
+use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotState};
 
 impl AppData {
     // -------- Plugin GUI bridge --------------------------------------------
@@ -573,6 +573,22 @@ impl AppData {
                 tracing::warn!(track_id, index, "open_slot_gui: no device id at slot");
                 return;
             };
+            // r.md #65: エディタコンテナ窓の owner にする **本体窓** (preview 窓ではない)。
+            // `main_window_hwnd` は runner が本体窓の生成時に 1 度だけ書き込む値で、
+            // preview 窓はここに載らない。0 は「窓が無い」なので `from_raw` が落とす。
+            let owner_main_window = self
+                .ui_ephemeral
+                .main_window_hwnd
+                .and_then(|hwnd| PlatformWindowHandle::from_raw(hwnd as u64));
+            if owner_main_window.is_none() {
+                // 起きるのは本体窓の生成前だけ (frame loop 由来の open では起きない)。
+                // plugin-host 側は owner 無し + TOOLWINDOW 無しで開くので、
+                // 「Alt+Tab から消えたのに潜る」状態にはならない。
+                tracing::warn!(
+                    device_id,
+                    "opening plugin editor without an owner window (main window not ready)"
+                );
+            }
             self.ipc.open_plugin_guis.insert((track_id, index));
             self.send_plugin(PluginCommand::OpenSlotGuiEmbedded {
                 device_id,
@@ -580,6 +596,7 @@ impl AppData {
                 // r.md #65: 前回このプロジェクトで閉じたときの窓の位置 / サイズ。
                 // 位置は常に、サイズは plugin が resizable のときだけ plugin-host が使う。
                 geometry: self.ui_prefs.plugin_editor_windows.get(&device_id).copied(),
+                owner_main_window,
             });
             // r.md #36: 「キーを全部プラグインに送る」 の現在値を open のたびに同期する
             // (plugin-host は再起動で状態を失う / device_id は open まで意味を持たない)。

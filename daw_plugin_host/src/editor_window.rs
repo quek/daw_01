@@ -78,7 +78,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SIZE, WM_SIZING,
     WM_TIMER, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
     WNDCLASSEXW,
-    WS_CAPTION, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+    WS_CAPTION, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_SYSMENU,
     WS_THICKFRAME,
 };
 use windows::core::PCWSTR;
@@ -393,6 +394,112 @@ pub fn editor_window_style(resizable: bool) -> WINDOW_STYLE {
     }
 }
 
+/// エディタコンテナ窓の **owner** と **タスクバー / Alt+Tab 上の見え方**を、
+/// **1 つの判断**から導くための型 (r.md #65)。
+///
+/// # なぜ 1 つにまとめるのか
+///
+/// この 2 つを別々に分岐させると、**owner 無しで `WS_EX_TOOLWINDOW` だけ付く**という
+/// 唯一の悪化する組み合わせが作れてしまう。その状態は
+///
+/// - `WS_EX_TOOLWINDOW` … *"A tool window does not appear in the taskbar or in the dialog
+///   that appears when the user presses ALT+TAB."*
+/// - owner 無し … 他アプリの窓の下に自由に潜れる
+///
+/// の合成で、**潜ったら二度と取り戻せない窓**になる。逆に owner だけなら
+/// *"An owned window is always above its owner in the z-order."* が効き、Alt+Tab にも
+/// 残るので単独で安全。よって「owner が取れたか」だけが分岐点で、両方の style が
+/// そこから決まる。型で表現しておけば、後から片方だけ触ることができない。
+///
+/// # 参照実装
+///
+/// REAPER の FX 窓が `WS_POPUP|WS_CAPTION|WS_THICKFRAME` +
+/// `ex=WS_EX_CONTROLPARENT|WS_EX_WINDOWEDGE|WS_EX_TOOLWINDOW` で、owner が REAPER 本体窓
+/// (外部プローブで実測)。[`Self::OwnedBy`] はその構成に揃えたもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerBinding {
+    /// ホスト本体窓に owned させる。Alt+Tab から外してよい (本体窓に戻れば
+    /// 必ず一緒に前へ出るので、一覧から選ぶ操作自体が要らなくなる)。
+    OwnedBy(HWND),
+    /// owner が取れなかった。**`WS_EX_TOOLWINDOW` を付けない** —
+    /// 潜っても Alt+Tab で取り戻せる状態を保つ。
+    Standalone,
+}
+
+impl OwnerBinding {
+    /// wire で渡ってきた platform ハンドルを検証して束縛を決める。
+    ///
+    /// `None` / 既に破棄済みの窓なら [`Self::Standalone`] へ落ちる。
+    /// なお owner に child 窓を渡した場合は Win32 が
+    /// *"the system assigns ownership to the top-level parent window of the child window"*
+    /// と規定しているので、ここでは弾かずに style をログへ出すに留める。
+    #[must_use]
+    pub fn resolve(owner: Option<common::protocol::PlatformWindowHandle>) -> Self {
+        let Some(handle) = owner else {
+            tracing::warn!(
+                target: RESIZE_TARGET,
+                "no owner window supplied — opening standalone (no WS_EX_TOOLWINDOW either)"
+            );
+            return Self::Standalone;
+        };
+        let hwnd = HWND(handle.raw() as *mut core::ffi::c_void);
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            tracing::warn!(
+                target: RESIZE_TARGET,
+                owner = format!("{:#x}", handle.raw()),
+                "owner window no longer exists — opening standalone (no WS_EX_TOOLWINDOW either)"
+            );
+            return Self::Standalone;
+        }
+        tracing::info!(
+            target: RESIZE_TARGET,
+            owner = format!("{:#x}", handle.raw()),
+            owner_style = format!("{:#010x}", unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32),
+            "editor container will be owned by the host main window"
+        );
+        Self::OwnedBy(hwnd)
+    }
+
+    /// `CreateWindowExW` の `dwExStyle`。**`AdjustWindowRectExForDpi` にも同じ値を渡すこと**
+    /// (`WS_EX_TOOLWINDOW` はキャプションが低くなるので、外枠サイズの計算が変わる)。
+    #[must_use]
+    pub fn ex_style(self) -> WINDOW_EX_STYLE {
+        match self {
+            Self::OwnedBy(_) => WS_EX_TOOLWINDOW,
+            Self::Standalone => WINDOW_EX_STYLE(0),
+        }
+    }
+
+    /// 最小化ボタンを出してよいか。**これも同じ 1 つの判断から導く** (r.md #65)。
+    ///
+    /// `WS_EX_TOOLWINDOW` の窓は *"does not appear in the taskbar"* なので、
+    /// **最小化すると復元する手掛かりが無くなる** (タスクバーボタンも Alt+Tab 項目も
+    /// 無い)。これは owner 無し + TOOLWINDOW と同じ「取り戻せない窓」の一種で、
+    /// しかも **owner を導入したこと自体が新設する経路**なので、ここで閉じておく。
+    ///
+    /// REAPER の FX 窓も実測で `WS_MINIMIZEBOX` を持たない
+    /// (style `0x94cd0044` = `WS_POPUP|WS_VISIBLE|WS_CLIPSIBLINGS|WS_CAPTION|
+    ///  WS_SYSMENU|WS_THICKFRAME|WS_MAXIMIZEBOX`。最大化はあるが最小化は無い)。
+    /// 最大化は ✕ / 復元ボタンで必ず戻せるので残してよい。
+    ///
+    /// owner がある場合、**daw_gui 本体窓を最小化すれば
+    /// *"An owned window is hidden when its owner is minimized."* で一緒に隠れる**ので、
+    /// 「エディタだけ引っ込める」操作は失われていない。
+    #[must_use]
+    pub fn allows_minimize(self) -> bool {
+        matches!(self, Self::Standalone)
+    }
+
+    /// `CreateWindowExW` の `hWndParent` (= owner)。
+    #[must_use]
+    pub fn owner_hwnd(self) -> Option<HWND> {
+        match self {
+            Self::OwnedBy(hwnd) => Some(hwnd),
+            Self::Standalone => None,
+        }
+    }
+}
+
 /// WNDPROC (= `extern "system"` で Rust の状態に触れない) と `EditorWindow` の
 /// 共有状態。`GWLP_USERDATA` に `Arc::into_raw` で貼り、`Drop` で回収する。
 ///
@@ -537,17 +644,38 @@ impl EditorWindow {
     /// **タイトルバーがアクティブ色になった直後に非アクティブへ戻る**。
     ///
     /// `position` は前回セッションの窓位置 (screen 座標)。`None` / 画面外なら既定位置。
+    ///
+    /// `owner` は **窓の作成時に** owner を決めるための束縛 (r.md #65)。
+    /// `SetWindowLongPtr(GWLP_HWNDPARENT)` で後から付け替えないのは、Microsoft Learn の
+    /// *"After creating an owned window, an application cannot transfer ownership of the
+    /// window to another window."* (window-features) と
+    /// *"GWLP_HWNDPARENT ... Sets a new owner for a top-level window."* (SetWindowLongPtr)
+    /// が正面から矛盾しているため。**作成時に渡す形なら前者が明示的に許している唯一の
+    /// 作り方**になり、矛盾を踏まない。
     pub fn create(
         width: u32,
         height: u32,
         title: &str,
         resizable: bool,
         position: Option<(i32, i32)>,
+        owner: OwnerBinding,
     ) -> windows::core::Result<Self> {
         let atom = class_atom()?;
         let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) }?;
         let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-        let style = editor_window_style(resizable);
+        // owner の有無から **ex style と最小化ボタンの両方**が決まる
+        // (`OwnerBinding` の doc 参照)。別々の条件で分岐させない。
+        // `WS_EX_TOOLWINDOW` はキャプションを低くするので、外枠サイズの計算にも
+        // 同じ値を渡さないと client 領域が要求サイズからずれる。
+        let ex_style = owner.ex_style();
+        let style = if owner.allows_minimize() {
+            editor_window_style(resizable)
+        } else {
+            // tool window は taskbar にも Alt+Tab にも出ないので、最小化すると
+            // 復元できなくなる。`set_resizable` が後から触るのは
+            // `WS_THICKFRAME|WS_MAXIMIZEBOX` だけなので、ここで落とせば以後も落ちたまま。
+            WINDOW_STYLE(editor_window_style(resizable).0 & !WS_MINIMIZEBOX.0)
+        };
 
         // Compute the outer size so the *client* area matches the plugin's
         // requested size (title bar + borders added on top). 窓がまだ無いので
@@ -560,7 +688,7 @@ impl EditorWindow {
         };
         unsafe {
             let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96);
-            let _ = AdjustWindowRectExForDpi(&mut rect, style, false, WINDOW_EX_STYLE(0), dpi);
+            let _ = AdjustWindowRectExForDpi(&mut rect, style, false, ex_style, dpi);
         }
         let outer_w = (rect.right - rect.left).max(1);
         let outer_h = (rect.bottom - rect.top).max(1);
@@ -570,7 +698,7 @@ impl EditorWindow {
 
         let hwnd = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                ex_style,
                 PCWSTR(atom as usize as *const u16),
                 PCWSTR(title_utf16.as_ptr()),
                 style,
@@ -579,7 +707,9 @@ impl EditorWindow {
                 y,
                 outer_w,
                 outer_h,
-                None, // no parent
+                // owner (parent ではない)。`WS_CHILD` を立てていないので Win32 は
+                // このスロットを owner として解釈する。
+                owner.owner_hwnd(),
                 Some(HMENU(std::ptr::null_mut())),
                 Some(hinstance.into()),
                 None,
@@ -634,6 +764,18 @@ impl EditorWindow {
     /// loop polls this to drive the close flow.
     pub fn take_close_request(&self) -> bool {
         self.shared.close_requested.replace(false)
+    }
+
+    /// コンテナ窓がまだ存在するか。
+    ///
+    /// r.md #65 で owner を daw_gui の本体窓にしたので、**daw_gui が異常終了すると
+    /// Windows がこの窓を道連れに破棄する**経路が新設された
+    /// (*"The system automatically destroys an owned window when its owner is destroyed."*)。
+    /// そのとき ✕ は押されないので [`Self::take_close_request`] では拾えない。
+    /// plugin-main の poll がこれを見て、通常と同じ close flow
+    /// (`gui_destroy` → drop → `SlotGuiClosed`) に合流させる。
+    pub fn is_window_alive(&self) -> bool {
+        !self.hwnd.0.is_null() && unsafe { IsWindow(Some(self.hwnd)) }.as_bool()
     }
 
     /// 位置 / サイズが変化していれば現在のジオメトリを返して dirty を落とす。
@@ -804,23 +946,41 @@ impl EditorWindow {
 
 impl Drop for EditorWindow {
     fn drop(&mut self) {
-        if !self.hwnd.0.is_null() {
-            unsafe {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        // r.md #65: owner (daw_gui 本体窓) の破棄に道連れにされて、**もう窓が無い**
+        // ことがある。その場合 `GWLP_USERDATA` を読む先が無いので、`create` で
+        // leak した `Rc` を USERDATA 経由では回収できない。
+        let alive = self.is_window_alive();
+        unsafe {
+            // WNDPROC が二度と sizer を辿らないようにしてから窓を壊す。
+            self.shared
+                .sizer
+                .set(std::ptr::null::<NoopSizer>() as *const dyn EditorSizer);
+            if alive {
                 let _ = KillTimer(Some(self.hwnd), SIZEMOVE_TICK_ID);
-                // WNDPROC が二度と sizer を辿らないようにしてから窓を壊す。
-                self.shared
-                    .sizer
-                    .set(std::ptr::null::<NoopSizer>() as *const dyn EditorSizer);
-                // Reclaim the Arc we leaked into GWLP_USERDATA.
+                // Reclaim the Rc we leaked into GWLP_USERDATA.
                 let raw = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const EditorShared;
                 if !raw.is_null() {
                     SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
                     drop(Rc::from_raw(raw));
                 }
                 let _ = DestroyWindow(self.hwnd);
+            } else {
+                // 窓が既に消えている経路。leak した 1 本を実体ポインタから回収する
+                // (`create` で leak するのは 1 本だけ、回収はこの Drop の
+                //  どちらか一方の枝でのみ行うので二重解放にならない)。
+                drop(Rc::from_raw(Rc::as_ptr(&self.shared)));
             }
-            tracing::info!(hwnd = self.hwnd.0 as usize, "editor window destroyed");
         }
+        tracing::info!(
+            hwnd = self.hwnd.0 as usize,
+            // 「我々が壊した」のか「消えていた」のかはログで区別できるようにする
+            // (r.md #65: 観測値に前提を埋め込む)。
+            destroyed_by = if alive { "host" } else { "already-gone (owner teardown?)" },
+            "editor window destroyed"
+        );
         // `self.sizer` (Box) はこの後 field drop で落ちる = DestroyWindow の後。
     }
 }
@@ -1921,6 +2081,46 @@ unsafe extern "system" fn editor_wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r.md #65: **owner 無しで `WS_EX_TOOLWINDOW` だけ付く**組み合わせが作れないこと。
+    ///
+    /// 自明な写像テストに見えるが、守っているのは写像ではなく
+    /// **「唯一の悪化する組み合わせが到達不能」**という不変条件。
+    /// `WS_EX_TOOLWINDOW` は Alt+Tab とタスクバーから窓を消すので、owner が無いまま
+    /// 付けると「他窓の下へ潜れるのに一覧から選べない = 取り戻せない窓」になる。
+    /// 将来 owner と ex style を別々の条件で分岐させたら、ここが落ちる。
+    #[test]
+    fn owner_binding_never_yields_toolwindow_without_an_owner() {
+        // owner が取れなかった側: TOOLWINDOW を付けない。最小化は許してよい
+        // (タスクバーボタンが出るので必ず戻せる)。
+        let standalone = OwnerBinding::Standalone;
+        assert_eq!(standalone.owner_hwnd(), None);
+        assert_eq!(standalone.ex_style(), WINDOW_EX_STYLE(0));
+        assert!(standalone.allows_minimize());
+        assert_eq!(
+            editor_window_style(true) & WS_MINIMIZEBOX,
+            WS_MINIMIZEBOX,
+            "owner 無しの窓は最小化できる (タスクバーから戻せる)"
+        );
+
+        // owner が取れた側: REAPER の FX 窓と同じ (owner + TOOLWINDOW、最小化なし)。
+        let owned = OwnerBinding::OwnedBy(HWND(0x1234 as *mut core::ffi::c_void));
+        assert!(owned.owner_hwnd().is_some());
+        assert_eq!(owned.ex_style(), WS_EX_TOOLWINDOW);
+        assert!(
+            !owned.allows_minimize(),
+            "tool window は taskbar/Alt+Tab に出ないので、最小化すると復元できなくなる"
+        );
+
+        // 窓が無い (= wire で `None`) は必ず Standalone へ落ちる。
+        assert_eq!(OwnerBinding::resolve(None), OwnerBinding::Standalone);
+        // 生値 0 は `PlatformWindowHandle` の段階で `None` になっているべき
+        // (ここが漏れると `HWND(0)` を owner に渡してしまう)。
+        assert_eq!(
+            OwnerBinding::resolve(common::protocol::PlatformWindowHandle::from_raw(0)),
+            OwnerBinding::Standalone
+        );
+    }
 
     /// スタイル写像そのもの (方針は `plugin_instance::should_offer_resize_frame`)。
     #[test]
