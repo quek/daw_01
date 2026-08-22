@@ -1782,6 +1782,10 @@ impl PluginHost {
         // 表示 + 前面化はここ 1 回だけ。
         editor.show_and_focus();
         let geometry = editor.geometry();
+        // open 中の `set_client_size` / `set_resizable` が `WM_SIZE` / `WM_MOVE` を
+        // 起こして dirty を立てているので、ここで**食べておく**。残すと直後の
+        // `poll_editor_geometry` が同じ値をもう 1 通送る。
+        let _ = editor.take_geometry_change();
         rec.editor = Some(editor);
 
         tracing::info!(
