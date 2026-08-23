@@ -2,7 +2,7 @@
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
-use common::protocol::{AudioCommand};
+use common::protocol::AudioCommand;
 
 /// [`AppData::play`] の結果。 録音開始が「本当に走り出したか」で分岐する
 /// (r.md #51) ため、要求が通ったかどうかを型で返す。
@@ -137,11 +137,8 @@ impl AppData {
         // `beats_to_samples` (SongTempo カーブの積分) を通す。定数換算のままだと
         // テンポオートメーションのある曲で「クリックした小節と実際に鳴り始める
         // 位置」がずれ、ラウドネス解析の「最大値の位置へ飛ぶ」も外れる。
-        let samples = common::automation::beats_to_samples(
-            self.song_doc.song(),
-            self.ipc.sample_rate,
-            beat,
-        );
+        let samples =
+            common::automation::beats_to_samples(self.song_doc.song(), self.ipc.sample_rate, beat);
         self.send_audio(AudioCommand::SeekTo { samples });
     }
 
@@ -173,7 +170,11 @@ impl AppData {
         // リセットされ、 再生中の playhead poll では触らないので、 再生中でも
         // 確実にトグルする。 clip が無ければ常に 1.1.1。
         let go_to_start = self.ui_ephemeral.home_toggle_at_first || first.is_none();
-        let target = if go_to_start { 0.0 } else { first.unwrap_or(0.0) };
+        let target = if go_to_start {
+            0.0
+        } else {
+            first.unwrap_or(0.0)
+        };
         // `seek_playhead_to` が flag を false に戻すので、 設定はその後に行う。
         self.seek_playhead_to(target);
         self.ui_ephemeral.home_toggle_at_first = !go_to_start;
@@ -234,7 +235,8 @@ impl AppData {
             self.send_audio(AudioCommand::Stop);
             self.transport.pending_play = true;
         }
-        self.ipc.next_plugin_load_generation = self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
+        self.ipc.next_plugin_load_generation =
+            self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
         let generation = self.ipc.next_plugin_load_generation;
         self.ipc.pending_plugin_loads.insert(device_id, generation);
         // 新しい load 要求が in-flight になった時点で、 直近の失敗理由は
@@ -402,11 +404,14 @@ impl AppData {
 
         const EPS: f64 = 1e-9;
         let current = self.transport.loop_region;
-        let same_range = (current.start_beat - start).abs() < EPS
-            && (current.end_beat - end).abs() < EPS;
+        let same_range =
+            (current.start_beat - start).abs() < EPS && (current.end_beat - end).abs() < EPS;
 
         if current.enabled && same_range {
-            self.set_loop_region(common::model::LoopRegion { enabled: false, ..current });
+            self.set_loop_region(common::model::LoopRegion {
+                enabled: false,
+                ..current
+            });
             return;
         }
 
@@ -415,9 +420,9 @@ impl AppData {
             start_beat: start,
             end_beat: end,
         });
+        self.seek_playhead_to(start);
         if !self.transport.is_playing {
             self.play();
         }
     }
-
 }
