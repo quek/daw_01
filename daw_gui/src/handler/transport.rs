@@ -396,9 +396,13 @@ impl AppData {
     ///
     /// 対象面 (`automation`) は root の `edit_surface` arbiter が解決した結果。
     /// その面の選択素材の bounding span を `arrange_selection_beat_span` で取る。
-    /// 解決できなければ no-op。
+    /// **span が取れない (= 何も選択されていない) ときは、今ある loop 範囲の
+    /// ON / OFF トグルにフォールバックする** (`P` と同じ `toggle_loop`)。
+    /// 「範囲を作り直す材料が無いなら、今の範囲を出し入れする」 が自然で、
+    /// 無反応 (旧 no-op) だとキーが死んでいるようにしか見えないため。
     pub(crate) fn loop_selected_clip_toggle(&mut self, automation: bool) {
         let Some((start, end)) = self.arrange_selection_beat_span(automation) else {
+            self.toggle_loop();
             return;
         };
 

@@ -130,7 +130,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     // ----- 再生 -----
     ShortcutDef { name: "daw.play_toggle", keys: &["Space"], category: ShortcutCategory::Transport, description: "再生 / 停止", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_loop", keys: &["P"], category: ShortcutCategory::Transport, description: "ループ ON / OFF", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
-    ShortcutDef { name: "daw.loop_selected_clip", keys: &["R"], category: ShortcutCategory::Transport, description: "選択クリップの範囲をループして再生 (再押下で解除)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.loop_selected_clip", keys: &["R"], category: ShortcutCategory::Transport, description: "選択クリップの範囲をループして再生 (再押下で解除、未選択ならループ ON/OFF)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.play_from_cursor", keys: &["F"], category: ShortcutCategory::Transport, description: "カーソル位置から再生 (Alt で吸着なし)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.goto_timeline_home", keys: &["Home"], category: ShortcutCategory::Transport, description: "プレイヘッドを最後のクリップ先頭へ (再押下で 1.1.1)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "daw.goto_timeline_end", keys: &["End"], category: ShortcutCategory::Transport, description: "プレイヘッドを最後のクリップの後ろへ", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
