@@ -977,6 +977,12 @@ impl LocalState {
         let pending_seek = shared.pending_seek.swap(NO_PENDING_SEEK, Ordering::AcqRel);
         if pending_seek != NO_PENDING_SEEK {
             shared.playhead.store(pending_seek, Ordering::Release);
+            // 飛び先には「今鳴っている note の Off」が無い。sequencer は Off が
+            // 当該 buffer 窓に入るときだけ emit する (`collect_events_for_buffer`)
+            // ので、跳び越した Off は二度と出ず note が鳴り続ける。再生中の seek
+            // (`R` = 選択範囲ループ / ルーラークリック / `f` / Home / End) は全部
+            // ここを通るので、Stop / loop wrap と同じ flush をこの経路でも通す。
+            self.queue_all_notes_off();
         }
 
         // Play / Stop edge handling. On Play, restart playhead and clear
@@ -1002,14 +1008,31 @@ impl LocalState {
                     .preroll_remaining_samples
                     .store(0, Ordering::Release);
                 self.shared.preroll_total_samples.store(0, Ordering::Release);
-                for s in self.scratch.iter_mut() {
-                    for &k in &s.state.active_notes {
-                        s.state.pending_offs.push(k);
-                    }
-                    s.state.active_notes.clear();
-                }
+                self.queue_all_notes_off();
             }
             _ => {}
+        }
+    }
+
+    /// 鳴っている全 note を「次の drain (= 各 track の process 冒頭、frame 0)」で
+    /// 出す NoteOff として予約し、追跡集合を空にする。
+    ///
+    /// **stuck note を防ぐ 3 経路 (Stop / loop wrap / seek) が共有する唯一の口。**
+    /// どれか 1 つで漏らすと、跳び越された Off が二度と emit されず note が
+    /// 鳴り続ける (`pending_offs` を積む処理を各所に手写しすると必ずどれかが
+    /// 漏れるので、増やすときもここを呼ぶこと)。
+    ///
+    /// RT-safe: `pending_offs` は `process_track_owned` の冒頭で毎 buffer drain +
+    /// clear され、この関数はどれも buffer 冒頭 (`consume_transport_requests`) か
+    /// buffer 末 (loop wrap) で呼ばれるので push 時点では空。`active_notes` は
+    /// `ACTIVE_NOTES_CAP` (= `PerTrackState::with_capacity` の確保量) でクランプ
+    /// 済みなので、push で再確保しない。
+    fn queue_all_notes_off(&mut self) {
+        for s in self.scratch.iter_mut() {
+            for &k in &s.state.active_notes {
+                s.state.pending_offs.push(k);
+            }
+            s.state.active_notes.clear();
         }
     }
 
@@ -1413,12 +1436,7 @@ impl LocalState {
                     n as f64 * f64::from(current_bpm) / (60.0 * sr);
             }
             if reached_end {
-                for s in self.scratch.iter_mut() {
-                    for &k in &s.state.active_notes {
-                        s.state.pending_offs.push(k);
-                    }
-                    s.state.active_notes.clear();
-                }
+                self.queue_all_notes_off();
                 let wrap_to = if looping {
                     effective_loop_bounds(song_ref, loop_region, sample_rate).map(|(s, _)| s)
                 } else {
