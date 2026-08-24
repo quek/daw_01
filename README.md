@@ -35,8 +35,16 @@ make license-check  # ライセンス表示の機械検査 (下記)
 現状 Windows (x86_64-pc-windows-msvc) が対象。動画デコード / エンコードは vendored な
 FFmpeg 共有ライブラリに依存する。
 
-VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**して起動しておく
+VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**しておく
 (daw_01 は `http://localhost:50021` に HTTP で話しかけるだけで、VOICEVOX 本体は同梱しない)。
+**手で起動しておく必要は無い** — vocal トラックが 1 つでもできた時点で、daw_01 が
+ヘッドレスエンジン (`vv-engine/run.exe`) を自分で立ち上げ、daw_01 の終了と一緒に落とす。
+既に :50021 が応答していれば (VOICEVOX エディタを手で開いている場合も含め) それを使う。
+
+既定のインストール先 (`%LOCALAPPDATA%\Programs\VOICEVOX\` / `C:\Program Files\VOICEVOX\`)
+以外に入れているときだけ、環境変数 `DAW_VOICEVOX_PATH` か
+`%LOCALAPPDATA%\daw_01\voicevox_engine_path.txt` に所在 (install root / `VOICEVOX.exe` /
+`run.exe` のいずれか) を書く。
 
 ## Claude Code の hook が同梱されている (clone したら読むこと)
 
