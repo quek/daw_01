@@ -302,31 +302,33 @@ impl AppData {
                 param_id,
                 display_name,
             } => {
-                let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) else {
+                let Some((track, _index)) = find_device_by_id(self.song_doc.song(), device_id)
+                else {
                     return; // 削除済み device の stale event
                 };
-                // Phase 2c: host から来る `display_name` は placeholder
-                // (= "Param N")。 `plugin_params` cache から param の
-                // 本来の name を引いて上書きする。
-                let resolved_name = self
-                    .ipc
-                    .plugin_params
-                    .get(&(track, index))
-                    .and_then(|params| params.iter().find(|p| p.id == param_id))
-                    .map(|info| info.name.clone())
-                    .unwrap_or(display_name);
                 let target = common::model::AutomationTarget::PluginParam {
                     device_id,
                     param_id,
                     legacy_device_index: None,
                 };
+                // Phase 2c: host から来る `display_name` は placeholder
+                // (= "Param N")。 完全修飾名 (`automation_target_label`) で
+                // 上書きする。 解決できなければ host の placeholder に落ちる。
+                let resolved_name = self
+                    .plugin_param_name(&target)
+                    .unwrap_or(display_name);
                 // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
                 // latched に反映する (= mixer knob と同 idiom)。
                 self.handle_event(AppEvent::ParamGestureBegin {
                     track_id: track,
-                    target,
+                    target: target.clone(),
                     display_name: resolved_name,
                 });
+                // r.md #78: modulation source が待受中 (◉) なら、 **プラグイン
+                // 自身の窓の中で触った param** をそのソースの変調先にする。
+                // daw_gui はプラグインの窓の中に overlay を描けないので、 arm +
+                // ドラッグが届かないのはここだけ。 touch 通知がその唯一の到達手段。
+                self.connect_armed_mod_source_to(track, target);
             }
             PluginEvent::PluginParamValueChanged {
                 device_id,

@@ -224,7 +224,7 @@ impl AppData {
         }) else {
             return;
         };
-        let display_name = self.automation_target_label(track_id, &target);
+        let display_name = self.automation_target_label(&target);
         self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target,
@@ -1662,7 +1662,7 @@ impl AppData {
             return;
         };
         // B6 (r.md #8): clip 名に実 param 名を使うため、 mut borrow を取る前に
-        // immutable borrow で target を取り出し track-aware label を解決する。
+        // immutable borrow で target を取り出し完全修飾 label を解決する。
         let Some(target) = self
             .song_doc.song()
             .automation_lane_by_key(lane_key.track, lane_key.lane)
@@ -1670,7 +1670,7 @@ impl AppData {
         else {
             return;
         };
-        let display = self.automation_target_label(lane_key.track, &target);
+        let display = self.automation_target_label(&target);
         self.edit_song_checked(|song| {
             let Some(lane) = song
                 .automation_lane_by_key_mut(lane_key.track, lane_key.lane)

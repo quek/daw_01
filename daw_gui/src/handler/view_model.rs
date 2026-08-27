@@ -424,45 +424,68 @@ impl AppData {
             .collect()
     }
 
-    /// docs/plan_modulation_routing_redesign.md §6: the cursor track's
-    /// **lane 非依存** modulation routings grouped by target —
-    /// `(track_id, target, target label, routings)` where each routing is
-    /// `(source_id, depth, is_bipolar)`. MASTER cursor → `song_mod_routings`.
-    /// Owned so inspector `Edit::mutate` closures can capture it.
-    #[allow(clippy::type_complexity)]
-    pub fn cursor_mod_routings(
-        &self,
-    ) -> Vec<(u32, common::model::AutomationTarget, String, Vec<(u32, f32, bool)>)> {
-        let (track_id, routings) =
-            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-                (common::model::MASTER_TRACK_ID, &self.song_doc.song().song_mod_routings)
-            } else {
-                match self.cursor_track_index().and_then(|i| self.song_doc.song().tracks.get(i)) {
-                    Some(t) => (t.id, &t.mod_routings),
-                    None => return Vec::new(),
-                }
-            };
-        // Group routings by target, preserving first-seen order.
-        let mut out: Vec<(u32, common::model::AutomationTarget, String, Vec<(u32, f32, bool)>)> =
-            Vec::new();
-        for r in routings {
-            let entry = (
-                r.source_id,
-                r.depth,
-                matches!(r.polarity, common::model::Polarity::Bipolar),
-            );
-            if let Some(group) = out.iter_mut().find(|(_, t, _, _)| *t == r.target) {
-                group.3.push(entry);
-            } else {
-                out.push((
+    /// r.md #78: `source_id` を参照する **全ての** routing を、 対象がどのトラックに
+    /// あっても集める (ラックの接続行 = ソース側から見た宛先一覧、 Bitwig の
+    /// "modulation sources" タブと同じ切り口)。
+    ///
+    /// 旧 `cursor_mod_routings` は「カーソルトラックの routing」しか返さず、
+    /// ラック側で「カーソルトラック所有のソース」と積を取っていたため、
+    /// **ソース所有トラック ≠ 対象トラック** の routing はどちらのインスペクタにも
+    /// 出ず削除できなかった。 ◉ は他トラックのツマミにも効くので、 その孤児は
+    /// 実際に作れてしまう。 ソース側 1 か所に全部並べればこの穴が閉じる。
+    ///
+    /// 対象が `owner_track_id` 以外にある行は `"<トラック名> ▸ "` を前置きする。
+    pub fn mod_source_routings(&self, source_id: u32) -> Vec<ModRoutingRow> {
+        let song = self.song_doc.song();
+        let owner = song
+            .mod_sources
+            .iter()
+            .find(|m| m.id == source_id)
+            .map_or(0, |m| m.owner_track_id);
+        // 自分の所有トラックを先頭に、 次に他トラック、 最後に song-level (master)。
+        let scan = song
+            .tracks
+            .iter()
+            .filter(|t| t.id == owner)
+            .chain(song.tracks.iter().filter(|t| t.id != owner))
+            .map(|t| (t.id, t.mod_routings.as_slice()))
+            .chain(std::iter::once((
+                common::model::MASTER_TRACK_ID,
+                song.song_mod_routings.as_slice(),
+            )));
+        let mut out: Vec<ModRoutingRow> = Vec::new();
+        for (track_id, routings) in scan {
+            for r in routings.iter().filter(|r| r.source_id == source_id) {
+                let label = self.automation_target_label(&r.target);
+                let label = if track_id == owner {
+                    label
+                } else {
+                    format!("{} \u{25b8} {label}", self.track_display_name(track_id))
+                };
+                out.push(ModRoutingRow {
                     track_id,
-                    r.target.clone(),
-                    self.automation_target_label(track_id, &r.target),
-                    vec![entry],
-                ));
+                    target: r.target.clone(),
+                    label,
+                    depth: r.depth,
+                    bipolar: matches!(r.polarity, common::model::Polarity::Bipolar),
+                });
             }
         }
         out
+    }
+
+    /// `track_id` の表示名 (`MASTER_TRACK_ID` → "Master")。 削除済みは id を出す
+    /// (無言で空にすると「名前の無い行」になって原因が追えない)。
+    pub fn track_display_name(&self, track_id: u32) -> String {
+        if track_id == common::model::MASTER_TRACK_ID {
+            return "Master".to_string();
+        }
+        self.song_doc
+            .song()
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .map_or_else(|| format!("Track {track_id}"), |t| t.name.clone())
     }
 
     /// docs/plan_modulation_routing_redesign.md §6: a stable display color for a
@@ -514,39 +537,59 @@ impl AppData {
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
     }
 
-    /// `PluginParam` target の実 param 名を `plugin_params` cache
-    /// `(track_id, device_index)` から引く (B6 / r.md #8)。 非 plugin target /
-    /// host が `PluginParamList` 未送 / 空名 は `None` (caller が generic 名へ
-    /// fallback)。 arrangement lane header の `param_name_of` closure と
-    /// `automation_target_label` の SSoT。
-    pub fn plugin_param_name(
-        &self,
-        track_id: u32,
-        target: &common::model::AutomationTarget,
-    ) -> Option<String> {
+    /// device の表示名の **SSoT** (r.md #78)。 音プラグインは plugin DB
+    /// (`resolve_name`)、 内蔵映像 FX は静的マニフェスト
+    /// (`common::video_fx::def_by_id`) が出所で、 device 表示名の出所が 2 系統ある
+    /// ことをここ 1 箇所に閉じ込める。
+    fn device_label(&self, inst: &common::model::PluginInstance) -> String {
+        common::video_fx::def_by_id(&inst.plugin_id)
+            .map_or_else(|| self.resolve_name(&inst.plugin_id), |def| def.name.to_string())
+    }
+
+    /// `PluginParam` target の **完全修飾** param 名 (r.md #72 / #78)。
+    /// 形は `"<device 名>: <param 名>"`、 CLAP が `module` (= "/" 区切りの
+    /// グループパス) を報告していれば `"<device 名>: <module>/<param 名>"`。
+    ///
+    /// device 名を必ず付けるのが要点で、 これが無いと MPhaser の "Dry/Wet" と
+    /// MSaturator の "Dry/Wet" が同一表示になる (r.md #72)。 modulation ラックの
+    /// 接続行・ arrangement lane header・ status message が**同じこの 1 本**を
+    /// 使うので、 名前の付け方はここだけを直せばよい。
+    ///
+    /// 内蔵映像 FX は host が `PluginParamList` を送らない (param 表は静的
+    /// マニフェスト) ので、 そちらから引く。 非 plugin target / device が消えて
+    /// いる / host 未送 / 空名 は `None` (caller が generic 名へ fallback)。
+    pub fn plugin_param_name(&self, target: &common::model::AutomationTarget) -> Option<String> {
         let common::model::AutomationTarget::PluginParam { device_id, param_id, .. } = target
         else {
             return None;
         };
-        let _ = track_id;
-        let (t, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
+        let (track_id, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
+        let inst = device_at(self.song_doc.song(), track_id, device_index)?;
+        let device = self.device_label(inst);
+        if let Some(def) = common::video_fx::def_by_id(&inst.plugin_id) {
+            let param = def.param(*param_id)?;
+            return Some(format!("{device}: {}", param.name));
+        }
         let info = self
             .ipc.plugin_params
-            .get(&(t, device_index))?
+            .get(&(track_id, device_index))?
             .iter()
             .find(|p| p.id == *param_id)?;
-        (!info.name.is_empty()).then(|| info.name.clone())
+        if info.name.is_empty() {
+            return None;
+        }
+        if info.module.is_empty() {
+            Some(format!("{device}: {}", info.name))
+        } else {
+            Some(format!("{device}: {}/{}", info.module, info.name))
+        }
     }
 
-    /// `automation_target_display_name` の track-aware 版 (B6 / r.md #8)。
-    /// `PluginParam` は実 param 名 (`plugin_param_name`) を、 解決できなければ
+    /// `automation_target_display_name` の song-aware 版 (B6 / r.md #8)。
+    /// `PluginParam` は完全修飾名 (`plugin_param_name`) を、 解決できなければ
     /// generic「Param N」を返す。 status_message / clip 名 / mod routing 表示用。
-    pub fn automation_target_label(
-        &self,
-        track_id: u32,
-        target: &common::model::AutomationTarget,
-    ) -> String {
-        self.plugin_param_name(track_id, target)
+    pub fn automation_target_label(&self, target: &common::model::AutomationTarget) -> String {
+        self.plugin_param_name(target)
             .unwrap_or_else(|| automation_target_display_name(target))
     }
 
@@ -618,95 +661,18 @@ impl AppData {
         InspectorModData { entries, live_display, armed, track_id, base_norm }
     }
 
-    /// docs/plan_modulation_routing_redesign.md §6: the cursor track's
-    /// modulatable param targets (for the rack's add-routing picker). Track
-    /// builtins always; group transform when the track is a group / has a
-    /// transform; plugin params per device; image / text builtins when the
-    /// track owns such clips.
-    ///
-    /// MASTER cursor は song-level target (`SongTempo`) を返す: engine の
-    /// `current_bpm` と export が `song_mod_routings` → `SongTempo` を消費する
-    /// (r.md #8 B11、 follower/LFO → tempo 変調)。 `SongTimeSigNumerator` は離散値で
-    /// 連続変調が無意味なため除外。 通常 track は builtin / group transform / plugin
-    /// param / image / text builtin を所有状況に応じて返す。
-    pub fn cursor_modulatable_targets(&self) -> Vec<common::model::AutomationTarget> {
-        use common::model::{
-            AutomationTarget as AT, GroupTransformParam as GP, ImageBuiltinParam as IB,
-            TextBuiltinParam as TX, TrackBuiltinParam as TB,
-        };
-        let mut out: Vec<AT> = Vec::new();
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            // B11 (r.md #8): song-level tempo modulation を master cursor の mod
-            // picker に出す (engine + export が SongTempo を消費するようになった)。
-            out.push(AT::SongTempo);
-            // r.md #8 再監査: master fx (`master_fx_chain`) の PluginParam も変調
-            // ターゲットに出す (engine の `process_master_fx_chain` が
-            // `song_mod_routings` を `fill_pd_param_events(MASTER_TRACK_ID)` で消費)。
-            for (di, dev) in self.song_doc.song().master_fx_chain.iter().enumerate() {
-                if let Some(params) =
-                    self.ipc.plugin_params.get(&(common::model::MASTER_TRACK_ID, di as u32))
-                {
-                    for p in params {
-                        out.push(AT::PluginParam {
-                            device_id: dev.id,
-                            param_id: p.id,
-                            legacy_device_index: None,
-                        });
-                    }
-                }
-            }
-            return out;
-        }
-        let Some(track) = self.cursor_track_index().and_then(|i| self.song_doc.song().tracks.get(i)) else {
-            return out;
-        };
-        out.push(AT::TrackBuiltin(TB::Volume));
-        out.push(AT::TrackBuiltin(TB::Pan));
-        if track.group_transform.is_some() || self.is_group_track(track.id) {
-            for p in [
-                GP::X, GP::Y, GP::ScaleX, GP::ScaleY, GP::Rotation, GP::Opacity, GP::AnchorX,
-                GP::AnchorY,
-            ] {
-                out.push(AT::GroupTransform(p));
-            }
-        }
-        for (di, dev) in track.devices.iter().enumerate() {
-            if let Some(params) = self.ipc.plugin_params.get(&(track.id, di as u32)) {
-                for p in params {
-                    out.push(AT::PluginParam {
-                        device_id: dev.id,
-                        param_id: p.id,
-                        legacy_device_index: None,
-                    });
-                }
-            }
-        }
-        let has_image = track.clips.iter().any(|c| {
-            self.song_doc.song()
-                .clip_contents
-                .get(&c.content_id)
-                .is_some_and(|cc| cc.image_events().is_some())
-        });
-        if has_image {
-            for p in [IB::X, IB::Y, IB::W, IB::H, IB::Opacity, IB::Rotation] {
-                out.push(AT::ImageBuiltin(p));
-            }
-        }
-        let has_text = track.clips.iter().any(|c| {
-            self.song_doc.song()
-                .clip_contents
-                .get(&c.content_id)
-                .is_some_and(|cc| cc.text_events().is_some())
-        });
-        if has_text {
-            // B10 (r.md #8): image と対称化 — text W/H も modulation 対象
-            // (text_compose の resolve_norm が W/H にも変調を適用済)。
-            for p in [TX::X, TX::Y, TX::W, TX::H, TX::Opacity, TX::Rotation, TX::FontSize] {
-                out.push(AT::TextBuiltin(p));
-            }
-        }
-        out
-    }
+    // r.md #78: `cursor_modulatable_targets` は撤去した。
+    //
+    // 「変調先の全候補を 1 本の Vec に平坦化して dropdown に流す」設計そのものが
+    // 誤りだった。 `ui.dropdown` の popup は高さ = 件数 × 24px で切り詰めないので
+    // (`ui/crates/ui/src/popup.rs`)、 画面高を超えた候補は描かれても hit-test に
+    // 当たらず**原理的に選べない**。 実測で 1 プラグイン 47,137 param という例が
+    // ある以上、 候補を絞る小細工では解けない。
+    //
+    // 置き換えは「候補を並べる」のをやめること。 変調先の指定は ◉ (arm) の
+    // ワンショット 1 本に統一し、 daw_gui が描くツマミは per-control ドラッグ、
+    // プラグイン自身の窓の中のツマミは `PluginParamTouched` が拾う
+    // (`handler/ipc.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
 
     pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
         let cursor_id = self.cursor_track_id();

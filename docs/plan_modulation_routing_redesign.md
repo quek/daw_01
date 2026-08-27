@@ -148,6 +148,11 @@ per-param に depth 入力を継ぎ足すのは SSoT 分裂 + interim（`feedbac
   widget が landing したら inspector の各 `scrubable_number_at` 呼び出しに modulation 引数を wire（parked）。
   interim な depth 入力は作らない。
 - **dropdown はみ出し**（長い track 名 / "(Video)" のクリップ）も同要望の補足で gui_01 に報告済（優先度低）。
+  → **2026-08-27 に本番で壊れて回収**。「優先度低」と見積もったのは項目数が数十で収まる前提だったが、
+  プラグイン 1 個が 47,137 param を報告する例があり、popup は高さを切り詰めないので画面外の候補は
+  原理的にクリックできなかった。**候補一覧そのものを撤去**し、ルート指定を ◉ (arm) 一本に統一した。
+  以後この節の「add-route dropdown」は存在しない。設計正本は
+  [plan_modulation_arm_only.md](plan_modulation_arm_only.md)（r.md #78）。
 
 ## 7. 実装手順（一括・フェーズ分けなし）
 

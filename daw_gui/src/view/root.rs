@@ -1391,6 +1391,14 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CloseAudioEditor)
             }));
+        } else if app.ui_ephemeral.armed_mod_source.is_some() {
+            // r.md #78: 変調ソースの待受 (◉) を Esc で取り消す。 待受中は
+            // 「次に触ったツマミ」に繋がるモードなので、 window を閉じるより先に
+            // モードを抜ける。 ラックの ◉ ボタンはカーソルトラック所有のソース
+            // しか出ず、 トラックを移ると解除する手段が無くなるため必須。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::SetArmedModSource(None));
+            }));
         } else if app.ui_ephemeral.resource_panel_open {
             // resource monitor (r.md #3): 詳細パネルが開いていれば Esc で閉じる
             // (rename / audio editor の後、 選択解除より優先)。

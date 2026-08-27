@@ -759,11 +759,6 @@ impl AppData {
         else {
             return;
         };
-        let display_name = if info.module.is_empty() {
-            info.name.clone()
-        } else {
-            format!("{} {}", info.module, info.name)
-        };
         let span = info.max_value - info.min_value;
         let norm = if span.abs() < f64::EPSILON {
             0.0
@@ -802,6 +797,10 @@ impl AppData {
                 }
             }
         });
+        // 表示名は `automation_target_label` 1 本に寄せる (r.md #72 / #78)。
+        // かつてここだけ `format!("{module} {name}")` を手組みしていたため、
+        // 同じ param が経路によって別名で出ていた。
+        let display_name = self.automation_target_label(&target);
         self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target,

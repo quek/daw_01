@@ -813,6 +813,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             open_popups: &mut self.open_popups,
             popup_primitives: Vec::new(),
             drawing_in_popup: false,
+            current_popup: None,
             redraw_requested: &mut redraw_requested,
             file_drop,
             file_hover,
@@ -998,6 +999,11 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     popup_primitives: Vec<Primitive>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
     drawing_in_popup: bool,
+    /// いま `popup_layer` の body を描いている popup の id。`Ui::popup_scroll` が
+    /// 「自分自身の popup state」に scroll 量を書くために使う (id を引数で持ち回すと
+    /// 呼び出し側が別 popup の id を渡せてしまう = ずれの温床)。cascade は nest するので
+    /// popup_layer が退避 / 復元する。
+    current_popup: Option<WidgetId>,
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだら true。
     /// `UiHost::frame` の末尾で `redraw_requested_in_last_frame` に commit され、
     /// 次のフレーム redraw の発火条件に含まれる。
@@ -1286,8 +1292,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 capture_input,
                 capture_keyboard,
                 dismiss_on_outside_click: true,
+                scroll_offset: 0.0,
+                scroll_drag: None,
             },
         );
+    }
+
+    /// `popup_layer` の body で描画中の popup の縦スクロール state
+    /// `(scroll_offset, scroll_drag)`。body の外では `None`。
+    /// 実処理は [`Ui::popup_scroll`] (popup.rs) が担う。
+    pub(crate) fn current_popup_scroll(&self) -> Option<(f32, Option<(f32, f32)>)> {
+        let wid = self.current_popup?;
+        self.open_popups
+            .get(&wid)
+            .map(|s| (s.scroll_offset, s.scroll_drag))
+    }
+
+    /// [`Ui::current_popup_scroll`] の書き込み側。body の外では no-op。
+    pub(crate) fn set_current_popup_scroll(&mut self, offset: f32, drag: Option<(f32, f32)>) {
+        let Some(wid) = self.current_popup else {
+            return;
+        };
+        if let Some(state) = self.open_popups.get_mut(&wid) {
+            state.scroll_offset = offset;
+            state.scroll_drag = drag;
+        }
     }
 
     /// M14 Phase 95 (daw_01 #066): 開いている popup の `dismiss_on_outside_click` を更新する。
@@ -1447,11 +1476,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let prev_in_popup = self.drawing_in_popup;
         let prev_clip = self.current_clip;
+        let prev_popup = self.current_popup;
         self.drawing_in_popup = true;
         self.current_clip = None;
+        self.current_popup = Some(wid);
         f(self);
         self.drawing_in_popup = prev_in_popup;
         self.current_clip = prev_clip;
+        self.current_popup = prev_popup;
         if let Some(s) = saved_pointer {
             self.pointer = s;
         }

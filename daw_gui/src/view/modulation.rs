@@ -124,6 +124,11 @@ pub(crate) fn build_mod(
 /// `SetModRoutingDepth` の edit_song が bump した epoch を runner の frame flush
 /// (`flush_song_sync`) が 1 frame 1 回で LoadSong する構造になったため、 ここでの
 /// 明示 resync は不要になった (drag 中も per-frame で構造的に coalesce される)。
+///
+/// r.md #78: 加えて **立ち下がり edge で待受 (◉) を解除**する。 arm は
+/// 「触ったツマミ 1 個に繋ぐ」ワンショットだが、 depth ドラッグ中は毎フレーム
+/// `AddModRouting` + `SetModRoutingDepth` を撃つので、 繋いだ瞬間に解除すると
+/// 自分のドラッグを切ってしまう。 よって解除は **ドラッグを離した瞬間**。
 pub(crate) fn push_mod_drag_resync(
     ui: &mut Ui<'_, AppData>,
     app: &AppData,
@@ -144,14 +149,19 @@ pub(crate) fn push_mod_drag_resync(
             app.ui_ephemeral.mod_depth_scrub_active = Some(key);
         } else {
             app.ui_ephemeral.mod_depth_scrub_active = None;
+            // 立ち下がり = このツマミへの割り当てが完了した瞬間。
+            // routing 自体は drag 中に作られているので、 ここは解除と通知だけ。
+            let (track_id, target) = key;
+            app.connect_armed_mod_source_to(track_id, target);
         }
     }));
 }
 
 /// `scrub_field` の `scrub_key` から modulation target と表示↔model 変換を導く。
 /// `None` = 変調対象でない field (clip-level gain / pan / pitch / fade 等)。
-/// per-control 対象は **`cursor_modulatable_targets` と同集合**に厳密に揃える
-/// (ラックで見えない/外せない routing を作らないため)。text は X/Y/W/H/Opacity/
+/// r.md #78 で候補 dropdown を撤去したので、 **ここに出るかどうかが「変調できる
+/// か」の定義そのもの** になった (指定経路は ◉ 一本で、 ◉ は per-control か
+/// プラグイン窓の touch でしか届かない)。text は X/Y/W/H/Opacity/
 /// Rotation/FontSize が対象 (B10 r.md #8: text_compose の resolve_norm が W/H にも
 /// modulation を適用しているので image と対称化。 色・outline・shadow は引き続き対象外)。
 pub(crate) fn scrub_field_mod(

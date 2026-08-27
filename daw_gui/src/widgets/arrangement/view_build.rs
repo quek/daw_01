@@ -247,7 +247,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 t,
                 lane_build_data,
                 &|tgt| app.plugin_param_range(t.id, tgt),
-                &|tgt| app.plugin_param_name(t.id, tgt),
+                &|tgt| app.plugin_param_name(tgt),
             ),
             row_h: app.ui_prefs.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
@@ -328,7 +328,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         common::model::MASTER_TRACK_ID,
         lane_build_data,
         &|tgt| app.plugin_param_range(common::model::MASTER_TRACK_ID, tgt),
-        &|tgt| app.plugin_param_name(common::model::MASTER_TRACK_ID, tgt),
+        &|tgt| app.plugin_param_name(tgt),
     );
     let master_row = ArrangementMasterRow {
         automation_lanes_collapsed: !app.ui_prefs.master_row_automation_expanded,

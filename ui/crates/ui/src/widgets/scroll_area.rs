@@ -25,7 +25,7 @@ use crate::id::WidgetId;
 use crate::ui::Ui;
 
 /// scrollbar の幅 (px)。track と thumb 共通。
-const SCROLLBAR_W: f32 = 10.0;
+pub(crate) const SCROLLBAR_W: f32 = 10.0;
 /// thumb の最低長さ (px)。content_size が極端に大きいときも掴める大きさを保つ。
 const THUMB_MIN_LEN: f32 = 24.0;
 
@@ -251,7 +251,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 }
 
 /// 縦 scrollbar の track 矩形 (rect の右端、横 scrollbar がある場合は下端を空ける)。
-fn vertical_scrollbar_rect(rect: Rect, has_horizontal: bool) -> Rect {
+pub(crate) fn vertical_scrollbar_rect(rect: Rect, has_horizontal: bool) -> Rect {
     let h_offset = if has_horizontal { SCROLLBAR_W } else { 0.0 };
     Rect {
         x: rect.x + rect.w - SCROLLBAR_W,
@@ -291,7 +291,15 @@ fn thumb_len(content: f32, viewport: f32, track: f32) -> f32 {
     ((viewport / content) * track).max(THUMB_MIN_LEN).min(track)
 }
 
-fn thumb_rect_vertical(track: Rect, content_h: f32, viewport_h: f32, offset_y: f32, max_y: f32) -> Rect {
+/// 縦 thumb の矩形 (track 内の現在位置)。popup の縦スクロール
+/// ([`crate::ui::Ui::popup_scroll`]) も同じ寸法規則を共有する。
+pub(crate) fn thumb_rect_vertical(
+    track: Rect,
+    content_h: f32,
+    viewport_h: f32,
+    offset_y: f32,
+    max_y: f32,
+) -> Rect {
     let thumb_h = thumb_len(content_h, viewport_h, track.h);
     let frac = if max_y > 0.0 { offset_y / max_y } else { 0.0 };
     let thumb_y = track.y + (track.h - thumb_h) * frac;

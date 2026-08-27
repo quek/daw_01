@@ -7,6 +7,10 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent};
 use crate::view::resource_monitor::load_color;
 
+/// 常駐リソースメーターのバッジ幅。 左側テキストの clip 幅を先に決めるため、
+/// 描画側とここで同じ値を使う (定数 1 つを共有 = 値の二重化を作らない)。
+const RESMON_BADGE_W: f32 = 248.0;
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ステータスバーはクロームのバー類 (= transport / menu bar と同じ層)。
     // 上に乗る文字はこの面 (パレット自身のクローム) の上なのでテーマ従属の
@@ -16,6 +20,47 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let pad = 12.0;
     let line_y = area.y + (area.h - 11.0) * 0.5;
+
+    // 左側テキストが使える右端。 常駐メーターが出ているならその手前まで
+    // (下の描画より先に決めておく — 待受表示と MIDI/file 行の両方を clip したい)。
+    let meters_left = if app.ui_prefs.resource_monitor_enabled {
+        area.x + area.w - RESMON_BADGE_W - pad - 8.0
+    } else {
+        area.x + area.w - pad
+    };
+
+    // ----- 変調ソースの待受表示 (r.md #78) -----
+    // ◉ 中は「次に触ったツマミ」に繋がるので、 待受中であることが常に見えて
+    // いなければ事故になる。 ラックの ◉ ボタンはカーソルトラック所有のソース
+    // しか出ないため、 トラックを移ると消える = 唯一の表示にできない。
+    //
+    // ソース色は暗いテーマ前提のパレットなので、 **文字には使わない**。
+    // 色は小さなチップ (塗り矩形) だけに載せ、 文字はテーマの `text` に固定する
+    // (明/暗どちらの背景でも読める)。
+    let mut left_x = area.x + pad;
+    if let Some((color, name)) = app.armed_mod_source_label() {
+        let chip = 10.0;
+        ui.panel(
+            "status_mod_arm_chip",
+            Rect { x: left_x, y: area.y + (area.h - chip) * 0.5, w: chip, h: chip },
+            daw_ui_renderer::Color { r: color[0], g: color[1], b: color[2], a: 1.0 },
+            2.0,
+        );
+        left_x += chip + 6.0;
+        let text = format!("{name} 待受中 \u{2014} 触ったツマミに繋がります (Esc で解除)");
+        // 幅は「実測」と「メーターまでの残り」の小さい方。 素の label_at は clip も
+        // 省略もしないので、 狭い窓では常駐メーターに重なって双方読めなくなる。
+        let w = ui.measure_text(&text, 11.0).min((meters_left - left_x).max(0.0));
+        ui.label_at_clipped(
+            "status_mod_arm",
+            &text,
+            Rect { x: left_x, y: line_y, w, h: 11.0 * 1.2 },
+            11.0,
+            p.text,
+        );
+        // 続く MIDI / file 行を待受表示の右へずらす (重ねない)。
+        left_x += w + 16.0;
+    }
 
     let left = format!(
         "MIDI: {} \u{2502} file: {}",
@@ -31,15 +76,29 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     // 旧 dim グレーはコントラスト不足だったため primary (= 他 view と同じ
     // body text) に統一。MIDI/file ラベルの可読性を上げる。
-    ui.label_at("status_left", &left, area.x + pad, line_y, 11.0, p.text);
+    // 待受表示が出ると開始位置が右へずれるので、 常駐メーターの手前で切る
+    // (長いファイルパスがメーターに重なるのを防ぐ)。
+    ui.label_at_clipped(
+        "status_left",
+        &left,
+        Rect {
+            x: left_x,
+            y: line_y,
+            w: (meters_left - left_x).max(0.0),
+            h: 11.0 * 1.2,
+        },
+        11.0,
+        p.text,
+    );
 
     // ----- 常駐リソースメーター (r.md #3) -----
     // 右端に DSP load (peak) / system CPU / FPS / xrun を色付きで常駐表示し、
     // クリックで詳細パネルを開閉する。 app_config で on/off (デフォルト on)。
-    let mut left_limit = area.x + area.w - pad;
+    // 右端は上で決めた `meters_left` と同じ (同じ値を 2 度計算しない)。
+    let left_limit = meters_left;
     if app.ui_prefs.resource_monitor_enabled {
         let m = &app.ipc.metrics;
-        let badge_w = 248.0;
+        let badge_w = RESMON_BADGE_W;
         let badge_x = area.x + area.w - badge_w - pad;
         let badge_y = area.y + 3.0;
         let badge_h = area.h - 6.0;
@@ -107,7 +166,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 p.text_dim
             },
         );
-        left_limit = badge_x - 8.0;
+        debug_assert!(
+            (left_limit - (badge_x - 8.0)).abs() < 0.01,
+            "meters_left と badge 実配置がずれている (幅の定数が二重化した)"
+        );
     }
 
     if !app.ui_ephemeral.status_message.is_empty() {

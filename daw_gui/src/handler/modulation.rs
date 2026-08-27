@@ -198,7 +198,54 @@ impl AppData {
         // follower の attack/release と同流儀)。
     }
 
+    /// r.md #78: **待受中 (◉) のソースを `target` に繋ぐ唯一の口**。
+    ///
+    /// arm は「触ったツマミ 1 個に繋ぐ」ワンショットなので、 繋いだ時点で自動
+    /// 解除する (待受けたまま忘れて、 音作りでツマミをいじっただけで繋がる事故を
+    /// 防ぐ)。 待受中でなければ何もしない。
+    ///
+    /// 呼び出し元は 2 つで、 **到達範囲が違う**:
+    /// - `handler/ipc.rs` の `PluginParamTouched` … プラグイン自身の窓の中の
+    ///   ツマミ (daw_gui が overlay を描けない唯一の領域)。
+    /// - `view/modulation.rs` の depth ドラッグ終端 … daw_gui が描いているツマミ
+    ///   (ドラッグ量がそのまま depth になるので、 ここでは解除だけ担う)。
+    pub(crate) fn connect_armed_mod_source_to(
+        &mut self,
+        track_id: u32,
+        target: common::model::AutomationTarget,
+    ) {
+        let Some(source_id) = self.ui_ephemeral.armed_mod_source else {
+            return;
+        };
+        let label = self.automation_target_label(&target);
+        let added = self.add_mod_routing(track_id, target, source_id);
+        self.ui_ephemeral.armed_mod_source = None;
+        // 既に繋がっていた param を再ドラッグしただけのときに「割り当てました」と
+        // 出すと、 何が起きたかを取り違える。 起きた事実をそのまま出す。
+        self.ui_ephemeral.status_message = if added {
+            format!("変調を割り当てました → {label}")
+        } else {
+            format!("変調の深さを更新しました → {label}")
+        };
+    }
+
+    /// r.md #78: 待受中 (◉) のソースの `(色, 表示名)`。 ステータスバーが
+    /// 「今どのソースが待受中か」を常時出すために使う。 ラックはカーソルトラック
+    /// 所有のソースしか列挙しないので、 トラックを移ると ◉ ボタン自体が画面から
+    /// 消える。 待受の可視化を ◉ ボタンだけに任せられない理由がこれ。
+    pub fn armed_mod_source_label(&self) -> Option<([f32; 3], String)> {
+        let sid = self.ui_ephemeral.armed_mod_source?;
+        let src = self.song_doc.song().mod_sources.iter().find(|m| m.id == sid)?;
+        let track = self.track_display_name(src.owner_track_id);
+        Some((src.color, format!("{track} / {}", src.kind.short_label())))
+    }
+
     pub(crate) fn remove_mod_source(&mut self, id: u32) {
+        // 待受中のソースを消したら待受も解除する (削除済み id を掴んだままだと
+        // 次に触ったツマミが幽霊 routing になる)。
+        if self.ui_ephemeral.armed_mod_source == Some(id) {
+            self.ui_ephemeral.armed_mod_source = None;
+        }
         self.edit_song(move |song| {
             song.mod_sources.retain(|m| m.id != id);
             // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
@@ -230,32 +277,34 @@ impl AppData {
         .flatten()
     }
 
+    /// 戻り値は **実際に足したか** (既に同じ (target, source) があれば `false`)。
+    /// per-control の depth ドラッグは毎フレームここを通るので、 呼び出し側が
+    /// 「今つないだ」 と「もう繋がっていた」 を区別できるようにしている。
     pub(crate) fn add_mod_routing(
         &mut self,
         track_id: u32,
         target: common::model::AutomationTarget,
         source_id: u32,
-    ) {
-        let _ = self
-            .edit_mod_routings(track_id, |routings| {
-                if routings
-                    .iter()
-                    .any(|r| r.source_id == source_id && r.target == target)
-                {
-                    false
-                } else {
-                    routings.push(common::model::ModRouting {
-                        target,
-                        source_id,
-                        depth: 1.0,
-                        polarity: common::model::Polarity::Unipolar,
-                    });
-                    true
-                }
-            })
-            .unwrap_or(false);
+    ) -> bool {
         // 実際に追加したときだけ recompile (per-control depth ドラッグは毎フレーム
         // AddModRouting を呼ぶので、no-op add で sync すると LoadSong 連発になる)。
+        self.edit_mod_routings(track_id, |routings| {
+            if routings
+                .iter()
+                .any(|r| r.source_id == source_id && r.target == target)
+            {
+                false
+            } else {
+                routings.push(common::model::ModRouting {
+                    target,
+                    source_id,
+                    depth: 1.0,
+                    polarity: common::model::Polarity::Unipolar,
+                });
+                true
+            }
+        })
+        .unwrap_or(false)
     }
 
     pub(crate) fn remove_mod_routing(

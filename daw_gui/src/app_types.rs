@@ -412,6 +412,24 @@ pub struct ModSourceRow {
     pub kind: common::model::ModSourceKind,
 }
 
+/// r.md #78: 変調ラックの「このソースが駆動している接続」1 行。
+///
+/// **ソース側から見た 1 本の routing** で、 対象がどのトラックにあっても並ぶ。
+/// かつては「カーソルトラックの routing」×「カーソルトラック所有のソース」の積
+/// でしか描いておらず、 ソース所有トラックと対象トラックが違う routing は
+/// どちらのインスペクタにも出ず**削除できなかった** (孤児)。
+#[derive(Debug, Clone)]
+pub struct ModRoutingRow {
+    /// この routing を保持しているトラック (`MASTER_TRACK_ID` → `song_mod_routings`)。
+    /// depth / 極性 / 削除の宛先。
+    pub track_id: u32,
+    pub target: common::model::AutomationTarget,
+    /// 表示ラベル。 対象がソース所有トラック以外なら `"<トラック名> \u{25b8} "` 前置き。
+    pub label: String,
+    pub depth: f32,
+    pub bipolar: bool,
+}
+
 /// `AddModSource` で作る変調器の種別タグ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModSourceKindTag {

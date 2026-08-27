@@ -54,6 +54,18 @@ TEST_PKGS_NO_GUI := $(patsubst %,-p %,$(filter-out daw_gui,$(TEST_PKG_NAMES)))
 # scripts/test_guards.py の check_launching_targets_list() が両者のズレを検出する。
 DAW_GUI_SAFE_TESTS := $(patsubst %,--test %,$(basename $(notdir \
     $(shell grep -L CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs 2>/dev/null))))
+# **ディレクトリ形式の test target** (`tests/<name>/main.rs` = 複数モジュールを 1 バイナリに
+# 統合したもの、現状 app_state) は上の glob に映らない。しかも target 名はファイル名では
+# なく **ディレクトリ名** なので、単に glob を足すだけでは `main` という存在しない target を
+# 渡してしまう。ここを落とすと `make test-nolaunch` が該当バイナリを**黙って丸ごと素通り**
+# する (2026-08-27 に発覚: app_state の 94 件が一度も回っていなかった。`make test` は
+# `--test` 列を渡さないので影響を受けず、差分に気付けなかった)。
+# 判定基準は同じく CARGO_BIN_EXE_daw_gui だが、対象は main.rs 単体ではなく
+# **ディレクトリ配下すべて** (サブモジュール側が起動しうる)。
+DAW_GUI_SAFE_TESTS += $(shell for d in daw_gui/tests/*/; do \
+    [ -f "$$d/main.rs" ] || continue; \
+    grep -rq CARGO_BIN_EXE_daw_gui "$$d" || echo "--test $$(basename $$d)"; \
+  done 2>/dev/null)
 
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)

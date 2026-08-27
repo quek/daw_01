@@ -676,17 +676,9 @@ impl AppData {
     }
 
     pub(crate) fn resolve_name(&self, plugin_id: &str) -> String {
-        self.ipc.plugin_db
-            .as_deref()
-            .and_then(|db| db.find_by_id(plugin_id))
-            .map(|e| {
-                if e.name.is_empty() {
-                    plugin_id.to_string()
-                } else {
-                    e.name.clone()
-                }
-            })
-            .unwrap_or_else(|| plugin_id.to_string())
+        // 本体は free 関数 1 本 (`&AppData` を持たない view からも呼ぶため)。
+        // ここで body を複製すると同じ解決規則が 2 箇所に散る。
+        crate::app::resolve_plugin_name(&self.ipc.plugin_db, plugin_id)
     }
 
 }

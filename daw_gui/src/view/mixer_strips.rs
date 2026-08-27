@@ -715,8 +715,8 @@ fn draw_strip(
     // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
     // #110): 音量フェーダーを音でドラッグ変調。表示ドメインは「フェーダーの正規化
     // トラック位置」(dB taper) なので base も `MeterScale::db_to_frac(dB)` の frac で
-    // 渡し、`ModControlDomain::FaderDb` が volume(amp) ↔ frac を解決する。master は
-    // 変調対象外 (cursor_modulatable_targets と同様)。
+    // 渡し、`ModControlDomain::FaderDb` が volume(amp) ↔ frac を解決する。master の
+    // 出力ゲインは `TrackBuiltin(Volume)` ではないので変調対象外。
     let vol_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
     let vol_mod = if is_master {
         None
@@ -966,8 +966,10 @@ fn draw_sends_rows(
                     })
                 })
             },
-            // SendGain は per-control modulation 非対象 (cursor_modulatable_targets
-            // = Volume/Pan のみ)。ラックからもルーティングしない。
+            // SendGain は per-control modulation 非対象。 engine 側が send gain に
+            // automation lane しか適用しない (`daw_audio/src/graph/execute.rs` の
+            // send 段) ので、 繋げても音が変わらない幽霊 routing になる。
+            // 変調可能にするなら engine を先に直すこと (r.md #78 の保留事項)。
             None,
         );
         // send-gain automation の gesture edge を volume / pan と同様に発火。

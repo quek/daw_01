@@ -7,15 +7,22 @@
 //! - `Ui::open_popup(id, anchor, modal)` で popup を開く (例: `menu_bar` が File menu の click で呼ぶ)
 //! - `Ui::close_popup(id)` で popup を閉じる
 //! - 外クリック検出は popup_layer 内で実装、自動 close
+//! - 縦リスト popup (menu / dropdown / context menu / cascade) は
+//!   `list_popup_rect_*` で **画面に収まる高さへ打ち切って** 配置し、body 側で
+//!   `Ui::popup_scroll` を呼んでホイール / scrollbar でスクロールさせる
+//!   (打ち切らないと末尾 item が画面外に描かれ、hit-test はスクリーン座標なので
+//!   原理的にクリックできない)
 //! - modal: M7 では popup の anchor 外クリックを popup_layer 自身が消費する形 (他 widget は
 //!   `pointer.primary_just_*` がそのまま見えるので、利用者が popup_layer を user closure の
 //!   早い段階に置くこと。この前提は `feedback_pursue_best_practice` の妥協ポイントとして
 //!   `docs/history.html` に記録)
 
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::Rect;
+use daw_ui_renderer::{Rect, RectCommand};
 
 use crate::id::WidgetId;
+use crate::ui::Ui;
+use crate::widgets::scroll_area::{SCROLLBAR_W, thumb_rect_vertical, vertical_scrollbar_rect};
 
 /// popup が現在 open している間 `UiHost` に保持される情報。
 // modal / capture_input / capture_keyboard / dismiss_on_outside_click は、 それぞれ
@@ -48,16 +55,48 @@ pub struct PopupOpenState {
     /// しか閉じない blocking modal)。`Ui::modal` が毎フレーム `ModalStyle::close_on_outside_click`
     /// から同期する (`open_popup` / `open_modal` の初期値は `true`)。
     pub dismiss_on_outside_click: bool,
+    /// popup body の縦スクロール量 (px、 `0.0` = 先頭)。 画面に入りきらない縦リスト
+    /// (menu / dropdown / context menu / cascade) を [`Ui::popup_scroll`] がここに書く。
+    ///
+    /// **popup state に持つ** のが要点: popup を閉じれば `PopupOpenState` ごと消えるので
+    /// 「開き直したら必ず先頭から」が構造的に保証される (widget_state 側に持つと popup の
+    /// 寿命とズレて、閉じたはずの popup の scroll 位置が次の open に漏れる)。
+    pub scroll_offset: f32,
+    /// scrollbar thumb を drag 中の anchor `(押下時の pointer y, 押下時の scroll_offset)`。
+    /// drag 中は item の hover / click を抑止する (thumb を掴んだまま item 上で離しても
+    /// 選択されない)。
+    pub scroll_drag: Option<(f32, f32)>,
 }
 
-/// anchor 起点の popup rect (dropdown / menu_bar 用)。
+/// [`Ui::popup_scroll`] の結果。
+///
+/// **描画と hit-test の両方に反映すること**。片方だけに適用すると「見えている項目と
+/// 押される項目がずれる」という最悪の壊れ方をする。
+#[derive(Debug, Clone, Copy)]
+pub struct PopupScroll {
+    /// item を `y - offset` に置くための縦スクロール量 (px、 `0.0` = 先頭)。
+    pub offset: f32,
+    /// item を描ける幅。 scrollbar を出している間は [`SCROLLBAR_W`] 分だけ狭い
+    /// (item が scrollbar の下に潜らない)。
+    pub content_w: f32,
+    /// scrollbar thumb を drag 中。 `true` の frame は item の hover / click を抑止する。
+    pub dragging: bool,
+}
+
+/// anchor 起点の popup rect (dropdown / menu_bar / color_picker 用)。
 ///
 /// 配置順:
 /// 1. anchor 直下 (`anchor.y + anchor.h`) に popup_h 分入るならそこに置く
 /// 2. 入らず anchor の上に空きがあるなら `anchor.y - popup_h` に flip
 /// 3. 上下どちらも入らない極端 case は空きの大きい側に置く (xy clamp、 popup_h 据え置き)
 ///
-/// scroll は scope 外。 popup_h は切り詰めない (極端 case では末尾 item が画面外で不可視)。
+/// **この関数は「置き場所」だけを決め、`popup_h` は切り詰めない** (3 の枝では popup が
+/// 画面外へはみ出しうる)。 画面内に収めるのは呼び出し側の責務で、縦リスト popup
+/// (menu / dropdown / context menu) は [`list_popup_rect_below_or_above`] を使う
+/// (= 画面高で打ち切り + y clamp + [`Ui::popup_scroll`] でスクロール)。 色ピッカーの
+/// ように中身をスクロールできない固定寸法 panel だけが本関数を直接呼ぶ (打ち切ると
+/// anchor が panel より小さくなり、 panel 上の click が outside-click 扱いになるため)。
+///
 /// `screen` の単位 (physical px) は anchor / popup_w / popup_h と統一されている前提
 /// (gui_01 全体が physical pixel ベース、 modal.rs:93-94 の前例と同じ扱い)。
 #[must_use]
@@ -85,10 +124,90 @@ pub fn popup_rect_below_or_above(
     Rect { x: clamp_x(anchor.x, popup_w, screen_w), y, w: popup_w, h: popup_h }
 }
 
+/// 縦リスト popup (menu_bar / dropdown) の rect。 anchor 直下 → 上 flip の配置に加えて、
+/// **画面内に必ず全体が収まる** ように高さと y を決める:
+///
+/// 1. 中身が画面高を超えるなら画面高で打ち切り、 scrollbar 分の幅を右に足す
+///    (打ち切られた popup は body 側で [`Ui::popup_scroll`] がスクロールさせる)
+/// 2. 上下どちらにも入らない高さは、 anchor に**重ねてでも**画面内へ寄せる
+///    (combobox が本体に被さるのと同じ。 [`popup_rect_below_or_above`] の 3 番目の枝は
+///    下に置くと画面外へはみ出すので、 ここで y を clamp する)
+///
+/// 打ち切りは「中身 > 画面高」のときだけなので、 画面に載る限りは **全項目を出す**
+/// (例: 600px の画面に 21 項目 × 24px = 504px の dropdown はスクロールなしで全部見える)。
+#[must_use]
+pub fn list_popup_rect_below_or_above(
+    anchor: Rect,
+    content_w: f32,
+    content_h: f32,
+    screen: PhysicalSize,
+) -> Rect {
+    let screen_h = screen.height as f32;
+    let (w, h) = fit_list_size(content_w, content_h, screen_h);
+    let r = popup_rect_below_or_above(anchor, w, h, screen);
+    Rect { y: r.y.clamp(0.0, (screen_h - h).max(0.0)), ..r }
+}
+
+/// 任意座標起点の縦リスト popup rect (context_menu 用)。 最大高さは画面高。
+#[must_use]
+pub fn list_popup_rect_at(
+    origin: (f32, f32),
+    content_w: f32,
+    content_h: f32,
+    screen: PhysicalSize,
+) -> Rect {
+    let (w, h) = fit_list_size(content_w, content_h, screen.height as f32);
+    popup_rect_clamped_at(origin, w, h, screen)
+}
+
+/// cascade サブ popup の rect (親 item の横に開く)。
+///
+/// - x: 既定は親 item の **右隣**。 画面右端に入らなければ item の **左** へ flip し、
+///   左にも入らなければ画面内へ clamp する (Windows / macOS のカスケードと同じ)。
+/// - y: 既定は親 item の上端揃え。 画面下端を超える分だけ上へ押し戻す。
+/// - 高さは画面高で打ち切り、 打ち切ったら scrollbar 分の幅を足す。
+#[must_use]
+pub fn list_popup_rect_beside(
+    item: Rect,
+    content_w: f32,
+    content_h: f32,
+    screen: PhysicalSize,
+) -> Rect {
+    let screen_w = screen.width as f32;
+    let screen_h = screen.height as f32;
+    let (w, h) = fit_list_size(content_w, content_h, screen_h);
+    let right = item.x + item.w;
+    let x = if right + w <= screen_w {
+        right
+    } else if item.x - w >= 0.0 {
+        item.x - w
+    } else {
+        clamp_x(right, w, screen_w)
+    };
+    let y = if item.y + h <= screen_h {
+        item.y.max(0.0)
+    } else {
+        (screen_h - h).max(0.0)
+    };
+    Rect { x, y, w, h }
+}
+
+/// 縦リスト popup の寸法を「画面に収まる高さ」で打ち切る。 打ち切ったときだけ
+/// scrollbar 分の幅を足す (項目テキストが scrollbar に食われて ellipsis になるのを防ぐ)。
+fn fit_list_size(content_w: f32, content_h: f32, max_h: f32) -> (f32, f32) {
+    if content_h <= max_h {
+        (content_w, content_h)
+    } else {
+        (content_w + SCROLLBAR_W, max_h.max(0.0))
+    }
+}
+
 /// 任意座標起点の popup rect (context_menu_for 用)。
 ///
 /// 右クリック座標 `origin` を top-left として popup を下に伸ばす。 画面下端 / 右端で
 /// clamp。 flip しない (右クリック位置と popup の関係を維持、 DAW 標準 UX)。
+/// `popup_h` は切り詰めない ([`popup_rect_below_or_above`] と同じ契約、
+/// 縦リストは [`list_popup_rect_at`] を使う)。
 #[must_use]
 pub fn popup_rect_clamped_at(
     origin: (f32, f32),
@@ -106,6 +225,82 @@ pub fn popup_rect_clamped_at(
         (screen_h - popup_h).max(0.0)
     };
     Rect { x, y, w: popup_w, h: popup_h }
+}
+
+impl<M: ?Sized + 'static> Ui<'_, M> {
+    /// popup body の縦スクロールを 1 フレーム分処理し、 scrollbar を描く。
+    ///
+    /// `viewport` は popup 自身の rect (= [`list_popup_rect_below_or_above`] 等が返した
+    /// 「画面に収まる高さ」)、 `content_h` は item を全部積んだときの高さ。
+    /// **`popup_layer` の closure の中で、 item を描く前に呼ぶこと** (scrollbar を item より
+    /// 先に積み、 item は戻り値の `content_w` 幅で描くので互いに重ならない)。
+    ///
+    /// `content_h <= viewport.h` (= 全部見えている) なら wheel も消費せず scrollbar も描かず
+    /// `offset = 0.0` / `content_w = viewport.w` を返す。 つまり **収まっている popup の
+    /// 見た目と入力は 1px も変わらない**。
+    ///
+    /// scroll 量は描画中の popup の [`PopupOpenState::scroll_offset`] に持つので、 popup を
+    /// 閉じれば捨てられる。 `popup_layer` の外で呼んだ場合は何もしない。
+    pub fn popup_scroll(&mut self, viewport: Rect, content_h: f32) -> PopupScroll {
+        let idle = PopupScroll { offset: 0.0, content_w: viewport.w, dragging: false };
+        let max_offset = (content_h - viewport.h).max(0.0);
+        let Some((prev_offset, prev_drag)) = self.current_popup_scroll() else {
+            return idle;
+        };
+        if max_offset <= 0.0 {
+            // 収まっているので scroll state を持たない (項目が減って収まりきった直後に
+            // 古い offset が残らないよう明示リセットする)。
+            self.set_current_popup_scroll(0.0, None);
+            return idle;
+        }
+
+        // ---- 1. wheel (popup body なので `pointer_blocked_by_modal_popup` は false) ----
+        let track = vertical_scrollbar_rect(viewport, false);
+        let wheel = self.take_scroll_in_rect(viewport).1;
+        let pointer = self.pointer();
+        let mut offset = (prev_offset - wheel).clamp(0.0, max_offset);
+        let mut thumb = thumb_rect_vertical(track, content_h, viewport.h, offset, max_offset);
+
+        // ---- 2. thumb drag (scroll_area と同じ「現在 offset の thumb で hit-test」) ----
+        let mut drag = prev_drag;
+        if drag.is_none()
+            && pointer.primary_just_pressed
+            && let Some((px, py)) = pointer.pos
+            && thumb.contains(px, py)
+        {
+            drag = Some((py, offset));
+        }
+        if let Some((anchor_py, anchor_offset)) = drag
+            && let Some((_, py)) = pointer.pos
+        {
+            let drag_range = (track.h - thumb.h).max(1.0);
+            offset = (anchor_offset + (py - anchor_py) / drag_range * max_offset)
+                .clamp(0.0, max_offset);
+            thumb = thumb_rect_vertical(track, content_h, viewport.h, offset, max_offset);
+        }
+        // release frame も「この frame の pointer は scrollbar のもの」と扱う
+        // (thumb を掴んだまま item の上へ動かして離しても、 その item を選ばない)。
+        let dragging = drag.is_some();
+        if pointer.primary_just_released {
+            drag = None;
+        }
+        self.set_current_popup_scroll(offset, drag);
+        if (offset - prev_offset).abs() > 1e-4 {
+            self.request_redraw();
+        }
+
+        // ---- 3. scrollbar 描画 (色 / 寸法は scroll_area と共通) ----
+        let p = self.palette();
+        self.push_rect(RectCommand::uniform_radius(track, p.scrollbar_track, 2.0));
+        let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
+        self.push_rect(RectCommand::uniform_radius(
+            thumb,
+            if hovered || dragging { p.scrollbar_thumb_hover } else { p.scrollbar_thumb },
+            3.0,
+        ));
+
+        PopupScroll { offset, content_w: (viewport.w - SCROLLBAR_W).max(0.0), dragging }
+    }
 }
 
 /// X 軸 clamp (popup が画面右端を超えれば押し戻す、 popup_w > screen_w なら 0)。
@@ -142,7 +337,9 @@ mod tests {
         let anchor = Rect { x: 100.0, y: 300.0, w: 120.0, h: 26.0 };
         let r = popup_rect_below_or_above(anchor, 120.0, 504.0, SCREEN);
         assert!(r.y < anchor.y, "flip して anchor の上に出る");
-        assert_eq!(r.h, 504.0, "popup_h は据え置き (scroll は別 PR)");
+        // 本関数は「置き場所」だけを決める契約なので popup_h は据え置き
+        // (打ち切りが要る縦リストは `list_popup_rect_below_or_above` を使う)。
+        assert_eq!(r.h, 504.0, "popup_h は切り詰めない");
     }
 
     #[test]
@@ -194,5 +391,120 @@ mod tests {
         // popup_h > screen_h (極端、 items 多すぎ) → 上端 0 で clamp
         let r = popup_rect_clamped_at((100.0, 100.0), 180.0, 800.0, SCREEN);
         assert_eq!(r.y, 0.0);
+    }
+
+    // ===== 縦リスト popup (最大高さ打ち切り + scroll) =====
+
+    /// 収まる項目数では **従来と 1px も変わらない** (打ち切りなし / scrollbar 幅の加算なし)。
+    #[test]
+    fn list_popup_identical_to_plain_placement_when_it_fits() {
+        let anchor = Rect { x: 100.0, y: 50.0, w: 120.0, h: 26.0 };
+        let plain = popup_rect_below_or_above(anchor, 120.0, 96.0, SCREEN);
+        let list = list_popup_rect_below_or_above(anchor, 120.0, 96.0, SCREEN);
+        assert_eq!((list.x, list.y, list.w, list.h), (plain.x, plain.y, plain.w, plain.h));
+    }
+
+    /// 上下どちらにも入らないが **画面には載る** 高さは、 打ち切らず anchor に重ねて
+    /// 全項目を出す (bug #013 の piano_roll snap dropdown = 21 items × 24px = 504px)。
+    /// 従来の「空きの広い側 + 上端 clamp」 と同じ結果 = この case は回帰ゼロ。
+    #[test]
+    fn list_popup_keeps_all_items_when_they_fit_on_screen() {
+        let anchor = Rect { x: 100.0, y: 300.0, w: 120.0, h: 26.0 };
+        let r = list_popup_rect_below_or_above(anchor, 120.0, 504.0, SCREEN);
+        assert_eq!(r.h, 504.0, "画面に載る高さは打ち切らない");
+        assert_eq!(r.y, 0.0, "上端 clamp (従来と同じ)");
+        assert_eq!(r.w, 120.0, "scrollbar 分は足さない (スクロール不要)");
+    }
+
+    /// 中身が **画面高を超える** ときだけ打ち切り + scrollbar 分の幅を足す。
+    #[test]
+    fn list_popup_caps_height_and_reserves_scrollbar() {
+        // 50 items × 24px = 1200px > 画面高 600px。
+        let anchor = Rect { x: 100.0, y: 300.0, w: 120.0, h: 26.0 };
+        let r = list_popup_rect_below_or_above(anchor, 120.0, 1200.0, SCREEN);
+        assert_eq!(r.h, SCREEN.height as f32, "画面高で打ち切る");
+        assert_eq!(r.y, 0.0, "打ち切った popup は上端から");
+        assert_eq!(r.w, 120.0 + SCROLLBAR_W, "scrollbar 分の幅を足す");
+        assert!(
+            r.y + r.h <= SCREEN.height as f32,
+            "popup 全体が画面内 (末尾 item が画面外に描かれない)"
+        );
+    }
+
+    /// 下にも上にも入らない高さは、 下側に置いて画面外へはみ出すのではなく
+    /// **画面内へ y を押し戻す** (旧 `popup_rect_below_or_above` の 3 番目の枝の穴)。
+    #[test]
+    fn list_popup_clamps_y_instead_of_overflowing_below() {
+        // anchor 上端寄り (上空き 50 / 下空き 524) に 560px の中身 → 下が広いので下に
+        // 置きたいが、 76 + 560 = 636 > 600 なのではみ出す → y を 40 まで押し戻す。
+        let anchor = Rect { x: 100.0, y: 50.0, w: 120.0, h: 26.0 };
+        let r = list_popup_rect_below_or_above(anchor, 120.0, 560.0, SCREEN);
+        assert_eq!(r.h, 560.0, "画面に載るので打ち切らない");
+        assert_eq!(r.y, 600.0 - 560.0, "画面内へ押し戻す");
+        assert!(r.y + r.h <= SCREEN.height as f32);
+    }
+
+    /// 画面高より高い項目数でも popup の高さは画面高を超えない (どの anchor 位置でも)。
+    #[test]
+    fn list_popup_never_exceeds_screen_height() {
+        for anchor_y in [0.0_f32, 100.0, 300.0, 560.0] {
+            let anchor = Rect { x: 10.0, y: anchor_y, w: 120.0, h: 26.0 };
+            // 1000 items × 24px
+            let r = list_popup_rect_below_or_above(anchor, 120.0, 24_000.0, SCREEN);
+            assert!(
+                r.h <= SCREEN.height as f32 && r.y >= 0.0 && r.y + r.h <= SCREEN.height as f32,
+                "anchor_y={anchor_y}: popup が画面内 (rect={r:?})"
+            );
+        }
+    }
+
+    /// context menu も画面高で打ち切る (右クリック位置は維持したまま)。
+    #[test]
+    fn list_popup_at_caps_to_screen_height() {
+        let r = list_popup_rect_at((100.0, 100.0), 180.0, 2400.0, SCREEN);
+        assert_eq!(r.y, 0.0);
+        assert_eq!(r.h, SCREEN.height as f32);
+        assert_eq!(r.w, 180.0 + SCROLLBAR_W);
+    }
+
+    /// cascade: 収まるなら従来どおり **親 item の右隣・上端揃え・原寸** (回帰ゼロ)。
+    #[test]
+    fn cascade_keeps_right_and_top_when_it_fits() {
+        let item = Rect { x: 100.0, y: 200.0, w: 180.0, h: 24.0 };
+        let r = list_popup_rect_beside(item, 180.0, 96.0, SCREEN);
+        assert_eq!((r.x, r.y, r.w, r.h), (280.0, 200.0, 180.0, 96.0));
+    }
+
+    /// cascade: 画面右端で右隣に入らなければ **親 item の左** へ flip する。
+    #[test]
+    fn cascade_flips_left_at_right_edge() {
+        // item 右端 = 780、 右隣に 180px は入らない (780 + 180 > 800) → 左へ flip。
+        let item = Rect { x: 600.0, y: 200.0, w: 180.0, h: 24.0 };
+        let r = list_popup_rect_beside(item, 180.0, 96.0, SCREEN);
+        assert_eq!(r.x, 600.0 - 180.0, "親 item の左に出る");
+        assert!(r.x >= 0.0 && r.x + r.w <= SCREEN.width as f32, "画面内");
+    }
+
+    /// cascade: 左右どちらにも入らない極端な幅は画面内へ clamp する。
+    #[test]
+    fn cascade_clamps_when_neither_side_fits() {
+        let item = Rect { x: 300.0, y: 10.0, w: 100.0, h: 24.0 };
+        let r = list_popup_rect_beside(item, 700.0, 96.0, SCREEN);
+        assert!(r.x >= 0.0 && r.x + r.w <= SCREEN.width as f32, "画面内へ clamp (rect={r:?})");
+    }
+
+    /// cascade: 画面下端では上へ押し戻し、 画面高を超える中身は打ち切る。
+    #[test]
+    fn cascade_clamps_at_screen_bottom() {
+        let item = Rect { x: 100.0, y: 560.0, w: 180.0, h: 24.0 };
+        let r = list_popup_rect_beside(item, 180.0, 240.0, SCREEN);
+        assert_eq!(r.y, 600.0 - 240.0, "下端に収まるまで上へ押し戻す");
+        assert!(r.y + r.h <= SCREEN.height as f32);
+
+        // 画面高より高い cascade は打ち切り + scrollbar 幅。
+        let tall = list_popup_rect_beside(item, 180.0, 2400.0, SCREEN);
+        assert_eq!(tall.y, 0.0);
+        assert_eq!(tall.h, SCREEN.height as f32);
+        assert_eq!(tall.w, 180.0 + SCROLLBAR_W);
     }
 }

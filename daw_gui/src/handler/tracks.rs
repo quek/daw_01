@@ -608,6 +608,23 @@ impl AppData {
         // 通さない = タグを触らない) ため、 **次の Delete が画面外の最下段トラックを
         // 消す**。 Ableton / REAPER と同じく削除位置の直後 (無ければ直前) へ倒す。
         let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
+        // r.md #78: 消えたトラックが所有していた変調ソースも道連れにする。
+        // ソースはラックで **所有トラックの下にしか列挙されない** ので、 残すと
+        // どの画面にも出ず削除できないまま、 生き残ったトラックの param を変調し
+        // 続ける (LFO / Random / MSEG / Steps は song 位置の純関数なので、 所有
+        // トラックが消えても値を出し続ける)。 接続行をソース側へ寄せて孤児を
+        // 潰したのと同じ穴。 `remove_mod_source` が参照 routing の掃除まで担う。
+        let orphan_source_ids: Vec<u32> = self
+            .song_doc
+            .song()
+            .mod_sources
+            .iter()
+            .filter(|m| subtree_ids_set.contains(&m.owner_track_id))
+            .map(|m| m.id)
+            .collect();
+        for id in orphan_source_ids {
+            self.remove_mod_source(id);
+        }
         self.selection.selected_track_ids
             .retain(|id| !subtree_ids_set.contains(id));
         if self.selection.selected_track_ids.is_empty()

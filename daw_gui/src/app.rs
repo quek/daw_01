@@ -1474,7 +1474,11 @@ impl AppData {
                 track_id,
                 target,
                 source_id,
-            } => self.add_mod_routing(track_id, target, source_id),
+            } => {
+                // 戻り値 (実際に足したか) は per-control ドラッグ経路では不要
+                // (毎フレーム呼ばれ、 2 回目以降は no-op)。
+                let _ = self.add_mod_routing(track_id, target, source_id);
+            }
             AppEvent::RemoveModRouting {
                 track_id,
                 target,

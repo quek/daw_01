@@ -307,7 +307,6 @@ pub(super) fn draw_modulation_rack(
     let lx = area.x + pad;
     let row_w = area.w - pad * 2.0;
     let mod_sources = app.mod_source_display();
-    let mod_routings = app.cursor_mod_routings();
     let unit_style = ScrubableNumberStyle {
         range: Some((0.0, 1.0)),
         sensitivity: 0.006,
@@ -345,13 +344,8 @@ pub(super) fn draw_modulation_rack(
     let mod_track_choices = app.mod_source_track_choices();
     let mod_track_labels: Vec<&str> = mod_track_choices.iter().map(|(_, l)| l.as_str()).collect();
     let mut any_mod_drag = false;
-    // routing は各ソースの直下に出す。 widget id 用のグローバル連番と、 追加先トラック。
+    // routing は各ソースの直下に出す。 widget id 用のグローバル連番。
     let mut route_i = 0usize;
-    let route_track_id = if app.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-        common::model::MASTER_TRACK_ID
-    } else {
-        app.cursor_track_id().unwrap_or(0)
-    };
 
     for (i, src) in mod_sources.iter().enumerate() {
         let sid = src.id;
@@ -762,129 +756,88 @@ pub(super) fn draw_modulation_rack(
         } // end `if expanded`
 
         // --- このソースが駆動している routing をソース直下に表示 (畳んでも見える) ---
-        for (tid, target, label, routings) in &mod_routings {
-            for (rsid, depth, bipolar) in routings {
-                if *rsid != sid {
-                    continue;
-                }
-                let row_y = y;
-                // B6 (r.md #8): cursor_mod_routings が解決済みの track-aware label
-                // (実 plugin param 名) を再利用する (再 derive しない)。
-                let tlabel = label;
-                ui.label_at(
-                    ("inspector_mod_rt_lbl", route_i),
-                    &format!("\u{2192} {tlabel}"),
-                    lx + 18.0,
-                    row_y + 4.0,
-                    11.0,
-                    p.text,
-                );
-                let rm_x = area.x + area.w - pad - 20.0;
-                let pol_x = rm_x - 4.0 - 22.0;
-                let depth_x = pol_x - 4.0 - 46.0;
-                let (t, s) = (*tid, sid);
-                let tgt = target.clone();
-                ui.scrubable_number_at(
-                    ("inspector_mod_rt_depth", route_i),
-                    Rect { x: depth_x, y: row_y, w: 46.0, h: 20.0 },
-                    f64::from(*depth),
-                    1.0,
-                    ScrubableNumberFormat::Decimal(2),
-                    &scrub_style(&app.theme),
-                    move |v| {
-                        let tgt = tgt.clone();
-                        Edit::mutate(move |app: &mut AppData| {
-                            app.handle_event(AppEvent::SetModRoutingDepth {
-                                track_id: t,
-                                target: tgt,
-                                source_id: s,
-                                depth: v as f32,
-                            });
-                        })
-                    },
-                    None,
-                    None,
-                );
-                let bip = *bipolar;
-                let tgt_pol = target.clone();
-                ui.button_at(
-                    ("inspector_mod_rt_pol", route_i),
-                    if bip { "\u{00b1}" } else { "+" },
-                    Rect { x: pol_x, y: row_y, w: 22.0, h: 20.0 },
-                    move || {
-                        let tgt_pol = tgt_pol.clone();
-                        Edit::mutate(move |app: &mut AppData| {
-                            app.handle_event(AppEvent::SetModRoutingPolarity {
-                                track_id: t,
-                                target: tgt_pol,
-                                source_id: s,
-                                bipolar: !bip,
-                            });
-                        })
-                    },
-                );
-                let tgt_rm = target.clone();
-                ui.button_at(
-                    ("inspector_mod_rt_rm", route_i),
-                    "\u{00d7}",
-                    Rect { x: rm_x, y: row_y, w: 20.0, h: 20.0 },
-                    move || {
-                        let tgt_rm = tgt_rm.clone();
-                        Edit::mutate(move |app: &mut AppData| {
-                            app.handle_event(AppEvent::RemoveModRouting {
-                                track_id: t,
-                                target: tgt_rm,
-                                source_id: s,
-                            });
-                        })
-                    },
-                );
-                y += 22.0;
-                route_i += 1;
-            }
-        }
-
-        // --- 展開時のみ: このソースから新規 route を足す dropdown ---
-        if expanded {
-            let mut add_labels: Vec<String> = vec!["+ route from this\u{2026}".into()];
-            let mut add_payload: Vec<common::model::AutomationTarget> =
-                vec![common::model::AutomationTarget::SongTempo];
-            for target in app.cursor_modulatable_targets() {
-                let already = mod_routings
-                    .iter()
-                    .find(|(_, t, _, _)| *t == target)
-                    .is_some_and(|(_, _, _, rs)| rs.iter().any(|(s, _, _)| *s == sid));
-                if already {
-                    continue;
-                }
-                // B6 (r.md #8): add-route dropdown も実 plugin param 名で表示。
-                add_labels.push(format!(
-                    "\u{2192} {}",
-                    app.automation_target_label(
-                        app.cursor_track_id().unwrap_or(common::model::MASTER_TRACK_ID),
-                        &target,
-                    )
-                ));
-                add_payload.push(target);
-            }
-            if add_labels.len() > 1 {
-                let label_refs: Vec<&str> = add_labels.iter().map(String::as_str).collect();
-                let dd_rect = Rect { x: lx + 18.0, y, w: row_w - 18.0, h: 22.0 };
-                if let Some(picked) =
-                    ui.dropdown(("inspector_mod_add_route", sid), dd_rect, &label_refs, 0)
-                    && picked > 0
-                    && let Some(tgt) = add_payload.get(picked).cloned()
-                {
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::AddModRouting {
-                            track_id: route_track_id,
+        //
+        // r.md #78: 対象が**どのトラックにあっても**ここに並ぶ (`mod_source_routings`)。
+        // ◉ は他トラックのツマミにも効くので、 ソース所有トラック以外の routing が
+        // 実際に作れる。 旧実装はカーソルトラックの routing しか描かなかったため、
+        // それらはどこにも出ず削除できない孤児になっていた。
+        for row in app.mod_source_routings(sid) {
+            let row_y = y;
+            ui.label_at_clipped(
+                ("inspector_mod_rt_lbl", route_i),
+                &format!("\u{2192} {}", row.label),
+                Rect {
+                    x: lx + 18.0,
+                    y: row_y + 4.0,
+                    // 右側の depth / 極性 / × と重ねない (幅は下の x 計算と対)。
+                    w: (row_w - 18.0 - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
+                    h: 11.0 * 1.2,
+                },
+                11.0,
+                p.text,
+            );
+            let rm_x = area.x + area.w - pad - 20.0;
+            let pol_x = rm_x - 4.0 - 22.0;
+            let depth_x = pol_x - 4.0 - 46.0;
+            let (t, s) = (row.track_id, sid);
+            let tgt = row.target.clone();
+            ui.scrubable_number_at(
+                ("inspector_mod_rt_depth", route_i),
+                Rect { x: depth_x, y: row_y, w: 46.0, h: 20.0 },
+                f64::from(row.depth),
+                1.0,
+                ScrubableNumberFormat::Decimal(2),
+                &scrub_style(&app.theme),
+                move |v| {
+                    let tgt = tgt.clone();
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetModRoutingDepth {
+                            track_id: t,
                             target: tgt,
-                            source_id: sid,
+                            source_id: s,
+                            depth: v as f32,
                         });
-                    }));
-                }
-                y += 24.0;
-            }
+                    })
+                },
+                None,
+                None,
+            );
+            let bip = row.bipolar;
+            let tgt_pol = row.target.clone();
+            ui.button_at(
+                ("inspector_mod_rt_pol", route_i),
+                if bip { "\u{00b1}" } else { "+" },
+                Rect { x: pol_x, y: row_y, w: 22.0, h: 20.0 },
+                move || {
+                    let tgt_pol = tgt_pol.clone();
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetModRoutingPolarity {
+                            track_id: t,
+                            target: tgt_pol,
+                            source_id: s,
+                            bipolar: !bip,
+                        });
+                    })
+                },
+            );
+            let tgt_rm = row.target.clone();
+            ui.button_at(
+                ("inspector_mod_rt_rm", route_i),
+                "\u{00d7}",
+                Rect { x: rm_x, y: row_y, w: 20.0, h: 20.0 },
+                move || {
+                    let tgt_rm = tgt_rm.clone();
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::RemoveModRouting {
+                            track_id: t,
+                            target: tgt_rm,
+                            source_id: s,
+                        });
+                    })
+                },
+            );
+            y += 22.0;
+            route_i += 1;
         }
         y += 4.0;
     }

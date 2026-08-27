@@ -93,6 +93,13 @@ pub(crate) fn entries_height<M: ?Sized + 'static>(entries: &[MenuEntry<'_, M>]) 
     entries.iter().map(MenuEntry::height).sum()
 }
 
+/// `&[&str]` 版 (dropdown / context_menu) の popup content 高さ。
+/// [`draw_items_popup`] の item レイアウトと同じ SSoT (呼び出し側が独自の item 高さ定数を
+/// 持つと、popup 枠と中身がずれる)。
+pub(crate) fn items_popup_height(item_count: usize) -> f32 {
+    item_count as f32 * MENU_ITEM_H
+}
+
 const MENU_ITEM_H: f32 = 24.0;
 /// 区切り線 1 本ぶんの高さ (線 1px + 上下の余白)。
 const MENU_SEPARATOR_H: f32 = 9.0;
@@ -148,12 +155,16 @@ pub(crate) fn entries_popup_width<'a, M: ?Sized + 'static>(
 /// `popup_id` は呼び出し側が責任を持って一意にする (例: `(b"menu_file", ...)`)。
 /// `anchor` は popup を開く起点。`items_rect` は popup 自身の描画領域。
 /// 戻り値: 選択された item の index (Some なら popup を close)。
+///
+/// `popup_rect` は画面に収まる高さに打ち切られている (`list_popup_rect_*`) 前提で、
+/// 入りきらない分は [`Ui::popup_scroll`] のホイール / scrollbar でスクロールする。
+/// **描画と hit-test の両方に同じ offset を適用**し、viewport の外に出た item は
+/// hover も click も受けない (見えている項目と押される項目を一致させる)。
 pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
     ui: &mut Ui<'a, M>,
     items: &[&str],
     popup_rect: Rect,
 ) -> Option<usize> {
-    let pointer = ui.pointer();
     let p = ui.palette();
 
     // 背景パネル
@@ -166,52 +177,79 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
         clip_rect: None,
     });
 
+    // scroll (収まっていれば offset 0 / scrollbar なしで従来と完全同一)。
+    let scroll = ui.popup_scroll(popup_rect, items_popup_height(items.len()));
+    let pointer = ui.pointer();
+    let hover_pos = hover_pos_in_popup(pointer.pos, popup_rect, scroll.dragging);
+
     let mut clicked: Option<usize> = None;
-    for (i, item) in items.iter().enumerate() {
-        let item_rect = Rect {
-            x: popup_rect.x,
-            y: popup_rect.y + i as f32 * MENU_ITEM_H,
-            w: popup_rect.w,
-            h: MENU_ITEM_H,
-        };
-        let hovered = pointer
-            .pos
-            .is_some_and(|(px, py)| item_rect.contains(px, py));
-        if hovered {
-            ui.push_rect(RectCommand {
-                rect: item_rect,
-                fill: p.accent,
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [2.0; 4],
-                clip_rect: None,
+    ui.with_clip_rect(popup_rect, |ui| {
+        for (i, item) in items.iter().enumerate() {
+            let item_rect = Rect {
+                x: popup_rect.x,
+                y: popup_rect.y - scroll.offset + i as f32 * MENU_ITEM_H,
+                w: scroll.content_w,
+                h: MENU_ITEM_H,
+            };
+            if !intersects_v(item_rect, popup_rect) {
+                continue; // viewport 外 (スクロールで隠れている) → 描画も hit-test もしない
+            }
+            let hovered = hover_pos.is_some_and(|(px, py)| item_rect.contains(px, py));
+            if hovered {
+                ui.push_rect(RectCommand {
+                    rect: item_rect,
+                    fill: p.accent,
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [2.0; 4],
+                    clip_rect: None,
+                });
+            }
+            // 項目が popup 幅に収まらないときは末尾 ellipsis + clip (daw_01 #079 の
+            // 「widget は自分の rect 境界に責任を持つ」)。 dropdown の popup 幅は
+            // 呼び出し側 dropdown の rect.w なので、 狭い dropdown ほど溢れやすい。
+            let item_max_w = (item_rect.w - MENU_PAD_X * 2.0).max(1.0);
+            let (display, _) = ui.fit_text_ellipsized(item, MENU_FONT, item_max_w);
+            ui.push_text(GlyphArea {
+                text: display.as_ref().into(),
+                left: item_rect.x + MENU_PAD_X,
+                top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
+                font_size: MENU_FONT,
+                line_height: MENU_FONT * 1.2,
+                color: p.text,
+                clip_rect: Some(Rect {
+                    x: item_rect.x + MENU_PAD_X,
+                    y: item_rect.y,
+                    w: item_max_w,
+                    h: item_rect.h,
+                }),
+                ..GlyphArea::default()
             });
+            if hovered && pointer.primary_just_released {
+                clicked = Some(i);
+            }
         }
-        // 項目が popup 幅に収まらないときは末尾 ellipsis + clip (daw_01 #079 の
-        // 「widget は自分の rect 境界に責任を持つ」)。 dropdown の popup 幅は
-        // 呼び出し側 dropdown の rect.w なので、 狭い dropdown ほど溢れやすい。
-        let item_max_w = (item_rect.w - MENU_PAD_X * 2.0).max(1.0);
-        let (display, _) = ui.fit_text_ellipsized(item, MENU_FONT, item_max_w);
-        ui.push_text(GlyphArea {
-            text: display.as_ref().into(),
-            left: item_rect.x + MENU_PAD_X,
-            top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
-            font_size: MENU_FONT,
-            line_height: MENU_FONT * 1.2,
-            color: p.text,
-            clip_rect: Some(Rect {
-                x: item_rect.x + MENU_PAD_X,
-                y: item_rect.y,
-                w: item_max_w,
-                h: item_rect.h,
-            }),
-            ..GlyphArea::default()
-        });
-        if hovered && pointer.primary_just_released {
-            clicked = Some(i);
-        }
-    }
+    });
     clicked
+}
+
+/// popup body の hover 判定に使う pointer 位置。
+/// - viewport (popup rect) の外なら `None` (スクロールで枠外へ出た item を掴ませない)
+/// - scrollbar thumb を drag 中も `None` (thumb を掴んだまま item 上で離しても選ばれない)
+fn hover_pos_in_popup(
+    pos: Option<(f32, f32)>,
+    popup_rect: Rect,
+    dragging: bool,
+) -> Option<(f32, f32)> {
+    if dragging {
+        return None;
+    }
+    pos.filter(|&(px, py)| popup_rect.contains(px, py))
+}
+
+/// `item` が `viewport` と縦方向に少しでも重なるか (スクロール culling 用)。
+fn intersects_v(item: Rect, viewport: Rect) -> bool {
+    item.y + item.h > viewport.y && item.y < viewport.y + viewport.h
 }
 
 /// menu_bar の 1 つの top-level menu を構築するためのビルダー。`item` / `sub_menu` を順に並べる。
@@ -343,7 +381,6 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     popup_rect: Rect,
     id_path: &str,
 ) -> Option<MenuItemAction<'a, M>> {
-    let pointer = ui.pointer();
     let p = ui.palette();
 
     // 背景パネル
@@ -356,6 +393,12 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         clip_rect: None,
     });
 
+    // scroll (popup_rect は画面内に収まる高さへ打ち切られている前提。 収まっていれば
+    // offset 0 / scrollbar なしで従来と完全同一)。
+    let scroll = ui.popup_scroll(popup_rect, entries_height(entries));
+    let pointer = ui.pointer();
+    let hover_pos = hover_pos_in_popup(pointer.pos, popup_rect, scroll.dragging);
+
     let mut return_action: Option<MenuItemAction<'a, M>> = None;
     let arrow_color = p.text_dim;
     let entries_len = entries.len();
@@ -363,12 +406,14 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     // entry ごとに高さが違う (Separator) ので、`i * MENU_ITEM_H` ではなく
     // **累積オフセット** で矩形を確定する。hover 判定・描画・sub-popup の
     // アンカーが同じ矩形を見るよう、先に 1 度だけ作る。
+    // scroll offset は **ここ 1 箇所** で足す (描画 / hit-test / cascade anchor が
+    // 同じ矩形を見る = ずれようがない)。
     let item_rects: Vec<Rect> = {
         let mut rects = Vec::with_capacity(entries_len);
-        let mut y = popup_rect.y;
+        let mut y = popup_rect.y - scroll.offset;
         for entry in entries.iter() {
             let h = entry.height();
-            rects.push(Rect { x: popup_rect.x, y, w: popup_rect.w, h });
+            rects.push(Rect { x: popup_rect.x, y, w: scroll.content_w, h });
             y += h;
         }
         rects
@@ -380,9 +425,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     // 一括処理する。
     let hovered_index: Option<usize> = (0..entries_len).find(|&i| {
         entries[i].is_interactive()
-            && pointer
-                .pos
-                .is_some_and(|(px, py)| item_rects[i].contains(px, py))
+            && hover_pos.is_some_and(|(px, py)| item_rects[i].contains(px, py))
     });
     if let Some(idx) = hovered_index {
         for j in 0..entries_len {
@@ -392,8 +435,28 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         }
     }
 
+    // popup 枠で clip する (スクロール時に上下端で半分だけ見える entry を枠内で切る)。
+    // entries を `iter_mut` しながら回すので closure 形の `with_clip_rect` ではなく
+    // 開いた形 (`current_clip_rect` / `set_current_clip_rect` のペア) を使う。 loop 内に
+    // 早期 return は無いので、 末尾の復元は必ず走る。
+    let prev_clip = ui.current_clip_rect();
+    ui.set_current_clip_rect(Some(
+        crate::ui::merge_clip(prev_clip, Some(popup_rect)).unwrap_or(popup_rect),
+    ));
+
     for (i, entry) in entries.iter_mut().enumerate() {
         let item_rect = item_rects[i];
+        // スクロールで viewport の外へ出た entry は描画も hit-test もしない。
+        // SubMenu なら開いていた cascade を道連れに閉じる (親 item が見えないのに
+        // cascade だけ残ると、 見えない modal popup として入力を遮断し続ける #095)。
+        if !intersects_v(item_rect, popup_rect) {
+            if let MenuEntry::SubMenu { entries: sub_entries, .. } = entry {
+                let sub_id = format!("{id_path}/{i}");
+                close_orphaned_cascades(ui, sub_entries, &sub_id);
+                ui.close_popup(&sub_id);
+            }
+            continue;
+        }
         if matches!(entry, MenuEntry::Separator) {
             // 左右に padding を空けた 1px の水平線。hover もクリックも受けない。
             ui.push_rect(RectCommand {
@@ -411,9 +474,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             });
             continue;
         }
-        let hovered = pointer
-            .pos
-            .is_some_and(|(px, py)| item_rect.contains(px, py));
+        let hovered = hover_pos.is_some_and(|(px, py)| item_rect.contains(px, py));
         let label = entry.label();
         let is_sub = matches!(entry, MenuEntry::SubMenu { .. });
         // M9 P1-5: enabled / shortcut_hint を取り出す (SubMenu は常に enabled、hint なし)。
@@ -508,36 +569,35 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             MenuEntry::Separator => unreachable!("Separator は描画直後に continue する"),
             MenuEntry::SubMenu { entries: sub_entries, .. } => {
                 let sub_id = format!("{id_path}/{i}");
-                let sub_popup_rect = Rect {
-                    x: item_rect.x + item_rect.w,
-                    y: item_rect.y,
-                    // 中身に合わせて伸ばす (Open Recent の長いファイル名が枠外に
-                    // 出ていた)。 上限を超えたら item 側の ellipsis が効く。
-                    w: entries_popup_width(ui, sub_entries),
-                    h: entries_height(sub_entries),
-                };
+                // 中身に合わせて伸ばす (Open Recent の長いファイル名が枠外に
+                // 出ていた)。 上限を超えたら item 側の ellipsis が効く。
+                let sub_content_w = entries_popup_width(ui, sub_entries);
+                let sub_content_h = entries_height(sub_entries);
+                // 親 item の右隣が既定。 画面右端なら左へ flip、 下端なら上へ押し戻し、
+                // 画面高を超える中身は打ち切って scroll する (`list_popup_rect_beside`)。
+                let sub_popup_rect = crate::popup::list_popup_rect_beside(
+                    item_rect,
+                    sub_content_w,
+                    sub_content_h,
+                    ui.screen(),
+                );
                 let sub_anchor = union_rect(item_rect, sub_popup_rect);
 
-                // hover で sub-popup を open (DAW 標準挙動)
+                // hover で sub-popup を open (DAW 標準挙動)。 open 済みなら anchor を
+                // 毎フレーム同期する (親をスクロールすると item_rect が動くので、
+                // stale な anchor のままだと outside-click 判定がずれる)。
                 if hovered && !ui.is_popup_open(&sub_id) {
                     ui.open_popup(&sub_id, sub_anchor, true);
+                } else {
+                    ui.update_popup_anchor(&sub_id, sub_anchor);
                 }
 
-                // sub-popup 描画 (popup_layer の中で再帰呼び出し、click を受け取る)
+                // sub-popup 描画 (popup_layer の中で再帰呼び出し、click を受け取る)。
+                // popup_layer は closed id では closure を呼ばない。
                 let mut sub_action: Option<MenuItemAction<'a, M>> = None;
-                let sub_id_for_anchor = sub_id.clone();
                 ui.popup_layer(&sub_id, |ui_inner| {
-                    if let Some(rect) = ui_inner.popup_anchor(&sub_id_for_anchor) {
-                        // anchor は item_rect + sub_popup_rect の union。sub_popup_rect は
-                        // anchor の右半分なので、anchor.x + item_rect.w 以降が sub_popup の領域。
-                        let sub_rect = Rect {
-                            x: rect.x + item_rect.w,
-                            y: rect.y,
-                            w: rect.w - item_rect.w,
-                            h: rect.h,
-                        };
-                        sub_action = draw_menu_entries(ui_inner, sub_entries, sub_rect, &sub_id);
-                    }
+                    sub_action =
+                        draw_menu_entries(ui_inner, sub_entries, sub_popup_rect, &sub_id);
                 });
                 if sub_action.is_some() {
                     return_action = sub_action;
@@ -545,6 +605,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             }
         }
     }
+    ui.set_current_clip_rect(prev_clip);
 
     return_action
 }
@@ -694,16 +755,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut anchors: Vec<Rect> = Vec::with_capacity(menus.len());
         for (i, (_label, entries)) in menus.iter().enumerate() {
             let label_rect = label_rects[i];
-            let popup_h = entries_height(entries);
-            let popup_w = if open_idx == Some(i) || hovered_idx == Some(i) {
+            let content_h = entries_height(entries);
+            let content_w = if open_idx == Some(i) || hovered_idx == Some(i) {
                 entries_popup_width(self, entries)
             } else {
                 MENU_W_DEFAULT
             };
-            let popup_rect = crate::popup::popup_rect_below_or_above(
+            // 画面に入りきらない項目数なら高さを打ち切る (末尾 item が画面外に描かれ、
+            // スクリーン座標の hit-test では原理的に押せなくなるのを防ぐ)。 打ち切った
+            // 分は popup body 側の `popup_scroll` でスクロールする。
+            let popup_rect = crate::popup::list_popup_rect_below_or_above(
                 label_rect,
-                popup_w,
-                popup_h,
+                content_w,
+                content_h,
                 self.screen(),
             );
             anchors.push(union_rect(label_rect, popup_rect));
@@ -842,14 +906,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let menu_id = ("context_menu_at", &id);
         let n = items.len();
         if let Some((px, py)) = open_at {
-            let popup_h = (n as f32) * MENU_ITEM_H;
+            let content_h = items_popup_height(n);
             // 幅は項目に合わせて伸ばす (日本語の項目名が 180px 固定枠から
             // はみ出して背後の画面に直描きされていた)。
-            let popup_w = items_popup_width(self, items, MENU_W_DEFAULT);
-            let anchor = crate::popup::popup_rect_clamped_at(
+            let content_w = items_popup_width(self, items, MENU_W_DEFAULT);
+            // 画面高を超える項目数なら打ち切り + scroll (`draw_items_popup` が担当)。
+            let anchor = crate::popup::list_popup_rect_at(
                 (px, py),
-                popup_w,
-                popup_h,
+                content_w,
+                content_h,
                 self.screen(),
             );
             self.open_popup(menu_id, anchor, true);
@@ -1741,5 +1806,288 @@ mod tests {
         // 区切りのぶん下へずれた Quit が当たる (旧計算だと y=56 を指していた)。
         frame(&mut host, &mut model, (20.0, 77.0), true);
         assert_eq!(model.fired, vec!["Quit"], "区切りの下の item が正しい位置で当たる");
+    }
+
+    // ===== popup の最大高さ + scroll + cascade の画面端 flip / clamp =====
+
+    /// 画面の高さを超える項目数の menu を開き、 **ホイールで下へスクロールしてから
+    /// 最終項目を click すると、 その item の action が発火する**。
+    ///
+    /// 旧実装は popup_h を切り詰めなかったので末尾 item が画面外に描かれ、 スクリーン
+    /// 座標の hit-test では原理的に押せなかった。
+    #[test]
+    fn long_menu_scrolls_and_last_item_is_clickable() {
+        struct M {
+            fired: Option<usize>,
+        }
+        let mut host: UiHost<M> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let mut model = M { fired: None };
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+        // 50 items × 24px = 1200px > 画面高 600px。 どの item が当たったかは action が
+        // 捕まえた index で判別する (ラベルは全部同じでよい)。
+        let mut frame = |host: &mut UiHost<M>, model: &mut M, input: FrameInput| {
+            host.frame(model, &mut scene, screen, input, |_, ui| {
+                ui.menu_bar(bar_rect, |bar| {
+                    bar.menu("File", |menu| {
+                        for i in 0..50 {
+                            menu.item("item", move |ui| {
+                                ui.push_edit(Edit::mutate(move |m: &mut M| m.fired = Some(i)));
+                            });
+                        }
+                    });
+                });
+            });
+        };
+
+        // Frame 1: "File" を click して open (popup は y=32 から画面下端 600 まで = 568px)。
+        frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 2: popup 上でホイールを下へ (offset は max = 1200 - 568 = 632 で clamp)。
+        frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 300.0)),
+                    scroll_delta: (0.0, -5000.0),
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 3: popup 最下段 (= 最終項目 item49) を click。
+        frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 590.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(model.fired, Some(49), "スクロール後の最終項目が click できる");
+    }
+
+    /// popup の高さは画面高を超えない (打ち切られ、 全体が画面内に収まる)。
+    #[test]
+    fn long_menu_popup_fits_on_screen() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 32.0 };
+        let build = |ui: &mut Ui<'_, ()>| {
+            ui.menu_bar(bar_rect, |bar| {
+                bar.menu("File", |menu| {
+                    // 50 items × 24px = 1200px > 画面高 600px。
+                    for _ in 0..50 {
+                        menu.item("item", |_| {});
+                    }
+                });
+            });
+        };
+
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((20.0, 16.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |(), ui| build(ui),
+        );
+        scene.clear();
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| build(ui));
+
+        let panel = scene.iter_popup_rects().next().expect("popup panel").rect;
+        assert!(
+            panel.y >= 0.0 && panel.y + panel.h <= 600.0,
+            "popup 全体が画面内 (panel={panel:?})"
+        );
+        assert!(panel.h < 50.0 * 24.0, "全項目ぶんから打ち切られている (panel={panel:?})");
+    }
+
+    /// cascade サブメニューが **画面右端で左へ flip** し、 flip 先で click できる。
+    /// 旧実装は `x: item_rect.x + item_rect.w` 固定で clamp も flip も無く、 右端付近の
+    /// サブメニューは画面外に出て選べなかった。
+    #[test]
+    fn cascade_flips_left_at_screen_right_edge_and_stays_clickable() {
+        struct M {
+            fired: bool,
+        }
+        let mut host: UiHost<M> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let mut model = M { fired: false };
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // menu bar を画面右寄せ: popup は x=600..780、 右隣に 180px の cascade は入らない。
+        let bar_rect = Rect { x: 600.0, y: 0.0, w: 200.0, h: 32.0 };
+        let mut frame = |host: &mut UiHost<M>, model: &mut M, pos: (f32, f32), click: bool| {
+            host.frame(
+                model,
+                &mut scene,
+                screen,
+                FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some(pos),
+                        primary_just_released: click,
+                        ..PointerFrame::default()
+                    },
+                    ..Default::default()
+                },
+                |_, ui| {
+                    ui.menu_bar(bar_rect, |bar| {
+                        bar.menu("File", |menu| {
+                            menu.sub_menu("Open Recent", |sub| {
+                                sub.item("wav01", |ui_inner| {
+                                    ui_inner.push_edit(Edit::mutate(|m: &mut M| m.fired = true));
+                                });
+                            });
+                        });
+                    });
+                },
+            );
+        };
+
+        // Frame 1: "File" (x=600..) を click → top-level popup が x=600..780 に開く。
+        frame(&mut host, &mut model, (620.0, 16.0), true);
+        // Frame 2: "Open Recent" (popup item 0、 y=44) に hover → cascade open (左へ flip)。
+        frame(&mut host, &mut model, (620.0, 44.0), false);
+        // Frame 3: flip 先 (= 親 popup の左隣 x=420..600) の cascade item を click。
+        frame(&mut host, &mut model, (440.0, 44.0), true);
+        assert!(
+            model.fired,
+            "画面右端では cascade が左へ flip し、 その位置で click できる"
+        );
+    }
+
+    /// flip した cascade が **実際に描かれる** (親 popup の clip で潰されない)。
+    /// 親 popup の item 列は popup 枠で clip するようになったので、 その clip が
+    /// cascade まで及んでいないことを固定する (popup_layer は body 突入時に clip を
+    /// None へ退避するので及ばない、 の回帰テスト)。
+    #[test]
+    fn flipped_cascade_is_drawn_outside_parent_clip() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let bar_rect = Rect { x: 600.0, y: 0.0, w: 200.0, h: 32.0 };
+        let build = |ui: &mut Ui<'_, ()>| {
+            ui.menu_bar(bar_rect, |bar| {
+                bar.menu("File", |menu| {
+                    menu.sub_menu("Open Recent", |sub| {
+                        sub.item("wav01", |_| {});
+                    });
+                });
+            });
+        };
+        let hover = |pos: (f32, f32), click: bool| FrameInput {
+            pointer: PointerFrame {
+                pos: Some(pos),
+                primary_just_released: click,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+
+        host.frame_to_edits(&(), &mut scene, screen, hover((620.0, 16.0), true), |(), ui| {
+            build(ui);
+        });
+        host.frame_to_edits(&(), &mut scene, screen, hover((620.0, 44.0), false), |(), ui| {
+            build(ui);
+        });
+        scene.clear();
+        host.frame_to_edits(&(), &mut scene, screen, hover((620.0, 44.0), false), |(), ui| {
+            build(ui);
+        });
+
+        let g = scene
+            .iter_popup_glyphs()
+            .find(|g| g.text.as_ref() == "wav01")
+            .expect("flip した cascade の item が描かれる");
+        assert!(g.left < 600.0, "親 popup (x>=600) の左に描かれる: left={}", g.left);
+        if let Some(c) = g.clip_rect {
+            assert!(
+                c.w > 0.0 && c.x < 600.0,
+                "親 popup の clip で潰されていない (clip={c:?})"
+            );
+        }
+    }
+
+    /// cascade サブメニューが **画面下端で上へ clamp** され、 clamp 先で click できる。
+    #[test]
+    fn cascade_clamps_at_screen_bottom_and_stays_clickable() {
+        struct M {
+            fired: bool,
+        }
+        let mut host: UiHost<M> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let mut model = M { fired: false };
+        let screen = PhysicalSize { width: 800, height: 600 };
+        // menu bar を画面下端へ: top-level popup は上へ flip して y=536..560。
+        let bar_rect = Rect { x: 0.0, y: 560.0, w: 800.0, h: 32.0 };
+        let mut frame = |host: &mut UiHost<M>, model: &mut M, pos: (f32, f32), click: bool| {
+            host.frame(
+                model,
+                &mut scene,
+                screen,
+                FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some(pos),
+                        primary_just_released: click,
+                        ..PointerFrame::default()
+                    },
+                    ..Default::default()
+                },
+                |_, ui| {
+                    ui.menu_bar(bar_rect, |bar| {
+                        bar.menu("File", |menu| {
+                            menu.sub_menu("Open Recent", |sub| {
+                                // 10 items × 24px = 240px。 item の上端 (536) から下へ
+                                // 伸ばすと 776 で画面外 → 上へ押し戻して y=360。
+                                for i in 0..10 {
+                                    let first = i == 0;
+                                    sub.item("wav", move |ui_inner| {
+                                        if first {
+                                            ui_inner.push_edit(Edit::mutate(|m: &mut M| {
+                                                m.fired = true;
+                                            }));
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    });
+                },
+            );
+        };
+
+        // Frame 1: "File" を click → top-level popup は上へ flip (y=536..560)。
+        frame(&mut host, &mut model, (20.0, 576.0), true);
+        // Frame 2: "Open Recent" に hover → cascade open (下端 clamp で y=360..600)。
+        frame(&mut host, &mut model, (20.0, 545.0), false);
+        // Frame 3: clamp 先の cascade item 0 (y=360..384) を click。
+        frame(&mut host, &mut model, (200.0, 370.0), true);
+        assert!(
+            model.fired,
+            "画面下端では cascade が上へ clamp され、 その位置で click できる"
+        );
     }
 }

@@ -286,12 +286,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // on_change を発火するので、 daw_01 が `SetSongBpmFromScrub` 経由で
     // song.bpm 更新 + 軽量 IPC で audio engine に即時伝搬する。
     let bpm_w = 64.0;
-    // NOTE: tempo (SongTempo) は per-control modulation **非対象**。audio engine の
-    // `evaluate_song_tempo` は lane curve + song.bpm のみ読み、song-level の
-    // follower modulation (`song_mod_routings`) を一切消費しない (export も song.bpm
-    // 直読み)。tempo を音で変調可能にするのはエンジン + export bake を要する別機能なので、
-    // 「効かないのに変調できそうに見えるコントロール」を作らないため modulation 引数は None。
-    // (tempo AUTOMATION は lane 経由で従来どおり機能する。)
+    // r.md #78: tempo (SongTempo) は per-control modulation **対象**。
+    //
+    // 以前ここには「engine は `song_mod_routings` を一切消費しない」というコメントと
+    // ともに `None` が置かれていたが、 それは stale だった。 実際には engine
+    // (`daw_audio/src/engine.rs` の `current_bpm`) も書き出し
+    // (`daw_audio/src/export.rs` の `smoothed_current_bpm_freewheel`) も
+    // `apply_modulation_with_scalars(SongTempo, ..., song_mod_routings, ...)` を
+    // 通しており、 tempo 変調は再生でも bounce でも効いている。
+    //
+    // 変調先の指定を ◉ (arm) 一本にした以上、 ここが `None` のままだと
+    // **tempo だけ指定手段が無い**取り残しになる。
+    let bpm_target = AutomationTarget::SongTempo;
+    let bpm_mod = crate::view::modulation::build_mod(
+        app,
+        bpm_target.clone(),
+        f64::from(app.song_doc.song().bpm),
+        crate::view::modulation::PLAIN_IDENT,
+        MASTER_TRACK_ID,
+    );
     let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",
         Rect { x, y: cy, w: bpm_w, h: bh },
@@ -307,7 +320,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         },
         None,
-        None,
+        Some(bpm_mod.modulation()),
+    );
+    crate::view::modulation::push_mod_drag_resync(
+        ui,
+        app,
+        MASTER_TRACK_ID,
+        &bpm_target,
+        bpm_resp.mod_dragging,
     );
     // Phase 4 Step B 流 ParamGesture edge 検知: drag 開始 (= dragging
     // false→true) で `ParamGestureBegin`、 終了で `ParamGestureEnd` を発火。
