@@ -183,6 +183,66 @@ impl AppData {
         }
     }
 
+    /// 子プロセス切断時に、進行中の bounce / 書き出しを畳む脱出口。中止したら `true`。
+    ///
+    /// bounce 進行中の crash では `BounceClipFxComplete` / `VocalSynthReady` が永遠に
+    /// 来ない。pending を放置すると以後の bounce が全て「既に bounce 中」で拒否され、
+    /// audio 側は isolated song のまま残る。`abort_audio_export` と同型の脱出口
+    /// (どちらの子の crash でも安全に解除できる)。
+    ///
+    /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
+    pub(crate) fn abort_inflight_renders_on_disconnect(&mut self) -> bool {
+        let mut aborted = false;
+        if self.ipc.pending_clip_fx_bounce.take().is_some()
+            || self.ipc.pending_vocal_synth_bounce.take().is_some()
+        {
+            self.send_plugin(PluginCommand::SetRenderMode(
+                common::protocol::RenderMode::Realtime,
+            ));
+            self.restore_engine_song_after_bounce();
+            aborted = true;
+        }
+        aborted
+            | self.abort_vocal_synth_export_gate("子プロセスが切断されたため書き出しを中止しました")
+    }
+
+    /// 音声 freewheel フェーズ (`AudioRender`) のキャンセル要求。
+    ///
+    /// 通常は daw_audio プロセスへ IPC で cancel を送り、freewheel ループが次 buffer で
+    /// 中断 → `ExportWavComplete { error: None, cancelled: true }` が返る (cancel は
+    /// typed flag で伝わる)。標準 WAV export / video 前段のどちらでも有効。
+    ///
+    /// ただし r.md #75 の **合成完了ゲート**で待っている間は daw_audio がまだ render を
+    /// 始めていないので cancel が届かない。その段階ではゲートごと畳んで中止する。
+    pub(crate) fn cancel_audio_render(&mut self) {
+        if self.abort_vocal_synth_export_gate("書き出しをキャンセルしました") {
+            return;
+        }
+        self.send_audio(common::protocol::AudioCommand::CancelExport);
+        self.ui_ephemeral.status_message = "書き出しをキャンセル中...".into();
+    }
+
+    /// r.md #75: WAV 書き出しの **合成完了ゲート**で待っている最中なら、それを畳んで
+    /// 書き出しごと中止する。畳んだら `true`、待っていなければ `false` (呼び出し側は
+    /// 通常の中止手順へ進む)。
+    ///
+    /// この段階では daw_audio はまだ render を始めていないので、`AudioCommand::CancelExport`
+    /// を送っても届かない — daw_audio は次の `ExportWav` 開始時に「前回の残り」として
+    /// cancel flag を消すので、**待ちが明けたあと書き出しがそのまま完走してしまう**。
+    /// 子プロセス切断 (`handle_child_disconnected`) とユーザーの Cancel/ESC の両方が
+    /// ここを通る (待ちを畳む手順は 1 か所)。
+    pub(crate) fn abort_vocal_synth_export_gate(&mut self, reason: &str) -> bool {
+        if self.ipc.pending_vocal_synth_export.is_empty() {
+            return false;
+        }
+        self.ipc.pending_vocal_synth_export.clear();
+        self.transport.pending_export = None;
+        // `export_stage` は既に `AudioRender` なので、既存の脱出口がそのまま効く
+        // (overlay / 入力 gate / temp WAV / SetRenderMode(Realtime) を畳む)。
+        self.abort_audio_export(reason.into());
+        true
+    }
+
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...
     /// `rfd` で .mid ファイル保存先を選択 → `midi_export::export_midi`
     /// で SMF1 書き出し。 audio engine への IPC 不要 (= GUI process 単独で

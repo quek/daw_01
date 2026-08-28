@@ -243,21 +243,7 @@ impl AppData {
                 last_synced_epoch: 0,
                 event_proxy,
             },
-            voicevox: VoicevoxState {
-                singers: Vec::new(),
-                talk_speakers: Vec::new(),
-                voicevox_job,
-                spawned_engine: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::state::voicevox::VoicevoxEngineSlot::default(),
-                )),
-                voicevox_launch_attempted: false,
-                lipsync_gen: 0,
-                lipsync_inflight: std::collections::HashSet::new(),
-                lipsync_fingerprints: std::collections::HashMap::new(),
-                voicevox_synth_status: std::collections::HashMap::new(),
-                voicevox_metadata_sent: std::collections::HashMap::new(),
-                priority_sent: std::collections::HashMap::new(),
-            },
+            voicevox: VoicevoxState::new(voicevox_job),
             media: MediaState {
                 audio_source_cache: AudioSourceCache::new(),
                 video_thumbnail_rgba: std::collections::HashMap::new(),
@@ -798,26 +784,8 @@ impl AppData {
                 self.theme = crate::theme::resolve(dirs.as_deref(), &id);
                 self.persist_app_config();
             }
-            // r.md #75: 合成の塊の長さ。ドラッグ中 (`commit = false`) は表示値だけ動かし、
-            // 確定 (release / 数値入力 / ダブルクリックリセット) でだけ保存と再合成を行う。
-            // **これは合成結果を変える入力**なので、確定時は差分キャッシュを落として全
-            // device へ流し直す (= 曲全体の再合成)。落とさないと再送されず、キーに混ぜて
-            // ある以上「設定が効かない」ように見える。
             AppEvent::SetVoicevoxChunkSecs { secs, commit } => {
-                let next = secs.clamp(
-                    common::voicevox_phrase::MIN_CHUNK_SECS,
-                    common::voicevox_phrase::MAX_CHUNK_SECS,
-                );
-                let changed = (next - self.ui_prefs.voicevox_chunk_secs).abs() >= 1e-3;
-                if changed {
-                    self.ui_prefs.voicevox_chunk_secs = next;
-                }
-                if !commit {
-                    return;
-                }
-                self.persist_app_config();
-                self.voicevox.voicevox_metadata_sent.clear();
-                self.sync_vocal_metadata();
+                self.set_voicevox_chunk_secs(secs, commit);
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
             AppEvent::JumpHistory(index) => self.jump_history_to(index),
@@ -1911,21 +1879,7 @@ impl AppData {
                 // freewheel ループが次 buffer で中断 → `ExportWavComplete
                 // { error: None, cancelled: true }` が返る (cancel は typed flag で
                 // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
-                Some(ExportStage::AudioRender { .. }) => {
-                    // r.md #75: まだ **VOICEVOX の合成完了待ち** (`AudioRender` に入って
-                    // いるが daw_audio は render を始めていない) の段階なら、cancel を
-                    // engine へ送っても届かない — daw_audio は次の `ExportWav` 開始時に
-                    // 「前回の残り」として cancel flag を消すので、待ちが明けたあとに
-                    // 書き出しがそのまま完走してしまう。ここで待ちを畳んで中止する。
-                    if !self.ipc.pending_vocal_synth_export.is_empty() {
-                        self.ipc.pending_vocal_synth_export.clear();
-                        self.transport.pending_export = None;
-                        self.abort_audio_export("書き出しをキャンセルしました".into());
-                        return;
-                    }
-                    self.send_audio(AudioCommand::CancelExport);
-                    self.ui_ephemeral.status_message = "書き出しをキャンセル中...".into();
-                }
+                Some(ExportStage::AudioRender { .. }) => self.cancel_audio_render(),
                 None => {}
             },
             AppEvent::SetClipReversed { target, reversed } => {

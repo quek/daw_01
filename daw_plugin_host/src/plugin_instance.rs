@@ -487,6 +487,54 @@ pub trait VocalSynth {
     fn synth_progress(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>);
 }
 
+/// 合成完了待ちの「停滞」判定 (r.md #75)。フレーズ 1 本の最大実測は 546 ms、engine の
+/// コールドスタートを見ても 60 秒進捗が無ければ異常。**総時間では打ち切らない**
+/// (5 分の曲の初回合成は実測 30 秒超で、旧 30 秒固定 deadline は部分ミックスを
+/// 書き出していた)。
+const SYNTH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`VocalSynth::synth_progress`] の 3 つ組が「呼び出し時点の queued 世代」まで進むのを
+/// 別スレッドで待ち、完了 (または停滞での打ち切り) で `VocalSynthReady` を `emit` へ渡す。
+///
+/// 戻り値は **スレッドを起こせたか**。`false` なら呼び出し側が即 ready を返すこと
+/// (待ち手が居ないまま bounce / 書き出しを止めない)。
+pub fn spawn_vocal_synth_wait(
+    device_id: u64,
+    progress: (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>),
+    emit: impl FnOnce(common::protocol::PluginEvent) + Send + 'static,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let (queued, done, heartbeat) = progress;
+    let target_gen = queued.load(Ordering::SeqCst);
+    let spawn = std::thread::Builder::new()
+        .name("voicevox-bounce-synth-wait".into())
+        .spawn(move || {
+            let sample = || (done.load(Ordering::SeqCst), heartbeat.load(Ordering::SeqCst));
+            let mut last_seen = sample();
+            let mut last_change = std::time::Instant::now();
+            while done.load(Ordering::SeqCst) < target_gen {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let now = sample();
+                if now != last_seen {
+                    last_seen = now;
+                    last_change = std::time::Instant::now();
+                    continue;
+                }
+                if last_change.elapsed() > SYNTH_STALL_TIMEOUT {
+                    tracing::warn!(
+                        device_id,
+                        target_gen,
+                        done = now.0,
+                        "vocal synth が 60 秒進捗しないため待機を打ち切る"
+                    );
+                    break;
+                }
+            }
+            emit(common::protocol::PluginEvent::VocalSynthReady { device_id });
+        });
+    spawn.is_ok()
+}
+
 // ====================================================================
 // Main half
 // ====================================================================

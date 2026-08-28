@@ -102,8 +102,6 @@ impl AppData {
         // 進行中 bounce の完了通知を新 project に適用しない。
         self.ipc.pending_clip_fx_bounce = None;
         self.ipc.pending_vocal_synth_bounce = None;
-        // r.md #75: 書き出しの合成完了ゲートも同様 (前の曲の device を待ち続けない)。
-        self.ipc.pending_vocal_synth_export.clear();
         // r.md #54: 前の曲のラウドネスレポート (数値も「範囲 x – y」の拍も) を
         // 新しい曲のものとして見せない。走査中なら engine ごと畳む。
         self.abort_loudness_analysis("プロジェクトを切り替えたのでラウドネス解析を中止しました".into());
@@ -160,9 +158,7 @@ impl AppData {
         // (device_id は project ごとに再割当されるので stale entry が誤 hit すると
         // 新 project の vocal device に seed 合成が飛ばず無音になる)。各 device の
         // load 時にも個別 invalidate するが、ここで全消去して stale entry も掃う。
-        self.voicevox.voicevox_metadata_sent.clear();
-        // r.md #75: 再生ヘッド優先ヒントの送信記憶も同様に持ち越さない。
-        self.voicevox.priority_sent.clear();
+        self.reset_voicevox_sync_state();
         // 保存ファイル内の口パク clip は既に authoritative。 その clip を生成した
         // 入力 (notes / 歌詞 / bpm / mouth_map / binding) を fingerprint のベースライン
         // として記録し、開いた直後の非入力編集 (track rename 等) で口パクが再生成
@@ -235,33 +231,10 @@ impl AppData {
         let Some(dirs) = &self.ui_prefs.app_dirs else {
             return;
         };
-        let cfg = crate::app_config::AppConfig {
-            resource_monitor_enabled: self.ui_prefs.resource_monitor_enabled,
-            undo_history_open: self.ui_prefs.undo_history_open,
-            undo_history_rect: self
-                .ui_prefs
-                .undo_history_rect
-                .map(|r| [r.x, r.y, r.w, r.h]),
-            // r.md #48: テーマは **id だけ**保存する (色を焼き込むとテーマファイルを
-            // 編集しても反映されず SSoT が二重化する)。
-            theme: self.theme.id.clone(),
-            settings_open: self.ui_prefs.settings_open,
-            settings_rect: self.ui_prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
-            // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
-            // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
-            master_panel_open: self.ui_prefs.master_panel_open,
-            master_panel_w: self.ui_prefs.master_panel_w,
-            master_panel_sections: self.ui_prefs.master_panel_sections,
-            meter: self.ui_prefs.meter_settings,
-            // r.md #54: レポート window の開閉と位置も「画面の使い方」側。
-            loudness_report_open: self.ui_prefs.loudness_report_open,
-            loudness_report_rect: self
-                .ui_prefs
-                .loudness_report_rect
-                .map(|r| [r.x, r.y, r.w, r.h]),
-            // r.md #75: 合成の塊の長さ (秒) も「この人の作業のしかた」側。
-            voicevox_chunk_secs: self.ui_prefs.voicevox_chunk_secs,
-        };
+        // 組み立ては `AppConfig` の定義の隣 (= app_config.rs)。網羅 literal なので
+        // field を 1 つ足すたびにここが太る (サイズ budget)、かつ「保存する / しない」の
+        // 判断は AppConfig 側の関心。
+        let cfg = crate::app_config::AppConfig::from_prefs(&self.ui_prefs, self.theme.id.clone());
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");
         }

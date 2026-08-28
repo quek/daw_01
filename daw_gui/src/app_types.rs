@@ -1642,23 +1642,19 @@ pub enum DeferredEdit {
 
 /// builtin VOICEVOX (歌唱/読み上げ) 合成の 1 plugin 分の状態。
 /// `AppData.voicevox_synth_status` に key=plugin_id で保持する。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct VocalSynthStatus {
-    /// いま合成中か (= plugin host の `queued_gen > done_gen`)。
-    pub busy: bool,
+    /// plugin host が報告した進捗そのもの (busy / 失敗種別 / 残フレーズ数 / クリップ帰属)。
+    /// **写しを作らず IPC の型をそのまま持つ** — 3 つの field を手で同期していると、
+    /// 片方だけ更新し忘れる余地が残る (r.md #75)。
+    pub progress: common::protocol::VocalSynthProgress,
     /// engine に**到達できず** (未接続/起動途中) 失敗してからの起点。到達成功で `None`。
     /// `Some` のまま `VOICEVOX_ENGINE_WARNING` 経過 = engine 未接続として警告に切替。
+    /// `progress.failure` から**時間をかけて導出**する状態なので、こちらは GUI が持つ。
     pub failing_since: Option<std::time::Instant>,
     /// engine には**到達できたが入力を拒否**された内容エラーの理由 (例: `lyricが不正です: ー`)。
     /// `Some` の間は「合成できない歌詞」警告を即時表示 (閾値なし)。到達成功/新規合成で `None`。
     pub rejected: Option<String>,
-    /// 未完了フレーズ数 / 総フレーズ数 (`VocalSynthProgress` の写し)。
-    /// r.md #75: 合成の最小単位はフレーズなので、進捗はトラック数ではなくフレーズ数で数える。
-    pub pending: u32,
-    pub total: u32,
-    /// 未完了フレーズが掛かっている clip id (昇順・重複なし)。クリップ上スピナーを
-    /// 「そのクリップに未完了の仕事があるときだけ」点けるために使う。
-    pub pending_clips: Vec<u32>,
 }
 
 /// 合成が `failing` のまま継続したとき「engine に接続できません」へ切り替える

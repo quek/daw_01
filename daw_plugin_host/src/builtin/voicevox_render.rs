@@ -277,6 +277,19 @@ struct MixBuffer {
 }
 
 impl MixBuffer {
+    /// 回収した `SynthResult` の buffer をプールへ返す (最大 2 本)。
+    /// `samples` が他所と共有されていれば諦めてそのまま drop する
+    /// (呼び出し側が唯一の所有者になったあとに呼ぶので、通常は起きない)。
+    fn recycle(&mut self, res: SynthResult) {
+        let Ok(mut v) = Arc::try_unwrap(res.samples) else {
+            return;
+        };
+        v.clear();
+        if self.pool.len() < 2 {
+            self.pool.push(v);
+        }
+    }
+
     fn new(total: usize) -> Self {
         Self {
             buf: vec![0.0; total],
@@ -397,14 +410,7 @@ impl PhraseRenderState {
                 continue;
             }
             match Arc::try_unwrap(arc) {
-                Ok(res) => {
-                    if let Ok(mut v) = Arc::try_unwrap(res.samples) {
-                        v.clear();
-                        if self.mix.pool.len() < 2 {
-                            self.mix.pool.push(v);
-                        }
-                    }
-                }
+                Ok(res) => self.mix.recycle(res),
                 // RT (または誰か) がまだ所有している。次の機会に再試行する。
                 Err(arc) => keep.push((arc, e)),
             }

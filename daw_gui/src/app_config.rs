@@ -63,6 +63,40 @@ fn default_voicevox_chunk_secs() -> f32 {
     common::voicevox_phrase::DEFAULT_CHUNK_SECS
 }
 
+impl AppConfig {
+    /// 現在の UI 設定 (`UiPrefs`) と選択中テーマ id から保存用の設定を組む。
+    ///
+    /// **網羅的な struct literal** なので、field を足したらここも必ず埋まる
+    /// (埋め忘れでビルドが通らない = 保存漏れが起きない)。組み立てを `AppConfig` の
+    /// 定義の隣に置くのは、「何を永続するか」がこの型の関心だから (呼び出し側の
+    /// `persist_app_config` は保存先の解決とエラー処理だけを持つ)。
+    ///
+    /// テーマは **id だけ**保存する (色を焼き込むとテーマファイルを編集しても
+    /// 反映されず SSoT が二重化する。r.md #48)。
+    #[must_use]
+    pub fn from_prefs(prefs: &crate::state::UiPrefs, theme_id: String) -> Self {
+        Self {
+            resource_monitor_enabled: prefs.resource_monitor_enabled,
+            undo_history_open: prefs.undo_history_open,
+            undo_history_rect: prefs.undo_history_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            theme: theme_id,
+            settings_open: prefs.settings_open,
+            settings_rect: prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
+            // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
+            master_panel_open: prefs.master_panel_open,
+            master_panel_w: prefs.master_panel_w,
+            master_panel_sections: prefs.master_panel_sections,
+            meter: prefs.meter_settings,
+            // r.md #54: レポート window の開閉と位置も「画面の使い方」側。
+            loudness_report_open: prefs.loudness_report_open,
+            loudness_report_rect: prefs.loudness_report_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #75: 合成の塊の長さ (秒) も「この人の作業のしかた」側。
+            voicevox_chunk_secs: prefs.voicevox_chunk_secs,
+        }
+    }
+}
+
 fn default_master_panel_w() -> f32 {
     300.0
 }

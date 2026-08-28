@@ -1131,10 +1131,7 @@ impl PluginHost {
             PluginCommand::PrepareVocalSynth { device_id } => {
                 self.prepare_vocal_synth(device_id);
             }
-            PluginCommand::SetVocalSynthPriority {
-                device_id,
-                playhead_beats,
-            } => {
+            PluginCommand::SetVocalSynthPriority { device_id, playhead_beats } => {
                 // device 未発見でも **warn を出さない** — トランスポート中に毎秒来る
                 // 順序ヒントなので、ログを汚さない。
                 if let Some(rec) = self.instances.get_mut(&device_id)
@@ -1614,58 +1611,22 @@ impl PluginHost {
     }
 
     fn prepare_vocal_synth(&mut self, device_id: u64) {
-        /// 合成完了待ちの「停滞」判定。フレーズ 1 本の最大実測は 546 ms、engine の
-        /// コールドスタートを見ても 60 秒進捗が無ければ異常。**総時間では打ち切らない**
-        /// (5 分の曲の初回合成は実測 30 秒超で、旧 30 秒固定 deadline は部分ミックスを
-        /// 書き出していた。r.md #75)。
-        const SYNTH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
         // bounce / 曲全体の WAV 書き出しの前に合成完了を保証する。builtin VOICEVOX の
         // (queued, done, heartbeat) を取り出し、直前 flush 世代まで done になるのを
-        // 別 thread で poll して VocalSynthReady を emit する。
-        // 該当 builtin が無ければ即 ready。
+        // 別 thread で poll して VocalSynthReady を emit する
+        // (待ちの規則は `plugin_instance::spawn_vocal_synth_wait`)。
+        // 該当 builtin が無ければ / spawn に失敗したら即 ready (bounce を hang させない)。
         let progress = self
             .instances
             .get_mut(&device_id)
             .and_then(|rec| rec.plugin.as_vocal_synth().map(|vs| vs.synth_progress()));
-        if let Some((queued, done, heartbeat)) = progress {
-            use std::sync::atomic::Ordering;
-            let target_gen = queued.load(Ordering::SeqCst);
-            let evt_thread = self.evt_tx.clone();
-            let spawn = std::thread::Builder::new()
-                .name("voicevox-bounce-synth-wait".into())
-                .spawn(move || {
-                    let mut last_seen = (
-                        done.load(Ordering::SeqCst),
-                        heartbeat.load(Ordering::SeqCst),
-                    );
-                    let mut last_change = std::time::Instant::now();
-                    while done.load(Ordering::SeqCst) < target_gen {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        let now = (
-                            done.load(Ordering::SeqCst),
-                            heartbeat.load(Ordering::SeqCst),
-                        );
-                        if now != last_seen {
-                            last_seen = now;
-                            last_change = std::time::Instant::now();
-                        } else if last_change.elapsed() > SYNTH_STALL_TIMEOUT {
-                            tracing::warn!(
-                                device_id,
-                                target_gen,
-                                done = now.0,
-                                "vocal synth が 60 秒進捗しないため待機を打ち切る"
-                            );
-                            break;
-                        }
-                    }
-                    let _ = evt_thread.send(PluginEvent::VocalSynthReady { device_id });
-                });
-            if spawn.is_err() {
-                // thread spawn 失敗時は bounce を hang させないよう即 ready。
-                self.emit(PluginEvent::VocalSynthReady { device_id });
-            }
-        } else {
+        let spawned = progress.is_some_and(|p| {
+            let tx = self.evt_tx.clone();
+            crate::plugin_instance::spawn_vocal_synth_wait(device_id, p, move |ev| {
+                let _ = tx.send(ev);
+            })
+        });
+        if !spawned {
             self.emit(PluginEvent::VocalSynthReady { device_id });
         }
     }
@@ -2395,13 +2356,7 @@ fn log_command(cmd: &PluginCommand) {
                 "received SetSlotPlugin"
             );
         }
-        PluginCommand::SetBuiltinPluginNoteMetadata {
-            device_id,
-            bpm,
-            chunk_secs,
-            entries,
-            talk,
-        } => {
+        PluginCommand::SetBuiltinPluginNoteMetadata { device_id, bpm, chunk_secs, entries, talk } => {
             tracing::debug!(
                 device_id,
                 bpm,

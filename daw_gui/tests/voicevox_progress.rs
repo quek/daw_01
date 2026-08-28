@@ -69,7 +69,7 @@ fn synth_status_busy_then_failing_then_unreachable_threshold() {
     // busy + Unreachable → entry が立ち failing_since 記録。
     app.handle_event(synth_status(1, status(true, VocalSynthFailure::Unreachable)));
     let st = app.voicevox.voicevox_synth_status.get(&1).cloned().expect("entry present");
-    assert!(st.busy);
+    assert!(st.progress.busy);
     let since = st.failing_since.expect("failing_since set on first failing");
 
     // 直後 / 閾値未満は「合成中」(警告しない)、animating は true。
@@ -101,7 +101,7 @@ fn synth_status_busy_without_failing_is_generating_but_never_warns() {
     let (mut app, _rx) = build_app();
     app.handle_event(synth_status(2, status(true, VocalSynthFailure::None)));
     let st = app.voicevox.voicevox_synth_status.get(&2).cloned().expect("entry present");
-    assert!(st.busy);
+    assert!(st.progress.busy);
     assert!(st.failing_since.is_none(), "failing なしでは failing_since を立てない");
     assert!(app.voicevox_any_generating());
     // failing_since が無いので、いくら時間が経っても未接続警告は出ない。
@@ -120,7 +120,7 @@ fn synth_status_rejected_shows_content_error_not_engine_warning() {
         ),
     ));
     let st = app.voicevox.voicevox_synth_status.get(&3).cloned().expect("entry present");
-    assert!(!st.busy);
+    assert!(!st.progress.busy);
     // Rejected は failing_since を立てない → 「engine 未接続」警告は永遠に出ない。
     assert!(st.failing_since.is_none());
     assert!(!app.voicevox_engine_unreachable(Instant::now() + Duration::from_secs(3600)));

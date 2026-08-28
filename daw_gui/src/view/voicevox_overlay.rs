@@ -49,7 +49,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     let rejected = app.voicevox_rejected_detail();
     let phrases_left = app.voicevox_pending_phrase_count();
     // busy だが pending がまだ 0 件の一瞬でパネルが消えないよう、busy 判定も併用する。
-    let wav_busy = app.voicevox.voicevox_synth_status.values().any(|s| s.busy);
+    let wav_busy = app.voicevox.voicevox_synth_status.values().any(|s| s.progress.busy);
     let lipsync = !app.voicevox.lipsync_inflight.is_empty();
 
     // engine 未接続 / 内容エラー (拒否された歌詞) が確定したら、進行中スピナーより
