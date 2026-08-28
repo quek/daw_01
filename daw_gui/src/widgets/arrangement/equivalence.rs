@@ -1128,7 +1128,9 @@ fn scenarios(header_w: f32) -> Vec<(&'static str, Vec<PointerFrame>)> {
 ///
 /// `automation_lane_rects` は lane **body** (x∈lanes) の rect なので、header 側は
 /// `press_header::lane_header` と同じ式 (`header_pane.x + indent`、Lead は depth 0) で組む。
-fn probe_geometry(header_w: f32) -> (Vec<(f32, f32)>, Vec<(f32, f32)>) {
+type ProbePoints = Vec<(f32, f32)>;
+
+fn probe_geometry(header_w: f32) -> (ProbePoints, ProbePoints) {
     let mut app = build_fixture(header_w);
     let mut host = UiHost::no_redraw();
     let (_scene, response) = drive_scene(&mut host, &mut app, PointerFrame::default());
