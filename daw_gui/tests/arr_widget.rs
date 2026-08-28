@@ -1843,3 +1843,61 @@ fn alt_click_on_a_point_only_deletes_it() {
     assert_eq!(lane_clip_start(&app, 1, 1), clip_before, "automation clip は動かない");
     assert_eq!(point_curve(&app, 2), curve_before, "区間 bend も起動しない");
 }
+
+/// automation lane の中に描かれた線分の総数 (curve 本体 + hover 強調 + preview)。
+/// **色ではなく本数**で見る — 「消えた」は本数が減ること、
+/// 「強調が乗った」は本数が増えること、と 1 つの尺度で表せる。
+fn lane_line_segment_count(scene: &Scene, lane_rect: Rect) -> usize {
+    scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Line(b) => Some(b),
+            _ => None,
+        })
+        .flat_map(|b| b.segments.iter())
+        .filter(|s| {
+            let inside = |y: f32| y >= lane_rect.y - 1.0 && y <= lane_rect.y + lane_rect.h + 1.0;
+            inside(s.a[1]) && inside(s.b[1])
+        })
+        .count()
+}
+
+/// **r.md #73 の回帰**: Alt を押したままカーソルを線の上に置いても、
+/// オートメーション曲線が消えない。
+///
+/// 実機で「Alt hover すると線が消える」症状が出た。 hover 強調は cached の **外** に
+/// 描くので、cached 側の base curve は 1 本も減らないはず — 減っていたら
+/// 「alt 押下が cached を再構築させて curve を落としている」ということになる。
+///
+/// 色ではなく **線分の本数** で見る (色は overlay の上塗りで変わりうるが、
+/// 「消えた」は本数でしか捕まえられない)。
+#[test]
+fn alt_hover_on_the_line_does_not_erase_the_automation_curve() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    let lane_rect = {
+        let mut host = UiHost::no_redraw();
+        let r = drive_response(&mut host, &mut app, PointerFrame::default());
+        r.automation_lane_rects.first().expect("lane が 1 本描かれている").1
+    };
+    let (gx, gy) = linear_segment_point(&mut app, 0.5);
+
+    // (a) 修飾なしで線の上 — これが基準。
+    let mut host = UiHost::no_redraw();
+    let plain = drive_scene(&mut host, &mut app, hold(gx, gy, no_mods()));
+    let base = lane_line_segment_count(&plain, lane_rect);
+    assert!(base > 0, "前提: 修飾なしで曲線が描かれている (got {base})");
+
+    // (b) Alt を押したまま同じ場所 — 強調が **上乗せ** されるので、本数は減らない。
+    let alt = modifiers(false, false, true);
+    let hovered = drive_scene(&mut host, &mut app, hold(gx, gy, alt));
+    let with_alt = lane_line_segment_count(&hovered, lane_rect);
+    assert!(
+        with_alt >= base,
+        "Alt hover で曲線が消えている: 修飾なし {base} 本 → Alt {with_alt} 本"
+    );
+}
+
+// r.md #73: 実機と同じ経路 (`view::root::build_root`) と **実ピクセル** での
+// 「Alt hover で曲線が消えない」検証は `daw_gui/tests/automation_hover_visual.rs`。
+// widget を直接呼ぶこのファイルでは、widget の外で起きる上書きが見えないため。
