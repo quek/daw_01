@@ -625,6 +625,9 @@ impl AppData {
         // collapsed_groups からも消えた id を除外。
         self.ui_prefs.collapsed_groups
             .retain(|id| !subtree_ids_set.contains(id));
+        // r.md #71 (プラグインのコピー / 移動): 消えた track の device を指す選択も
+        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
+        self.prune_device_selection();
         // Audio Editor を安定 key で貼り直す (消えていれば閉じる)。
         self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();

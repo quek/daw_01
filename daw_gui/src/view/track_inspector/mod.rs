@@ -1301,45 +1301,50 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         for (i, row_rect) in &resp.row_rects {
             let Some(e) = chain.get(*i) else { continue };
             let device_id = e.device_id;
-            let targets = carried_device_ids(app, &chain, device_id);
             let dest_track = cursor_tid;
             ui.context_menu_for(
                 *row_rect,
                 &["コピー", "切り取り", "貼り付け", "複製", "削除"],
                 move |idx, ui| {
-                    let ids = targets.clone();
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| match idx {
-                        0 => app.copy_devices(ids),
-                        1 => app.cut_devices(ids),
-                        2 => {
-                            // 貼り付け位置は「この device の直前」。 選択をこの device
-                            // 1 本にしてから **Ctrl+V と同じ経路** を起こす (挿入位置の
-                            // 決定は `paste_devices` が選択から引くので、規則も経路も
-                            // 1 本のまま。 OS クリップボードの読み出しは shortcut layer が
-                            // 担うので、ここで二重に読まない)。
-                            app.set_device_selection(vec![device_id]);
-                            app.ui_ephemeral.pending_shortcut_injections.push("paste");
+                    // 対象集合は **項目を選んだときだけ**組む (毎フレーム全行分
+                    // 作ると無駄な確保になる。 arrangement のトラックヘッダ
+                    // メニューが `target_ids()` を遅延させているのと同じ形)。
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        let chain = app.inspector_chain();
+                        let ids = carried_device_ids(app, &chain, device_id);
+                        match idx {
+                            0 => app.copy_devices(ids),
+                            1 => app.cut_devices(ids),
+                            2 => {
+                                // 貼り付け位置は「この device の直前」。 選択をこの
+                                // device 1 本にしてから **Ctrl+V と同じ経路** を起こす
+                                // (挿入位置の決定は `paste_devices` が選択から引くので、
+                                // 規則も経路も 1 本のまま。 OS クリップボードの読み出しは
+                                // shortcut layer が担うので、ここで二重に読まない)。
+                                app.set_device_selection(vec![device_id]);
+                                app.ui_ephemeral.pending_shortcut_injections.push("paste");
+                            }
+                            3 => {
+                                // 複製 = 選んだ device の直後にコピーを挿す。
+                                let Some(dest_track) = dest_track else { return };
+                                let Some(dest_index) = app
+                                    .song_doc
+                                    .song()
+                                    .fx_chain_by_track_id(dest_track)
+                                    .and_then(|c| c.iter().position(|d| d.id == device_id))
+                                    .map(|i| i as u32 + 1)
+                                else {
+                                    return;
+                                };
+                                app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+                                    device_ids: ids,
+                                    dest_track,
+                                    dest_index,
+                                    copy: true,
+                                }));
+                            }
+                            _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
                         }
-                        3 => {
-                            // 複製 = 各 device の直後にコピーを挿す。
-                            let Some(dest_track) = dest_track else { return };
-                            let Some(dest_index) = app
-                                .song_doc
-                                .song()
-                                .fx_chain_by_track_id(dest_track)
-                                .and_then(|c| c.iter().position(|d| d.id == device_id))
-                                .map(|i| i as u32 + 1)
-                            else {
-                                return;
-                            };
-                            app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
-                                device_ids: ids,
-                                dest_track,
-                                dest_index,
-                                copy: true,
-                            }));
-                        }
-                        _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
                     }));
                 },
             );

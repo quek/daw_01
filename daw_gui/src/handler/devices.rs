@@ -83,8 +83,8 @@ impl AppData {
                 return;
             }
         }
-        // v29: 安定 device_id → 旧 (track_id, index) 座標へ逆引きし、 既存の
-        // positional bookkeeping / song 再構築ロジックへ繋ぐ。
+        // chain の該当位置に `PluginInstance` を書き戻すために、 いまの
+        // 所属 track と位置を **その場で引き直す** (保持はしない)。
         let coords = find_device_by_id(self.song_doc.song(), device_id);
 
         // SSoT (code review 2026-06-06): audio engine に `ProcessData` shmem を
@@ -1330,10 +1330,10 @@ impl AppData {
         // frame loop が回らないのでここで明示的に流す (epoch 未変化なら no-op)。
         self.flush_song_sync();
 
-        // 落とした device を選択し、 落とし先のチェーンを表示し続ける。
-        self.selection.selected_device_ids = outcome.result_ids.clone();
+        // 落とした device を選択し、 落とし先のチェーンを表示し続ける
+        // (選択とタグの更新は `set_device_selection` 1 本に通す = SSoT)。
         self.selection.device_anchor = outcome.result_ids.last().copied();
-        self.selection.last_edit_select = Some(EditSurface::Devices);
+        self.set_device_selection(outcome.result_ids);
         self.focus_inspector_track(dest_track);
     }
 
@@ -1371,27 +1371,32 @@ impl AppData {
     /// copy 本体。最新 state 込みの live song から該当 device を serialize して
     /// `pending_clipboard_write` に積む (view が次フレーム OS clipboard へ flush)。
     pub(crate) fn copy_devices_inner(&mut self, device_ids: &[u64]) {
-        let Some((json, count, dropped)) = self.serialize_devices_to_envelope(device_ids) else {
-            return;
-        };
-        self.ui_ephemeral.pending_clipboard_write = Some(json);
-        self.ui_ephemeral.status_message = match dropped {
-            0 => format!("コピー: {count} プラグイン"),
-            n => format!(
-                "クリップボードには大きすぎるため {n} 件のプラグイン設定を除いて\
-                 コピーしました (ドラッグで運ぶと設定ごと移せます)"
-            ),
-        };
+        self.write_devices_to_clipboard(device_ids, "コピー");
     }
 
     /// cut 本体。serialize → `pending_clipboard_write` → 削除。呼び出し側で
     /// undo snapshot 済み (deferred 経由 or 即時 fallback)。
     pub(crate) fn cut_devices_inner(&mut self, device_ids: &[u64]) {
-        self.copy_devices_inner(device_ids);
-        if let Some(msg) = self.ui_ephemeral.status_message.strip_prefix("コピー: ") {
-            self.ui_ephemeral.status_message = format!("カット: {msg}");
-        }
+        self.write_devices_to_clipboard(device_ids, "カット");
         self.remove_devices_inner(device_ids);
+    }
+
+    /// copy / cut 共通: serialize して `pending_clipboard_write` に積み、
+    /// status を出す。 `verb` は「コピー」/「カット」。
+    fn write_devices_to_clipboard(&mut self, device_ids: &[u64], verb: &str) {
+        let Some((json, count, dropped)) = self.serialize_devices_to_envelope(device_ids) else {
+            return;
+        };
+        self.ui_ephemeral.pending_clipboard_write = Some(json);
+        self.ui_ephemeral.status_message = if dropped == 0 {
+            format!("{verb}: {count} プラグイン")
+        } else {
+            // 黙って切らない — 「貼ったら音色が違う」の原因が見えなくなる。
+            format!(
+                "クリップボードには大きすぎるため {dropped} 件のプラグイン設定を除いて\
+                 {verb}しました (ドラッグで運ぶと設定ごと移せます)"
+            )
+        };
     }
 
     /// 指定 device 群を `DeviceCopy` list に組み立てて envelope へ入れる。
@@ -1456,7 +1461,7 @@ impl AppData {
     /// Ctrl+V (device 面)。貼り先は「いまインスペクタに出ているチェーン」で、
     /// 挿入位置は **選んでいるプラグインの直前**、選択が無ければ末尾 (Ableton 流)。
     /// 戻り値は貼り付けた件数。
-    pub(crate) fn paste_devices(
+    pub fn paste_devices(
         &mut self,
         devices: Vec<crate::clipboard::DeviceCopy>,
         dest_track: u32,
@@ -1523,10 +1528,11 @@ impl AppData {
             self.restore_device(&inst);
         }
         self.flush_song_sync();
-        self.selection.selected_device_ids = created.iter().map(|d| d.id).collect();
+        // 貼った device を選択に倒す (更新は `set_device_selection` 1 本に通す)。
         self.selection.device_anchor = created.last().map(|d| d.id);
-        self.selection.last_edit_select = Some(EditSurface::Devices);
-        created.len()
+        let n = created.len();
+        self.set_device_selection(created.into_iter().map(|d| d.id).collect());
+        n
     }
 
     // -------- r.md #71: device 選択 ----------------------------------------
@@ -1557,7 +1563,7 @@ impl AppData {
     /// (行 click / 運搬 / 貼り付けの結果)。 空になったら last-wins タグを降ろす
     /// — 残すと `edit_surface` が Devices を返し続け、 次の Delete が
     /// 「実在 0 件」 で空振りして他の面の削除まで殺す。
-    pub(crate) fn set_device_selection(&mut self, ids: Vec<u64>) {
+    pub fn set_device_selection(&mut self, ids: Vec<u64>) {
         self.selection.selected_device_ids = ids;
         if self.selection.selected_device_ids.is_empty() {
             if self.selection.last_edit_select == Some(EditSurface::Devices) {
@@ -1626,9 +1632,8 @@ fn relocate_in_song(
     if targets.is_empty() {
         return None;
     }
-    if song.fx_chain_by_track_id(dest_track).is_none() {
-        return None;
-    }
+    // 落とし先チェーンが無ければ中止 (存在確認だけで値は使わない)。
+    song.fx_chain_by_track_id(dest_track)?;
     // 同一チェーン内の移動は「並べ替え」として正当なので、 無変化の早期 return は
     // しない (普通に処理する)。
 
@@ -1674,7 +1679,7 @@ fn relocate_in_song(
         .filter(|&&(_, t, i)| t == dest_track && i < dest_index)
         .count();
     // src チェーンごとに index 降順で抜く (前から抜くと後続の index がずれる)。
-    targets.sort_by(|a, b| b.2.cmp(&a.2));
+    targets.sort_by_key(|t| std::cmp::Reverse(t.2));
     let mut taken: Vec<(common::model::PluginInstance, u32)> = Vec::new();
     for &(_, src_track, index) in &targets {
         let Some(chain) = song.fx_chain_by_track_id_mut(src_track) else {

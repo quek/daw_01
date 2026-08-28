@@ -483,6 +483,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             1,
         )
         .function(
+            NativeFunction::from_fn_ptr(daw_relocate_devices),
+            js_string!("relocateDevices"),
+            5,
+        )
+        .function(
             NativeFunction::from_fn_ptr(daw_set_selection),
             js_string!("setSelection"),
             1,
@@ -1250,6 +1255,48 @@ fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     })
     .map_err(|e| js_native(format!("deviceChain: serialize: {e}")))?;
     Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.relocateDevices(srcTrack, srcIndicesJson, destTrack, destIndex, copy)`
+/// — r.md #71 (プラグインのコピー / 移動) の運搬を script から起こす。
+///
+/// device のアドレス指定は script の慣習に合わせて **「n 番目の device」**
+/// (`resolve_device_id` が安定 id に直す)。 `srcIndices` は `[0, 2]` のような
+/// JSON 配列で、チェーン表示順に並べて渡す。
+///
+/// 呼ぶのは `relocate_devices_inner` (= Song 側処理) で、
+/// [`AppData::relocate_devices`] の **plugin state round-trip 待ち**は経由しない。
+/// script mode には `AllPluginStates` を pump する口が無く、待たせると永久に
+/// 完了しないため。 round-trip 込みの経路は headless test
+/// (`daw_gui/tests/app_state/device_relocate.rs`) が応答を fake して押さえている。
+fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let src_track = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let indices_json = arg_to_string(args, 1, ctx)?;
+    let dest_track = u32::try_from_js(args.get_or_undefined(2), ctx)?;
+    let dest_index = u32::try_from_js(args.get_or_undefined(3), ctx)?;
+    let copy = bool::try_from_js(args.get_or_undefined(4), ctx).unwrap_or(false);
+    let indices: Vec<u32> = serde_json::from_str(&indices_json)
+        .map_err(|e| js_native(format!("relocateDevices: parse indices: {e}")))?;
+    with_host(|h| -> JsResult<()> {
+        let mut device_ids = Vec::with_capacity(indices.len());
+        for index in indices {
+            let Some(id) = h.resolve_device_id(src_track, index) else {
+                return Err(js_native(format!(
+                    "relocateDevices: no device at (track {src_track}, index {index})"
+                )));
+            };
+            device_ids.push(id);
+        }
+        h.app
+            .relocate_devices_inner(&crate::app::RelocateDevices {
+                device_ids,
+                dest_track,
+                dest_index,
+                copy,
+            });
+        Ok(())
+    })?;
+    Ok(JsValue::undefined())
 }
 
 fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

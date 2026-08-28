@@ -481,55 +481,53 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     );
 }
 
-/// The reorder re-keys daw_gui's positional caches, and a failed/in-flight
-/// plugin load can leave a phantom in the song that the caches do not have.
-/// Applying the reorder then would skew the cache re-keying, so the reorder
-/// must be a no-op (UI snaps back) unless the track's whole chain is
-/// consistently loaded.
+/// r.md #71 (プラグインのコピー / 移動): 旧実装は「チェーンが完全にロード済で
+/// なければ並べ替えを no-op にする」制約を持っていた。 理由は **positional cache の
+/// 再キーがずれる** ことで、 帳簿が安定 `device_id` keyed になった今その理由は消えた
+/// (並べ替えても帳簿のキーは動かない)。 いまはロード失敗 / 進行中の device が混じって
+/// いても素直に並べ替わる — その回帰を固定する。
 #[test]
-fn inspector_chain_reorder_aborts_when_chain_not_fully_loaded() {
+fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
     let (track_id, _devs) = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
 
-    // Inject a PHANTOM 4th device: present in the song (and the inspector chain)
-    // but never reported loaded, mimicking a plugin whose load failed.
+    // 「song には居るが host には載っていない」 device (= load 失敗 / 進行中) を混ぜる。
     app.edit_song(|song| {
+        let id = song.alloc_device_id();
         song.tracks
             .iter_mut()
             .find(|t| t.id == track_id)
             .unwrap()
             .devices
-            .push(common::model::PluginInstance::new(
-                "test.delay".into(),
-                common::plugin_format::PluginFormat::Clap,
-            ));
+            .push(common::model::PluginInstance {
+                id,
+                ..common::model::PluginInstance::new(
+                    "test.delay".into(),
+                    common::plugin_format::PluginFormat::Clap,
+                )
+            });
     });
-    let before: Vec<String> = app.song_doc.song().tracks[0]
-        .devices
-        .iter()
-        .map(|p| p.plugin_id.clone())
-        .collect();
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
 
-    // Try to swap indices 1 and 2 over the 4-item chain [synth, bitcrush, delay, phantom].
+    // [synth, bitcrush, delay, phantom] の index 1 と 2 を入れ替える。
     app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1, 3]));
 
-    // No song mutation and no child IPC.
     let after: Vec<String> = app.song_doc.song().tracks[0]
         .devices
         .iter()
         .map(|p| p.plugin_id.clone())
         .collect();
-    assert_eq!(before, after, "reorder must be a no-op on an inconsistent chain");
+    assert_eq!(
+        after,
+        vec!["test.synth", "test.delay", "test.bitcrush", "test.delay"],
+        "未ロード device が混じっていても並べ替わる"
+    );
+    // plugin_host へは何も送らない (host は順序を持たない)。 audio へは epoch flush で
+    // LoadSong が飛ぶが、 この test は明示 flush しないので何も出ない。
     let plugin_msgs = drain(&mut plugin_rx);
-    let audio_msgs = drain(&mut audio_rx);
     assert!(
         plugin_msgs.is_empty(),
-        "no plugin_host IPC may result from an aborted reorder: {plugin_msgs:?}"
-    );
-    assert!(
-        audio_msgs.is_empty(),
-        "no daw_audio IPC may result from an aborted reorder: {audio_msgs:?}"
+        "並べ替えは plugin_host への IPC を伴わない: {plugin_msgs:?}"
     );
 }

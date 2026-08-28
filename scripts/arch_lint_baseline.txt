@@ -17,15 +17,9 @@
 #
 # 直した行は「解消」として通知されるので、この行を削除すること (ゲートは落ちない)。
 
-# --- 不変条件 1 (安定 id addressing) 違反 4 件 ---------------------------------
-# 2026-08-22、arch-lint の backslash バグ (make 経由で 8 検査中 6 つが無効化されていた)
-# を直した結果、はじめて表に出たもの。オーケストレータが中身を確認済み。
-#
-# 理由: キーが (track_id, slot) で slot は chain 内の位置。doc コメント自身が
-#       insert / reorder / remove / clear と同じ箇所で維持すると書いており、
-#       不変条件 1 が禁じる「削除/並べ替えで参照を貼り替える補償コード」に当たる。
-# いつ消えるか: **未起票 / r.md への起票をユーザーへ提案済み**。
-POSITIONAL-KEY | daw_gui/src/app_types.rs | 272f099ddc56 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
-POSITIONAL-KEY | daw_gui/src/state/ipc.rs | be0f1cffa184 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
-POSITIONAL-KEY | daw_gui/src/state/ipc.rs | 282943df8643 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
-POSITIONAL-KEY | daw_gui/src/state/ipc.rs | 140a8b678882 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
+# (2026-08-28) 不変条件 1 (安定 id addressing) の負債 4 件は r.md #71
+# (プラグインのコピー / 移動) §A で完済した。 daw_gui の per-device 帳簿と device を
+# 運ぶ `AppEvent` を positional `(track_id, device_index)` から安定 `device_id` へ
+# 全面置換し、貼り替え補償コード 3 関数を削除している。 あわせて検査自体も
+# 「1 行の `HashMap<(u32, u32)` しか見ない」状態から **連想コンテナのタプルキー
+# (折り返し定義を含む)** を漏れなく見る awk へ作り直した (§A-10)。

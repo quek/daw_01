@@ -108,6 +108,9 @@ mod tests {
         PointerFrame {
             pos: Some((x, y)),
             primary_pressed: pressed,
+            // 押していないフレーム = このフレームに離した、として扱う
+            // (host の自動キャンセル hook は `primary_just_released` を見る)。
+            primary_just_released: !pressed,
             ..PointerFrame::default()
         }
     }
@@ -171,7 +174,10 @@ mod tests {
             &(),
             &mut scene,
             screen,
-            FrameInput::default(),
+            FrameInput {
+                pointer: PointerFrame { pos: Some((10.0, 10.0)), ..PointerFrame::default() },
+                ..FrameInput::default()
+            },
             |(), ui| assert!(ui.dragging_kind().is_none(), "release 後は自動キャンセル"),
         );
     }

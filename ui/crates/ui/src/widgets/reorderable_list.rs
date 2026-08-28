@@ -442,7 +442,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // アコーディオンが開いていても indicator が行とずれない。
         let external_insert_at: Option<usize> = accept_drag_kind
             .filter(|k| self.dragging_kind() == Some(*k))
-            .and_then(|_| pointer.pos)
+            .and(pointer.pos)
             .filter(|&(px, py)| rect.contains(px, py))
             .map(|(_px, py)| {
                 let local_y = py - rect.y + self.scroll_offset(("reorderable_list_scroll", &id)).1;
@@ -716,7 +716,7 @@ mod tests {
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
-    use daw_ui_platform::PhysicalSize;
+    use daw_ui_platform::{Modifiers, PhysicalSize};
     use daw_ui_renderer::{Rect, Scene};
 
     use super::{ReorderableListEditRequest, ReorderableListStyle};
@@ -1094,5 +1094,432 @@ mod tests {
         // row 2 の base top = row0(28) + row1(26+100+2=128) = ... tops[2] = 28 + 128 = 156。
         // (tops[0]=0, tops[1]=28, tops[2]=28+(26+100+2)=156)
         assert!((row2_y.get() - 156.0).abs() < 0.01, "row2 は展開分ずれる (got {})", row2_y.get());
+    }
+
+    // ==========================================================
+    // r.md #71 (プラグインのコピー / 移動)
+    // ==========================================================
+
+    /// list の rect (200x200 に 5 row)。全 test で共有する固定ジオメトリ。
+    const RL_RECT: Rect = Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 };
+
+    /// 1 frame 回して response を返す小道具 (以降の test はこれだけを使う)。
+    /// 引数は `reorderable_list` の引数をそのまま素通しするので多い。
+    #[allow(clippy::too_many_arguments)]
+    fn run_frame(
+        host: &mut UiHost<()>,
+        scene: &mut Scene,
+        items: &[u32],
+        selected: &[usize],
+        accept: Option<&'static str>,
+        style: &ReorderableListStyle,
+        pointer: PointerFrame,
+        before: impl FnOnce(&mut crate::ui::Ui<'_, ()>),
+    ) -> super::ReorderableListResponse {
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let out: std::cell::RefCell<Option<super::ReorderableListResponse>> =
+            std::cell::RefCell::new(None);
+        host.frame_to_edits(
+            &(),
+            scene,
+            screen,
+            FrameInput { pointer, ..Default::default() },
+            |(), ui| {
+                before(ui);
+                let r = ui.reorderable_list(
+                    "rl",
+                    RL_RECT,
+                    items,
+                    selected,
+                    accept,
+                    style,
+                    |_| Edit::mutate(|()| {}),
+                    |_, _, _, _, _, _| {},
+                );
+                *out.borrow_mut() = Some(r);
+            },
+        );
+        out.into_inner().expect("response")
+    }
+
+    /// 複数選択がハイライトされる (`selected: &[usize]`)。
+    /// 行の背景が `row_bg_selected` になっているかで見る。
+    #[test]
+    fn selected_slice_highlights_multiple_rows() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[1, 3],
+            None,
+            &style,
+            PointerFrame::default(),
+            |_| {},
+        );
+        let selected_bgs = scene
+            .rects_vec()
+            .iter()
+            .filter(|r| r.fill == style.row_bg_selected)
+            .count();
+        assert_eq!(selected_bgs, 2, "選択された 2 行がハイライトされる");
+    }
+
+    /// 掴んだまま **横へ** `CARRY_OUT_MARGIN_PX` を超えて出すと `dragged_out` が
+    /// 1 度だけ立ち、`Reorder` Edit は発行されない。
+    #[test]
+    fn horizontal_carry_out_sets_dragged_out_and_cancels_reorder() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        let reordered = Arc::new(Mutex::new(false));
+        let reordered_clo = reordered.clone();
+        // `frame_to_edits` は Edit を **返すだけで適用しない** ので、記録は
+        // Edit の中ではなく make_edit が呼ばれた事実そのもので取る
+        // (= `Reorder` が発行されたか)。
+        let make_edit = move |_req: ReorderableListEditRequest| -> Edit<()> {
+            *reordered_clo.lock().unwrap() = true;
+            Edit::mutate(|()| {})
+        };
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let mut frame = |pointer: PointerFrame| -> super::ReorderableListResponse {
+            let out: Cell<Option<usize>> = Cell::new(None);
+            let mut resp = super::ReorderableListResponse::default();
+            let captured: std::cell::RefCell<Option<super::ReorderableListResponse>> =
+                std::cell::RefCell::new(None);
+            host.frame_to_edits(
+                &(),
+                &mut scene,
+                screen,
+                FrameInput { pointer, ..Default::default() },
+                |(), ui| {
+                    let r = ui.reorderable_list(
+                        "rl",
+                        RL_RECT,
+                        &items,
+                        &[],
+                        None,
+                        &style,
+                        make_edit.clone(),
+                        |_, _, _, _, _, _| {},
+                    );
+                    out.set(r.dragged_out);
+                    *captured.borrow_mut() = Some(r);
+                },
+            );
+            if let Some(r) = captured.into_inner() {
+                resp = r;
+            }
+            resp
+        };
+        // press row 1。
+        let r = frame(PointerFrame {
+            pos: Some((100.0, 40.0)),
+            primary_just_pressed: true,
+            primary_pressed: true,
+            ..PointerFrame::default()
+        });
+        assert!(r.dragged_out.is_none(), "press だけでは運び出さない");
+        // 横へ大きく外す (x = -60 は rect.x - 24 より外)。
+        let r = frame(PointerFrame {
+            pos: Some((-60.0, 40.0)),
+            primary_pressed: true,
+            ..PointerFrame::default()
+        });
+        assert_eq!(r.dragged_out, Some(1), "横へ出た frame で dragged_out");
+        // 次フレームは session が消えているので二度は立たない。
+        let r = frame(PointerFrame {
+            pos: Some((-70.0, 40.0)),
+            primary_pressed: true,
+            ..PointerFrame::default()
+        });
+        assert!(r.dragged_out.is_none(), "dragged_out は 1 度だけ");
+        // release しても Reorder は出ない (session は破棄済み)。
+        frame(PointerFrame {
+            pos: Some((-70.0, 40.0)),
+            primary_just_released: true,
+            ..PointerFrame::default()
+        });
+        assert!(!*reordered.lock().unwrap(), "運び出した drag は Reorder を発行しない");
+    }
+
+    /// **縦に**リスト外へ出しても `dragged_out` は立たず、release で `Reorder` が出る
+    /// (= 並べ替えを壊さない回帰テスト。 y は reorder gesture の 1 次元軸)。
+    #[test]
+    fn vertical_overshoot_still_reorders() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        let reordered = Arc::new(Mutex::new(false));
+        let reordered_clo = reordered.clone();
+        // `frame_to_edits` は Edit を **返すだけで適用しない** ので、記録は
+        // Edit の中ではなく make_edit が呼ばれた事実そのもので取る
+        // (= `Reorder` が発行されたか)。
+        let make_edit = move |_req: ReorderableListEditRequest| -> Edit<()> {
+            *reordered_clo.lock().unwrap() = true;
+            Edit::mutate(|()| {})
+        };
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let dragged_out = Cell::new(None::<usize>);
+        let mut frame = |pointer: PointerFrame| {
+            host.frame_to_edits(
+                &(),
+                &mut scene,
+                screen,
+                FrameInput { pointer, ..Default::default() },
+                |(), ui| {
+                    let r = ui.reorderable_list(
+                        "rl",
+                        RL_RECT,
+                        &items,
+                        &[],
+                        None,
+                        &style,
+                        make_edit.clone(),
+                        |_, _, _, _, _, _| {},
+                    );
+                    if r.dragged_out.is_some() {
+                        dragged_out.set(r.dragged_out);
+                    }
+                },
+            );
+        };
+        frame(PointerFrame {
+            pos: Some((100.0, 12.0)),
+            primary_just_pressed: true,
+            primary_pressed: true,
+            ..PointerFrame::default()
+        });
+        // リストの下端 (200) を大きく越える。x はリスト内のまま。
+        frame(PointerFrame {
+            pos: Some((100.0, 400.0)),
+            primary_pressed: true,
+            ..PointerFrame::default()
+        });
+        assert!(dragged_out.get().is_none(), "縦のはみ出しでは運び出さない");
+        frame(PointerFrame {
+            pos: Some((100.0, 400.0)),
+            primary_just_released: true,
+            ..PointerFrame::default()
+        });
+        assert!(*reordered.lock().unwrap(), "縦へ振り切った drag は Reorder を出す");
+    }
+
+    /// 横に出しても余白 (`CARRY_OUT_MARGIN_PX`) 以内なら運び出さない
+    /// (幅の狭いチェーンで指が数 px ぶれても並べ替えが失われない)。
+    #[test]
+    fn small_horizontal_jitter_does_not_carry_out() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            None,
+            &style,
+            PointerFrame {
+                pos: Some((100.0, 40.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        // rect.x + rect.w = 200、余白 24 なので 210 はまだ内側扱い。
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            None,
+            &style,
+            PointerFrame {
+                pos: Some((210.0, 40.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        assert!(r.dragged_out.is_none(), "余白以内の横ぶれでは運び出さない");
+    }
+
+    /// 外部 drag は行の中点で挿入位置が切り替わり、release で `external_dropped_at` になる。
+    #[test]
+    fn external_drag_insert_position_and_drop() {
+        const KIND: &str = "test.external";
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        // row_total_h = 26 + 2 = 28。 row0 の中点は y=13、row1 の中点は 28+13=41。
+        let begin = |ui: &mut crate::ui::Ui<'_, ()>| ui.begin_drag(KIND, 1u32);
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            Some(KIND),
+            &style,
+            PointerFrame {
+                pos: Some((100.0, 10.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            begin,
+        );
+        assert_eq!(r.external_insert_at, Some(0), "row0 の中点より上 → 手前に挿入");
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            Some(KIND),
+            &style,
+            PointerFrame {
+                pos: Some((100.0, 20.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        assert_eq!(r.external_insert_at, Some(1), "row0 の中点より下 → 後ろに挿入");
+        assert!(r.external_dropped_at.is_none(), "押している間は drop しない");
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            Some(KIND),
+            &style,
+            PointerFrame {
+                pos: Some((100.0, 20.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        assert_eq!(r.external_dropped_at, Some(1), "release で drop 確定");
+    }
+
+    /// ポインタが `rect` の外にあるフレームは `external_insert_at` が `None` で、
+    /// そこで release しても `external_dropped_at` は立たない
+    /// (= アレンジのトラックヘッダへ落とす経路との幾何的排他の担保)。
+    #[test]
+    fn external_drag_outside_rect_is_inert() {
+        const KIND: &str = "test.external";
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            Some(KIND),
+            &style,
+            PointerFrame {
+                pos: Some((500.0, 300.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            |ui| ui.begin_drag(KIND, 1u32),
+        );
+        assert!(r.external_insert_at.is_none(), "リストの外では indicator を出さない");
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            Some(KIND),
+            &style,
+            PointerFrame {
+                pos: Some((500.0, 300.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        assert!(r.external_dropped_at.is_none(), "リストの外の release では drop しない");
+    }
+
+    /// `clicked_modifiers` は **press フレーム** の修飾キー。
+    /// release フレームで Ctrl を離しても Ctrl+click として解決できる。
+    #[test]
+    fn clicked_modifiers_come_from_press_frame() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::default() };
+        run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            None,
+            &style,
+            PointerFrame {
+                pos: Some((100.0, 40.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: ctrl,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            None,
+            &style,
+            PointerFrame {
+                pos: Some((100.0, 40.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            |_| {},
+        );
+        assert_eq!(r.clicked, Some(1));
+        assert!(
+            r.clicked_modifiers.ctrl,
+            "release で Ctrl が落ちても press フレームの値を返す"
+        );
+    }
+
+    /// `row_rects` に描いた行の画面座標が入る (caller が context_menu を重ねる contract)。
+    #[test]
+    fn row_rects_report_drawn_rows() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..5).collect();
+        let r = run_frame(
+            &mut host,
+            &mut scene,
+            &items,
+            &[],
+            None,
+            &style,
+            PointerFrame::default(),
+            |_| {},
+        );
+        assert_eq!(r.row_rects.len(), 5, "可視 5 行ぶん返る");
+        assert_eq!(r.row_rects[0].0, 0);
+        assert!((r.row_rects[0].1.y - RL_RECT.y).abs() < 0.01);
+        assert!(
+            (r.row_rects[1].1.y - (RL_RECT.y + style.row_height + style.row_gap)).abs() < 0.01,
+            "row1 は row_total_h ぶん下"
+        );
     }
 }

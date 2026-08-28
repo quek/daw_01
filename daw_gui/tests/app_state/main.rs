@@ -16,6 +16,7 @@
 mod support;
 
 mod clip_rename;
+mod device_relocate;
 mod dirty_guard;
 mod group_track_lifecycle;
 mod linked_clip_bounds;

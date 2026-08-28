@@ -173,7 +173,7 @@ impl AppData {
     /// 経路すべてに掃除を挿す (= 貼り替え補償コード、 不変条件 1 が禁じる形) のでは
     /// なく、 **読む側で毎回正規化する**。 [`Self::live_track_ids`] と同じ流儀。
     #[must_use]
-    pub(crate) fn live_device_ids(&self) -> Vec<u64> {
+    pub fn live_device_ids(&self) -> Vec<u64> {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
         };

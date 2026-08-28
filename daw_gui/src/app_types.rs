@@ -1660,8 +1660,9 @@ pub enum ClipboardCopyRequest {
 }
 
 /// state 取得が完了したあとに plugin-main thread へ実行させる編集。
-/// track index ではなく **stable な `track_id`** で持つので、 pending
-/// 中に他の編集が track の Vec position をずらしても整合性が保たれる。
+/// 対象は **すべて安定 id** (`track_id` / `device_id`) で持つので、 pending 中に
+/// 他の編集が track / device の Vec position をずらしても整合性が保たれる
+/// (r.md #71 で device 側も positional index から id へ移行)。
 #[derive(Debug, Clone)]
 pub enum DeferredEdit {
     /// トラック削除 (r.md #43)。 選択集合を **1 件にまとめて** 持つ — id ごとに

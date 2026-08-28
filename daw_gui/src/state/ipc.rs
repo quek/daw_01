@@ -169,7 +169,7 @@ pub struct IpcState {
     /// `select_plugin_from_db` と device コピー (r.md #71) が `device_id` を積む。
     /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
     /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
-    pub(crate) pending_added_plugin_finalize: std::collections::HashMap<u64, bool>,
+    pub pending_added_plugin_finalize: std::collections::HashMap<u64, bool>,
     /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
     /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
     /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム

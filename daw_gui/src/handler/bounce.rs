@@ -114,8 +114,8 @@ impl AppData {
     /// 混ざらない)。`bypass_inserts == true` (Bounce In Place) のとき、残すトラックの
     /// insert FX device (= `ports.has_audio_input`) を `PortConfig::default()` で中和して
     /// 「音源/synth の素の音」だけにする。**device は削除しない**: engine は plugin を
-    /// `(track_id, device_index)` で解決し LoadSong では re-key されないため、index を
-    /// 保ったまま ports を空にして dispatch を無害化する。元トラックの mute も解除する
+    /// 安定 `device_id` で解決するので、device を消すと host 側 instance との対応が
+    /// 切れる。並びを保ったまま ports を空にして dispatch を無害化する。元トラックの mute も解除する
     /// (= 元トラックが with-FX bounce で mute 済みでも isolate render は鳴らす)。
     pub(crate) fn isolated_bounce_song(&self, target: ClipRef, bypass_inserts: bool) -> Option<Song> {
         let track = self.song_doc.song().tracks.get(target.track as usize)?;
