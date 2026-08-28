@@ -200,23 +200,92 @@ fn ink_pixels(rgba: &[u8], band: Rect) -> usize {
         .count()
 }
 
+/// sRGB バイトから WCAG relative luminance (`theme_visual.rs` と同じ換算)。
+fn luminance(c: [u8; 3]) -> f32 {
+    let lin = |v: u8| daw_ui_core::theme::srgb_to_linear(f32::from(v) / 255.0);
+    0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2])
+}
+
+/// WCAG コントラスト比 (1.0 = 同色、21.0 = 黒白)。
+fn contrast(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// `path` (曲線上の screen 座標列) のピクセルが、その帯の背景に対して
+/// どれだけ contrast を持っているか。**「線が見えるか」の尺度**。
+///
+/// 「背景でないピクセルが在る」だけでは足りない — 可変背景の上に固定色を重ねると
+/// 「描かれてはいるが見えない」が起きる (memory
+/// `feedback_ui_indicator_contrast_on_variable_bg`)。
+fn path_contrast(rgba: &[u8], path: &[(f32, f32)], band: Rect) -> f32 {
+    let bg = modal_color(rgba, band);
+    let mut best: f32 = 1.0;
+    for &(x, y) in path {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (xi, yi) = (x.max(0.0) as u32, y.max(0.0) as u32);
+        if xi >= W || yi >= H {
+            continue;
+        }
+        // 線は AA が乗るので、狙った点の上下 2px から一番コントラストの高い画素を採る。
+        for dy in -2_i32..=2 {
+            let yy = yi as i32 + dy;
+            if yy < 0 || yy >= H as i32 {
+                continue;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let i = ((yy as u32 * W + xi) * 4) as usize;
+            best = best.max(contrast([rgba[i], rgba[i + 1], rgba[i + 2]], bg));
+        }
+    }
+    best
+}
+
+fn modal_color(rgba: &[u8], band: Rect) -> [u8; 3] {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (x0, y0) = (band.x.max(0.0) as u32, band.y.max(0.0) as u32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (x1, y1) = (((band.x + band.w) as u32).min(W), ((band.y + band.h) as u32).min(H));
+    let mut hist: HashMap<[u8; 3], usize> = HashMap::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y * W + x) * 4) as usize;
+            *hist.entry([rgba[i], rgba[i + 1], rgba[i + 2]]).or_insert(0) += 1;
+        }
+    }
+    *hist.iter().max_by_key(|(_, n)| **n).expect("帯が空でない").0
+}
+
 /// **r.md #73 の回帰**: Alt hover で automation の曲線が消えない (ダーク)。
 #[test]
 fn alt_hover_on_the_curve_does_not_erase_it() {
-    check_alt_hover_keeps_the_curve("dark");
+    check_alt_hover_keeps_the_curve("dark", false);
 }
 
 /// 同じことをライトテーマでも見る (レーン背景は可変で、極性が反転する)。
 #[test]
 fn alt_hover_on_the_curve_does_not_erase_it_in_light_theme() {
-    check_alt_hover_keeps_the_curve("light");
+    check_alt_hover_keeps_the_curve("light", false);
 }
 
-fn check_alt_hover_keeps_the_curve(theme_id: &str) {
+/// **クリップを選択した状態** (= 塗りが選択色に変わり背景の明度が跳ね上がる) でも消えない。
+/// 強調は固定の色トークンなので、背景が明るい側へ振れると contrast を失いうる。
+#[test]
+fn alt_hover_on_the_curve_does_not_erase_it_when_the_clip_is_selected() {
+    check_alt_hover_keeps_the_curve("dark", true);
+    check_alt_hover_keeps_the_curve("light", true);
+}
+
+fn check_alt_hover_keeps_the_curve(theme_id: &str, select_clip: bool) {
     let (mut app, _rx) = build_app();
     app.handle_event(AppEvent::SetTheme(theme_id.to_string()));
     assert_eq!(app.theme.id, theme_id, "テーマが適用されている");
     add_automation_lane(&mut app);
+    if select_clip {
+        app.selection.selected_automation_clips =
+            vec![common::model::AutomationClipKey { track: 1, lane: 1, clip: 1 }];
+    }
     let mut host: UiHost<AppData> = UiHost::no_redraw();
     if host.set_palette(app.theme.core.clone()) {
         host.invalidate_scene_cache();
@@ -287,15 +356,45 @@ fn check_alt_hover_keeps_the_curve(theme_id: &str) {
         let save = |name: &str, buf: &[u8]| {
             let _ = image::save_buffer(dir.join(name), buf, W, H, image::ColorType::Rgba8);
         };
-        save(&format!("{theme_id}_plain.png"), &plain_px);
-        save(&format!("{theme_id}_alt.png"), &alt_px);
+        let sel = if select_clip { "_selected" } else { "" };
+        save(&format!("{theme_id}{sel}_plain.png"), &plain_px);
+        save(&format!("{theme_id}{sel}_alt.png"), &alt_px);
     }
+    let tag = if select_clip { "選択中" } else { "非選択" };
     let plain_ink = ink_pixels(&plain_px, band);
     let alt_ink = ink_pixels(&alt_px, band);
-    assert!(plain_ink > 0, "[{theme_id}] 前提: 修飾なしで曲線のピクセルが見えている");
+    assert!(plain_ink > 0, "[{theme_id}/{tag}] 前提: 修飾なしで曲線のピクセルが見えている");
     assert!(
         alt_ink >= plain_ink,
-        "[{theme_id}] Alt hover で曲線が消えている (pixel): \
+        "[{theme_id}/{tag}] Alt hover で曲線が消えている (pixel): \
          修飾なし {plain_ink}px → Alt {alt_ink}px"
+    );
+
+    // **描かれているだけでなく見えているか** — 曲線上のピクセルの背景に対する contrast。
+    // 可変背景 (テーマ / lane 色 / 選択) の上に固定色を重ねると
+    // 「Scene には在るのに目には消えている」が起きる。
+    let hovered_path: Vec<(f32, f32)> = {
+        // 強調が乗った区間 = 幅 2.25 の batch。 その線分の中点を辿る。
+        let b = hovered
+            .iter_lines()
+            .find(|b| (b.line_width_px - 2.25).abs() < 1e-3)
+            .expect("Alt hover で強調 batch が出ている");
+        b.segments.iter().map(|s| ((s.a[0] + s.b[0]) * 0.5, (s.a[1] + s.b[1]) * 0.5)).collect()
+    };
+    let plain_contrast = path_contrast(&plain_px, &hovered_path, band);
+    let alt_contrast = path_contrast(&alt_px, &hovered_path, band);
+    eprintln!(
+        "[{theme_id}/{tag}] contrast 修飾なし {plain_contrast:.2} → Alt {alt_contrast:.2} \
+         (ink {plain_ink} → {alt_ink})"
+    );
+    // WCAG の非テキスト最低要件 3:1 を下回ったら「見えない」と判定する。
+    assert!(
+        plain_contrast >= 3.0,
+        "[{theme_id}/{tag}] 前提: 修飾なしの曲線が背景に対して見えている ({plain_contrast:.2}:1)"
+    );
+    assert!(
+        alt_contrast >= 3.0,
+        "[{theme_id}/{tag}] Alt hover の強調が背景に埋もれて見えない \
+         ({plain_contrast:.2}:1 → {alt_contrast:.2}:1)"
     );
 }

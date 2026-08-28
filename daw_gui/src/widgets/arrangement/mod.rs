@@ -1187,6 +1187,12 @@ pub struct ArrangementStyle {
     pub automation_curve_segment_hit_px: f32,
     /// r.md #73: Alt hover 中に「曲げられる区間」を強調する色
     /// (どこを掴むと何が起きるかの可視化)。
+    ///
+    /// **この色だけで線を描かないこと。** なぞる相手はレーンの塗り = lane 識別色 /
+    /// テーマ / 選択状態で変わる可変背景で、**選択中の automation clip の塗りは
+    /// `clip_selected_fill` = このトークンと同じ `selection_warm`** である。
+    /// 単色でなぞるとクリップ選択中に線が塗りと同化して消える (実機で報告)。
+    /// `render::draw_segment_polyline` が `ink_for` の逆極性インクで縁取る。
     pub automation_curve_bend_hover_color: Color,
     /// r.md #73: Alt+ドラッグ中の live preview 線の色 (旧
     /// `automation_curve_param_preview_color` を改名)。 cached curve の lane.color と

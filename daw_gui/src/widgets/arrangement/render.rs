@@ -940,7 +940,20 @@ struct ResolvedSegment<'a> {
     curve: common::model::AutomationCurve,
 }
 
-/// 1 区間を `curve::flatten_segment` で polyline 化して 1 本の線として押す。
+/// 1 区間を `curve::flatten_segment` で polyline 化し、**縁取り付き**で押す。
+///
+/// r.md #73: 縁取りが要るのは、なぞる相手が **可変背景** だから。 レーンの塗りは
+/// lane 識別色 / テーマ / **選択状態** で変わり、選択中の automation clip の塗りは
+/// `clip_selected_fill = p.selection_warm` — 強調 / preview に使う
+/// `automation_curve_bend_*_color` と **同じトークン**である。 単色でなぞると、
+/// クリップを選択したまま Alt hover した瞬間に線が塗りと同化して**消えて見えた**
+/// (実機で報告。`daw_gui/tests/automation_hover_visual.rs` が機械で止める)。
+///
+/// 解き方は point dot と同じ idiom — dot は `fill = ink_for(bg)` /
+/// `border = ink_for(fill)` の **逆極性の縁**を持つことで可変背景の上でも輪郭が残る。
+/// 線も同じで、アクセント色の下に逆極性のインクを 1px ずつはみ出させて敷く。
+/// これで背景がどちらの極性でも「線がそこに在る」ことは必ず読める
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
 fn draw_segment_polyline(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     seg: ResolvedSegment<'_>,
@@ -962,17 +975,23 @@ fn draw_segment_polyline(
     if pts.len() < 2 {
         return;
     }
-    let segments: Vec<daw_ui_renderer::LineSegment> = pts
-        .windows(2)
-        .map(|w| daw_ui_renderer::LineSegment {
-            a: [w[0].0, w[0].1],
-            b: [w[1].0, w[1].1],
-            color,
-        })
-        .collect();
-    hctx.push_lines(daw_ui_renderer::LineBatch {
-        segments: segments.into(),
-        line_width_px,
-        clip_rect: Some(seg.lane_rect),
-    });
+    let outline = hctx.palette().ink_for(color);
+    let mut push = |c: Color, w: f32| {
+        let segments: Vec<daw_ui_renderer::LineSegment> = pts
+            .windows(2)
+            .map(|p| daw_ui_renderer::LineSegment {
+                a: [p[0].0, p[0].1],
+                b: [p[1].0, p[1].1],
+                color: c,
+            })
+            .collect();
+        hctx.push_lines(daw_ui_renderer::LineBatch {
+            segments: segments.into(),
+            line_width_px: w,
+            clip_rect: Some(seg.lane_rect),
+        });
+    };
+    // 縁 → 本体の順 (call order = z 順)。 縁は両側に 1px ずつはみ出す幅。
+    push(outline, line_width_px + 2.0);
+    push(color, line_width_px);
 }
