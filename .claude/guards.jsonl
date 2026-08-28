@@ -115,10 +115,21 @@
 # 指示どおりだが、**判定が割れないよう「何を違反とみなすか」の SSoT は arch_lint.sh 側**に
 # 置く。ここはその write-time ミラーで、次の 2 点だけを arch-lint に合わせてある:
 #   - パターンの anchor (untagged は実属性のみ / positional key は HashMap<(u32,u32)>)
-#   - **コメント行を違反に数えない** (arch_lint.sh の strip_comments と同じ。撤去の
-#     経緯説明が doc comment に大量に残っており、数えると全部誤検知になる)
+#   - **コメント行を違反に数えない** (撤去の経緯説明が doc comment に大量に残っており、
+#     数えると全部誤検知になる)。**その判定の根拠は 2026-08-28 の r.md #76 以降
+#     `scripts/loc_budget.py` の Rust 字句解析**で、arch_lint.sh の strip_comments は
+#     `--filter-comments` を呼ぶだけになった。
 # 表記が違うのは意図的: arch-lint は shell 由来の argv 破壊を避けるためバックスラッシュを
-# 使わない POSIX 表記、こちらは Python re なので通常表記。**意味は同じ**。
+# 使わない POSIX 表記、こちらは Python re なので通常表記。
+# **行頭コメントについては意味は同じ。raw string の中の行頭 `//` と `/* … */` の中身では
+# 判定が割れ、そこは arch-lint の方が正確**である。割れ方は 2 方向あり、片方は安全側ではない:
+#   - `/* … */` の中の言及 … ガードは実コードと見て **nudge する** (arch-lint は数えない)。
+#     過剰な nudge なので安全側。
+#   - raw string の中の行頭 `//` … ガードは行頭 `//` をコメントと見て **見逃す**
+#     (arch-lint は実コードとして違反に数える)。**こちらは見逃す方向**。
+# それでもガードは `escalate: false` の write-time nudge に留めるので、**最終判定は
+# 常に arch-lint 側**が持つ (見逃しても commit 前の `make arch-lint` で赤くなる)。
+# ガードを block へ昇格させるときは、この非対称を先に潰すこと。
 # `push_undo_snapshot` 直呼びだけは arch-lint に無く、このガード固有。
 #
 # escalate:false — 編集テキストの行マッチなので、既存違反の行に触れただけでも当たる。

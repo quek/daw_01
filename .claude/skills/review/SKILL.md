@@ -74,7 +74,8 @@ UI スレッド (gui_01 の `UiHost::frame` / view の build closure / heavy() �
 - **アーキテクチャ不変条件** (CLAUDE.md 同名節): `make arch-lint` を実行し新規違反ゼロを確認。
   特に: positional index addressing の混入 / protocol への bulk 直載せ / 単一 enum への回帰 /
   RT の無限待ち / edit_song 迂回の song 変更 / live・export の二重実装 / daw-ui core への
-  ドメイン知識混入 / 3,000 行超ファイルの肥大継続
+  ドメイン知識混入 / baseline 済みのサイズ超過 (FILE-BUDGET / FN-BUDGET / FN-NESTING) を
+  更に太らせていないか
 
 ### 6. 問題の修正
 

@@ -412,13 +412,22 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 書く瞬間の強制は `.claude/guards.jsonl` の `arch-*` ルール (plan §11 の 5 件: INFINITE /
 positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToChild 復活)。
 **「何を違反とみなすか」の SSoT は `scripts/arch_lint.sh`**、ガードはその write-time ミラー。
+ただし **サイズ budget (FILE-BUDGET / FN-BUDGET / FN-NESTING) の測り方**と、
+**`strip_comments` を通す check (1/2/3/5/12) の「コメント内の言及は違反に数えない」の
+行分類**だけは `scripts/loc_budget.py` が持つ (Rust の字句解析が要るので shell の正規表現では
+表せない。UNTAGGED と COMMON-DEPS はパターン自体が行頭 anchor / Cargo.toml なので通さない)。
+その帰結として **python が無い / 壊れていると `make arch-lint` は全面停止する**
+(cargo-deny と同じ「skip の緑を作らない」原則)。
 
 **`make arch-lint` の exit 0 は「違反ゼロ、または `scripts/arch_lint_baseline.txt` に記録済みの
 ものだけ」を意味する。** baseline に無い違反が 1 件でもあれば exit 1 (行単位 ratchet)。
 以前は違反があっても常に exit 0 だったので、終了コードだけ見て「OK」と報告され続けていた。
 - 既知の負債は baseline に **理由と落とし所つきで 1 行**。fingerprint は行番号ではなく
-  マッチ行の内容ハッシュ (行番号は無関係な編集でずれる)。件数 baseline にはしない
-  (「1 件直して 1 件増やす」が素通りする)。
+  マッチ行の内容ハッシュ (行番号は無関係な編集でずれる)。**サイズ budget の行だけは
+  第 3 field が計測値の天井** (`/` 区切りの整数ベクトル。FILE/FN-BUDGET は実コード行、
+  FN-NESTING は 最大段数/6段以上の行数)。1 成分でも超えたら新規違反として表に出る
+  (path だけをキーにすると、baseline 済みのファイルが無制限に太れてしまう)。
+  件数 baseline にはしない (「1 件直して 1 件増やす」が素通りする)。
 - 直した行は「解消」として通知されるが **ゲートは落とさない** (良い変更を止めない)。
   baseline から削除すること。
 - **恒久的に正当な箇所は baseline ではなく行内マーカー** `// arch-lint: allow-<check>`。
@@ -456,8 +465,14 @@ positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToCh
    `WIRE_SOURCES` に必ず追加 (protocol 変更の検出網に穴が開く)。
 8. **daw-ui core はドメイン知識を持たない**: DAW 固有 widget (arrangement / piano_roll) は
    `daw_gui/src/widgets/` で `common::model` 直結。mirror 型・翻訳 request enum を作らない。
-9. **god file budget**: 手書き .rs は 1 ファイル 3,000 行以内。超過したら分割してから足す
-   (app.rs 25k 行の再発防止)。
+9. **サイズ budget**: **実コード行 (ncloc = 空白・コメント・doc comment を除いた物理行)** で
+   1 ファイル **1,000 行** / 1 関数 **300 行** / インデント **6 段**。超過したら分割してから
+   足す (app.rs 25k 行の再発防止)。**テストコードは対象外** (`#[cfg(test)]` の付いた item、
+   `#[cfg(test)] mod X;` が指すファイル、`tests/` `benches/` 直下)。
+   測り方の SSoT は `scripts/loc_budget.py` (Rust の字句解析。`wc -l` ではない —
+   物理行で測っていた頃は「テストを厚くすると分割を迫られる / doc を書くと分割を迫られる」
+   逆インセンティブになり、tests を別ファイルへ移すだけの commit が実際に 2 件生えた)。
+   現在値は `python scripts/loc_budget.py --report`。r.md #76。
 
 ## FFI / CLAP 境界のセキュリティ
 

@@ -1,6 +1,17 @@
 # arch-lint の baseline — **既知の負債**を 1 違反 1 行で記録する。
 #
-# 形式:  CHECK | path | fingerprint | 理由 / いつ消えるか
+# 形式:  CHECK | key | fingerprint または 天井 | 理由 / いつ消えるか
+#
+# 第 3 field は CHECK の mode で意味が変わる:
+#   grep / firstfield … マッチした行の内容ハッシュ (先頭 12 桁)
+#   budget            … **計測値の天井**。`/` 区切りの整数ベクトルで、成分ごとに比較する。
+#                       FILE-BUDGET / FN-BUDGET は 1 成分 (実コード行)、
+#                       FN-NESTING は 2 成分 (最大インデント段数 / 6 段以上の行数)。
+#                       1 成分でも天井を超えたら新規違反。
+#                       天井は登録時点の実測値そのもの (余裕を持たせない) — 不変条件 9 の
+#                       「超過したら分割してから足す」を字義どおり強制するため。
+#                       縮んだときはゲートを落とさない。上げたいときは人がここを書き換え、
+#                       なぜ太らせるのかを書く。
 #
 # fingerprint は **行番号ではなくマッチした行の内容**のハッシュ (空白は正規化、先頭 12 桁)。
 # 行番号にすると無関係な編集で毎回ずれて baseline が壊れる。内容ならずれない。
@@ -29,3 +40,272 @@ POSITIONAL-KEY | daw_gui/src/app_types.rs | 272f099ddc56 | キーが (track_id, 
 POSITIONAL-KEY | daw_gui/src/state/ipc.rs | be0f1cffa184 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
 POSITIONAL-KEY | daw_gui/src/state/ipc.rs | 282943df8643 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
 POSITIONAL-KEY | daw_gui/src/state/ipc.rs | 140a8b678882 | キーが (track_id, slot)。不変条件 1 が禁じる貼り替え補償コード。未起票 / r.md への起票をユーザーへ提案済み
+
+# =============================================================================
+# 不変条件 9 (サイズ budget) — 2026-08-28、r.md #76 で測り方を物理行 (wc -l、3,000 行)
+# から実コード行 (ncloc) へ入れ替えた結果、はじめて表に出たもの。
+#
+# 旧指標は今日 **1 件も当たらなかった** (最大が daw_audio/src/graph/compile.rs の物理
+# 2,978 行)。その裏にこれだけの負債が積んである、というのが r.md #76 の発見そのもの。
+# **件数が多いことは閾値を上げる理由にならない。**
+#
+# 天井は登録時点の実測値そのもの。**baseline に載っていても 1 行も太れない**
+# (path だけをキーにしていた頃は、baseline 済みのファイルが無制限に成長できた)。
+# =============================================================================
+
+# --- FILE-BUDGET (実コード 1,000 行) 23 件 ------------------------------------
+
+# A. r.md #77 系の widget 分割で消える。
+#    `heavy` → `hctx` → `for track` → `for clip` の描画・入力ループが 1 ファイルに
+#    同居している。r.md #77 が arrangement/run.rs を 9 ファイルへ割る計画を持っており、
+#    piano_roll も同型なので同じ切り方が使える。
+#    **#77 の着地後は「解消」と「新規違反」を両方読んで更新すること** — 分割で受け取り側
+#    (render.rs 等) が新たに閾値を超え得る。
+FILE-BUDGET | daw_gui/src/widgets/arrangement/run.rs      | 1946 | r.md #77 系の分割で解消
+FILE-BUDGET | daw_gui/src/widgets/piano_roll/run.rs       | 1633 | r.md #77 系の分割で解消
+FILE-BUDGET | daw_gui/src/widgets/arrangement/draw.rs     | 1565 | r.md #77 系の分割で解消
+FILE-BUDGET | daw_gui/src/widgets/arrangement/geometry.rs | 1435 | r.md #77 系の分割で解消
+FILE-BUDGET | daw_gui/src/widgets/arrangement/mod.rs      | 1249 | r.md #77 系の分割で解消
+
+# B. daw_gui の app / view / handler 中核。巨大 draw と巨大 match が 1 ファイルに溜まる。
+#    責務は分かれているのにファイルが分かれていない (track_inspector は 1 関数で 2,063 行、
+#    app.rs は AppData の定義と handle_event の match が同居) 状態。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FILE-BUDGET | daw_gui/src/view/track_inspector/mod.rs  | 2214 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/app.rs                       | 1993 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/view/runner.rs               | 1615 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/app_types.rs                 | 1436 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/handler/automation.rs        | 1410 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/script.rs                    | 1217 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/handler/project.rs           | 1188 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/handler/selection_view.rs    | 1184 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/handler/automation_lanes.rs  | 1170 | 巨大 draw / match。未起票
+FILE-BUDGET | daw_gui/src/view/root.rs                 | 1055 | 巨大 draw / match。未起票
+
+# C. プロセス境界の実装 (FFI / IPC / plugin host / audio engine)。
+#    CLAP / VST3 の C ABI 実装と、shmem + ring buffer の往復が 1 ファイルに集まっている。
+#    unsafe の塊なので分割の順序を誤ると危険で、切り方の設計から要る。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FILE-BUDGET | common/src/model.rs                     | 1795 | FFI/IPC 実装。未起票
+FILE-BUDGET | daw_plugin_host/src/main.rs             | 1760 | FFI/IPC 実装。未起票
+FILE-BUDGET | daw_plugin_host/src/clap_plugin.rs      | 1638 | FFI/IPC 実装。未起票
+FILE-BUDGET | daw_audio/src/main.rs                   | 1569 | FFI/IPC 実装。未起票
+FILE-BUDGET | daw_plugin_host/src/vst3_plugin.rs      | 1466 | FFI/IPC 実装。未起票
+FILE-BUDGET | daw_plugin_host/src/editor_window.rs    | 1462 | FFI/IPC 実装。未起票
+
+# D. daw-ui (ui/crates)。immediate-mode の中核 (Ui 本体) と波形 widget。
+#    不変条件 8 でドメイン知識は入らないが、widget の実装量そのものが溜まっている。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FILE-BUDGET | ui/crates/ui/src/ui.rs                  | 1613 | daw-ui core。未起票
+FILE-BUDGET | ui/crates/ui/src/widgets/waveform.rs    | 1023 | daw-ui core。未起票
+
+# --- FN-BUDGET (実コード 300 行) 15 件 ----------------------------------------
+# 旧指標 (物理行) が一度も報告しなかった真の god code。ファイル 2,623 行の陰に
+# 実コード 2,063 行の 1 関数が隠れていた (track_inspector/mod.rs:228 の draw)。
+
+# A. r.md #77 系の widget 分割で消える (上の FILE-BUDGET A と同じ塊)。
+FN-BUDGET | daw_gui/src/widgets/arrangement/run.rs::arrangement                 | 1944 | r.md #77 系の分割で解消
+FN-BUDGET | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                   | 1389 | r.md #77 系の分割で解消
+FN-BUDGET | daw_gui/src/widgets/arrangement/release.rs::commit_releases         |  962 | r.md #77 系の分割で解消
+FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy |  681 | r.md #77 系の分割で解消
+
+# B. daw_gui の app / view の巨大 draw と巨大 match。1 関数が 1 画面ぶんの UI を
+#    まるごと組み立てている / 1 関数が全イベントを裁いている。
+#    いつ消えるか: **未起票**。
+FN-BUDGET | daw_gui/src/view/track_inspector/mod.rs::draw                             | 2063 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1623 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/view/audio_editor.rs::draw                                    |  781 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/view/arrangement_view.rs::draw                                |  576 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                              |  525 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/view/track_inspector/modulation_rack.rs::draw_modulation_rack |  515 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/view/transport.rs::draw                                       |  358 | 巨大 draw / match。未起票
+FN-BUDGET | daw_gui/src/app.rs::AppData::new                                          |  338 | 巨大 draw / match。未起票
+
+# C. プロセス境界の実装 (IPC 受信ループ / オーディオグラフ構築)。
+#    いつ消えるか: **未起票**。
+FN-BUDGET | daw_audio/src/main.rs::recv_loop                     | 705 | FFI/IPC 実装。未起票
+FN-BUDGET | daw_audio/src/graph/compile.rs::compile_schedule     | 362 | FFI/IPC 実装。未起票
+
+# D. daw-ui (ui/crates) の widget。IME / 選択 / スクロールを 1 関数で抱えている。
+#    いつ消えるか: **未起票**。
+FN-BUDGET | ui/crates/ui/src/widgets/text_input.rs::Ui::text_input_at | 375 | daw-ui core。未起票
+
+# --- FN-NESTING (インデント 6 段) 126 件 --------------------------------------
+# 計測値は `最大段数/6 段以上の行数` の 2 成分。**深さが据え置きでも、6 段以上の行が
+# 増えたら新規違反**になる (深さだけを天井にすると、baseline 済みの関数が「深いまま
+# 無制限に太る」経路が残る)。
+
+# 1. immediate-mode の描画ループ (arrangement / piano_roll)。
+#    `heavy` → `hctx` → `for track` → `for clip` → `if` と下がる。widget の構造そのもの
+#    なので、ほどくには描画単位を関数へ切り出す = 分割が要る。
+#    いつ消えるか: **r.md #77 系の widget 分割で解消**。
+FN-NESTING | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy      | 12/399 | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/run.rs::arrangement                      | 11/520 | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/release.rs::commit_releases              | 11/338 | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build                     | 10/67  | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                        | 9/296  | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build_arrangement_lanes_from_slice | 8/33 | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::automation_point_at         | 8/16   | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect      | 8/8    | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::find_curve_param_handle_at  | 7/19   | r.md #77 系の分割で解消
+FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash       | 7/8    | r.md #77 系の分割で解消
+
+# 2. view の巨大 draw。1 関数が 1 画面ぶんの UI を組み立てるので、
+#    `if 表示中` → `for セクション` → `for 行` → `if 選択中` と素直に下がってしまう。
+#    ほどく = セクションごとの draw 関数へ切り出す。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | daw_gui/src/view/track_inspector/modulation_rack.rs::draw_modulation_rack | 9/92  | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/track_inspector/mod.rs::draw                             | 8/119 | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/audio_editor.rs::draw                                    | 8/95  | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/arrangement_view.rs::draw                                | 8/73  | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/root.rs::draw_menu_bar                                   | 8/19  | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/plugin_picker.rs::draw                                   | 7/34  | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/mixer_strips.rs::draw_strip                              | 7/8   | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/recovery_modal.rs::draw                                  | 7/8   | 巨大 draw。未起票
+
+# 3. IPC / イベント / ショートカットの巨大 match。
+#    `loop` → `match メッセージ` → `if 状態` → `for 対象` と下がる。variant ごとの
+#    ハンドラ関数へ切り出せばほどけるが、ハンドラ数が多いので機械的な一括作業になる。
+#    いつ消えるか: **未起票**。
+FN-NESTING | daw_gui/src/app.rs::AppData::handle_event                        | 9/112 | 巨大 match。未起票
+FN-NESTING | daw_audio/src/main.rs::recv_loop                                 | 10/242 | 巨大 match。未起票
+FN-NESTING | daw_gui/src/view/runner.rs::Runner::handle_preview_window_event  | 9/91  | 巨大 match。未起票
+FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::handle_command          | 9/39  | 巨大 match。未起票
+FN-NESTING | daw_gui/src/handler/ipc.rs::AppData::dispatch_audio_event        | 9/28  | 巨大 match。未起票
+FN-NESTING | daw_gui/src/handler/ipc.rs::AppData::dispatch_plugin_event       | 9/25  | 巨大 match。未起票
+FN-NESTING | daw_audio/src/engine.rs::LocalState::pump_commands               | 8/15  | 巨大 match。未起票
+FN-NESTING | daw_gui/src/view/root.rs::dispatch_shortcuts                     | 7/15  | 巨大 match。未起票
+FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result | 7/14 | 巨大 match。未起票
+FN-NESTING | daw_gui/src/view/root.rs::paste_from_clipboard                   | 7/8   | 巨大 match。未起票
+
+# 4. handler の `edit_song` クロージャ + 選択集合の多重ループ。
+#    `edit_song(|song| { for track { for clip { for note { if 選択中 {` が定型で、
+#    不変条件 5 (Song 編集の副作用は単一の口) を守るほどクロージャが深くなる。
+#    ほどく = 「選択された要素の列」を先に平坦化してから 1 段で回す形へ寄せる。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi                     | 9/42 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::inspector_plugin_params     | 9/31 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/glue.rs::AppData::action_glue_selected_clips              | 8/71 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/tick.rs::AppData::ensure_recording_lane_clip              | 8/64 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_video[cfg(windows)]      | 8/34 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/bounce.rs::AppData::set_clip_positions                    | 8/15 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::auto_warp_clip                   | 8/13 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_audio                    | 8/13 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/clips.rs::AppData::create_clip                            | 8/12 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::arrangement_labels                | 8/12 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_clips_at                    | 8/8  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_points_at                   | 8/7  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/notes.rs::AppData::delete_selected_notes                  | 8/6  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/notes.rs::AppData::resize_notes                           | 8/6  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_velocities                    | 8/6  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/clips.rs::AppData::split_clip_at_beat                     | 7/76 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::lane_default_for_target     | 7/36 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::regenerate_lipsync_for_track        | 7/28 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/clips.rs::AppData::stretch_clip_content                   | 7/24 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/devices.rs::AppData::on_plugin_loaded_from_child          | 7/24 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/bounce.rs::AppData::handle_bounce_clip_fx_complete        | 7/20 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::sync_vocal_metadata                 | 7/20 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::normalize_lipsync_clips_on_load     | 7/17 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_image                    | 7/16 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/project.rs::AppData::reconcile_plugins_with_song          | 7/15 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/tracks.rs::AppData::build_pasted_tracks                   | 7/15 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_automation_clips_at         | 7/14 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/tick.rs::AppData::current_plain_value                     | 7/12 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::track_mix                         | 7/12 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_open_path                     | 7/11 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/sync.rs::AppData::collect_ara_clips_for_track             | 7/11 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::quantize_selected_automation_points | 7/10 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::ensure_voicevox_engine                 | 7/10 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::clone_automation_clips_independent | 7/9 | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_save_as                       | 7/9  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::copy_automation_clips_clip        | 7/8  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::set_notes_muted                  | 7/8  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/project.rs::AppData::begin_asset_decode                   | 7/8  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::sidechain_entries                 | 7/6  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/audio_editor.rs::AppData::auto_fade_selected_clips        | 7/4  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::detect_onsets_for_clip           | 7/4  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/notes.rs::AppData::quantize_selected_notes                | 7/4  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::parallel_output_entries           | 7/4  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::delete_automation_points          | 7/3  | edit_song 多重ループ。未起票
+FN-NESTING | daw_gui/src/handler/automation.rs::AppData::move_automation_points            | 7/3  | edit_song 多重ループ。未起票
+
+# 5. FFI / Win32 / 子プロセスの状態機械。
+#    unsafe ブロック + エラー分岐 + リトライが同じ関数に積まれる。早期 return と
+#    ヘルパ抽出でほどけるが、FFI の対応関係を壊さないよう 1 本ずつ確認しながら要る
+#    (memory: feedback_no_dead_judgment_at_ffi)。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxBuiltin::start_synth_thread          | 11/173 | FFI/状態機械。未起票
+FN-NESTING | daw_plugin_host/src/clap_plugin.rs::ClapAudioHalf[AudioProcessorHalf]::process        | 8/41   | FFI/状態機械。未起票
+FN-NESTING | daw_audio/src/main.rs::build_stream                                                   | 8/32   | FFI/状態機械。未起票
+FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxAudioHalf[AudioProcessorHalf]::process | 7/39 | FFI/状態機械。未起票
+FN-NESTING | daw_plugin_host/src/editor_window.rs::editor_wnd_proc                                 | 7/15   | FFI/状態機械。未起票
+FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::poll_editor_close_requests                   | 7/12   | FFI/状態機械。未起票
+FN-NESTING | daw_gui/src/bootstrap.rs::ChildSupervisor::spawn_and_handshake_one                    | 7/10   | FFI/状態機械。未起票
+FN-NESTING | daw_audio/src/main.rs::spawn_notify_thread                                            | 7/7    | FFI/状態機械。未起票
+FN-NESTING | daw_plugin_host/src/plugin_scan.rs::scan_system                                       | 7/7    | FFI/状態機械。未起票
+
+# 6. daw_audio のオーディオグラフ構築 / バッファ合成。
+#    `for track` → `for device` → `for port` → `for frame` と下がる。RT 制約
+#    (確保・ロック・I/O 禁止) があるので、ほどく際にヘルパを増やしても確保が入らない
+#    形にする必要がある。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | daw_audio/src/audio_clip_renderer.rs::render_audio_events    | 9/77 | audio graph。未起票
+FN-NESTING | daw_audio/src/sequencer.rs::collect_events_for_buffer        | 8/15 | audio graph。未起票
+FN-NESTING | daw_audio/src/engine.rs::LocalState::process_buffer          | 7/28 | audio graph。未起票
+FN-NESTING | daw_audio/src/graph/compile.rs::compile_schedule             | 7/20 | audio graph。未起票
+FN-NESTING | daw_audio/src/graph/execute.rs::process_track_owned          | 7/13 | audio graph。未起票
+FN-NESTING | daw_audio/src/graph/compile.rs::compute_path_latency         | 7/12 | audio graph。未起票
+FN-NESTING | daw_audio/src/audio_clip_renderer.rs::compile_audio_schedule | 7/5  | audio graph。未起票
+
+# 7. 映像 / メディアパイプライン (GPU 効果チェイン / デコード / 立ち絵合成 / preview)。
+#    `for source` → `for pass` → `if 有効` → `for param` と下がる。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | daw_gui/src/view/preview_window.rs::PreviewWindowState::render        | 8/30 | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/video_fx/mod.rs::VideoFxEngine::ensure_common             | 7/28 | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/video_fx/mod.rs::VideoFxEngine::apply_chain               | 7/25 | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/video_playback.rs::VideoPlaybackEngine::active_sources_at | 7/20 | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/group_compose.rs::composite_and_place                     | 7/18 | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/video_playback.rs::VideoPlaybackEngine::active_source_at  | 7/14 | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/libav_decoder.rs::SourceDecoder::forward_walk             | 7/9  | 映像パイプライン。未起票
+FN-NESTING | daw_gui/src/view/runner.rs::Runner::sync_preview_window               | 7/7  | 映像パイプライン。未起票
+
+# 8. モデルの正規化 / 外部フォーマットの取り込み。
+#    旧形式の移行と SMF / VOICEVOX の取り込みで、`for track` → `for event` →
+#    `match 種別` → `if 条件` と下がる。派生データの load collapse は冪等でなければ
+#    ならない (r.md #9) ので、ほどく際に条件の抜けを作らないこと。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | daw_gui/src/midi_import.rs::scan_track          | 8/40 | モデル変換。未起票
+FN-NESTING | common/src/model.rs::Song::ensure_clip_contents | 7/8  | モデル変換。未起票
+FN-NESTING | daw_gui/src/voicevox_client.rs::fetch_voices    | 7/4  | モデル変換。未起票
+FN-NESTING | common/src/project.rs::migrate_legacy_clip_content | 7/3 | モデル変換。未起票
+
+# 9. daw-ui (ui/crates) の widget と examples。
+#    immediate-mode の widget は「入力判定 → 状態更新 → 描画」を 1 関数に持つので、
+#    `if hover` → `if drag` → `for item` → `if 選択` と下がる。examples は
+#    サンプルなので分割の優先度は低いが、同じ閾値で測る (非対称を作らないため)。
+#    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
+FN-NESTING | ui/crates/ui/src/widgets/text_input.rs::Ui::text_input_at                              | 9/141 | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/reorderable_list.rs::Ui::reorderable_list_core                | 9/104 | daw-ui core。未起票
+FN-NESTING | ui/crates/examples/mixer/src/main.rs::App::build_ui                                    | 9/91  | daw-ui example。未起票
+FN-NESTING | ui/crates/examples/automation/src/main.rs::App::build_ui                               | 9/9   | daw-ui example。未起票
+FN-NESTING | ui/crates/renderer/src/pipelines/glyph.rs::GlyphPipeline::prepare_renderer             | 8/13  | daw-ui core。未起票
+FN-NESTING | ui/crates/examples/sample_edit_ops/src/main.rs::App::build_ui                          | 7/22  | daw-ui example。未起票
+FN-NESTING | ui/crates/examples/sample_editor/src/main.rs::App::build_ui                            | 7/22  | daw-ui example。未起票
+FN-NESTING | ui/crates/renderer/src/device.rs::Renderer::acquire_frame                              | 7/20  | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/list_view.rs::Ui::list_view                                   | 7/20  | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/scroll_area.rs::Ui::scroll_area                               | 7/20  | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/color_picker.rs::Ui::color_picker                             | 7/19  | daw-ui core。未起票
+FN-NESTING | ui/crates/renderer/src/pipelines/mod.rs::prepare_text_effects                          | 7/18  | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/waveform.rs::peak_in_raw                                      | 7/16  | daw-ui core。未起票
+FN-NESTING | ui/crates/renderer/src/pipelines/texture.rs::TexturePipeline::new                      | 7/15  | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/scrubable_number.rs::Ui::scrubable_number_at                  | 7/11  | daw-ui core。未起票
+FN-NESTING | ui/crates/platform/src/winit_backend.rs::WinitWindow[WindowBackend]::set_text_input_document | 7/9 | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/fader.rs::Ui::fader_core                                      | 7/9   | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/knob.rs::Ui::knob_at                                          | 7/9   | daw-ui core。未起票
+FN-NESTING | ui/crates/examples/waveform_validation/src/main.rs::App::build_ui                      | 7/8   | daw-ui example。未起票
+FN-NESTING | ui/crates/ui/src/shortcut.rs::Shortcut::try_parse                                      | 7/6   | daw-ui core。未起票
+FN-NESTING | ui/crates/ui/src/widgets/goniometer.rs::Ui::goniometer                                 | 7/5   | daw-ui core。未起票
