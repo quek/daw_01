@@ -314,11 +314,15 @@ fn segment_bend(
         }
         other => other,
     };
-    let anchor_value_norm = find_lane_clip(&f.visible_tracks, seg.point.clip)
-        .map(|(lane, _clip)| curve::LaneValueMap::from_lane(lane, seg.clip_rect))
-        .map_or(0.0, |map| {
-            curve::eval_norm(map, seg.a_plain, seg.b_plain, seg.grab_u, start_curve)
-        });
+    // lane が引けなければ session を起動しない。 `automation_segment_at` が当てた lane と
+    // 同じものなので実際には必ず引けるが、 **握りつぶして 0.0 を anchor にしない** —
+    // それをやると最初の 1px で線が窓の下端へ飛ぶ。
+    let Some((lane, _clip)) = find_lane_clip(&f.visible_tracks, seg.point.clip) else {
+        return;
+    };
+    let map = curve::LaneValueMap::from_lane(lane, seg.clip_rect);
+    let anchor_value_norm =
+        curve::eval_norm(map, seg.a_plain, seg.b_plain, seg.grab_u, start_curve);
     let state: &mut ArrangementState = ui.widget_state(f.wid);
     state.automation_segment_bend = Some(AutomationSegmentBendSession {
         point: seg.point,
