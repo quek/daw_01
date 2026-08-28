@@ -89,6 +89,11 @@ build / clippy + clip_rename/video smoke)。**S8 実機 sign-off 完了 = arch-r
     WIRE_SOURCES に 4 ファイル登録 (invariant #7)。
   - ui.rs (daw-ui-core) 4,077→2,437: tests → ui/tests.rs。
   - いずれも pure code movement (挙動・serialize 不変)。
+  - (当時の指標 = 物理行 3,000。2026-08 の r.md #76 で実コード行 1,000 + 関数長 300 +
+    インデント 6 段へ置換した。物理行では「tests を別ファイルへ移すだけで緑になる」
+    逆インセンティブになり、上の 2 commit がまさにその形だったため。
+    **`:10` / `:28` / `:32` の「≤3000」「< 3,000」も同じく当時の値**。現在値は
+    `python scripts/loc_budget.py --report`)
 - **§11 arch-lint 精密化** (`528b32c`): grep がコメント言及を違反に誤カウントする false positive を
   共通 `strip_comments` ヘルパ + untagged anchor で class ごと修正 (untagged baseline 0、check 3/5 も
   予防)。§10 (untagged 撤去)・S4 (ui-domain 撤去) の達成が checker に正しく反映されるように。
@@ -463,12 +468,13 @@ resize / split / セクション / automation lane 編集 / piano_roll ノート
 - **CLAUDE.md に「アーキテクチャ不変条件」節を追加** (§0 の 7 原則を検査可能な形で)。
 - **`make arch-lint`** (bash scripts/arch_lint.sh): 機械検査 —
   RT パスの `INFINITE`、`(u32, u32)` positional key、`#[serde(untagged)]` 新設、
-  protocol への `Vec<f32>`/`Arc<[u8]>` 混入、file 行数 budget (>3000 warn)、
+  protocol への `Vec<f32>`/`Arc<[u8]>` 混入、サイズ budget (実コード 1,000 行 / 関数 300 行 /
+  インデント 6 段。`scripts/loc_budget.py`。当初は物理行 >3000 だったが r.md #76 で置換)、
   common の依存 (reqwest 等) 逆流。clippy と並ぶ検証段として Makefile に組み込む。
 - **guards.jsonl 追記** (承認不要の主経路): INFINITE / positional tuple key /
   `push_undo_snapshot` 直呼び / untagged 追加 / MainToChild 復活 の warn ルール。
-- **新 skill `/arch-review`**: 本セッションの 6 レンズ並列分析 + arch-lint + 行数 budget を
-  定型化 (四半期/大機能後に回す)。
+- **新 skill `/arch-review`**: 本セッションの 6 レンズ並列分析 + arch-lint + サイズ budget
+  (実コード行 / 関数長 / ネスト。当初は行数 budget) を定型化 (四半期/大機能後に回す)。
 - **implement skill に「アーキテクチャ影響チェック」段を追加**: 新機能が
   (a) 新しい id/addressing を導入するか (b) 新しい同期経路を生やすか (c) enum をどの層に
   足すか (d) god file を太らせるか、を実装前に列挙させる。

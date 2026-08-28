@@ -214,10 +214,19 @@ audit:
 	cargo deny --all-features check advisories
 
 # アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
-# docs/plan_arch_refactor.md §11)。違反は列挙のみ (exit 0)。
-# CI / commit ゲートでは ARCH_LINT_STRICT=1 を付ける。
+# docs/plan_arch_refactor.md §11)。**exit 0 = 「違反ゼロ、または
+# scripts/arch_lint_baseline.txt に記録済みのものだけ」** — baseline に無い違反が
+# 1 件でもあれば exit 1 (行単位 ratchet)。ARCH_LINT_STRICT=1 は baseline 済みの負債も落とす。
+# サイズ budget (FILE-BUDGET / FN-BUDGET / FN-NESTING) と行分類 (コメント内の言及を
+# 違反に数えない判定) は scripts/loc_budget.py が持つので **python が要る**。
+# **python が無い / 壊れている (Windows Store のスタブ等) と arch-lint は全面停止する** —
+# サイズ budget だけでなく RT-INFINITE / POSITIONAL-KEY / LEGACY-PROTOCOL / UNTAGGED /
+# BLOB-IN-PROTOCOL / COMMON-DEPS / UI-DOMAIN も止まる。cargo-deny (上の audit) と同じ
+# 「skip の緑を作らない」原則で、これは意図した挙動。
+# 検出と self-test は script 側が持つ (直接 bash で叩く経路 = /arch-review skill でも同じ
+# 保証が要るため)。ここは Makefile 冒頭で解決済みの PYTHON を渡すだけ。
 arch-lint:
-	/usr/bin/bash scripts/arch_lint.sh
+	PYTHON="$(PYTHON)" /usr/bin/bash scripts/arch_lint.sh
 
 check: fetch-ffmpeg
 	cargo check --workspace

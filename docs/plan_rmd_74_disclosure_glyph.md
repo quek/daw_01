@@ -1096,6 +1096,15 @@ make arch-lint
 - god file budget に余裕あり (`run.rs` 2,699 / `app.rs` 2,424 / `event.rs` 1,912 /
   `mod.rs` 2,413 / `mixer_strips.rs` 1,140 / `modulation_rack.rs` 853 行)。
   本計画の増分は各ファイル十数行なので 3,000 行制限には掛からない。
+  > (当時の指標 = 物理行 3,000。r.md #76 で実コード行 1,000 + 関数 300 行 + インデント 6 段へ
+  > 置換済み。現在値は `python scripts/loc_budget.py --report`。この計画書の他の箇所
+  > (§10 の「god file budget に余裕」) も同じく当時の判断。)
+  > **新指標では「余裕あり」は成り立たない。** `run.rs` (実コード 1,946) / `app.rs` (1,993) /
+  > `arrangement/mod.rs` (1,249) は `scripts/arch_lint_baseline.txt` に登録済みで、
+  > **天井は実測値なので 1 行も太れない**。本計画は 3 か所のグリフ複製を 1 関数へ畳む
+  > 変更なので **減る方向**に動くが、着地後に `make arch-lint` の「解消」通知を読んで
+  > baseline の天井を実測値へ更新すること。
+  > (`mixer_strips.rs` 1,140 行 / `modulation_rack.rs` 853 行は実コードでは budget 内。)
 
 
 ## 9. 参照

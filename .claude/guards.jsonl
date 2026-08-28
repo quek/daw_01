@@ -70,7 +70,7 @@
 # **許可されたときに回す手段**: 先頭に `DAW01_ALLOW_LAUNCH=1` を付ける。ユーザー / オーケストレータの
 # 許可を得た「これから起動します」の明示的な宣言で、コマンドを見れば意図が分かる。
 # 何も宣言せずに起動するのを止めるのがガードの目的であって、起動そのものの禁止ではない。
-{"id":"no-bulk-test-run","source":"feedback_cargo_tests_launches_app","tool":["Bash"],"field":"command_code","all":["\\bcargo\\s+test\\b[^\\n]*(?:--all-targets\\b|--tests\\b|--workspace\\b|-p\\s+daw_gui\\b)"],"none":["--test\\s","DAW01_ALLOW_LAUNCH"],"action":"block","msg":"daw_gui を対象にした一括テスト実行は、script モードの smoke test 経由で daw_gui (と daw_audio / daw_plugin_host) を暗黙に起動する。子プロセスを起動しない target を名指しで回すこと: cargo test -p daw_gui --test arr_widget --test pr_widget。ビルドだけなら cargo check --all-targets を使う。"}
+{"id":"no-bulk-test-run","source":"feedback_cargo_tests_launches_app","tool":["Bash"],"field":"command_code","all":["\\bcargo\\s+test\\b[^\\n]*(?:--all-targets\\b|--tests\\b|--workspace\\b|-p\\s+daw_gui\\b)"],"none":["--test\\s","--lib\\b","DAW01_ALLOW_LAUNCH"],"action":"block","msg":"daw_gui を対象にした一括テスト実行は、script モードの smoke test 経由で daw_gui (と daw_audio / daw_plugin_host) を暗黙に起動する。子プロセスを起動しない target を名指しで回すこと: cargo test -p daw_gui --test arr_widget --test pr_widget。ビルドだけなら cargo check --all-targets を使う。"}
 # **名前で判定しないこと。** 判定基準は `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。
 # pdc_real_vst3 / sidechain_real_vst3 は名前に smoke が付かないのに起動し、逆に
 # arr_widget / pr_widget / font_picker / plugin_picker_cursor / mixer_pan_readout_visual は
@@ -115,10 +115,21 @@
 # 指示どおりだが、**判定が割れないよう「何を違反とみなすか」の SSoT は arch_lint.sh 側**に
 # 置く。ここはその write-time ミラーで、次の 2 点だけを arch-lint に合わせてある:
 #   - パターンの anchor (untagged は実属性のみ / positional key は HashMap<(u32,u32)>)
-#   - **コメント行を違反に数えない** (arch_lint.sh の strip_comments と同じ。撤去の
-#     経緯説明が doc comment に大量に残っており、数えると全部誤検知になる)
+#   - **コメント行を違反に数えない** (撤去の経緯説明が doc comment に大量に残っており、
+#     数えると全部誤検知になる)。**その判定の根拠は 2026-08-28 の r.md #76 以降
+#     `scripts/loc_budget.py` の Rust 字句解析**で、arch_lint.sh の strip_comments は
+#     `--filter-comments` を呼ぶだけになった。
 # 表記が違うのは意図的: arch-lint は shell 由来の argv 破壊を避けるためバックスラッシュを
-# 使わない POSIX 表記、こちらは Python re なので通常表記。**意味は同じ**。
+# 使わない POSIX 表記、こちらは Python re なので通常表記。
+# **行頭コメントについては意味は同じ。raw string の中の行頭 `//` と `/* … */` の中身では
+# 判定が割れ、そこは arch-lint の方が正確**である。割れ方は 2 方向あり、片方は安全側ではない:
+#   - `/* … */` の中の言及 … ガードは実コードと見て **nudge する** (arch-lint は数えない)。
+#     過剰な nudge なので安全側。
+#   - raw string の中の行頭 `//` … ガードは行頭 `//` をコメントと見て **見逃す**
+#     (arch-lint は実コードとして違反に数える)。**こちらは見逃す方向**。
+# それでもガードは `escalate: false` の write-time nudge に留めるので、**最終判定は
+# 常に arch-lint 側**が持つ (見逃しても commit 前の `make arch-lint` で赤くなる)。
+# ガードを block へ昇格させるときは、この非対称を先に潰すこと。
 # `push_undo_snapshot` 直呼びだけは arch-lint に無く、このガード固有。
 #
 # escalate:false — 編集テキストの行マッチなので、既存違反の行に触れただけでも当たる。

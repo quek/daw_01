@@ -13,7 +13,10 @@
 
 use std::sync::Arc;
 
-use common::model::{Clip, ClipContent, ContentId, MidiContent, Note, Section};
+use common::model::{
+    AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+    AutomationTarget, Clip, ClipContent, ContentId, MidiContent, Note, Section, TrackBuiltinParam,
+};
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -33,6 +36,21 @@ const ROW_H: f32 = 50.0;
 const SEC_Y: f32 = 29.0;
 
 fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
+    build_app_with_header(0.0)
+}
+
+/// header pane を踏むテスト用の fixture。 `arrange_header_w` 以外は `build_app()` と同一。
+///
+/// `build_app()` (= `build_app_with_header(0.0)`) では press 側 (`press_header::dispatch` の
+/// `f.header_w > 0.0`) と描画側 (`header::draw_rows` の同ゲート) がともに丸ごと skip されるので、
+/// header pane を踏むテストは `build_app_with_header(160.0)` (production default、`app.rs`) を使う。
+///
+/// **既存テストの座標定数 (`ZOOM` / `WIDGET_RECT.w` / `track0_y()` 等) を header 側と共有しないこと。**
+/// `lanes.x` が 0 → 160 にずれ、`view.len_beats` も `640/64 = 10.0` に変わる (beat→x は
+/// `160.0 + beat * ZOOM`)。`beat_per_px` は `len_beats / lanes.w` なので header_w に依らず `1/64`。
+fn build_app_with_header(
+    header_w: f32,
+) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel();
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
     let event_dispatcher = RecordingDispatcher::new();
@@ -50,7 +68,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         48_000,
     );
     // 決定的な pixel→beat 変換のため view 由来の ui_prefs を固定。
-    app.ui_prefs.arrange_header_w = 0.0;
+    app.ui_prefs.arrange_header_w = header_w;
     app.ui_prefs.arrange_zoom_x = ZOOM;
     app.ui_prefs.arrange_scroll_beat = 0.0;
     app.ui_prefs.arrange_track_row_h = ROW_H;
@@ -771,5 +789,560 @@ fn section_drag_preview_shows_the_resolved_landing_position() {
     assert!(
         (committed - previewed).abs() < 1.0,
         "overlay == commit: preview={previewed} committed={committed}"
+    );
+}
+
+// ============================================================
+// r.md #77 §9-B: 分割で崩れうる 3 種を機械で止める
+//
+// 1. 押した場所ごとに何が起きるか (header pane 系は `build_app_with_header(160.0)`)
+// 2. 優先順位の排他 (`!splitter` の 9 ゲート + point / curve_handle / session の各読み点)
+// 3. 描画順 (heavy → header の z 順)
+//
+// **自明な算術を写経するテストは書かない。** 下の 3 種はいずれも「押した場所 → 起きること」
+// 「積まれた順序」 という観測可能な振る舞いを assert していて、本番の式を写していない。
+// ============================================================
+
+/// production default の header 幅。`build_app_with_header(HEADER_W)` と対で使う。
+const HEADER_W: f32 = 160.0;
+
+/// `add_expanded_automation_lane` が足す lane の高さ (px)。
+const LANE_H: u16 = 60;
+
+/// master row (visible index 0) の縦中央 y。
+fn master_row_y() -> f32 {
+    38.0 + ROW_H * 0.5
+}
+
+/// track 0 行の下端 (= lane がある場合は lane の上端)。`track0_y()` の行の底。
+fn track0_bottom() -> f32 {
+    38.0 + ROW_H * 2.0
+}
+
+/// automation lane body の下端 (= lane 下端 splitter の位置)。
+fn lane_bottom() -> f32 {
+    track0_bottom() + f32::from(LANE_H)
+}
+
+/// track 0 に automation lane (`lane_id`、高さ `LANE_H`) を 1 本足して展開する。
+/// clip `[0, 8)` に point 3 つ (2 つ目は Bezier = curve handle の対象)。
+fn add_expanded_automation_lane(app: &mut AppData, track_id: u32, lane_id: u32) {
+    app.edit_song(|song| {
+        song.clip_contents.insert(
+            AUTOMATION_CONTENT_ID,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint {
+                        id: 1,
+                        time_beat: 0.0,
+                        value: 0.2,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        id: 2,
+                        time_beat: 2.0,
+                        value: 0.8,
+                        curve: AutomationCurve::Bezier { tension: 0.5 },
+                    },
+                    AutomationPoint {
+                        id: 3,
+                        time_beat: 6.0,
+                        value: 0.4,
+                        curve: AutomationCurve::Linear,
+                    },
+                ],
+                next_point_id: 4,
+            }),
+        );
+        if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
+            t.automation_lanes.push(AutomationLane {
+                id: lane_id,
+                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                default_value: 0.5,
+                enabled: true,
+                visible: true,
+                height_px: LANE_H,
+                clips: vec![AutomationClip {
+                    id: 1,
+                    name: String::new(),
+                    start_beat: 0.0,
+                    length_beats: 8.0,
+                    content_id: AUTOMATION_CONTENT_ID,
+                    content_offset_beats: 0.0,
+                }],
+                next_clip_id: 2,
+            });
+        }
+    });
+    app.ui_prefs.expanded_automation_tracks.insert(track_id);
+}
+
+const AUTOMATION_CONTENT_ID: ContentId = 901;
+
+/// track 0 の automation lane を 1 本持つ状態の `app`。
+fn app_with_lane(
+    header_w: f32,
+) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
+    let (mut app, a, p) = build_app_with_header(header_w);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    add_expanded_automation_lane(&mut app, 1, 1);
+    (app, a, p)
+}
+
+/// 1 フレーム走らせて `ArrangementResponse` を返す (`arrange_fit_layout.rs` と同じ捕捉手口)。
+/// point rect の実座標は response から引く — lane 内の y は `value_norm` 依存なので
+/// 座標を当て推量で書くと分岐に届かない。
+fn drive_response(
+    host: &mut UiHost<AppData>,
+    app: &mut AppData,
+    p: PointerFrame,
+) -> daw_gui::widgets::arrangement::ArrangementResponse {
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+    let mut captured = None;
+    host.frame(app, &mut scene, screen, frame(p), |app, ui| {
+        captured = Some(arrangement(app, ui, WIDGET_RECT));
+    });
+    captured.expect("arrangement() は毎フレーム response を返す")
+}
+
+/// `point_idx` 番目の automation point の中心 (screen 座標)。
+fn point_center(app: &mut AppData, point_idx: u32) -> (f32, f32) {
+    let mut host = UiHost::no_redraw();
+    let r = drive_response(&mut host, app, PointerFrame::default());
+    let (_, rect) = r
+        .automation_point_rects
+        .iter()
+        .find(|(k, _)| k.point_idx == point_idx)
+        .copied()
+        .expect("automation_point_rects に対象 point が居る");
+    (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
+}
+
+/// 描かれた glyph を **文字で** 引いてその中心を返す。
+/// lane header の ★ / 👁 / ✕ は右寄せ配置で、座標を当て推量で書くと分岐に届かない
+/// (実際 1 度外した)。 production が実際に置いた位置を読む。
+fn glyph_center(scene: &Scene, text: &str) -> Option<(f32, f32)> {
+    scene.primitives.iter().find_map(|p| match p {
+        Primitive::Glyph(g) if &*g.text == text => {
+            Some((g.left + g.font_size * 0.5, g.top + g.font_size * 0.5))
+        }
+        _ => None,
+    })
+}
+
+/// header pane 内に描かれた volume band (`arr_tvol_track` の細い帯) の中心。
+/// 行内の他の rect とは **高さ** で切り分ける (band は数 px、行背景 / ボタンは桁違いに高い)。
+fn volume_band_center(scene: &Scene, row_top: f32) -> Option<(f32, f32)> {
+    scene.primitives.iter().find_map(|p| match p {
+        Primitive::Rect(c)
+            if c.rect.h < 8.0
+                && c.rect.x + c.rect.w <= HEADER_W + 0.5
+                && c.rect.y > row_top
+                && c.rect.y < row_top + ROW_H =>
+        {
+            Some((c.rect.x + c.rect.w * 0.5, c.rect.y + c.rect.h * 0.5))
+        }
+        _ => None,
+    })
+}
+
+fn track_volume_of(app: &AppData, id: u32) -> f32 {
+    app.song_doc.song().tracks.iter().find(|t| t.id == id).expect("track が居る").volume
+}
+
+fn lane_enabled(app: &AppData, track_id: u32, lane_id: u32) -> Option<bool> {
+    lane_field(app, track_id, lane_id, |l| l.enabled)
+}
+
+fn lane_visible(app: &AppData, track_id: u32, lane_id: u32) -> Option<bool> {
+    lane_field(app, track_id, lane_id, |l| l.visible)
+}
+
+fn lane_height(app: &AppData, track_id: u32, lane_id: u32) -> Option<u16> {
+    lane_field(app, track_id, lane_id, |l| l.height_px)
+}
+
+fn lane_clip_start(app: &AppData, track_id: u32, lane_id: u32) -> Option<f64> {
+    lane_field(app, track_id, lane_id, |l| l.clips.first().map(|c| c.start_beat)).flatten()
+}
+
+fn lane_exists(app: &AppData, track_id: u32, lane_id: u32) -> bool {
+    lane_field(app, track_id, lane_id, |_| ()).is_some()
+}
+
+fn lane_field<T>(
+    app: &AppData,
+    track_id: u32,
+    lane_id: u32,
+    f: impl Fn(&AutomationLane) -> T,
+) -> Option<T> {
+    app.song_doc
+        .song()
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .and_then(|t| t.automation_lanes.iter().find(|l| l.id == lane_id))
+        .map(f)
+}
+
+/// automation curve に残っている point の id 列。
+fn point_ids(app: &AppData) -> Vec<u32> {
+    app.song_doc
+        .song()
+        .clip_contents
+        .get(&AUTOMATION_CONTENT_ID)
+        .and_then(common::model::ClipContent::automation_points)
+        .map(|pts| pts.iter().map(|p| p.id).collect())
+        .unwrap_or_default()
+}
+
+/// `id` の point の clip-local 拍。
+fn point_time(app: &AppData, id: u32) -> Option<f64> {
+    app.song_doc
+        .song()
+        .clip_contents
+        .get(&AUTOMATION_CONTENT_ID)
+        .and_then(common::model::ClipContent::automation_points)
+        .and_then(|pts| pts.iter().find(|p| p.id == id))
+        .map(|p| p.time_beat)
+}
+
+// ------------------------------------------------------------
+// 1. 押した場所ごとに何が起きるか (header pane 系 = header_w 160 側)
+// ------------------------------------------------------------
+
+/// header の volume band を掴んで右へ引く → その track の音量が上がる。
+/// `header_w = 0` の既存 fixture では press 側のゲートで丸ごと skip される領域。
+#[test]
+fn header_volume_band_drag_changes_track_volume() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    let before = track_volume_of(&app, 1);
+    let mut host = UiHost::no_redraw();
+    // band の実位置は production が描いた帯から引く (行内で高さが桁違いに小さい rect)。
+    let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+    let (bx, by) = volume_band_center(&scene, track0_y() - ROW_H * 0.5)
+        .expect("track 0 の volume band が描かれている");
+    drive(&mut host, &mut app, press(bx, by, no_mods()));
+    drive(&mut host, &mut app, hold(HEADER_W - 10.0, by, no_mods()));
+    drive(&mut host, &mut app, release(HEADER_W - 10.0, by, no_mods()));
+    let after = track_volume_of(&app, 1);
+    assert!(after > before, "右へ引いたら音量が上がる: before={before} after={after}");
+}
+
+/// track 行の catch-all click → そのトラックが選択される。
+#[test]
+fn header_row_click_selects_track() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    app.selection.selected_track_ids.clear();
+    let mut host = UiHost::no_redraw();
+    // 名前帯 / M·S·R / volume band / lane disclosure を避けた行上部の空き。
+    let y = track0_y() - ROW_H * 0.4;
+    let x = HEADER_W - 8.0;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, release(x, y, no_mods()));
+    assert_eq!(app.selection.selected_track_ids, vec![1], "行 click でそのトラックが選択される");
+}
+
+/// master 行の header click も同じ経路でトラック選択に乗る。
+#[test]
+fn header_master_row_click_selects_master() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    app.selection.selected_track_ids.clear();
+    let mut host = UiHost::no_redraw();
+    let y = master_row_y();
+    let x = HEADER_W - 8.0;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, release(x, y, no_mods()));
+    assert_eq!(
+        app.selection.selected_track_ids,
+        vec![common::model::MASTER_TRACK_ID],
+        "master 行も選択対象"
+    );
+}
+
+/// track 行右端の lane disclosure (`+`/`-`) click → automation lane の展開が畳まれる。
+#[test]
+fn header_lane_disclosure_click_collapses_lanes() {
+    let (mut app, _a, _p) = app_with_lane(HEADER_W);
+    assert!(app.ui_prefs.expanded_automation_tracks.contains(&1), "前提: 展開されている");
+    let mut host = UiHost::no_redraw();
+    // `layout.lane_disc_rect` は S ボタンの右 = 行の右端寄り。
+    let x = HEADER_W - 6.0;
+    let y = track0_y() - ROW_H * 0.25;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, release(x, y, no_mods()));
+    assert!(
+        !app.ui_prefs.expanded_automation_tracks.contains(&1),
+        "lane disclosure の click で畳まれる"
+    );
+}
+
+/// lane header の ★ (enabled) / 👁 (visible) / ✕ (delete) がそれぞれ効く。
+/// icon 列は lane header 行の左から順に並ぶ (`automation_lane_header_layout`)。
+#[test]
+fn lane_header_icons_toggle_and_delete_the_lane() {
+    /// icon を **描かれた glyph の位置** で click する (★ は左寄せ、👁 / ✕ は右寄せ)。
+    fn click_icon(glyph: &str) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>)
+    {
+        let (mut app, a, p) = app_with_lane(HEADER_W);
+        let mut host = UiHost::no_redraw();
+        let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+        let (x, y) = glyph_center(&scene, glyph)
+            .unwrap_or_else(|| panic!("lane header に {glyph} が描かれている"));
+        drive(&mut host, &mut app, press(x, y, no_mods()));
+        drive(&mut host, &mut app, release(x, y, no_mods()));
+        (app, a, p)
+    }
+
+    // ★ (enabled を落とす)
+    let (app, _a, _p) = click_icon("★");
+    assert_eq!(lane_enabled(&app, 1, 1), Some(false), "★ click で lane.enabled が false になる");
+
+    // 👁 (visible を落とす)
+    let (app, _a, _p) = click_icon("👁");
+    assert_eq!(lane_visible(&app, 1, 1), Some(false), "👁 click で lane.visible が false になる");
+
+    // ✕ (lane 削除)
+    let (app, _a, _p) = click_icon("✕");
+    assert!(!lane_exists(&app, 1, 1), "✕ click で lane が消える");
+}
+
+/// popup (右クリックメニュー) が開いているフレームの header press は、
+/// 同じ座標で普段起きること (トラック選択) を **起こさない**。
+///
+/// context menu は `capture_input == false` で背景 pointer を mask しないので、
+/// menu item の click が背後の行に届いてしまう (r.md #43 の同件)。
+#[test]
+fn popup_open_header_press_does_not_select_track() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    app.selection.selected_track_ids.clear();
+    let mut host = UiHost::no_redraw();
+    let y = track0_y() - ROW_H * 0.4;
+    let x = HEADER_W - 8.0;
+    for p in [press(x, y, no_mods()), release(x, y, no_mods())] {
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+        host.frame(&mut app, &mut scene, screen, frame(p), |app, ui| {
+            ui.open_popup(
+                ("arr_test_popup", 0_u32),
+                Rect { x: 400.0, y: 300.0, w: 10.0, h: 10.0 },
+                false,
+            );
+            let _ = arrangement(app, ui, WIDGET_RECT);
+        });
+    }
+    assert!(
+        app.selection.selected_track_ids.is_empty(),
+        "popup が開いているフレームの header press は選択を動かさない: {:?}",
+        app.selection.selected_track_ids
+    );
+}
+
+// ------------------------------------------------------------
+// 2. 優先順位の排他 (`!splitter` の 9 ゲート + claim の各読み点)
+// ------------------------------------------------------------
+
+/// **clip の内側にある lane 下端 splitter** を押す → lane resize だけが起き、clip は動かない。
+/// (`press_lanes::clip_zone` の `!claim.splitter` ゲート)
+#[test]
+fn lane_splitter_inside_clip_does_not_start_clip_drag() {
+    let (mut app, _a, _p) = app_with_lane(0.0);
+    let start_before = clip_start(&app, 1, 1);
+    let h_before = lane_height(&app, 1, 1);
+    let mut host = UiHost::no_redraw();
+    // lane 下端 splitter は body の x 範囲 × `[bottom - handle, bottom)`。x は clip [0,4) の内側。
+    let x = 2.0 * ZOOM;
+    let y = lane_bottom() - 2.0;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, hold(x + 3.0 * ZOOM, y + 20.0, no_mods()));
+    drive(&mut host, &mut app, release(x + 3.0 * ZOOM, y + 20.0, no_mods()));
+    assert_eq!(clip_start(&app, 1, 1), start_before, "clip は動かない");
+    let h_after = lane_height(&app, 1, 1);
+    assert!(h_after > h_before, "lane だけが伸びる: before={h_before:?} after={h_after:?}");
+}
+
+/// **track 行下端の splitter** を押す → その行の高さだけが変わり、clip は動かない。
+#[test]
+fn row_splitter_inside_clip_does_not_start_clip_drag() {
+    let (mut app, _a, _p) = build_app();
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    let start_before = clip_start(&app, 1, 1);
+    let mut host = UiHost::no_redraw();
+    let x = 2.0 * ZOOM;
+    let y = track0_bottom() - 2.0;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, hold(x + 3.0 * ZOOM, y + 25.0, no_mods()));
+    drive(&mut host, &mut app, release(x + 3.0 * ZOOM, y + 25.0, no_mods()));
+    assert_eq!(clip_start(&app, 1, 1), start_before, "clip は動かない");
+    let row_h = app.ui_prefs.track_row_overrides.get(&1).copied().unwrap_or(0);
+    assert!(
+        f32::from(row_h) > ROW_H,
+        "行の高さだけが伸びる: {:?}",
+        app.ui_prefs.track_row_overrides
+    );
+}
+
+/// **arranger 帯と header 境界が重なる x** を押す → header 幅 resize が起き、section drag は起きない。
+/// (`press::arranger` の `!claim.splitter` ゲート)
+#[test]
+fn header_splitter_in_arranger_band_does_not_start_section_drag() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_section(&mut app, 1, 0.0, 4.0);
+    let start_before = section_start(&app, 1);
+    let mut host = UiHost::no_redraw();
+    // header splitter の hot zone は境界 ±`header_resize_handle_px/2`。
+    drive(&mut host, &mut app, press(HEADER_W + 1.0, SEC_Y, no_mods()));
+    drive(&mut host, &mut app, hold(HEADER_W + 60.0, SEC_Y, no_mods()));
+    drive(&mut host, &mut app, release(HEADER_W + 60.0, SEC_Y, no_mods()));
+    assert_eq!(section_start(&app, 1), start_before, "section は動かない");
+    assert!(
+        app.ui_prefs.arrange_header_w > HEADER_W + 1.0,
+        "header 幅だけが広がる: {}",
+        app.ui_prefs.arrange_header_w
+    );
+}
+
+/// **header 境界と ruler が交差する角** を押す → header 幅 resize が起き、playhead は動かない。
+/// (`press::ruler` の `!claim.splitter` ゲート)
+#[test]
+fn header_splitter_in_ruler_does_not_seek_playhead() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    let before = app.transport.playhead_beat;
+    let mut host = UiHost::no_redraw();
+    let ruler_y = 10.0;
+    drive(&mut host, &mut app, press(HEADER_W + 1.0, ruler_y, no_mods()));
+    drive(&mut host, &mut app, hold(HEADER_W + 60.0, ruler_y, no_mods()));
+    drive(&mut host, &mut app, release(HEADER_W + 60.0, ruler_y, no_mods()));
+    assert_eq!(app.transport.playhead_beat, before, "playhead は動かない");
+    assert!(
+        app.ui_prefs.arrange_header_w > HEADER_W + 1.0,
+        "header 幅だけが広がる: {}",
+        app.ui_prefs.arrange_header_w
+    );
+}
+
+/// **automation point の上** を押す → point が動き、automation clip drag は起動しない。
+/// (`press_lanes::automation_clip` の `!claim.point` ゲート)
+#[test]
+fn point_press_does_not_start_automation_clip_drag() {
+    let (mut app, _a, _p) = app_with_lane(0.0);
+    let clip_before = lane_clip_start(&app, 1, 1);
+    let (px, py) = point_center(&mut app, 0);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(px, py, no_mods()));
+    drive(&mut host, &mut app, hold(px + ZOOM, py, no_mods()));
+    drive(&mut host, &mut app, release(px + ZOOM, py, no_mods()));
+    assert_eq!(
+        lane_clip_start(&app, 1, 1),
+        clip_before,
+        "automation clip は動かない (point drag が先勝)"
+    );
+    assert_eq!(point_time(&app, 1), Some(1.0), "掴んだ point だけが 1 拍ぶん動く");
+}
+
+/// **Alt+drag のフォールバックは、同フレームで press action が立っていれば起動しない**。
+/// point を Alt+click すると即時削除が走る (= `actions.any()`) ので、
+/// 同じ drag で lane resize は起きない。
+#[test]
+fn alt_click_on_point_deletes_without_resizing_the_lane() {
+    let (mut app, _a, _p) = app_with_lane(0.0);
+    let h_before = lane_height(&app, 1, 1);
+    let (px, py) = point_center(&mut app, 1);
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(px, py, alt));
+    drive(&mut host, &mut app, hold(px, py + 30.0, alt));
+    drive(&mut host, &mut app, release(px, py + 30.0, alt));
+    assert_eq!(point_ids(&app), vec![1, 3], "Alt+click した point (id=2) だけが消える");
+    assert_eq!(lane_height(&app, 1, 1), h_before, "lane の高さは変わらない");
+}
+
+/// **lasso は clip の上では起動しない**。automation clip の上で drag すると
+/// clip が動き、point 選択 (lasso の結果) は起きない。
+#[test]
+fn drag_on_automation_clip_moves_it_instead_of_lassoing() {
+    let (mut app, _a, _p) = app_with_lane(0.0);
+    app.selection.selected_automation_points.clear();
+    let mut host = UiHost::no_redraw();
+    // clip [0,8) の内側で、point (拍 0 / 2 / 6) から離れた拍 4 付近。
+    let x = 4.0 * ZOOM;
+    let y = track0_bottom() + f32::from(LANE_H) * 0.8;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, hold(x + ZOOM, y, no_mods()));
+    drive(&mut host, &mut app, release(x + ZOOM, y, no_mods()));
+    assert_eq!(lane_clip_start(&app, 1, 1), Some(1.0), "automation clip が 1 拍ぶん動く");
+    assert!(
+        app.selection.selected_automation_points.is_empty(),
+        "lasso は起動しない: {:?}",
+        app.selection.selected_automation_points
+    );
+}
+
+/// **空き lane zone の drag は lasso**。clip の外 (拍 8 以降) から掴んで point の上まで
+/// 引くと、囲まれた point が選択される。
+#[test]
+fn drag_on_empty_lane_zone_lassos_points() {
+    let (mut app, _a, _p) = app_with_lane(0.0);
+    app.selection.selected_automation_points.clear();
+    let mut host = UiHost::no_redraw();
+    let y_top = track0_bottom() + 4.0;
+    let y_bottom = lane_bottom() - 6.0;
+    drive(&mut host, &mut app, press(9.0 * ZOOM, y_top, no_mods()));
+    drive(&mut host, &mut app, hold(0.5 * ZOOM, y_bottom, no_mods()));
+    drive(&mut host, &mut app, release(0.5 * ZOOM, y_bottom, no_mods()));
+    assert!(
+        !app.selection.selected_automation_points.is_empty(),
+        "空き zone の drag で lasso が走り point が選択される"
+    );
+}
+
+// ------------------------------------------------------------
+// 3. 描画順 (heavy → header の z 順)
+// ------------------------------------------------------------
+
+/// **フェーズ順の入れ替えを機械で止める唯一の手段。**
+///
+/// `Scene.primitives` は call order = z-order なので、`render::dispatch` →
+/// `release::commit_releases` → `header::draw_rows` の順を入れ替えると
+/// track header 行が heavy の背景に埋もれる (build / test / clippy をすり抜ける壊れ方)。
+///
+/// 色パレットに依存しないよう **幾何** で 2 つの marker を引く:
+/// - A = heavy が最初に置く lanes 全面の背景 (`draw_lanes_bg` の `push_filled_rect(lanes, bg)`)
+/// - B = master 行 header の panel (`header::draw_rows` の `ui.panel(("arr_master_thbg", 0), ..)`)
+///
+/// heavy が置く header pane 背景は `h = lanes.h` なので、B とは `h` で区別できる
+/// (**`h` が同じ rect を marker にしないこと**)。
+#[test]
+fn heavy_lanes_bg_is_drawn_before_header_rows() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    let mut host = UiHost::no_redraw();
+    let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+
+    let lanes_h = WIDGET_RECT.h - 20.0 - 18.0; // ruler 20 + arranger 帯 18
+    let index_of = |want: Rect| -> Option<usize> {
+        scene.primitives.iter().position(|p| match p {
+            Primitive::Rect(c) => {
+                (c.rect.x - want.x).abs() < 0.5
+                    && (c.rect.y - want.y).abs() < 0.5
+                    && (c.rect.w - want.w).abs() < 0.5
+                    && (c.rect.h - want.h).abs() < 0.5
+            }
+            _ => false,
+        })
+    };
+    let a = index_of(Rect { x: HEADER_W, y: 38.0, w: WIDGET_RECT.w - HEADER_W, h: lanes_h })
+        .expect("heavy が置く lanes 全面の背景");
+    let b = index_of(Rect { x: 0.0, y: 38.0, w: HEADER_W, h: ROW_H })
+        .expect("master 行 header の panel");
+    assert!(
+        b > a,
+        "header 行は heavy の背景より後 (= 手前) に積まれる: lanes_bg={a} master_header={b}"
     );
 }

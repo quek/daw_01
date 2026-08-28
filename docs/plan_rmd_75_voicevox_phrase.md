@@ -2034,9 +2034,16 @@ fn five_minute_song_renders_every_phrase() { … }
 10. **`cargo build --workspace` を忘れない。** `NoteMetadata` の doc / `PluginCommand` /
     `PluginEvent` を変えるので `PROTOCOL_FINGERPRINT` が変わる。子 exe が古いと
     handshake で弾かれる (それが検出網の目的なので、正しく作り直せばよい)。
-11. **god file budget**: `daw_plugin_host/src/builtin/voicevox.rs` は現在 1,300 行。
+11. **サイズ budget**: `daw_plugin_host/src/builtin/voicevox.rs` は現在 物理 1,300 行。
     レンダリングは `voicevox_render.rs` へ出すので増えない (むしろ synth thread の
     inline 実装が減る)。3,000 行に近づいたら更に分ける。
+    > (当時の指標 = 物理行 3,000。r.md #76 で実コード行 1,000 + 関数 300 行 + インデント 6 段へ
+    > 置換済み。現在値は `python scripts/loc_budget.py --report`。)
+    > 新指標では **実コード 708 行**なので `FILE-BUDGET` (1,000) には余裕がある。ただし
+    > `VoicevoxBuiltin::start_synth_thread` は **インデント 11 段 / 6 段以上が 173 行**で
+    > `scripts/arch_lint_baseline.txt` に登録済み (天井 `11/173`、**1 行も太れない**)。
+    > synth thread の inline 実装を `voicevox_render.rs` へ出すこの計画は
+    > その天井を下げる方向に効く。着地後に「解消」通知を読んで天井を実測値へ更新すること。
 12. **キャッシュ世代を上げるので、実装直後の 1 回だけ全曲再合成が走る。**
     ユーザーに事前に伝えること (「直した直後は遅い」という体験になる)。
     旧 1 GB のエントリは prune が mtime 順に押し出す。

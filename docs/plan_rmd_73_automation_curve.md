@@ -1866,6 +1866,21 @@ id 採番もこの関数が担うことを 1 行足す。
 どちらの diff も読めなくなる。移動するのは下記 (2) の 7 本 + ヘルパ 1 本 (約 210 行) と、
 新規に書く (3) の 8 本。**(1) は行レイアウトのテストなので `tests.rs` に残す。**
 
+> **(当時の指標 = 物理行 3,000。r.md #76 で実コード行 1,000 + 関数 300 行 + インデント 6 段へ
+> 置換済み。現在値は `python scripts/loc_budget.py --report`。)**
+> **新指標では上の「god file budget が理由」は成り立たない。** `tests.rs` は
+> `arrangement/mod.rs` の `#[cfg(test)] mod tests;` から解決されるファイルなので
+> **丸ごとテスト扱い = 実コード 0 行**として測られ (実測: raw 2,591 / ncloc 0 / test 2,591)、
+> 何行足しても `FILE-BUDGET` には当たらない。物理行で測っていた頃の
+> 「テストを厚くすると分割を迫られる」逆インセンティブを断つのが r.md #76 の目的そのもの。
+> **`tests_curve.rs` へ切り出すかどうかは「読みやすさの判断」として改めて決めること**
+> (機械検査は要求しない)。この計画書の他の箇所 (§4.2 の「god file budget の理由」/
+> §7 の「god file budget (3,000 行…)」/ リスク表の「予算 (2,591 行) が 3,000 に近づく」) も
+> 同じく当時の指標。
+> なお `arrangement/mod.rs` 本体 (実コード 1,249 行) と `run.rs` / `draw.rs` / `geometry.rs` は
+> `scripts/arch_lint_baseline.txt` に登録済みで、**天井は実測値なので 1 行も太れない**。
+> #73 が production 側へ足す行はこの天井に当たる。
+
 **(1) `ArrangementAutomationLane` の構造体リテラル 4 か所を直す (`tests.rs` に残す)**
 
 `tests.rs:220` / `245` / `268` / `291` が `ArrangementAutomationLane { .. }` を直に組んでいる。

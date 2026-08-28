@@ -1482,6 +1482,15 @@ god file budget まで 377 行しかない。D-4 が足すもの (選択配線 /
 外部 drop / 右クリックメニュー 5 項目 / popup gate) はその大半を食う。
 CLAUDE.md の不変条件 9 は「**超過したら分割してから足す**」なので、**先に割る**。
 
+> (当時の指標 = 物理行 3,000。r.md #76 で実コード行 1,000 + 関数 300 行 + インデント 6 段へ
+> 置換済み。現在値は `python scripts/loc_budget.py --report`。
+> **新指標では `track_inspector/mod.rs` は実コード 2,214 行 = 1,000 行 budget の 2 倍超**、
+> `draw` 単体で実コード 2,063 行 = 関数 budget の 6.9 倍で、どちらも
+> `scripts/arch_lint_baseline.txt` に登録済み。「377 行しか余裕が無い」という当時の根拠は
+> 新指標では更に強くなる。この計画書の他の箇所 (§0.5 の触るファイル一覧の
+> 「god file budget」/ §G 流儀の「god file budget (不変条件 9、3,000 行)」) に出てくる
+> 3,000 行も同じく当時の値。)
+
 割り方は自明で、`draw` の中の `ui.reorderable_list_expandable(` (`:1116`) は
 **`:2489` まで続いており、その `expansion` クロージャ (`:1195-2488`) が約 1,300 行を
 抱えている**: Group Transform (`:1201-`)、映像 FX param (`:1377-`)、plugin param
