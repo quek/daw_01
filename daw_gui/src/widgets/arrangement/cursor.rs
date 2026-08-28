@@ -74,7 +74,7 @@ pub(super) fn hover(
             {
                 return None;
             }
-            automation_segment_at(
+            curve::automation_segment_at(
                 &f.visible_tracks,
                 &f.tops,
                 f.view.track_row_h,

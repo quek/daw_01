@@ -394,16 +394,7 @@ pub(super) fn commit_releases(
             }
         }
 
-        // ---- r.md #73: automation_segment_bend release → SetAutomationCurve ----
-        // preview が anchor と同値なら no-op (= Alt+クリックしただけで動かしていない)。
-        // point は **安定 id** で指す (press → release を跨ぐので positional index では
-        // 追加 / 削除でずれる = 不変条件 1)。 undo は snapshot 方式なので prev は載せない。
-        if let Some(bd) = automation_segment_bend_release
-            && bd.preview_curve != bd.anchor_curve
-            && bd.point.point_id != 0
-        {
-            ui.push_edit({ let (k, next) = (bd.point, bd.preview_curve); Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetAutomationCurve { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_id: k.point_id, next }); }) });
-        }
+        curve::commit_segment_bend(ui, automation_segment_bend_release);
 
         // ---- M14 Phase 63n-8 (#033): automation_lasso_drag release → SelectAutomationPoints ----
         // 空き lane zone で press → drag → release で発火。 next 計算は **press 時 modifier** で分岐:
@@ -1239,27 +1230,13 @@ pub(super) fn commit_releases(
                 // caller (daw_01) が automation_point_rects で rect を引いて inline 数値入力 overlay を出す。
                 ui.push_edit({ let v_key = pt_key; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::BeginEditAutomationPointValue { key: AutomationPointKeyRef { track_id: v_key.clip.track, lane_id: v_key.clip.lane, clip_id: v_key.clip.clip, point_idx: v_key.point_idx } }); }) });
             } else if pointer.modifiers.alt
-                && let Some(seg) = automation_segment_at(
-                    visible_tracks,
-                    press_tops,
-                    view.track_row_h,
-                    view,
-                    header_pane.x,
-                    header_pane.w,
-                    lanes,
-                    cx,
-                    cy,
-                    style,
-                )
-                && seg.point.point_id != 0
+                && curve::reset_segment_to_linear(ui, f, cx, cy)
             {
                 // r.md #73: 線の上 (`automation_curve_segment_hit_px` 以内) で
-                // Alt+ダブルクリック → その区間を直線に戻す。 線から離れていれば
-                // 下の AddAutomationPoint 経路に落ちて、 従来どおり Alt = スナップ無効で
-                // 点を足す (= 線の近くでは点を足せなくなるが、 これは確定方針)。
-                if seg.curve != common::model::AutomationCurve::Linear {
-                    ui.push_edit({ let k = seg.point; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetAutomationCurve { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_id: k.point_id, next: common::model::AutomationCurve::Linear }); }) });
-                }
+                // Alt+ダブルクリック → その区間を直線に戻す (`reset_segment_to_linear`)。
+                // 線から離れていれば `false` が返って下の AddAutomationPoint 経路に落ち、
+                // 従来どおり Alt = スナップ無効で点を足す
+                // (= 線の近くでは点を足せなくなるが、 これは確定方針)。
             } else if let Some((t_idx, lane_idx, _h_rect, body_rect)) = automation_lane_at(
                 visible_tracks,
                 press_tops,
@@ -1380,3 +1357,8 @@ pub(super) fn commit_releases(
             }
         }
 }
+
+// r.md #73: 区間 bend の release commit (`curve::commit_segment_bend`) と、
+// 線の上の Alt+ダブルクリック (`curve::reset_segment_to_linear`) は `curve.rs` が持つ。
+// hit → session → 逆算 → commit がひと続きの subsystem なので、書き込み側だけを
+// この 1,000 行の god function の隣に置くと読めなくなる。

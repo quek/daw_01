@@ -207,6 +207,227 @@ pub(super) fn flatten_clip_curve(
     out
 }
 
+// ============================================================
+// 区間の当たり判定 (画面 → 区間)
+// ============================================================
+
+/// r.md #73: `automation_segment_at` の戻り値。 bend session の anchor をそのまま作れる形。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AutomationSegmentHit {
+    /// 入射側 point (= curve 属性を持つ後ろの点)。
+    pub point: AutomationPointIdKey,
+    /// 掴んだ位置の区間内進捗。
+    pub grab_u: f64,
+    /// 区間の始点値 / 終点値 (plain)。 overlay の再描画にもそのまま使う。
+    pub a_plain: f64,
+    pub b_plain: f64,
+    /// 現在の curve。
+    pub curve: AutomationCurve,
+    /// clip 描画域 (縦 padding 適用済)。 norm ↔ y の anchor。
+    pub clip_rect: Rect,
+}
+
+/// r.md #73: lane body 内の cursor から、曲げられる区間の当たりを返す。
+///
+/// 判定は「cursor x から区間内進捗 `u` を出し、`eval_norm` で曲線の y を評価して
+/// `|cy - y| <= style.automation_curve_segment_hit_px`」。曲線の形の評価は
+/// `common::automation::apply_curve` 1 本を通る (SSoT) ので、この関数は
+/// `geometry.rs` ではなくここ (= 曲線 ↔ 画面の変換を集める場所) に居る。
+///
+/// **`automation_point_at` が `None` のときだけ呼ぶこと** — 点の当たり判定 (半径 2 倍)
+/// が区間より先に効く (Alt+クリックの点削除と共存させるため)。
+///
+/// 引数の並びは `geometry::automation_point_at` と同じ (`.., lanes, cx, cy, style`)。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub(super) fn automation_segment_at(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    view: ArrangementView,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes: Rect,
+    cx: f32,
+    cy: f32,
+    style: &ArrangementStyle,
+) -> Option<AutomationSegmentHit> {
+    if !lanes.contains(cx, cy) {
+        return None;
+    }
+    let mut best: Option<(f32, AutomationSegmentHit)> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes.x,
+        lanes.w,
+        style,
+        |t_idx, _l_idx, lane, _h_rect, body_rect| {
+            if cy < body_rect.y || cy >= body_rect.y + body_rect.h {
+                return;
+            }
+            let track_id = visible_tracks[t_idx].id;
+            let Some(cand) = segment_hit_in_lane(track_id, lane, body_rect, view, style, cx, cy)
+            else {
+                return;
+            };
+            if best.as_ref().is_none_or(|(d, _)| cand.0 < *d) {
+                best = Some(cand);
+            }
+        },
+    );
+    best.map(|(_, hit)| hit)
+}
+
+/// 1 lane の中で cursor に最も近い区間と、その距離 (px) を返す。
+///
+/// 除外するもの:
+/// - `norm_mapping_is_invertible` が false の lane (= Mute。逆算に連続解が無い)
+/// - 端点の screen y の差が 1px 未満の区間 (= 水平区間。数学的に曲げられない。
+///   端点が両方とも窓の外で同じ端に飽和している区間もここで落ちる)
+/// - 幅 0 の区間
+/// - 入射側 point の `id == 0` (未採番 sentinel。安定 id で指せない)
+///
+/// `beat_to_px` / `clip_y` / `clip_h` は `geometry::automation_point_at` と **同じ式**
+/// (point dot と curve の x がずれる既知バグ #028 user 指摘 2 の再発防止)。
+#[must_use]
+fn segment_hit_in_lane(
+    track_id: u32,
+    lane: &ArrangementAutomationLane,
+    body_rect: Rect,
+    view: ArrangementView,
+    style: &ArrangementStyle,
+    cx: f32,
+    cy: f32,
+) -> Option<(f32, AutomationSegmentHit)> {
+    let pad = style.automation_clip_v_pad_px;
+    let clip_rect = Rect {
+        x: body_rect.x,
+        y: body_rect.y + pad,
+        w: body_rect.w,
+        h: (body_rect.h - pad * 2.0).max(2.0),
+    };
+    let map = LaneValueMap::from_lane(lane, clip_rect);
+    if !map.is_bendable() {
+        return None; // Mute lane は逆写像を持たないので曲げられない
+    }
+    let hit_px = style.automation_curve_segment_hit_px.max(1.0);
+    let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+    let to_x = |abs_beat: f64| -> f32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let x = body_rect.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+        x
+    };
+    let mut best: Option<(f32, AutomationSegmentHit)> = None;
+    for clip_in in &lane.clips {
+        for i in 1..clip_in.points.len() {
+            let (p_prev, p_next) = (&clip_in.points[i - 1], &clip_in.points[i]);
+            let x_prev = to_x(clip_in.start_beat + p_prev.time_beat);
+            let x_next = to_x(clip_in.start_beat + p_next.time_beat);
+            let bendable = p_next.id != 0
+                && x_next - x_prev > 1e-3
+                && cx > x_prev
+                && cx < x_next
+                && (map.plain_to_y(p_next.value_plain) - map.plain_to_y(p_prev.value_plain)).abs()
+                    >= 1.0;
+            if !bendable {
+                continue;
+            }
+            let u = f64::from(cx - x_prev) / f64::from(x_next - x_prev);
+            let y = map.norm_to_y(eval_norm(
+                map,
+                p_prev.value_plain,
+                p_next.value_plain,
+                u,
+                p_next.curve,
+            ));
+            let d = (cy - y).abs();
+            if d > hit_px || best.as_ref().is_some_and(|(bd, _)| *bd <= d) {
+                continue;
+            }
+            let clip_key =
+                AutomationClipKey { track: track_id, lane: lane.id, clip: clip_in.id };
+            let point = AutomationPointIdKey { clip: clip_key, point_id: p_next.id };
+            let a_plain = p_prev.value_plain;
+            let b_plain = p_next.value_plain;
+            let curve = p_next.curve;
+            best = Some((d, AutomationSegmentHit {
+                point,
+                grab_u: u,
+                a_plain,
+                b_plain,
+                curve,
+                clip_rect,
+            }));
+        }
+    }
+    best
+}
+
+/// r.md #73: 安定 id で区間を引く (`geometry::find_automation_point_data` の id 版)。
+/// 戻り値は `(前の点, この点)` — 曲線は **入射区間**の属性なので、片方だけでは
+/// 形を描けない。 前の点が無い (= clip の先頭) なら `None`。
+#[must_use]
+pub(super) fn find_automation_segment_by_id(
+    visible_tracks: &[ArrangementTrack],
+    key: AutomationPointIdKey,
+) -> Option<(&ArrangementAutomationPoint, &ArrangementAutomationPoint)> {
+    let (_lane, clip) = find_lane_clip(visible_tracks, key.clip)?;
+    let idx = clip.points.iter().position(|p| p.id == key.point_id && p.id != 0)?;
+    if idx == 0 {
+        return None;
+    }
+    Some((&clip.points[idx - 1], &clip.points[idx]))
+}
+
+// ============================================================
+// bend の drag session
+// ============================================================
+
+/// r.md #73: レーン本体の線 (= 2 点の間の区間) を Alt+ドラッグして曲げる session。
+///
+/// 掴んだ場所が指に付いてくるよう、感度定数ではなく **逆算** で curve を決める
+/// ([`solve_bend`])。逆算は区間の符号付き高さ `(b - a)` で割るので、
+/// 上り区間 / 下り区間で自動的に正しい符号の progress 値になる
+/// (保存する値は progress 基準なので、同じ画面ジェスチャが区間の向きで逆符号になる)。
+/// commit は release で 1 回だけ (undo 1 段)。
+///
+/// 他の drag session と違ってこの型だけ `mod.rs` ではなくここに居る —
+/// hit ([`AutomationSegmentHit`]) → anchor → 逆算がひと続きの subsystem で、
+/// 全フィールドが曲線ドメインの値だから。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AutomationSegmentBendSession {
+    /// 曲げる区間の **入射側** point (= `curve` 属性を持つ後ろの点)。
+    pub point: AutomationPointIdKey,
+    /// press 時に掴んだ位置の区間内進捗 `u ∈ (0, 1)`。drag 中不変
+    /// (横スクロール / ズームしても掴んだ場所が動かない)。
+    pub grab_u: f64,
+    /// 区間の始点値 / 終点値 (plain)。drag 中 model 不変なので anchor 固定。
+    pub a_plain: f64,
+    pub b_plain: f64,
+    /// press 時の curve (= release の no-op 判定に使う anchor)。
+    pub anchor_curve: AutomationCurve,
+    /// 逆算の基準になる curve。`anchor_curve` が Hold / Linear なら
+    /// `Exponential { bend: 0.0 }` (= 直線へ自動変換)、それ以外は `anchor_curve`。
+    pub start_curve: AutomationCurve,
+    /// press 時点の `apply_curve(a, b, grab_u, start_curve)` を norm に写した値。
+    /// 指の移動 px をここに足して目標値を作る (= 変換直後の線から相対で追従)。
+    /// **Hold 区間ではここで 1 度だけ線が飛ぶ** — `k ∈ [0.5, 2]` のどの
+    /// `Exponential` も `u<1` で値 `a` を通らないので連続解が存在しない。
+    pub anchor_value_norm: f32,
+    /// press 時点の clip 描画域 (norm ↔ y の anchor。view scroll 耐性)。
+    pub clip_rect_anchor: Rect,
+    pub anchor_mouse_y: f32,
+    /// 直近の cursor y (release frame は anchor と異なるときだけ更新 — 既存 pattern)。
+    pub last_mouse_y: f32,
+    /// drag 中の live curve (overlay 描画 + release commit の SSoT)。
+    /// `anchor_curve` と同値なら release で no-op。
+    pub preview_curve: AutomationCurve,
+}
+
 /// r.md #73: 「掴んだ場所が指に付いてくる」逆算。
 ///
 /// `target_norm` は目標の値 (norm)、`grab_u` は掴んだ位置の区間内進捗。
@@ -274,4 +495,64 @@ pub(super) fn solve_bend(
         // caller が `start_curve` を `Exponential { bend: 0.0 }` へ変換済なので到達しない。
         AutomationCurve::Hold | AutomationCurve::Linear => None,
     }
+}
+
+// ============================================================
+// 書き込み側 (`AppEvent::SetAutomationCurve` を出す 2 経路)
+//
+// release.rs ではなくここに居るのは、hit → session → 逆算 → commit が
+// ひと続きの subsystem だから。書き込み側だけを 1,000 行の
+// `commit_releases` の隣に置くと、機能が 2 ファイルに割れて読めなくなる。
+// ============================================================
+
+/// r.md #73: 区間 bend の release commit (`SetAutomationCurve` 1 件 = undo 1 段)。
+///
+/// preview が anchor と同値なら no-op (= Alt+クリックしただけで動かしていない)。
+/// point は **安定 id** で指す — 曲線編集は press → release を跨ぐので positional index
+/// では追加 / 削除でずれる (アーキテクチャ不変条件 1)。 undo は snapshot 方式なので
+/// `prev` は載せない。
+pub(super) fn commit_segment_bend(
+    ui: &mut Ui<'_, AppData>,
+    released: Option<AutomationSegmentBendSession>,
+) {
+    let Some(bd) = released else { return };
+    if bd.preview_curve == bd.anchor_curve || bd.point.point_id == 0 {
+        return;
+    }
+    emit_set_curve(ui, bd.point, bd.preview_curve);
+}
+
+/// r.md #73: 線の上 (`automation_curve_segment_hit_px` 以内) の Alt+ダブルクリックで
+/// その区間を直線に戻す。 **消費したら `true`** を返す (= caller は次の分岐へ落とさない)。
+///
+/// 既に `Linear` の区間でも `true` を返す — 「線を狙った」ことは確かなので、
+/// そこに点を足す経路へ落とすと「戻すつもりが点が増えた」になる。
+pub(super) fn reset_segment_to_linear(
+    ui: &mut Ui<'_, AppData>,
+    f: &ArrangementFrame<'_>,
+    cx: f32,
+    cy: f32,
+) -> bool {
+    let hit = automation_segment_at(
+        &f.visible_tracks, &f.tops, f.view.track_row_h, f.view,
+        f.header_pane.x, f.header_pane.w, f.lanes, cx, cy, f.style,
+    );
+    let Some(seg) = hit.filter(|s| s.point.point_id != 0) else { return false };
+    if seg.curve != AutomationCurve::Linear {
+        emit_set_curve(ui, seg.point, AutomationCurve::Linear);
+    }
+    true
+}
+
+/// 上の 2 経路が共有する 1 本の発行口 (event が 1 種類しかないことを形で示す)。
+fn emit_set_curve(ui: &mut Ui<'_, AppData>, key: AutomationPointIdKey, next: AutomationCurve) {
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::SetAutomationCurve {
+            track_id: key.clip.track,
+            lane_id: key.clip.lane,
+            clip_id: key.clip.clip,
+            point_id: key.point_id,
+            next,
+        });
+    }));
 }

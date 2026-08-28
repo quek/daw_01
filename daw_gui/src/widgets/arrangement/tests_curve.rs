@@ -428,7 +428,7 @@ fn automation_segment_at_hits_the_drawn_curve() {
     // 中央 (u=0.5) の値は norm 0.5 → y = clip_y + 0.5 * clip_h。
     let mid_x = 100.0_f32;
     let mid_y = clip_y + 0.5 * clip_h;
-    let hit = automation_segment_at(
+    let hit = curve::automation_segment_at(
         &tracks, &tops, view.track_row_h, view, 0.0, 0.0, lanes, mid_x, mid_y, &style,
     );
     let hit = hit.expect("曲線の上なので当たる");
@@ -436,7 +436,7 @@ fn automation_segment_at_hits_the_drawn_curve() {
     assert!((hit.grab_u - 0.5).abs() < 1e-2, "掴んだ進捗は 0.5 前後: got {}", hit.grab_u);
     // 20px 離れると当たらない (既定の hit 半径は 6px)。
     assert!(
-        automation_segment_at(
+        curve::automation_segment_at(
             &tracks,
             &tops,
             view.track_row_h,
@@ -455,7 +455,7 @@ fn automation_segment_at_hits_the_drawn_curve() {
     let mut tracks_unnumbered = tracks.clone();
     tracks_unnumbered[0].automation_lanes[0].clips[0].points[1].id = 0;
     assert!(
-        automation_segment_at(
+        curve::automation_segment_at(
             &tracks_unnumbered,
             &tops,
             view.track_row_h,
@@ -475,7 +475,7 @@ fn automation_segment_at_hits_the_drawn_curve() {
     mute_tracks[0].automation_lanes[0].target =
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute);
     assert!(
-        automation_segment_at(
+        curve::automation_segment_at(
             &mute_tracks,
             &tops,
             view.track_row_h,

@@ -58,9 +58,12 @@ use crate::app::{
 
 pub(crate) mod view_build;
 mod content_build;
-// r.md #73: 曲線 ↔ 画面の変換 SSoT。 `use curve::*;` は **しない** — `curve::eval_norm`
+// r.md #73: 曲線 ↔ 画面の変換 SSoT。 **関数は glob で出さない** — `curve::eval_norm`
 // のように修飾して呼ぶ (同名の自由関数が draw / geometry と衝突しやすい)。
+// session 型だけは他の drag session と同じ名前で書けるよう名指しで import する
+// (`ArrangementState` のフィールド / `LiveSessions` / `Overlays` が並べて持つため)。
 mod curve;
+use curve::AutomationSegmentBendSession;
 mod draw;
 use draw::*;
 mod geometry;
@@ -1838,42 +1841,9 @@ struct HeaderResizeDragSession {
     last_emitted_w: f32,
 }
 
-/// r.md #73: レーン本体の線 (= 2 点の間の区間) を Alt+ドラッグして曲げる session。
-///
-/// 掴んだ場所が指に付いてくるよう、感度定数ではなく **逆算** で curve を決める
-/// (`curve::solve_bend`)。逆算は区間の符号付き高さ `(b - a)` で割るので、
-/// 上り区間 / 下り区間で自動的に正しい符号の progress 値になる
-/// (保存する値は progress 基準なので、同じ画面ジェスチャが区間の向きで逆符号になる)。
-/// commit は release で 1 回だけ (undo 1 段)。
-#[derive(Clone, Copy, Debug)]
-pub(super) struct AutomationSegmentBendSession {
-    /// 曲げる区間の **入射側** point (= `curve` 属性を持つ後ろの点)。
-    pub point: AutomationPointIdKey,
-    /// press 時に掴んだ位置の区間内進捗 `u ∈ (0, 1)`。drag 中不変
-    /// (横スクロール / ズームしても掴んだ場所が動かない)。
-    pub grab_u: f64,
-    /// 区間の始点値 / 終点値 (plain)。drag 中 model 不変なので anchor 固定。
-    pub a_plain: f64,
-    pub b_plain: f64,
-    /// press 時の curve (= release の no-op 判定に使う anchor)。
-    pub anchor_curve: common::model::AutomationCurve,
-    /// 逆算の基準になる curve。`anchor_curve` が Hold / Linear なら
-    /// `Exponential { bend: 0.0 }` (= 直線へ自動変換)、それ以外は `anchor_curve`。
-    pub start_curve: common::model::AutomationCurve,
-    /// press 時点の `apply_curve(a, b, grab_u, start_curve)` を norm に写した値。
-    /// 指の移動 px をここに足して目標値を作る (= 変換直後の線から相対で追従)。
-    /// **Hold 区間ではここで 1 度だけ線が飛ぶ** — `k ∈ [0.5, 2]` のどの
-    /// `Exponential` も `u<1` で値 `a` を通らないので連続解が存在しない。
-    pub anchor_value_norm: f32,
-    /// press 時点の clip 描画域 (norm ↔ y の anchor。view scroll 耐性)。
-    pub clip_rect_anchor: Rect,
-    pub anchor_mouse_y: f32,
-    /// 直近の cursor y (release frame は anchor と異なるときだけ更新 — 既存 pattern)。
-    pub last_mouse_y: f32,
-    /// drag 中の live curve (overlay 描画 + release commit の SSoT)。
-    /// `anchor_curve` と同値なら release で no-op。
-    pub preview_curve: common::model::AutomationCurve,
-}
+// r.md #73: 区間 bend の session 型 (`AutomationSegmentBendSession`) は `curve.rs` が持つ。
+// hit (`AutomationSegmentHit`) → anchor → 逆算 (`solve_bend`) がひと続きの subsystem なので、
+// session だけをここに置くと「curve の話がこのファイルにもある」状態に戻る。
 
 /// M14 Phase 63n-8 (#033): automation point の lasso (= 空き automation lane zone から drag による
 /// 矩形選択) session。 既存 MIDI rect_select (`take_drag_rect_in_rect`) は library 全 widget 共用の

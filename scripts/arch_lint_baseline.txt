@@ -76,7 +76,6 @@ FILE-BUDGET | daw_gui/src/widgets/arrangement/mod.rs      | 1261 | #77 の分割
 # 本体 1,300 行は 1 byte も動いていない)。**署名の複雑度と引き換えに実コード行が増えた**
 # 形なので、wheel / double-click / secondary-click / marquee の切り出し (#77 のスコープ外)
 # で本体を割れば両方下がる。
-FILE-BUDGET | daw_gui/src/widgets/arrangement/release.rs  | 1003 | #77 の署名縮小で +26。本体分割が要る。未起票
 
 # B. daw_gui の app / view / handler 中核。巨大 draw と巨大 match が 1 ファイルに溜まる。
 #    責務は分かれているのにファイルが分かれていない (track_inspector は 1 関数で 2,063 行、
@@ -172,7 +171,6 @@ FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::automation_point_at   
 FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect      | 8/8    | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | #77 と同型の分割が未着手
 FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | #77 の対象外。未起票
-FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::find_curve_param_handle_at  | 7/19   | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/press_header.rs::lane_header             | 7/14   | #77 が 11 段から切り出した残り。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/rects.rs::push_point_rects               | 7/10   | #77 が 11 段から切り出した残り。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash       | 7/8    | #77 の対象外。未起票

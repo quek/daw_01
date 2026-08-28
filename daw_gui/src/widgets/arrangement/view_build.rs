@@ -512,6 +512,30 @@ fn build_arrangement_automation_lanes(
     build_arrangement_lanes_from_slice(&track.automation_lanes, track.id, data, range_of, param_name_of)
 }
 
+/// model の automation point 1 つを widget の point へ写す。
+///
+/// r.md #73: **`value_plain` と `value_norm` を同じ model 点から両方作る** —
+/// 片方から片方を再変換しないこと。`plain_to_norm_ranged` は末尾で `clamp(0, 1)` するので、
+/// 窓の外に出る値 (`GroupTransform::X` 等) は norm から復元できない。
+/// 曲線の評価 / hit-test / 逆算は `value_plain`、点 dot の y / drag の delta は `value_norm`。
+fn widget_point(
+    p: &common::model::AutomationPoint,
+    target: &common::model::AutomationTarget,
+    range: Option<(f64, f64)>,
+    content_offset_beats: f64,
+) -> ArrangementAutomationPoint {
+    ArrangementAutomationPoint {
+        // r.md #73: 曲線編集は安定 id で point を指す (アーキテクチャ不変条件 1)。
+        id: p.id,
+        // r.md #44: widget は clip の窓ローカル座標で描く
+        // (curve は content-local なので窓の offset を引く)。
+        time_beat: p.time_beat - content_offset_beats,
+        value_norm: common::automation::plain_to_norm_ranged(target, p.value, range),
+        value_plain: p.value,
+        curve: p.curve,
+    }
+}
+
 fn build_arrangement_lanes_from_slice(
     lanes: &[common::model::AutomationLane],
     track_id: u32,
@@ -538,23 +562,7 @@ fn build_arrangement_lanes_from_slice(
                         .and_then(|cc| cc.automation_points())
                         .unwrap_or(&[])
                         .iter()
-                        .map(|p| ArrangementAutomationPoint {
-                            // r.md #73: 曲線編集は安定 id で point を指す (不変条件 1)。
-                            id: p.id,
-                            // r.md #44: widget は clip の窓ローカル座標で描く
-                            // (curve は content-local なので窓の offset を引く)。
-                            time_beat: p.time_beat - c.content_offset_beats,
-                            value_norm: common::automation::plain_to_norm_ranged(
-                                &lane.target,
-                                p.value,
-                                range,
-                            ),
-                            // r.md #73: 曲線の真実は plain。 `value_norm` は clamp 済の
-                            // 画面射影なので、窓の外の値はここからしか復元できない。
-                            // **片方から片方を再変換しないこと** (同じ model 点から両方作る)。
-                            value_plain: p.value,
-                            curve: p.curve,
-                        })
+                        .map(|p| widget_point(p, &lane.target, range, c.content_offset_beats))
                         .collect();
                     ArrangementAutomationClip {
                         id: c.id,

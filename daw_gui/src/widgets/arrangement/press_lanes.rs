@@ -294,7 +294,7 @@ fn segment_bend(
     {
         return;
     }
-    let Some(seg) = automation_segment_at(
+    let Some(seg) = curve::automation_segment_at(
         &f.visible_tracks,
         &f.tops,
         f.view.track_row_h,

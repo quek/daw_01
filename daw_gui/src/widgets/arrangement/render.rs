@@ -888,7 +888,7 @@ fn resolve_bend_segment<'a>(
     key: AutomationPointIdKey,
 ) -> Option<ResolvedSegment<'a>> {
     let (lane, clip) = find_lane_clip(&f.visible_tracks, key.clip)?;
-    let (p_prev, p_next) = find_automation_segment_by_id(&f.visible_tracks, key)?;
+    let (p_prev, p_next) = curve::find_automation_segment_by_id(&f.visible_tracks, key)?;
     let body_rect = automation_lane_body_rect(
         &f.visible_tracks,
         &f.tops,
