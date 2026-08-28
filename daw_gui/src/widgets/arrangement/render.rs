@@ -70,21 +70,9 @@ pub(super) fn dispatch(
             |a, &x| a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x)),
         )
     });
-    // r.md #73 の同件: gain ドラッグ中の clip も同じ扱い (base の dB handle line を cached が
-    // 描かず、 ghost の 1 本だけにする)。 **kind が Gain のときだけ** — fade 系の drag は
-    // dB handle line を動かさないので、 skip すると線がただ消える。
-    let gain_drag_skip = overlays
-        .audio
-        .filter(|ad| ad.kind == AudioDragKind::Gain)
-        .map(|ad| ad.key);
-    let gain_drag_skip_hash: u64 = gain_drag_skip.map_or(0, |k| {
-        [k.track, k.clip].iter().fold(0xCBF2_9CE4_8422_2325_u64, |a, &x| {
-            a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x))
-        })
-    });
     let viewport_key = (
         (
-            b"arrangement_widget_v9" as &[u8],
+            b"arrangement_widget_v8" as &[u8],
             f.rect.w.to_bits(),
             f.rect.h.to_bits(),
             f.view.start_beat.to_bits(),
@@ -106,7 +94,7 @@ pub(super) fn dispatch(
         // key に含める — 「サイズ不変で位置 / lane 高さだけ変わる」 layout
         // 変化で旧座標に描かれるのを correct-by-construction で防ぐ。
         (f.rect.x.to_bits(), f.rect.y.to_bits(), f.view.arranger_lane_h.to_bits()),
-        (bend_skip_hash, gain_drag_skip_hash),
+        bend_skip_hash,
     );
 
     // M14 Phase 63n-3 (#028) / 63c (#016) / 63n-8 (#033): heavy 用 selection 集合。
@@ -191,8 +179,6 @@ pub(super) fn dispatch(
         // r.md #73: 曲げている最中の区間 (cached 層で base curve を描かない対象)。
         // `hovered_segment` と違い `viewport_key` に入っている (上の `bend_skip_hash`)。
         bend_skip,
-        // r.md #73 の同件: gain ドラッグ中の clip (base の dB handle line を描かない対象)。
-        gain_drag_skip,
         clip_content,
         stretch_ghost_content,
         selected_clip_set,
@@ -229,11 +215,6 @@ pub(super) struct HeavyInput {
     /// `bend_skip_hash`)。 cached の中身が変わるので入れないと反映されないし、値が変わるのは
     /// ドラッグの開始と終了の 2 回だけなので hover のような毎フレーム再構築にはならない。
     pub bend_skip: Option<AutomationPointIdKey>,
-    /// r.md #73 の同件: gain ドラッグ中の clip。 cached 層はこの clip の dB handle line を
-    /// **描かない** (`draw_audio_drag_ghost` が preview 値の 1 本を描く)。 `bend_skip` と同じく
-    /// **`viewport_key_hash` の材料にする** (`gain_drag_skip_hash`)。 値が変わるのはドラッグの
-    /// 開始と終了の 2 回だけ。
-    pub gain_drag_skip: Option<ClipKey>,
     pub clip_content: HashMap<ClipKey, ClipContentDraw>,
     /// r.md #68: Shift + 端 drag のときだけ入る「伸縮済みの中身」。 空のときは
     /// ゴーストも `clip_content` をそのまま描く (トリム / 移動では確定後の中身が
@@ -320,14 +301,7 @@ fn render_arrangement_heavy(
                     if r.w < f.style.audio_min_clip_w_for_handles_px {
                         continue;
                     }
-                    // r.md #73 の同件: gain drag 中の clip は base の dB handle line を
-                    // 描かない。 ghost が preview 位置に描くので、 描くと横線が 2 本になる
-                    // (曲線の 2 重線と同 root cause)。
-                    let gain_dragging =
-                        heavy.gain_drag_skip == Some(ClipKey { track: t.id, clip: c.id });
-                    if let Some(audio) = c.audio_edit
-                        && !gain_dragging
-                    {
+                    if let Some(audio) = c.audio_edit {
                         // r.md #46 / #73: 標識の色は clip の **実塗り色** から導く
                         // (fade と同じ SSoT = `clip_effective_fill`)。
                         let clip_bg = clip_effective_fill(c, t.kind, f.style);
