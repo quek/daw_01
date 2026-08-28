@@ -161,6 +161,8 @@ impl AppData {
         // 新 project の vocal device に seed 合成が飛ばず無音になる)。各 device の
         // load 時にも個別 invalidate するが、ここで全消去して stale entry も掃う。
         self.voicevox.voicevox_metadata_sent.clear();
+        // r.md #75: 再生ヘッド優先ヒントの送信記憶も同様に持ち越さない。
+        self.voicevox.priority_sent.clear();
         // 保存ファイル内の口パク clip は既に authoritative。 その clip を生成した
         // 入力 (notes / 歌詞 / bpm / mouth_map / binding) を fingerprint のベースライン
         // として記録し、開いた直後の非入力編集 (track rename 等) で口パクが再生成

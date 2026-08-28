@@ -43,6 +43,12 @@ pub struct Phrase {
     pub speaker_id: u32,
     /// このフレーズの note (song-absolute beat、start 昇順)。`build_sing_query*` に
     /// そのまま渡せる。
+    ///
+    /// **不変条件: ここに入る note は必ず query に載る** —
+    /// `place_sing_notes(&notes, bpm, _)` が 1 件も落とさない。
+    /// 落ちる note を残すと [`crate::voicevox::carry_vowel_after`] が
+    /// query に載らない note の母音まで数えてしまい、`emit_sing_query` 側の
+    /// 持ち越し母音の連鎖とずれる (= キャッシュキーの楽譜と実際に歌われた歌詞が食い違う)。
     pub notes: Vec<Note>,
     /// `notes` と同じ index の安定 note_id (`plugin_metadata::sing_note_id`)。
     pub note_ids: Vec<u32>,
@@ -146,10 +152,44 @@ pub fn split_into_phrases(entries: &[NoteMetadata], bpm: f32) -> Vec<Phrase> {
                 continue;
             }
             let seg = &placements[seg_start..=k];
-            let ph_notes: Vec<Note> = seg.iter().map(|p| notes[p.index].clone()).collect();
-            let note_ids: Vec<u32> = seg.iter().map(|p| entries[idxs[p.index]].note_id).collect();
-            let mut clip_ids: Vec<u32> =
+            let mut ph_notes: Vec<Note> = seg.iter().map(|p| notes[p.index].clone()).collect();
+            let mut note_ids: Vec<u32> =
+                seg.iter().map(|p| entries[idxs[p.index]].note_id).collect();
+            let mut clip_src: Vec<u32> =
                 seg.iter().map(|p| entries[idxs[p.index]].clip_id).collect();
+            seg_start = k + 1;
+
+            // **フレーズローカル格子の不動点まで絞る。**
+            //
+            // 上の `placements` は「グループ全体」を基準に丸めているが、実際に query を
+            // 組むのは常に**フレーズ先頭 note を基準**にした格子
+            // (`build_sing_query_with` も [`build_chunk_query`] も
+            // `place_sing_notes(&ph.notes, bpm, _)`)。基準が違うと、ごく短い note が
+            // 片方だけで「切り詰めで 1 frame 未満」として落ちることがある。
+            //
+            // 落ちた note を `Phrase::notes` に残したままにすると、
+            // [`crate::voicevox::carry_vowel_after`] が **query に載らない note の母音まで
+            // 数えて** carry を進めてしまい、`emit_sing_query` 側の連鎖とずれる
+            // = キャッシュキーの楽譜と実際に歌われた歌詞が食い違う。
+            // ここで揃えておけば「`Phrase::notes` は必ず query に載る」が不変条件になる。
+            //
+            // 絞るたびに基準 note が変わり得るので不動点まで回す (各回で必ず 1 件以上
+            // 減るので停止する。現実の入力では 1 回目で確定する)。
+            loop {
+                let local = voicevox::place_sing_notes(&ph_notes, bpm, 0);
+                if local.len() == ph_notes.len() {
+                    break;
+                }
+                let keep: Vec<usize> = local.iter().map(|p| p.index).collect();
+                ph_notes = keep.iter().map(|&i| ph_notes[i].clone()).collect();
+                note_ids = keep.iter().map(|&i| note_ids[i]).collect();
+                clip_src = keep.iter().map(|&i| clip_src[i]).collect();
+            }
+            if ph_notes.is_empty() {
+                continue;
+            }
+
+            let mut clip_ids = clip_src;
             clip_ids.sort_unstable();
             clip_ids.dedup();
             let start_beat = ph_notes[0].start_beat;
@@ -166,7 +206,6 @@ pub fn split_into_phrases(entries: &[NoteMetadata], bpm: f32) -> Vec<Phrase> {
                 start_beat,
                 end_beat,
             });
-            seg_start = k + 1;
         }
     }
     out
@@ -435,6 +474,47 @@ mod tests {
         let ph = split_into_phrases(&entries, 120.0);
         assert_eq!(ph.len(), 1);
         assert_eq!(ph[0].clip_ids, vec![7, 9]);
+    }
+
+    /// `Phrase::notes` は **必ず query に載る集合**であること。
+    ///
+    /// フレーズ分割はグループ全体を基準にした格子で行うが、query を組むのは常に
+    /// フレーズ先頭 note を基準にした格子なので、ごく短い note が片方だけで
+    /// 「切り詰めで 1 frame 未満」として落ちることがある。落ちた note を残すと
+    /// `carry_vowel_after` が query に載らない母音まで数え、`emit_sing_query` 側の
+    /// 連鎖とずれる = **キャッシュキーの楽譜と実際に歌われた歌詞が食い違う**。
+    #[test]
+    fn phrase_notes_all_survive_the_phrase_local_grid() {
+        let bpm = 93.7f32;
+        // グループ格子では 4 件残るが、フレーズローカル格子では 1 件落ちる並び。
+        let raw = [
+            (0.0, 0.5),
+            (1.622_921_656_887_116_5, 0.010_992_623_340_540_112),
+            (1.633_914_280_227_656_7, 0.007_942_691_540_579_139),
+            (1.641_856_971_768_235_9, 0.5),
+        ];
+        let entries: Vec<NoteMetadata> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, &(s, d))| meta(i as u32, 1, 3061, s, d, "ら"))
+            .collect();
+        let ph = split_into_phrases(&entries, bpm);
+        assert!(!ph.is_empty());
+        let kept: usize = ph.iter().map(|p| p.notes.len()).sum();
+        assert!(kept < raw.len(), "この入力は実際に 1 件落ちる (test の前提): {kept}");
+        for p in &ph {
+            let local = voicevox::place_sing_notes(&p.notes, bpm, 0);
+            assert_eq!(local.len(), p.notes.len(), "notes は全部 query に載る");
+            assert_eq!(p.note_ids.len(), p.notes.len(), "平行配列が揃っている");
+            // 単体 query も同じ集合を残す = carry の連鎖が split 側と一致する。
+            let solo = voicevox::build_sing_query_with(&p.notes, bpm, p.carry_in);
+            assert_eq!(solo.notes.len(), p.notes.len());
+            assert_eq!(
+                solo.carry_out,
+                voicevox::carry_vowel_after(&p.notes, p.carry_in),
+                "carry の SSoT が割れていない"
+            );
+        }
     }
 
     #[test]

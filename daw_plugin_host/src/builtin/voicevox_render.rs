@@ -49,7 +49,11 @@ const FINAL_PUBLISH_WAIT: Duration = Duration::from_secs(1);
 
 /// decode 済みフレーズ WAV の in-memory キャッシュ (synth thread が job をまたいで持つ)。
 /// これが「1 ノート編集 = 未変更フレーズは decode すらしない」を成立させる。
-pub(super) type MemoryCache = HashMap<CacheKey, Arc<Vec<f32>>>;
+///
+/// 値は `(mono サンプル, decode 時の sample rate)`。rate も憶えるのは、engine が
+/// 想定外の rate を返したとき (= 配置を再計算する経路) が **hit したときも同じ扱いに
+/// なる**ようにするため (憶えないと 2 回目だけ 48 kHz として置かれ、症状が変わる)。
+pub(super) type MemoryCache = HashMap<CacheKey, (Arc<Vec<f32>>, u32)>;
 
 /// 1 フレーズの生の合成結果 (= キャッシュに入る単位。継ぎ目のトリムもフェードも
 /// **掛けていない**)。トリム量は隣接フレーズの拍に依存するので、掛けてから
@@ -104,18 +108,26 @@ pub(super) fn phrase_window(
     let pad_s = frames_to_samples(PHRASE_PAD_FRAMES as f64, sr).round() as i64;
     // 合成 WAV の sample 0 = 「先頭 note の pad 手前」。塊クエリの端 rest を
     // PHRASE_PAD_FRAMES にしたので、これはどのフレーズでも成立する (クランプ不要)。
-    let place = head + rest_s - pad_s;
-    let len = frames_to_samples((span_frames + 2 * PHRASE_PAD_FRAMES) as f64, sr).round() as i64;
+    //
+    // 位置は f64 → i64 の飽和キャスト由来なので、壊れた project の巨大な `start_beat`
+    // でも panic しないよう saturating で回す (旧 `mix_placed_groups` と同じ配慮)。
+    let place = head.saturating_add(rest_s).saturating_sub(pad_s);
+    let len = frames_to_samples(
+        (span_frames.saturating_add(2 * PHRASE_PAD_FRAMES)) as f64,
+        sr,
+    )
+    .round() as i64;
+    let end = place.saturating_add(len);
 
     let seam = |a: f64, b: f64| (((a + b) * 0.5) * spb).round() as i64;
     let keep_start = prev_end_beat.map_or(place, |pe| seam(pe, start_beat).max(place));
-    let keep_end = next_start_beat.map_or(place + len, |ns| seam(end_beat, ns).min(place + len));
+    let keep_end = next_start_beat.map_or(end, |ns| seam(end_beat, ns).min(end));
     Placement {
         place,
         len,
         keep: keep_start..keep_end,
         fade_in: keep_start > place,
-        fade_out: keep_end < place + len,
+        fade_out: keep_end < end,
     }
 }
 
@@ -151,10 +163,21 @@ fn mix_phrase(buf: &mut Vec<f32>, r: &RenderedPhrase, xf: i64) {
     if wav_len == 0 {
         return;
     }
-    let lo = if r.fade_in { r.keep.start - xf } else { r.keep.start }
-        .max(r.place)
-        .max(0);
-    let hi = if r.fade_out { r.keep.end + xf } else { r.keep.end }.min(r.place + wav_len);
+    // 位置は f64 → i64 の飽和キャスト由来なので saturating で回す (壊れた project の
+    // 巨大な start_beat でも panic させない)。
+    let lo = if r.fade_in {
+        r.keep.start.saturating_sub(xf)
+    } else {
+        r.keep.start
+    }
+    .max(r.place)
+    .max(0);
+    let hi = if r.fade_out {
+        r.keep.end.saturating_add(xf)
+    } else {
+        r.keep.end
+    }
+    .min(r.place.saturating_add(wav_len));
     if hi <= lo {
         return;
     }
@@ -165,6 +188,54 @@ fn mix_phrase(buf: &mut Vec<f32>, r: &RenderedPhrase, xf: i64) {
         let src = (t - r.place) as usize;
         let g = seam_gain(t, &r.keep, r.fade_in, r.fade_out, xf);
         buf[t as usize] += r.samples[src] * g;
+    }
+}
+
+/// 公開中の buffer を `None` に戻す (= 無音)。**`ArcSwapOption::store(None)` を直接
+/// 呼んではいけない。**
+///
+/// arc-swap 1.9.1 の `store` は `drop(self.swap(val))` (`src/lib.rs`) で、`Debt::pay_all`
+/// の直後に **writer 自身が旧 `Arc` を即座に drop する**。store と同時に走っていた
+/// `process()` の `Guard` は debt を払われて所有者になっているので、そのまま RT が
+/// 最後の所有者になり、**audio thread 上で数十 MB の解放**が起きる
+/// ([`PhraseRenderState::reclaim`] の doc と同じ理由)。
+///
+/// ここでは `swap` で旧 `Arc` を手元に取り、RT の quiesce を確認して
+/// [`Arc::try_unwrap`] が通ってから (= writer が唯一の所有者になってから) 解放する。
+/// 待ちは有界 (`FINAL_PUBLISH_WAIT`)。**非 RT スレッドからのみ呼ぶこと。**
+pub(super) fn clear_published(result_arc: &ArcSwapOption<SynthResult>, rt_epoch: &AtomicU64) {
+    let Some(prev) = result_arc.swap(None) else {
+        return;
+    };
+    let e = rt_epoch.load(Ordering::Acquire);
+    release_when_quiesced(prev, e, rt_epoch);
+}
+
+/// swap で手元に取った旧 `Arc` を、**writer スレッド上で**解放されるように手放す。
+///
+/// `e` は swap の**直後**に読んだ epoch。偶数なら swap の瞬間に走っていた `process()` は
+/// 無いので即座に安全、奇数なら epoch が `e` から変化した時点で安全。所有権の判定自体は
+/// [`Arc::try_unwrap`] が担い、失敗している間は手放さない (手放すと RT が最後の所有者に
+/// なり、audio thread 上で数十 MB の解放が起きる)。
+///
+/// 待ちは有界 (`FINAL_PUBLISH_WAIT`)。**非 RT スレッドからのみ呼ぶこと。**
+fn release_when_quiesced(mut arc: Arc<SynthResult>, e: u64, rt_epoch: &AtomicU64) {
+    let deadline = Instant::now() + FINAL_PUBLISH_WAIT;
+    loop {
+        if e.is_multiple_of(2) || rt_epoch.load(Ordering::Acquire) != e {
+            match Arc::try_unwrap(arc) {
+                // writer が唯一の所有者だった = 解放はこのスレッド (非 RT) で起きる。
+                Ok(_) => return,
+                Err(back) => arc = back,
+            }
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "VoicevoxBuiltin: 旧 synth buffer の quiesce 待ちが上限を超えた (解放先が RT になり得る)"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -234,6 +305,22 @@ pub(super) struct PhraseRenderState {
     sample_rate: u32,
     samples_per_beat: f64,
     xf: i64,
+    /// audio half と共有する RT quiescence epoch。**`Drop` でも使う**ので所有する
+    /// (job が途中で捨てられても `retired` を RT に押し付けないため)。
+    rt_epoch: Arc<AtomicU64>,
+}
+
+impl Drop for PhraseRenderState {
+    /// job がどう終わっても (完了 / supersede / engine 未到達 / shutdown)、
+    /// `retired` に残った `Arc` は **writer スレッド上で**解放されるように畳む。
+    ///
+    /// ここを素の `Vec` の drop に任せると、RT の Guard が debt を払われて生きている
+    /// 場合に RT が最後の所有者になり、audio thread 上で数十 MB の解放が起きる。
+    fn drop(&mut self) {
+        for (arc, e) in std::mem::take(&mut self.retired) {
+            release_when_quiesced(arc, e, &self.rt_epoch);
+        }
+    }
 }
 
 impl PhraseRenderState {
@@ -289,55 +376,62 @@ impl PhraseRenderState {
     /// audio half が `process()` の入口と出口で epoch を +1 する (入口後は奇数、出口後は
     /// 偶数)。store 直後に読んだ値 `e` が **偶数なら即座に安全**、奇数なら
     /// **epoch が `e` から変化した時点で安全**。
-    fn reclaim(&mut self, rt_epoch: &AtomicU64) {
-        let mut i = 0;
-        while i < self.retired.len() {
-            let e = self.retired[i].1;
+    ///
+    /// epoch は「いつ試すか」のヒントにすぎず、**所有権の判定は
+    /// [`Arc::try_unwrap`] が担う**。失敗したら `Arc` を**手放さずに** `retired` へ
+    /// 戻す — ここで drop すると RT が最後の所有者になり、RT スレッド上で
+    /// multi-MB の解放が起きる (この機構が防ごうとしているもの)。
+    /// arc-swap 1.9.1 の hybrid 戦略では、`store` した writer が `Debt::pay_all`
+    /// (`src/debt/mod.rs`) で未払い debt ごとに strong count を +1 するので、
+    /// store と同時に走った `process()` の `Guard` は実際に所有者になり得る。
+    fn reclaim(&mut self) {
+        if self.retired.is_empty() {
+            return;
+        }
+        let mut keep: Vec<(Arc<SynthResult>, u64)> = Vec::with_capacity(self.retired.len());
+        for (arc, e) in std::mem::take(&mut self.retired) {
             // 偶数 = store の瞬間に走っていた `process()` が無い = 即座に安全。
-            let quiesced = e.is_multiple_of(2) || rt_epoch.load(Ordering::Acquire) != e;
+            let quiesced = e.is_multiple_of(2) || self.rt_epoch.load(Ordering::Acquire) != e;
             if !quiesced {
-                i += 1;
+                keep.push((arc, e));
                 continue;
             }
-            let (arc, _) = self.retired.swap_remove(i);
-            if let Some(res) = Arc::into_inner(arc)
-                && let Some(mut v) = Arc::into_inner(res.samples)
-            {
-                v.clear();
-                if self.mix.pool.len() < 2 {
-                    self.mix.pool.push(v);
+            match Arc::try_unwrap(arc) {
+                Ok(res) => {
+                    if let Ok(mut v) = Arc::try_unwrap(res.samples) {
+                        v.clear();
+                        if self.mix.pool.len() < 2 {
+                            self.mix.pool.push(v);
+                        }
+                    }
                 }
+                // RT (または誰か) がまだ所有している。次の機会に再試行する。
+                Err(arc) => keep.push((arc, e)),
             }
         }
+        self.retired = keep;
     }
 
     /// `PUBLISH_INTERVAL` 以上経っていて、かつ再利用可能な buffer があれば publish する。
     /// プールが空なら**見送る** (部分結果の表示が 0.5 秒遅れるだけ)。
-    pub(super) fn publish_if_due(
-        &mut self,
-        result_arc: &ArcSwapOption<SynthResult>,
-        rt_epoch: &AtomicU64,
-    ) {
+    pub(super) fn publish_if_due(&mut self, result_arc: &ArcSwapOption<SynthResult>) {
         if self.last_publish.elapsed() < PUBLISH_INTERVAL {
             return;
         }
-        self.publish(result_arc, rt_epoch, false);
+        self.publish(result_arc, false);
     }
 
     /// job 終端の publish。プールの空きを**有界に**待ち、それでも空なら 1 本だけ確保する。
-    pub(super) fn publish_final(
-        &mut self,
-        result_arc: &ArcSwapOption<SynthResult>,
-        rt_epoch: &AtomicU64,
-    ) {
+    pub(super) fn publish_final(&mut self, result_arc: &ArcSwapOption<SynthResult>) {
         if !self.has_output() {
-            // 歌唱も読み上げも 1 本も描けなかった = 無音。
-            result_arc.store(None);
+            // 歌唱も読み上げも 1 本も描けなかった (= 全フレーズが Rejected 等) = 無音。
+            // 旧 buffer は **retire 経由で**手放す (`store(None)` 直呼びは RT に解放させる)。
+            clear_published(result_arc, &self.rt_epoch);
             return;
         }
         let deadline = Instant::now() + FINAL_PUBLISH_WAIT;
         loop {
-            if self.publish(result_arc, rt_epoch, false) {
+            if self.publish(result_arc, false) {
                 return;
             }
             if Instant::now() >= deadline {
@@ -345,17 +439,12 @@ impl PhraseRenderState {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        self.publish(result_arc, rt_epoch, true);
+        self.publish(result_arc, true);
     }
 
     /// 実際の publish。`allow_alloc` でプールが空でも新規確保する。
-    fn publish(
-        &mut self,
-        result_arc: &ArcSwapOption<SynthResult>,
-        rt_epoch: &AtomicU64,
-        allow_alloc: bool,
-    ) -> bool {
-        self.reclaim(rt_epoch);
+    fn publish(&mut self, result_arc: &ArcSwapOption<SynthResult>, allow_alloc: bool) -> bool {
+        self.reclaim();
         self.apply_pending();
         if self.rendered.is_empty() {
             // まだ何も描けていない。publish するものが無い (= 前回の buffer を残す)。
@@ -373,8 +462,8 @@ impl PhraseRenderState {
             note_offsets: Arc::new(self.note_offsets.clone()),
         });
         let prev = result_arc.swap(Some(res));
-        // store の **後** に読むこと (これが quiesce 判定の基準点)。
-        let e = rt_epoch.load(Ordering::Acquire);
+        // swap の **後** に読むこと (これが quiesce 判定の基準点)。
+        let e = self.rt_epoch.load(Ordering::Acquire);
         if let Some(p) = prev {
             self.retired.push((p, e));
         }
@@ -403,6 +492,16 @@ struct SoloPhrase {
     note_offsets: Vec<(u32, u64)>,
     /// 単体 query の「先頭 note の開始 〜 末尾 note の終端」frame 数。
     span_frames: i64,
+}
+
+/// `FrameAudioQuery` の JSON を検証して `(Value, frame 数)` にする。
+/// キャッシュ hit をそのまま信じないための共通の関門。
+fn parse_frame_query(body: &str) -> anyhow::Result<(serde_json::Value, usize)> {
+    let fq: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("FrameAudioQuery parse: {e}"))?;
+    let n = frame_query_len(&fq)?;
+    anyhow::ensure!(n > 0, "FrameAudioQuery の f0 が空");
+    Ok((fq, n))
 }
 
 /// 塊 1 個ぶんの HTTP 取得済み状態 (同じ塊の別フレーズが再利用する)。
@@ -438,6 +537,7 @@ impl<'a> PhraseRenderer<'a> {
         entries: &[NoteMetadata],
         talk: &'a [TalkSynthSpec],
         priority_beats: Option<f64>,
+        rt_epoch: Arc<AtomicU64>,
     ) -> Self {
         let sr = OUTPUT_SAMPLE_RATE;
         let phrases = split_into_phrases(entries, bpm);
@@ -506,7 +606,12 @@ impl<'a> PhraseRenderer<'a> {
         // talk は長さが事前に分からないので、超えたぶんだけ resize で伸ばす。
         let total_samples = solo
             .iter()
-            .map(|s| (s.placement.place + s.placement.len).max(0) as usize)
+            .map(|s| {
+                s.placement
+                    .place
+                    .saturating_add(s.placement.len)
+                    .max(0) as usize
+            })
             .max()
             .unwrap_or(0);
 
@@ -535,6 +640,7 @@ impl<'a> PhraseRenderer<'a> {
             sample_rate: sr,
             samples_per_beat: f64::from(sr) * 60.0 / f64::from(bpm.max(0.001)),
             xf: xfade_half(sr),
+            rt_epoch,
         };
 
         let order = order_by_priority(&phrases, priority_beats);
@@ -642,8 +748,8 @@ impl<'a> PhraseRenderer<'a> {
         let mut hit = true;
         let mut frames: i64 = self.solo[i].span_frames + 2 * PHRASE_PAD_FRAMES;
 
-        let (samples, sample_rate) = if let Some(s) = mem.get(&key) {
-            (Arc::clone(s), OUTPUT_SAMPLE_RATE)
+        let (samples, sample_rate) = if let Some((s, sr)) = mem.get(&key) {
+            (Arc::clone(s), *sr)
         } else if let Some((s, sr)) = self
             .cache
             .as_ref()
@@ -657,7 +763,7 @@ impl<'a> PhraseRenderer<'a> {
             })
         {
             let arc = Arc::new(s);
-            mem.insert(key, Arc::clone(&arc));
+            mem.insert(key, (Arc::clone(&arc), sr));
             (arc, sr)
         } else {
             hit = false;
@@ -685,7 +791,7 @@ impl<'a> PhraseRenderer<'a> {
             let (s, sr) =
                 decode_wav_to_f32(&wav).map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
             let arc = Arc::new(s);
-            mem.insert(key, Arc::clone(&arc));
+            mem.insert(key, (Arc::clone(&arc), sr));
             (arc, sr)
         };
 
@@ -756,33 +862,53 @@ impl<'a> PhraseRenderer<'a> {
             self.bpm,
         );
         let qkey = key_for_sing_query(&query.json);
+        // キャッシュ hit は **必ず検証してから使う**。壊れたエントリをそのまま信じると、
+        // 以後その塊は永久に合成できない (次も同じ壊れた JSON を読むので HTTP へ落ちない)。
+        // 検証に失敗したら miss 扱いで HTTP へ落ち、`put` が上書きして直る
+        // (壊れた WAV の扱いと同じ規則)。
         let mut fetched = false;
-        let body = if let Some(hit) = self
+        let cached = self
             .cache
             .as_ref()
             .and_then(|c| c.get(qkey, CacheKind::Json))
             .and_then(|b| String::from_utf8(b).ok())
-        {
-            hit
-        } else {
-            fetched = true;
-            let json = query.json.clone();
-            let client = self.client()?;
-            // 応答は `fetch_sing_frame_query` の中で正規化済 (= キャッシュに入るのは正規形だけ)。
-            let body = fetch_sing_frame_query(client, &json)?;
-            if let Some(c) = self.cache.as_ref() {
-                c.put(qkey, CacheKind::Json, body.as_bytes());
+            .and_then(|text| match parse_frame_query(&text) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    tracing::warn!(error = %e, "voicevox cache: 壊れた塊 query を無視して再取得");
+                    None
+                }
+            });
+        let (fq, total_frames) = match cached {
+            Some(v) => v,
+            None => {
+                fetched = true;
+                let json = query.json.clone();
+                let client = self.client()?;
+                // 応答は `fetch_sing_frame_query` の中で正規化済
+                // (= キャッシュに入るのは正規形だけ)。
+                let body = fetch_sing_frame_query(client, &json)?;
+                let parsed = parse_frame_query(&body)
+                    .map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
+                if let Some(c) = self.cache.as_ref() {
+                    c.put(qkey, CacheKind::Json, body.as_bytes());
+                }
+                parsed
             }
-            body
         };
-        let fq: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| SynthError::Rejected(format!("FrameAudioQuery parse: {e}")))?;
-        let total_frames =
-            frame_query_len(&fq).map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
-        debug_assert_eq!(
-            total_frames as i64, query.total_frames,
-            "塊 query の総 frame 数は build_chunk_query の予測と一致するはず"
-        );
+        // engine が返した frame 数は**こちらの予測と一致するはず**だが、engine 側の
+        // 実装が変わればずれ得る。`debug_assert!` にすると debug ビルドで synth thread
+        // ごと落ちる (= engine の応答で自分のスレッドを殺す) ので、警告に留める。
+        // 窓は下の `phrase_window_frames` が実測値でクランプするので、ずれても degrade
+        // するだけで無音にはならない。
+        if total_frames as i64 != query.total_frames {
+            tracing::warn!(
+                engine = total_frames,
+                predicted = query.total_frames,
+                chunk = ci,
+                "塊 query の総 frame 数が予測と一致しない (切り出し窓を実測値でクランプする)"
+            );
+        }
         self.chunk_state[ci] = Some(ChunkState {
             query,
             fq,
@@ -1031,46 +1157,78 @@ mod tests {
         }
     }
 
+    /// テスト用の空 `PhraseRenderState` (mix / applied の bookkeeping だけを使う)。
+    fn empty_state(total: usize) -> PhraseRenderState {
+        PhraseRenderState {
+            rendered: Vec::new(),
+            mix: MixBuffer::new(total),
+            retired: Vec::new(),
+            last_publish: Instant::now(),
+            total: 0,
+            done: 0,
+            outstanding_clips: HashMap::new(),
+            note_offsets: HashMap::new(),
+            sample_rate: SR,
+            samples_per_beat: f64::from(SR) * 60.0 / f64::from(BPM),
+            xf: xfade_half(SR),
+            rt_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     #[test]
     fn mix_buffer_incremental_equals_full_remix() {
-        // フレーズを 1 本ずつ加算した buffer と、全部まとめて加算した buffer が一致する
-        // (差分 mix の同値性 = publish のたびに全部足し直さないことの根拠)。
+        // フレーズを 1 本ずつ (publish のたびに) 加算した buffer と、最後にまとめて
+        // 加算した buffer が一致すること。`applied` の bookkeeping が壊れると
+        // 二重加算 (音量 2 倍) か取りこぼし (無音) になる。
         let w = windows(&[(0.0, 1.0), (2.0, 1.0), (4.0, 1.0)]);
-        let xf = xfade_half(SR);
-        let rendered: Vec<RenderedPhrase> = w
+        let mk = |i: usize, p: &Placement| RenderedPhrase {
+            samples: Arc::new((0..p.len).map(|k| (i as f32 + 1.0) + k as f32 * 0.001).collect()),
+            place: p.place,
+            keep: p.keep.clone(),
+            fade_in: p.fade_in,
+            fade_out: p.fade_out,
+        };
+        let total = w
             .iter()
-            .enumerate()
-            .map(|(i, p)| RenderedPhrase {
-                samples: Arc::new(
-                    (0..p.len).map(|k| (i as f32 + 1.0) + k as f32 * 0.001).collect(),
-                ),
-                place: p.place,
-                keep: p.keep.clone(),
-                fade_in: p.fade_in,
-                fade_out: p.fade_out,
-            })
-            .collect();
-        let total = rendered
-            .iter()
-            .map(|r| (r.place + r.samples.len() as i64).max(0) as usize)
+            .map(|p| (p.place + p.len).max(0) as usize)
             .max()
             .unwrap();
 
-        let mut incremental = vec![0.0f32; total];
-        for r in &rendered {
-            mix_phrase(&mut incremental, r, xf);
+        // (a) 1 本積むごとに apply_pending (= publish_if_due が毎フレーズ呼ぶ形)。
+        // 追加で「何も足していないのにもう一度 apply しても変わらない」も見る
+        // (= applied が二重加算を防いでいることの直接の検査)。
+        let mut incremental = empty_state(total);
+        for (i, p) in w.iter().enumerate() {
+            incremental.rendered.push(mk(i, p));
+            incremental.apply_pending();
+            let snapshot = incremental.mix.buf.clone();
+            incremental.apply_pending();
+            assert_eq!(incremental.mix.buf, snapshot, "冪等: 二重加算しない");
         }
-        let mut full = vec![0.0f32; total];
-        for r in &rendered {
-            mix_phrase(&mut full, r, xf);
+
+        // (b) 全部積んでから 1 回だけ apply_pending。
+        let mut batched = empty_state(total);
+        for (i, p) in w.iter().enumerate() {
+            batched.rendered.push(mk(i, p));
         }
-        assert_eq!(incremental.len(), full.len());
-        for (i, (a, b)) in incremental.iter().zip(full.iter()).enumerate() {
+        batched.apply_pending();
+
+        assert_eq!(incremental.mix.buf.len(), batched.mix.buf.len());
+        for (i, (a, b)) in incremental
+            .mix
+            .buf
+            .iter()
+            .zip(batched.mix.buf.iter())
+            .enumerate()
+        {
             assert!((a - b).abs() < 1e-9, "sample {i}: {a} vs {b}");
         }
         // 継ぎ目の直前後で欠落 (0 の穴) が無いこと。
         let seam = w[0].keep.end as usize;
-        assert!(incremental[seam - 1] != 0.0 && incremental[seam] != 0.0);
+        assert!(
+            incremental.mix.buf[seam - 1] != 0.0 && incremental.mix.buf[seam] != 0.0,
+            "継ぎ目で音が途切れない"
+        );
     }
 
     #[test]
@@ -1239,7 +1397,14 @@ mod tests {
             beat += 2.0;
         }
         let talk: Vec<TalkSynthSpec> = Vec::new();
-        let mut renderer = PhraseRenderer::new(120.0, 60.0, &entries, &talk, None);
+        let mut renderer = PhraseRenderer::new(
+            120.0,
+            60.0,
+            &entries,
+            &talk,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        );
         let mut mem: MemoryCache = MemoryCache::new();
         let shutdown = AtomicBool::new(false);
         let outcome = renderer.render(&mut mem, &shutdown, &|| false, &mut |_| {});

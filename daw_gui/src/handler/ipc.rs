@@ -181,6 +181,12 @@ impl AppData {
                 self.handle_child_disconnected(ChildKind::PluginHost);
             }
             PluginEvent::PluginsReinitDone => {
+                // r.md #75: 下の VOICEVOX 再 flush の可否は **`pending_export` を take する
+                // 前**に見る (take した後だと必ず「render 中でない」に見えてしまう)。
+                let render_pending = self.transport.pending_export.is_some()
+                    || self.ipc.pending_clip_fx_bounce.is_some()
+                    || self.ipc.pending_vocal_synth_bounce.is_some()
+                    || !self.ipc.pending_vocal_synth_export.is_empty();
                 // plugins are now reinitialised to a clean state —
                 // fire the stashed offline export. (If nothing is pending, a
                 // stray reply; ignore.)
@@ -203,6 +209,21 @@ impl AppData {
                 if self.transport.panic_release_pending && self.transport.panic_reinit_due.is_none() {
                     self.transport.panic_release_pending = false;
                     self.send_audio(AudioCommand::PanicRelease);
+                }
+                // r.md #75: reinit は builtin VOICEVOX を deactivate する = 走っていた
+                // 合成 job が捨てられる。合成は **フレーズ単位で逐次 publish** するように
+                // なったので、job の途中で捨てられると **部分ミックスが公開されたまま**
+                // 残り、しかも `done_gen` が進まず誰も再送しない (metadata が変わって
+                // いないので差分キャッシュが送信を skip する) → そのトラックが以後ずっと
+                // 途中までしか鳴らない。device (re)load 時と同じ理由で差分キャッシュを
+                // 落として必ず流し直す (キャッシュが効くので HTTP はほぼ走らない)。
+                //
+                // **書き出し / bounce の最中は流し直さない** (`render_pending`) — あちらは
+                // reinit の前に合成完了を待ち終えており、ここで新しい job を走らせると
+                // 逐次 publish が render 中の buffer を差し替えてしまう。
+                if !render_pending {
+                    self.voicevox.voicevox_metadata_sent.clear();
+                    self.sync_vocal_metadata();
                 }
             }
             PluginEvent::VocalSynthReady { device_id } => {

@@ -105,10 +105,16 @@ pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
     let query = build_sing_query(notes, bpm);
     let cache = VoiceVoxDiskCache::production();
     let key = key_for_sing_query(&query.json);
+    // キャッシュ hit は **parse できて初めて採用**する。壊れたエントリをそのまま
+    // 返すと、そのクリップの口パクは以後永久に生成できない (次も同じ壊れた JSON を
+    // 読むので HTTP へ落ちない)。取り直せば `put` が上書きして直る。
     if let Some(hit) = cache.as_ref().and_then(|c| c.get(key, CacheKind::Json))
         && let Ok(text) = String::from_utf8(hit)
     {
-        return parse_phonemes(&text);
+        match parse_phonemes(&text) {
+            Ok(ph) if !ph.is_empty() => return Ok(ph),
+            _ => tracing::warn!("voicevox cache: 壊れた口パク query を無視して再取得"),
+        }
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -174,10 +180,15 @@ pub fn query_talk_phonemes(
 ) -> Result<Vec<Phoneme>> {
     let cache = VoiceVoxDiskCache::production();
     let key = key_for_talk_query(text, speaker_id);
+    // 歌唱側と同じ規則: hit は parse できて初めて採用する (壊れたエントリを信じると
+    // その Text クリップの口パクが永久に生成できない)。
     if let Some(hit) = cache.as_ref().and_then(|c| c.get(key, CacheKind::Json))
         && let Ok(body) = String::from_utf8(hit)
     {
-        return parse_talk_phonemes(&body, scales.speed_scale);
+        match parse_talk_phonemes(&body, scales.speed_scale) {
+            Ok(ph) if !ph.is_empty() => return Ok(ph),
+            _ => tracing::warn!("voicevox cache: 壊れた talk query を無視して再取得"),
+        }
     }
 
     let client = reqwest::blocking::Client::builder()

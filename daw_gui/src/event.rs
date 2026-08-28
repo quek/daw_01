@@ -123,11 +123,15 @@ pub enum AppEvent {
     /// に保存される。 Song は触らないので Undo / dirty 対象外。
     SetTheme(String),
     /// r.md #75: VOICEVOX 歌唱合成の「塊」(= `/sing_frame_audio_query` 1 回) の長さ (秒)。
-    /// handler が有効範囲へクランプして `app_config.json` に保存し、**曲全体を合成し直す**
+    /// handler が有効範囲へクランプする。Song は触らないので Undo / dirty 対象外。
+    ///
+    /// `commit = false` はドラッグ中の追従 (`ui_prefs` の値を更新するだけ)、`true` は確定。
+    /// **確定は `app_config.json` への保存 + 曲全体の再合成**を意味する
     /// (フレーズ WAV のキャッシュキーに `chunk_secs` が入っているので、再送しないと
     /// 全 hit で何も変わらない = つまみが嘘になる)。前の設定の音はキャッシュに残るので、
-    /// 戻せば即座に鳴る。Song は触らないので Undo / dirty 対象外。
-    SetVoicevoxChunkSecs(f32),
+    /// 戻せば即座に鳴る。マスターパネル幅と同じ commit-on-release の流儀
+    /// (毎フレーム確定すると掴んでいる間ずっと engine を叩き、設定ファイルも書き続ける)。
+    SetVoicevoxChunkSecs { secs: f32, commit: bool },
     /// r.md #29: 履歴リストの行 click。 `index` = [`crate::state::SongDoc::history_labels`]
     /// の 0 始まり index。 その state まで一気に Undo / Redo する
     /// ([`crate::state::SongDoc::jump_to`])。 履歴操作自体は Undo 対象外。

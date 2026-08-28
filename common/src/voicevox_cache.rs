@@ -73,6 +73,22 @@ const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 /// FS 書き込みになるので、mtime が既に十分新しいときは触らない (粗い LRU で足りる)。
 const TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// 前回 `prune` してから書いた bytes 数。これが [`PRUNE_INTERVAL_BYTES`] を超えたときだけ
+/// GC する (プロセス内の合算で十分)。
+static BYTES_SINCE_PRUNE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// GC を走らせる間隔 (前回からの書き込み量)。
+///
+/// `prune` は `read_dir` + 全エントリ `metadata()` の全走査なので、**put のたびに
+/// 呼ぶと重い**。r.md #75 で put の粒度が「曲に 1 回」から「フレーズに 1 回」
+/// (5 分の曲で 200 回超) になり、1 GiB のキャッシュでは数千ファイルの stat を
+/// 毎フレーズ繰り返すことになった。上限を 64 MiB だけ超過し得るが、
+/// [`MAX_CACHE_BYTES`] は 1 GiB なので実害は無い。
+///
+/// 初期値 `u64::MAX` なので **プロセス最初の put では必ず prune する**
+/// (前回終了時に上限を超えたまま終わっていても、そこで畳まれる)。
+const PRUNE_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// temp ファイル名のユニーク化カウンタ (同プロセス内の並行 put 衝突回避)。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -225,17 +241,27 @@ impl VoiceVoxDiskCache {
             tracing::debug!(error = ?e, "voicevox cache: put 失敗 (無視)");
             return;
         }
-        self.prune();
+        // GC は毎 put ではなく **書いた量が [`PRUNE_INTERVAL_BYTES`] を超えたとき**に
+        // 走らせる (`prune` はディレクトリ全走査なので、フレーズ単位の put で毎回
+        // 呼ぶと合成時間に効いてくる)。
+        let written = BYTES_SINCE_PRUNE
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed)
+            .saturating_add(bytes.len() as u64);
+        if written >= PRUNE_INTERVAL_BYTES {
+            BYTES_SINCE_PRUNE.store(0, Ordering::Relaxed);
+            self.prune();
+        }
     }
 
     fn put_inner(&self, key: CacheKey, kind: CacheKind, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let final_path = self.path_for(key, kind);
-        // 既存ヒットを無駄に書き直さない (内容は同一)。ただし LRU のため mtime は進める。
-        if final_path.exists() {
-            touch_if_stale(&final_path);
-            return Ok(());
-        }
+        // 既存ファイルがあっても **上書きする**。`put` が呼ばれるのは miss の後だけ
+        // (= 呼び出し側が HTTP で取り直した直後) なので、そこに残っているファイルは
+        // 「壊れていて decode できなかったもの」か「並行して同じ内容を書いた誰か」。
+        // 旧実装はここで早期 return していたため、**壊れたエントリを二度と直せなかった**
+        // (しかも `get` が読めてしまう限り mtime が touch され続けて prune の対象にも
+        // ならず、そのフレーズだけ毎回 HTTP で再合成し続ける)。
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let tmp = self.dir.join(format!(".{key:016x}.{pid}.{seq}.tmp"));
@@ -414,14 +440,23 @@ mod tests {
     }
 
     #[test]
-    fn put_is_idempotent_and_keeps_first_bytes() {
+    fn put_replaces_a_broken_entry() {
+        // `put` は miss の直後にしか呼ばれない = そこに残っているファイルは壊れている
+        // (decode できなかった) か、並行して書かれた同一内容。**必ず上書きする**。
+        // 旧実装は「既存なら早期 return」だったため、一度壊れたエントリは二度と直らず、
+        // そのフレーズだけ毎回 HTTP で再合成し続けていた。
         let dir = tempdir();
         let cache = VoiceVoxDiskCache::at(&dir);
         let key = 7u64;
-        cache.put(key, CacheKind::Wav, &[1, 1, 1]);
-        // 同キー再 put は既存を保つ (上書きしない)。
+        // 壊れた (= decode できない) エントリを模して 0 byte を置く。
+        cache.put(key, CacheKind::Wav, &[]);
+        assert_eq!(cache.get(key, CacheKind::Wav), Some(Vec::new()));
+        // 再合成した正しい bytes で置き換わる。
         cache.put(key, CacheKind::Wav, &[2, 2, 2]);
-        assert_eq!(cache.get(key, CacheKind::Wav), Some(vec![1, 1, 1]));
+        assert_eq!(cache.get(key, CacheKind::Wav), Some(vec![2, 2, 2]));
+        // 同内容の再 put は冪等 (内容が変わらない)。
+        cache.put(key, CacheKind::Wav, &[2, 2, 2]);
+        assert_eq!(cache.get(key, CacheKind::Wav), Some(vec![2, 2, 2]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

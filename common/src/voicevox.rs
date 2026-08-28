@@ -22,7 +22,7 @@ pub const VOICEVOX_URL: &str = "http://localhost:50021";
 
 /// sing_frame_audio_query の query 生成に使う speaker (query generation only — 実 singer は
 /// frame_synthesis で選ぶ)。6000 = 波音リツ、REAPER 参照と同じ。client (query_phonemes) と
-/// synth (sing_query_to_wav) が共用。
+/// synth (`voicevox_synth::fetch_sing_frame_query`) が共用。
 pub const QUERY_SPEAKER: u32 = 6000;
 /// frame_synthesis の既定 singer (声未指定時)。3061 = 中国うさぎ ノーマル。
 pub const DEFAULT_SINGER_ID: u32 = 3061;
@@ -90,7 +90,7 @@ pub struct Phoneme {
 }
 
 // ---------------------------------------------------------------------------
-// Query builder (sing) — client (query_phonemes) と synth (sing_query_to_wav) が共用
+// Query builder (sing) — client (query_phonemes) / synth (塊クエリ) / フレーズ分割が共用
 // ---------------------------------------------------------------------------
 
 /// 重なり解決後に query へ載る note 1 件の **絶対 frame 位置**

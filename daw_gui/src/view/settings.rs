@@ -25,9 +25,18 @@ const MENU_H: f32 = 24.0;
 /// 初期表示位置の上端 (MENU_H + TRANSPORT_H(44) + 8)。
 const PANEL_TOP: f32 = 76.0;
 const DEFAULT_W: f32 = 320.0;
-const DEFAULT_H: f32 = 300.0;
+const DEFAULT_H: f32 = 400.0;
 const MIN_W: f32 = 240.0;
-const MIN_H: f32 = 160.0;
+/// 最小の高さ。**固定 chrome (= 一覧以外) の合計に一覧 3 行を足した値**を下回らせないこと。
+///
+/// chrome の内訳は `TITLE_H`(24)、余白 4、`SECTION_H`(22、VOICEVOX 見出し)、
+/// `VOX_SECTION_H`(66)、`SECTION_H`(22、テーマ見出し)、`HINT_H`(30)、
+/// `RESIZE_MARGIN`(6) で合計 174。
+///
+/// r.md #75 で VOICEVOX セクションを足したぶん chrome が 86 から 174 に増えたので、
+/// 旧値 (160) のままだとテーマ一覧の高さが 0 に潰れて**テーマを選べなくなる**
+/// (しかも見出しがヒント行に重なる)。
+const MIN_H: f32 = 250.0;
 const TITLE_H: f32 = 24.0;
 const CLOSE_W: f32 = 26.0;
 const ROW_H: f32 = 24.0;
@@ -264,7 +273,13 @@ fn draw_voicevox_section(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y:
         w: VOX_FIELD_W,
         h: ROW_H,
     };
-    let _ = ui.scrubable_number_at(
+    // 値の適用は **確定 (drag release / 数値入力 / ダブルクリックリセット) でだけ**
+    // 行う。確定は「曲全体の再合成 + app_config.json への書き込み」なので、drag の
+    // per-frame 値でそれをやると掴んでいる間ずっと engine を叩くことになる。
+    // `on_change` は Cell に溜めるだけにして、確定かどうかは同じフレームの
+    // response (`dragging` / `editing_text`) から決める。
+    let pending = Cell::new(None::<f64>);
+    let resp = ui.scrubable_number_at(
         "settings_vv_chunk",
         field_rect,
         f64::from(app.ui_prefs.voicevox_chunk_secs),
@@ -281,13 +296,37 @@ fn draw_voicevox_section(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y:
             ..ScrubableNumberStyle::from_palette(p)
         },
         |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetVoicevoxChunkSecs(v as f32));
-            })
+            pending.set(Some(v));
+            // 適用は下で行う (確定判定に同フレームの response が要る)。
+            Edit::mutate(|_: &mut AppData| {})
         },
         None,
         None,
     );
+    let active = resp.dragging || resp.editing_text;
+    if let Some(v) = pending.get() {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetVoicevoxChunkSecs {
+                secs: v as f32,
+                commit: !active,
+            });
+        }));
+    }
+    // drag / 数値入力の**立ち下がり**で確定 (master フェーダーの undo bracket と同じ
+    // edge 検出)。release フレームで `on_change` が来ないケースもあるので、確定は
+    // 表示値 (`displayed_value`) から送る。
+    if active != app.ui_ephemeral.voicevox_chunk_editing {
+        let live = resp.displayed_value as f32;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.ui_ephemeral.voicevox_chunk_editing = active;
+            if !active {
+                app.handle_event(AppEvent::SetVoicevoxChunkSecs {
+                    secs: live,
+                    commit: true,
+                });
+            }
+        }));
+    }
     ui.label_at(
         "settings_vv_chunk_hint1",
         "短いほど 1 音直したときが速く、長いほど音量が揃う。既定 60 秒。",

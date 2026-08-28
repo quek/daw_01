@@ -369,6 +369,7 @@ impl AppData {
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
                 master_gain_dragging: false,
+                voicevox_chunk_editing: false,
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
@@ -797,18 +798,23 @@ impl AppData {
                 self.theme = crate::theme::resolve(dirs.as_deref(), &id);
                 self.persist_app_config();
             }
-            // r.md #75: 合成の塊の長さ。**これは合成結果を変える入力**なので、
-            // 差分キャッシュを落として全 device へ流し直す (= 曲全体の再合成)。
-            // 落とさないと再送されず、キーに混ぜてある以上「設定が効かない」ように見える。
-            AppEvent::SetVoicevoxChunkSecs(secs) => {
+            // r.md #75: 合成の塊の長さ。ドラッグ中 (`commit = false`) は表示値だけ動かし、
+            // 確定 (release / 数値入力 / ダブルクリックリセット) でだけ保存と再合成を行う。
+            // **これは合成結果を変える入力**なので、確定時は差分キャッシュを落として全
+            // device へ流し直す (= 曲全体の再合成)。落とさないと再送されず、キーに混ぜて
+            // ある以上「設定が効かない」ように見える。
+            AppEvent::SetVoicevoxChunkSecs { secs, commit } => {
                 let next = secs.clamp(
                     common::voicevox_phrase::MIN_CHUNK_SECS,
                     common::voicevox_phrase::MAX_CHUNK_SECS,
                 );
-                if (next - self.ui_prefs.voicevox_chunk_secs).abs() < 1e-3 {
+                let changed = (next - self.ui_prefs.voicevox_chunk_secs).abs() >= 1e-3;
+                if changed {
+                    self.ui_prefs.voicevox_chunk_secs = next;
+                }
+                if !commit {
                     return;
                 }
-                self.ui_prefs.voicevox_chunk_secs = next;
                 self.persist_app_config();
                 self.voicevox.voicevox_metadata_sent.clear();
                 self.sync_vocal_metadata();
@@ -1906,6 +1912,17 @@ impl AppData {
                 // { error: None, cancelled: true }` が返る (cancel は typed flag で
                 // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
                 Some(ExportStage::AudioRender { .. }) => {
+                    // r.md #75: まだ **VOICEVOX の合成完了待ち** (`AudioRender` に入って
+                    // いるが daw_audio は render を始めていない) の段階なら、cancel を
+                    // engine へ送っても届かない — daw_audio は次の `ExportWav` 開始時に
+                    // 「前回の残り」として cancel flag を消すので、待ちが明けたあとに
+                    // 書き出しがそのまま完走してしまう。ここで待ちを畳んで中止する。
+                    if !self.ipc.pending_vocal_synth_export.is_empty() {
+                        self.ipc.pending_vocal_synth_export.clear();
+                        self.transport.pending_export = None;
+                        self.abort_audio_export("書き出しをキャンセルしました".into());
+                        return;
+                    }
                     self.send_audio(AudioCommand::CancelExport);
                     self.ui_ephemeral.status_message = "書き出しをキャンセル中...".into();
                 }

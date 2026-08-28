@@ -605,7 +605,14 @@ impl VoicevoxBuiltin {
                         continue;
                     };
                     if job.entries.is_empty() && job.talk.is_empty() {
-                        result_arc.store(None);
+                        // 旧 buffer は **retire 経由で**手放す。`store(None)` を直呼び
+                        // すると arc-swap が writer 側で即 drop するので、store と同時に
+                        // 走っていた `process()` の Guard が最後の所有者になり、
+                        // audio thread 上で数十 MB の解放が起きる (r.md #75)。
+                        crate::builtin::voicevox_render::clear_published(
+                            &result_arc,
+                            &rt_epoch,
+                        );
                         mem_cache.clear();
                         done_gen.store(job.generation, Ordering::SeqCst);
                         // 歌唱/読み上げ無し = 合成しない = idle。
@@ -641,6 +648,7 @@ impl VoicevoxBuiltin {
                         &job.entries,
                         &job.talk,
                         priority_beats,
+                        Arc::clone(&rt_epoch),
                     );
                     // 今回の job で使うキーだけ残す (= メモリキャッシュの自然な GC)。
                     let live = renderer.live_keys();
@@ -667,7 +675,6 @@ impl VoicevoxBuiltin {
                         let reporter = Arc::clone(&status_reporter);
                         let heartbeat = Arc::clone(&heartbeat);
                         let result_arc = Arc::clone(&result_arc);
-                        let rt_epoch = Arc::clone(&rt_epoch);
                         let failure = prev_failure.clone();
                         // フレーズ 1 本完了ごと: heartbeat / 進捗報告 / 必要なら publish。
                         // ここでの報告は dedup を通さない (件数は毎回変わるので必ず届く)。
@@ -680,10 +687,24 @@ impl VoicevoxBuiltin {
                                 total: state.total(),
                                 pending_clips: state.pending_clips(),
                             });
-                            state.publish_if_due(&result_arc, &rt_epoch);
+                            state.publish_if_due(&result_arc);
                         };
                         renderer.render(&mut mem_cache, &shutdown, &superseded, &mut on_done)
                     };
+
+                    // `on_done` は dedup (`synth_report`) を通さず直接 reporter を呼ぶ
+                    // (件数は毎回変わるので必ず届けたい)。その分 `last_status` が実際の
+                    // 最後の報告からずれるので、ここで揃える。揃えないと、次 job の開始
+                    // 報告が「前回と同じ」と判定されて抑止され、GUI に古い残件数と
+                    // クリップスピナーが残ることがある (job が supersede され続ける
+                    // ドラッグ中に起きやすい)。
+                    last_status = Some(VocalSynthProgress {
+                        busy: true,
+                        failure: prev_failure.clone(),
+                        pending: renderer.state_mut().pending(),
+                        total: renderer.state_mut().total(),
+                        pending_clips: renderer.state_mut().pending_clips(),
+                    });
 
                     match outcome {
                         RenderOutcome::Shutdown => return,
@@ -713,7 +734,7 @@ impl VoicevoxBuiltin {
                                 + std::time::Duration::from_millis(1500);
                         }
                         RenderOutcome::Done { rejected } => {
-                            renderer.state_mut().publish_final(&result_arc, &rt_epoch);
+                            renderer.state_mut().publish_final(&result_arc);
                             tracing::info!(
                                 phrases = renderer.state_mut().total(),
                                 "VoicevoxBuiltin: synth complete (phrase-level, song-absolute)"

@@ -292,7 +292,8 @@ auto-insert**(既に在れば no-op)。
 - **id 空間 (§8 最難所)**: running counter ではなく **`talk_event_id(clip_id, event_index)` を
   high band (`1<<28`) に決定論的導出** (`common/src/plugin_metadata.rs`)。flush (daw_gui) と
   trigger (daw_audio sequencer) が同式で計算するので skip 計数の同期が不要 = リスクを構造的に解消。
-  sing の note_id (= 小さい通し index) と衝突しない。
+  sing の note_id と衝突しない (r.md #75 以降は `sing_note_id(clip_id, note.id)` =
+  値域 `[0, 1<<28)`。high band と定義上ちょうど接する。それ以前は「小さい通し index」だった)。
 - **builtin の RT path は完全不変**: `process()` は note_id / event_id を区別せず `note_offsets` を
   引くだけ。synth thread で talk WAV を `start_beat*spb` に配置し `note_offsets[event_id]=placement`
   を足すだけ (sing と同じ `placed` バッファ機構に相乗り)。

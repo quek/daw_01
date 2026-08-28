@@ -233,10 +233,17 @@ fn fetch_talk_query(
 ) -> Result<String, SynthError> {
     let cache = VoiceVoxDiskCache::production();
     let key = key_for_talk_query(text, speaker_id);
+    // キャッシュ hit は **必ず検証してから使う**。壊れたエントリをそのまま返すと
+    // `apply_talk_params` が失敗し、その発話は以後永久に合成できない (次も同じ壊れた
+    // JSON を読むので HTTP へ落ちない)。検証に失敗したら miss 扱いで取り直し、
+    // `put` が上書きして直る。
     if let Some(hit) = cache.as_ref().and_then(|c| c.get(key, CacheKind::Json))
-        && let Ok(text) = String::from_utf8(hit)
+        && let Ok(body) = String::from_utf8(hit)
     {
-        return Ok(text);
+        if serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|v| v.is_object()) {
+            return Ok(body);
+        }
+        tracing::warn!("voicevox cache: 壊れた audio_query を無視して再取得");
     }
     let url = format!(
         "{}/audio_query?speaker={}&text={}",
@@ -307,19 +314,27 @@ pub fn synthesize_talk_for_builtin(
         ));
     }
     // 永続キャッシュ (text + talk speaker + scales)。再オープンで読み上げを再合成しない。
+    // 歌唱側と同じ規則: **hit は decode できて初めて採用**する。壊れたエントリを信じると
+    // その発話は永久に鳴らない (次も同じ壊れた WAV を読むので HTTP へ落ちない)。
+    // 取り直せば `put` が上書きして直る。
     let cache = VoiceVoxDiskCache::production();
     let cache_key = key_for_talk(text, speaker_id, scales);
-    let wav = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key, CacheKind::Wav)) {
-        tracing::info!(cache_key, "VOICEVOX talk cache hit (HTTP skip)");
-        hit
-    } else {
-        let client = synth_client()?;
-        let wav = synthesize_talk(&client, text, speaker_id, scales)?;
-        if let Some(c) = cache.as_ref() {
-            c.put(cache_key, CacheKind::Wav, &wav);
+    if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key, CacheKind::Wav)) {
+        match decode_wav_to_f32(&hit) {
+            Ok(decoded) => {
+                tracing::info!(cache_key, "VOICEVOX talk cache hit (HTTP skip)");
+                return Ok(decoded);
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "voicevox cache: 壊れた talk WAV を無視して再合成");
+            }
         }
-        wav
-    };
+    }
+    let client = synth_client()?;
+    let wav = synthesize_talk(&client, text, speaker_id, scales)?;
+    if let Some(c) = cache.as_ref() {
+        c.put(cache_key, CacheKind::Wav, &wav);
+    }
     decode_wav_to_f32(&wav).map_err(|e| SynthError::Rejected(format!("{e:#}")))
 }
 
