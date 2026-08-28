@@ -19,7 +19,27 @@ use serde::{Deserialize, Serialize};
 
 /// daw_01 clipboard を他アプリ text と区別するマーカー兼 format version。
 /// 形式を破壊変更したら version を上げる (古い clipboard は magic 不一致で no-op)。
+///
+/// r.md #71 (プラグインのコピー / 移動) で `ClipboardPayload::Devices` を足したが
+/// **version は据え置く**。 serde の externally-tagged enum に variant を足すと
+/// 新 build が書いた clipboard を旧 build は deserialize できないが、
+/// [`ClipboardEnvelope::from_json`] は `serde_json::from_str(..).ok()?` なので
+/// **decode 失敗は `None` = 静かな no-op** に落ちる (magic 一致で誤爆はしない)。
+/// version を上げると逆に「旧 build が書いた clipboard を新 build が読めない」を
+/// 新規に作ってしまう。
 pub const CLIPBOARD_MAGIC: &str = "daw_01.clipboard.v1";
+
+/// r.md #71 (プラグインのコピー / 移動): 1 回のコピーで OS クリップボードへ載せる
+/// blob の総量上限 (base64 前の生バイト)。
+///
+/// `PluginInstance.state` / `ara_archive` は `#[serde(with = "base64_opt")]` なので
+/// **base64 テキストとして OS クリップボードへ流れる**。 サンプラー系の state は
+/// 数十 MB になり得るが、 OS クリップボードはテキストの通り道であって、
+/// そこを運ぶ場所ではない。 **超える分は運ばずに落とし、 status_message で何を
+/// 落としたか明示する** — 黙って切ると「貼ったら音色が違う」の原因が見えなくなる。
+/// 大きい state ごと運びたいときはドラッグ&ドロップ / 複製 (どちらもプロセス内で
+/// `Arc` を clone するだけ) を使う。
+pub const CLIPBOARD_BLOB_BUDGET: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardEnvelope {
@@ -37,6 +57,20 @@ pub enum ClipboardPayload {
     Clips(Vec<ClipCopy>),
     AutomationClips(Vec<AutomationClipCopy>),
     Tracks(Vec<TrackCopy>),
+    /// r.md #71 (プラグインのコピー / 移動): チェーンから選んだプラグイン。
+    Devices(Vec<DeviceCopy>),
+}
+
+/// 正規化済み device。`order` は選択群内の相対順 (上から 0,1,2...) で、貼り付けで
+/// 相対順を保つ。`device.id` は **0 に落として運ぶ** (貼り先で必ず新採番する)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCopy {
+    pub order: usize,
+    /// コピー元の所属トラック。貼り付け先が同じなら ARA アーカイブを引き継ぐ
+    /// (別トラックなら捨てて解析し直す — `handler/sync.rs` の persistent_id が
+    /// 元トラックのクリップを指すため)。
+    pub source_track: u32,
+    pub device: common::model::PluginInstance,
 }
 
 /// 正規化済みオートメーション点。`value_norm` は target 非依存の 0..=1 normalized
@@ -344,6 +378,25 @@ pub fn sanitize_tracks(mut tracks: Vec<TrackCopy>) -> Vec<TrackCopy> {
     tracks
 }
 
+/// 外部 clipboard 由来の `DeviceCopy` 群を sanitize (`sanitize_tracks` と同じ流儀)。
+/// `plugin_id` が空のものは捨て、id は必ず 0 に落とし (貼り先で新採番する)、
+/// aux 参照の Vec 長だけ上限を掛ける。 aux の dangling track 参照は貼り付け時に
+/// 実在判定で落とすので、 ここでは見ない。 `ports` は bool の集合で値域が無い。
+pub fn sanitize_devices(devices: Vec<DeviceCopy>) -> Vec<DeviceCopy> {
+    /// aux 入出力ポートの上限 (外部 clipboard が巨大 Vec を送り込むのを防ぐ)。
+    const MAX_AUX_PORTS: usize = 64;
+    devices
+        .into_iter()
+        .filter(|d| !d.device.plugin_id.is_empty())
+        .map(|mut d| {
+            d.device.id = 0;
+            d.device.aux_inputs.truncate(MAX_AUX_PORTS);
+            d.device.aux_outputs.truncate(MAX_AUX_PORTS);
+            d
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +429,56 @@ mod tests {
             }
             _ => panic!("wrong payload variant"),
         }
+    }
+
+    /// r.md #71 (プラグインのコピー / 移動): device payload が JSON 往復する。
+    /// `state` は base64 で載るので、 中身が保たれることも見る。
+    #[test]
+    fn envelope_roundtrip_devices() {
+        use common::plugin_format::PluginFormat;
+        let mut inst =
+            common::model::PluginInstance::new("test.comp".into(), PluginFormat::Clap);
+        inst.state = Some(std::sync::Arc::from(&b"knob"[..]));
+        let env = ClipboardEnvelope::new(
+            7,
+            ClipboardPayload::Devices(vec![DeviceCopy {
+                order: 0,
+                source_track: 3,
+                device: inst,
+            }]),
+        );
+        let json = env.to_json().unwrap();
+        let back = ClipboardEnvelope::from_json(&json).unwrap();
+        assert_eq!(back.source_project_id, 7);
+        match back.payload {
+            ClipboardPayload::Devices(d) => {
+                assert_eq!(d.len(), 1);
+                assert_eq!(d[0].source_track, 3);
+                assert_eq!(d[0].device.plugin_id, "test.comp");
+                assert_eq!(d[0].device.state.as_deref(), Some(&b"knob"[..]));
+            }
+            _ => panic!("wrong payload variant"),
+        }
+    }
+
+    #[test]
+    fn sanitize_devices_drops_id_and_empty_id() {
+        use common::plugin_format::PluginFormat;
+        let dev = |plugin_id: &str, id: u64| DeviceCopy {
+            order: 0,
+            source_track: 1,
+            device: common::model::PluginInstance {
+                id,
+                aux_inputs: vec![None; 200],
+                aux_outputs: vec![None; 200],
+                ..common::model::PluginInstance::new(plugin_id.into(), PluginFormat::Clap)
+            },
+        };
+        let out = sanitize_devices(vec![dev("test.comp", 99), dev("", 1)]);
+        assert_eq!(out.len(), 1, "plugin_id が空の device は捨てる");
+        assert_eq!(out[0].device.id, 0, "id は貼り先で採番するので 0 に落とす");
+        assert_eq!(out[0].device.aux_inputs.len(), 64);
+        assert_eq!(out[0].device.aux_outputs.len(), 64);
     }
 
     #[test]

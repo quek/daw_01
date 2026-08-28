@@ -13,7 +13,7 @@ use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
 use common::protocol::PluginCommand;
 
-use daw_gui::app::{AppEvent, LoadedSlotInfo};
+use daw_gui::app::{AppEvent, LoadedDeviceInfo};
 
 use super::support::{build_app, drain};
 
@@ -33,7 +33,7 @@ fn note(pitch: u8, start: f64, dur: f64, lyric: &str) -> Note {
 }
 
 /// builtin VOICEVOX device (安定 id = `VOCAL_DEVICE_ID`) + notes 入り MIDI clip を
-/// 持つ vocal track を app に足し、loaded_slots にも登録する (= SlotPluginLoaded 相当、
+/// 持つ vocal track を app に足し、`loaded_devices` にも登録する (= SlotPluginLoaded 相当、
 /// ただし本体の load handler を通さないので metadata cache は clear されない)。
 #[allow(clippy::field_reassign_with_default)]
 fn add_loaded_vocal_track(app: &mut daw_gui::app::AppData) {
@@ -64,10 +64,9 @@ fn add_loaded_vocal_track(app: &mut daw_gui::app::AppData) {
         track.clips.push(clip);
         song.tracks.push(track);
     });
-    app.ipc.loaded_slots.insert(
-        (VOCAL_ID, 0),
-        LoadedSlotInfo {
-            device_id: VOCAL_DEVICE_ID,
+    app.ipc.loaded_devices.insert(
+        VOCAL_DEVICE_ID,
+        LoadedDeviceInfo {
             plugin_id_str: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
         },
     );

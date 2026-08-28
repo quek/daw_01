@@ -75,9 +75,6 @@ pub(super) fn draw_failed_load_section(
     if entries.is_empty() {
         return y;
     }
-    let Some(track_id) = app.cursor_track_id() else {
-        return y;
-    };
     ui.label_at(
         "inspector_loadfail_label",
         "読み込み失敗",
@@ -118,14 +115,14 @@ pub(super) fn draw_failed_load_section(
             11.0,
             p.text_dim,
         );
-        let device_index = entry.device_index;
+        let device_id = entry.device_id;
         ui.button_at(
             ("inspector_loadfail_reload", i),
             "再読込",
             Rect { x: btn_x, y: y + NAME_H, w: BTN_W, h: ROW_H },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ReloadDevice { track_id, device_index });
+                    app.handle_event(AppEvent::ReloadDevice { device_id });
                 })
             },
         );
@@ -160,9 +157,6 @@ pub(super) fn draw_editor_key_section(
     if entries.is_empty() {
         return y;
     }
-    let Some(track_id) = app.cursor_track_id() else {
-        return y;
-    };
     ui.label_at("inspector_keys_label", "エディタ窓のキー", area.x + pad, y, 12.0, p.text);
     y += 18.0 + 4.0;
 
@@ -178,7 +172,7 @@ pub(super) fn draw_editor_key_section(
             11.0,
             p.text,
         );
-        let device_index = entry.device_index;
+        let device_id = entry.device_id;
         let next = !entry.send_all_keys;
         ui.toggle_button_at(
             ("inspector_keys_toggle", i),
@@ -189,8 +183,7 @@ pub(super) fn draw_editor_key_section(
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetPluginSendAllKeys {
-                        track_id,
-                        device_index,
+                        device_id,
                         enabled: next,
                     });
                 })
@@ -230,8 +223,7 @@ pub(super) fn draw_parallel_out_section(
     let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     for (ei, entry) in po_entries.iter().enumerate() {
-        let track_id = entry.track_id;
-        let device_index = entry.device_index;
+        let device_id = entry.device_id;
         // Entry row: plugin name (left) + explode button (right).
         let btn_w = 64.0;
         let btn_x = right_x - btn_w;
@@ -256,7 +248,7 @@ pub(super) fn draw_parallel_out_section(
             Rect { x: btn_x, y, w: btn_w, h: row_h },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ExplodeParallelOut { track_id, device_index });
+                    app.handle_event(AppEvent::ExplodeParallelOut { device_id });
                 })
             },
         );
@@ -294,8 +286,7 @@ pub(super) fn draw_parallel_out_section(
                 let p = port as u8;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetParallelOutputRoute {
-                        track_id,
-                        device_index,
+                        device_id,
                         port: p,
                         dest,
                     });
@@ -373,13 +364,11 @@ pub(super) fn draw_sidechain_section(
             selected_idx,
         ) && let Some(choice) = choices.get(picked)
         {
-            let track_id = entry.track_id;
-            let device_index = entry.device_index;
+            let device_id = entry.device_id;
             let new_source = choice.track_id;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetSidechainSource {
-                    track_id,
-                    device_index,
+                    device_id,
                     port: 0,
                     source: new_source,
                 });
@@ -398,12 +387,10 @@ pub(super) fn draw_sidechain_section(
             tap_sel,
         ) && let Some(&tp) = SC_TAP_POINTS.get(picked)
         {
-            let track_id = entry.track_id;
-            let device_index = entry.device_index;
+            let device_id = entry.device_id;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetAuxInputTapPoint {
-                    track_id,
-                    device_index,
+                    device_id,
                     port: 0,
                     tap_point: tp,
                 });

@@ -289,10 +289,9 @@ impl AppData {
             };
         let entries: Vec<SidechainEntry> = devices
             .iter()
-            .enumerate()
-            .map(|(i, p)| SidechainEntry {
+            .map(|p| SidechainEntry {
                 track_id,
-                device_index: i as u32,
+                device_id: p.id,
                 plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
                 current_source: p
                     .aux_inputs
@@ -361,9 +360,8 @@ impl AppData {
         track
             .devices
             .iter()
-            .enumerate()
-            .filter(|(_, p)| p.aux_output_count > 0)
-            .map(|(i, p)| {
+            .filter(|p| p.aux_output_count > 0)
+            .map(|p| {
                 let count = p.aux_output_count as usize;
                 // Normalize routes to length `count` (model Vec may be shorter
                 // when only some ports are wired).
@@ -378,7 +376,7 @@ impl AppData {
                 let exploded = routes.iter().any(Option::is_some);
                 ParallelOutputEntry {
                     track_id,
-                    device_index: i as u32,
+                    device_id: p.id,
                     plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
                     aux_output_count: p.aux_output_count,
                     routes,
@@ -521,18 +519,13 @@ impl AppData {
     /// non-plugin target, an unknown param, or a degenerate range.
     pub fn plugin_param_range(
         &self,
-        track_id: u32,
         target: &common::model::AutomationTarget,
     ) -> Option<(f64, f64)> {
         let common::model::AutomationTarget::PluginParam { device_id, param_id, .. } = target
         else {
             return None;
         };
-        // v29: target は安定 device_id。 positional cache
-        // (`plugin_params`) へは逆引きで繋ぐ (S3b で cache 自体を id 化)。
-        let _ = track_id;
-        let (t, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
-        let params = self.ipc.plugin_params.get(&(t, device_index))?;
+        let params = self.ipc.plugin_params.get(device_id)?;
         let info = params.iter().find(|p| p.id == *param_id)?;
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
     }
@@ -572,7 +565,7 @@ impl AppData {
         }
         let info = self
             .ipc.plugin_params
-            .get(&(track_id, device_index))?
+            .get(device_id)?
             .iter()
             .find(|p| p.id == *param_id)?;
         if info.name.is_empty() {
@@ -612,7 +605,7 @@ impl AppData {
         let model_base = domain.to_model(target, display_base);
         // docs/plan_modulation_followups.md §2: plugin params normalize against
         // their real min/max (identity placeholder would saturate the overlay).
-        let plugin_range = self.plugin_param_range(track_id, target);
+        let plugin_range = self.plugin_param_range(target);
         let base_norm =
             f64::from(common::automation::plain_to_norm_ranged(target, model_base, plugin_range));
         // Reachable display depth for a normalized `depth`: convert the value the
@@ -976,27 +969,21 @@ impl AppData {
             };
         devices
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let device_index = i as u32;
+            .map(|p| {
                 // 埋め込み GUI の有無。 builtin (VOICEVOX / Silence) は
                 // 規定で持たないので format から即断 (= PluginParamList 到着前でも
                 // 正しく「Par」routing)。 外部 CLAP・VST3 は host の通知
                 // (`slot_has_gui`)、 未受信 (load 直後) は楽観的に true で「GUI」のまま。
                 let has_embedded_gui = p.format != PluginFormat::Builtin
-                    && self
-                        .ipc.slot_has_gui
-                        .get(&(track_id, device_index))
-                        .copied()
-                        .unwrap_or(true);
+                    && self.ipc.slot_has_gui.get(&p.id).copied().unwrap_or(true);
                 let has_params = self
                     .ipc.plugin_params
-                    .get(&(track_id, device_index))
+                    .get(&p.id)
                     .is_some_and(|v| !v.is_empty());
                 let is_voicevox = p.format == PluginFormat::Builtin
                     && p.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX;
                 ChainEntry {
-                    device_index,
+                    device_id: p.id,
                     plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
                     has_embedded_gui,
                     is_video: p.ports.is_video(),

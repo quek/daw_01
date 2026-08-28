@@ -3,7 +3,6 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use common::protocol::{AudioCommand, PluginCommand};
 
 impl AppData {
     // -------- Track operations ---------------------------------------------
@@ -68,7 +67,9 @@ impl AppData {
             self.copy_tracks_inner(&track_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::CopyToClipboard { track_ids });
+        self.enqueue_state_request(PendingStateRequest::CopyToClipboard(
+            ClipboardCopyRequest::Tracks(track_ids),
+        ));
     }
 
     /// Ctrl+X (トラック面)。copy → 削除を 1 undo step。plugin があれば deferred
@@ -547,42 +548,31 @@ impl AppData {
         let removed_min_idx = subtree_idxs.first().copied().unwrap_or(idx) as usize;
 
         // PR2.1 race-fix: 順序を「song update → LoadSong → plugin
-        // destroy → RemoveTrack」 に固定する。 song update を先に送ら
+        // destroy → RemoveSlotPlugin」 に固定する。 song update を先に送ら
         // ないと、 audio thread が古い schedule (削除対象 track の
         // ProcessTrack / ProcessGroupFx を含む) で destroyed plugin に
         // dispatch して deadlock する。
-        // (a) snapshot を取って順次 song.tracks.remove
-        let mut snapshots: Vec<(u32, common::model::Track)> =
-            Vec::with_capacity(subtree_idxs.len());
+        // (a) device teardown の IPC 列を **Song から外す前に** 組む
+        //     (`fx_chain_by_track_id` は削除前の Song からしか引けない)。
+        let removal_targets: Vec<u32> = subtree_idxs
+            .iter()
+            .rev()
+            .map(|&i| self.song_doc.song().tracks[i as usize].id)
+            .collect();
+        let removal_plan =
+            Self::plan_track_removal_ipc(self.song_doc.song(), &removal_targets);
         for &i in subtree_idxs.iter().rev() {
-            let removed_id = self.song_doc.song().tracks[i as usize].id;
-            let snapshot = self.song_doc.song().tracks[i as usize].clone();
-            #[cfg(windows)]
-            {
-                self.ipc.open_plugin_guis.retain(|&(t, _)| t != removed_id);
-            }
-            // slot cache からも削除する track 由来の entry を外す。
-            // SlotPluginUnloaded event の到着待ち race を狭めて、
-            // reconcile が stale entry を見ないようにする防御的 cleanup。
-            self.ipc.loaded_slots.retain(|(t, _), _| *t != removed_id);
             self.edit_song(|song| song.tracks.remove(i as usize));
-            snapshots.push((removed_id, snapshot));
         }
         // (b) LoadSong で audio engine を新 schedule に
-        // (c) **重要 (deadlock 防止)**: RemoveTrack 送信前に daw_audio
+        // (c) **重要 (deadlock 防止)**: RemoveSlotPlugin 送信前に daw_audio
         // に直接 ClosePluginShmem を送って plugin_refs から stale entry
         // を消す。 plugin_host の `plugin_shmems.remove` で shmem を
         // unmap した直後、 audio worker が `pd.prepare()` で unmapped
         // memory を読み AV → silent terminate → all_done 永久 wait
-        // を防ぐため。
-        for (removed_id, _snapshot) in snapshots {
-            if let Some(device_ids) = self.ipc.track_plugin_ids.remove(&removed_id) {
-                for device_id in device_ids {
-                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
-                }
-            }
-            self.send_plugin(PluginCommand::RemoveTrack { track_id: removed_id });
-        }
+        // を防ぐため。 順序は `plan_track_removal_ipc` が持っている。
+        self.send_track_removal_ipc(&removal_plan);
+        self.forget_removed_track_devices(&removal_plan);
 
         // selected_clip / selected_clips は stable ClipKey 保持なので、 残った
         // track の index shift には自動追従する (再マッピング不要)。 ただし
@@ -635,6 +625,9 @@ impl AppData {
         // collapsed_groups からも消えた id を除外。
         self.ui_prefs.collapsed_groups
             .retain(|id| !subtree_ids_set.contains(id));
+        // r.md #71 (プラグインのコピー / 移動): 消えた track の device を指す選択も
+        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
+        self.prune_device_selection();
         // Audio Editor を安定 key で貼り直す (消えていれば閉じる)。
         self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();
@@ -808,6 +801,21 @@ impl AppData {
         } else if self.selection.last_edit_select == Some(EditSurface::Tracks) {
             self.selection.last_edit_select = None;
         }
+    }
+
+    /// r.md #71 (プラグインのコピー / 移動): インスペクタの表示対象トラックだけを
+    /// 動かす (= カーソルトラックの移動)。
+    ///
+    /// [`Self::set_track_selection`] を使わないのは、あちらが last-wins タグを
+    /// [`EditSurface::Tracks`] に倒すため。 device をドラッグ中 / 落とした直後に
+    /// トラック面へタグが移ると、 次の Delete がトラックを消してしまう。
+    /// **選択集合は動かすがタグは触らない** のがここの責務。
+    pub(crate) fn focus_inspector_track(&mut self, track_id: u32) {
+        if self.cursor_track_id() == Some(track_id) {
+            return;
+        }
+        self.selection.selected_track_ids = vec![track_id];
+        self.selection.track_anchor = Some(track_id);
     }
 
     /// 選択中トラックに `song.tracks` の実在トラックが 1 本でもあるか。

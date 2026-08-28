@@ -290,12 +290,8 @@ impl AppData {
                 params,
                 has_embedded_gui,
             } => {
-                // v29: device_id → 旧 (track_id, index) 座標へ逆引きして
-                // 既存の positional cache に繋ぐ (S3b で cache 自体を id 化)。
-                if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
-                    self.ipc.plugin_params.insert((track, index), params);
-                    self.ipc.slot_has_gui.insert((track, index), has_embedded_gui);
-                }
+                self.ipc.plugin_params.insert(device_id, params);
+                self.ipc.slot_has_gui.insert(device_id, has_embedded_gui);
             }
             PluginEvent::PluginParamTouched {
                 device_id,
@@ -335,13 +331,11 @@ impl AppData {
                 param_id,
                 value,
             } => {
-                // Phase 4 Step C-3: plugin GUI knob の最新値を per-(track,
-                // device_index, param_id) cache に保存。
-                if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
-                    self.ipc
-                        .plugin_param_values
-                        .insert((track, index, param_id), value);
-                }
+                // Phase 4 Step C-3: plugin GUI knob の最新値を
+                // `(device_id, param_id)` cache に保存。
+                self.ipc
+                    .plugin_param_values
+                    .insert(DeviceParamKey { device_id, param_id }, value);
             }
             PluginEvent::PluginParamGestureEnd { device_id, param_id } => {
                 let Some((track, _index)) = find_device_by_id(self.song_doc.song(), device_id)

@@ -13,6 +13,7 @@
 pub mod app;
 pub mod app_config;
 pub mod app_types;
+pub mod device_addr;
 pub mod recent;
 pub mod window_state;
 #[cfg(test)]

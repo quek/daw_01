@@ -47,7 +47,12 @@ fn panel_rect(app: &AppData, screen: Rect) -> Rect {
         .song_doc.song()
         .tracks
         .iter()
-        .map(|t| app.ipc.track_plugin_ids.get(&t.id).map_or(0, Vec::len))
+        .map(|t| {
+            t.devices
+                .iter()
+                .filter(|d| app.ipc.loaded_devices.contains_key(&d.id))
+                .count()
+        })
         .sum();
     let header_h = 28.0;
     let overall_h = ROW_H * 4.0;
@@ -260,8 +265,14 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
     // ---- トラック別 / プラグイン別 CPU 内訳 ----
     let bottom = py + ph - ROW_H;
     'tracks: for track in &app.song_doc.song().tracks {
-        let pids = app.ipc.track_plugin_ids.get(&track.id);
-        let track_us: u32 = pids.map_or(0, |v| v.iter().map(|pid| plugin_us(*pid)).sum());
+        // host に実体がある device (= `loaded_devices` に居る) だけを出す。
+        // device_id そのものが計測キーなので、 chain 順との対応づけは要らない。
+        let loaded: Vec<&common::model::PluginInstance> = track
+            .devices
+            .iter()
+            .filter(|d| app.ipc.loaded_devices.contains_key(&d.id))
+            .collect();
+        let track_us: u32 = loaded.iter().map(|d| plugin_us(d.id)).sum();
         load_row(
             &app.theme,
             ui,
@@ -272,24 +283,21 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
             row(y),
         );
         y += ROW_H;
-        if let Some(pids) = pids {
-            // device 名と host plugin_id を chain 順で対応づけ、 plugin 別 load を出す。
-            for (device, pid) in track.devices.iter().zip(pids.iter()) {
-                if y > bottom {
-                    break 'tracks; // パネル下端を超えたら打ち切り。
-                }
-                let name = resolve_plugin_name(&app.ipc.plugin_db, &device.plugin_id);
-                load_row(
-                    &app.theme,
-                    ui,
-                    &format!("resmon_pl_{pid}"),
-                    &name,
-                    14.0,
-                    load_of(plugin_us(*pid)),
-                    row(y),
-                );
-                y += ROW_H;
+        for device in loaded {
+            if y > bottom {
+                break 'tracks; // パネル下端を超えたら打ち切り。
             }
+            let name = resolve_plugin_name(&app.ipc.plugin_db, &device.plugin_id);
+            load_row(
+                &app.theme,
+                ui,
+                &format!("resmon_pl_{}", device.id),
+                &name,
+                14.0,
+                load_of(plugin_us(device.id)),
+                row(y),
+            );
+            y += ROW_H;
         }
         if y > bottom {
             break;

@@ -866,30 +866,33 @@ mod aspect_fit_tests {
 #[cfg(test)]
 mod master_fx_tests {
     use crate::app_types::{compute_slot_reconcile_actions, SlotReconcileAction};
-    use common::model::{MASTER_TRACK_ID, PluginInstance, Song};
+    use common::model::{PluginInstance, Song};
     use common::plugin_format::PluginFormat;
     use std::collections::HashMap;
 
     #[test]
-    fn reconcile_emits_loadslot_for_master_fx() {
-        // master_fx_chain に 1 plugin、 host (loaded_slots) は空 → master の
-        // device index 0 に対する LoadSlot が 1 件出る。
+    fn reconcile_emits_loaddevice_for_master_fx() {
+        // master_fx_chain に 1 plugin、 host (`loaded_devices`) は空 → その device の
+        // 安定 id に対する LoadDevice が 1 件出る。
         let mut song = Song::default();
         song.master_fx_chain.push(PluginInstance::new(
             "vendor.reverb".to_string(),
             PluginFormat::Clap,
         ));
+        // `PluginInstance::new` は id == 0 (未採番) を作るので、 assert 対象の
+        // device_id を確定させるために採番を通す。
+        song.ensure_ids();
+        let expected_id = song.master_fx_chain[0].id;
+        assert_ne!(expected_id, 0, "ensure_ids が安定 id を振る");
         let loaded = HashMap::new();
         let actions = compute_slot_reconcile_actions(&song, &loaded);
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                SlotReconcileAction::LoadSlot { track_id, index, plugin_id_str, .. }
-                    if *track_id == MASTER_TRACK_ID
-                        && *index == 0
-                        && plugin_id_str == "vendor.reverb"
+                SlotReconcileAction::LoadDevice { device_id, plugin_id_str, .. }
+                    if *device_id == expected_id && plugin_id_str == "vendor.reverb"
             )),
-            "master fx に対する LoadSlot が emit されること: {actions:?}"
+            "master fx に対する LoadDevice が emit されること: {actions:?}"
         );
     }
 

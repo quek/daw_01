@@ -1117,6 +1117,67 @@ fn ensure_ids_remaps_lane_device_index_to_device_id() {
     }
 }
 
+/// r.md #71 (プラグインのコピー / 移動): device をコピーする経路が
+/// `alloc_device_id()` を呼び忘れると 2 device が同じ id を共有し、plugin host の
+/// dedup (同 device_id + 同 plugin_id) が 1 instance へ silent に merge する
+/// (音は出るので気付けない)。 防御は SSoT (`ensure_ids`) 側に置く。
+#[test]
+fn ensure_ids_reallocates_duplicate_device_ids() {
+    use crate::plugin_format::PluginFormat;
+    let plug = |id: &str, dev_id: u64| PluginInstance {
+        id: dev_id,
+        ..PluginInstance::new(id.into(), PluginFormat::Clap)
+    };
+    let mut song = Song {
+        tracks: vec![
+            Track {
+                id: 1,
+                devices: vec![plug("comp", 7)],
+                ..Track::default()
+            },
+            Track {
+                id: 2,
+                // track 1 の device と **同じ id**。
+                devices: vec![plug("comp", 7)],
+                ..Track::default()
+            },
+        ],
+        // master_fx_chain にも同 id を置いて、chain をまたいだ重複も見ることを固定する。
+        master_fx_chain: vec![plug("limiter", 7)],
+        ids: IdAllocators {
+            next_track_id: 3,
+            ..Song::default().ids
+        },
+        ..Song::default()
+    };
+    song.ensure_ids();
+
+    let a = song.tracks[0].devices[0].id;
+    let b = song.tracks[1].devices[0].id;
+    let m = song.master_fx_chain[0].id;
+    assert_eq!(a, 7, "先に走査した device は id を据え置く");
+    assert_ne!(b, a, "重複した 2 つ目は再採番される");
+    assert_ne!(m, a, "master_fx_chain の重複も再採番される");
+    assert_ne!(m, b);
+    assert!(b != 0 && m != 0, "再採番は sentinel を作らない");
+    assert!(
+        song.ids.next_device_id > a.max(b).max(m),
+        "allocator は採番済み id より先へ進む"
+    );
+
+    // idempotent: 2 回目は何も動かない。
+    let before = (a, b, m);
+    song.ensure_ids();
+    assert_eq!(
+        (
+            song.tracks[0].devices[0].id,
+            song.tracks[1].devices[0].id,
+            song.master_fx_chain[0].id
+        ),
+        before
+    );
+}
+
 #[test]
 fn project_file_roundtrip() {
     let pf = ProjectFile {
@@ -1247,7 +1308,12 @@ fn current_version_is_pinned() {
     // v33 (r.md #50 の follow-up): master の出力音量を `Song.master_gain` として
     // 保存する。従来は GUI のセッション状態にしか無く、保存しても開き直すと 0dB に
     // 戻っていた。v32 以前は `serde(default)` の 1.0 (unity) で読める。
-    assert_eq!(CURRENT_VERSION, 33);
+    // v34 (r.md #71 プラグインのコピー / 移動): `BindingTarget::PluginParam.track` を
+    // deserialize 専用 (`legacy_track`) に落とした。device を別トラックへ移せる
+    // ようになったので、所属 track を保存すると stale になる (実行時の解決は
+    // `device_id` の逆引き 1 本)。v33 以前は `track` を読んで
+    // `legacy_device_index` の解決にだけ使う。
+    assert_eq!(CURRENT_VERSION, 34);
 }
 
 #[test]
@@ -1820,15 +1886,16 @@ fn binding_target_plugin_param_legacy_compat() {
         BindingTarget::PluginParam {
             device_id: 0,
             legacy_device_index: Some(2),
+            legacy_track: Some(1),
             ..
         }
     ));
     // v29 JSON (device_id) はそのまま。 bincode 往復 (IPC 経路) も一致。
     let bt3 = BindingTarget::PluginParam {
-        track: 1,
         device_id: 42,
         param_id: 5,
         legacy_device_index: None,
+        legacy_track: None,
     };
     let via_json = json_roundtrip(&bt3);
     assert_eq!(bt3, via_json);

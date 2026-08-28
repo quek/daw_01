@@ -28,7 +28,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
 
     // 単一デバイスチェーン: 1 つの track に device 3 つ (synth=0, bitcrush=1,
-    // delay=2) を順に append。 song_has_plugin() == true なので 各 RemoveDevice が
+    // delay=2) を順に append。 song_has_plugin() == true なので 各 RemoveDevices が
     // deferred path を通る。
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(&mut app, 0);
@@ -69,13 +69,15 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // セットアップ中の plugin_rx を捨てる。
     let _ = drain(&mut plugin_rx);
 
-    // 1 回目の RemoveDevice (bitcrush = index 1) → queue.len == 1、
+    // 1 回目の RemoveDevices (bitcrush) → queue.len == 1、
     // RequestAllStates が 1 発送られる。
-    app.handle_event(AppEvent::RemoveDevice { index: 1 });
+    app.handle_event(AppEvent::RemoveDevices {
+        device_ids: vec![bitcrush_dev],
+    });
     assert_eq!(
         app.ipc.pending_state_queue.len(),
         1,
-        "1st RemoveDevice enqueues 1 entry"
+        "1st RemoveDevices enqueues 1 entry"
     );
     let msgs = drain(&mut plugin_rx);
     assert_eq!(
@@ -83,7 +85,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
             .filter(|m| matches!(m, PluginCommand::RequestAllStates))
             .count(),
         1,
-        "1st RemoveDevice triggers 1 RequestAllStates: {msgs:?}"
+        "1st RemoveDevices triggers 1 RequestAllStates: {msgs:?}"
     );
     assert!(
         !msgs
@@ -92,16 +94,19 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         "no RemoveSlotPlugin yet (still pending): {msgs:?}"
     );
 
-    // 2 回目の RemoveDevice — in-flight 中なので queue にだけ
+    // 2 回目の RemoveDevices — in-flight 中なので queue にだけ
     // 積まれて RequestAllStates は再発行されない。
-    // NOTE: DeferredEdit は positional index を運ぶ (S3b で id 捕捉に変える
-    // 予定)。 1 件目の削除実行後は delay が index 1 に詰まるので、 実行時に
-    // delay を指す index 1 を渡す (= 連続削除のユーザー操作と同じ)。
-    app.handle_event(AppEvent::RemoveDevice { index: 1 });
+    // r.md #71 (プラグインのコピー / 移動): `DeferredEdit` が運ぶのは **安定
+    // device_id** なので、 1 件目の削除で index が詰まっても指す device は
+    // 変わらない (旧: positional index を運んでいたので、 実行時の index を
+    // 呼び出し側が読み替える必要があった)。
+    app.handle_event(AppEvent::RemoveDevices {
+        device_ids: vec![delay_dev],
+    });
     assert_eq!(
         app.ipc.pending_state_queue.len(),
         2,
-        "2nd RemoveDevice enqueues without sending another RequestAllStates"
+        "2nd RemoveDevices enqueues without sending another RequestAllStates"
     );
     let msgs = drain(&mut plugin_rx);
     assert!(
@@ -222,10 +227,14 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     assert!(app.ipc.pending_state_queue.is_empty(), "queue starts empty");
     let _ = drain(&mut plugin_rx);
 
-    // RemoveDevice (bitcrush = index 1) → Deferred enqueue、 RequestAllStates(R1)
+    // RemoveDevices (bitcrush) → Deferred enqueue、 RequestAllStates(R1)
     // 送信。 live はまだ [synth, bitcrush, delay] (削除は deferred)。
-    app.handle_event(AppEvent::RemoveDevice { index: 1 });
-    assert_eq!(app.ipc.pending_state_queue.len(), 1, "RemoveDevice enqueues Deferred");
+    let bitcrush_dev =
+        daw_gui::app::device_id_at(app.song_doc.song(), track_id, 1).expect("bitcrush device id");
+    app.handle_event(AppEvent::RemoveDevices {
+        device_ids: vec![bitcrush_dev],
+    });
+    assert_eq!(app.ipc.pending_state_queue.len(), 1, "RemoveDevices enqueues Deferred");
     let _ = drain(&mut plugin_rx);
 
     // Deferred in-flight 中に Save。 queue 後方に積まれ、 snapshot はまだ None
@@ -254,7 +263,7 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
         "no extra RequestAllStates while Deferred in-flight: {msgs:?}"
     );
 
-    // R1 応答 → Deferred(RemoveDevice index 1) 実行 (live devices → [synth, delay])、
+    // R1 応答 → Deferred(RemoveDevices bitcrush) 実行 (live devices → [synth, delay])、
     // queue 残り [Save]、 dispatch_front_state_request が Save の snapshot を **今の**
     // live (= 削除後 layout) で充填し、 R2 を送る。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
