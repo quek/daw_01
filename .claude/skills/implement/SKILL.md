@@ -123,7 +123,9 @@ $ARGUMENTS を実装する。
 - **export / live の両方に効く音声処理か?** → `render_master_buffer` の中に入れる (不変条件 6)
 - **widget を作るか?** → DAW 固有なら daw_gui/src/widgets/ (common::model 直結)、
   汎用なら ui/crates (ドメイン知識ゼロ)。mirror 型・翻訳 enum を作らない (不変条件 8)
-- **ファイルが 3,000 行に近いか?** → 先に分割 (不変条件 9)。`make arch-lint` で検査
+- **サイズ budget に近いか?** (ファイル実コード 1,000 行 / 関数実コード 300 行 /
+  インデント 6 段) → 先に分割 (不変条件 9)。現在値は `python scripts/loc_budget.py --report`、
+  検査は `make arch-lint`。**物理行ではない** — テスト / doc comment / 空行は数えない
 
 **要件一覧をユーザーに提示し、過不足の確認を取る。承認を得てから次へ進む**
 (`feedback_no_redundant_verification` — 未完成段階で実機確認を求めない)。

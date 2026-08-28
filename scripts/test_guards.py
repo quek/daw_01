@@ -481,6 +481,11 @@ CASES = [
     # these constructs is documented in doc comments all over common/src, so a matcher
     # that counts comment mentions would fire on ~40 existing lines. arch_lint.sh has
     # the same problem and solves it with strip_comments; these cases pin the parity.
+    # Since r.md #76 (2026-08-28) arch_lint.sh delegates that classification to the Rust
+    # lexer in scripts/loc_budget.py (--filter-comments), so parity holds only for
+    # LEADING line comments: inside a raw string or a /* … */ block the two disagree,
+    # and arch-lint is the accurate one. The guard errs toward nudging more, which is the
+    # safe direction for a write-time nudge (same rationale as escalate: false).
     ("arch/untagged-pos", "Write",
      {"file_path": "common/src/model/content.rs",
       "content": "#[derive(Deserialize)]\n#[serde(untagged)]\npub enum ClipContent {}\n"},
@@ -935,7 +940,10 @@ def check_launching_targets_list():
         bad("launchtargets:makefile-derives-from-criterion",
             "Makefile が基準 CARGO_BIN_EXE_daw_gui から導いていません (手書き列挙の疑い)")
     # コメント行は数えない (なぜ名前で判定してはいけないかの説明に target 名が出るため。
-    # arch_lint.sh の strip_comments / arch-* ガードと同じ扱い)。
+    # arch_lint.sh の strip_comments / arch-* ガードと同じ扱い)。ここは Makefile が対象で
+    # `#` 始まりの行しか無いので行頭判定で足りる — r.md #76 以降 arch_lint.sh 側は
+    # scripts/loc_budget.py の Rust 字句解析に寄せてあるが、それは .rs 専用なので
+    # ここには使わない (raw string / ブロックコメントが存在しない)。
     mk_code = "\n".join(ln for ln in mk_text.splitlines() if not ln.lstrip().startswith("#"))
     handwritten = sorted(t for t in actual if t in mk_code)
     if handwritten:
