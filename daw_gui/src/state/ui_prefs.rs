@@ -1,6 +1,7 @@
 //! S3b-1: AppData state group (UiPrefs)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 
+#[derive(Debug)]
 pub struct UiPrefs {
     /// docs/plan_video.md P4: video preview window の表示フラグ。 menu
     /// "View → Video Preview" / shortcut で toggle、 runner が毎フレーム

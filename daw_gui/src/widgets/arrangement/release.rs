@@ -1,47 +1,73 @@
 //! S4b Phase D: arrangement widget の release-commit フェーズ (各 drag session の release で
 //! 1 度だけ `Edit<AppData>` を発行 + shortcut / wheel / double-click / secondary-click)。
-//! `arrangement()` から抽出。 immediate-mode の geometry / session は明示引数で受ける。
-
-#![allow(clippy::too_many_arguments)]
+//! `arrangement()` から抽出。
+//!
+//! r.md #77: 旧実装は immediate-mode の geometry / session を **33 個の明示引数**で受けていた。
+//! 現在はフレーム不変の地形を `&ArrangementFrame`、 release フレームで `take()` した session を
+//! `ReleasedSessions` にまとめて **4 引数**。
 
 use super::*;
 use daw_ui_core::PointerFrame;
 
+/// **`f` / `released` から旧引数名へ 1 度だけ束ね直してから本体に入る。**
+///
+/// r.md #77 の release.rs に対するスコープは「**署名だけ**縮める」 (計画 §0)。 wheel /
+/// double-click / secondary-click / marquee の切り出しは別件なので、 1,300 行の本体は
+/// 1 byte も動かさない。 束ね直しは `ArrangementFrame` を導入する前の引数と同じものを
+/// 同じ名前で借り直しているだけで、 新しい状態の複製ではない
+/// (旧 `*_copy` / `*_clone` 別名群は render / run 側の話で、 ここには 1 つも無い)。
+///
+/// **本体の `ui.widget_state(wid)` 読みを `released.*` / `live.*` に置き換えないこと。**
+/// `marquee_press` は 11 session の `is_none()` を **`widget_state` から**読む。 この読みは
+/// `marquee_zone_ok` が `pointer.primary_just_pressed` を要求するので **press フレームで走る**
+/// — つまり「同フレームの `press::dispatch` が起動したばかりの session」 を見なければ
+/// 正しくない。 しかも読む 11 個には `LiveSessions` が意図的に外した
+/// `automation_lane_resize_drag` / `track_row_resize_drag` / `playhead_drag` が含まれる。
+/// `released.*` は release フレームでしか埋まらず、 `live` は 3 つを持たないので、
+/// **どちらに差し替えても現行と等価にならない**。
+/// `commit_releases` は毎フレーム呼ばれることを忘れないこと。
 pub(super) fn commit_releases(
     ui: &mut Ui<'_, AppData>,
-    wid: WidgetId,
+    f: &ArrangementFrame<'_>,
     response: &mut ArrangementResponse,
-    pointer: PointerFrame,
-    view: ArrangementView,
-    style: &ArrangementStyle,
-    master_row: Option<&ArrangementMasterRow>,
-    sections: &[SectionView],
-    selected_clips: &[ClipKey],
-    selected_automation_clips: &[AutomationClipKey],
-    selected_automation_points: &[AutomationPointKey],
-    visible_tracks: &[ArrangementTrack],
-    press_tops: &[f32],
-    lanes: Rect,
-    ruler: Rect,
-    header_pane: Rect,
-    arranger_rect: Rect,
-    lanes_h: f32,
-    arranger_lane_h: f32,
-    beat_per_px: f64,
-    zoom_x_px_per_beat: f32,
-    clip_drag_release: Option<ClipDragSession>,
-    clip_short_click_pos: Option<((f32, f32), bool, bool)>,
-    audio_drag_release: Option<AudioDragSession>,
-    point_drag_release: Option<AutomationPointDragSession>,
-    automation_clip_drag_release: Option<AutomationClipDragSession>,
-    automation_curve_param_release: Option<AutomationCurveParamDragSession>,
-    automation_lasso_release: Option<AutomationLassoSession>,
-    lane_resize_drag_release: Option<AutomationLaneResizeDragSession>,
-    section_drag_release: Option<SectionDragSession>,
-    loop_drag_release: Option<LoopDragSession>,
-    track_volume_release: Option<TrackVolumeDragSession>,
-    pending_drop: Option<(Vec<u32>, Option<u32>, Option<u32>)>,
+    released: ReleasedSessions,
 ) {
+    let wid: WidgetId = f.wid;
+    let pointer: PointerFrame = f.pointer;
+    let view: ArrangementView = f.view;
+    let style: &ArrangementStyle = f.style;
+    let master_row: Option<&ArrangementMasterRow> = f.master_row;
+    let sections: &[SectionView] = f.sections;
+    let selected_clips: &[ClipKey] = f.selected_clips;
+    let selected_automation_clips: &[AutomationClipKey] = f.selected_automation_clips;
+    let selected_automation_points: &[AutomationPointKey] = f.selected_automation_points;
+    let visible_tracks: &[ArrangementTrack] = &f.visible_tracks;
+    let press_tops: &[f32] = &f.tops;
+    let lanes: Rect = f.lanes;
+    let ruler: Rect = f.ruler;
+    let header_pane: Rect = f.header_pane;
+    let arranger_rect: Rect = f.arranger_rect;
+    let lanes_h: f32 = f.lanes_h;
+    let arranger_lane_h: f32 = f.arranger_lane_h;
+    let beat_per_px: f64 = f.beat_per_px;
+    let zoom_x_px_per_beat: f32 = f.zoom_x_px_per_beat;
+    let ReleasedSessions {
+        clip_drag: clip_drag_release,
+        clip_short_click_pos,
+        audio_drag: audio_drag_release,
+        point_drag: point_drag_release,
+        automation_clip_drag: automation_clip_drag_release,
+        automation_curve_param: automation_curve_param_release,
+        automation_lasso: automation_lasso_release,
+        lane_resize: lane_resize_drag_release,
+        section_drag: section_drag_release,
+        loop_drag: loop_drag_release,
+        track_volume: track_volume_release,
+        pending_drop,
+        // `viewport_key` に混ぜるための hash で、 読むのは `render::dispatch` (`Overlays` 経由)。
+        // release commit 側の消費者はいない。
+        pending_reorder_hash: _,
+    } = released;
         // ---- shortcut: Delete ----
         // r.md #43: widget 内蔵の Delete ハンドラは **撤去した**。 `dispatch_shortcuts`
         // (view/root.rs) が arrangement 描画より前に走り `Ui::take_shortcut` で 1 度きり

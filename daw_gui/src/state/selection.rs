@@ -3,6 +3,7 @@
 
 use crate::app::{AutomationPointKeyRef, EditSurface};
 
+#[derive(Debug)]
 pub struct SelectionState {
 
     // -------- Selection --------
