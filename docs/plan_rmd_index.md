@@ -6,7 +6,7 @@
 | 項目 | 計画書 | 内容 |
 |---|---|---|
 | #71 | [plan_rmd_71_device_copy.md](plan_rmd_71_device_copy.md) | プラグインのコピー / 移動 (前提: device 帳簿の安定 id 化) |
-| #73 | [plan_rmd_73_automation_curve.md](plan_rmd_73_automation_curve.md) | オートメーションカーブの操作系 |
+| #73 | [plan_rmd_73_automation_curve.md](plan_rmd_73_automation_curve.md) | オートメーションカーブの操作系 (**未解決 2 件 → [plan_rmd_73_followup.md](plan_rmd_73_followup.md)**) |
 | #74 | [plan_rmd_74_disclosure_glyph.md](plan_rmd_74_disclosure_glyph.md) | 開閉マークの向きと SSoT 化 |
 | #75 | [plan_rmd_75_voicevox_phrase.md](plan_rmd_75_voicevox_phrase.md) | VOICEVOX 合成の塊クエリ + フレーズ合成 |
 | #76 | [plan_rmd_76_loc_budget.md](plan_rmd_76_loc_budget.md) | god file budget の測り方 |
