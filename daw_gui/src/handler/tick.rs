@@ -624,6 +624,9 @@ impl AppData {
     /// Step D thinning は `common::automation::thin_collinear_and_insert` に
     /// 抽出 (pure fn、 unit test 付き)。 ε は plain 単位で固定 0.005
     /// (Volume 範囲 0..=2 / Pan 範囲 -1..=1 のいずれでも 0.25% 程度)。
+    /// r.md #73: 同関数は **安定 id の採番も担う** ので `&mut AutomationContent` を渡す。
+    /// 旧実装は `&mut a.points` を渡していて、録音した点は保存 → 再読込の
+    /// `Song::ensure_ids` までずっと `id == 0` だった (= 曲線編集の id addressing が壊れる)。
     pub(crate) fn insert_recording_point(
         &mut self,
         content_id: common::model::ContentId,
@@ -642,12 +645,13 @@ impl AppData {
             let entry = song.clip_contents.entry(content_id).or_insert_with(|| {
                 common::model::ClipContent::Automation(common::model::AutomationContent::default())
             });
-            let points = match entry {
-                common::model::ClipContent::Automation(a) => &mut a.points,
-                _ => return false,
+            let common::model::ClipContent::Automation(a) = entry else {
+                return false;
             };
+            // r.md #73: content ごと渡して安定 id を採番させる (旧実装は id: 0 のまま
+            // 挿していたので、録音した点はセッション中ずっと未採番だった)。
             common::automation::thin_collinear_and_insert(
-                points,
+                a,
                 time_beat,
                 plain_value,
                 THIN_EPSILON_PLAIN,

@@ -17,6 +17,12 @@
         ArrangementStyle::from_theme(&test_theme())
     }
 
+    /// r.md #73: lane の既定 target (plain 0..=2 ↔ norm 0..=1 の affine、 表示窓の内側)。
+    /// 行レイアウトのテストは曲線の形を見ないので、 どの affine target でも等価。
+    fn volume_target() -> common::model::AutomationTarget {
+        common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume)
+    }
+
     fn clip(id: u32, start: f64, len: f64, name: &str) -> ClipView {
         ClipView {
             id,
@@ -219,6 +225,10 @@
         t1.automation_lanes_collapsed = false;
         t1.automation_lanes = vec![ArrangementAutomationLane {
             id: 1,
+            // r.md #73: この 4 本は行レイアウトのテストで curve を見ないので、
+            // affine な既定 target (Volume) で足りる。
+            target: volume_target(),
+            plugin_range: None,
             label: Arc::from("Volume"),
             icon_glyph: 'V',
             color: Color::rgb(1.0, 1.0, 1.0),
@@ -244,6 +254,10 @@
         t1.automation_lanes_collapsed = true; // 既存挙動
         t1.automation_lanes = vec![ArrangementAutomationLane {
             id: 1,
+            // r.md #73: この 4 本は行レイアウトのテストで curve を見ないので、
+            // affine な既定 target (Volume) で足りる。
+            target: volume_target(),
+            plugin_range: None,
             label: Arc::from("Volume"),
             icon_glyph: 'V',
             color: Color::rgb(1.0, 1.0, 1.0),
@@ -267,6 +281,10 @@
         t1.automation_lanes_collapsed = false;
         t1.automation_lanes = vec![ArrangementAutomationLane {
             id: 1,
+            // r.md #73: この 4 本は行レイアウトのテストで curve を見ないので、
+            // affine な既定 target (Volume) で足りる。
+            target: volume_target(),
+            plugin_range: None,
             label: Arc::from("Volume"),
             icon_glyph: 'V',
             color: Color::rgb(1.0, 1.0, 1.0),
@@ -290,6 +308,8 @@
         let view = test_view();
         let lane = |id: u32, visible: bool, height_px: u16| ArrangementAutomationLane {
             id,
+            target: volume_target(),
+            plugin_range: None,
             label: Arc::from("Volume"),
             icon_glyph: 'V',
             color: Color::rgb(1.0, 1.0, 1.0),
@@ -2234,220 +2254,10 @@
         );
     }
 
-    // ============================================================
-    // M14 Phase 63n-7 (daw_01 #033): Bezier S 字 cubic + Exponential variant の flatten 検証
-    // ============================================================
-
-    /// 出力点列から (画面 x=cx) に最も近い点の y を線形補間で求める。 polyline 内挿。
-    fn sample_polyline_y(pts: &[(f32, f32)], cx: f32) -> f32 {
-        assert!(pts.len() >= 2);
-        for w in pts.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            let (lo_x, hi_x) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
-            if cx >= lo_x && cx <= hi_x {
-                if (b.0 - a.0).abs() < 1e-6 {
-                    return a.1; // 垂直 segment は始点 y を返す (Hold の立ち上がり等は test 対象外)
-                }
-                let t = (cx - a.0) / (b.0 - a.0);
-                return a.1 + (b.1 - a.1) * t;
-            }
-        }
-        // 端 fallback
-        if cx <= pts.first().unwrap().0 {
-            pts.first().unwrap().1
-        } else {
-            pts.last().unwrap().1
-        }
-    }
-
-    /// 端点 (p1, p2) を常に通る (= 描画ズレなし) ことを確認。
-    #[test]
-    fn flatten_segment_endpoints_exact_for_all_curve_kinds() {
-        let p1 = (10.0_f32, 100.0_f32);
-        let p2 = (50.0_f32, 40.0_f32);
-        for kind in [
-            ArrangementCurveKind::Hold,
-            ArrangementCurveKind::Linear,
-            ArrangementCurveKind::Bezier { tension: 0.0 },
-            ArrangementCurveKind::Bezier { tension: 0.5 },
-            ArrangementCurveKind::Bezier { tension: -0.5 },
-            ArrangementCurveKind::Exponential { bend: 0.0 },
-            ArrangementCurveKind::Exponential { bend: 0.8 },
-            ArrangementCurveKind::Exponential { bend: -0.8 },
-        ] {
-            let mut out = vec![p1];
-            flatten_lane_segment(p1, p1, p2, p2, kind, 2.0, &mut out);
-            let last = *out.last().expect("at least 1 point pushed");
-            assert!(
-                (last.0 - p2.0).abs() < 1e-3 && (last.1 - p2.1).abs() < 1e-3,
-                "{kind:?}: 出力末尾 = p2 を期待 (got {last:?})"
-            );
-        }
-    }
-
-    /// Bezier { tension: 0.0 } は **直線**に縮退する (制御点 4 つが対角線上 = daw_01 SSoT の数値性質)。
-    /// 中央 (x=p1.x + dx/2) で y = (p1.y + p2.y) / 2 ± 0.5 px 以内。
-    #[test]
-    fn bezier_tension_zero_is_linear() {
-        let p1 = (0.0_f32, 0.0_f32);
-        let p2 = (100.0_f32, 60.0_f32);
-        let mut out = vec![p1];
-        flatten_lane_segment(
-            p1,
-            p1,
-            p2,
-            p2,
-            ArrangementCurveKind::Bezier { tension: 0.0 },
-            2.0,
-            &mut out,
-        );
-        let mid_y = sample_polyline_y(&out, 50.0);
-        let linear_mid = (p1.1 + p2.1) * 0.5;
-        assert!(
-            (mid_y - linear_mid).abs() < 0.5,
-            "tension=0 で中央は線形中点 = {linear_mid}: got {mid_y}"
-        );
-    }
-
-    /// Bezier { tension: +1.0 } で中央 y が **prev に偏る** (= 滑らかな S 字、 前半 prev に張り付く)。
-    /// daw_01 SSoT: tension=+1 で c1y=p1.y, c2y=p2.y (end-hold)、 cubic Bezier の中点 y は
-    /// `1/8*p1.y + 3/8*c1y + 3/8*c2y + 1/8*p2.y = 1/8*p1 + 3/8*p1 + 3/8*p2 + 1/8*p2 = 1/2*p1 + 1/2*p2`
-    /// ではなく、 x(t)=t なので t=0.5 で y(0.5) = (1/2)(p1 + p2)。 ふむ、 これは中点が線形と同じか?
-    ///
-    /// 実際には c1y=p1.y で c2y=p2.y のとき、 y(t) = (1-t)^3*p1 + 3(1-t)^2*t*p1 + 3(1-t)*t^2*p2 + t^3*p2
-    /// = p1 * [(1-t)^3 + 3(1-t)^2*t] + p2 * [3(1-t)*t^2 + t^3]
-    /// = p1 * (1-t)^2 * [(1-t) + 3t] + p2 * t^2 * [3(1-t) + t]
-    /// = p1 * (1-t)^2 * (1 + 2t) + p2 * t^2 * (3 - 2t)
-    /// t=0.5 で y = p1 * 0.25 * 2 + p2 * 0.25 * 2 = 0.5*p1 + 0.5*p2 (= 線形中点)
-    ///
-    /// したがって中点は線形と同じだが、 **t=0.25 / 0.75** で差が出る。 t=0.25 で:
-    /// y(0.25) = p1 * 0.5625 * 1.5 + p2 * 0.0625 * 2.5 = p1 * 0.84375 + p2 * 0.15625
-    /// (線形は p1 * 0.75 + p2 * 0.25、 = +0.09375 だけ p1 寄り)
-    #[test]
-    fn bezier_tension_positive_pulls_toward_endpoints() {
-        let p1 = (0.0_f32, 0.0_f32);
-        let p2 = (100.0_f32, 100.0_f32);
-        let mut out = vec![p1];
-        flatten_lane_segment(
-            p1,
-            p1,
-            p2,
-            p2,
-            ArrangementCurveKind::Bezier { tension: 1.0 },
-            2.0,
-            &mut out,
-        );
-        // t=0.25 (= x=25) で y は線形 25 より小さい (= p1 寄り = 0 寄り)
-        let y_at_25 = sample_polyline_y(&out, 25.0);
-        assert!(
-            y_at_25 < 25.0 - 5.0,
-            "tension=+1 で x=25 の y は線形 25 より明確に小さい (got {y_at_25})"
-        );
-        // t=0.75 (= x=75) で y は線形 75 より大きい (= p2 寄り = 100 寄り)
-        let y_at_75 = sample_polyline_y(&out, 75.0);
-        assert!(
-            y_at_75 > 75.0 + 5.0,
-            "tension=+1 で x=75 の y は線形 75 より明確に大きい (got {y_at_75})"
-        );
-    }
-
-    /// Bezier { tension: -1.0 } で overshoot 反転 S 字 (= 前半 p2 側、 後半 p1 側に張り出す)。
-    /// daw_01 SSoT: tension=-1 で c1y=p2.y, c2y=p1.y (反転 end-hold)。
-    /// x=25 で y は線形 25 より大きい (= p2=100 寄り)、 x=75 で y は線形 75 より小さい (= p1=0 寄り)。
-    #[test]
-    fn bezier_tension_negative_inverts_s_curve() {
-        let p1 = (0.0_f32, 0.0_f32);
-        let p2 = (100.0_f32, 100.0_f32);
-        let mut out = vec![p1];
-        flatten_lane_segment(
-            p1,
-            p1,
-            p2,
-            p2,
-            ArrangementCurveKind::Bezier { tension: -1.0 },
-            2.0,
-            &mut out,
-        );
-        let y_at_25 = sample_polyline_y(&out, 25.0);
-        assert!(
-            y_at_25 > 25.0 + 5.0,
-            "tension=-1 で x=25 の y は線形 25 より明確に大きい (overshoot、 got {y_at_25})"
-        );
-        let y_at_75 = sample_polyline_y(&out, 75.0);
-        assert!(
-            y_at_75 < 75.0 - 5.0,
-            "tension=-1 で x=75 の y は線形 75 より明確に小さい (overshoot、 got {y_at_75})"
-        );
-    }
-
-    /// Exponential { bend: +1.0 } は t^2 (二次曲線、 前半遅・後半速)、 t=0.5 で y = 0.25 * (p2 - p1) + p1。
-    /// daw_01 SSoT と完全一致。
-    #[test]
-    fn exponential_bend_positive_is_quadratic() {
-        let p1 = (0.0_f32, 0.0_f32);
-        let p2 = (100.0_f32, 100.0_f32);
-        let mut out = vec![p1];
-        flatten_lane_segment(
-            p1,
-            p1,
-            p2,
-            p2,
-            ArrangementCurveKind::Exponential { bend: 1.0 },
-            2.0,
-            &mut out,
-        );
-        // t=0.5 で y = 0.5^2 * 100 = 25
-        let y_at_50 = sample_polyline_y(&out, 50.0);
-        assert!(
-            (y_at_50 - 25.0).abs() < 1.0,
-            "bend=+1 で x=50 の y = 25 (t^2): got {y_at_50}"
-        );
-    }
-
-    /// Exponential { bend: -1.0 } は t^0.5 (平方根、 前半速・後半遅)、 t=0.5 で y ≈ 0.707 * (p2 - p1) + p1。
-    #[test]
-    fn exponential_bend_negative_is_sqrt() {
-        let p1 = (0.0_f32, 0.0_f32);
-        let p2 = (100.0_f32, 100.0_f32);
-        let mut out = vec![p1];
-        flatten_lane_segment(
-            p1,
-            p1,
-            p2,
-            p2,
-            ArrangementCurveKind::Exponential { bend: -1.0 },
-            2.0,
-            &mut out,
-        );
-        // t=0.5 で y = 0.5^0.5 * 100 ≈ 70.71
-        let y_at_50 = sample_polyline_y(&out, 50.0);
-        assert!(
-            (y_at_50 - 70.71).abs() < 1.5,
-            "bend=-1 で x=50 の y ≈ 70.71 (sqrt(t)): got {y_at_50}"
-        );
-    }
-
-    /// Exponential { bend: 0.0 } は **直線** (t^1)。
-    #[test]
-    fn exponential_bend_zero_is_linear() {
-        let p1 = (0.0_f32, 0.0_f32);
-        let p2 = (100.0_f32, 100.0_f32);
-        let mut out = vec![p1];
-        flatten_lane_segment(
-            p1,
-            p1,
-            p2,
-            p2,
-            ArrangementCurveKind::Exponential { bend: 0.0 },
-            2.0,
-            &mut out,
-        );
-        let y_at_50 = sample_polyline_y(&out, 50.0);
-        assert!(
-            (y_at_50 - 50.0).abs() < 1.0,
-            "bend=0 で x=50 の y = 50 (linear): got {y_at_50}"
-        );
-    }
+    // r.md #73: ここにあった flatten 検証 7 本と `sample_polyline_y` は
+    // `tests_curve.rs` へ移した (god file budget + 曲線テストを 1 か所に集める)。
+    // 移設時に「上り区間 / 下り区間の両方で確かめる」形へ書き直してある — 旧テストは
+    // screen y で 1 方向しか見ておらず、 #73 の不具合 (上り区間で符号が逆) を通していた。
 
     // ============================================================
     // M14 Phase 77 (daw_01 #048): 縦 scroll 時の scissor 動作 unit test

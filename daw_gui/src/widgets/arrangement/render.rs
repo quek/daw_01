@@ -159,6 +159,11 @@ pub(super) fn dispatch(
         // (`app.ui_ephemeral.arrangement_hover_clip`、 1 フレーム遅れ) ではなくこちらを使う。
         // **`viewport_key` にも `fold_arrangement_clip_hash` にも入れないこと。**
         hovered_clip: response.hovered_clip,
+        // r.md #73: Alt hover 中の「曲げられる区間」。 `hovered_clip` と同じく
+        // `cursor::hover` がこのフレーム中に確定させた値を heavy へ渡す
+        // (`render_arrangement_heavy` は response を受け取らないので、
+        // **response に足しただけでは強調が描けない**)。 cache キーには入れない。
+        hovered_segment: response.hovered_automation_segment,
         clip_content,
         stretch_ghost_content,
         selected_clip_set,
@@ -183,6 +188,10 @@ pub(super) struct HeavyInput {
     /// r.md #58: フェードの掴む正方形を出す clip。 `response.hovered_clip` の写し。
     /// **`viewport_key_hash` の材料にしてはいけない** (hover でアレンジ全体が再構築される)。
     pub hovered_clip: Option<ClipKey>,
+    /// r.md #73: Alt hover 中に「曲げられる区間」があるならその入射側 point。
+    /// Alt 強調 (overlay 層) を出す対象を決めるためだけに使う。
+    /// **`viewport_key_hash` の材料にしてはいけない** (`hovered_clip` と同じ罠)。
+    pub hovered_segment: Option<AutomationPointIdKey>,
     pub clip_content: HashMap<ClipKey, ClipContentDraw>,
     /// r.md #68: Shift + 端 drag のときだけ入る「伸縮済みの中身」。 空のときは
     /// ゴーストも `clip_content` をそのまま描く (トリム / 移動では確定後の中身が
@@ -539,147 +548,13 @@ fn render_arrangement_heavy(
                 }
             }
         }
-        // M14 Phase 63n-9 (#033): selected point の Bezier / Exponential 入射 segment に handle を描画。
-        // 描画式は `compute_curve_handle_pos` で SSoT、 drag 中は preview_value で handle 位置 + curve
-        // segment を上書き (= cached layer の base curve を `automation_curve_param_preview_color` の
-        // thicker line で覆って live preview)、 release frame で session take 済なら drag 終了。
-        if !heavy.selected_automation_point_set.is_empty() {
-            let beat_to_px = f64::from(lanes.w) / f.view.len_beats.max(1e-6);
-            let pad = f.style.automation_clip_v_pad_px;
-            let handle_r = f.style.automation_curve_param_handle_radius_px;
-            let handle_offset = f.style.automation_curve_param_handle_offset_px;
-            for (i, t) in f.visible_tracks.iter().enumerate() {
-                if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
-                    continue;
-                }
-                let row_top = f.tops[i];
-                let row_total_bottom = f.tops[i + 1];
-                if row_total_bottom < lanes.y || row_top > lanes.y + lanes.h {
-                    continue;
-                }
-                let mut lane_y = row_top + effective_track_row_h(t, f.view.track_row_h);
-                for lane in &t.automation_lanes {
-                    if !lane.visible {
-                        continue;
-                    }
-                    let lh = f32::from(lane.height_px);
-                    if lane_y + lh < lanes.y || lane_y > lanes.y + lanes.h {
-                        lane_y += lh;
-                        continue;
-                    }
-                    let clip_y = lane_y + pad;
-                    let clip_h = (lh - pad * 2.0).max(2.0);
-                    let lane_clip = Rect { x: lanes.x, y: lane_y, w: lanes.w, h: lh };
-                    for c in &lane.clips {
-                        for p_idx in 1..c.points.len() {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let key = AutomationPointKey {
-                                clip: AutomationClipKey {
-                                    track: t.id,
-                                    lane: lane.id,
-                                    clip: c.id,
-                                },
-                                point_idx: p_idx as u32,
-                            };
-                            if !heavy.selected_automation_point_set.contains(&key) {
-                                continue;
-                            }
-                            let pt = &c.points[p_idx];
-                            let (kind, base_value) = match pt.curve {
-                                ArrangementCurveKind::Bezier { tension } => {
-                                    (SetAutomationCurveParamKind::BezierTension, tension)
-                                }
-                                ArrangementCurveKind::Exponential { bend } => {
-                                    (SetAutomationCurveParamKind::ExponentialBend, bend)
-                                }
-                                _ => continue,
-                            };
-                            // drag 中 (= overlays.curve_param の point == 当該 key) なら preview_value、
-                            // そうでなければ point の現在値 (= base_value)。 drag 中の handle のみが
-                            // 動く (他の selected の handle は静止)。
-                            let value = overlays
-                                .curve_param
-                                .as_ref()
-                                .filter(|cd| cd.point == key && cd.kind == kind)
-                                .map_or(base_value, |cd| cd.preview_value);
-                            let prev = &c.points[p_idx - 1];
-                            let prev_abs = c.start_beat + prev.time_beat;
-                            let cur_abs = c.start_beat + pt.time_beat;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let prev_x =
-                                lanes.x + ((prev_abs - f.view.start_beat) * beat_to_px) as f32;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let cur_x =
-                                lanes.x + ((cur_abs - f.view.start_beat) * beat_to_px) as f32;
-                            let prev_y =
-                                clip_y + (1.0 - prev.value_norm.clamp(0.0, 1.0)) * clip_h;
-                            let cur_y = clip_y + (1.0 - pt.value_norm.clamp(0.0, 1.0)) * clip_h;
-                            // drag 中の preview curve segment を上書き描画 (= cached の base curve を
-                            // 視覚的に置換、 line_width を +50% にして元線を覆う)。 drag 中の selected
-                            // のみ 1 件描画 (他 selected の base curve は cached のまま)。
-                            if overlays.curve_param.as_ref().is_some_and(|cd| cd.point == key) {
-                                let preview_kind_value = match kind {
-                                    SetAutomationCurveParamKind::BezierTension => {
-                                        ArrangementCurveKind::Bezier { tension: value }
-                                    }
-                                    SetAutomationCurveParamKind::ExponentialBend => {
-                                        ArrangementCurveKind::Exponential { bend: value }
-                                    }
-                                };
-                                let mut pts: Vec<(f32, f32)> = Vec::with_capacity(32);
-                                pts.push((prev_x, prev_y));
-                                flatten_lane_segment(
-                                    (prev_x, prev_y),
-                                    (prev_x, prev_y),
-                                    (cur_x, cur_y),
-                                    (cur_x, cur_y),
-                                    preview_kind_value,
-                                    2.0,
-                                    &mut pts,
-                                );
-                                let segs: Vec<daw_ui_renderer::LineSegment> = pts
-                                    .windows(2)
-                                    .map(|w| daw_ui_renderer::LineSegment {
-                                        a: [w[0].0, w[0].1],
-                                        b: [w[1].0, w[1].1],
-                                        color: f.style.automation_curve_param_preview_color,
-                                    })
-                                    .collect();
-                                hctx.push_lines(daw_ui_renderer::LineBatch {
-                                    segments: segs.into(),
-                                    line_width_px: f.style.automation_curve_line_width_px * 1.5,
-                                    clip_rect: Some(lane_clip),
-                                });
-                            }
-                            // handle dot 描画 (compute_curve_handle_pos と同 SSoT)。
-                            let (hx, hy) = compute_curve_handle_pos(
-                                prev_x,
-                                prev_y,
-                                cur_x,
-                                cur_y,
-                                kind,
-                                value,
-                                handle_offset,
-                            );
-                            hctx.push_rect(RectCommand {
-                                rect: Rect {
-                                    x: hx - handle_r,
-                                    y: hy - handle_r,
-                                    w: handle_r * 2.0,
-                                    h: handle_r * 2.0,
-                                },
-                                fill: f.style.automation_curve_param_handle_fill,
-                                border: f.style.automation_curve_param_handle_border,
-                                border_width: 1.5,
-                                radius: [handle_r; 4],
-                                clip_rect: Some(lane_clip),
-                            });
-                        }
-                    }
-                    lane_y += lh;
-                }
-            }
-        }
+        // r.md #73: 中央ハンドルの描画は撤去した (ハンドルは原理的に動かない —
+        // Bezier の t=0.5 は tension に依らず常に中点)。 代わりに
+        //   (1) Alt hover 中の「曲げられる区間」の強調 (どこを掴むと何が起きるかの可視化)
+        //   (2) bend drag 中の preview 曲線
+        // を描く。 どちらも `cached` の外 — hover / drag は毎フレーム変わるので
+        // cache キーに混ぜると全再構築になる。
+        draw_bend_overlays(hctx, f, heavy.hovered_segment, overlays.segment_bend.as_ref());
         if let Some((nd, bd, td)) = overlays.clip.as_ref() {
             draw_drag_preview(
                 hctx,
@@ -954,4 +829,150 @@ fn render_arrangement_heavy(
             );
         });
     }
+}
+
+/// r.md #73: 曲線編集の overlay 2 種を `cached` の外に描く。
+///
+/// - **(1) hover 強調** … Alt 押下中にポインタが乗っている区間を
+///   `automation_curve_bend_hover_color` でなぞる。 入力は `cursor::hover` が確定させた
+///   `AutomationPointIdKey` 1 つだけで、 **hover のたびに `automation_segment_at` を
+///   再実行しない** (cursor 層で 1 度出した結果を key で運び、 ここでは幾何を引き直す)。
+/// - **(2) bend preview** … drag 中の `preview_curve` を `line_width × 1.5` の
+///   `automation_curve_bend_preview_color` で cached 側の base curve に重ねて覆う。
+///
+/// 形の評価は cached 側と同じ `curve::flatten_segment` を通す
+/// (= 「プレビューだけ別式」を作らない。 それが #73 の不具合の原因だった)。
+fn draw_bend_overlays(
+    hctx: &mut HeavyCtx<'_, '_, AppData>,
+    f: &ArrangementFrame<'_>,
+    hovered: Option<AutomationPointIdKey>,
+    bend: Option<&AutomationSegmentBendSession>,
+) {
+    // (1) hover 強調。 drag 中は preview が同じ区間を上塗りするので出さない。
+    if let Some(key) = hovered
+        && bend.is_none()
+        && let Some(seg) = resolve_bend_segment(f, key)
+    {
+        draw_segment_polyline(
+            hctx,
+            seg,
+            seg.curve,
+            f.style.automation_curve_bend_hover_color,
+            f.style.automation_curve_line_width_px * 1.5,
+        );
+    }
+    // (2) drag 中の preview。 `preview_curve` は毎フレーム逆算済 (drag.rs)。
+    if let Some(bd) = bend
+        && let Some(mut seg) = resolve_bend_segment(f, bd.point)
+    {
+        // 値と clip 描画域は press 時の anchor を使う (drag 中 model は不変なので同値だが、
+        // 縦スクロール / lane 高さ変更が同時に起きても preview が飛ばない)。
+        seg.clip_rect = bd.clip_rect_anchor;
+        seg.a_plain = bd.a_plain;
+        seg.b_plain = bd.b_plain;
+        draw_segment_polyline(
+            hctx,
+            seg,
+            bd.preview_curve,
+            f.style.automation_curve_bend_preview_color,
+            f.style.automation_curve_line_width_px * 1.5,
+        );
+    }
+}
+
+/// r.md #73: 区間 key → 描画に必要な幾何 (lane 参照 + clip 描画域 + 端点)。
+/// `automation_segment_at` と **同じ式**で x / clip_rect を出す (point dot と curve の x が
+/// ずれる既知バグ #028 user 指摘 2 の再発防止)。
+fn resolve_bend_segment<'a>(
+    f: &'a ArrangementFrame<'a>,
+    key: AutomationPointIdKey,
+) -> Option<ResolvedSegment<'a>> {
+    let (lane, clip) = find_lane_clip(&f.visible_tracks, key.clip)?;
+    let (p_prev, p_next) = curve::find_automation_segment_by_id(&f.visible_tracks, key)?;
+    let body_rect = automation_lane_body_rect(
+        &f.visible_tracks,
+        &f.tops,
+        f.view.track_row_h,
+        f.header_pane.x,
+        f.header_pane.w,
+        f.lanes.x,
+        f.lanes.w,
+        f.style,
+        key.clip.lane_key(),
+    )?;
+    let pad = f.style.automation_clip_v_pad_px;
+    let clip_rect = Rect {
+        x: body_rect.x,
+        y: body_rect.y + pad,
+        w: body_rect.w,
+        h: (body_rect.h - pad * 2.0).max(2.0),
+    };
+    let beat_to_px = f64::from(body_rect.w) / f.view.len_beats.max(1e-6);
+    #[allow(clippy::cast_possible_truncation)]
+    let x_prev = body_rect.x
+        + ((clip.start_beat + p_prev.time_beat - f.view.start_beat) * beat_to_px) as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let x_next = body_rect.x
+        + ((clip.start_beat + p_next.time_beat - f.view.start_beat) * beat_to_px) as f32;
+    Some(ResolvedSegment {
+        lane,
+        lane_rect: body_rect,
+        clip_rect,
+        x_prev,
+        x_next,
+        a_plain: p_prev.value_plain,
+        b_plain: p_next.value_plain,
+        curve: p_next.curve,
+    })
+}
+
+/// `resolve_bend_segment` の戻り値。
+#[derive(Clone, Copy)]
+struct ResolvedSegment<'a> {
+    lane: &'a ArrangementAutomationLane,
+    /// lane body 全体 (overlay の scissor)。
+    lane_rect: Rect,
+    clip_rect: Rect,
+    x_prev: f32,
+    x_next: f32,
+    a_plain: f64,
+    b_plain: f64,
+    curve: common::model::AutomationCurve,
+}
+
+/// 1 区間を `curve::flatten_segment` で polyline 化して 1 本の線として押す。
+fn draw_segment_polyline(
+    hctx: &mut HeavyCtx<'_, '_, AppData>,
+    seg: ResolvedSegment<'_>,
+    curve: common::model::AutomationCurve,
+    color: Color,
+    line_width_px: f32,
+) {
+    let map = curve::LaneValueMap::from_lane(seg.lane, seg.clip_rect);
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(64);
+    pts.push((seg.x_prev, map.plain_to_y(seg.a_plain)));
+    curve::flatten_segment(
+        map,
+        (seg.x_prev, seg.a_plain),
+        (seg.x_next, seg.b_plain),
+        curve,
+        2.0,
+        &mut pts,
+    );
+    if pts.len() < 2 {
+        return;
+    }
+    let segments: Vec<daw_ui_renderer::LineSegment> = pts
+        .windows(2)
+        .map(|w| daw_ui_renderer::LineSegment {
+            a: [w[0].0, w[0].1],
+            b: [w[1].0, w[1].1],
+            color,
+        })
+        .collect();
+    hctx.push_lines(daw_ui_renderer::LineBatch {
+        segments: segments.into(),
+        line_width_px,
+        clip_rect: Some(seg.lane_rect),
+    });
 }

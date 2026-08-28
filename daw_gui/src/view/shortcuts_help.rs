@@ -102,8 +102,9 @@ static MOUSE_GESTURES: &[MouseGestureDef] = &[
     MouseGestureDef { category: MouseCategory::Automation, gesture: "ダブルクリック (点)", description: "値を入力" },
     MouseGestureDef { category: MouseCategory::Automation, gesture: "ドラッグ (点)", description: "ポイントを移動" },
     MouseGestureDef { category: MouseCategory::Automation, gesture: "Alt+クリック (点)", description: "ポイントを削除" },
-    MouseGestureDef { category: MouseCategory::Automation, gesture: "ドラッグ (線の中央)", description: "カーブの曲率を調整" },
-    MouseGestureDef { category: MouseCategory::Automation, gesture: "右クリック (点)", description: "カーブの種類を選択" },
+    MouseGestureDef { category: MouseCategory::Automation, gesture: "Alt+ドラッグ (線)", description: "カーブの曲がり具合を変える" },
+    MouseGestureDef { category: MouseCategory::Automation, gesture: "Alt+ダブルクリック (線)", description: "カーブを直線に戻す" },
+    MouseGestureDef { category: MouseCategory::Automation, gesture: "右クリック (点)", description: "カーブの種類を選ぶ" },
     // ミキサー・ノブ
     MouseGestureDef { category: MouseCategory::Mixer, gesture: "ドラッグ", description: "ノブ・数値を増減" },
     MouseGestureDef { category: MouseCategory::Mixer, gesture: "ダブルクリック", description: "既定値にリセット" },
@@ -111,6 +112,7 @@ static MOUSE_GESTURES: &[MouseGestureDef] = &[
     MouseGestureDef { category: MouseCategory::Zoom, gesture: "ホイール", description: "スクロール" },
     MouseGestureDef { category: MouseCategory::Zoom, gesture: "Shift+ホイール", description: "横スクロール" },
     MouseGestureDef { category: MouseCategory::Zoom, gesture: "Ctrl+ホイール", description: "ピアノロールを縦ズーム" },
+    MouseGestureDef { category: MouseCategory::Zoom, gesture: "Alt+ホイール", description: "トラック行とオートメーションレーンの高さを変更" },
     // 映像・立ち絵プレビュー
     MouseGestureDef { category: MouseCategory::Preview, gesture: "ドラッグ (枠)", description: "移動" },
     MouseGestureDef { category: MouseCategory::Preview, gesture: "ドラッグ (四隅)", description: "拡大・縮小" },

@@ -111,6 +111,39 @@ pub fn plain_to_norm_ranged(
     v.clamp(0.0, 1.0) as f32
 }
 
+/// `plain_to_norm_ranged` が **表示窓の内側で affine** (`α·plain + β` の 1 次式) か。
+///
+/// 窓の内側なら「plain で `apply_curve` を評価してから norm へ写す」のと
+/// 「norm 値どうしを直接補間する」のは恒等に一致する (`apply_curve` は a / b に
+/// 対して affine 同変)。 **末尾の `clamp(0.0, 1.0)` は含まない** — 端点が窓の外に
+/// 出ている区間では写像が端で飽和して 1 次でなくなる。 描画側でこの述語を使うときは
+/// 端点が窓の内側であることを別途確かめること
+/// (`daw_gui/src/widgets/arrangement/curve.rs::segment_is_straight_on_screen`)。
+///
+/// 窓の内側でも非 affine なのは `GroupTransform::ScaleX` / `ScaleY` (log 空間) と
+/// `TrackBuiltin::Mute` (0.5 閾値の階段) の 2 つだけ。
+#[must_use]
+pub fn norm_mapping_is_affine(target: &AutomationTarget) -> bool {
+    !matches!(
+        target,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute)
+            | AutomationTarget::GroupTransform(
+                crate::model::GroupTransformParam::ScaleX
+                    | crate::model::GroupTransformParam::ScaleY
+            )
+    )
+}
+
+/// `plain_to_norm_ranged` が **狭義単調 (= 逆写像 `norm_to_plain_ranged` を持つ)** か。
+///
+/// 階段の `TrackBuiltin::Mute` だけが false。 画面上の点を掴んで値を逆算する
+/// 直接操作 (r.md #73 の Alt+ドラッグ) は、これが true の lane でしか成立しない
+/// (Mute lane の曲線は必ず 0 / 1 の段なので、指に追従させる連続解が無い)。
+#[must_use]
+pub fn norm_mapping_is_invertible(target: &AutomationTarget) -> bool {
+    !matches!(target, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute))
+}
+
 /// Normalized 0..=1 → plain (target's native unit)。`plain_to_norm` の
 /// 逆変換。`Mute` は 0.5 を閾値に 0.0 / 1.0 へ snap。
 pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
@@ -240,6 +273,17 @@ pub fn evaluate_clip(content: &AutomationContent, t: f64) -> f64 {
 /// `x(t) = t` に縮退、 時間軸 `u` から Bezier parameter `t` は `t = u`
 /// で即決定 (Newton iter 不要)。 RT 安全 (O(1) operations、 heap alloc
 /// / I/O なし)。 詳細は `eval_bezier` の docstring。
+///
+/// **この関数が曲線の形の唯一の実装** (r.md #73)。 再生 (daw_audio) も
+/// arrangement widget の描画も hit-test も逆算も、全部ここを呼ぶ。
+/// 画面座標で式を書き直さないこと — 「評価と描画は一致しているのに
+/// ハンドルの向きだけ逆」 という #73 の不具合はそれが原因だった。
+///
+/// `a` / `b` に対して **affine 同変**: 任意の 1 次写像 φ について
+/// `apply_curve(φ(a), φ(b), u, c) == φ(apply_curve(a, b, u, c))`。
+/// ただし `plain_to_norm_ranged` は末尾で `clamp(0, 1)` するので、
+/// **端点が表示窓の外にある区間では norm 空間の補間と一致しない**
+/// (plain 側が真、 norm 側は飽和した嘘)。
 #[inline]
 pub fn apply_curve(a: f64, b: f64, u: f64, curve: AutomationCurve) -> f64 {
     let u = u.clamp(0.0, 1.0);
@@ -455,12 +499,23 @@ pub struct ThinInsertResult {
     pub removed_prev: bool,
 }
 
+/// r.md #73: **点を作る唯一の共有経路なので、ここで安定 id を採番する。**
+/// 旧実装は `id: 0` (未採番 sentinel) を挿していた。 v29 の id はセッション中に
+/// 採番されず、保存 → 再読込の `Song::ensure_ids` まで 0 のままだったので、
+/// 「オートメーション録音した点は全部 id 0」 という状態が実在した
+/// (`daw_gui/src/handler/tick.rs::insert_recording_point` が唯一の caller)。
+/// #73 の曲線編集は point を安定 id で指すため、この穴があると別の点が曲がる。
+///
+/// `&mut AutomationContent` を取るのは `alloc_point_id()` を呼ぶため
+/// (呼び出し側で後付けする形にすると次の caller が忘れる)。
 pub fn thin_collinear_and_insert(
-    points: &mut Vec<crate::model::AutomationPoint>,
+    content: &mut AutomationContent,
     time_beat: f64,
     plain_value: f64,
     epsilon: f64,
 ) -> ThinInsertResult {
+    let id = content.alloc_point_id();
+    let points = &mut content.points;
     let mut insert_at = points.partition_point(|p| p.time_beat <= time_beat);
     let mut removed_prev = false;
     if insert_at >= 2 {
@@ -478,7 +533,7 @@ pub fn thin_collinear_and_insert(
         }
     }
     let new_point = crate::model::AutomationPoint {
-        id: 0,
+        id,
         time_beat,
         value: plain_value,
         curve: crate::model::AutomationCurve::Linear,
@@ -1005,18 +1060,26 @@ mod tests {
     /// ε は plain 単位 0.005 (Volume / Pan の Live 規定 0.5% に相当)。
     const TEST_EPS: f64 = 0.005;
 
+    /// r.md #73: `thin_collinear_and_insert` は `&mut AutomationContent` を取るので、
+    /// テストの fixture もこの形で組む (期待値は 1 つも変えていない — thinning の
+    /// 挙動は signature 変更の前後で同一)。
+    fn content_of(points: Vec<AutomationPoint>) -> AutomationContent {
+        AutomationContent { points, next_point_id: 1 }
+    }
+
     /// 直線的に valueを上げる drag を sim: 各 tick で linear に増える値を
     /// 連続 insert すると、 thinning が中間点を削除して 最初と最後だけ残す。
     #[test]
     fn thin_linear_drag_collapses_to_endpoints() {
-        let mut pts: Vec<AutomationPoint> = vec![pt(0.0, 0.0, AutomationCurve::Linear)];
+        let mut c = content_of(vec![pt(0.0, 0.0, AutomationCurve::Linear)]);
         // beat 0.0 (= start), 0.1, 0.2, ..., 1.0 で y = beat を insert
         for i in 1..=10 {
             let t = i as f64 / 10.0;
-            thin_collinear_and_insert(&mut pts, t, t, TEST_EPS);
+            thin_collinear_and_insert(&mut c, t, t, TEST_EPS);
         }
         // 始点 (0,0) と直近 insert された点 (1.0, 1.0) の 2 点だけ残るはず。
         // 中間は collinear なので毎回 prev が削除される。
+        let pts = &c.points;
         assert_eq!(pts.len(), 2, "expected 2 points after linear thinning, got {pts:?}");
         assert!((pts[0].time_beat - 0.0).abs() < 1e-9);
         assert!((pts[0].value - 0.0).abs() < 1e-9);
@@ -1028,18 +1091,19 @@ mod tests {
     /// 直線部分は thin されるが、 折り返しの瞬間は collinear でないので残る。
     #[test]
     fn thin_v_shape_drag_keeps_inflection_point() {
-        let mut pts: Vec<AutomationPoint> = vec![pt(0.0, 0.0, AutomationCurve::Linear)];
+        let mut c = content_of(vec![pt(0.0, 0.0, AutomationCurve::Linear)]);
         // 上昇: t=0.1..0.5, y=t (直線で 0→0.5)
         for i in 1..=5 {
             let t = i as f64 / 10.0;
-            thin_collinear_and_insert(&mut pts, t, t, TEST_EPS);
+            thin_collinear_and_insert(&mut c, t, t, TEST_EPS);
         }
         // 下降: t=0.6..1.0, y = 1.0 - t (peak 0.5 から 0→0.0)
         for i in 6..=10 {
             let t = i as f64 / 10.0;
             let y = 1.0 - t;
-            thin_collinear_and_insert(&mut pts, t, y, TEST_EPS);
+            thin_collinear_and_insert(&mut c, t, y, TEST_EPS);
         }
+        let pts = &c.points;
         // 期待: (0,0) + (0.5, 0.5) peak + (1.0, 0.0) の 3 点に収束する想定。
         // (0,0) と (0.5, 0.5) の間は collinear で thin、 (0.5, 0.5) は折り返し
         // 直後の (0.6, 0.4) が collinear 検査されると prev_prev=(0,0) と new=
@@ -1062,13 +1126,13 @@ mod tests {
     /// points.len() < 2 (= 始点のみ) のとき thinning skip、 普通に insert される。
     #[test]
     fn thin_skips_when_fewer_than_two_points() {
-        let mut pts: Vec<AutomationPoint> = vec![];
-        let r = thin_collinear_and_insert(&mut pts, 0.0, 0.5, TEST_EPS);
-        assert_eq!(pts.len(), 1);
+        let mut c = content_of(vec![]);
+        let r = thin_collinear_and_insert(&mut c, 0.0, 0.5, TEST_EPS);
+        assert_eq!(c.points.len(), 1);
         assert!(!r.removed_prev);
 
-        let r2 = thin_collinear_and_insert(&mut pts, 0.5, 0.7, TEST_EPS);
-        assert_eq!(pts.len(), 2);
+        let r2 = thin_collinear_and_insert(&mut c, 0.5, 0.7, TEST_EPS);
+        assert_eq!(c.points.len(), 2);
         assert!(!r2.removed_prev);
     }
 
@@ -1076,11 +1140,12 @@ mod tests {
     /// 点は collinear で削除される。 結果 2 点。
     #[test]
     fn thin_constant_value_collapses_to_two_points() {
-        let mut pts: Vec<AutomationPoint> = vec![];
+        let mut c = content_of(vec![]);
         for i in 0..=10 {
             let t = i as f64 / 10.0;
-            thin_collinear_and_insert(&mut pts, t, 0.7, TEST_EPS);
+            thin_collinear_and_insert(&mut c, t, 0.7, TEST_EPS);
         }
+        let pts = &c.points;
         assert_eq!(pts.len(), 2, "expected 2 endpoints after constant thinning, got {pts:?}");
         assert!((pts[0].value - 0.7).abs() < 1e-9);
         assert!((pts[1].value - 0.7).abs() < 1e-9);
@@ -1091,35 +1156,183 @@ mod tests {
     #[test]
     fn thin_epsilon_boundary() {
         // ε = 0.005、 prev=(0.5, 0.502) ← interp は 0.5、 逸脱は 0.002 < ε → thin
-        let mut pts_thin: Vec<AutomationPoint> = vec![
+        let mut c_thin = content_of(vec![
             pt(0.0, 0.0, AutomationCurve::Linear),
             pt(0.5, 0.502, AutomationCurve::Linear),
-        ];
-        thin_collinear_and_insert(&mut pts_thin, 1.0, 1.0, TEST_EPS);
-        assert_eq!(pts_thin.len(), 2, "should have removed middle point");
+        ]);
+        thin_collinear_and_insert(&mut c_thin, 1.0, 1.0, TEST_EPS);
+        assert_eq!(c_thin.points.len(), 2, "should have removed middle point");
 
         // ε = 0.005、 prev=(0.5, 0.51) ← interp は 0.5、 逸脱は 0.01 > ε → keep
-        let mut pts_keep: Vec<AutomationPoint> = vec![
+        let mut c_keep = content_of(vec![
             pt(0.0, 0.0, AutomationCurve::Linear),
             pt(0.5, 0.51, AutomationCurve::Linear),
-        ];
-        thin_collinear_and_insert(&mut pts_keep, 1.0, 1.0, TEST_EPS);
-        assert_eq!(pts_keep.len(), 3, "should NOT have removed middle point");
+        ]);
+        thin_collinear_and_insert(&mut c_keep, 1.0, 1.0, TEST_EPS);
+        assert_eq!(c_keep.points.len(), 3, "should NOT have removed middle point");
     }
 
     /// dt_full == 0 (= prev_prev と new_point が同時刻) のときは divide
     /// by 0 を避けて thinning skip。 sort 順は保たれ、 単に末尾に append。
     #[test]
     fn thin_skips_when_dt_zero() {
-        let mut pts: Vec<AutomationPoint> = vec![
+        let mut c = content_of(vec![
             pt(0.5, 0.0, AutomationCurve::Linear),
             pt(0.5, 0.3, AutomationCurve::Linear),
-        ];
-        let r = thin_collinear_and_insert(&mut pts, 0.5, 0.5, TEST_EPS);
-        assert_eq!(pts.len(), 3);
+        ]);
+        let r = thin_collinear_and_insert(&mut c, 0.5, 0.5, TEST_EPS);
+        assert_eq!(c.points.len(), 3);
         assert!(!r.removed_prev);
         // partition_point の <= 比較で末尾に挿入される
         assert_eq!(r.insert_at, 2);
+    }
+
+    /// r.md #73: 点を作る唯一の共有経路が **必ず安定 id を採番する**。
+    /// 旧実装は `id: 0` (未採番 sentinel) のまま挿しており、 オートメーション録音した
+    /// 点は保存 → 再読込まで全部 id 0 だった (= `SetAutomationCurve` の id addressing が
+    /// 「先頭の別の点」を掴む)。
+    #[test]
+    fn thin_insert_allocates_stable_ids() {
+        let mut c = content_of(vec![]);
+        // 直線にならないよう値を振って thinning で消えないようにする。
+        thin_collinear_and_insert(&mut c, 0.0, 0.0, TEST_EPS);
+        thin_collinear_and_insert(&mut c, 1.0, 1.0, TEST_EPS);
+        thin_collinear_and_insert(&mut c, 2.0, 0.0, TEST_EPS);
+        assert_eq!(c.points.len(), 3, "3 点とも残る: {:?}", c.points);
+        let ids: Vec<u32> = c.points.iter().map(|p| p.id).collect();
+        assert!(ids.iter().all(|&id| id != 0), "id が未採番のまま: {ids:?}");
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "id が重複: {ids:?}");
+        assert!(c.next_point_id > *ids.iter().max().unwrap(), "allocator が進んでいない");
+    }
+
+    /// r.md #73: 2 述語は `AutomationTarget` の全 variant を明示的に覆う。
+    /// 新しい target を足したときにここが落ちるようにしておく (曲線の直接操作は
+    /// 「その lane で逆写像が取れるか」に依存するので、既定値で通してはいけない)。
+    #[test]
+    fn norm_mapping_predicates_cover_every_target() {
+        use crate::model::{GroupTransformParam, ImageBuiltinParam, TextBuiltinParam};
+        // affine でない = ScaleX / ScaleY (log) と Mute (階段) の 3 つだけ。
+        let non_affine = [
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute),
+            AutomationTarget::GroupTransform(GroupTransformParam::ScaleX),
+            AutomationTarget::GroupTransform(GroupTransformParam::ScaleY),
+        ];
+        for t in &non_affine {
+            assert!(!norm_mapping_is_affine(t), "{t:?} は非 affine のはず");
+        }
+        // 逆写像を持たない = Mute だけ。
+        assert!(!norm_mapping_is_invertible(&AutomationTarget::TrackBuiltin(
+            TrackBuiltinParam::Mute
+        )));
+        // 残りは全部 affine かつ invertible。 **全 variant を列挙する** (`_ =>` を書かない)。
+        let affine: Vec<AutomationTarget> = vec![
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                send_id: 1,
+                legacy_send_idx: None,
+            }),
+            AutomationTarget::PluginParam { device_id: 1, param_id: 2, legacy_device_index: None },
+            AutomationTarget::SongTempo,
+            AutomationTarget::SongTimeSigNumerator,
+            AutomationTarget::ImageBuiltin(ImageBuiltinParam::X),
+            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y),
+            AutomationTarget::ImageBuiltin(ImageBuiltinParam::W),
+            AutomationTarget::ImageBuiltin(ImageBuiltinParam::H),
+            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity),
+            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::X),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::Y),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::W),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::H),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::Opacity),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::Rotation),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::FontSize),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::FillR),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::FillG),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::FillB),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::FillA),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineR),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineG),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineB),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineA),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineWidth),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowR),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowG),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowB),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowA),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowOffsetX),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowOffsetY),
+            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowBlur),
+            AutomationTarget::GroupTransform(GroupTransformParam::X),
+            AutomationTarget::GroupTransform(GroupTransformParam::Y),
+            AutomationTarget::GroupTransform(GroupTransformParam::Rotation),
+            AutomationTarget::GroupTransform(GroupTransformParam::AnchorX),
+            AutomationTarget::GroupTransform(GroupTransformParam::AnchorY),
+            AutomationTarget::GroupTransform(GroupTransformParam::Opacity),
+        ];
+        for t in &affine {
+            assert!(norm_mapping_is_affine(t), "{t:?} は affine のはず");
+            assert!(norm_mapping_is_invertible(t), "{t:?} は逆写像を持つはず");
+        }
+    }
+
+    /// r.md #73: `apply_curve` は a / b に対して **affine 同変**。
+    /// これが「表示窓の内側に収まる affine な target なら plain 評価と norm 評価が
+    /// 一致する」ことの根拠なので、テストで固定する (α < 0 = 上下反転も含む)。
+    #[test]
+    fn apply_curve_is_affine_equivariant() {
+        let curves = [
+            AutomationCurve::Hold,
+            AutomationCurve::Linear,
+            AutomationCurve::Bezier { tension: 0.6 },
+            AutomationCurve::Bezier { tension: -0.4 },
+            AutomationCurve::Exponential { bend: 0.7 },
+            AutomationCurve::Exponential { bend: -0.9 },
+        ];
+        // φ(v) = α v + β。 α < 0 (上下反転) も混ぜる。
+        let phis: [(f64, f64); 3] = [(2.0, -1.0), (-0.5, 3.0), (1.0, 0.0)];
+        let (a, b) = (0.2_f64, 0.8_f64);
+        for c in curves {
+            for (alpha, beta) in phis {
+                for i in 0..=10 {
+                    let u = f64::from(i) / 10.0;
+                    let lhs = apply_curve(alpha * a + beta, alpha * b + beta, u, c);
+                    let rhs = alpha * apply_curve(a, b, u, c) + beta;
+                    assert!(
+                        (lhs - rhs).abs() < 1e-12,
+                        "{c:?} α={alpha} β={beta} u={u}: {lhs} != {rhs}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// r.md #73 §3.3 (c): `plain_to_norm_ranged` は末尾で `clamp(0, 1)` するので、
+    /// **表示窓の外に出る plain 値は端に飽和して norm から復元できない**。
+    /// 「affine だから描画は 1px も変わらない」は嘘であることをテストで固定する。
+    #[test]
+    fn plain_to_norm_saturates_outside_the_window() {
+        let t = AutomationTarget::GroupTransform(crate::model::GroupTransformParam::X);
+        // 窓の内側は恒等 (往復する)。
+        let inside = plain_to_norm_ranged(&t, 0.25, None);
+        assert!((f64::from(inside) - 0.25).abs() < 1e-6);
+        assert!((norm_to_plain_ranged(&t, inside, None) - 0.25).abs() < 1e-6);
+        // 窓の外は端に飽和し、 逆写像が元に戻らない。
+        let below = plain_to_norm_ranged(&t, -0.5, None);
+        assert!((below - 0.0).abs() < 1e-6, "下端に飽和: got {below}");
+        assert!(
+            (norm_to_plain_ranged(&t, below, None) - (-0.5)).abs() > 0.4,
+            "飽和した norm から plain は復元できない"
+        );
+        let above = plain_to_norm_ranged(&t, 1.5, None);
+        assert!((above - 1.0).abs() < 1e-6, "上端に飽和: got {above}");
+        assert!(
+            (norm_to_plain_ranged(&t, above, None) - 1.5).abs() > 0.4,
+            "飽和した norm から plain は復元できない"
+        );
+        // affine 述語は「窓の内側で 1 次か」であって飽和を含まない (= X は true)。
+        assert!(norm_mapping_is_affine(&t));
     }
 
     // ---- Phase 5 Step 5.2: evaluate_song_tempo tests ----

@@ -153,6 +153,17 @@ pub struct AutomationPoint {
     /// 最初の point の curve は意味を持たない (clip 先頭から線形に立ち上がる)。
     pub curve: AutomationCurve,
 }
+```
+
+> **r.md #73 でも保存形式 (スキーマ) は変えていない** — `AutomationCurve` の variant も
+> `AutomationPoint` の field も 1 つも増減しておらず、`CURRENT_VERSION` の bump も
+> migration も不要。 ただし `thin_collinear_and_insert` (オートメーション録音の挿入経路) が
+> **その場で安定 id を採番する**ようになったので、録音した content の JSON に
+> `id` / `next_point_id` が出るようになる (両方 `skip_serializing_if = is_zero_u32` で、
+> これまでは 0 のときだけ書かれていなかった)。`ensure_element_ids` は非 0 id を動かさない
+> ので、保存 → 再読込は冪等 (= r.md #9 の dirty-on-open 契約を守る)。
+
+```rust
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum AutomationCurve {
@@ -802,6 +813,15 @@ gui_01 #033 (Phase 63n-7 / -8 / -9) と daw_01 wire 全て land。 全項目達�
       popup で Exponential を選んだ point は `AutomationCurve::Exponential { bend: 0.0 }`
       として model に書き込まれ、 audio thread は exponential 評価で再生する。
       widget の描画は #033 完了まで Bezier { 0.0 } fallback 表示
+      - **r.md #73 (2026-08-28) で更新**: UI 表示は **階段 / 直線 / 曲線 / S 字** に改名
+        (内部の variant 名 `Bezier` / `Exponential` は不変)。 既定量は ±0.5 で、
+        「曲線」の符号だけは **区間の向きから決める** — 保存値は progress 基準なので
+        定数のままだと上り区間で線が下へ沈む。 発火する event は
+        `SetAutomationCurveType` / `SetAutomationCurveBezierTension` /
+        `SetAutomationCurveExponentialBend` の 3 本を畳んだ
+        **`AppEvent::SetAutomationCurve { track_id, lane_id, clip_id, point_id, next }`**
+        1 本で、 point は **安定 id** で指す。 詳細は
+        [`docs/plan_rmd_73_automation_curve.md`](plan_rmd_73_automation_curve.md)。
 - [x] `AppData.selected_automation_points: Vec<AutomationPointKeyRef>` 追加 +
       `AppEvent::SelectAutomationPoints { prev, next }` (widget は #033 で発火)
 - [x] Point copy / paste — `copy_selected_automation_points_as_json` /
@@ -850,6 +870,15 @@ gui_01 #033 (Phase 63n-7 / -8 / -9) と daw_01 wire 全て land。 全項目達�
           追加、 kind で 2 AppEvent に分岐 dispatch
       (d) `is_undoable` に 2 AppEvent 登録
 - [x] **#033 完結** (Phase 63n-7 / -8 / -9 all wired)。 Phase 3 全項目達成。
+- **r.md #73 (2026-08-28) で Phase 63n-9 の中央ハンドル方式は撤去した** (履歴として
+  上の記述は残す)。 撤去の理由は `evaluate_bezier_y` を t=0.5 で評価すると
+  `c1y + c2y` が tension に依らず常に `a + b` になるため **ハンドルが 1px も動かない**
+  こと (= 直接操作の不変条件が壊れていた)。 置き換えは
+  「**レーン本体の線そのものを Alt+ドラッグして曲げる**」で、感度定数ではなく
+  掴んだ位置の逆算 (`arrangement/curve.rs::solve_bend`) で決める。
+  `SetAutomationCurveParam` 系 2 event と `SetAutomationCurveType` は
+  `AppEvent::SetAutomationCurve` 1 本へ統合。 詳細は
+  [`docs/plan_rmd_73_automation_curve.md`](plan_rmd_73_automation_curve.md)。
 - [ ] smoke test (gui_01 #033 完了後): lasso で複数 point 選択 → Move /
       Delete / Copy / Paste / Quantize / curve type change が batch で動作する
 
@@ -1281,6 +1310,10 @@ pub enum ArrangementEditRequest {
     },
     MoveAutomationPoints(Vec<MoveAutomationPointDelta>),
     DeleteAutomationPoints(Vec<AutomationPointKey>),
+    // r.md #73 で `AppEvent::SetAutomationCurve { track_id, lane_id, clip_id,
+    // point_id, next: common::model::AutomationCurve }` 1 本に統合 (point は安定 id、
+    // `prev` は snapshot undo なので持たない)。 widget の mirror 型
+    // `ArrangementCurveKind` も撤去して `common::model::AutomationCurve` 直結。
     SetAutomationCurveType {
         point: AutomationPointKey,
         prev: ArrangementCurveKind,
@@ -1324,7 +1357,9 @@ pub struct ResizeAutomationClipDelta {
 | lane 内 空き領域 click | `AddAutomationPoint` |
 | point hover + drag | release 時 `MoveAutomationPoints(deltas)` |
 | Alt+click on point | `DeleteAutomationPoints(vec![point_key])` |
-| Right-click on point | `Response.automation_curve_popup_request` で daw_01 へ通知 → `context_menu_for(rect, ["Hold", "Linear", "Bezier"], ...)` → 選択 → `SetAutomationCurveType` |
+| Right-click on point | `Response.automation_curve_popup_request` で daw_01 へ通知 → `context_menu_for(rect, ["Hold", "Linear", "Bezier"], ...)` → 選択 → `SetAutomationCurveType` (**r.md #73 で項目名は 階段 / 直線 / 曲線 / S 字、 event は `SetAutomationCurve` へ**) |
+| Alt+drag on the lane curve | **r.md #73**: その区間を曲げる (`SetAutomationCurve`、 release で 1 件)。 掴んだ場所が指に付いてくるよう `curve::solve_bend` で逆算する |
+| Alt+double-click on the lane curve | **r.md #73**: その区間を直線に戻す (`SetAutomationCurve { next: Linear }`) |
 | lane 内 clip drag | release 時 `MoveAutomationClips` / Ctrl で `CloneAutomationClipsLinked` / Ctrl+Shift で `CloneAutomationClipsIndependent` |
 | lane header `★` click | `SetLaneEnabled` |
 | lane header `👁` click | `SetLaneVisible` |
@@ -1357,6 +1392,8 @@ schema の field 削除 / 改名は無い (= 追加のみ)。
    `arrangement_view.rs::make_edit` で受け、`context_menu_for(rect, &["Hold", "Linear",
    "Bezier"], ...)` を表示 → 選択を `AppEvent::SetAutomationCurveType` に変換 (既存
    "Make Unique" の context_menu 受け idiom と同パターン)
+   - **r.md #73 で現行化**: 項目は **階段 / 直線 / 曲線 / S 字** の 4 つ、
+     発火は `AppEvent::SetAutomationCurve` 1 本 (point は安定 id)
 3. **share_group_color**: 既存の audio/MIDI clip 用 hue 算出 (`content_id` の hash →
    `[0.0, 1.0)`) を `arrangement_view.rs` 内 helper でそのまま automation clip にも
    適用

@@ -18,11 +18,15 @@ pub(super) struct PressHit {
 /// 優先順位を、 **制御フローの値**として持ち回る。
 ///
 /// 旧実装との対応 (挙動を 1:1 に保つための表):
-/// - `splitter`      = 旧 `splitter_press`。 以降 **9 か所**のゲート
-///   (audio grip / clip / arranger / ruler / curve handle / point / automation clip /
-///   Alt+drag fallback / lasso)。
-/// - `curve_handle`  = 旧 `handle_press_started`。
+/// - `splitter`      = 旧 `splitter_press`。 以降のゲート
+///   (audio grip / clip / arranger / ruler / point / 区間 bend / automation clip / lasso)。
 /// - `point`         = 旧 `already_taken_by_point`。
+///   **r.md #73 で「立てる条件」だけを広げた** — 旧実装は point drag session が
+///   起動したときにしか立たず、 Alt+クリック (削除) では立たなかったので、
+///   同フレームに後続の press (automation clip / 区間 bend) が二重起動していた。
+///   seed (`from_live` の `automation_point_drag.is_some()`) は据え置きで、
+///   `press_lanes::point` が今フレームの当たりでも立てる = **単調に強くなる方向**
+///   なので、 r.md #77 の等価性の根拠は壊れない。
 /// - `session`       = 旧 `no_session` の否定。
 ///
 /// **`session` の列挙は 11 種で、 `section_drag` / `header_resize_drag` /
@@ -37,12 +41,10 @@ pub(super) struct PressHit {
 /// `widget_state` を読み直していたのと**厳密に等価**: press ブロック内で session を `None` に
 /// 戻す箇所は 1 つも無い ので、 「seed + 単調に立てる」 と「毎回読み直す」 の結果は必ず一致する。
 ///
-/// `splitter` / `curve_handle` は live seed **しない** (旧 `splitter_press` /
-/// `handle_press_started` も `false` から始まるローカル)。
+/// `splitter` は live seed **しない** (旧 `splitter_press` も `false` から始まるローカル)。
 #[derive(Clone, Copy)]
 pub(super) struct PressClaim {
     pub splitter: bool,
-    pub curve_handle: bool,
     pub point: bool,
     pub session: bool,
 }
@@ -54,7 +56,6 @@ impl PressClaim {
     fn from_live(s: &ArrangementState) -> Self {
         Self {
             splitter: false,
-            curve_handle: false,
             point: s.automation_point_drag.is_some(),
             session: s.track_volume_drag.is_some()
                 || s.track_reorder.is_some()
@@ -66,7 +67,8 @@ impl PressClaim {
                 || s.track_row_resize_drag.is_some()
                 || s.playhead_drag.is_some()
                 || s.loop_drag.is_some()
-                || s.automation_curve_param_drag.is_some(),
+                // r.md #73: 旧 `automation_curve_param_drag` (中央ハンドル) の差し替え。
+                || s.automation_segment_bend.is_some(),
         }
     }
 }

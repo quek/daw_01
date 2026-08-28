@@ -454,14 +454,38 @@ impl AppData {
         self.ui_ephemeral.editing_automation_point = None;
     }
 
-    pub(crate) fn set_automation_curve_type(
+    /// r.md #73: 1 区間の補間形状を設定する唯一の handler。
+    /// 点は安定 id で引く (positional index は追加 / 削除でずれる = 不変条件 1)。
+    /// 該当 point が見つからなければ no-op (= drag 中に点が消えた race)。
+    ///
+    /// 旧 3 本 (`set_automation_curve_type` /
+    /// `set_automation_curve_bezier_tension` / `set_automation_curve_exponential_bend`)
+    /// を畳んだもの。 旧 2 本にあった「既存 curve type と一致するときだけ更新」の
+    /// race ガードは **不要になった** — event が `next` として完全な `AutomationCurve`
+    /// を運ぶので、型が変わっていても意図どおりの形が入る。
+    pub(crate) fn set_automation_curve(
         &mut self,
         track_id: u32,
         lane_id: u32,
         clip_id: u32,
-        point_idx: u32,
+        point_id: u32,
         next: common::model::AutomationCurve,
     ) {
+        // `0` は未採番 sentinel。 先頭の別の点を掴まないよう最初に弾く。
+        if point_id == 0 {
+            return;
+        }
+        // 値域は `AutomationCurve` 自身の宣言 (`-1.0..=1.0`) に合わせる。
+        // widget 側でも clamp するが、 event は外から来るので handler でも守る。
+        let next = match next {
+            common::model::AutomationCurve::Bezier { tension } => {
+                common::model::AutomationCurve::Bezier { tension: tension.clamp(-1.0, 1.0) }
+            }
+            common::model::AutomationCurve::Exponential { bend } => {
+                common::model::AutomationCurve::Exponential { bend: bend.clamp(-1.0, 1.0) }
+            }
+            other => other,
+        };
         self.edit_song_checked(|song| {
             let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
                 return false;
@@ -475,87 +499,14 @@ impl AppData {
             else {
                 return false;
             };
-            if let Some(p) = a.points.get_mut(point_idx as usize) {
-                p.curve = next;
-                true
-            } else {
-                false
+            let Some(p) = a.points.iter_mut().find(|p| p.id == point_id) else {
+                return false;
+            };
+            if p.curve == next {
+                return false; // 同値なら dirty を立てない
             }
-        });
-    }
-
-    /// gui_01 #033 Phase 63n-9: Bezier curve handle drag release で 1 件
-    /// 発火される `SetAutomationCurveBezierTension` の handler。 既存
-    /// curve type が `Bezier` でない場合は no-op (= race / 仕様外発火)。
-    /// `next` は widget で `-1.0..=1.0` clamp 済だが、 defensive で再 clamp。
-    pub(crate) fn set_automation_curve_bezier_tension(
-        &mut self,
-        track_id: u32,
-        lane_id: u32,
-        clip_id: u32,
-        point_idx: u32,
-        next: f32,
-    ) {
-        self.edit_song_checked(|song| {
-            let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
-                return false;
-            };
-            let Some(clip) = lane.clip_by_id(clip_id) else {
-                return false;
-            };
-            let content_id = clip.content_id;
-            let Some(common::model::ClipContent::Automation(a)) =
-                song.clip_contents.get_mut(&content_id)
-            else {
-                return false;
-            };
-            if let Some(p) = a.points.get_mut(point_idx as usize)
-                && matches!(p.curve, common::model::AutomationCurve::Bezier { .. })
-            {
-                p.curve = common::model::AutomationCurve::Bezier {
-                    tension: next.clamp(-1.0, 1.0),
-                };
-                true
-            } else {
-                false
-            }
-        });
-    }
-
-    /// gui_01 #033 Phase 63n-9: Exponential curve handle drag release で
-    /// 発火される `SetAutomationCurveExponentialBend` の handler。 既存
-    /// curve type が `Exponential` でない場合は no-op。
-    pub(crate) fn set_automation_curve_exponential_bend(
-        &mut self,
-        track_id: u32,
-        lane_id: u32,
-        clip_id: u32,
-        point_idx: u32,
-        next: f32,
-    ) {
-        self.edit_song_checked(|song| {
-            let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
-                return false;
-            };
-            let Some(clip) = lane.clip_by_id(clip_id) else {
-                return false;
-            };
-            let content_id = clip.content_id;
-            let Some(common::model::ClipContent::Automation(a)) =
-                song.clip_contents.get_mut(&content_id)
-            else {
-                return false;
-            };
-            if let Some(p) = a.points.get_mut(point_idx as usize)
-                && matches!(p.curve, common::model::AutomationCurve::Exponential { .. })
-            {
-                p.curve = common::model::AutomationCurve::Exponential {
-                    bend: next.clamp(-1.0, 1.0),
-                };
-                true
-            } else {
-                false
-            }
+            p.curve = next;
+            true
         });
     }
 

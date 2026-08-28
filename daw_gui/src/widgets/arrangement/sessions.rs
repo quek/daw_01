@@ -33,7 +33,8 @@ pub(super) struct LiveSessions {
     pub point_drag: Option<AutomationPointDragSession>,
     pub automation_clip_drag: Option<AutomationClipDragSession>,
     pub automation_lasso: Option<AutomationLassoSession>,
-    pub automation_curve_param: Option<AutomationCurveParamDragSession>,
+    /// r.md #73: 旧 `automation_curve_param` (中央ハンドル drag) の差し替え。
+    pub automation_segment_bend: Option<AutomationSegmentBendSession>,
 }
 
 /// release フレームで `take()` した session。 **`release::commit_releases` だけが読む。**
@@ -45,7 +46,8 @@ pub(super) struct ReleasedSessions {
     pub audio_drag: Option<AudioDragSession>,
     pub point_drag: Option<AutomationPointDragSession>,
     pub automation_clip_drag: Option<AutomationClipDragSession>,
-    pub automation_curve_param: Option<AutomationCurveParamDragSession>,
+    /// r.md #73: 旧 `automation_curve_param` (中央ハンドル drag) の差し替え。
+    pub automation_segment_bend: Option<AutomationSegmentBendSession>,
     pub automation_lasso: Option<AutomationLassoSession>,
     pub lane_resize: Option<AutomationLaneResizeDragSession>,
     pub section_drag: Option<SectionDragSession>,
@@ -287,18 +289,17 @@ pub(super) fn take(
         response.automation_lasso_active = true;
     }
 
-    // M14 Phase 63n-9 (#033): automation_curve_param_drag overlay clone + release take。
-    // overlay は drag 中 handle + preview curve segment を cached 外で描画 (handle 位置は preview_value
-    // 由来、 curve は preview_value で再 flatten した polyline を `automation_curve_param_preview_color`
-    // で重ねる)、 release で 1 度だけ `SetAutomationCurveParam { point, kind, prev_value, next_value }`
-    // を発行 (anchor == preview なら 1e-4 閾値で no-op)。
-    live.automation_curve_param = {
+    // r.md #73: automation_segment_bend overlay clone + release take。
+    // overlay は drag 中の preview curve を cached 外で描画 (`preview_curve` で再 flatten した
+    // polyline を `automation_curve_bend_preview_color` で重ねる)、 release で 1 度だけ
+    // `SetAutomationCurve { .., point_id, next }` を発行 (anchor と同値なら no-op)。
+    live.automation_segment_bend = {
         let state: &mut ArrangementState = ui.widget_state(wid);
-        state.automation_curve_param_drag
+        state.automation_segment_bend
     };
-    released.automation_curve_param = if pointer.primary_just_released {
+    released.automation_segment_bend = if pointer.primary_just_released {
         let state: &mut ArrangementState = ui.widget_state(wid);
-        state.automation_curve_param_drag.take()
+        state.automation_segment_bend.take()
     } else {
         None
     };
@@ -318,7 +319,8 @@ pub(super) struct Overlays {
     pub audio: Option<AudioDragSession>,
     pub point: Option<AutomationPointDragSession>,
     pub automation_clip: Option<AutomationClipDragSession>,
-    pub curve_param: Option<AutomationCurveParamDragSession>,
+    /// r.md #73: 旧 `curve_param` (中央ハンドル) の差し替え。
+    pub segment_bend: Option<AutomationSegmentBendSession>,
     pub lasso: Option<AutomationLassoSession>,
     pub section: Option<SectionDragSession>,
     pub reorder: Option<ReorderOverlay>,
@@ -447,9 +449,9 @@ pub(super) fn overlays(
         // cross-lane drop なら新 lane の body 内) を cached 外で重ねる。 base 描画 (cached 内) も
         // 同 frame 表示されるが、 ghost が上に重なる。
         automation_clip: live.automation_clip_drag.clone(),
-        // M14 Phase 63n-9 (#033): curve param drag は handle + preview curve segment を
-        // cached 外で描画 (drag 中のみ true value で live update)。
-        curve_param: live.automation_curve_param,
+        // r.md #73: 区間 bend は preview curve を cached 外で描画
+        // (drag 中のみ逆算した `preview_curve` で live update)。
+        segment_bend: live.automation_segment_bend,
         // M14 Phase 63n-8 (#033): lasso rect を cached 外で描画。
         lasso: live.automation_lasso,
         // M14 Phase 127 (daw_01 #105): Arranger レーン overlay 用 capture。

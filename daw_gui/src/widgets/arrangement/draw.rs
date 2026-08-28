@@ -1523,7 +1523,7 @@ pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
         FadeEdge::Out => fade.fade.fade_out_curve,
     };
     // 曲線を px 単位で刻む。 分割粒度は既存の lane curve flatten と同じ 2px
-    // (`flatten_lane_curve` の呼び出し側 `max_segment_px`)。
+    // (`curve::flatten_clip_curve` の呼び出し側 `max_segment_px`)。
     const MAX_SEGMENT_PX: f32 = 2.0;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let steps = ((g.width_px / MAX_SEGMENT_PX).ceil() as usize).clamp(1, 512);
@@ -1774,163 +1774,6 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     }
 }
 
-/// 単一 segment (前 point → 次 point) を flatten。
-/// `kind` が `Hold` なら階段 (前値で水平 → 次 point の x で垂直)、 `Linear` なら直線、
-/// `Bezier { tension }` なら S 字 cubic Bezier、 `Exponential { bend }` なら指数 curve の polyline。
-/// 出力点列は `out` に push (caller が始点を 1 度 push 済の前提、 終点 (= 次 point) を含む)。
-/// `p0` / `p3` は前後 segment 用の virtual 点だが、 `Bezier` の S 字 cubic は `p1`/`p2` のみで決まり
-/// `Exponential` も同様なので両者では参照されない (= signature は M14 Phase 63n-1 互換維持)。
-pub(super) fn flatten_lane_segment(
-    _p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    _p3: (f32, f32),
-    kind: ArrangementCurveKind,
-    max_segment_px: f32,
-    out: &mut Vec<(f32, f32)>,
-) {
-    match kind {
-        ArrangementCurveKind::Hold => {
-            // 階段: 前値 (p1.y) を p2.x まで水平に保ち、 p2 で垂直に立ち上がる。
-            // out には始点 (p1) は積み済の前提なので、 (p2.x, p1.y) → (p2.x, p2.y) の 2 点を追加。
-            out.push((p2.0, p1.1));
-            out.push(p2);
-        }
-        ArrangementCurveKind::Linear => {
-            out.push(p2);
-        }
-        ArrangementCurveKind::Bezier { tension } => {
-            // M14 Phase 63n-7 (daw_01 #033): S 字 cubic Bezier。 daw_01 `apply_curve` SSoT と
-            // 完全同一の制御点配置:
-            //   - 制御点 x は (1/3, 2/3) 固定で x(t) = t (4 制御点の x が 0, 1/3, 2/3, 1 の等差列で
-            //     Bernstein 基底が打ち消し合うため、 cubic Bezier x 成分は **恒等関数** に縮退)
-            //   - 制御点 y を `tension` で対角線 ↔ end-hold を lerp:
-            //       diag1 = p1.y + (p2.y - p1.y) * 1/3   (端点で linear)
-            //       diag2 = p1.y + (p2.y - p1.y) * 2/3
-            //       mix = |tension|, target1/2 = (p1.y, p2.y) if tension >= 0 else (p2.y, p1.y)
-            //       c1.y = lerp(diag1, target1, mix), c2.y = lerp(diag2, target2, mix)
-            // tension = 0.0 で 4 制御点が対角線上 (= 直線)、 +1.0 で滑らかな S 字、 -1.0 で overshoot 反転。
-            let t_clamped = tension.clamp(-1.0, 1.0);
-            let a = p1.1;
-            let b = p2.1;
-            let dx = p2.0 - p1.0;
-            let c1x = p1.0 + dx * (1.0 / 3.0);
-            let c2x = p1.0 + dx * (2.0 / 3.0);
-            let diag1 = a + (b - a) * (1.0 / 3.0);
-            let diag2 = a + (b - a) * (2.0 / 3.0);
-            let mix = t_clamped.abs();
-            let (target1, target2) = if t_clamped >= 0.0 { (a, b) } else { (b, a) };
-            let c1y = diag1 * (1.0 - mix) + target1 * mix;
-            let c2y = diag2 * (1.0 - mix) + target2 * mix;
-            // 既存の adaptive de Casteljau (perpendicular distance 判定) を新制御点で呼ぶ。
-            flatten_lane_cubic(p1, (c1x, c1y), (c2x, c2y), p2, max_segment_px, 0, out);
-        }
-        ArrangementCurveKind::Exponential { bend } => {
-            // M14 Phase 63n-7 (daw_01 #033): value = a + (b - a) * t^(2^bend) の polyline。
-            // bend=0 で linear、 +1 で前半遅・後半速 (t^2、 二次曲線)、 -1 で前半速・後半遅 (t^0.5、 平方根)。
-            // segment が滑らかな単調関数なので uniform sampling で十分 (adaptive 不要)、
-            // sample 数は `dx / max_segment_px` を切り上げ + min 16 (短 segment でも形状を視認できる最小段数)。
-            let bend_clamped = bend.clamp(-1.0, 1.0);
-            let exponent = 2.0_f32.powf(bend_clamped);
-            let dx_abs = (p2.0 - p1.0).abs();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let samples = (dx_abs / max_segment_px.max(1e-3)).ceil().max(16.0) as usize;
-            for i in 1..=samples {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / samples as f32;
-                let x = p1.0 + (p2.0 - p1.0) * t;
-                let y = p1.1 + (p2.1 - p1.1) * t.powf(exponent);
-                out.push((x, y));
-            }
-        }
-    }
-}
-
-pub(super) const MAX_LANE_FLATTEN_DEPTH: u32 = 14;
-
-/// 点 `p` と直線 `a-b` の垂直距離 (`automation_curve` widget の `perpendicular_dist` と同戦略)。
-/// chord 距離 (`p0`-`p3`) で判定すると control points (p1, p2) が始終点直線から大きく離れていても
-/// chord が小さければ flatten 終了 → curve がポイントを通らず直線化する bug の原因 (#028 user 指摘 2)。
-/// 控制点と直線の **垂直距離** で判定すれば curve が正確にポイントを通る。
-#[inline]
-pub(super) fn perpendicular_dist_lane(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
-    let dx = b.0 - a.0;
-    let dy = b.1 - a.1;
-    let len = dx.hypot(dy);
-    if len < 1e-6 {
-        return ((p.0 - a.0).powi(2) + (p.1 - a.1).powi(2)).sqrt();
-    }
-    ((p.0 - a.0) * dy - (p.1 - a.1) * dx).abs() / len
-}
-
-pub(super) fn flatten_lane_cubic(
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    p3: (f32, f32),
-    max_dist: f32,
-    depth: u32,
-    out: &mut Vec<(f32, f32)>,
-) {
-    // 終了条件: control points (p1, p2) の始終点直線 (p0-p3) からの垂直距離が max_dist 以下なら
-    // 直線で近似可能 (= curve が直線に収束)。 depth limit はガード。
-    let d1 = perpendicular_dist_lane(p1, p0, p3);
-    let d2 = perpendicular_dist_lane(p2, p0, p3);
-    if d1.max(d2) < max_dist || depth >= MAX_LANE_FLATTEN_DEPTH {
-        out.push(p3);
-        return;
-    }
-    // de Casteljau の中点分割
-    let q0 = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
-    let q1 = ((p1.0 + p2.0) * 0.5, (p1.1 + p2.1) * 0.5);
-    let q2 = ((p2.0 + p3.0) * 0.5, (p2.1 + p3.1) * 0.5);
-    let r0 = ((q0.0 + q1.0) * 0.5, (q0.1 + q1.1) * 0.5);
-    let r1 = ((q1.0 + q2.0) * 0.5, (q1.1 + q2.1) * 0.5);
-    let s = ((r0.0 + r1.0) * 0.5, (r0.1 + r1.1) * 0.5);
-    flatten_lane_cubic(p0, q0, r0, s, max_dist, depth + 1, out);
-    flatten_lane_cubic(s, r1, q2, p3, max_dist, depth + 1, out);
-}
-
-/// lane 内 1 clip の curve を flatten 後の screen 座標点列で返す。 `clip_rect` は clip の
-/// 描画域 (lane body 内、 縦 padding 適用済)、 `body_origin_x` / `body_w` は lane body 全体の
-/// x 範囲 (= clip 越しに spans する curve 位置計算の base)、 `beat_to_px` は **screen-wide な拍 →
-/// px 換算** (= `body_w / view.len_beats`)。 旧設計で `clip_rect.w / view_len_beats` を使うと
-/// clip 長 ≠ view 長のとき curve x が point dot 描画 (`body_w / view.len_beats` で計算) と
-/// ずれる bug の根本原因 (#028 user 指摘 2)。 caller が同 `beat_to_px` を渡すことで両者が一致。
-pub(super) fn flatten_lane_curve(
-    clip: &ArrangementAutomationClip,
-    clip_rect: Rect,
-    view_start_beat: f64,
-    body_origin_x: f32,
-    beat_to_px: f64,
-    max_segment_px: f32,
-) -> Vec<(f32, f32)> {
-    if clip.points.is_empty() {
-        return Vec::new();
-    }
-    let to_screen = |p: &ArrangementAutomationPoint| -> (f32, f32) {
-        // clip-local time → arrangement absolute beat → screen x (body_origin_x ベース)
-        let abs_beat = clip.start_beat + p.time_beat;
-        #[allow(clippy::cast_possible_truncation)]
-        let x = body_origin_x + ((abs_beat - view_start_beat) * beat_to_px) as f32;
-        let y = clip_rect.y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_rect.h;
-        (x, y)
-    };
-    let n = clip.points.len();
-    let mut out = Vec::with_capacity(n * 4);
-    out.push(to_screen(&clip.points[0]));
-    for i in 0..(n - 1) {
-        let p0 = to_screen(&clip.points[i.saturating_sub(1)]); // i==0 で自分自身
-        let p1 = to_screen(&clip.points[i]);
-        let p2 = to_screen(&clip.points[i + 1]);
-        let p3 = to_screen(&clip.points[(i + 2).min(n - 1)]); // 最終 segment では自分自身
-        // 各 segment の curve は **次 point** の `curve` を使う (= incoming curve、 #028 §11.1 と整合)。
-        let kind = clip.points[i + 1].curve;
-        flatten_lane_segment(p0, p1, p2, p3, kind, max_segment_px, &mut out);
-    }
-    out
-}
-
 /// lane row (= header + body) を 1 つ描画。 `header_rect` は左 (track header と同 x 範囲)、
 /// `body_rect` は右 (clip 描画域と同 x 範囲)。 `view` は arrangement の global view (start_beat /
 /// len_beats / track_top 等を渡す、 lane 描画では `start_beat` / `len_beats` のみ参照)。
@@ -2178,7 +2021,10 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
 
         // curve flatten (clip 内描画域 = clip_rect 全体)。 caller の screen-wide な beat_to_px
         // (= body_rect.w / view.len_beats) を渡すことで、 curve x 座標が point dot 描画と完全一致。
-        let flat = flatten_lane_curve(c, clip_rect, view.start_beat, body_rect.x, beat_to_px, 2.0);
+        // r.md #73: 形の評価は `curve.rs` (= `common::automation::apply_curve`) 1 本を通る。
+        let map = curve::LaneValueMap::from_lane(lane, clip_rect);
+        let flat =
+            curve::flatten_clip_curve(c, map, view.start_beat, body_rect.x, beat_to_px, 2.0);
         if flat.len() >= 2 {
             let segments: Vec<daw_ui_renderer::LineSegment> = flat
                 .windows(2)
@@ -2204,7 +2050,8 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
             let abs_beat = c.start_beat + p.time_beat;
             #[allow(clippy::cast_possible_truncation)]
             let px = body_rect.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
-            let py = clip_rect.y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_rect.h;
+            // r.md #73: y は `LaneValueMap` 経由 (同じ式を 2 度書かない)。
+            let py = map.norm_to_y(p.value_norm);
             hctx.push_rect(RectCommand {
                 rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
                 fill: point_fill,

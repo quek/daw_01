@@ -312,11 +312,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     // gui_01 #028 (M14 Phase 63n-2): automation point 上の右クリック →
-    // Hold / Linear / Bezier の curve type popup。 widget が
+    // カーブ種別の popup。 widget が
     // `automation_point_rects: Vec<(AutomationPointKey, Rect)>` を返すので
     // clip_rects と同 idiom で `context_menu_for` を毎 frame 重ねる。
-    // popup 選択 → ArrangementCurveKind を `SetAutomationCurveType` に
-    // 変換、 prev は popup open 時点の `clip.points[idx].curve` を retrieve。
     //
     // **重要 (visual feedback fix 2026-05-09)**: automation_point_rects は
     // automation_clip_rects と空間的に overlap している (= point は clip
@@ -329,58 +327,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 右クリックが point rect 上で起きていたら clip popup ループを **skip**
     // する。 これで point popup だけが新規 open され、 clip popup の
     // open_popup が呼ばれない。
-    // popup は daw_01 側で完結する (= widget の `ArrangementCurveKind` を
-    // 介さず直接 `common::model::AutomationCurve` を構築する)。 gui_01 #033
-    // Phase 63n-7 で widget に Exponential variant が追加されたので 4 種
-    // 完全描画 + 評価。
+    // popup は daw_01 側で完結する (= 直接 `common::model::AutomationCurve` を構築)。
     //
-    // popup 選択時 default 値:
-    //  - Bezier { tension: 0.5 } — 新式 SSoT で `tension=0.0` は Linear と
-    //    完全に同じ直線、 「Bezier を選んだのに直線のまま」 という bug-like
-    //    UX を避けるため 0.5 (= 中程度の S 字) を default に。
-    //  - Exponential { bend: 0.5 } — 同様に、 `bend=0.0` は Linear 等価。
-    //    +0.5 で前半遅・後半速 default (Exponential らしい形状をすぐ視認)。
+    // r.md #73: 項目名から実装都合の型名 (Bezier / Exponential) を消し、
+    // **階段 / 直線 / 曲線 / S 字** の 4 択にする。 内部の variant 名は変えない。
     //
-    // 数値を ±1.0 まで動かす UI は Phase 63n-9 (tension/bend handle) で
-    // landing 予定。 それまでは popup で curve type を選んで default で固定。
+    // popup 選択時 default 値は ±0.5 — `0.0` は直線と同一なので
+    // 「選んだのに何も起きない」を避ける。
+    //
+    // 「曲線」の符号だけは **区間の向きから決める**。 保存する値は progress 基準
+    // (= 上り区間と下り区間で符号が逆になる) なので、定数のままだと上り区間で
+    // 「曲線」を選んだ瞬間に線が下へ沈む (#73 の元の症状)。 画面上は常に上へ膨らませる。
+    // 検算: 上り (b>a) で bend=-0.5 → k=2^-0.5≈0.707 → `u^k > u` → 直線より b 寄り = 画面上。
+    //       下り (b<a) で bend=+0.5 → k≈1.414 → `u^k < u` → 直線より a 寄り = 画面上。
     for (point_key, rect) in &resp.automation_point_rects {
         let key = *point_key;
-        ui.context_menu_for(
-            *rect,
-            &["Hold", "Linear", "Bezier", "Exponential"],
-            move |idx, ui| {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let next = match idx {
-                        0 => common::model::AutomationCurve::Hold,
-                        1 => common::model::AutomationCurve::Linear,
-                        2 => common::model::AutomationCurve::Bezier { tension: 0.5 },
-                        3 => common::model::AutomationCurve::Exponential { bend: 0.5 },
-                        _ => return,
-                    };
-                    // prev curve を retrieve (Undo 用)。 lookup できなかった
-                    // ら no-op で抜ける (= 編集中に lane / clip が削除された
-                    // race を防ぐ)。
-                    let prev = app
-                        .song_doc.song()
-                        .track_by_id(key.clip.track)
-                        .and_then(|t| t.lane_by_id(key.clip.lane))
-                        .and_then(|l| l.clip_by_id(key.clip.clip))
-                        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id))
-                        .and_then(|cc| cc.automation_points())
-                        .and_then(|pts| pts.get(key.point_idx as usize))
-                        .map(|p| p.curve);
-                    let Some(prev) = prev else { return };
-                    app.handle_event(AppEvent::SetAutomationCurveType {
-                        track_id: key.clip.track,
-                        lane_id: key.clip.lane,
-                        clip_id: key.clip.clip,
-                        point_idx: key.point_idx,
-                        prev,
-                        next,
-                    });
-                }));
-            },
-        );
+        ui.context_menu_for(*rect, &["階段", "直線", "曲線", "S 字"], move |idx, ui| {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                apply_curve_menu_choice(app, key, idx);
+            }));
+        });
     }
 
     // ===== automation 値の数値入力 overlay 群 =====
@@ -943,6 +909,59 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 /// (REAPER の右クリック空きエリア → Insert new item idiom)。`open_at` は 1-shot flag で
 /// 1 フレームだけ `Some(pos)` を渡す (毎フレーム `Some` だと outside-click で閉じても翌
 /// フレーム再 open するため)。 項目選択で `AddTextClipAt` を発火して stash を `None` に戻す。
+/// r.md #73: automation point の右クリックメニュー (階段 / 直線 / 曲線 / S 字) の選択を
+/// `AppEvent::SetAutomationCurve` へ変換する。
+///
+/// point は **安定 id** で指す (menu を開いてから選ぶまでに点が増減しうる)。
+/// 前の点が無い区間の先頭では curve が意味を持たないので no-op。
+///
+/// 既定量は ±0.5 — `0.0` は直線と同一なので「選んだのに何も起きない」を避ける。
+/// **「曲線」の符号だけは区間の向きから決める**: 保存する値は progress 基準
+/// (= 上り区間と下り区間で符号が逆になる) なので、定数のままだと上り区間で
+/// 「曲線」を選んだ瞬間に線が下へ沈む (#73 の元の症状)。 画面上は常に上へ膨らませる。
+/// 検算: 上り (b>a) で bend=-0.5 → k=2^-0.5≈0.707 → `u^k > u` → 直線より b 寄り = 画面上。
+///       下り (b<a) で bend=+0.5 → k≈1.414 → `u^k < u` → 直線より a 寄り = 画面上。
+fn apply_curve_menu_choice(
+    app: &mut AppData,
+    key: crate::widgets::arrangement::AutomationPointKey,
+    idx: usize,
+) {
+    let point_idx = key.point_idx as usize;
+    if point_idx == 0 {
+        return;
+    }
+    let resolved = app
+        .song_doc
+        .song()
+        .track_by_id(key.clip.track)
+        .and_then(|t| t.lane_by_id(key.clip.lane))
+        .and_then(|l| l.clip_by_id(key.clip.clip))
+        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id))
+        .and_then(|cc| cc.automation_points())
+        .and_then(|pts| Some((pts.get(point_idx)?, pts.get(point_idx - 1)?)))
+        .map(|(cur, prev)| (cur.id, prev.value, cur.value));
+    let Some((point_id, prev_value, next_value)) = resolved else { return };
+    if point_id == 0 {
+        return;
+    }
+    let next = match idx {
+        0 => common::model::AutomationCurve::Hold,
+        1 => common::model::AutomationCurve::Linear,
+        2 => common::model::AutomationCurve::Exponential {
+            bend: if next_value >= prev_value { -0.5 } else { 0.5 },
+        },
+        3 => common::model::AutomationCurve::Bezier { tension: 0.5 },
+        _ => return,
+    };
+    app.handle_event(AppEvent::SetAutomationCurve {
+        track_id: key.clip.track,
+        lane_id: key.clip.lane,
+        clip_id: key.clip.clip,
+        point_id,
+        next,
+    });
+}
+
 fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let Some((track, beat, pos)) = app.ui_ephemeral.clip_create_menu else {
         return;

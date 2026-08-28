@@ -216,21 +216,45 @@ fn update_sessions(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     {
         ls.last_mouse = (px, py);
     }
-    // M14 Phase 63n-9 (#033): automation_curve_param_drag continuation で last_mouse_y / last_alt /
-    // preview_value を update。 release frame は last_alt update を skip (= 既存 OS event 順序
-    // race 回避 pattern、 ModifiersChanged が MouseInput より先に届く現象への対応)、 last_mouse_y は
-    // release pos が anchor と異なる場合のみ update。 preview_value は anchor + sensitivity 計算で
-    // 毎 frame 算出 (= live preview の SSoT、 release で final 値として使用。 **巻き戻し判定の外**)。
-    if let Some(ref mut cd) = state.automation_curve_param_drag {
-        if accept_release_pos(is_release, RewindAxes::Y { cur: py, anchor: cd.anchor_mouse_y }) {
-            cd.last_mouse_y = py;
+    // r.md #73: 区間 bend の continuation。 release frame は last_mouse_y を anchor と
+    // 異なるときだけ更新する (既存 OS event 順序 race 回避 pattern)。
+    // `preview_curve` は毎 frame **逆算** で作り直す (= live preview の SSoT、 release で
+    // final 値として使う。 **巻き戻し判定の外**)。 解けない frame は直前値を維持する。
+    //
+    // 感度定数は使わない — 「掴んだ場所が指に付いてくる」を成立させるため、 指の移動 px
+    // ぶんだけ動かした目標値から curve を解く。 逆算は区間の符号付き高さ `(b - a)` で割るので
+    // 上り / 下りの符号は構造的に正しくなる (定数 `dir` を掛ける小細工は不要)。
+    if let Some(ref mut bd) = state.automation_segment_bend {
+        if accept_release_pos(is_release, RewindAxes::Y { cur: py, anchor: bd.anchor_mouse_y }) {
+            bd.last_mouse_y = py;
         }
-        if !is_release {
-            cd.last_alt = alt_now;
+        // **まだ 1px も動いていないフレームでは preview を触らない。**
+        // 触ると Alt+クリックしただけ (= 動かしていない) で curve が書き換わる:
+        // Hold / Linear 区間の `start_curve` は `Exponential { bend: 0.0 }` なので、
+        // dy = 0 で解いても `Exponential { bend: 0.0 }` が返り、 `anchor_curve`
+        // (= Linear) と異なるため release の no-op 判定をすり抜けてしまう。
+        // 既に Exponential / Bezier の区間でも、 逆算の丸めで最下位ビットがずれて
+        // 同じことが起きる。 「最初の 1px で直線化してから曲がる」 は仕様どおり。
+        let moved = (bd.last_mouse_y - bd.anchor_mouse_y).abs() > f32::EPSILON;
+        // lane は毎 frame 引き直す (session に target を持たせない = `Copy` を保つ)。
+        if moved
+            && let Some((lane, _clip)) = find_lane_clip(&f.visible_tracks, bd.point.clip)
+        {
+            let map = curve::LaneValueMap::from_lane(lane, bd.clip_rect_anchor);
+            let dy = bd.last_mouse_y - bd.anchor_mouse_y;
+            let target_norm =
+                (bd.anchor_value_norm - dy / bd.clip_rect_anchor.h.max(1.0)).clamp(0.0, 1.0);
+            if let Some(next) = curve::solve_bend(
+                map,
+                bd.a_plain,
+                bd.b_plain,
+                bd.grab_u,
+                bd.start_curve,
+                target_norm,
+            ) {
+                bd.preview_curve = next;
+            }
         }
-        let dy = cd.last_mouse_y - cd.anchor_mouse_y;
-        let delta = curve_param_delta_from_dy(dy, cd.effective_lane_height_px, cd.last_alt);
-        cd.preview_value = (cd.anchor_value + delta).clamp(-1.0, 1.0);
     }
 }
 
