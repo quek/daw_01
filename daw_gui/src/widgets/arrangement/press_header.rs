@@ -43,7 +43,7 @@ pub(super) fn dispatch(
     if py < track_row_bottom {
         track_row(ui, f, hit, claim, actions, t, row_top);
     } else if !t.automation_lanes_collapsed && !t.automation_lanes.is_empty() {
-        lane_header(ui, f, hit, actions, t, track_row_bottom);
+        lane_header(f, hit, actions, t, track_row_bottom);
     }
 }
 
@@ -154,16 +154,17 @@ fn track_row(
 /// === lane header press (Phase 63n-2) ===
 ///
 /// lane 群を上から積んで cursor py が当たる lane を見つけ、 button rect を判定する。
-/// invisible lane は積まない。 `claim` は立てない (session を起動しないため)。
+/// invisible lane は積まない。
+///
+/// `ui` を受け取らない: このフェーズは session を 1 つも起動せず (= `claim` も立てない)、
+/// `Edit` は `actions.lane_button` に貯めて `press::dispatch` が発行する。
 fn lane_header(
-    ui: &Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
     hit: &PressHit,
     actions: &mut PressActions,
     t: &ArrangementTrack,
     track_row_bottom: f32,
 ) {
-    let _ = ui;
     let (px, py) = (hit.px, hit.py);
     let style = f.style;
     let header_indent = f32::from(t.depth) * style.indent_px;

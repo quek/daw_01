@@ -23,7 +23,6 @@ pub(super) struct HeaderClicks {
 /// selection は `f.selected_tracks` で判定。 修飾 (Shift / Ctrl) で Single /
 /// RangeFromAnchor / Toggle を decode して渡す。 1 frame 内で最初に click された track id を
 /// `clicked_track` に蓄え、 loop 後に `apply_select_tracks` を 1 度呼ぶ。
-#[allow(clippy::too_many_lines)]
 pub(super) fn draw_rows(
     ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
