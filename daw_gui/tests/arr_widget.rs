@@ -1416,7 +1416,12 @@ fn heavy_lanes_bg_is_drawn_before_header_rows() {
 //
 // 「線を直接 Alt+ドラッグして曲げる」「Alt+ダブルクリックで直線に戻す」「選択の共存」
 // 「Alt+drag resize 撤去後に死角が無いこと」を widget を実際に駆動して確かめる。
-// daw_gui 本体は起動しない (`CARGO_BIN_EXE_daw_gui` を使わない)。
+//
+// **このファイルの本文に本体 exe の env 名 (`CARGO_BIN_EXE_` + `daw_gui`) を
+// 素の 1 語で書かないこと。** Makefile の `DAW_GUI_SAFE_TESTS` はその語の
+// **単純な substring grep** で「daw_gui を起動する target」を判定するので、
+// コメントに書くだけで `make test-nolaunch` がこのファイルを丸ごと素通りする
+// (実際 1 度やった。`scripts/test_guards.py` の launchtargets:in-sync が検出する)。
 // ============================================================
 
 /// r.md #73: 区間 1 本だけの automation lane (track 1 / lane 1 / clip 1、clip は `[0, 8)`)。
