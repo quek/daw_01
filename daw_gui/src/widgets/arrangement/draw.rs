@@ -1608,27 +1608,51 @@ pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
     clip_bg: Color,
     style: &ArrangementStyle,
 ) {
+    push_db_handle_line(
+        hctx,
+        clip_rect,
+        audio.gain_db,
+        clip_bg,
+        style,
+        style.audio_db_handle_width_px,
+    );
+}
+
+/// dB handle line 1 本 (横線、 端から `audio_db_handle_x_margin` 内側のみ)。
+///
+/// **cached 側の base (`draw_clip_audio_overlay`) と drag 中の ghost
+/// (`draw_audio_drag_ghost`) の共通経路**。 位置の式 (`db_to_handle_y`) と x 範囲を
+/// 1 か所に持つ — 2 つが別式になると「ドラッグを始めた瞬間に線が微妙に動く」。
+/// 違うのは太さだけ (ghost は `* 2.0` で「掴んでいる」 を示す)。
+fn push_db_handle_line<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    clip_rect: Rect,
+    gain_db: f32,
+    clip_bg: Color,
+    style: &ArrangementStyle,
+    line_width_px: f32,
+) {
     use daw_ui_renderer::{LineBatch, LineSegment};
 
-    // dB handle line (横線 1 本、 audio_db_handle_width_px の太さ)。 端から margin 内側のみ。
     let margin = style.audio_db_handle_x_margin;
     let line_w = (clip_rect.w - margin * 2.0).max(0.0);
-    if line_w > 0.0 {
-        let y = db_to_handle_y(clip_rect, audio.gain_db, style);
-        // 濃さ (alpha) は style トークンの役割値、極性だけ背景から決める。
-        let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg)
-            .with_alpha(style.audio_db_handle_color.a);
-        let seg = LineSegment {
-            a: [clip_rect.x + margin, y],
-            b: [clip_rect.x + margin + line_w, y],
-            color: ink,
-        };
-        hctx.push_lines(LineBatch {
-            segments: Arc::<[LineSegment]>::from(vec![seg]),
-            line_width_px: style.audio_db_handle_width_px,
-            clip_rect: Some(clip_rect),
-        });
+    if line_w <= 0.0 {
+        return;
     }
+    let y = db_to_handle_y(clip_rect, gain_db, style);
+    // 濃さ (alpha) は style トークンの役割値、極性だけ背景から決める。
+    let ink =
+        clip_ink_for(hctx.palette(), clip_bg, style.bg).with_alpha(style.audio_db_handle_color.a);
+    let seg = LineSegment {
+        a: [clip_rect.x + margin, y],
+        b: [clip_rect.x + margin + line_w, y],
+        color: ink,
+    };
+    hctx.push_lines(LineBatch {
+        segments: Arc::<[LineSegment]>::from(vec![seg]),
+        line_width_px,
+        clip_rect: Some(clip_rect),
+    });
 }
 
 /// r.md #38: clip の全 event の fade **カーブ**を描画 (content 種別に依らず共通)。
@@ -1727,7 +1751,8 @@ pub(super) fn draw_fade_handle_overlay<M: ?Sized + 'static>(
 
 /// M14 Phase 63k (#025): audio_drag 中の ghost overlay (cached 外、 drag 中の preview 値を最新表示)。
 /// `compute_audio_drag_outcome` の結果を視覚化:
-/// - `Gain { next_db }` → 新 dB position に handle line を 1 本 + ghost label「+3.2 dB」 を描く。
+/// - `Gain` → dB handle line を 1 本 (`next_db`、 未確定なら anchor 値) + ghost label「+3.2 dB」。
+///   **gain drag 中は cached 側が base line を描かない**ので、 これがその clip の唯一の線。
 /// - `FadeLength { edge, next_beats }` → 新 fade 範囲を `draw_fade_envelope` で描く + label 省略
 ///   (envelope の長さ自体が visual feedback)。
 /// - `FadeCurve { edge, next_curve }` → curve 名を ghost label「Curve: Exponential」 で描く。
@@ -1738,42 +1763,40 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     beat_per_px: f64,
     style: &ArrangementStyle,
 ) {
-    use daw_ui_renderer::{LineBatch, LineSegment};
-
     let r = ad.clip_rect_anchor;
     if r.w <= 0.0 || r.h <= 0.0 {
         return;
     }
     let clip_bg = ad.clip_bg_anchor;
     let outcome = compute_audio_drag_outcome(ad, beat_per_px, style);
+    // r.md #73 の同件: gain drag 中は cached 側が **この clip の base line を描かない**
+    // (`render::HeavyInput::gain_drag_skip`) ので、 ここが唯一の dB handle line になる。
+    // よって **outcome が None (= anchor と同値、 まだ動かしていない) でも描く** — 描かないと
+    // ドラッグを始めた瞬間に線が消え、 anchor 値へ戻すたびに点滅する。
+    //
+    // 旧実装は base に「重ねて表示」 する作りだったが、 preview は定義上 anchor と違う y に
+    // 出るので重なりようが無く、 **横線が 2 本**見えていた (曲線の 2 重線と同 root cause)。
+    if ad.kind == AudioDragKind::Gain {
+        let next_db = match outcome {
+            Some(AudioDragOutcome::Gain { next_db }) => next_db,
+            _ => ad.anchor_gain_db,
+        };
+        push_db_handle_line(
+            hctx,
+            r,
+            next_db,
+            clip_bg,
+            style,
+            // 掴んでいる間は太く (= 「これを動かしている」)。 位置の式は base と共通。
+            style.audio_db_handle_width_px * 2.0,
+        );
+    }
     let label_text: Option<String> = match (ad.kind, outcome) {
-        (AudioDragKind::Gain, Some(AudioDragOutcome::Gain { next_db })) => {
-            // 新 handle line を preview 位置に重ね描き (cached 内の base line は anchor 値で残るが、
-            // ghost が上に乗って drag 中の最新値を user に見せる)。
-            let margin = style.audio_db_handle_x_margin;
-            let line_w = (r.w - margin * 2.0).max(0.0);
-            if line_w > 0.0 {
-                let y = db_to_handle_y(r, next_db, style);
-                // r.md #73: 極性は実効背景 (掴んでいる clip の実塗り色) から。
-                let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg)
-                    .with_alpha(style.audio_db_handle_color.a);
-                let seg = LineSegment {
-                    a: [r.x + margin, y],
-                    b: [r.x + margin + line_w, y],
-                    color: ink,
-                };
-                hctx.push_lines(LineBatch {
-                    segments: Arc::<[LineSegment]>::from(vec![seg]),
-                    line_width_px: style.audio_db_handle_width_px * 2.0,
-                    clip_rect: Some(r),
-                });
-            }
-            Some(format!(
-                "{}{:.1} dB",
-                if next_db >= 0.0 { "+" } else { "" },
-                next_db
-            ))
-        }
+        (AudioDragKind::Gain, Some(AudioDragOutcome::Gain { next_db })) => Some(format!(
+            "{}{:.1} dB",
+            if next_db >= 0.0 { "+" } else { "" },
+            next_db
+        )),
         (_, Some(AudioDragOutcome::FadeLength { edge, next_beats })) => {
             if let Some(mut preview) = ad.anchor_fade {
                 match edge {
