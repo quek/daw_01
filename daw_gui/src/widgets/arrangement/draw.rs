@@ -1831,6 +1831,9 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
 /// M14 Phase 63n-3 (#028): `selected_clips_set` に含まれる `AutomationClipKey` は `clip_selected_fill` /
 /// `clip_selected_border` で描画 (selected priority 最高)、 share_group_color = Some の clip は名前の左に
 /// `share_group_link_glyph` (`⇌`) を 1 文字描画 (MIDI clip と同 idiom)。 `track_id` は selection lookup 用。
+///
+/// r.md #73: `bend_skip` = いま Alt+ドラッグで曲げている区間 (その point を終点とする 1 本)。
+/// **その区間だけ base curve を描かない** — 描くと preview と形が食い違って 2 重線に見える。
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
@@ -1842,6 +1845,7 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     style: &ArrangementStyle,
     lanes_clip: Rect,
     selected_clips_set: &HashSet<AutomationClipKey>,
+    bend_skip: Option<AutomationPointIdKey>,
 ) {
     let p = hctx.palette();
     // r.md #48: `lane.color` は「どのパラメータのレーンか」 を運ぶ **アイデンティティ色** で
@@ -2071,17 +2075,33 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         // (= body_rect.w / view.len_beats) を渡すことで、 curve x 座標が point dot 描画と完全一致。
         // r.md #73: 形の評価は `curve.rs` (= `common::automation::apply_curve`) 1 本を通る。
         let map = curve::LaneValueMap::from_lane(lane, clip_rect);
-        let flat =
-            curve::flatten_clip_curve(c, map, view.start_beat, body_rect.x, beat_to_px, 2.0);
-        if flat.len() >= 2 {
-            let segments: Vec<daw_ui_renderer::LineSegment> = flat
-                .windows(2)
-                .map(|w| daw_ui_renderer::LineSegment {
+        // r.md #73: bend ドラッグ中の 1 区間は **描かない** (preview が唯一の線になる)。
+        // 描くと形の食い違いがそのまま 2 重線として見える。
+        let skip = bend_skip
+            .filter(|k| k.clip.track == track_id && k.clip.lane == lane.id && k.clip.clip == c.id)
+            .map(|k| k.point_id);
+        let runs = curve::flatten_clip_curve(
+            c,
+            map,
+            view.start_beat,
+            body_rect.x,
+            beat_to_px,
+            2.0,
+            skip,
+        );
+        // `LineBatch.segments` は独立した線分の集合なので、run を跨いで 1 batch に畳んでよい
+        // (run の切れ目に線分を作らないことだけが本質)。
+        let segments: Vec<daw_ui_renderer::LineSegment> = runs
+            .iter()
+            .flat_map(|run| {
+                run.windows(2).map(|w| daw_ui_renderer::LineSegment {
                     a: [w[0].0, w[0].1],
                     b: [w[1].0, w[1].1],
                     color: curve_line_color,
                 })
-                .collect();
+            })
+            .collect();
+        if !segments.is_empty() {
             hctx.push_lines(daw_ui_renderer::LineBatch {
                 segments: segments.into(),
                 line_width_px: style.automation_curve_line_width_px,

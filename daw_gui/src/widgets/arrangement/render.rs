@@ -59,9 +59,20 @@ pub(super) fn dispatch(
                 .wrapping_mul(0x100_0000_01B3)
                 .wrapping_add(u64::from(k.clip))
         });
+    // r.md #73: 曲げている最中の区間は cached 層が base curve を描かない (2 重線の防止)。
+    // **cached の中身が変わるので key に入れる**。 hover (`hovered_segment`) を意図的に外して
+    // あるのと対照的だが、こちらは値が変わるのが drag の開始と終了の 2 回だけなので、
+    // 「マウスを動かすたびに全体再構築」 にはならない。
+    let bend_skip = overlays.segment_bend.as_ref().map(|b| b.point);
+    let bend_skip_hash: u64 = bend_skip.map_or(0, |k| {
+        [k.clip.track, k.clip.lane, k.clip.clip, k.point_id].iter().fold(
+            0xCBF2_9CE4_8422_2325_u64,
+            |a, &x| a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x)),
+        )
+    });
     let viewport_key = (
         (
-            b"arrangement_widget_v7" as &[u8],
+            b"arrangement_widget_v8" as &[u8],
             f.rect.w.to_bits(),
             f.rect.h.to_bits(),
             f.view.start_beat.to_bits(),
@@ -83,6 +94,7 @@ pub(super) fn dispatch(
         // key に含める — 「サイズ不変で位置 / lane 高さだけ変わる」 layout
         // 変化で旧座標に描かれるのを correct-by-construction で防ぐ。
         (f.rect.x.to_bits(), f.rect.y.to_bits(), f.view.arranger_lane_h.to_bits()),
+        bend_skip_hash,
     );
 
     // M14 Phase 63n-3 (#028) / 63c (#016) / 63n-8 (#033): heavy 用 selection 集合。
@@ -164,6 +176,9 @@ pub(super) fn dispatch(
         // (`render_arrangement_heavy` は response を受け取らないので、
         // **response に足しただけでは強調が描けない**)。 cache キーには入れない。
         hovered_segment: response.hovered_automation_segment,
+        // r.md #73: 曲げている最中の区間 (cached 層で base curve を描かない対象)。
+        // `hovered_segment` と違い `viewport_key` に入っている (上の `bend_skip_hash`)。
+        bend_skip,
         clip_content,
         stretch_ghost_content,
         selected_clip_set,
@@ -192,6 +207,14 @@ pub(super) struct HeavyInput {
     /// Alt 強調 (overlay 層) を出す対象を決めるためだけに使う。
     /// **`viewport_key_hash` の材料にしてはいけない** (`hovered_clip` と同じ罠)。
     pub hovered_segment: Option<AutomationPointIdKey>,
+    /// r.md #73: Alt+ドラッグで曲げている最中の区間。cached 層はこの区間の base curve を
+    /// **描かない** (`draw_automation_lane` の `bend_skip`)。 preview だけが線になるので
+    /// 「元の形の上に preview が重なって 2 重に見える」 が原理的に起きない。
+    ///
+    /// これは `hovered_segment` と違って **`viewport_key_hash` の材料にする** (下の
+    /// `bend_skip_hash`)。 cached の中身が変わるので入れないと反映されないし、値が変わるのは
+    /// ドラッグの開始と終了の 2 回だけなので hover のような毎フレーム再構築にはならない。
+    pub bend_skip: Option<AutomationPointIdKey>,
     pub clip_content: HashMap<ClipKey, ClipContentDraw>,
     /// r.md #68: Shift + 端 drag のときだけ入る「伸縮済みの中身」。 空のときは
     /// ゴーストも `clip_content` をそのまま描く (トリム / 移動では確定後の中身が
@@ -367,6 +390,7 @@ fn render_arrangement_heavy(
                         f.style,
                         lanes,
                         &heavy.selected_automation_clip_set,
+                        heavy.bend_skip,
                     );
                     lane_y += lh;
                 }
@@ -475,9 +499,9 @@ fn render_arrangement_heavy(
         // curve handle) を ghost より後に描いていると、 掴んでいる point が静止した dot / handle に
         // 隠れる。 clip / track 並べ替え / fade と同じ「base を全部描いてから ghost」 規律へ。
         //
-        // ※ 2 ブロック目 (curve handle) は純粋な静的 overlay では**なく** curve param drag の
-        //    live preview を内包する。 point drag と curve param drag は排他ジェスチャなので前出し
-        //    しても実害は無いが、 「静的だから前」 という理由では**ない**。
+        // ※ 2 ブロック目 (r.md #73 の `draw_bend_overlays`) は純粋な静的 overlay では**なく**
+        //    区間 bend の live preview を内包する。 point drag と bend drag は排他ジェスチャなので
+        //    前出ししても実害は無いが、 「静的だから前」 という理由では**ない**。
         // M14 Phase 63n-8 (#033): selected automation points overlay (cached 外、 selection 変化のみで
         // 全 lane 再キャッシュは走らない設計)。 base draw (cached 内) は selection 不問の通常 dot を
         // 描く、 ここで selected な点だけを白色 + 大 dot で上書き (= base dot を完全に覆って差し替え)。
@@ -559,8 +583,11 @@ fn render_arrangement_heavy(
         // Bezier の t=0.5 は tension に依らず常に中点)。 代わりに
         //   (1) Alt hover 中の「曲げられる区間」の強調 (どこを掴むと何が起きるかの可視化)
         //   (2) bend drag 中の preview 曲線
-        // を描く。 どちらも `cached` の外 — hover / drag は毎フレーム変わるので
+        // を描く。 どちらも `cached` の外 — hover / preview の形は毎フレーム変わるので
         // cache キーに混ぜると全再構築になる。
+        // ただし **「いまどの区間を曲げているか」 だけは cache キーに入っている**
+        // (`bend_skip`)。 cached 側がその区間の base curve を描かないようにするためで、
+        // 値が変わるのは drag の開始と終了の 2 回だけ (毎フレームではない)。
         draw_bend_overlays(hctx, f, heavy.hovered_segment, overlays.segment_bend.as_ref());
         if let Some((nd, bd, td)) = overlays.clip.as_ref() {
             draw_drag_preview(
@@ -847,7 +874,10 @@ fn render_arrangement_heavy(
 ///   `AutomationPointIdKey` 1 つだけで、 **hover のたびに `automation_segment_at` を
 ///   再実行しない** (cursor 層で 1 度出した結果を key で運び、 ここでは幾何を引き直す)。
 /// - **(2) bend preview** … drag 中の `preview_curve` を `line_width × 1.5` の
-///   `automation_curve_bend_preview_color` で cached 側の base curve に重ねて覆う。
+///   `automation_curve_bend_preview_color` で描く。 **その区間の base curve は cached 側が
+///   描かない** (`HeavyInput::bend_skip`) ので、 これがその区間の唯一の線になる。
+///   旧実装は base に「重ねて覆う」 つもりだったが、 曲げれば形が食い違うのだから
+///   原理的に覆いきれず、 **2 重線**として見えていた (r.md #73 の不具合報告)。
 ///
 /// 形の評価は cached 側と同じ `curve::flatten_segment` を通す
 /// (= 「プレビューだけ別式」を作らない。 それが #73 の不具合の原因だった)。

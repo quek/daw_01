@@ -1196,8 +1196,12 @@ pub struct ArrangementStyle {
     pub automation_curve_bend_hover_color: Color,
     /// r.md #73: Alt+ドラッグ中の live preview 線の色 (旧
     /// `automation_curve_param_preview_color` を改名)。 cached curve の lane.color と
-    /// 区別して「これは preview」と示す。 line_width は
-    /// `automation_curve_line_width_px * 1.5` で cached curve を視覚的に上書きする。
+    /// 区別して「これは preview」と示す。 line_width は `automation_curve_line_width_px * 1.5`
+    /// (= hover 強調と同じ太さ)。
+    ///
+    /// **base curve に「重ねて覆う」ためではない。** 曲げれば形が食い違うので原理的に
+    /// 覆いきれず、2 重線として見えていた (実機で報告)。 掴んでいる区間の base は cached 側が
+    /// 描かない (`render::HeavyInput::bend_skip`) ので、この線がその区間の唯一の線になる。
     pub automation_curve_bend_preview_color: Color,
     /// M14 Phase 63n-8 (#033): selected automation point の半径 (px)。 default 5.0 (= 通常 4.0 から +25%)。
     /// `automation_point_radius_px` より大きい値を期待 (= 視認性、 「selected の方が大きく / 明るく見える」 SSoT)。

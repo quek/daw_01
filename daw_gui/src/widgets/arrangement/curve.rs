@@ -169,6 +169,17 @@ pub(super) fn flatten_segment(
 /// `beat_to_px` は **screen-wide な拍 → px 換算** (= `body_w / view.len_beats`)。
 /// clip 長 ≠ view 長のとき point dot 描画とずれないための SSoT
 /// (#028 user 指摘 2 「curve が point を通らない」の根本原因だった)。
+///
+/// `skip_incoming_point_id` を渡すと、その point を終点とする区間 **1 本だけ**を描かない。
+///
+/// r.md #73: bend ドラッグ中はまだモデルを書き換えないので、これを渡さないと cached 側が
+/// **元の形**を描き続け、その上に preview が重なって **2 重線**に見える。 「線幅 1.5 倍で
+/// 覆う」設計は形が一致しているときしか成立しない (曲げた瞬間に食い違うのが目的なので、
+/// 原理的に覆いきれない)。 掴んでいる区間だけ base を止め、preview を唯一の線にする。
+///
+/// 戻り値が **polyline の run 列**なのはそのため — 区間を 1 本抜くと前後が不連続になり、
+/// 1 本の点列にすると抜いた区間を跨ぐ線分が生えて「近道の直線」が描かれてしまう。
+/// 通常は 1 run、区間を抜いたときだけ 2 run になる (先頭 / 末尾を抜けば 1 run)。
 #[must_use]
 pub(super) fn flatten_clip_curve(
     clip: &ArrangementAutomationClip,
@@ -177,7 +188,8 @@ pub(super) fn flatten_clip_curve(
     body_origin_x: f32,
     beat_to_px: f64,
     max_segment_px: f32,
-) -> Vec<(f32, f32)> {
+    skip_incoming_point_id: Option<u32>,
+) -> Vec<Vec<(f32, f32)>> {
     if clip.points.is_empty() {
         return Vec::new();
     }
@@ -188,12 +200,24 @@ pub(super) fn flatten_clip_curve(
         let x = body_origin_x + ((abs_beat - view_start_beat) * beat_to_px) as f32;
         x
     };
+    let start_of = |p: &ArrangementAutomationPoint| (to_x(p), map.plain_to_y(p.value_plain));
     let n = clip.points.len();
-    let mut out = Vec::with_capacity(n * 8);
-    out.push((to_x(&clip.points[0]), map.plain_to_y(clip.points[0].value_plain)));
+    let mut runs: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut cur: Vec<(f32, f32)> = Vec::with_capacity(n * 8);
+    cur.push(start_of(&clip.points[0]));
     for i in 0..(n - 1) {
         let p_prev = &clip.points[i];
         let p_next = &clip.points[i + 1];
+        // 抜く区間: 点列を切って次の run を「その区間の終点」から始め直す。
+        if skip_incoming_point_id == Some(p_next.id) && p_next.id != 0 {
+            if cur.len() >= 2 {
+                runs.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+            cur.push(start_of(p_next));
+            continue;
+        }
         // 各 segment の curve は **次 point** の `curve` を使う (= incoming curve)。
         flatten_segment(
             map,
@@ -201,10 +225,13 @@ pub(super) fn flatten_clip_curve(
             (to_x(p_next), p_next.value_plain),
             p_next.curve,
             max_segment_px,
-            &mut out,
+            &mut cur,
         );
     }
-    out
+    if cur.len() >= 2 {
+        runs.push(cur);
+    }
+    runs
 }
 
 // ============================================================

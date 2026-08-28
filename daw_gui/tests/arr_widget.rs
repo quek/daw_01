@@ -1901,3 +1901,96 @@ fn alt_hover_on_the_line_does_not_erase_the_automation_curve() {
 // r.md #73: 実機と同じ経路 (`view::root::build_root`) と **実ピクセル** での
 // 「Alt hover で曲線が消えない」検証は `daw_gui/tests/automation_hover_visual.rs`。
 // widget を直接呼ぶこのファイルでは、widget の外で起きる上書きが見えないため。
+
+/// `x_at` を跨ぐ線分の y を集め、近いもの (±1.5px) を 1 つにまとめた「その x に何本の
+/// 線が見えるか」。
+///
+/// **重ね塗り (太い線で覆う) は本数を増やさない** — 縁取りと本体は同じ y に乗るので
+/// 1 つのクラスタに畳まれる。形が食い違ったときだけクラスタが増える = 2 重線。
+///
+/// 薄い線 (alpha < 0.5) は数えない。 lane には `default_value` の水平ガイド
+/// (`automation_default_line_color` = `grid_line` の alpha 0.18) が **全 x に** 引かれて
+/// いるので、 除かないと常に 1 本増えて「曲線が何本見えるか」 を測れない。
+fn line_positions_at(scene: &Scene, band: Rect, x_at: f32) -> Vec<f32> {
+    let mut ys: Vec<f32> = scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Line(b) => Some(b),
+            _ => None,
+        })
+        .flat_map(|b| b.segments.iter())
+        .filter_map(|s| {
+            if s.color.a < 0.5 {
+                return None;
+            }
+            let (x0, x1) = (s.a[0].min(s.b[0]), s.a[0].max(s.b[0]));
+            if x_at < x0 || x_at > x1 {
+                return None;
+            }
+            // 線分上の y を線形補間 (垂直線は始点 y)。
+            let y = if (s.b[0] - s.a[0]).abs() < 1e-6 {
+                s.a[1]
+            } else {
+                let t = (x_at - s.a[0]) / (s.b[0] - s.a[0]);
+                s.a[1] + (s.b[1] - s.a[1]) * t
+            };
+            // lane の帯に入っているものだけ (グリッド線 / playhead を除く)。
+            (y >= band.y && y <= band.y + band.h).then_some(y)
+        })
+        .collect();
+    ys.sort_by(f32::total_cmp);
+    let mut clusters: Vec<f32> = Vec::new();
+    for y in ys {
+        if clusters.last().is_none_or(|last| (y - last).abs() > 1.5) {
+            clusters.push(y);
+        }
+    }
+    clusters
+}
+
+/// **r.md #73 の回帰**: 曲げている最中に線が 2 重に見えない。
+///
+/// ドラッグ中はまだモデルを書き換えないので、cached レイヤは **元の曲線**を描き続ける。
+/// その上に preview を重ねる作りだが、曲げた瞬間に 2 本の形が食い違うので下の元の線が
+/// 見える。「線幅 1.5 倍で覆う」設計は**形が一致しているときしか成立していなかった**。
+#[test]
+fn bend_drag_does_not_leave_the_original_curve_showing() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    let band = lane_clip_rect(&mut app);
+    // 区間の中点を掴む。preview は必ず指の位置を通るので、上へ引いた分だけ
+    // 元の線と形が食い違う = 2 重線が最大になる場所。
+    let (gx, gy) = linear_segment_point(&mut app, 0.5);
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+
+    // 前提: 掴む前は 1 本。
+    let before = drive_scene(&mut host, &mut app, hold(gx, gy, alt));
+    assert_eq!(
+        line_positions_at(&before, band, gx).len(),
+        1,
+        "前提: 掴む前は曲線が 1 本 (got {:?})",
+        line_positions_at(&before, band, gx)
+    );
+
+    drive(&mut host, &mut app, press(gx, gy, alt));
+    // 15px 上へ = 元の線と preview が 15px 離れる。
+    let dragging = drive_scene(&mut host, &mut app, hold(gx, gy - 15.0, alt));
+    let positions = line_positions_at(&dragging, band, gx);
+    assert_eq!(
+        positions.len(),
+        1,
+        "曲げている最中に線が 2 重に見えている (掴んだ x で {} 本): {positions:?}",
+        positions.len()
+    );
+
+    // release 後はモデルが更新され、また 1 本に戻る。
+    drive(&mut host, &mut app, release(gx, gy - 15.0, alt));
+    let after = drive_scene(&mut host, &mut app, hold(gx, gy - 15.0, no_mods()));
+    assert_eq!(
+        line_positions_at(&after, band, gx).len(),
+        1,
+        "release 後も 1 本 (got {:?})",
+        line_positions_at(&after, band, gx)
+    );
+}

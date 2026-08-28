@@ -291,8 +291,12 @@ pub(super) fn take(
 
     // r.md #73: automation_segment_bend overlay clone + release take。
     // overlay は drag 中の preview curve を cached 外で描画 (`preview_curve` で再 flatten した
-    // polyline を `automation_curve_bend_preview_color` で重ねる)、 release で 1 度だけ
+    // polyline を `automation_curve_bend_preview_color` で描く。 掴んでいる区間の base curve は
+    // cached 側が描かないので、 これが唯一の線)、 release で 1 度だけ
     // `SetAutomationCurve { .., point_id, next }` を発行 (anchor と同値なら no-op)。
+    //
+    // **`live` の clone は `released` の take より前**。 release frame でも overlay が Some で
+    // 残るので、 「base は既に skip、 preview はもう無い」 の 1 frame 抜けが起きない。
     live.automation_segment_bend = {
         let state: &mut ArrangementState = ui.widget_state(wid);
         state.automation_segment_bend
