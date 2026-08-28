@@ -90,6 +90,15 @@ FILE-BUDGET | daw_gui/src/widgets/arrangement/release.rs  | 1003 | #77 の署名
 #    app.rs は AppData の定義と handle_event の match が同居) 状態。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
 FILE-BUDGET | daw_gui/src/view/track_inspector/mod.rs  | 2214 | 巨大 draw / match。未起票
+# app.rs は r.md #74 で `AppEvent::ToggleGroupCollapsed` の handler arm 1 個
+# (`collapsed_groups` の insert / remove) が乗って **5 行増える**。#74 は arrangement と
+# mixer にインライン複製されていた同じ HashSet flip 2 か所を消してこの 1 か所へ寄せた
+# 変更で、消えた側は `arrangement/header.rs` と `mixer_strips.rs` (どちらも FILE / FN は
+# budget 内なので現れない。`mixer_strips.rs` は FN-NESTING だけ baseline 済みで、
+# 下の `draw_strip` を 7/8 -> 7/6 へ締めてある)。
+# **#71 統合後の実測は 1993 で、天井を上げる必要は無くなった** — #71 が app.rs を
+# 5 行 (handle_event を 7 行) 縮めていて、そのぶんを #74 が使い切った形。
+# 天井は据え置き = 実測値そのもの (余裕ゼロ) のまま。
 FILE-BUDGET | daw_gui/src/app.rs                       | 1993 | 巨大 draw / match。未起票
 FILE-BUDGET | daw_gui/src/view/runner.rs               | 1618 | #71 で drag payload の frame ライフサイクル配線 +3。分割は runner の責務分けごと別タスク。未起票
 FILE-BUDGET | daw_gui/src/handler/automation.rs        | 1410 | 巨大 draw / match。未起票
@@ -144,7 +153,9 @@ FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy 
 #    まるごと組み立てている / 1 関数が全イベントを裁いている。
 #    いつ消えるか: **未起票**。
 FN-BUDGET | daw_gui/src/view/track_inspector/mod.rs::draw                             | 2063 | 巨大 draw / match。未起票
-FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1623 | 巨大 draw / match。未起票
+# handle_event も #74 の arm で +5 だが、#71 が -7 していたので **#71 統合後の実測は
+# 1621** (旧天井 1623 より低い)。締まる方向なので実測値へ下げる。
+FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1621 | 巨大 draw / match。未起票
 FN-BUDGET | daw_gui/src/view/audio_editor.rs::draw                                    |  781 | 巨大 draw / match。未起票
 FN-BUDGET | daw_gui/src/view/arrangement_view.rs::draw                                |  577 | #71 が足したのは dispatch 1 行だけ (本体 57 行は関数外の `device_drag_over_headers`)。未起票
 FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                              |  525 | 巨大 draw / match。未起票
@@ -199,7 +210,11 @@ FN-NESTING | daw_gui/src/view/audio_editor.rs::draw                             
 FN-NESTING | daw_gui/src/view/arrangement_view.rs::draw                                | 8/73  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/root.rs::draw_menu_bar                                   | 8/19  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/plugin_picker.rs::draw                                   | 7/34  | 巨大 draw。未起票
-FN-NESTING | daw_gui/src/view/mixer_strips.rs::draw_strip                              | 7/8   | 巨大 draw。未起票
+# draw_strip は r.md #74 で 6 段以上の行が **8 -> 6 に減った** (最大段数 7 は不変)。
+# disclosure クロージャの `if contains { remove } else { insert }` が
+# `app.handle_event(...)` 1 行になったため。締まる方向なので実測値へ下げる
+# (据え置くと消したぶんの入れ子が戻っても検出できない silent headroom になる)。
+FN-NESTING | daw_gui/src/view/mixer_strips.rs::draw_strip                              | 7/6   | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/recovery_modal.rs::draw                                  | 7/8   | 巨大 draw。未起票
 
 # 3. IPC / イベント / ショートカットの巨大 match。

@@ -7,6 +7,8 @@ pub mod bottom_panel;
 /// Ctrl+C / Ctrl+X / Ctrl+V / D — 編集面ごとのクリップボード操作 (root.rs から分離)。
 pub mod clipboard_ops;
 pub mod dirty_guard_modal;
+/// r.md #74: 開閉マーク (disclosure triangle) の glyph 規則の SSoT。
+pub mod disclosure;
 pub mod export_overlay;
 /// r.md #61: 終了処理中オーバーレイ。
 pub mod shutdown_overlay;

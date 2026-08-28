@@ -11,10 +11,14 @@ pub struct UiPrefs {
     pub preview_window_visible: bool,
     /// 折り畳み中の group track id 集合。 group 自身が `kind == Group`
     /// (= 子を持つ) かつこの set に含まれていれば子孫の row を hide。
+    /// **arrangement と mixer が共有する SSoT** で、 反転は
+    /// `AppEvent::ToggleGroupCollapsed` の 1 経路のみ (r.md #74)。
+    /// session-only: プロジェクト load / New で clear、 track 削除 / ungroup /
+    /// undo-redo 後の照合で生存 id へ prune。 save / Undo 対象外。
     pub collapsed_groups: std::collections::HashSet<u32>,
     /// gui_01 #028 (M14 Phase 63n-1): automation lane 群を **展開中** の
     /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
-    /// `automation_lanes_collapsed = true` を widget へ渡す。 ▶/▼ click
+    /// `automation_lanes_collapsed = true` を widget へ渡す。 `+` / `-` click
     /// で `ToggleTrackAutomationCollapsed` イベント経由に insert/remove。
     /// プロジェクト保存対象ではない (= session-only): UI 状態は再起動で
     /// 既定 (全 collapsed) に戻る。

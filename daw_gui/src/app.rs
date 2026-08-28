@@ -807,6 +807,13 @@ impl AppData {
             AppEvent::GroupSelectedTracks { track_ids } => {
                 self.action_group_selected_tracks(&track_ids);
             }
+            AppEvent::ToggleGroupCollapsed { track_id } => {
+                // r.md #74: arrangement / mixer 両方の group disclosure が
+                // ここに合流する (`collapsed_groups` が 2 ビュー共通の SSoT)。
+                if !self.ui_prefs.collapsed_groups.insert(track_id) {
+                    self.ui_prefs.collapsed_groups.remove(&track_id);
+                }
+            }
             AppEvent::ToggleTrackAutomationCollapsed { track_id } => {
                 // gui_01 #034 (Phase 63n-10): master row の expansion は
                 // 通常 track の set とは別 SSoT。

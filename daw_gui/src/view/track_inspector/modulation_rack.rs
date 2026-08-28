@@ -11,6 +11,7 @@ use daw_ui_core::{
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 
 // 数値 field の base style は inspector 全体で共有するので親モジュールから借りる
 // (ラベル色は `app.theme.core.text` を直接読む)。
@@ -92,6 +93,16 @@ fn mod_editor_style(theme: &crate::theme::Theme) -> MsegEditorStyle {
 
 /// グラフィカルエディタのカーブ描画高さ (px)。
 const MOD_CANVAS_H: f32 = 96.0;
+
+/// modulation rack の header 行左端に置く開閉 disclosure ボタンの幅 (px)。
+const MOD_DISCLOSURE_W: f32 = 16.0;
+/// disclosure ボタンと、 その右に来る名前 / track dropdown / routing ラベルの間隔 (px)。
+const MOD_DISCLOSURE_GAP: f32 = 2.0;
+/// 行左端 (`lx`) から名前 / routing ラベル左端までの距離 (px)。
+/// **disclosure ボタンの実寸から導出する** — 旧実装は `18.0` を header の名前起点・
+/// routing 行の x・同じ行の幅の項の 3 か所に手写ししていて、 ボタン幅を変えると
+/// routing 行だけ黙ってずれた (r.md #74)。
+const MOD_NAME_INSET: f32 = MOD_DISCLOSURE_W + MOD_DISCLOSURE_GAP;
 
 /// MSEG を q∈[0,1] で `n+1` 点サンプルする (描画 == 評価の SSoT、 `mseg_sample` 直呼び)。
 fn mseg_samples(c: &common::model::MsegConfig, n: usize) -> Vec<(f32, f32)> {
@@ -352,7 +363,7 @@ pub(super) fn draw_modulation_rack(
         let i_u = i as u32;
         let expanded = app.ui_ephemeral.expanded_mod_sources.contains(&sid);
 
-        // --- header row: [▸/▾][name/track] [meter] [arm] [×] ---
+        // --- header row: [▶/▼][name/track] [meter] [arm] [×] ---
         let rm_rect = Rect { x: area.x + area.w - pad - 20.0, y, w: 20.0, h: 20.0 };
         let meter_w = 50.0;
         let meter_x = rm_rect.x - 4.0 - meter_w;
@@ -373,11 +384,15 @@ pub(super) fn draw_modulation_rack(
                 })
             },
         );
-        // 展開トグル (chevron)。
+        // 展開トグル。 rack 行は縦積みで中身は下に開く → 開示軸は Block
+        // (r.md #74 で全 disclosure の glyph を `view::disclosure` へ一本化した。
+        // 旧実装はここだけ小三角 ▸/▾ を使っていて、 同じ意味のマークが 2 系統
+        // 存在していた)。 ▸/▾ と ▶/▼ は既定フォントで advance が同一 (0.527 em)
+        // なので、 族を変えても行のレイアウトは 1px も動かない。
         ui.button_at(
             ("inspector_mod_src_expand", i),
-            if expanded { "\u{25be}" } else { "\u{25b8}" },
-            Rect { x: lx, y, w: 16.0, h: 20.0 },
+            disclosure_glyph(!expanded, RevealAxis::Block),
+            Rect { x: lx, y, w: MOD_DISCLOSURE_W, h: 20.0 },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
                     // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
@@ -387,7 +402,7 @@ pub(super) fn draw_modulation_rack(
                 })
             },
         );
-        let name_x = lx + 18.0;
+        let name_x = lx + MOD_NAME_INSET;
         let name_rect = Rect { x: name_x, y, w: (arm_x - 4.0 - name_x).max(40.0), h: 20.0 };
         if let K::EnvelopeFollower { tap, .. } = &src.kind {
             let sel = mod_track_choices
@@ -767,10 +782,10 @@ pub(super) fn draw_modulation_rack(
                 ("inspector_mod_rt_lbl", route_i),
                 &format!("\u{2192} {}", row.label),
                 Rect {
-                    x: lx + 18.0,
+                    x: lx + MOD_NAME_INSET,
                     y: row_y + 4.0,
                     // 右側の depth / 極性 / × と重ねない (幅は下の x 計算と対)。
-                    w: (row_w - 18.0 - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
+                    w: (row_w - MOD_NAME_INSET - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
                     h: 11.0 * 1.2,
                 },
                 11.0,
