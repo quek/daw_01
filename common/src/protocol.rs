@@ -526,14 +526,16 @@ pub enum PluginCommand {
     /// 合成をトリガしない専用の軽量メッセージにする。
     SetVocalSynthPriority { device_id: u64, playhead_beats: f64 },
     /// Load / replace the plugin instance for device `device_id` (安定 id、
-    /// `Song.next_device_id` 採番)。 `track_id` は所属 track (master fx は
-    /// `MASTER_TRACK_ID`) — teardown (`RemoveTrack`) 用の帰属情報で、
-    /// アドレスには使わない。 `generation` は per-device 単調増加の要求世代
-    /// — 応答 (`SlotPluginLoaded` / `SlotPluginLoadFailed`) に echo され、
+    /// `Song.next_device_id` 採番)。 `generation` は per-device 単調増加の
+    /// 要求世代 — 応答 (`SlotPluginLoaded` / `SlotPluginLoadFailed`) に echo され、
     /// GUI は最新世代のみ受理する (A→B 連続差し替えの stale 応答 race 対策)。
+    ///
+    /// r.md #71 (プラグインのコピー / 移動): 所属 track は載せない。 host は
+    /// device の帰属も順序も持たず、アドレスは `device_id` 一本 —
+    /// 帰属を二重所有すると device を別トラックへ移した瞬間に host 側が stale に
+    /// なり、「元トラックを削除したら移動先の device が破棄される」が起きる。
     SetSlotPlugin {
         device_id: u64,
-        track_id: u32,
         format: PluginFormat,
         path: std::path::PathBuf,
         plugin_id: String,
@@ -542,8 +544,6 @@ pub enum PluginCommand {
     },
     /// Remove the plugin instance for `device_id` if any.
     RemoveSlotPlugin { device_id: u64 },
-    /// Drop every plugin instance belonging to `track_id` (= track 削除)。
-    RemoveTrack { track_id: u32 },
     /// **別プロジェクトに切り替わったので instance を全部捨てる。**
     ///
     /// `device_id` (= `PluginInstance::id`) は Song スコープの名前で、
@@ -552,10 +552,12 @@ pub enum PluginCommand {
     /// 新 project の `SetSlotPlugin` が **同 id・同 plugin_id の dedup に吸収され**、
     /// 保存済み state を復元しないまま旧 instance で鳴ってしまう。
     ///
-    /// `RemoveTrack` の積み重ねでは塞げない: 列挙元は daw_gui 側の帳簿
-    /// (`loaded_slots`) で、load 応答が返る前に切り替わった device は帳簿に
-    /// 載っておらず、以後 **永久に** 回収対象にならない (漏れが自己増殖する)。
-    /// 「全部捨てろ」は帳簿に依存しない唯一の表現。
+    /// r.md #71 (プラグインのコピー / 移動) で `RemoveTrack` を撤去し、track 削除は
+    /// Song から列挙した device の `RemoveSlotPlugin` に置き換えたが、**本 variant は
+    /// 残る** — 守っているのは **project 切替**で、そこでは列挙元の Song 自体が
+    /// 差し替わり device_id が 1 から再採番される。前 project の instance を
+    /// 「列挙して消す」ことが原理的にできない (新 Song は旧 id を知らず、旧 Song は
+    /// もう無い) ので、帳簿にも Song にも依存しない「全部捨てろ」が唯一の表現になる。
     UnloadAllPlugins,
     /// Ask the plugin_host to capture state for one device. Reply is
     /// `PluginEvent::SlotPluginState`.
@@ -757,10 +759,9 @@ pub enum PluginEvent {
     /// 一時的に消え、 RT はその device を skip する (= ロード完了までの
     /// dispatch 抑止)。
     SlotPluginShmemReleased { device_id: u64 },
-    /// Plugin host destroyed a plugin instance (RemoveSlotPlugin /
-    /// RemoveTrack 経由)。 daw_gui はこれを受けて daw_gui ローカルの
-    /// bookkeeping (`track_plugin_ids` / `loaded_slots` / latency 等) を
-    /// 片付ける。 shmem の解放は必ず先行する
+    /// Plugin host destroyed a plugin instance (`RemoveSlotPlugin` 経由)。
+    /// daw_gui はこれを受けて daw_gui ローカルの bookkeeping
+    /// (`loaded_devices` / latency 等) を片付ける。 shmem の解放は必ず先行する
     /// [`Self::SlotPluginShmemReleased`] が担う (SSoT — 二重に送らない)。
     SlotPluginUnloaded { device_id: u64 },
     /// Plugin が報告した自身の processing latency (samples 単位)。 activate
@@ -968,7 +969,6 @@ mod tests {
     fn set_slot_plugin_roundtrip() {
         let msg = PluginCommand::SetSlotPlugin {
             device_id: 42,
-            track_id: 7,
             format: PluginFormat::Clap,
             path: std::path::PathBuf::from("C:/plugins/test.clap"),
             plugin_id: "test.synth".into(),

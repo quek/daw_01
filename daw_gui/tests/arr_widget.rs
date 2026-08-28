@@ -128,6 +128,24 @@ fn drive(host: &mut UiHost<AppData>, app: &mut AppData, p: PointerFrame) {
     let _ = drive_scene(host, app, p);
 }
 
+/// [`drive`] と同じだが、`arrangement()` を呼ぶ **前に** widget 跨ぎの drag を
+/// 始める (r.md #71 プラグインのコピー / 移動: インスペクタのチェーンから掴んだ
+/// device を運んでいる最中、という状況を作る)。payload は `UiHost` が持つので、
+/// 一度始めれば release まで後続フレームでも生きている。
+fn drive_dragging(host: &mut UiHost<AppData>, app: &mut AppData, p: PointerFrame) {
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+    host.frame(app, &mut scene, screen, frame(p), |app, ui| {
+        if ui.dragging_kind().is_none() {
+            ui.begin_drag(
+                daw_gui::app::DEVICE_DRAG_KIND,
+                daw_gui::app::DeviceDragPayload { device_ids: vec![1], source_track: 1 },
+            );
+        }
+        let _ = arrangement(app, ui, WIDGET_RECT);
+    });
+}
+
 fn no_mods() -> Modifiers {
     modifiers(false, false, false)
 }
@@ -1044,6 +1062,49 @@ fn header_row_click_selects_track() {
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert_eq!(app.selection.selected_track_ids, vec![1], "行 click でそのトラックが選択される");
+}
+
+/// r.md #71 (プラグインのコピー / 移動): **外部 drag を落とした frame の release は
+/// 「ヘッダの click」 として扱わない**。
+///
+/// 扱うと Ctrl+drop が `SelectModifier::Toggle` として解決され、 落とし先トラックの
+/// 選択が勝手に反転する / last-wins タグが `Tracks` に倒れて次の Delete がトラックを
+/// 消しに行く (= 「落とし先を表示し続ける」 という要件と真っ向から衝突する)。
+///
+/// このガードは元 `run.rs` にあり、 r.md #77 の 9 ファイル分割で
+/// `header::commit_clicks` へ移設された。 **移設で落ちても build / clippy は通る**
+/// 種類の壊れ方なので、 ここで機械的に止める。
+#[test]
+fn header_release_during_external_drag_does_not_select_track() {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    app.selection.selected_track_ids.clear();
+    app.selection.last_edit_select = None;
+    let mut host = UiHost::no_redraw();
+    // 押した場所はインスペクタ側 (= この widget の外) なので press は起こさない。
+    // 掴んだままヘッダの上へ来て、そこで離す。
+    let y = track0_y() - ROW_H * 0.4;
+    let x = HEADER_W - 8.0;
+    drive_dragging(&mut host, &mut app, hold(x, y, no_mods()));
+    drive_dragging(&mut host, &mut app, release(x, y, no_mods()));
+    assert!(
+        app.selection.selected_track_ids.is_empty(),
+        "運搬の drop frame ではトラック選択を走らせない: {:?}",
+        app.selection.selected_track_ids
+    );
+    assert_eq!(
+        app.selection.last_edit_select, None,
+        "last-wins タグも Tracks に倒さない (次の Delete がトラックを消さない)"
+    );
+
+    // 対照: drag していなければ同じ release で普通に選択される (ガードが
+    // 「常に選択を殺す」 方向へ壊れていないこと)。
+    drive(&mut host, &mut app, release(x, y, no_mods()));
+    assert_eq!(
+        app.selection.selected_track_ids,
+        vec![1],
+        "drag していない release は従来どおりトラックを選択する"
+    );
 }
 
 /// master 行の header click も同じ経路でトラック選択に乗る。

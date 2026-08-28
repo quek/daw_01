@@ -4,6 +4,8 @@ pub mod about;
 pub mod arrangement_view;
 pub mod audio_editor;
 pub mod bottom_panel;
+/// Ctrl+C / Ctrl+X / Ctrl+V / D — 編集面ごとのクリップボード操作 (root.rs から分離)。
+pub mod clipboard_ops;
 pub mod dirty_guard_modal;
 pub mod export_overlay;
 /// r.md #61: 終了処理中オーバーレイ。

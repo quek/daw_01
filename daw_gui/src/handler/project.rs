@@ -65,6 +65,9 @@ impl AppData {
         self.selection.selected_clips.clear();
         self.selection.selected_notes.clear();
         self.selection.audio_editor_selected_events.clear();
+        // r.md #71 (プラグインのコピー / 移動): device 選択も project スコープ。
+        self.selection.selected_device_ids.clear();
+        self.selection.device_anchor = None;
         self.selection.clip_anchor = None;
         self.selection.note_anchor = None;
         self.selection.track_anchor = None;
@@ -92,10 +95,9 @@ impl AppData {
         self.ui_prefs.multi_clip_view_key.clear();
         self.ui_prefs.collapsed_groups.clear();
 
-        // -- 子プロセスに関する帳簿 (device_id / (track,index) keyed) -------
+        // -- 子プロセスに関する帳簿 (すべて device_id keyed) ----------------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
         self.ipc.plugin_param_values.clear();
-        self.ipc.track_plugin_ids.clear();
         self.ipc.ara_doc_cache.clear();
         self.ipc.ara_pcm_materialized.clear();
         self.ipc.gui_open_requests.clear();
@@ -302,10 +304,13 @@ impl AppData {
         }
         // collapsed_groups も track が消えていたら除外。
         self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));
+        // r.md #71 (プラグインのコピー / 移動): undo/redo で消えた device の id も
+        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
+        self.prune_device_selection();
         self.resize_track_peak_display();
         // Undo / Redo は plugin_host / audio engine の plugin
         // load 状態に直接 IPC を発行しないので、 ここで Song と
-        // `track_plugin_ids` を diff して同期させる。 さもなければ
+        // `loaded_devices` を diff して同期させる。 さもなければ
         // 「Bass track 削除 → Undo で track は復活するが plugin は
         // load されない (= 音が出ない)」 となる。
         //
@@ -1002,19 +1007,16 @@ impl AppData {
     /// いないので音が鳴らない」「FX 1 個追加 → Undo でも host にその FX
     /// が残り続ける」 等の UX バグになる。
     ///
-    /// Phase A (stale tracks remove): `loaded_slots` にあるが
-    /// `Song.tracks` には居ない `track_id` を、 `delete_track` と同じ
-    /// IPC 順 (audio に `ClosePluginShmem` 先送り → plugin_host に
-    /// `RemoveTrack`) で破棄する。 Redo が track 削除を進めた場合に
-    /// 発動する。
+    /// r.md #71 (プラグインのコピー / 移動): diff は **device 粒度の 1 段**。
+    /// 旧 Phase A (「host にあるが Song に無い track」 を `RemoveTrack` で消す)
+    /// は撤去した — track という単位は host 側に無く、 「Song に無い device」 の
+    /// 判定に完全に吸収される。
     ///
-    /// Phase B (per-slot diff): `Song.tracks` の各 track について
-    /// [`AppData::loaded_slots`] と「Song の各 `(slot, plugin_id_str)`」
-    /// を比較する。 host にあるが Song に無い slot は `RemoveSlotPlugin`、
-    /// Song にあるが host に無い slot もしくは host にあるが
-    /// `plugin_id_str` が違う slot は `SetSlotPlugin`。 plugin_host の
-    /// SetSlotPlugin handler は同 plugin_id を同 slot に置く dedup logic
-    /// を持つので、 一致 slot に改めて送信しても no-op
+    /// [`AppData::loaded_devices`] と Song の device 集合を突き合わせ、
+    /// host にあるが Song に無い device は `RemoveSlotPlugin`、 Song にあるが
+    /// host に無い / `plugin_id_str` が違う device は `SetSlotPlugin`。
+    /// plugin_host の SetSlotPlugin handler は同 device に同 plugin_id を置く
+    /// dedup logic を持つので、 一致 device に改めて送信しても no-op
     /// (`SlotPluginLoaded` を再 emit するだけ)。
     ///
     /// plugin の **state** は `Song.PluginInstance::state` を
@@ -1022,98 +1024,46 @@ impl AppData {
     /// `RequestAllStates` で最新 state を Song に書き戻しているので、
     /// 削除直前の knob 値も Undo で復元される。
     pub(crate) fn reconcile_plugins_with_song(&mut self) {
-        // Phase A: Song に無い track を host から消す。 `loaded_slots` に
-        // 1 つでも残っている track id (= host 側 plugin chain がまだ
-        // ある) を見れば判定できる。
-        let song_track_ids: std::collections::HashSet<u32> =
-            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
-        let stale_track_ids: std::collections::HashSet<u32> = self
-            .ipc.loaded_slots
-            .keys()
-            .map(|(tid, _)| *tid)
-            .filter(|tid| !song_track_ids.contains(tid))
-            .collect();
-        if !stale_track_ids.is_empty() {
-            tracing::info!(
-                ?stale_track_ids,
-                "reconcile: removing stale tracks from plugin host"
-            );
-        }
-        for track_id in stale_track_ids {
-            // `delete_track` と同じ IPC 順序: audio engine に
-            // ClosePluginShmem を先送りしてから plugin_host に
-            // RemoveTrack。
-            let device_ids = self.ipc.track_plugin_ids.remove(&track_id);
-            if let Some(ref device_ids) = device_ids {
-                for &device_id in device_ids {
-                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
-                }
-            }
-            self.send_plugin(PluginCommand::RemoveTrack { track_id });
-            // host から消す track の pending load / GUI window / slot
-            // cache も掃除。 pending は device_id keyed なので、 その track の
-            // device 集合 (= track_plugin_ids に登録済みだったもの) で落とす。
-            if let Some(device_ids) = device_ids {
-                for device_id in device_ids {
-                    self.ipc.pending_plugin_loads.remove(&device_id);
-                }
-            }
-            self.ipc.loaded_slots.retain(|(t, _), _| *t != track_id);
-            self.ipc.open_plugin_guis.retain(|&(t, _)| t != track_id);
-        }
-
-        // Phase B: 各 track の slot 列を diff。 純粋関数で action 列を
-        // 計算し、 順に IPC を dispatch する (test しやすさのため切り出し)。
         if self.ipc.plugin_db.is_none() {
             // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
-            // RemoveSlotPlugin 単体は db 不要だが、 Phase B はまとめて
-            // skip する (= db ロード待ち)。
+            // RemoveSlotPlugin 単体は db 不要だが、 まとめて skip する
+            // (= db ロード待ち)。
             if !self.song_doc.song().tracks.is_empty() {
-                tracing::warn!("reconcile: plugin database not loaded; phase B skipped");
+                tracing::warn!("reconcile: plugin database not loaded; skipped");
             }
             return;
         }
-        let actions = compute_slot_reconcile_actions(self.song_doc.song(), &self.ipc.loaded_slots);
+        let actions =
+            compute_slot_reconcile_actions(self.song_doc.song(), &self.ipc.loaded_devices);
         for action in actions {
             match action {
-                SlotReconcileAction::RemoveSlot { track_id, index } => {
-                    tracing::info!(track_id, index, "reconcile: removing extra host device");
+                SlotReconcileAction::RemoveDevice { device_id } => {
+                    tracing::info!(device_id, "reconcile: removing extra host device");
                     // close the editor before removing (see
-                    // remove_device_inner for the ordering rationale).
-                    self.cleanup_slot_gui(track_id, index);
-                    // v29: host にあるが Song に無い device なので、 song から
-                    // id を引けない。 host 側の実 device id は loaded_slots が
-                    // 持っている (= SlotPluginLoaded で登録済み)。
-                    if let Some(info) = self.ipc.loaded_slots.remove(&(track_id, index)) {
-                        self.send_plugin(PluginCommand::RemoveSlotPlugin {
-                            device_id: info.device_id,
-                        });
-                        self.ipc.pending_plugin_loads.remove(&info.device_id);
-                    }
+                    // remove_devices_inner for the ordering rationale).
+                    self.cleanup_slot_gui(device_id);
+                    // **`ClosePluginShmem` を `RemoveSlotPlugin` より先に送る**
+                    // (順序は死守。 audio worker が unmapped shmem を踏むと
+                    // silent terminate → `all_done` 永久 wait。 理由は
+                    // `handler/grouping.rs` の `plan_track_removal_ipc` doc)。
+                    // 旧 Phase A が track 単位でまとめて送っていた責務を、
+                    // device 単位でここが引き取る。
+                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
+                    self.ipc.loaded_devices.remove(&device_id);
+                    self.ipc.pending_plugin_loads.remove(&device_id);
                 }
-                SlotReconcileAction::LoadSlot {
-                    track_id,
-                    index,
+                SlotReconcileAction::LoadDevice {
+                    device_id,
                     plugin_id_str,
                     initial_state,
                 } => {
-                    // v29: Song 側 device の安定 id でアドレスする。
-                    let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) else {
-                        tracing::error!(
-                            track_id,
-                            index,
-                            "reconcile: song device has no stable id (unallocated?)"
-                        );
-                        continue;
-                    };
                     tracing::info!(
-                        track_id,
-                        index,
                         device_id,
                         plugin_id = %plugin_id_str,
                         "reconcile: loading device from song"
                     );
-                    self.send_set_slot_plugin(track_id, device_id, &plugin_id_str, initial_state);
+                    self.send_set_slot_plugin(device_id, &plugin_id_str, initial_state);
                 }
             }
         }
@@ -1176,28 +1126,27 @@ impl AppData {
         }
     }
 
-    /// 現在 host に load されている全 track の plugin を破棄する (project 切替時)。
-    /// reconcile Phase A と同じ IPC 順 (audio へ `ClosePluginShmem` 先送り →
-    /// plugin_host へ `RemoveTrack`) を全 loaded track に適用する。`RemoveTrack` は
-    /// plugin_host 側でそのトラックの chain と **editor window** (`editor_windows`)
-    /// を破棄するので、開いていた plugin editor 窓も閉じる。master fx も
-    /// `MASTER_TRACK_ID` の RemoveTrack で同様に片付く。最後に GUI 側 cache を全消去。
+    /// 現在 host に load されている全 plugin を破棄する (project 切替時)。
+    /// audio へ `ClosePluginShmem` を先送りしてから plugin_host へ
+    /// `UnloadAllPlugins` を送る (use-after-free deadlock 防止の順序)。
+    /// 最後に GUI 側 cache を全消去。
     pub(crate) fn teardown_all_loaded_plugins(&mut self) {
-        let track_ids: std::collections::HashSet<u32> =
-            self.ipc.loaded_slots.keys().map(|(t, _)| *t).collect();
-        for track_id in track_ids {
-            if let Some(device_ids) = self.ipc.track_plugin_ids.remove(&track_id) {
-                for device_id in device_ids {
-                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
-                }
-            }
-            self.send_plugin(PluginCommand::RemoveTrack { track_id });
+        // 列挙元は **在庫 (`loaded_devices`) と Song の和集合**。 片方だけだと
+        // 「load 応答待ちの device」 (帳簿に居ない) か 「Song から消えたが host に
+        // 残っている device」 (Song に居ない) のどちらかを取りこぼす。
+        let mut ids: std::collections::HashSet<u64> =
+            self.ipc.loaded_devices.keys().copied().collect();
+        for t in &self.song_doc.song().tracks {
+            ids.extend(t.devices.iter().map(|d| d.id));
         }
-        // 上の RemoveTrack は `loaded_slots` (= SlotPluginLoaded を受け取った
-        // device だけ) からの列挙なので、load 応答待ちの device を取りこぼす。
-        // 取りこぼした instance は以後どの track にも帰属せず永久に残り、
-        // 新 project の同 device_id が dedup で吸収される。帳簿に依存しない
-        // 「全部捨てろ」で確実に閉じる。
+        ids.extend(self.song_doc.song().master_fx_chain.iter().map(|d| d.id));
+        for device_id in ids {
+            self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+        }
+        // project 切替。`device_id` は Song スコープの名前なので、 前 project の
+        // instance を「列挙して消す」ことが原理的にできない (新 Song は旧 id を
+        // 知らず、旧 Song はもう無い)。 帳簿にも Song にも依存しない
+        // 「全部捨てろ」でしか塞げない (protocol.rs の UnloadAllPlugins doc 参照)。
         self.send_plugin(PluginCommand::UnloadAllPlugins);
         // 計測 slot も device_id で引くので同じく project スコープ。解放は
         // これまでリソースモニタを描画しているフレームでしか走らず、モニタを
@@ -1207,12 +1156,14 @@ impl AppData {
         if let Some(bridge) = self.ipc.metrics_bridge.as_ref() {
             bridge.reclaim_plugin_metric_slots(&std::collections::HashSet::new());
         }
-        self.ipc.loaded_slots.clear();
+        self.ipc.loaded_devices.clear();
         self.ipc.open_plugin_guis.clear();
         self.ipc.plugin_params.clear();
         self.ipc.slot_has_gui.clear();
+        self.ipc.plugin_param_values.clear();
         self.ipc.pending_plugin_loads.clear();
         self.ipc.pending_added_plugin_finalize.clear();
+        self.ipc.gui_open_requests.clear();
         // 「未ロード」 表示も project スコープ (前 project の device_id を
         // 次 project が再利用するので、 残すと無関係な device が失敗表示になる)。
         self.ipc.failed_plugin_loads.clear();
@@ -1226,23 +1177,22 @@ impl AppData {
     /// 同じ組み立てを 4 箇所で重複させていたのを 1 本化したもの。
     pub(crate) fn send_set_slot_plugin(
         &mut self,
-        track_id: u32,
         device_id: u64,
         plugin_id: &str,
         initial_state: Option<Vec<u8>>,
     ) -> bool {
         let Some(db) = self.ipc.plugin_db.clone() else {
-            tracing::warn!(%plugin_id, track_id, "plugin database not loaded; cannot resolve plugin id");
+            tracing::warn!(%plugin_id, "plugin database not loaded; cannot resolve plugin id");
             return false;
         };
         let Some(entry) = db.find_by_id(plugin_id) else {
-            tracing::error!(id = %plugin_id, track_id, device_id, "plugin id not in database");
+            tracing::error!(id = %plugin_id, device_id, "plugin id not in database");
             return false;
         };
         // v29: 安定 device id でアドレスする。 0 (未採番) は ensure_ids 前の
         // song が漏れてきた設計バグなので error に出して skip。
         if device_id == 0 {
-            tracing::error!(id = %plugin_id, track_id, "device id unallocated; skipping SetSlotPlugin");
+            tracing::error!(id = %plugin_id, "device id unallocated; skipping SetSlotPlugin");
             return false;
         }
         let format = entry.format;
@@ -1251,7 +1201,6 @@ impl AppData {
         let generation = self.track_pending_load(device_id);
         self.send_plugin(PluginCommand::SetSlotPlugin {
             device_id,
-            track_id,
             format,
             path,
             plugin_id: resolved_id,
@@ -1261,36 +1210,34 @@ impl AppData {
         true
     }
 
+    /// plugin_host にこの device を実体化させる **唯一の口**。
+    /// 内蔵映像 FX (`ports.is_video()`) は plugin_host に載らない device なので
+    /// skip し `false` を返す (engine は未登録 device を skip する = 音声素通り)。
+    /// project 復元 / paste 復元 / device コピー (r.md #71) が全部ここを通る。
+    pub(crate) fn restore_device(&mut self, inst: &common::model::PluginInstance) -> bool {
+        if inst.ports.is_video() {
+            return false;
+        }
+        self.send_set_slot_plugin(
+            inst.id,
+            &inst.plugin_id,
+            inst.state.as_deref().map(<[u8]>::to_vec),
+        )
+    }
+
     pub(crate) fn restore_plugin_from_song(&mut self, song: &Song) {
         if self.ipc.plugin_db.is_none() {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         }
-        // PR2.1: send `Track::id` (not Vec position) so the plugin host
-        // keys its chains by id from the start. v29: chain 内の位置は送らない
-        // (host は順序を持たず、 安定 device id だけでアドレスする)。
-        let mut to_send: Vec<(u32, common::model::PluginInstance)> = Vec::new();
+        // v29: 帰属も chain 内の位置も送らない (host は device_id だけでアドレスする)。
+        let mut to_send: Vec<common::model::PluginInstance> = Vec::new();
         for track in song.tracks.iter() {
-            for p in track.devices.iter() {
-                to_send.push((track.id, p.clone()));
-            }
+            to_send.extend(track.devices.iter().cloned());
         }
-        // master bus fx chain も `MASTER_TRACK_ID` 帰属で送る。
-        for p in song.master_fx_chain.iter() {
-            to_send.push((common::model::MASTER_TRACK_ID, p.clone()));
-        }
-        for (track, inst) in to_send {
-            // 内蔵映像効果は GUI 描画 device。plugin_host に load しない
-            // (該当 builtin 無し)。engine は未登録 index を skip する (= 音声素通り)。
-            if inst.ports.is_video() {
-                continue;
-            }
-            self.send_set_slot_plugin(
-                track,
-                inst.id,
-                &inst.plugin_id,
-                inst.state.as_deref().map(<[u8]>::to_vec),
-            );
+        to_send.extend(song.master_fx_chain.iter().cloned());
+        for inst in to_send {
+            self.restore_device(&inst);
         }
     }
 
@@ -1299,26 +1246,16 @@ impl AppData {
     /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song_doc.song()` を読むため
     /// to_send を先に owned で確保してから送る (borrow 回避)。
     pub(crate) fn restore_plugins_for_tracks(&mut self, track_ids: &[u32]) {
-        let mut to_send: Vec<(u32, common::model::PluginInstance)> = Vec::new();
-        for track in self.song_doc.song().tracks.iter() {
-            if !track_ids.contains(&track.id) {
-                continue;
-            }
-            for p in track.devices.iter() {
-                to_send.push((track.id, p.clone()));
-            }
-        }
-        for (track, inst) in to_send {
-            // 内蔵映像効果は plugin_host に load しない (GUI 描画 device)。
-            if inst.ports.is_video() {
-                continue;
-            }
-            self.send_set_slot_plugin(
-                track,
-                inst.id,
-                &inst.plugin_id,
-                inst.state.as_deref().map(<[u8]>::to_vec),
-            );
+        let to_send: Vec<common::model::PluginInstance> = self
+            .song_doc
+            .song()
+            .tracks
+            .iter()
+            .filter(|t| track_ids.contains(&t.id))
+            .flat_map(|t| t.devices.iter().cloned())
+            .collect();
+        for inst in to_send {
+            self.restore_device(&inst);
         }
     }
 

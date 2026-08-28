@@ -62,16 +62,6 @@ impl AppData {
         };
         let is_master = track_id == common::model::MASTER_TRACK_ID;
 
-        // 挿入 index = 現在のチェーン長 (= 末尾 append)。
-        let dest_index = if is_master {
-            self.song_doc.song().master_fx_chain.len() as u32
-        } else {
-            let Some(track_idx) = self.cursor_track_index() else {
-                return;
-            };
-            self.song_doc.song().tracks[track_idx].devices.len() as u32
-        };
-
         // 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
         // load せず (load_builtin に該当無し)、モデルへ append するだけ。engine の
         // `process_track_owned` は `slot_to_plugin_id` 未登録の index を skip し
@@ -89,9 +79,10 @@ impl AppData {
             // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
             // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
             // 常に積み、 auto-open だけ値で分岐する。
-            self.ipc.pending_added_plugin_finalize
-                .insert((track_id, dest_index), open_gui);
-            self.send_set_slot_plugin(track_id, device_id, &entry_id, None);
+            self.ipc
+                .pending_added_plugin_finalize
+                .insert(device_id, open_gui);
+            self.send_set_slot_plugin(device_id, &entry_id, None);
         }
 
         let new_device = common::model::PluginInstance {

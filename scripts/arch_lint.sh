@@ -72,9 +72,26 @@ rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 # 検査パターンは **1 箇所で定義**して canary と本体で同じものを使う。別々に書くと
 # 「canary は通るが本体は壊れている」が成立してしまい、canary が証明にならない。
 INFINITE_RE='WaitForSingleObject[(][^,]*,[[:space:]]*INFINITE'
-POSKEY_RE='HashMap<[(]u32,[[:space:]]*u32[)]'
 UNTAGGED_RE='^[[:space:]]*#[[]serde[(]untagged[)][]]'
 PROTOCOL_RE='(MainToChild|ChildToMain)'
+
+# positional キーの検出 (不変条件 1)。 **連想コンテナのキーがタプル** という形だけを
+# 見る。 「(u32, u32) の並び」そのものを見るパターンは repo に 40 件当たり、その 8 割が
+# gui_get_size / texture_size / decode_image 等の **寸法タプル** で、型から区別できない。
+# 区別できないものを報告すると allow マーカーが散って検査が読まれなくなる
+# (= 守ろうとしているものを壊す)。
+# Vec / Option の生タプルは対象外 (寸法と区別不能)。 map/set のキーなら偽陽性ゼロ。
+# 折り返し (`HashMap<` で改行 → 次行が `(u32, u32),`) も拾うので awk。
+# バックスラッシュは使わない (make 経由で argv から落ちる、上の節)。
+POSKEY_AWK='
+FNR == 1 { prev = "" }
+{
+  if ($0 ~ /(HashMap|HashSet|BTreeMap|BTreeSet|IndexMap|IndexSet)[[:space:]]*<[[:space:]]*[(]u32,[[:space:]]*u32[,)]/)
+      print FILENAME ":" FNR ":" $0
+  else if (prev ~ /(HashMap|HashSet|BTreeMap|BTreeSet|IndexMap|IndexSet)[[:space:]]*<[[:space:]]*$/ && $0 ~ /^[[:space:]]*[(]u32,[[:space:]]*u32[,)]/)
+      print FILENAME ":" FNR ":" $0
+  prev = $0
+}'
 
 # 個別に正当化された箇所を落とす。**行内マーカー**にしているのは、除外の理由を
 # その場に書かせるため (パターン側で広く除外すると、次に同じ形が入っても気付けない)。
@@ -87,8 +104,16 @@ strip_allowed() { grep -v "arch-lint: allow-$1"; }
 canary_ok=1
 # (1) 肯定側 — 検査が実際に違反を捕まえること。絞り込みが「常に何も検出しない」へ
 #     退化したらここで落ちる。
-printf 'HashMap<(u32, u32), SlotInfo>\n' | grep -qE "$POSKEY_RE" || canary_ok=0
 printf 'WaitForSingleObject(h, INFINITE);\n' | grep -qE "$INFINITE_RE" || canary_ok=0
+# POSITIONAL-KEY: 1 行 / HashSet / 折り返した 3 つ組 のいずれも拾うこと。
+printf 'x: HashMap<(u32, u32), SlotInfo>,\n' | awk "$POSKEY_AWK" | grep -q . || canary_ok=0
+printf 'x: HashSet<(u32,u32)>,\n'            | awk "$POSKEY_AWK" | grep -q . || canary_ok=0
+printf 'p: std::collections::HashMap<\n    (u32, u32, u32),\n    f64,\n>,\n' \
+    | awk "$POSKEY_AWK" | grep -q . || canary_ok=0
+# 否定側 — 寸法タプルと (u64, u32) を拾わないこと (拾うと allow マーカーが散る)。
+printf 'fn size(&self) -> Option<(u32, u32)> {\n' | awk "$POSKEY_AWK" | grep -q . && canary_ok=0
+printf 'let v: Vec<(u32, u32)> = Vec::new();\n'   | awk "$POSKEY_AWK" | grep -q . && canary_ok=0
+printf 'x: HashMap<(u64, u32), f64>,\n'           | awk "$POSKEY_AWK" | grep -q . && canary_ok=0
 # UNTAGGED_RE は行頭 anchor 付き (doc comment の言及を数えないため) なので、
 # canary の入力も実際の属性行と同じ形にする。**パターンを共有した瞬間に、
 # 旧 canary が anchor 無しの別パターンを試していたことが露見した** — 検査対象と
@@ -101,7 +126,7 @@ printf '/// 旧 #[serde(untagged)] は撤去済み\n' | grep -qE "$UNTAGGED_RE" 
 printf 'WaitForSingleObject(h, INFINITE); // arch-lint: allow-infinite\n' \
     | grep -E "$INFINITE_RE" | strip_allowed infinite | grep -q . && canary_ok=0
 printf 'p: HashMap<(u32, u32), SizePool>, // arch-lint: allow-positional-key\n' \
-    | grep -E "$POSKEY_RE" | strip_allowed positional-key | grep -q . && canary_ok=0
+    | awk "$POSKEY_AWK" | strip_allowed positional-key | grep -q . && canary_ok=0
 if [ "$canary_ok" -ne 1 ]; then
     printf 'arch-lint: [SELF-BROKEN] 検査器の正規表現が効いていません。\n' >&2
     printf '  この環境の grep に既知のパターンが通りませんでした。違反ゼロの報告は信用できません。\n' >&2
@@ -471,10 +496,11 @@ hits=$(grep -rnE "$INFINITE_RE" \
 record RT-INFINITE grep "RT 境界に無限待ち。有界 dispatch + quarantine (DISPATCH_TIMEOUT_MS) が不変条件:" "$hits"
 
 # 2. positional pair キー (不変条件 1)。device/slot の bookkeeping は安定
-#    device_id (u64) 一本。 (track,index) tuple キーの map を作らない。
-hits=$(grep -rnE "$POSKEY_RE" $rs_dirs 2>/dev/null \
+#    device_id (u64) 一本。 (track,index) tuple キーの map/set を作らない。
+hits=$(find $rs_dirs -name '*.rs' -not -path '*/target/*' -print0 2>/dev/null \
+    | xargs -0 awk "$POSKEY_AWK" 2>/dev/null \
     | strip_allowed positional-key | strip_comments || true)
-record POSITIONAL-KEY grep "positional (u32,u32) キーの map。安定 id (device_id: u64 等) でキーする:" "$hits"
+record POSITIONAL-KEY grep "positional (u32,u32) キーの map/set。安定 id (device_id: u64 等) でキーする:" "$hits"
 
 # 3. 旧単一 protocol enum の復活 (不変条件 3)。
 hits=$(grep -rnwE "$PROTOCOL_RE" --include='*.rs' \

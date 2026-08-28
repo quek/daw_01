@@ -265,14 +265,18 @@ pub struct UiEphemeral {
     /// plugin picker の `is_plugin_picker_open` と同 idiom。
     pub send_picker: Option<SendPickerState>,
     /// 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
-    /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some((track_id, device_index))`
-    /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。cursor track 以外に切り替えたら閉じる。
-    pub open_video_fx_params: Option<(u32, u32)>,
+    /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some(device_id)`
+    /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。
+    ///
+    /// r.md #71 (プラグインのコピー / 移動): cursor track 以外の device を指して
+    /// いたら **閉じるのではなく描画側 gate が非表示にする**。 こうすると device を
+    /// 別トラックへ移してもパネルが自然に追従する。 `None` に落とすのは device が
+    /// song から消えたときだけ。
+    pub open_video_fx_params: Option<u64>,
     /// 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
-    /// CLAP・VST3) の「⚙」ボタンで開くインライン param パネル。 `open_video_fx_params`
-    /// と同 idiom: `Some((track_id, device_index))` で 1 つだけ、 cursor track 以外
-    /// では非表示、 device 削除で同トラックなら閉じる。
-    pub open_plugin_params: Option<(u32, u32)>,
+    /// CLAP・VST3) の「⚙」ボタンで開くインライン param パネル。
+    /// `open_video_fx_params` と同 idiom。
+    pub open_plugin_params: Option<u64>,
     /// スピナー回転位相の基準時刻 (construction で固定、単調増加)。
     pub anim_epoch: std::time::Instant,
     /// 現フレームの時刻。`render_frame` 冒頭で 1 度設定し、その frame の
@@ -281,6 +285,16 @@ pub struct UiEphemeral {
     /// 食い違わないようにする (= 警告へ切り替わる frame を確実に 1 枚描く)。
     pub frame_now: std::time::Instant,
     pub status_message: String,
+    /// r.md #71 (プラグインのコピー / 移動): view から **解決済みの shortcut 名** を
+    /// 次フレームへ注入する queue。 runner の frame loop が drain して
+    /// `UiHost::inject_shortcut` に流す。
+    ///
+    /// 右クリックメニューの「貼り付け」のように、 キー入力でないのに
+    /// 「Ctrl+V と完全に同じ経路」 を起こしたい場面のための seam。 view から
+    /// OS クリップボードを別途読むと paste の経路が 2 本になるので、
+    /// **shortcut レイヤという一段上の高さ**に注入する (r.md #36 の
+    /// `EditorKey` 転送と同じ idiom)。
+    pub pending_shortcut_injections: Vec<&'static str>,
 
     /// rename 中の track の **安定 ID** (positional index ではない)。 index で持つと
     /// track の reorder / delete で別 track に rename がすり替わる SSoT 違反になる

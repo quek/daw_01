@@ -479,7 +479,11 @@ impl AppData {
         // Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
         // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
         // ときだけ Group Transform セクションを出す。
-        let (open_track, open_idx) = self.ui_ephemeral.open_video_fx_params?;
+        let open_device = self.ui_ephemeral.open_video_fx_params?;
+        // r.md #71 (プラグインのコピー / 移動): パネルは device_id で開いたまま
+        // にして、 **描画側で** 「いま表示しているチェーンの device か」 を gate する
+        // (device を別トラックへ移してもパネルが自然に追従する)。
+        let (open_track, open_idx) = find_device_by_id(self.song_doc.song(), open_device)?;
         if self.cursor_track_id() != Some(open_track) {
             return None;
         }
@@ -506,7 +510,8 @@ impl AppData {
     /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
     /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
     pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
-        let (track_id, device_index) = self.ui_ephemeral.open_video_fx_params?;
+        let device_id = self.ui_ephemeral.open_video_fx_params?;
+        let (track_id, device_index) = find_device_by_id(self.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
@@ -527,9 +532,6 @@ impl AppData {
                     .track_by_id(track_id)
                     .map_or(empty, |t| t.automation_lanes.as_slice())
             };
-        // v29: lane target は安定 device_id。 panel の positional index から
-        // 解決する。
-        let device_id = device_id_at(self.song_doc.song(), track_id, device_index)?;
         let values: Vec<f32> = def
             .params
             .iter()
@@ -547,22 +549,22 @@ impl AppData {
                 p.kind.norm_to_real(norm)
             })
             .collect();
-        Some(VideoFxParamsInspector { track_id, device_index, def, values })
+        Some(VideoFxParamsInspector { track_id, device_id, def, values })
     }
 
     /// 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
     /// `PluginParam` lane の `default_value`（0..=1 norm、`video_fx` モジュール doc）。lane が
     /// 無ければ値保持用（`visible=false`・curve 無し）を作る。master は `song_lanes`。
-    pub(crate) fn set_video_fx_param(&mut self, device_index: u32, param_id: u32, value_real: f32) {
+    pub(crate) fn set_video_fx_param(&mut self, device_id: u64, param_id: u32, value_real: f32) {
         use common::model::{AutomationLane, AutomationTarget};
-        let Some(track_id) = self.cursor_track_id() else {
+        // lane の所有者 (track / master) は device_id から毎回引き直す
+        // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。
+        let song = self.song_doc.song();
+        let Some((track_id, device_index)) = find_device_by_id(song, device_id) else {
             return;
         };
         // def_by_id は &'static を返すので self.song_doc.song() の借用はここで終わる。
-        let Some(def) = self
-            .song_doc.song()
-            .fx_chain_by_track_id(track_id)
-            .and_then(|c| c.get(device_index as usize))
+        let Some(def) = device_at(song, track_id, device_index)
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
         else {
             return;
@@ -572,10 +574,6 @@ impl AppData {
         };
         let display_name = format!("{} {}", def.name, param.name);
         let norm = param.kind.real_to_norm(value_real);
-        // v29: 安定 device_id で target を組む。
-        let Some(device_id) = device_id_at(self.song_doc.song(), track_id, device_index) else {
-            return;
-        };
         let target = AutomationTarget::PluginParam {
             device_id,
             param_id,
@@ -620,14 +618,12 @@ impl AppData {
     /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
     pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
-        let (track_id, device_index) = self.ui_ephemeral.open_plugin_params?;
+        let device_id = self.ui_ephemeral.open_plugin_params?;
+        let (track_id, device_index) = find_device_by_id(self.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        let device = self
-            .song_doc.song()
-            .fx_chain_by_track_id(track_id)?
-            .get(device_index as usize)?;
+        let device = device_at(self.song_doc.song(), track_id, device_index)?;
         let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
@@ -641,11 +637,9 @@ impl AppData {
                     .track_by_id(track_id)
                     .map_or(empty, |t| t.automation_lanes.as_slice())
             };
-        // v29: lane target は安定 device_id で照合する。
-        let device_id = device.id;
         let params: Vec<PluginParamRow> = self
             .ipc.plugin_params
-            .get(&(track_id, device_index))
+            .get(&device_id)
             .map(|infos| {
                 infos
                     .iter()
@@ -694,7 +688,7 @@ impl AppData {
         }
         Some(PluginParamsInspector {
             track_id,
-            device_index,
+            device_id,
             plugin_name,
             params,
         })
@@ -703,14 +697,12 @@ impl AppData {
     /// 「Par」パネルが開いている device の plugin_id (cursor track 上)。
     /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
     pub(crate) fn open_param_panel_plugin_id(&self) -> Option<&str> {
-        let (track_id, idx) = self.ui_ephemeral.open_plugin_params?;
+        let device_id = self.ui_ephemeral.open_plugin_params?;
+        let (track_id, index) = find_device_by_id(self.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        self.song_doc.song()
-            .fx_chain_by_track_id(track_id)?
-            .get(idx as usize)
-            .map(|d| d.plugin_id.as_str())
+        device_at(self.song_doc.song(), track_id, index).map(|d| d.plugin_id.as_str())
     }
 
     /// VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
@@ -730,29 +722,20 @@ impl AppData {
     /// host が送った `PluginParamInfo` の min/max。 lane が無ければ値保持用
     /// (`visible=false`) を作る。 master は `song_lanes`。 音への反映 (host push) は
     /// scrub 終端で inspector が `flush_song_sync` を呼ぶ (RT 安全)。
-    pub(crate) fn set_plugin_param(&mut self, device_index: u32, param_id: u32, value_real: f64) {
-        let Some(track_id) = self.cursor_track_id() else {
+    /// r.md #71 (プラグインのコピー / 移動): 旧 `set_plugin_param_on_track` との
+    /// 2 本立てを 1 本に畳んだ。 両方が `device_id` を取った瞬間、 lane の
+    /// 所有者 (track / master) の解決が `find_device_by_id` に移り、 wrapper 側の
+    /// 存在理由 (cursor track の解決) が消えて中身まで同一になったため。
+    pub(crate) fn set_plugin_param(&mut self, device_id: u64, param_id: u32, value_real: f64) {
+        use common::model::{AutomationLane, AutomationTarget};
+        // device が消えていれば何もしない (削除済み device への stale binding /
+        // stale event は正常系なので tracing は出さない)。
+        let Some((track_id, _)) = find_device_by_id(self.song_doc.song(), device_id) else {
             return;
         };
-        self.set_plugin_param_on_track(track_id, device_index, param_id, value_real);
-    }
-
-    /// `set_plugin_param` の track 明示版 (B2 / r.md #8): inspector knob は
-    /// cursor track、 MIDI Learn binding は binding の `track` を渡す。 plugin
-    /// param の値を lane `default_value` に書き (= host が daw_audio 経由で読む
-    /// SSoT)、 `last_touched_param` を更新する。 host への push は caller 責務
-    /// (drag 終端 / CC 受信ごとに `flush_song_sync`)。
-    pub(crate) fn set_plugin_param_on_track(
-        &mut self,
-        track_id: u32,
-        device_index: u32,
-        param_id: u32,
-        value_real: f64,
-    ) {
-        use common::model::{AutomationLane, AutomationTarget};
         let Some(info) = self
             .ipc.plugin_params
-            .get(&(track_id, device_index))
+            .get(&device_id)
             .and_then(|v| v.iter().find(|p| p.id == param_id))
             .cloned()
         else {
@@ -763,10 +746,6 @@ impl AppData {
             0.0
         } else {
             ((value_real - info.min_value) / span).clamp(0.0, 1.0)
-        };
-        // v29: 安定 device_id で target を組む。
-        let Some(device_id) = device_id_at(self.song_doc.song(), track_id, device_index) else {
-            return;
         };
         let target = AutomationTarget::PluginParam {
             device_id,
@@ -990,7 +969,7 @@ impl AppData {
             ChildKind::PluginHost => {
                 self.ipc.plugin_tx = None;
                 self.ipc.pending_plugin_loads.clear();
-                self.ipc.loaded_slots.clear();
+                self.ipc.loaded_devices.clear();
                 // host が消えた時点で **全** device が未ロードなので、「一部だけ
                 // 未ロード」を示す失敗 entry は誤情報になる (respawn すれば
                 // restore_plugin_from_song が全 device を load し直し、crash-loop で
