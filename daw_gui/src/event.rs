@@ -784,8 +784,10 @@ pub enum AppEvent {
     /// load_overlay に「プラグイン走査中 done/total」を出す。
     RescanProgress { done: usize, total: usize },
 
-    /// 単一デバイスチェーン: `device_index` でアドレスする (役割別 slot 区分撤廃)。
-    ToggleSlotGui { index: u32 },
+    /// r.md #71 (プラグインのコピー / 移動): device を運ぶイベントは **すべて
+    /// 安定 `device_id`** でアドレスする。 positional index だと、 イベント発行と
+    /// 消費の間にチェーンが変わりうる (移動 / 削除) 場面で別 device に効く。
+    ToggleSlotGui { device_id: u64 },
     /// r.md #55: 開いているプラグインエディタ窓を全部閉じる
     /// (`Ctrl+Shift+W` / View メニュー)。どれが開いているかを知っているのは
     /// 窓の所有者である plugin_host なので、daw_gui は broadcast を 1 通投げるだけ。
@@ -793,28 +795,37 @@ pub enum AppEvent {
     CloseAllPluginEditors,
     /// 内蔵映像 FX の param 調整パネルから 1 param を編集。
     /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
-    SetVideoFxParam { device_index: u32, param_id: u32, value_real: f32 },
+    SetVideoFxParam { device_id: u64, param_id: u32, value_real: f32 },
     /// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルで
     /// param を 1 つ編集。 `value_real` は表示の実レンジ値 → host が送った
     /// `PluginParamInfo` の min/max で lane `default_value` (0..=1) へ逆写像。
     /// scrubable の per-frame 発火なので **非 undoable** (`BeginInspectorScrub`
     /// で 1 undo step に bracket)。
-    SetPluginParam { device_index: u32, param_id: u32, value_real: f64 },
-    /// inspector の x ボタン: 指定 `device_index` の device を chain から削除。
-    RemoveDevice { index: u32 },
+    SetPluginParam { device_id: u64, param_id: u32, value_real: f64 },
+    /// inspector の x ボタン / Delete / 右クリックメニュー: 選んだ device を
+    /// chain から削除する。 複数選択を **1 件にまとめて** 運ぶ (id ごとに送ると
+    /// undo が N ステップに割れる)。
+    RemoveDevices { device_ids: Vec<u64> },
+    /// r.md #71 (プラグインのコピー / 移動): 選んだ device を別のチェーンへ運ぶ。
+    /// 既定は移動 (instance を作り直さない = 音が切れない)、 `copy` で複製。
+    RelocateDevices(crate::app_types::RelocateDevices),
+    /// r.md #71: インスペクタのチェーン行を選択する (無修飾 / Ctrl / Shift)。
+    SelectDevice {
+        device_id: u64,
+        modifier: crate::widgets::select_modifier::SelectModifier,
+    },
     /// inspector 「読み込み失敗」 セクションの「再読込」 ボタン: ロードに
     /// 失敗した device を、 保存済み state 込みで plugin_host に load し直す。
     /// 自動リトライはしない (恒常的失敗で無限ループになる) ので、 再試行の
     /// トリガーは常にこのユーザー操作。 Song は変えない (= 非 undoable)。
-    ReloadDevice { track_id: u32, device_index: u32 },
+    ReloadDevice { device_id: u64 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
-    /// aux input port. `track_id` + `device_index` identifies the plugin
-    /// instance; `port` selects the aux input port on that plugin
+    /// aux input port. `device_id` identifies the plugin instance;
+    /// `port` selects the aux input port on that plugin
     /// (0 = first sidechain bus); `source` is `Some(track_id)` to wire
     /// from a track, or `None` to disconnect.
     SetSidechainSource {
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
         port: u8,
         source: Option<u32>,
     },
@@ -822,26 +833,23 @@ pub enum AppEvent {
     /// 「Send all keyboard input to plug-in」)。 消化の有無を外に出さない自前描画 GUI
     /// (Dear ImGui / GLFW 系) 用の逃げ道。 値は project に保存される。
     SetPluginSendAllKeys {
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
         enabled: bool,
     },
     /// パラアウト (docs/plan_paraout.md): one-click "explode" — auto-create a
-    /// child track per `is_main=false` output port of the plugin at
-    /// `(track_id, device_index)`, group them under the source track, and wire
+    /// child track per `is_main=false` output port of the plugin `device_id`,
+    /// group them under the source track, and wire
     /// each aux output to its new child. The source track becomes a
     /// group-with-instrument bus (its own main + the children sum through its
     /// FX/fader). Idempotent: ports already routed to a live track are kept.
     ExplodeParallelOut {
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
     },
     /// パラアウト: route a single aux output port to a destination track (or
     /// `None` = unrouted = silent). Used by the inspector's per-port dropdown
     /// for re-adjustment after (or instead of) explode.
     SetParallelOutputRoute {
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
         port: u8,
         dest: Option<u32>,
     },
@@ -902,8 +910,7 @@ pub enum AppEvent {
     SetArmedModSource(Option<u32>),
     /// flip an aux-input route's tap point (sidechain plugin input).
     SetAuxInputTapPoint {
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
         port: u8,
         tap_point: common::model::TapPoint,
     },
@@ -1757,7 +1764,14 @@ impl AppEvent {
 
             // ---- デバイス / プラグイン ----
             E::SelectPluginFromDb { .. } => "プラグイン追加",
-            E::RemoveDevice { .. } => "デバイス削除",
+            E::RemoveDevices { .. } => "デバイス削除",
+            E::RelocateDevices(req) => {
+                if req.copy {
+                    "デバイスコピー"
+                } else {
+                    "デバイス移動"
+                }
+            }
             E::ReorderInspectorChain(..) => "チェーン並べ替え",
             E::SetVideoFxParam { .. } => "映像FX変更",
             E::SetPluginParam { .. } => "プラグインパラメータ変更",

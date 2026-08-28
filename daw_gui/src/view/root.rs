@@ -200,6 +200,29 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // modal / overlay より前面で、下の操作を全部塞ぐ。
     // (バージョン情報を開いたまま終了しても、終了オーバーレイが手前に来る。)
     shutdown_overlay::draw(app, ui, screen);
+
+    // r.md #71 (プラグインのコピー / 移動): 運んでいる最中に「何を掴んでいるか」を
+    // 見せる。view の最後に描くので常に最前面。運搬そのものは daw-ui の drag payload が
+    // 持っているので、ここは表示だけ (状態を持たない)。
+    draw_device_drag_preview(app, ui);
+}
+
+/// 運搬中の device ラベル (D-6)。 波形やクリップ色の上に出るので、 背景に依存しない
+/// 暗いチップ + 明るい文字でコントラストを保証する
+/// (`[[feedback_ui_indicator_contrast_on_variable_bg]]`)。
+fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
+    let Some(p) = ui.drag_payload::<crate::app::DeviceDragPayload>(crate::app::DEVICE_DRAG_KIND)
+    else {
+        return;
+    };
+    let Some((px, py)) = ui.pointer().pos else {
+        return;
+    };
+    let label = format!("プラグイン {}", p.device_ids.len());
+    let core = &app.theme.core;
+    let chip = Rect { x: px + 12.0, y: py + 12.0, w: 120.0, h: 22.0 };
+    ui.panel_with_border("device_drag_chip", chip, core.panel_raised, core.accent, 1.0, 3.0);
+    ui.label_at("device_drag_label", &label, chip.x + 8.0, chip.y + 5.0, 11.0, core.text);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
@@ -449,7 +472,10 @@ fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edi
         EditSurface::AutomationClips => app
             .copy_automation_clips_clip()
             .map(|(j, c)| (j, c, "オートメーションクリップ")),
-        EditSurface::Tracks | EditSurface::Sections => None,
+        // r.md #71 (プラグインのコピー / 移動): device の copy は **最新 plugin state が
+        // 要るので非同期** (トラック copy と同じ round-trip 待ち)。 ここでは `None` に
+        // 落とし、実処理は下の `matches!` ブロックが `&mut AppData` 越しに呼ぶ。
+        EditSurface::Tracks | EditSurface::Sections | EditSurface::Devices => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -463,6 +489,12 @@ fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edi
         let ids = app.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.copy_tracks(ids);
+        }));
+    }
+    if matches!(surface, EditSurface::Devices) {
+        let ids = app.live_device_ids();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.copy_devices(ids);
         }));
     }
 }
@@ -484,7 +516,10 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
         EditSurface::AutomationClips => app
             .copy_automation_clips_clip()
             .map(|(j, c)| (j, c, "オートメーションクリップ")),
-        EditSurface::Tracks | EditSurface::Sections => None,
+        // r.md #71 (プラグインのコピー / 移動): device の copy は **最新 plugin state が
+        // 要るので非同期** (トラック copy と同じ round-trip 待ち)。 ここでは `None` に
+        // 落とし、実処理は下の `matches!` ブロックが `&mut AppData` 越しに呼ぶ。
+        EditSurface::Tracks | EditSurface::Sections | EditSurface::Devices => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -511,6 +546,14 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
         let ids = app.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.cut_tracks(ids);
+        }));
+    }
+    // r.md #71: device の cut は clipboard 書き込みと削除を `cut_devices` が
+    // 1 undo step にまとめる (上の `del` match には足さない)。
+    if matches!(surface, EditSurface::Devices) {
+        let ids = app.live_device_ids();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.cut_devices(ids);
         }));
     }
 }
@@ -629,7 +672,56 @@ fn paste_from_clipboard(
             }
             paste_noop(ui);
         }
+        P::Devices(devices) => {
+            // r.md #71 (プラグインのコピー / 移動): 貼り先は「いまインスペクタに
+            // 出ているチェーン」。 挿入位置は **選んでいるプラグインの直前**、
+            // 選択が無ければ末尾 (Ableton 流)。
+            if let Some(dest_track) = app.cursor_track_id() {
+                let devices = crate::clipboard::sanitize_devices(devices);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_devices(devices, dest_track);
+                    if n > 0 {
+                        app.ui_ephemeral.status_message = format!("貼り付け: {n} プラグイン");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
     }
+}
+
+/// r.md #71 (プラグインのコピー / 移動): 選択中の device を **各 device の直後**に
+/// 複製する (D / Alt+D / 右クリックメニューの「複製」)。
+///
+/// リンク / 独立の区別は device には無い (プラグインインスタンスは共有できない) ので、
+/// D と Alt+D はどちらもここへ来る。
+fn duplicate_devices(app: &AppData, ui: &mut Ui<'_, AppData>) {
+    let ids = app.live_device_ids();
+    if ids.is_empty() {
+        return;
+    }
+    let Some(dest_track) = app.cursor_track_id() else {
+        return;
+    };
+    // 挿入位置 = 選択の末尾 device の直後 (選択ブロック全体の後ろに並べる)。
+    let Some(dest_index) = app
+        .song_doc
+        .song()
+        .fx_chain_by_track_id(dest_track)
+        .and_then(|c| c.iter().rposition(|d| ids.contains(&d.id)))
+        .map(|i| i as u32 + 1)
+    else {
+        return;
+    };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
+            device_ids: ids,
+            dest_track,
+            dest_index,
+            copy: true,
+        }));
+    }));
 }
 
 fn paste_noop(ui: &mut Ui<'_, AppData>) {
@@ -1193,7 +1285,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.duplicate_clip_shared") {
         // 対象面は copy/cut/delete と同じ last-wins (`edit_surface`)。トラック面なら
         // トラックをリンク複製 (D = 共有、 クリップ複製と同規約)。 それ以外は従来通り。
-        if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Tracks)) {
+        if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Devices)) {
+            duplicate_devices(app, ui);
+        } else if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Tracks)) {
             let ids = app.selection.selected_track_ids.clone();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::DuplicateTracksShared(ids));
@@ -1221,8 +1315,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
     if ui.take_shortcut("daw.duplicate_clip_unique") {
-        // トラック面なら Alt+D = トラックを独立複製 (クリップ複製と同規約)。
-        if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Tracks)) {
+        // r.md #71 (プラグインのコピー / 移動): **リンク / 独立の区別は device に無い**
+        // (プラグインインスタンスは共有できない) ので、D と Alt+D は同じ動作。
+        if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Devices)) {
+            duplicate_devices(app, ui);
+        } else if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Tracks)) {
             let ids = app.selection.selected_track_ids.clone();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::DuplicateTracksUnique(ids));

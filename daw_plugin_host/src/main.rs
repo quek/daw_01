@@ -110,8 +110,6 @@ struct InstanceRecord {
     plugin: Box<dyn LoadedPlugin>,
     /// Editor container window (open 中のみ Some)。`plugin` の後に drop。
     editor: Option<editor_window::EditorWindow>,
-    /// 所属 track (`RemoveTrack` の帰属情報。アドレスには使わない)。
-    track_id: u32,
     /// GUI が要求した plugin id 文字列 (dedup キー — picker double-fire /
     /// 同プロジェクト 2 度目 LoadSong の再 emit 判定)。
     requested_id: String,
@@ -990,7 +988,6 @@ impl PluginHost {
             PluginCommand::ReinitAllPlugins => self.reinit_all_plugins(),
             PluginCommand::SetSlotPlugin {
                 device_id,
-                track_id,
                 format,
                 path,
                 plugin_id,
@@ -999,7 +996,6 @@ impl PluginHost {
             } => {
                 self.set_slot_plugin(
                     device_id,
-                    track_id,
                     format,
                     &path,
                     &plugin_id,
@@ -1009,18 +1005,6 @@ impl PluginHost {
             }
             PluginCommand::RemoveSlotPlugin { device_id } => {
                 self.teardown_device(device_id, true);
-            }
-            PluginCommand::RemoveTrack { track_id } => {
-                // `track_id` は stable な `Track::id`。属する device を全列挙
-                // して個別 teardown (順序は不定でよい — chain 順序概念なし)。
-                let ids: Vec<u64> = self
-                    .instances
-                    .iter()
-                    .filter_map(|(&id, rec)| (rec.track_id == track_id).then_some(id))
-                    .collect();
-                for id in ids {
-                    self.teardown_device(id, true);
-                }
             }
             // (r.md #61) 終了要求は `pipe_loop` が read ループを抜けるために
             // 消費するので、ここへは届かない。届いたら配線が壊れているので
@@ -1207,7 +1191,6 @@ impl PluginHost {
     fn set_slot_plugin(
         &mut self,
         device_id: u64,
-        track_id: u32,
         format: PluginFormat,
         path: &std::path::Path,
         plugin_id: &str,
@@ -1221,11 +1204,6 @@ impl PluginHost {
         if let Some(rec) = self.instances.get_mut(&device_id)
             && rec.requested_id == plugin_id
         {
-            // 帰属 track を必ず最新にする。ここを更新しないと、track を跨いで
-            // 同 device_id が再利用されたとき `RemoveTrack` の列挙
-            // (`rec.track_id == track_id`) から外れ、instance が永久に
-            // 回収されなくなる。
-            rec.track_id = track_id;
             tracing::info!(
                 device_id,
                 id = %plugin_id,
@@ -1364,7 +1342,6 @@ impl PluginHost {
             InstanceRecord {
                 plugin,
                 editor: None,
-                track_id,
                 requested_id: plugin_id.to_string(),
                 loaded_id: loaded_id.clone(),
                 name: loaded_name.clone(),
@@ -2341,7 +2318,6 @@ fn log_command(cmd: &PluginCommand) {
     match cmd {
         PluginCommand::SetSlotPlugin {
             device_id,
-            track_id,
             format,
             path,
             plugin_id,
@@ -2350,7 +2326,6 @@ fn log_command(cmd: &PluginCommand) {
         } => {
             tracing::info!(
                 device_id,
-                track_id,
                 ?format,
                 path = %path.display(),
                 id = %plugin_id,

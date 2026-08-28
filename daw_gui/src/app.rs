@@ -90,8 +90,8 @@ pub use crate::event::{
 };
 
 pub use crate::state::{
-    AppData, EditScope, IpcState, MediaState, RecordingState, SelectionState, SongDoc,
-    StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
+    AppData, DeviceParamKey, EditScope, IpcState, MediaState, RecordingState, SelectionState,
+    SongDoc, StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
 };
 
 
@@ -203,6 +203,7 @@ impl AppData {
                 selected_clips: Vec::new(),
                 selected_notes: Vec::new(),
                 audio_editor_selected_events: Vec::new(),
+                selected_device_ids: Vec::new(),
                 clip_anchor: None,
                 note_anchor: None,
                 track_anchor: None,
@@ -210,6 +211,7 @@ impl AppData {
                 automation_point_anchor: None,
                 automation_clip_anchor: None,
                 audio_editor_anchor: None,
+                device_anchor: None,
             },
             ipc: IpcState {
                 sample_rate,
@@ -218,8 +220,7 @@ impl AppData {
                 plugin_param_values: std::collections::HashMap::new(),
                 plugin_params: std::collections::HashMap::new(),
                 slot_has_gui: std::collections::HashMap::new(),
-                track_plugin_ids: std::collections::HashMap::new(),
-                loaded_slots: std::collections::HashMap::new(),
+                loaded_devices: std::collections::HashMap::new(),
                 metrics: common::metrics_bridge::ResourceMetrics::default(),
                 metrics_bridge: None,
                 plugin_db,
@@ -409,6 +410,7 @@ impl AppData {
                 anim_epoch: std::time::Instant::now(),
                 frame_now: std::time::Instant::now(),
                 status_message: String::new(),
+                pending_shortcut_injections: Vec::new(),
                 track_rename_id: None,
                 color_picker_target: None,
                 color_picker_anchor: None,
@@ -1414,8 +1416,8 @@ impl AppData {
             AppEvent::SelectPluginFromDb { id, keep_open, open_gui } => {
                 self.select_plugin_from_db(id, keep_open, open_gui);
             }
-            AppEvent::ToggleSlotGui { index } => {
-                self.toggle_slot_gui(index);
+            AppEvent::ToggleSlotGui { device_id } => {
+                self.toggle_slot_gui(device_id);
             }
             // r.md #55: 閉じた 1 枚ごとに `SlotGuiClosed` が返ってくるので、
             // `ipc.open_plugin_guis` の掃除は ✕ を押したときと同じ経路 (on_gui_closed)
@@ -1423,49 +1425,43 @@ impl AppData {
             AppEvent::CloseAllPluginEditors => {
                 self.send_plugin(PluginCommand::CloseAllSlotGuis);
             }
-            AppEvent::SetVideoFxParam { device_index, param_id, value_real } => {
-                self.set_video_fx_param(device_index, param_id, value_real);
+            AppEvent::SetVideoFxParam { device_id, param_id, value_real } => {
+                self.set_video_fx_param(device_id, param_id, value_real);
             }
-            AppEvent::SetPluginParam { device_index, param_id, value_real } => {
-                self.set_plugin_param(device_index, param_id, value_real);
+            AppEvent::SetPluginParam { device_id, param_id, value_real } => {
+                self.set_plugin_param(device_id, param_id, value_real);
             }
-            AppEvent::RemoveDevice { index } => {
-                self.remove_device(index);
+            AppEvent::RemoveDevices { device_ids } => {
+                self.remove_devices(device_ids);
             }
-            AppEvent::ReloadDevice {
-                track_id,
-                device_index,
-            } => {
-                self.reload_device(track_id, device_index);
+            AppEvent::RelocateDevices(req) => {
+                self.relocate_devices(req);
             }
-            AppEvent::ExplodeParallelOut {
-                track_id,
-                device_index,
-            } => {
-                self.explode_parallel_out(track_id, device_index);
+            AppEvent::SelectDevice { device_id, modifier } => {
+                self.apply_select_device(device_id, modifier);
+            }
+            AppEvent::ReloadDevice { device_id } => {
+                self.reload_device(device_id);
+            }
+            AppEvent::ExplodeParallelOut { device_id } => {
+                self.explode_parallel_out(device_id);
             }
             AppEvent::SetParallelOutputRoute {
-                track_id,
-                device_index,
+                device_id,
                 port,
                 dest,
             } => {
-                self.set_parallel_output_route(track_id, device_index, port, dest);
+                self.set_parallel_output_route(device_id, port, dest);
             }
             AppEvent::SetSidechainSource {
-                track_id,
-                device_index,
+                device_id,
                 port,
                 source,
             } => {
-                self.set_sidechain_source(track_id, device_index, port, source);
+                self.set_sidechain_source(device_id, port, source);
             }
-            AppEvent::SetPluginSendAllKeys {
-                track_id,
-                device_index,
-                enabled,
-            } => {
-                self.set_plugin_send_all_keys(track_id, device_index, enabled);
+            AppEvent::SetPluginSendAllKeys { device_id, enabled } => {
+                self.set_plugin_send_all_keys(device_id, enabled);
             }
             AppEvent::AddModSource { kind } => self.add_mod_source(kind),
             AppEvent::EditModSource { id, edit } => self.edit_mod_source(id, edit),
@@ -1507,11 +1503,10 @@ impl AppData {
             }
             AppEvent::SetArmedModSource(id) => self.ui_ephemeral.armed_mod_source = id,
             AppEvent::SetAuxInputTapPoint {
-                track_id,
-                device_index,
+                device_id,
                 port,
                 tap_point,
-            } => self.set_aux_input_tap_point(track_id, device_index, port, tap_point),
+            } => self.set_aux_input_tap_point(device_id, port, tap_point),
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
             }

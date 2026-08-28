@@ -199,7 +199,12 @@ pub use track::*;
 /// として保存する。従来は GUI のセッション状態にしか無く、**保存しても開き直すと
 /// 0dB に戻っていた**。v32 以前の `.daw` は `serde(default)` の `1.0` (unity) で
 /// 読めるので、旧ファイルの聞こえ方は変わらない。
-pub const CURRENT_VERSION: u32 = 33;
+/// Bumped to `34` (r.md #71 プラグインのコピー / 移動): `BindingTarget::PluginParam`
+/// の `track` を deserialize 専用 (`legacy_track`) に落とす。 device を別トラックへ
+/// 移せるようになったので、所属 track を保存すると stale になる (実行時の解決は
+/// `device_id` からの逆引き 1 本)。v33 以前の `.daw` は `track` を読んで
+/// `legacy_device_index` の解決にだけ使う。
+pub const CURRENT_VERSION: u32 = 34;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -760,14 +765,12 @@ pub enum BindingTarget {
     /// curve とは独立 (= curve がある場合は curve が優先、 CC は base bpm を
     /// 動かすイメージ)。
     SongTempo,
-    /// plugin parameter bind (r.md #8 B2)。 `track` + `device_index` で
-    /// linear device chain 上の plugin instance を特定 (`AutomationTarget::
-    /// PluginParam` と同じ addressing)、 `param_id` は format ごと
-    /// (CLAP `clap_id` / VST3 `ParamID`)。 CC 受信時は `apply_midi_value_to_target`
-    /// が param range で value_real に変換し、 inspector knob と同じ lane-default
-    /// 経路で plugin host へ反映する。
+    /// plugin parameter bind (r.md #8 B2)。 安定 `device_id` で plugin instance を
+    /// 特定 (`AutomationTarget::PluginParam` と同じ addressing)、 `param_id` は
+    /// format ごと (CLAP `clap_id` / VST3 `ParamID`)。 CC 受信時は
+    /// `apply_midi_value_to_target` が param range で value_real に変換し、
+    /// inspector knob と同じ lane-default 経路で plugin host へ反映する。
     PluginParam {
-        track: u32,
         /// v29: 安定 device id (`PluginInstance::id`)。`0` は未解決 sentinel。
         #[serde(default)]
         device_id: u64,
@@ -779,6 +782,12 @@ pub enum BindingTarget {
         /// 落としていたのを是正) を持つ。`Song::ensure_ids` の remap pass が安定 device_id へ写像。
         #[serde(default, rename = "device_index", skip_serializing)]
         legacy_device_index: Option<u32>,
+        /// v33 以前 migration 用 (deserialize 専用)。`legacy_device_index` を解決する
+        /// ための所属 track。実行時の解決は `find_device_by_id` なので読まれない
+        /// (r.md #71 (プラグインのコピー / 移動): device 移動で stale になる
+        /// フィールドを保存しない)。
+        #[serde(default, rename = "track", skip_serializing)]
+        legacy_track: Option<u32>,
     },
 }
 
@@ -1843,26 +1852,36 @@ impl Song {
 
         // v29: device 安定 id (`PluginInstance::id`) を採番する。 track devices
         // と master_fx_chain が Song-global の `next_device_id` を共有。
-        // sentinel (0) のみ上書き、 既存非 0 id は counter を bump するだけ
-        // (他 allocator と同 idiom)。
+        // sentinel (0) と **重複 id** を上書きし、 それ以外は counter を bump する
+        // だけ (他 allocator と同 idiom)。
         {
-            fn alloc_dev(p: &mut PluginInstance, next: &mut u64) {
-                if p.id == 0 {
+            fn alloc_dev(
+                p: &mut PluginInstance,
+                next: &mut u64,
+                seen: &mut std::collections::HashSet<u64>,
+            ) {
+                // 0 (未採番) と **既出 id** は必ず新採番する。 r.md #71
+                // (プラグインのコピー / 移動): 重複を放置すると plugin host の
+                // dedup (同 device_id + 同 plugin_id) が 2 device を 1 instance へ
+                // silent に merge する (音は出るので気付けない)。
+                if p.id == 0 || !seen.insert(p.id) {
                     let new_id = (*next).max(1);
                     *next = new_id + 1;
                     p.id = new_id;
+                    seen.insert(p.id);
                 } else if p.id >= *next {
                     *next = p.id + 1;
                 }
             }
             let mut next = self.ids.next_device_id;
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             for track in &mut self.tracks {
                 for p in track.devices.iter_mut() {
-                    alloc_dev(p, &mut next);
+                    alloc_dev(p, &mut next, &mut seen);
                 }
             }
             for p in self.master_fx_chain.iter_mut() {
-                alloc_dev(p, &mut next);
+                alloc_dev(p, &mut next, &mut seen);
             }
             self.ids.next_device_id = next.max(1);
         }
@@ -1910,17 +1929,22 @@ impl Song {
                 .collect();
             for binding in &mut self.midi_bindings {
                 if let BindingTarget::PluginParam {
-                    track,
                     device_id,
                     legacy_device_index,
+                    legacy_track,
                     ..
                 } = &mut binding.target
-                    && let Some(idx) = legacy_device_index.take()
-                    && *device_id == 0
-                    && let Some(ids) = track_devs.get(track)
-                    && let Some(&id) = ids.get(idx as usize)
                 {
-                    *device_id = id;
+                    // v33 以前の positional 参照は **必ず** 消費する (どちらも
+                    // deserialize 専用。 解決に使えなかった残りかすを持ち回らない)。
+                    let legacy = legacy_device_index.take().zip(legacy_track.take());
+                    if *device_id == 0
+                        && let Some((idx, track)) = legacy
+                        && let Some(ids) = track_devs.get(&track)
+                        && let Some(&id) = ids.get(idx as usize)
+                    {
+                        *device_id = id;
+                    }
                 }
             }
         }

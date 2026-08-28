@@ -283,17 +283,19 @@ impl AppData {
         self.request_bounce(target, BounceMode::InPlace);
     }
 
-    /// track の builtin VOICEVOX device の安定 device id を `loaded_slots`
-    /// から引く (`sync_vocal_metadata` と同じ解決)。device 未挿入 / load 未確定
-    /// (load 完了通知前) なら `None`。
+    /// track の builtin VOICEVOX device の安定 device id を返す
+    /// (`sync_vocal_metadata` と同じ解決)。device 未挿入 / load 未確定
+    /// (load 完了通知前 = `loaded_devices` に居ない) なら `None`。
     pub(crate) fn vocal_builtin_plugin_id(&self, track: &common::model::Track) -> Option<u64> {
-        let device_index = track.devices.iter().position(|d| {
-            d.format == common::plugin_format::PluginFormat::Builtin
-                && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-        })?;
-        self.ipc.loaded_slots
-            .get(&(track.id, device_index as u32))
-            .map(|s| s.device_id)
+        track
+            .devices
+            .iter()
+            .find(|d| {
+                d.format == common::plugin_format::PluginFormat::Builtin
+                    && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+            })
+            .map(|d| d.id)
+            .filter(|id| self.ipc.loaded_devices.contains_key(id))
     }
 
     /// bounce の入口。歌唱トラックは合成が非同期 HTTP で走り、 offline render が

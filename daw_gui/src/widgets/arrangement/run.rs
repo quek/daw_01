@@ -2469,6 +2469,17 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             clicked_track_for_select = None;
         }
 
+        // r.md #71 (プラグインのコピー / 移動): 外部 drag (device の運搬) を落とした
+        // frame は、 この release を「ヘッダの click」 として扱わない。 扱うと
+        // Ctrl+drop が Toggle 選択として解決され、 落とし先トラックの選択が反転する /
+        // last-wins タグが Tracks に倒れて次の Delete がトラックを消しに行く。
+        // drag の commit 自体は caller (arrangement_view) がこの後で行う。
+        // `dragging_kind()` は daw-ui core の汎用 API (札の中身を知らない) なので、
+        // 不変条件 8 (core にドメイン知識を持ち込まない) にも触れない。
+        if ui.dragging_kind().is_some() {
+            clicked_track_for_select = None;
+        }
+
         // M14 Phase 63c (#016): clicked_track があれば modifier-aware なトラック選択を
         // 1 度だけ発行する。 Single → next = [tid]、 anchor 更新。 RangeFromAnchor (Shift)
         // → anchor から visible 列の連続範囲 (anchor が None なら Single 同等)。

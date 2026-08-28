@@ -3,7 +3,7 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use common::model::{InstrumentSource, Track};
+use common::model::InstrumentSource;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotState};
 
@@ -33,16 +33,12 @@ impl AppData {
     pub(crate) fn on_gui_closed(&mut self, device_id: u64) {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
-        let slot = find_device_by_id(self.song_doc.song(), device_id);
-        if let Some((track, index)) = slot {
-            self.ipc.open_plugin_guis.remove(&(track, index));
-        }
+        self.ipc.open_plugin_guis.remove(&device_id);
         // r.md #65: エディタの open / close は **2 プロセスに跨って往復する**ので、
         // 片側のログだけでは「誰が閉じて誰が開き直したか」が決まらない。
         // 頻度は人の操作と同じなので info で常設する。
         tracing::info!(
             device_id,
-            slot = ?slot,
             still_open = self.ipc.open_plugin_guis.len(),
             "plugin editor closed (SlotGuiClosed from plugin-host)"
         );
@@ -113,18 +109,12 @@ impl AppData {
             tracing::error!(track = track_id, index, %id, %reason, "state_load failed (notified by plugin host)");
             self.ui_ephemeral.status_message = msg;
         }
-        // device_id を track_plugin_ids に登録 (delete / ungroup 時の
-        // ClosePluginShmem 先送りに使用、 use-after-free deadlock 防止)。
-        let entry = self.ipc.track_plugin_ids.entry(track_id).or_default();
-        if !entry.contains(&device_id) {
-            entry.push(device_id);
-        }
-        // device index 単位での load 状態 cache。 reconcile の device-level diff
-        // (Undo で同 track 内の plugin 構成が変化した場合の同期) で参照。
-        self.ipc.loaded_slots.insert(
-            (track_id, index),
-            LoadedSlotInfo {
-                device_id,
+        // device 単位での load 状態 cache。 reconcile の device-level diff
+        // (Undo で plugin 構成が変化した場合の同期) と、 track 削除前の
+        // `ClosePluginShmem` の対象確認 (use-after-free deadlock 防止) に使う。
+        self.ipc.loaded_devices.insert(
+            device_id,
+            LoadedDeviceInfo {
                 plugin_id_str: id.clone(),
             },
         );
@@ -270,10 +260,10 @@ impl AppData {
         // 無い Shift 追加 (open_gui=false) でも runner の frame flush が同 frame 末に
         // LoadSong する (旧: ここで明示 sync_song_to_plugin_host していた review 修正を
         // sync 一本化で epoch flush に移譲)。 pending_added_plugin_finalize は消費する。
-        if let Some(open_gui) = self.ipc.pending_added_plugin_finalize.remove(&(track_id, index))
+        if let Some(open_gui) = self.ipc.pending_added_plugin_finalize.remove(&device_id)
             && open_gui
         {
-            self.ipc.gui_open_requests.push((track_id, index));
+            self.ipc.gui_open_requests.push(device_id);
         }
 
         // A7: this load is done. If Play was queued waiting for the
@@ -290,7 +280,7 @@ impl AppData {
         }
 
         // PR-V3: builtin VOICEVOX が load されたら、 直後に歌詞 metadata を
-        // flush して背景 synth を trigger する。 plugin_id が `loaded_slots`
+        // flush して背景 synth を trigger する。 device が `loaded_devices`
         // に登録された後でないと sync_vocal_metadata が skip するため、 ここで
         // 明示呼び出し。 単一デバイスチェーン化で「instrument slot」 という
         // 区分は無いので、 全 device load 後に呼ぶ (sync_vocal_metadata 内で
@@ -349,9 +339,7 @@ impl AppData {
         self.ipc.failed_plugin_loads.insert(device_id, reason.clone());
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
-        if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
-            self.ipc.pending_added_plugin_finalize.remove(&(track, index));
-        }
+        self.ipc.pending_added_plugin_finalize.remove(&device_id);
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
         // と対称)。 失敗で空になったタイミングで queue Play を flush する。
         if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
@@ -384,8 +372,12 @@ impl AppData {
     ///
     /// 保存済み state (`PluginInstance.state`) 込みで送るので、 一時的な
     /// 失敗 (shmem 名衝突など) から復帰したときは音色も復元される。
-    pub(crate) fn reload_device(&mut self, track_id: u32, device_index: u32) {
-        let Some(inst) = device_at(self.song_doc.song(), track_id, device_index).cloned() else {
+    pub(crate) fn reload_device(&mut self, device_id: u64) {
+        let song = self.song_doc.song();
+        let Some(inst) = find_device_by_id(song, device_id)
+            .and_then(|(track_id, index)| device_at(song, track_id, index))
+            .cloned()
+        else {
             return;
         };
         // 内蔵映像 FX は plugin_host に載らない device なので再 load の
@@ -395,7 +387,6 @@ impl AppData {
         }
         let name = self.resolve_name(&inst.plugin_id);
         if self.send_set_slot_plugin(
-            track_id,
             inst.id,
             &inst.plugin_id,
             inst.state.as_deref().map(<[u8]>::to_vec),
@@ -424,20 +415,14 @@ impl AppData {
     }
 
     /// plugin_host が plugin destroy を完了した通知を受けて、
-    /// `track_plugin_ids` 等の daw_gui ローカル状態をクリーンアップする。
+    /// device 単位の daw_gui ローカル状態をクリーンアップする。
     /// shmem の close は必ず先行する `SlotPluginShmemReleased` が担うので
     /// ここでは送らない (SSoT — 二重送信しない)。
     pub(crate) fn on_plugin_unloaded_from_child(&mut self, device_id: u64) {
         // device が空になったので「未ロード」表示も畳む (再 load の対象は
         // song に残っている device だけ)。
         self.ipc.failed_plugin_loads.remove(&device_id);
-        for entry in self.ipc.track_plugin_ids.values_mut() {
-            entry.retain(|p| *p != device_id);
-        }
-        self.ipc.track_plugin_ids.retain(|_, v| !v.is_empty());
-        // slot 単位 cache からも、 同 device_id を持つ entry を retain で外す。
-        self.ipc.loaded_slots
-            .retain(|_, info| info.device_id != device_id);
+        self.forget_device_caches(device_id);
         // builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
         // overlay / スピナーが消えない)。plugin host の deactivate も idle を報告するが二重防御。
         self.voicevox.voicevox_synth_status.remove(&device_id);
@@ -446,6 +431,21 @@ impl AppData {
         self.voicevox.voicevox_metadata_sent.remove(&device_id);
         // 消えた device の PDC 寄与も畳む (0 = entry を落とす)。
         self.set_device_latency(device_id, 0);
+    }
+
+    /// r.md #71 (プラグインのコピー / 移動): device 単位の帳簿から 1 台分を落とす。
+    ///
+    /// device_id keyed になったので **消える瞬間に明示的に消す**のが正しい
+    /// (positional 時代は「index を詰めれば拾える」という理由で放置していたが、
+    /// id keyed では詰める操作が無いので放置 = 永久に残る)。 落とす経路は
+    /// unload 通知 / device 削除 / reconcile の RemoveDevice の 3 つ。
+    pub(crate) fn forget_device_caches(&mut self, device_id: u64) {
+        self.ipc.loaded_devices.remove(&device_id);
+        self.ipc.plugin_params.remove(&device_id);
+        self.ipc.slot_has_gui.remove(&device_id);
+        self.ipc
+            .plugin_param_values
+            .retain(|k, _| k.device_id != device_id);
     }
 
     /// plugin host が報告した device の processing latency を engine へ中継する。
@@ -471,20 +471,13 @@ impl AppData {
         self.send_audio(AudioCommand::SetDeviceLatency { device_id, samples });
     }
 
-    pub(crate) fn toggle_slot_gui(&mut self, index: u32) {
-        // open_plugin_guis / IPC は track_id ベース。 master 選択時は
-        // cursor_track_id が MASTER_TRACK_ID を返す (Vec に居ないので index 経由
-        // 不可)。
-        let Some(track_id) = self.cursor_track_id() else {
-            return;
-        };
-        // 内蔵映像 FX は plugin window を持たない。"GUI" ボタンは
-        // インスペクタ内のパラメータ調整パネルをトグルする (plugin window は開かない)。
-        // Transform も同様にトグル開閉 (開くと Group Transform セクションが出る。出っぱなしにしない)。
-        let device = self
-            .song_doc.song()
-            .fx_chain_by_track_id(track_id)
-            .and_then(|chain| chain.get(index as usize));
+    pub(crate) fn toggle_slot_gui(&mut self, device_id: u64) {
+        // r.md #71 (プラグインのコピー / 移動): アドレスは安定 device_id 一本。
+        // cursor track に依存しないので、 表示チェーンが切り替わっても
+        // 「どの device のボタンを押したか」 が変わらない。
+        let song = self.song_doc.song();
+        let device = find_device_by_id(song, device_id)
+            .and_then(|(track_id, index)| device_at(song, track_id, index));
         // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
         // (`builtin.video.subtitle`) は video device だが video_fx def を持たず、
         // 専用パラメータは Text Event セクション (= Par パネルで描画) なので、 ここで
@@ -493,13 +486,13 @@ impl AppData {
             && d.ports.is_video()
             && d.plugin_id != common::plugin_db::SUBTITLE_ID
         {
-            let key = (track_id, index);
             self.ui_ephemeral.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
-            self.ui_ephemeral.open_video_fx_params = if self.ui_ephemeral.open_video_fx_params == Some(key) {
-                None
-            } else {
-                Some(key)
-            };
+            self.ui_ephemeral.open_video_fx_params =
+                if self.ui_ephemeral.open_video_fx_params == Some(device_id) {
+                    None
+                } else {
+                    Some(device_id)
+                };
             return; // 映像 device は plugin window を持たない。
         }
         // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
@@ -511,73 +504,57 @@ impl AppData {
         let has_embedded_gui = !is_builtin
             && self
                 .ipc.slot_has_gui
-                .get(&(track_id, index))
+                .get(&device_id)
                 .copied()
                 .unwrap_or(true);
         if !has_embedded_gui {
-            let key = (track_id, index);
             self.ui_ephemeral.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
-            self.ui_ephemeral.open_plugin_params = if self.ui_ephemeral.open_plugin_params == Some(key) {
-                None
-            } else {
-                Some(key)
-            };
+            self.ui_ephemeral.open_plugin_params =
+                if self.ui_ephemeral.open_plugin_params == Some(device_id) {
+                    None
+                } else {
+                    Some(device_id)
+                };
             return;
         }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
         // open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
-        let is_open = self.ipc.open_plugin_guis.contains(&(track_id, index));
+        let is_open = self.ipc.open_plugin_guis.contains(&device_id);
         // r.md #65: 「GUI ボタンが押された」を 1 行で残す。押すたびに open / close が
         // 交互になるので、**このログが 2 行連続で出れば人が 2 回押した**と確定する
         // (= 自動で開き直っているのではない)。
-        tracing::info!(track_id, index, is_open, "toggle_slot_gui (GUI button)");
+        tracing::info!(device_id, is_open, "toggle_slot_gui (GUI button)");
         if is_open {
-            if let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) {
-                self.send_plugin(PluginCommand::CloseSlotGui { device_id });
-            }
+            self.send_plugin(PluginCommand::CloseSlotGui { device_id });
             return;
         }
-        self.open_slot_gui(track_id, index);
+        self.open_slot_gui(device_id);
     }
 
-    /// 指定 (track_id, device_index) のプラグイン GUI を embedded container
-    /// window で開く。既に開いていれば何もしない (重複 open 防止)。Windows 専用
+    /// 指定 device のプラグイン GUI を embedded container window で開く。
+    /// 既に開いていれば何もしない (重複 open 防止)。Windows 専用
     /// (他 OS では no-op)。`toggle_slot_gui` (手動トグル) と plugin 追加時の自動
     /// open の両方から使う。
     #[track_caller]
-    pub(crate) fn open_slot_gui(&mut self, track_id: u32, index: u32) {
+    pub(crate) fn open_slot_gui(&mut self, device_id: u64) {
         // r.md #65: **呼び出し元を値の中に入れる。** 「開き直った」を見たとき、
         // 呼んだのが `toggle_slot_gui` (= ユーザーが GUI ボタンを押した) なのか
         // `drain_pending_gui_opens` (= plugin load 完了の自動 open) なのかで
         // 原因がまったく別になるのに、ログからは区別できなかった。
         tracing::info!(
-            track_id,
-            index,
-            already_open = self.ipc.open_plugin_guis.contains(&(track_id, index)),
+            device_id,
+            already_open = self.ipc.open_plugin_guis.contains(&device_id),
             caller = %std::panic::Location::caller(),
             "open_slot_gui"
         );
         #[cfg(windows)]
         {
-            if self.ipc.open_plugin_guis.contains(&(track_id, index)) {
+            if self.ipc.open_plugin_guis.contains(&device_id) {
                 return;
             }
-            let label = if track_id == common::model::MASTER_TRACK_ID {
-                self.song_doc.song()
-                    .master_fx_chain
-                    .get(index as usize)
-                    .map(|p| format!("Master / {}", self.resolve_name(&p.plugin_id)))
-                    .unwrap_or_else(|| "Master".into())
-            } else {
-                self.song_doc.song()
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == track_id)
-                    .and_then(|t| self.slot_ref_name(t, index))
-                    .unwrap_or_else(|| "(unknown)".into())
-            };
+            let label = self.device_display_name(device_id);
             // the editor's top-level window is created by the
             // plugin-host process (so JUCE cascade sub-menus work). daw_gui
             // only records open state and passes the window title.
@@ -596,10 +573,6 @@ impl AppData {
                 };
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
             }
-            let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) else {
-                tracing::warn!(track_id, index, "open_slot_gui: no device id at slot");
-                return;
-            };
             // r.md #65: エディタコンテナ窓の owner にする **本体窓** (preview 窓ではない)。
             // `main_window_hwnd` は runner が本体窓の生成時に 1 度だけ書き込む値で、
             // preview 窓はここに載らない。0 は「窓が無い」なので `from_raw` が落とす。
@@ -616,7 +589,7 @@ impl AppData {
                     "opening plugin editor without an owner window (main window not ready)"
                 );
             }
-            self.ipc.open_plugin_guis.insert((track_id, index));
+            self.ipc.open_plugin_guis.insert(device_id);
             self.send_plugin(PluginCommand::OpenSlotGuiEmbedded {
                 device_id,
                 title: format!("Plugin — {label}"),
@@ -627,7 +600,9 @@ impl AppData {
             });
             // r.md #36: 「キーを全部プラグインに送る」 の現在値を open のたびに同期する
             // (plugin-host は再起動で状態を失う / device_id は open まで意味を持たない)。
-            let send_all = device_at(self.song_doc.song(), track_id, index)
+            let song = self.song_doc.song();
+            let send_all = find_device_by_id(song, device_id)
+                .and_then(|(t, i)| device_at(song, t, i))
                 .is_some_and(|p| p.send_all_keys_to_plugin);
             self.send_plugin(PluginCommand::SetEditorSendAllKeys {
                 device_id,
@@ -636,7 +611,30 @@ impl AppData {
         }
         #[cfg(not(windows))]
         {
-            let _ = (track_id, index);
+            let _ = device_id;
+        }
+    }
+
+    /// エディタ窓のタイトルに出す表示名 (`"Master / Comp"` / `"Bass / Serum"`)。
+    /// 所属 track は `find_device_by_id` で毎回引き直す (r.md #71 プラグインの
+    /// コピー / 移動: device は別トラックへ移動しうるので保持しない)。
+    #[cfg(windows)]
+    fn device_display_name(&self, device_id: u64) -> String {
+        let song = self.song_doc.song();
+        let Some((track_id, index)) = find_device_by_id(song, device_id) else {
+            return "(unknown)".into();
+        };
+        let Some(name) = device_at(song, track_id, index).map(|p| self.resolve_name(&p.plugin_id))
+        else {
+            return "(unknown)".into();
+        };
+        if track_id == common::model::MASTER_TRACK_ID {
+            format!("Master / {name}")
+        } else {
+            match song.tracks.iter().find(|t| t.id == track_id) {
+                Some(t) => format!("{} / {}", t.name, name),
+                None => name,
+            }
         }
     }
 
@@ -648,15 +646,9 @@ impl AppData {
         if self.ipc.gui_open_requests.is_empty() {
             return;
         }
-        for (track_id, index) in std::mem::take(&mut self.ipc.gui_open_requests) {
-            self.open_slot_gui(track_id, index);
+        for device_id in std::mem::take(&mut self.ipc.gui_open_requests) {
+            self.open_slot_gui(device_id);
         }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn slot_ref_name(&self, track: &Track, index: u32) -> Option<String> {
-        let id = track.devices.get(index as usize).map(|p| p.plugin_id.as_str())?;
-        Some(self.resolve_name(id))
     }
 
     /// inspector chain (= `Track.devices` / `master_fx_chain` を一列で表示) の
@@ -697,40 +689,19 @@ impl AppData {
             }
         }
 
-        // (review) daw_gui ローカルの positional cache (loaded_slots 等) の
-        // 貼り替えは song チェーンと一致している前提。 ロード失敗 / 進行中の
-        // plugin が song に phantom として残ると再キーがずれるので、 song
-        // チェーンが loaded_slots と完全一致 (= 全 plugin がロード済) のとき
-        // だけ並び替える (不一致なら snap back)。 v29: プロセス間は device_id
-        // addressing なので host/audio 側の再キーは不要になった。
-        let loaded_here = self
-            .ipc.loaded_slots
-            .keys()
-            .filter(|(t, _)| *t == track_id)
-            .count();
-        let fully_loaded = loaded_here == n
-            && old_devices.iter().enumerate().all(|(i, inst)| {
-                self.ipc.loaded_slots
-                    .get(&(track_id, i as u32))
-                    .is_some_and(|info| info.plugin_id_str == inst.plugin_id)
-            });
-        if !fully_loaded {
-            self.ui_ephemeral.status_message =
-                "プラグインの読み込み中または失敗のため並び替えできません".to_string();
-            return;
-        }
+        // r.md #71 (プラグインのコピー / 移動): 「ロード中は並べ替えできない」
+        // という旧制約は **撤去した**。 理由 (positional cache の再キーがずれる)
+        // が消えたため — 帳簿はすべて安定 device_id keyed で、 並べ替えても
+        // キーが動かない。 プロセス間も device_id addressing なので、
+        // 続く `LoadSong` (epoch flush) が処理順を Song から再 compile するだけ。
 
         // 新順での device 列を組む (new[i] = old[order[i]])。
         let new_devices: Vec<common::model::PluginInstance> =
             order.iter().map(|&o| old_devices[o].clone()).collect();
-        // moves: 各新位置 i について (old_index, new_index) = (order[i], i)。
-        let moves: Vec<(u32, u32)> =
-            (0..n).map(|i| (order[i] as u32, i as u32)).collect();
 
         // song を書き換え。
-        let applied = if is_master {
-            self.edit_song(move |song| song.master_fx_chain = new_devices)
-                .is_some()
+        if is_master {
+            self.edit_song(move |song| song.master_fx_chain = new_devices);
         } else {
             self.edit_song_checked(move |song| {
                 if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
@@ -739,66 +710,8 @@ impl AppData {
                 } else {
                     false
                 }
-            })
-        };
-        if !applied {
-            return;
+            });
         }
-
-        // song を組み替えただけでは plugin host のチェーンも audio engine の
-        // index→plugin_id マップも追従しない (= 見た目だけ並び替わり音は旧順の
-        // まま)。 旧→新 index の `moves` で 3 プロセスの per-device bookkeeping を
-        // 貼り直してから LoadSong (= schedule 再構築) を送る。
-        self.apply_chain_reorder(track_id, moves);
-    }
-
-    /// re-key our own `(track, device_index)`-keyed caches after an
-    /// inspector-chain reorder. `moves` is the complete
-    /// `(old_index, new_index)` permutation for `track_id` (one entry
-    /// per loaded plugin, `from == to` for ones that stayed put). The caller
-    /// has already rewritten `self.song_doc.song()` and follows up with
-    /// `flush_song_sync` (= LoadSong resend) — v29 ではそれだけで
-    /// 3 プロセスの並びが揃う (host は順序を持たない)。
-    pub(crate) fn apply_chain_reorder(&mut self, track_id: u32, moves: Vec<(u32, u32)>) {
-        // Local caches: remove ALL old keys first (snapshot), then re-insert at
-        // the new keys, so a swap (0↔1) can't clobber the second entry.
-        let mut new_loaded = Vec::new();
-        let mut new_open = Vec::new();
-        let mut new_params = Vec::new();
-        let mut new_has_gui = Vec::new();
-        for &(from, to) in &moves {
-            if let Some(v) = self.ipc.loaded_slots.remove(&(track_id, from)) {
-                new_loaded.push((to, v));
-            }
-            if self.ipc.open_plugin_guis.remove(&(track_id, from)) {
-                new_open.push(to);
-            }
-            if let Some(v) = self.ipc.plugin_params.remove(&(track_id, from)) {
-                new_params.push((to, v));
-            }
-            if let Some(v) = self.ipc.slot_has_gui.remove(&(track_id, from)) {
-                new_has_gui.push((to, v));
-            }
-        }
-        for (to, v) in new_loaded {
-            self.ipc.loaded_slots.insert((track_id, to), v);
-        }
-        for to in new_open {
-            self.ipc.open_plugin_guis.insert((track_id, to));
-        }
-        for (to, v) in new_has_gui {
-            self.ipc.slot_has_gui.insert((track_id, to), v);
-        }
-        for (to, v) in new_params {
-            self.ipc.plugin_params.insert((track_id, to), v);
-        }
-        // v29: automation lane / mod routing / MIDI binding の PluginParam は
-        // 安定 `device_id` addressing になったので、 並び替えでの remap は不要
-        // (id は device と一緒に動く)。 旧 `ReorderChain` IPC も廃止 —
-        // plugin_host は順序を持たず (flat HashMap<device_id, ..>)、 audio
-        // engine の処理順は caller が続けて送る LoadSong (=
-        // `flush_song_sync`) が Song から compile する
-        // (`docs/plan_arch_refactor.md` §1)。
     }
 
     /// PR4 sidechain: route a track's output into a plugin's `aux_in_port`.
@@ -809,52 +722,23 @@ impl AppData {
     /// so `compile_schedule` regenerates the `SidechainTap` ops.
     /// r.md #36: この device のエディタ窓で 「キーを全部プラグインに送る」 かを設定する。
     /// project に保存し (undo 対象)、 plugin-host にも即時反映する。
-    pub(crate) fn set_plugin_send_all_keys(
-        &mut self,
-        track_id: u32,
-        device_index: u32,
-        enabled: bool,
-    ) {
+    pub(crate) fn set_plugin_send_all_keys(&mut self, device_id: u64, enabled: bool) {
         self.edit_song_checked(|song| {
-            let inst = if track_id == common::model::MASTER_TRACK_ID {
-                song.master_fx_chain.get_mut(device_index as usize)
-            } else {
-                let Some(track) = song.track_by_id_mut(track_id) else {
-                    return false;
-                };
-                track.devices.get_mut(device_index as usize)
+            let Some(inst) = device_mut_by_id(song, device_id) else {
+                return false;
             };
-            let Some(inst) = inst else { return false };
             if inst.send_all_keys_to_plugin == enabled {
                 return false;
             }
             inst.send_all_keys_to_plugin = enabled;
             true
         });
-        if let Some(device_id) = device_id_at(self.song_doc.song(), track_id, device_index) {
-            self.send_plugin(PluginCommand::SetEditorSendAllKeys { device_id, enabled });
-        }
+        self.send_plugin(PluginCommand::SetEditorSendAllKeys { device_id, enabled });
     }
 
-    pub(crate) fn set_sidechain_source(
-        &mut self,
-        track_id: u32,
-        device_index: u32,
-        port: u8,
-        source: Option<u32>,
-    ) {
-        // 単一デバイスチェーン: master は master_fx_chain、 通常 track は devices
-        // を flat な device index で引く。
+    pub(crate) fn set_sidechain_source(&mut self, device_id: u64, port: u8, source: Option<u32>) {
         self.edit_song_checked(|song| {
-            let inst = if track_id == common::model::MASTER_TRACK_ID {
-                song.master_fx_chain.get_mut(device_index as usize)
-            } else {
-                let Some(track) = song.track_by_id_mut(track_id) else {
-                    return false;
-                };
-                track.devices.get_mut(device_index as usize)
-            };
-            let Some(inst) = inst else {
+            let Some(inst) = device_mut_by_id(song, device_id) else {
                 return false;
             };
             let port_idx = port as usize;
@@ -868,29 +752,20 @@ impl AppData {
         });
     }
 
-    /// パラアウト (docs/plan_paraout.md): route one aux output `port` of the
-    /// plugin at `(track_id, device_index)` to `dest` (or `None` = unrouted).
+    /// パラアウト (docs/plan_paraout.md): route one aux output `port` of device
+    /// `device_id` to `dest` (or `None` = unrouted).
     /// Mirror of `set_sidechain_source` (aux_outputs instead of aux_inputs).
     /// Used by the inspector dropdown for re-adjustment; not auto-undoable
     /// (matches sidechain), but marks dirty + recompiles via
     /// `flush_song_sync`.
     pub(crate) fn set_parallel_output_route(
         &mut self,
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
         port: u8,
         dest: Option<u32>,
     ) {
         self.edit_song_checked(|song| {
-            let inst = if track_id == common::model::MASTER_TRACK_ID {
-                song.master_fx_chain.get_mut(device_index as usize)
-            } else {
-                let Some(track) = song.track_by_id_mut(track_id) else {
-                    return false;
-                };
-                track.devices.get_mut(device_index as usize)
-            };
-            let Some(inst) = inst else {
+            let Some(inst) = device_mut_by_id(song, device_id) else {
                 return false;
             };
             let port_idx = port as usize;
@@ -911,7 +786,12 @@ impl AppData {
     /// re-clicking only fills gaps, never duplicates). Undo snapshot + dirty
     /// are taken at the dispatch choke point (`is_undoable`), so this only
     /// mutates the model and syncs.
-    pub(crate) fn explode_parallel_out(&mut self, track_id: u32, device_index: u32) {
+    pub(crate) fn explode_parallel_out(&mut self, device_id: u64) {
+        let Some((track_id, device_index)) =
+            find_device_by_id(self.song_doc.song(), device_id)
+        else {
+            return;
+        };
         // The grouped explode model needs the source to be a real track
         // (master has no `parent_group_id` children).
         if track_id == common::model::MASTER_TRACK_ID {
@@ -987,116 +867,131 @@ impl AppData {
         self.resize_track_peak_display();
     }
 
-    /// `AppEvent::RemoveDevice` の dispatcher。 削除する plugin の最新
+    /// `AppEvent::RemoveDevices` の dispatcher。 削除する plugin の最新
     /// state を取ってから Undo snapshot + 削除を行う。
-    pub(crate) fn remove_device(&mut self, index: u32) {
-        // master 選択時は cursor_track_id == MASTER_TRACK_ID (Vec に居ない)。
-        let Some(track_id) = self.cursor_track_id() else {
-            return;
-        };
-
-        if !self.song_has_plugin() {
-            self.remove_device_inner(track_id, index);
+    ///
+    /// r.md #71 (プラグインのコピー / 移動): 複数選択を **1 件にまとめて** 積む
+    /// (id ごとに enqueue すると round-trip が分かれて undo が N ステップに割れる)。
+    pub(crate) fn remove_devices(&mut self, device_ids: Vec<u64>) {
+        if device_ids.is_empty() {
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(
-            DeferredEdit::RemoveDevice { track_id, index },
-        ));
+        if !self.song_has_plugin() {
+            self.remove_devices_inner(&device_ids);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::RemoveDevices {
+            device_ids,
+        }));
     }
 
-    /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
-    /// device を `Vec::remove` する。host への RemoveSlotPlugin + GUI cleanup +
-    /// cache 削除 + 後続 index shift + device_index addressing の参照
-    /// (automation lane / mod routing / MIDI binding) の追従 + LoadSong flush
-    /// を行う。
-    pub(crate) fn remove_device_inner(&mut self, track_id: u32, index: u32) {
-        // **GUI lifecycle**: close the editor BEFORE removing the
-        // plugin. cleanup_slot_gui sends CloseSlotGui so the plugin-host tears
-        // the editor window down while the plugin is still at this index —
-        // after RemoveSlotPlugin the chain shifts (Vec::remove), so a
-        // post-remove close would target a shifted neighbor. RemoveSlotPlugin
-        // also closes the editor by stable plugin id as a backstop, and shifts
-        // the remaining open-state keys to match the new chain indices.
-        self.cleanup_slot_gui(track_id, index);
-        // 開いている映像 FX param パネルが同トラックなら閉じる
-        // (削除で device index がずれて別 device を指すのを防ぐ)。
-        if self.ui_ephemeral.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
-            self.ui_ephemeral.open_video_fx_params = None;
+    /// 単一デバイスチェーン: 指定 device を所属チェーンから `Vec::remove` する。
+    /// host への RemoveSlotPlugin + GUI cleanup + cache 削除 + device_id
+    /// addressing の参照 (automation lane / mod routing / MIDI binding) の
+    /// dangling 除去を行う。 **全 device を 1 回の `edit_song` で消す** ので
+    /// undo は 1 ステップ。
+    pub(crate) fn remove_devices_inner(&mut self, device_ids: &[u64]) {
+        // 実在する device だけに絞る (stale id は黙って捨てる = 削除済み device
+        // への stale event は正常系)。 所属 track も先に控えておく — chain から
+        // 外した後では引けない。
+        let targets: Vec<(u64, u32)> = device_ids
+            .iter()
+            .filter_map(|&id| {
+                find_device_by_id(self.song_doc.song(), id).map(|(track_id, _)| (id, track_id))
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
         }
-        // 汎用 param パネルも同様に閉じる。
-        if self.ui_ephemeral.open_plugin_params.is_some_and(|(t, _)| t == track_id) {
-            self.ui_ephemeral.open_plugin_params = None;
-        }
-        // v29: 安定 device id でアドレスする (song からは chain.remove 前の
-        // この時点で引ける)。 video device 等 host に居ないものは host 側が
-        // no-op で無視する。
-        let removed_device_id = device_id_at(self.song_doc.song(), track_id, index);
-        if let Some(device_id) = removed_device_id {
+        for &(device_id, _) in &targets {
+            // **GUI lifecycle**: close the editor BEFORE removing the plugin.
+            // cleanup_slot_gui sends CloseSlotGui so the plugin-host tears the
+            // editor window down. RemoveSlotPlugin also closes the editor by
+            // stable device id as a backstop (idempotent)。
+            self.cleanup_slot_gui(device_id);
+            // 開いているインライン param パネルが **消す device を指していたら**
+            // 閉じる (別 device を指しているなら触らない — id keyed なので
+            // 「同トラックだから」で巻き込む必要が無い)。
+            if self.ui_ephemeral.open_video_fx_params == Some(device_id) {
+                self.ui_ephemeral.open_video_fx_params = None;
+            }
+            if self.ui_ephemeral.open_plugin_params == Some(device_id) {
+                self.ui_ephemeral.open_plugin_params = None;
+            }
+            // video device 等 host に居ないものは host 側が no-op で無視する。
             self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
             // load に失敗した device は plugin_host に instance が無く
             // `SlotPluginUnloaded` が返って来ない。 「未ロード」 entry を
             // ここで落とさないと、 消したはずの device がインスペクタの
             // 失敗リストに残り続ける。
             self.ipc.failed_plugin_loads.remove(&device_id);
+            // cache から該当 entry を即時削除。 SlotPluginUnloaded event 到着前に
+            // reconcile が走っても stale entry を見ないようにする防御策。
+            self.forget_device_caches(device_id);
         }
-        // cache から該当 entry を即時削除。 SlotPluginUnloaded event 到着前に
-        // reconcile が走っても stale entry を見ないようにする防御策。
-        self.ipc.loaded_slots.remove(&(track_id, index));
-        // index 以降の loaded_slots / plugin_params を 1 つ前へ詰める (Vec::remove
-        // 後の device index と整合させる)。open_plugin_guis は cleanup_slot_gui →
-        // shift_slot_gui_keys が既に shift 済み。
-        self.shift_device_caches_after_remove(track_id, index);
 
-        // song を書き換え。master は master_fx_chain、 通常 track は devices。
-        let Some(Some(removed_id)) = self.edit_song(|song| {
-            let chain: Option<&mut Vec<common::model::PluginInstance>> =
-                if track_id == common::model::MASTER_TRACK_ID {
-                    Some(&mut song.master_fx_chain)
-                } else {
-                    song.tracks
-                        .iter_mut()
-                        .find(|t| t.id == track_id)
-                        .map(|t| &mut t.devices)
+        // song を書き換え。 全 device を 1 回の edit_song で消す (undo 1 step)。
+        let ids: Vec<u64> = targets.iter().map(|&(id, _)| id).collect();
+        let removed = self.edit_song(move |song| {
+            let mut removed: Vec<(u32, common::model::PluginInstance)> = Vec::new();
+            for &device_id in &ids {
+                let Some((track_id, index)) = find_device_by_id(song, device_id) else {
+                    continue;
                 };
-            let chain = chain?;
-            let i = index as usize;
-            if i >= chain.len() {
-                return None;
+                let Some(chain) = song.fx_chain_by_track_id_mut(track_id) else {
+                    continue;
+                };
+                removed.push((track_id, chain.remove(index as usize)));
             }
-            let removed = chain.remove(i);
-            // VOICEVOX builtin (= vocal track の音源) を外したら vocal 状態も解除
-            // (vocal 性は VOICEVOX device の有無に追従)。master には適用しない。
-            if track_id != common::model::MASTER_TRACK_ID
-                && removed.format == PluginFormat::Builtin
-                && removed.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-                && let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id)
-            {
-                track.source = InstrumentSource::None;
+            // 副作用は **全部消してから** 評価する。 「2 本ある VOICEVOX の
+            // 1 本だけ消す」 が成立するので、 途中の中間状態で判定すると
+            // 残っている方まで巻き込む。
+            for (track_id, inst) in &removed {
+                if *track_id == common::model::MASTER_TRACK_ID {
+                    continue; // master は Track ではないので副作用を持たない。
+                }
+                let Some(track) = song.tracks.iter_mut().find(|t| t.id == *track_id) else {
+                    continue;
+                };
+                // VOICEVOX builtin (= vocal track の音源) を外したら vocal 状態も解除
+                // (vocal 性は VOICEVOX device の有無に追従)。 **他に VOICEVOX が
+                // 残っていれば保持** — Transform 側と同じ規則にして 1 本にする
+                // (r.md #71: 複数選択削除で「2 本のうち 1 本だけ」が起きるようになった)。
+                if inst.format == PluginFormat::Builtin
+                    && inst.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+                    && !track
+                        .devices
+                        .iter()
+                        .any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX)
+                {
+                    track.source = InstrumentSource::None;
+                }
+                // Transform 配置 device を外したら group_transform を消す
+                // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
+                // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
+                if inst.plugin_id == common::video_fx::TRANSFORM_ID
+                    && !track
+                        .devices
+                        .iter()
+                        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
+                {
+                    track.group_transform = None;
+                }
             }
-            // Transform 配置 device を外したら group_transform を消す
-            // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
-            // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
-            if track_id != common::model::MASTER_TRACK_ID
-                && removed.plugin_id == common::video_fx::TRANSFORM_ID
-                && let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id)
-                && !track
-                    .devices
-                    .iter()
-                    .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
-            {
-                track.group_transform = None;
-            }
-            Some(removed.id)
-        }) else {
+            removed
+        });
+        let Some(removed) = removed else {
             return;
         };
         // (review) 削除 device を指す参照 (automation lane / mod routing /
         // MIDI binding) を落とす。 v29: 参照は安定 device_id なので「詰め」は
         // 不要になり、 dangling id の除去だけ行う。
-        self.remap_device_refs_after_remove(track_id, removed_id);
-        // song 更新を engine へ flush (= schedule から削除 device の dispatch を
-        // 落とす)。 これが無いと次の編集まで stale schedule のまま destroyed
-        // plugin へ dispatch し続け、 remap した lane も engine へ届かない。
+        for (track_id, inst) in &removed {
+            self.remap_device_refs_after_remove(*track_id, inst.id);
+        }
+        // 選択集合からも消えた id を落とし、 空になったら last-wins タグを降ろす
+        // (正しさは `live_device_ids()` の正規化が担保する。 これは後始末)。
+        self.prune_device_selection();
     }
 
     /// device を `Vec::remove` した後、 削除 device (安定 id =
@@ -1142,97 +1037,23 @@ impl AppData {
         });
     }
 
-    /// device を index で `Vec::remove` した後、`loaded_slots` / `plugin_params`
-    /// の `(track, idx)` キーのうち `idx > index` のものを 1 つ前へ詰める。
-    /// open_plugin_guis は `shift_slot_gui_keys` が別途扱う。
-    pub(crate) fn shift_device_caches_after_remove(&mut self, track_id: u32, index: u32) {
-        // loaded_slots
-        let mut moves: Vec<(u32, LoadedSlotInfo)> = Vec::new();
-        self.ipc.loaded_slots.retain(|&(t, idx), v| {
-            if t == track_id && idx > index {
-                moves.push((idx - 1, v.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        for (idx, v) in moves {
-            self.ipc.loaded_slots.insert((track_id, idx), v);
-        }
-        // plugin_params
-        let mut pmoves: Vec<(u32, Vec<common::protocol::PluginParamInfo>)> = Vec::new();
-        self.ipc.plugin_params.retain(|&(t, idx), v| {
-            if t == track_id && idx > index {
-                pmoves.push((idx - 1, v.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        for (idx, v) in pmoves {
-            self.ipc.plugin_params.insert((track_id, idx), v);
-        }
-        // slot_has_gui: plugin_params と同じ index シフト。
-        let mut gmoves: Vec<(u32, bool)> = Vec::new();
-        self.ipc.slot_has_gui.retain(|&(t, idx), v| {
-            if t == track_id && idx > index {
-                gmoves.push((idx - 1, *v));
-                false
-            } else {
-                true
-            }
-        });
-        for (idx, v) in gmoves {
-            self.ipc.slot_has_gui.insert((track_id, idx), v);
-        }
-    }
-
-    /// `(track_id, device_index)` のプラグイン GUI を閉じ、 同 track の後続
-    /// device (= `idx > index`) の open-state key を 1 つずつ前にずらす
-    /// (`Vec::remove` 後の chain index と整合させるため)。 実 window
-    /// は plugin-host プロセス所有なので、 破棄は `CloseSlotGui` を送って B 側に
-    /// 行わせる。 RemoveSlotPlugin / RemoveTrack も B 側で window を破棄するので
-    /// 二重でも idempotent。
+    /// この device のプラグイン GUI が開いていれば閉じる。 実 window は
+    /// plugin-host プロセス所有なので、 破棄は `CloseSlotGui` を送って B 側に
+    /// 行わせる。 `RemoveSlotPlugin` も B 側で window を破棄するので二重でも
+    /// idempotent。
+    ///
+    /// r.md #71 (プラグインのコピー / 移動): open-state は安定 device_id keyed に
+    /// なったので、 削除に伴う **key の詰め直しは無い** (旧
+    /// `shift_slot_gui_keys` は不変条件 1 が禁じる貼り替え補償コードだった)。
     #[cfg(windows)]
-    pub(crate) fn cleanup_slot_gui(&mut self, track_id: u32, index: u32) {
-        // open 中なら B に閉じてもらう (= DestroyWindow は plugin-host 側)。
-        // v29: device_id addressing。 host 実体の SSoT である loaded_slots を
-        // 優先し (reconcile の「song に無い device」 でも解決できる)、
-        // 無ければ song から引く。
-        if self.ipc.open_plugin_guis.remove(&(track_id, index)) {
-            let device_id = self
-                .ipc.loaded_slots
-                .get(&(track_id, index))
-                .map(|info| info.device_id)
-                .or_else(|| device_id_at(self.song_doc.song(), track_id, index));
-            if let Some(device_id) = device_id {
-                self.send_plugin(PluginCommand::CloseSlotGui { device_id });
-            }
+    pub(crate) fn cleanup_slot_gui(&mut self, device_id: u64) {
+        if self.ipc.open_plugin_guis.remove(&device_id) {
+            self.send_plugin(PluginCommand::CloseSlotGui { device_id });
         }
-        self.shift_slot_gui_keys(track_id, index);
     }
 
     #[cfg(not(windows))]
-    pub(crate) fn cleanup_slot_gui(&mut self, _track_id: u32, _index: u32) {}
-
-    /// 単一デバイスチェーン: `removed_idx` を `Vec::remove` した後、
-    /// `idx > removed_idx` な open-state key を 1 つずつ前にずらす。
-    #[cfg(windows)]
-    pub(crate) fn shift_slot_gui_keys(&mut self, track_id: u32, removed_idx: u32) {
-        let mut moves: Vec<u32> = self
-            .ipc.open_plugin_guis
-            .iter()
-            .filter(|&&(t, idx)| t == track_id && idx > removed_idx)
-            .map(|&(_, idx)| idx)
-            .collect();
-        // 低 index 側を先に詰める (collision-free)。
-        moves.sort_unstable();
-        for idx in moves {
-            if self.ipc.open_plugin_guis.remove(&(track_id, idx)) {
-                self.ipc.open_plugin_guis.insert((track_id, idx - 1));
-            }
-        }
-    }
+    pub(crate) fn cleanup_slot_gui(&mut self, _device_id: u64) {}
 
     /// `plugin_host` から `AllPluginStates` 受信。 全 plugin の最新
     /// state を Song に書き戻したあと、 [`AppData::pending_state_queue`]
@@ -1316,10 +1137,17 @@ impl AppData {
                 // 削除される編集を Undo すると knob 値が復元される)。
                 self.execute_deferred_edit(edit);
             }
-            PendingStateRequest::CopyToClipboard { track_ids } => {
+            PendingStateRequest::CopyToClipboard(req) => {
                 // copy は Song 不変なので undo を積まない。最新 state
                 // 込みで serialize して pending_clipboard_write に積むだけ。
-                self.copy_tracks_inner(&track_ids);
+                match req {
+                    ClipboardCopyRequest::Tracks(track_ids) => {
+                        self.copy_tracks_inner(&track_ids);
+                    }
+                    ClipboardCopyRequest::Devices(device_ids) => {
+                        self.copy_devices_inner(&device_ids);
+                    }
+                }
             }
         }
         // 後続の request が積まれていれば、 改めて `RequestAllStates` を発行して
@@ -1351,9 +1179,11 @@ impl AppData {
             DeferredEdit::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks_inner(&track_ids)
             }
-            DeferredEdit::RemoveDevice { track_id, index } => {
-                self.remove_device_inner(track_id, index)
+            DeferredEdit::RemoveDevices { device_ids } => {
+                self.remove_devices_inner(&device_ids)
             }
+            DeferredEdit::RelocateDevices(req) => self.relocate_devices_inner(&req),
+            DeferredEdit::CutDevices { device_ids } => self.cut_devices_inner(&device_ids),
             DeferredEdit::CutTracks { track_ids } => self.cut_tracks_inner(&track_ids),
             DeferredEdit::DuplicateTracks { track_ids, linked } => {
                 self.duplicate_tracks_inner(&track_ids, linked)
@@ -1361,4 +1191,739 @@ impl AppData {
         }
     }
 
+    // -------- r.md #71: device の運搬 (移動 / コピー) ----------------------
+
+    /// 選んだ device を別のチェーンへ運ぶ (移動 / コピー) **唯一の口**。
+    ///
+    /// 最新の knob 値を Song に書き戻してから実行する必要があるので、 host に
+    /// plugin が居るときは `RequestAllStates` の round-trip 待ちに積む
+    /// (track copy/cut/duplicate と同 idiom、`app_types.rs` の `DeferredEdit` doc 参照)。
+    /// - コピー: 落とし先 device の `initial_state` が「いまのツマミ」になる。
+    /// - 移動: instance は作り直さないが、undo snapshot が最新 state を捕まえる。
+    pub(crate) fn relocate_devices(&mut self, req: RelocateDevices) {
+        if req.device_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.relocate_devices_inner(&req);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::Deferred(
+            DeferredEdit::RelocateDevices(req),
+        ));
+    }
+
+    /// 運搬の本体。 **Song の書き換えは 1 回の `edit_song` に閉じ込める**
+    /// (不変条件 5、undo 1 step、epoch bump 1 回)。
+    pub(crate) fn relocate_devices_inner(&mut self, req: &RelocateDevices) {
+        let RelocateDevices { device_ids, dest_track, dest_index, copy } = req.clone();
+        let Some(outcome) = self
+            .edit_song(move |song| relocate_in_song(song, &device_ids, dest_track, dest_index, copy))
+            .flatten()
+        else {
+            return;
+        };
+
+        // lane の再キーに伴う session 状態の写し替え (B-4)。
+        for &(src_track, old_lane, dst_track, new_lane) in &outcome.lane_remap {
+            let from = common::model::AutomationLaneKey { track: src_track, lane: old_lane };
+            let to = common::model::AutomationLaneKey { track: dst_track, lane: new_lane };
+            // 行高 override は session-only だが、 鍵 (track, lane) が両方変わるので
+            // 写し替えないと「行高だけ元の位置に取り残されて別 lane に化ける」。
+            if let Some(v) = self.ui_prefs.automation_lane_row_overrides.remove(&from) {
+                self.ui_prefs.automation_lane_row_overrides.insert(to, v);
+            }
+            // Z 段階ズームの復元スナップショットにも同じ写像を掛ける
+            // (掛けないと X で 1 段戻した瞬間に行高が飛ぶ)。
+            for snap in &mut self.ui_ephemeral.arrange_zoom_history {
+                if let Some(v) = snap.lane_row_overrides.remove(&from) {
+                    snap.lane_row_overrides.insert(to, v);
+                }
+            }
+            for k in &mut self.selection.selected_automation_clips {
+                if k.lane_key() == from {
+                    k.track = to.track;
+                    k.lane = to.lane;
+                }
+            }
+            if let Some(k) = self.selection.automation_clip_anchor.as_mut()
+                && k.lane_key() == from
+            {
+                k.track = to.track;
+                k.lane = to.lane;
+            }
+            for p in &mut self.selection.selected_automation_points {
+                if (p.track_id, p.lane_id) == (from.track, from.lane) {
+                    p.track_id = to.track;
+                    p.lane_id = to.lane;
+                }
+            }
+            if let Some(p) = self.selection.automation_point_anchor.as_mut()
+                && (p.track_id, p.lane_id) == (from.track, from.lane)
+            {
+                p.track_id = to.track;
+                p.lane_id = to.lane;
+            }
+        }
+        if !outcome.lane_remap.is_empty() {
+            // 「いまポインタがどこを指しているか」 の観測値は写像せず捨てる
+            // (次のフレームで再計算される)。
+            self.ui_ephemeral.arrange_hovered_automation_lane = None;
+            self.ui_ephemeral.arrange_default_scrub_active = None;
+        }
+
+        // 録音中の param gesture も新しい所有者へ移す。 移送しないと
+        // `daw_audio/src/automation.rs` の skip 判定が旧 track でも新 track でも
+        // 外れ、 curve eval とユーザーのノブ操作が二重に効く。
+        for &(src_track, dst_track, device_id) in &outcome.moved_devices {
+            let owns = |key: &(u32, common::model::AutomationTarget)| {
+                key.0 == src_track
+                    && matches!(
+                        &key.1,
+                        common::model::AutomationTarget::PluginParam { device_id: d, .. }
+                            if *d == device_id
+                    )
+            };
+            let rekey_set = |set: &mut std::collections::HashSet<(
+                u32,
+                common::model::AutomationTarget,
+            )>| {
+                let hits: Vec<_> = set.iter().filter(|k| owns(k)).cloned().collect();
+                for k in hits {
+                    set.remove(&k);
+                    set.insert((dst_track, k.1));
+                }
+            };
+            rekey_set(&mut self.recording.active_param_gestures);
+            rekey_set(&mut self.recording.latched_param_gestures);
+            let hits: Vec<_> = self
+                .recording
+                .recording_last_beat
+                .keys()
+                .filter(|k| owns(k))
+                .cloned()
+                .collect();
+            for k in hits {
+                if let Some(beat) = self.recording.recording_last_beat.remove(&k) {
+                    self.recording.recording_last_beat.insert((dst_track, k.1), beat);
+                }
+            }
+        }
+        if !outcome.moved_devices.is_empty() {
+            self.sync_recording_lanes_with_audio();
+        }
+
+        // コピーで作った device を host に実体化する。 **finalize を先に積む**
+        // (load 応答が先に届いたときに取りこぼさないため)。 `OpenPluginShmem` は
+        // `on_plugin_loaded_from_child` が live な `audio_tx` から送る既存経路に乗る。
+        for inst in &outcome.created {
+            self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
+        }
+        for inst in outcome.created.clone() {
+            self.restore_device(&inst);
+        }
+
+        // 移動は plugin_host への IPC が 1 通も要らない (device_id は不変で
+        // instance も作り直さない = 音が切れない)。 daw_audio 側は `LoadSong` が
+        // `Topology::Recompile` を起こして処理順を再 compile する。 GUI では
+        // runner の frame flush が epoch bump を拾うが、 headless / script 経路は
+        // frame loop が回らないのでここで明示的に流す (epoch 未変化なら no-op)。
+        self.flush_song_sync();
+
+        // 落とした device を選択し、 落とし先のチェーンを表示し続ける。
+        self.selection.selected_device_ids = outcome.result_ids.clone();
+        self.selection.device_anchor = outcome.result_ids.last().copied();
+        self.selection.last_edit_select = Some(EditSurface::Devices);
+        self.focus_inspector_track(dest_track);
+    }
+
+    // -------- r.md #71: device のクリップボード -----------------------------
+
+    /// Ctrl+C (device 面)。plugin があれば最新 state を取ってから serialize する
+    /// ため deferred、無ければ即時。copy は Song 不変なので undo を積まない。
+    pub(crate) fn copy_devices(&mut self, device_ids: Vec<u64>) {
+        if device_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.copy_devices_inner(&device_ids);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::CopyToClipboard(
+            ClipboardCopyRequest::Devices(device_ids),
+        ));
+    }
+
+    /// Ctrl+X (device 面)。copy → 削除を 1 undo step。
+    pub(crate) fn cut_devices(&mut self, device_ids: Vec<u64>) {
+        if device_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.cut_devices_inner(&device_ids);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::CutDevices {
+            device_ids,
+        }));
+    }
+
+    /// copy 本体。最新 state 込みの live song から該当 device を serialize して
+    /// `pending_clipboard_write` に積む (view が次フレーム OS clipboard へ flush)。
+    pub(crate) fn copy_devices_inner(&mut self, device_ids: &[u64]) {
+        let Some((json, count, dropped)) = self.serialize_devices_to_envelope(device_ids) else {
+            return;
+        };
+        self.ui_ephemeral.pending_clipboard_write = Some(json);
+        self.ui_ephemeral.status_message = match dropped {
+            0 => format!("コピー: {count} プラグイン"),
+            n => format!(
+                "クリップボードには大きすぎるため {n} 件のプラグイン設定を除いて\
+                 コピーしました (ドラッグで運ぶと設定ごと移せます)"
+            ),
+        };
+    }
+
+    /// cut 本体。serialize → `pending_clipboard_write` → 削除。呼び出し側で
+    /// undo snapshot 済み (deferred 経由 or 即時 fallback)。
+    pub(crate) fn cut_devices_inner(&mut self, device_ids: &[u64]) {
+        self.copy_devices_inner(device_ids);
+        if let Some(msg) = self.ui_ephemeral.status_message.strip_prefix("コピー: ") {
+            self.ui_ephemeral.status_message = format!("カット: {msg}");
+        }
+        self.remove_devices_inner(device_ids);
+    }
+
+    /// 指定 device 群を `DeviceCopy` list に組み立てて envelope へ入れる。
+    /// 戻り値は `(json, 件数, blob を落とした device 数)`。
+    ///
+    /// blob (`state` / `ara_archive`) は base64 テキストとして OS クリップボードへ
+    /// 流れるので [`CLIPBOARD_BLOB_BUDGET`](crate::clipboard::CLIPBOARD_BLOB_BUDGET)
+    /// を超える分は運ばない。 落とす順序は決定的に **(1) 全 device の
+    /// `ara_archive`、(2) 全 device の `state`** で、(1) で収まればそこで止める。
+    fn serialize_devices_to_envelope(&self, device_ids: &[u64]) -> Option<(String, usize, usize)> {
+        let song = self.song_doc.song();
+        // 表示順 (= チェーン順) を保つため、 呼び出し側の並びをそのまま使う。
+        let mut out: Vec<crate::clipboard::DeviceCopy> = Vec::new();
+        for &id in device_ids {
+            let Some((source_track, index)) = find_device_by_id(song, id) else {
+                continue;
+            };
+            let Some(inst) = device_at(song, source_track, index) else {
+                continue;
+            };
+            out.push(crate::clipboard::DeviceCopy {
+                order: out.len(),
+                source_track,
+                device: inst.clone(),
+            });
+        }
+        if out.is_empty() {
+            return None;
+        }
+        let blob_bytes = |ds: &[crate::clipboard::DeviceCopy]| -> usize {
+            ds.iter()
+                .map(|d| {
+                    d.device.state.as_ref().map_or(0, |s| s.len())
+                        + d.device.ara_archive.as_ref().map_or(0, |s| s.len())
+                })
+                .sum()
+        };
+        let mut dropped = 0usize;
+        if blob_bytes(&out) > crate::clipboard::CLIPBOARD_BLOB_BUDGET {
+            for d in &mut out {
+                if d.device.ara_archive.take().is_some() {
+                    dropped += 1;
+                }
+            }
+        }
+        if blob_bytes(&out) > crate::clipboard::CLIPBOARD_BLOB_BUDGET {
+            for d in &mut out {
+                if d.device.state.take().is_some() {
+                    dropped += 1;
+                }
+            }
+        }
+        let count = out.len();
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            song.project_id,
+            crate::clipboard::ClipboardPayload::Devices(out),
+        )
+        .to_json()?;
+        Some((json, count, dropped))
+    }
+
+    /// Ctrl+V (device 面)。貼り先は「いまインスペクタに出ているチェーン」で、
+    /// 挿入位置は **選んでいるプラグインの直前**、選択が無ければ末尾 (Ableton 流)。
+    /// 戻り値は貼り付けた件数。
+    pub(crate) fn paste_devices(
+        &mut self,
+        devices: Vec<crate::clipboard::DeviceCopy>,
+        dest_track: u32,
+    ) -> usize {
+        if devices.is_empty() {
+            return 0;
+        }
+        let Some(chain_len) = self
+            .song_doc
+            .song()
+            .fx_chain_by_track_id(dest_track)
+            .map(<[_]>::len)
+        else {
+            return 0;
+        };
+        // 挿入位置: 表示チェーンの中で選択されている device の最小 index。
+        // `live_device_ids` を通すので、 別トラックの選択が残っていても末尾に
+        // 落ちる (= 画面と一致する)。
+        let selected = self.live_device_ids();
+        let dest_index = self
+            .song_doc
+            .song()
+            .fx_chain_by_track_id(dest_track)
+            .and_then(|chain| {
+                chain
+                    .iter()
+                    .position(|d| selected.contains(&d.id))
+                    .map(|i| i as u32)
+            })
+            .unwrap_or(chain_len as u32);
+
+        let mut ordered = devices;
+        ordered.sort_by_key(|d| d.order);
+        let created = self.edit_song(move |song| {
+            let mut created: Vec<common::model::PluginInstance> = Vec::new();
+            for dc in &ordered {
+                let mut inst = dc.device.clone();
+                inst.id = song.alloc_device_id();
+                // 別トラックへ運んだ ARA アーカイブは復元できない (persistent_id が
+                // 元トラックのクリップを指す) ので落として解析し直させる。
+                if dc.source_track != dest_track {
+                    inst.ara_archive = None;
+                }
+                resolve_aux_refs_after_paste(song, &mut inst);
+                created.push(inst);
+            }
+            let at = (dest_index as usize).min(
+                song.fx_chain_by_track_id(dest_track)
+                    .map_or(0, <[_]>::len),
+            );
+            if let Some(chain) = song.fx_chain_by_track_id_mut(dest_track) {
+                chain.splice(at..at, created.iter().cloned());
+            }
+            apply_dest_side_effects(song, dest_track, &created);
+            created
+        });
+        let Some(created) = created else {
+            return 0;
+        };
+        for inst in &created {
+            self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
+        }
+        for inst in created.clone() {
+            self.restore_device(&inst);
+        }
+        self.flush_song_sync();
+        self.selection.selected_device_ids = created.iter().map(|d| d.id).collect();
+        self.selection.device_anchor = created.last().map(|d| d.id);
+        self.selection.last_edit_select = Some(EditSurface::Devices);
+        created.len()
+    }
+
+    // -------- r.md #71: device 選択 ----------------------------------------
+
+    /// チェーン行 click の解決 (無修飾 = Single / Ctrl = Toggle / Shift = 範囲)。
+    /// 範囲の並びは表示チェーンの device id 列で、 解決自体は全選択面共通の
+    /// [`range_ordered`](crate::widgets::select_modifier::range_ordered) に任せる。
+    pub(crate) fn apply_select_device(
+        &mut self,
+        device_id: u64,
+        modifier: crate::widgets::select_modifier::SelectModifier,
+    ) {
+        let order: Vec<u64> = self.inspector_chain().iter().map(|e| e.device_id).collect();
+        // `prev` は **正規化済み** を渡す (異トラックの stale id は最初の click で落ちる)。
+        let prev = self.live_device_ids();
+        let next = modifier.resolve(&prev, device_id, || {
+            self.selection
+                .device_anchor
+                .and_then(|a| crate::widgets::select_modifier::range_ordered(&order, a, device_id))
+        });
+        self.set_device_selection(next);
+        if modifier.updates_anchor() {
+            self.selection.device_anchor = Some(device_id);
+        }
+    }
+
+    /// device 選択の setter。 ここを通るのは **明示的なチェーン操作だけ**
+    /// (行 click / 運搬 / 貼り付けの結果)。 空になったら last-wins タグを降ろす
+    /// — 残すと `edit_surface` が Devices を返し続け、 次の Delete が
+    /// 「実在 0 件」 で空振りして他の面の削除まで殺す。
+    pub(crate) fn set_device_selection(&mut self, ids: Vec<u64>) {
+        self.selection.selected_device_ids = ids;
+        if self.selection.selected_device_ids.is_empty() {
+            if self.selection.last_edit_select == Some(EditSurface::Devices) {
+                self.selection.last_edit_select = None;
+            }
+        } else {
+            self.selection.last_edit_select = Some(EditSurface::Devices);
+        }
+    }
+
+    /// device が消える経路 (削除 / track 削除 / project 切替 / undo-redo) の後始末。
+    /// 実在しない id を落とし、 空になったらタグを降ろす。
+    ///
+    /// **正しさの担保ではない** — それは読む側の [`Self::live_device_ids`] が持つ。
+    /// ここは保持した集合が無限に育たないようにするだけ。
+    pub(crate) fn prune_device_selection(&mut self) {
+        let song = self.song_doc.song();
+        let alive: Vec<u64> = self
+            .selection
+            .selected_device_ids
+            .iter()
+            .copied()
+            .filter(|id| find_device_by_id(song, *id).is_some())
+            .collect();
+        if alive.len() != self.selection.selected_device_ids.len() {
+            self.set_device_selection(alive);
+        }
+        if self
+            .selection
+            .device_anchor
+            .is_some_and(|id| find_device_by_id(self.song_doc.song(), id).is_none())
+        {
+            self.selection.device_anchor = None;
+        }
+    }
+}
+
+/// [`AppData::relocate_devices_inner`] が `edit_song` の中で組み立てる結果。
+struct RelocateOutcome {
+    /// 挿入順に並んだ結果の device id (移動なら元 id、コピーなら新 id)。選択に使う。
+    result_ids: Vec<u64>,
+    /// 移送した automation lane の再キー表 `(src_track, old_lane, dest_track, new_lane)`。
+    lane_remap: Vec<(u32, u32, u32, u32)>,
+    /// **トラックを跨いで**移した device `(src_track, dest_track, device_id)`。
+    /// recording gesture の再キーに使う (gesture の鍵は `(track_id, target)` で、
+    /// lane が無くても gesture だけ立っていることがあるので、 lane 由来ではなく
+    /// device 由来で洗う)。
+    moved_devices: Vec<(u32, u32, u64)>,
+    /// コピーで新規に作った device (host へ実体化する対象)。
+    created: Vec<common::model::PluginInstance>,
+}
+
+/// 運搬の Song 側処理 (純関数)。 `None` = 落とし先チェーンが無い / 対象ゼロ。
+fn relocate_in_song(
+    song: &mut common::model::Song,
+    device_ids: &[u64],
+    dest_track: u32,
+    dest_index: u32,
+    copy: bool,
+) -> Option<RelocateOutcome> {
+    // 解決できない id は捨てる (削除済み device への stale 要求は正常系)。
+    let mut targets: Vec<(u64, u32, u32)> = device_ids
+        .iter()
+        .filter_map(|&id| find_device_by_id(song, id).map(|(t, i)| (id, t, i)))
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    if song.fx_chain_by_track_id(dest_track).is_none() {
+        return None;
+    }
+    // 同一チェーン内の移動は「並べ替え」として正当なので、 無変化の早期 return は
+    // しない (普通に処理する)。
+
+    let mut outcome = RelocateOutcome {
+        result_ids: Vec::new(),
+        lane_remap: Vec::new(),
+        moved_devices: Vec::new(),
+        created: Vec::new(),
+    };
+
+    if copy {
+        let mut copies: Vec<common::model::PluginInstance> = Vec::new();
+        for &(_, src_track, index) in &targets {
+            let Some(src) = device_at(song, src_track, index) else {
+                continue;
+            };
+            let mut inst = src.clone();
+            inst.id = song.alloc_device_id();
+            // `state` (= いまのツマミ) は引き継ぐ (`Arc` の clone なのでコストゼロ)。
+            // ARA アーカイブはトラックを跨いだら復元できないので捨てる。
+            if src_track != dest_track {
+                inst.ara_archive = None;
+            }
+            retarget_self_track_aux(&mut inst, src_track, dest_track);
+            copies.push(inst);
+        }
+        let at = (dest_index as usize).min(song.fx_chain_by_track_id(dest_track)?.len());
+        if let Some(chain) = song.fx_chain_by_track_id_mut(dest_track) {
+            chain.splice(at..at, copies.iter().cloned());
+        }
+        // 副作用は **dest 側だけ** (src はそのまま残るので降ろさない)。
+        apply_dest_side_effects(song, dest_track, &copies);
+        outcome.result_ids = copies.iter().map(|d| d.id).collect();
+        outcome.created = copies;
+        return Some(outcome);
+    }
+
+    // ---- 移動 ----
+    // 挿入位置の補正: dest と同じチェーンから `dest_index` より前で抜いた個数だけ
+    // 引く。 忘れると同一チェーン内の移動が 1 個ずれる。
+    let removed_before_dest = targets
+        .iter()
+        .filter(|&&(_, t, i)| t == dest_track && i < dest_index)
+        .count();
+    // src チェーンごとに index 降順で抜く (前から抜くと後続の index がずれる)。
+    targets.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut taken: Vec<(common::model::PluginInstance, u32)> = Vec::new();
+    for &(_, src_track, index) in &targets {
+        let Some(chain) = song.fx_chain_by_track_id_mut(src_track) else {
+            continue;
+        };
+        if (index as usize) >= chain.len() {
+            continue;
+        }
+        taken.push((chain.remove(index as usize), src_track));
+    }
+    // 元の指定順 (= チェーン表示順) に戻す。
+    taken.reverse();
+
+    let mut moved: Vec<common::model::PluginInstance> = Vec::new();
+    // src track ごとに「そのトラックから出ていった device」 を控える
+    // (副作用の判定は種類ごとなので、 出ていった種類だけを見る)。
+    let mut left_by_track: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    for (mut inst, src_track) in taken {
+        if src_track != dest_track {
+            // automation lane / mod_routing を新しい所有者へ移す。 lane を元
+            // トラックに置いたまま device だけ移すと、 その lane は永久に効かない
+            // (`daw_audio/src/automation.rs` が track から lane を引いてから
+            //  device_id で絞るため)。
+            let (lanes, routings) = extract_device_bindings(song, src_track, inst.id);
+            for lane in lanes {
+                let old_id = lane.id;
+                let new_id = push_lane_to(song, dest_track, lane);
+                outcome
+                    .lane_remap
+                    .push((src_track, old_id, dest_track, new_id));
+            }
+            for routing in routings {
+                // `ModRouting.source_id` は `Song.mod_sources` の song-global id
+                // なのでそのまま生きる (再キー不要)。
+                push_routing_to(song, dest_track, routing);
+            }
+            outcome.moved_devices.push((src_track, dest_track, inst.id));
+            left_by_track
+                .entry(src_track)
+                .or_default()
+                .push(inst.plugin_id.clone());
+            // ARA アーカイブは元トラックのクリップを指す persistent_id で作られて
+            // いるので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
+            inst.ara_archive = None;
+            retarget_self_track_aux(&mut inst, src_track, dest_track);
+        }
+        moved.push(inst);
+    }
+
+    let at = ((dest_index as usize).saturating_sub(removed_before_dest))
+        .min(song.fx_chain_by_track_id(dest_track)?.len());
+    outcome.result_ids = moved.iter().map(|d| d.id).collect();
+    if let Some(chain) = song.fx_chain_by_track_id_mut(dest_track) {
+        chain.splice(at..at, moved.iter().cloned());
+    }
+    // 副作用の対称化: src 側は「他に残っていなければ降ろす」、 dest 側は立てる。
+    for (src_track, left) in left_by_track {
+        apply_src_side_effects(song, src_track, &left);
+    }
+    apply_dest_side_effects(song, dest_track, &moved);
+    Some(outcome)
+}
+
+/// この device を指す automation lane / mod routing を所有者から **抜き取る**
+/// (retain ではなく取り出し — 移送先へ渡すため)。
+fn extract_device_bindings(
+    song: &mut common::model::Song,
+    track_id: u32,
+    device_id: u64,
+) -> (
+    Vec<common::model::AutomationLane>,
+    Vec<common::model::ModRouting>,
+) {
+    let hits = |target: &common::model::AutomationTarget| {
+        matches!(
+            target,
+            common::model::AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id
+        )
+    };
+    let (lanes_src, routings_src): (
+        &mut Vec<common::model::AutomationLane>,
+        &mut Vec<common::model::ModRouting>,
+    ) = if track_id == common::model::MASTER_TRACK_ID {
+        (&mut song.song_lanes, &mut song.song_mod_routings)
+    } else {
+        match song.tracks.iter_mut().find(|t| t.id == track_id) {
+            Some(t) => (&mut t.automation_lanes, &mut t.mod_routings),
+            None => return (Vec::new(), Vec::new()),
+        }
+    };
+    let mut lanes = Vec::new();
+    let mut i = 0;
+    while i < lanes_src.len() {
+        if hits(&lanes_src[i].target) {
+            lanes.push(lanes_src.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    let mut routings = Vec::new();
+    let mut i = 0;
+    while i < routings_src.len() {
+        if hits(&routings_src[i].target) {
+            routings.push(routings_src.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    (lanes, routings)
+}
+
+/// 移送した lane を新しい所有者へ push する。 **lane id は必ず再採番する** —
+/// 据え置くと dest 側の既存 lane と衝突し、 選択や行高 override が silent に
+/// 別 lane へ付け替わる。 戻り値は新 lane id。
+fn push_lane_to(
+    song: &mut common::model::Song,
+    dest_track: u32,
+    mut lane: common::model::AutomationLane,
+) -> u32 {
+    if dest_track == common::model::MASTER_TRACK_ID {
+        let id = song.alloc_song_lane_id();
+        lane.id = id;
+        song.song_lanes.push(lane);
+        id
+    } else if let Some(t) = song.tracks.iter_mut().find(|t| t.id == dest_track) {
+        let id = t.alloc_lane_id();
+        lane.id = id;
+        t.automation_lanes.push(lane);
+        id
+    } else {
+        lane.id
+    }
+}
+
+fn push_routing_to(
+    song: &mut common::model::Song,
+    dest_track: u32,
+    routing: common::model::ModRouting,
+) {
+    if dest_track == common::model::MASTER_TRACK_ID {
+        song.song_mod_routings.push(routing);
+    } else if let Some(t) = song.tracks.iter_mut().find(|t| t.id == dest_track) {
+        t.mod_routings.push(routing);
+    }
+}
+
+/// 自トラックを指していた aux 参照を移動先へ貼り替える。 他トラックを指すものは
+/// 触らない (= その配線はユーザーが意図して張ったもの)。
+fn retarget_self_track_aux(
+    inst: &mut common::model::PluginInstance,
+    src_track: u32,
+    dest_track: u32,
+) {
+    for slot in &mut inst.aux_inputs {
+        if let Some(route) = slot
+            && route.tap.source_track == src_track
+        {
+            route.tap.source_track = dest_track;
+        }
+    }
+    for slot in &mut inst.aux_outputs {
+        if let Some(route) = slot
+            && route.dest_track == src_track
+        {
+            route.dest_track = dest_track;
+        }
+    }
+}
+
+/// 貼り付け (別プロジェクト由来もありうる) の aux 参照解決。 実在しない track を
+/// 指す route は落とす。 **`aux_outputs` も見る** — `build_pasted_tracks` は
+/// `aux_inputs` しか見ていないが、それは取りこぼしなので真似しない。
+fn resolve_aux_refs_after_paste(
+    song: &common::model::Song,
+    inst: &mut common::model::PluginInstance,
+) {
+    for slot in &mut inst.aux_inputs {
+        if let Some(route) = slot
+            && song.track_by_id(route.tap.source_track).is_none()
+        {
+            *slot = None;
+        }
+    }
+    for slot in &mut inst.aux_outputs {
+        if let Some(route) = slot
+            && song.track_by_id(route.dest_track).is_none()
+        {
+            *slot = None;
+        }
+    }
+}
+
+/// 落とし先の副作用: VOICEVOX builtin が入ったら vocal track 化、 Transform が
+/// 入ったら `group_transform` を初期化する (追加側 `handler/mixer.rs` と同じ規則)。
+/// master (`MASTER_TRACK_ID`) は Track ではないので副作用を持たない。
+fn apply_dest_side_effects(
+    song: &mut common::model::Song,
+    dest_track: u32,
+    placed: &[common::model::PluginInstance],
+) {
+    if dest_track == common::model::MASTER_TRACK_ID {
+        return;
+    }
+    let has_voicevox = placed
+        .iter()
+        .any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX);
+    let has_transform = placed
+        .iter()
+        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID);
+    let Some(track) = song.tracks.iter_mut().find(|t| t.id == dest_track) else {
+        return;
+    };
+    if has_voicevox {
+        track.source = InstrumentSource::Vocal;
+    }
+    if has_transform && track.group_transform.is_none() {
+        track.group_transform = Some(common::model::GroupTransform::default());
+    }
+}
+
+/// 運び出した側の副作用: **出ていった種類**について、 同じ種類の device が
+/// 1 つも残っていなければ降ろす (削除側 `remove_devices_inner` と同じ規則 —
+/// 規則は 1 つで済ませる)。 `left` は そのトラックから出ていった `plugin_id` 列。
+fn apply_src_side_effects(song: &mut common::model::Song, src_track: u32, left: &[String]) {
+    if src_track == common::model::MASTER_TRACK_ID {
+        return;
+    }
+    let left_voicevox = left
+        .iter()
+        .any(|id| id == common::plugin_db::BUILTIN_ID_VOICEVOX);
+    let left_transform = left.iter().any(|id| id == common::video_fx::TRANSFORM_ID);
+    let Some(track) = song.tracks.iter_mut().find(|t| t.id == src_track) else {
+        return;
+    };
+    if left_voicevox
+        && !track
+            .devices
+            .iter()
+            .any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX)
+    {
+        track.source = InstrumentSource::None;
+    }
+    if left_transform
+        && !track
+            .devices
+            .iter()
+            .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
+    {
+        track.group_transform = None;
+    }
 }

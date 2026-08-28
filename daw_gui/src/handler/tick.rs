@@ -499,13 +499,14 @@ impl AppData {
                 .iter()
                 .find(|t| t.id == track_id)
                 .map(|t| f64::from(t.pan)),
-            common::model::AutomationTarget::PluginParam { device_id, param_id, .. } => {
-                // v29: 安定 device_id → positional cache key へ逆引き。
-                let (t, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
-                self.ipc.plugin_param_values
-                    .get(&(t, device_index, *param_id))
-                    .copied()
-            }
+            common::model::AutomationTarget::PluginParam { device_id, param_id, .. } => self
+                .ipc
+                .plugin_param_values
+                .get(&DeviceParamKey {
+                    device_id: *device_id,
+                    param_id: *param_id,
+                })
+                .copied(),
             // Image PiP: 同 track の first image event の field 値を現在値とする
             // (`docs/plan_image_automation.md` §4)。 drag が ImageEvent.field を
             // 更新 → ここで再読み込み → record_automation_points_for_tick が

@@ -1415,6 +1415,14 @@ impl Runner {
             state.ui.invalidate_scene_cache();
         }
 
+        // r.md #71 (プラグインのコピー / 移動): view が積んだ **解決済み shortcut 名** を
+        // 次フレームの shortcut layer へ注入する (右クリックメニューの「貼り付け」等)。
+        // 着地点は Ctrl+V を押したときと完全に同一経路になり、 paste の実装が
+        // 2 本に割れない (r.md #36 の `EditorKey` 転送と同じ idiom)。
+        for name in std::mem::take(&mut state.app.ui_ephemeral.pending_shortcut_injections) {
+            state.ui.inject_shortcut(name);
+        }
+
         state.ui.frame_with_fonts(
             &mut state.app,
             &mut state.scene,

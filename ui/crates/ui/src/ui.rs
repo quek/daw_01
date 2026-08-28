@@ -184,6 +184,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// None のまま (= 二重ロードしない)。`frame` / `frame_to_edits` を直接使う caller の
     /// ときだけ初回 measure 時に lazy 生成する。
     owned_font_system: Option<FontSystem>,
+    /// r.md #71 (プラグインのコピー / 移動): widget / view をまたぐ drag の payload
+    /// (同時に 1 本)。 詳細と寿命は [`crate::drag_drop`]。
+    drag_payload: Option<crate::drag_drop::DragPayload>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -256,6 +259,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             injected_shortcuts: Vec::new(),
             text_metrics: TextMetrics::new(),
             owned_font_system: None,
+            drag_payload: None,
             _m: PhantomData,
         }
     }
@@ -605,6 +609,16 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let mut keyboard_events = keyboard;
         let mut ime_events = ime;
 
+        // r.md #71 (プラグインのコピー / 移動): 運搬中の payload の修飾キーを
+        // 「**ボタンが押されていた最後のフレーム**」に保つ。 release フレームは
+        // primary_pressed == false なので更新されず、直前の値が残る = drop 側は
+        // ModifiersChanged 先行 race に晒されない (`DragPayload::modifiers` の doc 参照)。
+        if let Some(p) = self.drag_payload.as_mut()
+            && pointer.primary_pressed
+        {
+            p.modifiers = pointer.modifiers;
+        }
+
         // M15: OS text store (TSF) がこのフレームに加えた編集 (まぜ書き変換 / 再変換 /
         // composition 確定) を drain し、`ImeEvent` に変換して ime_events 先頭へ置く
         // (winit IMM 由来の ime より前に適用)。Windows で TSF 駆動中は winit IMM を使わない
@@ -836,6 +850,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_double_click: &mut pending_double_click,
             pending_double_click_press: &mut pending_double_click_press,
             pending_secondary_click: &mut pending_secondary_click,
+            drag_payload: &mut self.drag_payload,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -913,6 +928,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
             widget_count: u32::try_from(seen_widgets.len()).unwrap_or(u32::MAX),
             scenegraph_size: u32::try_from(self.scenegraph.len()).unwrap_or(u32::MAX),
         };
+        // r.md #71 (プラグインのコピー / 移動): **どこにも落とさなかった drag は
+        // release フレームの末尾で捨てる**。 host 側に置くことで「取り消し忘れ」の
+        // 分岐が view から構造的に無くなる。 落とし先の view はこの同じフレームの
+        // 中で `take_drag_payload` するので取りこぼさない。
+        if pointer.primary_just_released {
+            self.drag_payload = None;
+        }
         edits
     }
 }
@@ -1067,6 +1089,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `take_secondary_click_in_rect(rect)` が rect.contains で 1 度だけ消費する。
     /// 右ドラッグ (= 矩形選択) だったフレームでは立たない。
     pub(crate) pending_secondary_click: &'a mut Option<(f32, f32)>,
+    /// r.md #71 (プラグインのコピー / 移動): widget / view をまたぐ drag の payload。
+    /// `Ui` は `&mut UiHost` を持たずフィールドごとに借用する構造なので、 この 1 本を
+    /// 通さないと [`crate::drag_drop`] の `impl Ui` から payload に触れない。
+    pub(crate) drag_payload: &'a mut Option<crate::drag_drop::DragPayload>,
     _m: PhantomData<&'a M>,
 }
 

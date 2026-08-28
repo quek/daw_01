@@ -389,19 +389,12 @@ impl AppData {
 
     pub(crate) fn set_aux_input_tap_point(
         &mut self,
-        track_id: u32,
-        device_index: u32,
+        device_id: u64,
         port: u8,
         tap_point: common::model::TapPoint,
     ) {
         self.edit_song(|song| {
-            let inst = if track_id == common::model::MASTER_TRACK_ID {
-                song.master_fx_chain.get_mut(device_index as usize)
-            } else {
-                song.track_by_id_mut(track_id)
-                    .and_then(|t| t.devices.get_mut(device_index as usize))
-            };
-            if let Some(inst) = inst
+            if let Some(inst) = device_mut_by_id(song, device_id)
                 && let Some(route) = inst
                     .aux_inputs
                     .get_mut(port as usize)

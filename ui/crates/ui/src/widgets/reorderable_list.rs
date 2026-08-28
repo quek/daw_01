@@ -33,9 +33,10 @@
 //! press → session 開始の anchor 判定は「前フレームに表示されていた (= 可変高の) layout」 で行い、
 //! 次フレームから畳む (1 frame 遅延、 視覚的に滑らか)。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 
+use daw_ui_platform::Modifiers;
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::edit::Edit;
@@ -149,14 +150,47 @@ impl ReorderableListStyle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// r.md #71 (プラグインのコピー / 移動): 掴んだ行をリスト矩形の **横へ** 出したと
+/// 判定する余白 (px)。
+///
+/// **縦のはみ出しでは運び出さない**: reorder は `compute_reorder_target_index` が
+/// y だけを見る **1 次元の gesture** で、リストより上/下にポインタがあることは
+/// 「先頭へ / 末尾へ動かす」の途中経過として意味を持つ。 一方 x はリスト内で
+/// 何の意味も持たないので、横に出たことが「別の場所へ運ぶ」の曖昧さのない合図になる。
+///
+/// 余白ゼロだと事故る: inspector の chain は幅 260px 前後 (`area.w - pad*2`) しか
+/// 無く、普通に並べ替えているだけで数 px 横に揺れる。 その瞬間に reorder が失われて
+/// トラック跨ぎの運搬に化けたら、並べ替えが「たまに効かない」機能になる。
+const CARRY_OUT_MARGIN_PX: f32 = 24.0;
+
+#[derive(Clone, Debug, Default)]
 pub struct ReorderableListResponse {
     /// このフレームで click された row index (drag 距離 < 16px の release で trigger)。
     pub clicked: Option<usize>,
+    /// `clicked` を起こした **press フレーム**の修飾キー。 選択遷移
+    /// (Ctrl / Shift) は必ずこれで決める。 release フレームの生読みは
+    /// `ModifiersChanged` 先行 race で修飾が落ちて見え、Ctrl+click が
+    /// Single に化ける (arrangement が `press_modifiers` で同じ罠を回避している)。
+    pub clicked_modifiers: Modifiers,
     /// hover 中の row index (任意フレーム)。
     pub hovered: Option<usize>,
     /// drag 中の anchor row index。drag 開始フレーム以降、release まで保持。
     pub dragging: Option<usize>,
+    /// 掴んだ行がリスト矩形の **横へ出た最初のフレーム**だけ `Some(index)`。
+    /// widget 内部の reorder session はこの時点で破棄され、以後 `Reorder` は
+    /// 発行されない。caller はここで [`Ui::begin_drag`] して運搬を引き継ぐ。
+    pub dragged_out: Option<usize>,
+    /// `accept_drag_kind` と一致する外部 drag が **`rect` の上にある**ときの挿入位置
+    /// (`0..=items.len()`)。 リストの外にポインタがあるフレームは `None`
+    /// (= indicator を出さない / drop も受けない)。drop indicator は widget が描く。
+    pub external_insert_at: Option<usize>,
+    /// 上の位置で **このフレームに release された** (= drop 確定)。caller は
+    /// [`Ui::take_drag_payload`] して commit する。
+    pub external_dropped_at: Option<usize>,
+    /// このフレームに描いた行の `(index, 画面座標 rect)`。 caller が
+    /// `context_menu_for` / overlay を重ねるため (arrangement の
+    /// `track_header_rects` / `clip_rects` と同じ contract)。 可視行のみ。
+    pub row_rects: Vec<(usize, Rect)>,
 }
 
 /// release frame で 1 度発行される reorder Edit リクエスト。
@@ -175,6 +209,10 @@ struct ReorderSession {
     /// drag 中の最終 mouse y (release frame の `pointer.pos` が press 位置のままになる
     /// winit ケースに備えて、widget state 側で確実に保持)。
     last_mouse_y: f32,
+    /// press した **そのフレーム**の修飾キー。 release フレームの生読みは
+    /// `ModifiersChanged` 先行 race で落ちるので、 選択遷移はこの値で決める
+    /// (`ArrangementState.press_modifiers` と同じ理由)。
+    press_modifiers: Modifiers,
 }
 
 #[derive(Debug, Default)]
@@ -192,15 +230,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// drag による並び替えは release frame で `make_edit(ReorderableListEditRequest::Reorder(order))` を
     /// 1 度だけ発行する (commit-by-release)。dy < 16px の release は click 扱い (`Response.clicked`)。
     ///
-    /// `selected: Option<usize>` は描画用ハイライトのみ (本 widget は selection を管理しない、
-    /// caller が `clicked` を見て更新する)。
+    /// `selected: &[usize]` は描画用ハイライトのみ (本 widget は selection を管理しない、
+    /// caller が `clicked` / `clicked_modifiers` を見て更新する)。
+    ///
+    /// `accept_drag_kind` は **外部 drag** ([`Ui::begin_drag`]) を受け入れる札。
+    /// `None` = 受け付けない。
     #[allow(clippy::too_many_arguments)]
     pub fn reorderable_list<T, F, R>(
         &mut self,
         id: impl Hash,
         rect: Rect,
         items: &[T],
-        selected: Option<usize>,
+        selected: &[usize],
+        accept_drag_kind: Option<&'static str>,
         style: &ReorderableListStyle,
         make_edit: F,
         row: R,
@@ -214,6 +256,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect,
             items,
             selected,
+            accept_drag_kind,
             style,
             make_edit,
             row,
@@ -236,7 +279,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         rect: Rect,
         items: &[T],
-        selected: Option<usize>,
+        selected: &[usize],
+        accept_drag_kind: Option<&'static str>,
         style: &ReorderableListStyle,
         make_edit: F,
         row: R,
@@ -254,6 +298,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect,
             items,
             selected,
+            accept_drag_kind,
             style,
             make_edit,
             row,
@@ -268,7 +313,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         rect: Rect,
         items: &[T],
-        selected: Option<usize>,
+        selected: &[usize],
+        accept_drag_kind: Option<&'static str>,
         style: &ReorderableListStyle,
         make_edit: F,
         mut row: R,
@@ -345,11 +391,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         local >= tops[i] && local < tops[i] + style.row_height
                     });
                     if let Some(idx) = hit {
+                        let press_modifiers = pointer.modifiers;
                         let state: &mut ReorderableListState = self.widget_state(wid);
                         state.session = Some(ReorderSession {
                             anchor_index: idx,
                             anchor_mouse_y: py,
                             last_mouse_y: py,
+                            press_modifiers,
                         });
                     }
                 }
@@ -357,10 +405,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- drag continue: 毎フレーム last_mouse_y を更新 ----
-        if let Some((_px, py)) = pointer.pos {
+        // r.md #71 (プラグインのコピー / 移動): 掴んだまま **横へ** 出たら内部 reorder を
+        // 打ち切り、 caller に運搬 (`begin_drag`) を引き継がせる。 判定は x だけ
+        // (`CARRY_OUT_MARGIN_PX` の doc 参照)。
+        let mut dragged_out: Option<usize> = None;
+        if let Some((px, py)) = pointer.pos {
+            let out_of_x = px < rect.x - CARRY_OUT_MARGIN_PX
+                || px > rect.x + rect.w + CARRY_OUT_MARGIN_PX;
             let state: &mut ReorderableListState = self.widget_state(wid);
             if let Some(ref mut s) = state.session {
                 s.last_mouse_y = py;
+                if out_of_x {
+                    dragged_out = Some(s.anchor_index);
+                    state.session = None;
+                }
             }
         }
 
@@ -374,7 +432,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             None
         };
 
+        // ---- 外部 drag (widget を跨いだ運搬) の受け入れ ----
+        // **ポインタがこのリストの矩形の中にあるフレームだけ** 挿入位置を出す
+        // (外にあるフレームは None = indicator も drop も無し)。 gate が無いと画面の
+        // どこで drag していてもチェーンに indicator が出て、 しかも release でその
+        // 位置に落ちてしまう (トラックヘッダへ落とす経路と二重に発火する)。
+        // gate を入れれば 2 つの drop 経路は幾何的に排他になる。
+        // 行の中点より上なら手前、下なら後ろ。 tops は展開高込みの実表示レイアウトなので、
+        // アコーディオンが開いていても indicator が行とずれない。
+        let external_insert_at: Option<usize> = accept_drag_kind
+            .filter(|k| self.dragging_kind() == Some(*k))
+            .and_then(|_| pointer.pos)
+            .filter(|&(px, py)| rect.contains(px, py))
+            .map(|(_px, py)| {
+                let local_y = py - rect.y + self.scroll_offset(("reorderable_list_scroll", &id)).1;
+                (0..item_count)
+                    .filter(|&i| tops[i] + style.row_height * 0.5 < local_y)
+                    .count()
+            });
+        let external_dropped_at = if pointer.primary_just_released {
+            external_insert_at
+        } else {
+            None
+        };
+
         let mut clicked: Option<usize> = None;
+        let mut clicked_modifiers = Modifiers::default();
         if let Some(s) = release_session {
             let dy = (s.last_mouse_y - s.anchor_mouse_y).abs();
             if dy >= DRAG_THRESHOLD_PX {
@@ -400,6 +483,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // row 残り領域の button_at 等が click を消費する想定なので、widget は出さない)。
                 if style.drag_handle_w <= 0.0 {
                     clicked = Some(s.anchor_index);
+                    clicked_modifiers = s.press_modifiers;
                 }
             }
         }
@@ -419,6 +503,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let style_copy = *style;
         let item_count_copy = item_count;
         let hovered = Cell::new(None::<usize>);
+        // 描いた行の rect (caller が context_menu / overlay を重ねるため)。
+        // 描画クロージャの中から書くので `RefCell` (`hovered` が `Cell` なのと同じ理由)。
+        let row_rects: RefCell<Vec<(usize, Rect)>> = RefCell::new(Vec::new());
         // 展開を描くのは「静止時」 のみ (= collapsed=false かつ drag overlay 無し)。
         let draw_expanded = !collapsed && session_for_overlay.is_none();
         let tops_for_draw = tops;
@@ -453,7 +540,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         let inside = pointer
                             .pos
                             .is_some_and(|(px, py)| row_rect.contains(px, py));
-                        let is_selected = selected == Some(i);
+                        let is_selected = selected.contains(&i);
                         let bg = if is_selected {
                             style_copy.row_bg_selected
                         } else if inside {
@@ -461,6 +548,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         } else {
                             style_copy.row_bg
                         };
+                        row_rects.borrow_mut().push((i, row_rect));
                         ui.push_rect(RectCommand {
                             rect: row_rect,
                             fill: bg,
@@ -513,8 +601,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     let inside = pointer
                         .pos
                         .is_some_and(|(px, py)| row_rect.contains(px, py));
-                    let is_selected = selected == Some(src);
+                    let is_selected = selected.contains(&src);
                     let is_dragging = session_for_overlay.is_some_and(|s| s.anchor_index == src);
+                    row_rects.borrow_mut().push((src, row_rect));
                     let bg = if is_dragging {
                         style_copy.row_bg_dragging
                     } else if is_selected {
@@ -537,6 +626,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     if inside {
                         hovered.set(Some(src));
                     }
+                }
+
+                // ---- 外部 drag の drop indicator ----
+                // 内部 session と外部 drag は同時に成立しない (session がある間は
+                // `dragging_kind()` が None) ので分岐は排他。 位置は展開高込みの
+                // 実表示レイアウト (`tops_for_draw`) 基準。
+                if let Some(at) = external_insert_at {
+                    let top = tops_for_draw.get(at).copied().unwrap_or(content_h);
+                    let indicator_y =
+                        rect.y - offset.1 + top - style_copy.drop_indicator_h * 0.5;
+                    let y_clamped = indicator_y
+                        .max(rect.y)
+                        .min(rect.y + rect.h - style_copy.drop_indicator_h);
+                    ui.push_rect(RectCommand {
+                        rect: Rect {
+                            x: rect.x,
+                            y: y_clamped,
+                            w: row_visible_w,
+                            h: style_copy.drop_indicator_h,
+                        },
+                        fill: style_copy.drop_indicator_color,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [0.0; 4],
+                        clip_rect: None,
+                    });
                 }
 
                 // ---- drop indicator: drag 中で dy >= threshold なら描画 ----
@@ -585,8 +700,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         ReorderableListResponse {
             clicked,
+            clicked_modifiers,
             hovered: hovered.get(),
             dragging: session_for_overlay.map(|s| s.anchor_index),
+            dragged_out,
+            external_insert_at,
+            external_dropped_at,
+            row_rects: row_rects.into_inner(),
         }
     }
 }
@@ -626,6 +746,7 @@ mod tests {
                 "rl",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                 &items,
+                &[],
                 None,
                 &style,
                 |_| Edit::mutate(|()| {}),
@@ -652,6 +773,7 @@ mod tests {
                 "rl",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                 &items,
+                &[],
                 None,
                 &style,
                 |_| Edit::mutate(|()| {}),
@@ -704,6 +826,7 @@ mod tests {
                     "rl",
                     Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                     &items,
+                    &[],
                     None,
                     &style,
                     make_edit.clone(),
@@ -757,6 +880,7 @@ mod tests {
                     "rl",
                     Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                     &items,
+                    &[],
                     None,
                     &style,
                     make_edit.clone(),
@@ -786,6 +910,7 @@ mod tests {
                     "rl",
                     Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                     &items,
+                    &[],
                     None,
                     &style,
                     make_edit.clone(),
@@ -834,6 +959,7 @@ mod tests {
                     "rl",
                     Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                     &items,
+                    &[],
                     None,
                     &style,
                     |_| Edit::mutate(|()| {}),
@@ -876,6 +1002,7 @@ mod tests {
                     "rl",
                     Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                     &items,
+                    &[],
                     None,
                     &style,
                     |_| Edit::mutate(|()| {}),
@@ -902,6 +1029,7 @@ mod tests {
                 "rl",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
                 &items,
+                &[],
                 None,
                 &style,
                 |_| Edit::mutate(|()| {}),
@@ -940,6 +1068,7 @@ mod tests {
                 "rl",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 600.0 },
                 &items,
+                &[],
                 None,
                 &style,
                 |_| Edit::mutate(|()| {}),

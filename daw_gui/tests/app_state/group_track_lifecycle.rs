@@ -14,11 +14,11 @@
 //! 1. group 化で楽器 track が group の子になり、 group は楽器 track の
 //!    直前 (= 上) に挿入される (Live 互換)
 //! 2. group のチェーンに Bitcrush+Delay を順に append できて、
-//!    `track_plugin_ids` に device_id が反映される
-//! 3. Bitcrush 削除で、 残った Delay の device_id だけが
-//!    `track_plugin_ids[group_id]` に残る
-//! 4. ungroup で audio 側に `ClosePluginShmem` / plugin_host 側に
-//!    `RemoveTrack` が送られ、 楽器 track は `parent_group_id == None` で残る
+//!    `loaded_devices` に device_id が反映される
+//! 3. Bitcrush 削除で、 残った Delay の device_id だけが `loaded_devices` に残る
+//! 4. ungroup で group の全 device について audio 側に `ClosePluginShmem` →
+//!    plugin_host 側に `RemoveSlotPlugin` が **この順で** 送られ、
+//!    楽器 track は `parent_group_id == None` で残る
 
 use common::model::{AutomationLane, AutomationTarget, InstrumentSource};
 use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
@@ -51,17 +51,16 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         plugin_msgs
             .iter()
-            .any(|m| matches!(m, PluginCommand::SetSlotPlugin { device_id, track_id, .. }
-                if *device_id == synth_dev && *track_id == inst_track_id)),
+            .any(|m| matches!(m, PluginCommand::SetSlotPlugin { device_id, .. }
+                if *device_id == synth_dev)),
         "SetSlotPlugin(device_id) should be sent to plugin_host: {:?}",
         plugin_msgs
     );
 
     fake_plugin_loaded(&mut app, inst_track_id, 0, "test.synth");
-    assert_eq!(
-        app.ipc.track_plugin_ids.get(&inst_track_id).map(|v| v.as_slice()),
-        Some([synth_dev].as_slice()),
-        "instrument device_id should register in track_plugin_ids"
+    assert!(
+        app.ipc.loaded_devices.contains_key(&synth_dev),
+        "instrument device_id should register in loaded_devices"
     );
 
     // 子プロセス sync は pull 型 (docs/plan_arch_refactor.md §7.5): 実機では runner が
@@ -145,8 +144,8 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::SetSlotPlugin { device_id, track_id, .. }
-                if *device_id == bitcrush_dev && *track_id == group_id
+            PluginCommand::SetSlotPlugin { device_id, .. }
+                if *device_id == bitcrush_dev
         )),
         "Bitcrush should land at device 0 on the group track: {:?}",
         plugin_msgs
@@ -166,19 +165,19 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::SetSlotPlugin { device_id, track_id, .. }
-                if *device_id == delay_dev && *track_id == group_id
+            PluginCommand::SetSlotPlugin { device_id, .. }
+                if *device_id == delay_dev
         )),
         "Delay should land at device 1 on the group track: {:?}",
         plugin_msgs
     );
     fake_plugin_loaded(&mut app, group_id, 1, "test.delay");
 
-    // group_plugin_ids には Bitcrush, Delay の device_id が register されている。
-    assert_eq!(
-        app.ipc.track_plugin_ids.get(&group_id).map(|v| v.as_slice()),
-        Some([bitcrush_dev, delay_dev].as_slice()),
-        "group has Bitcrush + Delay device_ids"
+    // `loaded_devices` に Bitcrush, Delay の device_id が register されている。
+    assert!(
+        app.ipc.loaded_devices.contains_key(&bitcrush_dev)
+            && app.ipc.loaded_devices.contains_key(&delay_dev),
+        "group has Bitcrush + Delay device_ids in loaded_devices"
     );
     assert_eq!(
         app.song_doc.song().tracks
@@ -192,8 +191,10 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // Step 6: Bitcrush (device 0) を削除。
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
-    app.handle_event(AppEvent::RemoveDevice { index: 0 });
-    // RemoveDevice は plugin の最新 state を取ってから Undo snapshot → 削除 という
+    app.handle_event(AppEvent::RemoveDevices {
+        device_ids: vec![bitcrush_dev],
+    });
+    // RemoveDevices は plugin の最新 state を取ってから Undo snapshot → 削除 という
     // deferred path を通る。 test では plugin_host を mock していないので、 fake で
     // AllStatesReceived を流して deferred edit を実行させる。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
@@ -209,11 +210,11 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // plugin_host が destroy 完了して SlotPluginUnloaded を返したのを fake。
     app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginUnloaded { device_id: bitcrush_dev }));
 
-    // Bitcrush が track_plugin_ids から消えて、 Delay のみ残る。
-    assert_eq!(
-        app.ipc.track_plugin_ids.get(&group_id).map(|v| v.as_slice()),
-        Some([delay_dev].as_slice()),
-        "after Bitcrush remove: only Delay's device_id remains in group"
+    // Bitcrush が `loaded_devices` から消えて、 Delay のみ残る。
+    assert!(
+        !app.ipc.loaded_devices.contains_key(&bitcrush_dev)
+            && app.ipc.loaded_devices.contains_key(&delay_dev),
+        "after Bitcrush remove: only Delay's device_id remains loaded"
     );
     assert_eq!(
         app.song_doc.song().tracks
@@ -225,7 +226,9 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     );
 
     // Step 7: ungroup。 use-after-free 防止: audio 側に `ClosePluginShmem(delay)` を
-    // 先に送り、 そのあと plugin_host に `RemoveTrack(group_id)`。
+    // 先に送り、 そのあと plugin_host に `RemoveSlotPlugin(delay)`。
+    // r.md #71 (プラグインのコピー / 移動): track という単位は host 側に無いので、
+    // teardown は **group の全 device について device 単位** で出る。
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
     app.handle_event(AppEvent::UngroupTracks {
@@ -261,12 +264,22 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     );
 
     // ----- ungroup IPC: plugin_host 側 -----
+    // group が持っていた device (= delay) だけが teardown される。 synth は別
+    // トラックなので触られない (= 音が続く)。
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::RemoveTrack { track_id } if *track_id == group_id
+            PluginCommand::RemoveSlotPlugin { device_id } if *device_id == delay_dev
         )),
-        "RemoveTrack(group_id) must be sent on plugin_tx: {:?}",
+        "RemoveSlotPlugin(delay) must be sent on plugin_tx: {:?}",
+        plugin_msgs
+    );
+    assert!(
+        !plugin_msgs.iter().any(|m| matches!(
+            m,
+            PluginCommand::RemoveSlotPlugin { device_id } if *device_id == synth_dev
+        )),
+        "instrument device must survive ungroup: {:?}",
         plugin_msgs
     );
 
@@ -289,13 +302,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "instrument track has no children → not a group"
     );
     assert!(
-        !app.ipc.track_plugin_ids.contains_key(&group_id),
-        "group_id is removed from track_plugin_ids"
+        !app.ipc.loaded_devices.contains_key(&delay_dev),
+        "group の device は帳簿から落ちる"
     );
-    assert_eq!(
-        app.ipc.track_plugin_ids.get(&inst_track_id).map(|v| v.as_slice()),
-        Some([synth_dev].as_slice()),
-        "instrument track keeps its device_id (audio continues)"
+    assert!(
+        app.ipc.loaded_devices.contains_key(&synth_dev),
+        "instrument track keeps its device (audio continues)"
     );
     // 念のため song モデル側も instrument device が残っているか。
     let inst_track = &app.song_doc.song().tracks[0];
@@ -354,11 +366,13 @@ fn setup_loaded_chain(
     (track_id, [synth_dev, bitcrush_dev, delay_dev])
 }
 
-/// v29 の reorder は (a) song を permute、 (b) daw_gui の `(track, index)`
-/// cache を再キー、 (c) `LoadSong` 再送のみ (旧 `ReorderChain` は削除 —
-/// plugin_host は順序を持たず、 audio の処理順は LoadSong が compile する)。
+/// reorder は (a) song を permute、 (b) `LoadSong` 再送のみ
+/// (旧 `ReorderChain` は削除 — plugin_host は順序を持たず、 audio の処理順は
+/// LoadSong が compile する)。 r.md #71 (プラグインのコピー / 移動) で
+/// daw_gui 側の帳簿も安定 `device_id` keyed になったので、 **再キーする対象が
+/// そもそも無い**。
 #[test]
-fn inspector_chain_reorder_rekeys_both_children() {
+fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
     let (track_id, [synth_dev, bitcrush_dev, delay_dev]) =
         setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
@@ -384,22 +398,16 @@ fn inspector_chain_reorder_rekeys_both_children() {
         );
     }
 
-    // (b) daw_gui caches re-keyed so each device index resolves to its moved plugin.
-    assert_eq!(
-        app.ipc.loaded_slots.get(&(track_id, 0)).map(|i| i.device_id),
-        Some(synth_dev),
-        "index 0 still maps to synth's device_id"
-    );
-    assert_eq!(
-        app.ipc.loaded_slots.get(&(track_id, 1)).map(|i| i.device_id),
-        Some(delay_dev),
-        "index 1 now maps to delay's device_id"
-    );
-    assert_eq!(
-        app.ipc.loaded_slots.get(&(track_id, 2)).map(|i| i.device_id),
-        Some(bitcrush_dev),
-        "index 2 now maps to bitcrush's device_id"
-    );
+    // (b) r.md #71 (プラグインのコピー / 移動): 帳簿は安定 `device_id` keyed なので
+    //     並べ替えで **再キーが発生しない** (旧実装は index を詰め直していた =
+    //     不変条件 1 が禁じる貼り替え補償コード)。 3 台とも load 済のまま。
+    for dev in [synth_dev, bitcrush_dev, delay_dev] {
+        assert!(
+            app.ipc.loaded_devices.contains_key(&dev),
+            "並べ替えで帳簿の entry は動かない (device_id keyed): {dev}"
+        );
+    }
+    let _ = track_id;
 
     // (c) v29: children には LoadSong だけが飛ぶ (audio schedule は Song から
     // 再 compile、 plugin_host は順序を持たない)。 pull 型 sync なので frame flush を

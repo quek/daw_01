@@ -246,7 +246,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             automation_lanes: build_arrangement_automation_lanes(
                 t,
                 lane_build_data,
-                &|tgt| app.plugin_param_range(t.id, tgt),
+                &|tgt| app.plugin_param_range(tgt),
                 &|tgt| app.plugin_param_name(tgt),
             ),
             row_h: app.ui_prefs.track_row_overrides.get(&t.id).copied(),
@@ -327,7 +327,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         &app.song_doc.song().song_lanes,
         common::model::MASTER_TRACK_ID,
         lane_build_data,
-        &|tgt| app.plugin_param_range(common::model::MASTER_TRACK_ID, tgt),
+        &|tgt| app.plugin_param_range(tgt),
         &|tgt| app.plugin_param_name(tgt),
     );
     let master_row = ArrangementMasterRow {

@@ -21,7 +21,7 @@ pub use song_doc::{EditScope, SongDoc, StreamGesture};
 pub use activity::ActivityState;
 pub use transport::TransportState;
 pub use selection::SelectionState;
-pub use ipc::IpcState;
+pub use ipc::{DeviceParamKey, IpcState};
 pub use voicevox::VoicevoxState;
 pub use media::MediaState;
 pub use recording::RecordingState;

@@ -10,9 +10,17 @@ use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{
-    LoadedSlotInfo, PendingClipFxBounce, PendingStateRequest, PendingVocalSynthBounce,
+    LoadedDeviceInfo, PendingClipFxBounce, PendingStateRequest, PendingVocalSynthBounce,
 };
 use crate::dispatcher::BackgroundDispatcher;
+
+/// `(device_id, param_id)` の複合キー。 生タプルにしないのは、 positional
+/// キーと見分けが付かなくなる (arch-lint / 読み手の双方) ため。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceParamKey {
+    pub device_id: u64,
+    pub param_id: u32,
+}
 
 pub struct IpcState {
     /// (r.md #5 ARA2) Last ARA clip-spec set sent to the plugin host per
@@ -30,52 +38,34 @@ pub struct IpcState {
         std::collections::HashMap<common::model::AudioSourceId, PathBuf>,
     /// Phase 4 Step C-3 (`docs/plan_automation.md` §6): plugin GUI で knob 値が
     /// 変更されるたびに `PluginParamValueChangedFromChild` で受け取る最新値の
-    /// cache。 `(track_id, slot, param_id) -> plain value`。 audio bridge tick
+    /// cache。 `(device_id, param_id) -> plain value`。 audio bridge tick
     /// で `current_plain_value(PluginParam)` がここから plain 値を引いて
-    /// `AutomationPoint` を生成する。 session-only / Undo 対象外。 plugin
-    /// reload で古い entry が残るが、 lane.target も同 plugin_id を持つので
-    /// stale 値が誤って record されるリスクは低い (= 念のため Step C-3
-    /// follow-up で plugin unload 時に該当 entry を消す)。
-    pub plugin_param_values: std::collections::HashMap<
-        (u32, u32, u32),
-        f64,
-    >,
+    /// `AutomationPoint` を生成する。 session-only / Undo 対象外。 device が
+    /// 消える経路 (unload / 削除 / project 切替) で当該 entry を落とす。
+    pub plugin_param_values: std::collections::HashMap<DeviceParamKey, f64>,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
-    /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
+    /// くるたびに上書き。 安定 `device_id` で identify、 Parameter
     /// Picker (Phase 3+) / lane の label 解決 / norm↔plain 変換に
     /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
-    pub plugin_params: std::collections::HashMap<
-        (u32, u32),
-        Vec<common::protocol::PluginParamInfo>,
-    >,
-    /// `(track_id, slot)` ごとに plugin が埋め込み GUI (editor window)
+    pub plugin_params: std::collections::HashMap<u64, Vec<common::protocol::PluginParamInfo>>,
+    /// device ごとに plugin が埋め込み GUI (editor window)
     /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
     /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
     /// 「⚙」 でインライン param パネルをトグル。 plugin_params と同じ寿命・同じ箇所
-    /// (insert / reorder / remove / clear) で維持する。
-    pub slot_has_gui: std::collections::HashMap<(u32, u32), bool>,
-    /// `track_id → 現在ロード済の device_id 列` (v29: 安定
-    /// `PluginInstance::id`)。 plugin_host から `SlotPluginLoaded` を
-    /// 受信したときに register、 `SlotPluginUnloaded` で drain。
-    /// `RemoveTrack` を plugin_host に送る前に audio engine
-    /// に直接 `ClosePluginShmem` を発射して plugin_refs / device 表
-    /// を空にし、 plugin destroy 中の use-after-free (`pd.prepare()` で
-    /// unmapped shmem を踏む → audio worker が AV で silent terminate
-    /// → all_done 永久 wait) を防ぐ。 「host に実際に載った device」 を
-    /// 保持するための session-only bookkeeping。
-    pub track_plugin_ids: std::collections::HashMap<u32, Vec<u64>>,
-    /// `(track_id, device_index)` → 現在 plugin_host に load されている
-    /// plugin の情報。 Undo/Redo の reconcile (`reconcile_plugins_with_song`)
-    /// で「Song の各 device の plugin が host 側と一致しているか」 を device
-    /// 粒度で diff するために使う。 [`Self::track_plugin_ids`] が track
-    /// 単位の plugin_id 集合だけを持つのに対し、 こちらは device ごとの
-    /// 詳細 (どの index にどの plugin string id) まで track する。
+    /// (insert / remove / clear) で維持する。
+    pub slot_has_gui: std::collections::HashMap<u64, bool>,
+    /// `device_id` → 現在 plugin_host に load されている plugin の情報。
+    /// Undo/Redo の reconcile (`reconcile_plugins_with_song`) で「Song の各
+    /// device の plugin が host 側と一致しているか」 を device 粒度で diff する
+    /// ために使う。 track を消す前に **Song から** device を列挙して
+    /// `ClosePluginShmem` を撃つので (`plan_track_removal_ipc`)、 track → device
+    /// の帳簿は持たない (r.md #71 プラグインのコピー / 移動: device の帰属は
+    /// Song が SSoT、 複製すると移動で stale になる)。
     ///
     /// 更新タイミング: `SlotPluginLoaded` 受信時に insert、
-    /// `SlotPluginUnloaded` 受信時に reverse-lookup retain、
-    /// 削除系編集の `_inner` 関数内で track / device index 単位で remove。
-    pub loaded_slots: std::collections::HashMap<(u32, u32), LoadedSlotInfo>,
+    /// `SlotPluginUnloaded` 受信時と削除系編集の `_inner` 関数内で remove。
+    pub loaded_devices: std::collections::HashMap<u64, LoadedDeviceInfo>,
     // PDC の入力となる「plugin が報告した latency」 は daw_gui では **持たない**。
     // plugin_host からの `PluginEvent::PluginLatencyChanged` を
     // `AudioCommand::SetDeviceLatency` としてそのまま engine へ中継し、
@@ -88,8 +78,8 @@ pub struct IpcState {
     /// 更新し、 status bar 常駐メーターと詳細パネルが読む。
     pub metrics: common::metrics_bridge::ResourceMetrics,
     /// MetricsBridge ハンドル (per-plugin CPU の直接読み出し用)。 GUI mode のみ
-    /// `Some`、 script / test は `None`。 詳細パネルが `track_plugin_ids` の
-    /// 各 plugin_id について `plugin_dsp_us` を直接読む。
+    /// `Some`、 script / test は `None`。 詳細パネルが Song の各 device (かつ
+    /// `loaded_devices` に居るもの) について `plugin_dsp_us` を直接読む。
     pub metrics_bridge: Option<Arc<common::metrics_bridge::MetricsBridgeHandle>>,
 
     // -------- Plugin database / picker --------
@@ -140,12 +130,12 @@ pub struct IpcState {
     /// `VocalSynthReady` を待つ間 stable id を退避し、 ready 受信で現在位置へ
     /// 解決して `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
     pub pending_vocal_synth_bounce: Option<PendingVocalSynthBounce>,
-    /// which (track, slot) plugin editors are currently open. The
-    /// editor *windows* are now created and owned by the plugin-host process
+    /// which device (`PluginInstance::id`) plugin editors are currently open.
+    /// The editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
     /// it's a plain id set — the window FFI lives in the plugin-host process.
-    pub open_plugin_guis: std::collections::HashSet<(u32, u32)>,
+    pub open_plugin_guis: std::collections::HashSet<u64>,
 
     // -------- Plugin load tracking (A7 race-condition fix) -----------
     /// v29: `device_id → 要求 generation`。 `SetSlotPlugin` を送ったが
@@ -176,15 +166,15 @@ pub struct IpcState {
     /// するか)。load 完了 (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio
     /// へ `LoadSong` を再送して新 plugin を signal path に入れ (Shift 追加でも必須)、
     /// (2) 値が true なら GUI 自動 open を `gui_open_requests` に queue する。
-    /// `select_plugin_from_db` で (track_id, device_index) を積む。
+    /// `select_plugin_from_db` と device コピー (r.md #71) が `device_id` を積む。
     /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
     /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
-    pub(crate) pending_added_plugin_finalize: std::collections::HashMap<(u32, u32), bool>,
+    pub(crate) pending_added_plugin_finalize: std::collections::HashMap<u64, bool>,
     /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
     /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
     /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム
     /// 遅延させる seam (headless test は frame loop を回さない → window を作らない)。
-    pub(crate) gui_open_requests: Vec<(u32, u32)>,
+    pub(crate) gui_open_requests: Vec<u64>,
 
     // -------- Background workers --------
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,

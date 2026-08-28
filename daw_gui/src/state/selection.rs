@@ -48,6 +48,14 @@ pub struct SelectionState {
     /// 全体に broadcast (`audio_event_target_indices`)。 close で clear、
     /// undo でも clear (index は容易にずれるため、 ノート選択と同方針)。
     pub audio_editor_selected_events: Vec<usize>,
+    /// r.md #71 (プラグインのコピー / 移動): インスペクタのチェーンで選択中の
+    /// device (安定 `PluginInstance::id`)。 末尾 = 「最後にクリックした anchor」。
+    /// session-only (保存しない)。
+    ///
+    /// **読む側は必ず `live_device_ids()` で正規化する** — この集合は
+    /// 「カーソルトラックのチェーン」 という面の上にあるので、 cursor track が
+    /// 動いた瞬間に元トラックの id が stale になる。
+    pub selected_device_ids: Vec<u64>,
 
     // -------- Shift+click 範囲選択のアンカー (r.md #35) --------
     // `docs/plan_selection_modifiers.md` §4.3。 無修飾 click / Ctrl+click で更新し、
@@ -69,4 +77,7 @@ pub struct SelectionState {
     pub automation_clip_anchor: Option<common::model::AutomationClipKey>,
     /// Audio Editor event 選択のアンカー (`audio_editor_selected_events` と同じ index 空間)。
     pub audio_editor_anchor: Option<usize>,
+    /// r.md #71 (プラグインのコピー / 移動): device 選択のアンカー
+    /// (Shift+click 範囲選択の基点)。
+    pub device_anchor: Option<u64>,
 }

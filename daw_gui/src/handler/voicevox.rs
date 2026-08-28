@@ -228,15 +228,18 @@ impl AppData {
     }
 
     /// track が持つ builtin VOICEVOX device の安定 device id (= load 済なら)。
-    /// `sync_vocal_metadata` の lookup と同じ (device 実在 → loaded_slots で load 確認)。
+    /// `sync_vocal_metadata` の lookup と同じ (device 実在 → `loaded_devices` で
+    /// load 確認)。
     pub fn voicevox_plugin_id_for_track(&self, track: &common::model::Track) -> Option<u64> {
-        let device_index = track.devices.iter().position(|d| {
-            d.format == PluginFormat::Builtin
-                && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-        })?;
-        self.ipc.loaded_slots
-            .get(&(track.id, device_index as u32))
-            .map(|s| s.device_id)
+        track
+            .devices
+            .iter()
+            .find(|d| {
+                d.format == PluginFormat::Builtin
+                    && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+            })
+            .map(|d| d.id)
+            .filter(|id| self.ipc.loaded_devices.contains_key(id))
     }
 
     /// track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
@@ -311,21 +314,19 @@ impl AppData {
                 continue;
             }
             // 単一デバイスチェーン: builtin VOICEVOX を chain 内に持つ device の
-            // index を探す (役割別 instrument slot は撤廃、 device index で引く)。
-            let Some(device_index) = track.devices.iter().position(|d| {
-                d.format == PluginFormat::Builtin
-                    && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-            }) else {
-                continue;
-            };
-            // 安定 device id を loaded_slots から引く (= load 完了確認込み)。
-            let Some(slot_info) = self
-                .ipc.loaded_slots
-                .get(&(track.id, device_index as u32))
+            // 安定 id を引く (`loaded_devices` に居ること = load 完了確認込み)。
+            let Some(host_plugin_id) = track
+                .devices
+                .iter()
+                .find(|d| {
+                    d.format == PluginFormat::Builtin
+                        && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+                })
+                .map(|d| d.id)
+                .filter(|id| self.ipc.loaded_devices.contains_key(id))
             else {
                 continue;
             };
-            let host_plugin_id = slot_info.device_id;
 
             // 全 clip の notes を NoteMetadata 配列に flatten。 note_id は
             // (clip-internal index) を「track 内通し番号」 にしないと衝突

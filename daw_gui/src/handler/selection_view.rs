@@ -60,6 +60,7 @@ impl AppData {
             self.selection.selected_clip.is_some() || !self.selection.selected_clips.is_empty();
         let tracks = !self.selection.selected_track_ids.is_empty();
         let sections = !self.selection.selected_section_ids.is_empty();
+        let devices = !self.live_device_ids().is_empty();
         let auto_prefer_clips = auto_clips
             && (!points || self.selection.last_edit_select == Some(S::AutomationClips));
         // 1. ポインタが乗っている面を最優先 (選択が非空な面に限る)。
@@ -89,6 +90,7 @@ impl AppData {
             Some(S::Clips) if clips => Some(S::Clips),
             Some(S::Tracks) if tracks => Some(S::Tracks),
             Some(S::Sections) if sections => Some(S::Sections),
+            Some(S::Devices) if devices => Some(S::Devices),
             _ => None,
         };
         if let Some(surface) = last_wins {
@@ -152,8 +154,39 @@ impl AppData {
                 keys: self.selection.selected_automation_clips.clone(),
             },
             EditSurface::Clips => AppEvent::DeleteSelectedClip,
+            // r.md #71 (プラグインのコピー / 移動): チェーンで選んだプラグインを
+            // 1 undo step で削除する。 対象 id は正規化を通す (= いま表示している
+            // チェーンに実在するものだけ)。
+            EditSurface::Devices => AppEvent::RemoveDevices {
+                device_ids: self.live_device_ids(),
+            },
         };
         self.handle_event(event);
+    }
+
+    /// r.md #71 (プラグインのコピー / 移動): device 面の一括操作 (削除 / cut /
+    /// copy / 複製 / 運搬) が受け取る id 集合を正規化する。**いまインスペクタに
+    /// 出ているチェーンに実在する id だけ**を入力順のまま残し、 重複を落とす。
+    ///
+    /// device 選択は「カーソルトラックのチェーン」 という面の上にあるので、
+    /// cursor track が動いた瞬間に元トラックの id が stale になる。 cursor を動かす
+    /// 経路すべてに掃除を挿す (= 貼り替え補償コード、 不変条件 1 が禁じる形) のでは
+    /// なく、 **読む側で毎回正規化する**。 [`Self::live_track_ids`] と同じ流儀。
+    #[must_use]
+    pub(crate) fn live_device_ids(&self) -> Vec<u64> {
+        let Some(track_id) = self.cursor_track_id() else {
+            return Vec::new();
+        };
+        let Some(chain) = self.song_doc.song().fx_chain_by_track_id(track_id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<u64> = Vec::with_capacity(self.selection.selected_device_ids.len());
+        for &id in &self.selection.selected_device_ids {
+            if chain.iter().any(|d| d.id == id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// stable `ClipKey` (track_id + clip_id) → 現在の index ベース `ClipRef`。

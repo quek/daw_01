@@ -89,11 +89,6 @@ struct ScriptHost {
     /// app.handle_event 経由)。 dispatcher は test 用の Recording / Noop
     /// を使う (winit event loop 無し)。
     app: AppData,
-    /// PR3.3: GUI mode の `AppData` と同じ役割。 `SlotPluginLoaded` で
-    /// `(device_id → track_id)` を覚え、 unload で落とす (v29: key は安定
-    /// device id)。 latency の中継は device 単位なのでこの map を経由しない。
-    plugin_to_track: std::collections::HashMap<u64, u32>,
-    track_plugin_ids: std::collections::HashMap<u32, Vec<u64>>,
     /// v29: 生 `daw.setSlotPlugin` 用の要求 generation counter (AppData の
     /// counter と衝突しないよう ScriptHost 側でも単調増加を維持し、 送信前に
     /// `app.ipc.pending_plugin_loads` へ登録して echo を通す)。
@@ -189,8 +184,6 @@ impl ScriptHost {
             bootstrap,
             script_args: ScriptArgs { output, extra },
             last_loaded_song: None,
-            plugin_to_track: std::collections::HashMap::new(),
-            track_plugin_ids: std::collections::HashMap::new(),
             next_raw_load_generation: 0,
             plugin_load_events: PluginLoadEvents::default(),
             app,
@@ -205,15 +198,6 @@ impl ScriptHost {
             self.last_loaded_song
                 .as_ref()
                 .and_then(|s| crate::app::device_id_at(s, track_id, index))
-        })
-    }
-
-    /// 逆方向: device id → `(track_id, device_index)`。
-    fn resolve_device_coords(&self, device_id: u64) -> Option<(u32, u32)> {
-        crate::app::find_device_by_id(self.app.song_doc.song(), device_id).or_else(|| {
-            self.last_loaded_song
-                .as_ref()
-                .and_then(|s| crate::app::find_device_by_id(s, device_id))
         })
     }
 
@@ -276,16 +260,8 @@ impl ScriptHost {
                 aux_output_count,
                 generation,
             } => {
-                // script 専用 bookkeeping (PDC recompute が参照)。
-                if let Some((track, _index)) = self.resolve_device_coords(*device_id) {
-                    self.plugin_to_track.insert(*device_id, track);
-                    self.track_plugin_ids
-                        .entry(track)
-                        .or_default()
-                        .push(*device_id);
-                }
                 self.plugin_load_events.loaded.push(*device_id);
-                // GUI runner と同じく app へ dispatch する。これで `loaded_slots` が
+                // GUI runner と同じく app へ dispatch する。これで `loaded_devices` が
                 // 埋まり、OpenPluginShmem 送信 + `sync_vocal_metadata` 再 flush
                 // (= builtin VOICEVOX の歌唱/読み上げ合成 trigger) が走る。これが
                 // 無いと、 slot ロード前の初回 flush が skip されたまま再 flush されず、
@@ -312,11 +288,6 @@ impl ScriptHost {
                     }));
             }
             PluginEvent::SlotPluginUnloaded { device_id } => {
-                self.plugin_to_track.remove(device_id);
-                for v in self.track_plugin_ids.values_mut() {
-                    v.retain(|p| p != device_id);
-                }
-                self.track_plugin_ids.retain(|_, v| !v.is_empty());
                 let _ = self.bootstrap.audio_tx.send(AudioCommand::SetDeviceLatency {
                     device_id: *device_id,
                     samples: 0,
@@ -706,7 +677,6 @@ fn daw_set_slot_plugin(
         h.app.ipc.pending_plugin_loads.insert(device_id, generation);
         let _ = h.bootstrap.plugin_tx.send(PluginCommand::SetSlotPlugin {
             device_id,
-            track_id,
             format,
             path: PathBuf::from(path_str),
             plugin_id,
