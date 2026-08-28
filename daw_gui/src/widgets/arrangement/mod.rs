@@ -359,7 +359,7 @@ pub struct ArrangementTrack {
     /// state と整合)。 caller は collapsed フラグを各 track に set して渡すだけ (state は caller 側で
     /// `HashSet<u32>` 等に保持)。
     pub collapsed: bool,
-    /// M14 Phase 63n-1 (#028): track の automation lane 群を折り畳むか (▶ = collapsed / ▼ = expanded)。
+    /// M14 Phase 63n-1 (#028): track の automation lane 群を折り畳むか (`+` = collapsed / `-` = expanded)。
     /// `automation_lanes.is_empty()` の track は disclosure を描画しないので、 この値は意味を持たない。
     /// `true` で track 行高さは `track_row_h` のまま (= 既存挙動互換)。 `false` で expanded =
     /// `automation_lanes.iter().filter(|l| l.visible)` を上から積む (各 `lane.height_px` を加算)。
@@ -538,7 +538,7 @@ pub const MASTER_TRACK_ID: u32 = u32::MAX;
 #[derive(Clone, Debug)]
 pub struct ArrangementMasterRow {
     /// 展開 / 折り畳み状態 (通常 track の `automation_lanes_collapsed` と同 idiom)。
-    /// `▶` (collapsed = true) / `▼` (expanded = false) を toggle すると
+    /// `+` (collapsed = true) / `-` (expanded = false) を toggle すると
     /// `ToggleTrackAutomationCollapsed { track: MASTER_TRACK_ID }` が発火する。
     /// `automation_lanes.is_empty()` で disclosure 非描画 (= toggle 不可)。
     pub automation_lanes_collapsed: bool,
@@ -1059,7 +1059,8 @@ pub struct ArrangementStyle {
     /// M14 Phase 63c (#016): group hierarchy で 1 段ネストするごとに track header を右にずらす量 (px)。
     /// 各 track の `header_x = rect.x + depth * indent_px`。 default = 16.0。
     pub indent_px: f32,
-    /// M14 Phase 63c (#016): ▼ / ▶ disclosure アイコンの色 (group 行の左端)。
+    /// M14 Phase 63c (#016): disclosure アイコンの色 — group 行左端の ▼ / ▶ と、
+    /// lane 行の `+` / `-` の両方に使う。
     /// M14 Phase 113 (daw_01 #085): group track 専用の背景 tint は撤去 (旧 `track_group_bg`)。
     /// group は indent + disclosure ▶▼ の構造手掛かりのみで識別し、 行背景は他 track と同色。
     pub disclosure_color: Color,
@@ -1225,7 +1226,7 @@ pub struct ArrangementStyle {
     /// 過剰に伸びないようにする safety net。 default 2000 は典型 desktop の縦サイズ (1080〜1440 px) を
     /// 上回るため事実上無制限。
     pub automation_lane_max_height_px: u16,
-    /// disclosure ▶ / ▼ glyph の描画 font size。 default = `track_text_size`。
+    /// automation lane disclosure (`+` / `-`) glyph の描画 font size。 default = `track_text_size`。
     pub automation_disclosure_size: f32,
     /// lane header に描く icon glyph (`★` / `[V]` / `👁` / `▣` / `✕`) の font size。 default = `track_text_size`。
     pub automation_lane_icon_size: f32,

@@ -4,6 +4,8 @@
 
 use super::*;
 
+use crate::view::disclosure::{RevealAxis, disclosure_glyph};
+
 /// この 1 フレームで検出した header の click (loop 内で `push_edit` すると複数発行に
 /// なるため、 loop 後に 1 度だけ発行する — 旧 `clicked_track_for_select` /
 /// `disclosure_clicked`)。
@@ -68,7 +70,7 @@ fn draw_rows_inner(
 
         // M14 Phase 63n-10 (#034): master row 専用 header 描画。 mute/solo button / volume band /
         // group disclosure / row click → トラック選択の全 path を skip し、 neutral gray 背景 +
-        // "Master" label + lane disclosure (`▶`/`▼`) のみを描画する (daw_01 #034 §B 仕様)。
+        // "Master" label + lane disclosure (`+`/`-`) のみを描画する (daw_01 #034 §B 仕様)。
         // 通常 track 経路の `selected_tracks` / `is_group_set` 判定とは独立 (master は selection
         // 対象外、 group でもない、 = 「特殊な行」 として描画分岐)。
         if t.id == MASTER_TRACK_ID {
@@ -207,12 +209,14 @@ fn draw_rows_inner(
             }
         }
 
-        // M14 Phase 63c (#016): disclosure ▼/▶ — group track のみ描画 + click で
-        // 折り畳み toggle Edit 発行 (loop 後に発火、 トラック選択より priority 高)。
+        // M14 Phase 63c (#016): group disclosure — group track のみ描画 + click で
+        // `AppEvent::ToggleGroupCollapsed` を発行 (loop 後に発火、 トラック選択より
+        // priority 高)。 arrangement は track が **縦** に並び group の子は下に
+        // 現れるので開示軸は Block (r.md #74: 折り畳み中 ▶ / 展開中 ▼)。
         let is_group = f.is_group_set.contains(&t.id);
         let disclosure_rect = disclosure_rect_for(name_rect, style, t.depth);
         if is_group {
-            let label = if t.collapsed { "▶" } else { "▼" };
+            let label = disclosure_glyph(t.collapsed, RevealAxis::Block);
             ui.push_text(GlyphArea {
                 text: label.into(),
                 left: disclosure_rect.x + disclosure_rect.w * 0.2,
@@ -311,8 +315,9 @@ fn draw_rows_inner(
         // 無関係 = 最上段が top-level group になりがちなだけの相関、 と pixel/hit-test 検証で確定)。 disclosure
         // の **single-click** 折り畳みは別経路 (`clicks.disclosure`) で従来どおり (回帰なし)。 **double-click**
         // は明確に rename 意図なので disclosure 上でも rename を起こす。 double-click が disclosure を踏むと
-        // 2 release で折り畳みが 2 回 toggle するが、 daw_01 の `collapsed_groups` (HashSet) を直接 flip する
-        // 非 undoable な view-state edit なので net-zero (= fold 状態保存、 undo 履歴も汚さない)。 M·S·R /
+        // 2 release で折り畳みが 2 回 toggle するが、 `AppEvent::ToggleGroupCollapsed` は daw_01 の
+        // `collapsed_groups` (HashSet) を反転するだけの非 undoable な view-state edit なので net-zero
+        // (= fold 状態保存、 undo 履歴も汚さない、 r.md #74)。 M·S·R /
         // lane disclosure は name 帯の **右**で名前と無関係なので除外を維持 (button の double-toggle を rename に
         // 化けさせない)、 volume band も名前帯の下の独立 drag 控除なので維持。
         let rename_hit = if is_group { row } else { name_rect_visible };
@@ -390,14 +395,15 @@ fn draw_rows_inner(
     }
 }
 
-/// disclosure toggle → `app.ui_prefs.collapsed_groups` の insert / remove、
+/// disclosure toggle → `AppEvent::ToggleGroupCollapsed`、
 /// それ以外は `app.apply_select_tracks(tid, modifier, &visible_ids)`。
 /// modifier は **press 時 snapshot** (`state.press_modifiers`) を真値にする。
 ///
-/// **disclosure は `AppEvent` を経由しない。** `Edit::mutate` の中で `collapsed_groups` を
-/// 直接 toggle する (コード中のコメントはこれを「ToggleGroupCollapsed」と呼ぶが、
-/// 同名の `AppEvent` variant は存在しない — `AppEvent::ToggleTrackAutomationCollapsed` と
-/// 混同しないこと)。 発行順は disclosure が先で、 立ったら `clicked_track` を `None` に
+/// **disclosure は `AppEvent::ToggleGroupCollapsed` を経由する** (r.md #74 で新設。
+/// mixer の group disclosure も同じ event に合流し、 `ui_prefs.collapsed_groups` の
+/// 反転経路は 1 つだけになった)。 automation lane の開閉
+/// (`AppEvent::ToggleTrackAutomationCollapsed`) とは別物なので混同しないこと。
+/// 発行順は disclosure が先で、 立ったら `clicked_track` を `None` に
 /// 落とすという priority も現行のまま。
 pub(super) fn commit_clicks(
     ui: &mut Ui<'_, AppData>,
@@ -406,20 +412,14 @@ pub(super) fn commit_clicks(
     response: &mut ArrangementResponse,
 ) {
     let HeaderClicks { mut clicked_track, disclosure } = clicks;
-    // M14 Phase 63c (#016): disclosure click → 折り畳み toggle (priority 高、 トラック選択は
-    // この frame では skip = group の collapsed toggle 動作のみで selection は変えない、
-    // Reaper / Live と同じ UX)。
+    // M14 Phase 63c (#016): disclosure click → `AppEvent::ToggleGroupCollapsed`
+    // (priority 高、 トラック選択はこの frame では skip = group の collapsed toggle
+    // 動作のみで selection は変えない、 Reaper / Live と同じ UX)。 mixer の
+    // disclosure も同じ event に合流する (r.md #74)。
     if let Some(tid) = disclosure {
-        ui.push_edit({
-            let v_id = tid;
-            Edit::mutate(move |app: &mut AppData| {
-                if app.ui_prefs.collapsed_groups.contains(&v_id) {
-                    app.ui_prefs.collapsed_groups.remove(&v_id);
-                } else {
-                    app.ui_prefs.collapsed_groups.insert(v_id);
-                }
-            })
-        });
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleGroupCollapsed { track_id: tid });
+        }));
         clicked_track = None;
     }
 

@@ -5,6 +5,8 @@ pub mod arrangement_view;
 pub mod audio_editor;
 pub mod bottom_panel;
 pub mod dirty_guard_modal;
+/// r.md #74: 開閉マーク (disclosure triangle) の glyph 規則の SSoT。
+pub mod disclosure;
 pub mod export_overlay;
 /// r.md #61: 終了処理中オーバーレイ。
 pub mod shutdown_overlay;

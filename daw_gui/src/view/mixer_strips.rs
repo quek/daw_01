@@ -16,6 +16,7 @@ use daw_ui_core::{
 use common::automation::{norm_to_plain, plain_to_norm};
 
 use crate::automation_value::automation_value_display;
+use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 use crate::view::modulation::{build_mod, push_mod_drag_resync};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
@@ -28,15 +29,27 @@ use crate::widgets::select_modifier::SelectModifier;
 const STRIP_WIDTH: f32 = 80.0;
 const STRIP_GAP: f32 = 4.0;
 const TOP_LABEL_H: f32 = 18.0;
+/// strip の内側余白 (px)。 `draw_strip` が上端 / 下端と、 左右を pad で切る行
+/// (名前行 / M·S 行) に共通で使う。 pan 行と fader・メーター群は pad ではなく
+/// strip 幅に対する**中央寄せ**なので、 この値は横位置に効かない (内側幅
+/// `STRIP_WIDTH - pad * 2` の上限としてだけ効く)。 **strip で「余白」 と言えば
+/// この値**で、 下の NAME_BAND_H / DISCLOSURE_ZONE_W / STRIP_FADER_* もここから
+/// 導く (r.md #74: 以前は同じ `6.0` が 5 か所に手写しされていた)。
+const STRIP_PAD: f32 = 6.0;
 /// r.md #13: strip 上端の「トラック名バンド」の高さ (px)。 この帯を押すと
 /// トラックを選択する (M/S トグルや fader/knob より上なので操作と干渉しない)。
-/// top pad(6) + 名前(TOP_LABEL_H=18) = 次の M/S トグル行の直前まで。
-const NAME_BAND_H: f32 = 24.0;
-/// group strip の名前バンド左端にある折り畳み disclosure (▶/▼) が占める幅
-/// (= draw_strip の `pad(6) + disc_w(14) + gap(2)`)。 選択の press 帯はこの分
-/// だけ右にずらして、 disclosure クリック (= 折り畳みトグル) が選択を巻き込まない
-/// ようにする (code review: group strip で disclosure が NAME_BAND 内に重なる)。
-const DISCLOSURE_ZONE_W: f32 = 22.0;
+/// 上 pad + 名前 = 次の M/S トグル行の直前まで。
+const NAME_BAND_H: f32 = STRIP_PAD + TOP_LABEL_H;
+/// group strip の名前バンド左端に置く折り畳み disclosure ボタンの幅 (px)。
+const DISCLOSURE_W: f32 = 14.0;
+/// disclosure ボタンとトラック名の間隔 (px)。
+const DISCLOSURE_GAP: f32 = 2.0;
+/// group strip の名前バンド左端にある折り畳み disclosure (r.md #74: 展開中 ▶ /
+/// 折り畳み中 ▼) が占める幅。 選択の press 帯はこの分だけ右にずらして、
+/// disclosure クリック (= 折り畳みトグル) が選択を巻き込まないようにする。
+/// **`draw_strip` の実 geometry から導出する** — 旧実装は `22.0` を手写ししていて、
+/// 幅を変えると黙ってズレる位置依存デッドゾーンになりえた (r.md #74)。
+const DISCLOSURE_ZONE_W: f32 = STRIP_PAD + DISCLOSURE_W + DISCLOSURE_GAP;
 const TOGGLE_H: f32 = 22.0;
 const KNOB_SIZE: f32 = 32.0;
 /// Pan ノブ **右** の数値欄 (`"L50"` / `"C"` / `"R100"`) の font size (px)。
@@ -175,7 +188,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 折り畳まれた group の配下 strip は隠す (arrangement と同じ
     // `collapsed_groups` を参照 = SSoT 共有)。x レイアウト / content_w が
     // filter 後の index に揃うよう、 並べる前に除外する。group strip 自身は
-    // (自分の祖先に collapsed が無い限り) 残り、 disclosure ▶/▼ を出す。
+    // (自分の祖先に collapsed が無い限り) 残り、 disclosure (r.md #74: 展開中 ▶ /
+    // 折り畳み中 ▼) を出す。
     let normals: Vec<_> = normals
         .into_iter()
         .filter(|e| !app.is_hidden_under_collapsed_group(e.track_id))
@@ -437,7 +451,8 @@ fn draw_strip(
     track_idx: u32,
     is_master: bool,
     // group strip のとき `Some(collapsed)` を渡すと、 名前左に折り畳み
-    // disclosure ▶/▼ を描き、 click で `collapsed_groups` を toggle する
+    // disclosure (r.md #74: 展開中 ▶ / 折り畳み中 ▼、 開示軸 Inline) を描き、
+    // click で `collapsed_groups` を toggle する
     // (arrangement と同じ SSoT)。 非 group (通常 track / return / master) は `None`。
     group_collapsed: Option<bool>,
     // この strip 下部に確保する Sends セクション band の高さ (px)。 通常
@@ -484,30 +499,24 @@ fn draw_strip(
         });
     }
 
-    let pad = 6.0;
+    let pad = STRIP_PAD;
     let mut y = rect.y + pad;
 
-    // 名前 (group strip は左に折り畳み disclosure ▶/▼ を置く)
+    // 名前 (group strip は左に折り畳み disclosure を置く)。 mixer は strip が
+    // **横** に並び、 group の子は右に現れるので開示軸は Inline
+    // (r.md #74: 展開中 ▶ = 子が右に並んでいる / 折り畳み中 ▼)。
     let name_x = if let Some(collapsed) = group_collapsed {
-        let tri = if collapsed { "\u{25b6}" } else { "\u{25bc}" }; // ▶ 折り畳み / ▼ 展開
-        let disc_w = 14.0;
         ui.button_at(
             ("mixer_strip_disclosure", layout_idx),
-            tri,
-            Rect { x: rect.x + pad, y, w: disc_w, h: 14.0 },
+            disclosure_glyph(collapsed, RevealAxis::Inline),
+            Rect { x: rect.x + pad, y, w: DISCLOSURE_W, h: 14.0 },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    // arrangement の ToggleGroupCollapsed と同じ toggle
-                    // (collapsed_groups が両 view 共通の SSoT)。
-                    if app.ui_prefs.collapsed_groups.contains(&track_idx) {
-                        app.ui_prefs.collapsed_groups.remove(&track_idx);
-                    } else {
-                        app.ui_prefs.collapsed_groups.insert(track_idx);
-                    }
+                    app.handle_event(AppEvent::ToggleGroupCollapsed { track_id: track_idx })
                 })
             },
         );
-        rect.x + pad + disc_w + 2.0
+        rect.x + pad + DISCLOSURE_W + DISCLOSURE_GAP
     } else {
         rect.x + pad
     };
@@ -779,7 +788,7 @@ const MIN_FADER_H: f32 = 28.0;
 /// `draw_strip` の y 積み上げと一致させること (`debug_assert` で固定)。
 /// r.md #62 で pan 数値をノブの右へ移したので、 pan 行の高さ = ノブ径のみ (旧実装は
 /// ここに数値行 `PAN_READOUT_H + 2.0` が積まれていて strip 1 本あたり 14px 高かった)。
-const STRIP_FADER_TOP_OFFSET: f32 = 6.0
+const STRIP_FADER_TOP_OFFSET: f32 = STRIP_PAD
     + TOP_LABEL_H
     + TOGGLE_H
     + 6.0
@@ -787,7 +796,7 @@ const STRIP_FADER_TOP_OFFSET: f32 = 6.0
     + 2.0
     + 4.0;
 /// fader 下端から strip 下端までの固定余白 (`draw_strip` の `pad + 12.0`)。
-const STRIP_FADER_BOTTOM_PAD: f32 = 6.0 + 12.0;
+const STRIP_FADER_BOTTOM_PAD: f32 = STRIP_PAD + 12.0;
 
 /// `sends_band_height` を strip の実高さに収まるよう clamp した値。
 /// 収まらないぶんは `draw_sends_section` 内の縦スクロールで到達する。
@@ -1113,7 +1122,7 @@ mod tests {
             "'{widest}' ({w}px @ {PAN_READOUT_FONT}pt) は数値欄の文字領域 {text_avail}px に収まる"
         );
 
-        let inner_w = STRIP_WIDTH - 6.0 * 2.0; // draw_strip の pad = 6.0
+        let inner_w = STRIP_WIDTH - STRIP_PAD * 2.0;
         assert!(
             PAN_ROW_W <= inner_w,
             "pan 行 [ノブ+gap+数値欄] {PAN_ROW_W}px は strip 内側幅 {inner_w}px に収まる"
@@ -1125,7 +1134,7 @@ mod tests {
     /// `draw_strip` 側は debug_assert でしか守られていないため、 定数側をここで固定する。
     #[test]
     fn strip_fader_top_offset_matches_stack() {
-        let stack = 6.0 // 上 pad
+        let stack = STRIP_PAD // 上 pad
             + TOP_LABEL_H
             + TOGGLE_H
             + 6.0 // M/S 行の下マージン

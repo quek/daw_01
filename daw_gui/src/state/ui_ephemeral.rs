@@ -372,7 +372,9 @@ pub struct UiEphemeral {
     /// the set of `ModSource`s whose inspector row is **expanded** to its
     /// full Bitwig 風グラフィカルエディタ (MSEG curve canvas / Steps grid / LFO·Random
     /// preview + 全コントロール). **Multi-expand** — 複数同時に開ける (Bitwig 同様)。
-    /// chevron クリックで toggle。 session-only (not persisted)。
+    /// 行頭の disclosure (r.md #74 で `view::disclosure` へ一本化。 rack 行は縦積みで
+    /// 中身が下に開くので開示軸 Block = 折り畳み中 ▶ / 展開中 ▼) クリックで toggle。
+    /// session-only (not persisted)。
     pub expanded_mod_sources: std::collections::HashSet<u32>,
     /// The `(track_id, target)` whose per-control modulation depth drag is in
     /// progress (gui_01 `mod_dragging`), or `None`. Keyed by **track + target**

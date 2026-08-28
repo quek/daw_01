@@ -153,7 +153,21 @@ pub enum AppEvent {
     GroupSelectedTracks {
         track_ids: Vec<u32>,
     },
-    /// gui_01 #028 (M14 Phase 63n-1): track 行の disclosure ▶/▼ click。
+    /// r.md #74 / gui_01 #016: group track の折り畳み disclosure click。
+    /// `ui_prefs.collapsed_groups` の `track_id` を反転し、 arrangement /
+    /// mixer 両方の可視 track 集合が次フレームで追従する (`collapsed_groups`
+    /// が 2 ビュー共通の SSoT)。 session-only な UI 状態なので Undo / save
+    /// 対象外。
+    ///
+    /// **両ビューはこの event 経由でのみ toggle する。** 以前は
+    /// `mixer_strips.rs` と arrangement widget が同じ HashSet flip を各々
+    /// インラインで持ち、 コメントだけが存在しない `ToggleGroupCollapsed` を
+    /// 指す幽霊になっていた (r.md #74)。
+    ToggleGroupCollapsed {
+        track_id: u32,
+    },
+    /// gui_01 #028 (M14 Phase 63n-1): track 行の automation lane disclosure
+    /// (`+` / `-`) click。
     /// `expanded_automation_tracks` の `track_id` を反転し、 widget が
     /// 次フレームで lane 群を展開 / 折り畳む。 session-only な UI 状態
     /// なので Undo / save 対象外。

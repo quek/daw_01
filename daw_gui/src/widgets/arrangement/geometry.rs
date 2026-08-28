@@ -1003,7 +1003,9 @@ pub(super) fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayou
     HeaderRowLayout { name_rect, buttons, volume_band, lane_disc_rect }
 }
 
-/// M14 Phase 63c (#016): disclosure ▼ / ▶ アイコンの hit / 描画 rect。
+/// M14 Phase 63c (#016): group disclosure アイコンの hit / 描画 rect。
+/// glyph の向きは `crate::view::disclosure::disclosure_glyph`
+/// (arrangement は `RevealAxis::Block`) が決める (r.md #74)。
 /// `name_rect` の左端から `disclosure_w` 幅で切り出し、 indent 量 (`depth * indent_px`) は **既に
 /// `name_rect.x` に反映されている前提** (caller 側の指定)。 group track でない場合は呼ばない (caller が判定)。
 /// rect は `name_rect.h` を超えない正方形に近い (アイコン center 用)。

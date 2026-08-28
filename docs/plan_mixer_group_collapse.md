@@ -3,6 +3,19 @@
 FIXME #7。「ミキサーのグループトラックをアレンジメントのように子を折り畳めるように
 してほしい」。
 
+> **supersede (r.md #74 / [plan_rmd_74_disclosure_glyph.md](plan_rmd_74_disclosure_glyph.md))**:
+> 本書の「glyph は arrangement と揃える (▶/▼)」 (確定仕様 表 #3 / 実装方針) は **#74 で反転した**。
+> mixer は strip が横に並び group の子が **右** に現れるので、開示軸は Inline =
+> **展開中 ▶ / 折り畳み中 ▼** で arrangement の裏返しになる。
+> **「arrangement と同じ toggle 経路を使う」方針は #74 でも有効**
+> (#74 で `AppEvent::ToggleGroupCollapsed` が実在するようになり、本書が想定した
+> 「既存 `ToggleGroupCollapsed` 相当を mixer からも発火」が初めて字義どおり成立する)。
+> 同じ文の「色は `disclosure_color` と揃える」は **#74 とは無関係に、そもそも実装されたことがない**。
+> `disclosure_color` は `ArrangementStyle` の field で読み手は arrangement widget だけであり、
+> mixer の disclosure は `ui.button_at` の枠付きボタン = button の text 色を使う。
+> presentation (枠の有無 / 色) を片方へ寄せるかは #74 のスコープ外
+> (#74 §5)。
+
 ## 現状 (2026-06-08)
 
 - mixer ([mixer_strips.rs:106-209](F:/dev/daw_01/daw_gui/src/view/mixer_strips.rs))
