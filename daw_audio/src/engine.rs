@@ -43,9 +43,10 @@ use crate::sequencer::NoteTransition;
 /// meter doesn't fall off the GUI side.
 pub const MAX_TRACKS: usize = 32;
 
-/// 鍵盤プレビュー note の `note_id`。 sequencer が振る通し index (= 0.. の
-/// 小さい値) と衝突しない sentinel。 CLAP/VST3 は `note_id` を無視し、 builtin
-/// は key 一致で発音/停止するので、 on/off で同値であれば voice 対応が取れる。
+/// 鍵盤プレビュー note の `note_id`。 sequencer が振る `sing_note_id` /
+/// `talk_event_id` (= `[0, 1 << 28)` ∪ high band) のどちらとも衝突しない sentinel。
+/// CLAP/VST3 は `note_id` を無視し、 builtin は key 一致で発音/停止するので、
+/// on/off で同値であれば voice 対応が取れる。
 const PREVIEW_NOTE_ID: u32 = u32::MAX;
 
 /// IPC 受信ループから audio thread へ渡す軽量コマンド。毎 buffer 頭の

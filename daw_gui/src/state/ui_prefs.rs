@@ -156,6 +156,11 @@ pub struct UiPrefs {
     /// テレメトリスレッドの解析器へは `AppData::meter_control` 経由で渡る。
     pub meter_settings: crate::master_meter::settings::MeterSettings,
 
+    /// r.md #75: VOICEVOX 歌唱合成の「塊」(= `/sing_frame_audio_query` 1 回) の長さ (秒)。
+    /// 曲の内容ではなく **合成品質のつまみ**なのでプロジェクトではなく app_config に持つ。
+    /// 読むときは `AppData::voicevox_chunk_secs()` (有効範囲へクランプ) を通す。
+    pub voicevox_chunk_secs: f32,
+
     pub is_help_open: bool,
 
     /// r.md #60: ヘルプ > バージョン情報 (About) が開いているか。

@@ -33,6 +33,12 @@ impl AppData {
         // VideoRender は daw_gui 内で必ず ExportFinished を返すので対象外。
         const EXPORT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
         if matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. }))
+            // r.md #75: 合成完了ゲートで待っている間は daw_audio がまだ render を
+            // 始めていないので、この watchdog の対象外。待ち自体は plugin host 側の
+            // 停滞判定 (SYNTH_STALL_TIMEOUT) で必ず終わる。これを入れないと、
+            // キャッシュが冷たい長い曲で合成が 60 秒を超えた瞬間に
+            // 「音声エンジンが応答しないため書き出しを中止しました」になる。
+            && self.ipc.pending_vocal_synth_export.is_empty()
             && let Some(since) = self.transport.export_progress_at
             && since.elapsed() > EXPORT_WATCHDOG
         {
@@ -104,6 +110,12 @@ impl AppData {
         if self.transport.is_playing && next_beat != self.transport.playhead_beat {
             self.transport.playhead_beat = next_beat;
         }
+
+        // r.md #75: 合成中の VOICEVOX device に「いまここを再生している」を伝える。
+        // 再合成はトリガしない (`SetVocalSynthPriority` は順序ヒント専用)。1 拍動くまでは
+        // 送らない = トランスポート中でも IPC は数 Hz 以下に収まる。停止 / seek で
+        // playhead が動いたときも同じ経路で届く (停止中は GUI 側が権威)。
+        self.send_vocal_synth_priority_if_moved();
 
         // 再生追従スクロール (Alt+F で off/scroll/page)。 playhead 反映直後に follow
         // mode に応じて arrange_scroll_beat を更新する。 canvas 幅は前フレーム描画値

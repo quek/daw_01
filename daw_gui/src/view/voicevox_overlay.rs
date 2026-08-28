@@ -1,8 +1,8 @@
 //! VOICEVOX の wav 合成 / 口パク生成の進行状態を見せる **非ブロック**
 //! overlay (画面上端中央)。`load_overlay` と同じ idiom (= modal でない、操作を妨げない)。
 //!
-//! - WAV 合成中 (= builtin VOICEVOX が busy なトラックあり) → 回転スピナー +
-//!   「VOICEVOX 合成中…  残り N トラック」。
+//! - WAV 合成中 (= builtin VOICEVOX が busy) → 回転スピナー +
+//!   「VOICEVOX 合成中…  残り N フレーズ」(r.md #75: 合成の最小単位はフレーズ)。
 //! - 口パク生成中 (= `lipsync_inflight` 非空) → スピナー + 「口パク生成中…」。
 //! - engine 未接続が確定 (= `Unreachable` が `VOICEVOX_ENGINE_WARNING` 以上継続) → static の
 //!   amber 警告「VOICEVOX エンジンに接続できません / エンジンを起動してください」に切替。
@@ -47,12 +47,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     let now = app.ui_ephemeral.frame_now;
     let unreachable = app.voicevox_engine_unreachable(now);
     let rejected = app.voicevox_rejected_detail();
-    let wav_n = app.voicevox_synth_busy_count();
+    let phrases_left = app.voicevox_pending_phrase_count();
+    // busy だが pending がまだ 0 件の一瞬でパネルが消えないよう、busy 判定も併用する。
+    let wav_busy = app.voicevox.voicevox_synth_status.values().any(|s| s.progress.busy);
     let lipsync = !app.voicevox.lipsync_inflight.is_empty();
 
     // engine 未接続 / 内容エラー (拒否された歌詞) が確定したら、進行中スピナーより
     // 警告を優先表示する。
-    if !unreachable && rejected.is_none() && wav_n == 0 && !lipsync {
+    if !unreachable && rejected.is_none() && !wav_busy && !lipsync {
         return;
     }
 
@@ -76,8 +78,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
 
     // 進行中: スピナー + 1〜2 行のラベル。
     let mut lines: Vec<String> = Vec::with_capacity(2);
-    if wav_n > 0 {
-        lines.push(format!("VOICEVOX 合成中\u{2026}  残り {wav_n} トラック"));
+    if wav_busy {
+        lines.push(format!("VOICEVOX 合成中\u{2026}  残り {phrases_left} フレーズ"));
     }
     if lipsync {
         lines.push("口パク生成中\u{2026}".to_string());

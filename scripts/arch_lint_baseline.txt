@@ -260,7 +260,6 @@ FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::regenerate_lipsync_for_tr
 FN-NESTING | daw_gui/src/handler/clips.rs::AppData::stretch_clip_content                   | 7/24 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/devices.rs::AppData::on_plugin_loaded_from_child          | 7/24 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/bounce.rs::AppData::handle_bounce_clip_fx_complete        | 7/20 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::sync_vocal_metadata                 | 7/20 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::normalize_lipsync_clips_on_load     | 7/17 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_image                    | 7/16 | edit_song 多重ループ。未起票
 # `project.rs::reconcile_plugins_with_song` (7/15) は #71 で **解消**。 §A で slot
@@ -292,7 +291,7 @@ FN-NESTING | daw_gui/src/handler/automation.rs::AppData::move_automation_points 
 #    ヘルパ抽出でほどけるが、FFI の対応関係を壊さないよう 1 本ずつ確認しながら要る
 #    (memory: feedback_no_dead_judgment_at_ffi)。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
-FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxBuiltin::start_synth_thread          | 11/173 | FFI/状態機械。未起票
+FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxBuiltin::start_synth_thread          | 10/138 | FFI/状態機械。r.md #75 でレンダリングを voicevox_render.rs へ出し 11/173 から下げた。落とし所は「job ループの本体 (retry backoff / coalesce / 報告) も切り出して 6 段以下」。未起票
 FN-NESTING | daw_plugin_host/src/clap_plugin.rs::ClapAudioHalf[AudioProcessorHalf]::process        | 8/41   | FFI/状態機械。未起票
 FN-NESTING | daw_audio/src/main.rs::build_stream                                                   | 8/32   | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxAudioHalf[AudioProcessorHalf]::process | 7/39 | FFI/状態機械。未起票

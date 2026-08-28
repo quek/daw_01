@@ -22,9 +22,16 @@
 
 VOICEVOX 合成 (`/frame_synthesis` 歌唱, `/audio_query`+`/synthesis` talk) も口パク
 phoneme query (`/sing_frame_audio_query`) も **1 回の blocking HTTP**。中間進捗イベントが
-無いので、声/トラック単位の「処理中/完了」(indeterminate) + 件数が最も正直な粒度。
-WAV 合成は FIXME #36 で音量一貫性のため「声(speaker)単位まとめ合成」を採用しており、
-clip 別合成はしない設計 → WAV 側の最小粒度はトラック単位、口パク側は口トラック単位。
+無いので、**フレーズ単位**の「処理中/完了」(indeterminate) + 件数が最も正直な粒度。
+
+> **2026-08-28 更新 (r.md #75)**: WAV 合成の最小粒度は **フレーズ** (= 隙間ゼロで続く note の
+> 極大列) になった。旧記述「FIXME #36 で音量一貫性のため『声(speaker)単位まとめ合成』を採用
+> しており clip 別合成はしない設計 → WAV 側の最小粒度はトラック単位」は歴史的経緯。
+> 音量一貫性は **塊 (既定 60 秒) 単位の 1 クエリ**が担い、合成 (`/frame_synthesis`) だけを
+> フレーズへ割る。設計正本は `docs/plan_rmd_75_voicevox_phrase.md`。
+> オーバーレイは「残り N フレーズ」、クリップ上スピナーは
+> `VocalSynthProgress::pending_clips` で **未完了の仕事があるクリップだけ**に点く。
+> 口パク側の最小粒度は引き続き口トラック単位。**percent は出さない**という判断は不変。
 
 ## 生成は 2 系統 (調査済み)
 
@@ -78,6 +85,9 @@ builtin VOICEVOX plugin (`daw_plugin_host/src/builtin/voicevox.rs`) の synth th
   - `track_is_synthesizing(track_id) -> bool` (= 所属 builtin VOICEVOX plugin が busy)。
   - `lipsync_target_is_generating(track_id) -> bool` (= lipsync_inflight.contains)。
   - `voicevox_busy_track_count() -> usize` (残り N)。
+    **r.md #75 で `voicevox_pending_phrase_count() -> u32` (残り N フレーズ) へ置換済**
+    (合成の最小単位がフレーズになったため)。クリップ単位の点灯は
+    `clip_wav_synthesizing(track_id, clip_id)`。
   - `voicevox_engine_warning(now) -> bool` (busy && failing_since 経過 >= 5s が 1 つでも)。
   - `voicevox_animating(now) -> bool` (busy 系が在り && !engine_warning。warning 後は static で再描画停止)。
 

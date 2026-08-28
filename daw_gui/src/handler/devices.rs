@@ -429,6 +429,9 @@ impl AppData {
         // r.md #27: metadata 差分キャッシュも live device に揃える (unload された
         // device の stale entry を残さない。voicevox_synth_status と対称)。
         self.voicevox.voicevox_metadata_sent.remove(&device_id);
+        // r.md #75: 再生ヘッド優先ヒントの送信記憶も同様 (device_id 再利用時に
+        // 「もう送った」と誤判定して最初のヒントを落とさない)。
+        self.voicevox.priority_sent.remove(&device_id);
         // 消えた device の PDC 寄与も畳む (0 = entry を落とす)。
         self.set_device_latency(device_id, 0);
     }

@@ -1212,7 +1212,9 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 
 /// VOICEVOX 生成中のクリップ右上角に回転スピナーを重ねる。
 ///
-/// 歌唱/読み上げトラックが合成中ならそのトラックの全 clip に、口パク再生成中なら
+/// **そのクリップに未完了の合成があるクリップだけ**に出す (r.md #75: 合成の単位が
+/// フレーズになり、進捗がクリップ単位で帰属するようになった。旧実装は「トラックが busy」
+/// だったので 1 ノート直すと同トラックの全クリップが回っていた)。口パク再生成中なら
 /// 出力先 (口) track の `auto_lipsync` clip に出す。印が消える = そのクリップが最新を
 /// 反映した、の合図 (grill-me 確定)。rect が小さい (zoom out) ときは名前/枠に被るので省略する。
 fn draw_clip_synth_spinner(
@@ -1229,7 +1231,7 @@ fn draw_clip_synth_spinner(
     if clip_rect.w < 30.0 || clip_rect.h < 24.0 {
         return;
     }
-    let wav = app.track_wav_synthesizing(clip_key.track);
+    let wav = app.clip_wav_synthesizing(clip_key.track, clip_key.clip);
     let lip = app.lipsync_target_generating(clip_key.track)
         && app
             .song_doc.song()

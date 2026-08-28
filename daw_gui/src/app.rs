@@ -230,6 +230,7 @@ impl AppData {
                 plugin_tx: Some(plugin_tx),
                 pending_clip_fx_bounce: None,
                 pending_vocal_synth_bounce: None,
+                pending_vocal_synth_export: std::collections::HashSet::new(),
                 open_plugin_guis: std::collections::HashSet::new(),
                 pending_plugin_loads: std::collections::HashMap::new(),
                 next_plugin_load_generation: 0,
@@ -243,20 +244,7 @@ impl AppData {
                 last_synced_epoch: 0,
                 event_proxy,
             },
-            voicevox: VoicevoxState {
-                singers: Vec::new(),
-                talk_speakers: Vec::new(),
-                voicevox_job,
-                spawned_engine: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::state::voicevox::VoicevoxEngineSlot::default(),
-                )),
-                voicevox_launch_attempted: false,
-                lipsync_gen: 0,
-                lipsync_inflight: std::collections::HashSet::new(),
-                lipsync_fingerprints: std::collections::HashMap::new(),
-                voicevox_synth_status: std::collections::HashMap::new(),
-                voicevox_metadata_sent: std::collections::HashMap::new(),
-            },
+            voicevox: VoicevoxState::new(voicevox_job),
             media: MediaState {
                 audio_source_cache: AudioSourceCache::new(),
                 video_thumbnail_rgba: std::collections::HashMap::new(),
@@ -334,6 +322,8 @@ impl AppData {
                 master_panel_w: app_config.master_panel_w,
                 master_panel_sections: app_config.master_panel_sections,
                 meter_settings: app_config.meter,
+                // r.md #75: VOICEVOX 合成の塊の長さ (秒)。load 側でクランプ済。
+                voicevox_chunk_secs: app_config.voicevox_chunk_secs,
                 is_help_open: false,
                 is_about_open: false,
                 app_dirs,
@@ -366,6 +356,7 @@ impl AppData {
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
                 master_gain_dragging: false,
+                voicevox_chunk_editing: false,
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
@@ -794,6 +785,9 @@ impl AppData {
                 let dirs = self.ui_prefs.app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir);
                 self.theme = crate::theme::resolve(dirs.as_deref(), &id);
                 self.persist_app_config();
+            }
+            AppEvent::SetVoicevoxChunkSecs { secs, commit } => {
+                self.set_voicevox_chunk_secs(secs, commit);
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
             AppEvent::JumpHistory(index) => self.jump_history_to(index),
@@ -1862,10 +1856,7 @@ impl AppData {
                 // freewheel ループが次 buffer で中断 → `ExportWavComplete
                 // { error: None, cancelled: true }` が返る (cancel は typed flag で
                 // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
-                Some(ExportStage::AudioRender { .. }) => {
-                    self.send_audio(AudioCommand::CancelExport);
-                    self.ui_ephemeral.status_message = "書き出しをキャンセル中...".into();
-                }
+                Some(ExportStage::AudioRender { .. }) => self.cancel_audio_render(),
                 None => {}
             },
             AppEvent::SetClipReversed { target, reversed } => {

@@ -22,7 +22,7 @@ pub const VOICEVOX_URL: &str = "http://localhost:50021";
 
 /// sing_frame_audio_query の query 生成に使う speaker (query generation only — 実 singer は
 /// frame_synthesis で選ぶ)。6000 = 波音リツ、REAPER 参照と同じ。client (query_phonemes) と
-/// synth (sing_query_to_wav) が共用。
+/// synth (`voicevox_synth::fetch_sing_frame_query`) が共用。
 pub const QUERY_SPEAKER: u32 = 6000;
 /// frame_synthesis の既定 singer (声未指定時)。3061 = 中国うさぎ ノーマル。
 pub const DEFAULT_SINGER_ID: u32 = 3061;
@@ -90,21 +90,36 @@ pub struct Phoneme {
 }
 
 // ---------------------------------------------------------------------------
-// Query builder (sing) — client (query_phonemes) と synth (sing_query_to_wav) が共用
+// Query builder (sing) — client (query_phonemes) / synth (塊クエリ) / フレーズ分割が共用
 // ---------------------------------------------------------------------------
+
+/// 重なり解決後に query へ載る note 1 件の **絶対 frame 位置**
+/// (query 先頭 = frame 0、先頭 rest 込み)。プロセス内の計算専用で IPC を渡らない
+/// (`common/build.rs` の `WIRE_SOURCES` に voicevox.rs は入っていない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotePlacement {
+    /// 入力 `notes` 内の index。
+    pub index: usize,
+    /// 音が始まる絶対 frame。
+    pub start_frame: i64,
+    /// 音が終わる絶対 frame (排他)。重なり切り詰め後の実値。
+    pub end_frame: i64,
+}
 
 /// [`build_sing_query`] の出力。
 ///
-/// `note_frames` は「入力 `notes` 内の index → その note の音声が始まる **絶対 frame
-/// 位置**」(query 先頭 = frame 0、先頭 rest 込み)。合成 WAV / phoneme 列の実位置その
-/// もので、sample 位置は [`frames_to_samples`] で得られる。歌詞・長さ・重なりの都合で
-/// query に載らなかった note は含まれない。
+/// `notes` の frame 位置は合成 WAV / phoneme 列の実位置そのもので、sample 位置は
+/// [`frames_to_samples`] で得られる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingQuery {
     /// `POST /sing_frame_audio_query` に渡す JSON body。
     pub json: String,
-    /// `(notes 内 index, 絶対 frame 位置)`、query 内の出現順。
-    pub note_frames: Vec<(usize, i64)>,
+    /// query 内の出現順 (= start_frame 昇順)。歌詞・長さ・重なりの都合で
+    /// query に載らなかった note は含まれない。
+    pub notes: Vec<NotePlacement>,
+    /// 末尾まで歌詞解決したあとの「持ち越し母音」。長音符「ー」を
+    /// フレーズ / 塊をまたいで解決するため、次の query 構築へ引き渡す。
+    pub carry_out: Option<char>,
 }
 
 /// query に載る (= 実際に歌われる) note か。長さ 0 / pitch 0 は VOICEVOX に渡せない。
@@ -163,12 +178,38 @@ fn rest_entry(id: &str, frames: i64) -> String {
 /// 残差は VOICEVOX の 93.75fps 分解能そのもの (±0.5 frame = ±5.33ms、バイアス 0) で、
 /// これは VOICEVOX 本体エディタと同じ精度。
 pub fn build_sing_query(notes: &[Note], bpm: f32) -> SingQuery {
-    let mut parts: Vec<String> = Vec::new();
-    let rest = i64::from(REST_FRAMES);
+    build_sing_query_with(notes, bpm, None)
+}
 
-    // Leading rest (gives the synth a moment of silence for the attack).
-    parts.push(rest_entry("rest_start", rest));
+/// 単体 query の全部入り builder。[`build_sing_query`] はこれに `carry_in = None` で
+/// 委譲する (**実装は 1 本だけ**)。
+///
+/// 端 rest は常に [`REST_FRAMES`] — 口パク配置 SSoT ([`sing_head_beat`]) がこの値に
+/// 乗っているので、単体 query 側では**可変にしない**。塊 query
+/// ([`crate::voicevox_phrase::build_chunk_query`]) だけが [`emit_sing_query`] へ別の
+/// 端 rest を渡す。
+///
+/// `carry_in` は「フレーズ先頭で有効な持ち越し母音」。長音符「ー」だけの note は
+/// 直前 note の母音へ解決されるので、フレーズに割ったときはこれを引き継がないと
+/// 先頭が裸の「ー」であるフレーズが fallback の「あ」になり **歌詞が変わる**。
+#[must_use]
+pub fn build_sing_query_with(notes: &[Note], bpm: f32, carry_in: Option<char>) -> SingQuery {
+    let placements = place_sing_notes(notes, bpm, i64::from(REST_FRAMES));
+    emit_sing_query(notes, &placements, i64::from(REST_FRAMES), carry_in)
+}
 
+/// notes を `start_beat` 昇順に整列し、Reaper 流の重なり解決 (前の note を次の開始で
+/// 切り詰める / 切り詰めで 1 frame 未満に潰れたら落とす、押し出しはしない) を掛けて
+/// **絶対 frame 位置**を確定する。
+///
+/// `edge_rest_frames` は query 先頭に置く無音の長さ (= 全 placement に一律で足される
+/// オフセット。隙間の有無には影響しない)。
+///
+/// [`build_sing_query_with`] / [`crate::voicevox_phrase::split_into_phrases`] /
+/// [`crate::voicevox_phrase::build_chunk_query`] の共通前段。3 者が同じ
+/// 「どの note が載るか」「どこで隙間ゼロか」を見るための SSoT。
+#[must_use]
+pub fn place_sing_notes(notes: &[Note], bpm: f32, edge_rest_frames: i64) -> Vec<NotePlacement> {
     // Sort notes by start_beat — `ClipContent.notes` is unordered by contract, and this
     // builder requires monotonic timing. 安定ソートなので同時刻は入力順を保つ。
     let mut sorted: Vec<(usize, &Note)> = notes
@@ -183,11 +224,7 @@ pub fn build_sing_query(notes: &[Note], bpm: f32) -> SingQuery {
     });
 
     let Some(&(_, first)) = sorted.first() else {
-        parts.push(rest_entry("rest_end", rest));
-        return SingQuery {
-            json: format!(r#"{{"notes":[{}]}}"#, parts.join(",")),
-            note_frames: Vec::new(),
-        };
+        return Vec::new();
     };
 
     let seconds_per_beat = 60.0 / f64::from(bpm);
@@ -195,52 +232,80 @@ pub fn build_sing_query(notes: &[Note], bpm: f32) -> SingQuery {
     // bpm <= 0 の壊れた song では `seconds_per_beat` が inf になり frame が飽和するので、
     // 先頭 rest の加算も saturating で回す (panic させない)。
     let pos_of = |beat: f64| {
-        rest.saturating_add(beat_offset_to_frame(beat - base_beat, seconds_per_beat))
+        edge_rest_frames.saturating_add(beat_offset_to_frame(beat - base_beat, seconds_per_beat))
     };
 
     // 絶対位置 → 重なり解決 (前を切り詰め / 潰れたら落とす)。押し出しは一切しない。
-    let mut kept: Vec<(usize, i64, i64)> = Vec::with_capacity(sorted.len());
+    let mut kept: Vec<NotePlacement> = Vec::with_capacity(sorted.len());
     for (idx, note) in sorted {
         let pos = pos_of(note.start_beat);
         let end = pos_of(note.start_beat + note.duration_beats);
-        while let Some(&(_, prev_pos, prev_end)) = kept.last() {
-            let truncated = prev_end.min(pos);
+        while let Some(prev) = kept.last().copied() {
+            let truncated = prev.end_frame.min(pos);
             // 位置は f64 → i64 の飽和キャストなので、壊れた project の巨大な
             // start_beat でも panic しないよう saturating で回す。
-            if truncated.saturating_sub(prev_pos) >= 1 {
-                if let Some(prev) = kept.last_mut() {
-                    prev.2 = truncated;
+            if truncated.saturating_sub(prev.start_frame) >= 1 {
+                if let Some(p) = kept.last_mut() {
+                    p.end_frame = truncated;
                 }
                 break;
             }
             // 切り詰めで 1 frame 未満に潰れた → 落とす (押し出さない)。
             kept.pop();
         }
-        kept.push((idx, pos, end.max(pos.saturating_add(1))));
+        kept.push(NotePlacement {
+            index: idx,
+            start_frame: pos,
+            end_frame: end.max(pos.saturating_add(1)),
+        });
     }
+    kept
+}
+
+/// 確定済み placement 列から `/sing_frame_audio_query` の body を組む
+/// (前後の端 rest + 隙間 rest の挿入、長音符「ー」の解決、JSON 文字列化)。
+///
+/// `placements` は **`start_frame` 昇順・区間が重ならない**こと。`index` は `notes` への
+/// index で、**`notes` の並びが `placements` の順である必要は無い**
+/// (塊 query は複数フレーズの placement を連結して渡す)。
+///
+/// 戻り値の [`SingQuery::carry_out`] は末尾時点の持ち越し母音。
+pub(crate) fn emit_sing_query(
+    notes: &[Note],
+    placements: &[NotePlacement],
+    edge_rest_frames: i64,
+    carry_in: Option<char>,
+) -> SingQuery {
+    let mut parts: Vec<String> = Vec::with_capacity(placements.len() * 2 + 2);
+    let rest = edge_rest_frames;
+
+    // Leading rest (gives the synth a moment of silence for the attack).
+    parts.push(rest_entry("rest_start", rest));
 
     // 長音「ー」を「直前の母音を伸ばす」で解決するため、直前ノートの母音を持ち越す。
-    let mut carried_vowel: Option<char> = None;
-    let mut note_frames: Vec<(usize, i64)> = Vec::with_capacity(kept.len());
+    // フレーズ分割では前フレーズ末尾の母音が `carry_in` で入ってくる。
+    let mut carried_vowel: Option<char> = carry_in;
     let mut cursor = rest;
-    for (i, &(idx, pos, end)) in kept.iter().enumerate() {
-        if pos > cursor {
-            parts.push(rest_entry(&format!("rest{i}"), pos.saturating_sub(cursor)));
+    for (i, p) in placements.iter().enumerate() {
+        if p.start_frame > cursor {
+            parts.push(rest_entry(
+                &format!("rest{i}"),
+                p.start_frame.saturating_sub(cursor),
+            ));
         }
         // 長音符「ー」は VOICEVOX の sing 合成が単独歌詞として弾く (400
         // `lyricが不正です: ー`)。直前の母音へ解決してから流す。
-        let raw_lyric = notes[idx].lyric.as_deref().unwrap_or("ら");
+        let raw_lyric = notes[p.index].lyric.as_deref().unwrap_or("ら");
         let lyric = resolve_sing_lyric(raw_lyric, &mut carried_vowel);
         let escaped = lyric.replace('\\', "\\\\").replace('"', "\\\"");
         parts.push(format!(
             r#"{{"id":"note{}","key":{},"frame_length":{},"lyric":"{}"}}"#,
             i,
-            notes[idx].pitch,
-            end.saturating_sub(pos),
+            notes[p.index].pitch,
+            p.end_frame.saturating_sub(p.start_frame),
             escaped
         ));
-        note_frames.push((idx, pos));
-        cursor = end;
+        cursor = p.end_frame;
     }
 
     // Trailing rest
@@ -248,8 +313,23 @@ pub fn build_sing_query(notes: &[Note], bpm: f32) -> SingQuery {
 
     SingQuery {
         json: format!(r#"{{"notes":[{}]}}"#, parts.join(",")),
-        note_frames,
+        notes: placements.to_vec(),
+        carry_out: carried_vowel,
     }
+}
+
+/// `notes` を順に歌詞解決したときの、末尾時点の持ち越し母音。
+/// query を組まずに carry だけ先送りしたいとき (フレーズ分割器) に使う。
+///
+/// `notes` は **query に載る順** (= `place_sing_notes` が返した順) であること。
+#[must_use]
+pub fn carry_vowel_after(notes: &[Note], carry_in: Option<char>) -> Option<char> {
+    let mut carried = carry_in;
+    for n in notes {
+        // 戻り値は捨てる (別実装にしない — 解決規則の SSoT は resolve_sing_lyric)。
+        let _ = resolve_sing_lyric(n.lyric.as_deref().unwrap_or("ら"), &mut carried);
+    }
+    carried
 }
 
 /// 長音符 (prolonged sound mark)。全角 `ー` (U+30FC) と半角 `ｰ` (U+FF70)。
@@ -318,6 +398,49 @@ fn resolve_sing_lyric(raw: &str, carried: &mut Option<char>) -> String {
 // ---------------------------------------------------------------------------
 // Helpers (client / synth 共用)
 // ---------------------------------------------------------------------------
+
+/// 合成 WAV の出力 sample rate。`/sing_frame_audio_query` 応答の `outputSamplingRate`
+/// を必ずこの値へ上書きしてから `/frame_synthesis` に渡す。
+pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
+
+/// FrameAudioQuery 応答 JSON を **キャッシュに置ける正規形**にする
+/// (= `outputSamplingRate` を [`OUTPUT_SAMPLE_RATE`] へ上書き。key が無ければそのまま)。
+///
+/// daw_gui (口パク) と daw_plugin_host (塊クエリ) は **同じ鍵関数
+/// ([`crate::voicevox_cache::key_for_sing_query`])・同じ schema・同じ prefix** を使う。
+/// 両者のエントリが実際に混ざらないのは、いま**楽譜 JSON の端 rest が違う**からに
+/// すぎない (口パク = [`build_sing_query`] で `rest_start` / `rest_end` が [`REST_FRAMES`]
+/// = 10、塊 = [`crate::voicevox_phrase::build_chunk_query`] で `PHRASE_PAD_FRAMES` = 47
+/// → 別ハッシュ)。**これは誰も強制していない偶然の分離**であって、鍵空間の分離ではない。
+///
+/// なので「この鍵空間に入る値は必ず正規形」を不変条件にして、put の前に両方がこれを
+/// 通す。破ると、生 body を put した側の 24 kHz 指定 query をもう片方がスライスして
+/// `/frame_synthesis` に投げ、24 kHz の WAV が 48 kHz 前提の buffer に混ざる。
+///
+/// 実装は文字列置換のまま (`serde_json` 経由にすると engine が返した他 field の表現が
+/// 変わり、鍵が engine の JSON 整形に依存してしまう)。
+#[must_use]
+pub fn normalize_frame_query(body: &str) -> String {
+    match find_sample_rate_field(body) {
+        Some(field) => body.replace(
+            &field,
+            &format!("\"outputSamplingRate\":{OUTPUT_SAMPLE_RATE}"),
+        ),
+        None => body.to_string(),
+    }
+}
+
+/// `"outputSamplingRate":<number>` の部分文字列を探して丸ごと返す (置換用)。
+/// key が無ければ `None`。
+fn find_sample_rate_field(json: &str) -> Option<String> {
+    let start = json.find("\"outputSamplingRate\":")?;
+    let after_key = start + "\"outputSamplingRate\":".len();
+    let end = json[after_key..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| after_key + i)
+        .unwrap_or(json.len());
+    Some(json[start..end].to_string())
+}
 
 /// Minimal URL-encoding for query parameters (talk の `/audio_query?text=` で使う)。
 /// client (query_talk_phonemes) と synth (synthesize_talk) が共用。
@@ -626,6 +749,11 @@ mod tests {
         f64::from(REST_FRAMES) + (start_beat - base_beat) * (60.0 / bpm) * FRAME_RATE
     }
 
+    /// `(index, start_frame)` の一覧 (旧 `note_frames` と同じ形の期待値を書くため)。
+    fn starts(q: &SingQuery) -> Vec<(usize, i64)> {
+        q.notes.iter().map(|p| (p.index, p.start_frame)).collect()
+    }
+
     #[test]
     fn note_positions_are_absolute_with_no_systematic_bias() {
         // 旧実装は `seconds_to_frames` の `.max(1.0)` が先頭 note の位置 0 を 1 に
@@ -633,12 +761,17 @@ mod tests {
         // 位置は絶対 frame へ丸めるだけなので、誤差は ±0.5 frame・バイアス 0 になる。
         let notes: Vec<Note> = (0..4).map(|i| note_at(f64::from(i), 1.0)).collect();
         let q = build_sing_query(&notes, 120.0);
-        assert_eq!(q.note_frames, vec![(0, 10), (1, 57), (2, 104), (3, 151)]);
-        for (idx, frame) in &q.note_frames {
-            let ideal = ideal_frame(notes[*idx].start_beat, 0.0, 120.0);
+        assert_eq!(starts(&q), vec![(0, 10), (1, 57), (2, 104), (3, 151)]);
+        // 隙間ゼロで続くので、各 note の終端は次の開始と一致する (= 1 フレーズ)。
+        assert_eq!(q.notes[0].end_frame, q.notes[1].start_frame);
+        assert_eq!(q.notes[2].end_frame, q.notes[3].start_frame);
+        for p in &q.notes {
+            let ideal = ideal_frame(notes[p.index].start_beat, 0.0, 120.0);
+            let frame = p.start_frame;
             assert!(
-                (*frame as f64 - ideal).abs() <= 0.5,
-                "note {idx}: frame={frame} ideal={ideal}"
+                (frame as f64 - ideal).abs() <= 0.5,
+                "note {}: frame={frame} ideal={ideal}",
+                p.index
             );
         }
     }
@@ -646,18 +779,23 @@ mod tests {
     #[test]
     fn rests_between_notes_do_not_accumulate_error() {
         // 休符を挟んでも誤差が積み上がらない (旧実装は休符ごとに更にずれた)。
-        let starts = [0.0, 1.5, 3.0, 4.5];
-        let notes: Vec<Note> = starts.iter().map(|&s| note_at(s, 1.0)).collect();
+        let starts_beats = [0.0, 1.5, 3.0, 4.5];
+        let notes: Vec<Note> = starts_beats.iter().map(|&s| note_at(s, 1.0)).collect();
         let q = build_sing_query(&notes, 120.0);
-        for (idx, frame) in &q.note_frames {
-            let ideal = ideal_frame(starts[*idx], 0.0, 120.0);
+        for p in &q.notes {
+            let ideal = ideal_frame(starts_beats[p.index], 0.0, 120.0);
+            let frame = p.start_frame;
             assert!(
-                (*frame as f64 - ideal).abs() <= 0.5,
-                "note {idx}: frame={frame} ideal={ideal}"
+                (frame as f64 - ideal).abs() <= 0.5,
+                "note {}: frame={frame} ideal={ideal}",
+                p.index
             );
+            // 休符を挟むので終端は次の開始より手前 (= フレーズ境界になる)。
+            assert!(p.end_frame > p.start_frame);
         }
         // 先頭 note は必ず REST_FRAMES ちょうど。
-        assert_eq!(q.note_frames[0], (0, i64::from(REST_FRAMES)));
+        assert_eq!(starts(&q)[0], (0, i64::from(REST_FRAMES)));
+        assert!(q.notes[0].end_frame < q.notes[1].start_frame);
     }
 
     #[test]
@@ -667,7 +805,7 @@ mod tests {
         // 重なった分だけ以降が後ろへずれていた = r.md #39 付随 (b))。
         let notes = vec![note_at(0.0, 2.0), note_at(1.5, 1.0)];
         let q = build_sing_query(&notes, 120.0);
-        assert_eq!(q.note_frames, vec![(0, 10), (1, 80)]);
+        assert_eq!(starts(&q), vec![(0, 10), (1, 80)]);
         let entries = parse_query(&q);
         // rest_start(10), note0(70 = 80-10), note1(47), rest_end(10)。gap rest 無し。
         assert_eq!(entries.len(), 4);
@@ -676,12 +814,26 @@ mod tests {
     }
 
     #[test]
+    fn note_placements_report_truncated_end_frames() {
+        // 重なる 2 note では、前の `end_frame` が次の `start_frame` へ切り詰められた
+        // **実値**になる (切り出し窓を決めるのにこれが要る)。
+        let notes = vec![note_at(0.0, 2.0), note_at(1.5, 1.0)];
+        let placed = place_sing_notes(&notes, 120.0, i64::from(REST_FRAMES));
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[0].end_frame, placed[1].start_frame);
+        assert_eq!(placed[0].end_frame, 80);
+        // 後ろの note は切り詰められないので理論終端のまま (1.5+1.0 拍 = 127)。
+        assert_eq!(placed[1].end_frame, 127);
+    }
+
+    #[test]
     fn sub_frame_note_keeps_one_frame_and_does_not_delay_the_next() {
         // 1 frame (10.7ms) 未満の note も VOICEVOX 要求どおり 1 frame は確保するが、
         // 次の note の位置は押し出さない。
         let notes = vec![note_at(0.0, 0.005), note_at(1.0, 1.0)];
         let q = build_sing_query(&notes, 120.0);
-        assert_eq!(q.note_frames, vec![(0, 10), (1, 57)]);
+        assert_eq!(starts(&q), vec![(0, 10), (1, 57)]);
+        assert_eq!(q.notes[0].end_frame, 11, "最小 1 frame は end_frame にも出る");
         let entries = parse_query(&q);
         assert_eq!(entries[1].1, 1, "最小 1 frame");
         assert_eq!(entries[2].1, 46, "gap rest = 57 - 11");
@@ -693,7 +845,7 @@ mod tests {
         // 後続位置は保つ (押し出すと以降が全部ずれるため)。
         let notes = vec![note_at(0.0, 1.0), note_at(0.0, 2.0), note_at(2.0, 1.0)];
         let q = build_sing_query(&notes, 120.0);
-        assert_eq!(q.note_frames, vec![(1, 10), (2, 104)]);
+        assert_eq!(starts(&q), vec![(1, 10), (2, 104)]);
     }
 
     #[test]
@@ -705,8 +857,80 @@ mod tests {
         no_pitch.pitch = 0;
         let notes = vec![zero_len, no_pitch, note_at(2.0, 1.0)];
         assert_eq!(sing_base_beat(&notes), Some(2.0));
-        assert_eq!(build_sing_query(&notes, 120.0).note_frames, vec![(2, 10)]);
+        assert_eq!(starts(&build_sing_query(&notes, 120.0)), vec![(2, 10)]);
         assert_eq!(sing_base_beat(&[]), None);
+    }
+
+    // ---- フレーズ分割の前提 (r.md #75) --------------------------------------
+
+    #[test]
+    fn carry_vowel_flows_across_rests() {
+        // 「ら」→ 休符 → 「ー」。持ち越し母音は休符をまたいで生きるので、
+        // 2 つ目の note は「あ」に解決される (= フレーズを割ったら引き継ぐ必要がある)。
+        let notes = vec![note_with_lyric(0.0, "ら"), note_with_lyric(2.0, "ー")];
+        let entries = parse_query(&build_sing_query(&notes, 120.0));
+        let lyrics: Vec<&str> = entries.iter().map(|e| e.2.as_str()).collect();
+        assert_eq!(lyrics, vec!["", "ら", "", "あ", ""]);
+        assert_eq!(carry_vowel_after(&notes[..1], None), Some('あ'));
+    }
+
+    #[test]
+    fn carry_in_restores_prolongation_across_a_split() {
+        // 「こ」「ー」を 2 つに割っても、carry_in を渡せば全体 1 本と同じ歌詞になる
+        // (= フレーズ分割の要。渡さないと fallback の「あ」に化ける)。
+        let notes = vec![note_with_lyric(0.0, "こ"), note_with_lyric(2.0, "ー")];
+        let whole = parse_query(&build_sing_query(&notes, 120.0));
+        let whole_last_lyric = whole[3].2.clone();
+        assert_eq!(whole_last_lyric, "お");
+
+        let carry = carry_vowel_after(&notes[..1], None);
+        let split = parse_query(&build_sing_query_with(&notes[1..], 120.0, carry));
+        assert_eq!(split[1].2, whole_last_lyric, "carry_in で同じ母音に解決される");
+
+        // carry_in を渡さないと「あ」に落ちる (= 引き渡しが必要であることの証拠)。
+        let naive = parse_query(&build_sing_query(&notes[1..], 120.0));
+        assert_eq!(naive[1].2, "あ");
+    }
+
+    #[test]
+    fn edge_rest_frames_shifts_every_placement_uniformly() {
+        // 端 rest を変えても、全 placement が同じ差分だけ平行移動するだけで、
+        // 隙間の有無 (= フレーズ境界) も落ちる note の集合も変わらない。
+        // 塊 query 内のフレーズ (端 rest 0 起点) と単体 query (端 rest REST_FRAMES) の
+        // 相対 frame 列が一致する、という §3.2 / §4.2 の前提。
+        let notes = vec![
+            note_at(0.0, 1.0),
+            note_at(1.0, 1.0),   // 隙間ゼロ (同一フレーズ)
+            note_at(3.0, 0.005), // 休符後、1 frame 未満
+            note_at(4.0, 1.0),
+        ];
+        let a = place_sing_notes(&notes, 120.0, 0);
+        let b = place_sing_notes(&notes, 120.0, i64::from(REST_FRAMES));
+        assert_eq!(a.len(), b.len(), "落ちる note の集合が変わらない");
+        for (pa, pb) in a.iter().zip(b.iter()) {
+            assert_eq!(pa.index, pb.index);
+            assert_eq!(pb.start_frame - pa.start_frame, i64::from(REST_FRAMES));
+            assert_eq!(pb.end_frame - pa.end_frame, i64::from(REST_FRAMES));
+        }
+        // 隙間の有無 (= フレーズ境界) も一致する。
+        let gaps = |v: &[NotePlacement]| -> Vec<bool> {
+            v.windows(2).map(|w| w[0].end_frame != w[1].start_frame).collect()
+        };
+        assert_eq!(gaps(&a), gaps(&b));
+        assert_eq!(gaps(&a), vec![false, true, true]);
+    }
+
+    #[test]
+    fn normalize_frame_query_forces_the_output_sample_rate() {
+        let body = r#"{"f0":[1.0],"outputSamplingRate":24000,"volumeScale":1.0}"#;
+        let out = normalize_frame_query(body);
+        assert!(out.contains("\"outputSamplingRate\":48000"), "{out}");
+        assert!(out.contains("\"volumeScale\":1.0"), "他 field はそのまま: {out}");
+        // key が無ければ素通し (engine の応答形が変わっても壊さない)。
+        let no_key = r#"{"f0":[1.0]}"#;
+        assert_eq!(normalize_frame_query(no_key), no_key);
+        // 既に正規形なら冪等。
+        assert_eq!(normalize_frame_query(&out), out);
     }
 
     #[test]

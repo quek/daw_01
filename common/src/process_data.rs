@@ -135,8 +135,9 @@ pub struct Event {
     /// (`PluginFormat::Builtin`, e.g. VOICEVOX) use this to look up
     /// per-note metadata (歌詞 / phoneme) and synthesised audio
     /// caches. CLAP backends forward it to `clap_event_note.note_id`;
-    /// VST3 backends ignore it. `0` is a valid id (= first note in
-    /// the track), so consumers should not treat 0 as "unset".
+    /// VST3 backends ignore it. `0` is a valid id
+    /// (`plugin_metadata::sing_note_id(0, 0)`), so consumers must not
+    /// treat 0 as "unset".
     pub note_id: u32,
     /// Param value (Param events) — ignored otherwise.
     pub value: f64,

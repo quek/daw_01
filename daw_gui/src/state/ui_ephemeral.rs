@@ -81,6 +81,14 @@ pub struct UiEphemeral {
     /// bracket しないと per-frame の編集が履歴を埋める (group transform /
     /// inspector scrub と同じ罠)。session-only。
     pub master_gain_dragging: bool,
+    /// r.md #75: 設定 window の「合成の塊の長さ」を drag / text 編集中か
+    /// (確定 = 立ち下がりの edge 検出用)。session-only。
+    ///
+    /// この値の確定は **曲全体の再合成 + app_config.json への書き込み**を意味するので、
+    /// drag の per-frame 値では確定させない (掴んで振っている間ずっと engine を叩き、
+    /// 毎フレーム設定ファイルを書くことになる)。マスターフェーダーの undo bracket
+    /// (`master_gain_dragging`) と同じ edge 検出の流儀。
+    pub voicevox_chunk_editing: bool,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。

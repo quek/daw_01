@@ -51,6 +51,50 @@ pub struct AppConfig {
     /// r.md #54: ラウドネスレポート window の位置・サイズ `[x, y, w, h]` (px)。
     #[serde(default)]
     pub loudness_report_rect: Option<[f32; 4]>,
+    /// r.md #75: VOICEVOX 歌唱合成の「塊」(= `/sing_frame_audio_query` 1 回) の長さ (秒)。
+    /// 曲の内容ではなく **合成品質のつまみ**なのでプロジェクトには保存しない。
+    /// 既定 60 秒 (実測で 30 秒はばらつきが倍、120 秒は改善せずクエリだけ遅くなる)。
+    /// `load` が必ず有効範囲へクランプする (壊れた / 手書きの値で engine を落とさない)。
+    #[serde(default = "default_voicevox_chunk_secs")]
+    pub voicevox_chunk_secs: f32,
+}
+
+fn default_voicevox_chunk_secs() -> f32 {
+    common::voicevox_phrase::DEFAULT_CHUNK_SECS
+}
+
+impl AppConfig {
+    /// 現在の UI 設定 (`UiPrefs`) と選択中テーマ id から保存用の設定を組む。
+    ///
+    /// **網羅的な struct literal** なので、field を足したらここも必ず埋まる
+    /// (埋め忘れでビルドが通らない = 保存漏れが起きない)。組み立てを `AppConfig` の
+    /// 定義の隣に置くのは、「何を永続するか」がこの型の関心だから (呼び出し側の
+    /// `persist_app_config` は保存先の解決とエラー処理だけを持つ)。
+    ///
+    /// テーマは **id だけ**保存する (色を焼き込むとテーマファイルを編集しても
+    /// 反映されず SSoT が二重化する。r.md #48)。
+    #[must_use]
+    pub fn from_prefs(prefs: &crate::state::UiPrefs, theme_id: String) -> Self {
+        Self {
+            resource_monitor_enabled: prefs.resource_monitor_enabled,
+            undo_history_open: prefs.undo_history_open,
+            undo_history_rect: prefs.undo_history_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            theme: theme_id,
+            settings_open: prefs.settings_open,
+            settings_rect: prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
+            // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
+            master_panel_open: prefs.master_panel_open,
+            master_panel_w: prefs.master_panel_w,
+            master_panel_sections: prefs.master_panel_sections,
+            meter: prefs.meter_settings,
+            // r.md #54: レポート window の開閉と位置も「画面の使い方」側。
+            loudness_report_open: prefs.loudness_report_open,
+            loudness_report_rect: prefs.loudness_report_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #75: 合成の塊の長さ (秒) も「この人の作業のしかた」側。
+            voicevox_chunk_secs: prefs.voicevox_chunk_secs,
+        }
+    }
 }
 
 fn default_master_panel_w() -> f32 {
@@ -85,11 +129,16 @@ impl Default for AppConfig {
             meter: crate::master_meter::settings::MeterSettings::default(),
             loudness_report_open: false,
             loudness_report_rect: None,
+            voicevox_chunk_secs: default_voicevox_chunk_secs(),
         }
     }
 }
 
 /// ファイルが無い / 読めない / parse 失敗なら `Default` を返す (常に有効な設定)。
+///
+/// 値域を持つ設定はここで必ずクランプする — 手書きや旧バージョンの
+/// `app_config.json` に 5 秒 / 9999 秒が入っていても、VOICEVOX engine を
+/// 落とさないため (r.md #75)。
 pub fn load(path: impl AsRef<Path>) -> AppConfig {
     let Ok(text) = std::fs::read_to_string(path.as_ref()) else {
         return AppConfig::default();
@@ -97,7 +146,12 @@ pub fn load(path: impl AsRef<Path>) -> AppConfig {
     if text.trim().is_empty() {
         return AppConfig::default();
     }
-    serde_json::from_str(&text).unwrap_or_default()
+    let mut cfg: AppConfig = serde_json::from_str(&text).unwrap_or_default();
+    cfg.voicevox_chunk_secs = cfg.voicevox_chunk_secs.clamp(
+        common::voicevox_phrase::MIN_CHUNK_SECS,
+        common::voicevox_phrase::MAX_CHUNK_SECS,
+    );
+    cfg
 }
 
 pub fn save(path: impl AsRef<Path>, config: &AppConfig) -> Result<()> {
@@ -136,6 +190,7 @@ mod tests {
             },
             loudness_report_open: true,
             loudness_report_rect: Some([5.0, 6.0, 720.0, 500.0]),
+            voicevox_chunk_secs: 120.0,
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -152,6 +207,31 @@ mod tests {
         assert_eq!(loaded.meter.loudness_true_peak_ceiling_dbtp, -2.0);
         assert!(loaded.loudness_report_open);
         assert_eq!(loaded.loudness_report_rect, Some([5.0, 6.0, 720.0, 500.0]));
+        assert_eq!(loaded.voicevox_chunk_secs, 120.0);
+    }
+
+    /// r.md #75: 壊れた / 手書きの `app_config.json` で 5 秒や 9999 秒が来ても、
+    /// VOICEVOX engine を落とさない (= load 時に必ず有効範囲へ畳む)。
+    #[test]
+    fn load_clamps_chunk_secs_out_of_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        std::fs::write(&path, r#"{"voicevox_chunk_secs": 9999.0}"#).unwrap();
+        assert_eq!(
+            load(&path).voicevox_chunk_secs,
+            common::voicevox_phrase::MAX_CHUNK_SECS
+        );
+        std::fs::write(&path, r#"{"voicevox_chunk_secs": 5.0}"#).unwrap();
+        assert_eq!(
+            load(&path).voicevox_chunk_secs,
+            common::voicevox_phrase::MIN_CHUNK_SECS
+        );
+        // 未指定は既定 (60 秒)。
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(
+            load(&path).voicevox_chunk_secs,
+            common::voicevox_phrase::DEFAULT_CHUNK_SECS
+        );
     }
 
     #[test]

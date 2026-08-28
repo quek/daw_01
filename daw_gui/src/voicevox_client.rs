@@ -13,9 +13,10 @@ use anyhow::{Context, Result};
 
 use common::model::{Note, TalkParams};
 use common::voicevox::{
-    FRAME_RATE, Phoneme, QUERY_SPEAKER, VOICEVOX_URL, build_sing_query, talk_pre_silence_frames,
-    urlencoding_encode,
+    FRAME_RATE, Phoneme, QUERY_SPEAKER, VOICEVOX_URL, build_sing_query, normalize_frame_query,
+    talk_pre_silence_frames, urlencoding_encode,
 };
+use common::voicevox_cache::{CacheKind, VoiceVoxDiskCache, key_for_sing_query, key_for_talk_query};
 
 /// このファイルの HTTP はすべて **query 系** (声一覧の取得 / 口パク用の phoneme タイミング
 /// 取得) の timeout。 音声 **合成** は呼ばないので軽く、5 秒で足りる
@@ -97,11 +98,28 @@ fn fetch_voices(path: &str) -> anyhow::Result<Vec<VoiceVoxSinger>> {
 ///
 /// 戻り値は先頭/末尾の `REST_FRAMES` 分の `pau` も含む VOICEVOX 生の phoneme 列 (frame 0 起点)。
 /// beat への配置は `common::lipsync` 側で行う。
+///
+/// r.md #75: 応答をディスクキャッシュする (`key_for_sing_query`、鍵は**入力の楽譜**)。
+/// これで「入力が変わっていないクリップ」の口パク再生成は HTTP が丸ごと消える。
 pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
+    let query = build_sing_query(notes, bpm);
+    let cache = VoiceVoxDiskCache::production();
+    let key = key_for_sing_query(&query.json);
+    // キャッシュ hit は **parse できて初めて採用**する。壊れたエントリをそのまま
+    // 返すと、そのクリップの口パクは以後永久に生成できない (次も同じ壊れた JSON を
+    // 読むので HTTP へ落ちない)。取り直せば `put` が上書きして直る。
+    if let Some(hit) = cache.as_ref().and_then(|c| c.get(key, CacheKind::Json))
+        && let Ok(text) = String::from_utf8(hit)
+    {
+        match parse_phonemes(&text) {
+            Ok(ph) if !ph.is_empty() => return Ok(ph),
+            _ => tracing::warn!("voicevox cache: 壊れた口パク query を無視して再取得"),
+        }
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(QUERY_HTTP_TIMEOUT)
         .build()?;
-    let query = build_sing_query(notes, bpm);
     let url = format!("{VOICEVOX_URL}/sing_frame_audio_query?speaker={QUERY_SPEAKER}");
     let resp = client
         .post(&url)
@@ -114,6 +132,13 @@ pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
     if !status.is_success() {
         let preview: String = body.chars().take(200).collect();
         anyhow::bail!("sing_frame_audio_query returned {}: {}", status, preview);
+    }
+    // 鍵空間は plugin host の塊クエリと共有なので、**正規化してから put する**
+    // (生 body を置くと、向こうが 24 kHz 指定の query をスライスして 24 kHz の WAV を
+    // 得る)。口パクは phoneme しか見ないのでこちらへの影響は無い。
+    let body = normalize_frame_query(&body);
+    if let Some(c) = cache.as_ref() {
+        c.put(key, CacheKind::Json, body.as_bytes());
     }
     parse_phonemes(&body)
 }
@@ -144,11 +169,28 @@ fn parse_phonemes(body: &str) -> Result<Vec<Phoneme>> {
 /// 歌唱の `query_phonemes` と同じ `Vec<Phoneme>` を返すので、生成先 clip への配置は
 /// `common::lipsync::build_mouth_events` をそのまま再利用できる。先頭/末尾の `pau` を含む。
 /// `scales.speed_scale` で frame_length を割り、実際に鳴る (= speed 適用後の) 音声と口を揃える。
+///
+/// r.md #75: 応答をディスクキャッシュする (`key_for_talk_query`)。**speed は鍵に混ぜない**
+/// — `parse_talk_phonemes` が応答を受けた後で割るので、話速を変えても query は再取得
+/// しなくてよい。鍵空間は plugin host の talk 合成側と共有する (どちらも生の応答を置く)。
 pub fn query_talk_phonemes(
     text: &str,
     speaker_id: u32,
     scales: &TalkParams,
 ) -> Result<Vec<Phoneme>> {
+    let cache = VoiceVoxDiskCache::production();
+    let key = key_for_talk_query(text, speaker_id);
+    // 歌唱側と同じ規則: hit は parse できて初めて採用する (壊れたエントリを信じると
+    // その Text クリップの口パクが永久に生成できない)。
+    if let Some(hit) = cache.as_ref().and_then(|c| c.get(key, CacheKind::Json))
+        && let Ok(body) = String::from_utf8(hit)
+    {
+        match parse_talk_phonemes(&body, scales.speed_scale) {
+            Ok(ph) if !ph.is_empty() => return Ok(ph),
+            _ => tracing::warn!("voicevox cache: 壊れた talk query を無視して再取得"),
+        }
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(QUERY_HTTP_TIMEOUT)
         .build()?;
@@ -167,6 +209,9 @@ pub fn query_talk_phonemes(
     if !status.is_success() {
         let preview: String = body.chars().take(200).collect();
         anyhow::bail!("audio_query returned {}: {}", status, preview);
+    }
+    if let Some(c) = cache.as_ref() {
+        c.put(key, CacheKind::Json, body.as_bytes());
     }
     parse_talk_phonemes(&body, scales.speed_scale)
 }

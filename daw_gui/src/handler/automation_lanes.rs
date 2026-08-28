@@ -3,7 +3,6 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use common::protocol::{PluginCommand};
 
 impl AppData {
     /// `A` キー shortcut の handler。`last_touched_param` の lane を
@@ -984,19 +983,8 @@ impl AppData {
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
-        // (review) bounce 進行中の crash では BounceClipFxComplete / VocalSynthReady
-        // が永遠に来ない。 pending を放置すると以後の bounce が全て「既に bounce 中」
-        // で拒否され、 audio 側は isolated song のまま残る。 abort_audio_export と
-        // 同型の脱出口 (どちらの子の crash でも安全に解除できる)。
-        if self.ipc.pending_clip_fx_bounce.take().is_some()
-            || self.ipc.pending_vocal_synth_bounce.take().is_some()
-        {
-            self.send_plugin(PluginCommand::SetRenderMode(
-                common::protocol::RenderMode::Realtime,
-            ));
-            self.restore_engine_song_after_bounce();
-            export_aborted = true;
-        }
+        // 進行中の bounce / 書き出しを畳む (脱出口は handler::export が持つ)。
+        export_aborted |= self.abort_inflight_renders_on_disconnect();
 
         // 中止した書き出しがあれば status に併記する suffix。
         let export_suffix = if export_aborted {

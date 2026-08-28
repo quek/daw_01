@@ -16,11 +16,13 @@ use common::process_data::MAX_EVENTS;
 /// `MAX_EVENTS` で確保しているので、 clamp が効く限り再確保は起きない。
 const ACTIVE_NOTES_CAP: usize = MAX_EVENTS;
 
-/// PR-V2.4: `note_id` を追加。 audio engine が track 内全 clip notes を
-/// flatten した「通し index」 を振り、 plugin host (= builtin VOICEVOX) は
-/// この id で `NoteMetadata` (歌詞 / phoneme) や合成 wav frame offset を
-/// 引く。 CLAP / VST3 backend はこの field を無視する (= 既存 MIDI
-/// pipeline はそのまま動く)。
+/// PR-V2.4: `note_id` を追加。 値は
+/// `common::plugin_metadata::sing_note_id(clip.id, note.id)` = **安定 id**
+/// (r.md #75、アーキ不変条件 1)。 plugin host (= builtin VOICEVOX) はこの id で
+/// `NoteMetadata` (歌詞 / phoneme) や合成 wav frame offset を引く。 daw_gui の
+/// `sync_vocal_metadata` が **同じ関数**で同じ値を flush するので、clip の追加 /
+/// 削除 / 並べ替え / muted で番号がずれない。 CLAP / VST3 backend はこの field を
+/// 無視する (= 既存 MIDI pipeline はそのまま動く)。
 #[derive(Debug, Clone, Copy)]
 pub enum NoteTransition {
     On { note_id: u32, key: u8, velocity: f64 },
@@ -117,20 +119,11 @@ pub fn collect_events_for_buffer(
         f64::from(frames) * f64::from(current_bpm) / (60.0 * f64::from(sample_rate));
     let buf_end_beats = playhead_beats + buf_len_beats;
 
-    // PR-V2.4: track 内全 clip の notes を flatten した「通し index」 を
-    // note_id とする。 同 track の `sync_vocal_metadata` (daw_gui 側) と
-    // 同じ番号体系で flush されるので、 builtin plugin 側で `note_id` →
-    // 合成 wav frame offset の対応が成立する。 clip skip (= 範囲外 / 0
-    // length) でも `note_id_base` は necessary に進める必要があるが、
-    // current loop は `length_beats <= 0` の clip も notes を読まずに
-    // skip している。 ここでは「skip した clip の notes は数えない」 と
-    // 「skip しない clip 内 notes だけで通し番号」 のどちらでも builtin
-    // plugin 側の expected note_id とずれる可能性がある。 sync_vocal_
-    // metadata 側も同じ `length_beats <= 0` skip を入れて整合させるのが
-    // 正しいが、 通常 audio engine 側は無効 clip を skip しないので
-    // (= length_beats <= 0 は GUI で防がれる)、 ここは「全 clip notes を
-    // 通し」 で実装する。
-    let mut note_id_base: u32 = 0;
+    // note_id は `(clip.id, note.id)` からの決定論的導出
+    // (`common::plugin_metadata::sing_note_id`)。daw_gui の `sync_vocal_metadata` が
+    // **同じ関数**で同じ値を flush するので、clip の追加 / 削除 / 並べ替え / muted で
+    // 番号がずれない (旧「track 内通し index」の欠陥、アーキ不変条件 1)。
+    // 通し番号の bookkeeping はもう要らない (どの clip を skip しても影響しない)。
     for clip in &track.clips {
         // v6 linked clip: notes は Song.clip_contents から取り出す。
         // 共有 clip 群は同じ content から同じ notes を見るので、 別々の
@@ -140,17 +133,13 @@ pub fn collect_events_for_buffer(
             .get(&clip.content_id)
             .and_then(|c| c.notes())
             .unwrap_or(&[]);
-        let clip_note_count = notes.len() as u32;
 
-        // muted clip は全 note を skip (note_id 通し番号は維持して
-        // builtin VOICEVOX 側の note_id 対応がずれないよう base は加算する)。
+        // muted clip は全 note を skip。
         if clip.muted {
-            note_id_base += clip_note_count;
             continue;
         }
 
         if clip.length_beats <= 0.0 {
-            note_id_base += clip_note_count;
             continue;
         }
         let clip_end_beats = clip.start_beat + clip.length_beats;
@@ -158,7 +147,6 @@ pub fn collect_events_for_buffer(
         // 不要に)。 [clip.start_beat, clip.start_beat + length_beats) が
         // [playhead_beats, buf_end_beats) と重ならなければ skip。
         if clip_end_beats <= playhead_beats || clip.start_beat >= buf_end_beats {
-            note_id_base += clip_note_count;
             continue;
         }
         // r.md #44: clip は content への窓。 鳴らす note は content-local 拍で
@@ -167,10 +155,10 @@ pub fn collect_events_for_buffer(
         // 共有するが窓は clip ごとに独立する。
         let (win_start, win_end) = clip.content_window();
 
-        for (note_idx, note) in notes.iter().enumerate() {
-            let note_id = note_id_base + note_idx as u32;
+        for note in notes {
+            let note_id = common::plugin_metadata::sing_note_id(clip.id, note.id);
             // muted note は On/Off を一切 emit しない (On を出さないので
-            // stuck note にならない)。note_id 通し番号は enumerate で維持される。
+            // stuck note にならない)。note_id は note.id 由来なので影響を受けない。
             if note.muted {
                 continue;
             }
@@ -244,7 +232,6 @@ pub fn collect_events_for_buffer(
                 }
             }
         }
-        note_id_base += clip_note_count;
     }
 
     // (talk) 読み上げトリガ (`docs/plan_voicevox_talk.md` §3.4)。VOICEVOX デバイス付き
@@ -252,8 +239,9 @@ pub fn collect_events_for_buffer(
     // note_id = `talk_event_id(clip.id, event_index)` (= builtin の note_offsets と対応する
     // high band id)。builtin は wav 終端で自動 drain するので note_off は不要 (= active_notes
     // にも積まない)。空テキストは flush 側 (sync_vocal_metadata) と同条件で skip して
-    // event_id の対応を保つ。歌唱 MIDI clip と talk Text clip が混在しても、note_id (= 小さい
-    // 通し index) と event_id (= high band) は衝突しない。
+    // event_id の対応を保つ。歌唱 MIDI clip と talk Text clip が混在しても、
+    // note_id (= `sing_note_id`、`[0, TALK_EVENT_ID_BASE)`) と event_id (= high band) は
+    // 衝突しない。
     if track.is_voicevox_vocal() {
         for clip in &track.clips {
             // muted な Text(読み上げ) clip は talk note_on を発火しない。
@@ -418,10 +406,10 @@ mod tests {
     }
 
     /// muted note を skip しても、 同 clip 内の sibling note の `note_id`
-    /// (= enumerate 通し index) はずれない (builtin VOICEVOX の note_id ↔ 合成 wav
-    /// frame offset 対応を壊さないための不変条件)。
+    /// (= `sing_note_id(clip.id, note.id)`) はずれない (builtin VOICEVOX の
+    /// note_id ↔ 合成 wav frame offset 対応を壊さないための不変条件)。
     #[test]
-    fn muted_note_skipped_but_sibling_keeps_running_note_id() {
+    fn muted_note_skipped_but_sibling_keeps_stable_note_id() {
         let mut song = one_note_song(0.0, 1.0, 60);
         let cid = song.tracks[0].clips[0].content_id;
         if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) {
@@ -454,17 +442,60 @@ mod tests {
             .filter(|e| matches!(e.event, NoteTransition::On { .. }))
             .collect();
         assert_eq!(ons.len(), 1, "only the unmuted sibling emits On");
+        let clip_id = song.tracks[0].clips[0].id;
         match ons[0].event {
             NoteTransition::On { note_id, key, .. } => {
                 assert_eq!(key, 64);
                 assert_eq!(
-                    note_id, 1,
-                    "unmuted sibling keeps running note_id = enumerate index 1"
+                    note_id,
+                    common::plugin_metadata::sing_note_id(clip_id, 2),
+                    "unmuted sibling keeps its stable note_id (clip.id, note.id)"
                 );
             }
             NoteTransition::Off { .. } => unreachable!(),
         }
         assert_eq!(active, vec![64]);
+    }
+
+    /// r.md #75 が直した欠陥の直接の回帰テスト: clip の**先頭に 1 音足しても**、
+    /// 既存 note の `note_id` は変わらない (旧「通し index」では以降が全部ずれ、
+    /// builtin VOICEVOX のフレーズキャッシュも停止中プレビューも壊れていた)。
+    #[test]
+    fn note_id_is_unaffected_by_inserting_a_note_before_it() {
+        let collect_id_for_pitch = |song: &Song, pitch: u8| -> u32 {
+            let mut out = Vec::new();
+            let mut active = Vec::new();
+            collect_events_for_buffer(Some(song), 0, SR, 0.0, 120.0, 4096, &mut out, &mut active);
+            out.iter()
+                .find_map(|e| match e.event {
+                    NoteTransition::On { note_id, key, .. } if key == pitch => Some(note_id),
+                    _ => None,
+                })
+                .expect("note on for pitch")
+        };
+
+        let mut song = one_note_song(0.0, 1.0, 60);
+        let before = collect_id_for_pitch(&song, 60);
+
+        // 先頭 (時間的にも Vec 上も前) に別の note を足す。
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) {
+            m.notes.insert(
+                0,
+                Note {
+                    id: 7,
+                    start_beat: 0.0,
+                    duration_beats: 0.25,
+                    pitch: 48,
+                    velocity: 100,
+                    lyric: None,
+                    muted: false,
+                },
+            );
+            m.next_note_id = 8;
+        }
+        let after = collect_id_for_pitch(&song, 60);
+        assert_eq!(before, after, "既存 note の note_id は前挿入で変わらない");
     }
 
     #[test]

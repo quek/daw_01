@@ -32,6 +32,8 @@ pub mod timing;
 pub mod truepeak;
 pub mod video_fx;
 pub mod voicevox;
+pub mod voicevox_cache;
+pub mod voicevox_phrase;
 pub mod wire;
 pub mod worker_bridge;
 

@@ -130,6 +130,13 @@ pub struct IpcState {
     /// `VocalSynthReady` を待つ間 stable id を退避し、 ready 受信で現在位置へ
     /// 解決して `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
     pub pending_vocal_synth_bounce: Option<PendingVocalSynthBounce>,
+    /// r.md #75: WAV 書き出し前の合成完了待ち。`PrepareVocalSynth` を送った device の
+    /// 集合で、`VocalSynthReady` で 1 つずつ減らす。空になったら `ReinitAllPlugins` へ
+    /// 進む。bounce (1 件) と違い **曲中の全 VOICEVOX device** が対象。
+    ///
+    /// 逐次 publish (フレーズ単位) にした以上、待たずに render すると **部分ミックス**を
+    /// 掴む。plugin host 側で `done_gen` を守っても、待つ人がいなければ意味がない。
+    pub pending_vocal_synth_export: std::collections::HashSet<u64>,
     /// which device (`PluginInstance::id`) plugin editors are currently open.
     /// The editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed

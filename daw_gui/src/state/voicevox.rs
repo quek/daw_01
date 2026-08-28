@@ -73,7 +73,7 @@ pub struct VoicevoxState {
     /// engine 未接続警告へ切り替える。plugin unload (`SlotPluginUnloadedFromChild`) で entry を消す。
     pub voicevox_synth_status: std::collections::HashMap<u64, VocalSynthStatus>,
     /// r.md #27: builtin VOICEVOX device ごとに、最後に `SetBuiltinPluginNoteMetadata`
-    /// で送った `(bpm, notes, talk)`。`sync_vocal_metadata` は epoch bump のたび
+    /// で送った `(bpm, chunk_secs, notes, talk)`。`sync_vocal_metadata` は epoch bump のたび
     /// (= あらゆる編集) に呼ばれるが、この device の歌唱/読み上げ入力が前回送信から
     /// 変わっていなければ **再送しない** (= builtin plugin が不要な再合成を走らせない。
     /// Transform 等の非 vocal 編集で VOICEVOX 合成が走る問題の修正)。差分検出で送信を
@@ -83,8 +83,39 @@ pub struct VoicevoxState {
         u64,
         (
             f32,
+            f32,
             Vec<common::plugin_metadata::NoteMetadata>,
             Vec<common::plugin_metadata::TalkMetadata>,
         ),
     >,
+    /// r.md #75: builtin VOICEVOX device ごとに、最後に `SetVocalSynthPriority` で送った
+    /// 再生ヘッド位置 (拍)。1 拍以上動いたときだけ再送するための記憶 (= トランスポート中
+    /// でも IPC は数 Hz 以下に収まる)。**再合成はトリガしない**軽量ヒントなので、
+    /// `voicevox_metadata_sent` (再送デデュープ) とは別に持つ。
+    pub priority_sent: std::collections::HashMap<u64, f64>,
+}
+
+impl VoicevoxState {
+    /// 起動時の初期状態。engine は lazy 起動なので、ここでは何も spawn しない
+    /// (`voicevox_launch_attempted` が false のまま `ensure_voicevox_engine` を待つ)。
+    ///
+    /// **初期化はこの group の定義の隣に置く** — `AppData::new` の巨大な struct literal
+    /// に並べると、field を 1 つ足すたびに app.rs の実コード行が増えてサイズ budget
+    /// (不変条件 9) を押し上げる。`state/*` へ分けた意図どおり、group ごとに閉じる。
+    #[must_use]
+    pub fn new(voicevox_job: Arc<dyn JobDispatcher>) -> Self {
+        Self {
+            singers: Vec::new(),
+            talk_speakers: Vec::new(),
+            voicevox_job,
+            spawned_engine: Arc::new(std::sync::Mutex::new(VoicevoxEngineSlot::default())),
+            voicevox_launch_attempted: false,
+            lipsync_gen: 0,
+            lipsync_inflight: std::collections::HashSet::new(),
+            lipsync_fingerprints: std::collections::HashMap::new(),
+            voicevox_synth_status: std::collections::HashMap::new(),
+            voicevox_metadata_sent: std::collections::HashMap::new(),
+            priority_sent: std::collections::HashMap::new(),
+        }
+    }
 }

@@ -175,30 +175,99 @@ fn rebuild_mouth_clip(
     }
 }
 
+/// 1 clip の notes を builtin VOICEVOX 向けの [`NoteMetadata`] へ変換する。
+///
+/// `note_id` は **安定 id** (アーキ不変条件 1): `(clip.id, note.id)` から
+/// [`common::plugin_metadata::sing_note_id`] で決定論的に導出する。daw_audio の
+/// sequencer が **同じ関数**で同じ値を作るので、「クリップ先頭に 1 音足すと以降の
+/// 全 note_id がずれる」が起きない。
+///
+/// `start_beat` は content-local → song-absolute (r.md #44: note は content 原点基準)。
+/// `clip_id` は `note_id` の導出元であり、合成進捗のクリップ帰属にも使う (r.md #75)。
+/// `speaker_id` は per-clip 歌唱声 (`0` = builtin 側で `DEFAULT_SINGER_ID` へフォールバック)。
+fn collect_sing_metadata(
+    song: &common::model::Song,
+    clip: &Clip,
+) -> Vec<common::plugin_metadata::NoteMetadata> {
+    let notes: &[common::model::Note] = song
+        .clip_contents
+        .get(&clip.content_id)
+        .and_then(|c| c.notes())
+        .unwrap_or(&[]);
+    notes
+        .iter()
+        .map(|n| common::plugin_metadata::NoteMetadata {
+            note_id: common::plugin_metadata::sing_note_id(clip.id, n.id),
+            start_beat: clip.content_to_song_beat(n.start_beat),
+            duration_beats: n.duration_beats,
+            pitch: n.pitch,
+            velocity: n.velocity,
+            lyric: n.lyric.clone().unwrap_or_default(),
+            clip_id: clip.id,
+            speaker_id: clip.speaker_id,
+        })
+        .collect()
+}
+
+/// (talk) 1 clip の `ClipContent::Text` を [`TalkMetadata`] へ変換する
+/// (`docs/plan_voicevox_talk.md` §3.2)。
+///
+/// `event_id` は `talk_event_id(clip.id, event_index)` で決定論的に導出する
+/// (sequencer の talk-trigger と同式)。**空テキストは両側で skip** して event_id の
+/// 対応を保つ。声は per-clip (`clip.speaker_id` を talk style として解釈)、
+/// スケールは `clip.talk`。`clip_id` は合成進捗のクリップ帰属 (r.md #75) —
+/// これが無いと Text クリップにスピナーが一切点かない。
+fn collect_talk_metadata(
+    song: &common::model::Song,
+    clip: &Clip,
+) -> Vec<common::plugin_metadata::TalkMetadata> {
+    let Some(events) = song
+        .clip_contents
+        .get(&clip.content_id)
+        .and_then(|c| c.text_events())
+    else {
+        return Vec::new();
+    };
+    let scales = clip.talk.unwrap_or_default();
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, ev)| !ev.text.is_empty())
+        .map(|(event_index, ev)| common::plugin_metadata::TalkMetadata {
+            event_id: common::plugin_metadata::talk_event_id(clip.id, event_index as u32),
+            start_beat: clip.content_to_song_beat(ev.event_start_in_clip_beats),
+            text: ev.text.clone(),
+            speaker_id: clip.speaker_id,
+            speed_scale: scales.speed_scale,
+            pitch_scale: scales.pitch_scale,
+            intonation_scale: scales.intonation_scale,
+            volume_scale: scales.volume_scale,
+            clip_id: clip.id,
+        })
+        .collect()
+}
+
 impl AppData {
     // ===== VOICEVOX 生成状態の可視化 ==========================
 
-    /// `VoicevoxSynthStatus` IPC handler。per-plugin の busy + 失敗種別を更新する。
+    /// `VoicevoxSynthStatus` IPC handler。per-plugin の busy + 失敗種別 + 進捗を更新する。
     /// `Unreachable` の立上りで `failing_since` を記録 (継続中は維持) して 5s 後に
     /// 「engine 未接続」へ、`Rejected` は `rejected` に理由を積んで即時「合成できない歌詞」
     /// 表示へ。成功 (`None`) で両方クリア。idle かつ失敗なしの entry は掃除して
-    /// `voicevox_any_generating` 等の判定を軽く保つ。
+    /// `voicevox_any_generating` 等の判定を軽く保つ (= 進捗もクリアされる)。
     pub(crate) fn apply_voicevox_synth_status(
         &mut self,
         device_id: u64,
-        busy: bool,
-        failure: VocalSynthFailure,
+        progress: common::protocol::VocalSynthProgress,
     ) {
         let now = std::time::Instant::now();
+        let failure = progress.failure.clone();
         let entry = self
-            .voicevox.voicevox_synth_status
+            .voicevox
+            .voicevox_synth_status
             .entry(device_id)
-            .or_insert(VocalSynthStatus {
-                busy: false,
-                failing_since: None,
-                rejected: None,
-            });
-        entry.busy = busy;
+            .or_default();
+        entry.progress = progress;
         match failure {
             VocalSynthFailure::None => {
                 entry.failing_since = None;
@@ -213,7 +282,7 @@ impl AppData {
                 entry.rejected = Some(detail);
             }
         }
-        if !entry.busy && entry.failing_since.is_none() && entry.rejected.is_none() {
+        if !entry.progress.busy && entry.failing_since.is_none() && entry.rejected.is_none() {
             self.voicevox.voicevox_synth_status.remove(&device_id);
         }
     }
@@ -250,7 +319,35 @@ impl AppData {
         let Some(pid) = self.voicevox_plugin_id_for_track(track) else {
             return false;
         };
-        self.voicevox.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy)
+        self.voicevox.voicevox_synth_status.get(&pid).is_some_and(|s| s.progress.busy)
+    }
+
+    /// このクリップに **未完了フレーズが掛かっているか** (= クリップ上スピナーの点灯条件)。
+    /// 「トラックが busy」ではないので、1 ノート直しただけで同トラックの全クリップが
+    /// 回ることがなくなる (r.md #75)。
+    pub fn clip_wav_synthesizing(&self, track_id: u32, clip_id: u32) -> bool {
+        let Some(track) = self.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {
+            return false;
+        };
+        let Some(pid) = self.voicevox_plugin_id_for_track(track) else {
+            return false;
+        };
+        self.voicevox
+            .voicevox_synth_status
+            .get(&pid)
+            .is_some_and(|s| s.progress.pending_clips.binary_search(&clip_id).is_ok())
+    }
+
+    /// 曲中の builtin VOICEVOX device の安定 id (load 済のものだけ、track 順)。
+    /// 書き出し前の合成完了ゲートが「誰を待つか」を決めるのに使う。
+    pub(crate) fn all_vocal_synth_device_ids(&self) -> Vec<u64> {
+        self.song_doc
+            .song()
+            .tracks
+            .iter()
+            .filter(|t| t.is_voicevox_vocal())
+            .filter_map(|t| self.voicevox_plugin_id_for_track(t))
+            .collect()
     }
 
     /// 出力先 (口 track) が口パク再生成中か。
@@ -261,27 +358,68 @@ impl AppData {
     /// いずれかの VOICEVOX 生成 (WAV 合成 / 口パク) が進行中か。
     pub fn voicevox_any_generating(&self) -> bool {
         !self.voicevox.lipsync_inflight.is_empty()
-            || self.voicevox.voicevox_synth_status.values().any(|s| s.busy)
+            || self.voicevox.voicevox_synth_status.values().any(|s| s.progress.busy)
     }
 
-    /// WAV 合成中の vocal track 数 (= 全体オーバーレイの「残り N」)。
-    /// track→plugin_id を直接引く (track_wav_synthesizing の id 再 find を避け O(tracks²) 回避)。
-    pub fn voicevox_synth_busy_count(&self) -> usize {
-        self.song_doc.song()
-            .tracks
-            .iter()
-            .filter(|t| {
-                self.voicevox_plugin_id_for_track(t)
-                    .is_some_and(|pid| self.voicevox.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy))
-            })
-            .count()
+    /// 合成待ちのフレーズ総数 (= 全体オーバーレイの「残り N フレーズ」)。
+    /// r.md #75 で合成の最小単位がフレーズになったので、旧
+    /// `voicevox_synth_busy_count` (= busy な track 数) は意味を失った。
+    pub fn voicevox_pending_phrase_count(&self) -> u32 {
+        self.voicevox
+            .voicevox_synth_status
+            .values()
+            .map(|s| s.progress.pending)
+            .sum()
+    }
+
+    /// r.md #75: 合成の塊の長さ (秒) を設定する。
+    ///
+    /// ドラッグ中 (`commit = false`) は表示値だけ動かし、確定 (release / 数値入力 /
+    /// ダブルクリックリセット) でだけ保存と再合成を行う。**これは合成結果を変える入力**
+    /// なので、確定時は差分キャッシュを落として全 device へ流し直す (= 曲全体の再合成)。
+    /// 落とさないと再送されず、フレーズ WAV のキャッシュキーに混ぜてある以上
+    /// 「設定が効かない」ように見える。
+    pub(crate) fn set_voicevox_chunk_secs(&mut self, secs: f32, commit: bool) {
+        let next = secs.clamp(
+            common::voicevox_phrase::MIN_CHUNK_SECS,
+            common::voicevox_phrase::MAX_CHUNK_SECS,
+        );
+        if (next - self.ui_prefs.voicevox_chunk_secs).abs() >= 1e-3 {
+            self.ui_prefs.voicevox_chunk_secs = next;
+        }
+        if !commit {
+            return;
+        }
+        self.persist_app_config();
+        self.voicevox.voicevox_metadata_sent.clear();
+        self.sync_vocal_metadata();
+    }
+
+    /// 別プロジェクトへ切り替えるときに捨てる VOICEVOX の in-flight / 送信記憶。
+    ///
+    /// device_id は project ごとに再割当されるので、stale entry が誤 hit すると
+    /// 新 project の vocal device に seed 合成が飛ばず無音になる。書き出しの
+    /// 合成完了ゲートも同様に畳む (前の曲の device を待ち続けない)。
+    pub(crate) fn reset_voicevox_sync_state(&mut self) {
+        self.voicevox.voicevox_metadata_sent.clear();
+        self.voicevox.priority_sent.clear();
+        self.ipc.pending_vocal_synth_export.clear();
+    }
+
+    /// アプリ設定の「合成の塊の長さ」(秒) を有効範囲へクランプして返す。
+    /// SSoT は `app_config.json` の `voicevox_chunk_secs`。
+    pub(crate) fn voicevox_chunk_secs(&self) -> f32 {
+        self.ui_prefs.voicevox_chunk_secs.clamp(
+            common::voicevox_phrase::MIN_CHUNK_SECS,
+            common::voicevox_phrase::MAX_CHUNK_SECS,
+        )
     }
 
     /// engine 未接続警告を出すべきか (= busy のまま failing が閾値以上継続)。
     /// engine boot (数秒) の間は failing でも警告せず「合成中」に見せ、閾値超過で切り替える。
     pub fn voicevox_engine_unreachable(&self, now: std::time::Instant) -> bool {
         self.voicevox.voicevox_synth_status.values().any(|s| {
-            s.busy
+            s.progress.busy
                 && s.failing_since
                     .is_some_and(|t| now.duration_since(t) >= VOICEVOX_ENGINE_WARNING)
         })
@@ -305,6 +443,8 @@ impl AppData {
     /// spawn、 builtin plugin の HTTP synth を成功させる前提)。
     pub fn sync_vocal_metadata(&mut self) {
         let bpm = self.song_doc.song().bpm;
+        // r.md #75: 塊 (= `/sing_frame_audio_query` 1 回) の長さ。アプリ設定が SSoT。
+        let chunk_secs = self.voicevox_chunk_secs();
         let has_vocal_track = self.song_doc.song().tracks.iter().any(|t| t.is_voicevox_vocal());
         if has_vocal_track {
             self.ensure_voicevox_engine();
@@ -319,96 +459,85 @@ impl AppData {
                 continue;
             };
 
-            // 全 clip の notes を NoteMetadata 配列に flatten。 note_id は
-            // (clip-internal index) を「track 内通し番号」 にしないと衝突
-            // する可能性があるので、 ここでは「全 clip 連結 index」 を使う
-            // (= clip 1 の note 数 + clip 2 の note index)。 PR-V2.4 で
-            // 改めて clip 単位にする予定。
-            let mut entries: Vec<common::plugin_metadata::NoteMetadata> = Vec::new();
-            for clip in &track.clips {
-                let notes: &[common::model::Note] = self
-                    .song_doc.song()
-                    .clip_contents
-                    .get(&clip.content_id)
-                    .and_then(|c| c.notes())
-                    .unwrap_or(&[]);
-                for n in notes {
-                    let note_id = entries.len() as u32;
-                    entries.push(common::plugin_metadata::NoteMetadata {
-                        note_id,
-                        // clip-relative beats を song-absolute に変換 (=
-                        // VOICEVOX synth wrapper が earliest を引いて
-                        // 0 起点にする、 clip 境界跨ぎでも一貫)。
-                        // r.md #44: note は content-local → content 原点基準で song 化。
-                        start_beat: clip.content_to_song_beat(n.start_beat),
-                        duration_beats: n.duration_beats,
-                        pitch: n.pitch,
-                        velocity: n.velocity,
-                        lyric: n.lyric.clone().unwrap_or_default(),
-                        // builtin が clip 単位で声を分けるための
-                        // grouping key + per-clip 歌唱 speaker (0 = builtin 側で
-                        // DEFAULT_SINGER_ID にフォールバック)。
-                        clip_id: clip.id,
-                        speaker_id: clip.speaker_id,
-                    });
-                }
-            }
-            // (talk) 同トラックの `ClipContent::Text` 由来の読み上げ群を集める
-            // (`docs/plan_voicevox_talk.md` §3.2)。event_id は `talk_event_id(clip.id,
-            // event_index)` で決定論的に導出 (sequencer の talk-trigger と同式)。空
-            // テキストは両側で skip して event_id の対応を保つ。声は per-clip
-            // (`clip.speaker_id` を talk style として解釈)、スケールは `clip.talk`。
-            let mut talk: Vec<common::plugin_metadata::TalkMetadata> = Vec::new();
-            for clip in &track.clips {
-                let Some(events) = self
-                    .song_doc.song()
-                    .clip_contents
-                    .get(&clip.content_id)
-                    .and_then(|c| c.text_events())
-                else {
-                    continue;
-                };
-                let scales = clip.talk.unwrap_or_default();
-                for (event_index, ev) in events.iter().enumerate() {
-                    if ev.text.is_empty() {
-                        continue;
-                    }
-                    talk.push(common::plugin_metadata::TalkMetadata {
-                        event_id: common::plugin_metadata::talk_event_id(
-                            clip.id,
-                            event_index as u32,
-                        ),
-                        start_beat: clip.content_to_song_beat(ev.event_start_in_clip_beats),
-                        text: ev.text.clone(),
-                        speaker_id: clip.speaker_id,
-                        speed_scale: scales.speed_scale,
-                        pitch_scale: scales.pitch_scale,
-                        intonation_scale: scales.intonation_scale,
-                        volume_scale: scales.volume_scale,
-                    });
-                }
-            }
+            let song = self.song_doc.song();
+            // 全 clip の notes / TextEvent を metadata 配列へ flatten する
+            // (組み立ての規則は下の 2 つの純粋関数が持つ)。
+            let entries: Vec<common::plugin_metadata::NoteMetadata> = track
+                .clips
+                .iter()
+                .flat_map(|clip| collect_sing_metadata(song, clip))
+                .collect();
+            let talk: Vec<common::plugin_metadata::TalkMetadata> = track
+                .clips
+                .iter()
+                .flat_map(|clip| collect_talk_metadata(song, clip))
+                .collect();
             // r.md #27: この device の歌唱/読み上げ入力 (bpm/notes/talk) が前回送信から
             // 変わっていなければ再送しない (= builtin plugin が不要な再合成を走らせない)。
             // `sync_vocal_metadata` は epoch bump のたびに呼ばれるので、Transform 等の
             // 非 vocal 編集ではここが cache hit → send skip になる。`sync_ara_documents`
             // の差分キャッシュと同 idiom。
+            // r.md #75: `chunk_secs` は **合成結果を変える入力**なので比較に含める
+            // (含めないと設定つまみを動かしても再送されない)。**playhead はここに
+            // 入れない** — 入れるとトランスポートのたびに再合成になる (順序ヒントは
+            // 専用の `SetVocalSynthPriority`)。
             if self
                 .voicevox
                 .voicevox_metadata_sent
                 .get(&host_plugin_id)
-                .is_some_and(|(b, e, t)| *b == bpm && *e == entries && *t == talk)
+                .is_some_and(|(b, c, e, t)| {
+                    *b == bpm && *c == chunk_secs && *e == entries && *t == talk
+                })
             {
                 continue;
             }
-            self.voicevox
-                .voicevox_metadata_sent
-                .insert(host_plugin_id, (bpm, entries.clone(), talk.clone()));
+            self.voicevox.voicevox_metadata_sent.insert(
+                host_plugin_id,
+                (bpm, chunk_secs, entries.clone(), talk.clone()),
+            );
             self.send_plugin(PluginCommand::SetBuiltinPluginNoteMetadata {
                 device_id: host_plugin_id,
                 bpm,
+                chunk_secs,
                 entries,
                 talk,
+            });
+        }
+    }
+
+    /// 合成中の builtin VOICEVOX へ再生ヘッド位置を送る (r.md #75)。前回送信から
+    /// **1 拍以上動いたときだけ**送るので、トランスポート中でも IPC は数 Hz 以下に収まる。
+    /// busy な device が 1 つも無ければ何もしない。
+    ///
+    /// **再合成はトリガしない** (`SetVocalSynthPriority` は順序ヒント専用)。停止 / seek でも
+    /// `playhead_beat` が動くので、同じ経路で届く。
+    pub(crate) fn send_vocal_synth_priority_if_moved(&mut self) {
+        if self.voicevox.voicevox_synth_status.is_empty() {
+            return;
+        }
+        let Some(playhead) = self.transport.playhead_beat.map(f64::from) else {
+            return;
+        };
+        let busy: Vec<u64> = self
+            .voicevox
+            .voicevox_synth_status
+            .iter()
+            .filter(|(_, s)| s.progress.busy)
+            .map(|(id, _)| *id)
+            .collect();
+        for device_id in busy {
+            let moved = self
+                .voicevox
+                .priority_sent
+                .get(&device_id)
+                .is_none_or(|prev| (playhead - prev).abs() >= 1.0);
+            if !moved {
+                continue;
+            }
+            self.voicevox.priority_sent.insert(device_id, playhead);
+            self.send_plugin(PluginCommand::SetVocalSynthPriority {
+                device_id,
+                playhead_beats: playhead,
             });
         }
     }
