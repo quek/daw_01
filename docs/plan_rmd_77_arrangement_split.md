@@ -311,6 +311,23 @@ caller 責務 / 旧設計が popup anchor を 1 フレームで壊した理由 /
 新しく生えたファイル / 関数が違反するなら、**分割単位を切り直す** (baseline を増やして
 着地させない)。
 
+> **着地後の実測 (2026-08-28、#76 を #77 の上に統合した時点)**:
+> - 解消 3 件 — `FILE-BUDGET run.rs` (1946 → **19**) / `FN-BUDGET run.rs::arrangement`
+>   (1944) / `FN-NESTING run.rs::arrangement` (11/520)。
+> - `render.rs` は **上の懸念どおりにはならなかった** — 実コード 721 → **746** で
+>   budget 1,000 の内側。`render_arrangement_heavy` も 681 → **627**、
+>   ネストは 12/399 → **10/220** と大きく改善した。
+> - 一方で **2 件が太った**: `arrangement/mod.rs` 1249 → **1261** (兄弟モジュール宣言と
+>   glob re-export の 18 物理行。分割の必然)、`release.rs::commit_releases` 962 → **996**
+>   で `release.rs` が 977 → **1003** と新たに budget を超えた。原因は §0 の
+>   「`commit_releases` の**署名だけ**縮める」というスコープで、33 引数を 4 引数へ畳んだ
+>   代わりに本体先頭へ旧引数名を束ね直す 33 行が入ったこと。**署名の複雑度は下がったが
+>   実コード行は増えた**ので、wheel / double-click / secondary-click / marquee の切り出し
+>   (同じく §0 でスコープ外とした項目) が残件として残る。
+> - 切り出された `press_header.rs::lane_header` (7/14) と `rects.rs::push_point_rects`
+>   (7/10) が FN-NESTING に新規登録。どちらも元は `arrangement()` の中で 11 段だった
+>   部分なので、**7 段は改善の途中経過**。
+
 ### この計画で編集するファイル (完全な一覧)
 
 | ファイル | 何をするか |

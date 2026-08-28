@@ -55,17 +55,28 @@ POSITIONAL-KEY | daw_gui/src/state/ipc.rs | 140a8b678882 | キーが (track_id, 
 
 # --- FILE-BUDGET (実コード 1,000 行) 23 件 ------------------------------------
 
-# A. r.md #77 系の widget 分割で消える。
-#    `heavy` → `hctx` → `for track` → `for clip` の描画・入力ループが 1 ファイルに
-#    同居している。r.md #77 が arrangement/run.rs を 9 ファイルへ割る計画を持っており、
-#    piano_roll も同型なので同じ切り方が使える。
-#    **#77 の着地後は「解消」と「新規違反」を両方読んで更新すること** — 分割で受け取り側
-#    (render.rs 等) が新たに閾値を超え得る。
-FILE-BUDGET | daw_gui/src/widgets/arrangement/run.rs      | 1946 | r.md #77 系の分割で解消
-FILE-BUDGET | daw_gui/src/widgets/piano_roll/run.rs       | 1633 | r.md #77 系の分割で解消
-FILE-BUDGET | daw_gui/src/widgets/arrangement/draw.rs     | 1565 | r.md #77 系の分割で解消
-FILE-BUDGET | daw_gui/src/widgets/arrangement/geometry.rs | 1435 | r.md #77 系の分割で解消
-FILE-BUDGET | daw_gui/src/widgets/arrangement/mod.rs      | 1249 | r.md #77 系の分割で解消
+# A. widget の描画・入力ループが 1 ファイルに溜まっているもの。
+#    `heavy` → `hctx` → `for track` → `for clip` と下がる構造そのもの。
+#
+#    **r.md #77 (arrangement/run.rs を 9 ファイルへ分割) は 2026-08-28 に着地した。**
+#    `run.rs` は実コード 1,946 → **19 行**になり、この行は解消して削除済み。
+#    残っているのは (a) 同型だが未着手の `piano_roll/run.rs`、(b) #77 が触らなかった
+#    arrangement の兄弟ファイル、の 2 つ。
+#    piano_roll は #77 で確立した `ArrangementFrame` idiom をそのまま適用できる。
+FILE-BUDGET | daw_gui/src/widgets/piano_roll/run.rs       | 1633 | #77 と同型の分割が未着手
+FILE-BUDGET | daw_gui/src/widgets/arrangement/draw.rs     | 1563 | #77 の対象外。未起票
+FILE-BUDGET | daw_gui/src/widgets/arrangement/geometry.rs | 1435 | #77 の対象外。未起票
+# mod.rs は #77 の分割で **12 行増えた** (1249 -> 1261)。増分は兄弟モジュールの宣言と
+# glob re-export だけ (`mod cursor;` … `use sessions::*;` の 18 物理行) で、ロジックは
+# 1 行も増えていない。分割の必然なので天井を実測値へ上げる。
+FILE-BUDGET | daw_gui/src/widgets/arrangement/mod.rs      | 1261 | #77 の分割で +12 (モジュール宣言)。未起票
+# release.rs は #77 の着地で **新たに閾値を超えた** (977 -> 1003)。原因は
+# `commit_releases` の署名を 33 引数から 4 引数へ縮めた代わりに、本体先頭へ旧引数名を
+# 束ね直す 33 行が入ったこと (#77 の計画がスコープを「署名だけ縮める」と明示しており、
+# 本体 1,300 行は 1 byte も動いていない)。**署名の複雑度と引き換えに実コード行が増えた**
+# 形なので、wheel / double-click / secondary-click / marquee の切り出し (#77 のスコープ外)
+# で本体を割れば両方下がる。
+FILE-BUDGET | daw_gui/src/widgets/arrangement/release.rs  | 1003 | #77 の署名縮小で +26。本体分割が要る。未起票
 
 # B. daw_gui の app / view / handler 中核。巨大 draw と巨大 match が 1 ファイルに溜まる。
 #    責務は分かれているのにファイルが分かれていない (track_inspector は 1 関数で 2,063 行、
@@ -99,15 +110,23 @@ FILE-BUDGET | daw_plugin_host/src/editor_window.rs    | 1462 | FFI/IPC 実装。
 FILE-BUDGET | ui/crates/ui/src/ui.rs                  | 1613 | daw-ui core。未起票
 FILE-BUDGET | ui/crates/ui/src/widgets/waveform.rs    | 1023 | daw-ui core。未起票
 
-# --- FN-BUDGET (実コード 300 行) 15 件 ----------------------------------------
+# --- FN-BUDGET (実コード 300 行) 14 件 ----------------------------------------
 # 旧指標 (物理行) が一度も報告しなかった真の god code。ファイル 2,623 行の陰に
 # 実コード 2,063 行の 1 関数が隠れていた (track_inspector/mod.rs:228 の draw)。
 
-# A. r.md #77 系の widget 分割で消える (上の FILE-BUDGET A と同じ塊)。
-FN-BUDGET | daw_gui/src/widgets/arrangement/run.rs::arrangement                 | 1944 | r.md #77 系の分割で解消
-FN-BUDGET | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                   | 1389 | r.md #77 系の分割で解消
-FN-BUDGET | daw_gui/src/widgets/arrangement/release.rs::commit_releases         |  962 | r.md #77 系の分割で解消
-FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy |  681 | r.md #77 系の分割で解消
+# A. widget の巨大関数 (上の FILE-BUDGET A と同じ塊)。
+#    **r.md #77 で `run.rs::arrangement` (1,944 行) は消えた** — 9 ファイルへ割られ、
+#    残った `arrangement()` は 19 行。この行は解消して削除済み。
+#    `render_arrangement_heavy` は #77 で 681 -> 627 に縮んだので天井も実測値へ下げる
+#    (縮んだぶんを残すと、そのぶん黙って太り直せてしまう)。
+FN-BUDGET | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                   | 1389 | #77 と同型の分割が未着手
+# commit_releases は #77 で **34 行増えた** (962 -> 996)。#77 のスコープが
+# 「署名だけ縮める」だったため、33 引数を `&ArrangementFrame` + `ReleasedSessions` の
+# 4 引数へ畳んだ代わりに、本体先頭で旧引数名へ束ね直す行が入った。**本体 1,300 行は
+# 未分割のまま**なので、wheel / double-click / secondary-click / marquee を切り出せば
+# ここも FILE-BUDGET の release.rs も同時に下がる。
+FN-BUDGET | daw_gui/src/widgets/arrangement/release.rs::commit_releases         |  996 | #77 の署名縮小で +34。本体分割が要る。未起票
+FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy |  627 | #77 の対象外。未起票
 
 # B. daw_gui の app / view の巨大 draw と巨大 match。1 関数が 1 画面ぶんの UI を
 #    まるごと組み立てている / 1 関数が全イベントを裁いている。
@@ -130,7 +149,7 @@ FN-BUDGET | daw_audio/src/graph/compile.rs::compile_schedule     | 362 | FFI/IPC
 #    いつ消えるか: **未起票**。
 FN-BUDGET | ui/crates/ui/src/widgets/text_input.rs::Ui::text_input_at | 375 | daw-ui core。未起票
 
-# --- FN-NESTING (インデント 6 段) 126 件 --------------------------------------
+# --- FN-NESTING (インデント 6 段) 127 件 --------------------------------------
 # 計測値は `最大段数/6 段以上の行数` の 2 成分。**深さが据え置きでも、6 段以上の行が
 # 増えたら新規違反**になる (深さだけを天井にすると、baseline 済みの関数が「深いまま
 # 無制限に太る」経路が残る)。
@@ -138,19 +157,25 @@ FN-BUDGET | ui/crates/ui/src/widgets/text_input.rs::Ui::text_input_at | 375 | da
 # 1. immediate-mode の描画ループ (arrangement / piano_roll)。
 #    `heavy` → `hctx` → `for track` → `for clip` → `if` と下がる。widget の構造そのもの
 #    なので、ほどくには描画単位を関数へ切り出す = 分割が要る。
-#    いつ消えるか: **r.md #77 系の widget 分割で解消**。
-FN-NESTING | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy      | 12/399 | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/run.rs::arrangement                      | 11/520 | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/release.rs::commit_releases              | 11/338 | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build                     | 10/67  | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                        | 9/296  | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build_arrangement_lanes_from_slice | 8/33 | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::automation_point_at         | 8/16   | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect      | 8/8    | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::find_curve_param_handle_at  | 7/19   | r.md #77 系の分割で解消
-FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash       | 7/8    | r.md #77 系の分割で解消
+#
+#    **r.md #77 (2026-08-28 着地) が何をしたか**: `run.rs::arrangement` (11 段 / 6 段以上
+#    520 行) は消え、`render_arrangement_heavy` は **12/399 -> 10/220** まで下がった。
+#    その代わり、切り出された `press_header.rs::lane_header` と `rects.rs::push_point_rects`
+#    が独立した関数として表に出た (どちらも元は `arrangement()` の中で 11 段だった部分で、
+#    7 段まで下がっている = 改善の途中経過)。piano_roll は未着手。
+FN-NESTING | daw_gui/src/widgets/arrangement/release.rs::commit_releases              | 11/338 | #77 の対象外 (本体未分割)。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy      | 10/220 | #77 で 12/399 から改善。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build                     | 10/67  | #77 の対象外。未起票
+FN-NESTING | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                        | 9/296  | #77 と同型の分割が未着手
+FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build_arrangement_lanes_from_slice | 8/33 | #77 の対象外。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::automation_point_at         | 8/16   | #77 の対象外。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect      | 8/8    | #77 の対象外。未起票
+FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | #77 と同型の分割が未着手
+FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | #77 の対象外。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::find_curve_param_handle_at  | 7/19   | #77 の対象外。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/press_header.rs::lane_header             | 7/14   | #77 が 11 段から切り出した残り。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/rects.rs::push_point_rects               | 7/10   | #77 が 11 段から切り出した残り。未起票
+FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash       | 7/8    | #77 の対象外。未起票
 
 # 2. view の巨大 draw。1 関数が 1 画面ぶんの UI を組み立てるので、
 #    `if 表示中` → `for セクション` → `for 行` → `if 選択中` と素直に下がってしまう。
