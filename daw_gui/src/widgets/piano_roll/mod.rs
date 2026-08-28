@@ -1396,6 +1396,37 @@ mod tests {
         assert!(!is_black_key(4)); // E
     }
 
+    /// r.md #73 の兄弟: **歌詞はノートの塗りの上に乗る標識**なので、色は塗りから決める。
+    ///
+    /// 旧実装は `lyric_color = p.ink_on_bright` 固定だった。 ノートの塗りは
+    /// `note_fill_color` = ユーザー着色 × ベロシティ × dim / lock で、locked は背景側へ
+    /// 0.72 寄せるので**暗くなる**。 暗いノートの上で暗インクの歌詞は読めない。
+    /// VOICEVOX 歌唱がこのプロジェクトの中心機能なので、ここが沈むと実害が大きい。
+    ///
+    /// **fixture に「沈む側」(暗いノート) を必ず入れる** — 明るいノートだけで測ると
+    /// 固定の暗インクでも通ってしまい、欠陥を検出できない
+    /// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+    #[test]
+    fn lyric_color_is_readable_on_every_note_fill() {
+        use daw_ui_core::theme::contrast_ratio;
+        let theme = theme_of("dark");
+        let p = &theme.core;
+        let style = PianoRollStyle::from_theme(&theme);
+        for (name, fill) in [
+            ("明るいノート (既定 velocity ramp の高域)", Color::rgb(0.85, 0.80, 0.45)),
+            ("暗いノート (locked = 背景へ寄せた)", Color::rgb(0.04, 0.05, 0.07)),
+            ("選択中ノート (selection_warm)", style.note_selected_fill),
+            ("ユーザー着色 (濃紺)", Color::rgb(0.03, 0.06, 0.20)),
+        ] {
+            let got = crate::widgets::piano_roll::draw::lyric_color_for(p, &style, fill);
+            let ratio = contrast_ratio(got, fill);
+            assert!(
+                ratio >= 3.0,
+                "歌詞が「{name}」の上で読めない: contrast {ratio:.2}:1 (最低 3:1)"
+            );
+        }
+    }
+
     /// M14 Phase 117 (daw_01 #093): 鍵盤ラベル色が行の実効背景 (key fill + overlay 合成) の輝度で
     /// dark / light を選び、 opt-out 時は fallback を返す。
     #[test]

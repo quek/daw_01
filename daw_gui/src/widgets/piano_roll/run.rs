@@ -1140,8 +1140,8 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 &visible_owned,
                 view_copy,
                 grid,
-                style_copy.lyric_color,
-                style_copy.lyric_font_px,
+                &style_copy,
+                &selected_set,
                 lyric_editing_for_draw,
             );
             // drag preview (drag 中の shifted rect)

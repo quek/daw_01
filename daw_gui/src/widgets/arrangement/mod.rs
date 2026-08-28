@@ -1296,10 +1296,14 @@ impl ArrangementStyle {
             on_color: d.solo,
             radius: 3.0,
             font_size: 11.0,
-            // r.md #22: ON 色は高輝度の黄 (`solo`)。 明インクでは「S」が埋もれるので、 黄背景には
-            // 極性固定の暗インク (`ink_on_bright`) を敷く (mixer/metronome の Solo と同じ)。
-            // M/R は ON 色が赤で明インクが読めるため `None` (= `text_color`) のまま。
-            on_text_color: Some(p.ink_on_bright),
+            // r.md #22: ON 色は高輝度の黄 (`solo`) なので「S」は暗インクでないと埋もれる。
+            // r.md #73: ただし **色を固定しない** — `ToggleButtonStyle::from_palette` の既定
+            // (`on_text_color: None`) が「ON 塗りの輝度から auto-contrast」で、その doc は
+            // 「caller が `on_color` を上書きしても文字が読めることが保証される」と書いている。
+            // 固定すると、ユーザーテーマが `daw.solo` を暗くした瞬間に「S」が消える。
+            // ミキサーの Solo (`view/mixer_strips.rs`) は `ink_for(theme.daw.solo)` で
+            // 解いており、規則が 2 つに割れてもいた。 既定に委ねて 1 本にする。
+            // M/R は ON 色が赤で明インクが読めるため元から `None`。
             ..ToggleButtonStyle::from_palette(p)
         };
         // M14 Phase 68 (#040): R button (Record-arm)。 active = 鮮やかな赤、
@@ -2449,3 +2453,8 @@ mod tests;
 // 「超えそうになったら切り出す」ではなく、**書き始める前に切り出した**。
 #[cfg(test)]
 mod tests_curve;
+
+// 可変背景の上の標識が「どの背景でも読めるか」を contrast で見る検査。
+// 描画の有無ではなく **背景との対比** を測る (r.md #73 の学び)。
+#[cfg(test)]
+mod tests_contrast;

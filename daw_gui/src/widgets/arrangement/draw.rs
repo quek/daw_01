@@ -103,8 +103,41 @@ pub(super) fn clip_text_color_for(
     if !style.clip_auto_contrast_text {
         return style.clip_text_color;
     }
-    let bg = daw_ui_core::color::composite_over(fill, lane_bg);
-    p.ink_for(bg)
+    clip_ink_for(p, fill, lane_bg)
+}
+
+/// r.md #73: **クリップ面の上に置く標識のインク**。
+///
+/// クリップの塗りはユーザー着色 / 選択の黄 (`clip_selected_fill = selection_warm`) /
+/// レーン背景 (ライトテーマでは明るい) で変わる **可変背景**なので、極性固定インクを
+/// そのまま置くと片方の極性で必ず消える。実効背景の輝度から極性を決めるのが唯一の解。
+///
+/// バッジ glyph (`⇌` / `+`) / ゲインのハンドル線 / ドラッグ中のゴーストラベルが
+/// これを共有する。濃さ (alpha) だけは役割ごとに call site が決める
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+#[must_use]
+pub(super) fn clip_ink_for(p: &Palette, fill: Color, lane_bg: Color) -> Color {
+    p.ink_for(daw_ui_core::color::composite_over(fill, lane_bg))
+}
+
+/// r.md #73: 選択中 automation point の dot の `(fill, border)`。
+///
+/// dot は automation clip の面の上に乗る。旧実装は fill / border とも `ink_on_dark`
+/// (明インク) 固定で、**ライトテーマの明るいレーン**でも**クリップ選択中の黄**でも
+/// 両方まとめて沈んでいた (縁が同色なので輪郭も残らない)。
+///
+/// 直し方は非選択の dot と同じ idiom — 非選択は `fill = ink_for(bg)` /
+/// `border = ink_for(fill)` の **逆極性の縁**を持つので、可変背景の上でも輪郭が残る。
+/// 選択 dot は「明るく大きい」という視覚言語を保ちたいので **fill は明インクのまま**、
+/// 縁だけを逆極性にする。fill と border が逆極性である限り、
+/// **どんな背景でも必ずどちらか一方が読める**。
+#[must_use]
+pub(super) fn automation_point_selected_colors(
+    p: &Palette,
+    style: &ArrangementStyle,
+) -> (Color, Color) {
+    let fill = style.automation_point_selected_fill;
+    (fill, p.ink_for(fill))
 }
 
 /// clip が **実際に塗る** fill 色 (`clip.color` 既定 / muted の減光込み)。
@@ -1402,13 +1435,16 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
             && r.w > style.clip_clone_badge_size + 4.0
             && r.h > style.clip_clone_badge_size + 2.0
         {
+            // r.md #73: 下地は ghost の塗り (= ユーザー着色 / 選択の黄) なので極性は
+            // 実効背景から決める。 固定インクだと片方の極性でバッジが消える。
+            let badge_ink = clip_ink_for(hctx.palette(), preview_fill, style.bg);
             hctx.push_text(GlyphArea {
                 text: Arc::from(g.to_string()),
                 left: r.x + 4.0,
                 top: r.y + 2.0,
                 font_size: style.clip_clone_badge_size,
                 line_height: style.clip_clone_badge_size * 1.2,
-                color: style.clip_clone_badge_color,
+                color: badge_ink,
                 clip_rect: Some(r),
                 ..GlyphArea::default()
             });
@@ -1562,10 +1598,14 @@ pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
 
 /// M14 Phase 63k (#025): audio_edit が Some の clip に対する dB handle line 描画。
 /// cached 内で呼ばれる (audio_edit / clip rect が変化したら viewport_key で cache 再生成)。
+///
+/// r.md #73: `clip_bg` は **実際に塗られるクリップ色**。 ハンドル線はその上に乗る標識
+/// なので、極性は実効背景から決める (固定インクだと明るいクリップ色で沈む)。
 pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
     audio: &ClipViewAudioEdit,
+    clip_bg: Color,
     style: &ArrangementStyle,
 ) {
     use daw_ui_renderer::{LineBatch, LineSegment};
@@ -1575,10 +1615,13 @@ pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
     let line_w = (clip_rect.w - margin * 2.0).max(0.0);
     if line_w > 0.0 {
         let y = db_to_handle_y(clip_rect, audio.gain_db, style);
+        // 濃さ (alpha) は style トークンの役割値、極性だけ背景から決める。
+        let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg)
+            .with_alpha(style.audio_db_handle_color.a);
         let seg = LineSegment {
             a: [clip_rect.x + margin, y],
             b: [clip_rect.x + margin + line_w, y],
-            color: style.audio_db_handle_color,
+            color: ink,
         };
         hctx.push_lines(LineBatch {
             segments: Arc::<[LineSegment]>::from(vec![seg]),
@@ -1711,10 +1754,13 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
             let line_w = (r.w - margin * 2.0).max(0.0);
             if line_w > 0.0 {
                 let y = db_to_handle_y(r, next_db, style);
+                // r.md #73: 極性は実効背景 (掴んでいる clip の実塗り色) から。
+                let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg)
+                    .with_alpha(style.audio_db_handle_color.a);
                 let seg = LineSegment {
                     a: [r.x + margin, y],
                     b: [r.x + margin + line_w, y],
-                    color: style.audio_db_handle_color,
+                    color: ink,
                 };
                 hctx.push_lines(LineBatch {
                     segments: Arc::<[LineSegment]>::from(vec![seg]),
@@ -1761,13 +1807,15 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     if let Some(text) = label_text {
         // ghost label は clip rect の中央上端に 1 行 (= 既存 clip name と被るが、 drag 中のみ表示で問題なし)。
         let font_size = style.audio_ghost_label_size;
+        // r.md #73: 下地は掴んでいる clip の実塗り色 (可変) なので極性をそこから決める。
+        let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg);
         hctx.push_text(GlyphArea {
             text: Arc::from(text),
             left: r.x + 4.0,
             top: r.y + r.h - font_size - 4.0,
             font_size,
             line_height: font_size * 1.2,
-            color: style.audio_ghost_label_color,
+            color: ink,
             clip_rect: Some(r),
             ..GlyphArea::default()
         });

@@ -279,7 +279,10 @@ fn render_arrangement_heavy(
                         continue;
                     }
                     if let Some(audio) = c.audio_edit {
-                        draw_clip_audio_overlay(hctx, r, &audio, f.style);
+                        // r.md #46 / #73: 標識の色は clip の **実塗り色** から導く
+                        // (fade と同じ SSoT = `clip_effective_fill`)。
+                        let clip_bg = clip_effective_fill(c, t.kind, f.style);
+                        draw_clip_audio_overlay(hctx, r, &audio, clip_bg, f.style);
                     }
                     // r.md #38: fade は content 種別に依らず全 clip 種別に描く
                     // (音声だけでなく映像 / 画像 / 字幕も同じ見た目)。
@@ -483,6 +486,10 @@ fn render_arrangement_heavy(
         if !heavy.selected_automation_point_set.is_empty() {
             let beat_to_px = f64::from(lanes.w) / f.view.len_beats.max(1e-6);
             let r_sel = f.style.automation_point_radius_selected_px;
+            // r.md #73: dot は automation clip の面 (= lane 色 / 選択の黄 / ライトテーマの
+            // 明るいレーン) の上に乗る。 fill / border を **逆極性のペア**にして、
+            // どちらの極性の背景でも必ず一方が読めるようにする (非選択 dot と同 idiom)。
+            let (sel_dot_fill, sel_dot_border) = automation_point_selected_colors(p, f.style);
             let pad = f.style.automation_clip_v_pad_px;
             for (i, t) in f.visible_tracks.iter().enumerate() {
                 if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
@@ -531,8 +538,8 @@ fn render_arrangement_heavy(
                                     w: r_sel * 2.0,
                                     h: r_sel * 2.0,
                                 },
-                                fill: f.style.automation_point_selected_fill,
-                                border: f.style.automation_point_selected_border,
+                                fill: sel_dot_fill,
+                                border: sel_dot_border,
                                 border_width: 1.5,
                                 radius: [r_sel; 4],
                                 clip_rect: Some(Rect {
@@ -708,13 +715,15 @@ fn render_arrangement_heavy(
                         && ghost_rect.w > f.style.clip_clone_badge_size + 4.0
                         && ghost_rect.h > f.style.clip_clone_badge_size + 2.0
                     {
+                        // r.md #73: 下地は ghost の塗り (可変) なので極性を実効背景から決める。
+                        let badge_ink = clip_ink_for(hctx.palette(), fill, f.style.bg);
                         hctx.push_text(GlyphArea {
                             text: Arc::from(g.to_string()),
                             left: ghost_rect.x + 4.0,
                             top: ghost_rect.y + 2.0,
                             font_size: f.style.clip_clone_badge_size,
                             line_height: f.style.clip_clone_badge_size * 1.2,
-                            color: f.style.clip_clone_badge_color,
+                            color: badge_ink,
                             clip_rect: Some(ghost_rect),
                             ..GlyphArea::default()
                         });

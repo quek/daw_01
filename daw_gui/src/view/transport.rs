@@ -182,12 +182,14 @@ fn style_panic(theme: &Theme) -> ToggleButtonStyle {
 /// 意味的に区別。 label は ♬ (16 分音符 ×2、 細かい beat 感)。
 /// gui_01 #051 (state-dependent text color) landing で実現。
 ///
-/// on 面 (`solo`) は**どのテーマでも明るい黄**なので、 その上のインクは `text`
-/// (テーマ従属 = ダークでは明色) ではなく極性固定の `ink_on_bright` を使う。
+/// on 面 (`solo`) は明るい黄なので、その上のインクは `text` (テーマ従属 = ダークでは
+/// 明色) では読めない。 r.md #73: ただし**色を固定せず** `ToggleButtonStyle` の既定
+/// (`on_text_color: None` = ON 塗りの輝度から auto-contrast) に委ねる — 固定すると
+/// ユーザーテーマが `daw.solo` を暗くしたときに文字が消える。 アレンジの Solo /
+/// ミキサーの Solo と同じ 1 つの規則。
 fn style_click(theme: &Theme) -> ToggleButtonStyle {
     ToggleButtonStyle {
         on_color: theme.daw.solo,
-        on_text_color: Some(theme.core.ink_on_bright),
         ..style_transport_button(theme)
     }
 }

@@ -70,6 +70,24 @@ pub(super) fn keyboard_label_color(
     p.ink_for(bg)
 }
 
+/// r.md #73: **歌詞はノートの塗りの上に乗る標識**なので、色は塗りから決める。
+///
+/// ノートの塗りは `note_fill_color` = ユーザー着色 × ベロシティ × dim / lock で、
+/// locked は背景側へ 0.72 寄せるので暗くなる。 固定の暗インク (旧 `style.lyric_color`
+/// = `ink_on_bright`) だと暗いノートの上で歌詞が読めない。 VOICEVOX 歌唱がこの
+/// プロジェクトの中心機能なので、ここが沈むと実害が大きい
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+///
+/// 鍵盤ラベルと同じ `label_auto_contrast` で opt-out できる (どちらも「ラベルは
+/// 下地に追従する」という 1 つの規則)。 opt-out 時は従来の固定色。
+#[must_use]
+pub(super) fn lyric_color_for(p: &Palette, style: &PianoRollStyle, note_fill: Color) -> Color {
+    if !style.label_auto_contrast {
+        return style.lyric_color;
+    }
+    p.ink_for(note_fill)
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_lines)]
 pub(super) fn draw_grid_background<M: ?Sized + 'static>(
     hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
@@ -410,10 +428,14 @@ pub(super) fn draw_lyrics<M: ?Sized + 'static>(
     visible: &[Note],
     view: PianoRollView,
     grid: Rect,
-    lyric_color: Color,
-    lyric_font_px_max: f32,
+    style: &PianoRollStyle,
+    selected: &std::collections::HashSet<NoteId>,
     skip_note_id: Option<NoteId>,
 ) {
+    // r.md #73: 歌詞の色は 1 音ごとに **その音の塗り** から決めるので palette が要る。
+    // `HeavyCtx::palette` は host 寿命の参照なので、以降 `hctx` を可変で使っても衝突しない。
+    let p = hctx.palette();
+    let lyric_font_px_max = style.lyric_font_px;
     for note in visible {
         if Some(note.id) == skip_note_id {
             continue;
@@ -445,13 +467,20 @@ pub(super) fn draw_lyrics<M: ?Sized + 'static>(
         }
         // 縦方向中央寄せ: top = clipped.y + (clipped.h - font_size) / 2
         let top = clipped.y + ((clipped.h - font_size) * 0.5).max(0.0);
+        // r.md #73: 歌詞の下地は **このノートの塗り**。 選択中は selection overlay が
+        // 上塗りされた後に歌詞を描くので、そちらが実効背景になる。
+        let note_bg = if selected.contains(&note.id) {
+            style.note_selected_fill
+        } else {
+            note_fill_color(note, style.velocity_ramp, style.bg)
+        };
         hctx.push_text(GlyphArea {
             text: lyric.clone(),
             left: clipped.x + 2.0,
             top,
             font_size,
             line_height: font_size * 1.1,
-            color: lyric_color,
+            color: lyric_color_for(p, style, note_bg),
             clip_rect: Some(clipped),
             ..GlyphArea::default()
         });
