@@ -17,7 +17,7 @@ use crate::view::track_color;
 
 use super::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
-    ArrangementCurveKind, ArrangementMasterRow, ArrangementStyle, ArrangementTrack, ArrangementView,
+    ArrangementMasterRow, ArrangementStyle, ArrangementTrack, ArrangementView,
     AutomationClipKey, AutomationPointKey, ClipThumbnail, ClipView, ClipViewAudioEdit, ClipKey,
     ClipEventFade, SectionView, TrackKind, pixel_snapped_scroll_beat, view_len_beats,
 };
@@ -539,6 +539,8 @@ fn build_arrangement_lanes_from_slice(
                         .unwrap_or(&[])
                         .iter()
                         .map(|p| ArrangementAutomationPoint {
+                            // r.md #73: 曲線編集は安定 id で point を指す (不変条件 1)。
+                            id: p.id,
                             // r.md #44: widget は clip の窓ローカル座標で描く
                             // (curve は content-local なので窓の offset を引く)。
                             time_beat: p.time_beat - c.content_offset_beats,
@@ -547,7 +549,11 @@ fn build_arrangement_lanes_from_slice(
                                 p.value,
                                 range,
                             ),
-                            curve: model_curve_to_widget(p.curve),
+                            // r.md #73: 曲線の真実は plain。 `value_norm` は clamp 済の
+                            // 画面射影なので、窓の外の値はここからしか復元できない。
+                            // **片方から片方を再変換しないこと** (同じ model 点から両方作る)。
+                            value_plain: p.value,
+                            curve: p.curve,
                         })
                         .collect();
                     ArrangementAutomationClip {
@@ -574,6 +580,11 @@ fn build_arrangement_lanes_from_slice(
                 .collect();
             ArrangementAutomationLane {
                 id: lane.id,
+                // r.md #73: 曲線を再生と同じ plain 空間で評価するために widget が持つ。
+                // `range` は上の `range_of(&lane.target)` と同じもの (= point の
+                // `value_norm` / `default_value_norm` と同じ写像を共有する)。
+                target: lane.target.clone(),
+                plugin_range: range,
                 label: display.label,
                 icon_glyph: display.icon_glyph,
                 color: display.color,
@@ -749,17 +760,6 @@ fn lane_target_display(
             };
             LaneDisplay { label: intern_label(label), icon_glyph: icon, color }
         }
-    }
-}
-
-/// `common::model::AutomationCurve` → widget `ArrangementCurveKind` (4 種 1:1)。
-fn model_curve_to_widget(c: common::model::AutomationCurve) -> ArrangementCurveKind {
-    use common::model::AutomationCurve;
-    match c {
-        AutomationCurve::Hold => ArrangementCurveKind::Hold,
-        AutomationCurve::Linear => ArrangementCurveKind::Linear,
-        AutomationCurve::Bezier { tension } => ArrangementCurveKind::Bezier { tension },
-        AutomationCurve::Exponential { bend } => ArrangementCurveKind::Exponential { bend },
     }
 }
 

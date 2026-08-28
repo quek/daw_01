@@ -253,42 +253,26 @@ pub enum AppEvent {
         key: AutomationPointKeyRef,
         value: f64,
     },
-    /// 右クリック popup → curve type 選択 → 1 point の `curve` 更新。
-    /// `prev` / `next` は Undo 構築用に両方持たせる (gui_01 §11.4 と
-    /// 同 idiom、`SetTrackVolume` 等と同じ pattern)。
-    SetAutomationCurveType {
+    /// r.md #73: 1 区間の補間形状を設定する **唯一の** event。
+    /// 右クリックメニュー (階段 / 直線 / 曲線 / S 字) と、レーン本体の線の
+    /// Alt+ドラッグ (release で 1 件)、Alt+ダブルクリック (直線に戻す) が
+    /// すべてこれを発火する。
+    ///
+    /// 点は **安定 id** (`common::model::AutomationPoint::id`) で指す —
+    /// 曲線編集は press → release を跨ぐので positional index では追加 / 削除で
+    /// ずれる (アーキテクチャ不変条件 1)。`point_id == 0` は未採番 sentinel で no-op。
+    ///
+    /// **`prev` は持たない。** undo は `SongDoc::edit` の snapshot 方式で、
+    /// 旧 `is_undoable` whitelist と手動 `push_undo_snapshot` は arch refactor で
+    /// 全廃されている (`daw_gui/src/state/song_doc.rs`)。旧 3 event は
+    /// `prev` を運んでいたが `app.rs` の dispatch で `prev: _` として捨てられており、
+    /// 誰も読んでいなかった。
+    SetAutomationCurve {
         track_id: u32,
         lane_id: u32,
         clip_id: u32,
-        point_idx: u32,
-        prev: common::model::AutomationCurve,
+        point_id: u32,
         next: common::model::AutomationCurve,
-    },
-    /// gui_01 #033 Phase 63n-9: Bezier curve 中央 handle drag (lane 高さ
-    /// 連動 sensitivity、 Alt × 0.2 微調整) の release で 1 件発火。
-    /// 当該 point の `curve` を `AutomationCurve::Bezier { tension: next }`
-    /// で上書きする。 widget 側で `-1.0..=1.0` clamp 済。 type が Bezier
-    /// 以外だった場合 (= race) は no-op (handler 内で current curve を
-    /// 確認、 異なれば skip)。
-    SetAutomationCurveBezierTension {
-        track_id: u32,
-        lane_id: u32,
-        clip_id: u32,
-        point_idx: u32,
-        prev: f32,
-        next: f32,
-    },
-    /// gui_01 #033 Phase 63n-9: Exponential curve 中央 handle drag の
-    /// release で 1 件発火。 当該 point の `curve` を `Exponential { bend:
-    /// next }` で上書き。 値域 / race 扱いは `SetAutomationCurveBezierTension`
-    /// と同。
-    SetAutomationCurveExponentialBend {
-        track_id: u32,
-        lane_id: u32,
-        clip_id: u32,
-        point_idx: u32,
-        prev: f32,
-        next: f32,
     },
     // ----------------------------------------------------------------
     // gui_01 #028 (M14 Phase 63n-3) — automation clip drag / select
@@ -1784,9 +1768,7 @@ impl AppEvent {
             E::DeleteAutomationPoints { .. } => "ポイント削除",
             E::SetAutomationPointValue { .. } => "ポイント値変更",
             E::QuantizeSelectedAutomationPoints(..) => "ポイントをクオンタイズ",
-            E::SetAutomationCurveType { .. }
-            | E::SetAutomationCurveBezierTension { .. }
-            | E::SetAutomationCurveExponentialBend { .. } => "カーブ変更",
+            E::SetAutomationCurve { .. } => "カーブ変更",
             E::CreateAutomationClip { .. } => "オートメーションクリップ作成",
             E::MoveAutomationClips { .. } => "オートメーションクリップ移動",
             E::ResizeAutomationClips { .. } => "オートメーションクリップ長さ変更",

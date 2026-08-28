@@ -4,7 +4,8 @@
 use super::*;
 
 /// `hovered_track` / `hovered_clip` / `hovered_zone` / `hovered_automation_lane` /
-/// `hovered_section` / `hovered_section_zone` / `section_rects` / `dragging*` を埋める。
+/// `hovered_automation_segment` / `hovered_section` / `hovered_section_zone` /
+/// `section_rects` / `dragging*` を埋める。
 ///
 /// `response.hovered_clip` は **このフレーム中に**確定し、 heavy (`render::dispatch`) が
 /// フェードの掴む正方形を出す clip の判定に使う (r.md #58)。
@@ -49,6 +50,47 @@ pub(super) fn hover(
             .map(|(key, _body_rect)| key);
         }
     }
+    // r.md #73: Alt 押下中に「曲げられる区間」の上にいるかを公開する
+    // (overlay の強調 + カーソル形状)。 point が先に当たっていたら None
+    // (点の当たり判定が区間より先に効く = Alt+クリックの点削除と共存させるため)。
+    //
+    // **`viewport_key` にも `fold_arrangement_clip_hash` にも入れないこと** —
+    // `hovered_clip` と同じ罠 (マウスを動かすたびにアレンジ全体が再構築される)。
+    response.hovered_automation_segment = if f.pointer.modifiers.alt {
+        f.pointer.pos.and_then(|(cx, cy)| {
+            if automation_point_at(
+                &f.visible_tracks,
+                &f.tops,
+                f.view.track_row_h,
+                f.view,
+                f.header_pane.x,
+                f.header_pane.w,
+                f.lanes,
+                cx,
+                cy,
+                f.style,
+            )
+            .is_some()
+            {
+                return None;
+            }
+            automation_segment_at(
+                &f.visible_tracks,
+                &f.tops,
+                f.view.track_row_h,
+                f.view,
+                f.header_pane.x,
+                f.header_pane.w,
+                f.lanes,
+                cx,
+                cy,
+                f.style,
+            )
+            .map(|h| h.point)
+        })
+    } else {
+        None
+    };
     // M14 Phase 127 (daw_01 #105): Arranger section hover (arranger_rect 内、 clip / lane と y 排他)。
     if let Some((cx, cy)) = f.pointer.pos
         && f.arranger_lane_h > 0.0
@@ -85,8 +127,9 @@ pub(super) fn hover(
 }
 
 /// cursor 形状の決定。 優先順位は
-/// header resize > lane/row resize > drag 種別 > reorder > volume > hover zone >
-/// hover section zone > splitter hover (Ns) > header splitter hover (Ew) > automation clip zone。
+/// header resize > lane/row resize (+ r.md #73 の区間 bend drag) > drag 種別 > reorder >
+/// volume > hover zone > hover section zone > **区間 bend hover (Ns)** >
+/// splitter hover (Ns) > header splitter hover (Ew) > automation clip zone。
 ///
 /// **`automation_lane_resize_drag` / `track_row_resize_drag` / `header_resize_drag` は
 /// `ui.widget_state` から直接読む** — この読みは `sessions::take` の release take より後に
@@ -106,9 +149,12 @@ pub(super) fn apply(
     // priority (= 同時に成立しないが、 万一重なっても resize を優先)。
     // M14 Phase 63n-6 (#031): row resize drag 中も NsResize (lane resize と同じ)。 lane / row の
     // 両 session を同 priority で扱い、 同時に立たない (press 時に一方しか起動しない)。
+    // r.md #73: 区間 bend も縦ドラッグなので NsResize (lane/row splitter と同じ形)。
     let resize_active = {
         let state: &mut ArrangementState = ui.widget_state(f.wid);
-        state.automation_lane_resize_drag.is_some() || state.track_row_resize_drag.is_some()
+        state.automation_lane_resize_drag.is_some()
+            || state.track_row_resize_drag.is_some()
+            || live.automation_segment_bend.is_some()
     };
     // M14 Phase 117 (daw_01 #091): header 幅 resize drag 中 / hover 中は EwResize (横軸)。
     // active は最優先 (NsResize / clip drag より上)、 hover は lane/row splitter NsResize の後に評価。
@@ -138,6 +184,12 @@ pub(super) fn apply(
         // section 帯の hover も clip と同 idiom — 端 (Resize zone) で EwResize、
         // 中央 (Move zone) で Move。 帯端を掴んでリサイズできることを ↔ カーソルで示す。
         ui.set_cursor(drag_kind_cursor(zone));
+    } else if response.hovered_automation_segment.is_some() {
+        // r.md #73: Alt hover 中の区間は縦ドラッグで曲げる → NsResize。
+        // lane/row splitter も NsResize なので視覚的な衝突は無い。
+        // 新しい `CursorIcon` variant は足さない (daw-ui core に DAW 都合を持ち込まない
+        // = アーキテクチャ不変条件 8)。
+        ui.set_cursor(CursorIcon::NsResize);
     } else if let Some((cx, cy)) = f.pointer.pos
         && (automation_lane_resize_splitter_at(
             &f.visible_tracks,

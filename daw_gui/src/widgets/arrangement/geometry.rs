@@ -1381,148 +1381,198 @@ pub(super) fn find_lane_clip(
     Some((lane, clip))
 }
 
-/// M14 Phase 63n-9 (#033): S 字 cubic Bezier (制御点 x=(1/3, 2/3) 固定) の y(t) を評価。
-/// `flatten_lane_segment` の Bezier 分岐と同 SSoT。 t=0 で a、 t=1 で b、 tension=0 で線形等価、
-/// `tension=+1.0` で c1y=a, c2y=b (滑らかな S 字)、 `tension=-1.0` で c1y=b, c2y=a (overshoot 反転)。
-#[must_use]
-pub(super) fn evaluate_bezier_y(a: f32, b: f32, tension: f32, t: f32) -> f32 {
-    let t_clamped = tension.clamp(-1.0, 1.0);
-    let diag1 = a + (b - a) * (1.0 / 3.0);
-    let diag2 = a + (b - a) * (2.0 / 3.0);
-    let mix = t_clamped.abs();
-    let (target1, target2) = if t_clamped >= 0.0 { (a, b) } else { (b, a) };
-    let c1y = diag1 * (1.0 - mix) + target1 * mix;
-    let c2y = diag2 * (1.0 - mix) + target2 * mix;
-    let omt = 1.0 - t;
-    omt.powi(3) * a + 3.0 * omt.powi(2) * t * c1y + 3.0 * omt * t.powi(2) * c2y + t.powi(3) * b
+/// r.md #73: `automation_segment_at` の戻り値。 bend session の anchor をそのまま作れる形。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AutomationSegmentHit {
+    /// 入射側 point (= curve 属性を持つ後ろの点)。
+    pub point: AutomationPointIdKey,
+    /// 掴んだ位置の区間内進捗。
+    pub grab_u: f64,
+    /// 区間の始点値 / 終点値 (plain)。 overlay の再描画にもそのまま使う。
+    pub a_plain: f64,
+    pub b_plain: f64,
+    /// 現在の curve。
+    pub curve: common::model::AutomationCurve,
+    /// clip 描画域 (縦 padding 適用済)。 norm ↔ y の anchor。
+    pub clip_rect: Rect,
 }
 
-/// M14 Phase 63n-9 (#033): tension/bend handle の screen 座標を計算。
-/// `(prev_x, prev_y)` と `(cur_x, cur_y)` は curve 端点の screen 座標、 `kind` + `param_value` で
-/// segment 中央 (= t=0.5) の y を curve 評価値から算出。 handle は curve から上方向に `offset_px`
-/// 飛び出させて click target を curve 線 (1.5px) と分離。 daw_01 #033 §B Q3=A 仕様。
-#[must_use]
-pub(super) fn compute_curve_handle_pos(
-    prev_x: f32,
-    prev_y: f32,
-    cur_x: f32,
-    cur_y: f32,
-    kind: SetAutomationCurveParamKind,
-    param_value: f32,
-    offset_px: f32,
-) -> (f32, f32) {
-    let x = (prev_x + cur_x) * 0.5;
-    let mid_y = match kind {
-        SetAutomationCurveParamKind::BezierTension => {
-            evaluate_bezier_y(prev_y, cur_y, param_value, 0.5)
-        }
-        SetAutomationCurveParamKind::ExponentialBend => {
-            let exponent = 2.0_f32.powf(param_value.clamp(-1.0, 1.0));
-            prev_y + (cur_y - prev_y) * (0.5_f32).powf(exponent)
-        }
-    };
-    (x, mid_y - offset_px)
-}
-
-/// M14 Phase 63n-9 (#033): cursor 座標から hit する curve param handle を返す。 `selected_points`
-/// に含まれる point の **Bezier / Exponential 入射 segment** にのみ handle が存在 (= Hold / Linear は
-/// handle なし、 first point (= idx 0) も入射 segment なしで除外)。 hit zone は handle の **半径 2 倍**
-/// (= 8px @ default radius=4)、 描画と同 SSoT (`compute_curve_handle_pos`)。
-/// 戻り値: `(point_key, kind, current_value, lane_height_px)` — current_value は drag session の
-/// `anchor_value`、 lane_height_px は sensitivity 計算用 (`effective_lane_height_px` = max(_, 40))。
-#[must_use]
+/// r.md #73: lane body 内の cursor から、曲げられる区間の当たりを返す。
+///
+/// 判定は「cursor x から区間内進捗 `u` を出し、`curve::eval_norm` で曲線の y を
+/// 評価して `|cy - y| <= style.automation_curve_segment_hit_px`」。
+/// 曲線の形の評価は `common::automation::apply_curve` 1 本を通る (SSoT)。
+///
+/// **`automation_point_at` が `None` のときだけ呼ぶこと** — 点の当たり判定 (半径 2 倍)
+/// が区間より先に効く (Alt+クリックの点削除と共存させるため)。
+///
+/// 除外するもの:
+/// - `norm_mapping_is_invertible` が false の lane (= Mute。逆算に連続解が無い)
+/// - 端点の screen y の差が 1px 未満の区間 (= 水平区間。数学的に曲げられない。
+///   端点が両方とも窓の外で同じ端に飽和している区間もここで落ちる)
+/// - 幅 0 の区間
+/// - 入射側 point の `id == 0` (未採番 sentinel。安定 id で指せない)
+///
+/// 引数の並びは `automation_point_at` と同じ (`.., lanes, cx, cy, style`)。
+/// 内部の `beat_to_px` / `clip_y` / `clip_h` も `automation_point_at` と同じ式
+/// (point dot と curve の x がずれる既知バグ #028 user 指摘 2 の再発防止)。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn find_curve_param_handle_at(
+#[must_use]
+pub(super) fn automation_segment_at(
     visible_tracks: &[ArrangementTrack],
     tops: &[f32],
+    track_row_h: f32,
     view: ArrangementView,
+    header_pane_x: f32,
+    header_pane_w: f32,
     lanes: Rect,
-    selected_points: &[AutomationPointKey],
-    style: &ArrangementStyle,
     cx: f32,
     cy: f32,
-) -> Option<(AutomationPointKey, SetAutomationCurveParamKind, f32, u16)> {
-    if selected_points.is_empty() {
+    style: &ArrangementStyle,
+) -> Option<AutomationSegmentHit> {
+    if !lanes.contains(cx, cy) {
         return None;
     }
-    let handle_r = style.automation_curve_param_handle_radius_px.max(2.0);
-    let hit_r_sq = (handle_r * 2.0).powi(2);
-    let offset = style.automation_curve_param_handle_offset_px;
-    let pad = style.automation_clip_v_pad_px;
-    let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
-    for (i, t) in visible_tracks.iter().enumerate() {
-        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
-            continue;
-        }
-        let row_top = tops[i];
-        let row_h = effective_track_row_h(t, view.track_row_h);
-        let mut lane_y = row_top + row_h;
-        for lane in &t.automation_lanes {
-            if !lane.visible {
-                continue;
+    let hit_px = style.automation_curve_segment_hit_px.max(1.0);
+    let mut best: Option<(f32, AutomationSegmentHit)> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes.x,
+        lanes.w,
+        style,
+        |t_idx, _l_idx, lane, _h_rect, body_rect| {
+            if cy < body_rect.y || cy >= body_rect.y + body_rect.h {
+                return;
             }
-            let lh = f32::from(lane.height_px);
-            let clip_y = lane_y + pad;
-            let clip_h = (lh - pad * 2.0).max(2.0);
-            for c in &lane.clips {
-                for p_idx in 1..c.points.len() {
-                    let key = AutomationPointKey {
-                        clip: AutomationClipKey {
-                            track: t.id,
-                            lane: lane.id,
-                            clip: c.id,
-                        },
-                        #[allow(clippy::cast_possible_truncation)]
-                        point_idx: p_idx as u32,
-                    };
-                    if !selected_points.contains(&key) {
+            let track_id = visible_tracks[t_idx].id;
+            let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+            let pad = style.automation_clip_v_pad_px;
+            let clip_y = body_rect.y + pad;
+            let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+            let clip_rect = Rect { x: body_rect.x, y: clip_y, w: body_rect.w, h: clip_h };
+            let map = curve::LaneValueMap::from_lane(lane, clip_rect);
+            if !map.is_bendable() {
+                return; // Mute lane は逆写像を持たないので曲げられない
+            }
+            for clip_in in &lane.clips {
+                for i in 1..clip_in.points.len() {
+                    let p_prev = &clip_in.points[i - 1];
+                    let p_next = &clip_in.points[i];
+                    if p_next.id == 0 {
+                        continue; // 未採番 sentinel は安定 id で指せない
+                    }
+                    let abs_prev = clip_in.start_beat + p_prev.time_beat;
+                    let abs_next = clip_in.start_beat + p_next.time_beat;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x_prev = body_rect.x + ((abs_prev - view.start_beat) * beat_to_px) as f32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x_next = body_rect.x + ((abs_next - view.start_beat) * beat_to_px) as f32;
+                    if x_next - x_prev <= 1e-3 || cx <= x_prev || cx >= x_next {
                         continue;
                     }
-                    let p = &c.points[p_idx];
-                    let (kind, value) = match p.curve {
-                        ArrangementCurveKind::Bezier { tension } => {
-                            (SetAutomationCurveParamKind::BezierTension, tension)
-                        }
-                        ArrangementCurveKind::Exponential { bend } => {
-                            (SetAutomationCurveParamKind::ExponentialBend, bend)
-                        }
-                        _ => continue, // Hold / Linear: handle なし
-                    };
-                    let prev = &c.points[p_idx - 1];
-                    let prev_abs = c.start_beat + prev.time_beat;
-                    let cur_abs = c.start_beat + p.time_beat;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let prev_x = lanes.x + ((prev_abs - view.start_beat) * beat_to_px) as f32;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let cur_x = lanes.x + ((cur_abs - view.start_beat) * beat_to_px) as f32;
-                    let prev_y =
-                        clip_y + (1.0 - prev.value_norm.clamp(0.0, 1.0)) * clip_h;
-                    let cur_y =
-                        clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
-                    let (hx, hy) = compute_curve_handle_pos(
-                        prev_x, prev_y, cur_x, cur_y, kind, value, offset,
-                    );
-                    let dx = cx - hx;
-                    let dy = cy - hy;
-                    if dx * dx + dy * dy <= hit_r_sq {
-                        return Some((key, kind, value, lane.height_px));
+                    // 水平区間 (画面上で高さが 1px 未満) は曲げられない。
+                    // 端点が両方とも窓の外で同じ端に飽和している区間もここで落ちる。
+                    let y_prev = map.plain_to_y(p_prev.value_plain);
+                    let y_next = map.plain_to_y(p_next.value_plain);
+                    if (y_next - y_prev).abs() < 1.0 {
+                        continue;
+                    }
+                    let u = f64::from(cx - x_prev) / f64::from(x_next - x_prev);
+                    let y = map.norm_to_y(curve::eval_norm(
+                        map,
+                        p_prev.value_plain,
+                        p_next.value_plain,
+                        u,
+                        p_next.curve,
+                    ));
+                    let d = (cy - y).abs();
+                    if d > hit_px {
+                        continue;
+                    }
+                    if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                        best = Some((
+                            d,
+                            AutomationSegmentHit {
+                                point: AutomationPointIdKey {
+                                    clip: AutomationClipKey {
+                                        track: track_id,
+                                        lane: lane.id,
+                                        clip: clip_in.id,
+                                    },
+                                    point_id: p_next.id,
+                                },
+                                grab_u: u,
+                                a_plain: p_prev.value_plain,
+                                b_plain: p_next.value_plain,
+                                curve: p_next.curve,
+                                clip_rect,
+                            },
+                        ));
                     }
                 }
             }
-            lane_y += lh;
-        }
-    }
-    None
+        },
+    );
+    best.map(|(_, hit)| hit)
 }
 
-/// M14 Phase 63n-9 (#033): handle drag の sensitivity 計算。 dy → value delta。
-/// Q3=A 仕様: `effective_lane_height = max(lane_height_px, 40)` drag で full range (`-2.0`)、 つまり
-/// `1 px = 2.0 / effective_h` の value delta。 Alt 押下で × 0.2 (= 5x 精細)。 y は screen 軸で上が
-/// 負なので上 drag = + value (符号反転)。
+/// r.md #73: lane key から lane body rect を引く (`for_each_visible_lane` の 1 件版)。
+/// overlay 層 (hover 強調 / bend preview) が「key から幾何を引き直す」ために使う —
+/// hover のたびに `automation_segment_at` を再実行しない (cursor 層で 1 度出した結果を
+/// key で運ぶ)。 collapsed track / invisible lane は `for_each_visible_lane` が既に除く。
+#[allow(clippy::too_many_arguments)]
 #[must_use]
-pub(super) fn curve_param_delta_from_dy(dy: f32, effective_h: f32, alt: bool) -> f32 {
-    let raw = -dy * 2.0 / effective_h.max(1.0);
-    if alt { raw * 0.2 } else { raw }
+pub(super) fn automation_lane_body_rect(
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    track_row_h: f32,
+    header_pane_x: f32,
+    header_pane_w: f32,
+    lanes_x: f32,
+    lanes_w: f32,
+    style: &ArrangementStyle,
+    key: AutomationLaneKey,
+) -> Option<Rect> {
+    let mut found: Option<Rect> = None;
+    for_each_visible_lane(
+        visible_tracks,
+        tops,
+        track_row_h,
+        header_pane_x,
+        header_pane_w,
+        lanes_x,
+        lanes_w,
+        style,
+        |t_idx, _l_idx, lane, _h_rect, b_rect| {
+            if found.is_some() {
+                return;
+            }
+            if visible_tracks[t_idx].id == key.track && lane.id == key.lane {
+                found = Some(b_rect);
+            }
+        },
+    );
+    found
+}
+
+/// r.md #73: 安定 id で point を引く (`find_automation_point_data` の id 版)。
+/// 戻り値は `(前の点, この点)` — 曲線は **入射区間**の属性なので、片方だけでは
+/// 形を描けない。 前の点が無い (= clip の先頭) なら `None`。
+#[must_use]
+pub(super) fn find_automation_segment_by_id(
+    visible_tracks: &[ArrangementTrack],
+    key: AutomationPointIdKey,
+) -> Option<(&ArrangementAutomationPoint, &ArrangementAutomationPoint)> {
+    let (_lane, clip) = find_lane_clip(visible_tracks, key.clip)?;
+    let idx = clip.points.iter().position(|p| p.id == key.point_id && p.id != 0)?;
+    if idx == 0 {
+        return None;
+    }
+    Some((&clip.points[idx - 1], &clip.points[idx]))
 }
 
 /// M14 Phase 63n-8 (#033): point key から `(time_beat, value_norm, clip_start, clip_len)` を取得。

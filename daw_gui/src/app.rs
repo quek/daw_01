@@ -877,34 +877,9 @@ impl AppData {
                 self.set_automation_point_value(&key, value);
                 self.ui_ephemeral.editing_automation_point = None;
             }
-            AppEvent::SetAutomationCurveType {
-                track_id,
-                lane_id,
-                clip_id,
-                point_idx,
-                prev: _,
-                next,
-            } => self.set_automation_curve_type(track_id, lane_id, clip_id, point_idx, next),
-            AppEvent::SetAutomationCurveBezierTension {
-                track_id,
-                lane_id,
-                clip_id,
-                point_idx,
-                prev: _,
-                next,
-            } => self.set_automation_curve_bezier_tension(
-                track_id, lane_id, clip_id, point_idx, next,
-            ),
-            AppEvent::SetAutomationCurveExponentialBend {
-                track_id,
-                lane_id,
-                clip_id,
-                point_idx,
-                prev: _,
-                next,
-            } => self.set_automation_curve_exponential_bend(
-                track_id, lane_id, clip_id, point_idx, next,
-            ),
+            AppEvent::SetAutomationCurve { track_id, lane_id, clip_id, point_id, next } => {
+                self.set_automation_curve(track_id, lane_id, clip_id, point_id, next);
+            }
             AppEvent::MoveAutomationClips { deltas } => {
                 self.move_automation_clips(&deltas)
             }

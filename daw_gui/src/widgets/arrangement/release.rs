@@ -57,7 +57,7 @@ pub(super) fn commit_releases(
         audio_drag: audio_drag_release,
         point_drag: point_drag_release,
         automation_clip_drag: automation_clip_drag_release,
-        automation_curve_param: automation_curve_param_release,
+        automation_segment_bend: automation_segment_bend_release,
         automation_lasso: automation_lasso_release,
         lane_resize: lane_resize_drag_release,
         section_drag: section_drag_release,
@@ -355,13 +355,11 @@ pub(super) fn commit_releases(
                 // point は 1 clip 内で時間順に一意なので範囲は 1 次元 (`range_ordered`)。
                 // アンカーが別 clip / 別 lane に居るときは filter で落として Single に倒れる。
                 let modifier = SelectModifier::from_modifiers(press_shift, press_ctrl);
-                // 修飾なし単一クリック (= 置き換え選択) では競合する clip 選択も解除して
-                // automation 面を 1 つだけにする (点とクリップが同時に光って混乱するのを
-                // 防ぐ。 lasso / Shift / Ctrl は両面選択を温存するので除外)。
-                if modifier == SelectModifier::Single && !selected_automation_clips.is_empty() {
-                    ui.push_edit({ let v_prev = selected_automation_clips.to_vec(); let v_next = Vec::new(); Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<common::model::AutomationClipKey> = v_prev.into_iter().map(widget_to_model_clip_key).collect(); let next_model: Vec<common::model::AutomationClipKey> = v_next.into_iter().map(widget_to_model_clip_key).collect(); app.handle_event(AppEvent::SelectAutomationClips { prev: prev_model, next: next_model }); }) });
-                    response.selection_changed = true;
-                }
+                // r.md #73: ここで clip 選択を消さない。 選択集合は面を跨いで共存でき
+                // (`handler/selection_view.rs` の `edit_surface` doc)、 Delete / Copy / Cut の
+                // 宛先は last-wins が解決する。 Ctrl+A の 2 段目も共存前提で書かれている
+                // (`view/root.rs`)。 旧実装の理由はコメント上「見た目の混乱」だけで、
+                // 同一機能内で規約が自分自身と矛盾していた。
                 let pressed = ad.point;
                 // 範囲表は Shift のときだけ組む (clip click と同じ理由)。
                 let order = if modifier == SelectModifier::RangeFromAnchor {
@@ -396,15 +394,15 @@ pub(super) fn commit_releases(
             }
         }
 
-        // ---- M14 Phase 63n-9 (#033): automation_curve_param_drag release → SetAutomationCurveParam ----
-        // anchor と preview の差分が 1e-4 未満なら no-op (= handle を click したけど drag しなかったケース、
-        // = user 意図的に値を変えていない)。 そうでなければ `SetAutomationCurveParam { point, kind, prev, next }`
-        // を 1 件発行 (caller の AppEvent は kind で `BezierTension` / `ExponentialBend` を分岐して
-        // `clip.points[idx].curve = Bezier { tension: next }` or `Exponential { bend: next }` で commit)。
-        if let Some(cd) = automation_curve_param_release
-            && (cd.preview_value - cd.anchor_value).abs() > 1e-4
+        // ---- r.md #73: automation_segment_bend release → SetAutomationCurve ----
+        // preview が anchor と同値なら no-op (= Alt+クリックしただけで動かしていない)。
+        // point は **安定 id** で指す (press → release を跨ぐので positional index では
+        // 追加 / 削除でずれる = 不変条件 1)。 undo は snapshot 方式なので prev は載せない。
+        if let Some(bd) = automation_segment_bend_release
+            && bd.preview_curve != bd.anchor_curve
+            && bd.point.point_id != 0
         {
-            ui.push_edit({ let v_pt = cd.point; let v_kind = cd.kind; let v_pv = cd.anchor_value; let v_nv = cd.preview_value; Edit::mutate(move |app: &mut AppData| { let track_id = v_pt.clip.track; let lane_id = v_pt.clip.lane; let clip_id = v_pt.clip.clip; let point_idx = v_pt.point_idx; match v_kind { SetAutomationCurveParamKind::BezierTension => { app.handle_event(AppEvent::SetAutomationCurveBezierTension { track_id, lane_id, clip_id, point_idx, prev: v_pv, next: v_nv }); } SetAutomationCurveParamKind::ExponentialBend => { app.handle_event(AppEvent::SetAutomationCurveExponentialBend { track_id, lane_id, clip_id, point_idx, prev: v_pv, next: v_nv }); } } }) });
+            ui.push_edit({ let (k, next) = (bd.point, bd.preview_curve); Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetAutomationCurve { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_id: k.point_id, next }); }) });
         }
 
         // ---- M14 Phase 63n-8 (#033): automation_lasso_drag release → SelectAutomationPoints ----
@@ -566,13 +564,9 @@ pub(super) fn commit_releases(
                 let prev = selected_automation_clips.to_vec();
                 let key = acd.primary;
                 let modifier = SelectModifier::from_modifiers(acd.last_shift, acd.last_ctrl);
-                // 修飾なし単一クリック (= 置き換え選択) では競合する point 選択も解除して
-                // automation 面を 1 つだけにする (点とクリップが同時に光って混乱するのを
-                // 防ぐ。 lasso / Shift / Ctrl は両面選択を温存するので除外)。
-                if modifier == SelectModifier::Single && !selected_automation_points.is_empty() {
-                    ui.push_edit({ let v_prev = selected_automation_points.to_vec(); Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<AutomationPointKeyRef> = v_prev.into_iter().map(point_key_to_model).collect(); app.handle_event(AppEvent::SelectAutomationPoints { prev: prev_model, next: Vec::new() }); }) });
-                    response.selection_changed = true;
-                }
+                // r.md #73: ここで point 選択を消さない (上の点クリック側と対称)。
+                // 選択集合は面を跨いで共存でき、 Delete / Copy / Cut の宛先は
+                // `edit_surface` の last-wins が解決する。
                 // 範囲表は Shift のときだけ組む (clip click と同じ理由)。
                 let items = if modifier == SelectModifier::RangeFromAnchor {
                     automation_clip_range_items(visible_tracks)
@@ -848,8 +842,11 @@ pub(super) fn commit_releases(
         };
         let press_in_automation_lane = pointer.primary_just_pressed
             && pointer.pos.is_some_and(|(_, py)| in_automation_lane(py));
+        // r.md #73: Alt を弾いていたのは空き track row の Alt+drag が行高さ変更に
+        // 予約されていたから。 その機能を撤去したので、 ここで弾くと Alt+drag が
+        // 何も起こさない死角になる。 marquee に snap は無いので Alt に別の意味は無い。
+        // `lanes.contains(px, py)` を要求するのでヘッダ列には元から届かない。
         let marquee_zone_ok = pointer.primary_just_pressed
-            && !pointer.modifiers.alt
             && !press_in_automation_lane
             && pointer.pos.is_some_and(|(px, py)| {
                 lanes.contains(px, py)
@@ -876,7 +873,9 @@ pub(super) fn commit_releases(
                 && s.track_row_resize_drag.is_none()
                 && s.playhead_drag.is_none()
                 && s.loop_drag.is_none()
-                && s.automation_curve_param_drag.is_none()
+                // r.md #73: 旧 `automation_curve_param_drag` の差し替え。 **これを忘れると
+                // 線の上の Alt+drag で bend と marquee が同フレームで両方起動する。**
+                && s.automation_segment_bend.is_none()
         } else {
             false
         };
@@ -1239,6 +1238,28 @@ pub(super) fn commit_releases(
                 // 既存 point の上での dblclick → 値の数値入力を開始 (新規点追加より優先)。
                 // caller (daw_01) が automation_point_rects で rect を引いて inline 数値入力 overlay を出す。
                 ui.push_edit({ let v_key = pt_key; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::BeginEditAutomationPointValue { key: AutomationPointKeyRef { track_id: v_key.clip.track, lane_id: v_key.clip.lane, clip_id: v_key.clip.clip, point_idx: v_key.point_idx } }); }) });
+            } else if pointer.modifiers.alt
+                && let Some(seg) = automation_segment_at(
+                    visible_tracks,
+                    press_tops,
+                    view.track_row_h,
+                    view,
+                    header_pane.x,
+                    header_pane.w,
+                    lanes,
+                    cx,
+                    cy,
+                    style,
+                )
+                && seg.point.point_id != 0
+            {
+                // r.md #73: 線の上 (`automation_curve_segment_hit_px` 以内) で
+                // Alt+ダブルクリック → その区間を直線に戻す。 線から離れていれば
+                // 下の AddAutomationPoint 経路に落ちて、 従来どおり Alt = スナップ無効で
+                // 点を足す (= 線の近くでは点を足せなくなるが、 これは確定方針)。
+                if seg.curve != common::model::AutomationCurve::Linear {
+                    ui.push_edit({ let k = seg.point; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetAutomationCurve { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_id: k.point_id, next: common::model::AutomationCurve::Linear }); }) });
+                }
             } else if let Some((t_idx, lane_idx, _h_rect, body_rect)) = automation_lane_at(
                 visible_tracks,
                 press_tops,

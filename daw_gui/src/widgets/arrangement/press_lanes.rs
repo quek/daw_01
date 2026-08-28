@@ -1,6 +1,13 @@
-//! lane 領域 (clip 描画域 = `f.lanes`) の press 振り分け。 ゾーンごとに排他な 7 本のチェーンで、
-//! 優先順位は audio grip > clip > curve handle > automation point > automation clip >
-//! Alt+drag resize > lasso。 各分岐は消費したことを `PressClaim` に立てて後続を止める。
+//! lane 領域 (clip 描画域 = `f.lanes`) の press 振り分け。 ゾーンごとに排他なチェーンで、
+//! 優先順位は audio grip > clip > automation point > **区間 bend** > automation clip > lasso。
+//! 各分岐は消費したことを `PressClaim` に立てて後続を止める。
+//!
+//! r.md #73: 旧 `curve_handle` (選択済 point の中央ハンドル) と `alt_resize`
+//! (Alt+drag = レーン / 行の高さ変更) の 2 本を撤去した。 前者はハンドルが原理的に
+//! 動かない (Bezier の t=0.5 は tension に依らず常に中点) 実装で、 後者が Alt を
+//! 占有していたせいで「線を直接掴んで曲げる」を置く場所が無かった。 高さ変更は
+//! Alt+ホイール (`release.rs`、 ヘッダ列でも効く) と下端スプリッタ (`press::splitter`)
+//! が引き続き担う。
 
 use super::*;
 
@@ -136,8 +143,8 @@ pub(super) fn clip_zone(
     }
 }
 
-/// automation 系 5 本 + Alt+drag フォールバック + lasso。
-/// 内部で `curve_handle` → `point` → `automation_clip` → `alt_resize` → `lasso` を
+/// automation 系 4 本 + lasso。
+/// 内部で `point` → `segment_bend` → `automation_clip` → `lasso` を
 /// **この順**で呼ぶ (優先順位そのもの)。
 pub(super) fn automation(
     ui: &mut Ui<'_, AppData>,
@@ -146,56 +153,10 @@ pub(super) fn automation(
     claim: &mut PressClaim,
     actions: &mut PressActions,
 ) {
-    curve_handle(ui, f, hit, claim);
     point(ui, f, hit, claim, actions);
+    segment_bend(ui, f, hit, claim);
     automation_clip(ui, f, hit, claim);
-    alt_resize(ui, f, hit, claim, actions);
     lasso(ui, f, hit, claim, actions);
-}
-
-/// M14 Phase 63n-9 (#033): tension/bend handle press 検出 — **point press より先勝** で
-/// selected point の Bezier / Exponential 入射 segment 中央 handle に当たった場合、 curve
-/// param drag を起動。 handle は curve から 10px 上方向 offset で描画されるので point dot
-/// 位置とは交差しないが、 priority 上 handle > point > lasso にする (= curve param 編集が
-/// 最も狙った操作のため)。 modifier (Shift / Ctrl / Alt) は handle press では無視 (= Alt
-/// は drag continuation で × 0.2 sensitivity に使う、 Shift/Ctrl は将来 multi-handle 編集に
-/// 予約) — handle 上 click は **常に curve param drag 起動**。
-fn curve_handle(
-    ui: &mut Ui<'_, AppData>,
-    f: &ArrangementFrame<'_>,
-    hit: &PressHit,
-    claim: &mut PressClaim,
-) {
-    if !claim.splitter
-        && hit.in_lanes
-        && let Some((handle_point, handle_kind, handle_value, lane_h)) =
-            find_curve_param_handle_at(
-                &f.visible_tracks,
-                &f.tops,
-                f.view,
-                f.lanes,
-                f.selected_automation_points,
-                f.style,
-                hit.px,
-                hit.py,
-            )
-    {
-        let effective_h = f32::from(lane_h.max(40));
-        let last_alt = f.pointer.modifiers.alt;
-        let state: &mut ArrangementState = ui.widget_state(f.wid);
-        state.automation_curve_param_drag = Some(AutomationCurveParamDragSession {
-            point: handle_point,
-            kind: handle_kind,
-            anchor_value: handle_value,
-            anchor_mouse_y: hit.py,
-            last_mouse_y: hit.py,
-            last_alt,
-            effective_lane_height_px: effective_h,
-            preview_value: handle_value,
-        });
-        claim.curve_handle = true;
-        claim.session = true;
-    }
 }
 
 /// M14 Phase 63n-8 (#033): point press は **Shift / Ctrl 修飾も accept** (release 時 短 click
@@ -204,8 +165,11 @@ fn curve_handle(
 /// Shift+click on point は drag>=4px なら通常 move (= MoveAutomationPoints、 modifier 無視で
 /// pressed が selection に含まれていれば multi)、 短 click なら toggle。 Ctrl 同様。
 ///
-/// M14 Phase 63n-9 (#033): handle press が先勝した場合 (= `claim.curve_handle`) は
-/// point press を skip (= 同 frame で 2 session が起動するのを回避)。
+/// r.md #73: **点に当たった時点で `claim.point` を立てる** (旧実装は drag session を
+/// 起動したときだけ立てていた)。 Alt+クリック (削除) は drag session を張らないので、
+/// 旧述語では「点の削除」と後続の press (区間 bend / automation clip) が同フレームで
+/// 両方走ってしまう。 seed は据え置きで立てる条件だけを広げるので、 ゲートは単調に
+/// 強くなる方向にしか動かない (r.md #77 の等価性の根拠を壊さない)。
 fn point(
     ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
@@ -214,7 +178,7 @@ fn point(
     actions: &mut PressActions,
 ) {
     let (px, py) = (hit.px, hit.py);
-    if !(!claim.splitter && !claim.curve_handle && hit.in_lanes) {
+    if claim.splitter || !hit.in_lanes {
         return;
     }
     let Some((point_key, _r)) = automation_point_at(
@@ -231,6 +195,9 @@ fn point(
     ) else {
         return;
     };
+    // 当たった時点で「point 層がこの押下を消費した」。 以降の分岐 (区間 bend /
+    // automation clip / lasso) はこれを読む。
+    claim.point = true;
     if f.pointer.modifiers.alt {
         // Alt + click on point → 即時 DeleteAutomationPoints (commit-by-release なし)
         let v_k = vec![point_key];
@@ -301,23 +268,88 @@ fn point(
     }
 }
 
+/// r.md #73: Alt + レーン本体の線 → 区間の曲げ (bend) session。
+///
+/// 優先順位は point (半径 2 倍) の **後**、automation clip の **前**。 point が先に効くので
+/// Alt+クリック (点の削除) と共存する。 Hold / Linear の区間は「曲線」(= `Exponential`)
+/// へ自動変換してから量を付ける。 commit は release で 1 回だけ (undo 1 段)。
+///
+/// `preview_curve` の初期値は **`anchor_curve`** (= press 直後は今の見た目のまま)。
+/// 最初の continuation で `start_curve` を基準に解いた結果へ切り替わる
+/// (= Hold 区間は最初の 1px 動かした瞬間に直線化してから曲がる。 連続解が無いので仕様)。
+fn segment_bend(
+    ui: &mut Ui<'_, AppData>,
+    f: &ArrangementFrame<'_>,
+    hit: &PressHit,
+    claim: &mut PressClaim,
+) {
+    let (px, py) = (hit.px, hit.py);
+    if !(!claim.splitter
+        && !claim.point
+        && !claim.session
+        && hit.in_lanes
+        && f.pointer.modifiers.alt
+        && !hit.shift
+        && !hit.ctrl)
+    {
+        return;
+    }
+    let Some(seg) = automation_segment_at(
+        &f.visible_tracks,
+        &f.tops,
+        f.view.track_row_h,
+        f.view,
+        f.header_pane.x,
+        f.header_pane.w,
+        f.lanes,
+        px,
+        py,
+        f.style,
+    ) else {
+        return;
+    };
+    let start_curve = match seg.curve {
+        common::model::AutomationCurve::Hold | common::model::AutomationCurve::Linear => {
+            common::model::AutomationCurve::Exponential { bend: 0.0 }
+        }
+        other => other,
+    };
+    let anchor_value_norm = find_lane_clip(&f.visible_tracks, seg.point.clip)
+        .map(|(lane, _clip)| curve::LaneValueMap::from_lane(lane, seg.clip_rect))
+        .map_or(0.0, |map| {
+            curve::eval_norm(map, seg.a_plain, seg.b_plain, seg.grab_u, start_curve)
+        });
+    let state: &mut ArrangementState = ui.widget_state(f.wid);
+    state.automation_segment_bend = Some(AutomationSegmentBendSession {
+        point: seg.point,
+        grab_u: seg.grab_u,
+        a_plain: seg.a_plain,
+        b_plain: seg.b_plain,
+        anchor_curve: seg.curve,
+        start_curve,
+        anchor_value_norm,
+        clip_rect_anchor: seg.clip_rect,
+        anchor_mouse_y: py,
+        last_mouse_y: py,
+        preview_curve: seg.curve,
+    });
+    claim.session = true;
+}
+
 /// M14 Phase 63n-3 (#028) / daw_01 #071: lane body 内 automation clip の press 振り分け。
-/// priority: **point hit より低い** (= 上の point block で point drag / Alt+delete が起動済なら
-/// skip)。 #071 で Shift / Ctrl 修飾でも起動する (= MIDI clip drag と完全対称、 release で短 click
+/// priority: **point hit / 区間 bend より低い** (= 上の 2 ブロックが消費していたら skip)。
+/// #071 で Shift / Ctrl 修飾でも起動する (= MIDI clip drag と完全対称、 release で短 click
 /// を modifier 別 (plain=単一置換 / Shift・Ctrl=選択足し引き) に demote)。 automation lane では
-/// marquee (`!press_in_automation_lane`) は走らないので Shift を温存する必要はない。 Alt のみ
-/// lane resize に予約 (下の Alt+drag fallback)。 掴んだ clip が選択集合に含まれていれば選択中の
-/// 全 clip を grabbed-first で `anchors` に積み一括 move / resize する (MIDI clip と同 idiom)。
+/// marquee (`!press_in_automation_lane`) は走らないので Shift を温存する必要はない。
+/// 掴んだ clip が選択集合に含まれていれば選択中の全 clip を grabbed-first で `anchors` に
+/// 積み一括 move / resize する (MIDI clip と同 idiom)。
 ///
-/// M14 Phase 63n-6 (#031 follow-up): Alt 修飾は **lane Alt+drag for resize に予約** する
-/// ため、 Alt+press on automation clip は session を起動しない。 これによって lane body 内の
-/// 任意位置 (clip 上を含む) で Alt+drag → lane resize が動作する (= user expectation 1:1)。
-/// 既存 automation clip Alt-snap-off 機能は失われるが、 automation 編集で sub-grid 位置を
-/// 細かく調整する用途は稀で、 lane resize の優先度の方が高いと判断 (= user feedback 反映)。
-/// MIDI / audio clip の Alt-snap-off (= clip_drag press) は **track row のみ** に作用するため
-/// この変更の影響を受けない。
-///
-/// M14 Phase 63n-9 (#033): handle press (curve param drag) が先勝した場合 clip drag も skip。
+/// r.md #73: **`!alt` ゲートを外した。** 旧実装は「Alt 修飾は lane Alt+drag for resize に
+/// 予約する」ために Alt+press を弾いており、 その代償として automation clip の
+/// Alt-snap-off を失っていた。 #73 で Alt+drag resize を撤去したので予約の根拠が消え、
+/// 残すと「Alt を押してドラッグすると何も起きない」死角が新しく生まれる。 外したことで
+/// **Alt = スナップ無効が復活し、 MIDI / audio clip と対称になる**。 線の上の Alt+drag は
+/// 1 段上の `segment_bend` が先勝する (`!claim.session`)。
 fn automation_clip(
     ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
@@ -327,9 +359,8 @@ fn automation_clip(
     let (px, py) = (hit.px, hit.py);
     if !claim.splitter
         && !claim.point
-        && !claim.curve_handle
+        && !claim.session
         && hit.in_lanes
-        && !f.pointer.modifiers.alt
         && let Some((clip_key, kind, _clip_rect, _body_rect_anchor)) = automation_clip_zone_at(
             &f.visible_tracks,
             &f.tops,
@@ -384,87 +415,20 @@ fn automation_clip(
     }
 }
 
-/// M14 Phase 63n-6 (#031): Alt+drag detection — splitter / 既存 press logic で session が
-/// 起動しなかった場合のみ動作 (Alt+click on point / Alt+drag on clip 等は既に上で処理済 →
-/// 該当 session が立っていれば skip する)。 lane body hit なら lane resize、 そうでなく
-/// track row body hit なら row resize。 cursor が lanes 領域 (= clip 描画域) でも
-/// header_pane (= lane label 列) でも動く — lane label 上 Alt+drag を「lane を伸ばす」 と
-/// 期待する user 直感に合わせる (= 「lane の上で Alt+drag」 = lane resize)。
-fn alt_resize(
-    ui: &mut Ui<'_, AppData>,
-    f: &ArrangementFrame<'_>,
-    hit: &PressHit,
-    claim: &mut PressClaim,
-    actions: &PressActions,
-) {
-    let (px, py) = (hit.px, hit.py);
-    let in_arr = hit.in_lanes || (f.header_w > 0.0 && f.header_pane.contains(px, py));
-    if !(f.pointer.modifiers.alt && !hit.shift && !hit.ctrl && !claim.splitter && in_arr) {
-        return;
-    }
-    if claim.session || actions.any() {
-        return;
-    }
-    let lane_at = automation_lane_at(
-        &f.visible_tracks,
-        &f.tops,
-        f.view.track_row_h,
-        f.header_pane.x,
-        f.header_pane.w,
-        f.lanes.x,
-        f.lanes.w,
-        f.style,
-        py,
-    );
-    if let Some((t_idx, l_idx, _h_rect, _b_rect)) = lane_at {
-        let lane = &f.visible_tracks[t_idx].automation_lanes[l_idx];
-        let lane_key = AutomationLaneKey { track: f.visible_tracks[t_idx].id, lane: lane.id };
-        let anchor_h = lane.height_px;
-        if anchor_h > 0 {
-            let state: &mut ArrangementState = ui.widget_state(f.wid);
-            state.automation_lane_resize_drag = Some(AutomationLaneResizeDragSession {
-                lane: lane_key,
-                anchor_height_px: anchor_h,
-                anchor_mouse_y: py,
-                last_mouse_y: py,
-                last_emitted_height: anchor_h,
-            });
-            claim.session = true;
-        }
-    } else if let Some(t_idx) = track_index_from_y(py, f.lanes.y, &f.tops)
-        && t_idx + 1 < f.tops.len()
-    {
-        // lane が無い (or collapsed) で track row body の中の Alt+drag → per-track row resize。
-        // row body 範囲 = `[tops[t_idx], tops[t_idx] + effective_row_h(t))`、 それ以遠は
-        // lane 領域 (= `lane_at` で既に拾われる前提) — y check は collapsed track / 末尾
-        // track の「lane 無し領域」 まで含めて row body と認定するための明示判定。
-        let t = &f.visible_tracks[t_idx];
-        let row_top = f.tops[t_idx];
-        let anchor_row_h = effective_track_row_h(t, f.view.track_row_h);
-        let row_bottom = row_top + anchor_row_h;
-        if py >= row_top && py < row_bottom && anchor_row_h > 0.0 {
-            let track = t.id;
-            let state: &mut ArrangementState = ui.widget_state(f.wid);
-            state.track_row_resize_drag = Some(TrackRowResizeDragSession {
-                track,
-                anchor_row_h,
-                anchor_mouse_y: py,
-                last_mouse_y: py,
-                last_emitted_height: anchor_row_h,
-            });
-            claim.session = true;
-        }
-    }
-}
-
 /// M14 Phase 63n-8 (#033): automation point の lasso press — **空き automation lane zone**
 /// (= lane body && !clip && !point && !lane resize splitter) の drag で起動。 Q2=A の zone 排他
 /// 設計: clip / point / splitter 上は既存 drag (move / move-points / resize) を最優先で起動済、
 /// ここはそれら全てが起動しなかった場合の lane body fallback。 既存 MIDI clip rect_select は
 /// automation lane 内では起動しない (= 後段の rect_select block で `!in_automation_lane` で
 /// guard)、 automation lane では空き zone drag が **修飾なしで lasso** (= Shift / Ctrl は
-/// release 時 next 計算で union / XOR 分岐)、 #033 Q2 回答 A と整合。 Alt は lane resize に
-/// 予約済 (上の Alt+drag fallback で先勝) なので `!alt` で除外。
+/// release 時 next 計算で union / XOR 分岐)、 #033 Q2 回答 A と整合。
+///
+/// r.md #73: **`!alt` ゲートを外した。** 旧コメントは「Alt は lane resize に予約済
+/// (上の Alt+drag fallback で先勝) なので `!alt` で除外」と書いていたが、 その
+/// Alt+drag resize を撤去したので予約が無効になった。 残すと空き lane zone の
+/// Alt+drag が何も起こさない死角になる。 lasso に snap の概念は無いので Alt に別の
+/// 意味は無く、 線の上の Alt+drag は `segment_bend` が先に `claim.session` を立てて
+/// ここへ来ない (`no_session` 相当のゲートは下の `claim.session` チェック)。
 ///
 /// **`automation_lasso_drag` は 11 列挙外なので `claim` は立てない。**
 ///
@@ -478,7 +442,7 @@ fn lasso(
     actions: &PressActions,
 ) {
     let (px, py) = (hit.px, hit.py);
-    if !(!f.pointer.modifiers.alt && !claim.splitter && hit.in_lanes) {
+    if !(!claim.splitter && !claim.point && hit.in_lanes) {
         return;
     }
     if claim.session || actions.any() {

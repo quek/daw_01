@@ -1246,9 +1246,12 @@ fn point_press_does_not_start_automation_clip_drag() {
     assert_eq!(point_time(&app, 1), Some(1.0), "掴んだ point だけが 1 拍ぶん動く");
 }
 
-/// **Alt+drag のフォールバックは、同フレームで press action が立っていれば起動しない**。
-/// point を Alt+click すると即時削除が走る (= `actions.any()`) ので、
-/// 同じ drag で lane resize は起きない。
+/// point を Alt+click すると即時削除が走り、同じ drag で lane resize は起きない。
+///
+/// r.md #73 で Alt+drag = lane resize の経路そのものを撤去したので、
+/// 「resize が起きない」根拠は `actions.any()` ゲートから **機能の不在**へ変わった。
+/// 観測する挙動は同じなのでテストはそのまま残す (`alt_drag_in_a_lane_no_longer_resizes_it`
+/// が撤去そのものを、こちらが「削除と同フレームでも巻き添えが無い」ことを見る)。
 #[test]
 fn alt_click_on_point_deletes_without_resizing_the_lane() {
     let (mut app, _a, _p) = app_with_lane(0.0);
@@ -1345,4 +1348,432 @@ fn heavy_lanes_bg_is_drawn_before_header_rows() {
         b > a,
         "header 行は heavy の背景より後 (= 手前) に積まれる: lanes_bg={a} master_header={b}"
     );
+}
+
+// ============================================================
+// r.md #73: オートメーションカーブの操作系
+//
+// 「線を直接 Alt+ドラッグして曲げる」「Alt+ダブルクリックで直線に戻す」「選択の共存」
+// 「Alt+drag resize 撤去後に死角が無いこと」を widget を実際に駆動して確かめる。
+// daw_gui 本体は起動しない (`CARGO_BIN_EXE_daw_gui` を使わない)。
+// ============================================================
+
+/// r.md #73: 区間 1 本だけの automation lane (track 1 / lane 1 / clip 1、clip は `[0, 8)`)。
+/// `values` は **plain** (Volume は `0.0..=2.0`、norm = plain / 2)。
+/// 曲線編集は「区間の向き」で保存値の符号が変わるので、上り / 下りを引数で作り分ける。
+/// `curve` は **入射側** (= 後ろの点、id = 2) に付く。
+fn add_bend_lane(app: &mut AppData, values: (f64, f64), curve: AutomationCurve) {
+    app.edit_song(|song| {
+        song.clip_contents.insert(
+            AUTOMATION_CONTENT_ID,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint {
+                        id: 1,
+                        time_beat: 0.0,
+                        value: values.0,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint { id: 2, time_beat: 8.0, value: values.1, curve },
+                ],
+                next_point_id: 3,
+            }),
+        );
+        if let Some(t) = song.tracks.iter_mut().find(|t| t.id == 1) {
+            t.automation_lanes = vec![AutomationLane {
+                id: 1,
+                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                default_value: 1.0,
+                enabled: true,
+                visible: true,
+                height_px: LANE_H,
+                clips: vec![AutomationClip {
+                    id: 1,
+                    name: String::new(),
+                    start_beat: 0.0,
+                    length_beats: 8.0,
+                    content_id: AUTOMATION_CONTENT_ID,
+                    content_offset_beats: 0.0,
+                }],
+                next_clip_id: 2,
+            }];
+        }
+    });
+    app.ui_prefs.expanded_automation_tracks.insert(1);
+}
+
+fn app_with_bend_lane(
+    header_w: f32,
+    values: (f64, f64),
+    curve: AutomationCurve,
+) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
+    let (mut app, a, p) = build_app_with_header(header_w);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    add_bend_lane(&mut app, values, curve);
+    (app, a, p)
+}
+
+/// 2 つの point dot の中心 (x 昇順)。**レイアウト式をテスト側で複製しない**ため、
+/// widget が返す `automation_point_rects` を SSoT にする。
+fn point_dots(app: &mut AppData) -> ((f32, f32), (f32, f32)) {
+    let mut host = UiHost::no_redraw();
+    let r = drive_response(&mut host, app, PointerFrame::default());
+    let mut c: Vec<(f32, f32)> = r
+        .automation_point_rects
+        .iter()
+        .map(|(_, rect)| (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5))
+        .collect();
+    c.sort_by(|a, b| a.0.total_cmp(&b.0));
+    assert_eq!(c.len(), 2, "点 2 つを想定: {c:?}");
+    (c[0], c[1])
+}
+
+/// automation clip の描画域 (縦 padding 適用済)。 これも widget の実 rect を使う。
+fn lane_clip_rect(app: &mut AppData) -> Rect {
+    let mut host = UiHost::no_redraw();
+    let r = drive_response(&mut host, app, PointerFrame::default());
+    r.automation_clip_rects.first().expect("automation clip が 1 本描かれている").1
+}
+
+/// `Linear` 区間の進捗 `u` にあたる screen 座標 (= 2 dot を結ぶ直線上)。
+fn linear_segment_point(app: &mut AppData, u: f32) -> (f32, f32) {
+    let (p0, p1) = point_dots(app);
+    (p0.0 + (p1.0 - p0.0) * u, p0.1 + (p1.1 - p0.1) * u)
+}
+
+fn point_curve(app: &AppData, id: u32) -> Option<AutomationCurve> {
+    app.song_doc
+        .song()
+        .clip_contents
+        .get(&AUTOMATION_CONTENT_ID)
+        .and_then(common::model::ClipContent::automation_points)
+        .and_then(|pts| pts.iter().find(|p| p.id == id))
+        .map(|p| p.curve)
+}
+
+/// 区間の進捗 `u` における **plain 値** (= 実際に鳴る値)。
+/// 数式は production の `apply_curve` をそのまま呼ぶ (テストに式を写さない)。
+fn curve_value_at(app: &AppData, u: f64) -> f64 {
+    let pts = app
+        .song_doc
+        .song()
+        .clip_contents
+        .get(&AUTOMATION_CONTENT_ID)
+        .and_then(common::model::ClipContent::automation_points)
+        .expect("automation content が居る");
+    assert!(pts.len() >= 2, "区間が 1 本以上ある: {pts:?}");
+    common::automation::apply_curve(pts[0].value, pts[1].value, u, pts[1].curve)
+}
+
+/// Alt+ドラッグで線を **画面上へ**曲げ、鳴る値が直線より上へ動いたことを確かめる。
+///
+/// **保存される `bend` の符号は assert しない** — 値は progress 基準なので上り区間と
+/// 下り区間で逆符号になる (それが #73 の核心)。見えるもの (= 値の上下) だけを見る。
+fn assert_alt_drag_bends_upward(values: (f64, f64)) {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, values, AutomationCurve::Linear);
+    const U: f64 = 0.25;
+    let straight = curve_value_at(&app, U);
+    let (gx, gy) = linear_segment_point(&mut app, 0.25);
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(gx, gy, alt));
+    drive(&mut host, &mut app, hold(gx, gy - 12.0, alt));
+    drive(&mut host, &mut app, release(gx, gy - 12.0, alt));
+    assert!(
+        matches!(point_curve(&app, 2), Some(AutomationCurve::Exponential { .. })),
+        "Linear 区間は「曲線」(Exponential) へ自動変換される: got {:?}",
+        point_curve(&app, 2)
+    );
+    let bent = curve_value_at(&app, U);
+    assert!(
+        bent > straight + 1e-3,
+        "{values:?}: カーソルを上げたので鳴る値も直線 {straight} より上のはず (got {bent})"
+    );
+}
+
+/// Alt+ドラッグで上り区間を曲げると、鳴る値が直線より上になる。
+#[test]
+fn alt_drag_bends_a_rising_segment_upward() {
+    assert_alt_drag_bends_upward((0.2, 1.8));
+}
+
+/// 同じジェスチャを下り区間でやっても、鳴る値は直線より上になる (= 画面上で上がる)。
+/// 保存される `bend` の符号は上り区間と逆になるが、見える挙動は同じ。
+/// **旧実装はここが逆で、上り区間で線が下へ沈んでいた。**
+#[test]
+fn alt_drag_bends_a_falling_segment_upward_too() {
+    assert_alt_drag_bends_upward((1.8, 0.2));
+}
+
+/// Hold 区間を Alt+ドラッグすると「曲線」に自動変換されてから量が付く。
+/// Hold の描画は水平線なので、掴む座標は前の点の y を使う。
+#[test]
+fn alt_drag_converts_hold_segment_to_a_curve() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Hold);
+    let (p0, p1) = point_dots(&mut app);
+    let gx = p0.0 + (p1.0 - p0.0) * 0.25;
+    let gy = p0.1; // Hold は前値で水平
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(gx, gy, alt));
+    drive(&mut host, &mut app, hold(gx, gy - 12.0, alt));
+    drive(&mut host, &mut app, release(gx, gy - 12.0, alt));
+    assert!(
+        matches!(point_curve(&app, 2), Some(AutomationCurve::Exponential { .. })),
+        "Hold 区間も「曲線」へ自動変換される: got {:?}",
+        point_curve(&app, 2)
+    );
+}
+
+/// Alt+ドラッグは release で 1 件だけ Edit を出す (= undo 1 段)。
+#[test]
+fn alt_drag_commits_once_on_release() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    let (gx, gy) = linear_segment_point(&mut app, 0.25);
+    let before = app.song_doc.undo_depth();
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(gx, gy, alt));
+    drive(&mut host, &mut app, hold(gx, gy - 8.0, alt));
+    drive(&mut host, &mut app, hold(gx, gy - 12.0, alt));
+    drive(&mut host, &mut app, release(gx, gy - 12.0, alt));
+    assert_eq!(
+        app.song_doc.undo_depth(),
+        before + 1,
+        "drag 中は commit せず、release で 1 段だけ積む"
+    );
+}
+
+/// **動かさない Alt+クリック (線の上) は何も変えない。**
+///
+/// `preview_curve` を毎フレーム無条件に逆算すると、Hold / Linear 区間では
+/// `start_curve` が `Exponential { bend: 0.0 }` なので dy = 0 でも
+/// `Exponential { bend: 0.0 }` が返り、`anchor_curve` (= Linear) と異なるため
+/// release の no-op 判定をすり抜けて **クリックしただけで dirty + undo 1 段**になる。
+/// 既に曲がっている区間でも逆算の丸めで同じことが起きる。
+#[test]
+fn alt_click_on_the_line_without_moving_changes_nothing() {
+    for curve in [
+        AutomationCurve::Linear,
+        AutomationCurve::Hold,
+        AutomationCurve::Exponential { bend: 0.5 },
+    ] {
+        let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), curve);
+        let (p0, p1) = point_dots(&mut app);
+        // Hold は水平なので前の点の y、それ以外は直線 (Exponential は掴めなくてもよい —
+        // session が起動しなければそもそも何も起きないので、どちらでも assert は成立する)。
+        let gx = p0.0 + (p1.0 - p0.0) * 0.25;
+        let gy = if matches!(curve, AutomationCurve::Hold) {
+            p0.1
+        } else {
+            p0.1 + (p1.1 - p0.1) * 0.25
+        };
+        let before = app.song_doc.undo_depth();
+        let alt = modifiers(false, false, true);
+        let mut host = UiHost::no_redraw();
+        drive(&mut host, &mut app, press(gx, gy, alt));
+        drive(&mut host, &mut app, release(gx, gy, alt));
+        assert_eq!(point_curve(&app, 2), Some(curve), "{curve:?}: curve は変わらない");
+        assert_eq!(app.song_doc.undo_depth(), before, "{curve:?}: undo も積まれない");
+    }
+}
+
+/// Alt+ダブルクリック (線の上) で直線に戻る。
+/// S 字 (`Bezier`) は u=0.5 を必ず通る (数学的な固定点) ので、
+/// 2 dot の中点がそのまま曲線の上になる。
+#[test]
+fn alt_double_click_on_the_line_resets_to_linear() {
+    let (mut app, _a, _p) =
+        app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Bezier { tension: 0.5 });
+    let (mx, my) = linear_segment_point(&mut app, 0.5);
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    for p in [press(mx, my, alt), release(mx, my, alt), press(mx, my, alt), release(mx, my, alt)] {
+        drive(&mut host, &mut app, p);
+    }
+    assert_eq!(
+        point_curve(&app, 2),
+        Some(AutomationCurve::Linear),
+        "線の上の Alt+ダブルクリックで直線に戻る"
+    );
+}
+
+/// Alt+ダブルクリック (線から離れた場所) は従来どおりスナップ無しで点を足す。
+/// **ハーネスの `build_app` は `arrange_snap_enabled = false` なので、
+/// このテストは冒頭で `true` に戻す** — 戻さないと「Alt 無しでもスナップしない」ので
+/// 「Alt でスナップが切れた」が空振りする。
+#[test]
+fn alt_double_click_off_the_line_still_adds_an_unsnapped_point() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    app.ui_prefs.arrange_snap_enabled = true;
+    let clip_rect = lane_clip_rect(&mut app);
+    // 線は norm 0.1 → 0.9 の直線。 clip 上端近く (norm 0.9 付近) は前半では線から遠い。
+    // x はグリッドに乗らない拍を選ぶ。
+    let x = 1.3_f32 * ZOOM;
+    let y = clip_rect.y + clip_rect.h * 0.1;
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    for p in [press(x, y, alt), release(x, y, alt), press(x, y, alt), release(x, y, alt)] {
+        drive(&mut host, &mut app, p);
+    }
+    let times: Vec<f64> = app
+        .song_doc
+        .song()
+        .clip_contents
+        .get(&AUTOMATION_CONTENT_ID)
+        .and_then(common::model::ClipContent::automation_points)
+        .map(|pts| pts.iter().map(|p| p.time_beat).collect())
+        .unwrap_or_default();
+    assert_eq!(times.len(), 3, "点が 1 つ増える: {times:?}");
+    let added = times.iter().copied().find(|t| *t > 0.0 && *t < 8.0).expect("中間に足された点");
+    assert!(
+        (added - 1.3).abs() < 1e-4,
+        "Alt でスナップが切れて raw 拍 1.3 に着地する: got {added}"
+    );
+}
+
+/// r.md #73 (E): 点の無修飾クリックでクリップ選択が消えない。
+/// 選択集合は面を跨いで共存でき、Delete / Copy / Cut の宛先は last-wins が解決する。
+#[test]
+fn clicking_a_point_keeps_the_automation_clip_selection() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    app.selection.selected_automation_clips =
+        vec![common::model::AutomationClipKey { track: 1, lane: 1, clip: 1 }];
+    let (p0, _p1) = point_dots(&mut app);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(p0.0, p0.1, no_mods()));
+    drive(&mut host, &mut app, release(p0.0, p0.1, no_mods()));
+    assert!(
+        !app.selection.selected_automation_clips.is_empty(),
+        "点の click でクリップ選択は消えない: {:?}",
+        app.selection.selected_automation_clips
+    );
+    assert!(
+        !app.selection.selected_automation_points.is_empty(),
+        "点は選択される: {:?}",
+        app.selection.selected_automation_points
+    );
+}
+
+/// 逆方向も同じ — クリップの無修飾クリックで点選択が消えない。
+#[test]
+fn clicking_an_automation_clip_keeps_the_point_selection() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    app.selection.selected_automation_points = vec![daw_gui::app_types::AutomationPointKeyRef {
+        track_id: 1,
+        lane_id: 1,
+        clip_id: 1,
+        point_idx: 0,
+    }];
+    let clip_rect = lane_clip_rect(&mut app);
+    // 線からも点からも離れた clip 内 (上端寄り、 拍 2 付近 = 線はまだ下にいる)。
+    let x = 2.0_f32 * ZOOM;
+    let y = clip_rect.y + clip_rect.h * 0.05;
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, release(x + 1.0, y, no_mods()));
+    assert!(
+        !app.selection.selected_automation_clips.is_empty(),
+        "クリップが選択される: {:?}",
+        app.selection.selected_automation_clips
+    );
+    assert!(
+        !app.selection.selected_automation_points.is_empty(),
+        "クリップの click で点選択は消えない: {:?}",
+        app.selection.selected_automation_points
+    );
+}
+
+/// r.md #73: レーン本体の Alt+ドラッグはもうレーン高さを変えない
+/// (高さは Alt+ホイールと下端スプリッタが担う)。
+#[test]
+fn alt_drag_in_a_lane_no_longer_resizes_it() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    let before = lane_height(&app, 1, 1);
+    let (gx, gy) = linear_segment_point(&mut app, 0.25);
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(gx, gy, alt));
+    drive(&mut host, &mut app, hold(gx, gy + 30.0, alt));
+    drive(&mut host, &mut app, release(gx, gy + 30.0, alt));
+    assert_eq!(lane_height(&app, 1, 1), before, "レーン本体の Alt+drag で高さは変わらない");
+}
+
+/// r.md #73 (§3.6): 線から離れた場所の Alt+ドラッグは死角にならず、
+/// automation clip が動く。しかも Alt がスナップを無効にしている
+/// (= MIDI / audio clip と対称)。
+///
+/// **ハーネスの `build_app` は `arrange_snap_enabled = false` なので、
+/// このテストは冒頭で `true` に戻す。** 戻さないと「Alt 無しでもスナップしない」ので
+/// 比較が成立しない (空振りする)。
+#[test]
+fn alt_drag_off_the_line_moves_the_clip_without_snapping() {
+    /// 線から離れた clip 上を 0.3 拍ぶん引いて、着地した clip start を返す。
+    fn drag_clip(alt_on: bool) -> f64 {
+        let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+        app.ui_prefs.arrange_snap_enabled = true;
+        let clip_rect = lane_clip_rect(&mut app);
+        // 線は左下から右上へ上がるので、左半分の **上端寄り** は線から遠い。
+        let x = 2.0_f32 * ZOOM;
+        let y = clip_rect.y + clip_rect.h * 0.05;
+        let m = modifiers(false, false, alt_on);
+        let dx = ZOOM * 0.3; // グリッドに乗らない移動量
+        let mut host = UiHost::no_redraw();
+        drive(&mut host, &mut app, press(x, y, m));
+        drive(&mut host, &mut app, hold(x + dx * 0.5, y, m));
+        drive(&mut host, &mut app, release(x + dx, y, m));
+        lane_clip_start(&app, 1, 1).expect("automation clip が居る")
+    }
+    let snapped = drag_clip(false);
+    let raw = drag_clip(true);
+    assert!(
+        (raw - 0.3).abs() < 1e-4,
+        "Alt でスナップが切れて 0.3 拍ぶんそのまま動く: got {raw}"
+    );
+    assert!(
+        (snapped - raw).abs() > 1e-3,
+        "Alt 無しはグリッドに吸着して別の位置になる: snapped={snapped} raw={raw}"
+    );
+}
+
+/// r.md #73 (§3.6): lane header 列の Alt+ドラッグはレーン高さを変えない
+/// (撤去後は無反応。高さは Alt+ホイールとスプリッタが担う)。
+/// 既定ハーネスは `arrange_header_w = 0.0` なので header 付き fixture で回す。
+#[test]
+fn alt_drag_in_the_lane_header_column_no_longer_resizes() {
+    let (mut app, _a, _p) = app_with_bend_lane(HEADER_W, (0.2, 1.8), AutomationCurve::Linear);
+    let before = lane_height(&app, 1, 1);
+    // lane header 列 = x < HEADER_W、 y は lane body の中ほど (下端 splitter を避ける)。
+    let x = HEADER_W * 0.5;
+    let y = track0_bottom() + f32::from(LANE_H) * 0.5;
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(x, y, alt));
+    drive(&mut host, &mut app, hold(x, y + 30.0, alt));
+    drive(&mut host, &mut app, release(x, y + 30.0, alt));
+    assert_eq!(
+        lane_height(&app, 1, 1),
+        before,
+        "レーンヘッダ列の Alt+drag でも高さは変わらない"
+    );
+}
+
+/// r.md #73 (§3.5): Alt+クリック (点) は点を消すだけで、
+/// 同フレームに区間 bend も clip drag も起動しない。
+/// 旧実装は「point drag session が立ったか」でしか消費を判定しておらず、
+/// Alt+クリックでは session が立たないので後続の press が二重に走っていた。
+#[test]
+fn alt_click_on_a_point_only_deletes_it() {
+    let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
+    let clip_before = lane_clip_start(&app, 1, 1);
+    let curve_before = point_curve(&app, 2);
+    let (p0, _p1) = point_dots(&mut app);
+    let alt = modifiers(false, false, true);
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(p0.0, p0.1, alt));
+    drive(&mut host, &mut app, hold(p0.0, p0.1 - 20.0, alt));
+    drive(&mut host, &mut app, release(p0.0, p0.1 - 20.0, alt));
+    assert_eq!(point_ids(&app), vec![2], "Alt+click した点 (id=1) だけが消える");
+    assert_eq!(lane_clip_start(&app, 1, 1), clip_before, "automation clip は動かない");
+    assert_eq!(point_curve(&app, 2), curve_before, "区間 bend も起動しない");
 }

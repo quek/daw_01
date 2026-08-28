@@ -58,6 +58,9 @@ use crate::app::{
 
 pub(crate) mod view_build;
 mod content_build;
+// r.md #73: 曲線 ↔ 画面の変換 SSoT。 `use curve::*;` は **しない** — `curve::eval_norm`
+// のように修飾して呼ぶ (同名の自由関数が draw / geometry と衝突しやすい)。
+mod curve;
 mod draw;
 use draw::*;
 mod geometry;
@@ -436,40 +439,41 @@ pub struct AutomationPointDragInfo {
     pub cursor: (f32, f32),
 }
 
-/// M14 Phase 63n-1 (#028): automation point の incoming curve 種別 (= 直前の point からこの point に
-/// 至る曲線形状)。 daw_01 conversation #033 で `apply_curve` の式を更新済 (Bezier は真の S 字 cubic
-/// に書き直し、 Exponential variant を追加)。 描画は daw_01 `common::automation::apply_curve` を SSoT
-/// として完全ミラー (描画と再生の数値完全一致を保証、 audio/MIDI と同 idiom)。
-/// - `Hold`: 階段 (前の値を保持して垂直立ち上がり)
-/// - `Linear`: 直線
-/// - `Bezier { tension }`: 制御点 x = (1/3, 2/3) 固定、 y を `tension` で対角線 ↔ end-hold lerp した
-///   cubic Bezier (`-1.0..=1.0`、 `0.0` で直線等価、 `+1.0` で滑らかな S 字、 `-1.0` で overshoot 反転 S 字)。
-/// - `Exponential { bend }`: `value = prev + (next - prev) * t.powf(2^bend)` の polyline (`-1.0..=1.0`、
-///   `0.0` で直線、 `+1.0` で前半遅・後半速 (二次曲線)、 `-1.0` で前半速・後半遅 (平方根))。
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum ArrangementCurveKind {
-    Hold,
-    Linear,
-    Bezier { tension: f32 },
-    Exponential { bend: f32 },
+/// r.md #73: automation point の **安定 id** による addressing。
+/// `AutomationPointKey` は `point_idx` (positional) なので、点の追加 / 削除で
+/// 指す先が変わる (アーキテクチャ不変条件 1)。曲線編集は press → release を跨ぐので、
+/// この経路だけは `common::model::AutomationPoint::id` で指す。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AutomationPointIdKey {
+    pub clip: AutomationClipKey,
+    /// `AutomationPoint::id` (per-content 安定 id、`0` は未採番 sentinel)。
+    /// `0` はこの経路の対象外 (hit-test で弾く / handler で no-op)。
+    pub point_id: u32,
 }
 
-/// M14 Phase 63n-9 (#033): `SetAutomationCurveParam` の対象種別 (Bezier tension / Exponential bend)。
-/// daw_01 #033 §B 仕様の `BezierTension` / `ExponentialBend` 2 variant 1 対 1 対応。 caller は match で
-/// `point.curve` の対応 variant を更新する idiom (Bezier { tension: next_value } / Exponential { bend: next_value })。
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum SetAutomationCurveParamKind {
-    BezierTension,
-    ExponentialBend,
-}
-
-/// M14 Phase 63n-1 (#028): automation point の clip-local 座標 + curve 種別。
-/// `time_beat` は clip-local (clip start からのオフセット拍)、 `value_norm` は `0.0..=1.0` 正規化。
+/// M14 Phase 63n-1 (#028): automation point の clip 窓ローカル座標 + 補間形状。
+/// `time_beat` は clip-local (clip start からのオフセット拍)。
+///
+/// r.md #73: **`value_plain` が曲線の真実、`value_norm` は画面への射影**。
+/// `plain_to_norm_ranged` は末尾で `clamp(0, 1)` するので、窓の外に出る値
+/// (`GroupTransform::X` / `TextBuiltin::OutlineWidth` 等) は norm から
+/// 復元できない。曲線の評価 / hit-test / 逆算は `value_plain` を使い、
+/// 点 dot の y / drag の delta / 選択矩形は `value_norm` を使う。
+/// 2 つは `view_build.rs` の同じ場所で同じ model 点から作る (再変換しない)。
 #[derive(Clone, Copy, Debug)]
 pub struct ArrangementAutomationPoint {
+    /// r.md #73: `common::model::AutomationPoint::id` (per-content 安定 id)。
+    /// 曲線編集は press → release を跨ぐので positional index では指せない
+    /// (不変条件 1)。`0` は未採番 sentinel = 曲線編集の対象外。
+    pub id: u32,
     pub time_beat: f64,
+    /// `0.0..=1.0` 正規化 (clamp 済)。
     pub value_norm: f32,
-    pub curve: ArrangementCurveKind,
+    /// target のネイティブ単位。`common::automation::apply_curve` に渡す値。
+    pub value_plain: f64,
+    /// r.md #73: mirror 型 `ArrangementCurveKind` を廃止して model 直結
+    /// (アーキテクチャ不変条件 8)。
+    pub curve: common::model::AutomationCurve,
 }
 
 /// M14 Phase 63n-1 (#028): lane 内の automation clip。 MIDI / Audio clip と意味的に独立した型として
@@ -488,11 +492,23 @@ pub struct ArrangementAutomationClip {
     pub share_group_color: Option<f32>,
 }
 
-/// M14 Phase 63n-1 (#028): automation lane (target を持たず、 widget は label / icon の表示しか扱わない)。
-/// caller (daw_01) が `target` (Track の volume/pan、 plugin parameter 等) を別途保持する。
+/// M14 Phase 63n-1 (#028): automation lane。
+///
+/// r.md #73: **`target` / `plugin_range` を widget が持つようになった** (旧 doc の
+/// 「target を持たず label / icon の表示しか扱わない」は撤回)。曲線の形を
+/// **再生と同じ plain 空間**で評価する (`common::automation::apply_curve` が唯一の
+/// 実装) ために、値 ↔ 画面 y の写像を widget 側で解決する必要があるため。
+/// この 2 つは `fold_arrangement_clip_hash` の cache key にも入る (曲線の形が
+/// 依存するので、入れないと plugin param の range が後から埋まったときに古い形が残る)。
 #[derive(Clone, Debug)]
 pub struct ArrangementAutomationLane {
     pub id: u32,
+    /// r.md #73: 曲線を **再生と同じ plain 空間**で評価するために必要
+    /// (`common::automation::{plain_to_norm_ranged, norm_to_plain_ranged}`)。
+    pub target: common::model::AutomationTarget,
+    /// `PluginParam` の実 min/max (caller の plugin_params cache 由来、
+    /// 非 PluginParam は `None`)。`plain_to_norm_ranged` にそのまま渡す。
+    pub plugin_range: Option<(f64, f64)>,
     pub label: Arc<str>,
     /// lane header の icon 用 1 文字 ('V' / 'P' / 'F' 等)。 caller が parameter 種別から決める。
     pub icon_glyph: char,
@@ -903,6 +919,11 @@ pub struct ArrangementResponse {
     /// point drag セッション進行中の live 値 (`Some` のとき caller は
     /// `cursor` 近傍に `value_norm` を人間可読単位で表示する)。 release frame では `None`。
     pub automation_point_drag: Option<AutomationPointDragInfo>,
+    /// r.md #73: Alt 押下中にポインタが乗っている「曲げられる区間」。
+    /// `hovered_clip` と同じ毎フレーム算出の hover state。
+    /// **caller はこれを heavy cache キーに混ぜないこと** (マウス移動のたびに
+    /// アレンジ全体が再構築される)。強調描画は overlay 層で行う。
+    pub hovered_automation_segment: Option<AutomationPointIdKey>,
 }
 
 impl Default for ArrangementResponse {
@@ -935,6 +956,7 @@ impl Default for ArrangementResponse {
             section_rects: Vec::new(),
             automation_lane_default_rects: Vec::new(),
             automation_point_drag: None,
+            hovered_automation_segment: None,
         }
     }
 }
@@ -1156,23 +1178,17 @@ pub struct ArrangementStyle {
     pub automation_curve_line_width_px: f32,
     /// lane 内 point の半径 (px)。 default 4.0。
     pub automation_point_radius_px: f32,
-    /// M14 Phase 63n-9 (#033): tension/bend handle (= selected point の Bezier / Exponential 入射 segment
-    /// 中央に出る dot) の半径 (px)。 default 4.0 (= 8x8 px 円、 selection の point dot と同サイズ)。
-    pub automation_curve_param_handle_radius_px: f32,
-    /// M14 Phase 63n-9 (#033): tension/bend handle の fill。 default 黄色系 (curve / point とは異なる色相
-    /// で「これは handle」 と user に明示)。
-    pub automation_curve_param_handle_fill: Color,
-    /// M14 Phase 63n-9 (#033): tension/bend handle の border。 明るい handle fill の上に乗る
-    /// 極性固定の暗インク (`ink_on_bright`) で handle を背景から分離する。
-    pub automation_curve_param_handle_border: Color,
-    /// M14 Phase 63n-9 (#033): handle を curve から上方向 (= y - offset) に offset させる px。 default 10.0
-    /// (= curve 線 (1.5px) と完全に分離して click target が curve と紛れない)。
-    pub automation_curve_param_handle_offset_px: f32,
-    /// M14 Phase 63n-9 (#033): handle drag 中の preview curve line (= 新しい tension/bend で描き直した
-    /// segment) の色。 default 黄色系 (cached curve の lane.color と区別して「これは preview」 と user に
-    /// 明示)。 line_width は `automation_curve_line_width_px * 1.5` (= 通常 1.5 → 2.25px、 +50%) で cached
-    /// curve を視覚的に上書き。
-    pub automation_curve_param_preview_color: Color,
+    /// r.md #73: レーン本体の線 (区間) の当たり判定半径 (px)。 default 6.0。
+    /// point dot (半径 2 倍 = 8px) より後に評価するので、点の上では点が勝つ。
+    pub automation_curve_segment_hit_px: f32,
+    /// r.md #73: Alt hover 中に「曲げられる区間」を強調する色
+    /// (どこを掴むと何が起きるかの可視化)。
+    pub automation_curve_bend_hover_color: Color,
+    /// r.md #73: Alt+ドラッグ中の live preview 線の色 (旧
+    /// `automation_curve_param_preview_color` を改名)。 cached curve の lane.color と
+    /// 区別して「これは preview」と示す。 line_width は
+    /// `automation_curve_line_width_px * 1.5` で cached curve を視覚的に上書きする。
+    pub automation_curve_bend_preview_color: Color,
     /// M14 Phase 63n-8 (#033): selected automation point の半径 (px)。 default 5.0 (= 通常 4.0 から +25%)。
     /// `automation_point_radius_px` より大きい値を期待 (= 視認性、 「selected の方が大きく / 明るく見える」 SSoT)。
     pub automation_point_radius_selected_px: f32,
@@ -1395,13 +1411,12 @@ impl ArrangementStyle {
             automation_lane_disabled_color: p.text_dim.with_alpha(0.65),
             automation_curve_line_width_px: 1.5,
             automation_point_radius_px: 4.0,
-            // M14 Phase 63n-9 (#033): tension/bend handle は暖色 (`selection_warm`。 lane.color と差別化して
-            // 「触ると curve param が変わる handle」 を明示)、 size は selection dot と同 4.0。
-            automation_curve_param_handle_radius_px: 4.0,
-            automation_curve_param_handle_fill: p.selection_warm,
-            automation_curve_param_handle_border: p.ink_on_bright,
-            automation_curve_param_handle_offset_px: 10.0,
-            automation_curve_param_preview_color: p.selection_warm,
+            // r.md #73: 線そのものを掴む当たり判定は 6px (point dot の 8px より小さいので
+            // 点の上では点が勝つ)。 hover 強調 / preview はどちらも暖色 (`selection_warm`。
+            // lane.color と差別化して「これは操作対象 / preview」 を明示)。
+            automation_curve_segment_hit_px: 6.0,
+            automation_curve_bend_hover_color: p.selection_warm,
+            automation_curve_bend_preview_color: p.selection_warm,
             // M14 Phase 63n-8 (#033): selected point は半径 +25% (= 通常 4 → 5)、 fill / border 共に
             // 明インクで「明らかに大きく / 明るく見える」 を実現 (daw_01 #033 §D 仕様)。
             // lane disabled でも色維持。
@@ -1823,33 +1838,41 @@ struct HeaderResizeDragSession {
     last_emitted_w: f32,
 }
 
-/// M14 Phase 63n-9 (#033): tension/bend handle drag session。 selected point の Bezier / Exponential
-/// 入射 segment 中央に出る 8x8 px 円を上下 drag → release で `SetAutomationCurveParam` 1 件発火。
-/// drag 中は internal preview state で curve を live update (cached 外で preview line overlay 描画)、
-/// release で final value を caller に送信。 anchor 固定 (`anchor_value` / `anchor_mouse_y` /
-/// `effective_lane_height_px`) で view scroll 耐性、 sensitivity は Q3=A の `effective_lane_height_px`
-/// drag で full range (`-1.0..=1.0`)、 Alt × 0.2 で微調整 (1 px ≈ `2.0 / lane_height` の value delta、
-/// alt = `0.4 / lane_height` で 5x 精細)。
+/// r.md #73: レーン本体の線 (= 2 点の間の区間) を Alt+ドラッグして曲げる session。
+///
+/// 掴んだ場所が指に付いてくるよう、感度定数ではなく **逆算** で curve を決める
+/// (`curve::solve_bend`)。逆算は区間の符号付き高さ `(b - a)` で割るので、
+/// 上り区間 / 下り区間で自動的に正しい符号の progress 値になる
+/// (保存する値は progress 基準なので、同じ画面ジェスチャが区間の向きで逆符号になる)。
+/// commit は release で 1 回だけ (undo 1 段)。
 #[derive(Clone, Copy, Debug)]
-struct AutomationCurveParamDragSession {
-    /// drag 対象 point identity (release commit に乗せる)。
-    point: AutomationPointKey,
-    /// `BezierTension` or `ExponentialBend` (drag 中 invariant、 press 時 curve から決定)。
-    kind: SetAutomationCurveParamKind,
-    /// drag 開始時の tension / bend 値 (`prev_value` の元、 sensitivity delta 計算の base)。
-    anchor_value: f32,
-    /// drag 開始時の cursor y (dy 計算の anchor)。
-    anchor_mouse_y: f32,
-    /// 最後に観測した cursor y (continuation で update、 release で final value 計算に使用)。
-    last_mouse_y: f32,
-    /// drag 中の最終 alt 状態 (× 0.2 sensitivity、 既存 drag session と同 race 回避 pattern)。
-    last_alt: bool,
-    /// drag 開始時の effective lane height (`max(lane.height_px, 40)`、 sensitivity の SSoT)。
-    /// caller が drag 中 lane.height_px を変えても sensitivity は drag 開始時値で固定。
-    effective_lane_height_px: f32,
-    /// drag 中の preview value (continuation で update、 overlay 描画 + release commit に使用)。
-    /// `-1.0..=1.0` clamp 済。 anchor と同値なら release で no-op (= click 相当)。
-    preview_value: f32,
+pub(super) struct AutomationSegmentBendSession {
+    /// 曲げる区間の **入射側** point (= `curve` 属性を持つ後ろの点)。
+    pub point: AutomationPointIdKey,
+    /// press 時に掴んだ位置の区間内進捗 `u ∈ (0, 1)`。drag 中不変
+    /// (横スクロール / ズームしても掴んだ場所が動かない)。
+    pub grab_u: f64,
+    /// 区間の始点値 / 終点値 (plain)。drag 中 model 不変なので anchor 固定。
+    pub a_plain: f64,
+    pub b_plain: f64,
+    /// press 時の curve (= release の no-op 判定に使う anchor)。
+    pub anchor_curve: common::model::AutomationCurve,
+    /// 逆算の基準になる curve。`anchor_curve` が Hold / Linear なら
+    /// `Exponential { bend: 0.0 }` (= 直線へ自動変換)、それ以外は `anchor_curve`。
+    pub start_curve: common::model::AutomationCurve,
+    /// press 時点の `apply_curve(a, b, grab_u, start_curve)` を norm に写した値。
+    /// 指の移動 px をここに足して目標値を作る (= 変換直後の線から相対で追従)。
+    /// **Hold 区間ではここで 1 度だけ線が飛ぶ** — `k ∈ [0.5, 2]` のどの
+    /// `Exponential` も `u<1` で値 `a` を通らないので連続解が存在しない。
+    pub anchor_value_norm: f32,
+    /// press 時点の clip 描画域 (norm ↔ y の anchor。view scroll 耐性)。
+    pub clip_rect_anchor: Rect,
+    pub anchor_mouse_y: f32,
+    /// 直近の cursor y (release frame は anchor と異なるときだけ更新 — 既存 pattern)。
+    pub last_mouse_y: f32,
+    /// drag 中の live curve (overlay 描画 + release commit の SSoT)。
+    /// `anchor_curve` と同値なら release で no-op。
+    pub preview_curve: common::model::AutomationCurve,
 }
 
 /// M14 Phase 63n-8 (#033): automation point の lasso (= 空き automation lane zone から drag による
@@ -1948,10 +1971,10 @@ pub(crate) struct ArrangementState {
     /// release で `SelectAutomationPoints { prev, next }` 1 件発火、 next は press 時の modifier で
     /// replace / union / XOR を分岐 (#033 Q2=A の zone 排他 lasso)。
     automation_lasso_drag: Option<AutomationLassoSession>,
-    /// M14 Phase 63n-9 (#033): selected point の Bezier/Exponential 入射 segment 中央 handle drag session。
-    /// release で `SetAutomationCurveParam { point, kind, prev_value, next_value }` 1 件発火、 drag 中は
-    /// preview_value を継続更新して curve を live preview (cached 外で overlay 描画)。
-    automation_curve_param_drag: Option<AutomationCurveParamDragSession>,
+    /// r.md #73: レーン本体の線を Alt+ドラッグして曲げる session。
+    /// release で `SetAutomationCurve { .., point_id, next }` 1 件発火、 drag 中は
+    /// `preview_curve` を毎フレーム逆算して live preview (cached 外で overlay 描画)。
+    automation_segment_bend: Option<AutomationSegmentBendSession>,
     /// M14 Phase 127 (daw_01 #105): Arranger section の Move/Resize/Duplicate/範囲作成 drag session
     /// (release で `MoveSection` / `ResizeSection` / `DuplicateSection` / `CreateSection` のいずれか
     /// 1 件発火、 短 drag の Move は `SetPlayheadBeat` (帯ジャンプ) に demote)。
@@ -2380,6 +2403,15 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h = h.wrapping_mul(PRIME);
             h ^= lane.label.len() as u64; // label の文字列内容変更は label.len() で簡易検知
             h = h.wrapping_mul(PRIME);
+            // r.md #73: 曲線の形は plain 空間で評価するので、同じ value_norm でも
+            // target / plugin_range が違えば別の形になる。 cache key に入れないと
+            // plugin param の range が後から埋まったときに古い形が残る。
+            h ^= daw_ui_core::hash_inputs(&lane.target);
+            h = h.wrapping_mul(PRIME);
+            h ^= daw_ui_core::hash_inputs(
+                lane.plugin_range.map(|(lo, hi)| (lo.to_bits(), hi.to_bits())),
+            );
+            h = h.wrapping_mul(PRIME);
             for ac in &lane.clips {
                 h ^= u64::from(ac.id);
                 h = h.wrapping_mul(PRIME);
@@ -2396,14 +2428,18 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
                     h = h.wrapping_mul(PRIME);
                     h ^= u64::from(p.value_norm.to_bits());
                     h = h.wrapping_mul(PRIME);
+                    // r.md #73: 曲線の形は plain 空間で評価するので、 clamp 済の
+                    // value_norm だけでは足りない (窓の外の値は端に飽和して区別できない)。
+                    h ^= p.value_plain.to_bits();
+                    h = h.wrapping_mul(PRIME);
                     let curve_code = match p.curve {
-                        ArrangementCurveKind::Hold => 0_u64,
-                        ArrangementCurveKind::Linear => 1,
-                        ArrangementCurveKind::Bezier { tension } => {
+                        common::model::AutomationCurve::Hold => 0_u64,
+                        common::model::AutomationCurve::Linear => 1,
+                        common::model::AutomationCurve::Bezier { tension } => {
                             // tension の bits を加味して 2_u64 + bits
                             2_u64 ^ u64::from(tension.to_bits())
                         }
-                        ArrangementCurveKind::Exponential { bend } => {
+                        common::model::AutomationCurve::Exponential { bend } => {
                             // M14 Phase 63n-7 (daw_01 #033): Exponential variant の bend bits を
                             // 3_u64 と XOR (discriminant 衝突を防ぐ、 Bezier と独立に変化検知)。
                             3_u64 ^ u64::from(bend.to_bits())
@@ -2429,3 +2465,10 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+// r.md #73: 曲線のテストは `tests.rs` に足さず、ここに分ける。 god file budget
+// (アーキテクチャ不変条件 9 / arch-lint チェック 6、3,000 行) — `tests.rs` は 2,591 行で、
+// 曲線テストを上り / 下りの 2 ケース化して回帰網を足すと到達する。
+// 「超えそうになったら切り出す」ではなく、**書き始める前に切り出した**。
+#[cfg(test)]
+mod tests_curve;
