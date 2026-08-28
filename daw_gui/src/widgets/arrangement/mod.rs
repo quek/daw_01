@@ -62,6 +62,24 @@ mod draw;
 use draw::*;
 mod geometry;
 use geometry::*;
+// r.md #77: `run.rs` (2,699 行 1 関数) をフェーズ軸で分割した兄弟モジュール群。
+// 子ファイルは `use super::*;` しか書かない流儀なので、 兄弟へ型を出すモジュールは
+// **glob re-export が必須** (既存の `use draw::*;` / `use geometry::*;` と同じ仕掛け)。
+// glob を足すのは「型を兄弟へ出すモジュール」だけ — `drag::RewindAxes` /
+// `header::HeaderClicks` / `render::HeavyInput` はモジュール内で閉じるので足さない
+// (足すと `unused_imports` が `-D warnings` で落ちる)。
+mod cursor;
+mod drag;
+mod frame;
+use frame::*;
+mod header;
+mod press;
+use press::*;
+mod press_header;
+mod press_lanes;
+mod rects;
+mod sessions;
+use sessions::*;
 mod render;
 mod release;
 mod run;

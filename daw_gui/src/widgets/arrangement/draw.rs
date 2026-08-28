@@ -42,9 +42,16 @@ pub(super) fn draw_lanes_bg<M: ?Sized + 'static>(
     // M14 Phase 63n-6 (#031): per-track row 高さ override 反映のため `visible_tops` (prefix sum) を
     // 受け取り、 row_y / row_h を per-track で算出する (= override 済 track の backdrop fill が正しく
     // 行高さに追従)。
-    let visible_indices = compute_visible_indices(tracks);
-    for (visible_i, &i) in visible_indices.iter().enumerate() {
-        let t = &tracks[i];
+    //
+    // r.md #77: 旧実装はここで `compute_visible_indices(tracks)` を呼び直していたが、
+    // 唯一の呼び出し元 (`render::dispatch`) が渡すのは **既に filter 済の
+    // `ArrangementFrame::visible_tracks`** なので、 この呼び出しは恒等
+    // (`compute_visible_indices(visible) == (0..visible.len())`) だった。
+    // 根拠: `visible_tracks` は `is_visible_track(t, full_tracks)` で filter 済で、
+    // 親チェーンの全 ancestor も同じ条件を満たすので `visible_tracks` 内に存在し、
+    // いずれも `collapsed == false`。 synthetic master は `parent_id == None` で即 true。
+    // 撤去で cached ブロック内の毎フレーム `Vec<usize>` 確保も消える。
+    for (visible_i, t) in tracks.iter().enumerate() {
         let row_y = visible_tops.get(visible_i).copied().unwrap_or(lanes.y);
         let row_h = effective_track_row_h(t, view.track_row_h);
         let row = Rect { x: lanes.x, y: row_y, w: lanes.w, h: row_h };
