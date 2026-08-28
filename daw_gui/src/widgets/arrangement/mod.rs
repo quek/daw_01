@@ -2411,3 +2411,8 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+// r.md #77 §9-A: 分割前後の等価性トランスクリプト (**一時**。分割完了後にこの 2 行と
+// `equivalence.rs` を削除する)。
+#[cfg(test)]
+mod equivalence;
