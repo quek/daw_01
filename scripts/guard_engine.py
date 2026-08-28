@@ -11,8 +11,9 @@ memory into such a hook required (a) hand-writing a bespoke check_*.ps1 AND
 (b) editing .claude/settings.json -- which the harness classifier BLOCKS (needs
 the human). That cost meant promotion almost never happened, so violations were
 "dismissed" in the backlog and recurred (see ahe_backlog bash-repeat-c52bab59:
-a cd-prefix was DETECTED as a recurrence of feedback_no_cd_prefix, but there was
-no path to make it an active guard, so it was dismissed -- and recurs).
+a recurring shell-hygiene slip was DETECTED as a repeat of an existing feedback
+memory, but there was no path to make it an active guard, so it was dismissed --
+and recurred).
 
 This engine is registered ONCE in settings.json. After that, adding/refining a
 guard is just APPENDING one JSON line to the registry -- no script, no settings
@@ -54,10 +55,10 @@ checkout's slug) -- nothing is hardcoded to one machine. Each rule:
     field     which tool_input to scan: "command" | "command_code" (shell literals
               masked) | "text" (Edit/Write/MultiEdit new content) | "file_path" |
               "ask_options" (AskUserQuestion question+option text) | "worktree_outside"
-              / "cd_redundant" / "ask_multi" (LOGIC fields computed in code, because
-              they are RELATIONS -- target vs session cwd, question count -- that no
-              single-field regex can express; the rule row supplies only action/msg.
-              See the cwd-aware block in main())
+              / "ask_multi" (LOGIC fields computed in code, because they are
+              RELATIONS -- edited path vs session worktree, question count -- that
+              no single-field regex can express; the rule row supplies only
+              action/msg. See the cwd-aware block in main())
     file_glob optional fnmatch glob (or list of globs) on tool_input.file_path
               (forward-slash normalized); rule skipped unless one of them matches
     all       list of regex; ALL must match the field text for the rule to fire
@@ -327,26 +328,6 @@ def main():
         if (fpl == repo_l or fpl.startswith(repo_l + "/")) and \
            not (fpl == wt_l or fpl.startswith(wt_l + "/")):
             worktree_outside = file_path_norm
-    # cd-prefix discipline: `cd <dir> && ...` where <dir> IS the session cwd is pure
-    # noise -- the Bash tool already runs there -- and from a worktree, cd'ing to the
-    # main checkout or a sibling worktree is the cross-agent contention hazard.
-    # A plain `cd /tmp` or `cd build/` is legitimate and must NOT fire, which is why
-    # this is a relational check in code and not a regex on "^cd ".
-    cd_redundant = ""
-    mcd = re.match(r"^\s*cd\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", command)
-    if mcd and cwd_norm:
-        target = (mcd.group(1) or mcd.group(2) or mcd.group(3) or "")
-        target = target.replace("\\", "/").rstrip("/").lower()
-        cwd_l = cwd_norm.rstrip("/").lower()
-        if target and target == cwd_l:
-            cd_redundant = target
-        elif target:
-            m2 = re.match(r"^(.*?)/\.claude/worktrees/[^/]+", cwd_l)
-            if m2:
-                repo_l, wt_l = m2.group(1), m2.group(0)
-                if (target == repo_l or target.startswith(repo_l + "/")) and \
-                   not (target == wt_l or target.startswith(wt_l + "/")):
-                    cd_redundant = target
     # AskUserQuestion batching: more than one question asked at once.
     _qs = tool_input.get("questions")
     ask_multi = "multi" if isinstance(_qs, list) and len([q for q in _qs if isinstance(q, dict)]) > 1 else ""
@@ -367,8 +348,6 @@ def main():
             text = file_path
         elif field == "worktree_outside":
             text = worktree_outside
-        elif field == "cd_redundant":
-            text = cd_redundant
         elif field == "ask_multi":
             text = ask_multi
         elif field == "ask_options":
