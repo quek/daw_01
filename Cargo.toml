@@ -145,6 +145,12 @@ elidable_lifetime_names = "allow"
 # 1 関数 1 役で書きやすくするため
 needless_pass_by_value = "allow"
 unreadable_literal = "allow"
+# 関数長ゲートの SSoT は scripts/loc_budget.py (make arch-lint の FN-BUDGET / FN-NESTING)。
+# clippy::too_many_lines は (a) [lints] workspace = true を opt-in している ui/crates の
+# 10 crate にしか掛からない非対称、(b) 文字列を見ないので raw string 中の // を誤分類する、
+# (c) 逃げ道が理由なしの #[allow] しかなく「恒久的に正当」と「既知の負債」を区別できない、
+# の 3 点で劣る。全 crate 共通の閾値 (実コード 300 行) + 理由付き baseline へ寄せる。r.md #76。
+too_many_lines = "allow"
 
 # 旧 gui_01 の profile。wgpu/glyphon は debug が遅すぎるので軽く最適化する。
 # profile は workspace 全体 (root のみ有効) なので daw_01 crate にも効く。

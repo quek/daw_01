@@ -215,6 +215,89 @@ fn carried_device_ids(app: &AppData, chain: &[ChainEntry], device_id: u64) -> Ve
     }
 }
 
+/// チェーン行の右端に並ぶボタン。
+enum ChainRowButton {
+    /// `GUI` / `Par` — プラグイン窓 (またはパラメータ欄) の開閉。
+    ToggleGui,
+    /// `x` — この device を外す。
+    Remove,
+}
+
+/// チェーン行のボタンが返す `Edit`。
+///
+/// `[[feedback_popup_click_leaks_to_background]]`: 右クリックメニューが開いている frame は
+/// **描くが発行しない** (項目 click が下の行のボタンを誤発火する)。判定は `Edit` の中で行う
+/// — メニューはこの行より後に描かれるので、ボタンを積む時点ではまだ確定していない。
+fn chain_row_edit(button: ChainRowButton, device_id: u64, popup_open: bool) -> Edit<AppData> {
+    Edit::mutate(move |app: &mut AppData| {
+        if popup_open {
+            return;
+        }
+        match button {
+            ChainRowButton::ToggleGui => app.handle_event(AppEvent::ToggleSlotGui { device_id }),
+            ChainRowButton::Remove => app.handle_event(AppEvent::RemoveDevices {
+                device_ids: vec![device_id],
+            }),
+        }
+    })
+}
+
+/// r.md #71 (プラグインのコピー / 移動): チェーン行の右クリックメニュー
+/// (`コピー / 切り取り / 貼り付け / 複製 / 削除`) 1 項目分の実行。
+///
+/// 対象集合は **項目を選んだときだけ**組む (毎フレーム全行分作ると無駄な確保になる。
+/// arrangement のトラックヘッダメニューが `target_ids()` を遅延させているのと同じ形)。
+/// `idx` は上のラベル配列と同順。
+fn apply_chain_menu_action(
+    app: &mut AppData,
+    idx: usize,
+    device_id: u64,
+    dest_track: Option<u32>,
+) {
+    let chain = app.inspector_chain();
+    let ids = carried_device_ids(app, &chain, device_id);
+    match idx {
+        0 => app.copy_devices(ids),
+        1 => app.cut_devices(ids),
+        // 貼り付け位置は「この device の直前」。 選択をこの device 1 本にしてから
+        // **Ctrl+V と同じ経路** を起こす (挿入位置の決定は `paste_devices` が選択から
+        // 引くので、規則も経路も 1 本のまま。 OS クリップボードの読み出しは shortcut
+        // layer が担うので、ここで二重に読まない)。
+        2 => {
+            app.set_device_selection(vec![device_id]);
+            app.ui_ephemeral.pending_shortcut_injections.push("paste");
+        }
+        // 複製 = 選んだ device の直後にコピーを挿す。
+        3 => duplicate_devices_after(app, ids, device_id, dest_track),
+        _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
+    }
+}
+
+/// `device_id` の直後に `ids` のコピーを挿す (チェーン行メニューの「複製」)。
+fn duplicate_devices_after(
+    app: &mut AppData,
+    ids: Vec<u64>,
+    device_id: u64,
+    dest_track: Option<u32>,
+) {
+    let Some(dest_track) = dest_track else { return };
+    let Some(dest_index) = app
+        .song_doc
+        .song()
+        .fx_chain_by_track_id(dest_track)
+        .and_then(|c| c.iter().position(|d| d.id == device_id))
+        .map(|i| i as u32 + 1)
+    else {
+        return;
+    };
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: ids,
+        dest_track,
+        dest_index,
+        copy: true,
+    }));
+}
+
 // ---- Sidechain セクションの行レイアウト (高さ予約と描画の SSoT) ----------
 /// 1 行目 = プラグイン名 (行幅いっぱい)。
 const SC_NAME_H: f32 = 14.0;
@@ -1192,23 +1275,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     11.0,
                     if failed { p.text_error } else { p.text },
                 );
-                // `[[feedback_popup_click_leaks_to_background]]`: 右クリックメニューが
-                // 開いている frame は **描くが発行しない** (項目 click が下の行の
-                // ボタンを誤発火する)。
+                // 右クリックメニューが開いている frame の抑止は `chain_row_edit` が担う。
                 if entry.shows_button() {
                     let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
                     ui.button_at(
                         ("inspector_row_gui", idx),
                         label,
                         Rect { x: gui_x, y: row_rect.y + 2.0, w: btn_gui_w, h: row_rect.h - 4.0 },
-                        move || {
-                            Edit::mutate(move |app: &mut AppData| {
-                                if popup_open {
-                                    return;
-                                }
-                                app.handle_event(AppEvent::ToggleSlotGui { device_id });
-                            })
-                        },
+                        move || chain_row_edit(ChainRowButton::ToggleGui, device_id, popup_open),
                     );
                 }
                 let xb_x = row_rect.x + row_rect.w - btn_x_w;
@@ -1216,16 +1290,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     ("inspector_row_remove", idx),
                     "x",
                     Rect { x: xb_x, y: row_rect.y + 2.0, w: btn_x_w, h: row_rect.h - 4.0 },
-                    move || {
-                        Edit::mutate(move |app: &mut AppData| {
-                            if popup_open {
-                                return;
-                            }
-                            app.handle_event(AppEvent::RemoveDevices {
-                                device_ids: vec![device_id],
-                            });
-                        })
-                    },
+                    move || chain_row_edit(ChainRowButton::Remove, device_id, popup_open),
                 );
             },
             |i| {
@@ -1306,45 +1371,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 *row_rect,
                 &["コピー", "切り取り", "貼り付け", "複製", "削除"],
                 move |idx, ui| {
-                    // 対象集合は **項目を選んだときだけ**組む (毎フレーム全行分
-                    // 作ると無駄な確保になる。 arrangement のトラックヘッダ
-                    // メニューが `target_ids()` を遅延させているのと同じ形)。
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        let chain = app.inspector_chain();
-                        let ids = carried_device_ids(app, &chain, device_id);
-                        match idx {
-                            0 => app.copy_devices(ids),
-                            1 => app.cut_devices(ids),
-                            2 => {
-                                // 貼り付け位置は「この device の直前」。 選択をこの
-                                // device 1 本にしてから **Ctrl+V と同じ経路** を起こす
-                                // (挿入位置の決定は `paste_devices` が選択から引くので、
-                                // 規則も経路も 1 本のまま。 OS クリップボードの読み出しは
-                                // shortcut layer が担うので、ここで二重に読まない)。
-                                app.set_device_selection(vec![device_id]);
-                                app.ui_ephemeral.pending_shortcut_injections.push("paste");
-                            }
-                            3 => {
-                                // 複製 = 選んだ device の直後にコピーを挿す。
-                                let Some(dest_track) = dest_track else { return };
-                                let Some(dest_index) = app
-                                    .song_doc
-                                    .song()
-                                    .fx_chain_by_track_id(dest_track)
-                                    .and_then(|c| c.iter().position(|d| d.id == device_id))
-                                    .map(|i| i as u32 + 1)
-                                else {
-                                    return;
-                                };
-                                app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
-                                    device_ids: ids,
-                                    dest_track,
-                                    dest_index,
-                                    copy: true,
-                                }));
-                            }
-                            _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
-                        }
+                        apply_chain_menu_action(app, idx, device_id, dest_track);
                     }));
                 },
             );

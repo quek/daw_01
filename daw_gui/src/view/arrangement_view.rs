@@ -55,6 +55,63 @@ fn snap_toggle_style(theme: &Theme) -> ToggleButtonStyle {
     }
 }
 
+/// r.md #71 (プラグインのコピー / 移動): チェーンから掴んだプラグインをトラック
+/// ヘッダの上に持っていくと、 インスペクタの表示をそのトラックのチェーンへ
+/// 切り替える (= 運び先が見える)。 切り替えのトリガは **アレンジのトラック
+/// ヘッダだけ** (ミキサーのストリップでは切り替えない)。 ヘッダの上で離したら
+/// そのトラックのチェーン末尾に入れる。 master 行も `track_header_rects` に
+/// 入るので、 master へのドロップは追加コードなしで成立する。
+///
+/// widget 側 (`arrangement/header.rs::commit_clicks`) は同じ release frame で
+/// 「ヘッダの click」 の発行を抑止している (`dragging_kind().is_some()`)。
+/// 抑止しないと Ctrl+drop が Toggle 選択として解決され、 落とし先の選択が反転する。
+fn device_drag_over_headers(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    resp: &crate::widgets::arrangement::ArrangementResponse,
+) {
+    if ui.dragging_kind() != Some(crate::app::DEVICE_DRAG_KIND) {
+        return;
+    }
+    let Some((px, py)) = ui.pointer().pos else { return };
+    let Some(&(hover_track, _)) = resp
+        .track_header_rects
+        .iter()
+        .find(|(_, r)| r.contains(px, py))
+    else {
+        return;
+    };
+    if !ui.pointer().primary_just_released {
+        // ドラッグ中: 表示だけ運び先へ切り替える (選択タグは動かさない)。
+        if app.cursor_track_id() != Some(hover_track) {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.focus_inspector_track(hover_track);
+            }));
+        }
+        return;
+    }
+    // 落とした。 修飾キーは payload が持つ「押されていた最後のフレーム」の値 (D-2)。
+    let copy = ui.drag_modifiers().is_some_and(|m| m.ctrl);
+    let Some(payload) =
+        ui.take_drag_payload::<crate::app::DeviceDragPayload>(crate::app::DEVICE_DRAG_KIND)
+    else {
+        return;
+    };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        let dest_index = app
+            .song_doc
+            .song()
+            .fx_chain_by_track_id(hover_track)
+            .map_or(0, <[_]>::len) as u32;
+        app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
+            device_ids: payload.device_ids.clone(),
+            dest_track: hover_track,
+            dest_index,
+            copy,
+        }));
+    }));
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let p = &app.theme.core;
     // 上部 24 px を Snap toolbar に。残りを arrangement widget に渡す。
@@ -562,45 +619,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // r.md #71 (プラグインのコピー / 移動): チェーンから掴んだプラグインをトラック
-    // ヘッダの上に持っていくと、 インスペクタの表示をそのトラックのチェーンへ
-    // 切り替える (= 運び先が見える)。 切り替えのトリガは **アレンジのトラック
-    // ヘッダだけ** (ミキサーのストリップでは切り替えない)。 ヘッダの上で離したら
-    // そのトラックのチェーン末尾に入れる。 master 行も `track_header_rects` に
-    // 入るので、 master へのドロップは追加コードなしで成立する。
-    if ui.dragging_kind() == Some(crate::app::DEVICE_DRAG_KIND)
-        && let Some((px, py)) = ui.pointer().pos
-        && let Some(&(hover_track, _)) = resp
-            .track_header_rects
-            .iter()
-            .find(|(_, r)| r.contains(px, py))
-    {
-        if ui.pointer().primary_just_released {
-            // 修飾キーは payload が持つ「押されていた最後のフレーム」の値 (D-2)。
-            let copy = ui.drag_modifiers().is_some_and(|m| m.ctrl);
-            if let Some(p) =
-                ui.take_drag_payload::<crate::app::DeviceDragPayload>(crate::app::DEVICE_DRAG_KIND)
-            {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let dest_index = app
-                        .song_doc
-                        .song()
-                        .fx_chain_by_track_id(hover_track)
-                        .map_or(0, <[_]>::len) as u32;
-                    app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
-                        device_ids: p.device_ids.clone(),
-                        dest_track: hover_track,
-                        dest_index,
-                        copy,
-                    }));
-                }));
-            }
-        } else if app.cursor_track_id() != Some(hover_track) {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.focus_inspector_track(hover_track);
-            }));
-        }
-    }
+    device_drag_over_headers(app, ui, &resp);
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
     // widget は track_header_rects の収集までを担い、 メニュー項目の発行は view 側。

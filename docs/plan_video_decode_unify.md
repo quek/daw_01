@@ -88,7 +88,7 @@ RGB 変換も省ける。**同じテクスチャシンクの背後の最適化**
 
 ## モジュール構成 (as-built)
 
-MF 中核を削った後は各ファイルが god-file budget (3,000 行) に十分収まるため、`video/`
+MF 中核を削った後は各ファイルがサイズ budget (実コード 1,000 行) に十分収まるため、`video/`
 ディレクトリへの再編は行わず **既存ファイルを in-place で slim 化** した (churn / risk 最小化。
 アーキテクチャの理想 = libav 一本・MF 撤去は達成済みで、ディレクトリ分割は cosmetic なため):
 
@@ -128,7 +128,9 @@ audio engine が別デッドラインを持つ。「8〜20× 実時間」は 108
 - **#6 live と export は同じ render**: むしろ強化 — デコードも single engine で SSoT 化。
 - **#8 daw-ui core はドメイン知識を持たない**: renderer は「BGRA 矩形を upload」だけ残す。D3D11/MF/
   backend 分岐を削除するので invariant がより綺麗になる。
-- **#9 god-file budget**: `video/` 分割で全ファイル 3,000 行以内。現 `video_playback.rs` 1,946 行は解体。
+- **#9 サイズ budget**: `video/` 分割で全ファイル実コード 1,000 行以内。
+  `video_playback.rs` (計画時 物理 1,946 行) は解体 — as-built では物理 892 行 /
+  **実コード 284 行** (r.md #76 の `python scripts/loc_budget.py --report` で実測)。
 - **RT 境界**: 全経路は GUI worker / export loop 上。audio RT スレッドは動画に触れない。BGRA scratch は
   再利用 (現 `libav_decoder.rs` の pattern) で hot loop の `Vec::new()` 無し。
 

@@ -101,6 +101,54 @@ pub fn compute_reorder_target_index(
     }
 }
 
+/// content 空間の `local_y` にある **base row** の index (展開領域に落ちたら `None`)。
+///
+/// press の当たり判定に使う。 `tops` は展開高込みの実表示レイアウトなので、
+/// アコーディオンが開いていても行と判定がずれない。 展開領域 (`row_height` から
+/// 次の `tops` まで) を弾くのが要点で、 そこを押しても drag は始めない
+/// (中の widget が入力を消費する)。
+fn row_at_local_y(local_y: f32, tops: &[f32], row_height: f32, item_count: usize) -> Option<usize> {
+    if local_y < 0.0 {
+        return None;
+    }
+    (0..item_count).find(|&i| local_y >= tops[i] && local_y < tops[i] + row_height)
+}
+
+/// **内部 reorder** の drop indicator を引く content-y (`None` = 引かない)。
+///
+/// drag 中で移動量が threshold を超え、かつ挿入先が anchor と違うときだけ出す。
+/// `compute_reorder_target_index` は「anchor 抜き取り後」の index を返すので、
+/// 表示上の線の位置へ戻す 1 段の写像が要る:
+///   `target <= anchor` → `row[target]` の上端 /
+///   `target >  anchor` → `row[target+1]` の上端 (= 抜き取り後の次行の上)。
+/// drag 中は全展開が畳まれて uniform 行高なので、`row_total_h` 掛け算でよい。
+fn internal_drop_indicator_top(
+    session: Option<ReorderSession>,
+    row_total_h: f32,
+    item_count: usize,
+    header_top: f32,
+    scroll_y: f32,
+) -> Option<f32> {
+    let s = session?;
+    if (s.last_mouse_y - s.anchor_mouse_y).abs() < DRAG_THRESHOLD_PX || item_count == 0 {
+        return None;
+    }
+    let target = compute_reorder_target_index(
+        s.anchor_index,
+        s.last_mouse_y,
+        header_top,
+        scroll_y,
+        row_total_h,
+        item_count,
+    );
+    if target == s.anchor_index {
+        return None;
+    }
+    let target_visual = if target > s.anchor_index { target + 1 } else { target };
+    #[allow(clippy::cast_precision_loss)]
+    Some((target_visual as f32) * row_total_h)
+}
+
 /// `scroll_area` 内部の scrollbar 幅 (`scroll_area::SCROLLBAR_W` のミラー、row 幅から差し引くため)。
 const SCROLLBAR_W: f32 = 10.0;
 
@@ -377,31 +425,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // thumb ドラッグが Reorder Edit を併発する (list_view と同基準、 review)。
             && px < rect.x + row_visible_w
             && row_total_h > 0.0
+            // drag_handle_w == 0 は行全体が掴める (Bitwig 風)、> 0 は左端 N px だけ
+            // (Logic / Cubase 風グリップ)。
+            && (style.drag_handle_w <= 0.0 || (px - rect.x) <= style.drag_handle_w)
+            && let Some(idx) = row_at_local_y(
+                py - rect.y + self.scroll_offset(("reorderable_list_scroll", &id)).1,
+                &tops,
+                style.row_height,
+                item_count,
+            )
         {
-            let in_handle = if style.drag_handle_w <= 0.0 {
-                true
-            } else {
-                (px - rect.x) <= style.drag_handle_w
-            };
-            if in_handle {
-                let scroll_y = self.scroll_offset(("reorderable_list_scroll", &id)).1;
-                let local = py - rect.y + scroll_y;
-                if local >= 0.0 {
-                    let hit = (0..item_count).find(|&i| {
-                        local >= tops[i] && local < tops[i] + style.row_height
-                    });
-                    if let Some(idx) = hit {
-                        let press_modifiers = pointer.modifiers;
-                        let state: &mut ReorderableListState = self.widget_state(wid);
-                        state.session = Some(ReorderSession {
-                            anchor_index: idx,
-                            anchor_mouse_y: py,
-                            last_mouse_y: py,
-                            press_modifiers,
-                        });
-                    }
-                }
-            }
+            let press_modifiers = pointer.modifiers;
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            state.session = Some(ReorderSession {
+                anchor_index: idx,
+                anchor_mouse_y: py,
+                last_mouse_y: py,
+                press_modifiers,
+            });
         }
 
         // ---- drag continue: 毎フレーム last_mouse_y を更新 ----
@@ -628,15 +669,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
 
-                // ---- 外部 drag の drop indicator ----
-                // 内部 session と外部 drag は同時に成立しない (session がある間は
-                // `dragging_kind()` が None) ので分岐は排他。 位置は展開高込みの
-                // 実表示レイアウト (`tops_for_draw`) 基準。
-                if let Some(at) = external_insert_at {
-                    let top = tops_for_draw.get(at).copied().unwrap_or(content_h);
-                    let indicator_y =
-                        rect.y - offset.1 + top - style_copy.drop_indicator_h * 0.5;
-                    let y_clamped = indicator_y
+                // ---- drop indicator ----
+                // 内部 session と外部 drag は **同時に成立しない** (session がある間は
+                // `dragging_kind()` が None) ので、 挿入位置の content-y を先に 1 本へ
+                // 畳んでから 1 回だけ描く。
+                let indicator_top = if let Some(at) = external_insert_at {
+                    // 外部 drag: 展開高込みの実表示レイアウト (`tops_for_draw`) 基準。
+                    Some(tops_for_draw.get(at).copied().unwrap_or(content_h))
+                } else {
+                    internal_drop_indicator_top(
+                        session_for_overlay,
+                        row_total_h,
+                        item_count_copy,
+                        rect.y,
+                        offset.1,
+                    )
+                };
+                if let Some(top) = indicator_top {
+                    // viewport 内 clamp (上下端で indicator がはみ出さないように)。
+                    let y_clamped = (rect.y - offset.1 + top - style_copy.drop_indicator_h * 0.5)
                         .max(rect.y)
                         .min(rect.y + rect.h - style_copy.drop_indicator_h);
                     ui.push_rect(RectCommand {
@@ -652,48 +703,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         radius: [0.0; 4],
                         clip_rect: None,
                     });
-                }
-
-                // ---- drop indicator: drag 中で dy >= threshold なら描画 ----
-                if let Some(s) = session_for_overlay {
-                    let dy = (s.last_mouse_y - s.anchor_mouse_y).abs();
-                    if dy >= DRAG_THRESHOLD_PX && item_count_copy > 0 {
-                        let target = compute_reorder_target_index(
-                            s.anchor_index,
-                            s.last_mouse_y,
-                            rect.y,
-                            offset.1,
-                            row_total_h,
-                            item_count_copy,
-                        );
-                        if target != s.anchor_index {
-                            // anchor 抜き取り後の挿入位置 → 表示上の line 位置:
-                            //   target <= anchor → row[target] の上端
-                            //   target >  anchor → row[target+1] の上端 (= row[target] 抜き取り後の次行の上)
-                            let target_visual = if target > s.anchor_index { target + 1 } else { target };
-                            #[allow(clippy::cast_precision_loss)]
-                            let indicator_y = rect.y - offset.1
-                                + (target_visual as f32) * row_total_h
-                                - style_copy.drop_indicator_h * 0.5;
-                            // viewport 内 clamp (上下端で indicator がはみ出さないように)
-                            let y_clamped = indicator_y
-                                .max(rect.y)
-                                .min(rect.y + rect.h - style_copy.drop_indicator_h);
-                            ui.push_rect(RectCommand {
-                                rect: Rect {
-                                    x: rect.x,
-                                    y: y_clamped,
-                                    w: row_visible_w,
-                                    h: style_copy.drop_indicator_h,
-                                },
-                                fill: style_copy.drop_indicator_color,
-                                border: Color::TRANSPARENT,
-                                border_width: 0.0,
-                                radius: [0.0; 4],
-                                clip_rect: None,
-                            });
-                        }
-                    }
                 }
             },
         );

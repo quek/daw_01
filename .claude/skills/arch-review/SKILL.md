@@ -2,13 +2,13 @@
 name: arch-review
 description: |
   コードベース全体のアーキテクチャ監査。サブシステム別の並列分析 agent (6 レンズ) +
-  arch-lint 機械検査 + god file budget で、構造問題 (SSoT 違反 / positional addressing /
+  arch-lint 機械検査 + サイズ budget (実コード行 / 関数長 / ネスト) で、構造問題 (SSoT 違反 / positional addressing /
   レイヤ違反 / god module / 同期経路の増殖 / RT 境界リスク) を洗い出し、優先度付き
   レポートを出す。「アーキテクチャレビュー」「構造的な問題を探して」「arch review」
   「定期監査」等で発動。大機能の landing 後・四半期ごとの実行を想定。分析のみ行い、
   コードの修正はしない (修正はレポートを受けてユーザーが指示する)。
 argument-hint: "[重点サブシステム (省略可: 全体)]"
-allowed-tools: Read, Grep, Glob, Bash(bash scripts/arch_lint.sh*), Bash(git log *), Bash(git diff *), Bash(find *), Bash(wc *), Agent
+allowed-tools: Read, Grep, Glob, Bash(bash scripts/arch_lint.sh*), Bash(git log *), Bash(git diff *), Bash(python *), Bash(python3 *), Agent
 ---
 
 # アーキテクチャ監査 (daw_01)
@@ -27,11 +27,14 @@ bash scripts/arch_lint.sh
 ```
 
 違反があればそれ自体がレポートの先頭項目 (不変条件からの逸脱 = 最優先)。
-加えて god file budget の推移を測る:
+加えてサイズ budget (実コード行 / 関数長 / ネスト) の推移を測る:
 
 ```bash
-find common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates -name '*.rs' -not -path '*/target/*' -not -name 'binding_ffmpeg*' -not -name 'bindings.rs' | xargs wc -l | sort -rn | head -20
+python scripts/loc_budget.py --report
 ```
+
+`wc -l` で測らないこと。物理行はテスト module と doc comment を課金してしまい、
+「テストを厚くすると分割を迫られる」逆インセンティブになる (r.md #76)。
 
 ### 2. 並列サブシステム分析 (6 レンズ)
 

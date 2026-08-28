@@ -313,18 +313,9 @@ impl AppData {
             if !track.is_voicevox_vocal() {
                 continue;
             }
-            // 単一デバイスチェーン: builtin VOICEVOX を chain 内に持つ device の
-            // 安定 id を引く (`loaded_devices` に居ること = load 完了確認込み)。
-            let Some(host_plugin_id) = track
-                .devices
-                .iter()
-                .find(|d| {
-                    d.format == PluginFormat::Builtin
-                        && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-                })
-                .map(|d| d.id)
-                .filter(|id| self.ipc.loaded_devices.contains_key(id))
-            else {
+            // builtin VOICEVOX を chain 内に持つ device の安定 id
+            // (`loaded_devices` に居ること = load 完了確認込み)。
+            let Some(host_plugin_id) = self.voicevox_plugin_id_for_track(track) else {
                 continue;
             };
 

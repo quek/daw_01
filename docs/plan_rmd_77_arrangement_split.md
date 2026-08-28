@@ -46,10 +46,12 @@
 - **ドラッグを離した瞬間の「最後の 1px」判定規則そのものの統一。** 現行は対象ごとに 4 通りに割れている
   (§6-E2)。**判定を「どの軸を見るか」を引数にした 1 つの関数へまとめる**が、**どの対象がどの軸を見るかは
   1 つも変えない**。規則自体の統一はユーザーに見える挙動が変わるので別件。
-- **`daw_gui/src/widgets/piano_roll/run.rs` (2,177 行 / `piano_roll` 関数本体 ≈1,868 行) の分割。**
-  今回は触らない。r.md #76 で関数長の機械検査が入った場合は
-  `scripts/arch_lint_baseline.txt` に「r.md #77 と同型の分割が別途必要。#77 で確立した
-  `ArrangementFrame` idiom を適用する」という理由つきで 1 行登録する (件数 baseline にはしない)。
+- **`daw_gui/src/widgets/piano_roll/run.rs` (物理 2,177 行 / 実コード 1,633 行、
+  `piano_roll` 関数本体は実コード 1,389 行) の分割。**
+  今回は触らない。**r.md #76 で関数長の機械検査は既に入っており** (2026-08-28)、
+  `scripts/arch_lint_baseline.txt` には `FILE-BUDGET | …/piano_roll/run.rs | 1633` /
+  `FN-BUDGET | …::piano_roll | 1389` / `FN-NESTING | …::piano_roll | 9/296` が
+  「r.md #77 系の分割で解消」の理由つきで **登録済み**。#77 側で新規登録する作業は無い。
 - `release.rs` が抱えている wheel / double-click / secondary-click / marquee の切り出し。
   今回は `commit_releases` の**署名だけ**縮める。
 - 性能を目的とした変更。描画結果が変わる最適化 (カリング条件・cache key の材料変更) は入れない。
@@ -287,8 +289,44 @@ caller 責務 / 旧設計が popup anchor を 1 フレームで壊した理由 /
 `response.automation_point_rects` を毎フレーム返し、caller が anchor を毎フレーム呼ぶ」という
 `rects.rs` の存在理由そのものだから。§6-A と同じく**非局所的な理由を書いた記録は 1 行も落とさない**。
 
-全ファイルが god file budget (`scripts/arch_lint.sh:284-290` のチェック 6、3,000 行) の内側。
-`scripts/arch_lint_baseline.txt` に arrangement 関連のエントリは 0 件なので新規追記も不要。
+全ファイルがサイズ budget (実コード 1,000 行 / 関数 300 行 / インデント 6 段。
+`scripts/loc_budget.py`) の内側であることを、分割後に
+`python scripts/loc_budget.py --report` で確認する。
+**上表の分割後サイズ見積り (`render.rs` ~1,060 等) は物理行なので、新指標での値は未検証**。
+特に `render.rs` は現在 物理 861 行 / **ファイルの実コード 721 行**
+(そのうち `render_arrangement_heavy` 1 関数が 681 行) で、あと 279 行しか余裕が無いまま
+`FILE-BUDGET` の baseline に**載っていない**。`run.rs` から 244 行 (`:1851-2094`) を
+受け取ると **新規違反になり得る**。分割後に `--report` で確認し、超えるなら分割単位を切り直す。
+
+`scripts/arch_lint_baseline.txt` には arrangement 関連の `FILE-BUDGET` / `FN-BUDGET` /
+`FN-NESTING` が登録済み (r.md #76、2026-08-28)。内訳は `FILE-BUDGET` × 4
+(`run.rs` 1946 / `draw.rs` 1565 / `geometry.rs` 1435 / `mod.rs` 1249)、`FN-BUDGET` × 3
+(`run.rs::arrangement` 1944 / `release.rs::commit_releases` 962 /
+`render.rs::render_arrangement_heavy` 681)、`FN-NESTING` × 10
+(上の 3 本 + `view_build.rs::build` 10/67 + `build_arrangement_lanes_from_slice` /
+`geometry.rs::automation_point_at` / `collect_points_in_rect` /
+`content_build.rs::build_one` / `geometry.rs::find_curve_param_handle_at` /
+`mod.rs::fold_arrangement_clip_hash`)。
+分割で消えた行は「解消」として通知されるので削除し、残った関数の天井は実測値に更新する。
+新しく生えたファイル / 関数が違反するなら、**分割単位を切り直す** (baseline を増やして
+着地させない)。
+
+> **着地後の実測 (2026-08-28、#76 を #77 の上に統合した時点)**:
+> - 解消 3 件 — `FILE-BUDGET run.rs` (1946 → **19**) / `FN-BUDGET run.rs::arrangement`
+>   (1944) / `FN-NESTING run.rs::arrangement` (11/520)。
+> - `render.rs` は **上の懸念どおりにはならなかった** — 実コード 721 → **746** で
+>   budget 1,000 の内側。`render_arrangement_heavy` も 681 → **627**、
+>   ネストは 12/399 → **10/220** と大きく改善した。
+> - 一方で **2 件が太った**: `arrangement/mod.rs` 1249 → **1261** (兄弟モジュール宣言と
+>   glob re-export の 18 物理行。分割の必然)、`release.rs::commit_releases` 962 → **996**
+>   で `release.rs` が 977 → **1003** と新たに budget を超えた。原因は §0 の
+>   「`commit_releases` の**署名だけ**縮める」というスコープで、33 引数を 4 引数へ畳んだ
+>   代わりに本体先頭へ旧引数名を束ね直す 33 行が入ったこと。**署名の複雑度は下がったが
+>   実コード行は増えた**ので、wheel / double-click / secondary-click / marquee の切り出し
+>   (同じく §0 でスコープ外とした項目) が残件として残る。
+> - 切り出された `press_header.rs::lane_header` (7/14) と `rects.rs::push_point_rects`
+>   (7/10) が FN-NESTING に新規登録。どちらも元は `arrangement()` の中で 11 段だった
+>   部分なので、**7 段は改善の途中経過**。
 
 ### この計画で編集するファイル (完全な一覧)
 
@@ -1637,8 +1675,10 @@ cargo test -p daw_gui --lib arrangement::equivalence
 - `common` の protocol 型・bincode derive・`common/build.rs` の `WIRE_SOURCES`・shmem に触れない
   → 子 exe (`daw_audio` / `daw_plugin_host`) の再ビルドは不要。
 - オーディオコールバック / CLAP `process()` のパスに触れない → RT 制約 (ヒープ確保 / ロック / I/O) は無関係。
-- `make arch-lint` の 8 チェックはいずれも無関係。god file budget は全ファイルが 3,000 行以内に
-  収まる方向にしか動かない。`scripts/arch_lint_baseline.txt` に arrangement 関連は 0 件。
+- `make arch-lint` の 12 チェックのうち `FILE-BUDGET` / `FN-BUDGET` / `FN-NESTING` が
+  **直接関係する** (r.md #76 で指標が実コード行 + 関数長 + ネストへ入れ替わった)。
+  分割は違反を減らす方向に動くが、**受け取り側 (`render.rs`) が新たに閾値を超えないこと**を
+  `python scripts/loc_budget.py --report` で確認する。
 - 安定 id addressing: `ArrangementFrame` は positional index を新たに導入しない。
   `visible_tracks` の index は**このフレームの描画順**として既存コードが使っているもので、
   プロセス境界・イベント・永続参照には出ない (clip / lane / point / section はすべて安定 id で
@@ -1760,10 +1800,13 @@ cargo test -p daw_gui --lib arrangement::equivalence
 - `ui/crates/ui/src/ui.rs:2588` — `Ui::widget_state` (`&mut Ui` を占有)
 - `docs/plan_arch_refactor.md:399-403` — S4b の宣言「4,600 行関数を interaction 単位に分解」
 - `docs/plan_arch_refactor.md:419-` — S4b/c は build/test green に加え実機 sign-off が完了判定
-- `scripts/arch_lint.sh:284-290` — god file budget 3,000 行
+- `scripts/loc_budget.py` — サイズ budget (実コード 1,000 行 / 関数 300 行 / インデント 6 段)。
+  `arch_lint.sh` の check 6-10 がこれを呼ぶ
 - `Makefile:168-169` — `cargo clippy --workspace --all-targets -- -D warnings`
 - `Cargo.toml:124-125` — 「daw_01 既存 crate は `[lints]` を opt-in しないので pedantic は
-  適用されない」(= `too_many_lines` は最初から無効、`too_many_arguments` は complexity で有効)
+  適用されない」(= `too_many_lines` は最初から無効、`too_many_arguments` は complexity で有効)。
+  なお r.md #76 で `[workspace.lints.clippy] too_many_lines = "allow"` を足し、
+  関数長ゲートは `scripts/loc_budget.py` に一本化済み (ui/crates だけ閾値 100 が効く非対称を解消)
 
 ---
 
