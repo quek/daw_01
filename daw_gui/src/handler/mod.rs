@@ -8,6 +8,7 @@ pub mod automation_lanes;
 pub mod bounce;
 pub mod clip_events;
 pub mod clips;
+pub mod device_relocate;
 pub mod devices;
 pub mod export;
 pub mod glue;

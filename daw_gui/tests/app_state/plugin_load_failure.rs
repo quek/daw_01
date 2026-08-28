@@ -52,8 +52,8 @@ fn load_failure_releases_single_pending_and_flushes_play() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::SetSlotPlugin { device_id, track_id: t, .. }
-            if *device_id == synth_dev && *t == track_id
+            PluginCommand::SetSlotPlugin { device_id, .. }
+            if *device_id == synth_dev
         )),
         "SetSlotPlugin should be sent: {plugin_msgs:?}"
     );
@@ -240,8 +240,7 @@ fn failed_load_is_visible_in_chain_and_reload_retries() {
 
     // 再読込 → SetSlotPlugin が再送され、pending に戻り、「未ロード」表示は畳まれる。
     app.handle_event(AppEvent::ReloadDevice {
-        track_id,
-        device_index: 0,
+        device_id: synth_dev,
     });
     let msgs = drain(&mut plugin_rx);
     assert!(

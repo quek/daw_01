@@ -107,10 +107,10 @@ impl AppData {
             match tp.target {
                 AutomationTarget::PluginParam { device_id, param_id, .. } => {
                     return Some(BindingTarget::PluginParam {
-                        track: tp.track_id,
                         device_id,
                         param_id,
                         legacy_device_index: None,
+                        legacy_track: None,
                     });
                 }
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => {
@@ -205,35 +205,29 @@ impl AppData {
                 // (旧 pending_host_sync coalesce を epoch 一本化で置換)。
             }
             common::model::BindingTarget::PluginParam {
-                track,
                 device_id,
                 param_id,
                 ..
             } => {
                 // B2 (r.md #8): CC → plugin param。 param range で CC 0..1 を実
                 // value_real (min..max) に変換し、 inspector knob と同じ lane-
-                // default 経路 (`set_plugin_param_on_track`) で更新 → host へ再
+                // default 経路 (`set_plugin_param`) で更新 → host へ再
                 // sync して音に反映。 range 未取得 (host が PluginParamList 未送)
                 // は 0..1 を plain とみなす best-effort。
-                // v29: binding は安定 device_id を持つ。 現在位置 (track /
-                // index) へは逆引きで繋ぐ (device 削除済みなら無視)。
-                let Some((resolved_track, device_index)) =
-                    find_device_by_id(self.song_doc.song(), device_id)
-                else {
-                    return;
-                };
-                let _ = track;
+                // r.md #71 (プラグインのコピー / 移動): binding も param range も
+                // 安定 device_id でアドレスするので、 ここに座標の逆引きは無い
+                // (device が消えていれば `set_plugin_param` 側で早期 return)。
                 let target = common::model::AutomationTarget::PluginParam {
                     device_id,
                     param_id,
                     legacy_device_index: None,
                 };
-                let value_real = match self.plugin_param_range(resolved_track, &target) {
+                let value_real = match self.plugin_param_range(&target) {
                     Some((min, max)) => min + f64::from(v_norm) * (max - min),
                     None => f64::from(v_norm),
                 };
-                self.set_plugin_param_on_track(resolved_track, device_index, param_id, value_real);
-                // set_plugin_param_on_track が edit_song で epoch を bump するので、
+                self.set_plugin_param(device_id, param_id, value_real);
+                // set_plugin_param が edit_song で epoch を bump するので、
                 // 毎 CC の full LoadSong flood は runner の frame flush (flush_song_sync)
                 // が 1 frame 1 回へ構造的に coalesce する (旧 pending_host_sync 置換)。
             }

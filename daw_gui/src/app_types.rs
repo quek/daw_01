@@ -1,22 +1,31 @@
 //! app.rs から分割した補助 type / free fn / const 群 (view-model / inspector
 //! summary / IPC bookkeeping / pure helper)。 挙動は元と同一、 可視性のみ
 //! cross-module 用に private -> pub(crate) へ引き上げてある。
-use std::collections::{HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc};
 use common::model::{ClipContent, MidiContent, Note, Song, Track};
 use common::plugin_db::PluginDatabase;
+
+/// device の宛先解決 / host load 差分は [`crate::device_addr`] が持つ (不変条件 9
+/// でこのファイルから切り出した)。 呼び出し側は `crate::app::*` 経由で今までどおり
+/// 名前を引けるよう、ここで再輸出する。
+pub use crate::device_addr::{
+    DEVICE_DRAG_KIND, DeviceDragPayload, LoadedDeviceInfo, RelocateDevices, SlotReconcileAction,
+    compute_slot_reconcile_actions, device_at, device_id_at, device_mut_by_id, find_device_by_id,
+};
 
 /// `plan_track_removal_ipc` の出力。 順序が deadlock 防止に必須なので
 /// テスト可能な enum で表現する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackRemovalIpc {
     /// daw_audio engine に `AudioCommand::ClosePluginShmem { device_id }`
-    /// を送る (use-after-free deadlock 防止のため RemoveTrack より先)。
+    /// を送る (use-after-free deadlock 防止のため teardown より先)。
     CloseAudioShmem { device_id: u64 },
-    /// daw_plugin_host に `PluginCommand::RemoveTrack { track_id }` を送る
-    /// (plugin chain の proper teardown)。
-    RemoveTrackFromPluginHost { track_id: u32 },
+    /// daw_plugin_host に `PluginCommand::RemoveSlotPlugin { device_id }` を送る
+    /// (plugin instance の proper teardown)。 r.md #71 (プラグインのコピー / 移動):
+    /// **track という単位は host 側に無い** — 帰属を二重所有すると device 移動で
+    /// stale になるので、列挙は Song を持つ daw_gui 側の責務。
+    RemoveHostDevice { device_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,11 +185,12 @@ impl PluginPickEntry {
 }
 
 /// 単一デバイスチェーン上の 1 行 (`docs/plan_linear_chain.md` §5)。役割は持たず
-/// (判定もしない)、`device_index` (= `Track.devices` / `master_fx_chain` への
-/// flat な添字) でアドレスする。表示は plugin 名のみ。
+/// (判定もしない)、安定 `device_id` (`PluginInstance::id`) でアドレスする。
+/// 表示順は Vec の位置が持つ (r.md #71 プラグインのコピー / 移動:
+/// positional index はイベントにも帳簿にも出さない)。表示は plugin 名のみ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainEntry {
-    pub device_index: u32,
+    pub device_id: u64,
     pub plugin_name: String,
     /// チェーン行ボタンの分岐用。 埋め込み GUI (editor window) を持つ
     /// plugin か (`PluginParamList` の `has_embedded_gui`、 未受信は楽観的に true)。
@@ -203,10 +213,6 @@ pub struct ChainEntry {
 }
 
 impl ChainEntry {
-    pub fn to_device_index(&self) -> u32 {
-        self.device_index
-    }
-
     /// チェーン行ボタンが「埋め込み GUI window を開く」 のではなく
     /// 「インライン param パネルをトグルする」 種類か。 映像 FX / VOICEVOX /
     /// 埋め込み GUI を持たないが param がある plugin が該当。
@@ -388,11 +394,11 @@ pub enum InspectorScrubField {
     ImageFadeIn,
     ImageFadeOut,
     Text(TextNumField),
-    /// 内蔵映像 FX param scrub（device_index, param_id 単位で
+    /// 内蔵映像 FX param scrub（device_id, param_id 単位で
     /// drag stroke を undo 1 step に bracket する）。
-    VideoFx { device_index: u32, param_id: u32 },
-    /// 汎用 plugin param scrub (「⚙」パネル、device_index, param_id 単位)。
-    PluginParam { device_index: u32, param_id: u32 },
+    VideoFx { device_id: u64, param_id: u32 },
+    /// 汎用 plugin param scrub (「⚙」パネル、device_id, param_id 単位)。
+    PluginParam { device_id: u64, param_id: u32 },
     /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub。
     Talk(TalkParamKind),
 }
@@ -644,14 +650,14 @@ pub fn text_event_num_value(ev: &common::model::TextEvent, field: TextNumField) 
 }
 
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
-/// chain device (addressed by `device_index` into `Track.devices` /
-/// `master_fx_chain`); the `current_source` field is the value of
-/// `PluginInstance::aux_inputs[0]` tap source (port 0; the inspector only
-/// exposes the first aux input port for now).
+/// chain device (addressed by stable `device_id`); the `current_source` field
+/// is the value of `PluginInstance::aux_inputs[0]` tap source (port 0; the
+/// inspector only exposes the first aux input port for now). `track_id` は
+/// source picker が自トラックを除外するのに要るので残す (アドレスには使わない)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidechainEntry {
     pub track_id: u32,
-    pub device_index: u32,
+    pub device_id: u64,
     pub plugin_name: String,
     pub current_source: Option<u32>,
     /// aux_inputs[0] の現 tap point (B8 / r.md #8: inspector で編集可能化)。
@@ -678,7 +684,7 @@ pub struct SidechainSourceChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelOutputEntry {
     pub track_id: u32,
-    pub device_index: u32,
+    pub device_id: u64,
     pub plugin_name: String,
     pub aux_output_count: u8,
     pub routes: Vec<Option<u32>>,
@@ -855,6 +861,11 @@ pub enum EditSurface {
     Tracks,
     /// Arranger セクション帯 (選択中なら Delete で帯削除)。
     Sections,
+    /// r.md #71 (プラグインのコピー / 移動): インスペクタの Chain 行
+    /// (選択中のプラグイン)。 **明示的に行を click したときだけ**立つので、
+    /// `edit_surface` の非空優先順 fallback には入れない (タグ経由の
+    /// last-wins だけで足りる)。
+    Devices,
 }
 
 /// gui_01 #028: `MoveAutomationPoints` 用の 1 point delta。`value_norm`
@@ -911,7 +922,7 @@ pub struct GroupTransformInspectorSummary {
 #[derive(Clone)]
 pub struct VideoFxParamsInspector {
     pub track_id: u32,
-    pub device_index: u32,
+    pub device_id: u64,
     pub def: &'static common::video_fx::VideoFxDef,
     pub values: Vec<f32>,
 }
@@ -922,7 +933,7 @@ pub struct VideoFxParamsInspector {
 /// 既定の声を、 汎用 plugin は `params` に編集可能な param 行を載せる。
 pub struct PluginParamsInspector {
     pub track_id: u32,
-    pub device_index: u32,
+    pub device_id: u64,
     pub plugin_name: String,
     /// 汎用 plugin param 行 (lane default_value を実レンジ化した現値つき)。
     pub params: Vec<PluginParamRow>,
@@ -1387,75 +1398,6 @@ pub(crate) enum FileDialogMode {
     PickFiles,
 }
 
-/// v29 機械適応 helper: 安定 `device_id` (`PluginInstance::id`) を、 GUI の
-/// 既存ロジックが使う旧 `(track_id, device_index)` 座標へ逆引きする。
-/// track 内 device は `(Track::id, Vec index)`、 master bus の device は
-/// `(MASTER_TRACK_ID, master_fx_chain の Vec index)`。 見つからなければ
-/// `None` (= 削除済み device への stale event 等は呼び出し側で無視する)。
-///
-/// S3b で選択/参照ロジック自体を id 化するまでの橋渡し
-/// (`docs/plan_arch_refactor.md` §1)。
-pub fn find_device_by_id(
-    song: &common::model::Song,
-    device_id: u64,
-) -> Option<(u32, u32)> {
-    if device_id == 0 {
-        return None;
-    }
-    for t in &song.tracks {
-        if let Some(i) = t.devices.iter().position(|d| d.id == device_id) {
-            return Some((t.id, i as u32));
-        }
-    }
-    if let Some(i) = song
-        .master_fx_chain
-        .iter()
-        .position(|d| d.id == device_id)
-    {
-        return Some((common::model::MASTER_TRACK_ID, i as u32));
-    }
-    None
-}
-
-/// r.md #36: `(track_id, device_index)` 座標から `PluginInstance` 本体を引く。
-/// `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
-/// device が存在しなければ `None` (id 未採番かどうかは見ない — それは
-/// [`device_id_at`] の責務)。
-#[must_use]
-pub fn device_at(
-    song: &common::model::Song,
-    track_id: u32,
-    device_index: u32,
-) -> Option<&common::model::PluginInstance> {
-    let devices: &[common::model::PluginInstance] =
-        if track_id == common::model::MASTER_TRACK_ID {
-            &song.master_fx_chain
-        } else {
-            song.tracks
-                .iter()
-                .find(|t| t.id == track_id)
-                .map(|t| t.devices.as_slice())?
-        };
-    devices.get(device_index as usize)
-}
-
-/// 逆方向: 旧 `(track_id, device_index)` 座標から安定 `device_id` を引く。
-/// IPC 送信サイト (SetSlotPlugin / RemoveSlotPlugin / GUI open 等) が
-/// positional な GUI 内部状態から protocol の id addressing へ変換するのに
-/// 使う。 `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
-/// device が存在しない / id 未採番 (0) なら `None`。
-#[must_use]
-pub fn device_id_at(
-    song: &common::model::Song,
-    track_id: u32,
-    device_index: u32,
-) -> Option<u64> {
-    // 座標解決は `device_at` 1 本に集約する (同じ走査を 2 度書かない)。
-    device_at(song, track_id, device_index)
-        .map(|d| d.id)
-        .filter(|&id| id != 0)
-}
-
 /// v29 機械適応 helper: `(track_idx, clip_idx)` の MIDI content を引く
 /// (`Song::notes_in_clip_mut` の content 版)。 note 追加サイトが
 /// `MidiContent::alloc_note_id()` で安定 id を採番できるように allocator
@@ -1470,115 +1412,6 @@ pub(crate) fn midi_content_in_clip_mut(
         Some(ClipContent::Midi(m)) => Some(m),
         _ => None,
     }
-}
-
-/// 一部 variant は将来の機能 (rename UI / quantize / autosave / piano-roll
-/// shortcut 等) で使う予定なので、現時点で未参照でも残す。新規 variant 追加時に
-/// `loaded_slots` の値: 1 つの (track, device_index) ペアに対する load 情報。
-#[derive(Debug, Clone)]
-pub struct LoadedSlotInfo {
-    /// v29: 安定 device id (`PluginInstance::id`)。 旧 session-unique な
-    /// `plugin_id: u32` (plugin_host 採番) は廃止され、 host 側 addressing
-    /// もこの id 一本 (`docs/plan_arch_refactor.md` §1)。
-    pub device_id: u64,
-    /// stable string id (= `PluginInstance::plugin_id` と同じ値)。
-    /// reconcile の device-level diff で「Song と host で同じ plugin が
-    /// 居るか」 を判定するキー。
-    pub plugin_id_str: String,
-}
-
-/// `reconcile_plugins_with_song` の Phase B が計算する action。
-/// IPC dispatch から独立した純粋データ型にすることで unit test しやすく
-/// する (4dc982c で導入した device-level diff の regression 防止)。
-/// 単一デバイスチェーン化で slot enum を捨て flat な `index: u32` でアドレス。
-#[derive(Debug, Clone, PartialEq)]
-pub enum SlotReconcileAction {
-    /// host にあるが Song に無い device を host から消す
-    /// (= `PluginCommand::RemoveSlotPlugin` 相当)。
-    RemoveSlot { track_id: u32, index: u32 },
-    /// Song にあるが host に無い、 もしくは plugin_id_str が違う device を
-    /// (再) load する (= `PluginCommand::SetSlotPlugin` 相当)。 caller が
-    /// `plugin_db` から format / path を解決して IPC を組み立てる。
-    LoadSlot {
-        track_id: u32,
-        index: u32,
-        plugin_id_str: String,
-        initial_state: Option<Vec<u8>>,
-    },
-}
-
-/// Phase B 純粋関数化。 song と現在の loaded_slots cache を見て、 host
-/// と Song を揃えるための action 列を返す。 副作用なし (IPC は呼ばない、
-/// AppData にも触らない)。
-///
-/// 単一デバイスチェーン: 通常 track は `Track.devices`、 master bus は
-/// `master_fx_chain` を flat な `index: u32` 空間で diff する (役割別 3 chain
-/// 区分は撤廃、 load 順は Vec 順 = 音の処理順)。
-pub fn compute_slot_reconcile_actions(
-    song: &common::model::Song,
-    loaded_slots: &HashMap<(u32, u32), LoadedSlotInfo>,
-) -> Vec<SlotReconcileAction> {
-    let mut actions = Vec::new();
-
-    // 1 chain 分の reconcile。 track / master を同じロジックで処理する。
-    let mut reconcile_chain =
-        |track_id: u32, devices: &[common::model::PluginInstance]| {
-            // 内蔵映像効果は plugin_host の host slot ではない (GUI 描画 device)。
-            // 「host slot を持つ index 集合」= **映像でない** device の index。これにより
-            // 映像 device は LoadSlot されず、 また音声 device 削除で映像 device が同 index に
-            // ずれ込んでも、 古い host slot は (この集合に無いので) RemoveSlot される。
-            let host_slot_indices: std::collections::HashSet<u32> = devices
-                .iter()
-                .enumerate()
-                .filter(|(_, inst)| !inst.ports.is_video())
-                .map(|(i, _)| i as u32)
-                .collect();
-
-            // (1) host にあるが Song の host slot に無い index → RemoveSlot
-            // 順序を安定にするため index を sort してから push する (= test の
-            // assertion が決定的になる)。 production の挙動は HashMap iter
-            // 順依存だが、 RemoveSlot 同士は独立操作なので順序は無関係。
-            let mut host_extra: Vec<u32> = loaded_slots
-                .iter()
-                .filter(|((tid, _), _)| *tid == track_id)
-                .map(|((_, idx), _)| *idx)
-                .filter(|idx| !host_slot_indices.contains(idx))
-                .collect();
-            host_extra.sort_unstable();
-            for index in host_extra {
-                actions.push(SlotReconcileAction::RemoveSlot { track_id, index });
-            }
-
-            // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う index → LoadSlot
-            for (i, inst) in devices.iter().enumerate() {
-                // 映像 device は plugin_host に load しない。
-                if inst.ports.is_video() {
-                    continue;
-                }
-                let index = i as u32;
-                let need_load = match loaded_slots.get(&(track_id, index)) {
-                    None => true,
-                    Some(info) => info.plugin_id_str != inst.plugin_id,
-                };
-                if !need_load {
-                    continue;
-                }
-                actions.push(SlotReconcileAction::LoadSlot {
-                    track_id,
-                    index,
-                    plugin_id_str: inst.plugin_id.clone(),
-                    initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
-                });
-            }
-        };
-
-    for track in &song.tracks {
-        reconcile_chain(track.id, &track.devices);
-    }
-    // master bus fx chain (= 音源境界なしの全 audio FX)。
-    reconcile_chain(common::model::MASTER_TRACK_ID, &song.master_fx_chain);
-
-    actions
 }
 
 /// `RequestAllStates` の発行理由。 plugin_host から `AllPluginStates`
@@ -1610,25 +1443,43 @@ pub enum PendingStateRequest {
     /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
     /// を呼ぶことで、 削除直前の knob 値等を Undo で復元できる。
     Deferred(DeferredEdit),
-    /// トラック copy (Ctrl+C)。state 書き戻し後の live song から
-    /// 該当トラックを最新 plugin state 込みで serialize して
-    /// `pending_clipboard_write` に積むだけ (Song 不変)。**undo snapshot は積まない**
-    /// (copy は履歴を汚さない) ので `Deferred` とは別 variant にする。
-    CopyToClipboard { track_ids: Vec<u32> },
+    /// copy (Ctrl+C)。state 書き戻し後の live song から対象を最新 plugin state
+    /// 込みで serialize して `pending_clipboard_write` に積むだけ (Song 不変)。
+    /// **undo snapshot は積まない** (copy は履歴を汚さない) ので `Deferred` とは
+    /// 別 variant にする。
+    CopyToClipboard(ClipboardCopyRequest),
+}
+
+/// [`PendingStateRequest::CopyToClipboard`] の対象。 round-trip 待ちに積む
+/// 「何をコピーするか」 は面ごとに違うが、 待ち行列の仕組みは 1 本でよい。
+#[derive(Debug, Clone)]
+pub enum ClipboardCopyRequest {
+    Tracks(Vec<u32>),
+    /// r.md #71 (プラグインのコピー / 移動): チェーンで選んだ device。
+    Devices(Vec<u64>),
 }
 
 /// state 取得が完了したあとに plugin-main thread へ実行させる編集。
-/// track index ではなく **stable な `track_id`** で持つので、 pending
-/// 中に他の編集が track の Vec position をずらしても整合性が保たれる。
+/// 対象は **すべて安定 id** (`track_id` / `device_id`) で持つので、 pending 中に
+/// 他の編集が track / device の Vec position をずらしても整合性が保たれる
+/// (r.md #71 で device 側も positional index から id へ移行)。
 #[derive(Debug, Clone)]
 pub enum DeferredEdit {
     /// トラック削除 (r.md #43)。 選択集合を **1 件にまとめて** 持つ — id ごとに
     /// enqueue すると round-trip が分かれて undo が N ステップに割れる。
     DeleteTracks { track_ids: Vec<u32> },
     UngroupTracks { track_ids: Vec<u32> },
-    /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
-    /// device を `Vec::remove` する (役割別 slot 区分は撤廃)。
-    RemoveDevice { track_id: u32, index: u32 },
+    /// 単一デバイスチェーン: 安定 `device_id` で指した device を chain から外す。
+    /// 複数選択を **1 件にまとめて** 持つ (id ごとに enqueue すると undo が
+    /// N ステップに割れる)。
+    RemoveDevices { device_ids: Vec<u64> },
+    /// r.md #71 (プラグインのコピー / 移動): device を別のチェーンへ運ぶ
+    /// (移動 / コピー)。 最新の knob 値を Song へ書き戻してから実行したいので
+    /// round-trip 待ちに積む。
+    RelocateDevices(RelocateDevices),
+    /// r.md #71: device の cut (Ctrl+X)。最新 plugin state 込みで serialize して
+    /// `pending_clipboard_write` に積んでから削除する (1 undo step)。
+    CutDevices { device_ids: Vec<u64> },
     /// トラック cut (Ctrl+X)。最新 plugin state 込みで serialize して
     /// `pending_clipboard_write` に積んでから各トラックを削除する。`Deferred` 経由なので
     /// 削除前に undo snapshot が積まれ、Ctrl+Z 1 回で復元できる。

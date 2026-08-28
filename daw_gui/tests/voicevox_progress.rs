@@ -18,7 +18,7 @@ use common::port_config::PortConfig;
 use common::protocol::{PluginCommand, PluginEvent, VocalSynthFailure};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, LoadedSlotInfo, VOICEVOX_ENGINE_WARNING};
+use daw_gui::app::{AppData, AppEvent, LoadedDeviceInfo, VOICEVOX_ENGINE_WARNING};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -160,11 +160,10 @@ fn track_wav_synthesizing_resolves_plugin_id_and_counts_busy() {
     clip.length_beats = 4.0;
     track.clips.push(clip);
     app.edit_song(|song| song.tracks.push(track));
-    // 安定 device_id を device index 0 に紐付け (= SlotPluginLoaded 相当)。
-    app.ipc.loaded_slots.insert(
-        (100, 0),
-        LoadedSlotInfo {
-            device_id: 5,
+    // device が host に載っている印 (= SlotPluginLoaded 相当)。
+    app.ipc.loaded_devices.insert(
+        5,
+        LoadedDeviceInfo {
             plugin_id_str: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
         },
     );

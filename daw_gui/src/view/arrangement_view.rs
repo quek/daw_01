@@ -55,6 +55,63 @@ fn snap_toggle_style(theme: &Theme) -> ToggleButtonStyle {
     }
 }
 
+/// r.md #71 (プラグインのコピー / 移動): チェーンから掴んだプラグインをトラック
+/// ヘッダの上に持っていくと、 インスペクタの表示をそのトラックのチェーンへ
+/// 切り替える (= 運び先が見える)。 切り替えのトリガは **アレンジのトラック
+/// ヘッダだけ** (ミキサーのストリップでは切り替えない)。 ヘッダの上で離したら
+/// そのトラックのチェーン末尾に入れる。 master 行も `track_header_rects` に
+/// 入るので、 master へのドロップは追加コードなしで成立する。
+///
+/// widget 側 (`arrangement/header.rs::commit_clicks`) は同じ release frame で
+/// 「ヘッダの click」 の発行を抑止している (`dragging_kind().is_some()`)。
+/// 抑止しないと Ctrl+drop が Toggle 選択として解決され、 落とし先の選択が反転する。
+fn device_drag_over_headers(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    resp: &crate::widgets::arrangement::ArrangementResponse,
+) {
+    if ui.dragging_kind() != Some(crate::app::DEVICE_DRAG_KIND) {
+        return;
+    }
+    let Some((px, py)) = ui.pointer().pos else { return };
+    let Some(&(hover_track, _)) = resp
+        .track_header_rects
+        .iter()
+        .find(|(_, r)| r.contains(px, py))
+    else {
+        return;
+    };
+    if !ui.pointer().primary_just_released {
+        // ドラッグ中: 表示だけ運び先へ切り替える (選択タグは動かさない)。
+        if app.cursor_track_id() != Some(hover_track) {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.focus_inspector_track(hover_track);
+            }));
+        }
+        return;
+    }
+    // 落とした。 修飾キーは payload が持つ「押されていた最後のフレーム」の値 (D-2)。
+    let copy = ui.drag_modifiers().is_some_and(|m| m.ctrl);
+    let Some(payload) =
+        ui.take_drag_payload::<crate::app::DeviceDragPayload>(crate::app::DEVICE_DRAG_KIND)
+    else {
+        return;
+    };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        let dest_index = app
+            .song_doc
+            .song()
+            .fx_chain_by_track_id(hover_track)
+            .map_or(0, <[_]>::len) as u32;
+        app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
+            device_ids: payload.device_ids.clone(),
+            dest_track: hover_track,
+            dest_index,
+            copy,
+        }));
+    }));
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let p = &app.theme.core;
     // 上部 24 px を Snap toolbar に。残りを arrangement widget に渡す。
@@ -314,7 +371,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .automation_lane_by_key(edit_key.track_id, edit_key.lane_id)
             .map(|l| l.target.clone());
         if let (Some(rect), Some(target)) = (point_rect, lane_target) {
-            let plugin_range = app.plugin_param_range(edit_key.track_id, &target);
+            let plugin_range = app.plugin_param_range(&target);
             let desc = crate::automation_value::automation_value_display(&target, plugin_range);
             let cur = app.automation_point_value(&edit_key).unwrap_or(0.0);
             let prefill = desc.format_number(cur);
@@ -386,7 +443,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .song_doc.song()
             .automation_lane_by_key(lk.track, lk.lane)
             .map_or(0.0, |l| l.default_value);
-        let plugin_range = app.plugin_param_range(lk.track, &target);
+        let plugin_range = app.plugin_param_range(&target);
         let desc = crate::automation_value::automation_value_display(&target, plugin_range);
         let display_value = (desc.to_display)(default_value);
         let span = (desc.range.1 - desc.range.0).abs();
@@ -455,7 +512,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .automation_lane_by_key(drag.key.clip.track, drag.key.clip.lane)
             .map(|l| l.target.clone())
     {
-        let plugin_range = app.plugin_param_range(drag.key.clip.track, &target);
+        let plugin_range = app.plugin_param_range(&target);
         let desc = crate::automation_value::automation_value_display(&target, plugin_range);
         let plain = common::automation::norm_to_plain(&target, drag.value_norm);
         let text = desc.format_with_unit(plain);
@@ -527,6 +584,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             );
         }
     }
+
+    device_drag_over_headers(app, ui, &resp);
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
     // widget は track_header_rects の収集までを担い、 メニュー項目の発行は view 側。

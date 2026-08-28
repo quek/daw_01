@@ -96,10 +96,9 @@ impl AppData {
             });
         }
         // 仕様 §4: 「一番上の選択 track の直前」 に挿入 (= 子の上に
-        // ヘッダー)。 PR2.1 で plugin_host の chains を `Track::id`
-        // ベースに改修した結果、 Vec::insert で既存 track の Vec
-        // position が shift しても plugin chain の lookup は壊れない
-        // (engine の `slot_to_plugin_id` も (track_id, slot) ベース)。
+        // ヘッダー)。 device のアドレスは安定 `device_id` 一本なので、
+        // Vec::insert で既存 track の Vec position が shift しても
+        // plugin の lookup は壊れない。
         let insert_at = top_child_idx.min(self.song_doc.song().tracks.len());
         self.edit_song(|song| song.tracks.insert(insert_at, group_track));
         // 新規 group track を選択状態に (Live 互換: グループ化直後は
@@ -114,28 +113,73 @@ impl AppData {
     /// pure function。 順序が必須仕様 (deadlock 防止) なので、 ロジックを
     /// ここに集約して unit test で検証する:
     ///
-    /// 1. `audio: ClosePluginShmem(plugin_id)` × N — 削除対象 track が
-    ///    持っていた全 plugin について先に audio engine に送る。 これに
-    ///    より plugin_refs / slot_to_plugin_id から stale entry が消え、
+    /// 1. `audio: ClosePluginShmem(device_id)` × N — 削除対象 track が
+    ///    持っていた全 device について先に audio engine に送る。 これに
+    ///    より plugin_refs から stale entry が消え、
     ///    audio worker が destroyed plugin に dispatch する race を断つ。
-    /// 2. `plugin_host: RemoveTrack(track_id)` — plugin_host が chain
-    ///    の Box<Plugin> を properly tear down (stop_processing →
+    ///    (踏むと `pd.prepare()` が unmapped shmem を触って audio worker が
+    ///    AV で silent terminate → `all_done` 永久 wait)。
+    /// 2. `plugin_host: RemoveSlotPlugin(device_id)` × N — plugin_host が
+    ///    `Box<Plugin>` を properly tear down (stop_processing →
     ///    deactivate → gui_destroy → drop) して、 shmem mapping を
     ///    unmap する。 (1) で audio 側はもう触らないので安全。
+    ///
+    /// **列挙元は Song** (帳簿 `loaded_devices` ではない) — load 応答待ちの
+    /// device を取りこぼさないため。 `fx_chain_by_track_id` は **track を Song から
+    /// 外す前** にしか引けないので、 呼び出し側は削除より前にこれを呼んで戻り値を
+    /// 保持し、 送信は従来どおり song update / `LoadSong` の後に行う。
+    ///
+    /// r.md #71 (プラグインのコピー / 移動): 単位は device。 host 側に track という
+    /// 概念は無い (帰属を二重所有すると device 移動で stale になる)。
     pub fn plan_track_removal_ipc(
+        song: &common::model::Song,
         track_ids: &[u32],
-        track_plugin_ids: &std::collections::HashMap<u32, Vec<u64>>,
     ) -> Vec<TrackRemovalIpc> {
         let mut plan = Vec::new();
-        for track_id in track_ids {
-            if let Some(device_ids) = track_plugin_ids.get(track_id) {
-                for device_id in device_ids {
-                    plan.push(TrackRemovalIpc::CloseAudioShmem { device_id: *device_id });
-                }
+        for &track_id in track_ids {
+            let ids: Vec<u64> = song
+                .fx_chain_by_track_id(track_id)
+                .map(|c| c.iter().map(|d| d.id).collect())
+                .unwrap_or_default();
+            // (1) audio engine から先に mapping を落とす (use-after-free deadlock 防止)。
+            for &device_id in &ids {
+                plan.push(TrackRemovalIpc::CloseAudioShmem { device_id });
             }
-            plan.push(TrackRemovalIpc::RemoveTrackFromPluginHost { track_id: *track_id });
+            // (2) plugin_host に device 単位で teardown させる。
+            for device_id in ids {
+                plan.push(TrackRemovalIpc::RemoveHostDevice { device_id });
+            }
         }
         plan
+    }
+
+    /// [`Self::plan_track_removal_ipc`] が組んだ列を実際に送る。 順序は plan が
+    /// 決めているので、 ここは変換して流すだけ (分岐を増やさない)。
+    pub(crate) fn send_track_removal_ipc(&mut self, plan: &[TrackRemovalIpc]) {
+        for step in plan {
+            match *step {
+                TrackRemovalIpc::CloseAudioShmem { device_id } => {
+                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+                }
+                TrackRemovalIpc::RemoveHostDevice { device_id } => {
+                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
+                }
+            }
+        }
+    }
+
+    /// track を消す 3 経路 (選択トラック削除 / ungroup / 最終 track 削除) が共通で
+    /// 使う daw_gui ローカル帳簿の掃除。 対象 device は **削除前の Song から**
+    /// 列挙した id 集合で渡す (帳簿から引くと load 応答待ちを取りこぼす)。
+    pub(crate) fn forget_removed_track_devices(&mut self, plan: &[TrackRemovalIpc]) {
+        for step in plan {
+            if let TrackRemovalIpc::RemoveHostDevice { device_id } = *step {
+                self.cleanup_slot_gui(device_id);
+                self.forget_device_caches(device_id);
+                self.ipc.pending_plugin_loads.remove(&device_id);
+                self.ipc.failed_plugin_loads.remove(&device_id);
+            }
+        }
     }
 
     /// Alt+G: 選択中の group track の subtree を 1 階層持ち上げる。
@@ -190,13 +234,11 @@ impl AppData {
             (-(depth as i32), -(self.song_doc.song().track_index_by_id(*id).unwrap_or(0) as i32))
         });
 
-        // 各 group の plugin chain snapshot を **削除前に** 取得して
-        // おく (後の plugin destroy 用)。 song.tracks から group を
-        // remove した後では取得できない。
-        let group_snapshots: Vec<(u32, common::model::Track)> = groups_to_ungroup
-            .iter()
-            .filter_map(|gid| self.song_doc.song().track_by_id(*gid).map(|t| (*gid, t.clone())))
-            .collect();
+        // 削除する group の device teardown IPC を **Song から外す前に** 組む
+        // (`fx_chain_by_track_id` は削除前の Song からしか引けない。 後から呼ぶと
+        // plan が空になり IPC が 1 通も出ない = 無言で壊れる)。
+        let removal_plan =
+            Self::plan_track_removal_ipc(self.song_doc.song(), &groups_to_ungroup);
 
         let mut new_selection: Vec<u32> = Vec::new();
         for group_id in &groups_to_ungroup {
@@ -213,11 +255,6 @@ impl AppData {
                 }
             });
             if let Some(pos) = self.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
-                #[cfg(windows)]
-                {
-                    self.ipc.open_plugin_guis.retain(|&(t, _)| t != *group_id);
-                }
-                self.ipc.loaded_slots.retain(|(t, _), _| *t != *group_id);
                 self.edit_song(|song| song.tracks.remove(pos));
             }
             self.ui_prefs.collapsed_groups.remove(group_id);
@@ -236,19 +273,12 @@ impl AppData {
         // silently terminate** し、 master の `WaitForSingleObject(all_done,
         // INFINITE)` が永久 wait → 18 秒 audio thread 完全停止。
         //
-        // 対策: RemoveTrack を plugin_host に送る **前に** daw_audio に
-        // 直接 ClosePluginShmem を送って `plugin_refs` / `slot_to_plugin_id`
-        // から stale entry を削除させ、 audio worker が destroyed plugin
-        // を dispatch しないようにする。
-        let _ = group_snapshots;
-        for group_id in &groups_to_ungroup {
-            if let Some(device_ids) = self.ipc.track_plugin_ids.remove(group_id) {
-                for device_id in device_ids {
-                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
-                }
-            }
-            self.send_plugin(PluginCommand::RemoveTrack { track_id: *group_id });
-        }
+        // 対策: teardown を plugin_host に送る **前に** daw_audio に
+        // 直接 ClosePluginShmem を送って `plugin_refs` から stale entry を
+        // 削除させ、 audio worker が destroyed plugin を dispatch しないように
+        // する。 順序は `plan_track_removal_ipc` が持っている。
+        self.send_track_removal_ipc(&removal_plan);
+        self.forget_removed_track_devices(&removal_plan);
         // selection: ungroup 後は元 group の子を選択 (Live 互換)。 明示的な
         // トラック面操作なので last-wins タグも Tracks に倒す。
         if !new_selection.is_empty() {
@@ -313,6 +343,12 @@ impl AppData {
         if len == 0 {
             return;
         }
+        // device teardown の IPC は **pop する前に** 組む (Song から外した後では
+        // chain を列挙できず、 plan が空 = IPC が 1 通も出ない)。
+        let Some(last_id) = self.song_doc.song().tracks.last().map(|t| t.id) else {
+            return;
+        };
+        let removal_plan = Self::plan_track_removal_ipc(self.song_doc.song(), &[last_id]);
         // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
         let Some(Some(removed)) = self.edit_song(|song| song.tracks.pop()) else {
             return;
@@ -324,11 +360,11 @@ impl AppData {
             name = %removed.name,
             "removed last track"
         );
-        #[cfg(windows)]
-        {
-            self.ipc.open_plugin_guis.retain(|&(t, _)| t != removed_id);
-        }
-        self.send_plugin(PluginCommand::RemoveTrack { track_id: removed_id });
+        // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ。 この経路は
+        // 以前 `ClosePluginShmem` を送っておらず (= 順序仕様が守られていなかった)、
+        // plan 経由に統一したことで穴も塞がる。
+        self.send_track_removal_ipc(&removal_plan);
+        self.forget_removed_track_devices(&removal_plan);
         // selected_track_ids は id ベース。 削除対象 track id を除外
         // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
         // 空なら最後尾にフォールバック。
@@ -356,4 +392,65 @@ impl AppData {
         self.resize_track_peak_display();
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track_with_devices(id: u32, device_ids: &[u64]) -> common::model::Track {
+        let mut t = common::model::Track {
+            id,
+            ..common::model::Track::default()
+        };
+        for &device_id in device_ids {
+            t.devices.push(common::model::PluginInstance {
+                id: device_id,
+                ..common::model::PluginInstance::new(
+                    "test.fx".into(),
+                    common::plugin_format::PluginFormat::Clap,
+                )
+            });
+        }
+        t
+    }
+
+    /// **順序が仕様** (track ごとに 全 CloseAudioShmem → 全 RemoveHostDevice)。
+    /// audio 側の mapping を先に落とさないと、 plugin_host が shmem を unmap した
+    /// 直後に audio worker が `pd.prepare()` で unmapped memory を踏み、 AV で
+    /// silent terminate → `all_done` 永久 wait になる。
+    #[test]
+    fn plan_orders_close_before_teardown_per_track() {
+        let mut song = common::model::Song::default();
+        song.tracks.clear();
+        song.tracks.push(track_with_devices(1, &[10, 11]));
+        song.tracks.push(track_with_devices(2, &[20, 21]));
+
+        let plan = AppData::plan_track_removal_ipc(&song, &[1, 2]);
+        assert_eq!(
+            plan,
+            vec![
+                TrackRemovalIpc::CloseAudioShmem { device_id: 10 },
+                TrackRemovalIpc::CloseAudioShmem { device_id: 11 },
+                TrackRemovalIpc::RemoveHostDevice { device_id: 10 },
+                TrackRemovalIpc::RemoveHostDevice { device_id: 11 },
+                TrackRemovalIpc::CloseAudioShmem { device_id: 20 },
+                TrackRemovalIpc::CloseAudioShmem { device_id: 21 },
+                TrackRemovalIpc::RemoveHostDevice { device_id: 20 },
+                TrackRemovalIpc::RemoveHostDevice { device_id: 21 },
+            ],
+            "2 track × 2 device で 8 要素が期待順に並ぶ"
+        );
+    }
+
+    /// device を持たない track / 存在しない track は plan に何も出さない
+    /// (= 空振りの IPC を送らない)。
+    #[test]
+    fn plan_is_empty_for_deviceless_and_missing_tracks() {
+        let mut song = common::model::Song::default();
+        song.tracks.clear();
+        song.tracks.push(track_with_devices(1, &[]));
+        assert!(AppData::plan_track_removal_ipc(&song, &[1]).is_empty());
+        assert!(AppData::plan_track_removal_ipc(&song, &[99]).is_empty());
+    }
 }

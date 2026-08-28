@@ -13,6 +13,7 @@
 pub mod clipboard;
 pub mod color;
 pub mod dialog;
+pub mod drag_drop;
 pub mod edit;
 pub mod id;
 pub mod input;
@@ -30,6 +31,7 @@ pub mod widgets;
 pub use clipboard::ArboardClipboard;
 pub use clipboard::{ClipboardProvider, NoopClipboard};
 pub use dialog::{DialogResult, FileDialogFilter};
+pub use drag_drop::DragPayload;
 pub use edit::Edit;
 pub use id::WidgetId;
 pub use widgets::WidgetState;
@@ -40,6 +42,11 @@ pub use widgets::drag_rect::DragRect;
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
 pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use daw_ui_platform::CursorIcon;
+// r.md #71 (プラグインのコピー / 移動): `DragPayload.modifiers` /
+// `ReorderableListResponse.clicked_modifiers` を public フィールドに出す以上、
+// caller が型名を書けるように再 export する (従来は `input.rs` の private な
+// `use` でしか取り込んでおらず、外から名前が付けられなかった)。
+pub use daw_ui_platform::Modifiers;
 pub use daw_ui_renderer::{available_font_families, Color, TextureHandle, TexturedQuad};
 pub use theme::{Palette, WaveformInk, contrast_ratio};
 pub use ui::{FrameStats, Ui, UiHost};
