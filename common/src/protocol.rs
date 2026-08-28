@@ -500,13 +500,31 @@ pub enum PluginCommand {
     SetBuiltinPluginNoteMetadata {
         device_id: u64,
         bpm: f32,
+        /// 塊 (= `/sing_frame_audio_query` 1 回) の長さ (秒)。アプリ設定
+        /// (`app_config.json` の `voicevox_chunk_secs`) が SSoT で、
+        /// `voicevox_phrase::{MIN,MAX}_CHUNK_SECS` にクランプ済みの値が来る。
+        /// **合成結果を変える入力**なので、daw_gui 側の再送デデュープの比較対象に
+        /// 含め、かつ **フレーズ WAV のキャッシュキーにも混ぜる**
+        /// (`voicevox_cache::key_for_sing_phrase`)。両方に入れて初めて
+        /// 「設定を変えたら音が変わる」が成立する (キーに入れないと、再送しても
+        /// 全フレーズが cache hit して何も変わらない)。
+        chunk_secs: f32,
         entries: Vec<crate::plugin_metadata::NoteMetadata>,
         /// (talk) 同トラックの `ClipContent::Text` 由来の読み上げ群。
         talk: Vec<crate::plugin_metadata::TalkMetadata>,
     },
-    /// 歌唱 bounce の前に builtin VOICEVOX の合成完了を要求する。 完了で
-    /// `PluginEvent::VocalSynthReady` が返る。
+    /// 歌唱 bounce / 曲全体の WAV 書き出しの前に builtin VOICEVOX の合成完了を
+    /// 要求する。 完了で `PluginEvent::VocalSynthReady` が返る。
     PrepareVocalSynth { device_id: u64 },
+    /// builtin VOICEVOX の合成順序ヒント。再生位置に近いフレーズから合成させる
+    /// (本家 `selectPriorPhrase`: 再生位置を含む → 後ろ → 前)。
+    ///
+    /// **`SetBuiltinPluginNoteMetadata` に相乗りさせてはいけない** — あちらは
+    /// daw_gui 側で `(bpm, chunk_secs, entries, talk)` の一致による再送デデュープが
+    /// 掛かっており、playhead を比較に入れれば**トランスポートを動かすたびに再合成**、
+    /// 入れなければ **playhead が永久に stale** になる。どちらも壊れているので、
+    /// 合成をトリガしない専用の軽量メッセージにする。
+    SetVocalSynthPriority { device_id: u64, playhead_beats: f64 },
     /// Load / replace the plugin instance for device `device_id` (安定 id、
     /// `Song.next_device_id` 採番)。 `track_id` は所属 track (master fx は
     /// `MASTER_TRACK_ID`) — teardown (`RemoveTrack`) 用の帰属情報で、
@@ -772,22 +790,43 @@ pub enum PluginEvent {
     },
     /// Plugin GUI で knob を release した通知 (gesture end)。
     PluginParamGestureEnd { device_id: u64, param_id: u32 },
-    /// builtin VOICEVOX plugin の合成スレッドの状態遷移。
+    /// builtin VOICEVOX plugin の合成スレッドの状態遷移 + 進捗。
     VoicevoxSynthStatus {
         device_id: u64,
-        busy: bool,
-        /// 直近試行の失敗種別 (engine 到達可否で区別)。
-        failure: VocalSynthFailure,
+        progress: VocalSynthProgress,
     },
+}
+
+/// builtin VOICEVOX 合成の進捗。`(busy, failure)` だけだった報告を、フレーズ単位の
+/// 残件数とクリップ帰属まで含む 1 つの形に統一する (callback の引数と IPC の payload が
+/// 同じ型 = SSoT)。
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Default)]
+pub struct VocalSynthProgress {
+    /// 合成中か。
+    pub busy: bool,
+    /// 直近試行の失敗種別 (engine 到達可否で区別)。
+    pub failure: VocalSynthFailure,
+    /// 未完了フレーズ数 (talk の 1 発話も 1 件として数える)。
+    pub pending: u32,
+    /// この job の総フレーズ数。`pending / total` は **percent にしない**
+    /// (HTTP は中間進捗を返さない = 偽の % を出さない、という既存判断を維持)。
+    pub total: u32,
+    /// 未完了フレーズ / 未完了 talk 発話が掛かっている clip id (昇順・重複なし)。
+    /// クリップ上スピナーを「そのクリップに未完了の仕事があるときだけ」点けるために使う。
+    /// 歌唱は `voicevox_phrase::Phrase::clip_ids`、talk は
+    /// `plugin_metadata::TalkMetadata::clip_id` から集める — talk を入れ忘れると
+    /// Text クリップのスピナーが消える。
+    pub pending_clips: Vec<u32>,
 }
 
 /// builtin VOICEVOX 合成の失敗種別。engine に**到達できない** (未起動 / 起動途中 /
 /// timeout = transient、retry する) のか、engine は**到達できたが入力を拒否**した
 /// (HTTP 4xx/5xx = 例: 不正な歌詞。同 job を retry しても無駄なので retry しない) のかを
 /// 区別する。後者を「engine 未接続」と誤表示しない / 無限 retry しないための SSoT。
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Default)]
 pub enum VocalSynthFailure {
     /// 直近試行は失敗していない (成功 or まだ試行なし)。
+    #[default]
     None,
     /// engine に到達できない (接続拒否 / timeout / 未起動・起動途中)。transient。
     Unreachable,
@@ -1027,6 +1066,7 @@ mod tests {
         let msg = PluginCommand::SetBuiltinPluginNoteMetadata {
             device_id: 9,
             bpm: 128.0,
+            chunk_secs: 60.0,
             entries: vec![crate::plugin_metadata::NoteMetadata {
                 note_id: 0,
                 start_beat: 0.0,
@@ -1046,7 +1086,37 @@ mod tests {
                 pitch_scale: 0.0,
                 intonation_scale: 1.0,
                 volume_scale: 1.0,
+                clip_id: 7,
             }],
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn vocal_synth_progress_roundtrip() {
+        let msg = PluginEvent::VoicevoxSynthStatus {
+            device_id: 4,
+            progress: VocalSynthProgress {
+                busy: true,
+                failure: VocalSynthFailure::Rejected {
+                    detail: "lyricが不正です: ー".to_string(),
+                },
+                pending: 3,
+                total: 11,
+                pending_clips: vec![2, 5, 9],
+            },
+        };
+        assert_eq!(roundtrip(&msg), msg);
+        // Default は「idle・失敗なし・件数 0」。stop 時の報告に使う。
+        assert_eq!(VocalSynthProgress::default().failure, VocalSynthFailure::None);
+        assert!(!VocalSynthProgress::default().busy);
+    }
+
+    #[test]
+    fn vocal_synth_priority_roundtrip() {
+        let msg = PluginCommand::SetVocalSynthPriority {
+            device_id: 12,
+            playhead_beats: 37.25,
         };
         assert_eq!(roundtrip(&msg), msg);
     }

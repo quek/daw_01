@@ -1,24 +1,33 @@
-//! VOICEVOX 音声 **合成** — `frame_synthesis` (sing) / `synthesis` (talk) HTTP + WAV decode。
+//! VOICEVOX 音声 **合成** — HTTP (`sing_frame_audio_query` / `frame_synthesis` /
+//! `audio_query` / `synthesis`) と WAV decode、FrameAudioQuery のスライス。
 //!
 //! arch-refactor S5-2 で common::voicevox から分離した (合成は builtin plugin = plugin-host
 //! プロセスが唯一の実行場所、reqwest を要する)。`/singers` fetch や口パク phoneme query
-//! (= GUI 側の責務) は `daw_gui::voicevox_client`。共有の純粋部分 (build_sing_query /
-//! urlencoding / 各 const / Note 型) は `common::voicevox` / `common::model`。
+//! (= GUI 側の責務) は `daw_gui::voicevox_client`。共有の純粋部分 (query builder /
+//! フレーズ分割 / 各 const / Note 型 / ディスクキャッシュ) は `common::voicevox` /
+//! `common::voicevox_phrase` / `common::voicevox_cache` / `common::model`。
 //!
-//! すべて blocking (background synth thread で呼ぶ)。合成結果は `voicevox_cache`
-//! (`VoiceVoxDiskCache`) で per-user global に永続化する。
+//! r.md #75 で歌唱は **2 段**に割れている:
+//! 1. **塊クエリ** (`fetch_sing_frame_query`) — 60 秒ぶんの楽譜を 1 回投げて
+//!    FrameAudioQuery を得る。応答は非決定的なので、キャッシュキーは**入力の楽譜**から作る。
+//! 2. **フレーズ合成** (`slice_frame_query` → `frame_synthesis`) — 1 フレーズ ±0.5 秒だけ
+//!    切り出して投げる。こちらは決定的なので WAV キャッシュが正しく効く。
+//!
+//! オーケストレーション (キャッシュ / 継ぎ目 / mix / publish) は
+//! [`super::voicevox_render`]。ここは HTTP と純粋な JSON 操作だけを持つ。
+//!
+//! すべて blocking (background synth thread で呼ぶ)。
 
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
 
-use common::model::{Note, TalkParams};
+use common::model::TalkParams;
 use common::voicevox::{
-    DEFAULT_SINGER_ID, QUERY_SPEAKER, TALK_PRE_PHONEME_LENGTH, VOICEVOX_URL, build_sing_query,
-    frames_to_samples, sing_base_beat, urlencoding_encode,
+    OUTPUT_SAMPLE_RATE, QUERY_SPEAKER, TALK_PRE_PHONEME_LENGTH, VOICEVOX_URL,
+    normalize_frame_query, urlencoding_encode,
 };
-
-use super::voicevox_cache::{VoiceVoxDiskCache, key_for_sing, key_for_talk};
+use common::voicevox_cache::{CacheKind, VoiceVoxDiskCache, key_for_talk, key_for_talk_query};
 
 /// 合成失敗の種別。engine への**到達可否**で分ける (呼び出し側の synth thread が
 /// retry するか / GUI に「engine 未接続」と出すかを正しく決めるため)。
@@ -64,32 +73,41 @@ fn reject_detail(status: reqwest::StatusCode, body: &str) -> String {
     s
 }
 
-/// 音声 **合成** (`frame_synthesis` / `synthesis`) HTTP の timeout。歌唱は曲全体の全 note を
-/// 1 query にまとめて `frame_synthesis` する (json 数 KB) ため、合成は数十秒かかり得る。
+/// 音声合成 HTTP の timeout。
+///
+/// r.md #75 以降、合成は **フレーズ単位** (実測 平均 145 ms / 最大 546 ms)、クエリは
+/// **塊単位** (60 秒 ≈ 0.55 s、上限 300 秒でも 15 s 程度)。120 秒は engine の
+/// コールドスタートと極端に長いフレーズ (休符が無い長大な区間 = 1 フレーズ) のための余裕。
 const SYNTH_HTTP_TIMEOUT_SECS: u64 = 120;
-/// 合成 WAV の出力 sample rate に揃える値 (query の `outputSamplingRate` を上書き)。
-const OUTPUT_SAMPLE_RATE: u32 = 48000;
+
+/// 合成 HTTP client (timeout 付き) を作る。塊クエリ / フレーズ合成 / talk が共用する。
+pub fn synth_client() -> Result<reqwest::blocking::Client, SynthError> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| unreachable(e, "building HTTP client"))
+}
 
 // ---------------------------------------------------------------------------
-// Sing
+// Sing — 塊クエリ / フレーズ合成
 // ---------------------------------------------------------------------------
 
-/// 既に組み立て済みの sing query JSON を `frame_synthesis` に流して WAV bytes を得る
-/// (`build_sing_query` → 本関数 の 2 段)。 caller が query を先に作るのはキャッシュキー
-/// (= query 内容 + singer) を HTTP 前に計算するため。
-fn sing_query_to_wav(
+/// `POST /sing_frame_audio_query` (塊 1 回)。応答を
+/// [`common::voicevox::normalize_frame_query`] に通した `FrameAudioQuery` JSON を返す。
+///
+/// `outputSamplingRate` は**ここで 1 回だけ** [`OUTPUT_SAMPLE_RATE`] に差し替える。
+/// 以降の全スライスがこの値を継承するのでフレーズごとに sample rate がぶれず、
+/// **キャッシュへ入るのも正規形だけ**になる (daw_gui の口パク query と鍵空間を共有する
+/// ので、片方が生 body を put すると他方が 24 kHz の WAV を掴む)。
+pub fn fetch_sing_frame_query(
     client: &reqwest::blocking::Client,
-    query_json: &str,
-    singer_id: u32,
-) -> Result<Vec<u8>, SynthError> {
-    tracing::info!(json_len = query_json.len(), "sing_frame_audio_query");
-
-    // Step 1: sing_frame_audio_query
+    score_json: &str,
+) -> Result<String, SynthError> {
     let url = format!("{VOICEVOX_URL}/sing_frame_audio_query?speaker={QUERY_SPEAKER}");
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .body(query_json.to_owned())
+        .body(score_json.to_owned())
         .send()
         .map_err(|e| unreachable(e, "sing_frame_audio_query request failed"))?;
     let status = resp.status();
@@ -100,20 +118,20 @@ fn sing_query_to_wav(
         // engine は応答した = 到達済。入力 (歌詞等) が不正 → Rejected。
         return Err(SynthError::Rejected(reject_detail(status, &body)));
     }
+    Ok(normalize_frame_query(&body))
+}
 
-    // Patch outputSamplingRate
-    let patched = if let Some(field) = find_sample_rate_field(&body) {
-        body.replace(&field, &format!("\"outputSamplingRate\":{}", OUTPUT_SAMPLE_RATE))
-    } else {
-        body
-    };
-
-    // Step 2: frame_synthesis
+/// `POST /frame_synthesis` (フレーズ 1 回)。WAV bytes を返す。
+pub fn frame_synthesis(
+    client: &reqwest::blocking::Client,
+    frame_query_json: &str,
+    singer_id: u32,
+) -> Result<Vec<u8>, SynthError> {
     let url = format!("{VOICEVOX_URL}/frame_synthesis?speaker={singer_id}");
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .body(patched)
+        .body(frame_query_json.to_owned())
         .send()
         .map_err(|e| unreachable(e, "frame_synthesis request failed"))?;
     let status = resp.status();
@@ -124,143 +142,102 @@ fn sing_query_to_wav(
         let preview = String::from_utf8_lossy(&wav[..wav.len().min(300)]);
         return Err(SynthError::Rejected(reject_detail(status, &preview)));
     }
-
     Ok(wav.to_vec())
 }
 
-/// One note in a `synthesize_notes_for_builtin` request. Kept distinct from
-/// `common::model::Note` (which carries DAW-internal IDs and clip-scoped fields) so the
-/// plugin SDK boundary stays minimal — only the fields VOICEVOX actually needs.
-#[derive(Debug, Clone)]
-pub struct BuiltinNoteSpec {
-    pub note_id: u32,
-    pub start_beat: f64,
-    pub duration_beats: f64,
-    pub pitch: u8,
-    pub velocity: u8,
-    pub lyric: String,
+/// FrameAudioQuery の frame 総数 (= `f0` 配列長)。
+pub fn frame_query_len(fq: &serde_json::Value) -> Result<usize> {
+    let arr = fq
+        .get("f0")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("FrameAudioQuery has no `f0` array"))?;
+    Ok(arr.len())
 }
 
-impl BuiltinNoteSpec {
-    fn to_model_note(&self) -> Note {
-        Note {
-            id: 0,
-            start_beat: self.start_beat,
-            duration_beats: self.duration_beats,
-            pitch: self.pitch,
-            velocity: self.velocity,
-            lyric: if self.lyric.is_empty() {
-                None
-            } else {
-                Some(self.lyric.clone())
-            },
-            muted: false,
-        }
-    }
-}
-
-/// Result of `synthesize_notes_for_builtin`. `samples` is mono f32 audio at `sample_rate` Hz;
-/// `note_offsets` lets `process()` look up where a `note_on` event for a given `note_id`
-/// starts streaming.
-#[derive(Debug, Clone)]
-pub struct BuiltinSynthOutput {
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-    /// query の基準 note の `start_beat` (= `common::voicevox::sing_base_beat`)。
-    /// wav の **frame 0** は `sing_head_beat(base_beat, bpm)` に来る。呼び出し側が
-    /// この wav を曲上へ配置するときの唯一の基準 (r.md #39)。
-    pub base_beat: f64,
-    /// `note_id → wav 内の sample offset` (= query の絶対 frame 位置を sample 換算した
-    /// **実位置**。「理想位置」の再計算ではないので停止中プレビューが波形とズレない)。
-    pub note_offsets: std::collections::HashMap<u32, u64>,
-}
-
-/// Synthesise a single track's worth of notes for the VOICEVOX builtin plugin
-/// (`docs/plan_voicevox_synth.md` PR-V2.3). Returns the **mono** PCM samples + sample rate +
-/// per-note frame offsets within the synthesised buffer (= `note_id → start frame`).
+/// FrameAudioQuery を frame 範囲 `[a, b)` で切り出す (純粋関数)。
 ///
-/// `notes` must NOT be empty — VOICEVOX rejects empty queries; callers should bail before
-/// reaching this function.
+/// - `f0` / `volume` は `[a, b)` をそのままスライス。
+/// - `phonemes` は先頭から `frame_length` を積んで区間を出し、`[a, b)` と重なるものだけを
+///   境界で切り詰めて残す (完全に外のものは落とす)。
+/// - それ以外の field (`volumeScale` / `outputSamplingRate` 等) はそのまま引き継ぐ。
 ///
-/// 歌える note (長さ > 0 かつ pitch > 0) が 1 つも無いときは `Ok(None)` = 「このグループ
-/// には音が無い」。query builder が歌えない note を黙って落とす契約と揃える (= エラーに
-/// しない)。
-pub fn synthesize_notes_for_builtin(
-    notes: &[BuiltinNoteSpec],
-    bpm: f32,
-    speaker_id: u32,
-) -> Result<Option<BuiltinSynthOutput>, SynthError> {
-    if notes.is_empty() {
-        return Err(SynthError::Rejected(
-            "synthesize_notes_for_builtin called with no notes".into(),
-        ));
-    }
-    // speaker_id 0 = 未設定 → DEFAULT_SINGER_ID (歌唱可能 style) へフォールバック。旧プロジェクトの
-    // clip は声未焼き込み (0) で来るため、0 をそのまま frame_synthesis に渡すと 500 になる。
-    let speaker_id = if speaker_id != 0 {
-        speaker_id
-    } else {
-        DEFAULT_SINGER_ID
-    };
-    let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
-    let Some(base_beat) = sing_base_beat(&model_notes) else {
-        // 歌える note が 1 つも無い (長さ 0 / pitch 0 のみ) = 無音。エラーではない。
-        return Ok(None);
-    };
-    let query = build_sing_query(&model_notes, bpm);
+/// **phoneme の長さ field は `frame_length` (snake_case)**。engine の `FramePhoneme` が
+/// そう定義しており (`voicevox_engine/tts_pipeline/song_engine.py` の
+/// `phoneme.frame_length`)、本番の `daw_gui::voicevox_client` も `frame_length` だけを
+/// 読んで動いている。同じ応答の中で `outputSamplingRate` / `volumeScale` は camelCase と
+/// いう混在があるが、**phoneme 側が camelCase で返った観測は無い**ので推測で両対応を
+/// 書かない。欠けていたら `Err` にして表に出す (黙って 0 扱いにすると全 phoneme が
+/// 落ちて無音になる)。
+pub fn slice_frame_query(fq: &serde_json::Value, a: usize, b: usize) -> Result<String> {
+    anyhow::ensure!(a <= b, "slice_frame_query: 逆転した範囲 {a}..{b}");
+    let obj = fq
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("FrameAudioQuery is not a JSON object"))?;
+    let mut out = obj.clone();
 
-    // 永続コンテンツアドレスキャッシュ。query 内容 (= 歌詞 / pitch / frame / bpm が畳み込み済) +
-    // singer が同じなら、HTTP 合成を丸ごと skip して保存済 WAV を返す。
-    let cache = VoiceVoxDiskCache::production();
-    let cache_key = key_for_sing(&query.json, speaker_id);
-    let wav_bytes = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key)) {
-        tracing::info!(cache_key, "VOICEVOX sing cache hit (HTTP skip)");
-        hit
-    } else {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| unreachable(e, "building HTTP client"))?;
-        let wav = sing_query_to_wav(&client, &query.json, speaker_id)?;
-        if let Some(c) = cache.as_ref() {
-            c.put(cache_key, &wav);
+    for key in ["f0", "volume"] {
+        let arr = obj
+            .get(key)
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("FrameAudioQuery has no `{key}` array"))?;
+        let hi = b.min(arr.len());
+        let lo = a.min(hi);
+        out.insert(key.to_string(), serde_json::Value::Array(arr[lo..hi].to_vec()));
+    }
+
+    let phonemes = obj
+        .get("phonemes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("FrameAudioQuery has no `phonemes` array"))?;
+    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(phonemes.len());
+    let mut cursor = 0usize;
+    for p in phonemes {
+        let len = p
+            .get("frame_length")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("FramePhoneme has no `frame_length`"))?
+            as usize;
+        let start = cursor;
+        let end = cursor.saturating_add(len);
+        cursor = end;
+        let s = start.max(a);
+        let e = end.min(b);
+        if e <= s {
+            continue;
         }
-        wav
-    };
-    let (samples, sample_rate) =
-        decode_wav_to_f32(&wav_bytes).map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
-
-    // 各 note の wav 内 offset は query の **実 frame 位置** から換算する (`note_frames`)。
-    // 旧実装は「lead-in + (start_beat - earliest) × spb」という理想位置の再計算で、
-    // query の丸め (93.75fps) と最大 0.5 frame ずれていた (r.md #39 付随 (d))。
-    let mut note_offsets: std::collections::HashMap<u32, u64> =
-        std::collections::HashMap::with_capacity(query.note_frames.len());
-    for &(idx, frame) in &query.note_frames {
-        let off = frames_to_samples(frame as f64, sample_rate).round().max(0.0) as u64;
-        note_offsets.insert(notes[idx].note_id, off);
+        let mut q = p.clone();
+        if let Some(o) = q.as_object_mut() {
+            o.insert("frame_length".into(), serde_json::json!(e - s));
+        }
+        kept.push(q);
     }
+    out.insert("phonemes".to_string(), serde_json::Value::Array(kept));
 
-    Ok(Some(BuiltinSynthOutput {
-        samples,
-        sample_rate,
-        base_beat,
-        note_offsets,
-    }))
+    serde_json::to_string(&serde_json::Value::Object(out))
+        .context("serializing sliced FrameAudioQuery")
 }
 
 // ---------------------------------------------------------------------------
 // Talk
 // ---------------------------------------------------------------------------
 
-/// `text` を talk 合成して WAV bytes を返す。`/audio_query` → (TalkParams patch) → `/synthesis`。
-/// `scales` の話速/音高/抑揚/音量 を audio_query 応答に適用してから synthesis する。blocking。
-fn synthesize_talk(
+/// `/audio_query` 応答 JSON を取る (ディスクキャッシュ付き)。
+///
+/// 応答は `(text, speaker)` の純粋関数で、speed / pitch 等は後から patch するので
+/// 鍵に混ぜない。**同じ鍵空間を daw_gui の口パク (`query_talk_phonemes`) と共有する**
+/// ので、両者とも生の応答 body をそのまま置く (patch は読み手が行う)。
+fn fetch_talk_query(
     client: &reqwest::blocking::Client,
     text: &str,
     speaker_id: u32,
-    scales: &TalkParams,
-) -> Result<Vec<u8>, SynthError> {
-    // Step 1: audio_query
+) -> Result<String, SynthError> {
+    let cache = VoiceVoxDiskCache::production();
+    let key = key_for_talk_query(text, speaker_id);
+    if let Some(hit) = cache.as_ref().and_then(|c| c.get(key, CacheKind::Json))
+        && let Ok(text) = String::from_utf8(hit)
+    {
+        return Ok(text);
+    }
     let url = format!(
         "{}/audio_query?speaker={}&text={}",
         VOICEVOX_URL,
@@ -278,9 +255,24 @@ fn synthesize_talk(
     if !status.is_success() {
         return Err(SynthError::Rejected(reject_detail(status, &body)));
     }
+    if let Some(c) = cache.as_ref() {
+        c.put(key, CacheKind::Json, body.as_bytes());
+    }
+    Ok(body)
+}
 
-    let patched = apply_talk_params(&body, scales)
-        .map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
+/// `text` を talk 合成して WAV bytes を返す。`/audio_query` → (TalkParams patch) → `/synthesis`。
+/// `scales` の話速/音高/抑揚/音量 を audio_query 応答に適用してから synthesis する。blocking。
+fn synthesize_talk(
+    client: &reqwest::blocking::Client,
+    text: &str,
+    speaker_id: u32,
+    scales: &TalkParams,
+) -> Result<Vec<u8>, SynthError> {
+    let body = fetch_talk_query(client, text, speaker_id)?;
+
+    let patched =
+        apply_talk_params(&body, scales).map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
 
     // Step 2: synthesis
     let url = format!("{VOICEVOX_URL}/synthesis?speaker={speaker_id}");
@@ -317,17 +309,14 @@ pub fn synthesize_talk_for_builtin(
     // 永続キャッシュ (text + talk speaker + scales)。再オープンで読み上げを再合成しない。
     let cache = VoiceVoxDiskCache::production();
     let cache_key = key_for_talk(text, speaker_id, scales);
-    let wav = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key)) {
+    let wav = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key, CacheKind::Wav)) {
         tracing::info!(cache_key, "VOICEVOX talk cache hit (HTTP skip)");
         hit
     } else {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| unreachable(e, "building HTTP client"))?;
+        let client = synth_client()?;
         let wav = synthesize_talk(&client, text, speaker_id, scales)?;
         if let Some(c) = cache.as_ref() {
-            c.put(cache_key, &wav);
+            c.put(cache_key, CacheKind::Wav, &wav);
         }
         wav
     };
@@ -404,18 +393,6 @@ pub fn decode_wav_to_f32(data: &[u8]) -> Result<(Vec<f32>, u32)> {
     Ok((mono, sr))
 }
 
-/// Finds the `"outputSamplingRate":<number>` substring in `json` so it can be replaced.
-/// Returns the full match including the key name, or `None` when the key is absent.
-fn find_sample_rate_field(json: &str) -> Option<String> {
-    let start = json.find("\"outputSamplingRate\":")?;
-    let after_key = start + "\"outputSamplingRate\":".len();
-    let end = json[after_key..]
-        .find(|c: char| !c.is_ascii_digit())
-        .map(|i| after_key + i)
-        .unwrap_or(json.len());
-    Some(json[start..end].to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +419,67 @@ mod tests {
         assert!(v["prePhonemeLength"].as_f64().unwrap().abs() < 1e-12);
         // 語尾の余韻 (postPhonemeLength) は engine 既定のまま。
         assert!((v["postPhonemeLength"].as_f64().unwrap() - 0.1).abs() < 1e-12);
+    }
+
+    /// frames = 10 の合成 FrameAudioQuery (phoneme は 3/4/3)。
+    fn fq_fixture() -> Value {
+        serde_json::json!({
+            "f0": (0..10).map(f64::from).collect::<Vec<f64>>(),
+            "volume": (0..10).map(|i| f64::from(i) * 0.1).collect::<Vec<f64>>(),
+            "phonemes": [
+                {"phoneme": "pau", "frame_length": 3},
+                {"phoneme": "r",   "frame_length": 4},
+                {"phoneme": "a",   "frame_length": 3},
+            ],
+            "volumeScale": 1.0,
+            "outputSamplingRate": 48000,
+        })
+    }
+
+    #[test]
+    fn frame_query_len_reads_f0() {
+        assert_eq!(frame_query_len(&fq_fixture()).unwrap(), 10);
+        let bad = serde_json::json!({"volume": []});
+        assert!(frame_query_len(&bad).is_err());
+    }
+
+    #[test]
+    fn slice_frame_query_cuts_arrays_and_phonemes() {
+        let fq = fq_fixture();
+        let out: Value = serde_json::from_str(&slice_frame_query(&fq, 2, 8).unwrap()).unwrap();
+        // f0 / volume は [a, b) をそのまま。
+        assert_eq!(out["f0"].as_array().unwrap().len(), 6);
+        assert!((out["f0"][0].as_f64().unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(out["volume"].as_array().unwrap().len(), 6);
+        // phoneme の合計 frame_length は b - a。
+        let ph = out["phonemes"].as_array().unwrap();
+        let total: u64 = ph
+            .iter()
+            .map(|p| p["frame_length"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, 6);
+        // 境界で切り詰められる: pau 3→1、r 4→4、a 3→1。
+        assert_eq!(ph.len(), 3);
+        assert_eq!(ph[0]["frame_length"].as_u64().unwrap(), 1);
+        assert_eq!(ph[1]["frame_length"].as_u64().unwrap(), 4);
+        assert_eq!(ph[2]["frame_length"].as_u64().unwrap(), 1);
+        // 範囲外の phoneme は落ちる。
+        let head: Value = serde_json::from_str(&slice_frame_query(&fq, 0, 3).unwrap()).unwrap();
+        assert_eq!(head["phonemes"].as_array().unwrap().len(), 1);
+        // 他 field はそのまま引き継ぐ (= 48 kHz 指定が保たれる)。
+        assert_eq!(out["outputSamplingRate"].as_u64().unwrap(), 48_000);
+        assert!((out["volumeScale"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slice_frame_query_rejects_phonemes_without_frame_length() {
+        // 黙って 0 扱いにすると全 phoneme が落ちて無音になるので、必ず Err にする。
+        let fq = serde_json::json!({
+            "f0": [0.0, 1.0],
+            "volume": [0.0, 0.1],
+            "phonemes": [{"phoneme": "a", "frameLength": 2}],
+        });
+        assert!(slice_frame_query(&fq, 0, 2).is_err());
     }
 
     /// 実 VOICEVOX engine に対する talk 合成の統合テスト。engine (localhost:50021) が要るので

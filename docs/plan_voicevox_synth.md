@@ -17,8 +17,9 @@
     `REST_FRAMES` の leading rest ぶん手前に置く。
   - talk = `talk_place_samples(start_beat, speed, bpm, sr)` — `prePhonemeLength`
     を 0 に注入してあるので実質「クリップ位置 = 発話開始」。
-  - 配置位置は **符号付き**。曲頭付近では負になり、その部分 (無音) は
-    `mix_placed_groups` が捨てる。位置をずらして回避しない。
+  - 配置位置は **符号付き**。曲頭付近では負になり、その部分 (無音) は mix が捨てる。
+    位置をずらして回避しない。(r.md #75 で `mix_placed_groups` は
+    `voicevox_render::MixBuffer` の差分 mix に置き換わったが、**この契約は不変**。)
 - **query の note 位置は絶対 frame**: `build_sing_query` は「基準ノートからの拍
   オフセットを frame へ丸めた絶対値」を先に確定してから frame_length 列に落とす。
   長さの下限 1 frame を確保するために **後続の位置を押し出さない**
@@ -105,6 +106,12 @@ click が clip / note (`playhead_beats` 基準) と別グリッドに載る。
     notes を flatten した「通し index」 を `note_id` として振る (= daw_gui
     `sync_vocal_metadata` と同じ番号体系で flush されるので builtin
     plugin は note_id ↔ 歌詞 / 合成 wav frame offset を正しく引ける)
+    — **r.md #75 で `common::plugin_metadata::sing_note_id(clip.id, note.id)` へ
+    置換済 (歴史的経緯)**。通し index は「クリップ先頭に 1 音足すと以降の全 note_id が
+    ずれる」欠陥があり、両側 (daw_gui / daw_audio) が独立に数え直していた。
+    現在は同じ関数を両側が呼ぶ安定 id (アーキ不変条件 1)。
+    合成そのものの分割 (フレーズ / 塊) の設計正本は
+    [`plan_rmd_75_voicevox_phrase.md`](plan_rmd_75_voicevox_phrase.md)。
   - `daw_plugin_host::clap_plugin`: `clap_event_note.note_id` field を
     encode/decode で host ↔ plugin 間に伝搬 (`-1` = "未指定" sentinel
     対応)

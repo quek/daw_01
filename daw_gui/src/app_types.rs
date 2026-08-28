@@ -1652,6 +1652,13 @@ pub struct VocalSynthStatus {
     /// engine には**到達できたが入力を拒否**された内容エラーの理由 (例: `lyricが不正です: ー`)。
     /// `Some` の間は「合成できない歌詞」警告を即時表示 (閾値なし)。到達成功/新規合成で `None`。
     pub rejected: Option<String>,
+    /// 未完了フレーズ数 / 総フレーズ数 (`VocalSynthProgress` の写し)。
+    /// r.md #75: 合成の最小単位はフレーズなので、進捗はトラック数ではなくフレーズ数で数える。
+    pub pending: u32,
+    pub total: u32,
+    /// 未完了フレーズが掛かっている clip id (昇順・重複なし)。クリップ上スピナーを
+    /// 「そのクリップに未完了の仕事があるときだけ」点けるために使う。
+    pub pending_clips: Vec<u32>,
 }
 
 /// 合成が `failing` のまま継続したとき「engine に接続できません」へ切り替える

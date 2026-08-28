@@ -555,3 +555,24 @@ RefetchSingers,
   `snap::subgrid_interval_beats` + `piano_roll_view.rs` 1 行 wire 済み。 縦グリッドの視覚確認は
   runtime が必要。
 - **#37**: gui_01 #099 landing 待ち。 daw_01 側変更なし。
+
+## 2026-08-28 追記 (r.md #75): 「声の解決」は per-clip のまま、「合成の単位」はフレーズ
+
+本書の「clip 単位で声を分ける」は**そのまま生きている** — `Clip.speaker_id` が声の SSoT で、
+`sync_vocal_metadata` が per-note の `NoteMetadata.speaker_id` に焼き込む。
+
+変わったのは **合成の単位**。旧実装は「解決済み speaker でグルーピングして、その声の全 note を
+1 query + 1 synth」だったが、r.md #75 で
+
+- **フレーズ** (= 隙間ゼロで続く note の極大列、同一 speaker。**クリップ境界では切らない**)
+  = `/frame_synthesis` の単位
+- **塊** (= 連続する複数フレーズ、既定 60 秒) = `/sing_frame_audio_query` の単位
+
+へ分割した。フレーズ分割は声でも切るので、per-clip 声の解決結果はそのまま尊重される。
+`§2 cache キーに per-clip 声を含める` も生きている (`key_for_sing_phrase` が `singer_id` を
+混ぜる)。ただしキャッシュ module は `common/src/voicevox_cache.rs` へ移設され、鍵は
+**フレーズ単体 query + singer + 塊の長さ**になった。設計正本は
+`docs/plan_rmd_75_voicevox_phrase.md`。
+
+なお `NoteMetadata.clip_id` の用途も変わった: 旧「builtin のグルーピング key」→
+「`sing_note_id` の導出元 + 合成進捗のクリップ帰属 (`VocalSynthProgress::pending_clips`)」。

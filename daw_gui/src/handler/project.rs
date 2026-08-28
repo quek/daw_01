@@ -102,6 +102,8 @@ impl AppData {
         // 進行中 bounce の完了通知を新 project に適用しない。
         self.ipc.pending_clip_fx_bounce = None;
         self.ipc.pending_vocal_synth_bounce = None;
+        // r.md #75: 書き出しの合成完了ゲートも同様 (前の曲の device を待ち続けない)。
+        self.ipc.pending_vocal_synth_export.clear();
         // r.md #54: 前の曲のラウドネスレポート (数値も「範囲 x – y」の拍も) を
         // 新しい曲のものとして見せない。走査中なら engine ごと畳む。
         self.abort_loudness_analysis("プロジェクトを切り替えたのでラウドネス解析を中止しました".into());
@@ -255,6 +257,8 @@ impl AppData {
                 .ui_prefs
                 .loudness_report_rect
                 .map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #75: 合成の塊の長さ (秒) も「この人の作業のしかた」側。
+            voicevox_chunk_secs: self.ui_prefs.voicevox_chunk_secs,
         };
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");

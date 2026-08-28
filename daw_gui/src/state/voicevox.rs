@@ -73,7 +73,7 @@ pub struct VoicevoxState {
     /// engine 未接続警告へ切り替える。plugin unload (`SlotPluginUnloadedFromChild`) で entry を消す。
     pub voicevox_synth_status: std::collections::HashMap<u64, VocalSynthStatus>,
     /// r.md #27: builtin VOICEVOX device ごとに、最後に `SetBuiltinPluginNoteMetadata`
-    /// で送った `(bpm, notes, talk)`。`sync_vocal_metadata` は epoch bump のたび
+    /// で送った `(bpm, chunk_secs, notes, talk)`。`sync_vocal_metadata` は epoch bump のたび
     /// (= あらゆる編集) に呼ばれるが、この device の歌唱/読み上げ入力が前回送信から
     /// 変わっていなければ **再送しない** (= builtin plugin が不要な再合成を走らせない。
     /// Transform 等の非 vocal 編集で VOICEVOX 合成が走る問題の修正)。差分検出で送信を
@@ -83,8 +83,14 @@ pub struct VoicevoxState {
         u64,
         (
             f32,
+            f32,
             Vec<common::plugin_metadata::NoteMetadata>,
             Vec<common::plugin_metadata::TalkMetadata>,
         ),
     >,
+    /// r.md #75: builtin VOICEVOX device ごとに、最後に `SetVocalSynthPriority` で送った
+    /// 再生ヘッド位置 (拍)。1 拍以上動いたときだけ再送するための記憶 (= トランスポート中
+    /// でも IPC は数 Hz 以下に収まる)。**再合成はトリガしない**軽量ヒントなので、
+    /// `voicevox_metadata_sent` (再送デデュープ) とは別に持つ。
+    pub priority_sent: std::collections::HashMap<u64, f64>,
 }

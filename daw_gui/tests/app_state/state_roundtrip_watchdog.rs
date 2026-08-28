@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent, VocalSynthFailure};
+use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent, VocalSynthProgress};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::shutdown::QuitRequest;
@@ -344,8 +344,7 @@ fn export_gate_flows_default_events_but_blocks_host_reconfig() {
     //     通す = 「allow 忘れ → deadlock」 が不能。
     app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus {
         device_id: 7,
-        busy: true,
-        failure: VocalSynthFailure::None,
+        progress: VocalSynthProgress { busy: true, ..Default::default() },
     }));
     assert!(
         app.voicevox.voicevox_synth_status.contains_key(&7),

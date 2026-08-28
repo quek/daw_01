@@ -795,11 +795,10 @@ impl PluginHost {
             // の第 2 callback 機構を HostCallbacks に統合)。
             on_vocal_synth_status: {
                 let tx = self.evt_tx.clone();
-                Arc::new(move |busy, failure| {
+                Arc::new(move |progress| {
                     let _ = tx.send(PluginEvent::VoicevoxSynthStatus {
                         device_id,
-                        busy,
-                        failure,
+                        progress,
                     });
                 })
             },
@@ -1115,6 +1114,7 @@ impl PluginHost {
             PluginCommand::SetBuiltinPluginNoteMetadata {
                 device_id,
                 bpm,
+                chunk_secs,
                 entries,
                 talk,
             } => {
@@ -1125,11 +1125,23 @@ impl PluginHost {
                 // VocalSynth capability (builtin VOICEVOX のみ Some)。CLAP /
                 // VST3 は None → silent no-op (IPC 経路は format-neutral)。
                 if let Some(vs) = rec.plugin.as_vocal_synth() {
-                    vs.set_note_metadata(bpm, &entries, &talk);
+                    vs.set_note_metadata(bpm, chunk_secs, &entries, &talk);
                 }
             }
             PluginCommand::PrepareVocalSynth { device_id } => {
                 self.prepare_vocal_synth(device_id);
+            }
+            PluginCommand::SetVocalSynthPriority {
+                device_id,
+                playhead_beats,
+            } => {
+                // device 未発見でも **warn を出さない** — トランスポート中に毎秒来る
+                // 順序ヒントなので、ログを汚さない。
+                if let Some(rec) = self.instances.get_mut(&device_id)
+                    && let Some(vs) = rec.plugin.as_vocal_synth()
+                {
+                    vs.set_priority_beats(playhead_beats);
+                }
             }
             PluginCommand::SetupAraDocument { device_id, clips, bpm, time_sig, archive } => {
                 // setup_ara は内部で deactivate→activate するので quiesce 契約。
@@ -1602,26 +1614,50 @@ impl PluginHost {
     }
 
     fn prepare_vocal_synth(&mut self, device_id: u64) {
-        // 歌唱 bounce の前に合成完了を保証する。builtin VOICEVOX の
-        // (queued, done) 世代 Arc を取り出し、直前 flush 世代まで done に
-        // なるのを別 thread で poll して VocalSynthReady を emit する。
+        /// 合成完了待ちの「停滞」判定。フレーズ 1 本の最大実測は 546 ms、engine の
+        /// コールドスタートを見ても 60 秒進捗が無ければ異常。**総時間では打ち切らない**
+        /// (5 分の曲の初回合成は実測 30 秒超で、旧 30 秒固定 deadline は部分ミックスを
+        /// 書き出していた。r.md #75)。
+        const SYNTH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // bounce / 曲全体の WAV 書き出しの前に合成完了を保証する。builtin VOICEVOX の
+        // (queued, done, heartbeat) を取り出し、直前 flush 世代まで done になるのを
+        // 別 thread で poll して VocalSynthReady を emit する。
         // 該当 builtin が無ければ即 ready。
         let progress = self
             .instances
             .get_mut(&device_id)
             .and_then(|rec| rec.plugin.as_vocal_synth().map(|vs| vs.synth_progress()));
-        if let Some((queued, done)) = progress {
+        if let Some((queued, done, heartbeat)) = progress {
             use std::sync::atomic::Ordering;
             let target_gen = queued.load(Ordering::SeqCst);
             let evt_thread = self.evt_tx.clone();
             let spawn = std::thread::Builder::new()
                 .name("voicevox-bounce-synth-wait".into())
                 .spawn(move || {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    while done.load(Ordering::SeqCst) < target_gen
-                        && std::time::Instant::now() < deadline
-                    {
+                    let mut last_seen = (
+                        done.load(Ordering::SeqCst),
+                        heartbeat.load(Ordering::SeqCst),
+                    );
+                    let mut last_change = std::time::Instant::now();
+                    while done.load(Ordering::SeqCst) < target_gen {
                         std::thread::sleep(std::time::Duration::from_millis(50));
+                        let now = (
+                            done.load(Ordering::SeqCst),
+                            heartbeat.load(Ordering::SeqCst),
+                        );
+                        if now != last_seen {
+                            last_seen = now;
+                            last_change = std::time::Instant::now();
+                        } else if last_change.elapsed() > SYNTH_STALL_TIMEOUT {
+                            tracing::warn!(
+                                device_id,
+                                target_gen,
+                                done = now.0,
+                                "vocal synth が 60 秒進捗しないため待機を打ち切る"
+                            );
+                            break;
+                        }
                     }
                     let _ = evt_thread.send(PluginEvent::VocalSynthReady { device_id });
                 });
@@ -2359,14 +2395,26 @@ fn log_command(cmd: &PluginCommand) {
                 "received SetSlotPlugin"
             );
         }
-        PluginCommand::SetBuiltinPluginNoteMetadata { device_id, bpm, entries, talk } => {
+        PluginCommand::SetBuiltinPluginNoteMetadata {
+            device_id,
+            bpm,
+            chunk_secs,
+            entries,
+            talk,
+        } => {
             tracing::debug!(
                 device_id,
                 bpm,
+                chunk_secs,
                 count = entries.len(),
                 talk = talk.len(),
                 "received SetBuiltinPluginNoteMetadata"
             );
+        }
+        // r.md #75: トランスポート中に毎 tick 来る順序ヒント。**必ず arm を持つこと** —
+        // 下の catch-all は `info!` なので、arm が無いとログが優先度ヒントで溢れる。
+        PluginCommand::SetVocalSynthPriority { device_id, playhead_beats } => {
+            tracing::trace!(device_id, playhead_beats, "received SetVocalSynthPriority");
         }
         PluginCommand::SetupAraDocument { device_id, clips, bpm, archive, .. } => {
             tracing::info!(

@@ -187,6 +187,22 @@ pub fn build_mouth_events(
 ### 7.4 明示コマンド
 - 「口パク再生成」を shortcut / context-menu に (force refresh)。
 
+### 7.5 query のディスクキャッシュ (r.md #75、2026-08-28 追加)
+- `query_phonemes` / `query_talk_phonemes` は応答 JSON を
+  `common::voicevox_cache` (`CacheKind::Json`) に保存する。鍵は **入力**
+  (`key_for_sing_query(score_json)` / `key_for_talk_query(text, speaker_id)`) で、
+  engine の応答ではない (`/sing_frame_audio_query` は非決定的なので、応答を鍵にすると
+  毎回 miss する)。これで「入力が変わっていないクリップ」の口パク再生成は HTTP が丸ごと消える。
+- **口パク query と合成側の塊クエリは別物**なので共有しない。粒度もビート空間も違う
+  (口パクは per-clip・端 rest = `REST_FRAMES`、合成は塊 60 秒・端 rest =
+  `PHRASE_PAD_FRAMES`)。`lipsync_input_fingerprint` の再生成判定も従来どおり。
+- ただし **鍵関数 `key_for_sing_query` は 1 本を共有する**。端 rest が違うので実際には
+  衝突しないが、それは偶然なので「この鍵空間へ入れる値は必ず
+  `common::voicevox::normalize_frame_query` を通す」を不変条件にしてある
+  (`voicevox_cache::lipsync_and_chunk_queries_do_not_share_a_key` が事実を固定する)。
+- 合成側の変更 (フレーズ単位合成) は口パクの配置に影響しない —
+  `REST_FRAMES` / `sing_head_beat` / `sing_base_beat` は一切動かしていない。
+
 ## 8. preview / export
 追加描画コード不要。口 track は子 image レイヤーなので
 `active_image_sources_at` → group 合成 → preview / `render_video.rs` の既存経路で

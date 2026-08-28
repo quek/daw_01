@@ -1018,6 +1018,17 @@ impl AppData {
             self.restore_engine_song_after_bounce();
             export_aborted = true;
         }
+        // r.md #75: WAV 書き出しの合成完了ゲートも同型の脱出口が要る。plugin host が
+        // 落ちたら `VocalSynthReady` は永遠に来ないので、待ち集合を畳んで書き出しを
+        // 中止する (`export_stage` は既に AudioRender なので既存の脱出口がそのまま効く:
+        // overlay / 入力 gate / temp WAV / SetRenderMode(Realtime) を畳む)。
+        if !self.ipc.pending_vocal_synth_export.is_empty() {
+            self.ipc.pending_vocal_synth_export.clear();
+            self.transport.pending_export = None;
+            export_aborted |= self.abort_audio_export(
+                "子プロセスが切断されたため書き出しを中止しました".into(),
+            );
+        }
 
         // 中止した書き出しがあれば status に併記する suffix。
         let export_suffix = if export_aborted {

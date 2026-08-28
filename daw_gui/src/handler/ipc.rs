@@ -206,10 +206,20 @@ impl AppData {
                 }
             }
             PluginEvent::VocalSynthReady { device_id } => {
+                // r.md #75: 曲全体の WAV 書き出しの合成完了ゲート。全 VOICEVOX device の
+                // ready が揃ってから reinit → render へ進む (揃う前に render すると
+                // 部分ミックスが焼かれる)。
+                if self.ipc.pending_vocal_synth_export.remove(&device_id)
+                    && self.ipc.pending_vocal_synth_export.is_empty()
+                {
+                    // 合成に掛かった時間を書き出し watchdog の 60 秒に食わせないため、
+                    // ここで進捗時刻を打ち直す。
+                    self.transport.export_progress_at = Some(std::time::Instant::now());
+                    self.send_plugin(PluginCommand::ReinitAllPlugins);
+                }
                 // 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
                 // device_id は echo back 用。 pending があれば offline render を開始する。
                 // 合成待ち中の編集で index が動いていても stable id で現在位置へ解決する。
-                let _ = device_id;
                 if let Some(p) = self.ipc.pending_vocal_synth_bounce.take() {
                     let resolved = self
                         .song_doc
@@ -362,10 +372,9 @@ impl AppData {
             }
             PluginEvent::VoicevoxSynthStatus {
                 device_id,
-                busy,
-                failure,
+                progress,
             } => {
-                self.apply_voicevox_synth_status(device_id, busy, failure);
+                self.apply_voicevox_synth_status(device_id, progress);
             }
         }
     }

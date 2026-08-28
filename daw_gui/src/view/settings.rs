@@ -14,7 +14,7 @@
 
 use std::cell::Cell;
 
-use daw_ui_core::{DragKind, Edit, Ui};
+use daw_ui_core::{DragKind, Edit, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
@@ -32,8 +32,12 @@ const TITLE_H: f32 = 24.0;
 const CLOSE_W: f32 = 26.0;
 const ROW_H: f32 = 24.0;
 const ROW_GAP: f32 = 1.0;
-/// セクション見出し (「テーマ」) の高さ。
+/// セクション見出し (「VOICEVOX」「テーマ」) の高さ。
 const SECTION_H: f32 = 22.0;
+/// 「VOICEVOX」セクション本体 (数値欄 1 行 + 説明 2 行) の高さ。
+const VOX_SECTION_H: f32 = 66.0;
+/// 数値欄の幅 (px)。
+const VOX_FIELD_W: f32 = 70.0;
 /// 下端に出す「テーマの置き場所」ヒント行の高さ。
 const HINT_H: f32 = 30.0;
 /// 端リサイズ grab 帯の幅 (px)。
@@ -179,8 +183,20 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleSettings)),
     );
 
+    // セクション見出し「VOICEVOX」+ 「合成の塊の長さ (秒)」。
+    let vox_y = rect.y + TITLE_H + 4.0;
+    ui.label_at(
+        "settings_sec_vox",
+        "VOICEVOX",
+        rect.x + 12.0,
+        vox_y + (SECTION_H - 12.0) * 0.5,
+        12.0,
+        p.text_dim,
+    );
+    draw_voicevox_section(app, ui, rect, vox_y + SECTION_H);
+
     // セクション見出し「テーマ」。
-    let section_y = rect.y + TITLE_H + 4.0;
+    let section_y = vox_y + SECTION_H + VOX_SECTION_H;
     ui.label_at(
         "settings_sec_theme",
         "テーマ",
@@ -197,7 +213,9 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         x: rect.x + 1.0,
         y: section_y + SECTION_H,
         w: (rect.w - 1.0 - RESIZE_MARGIN).max(0.0),
-        h: (rect.h - TITLE_H - SECTION_H - 4.0 - HINT_H - RESIZE_MARGIN).max(0.0),
+        // VOICEVOX セクション (見出し + 本体) のぶん高さを引く。
+        h: (rect.h - TITLE_H - SECTION_H * 2.0 - VOX_SECTION_H - 4.0 - HINT_H - RESIZE_MARGIN)
+            .max(0.0),
     };
     draw_theme_list(app, ui, list_rect);
 
@@ -223,6 +241,69 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             0.0,
         );
     }
+}
+
+/// 「VOICEVOX」セクション本体 (r.md #75): 合成の塊の長さ (秒)。
+///
+/// 数値欄は inspector / export range と同じ `scrubable_number_at` の idiom
+/// (drag-to-edit + click-to-type)。クランプは widget 側の `range` に持たせるので、
+/// 掴んで振り切っても範囲外にならない。
+fn draw_voicevox_section(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) {
+    let p = &app.theme.core;
+    ui.label_at(
+        "settings_vv_chunk_label",
+        "合成の塊の長さ (秒)",
+        rect.x + 12.0,
+        y + 6.0,
+        12.0,
+        p.text,
+    );
+    let field_rect = Rect {
+        x: (rect.x + rect.w - RESIZE_MARGIN - VOX_FIELD_W - 12.0).max(rect.x + 12.0),
+        y,
+        w: VOX_FIELD_W,
+        h: ROW_H,
+    };
+    let _ = ui.scrubable_number_at(
+        "settings_vv_chunk",
+        field_rect,
+        f64::from(app.ui_prefs.voicevox_chunk_secs),
+        f64::from(common::voicevox_phrase::DEFAULT_CHUNK_SECS),
+        ScrubableNumberFormat::Integer,
+        &ScrubableNumberStyle {
+            font_size: 13.0,
+            sensitivity: 0.5,
+            // クランプは widget 側に持たせる (= 掴んで振り切っても範囲外にならない)。
+            range: Some((
+                f64::from(common::voicevox_phrase::MIN_CHUNK_SECS),
+                f64::from(common::voicevox_phrase::MAX_CHUNK_SECS),
+            )),
+            ..ScrubableNumberStyle::from_palette(p)
+        },
+        |v| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetVoicevoxChunkSecs(v as f32));
+            })
+        },
+        None,
+        None,
+    );
+    ui.label_at(
+        "settings_vv_chunk_hint1",
+        "短いほど 1 音直したときが速く、長いほど音量が揃う。既定 60 秒。",
+        rect.x + 12.0,
+        y + ROW_H + 6.0,
+        10.0,
+        p.text_faint,
+    );
+    ui.label_at(
+        "settings_vv_chunk_hint2",
+        "変えると曲全体を合成し直します (前の設定の音はキャッシュに残るので、戻せばすぐ鳴ります)。",
+        rect.x + 12.0,
+        y + ROW_H + 20.0,
+        10.0,
+        p.text_faint,
+    );
 }
 
 fn draw_theme_list(app: &AppData, ui: &mut Ui<'_, AppData>, list_rect: Rect) {

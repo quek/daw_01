@@ -141,13 +141,13 @@ pub struct HostCallbacks {
     pub on_param_value: Arc<dyn Fn(u32, f64) + Send + Sync>,
     /// VST3 only: plugin GUI param gesture end (`endEdit`).
     pub on_param_gesture_end: Arc<dyn Fn(u32) + Send + Sync>,
-    /// builtin VOICEVOX の合成状態 `(busy, failure)` 報告。旧「第 2 の
+    /// builtin VOICEVOX の合成状態 + 進捗の報告。旧「第 2 の
     /// callback 登録機構」(`set_voicevox_status_reporter`) を廃止して
     /// ここに統合 (`docs/plan_arch_refactor.md` §6)。synth thread が任意
-    /// スレッドから呼ぶ。`failure` は engine 到達可否を区別する
-    /// (`common::protocol::VocalSynthFailure`)。
+    /// スレッドから呼ぶ。payload は `common::protocol::VocalSynthProgress`
+    /// (busy / 失敗種別 / 残フレーズ数 / クリップ帰属) で、**IPC の payload と同じ型**。
     pub on_vocal_synth_status:
-        Arc<dyn Fn(bool, common::protocol::VocalSynthFailure) + Send + Sync>,
+        Arc<dyn Fn(common::protocol::VocalSynthProgress) + Send + Sync>,
     /// r.md #65: このインスタンスのエディタ**コンテナ窓の HWND** (`0` = 未 open)。
     ///
     /// **`on_request_resize` (非同期 channel) では VST3 の契約を満たせない**ので置く。
@@ -315,7 +315,7 @@ impl HostCallbacks {
             on_param_gesture_begin: Arc::new(|_| {}),
             on_param_value: Arc::new(|_, _| {}),
             on_param_gesture_end: Arc::new(|_| {}),
-            on_vocal_synth_status: Arc::new(|_, _| {}),
+            on_vocal_synth_status: Arc::new(|_| {}),
             editor_hwnd: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -464,13 +464,27 @@ impl AudioHalf {
 /// opt-in downcast ([`LoadedPlugin::as_vocal_synth`]) instead of a set of
 /// default-no-op methods on every plugin.
 pub trait VocalSynth {
-    /// Per-note metadata flush (歌詞 + talk)。plugin-main thread から、GUI
-    /// 側で歌詞 / phoneme が編集されるたびに呼ばれる。
-    fn set_note_metadata(&mut self, bpm: f32, entries: &[NoteMetadata], talk: &[TalkMetadata]);
+    /// Per-note metadata flush (歌詞 + talk + 塊の長さ)。plugin-main thread から、
+    /// GUI 側で歌詞 / phoneme が編集されるたびに呼ばれる。
+    ///
+    /// `chunk_secs` は `/sing_frame_audio_query` 1 回にまとめる長さ (秒)。
+    /// **合成結果を変える入力**なので、フレーズ WAV のキャッシュキーにも混ざる。
+    fn set_note_metadata(
+        &mut self,
+        bpm: f32,
+        chunk_secs: f32,
+        entries: &[NoteMetadata],
+        talk: &[TalkMetadata],
+    );
 
-    /// `(queued_gen, done_gen)` 世代カウンタ。歌唱 bounce 前の合成完了待ち
-    /// (`PrepareVocalSynth`) が `done >= queued` を poll する。
-    fn synth_progress(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>);
+    /// 再生ヘッド優先ヒント。再生位置に近いフレーズから合成させる。
+    /// **再合成はトリガしない** (順序だけを変える)。
+    fn set_priority_beats(&mut self, playhead_beats: f64);
+
+    /// `(queued_gen, done_gen, phrase_heartbeat)`。bounce / 書き出し前の合成完了待ち
+    /// (`PrepareVocalSynth`) は `done >= queued` を待ち、**heartbeat が動いている間は
+    /// 打ち切らない** (総時間で切ると長い曲が部分ミックスで書き出される)。
+    fn synth_progress(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>);
 }
 
 // ====================================================================

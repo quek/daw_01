@@ -122,6 +122,12 @@ pub enum AppEvent {
     /// 編集が次回にそのまま効く)。 切替は即時で全画面に反映され、`app_config.json`
     /// に保存される。 Song は触らないので Undo / dirty 対象外。
     SetTheme(String),
+    /// r.md #75: VOICEVOX 歌唱合成の「塊」(= `/sing_frame_audio_query` 1 回) の長さ (秒)。
+    /// handler が有効範囲へクランプして `app_config.json` に保存し、**曲全体を合成し直す**
+    /// (フレーズ WAV のキャッシュキーに `chunk_secs` が入っているので、再送しないと
+    /// 全 hit で何も変わらない = つまみが嘘になる)。前の設定の音はキャッシュに残るので、
+    /// 戻せば即座に鳴る。Song は触らないので Undo / dirty 対象外。
+    SetVoicevoxChunkSecs(f32),
     /// r.md #29: 履歴リストの行 click。 `index` = [`crate::state::SongDoc::history_labels`]
     /// の 0 始まり index。 その state まで一気に Undo / Redo する
     /// ([`crate::state::SongDoc::jump_to`])。 履歴操作自体は Undo 対象外。

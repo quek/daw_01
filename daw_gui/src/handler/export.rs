@@ -160,7 +160,27 @@ impl AppData {
         // 全 plugin を deactivate→activate でクリーンにしてから export する。
         // 完了 (`PluginsReinitDone`) で stashed export を発火。
         self.transport.pending_export = Some((path, range, write_mod_sidecar));
-        self.send_plugin(PluginCommand::ReinitAllPlugins);
+
+        // r.md #75: 合成が終わる前に render すると部分ミックスが焼かれる (フレーズ単位で
+        // 逐次 publish するようになったため)。全 VOICEVOX device に最新メタデータを
+        // 流し直して完了を待つ。
+        // **reinit より前**に待つ — deactivate は synth thread を止めるので、走っている
+        // job があるとそこで捨てられ、`done_gen` が永久に追いつかない。
+        let devices = self.all_vocal_synth_device_ids();
+        if devices.is_empty() {
+            self.send_plugin(PluginCommand::ReinitAllPlugins);
+            return;
+        }
+        for &device_id in &devices {
+            // bounce と同じ理由で差分キャッシュを迂回する (前回失敗していても再試行し、
+            // 合成世代を必ず 1 つ進めて `VocalSynthReady` を確実に返させる)。
+            self.voicevox.voicevox_metadata_sent.remove(&device_id);
+        }
+        self.sync_vocal_metadata();
+        self.ipc.pending_vocal_synth_export = devices.iter().copied().collect();
+        for device_id in devices {
+            self.send_plugin(PluginCommand::PrepareVocalSynth { device_id });
+        }
     }
 
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...

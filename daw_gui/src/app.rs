@@ -229,6 +229,7 @@ impl AppData {
                 plugin_tx: Some(plugin_tx),
                 pending_clip_fx_bounce: None,
                 pending_vocal_synth_bounce: None,
+                pending_vocal_synth_export: std::collections::HashSet::new(),
                 open_plugin_guis: std::collections::HashSet::new(),
                 pending_plugin_loads: std::collections::HashMap::new(),
                 next_plugin_load_generation: 0,
@@ -255,6 +256,7 @@ impl AppData {
                 lipsync_fingerprints: std::collections::HashMap::new(),
                 voicevox_synth_status: std::collections::HashMap::new(),
                 voicevox_metadata_sent: std::collections::HashMap::new(),
+                priority_sent: std::collections::HashMap::new(),
             },
             media: MediaState {
                 audio_source_cache: AudioSourceCache::new(),
@@ -333,6 +335,8 @@ impl AppData {
                 master_panel_w: app_config.master_panel_w,
                 master_panel_sections: app_config.master_panel_sections,
                 meter_settings: app_config.meter,
+                // r.md #75: VOICEVOX 合成の塊の長さ (秒)。load 側でクランプ済。
+                voicevox_chunk_secs: app_config.voicevox_chunk_secs,
                 is_help_open: false,
                 is_about_open: false,
                 app_dirs,
@@ -792,6 +796,22 @@ impl AppData {
                 let dirs = self.ui_prefs.app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir);
                 self.theme = crate::theme::resolve(dirs.as_deref(), &id);
                 self.persist_app_config();
+            }
+            // r.md #75: 合成の塊の長さ。**これは合成結果を変える入力**なので、
+            // 差分キャッシュを落として全 device へ流し直す (= 曲全体の再合成)。
+            // 落とさないと再送されず、キーに混ぜてある以上「設定が効かない」ように見える。
+            AppEvent::SetVoicevoxChunkSecs(secs) => {
+                let next = secs.clamp(
+                    common::voicevox_phrase::MIN_CHUNK_SECS,
+                    common::voicevox_phrase::MAX_CHUNK_SECS,
+                );
+                if (next - self.ui_prefs.voicevox_chunk_secs).abs() < 1e-3 {
+                    return;
+                }
+                self.ui_prefs.voicevox_chunk_secs = next;
+                self.persist_app_config();
+                self.voicevox.voicevox_metadata_sent.clear();
+                self.sync_vocal_metadata();
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
             AppEvent::JumpHistory(index) => self.jump_history_to(index),
