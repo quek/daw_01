@@ -33,6 +33,21 @@ const ROW_H: f32 = 50.0;
 const SEC_Y: f32 = 29.0;
 
 fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
+    build_app_with_header(0.0)
+}
+
+/// header pane を踏むテスト用の fixture。 `arrange_header_w` 以外は `build_app()` と同一。
+///
+/// `build_app()` (= `build_app_with_header(0.0)`) では press 側 (`press_header::dispatch` の
+/// `f.header_w > 0.0`) と描画側 (`header::draw_rows` の同ゲート) がともに丸ごと skip されるので、
+/// header pane を踏むテストは `build_app_with_header(160.0)` (production default、`app.rs`) を使う。
+///
+/// **既存テストの座標定数 (`ZOOM` / `WIDGET_RECT.w` / `track0_y()` 等) を header 側と共有しないこと。**
+/// `lanes.x` が 0 → 160 にずれ、`view.len_beats` も `640/64 = 10.0` に変わる (beat→x は
+/// `160.0 + beat * ZOOM`)。`beat_per_px` は `len_beats / lanes.w` なので header_w に依らず `1/64`。
+fn build_app_with_header(
+    header_w: f32,
+) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel();
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
     let event_dispatcher = RecordingDispatcher::new();
@@ -50,7 +65,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         48_000,
     );
     // 決定的な pixel→beat 変換のため view 由来の ui_prefs を固定。
-    app.ui_prefs.arrange_header_w = 0.0;
+    app.ui_prefs.arrange_header_w = header_w;
     app.ui_prefs.arrange_zoom_x = ZOOM;
     app.ui_prefs.arrange_scroll_beat = 0.0;
     app.ui_prefs.arrange_track_row_h = ROW_H;
