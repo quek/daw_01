@@ -332,7 +332,6 @@ FN-NESTING | daw_gui/src/view/runner.rs::Runner::sync_preview_window            
 #    ならない (r.md #9) ので、ほどく際に条件の抜けを作らないこと。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
 FN-NESTING | daw_gui/src/midi_import.rs::scan_track          | 8/40 | モデル変換。未起票
-FN-NESTING | common/src/model.rs::Song::ensure_clip_contents | 7/8  | モデル変換。未起票
 FN-NESTING | daw_gui/src/voicevox_client.rs::fetch_voices    | 7/4  | モデル変換。未起票
 FN-NESTING | common/src/project.rs::migrate_legacy_clip_content | 7/3 | モデル変換。未起票
 

@@ -97,11 +97,6 @@ fn add_track_automation_clip(
     app.edit_song(|song| {
         song.tracks[track_idx].automation_lanes.push(AutomationLane {
             id: lane_id,
-            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            default_value: 0.0,
-            enabled: true,
-            visible: true,
-            height_px: 60,
             clips: vec![AutomationClip {
                 id: clip_id,
                 name: String::new(),
@@ -111,6 +106,10 @@ fn add_track_automation_clip(
                 content_offset_beats: 0.0,
             }],
             next_clip_id: clip_id + 1,
+            ..AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                0.0,
+            )
         });
     });
 }
@@ -167,11 +166,6 @@ fn z_縦ズームは_master_行の_automation_clip_を行_0_として扱う() {
     app.edit_song(|song| {
         song.song_lanes.push(AutomationLane {
             id: 1,
-            target: AutomationTarget::SongTempo,
-            default_value: 120.0,
-            enabled: true,
-            visible: true,
-            height_px: 60,
             clips: vec![AutomationClip {
                 id: 1,
                 name: String::new(),
@@ -181,6 +175,7 @@ fn z_縦ズームは_master_行の_automation_clip_を行_0_として扱う() {
                 content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
+            ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
         });
     });
     let track_id = app.song_doc.song().tracks[0].id;
@@ -284,13 +279,12 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
     app.edit_song(|song| {
         song.tracks[0].automation_lanes.push(AutomationLane {
             id: 1,
-            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            default_value: 0.0,
-            enabled: true,
-            visible: true,
-            height_px: 60,
             clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 }],
             next_clip_id: 2,
+            ..AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                0.0,
+            )
         });
     });
     app.edit_song(|song| song.tracks[0].clips.push(Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() }));
@@ -461,16 +455,15 @@ fn z_は別_clip_を選び直すと新しい選択へ横ズームし直す() {
     app.edit_song(|song| {
         song.tracks[0].automation_lanes.push(AutomationLane {
             id: 1,
-            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            default_value: 0.0,
-            enabled: true,
-            visible: true,
-            height_px: 60,
             clips: vec![
                 AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 },
                 AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 },
             ],
             next_clip_id: 3,
+            ..AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                0.0,
+            )
         });
     });
     set_default_layout(&mut app, track_id);

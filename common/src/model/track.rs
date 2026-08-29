@@ -156,6 +156,20 @@ pub struct Track {
     /// v20 files forward-migrate to `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouth_map: Option<MouthMap>,
+    /// v35 (r.md #87 クリップランチャー): この**トラック行**のセル。列は
+    /// [`SessionClip::scene_id`] が指す (`Song.scenes` の id、positional index ではない)。
+    ///
+    /// `clip.id` は `next_clip_id` の **`clips` と同じ id 空間**から採る — これで
+    /// `ClipKey { track_id, clip_id }` が arrangement のクリップと同じ形で通り、
+    /// 選択 / undo / 色 / mute / 共有 content / ピアノロールがそのまま効く。
+    /// 逆に **`clips` と `session_clips` で同じ id を再利用してはいけない**。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_clips: Vec<SessionClip>,
+    /// v35 (r.md #87): このトラック行の主導権 (アレンジ / ランチャー)。
+    /// 停止しても消えず `.daw` に保存する — 停止 → 再生で同じセルが鳴り直し、
+    /// 書き出す音もこの状態で決まる (`docs/plan_rmd_87_clip_launcher.md` Q9 / Q10)。
+    #[serde(default, skip_serializing_if = "RowPlayback::is_arranger")]
+    pub launcher: RowPlayback,
 }
 
 /// Where a `Send` taps the source track's signal chain.
@@ -240,6 +254,8 @@ impl Default for Track {
             group_transform: None,
             lipsync_target_track: None,
             mouth_map: None,
+            session_clips: Vec::new(),
+            launcher: RowPlayback::Arranger,
         }
     }
 }
@@ -290,6 +306,40 @@ impl Default for GroupTransform {
 }
 
 impl Track {
+    /// v35 (r.md #87): arrangement (`clips`) と launcher (`session_clips`) の
+    /// **全 Clip**。
+    ///
+    /// **content の参照数え上げ / GC / content_id 採番はこの 1 本を通すこと。**
+    /// 片方を数え落とすと、保存時に GC が「誰も参照していない content」と判定して
+    /// **セルの中身が黙って消える**。
+    pub fn all_clips(&self) -> impl Iterator<Item = &Clip> {
+        self.clips.iter().chain(self.session_clips.iter().map(|s| &s.clip))
+    }
+
+    /// [`Self::all_clips`] の可変版。
+    pub fn all_clips_mut(&mut self) -> impl Iterator<Item = &mut Clip> {
+        self.clips
+            .iter_mut()
+            .chain(self.session_clips.iter_mut().map(|s| &mut s.clip))
+    }
+
+    /// 列 (`scene_id`) にあるこのトラック行のセル。
+    #[must_use]
+    pub fn session_clip(&self, scene_id: u32) -> Option<&SessionClip> {
+        self.session_clips.iter().find(|s| s.scene_id == scene_id)
+    }
+
+    /// 列 (`scene_id`) にあるこのトラック行のセル (可変)。
+    pub fn session_clip_mut(&mut self, scene_id: u32) -> Option<&mut SessionClip> {
+        self.session_clips.iter_mut().find(|s| s.scene_id == scene_id)
+    }
+
+    /// `clip_id` でセルを引く (`clip_id` は行内で一意 — `clips` と id 空間を共有する)。
+    #[must_use]
+    pub fn session_clip_by_id(&self, clip_id: u32) -> Option<&SessionClip> {
+        self.session_clips.iter().find(|s| s.clip.id == clip_id)
+    }
+
     /// このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
     /// 「builtin VOICEVOX device を実際に持つか」。 旧 `InstrumentSource::Vocal`
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
@@ -354,18 +404,25 @@ impl Track {
 
     /// Re-assign stable ids to all clips. Idempotent (clips with non-zero
     /// ids are left alone, counter is bumped above the max seen).
+    /// v35 (r.md #87): arrangement の `clips` と launcher の `session_clips` は
+    /// **同じ id 空間**なので、両方を 1 回の走査で採番する。未採番 (`0`) と
+    /// **重複**を採り直すので冪等 (2 回呼んでも同じ結果 = 開いただけで `*` が立たない)。
     pub fn ensure_clip_ids(&mut self) {
-        for clip in &mut self.clips {
-            if clip.id == 0 {
-                clip.id = self.next_clip_id.max(1);
-                self.next_clip_id = clip.id + 1;
-            } else if clip.id >= self.next_clip_id {
-                self.next_clip_id = clip.id + 1;
+        let mut next = self.next_clip_id.max(1);
+        for clip in self.all_clips() {
+            if clip.id != 0 {
+                next = next.max(clip.id.saturating_add(1));
             }
         }
-        if self.next_clip_id == 0 {
-            self.next_clip_id = 1;
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for clip in self.all_clips_mut() {
+            if clip.id == 0 || !seen.insert(clip.id) {
+                clip.id = next;
+                seen.insert(next);
+                next = next.saturating_add(1);
+            }
         }
+        self.next_clip_id = next.max(1);
     }
 
     pub fn clip_index_by_id(&self, clip_id: u32) -> Option<usize> {

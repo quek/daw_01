@@ -355,11 +355,6 @@ impl AppData {
                     let lid = song.alloc_song_lane_id();
                     song.song_lanes.push(AutomationLane {
                         id: lid,
-                        target: target.clone(),
-                        default_value,
-                        enabled: true,
-                        visible: true,
-                        height_px: 60,
                         clips: vec![AutomationClip {
                             id: 1,
                             name: "Rec".into(),
@@ -369,6 +364,7 @@ impl AppData {
                             content_offset_beats: 0.0,
                         }],
                         next_clip_id: 2,
+                        ..AutomationLane::new(target.clone(), default_value)
                     });
                 }
             });
@@ -397,11 +393,6 @@ impl AppData {
                         let lid = track.alloc_lane_id();
                         track.automation_lanes.push(AutomationLane {
                             id: lid,
-                            target: target.clone(),
-                            default_value,
-                            enabled: true,
-                            visible: true,
-                            height_px: 60,
                             clips: vec![AutomationClip {
                                 id: 1,
                                 name: "Rec".into(),
@@ -411,6 +402,7 @@ impl AppData {
                                 content_offset_beats: 0.0,
                             }],
                             next_clip_id: 2,
+                            ..AutomationLane::new(target.clone(), default_value)
                         });
                     }
                     true

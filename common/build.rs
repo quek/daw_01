@@ -23,6 +23,11 @@ const WIRE_SOURCES: &[&str] = &[
     "src/model/modulation.rs",
     "src/model/content.rs",
     "src/model/automation.rs",
+    // model.rs から切り出した `IdAllocators` (Song.ids として wire を渡る)。
+    "src/model/ids.rs",
+    // r.md #87 (クリップランチャー): Scene / SessionClip / LaunchSettings / FollowAction /
+    // RowPlayback。Song に載って `LoadSong` の wire を渡るので登録必須 (不変条件 7)。
+    "src/model/session.rs",
     "src/loudness_report.rs",
     // Song.scale_changes が持つ型 (Scale / KeySignature 等) の定義。model.rs から
     // 参照され `LoadSong` の wire に載るのに未登録だった (r.md #54 レビューで発覚)。

@@ -99,10 +99,6 @@ fn add_automation_lane(app: &mut AppData) {
             t.id = 1;
             t.automation_lanes = vec![AutomationLane {
                 id: 1,
-                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                default_value: 1.0,
-                enabled: true,
-                visible: true,
                 height_px: 80,
                 clips: vec![AutomationClip {
                     id: 1,
@@ -113,6 +109,10 @@ fn add_automation_lane(app: &mut AppData) {
                     content_offset_beats: 0.0,
                 }],
                 next_clip_id: 2,
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    1.0,
+                )
             }];
         }));
     });
@@ -449,10 +449,6 @@ fn add_bend_lane(app: &mut AppData) {
             t.id = 1;
             t.automation_lanes = vec![AutomationLane {
                 id: 1,
-                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                default_value: 0.0,
-                enabled: true,
-                visible: true,
                 height_px: 80,
                 clips: vec![AutomationClip {
                     id: 1,
@@ -463,6 +459,10 @@ fn add_bend_lane(app: &mut AppData) {
                     content_offset_beats: 0.0,
                 }],
                 next_clip_id: 2,
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    0.0,
+                )
             }];
         }));
     });

@@ -875,10 +875,6 @@ fn add_expanded_automation_lane(app: &mut AppData, track_id: u32, lane_id: u32) 
         if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
             t.automation_lanes.push(AutomationLane {
                 id: lane_id,
-                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                default_value: 0.5,
-                enabled: true,
-                visible: true,
                 height_px: LANE_H,
                 clips: vec![AutomationClip {
                     id: 1,
@@ -889,6 +885,10 @@ fn add_expanded_automation_lane(app: &mut AppData, track_id: u32, lane_id: u32) 
                     content_offset_beats: 0.0,
                 }],
                 next_clip_id: 2,
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    0.5,
+                )
             });
         }
     });
@@ -1448,10 +1448,6 @@ fn add_bend_lane(app: &mut AppData, values: (f64, f64), curve: AutomationCurve) 
         if let Some(t) = song.tracks.iter_mut().find(|t| t.id == 1) {
             t.automation_lanes = vec![AutomationLane {
                 id: 1,
-                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                default_value: 1.0,
-                enabled: true,
-                visible: true,
                 height_px: LANE_H,
                 clips: vec![AutomationClip {
                     id: 1,
@@ -1462,6 +1458,10 @@ fn add_bend_lane(app: &mut AppData, values: (f64, f64), curve: AutomationCurve) 
                     content_offset_beats: 0.0,
                 }],
                 next_clip_id: 2,
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    1.0,
+                )
             }];
         }
     });

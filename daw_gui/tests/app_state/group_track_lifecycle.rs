@@ -443,17 +443,14 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     app.edit_song(|song| {
         song.tracks[0].automation_lanes.push(AutomationLane {
             id: 1,
-            target: AutomationTarget::PluginParam {
-                device_id: bitcrush_dev,
-                param_id: 42,
-                legacy_device_index: None,
-            },
-            default_value: 0.25,
-            enabled: true,
-            visible: true,
-            height_px: 60,
-            clips: Vec::new(),
-            next_clip_id: 1,
+            ..AutomationLane::new(
+                AutomationTarget::PluginParam {
+                    device_id: bitcrush_dev,
+                    param_id: 42,
+                    legacy_device_index: None,
+                },
+                0.25,
+            )
         });
     });
 

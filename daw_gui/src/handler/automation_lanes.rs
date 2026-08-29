@@ -106,16 +106,8 @@ impl AppData {
                 return false;
             };
             let lane_id = track.alloc_lane_id();
-            let new_lane = AutomationLane {
-                id: lane_id,
-                target: target.clone(),
-                default_value,
-                enabled: true,
-                visible: true,
-                height_px: 60,
-                clips: Vec::new(),
-                next_clip_id: 1,
-            };
+            let new_lane =
+                AutomationLane { id: lane_id, ..AutomationLane::new(target.clone(), default_value) };
             track.automation_lanes.push(new_lane);
             true
         });
@@ -375,13 +367,7 @@ impl AppData {
             let lane_id = track.alloc_lane_id();
             track.automation_lanes.push(AutomationLane {
                 id: lane_id,
-                target: target.clone(),
-                default_value,
-                enabled: true,
-                visible: true,
-                height_px: 60,
-                clips: Vec::new(),
-                next_clip_id: 1,
+                ..AutomationLane::new(target.clone(), default_value)
             });
             true
         });
@@ -854,13 +840,7 @@ impl AppData {
             let lane_id = track.alloc_lane_id();
             track.automation_lanes.push(AutomationLane {
                 id: lane_id,
-                target: target.clone(),
-                default_value,
-                enabled: true,
-                visible: true,
-                height_px: 60,
-                clips: Vec::new(),
-                next_clip_id: 1,
+                ..AutomationLane::new(target.clone(), default_value)
             });
             true
         });
@@ -1195,13 +1175,7 @@ impl AppData {
                 let lane_id = song.alloc_song_lane_id();
                 let new_lane = common::model::AutomationLane {
                     id: lane_id,
-                    target: touched.target.clone(),
-                    default_value,
-                    enabled: true,
-                    visible: true,
-                    height_px: 60,
-                    clips: Vec::new(),
-                    next_clip_id: 1,
+                    ..common::model::AutomationLane::new(touched.target.clone(), default_value)
                 };
                 song.song_lanes.push(new_lane);
             });
@@ -1214,13 +1188,7 @@ impl AppData {
                 let lane_id = track.alloc_lane_id();
                 let new_lane = common::model::AutomationLane {
                     id: lane_id,
-                    target: touched.target.clone(),
-                    default_value,
-                    enabled: true,
-                    visible: true,
-                    height_px: 60,
-                    clips: Vec::new(),
-                    next_clip_id: 1,
+                    ..common::model::AutomationLane::new(touched.target.clone(), default_value)
                 };
                 track.automation_lanes.push(new_lane);
                 true

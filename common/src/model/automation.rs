@@ -290,6 +290,16 @@ pub struct AutomationLane {
     /// sentinel; valid allocations start at `1`.
     #[serde(default)]
     pub next_clip_id: u32,
+    /// v35 (r.md #87 クリップランチャー): この**オートメーションレーン行**のセル。
+    /// トラック行と完全に同じ規則で、`clip.id` は `next_clip_id` の `clips` と同じ
+    /// id 空間から採る (再利用禁止)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_clips: Vec<SessionAutomationClip>,
+    /// v35 (r.md #87): このレーン行の主導権。空セルのシーンを撃つと
+    /// [`RowPlayback::LauncherStopped`] になり、レーンは `default_value` を出す
+    /// (`docs/plan_rmd_87_clip_launcher.md` Q11)。
+    #[serde(default, skip_serializing_if = "RowPlayback::is_arranger")]
+    pub launcher: RowPlayback,
     // NOTE: モジュレーション routing は lane を離れ `Track.mod_routings` /
     // `Song.song_mod_routings` に移動した (`docs/plan_modulation_routing_redesign.md`)。
     // 旧 file の `mod_routings` キーは serde の unknown-field 無視で読み捨てられる。
@@ -314,7 +324,30 @@ impl AutomationLane {
             height_px: default_lane_height_px(),
             clips: Vec::new(),
             next_clip_id: 1,
+            session_clips: Vec::new(),
+            launcher: RowPlayback::Arranger,
         }
+    }
+
+    /// v35 (r.md #87): arrangement (`clips`) と launcher (`session_clips`) の
+    /// **全 AutomationClip**。数え落とすと保存時に GC でセルの中身が消えるので、
+    /// content の参照数え上げ / GC / id 採番はこの 1 本を通す
+    /// ([`Track::all_clips`](crate::model::Track::all_clips) と同じ契約)。
+    pub fn all_clips(&self) -> impl Iterator<Item = &AutomationClip> {
+        self.clips.iter().chain(self.session_clips.iter().map(|s| &s.clip))
+    }
+
+    /// [`Self::all_clips`] の可変版。
+    pub fn all_clips_mut(&mut self) -> impl Iterator<Item = &mut AutomationClip> {
+        self.clips
+            .iter_mut()
+            .chain(self.session_clips.iter_mut().map(|s| &mut s.clip))
+    }
+
+    /// 列 (`scene_id`) にあるこのレーン行のセル。
+    #[must_use]
+    pub fn session_clip(&self, scene_id: u32) -> Option<&SessionAutomationClip> {
+        self.session_clips.iter().find(|s| s.scene_id == scene_id)
     }
 
     /// Allocate a new stable clip id within this lane.
@@ -325,18 +358,24 @@ impl AutomationLane {
     }
 
     /// Re-assign stable ids to all clips inside the lane. Idempotent.
+    /// v35 (r.md #87): `clips` と `session_clips` は同じ id 空間なので 1 回の走査で
+    /// 採番する (`Track::ensure_clip_ids` と同契約 — 未採番と重複を採り直す冪等操作)。
     pub fn ensure_clip_ids(&mut self) {
-        for clip in &mut self.clips {
-            if clip.id == 0 {
-                clip.id = self.next_clip_id.max(1);
-                self.next_clip_id = clip.id + 1;
-            } else if clip.id >= self.next_clip_id {
-                self.next_clip_id = clip.id + 1;
+        let mut next = self.next_clip_id.max(1);
+        for clip in self.all_clips() {
+            if clip.id != 0 {
+                next = next.max(clip.id.saturating_add(1));
             }
         }
-        if self.next_clip_id == 0 {
-            self.next_clip_id = 1;
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for clip in self.all_clips_mut() {
+            if clip.id == 0 || !seen.insert(clip.id) {
+                clip.id = next;
+                seen.insert(next);
+                next = next.saturating_add(1);
+            }
         }
+        self.next_clip_id = next.max(1);
     }
 
     pub fn clip_index_by_id(&self, clip_id: u32) -> Option<usize> {

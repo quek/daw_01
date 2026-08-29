@@ -1313,7 +1313,15 @@ fn current_version_is_pinned() {
     // ようになったので、所属 track を保存すると stale になる (実行時の解決は
     // `device_id` の逆引き 1 本)。v33 以前は `track` を読んで
     // `legacy_device_index` の解決にだけ使う。
-    assert_eq!(CURRENT_VERSION, 34);
+    // v35 (r.md #87 クリップランチャー / `docs/plan_rmd_87_clip_launcher.md`):
+    // `Song.scenes` (ランチャーの列)、`Track.session_clips` /
+    // `AutomationLane.session_clips` (セル)、行ごとの主導権 `Track.launcher` /
+    // `AutomationLane.launcher` を追加。主導権と鳴っているセルは「曲の一部」
+    // として保存する (停止 → 再生で同じセルが鳴り直し、書き出す音もこれで決まる)。
+    // v34 以前は全 field が `serde(default)` で読め、`scenes` は空 Vec・主導権は
+    // `Arranger` になる (= 従来どおりアレンジだけが鳴る)。**load 時に列を補わない**
+    // ので開いただけでは `*` が立たない (r.md #9)。
+    assert_eq!(CURRENT_VERSION, 35);
 }
 
 #[test]

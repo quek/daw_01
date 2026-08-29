@@ -14,11 +14,15 @@ use crate::scale::ScaleChange;
 // 登録している (invariant #7: fingerprint handshake の検出網に穴を開けない)。
 mod automation;
 mod content;
+mod ids;
 mod modulation;
+mod session;
 mod track;
 pub use automation::*;
 pub use content::*;
+pub use ids::*;
 pub use modulation::*;
+pub use session::*;
 pub use track::*;
 
 /// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。
@@ -204,7 +208,16 @@ pub use track::*;
 /// 移せるようになったので、所属 track を保存すると stale になる (実行時の解決は
 /// `device_id` からの逆引き 1 本)。v33 以前の `.daw` は `track` を読んで
 /// `legacy_device_index` の解決にだけ使う。
-pub const CURRENT_VERSION: u32 = 34;
+/// Bumped to `35` (r.md #87 クリップランチャー / セッションビュー、
+/// `docs/plan_rmd_87_clip_launcher.md`): `Song.scenes` (ランチャーの列)、
+/// `Track.session_clips` / `AutomationLane.session_clips` (セル)、および
+/// 行ごとの主導権 `Track.launcher` / `AutomationLane.launcher` が追加される。
+/// **主導権と鳴っているセルは「曲の一部」として保存する** — 停止 → 再生で同じセルが
+/// 鳴り直し、書き出す音もこの状態で決まるため (Q9 / Q10)。v34 以前の `.daw` は全
+/// field が `#[serde(default)]` で forward-migrate する (`scenes` は空 Vec、主導権は
+/// `RowPlayback::Arranger` = 従来どおりアレンジだけが鳴る)。**load 時に列を補わない**
+/// ので、開いただけでは `*` が立たない (r.md #9)。
+pub const CURRENT_VERSION: u32 = 35;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -536,34 +549,6 @@ pub struct MediaPools {
     pub image_sources: HashMap<ImageSourceId, ImageSource>,
 }
 
-/// Song の安定 id アロケータ群 (§10 bullet 4 で Song のフラットな `next_*_id` カウンタを集約)。
-/// 各 `next_*_id` は「次に採番する id」で、`0` は "未採番" sentinel。削除後も id を再利用しない
-/// (安定 id addressing、invariant #1)。nested `"ids": {...}` として save / wire し、旧 .daw の
-/// フラット形式は load 時の JSON 前処理 `project::migrate_flat_ids_to_allocators` が `ids` 下へ移す
-/// (save 互換)。Song は `clip_contents` 等の `HashMap<u32, _>` を持つため serde `flatten` は
-/// 使えず (整数キー復元不可)、MediaPools と同じく nested を採る。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-pub struct IdAllocators {
-    #[serde(default)]
-    pub next_track_id: u32,
-    #[serde(default)]
-    pub next_device_id: u64,
-    #[serde(default)]
-    pub next_content_id: ContentId,
-    #[serde(default)]
-    pub next_audio_source_id: AudioSourceId,
-    #[serde(default)]
-    pub next_video_source_id: VideoSourceId,
-    #[serde(default)]
-    pub next_image_source_id: ImageSourceId,
-    #[serde(default)]
-    pub next_song_lane_id: u32,
-    #[serde(default)]
-    pub next_section_id: u32,
-    #[serde(default)]
-    pub next_mod_source_id: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Song {
     pub bpm: f32,
@@ -685,6 +670,17 @@ pub struct Song {
     /// (`song_lanes` と同じ「master 固有データは Song 直下」流儀)。空 Vec で変調なし。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub song_mod_routings: Vec<ModRouting>,
+    /// v35 (r.md #87 クリップランチャー): ランチャーの**列**。`Vec` の順序が
+    /// そのまま表示順で、並べ替えは `Vec` 内の move、参照は常に [`Scene::id`]
+    /// (positional index を持たない = アーキ不変条件 1)。
+    ///
+    /// Arranger セクション (`Song.sections`) とは**完全に無関係** — 列を足しても
+    /// 曲の長さもクリップ位置も動かない (`docs/plan_rmd_87_clip_launcher.md` Q3)。
+    /// 旧 file は空 Vec で forward-migrate し、**load 時に列を補わない**
+    /// (補うと「開いただけで `*`」になる、r.md #9)。グリッドが描く空きの列は
+    /// 表示上のプレースホルダで、そこにセルを置いた瞬間に実体化する。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenes: Vec<Scene>,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -717,6 +713,7 @@ impl Default for Song {
                 next_song_lane_id: 1,
                 next_section_id: 1,
                 next_mod_source_id: 1,
+                next_scene_id: 1,
             },
             clip_contents: HashMap::new(),
             clip_content_names: HashMap::new(),
@@ -732,6 +729,7 @@ impl Default for Song {
             sections: Vec::new(),
             mod_sources: Vec::new(),
             song_mod_routings: Vec::new(),
+            scenes: Vec::new(),
         }
     }
 }
@@ -1596,6 +1594,7 @@ impl Song {
         self.ensure_video_source_ids();
         self.ensure_image_source_ids();
         self.ensure_ids();
+        self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
         self.ensure_overlay_event_coverage();
@@ -2156,10 +2155,9 @@ impl Song {
     }
 
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
+    /// 実体は [`IdAllocators::alloc_content_id`] (= 採番規則の SSoT)。
     pub fn alloc_content_id(&mut self) -> ContentId {
-        let id = self.ids.next_content_id.max(1);
-        self.ids.next_content_id = id.saturating_add(1);
-        id
+        self.ids.alloc_content_id()
     }
 
     /// Shared clip name for a `ContentId` (SSoT, v20+). Empty string if
@@ -2283,8 +2281,10 @@ impl Song {
         // 2. Raw content を参照する clip の length_beats をスケール (start_beat は固定)。
         //    r.md #44: 内容窓の起点も content 拍量なので同じ比でスケールする
         //    (= trim 済み clip でも「窓が content の同じ場所を見せ続ける」)。
+        //    v35 (r.md #87): launcher のセルも同じ content を指すので同じ比でスケールする
+        //    (漏らすと bpm 変更後にセルだけ窓が content とズレる)。
         for track in &mut self.tracks {
-            for clip in &mut track.clips {
+            for clip in track.all_clips_mut() {
                 if raw_content_ids.contains(&clip.content_id) {
                     clip.length_beats *= ratio;
                     clip.content_offset_beats *= ratio;
@@ -2298,15 +2298,16 @@ impl Song {
         // Collect all live content_ids first so we can bump the counter
         // above the highest one before allocating new ids for sentinels.
         // Walks both main `clips` and every `automation_lanes[].clips`.
+        // v35 (r.md #87): `all_clips` は arrangement + launcher のセルを両方返す。
         let mut max_seen: ContentId = 0;
         for track in &self.tracks {
-            for clip in &track.clips {
+            for clip in track.all_clips() {
                 if clip.content_id != 0 {
                     max_seen = max_seen.max(clip.content_id);
                 }
             }
             for lane in &track.automation_lanes {
-                for clip in &lane.clips {
+                for clip in lane.all_clips() {
                     if clip.content_id != 0 {
                         max_seen = max_seen.max(clip.content_id);
                     }
@@ -2314,7 +2315,7 @@ impl Song {
             }
         }
         for lane in &self.song_lanes {
-            for clip in &lane.clips {
+            for clip in lane.all_clips() {
                 if clip.content_id != 0 {
                     max_seen = max_seen.max(clip.content_id);
                 }
@@ -2327,39 +2328,32 @@ impl Song {
             self.ids.next_content_id = 1;
         }
 
-        for t_idx in 0..self.tracks.len() {
-            for c_idx in 0..self.tracks[t_idx].clips.len() {
-                if self.tracks[t_idx].clips[c_idx].content_id == 0 {
-                    let new_id = self.alloc_content_id();
-                    self.tracks[t_idx].clips[c_idx].content_id = new_id;
+        // `ids` / `clip_contents` / `tracks` をフィールド分割で同時に可変借用する
+        // (旧実装の index ループは `self.alloc_content_id()` を呼ぶための回避策だった。
+        //  採番規則を `IdAllocators` へ下ろしたので走査そのものを素直に書ける)。
+        let Song { tracks, song_lanes, ids, clip_contents, .. } = self;
+        for track in tracks.iter_mut() {
+            for clip in track.all_clips_mut() {
+                if clip.content_id == 0 {
+                    clip.content_id = ids.alloc_content_id();
                 }
-                let cid = self.tracks[t_idx].clips[c_idx].content_id;
                 // Ensure an entry exists for every referenced content_id so
                 // lookups never miss. 旧 per-clip インライン content (v5 notes /
                 // v19 name) は deserialize 前に `project::migrate_legacy_clip_content`
                 // が content store へドレイン済み。
-                self.clip_contents.entry(cid).or_default();
+                clip_contents.entry(clip.content_id).or_default();
             }
-            for l_idx in 0..self.tracks[t_idx].automation_lanes.len() {
-                let lane_clip_count =
-                    self.tracks[t_idx].automation_lanes[l_idx].clips.len();
-                for c_idx in 0..lane_clip_count {
-                    let needs_new_id =
-                        self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx].content_id
-                            == 0;
-                    if needs_new_id {
-                        let new_id = self.alloc_content_id();
-                        self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx]
-                            .content_id = new_id;
+            for lane in track.automation_lanes.iter_mut() {
+                for clip in lane.all_clips_mut() {
+                    if clip.content_id == 0 {
+                        clip.content_id = ids.alloc_content_id();
                     }
-                    let cid = self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx]
-                        .content_id;
                     // Automation clips have no legacy in-place payload
                     // (v8-introduced) — just ensure the content store has an
                     // entry so audio thread / GUI lookups never miss. Default
                     // is `Midi(empty)`; writers promote to `Automation` on
                     // first edit. (Legacy name は前処理でドレイン済み。)
-                    self.clip_contents.entry(cid).or_insert_with(|| {
+                    clip_contents.entry(clip.content_id).or_insert_with(|| {
                         ClipContent::Automation(AutomationContent::default())
                     });
                 }
@@ -2370,15 +2364,12 @@ impl Song {
         // ensure an entry exists — mirroring the `automation_lanes` handling so
         // SongTempo / TimeSig curves resolve instead of falling back to empty.
         // (Legacy name は前処理でドレイン済み。)
-        for l_idx in 0..self.song_lanes.len() {
-            let lane_clip_count = self.song_lanes[l_idx].clips.len();
-            for c_idx in 0..lane_clip_count {
-                if self.song_lanes[l_idx].clips[c_idx].content_id == 0 {
-                    let new_id = self.alloc_content_id();
-                    self.song_lanes[l_idx].clips[c_idx].content_id = new_id;
+        for lane in song_lanes.iter_mut() {
+            for clip in lane.all_clips_mut() {
+                if clip.content_id == 0 {
+                    clip.content_id = ids.alloc_content_id();
                 }
-                let cid = self.song_lanes[l_idx].clips[c_idx].content_id;
-                self.clip_contents.entry(cid).or_insert_with(|| {
+                clip_contents.entry(clip.content_id).or_insert_with(|| {
                     ClipContent::Automation(AutomationContent::default())
                 });
             }
@@ -2390,17 +2381,18 @@ impl Song {
     /// `Track.automation_lanes`. Used by the GUI to switch the visual
     /// style between "shared" (>=2) and "regular" (==1) and by GC.
     pub fn clip_content_refcount(&self, content_id: ContentId) -> usize {
+        // v35 (r.md #87): `all_clips` は arrangement + launcher のセルを両方数える。
         let main_clips = self
             .tracks
             .iter()
-            .flat_map(|t| t.clips.iter())
+            .flat_map(Track::all_clips)
             .filter(|c| c.content_id == content_id)
             .count();
         let auto_clips = self
             .tracks
             .iter()
             .flat_map(|t| t.automation_lanes.iter())
-            .flat_map(|l| l.clips.iter())
+            .flat_map(AutomationLane::all_clips)
             .filter(|c| c.content_id == content_id)
             .count();
         // Song-level lanes share the same content store, so they must be
@@ -2409,7 +2401,7 @@ impl Song {
         let song_lane_clips = self
             .song_lanes
             .iter()
-            .flat_map(|l| l.clips.iter())
+            .flat_map(AutomationLane::all_clips)
             .filter(|c| c.content_id == content_id)
             .count();
         main_clips + auto_clips + song_lane_clips
@@ -2482,15 +2474,17 @@ impl Song {
     /// `automation_lanes[].clips` entry — automation clips share the
     /// same content store as MIDI / audio clips.
     pub fn gc_clip_contents(&mut self) {
+        // v35 (r.md #87): launcher のセルも `all_clips` 経由で「生きている」に数える。
+        // 数え落とすと保存のたびにセルの中身が GC で消える。
         let mut live: std::collections::HashSet<ContentId> = self
             .tracks
             .iter()
-            .flat_map(|t| t.clips.iter())
+            .flat_map(Track::all_clips)
             .map(|c| c.content_id)
             .collect();
         for track in &self.tracks {
             for lane in &track.automation_lanes {
-                for clip in &lane.clips {
+                for clip in lane.all_clips() {
                     live.insert(clip.content_id);
                 }
             }
@@ -2500,7 +2494,7 @@ impl Song {
         // tempo-automation curve's `content_id` is judged dead and GC'd
         // before save, losing the whole curve on next load.
         for lane in &self.song_lanes {
-            for clip in &lane.clips {
+            for clip in lane.all_clips() {
                 live.insert(clip.content_id);
             }
         }

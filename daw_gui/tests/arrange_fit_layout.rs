@@ -158,13 +158,10 @@ fn fit_は展開_automation_lane_があっても下端を揃える() {
         for t in song.tracks.iter_mut().take(2) {
             t.automation_lanes.push(AutomationLane {
                 id: 1,
-                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                default_value: 0.0,
-                enabled: true,
-                visible: true,
-                height_px: 60,
-                clips: Vec::new(),
-                next_clip_id: 1,
+                ..AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    0.0,
+                )
             });
         }
     });
