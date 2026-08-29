@@ -159,7 +159,10 @@ FN-BUDGET | daw_gui/src/view/audio_editor.rs::draw                              
 FN-BUDGET | daw_gui/src/view/arrangement_view.rs::draw                                |  577 | #71 が足したのは dispatch 1 行だけ (本体 57 行は関数外の `device_drag_over_headers`)。未起票
 FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                              |  525 | 巨大 draw / match。未起票
 FN-BUDGET | daw_gui/src/view/track_inspector/modulation_rack.rs::draw_modulation_rack |  515 | 巨大 draw / match。未起票
-FN-BUDGET | daw_gui/src/view/transport.rs::draw                                       |  358 | 巨大 draw / match。未起票
+# `daw_gui/src/view/transport.rs::draw` は r.md #87 で解消した。 ランチャー用の
+# コントロール (グローバルローンチ量子化 / アレンジに戻す) を足す前に、
+# 左詰め列を 4 つの `draw_*(app, ui, [area,] x, cy, bh) -> f32` へ割って running x を
+# バケツリレーする形にしてある (= 「超過したら分割してから足す」 不変条件 9 のとおり)。
 FN-BUDGET | daw_gui/src/app.rs::AppData::new                                          |  340 | #71 で新 state 2 本の初期化 +2 (フィールド初期化は構造体定義と同居させるほかない)。未起票
 
 # C. プロセス境界の実装 (IPC 受信ループ / オーディオグラフ構築)。

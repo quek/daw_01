@@ -17,6 +17,15 @@ pub enum AppEvent {
     /// daw_plugin_host からの protocol event (direct-wrap)。
     /// `crate::handler::ipc::dispatch_plugin_event` が処理する。
     Plugin(common::protocol::PluginEvent),
+    /// r.md #87: クリップランチャーの操作 (発火 / 列とセルの CRUD /
+    /// ローンチ設定 / レイアウト / MIDI learn)。
+    /// `crate::handler::launcher::handle_launcher_event` が処理する。
+    ///
+    /// **1 variant にまとめてあるのは意図的**。 ランチャーは 25 前後の操作を
+    /// 持つが、`AppData::handle_event` の match は実コード 300 行 budget
+    /// (不変条件 9) の天井に張り付いていて 1 arm しか置けない。`Audio` /
+    /// `Plugin` と同じ「サブ enum を 1 arm で受けて専用 dispatcher へ渡す」形。
+    Launcher(crate::event_launcher::LauncherEvent),
     // -------- File / playback ---------------------------------------------
     New,
     Open,
@@ -614,8 +623,13 @@ pub enum AppEvent {
     RecoveryDiscard(PathBuf),
     /// Recovery modal を閉じる (候補は次回起動時にも見える)。
     RecoveryDismiss,
-    MidiNoteOn { pitch: u8, velocity: u8 },
-    MidiNoteOff { pitch: u8 },
+    /// r.md #87: `channel` を持つのは **パッドをノートで撃つ**ため。
+    /// ランチャーの MIDI binding は「ch 10 のノート 36」 のように channel 込みで
+    /// 指すので、ここで落とすと鍵盤の中央ド (ch 1 / note 60) が
+    /// note 60 に bind したセルを撃ってしまう (CC 側は最初から channel を運んでいる)。
+    /// 値は 0..=15。
+    MidiNoteOn { channel: u8, pitch: u8, velocity: u8 },
+    MidiNoteOff { channel: u8, pitch: u8 },
     /// Phase 7 B1-M Step 1 (2026-05-13): MIDI Control Change (CC)。 MIDI Learn
     /// 経路の入力。 GUI handler で midi_learn_target Some なら新規 binding
     /// 追加、 None なら既存 binding lookup → target に値送信。
@@ -1755,6 +1769,11 @@ impl AppEvent {
             // ---- セクション帯 ----
             E::CommitRenameSection => "セクション名変更",
             E::SetSectionColor { .. } => "セクション色変更",
+
+            // ---- r.md #87 クリップランチャー ----
+            // ラベルの SSoT はサブ enum 側 (variant が 25 個あるので、
+            // ここに並べると「巨大 match」 が 2 か所に増える)。
+            E::Launcher(ev) => ev.undo_label(),
 
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",

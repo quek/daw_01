@@ -182,6 +182,18 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.toggle_triplet", keys: &["3"], category: ShortcutCategory::GridView, description: "三連符グリッド ON / OFF", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_preview_window", keys: &["F12"], category: ShortcutCategory::GridView, description: "ビデオプレビューウィンドウを開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_master_panel", keys: &["Ctrl+Alt+M"], category: ShortcutCategory::GridView, description: "マスターパネル (フェーダー + 各種メーター) を開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // r.md #87 (クリップランチャー、計画書 Q5-b): 両方 → ランチャーのみ → アレンジのみ を巡回。
+    // **`Tab` 単体は入力欄の移動 (`tab_next`) に取られている**ので使えない。修飾付きの
+    // `Ctrl+Tab` は `Shortcut::matches` が修飾を完全一致で見るので `tab_next` とは衝突しない。
+    // `typing_only` は立てない — テキスト編集中の Ctrl+Tab に編集側の意味は無い。
+    ShortcutDef { name: "daw.cycle_launcher_layout", keys: &["Ctrl+Tab"], category: ShortcutCategory::GridView, description: "ランチャー帯の表示を巡回 (両方 → ランチャーのみ → アレンジのみ)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // ランチャーのセルを撃つ。矢印での選択移動は **既存の nudge 系 binding
+    // (`daw.nudge_note_*`) を文脈で振り分ける** ので、ここに行を足さない —
+    // `ShortcutMap::matches` は同じキーに複数の name が bind されていても
+    // **先勝ちで 1 つしか返さない**ので、`Left` を 2 つ宣言すると後の行は
+    // 永久に発火しない (先に宣言されている nudge が全部取る)。
+    // 削除 (`Delete`) と複製 (`Ctrl+D`) も同じ理由で既存 binding に合流する。
+    ShortcutDef { name: "daw.launcher_fire", keys: &["Enter"], category: ShortcutCategory::GridView, description: "ランチャーの選択セルを撃つ (空セルはその行を停止)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "daw.close_all_plugin_editors", keys: &["Ctrl+Shift+W"], category: ShortcutCategory::GridView, description: "開いているプラグインのエディタ窓をまとめて閉じる", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
     // ----- オーディオエディタ -----
     ShortcutDef { name: "daw.duplicate_audio_event", keys: &["Ctrl+D"], category: ShortcutCategory::AudioEditor, description: "オーディオイベントを複製", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },

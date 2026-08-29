@@ -10,6 +10,7 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::event::NudgeStep;
+use crate::event_launcher::LauncherEvent;
 use crate::view::{
     about, arrangement_view, bottom_panel, clipboard_ops, dirty_guard_modal, export_overlay,
     export_range_modal,
@@ -31,6 +32,15 @@ pub const INSPECTOR_W: f32 = 280.0;
 /// を drag すると gui_01 `split_view` widget が state に新比率を持って frame
 /// 越しに保持する (= session 内のみ persist、 project save 不対応は別 phase)。
 const ARRANGEMENT_SPLIT_DEFAULT_RATIO: f32 = 0.65;
+
+/// r.md #87: View メニューに出すランチャー帯の見せ方 3 項目 (計画書 Q5-b)。
+/// 並びは `LauncherLayout::cycle` の巡回順と揃える (メニューとキーで順序が
+/// 食い違うと「Ctrl+Tab を何回押せばどれになるか」が読めない)。
+const LAUNCHER_LAYOUT_MENU: &[(&str, common::model::LauncherLayout)] = &[
+    ("ランチャーとアレンジ (両方)", common::model::LauncherLayout::Both),
+    ("ランチャーのみ", common::model::LauncherLayout::LauncherOnly),
+    ("アレンジのみ", common::model::LauncherLayout::ArrangerOnly),
+];
 
 pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: PhysicalSize) {
     let sw = screen.width as f32;
@@ -226,6 +236,35 @@ fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
     ui.label_at("device_drag_label", &label, chip.x + 8.0, chip.y + 5.0, 11.0, core.text);
 }
 
+/// r.md #87: View メニューの「両方 / ランチャーのみ / アレンジのみ」 3 項目。
+///
+/// `draw_menu_bar` の中に直接書かないのは不変条件 9 (インデント 6 段) のため
+/// — メニュー構築は `menu_bar → menu → item → push_edit → handle_event` で
+/// 既に 5 段あり、そこにループを足すと即座に超える。
+fn add_launcher_layout_items<'a>(m: &mut daw_ui_core::widgets::menu::MenuBuilder<'a, AppData>) {
+    for (label, layout) in LAUNCHER_LAYOUT_MENU {
+        let layout = *layout;
+        // 巡回キー (`Ctrl+Tab`) のヒントは 3 項目に共通なので、代表して
+        // 「両方」の行にだけ出す。
+        let hint = (layout == common::model::LauncherLayout::Both)
+            .then(|| crate::view::shortcuts::shortcut_hint("daw.cycle_launcher_layout"))
+            .flatten();
+        m.item_with(daw_ui_core::MenuItemSpec {
+            label,
+            on_click: Box::new(move |ui| set_launcher_layout(ui, layout)),
+            enabled: true,
+            shortcut_hint: hint,
+        });
+    }
+}
+
+/// レイアウトを直接その状態にする (巡回順の SSoT は `LauncherLayout::cycle`)。
+fn set_launcher_layout(ui: &mut Ui<'_, AppData>, layout: common::model::LauncherLayout) {
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::Launcher(LauncherEvent::SetLayout(layout)));
+    }));
+}
+
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
 /// `Ui<'a, AppData>` の `'a` は `&AppData` borrow 寿命と同一なので、
 /// `app: &'a AppData` を明示して menu の dynamic label (= `&app.ui_prefs.recent_files_labels[i]`)
@@ -388,6 +427,9 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             });
         });
         mb.menu("View", |m| {
+            // r.md #87: ランチャー帯とアレンジのレーンの見せ方 (Q5-b)。
+            add_launcher_layout_items(m);
+            m.separator();
             // r.md #29: 編集履歴パネルの開閉。 行 click でその時点へ一発 Undo/Redo。
             m.item("編集履歴", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
@@ -932,6 +974,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
+    // ----- r.md #87: ランチャーのキー操作 (Ctrl+Tab / 矢印 / Enter) -----
+    // **note nudge より先に**呼ぶ (矢印の取り合いをここで決める)。 対象面が
+    // `Notes` のときはランチャーが矢印を取らないので、両者は排他になる。
+    crate::view::launcher_keys::dispatch_launcher_keys(app, ui, surface);
+
     // ----- r.md #67: カーソルキーでノートを移動 / 伸縮 / 音程変更 -----
     dispatch_note_nudge(ui, surface);
 
@@ -1088,7 +1135,16 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 選択中 event を Duplicate。 audio_editor_clip is None のときは
     // 消費しない (= 既存 D / Alt+D の clip duplicate と紛らわしくない
     // よう、 Audio Editor 内限定の shortcut として gate する)。
-    if app.ui_ephemeral.audio_editor_clip.is_some() && ui.take_shortcut("daw.duplicate_audio_event") {
+    //
+    // r.md #87: ランチャーのセルを選んでいるときは **セルの複製が勝つ**
+    // (計画書 §3.5 の「Ctrl+D で複製」)。 同じキーに 2 つ目の binding を
+    // 宣言できない (`ShortcutMap::matches` は先勝ち) ので、take は 1 度だけ行い
+    // 行き先をここで振り分ける。
+    let dup_pressed = ui.take_shortcut("daw.duplicate_audio_event");
+    if !crate::view::launcher_keys::duplicate_cells_if_launcher(app, ui, dup_pressed)
+        && dup_pressed
+        && app.ui_ephemeral.audio_editor_clip.is_some()
+    {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateAudioEditorEvent)
         }));

@@ -55,16 +55,18 @@ fn dispatch(msg: &[u8], proxy: &EventLoopProxy<AppEvent>) {
             let (Some(&pitch), Some(&velocity)) = (msg.get(1), msg.get(2)) else {
                 return;
             };
+            // r.md #87: channel も運ぶ (パッドをノートで撃つ binding が
+            // 「ch 10 のノート 36」 のように channel 込みで指すため)。
             let event = if velocity == 0 {
-                AppEvent::MidiNoteOff { pitch }
+                AppEvent::MidiNoteOff { channel, pitch }
             } else {
-                AppEvent::MidiNoteOn { pitch, velocity }
+                AppEvent::MidiNoteOn { channel, pitch, velocity }
             };
             let _ = proxy.send_event(event);
         }
         0x80 => {
             let Some(&pitch) = msg.get(1) else { return };
-            let _ = proxy.send_event(AppEvent::MidiNoteOff { pitch });
+            let _ = proxy.send_event(AppEvent::MidiNoteOff { channel, pitch });
         }
         // Phase 7 B1-M Step 1 (2026-05-13): MIDI Control Change (CC)。 status
         // 0xB0..0xBF (= channel 0..15)、 data[0] = controller# (0..127)、

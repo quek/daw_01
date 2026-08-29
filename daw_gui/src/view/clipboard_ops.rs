@@ -19,6 +19,14 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
     let Some(surface) = surface else {
         return;
     };
+    // r.md #87: 選択が **ランチャーのセル**ならセルとしてコピーする。 セルは
+    // アレンジのクリップと `ClipKey` / `AutomationClipKey` を共有するので面が
+    // 同じ (`Clips` / `AutomationClips`) になるが、貼り先の座標系が
+    // (トラック, 拍) ではなく (行, 列) なので payload を分ける。
+    if let Some((json, count)) = app.copy_launcher_cells_clip() {
+        finish_copy(ui, json, count, "セル");
+        return;
+    }
     let synced: Option<(String, usize, &'static str)> = match surface {
         EditSurface::AudioEvents => app.copy_events_clip().map(|(j, c)| (j, c, "イベント")),
         EditSurface::Notes => app.copy_notes_clip().map(|(j, c)| (j, c, "ノート")),
@@ -35,11 +43,7 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
         EditSurface::Tracks | EditSurface::Sections | EditSurface::Devices => None,
     };
     if let Some((json, count, label)) = synced {
-        ui.set_clipboard_text(json);
-        let label = label.to_string();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.status_message = format!("コピー: {count} {label}");
-        }));
+        finish_copy(ui, json, count, label);
         return;
     }
     if matches!(surface, EditSurface::Tracks) {
@@ -56,6 +60,15 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
     }
 }
 
+/// copy 成立時の共通後始末 (clipboard へ書いて status に件数を出す)。
+fn finish_copy(ui: &mut Ui<'_, AppData>, json: String, count: usize, label: &str) {
+    ui.set_clipboard_text(json);
+    let label = label.to_string();
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.ui_ephemeral.status_message = format!("コピー: {count} {label}");
+    }));
+}
+
 /// Ctrl+X: copy (clipboard へ) + 対象の削除を 1 undo step。clipboard 書込は undo 対象外、
 /// 削除イベントが自前で undo snapshot を積む。トラックは `AppData::cut_tracks` で
 /// 非同期に copy+削除。
@@ -63,6 +76,19 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
     let Some(surface) = surface else {
         return;
     };
+    // r.md #87: セルの cut は「セルとしてコピー + セル削除」。 削除は
+    // `DeleteCells` (アレンジのクリップは触らない) を使う。
+    if let Some((json, count)) = app.copy_launcher_cells_clip() {
+        ui.set_clipboard_text(json);
+        let cells = app.selected_launcher_cells();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::Launcher(
+                crate::event_launcher::LauncherEvent::DeleteCells(cells.clone()),
+            ));
+            app.ui_ephemeral.status_message = format!("カット: {count} セル");
+        }));
+        return;
+    }
     let synced: Option<(String, usize, &'static str)> = match surface {
         EditSurface::AudioEvents => app.copy_events_clip().map(|(j, c)| (j, c, "イベント")),
         EditSurface::Notes => app.copy_notes_clip().map(|(j, c)| (j, c, "ノート")),
@@ -193,6 +219,19 @@ pub(crate) fn paste_from_clipboard(
             }
             paste_noop(ui);
         }
+        P::LauncherCells(cells) => {
+            // r.md #87: 貼り先は **ポインタが乗っているセル** (行 × 列)。
+            // ランチャーの上にポインタが無ければ貼らない (アレンジの paste と
+            // 同じ規約 — 再生ヘッドや先頭列への fallback はしない)。
+            if let Some(dest) = app.launcher.hover {
+                let cells = crate::clipboard::sanitize_launcher_cells(cells);
+                ui.push_edit(paste_edit("セル", move |app| {
+                    app.paste_launcher_cells(cells, src_pid, dest)
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
         P::Tracks(tracks) => {
             if !is_pianoroll_active
                 && let Some(above) = app.ui_ephemeral.arrange_hovered_track
@@ -301,6 +340,23 @@ let dup_devices = (dup_shared || dup_unique)
     && matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Devices));
 if dup_devices {
     duplicate_devices(app, ui);
+}
+// r.md #87: ランチャーのセルを選んでいるなら D / Alt+D はセルの複製
+// (共有 / 独立の区別はアレンジのクリップと同じ)。 セルは `EditSurface::Clips` を
+// 共有するので、ここで先に裁かないと下の clip 複製が `selected_clip_refs()` の
+// 空リストで無音の no-op になる。
+let launcher_cells = if dup_devices { Vec::new() } else { app.selected_launcher_cells() };
+if (dup_shared || dup_unique) && !launcher_cells.is_empty() {
+    let unique = dup_unique;
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::Launcher(
+            crate::event_launcher::LauncherEvent::DuplicateCells {
+                cells: launcher_cells.clone(),
+                unique,
+            },
+        ));
+    }));
+    return;
 }
 if dup_shared && !dup_devices {
     // 対象面は copy/cut/delete と同じ last-wins (`edit_surface`)。トラック面なら

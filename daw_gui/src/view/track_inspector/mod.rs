@@ -6,6 +6,8 @@
 
 mod chain_sections;
 mod device_panel;
+/// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
+mod launch_section;
 mod modulation_rack;
 
 use daw_ui_core::{
@@ -403,6 +405,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let measured_body_h = std::cell::Cell::new(0.0_f32);
     ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
     let mut y = body_top - scroll_off.1;
+
+    // ---- r.md #87: ランチャーのセルのローンチ設定 (Q7) -------------------
+    // 選択にセルが 1 つも無ければ何も描かない (= 通常のクリップ編集時は
+    // 従来と 1px も変わらない)。 先頭に置くのは「セルを選んだらまずここを見る」
+    // 導線のため (`chain_sections` と同じ `(app, ui, area, pad, y) -> f32` 契約)。
+    y = launch_section::draw_launch_section(app, ui, area, pad, y);
 
     // ---- Audio Event section (Phase 2 PR1 + PR2) -----------------------
     // selected_clip が `ClipContent::Audio` のとき、 first event の field

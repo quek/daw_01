@@ -57,6 +57,11 @@ pub enum ClipboardPayload {
     Clips(Vec<ClipCopy>),
     AutomationClips(Vec<AutomationClipCopy>),
     Tracks(Vec<TrackCopy>),
+    /// r.md #87 (クリップランチャー): ランチャーのセル。
+    /// アレンジのクリップ (`Clips`) とは **貼り先の座標系が違う** ので別 variant に
+    /// する — アレンジは (トラック, 拍)、ランチャーは (行, 列) で、同じ payload に
+    /// 押し込むと「拍」に列番号を入れる類の嘘が要る。
+    LauncherCells(Vec<LauncherCellCopy>),
     /// r.md #71 (プラグインのコピー / 移動): チェーンから選んだプラグイン。
     Devices(Vec<DeviceCopy>),
 }
@@ -149,6 +154,30 @@ pub struct AutomationClipCopy {
     pub points: Vec<CopiedPoint>,
     /// 共有名 (`Song.clip_content_names` 由来)。
     pub name: Option<String>,
+}
+
+/// r.md #87: ランチャーのセル 1 つ。位置は **選択群の左上を (0, 0) とした相対
+/// (行, 列)** で運ぶ (貼り先はポインタ下のセル)。中身はアレンジのクリップと
+/// 同じ [`ClipCopy`] / [`AutomationClipCopy`] をそのまま使う — セルは
+/// 「アレンジと同じ中身を別の入れ物に置いたもの」 なので、正規化の規則を
+/// 二重に持たない。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LauncherCellCopy {
+    /// 選択群の最上段行を 0 とした相対行 index。
+    pub row_offset: i64,
+    /// 選択群の最左列を 0 とした相対列 index。
+    pub scene_offset: i64,
+    pub cell: LauncherCellPayload,
+    /// セルのローンチ設定 (量子化 / モード / ループ / レガート / フォロー)。
+    pub launch: common::model::LaunchSettings,
+}
+
+/// [`LauncherCellCopy`] の中身。トラック行のセルとオートメーションレーン行の
+/// セルで型が違う (それぞれ `Clip` / `AutomationClip`)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LauncherCellPayload {
+    Track(ClipCopy),
+    Lane(AutomationClipCopy),
 }
 
 /// 正規化済みトラックまるごと。`track` は raw (旧 legacy field は skip_serializing で
@@ -340,6 +369,39 @@ pub fn sanitize_automation_clips(clips: Vec<AutomationClipCopy>) -> Vec<Automati
                 c.start_beat = 0.0;
             }
             c.points = sanitize_points(std::mem::take(&mut c.points));
+            Some(c)
+        })
+        .collect()
+}
+
+/// r.md #87: 外部 clipboard 由来の `LauncherCellCopy` 群を sanitize。
+/// 中身の検証は [`sanitize_clips`] / [`sanitize_automation_clips`] に委譲し
+/// (規則を二重に持たない)、ここは **セル固有の 2 点**だけを見る:
+/// 相対位置が現実的な範囲か、フォローアクションの値域が壊れていないか。
+#[must_use]
+pub fn sanitize_launcher_cells(cells: Vec<LauncherCellCopy>) -> Vec<LauncherCellCopy> {
+    cells
+        .into_iter()
+        .filter_map(|mut c| {
+            // 相対位置は選択群の広がりぶんしか出ない。桁違いの値は改竄なので捨てる
+            // (`ensure_scene_at` に巨大 index を渡すと列を大量生成してしまう)。
+            if !(0..4096).contains(&c.row_offset) || !(0..4096).contains(&c.scene_offset) {
+                return None;
+            }
+            c.launch.follow.chance_a = c.launch.follow.chance_a.min(100);
+            c.launch.follow.multiplier = c.launch.follow.multiplier.max(1);
+            if !c.launch.follow.time_beats.is_finite() {
+                c.launch.follow.time_beats = 4.0;
+            }
+            c.launch.follow.time_beats = c.launch.follow.time_beats.clamp(0.0625, 512.0);
+            c.cell = match c.cell {
+                LauncherCellPayload::Track(cc) => {
+                    LauncherCellPayload::Track(sanitize_clips(vec![cc]).pop()?)
+                }
+                LauncherCellPayload::Lane(ac) => {
+                    LauncherCellPayload::Lane(sanitize_automation_clips(vec![ac]).pop()?)
+                }
+            };
             Some(c)
         })
         .collect()

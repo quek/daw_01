@@ -227,4 +227,15 @@ pub struct UiPrefs {
     pub launcher_scene_col_w: f32,
     /// ランチャー帯の横スクロール位置 (列数、小数可)。
     pub launcher_scroll_scene: f32,
+    /// グローバルローンチ量子化 (トランスポートの dropdown)。セル側が
+    /// [`LaunchQuantize::Global`](common::model::LaunchQuantize::Global) の
+    /// ときの実効値で、既定は 1 小節
+    /// ([`DEFAULT_GLOBAL_LAUNCH_QUANTIZE`](common::model::DEFAULT_GLOBAL_LAUNCH_QUANTIZE))。
+    ///
+    /// **本来は `Song` に置いて保存すべき値** — 「どの粒度で撃つか」 は演奏の
+    /// 一部で、プロジェクトを開き直したら戻ってほしい。 モデル層 (束 A) に
+    /// `Song.global_launch_quantize` が入るまでの暫定の置き場で、読み書きは
+    /// `AppData::global_launch_quantize` / `set_global_launch_quantize` の
+    /// 1 対だけを通す (移設時にそこだけ直せばよい)。
+    pub global_launch_quantize: common::model::LaunchQuantize,
 }

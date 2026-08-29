@@ -296,6 +296,7 @@ impl AppData {
                 launcher_width: 0.0,
                 launcher_scene_col_w: 0.0,
                 launcher_scroll_scene: 0.0,
+                global_launch_quantize: common::model::DEFAULT_GLOBAL_LAUNCH_QUANTIZE,
                 piano_roll_views: std::collections::HashMap::new(),
                 plugin_editor_windows: std::collections::HashMap::new(),
                 multi_clip_view: common::model::PianoRollViewState::default(),
@@ -449,6 +450,8 @@ impl AppData {
                 main_focused: true,
                 ..Default::default()
             },
+            // r.md #87: ランチャーの一時状態 (フォーカス / hover / MIDI bind)。
+            launcher: crate::state::LauncherUiState::default(),
             // r.md #61: 起動直後は `Running`。終了要求で `Draining` に入る。
             shutdown: crate::shutdown::ShutdownState::default(),
             // r.md #50: メーター設定の初期値は app_config から。`active` は
@@ -578,6 +581,8 @@ impl AppData {
             // handler::ipc の dispatch_* が担う (旧 1:1 bridge / *FromChild を置換)。
             AppEvent::Audio(ev) => self.dispatch_audio_event(ev),
             AppEvent::Plugin(ev) => self.dispatch_plugin_event(ev),
+            // r.md #87: ランチャー操作は 1 arm で受けて専用 dispatcher へ。
+            AppEvent::Launcher(ev) => self.handle_launcher_event(ev),
             // New / Open は現在のプロジェクトを破棄するので、 dirty なら
             // 先に保存確認ダイアログを挟む (clean なら即実行)。
             // r.md #61: 全終了経路の合流点。
@@ -1162,14 +1167,14 @@ impl AppData {
             AppEvent::RecoveryDismiss => {
                 self.ui_ephemeral.show_recovery_modal = false;
             }
-            AppEvent::MidiNoteOn { pitch, velocity } => {
-                self.handle_midi_note_on(pitch, velocity);
+            AppEvent::MidiNoteOn { channel, pitch, velocity } => {
+                self.handle_midi_note_on(channel, pitch, velocity);
             }
-            AppEvent::MidiNoteOff { pitch } => {
+            AppEvent::MidiNoteOff { channel, pitch } => {
                 // Phase 7 B4 Step D (2026-05-13): 録音中は note_off で
                 // length_beats を確定。 step-input mode は note end を追跡
                 // しないので無視。
-                self.handle_midi_note_off(pitch);
+                self.handle_midi_note_off(channel, pitch);
             }
             AppEvent::MidiControlChange { channel, controller, value } => {
                 // Phase 7 B1-M Step 2 (2026-05-13): Learn mode なら binding 追加、
