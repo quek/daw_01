@@ -18,8 +18,7 @@ $ARGUMENTS を実装する。
 ## 大原則 (CLAUDE.md より、 この skill の全段に優先)
 
 - **理想とベストプラクティスを追求する。実装コストは無視して大胆に作り直す。**
-  「実装コスト」「影響範囲」「現実的に」「妥協」が思考に出た時点で principle 違反
-  (PreToolUse guard engine `scripts/guard_engine.py` + guards.jsonl の compromise-smell ルールが検出)。
+  「実装コスト」「影響範囲」「現実的に」「妥協」が思考に出た時点で principle 違反。
 - **最終形まで一気に完成させる。フェーズ分けをしない。**「Phase 1 完成、次に進みますか」は禁止。
   ゴールまで完走する。
 - **まず調べる。推測で実装しない。** 一次情報 (DAW manual / CLAP spec / 参照実装 / gui_01 doc)

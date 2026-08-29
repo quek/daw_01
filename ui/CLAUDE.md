@@ -3,8 +3,8 @@
 Rust 製・モデルを Clone しない immediate-mode GUI ライブラリ。GUI のみを扱い、audio / IPC には
 一切関知しない。daw_01 に統合され `daw_01/ui/` に置かれる（旧 sibling repo gui_01）。
 
-AHE ループ / hook / skill / 共通の coding principle は daw_01 root の [CLAUDE.md](../CLAUDE.md) と
-`.claude/` に一本化済み。この CLAUDE.md は **UI ライブラリ固有の技術ガイド** (クレート構成・
+skill / 共通の coding principle は daw_01 root の [CLAUDE.md](../CLAUDE.md) と `.claude/` に
+一本化済み。この CLAUDE.md は **UI ライブラリ固有の技術ガイド** (クレート構成・
 load-bearing invariant・高頻度の罠) のみを残す。
 
 設計の詳細は [docs/plan.html](docs/plan.html) を参照 (正本)。
@@ -48,6 +48,28 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - ライブラリは audio / IPC / プロセス間通信に一切関知しない。`Edit` を返したところで責務を切る
 
 これらは `crates/ui/tests/no_clone_required.rs` (trybuild) で CI 固定済み。
+
+## daw_01 側からの使い方
+
+- **AppData は plain mutable struct**。Signal / Memo / derive は使わない。派生は method
+  (`app.track_headers() -> Vec<TrackHeader>`) として毎フレーム計算し、重ければ view 側で
+  1 frame 分キャッシュする。
+- **イベント dispatch**: view から `Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::X))`、
+  background thread から `EventLoopProxy<AppEvent>::send_event`。`impl Model` 的な trait 接続は不要。
+- **immediate-mode + `heavy()` escape hatch**: 大量描画 (ピアノロール / アレンジ) は
+  `ui.heavy(id, |hctx| hctx.cached(viewport_key, |hctx| { ... }))` の中で `push_rect` / `push_text` /
+  `push_lines` / `push_edit` を呼ぶ。`Ui::push_edit` は `pub(crate)` なので、view から Edit を
+  流すのは heavy ブロック内から。
+- **背景スレッド** (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX synth / plugin DB
+  rescan) は `std::thread` + `EventLoopProxy`。**`tokio::time::sleep` は使えない**。
+- **ダブルクリック検出は built-in が無い**。`AppData::last_click: Option<(Instant, x, y)>` に
+  最終クリックを記録し、各 view の入力ハンドラで 400ms + 5px 以内なら double 判定。
+- **UI のキーバインド・イベントは可視フィードバックが無いと動いたか判別不能**。迷ったら
+  `AppData::handle_event` 冒頭に `tracing::info!(?event, "received")` を入れてログで確認し、
+  確認後は削除するか debug feature で囲う (`/debug-gui` / `/debug-ui` skill)。
+- イベントループ (`daw_gui/src/view/runner.rs::Runner`)、ショートカット
+  (`Runner::dispatch_shortcut`)、`WindowBackend` の配線 (上流の正準実装
+  `daw_ui_platform::WinitWindow` を直接使う) は該当ファイルを読む。
 
 ## Coding Principles (daw-ui 固有の上乗せ)
 

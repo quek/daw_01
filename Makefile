@@ -28,8 +28,7 @@ PYTHON ?= $(shell command -v python 2>/dev/null || command -v python3 2>/dev/nul
 #     `NVIDIA Corporation/umdlogs` を作る。main + worktree で 9 箇所に堆積していた。
 #     この復元ブロックの有無だけを変えた A/B で、出る / 出ないが再現する。
 #   - Python の os.path.expanduser("~") がリテラル `~` を返す (ntpath は HOME を見ず、
-#     USERPROFILE → HOMEDRIVE+HOMEPATH の順に見るため)。scripts/test_guards.py は
-#     Git Bash から FAIL 0、make の recipe からは FAIL 27 だった。
+#     USERPROFILE → HOMEDRIVE+HOMEPATH の順に見るため)。
 #     解決不能な `~` を含むパスに書きに行くと、**リポジトリ内にリテラル `~` ディレクトリ**が
 #     生える (`daw_guitestsfixtures/` と同じ種類のゴミ)。
 #   - recipe 内の git がユーザーの ~/.gitconfig を丸ごと見失う (`git config --get user.name`
@@ -167,7 +166,7 @@ endif
 
 # --- カナリア ---
 # 「復元ブロックが動いていない」状態は、今と同じく **無症状で何か月も続く**
-# (guards.jsonl 消失は 5 日、arch-lint の backslash 欠落は数か月、どちらも症状ゼロだった)。
+# (arch-lint の backslash 欠落は数か月、症状ゼロだった)。
 # だから復元セットが埋まらなかったら **落とす**。cargo-deny / arch-lint と同じ
 # 「skip の緑を作らない」原則。
 # **置き場所は parse time でなければならない。** recipe の先頭に置く案は、canary を持たない
@@ -210,8 +209,7 @@ TEST_PKGS_NO_GUI := $(patsubst %,-p %,$(filter-out daw_gui,$(TEST_PKG_NAMES)))
 # daw_plugin_host まで spawn して audio device を開く。名前は基準ではない
 # (pdc_real_vst3 / sidechain_real_vst3 は smoke が付かないのに起動し、arr_widget /
 # pr_widget / font_picker は起動しない)。ここは grep -L (= 当たらない側) で反転して取る。
-# 同じ基準を .claude/guards.jsonl の no-app-launching-test-target が列挙しており、
-# scripts/test_guards.py の check_launching_targets_list() が両者のズレを検出する。
+# **手で列挙しないこと。** 列挙にするとテストが増減した瞬間に静かにズレる。
 DAW_GUI_SAFE_TESTS := $(patsubst %,--test %,$(basename $(notdir \
     $(shell grep -L CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs 2>/dev/null))))
 # **ディレクトリ形式の test target** (`tests/<name>/main.rs` = 複数モジュールを 1 バイナリに

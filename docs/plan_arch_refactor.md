@@ -471,8 +471,6 @@ resize / split / セクション / automation lane 編集 / piano_roll ノート
   protocol への `Vec<f32>`/`Arc<[u8]>` 混入、サイズ budget (実コード 1,000 行 / 関数 300 行 /
   インデント 6 段。`scripts/loc_budget.py`。当初は物理行 >3000 だったが r.md #76 で置換)、
   common の依存 (reqwest 等) 逆流。clippy と並ぶ検証段として Makefile に組み込む。
-- **guards.jsonl 追記** (承認不要の主経路): INFINITE / positional tuple key /
-  `push_undo_snapshot` 直呼び / untagged 追加 / MainToChild 復活 の warn ルール。
 - **新 skill `/arch-review`**: 本セッションの 6 レンズ並列分析 + arch-lint + サイズ budget
   (実コード行 / 関数長 / ネスト。当初は行数 budget) を定型化 (四半期/大機能後に回す)。
 - **implement skill に「アーキテクチャ影響チェック」段を追加**: 新機能が

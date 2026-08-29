@@ -53,53 +53,14 @@ VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**
 `%LOCALAPPDATA%\daw_01\voicevox_engine_path.txt` に所在 (install root / `VOICEVOX.exe` /
 `run.exe` のいずれか) を書く。
 
-## Claude Code の hook が同梱されている (clone したら読むこと)
+## Claude Code の hook は同梱していない
 
-このリポジトリは [`.claude/settings.json`](.claude/settings.json) を **git 追跡している**。
-そのため **clone したツリーを Claude Code で開くと、下の 8 本の hook が自動で有効になり、
-以後のツール呼び出しのたびにローカルで実行される**。
+このリポジトリは [`.claude/settings.json`](.claude/settings.json) を git 追跡しているが、
+**hook は 1 本も登録していない** (`{}`)。clone したツリーを Claude Code で開いても、
+ツール呼び出しに割り込むローカルスクリプトは走らない。外部通信もしない。
 
-これらは作者のエージェント運用ループ (CLAUDE.md の「Reflection の確認」節) のためのもので、
-**daw_01 のビルド・実行・テストには一切不要**。Claude Code を使わない場合は何も起きない。
-
-実体は [`.claude/hooks/`](.claude/hooks) と [`scripts/`](scripts) にある。
-
-| イベント | スクリプト | 何をするか |
-|---|---|---|
-| SessionStart | [`sessionstart_show_pending_reflections.sh`](.claude/hooks/sessionstart_show_pending_reflections.sh) | 前セッションが書き残した「要 triage」項目をセッション冒頭に提示し、ファイルを `.last` へ回転する |
-| PreToolUse (Edit/Write/Bash 等) | [`scripts/guard_engine.py`](scripts/guard_engine.py) | リポジトリ内のルール DB [`.claude/guards.jsonl`](.claude/guards.jsonl) の正規表現をツール入力に当て、一致したら警告する。ルールの `action` が `block` のものは **そのツール呼び出しを取り消す** |
-| PreToolUse (Bash) | [`pretooluse_git_commit_review_reminder.sh`](.claude/hooks/pretooluse_git_commit_review_reminder.sh) | `git commit` の前にレビューと同件チェックの実施を促す文面を差し込む (警告のみ) |
-| PreToolUse (Bash) | [`scripts/check_destructive_delete.py`](scripts/check_destructive_delete.py) | 削除対象が変数・環境変数参照やルート相当のとき、再帰削除コマンドを **取り消す** (リテラルな部分パスの削除は通す) |
-| PostToolUse | [`scripts/log_metric.py`](scripts/log_metric.py) | ツール呼び出し 1 件につき 1 行を **ユーザ home の jsonl へ追記** (時刻 / セッション id / ツール名 / 対象の要約 / 成否) |
-| Stop | [`stop_session_reflect.sh`](.claude/hooks/stop_session_reflect.sh) | セッションの transcript から直近のやり取りを読み、修正・やり直しのパターンを検出して **抜粋つきで**次セッション用ファイルに書く |
-| Stop | [`scripts/reflect.py`](scripts/reflect.py) | 同じ警告ルールが 3 セッション以上で発火していたら `warn` → `block` に自動昇格する (= 以後そのパターンはツール呼び出しごと取り消される)。**昇格はリポジトリ外の overlay (`guard_state.json`) に書き、追跡ファイルは書き換えない**。Bash の連続失敗も検出して backlog に 1 行足す |
-| WorktreeRemove | [`scripts/worktree_remove_cleanup.py`](scripts/worktree_remove_cleanup.py) | worktree 削除がファイルロックで失敗して dir が残った場合に、ロック元を落として dir を消す (下記) |
-
-有効にする前に知っておくべき挙動が 3 つある。
-
-**1. `worktree_remove_cleanup.py` の削除範囲とプロセス kill は範囲が違う。**
-ディレクトリ削除 (`shutil.rmtree`) は **`<リポジトリ>/.claude/worktrees/` 配下に限定**され、
-それ以外のパスが渡されたら何もせずに戻る (main のチェックアウトや任意のパスは触らない)。
-一方、ロック元を落とす `taskkill /F /IM rust-analyzer.exe` (と `rust-analyzer-proc-macro-srv.exe`) は
-**イメージ名指定なのでマシン全体に効く** — 無関係な別プロジェクトで動いている rust-analyzer も
-一緒に落ちる。走るのは Windows で、かつ「削除に失敗して dir が実在する」ときだけ。
-
-**2. リポジトリの外に書き、プロンプトの抜粋を含む。**
-`log_metric.py` / `reflect.py` / `guard_engine.py` の**実行時状態**の書き込み先は
-`~/.claude/projects/<チェックアウトのパス由来の名前>/` 配下 (`metrics/*.jsonl` /
-`guard_hits.jsonl` / `guard_state.json` / `ahe_backlog.md`)。ディレクトリ名は
-[`scripts/ahe_paths.py`](scripts/ahe_paths.py) が **main チェックアウトの絶対パスから導出**する
-(マシン固有パスのハードコードはしていない)。**ルール DB
-[`.claude/guards.jsonl`](.claude/guards.jsonl) はリポジトリ内**で、hook が書き換えることは無い。
-`stop_session_reflect.sh` はセッションの transcript を読み、検出したユーザ発言の抜粋を
-main チェックアウトの `.claude/.session_reflect_pending.md` に書く。
-
-**3. 外部通信はしない。** 8 本とも読むのはローカルのファイルと標準入力だけで、
-ネットワークアクセスも認証情報の読み取りも行わない。
-
-無効化するには、clone 後に `.claude/settings.json` の `hooks` ブロックを削除する
-(追跡ファイルなので、差分を残したくなければ `git update-index --skip-worktree .claude/settings.json`
-を併用する)。`.claude/settings.local.json` は gitignore 対象なので clone には含まれない。
+コード品質の強制は `make` の検査 (`arch-lint` / `clippy` / `test` / `license-check` / `audit`) が
+担う。どれも実行結果が出力に出るので、黙って壊れても気付ける。
 
 ## ライセンス
 
