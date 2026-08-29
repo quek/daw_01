@@ -42,19 +42,44 @@ pub struct Vst3Entry {
 /// imposing a real limit.
 const MAX_DEPTH: u8 = 8;
 
-/// Scans `%COMMONPROGRAMFILES%\VST3` (or the default `C:\Program Files\Common Files\VST3`)
-/// **recursively** for `.vst3` entries (vendor subfolders are standard per
-/// the VST3 SDK, e.g. `…\VST3\Steinberg\HALion 7.vst3`) and resolves each
-/// one's DLL path. The `.vst3` bundle itself is treated as a leaf — we
-/// don't recurse into `Contents/x86_64-win/` because that's the bundle
-/// internals, not a search path. Individual unresolvable entries are
-/// logged and skipped.
+/// Scans **every** VST3 location the spec defines — user
+/// (`FOLDERID_UserProgramFilesCommon\VST3`), global
+/// (`FOLDERID_ProgramFilesCommon\VST3`) and application (`<exe dir>\VST3`),
+/// in that priority order (see [`crate::plugin_paths`] for the spec text).
+///
+/// Each root is walked **recursively** for `.vst3` entries (vendor
+/// subfolders are standard per the VST3 SDK, e.g.
+/// `…\VST3\Steinberg\HALion 7.vst3`) and each one's DLL path is resolved.
+/// The `.vst3` bundle itself is treated as a leaf — we don't recurse into
+/// `Contents/x86_64-win/` because that's the bundle internals, not a search
+/// path. Individual unresolvable entries are logged and skipped.
+///
+/// Roots that don't exist are not an error; a root that exists but can't be
+/// read is logged and skipped, so "not installed" and "couldn't look" stay
+/// distinguishable.
 pub fn scan_system_vst3_directory() -> Result<Vec<Vst3Entry>> {
-    let common_files = std::env::var_os("COMMONPROGRAMFILES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Common Files"));
-    let vst3_dir = common_files.join("VST3");
-    scan_directory(&vst3_dir)
+    let roots = crate::plugin_paths::vst3_search_roots();
+    if roots.is_empty() {
+        tracing::info!("no VST3 search root exists on this machine");
+        return Ok(Vec::new());
+    }
+    let mut plugins = Vec::new();
+    for root in &roots {
+        match scan_directory(root) {
+            Ok(found) => plugins.extend(found),
+            Err(e) => tracing::warn!(
+                error = ?e,
+                path = %root.display(),
+                "VST3 search root scan failed, skipping"
+            ),
+        }
+    }
+    plugins.sort_by(|a, b| a.bundle_path.cmp(&b.bundle_path));
+    // 仕様の優先度は User → Global → Application で「同じ Processor UID なら
+    // 最初に見つかったもの」。 ここは bundle_path が同一のものだけを畳む
+    // (別ルートの同名 bundle は別プラグインでありうるので UID では畳まない)。
+    plugins.dedup_by(|a, b| a.bundle_path == b.bundle_path);
+    Ok(plugins)
 }
 
 fn scan_directory(dir: &Path) -> Result<Vec<Vst3Entry>> {

@@ -17,6 +17,10 @@ serde_json.workspace = true
 bincode.workspace = true
 clap-sys.workspace = true
 com-scrape-types.workspace = true
+# CLAP 仕様の非 Windows 検索パス (`~/.clap` / `~/Library/Audio/Plug-Ins/CLAP`) を
+# home の推測なしに解決するため (plugin_paths.rs)。Windows 側は windows crate の
+# SHGetKnownFolderPath を直接使う。
+dirs.workspace = true
 hound.workspace = true
 libloading.workspace = true
 tokio.workspace = true

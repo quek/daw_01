@@ -15,6 +15,7 @@
 mod ara;
 mod builtin;
 mod clap_scan;
+mod plugin_paths;
 mod plugin_scan;
 mod vst3_scan;
 mod clap_host;

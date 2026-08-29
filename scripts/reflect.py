@@ -42,12 +42,22 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ahe_paths  # noqa: E402  (sibling module, resolved from this file's dir)
 
-PROJ = ahe_paths.state_dir()
-BACKLOG = os.path.join(PROJ, "ahe_backlog.md")
+# Resolved at import time so the rest of the module can stay declarative.
+# When the home directory is unresolvable (see ahe_paths.home_dir) every
+# untracked path below is unknowable; keep them None and let main() report it
+# once and stop, rather than dying with a traceback before its own try/except
+# is even installed.
+ENV_BROKEN = None
+try:
+    PROJ = ahe_paths.state_dir()
+except ahe_paths.EnvironmentBroken as _exc:
+    ENV_BROKEN = str(_exc)
+    PROJ = None
+BACKLOG = None if PROJ is None else os.path.join(PROJ, "ahe_backlog.md")
 GUARDS = ahe_paths.guards_file()          # TRACKED: read-only from this hook
-GUARD_STATE = ahe_paths.guard_state_file()  # untracked overlay: the only thing we write
-HITS = os.path.join(PROJ, "guard_hits.jsonl")
-METRICS_DIR = os.path.join(PROJ, "metrics")
+GUARD_STATE = None if PROJ is None else os.path.join(PROJ, "guard_state.json")
+HITS = None if PROJ is None else os.path.join(PROJ, "guard_hits.jsonl")
+METRICS_DIR = None if PROJ is None else os.path.join(PROJ, "metrics")
 
 ESCALATE_SESSIONS = 3  # a warn guard firing in this many distinct sessions -> auto-block
 
@@ -421,6 +431,17 @@ def upsert_backlog(detected, session_short, today):
 
 
 def main():
+    if ENV_BROKEN is not None:
+        # Stop hook: stderr is shown to the user and does not block anything,
+        # so this is the right place in the AHE loop to be loud once per stop.
+        # Silence here is what let the 2026-08-22 outage run for five days.
+        sys.stderr.write(
+            "reflect.py: 環境が壊れているため AHE ループを実行できません。\n"
+            "  %s\n"
+            "  昇格 (warn->block) と backlog の更新はこの session では行われません。\n"
+            % ENV_BROKEN
+        )
+        return 0
     raw = sys.stdin.buffer.read().decode("utf-8", "replace")
     if not raw.strip():
         return 0

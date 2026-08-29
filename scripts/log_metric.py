@@ -49,7 +49,17 @@ def main():
         "status": status,
     }
 
-    logdir = os.path.join(ahe_paths.state_dir(), "metrics")
+    try:
+        state = ahe_paths.state_dir()
+    except ahe_paths.EnvironmentBroken:
+        # Deliberate silent give-up, not an accident: metrics are a
+        # convenience, and PostToolUse stdout only reaches the transcript, so
+        # shouting here would not reach anyone who can fix it. The guard
+        # engine (PreToolUse) already warns loudly about the same condition
+        # on the very next tool call. Never write into a literal '~' dir.
+        return 0
+
+    logdir = os.path.join(state, "metrics")
     try:
         os.makedirs(logdir, exist_ok=True)
         logfile = os.path.join(logdir, datetime.now().strftime("%Y-%m") + ".jsonl")

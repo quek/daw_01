@@ -7,22 +7,182 @@ PYTHON ?= $(shell command -v python 2>/dev/null || command -v python3 2>/dev/nul
 
 .DEFAULT_GOAL := release
 
-# --- TMP/TEMP の書き戻し (Claude Code の Git Bash → MSYS2 make 対策、2026-07-03 発覚) ---
-# Git for Windows の bash から MSYS2 の make を起動すると、msys-2.0.dll ランタイム差で
-# recipe 環境が HOME/MSYSTEM/PATH/SYSTEMDRIVE/SYSTEMROOT/TERM/WINDIR の 7 変数まで scrub
-# され TMP/TEMP が消える。native な cargo / テスト exe は GetTempPath が SYSTEMROOT
-# (C:\WINDOWS) へ fallback し、tempfile を使うテスト 51 件が PermissionDenied で全滅する。
-# 欠落時のみ workspace 内の target/tmp を割り当てて export する (user profile の推測は
-# しない — この文脈の HOME は /home/<user> = C:\msys64\home\<user> で実在しない)。
-# 通常のシェルでは TMP 定義済みなので素通り、Linux は SYSTEMROOT が無いのでブロックごと
-# 素通り。MSYS2 sh は native 子プロセスへの exec 時に TMP/TEMP を Windows 形式へ自動変換する。
+# =====================================================================================
+# Windows のログオン環境の復元 (r.md #81)
+# 2026-07-03 に TMP/TEMP だけを埋める版で発覚、2026-08-29 に全面的に作り直した。
+# =====================================================================================
+#
+# 【症状】Git for Windows の bash から MSYS2 の make を起動すると、msys-2.0.dll の
+# ランタイム差で **POSIX 環境変数が 1 つも継承されない**。値ごと渡るのは Win32 側の
+# 強制セット (PATH / SYSTEMDRIVE / SYSTEMROOT / WINDIR / MSYSTEM) だけで、HOME と TERM は
+# 受信側ランタイムの合成値 (実測: TERM=BOGUS-TERM を渡しても xterm-256color、
+# HOME=/tmp/bogus を渡しても /home/<user>)。recipe の native 子プロセス (cargo / rustc /
+# daw exe / プラグイン DLL / GPU ドライバ) が見るのは、make と sh が足した
+# MAKEFLAGS / MAKELEVEL / MFLAGS / PWD / SHLVL / _ を含めて 13 変数しかない。
+# **「7 変数まで scrub される」という以前の記述は測定器由来の誤り**だった — recipe の中で
+# PATH 解決される `env` は Git for Windows 側のバイナリで、それを呼ぶこと自体が 2 度目の
+# cross-runtime exec になっていた (下の【検証のしかた】)。
+#
+# 【実害】すべて実測で確認済み。
+#   - GPU ドライバ (nvwgf2umx.dll) が %ProgramData% を解決できず、cwd に
+#     `NVIDIA Corporation/umdlogs` を作る。main + worktree で 9 箇所に堆積していた。
+#     この復元ブロックの有無だけを変えた A/B で、出る / 出ないが再現する。
+#   - Python の os.path.expanduser("~") がリテラル `~` を返す (ntpath は HOME を見ず、
+#     USERPROFILE → HOMEDRIVE+HOMEPATH の順に見るため)。scripts/test_guards.py は
+#     Git Bash から FAIL 0、make の recipe からは FAIL 27 だった。
+#     解決不能な `~` を含むパスに書きに行くと、**リポジトリ内にリテラル `~` ディレクトリ**が
+#     生える (`daw_guitestsfixtures/` と同じ種類のゴミ)。
+#   - recipe 内の git がユーザーの ~/.gitconfig を丸ごと見失う (`git config --get user.name`
+#     が空)。identity だけでなく core.excludesFile / alias / credential helper / safe.directory
+#     も全部消える。scripts/cleanup_worktree.sh は make から起動され、その中で
+#     git worktree remove / git branch -D を回している。
+#   - GetTempPath が SYSTEMROOT (C:\WINDOWS) へ fallback し、tempfile を使うテスト 51 件が
+#     PermissionDenied で全滅する (2026-07-03 の元症状)。
+#
+# 【復元の権威は known folder API ただ 1 つ】`cygpath -w -F <CSIDL>` は SHGetFolderPath を
+# 叩くので env を一切参照せず、scrub 済みの環境でも正しい値を返す (実測)。
+# SHGetFolderPath は Vista 以降 SHGetKnownFolderPath の薄いラッパなので、
+# common/src/app_dirs.rs が使う dirs crate と同じ権威に行き着く。
+# **レジストリからは取らない** — HKLM の Session Manager\Environment は live session と
+# 食い違う値を持つ (実測: USERNAME=SYSTEM / TEMP=%SystemRoot%\TEMP)。
+#
+# 【書き戻さないもの】USERNAME / USERDOMAIN / LOGONSERVER / COMPUTERNAME / SESSIONNAME /
+# NUMBER_OF_PROCESSORS / PROCESSOR_* / OS / PATHEXT。これらの権威は known folder API では
+# なく GetUserNameW / GetComputerNameW / GetSystemInfo 等の別 API にあり、env が無ければ
+# 読む側がその API へ落ちられる。**間違った値を入れるのは未定義のままより悪い** —
+# 未定義なら呼び出し側が API にフォールバックするが、誤値は静かに間違った答えになる。
+#
+# 【大文字小文字の罠】Windows の env は case-insensitive だが make は case-sensitive で、
+# しかも make に届く綴りは起動経路依存 (実測: 同じマシンでも PROGRAMFILES は全大文字なのに
+# ProgramData / ProgramFiles(x86) は混在綴り)。だから「在るか」は候補綴りを全部見る。
+# 1 綴りしか見ないと、健全な環境で綴り違いの二重登録を作る。
+# 以前あった「括弧付きの名前は $(origin ...) でガードできない」という診断は**誤り**で、
+# $(origin ProgramFiles(x86)) は正しく environment を返す。壊れていたのは
+# $(origin PROGRAMFILES(X86)) = 綴り違いのほうで、括弧は無関係だった。
+# ただし参照だけは $(ProgramFiles(x86)) では取れないので $(value ...) を使う。
+#
+# 【検証のしかた】**printenv / env で検証しないこと。** PATH 上の env は Git for Windows 側の
+# バイナリで、MSYS2 make から見ると cross-runtime の子プロセスなので、自分が失った環境を
+# 正直に報告してしまう (= 測定器が答えを作る)。確認は必ず **native プロセス**で行う:
+#   make <target> のかわりに recipe へ  @python -c "import os;print(os.environ.get('LOCALAPPDATA'))"
+#
+# 【Linux / macOS】SYSTEMROOT が無いのでブロックごと展開されず、cygpath も走らない。
+#
+# 【コスト】実測 (5 回平均、make 起動込み)。健全な環境では $(shell) が 1 回も走らない。
+#   健全 (cmd 経由)    : 75ms → 77ms   (+2ms、実質 no-op かつ値も不変 = 冪等)
+#   scrub 済み (Git Bash): 66ms → 約 450ms  (cygpath 1 回あたり約 45ms × 10)
 ifdef SYSTEMROOT
+
+# 候補綴りのどれかが「未定義でない」なら在る。command line / override も尊重するので
+# `make LOCALAPPDATA=D:\x` を勝手に上書きしない。
+win_env_have = $(strip $(foreach n,$(1),$(filter-out undefined,$(origin $(n)))))
+
+# 「環境が MSYS2 に作り直された」印。HOME の判定に使う (下記) ので、USERPROFILE を
+# 再構成する **前に** 取っておく。
+_WIN_ENV_USERPROFILE_WAS_MISSING := $(if $(call win_env_have,USERPROFILE),,1)
+
+# CSIDL 1 個につき cygpath は 1 回だけ。ALLUSERSPROFILE と ProgramData のように
+# **同じ known folder を指す別名**が 3 組あるので、値の出どころを 1 つにまとめる (SSoT)。
+win_kf = $(if $(_WIN_KF_$(1)),,$(eval _WIN_KF_$(1) := $(shell cygpath -w -F $(1))))$(_WIN_KF_$(1))
+
+# $(1)=書き戻す綴り / $(2)=CSIDL / $(3)=同義の綴り (空可)
+define win_env_folder
+ifeq ($$(call win_env_have,$(1) $(3)),)
+$(1) := $$(call win_kf,$(2))
+export $(1)
+endif
+endef
+
+# CSIDL は MS 公式の env ↔ CSIDL 対応 (USMT の Recognized environment variables) どおり。
+# 値はこのマシンで実測して一致を確認済み。
+$(eval $(call win_env_folder,APPDATA,26,))
+$(eval $(call win_env_folder,LOCALAPPDATA,28,))
+$(eval $(call win_env_folder,USERPROFILE,40,))
+$(eval $(call win_env_folder,ProgramData,35,PROGRAMDATA))
+$(eval $(call win_env_folder,ALLUSERSPROFILE,35,))
+$(eval $(call win_env_folder,PROGRAMFILES,38,ProgramFiles))
+$(eval $(call win_env_folder,ProgramW6432,38,PROGRAMW6432))
+$(eval $(call win_env_folder,ProgramFiles(x86),42,PROGRAMFILES(X86)))
+$(eval $(call win_env_folder,COMMONPROGRAMFILES,43,CommonProgramFiles))
+$(eval $(call win_env_folder,CommonProgramW6432,43,COMMONPROGRAMW6432))
+$(eval $(call win_env_folder,CommonProgramFiles(x86),44,COMMONPROGRAMFILES(X86)))
+
+# PUBLIC には CSIDL が無い (KNOWNFOLDERID には FOLDERID_Public として在る)。
+# CSIDL_COMMON_DESKTOPDIRECTORY(25) の親から取る。**葉の名前 (Desktop) を書かずに**
+# POSIX 形式の親を切るので、プロファイル置き場が既定以外でも、空白入りでも壊れない。
+ifeq ($(call win_env_have,PUBLIC Public),)
+PUBLIC := $(shell p=$$(cygpath -u -F 25); cygpath -w "$${p%/*}")
+export PUBLIC
+endif
+
+# 以下は known folder から **推測ゼロで導出**できるもの。追加の API 問い合わせは要らない。
+# USERPROFILE が取れなかったときに HOMEDRIVE=`:` のような誤値を作らないよう、非空のときだけ
+# 導出する (誤値は未定義より悪い)。取れなかった事実は下のカナリアが USERPROFILE 側で捕まえる。
+ifneq ($(USERPROFILE),)
+ifeq ($(call win_env_have,HOMEDRIVE),)
+HOMEDRIVE := $(firstword $(subst :, ,$(USERPROFILE))):
+export HOMEDRIVE
+endif
+ifeq ($(call win_env_have,HOMEPATH),)
+HOMEPATH := $(subst $(HOMEDRIVE),,$(USERPROFILE))
+export HOMEPATH
+endif
+endif
+ifeq ($(call win_env_have,COMSPEC ComSpec),)
+COMSPEC := $(SYSTEMROOT)\system32\cmd.exe
+export COMSPEC
+endif
+
+# HOME は「未定義」ではなく MSYS2 が /etc から作り直した値 (C:\msys64\home\<user>) が
+# 入っているので origin では判定できない。**USERPROFILE を再構成したとき = 環境が
+# 作り直されたと分かったときだけ**、同じ根拠で HOME も戻す。健全な環境では、ユーザーが
+# HKCU\Environment に置いた HOME を尊重して触らない。
+# **POSIX 形式でなければならない** — Windows パスを sh の HOME に入れると `cd ~` が壊れる。
+# MSYS2 は native 子プロセスへの exec 時に HOME を Windows 形式へ自動変換するので、
+# native 側は C:\Users\<user> を受け取る (実測)。
+# 実測 (before → after): `cd ~` /home/ancient → /c/Users/ancient、
+# `git config --get user.name` 空 → 'Tahara Yoshinori'、native HOME
+# C:\msys64\home\ancient → C:\Users\ancient、expanduser('~') `~` → C:\Users\ancient。
+ifeq ($(_WIN_ENV_USERPROFILE_WAS_MISSING),1)
+HOME := $(shell cygpath -u -F 40)
+export HOME
+endif
+
+# TMP / TEMP は **復元ではない**。known folder API に「ユーザーの一時ディレクトリ」に
+# 相当する権威が無く、実値は HKCU\Environment にしか無いので、上の「推測で書かない」方針
+# では再構成できない。かといって欠落のまま native 子プロセスへ渡すと GetTempPath が
+# SYSTEMROOT へ落ちて書き込み不能になる。よってここは**方針として** checkout 内の
+# target/tmp を割り当てる:
+#   - checkout ごとに隔離される (worktree を並列に回しても一時ファイルが混ざらない)
+#   - make clean (= cargo clean) が掃除する
+# 以前ここに「未保存インポートの実データが落ちて make clean が黙って消す」という実害が
+# あったが、それは TMP の指す先ではなく LOCALAPPDATA が無いことが原因で、daw_gui が
+# common::app_dirs (= SHGetKnownFolderPath) 経由になった今は起きない。
 ifeq ($(origin TMP),undefined)
 TMP := $(CURDIR)/target/tmp
 TEMP := $(TMP)
 export TMP TEMP
 $(shell mkdir -p "$(TMP)")
 endif
+
+# --- カナリア ---
+# 「復元ブロックが動いていない」状態は、今と同じく **無症状で何か月も続く**
+# (guards.jsonl 消失は 5 日、arch-lint の backslash 欠落は数か月、どちらも症状ゼロだった)。
+# だから復元セットが埋まらなかったら **落とす**。cargo-deny / arch-lint と同じ
+# 「skip の緑を作らない」原則。
+# **置き場所は parse time でなければならない。** recipe の先頭に置く案は、canary を持たない
+# target (help / clean / fmt / worktree-rm) を素通りさせる。ここが唯一漏れない位置。
+# 空値を export したまま進むのは未定義より悪い (Rust の var_os は Some("") を返すので
+# fallback が働かず、空パスへ連結しに行く) ので、空も「欠落」として扱う。
+WIN_ENV_REQUIRED := APPDATA LOCALAPPDATA USERPROFILE ProgramData ALLUSERSPROFILE \
+                    PROGRAMFILES ProgramW6432 ProgramFiles(x86) \
+                    COMMONPROGRAMFILES CommonProgramW6432 CommonProgramFiles(x86) \
+                    PUBLIC HOMEDRIVE HOMEPATH COMSPEC TMP TEMP
+WIN_ENV_MISSING := $(strip $(foreach v,$(WIN_ENV_REQUIRED),$(if $(value $(v)),,$(v))))
+ifneq ($(WIN_ENV_MISSING),)
+$(error Windows 環境の復元に失敗しました。空のまま残った変数: $(WIN_ENV_MISSING) -- cygpath は PATH にありますか (command -v cygpath)。空の環境変数は未定義より危険なので停止します)
+endif
+
 endif
 
 # 実行に必要な 3 つの exe (= runtime product)。ui/crates/examples/* (daw-ui-example-*) は

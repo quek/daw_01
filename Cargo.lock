@@ -1445,6 +1445,7 @@ dependencies = [
  "clap-sys",
  "com-scrape-types",
  "common",
+ "dirs",
  "hound",
  "libloading",
  "reqwest",

@@ -35,7 +35,13 @@ cross-checked against whatever ~/.claude/projects actually contains on the host
 that runs scripts/test_guards.py, which is stronger evidence than a baked-in
 example and does not leak a checkout location into a public repository.
 
-Every function is total: callers are hooks that must never raise.
+Every function is total EXCEPT `state_dir` / `guard_state_file`, which raise
+`EnvironmentBroken` when the home directory cannot be resolved. They must not
+invent a path in that case: a literal '~' would turn every write into
+repository litter and would make a broken environment indistinguishable from a
+fresh clone. Hook callers still must never crash, so each of them catches
+`EnvironmentBroken` explicitly and says, at its call site, what it does
+instead. Use `home_dir()` when you only need to ask whether home is knowable.
 """
 import os
 import re
@@ -66,9 +72,62 @@ def slug(path):
     return _SLUG_UNSAFE_RE.sub("-", p)
 
 
+class EnvironmentBroken(Exception):
+    """The environment cannot say where the user's home directory is.
+
+    Raised instead of handing back a path that merely LOOKS usable. See
+    `home_dir` for why a literal '~' must never be joined into a path.
+    """
+
+
+def home_dir():
+    """The user's home directory, or None when the environment can't say.
+
+    `os.path.expanduser("~")` does NOT fail when it cannot expand -- it
+    returns the string "~" unchanged. On Windows it never looks at HOME; it
+    reads USERPROFILE, then HOMEDRIVE+HOMEPATH (CPython Lib/ntpath.py). Both
+    of those are gone from a `make` recipe launched out of Git Bash, because
+    the MSYS2 runtime rebuilds the environment from scratch and keeps only
+    the Win32 forced set (see the top of the Makefile). Measured there:
+    expanduser('~') == '~'.
+
+    Joining that onto a path yields a RELATIVE path starting with a literal
+    '~' directory, so every write lands in `<cwd>/~/.claude/...` -- i.e. a
+    stray '~' directory inside the repository, the same class of litter as
+    `daw_guitestsfixtures/`. Worse, it makes "the environment is broken"
+    indistinguishable from "this is a fresh clone with no memories yet":
+    both look like "the file isn't there".
+
+    So: resolve it here, once, and say None when it did not resolve.
+    """
+    home = os.path.expanduser("~")
+    # expanduser leaves the tilde in place on failure -- that is the signal.
+    if not home or home == "~" or home.startswith("~"):
+        return None
+    return home
+
+
 def state_dir(path=None):
-    """~/.claude/projects/<main-checkout-slug>/ -- shared by all worktrees."""
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects",
+    """~/.claude/projects/<main-checkout-slug>/ -- shared by all worktrees.
+
+    Raises `EnvironmentBroken` when the home directory is unresolvable
+    (see `home_dir`). This is the one function in this module that is not
+    total, deliberately: returning a '~'-prefixed path here would create
+    repository litter and hide a broken environment behind a green check.
+    Callers that must not raise catch it explicitly -- and each of them
+    documents what it does instead, so the degradation is a decision rather
+    than an accident.
+    """
+    home = home_dir()
+    if home is None:
+        raise EnvironmentBroken(
+            "cannot resolve the home directory: expanduser('~') returned it "
+            "unchanged. On Windows that means USERPROFILE and HOMEDRIVE+"
+            "HOMEPATH are both unset -- typically a `make` recipe started "
+            "from Git Bash (see the environment-restoration block at the top "
+            "of the Makefile)."
+        )
+    return os.path.join(home, ".claude", "projects",
                         slug(main_checkout(path)))
 
 

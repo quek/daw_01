@@ -55,6 +55,14 @@ strip_comments() {
     "$PY" scripts/loc_budget.py --filter-comments || printf '%s\n' "$FILTER_BROKEN"
 }
 
+# 追跡外の空ディレクトリ列挙 (check 13)。同じ理由で fail-open にしない —
+# **「1 件も出なかった」と「走査できなかった」を区別する**ための番兵。
+# 列挙が空を返すのは正常な状態でもあるので、失敗を空で表現してはいけない。
+EMPTYDIR_BROKEN='EMPTY-DIR-SCAN-BROKEN'
+list_empty_dirs() {
+    "$PY" scripts/empty_dirs.py || printf '%s\n' "$EMPTYDIR_BROKEN"
+}
+
 rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 
 # --- 正規表現にバックスラッシュを使わない (2026-08-22 発覚の偽グリーン対策) ---
@@ -161,6 +169,29 @@ case "$NL$_fb$NL" in
         exit 1 ;;
 esac
 
+# (5) 空ディレクトリ検査 (check 13) の自己検証。**この検査は「何も出ない」が正常**
+#     なので、検出器が壊れて何も出さなくなっても症状がゼロになる — NVIDIA litter が
+#     main + worktree の 9 箇所に何か月も溜まりながら誰も気付かなかったのと同じ形。
+#     よって検出器自身に合成ツリーで「実際に検出する / 誤検出しない / 子ではなく親を
+#     名指しする / 走査が空振りしたら落ちる」を証明させ、駄目なら即 exit 1。
+if ! _ed="$("$PY" scripts/empty_dirs.py --self-test 2>&1)"; then
+    printf 'arch-lint: [SELF-BROKEN] empty_dirs.py の self-test が落ちました。\n' >&2
+    printf '%s\n' "$_ed" >&2
+    exit 1
+fi
+
+# (6) その列挙が **落ちたときに黙って空を返さない**ことの canary ((4) と同型)。
+_pysave="$PY"
+PY="/nonexistent/python-for-arch-lint-canary"
+_eb="$(list_empty_dirs 2>/dev/null)"
+PY="$_pysave"
+case "$NL$_eb$NL" in
+    *"$NL$EMPTYDIR_BROKEN$NL"*) : ;;
+    *)  printf 'arch-lint: [SELF-BROKEN] 空ディレクトリ列挙が失敗を報告しません (fail-open)。\n' >&2
+        printf '  python が壊れたとき check 13 が黙って「違反ゼロ」になります。\n' >&2
+        exit 1 ;;
+esac
+
 # サイズ budget の判定器 (loc_budget.py) も、上の正規表現 canary と同格で自己検証する。
 # **「出力が空 = 違反ゼロ」を信じないための土台**なので、失敗したら即 exit 1。
 if ! _st="$("$PY" scripts/loc_budget.py --self-test 2>&1)"; then
@@ -224,6 +255,11 @@ record() {
     case "$NL$4$NL" in
         *"$NL$FILTER_BROKEN$NL"*)
             printf 'arch-lint: [SELF-BROKEN] strip_comments (scripts/loc_budget.py --filter-comments) が\n' >&2
+            printf '  異常終了しました。check %s の結果は信用できません (「違反ゼロ」とは判定しません)。\n' "$1" >&2
+            printf '  PY=%s\n' "$PY" >&2
+            exit 1 ;;
+        *"$NL$EMPTYDIR_BROKEN$NL"*)
+            printf 'arch-lint: [SELF-BROKEN] 空ディレクトリ列挙 (scripts/empty_dirs.py) が\n' >&2
             printf '  異常終了しました。check %s の結果は信用できません (「違反ゼロ」とは判定しません)。\n' "$1" >&2
             printf '  PY=%s\n' "$PY" >&2
             exit 1 ;;
@@ -594,6 +630,19 @@ record COMMON-DEPS grep "common に域外依存 (GUI/HTTP へ移設する):" "$h
 hits=$(grep -rnE 'ArrangementEditRequest|split_into_morae|Edit::Undoable' \
     --include='*.rs' ui/crates/ui/src 2>/dev/null | strip_comments || true)
 record UI-DOMAIN grep "daw-ui core に DAW ドメイン/mirror 機構が残存 (daw_gui 側へ):" "$hits"
+
+# 13. 追跡外の空ディレクトリ (r.md #81)。**git では原理的に検出できない** —
+#     git はディレクトリを追跡しないので、ファイルを 1 つも含まないディレクトリは
+#     `??` にも `!!` にも出ず、check-ignore も「どのルールにも当たらない」を返すだけ。
+#     実際 `NVIDIA Corporation/umdlogs` (GPU ドライバが %ProgramData% を解決できず cwd に
+#     作る) と `daw_guitestsfixtures` (shell が backslash を落とした跡) が main + worktree の
+#     9 箇所に何か月も溜まっていて、誰も気付けなかった。
+#     **.gitignore に足すのは禁止** — もともと出力に出ていないので症状は消えず、
+#     原因が残ったまま「無害な既知のゴミ」に格上げされるだけ。
+#     mode は firstfield (hits が path だけ)。列挙と自己検証は empty_dirs.py が持つ
+#     (パターンを shell に書かない = 上の backslash 節の方針)。
+hits=$(list_empty_dirs || true)
+record EMPTY-DIR firstfield "追跡外の空ディレクトリ (git では見えない。原因を直して削除する。.gitignore に足さない):" "$hits"
 
 # ---------------------------------------------------------------- 判定
 # 「検査器が実際に何を見たか」を毎回可視化する (出力が空 = 違反ゼロ、を信じないための土台)。

@@ -34,7 +34,14 @@ import ahe_paths  # noqa: E402  (the module under test for slug/path derivation)
 DESTRUCT = os.path.join(HERE, "check_destructive_delete.py")  # registry-independent
 HOOK_SCRIPTS = ("guard_engine.py", "reflect.py", "ahe_paths.py")
 REAL_GUARDS = ahe_paths.guards_file()          # <repo>/.claude/guards.jsonl (tracked)
-MEM_DIR = os.path.join(ahe_paths.state_dir(), "memory")
+# None when the environment cannot say where home is (see ahe_paths.home_dir).
+# Kept as None rather than a '~'-prefixed path so that "the environment is
+# broken" reports as ONE named failure instead of ~30 bogus "missing
+# <memory>.md" failures that bury the real cause.
+try:
+    MEM_DIR = os.path.join(ahe_paths.state_dir(), "memory")
+except ahe_paths.EnvironmentBroken:
+    MEM_DIR = None
 # optional arg: validate a candidate registry (e.g. scripts/guards.proposed.jsonl) in the
 # sandbox without touching the tracked one.
 GUARDS_SRC = sys.argv[1] if len(sys.argv) > 1 else REAL_GUARDS
@@ -179,10 +186,17 @@ def check_registry():
                 except re.error as e:
                     bad("registry:%s-regex" % rid, "%r: %s" % (p, e))
             src = str(r.get("source") or "")
-            if src.startswith("feedback_") or src.startswith("project_") or src.startswith("user_"):
+            if MEM_DIR and (src.startswith("feedback_") or src.startswith("project_")
+                            or src.startswith("user_")):
                 if not os.path.isfile(os.path.join(MEM_DIR, src + ".md")):
                     bad("registry:%s-source-memory" % rid, "missing %s.md" % src)
             ok("registry:%s" % rid)
+    if MEM_DIR is None:
+        # Named non-failure: say exactly what was NOT verified, so this can
+        # never read as "the source memories are fine".
+        bad("registry:source-memory-unverifiable",
+            "ホームを解決できないため <state>/memory/*.md を 1 件も照合できていません "
+            "(ahe_paths.home_dir() が None)")
 
 
 # ---------------------------------------------------------------- 2. engine cases
@@ -635,15 +649,28 @@ def check_paths():
 
     # live cross-check: this harness runs from inside a Claude Code checkout, so the
     # directory our rule derives for THIS repo must be one Claude Code really made.
-    projects = os.path.join(os.path.expanduser("~"), ".claude", "projects")
-    if os.path.isdir(projects):
-        derived = os.path.join(projects, ahe_paths.slug(ahe_paths.REPO_ROOT))
-        ok("paths:slug-matches-live-dir") if os.path.isdir(derived) else \
-            bad("paths:slug-matches-live-dir",
-                "導出した %r が実在しない = slug 規則が Claude Code とズレている" % derived)
+    #
+    # Three outcomes, and they must stay THREE. Until r.md #81 this collapsed the
+    # first two into one green: `expanduser("~")` returns "~" unchanged when it
+    # cannot expand, so a broken environment produced the relative path
+    # "~/.claude/projects", isdir() said False, and the harness reported
+    # "~/.claude/projects なし" -- a hidden skip wearing a not-a-hidden-skip label.
+    home = ahe_paths.home_dir()
+    if home is None:
+        bad("paths:home-unresolvable",
+            "expanduser('~') がリテラル '~' を返しました。USERPROFILE / HOMEDRIVE+"
+            "HOMEPATH が無い環境です (make の recipe から起動した場合など)。"
+            "この状態では slug の live cross-check ができません")
     else:
-        # Not a hidden skip: the name says exactly what was and was not verified.
-        ok("paths:slug-live-crosscheck-unavailable(~/.claude/projects なし)")
+        projects = os.path.join(home, ".claude", "projects")
+        if os.path.isdir(projects):
+            derived = os.path.join(projects, ahe_paths.slug(ahe_paths.REPO_ROOT))
+            ok("paths:slug-matches-live-dir") if os.path.isdir(derived) else \
+                bad("paths:slug-matches-live-dir",
+                    "導出した %r が実在しない = slug 規則が Claude Code とズレている" % derived)
+        else:
+            # Genuinely absent (fresh machine), NOT "we could not look".
+            ok("paths:slug-live-crosscheck-unavailable(~/.claude/projects なし)")
 
     # the registry is repo-relative and tracked
     if os.path.isfile(REAL_GUARDS):

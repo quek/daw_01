@@ -283,13 +283,37 @@ def main():
     tool_input = data.get("tool_input") or {}
     session = str(data.get("session_id") or "")
 
-    proj_dir = ahe_paths.state_dir()
     guard_file = ahe_paths.guards_file()
+    try:
+        proj_dir = ahe_paths.state_dir()
+    except ahe_paths.EnvironmentBroken as exc:
+        # The rules live in the repo and still load, but the escalation
+        # overlay and the hit log live under the home directory we cannot
+        # find. Rather than write them into a literal '~' directory inside
+        # the repo, say so loudly and run the rules WITHOUT the overlay --
+        # every rule keeps its registry action, nothing is silently skipped.
+        # Loud, not blocking: a broken environment must not wedge the session
+        # that is trying to repair it (same rule as a broken registry).
+        _oprint(
+            "[guard: 環境が壊れています — ホームディレクトリを解決できません]\n"
+            "\n"
+            "  %s\n"
+            "\n"
+            "  ガード本体 (%s) は読めているので判定は続けます。ただし warn→block の\n"
+            "  昇格状態と発火ログはホーム配下にあるため、この呼び出しでは記録されず、\n"
+            "  昇格も反映されません。`make` の recipe から起動していませんか。\n"
+            % (exc, guard_file)
+        )
+        proj_dir = None
     rules, defect = _load_registry(guard_file)
     if defect:
+        if proj_dir is None:
+            # No place to keep the once-per-session marker; the environment
+            # warning above already fired, so don't also spam the registry one.
+            return 0
         _report_registry_defect(proj_dir, guard_file, defect, session)
         return 0
-    overlay = _load_overlay(ahe_paths.guard_state_file())
+    overlay = {} if proj_dir is None else _load_overlay(ahe_paths.guard_state_file())
 
     # --- candidate field texts from this tool call ---
     command = str(tool_input.get("command") or "")
@@ -404,8 +428,13 @@ def main():
         return 0
 
     # --- log fires so reflect.py can auto-escalate repeat offenders ---
+    # proj_dir is None only when the home directory was unresolvable; the
+    # warning for that already went out above, so skip the log rather than
+    # writing it into a literal '~' directory next to the checkout.
     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     try:
+        if proj_dir is None:
+            raise ahe_paths.EnvironmentBroken("no state dir")
         with open(os.path.join(proj_dir, "guard_hits.jsonl"), "a", encoding="utf-8") as fh:
             for r in fired:
                 fh.write(json.dumps({

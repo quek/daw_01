@@ -89,10 +89,31 @@ impl AppDirs {
     /// キャッシュ。 合成 wav は (歌詞 / pitch / bpm / speaker) の
     /// 純粋関数 = コンテンツアドレス可能なので、 プロジェクト跨ぎで再利用できる
     /// per-user global に置く。 プロジェクトを開き直しても再合成しないための
-    /// ディスクキャッシュ。 合成プロセス (daw_plugin_host) も `dirs::data_local
-    /// _dir` (env ベース) で同じ root を解決できる。
+    /// ディスクキャッシュ。 合成プロセス (daw_plugin_host) も
+    /// `dirs::data_local_dir` で同じ root を解決できる
+    /// (= `SHGetKnownFolderPath`。 環境変数は経由しない)。
     pub fn voicevox_cache_dir(&self) -> PathBuf {
         self.root.join("voicevox_cache")
+    }
+
+    /// `<root>\import_cache\` — **未保存プロジェクト**に取り込んだ素材
+    /// (audio / video / image) の置き場。 保存時に
+    /// `<project_dir>/samples/` へ移送される (`import_audio::migrate_*`)。
+    ///
+    /// 以前ここは `%LOCALAPPDATA%` の**環境変数直読み**で解決していた
+    /// (r.md #81)。 make 経由だと env が丸ごと落ちるため
+    /// `<repo>/target/tmp/daw_01/import_cache` に着地し、 `make clean`
+    /// (= `cargo clean`) が**未保存プロジェクトの実データを黙って消す**
+    /// 経路になっていた。 root を [`AppDirs`] に一本化して塞いだ。
+    pub fn import_cache_dir(&self) -> PathBuf {
+        self.root.join("import_cache")
+    }
+
+    /// `<root>\bounce_cache\` — **未保存プロジェクト**の Bounce 出力 WAV。
+    /// 保存時に `<project_dir>/bounce/` へ移送される。
+    /// [`AppDirs::import_cache_dir`] と同じ経緯で env 直読みから移した。
+    pub fn bounce_cache_dir(&self) -> PathBuf {
+        self.root.join("bounce_cache")
     }
 }
 

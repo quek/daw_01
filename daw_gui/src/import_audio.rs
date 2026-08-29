@@ -188,11 +188,18 @@ impl From<common::audio_decode::DecodeError> for ImportError {
 /// are expected to thread the chosen directory through and migrate the
 /// files into `<project_dir>/samples/` on the next save (see
 /// [`migrate_unsaved_audio_sources_into`]).
+///
+/// 置き場の SSoT は [`common::app_dirs::AppDirs`] (= `dirs::data_local_dir`
+/// = `SHGetKnownFolderPath`)。 **`LOCALAPPDATA` を直読みしない** — env は
+/// 起動経路によって丸ごと消えることがあり (r.md #81)、 消えたときの
+/// `std::env::temp_dir()` 送りが `make` 配下では `<repo>/target/tmp/...` を
+/// 指すため、 `make clean` が未保存プロジェクトの実データを消していた。
+/// `AppDirs::production()` が `None` を返す極端な環境の fallback は
+/// `common::logging` と同じ idiom で temp へ落とす。
 pub fn unsaved_import_cache_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("daw_01").join("import_cache")
+    common::app_dirs::AppDirs::production()
+        .map(|d| d.import_cache_dir())
+        .unwrap_or_else(|| std::env::temp_dir().join("daw_01").join("import_cache"))
 }
 
 /// Move every `AudioSource` whose path is an `Absolute` pointing into
@@ -225,10 +232,9 @@ pub fn migrate_unsaved_audio_sources_into(
 /// Saving the project later moves the files into `<project_dir>/bounce/`
 /// (see [`migrate_unsaved_bounce_sources_into`]).
 pub fn unsaved_bounce_cache_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("daw_01").join("bounce_cache")
+    common::app_dirs::AppDirs::production()
+        .map(|d| d.bounce_cache_dir())
+        .unwrap_or_else(|| std::env::temp_dir().join("daw_01").join("bounce_cache"))
 }
 
 /// Mirror of [`migrate_unsaved_audio_sources_into`] for the bounce

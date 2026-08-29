@@ -7,17 +7,42 @@ use anyhow::{Context, Result};
 /// without imposing a real limit.
 const MAX_DEPTH: u8 = 8;
 
-/// Enumerates CLAP plugins installed under the system-wide Common Files
-/// directory (e.g. `C:\Program Files\Common Files\CLAP` on Windows).
+/// Enumerates CLAP plugins in **every** location CLAP's `entry.h` defines
+/// (see [`crate::plugin_paths`] for the verbatim spec text): the system-wide
+/// and per-user Common Files trees, plus everything listed in the
+/// `CLAP_PATH` environment variable — which the spec makes a host's
+/// obligation ("a CLAP host **must** query the environment for a CLAP_PATH
+/// variable"), not a suggestion.
+///
 /// **Recurses into subdirectories** (vendor folders are common, e.g.
-/// `…\CLAP\Surge XT\Surge XT.clap`). Per CLAP entry.h: hosts should
+/// `…\CLAP\Surge XT\Surge XT.clap`). Per CLAP entry.h hosts *should*
 /// recursively scan the standard locations.
+///
+/// Roots that don't exist are not an error — they simply aren't installed.
+/// A root that exists but can't be read *is* reported (logged and skipped)
+/// so "no plugins" and "couldn't look" stay distinguishable.
 pub fn scan_system_clap_directory() -> Result<Vec<PathBuf>> {
-    let common_files = std::env::var_os("COMMONPROGRAMFILES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Common Files"));
-    let clap_dir = common_files.join("CLAP");
-    scan_directory(&clap_dir)
+    let roots = crate::plugin_paths::clap_search_roots();
+    if roots.is_empty() {
+        tracing::info!("no CLAP search root exists on this machine");
+        return Ok(Vec::new());
+    }
+    let mut plugins = Vec::new();
+    for root in &roots {
+        match scan_directory(root) {
+            Ok(found) => plugins.extend(found),
+            Err(e) => tracing::warn!(
+                error = ?e,
+                path = %root.display(),
+                "CLAP search root scan failed, skipping"
+            ),
+        }
+    }
+    plugins.sort();
+    // 同じ .clap が 2 つのルートから見えるとピッカーに二重登録される。
+    // ルートが 1 本だった頃は起きなかったので、 ここで初めて必要になる。
+    plugins.dedup();
+    Ok(plugins)
 }
 
 fn scan_directory(dir: &Path) -> Result<Vec<PathBuf>> {

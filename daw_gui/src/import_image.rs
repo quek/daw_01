@@ -119,9 +119,15 @@ pub fn is_supported_extension(path: &Path) -> bool {
 /// `project_dir` is `Some` once the project has been saved; the file
 /// is copied into a sibling `images/` subdir and the returned
 /// `ImageSource.path` is `ProjectRelative`. When `project_dir` is
-/// `None` (= unsaved new project), the cache lands at
-/// `<temp>/daw_01/images/<basename>_<hash>.<ext>` and the path stored
-/// is `Absolute` so the project remains loadable after save-as.
+/// `None` (= unsaved new project), the cache lands in
+/// [`crate::import_audio::unsaved_import_cache_dir`] — **the same
+/// unsaved-import cache audio and video already use** — and the path
+/// stored is `Absolute` so the project remains loadable after save-as.
+///
+/// 以前ここだけが無条件に `std::env::temp_dir()` を使っていて、 音声 /
+/// 動画 (`%LOCALAPPDATA%\daw_01\import_cache`) と置き場が食い違っていた
+/// (r.md #81)。 `make` 配下では `temp_dir()` が `<repo>/target/tmp` を指し、
+/// `make clean` (= `cargo clean`) が取り込んだ画像を黙って消していた。
 pub fn import_one_image(
     src: &Path,
     project_dir: Option<&Path>,
@@ -146,20 +152,17 @@ pub fn import_one_image(
     let filename = images_filename(src, &hash);
 
     // Resolve the cache location. Saved projects get a project-relative
-    // path; unsaved projects fall back to a temp cache under the
-    // platform's temp dir (matches `import_audio` idiom).
+    // path; unsaved projects land in the shared unsaved-import cache
+    // (the same one `import_audio` / `import_video` use).
     let (cache_path, path_variant) = match project_dir {
         Some(dir) => {
             let dest = dir.join("images").join(&filename);
             (dest, PathVariant::ProjectRelative)
         }
-        None => {
-            let mut tmp = std::env::temp_dir();
-            tmp.push("daw_01");
-            tmp.push("images");
-            tmp.push(&filename);
-            (tmp, PathVariant::Absolute)
-        }
+        None => (
+            crate::import_audio::unsaved_import_cache_dir().join(&filename),
+            PathVariant::Absolute,
+        ),
     };
 
     if let Some(parent) = cache_path.parent() {
@@ -347,8 +350,16 @@ mod tests {
         let imported = import_one_image(&png_path, None).expect("import");
         match imported.source.path {
             ImageSourcePath::Absolute(p) => {
-                assert!(p.to_string_lossy().contains("daw_01"));
-                assert!(p.to_string_lossy().contains("images"));
+                // 部分文字列ではなく **音声 / 動画と同じ cache root の下か**
+                // を見る (r.md #81 で置き場を一本化した。substring 比較だと
+                // 置き場が別物に戻っても通ってしまう)。
+                let root = crate::import_audio::unsaved_import_cache_dir();
+                assert!(
+                    p.starts_with(&root),
+                    "{} is not under the shared unsaved-import cache {}",
+                    p.display(),
+                    root.display()
+                );
             }
             other => panic!("expected Absolute path, got {other:?}"),
         }
