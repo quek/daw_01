@@ -5,11 +5,11 @@ VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。詳細は [DESIGN.md](DES
 ## 大原則
 
 理想とベストプラクティスを追求する。
-そのためは実装コストは無視して大胆に破壊して作り直す。
+そのためには実装コストは無視して大胆に破壊して作り直す。
 
 ## 禁止事項
 
-大原則を守るために次を禁止します。
+大原則を守るために、**何を作るかの判断**に次を持ち込むことを禁止します。
 
 - 実装コストで判断すること
 - 実装難易度で判断すること
@@ -17,20 +17,25 @@ VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。詳細は [DESIGN.md](DES
 - コンパイルがとおらないことで判断すること
 - 作業時間で判断すること
 
+**順序と分け方は別**。統合順・並列 worktree の切り方・大改造の着手前確認は、規模と衝突の実測を
+根拠に決めてよい (むしろ決めること)。禁じているのは「安いほうを**選ぶ**」ことであって、
+「安全な順に**積む**」ことではない。→ [最終形まで実装する](#最終形まで実装する) /
+[妥協を選択肢に上げない](#妥協を選択肢に上げない) が同じ規則の別の面。
+
 ## プロジェクト構成
 
-Cargo workspace (Edition 2024)。
+Cargo workspace (Edition 2024)。実行時は独立した 3 プロセスが協調する。
 
 ```
 common/            -- 共有型・IPC プロトコル・shared memory・データモデル
-daw_gui/           -- GUI プロセス (daw-ui = winit + wgpu + 自作 immediate-mode UI)
+daw_gui/           -- GUI プロセス。Song ドキュメントの SSoT (daw-ui = winit + wgpu + 自作 UI)
 daw_audio/         -- Audio Engine プロセス (CPAL)
 daw_plugin_host/   -- Plugin Host プロセス (CLAP/VST3)
-ui/                -- UI ライブラリ daw-ui (旧 gui_01)。crates/{platform,renderer,ui} + examples
+ui/                -- UI ライブラリ daw-ui (旧 sibling repo gui_01)。crates/{platform,renderer,ui}
 ```
 
-UI ライブラリ daw-ui は `ui/` に統合済み (旧 sibling repo gui_01)。同一 workspace・同一
-セッションで直接編集する。UI 固有の技術ガイド・既知の罠は `ui/CLAUDE.md` 参照。
+daw-ui は同一 workspace・同一セッションで直接編集する。UI 固有の技術ガイド・既知の罠・
+load-bearing invariant は [ui/CLAUDE.md](ui/CLAUDE.md)。
 
 ## Development Workflow
 
@@ -51,31 +56,28 @@ make license-check # ライセンス表示の機械検査 (REUSE 準拠 / 依存
 make audit       # 依存の脆弱性 / 供給網攻撃の検査 (network 要。下記「依存の脆弱性」節)
 ```
 
-### `make test` は daw_gui を起動する (2026-08-22 に判明)
-
-`daw_gui/tests/` の一部は **daw_gui 本体を `--script` で subprocess 起動**し、それが
-daw_audio / daw_plugin_host まで spawn して audio device を開く。`--script` は窓を出さず
-single-instance gate も素通りするので、**起動したことに誰も気付けない**。実機を触っている
-最中に回すと、開いているプロジェクトの再生を壊す。
-
-- **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。
-  **名前で判断しない** — `pdc_real_vst3` / `sidechain_real_vst3` は smoke が付かないのに
-  起動し、`arr_widget` / `pr_widget` / `font_picker` は起動しない。
-  `--test` で名指ししても、この基準に当たる target なら起動する。
-- **`make test` / `make run` / `make run-release` は前提条件で止まる**
-  (`scripts/preflight_no_running_app.sh`)。daw_gui が起動していたら明示エラー。
-  ユーザーが手で打っても効く。迂回は `DAW01_SKIP_PREFLIGHT=1`(理由は同スクリプト冒頭)。
-- **起動を伴わない検証だけなら `make test-nolaunch`**。対象 target は Makefile が上の基準から
-  機械的に導く (手書きの列挙にしない)。
-- Claude 向けには `.claude/guards.jsonl` の `no-bulk-test-run` /
-  `no-app-launching-test-target` が書く瞬間に block する。許可を得たうえで回すときは
-  `DAW01_ALLOW_LAUNCH=1` を頭に付けて意図を明示する。
-- 列挙が陳腐化しないよう、`scripts/test_guards.py` の `check_launching_targets_list()` が
-  **毎回リポジトリから基準を再適用**して、ガードと Makefile のズレを検出する。
-
 特定 crate/test だけを素早く確認したいときは `cargo check -p <crate>` /
-`cargo test -p <crate> --test <name>` 等のピンポイント指定を使ってよい (これは Makefile の
-scoping と矛盾しない、むしろ更に絞り込む方向)。避けるべきは `--workspace` の無条件多用。
+`cargo test -p <crate> --test <name>` 等のピンポイント指定を使ってよい (Makefile の scoping と
+矛盾しない、むしろ更に絞り込む方向)。避けるべきは `--workspace` の無条件多用。
+
+### `make test` は daw_gui を起動する
+
+`daw_gui/tests/` の一部は **daw_gui 本体を `--script` で subprocess 起動**し、それが daw_audio /
+daw_plugin_host まで spawn して audio device を開く。窓を出さず single-instance gate も素通りする
+ので **起動したことに誰も気付けない**。実機を触っている最中に回すと、開いているプロジェクトの
+再生を壊す。
+
+- **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。**名前で判断しない**
+  — `pdc_real_vst3` / `sidechain_real_vst3` は smoke が付かないのに起動し、`arr_widget` /
+  `pr_widget` / `font_picker` は起動しない。`--test` で名指ししても基準に当たる target なら起動する。
+- **起動を伴わない検証だけなら `make test-nolaunch`** (対象は Makefile が上の基準から機械的に
+  導く。手書きの列挙にしない)。許可を得て回すときは `DAW01_ALLOW_LAUNCH=1` を頭に付ける。
+- `make test` / `make run` / `make run-release` は `scripts/preflight_no_running_app.sh` が前提条件で
+  止める。**ユーザーが手で打っても効く**。迂回 (`DAW01_SKIP_PREFLIGHT=1`) と、プロセス一覧が
+  取れない環境で緑に見せない設計は同スクリプト冒頭。
+- 書く瞬間の block は `.claude/guards.jsonl` の `no-bulk-test-run` / `no-app-launching-test-target`。
+  ガードの target 一覧と Makefile のズレは `scripts/test_guards.py` の
+  `check_launching_targets_list()` が基準から再導出して検査する。
 
 ### 依存の脆弱性 / 供給網攻撃 (`make audit`)
 
@@ -83,167 +85,108 @@ scoping と矛盾しない、むしろ更に絞り込む方向)。避けるべ�
 いなければ、上流が汚染された瞬間に次のビルドで取り込む。だから `cargo update` は
 「更新したい理由があるとき」だけ意図的に打ち、打ったら必ず `make audit` を通す。
 
-実例 (2026-08-20): crates.io の **arrayref 0.3.10** が汚染された (**RUSTSEC-2026-0260**)。
-typosquat の `proc-macro1` への依存が足され、その build script が **コンパイル中にリモートの
-バイナリを取得して実行**する。同じ攻撃者が 23 分の間に `internment` 0.8.7 と
-`append-only-vec` 0.1.9 も汚染。Rust Security Response Team は作者の端末 / 資格情報の侵害と
-見ている。**daw_01 は無事だった** — lock の arrayref が 0.3.9 のままで、`cargo update` を
-走らせていなかったから。運が良かっただけで検査は無かったので、`make audit` を足した。
-
-```bash
-make audit          # 依存の脆弱性 / yanked / 供給網攻撃の検査 (network 要)
-```
-
 - `scripts/lockfile_guard.py` … **ネットワーク不要・常に走る**。lock が git 追跡下か /
-  `cargo metadata --locked` が通るか (lock と manifest の乖離) / **既知の汚染リリースが
-  完全一致で入っていないか**。範囲 (semver) 判定を要さないものだけを厳密に見る。
-- `cargo deny --all-features check advisories` … RustSec advisory DB との突き合わせ。
-  **cargo-deny が無ければ `make audit` は明示エラーで落ちる。**「未インストールにつき skip」
-  の緑は作らない — ライセンス検査と違い advisories には自前の代替が無く、semver range を
-  自前実装すると間違えたときに false green になる (守ろうとしているものを壊す)。
-  `cargo install --locked cargo-deny`。
+  `cargo metadata --locked` が通るか / **既知の汚染リリースが完全一致で入っていないか**。
+  新しい汚染事件を知ったら `KNOWN_COMPROMISED` に `(name, version, 出典)` を 1 行足す。
+- `cargo deny --all-features check advisories` … **cargo-deny が無ければ `make audit` は明示
+  エラーで落ちる。**「未インストールにつき skip」の緑は作らない — advisories には自前の代替が
+  無く、semver range を自前実装すると false green になる (守ろうとしているものを壊す)。
 - 方針は `deny.toml` の `[advisories]`。vulnerability / unsound / yanked は全部エラー、
-  `unmaintained` は `"workspace"` (自分が直接選んだ依存だけ止める)。
-  **`ignore` を足すときは必ず「RUSTSEC-ID: 理由 / 見直し期限」をコメントで書く。**
-  無言の ignore は禁止。
+  `unmaintained` は `"workspace"`。**`ignore` を足すときは必ず「RUSTSEC-ID: 理由 / 見直し期限」を
+  コメントで書く。** 無言の ignore は禁止。
 
-新しい汚染事件を知ったら `scripts/lockfile_guard.py` の `KNOWN_COMPROMISED` に
-`(name, version, 出典)` を 1 行足す (完全一致なので誤判定が無い)。
+なぜ検査を足したか (2026-08-20 の **arrayref 0.3.10** 汚染 = RUSTSEC-2026-0260。daw_01 が無事
+だったのは lock を commit していて `cargo update` を打っていなかったからで、運が良かっただけ) は
+`scripts/lockfile_guard.py` 冒頭。指摘ごとの triage 記録は
+[docs/dependency_audit.md](docs/dependency_audit.md)。
 
 ### vendored FFmpeg（fresh machine / 手動 worktree で必須）
 
 - `third_party/ffmpeg`（BtbN n7.1 win64 LGPL shared）は **gitignore** で checkout には入らない。
-  fresh なマシン（main checkout 自身）では **`make fetch-ffmpeg`** で取得する（idempotent。`make build` /
-  `test` / `check` の前提条件にも入れてある）。
-- **取得は「latest から発見」ではなく URL + sha256 固定**（2026-08-22 に方針を反転）。
-  旧方針は「BtbN の asset 名変更に耐えるよう URL を固定しない」だったが、実際に起きたのは
-  **asset 名の変更ではなく asset の消滅**だった（latest に残るのは master / n8.1 / n9.0 だけで
-  n7.1 系はゼロ）。発見方式は「見つからなければ落ちる」ので原理的に対応できず、
-  third_party を持たないマシンが何もビルドできない状態になっていた。
-  BtbN の保持ポリシーは「月末ビルドは 2 年、日次は直近 14 本」なので、固定した URL もいずれ
-  404 になる。よって **固定 + 自前ミラーへのフォールバック**をセットで持つ。
-  実装は `scripts/fetch_ffmpeg.sh`（pin の SSoT。Makefile に URL を二重化しない）、
-  ミラーの作り方と LGPL 上の義務は `docs/ffmpeg_mirror.md`。
-  ミラーに置くのはバイナリだけでなく **対応するソース一式**（FFmpeg 本体 + BtbN のビルド
-  レシピ + DLL に静的リンクされる外部ライブラリ）。GPL-3.0 §6(d) の義務で、`make ffmpeg-mirror`
-  が用意する（**アップロードは自動化しない。外部に出る操作は人がやる**）。
-- **Claude Code の worktree（`--worktree` / EnterWorktree / subagent）は自動コピー**: リポジトリ直下の
-  `.worktreeinclude`（`/third_party/`）により、新 worktree 作成時に main checkout から ffmpeg が
-  **実コピー**される（junction ではない）。よって Claude が作る worktree では `make fetch-ffmpeg` は不要。
-  ただし `.worktreeinclude` は「main にある物を持ち込む」だけなので、main checkout 自身が未取得なら
-  先に `make fetch-ffmpeg` しておくこと。手動 `git worktree add` で作った worktree は `.worktreeinclude`
-  を経由しないので従来どおり `make fetch-ffmpeg` する。参考: https://code.claude.com/docs/en/worktrees
-- git に無いので **rm / `git worktree remove` で third_party junction を辿ると本体が消えて
-  復元不能**になる（2026-06-14 に worktree 削除が内部の third_party junction を辿って本体を
-  削除した事故あり → `make fetch-ffmpeg` で復旧）。**`.worktreeinclude` 経由は実コピーなのでこの
-  junction ハザードは無い**が、手動で junction を張った場合は worktree を消す前に内部の reparse
-  point を `cmd //c rmdir <junction>` で外してから削除すること。
+  fresh なマシンでは **`make fetch-ffmpeg`**（idempotent。`build` / `test` / `check` の前提条件）。
+- **取得は「latest から発見」ではなく URL + sha256 固定 + 自前ミラーへのフォールバック**。
+  実装は `scripts/fetch_ffmpeg.sh`（pin の SSoT。Makefile に URL を二重化しない）。なぜ発見方式を
+  捨てたか（起きたのは asset 名の変更ではなく **asset の消滅**で、発見方式は原理的に対応できない）、
+  ミラーに置く「対応するソース一式」の GPL-3.0 §6(d) 上の義務、**アップロードを自動化しない**理由は
+  [docs/ffmpeg_mirror.md](docs/ffmpeg_mirror.md) §1 / §4 / §5。
+- **Claude Code の worktree は `.worktreeinclude`（`/third_party/`）で main checkout から
+  実コピー**されるので `make fetch-ffmpeg` は不要（main checkout 自身が未取得なら先に取る）。
+  手動 `git worktree add` はこの経路を通らないので従来どおり取得する。
+- git に無いので **`rm` / `git worktree remove` が third_party junction を辿ると本体ごと消え、
+  復元できない**（2026-06-14 に実際に起きた）。実コピーの worktree にこのハザードは無いが、手動で
+  junction を張ったら消す前に `cmd //c rmdir <junction>` で外すこと。事故と復旧は
+  [docs/ffmpeg_mirror.md](docs/ffmpeg_mirror.md) §6。
 
 ### ビルドと検証の区別（重要）
 
-- `cargo clippy` / `cargo check` / `cargo test` は**実行バイナリを生成しない** or 生成してもテストビルドのみ。
-  手動で `./target/debug/daw_gui.exe` を走らせる前に、必ず `cargo build` を明示する
-- 子プロセス（daw_audio / daw_plugin_host）の挙動を変えたときは、子プロセスのバイナリも再生成が必要。
-  `cargo build -p <crate>` または `cargo build --workspace`
-- `cargo run -p daw_gui` は dependency crate も自動ビルドしてくれるが、既に起動中のプロセスのバイナリは上書きされない場合がある（Windows の ERROR 5）。必要なら先に全プロセスを終了
+- `cargo clippy` / `cargo check` / `cargo test` は**実行バイナリを生成しない** or 生成しても
+  テストビルドのみ。`./target/debug/daw_gui.exe` を走らせる前に、必ずビルドを明示する
+- 子プロセス（daw_audio / daw_plugin_host）の挙動を変えたときは、子プロセスのバイナリも再生成が
+  必要。**`make build`**（1 crate に閉じるなら `cargo build -p <crate>` まで絞ってよい）
+- `cargo run -p daw_gui` は dependency crate も自動ビルドしてくれるが、既に起動中のプロセスの
+  バイナリは上書きされない場合がある（Windows の ERROR 5）。必要なら先に全プロセスを終了
 
 ### IPC 境界で送る型
 
-- `MainToChild` / `ChildToMain` 等の protocol 型、およびそれが保持する内側の型すべてに
-  `#[derive(bincode::Encode, bincode::Decode)]` が必要
-- Song / Track / Clip / Row 等のモデル型も protocol 経由で渡す場合は bincode derive を追加する
+- protocol 型 (`AudioCommand` / `AudioEvent` / `PluginCommand` / `PluginEvent`)、および
+  それが保持する内側の型すべてに `#[derive(bincode::Encode, bincode::Decode)]` が必要
+- Song / Track / Clip / Row 等のモデル型も protocol 経由で渡すなら bincode derive を追加する
+- 足したら **`make build`** で 3 exe を揃える。子 exe が古いと decode に失敗し、
+  「再生が止まる」形で出る ([[feedback_workspace_build_for_protocol_changes]])
 
-### GUI デバッグ
+### daw-ui (旧 gui_01) の使い方
 
-- UI のキーバインド・イベントは可視フィードバックが無いと動いたか判別不能
-- 迷ったら `AppData::handle_event` 冒頭に `tracing::info!(?event, "received")` を仕込んでログで確認
-- 確認後は削除するか、debug feature で囲う（`[debug-gui]` skill 参照）
-
-### gui_01 (daw-ui) アーキテクチャ要点
-
-- **path 依存**: `daw-ui-platform` / `daw-ui-renderer` / `daw-ui-core` は workspace で
-  `path = "ui/crates/*"` 指定 (統合済み)。直接の依存は `winit 0.30` / `raw-window-handle 0.6` も追加
 - **AppData は plain mutable struct**: Signal/Memo/derive は使わない。派生は method
-  (`app.track_headers() -> Vec<TrackHeader>`) として毎フレーム計算。重ければ view 側で 1 frame 分キャッシュ
+  (`app.track_headers() -> Vec<TrackHeader>`) として毎フレーム計算し、重ければ view 側で 1 frame
+  分キャッシュ
 - **イベント dispatch**: view から `Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::X))`、
   background thread から `EventLoopProxy<AppEvent>::send_event`。`impl Model` 的な trait 接続は不要
-- **immediate-mode + heavy() escape hatch**: 通常 widget は毎フレーム再構築だが、
-  `ui.heavy(id, |hctx| { hctx.cached(viewport_key, |hctx| { ... }) })` で粗粒度キャッシュ。
-  ピアノロール / アレンジビュー等の大量描画はこの中で `push_rect / push_text / push_lines` を呼ぶ
-- **Edit<M>**: `Box<dyn FnOnce(&mut M) + Send + 'static>`。view 内クロージャから直接モデル変更可
-- **WindowBackend**: `daw-ui-platform::WindowBackend` trait を満たす型を `Renderer<W>` に渡す。
-  daw_gui は `daw_ui_platform::WinitWindow` (上流の正準実装) を直接使う
-  (Phase 4 で手写しミラー DawGuiWindow を撤去。TSF/IME 配線・入力 mapping も上流に一本化)
-- **イベントループ**: `view/runner.rs::Runner` が `winit::ApplicationHandler<AppEvent>` を実装。
-  WindowEvent → `daw_ui_platform::AppEvent` 変換 + InputAccumulator ingest、user_event →
-  `AppData::handle_event` dispatch、IME 差分管理、Win32 cursor 位置補正
-- **キーボードショートカット**: `Runner::dispatch_shortcut` が WindowEvent::KeyboardInput を
-  直接見て、focus 中の widget が無いとき AppEvent を発火 (Space/P/V/Ctrl+S/Ctrl+Z/Delete 等)
-- **ダブルクリック**: gui_01 v1 には built-in 検出無し。`AppData::last_click: Option<(Instant, x, y)>`
-  に最終クリックを記録し、各 view の入力ハンドラで 400ms+5px 以内なら double 判定
-- **背景スレッド**: autosave / playhead poll / MIDI / IPC bridge / VOICEVOX synth / plugin DB
-  rescan は std::thread + EventLoopProxy。`tokio::time::sleep` は不可、`std::thread::sleep` を使う
-- **HeavyCtx の API**: `push_rect`, `push_text`, `push_lines`, `push_edit`, `button_at`, `label_at`,
-  `waveform`。`Ui::push_edit` は `pub(crate)` なので、view から Edit を流す際は heavy ブロック内で
-  `hctx.push_edit(...)` を使う
+- **immediate-mode + heavy() escape hatch**: 大量描画 (ピアノロール / アレンジ) は
+  `ui.heavy(id, |hctx| hctx.cached(viewport_key, |hctx| { ... }))` の中で `push_rect` / `push_text` /
+  `push_lines` / `push_edit` を呼ぶ (`Ui::push_edit` は `pub(crate)` なので、view から Edit を流すのは
+  heavy ブロック内から)
+- **背景スレッド** (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX synth / plugin DB
+  rescan) は `std::thread` + `EventLoopProxy`。**`tokio::time::sleep` は使えない**
+- **ダブルクリック検出は built-in が無い**。`AppData::last_click: Option<(Instant, x, y)>` に最終
+  クリックを記録し、各 view の入力ハンドラで 400ms+5px 以内なら double 判定
+- **UI のキーバインド・イベントは可視フィードバックが無いと動いたか判別不能**。迷ったら
+  `AppData::handle_event` 冒頭に `tracing::info!(?event, "received")` を仕込んでログで確認し、
+  確認後は削除するか debug feature で囲う (`[debug-gui]` / `[debug-ui]` skill)
+- イベントループ (`daw_gui/src/view/runner.rs::Runner`)、ショートカット
+  (`Runner::dispatch_shortcut`)、`WindowBackend` の配線 (上流の正準実装
+  `daw_ui_platform::WinitWindow` を直接使う) は該当ファイルを読む。ライブラリ側の API・
+  load-bearing invariant・既知の罠は [ui/CLAUDE.md](ui/CLAUDE.md)
 
 ### プラグインエディタ窓と Win32（Windows）
 
+設計正本は [docs/plan_plugin_editor_topwindow.md](docs/plan_plugin_editor_topwindow.md)。
+
 - **エディタ窓は daw_plugin_host が作る top-level で、owner は daw_gui の本体窓**
-  (`daw_plugin_host/src/editor_window.rs`)。plugin-main スレッドで `CreateWindowExW` し、
-  同じスレッドで CLAP `clap_plugin_gui.set_parent` / VST3 `IPlugView::attached(kPlatformTypeHWND)`
-  を呼んでプラグイン側を子ウィンドウ化する。設計正本は `docs/plan_plugin_editor_topwindow.md`
-- **daw_gui がエディタ窓を「作って」はいけない** (窓が daw_gui のプロセスに属してはいけない)。
-  JUCE は `Process::isForegroundProcess()` = `GetForegroundWindow()` の **プロセス ID** を
-  `GetCurrentProcessId()` と比べる。窓が daw_gui のものだと、プラグイン (= daw_plugin_host で
-  動く) から見て false になり、cascade サブメニューが即 dismiss される。旧実装
-  (daw_gui が窓を作り HWND を子プロセスへ渡す) がこれを踏んでいた (FIXME #31)。
-  **禁止されるのは「窓の所属プロセス」であって「所有関係」ではない。**
-  現行実装は daw_plugin_host が作るので前面窓は常に自プロセスのものになり、この枝で通る。
-- **owner に daw_gui の本体窓を指定すること自体は安全** (2026-08-22 に一次情報で確認し、
-  それ以前の「daw_gui を owner にしてはいけない」という記述を撤回した)。根拠:
-  JUCE のメニューが使う述語は
-  `Process::isForegroundProcess() || isEmbeddedInForegroundProcess(c)`
-  (`juce_gui_basics/detail/juce_WindowingHelpers.h`) で、**`GA_ROOTOWNER` を見るのは
-  `||` の右側 = 救済パス**。判定を緩める方向にしか効かないので、`GA_ROOTOWNER` が daw_gui に
-  解決することが dismiss を引き起こすことは原理的に無い。しかも左辺が true (前面窓は
-  daw_plugin_host のもの) なので短絡し、右辺は評価すらされない。
-- **owner を付ける目的**は REAPER と同じ体験 (エディタ窓が本体窓の後ろに回らない /
-  Alt+Tab の一覧に出ない)。Win32 の規定に丸ごと乗る:
-  「owner を持つ窓は常に owner より上の Z 順」「owner が破棄されると owned も破棄される」
-  「owner が最小化されると owned は隠れる」。`WS_EX_TOOLWINDOW` が Alt+Tab とタスクバーから
-  外す。**この 2 つは必ずセットで、owner が先**。`WS_EX_TOOLWINDOW` だけ先に入れると、
-  一覧から消えたのに潜れる = 戻す手段が無い状態になり、現状より悪化する。
-- owner は **`CreateWindowExW` の `hWndParent` で作成時に決める**。
-  `SetWindowLongPtr(GWLP_HWNDPARENT)` で後から付け替えない
-  (Learn は "cannot transfer ownership of the window to another window" と
-  "GWLP_HWNDPARENT ... Sets a new owner" が矛盾している。作成時指定なら矛盾を踏まない)。
-- 上の帰結として **owner の HWND は IPC を渡る**。`u64` の platform window handle として
-  protocol に載せる (`HWND` は `windows` crate で `HWND(*mut c_void)`、macOS なら `NSView*`
-  相当が入る想定の platform 非依存 field)。**PID を渡して窓を探す方式は採らない** —
-  「見つからなければ owner 無しに落ちる」発見方式は、fetch-ffmpeg で原理的に対応できないと
-  判明したのと同じ形 ([[project_ffmpeg_fetch_n71_gone]])。所有者は 1 か所で決まるべき。
-- **エディタ窓を操作している間、daw_gui は非フォーカスどころか foreground プロセスですらない**
-  (上記のとおり意図的)。「アプリ全体がアクティブか」は daw_gui 内の情報だけでは原理的に
-  判定できないので、エディタ窓の WNDPROC が `WM_ACTIVATEAPP` を拾い
-  `PluginEvent::HostWindowsActive` で daw_gui へ報告する (r.md #49 アイドル省電力)
-- WNDPROC は `extern "system" fn` で Rust 状態にアクセスできないので、`GWLP_USERDATA` に
-  `Arc<AtomicBool>` 等を leak で貼り付け、Drop で `Arc::from_raw` して回収する
-- プラグインのウィンドウメッセージは **作ったスレッドのキュー** に入る。daw_plugin_host は
-  `#[tokio::main]` 側とは別に **専用 std::thread「plugin-main」** を立て、そこで
-  `GetMessageW` ポンプを回す。同じスレッドで CLAP の `@[main-thread]` 呼び出しも直列化する
+  (`daw_plugin_host/src/editor_window.rs`)。**daw_gui が窓を「作って」はいけない** — 窓が daw_gui の
+  プロセスに属すると JUCE の `Process::isForegroundProcess()` (前面窓の **プロセス ID** 比較) が
+  false になり cascade サブメニューが即 dismiss される (FIXME #31 の真因)。**禁止されるのは
+  「窓の所属プロセス」であって「所有関係」ではない**。
+- **owner と `WS_EX_TOOLWINDOW` は必ずセットで、owner が先**。片方だけ入れると Alt+Tab から消えた
+  のに背後へ潜れる = 戻す手段が無い状態になる。owner は `CreateWindowExW` の `hWndParent` で
+  **作成時に決める**。帰結として **owner の HWND は u64 の platform window handle として IPC を
+  渡る** — PID から窓を探す発見方式は採らない ([[project_ffmpeg_fetch_n71_gone]] と同じ形。
+  所有者は 1 か所で決まるべき)。
+- **エディタ窓を操作している間、daw_gui は foreground プロセスですらない** (意図的)。「アプリ
+  全体がアクティブか」は daw_gui 内の情報だけでは判定できないので、エディタ窓の WNDPROC が
+  `WM_ACTIVATEAPP` を拾い `PluginEvent::HostWindowsActive` で報告する (r.md #49)。
+- プラグインのウィンドウメッセージは **作ったスレッドのキュー**に入る。daw_plugin_host は
+  `#[tokio::main]` とは別に専用 std::thread「plugin-main」で `GetMessageW` ポンプを回し、CLAP の
+  `@[main-thread]` 呼び出しも同じスレッドで直列化する。窓もそのスレッドで作る。
+- JUCE の述語の読み解きと 2026-08-22 の撤回、`GWLP_HWNDPARENT` を使わない理由、WNDPROC から
+  Rust 状態へ届かせる `GWLP_USERDATA` + leak/`Arc::from_raw` の作法、リサイズ・フォーカス転送・
+  ジオメトリ永続化の契約は、上記設計正本 §背景 / §1-1 / §2-5。
 
 ### CLAP GUI 仕様の落とし穴
 
-- `clap_plugin_gui.set_size` は「前回セッションで保存したサイズを復元」用。**初回 open では
-  呼ばない**（`get_size` の戻り値をコンテナ側に反映するだけ）。これで VCV Rack 等が
-  `gui.show` を拒否するケースを防げる
-- `gui.show` が `false` を返しても、`create` + `set_parent` が成功していれば GUI は実際に
-  動いているケースがある（VCV Rack）。ログ警告に留め、即 destroy しない
-- `set_parent` と `show` の間に `PeekMessage` + `DispatchMessageW` でポンプを 1 回回すと、
-  プラグインが内部で `PostMessage` した初期化メッセージが処理され、show が通るケースがある
-- ホスト側 `clap_host_gui` は `host_data` に `&mut Host` のポインタを仕込み、
-  callback 内で復元する（`Box<Host>` は heap 固定なのでポインタが安定）
+初回 open では `set_size` を呼ばない / `gui.show` が false でも即 destroy しない /
+`set_parent` と `show` の間にメッセージポンプを 1 回回す / `clap_host_gui` は `host_data` に
+`&mut Host` のポインタを仕込んで復元する。4 件とも VCV Rack での実測が根拠で、それぞれの理由は
+[docs/plan_plugin_editor_topwindow.md](docs/plan_plugin_editor_topwindow.md) §9。
 
 ## Reflection の確認 (AHE 自律改善ループ)
 
@@ -258,77 +201,43 @@ make audit          # 依存の脆弱性 / yanked / 供給網攻撃の検査 (ne
 
 #### Guard layer（メモリ → 能動的強制力）= 旧ループ最大の欠陥の修正
 
-feedback メモリは `<system-reminder>` の **受動的背景** として recall されるだけで「ミスの瞬間」に
-強制力を持たない（= 「メモリに書いた、でも同じミスを繰り返す」）。唯一 action-time に効くのは
-PreToolUse hook。従来はメモリを hook 化するのに bespoke スクリプト + settings.json 編集
-(classifier ブロック) が要り重すぎて actuate せず、backlog で dismiss → 再発していた
-（例: cd-prefix 再発は guard 経路が無く dismiss され続けた）。
+feedback メモリは `<system-reminder>` の **受動的背景**として recall されるだけで「ミスの瞬間」に
+強制力を持たない。action-time に効くのは PreToolUse hook だけなので、**`.claude/guards.jsonl`
+(git 追跡下) に 1 行足すのがメモリを強制力に変える主経路**である（新規スクリプトも
+settings.json 編集も承認も要らない = classifier ブロックを回避できる。これが loop 自律化の鍵）。
 
-**解決 = データ駆動の汎用ガードエンジン (Python・追加依存なし・cross-platform)**:
-- **`.claude/guards.jsonl`（リポジトリ追跡下）** に 1 行 1 ルール。各行は feedback メモリ 1 件の
-  能動的強制（`source` でメモリへ逆リンク = SSoT）。
-- `scripts/guard_engine.py`（PreToolUse）が全ルールを適用。**一度だけ** settings.json に登録すれば、
-  以後ガード追加は **guards.jsonl に 1 行追記するだけ**（新規スクリプトも settings 編集も承認も不要
-  = classifier ブロック回避）。これが loop 自律化の鍵。`warn`=stdout/exit0、`block`=stderr/exit2（取消）。
-- 発火は `guard_hits.jsonl` に記録 → `reflect.py` が **warn ガードが 3 つ以上の異なる session で発火したら
-  自動で warn→block に昇格**（人手 triage 不要で actuate）。昇格状態は
-  **`<state>/guard_state.json`（git 外の overlay）** に書き、**追跡ファイルは一切書き換えない**。
-- 正規表現 1 本で表せない security block（`check_destructive_delete.py` の per-statement 分割）は
-  code hook のまま。**pattern guard は data、logic guard は code** の分離。
-  cwd との関係でしか判定できないもの（`worktree_outside` / `cd_redundant` / `ask_multi`）も
-  engine 側の logic field で、ルール行は action/msg だけを供給する。
+- `scripts/guard_engine.py` が全ルールを適用する。`warn` = stdout/exit 0、`block` = stderr/exit 2
+  （取消）。ルール書式 (tool / field / all / none / file_glob) と `source`（由来メモリへの逆リンク
+  = SSoT）は同ファイル冒頭。
+- 発火は `guard_hits.jsonl` に記録され、`scripts/reflect.py` が **3 つ以上の異なる session で
+  発火した warn を自動で block へ昇格**する。昇格は **`<state>/guard_state.json`（git 外の
+  overlay）** に書き、**追跡ファイルは一切書き換えない**。
+- **ルール本体は追跡下 / 昇格状態は git 外**。この 2 つを 1 ファイルに同居させていたせいで
+  レジストリが丸ごと消え、**5 日間 pattern guard が全滅していたのに fail-open で症状ゼロ**
+  だった（2026-08-22）。事故と分離の設計は `scripts/guard_engine.py` docstring の "Registry" 節、
+  パス導出は `scripts/ahe_paths.py`（マシン固有パスをハードコードしない）。
+- **`escalate: false` を外さないこと。** substring レベルのマッチャは nudge としては妥当でも、
+  block にすると正当な作業まで取り消す。理由は各ルールの直前にコメントで書いてある。
+- 正規表現 1 本で表せない security block と、cwd・件数との関係でしか判定できないもの
+  (`worktree_outside` / `ask_multi`) は code 側。**pattern guard は data、logic guard は code。**
 
-#### なぜ追跡下なのか（2026-08-22 の消失事故）
-
-`guards.jsonl` は元々 user dir にあった。理由は「reflect.py が昇格をこのファイルに書き戻すので、
-git に入れると全 worktree が毎 Stop で dirty になる」。つまり **性質の違う 2 つ（人が書いたルール
-本体 ＝ 恒久的なプロジェクト知識 / 昇格状態 ＝ 実行時状態）が 1 ファイルに同居**していて、
-可変な方が恒久的な方をバージョン管理の外へ引きずり出していた。
-
-結果、レジストリが丸ごと消えた。`guard_hits.jsonl` の最終発火が 08-17、発覚が 08-22。
-**5 日間、全セッションでパターンガードが 1 件も効いていなかったのに症状がゼロ**だった
-（engine が `if not isfile: return 0` の fail-open で、「無い」と「該当しない」が区別できなかった）。
-
-対処は分離:
-- ルール本体 → `.claude/guards.jsonl`（追跡。CLAUDE.md や `.claude/hooks/` と同じ class）
-- 昇格状態 → `<state>/guard_state.json`（git 外。消えても `guard_hits.jsonl` から再計算できる）
-- レジストリ不在・空・全行 parse 失敗は **session ごとに 1 回、目に見える警告**を出す（黙って通さない）
-- パス導出は `scripts/ahe_paths.py` に集約。repo root は `__file__` から、state dir は
-  **main checkout の slug** から導出する（マシン固有パスをハードコードしない）
-
-**`escalate: false` を外さないこと。** substring レベルのマッチャは nudge としては妥当でも、
-block にすると正当な作業まで取り消す。理由は各ルールの直前にコメントで書いてある。
-
-ループ構造（observe → reflect → **actuate** → close）:
-1. `PostToolUse` で `scripts/log_metric.py` が metrics jsonl に追記し、`scripts/guard_engine.py` が
-   `guards.jsonl` の各ルールをその tool 呼び出しに対し発火・`guard_hits.jsonl` に記録
-2. `Stop` で `scripts/reflect.py` が **warn ガードの自動 block 昇格** + Bash 連続失敗を backlog に upsert
-   （id でデデュープ、status / sessions 付き、truncate しない。ノイズだった read/edit/bash hotspot 検出は撤去）
-3. 次 session 開始時、`SessionStart` hook が OPEN 行を Required Action として強制提示
-4. `/promote-reflection` で各行を終端。**機械化できる再発は guard (guards.jsonl 追記) が主経路で
-   settings.json 不要・承認不要**。新規 hook 種別の登録だけは user 承認が要るので backlog の
-   "hook requests" 節に ready-to-paste spec を書いて依頼する
-
-詳細設計は `docs/plan_ahe.md` (章 1.5 autonomy spectrum + 章 3 H13/H14/H15)。
+ループ構造は observe（`PostToolUse` で `log_metric.py` + `guard_engine.py` が記録）→ reflect
+（`Stop` で `reflect.py` が warn の自動昇格 + Bash 連続失敗を backlog へ upsert）→ **actuate**
+（次 session の `SessionStart` が OPEN 行を提示 → `/promote-reflection` で終端）→ close。設計の
+出発点は [docs/plan_ahe.md](docs/plan_ahe.md) 章 1.5 + 章 3 (H13/H14/H15)。
 
 ### hook 配置ポリシー
 
-- **hook / スクリプトは PowerShell 禁止。bash を既定**とし、**JSON を構造的にパースする必要がある
-  ものだけ Python (stdlib のみ、jq 不要)** で書く (Linux でも動くこと。PS 5.1 の encoding 地獄 +
-  Windows 専用を排除。memory [[feedback_no_powershell_cross_platform]])。
-  - JSON 解析が要る → Python: `guard_engine.py` (ルール DB) / `reflect.py` (hits/metrics 解析 +
-    ルール再シリアライズ) / `log_metric.py` (Windows パスの `\` を含む JSON 出力) /
-    `check_destructive_delete.py` (security block・確実な command 抽出 + `\b` 正規表現)。
-  - JSON 不要 (テキスト/git/build) → bash: `cleanup_worktree.sh` 等。新規 .ps1 は guard が block する。
-- AHE hook (PreToolUse / PostToolUse / Stop) は **`.claude/settings.json`** に集約する。
-  このファイルは git 追跡対象なので、新規 worktree でも何もせず hook が有効になる。
-- `.claude/settings.local.json` は **マシン固有 permissions allowlist 専用** に残す
-  (gitignore 対象、harness が worktree 開始時に同期する想定)。
-- hook を追加したくなったら必ず `settings.json` 側に追加すること。
-  `settings.local.json` に hook を書くと、harness の同期次第で worktree に伝わらず
-  AHE ループが片肺になる。
+- **PowerShell 禁止。bash を既定**とし、**JSON を構造的にパースする必要があるものだけ Python
+  (stdlib のみ、jq 不要)** で書く (Linux でも動くこと。PS 5.1 の encoding 地獄 + Windows 専用を
+  排除。[[feedback_no_powershell_cross_platform]])。新規 .ps1 と bash からの powershell 起動は
+  guard が block する。
+- AHE hook (PreToolUse / PostToolUse / Stop) は **`.claude/settings.json`** に集約する。git 追跡
+  対象なので新規 worktree でも何もせず有効になる。`settings.local.json` に hook を書くと harness の
+  同期次第で worktree に伝わらず AHE ループが片肺になる (こちらは **マシン固有 permissions
+  allowlist 専用**、gitignore 対象)。
 - `.claude/settings.json` の編集は harness の auto-mode classifier に self-modification として
-  ブロックされる。settings.json の hook を増減したいときはユーザーに依頼すること。
+  ブロックされる。hook を増減したいときはユーザーに依頼すること。
 
 ## 応答・コミット
 
@@ -340,9 +249,20 @@ block にすると正当な作業まで取り消す。理由は各ルールの�
 
 ### 最終形まで実装する
 
-フェーズ分けをせずに最終形を一気に完成させる。
-「Phase 1 完成しました。Phase 2 に進みますか」などはだめ。
-ゴールまで完走する。
+**禁じているのは「途中で報告して承認を待つこと」であって、計画を段階に割ることではない。**
+大規模改修を `docs/plan_*.md` で段階に割り、並列 worktree の統合順まで決めるのはむしろ推奨。
+だめなのは「Phase 1 完成しました。Phase 2 に進みますか」で手を止めること。着手したらゴールまで
+完走する ([[feedback_dont_stop_prematurely]])。実装方針 / 分割単位 / 命名 / テストの粒度、一次情報を
+読めば決まること、同じ root cause の同件修正 ([[feedback_sibling_occurrence_check]]) は聞かずに進む。
+
+**止まって聞く場面は次の 4 つだけ**:
+- **着手前** — UI の見せ方・操作 (閉じ方 / 移動 / リサイズ / 永続範囲 / 並び / 背後操作) を確定
+  させる。省くとイメージ違いで全書き直しになる ([[feedback_grill_ui_presentation_first]])。
+- **着手前** — 要件が 2 通りに読め、どちらを取るかで作るものが変わるとき。**1 問ずつ、上流から、
+  番号付きの選択肢で** ([[feedback_one_question_at_a_time]] / [[feedback_numbered_question_options]])。
+- **commit の直前** — 実機 / 視覚の sign-off ([[feedback_confirm_before_commit]])。自動検証だけで
+  先に commit しない。
+- **完全に手詰まりのとき** — 権限・外部要因で先へ進めず、こちらで解けないと確定したとき。
 
 ### ベストプラクティスを追求する
 - Rust Edition 2024 / 各 crate は最新版
@@ -357,12 +277,35 @@ block にすると正当な作業まで取り消す。理由は各ルールの�
 ### Single Source of Truth
 - 同じデータを複数箇所に複製しない
 - 「この値は誰が所有し、誰が更新するか」を明確にしてから実装する
+- **規範も同じ**。同じ規則を 2 か所に書かない。機械が持てるものは機械に持たせ (Makefile /
+  guards.jsonl / arch_lint.sh)、散文は 1 行要約 + リンクにする。**原文を引用して再掲しない** —
+  片側だけ更新されて静かに食い違う
 
 ### まず調べる
 - 設計提案・前提確認・実装方針を書く前に、必ず一次情報を調査する
 - 公式ドキュメント (Ardour manual / REAPER manual / clap repo / cpal docs / windows API docs 等)、spec ファイル (clap/ext/*.h / VST3 spec)、参照実装ソース (sing_like_coding / gui_01 / clap-host / nih-plug 等) を読む
 - ユーザーの発言は調査の方向ヒントとして扱い、最終根拠は一次情報で取る。引用 URL や行番号付きで書く
 - 推測で書かない
+
+#### 調査結果の採用条件 — 反証を通っていないものを根拠にしない
+
+**引用付きで集めた時点ではまだ根拠にならない。** その調査を**反証する側を独立に立て**、
+反証が潰せなかった主張だけを設計判断の根拠にする。潰すべき失敗パターンは決まっている:
+
+- **実行して確かめずに書いた主張** — 「make の target にする」が結論なのに make 経由で一度も
+  実行していない、等。結論が使われる**その経路で**動かして確かめる。
+- **測定器そのものが交絡している主張** — 環境を観測するのに交絡した環境から観測している、等。
+  `env -i` 相当の対照を取る ([[feedback_diagnostics_can_lie]])。
+- **範囲の誇張** — 「全数検査」が実際は 2 割。**母数と分母を必ず数える**。
+- **隣の項目との衝突に気付いていない** — その推奨が、同じ backlog の別項目が未解決だと動かない。
+
+「調べた」と「確かめた」は別で、これは
+[外部 API の挙動を先に理解する](#外部-api-の挙動を先に理解する) と
+[[feedback_called_is_not_worked]] (「呼んだ」と「効いた」は別) と同じ規則の別の面。
+r.md #79-#85 では 8 本の調査に 1 本ずつ反証を当てて **主要結論 6 本が覆った** (#82 の「劣化
+コピー」は `git log -S` で片側更新の drift と判明、「全数検査」は実際 19.7% 等)。全 6 例は
+[docs/plan_rmd_79_85_index.md](docs/plan_rmd_79_85_index.md)。同型の実測は
+[[project_rmd_39_43_parallel]] にもあり、2 回続けて起きているので構造として扱う。
 
 ### 外部 API の挙動を先に理解する
 - 推測で実装→失敗→修正のサイクルは、調査→実装より遅い
@@ -373,21 +316,25 @@ block にすると正当な作業まで取り消す。理由は各ルールの�
 - FFI・CLAP コールバック・IPC のエラーは根本原因を調査してから対処
 
 ### テスト
-- js テストで対応できるものはユーザ確認を依頼しない
+
+**自動で確かめられることをユーザーに頼まない。** このワークスペースに js テストは無い
+(`daw_gui/tests/scripts/*.js` は `--script` モードのシナリオ記述であってテストではない)。
+- Rust の `#[test]` で書けるものは書いて自分で回す (`cargo test -p <crate> --test <name>`)。
+- GUI / IPC / 再生を跨ぐ切り分けは `daw_gui --script <js>` の headless モードで自分でやる。同じ
+  実機操作を何度も頼まない ([[feedback_prefer_headless_verification]])。**頼むのは最終 sign-off
+  だけ**で、揃う前に実機確認を要求しない ([[feedback_no_redundant_verification]])。
+- 逆に**自明な修正に回帰テストを書かない**。本番の算術をテストへ写して突き合わせるだけの
+  テストは特に禁止 ([[feedback_no_tests_for_simple_cases]])。
 
 ### 妥協を選択肢に上げない
 
-冒頭の **「理想とベストプラクティスを追求する。 そのためは大胆に破壊して作り直す。」** は、 **実測してから妥協を選ぶ** ではない。 **そもそも妥協を選ばない**。
+**大原則 (冒頭) は「実測してから妥協を選ぶ」ではない。そもそも妥協を選ばない。**
+(これは **何を作るかの選択**についての規則。統合順や分け方に規模・衝突の実測を使うのは
+[禁止事項](#禁止事項) のとおり別の話。)
 
-選択肢を比較する時に出すべき問い:
-- どれが **理想** か?
-- 理想を実現するには何を破壊する必要があるか?
-
-出してはいけない問い (= principle 違反):
-- どれが **実装コストが低い** か?
-- どれが **影響範囲が狭い** か?
-- どれが **caller boilerplate が少ない** か?
-- どれが **現実的** か?
+出すべき問いは 2 つだけ — どれが **理想** か? / 理想を実現するには何を破壊する必要があるか?
+出してはいけない問い (= principle 違反) — どれが **実装コストが低い** か? / **影響範囲が狭い** か? /
+**caller boilerplate が少ない** か? / **現実的** か?
 
 「実装コスト」「影響範囲」「連鎖する」「許容範囲」「現実的に」「妥協」 — これらが思考に出てきた**時点で**、 理想以外の選択肢を比較対象に上げてしまっている。 PreToolUse の guard engine (`scripts/guard_engine.py` + `guards.jsonl` の compromise-smell-ja/en ルール) がこれらのキーワードを Edit / Write の対象 string に見つけたら、 警告を emit する (block はしない、 思考の中断点として作用)。
 
@@ -407,40 +354,28 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 
 ## アーキテクチャ不変条件
 
-2026-07-03 の全体改修 (`docs/plan_arch_refactor.md`) で確立。**`make arch-lint` が機械検査**し、
-`/arch-review` skill が定期監査する。これらに触れる変更は plan_arch_refactor.md を先に読む。
-書く瞬間の強制は `.claude/guards.jsonl` の `arch-*` ルール (plan §11 の 5 件: INFINITE /
-positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToChild 復活)。
-**「何を違反とみなすか」の SSoT は `scripts/arch_lint.sh`**、ガードはその write-time ミラー。
-ただし **サイズ budget (FILE-BUDGET / FN-BUDGET / FN-NESTING) の測り方**と、
-**`strip_comments` を通す check (1/2/3/5/12) の「コメント内の言及は違反に数えない」の
-行分類**だけは `scripts/loc_budget.py` が持つ (Rust の字句解析が要るので shell の正規表現では
-表せない。UNTAGGED と COMMON-DEPS はパターン自体が行頭 anchor / Cargo.toml なので通さない)。
-その帰結として **python が無い / 壊れていると `make arch-lint` は全面停止する**
-(cargo-deny と同じ「skip の緑を作らない」原則)。
+2026-07-03 の全体改修 ([docs/plan_arch_refactor.md](docs/plan_arch_refactor.md)) で確立。
+**`make arch-lint` が機械検査**し、`/arch-review` skill が定期監査する。これらに触れる変更は
+plan_arch_refactor.md を先に読む。書く瞬間の強制は `.claude/guards.jsonl` の `arch-*` ルール
+(plan §11 の 5 件: INFINITE / positional tuple key / push_undo_snapshot 直呼び / untagged 追加 /
+MainToChild 復活)。**「何を違反とみなすか」の SSoT は `scripts/arch_lint.sh`**、ガードはその
+write-time ミラー。サイズ budget の測り方と「コメント内の言及は違反に数えない」の行分類だけは
+`scripts/loc_budget.py` が持つ (Rust の字句解析が要る)。その帰結として **python が無い / 壊れて
+いると `make arch-lint` は全面停止する** (「skip の緑を作らない」原則)。
 
 **`make arch-lint` の exit 0 は「違反ゼロ、または `scripts/arch_lint_baseline.txt` に記録済みの
 ものだけ」を意味する。** baseline に無い違反が 1 件でもあれば exit 1 (行単位 ratchet)。
 以前は違反があっても常に exit 0 だったので、終了コードだけ見て「OK」と報告され続けていた。
-- 既知の負債は baseline に **理由と落とし所つきで 1 行**。fingerprint は行番号ではなく
-  マッチ行の内容ハッシュ (行番号は無関係な編集でずれる)。**サイズ budget の行だけは
-  第 3 field が計測値の天井** (`/` 区切りの整数ベクトル。FILE/FN-BUDGET は実コード行、
-  FN-NESTING は 最大段数/6段以上の行数)。1 成分でも超えたら新規違反として表に出る
-  (path だけをキーにすると、baseline 済みのファイルが無制限に太れてしまう)。
-  件数 baseline にはしない (「1 件直して 1 件増やす」が素通りする)。
-- 直した行は「解消」として通知されるが **ゲートは落とさない** (良い変更を止めない)。
-  baseline から削除すること。
-- **恒久的に正当な箇所は baseline ではなく行内マーカー** `// arch-lint: allow-<check>`。
-  区別しないと負債が「正当」として永久に隠れる。
-- 貼り付け用の行は `ARCH_LINT_EMIT_BASELINE=1` が出す (書き込みはしない)。
-  `ARCH_LINT_STRICT=1` は baseline 済みの負債も落とす。
+**恒久的に正当な箇所は baseline ではなく行内マーカー** `// arch-lint: allow-<check>` (区別しないと
+負債が「正当」として永久に隠れる)。baseline の書式 (行番号ではなく内容ハッシュ / サイズ budget
+だけ第 3 field が計測値の天井 / 件数 baseline にしない理由 / 直した行は削除する) と
+`ARCH_LINT_EMIT_BASELINE` / `ARCH_LINT_STRICT` は `scripts/arch_lint_baseline.txt` 冒頭が正本。
 
-> **arch-lint のパターンにバックスラッシュを使わないこと。** make (MSYS2) 経由だと
-> grep/sed へ渡す引数のバックスラッシュが落ち、`\( \s \b \[` を含むパターンが無言で
-> 別物になる。2026-08-22 に発覚 — 8 チェック中 6 つが無効化され、違反 7 行を抱えたまま
-> 「OK (違反なし)」を出していた。POSIX ブラケット式 (`[(]` `[]]` `[[:space:]]`) と
-> `grep -w` で書く。arch_lint.sh は冒頭に canary を持ち、検査器自身が効いていなければ
-> exit 1 する (違反ゼロの報告を無条件に信じない)。
+> **arch-lint のパターンにバックスラッシュを使わないこと。** POSIX ブラケット式
+> (`[(]` `[]]` `[[:space:]]`) と `grep -w` で書く。make (MSYS2) 経由だと grep へ渡す argv の
+> バックスラッシュが落ちるため。実測した argv と、**8 チェック中 6 つが無言で無効化されたまま
+> 「OK (違反なし)」を出していた** 2026-08-22 の偽グリーンは `scripts/arch_lint.sh` 冒頭
+> 「正規表現にバックスラッシュを使わない」節。同ファイルの canary が毎回これを再検査する。
 
 1. **安定 id addressing**: プロセス境界・イベント・永続参照に positional index を使わない。
    device = `PluginInstance.id` (u64、shmem 名・worker dispatch・plugin host bookkeeping も同じ id)、
@@ -474,6 +409,9 @@ positional tuple key / push_undo_snapshot 直呼び / untagged 追加 / MainToCh
    逆インセンティブになり、tests を別ファイルへ移すだけの commit が実際に 2 件生えた)。
    現在値は `python scripts/loc_budget.py --report`。r.md #76。
 
+**不変条件 2 / 5 / 6 / 8 に対応する arch-lint チェックは無い** (機械検査があるのは 1 / 3 / 9 と
+untagged / RT の INFINITE)。この 4 件は上の本文が唯一の強制手段なので、圧縮しないこと。
+
 ## FFI / CLAP 境界のセキュリティ
 
 - ポインタの null / 境界チェックを必ず行う
@@ -501,28 +439,19 @@ FFI 境界 (= D3D11 / wgpu / CLAP / cpal / windows API) のコードを「**自�
 
 ## Visual regression smoke test
 
-video preview の暗転 / 全 pixel 透過 / 一様 fill 等の **visual regression** は
-`cargo build` / `cargo test` / `cargo clippy` 全 pass でもすり抜ける (= 実例:
-`c2ae697` は build/test/clippy clean なのに preview を fully-transparent quad
-にした、 6-7 時間費やして発覚)。 これを 1 コマンドで catch するために
-`daw_gui --smoke-test <fixture.mp4>` を導入。
+video preview の暗転 / 全 pixel 透過 / 一様 fill 等の **visual regression** は `cargo build` /
+`cargo test` / `cargo clippy` を全部すり抜ける。**video preview / texture sampling /
+shared-handle 周りに触れる変更は、commit 前に必ずこれを通す。**
 
 ```bash
 cargo run -p daw_gui -- --smoke-test daw_gui/tests/fixtures/smoke_test.mp4
-# exit 0 = preview rendered visible content (= healthy ~20 000 unique colors)
-# exit 1 = preview blank / uniform / transparent (= unique_colors < 1000)
+# exit 0 = 描画されている / exit 1 = blank・一様・透過
 ```
 
-仕組み:
-1. background thread が programmatic に `ImportVideo` → `TogglePreviewWindow`
-   → `Play` を発火、 1.5s 再生
-2. preview window の client area を Win32 `PrintWindow(PW_RENDERFULLCONTENT)`
-   で pixel capture
-3. histogram 解析: unique RGB ≥ 1000 / black pixels ≤ 95%、 を assertion
-4. 結果を `std::process::exit(0 or 1)` で返す
-
-video preview / texture sampling / shared-handle 周りに触れる変更は **必ず
-commit 前にこれを通す**。 詳細は `daw_gui/src/smoke_test.rs`。
+なぜ要るか (`c2ae697` が build/test/clippy すべて green のまま preview を全 pixel 透過の quad に
+し、発覚まで 6-7 時間かかった)、fixture の作り方 (pin した FFmpeg + libopenh264 を使う理由)、
+histogram 判定の閾値、終了時に `AppEvent::Quit` で通常の shutdown を通す理由は
+`daw_gui/src/smoke_test.rs` の module doc が正本。
 
 ## Debugging Methodology
 
@@ -533,9 +462,11 @@ commit 前にこれを通す**。 詳細は `daw_gui/src/smoke_test.rs`。
 
 ## 参照プロジェクト
 
-- `ui/` — 自作 GUI ライブラリ daw-ui (旧 gui_01, 統合済み)。同一 workspace・同一セッションで
-  直接編集する。API は crate doc-comments、サンプルは `ui/crates/examples/{mixer, arrangement,
-  piano_roll, ...}`、UI 固有の技術ガイド・既知の罠は `ui/CLAUDE.md`、設計正本は `ui/docs/plan.html`。
+- `ui/` — 自作 GUI ライブラリ daw-ui。API は crate doc-comments、サンプルは
+  `ui/crates/examples/{mixer, arrangement, piano_roll, ...}`、設計正本は
+  [ui/docs/plan.html](ui/docs/plan.html)。
 - `sing_like_coding` (作者ローカルの別リポジトリ) — 前作 Rust DAW。IPC, CLAP ホスト,
   オーディオエンジンの参照実装
 - `%APPDATA%\REAPER\Scripts\<user>\voicevox\` (作者ローカル) — VOICEVOX API 統合の参照実装 (Lua)
+- clap-host / clap-validator / nih-plug 等の clone 先パスつき一覧は
+  `.claude/skills/research-similar-impl/references.md`

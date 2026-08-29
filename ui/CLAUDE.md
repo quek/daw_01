@@ -3,11 +3,12 @@
 Rust 製・モデルを Clone しない immediate-mode GUI ライブラリ。GUI のみを扱い、audio / IPC には
 一切関知しない。daw_01 に統合され `daw_01/ui/` に置かれる（旧 sibling repo gui_01）。
 
-AHE ループ / hook / skill / 共通の coding principle は daw_01 root の `CLAUDE.md` と `.claude/` に
-一本化済み。この CLAUDE.md は **UI ライブラリ固有の技術ガイド** (クレート構成・load-bearing
-invariant・既知の罠) のみを残す。
+AHE ループ / hook / skill / 共通の coding principle は daw_01 root の [CLAUDE.md](../CLAUDE.md) と
+`.claude/` に一本化済み。この CLAUDE.md は **UI ライブラリ固有の技術ガイド** (クレート構成・
+load-bearing invariant・高頻度の罠) のみを残す。
 
 設計の詳細は [docs/plan.html](docs/plan.html) を参照 (正本)。
+サブシステムを触るときにしか要らない低頻度の罠は [docs/known_traps.md](docs/known_traps.md)。
 
 ## クレート構成
 
@@ -24,7 +25,7 @@ crates/examples/  (mixer / waveform_validation 等) -- 動作確認サンプル
 
 ```bash
 make build                            # ルート Makefile が SSoT (実行 3 exe)
-make test                             # テストを持つ package のみ (TEST_PKGS)
+make test-nolaunch                    # テスト (素の make test は daw_gui を起動する。root 参照)
 cargo clippy --workspace --tests -- -D warnings
 cargo run --bin mixer                 # mixer 動作確認
 cargo run --bin waveform_validation   # 波形 UI 動作確認
@@ -32,10 +33,8 @@ cargo bench -p daw-ui-core            # criterion ベンチ
 cargo test -p daw-ui-core --test no_clone_required   # trybuild (no-Clone 制約)
 ```
 
-### ビルドと検証の区別
-
-`cargo clippy` / `cargo check` / `cargo test` は **実行 exe を生成しない** (or test 用のみ)。
-example を実機検証する前に必ず `cargo run --bin <name>` または `cargo build` を明示する。
+example を実機検証する前に必ず `cargo run --bin <name>` または `cargo build` を明示する
+(root CLAUDE.md「ビルドと検証の区別」の ui 版)。
 
 ## 設計上の不変条件 (load-bearing)
 
@@ -50,34 +49,21 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 
 これらは `crates/ui/tests/no_clone_required.rs` (trybuild) で CI 固定済み。
 
-## 応答・コミット
+## Coding Principles (daw-ui 固有の上乗せ)
 
-- 応答は日本語
-- コミットメッセージは日本語
-- 技術用語は英語のまま使用可
+応答・コミットの言語、KISS / DRY、Single Source of Truth、まず調べる、エラーを握りつぶさない、
+最終形まで実装する、妥協を選択肢に上げない — **共通の規範は root の
+[CLAUDE.md](../CLAUDE.md) に一本化済み**。ここには daw-ui 固有の上乗せだけを書く。
 
-## Coding Principles
+### 最新の安定版を使う (上乗せ)
+- **deprecated な API を新規コードで使わない**
 
-### 最新の安定版を使う
-- Rust Edition 2024 / 各 crate は最新版
-- deprecated な API を新規コードで使わない
-- `let-else` で早期リターン、`?` を `match` より優先
+### 外部 API の挙動を先に理解する (上乗せ)
+- wgpu / winit / glyphon / taffy はバージョン間で breaking change が多い。**該当バージョン** の
+  ドキュメント・examples を確認してから書く (後述「既知の罠」と
+  [docs/known_traps.md](docs/known_traps.md) も参照)
 
-### KISS / DRY
-- 最小限の実装で目的を達成する。不要な抽象化を作らない
-- 同じロジックを複数箇所に書かない
-- 1 関数 1 責務、3 回繰り返されたら抽象化を検討
-
-### Single Source of Truth
-- 同じデータを複数箇所に複製しない
-- 「この値は誰が所有し、誰が更新するか」を明確にしてから実装する
-
-### 外部 API の挙動を先に理解する
-- 推測で実装→失敗→修正のサイクルは、調査→実装より遅い
-- wgpu / winit / glyphon / taffy はバージョン間で breaking change が多い。**該当バージョン** のドキュメント・examples を確認してから書く (後述「既知の罠」も参照)
-
-### エラーを握りつぶさない
-- `?` を安易に `ok()` / `unwrap_or_default()` に置き換えない
+### エラーを握りつぶさない (上乗せ)
 - wgpu / winit からのエラーは根本原因を調査してから対処
 
 ### 要件にない変更を入れない
@@ -90,22 +76,22 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - 「KISS で見送る」と判断する場合は、なぜ今ここで使わないかを **明示的に書く**
 - 例: `LayoutPass` の Phase 5 で `Padding` / `Gap` / `flex_grow` を入れたら、Phase 6 (mixer 拡張) では使う
 
-### 理想とベストプラクティスを追求する (使う側に boilerplate を強要しない)
+### 使う側に boilerplate を強要しない
 - ユーザに同じ workaround を書かせる API は **設計欠陥のシグナル**。利用者全員が同じ boilerplate を書く状況になっていたら、ライブラリで吸収すべき
 - 改善のためなら **破壊的 API 変更を恐れない**。単一 workspace + Edition 2024 の利点を活かし、breaking change を入れたら全 example / test / docs を **1 commit で一括更新** する
 - 「audio thread に Edit を送るかも」のような **曖昧な future-proof のために現実の全ユーザに boilerplate を強要しない**。必要になってから別 method (`frame_to_edits` 等) を追加すれば十分
-- 妥協 (短期 workaround) で進めるしかない場面では、**なぜ短期で済むか / 根本対処の方針** を memory / docs に明示的に残す
 
-## Debugging Methodology
-
-- **実データから始める**: コード推論より実データ観察が速い
-- **フルサイクルで検証する**: 個別関数が正しくても、`Ui::frame` → render → 表示 のサイクル全体が壊れていれば無意味
-- **上流→下流の順で調査する**: OS イベント → winit AppEvent → InputAccumulator → Ui::frame → widget → Edit → Model → render
-- **UI イベントは可視フィードバック必須**: GUI のクリック・キーバインドは「動いた / 動いてない」が見えない。`tracing::info!` を該当層に仕込んで切り分ける ([.claude/skills/debug-ui/SKILL.md](.claude/skills/debug-ui/SKILL.md) 参照)
+### デバッグの層 (root「Debugging Methodology」の上乗せ)
+- **上流→下流**: OS イベント → winit AppEvent → InputAccumulator → `Ui::frame` → widget → Edit
+  → Model → render。`Ui::frame` → render → 表示 のサイクル全体で見る
+- クリック・キーバインドは「動いた / 動いてない」が見えないので `tracing::info!` を該当層に
+  仕込んで切り分ける (root の `.claude/skills/debug-ui/SKILL.md`)
 
 ## 既知の罠 (winit / wgpu / glyphon / taffy)
 
-実ビルド/動作で踏んだ落とし穴。新規実装で再発させない。
+実ビルド/動作で踏んだ落とし穴。新規実装で再発させない。**低頻度のもの (line pipeline の
+sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイポグラフィ) は
+[docs/known_traps.md](docs/known_traps.md) にある。**
 
 ### winit 0.30
 - **Alt-Tab 復帰直後のクリック** で OS が `WM_MOUSEMOVE` を送らず、winit の `cur_pos` が更新されないまま `MouseInput` が来る。`crates/platform/src/winit_backend.rs` で OS にカーソル位置を問い合わせて synthetic な `PointerMoved` を先に流す対処を入れてある。Alt-Tab 後の最初のクリックの hit-test で空振りする症状を見たら、まずこの workaround を疑う。
@@ -119,44 +105,6 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
   3. **Move + Alt なしは jitter 用 4px 閾値** (mouse jitter のみ ignore)
   実装は `let demote = matches!(nd.kind, ClipDragKind::Move) && !nd.last_alt && dist < 4.0;`。 user 視点で「drag したら反映される」 を保証しつつ jitter は ignore できる。
 - **隣接 resize widget の共有境界は in-rect 優先 (後勝ち + 外側拡張ハンドルは内側を奪う)**: clip / note のように左右端 resize ハンドルを rect の **内外 ±handle_px** に張る widget は、 隣接要素 (`A.right == B.left`、 連続同音 note / 接触 clip) があると B の左端外側ハンドル `[B.left-px, B.left)` が **A の rect 内部に食い込む**。 hit-test を「visible 走査で match ごとに後勝ち上書き」 で書くと、 cursor が A の rect 内 (`A.right-px ≤ cx < A.right`) でも後ろの B が常に勝ち **A の右端を一切掴めない** (piano_roll #053 / M14 Phase 82)。 **正しい設計**: match を「rect 内部 (in-rect)」 と「外側拡張のみ (outer)」 の 2 tier に分け **in-rect を outer に無条件優先** (同 tier は resize edge への水平距離が近い方、 同距離は後勝ち)。 各 widget が「自分の rect 側ハンドル px を所有」 し、 共有境界は半開区間で後者 (B) 内側になる。 piano_roll は `note_hit` / `note_hover_cursor` 共有の internal `note_hit_in` で実装済 (hover カーソルが指す要素 = drag で掴む要素 を構造保証)。 **arrangement の `clip_hit` も M14 Phase 125 (#101) で同じ in-rect 優先ループに統一済** (旧「後勝ち上書き」 で隣接 clip の A 右端が B に奪われていた bug を解消)。 今後 左右端 resize ハンドルを内外に張る新 widget を足すときは、 この 2 tier (in-rect 無条件優先 / 同 tier は edge 距離) を最初から踏襲する。
-
-### line pipeline: **sub-pixel の quad は rasterizer が落とす**
-
-`push_lines` の 1 segment は cap を持たない素の quad (`pipelines/line.wgsl` は `along` が
-0/1 のみで線方向へは 1px も伸ばさない)。 **長さが 1px を切る segment は pixel 中心を掴めず
-描かれない**。 円弧を折れ線近似するときに固定角度で刻むとこれを踏む: 半径 14px の knob を
-2° 刻みにすると 1 segment の弦長が `14 × 0.035 = 0.49px` で、 弧のあちこちに穴が空く。
-
-- 値弧のように「下地が同じ色の面」 の上に描く分には斑点として微かに出るだけだが、
-  **下地を隠す目的で描く弧では致命的** (daw_01: knob の可動範囲外を面の色で塗り潰しても、
-  穴から本体の縁と枠が漏れてリングが切れて見えなかった)。
-- 対処は `widgets/knob.rs` の `push_arc`: 刻みを **半径に反比例** させて弦長を
-  `ARC_CHORD_PX` 前後に保ち、 さらに span を **均等割り** する (単純な足し込みだと最後に
-  「余り」 の短い segment が 1 本出て、 そこだけ sub-pixel になる)。 joint は butt 継ぎなので
-  各 segment の終端を半 step 重ねて楔形の隙間も潰す。 副次的に instance 数も 1/6 に減る。
-- 新しく円弧 / 曲線を折れ線化する widget を足すときは、 **角度ではなく弦長で刻む**。
-
-### TSF (Windows IME / `ITextStoreACP` — M15)
-text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP) のまぜ書き `GetText` / MS-IME 再変換を成立させる経路 (`crates/platform/src/tsf/`、Windows 限定)。設計は [docs/plan_tsf_ime.html](docs/plan_tsf_ime.html)。
-- **`AssociateFocus` 必須 (`SetFocus` だけでは不可)**: `ITfThreadMgr::SetFocus(doc_mgr)` は thread の focus doc を設定するだけで **document を HWND に束縛しない**。window が OS focus を得ると msctf は CUAS の既定 document を使い、TIP の編集が我々の `ITextStoreACP` に届かない。症状: rtry ログ `ShiftStart(-10) shifted=0` / `TSF read failed, using postbuf fallback`、まぜ書きが postbuf の backspace 再現で「ねこ→ね」 のようにズレる (= store が空に見えている)。`ITfThreadMgr::AssociateFocus(hwnd, doc_mgr)` で束縛して解決。focus 取得時に `AssociateFocus` + `SetFocus` の両方を呼ぶ (前者は次の focus 変化で効くため後者で即時反映)。
-- **winit はデフォルト IME 無効**: 生成時に `set_ime_allowed(window, false)` される。focus 中に app が `set_ime_allowed(true)` を呼ばないと IME を ON にできない (TSF doc focus だけでは不足)。既存の「app が `ime_request()` で IME enable を駆動」 contract は不変で、TSF は純粋に additive (daw_01/mixer/piano_roll は無改修で TSF を得る)。
-- **STA apartment は winit が保証**: winit が `OleInitialize` で event loop スレッドを STA 化するので `CoInitializeEx(APARTMENTTHREADED)` は `S_FALSE` (既に STA) を返す = 正常 (`did_coinit` で balance)。`RPC_E_CHANGED_MODE` (既に MTA) 時のみ TSF を諦め winit IMM に fallback。TSF COM は STA / `Rc` 保持で **非 Send** なので `WinitWindow` (Send 要求) に持たせず UI スレッド thread-local (`TsfSlot`: Untried/Failed/Active、初期化は 1 度きり試行) に置く。
-- **ACP ⇔ byte と invariant 型の Default**: TSF は UTF-16 code-unit offset (ACP)、widget は UTF-8 byte。`AcpMap` で相互変換 (サロゲートは char 先頭へ丸め)。**`#[derive(Default)]` で空 `Vec` になり `len()-1` が underflow した実バグ** → sentinel `[0]` を持つ Default を手実装 + `saturating_sub` 防御。invariant を持つ型は `build()` だけでなく **Default/空構築もテストする**。
-- **COM shim の lint**: windows API の wildcard import / `#[implement]` マクロ生成 (`inline_always`) / ACP i32 cast / out-param raw pointer は不可避なので COM module 単位で `#![allow(...)]`。
-- **検証は実機 + rtry ログ必須**: 単体テストは純粋ロジック (AcpMap/DocState) のみ。COM 経路は `examples/text_input_ime` (IMM 不介入＝TSF のみ) を rtry 有効化で起動し、gui_01 側 trace + rtry の `%TEMP%\rtry_debug.log` (`text before cursor = '...'` が非空か) で往復を確認する。
-
-### wgpu (29.x 系)
-- リサイズ中の surface 再構成で `SurfaceError::Outdated` が稀に発生。`render` の戻りがエラーでもログに出して次フレームまで生かす設計。
-- **offscreen rendering** (Phase 18 で `OffscreenRenderer` を実装した際に確定):
-  - `Maintain::Wait` は 28 以前の API。29 では **`PollType::wait_indefinitely()`** に置換 (`device.poll(PollType::wait_indefinitely()).unwrap()` が定型)。`Maintain` を import すると型エラー。
-  - `compatible_surface: None` で adapter 取得可 (native は OK、WebGL2 のみ surface 必須)。プラグイン UI 埋め込みや snapshot 用途で window なしに使える。
-  - `copy_texture_to_buffer` の引数は **`TexelCopyTextureInfo` / `TexelCopyBufferInfo` / `TexelCopyBufferLayout`** (29 の新名称)。`ImageCopyTexture` 等の旧名は使えない。
-  - `bytes_per_row` は **`COPY_BYTES_PER_ROW_ALIGNMENT` (= 256) の倍数必須**。`unpadded.div_ceil(256) * 256` で staging buffer に padding し、readback 後に row 単位で詰め直す。`Queue::write_texture` には適用されない。
-  - `map_async` + `poll(Wait)` 順序: コールバック登録 → `device.poll(PollType::wait_indefinitely())` の順。逆にするとコールバックが永遠に呼ばれない。
-  - `DeviceDescriptor` の `trace: Trace::Off` / `experimental_features: ExperimentalFeatures::disabled()` フィールドが 29 で必須 (省略不可)。`device.rs` / `offscreen.rs` 双方で全フィールド明示。
-  - sRGB 二重変換は **起きない**: `Rgba8UnormSrgb` で render → そのまま PNG `ColorType::Rgba` に渡せる (PNG decoder は sRGB 仮定でデコードするので一致)。バイト単位で snapshot 比較するなら `Rgba8Unorm` (linear) を選ぶ判断もあり。
-- **uniform buffer の LAST WRITE WINS trap** (M14 Phase 78 で発覚): pipeline instance が **1 つだけ** uniform buffer を保持して同 encoder 内で複数の draw call から `queue.write_buffer` で値を書き換えると、 GPU は submit 時に **最後の write** の値を全 draw が読む (= 各 draw が異なる uniform を期待しても全部同じ値を見る)。 `queue.write_buffer` は deferred で encoder の draw 順とは無関係に submit 直前に 1 度書く。 対処: (a) **per-call で `device.create_buffer`** して各 draw が独自 buffer を参照 (`pipelines/text_effect.rs::run_blur_pass` / `run_composite_pass` 参照)、 (b) **dynamic offset uniform** で 1 buffer + 複数 offset、 (c) **encoder.copy_buffer_to_buffer** で encoder 内に書き込みを order する。 multi-pass / per-instance uniform を扱う pipeline では **(a) を default 設計** にする。 symptom: 複数 effect で全部が最後の効果に化ける、 視覚的に「動いてるように見える」 が pixel 単位 verify で破綻が見つかる ← この性質ゆえ visual smoke「見える」 で OK にせず pixel verify を徹底すること (memory: `feedback_no_excuse_pixel_verify`)。
-- **LAST WRITE WINS の対: 別 submit なら安全** (M14 Phase 93 で確定): 上の trap は **1 つの submit (encoder) 内**で buffer を多重 write して多重 draw が読む場合のみ起きる。 `queue.write_buffer` は次の `queue.submit` で「その submit までに積まれた write を、 command 実行の **前** に flush」 するので、 `write(A) → submit(A) → write(B) → submit(B)` は各 submit が個別の値を読む。 = **別 submit ごとに begin_frame/upload/render/submit を完結させる経路 (例: `composite_scene_to_texture` を呼ぶ毎に独自 encoder を submit) は、 既存 pipeline (rect/line/glyph/texture) を main `render()` と流用しても screen uniform を破壊しない**。 専用 pipeline を増やす (= GlyphPipeline の FontSystem 二重ロード等) 必要はない。 multi-submit-per-frame な新経路を足すときは「同 submit 内に複数 write が無いか」 だけ確認すればよい。
 
 ### taffy 0.10
 - **`Dimension::auto()` の flex 親に `flex_basis: 0` の grow-only 子** を入れると fit-content = 0px に潰れて `flex_grow` の比例分配が起きない。`LayoutPass::flex` は親の size を `Dimension::percent(1.0)` で「親の利用可能領域いっぱい」にしてこれを回避している (Phase 5 で発見)。
@@ -174,20 +122,6 @@ text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP
 
 ### widget state の downcast
 - `state: HashMap<WidgetId, Box<dyn WidgetState>>` から型復元するとき、`Box<dyn WidgetState>` 自身に WidgetState の blanket impl が当たって外側 Box の TypeId を返すバグに注意。`&mut **entry` で明示的に deref してから `as_any_mut().downcast_mut::<S>()` する (M2 で修正、回帰テスト済)。
-
-### text_input のタイポグラフィは caller が持つ (`TextInputStyle`)
-
-- **`text_input_at` / `text_input_at_focused` は `&TextInputStyle` (font_size / pad_x) を取る**。
-  旧実装はこの 2 つを `draw_text_input` に 14.0 / 8.0 で埋め込んでいたため、
-  (a) `scrubable_number_at` が `style.font_size` を渡していても **click で編集モードに入った
-  瞬間だけ文字が 14px に跳ねる** (inspector の 11px 欄で実際に起きていた)、(b) 狭い欄に入力を
-  置けない (`pad 8 + "L100"@14px = 37px` 必要)、という 2 つの欠陥があった。色は palette が SSoT
-  なので style には入れない (r.md #48)。
-- **cursor 高は `font_size * 1.2` を rect 中央に置く** (`caret_rect`)。旧 `rect.h - 8.0` は
-  font 14 / 高さ 22-28px の欄でしか成立せず、小さい欄では文字より短い caret になる。描画と
-  IME 候補位置要求 (`request_ime`) が同じ helper を共有する。
-- **テキストは rect で clip する**。横スクロールを持たない widget なので、欄からはみ出した
-  グリフは隣の widget の上に重なって描かれてしまう (mixer strip の 30px 欄で顕在化)。
 
 ### shortcut の属性は **登録側が宣言** する (`set_typing_only` / `set_repeatable`)
 
@@ -215,7 +149,7 @@ text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP
 
 ## 参考リソース
 
-- 設計の正本: [docs/plan.html](docs/plan.html)
+- 設計の正本: [docs/plan.html](docs/plan.html) / 低頻度の罠: [docs/known_traps.md](docs/known_traps.md)
 - フィードバック / 過去知見: daw_01 の `~/.claude/projects/F--dev-daw-01/memory/`
   （旧 gui_01 memory `F--dev-gui-01` からの移行は統合作業の follow-up）
 - skill: UI デバッグは daw_01 root の `.claude/skills/debug-ui`。実装 / レビュー / 調査は

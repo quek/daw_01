@@ -43,7 +43,8 @@ artifact** に昇格させる。旧ループは「memory に save / discard」�
   だけで能動的強制力になる。`guard_engine.py` は settings.json に登録済なので、ルール追加に
   hook 登録編集 (classifier ブロック) は不要 = 自分で完結できる。
 - file: `.claude/guards.jsonl` (1 行 1 JSON ルール、**リポジトリ追跡下**。2026-08-22 に user dir から
-  移設 — 追跡外に置いていたせいでレジストリが丸ごと消えた。CLAUDE.md「なぜ追跡下なのか」参照)。
+  移設 — 追跡外に置いていたせいでレジストリが丸ごと消えた。事故と分離の設計は
+  `scripts/guard_engine.py` docstring の "Registry" 節、規範は CLAUDE.md「Guard layer」節)。
   warn→block の自動昇格状態だけが git 外の overlay (`<state>/guard_state.json`) にある。
 - ルール形:
   `{"id":<slug>,"source":<feedback メモリ slug>,"tool":["Bash"]|["Edit","Write","MultiEdit"],`

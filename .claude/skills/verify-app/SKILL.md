@@ -5,24 +5,25 @@ description: |
   ログで検証する定型手順。二重起動チェック → background 起動 → ログ grep を1アクションに束ねる。
   「実機で確認」「動かして確認」「daw_gui を起動して」「変更が効いているか見て」等のとき発動。
   GUI / オーディオ / プラグイン挙動など unit test で拾えない変更の確認に使う。
-allowed-tools: Read, Grep, Glob, Bash, PowerShell
+allowed-tools: Read, Grep, Glob, Bash
 ---
 
 # daw_01 実機検証ワークフロー
 
 `cargo test` で拾えない GUI / オーディオ / プラグイン GUI / IPC 挙動を、実際に daw_gui を
-起動して確認する。**3 つの不変ルール**を必ず守る (各々 memory に根拠あり)。
+起動して確認する。**4 つの不変ルール**を必ず守る (各々 memory に根拠あり)。
 
 ## 不変ルール
-1. **二重起動しない** (`feedback_no_duplicate_app_launch`): 既存の daw_gui が動いていると
-   IPC 衝突で入力不能 (「何もクリックできない」) になる。起動前に必ずプロセス確認。
-2. **自分で起動する** (`feedback_launch_app_for_verification`): ユーザーに「起動して」と頼まず、
+1. **起動する前に一声かける** (`feedback_ask_before_launching_app`): 窓が前面に出て作業の邪魔に
+   なる。並列作業中は特に。
+2. **二重起動しない** (`feedback_no_duplicate_app_launch`): 既存の daw_gui が動いていると
+   IPC 衝突で入力不能 (「何もクリックできない」) になる。起動前に必ずプロセス確認 (下記 §2)。
+3. **自分で起動する** (`feedback_launch_app_for_verification`): ユーザーに「起動して」と頼まず、
    `run_in_background` で自分が起動する。ただし振る舞いの目視 (メニュー hover 等 UI 操作が要る
-   検証) はユーザーに依頼する。
-3. **tail パイプ越しに起動しない** (`feedback_launch_no_tail_pipe`): `| tail` 越しだと I/O abort で
-   誤クラッシュ。`run_in_background` + `tee <log>` でログをファイルに落とす。
-4. **動いているアプリを kill しない** (`feedback_no_kill_running_app`): `taskkill`/`Stop-Process`
-   しない。既存起動があればユーザーに「閉じてください」と依頼。
+   検証) はユーザーに依頼する。`| tail` 越しに起動しない (`feedback_launch_no_tail_pipe` —
+   I/O abort で誤クラッシュする)。`tee <log>` でログをファイルに落とす。
+4. **動いているアプリを kill しない** (`feedback_no_kill_running_app`): `taskkill` 等で止めない。
+   既存起動があればユーザーに「閉じてください」と依頼。
 
 ## 手順
 
@@ -36,10 +37,21 @@ allowed-tools: Read, Grep, Glob, Bash, PowerShell
   `cargo build -p <crate>` まで絞る。
 
 ### 2. 二重起動チェック
-```powershell
-Get-Process daw_gui,daw_audio,daw_plugin_host -ErrorAction SilentlyContinue | Select-Object Name,Id
+
+**専用のコマンドを書かず、`make run` / `make test` と同じ判定器を使う** (SSoT。PowerShell は
+使わない — `feedback_no_powershell_cross_platform`)。
+
+```bash
+bash scripts/preflight_no_running_app.sh verify-app
 ```
-- 何か出たら **起動しない**。ユーザーに「閉じてください」と依頼してから再確認。
+
+- **exit 1 (= 起動中)** … 起動しない。ユーザーに「閉じてください」と依頼してから再実行。
+- **exit 0** … 起動してよい。ただしスクリプトが `[警告]` を出していたら、それは
+  「**起動していない**」ではなく「**判定できなかった**」(プロセス一覧が取れない環境)。
+  その場合は緑と読まず、ユーザーに確認する。
+- 判定は `tasklist` → `pgrep` → `ps` の順に使える手段を選ぶので Windows 以外でも動く。
+  `DAW01_PREFLIGHT_APP=<必ず居るプロセス名>` を付けて **検査自身が実際に止まること**を
+  確かめられる。
 
 ### 3. background 起動
 ```bash

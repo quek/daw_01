@@ -4,6 +4,27 @@
 新しい指摘が出たらここに追記する。運用方針は `CLAUDE.md`「依存の脆弱性 / 供給網攻撃」節、
 設定は `deny.toml` の `[advisories]`。
 
+## 0. なぜ `make audit` を足したか (2026-08-20 の arrayref 汚染)
+
+crates.io の **arrayref 0.3.10** が汚染された (**RUSTSEC-2026-0260**)。typosquat の
+`proc-macro1` への依存が足され、その build script が **コンパイル中にリモートのバイナリを取得
+して実行**する。同じ攻撃者が 23 分の間に `internment` 0.8.7 と `append-only-vec` 0.1.9 も汚染
+した。Rust Security Response Team は作者の端末 / 資格情報の侵害と見ている。
+
+**daw_01 は無事だった** — `Cargo.lock` の arrayref が 0.3.9 のままで、`cargo update` を走らせて
+いなかったから。つまり守ったのは検査ではなく **lock を commit していたこと**で、当時この
+リポジトリには依存の脆弱性検査が 1 つも無かった。運が良かっただけなので `make audit` を足した。
+
+帰結として運用の中心は 2 つ:
+
+1. **`Cargo.lock` の commit が一次防御**。`cargo update` は「更新したい理由があるとき」だけ
+   意図的に打ち、打ったら必ず `make audit` を通す。
+2. **新しい汚染事件を知ったら `scripts/lockfile_guard.py` の `KNOWN_COMPROMISED` に
+   `(name, version, 出典)` を 1 行足す**。完全一致判定なので誤検知が無く、ネットワークも要らない。
+
+「なぜ lock の commit が一次防御なのか」の詳しい説明は `scripts/lockfile_guard.py` の
+module docstring が正本。
+
 ## 現状 (2026-08-22): **GREEN**
 
 検出は 9 件。**全件が daw_01 の使い方では露出しない**ことを確認したうえで、

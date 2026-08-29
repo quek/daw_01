@@ -20,17 +20,24 @@ Cargo workspace (Rust Edition 2024)。実行時は独立した 3 プロセスが
 
 ## ビルド
 
-`Makefile` が SSoT。素の `cargo build --workspace` は使わない。
+`Makefile` が SSoT。素の `cargo build --workspace` / `cargo test --workspace` は使わない
+(テスト 0 個の crate まで毎回フルビルドするので、`make` 側の scoping が効かなくなる)。
 
 ```bash
 make fetch-ffmpeg   # third_party/ffmpeg を取得 (各マシン 1 回。build/test/check の前提)
 make build          # 実行 3 exe を debug ビルド
 make run            # daw_gui をビルドして起動
-make test           # テストを持つ package のみ実行
+make test           # テストを持つ package のみ実行 (一部は daw_gui を起動する。下記)
+make test-nolaunch  # そのうち daw_gui を起動しない target だけ
 make clippy         # clippy をエラー扱いで
 make arch-lint      # アーキテクチャ不変条件の機械検査
 make license-check  # ライセンス表示の機械検査 (下記)
+make audit          # 依存の脆弱性 / 供給網攻撃の検査 (network 要)
 ```
+
+`make test` / `make run` は **daw_gui が起動中だと前提条件チェックで止まる**
+(`scripts/preflight_no_running_app.sh`)。テストの一部が daw_gui 本体を subprocess として
+起動して audio device を開くので、DAW を開いたまま回すと再生が壊れるため。
 
 現状 Windows (x86_64-pc-windows-msvc) が対象。動画デコード / エンコードは vendored な
 FFmpeg 共有ライブラリに依存する。
@@ -60,12 +67,12 @@ VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**
 | イベント | スクリプト | 何をするか |
 |---|---|---|
 | SessionStart | [`sessionstart_show_pending_reflections.sh`](.claude/hooks/sessionstart_show_pending_reflections.sh) | 前セッションが書き残した「要 triage」項目をセッション冒頭に提示し、ファイルを `.last` へ回転する |
-| PreToolUse (Edit/Write/Bash 等) | [`scripts/guard_engine.py`](scripts/guard_engine.py) | ユーザ home のルール DB (`guards.jsonl`) の正規表現をツール入力に当て、一致したら警告する。ルールの `action` が `block` のものは **そのツール呼び出しを取り消す** |
+| PreToolUse (Edit/Write/Bash 等) | [`scripts/guard_engine.py`](scripts/guard_engine.py) | リポジトリ内のルール DB [`.claude/guards.jsonl`](.claude/guards.jsonl) の正規表現をツール入力に当て、一致したら警告する。ルールの `action` が `block` のものは **そのツール呼び出しを取り消す** |
 | PreToolUse (Bash) | [`pretooluse_git_commit_review_reminder.sh`](.claude/hooks/pretooluse_git_commit_review_reminder.sh) | `git commit` の前にレビューと同件チェックの実施を促す文面を差し込む (警告のみ) |
 | PreToolUse (Bash) | [`scripts/check_destructive_delete.py`](scripts/check_destructive_delete.py) | 削除対象が変数・環境変数参照やルート相当のとき、再帰削除コマンドを **取り消す** (リテラルな部分パスの削除は通す) |
 | PostToolUse | [`scripts/log_metric.py`](scripts/log_metric.py) | ツール呼び出し 1 件につき 1 行を **ユーザ home の jsonl へ追記** (時刻 / セッション id / ツール名 / 対象の要約 / 成否) |
 | Stop | [`stop_session_reflect.sh`](.claude/hooks/stop_session_reflect.sh) | セッションの transcript から直近のやり取りを読み、修正・やり直しのパターンを検出して **抜粋つきで**次セッション用ファイルに書く |
-| Stop | [`scripts/reflect.py`](scripts/reflect.py) | 同じ警告ルールが 3 セッション以上で発火していたら `guards.jsonl` を書き換えて `warn` → `block` に自動昇格する (= 以後そのパターンはツール呼び出しごと取り消される)。Bash の連続失敗も検出して backlog に 1 行足す |
+| Stop | [`scripts/reflect.py`](scripts/reflect.py) | 同じ警告ルールが 3 セッション以上で発火していたら `warn` → `block` に自動昇格する (= 以後そのパターンはツール呼び出しごと取り消される)。**昇格はリポジトリ外の overlay (`guard_state.json`) に書き、追跡ファイルは書き換えない**。Bash の連続失敗も検出して backlog に 1 行足す |
 | WorktreeRemove | [`scripts/worktree_remove_cleanup.py`](scripts/worktree_remove_cleanup.py) | worktree 削除がファイルロックで失敗して dir が残った場合に、ロック元を落として dir を消す (下記) |
 
 有効にする前に知っておくべき挙動が 3 つある。
@@ -78,10 +85,12 @@ VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**
 一緒に落ちる。走るのは Windows で、かつ「削除に失敗して dir が実在する」ときだけ。
 
 **2. リポジトリの外に書き、プロンプトの抜粋を含む。**
-`log_metric.py` / `reflect.py` / `guard_engine.py` の書き込み先は
-`~/.claude/projects/F--dev-daw-01/` 配下 (`metrics/*.jsonl` / `guards.jsonl` /
-`guard_hits.jsonl` / `ahe_backlog.md`)。**このディレクトリ名は作者のパス由来でハードコード**
-されているので、別の場所に clone しても同じ名前の下に溜まる。
+`log_metric.py` / `reflect.py` / `guard_engine.py` の**実行時状態**の書き込み先は
+`~/.claude/projects/<チェックアウトのパス由来の名前>/` 配下 (`metrics/*.jsonl` /
+`guard_hits.jsonl` / `guard_state.json` / `ahe_backlog.md`)。ディレクトリ名は
+[`scripts/ahe_paths.py`](scripts/ahe_paths.py) が **main チェックアウトの絶対パスから導出**する
+(マシン固有パスのハードコードはしていない)。**ルール DB
+[`.claude/guards.jsonl`](.claude/guards.jsonl) はリポジトリ内**で、hook が書き換えることは無い。
 `stop_session_reflect.sh` はセッションの transcript を読み、検出したユーザ発言の抜粋を
 main チェックアウトの `.claude/.session_reflect_pending.md` に書く。
 

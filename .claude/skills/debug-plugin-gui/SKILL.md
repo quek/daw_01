@@ -23,7 +23,7 @@ plugin-main スレッド上で所有する** (`daw_plugin_host/src/editor_window
 ```
 daw_gui (UI 側)
   ↓ open_slot_gui: AllowSetForegroundWindow(ASFW_ANY)  ← 前面化許可を付与
-  ↓ MainToChild::OpenSlotGuiEmbedded { track, slot, title } ──▶
+  ↓ PluginCommand::OpenSlotGuiEmbedded { track, slot, title } ──▶
                                           daw_plugin_host (tokio recv → PluginCommand)
                                           ↓                     plugin-main std::thread
                                           ↓                     ├ gui_create_embedded
@@ -128,7 +128,8 @@ daw_gui: on_gui_geometry が窓の位置/サイズを記録 (ViewState に保存
 - `clap_host_thread_check` を実装すればプラグイン側から main-thread 検証ができる。
 
 ## デバッグ用ログ追加のコツ
-- IPC 送受信を全てログ化: `sending to plugin_host msg=...` / `received <Command>` / `<ChildToMain>`。
+- IPC 送受信を全てログ化: `sending to plugin_host msg=...` / `received <PluginCommand>` /
+  `<PluginEvent>` (protocol は宛先ごとに型が分かれている。CLAUDE.md 不変条件 3)。
 - プラグイン本体の stderr ログも見る (VCV Rack の `guiSetParent()`/`guiDestroy()` 等)。
 - foreground 周りを疑うときは B 側で `GetWindowThreadProcessId(GetForegroundWindow())` vs
   `GetCurrentProcessId()` をログして「どのプロセスが foreground か」を確認。

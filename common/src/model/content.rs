@@ -631,8 +631,10 @@ pub struct AudioSource {
 /// reserved for the unsaved-project import-cache fallback (and a
 /// future "link to external sample" mode). `Generated` is used by
 /// VOICEVOX and other in-memory synthesised audio with no file on
-/// disk; the `id` is the same one carried by
-/// `MainToChild::SetGeneratedAudio`.
+/// disk; the `id` is the `ContentId` the renderer keys the generated
+/// buffer by. (It used to be carried over IPC as
+/// `MainToChild::SetGeneratedAudio`; both that enum and that wire
+/// route are gone — see `daw_audio/src/audio_clip_renderer.rs`.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum AudioSourcePath {
     ProjectRelative(PathBuf),

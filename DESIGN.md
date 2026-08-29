@@ -198,7 +198,9 @@ Song ─ tracks: Vec<Track> ─ devices: Vec<PluginInstance>   (id: u64 安定)
 
 - **Clip ベースのタイムライン** (Pattern 不採用): VOICEVOX のアウフタクト・フレーズ
   単位合成と自然にマップする。`start_beat` は f64・負値可。
-- 永続化: `.daw` JSON (serde) アトミック書き込み、`CURRENT_VERSION` = 30。
+- 永続化: `.daw` JSON (serde) アトミック書き込み。現在の版は
+  `common/src/model.rs` の `CURRENT_VERSION` が SSoT (**ここに数値を書き写さない** —
+  書き写した数値は静かに古くなる。`common/src/model/tests.rs` が実値を assert している)。
   旧版は deserialize 専用 legacy field + `ensure_ids` (採番 + positional → id 写像) +
   JSON 前処理 migration で forward-load する。blob (plugin state / ARA archive) は
   ドキュメントには base64 で残る (wire にだけ載らない)。
@@ -215,7 +217,9 @@ device が gate する。歌唱 wav 先頭の leading rest 分は配置側で補
 
 ## 検証
 
-- `make test` (テスト保有 package のみ) / `make clippy` / `make check`
+- `make test` (テスト保有 package のみ。**一部の target が daw_gui 本体を subprocess 起動して
+  audio device を開く** ので、DAW を開いたまま回さない。`scripts/preflight_no_running_app.sh` が
+  止める。起動を伴わない範囲だけなら `make test-nolaunch`) / `make clippy` / `make check`
 - **`make arch-lint`**: アーキテクチャ不変条件 (CLAUDE.md 参照) の機械検査
 - `daw_gui --smoke-test <fixture.mp4>`: video preview の visual regression
   (build/test/clippy をすり抜ける描画破壊を pixel capture で検出)

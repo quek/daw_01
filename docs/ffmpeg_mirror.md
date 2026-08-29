@@ -167,7 +167,32 @@ GPL-3.0 §6(d) は「**object code の隣に**、対応するソースの在処�
 - DLL は**絶対にリネームしない**。利用者が同じ ABI の自前ビルドに差し替えられること
   (LGPL-3.0 §4(d)(1)) が壊れる。
 
-## 6. 既知の限界
+## 6. worktree と third_party — junction を辿る削除で本体が消える
+
+`third_party/ffmpeg` は gitignore なので **git から復元できない**。ここに reparse point
+(junction / symlink) を張ったまま worktree を削除すると、削除処理が junction を辿って
+**main checkout 側の実体を消す**。
+
+**2026-06-14 に実際に起きた。** worktree の削除が内部の `third_party` junction を辿り、
+main checkout の `third_party/ffmpeg` ごと消えた。git に無いので `git checkout` では戻らず、
+`make fetch-ffmpeg` で取り直して復旧した。
+
+現在の構成ではこのハザードは無い:
+
+- Claude Code の worktree (`--worktree` / EnterWorktree / subagent) は、リポジトリ直下の
+  `.worktreeinclude` (`/third_party/`) により main checkout から **実コピー**される。
+  reparse point ではないので、消しても main 側には影響しない。よって Claude が作る worktree で
+  `make fetch-ffmpeg` は不要 (ただし **main checkout 自身が未取得なら先に取っておく** —
+  `.worktreeinclude` は「main にある物を持ち込む」だけ)。
+- 手動 `git worktree add` で作った worktree はこの経路を通らない。従来どおり
+  `make fetch-ffmpeg` で取得すること。
+- それでも手で junction を張ったら、**worktree を消す前に内部の reparse point を
+  `cmd //c rmdir <junction>` で外す**。削除ツールは reparse point 属性でスキャンしてから消す
+  (memory: `feedback_junction_safe_removal`)。
+
+参考: <https://code.claude.com/docs/en/worktrees>
+
+## 7. 既知の限界
 
 - BtbN のビルドイメージは `FROM ubuntu:26.04` + `apt-get dist-upgrade` で、ツールチェーンの
   版が固定されていない。**同梱ライブラリの版はレシピ commit で確定する**が、

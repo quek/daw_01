@@ -485,3 +485,38 @@ command / notify の drain はここでやらない: `CloseSlotGui` / `HostNotif
 - **プラグインが view を owned popup へ逃がす挙動そのもの** (Redux の内部 Editor)。同期
   resize で必要性は消えるはずだが、プラグイン側の実装次第で残る可能性がある。残る場合、
   コンテナが空になったことを検出して窓を隠す / 追従する等の対処が要るかを実機で見てから決める。
+
+## 9. CLAP GUI 仕様の落とし穴
+
+CLAP `clap_plugin_gui` を叩く側 (`daw_plugin_host`) が踏んだ実測。いずれも**仕様書だけ読んで
+書くと踏む**もので、根拠は VCV Rack をはじめとする実プラグインでの挙動。
+
+### 9-1. 初回 open で `set_size` を呼ばない
+
+`clap_plugin_gui.set_size` は **「前回セッションで保存したサイズを復元する」ための呼び出し**で
+あって、「これから開く窓の大きさを教える」ものではない。初回 open では呼ばず、`get_size` の
+戻り値をコンテナ側 (エディタ窓) に反映するだけにする。
+
+初回に `set_size` を投げると、VCV Rack のように「まだ view を構築していないのにサイズを
+指定された」と解釈して **後続の `gui.show` を拒否する**プラグインがある。
+
+### 9-2. `gui.show` が `false` を返しても即 destroy しない
+
+`create` + `set_parent` が成功していれば、`show` が `false` を返しても GUI は実際に動いて
+いるケースがある (VCV Rack で実測)。`show` の戻り値だけを見て `destroy` へ進むと、**動いて
+いる GUI を自分で壊す**。ログ警告に留めて生かす。
+
+### 9-3. `set_parent` と `show` の間にポンプを 1 回回す
+
+`set_parent` の中でプラグインが自分自身へ `PostMessage` して初期化を続ける実装がある。
+`set_parent` → `show` を隙間なく呼ぶと、その初期化メッセージが処理されないまま `show` に入って
+失敗する。間に `PeekMessage` + `DispatchMessageW` を 1 回挟むと通るケースがある。
+
+plugin-main スレッド (= 窓を作ったスレッド = `GetMessageW` ポンプを回しているスレッド) で
+呼ぶこと。別スレッドで回してもそのプラグインのキューは進まない。
+
+### 9-4. `clap_host_gui` の `host_data` はホスト側ポインタの置き場
+
+ホストが渡す `clap_host_gui` の callback は `extern "C" fn` なので Rust の状態を直接掴めない。
+`host_data` に `&mut Host` のポインタを仕込み、callback 内で復元する。`Box<Host>` は heap に
+固定されるのでポインタが安定する (スタック上の値のアドレスを渡さないこと)。

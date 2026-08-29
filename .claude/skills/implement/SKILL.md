@@ -135,15 +135,18 @@ $ARGUMENTS を実装する。
   (`feedback_plain_language_questions` / `feedback_numbered_question_options` / `feedback_one_question_at_a_time`)。
 - 大きめプランは `docs/plan_<feature>.md` に最終形を書く (`feedback_plan_location`)。
 
-#### gui_01 (daw-ui) widget の拡張が要るとき
+#### daw-ui (旧 gui_01) の widget 拡張が要るとき
 
-interim な自前 widget を作る前に、**まず `docs/gui_01_conversation.md` に要望を出す**
-(`feedback_gui_01_conversation` / `feedback_gui_01_request_before_interim`)。
-- 最終的にこう使いたい完成形を全部書く。v1/v2 の段階分割をしない (`feedback_gui_01_scope_review`)。
-- `関連仕様: docs/plan_<feature>.md` を必ず添える (`feedback_gui_01_link_plan_ref`)。
-- landing を待つ間も **gui_01 非依存の backend は全部進める** (`feedback_progress_while_waiting_gui01`)。
-  widget が landing したら呼び出し側を wire (parked)。
-- 「値 X を公開して」の前に daw_01 が既に mirror/算出してないか grep (`feedback_verify_gui01_need_before_request`)。
+**`ui/` は同一 workspace なので、同じセッションで直接編集する** (`project_gui01_integrated` —
+旧 sibling repo 時代の `docs/gui_01_conversation.md` 経由の往復と待ち合わせは廃止済み。
+あのファイルは歴史的記録)。
+- daw_gui 側に interim な自前 widget を作らず、**ライブラリ側を直す**。利用者全員が同じ
+  boilerplate を書く状況は設計欠陥のシグナル (`ui/CLAUDE.md`「使う側に boilerplate を強要しない」)。
+- 変更は最終形を一度に入れる。v1/v2 の段階分割をしない (`feedback_gui_01_scope_review`)。
+  breaking change を入れたら全 example / test / docs を **1 commit で一括更新**する。
+- 「値 X を公開する」前に、daw_01 側が既に mirror / 算出していないか grep する (SSoT)。
+- daw-ui core に **DAW 固有のドメイン知識を持ち込まない** (CLAUDE.md 不変条件 8)。
+  arrangement / piano_roll は `daw_gui/src/widgets/` で `common::model` 直結。
 
 ### 4. 統合テストの作成
 
@@ -210,10 +213,15 @@ fn lfo_は_beat_の純粋関数で各シェイプの値を返す() {
 #### テスト失敗の確認
 
 ```bash
-make test
+make test-nolaunch          # 起動を伴う target を除いた全テスト
+cargo test -p <crate> --test <name>   # 対象が 1 crate に閉じているならこちらまで絞る
 ```
 
 - コンパイルが通る / 新規テストがアサーション失敗で落ちる (意味のある検証の証拠) / 既存テストは壊れていない
+- **素の `make test` は使わない**。`daw_gui/tests/` の一部が daw_gui 本体を `--script` で
+  subprocess 起動して audio device を開き、ユーザーが開いているプロジェクトの再生を壊す
+  (`feedback_cargo_tests_launches_app`)。起動を伴う target まで回す必要があるときは
+  **ユーザーの許可を得てから** `DAW01_ALLOW_LAUNCH=1 make test`。
 
 ### 5. 実装
 
@@ -263,8 +271,9 @@ make test
 ### 6. 全テスト通過 + 実機ビルドの確認
 
 ```bash
-make test
+make test-nolaunch   # 素の make test は daw_gui を起動する (上記)
 make clippy
+make arch-lint       # 新規違反ゼロ (exit 0 = 違反ゼロ or baseline 済みのみ)
 ```
 
 **実機検証前の再ビルド (必須)**: clippy/check/test は実行 exe を生成しない (or test exe のみ)。
@@ -312,15 +321,13 @@ NG: 新機能追加 (次サイクル)。リファクタ後も全テスト通過�
 承認を得たら:
 
 ```bash
-make test
+make test-nolaunch
 make clippy
 git add <変更ファイルを全列挙>        # -A / . / ディレクトリ指定は不可 (feedback_git_add_one_file)
 git commit -m "<日本語メッセージ>"
 ```
 
 - コミットメッセージは日本語。テストと実装を 1 コミットにまとめる。警告を残さない
-- コマンドを `&&`/`;` で連結しない (`feedback_no_command_chaining`)。作業ディレクトリに `cd`/`--manifest-path`
-  を付けない (`feedback_no_cd_prefix`)
 - commit を細かく割りすぎない (`feedback_dont_split_commits_too_finely`)
 
 ## テストが間違っていると気づいた場合

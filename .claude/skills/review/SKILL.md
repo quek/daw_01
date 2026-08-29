@@ -84,8 +84,13 @@ UI スレッド (gui_01 の `UiHost::frame` / view の build closure / heavy() �
 - **Mid**: パフォーマンス、整合性
 - **Low**: 軽微な重複、命名
 
-修正後の確認は **`make clippy` と `make test` だけ**。各 1 回。
+修正後の確認は **`make clippy` / `make test-nolaunch` / `make arch-lint` の 3 つだけ**。各 1 回
+(arch-lint は上の §5 で見た不変条件チェックと同じ 1 回。二重に回さない)。
 
+- **`make test` ではなく `make test-nolaunch`**。素の `make test` は daw_gui 本体を subprocess
+  起動する target を含み、ユーザーが開いているプロジェクトの再生を壊す
+  (`feedback_cargo_tests_launches_app`)。起動を伴う target まで要るなら**許可を得てから**
+  `DAW01_ALLOW_LAUNCH=1 make test`。
 - **release ビルドは回さない**。opt-level / LTO が違うだけで、debug の clippy が
   通っていて新たに出るコンパイルエラーは実質無い。thin LTO の全ビルドは数分〜
   十数分かかり、その間 review が止まるだけ。
