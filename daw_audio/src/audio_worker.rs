@@ -110,6 +110,13 @@ pub struct DispatchShared {
     /// playhead を f64 bits で atomic 配信。 workers が
     /// `f64::from_bits(load())` で復元、 `collect_events_for_buffer` に渡す。
     pub playhead_beats_bits: std::sync::atomic::AtomicU64,
+    /// r.md #87 (クリップランチャー): 行ごとの時間軸の供給元テーブルへの ptr。
+    ///
+    /// **ポインタ 1 本で 1 スナップショット**として渡す (`loop_region_ptr` と
+    /// 同じ idiom) — 行の状態をバラの atomic に割ると、worker が「切り替え前の
+    /// 供給元」と「切り替え後の frame」のような食い違った組を読みうる。
+    /// null = テーブルなし (= 全行アレンジ、従来の挙動)。
+    pub row_sources_ptr: AtomicPtr<crate::launcher::RowSourceTable>,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -141,6 +148,7 @@ impl DispatchShared {
             playhead_beats_bits: std::sync::atomic::AtomicU64::new(
                 0.0_f64.to_bits(),
             ),
+            row_sources_ptr: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -253,6 +261,7 @@ impl AudioWorkerPool {
         playhead_beats: f64,
         loop_region: &common::model::LoopRegion,
         mod_scalars: &[f32],
+        rows: &crate::launcher::RowSourceTable,
     ) {
         // plan §4: stalled pool は二度と dispatch しない (worker thread の
         // 生死が不明なため)。 無音のまま CPAL callback は回り続ける。
@@ -297,6 +306,10 @@ impl AudioWorkerPool {
             .store(if any_solo { 1 } else { 0 }, Ordering::Release);
         self.shared.loop_region_ptr.store(
             loop_region as *const _ as *mut _,
+            Ordering::Release,
+        );
+        self.shared.row_sources_ptr.store(
+            rows as *const _ as *mut _,
             Ordering::Release,
         );
         self.shared.recording_lanes_ptr.store(
@@ -543,6 +556,16 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         // via `dispatch_and_wait`'s `&LoopRegion` borrow.
         unsafe { *loop_region_ptr }
     };
+    // r.md #87: 行ごとの時間軸の供給元。null なら全行アレンジ (従来の挙動)。
+    let row_sources_ptr = shared.row_sources_ptr.load(Ordering::Acquire);
+    let empty_rows = crate::launcher::RowSourceTable::default();
+    let rows: &crate::launcher::RowSourceTable = if row_sources_ptr.is_null() {
+        &empty_rows
+    } else {
+        // SAFETY: master holds the table (`LocalState::launcher`) alive for the
+        // dispatch window via `dispatch_and_wait`'s `&RowSourceTable` borrow.
+        unsafe { &*row_sources_ptr }
+    };
 
     if scratch_base.is_null() || plugin_refs_ptr.is_null() || slots_base.is_null() {
         return;
@@ -617,6 +640,7 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
             playhead_beats,
             loop_region,
             mod_scalars,
+            rows.track_rows(track_idx as usize),
         );
     }
 }

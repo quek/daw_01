@@ -29,9 +29,11 @@ mod automation;
 mod engine;
 mod export;
 mod graph;
+mod launcher;
 mod metronome;
 mod mixer;
 mod sequencer;
+mod song_values;
 mod stretch_engine;
 
 use engine::{
@@ -1232,91 +1234,32 @@ async fn recv_loop(
                 hold_released_entry_for_test(removed);
                 tracing::info!(device_id, "plugin shmem dropped");
             }
-            // Phase 6 review (SSOT fix): `track` field は Track::id (stable)。
-            // 値のみの更新 — schedule は再 compile されない (§5 D)。
-            Ok(AudioCommand::SetTrackVolume { track, volume }) => {
+            // 値のみの Song 更新 (mixer strip / send / arm / bpm / 拍子)。
+            // 宛先は安定 id、クランプと適用は `song_values::apply` が SSoT。
+            // schedule は再 compile しない (§5 D) — RT は snapshot を live-read する。
+            Ok(cmd @ (AudioCommand::SetTrackVolume { .. }
+                | AudioCommand::SetTrackPan { .. }
+                | AudioCommand::SetTrackMuted { .. }
+                | AudioCommand::SetTrackSolo { .. }
+                | AudioCommand::SetTrackArmed { .. }
+                | AudioCommand::SetSendGain { .. }
+                | AudioCommand::SetSendEnabled { .. }
+                | AudioCommand::SetSongBpm { .. }
+                | AudioCommand::SetSongTimeSigNumerator { .. })) => {
                 update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
-                        // +6 dB (amp 2.0) まで許可 (r.md #11、 GUI clamp と同 SSoT)。
-                        t.volume = volume.clamp(0.0, common::model::MAX_TRACK_GAIN);
-                    }
+                    song_values::apply(&cmd, s);
                 });
             }
-            Ok(AudioCommand::SetTrackPan { track, pan }) => {
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
-                        t.pan = pan.clamp(-1.0, 1.0);
-                    }
-                });
-            }
-            Ok(AudioCommand::SetTrackMuted { track, muted }) => {
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
-                        t.muted = muted;
-                    }
-                });
-            }
-            Ok(AudioCommand::SetTrackSolo { track, solo }) => {
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
-                        t.solo = solo;
-                    }
-                });
-            }
-            Ok(AudioCommand::SetSendGain {
-                track,
-                send_id,
-                gain,
-            }) => {
-                // Realtime aux-send level. v29: send は stable `Send::id` で
-                // アドレス。 MixSend op が live に再読するので schedule 再
-                // compile は不要 (§5 D)。
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
-                        && let Some(send) = t.sends.iter_mut().find(|sd| sd.id == send_id)
-                    {
-                        // track/master と同じ +6dB 上限を共有 (r.md #11 sibling)。
-                        send.gain = gain.clamp(0.0, common::model::MAX_TRACK_GAIN);
-                    }
-                });
-            }
-            Ok(AudioCommand::SetSendEnabled {
-                track,
-                send_id,
-                enabled,
-            }) => {
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
-                        && let Some(send) = t.sends.iter_mut().find(|sd| sd.id == send_id)
-                    {
-                        send.enabled = enabled;
-                    }
-                });
-            }
-            Ok(AudioCommand::SetTrackArmed { track, armed }) => {
-                // Phase 7 B4 (2026-05-13): track.armed を Song に反映するのみ。
-                // 録音書き込み自体は GUI process で行うため audio thread 側
-                // は schema 一貫性のために値を持つだけ。
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
-                        t.armed = armed;
-                    }
-                });
-            }
-            Ok(AudioCommand::SetSongBpm { bpm }) => {
-                // BPM 軽量更新 (transport scrub 中に毎 frame 流れうる)。 値のみ
-                // — schedule は再 compile しない。 tempo map は bundle 側で
-                // 常に再構築される (安価) ので seek/loop 逆算も追従する。
-                let clamped = bpm.clamp(1.0, 400.0);
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    s.bpm = clamped;
-                });
-            }
-            Ok(AudioCommand::SetSongTimeSigNumerator { num }) => {
-                let clamped = num.clamp(1, 32);
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
-                    s.time_sig.0 = clamped;
-                });
+            // r.md #87: クリップランチャーの操作。発火の判断には Song が要るので
+            // ここでは audio thread へ積むだけ (`launcher::ipc` が唯一の口)。
+            Ok(cmd @ (AudioCommand::LaunchCell { .. }
+                | AudioCommand::LaunchScene { .. }
+                | AudioCommand::StopRow { .. }
+                | AudioCommand::StopAllRows
+                | AudioCommand::SwitchRowToArranger { .. }
+                | AudioCommand::SwitchAllToArranger
+                | AudioCommand::SetGlobalLaunchQuantize(_))) => {
+                launcher::ipc::dispatch(cmd, &engine_shared, &cmd_tx);
             }
             Ok(AudioCommand::StartRecording { preroll_samples }) => {
                 // r.md #51: 録音セッションの開始。 `recording_requested` は

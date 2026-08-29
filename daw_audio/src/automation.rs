@@ -11,11 +11,12 @@
 
 #![allow(dead_code)]
 
-use common::automation::{
-    apply_modulation_with_scalars, lane_value_at, modulation_offset_norm_with_scalars,
-};
+use common::automation::{apply_modulation_with_scalars, modulation_offset_norm_with_scalars};
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
+
+use crate::launcher::TrackRows;
+use crate::launcher::render::{lane_value, phase_at_frame};
 
 /// Fill `volume_per_sample` / `pan_per_sample` (each at least `frames`
 /// long, but typically `MAX_FRAMES`) for the given track and buffer.
@@ -40,6 +41,10 @@ use common::process_data::ProcessData;
 pub fn fill_track_param_ramps(
     song: Option<&Song>,
     track_idx: u32,
+    // r.md #87: この track の行 (トラック行 + レーン行) の供給元。レーン行が
+    // ランチャー主導ならそのセルのカーブを、停止していれば `lane.default_value` を
+    // 出す (Q11)。空 (`TrackRows::default()`) なら全部アレンジ = 従来の挙動。
+    rows: TrackRows<'_>,
     sample_rate: u32,
     // M5 (r.md #8 再監査): automation lookup beat は transport の積分済
     // `playhead_beats` を anchor に、 buffer 内は `current_bpm` で advance する
@@ -91,7 +96,7 @@ pub fn fill_track_param_ramps(
     // ままで正しいので per-sample ループを丸ごと skip (= 無回帰)。
     let fill_builtin = |target: AutomationTarget, buf: &mut [f32], track_const: f32| {
         // 当該 target を駆動する lane (enabled + 非 recording)。
-        let lane = track.automation_lanes.iter().find(|l| {
+        let lane = track.automation_lanes.iter().enumerate().find(|(_, l)| {
             l.enabled
                 && l.target == target
                 && !recording_lanes
@@ -103,10 +108,16 @@ pub fn fill_track_param_ramps(
             // constant fill (上で書いた track.volume / track.pan) がそのまま正しい。
             return;
         }
+        // r.md #87: このレーン行の供給元。`switch_frame` を跨ぐと途中で変わる。
+        let src = lane.map(|(li, _)| rows.lane(li)).unwrap_or_default();
         for (i, slot) in buf.iter_mut().enumerate().take(frames) {
             let beat = playhead_beats + i as f64 * beats_per_frame;
             let base = match lane {
-                Some(l) => lane_value_at(l, &song.clip_contents, beat),
+                #[allow(clippy::cast_possible_truncation)]
+                Some((_, l)) => {
+                    let phase = phase_at_frame(src, i as u32);
+                    lane_value(l, &song.clip_contents, phase, beat)
+                }
                 None => f64::from(track_const),
             };
             *slot =
@@ -146,6 +157,9 @@ pub fn fill_pd_param_events(
     pd: &mut ProcessData,
     song: &Song,
     track_id: u32,
+    // r.md #87: この track の行の供給元 (master fx は行を持たないので
+    // `TrackRows::default()` = 全部アレンジ)。
+    rows: TrackRows<'_>,
     device_id: u64,
     sample_rate: u32,
     // M5 (r.md #8 再監査): transport の積分済 `playhead_beats` を anchor に
@@ -182,7 +196,7 @@ pub fn fill_pd_param_events(
     if beats_per_frame <= 0.0 {
         return;
     }
-    for lane in lanes {
+    for (lane_idx, lane) in lanes.iter().enumerate() {
         if !lane.enabled {
             continue;
         }
@@ -217,11 +231,13 @@ pub fn fill_pd_param_events(
         // 静的セグメントは値不変なので 1 event に縮退 (events_in=256 を無駄に食わない)。
         // push_param は満杯時 drop のみ (panic なし) なので RT 安全。
         const SUB_FRAMES: u32 = 64;
+        // r.md #87: このレーン行の供給元 (ランチャー主導ならセルのカーブ)。
+        let src = rows.lane(lane_idx);
         let mut f = 0u32;
         let mut last_v = f64::NAN;
         loop {
             let beat_at_f = playhead_beats + f64::from(f) * beats_per_frame;
-            let v = lane_value_at(lane, &song.clip_contents, beat_at_f);
+            let v = lane_value(lane, &song.clip_contents, phase_at_frame(src, f), beat_at_f);
             if last_v.is_nan() || (v - last_v).abs() > 1e-6 {
                 pd.push_param(f, param_id, v);
                 last_v = v;
@@ -257,6 +273,64 @@ pub fn fill_pd_param_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用の薄いラッパ: 全行アレンジ (= ランチャー無し) で従来の経路を通す。
+    /// ランチャー行の評価は `crate::launcher::render` 側でテストする。
+    #[allow(clippy::too_many_arguments)]
+    fn ramps(
+        song: Option<&Song>,
+        track_idx: u32,
+        sample_rate: u32,
+        current_bpm: f64,
+        playhead_beats: f64,
+        frames: u32,
+        volume_per_sample: &mut [f32],
+        pan_per_sample: &mut [f32],
+        recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+        mod_scalars: &[f32],
+    ) {
+        fill_track_param_ramps(
+            song,
+            track_idx,
+            TrackRows::default(),
+            sample_rate,
+            current_bpm,
+            playhead_beats,
+            frames,
+            volume_per_sample,
+            pan_per_sample,
+            recording_lanes,
+            mod_scalars,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pd_params(
+        pd: &mut ProcessData,
+        song: &Song,
+        track_id: u32,
+        device_id: u64,
+        sample_rate: u32,
+        current_bpm: f64,
+        playhead_beats: f64,
+        frames: u32,
+        recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+        mod_scalars: &[f32],
+    ) {
+        fill_pd_param_events(
+            pd,
+            song,
+            track_id,
+            TrackRows::default(),
+            device_id,
+            sample_rate,
+            current_bpm,
+            playhead_beats,
+            frames,
+            recording_lanes,
+            mod_scalars,
+        );
+    }
     use common::model::{
         AutomationClip, AutomationContent, AutomationCurve, AutomationLane,
         AutomationPoint, ClipContent, Song, Track,
@@ -342,7 +416,7 @@ mod tests {
         let mut vol = vec![0.0_f32; 8];
         let mut pan = vec![0.5_f32; 8];
         let empty = empty_recording_lanes();
-        fill_track_param_ramps(None, 0, SR, 120.0, 0.0, 8, &mut vol, &mut pan, &empty, &[]);
+        ramps(None, 0, SR, 120.0, 0.0, 8, &mut vol, &mut pan, &empty, &[]);
         assert!(vol.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert!(pan.iter().all(|&p| p.abs() < 1e-6));
     }
@@ -362,7 +436,7 @@ mod tests {
         let mut vol = vec![0.0_f32; 16];
         let mut pan = vec![0.0_f32; 16];
         let empty = empty_recording_lanes();
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -387,7 +461,7 @@ mod tests {
         // Buffer of 16 samples starting at playhead 0 → first 16 samples
         // out of 24000 samples-per-beat × 4 = 96000 total. Volume should
         // ramp from 0.0 toward ~16/96000 ≈ 0.000167.
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -413,7 +487,7 @@ mod tests {
         let empty = empty_recording_lanes();
         // Beat 2.0 = 48000 samples in. Curve linear 0→1 over beats 0..4
         // → value 0.5 at beat 2.
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -438,7 +512,7 @@ mod tests {
         let mut vol = vec![0.0_f32; 4];
         let mut pan = vec![0.0_f32; 4];
         let empty = empty_recording_lanes();
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -467,7 +541,7 @@ mod tests {
         let mut vol = vec![0.0_f32; 4];
         let mut pan = vec![0.0_f32; 4];
         let empty = empty_recording_lanes();
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -504,7 +578,7 @@ mod tests {
         ));
         // Beat 2.0 の curve eval は 0.5 だが、 recording bypass で track.volume
         // (= 0.9) がそのまま残る。
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -536,7 +610,7 @@ mod tests {
         let mut pan = vec![0.0_f32; 4];
         let empty = empty_recording_lanes();
         // Beat 2.0 の curve eval は 0.5、 bypass されないので vol[i] = 0.5。
-        fill_track_param_ramps(
+        ramps(
             Some(&song),
             0,
             SR,
@@ -618,7 +692,7 @@ mod tests {
         let song = one_plugin_param_lane_song();
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, 7, DEVICE_ID, SR, 120.0, 0.0, 512, &empty, &[]);
+        pd_params(&mut pd, &song, 7, DEVICE_ID, SR, 120.0, 0.0, 512, &empty, &[]);
         assert!(
             pd.n_events_in > 1,
             "ramp は sub-buffer で複数 event を出すべき, got {}",
@@ -655,7 +729,7 @@ mod tests {
         // Not recording: the curve value is pushed as a ParamValue event (read).
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, track_id, DEVICE_ID, SR, 120.0, 0.0, 64, &empty, &[]);
+        pd_params(&mut pd, &song, track_id, DEVICE_ID, SR, 120.0, 0.0, 64, &empty, &[]);
         assert_eq!(pd.n_events_in, 1, "read mode must push the curve value");
 
         // Recording: the lane is skipped, so no curve event overwrites the
@@ -663,13 +737,13 @@ mod tests {
         let mut pd2 = ProcessData::empty();
         let mut rec = std::collections::HashSet::new();
         rec.insert((track_id, target));
-        fill_pd_param_events(&mut pd2, &song, track_id, DEVICE_ID, SR, 120.0, 0.0, 64, &rec, &[]);
+        pd_params(&mut pd2, &song, track_id, DEVICE_ID, SR, 120.0, 0.0, 64, &rec, &[]);
         assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
     }
 
     /// r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam automation は
     /// track ではなく `song_lanes` から引く。 track を 1 つも持たない song の
-    /// song_lanes に置いた PluginParam lane が `fill_pd_param_events(MASTER_TRACK_ID,
+    /// song_lanes に置いた PluginParam lane が `pd_params(MASTER_TRACK_ID,
     /// device_id)` で適用されること (= master fx 自動化) を検証。
     #[test]
     fn fill_pd_param_events_master_fx_reads_song_lanes() {
@@ -717,7 +791,7 @@ mod tests {
         // MASTER_TRACK_ID の track は存在しない → song_lanes 経由で解決するはず。
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(
+        pd_params(
             &mut pd,
             &song,
             common::model::MASTER_TRACK_ID,
@@ -738,7 +812,7 @@ mod tests {
         );
         // 別 device_id (別 master fx) には適用されない。
         let mut pd2 = ProcessData::empty();
-        fill_pd_param_events(
+        pd_params(
             &mut pd2,
             &song,
             common::model::MASTER_TRACK_ID,

@@ -384,6 +384,41 @@ pub enum AudioCommand {
     /// 用意しない — 「返事を書けた」と「デバイスを解放し終えた」は別の事実で、
     /// 親が欲しいのは後者だけだから (親は `Child::try_wait` で観測する)。
     ///
+    /// r.md #87 (クリップランチャー): セルを 1 つ撃つ / 離す。
+    ///
+    /// 宛先は安定 id — `track_id` = [`Track::id`](crate::model::Track)、
+    /// `lane_id` = オートメーションレーン行なら [`AutomationLane::id`](crate::model::AutomationLane)、
+    /// **トラック行なら `0`** (レーン行とトラック行を 1 本の「行」で表す唯一の区別)。
+    /// `clip_id` は撃つセルの `clip.id` (列 = `scene_id` はセル側が持つので運ばない)。
+    ///
+    /// `pressed` で押下 / 離しを運ぶ。engine が
+    /// [`LaunchMode`](crate::model::LaunchMode) 4 種 (Trigger / Gate / Toggle / Repeat) を
+    /// 解釈するので、GUI は「押した」「離した」という事実だけを送る。
+    LaunchCell {
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        pressed: bool,
+    },
+    /// r.md #87: 列 ([`Scene::id`](crate::model::Scene)) をまとめて撃つ / 離す。
+    /// その列にセルを持たない行は **停止**する (Q11、空セル = 停止)。
+    LaunchScene { scene_id: u32, pressed: bool },
+    /// r.md #87: 1 行を止める (Stop Clips)。アレンジへは戻さない —
+    /// ランチャーが主導権を握ったまま無音になる
+    /// ([`RowPlayback::LauncherStopped`](crate::model::RowPlayback))。
+    StopRow { track_id: u32, lane_id: u32 },
+    /// r.md #87: 全行を止める (グローバル Stop Clips)。
+    StopAllRows,
+    /// r.md #87: 1 行の主導権をアレンジへ返す
+    /// ([`RowPlayback::Arranger`](crate::model::RowPlayback))。
+    SwitchRowToArranger { track_id: u32, lane_id: u32 },
+    /// r.md #87: 全行の主導権をアレンジへ返す。
+    SwitchAllToArranger,
+    /// r.md #87: グローバルローンチ量子化 (= セルの
+    /// [`LaunchQuantize::Global`](crate::model::LaunchQuantize) が解決される先)。
+    /// 既定は [`DEFAULT_GLOBAL_LAUNCH_QUANTIZE`](crate::model::DEFAULT_GLOBAL_LAUNCH_QUANTIZE)
+    /// (= 1 小節)。`Global` を送っても既定に倒れる (自己参照は解決できない)。
+    SetGlobalLaunchQuantize(crate::model::LaunchQuantize),
     /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流するので、
     /// 「終わり方」の実装は 1 つしかない。
     Shutdown,

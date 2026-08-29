@@ -16,6 +16,7 @@ mod compile;
 mod delay_line;
 pub mod execute;
 mod follower;
+mod mix;
 mod port_buffer;
 mod schedule;
 

@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use common::model::{Note, Song};
+use common::model::{Clip, Note, Song};
 use common::process_data::MAX_EVENTS;
 
 /// `active_notes` の RT-safe な上限。 push 前にこの値でクランプして
@@ -94,14 +94,21 @@ impl PerTrackState {
 ///
 /// RT-safe: pushes into the caller-provided `out` (pre-allocated capacity)
 /// and uses `sort_unstable_by_key` (in-place pdqsort).
+/// r.md #87 (クリップランチャー): `clips` が **イベント源**、`time_offset` が
+/// **buffer 内の書き出し位置**。アレンジ行は `&track.clips` と `0` を渡す
+/// (従来と完全に同じ挙動)。ランチャー行は「セル 1 つのスライス」と、
+/// ループ端で割った区間の開始 frame を渡す。`playhead_beats` はその区間の実効拍。
+/// 割り方は `crate::launcher::render` が唯一の口 (ここには分岐を持ち込まない)。
 #[allow(clippy::too_many_arguments)]
 pub fn collect_events_for_buffer(
     song: Option<&Song>,
     track_idx: u32,
+    clips: &[Clip],
     sample_rate: u32,
     playhead_beats: f64,
     current_bpm: f32,
     frames: u32,
+    time_offset: u32,
     out: &mut Vec<TimedNoteEvent>,
     active_notes: &mut Vec<u8>,
 ) {
@@ -124,7 +131,7 @@ pub fn collect_events_for_buffer(
     // **同じ関数**で同じ値を flush するので、clip の追加 / 削除 / 並べ替え / muted で
     // 番号がずれない (旧「track 内通し index」の欠陥、アーキ不変条件 1)。
     // 通し番号の bookkeeping はもう要らない (どの clip を skip しても影響しない)。
-    for clip in &track.clips {
+    for clip in clips {
         // v6 linked clip: notes は Song.clip_contents から取り出す。
         // 共有 clip 群は同じ content から同じ notes を見るので、 別々の
         // 配置位置 (clip.start_beat) で同じ内容が再生される。
@@ -191,7 +198,7 @@ pub fn collect_events_for_buffer(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss
                 )]
-                let time = time_samples as u32;
+                let time = time_samples as u32 + time_offset;
                 out.push(TimedNoteEvent {
                     time,
                     event: NoteTransition::On {
@@ -219,7 +226,7 @@ pub fn collect_events_for_buffer(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss
                 )]
-                let time = time_samples as u32;
+                let time = time_samples as u32 + time_offset;
                 out.push(TimedNoteEvent {
                     time,
                     event: NoteTransition::Off {
@@ -243,7 +250,7 @@ pub fn collect_events_for_buffer(
     // note_id (= `sing_note_id`、`[0, TALK_EVENT_ID_BASE)`) と event_id (= high band) は
     // 衝突しない。
     if track.is_voicevox_vocal() {
-        for clip in &track.clips {
+        for clip in clips {
             // muted な Text(読み上げ) clip は talk note_on を発火しない。
             if clip.muted {
                 continue;
@@ -274,7 +281,7 @@ pub fn collect_events_for_buffer(
                     let time_samples =
                         ((on_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let time = time_samples as u32;
+                    let time = time_samples as u32 + time_offset;
                     out.push(TimedNoteEvent {
                         time,
                         event: NoteTransition::On {
@@ -306,7 +313,39 @@ pub fn collect_events_for_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, ClipContent, MidiContent, Track};
+    use common::model::{ClipContent, MidiContent, Track};
+
+    /// テスト用の薄いラッパ: アレンジ行 (= その track の `clips` 全部) を
+    /// buffer 先頭から集める (`clips` = 源、`time_offset` = 0)。
+    /// ランチャー行の分割は `crate::launcher::render` 側でテストする。
+    #[allow(clippy::too_many_arguments)]
+    fn collect(
+        song: Option<&Song>,
+        track_idx: u32,
+        sample_rate: u32,
+        playhead_beats: f64,
+        current_bpm: f32,
+        frames: u32,
+        out: &mut Vec<TimedNoteEvent>,
+        active_notes: &mut Vec<u8>,
+    ) {
+        let empty: &[Clip] = &[];
+        let clips = song
+            .and_then(|s| s.tracks.get(track_idx as usize))
+            .map_or(empty, |t| t.clips.as_slice());
+        collect_events_for_buffer(
+            song,
+            track_idx,
+            clips,
+            sample_rate,
+            playhead_beats,
+            current_bpm,
+            frames,
+            0,
+            out,
+            active_notes,
+        );
+    }
 
     /// v23 single-chain: `Track` の `legacy_*` migration fields は `common`
     /// に `pub(crate)` で閉じているので、 downstream の test では
@@ -368,7 +407,7 @@ mod tests {
         let song = one_note_song(0.0, 1.0, 60);
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -391,7 +430,7 @@ mod tests {
         song.tracks[0].clips[0].muted = true;
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -427,7 +466,7 @@ mod tests {
         }
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -465,7 +504,7 @@ mod tests {
         let collect_id_for_pitch = |song: &Song, pitch: u8| -> u32 {
             let mut out = Vec::new();
             let mut active = Vec::new();
-            collect_events_for_buffer(Some(song), 0, SR, 0.0, 120.0, 4096, &mut out, &mut active);
+            collect(Some(song), 0, SR, 0.0, 120.0, 4096, &mut out, &mut active);
             out.iter()
                 .find_map(|e| match e.event {
                     NoteTransition::On { note_id, key, .. } if key == pitch => Some(note_id),
@@ -506,7 +545,7 @@ mod tests {
         // SPB-100 samples ≈ beat 0.9958 (= 1 beat 直前)、 buffer 200 frames で
         // beat 1.0 の note off を捕まえる。 sample→beat 換算は `samples / SPB`。
         let playhead_beats = (SPB - 100) as f64 / SPB as f64;
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -526,7 +565,7 @@ mod tests {
         let song = one_note_song(0.0, 0.01, 60);
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -563,7 +602,7 @@ mod tests {
             });
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -586,7 +625,7 @@ mod tests {
     fn no_song_returns_empty() {
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             None,
             0,
             SR,
@@ -605,7 +644,7 @@ mod tests {
         let song = one_note_song(2.0, 1.0, 60);
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -629,7 +668,7 @@ mod tests {
         let mut active = vec![60u8];
         // playhead (samples) を beat に変換: samples / SPB。
         let playhead_beats = playhead as f64 / SPB as f64;
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -676,12 +715,12 @@ mod tests {
         // 窓の前 (content 0 拍 = song 0 拍) は鳴らない。
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 0.0, 120.0, 1024, &mut out, &mut active);
+        collect(Some(&song), 0, SR, 0.0, 120.0, 1024, &mut out, &mut active);
         assert!(out.is_empty(), "trim で隠した note は発音しない: {out:?}");
         // 窓内の note は song 2 拍のまま (= content が動いていない)。
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 2.0, 120.0, 1024, &mut out, &mut active);
+        collect(Some(&song), 0, SR, 2.0, 120.0, 1024, &mut out, &mut active);
         assert!(
             matches!(out.first().map(|e| &e.event), Some(NoteTransition::On { key: 64, .. })),
             "窓内の note は song 上の元の位置で鳴る: {out:?}"
@@ -725,7 +764,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 0.0, 120.0, 1024, &mut out, &mut active);
+        collect(Some(&song), 0, SR, 0.0, 120.0, 1024, &mut out, &mut active);
         assert!(
             matches!(out.first().map(|e| &e.event), Some(NoteTransition::On { key: 60, .. })),
             "clip 1 の窓は前半 note だけ: {out:?}"
@@ -733,7 +772,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(Some(&song), 0, SR, 8.0, 120.0, 1024, &mut out, &mut active);
+        collect(Some(&song), 0, SR, 8.0, 120.0, 1024, &mut out, &mut active);
         assert!(
             matches!(out.first().map(|e| &e.event), Some(NoteTransition::On { key: 64, .. })),
             "clip 2 の窓は後半 note だけを 8 拍で鳴らす: {out:?}"
@@ -747,7 +786,7 @@ mod tests {
         let mut out = Vec::new();
         let mut active = Vec::new();
         let playhead_beats = (10 * SPB - 100) as f64 / SPB as f64;
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,
@@ -809,7 +848,7 @@ mod tests {
         }));
         let mut out = Vec::new();
         let mut active = Vec::new();
-        collect_events_for_buffer(
+        collect(
             Some(&song),
             0,
             SR,

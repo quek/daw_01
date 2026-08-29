@@ -312,7 +312,6 @@ FN-NESTING | daw_audio/src/engine.rs::LocalState::process_buffer          | 7/28
 FN-NESTING | daw_audio/src/graph/compile.rs::compile_schedule             | 7/20 | audio graph。未起票
 FN-NESTING | daw_audio/src/graph/execute.rs::process_track_owned          | 7/13 | audio graph。未起票
 FN-NESTING | daw_audio/src/graph/compile.rs::compute_path_latency         | 7/12 | audio graph。未起票
-FN-NESTING | daw_audio/src/audio_clip_renderer.rs::compile_audio_schedule | 7/5  | audio graph。未起票
 
 # 7. 映像 / メディアパイプライン (GPU 効果チェイン / デコード / 立ち絵合成 / preview)。
 #    `for source` → `for pass` → `if 有効` → `for param` と下がる。

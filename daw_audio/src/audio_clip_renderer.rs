@@ -91,7 +91,11 @@ impl AudioSourceBuffer {
 /// - **Raw: native rate 再生**、 BPM 変更時は clip 窓を秒固定で再スケール (r.md #7)
 pub struct RenderedEvent {
     pub track_idx: usize,
-    pub clip_idx: usize,
+    /// r.md #87: この event を出したのが **ランチャーのセル**なら、そのセルの
+    /// `clip.id`。アレンジのクリップは `0`。`render_audio_events` は行の供給元に
+    /// 応じてこの値で選り分ける (旧 `clip_idx` は `track.clips` の positional index で、
+    /// 書かれるだけで一度も読まれていなかった = アーキ不変条件 1 の負債)。
+    pub cell_clip_id: u32,
     /// First song-beat this event contributes audio at。
     ///
     /// **event 自身の時間写像の起点** (source 読み出し / fade はここが 0 点)。
@@ -330,116 +334,15 @@ pub fn compile_audio_schedule(
     // -- Flatten every audio clip's events into RenderedEvent ----------------
     let mut schedule: Vec<RenderedEvent> = Vec::new();
     for (track_idx, track) in song.tracks.iter().enumerate() {
-        for (clip_idx, clip) in track.clips.iter().enumerate() {
-            let Some(content) = song.clip_contents.get(&clip.content_id) else {
-                continue;
-            };
-            let ClipContent::Audio(audio) = content else {
-                continue;
-            };
-            // muted clip は全 audio event を schedule から除外する
-            // (per-event `event.muted` とは独立。clip-level mute の SSoT)。
-            if clip.muted {
-                continue;
-            }
-            // r.md #44: clip は content への窓。 窓 (`[start_beat, +length_beats)`) の
-            // 外にはみ出す event 部分は鳴らさない。 event 自身の時間写像
-            // (`start_beat` 起点の source 読み出し / fade) は **一切動かさず**、
-            // 出力範囲だけを交差させる (source 窓を切り詰めると warp marker /
-            // slice onset / spectral stretch の写像が壊れるため)。
-            let (clip_gate_start, clip_gate_end) = clip.song_window();
-            for (event_seq, event) in audio.events.iter().enumerate() {
-                let Some(buffer) = sources.get(&event.source_id) else {
-                    continue;
-                };
-                let event_start_beat =
-                    clip.content_to_song_beat(event.event_start_in_clip_beats);
-                let event_end_beat = event_start_beat + event.event_length_beats;
-                if event_end_beat <= event_start_beat {
-                    continue;
-                }
-                // 窓と交差しない event は schedule に載せない。
-                if event_end_beat <= clip_gate_start || event_start_beat >= clip_gate_end {
-                    continue;
-                }
-                // 時間軸 (SR 比) と ピッチ軸 (semitone) は直交した 2 量として持ち、
-                // どちらをどこに掛けるかは render loop が mode ごとに決める
-                // (旧 `pitch_ratio_for` は mode 分岐でピッチ比を捨てており、
-                // Raw / Stretch / Slice で inspector のピッチが無反応だった)。
-                let sr_ratio = sample_rate_ratio(buffer.sample_rate, engine_sample_rate);
-                let pitch_semitones =
-                    clamp_semitones(event.pitch_semitones, PITCH_SEMITONES_LIMIT);
-                let formant_semitones =
-                    clamp_semitones(event.formant_semitones, FORMANT_SEMITONES_LIMIT);
-                let pitch_factor = pitch_factor(pitch_semitones);
-                // clip time-stretch 量 = source native 長 / event 配置長
-                // (秒で比較、 engine SR に依らない)。 nominal bpm 基準で固定し、
-                // tempo-follow (current/nominal) とは render loop で乗算合成する。
-                // trim では source 窓と event 長が lockstep するので比 ≈ 1.0。
-                let stretch_ratio = stretch_ratio_for(
-                    event.source_end_frames.saturating_sub(event.source_start_frames),
-                    buffer.sample_rate,
-                    event.event_length_beats,
-                    song.bpm,
-                );
-                let gain_lin = 10f32.powf(event.gain_db / 20.0);
-                if event.muted {
-                    continue;
-                }
-                // Phase 5 follow-up (StretchMode::Slice) bug fix: onsets が
-                // sort 済の不変条件は model に明示されておらず、 user / import
-                // 経路次第で未 sort のまま入る可能性がある。 audio thread の
-                // `slice_sample_at` は `partition_point` 前提で sorted を期待
-                // するので、 compile 時 (off-RT) に一度 sort し直して保証する。
-                let mut onsets_sorted = event.onsets.clone();
-                onsets_sorted.sort_unstable();
-                onsets_sorted.dedup();
-                // B12 (r.md #8): warp markers を locked_beat 昇順 + dedup して保持
-                // (warp_source_frame は sorted・non-degenerate を前提)。
-                let mut warp_markers = event.beat_markers.clone();
-                warp_markers.sort_by(|a, b| a.locked_beat.total_cmp(&b.locked_beat));
-                warp_markers.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
-                schedule.push(RenderedEvent {
-                    track_idx,
-                    clip_idx,
-                    start_beat: event_start_beat,
-                    end_beat: event_end_beat,
-                    gate_start_beat: clip_gate_start,
-                    gate_end_beat: clip_gate_end,
-                    source_id: event.source_id,
-                    source_start_frames: event.source_start_frames,
-                    source_end_frames: event.source_end_frames,
-                    gain_lin,
-                    pan: event.pan.clamp(-1.0, 1.0),
-                    sr_ratio,
-                    pitch_factor,
-                    pitch_semitones,
-                    formant_semitones,
-                    // 安定 id で発音を識別する。 `AudioEvent.id` が未採番 (0) の
-                    // 古い project では content 内の位置で代用する (load 時に
-                    // `ensure_*_ids` が採番するので通常は通らない fallback)。 実 id は
-                    // 1 から順に採番されるので最上位ビットは常に 0 — fallback をそこに
-                    // 逃がして、採番済み event との衝突を構造的に無くす。
-                    stream_key: (u64::from(clip.id) << 32)
-                        | u64::from(if event.id != 0 {
-                            event.id
-                        } else {
-                            0x8000_0000 | u32::try_from(event_seq).unwrap_or(0x7fff_ffff)
-                        }),
-                    // 判定は schedule 完成後 (`count_engines_per_track`)。
-                    needs_engine: false,
-                    stretch_ratio,
-                    nominal_bpm: song.bpm,
-                    fade_in_beats: event.fade_in_beats.max(0.0),
-                    fade_out_beats: event.fade_out_beats.max(0.0),
-                    fade_in_curve: event.fade_in_curve,
-                    fade_out_curve: event.fade_out_curve,
-                    reversed: event.reversed,
-                    stretch_mode: event.stretch_mode,
-                    onsets: onsets_sorted,
-                    beat_markers: warp_markers,
-                });
-            }
+        for clip in &track.clips {
+            push_clip_events(&mut schedule, song, &sources, track_idx, clip, 0, engine_sample_rate);
+        }
+        // r.md #87: ランチャーのセルも同じ schedule に載せる。`clip.start_beat` は
+        // 0 なので窓は `[0, length)` = セル自身の座標になり、行の実効拍を渡すだけで
+        // 鳴る。走査時は `cell_clip_id` で選り分けるので、アレンジ行には漏れない。
+        for cell in &track.session_clips {
+            let id = cell.clip.id;
+            push_clip_events(&mut schedule, song, &sources, track_idx, &cell.clip, id, engine_sample_rate);
         }
     }
     schedule.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
@@ -456,6 +359,137 @@ pub fn compile_audio_schedule(
         schedule,
         sources,
         engines_per_track,
+    }
+}
+
+/// 1 クリップ (アレンジのクリップ or ランチャーのセル) の audio event を
+/// `schedule` へ平坦化する。
+///
+/// r.md #87: **セルもアレンジのクリップと完全に同じ算術**で載る — 窓は
+/// `clip.song_window()`、event の起点は `content_to_song_beat`。違うのは
+/// `cell_clip_id` (0 = アレンジ、それ以外 = そのセルの `clip.id`) だけで、
+/// `render_audio_events` が行の供給元に応じてこれで選り分ける。
+///
+/// `compile_audio_schedule` の二重ループから切り出したのは、そこへセル用の
+/// ループを入れ子で足すと `scripts/arch_lint_baseline.txt` の FN-NESTING 天井
+/// (`compile_audio_schedule 7/5`) を即座に超えるため (不変条件 9)。
+fn push_clip_events(
+    schedule: &mut Vec<RenderedEvent>,
+    song: &Song,
+    sources: &HashMap<AudioSourceId, Arc<AudioSourceBuffer>>,
+    track_idx: usize,
+    clip: &common::model::Clip,
+    cell_clip_id: u32,
+    engine_sample_rate: u32,
+) {
+    let Some(content) = song.clip_contents.get(&clip.content_id) else {
+        return;
+    };
+    let ClipContent::Audio(audio) = content else {
+        return;
+    };
+    // muted clip は全 audio event を schedule から除外する
+    // (per-event `event.muted` とは独立。clip-level mute の SSoT)。
+    if clip.muted {
+        return;
+    }
+    // r.md #44: clip は content への窓。 窓 (`[start_beat, +length_beats)`) の
+    // 外にはみ出す event 部分は鳴らさない。 event 自身の時間写像
+    // (`start_beat` 起点の source 読み出し / fade) は **一切動かさず**、
+    // 出力範囲だけを交差させる (source 窓を切り詰めると warp marker /
+    // slice onset / spectral stretch の写像が壊れるため)。
+    let (clip_gate_start, clip_gate_end) = clip.song_window();
+    for (event_seq, event) in audio.events.iter().enumerate() {
+        let Some(buffer) = sources.get(&event.source_id) else {
+            continue;
+        };
+        let event_start_beat =
+            clip.content_to_song_beat(event.event_start_in_clip_beats);
+        let event_end_beat = event_start_beat + event.event_length_beats;
+        if event_end_beat <= event_start_beat {
+            continue;
+        }
+        // 窓と交差しない event は schedule に載せない。
+        if event_end_beat <= clip_gate_start || event_start_beat >= clip_gate_end {
+            continue;
+        }
+        // 時間軸 (SR 比) と ピッチ軸 (semitone) は直交した 2 量として持ち、
+        // どちらをどこに掛けるかは render loop が mode ごとに決める
+        // (旧 `pitch_ratio_for` は mode 分岐でピッチ比を捨てており、
+        // Raw / Stretch / Slice で inspector のピッチが無反応だった)。
+        let sr_ratio = sample_rate_ratio(buffer.sample_rate, engine_sample_rate);
+        let pitch_semitones =
+            clamp_semitones(event.pitch_semitones, PITCH_SEMITONES_LIMIT);
+        let formant_semitones =
+            clamp_semitones(event.formant_semitones, FORMANT_SEMITONES_LIMIT);
+        let pitch_factor = pitch_factor(pitch_semitones);
+        // clip time-stretch 量 = source native 長 / event 配置長
+        // (秒で比較、 engine SR に依らない)。 nominal bpm 基準で固定し、
+        // tempo-follow (current/nominal) とは render loop で乗算合成する。
+        // trim では source 窓と event 長が lockstep するので比 ≈ 1.0。
+        let stretch_ratio = stretch_ratio_for(
+            event.source_end_frames.saturating_sub(event.source_start_frames),
+            buffer.sample_rate,
+            event.event_length_beats,
+            song.bpm,
+        );
+        let gain_lin = 10f32.powf(event.gain_db / 20.0);
+        if event.muted {
+            continue;
+        }
+        // Phase 5 follow-up (StretchMode::Slice) bug fix: onsets が
+        // sort 済の不変条件は model に明示されておらず、 user / import
+        // 経路次第で未 sort のまま入る可能性がある。 audio thread の
+        // `slice_sample_at` は `partition_point` 前提で sorted を期待
+        // するので、 compile 時 (off-RT) に一度 sort し直して保証する。
+        let mut onsets_sorted = event.onsets.clone();
+        onsets_sorted.sort_unstable();
+        onsets_sorted.dedup();
+        // B12 (r.md #8): warp markers を locked_beat 昇順 + dedup して保持
+        // (warp_source_frame は sorted・non-degenerate を前提)。
+        let mut warp_markers = event.beat_markers.clone();
+        warp_markers.sort_by(|a, b| a.locked_beat.total_cmp(&b.locked_beat));
+        warp_markers.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
+        schedule.push(RenderedEvent {
+            track_idx,
+            cell_clip_id,
+            start_beat: event_start_beat,
+            end_beat: event_end_beat,
+            gate_start_beat: clip_gate_start,
+            gate_end_beat: clip_gate_end,
+            source_id: event.source_id,
+            source_start_frames: event.source_start_frames,
+            source_end_frames: event.source_end_frames,
+            gain_lin,
+            pan: event.pan.clamp(-1.0, 1.0),
+            sr_ratio,
+            pitch_factor,
+            pitch_semitones,
+            formant_semitones,
+            // 安定 id で発音を識別する。 `AudioEvent.id` が未採番 (0) の
+            // 古い project では content 内の位置で代用する (load 時に
+            // `ensure_*_ids` が採番するので通常は通らない fallback)。 実 id は
+            // 1 から順に採番されるので最上位ビットは常に 0 — fallback をそこに
+            // 逃がして、採番済み event との衝突を構造的に無くす。
+            stream_key: (u64::from(clip.id) << 32)
+                | u64::from(if event.id != 0 {
+                    event.id
+                } else {
+                    0x8000_0000 | u32::try_from(event_seq).unwrap_or(0x7fff_ffff)
+                }),
+            // 判定は schedule 完成後 (`count_engines_per_track`)。
+            needs_engine: false,
+            stretch_ratio,
+            nominal_bpm: song.bpm,
+            fade_in_beats: event.fade_in_beats.max(0.0),
+            fade_out_beats: event.fade_out_beats.max(0.0),
+            fade_in_curve: event.fade_in_curve,
+            fade_out_curve: event.fade_out_curve,
+            reversed: event.reversed,
+            stretch_mode: event.stretch_mode,
+            onsets: onsets_sorted,
+            beat_markers: warp_markers,
+        });
     }
 }
 
@@ -621,6 +655,9 @@ pub struct ClipRenderState<'a> {
 pub fn render_audio_events(
     renderer: &AudioClipRenderer,
     track_idx: usize,
+    // r.md #87: この行が今どこから鳴っているか。`0` = アレンジのクリップ列、
+    // それ以外 = そのセル 1 つ (`RenderedEvent::cell_clip_id` と一致する event だけ描く)。
+    cell_clip_id: u32,
     track_l: &mut [f32],
     track_r: &mut [f32],
     playhead_beats: f64,
@@ -654,6 +691,12 @@ pub fn render_audio_events(
         // pass the buffer end.
         if event.start_beat >= buf_end_beats {
             break;
+        }
+        // r.md #87: 行の供給元と違う出どころの event は描かない。判定は
+        // `accum_idx` を進めた **後**なので、アレンジ ↔ ランチャーを行き来しても
+        // `repitch_accum` の添字は同じ event に張り付いたままになる。
+        if event.cell_clip_id != cell_clip_id {
+            continue;
         }
         if event.end_beat <= playhead_beats {
             continue;
@@ -1358,7 +1401,7 @@ mod render_tests {
         let source_frames = buffer.frames;
         let mut schedule = vec![RenderedEvent {
             track_idx: 0,
-            clip_idx: 0,
+            cell_clip_id: 0,
             start_beat: 0.0,
             end_beat: LEN_BEATS,
             gate_start_beat: f64::NEG_INFINITY,
@@ -1414,6 +1457,7 @@ mod render_tests {
             render_audio_events(
                 &renderer,
                 0,
+                0,
                 &mut l,
                 &mut r,
                 out_l.len() as f64 / samples_per_beat,
@@ -1450,7 +1494,7 @@ mod render_tests {
         let render = |gate: (f64, f64)| -> Vec<f32> {
             let mut schedule = vec![RenderedEvent {
                 track_idx: 0,
-                clip_idx: 0,
+                cell_clip_id: 0,
                 start_beat: 0.0,
                 end_beat: LEN_BEATS,
                 gate_start_beat: gate.0,
@@ -1494,6 +1538,7 @@ mod render_tests {
                 let mut r = vec![0.0f32; frames];
                 render_audio_events(
                     &renderer,
+                    0,
                     0,
                     &mut l,
                     &mut r,
@@ -1740,7 +1785,7 @@ mod render_tests {
     fn test_event(mode: StretchMode, formant: f32, start: f64, end: f64) -> RenderedEvent {
         RenderedEvent {
             track_idx: 0,
-            clip_idx: 0,
+            cell_clip_id: 0,
             start_beat: start,
             end_beat: end,
             gate_start_beat: f64::NEG_INFINITY,
@@ -2043,7 +2088,7 @@ mod render_tests {
         let source_frames = buffer.frames;
         let mut schedule = vec![RenderedEvent {
             track_idx: 0,
-            clip_idx: 0,
+            cell_clip_id: 0,
             start_beat: 0.0,
             end_beat: LEN_BEATS,
             gate_start_beat: f64::NEG_INFINITY,
@@ -2107,6 +2152,7 @@ mod render_tests {
             for buf in 0..4u64 {
                 render_audio_events(
                     &renderer,
+                    0,
                     0,
                     &mut l,
                     &mut r,
@@ -2295,7 +2341,7 @@ mod wave_span_binding_tests {
         beat_markers.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
         let mut schedule = vec![RenderedEvent {
             track_idx: 0,
-            clip_idx: 0,
+            cell_clip_id: 0,
             start_beat: 0.0,
             end_beat: event.event_length_beats,
             gate_start_beat: f64::NEG_INFINITY,
@@ -2353,6 +2399,7 @@ mod wave_span_binding_tests {
             r.marks.push((playhead_beats, r.out.len()));
             render_audio_events(
                 &renderer,
+                0,
                 0,
                 &mut l,
                 &mut rr,

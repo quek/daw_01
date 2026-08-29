@@ -22,6 +22,48 @@ pub const MAX_TRACKS: usize = 32;
 /// `EnvelopeFollow` node isn't emitted). Indexed by `ModSource` position.
 pub const MAX_MOD_SOURCES: usize = 64;
 
+/// r.md #87 (クリップランチャー): 走行状態を publish できる行数の上限。
+/// 行 = トラック行 + 展開したオートメーションレーン行なので、`MAX_TRACKS` (= 32) では
+/// 足りない。溢れた行は publish されない (= GUI の表示が出ないだけで、音は鳴る)。
+pub const MAX_LAUNCHER_ROWS: usize = 128;
+
+/// [`LauncherRowState::state`] の値。**engine と GUI が共有する唯一の定義**。
+pub const LAUNCHER_STATE_ARRANGER: u32 = 0;
+/// ランチャーが握っていてセルが鳴っている。
+pub const LAUNCHER_STATE_PLAYING: u32 = 1;
+/// ランチャーが握っているが無音 (Stop Clips)。
+pub const LAUNCHER_STATE_STOPPED: u32 = 2;
+
+/// [`LauncherRowState::queued_clip_id`] が「停止の予約」を表す値。
+/// `clip.id` は 1 から採番されるので実 id と衝突しない。
+pub const LAUNCHER_QUEUED_STOP: u32 = u32::MAX;
+/// [`LauncherRowState::queued_clip_id`] が「アレンジへ返す予約」を表す値。
+pub const LAUNCHER_QUEUED_ARRANGER: u32 = u32::MAX - 1;
+
+/// r.md #87: 1 行ぶんの走行状態 (表示専用)。
+///
+/// **`Song` には入れない** — フォローアクションで移った先を保存すると
+/// 「何秒鳴らしてから書き出したか」で出力が変わり、Q9 の再現性が壊れる
+/// (`docs/plan_rmd_87_clip_launcher.md` §1.4)。ここは plugin latency と同じ
+/// 「実行時の観測値」の置き場。
+#[repr(C)]
+pub struct LauncherRowState {
+    /// 行の安定 id を 1 ワードに詰めたもの: `(track_id as u64) << 32 | lane_id`。
+    /// `lane_id == 0` がトラック行。**`0` = 空きスロット** (`track_id` は 1 から
+    /// 採番されるので実在の行と衝突しない)。GUI は index ではなくこの値で引く
+    /// (アーキ不変条件 1 — 行の並びは折りたたみ / 追加で動く)。
+    pub row_key: AtomicU64,
+    /// `LAUNCHER_STATE_*` のいずれか。
+    pub state: AtomicU32,
+    /// いま鳴っているセルの `clip.id` (0 = なし)。
+    pub playing_clip_id: AtomicU32,
+    /// 量子化境界待ちのセルの `clip.id` (0 = なし / `LAUNCHER_QUEUED_STOP` /
+    /// `LAUNCHER_QUEUED_ARRANGER`)。
+    pub queued_clip_id: AtomicU32,
+    /// いま鳴っているセルの中の進捗 `0..1` (`f32::to_bits`)。停止中は 0。
+    pub progress_bits: AtomicU32,
+}
+
 /// Shared memory telemetry plane: daw_audio (writer) → daw_gui (30Hz
 /// polling reader)。
 ///
@@ -76,10 +118,26 @@ pub struct AudioBridge {
     /// GUI が preroll ミラーの 0 を見て自前で導出すると、`StartRecording` 送信直後に
     /// 届いた stale な Tick (まだ preroll が立つ前の 0) で count-in を丸ごと飛ばす。
     pub recording_live: AtomicU32,
+    /// r.md #87 (クリップランチャー): 行ごとの走行状態 (鳴っているセル / 予約 / 進捗)。
+    /// 書き手は audio thread (毎 buffer)、読み手は GUI の poller。
+    /// 使っていないスロットは `row_key == 0`。
+    pub launcher_rows: [LauncherRowState; MAX_LAUNCHER_ROWS],
 }
 
 impl AudioBridge {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// r.md #87: [`AudioBridgeHandle::launcher_row`] が返す 1 行ぶんの値
+/// (atomic を 4 つ読んだ結果の組)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LauncherRowSnapshot {
+    /// `LAUNCHER_STATE_*`。
+    pub state: u32,
+    pub playing_clip_id: u32,
+    pub queued_clip_id: u32,
+    /// セル内の進捗 `0..1`。
+    pub progress: f32,
 }
 
 /// Owning handle to the audio shared memory region.
@@ -207,6 +265,68 @@ impl AudioBridgeHandle {
             return 0.0;
         };
         f32::from_bits(cell.load(Ordering::Acquire))
+    }
+
+    /// r.md #87: 1 行ぶんの走行状態を publish する。`slot` は engine が毎 buffer
+    /// 詰め直す **その buffer 限りの並び**で、意味を持つのは `row_key` の方
+    /// (GUI は key で引く)。範囲外は黙って捨てる (`set_mod_scalar` と同じ規約)。
+    ///
+    /// RT 安全: atomic store のみ (確保・ロック・I/O なし)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_launcher_row(
+        &self,
+        slot: usize,
+        row_key: u64,
+        state: u32,
+        playing_clip_id: u32,
+        queued_clip_id: u32,
+        progress: f32,
+    ) {
+        let Some(cell) = self.bridge().launcher_rows.get(slot) else {
+            return;
+        };
+        cell.state.store(state, Ordering::Release);
+        cell.playing_clip_id.store(playing_clip_id, Ordering::Release);
+        cell.queued_clip_id.store(queued_clip_id, Ordering::Release);
+        cell.progress_bits.store(progress.to_bits(), Ordering::Release);
+        // `row_key` は **最後に**書く — GUI は `row_key != 0` を見てから残りを読むので、
+        // 先に書くと 1 tick だけ古い state と新しい key の組を見せてしまう。
+        cell.row_key.store(row_key, Ordering::Release);
+    }
+
+    /// r.md #87: `slot` 以降を「空き」にする (engine が publish した行数より後ろ)。
+    pub fn clear_launcher_rows_from(&self, slot: usize) {
+        for cell in self.bridge().launcher_rows.iter().skip(slot) {
+            if cell.row_key.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            cell.row_key.store(0, Ordering::Release);
+        }
+    }
+
+    /// r.md #87: 行の走行状態を安定 id で引く
+    /// (`lane_id == 0` がトラック行)。見つからなければ `None`。
+    #[must_use]
+    pub fn launcher_row(&self, track_id: u32, lane_id: u32) -> Option<LauncherRowSnapshot> {
+        let want = (u64::from(track_id) << 32) | u64::from(lane_id);
+        if want == 0 {
+            return None;
+        }
+        for cell in &self.bridge().launcher_rows {
+            let key = cell.row_key.load(Ordering::Acquire);
+            if key == 0 {
+                break;
+            }
+            if key == want {
+                return Some(LauncherRowSnapshot {
+                    state: cell.state.load(Ordering::Acquire),
+                    playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
+                    queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
+                    progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
+                });
+            }
+        }
+        None
     }
 
     /// Fills `out` with the modulation scalars for slots `0..MAX_MOD_SOURCES`.

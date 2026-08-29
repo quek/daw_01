@@ -581,6 +581,20 @@ fn render_loop(
     // integrate して進める (= sample↔beat 対応が tempo automation に追従)。 曲中から
     // 始まる range 書き出しは walk_start に対応する beat で seed する。
     let mut playhead_beats = common::automation::samples_to_beats(song, sample_rate, walk_start);
+
+    // r.md #87 (Q9 / §2.5): 書き出しは **今のランチャーの状態を反映する**。
+    // 走査の先頭で `Track.launcher` / `AutomationLane.launcher` を一斉に撃った
+    // 状態から始め、以降はフォローアクションが決定論的に進む
+    // (乱数は `f(seed, 発火拍)` の純ハッシュ) ので、同じプロジェクトなら
+    // 何度書き出しても同じファイルになる。走行位置を `Song` に保存しないのが
+    // その前提 (§1.4)。
+    let mut launcher = crate::launcher::LauncherRuntime::new();
+    launcher.arm_reseed();
+    // グローバルローンチ量子化は engine と同じ値を使う (セルの `Global` の解決先)。
+    let global_launch_quantize = crate::launcher::quantize::decode(
+        engine_shared.global_launch_quantize.load(Ordering::Acquire),
+    );
+
     while playhead < total_samples {
         // User abort (`AudioCommand::CancelExport`). Checked before any
         // work this buffer so the render stops promptly; `run_export`
@@ -631,6 +645,15 @@ fn render_loop(
         // live と同一の単一 render 経路 (§5): dispatch → schedule → master fx
         // → master gain。 export (freewheel render) は loop しない。
         let master_gain = f32::from_bits(engine_shared.master_gain.load(Ordering::Relaxed));
+        // 行ごとの時間軸を live と同じ解き方で更新する (不変条件 6 — 片方だけ
+        // 別経路にすると「聴こえた通りに書き出す」が成立しない)。
+        let span = crate::launcher::runtime::BufferSpan::new(
+            playhead_beats,
+            smoothed_current_bpm_freewheel as f32,
+            sample_rate,
+            frames as u32,
+        );
+        launcher.update(song, span, global_launch_quantize, true);
         render_master_buffer(
             song,
             &mut schedule,
@@ -653,6 +676,7 @@ fn render_loop(
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
             &mod_scalars_snapshot,
+            launcher.rows(),
             master_gain,
         );
 

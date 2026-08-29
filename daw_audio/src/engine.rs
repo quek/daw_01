@@ -53,7 +53,13 @@ const PREVIEW_NOTE_ID: u32 = u32::MAX;
 /// `pump_commands` で drain される。v29: shmem / worker pool の重い扱いは
 /// recv loop 側で [`RtBundle`] に載る経路へ移設したので、残るのは
 /// 鍵盤プレビューのみ。
+#[derive(Debug)]
 pub enum EngineCommand {
+    /// r.md #87: ランチャーの操作 (セル / 列の発火、停止、アレンジへ返す)。
+    /// 発火の判断には `Song` (セルの [`common::model::LaunchSettings`]) が要るので、
+    /// IPC スレッドでは解決せず audio thread の
+    /// [`crate::launcher::LauncherRuntime`] へそのまま積む。
+    Launch(crate::launcher::LaunchRequest),
     /// 鍵盤レーン click のプレビュー note-on (gui_01 #055)。 `track` は
     /// song.tracks の Vec index (= main.rs が `track_id` から現 song snapshot
     /// で解決済)、 `velocity` は normalized 0..=1。 `pump_commands` が該当
@@ -540,6 +546,12 @@ pub struct EngineShared {
     /// export 共通 (§5 — 旧実装は CPAL interleave 段のみで export に乗らず、
     /// master gain が WAV に反映されなかった)。
     pub master_gain: AtomicU32,
+    /// r.md #87: グローバルローンチ量子化 (`crate::launcher::quantize::encode` の
+    /// 1 ワード表現)。セルの [`common::model::LaunchQuantize::Global`] がここへ
+    /// 解決される。**live (audio thread) と書き出し (freewheel) の両方が読む**ので
+    /// `EngineShared` に置く (不変条件 6 — 片方だけ別の値で走ると音が変わる)。
+    /// 起動時は `Global` の encode = 0 で、解決側が既定 (1 小節) へ倒す。
+    pub global_launch_quantize: AtomicU32,
     /// 安定 `device_id` → プラグインが報告した processing latency (samples)。
     /// `AudioCommand::SetDeviceLatency` で recv loop が差し替え、
     /// `compile_schedule` (live publish / export の両方) が PDC の入力に読む。
@@ -613,6 +625,7 @@ impl EngineShared {
             preroll_remaining_samples: AtomicU64::new(0),
             recording_requested: AtomicBool::new(false),
             master_gain: AtomicU32::new(1.0_f32.to_bits()),
+            global_launch_quantize: AtomicU32::new(0),
             device_latencies: ArcSwap::from_pointee(HashMap::new()),
             last_buffer_frames: AtomicU32::new(0),
             mmcss_join_failed: AtomicBool::new(false),
@@ -771,6 +784,10 @@ pub struct LocalState {
     pub plugin_refs: Arc<PluginRefs>,
     /// RT が使う worker rig (bundle 由来 Arc clone)。
     pub worker: Option<Arc<WorkerRig>>,
+    /// r.md #87: クリップランチャーの走行状態 (行ごとの予約 / フォローアクション /
+    /// 供給元)。**`Song` には書き戻さない** — 詳細は
+    /// [`crate::launcher::LauncherRuntime`] の doc。事前確保のみで RT で伸びない。
+    pub launcher: crate::launcher::LauncherRuntime,
     /// docs/plan_modulation.md §5: reusable per-buffer snapshot of follower
     /// scalars (slot = `ModSource` position), filled from
     /// `cached_schedule.follower_slots` before dispatch (= the previous
@@ -822,6 +839,7 @@ impl LocalState {
             tempo_map: common::tempo_map::TempoMap::from_song(&Song::default()),
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
+            launcher: crate::launcher::LauncherRuntime::new(),
             mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
@@ -993,6 +1011,10 @@ impl LocalState {
         match (self.playing, desired) {
             (false, PlaybackCommand::Play) => {
                 self.playing = true;
+                // r.md #87 §1.4: 再生の起点は **ユーザーが最後に撃った状態**
+                // (`Track.launcher` / `AutomationLane.launcher`)。フォローアクションで
+                // 移った先は走行状態にしか無いので、停止 → 再生で同じセルが鳴り直す。
+                self.launcher.arm_reseed();
                 // Play は **現在の playhead からそのまま再生する** (頭出しは
                 // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
                 // が所有する (モデル A = Pro Tools / Ableton 流)。
@@ -1041,6 +1063,9 @@ impl LocalState {
     fn pump_commands(&mut self) {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
+                // r.md #87: ランチャーの操作。発火拍の解決は buffer 頭の
+                // `launcher.update` (= song snapshot が入ってから) が行う。
+                EngineCommand::Launch(req) => self.launcher.push_request(req),
                 EngineCommand::PreviewNoteOn {
                     track,
                     pitch,
@@ -1122,6 +1147,12 @@ impl LocalState {
         let loop_region = **shared.loop_region.load();
         let looping = loop_region.enabled;
         let metronome_enabled = shared.metronome_enabled.load(Ordering::Acquire);
+        // r.md #87: グローバルローンチ量子化も同じ「buffer 頭で 1 回だけ読む」
+        // 規約に乗せる (行ごとに load すると、同じ buffer 内で行ごとに別の格子へ
+        // 発火しうる)。
+        let global_launch_quantize = crate::launcher::quantize::decode(
+            self.shared.global_launch_quantize.load(Ordering::Acquire),
+        );
 
         // r.md #51: transport の要求 (Play / Stop) と seek の消費、および
         // 「今どういう状態か」の publish は **どの早期 return よりも先に**行う。
@@ -1279,6 +1310,17 @@ impl LocalState {
                 self.mod_scalars_snapshot.push(v);
             }
 
+            // r.md #87: 行ごとの時間軸を **dispatch より前に**確定させる
+            // (worker はこのテーブルをポインタで読む)。予約の発火 / フォロー
+            // アクション / セルのループ解決はすべてここで済む。
+            let span = crate::launcher::runtime::BufferSpan::new(
+                self.playhead_beats,
+                current_bpm,
+                sample_rate,
+                n as u32,
+            );
+            self.launcher.update(song, span, global_launch_quantize, playing);
+
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
             // master fx → master gain。
             let master_gain =
@@ -1300,8 +1342,13 @@ impl LocalState {
                 current_bpm,
                 self.playhead_beats,
                 &self.mod_scalars_snapshot,
+                self.launcher.rows(),
                 master_gain,
             );
+
+            // r.md #87: 走行状態 (鳴っているセル / 予約 / 進捗) を GUI へ publish。
+            // `Song` には入れない (§1.4 — 遷移先を保存すると書き出しの再現性が壊れる)。
+            self.launcher.publish(bridge, span);
 
             // r.md #50: マスター出力サンプルを GUI のメーター解析リングへ流す。
             // **metronome click を重ねる前** に取るのがこのタップ位置の要点で、
