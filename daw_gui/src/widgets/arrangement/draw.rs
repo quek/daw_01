@@ -120,6 +120,86 @@ pub(super) fn clip_ink_for(p: &Palette, fill: Color, lane_bg: Color) -> Color {
     p.ink_for(daw_ui_core::color::composite_over(fill, lane_bg))
 }
 
+/// automation clip の矩形 (lane body 内、縦 padding 適用済)。
+///
+/// `draw_automation_lane` の描画と、cached 外の bend overlay
+/// (`render::resolve_bend_segment`) が **同じ式**を使うための SSoT。
+/// 2 か所で別式にすると、強調 / preview が base の 1px 隣に出たり
+/// scissor が食い違ったりする (#028 user 指摘 2 と同じ形の再発)。
+#[must_use]
+pub(super) fn automation_clip_rect(
+    body_rect: Rect,
+    view: ArrangementView,
+    clip_start_beat: f64,
+    clip_len_beats: f64,
+    style: &ArrangementStyle,
+) -> Rect {
+    let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+    #[allow(clippy::cast_possible_truncation)]
+    let x = body_rect.x + ((clip_start_beat - view.start_beat) * beat_to_px) as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let w = ((clip_len_beats * beat_to_px) as f32).max(2.0);
+    let pad = style.automation_clip_v_pad_px;
+    Rect { x, y: body_rect.y + pad, w, h: (body_rect.h - pad * 2.0).max(2.0) }
+}
+
+/// automation clip の `(fill, border)`。優先順は **selected > disabled > lane 識別色**。
+///
+/// M14 Phase 114 (daw_01 #086): automation clip は専用の `color` field を持たず `lane.color` が
+/// fill / border の唯一 source (audio clip の `clip.color` に相当)。 `share_group_color` は fill /
+/// border を上書きせず、 リンク識別は ⇌ glyph + #068 hover 強調のみが担う (#086)。 disabled lane は
+/// **clip rect の fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の
+/// lane 識別色のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
+/// r.md #48: 識別色は lane 面に合わせて明度を寄せた `lane_ink` (ダークでは恒等)。
+///
+/// r.md #73: **cached 側の curve と cached 外の強調 / preview が共有する SSoT**。
+/// 「その clip が実際に何色で塗られているか」を 1 か所で決めないと、
+/// 強調の色を実効背景から導けない (= 塗りと同色になって中抜けする)。
+#[must_use]
+pub(super) fn automation_clip_colors(
+    p: &Palette,
+    lane: &ArrangementAutomationLane,
+    is_selected: bool,
+    style: &ArrangementStyle,
+) -> (Color, Color) {
+    if is_selected {
+        return (style.clip_selected_fill, style.clip_selected_border);
+    }
+    if lane.enabled {
+        let lane_ink = p.adapt_on(style.automation_lane_bg, lane.color);
+        return (lane_ink.with_alpha(0.20), lane_ink);
+    }
+    // disabled: fill = 灰色 alpha 0.10 (lane_bg がほぼ透ける、 中身可読) + border = 灰色
+    // alpha 1.0 (識別 marker、 不透明で確実に見える)。 fill alpha 0 だと renderer が rect 全体を
+    // skip する可能性があるので非ゼロを保つ (#028 user 指摘 3 = 配色で見えない)。
+    let dc = style.automation_lane_disabled_color;
+    (Color { r: dc.r, g: dc.g, b: dc.b, a: 0.10 }, Color { r: dc.r, g: dc.g, b: dc.b, a: 1.0 })
+}
+
+/// automation clip の塗りを lane 面に合成した **実効背景**。
+/// curve のインク・point dot の極性・bend 強調の色は、すべてこの輝度から決める。
+#[must_use]
+pub(super) fn automation_clip_eff_bg(fill: Color, style: &ArrangementStyle) -> Color {
+    daw_ui_core::color::composite_over(fill, style.automation_lane_bg)
+}
+
+/// r.md #73: **automation clip の面の上に置くアクセント線の色**。
+///
+/// hover 強調と bend preview は「いまこの区間を触っている」を示す暖色だが、
+/// **選択中の automation clip の塗り (`clip_selected_fill`) は同じ `selection_warm`** である
+/// (`mod.rs` のトークン定義参照)。固定トークンをそのまま置くと、選択中のクリップの上では
+/// 線の芯が塗りと完全に同化し、逆極性の縁取りだけが両側に残って **平行 2 本線**に見える
+/// (r.md #73「曲げている最中に線が 2 重に見える」の実体。実ピクセルで確認済)。
+///
+/// 解き方はクリップ標識と同じ — 面の色から導く。`adapt_on` は色相・彩度を保ったまま
+/// 図形コントラスト 3:1 を満たす明度まで寄せる (足りていれば恒等 = ダークの非選択では
+/// 従来と 1 bit も変わらない)。これで「芯が背景に沈む」状態が原理的に作れなくなる
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+#[must_use]
+pub(super) fn automation_accent_on(p: &Palette, eff_bg: Color, accent: Color) -> Color {
+    p.adapt_on(eff_bg, accent)
+}
+
 /// r.md #73: 選択中 automation point の dot の `(fill, border)`。
 ///
 /// dot は automation clip の面の上に乗る。旧実装は fill / border とも `ink_on_dark`
@@ -1382,7 +1462,6 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
             color: Some(preview_fill),
             // 共有マーク / 連動ハイライトは transient な preview では出さない (元 clip 側で描画済)。
             share_group_color: None,
-            audio_edit: None,
             // fade envelope は transient な preview では出さない (元 clip 側で描画済)。
             fades: Vec::new(),
             // video / image / text clip の thumbnail はコピーにも見せる (それが中身なので)。
@@ -1452,16 +1531,10 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
     }
 }
 
-/// M14 Phase 63k (#025): gain_db を clip rect 内の handle line y 座標に変換する pure helper。
-/// `gain_db = 0` で rect 中央、 `+range_db` で上端、 `-range_db` で下端 (Bitwig spec 準拠)。
-/// 描画と hit-test の両方で使う SSoT (overlay と base 描画が同じ y で描かれる)。
-#[must_use]
-pub(super) fn db_to_handle_y(rect: Rect, gain_db: f32, style: &ArrangementStyle) -> f32 {
-    let range = style.audio_db_range_db.max(0.001);
-    let normalized = (gain_db / range).clamp(-1.0, 1.0);
-    // gain=0 で rect 中央、 +range で rect 上端 (y 小さい)、 -range で rect 下端 (y 大きい)。
-    rect.y + rect.h * 0.5 - rect.h * 0.5 * normalized
-}
+// r.md #73: `db_to_handle_y` (gain_db → clip 内の横線 y) は dB ハンドル線ごと撤去した。
+// doc は「描画と hit-test の SSoT」を名乗っていたが、hit-test 側 (`geometry::audio_grip_hit`)
+// は実際にはこれを呼ばず clip の縦中央を固定で使っていたので、gain が 0 dB を外れると
+// 線と掴む帯がずれていた。線が不可視 (`Color::TRANSPARENT` 固定) だったので誰も気付けなかった。
 
 /// r.md #38: 1 event の fade envelope (カーブ + 掴む正方形) を描画
 /// (event 左端 = In / 右端 = Out)。
@@ -1596,41 +1669,6 @@ pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
     });
 }
 
-/// M14 Phase 63k (#025): audio_edit が Some の clip に対する dB handle line 描画。
-/// cached 内で呼ばれる (audio_edit / clip rect が変化したら viewport_key で cache 再生成)。
-///
-/// r.md #73: `clip_bg` は **実際に塗られるクリップ色**。 ハンドル線はその上に乗る標識
-/// なので、極性は実効背景から決める (固定インクだと明るいクリップ色で沈む)。
-pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
-    hctx: &mut HeavyCtx<'_, '_, M>,
-    clip_rect: Rect,
-    audio: &ClipViewAudioEdit,
-    clip_bg: Color,
-    style: &ArrangementStyle,
-) {
-    use daw_ui_renderer::{LineBatch, LineSegment};
-
-    // dB handle line (横線 1 本、 audio_db_handle_width_px の太さ)。 端から margin 内側のみ。
-    let margin = style.audio_db_handle_x_margin;
-    let line_w = (clip_rect.w - margin * 2.0).max(0.0);
-    if line_w > 0.0 {
-        let y = db_to_handle_y(clip_rect, audio.gain_db, style);
-        // 濃さ (alpha) は style トークンの役割値、極性だけ背景から決める。
-        let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg)
-            .with_alpha(style.audio_db_handle_color.a);
-        let seg = LineSegment {
-            a: [clip_rect.x + margin, y],
-            b: [clip_rect.x + margin + line_w, y],
-            color: ink,
-        };
-        hctx.push_lines(LineBatch {
-            segments: Arc::<[LineSegment]>::from(vec![seg]),
-            line_width_px: style.audio_db_handle_width_px,
-            clip_rect: Some(clip_rect),
-        });
-    }
-}
-
 /// r.md #38: clip の全 event の fade **カーブ**を描画 (content 種別に依らず共通)。
 ///
 /// r.md #58: 掴む正方形はここでは描かない。 カーブは曲の状態 (どこにどんなフェードが
@@ -1727,53 +1765,23 @@ pub(super) fn draw_fade_handle_overlay<M: ?Sized + 'static>(
 
 /// M14 Phase 63k (#025): audio_drag 中の ghost overlay (cached 外、 drag 中の preview 値を最新表示)。
 /// `compute_audio_drag_outcome` の結果を視覚化:
-/// - `Gain { next_db }` → 新 dB position に handle line を 1 本 + ghost label「+3.2 dB」 を描く。
 /// - `FadeLength { edge, next_beats }` → 新 fade 範囲を `draw_fade_envelope` で描く + label 省略
 ///   (envelope の長さ自体が visual feedback)。
 /// - `FadeCurve { edge, next_curve }` → curve 名を ghost label「Curve: Exponential」 で描く。
-/// - `None` (sticky 未確定) → label「Move」 (= drag が始まったが方向未確定の hint)、 描画は anchor 値の line。
+/// - `None` (sticky 未確定) → label「Move」 (= drag が始まったが方向未確定の hint)。
 pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     ad: &AudioDragSession,
     beat_per_px: f64,
     style: &ArrangementStyle,
 ) {
-    use daw_ui_renderer::{LineBatch, LineSegment};
-
     let r = ad.clip_rect_anchor;
     if r.w <= 0.0 || r.h <= 0.0 {
         return;
     }
     let clip_bg = ad.clip_bg_anchor;
-    let outcome = compute_audio_drag_outcome(ad, beat_per_px, style);
+    let outcome = compute_audio_drag_outcome(ad, beat_per_px);
     let label_text: Option<String> = match (ad.kind, outcome) {
-        (AudioDragKind::Gain, Some(AudioDragOutcome::Gain { next_db })) => {
-            // 新 handle line を preview 位置に重ね描き (cached 内の base line は anchor 値で残るが、
-            // ghost が上に乗って drag 中の最新値を user に見せる)。
-            let margin = style.audio_db_handle_x_margin;
-            let line_w = (r.w - margin * 2.0).max(0.0);
-            if line_w > 0.0 {
-                let y = db_to_handle_y(r, next_db, style);
-                // r.md #73: 極性は実効背景 (掴んでいる clip の実塗り色) から。
-                let ink = clip_ink_for(hctx.palette(), clip_bg, style.bg)
-                    .with_alpha(style.audio_db_handle_color.a);
-                let seg = LineSegment {
-                    a: [r.x + margin, y],
-                    b: [r.x + margin + line_w, y],
-                    color: ink,
-                };
-                hctx.push_lines(LineBatch {
-                    segments: Arc::<[LineSegment]>::from(vec![seg]),
-                    line_width_px: style.audio_db_handle_width_px * 2.0,
-                    clip_rect: Some(r),
-                });
-            }
-            Some(format!(
-                "{}{:.1} dB",
-                if next_db >= 0.0 { "+" } else { "" },
-                next_db
-            ))
-        }
         (_, Some(AudioDragOutcome::FadeLength { edge, next_beats })) => {
             if let Some(mut preview) = ad.anchor_fade {
                 match edge {
@@ -1968,40 +1976,18 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         if end < view.start_beat || c.start_beat > view_end {
             continue;
         }
-        // clip rect (lane body 内、 縦 padding 適用)
-        #[allow(clippy::cast_possible_truncation)]
-        let x = body_rect.x + ((c.start_beat - view.start_beat) * beat_to_px) as f32;
-        #[allow(clippy::cast_possible_truncation)]
-        let w = ((c.len_beats * beat_to_px) as f32).max(2.0);
-        let pad = style.automation_clip_v_pad_px;
-        let cy = body_rect.y + pad;
-        let ch = (body_rect.h - pad * 2.0).max(2.0);
-        let clip_rect = Rect { x, y: cy, w, h: ch };
+        // clip rect (lane body 内、 縦 padding 適用)。式は `automation_clip_rect` が SSoT
+        // (cached 外の bend overlay も同じ関数から引く)。
+        let clip_rect = automation_clip_rect(body_rect, view, c.start_beat, c.len_beats, style);
+        let (w, ch) = (clip_rect.w, clip_rect.h);
 
         // M14 Phase 63n-3 (#028): selected な automation clip は selected_fill / selected_border で
         // 描画 (priority: selected > disabled > share_group > lane.color)。
         let clip_key = AutomationClipKey { track: track_id, lane: lane.id, clip: c.id };
         let is_selected = selected_clips_set.contains(&clip_key);
-        // M14 Phase 114 (daw_01 #086): automation clip は専用の `color` field を持たず `lane.color` が
-        // fill / border の唯一 source (audio clip の `clip.color` に相当)。 `share_group_color` は fill /
-        // border を上書きせず、 リンク識別は ⇌ glyph + #068 hover 強調のみが担う (#086)。 disabled lane は
-        // **clip rect の fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の
-        // lane 識別色のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
-        // r.md #48: 識別色は lane 面に合わせて明度を寄せた `lane_ink` (ダークでは恒等)。
-        let (fill, border) = if is_selected {
-            (style.clip_selected_fill, style.clip_selected_border)
-        } else if lane.enabled {
-            (lane_ink.with_alpha(0.20), lane_ink)
-        } else {
-            // disabled: fill = 灰色 alpha 0.10 (lane_bg がほぼ透ける、 中身可読) + border = 灰色
-            // alpha 1.0 (識別 marker、 不透明で確実に見える)。 fill alpha 0 だと renderer が rect 全体を
-            // skip する可能性があるので非ゼロを保つ (#028 user 指摘 3 = 配色で見えない)。
-            let dc = style.automation_lane_disabled_color;
-            (
-                Color { r: dc.r, g: dc.g, b: dc.b, a: 0.10 },
-                Color { r: dc.r, g: dc.g, b: dc.b, a: 1.0 },
-            )
-        };
+        // 塗り / 枠の決め方は `automation_clip_colors` が SSoT (cached 外の bend 強調が
+        // 「実際に塗られた色」を必要とするので、式をここに閉じ込めない)。
+        let (fill, border) = automation_clip_colors(p, lane, is_selected, style);
         hctx.push_rect(RectCommand {
             rect: clip_rect,
             fill,
@@ -2062,8 +2048,7 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         // (`automation_lane_disabled_color`) を維持 (= clip 名と同方針)、 その枠だけはクローム面
         // の上に乗る細線なので `text` (テーマ従属) で薄く縁取る。
         let (curve_line_color, point_fill, point_border) = if lane.enabled {
-            let eff_bg = daw_ui_core::color::composite_over(fill, style.automation_lane_bg);
-            let neutral = p.ink_for(eff_bg);
+            let neutral = p.ink_for(automation_clip_eff_bg(fill, style));
             let edge = p.ink_for(neutral);
             (neutral, neutral, edge)
         } else {

@@ -178,19 +178,6 @@ pub struct ClipKey {
     pub clip: u32,
 }
 
-/// M14 Phase 63k (#025): audio clip の inline 編集用フィールド (gain_db)。
-/// `ClipView.audio_edit = Some(...)` のとき widget が dB handle line を描画 + 中央帯に
-/// drag handler を bind。 MIDI / Vocal clip は `None`。
-///
-/// r.md #38 で fade は [`ClipView::fades`] へ分離した。 fade は audio 固有ではなく
-/// video / image / text の event も同じ形で持つため (= `common::model::EventFade`)、
-/// audio 専用フィールドと同居させると 4 content 種別ぶんの重複実装を誘発する。
-/// ここに残るのは本当に audio だけの値 (gain_db = dB handle line) のみ。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClipViewAudioEdit {
-    pub gain_db: f32,
-}
-
 /// r.md #38: clip 内 1 event 分の fade 表示情報。 content 種別 (audio / video / image /
 /// text) に依らず同じ型で扱う — 4 種とも `event_start_in_clip_beats` /
 /// `event_length_beats` / `fade_*_beats` / `fade_*_curve` を同じ意味で持ち、 適用側も
@@ -284,11 +271,6 @@ pub struct ClipView {
     /// `is_some()` だけを見るが、 caller の互換 (refcount >= 2 で `Some(hue)` を渡す既存契約) を保つため
     /// 型は `Option<f32>` のまま据え置き、 hue 値は将来の hue ベース theming 用に予約する。
     pub share_group_color: Option<f32>,
-    /// M14 Phase 63k (#025): audio clip の inline 編集 (gain_db / fade)。 `Some` で widget が
-    /// dB handle / fade 角 / envelope を描画 + grip 領域に drag handler を bind し
-    /// `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発行する。 MIDI / Vocal clip は
-    /// `None` で既存挙動 (clip 内 hit zone 全体が Move、 audio 描画なし)。
-    pub audio_edit: Option<ClipViewAudioEdit>,
     /// r.md #38: この clip の各 event の fade。 content 種別 (audio / video / image / text)
     /// に依らず、 空でなければ widget が event ごとに fade を描画し、 handle 領域に
     /// drag handler を bind して `SetClipFadeBeatsBatch` / `SetClipFadeCurveBatch` を
@@ -300,7 +282,7 @@ pub struct ClipView {
     /// clip (+ フェードをドラッグ中の clip) にだけ**描く。 hit zone は hover と無関係に
     /// 常に生きている (`fade_geometry` が描画と hit-test 共通の SSoT)。
     ///
-    /// r.md #38 以前は `audio_edit` (= audio の first event) 経由でしか渡らず、
+    /// r.md #38 以前は audio 専用フィールド (= audio の first event) 経由でしか渡らず、
     /// (a) 音声クリップにしか線が出ず、 (b) 複数 event を持つクリップでは 1 本目の
     /// fade しか描かれなかった。
     pub fades: Vec<ClipEventFade>,
@@ -712,15 +694,6 @@ pub struct ResizeClipDelta {
     pub stretch: bool,
 }
 
-/// M14 Phase 63k (#025): `SetClipGainDb` の delta 1 件 (release 時に発火)。
-/// `prev_gain_db` で undo を構築できる (caller は `Edit::with_inverse` で対称適用すれば良い)。
-#[derive(Clone, Copy, Debug)]
-pub struct ClipGainDelta {
-    pub key: ClipKey,
-    pub prev_gain_db: f32,
-    pub next_gain_db: f32,
-}
-
 /// M14 Phase 63k (#025): `SetClipFade` の delta 1 件 (length 変更、 release 時に発火)。
 /// `edge` で fade_in / fade_out を区別、 `prev_beats` / `next_beats` は当該 edge の length 拍数。
 #[derive(Clone, Copy, Debug)]
@@ -1125,23 +1098,13 @@ pub struct ArrangementStyle {
     /// default = 0.22 で clip 名の可読性を保ちつつ強調が分かる。 `0.0` で glow なし = bright border のみ
     /// (= ring のみの強調にしたい theme 向け)。
     pub share_group_active_glow_alpha: f32,
-    // ---- M14 Phase 63k (#025): audio clip inline 編集 (dB handle / fade) ----
-    /// audio_edit が Some の clip に重ねる dB handle line の色。 波形 / ユーザー着色 clip の
-    /// 上に乗るので極性固定の明インク (`ink_on_dark`) を半透明で。
-    pub audio_db_handle_color: Color,
-    /// dB handle line の太さ (default 1.5 px)。
-    pub audio_db_handle_width_px: f32,
-    /// dB handle hit zone の縦帯 (handle line を中心に上下 ± half_band_h)。 default 8.0 = ±4 px。
-    pub audio_db_handle_band_h: f32,
-    /// dB handle 帯の左右 margin (clip 端から内側にこの px は除外、 端の resize/fade grip と
-    /// 被らないようにする)。 default 24.0。
-    pub audio_db_handle_x_margin: f32,
-    /// dB drag の感度 (1 px = この dB)。 default 0.25 dB/px (= 4 px/dB)。
-    /// negative dy = 上に drag = gain 増加。
-    pub audio_db_pixels_per_db: f32,
-    /// rect 上下端にマップする dB 範囲 (`±` この値)。 default 24.0 → 上端 = +24 dB、 下端 = -24 dB。
-    /// drag の commit 値もこの範囲に clamp される。
-    pub audio_db_range_db: f32,
+    // ---- M14 Phase 63k (#025): audio clip inline 編集 (fade) ----
+    // r.md #73: クリップ中央を横切る dB ハンドル線とその上下ドラッグは**撤去した**
+    // (`audio_db_*` トークン一式 / `AudioDragKind::Gain` / `AudioGripHit::GainHandleBand`)。
+    // 線は 2026-05-08 (1cd2b43) 以来 `Color::TRANSPARENT` で固定されており、実機では
+    // 一度も描かれていなかった — 「掴めるのに見えない操作子」で、しかも gain が 0 dB を
+    // 外れると掴む帯だけがクリップ中央に取り残されて線とずれる状態だった。
+    // クリップゲインの編集はトラックインスペクタの数値フィールド (`SetClipGainDb`) に一本化する。
     /// fade 角 grip の正方形サイズ (px、 clip 上端の左右にこの size の正方形 hit zone)。 default 12.0。
     pub audio_fade_corner_size_px: f32,
     /// fade envelope (clip の中身領域上端から fade 末尾まで) と grip の描画色。
@@ -1406,12 +1369,6 @@ impl ArrangementStyle {
             // dB handle / fade envelope は波形と clip 色の上に乗るので極性固定インク。
             // ±4 px hit 帯、 端から 24 px margin、 0.25 dB/px、 ±24 dB 範囲、 12×12 の fade grip、
             // sticky 閾値 10 px (要望文 §3.2)。
-            audio_db_handle_color: p.ink_on_dark.with_alpha(0.55),
-            audio_db_handle_width_px: 1.5,
-            audio_db_handle_band_h: 8.0,
-            audio_db_handle_x_margin: 24.0,
-            audio_db_pixels_per_db: 0.25,
-            audio_db_range_db: 24.0,
             audio_fade_corner_size_px: 12.0,
             audio_fade_overlay_color: p.ink_on_dark.with_alpha(0.65),
             audio_fade_overlay_color_dark: p.ink_on_bright.with_alpha(0.75),
@@ -1727,8 +1684,6 @@ struct TrackVolumeDragSession {
 /// overlay のみ、 release で 1 度だけ `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発火。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AudioDragKind {
-    /// clip 中央 dB handle 帯 → 縦 drag のみ意味あり (gain_db 変更)。
-    Gain,
     /// clip 上端左角 → sticky で length / curve に分岐。
     FadeIn,
     /// clip 上端右角 → 同上 (length / curve)。
@@ -1740,14 +1695,12 @@ struct AudioDragSession {
     /// 単一 clip の drag (multi-select 一括対応は将来拡張、 仕様 §scope 外)。
     key: ClipKey,
     kind: AudioDragKind,
-    /// drag 開始時の gain 値 (`Gain` の commit / ghost preview に使う)。
-    anchor_gain_db: f32,
-    /// r.md #38: drag 開始時の fade 値と **その event の識別**。 `Gain` では未使用。
+    /// r.md #38: drag 開始時の fade 値と **その event の識別**。
     /// fade の commit 先は clip ではなくこの event 1 つ
     /// (以前は clip 内全 event に broadcast されていた)。
     anchor_fade: Option<ClipEventFade>,
     /// drag 開始時の clip rect (release 時にも参照、 view scroll 中も安定 — track 並び替えや
-    /// scroll で「rect が動いて」 も anchor の dB 0 ライン位置を変えない)。
+    /// scroll で「rect が動いて」 も ghost の描画位置を変えない)。
     clip_rect_anchor: Rect,
     /// drag 開始時の content 写像 (content-local 拍 → 画面 x)。 ghost 描画で clip rect から
     /// event 矩形を切り出すのに使う。 **fade 長の clamp には使わない** (それは event 長 =
@@ -1983,7 +1936,6 @@ pub(crate) struct ArrangementState {
 /// `None` (= sticky direction 未確定 + drag 距離不足) は no-op (release で何も発火しない)。
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AudioDragOutcome {
-    Gain { next_db: f32 },
     FadeLength { edge: FadeEdge, next_beats: f64 },
     FadeCurve { edge: FadeEdge, next_curve: FadeCurve },
 }
@@ -1992,39 +1944,20 @@ enum AudioDragOutcome {
 /// release で同一値を生成する SSoT)。 `None` 戻りは「commit すべき変化なし」 を意味し、 caller は
 /// EditRequest を発火しない。
 ///
-/// - `Gain`: dy * pixels_per_db で dB delta を計算 → anchor + delta、 widget で ±range_db に clamp。
-///   anchor と等しいなら `None`。
 /// - `FadeIn / FadeOut` + horizontal lock: dx を beat 単位に変換、 anchor + delta を `0..clip_len` に
 ///   clamp。 anchor と等しいなら `None`。
 /// - `FadeIn / FadeOut` + vertical lock: 既存 curve.next() を返す (dy 方向は「次 / 前」 を区別せず
 ///   常に順送り、 ユーザは連続 click で SCurve → Linear へ進む)。 同じ curve なら `None`。
 /// - sticky lock 未確定 (= drag 距離が threshold 未満): `None` (release で no-op、 click 相当)。
-fn compute_audio_drag_outcome(
-    ad: &AudioDragSession,
-    beat_per_px: f64,
-    style: &ArrangementStyle,
-) -> Option<AudioDragOutcome> {
+fn compute_audio_drag_outcome(ad: &AudioDragSession, beat_per_px: f64) -> Option<AudioDragOutcome> {
     let dx = ad.last_mouse.0 - ad.anchor_mouse.0;
-    let dy = ad.last_mouse.1 - ad.anchor_mouse.1;
-    let range = style.audio_db_range_db.max(0.001);
     match ad.kind {
-        AudioDragKind::Gain => {
-            // dy 上が負 → gain 増。 px → dB は `pixels_per_db` (default 0.25 dB/px = 4 px/dB)。
-            let delta_db = -dy * style.audio_db_pixels_per_db;
-            let next = (ad.anchor_gain_db + delta_db).clamp(-range, range);
-            if (next - ad.anchor_gain_db).abs() < 1e-3 {
-                None
-            } else {
-                Some(AudioDragOutcome::Gain { next_db: next })
-            }
-        }
         AudioDragKind::FadeIn | AudioDragKind::FadeOut => {
             let lock = ad.locked_horizontal?;
             let anchor = ad.anchor_fade?;
             let edge = match ad.kind {
                 AudioDragKind::FadeIn => FadeEdge::In,
                 AudioDragKind::FadeOut => FadeEdge::Out,
-                AudioDragKind::Gain => unreachable!(),
             };
             if lock {
                 // length 編集: fade_in は dx 正で増、 fade_out は dx 負で増 (event 右端から内側に伸びる)。
@@ -2315,22 +2248,6 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= color_marker;
             h = h.wrapping_mul(PRIME);
             h ^= c.share_group_color.map_or(u64::MAX, |hue| u64::from(hue.to_bits()));
-            h = h.wrapping_mul(PRIME);
-            // M14 Phase 63k (#025): audio_edit (gain_db / fade_in/out_beats / fade curve) も
-            // viewport_key に反映させて、 caller が gain / fade を更新したら cache が再構築されるよう保証。
-            // 旧設計で `audio_edit` を hash に入れない場合、 dB handle line / envelope の表示が
-            // 1 frame 遅れる (#011 と同根の cache miss 不在問題)。 None は固定 sentinel value
-            // (`u64::MAX`) で hash に混ぜて、 None ↔ Some 切替も検知。
-            let audio_marker = match c.audio_edit {
-                None => u64::MAX,
-                Some(audio) => {
-                    let mut a: u64 = 0xDEAD_BEEF_CAFE_BABE;
-                    a ^= u64::from(audio.gain_db.to_bits());
-                    a = a.wrapping_mul(PRIME);
-                    a
-                }
-            };
-            h ^= audio_marker;
             h = h.wrapping_mul(PRIME);
             // r.md #38: fade は content 種別に依らず `fades` (per-event) に移したので、
             // hash も per-event で混ぜる。 混ぜ忘れると fade を編集しても cached が

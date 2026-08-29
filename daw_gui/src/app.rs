@@ -2089,11 +2089,6 @@ impl AppData {
             AppEvent::BounceClipWithFx(target) => {
                 self.bounce_clip_with_fx(target);
             }
-            AppEvent::SetClipGainDbBatch(entries) => {
-                for (target, gain_db) in &entries {
-                    self.set_clip_audio_event_gain_db(*target, *gain_db);
-                }
-            }
             AppEvent::SetClipFadeBeatsBatch(entries) => {
                 for (target, edge, beats) in &entries {
                     let beats = *beats;

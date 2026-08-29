@@ -232,23 +232,15 @@ pub(super) fn commit_releases(
             }
         }
 
-        // ---- M14 Phase 63k (#025): audio_drag release → SetClipGainDb / SetClipFade / SetClipFadeCurve ----
+        // ---- M14 Phase 63k (#025): audio_drag release → SetClipFade / SetClipFadeCurve ----
         // commit-by-release: drag 中は ghost overlay のみ、 release で `compute_audio_drag_outcome` の
         // 結果に応じて 1 件 emit する。 sticky direction 未確定 + drag 距離不足の場合は no-op
         // (= click 相当、 caller 側で selection 等は変化しない、 既存挙動)。 単一 clip 限定の `vec![delta]`
         // で発行 (multi-clip selection 一括は仕様 §scope 外、 将来拡張)。
         if let Some(ad) = audio_drag_release
-            && let Some(out) = compute_audio_drag_outcome(&ad, beat_per_px, style)
+            && let Some(out) = compute_audio_drag_outcome(&ad, beat_per_px)
         {
             match out {
-                AudioDragOutcome::Gain { next_db } => {
-                    let delta = ClipGainDelta {
-                        key: ad.key,
-                        prev_gain_db: ad.anchor_gain_db,
-                        next_gain_db: next_db,
-                    };
-                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipRef, f32)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| (t, d.next_gain_db))).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipGainDbBatch(entries)); } }) });
-                }
                 // r.md #38: fade の commit 先は掴んだ **event 1 つ** (`event_index`)。
                 // 以前は ClipRef だけを載せ、 handler 側が clip 内全 event に broadcast して
                 // いたため、 複数 event を持つ clip では「掴んだ event と書き換わる event」 が

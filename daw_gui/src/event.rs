@@ -1503,12 +1503,10 @@ pub enum AppEvent {
     BounceClipWithFx(ClipRef),
 
     // ---- multi-clip drag batch (Phase 2 PR-B) ---------------------------
-    /// gui_01 widget が multi-clip 一括 drag (= dB / fade / curve) を 1
-    /// release で発行する場合、 各 delta を 1 AppEvent にまとめて 1
-    /// Undo step とする。 delta 数だけ単発 AppEvent を撃つと Undo step
-    /// が分散してしまう (Phase 2 PR-B、 `docs/plan_audio_followup.md` §PR-B)。
-    /// 単発 `SetClipGainDb` 等は Inspector commit 経路で引き続き使用。
-    SetClipGainDbBatch(Vec<(ClipRef, f32)>),
+    // r.md #73: `SetClipGainDbBatch` は撤去した。唯一の発行元がアレンジメントの
+    // 「クリップ中央の横線を上下ドラッグしてゲインを変える」経路で、その機能ごと
+    // 廃止したため (線は 2026-05-08 以来 `Color::TRANSPARENT` で不可視だった)。
+    // クリップゲインの編集は Inspector の `SetClipGainDb` 単発経路に一本化する。
     /// `(target, edge, beats)` 列で fade length を一括設定。
     /// r.md #38: 宛先は clip ではなく **clip 内の 1 event** ([`ClipEventRef`])。
     /// content 種別 (audio / video / image / text) は handler が clip から解決する。
@@ -1703,7 +1701,7 @@ impl AppEvent {
             E::SetClipMuted { .. } | E::SetClipsMuted { .. } => "クリップミュート",
             E::SetClipReversed { .. } | E::ToggleClipReversed(..) => "クリップ逆再生",
             E::SetClipStretchMode { .. } => "ストレッチモード変更",
-            E::SetClipGainDb { .. } | E::SetClipGainDbBatch(..) => "クリップゲイン変更",
+            E::SetClipGainDb { .. } => "クリップゲイン変更",
             E::SetClipPan { .. } => "クリップパン変更",
             E::SetClipPitchSemitones { .. } => "クリップピッチ変更",
             E::SetClipFormantSemitones { .. } => "クリップフォルマント変更",

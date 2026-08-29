@@ -18,7 +18,7 @@ use crate::view::track_color;
 use super::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementMasterRow, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, AutomationPointKey, ClipThumbnail, ClipView, ClipViewAudioEdit, ClipKey,
+    AutomationClipKey, AutomationPointKey, ClipThumbnail, ClipView, ClipKey,
     ClipEventFade, SectionView, TrackKind, pixel_snapped_scroll_beat, view_len_beats,
 };
 
@@ -183,10 +183,6 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         },
                         in_active_group: active_groups.contains(&c.content_id),
                         muted: c.muted,
-                        audio_edit: content
-                            .and_then(|ct| ct.audio_events())
-                            .and_then(|events| events.first())
-                            .map(|ev| ClipViewAudioEdit { gain_db: ev.gain_db }),
                         // r.md #38: fade は content 種別に依らず全 event ぶん渡す
                         // (音声だけ / first event だけ だった旧実装を置換)。
                         // r.md #68: 座標系は **content-local のまま素通し**。 r.md #44 で
@@ -297,8 +293,6 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     // runtime パレットを読めない)。ここで上書きするのは色ではない寸法と、意図的に描画を
     // 止める 1 色だけ。
     let style = ArrangementStyle {
-        // 完全透明で dB handle line の描画だけ抑制する (hit zone は色非依存)。
-        audio_db_handle_color: Color::TRANSPARENT,
         track_text_size: 11.0,
         master_row_label_size: 11.0,
         indent_px: 8.0,

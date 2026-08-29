@@ -275,9 +275,9 @@ fn render_arrangement_heavy(
                 None,
             );
             draw_clips(hctx, &f.visible_tracks, &f.tops, f.view, lanes, f.style);
-            // M14 Phase 63k (#025): audio_edit が Some の clip に dB handle line + fade envelope を重ねる。
+            // M14 Phase 63k (#025): fade を持つ clip に envelope を重ねる。
             // 描画は draw_clips 後 (clip rect の上に重なる)、 selection overlay より前 (selection の
-            // 黄色 fill が上書きしない、 selection 中も dB / fade が見える)。
+            // 黄色 fill が上書きしない、 selection 中も fade が見える)。
             let view_end_for_audio = f.view.start_beat + f.view.len_beats;
             for (i, t) in f.visible_tracks.iter().enumerate() {
                 let row_top = f.tops[i];
@@ -287,7 +287,7 @@ fn render_arrangement_heavy(
                     continue;
                 }
                 for c in &t.clips {
-                    if c.audio_edit.is_none() && c.fades.is_empty() {
+                    if c.fades.is_empty() {
                         continue;
                     }
                     let end = c.start_beat + c.len_beats;
@@ -300,12 +300,6 @@ fn render_arrangement_heavy(
                     }
                     if r.w < f.style.audio_min_clip_w_for_handles_px {
                         continue;
-                    }
-                    if let Some(audio) = c.audio_edit {
-                        // r.md #46 / #73: 標識の色は clip の **実塗り色** から導く
-                        // (fade と同じ SSoT = `clip_effective_fill`)。
-                        let clip_bg = clip_effective_fill(c, t.kind, f.style);
-                        draw_clip_audio_overlay(hctx, r, &audio, clip_bg, f.style);
                     }
                     // r.md #38: fade は content 種別に依らず全 clip 種別に描く
                     // (音声だけでなく映像 / 画像 / 字幕も同じ見た目)。
@@ -588,7 +582,13 @@ fn render_arrangement_heavy(
         // ただし **「いまどの区間を曲げているか」 だけは cache キーに入っている**
         // (`bend_skip`)。 cached 側がその区間の base curve を描かないようにするためで、
         // 値が変わるのは drag の開始と終了の 2 回だけ (毎フレームではない)。
-        draw_bend_overlays(hctx, f, heavy.hovered_segment, overlays.segment_bend.as_ref());
+        draw_bend_overlays(
+            hctx,
+            f,
+            heavy.hovered_segment,
+            overlays.segment_bend.as_ref(),
+            &heavy.selected_automation_clip_set,
+        );
         if let Some((nd, bd, td)) = overlays.clip.as_ref() {
             draw_drag_preview(
                 hctx,
@@ -886,11 +886,16 @@ fn draw_bend_overlays(
     f: &ArrangementFrame<'_>,
     hovered: Option<AutomationPointIdKey>,
     bend: Option<&AutomationSegmentBendSession>,
+    selected_clips: &HashSet<AutomationClipKey>,
 ) {
+    // 強調 / preview の色は「その区間が乗っている面の実効背景」から導くので、
+    // 幾何を引く段階でパレットが要る (`hctx.palette()` は host 寿命の借用なので
+    // 以降 `hctx` を可変で使っても問題ない)。
+    let p = hctx.palette();
     // (1) hover 強調。 drag 中は preview が同じ区間を上塗りするので出さない。
     if let Some(key) = hovered
         && bend.is_none()
-        && let Some(seg) = resolve_bend_segment(f, key)
+        && let Some(seg) = resolve_bend_segment(p, f, key, selected_clips)
     {
         draw_segment_polyline(
             hctx,
@@ -902,7 +907,7 @@ fn draw_bend_overlays(
     }
     // (2) drag 中の preview。 `preview_curve` は毎フレーム逆算済 (drag.rs)。
     if let Some(bd) = bend
-        && let Some(mut seg) = resolve_bend_segment(f, bd.point)
+        && let Some(mut seg) = resolve_bend_segment(p, f, bd.point, selected_clips)
     {
         // 値と clip 描画域は press 時の anchor を使う (drag 中 model は不変なので同値だが、
         // 縦スクロール / lane 高さ変更が同時に起きても preview が飛ばない)。
@@ -923,8 +928,10 @@ fn draw_bend_overlays(
 /// `automation_segment_at` と **同じ式**で x / clip_rect を出す (point dot と curve の x が
 /// ずれる既知バグ #028 user 指摘 2 の再発防止)。
 fn resolve_bend_segment<'a>(
+    p: &daw_ui_core::theme::Palette,
     f: &'a ArrangementFrame<'a>,
     key: AutomationPointIdKey,
+    selected_clips: &HashSet<AutomationClipKey>,
 ) -> Option<ResolvedSegment<'a>> {
     let (lane, clip) = find_lane_clip(&f.visible_tracks, key.clip)?;
     let (p_prev, p_next) = curve::find_automation_segment_by_id(&f.visible_tracks, key)?;
@@ -953,10 +960,20 @@ fn resolve_bend_segment<'a>(
     #[allow(clippy::cast_possible_truncation)]
     let x_next = body_rect.x
         + ((clip.start_beat + p_next.time_beat - f.view.start_beat) * beat_to_px) as f32;
+    // r.md #73: 強調 / preview の色は **その clip が実際に塗られている色**から導く。
+    // 塗りの決め方 (selected > disabled > lane 識別色) と、それを lane 面に合成する式は
+    // cached 側の curve と同じ `draw.rs` のヘルパを通す (2 か所で書くと極性がずれる)。
+    let is_selected = selected_clips.contains(&key.clip);
+    let (fill, _) = automation_clip_colors(p, lane, is_selected, f.style);
+    let eff_bg = automation_clip_eff_bg(fill, f.style);
     Some(ResolvedSegment {
         lane,
-        lane_rect: body_rect,
+        // scissor は cached 側の base curve と同じ **automation clip の矩形**
+        // (`draw_automation_lane` と同じ `automation_clip_rect`)。 lane body 全体で切ると
+        // 「base は clip で切られるのに強調だけクリップ外へはみ出す」 食い違いが出る。
+        scissor: automation_clip_rect(body_rect, f.view, clip.start_beat, clip.len_beats, f.style),
         clip_rect,
+        eff_bg,
         x_prev,
         x_next,
         a_plain: p_prev.value_plain,
@@ -969,9 +986,12 @@ fn resolve_bend_segment<'a>(
 #[derive(Clone, Copy)]
 struct ResolvedSegment<'a> {
     lane: &'a ArrangementAutomationLane,
-    /// lane body 全体 (overlay の scissor)。
-    lane_rect: Rect,
+    /// overlay の scissor (= base curve と同じ automation clip の矩形)。
+    scissor: Rect,
+    /// 値 ↔ y の anchor (lane body に縦 padding を適用したもの)。
     clip_rect: Rect,
+    /// この区間が乗っている面の **実効背景**。強調 / preview の色をここから導く。
+    eff_bg: Color,
     x_prev: f32,
     x_next: f32,
     a_plain: f64,
@@ -979,25 +999,30 @@ struct ResolvedSegment<'a> {
     curve: common::model::AutomationCurve,
 }
 
-/// 1 区間を `curve::flatten_segment` で polyline 化し、**縁取り付き**で押す。
+/// 1 区間を `curve::flatten_segment` で polyline 化して押す。
 ///
-/// r.md #73: 縁取りが要るのは、なぞる相手が **可変背景** だから。 レーンの塗りは
-/// lane 識別色 / テーマ / **選択状態** で変わり、選択中の automation clip の塗りは
-/// `clip_selected_fill = p.selection_warm` — 強調 / preview に使う
-/// `automation_curve_bend_*_color` と **同じトークン**である。 単色でなぞると、
-/// クリップを選択したまま Alt hover した瞬間に線が塗りと同化して**消えて見えた**
-/// (実機で報告。`daw_gui/tests/automation_hover_visual.rs` が機械で止める)。
+/// r.md #73: なぞる相手は **可変背景** である。レーンの塗りは lane 識別色 / テーマ /
+/// **選択状態** で変わり、選択中の automation clip の塗りは
+/// `clip_selected_fill = p.selection_warm` — 強調 / preview のトークン
+/// `automation_curve_bend_*_color` と **同じ値**である。
 ///
-/// 解き方は point dot と同じ idiom — dot は `fill = ink_for(bg)` /
-/// `border = ink_for(fill)` の **逆極性の縁**を持つことで可変背景の上でも輪郭が残る。
-/// 線も同じで、アクセント色の下に逆極性のインクを 1px ずつはみ出させて敷く。
-/// これで背景がどちらの極性でも「線がそこに在る」ことは必ず読める
-/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+/// 解き方は **芯の色を面から導く** の 1 本だけ (`automation_accent_on` =
+/// `Palette::adapt_on`)。色相・彩度を保ったまま図形コントラスト 3:1 を満たす明度まで
+/// 寄せるので、`accent` と面の色が同一トークンでも芯は必ず読める。足りていれば恒等なので、
+/// ダークの非選択レーンでは従来と 1 bit も変わらない。
+///
+/// **縁取りは持たない。** 旧実装は固定色の芯が塗りに沈むのを逆極性の縁で凌ごうとしたが、
+/// それは「消える」を「芯が抜けて縁が 2 本残る」= **二重線**に変換しただけだった
+/// (r.md #73「曲げている最中に線が 2 重に見える」の実体。実ピクセルで確認)。
+/// 芯が必ず読めるようになった今、縁は可視性に寄与しないうえ **害がある** — hover 強調は
+/// base curve を上から覆う作りなので、面と同系色になった縁が base を消して縁の外側に
+/// 断片を残す (実測: 選択中クリップで芯の 1px 下に背景が覗く)。
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)
 fn draw_segment_polyline(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     seg: ResolvedSegment<'_>,
     curve: common::model::AutomationCurve,
-    color: Color,
+    accent: Color,
     line_width_px: f32,
 ) {
     let map = curve::LaneValueMap::from_lane(seg.lane, seg.clip_rect);
@@ -1014,23 +1039,19 @@ fn draw_segment_polyline(
     if pts.len() < 2 {
         return;
     }
-    let outline = hctx.palette().ink_for(color);
-    let mut push = |c: Color, w: f32| {
-        let segments: Vec<daw_ui_renderer::LineSegment> = pts
-            .windows(2)
-            .map(|p| daw_ui_renderer::LineSegment {
-                a: [p[0].0, p[0].1],
-                b: [p[1].0, p[1].1],
-                color: c,
-            })
-            .collect();
-        hctx.push_lines(daw_ui_renderer::LineBatch {
-            segments: segments.into(),
-            line_width_px: w,
-            clip_rect: Some(seg.lane_rect),
-        });
-    };
-    // 縁 → 本体の順 (call order = z 順)。 縁は両側に 1px ずつはみ出す幅。
-    push(outline, line_width_px + 2.0);
-    push(color, line_width_px);
+    // 芯は「その面の上で必ず読める暖色」。面と同一トークンでも沈まない。
+    let color = automation_accent_on(hctx.palette(), seg.eff_bg, accent);
+    let segments: Vec<daw_ui_renderer::LineSegment> = pts
+        .windows(2)
+        .map(|p| daw_ui_renderer::LineSegment {
+            a: [p[0].0, p[0].1],
+            b: [p[1].0, p[1].1],
+            color,
+        })
+        .collect();
+    hctx.push_lines(daw_ui_renderer::LineBatch {
+        segments: segments.into(),
+        line_width_px,
+        clip_rect: Some(seg.scissor),
+    });
 }

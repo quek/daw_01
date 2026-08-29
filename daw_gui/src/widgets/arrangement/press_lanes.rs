@@ -46,7 +46,6 @@ pub(super) fn clip_zone(
         {
             // r.md #38: fade は掴んだ **その event** だけを対象にする。
             let (kind, anchor_fade) = match grip {
-                AudioGripHit::GainHandleBand => (AudioDragKind::Gain, None),
                 AudioGripHit::FadeCornerIn { event_index } => (
                     AudioDragKind::FadeIn,
                     c.fades.iter().find(|f| f.event_index == event_index).copied(),
@@ -63,23 +62,18 @@ pub(super) fn clip_zone(
                 f.view,
                 f.lanes,
             );
-            // Gain は常に vertical lock 確定 (横 drag は無視)、 Fade は press 時 `None` で
-            // sticky direction 待ち (continuation で閾値超えた方向に lock)。
-            let locked_horizontal = match kind {
-                AudioDragKind::Gain => Some(false),
-                _ => None,
-            };
             let session = AudioDragSession {
                 key: hit_key,
                 kind,
-                anchor_gain_db: c.audio_edit.map_or(0.0, |a| a.gain_db),
                 anchor_fade,
                 clip_rect_anchor: r_anchor,
                 content_map_anchor: content_map(c, f.view, f.lanes),
                 clip_bg_anchor: draw::clip_effective_fill(c, t.kind, f.style),
                 anchor_mouse: (px, py),
                 last_mouse: (px, py),
-                locked_horizontal,
+                // press 時は `None` で sticky direction 待ち
+                // (continuation で閾値を超えた方向に lock)。
+                locked_horizontal: None,
             };
             let state: &mut ArrangementState = ui.widget_state(f.wid);
             state.audio_drag = Some(session);

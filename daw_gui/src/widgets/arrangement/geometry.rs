@@ -305,19 +305,15 @@ pub(super) enum AudioGripHit {
     FadeCornerIn { event_index: u32 },
     /// fade out の掴む正方形。
     FadeCornerOut { event_index: u32 },
-    /// clip 中央 horizontal 帯 (handle line ±4 px、 端から x_margin 内側)。 gain dB drag の起点。
-    GainHandleBand,
 }
 
 /// M14 Phase 63k (#025) / r.md #38: 単一 clip の inline grip ヒット。
 ///
-/// priority は **fade handle > gain band**。 fade handle は fade 長で横に動く小さな
-/// 正方形 (= 狙って掴む対象) で、 gain band は clip 中央を横断する大きな帯なので、
-/// 小さい方を優先しないと 「見えているのに掴めない」 領域が出る (行高が低い clip では
-/// 中央帯が上端 12px に食い込む)。
+/// r.md #73: 以前はここに **clip 中央を横断する gain 帯**が同居していて、fade handle より
+/// 低い priority で拾っていた。その帯ごと撤去した (ドラッグ機能の廃止)。
 ///
-/// fade を持たない clip (MIDI / Automation) と `audio_edit` が None の clip では
-/// それぞれ該当ヒットが出ない。 `r.w < min_w` の短 clip では全て無効。
+/// fade を持たない clip (MIDI / Automation) では該当ヒットが出ない。
+/// `r.w < min_w` の短 clip では全て無効。
 /// fade handle は resize handle (4 px) より priority 高、 resize は clip rect の外側 ±4 px で活きる。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn audio_grip_hit(
@@ -330,7 +326,7 @@ pub(super) fn audio_grip_hit(
     cy: f32,
     style: &ArrangementStyle,
 ) -> Option<AudioGripHit> {
-    if clip.audio_edit.is_none() && clip.fades.is_empty() {
+    if clip.fades.is_empty() {
         return None;
     }
     let r = clip_to_rect(track_row_top, track_row_h, clip, view, lanes);
@@ -364,19 +360,6 @@ pub(super) fn audio_grip_hit(
     let fade_hit = fade_hit.map(|(_, h)| h);
     if fade_hit.is_some() {
         return fade_hit;
-    }
-    // priority 2: gain handle band — clip 中央 y ±half_band、 端から x_margin 内側のみ (audio のみ)
-    if clip.audio_edit.is_some() {
-        let center_y = r.y + r.h * 0.5;
-        let half_band = style.audio_db_handle_band_h * 0.5;
-        let margin = style.audio_db_handle_x_margin;
-        if cx >= r.x + margin
-            && cx < r.x + r.w - margin
-            && cy >= center_y - half_band
-            && cy < center_y + half_band
-        {
-            return Some(AudioGripHit::GainHandleBand);
-        }
     }
     None
 }

@@ -32,7 +32,6 @@
             name: Arc::from(name),
             color: None,
             share_group_color: None,
-            audio_edit: None,
             fades: Vec::new(),
             thumbnail: None,
             in_active_group: false,
@@ -77,14 +76,8 @@
         }
     }
 
-    /// M14 Phase 63k (#025): audio_edit が Some の test clip helper。
-    fn audio_clip(
-        id: u32,
-        start: f64,
-        len: f64,
-        name: &str,
-        audio: ClipViewAudioEdit,
-    ) -> ClipView {
+    /// M14 Phase 63k (#025): fade を 1 event ぶん持つ test clip helper。
+    fn audio_clip(id: u32, start: f64, len: f64, name: &str) -> ClipView {
         ClipView {
             id,
             start_beat: start,
@@ -93,7 +86,6 @@
             name: Arc::from(name),
             color: None,
             share_group_color: None,
-            audio_edit: Some(audio),
             // r.md #38: clip 全体を覆う 1 event、 fade 0 (= handle は clip の角に一致)。
             fades: vec![ClipEventFade {
                 event_index: 0,
@@ -1695,36 +1687,35 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = test_style();
-        // 通常 clip (audio_edit = None) は中央 click でも fade 角 click でも None
+        // fade を持たない clip は中央 click でも fade 角 click でも None
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
         // Get hit at clip middle
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 80.0, 16.0, &style),
             None,
-            "audio_edit None の clip は GainHandleBand を返さない"
+            "fade を持たない clip の中央は何も返さない"
         );
         // Get hit at top-left corner
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
             None,
-            "audio_edit None の clip は FadeCornerIn を返さない"
+            "fade を持たない clip は FadeCornerIn を返さない"
         );
     }
 
-    /// audio_edit が Some の clip 中央 (handle band) は GainHandleBand を返す。
+    /// r.md #73: clip 中央には **もう掴み所が無い** (gain の上下ドラッグを撤去した)。
+    /// fade の角だけが残る。
     #[test]
-    fn audio_grip_hit_returns_gain_handle_at_clip_middle() {
+    fn audio_grip_hit_returns_nothing_at_clip_middle() {
         let view = test_view();
         let lanes = test_lanes();
         let style = test_style();
-        // clip rect = (0, 2, 160, 28), 中央 (80, 16) は handle band 内
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
-        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
-        // clip 中央 y = r.y + r.h / 2 = 2 + 14 = 16
-        // x = 80 (clip 中央)、 端 (0/160) から 24 px margin 内
+        // clip rect = (0, 2, 160, 28)、中央 (80, 16) は旧 gain handle band の内側。
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c")])];
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 80.0, 16.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::GainHandleBand))
+            None,
+            "clip 中央の gain 帯は撤去済み"
         );
     }
 
@@ -1734,8 +1725,7 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
-        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c")])];
         // clip rect = (0, 2, 160, 28)、名前帯 = 14px → 中身領域は y ∈ [16, 30)。
         // 掴む正方形は (0..12, 16..28) → cx=6, cy=20。
         assert_eq!(
@@ -1756,8 +1746,7 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
-        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c")])];
         // clip rect = (0, 2, 160, 28) → 掴む正方形は (148..160, 16..28) → cx=155, cy=20。
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 20.0, &style),
@@ -1771,9 +1760,8 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // len_beats=0.5 → w = 20px、 default min = 32 → grip disable
-        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c", audio)])];
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c")])];
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 10.0, 16.0, &style),
             None
@@ -1792,68 +1780,16 @@
         assert_eq!(FadeCurve::SCurve.next(), FadeCurve::Linear);
     }
 
-    /// compute_audio_drag_outcome: Gain drag は dy 上で gain_db 増加 (pixels_per_db = 0.25 default)。
-    #[test]
-    fn compute_audio_drag_outcome_gain_changes_db_by_pixels() {
-        let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
-        let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
-            kind: AudioDragKind::Gain,
-            anchor_gain_db: audio.gain_db,
-            anchor_fade: None,
-            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
-            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 25.0 },
-            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
-            anchor_mouse: (50.0, 14.0),
-            // dy = -20 (上に 20 px) → next_db = 0 + (-(-20) * 0.25) = +5.0
-            last_mouse: (50.0, -6.0),
-            locked_horizontal: Some(false),
-        };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
-            Some(AudioDragOutcome::Gain { next_db }) => {
-                assert!((next_db - 5.0).abs() < 1e-3, "+20px = +5dB: got {next_db}");
-            }
-            other => panic!("expected Gain, got {other:?}"),
-        }
-    }
-
-    /// compute_audio_drag_outcome: Gain drag は ±range_db に clamp される。
-    #[test]
-    fn compute_audio_drag_outcome_gain_clamps_to_range() {
-        let style = test_style(); // range = 24 dB
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
-        // dy = -200 → +50 dB raw → clamped to +24
-        let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
-            kind: AudioDragKind::Gain,
-            anchor_gain_db: audio.gain_db,
-            anchor_fade: None,
-            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
-            content_map_anchor: ContentMap { origin_x: 0.0, px_per_beat: 25.0 },
-            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
-            anchor_mouse: (50.0, 14.0),
-            last_mouse: (50.0, -186.0),
-            locked_horizontal: Some(false),
-        };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
-            Some(AudioDragOutcome::Gain { next_db }) => {
-                assert!((next_db - 24.0).abs() < 1e-3, "clamped to +24 dB: got {next_db}");
-            }
-            other => panic!("expected Gain, got {other:?}"),
-        }
-    }
+    // r.md #73: `compute_audio_drag_outcome` の Gain 分岐 (dy → dB、 ±range clamp) の
+    // 2 件は、クリップ中央のゲインドラッグごと撤去したので削除した。
 
     /// compute_audio_drag_outcome: FadeIn + horizontal lock は dx 正で fade_in_beats 増加。
     /// beat_per_px = 0.025 (= 40 px/beat), dx = +40 px → +1 beat.
     #[test]
     fn compute_audio_drag_outcome_fade_in_horizontal_changes_length() {
-        let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor_gain_db: audio.gain_db,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
@@ -1865,7 +1801,7 @@
             last_mouse: (40.0, 0.0),
             locked_horizontal: Some(true),
         };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+        match compute_audio_drag_outcome(&ad, 0.025) {
             Some(AudioDragOutcome::FadeLength { edge, next_beats }) => {
                 assert_eq!(edge, FadeEdge::In);
                 // anchor 0.5 + delta 1.0 = 1.5
@@ -1878,12 +1814,9 @@
     /// FadeOut + horizontal lock は dx **負** で fade_out_beats 増加 (右側から内側に伸びる)。
     #[test]
     fn compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx() {
-        let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeOut,
-            anchor_gain_db: audio.gain_db,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
                 fade: ev_fade(4.0, 0.0, 0.5, FadeCurve::Linear, FadeCurve::Linear),
@@ -1895,7 +1828,7 @@
             last_mouse: (120.0, 0.0), // dx = -40
             locked_horizontal: Some(true),
         };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+        match compute_audio_drag_outcome(&ad, 0.025) {
             Some(AudioDragOutcome::FadeLength { edge, next_beats }) => {
                 assert_eq!(edge, FadeEdge::Out);
                 // dx=-40 → -40 * 0.025 = -1.0、 FadeOut signed = -(-1) = +1
@@ -1909,13 +1842,10 @@
     /// fade length は `0..=clip_len_beats` に clamp される。
     #[test]
     fn compute_audio_drag_outcome_fade_length_clamps_to_clip_len() {
-        let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // dx = +400 px @ 0.025 beat/px = +10 beat → 0.5 + 10 = 10.5、 clamp to clip_len 4.0
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor_gain_db: audio.gain_db,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
@@ -1927,7 +1857,7 @@
             last_mouse: (400.0, 0.0),
             locked_horizontal: Some(true),
         };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+        match compute_audio_drag_outcome(&ad, 0.025) {
             Some(AudioDragOutcome::FadeLength { next_beats, .. }) => {
                 assert!((next_beats - 4.0).abs() < 1e-6, "clamped to 4.0: got {next_beats}");
             }
@@ -1940,11 +1870,9 @@
     /// (trim / split 後) では event 長で頭打ちにならないと絵と実挙動がずれる。
     #[test]
     fn compute_audio_drag_outcome_fade_length_clamps_to_event_len_not_clip_len() {
-        let style = test_style();
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor_gain_db: 0.0,
             // clip は 4 拍だが event は先頭 1 拍だけ。
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
@@ -1957,7 +1885,7 @@
             last_mouse: (400.0, 0.0), // +10 beat 相当
             locked_horizontal: Some(true),
         };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+        match compute_audio_drag_outcome(&ad, 0.025) {
             Some(AudioDragOutcome::FadeLength { next_beats, .. }) => {
                 assert!(
                     (next_beats - 1.0).abs() < 1e-6,
@@ -2168,12 +2096,9 @@
     /// FadeIn + vertical lock は curve 切替を返す (Linear → Exponential)。
     #[test]
     fn compute_audio_drag_outcome_fade_in_vertical_toggles_curve() {
-        let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor_gain_db: audio.gain_db,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
@@ -2185,7 +2110,7 @@
             last_mouse: (0.0, -20.0),
             locked_horizontal: Some(false),
         };
-        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+        match compute_audio_drag_outcome(&ad, 0.025) {
             Some(AudioDragOutcome::FadeCurve { edge, next_curve }) => {
                 assert_eq!(edge, FadeEdge::In);
                 assert_eq!(next_curve, FadeCurve::Exponential);
@@ -2197,12 +2122,9 @@
     /// sticky direction 未確定 (locked_horizontal = None) は no-op (None) を返す。
     #[test]
     fn compute_audio_drag_outcome_unlocked_returns_none() {
-        let style = test_style();
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor_gain_db: audio.gain_db,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
                 fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
@@ -2214,30 +2136,19 @@
             last_mouse: (3.0, 4.0), // < threshold 10 px
             locked_horizontal: None,
         };
-        assert_eq!(compute_audio_drag_outcome(&ad, 0.025, &style), None);
+        assert_eq!(compute_audio_drag_outcome(&ad, 0.025), None);
     }
 
-    /// fold_arrangement_clip_hash: audio_edit の gain_db / fade を変えると hash が変わる。
-    #[test]
-    fn fold_arrangement_clip_hash_changes_on_gain_db() {
-        let audio_a = ClipViewAudioEdit { gain_db: 0.0 };
-        let audio_b = ClipViewAudioEdit { gain_db: 3.0 };
-        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
-        let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
-        assert_ne!(
-            fold_arrangement_clip_hash(&before),
-            fold_arrangement_clip_hash(&after),
-            "audio_edit.gain_db 変化で hash が変わる (cache 再構築保証)"
-        );
-    }
+    // r.md #73: `fold_arrangement_clip_hash_changes_on_gain_db` は削除した。 gain_db は
+    // dB ハンドル線を描くためだけに widget モデル (`ClipView::audio_edit`) へ渡っていた値で、
+    // 線ごと撤去したので widget はもう gain を知らない = hash に混ぜる対象でもない。
 
     #[test]
     fn fold_arrangement_clip_hash_changes_on_fade_curve() {
         // r.md #38: fade は `ClipView.fades` (per-event) に移ったので、 hash も
         // そちら経由で反応しなければならない (混ぜ忘れると fade を編集しても
         // cached が再構築されず線が更新されない)。
-        let audio = ClipViewAudioEdit { gain_db: 0.0 };
-        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c")])];
         let mut after = before.clone();
         after[0].clips[0].fades[0].fade.fade_in_curve = FadeCurve::Exponential;
         assert_ne!(
