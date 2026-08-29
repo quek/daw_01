@@ -245,12 +245,9 @@ fn render_arrangement_heavy(
     // `below_ruler` は ruler 下の領域 (= header_pane ∪ lanes)、 automation lane / reorder
     // overlay 等 header と lanes をまたぐ draw 用。 ruler / loop_band / playhead は
     // track_top に依存しない static draw なので scope 外に置いて既存挙動維持。
-    let below_ruler = Rect {
-        x: header_pane.x.min(lanes.x),
-        y: header_pane.y,
-        w: header_pane.w + lanes.w,
-        h: lanes.h,
-    };
+    // r.md #87: ランチャー帯が header と lanes の間に挟まるので、幅は `f` が持つ
+    // 実測値を使う (`header_pane.w + lanes.w` で再導出すると帯のぶん右端が欠ける)。
+    let below_ruler = f.content_below_ruler;
     // === cached: viewport_key 一致時 skip ===
     hctx.cached(heavy.viewport_key_hash, |hctx| {
         push_filled_rect(hctx, header_pane, f.style.header_bg);
@@ -840,7 +837,7 @@ fn render_arrangement_heavy(
                 push_filled_rect(hctx, hl, f.style.reorder_group_highlight);
             }
             // (2) 深さ連動 drop indicator 横線。 左端 = indent 列、 右端 = header + lanes。
-            let line_right = header_pane.x + header_pane.w + lanes.w;
+            let line_right = f.content_below_ruler.x + f.content_below_ruler.w;
             let line_x = ov.indent_x.min(line_right - 1.0);
             push_filled_rect(
                 hctx,

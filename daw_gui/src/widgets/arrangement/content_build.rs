@@ -24,7 +24,7 @@ use super::{ArrangementTrack, ClipDragKind, ClipDragSession, ClipKey, MASTER_TRA
 
 /// time-stretch プレビューの写像パラメータ (`stretch_clip_content` の引数と同じ形)。
 #[derive(Clone, Copy, Debug)]
-struct StretchPreview {
+pub(super) struct StretchPreview {
     prev_start: f64,
     prev_len: f64,
     new_start: f64,
@@ -155,7 +155,7 @@ pub(super) fn build_stretch_ghost_content(
 /// clip 1 件の中身を組む。 `stretch` を渡すと time-stretch 後の内容になる。
 ///
 /// `spans` は使い回しバッファ (毎フレーム全 event ぶん確保しないため)。
-fn build_one(
+pub(super) fn build_one(
     app: &AppData,
     tempo_map: &TempoMap,
     mc: &Clip,

@@ -434,7 +434,7 @@ pub(super) fn overlays(
                 f.visible_tracks.iter().position(|t| t.id == pid).map(|vi| {
                     let y = f.tops.get(vi).copied().unwrap_or(f.header_pane.y);
                     let h = effective_track_row_h(&f.visible_tracks[vi], f.view.track_row_h);
-                    Rect { x: f.header_pane.x, y, w: f.header_pane.w + f.lanes.w, h }
+                    Rect { x: f.content_below_ruler.x, y, w: f.content_below_ruler.w, h }
                 })
             });
             ReorderOverlay { indicator_y, indent_x, drag_center_y: tr.last_mouse_y, highlight_row }

@@ -79,6 +79,14 @@ mod drag;
 mod frame;
 use frame::*;
 mod header;
+// r.md #87: クリップランチャー (セッションビュー) の帯。 既存 4 ファイルが 1,000 行
+// budget に近いので **新規コードはここへ足さず** `launcher/` 配下に分けて置く
+// (不変条件 9)。 帯の型は caller が読むので選んで re-export する。
+mod launcher;
+pub use launcher::{
+    ClipCopyMode, ClipToCellDrop, CellToClipDrop, LauncherCellKey, LauncherCellMove,
+    LauncherIntent, LauncherResponse,
+};
 mod press;
 use press::*;
 mod press_header;
@@ -900,6 +908,10 @@ pub struct ArrangementResponse {
     /// **caller はこれを heavy cache キーに混ぜないこと** (マウス移動のたびに
     /// アレンジ全体が再構築される)。強調描画は overlay 層で行う。
     pub hovered_automation_segment: Option<AutomationPointIdKey>,
+    /// r.md #87: クリップランチャー帯の rect 群と、このフレームに起きた
+    /// [`LauncherIntent`] の列。 **widget は発火も `Song` 編集もしない** ので、
+    /// caller (束 D) がこの意図を `AppEvent` / `AudioCommand` へ翻訳する。
+    pub launcher: LauncherResponse,
 }
 
 impl Default for ArrangementResponse {
@@ -933,6 +945,7 @@ impl Default for ArrangementResponse {
             automation_lane_default_rects: Vec::new(),
             automation_point_drag: None,
             hovered_automation_segment: None,
+            launcher: LauncherResponse::default(),
         }
     }
 }
@@ -1924,6 +1937,10 @@ pub(crate) struct ArrangementState {
     /// 端スクロールは「press からここまでの移動が `ACTIVATE_PX` 以上」 のときのみ発火させ、端近くの
     /// clip を click-and-hold しただけで view が動くのを防ぐ (実 DAW は実ドラッグで初めて端スクロール)。
     edge_scroll_press: Option<(f32, f32)>,
+    /// r.md #87: クリップランチャー帯の drag session 群 (帯幅 / 列幅 / 列の並べ替え /
+    /// セルの移動 / 押しっぱなしのボタン)。 帯の session は 5 種あるので、
+    /// `ArrangementState` を 5 フィールド太らせず 1 つの束にまとめて持つ。
+    pub(crate) launcher: launcher::LauncherState,
     /// 直近 primary press 時の modifier snapshot。 track header の選択更新
     /// (release frame で確定する click) が読む — release frame の `pointer.modifiers`
     /// 生読みは「ModifiersChanged が MouseInput(Released) より先に届く」 race で

@@ -8,6 +8,12 @@
 //! 幾何 (widget 固定レイアウト): ruler=20px / arranger 帯=18px (y∈[20,38)) / lanes は y≥38。
 //! `arrange_header_w=0` / `arrange_zoom_x=64` (1 拍=64px) / `arrange_scroll_beat=0` / snap 無効で
 //! beat→x = beat*64。 master row が lanes 先頭に 1 行入るので track 0 は `38 + row_h` から。
+//!
+//! r.md #87 (クリップランチャー): 帯はヘッダとレーンの**間**に入る。このファイルは
+//! **アレンジ側**の interaction の回帰網なので、fixture は帯を `ArrangerOnly` に畳んで
+//! 回す。畳んでも掴み代 ([`LAUNCHER_GRAB_W`]) は必ず残る仕様なので、**widget の原点を
+//! その幅ぶん左へ出して `lanes` の左端と幅を従来どおりに保つ** — こうしないと
+//! 全テストの x 定数が 6px ずれる。y は帯の影響を受けない。
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -29,7 +35,15 @@ use daw_ui_core::{FrameInput, PointerFrame, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Color, Primitive, Rect, Scene};
 
-const WIDGET_RECT: Rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+/// r.md #87: ランチャー帯を畳みきっても残る掴み代 (`launcher::GRAB_W`)。
+/// これが残るので「一度アレンジのみにしたら帯を戻せない」が起きない。
+const LAUNCHER_GRAB_W: f32 = 12.0;
+/// widget の矩形。 **原点を掴み代ぶん左へ出す**ので、`lanes` は従来どおり
+/// `x = arrange_header_w` から幅 800 - `arrange_header_w` になる。
+const WIDGET_RECT: Rect =
+    Rect { x: -LAUNCHER_GRAB_W, y: 0.0, w: 800.0 + LAUNCHER_GRAB_W, h: 600.0 };
+/// `lanes` の右端 (= 従来の `WIDGET_RECT.w`)。
+const LANES_RIGHT: f32 = 800.0;
 const ZOOM: f32 = 64.0;
 const ROW_H: f32 = 50.0;
 /// 帯 (arranger lane) の縦中央 y。
@@ -74,7 +88,15 @@ fn build_app_with_header(
     app.ui_prefs.arrange_track_row_h = ROW_H;
     app.ui_prefs.arrange_track_top = 0.0;
     app.ui_prefs.arrange_snap_enabled = false;
+    // r.md #87: 帯は畳んだ状態で回す (このファイルはアレンジ側の回帰網)。
+    app.ui_prefs.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
     (app, audio_rx, plugin_rx)
+}
+
+/// header pane の右端 x (= ランチャー帯の左端)。 widget の原点が掴み代ぶん
+/// 左へ出ているので、 header 相対の座標は `HEADER_W` ではなくここから測る。
+fn header_right(header_w: f32) -> f32 {
+    WIDGET_RECT.x + header_w
 }
 
 fn modifiers(ctrl: bool, shift: bool, alt: bool) -> Modifiers {
@@ -681,7 +703,7 @@ fn video_clip_thumbnails_tile_across_the_visible_range() {
         let left = tiles.iter().fold(f32::MAX, |m, t| m.min(t.x));
         let right = tiles.iter().fold(f32::MIN, |m, t| m.max(t.x + t.w));
         assert!(left <= 0.0, "{what}: 左端まで届く: got {left}");
-        assert!(right >= WIDGET_RECT.w, "{what}: 右端まで届く: got {right}");
+        assert!(right >= LANES_RIGHT, "{what}: 右端まで届く: got {right}");
     }
 }
 
@@ -1043,8 +1065,8 @@ fn header_volume_band_drag_changes_track_volume() {
     let (bx, by) = volume_band_center(&scene, track0_y() - ROW_H * 0.5)
         .expect("track 0 の volume band が描かれている");
     drive(&mut host, &mut app, press(bx, by, no_mods()));
-    drive(&mut host, &mut app, hold(HEADER_W - 10.0, by, no_mods()));
-    drive(&mut host, &mut app, release(HEADER_W - 10.0, by, no_mods()));
+    drive(&mut host, &mut app, hold(header_right(HEADER_W) - 10.0, by, no_mods()));
+    drive(&mut host, &mut app, release(header_right(HEADER_W) - 10.0, by, no_mods()));
     let after = track_volume_of(&app, 1);
     assert!(after > before, "右へ引いたら音量が上がる: before={before} after={after}");
 }
@@ -1058,7 +1080,7 @@ fn header_row_click_selects_track() {
     let mut host = UiHost::no_redraw();
     // 名前帯 / M·S·R / volume band / lane disclosure を避けた行上部の空き。
     let y = track0_y() - ROW_H * 0.4;
-    let x = HEADER_W - 8.0;
+    let x = header_right(HEADER_W) - 8.0;
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert_eq!(app.selection.selected_track_ids, vec![1], "行 click でそのトラックが選択される");
@@ -1084,7 +1106,7 @@ fn header_release_during_external_drag_does_not_select_track() {
     // 押した場所はインスペクタ側 (= この widget の外) なので press は起こさない。
     // 掴んだままヘッダの上へ来て、そこで離す。
     let y = track0_y() - ROW_H * 0.4;
-    let x = HEADER_W - 8.0;
+    let x = header_right(HEADER_W) - 8.0;
     drive_dragging(&mut host, &mut app, hold(x, y, no_mods()));
     drive_dragging(&mut host, &mut app, release(x, y, no_mods()));
     assert!(
@@ -1115,7 +1137,7 @@ fn header_master_row_click_selects_master() {
     app.selection.selected_track_ids.clear();
     let mut host = UiHost::no_redraw();
     let y = master_row_y();
-    let x = HEADER_W - 8.0;
+    let x = header_right(HEADER_W) - 8.0;
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert_eq!(
@@ -1132,7 +1154,7 @@ fn header_lane_disclosure_click_collapses_lanes() {
     assert!(app.ui_prefs.expanded_automation_tracks.contains(&1), "前提: 展開されている");
     let mut host = UiHost::no_redraw();
     // `layout.lane_disc_rect` は S ボタンの右 = 行の右端寄り。
-    let x = HEADER_W - 6.0;
+    let x = header_right(HEADER_W) - 6.0;
     let y = track0_y() - ROW_H * 0.25;
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
@@ -1184,7 +1206,7 @@ fn popup_open_header_press_does_not_select_track() {
     app.selection.selected_track_ids.clear();
     let mut host = UiHost::no_redraw();
     let y = track0_y() - ROW_H * 0.4;
-    let x = HEADER_W - 8.0;
+    let x = header_right(HEADER_W) - 8.0;
     for p in [press(x, y, no_mods()), release(x, y, no_mods())] {
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
@@ -1257,9 +1279,10 @@ fn header_splitter_in_arranger_band_does_not_start_section_drag() {
     let start_before = section_start(&app, 1);
     let mut host = UiHost::no_redraw();
     // header splitter の hot zone は境界 ±`header_resize_handle_px/2`。
-    drive(&mut host, &mut app, press(HEADER_W + 1.0, SEC_Y, no_mods()));
-    drive(&mut host, &mut app, hold(HEADER_W + 60.0, SEC_Y, no_mods()));
-    drive(&mut host, &mut app, release(HEADER_W + 60.0, SEC_Y, no_mods()));
+    let bx = header_right(HEADER_W) + 1.0;
+    drive(&mut host, &mut app, press(bx, SEC_Y, no_mods()));
+    drive(&mut host, &mut app, hold(bx + 59.0, SEC_Y, no_mods()));
+    drive(&mut host, &mut app, release(bx + 59.0, SEC_Y, no_mods()));
     assert_eq!(section_start(&app, 1), start_before, "section は動かない");
     assert!(
         app.ui_prefs.arrange_header_w > HEADER_W + 1.0,
@@ -1277,9 +1300,10 @@ fn header_splitter_in_ruler_does_not_seek_playhead() {
     let before = app.transport.playhead_beat;
     let mut host = UiHost::no_redraw();
     let ruler_y = 10.0;
-    drive(&mut host, &mut app, press(HEADER_W + 1.0, ruler_y, no_mods()));
-    drive(&mut host, &mut app, hold(HEADER_W + 60.0, ruler_y, no_mods()));
-    drive(&mut host, &mut app, release(HEADER_W + 60.0, ruler_y, no_mods()));
+    let bx = header_right(HEADER_W) + 1.0;
+    drive(&mut host, &mut app, press(bx, ruler_y, no_mods()));
+    drive(&mut host, &mut app, hold(bx + 59.0, ruler_y, no_mods()));
+    drive(&mut host, &mut app, release(bx + 59.0, ruler_y, no_mods()));
     assert_eq!(app.transport.playhead_beat, before, "playhead は動かない");
     assert!(
         app.ui_prefs.arrange_header_w > HEADER_W + 1.0,
@@ -1401,9 +1425,9 @@ fn heavy_lanes_bg_is_drawn_before_header_rows() {
             _ => false,
         })
     };
-    let a = index_of(Rect { x: HEADER_W, y: 38.0, w: WIDGET_RECT.w - HEADER_W, h: lanes_h })
+    let a = index_of(Rect { x: HEADER_W, y: 38.0, w: LANES_RIGHT - HEADER_W, h: lanes_h })
         .expect("heavy が置く lanes 全面の背景");
-    let b = index_of(Rect { x: 0.0, y: 38.0, w: HEADER_W, h: ROW_H })
+    let b = index_of(Rect { x: WIDGET_RECT.x, y: 38.0, w: HEADER_W, h: ROW_H })
         .expect("master 行 header の panel");
     assert!(
         b > a,
@@ -1992,5 +2016,154 @@ fn bend_drag_does_not_leave_the_original_curve_showing() {
         1,
         "release 後も 1 本 (got {:?})",
         line_positions_at(&after, band, gx)
+    );
+}
+
+// ============================================================
+// r.md #87: クリップランチャー帯
+// ============================================================
+
+/// 帯を出した状態の fixture (既定の `build_app_with_header` は畳んで回す)。
+fn app_with_launcher(
+    header_w: f32,
+    pane_w: f32,
+) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
+    let (mut app, a, p) = build_app_with_header(header_w);
+    app.ui_prefs.launcher_layout = common::model::LauncherLayout::Both;
+    app.ui_prefs.launcher_width = pane_w;
+    (app, a, p)
+}
+
+/// トラック行に列 1 つとセル 1 つを足す。
+fn add_session_cell(app: &mut AppData, track_id: u32, clip_id: u32, len: f64) {
+    app.edit_song(|song| {
+        let scene_id = song.push_scene();
+        let cid: ContentId = song.alloc_content_id();
+        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent::default()));
+        if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
+            t.session_clips.push(common::model::SessionClip {
+                scene_id,
+                clip: Clip {
+                    id: clip_id,
+                    content_id: cid,
+                    start_beat: 0.0,
+                    length_beats: len,
+                    ..Clip::default()
+                },
+                launch: common::model::LaunchSettings::default(),
+            });
+        }
+    });
+}
+
+/// 帯はヘッダとアレンジのレーンの **間** に入り、その幅ぶんレーンが右へ寄る。
+#[test]
+fn launcher_pane_sits_between_header_and_lanes() {
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 200.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    let mut host = UiHost::no_redraw();
+    let r = drive_response(&mut host, &mut app, PointerFrame::default());
+    assert!(
+        (r.launcher.pane_rect.x - header_right(HEADER_W)).abs() < 0.5,
+        "帯の左端 = ヘッダの右端: got {}",
+        r.launcher.pane_rect.x
+    );
+    assert!(
+        (r.launcher.pane_rect.w - 200.0).abs() < 0.5,
+        "帯幅は ui_prefs の値: got {}",
+        r.launcher.pane_rect.w
+    );
+    assert!(
+        (r.lanes_rect.x - (r.launcher.pane_rect.x + r.launcher.pane_rect.w)).abs() < 0.5,
+        "アレンジのレーンは帯の右端から始まる: lanes.x={} pane 右端={}",
+        r.lanes_rect.x,
+        r.launcher.pane_rect.x + r.launcher.pane_rect.w
+    );
+    assert!(!r.launcher.cell_rects.is_empty(), "格子のセルが caller に返る");
+}
+
+/// セルの ▶ を押す → `Launch` の意図が返る。**widget は `Song` を書かない**
+/// (主導権の書き換えと発火は束 D / 束 B の担当)。
+#[test]
+fn launcher_cell_play_button_reports_a_launch_intent() {
+    use daw_gui::widgets::arrangement::LauncherIntent;
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    add_session_cell(&mut app, 1, 9, 4.0);
+    let mut host = UiHost::no_redraw();
+    let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
+    let (_, rect) = r0
+        .launcher
+        .cell_rects
+        .iter()
+        .copied()
+        .find(|(k, _)| k.clip_id == 9)
+        .expect("置いたセルの rect が返る");
+    // ▶ はセルの左端 (`launch_button_rect`)。
+    let (x, y) = (rect.x + 4.0, rect.y + rect.h * 0.5);
+    let r1 = drive_response(&mut host, &mut app, press(x, y, no_mods()));
+    assert!(
+        r1.launcher.intents.iter().any(|i| matches!(
+            i,
+            LauncherIntent::Launch { cell, pressed: true } if cell.clip_id == 9
+        )),
+        "▶ の押下で Launch: {:?}",
+        r1.launcher.intents
+    );
+    let r2 = drive_response(&mut host, &mut app, release(x, y, no_mods()));
+    assert!(
+        r2.launcher.intents.iter().any(|i| matches!(
+            i,
+            LauncherIntent::Launch { cell, pressed: false } if cell.clip_id == 9
+        )),
+        "離しでも 1 件 (`LaunchMode::Gate` の停止契機): {:?}",
+        r2.launcher.intents
+    );
+    assert_eq!(
+        app.song_doc.song().tracks[0].launcher,
+        common::model::RowPlayback::Arranger,
+        "widget は主導権を書き換えない"
+    );
+}
+
+/// 空セルのダブルクリック → `CreateCell` の意図。**列はまだ実体化しない**
+/// (実体化は handler 側。ここで `Song.scenes` を触ると「開いただけで `*`」になる)。
+#[test]
+fn launcher_empty_cell_double_click_reports_create_cell() {
+    use daw_gui::widgets::arrangement::{ArrangementRowKey, LauncherIntent};
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    let mut host = UiHost::no_redraw();
+    let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
+    let (key, rect) = r0
+        .launcher
+        .cell_rects
+        .iter()
+        .copied()
+        .find(|(k, _)| k.row == ArrangementRowKey::Track(1) && k.scene_index == 0)
+        .expect("トラック 1 行の 0 列目");
+    assert!(key.is_empty(), "列が無いのでプレースホルダの空セル");
+    let (x, y) = (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+    let mut last = None;
+    for p in [
+        press(x, y, no_mods()),
+        release(x, y, no_mods()),
+        press(x, y, no_mods()),
+        release(x, y, no_mods()),
+    ] {
+        last = Some(drive_response(&mut host, &mut app, p));
+    }
+    let r = last.expect("4 フレーム走らせた");
+    assert!(
+        r.launcher.intents.iter().any(|i| matches!(
+            i,
+            LauncherIntent::CreateCell { row: ArrangementRowKey::Track(1), scene_index: 0 }
+        )),
+        "空セルのダブルクリックで CreateCell: {:?}",
+        r.launcher.intents
+    );
+    assert!(
+        app.song_doc.song().scenes.is_empty(),
+        "widget は列を実体化しない (開いただけで `*` が立たない)"
     );
 }

@@ -47,7 +47,6 @@ pub(super) fn commit_releases(
     let ruler: Rect = f.ruler;
     let header_pane: Rect = f.header_pane;
     let arranger_rect: Rect = f.arranger_rect;
-    let lanes_h: f32 = f.lanes_h;
     let arranger_lane_h: f32 = f.arranger_lane_h;
     let beat_per_px: f64 = f.beat_per_px;
     let zoom_x_px_per_beat: f32 = f.zoom_x_px_per_beat;
@@ -88,6 +87,10 @@ pub(super) fn commit_releases(
         // では `allow_update = false` で保持されるので OS event 順序に依存しない。 overlay の snap
         // 判定とも同一値で確定し、 「release で grid に飛ぶ」 不整合が起きない。
         let clip_drag_release_was_some = clip_drag_release.is_some();
+        // r.md #87: ランチャー帯の上で離したら、アレンジ側の移動ではなく
+        // 「セルへ落とした」意図 (`DropClipsToCells`) に振り替える。
+        let clip_drag_release = clip_drag_release
+            .filter(|nd| !launcher::release::take_arrangement_drop(f, nd, response));
         if let Some(nd) = clip_drag_release {
             let release_alt = nd.last_alt;
             let (beat_delta, track_delta): (f64, i32) = {
@@ -994,12 +997,9 @@ pub(super) fn commit_releases(
         // (`mx - lanes.x`) が header 上 (`mx < lanes.x`) では意味を成さないため header 上では無視する
         // (= `over_lanes` で gate)。 lanes 上の 4 操作はすべて従来どおり (header_w==0 なら content 全域 ==
         // lanes、 over_lanes は常に true で旧挙動と byte 互換)。
-        let content_below_ruler = Rect {
-            x: header_pane.x,
-            y: header_pane.y,
-            w: header_pane.w + lanes.w,
-            h: lanes_h,
-        };
+        // r.md #87: ランチャー帯も縦スクロールの取得域に含める (行はヘッダ / 帯 /
+        // レーンで共有なので、帯の上でホイールを回しても行が動くのが正しい)。
+        let content_below_ruler = f.content_below_ruler;
         let scroll = ui.take_scroll_in_rect(content_below_ruler);
         if scroll.1.abs() > 0.0 || scroll.0.abs() > 0.0 {
             let dy = scroll.1;

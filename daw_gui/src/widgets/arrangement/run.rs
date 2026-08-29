@@ -21,17 +21,24 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     press::dispatch(ui, &f);
     // 3. drag 継続 + 端オートスクロール + per-frame live 発火。
     drag::advance(ui, &f);
+    launcher::drag::advance(ui, &f);
     // 4. session の overlay 用スナップショットと release take。
     let (live, released) = sessions::take(ui, &f, &mut response);
+    let launcher_sessions = launcher::drag::take(ui, &f);
     let overlays = sessions::overlays(&f, &live, &released);
     // 5. hover 判定 → cursor 決定 (cursor は hover が書いた response を読む)。
     cursor::hover(&f, &live, &mut response);
     cursor::apply(ui, &f, &live, &response);
+    launcher::press::cursor(ui, &f);
     // 6. heavy 描画 → release commit → track header 描画 (この 3 つの順が z 順)。
     render::dispatch(ui, app, &f, &overlays, &response);
     release::commit_releases(ui, &f, &mut response, released);
     let clicks = header::draw_rows(ui, &f, &live, &mut response);
     header::commit_clicks(ui, &f, clicks, &mut response);
+    // 6b. ランチャー帯 (r.md #87)。 帯はヘッダ / レーンと x が排他なので z の競合は無いが、
+    //     ランチャー主導の行の減光だけはアレンジのクリップの上に乗るので **この位置**。
+    launcher::draw::dispatch(ui, app, &f, &launcher_sessions, &mut response);
+    launcher::release::commit(ui, &f, launcher_sessions, &mut response);
     // 7. caller 向け rect 群の収集。
     rects::collect(&f, &live, &mut response);
 

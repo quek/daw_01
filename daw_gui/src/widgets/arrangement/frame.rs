@@ -41,7 +41,14 @@ pub(super) struct ArrangementFrame<'a> {
     pub lanes: Rect,
     pub header_w: f32,
     pub arranger_lane_h: f32,
-    pub lanes_h: f32,
+    /// r.md #87: ルーラーより下の内容全域 (`header_pane` ∪ ランチャー帯 ∪ `lanes`)。
+    /// **`header_pane.w + lanes.w` で再導出しないこと** — 間にランチャー帯が挟まるので
+    /// 幅が足りず、ホイール取得域 / reorder 指標線 / scissor が右端で欠ける。
+    pub content_below_ruler: Rect,
+    /// r.md #87: ランチャー帯の矩形群 (幅 0 で非表示)。
+    pub launcher: launcher::layout::LauncherRects,
+    /// r.md #87: ランチャー帯の 1 フレーム分のビュー。
+    pub launcher_view: &'a launcher::LauncherView,
 
     // ---- 尺度 ----
     pub beat_per_px: f64,
@@ -52,6 +59,9 @@ pub(super) struct ArrangementFrame<'a> {
     /// **描画 / hit-test / release / rect 収集がすべてこの 1 本を共有する** (旧 `visible_tracks` /
     /// `tracks_for_draw` / `tracks_owned` の 3 つ名は同一内容だった)。
     pub visible_tracks: Vec<ArrangementTrack>,
+    /// r.md #63 / #87: このフレームに縦へ積む行 (track 行 + 展開中の automation lane 行)。
+    /// **ランチャー帯もこの 1 本から行の縦位置を読む**ので、行ズレが構造的に起きない。
+    pub rows: Vec<ArrangementRow>,
     /// `visible_tracks` の prefix-sum row top。 **`header_pane.y == lanes.y` は rect 分割から
     /// 自明に成り立つので、 header 側と lanes 側で同一。**
     /// 旧 `press_tops` / `header_tops` / `tops_owned_for_heavy` の 3 重計算をこの 1 本に統合。
@@ -98,20 +108,35 @@ pub(super) fn build<'a>(
     // y 原点を arranger 分だけ下げることで track row (header / lanes 双方) が自動的に下にずれる
     // (`header_pane.y == lanes.y` の不変条件は維持 = tops を header / lanes で共有する前提)。
     let arranger_lane_h = view.arranger_lane_h.max(0.0);
-    let lanes_h = (rect.h - ruler_h - arranger_lane_h).max(1.0);
-    let lanes_w = (rect.w - header_w).max(1.0);
-    let header_pane =
-        Rect { x: rect.x, y: rect.y + ruler_h + arranger_lane_h, w: header_w, h: lanes_h };
-    let ruler = Rect { x: rect.x + header_w, y: rect.y, w: lanes_w, h: ruler_h };
+    let head_h = ruler_h + arranger_lane_h;
+    let lanes_h = (rect.h - head_h).max(1.0);
+    // r.md #87: ヘッダとアレンジのレーンの **間**にランチャー帯を 1 本挟む
+    // (Bitwig のハイブリッドレイアウト)。 帯幅は `ui_prefs` + `LauncherLayout` から
+    // `resolve_pane_w` が解き、どちらの端でも掴み代が残る。
+    let launcher_pane_w =
+        launcher::layout::resolve_pane_w(&built.launcher, (rect.w - header_w).max(1.0));
+    let launcher = launcher::layout::split(
+        rect,
+        rect.x + header_w,
+        launcher_pane_w,
+        head_h,
+        rect.y + head_h,
+        lanes_h,
+        &built.launcher,
+    );
+    let lanes_x = rect.x + header_w + launcher_pane_w;
+    let lanes_w = (rect.w - header_w - launcher_pane_w).max(1.0);
+    let header_pane = Rect { x: rect.x, y: rect.y + head_h, w: header_w, h: lanes_h };
+    let ruler = Rect { x: lanes_x, y: rect.y, w: lanes_w, h: ruler_h };
     // Arranger レーン本体 (lanes 幅、 ruler 直下) と header 側の見出し領域 ("Arranger" ラベル用)。
-    let arranger_rect =
-        Rect { x: rect.x + header_w, y: rect.y + ruler_h, w: lanes_w, h: arranger_lane_h };
+    let arranger_rect = Rect { x: lanes_x, y: rect.y + ruler_h, w: lanes_w, h: arranger_lane_h };
     let arranger_header_rect =
         Rect { x: rect.x, y: rect.y + ruler_h, w: header_w, h: arranger_lane_h };
-    let lanes = Rect {
-        x: rect.x + header_w,
-        y: rect.y + ruler_h + arranger_lane_h,
-        w: lanes_w,
+    let lanes = Rect { x: lanes_x, y: rect.y + head_h, w: lanes_w, h: lanes_h };
+    let content_below_ruler = Rect {
+        x: rect.x,
+        y: header_pane.y,
+        w: header_w + launcher_pane_w + lanes_w,
         h: lanes_h,
     };
 
@@ -151,6 +176,8 @@ pub(super) fn build<'a>(
     // **caller の full `tracks`** から「他 track の parent_id として参照されている id 集合」 を 1 度計算。
     // `is_group_track(id, visible_tracks)` だと collapsed で children が filter outされ false 化する罠を回避。
     let is_group_set: HashSet<u32> = tracks.iter().filter_map(|t| t.parent_id).collect();
+    // r.md #63 / #87: 行の一覧は 1 度だけ組み、 `mirror_layout` とランチャー帯が共有する。
+    let rows = arrangement_row_layout(&visible_tracks, view.track_row_h);
 
     ArrangementFrame {
         tracks,
@@ -170,10 +197,13 @@ pub(super) fn build<'a>(
         lanes,
         header_w,
         arranger_lane_h,
-        lanes_h,
+        content_below_ruler,
+        launcher,
+        launcher_view: &built.launcher,
         beat_per_px,
         zoom_x_px_per_beat,
         visible_tracks,
+        rows,
         tops,
         is_group_set,
         wid,
@@ -202,7 +232,7 @@ pub(super) fn mirror_layout(
             app.ui_ephemeral.last_arrange_lanes_size = lanes_size;
         }));
     }
-    let rows = arrangement_row_layout(&f.visible_tracks, f.view.track_row_h);
+    let rows = f.rows.clone();
     if app.ui_ephemeral.last_arrange_rows != rows {
         let next = rows.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
