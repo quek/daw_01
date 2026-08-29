@@ -338,7 +338,7 @@ mod add_track_insert_index_tests {
 
 #[cfg(test)]
 mod clip_color_tests {
-    use crate::app_types::{ClipRef, propagate_clip_color, track_with};
+    use crate::app_types::{ClipKey, propagate_clip_color, track_with};
     use common::model::{Clip, Track};
 
     fn clip(id: u32, content_id: u32) -> Clip {
@@ -359,7 +359,7 @@ mod clip_color_tests {
             track(1, vec![clip(1, 7), clip(2, 9)]),
             track(2, vec![clip(3, 7)]),
         ];
-        propagate_clip_color(&mut tracks, ClipRef { track: 0, clip: 0 }, Some([0.9, 0.3, 0.3]));
+        propagate_clip_color(&mut tracks, ClipKey { track_id: 1, clip_id: 1 }, Some([0.9, 0.3, 0.3]));
         // cid==7 は cross-track 含め全部同色、 cid==9 は不変 (= 確定動作 1)。
         assert_eq!(tracks[0].clips[0].color, Some([0.9, 0.3, 0.3]));
         assert_eq!(tracks[1].clips[0].color, Some([0.9, 0.3, 0.3]));
@@ -371,7 +371,7 @@ mod clip_color_tests {
         // content_id == 0 (未採番 sentinel) は伝播せず target のみ (別の cid==0 を巻き込まない)。
         let mut tracks =
             vec![track(1, vec![clip(1, 0), clip(2, 0)])];
-        propagate_clip_color(&mut tracks, ClipRef { track: 0, clip: 0 }, Some([0.1, 0.2, 0.3]));
+        propagate_clip_color(&mut tracks, ClipKey { track_id: 1, clip_id: 1 }, Some([0.1, 0.2, 0.3]));
         assert_eq!(tracks[0].clips[0].color, Some([0.1, 0.2, 0.3]));
         assert_eq!(tracks[0].clips[1].color, None);
     }
@@ -379,7 +379,7 @@ mod clip_color_tests {
     #[test]
     fn set_color_out_of_range_target_is_noop() {
         let mut tracks = vec![track(1, vec![clip(1, 7)])];
-        propagate_clip_color(&mut tracks, ClipRef { track: 5, clip: 0 }, Some([0.5, 0.5, 0.5]));
+        propagate_clip_color(&mut tracks, ClipKey { track_id: 99, clip_id: 1 }, Some([0.5, 0.5, 0.5]));
         assert_eq!(tracks[0].clips[0].color, None);
     }
 }
@@ -740,10 +740,10 @@ mod note_overlap_tests {
 #[cfg(test)]
 mod multiclip_pianoroll_id_tests {
     use crate::app::AppData;
-    use crate::app_types::ClipRef;
+    use crate::app_types::ClipKey;
 
-    fn cr(track: u32, clip: u32) -> ClipRef {
-        ClipRef { track, clip }
+    fn cr(track_id: u32, clip_id: u32) -> ClipKey {
+        ClipKey { track_id, clip_id }
     }
 
     #[test]

@@ -30,7 +30,10 @@ impl AppData {
         if cells.is_empty() {
             return None;
         }
-        let rows = self.launcher_rows();
+        // **行の座標は曲の構造 (`all_launcher_rows`) で数える。** 表示順
+        // (`launcher_rows`) は折りたたみで変わるので、コピーと貼り付けで
+        // 畳み方が違うと別の行に貼られ、畳まれた行のセルは黙って落ちる。
+        let rows = self.all_launcher_rows();
         // 相対座標の原点 = 選択群の左上。
         let mut placed: Vec<(usize, usize, LauncherCellKey)> = Vec::new();
         for cell in &cells {
@@ -96,7 +99,8 @@ impl AppData {
         if cells.is_empty() {
             return 0;
         }
-        let rows = self.launcher_rows();
+        // コピー側と同じ基準 (曲の構造) で数える。
+        let rows = self.all_launcher_rows();
         let Some(base_row) = rows.iter().position(|r| *r == dest.row) else {
             return 0;
         };
@@ -121,6 +125,12 @@ impl AppData {
                         | (LauncherCellPayload::Lane(_), LauncherRow::Lane(_))
                 );
                 if !compatible {
+                    continue;
+                }
+                // **行が実在するかも列を実体化する前に確かめる。** 後で失敗すると
+                // 「貼れていないのに列だけ増え、undo もできない」状態が残る
+                // (`edit_song_checked` は snapshot を捨てるだけで巻き戻さない)。
+                if !row_exists(song, row) {
                     continue;
                 }
                 let scene_id = song.ensure_scene_at(dest.scene_index + cc.scene_offset as usize);
@@ -164,8 +174,7 @@ fn paste_one(
             };
             let track = song.track_by_id_mut(track_id)?;
             let id = track.alloc_clip_id();
-            track.session_clips.retain(|s| s.scene_id != scene_id);
-            track.session_clips.push(common::model::SessionClip {
+            track.put_session_clip(common::model::SessionClip {
                 scene_id,
                 clip: Clip {
                     id,
@@ -213,8 +222,7 @@ fn paste_one(
             );
             let lane = song.automation_lane_by_key_mut(lk.track, lk.lane)?;
             let id = lane.alloc_clip_id();
-            lane.session_clips.retain(|s| s.scene_id != scene_id);
-            lane.session_clips.push(common::model::SessionAutomationClip {
+            lane.put_session_clip(common::model::SessionAutomationClip {
                 scene_id,
                 clip: AutomationClip {
                     id,
@@ -295,4 +303,12 @@ fn automation_points_of(
             curve: p.curve,
         })
         .collect()
+}
+
+/// 貼り付け先の行が実在するか (トラック / レーンとも)。
+fn row_exists(song: &common::model::Song, row: LauncherRow) -> bool {
+    match row {
+        LauncherRow::Track(id) => song.track_by_id(id).is_some(),
+        LauncherRow::Lane(k) => song.automation_lane_by_key(k.track, k.lane).is_some(),
+    }
 }

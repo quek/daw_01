@@ -35,7 +35,7 @@ const ARRANGEMENT_SPLIT_DEFAULT_RATIO: f32 = 0.65;
 
 /// r.md #87: View メニューに出すランチャー帯の見せ方 3 項目 (計画書 Q5-b)。
 /// 並びは `LauncherLayout::cycle` の巡回順と揃える (メニューとキーで順序が
-/// 食い違うと「Ctrl+Tab を何回押せばどれになるか」が読めない)。
+/// 食い違うと「Tab を何回押せばどれになるか」が読めない)。
 const LAUNCHER_LAYOUT_MENU: &[(&str, common::model::LauncherLayout)] = &[
     ("ランチャーとアレンジ (両方)", common::model::LauncherLayout::Both),
     ("ランチャーのみ", common::model::LauncherLayout::LauncherOnly),
@@ -244,7 +244,7 @@ fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
 fn add_launcher_layout_items<'a>(m: &mut daw_ui_core::widgets::menu::MenuBuilder<'a, AppData>) {
     for (label, layout) in LAUNCHER_LAYOUT_MENU {
         let layout = *layout;
-        // 巡回キー (`Ctrl+Tab`) のヒントは 3 項目に共通なので、代表して
+        // 巡回キー (`Tab`) のヒントは 3 項目に共通なので、代表して
         // 「両方」の行にだけ出す。
         let hint = (layout == common::model::LauncherLayout::Both)
             .then(|| crate::view::shortcuts::shortcut_hint("daw.cycle_launcher_layout"))
@@ -894,7 +894,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // S ボタンと同じ ToggleTrackSolo を発火)。 対象 track は pointer の位置で決まる:
     // - piano roll active (= pointer が bottom panel 内 + Piano Roll タブ。 audio
     //   editor は MIDI 編集文脈ではないので除外): 編集中 clip の所属 track
-    //   (ClipRef.track は index なので id へ解決)。
+    //   (ClipKey.track は index なので id へ解決)。
     // - mixer (= pointer が bottom panel 内 + Mixer タブ): マウス直下のストリップ
     //   (`mixer_hovered_track`)。 master strip / strip 外は None で no-op。
     // - それ以外 (= pointer がアレンジ上): マウス直下のトラック
@@ -908,7 +908,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 None
             } else {
                 app.selected_clip_ref()
-                    .and_then(|c| app.song_doc.song().tracks.get(c.track as usize))
+                    .and_then(|c| app.song_doc.song().track_by_id(c.track_id))
                     .map(|t| t.id)
             }
         } else if app.ui_prefs.bottom_panel == 0 && pointer_in_bottom {
@@ -954,7 +954,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 }));
             }
         } else {
-            let targets: Vec<crate::app::ClipRef> = if is_pianoroll_active {
+            let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {
                 // audio waveform editor を開いている: その clip を mute。
                 app.ui_ephemeral.audio_editor_clip.into_iter().collect()
             } else if app.selection.selected_clip.is_some() || !app.selection.selected_clips.is_empty() {
@@ -974,7 +974,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
-    // ----- r.md #87: ランチャーのキー操作 (Ctrl+Tab / 矢印 / Enter) -----
+    // ----- r.md #87: ランチャーのキー操作 (Tab / 矢印 / Enter) -----
     // **note nudge より先に**呼ぶ (矢印の取り合いをここで決める)。 対象面が
     // `Notes` のときはランチャーが矢印を取らないので、両者は排他になる。
     crate::view::launcher_keys::dispatch_launcher_keys(app, ui, surface);
@@ -1275,7 +1275,7 @@ mod tests {
     use daw_ui_renderer::Scene;
     use tokio::sync::mpsc;
 
-    use crate::app::ClipRef;
+    use crate::app::ClipKey;
     use crate::dispatcher::{
         BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
     };
@@ -1471,7 +1471,7 @@ mod tests {
         let mut app = build_app();
         app.ui_prefs.bottom_panel = 1;
         app.ui_ephemeral.piano_roll_lyric_editing = true; // stale-true を想定
-        app.ui_ephemeral.audio_editor_clip = Some(ClipRef { track: 0, clip: 0 });
+        app.ui_ephemeral.audio_editor_clip = Some(ClipKey { track_id: 0, clip_id: 0 });
         dispatch_escape(&mut app);
         assert!(
             app.ui_ephemeral.audio_editor_clip.is_none(),

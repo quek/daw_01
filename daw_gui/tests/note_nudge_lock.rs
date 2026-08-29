@@ -10,7 +10,7 @@ use common::protocol::{AudioCommand, PluginCommand};
 use common::scale::{Scale, ScaleChange};
 use tokio::sync::mpsc;
 
-use daw_gui::app::{track_with, AppData, AppEvent, ClipRef};
+use daw_gui::app::{track_with, AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -97,7 +97,7 @@ fn lock_has_no_effect_while_its_toggle_is_offscreen() {
     show_clips(&mut app, &keys);
     app.handle_event(AppEvent::TogglePianoRollTrackLock(1)); // track 0 (id=1) をロック
 
-    let t0 = ClipRef { track: 0, clip: 0 };
+    let t0 = keys[0]; // 住所は安定 id (track id 1 / clip id 10)
     assert!(app.is_pianoroll_clip_locked(t0), "2 クリップ表示中はロックが効く (凡例が出ている)");
     assert!(
         !app.all_shown_pianoroll_note_ids().iter().any(|&id| AppData::note_id_clip_slot(id) == 0),
@@ -145,8 +145,7 @@ fn locked_track_rejects_new_notes_from_every_path() {
 
     // (a) 鉛筆 / Insert
     app.handle_event(AppEvent::AddNote {
-        track: 0,
-        clip: 0,
+        key: keys[0],
         start_beat: 2.0,
         duration: 1.0,
         pitch: 60,
@@ -166,8 +165,7 @@ fn locked_track_rejects_new_notes_from_every_path() {
     // ロックを外せば通る (= 拒否がロック起因であることの対)。
     app.handle_event(AppEvent::TogglePianoRollTrackLock(1));
     app.handle_event(AppEvent::AddNote {
-        track: 0,
-        clip: 0,
+        key: keys[0],
         start_beat: 2.0,
         duration: 1.0,
         pitch: 60,

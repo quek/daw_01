@@ -696,8 +696,8 @@ impl AppData {
     /// view は first event を「代表値」 として見せれば編集後に整合が取れる。
     pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song_doc.song().tracks.get(cref.track as usize)?;
-        let clip = track.clips.get(cref.clip as usize)?;
+        let track = self.song_doc.song().track_by_id(cref.track_id)?;
+        let clip = track.clip_by_id(cref.clip_id)?;
         let common::model::ClipContent::Audio(audio) =
             self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
@@ -739,8 +739,8 @@ impl AppData {
     /// 引数を組み立てる用。
     pub fn next_audio_editor_event_idx(&self, delta: i32) -> Option<usize> {
         let target = self.ui_ephemeral.audio_editor_clip?;
-        let track = self.song_doc.song().tracks.get(target.track as usize)?;
-        let clip = track.clips.get(target.clip as usize)?;
+        let track = self.song_doc.song().track_by_id(target.track_id)?;
+        let clip = track.clip_by_id(target.clip_id)?;
         let common::model::ClipContent::Audio(audio) =
             self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
@@ -773,8 +773,8 @@ impl AppData {
     /// のみ snapshot に乗せる)。
     pub fn inspector_image_event_summary(&self) -> Option<InspectorImageEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song_doc.song().tracks.get(cref.track as usize)?;
-        let clip = track.clips.get(cref.clip as usize)?;
+        let track = self.song_doc.song().track_by_id(cref.track_id)?;
+        let clip = track.clip_by_id(cref.clip_id)?;
         let common::model::ClipContent::Image(image) =
             self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
@@ -817,7 +817,7 @@ impl AppData {
     /// 既存挙動、 1 clip 1 event 前提なので broadcast = first event 編集)。
     /// 引数 `n_events` は当該 ClipContent::Audio の events 長 (= 呼び出し
     /// 前に immutable get で取得)。
-    pub(crate) fn audio_event_target_indices(&self, target: ClipRef, n_events: usize) -> Vec<usize> {
+    pub(crate) fn audio_event_target_indices(&self, target: ClipKey, n_events: usize) -> Vec<usize> {
         if self.ui_ephemeral.audio_editor_clip == Some(target)
             && !self.selection.audio_editor_selected_events.is_empty()
         {
@@ -843,15 +843,14 @@ impl AppData {
     /// その 1 つだけ、 そうでなければ全 event を更新する。 戻り値は
     /// 「実際に何らかの event を更新したか」 (= caller が edit buffer
     /// resync を呼ぶかの判断に使う)。
-    pub(crate) fn mutate_audio_events_in_clip<F>(&mut self, target: ClipRef, mut f: F) -> bool
+    pub(crate) fn mutate_audio_events_in_clip<F>(&mut self, target: ClipKey, mut f: F) -> bool
     where
         F: FnMut(&mut common::model::AudioEvent),
     {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return false;
@@ -893,9 +892,8 @@ impl AppData {
         };
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return false;
@@ -918,15 +916,14 @@ impl AppData {
     /// 選択 UI を持たないので broadcast 固定)。 戻り値は「実際に何らか
     /// の event を更新したか」 (= caller が edit buffer resync を呼ぶか
     /// の判断に使う)。
-    pub(crate) fn mutate_image_events_in_clip<F>(&mut self, target: ClipRef, mut f: F) -> bool
+    pub(crate) fn mutate_image_events_in_clip<F>(&mut self, target: ClipKey, mut f: F) -> bool
     where
         F: FnMut(&mut common::model::ImageEvent),
     {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return false;

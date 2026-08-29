@@ -350,6 +350,24 @@ impl AutomationLane {
         self.session_clips.iter().find(|s| s.scene_id == scene_id)
     }
 
+    /// 列 `cell.scene_id` にセルを置く (既にあれば置き換え + 主導権の引き継ぎ)。
+    /// トラック行の [`Track::put_session_clip`](super::Track::put_session_clip) と同じ契約。
+    pub fn put_session_clip(&mut self, cell: SessionAutomationClip) {
+        let new_id = cell.clip.id;
+        let replaced: Option<u32> = self
+            .session_clips
+            .iter()
+            .find(|c| c.scene_id == cell.scene_id)
+            .map(|c| c.clip.id);
+        self.session_clips.retain(|c| c.scene_id != cell.scene_id);
+        self.session_clips.push(cell);
+        if let Some(old) = replaced
+            && self.launcher == (RowPlayback::Launcher { clip_id: old })
+        {
+            self.launcher = RowPlayback::Launcher { clip_id: new_id };
+        }
+    }
+
     /// Allocate a new stable clip id within this lane.
     pub fn alloc_clip_id(&mut self) -> u32 {
         let id = self.next_clip_id.max(1);

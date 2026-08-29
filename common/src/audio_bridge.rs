@@ -23,9 +23,13 @@ pub const MAX_TRACKS: usize = 32;
 pub const MAX_MOD_SOURCES: usize = 64;
 
 /// r.md #87 (クリップランチャー): 走行状態を publish できる行数の上限。
-/// 行 = トラック行 + 展開したオートメーションレーン行なので、`MAX_TRACKS` (= 32) では
-/// 足りない。溢れた行は publish されない (= GUI の表示が出ないだけで、音は鳴る)。
-pub const MAX_LAUNCHER_ROWS: usize = 128;
+/// 行 = トラック行 + オートメーションレーン行なので、`MAX_TRACKS` (= 32) では足りない。
+///
+/// **engine 側の走行状態の器 (`launcher::MAX_ROWS`) も同じ値**なので、溢れると
+/// 表示が出ないだけでは済まず、その行はランチャーを持てない (= セルを撃っても
+/// アレンジのクリップが鳴り続ける)。32 トラック × 15 レーンぶんを確保して、
+/// 現実的な曲で溢れないようにする (1 行 32 バイト = 16 KB)。
+pub const MAX_LAUNCHER_ROWS: usize = 512;
 
 /// [`LauncherRowState::state`] の値。**engine と GUI が共有する唯一の定義**。
 pub const LAUNCHER_STATE_ARRANGER: u32 = 0;
@@ -62,6 +66,13 @@ pub struct LauncherRowState {
     pub queued_clip_id: AtomicU32,
     /// いま鳴っているセルの中の進捗 `0..1` (`f32::to_bits`)。停止中は 0。
     pub progress_bits: AtomicU32,
+    /// いま鳴っているセルを **撃った song 拍** (`f64::to_bits`)。停止中は 0。
+    ///
+    /// 進捗 (`progress_bits`) は 30Hz でしか届かないので、映像側がこれだけで
+    /// 位相を出すと 1/30 秒刻みでカクつく。撃った拍が分かれば、映像は自分の
+    /// フレーム時刻から `daw_gui::launcher_time::cell_phase` で **音と同じ式**を
+    /// 使って滑らかに解ける (計画書 §3.6)。
+    pub launch_beat_bits: AtomicU64,
 }
 
 /// Shared memory telemetry plane: daw_audio (writer) → daw_gui (30Hz
@@ -138,6 +149,8 @@ pub struct LauncherRowSnapshot {
     pub queued_clip_id: u32,
     /// セル内の進捗 `0..1`。
     pub progress: f32,
+    /// 鳴っているセルを撃った song 拍 (停止中は `0.0`)。
+    pub launch_beat: f64,
 }
 
 /// Owning handle to the audio shared memory region.
@@ -281,6 +294,7 @@ impl AudioBridgeHandle {
         playing_clip_id: u32,
         queued_clip_id: u32,
         progress: f32,
+        launch_beat: f64,
     ) {
         let Some(cell) = self.bridge().launcher_rows.get(slot) else {
             return;
@@ -289,9 +303,15 @@ impl AudioBridgeHandle {
         cell.playing_clip_id.store(playing_clip_id, Ordering::Release);
         cell.queued_clip_id.store(queued_clip_id, Ordering::Release);
         cell.progress_bits.store(progress.to_bits(), Ordering::Release);
-        // `row_key` は **最後に**書く — GUI は `row_key != 0` を見てから残りを読むので、
+        cell.launch_beat_bits.store(launch_beat.to_bits(), Ordering::Release);
+        // `row_key` は **最後に**書く — GUI は「使用中か」を見てから残りを読むので、
         // 先に書くと 1 tick だけ古い state と新しい key の組を見せてしまう。
-        cell.row_key.store(row_key, Ordering::Release);
+        //
+        // 保存するのは **`row_key + 1`**。0 を「空きスロット」の印に使うので、
+        // `row_key` そのものを入れると `RowKey::packed() == 0` の行
+        // (= `track_id` も `lane_id` も 0) が空きと見分けられず、そこで読み取りが
+        // 打ち切られて**以降の行が丸ごと GUI に届かない**。
+        cell.row_key.store(row_key.saturating_add(1), Ordering::Release);
     }
 
     /// r.md #87: `slot` 以降を「空き」にする (engine が publish した行数より後ろ)。
@@ -308,10 +328,9 @@ impl AudioBridgeHandle {
     /// (`lane_id == 0` がトラック行)。見つからなければ `None`。
     #[must_use]
     pub fn launcher_row(&self, track_id: u32, lane_id: u32) -> Option<LauncherRowSnapshot> {
-        let want = (u64::from(track_id) << 32) | u64::from(lane_id);
-        if want == 0 {
-            return None;
-        }
+        // 格納値は `row_key + 1` (0 = 空きスロット)。`row_key` が 0 の行
+        // (track_id / lane_id とも 0) も**正しく引ける**ようにここで +1 する。
+        let want = ((u64::from(track_id) << 32) | u64::from(lane_id)).saturating_add(1);
         for cell in &self.bridge().launcher_rows {
             let key = cell.row_key.load(Ordering::Acquire);
             if key == 0 {
@@ -323,10 +342,45 @@ impl AudioBridgeHandle {
                     playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
                     queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
                     progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
+                    launch_beat: f64::from_bits(
+                        cell.launch_beat_bits.load(Ordering::Acquire),
+                    ),
                 });
             }
         }
         None
+    }
+
+    /// r.md #87: publish 済みの行を **まとめて** 読み出す (GUI の 30Hz poller 用)。
+    /// `out` は `(row_key, snapshot)` で、`row_key` は `(track_id << 32) | lane_id`
+    /// (`lane_id == 0` がトラック行)。呼び側の `Vec` を使い回すので確保は起きない。
+    ///
+    /// 1 行ずつ引く [`Self::launcher_row`] は毎回配列を線形走査するので、
+    /// 行数ぶん呼ぶと O(n²) になる。表示側は全行ぶん要るのでこちらを使う。
+    pub fn launcher_row_snapshots(&self, out: &mut Vec<(u64, LauncherRowSnapshot)>) {
+        out.clear();
+        for cell in &self.bridge().launcher_rows {
+            // publisher は `row_key` を最後に書くので、ここで先に読めば
+            // 「新しい key と古い値」の組は見えない (set_launcher_row の doc)。
+            // 格納値は `row_key + 1` (0 = 空きスロット)。
+            let stored = cell.row_key.load(Ordering::Acquire);
+            if stored == 0 {
+                break;
+            }
+            let key = stored - 1;
+            out.push((
+                key,
+                LauncherRowSnapshot {
+                    state: cell.state.load(Ordering::Acquire),
+                    playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
+                    queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
+                    progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
+                    launch_beat: f64::from_bits(
+                        cell.launch_beat_bits.load(Ordering::Acquire),
+                    ),
+                },
+            ));
+        }
     }
 
     /// Fills `out` with the modulation scalars for slots `0..MAX_MOD_SOURCES`.
@@ -347,4 +401,31 @@ unsafe impl Sync for AudioBridgeHandle {}
 
 pub fn shmem_id(parent_pid: u32) -> String {
     format!("daw_01_audio_{parent_pid}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r.md #87: **`row_key == 0` の行 (track_id 0 / lane_id 0) も GUI へ届く。**
+    /// 空きスロットの印と実 key が衝突していたときは、その行で読み取りが打ち切られ、
+    /// 以降の行が丸ごと届かなかった (= セルの進捗が一切出ない)。
+    #[test]
+    fn 行キー_0_の行も読み出せる() {
+        let name = format!("daw01_test_bridge_{}", std::process::id());
+        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        h.set_launcher_row(0, 0, LAUNCHER_STATE_PLAYING, 7, 0, 0.25, 4.0);
+        h.set_launcher_row(1, (1_u64 << 32) | 2, LAUNCHER_STATE_STOPPED, 0, 0, 0.0, 0.0);
+        h.clear_launcher_rows_from(2);
+
+        let mut out = Vec::new();
+        h.launcher_row_snapshots(&mut out);
+        assert_eq!(out.len(), 2, "2 行とも届く: {out:?}");
+        assert_eq!(out[0].0, 0, "1 行目の key は 0 (track_id 0 / lane_id 0)");
+        assert_eq!(out[0].1.playing_clip_id, 7);
+        assert_eq!(out[1].0, (1_u64 << 32) | 2);
+        // 単発引きも同じ行を引ける。
+        let one = h.launcher_row(0, 0).expect("row_key 0 も引ける");
+        assert_eq!(one.playing_clip_id, 7);
+    }
 }

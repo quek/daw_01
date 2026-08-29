@@ -11,7 +11,7 @@ use super::*;
 
 use daw_ui_core::{ButtonTextAlign, TextInputStyle, ToggleButtonStyle};
 
-use crate::app::{AppData, AppEvent, ClipRef};
+use crate::app::{AppData, AppEvent, ClipKey};
 use crate::theme::Palette;
 use crate::view::snap::{self, SNAP_LABELS};
 use crate::view::track_color;
@@ -92,7 +92,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // 表示集合 (shown) が変わったら共有 viewport (`multi_clip_view`) を union-fit し直す。
         if multi {
             let keys: Vec<common::model::ClipKey> =
-                shown.iter().filter_map(|r| app.clip_key_of(*r)).collect();
+                shown.iter().filter_map(|r| app.live_clip_key(*r)).collect();
             if app.ui_prefs.multi_clip_view_key != keys {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.ui_prefs.multi_clip_view_key = keys.clone();
@@ -1251,8 +1251,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let insert_len = view.default_note_len_beats.max(MIN_NOTE_LEN);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::AddNote {
-                    track: target.track,
-                    clip: target.clip,
+                    key: target,
                     start_beat: start_beat - clip_origin_beat,
                     duration: insert_len,
                     pitch,
@@ -1510,8 +1509,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // song-absolute → model は clip-local (clip_origin_beat を引く)。
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::AddNote {
-                    track: target.track,
-                    clip: target.clip,
+                    key: target,
                     start_beat: start_beat - clip_origin_beat,
                     duration: len_beats,
                     pitch,
@@ -1688,7 +1686,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                             morae.len().saturating_sub(target_ids.len());
                         if !updates.is_empty() {
                             // widget は編集対象 clip を context として知らないので、描画中の
-                            // `target` (ClipRef) を capture して渡す (歌詞分配は 1 batch = 1 undo)。
+                            // `target` (ClipKey) を capture して渡す (歌詞分配は 1 batch = 1 undo)。
                             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                                 app.handle_event(AppEvent::SetNoteLyrics {
                                     clip_ref: target,
@@ -1763,7 +1761,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // gui_01 #055: 鍵盤レーン click のピッチプレビュー。前フレーム値 (recording.preview_note の
         // pitch) と差分し、変化した frame だけ PreviewPitchChanged を発火。鳴らす track は描画中 clip の track。
         if response.keyboard_active_pitch != app.recording.preview_note.map(|(_, p)| p) {
-            let track_idx = target.track;
+            let track_idx = target.track_id;
             let pitch = response.keyboard_active_pitch;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::PreviewPitchChanged { track_idx, pitch });
@@ -2025,8 +2023,8 @@ fn draw_legend(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     rect: Rect,
-    shown: &[ClipRef],
-    target: ClipRef,
+    shown: &[ClipKey],
+    target: ClipKey,
 ) {
     let p = &*app.theme.core;
     let toggle_style = snap_toggle_style(p);
@@ -2065,18 +2063,18 @@ fn draw_legend(
                 continue;
             };
             let track_id = track.id;
-            let is_target = ti == target.track;
+            let is_target = ti == target.track_id;
             let locked = app.is_pianoroll_track_locked(track_id);
             // 対象切替先 = このトラックの代表クリップ (anchor がこのトラックなら anchor、 でなければ
             // このトラックの最初の表示クリップ)。target_clip は anchor なので legend 切替で動く。
-            let rep_key = if ti == target.track {
-                app.clip_key_of(target)
+            let rep_key = if ti == target.track_id {
+                app.live_clip_key(target)
             } else {
                 shown
                     .iter()
                     .copied()
-                    .find(|r| r.track == ti)
-                    .and_then(|r| app.clip_key_of(r))
+                    .find(|r| r.track_id == ti)
+                    .and_then(|r| app.live_clip_key(r))
             };
             let row = Rect {
                 x: rect.x + pad,

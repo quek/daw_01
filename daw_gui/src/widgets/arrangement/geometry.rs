@@ -387,7 +387,7 @@ pub(super) fn audio_grip_hit_in_lanes(
     let mut hit: Option<(ClipKey, AudioGripHit)> = None;
     for clip in &track.clips {
         if let Some(zone) = audio_grip_hit(row_top, row_h, clip, view, lanes, cx, cy, style) {
-            hit = Some((ClipKey { track: track.id, clip: clip.id }, zone));
+            hit = Some((ClipKey { track_id: track.id, clip_id: clip.id }, zone));
         }
     }
     hit
@@ -494,7 +494,7 @@ pub fn clip_hit(
             inside
         };
         if better {
-            hit = Some((ClipKey { track: track.id, clip: clip.id }, kind));
+            hit = Some((ClipKey { track_id: track.id, clip_id: clip.id }, kind));
             hit_inside = inside;
             hit_edge_dist = dist;
         }
@@ -1232,9 +1232,12 @@ pub fn header_resize_splitter_at(
         return false;
     }
     let boundary = arrangement_rect.x + header_w;
-    let half = handle * 0.5;
-    cx >= boundary - half
-        && cx < boundary + half
+    // r.md #87: ホットゾーンは **境界の左 (= ヘッダ側) だけ**。中心対称に張ると
+    // 境界のすぐ右に置いたランチャーの停止列 (16px) の左 4px を食い、
+    // 「見えているボタンの左側だけ押せない」位置依存のデッドゾーンになる
+    // (帯の右端スプリッタを片側だけにしてあるのと同じ理由)。
+    cx >= boundary - handle
+        && cx < boundary
         && cy >= arrangement_rect.y
         && cy < arrangement_rect.y + arrangement_rect.h
 }

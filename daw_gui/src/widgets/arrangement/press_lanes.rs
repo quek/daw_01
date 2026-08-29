@@ -41,8 +41,8 @@ pub(super) fn clip_zone(
     };
     if let Some((hit_key, grip)) = audio_press {
         if let Some((t_idx, t)) =
-            f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == hit_key.track)
-            && let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip)
+            f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == hit_key.track_id)
+            && let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip_id)
         {
             // r.md #38: fade は掴んだ **その event** だけを対象にする。
             let (kind, anchor_fade) = match grip {
@@ -107,8 +107,8 @@ pub(super) fn clip_zone(
             // visible_tracks の visible-idx を anchor.track_index に保存 (release frame の
             // delta 計算 + draw_drag_preview の new_idx も同じ visible-idx で動く)。
             if let Some((t_idx, t)) =
-                f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == k.track)
-                && let Some(c) = t.clips.iter().find(|c| c.id == k.clip)
+                f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == k.track_id)
+                && let Some(c) = t.clips.iter().find(|c| c.id == k.clip_id)
             {
                 anchors.push(ClipDragAnchor {
                     key: *k,

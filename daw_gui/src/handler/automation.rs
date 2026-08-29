@@ -798,8 +798,8 @@ impl AppData {
         if self.selection.audio_editor_selected_events.is_empty() {
             return None;
         }
-        let track = self.song_doc.song().tracks.get(r.track as usize)?;
-        let clip = track.clips.get(r.clip as usize)?;
+        let track = self.song_doc.song().track_by_id(r.track_id)?;
+        let clip = track.clip_by_id(r.clip_id)?;
         let content = self.song_doc.song().clip_contents.get(&clip.content_id)?;
         let events = content.audio_events()?;
         let mut copied: Vec<AudioEvent> = self
@@ -841,9 +841,8 @@ impl AppData {
         };
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return 0;
@@ -877,8 +876,8 @@ impl AppData {
             }
             // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
             // r.md #44: `max_end` は content-local。 clip の窓の末尾を基準に伸ばす。
-            if let Some(track) = song.tracks.get_mut(target.track as usize)
-                && let Some(clip) = track.clips.get_mut(target.clip as usize)
+            if let Some(track) = song.track_by_id_mut(target.track_id)
+                && let Some(clip) = track.clip_by_id_mut(target.clip_id)
                 && max_end > clip.content_offset_beats + clip.length_beats
             {
                 clip.length_beats = max_end - clip.content_offset_beats;
@@ -907,10 +906,12 @@ impl AppData {
         }
         let mut resolved: Vec<(usize, common::model::Clip)> = Vec::new();
         for r in &refs {
-            if let Some(t) = self.song_doc.song().tracks.get(r.track as usize)
-                && let Some(c) = t.clips.get(r.clip as usize)
+            // クリップボードは「最上段トラックからの相対」で正規化するので、
+            // ここだけは **表示 index** が要る (住所は id、並びは index)。
+            if let Some(t_idx) = self.song_doc.song().track_index_of(r.track_id)
+                && let Some(c) = self.song_doc.song().clip_by_key(*r)
             {
-                resolved.push((r.track as usize, c.clone()));
+                resolved.push((t_idx, c.clone()));
             }
         }
         if resolved.is_empty() {
@@ -998,7 +999,7 @@ impl AppData {
                 common::model::ContentId,
                 common::model::ContentId,
             > = std::collections::HashMap::new();
-            let mut new_refs: Vec<ClipRef> = Vec::new();
+            let mut new_refs: Vec<ClipKey> = Vec::new();
             for cc in &clips {
                 let target_idx = anchor_idx as i64 + cc.track_offset;
                 if target_idx < 0 || target_idx as usize >= song.tracks.len() {
@@ -1046,9 +1047,9 @@ impl AppData {
                     // (talk) per-clip 読み上げスケールも引き継ぐ。
                     talk: cc.talk,
                 });
-                new_refs.push(ClipRef {
-                    track: target_idx as u32,
-                    clip: new_idx,
+                new_refs.push(ClipKey {
+                    track_id: target_idx as u32,
+                    clip_id: new_idx,
                 });
             }
             new_refs

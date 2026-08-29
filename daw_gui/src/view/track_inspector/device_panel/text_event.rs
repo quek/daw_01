@@ -27,7 +27,7 @@ pub(super) fn draw_text_event(
     // テキスト編集は失われない。
     let text_track_has_subtitle = app
         .selected_clip_ref()
-        .and_then(|r| app.song_doc.song().tracks.get(r.track as usize))
+        .and_then(|r| app.song_doc.song().track_by_id(r.track_id))
         .is_some_and(common::model::Track::has_subtitle_device);
     // 字幕 device の「Par」を押したときだけ Text Event 欄を出す
     // (= 専用欄を常時表示せず Par パネルに集約)。

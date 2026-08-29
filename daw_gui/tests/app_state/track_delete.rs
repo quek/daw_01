@@ -16,7 +16,7 @@ use common::model::{Clip, ClipContent, MidiContent, Section};
 
 use common::protocol::PluginEvent;
 
-use daw_gui::app::{AppData, AppEvent, ClipRef, EditSurface};
+use daw_gui::app::{AppData, AppEvent, ClipKey, EditSurface};
 use daw_gui::widgets::select_modifier::SelectModifier;
 
 use super::support::{build_app, load_instrument, select_track_single};
@@ -34,10 +34,9 @@ fn ensure_tracks(app: &mut AppData, n: usize) -> Vec<u32> {
     visible_ids(app)
 }
 
-/// 安定 id (track_id, clip_id) → いまの index ベース `ClipRef`。
-fn clip_ref(app: &AppData, track_id: u32, clip_id: u32) -> ClipRef {
-    app.clip_ref_of(common::model::ClipKey { track_id, clip_id })
-        .expect("clip exists")
+/// 生きているクリップの `ClipKey` (住所は安定 id 1 本)。
+fn clip_ref(app: &AppData, track_id: u32, clip_id: u32) -> ClipKey {
+    app.live_clip_key(ClipKey { track_id, clip_id }).expect("clip exists")
 }
 
 /// `track_id` に空の MIDI clip を 1 つ足して `clip_id` を返す。

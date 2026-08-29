@@ -62,7 +62,9 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
             return Some(Zone::GlobalReturn);
         }
         let i = l.col_index_at_x(x)?;
-        let scene = f.launcher_view.scenes.get(i)?;
+        // 実体の無い列 (= 空きプレースホルダ) は `scene_id = 0`。撃つと全行停止、
+        // 並べ替えの対象にはならない (並び順を持たないため)。
+        let scene_id = f.launcher_view.scenes.get(i).map_or(0, |s| s.id);
         let head_cell = Rect {
             x: l.col_x(i) + 1.0,
             y: l.scene_head.y + 1.0,
@@ -74,11 +76,14 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
             w: (head_cell.w - 3.0).max(2.0),
             ..head_cell
         });
-        if btn.contains(x, y) {
-            return Some(Zone::SceneLaunch(scene.id));
+        if btn.contains(x, y) || scene_id == 0 {
+            // 実体の無い列 (プレースホルダ) は並び順を持たないので、本体を掴んでも
+            // 並べ替えない。押したら「全停止」= `SceneLaunch(0)` に倒す
+            // (掴めるように見えて何も起きない、を無くす)。
+            return Some(Zone::SceneLaunch(scene_id));
         }
         #[allow(clippy::cast_possible_truncation)]
-        return Some(Zone::SceneBody { scene_id: scene.id, index: i as u32 });
+        return Some(Zone::SceneBody { scene_id, index: i as u32 });
     }
     let row = layout::row_at_y(f, y)?;
     // マスター行はクリップを持たないので、停止 / 返す / セルのどれも押せない
@@ -228,6 +233,17 @@ pub(crate) fn dispatch(
             claim.session = true;
         }
         Zone::CellLaunch(cell) => {
+            // 空セルは掴む実体が無いので選択には入らないが、**キーボードの起点
+            // (焦点) は動かす** — でないと空セルを押しても矢印 / `Enter` の対象が
+            // 前のままで、「押した場所と動く場所が違う」になる
+            // (`launcher_bridge` が空セルの `SelectCell` を `FocusCell` に倒す)。
+            if cell.is_empty() {
+                s.pending_intents.push(LauncherIntent::SelectCell {
+                    cell,
+                    additive: false,
+                    range: false,
+                });
+            }
             for c in launch_cells {
                 s.pending_intents.push(LauncherIntent::Launch { cell: c, pressed: true });
             }

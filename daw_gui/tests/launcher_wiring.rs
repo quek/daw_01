@@ -14,7 +14,7 @@ use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
 use daw_gui::event_launcher::{
-    LaunchEdit, LauncherBindTarget, LauncherCellKey, LauncherEvent, LauncherRow,
+    LaunchEdit, LauncherCellKey, LauncherEvent, LauncherRow,
 };
 use daw_gui::state::LauncherFocus;
 
@@ -95,10 +95,13 @@ fn セルを撃つと行の主導権がランチャーへ移り全行戻すで�
     assert!(!app.launcher_has_active_row(), "全行戻したら点灯しない");
 }
 
-/// シーンを撃つと、その列にセルがある行は鳴り、**既にランチャーが握っている**行だけが
-/// 止まる。アレンジ主導のままの行は黙って無音にならない (計画書 Q11 の解釈)。
+/// シーンを撃つと **全行がランチャーへ移る**。その列にセルがある行は鳴り、
+/// 無い行は停止する (計画書 Q11 「空セル = 停止」 + §0「シーンを撃つと主導権を奪う」/
+/// Bitwig: "triggering a scene shifts all tracks to Launcher control")。
+///
+/// アレンジ主導のまま残すと、シーンを撃った直後にアレンジの音とセルの音が混ざる。
 #[test]
-fn シーン発火は空セルの行を止めるがアレンジ主導の行は触らない() {
+fn シーン発火は全行をランチャーへ移し空セルの行は停止する() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 3, 2);
     let t1_s0 = put_cell(&mut app, 1, 0);
@@ -114,7 +117,11 @@ fn シーン発火は空セルの行を止めるがアレンジ主導の行は�
     }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: t1_s0.clip_id() });
     assert_eq!(launcher_of(&app, 2), RowPlayback::Launcher { clip_id: t2_s0.clip_id() });
-    assert_eq!(launcher_of(&app, 3), RowPlayback::Arranger);
+    assert_eq!(
+        launcher_of(&app, 3),
+        RowPlayback::LauncherStopped,
+        "セルを持たない行もランチャーへ移って停止する (アレンジの音が残らない)"
+    );
 
     // 列 1 を撃つ → t1 は次のセルへ、t2 は空セルなので停止、t3 は据え置き。
     let scene1 = app.song_doc.song().scenes[1].id;
@@ -130,8 +137,8 @@ fn シーン発火は空セルの行を止めるがアレンジ主導の行は�
     );
     assert_eq!(
         launcher_of(&app, 3),
-        RowPlayback::Arranger,
-        "セルを 1 つも持たない行はシーン発火で無音にならない"
+        RowPlayback::LauncherStopped,
+        "2 度目のシーン発火でも停止のまま (アレンジへは戻さない)"
     );
 }
 
@@ -231,7 +238,7 @@ fn midi_learn_したノートでセルを撃てる() {
     while audio_rx.try_recv().is_ok() {}
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::StartLearn(
-        LauncherBindTarget::LaunchCell { track_id: 1, scene_id },
+        common::model::BindingTarget::LaunchCell { track_id: 1, scene_id },
     )));
     app.handle_event(AppEvent::MidiNoteOn { channel: 9, pitch: 36, velocity: 100 });
 
@@ -247,6 +254,9 @@ fn midi_learn_したノートでセルを撃てる() {
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: cell.clip_id() });
 
     // 別チャンネルの同じノートは鍵盤の音として素通りする (channel を落とさない)。
+    // 直前の発火で `AudioCommand::LaunchCell` がキューに載っているので、
+    // 「次に来るのが PreviewNoteOn か」を見る前に捌いておく。
+    while audio_rx.try_recv().is_ok() {}
     app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch: 36, velocity: 100 });
     assert!(
         matches!(audio_rx.try_recv(), Ok(AudioCommand::PreviewNoteOn { .. })),
@@ -575,4 +585,67 @@ fn 同じ場所へのドロップは未保存マークを立てない() {
         cell.clip_id(),
         "id も採り直さない"
     );
+}
+
+/// セルのダブルクリック (= `OpenCellEditor`) で **ピアノロールがそのセルを開く**。
+/// セルのクリップは `Track.session_clips` に居るので、住所が index だった頃は
+/// 編集面から**そもそも指せなかった** (開いても対象が解決できず何も出ない)。
+#[test]
+fn セルを開くとピアノロールの編集対象になる() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    app.ui_prefs.bottom_panel = 0;
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
+
+    assert_eq!(app.ui_prefs.bottom_panel, 1, "ピアノロールのタブが開く");
+    assert_eq!(
+        app.pianoroll_target_clip(),
+        Some(common::model::ClipKey { track_id: 1, clip_id: cell.clip_id() }),
+        "編集対象がそのセルのクリップ"
+    );
+}
+
+/// 停止中にセルを撃つと、その操作自体が再生の開始になる (Live / Bitwig と同じ)。
+/// ランチャーは transport の拍で走るので、Play を送らないと**音が出ない**。
+#[test]
+fn 停止中にセルを撃つと再生が始まる() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    while audio_rx.try_recv().is_ok() {}
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(
+        sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        "撃った瞬間に Play が出る: {sent:?}"
+    );
+    assert!(
+        sent.iter().any(|c| matches!(c, AudioCommand::LaunchCell { pressed: true, .. })),
+        "発火自体も送る: {sent:?}"
+    );
+}
+
+/// 再生中に撃ったときは Play を重ねて送らない (二重に送ると開始位置が戻る)。
+#[test]
+fn 再生中に撃っても_play_を重ねない() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    app.transport.is_playing = true;
+    while audio_rx.try_recv().is_ok() {}
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play)), "Play は出ない: {sent:?}");
 }

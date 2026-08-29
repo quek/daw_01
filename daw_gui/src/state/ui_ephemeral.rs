@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use crate::app::{
-    ArrLabelCache, ArrangeViewSnapshot, ArrangeZoomAnchor, AutomationPointKeyRef, ClipRef,
+    ArrLabelCache, ArrangeViewSnapshot, ArrangeZoomAnchor, AutomationPointKeyRef, ClipKey,
     ColorPickerTarget, DirtyGuardAction, ExportRangePicker, InspectorScrubField, PluginPickEntry,
     SendPickerState, TempoMapCache, TouchedParam,
 };
@@ -65,7 +65,7 @@ pub struct UiEphemeral {
     /// explicit selection — hover over a clip, press `E`, and that
     /// clip is split. Falls back to the existing `selected_clips`
     /// when no clip is under the cursor.
-    pub arrangement_hover_clip: Option<ClipRef>,
+    pub arrangement_hover_clip: Option<ClipKey>,
     /// ポインタ下のトラック id (`ArrangementResponse.hovered_track` の
     /// mirror)。トラック paste の挿入先 (= マウス下トラックの直上) に使う。
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
@@ -171,7 +171,7 @@ pub struct UiEphemeral {
     /// 「piano_roll の領域を流用」)。 `None` なら通常の Piano Roll が
     /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
     /// Editor close で `None` に戻る。
-    pub audio_editor_clip: Option<ClipRef>,
+    pub audio_editor_clip: Option<ClipKey>,
     /// Audio Editor 内のマウス hover 位置を clip 内 beat (clip 始端 = 0)
     /// に変換した値。 audio_editor.rs が毎フレーム push、 マウスが
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
@@ -256,7 +256,7 @@ pub struct UiEphemeral {
     /// background のフォント列挙が走行中。
     pub font_picker_loading: bool,
     /// 編集対象の text クリップ (open 時に anchor から確定)。
-    pub font_picker_target: Option<ClipRef>,
+    pub font_picker_target: Option<ClipKey>,
     /// open 時の元フォント。cancel / commit の undo 復元元。
     pub font_picker_restore: String,
 
@@ -303,10 +303,10 @@ pub struct UiEphemeral {
     pub track_rename_text: String,
 
     /// 編集中の clip rename。 `Some` のとき該当 clip rect に inline
-    /// text_input を重ね描きする (track rename の clip 版)。 `ClipRef` は
+    /// text_input を重ね描きする (track rename の clip 版)。 `ClipKey` は
     /// index ベースなので rename mode 中の track/clip reorder は track
     /// rename と同様に想定しない。
-    pub clip_rename: Option<ClipRef>,
+    pub clip_rename: Option<ClipKey>,
     pub clip_rename_text: String,
 
     /// v18 (`docs/plan_track_clip_color.md`): color_picker (gui_01 #058) の
@@ -365,7 +365,7 @@ pub struct UiEphemeral {
     /// (`clip_gain_db_edit_text` 等 / `clip_image_*_edit_text`) は撤去
     /// (scrubable が編集状態を自前で内包)。 `clip_edit_buffer_target` は
     /// content / font_family 文字列 buffer の resync 判定に引き続き使う。
-    pub clip_edit_buffer_target: Option<ClipRef>,
+    pub clip_edit_buffer_target: Option<ClipKey>,
 
     /// v19 (`docs/plan_tachie_group_transform.md` §5.5): inspector の
     /// scrubable_number で transform を drag / text 編集中の param。drag・編集の

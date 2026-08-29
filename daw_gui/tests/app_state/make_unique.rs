@@ -7,7 +7,7 @@
 use common::model::{Clip, ClipContent};
 
 use daw_gui::app::AppEvent;
-use daw_gui::app_types::ClipRef;
+use daw_gui::app_types::ClipKey;
 
 use super::support;
 
@@ -30,8 +30,12 @@ fn content_ids(app: &daw_gui::app::AppData) -> (u32, u32) {
     (clips[0].content_id, clips[1].content_id)
 }
 
-const A: ClipRef = ClipRef { track: 0, clip: 0 };
-const B: ClipRef = ClipRef { track: 0, clip: 1 };
+const A: ClipKey = ClipKey { track_id: TRACK_ID, clip_id: 1 };
+const B: ClipKey = ClipKey { track_id: TRACK_ID, clip_id: 2 };
+/// `support::build_app` の既定トラックの id (住所は index ではなく安定 id)。
+/// 起動時の 1 本目は allocator から採るので 1 (r.md #87 — id 0 は未採番の
+/// sentinel で、実トラックの住所に使うとランチャーの行キーと衝突する)。
+const TRACK_ID: u32 = 1;
 
 /// 2 clip を選択して Make Unique → 両方が独立 (別々の content_id) になる。
 #[test]

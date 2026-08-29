@@ -26,7 +26,7 @@ use daw_ui_renderer::Rect;
 use common::model::{FollowAction, FollowActionKind, LaunchMode, LAUNCH_QUANTIZE_CHOICES};
 
 use crate::app::{AppData, AppEvent};
-use crate::event_launcher::{LaunchEdit, LauncherBindTarget, LauncherCellKey, LauncherEvent};
+use crate::event_launcher::{LaunchEdit, LauncherCellKey, LauncherEvent};
 
 /// 1 行の高さ (dropdown / toggle / 数値欄で共通)。
 const ROW_H: f32 = 22.0;
@@ -125,6 +125,48 @@ pub(super) fn draw_launch_section(
     ) && let Some((m, _)) = MODE_CHOICES.get(i)
     {
         push_cell_edit(ui, &cells, LaunchEdit::Mode(*m));
+    }
+    y += ROW_H + ROW_GAP;
+
+    // ---- 長さ (ループ長) ----
+    // セルは格子の中の固定サイズなので、アレンジのクリップのように端を掴めない。
+    // ここが**セルの長さを変える唯一の口**。値が割れているときは 0 を出す
+    // (触ると全部その値に揃う)。
+    ui.label_at(
+        "inspector_launch_len_label",
+        "長さ (拍)",
+        area.x + pad,
+        y + 4.0,
+        11.0,
+        app.theme.core.text_dim,
+    );
+    let len = app.launch_cell_length_fold(&cells).unwrap_or(0.0);
+    {
+        let style = ScrubableNumberStyle {
+            sensitivity: 0.05,
+            range: Some((f64::from(common::model::MIN_CLIP_LEN_BEATS as f32), 4096.0)),
+            ..super::scrub_style(&app.theme)
+        };
+        let cells_for_len = cells.clone();
+        ui.scrubable_number_at(
+            ("inspector_launch_len", "cells"),
+            Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
+            len,
+            4.0,
+            ScrubableNumberFormat::Decimal(2),
+            &style,
+            move |v| {
+                let cells = cells_for_len.clone();
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::Launcher(LauncherEvent::SetCellLength {
+                        cells: cells.clone(),
+                        beats: v,
+                    }));
+                })
+            },
+            None,
+            None,
+        );
     }
     y += ROW_H + ROW_GAP;
 
@@ -397,11 +439,11 @@ fn draw_midi_rows(
 
     // (widget id, ラベル, 宛先)。宛先が `None` = いま決められない
     // (セル未選択 / 列が無い) ので押しても何もしない。
-    let targets: [(&str, &str, Option<LauncherBindTarget>); 6] = [
+    let targets: [(&str, &str, Option<common::model::BindingTarget>); 6] = [
         (
             "learn_cell",
             "セル",
-            anchor.zip(scene_id).map(|(k, s)| LauncherBindTarget::LaunchCell {
+            anchor.zip(scene_id).map(|(k, s)| common::model::BindingTarget::LaunchCell {
                 track_id: k.track_id,
                 scene_id: s,
             }),
@@ -409,20 +451,20 @@ fn draw_midi_rows(
         (
             "learn_scene",
             "シーン",
-            scene_id.map(|s| LauncherBindTarget::LaunchScene { scene_id: s }),
+            scene_id.map(|s| common::model::BindingTarget::LaunchScene { scene_id: s }),
         ),
         (
             "learn_stop_row",
             "行を止める",
-            anchor.map(|k| LauncherBindTarget::StopRow { track_id: k.track_id }),
+            anchor.map(|k| common::model::BindingTarget::StopLauncherRow { track_id: k.track_id }),
         ),
         (
             "learn_row_arr",
             "行→アレンジ",
-            anchor.map(|k| LauncherBindTarget::SwitchRowToArranger { track_id: k.track_id }),
+            anchor.map(|k| common::model::BindingTarget::SwitchRowToArranger { track_id: k.track_id }),
         ),
-        ("learn_stop_all", "全停止", Some(LauncherBindTarget::StopAllRows)),
-        ("learn_all_arr", "全→アレンジ", Some(LauncherBindTarget::SwitchAllToArranger)),
+        ("learn_stop_all", "全停止", Some(common::model::BindingTarget::StopAllLauncherRows)),
+        ("learn_all_arr", "全→アレンジ", Some(common::model::BindingTarget::SwitchAllToArranger)),
     ];
 
     for (i, (id, label, target)) in targets.into_iter().enumerate() {

@@ -1,16 +1,17 @@
 //! Arrangement view (track headers / ruler / lanes / clip drag) を gui_01 の
 //! `Ui::arrangement` widget 1 呼び出しに集約。
 //!
-//! AppData は引き続き track / clip を index ベースで持つので、ここで stable id
-//! (Track.id / Clip.id) と index の変換層を担う。
+//! クリップの住所は widget も `AppData` も `ClipKey` (安定 id) 1 本なので、
+//! ここに id ↔ index の変換層は無い (トラックの index が要る箇所だけ
+//! `Song::track_index_of` を通す)。
 
-use crate::widgets::arrangement::{clip_key_to_ref, ClipKey};
+use crate::widgets::arrangement::live_clip_key;
 use daw_ui_core::{
     ColorPickerStyle, Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, ImportTrackTarget};
+use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget};
 use crate::theme::Theme;
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
@@ -130,12 +131,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ArrangementResponse の rect を hit-test / context-menu / inline 数値入力 overlay にだけ使う。
     let resp = crate::widgets::arrangement::arrangement(app, ui, area);
 
+    // r.md #87: ランチャー帯が返した「押された」を `AppEvent` へ流す。
+    // **widget は `Song` も engine も触らない**ので、これが効かせる唯一の口。
+    crate::view::launcher_bridge::dispatch(app, ui, &resp);
+    // シーン見出しの右クリックメニュー / inline rename (widget は rect だけを返す)。
+    crate::view::launcher_bridge::scene_overlays(app, ui, &resp);
+    // セルの右クリックメニュー (開く / 色 / 独立化 / 削除)。
+    crate::view::launcher_bridge::cell_overlays(ui, &resp);
+
     // gui_01 #068 連動ハイライト: 今フレームの hovered clip の content_id を
     // 次フレームの active group 計算用に保持 (変化時のみ Edit を発火、 毎フレーム
     // の無駄な mutate を避ける)。
     let hover_content = resp.hovered_clip.and_then(|k| {
-        let t = app.song_doc.song().tracks.iter().find(|t| t.id == k.track)?;
-        t.clips.iter().find(|c| c.id == k.clip).map(|c| c.content_id)
+        let t = app.song_doc.song().tracks.iter().find(|t| t.id == k.track_id)?;
+        t.clips.iter().find(|c| c.id == k.clip_id).map(|c| c.content_id)
     });
     if hover_content != app.ui_ephemeral.arrange_hover_content {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -200,14 +209,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`docs/plan_audio_clip.md` §3.5)。 選択 clip 群に対して動くので、
     // 右クリックされた clip 自体の selection を変える/変えないは handler
     // 側に任せる (= MakeClipUnique も同 pattern)。
-    // rename overlay 判定用に clip_rename (index ベース ClipRef) を 1 回だけ
+    // rename overlay 判定用に clip_rename (index ベース ClipKey) を 1 回だけ
     // ClipKey (id ベース) に解決する (selected_clips と同 idiom)。 track rename
-    // の renaming_track_id と同パターンで、 ループ内で clip_key_to_ref を毎
+    // の renaming_track_id と同パターンで、 ループ内で live_clip_key を毎
     // clip 呼ぶ線形探索を避ける。
     let renaming_clip_key = app.ui_ephemeral.clip_rename.and_then(|r| {
-        let t = app.song_doc.song().tracks.get(r.track as usize)?;
-        let c = t.clips.get(r.clip as usize)?;
-        Some(ClipKey { track: t.id, clip: c.id })
+        let t = app.song_doc.song().track_by_id(r.track_id)?;
+        let c = t.clip_by_id(r.clip_id)?;
+        Some(ClipKey { track_id: t.id, clip_id: c.id })
     });
     for (clip_key, rect) in &resp.clip_rects {
         let key = *clip_key;
@@ -228,7 +237,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let Some(target) = clip_key_to_ref(app, key) else {
+                    let Some(target) = live_clip_key(app, key) else {
                         return;
                     };
                     match idx {
@@ -291,7 +300,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 h: 18.0,
             };
             let edit_resp = ui.text_input_at_focused(
-                ("clip_rename", key.track, key.clip),
+                ("clip_rename", key.track_id, key.clip_id),
                 input_rect,
                 &app.ui_ephemeral.clip_rename_text,
                 &TextInputStyle::default(),
@@ -747,7 +756,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             0.0,
         );
     }
-    if let Some(drop) = ui.take_file_drop_in_rect(canvas_area) {
+    // r.md #87: ランチャー帯へのドロップは **帯の矩形で先に受ける**。
+    // `canvas_area` (= レーン) だけを見ていると、帯の上に落としたファイルは
+    // どの矩形にも当たらず黙って捨てられる (セルへの D&D が効かない原因だった)。
+    let launcher_drop = (resp.launcher.pane_rect.w > 0.0)
+        .then(|| ui.take_file_drop_in_rect(resp.launcher.pane_rect))
+        .flatten();
+    if let Some(drop) = launcher_drop.or_else(|| ui.take_file_drop_in_rect(canvas_area)) {
         // drop target 解決: drop 位置 (position.y) が乗っている track を、 widget が
         // 返す実際の header rect (`resp.track_header_rects`) で hit-test する。
         // header_rects は縦スクロール (`arrange_track_top`) / 個別行高 override /
@@ -767,11 +782,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // import パイプラインに流す (= `common::audio_decode` が WAV / AIFF /
         // FLAC / MP3 / OGG / M4A をコンテンツ判定でデコード、 r.md #19)。
         let drop_y = drop.position.1;
-        let target =
-            match track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, drop_y) {
-                Some(idx) => ImportTrackTarget::Track(idx as u32),
-                None => ImportTrackTarget::NewTrackBottom,
-            };
+        // r.md #87: ランチャーのセルに当たったらそのセルへ入れる。
+        let cell_target =
+            crate::view::launcher_bridge::cell_drop_target(&resp, drop.position);
+        let target = match cell_target {
+            Some(t) => t,
+            None => {
+                match track_index_at_y(
+                    &resp.track_header_rects,
+                    &app.song_doc.song().tracks,
+                    drop_y,
+                ) {
+                    Some(idx) => ImportTrackTarget::Track(idx as u32),
+                    None => ImportTrackTarget::NewTrackBottom,
+                }
+            }
+        };
         // ドロップ X 位置 → beat。 import で生成する clip を「先頭 (playhead) では
         // なくドロップしたカーソル位置」 に置く。 hover-beat (下) と同じ pixel→beat
         // 変換 (canvas 左端基準) + 既存 snap 設定を適用。 header 上に落とした等で
@@ -859,7 +885,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     });
     let snapped_beat: Option<f64> = raw_beat
         .map(|raw| arr_snap.snap_beat(raw, /* alt: */ false, zoom));
-    let hover_clip: Option<ClipRef> = raw_beat.and_then(|beat| {
+    let hover_clip: Option<ClipKey> = raw_beat.and_then(|beat| {
         // カーソル Y が乗っている track を、 widget が返す実際の header rect
         // (`resp.track_header_rects`) で hit-test する (file drop target と同じ手法)。
         // naive な `(py - canvas_top) / row_h` は master 行 (Reaper 流 at top) /
@@ -871,9 +897,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let track = app.song_doc.song().tracks.get(track_idx)?;
         for (clip_idx, clip) in track.clips.iter().enumerate() {
             if beat >= clip.start_beat && beat < clip.start_beat + clip.length_beats {
-                return Some(ClipRef {
-                    track: track_idx as u32,
-                    clip: clip_idx as u32,
+                return Some(ClipKey {
+                    track_id: track_idx as u32,
+                    clip_id: clip_idx as u32,
                 });
             }
         }
@@ -1077,10 +1103,9 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
             .map(|t| track_color::to_renderer(track_color::effective_track_color(t))),
         ColorPickerTarget::Clip(clip_ref) => app
             .song_doc.song()
-            .tracks
-            .get(clip_ref.track as usize)
+            .track_by_id(clip_ref.track_id)
             .and_then(|t| {
-                t.clips.get(clip_ref.clip as usize).map(|c| {
+                t.clip_by_id(clip_ref.clip_id).map(|c| {
                     track_color::to_renderer(track_color::effective_clip_color(t, c))
                 })
             }),
@@ -1139,7 +1164,7 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
 fn target_id_hash(target: ColorPickerTarget) -> u64 {
     match target {
         ColorPickerTarget::Track(id) => (1u64 << 63) | id as u64,
-        ColorPickerTarget::Clip(r) => ((r.track as u64) << 32) | r.clip as u64,
+        ColorPickerTarget::Clip(r) => ((r.track_id as u64) << 32) | r.clip_id as u64,
         ColorPickerTarget::Section(id) => (1u64 << 62) | id as u64,
         ColorPickerTarget::Scene(id) => (1u64 << 61) | id as u64,
     }
@@ -1245,14 +1270,14 @@ fn draw_clip_synth_spinner(
     if clip_rect.w < 30.0 || clip_rect.h < 24.0 {
         return;
     }
-    let wav = app.clip_wav_synthesizing(clip_key.track, clip_key.clip);
-    let lip = app.lipsync_target_generating(clip_key.track)
+    let wav = app.clip_wav_synthesizing(clip_key.track_id, clip_key.clip_id);
+    let lip = app.lipsync_target_generating(clip_key.track_id)
         && app
             .song_doc.song()
             .tracks
             .iter()
-            .find(|t| t.id == clip_key.track)
-            .and_then(|t| t.clips.iter().find(|c| c.id == clip_key.clip))
+            .find(|t| t.id == clip_key.track_id)
+            .and_then(|t| t.clips.iter().find(|c| c.id == clip_key.clip_id))
             .is_some_and(|c| c.auto_lipsync);
     if !wav && !lip {
         return;
@@ -1268,7 +1293,7 @@ fn draw_clip_synth_spinner(
     let cy = clip_rect.y + chip + 2.0;
     super::voicevox_overlay::draw_spinner_badge(
         ui,
-        (b"vox_clip_spin", clip_key.track, clip_key.clip),
+        (b"vox_clip_spin", clip_key.track_id, clip_key.clip_id),
         cx,
         cy,
         r,
@@ -1301,13 +1326,13 @@ fn draw_audio_clip_value_overlay(
     if clip_rect.w < 60.0 || clip_rect.h < 24.0 {
         return;
     }
-    let Some(t_idx) = app.song_doc.song().tracks.iter().position(|t| t.id == clip_key.track) else {
+    let Some(t_idx) = app.song_doc.song().tracks.iter().position(|t| t.id == clip_key.track_id) else {
         return;
     };
     let Some(c_idx) = app.song_doc.song().tracks[t_idx]
         .clips
         .iter()
-        .position(|c| c.id == clip_key.clip)
+        .position(|c| c.id == clip_key.clip_id)
     else {
         return;
     };
@@ -1359,7 +1384,7 @@ fn draw_audio_clip_value_overlay(
         }
         *x_right = x;
         ui.label_at_clipped(
-            (id, clip_key.track, clip_key.clip),
+            (id, clip_key.track_id, clip_key.clip_id),
             s,
             Rect { x, y, w, h: font_size * 1.2 },
             font_size,

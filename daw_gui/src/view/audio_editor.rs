@@ -159,10 +159,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             return;
         }
     };
-    let Some(track) = app.song_doc.song().tracks.get(target.track as usize) else {
+    let Some(track) = app.song_doc.song().track_by_id(target.track_id) else {
         return;
     };
-    let Some(clip) = track.clips.get(target.clip as usize) else {
+    let Some(clip) = track.clip_by_id(target.clip_id) else {
         return;
     };
     let Some(common::model::ClipContent::Audio(audio)) =
@@ -1102,8 +1102,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // event.event_start_in_clip_beats から event_length_beats まで
     // (= 1 event = clip 全体) を全幅マッピングしているので、
     // x = wf_area.x + (in_clip_beats / clip.length_beats) * wf_area.w。
-    if let Some(ph_beat) = app.transport.playhead_beat {
-        let ph_beat = ph_beat as f64;
+    // r.md #87: **ランチャーのセルを開いているときはセル内の位相**を出す。
+    // セルは song の playhead とは別の時間軸で回るので、song 拍をそのまま
+    // 写すと編集面の外を指して線が 1 本も出ない (ピアノロールと同じ扱い)。
+    if let Some(ph_beat) = app.editor_playhead_beat(target) {
         // playhead の content-local 位置。 view 範囲外 (zoom 中で
         // playhead が画面外) なら描画 skip。
         let in_clip = clip.song_to_content_beat(ph_beat);

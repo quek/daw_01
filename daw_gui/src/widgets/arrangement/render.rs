@@ -404,7 +404,7 @@ fn render_arrangement_heavy(
                 continue;
             }
             for c in &t.clips {
-                let key = ClipKey { track: t.id, clip: c.id };
+                let key = ClipKey { track_id: t.id, clip_id: c.id };
                 let Some(content) = heavy.clip_content.get(&key) else {
                     continue;
                 };

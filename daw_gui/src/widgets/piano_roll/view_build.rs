@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use daw_ui_renderer::Rect;
 
-use crate::app::{AppData, ClipRef};
+use crate::app::{AppData, ClipKey};
 use crate::view::snap;
 use crate::view::track_color;
 
@@ -48,8 +48,8 @@ pub(super) struct PrContent {
     pub view: PianoRollView,
     pub style: PianoRollStyle,
     pub selected: Vec<NoteId>,
-    pub shown: Vec<ClipRef>,
-    pub target: ClipRef,
+    pub shown: Vec<ClipKey>,
+    pub target: ClipKey,
     /// 各表示クリップ (clip_slot 順) の **content 原点** の song-absolute 拍
     /// (per-note offset で content-local へ戻す。r.md #44)。
     pub clip_starts: Vec<f64>,
@@ -124,7 +124,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     };
 
     // dim は **トラック基準** (対象クリップのトラック以外を淡色)。
-    let notes = build_widget_notes(app, &shown, Some(target.track));
+    let notes = build_widget_notes(app, &shown, Some(target.track_id));
     let zoom_x = app.pianoroll_zoom_x().max(4.0);
     let zoom_y = app.pianoroll_zoom_y().max(6.0);
     let loop_range = app.transport.loop_region.range();
@@ -137,9 +137,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     let target_clip = app
         .song_doc
         .song()
-        .tracks
-        .get(target.track as usize)
-        .and_then(|t| t.clips.get(target.clip as usize));
+        .track_by_id(target.track_id)
+        .and_then(|t| t.clip_by_id(target.clip_id));
     let clip_origin_beat = target_clip.map_or(0.0, common::model::Clip::content_origin_beat);
     let clip_window_start_beat = target_clip.map_or(0.0, |c| c.start_beat);
     // 編集中 clip の start_beat 位置の scale を採用 (単一 view 内で動的に scale が変わらない)。
@@ -155,9 +154,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
             .filter_map(|r| {
                 app.song_doc
                     .song()
-                    .tracks
-                    .get(r.track as usize)
-                    .and_then(|t| t.clips.get(r.clip as usize))
+                    .track_by_id(r.track_id)
+                    .and_then(|t| t.clip_by_id(r.clip_id))
                     .map(|c| c.start_beat)
             })
             .fold(f64::INFINITY, f64::min);
@@ -180,7 +178,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         pitch_visible: main_h / zoom_y,
         keyboard_w: KEYBOARD_W,
         velocity_lane_h: VEL_LANE_H,
-        playhead_beat: app.transport.playhead_beat.map(f64::from),
+        // r.md #87: セルを開いているときはセル内の位相 (song の playhead ではない)。
+        playhead_beat: app.editor_playhead_beat(target),
         ruler_h: RULER_H,
         bpm: app.song_doc.song().bpm,
         time_sig: app.song_doc.song().time_sig,
@@ -199,9 +198,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         .map(|r| {
             app.song_doc
                 .song()
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
+                .track_by_id(r.track_id)
+                .and_then(|t| t.clip_by_id(r.clip_id))
                 // r.md #44: emit の逆変換も content 原点基準 (note は content-local)。
                 .map(common::model::Clip::content_origin_beat)
                 .unwrap_or(0.0)
@@ -242,18 +240,18 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
 /// トラック単位なのでノートもトラック色)、非対象 _トラック_ のノートは `dimmed`、ロック中トラックの
 /// ノートは `locked` (widget 側で hit-test 除外)。`target_track` = 編集対象クリップのトラック index。
 /// v6 linked clip の notes は `Song.clip_contents` 経由で lookup する。
-pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipRef], target_track: Option<u32>) -> Vec<Note> {
+pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipKey], target_track: Option<u32>) -> Vec<Note> {
     let mut out: Vec<Note> = Vec::new();
     for (clip_slot, &r) in shown.iter().enumerate() {
-        let Some(track) = app.song_doc.song().tracks.get(r.track as usize) else {
+        let Some(track) = app.song_doc.song().track_by_id(r.track_id) else {
             continue;
         };
-        let Some(clip) = track.clips.get(r.clip as usize) else {
+        let Some(clip) = track.clip_by_id(r.clip_id) else {
             continue;
         };
         let color = track_color::to_renderer(track_color::effective_track_color(track));
         // トラック基準の dim: 編集対象トラック以外のノートを淡色に。
-        let dimmed = Some(r.track) != target_track;
+        let dimmed = Some(r.track_id) != target_track;
         // r.md #64: 効力は「凡例に行がある」 ∧ 「ロック集合に居る」 の派生値。
         let locked = app.is_pianoroll_clip_locked_in(shown, r);
         // r.md #44: note は content-local なので song-absolute 化は content 原点基準

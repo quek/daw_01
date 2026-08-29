@@ -28,7 +28,7 @@ impl AppData {
     pub(crate) fn handle_midi_note_on(&mut self, channel: u8, pitch: u8, velocity: u8) {
         if self.consume_launcher_midi(
             channel,
-            crate::event_launcher::LauncherBindInput::Note(pitch),
+            common::model::MidiBindInput::Note(pitch),
             true,
         ) {
             return;
@@ -49,11 +49,19 @@ impl AppData {
         // r.md #87: note-on を飲んだ binding は note-off も飲む (`Gate` の
         // 「離すと停止」がここを通る)。Learn は note-on だけで確定するので、
         // ここでは新規 bind はしない。
+        //
+        // **モニター中の音は必ず止める。** note-on の後に割り当てが増えると
+        // note-off だけが飲まれ、鳴らしっぱなしになる (押している最中に Learn を
+        // 済ませると起こる)。飲むかどうかに関係なく先に消音する。
+        let monitoring = self.recording.monitor_notes.iter().any(|(_, p)| *p == pitch);
         if self.fire_launcher_bindings(
             channel,
-            crate::event_launcher::LauncherBindInput::Note(pitch),
+            common::model::MidiBindInput::Note(pitch),
             false,
         ) {
+            if monitoring {
+                self.monitor_note_off(pitch);
+            }
             return;
         }
         self.monitor_note_off(pitch);
@@ -159,11 +167,19 @@ impl AppData {
     ) {
         // r.md #87: ランチャーの binding / Learn が先。CC でセルを撃つときは
         // 値 >= 64 を「押下」、< 64 を「離す」とみなす (パッドの CC モードの慣例)。
-        if self.consume_launcher_midi(
-            channel,
-            crate::event_launcher::LauncherBindInput::ControlChange(controller),
-            value >= 64,
-        ) {
+        //
+        // ただし **パラメータの MIDI Learn 待ちのときは飛ばす** — 既存の
+        // ランチャー割り当てがある CC を Learn に使うと、ここで消費されて
+        // Learn が永久に完了しなくなる。
+        let input = common::model::MidiBindInput::ControlChange(controller);
+        let pressed = value >= 64;
+        // 値が動くたびに届く CC を毎回「押下」にすると `Toggle` が往復するので、
+        // **押下状態が変わったフレームだけ**ランチャーへ回す。
+        let edge = self.launcher_cc_edge(channel, input, pressed);
+        if self.recording.midi_learn_target.is_none()
+            && (self.launcher.learn_target.is_some() || edge)
+            && self.consume_launcher_midi(channel, input, pressed)
+        {
             return;
         }
         if let Some(target) = self.recording.midi_learn_target.take() {
@@ -172,11 +188,13 @@ impl AppData {
             // されるが「bind 完了」 を一瞬表示。
             self.edit_song(move |song| {
                 song.midi_bindings.retain(|b| {
-                    !(b.controller == controller && b.channel == channel)
+                    !(b.input == common::model::MidiBindInput::cc(controller)
+                        && b.channel == channel)
                 });
                 song.midi_bindings.push(common::model::MidiBinding {
                     channel,
-                    controller,
+                    input: common::model::MidiBindInput::cc(controller),
+                    legacy_controller: None,
                     target,
                 });
             });
@@ -191,7 +209,7 @@ impl AppData {
             .midi_bindings
             .iter()
             .filter(|b| {
-                b.controller == controller
+                b.input == common::model::MidiBindInput::cc(controller)
                     && (b.channel == channel || b.channel == 16)
             })
             .map(|b| b.target)
@@ -211,6 +229,11 @@ impl AppData {
         target: common::model::BindingTarget,
         value: u8,
     ) {
+        // r.md #87: ランチャー宛の bind は「押した / 離した」で効くので、
+        // ここ (連続値の反映) には来ない。`fire_launcher_bindings` が先に消費する。
+        if target.is_launcher() {
+            return;
+        }
         let v_norm = f32::from(value.min(127)) / 127.0;
         match target {
             common::model::BindingTarget::TrackVolume(track_id) => {
@@ -261,6 +284,15 @@ impl AppData {
                 // 毎 CC の full LoadSong flood は runner の frame flush (flush_song_sync)
                 // が 1 frame 1 回へ構造的に coalesce する (旧 pending_host_sync 置換)。
             }
+            // r.md #87: ランチャー宛は冒頭の `is_launcher()` で弾いてある
+            // (押した / 離したで効くので連続値の経路には来ない)。
+            // **`_` で受けない** — ランチャー操作が増えたときにここで気付けるように。
+            common::model::BindingTarget::LaunchCell { .. }
+            | common::model::BindingTarget::LaunchScene { .. }
+            | common::model::BindingTarget::StopLauncherRow { .. }
+            | common::model::BindingTarget::StopAllLauncherRows
+            | common::model::BindingTarget::SwitchRowToArranger { .. }
+            | common::model::BindingTarget::SwitchAllToArranger => {}
         }
     }
 
@@ -277,14 +309,7 @@ impl AppData {
         }
         let cursor = self.recording.step_cursor_beat;
         let step = self.recording.step_size_beats;
-        let target_track_idx = target.track as usize;
-        let target_clip_idx = target.clip as usize;
-        let Some(clip) = self
-            .song_doc.song()
-            .tracks
-            .get(target_track_idx)
-            .and_then(|t| t.clips.get(target_clip_idx))
-        else {
+        let Some(clip) = self.song_doc.song().clip_by_key(target) else {
             return;
         };
         // r.md #44: step カーソルは content-local。 clip が見せている窓
@@ -298,7 +323,7 @@ impl AppData {
         };
         let Some(Some(selected)) = self.edit_song(|song| {
             let content =
-                midi_content_in_clip_mut(song, target_track_idx, target_clip_idx)?;
+                midi_content_in_clip_mut(song, target)?;
             // v29: 新規 note は allocator で安定 id を採番する。
             let note_id = content.alloc_note_id();
             let notes = &mut content.notes;
@@ -351,18 +376,19 @@ impl AppData {
         };
         for track_id in self.armed_track_ids() {
             self.ensure_midi_clip_at_playhead(track_id, playhead);
-            let Some((track_idx, clip_idx)) =
-                self.find_midi_clip_at_playhead(track_id, playhead)
-            else {
+            let Some(key) = self.find_midi_clip_at_playhead(track_id, playhead) else {
                 continue;
             };
             // r.md #44: note は content-local なので、原点 (= clip 開始 - 窓 offset)
             // を引いて local 化する。
-            let clip_origin = self.song_doc.song().tracks[track_idx].clips[clip_idx]
-                .content_origin_beat();
+            let Some(clip_origin) =
+                self.song_doc.song().clip_by_key(key).map(common::model::Clip::content_origin_beat)
+            else {
+                continue;
+            };
             let local_start = playhead - clip_origin;
             let note_id = self.edit_song(|song| {
-                let content = midi_content_in_clip_mut(song, track_idx, clip_idx)?;
+                let content = midi_content_in_clip_mut(song, key)?;
                 // v29: 録音で入る note も allocator で安定 id を採番。
                 let note_id = content.alloc_note_id();
                 content.notes.push(common::model::Note {
@@ -422,14 +448,12 @@ impl AppData {
     /// 探し直していたため、同じ位置に同じ高さのノートが 2 本あると常に 1 本目に
     /// 当たり、2 本目以降が仮の長さ (0.05 拍) のまま残った (不変条件 1)。
     fn finalize_recorded_note(&mut self, track_id: u32, start: f64, note_id: u32, end: f64) {
-        let Some((track_idx, clip_idx)) =
-            self.find_midi_clip_containing_beat(track_id, start)
-        else {
+        let Some(key) = self.find_midi_clip_containing_beat(track_id, start) else {
             return;
         };
         let length = (end - start).max(0.05);
         self.edit_song(|song| {
-            if let Some(notes) = song.notes_in_clip_mut(track_idx, clip_idx)
+            if let Some(notes) = song.notes_in_clip_mut(key)
                 && let Some(n) = notes.iter_mut().find(|n| n.id == note_id)
             {
                 n.duration_beats = length;
@@ -502,25 +526,23 @@ impl AppData {
         &self,
         track_id: u32,
         playhead: f64,
-    ) -> Option<(usize, usize)> {
-        let track_idx =
-            self.song_doc.song().tracks.iter().position(|t| t.id == track_id)?;
-        let track = &self.song_doc.song().tracks[track_idx];
-        let clip_idx = track.clips.iter().position(|c| {
+    ) -> Option<ClipKey> {
+        let track = self.song_doc.song().track_by_id(track_id)?;
+        let clip = track.clips.iter().find(|c| {
             playhead >= c.start_beat
                 && playhead < c.start_beat + c.length_beats
         })?;
-        Some((track_idx, clip_idx))
+        Some(ClipKey { track_id, clip_id: clip.id })
     }
 
-    /// 指定 beat 位置を含む MIDI clip の (track_idx, clip_idx)。
+    /// 指定 beat 位置を含む MIDI clip の [`ClipKey`]。
     /// `find_midi_clip_at_playhead` と同等だが、 引数を意味的に区別する
     /// (= note_off 時は note_on 時刻、 note_on 時は playhead を渡す)。
     pub(crate) fn find_midi_clip_containing_beat(
         &self,
         track_id: u32,
         beat: f64,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<ClipKey> {
         self.find_midi_clip_at_playhead(track_id, beat)
     }
 

@@ -488,6 +488,9 @@ pub fn process_master_fx_chain(
     loop_region: LoopRegion,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     mod_scalars: &[f32],
+    // r.md #87: マスター行 (`song_lanes`) の供給元。ランチャーで撃った行は
+    // アレンジのカーブではなくセルのカーブを使う。
+    master_rows: TrackRows<'_>,
 ) {
     let n = frames as usize;
     let Some(ws) = worker_sync else { return };
@@ -512,8 +515,7 @@ pub fn process_master_fx_chain(
                 pd,
                 song,
                 common::model::MASTER_TRACK_ID,
-                // master は `song_lanes` を使う = ランチャーの「行」を持たない。
-                TrackRows::default(),
+                master_rows,
                 device.id,
                 sample_rate,
                 f64::from(current_bpm),
@@ -777,6 +779,7 @@ pub fn execute_schedule_post_dispatch(
                     any_solo,
                     recording_lanes,
                     n,
+                    rows.track_rows(*src_track_idx as usize),
                 );
             }
 
@@ -1099,6 +1102,7 @@ pub fn render_master_buffer(
         loop_region,
         recording_lanes,
         mod_scalars,
+        rows.master_rows(),
     );
 
     // ---- master gain ----
@@ -1384,6 +1388,7 @@ mod send_tests {
         mix_send_into_track_scratch(
             &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
+            crate::launcher::TrackRows::default(),
         );
         for i in 0..FRAMES {
             let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
@@ -1406,6 +1411,7 @@ mod send_tests {
         mix_send_into_track_scratch(
             &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
+            crate::launcher::TrackRows::default(),
         );
         for i in 0..FRAMES {
             assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
@@ -1426,6 +1432,7 @@ mod send_tests {
         mix_send_into_track_scratch(
             &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
+            crate::launcher::TrackRows::default(),
         );
         for i in 0..FRAMES {
             assert_eq!(
@@ -1452,6 +1459,7 @@ mod send_tests {
             mix_send_into_track_scratch(
                 &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, true, &empty,
                 FRAMES,
+                crate::launcher::TrackRows::default(),
             );
             scratch[1].track_l[0]
         };
@@ -1491,6 +1499,7 @@ mod send_tests {
         mix_send_into_track_scratch(
             &mut scratch, 1, 0, true, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
+            crate::launcher::TrackRows::default(),
         );
         for i in 0..FRAMES {
             assert!(
@@ -1512,6 +1521,7 @@ mod send_tests {
         let empty = empty_lanes();
         mix_send_into_track_scratch(
             &mut scratch, 1, 0, false, &song, 0, 999, 48_000, 120.0, 0.0, false, &empty, FRAMES,
+            crate::launcher::TrackRows::default(),
         );
         assert_eq!(scratch[1].track_l[0], 3.0, "unknown send id must be a no-op");
     }

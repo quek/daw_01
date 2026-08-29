@@ -1258,8 +1258,8 @@ async fn recv_loop(
                 | AudioCommand::StopAllRows
                 | AudioCommand::SwitchRowToArranger { .. }
                 | AudioCommand::SwitchAllToArranger
-                | AudioCommand::SetGlobalLaunchQuantize(_))) => {
-                launcher::ipc::dispatch(cmd, &engine_shared, &cmd_tx);
+                )) => {
+                launcher::ipc::dispatch(cmd, &cmd_tx);
             }
             Ok(AudioCommand::StartRecording { preroll_samples }) => {
                 // r.md #51: 録音セッションの開始。 `recording_requested` は

@@ -7,19 +7,19 @@
 //! (`app_types` が再輸出する)。
 //!
 //! 対象は全部 **安定 id** で持つ (`Clip` だけは index ベースの
-//! [`ClipRef`] だが、これは overlay が開いている 1 フレームの間だけ生きる
+//! [`ClipKey`] だが、これは overlay が開いている 1 フレームの間だけ生きる
 //! 一時参照で、保持されない)。
 
-use crate::app_types::ClipRef;
+use crate::app_types::ClipKey;
 
 /// v18 (`docs/plan_track_clip_color.md`): color_picker overlay (gui_01 #058)
 /// の編集対象。`Some` の間 arrangement_view が 1 フレームごとに
 /// `ui.color_picker` を呼んで overlay を描画する。`Track` は track id、
-/// `Clip` は index ベース `ClipRef`。
+/// `Clip` は index ベース `ClipKey`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorPickerTarget {
     Track(u32),
-    Clip(ClipRef),
+    Clip(ClipKey),
     /// Arranger セクション帯の色。
     Section(u32),
     /// r.md #87: ランチャーの列 (シーン) の色ストライプ (`Scene::id`)。

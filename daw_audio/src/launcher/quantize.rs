@@ -53,37 +53,6 @@ pub fn next_boundary(beat: f64, q: f64) -> f64 {
 /// (f64 で 1e-12 オーダー) より十分大きく、人間が感じる先行より十分小さい。
 pub const GRID_EPSILON_BEATS: f64 = 0.001;
 
-/// [`LaunchQuantize`] を 1 ワードに詰める (`SharedState` の atomic 用)。
-///
-/// IPC は `AudioCommand::SetGlobalLaunchQuantize` が値そのものを運ぶが、
-/// audio thread は `ArcSwap` を増やさず atomic 1 本で読みたい。往復は
-/// `encode` / `decode` の 2 関数だけに閉じる。
-#[must_use]
-pub fn encode(q: LaunchQuantize) -> u32 {
-    match q {
-        LaunchQuantize::Global => 0,
-        LaunchQuantize::Off => 1,
-        LaunchQuantize::Bars(n) => 2 | (u32::from(n) << 8),
-        LaunchQuantize::Note { div, triplet } => {
-            3 | (u32::from(div) << 8) | (u32::from(triplet) << 24)
-        }
-    }
-}
-
-/// [`encode`] の逆。未知のタグは `Global` (= 既定へ倒れる) にする。
-#[must_use]
-pub fn decode(bits: u32) -> LaunchQuantize {
-    match bits & 0xFF {
-        1 => LaunchQuantize::Off,
-        2 => LaunchQuantize::Bars(((bits >> 8) & 0xFF) as u8),
-        3 => LaunchQuantize::Note {
-            div: ((bits >> 8) & 0xFFFF) as u16,
-            triplet: (bits >> 24) & 1 != 0,
-        },
-        _ => LaunchQuantize::Global,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,12 +176,4 @@ mod tests {
         assert!((map.seconds_to_beat(fire_secs) - 12.0).abs() < 0.01);
     }
 
-    #[test]
-    fn 量子化設定は_1_ワードに往復する() {
-        for q in common::model::LAUNCH_QUANTIZE_CHOICES.iter().map(|(q, _)| *q) {
-            assert_eq!(decode(encode(q)), q, "{q:?}");
-        }
-        // 未知のタグは Global (= 既定へ倒れる)。
-        assert_eq!(decode(0xFF), LaunchQuantize::Global);
-    }
 }

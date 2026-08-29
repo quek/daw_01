@@ -72,7 +72,7 @@ pub(super) fn build_clip_content(
             let Some(mc) = mt.clips.iter().find(|mc| mc.id == c.id) else {
                 continue;
             };
-            let key = ClipKey { track: t.id, clip: c.id };
+            let key = ClipKey { track_id: t.id, clip_id: c.id };
             if let Some(content) = build_one(app, tempo_map, mc, None, &mut spans) {
                 map.insert(key, content);
             }
@@ -114,7 +114,7 @@ pub(super) fn build_stretch_ghost_content(
         // 見えなくなった瞬間に「中身はあるのに原点が 0 扱い」 になり、 伸縮した中身が
         // ゴースト枠に対して `content_offset_beats` ぶんずれる。
         if !visible_tracks.iter().any(|t| {
-            t.id == a.key.track && t.clips.iter().any(|c| c.id == a.key.clip)
+            t.id == a.key.track_id && t.clips.iter().any(|c| c.id == a.key.clip_id)
         }) {
             continue;
         }
@@ -123,11 +123,11 @@ pub(super) fn build_stretch_ghost_content(
             .song()
             .tracks
             .iter()
-            .find(|mt| mt.id == a.key.track)
+            .find(|mt| mt.id == a.key.track_id)
         else {
             continue;
         };
-        let Some(mc) = mt.clips.iter().find(|mc| mc.id == a.key.clip) else {
+        let Some(mc) = mt.clips.iter().find(|mc| mc.id == a.key.clip_id) else {
             continue;
         };
         // ゴースト矩形 / release commit と **同じ** `resize_preview_start_len`。

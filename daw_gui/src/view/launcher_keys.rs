@@ -41,7 +41,7 @@ pub(crate) fn dispatch_launcher_keys(
     ui: &mut Ui<'_, AppData>,
     surface: Option<EditSurface>,
 ) {
-    // Ctrl+Tab は文脈に関係なく効く (帯の見せ方はいつでも切り替えたい)。
+    // Tab は文脈に関係なく効く (帯の見せ方はいつでも切り替えたい)。
     if ui.take_shortcut("daw.cycle_launcher_layout") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::Launcher(LauncherEvent::CycleLayout));

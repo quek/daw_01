@@ -21,7 +21,7 @@ impl AppData {
         let mut piano_roll_views: Vec<(common::model::ClipKey, common::model::PianoRollViewState)> =
             self.ui_prefs.piano_roll_views
                 .iter()
-                .filter(|(k, _)| self.clip_ref_of(**k).is_some())
+                .filter(|(k, _)| self.live_clip_key(**k).is_some())
                 .map(|(k, v)| (*k, *v))
                 .collect();
         piano_roll_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
@@ -31,7 +31,7 @@ impl AppData {
         )> = self
             .ui_prefs.audio_editor_views
             .iter()
-            .filter(|(k, _)| self.clip_ref_of(**k).is_some())
+            .filter(|(k, _)| self.live_clip_key(**k).is_some())
             .map(|(k, v)| (*k, *v))
             .collect();
         audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
@@ -68,12 +68,12 @@ impl AppData {
             snap_live_input: self.recording.snap_live_input,
             bottom_panel: self.ui_prefs.bottom_panel,
             // 開いていたクリップを復元できるよう選択も保存 (現存クリップのみ)。
-            selected_clip: self.selection.selected_clip.filter(|k| self.clip_ref_of(*k).is_some()),
+            selected_clip: self.selection.selected_clip.filter(|k| self.live_clip_key(*k).is_some()),
             selected_clips: self
                 .selection.selected_clips
                 .iter()
                 .copied()
-                .filter(|k| self.clip_ref_of(*k).is_some())
+                .filter(|k| self.live_clip_key(*k).is_some())
                 .collect(),
             piano_roll_views,
             audio_editor_views,
@@ -144,9 +144,9 @@ impl AppData {
         self.selection.selected_clips = v
             .selected_clips
             .into_iter()
-            .filter(|k| self.clip_ref_of(*k).is_some())
+            .filter(|k| self.live_clip_key(*k).is_some())
             .collect();
-        self.selection.selected_clip = v.selected_clip.filter(|k| self.clip_ref_of(*k).is_some());
+        self.selection.selected_clip = v.selected_clip.filter(|k| self.live_clip_key(*k).is_some());
         for (k, mut pv) in v.piano_roll_views {
             pv.zoom_x = pv.zoom_x.clamp(8.0, 400.0);
             pv.zoom_y = pv.zoom_y.clamp(6.0, 40.0);

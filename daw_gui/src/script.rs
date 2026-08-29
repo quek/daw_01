@@ -26,7 +26,7 @@ use common::model::Song;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent};
 
-use crate::app::{AppData, AppEvent, ClipRef};
+use crate::app::{AppData, AppEvent, ClipKey};
 use crate::bootstrap::{Bootstrap, ChildEvent};
 use crate::dispatcher::RecordingDispatcher;
 
@@ -1206,15 +1206,11 @@ fn daw_clip_display_label(
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
     let ref_json = arg_to_string(args, 0, ctx)?;
-    let target: ClipRef = serde_json::from_str(&ref_json)
+    let target: ClipKey = serde_json::from_str(&ref_json)
         .map_err(|e| js_native(format!("clipDisplayLabel: parse: {e}")))?;
     let label = with_host(|host| {
         let song = &host.app.song_doc.song();
-        let Some(clip) = song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-        else {
+        let Some(clip) = song.clip_by_key(target) else {
             return String::new();
         };
         crate::widgets::arrangement::view_build::clip_display_label(clip, song).to_string()
@@ -1301,12 +1297,12 @@ fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
 
 fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let json = arg_to_string(args, 0, ctx)?;
-    let refs: Vec<ClipRef> = serde_json::from_str(&json)
+    let refs: Vec<ClipKey> = serde_json::from_str(&json)
         .map_err(|e| js_native(format!("setSelection: parse: {e}")))?;
     with_host(|host| {
-        // ClipRef (index) → stable ClipKey に変換して格納。
+        // 消えた key は落とす (住所は安定 id なので変換は要らない)。
         let keys: Vec<common::model::ClipKey> =
-            refs.iter().filter_map(|r| host.app.clip_key_of(*r)).collect();
+            refs.iter().filter_map(|r| host.app.live_clip_key(*r)).collect();
         host.app.selection.selected_clip = keys.last().copied();
         host.app.selection.selected_clips = keys;
     });
@@ -1335,10 +1331,10 @@ fn daw_duplicate_tracks(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
 }
 
 fn daw_set_hover_clip(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    // 引数は JSON 文字列。 "null" or `{"track":N,"clip":N}`。
+    // 引数は JSON 文字列。 "null" or `{"track_id":N,"clip_id":N}` (安定 id)。
     let json = arg_to_string(args, 0, ctx)?;
     let trimmed = json.trim();
-    let cref: Option<ClipRef> = if trimmed == "null" || trimmed.is_empty() {
+    let cref: Option<ClipKey> = if trimmed == "null" || trimmed.is_empty() {
         None
     } else {
         Some(
@@ -1396,7 +1392,7 @@ fn daw_dispatch_rename_clip(
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
     let ref_json = arg_to_string(args, 0, ctx)?;
-    let target: ClipRef = serde_json::from_str(&ref_json)
+    let target: ClipKey = serde_json::from_str(&ref_json)
         .map_err(|e| js_native(format!("dispatchRenameClip: parse: {e}")))?;
     let new_name = arg_to_string(args, 1, ctx)?;
     with_host(|host| {
@@ -1537,15 +1533,15 @@ fn daw_quantize_pitches_to_scale(
 }
 
 fn daw_add_note(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let track = args.get_or_undefined(0).to_number(ctx)? as u32;
-    let clip = args.get_or_undefined(1).to_number(ctx)? as u32;
+    // 住所は **安定 id** (`Track.id` / `Clip.id`)。index ではない。
+    let track_id = args.get_or_undefined(0).to_number(ctx)? as u32;
+    let clip_id = args.get_or_undefined(1).to_number(ctx)? as u32;
     let start_beat = args.get_or_undefined(2).to_number(ctx)?;
     let duration = args.get_or_undefined(3).to_number(ctx)?;
     let pitch = args.get_or_undefined(4).to_number(ctx)? as u8;
     with_host(|host| {
         host.app.handle_event(AppEvent::AddNote {
-            track,
-            clip,
+            key: ClipKey { track_id, clip_id },
             start_beat,
             duration,
             pitch,

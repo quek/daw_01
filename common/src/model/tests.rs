@@ -1320,7 +1320,10 @@ fn current_version_is_pinned() {
     // として保存する (停止 → 再生で同じセルが鳴り直し、書き出す音もこれで決まる)。
     // v34 以前は全 field が `serde(default)` で読め、`scenes` は空 Vec・主導権は
     // `Arranger` になる (= 従来どおりアレンジだけが鳴る)。**load 時に列を補わない**
-    // ので開いただけでは `*` が立たない (r.md #9)。
+    // ので開いただけでは `*` が立たない (r.md #9)。あわせて
+    // `Song.global_launch_quantize` と、`MidiBinding` の入力の `MidiBindInput`
+    // (CC / ノート) 化 + `BindingTarget` のランチャー操作 6 種を含む。旧
+    // `controller` は deserialize 専用に降格し `ensure_midi_binding_inputs` が移す。
     assert_eq!(CURRENT_VERSION, 35);
 }
 

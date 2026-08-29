@@ -189,33 +189,17 @@ impl AppData {
         out
     }
 
-    /// stable `ClipKey` (track_id + clip_id) → 現在の index ベース `ClipRef`。
-    /// track / clip が見つからなければ `None` (= 削除済 / undo で消えた)。
-    pub fn clip_ref_of(&self, key: common::model::ClipKey) -> Option<ClipRef> {
-        let t_idx = self.song_doc.song().tracks.iter().position(|t| t.id == key.track_id)?;
-        let c_idx = self.song_doc.song().tracks[t_idx]
-            .clips
-            .iter()
-            .position(|c| c.id == key.clip_id)?;
-        Some(ClipRef {
-            track: t_idx as u32,
-            clip: c_idx as u32,
-        })
+    /// まだ生きているクリップだけを通す (削除済 / undo で消えた key は `None`)。
+    /// **id ↔ index の変換は無くなった** — 住所は [`ClipKey`] 1 本で、
+    /// アレンジのクリップもランチャーのセルも同じ id 空間に居る (r.md #87)。
+    #[must_use]
+    pub fn live_clip_key(&self, key: ClipKey) -> Option<ClipKey> {
+        self.song_doc.song().clip_by_key(key).map(|_| key)
     }
 
-    /// index ベース `ClipRef` → stable `ClipKey`。 範囲外なら `None`。
-    pub fn clip_key_of(&self, r: ClipRef) -> Option<common::model::ClipKey> {
-        let t = self.song_doc.song().tracks.get(r.track as usize)?;
-        let c = t.clips.get(r.clip as usize)?;
-        Some(common::model::ClipKey {
-            track_id: t.id,
-            clip_id: c.id,
-        })
-    }
-
-    /// 選択 anchor (`selected_clip` = 末尾) を現在の `ClipRef` へ解決。
-    pub fn selected_clip_ref(&self) -> Option<ClipRef> {
-        self.selection.selected_clip.and_then(|k| self.clip_ref_of(k))
+    /// 選択 anchor (`selected_clip` = 末尾) を現在の `ClipKey` へ解決。
+    pub fn selected_clip_ref(&self) -> Option<ClipKey> {
+        self.selection.selected_clip.and_then(|k| self.live_clip_key(k))
     }
 
     // -------- per-clip piano roll / audio editor view 状態 --------
@@ -271,7 +255,7 @@ impl AppData {
     /// entry が無ければ default (`{0,0}` = 「未設定」、view 側でクリップ全長表示に倒れる)。
     pub fn audio_editor_view_state(&self) -> common::model::AudioEditorViewState {
         self.ui_ephemeral.audio_editor_clip
-            .and_then(|r| self.clip_key_of(r))
+            .and_then(|r| self.live_clip_key(r))
             .and_then(|k| self.ui_prefs.audio_editor_views.get(&k).copied())
             .unwrap_or_default()
     }
@@ -286,22 +270,22 @@ impl AppData {
         self.audio_editor_view_state().len_beats
     }
 
-    /// 選択集合 (`selected_clips`) を現在の `ClipRef` 群へ解決 (解決でき
+    /// 選択集合 (`selected_clips`) を現在の `ClipKey` 群へ解決 (解決でき
     /// ない stale key は除外)。 owned `Vec` を返す。
-    pub fn selected_clip_refs(&self) -> Vec<ClipRef> {
+    pub fn selected_clip_refs(&self) -> Vec<ClipKey> {
         self.selection.selected_clips
             .iter()
-            .filter_map(|k| self.clip_ref_of(*k))
+            .filter_map(|k| self.live_clip_key(*k))
             .collect()
     }
 
     /// ピアノロールに同時表示する MIDI クリップ群を順序付きで返す
-    /// (`selected_clips` を `ClipRef` 解決 → MIDI のみ filter)。anchor (`selected_clip`) は
+    /// (`selected_clips` を `ClipKey` 解決 → MIDI のみ filter)。anchor (`selected_clip`) は
     /// `selected_clips` の末尾なので、末尾要素 = 新規ノートの所属先 (= 対象/target クリップ)。
     /// `selected_clips` が空の単一選択経路では `selected_clip` にフォールバックする。
     /// **この順序が packed note id の `clip_slot` の SSoT** (`decode_note_id` と必ず一致させる)。
     #[must_use]
-    pub fn shown_pianoroll_clips(&self) -> Vec<ClipRef> {
+    pub fn shown_pianoroll_clips(&self) -> Vec<ClipKey> {
         let mut out = Vec::new();
         if self.selection.selected_clips.is_empty() {
             if let Some(r) = self.selected_clip_ref()
@@ -311,7 +295,7 @@ impl AppData {
             }
         } else {
             for k in &self.selection.selected_clips {
-                if let Some(r) = self.clip_ref_of(*k)
+                if let Some(r) = self.live_clip_key(*k)
                     && self.is_midi_clip(r)
                 {
                     out.push(r);
@@ -328,7 +312,7 @@ impl AppData {
     /// 変わらない** ので、target 変更で `selected_notes` を clear する必要はない (anchor の
     /// ポインタが動くだけ)。
     #[must_use]
-    pub fn pianoroll_target_clip(&self) -> Option<ClipRef> {
+    pub fn pianoroll_target_clip(&self) -> Option<ClipKey> {
         let shown = self.shown_pianoroll_clips();
         if let Some(a) = self.selected_clip_ref()
             && shown.contains(&a)
@@ -382,9 +366,9 @@ impl AppData {
     /// 重なり解決の勝者にする local index 群を返す) → `resolve_note_overlaps` で同ピッチ
     /// 重なりを解消 → packed `selected_notes` の当該クリップ部分を remap、という複数クリップ
     /// note 編集の共通基盤。snap 等の immutable 計算は呼び出し側で済ませて `f` に閉じ込める。
-    pub(crate) fn edit_clip_notes(&mut self, slot: usize, r: ClipRef, f: impl FnOnce(&mut Vec<Note>) -> Vec<u32>) {
+    pub(crate) fn edit_clip_notes(&mut self, slot: usize, r: ClipKey, f: impl FnOnce(&mut Vec<Note>) -> Vec<u32>) {
         let Some(Some(remap)) = self.edit_song(move |song| {
-            let notes = song.notes_in_clip_mut(r.track as usize, r.clip as usize)?;
+            let notes = song.notes_in_clip_mut(r)?;
             let winners = f(notes);
             Some(resolve_note_overlaps(notes, &winners))
         }) else {
@@ -400,17 +384,16 @@ impl AppData {
     /// `start_beat - content_offset_beats` ([`Clip::content_origin_beat`])。
     /// 左端 trim した clip でも note の song 上の位置は動かない。
     #[must_use]
-    pub fn clip_start_beat_of(&self, r: ClipRef) -> f64 {
+    pub fn clip_start_beat_of(&self, r: ClipKey) -> f64 {
         self.song_doc.song()
-            .tracks
-            .get(r.track as usize)
-            .and_then(|t| t.clips.get(r.clip as usize))
+            .track_by_id(r.track_id)
+            .and_then(|t| t.clip_by_id(r.clip_id))
             .map(common::model::Clip::content_origin_beat)
             .unwrap_or(0.0)
     }
 
     /// packed note id を持つ `entries` を **所属クリップ (clip_slot) ごと** に
-    /// グルーピングし、各クリップで `per_clip(self, slot, ClipRef, &[(local_index, payload)])` を
+    /// グルーピングし、各クリップで `per_clip(self, slot, ClipKey, &[(local_index, payload)])` を
     /// 呼ぶ。範囲外 slot / ロック中クリップは飛ばす (ロックは widget が hit 除外済だが二重防御)。
     /// payload は handler ごとに異なる (移動=(beat,pitch)、リサイズ=(beat,len)、velocity=u8、
     /// 削除/複製=`()` 等)。複数クリップ note 編集 handler の共通ディスパッチ。slot 昇順で適用
@@ -418,7 +401,7 @@ impl AppData {
     pub(crate) fn for_each_note_clip_group<T>(
         &mut self,
         entries: impl IntoIterator<Item = (u32, T)>,
-        mut per_clip: impl FnMut(&mut Self, usize, ClipRef, &[(usize, T)]),
+        mut per_clip: impl FnMut(&mut Self, usize, ClipKey, &[(usize, T)]),
     ) {
         let shown = self.shown_pianoroll_clips();
         let mut groups: std::collections::BTreeMap<usize, Vec<(usize, T)>> =
@@ -438,11 +421,11 @@ impl AppData {
         }
     }
 
-    /// packed note id を `(ClipRef, clip 内 index)` に分解。`shown` は
+    /// packed note id を `(ClipKey, clip 内 index)` に分解。`shown` は
     /// `shown_pianoroll_clips()` の結果 (呼び出し側で 1 度作って使い回す)。`clip_slot` が
     /// 範囲外なら `None`。
     #[must_use]
-    pub fn decode_note_id_in(shown: &[ClipRef], id: u32) -> Option<(ClipRef, usize)> {
+    pub fn decode_note_id_in(shown: &[ClipKey], id: u32) -> Option<(ClipKey, usize)> {
         let clip_slot = (id >> 24) as usize;
         let note_index = (id & 0x00FF_FFFF) as usize;
         shown.get(clip_slot).copied().map(|r| (r, note_index))
@@ -451,14 +434,14 @@ impl AppData {
     /// 単発デコード (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の id を
     /// 捌くハンドラでは `shown` を 1 度作って `decode_note_id_in` を使う (再計算を避ける)。
     #[must_use]
-    pub fn decode_note_id(&self, id: u32) -> Option<(ClipRef, usize)> {
+    pub fn decode_note_id(&self, id: u32) -> Option<(ClipKey, usize)> {
         Self::decode_note_id_in(&self.shown_pianoroll_clips(), id)
     }
 
     /// クリップ `r` 内の local note index 群を、現在の表示集合 (`shown_pianoroll_clips`)
     /// における **packed note id** に変換する。新規ノート (add / paste / step 入力) の結果選択を
     /// packed 化する共通基盤。`r` が表示集合に無ければ slot 0 (= 単一表示と byte 互換) に倒す。
-    pub(crate) fn pack_clip_selection(&self, r: ClipRef, locals: &[u32]) -> Vec<u32> {
+    pub(crate) fn pack_clip_selection(&self, r: ClipKey, locals: &[u32]) -> Vec<u32> {
         let slot = self
             .shown_pianoroll_clips()
             .iter()
@@ -484,9 +467,8 @@ impl AppData {
         let clip = self
             .song_doc
             .song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))?;
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))?;
         let sc = self.song_doc.song().scale_at(clip.start_beat)?;
         Some(PianoRollScale {
             root: sc.root,
@@ -517,20 +499,20 @@ impl AppData {
     /// `selected_clips` の書き込み点は 10 箇所以上に散っていてチョークポイントが無く、
     /// 「参照を貼り替える補償コード」 (アーキテクチャ不変条件 1 が禁じるパターン) になる。
     #[must_use]
-    pub fn has_pianoroll_lock_row(shown: &[ClipRef], track: u32) -> bool {
+    pub fn has_pianoroll_lock_row(shown: &[ClipKey], track: u32) -> bool {
         // 凡例パネルは複数クリップ表示のときだけ出て、行は表示クリップのトラック 1 つにつき 1 行。
-        shown.len() >= 2 && shown.iter().any(|r| r.track == track)
+        shown.len() >= 2 && shown.iter().any(|r| r.track_id == track)
     }
 
     /// [`Self::has_pianoroll_lock_row`] が真になるトラック index を **初出順** で列挙する
     /// (凡例パネルの行そのもの)。 行の集合が要る描画側が使う。 判定 1 件だけなら
     /// alloc しない述語版 (`has_pianoroll_lock_row`) を使うこと。
     #[must_use]
-    pub fn pianoroll_lock_rows_in(shown: &[ClipRef]) -> Vec<u32> {
+    pub fn pianoroll_lock_rows_in(shown: &[ClipKey]) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         for r in shown {
-            if Self::has_pianoroll_lock_row(shown, r.track) && !out.contains(&r.track) {
-                out.push(r.track);
+            if Self::has_pianoroll_lock_row(shown, r.track_id) && !out.contains(&r.track_id) {
+                out.push(r.track_id);
             }
         }
         out
@@ -550,20 +532,19 @@ impl AppData {
     /// 前者が [`Self::pianoroll_lock_rows_in`] = 解除 UI の描画条件そのものなので、
     /// 解除できないロックが存在しえない。
     #[must_use]
-    pub fn is_pianoroll_clip_locked_in(&self, shown: &[ClipRef], r: ClipRef) -> bool {
-        Self::has_pianoroll_lock_row(shown, r.track)
+    pub fn is_pianoroll_clip_locked_in(&self, shown: &[ClipKey], r: ClipKey) -> bool {
+        Self::has_pianoroll_lock_row(shown, r.track_id)
             && self
                 .song_doc
                 .song()
-                .tracks
-                .get(r.track as usize)
+                .track_by_id(r.track_id)
                 .is_some_and(|t| self.ui_prefs.locked_pr_tracks.contains(&t.id))
     }
 
     /// 単発版 (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の clip を捌く
     /// ハンドラでは `shown` を 1 度作って `is_pianoroll_clip_locked_in` を使う。
     #[must_use]
-    pub fn is_pianoroll_clip_locked(&self, r: ClipRef) -> bool {
+    pub fn is_pianoroll_clip_locked(&self, r: ClipKey) -> bool {
         self.is_pianoroll_clip_locked_in(&self.shown_pianoroll_clips(), r)
     }
 
@@ -576,15 +557,14 @@ impl AppData {
     ///
     /// 拒否したときは理由をステータスバーに出す (何も起きないと故障に見えるため)。
     /// 戻り値 `true` = 拒否した (呼び出し側は即 return)。
-    pub(crate) fn reject_write_if_pianoroll_locked(&mut self, r: ClipRef) -> bool {
+    pub(crate) fn reject_write_if_pianoroll_locked(&mut self, r: ClipKey) -> bool {
         if !self.is_pianoroll_clip_locked(r) {
             return false;
         }
         let name = self
             .song_doc
             .song()
-            .tracks
-            .get(r.track as usize)
+            .track_by_id(r.track_id)
             .map_or_else(String::new, |t| format!("「{}」 ", t.name));
         self.ui_ephemeral.status_message =
             format!("{name}トラックはロック中です (凡例の L で解除)");
@@ -609,8 +589,8 @@ impl AppData {
             return;
         }
         self.selection.selected_clip = Some(key);
-        if let Some(r) = self.clip_ref_of(key) {
-            self.select_track(r.track);
+        if let Some(r) = self.live_clip_key(key) {
+            self.select_track(r.track_id);
         }
     }
 
@@ -630,21 +610,21 @@ impl AppData {
     /// inspector 編集対象クリップを **alloc せず** 順に渡す。 `selected_clips`
     /// 全体 (空なら `selected_clip` 単体) を走査する。 mixed 検出 (`inspector_fold`) は
     /// 毎フレーム全 field で呼ばれるので、 Vec を作らないこの基盤を使う。
-    pub(crate) fn for_each_inspector_target(&self, mut f: impl FnMut(ClipRef)) {
+    pub(crate) fn for_each_inspector_target(&self, mut f: impl FnMut(ClipKey)) {
         if self.selection.selected_clips.is_empty() {
             if let Some(r) = self.selected_clip_ref() {
                 f(r);
             }
         } else {
             for k in &self.selection.selected_clips {
-                if let Some(r) = self.clip_ref_of(*k) {
+                if let Some(r) = self.live_clip_key(*k) {
                     f(r);
                 }
             }
         }
     }
 
-    pub fn inspector_target_refs(&self) -> Vec<ClipRef> {
+    pub fn inspector_target_refs(&self) -> Vec<ClipKey> {
         let mut refs = Vec::new();
         self.for_each_inspector_target(|r| refs.push(r));
         refs
@@ -655,7 +635,7 @@ impl AppData {
     /// クリップ (= その field を持たない種別) は無視する。 表示中の section のアンカーは
     /// 必ずその種別なので、 表示中 field では `None` == mixed と解釈できる。 毎フレーム
     /// 全 field で呼ばれるので alloc しない (`for_each_inspector_target` を使う)。
-    pub fn inspector_fold(&self, extract: impl Fn(&AppData, ClipRef) -> Option<f64>) -> Option<f64> {
+    pub fn inspector_fold(&self, extract: impl Fn(&AppData, ClipKey) -> Option<f64>) -> Option<f64> {
         let mut acc: Option<f64> = None;
         let mut mixed = false;
         self.for_each_inspector_target(|t| {
@@ -677,15 +657,13 @@ impl AppData {
     /// mixed 畳み込み (`inspector_fold`) 用 accessor。
     pub fn image_first_event<R>(
         &self,
-        target: ClipRef,
+        target: ClipKey,
         f: impl FnOnce(&common::model::ImageEvent) -> R,
     ) -> Option<R> {
         let content_id = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)?
-            .clips
-            .get(target.clip as usize)?
+            .track_by_id(target.track_id)?
+            .clip_by_id(target.clip_id)?
             .content_id;
         match self.song_doc.song().clip_contents.get(&content_id)? {
             common::model::ClipContent::Image(img) => img.events.first().map(f),
@@ -696,15 +674,13 @@ impl AppData {
     /// `target` clip の first `TextEvent` に `f` を適用 (text clip でなければ `None`)。
     pub fn text_first_event<R>(
         &self,
-        target: ClipRef,
+        target: ClipKey,
         f: impl FnOnce(&common::model::TextEvent) -> R,
     ) -> Option<R> {
         let content_id = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)?
-            .clips
-            .get(target.clip as usize)?
+            .track_by_id(target.track_id)?
+            .clip_by_id(target.clip_id)?
             .content_id;
         match self.song_doc.song().clip_contents.get(&content_id)? {
             common::model::ClipContent::Text(text) => text.events.first().map(f),
@@ -715,15 +691,13 @@ impl AppData {
     /// `target` clip の first `AudioEvent` に `f` を適用 (audio clip でなければ `None`)。
     pub fn audio_first_event<R>(
         &self,
-        target: ClipRef,
+        target: ClipKey,
         f: impl FnOnce(&common::model::AudioEvent) -> R,
     ) -> Option<R> {
         let content_id = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)?
-            .clips
-            .get(target.clip as usize)?
+            .track_by_id(target.track_id)?
+            .clip_by_id(target.clip_id)?
             .content_id;
         match self.song_doc.song().clip_contents.get(&content_id)? {
             common::model::ClipContent::Audio(audio) => audio.events.first().map(f),
@@ -743,8 +717,8 @@ impl AppData {
             .and_then(|t| t.clip_by_id(key.clip_id))
     }
 
-    pub(crate) fn select_clip(&mut self, target: ClipRef, additive: bool) {
-        let Some(key) = self.clip_key_of(target) else {
+    pub(crate) fn select_clip(&mut self, target: ClipKey, additive: bool) {
+        let Some(key) = self.live_clip_key(target) else {
             return;
         };
         let mut keys = self.selection.selected_clips.clone();
@@ -766,7 +740,7 @@ impl AppData {
         }
         self.recording.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
-            self.select_track(r.track);
+            self.select_track(r.track_id);
         }
         // per-clip view を記憶するので、初めて開くクリップ (= entry 無し)
         // のときだけ auto-fit する。 既に記憶があれば draw が `piano_roll_views` を
@@ -779,9 +753,9 @@ impl AppData {
         }
     }
 
-    pub(crate) fn set_clip_selection(&mut self, targets: Vec<ClipRef>) {
+    pub(crate) fn set_clip_selection(&mut self, targets: Vec<ClipKey>) {
         let keys: Vec<common::model::ClipKey> =
-            targets.iter().filter_map(|r| self.clip_key_of(*r)).collect();
+            targets.iter().filter_map(|r| self.live_clip_key(*r)).collect();
         let primary = keys.last().copied();
         self.selection.selected_clips = keys;
         self.selection.selected_clip = primary;
@@ -791,7 +765,7 @@ impl AppData {
         }
         self.recording.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
-            self.select_track(r.track);
+            self.select_track(r.track_id);
         }
         // 初回 (entry 無し) のみ fit。 記憶があれば復元 (select_clip と同方針)。
         if let Some(p) = primary
@@ -839,11 +813,11 @@ impl AppData {
         self.selection.selected_notes.clear();
     }
 
-    /// 単一 clip (新規作成直後の `ClipRef`) を選択集合にする。 ClipRef→ClipKey
+    /// 単一 clip (新規作成直後の `ClipKey`) を選択集合にする。 ClipRef→ClipKey
     /// 変換して anchor + set を更新 (view ジャンプ無し)。 create / duplicate の
     /// 結果選択用。
-    pub(crate) fn set_single_clip_selection(&mut self, r: ClipRef) {
-        let key = self.clip_key_of(r);
+    pub(crate) fn set_single_clip_selection(&mut self, r: ClipKey) {
+        let key = self.live_clip_key(r);
         self.selection.selected_clip = key;
         self.selection.selected_clips = key.into_iter().collect();
         if key.is_some() {
@@ -851,11 +825,11 @@ impl AppData {
         }
     }
 
-    /// 新規 clip 群 (`ClipRef`) を選択集合にする (anchor = 末尾、 view ジャンプ
+    /// 新規 clip 群 (`ClipKey`) を選択集合にする (anchor = 末尾、 view ジャンプ
     /// 無し)。 ClipRef→ClipKey 変換。 clone / split / glue の結果選択用。
-    pub(crate) fn select_new_clips(&mut self, refs: &[ClipRef]) {
+    pub(crate) fn select_new_clips(&mut self, refs: &[ClipKey]) {
         let keys: Vec<common::model::ClipKey> =
-            refs.iter().filter_map(|r| self.clip_key_of(*r)).collect();
+            refs.iter().filter_map(|r| self.live_clip_key(*r)).collect();
         self.selection.selected_clip = keys.last().copied();
         if self.selection.selected_clip.is_some() {
             self.selection.last_edit_select = Some(EditSurface::Clips);
@@ -873,10 +847,10 @@ impl AppData {
             if self.is_pianoroll_clip_locked_in(&shown, r) {
                 continue;
             }
-            let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
+            let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
                 continue;
             };
-            let Some(clip) = track.clips.get(r.clip as usize) else {
+            let Some(clip) = track.clip_by_id(r.clip_id) else {
                 continue;
             };
             let n = self.song_doc.song().clip_notes(clip).len();
@@ -891,10 +865,10 @@ impl AppData {
         let Some(target) = self.ui_ephemeral.audio_editor_clip else {
             return Vec::new();
         };
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
             return Vec::new();
         };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
+        let Some(clip) = track.clip_by_id(target.clip_id) else {
             return Vec::new();
         };
         match self.song_doc.song().clip_contents.get(&clip.content_id) {
@@ -959,12 +933,11 @@ impl AppData {
     /// `content_id` は payload 種別ごとに別空間なので automation clip 等と
     /// 混ざらない。 refcount==1 のときは自身 1 個の選択 (= 無害)。 clicked
     /// `target` を末尾 (= primary) に置いて piano_roll fit 対象を維持する。
-    pub(crate) fn select_linked_clips(&mut self, target: ClipRef) {
+    pub(crate) fn select_linked_clips(&mut self, target: ClipKey) {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
@@ -973,9 +946,9 @@ impl AppData {
         for (t_idx, track) in self.song_doc.song().tracks.iter().enumerate() {
             for (c_idx, clip) in track.clips.iter().enumerate() {
                 if clip.content_id == content_id {
-                    linked.push(ClipRef {
-                        track: t_idx as u32,
-                        clip: c_idx as u32,
+                    linked.push(ClipKey {
+                        track_id: t_idx as u32,
+                        clip_id: c_idx as u32,
                     });
                 }
             }
@@ -1028,10 +1001,10 @@ impl AppData {
         let mut union_start = f64::INFINITY;
         let mut union_end = f64::NEG_INFINITY;
         for &r in &shown {
-            let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
+            let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
                 continue;
             };
-            let Some(clip) = track.clips.get(r.clip as usize) else {
+            let Some(clip) = track.clip_by_id(r.clip_id) else {
                 continue;
             };
             // r.md #44: note は content-local なので song 化は content 原点基準。

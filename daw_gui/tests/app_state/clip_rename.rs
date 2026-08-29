@@ -10,14 +10,14 @@
 //! `tests/scripts/clip_rename_smoke.js` が inspectSongJson で別途担保する。
 
 use daw_gui::app::AppEvent;
-use daw_gui::app_types::ClipRef;
+use daw_gui::app_types::ClipKey;
 
 use super::support;
 
 /// track0 に content_name 付き clip を 1 つ用意し、 保存済みベースライン
 /// (clean) にして返す。 clip は非 Text (clip_contents エントリ無し = content_name
-/// 経路)。 戻り値は index ベースの `ClipRef` (track 0 / clip 0)。
-fn app_with_named_clip(name: &str) -> (daw_gui::app::AppData, ClipRef) {
+/// 経路)。 戻り値は index ベースの `ClipKey` (track 0 / clip 0)。
+fn app_with_named_clip(name: &str) -> (daw_gui::app::AppData, ClipKey) {
     let (mut app, _a, _p, _d) = support::build_app();
     app.edit_song(|song| {
         let cid = song.alloc_content_id();
@@ -33,10 +33,11 @@ fn app_with_named_clip(name: &str) -> (daw_gui::app::AppData, ClipRef) {
     // 保存済みベースライン = clean。 以後の rename が dirty 化するかを観測する。
     app.song_doc.mark_saved();
     assert!(!app.song_doc.is_dirty(), "fixture starts clean");
-    (app, ClipRef { track: 0, clip: 0 })
+    let track_id = app.song_doc.song().tracks[0].id;
+    (app, ClipKey { track_id, clip_id: 1 })
 }
 
-fn rename(app: &mut daw_gui::app::AppData, target: ClipRef, new_name: &str) {
+fn rename(app: &mut daw_gui::app::AppData, target: ClipKey, new_name: &str) {
     app.handle_event(AppEvent::BeginRenameClip(target));
     app.handle_event(AppEvent::RenameClipChanged(new_name.to_string()));
     app.handle_event(AppEvent::CommitRenameClip);

@@ -340,6 +340,29 @@ impl Track {
         self.session_clips.iter().find(|s| s.clip.id == clip_id)
     }
 
+    /// 列 `cell.scene_id` にセルを置く。 既にセルが居れば**置き換える**
+    /// (ドロップ / 移動の「落とした先が埋まっていたら置き換え」規約)。
+    ///
+    /// 退けたセルがその行で**鳴っていたセル**なら、主導権を新しいセルへ移す。
+    /// これをやらないと [`Song::normalize_session`] が「鳴っていたセルが消えた」と
+    /// 見て行を停止に落とし、**再生中のセルへ落とした瞬間に音が止まる**。
+    /// 置き換えは必ずこの 1 本を通すこと (retain + push を手写しすると必ず漏れる)。
+    pub fn put_session_clip(&mut self, cell: SessionClip) {
+        let new_id = cell.clip.id;
+        let replaced: Option<u32> = self
+            .session_clips
+            .iter()
+            .find(|c| c.scene_id == cell.scene_id)
+            .map(|c| c.clip.id);
+        self.session_clips.retain(|c| c.scene_id != cell.scene_id);
+        self.session_clips.push(cell);
+        if let Some(old) = replaced
+            && self.launcher == (RowPlayback::Launcher { clip_id: old })
+        {
+            self.launcher = RowPlayback::Launcher { clip_id: new_id };
+        }
+    }
+
     /// このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
     /// 「builtin VOICEVOX device を実際に持つか」。 旧 `InstrumentSource::Vocal`
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
@@ -429,12 +452,28 @@ impl Track {
         self.clips.iter().position(|c| c.id == clip_id)
     }
 
+    /// トラック内で id からクリップを引く。**アレンジのクリップ (`clips`) と
+    /// ランチャーのセル (`session_clips`) の両方**を見る (v35 以降、両者は 1 つの
+    /// id 空間を共有するので「この id のクリップ」は一意)。 GUI の住所
+    /// (`ClipKey`) の解決はここが唯一の口で、これによりピアノロール /
+    /// オーディオエディタ / 名前 / 色 がセルにもそのまま効く。
     pub fn clip_by_id(&self, clip_id: u32) -> Option<&Clip> {
-        self.clips.iter().find(|c| c.id == clip_id)
+        self.all_clips().find(|c| c.id == clip_id)
     }
 
     pub fn clip_by_id_mut(&mut self, clip_id: u32) -> Option<&mut Clip> {
-        self.clips.iter_mut().find(|c| c.id == clip_id)
+        self.all_clips_mut().find(|c| c.id == clip_id)
+    }
+
+    /// id でクリップを取り除く。返り値は `(取り除いたクリップ, セルだったか)` で、
+    /// アレンジのクリップ (`clips`) とランチャーのセル (`session_clips`) の
+    /// **どちらに居ても**消せる (住所は 1 つの id 空間なので呼ぶ側は区別しない)。
+    pub fn remove_clip_by_id(&mut self, clip_id: u32) -> Option<(Clip, bool)> {
+        if let Some(i) = self.clips.iter().position(|c| c.id == clip_id) {
+            return Some((self.clips.remove(i), false));
+        }
+        let i = self.session_clips.iter().position(|c| c.clip.id == clip_id)?;
+        Some((self.session_clips.remove(i).clip, true))
     }
 
     /// Allocate a new stable lane id, bumping the per-track counter.

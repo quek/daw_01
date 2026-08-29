@@ -30,7 +30,7 @@ impl AppData {
     /// **time-stretch** (= 内容を新 clip 長に伸縮)。 `stretch_clip_content` 参照。
     pub(crate) fn resize_clip(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         new_start_beat: f64,
         new_length_beats: f64,
         stretch: bool,
@@ -41,8 +41,8 @@ impl AppData {
         let new_start_beat = new_start_beat.max(0.0);
         let Some(Some((content_id, prev_start_beat, prev_length_beats, new_offset))) =
             self.edit_song(|song| {
-                let track = song.tracks.get_mut(target.track as usize)?;
-                let clip = track.clips.get_mut(target.clip as usize)?;
+                let track = song.track_by_id_mut(target.track_id)?;
+                let clip = track.clip_by_id_mut(target.clip_id)?;
                 let prev_start_beat = clip.start_beat;
                 let prev_length_beats = clip.length_beats;
                 // 左端の移動量ぶんだけ窓を content 上で進める (右端 drag は δ=0)。
@@ -97,7 +97,7 @@ impl AppData {
     /// 固定端 (右端 drag = 左端固定 / 左端 drag = 右端固定)。
     pub(crate) fn stretch_clip_content(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         content_id: common::model::ContentId,
         prev_start: f64,
         prev_len: f64,
@@ -113,9 +113,8 @@ impl AppData {
         let new_off = self
             .song_doc
             .song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map_or(0.0, |c| c.content_offset_beats);
         let prev_off = new_off - (new_start - prev_start);
         // 共有 content は fork してから伸縮 (siblings の length と無関係)。
@@ -123,9 +122,8 @@ impl AppData {
             self.edit_song(|song| {
                 let new_id = song.fork_content(content_id);
                 if let Some(clip) = song
-                    .tracks
-                    .get_mut(target.track as usize)
-                    .and_then(|t| t.clips.get_mut(target.clip as usize))
+                    .track_by_id_mut(target.track_id)
+                    .and_then(|t| t.clip_by_id_mut(target.clip_id))
                 {
                     clip.content_id = new_id;
                 }
@@ -188,15 +186,14 @@ impl AppData {
     /// 直後に並べるためのオフセット (相対位置を保ったままブロック複製)。 単一
     /// clip では clip 長と一致する (= 旧 single duplicate と同挙動)。 解決でき
     /// ない stale ref は無視、 有効 clip が 1 つも無ければ `None`。
-    pub(crate) fn clip_block_span(&self, sources: &[ClipRef]) -> Option<f64> {
+    pub(crate) fn clip_block_span(&self, sources: &[ClipKey]) -> Option<f64> {
         let mut min_start = f64::MAX;
         let mut max_end = f64::MIN;
         for &src in sources {
             let Some(clip) = self
                 .song_doc.song()
-                .tracks
-                .get(src.track as usize)
-                .and_then(|t| t.clips.get(src.clip as usize))
+                .track_by_id(src.track_id)
+                .and_then(|t| t.clip_by_id(src.clip_id))
             else {
                 continue;
             };
@@ -206,20 +203,18 @@ impl AppData {
         (max_end >= min_start).then_some(max_end - min_start)
     }
 
-    /// `source` の共有コピーを `new_start_beat` に 1 つ生成し、 新 `ClipRef` を
+    /// `source` の共有コピーを `new_start_beat` に 1 つ生成し、 新 `ClipKey` を
     /// 返す (選択・sync は呼び出し側)。 同 `content_id` を流用 → 名前 (content_id
     /// 単位 SSoT) も共有、 色 (per-clip) は source 引き継ぎ。
     pub(crate) fn duplicate_one_clip_shared_at(
         &mut self,
-        source: ClipRef,
+        source: ClipKey,
         new_start_beat: f64,
-    ) -> Option<ClipRef> {
+    ) -> Option<ClipKey> {
         let src_clip = self
             .song_doc.song()
-            .tracks
-            .get(source.track as usize)?
-            .clips
-            .get(source.clip as usize)?;
+            .track_by_id(source.track_id)?
+            .clip_by_id(source.clip_id)?;
         let new_length = src_clip.length_beats;
         let content_id = src_clip.content_id;
         // trim 済み clip の複製は **同じ窓** を見せる (r.md #44)。
@@ -232,10 +227,9 @@ impl AppData {
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
         let src_talk = src_clip.talk;
-        let new_idx = self.edit_song(move |song| {
-            let track = song.tracks.get_mut(source.track as usize)?;
+        let new_clip_id = self.edit_song(move |song| {
+            let track = song.track_by_id_mut(source.track_id)?;
             let new_clip_id = track.alloc_clip_id();
-            let new_idx = track.clips.len() as u32;
             track.clips.push(Clip {
                 id: new_clip_id,
                 start_beat: new_start_beat,
@@ -251,24 +245,22 @@ impl AppData {
                 style_name: src_style,
                 talk: src_talk,
             });
-            Some(new_idx)
+            Some(new_clip_id)
         })??;
-        Some(ClipRef { track: source.track, clip: new_idx })
+        Some(ClipKey { track_id: source.track_id, clip_id: new_clip_id })
     }
 
     /// `source` の独立コピー (content を deep clone + 新 ContentId 採番) を
-    /// `new_start_beat` に 1 つ生成し、 新 `ClipRef` を返す。 §3.3。
+    /// `new_start_beat` に 1 つ生成し、 新 `ClipKey` を返す。 §3.3。
     pub(crate) fn duplicate_one_clip_unique_at(
         &mut self,
-        source: ClipRef,
+        source: ClipKey,
         new_start_beat: f64,
-    ) -> Option<ClipRef> {
+    ) -> Option<ClipKey> {
         let src_clip = self
             .song_doc.song()
-            .tracks
-            .get(source.track as usize)?
-            .clips
-            .get(source.clip as usize)?;
+            .track_by_id(source.track_id)?
+            .clip_by_id(source.clip_id)?;
         let new_length = src_clip.length_beats;
         let src_content_id = src_clip.content_id;
         // content は fork するが窓 (offset) は同じものを見せる。
@@ -281,11 +273,10 @@ impl AppData {
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
         let src_talk = src_clip.talk;
-        let new_idx = self.edit_song(move |song| {
+        let new_clip_id = self.edit_song(move |song| {
             let new_content_id = song.fork_content(src_content_id);
-            let track = song.tracks.get_mut(source.track as usize)?;
+            let track = song.track_by_id_mut(source.track_id)?;
             let new_clip_id = track.alloc_clip_id();
-            let new_idx = track.clips.len() as u32;
             track.clips.push(Clip {
                 id: new_clip_id,
                 start_beat: new_start_beat,
@@ -301,15 +292,15 @@ impl AppData {
                 style_name: src_style,
                 talk: src_talk,
             });
-            Some(new_idx)
+            Some(new_clip_id)
         })??;
-        Some(ClipRef { track: source.track, clip: new_idx })
+        Some(ClipKey { track_id: source.track_id, clip_id: new_clip_id })
     }
 
     /// 選択 clip 群をまとめて共有複製 (D shortcut)。 選択ブロック span
     /// だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じセマンティ
     /// クス)、 複製群を選択にする。 D 連打で後方連鎖する。
-    pub(crate) fn duplicate_clips_shared(&mut self, sources: &[ClipRef]) {
+    pub(crate) fn duplicate_clips_shared(&mut self, sources: &[ClipKey]) {
         let Some(offset) = self.clip_block_span(sources) else {
             return;
         };
@@ -317,9 +308,8 @@ impl AppData {
         for &src in sources {
             let Some(new_start) = self
                 .song_doc.song()
-                .tracks
-                .get(src.track as usize)
-                .and_then(|t| t.clips.get(src.clip as usize))
+                .track_by_id(src.track_id)
+                .and_then(|t| t.clip_by_id(src.clip_id))
                 .map(|c| c.start_beat + offset)
             else {
                 continue;
@@ -336,7 +326,7 @@ impl AppData {
 
     /// 選択 clip 群をまとめて独立複製 (Alt+D shortcut)。 配置・選択は
     /// `duplicate_clips_shared` と同じ、 各 clip の content を独立化する点が違う。
-    pub(crate) fn duplicate_clips_unique(&mut self, sources: &[ClipRef]) {
+    pub(crate) fn duplicate_clips_unique(&mut self, sources: &[ClipKey]) {
         let Some(offset) = self.clip_block_span(sources) else {
             return;
         };
@@ -344,9 +334,8 @@ impl AppData {
         for &src in sources {
             let Some(new_start) = self
                 .song_doc.song()
-                .tracks
-                .get(src.track as usize)
-                .and_then(|t| t.clips.get(src.clip as usize))
+                .track_by_id(src.track_id)
+                .and_then(|t| t.clip_by_id(src.clip_id))
                 .map(|c| c.start_beat + offset)
             else {
                 continue;
@@ -365,14 +354,14 @@ impl AppData {
     /// 共有コピーを生成。 元 clip 群はそのまま、 selected_clips は新 clip
     /// 群に置き換える (drag 後に選択が新 clip に移るのは MoveClips と同じ semantics)。
     /// §3.4。
-    pub(crate) fn clone_clips_linked(&mut self, entries: &[(ClipRef, u32, f64)]) {
+    pub(crate) fn clone_clips_linked(&mut self, entries: &[(ClipKey, u32, f64)]) {
         let Some(new_refs) = self.edit_song(|song| {
             let mut new_refs = Vec::with_capacity(entries.len());
             for &(source, to_track_id, drop_start) in entries {
-                let Some(track) = song.tracks.get(source.track as usize) else {
+                let Some(track) = song.track_by_id(source.track_id) else {
                     continue;
                 };
-                let Some(src_clip) = track.clips.get(source.clip as usize) else {
+                let Some(src_clip) = track.clip_by_id(source.clip_id) else {
                     continue;
                 };
                 let new_length = src_clip.length_beats;
@@ -398,7 +387,6 @@ impl AppData {
                     continue;
                 };
                 let new_clip_id = to_track.alloc_clip_id();
-                let new_idx = to_track.clips.len() as u32;
                 to_track.clips.push(Clip {
                     id: new_clip_id,
                     start_beat: drop_start.max(0.0),
@@ -414,10 +402,7 @@ impl AppData {
                     style_name: src_voice.2,
                     talk: src_voice.3,
                 });
-                new_refs.push(ClipRef {
-                    track: to_track_idx as u32,
-                    clip: new_idx,
-                });
+                new_refs.push(ClipKey { track_id: to_track_id, clip_id: new_clip_id });
             }
             new_refs
         }) else {
@@ -431,14 +416,14 @@ impl AppData {
 
     /// arrangement Ctrl+Shift+drag → release: 各 (source, drop_start_beat)
     /// で独立コピーを生成。 §3.5。
-    pub(crate) fn clone_clips_independent(&mut self, entries: &[(ClipRef, u32, f64)]) {
+    pub(crate) fn clone_clips_independent(&mut self, entries: &[(ClipKey, u32, f64)]) {
         let Some(new_refs) = self.edit_song(|song| {
             let mut new_refs = Vec::with_capacity(entries.len());
             for &(source, to_track_id, drop_start) in entries {
-                let Some(track) = song.tracks.get(source.track as usize) else {
+                let Some(track) = song.track_by_id(source.track_id) else {
                     continue;
                 };
-                let Some(src_clip) = track.clips.get(source.clip as usize) else {
+                let Some(src_clip) = track.clip_by_id(source.clip_id) else {
                     continue;
                 };
                 let new_length = src_clip.length_beats;
@@ -464,7 +449,6 @@ impl AppData {
                     continue;
                 };
                 let new_clip_id = to_track.alloc_clip_id();
-                let new_idx = to_track.clips.len() as u32;
                 to_track.clips.push(Clip {
                     id: new_clip_id,
                     start_beat: drop_start.max(0.0),
@@ -480,10 +464,7 @@ impl AppData {
                     style_name: src_voice.2,
                     talk: src_voice.3,
                 });
-                new_refs.push(ClipRef {
-                    track: to_track_idx as u32,
-                    clip: new_idx,
-                });
+                new_refs.push(ClipKey { track_id: to_track_id, clip_id: new_clip_id });
             }
             new_refs
         }) else {
@@ -503,10 +484,10 @@ impl AppData {
     /// 選択内で互いに linked だった clip も全て独立になる。 1 回の `edit_song` に
     /// まとめて 1 undo step。 既に全て独立なら `edit_song_checked` の no-op 検出で
     /// dirty 化しない。
-    pub(crate) fn make_clip_unique(&mut self, target: ClipRef) {
+    pub(crate) fn make_clip_unique(&mut self, target: ClipKey) {
         // 対象集合: 複数選択があれば選択全体を、 無ければ右クリックした clip 単体を
         // 独立化する (Auto-Fade / Auto-Crossfade と同じ「選択集合に効く」idiom)。
-        let targets: Vec<ClipRef> = if self.selection.selected_clips.is_empty() {
+        let targets: Vec<ClipKey> = if self.selection.selected_clips.is_empty() {
             vec![target]
         } else {
             self.selected_clip_refs()
@@ -519,9 +500,8 @@ impl AppData {
             .filter(|t| {
                 self.song_doc
                     .song()
-                    .tracks
-                    .get(t.track as usize)
-                    .and_then(|tr| tr.clips.get(t.clip as usize))
+                    .track_by_id(t.track_id)
+                    .and_then(|tr| tr.clip_by_id(t.clip_id))
                     .is_some_and(|c| self.song_doc.song().clip_content_refcount(c.content_id) >= 2)
             })
             .count();
@@ -529,9 +509,8 @@ impl AppData {
             let mut changed = false;
             for t in &targets {
                 let Some(content_id) = song
-                    .tracks
-                    .get(t.track as usize)
-                    .and_then(|tr| tr.clips.get(t.clip as usize))
+                    .track_by_id(t.track_id)
+                    .and_then(|tr| tr.clip_by_id(t.clip_id))
                     .map(|c| c.content_id)
                 else {
                     continue;
@@ -543,9 +522,8 @@ impl AppData {
                 }
                 let new_content_id = song.fork_content(content_id);
                 if let Some(clip) = song
-                    .tracks
-                    .get_mut(t.track as usize)
-                    .and_then(|tr| tr.clips.get_mut(t.clip as usize))
+                    .track_by_id_mut(t.track_id)
+                    .and_then(|tr| tr.clip_by_id_mut(t.clip_id))
                 {
                     clip.content_id = new_content_id;
                     changed = true;
@@ -569,29 +547,9 @@ impl AppData {
             let content_id = song.alloc_content_id();
             song.clip_contents.insert(content_id, ClipContent::default());
             let track = song.tracks.get_mut(track_idx as usize)?;
+            let track_id = track.id;
             let new_clip_id = track.alloc_clip_id();
-            let new_idx = track.clips.len() as u32;
-            // vocal track の新規 clip は声を引き継ぐ: 同トラックの
-            // 直前 (= start_beat 最大の既存) clip の声、 無ければアプリ既定
-            // (中国うさぎ ノーマル)。 非 vocal track では声は未設定 (0)。
-            let (speaker_id, singer_name, style_name) =
-                if track.is_voicevox_vocal() {
-                    track
-                        .clips
-                        .iter()
-                        .filter(|c| c.speaker_id != 0)
-                        .max_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
-                        .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
-                        .unwrap_or_else(|| {
-                            (
-                                common::voicevox::DEFAULT_SINGER_ID,
-                                common::voicevox::DEFAULT_SINGER_NAME.to_string(),
-                                common::voicevox::DEFAULT_STYLE_NAME.to_string(),
-                            )
-                        })
-                } else {
-                    (0, String::new(), String::new())
-                };
+            let (speaker_id, singer_name, style_name) = inherited_voice(track);
             track.clips.push(Clip {
                 id: new_clip_id,
                 start_beat,
@@ -612,10 +570,7 @@ impl AppData {
             // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
             // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
             // から導出する。 ユーザーが Rename したときだけ明示名が入る。
-            Some(ClipRef {
-                track: track_idx,
-                clip: new_idx,
-            })
+            Some(ClipKey { track_id, clip_id: new_clip_id })
         }) else {
             return;
         };
@@ -628,30 +583,17 @@ impl AppData {
         if self.selection.selected_clips.is_empty() {
             return;
         }
-        // ClipKey → 現在の index ClipRef に解決し、 同 track 内は高 clip index
-        // から remove して shift を回避する。
-        let mut targets: Vec<ClipRef> = self.selected_clip_refs();
-        // r.md #87: 同じ選択集合に **ランチャーのセル**も混ざる (セルは
-        // `ClipKey` で指せて `clips` と id 空間を共有するが、`clip_ref_of` は
-        // `clips` しか見ないので `targets` には出てこない)。 ここを落とすと
-        // 「セルを選んで Delete しても何も起きない」 になる。
-        let cells: Vec<common::model::ClipKey> = self.selection.selected_clips.clone();
+        // 住所は安定 id 1 本なので、アレンジのクリップも**ランチャーのセル**も
+        // 同じループで消える (`Track::remove_clip_by_id` がどちらの Vec に居るかを
+        // 解決する)。index 時代に必要だった「高 index から消して詰まりを避ける」
+        // 儀式も、セル専用の第 2 ループも要らない。
+        let targets: Vec<ClipKey> = self.selected_clip_refs();
         self.selection.selected_clips.clear();
-        targets.sort_by(|a, b| a.track.cmp(&b.track).then(b.clip.cmp(&a.clip)));
         self.edit_song(|song| {
-            for target in &targets {
-                if let Some(track) = song.tracks.get_mut(target.track as usize)
-                    && (target.clip as usize) < track.clips.len()
-                {
-                    track.clips.remove(target.clip as usize);
-                }
-            }
             let mut removed_cell = false;
-            for key in &cells {
-                if let Some(track) = song.track_by_id_mut(key.track_id) {
-                    let before = track.session_clips.len();
-                    track.session_clips.retain(|c| c.clip.id != key.clip_id);
-                    removed_cell |= track.session_clips.len() != before;
+            for target in &targets {
+                if let Some(track) = song.track_by_id_mut(target.track_id) {
+                    removed_cell |= track.remove_clip_by_id(target.clip_id).is_some_and(|r| r.1);
                 }
             }
             if removed_cell {
@@ -713,7 +655,7 @@ impl AppData {
             return;
         }
         // Build targets list. Prefer hover clip, fall back to selection.
-        let targets: Vec<ClipRef> = if let Some(hover) = self.ui_ephemeral.arrangement_hover_clip {
+        let targets: Vec<ClipKey> = if let Some(hover) = self.ui_ephemeral.arrangement_hover_clip {
             vec![hover]
         } else if !self.selection.selected_clips.is_empty() {
             self.selected_clip_refs()
@@ -723,7 +665,7 @@ impl AppData {
             return;
         };
         let mut split_count = 0usize;
-        let mut new_selection: Vec<ClipRef> = Vec::new();
+        let mut new_selection: Vec<ClipKey> = Vec::new();
         for src in &targets {
             if self.split_clip_at_beat(*src, cursor, &mut new_selection) {
                 split_count += 1;
@@ -763,10 +705,8 @@ impl AppData {
                 let ph = self.transport.playhead_beat? as f64;
                 let clip = self
                     .song_doc.song()
-                    .tracks
-                    .get(target.track as usize)?
-                    .clips
-                    .get(target.clip as usize)?;
+                    .track_by_id(target.track_id)?
+                    .clip_by_id(target.clip_id)?;
                 // r.md #44: Audio Editor の軸は content-local。
                 let in_clip = clip.song_to_content_beat(ph);
                 let (w0, w1) = clip.content_window();
@@ -782,9 +722,8 @@ impl AppData {
         // event_idx を解決 (= cursor が strict interior に乗っている event)。
         let track = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize);
-        let clip = track.and_then(|t| t.clips.get(target.clip as usize));
+            .track_by_id(target.track_id);
+        let clip = track.and_then(|t| t.clip_by_id(target.clip_id));
         let Some(clip) = clip else { return false };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio_ro)) =
@@ -878,14 +817,14 @@ impl AppData {
     /// caller can update the selection afterwards.
     pub(crate) fn split_clip_at_beat(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         playhead: f64,
-        new_selection: &mut Vec<ClipRef>,
+        new_selection: &mut Vec<ClipKey>,
     ) -> bool {
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
+        let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         let clip_start = clip.start_beat;
@@ -1154,12 +1093,16 @@ impl AppData {
         // Mutate the clip in place: front half stays as `clip`
         // (length / content_id rewritten), and a new clip for the
         // back half is appended on the same track.
-        let track = &mut song.tracks[target.track as usize];
+        let Some(track) = song.track_by_id_mut(target.track_id) else {
+            return false;
+        };
         // 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
         // その声を引き継ぐ。
         // 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
         let (src_speaker, src_singer, src_style, src_talk, src_muted) = {
-            let clip_mut = &mut track.clips[target.clip as usize];
+            let Some(clip_mut) = track.clip_by_id_mut(target.clip_id) else {
+                return false;
+            };
             clip_mut.length_beats = front_len;
             clip_mut.content_id = front_content_id;
             (
@@ -1171,7 +1114,6 @@ impl AppData {
             )
         };
         let new_clip_id = track.alloc_clip_id();
-        let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
             id: new_clip_id,
             start_beat: clip_start + front_len,
@@ -1189,12 +1131,36 @@ impl AppData {
             talk: src_talk,
         });
         new_selection.push(target);
-        new_selection.push(ClipRef {
-            track: target.track,
-            clip: new_idx,
+        new_selection.push(ClipKey {
+            track_id: target.track_id,
+            clip_id: new_clip_id,
         });
         true
         })
     }
 
+}
+
+/// 新規クリップ / セルが引き継ぐ声 (VOICEVOX)。
+///
+/// vocal トラックなら同トラックの直前 (= `start_beat` 最大の既存クリップ、
+/// **セルも含む**) の声、無ければアプリ既定。非 vocal トラックは未設定 (0)。
+/// アレンジの新規クリップとランチャーの空セルで**同じ 1 本**を通す — 別々に
+/// 書くと「同じトラックの同じ操作なのに、帯で作ったセルだけ歌わない」になる。
+pub(crate) fn inherited_voice(track: &common::model::Track) -> (u32, String, String) {
+    if !track.is_voicevox_vocal() {
+        return (0, String::new(), String::new());
+    }
+    track
+        .all_clips()
+        .filter(|c| c.speaker_id != 0)
+        .max_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
+        .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
+        .unwrap_or_else(|| {
+            (
+                common::voicevox::DEFAULT_SINGER_ID,
+                common::voicevox::DEFAULT_SINGER_NAME.to_string(),
+                common::voicevox::DEFAULT_STYLE_NAME.to_string(),
+            )
+        })
 }

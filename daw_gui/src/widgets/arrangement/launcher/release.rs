@@ -181,7 +181,7 @@ fn drop_to_cells(
     response: &mut ArrangementResponse,
 ) {
     let (mx, my) = cd.last_mouse;
-    let Some((target, _)) = layout::cell_at(f, mx, my) else {
+    let Some(target) = layout::drop_cell_at(f, mx, my) else {
         return;
     };
     let Some(base_idx) = row_index(f, target.row) else {
@@ -200,16 +200,10 @@ fn drop_to_cells(
             let col = (i64::from(cell.scene_index) + col_delta).max(0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let to_scene_index = col as u32;
-            let to_scene_id = f
-                .launcher_view
-                .scenes
-                .get(to_scene_index as usize)
-                .map_or(0, |s| s.id);
             Some(LauncherCellMove {
                 from: *cell,
                 to_row,
                 to_scene_index,
-                to_scene_id,
             })
         })
         .filter(|m| m.to_row != m.from.row || m.to_scene_index != m.from.scene_index)
@@ -237,10 +231,14 @@ pub(crate) fn take_arrangement_drop(
         return false;
     }
     let (mx, my) = nd.last_mouse;
-    if !f.launcher.grid.contains(mx, my) {
+    // **帯の上で離したら必ずここで受け止める。** 格子の外 (停止列 / 返す列 /
+    // 見出し行 / つかみ代) はセルにできないので「移動をキャンセル」として吸収する
+    // — 素通りさせるとアレンジ側の move が走り、掴んだクリップが帯まで戻した
+    // ぶんだけ左へ飛んで **拍 0 にワープする**。
+    if !f.launcher.pane.contains(mx, my) {
         return false;
     }
-    let Some((target, _)) = layout::cell_at(f, mx, my) else {
+    let Some(target) = layout::drop_cell_at(f, mx, my) else {
         return true;
     };
     let Some(base_idx) = row_index(f, target.row) else {
@@ -249,7 +247,7 @@ pub(crate) fn take_arrangement_drop(
     let Some(first) = nd.anchors.first() else {
         return true;
     };
-    let Some(anchor_idx) = track_row_index(f, first.key.track) else {
+    let Some(anchor_idx) = track_row_index(f, first.key.track_id) else {
         return true;
     };
     // 同じトラックの複数クリップは、開始拍の順に隣の列へ並べる (Live と同じ
@@ -269,16 +267,14 @@ pub(crate) fn take_arrangement_drop(
             rank_track = Some(a.track_index);
             rank = 0;
         }
-        let Some(idx) = track_row_index(f, a.key.track) else {
+        let Some(idx) = track_row_index(f, a.key.track_id) else {
             continue;
         };
         let Some(to_row) = shift_row(f, idx, base_idx, anchor_idx) else {
             continue;
         };
         let to_scene_index = target.scene_index.saturating_add(rank);
-        let to_scene_id =
-            f.launcher_view.scenes.get(to_scene_index as usize).map_or(0, |s| s.id);
-        drops.push(ClipToCellDrop { from: a.key, to_row, to_scene_index, to_scene_id });
+        drops.push(ClipToCellDrop { from: a.key, to_row, to_scene_index });
         rank += 1;
     }
     let mode = ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift);

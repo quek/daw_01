@@ -657,7 +657,7 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
                 sample_rate: ev.buffer.sample_rate,
             };
             let _ = hctx.waveform_segments(
-                (wf_id_tag, key.track, key.clip, ev.key),
+                (wf_id_tag, key.track_id, key.clip_id, ev.key),
                 source,
                 &segs,
                 wstyle,
@@ -1235,7 +1235,7 @@ pub(super) fn draw_selection_overlay<M: ?Sized + 'static>(
             continue;
         }
         for c in &t.clips {
-            let key = ClipKey { track: t.id, clip: c.id };
+            let key = ClipKey { track_id: t.id, clip_id: c.id };
             if !selected.contains(&key) {
                 continue;
             }
@@ -1432,8 +1432,8 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         // drag 中に clip が消える等の異常時は選択色でフォールバック (content なしの薄い枠)。
         let src = visible_tracks
             .iter()
-            .find(|t| t.id == a.key.track)
-            .and_then(|t| t.clips.iter().find(|c| c.id == a.key.clip).map(|c| (t.kind, c)));
+            .find(|t| t.id == a.key.track_id)
+            .and_then(|t| t.clips.iter().find(|c| c.id == a.key.clip_id).map(|c| (t.kind, c)));
         let src_color =
             src.map_or(style.clip_selected_fill, |(_, c)| c.color.unwrap_or(style.clip_default_fill));
         // preview fill = 元 clip 色を半透明化 (中身が透けて「コピー」 と分かる)。 元色が既に半透明
@@ -1454,7 +1454,7 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
             }
         };
         let preview_clip = ClipView {
-            id: a.key.clip,
+            id: a.key.clip_id,
             start_beat: start,
             len_beats: len,
             content_offset_beats: preview_offset,
@@ -1729,7 +1729,7 @@ pub(super) fn draw_fade_handle_overlay<M: ?Sized + 'static>(
             if c.fades.is_empty() {
                 continue;
             }
-            let key = ClipKey { track: t.id, clip: c.id };
+            let key = ClipKey { track_id: t.id, clip_id: c.id };
             if Some(key) != hovered_clip && Some(key) != drag_clip {
                 continue;
             }

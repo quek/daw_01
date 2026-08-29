@@ -245,12 +245,10 @@ FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::inspector_plugin_
 FN-NESTING | daw_gui/src/handler/glue.rs::AppData::action_glue_selected_clips              | 8/71 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/tick.rs::AppData::ensure_recording_lane_clip              | 8/64 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_video[cfg(windows)]      | 8/34 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/bounce.rs::AppData::set_clip_positions                    | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::auto_warp_clip                   | 8/13 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_audio                    | 8/13 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/clips.rs::AppData::create_clip                            | 8/12 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::arrangement_labels                | 8/12 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_clips_at                    | 8/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_points_at                   | 8/7  | edit_song 多重ループ。未起票

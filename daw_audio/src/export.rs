@@ -591,9 +591,10 @@ fn render_loop(
     let mut launcher = crate::launcher::LauncherRuntime::new();
     launcher.arm_reseed();
     // グローバルローンチ量子化は engine と同じ値を使う (セルの `Global` の解決先)。
-    let global_launch_quantize = crate::launcher::quantize::decode(
-        engine_shared.global_launch_quantize.load(Ordering::Acquire),
-    );
+    // r.md #87: 生成と同じく `Song` が SSoT (engine.rs の同名変数と同じ理由)。
+    // 書き出しは曲頭から freewheel で描き直すので、実行時の速報ではなく
+    // 保存された値で決まる必要がある (= 同じプロジェクトなら同じファイル)。
+    let global_launch_quantize = song.global_launch_quantize;
 
     while playhead < total_samples {
         // User abort (`AudioCommand::CancelExport`). Checked before any

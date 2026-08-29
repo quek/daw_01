@@ -49,7 +49,7 @@ fn push_clip_rects(f: &ArrangementFrame<'_>, response: &mut ArrangementResponse)
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, f.view, f.lanes);
-            response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
+            response.clip_rects.push((ClipKey { track_id: t.id, clip_id: c.id }, r));
         }
     }
 }

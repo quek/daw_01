@@ -175,6 +175,10 @@ pub(super) fn mix_send_into_track_scratch(
     any_solo: bool,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     n: usize,
+    // r.md #87: 送り元トラックの行の供給元。SendGain レーン行をランチャーで
+    // 撃っていたら、アレンジのカーブではなく **セルのカーブ**を使う
+    // (Volume / Pan / PluginParam は既にそうなっていて、ここだけ抜けていた)。
+    rows: crate::launcher::TrackRows<'_>,
 ) {
     use common::model::{AutomationTarget, TrackBuiltinParam};
 
@@ -254,11 +258,24 @@ pub(super) fn mix_send_into_track_scratch(
         .min(dst_scratch.track_r.len());
 
     if let (Some(lane), true) = (lane, beats_per_frame > 0.0) {
+        // この行の供給元 (アレンジ / セル / 停止) を 1 度だけ解く。
+        let lane_row = song
+            .tracks
+            .get(src_track_idx as usize)
+            .and_then(|t| t.automation_lanes.iter().position(|l| l.id == lane.id))
+            .map_or(crate::launcher::RowTimeSource::default(), |i| rows.lane(i));
         for i in 0..n {
             // `fill_track_param_ramps` / `fill_pd_param_events` と同じ積分済み
             // anchor + per-frame 増分 (M5 の beat-domain 統一)。
             let beat = playhead_beats + i as f64 * beats_per_frame;
-            let g = common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let phase = crate::launcher::render::phase_at_frame(lane_row, i as u32);
+            let g = crate::launcher::render::lane_value(
+                lane,
+                &song.clip_contents,
+                phase,
+                beat,
+            ) as f32;
             dst_scratch.track_l[i] += src_l[i] * g;
             dst_scratch.track_r[i] += src_r[i] * g;
         }

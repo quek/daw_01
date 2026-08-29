@@ -51,6 +51,13 @@ pub const MAX_ROWS: usize = common::audio_bridge::MAX_LAUNCHER_ROWS;
 /// 拍数 / 長さとして使える値か (有限かつ正)。
 ///
 /// `!(x > 0.0)` と書くと NaN も弾けるが clippy の `neg_cmp_op_on_partial_ord` に
+/// 発火拍 / ループ端の丸め誤差を吸収する幅 (拍)。frame → 拍 の往復で
+/// 数 ULP ずれるのと、`switch_frame` が floor である (= 発火 frame の拍は
+/// 発火拍のわずか手前) の 2 つを吸収する。48 kHz / 120 BPM の 1 frame が
+/// 約 8.3e-5 拍なので、その 1/8 を採る。**GUI 側 (`launcher_time`) の
+/// 同名定数と意味を揃えること。**
+pub const LAUNCH_EPSILON_BEATS: f64 = 1e-5;
+
 /// 当たる。判定を 1 か所に閉じて、呼び側は `!is_positive(x)` と書く。
 #[must_use]
 #[inline]
@@ -132,8 +139,15 @@ impl RowPhase {
             Self::Arranger => Some(beat),
             Self::Silent => None,
             Self::Cell { launch_beat, loop_len, cell_start_beat, looping, .. } => {
-                let d = beat - launch_beat;
-                if !d.is_finite() || d < 0.0 || !is_positive(loop_len) {
+                // 発火拍ちょうどの frame は、frame → 拍 の丸めで `d` が
+                // **ごくわずかに負**になることがある (`switch_frame` は floor)。
+                // そこで `None` を返すと、その buffer の残り全部が無音として
+                // 捨てられる (`emit_phase` は最初の `None` で打ち切る) ので、
+                // 1 frame ぶんの下振れは「撃った瞬間」として吸収する。
+                let d = (beat - launch_beat).max(0.0);
+                if !d.is_finite() || beat - launch_beat < -LAUNCH_EPSILON_BEATS
+                    || !is_positive(loop_len)
+                {
                     return None;
                 }
                 if looping {
@@ -238,10 +252,26 @@ fn emit_phase(
             // 無音 (停止 / ワンショットの終端を越えた)。以降も無音なので抜ける。
             return;
         };
+        // ループの巻き戻し直後 / 撃った直後の区間は、frame 境界の切り上げのぶん
+        // 実効拍が原点をわずかに **越えて** 始まる。そのままだと
+        // 「content 拍 0 ちょうどの note」が毎周スキップされる (キックが 2 周目
+        // 以降消える) ので、1 frame 未満のはみ出しは原点へ吸着させる。
+        let eff = snap_to_cell_origin(phase, eff, beats_per_frame);
         let end = next_break(phase, eff, beats_per_frame, cursor, to);
         f(RowSegment { start_frame: cursor, end_frame: end, beat: eff, cell_clip_id });
         cursor = end.max(cursor.saturating_add(1));
     }
+}
+
+/// ループ原点をわずかに越えて始まった区間の実効拍を、原点ちょうどへ吸着する。
+/// はみ出しが 1 frame 未満のときだけ (= 本当に境界の直後のときだけ) 効く。
+#[must_use]
+fn snap_to_cell_origin(phase: RowPhase, eff: f64, beats_per_frame: f64) -> f64 {
+    let RowPhase::Cell { cell_start_beat, .. } = phase else {
+        return eff;
+    };
+    let over = eff - cell_start_beat;
+    if over > 0.0 && over < beats_per_frame { cell_start_beat } else { eff }
 }
 
 /// この区間がどこで切れるか (ループ端 or 供給元の終わり)。
@@ -272,6 +302,9 @@ pub struct RowSourceTable {
     sources: Vec<RowTimeSource>,
     /// `offsets[track_idx]` = そのトラックの行の先頭 (= トラック行)。
     offsets: Vec<u32>,
+    /// マスター行 (`Song.song_lanes`) のグループ index。
+    /// マスターはトラックではないので `offsets` の末尾に別枠で積む。
+    master_group: Option<usize>,
 }
 
 impl RowSourceTable {
@@ -280,13 +313,31 @@ impl RowSourceTable {
     pub fn new() -> Self {
         Self {
             sources: Vec::with_capacity(MAX_ROWS),
-            offsets: Vec::with_capacity(crate::engine::MAX_TRACKS + 1),
+            // +2 = マスター行のグループと番兵。
+            offsets: Vec::with_capacity(crate::engine::MAX_TRACKS + 2),
+            master_group: None,
         }
     }
 
     pub fn clear(&mut self) {
         self.sources.clear();
         self.offsets.clear();
+        self.master_group = None;
+    }
+
+    /// マスター行群 (`Song.song_lanes`) の開始。以降の `push` はマスターの行。
+    pub fn begin_master(&mut self) {
+        self.master_group = Some(self.offsets.len());
+        self.begin_track();
+    }
+
+    /// マスターのレーン行。マスター行を積んでいなければ空 (= すべて `Arranger`)。
+    #[must_use]
+    pub fn master_rows(&self) -> TrackRows<'_> {
+        match self.master_group {
+            Some(i) => self.track_rows(i),
+            None => TrackRows::default(),
+        }
     }
 
     /// 新しいトラックの行群を開始する (トラック行 → レーン行の順で `push`)。

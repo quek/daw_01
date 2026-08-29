@@ -414,11 +414,6 @@ pub enum AudioCommand {
     SwitchRowToArranger { track_id: u32, lane_id: u32 },
     /// r.md #87: 全行の主導権をアレンジへ返す。
     SwitchAllToArranger,
-    /// r.md #87: グローバルローンチ量子化 (= セルの
-    /// [`LaunchQuantize::Global`](crate::model::LaunchQuantize) が解決される先)。
-    /// 既定は [`DEFAULT_GLOBAL_LAUNCH_QUANTIZE`](crate::model::DEFAULT_GLOBAL_LAUNCH_QUANTIZE)
-    /// (= 1 小節)。`Global` を送っても既定に倒れる (自己参照は解決できない)。
-    SetGlobalLaunchQuantize(crate::model::LaunchQuantize),
     /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流するので、
     /// 「終わり方」の実装は 1 つしかない。
     Shutdown,

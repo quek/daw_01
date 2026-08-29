@@ -18,9 +18,9 @@ pub(super) fn draw_clip_voice(
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
     if app.voicevox_param_panel_open()
         && let Some(r) = app.selected_clip_ref()
-        && let Some(track) = app.song_doc.song().tracks.get(r.track as usize)
+        && let Some(track) = app.song_doc.song().track_by_id(r.track_id)
         && track.is_voicevox_vocal()
-        && let Some(clip) = track.clips.get(r.clip as usize)
+        && let Some(clip) = track.clip_by_id(r.clip_id)
         && app
             .song_doc.song()
             .clip_contents

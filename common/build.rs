@@ -25,6 +25,8 @@ const WIRE_SOURCES: &[&str] = &[
     "src/model/automation.rs",
     // model.rs から切り出した `IdAllocators` (Song.ids として wire を渡る)。
     "src/model/ids.rs",
+    // v35 (r.md #87): MidiBinding / MidiBindInput / BindingTarget。
+    "src/model/midi_bind.rs",
     // r.md #87 (クリップランチャー): Scene / SessionClip / LaunchSettings / FollowAction /
     // RowPlayback。Song に載って `LoadSong` の wire を渡るので登録必須 (不変条件 7)。
     "src/model/session.rs",

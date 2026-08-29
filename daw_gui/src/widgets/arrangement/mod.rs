@@ -52,7 +52,7 @@ use daw_ui_core::{
 use crate::audio_source_cache::AudioSourceBuffer;
 
 use crate::app::{
-    AppData, AppEvent, AutomationPointKeyRef, ClipEventRef, ClipRef, FadeEdgeKind, MoveAutomationClipEntry,
+    AppData, AppEvent, AutomationPointKeyRef, ClipEventRef, FadeEdgeKind, MoveAutomationClipEntry,
     MoveAutomationPointEntry, ResizeAutomationClipEntry,
 };
 
@@ -106,21 +106,11 @@ pub use run::arrangement;
 // 発火自体は各 interaction site が `Edit::mutate(...)` を直接 push する。
 // ============================================================
 
-/// widget `ClipKey` (安定 id) → `AppData` の index ベース `ClipRef`。
-pub(crate) fn clip_key_to_ref(app: &AppData, key: ClipKey) -> Option<ClipRef> {
-    let t_idx = app.song_doc.song().tracks.iter().position(|t| t.id == key.track)?;
-    let c_idx =
-        app.song_doc.song().tracks[t_idx].clips.iter().position(|c| c.id == key.clip)?;
-    Some(ClipRef { track: t_idx as u32, clip: c_idx as u32 })
-}
-
-/// widget `ClipKey` ↔ `common::model::ClipKey` (field 名だけが違う同一の安定 id ペア)。
-pub(crate) fn clip_key_to_model(k: ClipKey) -> common::model::ClipKey {
-    common::model::ClipKey { track_id: k.track, clip_id: k.clip }
-}
-
-pub(crate) fn clip_key_from_model(k: common::model::ClipKey) -> ClipKey {
-    ClipKey { track: k.track_id, clip: k.clip_id }
+/// まだ生きているクリップだけを通す (消えた key を選択や編集へ流さない)。
+/// widget ↔ `AppData` の **id → index 変換は無くなった** — 住所は
+/// [`ClipKey`] 1 本で、アレンジのクリップもランチャーのセルも同じ id 空間に居る。
+pub(crate) fn live_clip_key(app: &AppData, key: ClipKey) -> Option<ClipKey> {
+    app.live_clip_key(key)
 }
 
 /// r.md #35: Shift+click 範囲選択 (長方形ブロック) 用に、 可視 track 上の全 clip を
@@ -131,7 +121,7 @@ pub(crate) fn clip_range_items(visible_tracks: &[ArrangementTrack]) -> Vec<Range
     for (row, t) in visible_tracks.iter().enumerate() {
         for c in &t.clips {
             out.push(RangeItem {
-                key: ClipKey { track: t.id, clip: c.id },
+                key: ClipKey { track_id: t.id, clip_id: c.id },
                 row: row as i64,
                 start: c.start_beat,
                 end: c.start_beat + c.len_beats,
@@ -179,12 +169,12 @@ fn widget_to_model_clip_delta(d: MoveAutomationClipDelta) -> MoveAutomationClipE
 // Public types (conversation #005 [Replied] のまま)
 // ============================================================
 
-/// clip の identity。track_id + clip_id (どちらも track / track 内 clip で安定)。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ClipKey {
-    pub track: u32,
-    pub clip: u32,
-}
+/// clip の identity。**モデルの [`common::model::ClipKey`] をそのまま使う**
+/// (アーキ不変条件 8 — daw_gui の widget は `common::model` 直結で、mirror 型を
+/// 作らない)。 以前はここに同じ 2 フィールドの widget 専用 struct が居たが、
+/// アレンジのクリップとランチャーのセルを 1 つの住所で扱う (r.md #87) 都合で
+/// 差が完全に無くなったので畳んだ。
+pub use common::model::ClipKey;
 
 /// r.md #38: clip 内 1 event 分の fade 表示情報。 content 種別 (audio / video / image /
 /// text) に依らず同じ型で扱う — 4 種とも `event_start_in_clip_beats` /

@@ -357,7 +357,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 80.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::Move))
         );
     }
 
@@ -370,7 +370,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 1.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::ResizeLeft))
         );
     }
 
@@ -383,7 +383,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 159.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::ResizeRight))
         );
     }
 
@@ -413,7 +413,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 77.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::ResizeLeft))
         );
     }
 
@@ -427,7 +427,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 162.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::ResizeRight))
         );
     }
 
@@ -453,7 +453,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 81.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::Move))
         );
     }
 
@@ -468,7 +468,7 @@
         let hit = clip_hit(&tracks, &tops, view, lanes, 78.0, 16.0, 4.0);
         assert_eq!(
             hit,
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::ResizeLeft))
         );
     }
 
@@ -490,17 +490,17 @@
         // に勝つ。旧 last-wins では B ResizeLeft だった回帰ケース。
         assert_eq!(
             clip_hit(&tracks, &tops, view, lanes, 159.0, 16.0, 4.0),
-            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, ClipDragKind::ResizeRight))
         );
         // cx=161: B の rect 内側 (in-rect ResizeLeft) が A の外側ハンドル (outer) に勝つ。
         assert_eq!(
             clip_hit(&tracks, &tops, view, lanes, 161.0, 16.0, 4.0),
-            Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
+            Some((ClipKey { track_id: 10, clip_id: 101 }, ClipDragKind::ResizeLeft))
         );
         // cx=160: 共有境界。半開区間で B の rect 内側 → B の左端 resize。
         assert_eq!(
             clip_hit(&tracks, &tops, view, lanes, 160.0, 16.0, 4.0),
-            Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
+            Some((ClipKey { track_id: 10, clip_id: 101 }, ClipDragKind::ResizeLeft))
         );
     }
 
@@ -722,7 +722,7 @@
     #[test]
     fn drag_preview_geometry_move_clamps_track() {
         let anchor = ClipDragAnchor {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             start_beat: 4.0,
             len_beats: 2.0,
             track_index: 0,
@@ -1596,11 +1596,11 @@
         let items = clip_range_items(&tracks);
         assert_eq!(items.len(), 12, "3 track × 4 clip");
         // 先頭 track の 2 番目の clip: row=0 / beat 1..2。
-        let it = items.iter().find(|i| i.key == ClipKey { track: 1, clip: 2 }).unwrap();
+        let it = items.iter().find(|i| i.key == ClipKey { track_id: 1, clip_id: 2 }).unwrap();
         assert_eq!(it.row, 0);
         assert!((it.start - 1.0).abs() < 1e-9 && (it.end - 2.0).abs() < 1e-9);
         // 3 番目の track は row=2。
-        let it3 = items.iter().find(|i| i.key == ClipKey { track: 3, clip: 1 }).unwrap();
+        let it3 = items.iter().find(|i| i.key == ClipKey { track_id: 3, clip_id: 1 }).unwrap();
         assert_eq!(it3.row, 2);
     }
 
@@ -1610,13 +1610,13 @@
         // → track1..3 × beat 1..3 の 6 個 (各 track の clip2, clip3)。
         let tracks = range_test_tracks();
         let items = clip_range_items(&tracks);
-        let anchor = ClipKey { track: 1, clip: 2 };
-        let clicked = ClipKey { track: 3, clip: 3 };
+        let anchor = ClipKey { track_id: 1, clip_id: 2 };
+        let clicked = ClipKey { track_id: 3, clip_id: 3 };
         let next = SelectModifier::RangeFromAnchor
             .resolve(&[anchor], clicked, || range_block(&items, anchor, clicked));
         let expect: Vec<ClipKey> = [1_u32, 2, 3]
             .iter()
-            .flat_map(|t| [2_u32, 3].iter().map(move |c| ClipKey { track: *t, clip: *c }))
+            .flat_map(|t| [2_u32, 3].iter().map(move |c| ClipKey { track_id: *t, clip_id: *c }))
             .collect();
         assert_eq!(next, expect);
     }
@@ -1625,16 +1625,16 @@
     fn shift_click_は同じtrack内ならその行だけ選ぶ() {
         let tracks = range_test_tracks();
         let items = clip_range_items(&tracks);
-        let anchor = ClipKey { track: 2, clip: 2 };
-        let clicked = ClipKey { track: 2, clip: 4 };
+        let anchor = ClipKey { track_id: 2, clip_id: 2 };
+        let clicked = ClipKey { track_id: 2, clip_id: 4 };
         let next = SelectModifier::RangeFromAnchor
             .resolve(&[anchor], clicked, || range_block(&items, anchor, clicked));
         assert_eq!(
             next,
             vec![
-                ClipKey { track: 2, clip: 2 },
-                ClipKey { track: 2, clip: 3 },
-                ClipKey { track: 2, clip: 4 },
+                ClipKey { track_id: 2, clip_id: 2 },
+                ClipKey { track_id: 2, clip_id: 3 },
+                ClipKey { track_id: 2, clip_id: 4 },
             ],
             "隣接 clip は端点を共有するが、 範囲外の clip1 は含めない"
         );
@@ -1644,7 +1644,7 @@
     fn shift_click_はアンカーが無ければ単一選択に倒れる() {
         let tracks = range_test_tracks();
         let items = clip_range_items(&tracks);
-        let clicked = ClipKey { track: 2, clip: 3 };
+        let clicked = ClipKey { track_id: 2, clip_id: 3 };
         // アンカー未設定 (None) を模す → range が None → Single 相当。
         let next = SelectModifier::RangeFromAnchor.resolve(&[], clicked, || {
             let anchor: Option<ClipKey> = None;
@@ -1730,7 +1730,7 @@
         // 掴む正方形は (0..12, 16..28) → cx=6, cy=20。
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 20.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 }))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 }))
         );
         // r.md #46: 名前帯の中 (cy=6) はもう掴む場所ではない (クリップ名と重ならない)。
         assert_eq!(
@@ -1750,7 +1750,7 @@
         // clip rect = (0, 2, 160, 28) → 掴む正方形は (148..160, 16..28) → cx=155, cy=20。
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 20.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut { event_index: 0 }))
+            Some((ClipKey { track_id: 10, clip_id: 100 }, AudioGripHit::FadeCornerOut { event_index: 0 }))
         );
     }
 
@@ -1788,7 +1788,7 @@
     #[test]
     fn compute_audio_drag_outcome_fade_in_horizontal_changes_length() {
         let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             kind: AudioDragKind::FadeIn,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
@@ -1815,7 +1815,7 @@
     #[test]
     fn compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx() {
         let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             kind: AudioDragKind::FadeOut,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
@@ -1844,7 +1844,7 @@
     fn compute_audio_drag_outcome_fade_length_clamps_to_clip_len() {
         // dx = +400 px @ 0.025 beat/px = +10 beat → 0.5 + 10 = 10.5、 clamp to clip_len 4.0
         let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             kind: AudioDragKind::FadeIn,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
@@ -1871,7 +1871,7 @@
     #[test]
     fn compute_audio_drag_outcome_fade_length_clamps_to_event_len_not_clip_len() {
         let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             kind: AudioDragKind::FadeIn,
             // clip は 4 拍だが event は先頭 1 拍だけ。
             anchor_fade: Some(ClipEventFade {
@@ -2066,7 +2066,7 @@
         // clip rect = (0, 2, 160, 28) → 重なった handle_rect は x ∈ [148, 160)
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 152.0, 20.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
+            Some((ClipKey { track_id: 10, clip_id: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
             "幅のある fade in 側が掴める (幅 0 の fade out に奪われない)"
         );
     }
@@ -2083,7 +2083,7 @@
         let tops = make_tops(&tracks, lanes, view);
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 84.0, 20.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
+            Some((ClipKey { track_id: 10, clip_id: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
             "fade 末尾 (80px) の正方形で掴める"
         );
         assert_eq!(
@@ -2097,7 +2097,7 @@
     #[test]
     fn compute_audio_drag_outcome_fade_in_vertical_toggles_curve() {
         let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             kind: AudioDragKind::FadeIn,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
@@ -2123,7 +2123,7 @@
     #[test]
     fn compute_audio_drag_outcome_unlocked_returns_none() {
         let ad = AudioDragSession {
-            key: ClipKey { track: 0, clip: 0 },
+            key: ClipKey { track_id: 0, clip_id: 0 },
             kind: AudioDragKind::FadeIn,
             anchor_fade: Some(ClipEventFade {
                 event_index: 0,
@@ -2182,27 +2182,28 @@
     /// 帯の外 / header_w=0 / handle=0 で miss する。
     #[test]
     fn header_resize_splitter_at_hits_centered_full_height_band() {
-        let style = test_style(); // header_resize_handle_px = 8 → ±4
+        let style = test_style(); // header_resize_handle_px = 8 → 境界の左 8px
         let rect = Rect { x: 100.0, y: 50.0, w: 800.0, h: 400.0 };
         let header_w = 160.0;
         let boundary = 100.0 + 160.0; // = 260
-        // 境界中心: hit。
-        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 200.0));
+        // 境界のすぐ左: hit。
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary - 1.0, 200.0));
         // 全高で hit (上端 / 下端近く)。
-        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 50.0));
-        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 449.0));
-        // 帯端 (±4px) 内側: hit (256) / 外側: miss (255.9 は < 256 で外、 264 は半開で外)。
-        assert!(header_resize_splitter_at(rect, header_w, &style, 256.0, 200.0));
-        assert!(!header_resize_splitter_at(rect, header_w, &style, 255.0, 200.0));
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary - 1.0, 50.0));
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary - 1.0, 449.0));
+        // r.md #87: ホットゾーンは **境界の左だけ** (右はランチャーの停止列)。
+        assert!(header_resize_splitter_at(rect, header_w, &style, 252.0, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, 251.0, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 200.0));
         assert!(!header_resize_splitter_at(rect, header_w, &style, 264.0, 200.0));
         // rect の外 (上 / 下): miss。
-        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 49.0));
-        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 450.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary - 1.0, 49.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary - 1.0, 450.0));
         // header_w = 0 (header 無し): 常に miss。
         assert!(!header_resize_splitter_at(rect, 0.0, &style, 100.0, 200.0));
         // handle = 0: 無効化。
         let no_handle = ArrangementStyle { header_resize_handle_px: 0.0, ..test_style() };
-        assert!(!header_resize_splitter_at(rect, header_w, &no_handle, boundary, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &no_handle, boundary - 1.0, 200.0));
     }
 
     // ============================================================

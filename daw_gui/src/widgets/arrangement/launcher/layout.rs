@@ -104,12 +104,21 @@ pub(crate) fn split(
 ) -> LauncherRects {
     let pane = Rect { x: pane_x, y: rect.y, w: pane_w.max(0.0), h: rect.h };
     let head = Rect { x: pane.x, y: rect.y, w: pane.w, h: head_h.max(0.0) };
-    let stop_w = STOP_COL_W.min(pane.w);
-    let return_w = RETURN_COL_W.min((pane.w - stop_w).max(0.0));
-    let grid_w = (pane.w - stop_w - return_w).max(0.0);
+    // 帯の右端 `PANE_SPLITTER_HANDLE` px は **スプリッタ専用**。ここに列を置くと
+    // `zone_at` がスプリッタを先に返すので、「アレンジへ返す」ボタンが押せない
+    // (幅を変えるドラッグとボタンが同じ場所に居る、が実機で出た)。
+    let grab_w = PANE_SPLITTER_HANDLE.min(pane.w);
+    let cols_w = (pane.w - grab_w).max(0.0);
+    let stop_w = STOP_COL_W.min(cols_w);
+    let return_w = RETURN_COL_W.min((cols_w - stop_w).max(0.0));
+    let grid_w = (cols_w - stop_w - return_w).max(0.0);
     let stop_col = Rect { x: pane.x, y: rect.y, w: stop_w, h: rect.h };
-    let return_col =
-        Rect { x: pane.x + pane.w - return_w, y: rect.y, w: return_w, h: rect.h };
+    let return_col = Rect {
+        x: pane.x + pane.w - grab_w - return_w,
+        y: rect.y,
+        w: return_w,
+        h: rect.h,
+    };
     let grid = Rect { x: pane.x + stop_w, y: body_y, w: grid_w, h: body_h.max(0.0) };
     let scene_head = Rect { x: grid.x, y: rect.y, w: grid_w, h: head_h.max(0.0) };
     LauncherRects {
@@ -261,6 +270,35 @@ pub(crate) fn cell_at(
     let top = row_screen_top(f, &row);
     let r = cell_rect(rects, top, row.height, col);
     r.contains(x, y).then(|| (cell_key(f.launcher_view, row.key, col), r))
+}
+
+/// **落とし先**としてのセル解決。`cell_at` と違い、セルの見た目のインセット
+/// (左右 1px / 上下 2px) を当たり判定に使わない — 格子の中なら列と行から必ず
+/// 1 つに決まる。
+///
+/// 見た目の隙間に落としただけで drop が黙って消える (ドラッグしたクリップが
+/// 元の位置へ戻る / ファイルが無反応になる) のを防ぐための別口。
+#[must_use]
+pub(crate) fn drop_cell_at(
+    f: &ArrangementFrame<'_>,
+    x: f32,
+    y: f32,
+) -> Option<LauncherCellKey> {
+    let rects = &f.launcher;
+    if rects.collapsed || !rects.grid.contains(x, y) {
+        return None;
+    }
+    let col = rects.col_index_at_x(x)?;
+    let row = row_at_y(f, y)?;
+    if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) {
+        return None;
+    }
+    // グループ行は自分のクリップを鳴らさない (まとめセルは「子を一斉に」の意味
+    // しか持たない) ので、落とし先にはしない。
+    if f.launcher_view.rows.get(&row.key).is_some_and(|r| r.group) {
+        return None;
+    }
+    Some(cell_key(f.launcher_view, row.key, col))
 }
 
 // ============================================================

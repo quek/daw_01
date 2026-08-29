@@ -9,30 +9,21 @@
 
 use common::protocol::AudioCommand;
 
-use super::quantize;
 use super::runtime::LaunchRequest;
 use super::RowKey;
-use crate::engine::{EngineCommand, EngineShared};
+use crate::engine::EngineCommand;
 
 /// この `AudioCommand` が launcher 系なら処理して `true`。
 ///
-/// `SetGlobalLaunchQuantize` だけは `SharedState` の atomic に直接載せる
-/// (毎 buffer 1 回読むスカラーなので、キューを通す意味が無い)。それ以外は
-/// 発火の判断に `Song` が要るので audio thread へ渡す。
+/// 発火の判断には `Song` が要る (どのセルがどの列に居るか) ので、
+/// すべて audio thread のキューへ渡す。**グローバルローンチ量子化はここを通らない** —
+/// `Song.global_launch_quantize` が SSoT で、`LoadSong` に載って届く
+/// (値の経路を 2 本持つと、どちらが効いたか分からなくなる)。
 pub fn dispatch(
     cmd: AudioCommand,
-    engine_shared: &EngineShared,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
 ) -> bool {
     let req = match cmd {
-        AudioCommand::SetGlobalLaunchQuantize(q) => {
-            engine_shared.global_launch_quantize.store(
-                quantize::encode(q),
-                std::sync::atomic::Ordering::Release,
-            );
-            tracing::info!(?q, "received SetGlobalLaunchQuantize");
-            return true;
-        }
         AudioCommand::LaunchCell { track_id, lane_id, clip_id, pressed } => {
             LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed }
         }
@@ -58,35 +49,13 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::LaunchQuantize;
 
     #[test]
-    fn 量子化設定は_atomic_へ_それ以外は_audio_thread_へ() {
-        let shared = EngineShared::new();
+    fn 発火系の_command_は_audio_thread_へ渡る() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(dispatch(
-            AudioCommand::SetGlobalLaunchQuantize(LaunchQuantize::Note {
-                div: 8,
-                triplet: false
-            }),
-            &shared,
-            &tx
-        ));
-        assert!(rx.try_recv().is_err(), "量子化設定はキューを通さない");
-        assert_eq!(
-            quantize::decode(
-                shared.global_launch_quantize.load(std::sync::atomic::Ordering::Acquire)
-            ),
-            LaunchQuantize::Note { div: 8, triplet: false }
-        );
-
         // 行の宛先は安定 id で運ばれる (lane_id = 0 がトラック行)。
-        assert!(dispatch(
-            AudioCommand::LaunchCell { track_id: 3, lane_id: 0, clip_id: 9, pressed: true },
-            &shared,
-            &tx
-        ));
+        assert!(dispatch(AudioCommand::LaunchCell { track_id: 3, lane_id: 0, clip_id: 9, pressed: true }, &tx));
         let got = rx.try_recv().expect("audio thread へ渡る");
         match got {
             EngineCommand::Launch(LaunchRequest::Cell { key, clip_id, pressed }) => {
@@ -98,6 +67,6 @@ mod tests {
         }
 
         // launcher 以外は素通り (recv_loop の他の arm が処理する)。
-        assert!(!dispatch(AudioCommand::Play, &shared, &tx));
+        assert!(!dispatch(AudioCommand::Play, &tx));
     }
 }

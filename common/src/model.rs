@@ -15,12 +15,14 @@ use crate::scale::ScaleChange;
 mod automation;
 mod content;
 mod ids;
+mod midi_bind;
 mod modulation;
 mod session;
 mod track;
 pub use automation::*;
 pub use content::*;
 pub use ids::*;
+pub use midi_bind::*;
 pub use modulation::*;
 pub use session::*;
 pub use track::*;
@@ -217,6 +219,12 @@ pub use track::*;
 /// field が `#[serde(default)]` で forward-migrate する (`scenes` は空 Vec、主導権は
 /// `RowPlayback::Arranger` = 従来どおりアレンジだけが鳴る)。**load 時に列を補わない**
 /// ので、開いただけでは `*` が立たない (r.md #9)。
+///
+/// あわせて `Song.global_launch_quantize` (グローバルローンチ量子化、既定 = 1 小節) と、
+/// `MidiBinding` の入力が CC 固定 (`controller: u8`) から `MidiBindInput` (CC / ノート) へ
+/// 変わり、`BindingTarget` にランチャー操作 6 種が加わる。パッドはノートで撃つので
+/// CC だけでは足りない。旧 `controller` は deserialize 専用に降格し、
+/// `Song::ensure_midi_binding_inputs` が load 時に `input` へ移す。
 pub const CURRENT_VERSION: u32 = 35;
 
 /// Stable id for shared clip content (notes). Allocated by
@@ -505,7 +513,7 @@ pub struct ViewState {
     /// ランチャー帯とアレンジのレーンをどう見せるか。
     #[serde(default)]
     pub launcher_layout: LauncherLayout,
-    /// [`LauncherLayout::Both`] のときのランチャー帯の幅 (px)。`Ctrl+Tab` で
+    /// [`LauncherLayout::Both`] のときのランチャー帯の幅 (px)。`Tab` で
     /// レイアウトを一巡して戻ってきたとき、手で決めたこの幅に復帰する。
     /// `0` 以下 = 未設定 (表示側の既定幅)。
     #[serde(default)]
@@ -699,6 +707,20 @@ pub struct Song {
     /// 表示上のプレースホルダで、そこにセルを置いた瞬間に実体化する。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scenes: Vec<Scene>,
+    /// v35 (r.md #87): ランチャーのグローバルローンチ量子化 (既定 = 1 小節)。
+    ///
+    /// **曲の一部** — セルの [`LaunchSettings::quantize`] が `Global` のとき
+    /// 「いつ鳴り始めるか」がこれで決まり、書き出す音が変わる。保存しないと
+    /// 「開き直したら書き出し結果が違う」になる (計画書 Q9 / Q10)。
+    /// [`LaunchQuantize::Global`] 自身は入らない (自己参照になる) が、壊れた値が
+    /// 来ても [`LaunchQuantize::beats`] が `None` を返して量子化なしに倒れる。
+    #[serde(default = "default_global_launch_quantize")]
+    pub global_launch_quantize: LaunchQuantize,
+}
+
+/// v34 以前の `.daw` に無いので 1 小節へ forward-migrate (Live / Bitwig / Studio One と同じ既定)。
+fn default_global_launch_quantize() -> LaunchQuantize {
+    DEFAULT_GLOBAL_LAUNCH_QUANTIZE
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -748,63 +770,9 @@ impl Default for Song {
             mod_sources: Vec::new(),
             song_mod_routings: Vec::new(),
             scenes: Vec::new(),
+            global_launch_quantize: DEFAULT_GLOBAL_LAUNCH_QUANTIZE,
         }
     }
-}
-
-/// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn binding 1 件 (= CC → target)。
-/// `channel = 16` は any-channel (= channel-agnostic、 全 16 channel にマッチ)。
-/// 同じ `(channel, controller)` の重複は許容しない (= GUI 側 handler が
-/// 新規 bind 時に既存 entry を replace する)。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
-pub struct MidiBinding {
-    /// MIDI channel 0..15、 または 16 = any-channel (= channel 無視で match)。
-    pub channel: u8,
-    /// MIDI CC 番号 0..127。
-    pub controller: u8,
-    /// CC 値が変化したときに更新する parameter。
-    pub target: BindingTarget,
-}
-
-/// MIDI Learn の bind 先。 TrackVolume / TrackPan / SongTempo / PluginParam。
-/// CC 受信時は `apply_midi_value_to_target` が各 target に値を反映する
-/// (PluginParam は param range で value_real に変換し inspector knob と同じ
-/// lane-default 経路で plugin host へ、 r.md #8 B2)。 transport の Learn button が
-/// 「直近に触った param」 を bind する (touch + learn)。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
-pub enum BindingTarget {
-    /// `Track.volume` (0.0..=1.0、 CC 0..127 を linear マップ)。
-    TrackVolume(u32),
-    /// `Track.pan` (-1.0..=1.0、 CC 0..127 を `value*2/127 - 1` で linear マップ)。
-    TrackPan(u32),
-    /// `Song.bpm` (60.0..=180.0、 CC 0..127 を linear マップ)。 SongTempo
-    /// curve とは独立 (= curve がある場合は curve が優先、 CC は base bpm を
-    /// 動かすイメージ)。
-    SongTempo,
-    /// plugin parameter bind (r.md #8 B2)。 安定 `device_id` で plugin instance を
-    /// 特定 (`AutomationTarget::PluginParam` と同じ addressing)、 `param_id` は
-    /// format ごと (CLAP `clap_id` / VST3 `ParamID`)。 CC 受信時は
-    /// `apply_midi_value_to_target` が param range で value_real に変換し、
-    /// inspector knob と同じ lane-default 経路で plugin host へ反映する。
-    PluginParam {
-        /// v29: 安定 device id (`PluginInstance::id`)。`0` は未解決 sentinel。
-        #[serde(default)]
-        device_id: u64,
-        param_id: u32,
-        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内 positional
-        /// index、または旧 `slot: PluginSlot` (load 時 JSON 前処理
-        /// `project::migrate_legacy_device_chains` が chain 長から index へ解決。
-        /// r.md #8 M7: 旧 PluginParam binding が device_index 欠落で deserialize を
-        /// 落としていたのを是正) を持つ。`Song::ensure_ids` の remap pass が安定 device_id へ写像。
-        #[serde(default, rename = "device_index", skip_serializing)]
-        legacy_device_index: Option<u32>,
-        /// v33 以前 migration 用 (deserialize 専用)。`legacy_device_index` を解決する
-        /// ための所属 track。実行時の解決は `find_device_by_id` なので読まれない
-        /// (r.md #71 (プラグインのコピー / 移動): device 移動で stale になる
-        /// フィールドを保存しない)。
-        #[serde(default, rename = "track", skip_serializing)]
-        legacy_track: Option<u32>,
-    },
 }
 
 /// r.md #71: セクション帯を `desired_start` (= **移動後の座標系** = ドラッグ中に画面で
@@ -1612,6 +1580,7 @@ impl Song {
         self.ensure_video_source_ids();
         self.ensure_image_source_ids();
         self.ensure_ids();
+        self.ensure_midi_binding_inputs();
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
@@ -1833,20 +1802,11 @@ impl Song {
             } else if lane.id >= self.ids.next_song_lane_id {
                 self.ids.next_song_lane_id = lane.id + 1;
             }
-            // lane 内 clip ids も担保 (Track の ensure_lane_ids 同 idiom、
-            // ただし song_lanes は track field を持たないので per-lane で展開)
-            for clip in &mut lane.clips {
-                if clip.id == 0 {
-                    let new_id = lane.next_clip_id.max(1);
-                    lane.next_clip_id = new_id + 1;
-                    clip.id = new_id;
-                } else if clip.id >= lane.next_clip_id {
-                    lane.next_clip_id = clip.id + 1;
-                }
-            }
-            if lane.next_clip_id == 0 {
-                lane.next_clip_id = 1;
-            }
+            // lane 内 clip ids も担保。**`AutomationLane::ensure_clip_ids` を通す** —
+            // ベタ書きすると `clips` しか見ず、ランチャーのセル (`session_clips`) が
+            // 採番・重複解消・`next_clip_id` の bump から漏れる (同じ id のセルが
+            // 2 つできると `RowPlayback` がどちらを指すか決まらない)。
+            lane.ensure_clip_ids();
         }
         if self.ids.next_song_lane_id == 0 {
             self.ids.next_song_lane_id = 1;
@@ -2042,6 +2002,25 @@ impl Song {
 
     pub fn track_by_id_mut(&mut self, track_id: u32) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == track_id)
+    }
+
+    /// [`ClipKey`] が指すクリップ。 アレンジのクリップとランチャーのセルの
+    /// **どちらも**引ける ([`Track::clip_by_id`])。
+    #[must_use]
+    pub fn clip_by_key(&self, key: ClipKey) -> Option<&Clip> {
+        self.track_by_id(key.track_id)?.clip_by_id(key.clip_id)
+    }
+
+    /// [`Self::clip_by_key`] の可変版。
+    pub fn clip_by_key_mut(&mut self, key: ClipKey) -> Option<&mut Clip> {
+        self.track_by_id_mut(key.track_id)?.clip_by_id_mut(key.clip_id)
+    }
+
+    /// 行レイアウト用の track index (表示順)。 **住所には使わない** —
+    /// index は削除 / 並べ替えで意味が変わる (アーキ不変条件 1)。
+    #[must_use]
+    pub fn track_index_of(&self, track_id: u32) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == track_id)
     }
 
     /// Effective silence for the VISUAL layer (preview + export). A track's
@@ -2441,12 +2420,10 @@ impl Song {
     /// to the shared `notes` vector. Returns `None` if the indices are
     /// out of range, the `content_id` has no entry, or the entry is an
     /// `Audio` variant.
-    pub fn notes_in_clip_mut(
-        &mut self,
-        track_idx: usize,
-        clip_idx: usize,
-    ) -> Option<&mut Vec<Note>> {
-        let content_id = self.tracks.get(track_idx)?.clips.get(clip_idx)?.content_id;
+    /// [`ClipKey`] が指すクリップの note 列 (共有 content の実体)。
+    /// アレンジのクリップでもランチャーのセルでも同じように引ける。
+    pub fn notes_in_clip_mut(&mut self, key: ClipKey) -> Option<&mut Vec<Note>> {
+        let content_id = self.clip_by_key(key)?.content_id;
         self.clip_contents
             .get_mut(&content_id)
             .and_then(|c| c.notes_mut())

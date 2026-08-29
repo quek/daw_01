@@ -77,8 +77,17 @@ pub fn resolve(
     }
     let step = beat_step(fire_beat);
     // `chance_a` % で a、残りで b。100 なら常に a、0 なら常に b。
+    let chance = action.chance_a.min(100);
+    // 端は抽選しない — `random_unit` は `[0,1)` だが f32 化で 1.0 に丸まりうるので、
+    // 「100% なのに稀に b」「0% なのに稀に a」が起きる (UI の表示と食い違う)。
+    if chance == 100 {
+        return apply(action.a, occupied, from, scenes, seed, step);
+    }
+    if chance == 0 {
+        return apply(action.b, occupied, from, scenes, seed, step);
+    }
     let roll = random_unit(seed ^ SALT_LOTTERY, step);
-    let kind = if roll * 100.0 < f32::from(action.chance_a.min(100)) {
+    let kind = if roll * 100.0 < f32::from(chance) {
         action.a
     } else {
         action.b

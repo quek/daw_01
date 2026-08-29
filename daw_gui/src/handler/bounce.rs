@@ -10,17 +10,17 @@ use common::protocol::{AudioCommand, PluginCommand};
 use crate::import_audio;
 
 impl AppData {
-    pub(crate) fn set_clip_positions(&mut self, entries: &[(ClipRef, u32, f64)]) {
+    pub(crate) fn set_clip_positions(&mut self, entries: &[(ClipKey, u32, f64)]) {
         // track 跨ぎ move: source track と to_track が異なれば clip を remove +
         // 別 track に再 push。 同 track 内なら start_beat だけ update。
         // 同 track 内で複数 entry がある場合、 高い clip_idx から処理しないと
         // 配列インデックスが先に変動してしまうので、 source.track 同一 group
         // ごとに clip_idx 降順で sort してから処理する。
-        let mut entries: Vec<(ClipRef, u32, f64)> = entries.to_vec();
+        let mut entries: Vec<(ClipKey, u32, f64)> = entries.to_vec();
         entries.sort_by(|a, b| {
-            a.0.track
-                .cmp(&b.0.track)
-                .then_with(|| b.0.clip.cmp(&a.0.clip))
+            a.0.track_id
+                .cmp(&b.0.track_id)
+                .then_with(|| b.0.clip_id.cmp(&a.0.clip_id))
         });
 
         let Some(new_refs) = self.edit_song(move |song| {
@@ -28,31 +28,25 @@ impl AppData {
             for (source, to_track_id, new_start_beat) in entries {
                 let new_start = new_start_beat.max(0.0);
                 let Some(source_track_id) = song
-                    .tracks
-                    .get(source.track as usize)
+                    .track_by_id(source.track_id)
                     .map(|t| t.id)
                 else {
                     continue;
                 };
                 if source_track_id == to_track_id {
-                    if let Some(track) = song.tracks.get_mut(source.track as usize)
-                        && let Some(clip) = track.clips.get_mut(source.clip as usize)
+                    if let Some(track) = song.track_by_id_mut(source.track_id)
+                        && let Some(clip) = track.clip_by_id_mut(source.clip_id)
                     {
                         clip.start_beat = new_start;
-                        new_refs.push((source.track, clip.id));
+                        new_refs.push((source.track_id, clip.id));
                     }
                 } else {
                     let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
                         continue;
                     };
-                    let Some(removed) =
-                        song.tracks.get_mut(source.track as usize).and_then(|t| {
-                            if (source.clip as usize) < t.clips.len() {
-                                Some(t.clips.remove(source.clip as usize))
-                            } else {
-                                None
-                            }
-                        })
+                    let Some((removed, _)) = song
+                        .track_by_id_mut(source.track_id)
+                        .and_then(|t| t.remove_clip_by_id(source.clip_id))
                     else {
                         continue;
                     };
@@ -117,8 +111,8 @@ impl AppData {
     /// 安定 `device_id` で解決するので、device を消すと host 側 instance との対応が
     /// 切れる。並びを保ったまま ports を空にして dispatch を無害化する。元トラックの mute も解除する
     /// (= 元トラックが with-FX bounce で mute 済みでも isolate render は鳴らす)。
-    pub(crate) fn isolated_bounce_song(&self, target: ClipRef, bypass_inserts: bool) -> Option<Song> {
-        let track = self.song_doc.song().tracks.get(target.track as usize)?;
+    pub(crate) fn isolated_bounce_song(&self, target: ClipKey, bypass_inserts: bool) -> Option<Song> {
+        let track = self.song_doc.song().track_by_id(target.track_id)?;
         let mut isolated = self.song_doc.song().clone();
         isolated.master_fx_chain.clear();
         // master fx と同じ理由でマスター音量も外す。焼き込むと、再生時に
@@ -200,16 +194,16 @@ impl AppData {
     /// 元ミュート」する。Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し
     /// 「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
-    pub(crate) fn start_clip_bounce(&mut self, target: ClipRef, mode: BounceMode) {
+    pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
         if self.ipc.pending_clip_fx_bounce.is_some() {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
             return;
         };
         let source_track_id = track.id;
-        let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
+        let Some(clip) = track.clip_by_id(target.clip_id).cloned() else {
             return;
         };
         let clip_name = self.song_doc.song().content_name(clip.content_id).to_string();
@@ -239,8 +233,8 @@ impl AppData {
         };
         self.ipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
             mode,
-            source_track: target.track,
-            source_clip: target.clip,
+            source_track: target.track_id,
+            source_clip: target.clip_id,
             source_track_id,
             source_content_id: clip.content_id,
             out_path: out_path.clone(),
@@ -265,8 +259,8 @@ impl AppData {
         ));
         self.send_audio(AudioCommand::BounceClipFxOnline {
             path: out_path,
-            source_track: target.track,
-            source_clip: target.clip,
+            source_track: target.track_id,
+            source_clip: target.clip_id,
             start_beat,
             end_beat,
         });
@@ -279,7 +273,7 @@ impl AppData {
 
     /// In Place = 音源/synth の素の音 (insert FX 抜き) を engine offline
     /// render で焼き、**同じクリップに置換** (async)。歌唱の合成待ちは `request_bounce` 経由。
-    pub(crate) fn bounce_clip_in_place(&mut self, target: ClipRef) {
+    pub(crate) fn bounce_clip_in_place(&mut self, target: ClipKey) {
         self.request_bounce(target, BounceMode::InPlace);
     }
 
@@ -303,7 +297,7 @@ impl AppData {
     /// 送り、 plugin host の `VocalSynthReady`（builtin の synth 世代が最新メタデータまで
     /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
     /// または plugin_id 未確定なら即 `start_clip_bounce`。
-    pub(crate) fn request_bounce(&mut self, target: ClipRef, mode: BounceMode) {
+    pub(crate) fn request_bounce(&mut self, target: ClipKey, mode: BounceMode) {
         if self.ipc.pending_clip_fx_bounce.is_some() || self.ipc.pending_vocal_synth_bounce.is_some() {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
@@ -312,12 +306,11 @@ impl AppData {
         // 待ち中の編集で index が動いても追跡できるよう stable id で退避する。
         let vocal = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
+            .track_by_id(target.track_id)
             .filter(|t| t.is_voicevox_vocal())
             .and_then(|t| {
                 let plugin_id = self.vocal_builtin_plugin_id(t)?;
-                let clip_id = t.clips.get(target.clip as usize)?.id;
+                let clip_id = t.clip_by_id(target.clip_id)?.id;
                 Some((plugin_id, t.id, clip_id))
             });
         if let Some((device_id, track_id, clip_id)) = vocal {
@@ -346,7 +339,7 @@ impl AppData {
     /// render で焼き、**新トラックに複製** + 元トラック自動ミュート (非破壊・二重再生
     /// 回避、async)。対象クリップ 1 トラックだけを isolate するので他トラックは混ざらない
     /// (旧実装は時間範囲の全ミックスを焼くバグがあった)。歌唱の合成待ちは `request_bounce` 経由。
-    pub(crate) fn bounce_clip_with_fx(&mut self, target: ClipRef) {
+    pub(crate) fn bounce_clip_with_fx(&mut self, target: ClipKey) {
         self.request_bounce(target, BounceMode::WithFx);
     }
 

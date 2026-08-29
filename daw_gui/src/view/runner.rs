@@ -27,7 +27,7 @@ use winit::event::{Ime as WinitIme, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{WindowAttributes, WindowId};
 
-use crate::app::{AppData, AppEvent, ClipRef};
+use crate::app::{AppData, AppEvent, ClipKey};
 use crate::launcher_time::RowTimeline;
 use crate::view::shortcuts::daw_shortcut_map;
 use daw_ui_platform::WinitWindow;
@@ -272,7 +272,7 @@ struct PreviewDragState {
     start_cursor_angle: f32,
     /// 操作中の image clip。 drag 中に selected_clip が切り替えられても
     /// 当初の clip を編集対象として保持。
-    target: crate::app::ClipRef,
+    target: crate::app::ClipKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,9 +593,8 @@ fn handle_preview_drag(
             let cur_rot = {
                 let content = app
                     .song_doc.song()
-                    .tracks
-                    .get(drag.target.track as usize)
-                    .and_then(|t| t.clips.get(drag.target.clip as usize))
+                    .track_by_id(drag.target.track_id)
+                    .and_then(|t| t.clip_by_id(drag.target.clip_id))
                     .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
                 match content {
                     Some(c) if matches!(kind, PreviewDragTargetKind::Text) => c
@@ -632,9 +631,8 @@ fn handle_preview_drag(
     let target = drag.target;
     let content = app
         .song_doc.song()
-        .tracks
-        .get(target.track as usize)
-        .and_then(|t| t.clips.get(target.clip as usize))
+        .track_by_id(target.track_id)
+        .and_then(|t| t.clip_by_id(target.clip_id))
         .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
     let kind = preview_drag_target_kind(app, target);
     let current = match content {
@@ -687,12 +685,11 @@ enum PreviewDragTargetKind {
     Text,
 }
 
-fn preview_drag_target_kind(app: &AppData, target: ClipRef) -> PreviewDragTargetKind {
+fn preview_drag_target_kind(app: &AppData, target: ClipKey) -> PreviewDragTargetKind {
     let content = app
         .song_doc.song()
-        .tracks
-        .get(target.track as usize)
-        .and_then(|t| t.clips.get(target.clip as usize))
+        .track_by_id(target.track_id)
+        .and_then(|t| t.clip_by_id(target.clip_id))
         .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
     match content {
         Some(common::model::ClipContent::Text(_)) => PreviewDragTargetKind::Text,
@@ -1705,6 +1702,12 @@ impl Runner {
                     // いれば対象（立ち絵 group も通常トラックも）。base group_transform は
                     // device 追加時に materialize 済なので overlay と同じ effective transform
                     // で hit-test する（枠が出れば必ず掴める）。
+                    // r.md #87: 行ごとの実効拍。`if let` の鎖に埋めるとネストが 1 段
+                    // 深くなるので手前で組む (engine が publish していない行は
+                    // `RowTimeline` が `Song.launcher` へ倒す)。
+                    let running = state.app.launcher_running_rows();
+                    let beat = state.app.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
+                    let rows = RowTimeline::with_running(0.0, beat, &running);
                     if state.preview_drag.is_none()
                         && let Some(cursor) = state.preview_cursor
                         && let Some(track_id) = state.app.cursor_track_id()
@@ -1712,7 +1715,7 @@ impl Runner {
                         && let Some(transform) = crate::video_fx::resolve_track_transform(
                             state.app.song_doc.song(),
                             track,
-                            &RowTimeline::at_playhead(state.app.transport.playhead_beat),
+                            &rows,
                             &state.app.transport.mod_scalars,
                         )
                     {
@@ -1942,7 +1945,10 @@ impl Runner {
         let mods = &state.app.transport.mod_scalars;
         // r.md #87: 「どの行が今なにを、どの拍で映すか」の解決器。映像 / 画像 / 字幕 /
         // グループ変換 / 映像効果が全部これを通る (書き出しは `RowTimeline::export`)。
-        let rows = RowTimeline::preview(playhead_beat);
+        // engine の走行状態を差す (フォローアクションで移った先まで絵が追う)。
+        // publish されていない行は `RowTimeline` が `Song.launcher` へ倒す。
+        let running = state.app.launcher_running_rows();
+        let rows = RowTimeline::with_running(0.0, playhead_beat, &running);
         let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(song, &rows);
         let project_dir = state
             .app
@@ -2104,8 +2110,8 @@ impl Runner {
             .app
             .selected_clip_ref()
             .and_then(|cref| {
-                let track = song.tracks.get(cref.track as usize)?;
-                let clip = track.clips.get(cref.clip as usize)?;
+                let track = song.track_by_id(cref.track_id)?;
+                let clip = track.clip_by_id(cref.clip_id)?;
                 let content = song.clip_contents.get(&clip.content_id)?;
                 if let Some(events) = content.image_events() {
                     let ev = events.first()?;
@@ -2136,8 +2142,8 @@ impl Runner {
         // 判定条件（owning track の parent_group_id ∈ active_groups）は子を
         // group へ bucket する partition（上の image_frames ループ）と同一。
         let selection_group = state.app.selected_clip_ref().and_then(|cref| {
-            let track = song.tracks.get(cref.track as usize)?;
-            let clip = track.clips.get(cref.clip as usize)?;
+            let track = song.track_by_id(cref.track_id)?;
+            let clip = track.clip_by_id(cref.clip_id)?;
             let content = song.clip_contents.get(&clip.content_id)?;
             // text overlay は group 合成パスに乗らないので image の子のみ写像。
             content.image_events()?;

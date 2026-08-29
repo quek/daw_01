@@ -16,6 +16,8 @@ pub(crate) fn build(
     app: &AppData,
     tracks: &[ArrangementTrack],
     master_lanes: &[ArrangementAutomationLane],
+    // content ごとの参照数 (`view_build` が 1 度だけ作る表)。
+    refcounts: &HashMap<common::model::ContentId, usize>,
 ) -> LauncherView {
     let song = app.song_doc.song();
     let scenes: Vec<LauncherSceneView> = song
@@ -54,7 +56,7 @@ pub(crate) fn build(
                 track: MASTER_TRACK_ID,
                 lane: lane.id,
             }),
-            lane_row(ml, lane, song),
+            lane_row(ml, lane, song, refcounts),
         );
     }
 
@@ -76,10 +78,11 @@ pub(crate) fn build(
                         mt, &sc.clip,
                     )),
                     muted: sc.clip.muted,
-                    linked: content_refcount(song, sc.clip.content_id) >= 2,
+                    linked: is_shared(refcounts, sc.clip.content_id),
                     follow: sc.launch.follow.enabled,
                     content_offset_beats: sc.clip.content_offset_beats,
                     len_beats: sc.clip.length_beats,
+                    looping: sc.launch.looping,
                     curve: Vec::new(),
                 },
             );
@@ -102,10 +105,14 @@ pub(crate) fn build(
                     track: t.id,
                     lane: lane.id,
                 }),
-                lane_row(ml, lane, song),
+                lane_row(ml, lane, song, refcounts),
             );
         }
     }
+
+    // engine の走行状態を最後に被せる (`Song` は「撃った起点」しか持たないので、
+    // フォローアクションで移った先はこちらにしか出ない)。
+    let progress = apply_running(app, &mut rows);
 
     LauncherView {
         scenes,
@@ -114,7 +121,7 @@ pub(crate) fn build(
         width: app.ui_prefs.launcher_width,
         col_w: app.ui_prefs.launcher_scene_col_w,
         scroll_scene: app.ui_prefs.launcher_scroll_scene,
-        progress: build_progress(app),
+        progress,
     }
 }
 
@@ -123,6 +130,7 @@ fn lane_row(
     ml: &common::model::AutomationLane,
     lane: &ArrangementAutomationLane,
     song: &common::model::Song,
+    refcounts: &HashMap<common::model::ContentId, usize>,
 ) -> LauncherRowView {
     let mut cells: HashMap<u32, LauncherCellView> = HashMap::new();
     for sc in &ml.session_clips {
@@ -150,10 +158,11 @@ fn lane_row(
                 name: Arc::from(song.content_name(sc.clip.content_id)),
                 color: lane.color,
                 muted: false,
-                linked: content_refcount(song, sc.clip.content_id) >= 2,
+                linked: is_shared(refcounts, sc.clip.content_id),
                 follow: sc.launch.follow.enabled,
                 content_offset_beats: sc.clip.content_offset_beats,
                 len_beats: sc.clip.length_beats,
+                looping: sc.launch.looping,
                 curve,
             },
         );
@@ -172,26 +181,70 @@ fn lane_row(
 /// **`all_clips()` を通す** — arrangement と launcher の両方を数えないと、リンク
 /// 表示 (`⇌`) がランチャーを跨いだ共有で出ない (同じ数え落としが保存時の GC で
 /// 「セルの中身が黙って消える」に化ける、`common/src/model/track.rs` の doc 参照)。
-fn content_refcount(song: &common::model::Song, id: common::model::ContentId) -> usize {
-    let mut n = 0usize;
-    for t in &song.tracks {
-        n += t.all_clips().filter(|c| c.content_id == id).count();
-        for lane in &t.automation_lanes {
-            n += lane.all_clips().filter(|c| c.content_id == id).count();
-        }
-    }
-    for lane in &song.song_lanes {
-        n += lane.all_clips().filter(|c| c.content_id == id).count();
-    }
-    n
+/// 共有マーク (`⇌`) の判定。**数え方の SSoT は `view_build` が 1 度だけ作る
+/// `refcount_by_content`** で、ここはそれを引くだけ (セル 1 個ごとに全クリップを
+/// 走査し直すと毎フレーム O(セル数 × クリップ数) になり、しかも数え方が 2 本に
+/// 増えて片方だけ直すと表示が食い違う)。
+fn is_shared(
+    refcounts: &HashMap<common::model::ContentId, usize>,
+    id: common::model::ContentId,
+) -> bool {
+    refcounts.get(&id).copied().unwrap_or(0) >= 2
 }
 
-/// 走行中セルの進捗 (行 → `0..1`)。
+/// engine が publish した**走行状態**を各行に被せ、進捗 (行 → `0..1`) を返す。
 ///
-/// **束 B が `common::audio_bridge` の atomic で publish するまで常に空**
-/// (計画書 §1.4: 走行位置は `Song` に入れない = 表示専用)。配線するときは
-/// **この 1 関数だけ**を差し替える — 表示側 ([`draw`](super::draw)) は
-/// 既に `Some(0..1)` を受ける形で書いてある。
-fn build_progress(_app: &AppData) -> HashMap<ArrangementRowKey, f32> {
-    HashMap::new()
+/// `Song.launcher` が持つのは「ユーザーが最後に撃った状態」= 再生の起点だけで、
+/// **フォローアクションで移った先はここにしか出ない** (計画書 §1.4)。被せないと
+/// 音だけ次のセルへ進んでグリッドが前のセルを光らせ続ける。
+///
+/// engine が publish していない行 (= 停止中 / まだ届いていない) は `Song` 側の値を
+/// そのまま使う — 起動直後や再生前でも「撃ってあるセル」が正しく光る。
+fn apply_running(
+    app: &AppData,
+    rows: &mut HashMap<ArrangementRowKey, LauncherRowView>,
+) -> HashMap<ArrangementRowKey, f32> {
+    use common::audio_bridge::{LAUNCHER_STATE_PLAYING, LAUNCHER_STATE_STOPPED};
+    let mut progress = HashMap::new();
+    for (key, row) in rows.iter_mut() {
+        let (track_id, lane_id) = match key {
+            ArrangementRowKey::Track(id) => (*id, 0),
+            ArrangementRowKey::Lane(k) => (k.track, k.lane),
+        };
+        let Some(snap) = app.launcher_running_row(track_id, lane_id) else {
+            continue;
+        };
+        row.playback = match snap.state {
+            LAUNCHER_STATE_PLAYING => {
+                common::model::RowPlayback::Launcher { clip_id: snap.playing_clip_id }
+            }
+            LAUNCHER_STATE_STOPPED => common::model::RowPlayback::LauncherStopped,
+            // `LAUNCHER_STATE_ARRANGER` と、未知の値 (= 世代違いの子プロセス)。
+            // 光らせないほうが、無関係なセルを光らせるより誤解が小さい。
+            _ => common::model::RowPlayback::Arranger,
+        };
+        if snap.state != LAUNCHER_STATE_PLAYING {
+            continue;
+        }
+        // **進捗は engine の 30Hz スカラーではなく、撃った拍から毎フレーム解く。**
+        // publish は 30Hz なので、そのまま描くと進捗バーがカクつく。位相の式は
+        // 映像 / クリップ編集面と同じ 1 本 (`launcher_time::cell_phase`) を通す
+        // ので、音・絵・帯がズレない。解けないとき (長さ 0 / まだ届いていない)
+        // だけ publish 値へ倒す。
+        let smooth = app.transport.playhead_beat.and_then(|ph| {
+            let cell = row.cells.values().find(|c| c.clip_id == snap.playing_clip_id)?;
+            let phase = crate::launcher_time::cell_phase(
+                snap.launch_beat,
+                f64::from(ph),
+                cell.len_beats,
+                cell.looping,
+            )?;
+            (cell.len_beats > 0.0).then(|| (phase / cell.len_beats) as f32)
+        });
+        let p = smooth.unwrap_or(snap.progress);
+        if p.is_finite() {
+            progress.insert(*key, p.clamp(0.0, 1.0));
+        }
+    }
+    progress
 }

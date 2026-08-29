@@ -16,6 +16,8 @@ pub mod export_range_modal;
 pub mod font_picker;
 /// r.md #87: クリップランチャーのキーボード操作と widget イベントの流し込み。
 pub mod launcher_keys;
+/// ランチャー widget の intent を `AppEvent` へ橋渡しする (view → handler の唯一の口)。
+pub mod launcher_bridge;
 pub mod load_overlay;
 pub mod loudness_report;
 pub mod master_panel;

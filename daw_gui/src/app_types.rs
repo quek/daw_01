@@ -239,7 +239,7 @@ impl ChainEntry {
 #[derive(Debug, Clone, Copy)]
 pub struct InspectorAudioEventSummary {
     /// 編集 AppEvent (`SetClipReversed` 等) の宛先 clip。
-    pub target: ClipRef,
+    pub target: ClipKey,
     pub reversed: bool,
     pub muted: bool,
     pub stretch_mode: common::model::StretchMode,
@@ -272,7 +272,7 @@ pub struct InspectorAudioEventSummary {
 /// (`docs/plan_image_automation.md` §4.3 / §5)。
 #[derive(Debug, Clone, Copy)]
 pub struct InspectorImageEventSummary {
-    pub target: ClipRef,
+    pub target: ClipKey,
     pub muted: bool,
     pub fade_in_curve: common::model::FadeCurve,
     pub fade_out_curve: common::model::FadeCurve,
@@ -589,7 +589,7 @@ pub struct InspectorModData {
 /// は dropdown 直値、 `muted` は toggle 直値。
 #[derive(Debug, Clone)]
 pub struct InspectorTextEventSummary {
-    pub target: ClipRef,
+    pub target: ClipKey,
     pub muted: bool,
     pub align: common::model::TextAlign,
     pub fade_in_curve: common::model::FadeCurve,
@@ -793,21 +793,26 @@ pub struct ExportRangePicker {
     pub framerate: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
-pub struct ClipRef {
-    pub track: u32,
-    pub clip: u32,
-}
+/// クリップ 1 つの住所。**daw_gui 独自の index ベース `ClipRef` は廃止**し、
+/// モデル側の安定 id (`ClipKey { track_id, clip_id }`) 1 本に統合した
+/// (r.md #87 — ランチャーのセルは `Track.session_clips` に居るので、
+/// `track.clips[index]` では**そもそも指せない**。id なら
+/// [`Track::all_clips`](common::model::Track::all_clips) が
+/// アレンジのクリップとセルを 1 つの id 空間として引ける)。
+///
+/// 解決は [`AppData::clip_of`](crate::state::AppData::clip_of) /
+/// `clip_of_mut` / `track_index_of` を通す (index が要るのは行レイアウトだけ)。
+pub use common::model::ClipKey;
 
-/// r.md #38: clip 内の 1 event を指す参照。 `ClipRef` (track index / clip index) の延長で、
+/// r.md #38: clip 内の 1 event を指す参照。 `ClipKey` の延長で、
 /// `event` は clip の `ClipContent` 内 event index。
 ///
 /// fade はこの粒度で編集する。 clip 単位だと複数 event を持つ clip で
 /// 「アレンジ画面で掴んだ event」 と 「実際に書き換わる event」 がずれる
 /// (旧実装は clip 内全 event に broadcast していた)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClipEventRef {
-    pub clip: ClipRef,
+    pub clip: ClipKey,
     pub event: u32,
 }
 
@@ -1180,7 +1185,7 @@ pub struct PendingClipFxBounce {
 
 /// 歌唱 bounce の合成待ち (`PrepareVocalSynth` → `VocalSynthReady`) の退避 entry。
 /// 待ち中の編集で clip index が動いても正しい clip へ bounce できるよう stable id
-/// で保持し、 `VocalSynthReady` 受信時に現在の `ClipRef` へ解決してから
+/// で保持し、 `VocalSynthReady` 受信時に現在の `ClipKey` へ解決してから
 /// `start_clip_bounce` する。
 #[derive(Debug, Clone, Copy)]
 pub struct PendingVocalSynthBounce {
@@ -1376,7 +1381,7 @@ pub enum FileDialogKind {
     ImportMidi,
     /// Audio Editor の "Add From Source..."。 取り込み先 clip と挿入位置を保持。
     AddAudioEvent {
-        clip: ClipRef,
+        clip: ClipKey,
         position_in_clip_beats: f64,
     },
 }
@@ -1394,10 +1399,9 @@ pub(crate) enum FileDialogMode {
 /// ごと返す。
 pub(crate) fn midi_content_in_clip_mut(
     song: &mut Song,
-    track_idx: usize,
-    clip_idx: usize,
+    key: ClipKey,
 ) -> Option<&mut MidiContent> {
-    let content_id = song.tracks.get(track_idx)?.clips.get(clip_idx)?.content_id;
+    let content_id = song.clip_by_key(key)?.content_id;
     match song.clip_contents.get_mut(&content_id) {
         Some(ClipContent::Midi(m)) => Some(m),
         _ => None,
@@ -1676,6 +1680,16 @@ pub enum ImportTrackTarget {
     /// 位置情報なし (File メニュー / dialog 経由)。handler ごとの既定に従う
     /// (audio = cursor track fallback、image = 一番下に新規 track)。
     NoHint,
+    /// r.md #87: ランチャーのセルへ落とした。`track_id` は **安定 id**
+    /// (アーキ不変条件 1 — index だとトラックが増減した瞬間に別の行へ落ちる)、
+    /// `scene_index` は **表示順の列** (プレースホルダ列を含むので id ではない —
+    /// 置いた瞬間に `Song::ensure_scene_at` が実体化する)。
+    LauncherCell { track_id: u32, scene_index: u32 },
+    /// r.md #87: ランチャー帯の **行が 1 つも無い余白**へ落とした。
+    /// 一番下に新しいトラックを作り、そのトラックの `scene_index` 列のセルに置く
+    /// ([`Self::NewTrackBottom`] のランチャー版 — ここを分けないと
+    /// 「セッションビューに落としたのにアレンジへ入る」になる)。
+    LauncherNewTrack { scene_index: u32 },
 }
 
 /// メディアドロップの配置先を解決する (`action_import_image` / `action_import_midi`
@@ -1690,7 +1704,14 @@ pub(crate) fn resolve_media_drop_target(target: ImportTrackTarget, n_tracks: usi
             let i = i as usize;
             (i < n_tracks).then_some(i)
         }
-        ImportTrackTarget::NewTrackBottom | ImportTrackTarget::NoHint => None,
+        // r.md #87: セルへの drop は **安定 id** で来るので、index への解決は
+        // 呼び側 (`Song::track_index_of`) が行う。ここでは「新規トラックを作る」
+        // 側へ倒さない — 呼び側が id を解決できたときだけその行に置くため、
+        // この関数からは `None` (= 位置指定なし) として扱う。
+        ImportTrackTarget::LauncherCell { .. } => None,
+        ImportTrackTarget::NewTrackBottom
+        | ImportTrackTarget::LauncherNewTrack { .. }
+        | ImportTrackTarget::NoHint => None,
     }
 }
 
@@ -2007,10 +2028,11 @@ pub(crate) fn remap_indices(remap: &[Option<u32>], idxs: &[u32]) -> Vec<u32> {
 /// 「クリップ色をトラックに揃える」(`ResetTrackClipColors`) は逆に **track-scoped** で
 /// 他 track の共有 clip を変えない — 色は per-clip 所有 (`Clip.color`) なので、 SET 伝播 /
 /// RESET track-local の両立ができる (`docs/plan_track_clip_color.md` 追加要件)。
-pub(crate) fn propagate_clip_color(tracks: &mut [Track], target: ClipRef, color: Option<[f32; 3]>) {
+pub(crate) fn propagate_clip_color(tracks: &mut [Track], target: ClipKey, color: Option<[f32; 3]>) {
     let content_id = tracks
-        .get(target.track as usize)
-        .and_then(|t| t.clips.get(target.clip as usize))
+        .iter()
+        .find(|t| t.id == target.track_id)
+        .and_then(|t| t.clip_by_id(target.clip_id))
         .map(|c| c.content_id);
     match content_id {
         Some(cid) if cid != 0 => {
@@ -2022,8 +2044,9 @@ pub(crate) fn propagate_clip_color(tracks: &mut [Track], target: ClipRef, color:
         }
         _ => {
             if let Some(clip) = tracks
-                .get_mut(target.track as usize)
-                .and_then(|t| t.clips.get_mut(target.clip as usize))
+                .iter_mut()
+                .find(|t| t.id == target.track_id)
+                .and_then(|t| t.clip_by_id_mut(target.clip_id))
             {
                 clip.color = color;
             }

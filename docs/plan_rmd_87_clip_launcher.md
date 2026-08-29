@@ -27,7 +27,7 @@ daw_01 に入れる。**「もう 1 本のタイムライン」ではなく、�
 | Q3   | シーンは**独立** (`Song.scenes`)。Arranger セクション (`Song.sections`) とは無関係 — 列を足しても曲の長さもクリップ位置も動かない                                 |
 | Q4   | セルを置けるのは**全部の行** — 通常トラック (MIDI / オーディオ / 映像 / 画像 / 字幕) と、展開したオートメーションレーンの行                                       |
 | Q5   | 既定で表示。**ヘッダとレーンの間の境界をドラッグ**して幅を変える。左端＝アレンジのみ / 中間＝両方 / 右端＝ランチャーのみ                                           |
-| Q5-b | `Ctrl+Tab` で 3 レイアウトを巡回 (両方 → ランチャーのみ → アレンジのみ)。「両方」の比率は覚えている。View メニューにも 3 項目                                    |
+| Q5-b | `Tab` で 3 レイアウトを巡回 (両方 → ランチャーのみ → アレンジのみ)。「両方」の比率は覚えている。View メニューにも 3 項目                                    |
 | Q6   | ランチャー主導の行は、**アレンジ側のクリップを減光**する (+ Switch Playback to Arranger ボタン点灯)                                                                |
 | Q7   | セルごとのローンチ設定は**左インスペクタの「ローンチ」セクション**                                                                                                 |
 | Q8   | ランチャー演奏のアレンジへの記録は**既存の Rec ボタン 1 つ**が担う (MIDI 入力録音と同時に走る)                                                                     |
@@ -258,7 +258,18 @@ LauncherStopped: 無音 (オートメーションはレーン既定値)
 ### 3.3 選択と編集
 
 - セルは `ClipKey { track_id, clip_id }` で指せるので、**選択 SSoT / undo / クリップ色 /
-  Mute / 名前 / リンク表示 / ピアノロール / オーディオエディタが追加実装ゼロで通る**。
+  Mute / 名前 / リンク表示が追加実装ゼロで通る**。
+- **ピアノロール / オーディオエディタは「ゼロ」ではなかった** (2026-08-29 実測)。編集面は
+  daw_gui 独自の `ClipRef { track: index, clip: index }` (= `track.clips` への添字) で
+  クリップを指しており、セルは `Track.session_clips` に居るので**そもそも住所が無かった**。
+  住所を安定 id 1 本へ統合して解消する:
+  - `daw_gui::ClipRef` を廃止し `common::model::ClipKey` に統合 (widget 層にあった同名の
+    mirror 型も畳む = アーキ不変条件 8)。
+  - `Track::clip_by_id` / `remove_clip_by_id`、`Song::clip_by_key(_mut)` /
+    `notes_in_clip_mut(key)` が `clips` と `session_clips` の**両方**を引く。
+  - id ↔ index 変換 (`clip_ref_of` / `clip_key_of`) は生存確認 1 本 (`live_clip_key`) へ。
+    index が要るのは行レイアウトとクリップボードの相対トラックだけで、そこは
+    `Song::track_index_of` を明示的に通す。
 - Del / Cut / Copy / Paste は `feedback_selection_action_last_wins` に従い、直近に触った面で決まる。
 
 ### 3.4 インスペクタ「ローンチ」セクション (Q7)
@@ -266,15 +277,33 @@ LauncherStopped: 無音 (オートメーションはレーン既定値)
 選択中のセルの `quantize` / `mode` / `looping` / `legato` / フォローアクション一式を
 既存 idiom (`scrubable_number` / `dropdown` / `toggle_button`) で出す。複数選択は一括変更。
 
+### 3.4-b セルの右クリックメニュー / 長さ
+
+- セル (クリップ有り): 「ピアノロール / エディタで開く」「色...」「独立化」「削除」。
+  アレンジのクリップにある操作を帯からも同じように出す。
+- 空セル: 「空のクリップを作る」(プレースホルダ列なら `ensure_scene_at` で実体化)。
+- セルは格子の中の固定サイズで**掴む端が無い**ので、長さ (= ループ長) は
+  インスペクタ「ローンチ」の数値欄が唯一の口。新規セルは拍子から 1 小節ぶん。
+- **オーディオをセルへ落としたら小節にフィットさせる** — いちばん近い小節数へ丸め、
+  その長さへ time-stretch する (`source_*_frames` は動かさないので中身は全部鳴る)。
+  アレンジのレーンへ落としたときは実長のまま。
+
 ### 3.5 トランスポート / メニュー / ショートカット
 
 - トランスポートに**グローバルローンチ量子化**の dropdown (既定 = 1 小節) と
   「アレンジに戻す (全行)」ボタン。
-- View メニュー: 「両方 / ランチャーのみ / アレンジのみ」の 3 項目。`Ctrl+Tab` で巡回。
+- View メニュー: 「両方 / ランチャーのみ / アレンジのみ」の 3 項目。`Tab` で巡回。
+  daw-ui core の default binding にある `tab_next` / `tab_prev` (Tab focus traversal) は、
+  `Ui::focusable` の登録が daw_gui / daw-ui widget に 1 つも無く**実挙動が無かった**ので
+  `SHORTCUTS` から宣言ごと落とし、`Tab` を巡回に充てた (Ableton と同じ操作感)。
 - キーボード: 矢印でセル選択移動、`Enter` で発火、`Delete` で削除、`Ctrl+D` で複製。
-- MIDI: `MidiBinding` を **CC だけでなくノートも受ける**よう拡張し、`BindingTarget` に
-  `LaunchCell` / `LaunchScene` / `StopRow` / `StopAll` / `SwitchToArranger` を追加
-  (パッドコントローラで撃てないランチャーは半分の機能しかない)。
+- MIDI: `MidiBinding` の入力を **CC 固定からノートも受ける形** (`MidiBindInput`) へ広げ、
+  `BindingTarget` に `LaunchCell` / `LaunchScene` / `StopLauncherRow` /
+  `StopAllLauncherRows` / `SwitchRowToArranger` / `SwitchAllToArranger` を追加する。
+  **表は `Song.midi_bindings` 1 本**に保つ (パラメータ用と別表にすると「この CC を何に
+  割り当てたか」を 2 か所探すことになり、同じ入力を 2 つの意味に bind できてしまう)。
+  セルは `clip.id` ではなく `(track_id, scene_id)` で指す — パッドの物理位置は
+  「このトラックのこの列」に対応するので、セルを差し替えても同じパッドが新しいセルを撃つ。
 
 ### 3.6 映像 / 画像 / 字幕プレビュー
 

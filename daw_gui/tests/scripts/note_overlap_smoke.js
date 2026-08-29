@@ -74,11 +74,11 @@ const song = {
   next_content_id: 11,
 };
 daw.appLoadSongJson(JSON.stringify(song));
-daw.setSelection(JSON.stringify([{ track: 0, clip: 0 }]));
+daw.setSelection(JSON.stringify([{ track_id: 1, clip_id: 1 }]));
 
 // ---- 1. 末尾重なり: A[0,4) p60、B[2,4) p60 を描く → A を [0,2) にトリム ----
-daw.addNote(0, 0, 0.0, 4.0, 60); // A
-daw.addNote(0, 0, 2.0, 4.0, 60); // B (A の末尾に重なる)
+daw.addNote(1, 1, 0.0, 4.0, 60); // A
+daw.addNote(1, 1, 2.0, 4.0, 60); // B (A の末尾に重なる)
 {
   const p60 = byPitch(clipNotes(), 60);
   if (p60.length !== 2) fail("step1: expected 2 notes at p60, got " + p60.length);
@@ -89,7 +89,7 @@ daw.addNote(0, 0, 2.0, 4.0, 60); // B (A の末尾に重なる)
 }
 
 // ---- 2. 異なるピッチは重なってよい (和音): C[1,2) p62 を描く → 解消されない ----
-daw.addNote(0, 0, 1.0, 2.0, 62); // C (時間的に A/B と重なるが別ピッチ)
+daw.addNote(1, 1, 1.0, 2.0, 62); // C (時間的に A/B と重なるが別ピッチ)
 {
   const notes = clipNotes();
   assertNoOverlap(notes);

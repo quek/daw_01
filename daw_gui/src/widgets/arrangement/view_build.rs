@@ -101,9 +101,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             if let Some(c) = app
                 .song_doc
                 .song()
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
+                .track_by_id(r.track_id)
+                .and_then(|t| t.clip_by_id(r.clip_id))
                 && is_shared(c.content_id)
             {
                 set.insert(c.content_id);
@@ -260,7 +259,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         .selection
         .selected_clips
         .iter()
-        .map(|k| ClipKey { track: k.track_id, clip: k.clip_id })
+        .map(|k| ClipKey { track_id: k.track_id, clip_id: k.clip_id })
         .collect();
 
     let selected_tracks: Vec<u32> = app.selection.selected_track_ids.clone();
@@ -364,7 +363,12 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         })
         .collect();
 
-    let launcher = super::launcher::build::build(app, &tracks, &master_row.automation_lanes);
+    let launcher = super::launcher::build::build(
+        app,
+        &tracks,
+        &master_row.automation_lanes,
+        &refcount_by_content,
+    );
 
     BuiltArrangement {
         tracks,

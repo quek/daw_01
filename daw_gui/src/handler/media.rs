@@ -50,7 +50,7 @@ impl AppData {
     /// snapshot が積まれる。
     pub fn action_open_audio_event_dialog(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         position_in_clip_beats: f64,
     ) {
         let dialog = rfd::FileDialog::new()
@@ -90,7 +90,9 @@ impl AppData {
         // 要する Track/NoHint で track が 0 本なら取り込めない (NewTrackBottom は除く)。
         let n_tracks = self.song_doc.song().tracks.len();
         let fixed_dest: Option<usize> = match target {
-            ImportTrackTarget::NewTrackBottom => None,
+            // どちらも「一番下に新しいトラックを作る」。違うのは置き場所だけ
+            // (アレンジのレーン / ランチャーのセル) で、それは `cell_index` が決める。
+            ImportTrackTarget::NewTrackBottom | ImportTrackTarget::LauncherNewTrack { .. } => None,
             ImportTrackTarget::Track(i) => {
                 if n_tracks == 0 {
                     self.ui_ephemeral.status_message =
@@ -98,6 +100,11 @@ impl AppData {
                     return;
                 }
                 Some((i as usize).min(n_tracks - 1))
+            }
+            // セルへの drop は **安定 id** で来る。解決できない (消えた) なら
+            // 一番下に新規トラックを作る側へ倒す。
+            ImportTrackTarget::LauncherCell { track_id, .. } => {
+                self.song_doc.song().track_index_of(track_id)
             }
             ImportTrackTarget::NoHint => {
                 if n_tracks == 0 {
@@ -126,6 +133,9 @@ impl AppData {
         // NewTrackBottom: 最初の成功ファイルで作った bottom track の index を覚え、
         // 2 ファイル目以降は同じ track に順送りで積む (track + clip1 が 1 undo step)。
         let mut bottom_idx: Option<usize> = None;
+        // セルへの drop で 2 ファイル目以降を右の列へ送る量 (arrangement の
+        // `next_start_beat` と同じ役割)。
+        let mut cell_offset = 0usize;
 
         for path in paths {
             let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
@@ -141,18 +151,28 @@ impl AppData {
 
             let prev_bottom = bottom_idx;
             let track_name = new_track_name.clone();
+            // 落とし先の列 (表示順 index)。`song` を要らないのでループ側で解く
+            // (edit_song の閉包の中に入れるとネストが 1 段深くなる)。
+            let cell_index = import_cell_index(target, cell_offset);
             let Some((source_id, dest_idx)) = self.edit_song(|song| {
                 let source_id = song.alloc_audio_source_id();
                 song.media.audio_sources.insert(source_id, imported.source);
+
+                // r.md #87: セルへ落としたファイルは小節にフィットさせる
+                // (`cell_place_len` の doc)。
+                let (place_len, stretch_mode) =
+                    cell_place_len(cell_index.is_some(), length_beats, song.time_sig);
 
                 // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
                 let event = AudioEvent {
                     id: 1,
                     source_id,
                     event_start_in_clip_beats: 0.0,
-                    event_length_beats: length_beats,
+                    // 素材全体 (`source_*_frames`) を `place_len` 拍に写す。
+                    event_length_beats: place_len,
                     source_start_frames: 0,
                     source_end_frames: imported.buffer.frames,
+                    stretch_mode,
                     ..AudioEvent::default()
                 };
                 let content_id = song.alloc_content(
@@ -179,17 +199,17 @@ impl AppData {
                         }
                     },
                 };
-                let track = &mut song.tracks[dest_idx];
-                let new_clip_id = track.alloc_clip_id();
-                track.clips.push(Clip {
-                    id: new_clip_id,
-                    start_beat: next_start_beat,
-                    length_beats,
+                // r.md #87: ランチャーのセルへ落としたときは **arrangement ではなく
+                // その行のセル**に置く。列は表示順 index で来るので、ここで
+                // `ensure_scene_at` が実体化する (load 時に列を補わない規約のまま)。
+                let cell_scene = cell_index.map(|i| song.ensure_scene_at(i));
+                place_audio_clip(
+                    &mut song.tracks[dest_idx],
+                    cell_scene,
+                    next_start_beat,
+                    place_len,
                     content_id,
-                    color: None,
-                    auto_lipsync: false,
-                    ..Default::default()
-                });
+                );
                 (source_id, dest_idx)
             }) else {
                 return;
@@ -199,6 +219,7 @@ impl AppData {
             }
             self.media.audio_source_cache.insert(source_id, imported.buffer.clone());
             next_start_beat += length_beats;
+            cell_offset += 1;
             imported_ok += 1;
         }
 
@@ -455,8 +476,15 @@ impl AppData {
         // 貼り付ける (= ドロップしたトラックに追加)。 track の無い下の余白 drop
         // (`NewTrackBottom`) や dialog 経由 (`NoHint`) は一番下に新規 track を作って
         // 貼る (r.md #31: 以前は arrangement 先頭 index 0 への insert だった)。
-        let dest_track_idx: Option<usize> =
-            resolve_media_drop_target(target, self.song_doc.song().tracks.len());
+        // r.md #87: セルへの drop は安定 id なので、まず id → index を解く。
+        let cell_track_idx = match target {
+            ImportTrackTarget::LauncherCell { track_id, .. } => {
+                self.song_doc.song().track_index_of(track_id)
+            }
+            _ => None,
+        };
+        let dest_track_idx: Option<usize> = cell_track_idx
+            .or_else(|| resolve_media_drop_target(target, self.song_doc.song().tracks.len()));
 
         // drag&drop の drop 位置 (`target_beat`) を最優先。 無いとき (dialog 経由)
         // は従来挙動: 既存 track に貼るときは playhead を seed に順送り配置
@@ -473,6 +501,8 @@ impl AppData {
 
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
+        // セルへの drop で 2 枚目以降を右の列へ送る量 (audio import と同じ役割)。
+        let mut cell_offset = 0usize;
         for path in &paths {
             let imported = match crate::import_image::import_one_image(
                 path,
@@ -489,6 +519,7 @@ impl AppData {
             // bgra length matches width * height * 4 by construction of
             // `import_one_image`; re-fetch dims from the source we just
             // inserted so the staging matches.
+            let cell_idx = import_cell_index(target, cell_offset);
             let Some((image_source_id, src_w, src_h)) = self.edit_song(|song| {
                 let image_source_id = song.alloc_image_source_id();
                 song.media.image_sources.insert(image_source_id, imported.source);
@@ -552,23 +583,22 @@ impl AppData {
                         song.tracks.len() - 1
                     }
                 };
-                let track = &mut song.tracks[place_idx];
-                let i_clip_id = track.alloc_clip_id();
-                track.clips.push(Clip {
-                    id: i_clip_id,
-                    start_beat: next_start_beat,
-                    length_beats: image_clip_length_beats,
-                    content_id: i_content_id,
-                    color: None,
-                    auto_lipsync: false,
-                    ..Default::default()
-                });
+                // r.md #87: セルへ落としたときは **アレンジではなくその行のセル**へ。
+                place_new_clip(
+                    song,
+                    place_idx,
+                    cell_idx,
+                    next_start_beat,
+                    image_clip_length_beats,
+                    i_content_id,
+                );
             });
             // 既存 track に複数枚貼るときだけ順送り。 新規 track 経路は各画像が
             // 自分の track を持つので beat 0 固定 (従来挙動)。
             if dest_track_idx.is_some() {
                 next_start_beat += image_clip_length_beats;
             }
+            cell_offset += 1;
             imported_ok += 1;
         }
 
@@ -635,9 +665,9 @@ impl AppData {
         };
 
         // create_clip と同様、 生成直後の clip を選択して inspector に出す。
-        let r = ClipRef {
-            track: track_idx as u32,
-            clip: new_clip_idx,
+        let r = ClipKey {
+            track_id: track_idx as u32,
+            clip_id: new_clip_idx,
         };
         self.set_single_clip_selection(r);
         self.selection.selected_notes.clear();
@@ -854,18 +884,17 @@ impl AppData {
                             }
                         }
                     };
-                    let track = &mut song.tracks[dest_idx];
-                    let clip_id = track.alloc_clip_id();
+                    // r.md #87: セルへ落としたら **アレンジではなくセル**へ置く。
+                    // SMF が複数トラックを作る場合も同じ列に 1 つずつ並べる。
                     let start_beat = drop_beat + win_start;
                     let length_beats = win_end - win_start;
-                    track.clips.push(Clip {
-                        id: clip_id,
-                        start_beat,
-                        length_beats,
+                    place_new_midi_clip(
+                        song,
+                        dest_idx,
+                        import_cell_index(target, 0),
+                        (start_beat, length_beats, win_start),
                         content_id,
-                        content_offset_beats: win_start,
-                        ..Default::default()
-                    });
+                    );
                     song_end = song_end.max(start_beat + length_beats);
                     placed_clips += 1;
                     notes_total += ptrack.notes.len();
@@ -997,4 +1026,161 @@ fn install_song_tempo_lane(
         content_offset_beats: 0.0,
     });
     end_beat
+}
+
+/// 取り込んだオーディオを配置する。**列 (`cell_scene`) が `Some` ならランチャーの
+/// セル、`None` ならアレンジのクリップ**。セルは「撃った瞬間」が原点なので開始拍を
+/// 持たない (`SessionClip::clip` の契約)。同じ列に既にセルがあれば置き換える
+/// (ドロップは上書きの意味)。
+fn place_audio_clip(
+    track: &mut common::model::Track,
+    cell_scene: Option<u32>,
+    start_beat: f64,
+    length_beats: f64,
+    content_id: common::model::ContentId,
+) {
+    let id = track.alloc_clip_id();
+    place_imported_clip(
+        track,
+        cell_scene,
+        Clip {
+            id,
+            start_beat,
+            length_beats,
+            content_id,
+            color: None,
+            auto_lipsync: false,
+            ..Default::default()
+        },
+    );
+}
+
+/// 取り込んだ 1 クリップを `track_idx` の行へ置く (アレンジ / セル共通)。
+/// `cell_index` が `Some` ならその表示順の列を実体化してセルにする。
+fn place_new_clip(
+    song: &mut common::model::Song,
+    track_idx: usize,
+    cell_index: Option<usize>,
+    start_beat: f64,
+    length_beats: f64,
+    content_id: common::model::ContentId,
+) {
+    let cell_scene = cell_index.map(|i| song.ensure_scene_at(i));
+    let Some(track) = song.tracks.get_mut(track_idx) else {
+        return;
+    };
+    let id = track.alloc_clip_id();
+    place_imported_clip(
+        track,
+        cell_scene,
+        Clip {
+            id,
+            start_beat,
+            length_beats,
+            content_id,
+            color: None,
+            auto_lipsync: false,
+            ..Default::default()
+        },
+    );
+}
+
+/// [`place_new_clip`] の MIDI 版 (窓の開始 `content_offset_beats` を持つ)。
+/// `span` = `(start_beat, length_beats, content_offset_beats)`。
+fn place_new_midi_clip(
+    song: &mut common::model::Song,
+    track_idx: usize,
+    cell_index: Option<usize>,
+    span: (f64, f64, f64),
+    content_id: common::model::ContentId,
+) {
+    let cell_scene = cell_index.map(|i| song.ensure_scene_at(i));
+    let Some(track) = song.tracks.get_mut(track_idx) else {
+        return;
+    };
+    let id = track.alloc_clip_id();
+    place_imported_clip(
+        track,
+        cell_scene,
+        Clip {
+            id,
+            start_beat: span.0,
+            length_beats: span.1,
+            content_id,
+            content_offset_beats: span.2,
+            ..Default::default()
+        },
+    );
+}
+
+/// セルへ落とすときの長さと伸縮モード。
+///
+/// **セルの長さ = ループ長**なので、素材の実長 (端数拍) のままだとループが小節から
+/// ずれて曲と合わない。いちばん近い小節数へ丸め、その長さへ time-stretch する
+/// (`source_*_frames` は動かさないので中身は全部鳴る)。端数が無ければ `Raw` の
+/// まま無加工。アレンジのレーンへ落としたときは実長のまま (従来どおり)。
+#[must_use]
+fn cell_place_len(
+    into_cell: bool,
+    natural_beats: f64,
+    time_sig: (u8, u8),
+) -> (f64, common::model::StretchMode) {
+    if !into_cell {
+        return (natural_beats, common::model::StretchMode::Raw);
+    }
+    let fit = fit_to_bars(natural_beats, time_sig);
+    let mode = if (fit - natural_beats).abs() > 1e-6 {
+        common::model::StretchMode::Stretch
+    } else {
+        common::model::StretchMode::Raw
+    };
+    (fit, mode)
+}
+
+/// 素材の長さ (拍) を **いちばん近い小節数** に丸める (最低 1 小節)。
+///
+/// ランチャーのセルはこの長さでループするので、端数拍のままだと曲の小節と
+/// ずれ続ける。丸めた長さへ time-stretch して「撃てばそのまま合う」状態にする。
+#[must_use]
+fn fit_to_bars(natural_beats: f64, time_sig: (u8, u8)) -> f64 {
+    let bar = common::model::beats_per_bar(time_sig);
+    if !natural_beats.is_finite() || natural_beats <= 0.0 || bar <= 0.0 {
+        return bar.max(1.0);
+    }
+    let bars = (natural_beats / bar).round().max(1.0);
+    bars * bar
+}
+
+/// 取り込んだクリップを行へ置く **唯一の口**。
+///
+/// `cell_scene` が `Some` ならランチャーのセルとして置く (`start_beat` は捨てて
+/// 0 — セルは「撃った瞬間」を原点にする契約)。置き換えは `put_session_clip` を
+/// 通すので、**鳴っているセルの上に落としても主導権が新しい id へ移り、音が
+/// 止まらない**。取り込み経路 (オーディオ / 画像 / MIDI) は全部ここを通すこと —
+/// 経路ごとに `clips.push` を手写しすると、その経路だけセルに落ちない。
+pub(crate) fn place_imported_clip(
+    track: &mut common::model::Track,
+    cell_scene: Option<u32>,
+    clip: Clip,
+) {
+    match cell_scene {
+        Some(scene_id) => track.put_session_clip(common::model::SessionClip {
+            scene_id,
+            clip: Clip { start_beat: 0.0, ..clip },
+            launch: common::model::LaunchSettings::default(),
+        }),
+        None => track.clips.push(clip),
+    }
+}
+
+/// 取り込み先の列 (表示順 index)。ランチャーのセル / 新規トラック行への drop の
+/// ときだけ `Some`。`offset` は同じ drop 内の 2 件目以降を右の列へ送る量。
+pub(crate) fn import_cell_index(target: ImportTrackTarget, offset: usize) -> Option<usize> {
+    match target {
+        ImportTrackTarget::LauncherCell { scene_index, .. }
+        | ImportTrackTarget::LauncherNewTrack { scene_index } => {
+            Some(scene_index as usize + offset)
+        }
+        _ => None,
+    }
 }

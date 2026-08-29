@@ -104,6 +104,21 @@ fn default_true() -> bool {
     true
 }
 
+/// [`FollowAction`] の欠損フィールド用の既定 (`Default` と同じ値)。
+/// **1 つでも欠けた JSON でプロジェクト全体の読み込みが落ちる**のを防ぐ
+/// (前方互換の方針は他の型と同じ)。
+fn default_chance_a() -> u8 {
+    100
+}
+
+fn default_follow_time_beats() -> f64 {
+    4.0
+}
+
+fn default_multiplier() -> u8 {
+    1
+}
+
 impl Default for LaunchSettings {
     fn default() -> Self {
         Self {
@@ -225,17 +240,22 @@ pub struct FollowAction {
     /// `false` = フォローアクションなし (既定)。
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub a: FollowActionKind,
+    #[serde(default)]
     pub b: FollowActionKind,
     /// `a` を選ぶ確率 (%)。`b` は `100 - chance_a`。
+    #[serde(default = "default_chance_a")]
     pub chance_a: u8,
     /// `true` (Linked、既定) = クリップ終端 (`multiplier` 回ループした後) に発火。
     /// `false` (Unlinked) = `time_beats` 拍ごとに発火。
     #[serde(default = "default_true")]
     pub linked: bool,
     /// Unlinked のときの発火間隔 (拍)。既定 4 拍 (= 4/4 の 1 小節)。
+    #[serde(default = "default_follow_time_beats")]
     pub time_beats: f64,
     /// Linked のときのループ回数。`1` = 1 周で発火。
+    #[serde(default = "default_multiplier")]
     pub multiplier: u8,
 }
 
@@ -335,7 +355,7 @@ impl RowPlayback {
 /// ランチャー帯とアレンジのレーンの見せ方 (`docs/plan_rmd_87_clip_launcher.md` Q5 / Q5-b)。
 ///
 /// 境界 1 本のドラッグで 3 つとも出せる (左端 = アレンジのみ / 中間 = 両方 /
-/// 右端 = ランチャーのみ)。`Ctrl+Tab` はこの 3 つを巡回し、`Both` へ戻ったときは
+/// 右端 = ランチャーのみ)。`Tab` はこの 3 つを巡回し、`Both` へ戻ったときは
 /// [`ViewState::launcher_width`](crate::model::ViewState::launcher_width) に
 /// 覚えてある幅へ復帰する。
 ///
@@ -353,7 +373,7 @@ pub enum LauncherLayout {
 }
 
 impl LauncherLayout {
-    /// `Ctrl+Tab` の巡回順: 両方 → ランチャーのみ → アレンジのみ → 両方…
+    /// `Tab` の巡回順: 両方 → ランチャーのみ → アレンジのみ → 両方…
     #[must_use]
     pub fn cycle(self) -> Self {
         match self {
@@ -481,6 +501,51 @@ impl super::Song {
                     |c| c.clip.id,
                 );
             }
+        }
+        // 消えた列を指す `Jump` は **もう飛べない** ので `NoAction` に倒す。
+        // 残しておくと `.daw` に dangling な `scene_id` が保存され、インスペクタは
+        // 空表示になって壊れていることに気づけない。
+        let live = &live_scenes;
+        let fix = |f: &mut FollowAction| {
+            for k in [&mut f.a, &mut f.b] {
+                if let FollowActionKind::Jump { scene_id } = *k
+                    && !live.contains(&scene_id)
+                {
+                    *k = FollowActionKind::NoAction;
+                }
+            }
+        };
+        for scene in &mut self.scenes {
+            fix(&mut scene.follow);
+        }
+        for track in &mut self.tracks {
+            for cell in &mut track.session_clips {
+                fix(&mut cell.launch.follow);
+            }
+            for lane in &mut track.automation_lanes {
+                for cell in &mut lane.session_clips {
+                    fix(&mut cell.launch.follow);
+                }
+            }
+        }
+        for lane in &mut self.song_lanes {
+            for cell in &mut lane.session_clips {
+                fix(&mut cell.launch.follow);
+            }
+        }
+        // マスター行のレーン (`song_lanes`) も**ランチャーの行**として撃てる
+        // (`AppData::all_launcher_rows` が `MASTER_TRACK_ID` の行として列挙し、
+        // `automation_lane_by_key_mut` がここへ書く)。ここを落とすと、列を消しても
+        // マスターレーンのセルだけが孤児として残り、鳴っていたセルを消しても
+        // `RowPlayback` が消えた id を指したまま保存される。
+        for lane in &mut self.song_lanes {
+            normalize_row(
+                &mut lane.session_clips,
+                &mut lane.launcher,
+                &live_scenes,
+                |c| &mut c.clip.start_beat,
+                |c| c.clip.id,
+            );
         }
     }
 }

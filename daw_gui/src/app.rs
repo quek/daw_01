@@ -117,10 +117,17 @@ impl AppData {
         // (A1 r.md #8) 解決済みデバイス実サンプルレート (= bootstrap.sample_rate)。
         sample_rate: u32,
     ) -> Self {
-        let mut song = Song {
-            tracks: vec![track_with(|t| t.name = "Track 1".into())],
-            ..Song::default()
-        };
+        let mut song = Song::default();
+        // **id は必ず allocator から採る。** `Track::default()` の `id` は
+        // 「未採番」の sentinel (0) で、0 を実トラックの住所として使うと
+        // `RowKey::packed()` が 0 になり、`audio_bridge` の「空きスロット =
+        // row_key 0」規約と衝突する (= ランチャーの走行状態が 1 行も GUI へ
+        // 届かず、セルの進捗が永久に出ない)。起動直後の 1 本目でそれを踏んでいた。
+        let first_track_id = song.alloc_track_id();
+        song.tracks.push(track_with(|t| {
+            t.id = first_track_id;
+            t.name = "Track 1".into();
+        }));
         // 起動時の初期プロジェクトにも安定 project_id を採番する
         // (clipboard の同一プロジェクト判定用)。
         song.ensure_project_id();
@@ -296,7 +303,6 @@ impl AppData {
                 launcher_width: 0.0,
                 launcher_scene_col_w: 0.0,
                 launcher_scroll_scene: 0.0,
-                global_launch_quantize: common::model::DEFAULT_GLOBAL_LAUNCH_QUANTIZE,
                 piano_roll_views: std::collections::HashMap::new(),
                 plugin_editor_windows: std::collections::HashMap::new(),
                 multi_clip_view: common::model::PianoRollViewState::default(),
@@ -1244,17 +1250,11 @@ impl AppData {
                 self.select_note(note, additive);
             }
             AppEvent::ClearNoteSelection => self.selection.selected_notes.clear(),
-            AppEvent::AddNote {
-                track,
-                clip,
-                start_beat,
-                duration,
-                pitch,
-            } => {
-                self.add_note(track, clip, start_beat, duration, pitch);
+            AppEvent::AddNote { key, start_beat, duration, pitch } => {
+                self.add_note(key, start_beat, duration, pitch);
             }
-            AppEvent::ResizeNote { track, clip, note, duration } => {
-                self.resize_note(track, clip, note, duration);
+            AppEvent::ResizeNote { key, note, duration } => {
+                self.resize_note(key, note, duration);
             }
             AppEvent::SetNotePositions(entries) => {
                 self.set_note_positions(&entries);
@@ -1274,14 +1274,13 @@ impl AppData {
                 if let Some(&last) = self.selection.selected_notes.last()
                     && let Some((r, local)) = self.decode_note_id(last)
                 {
-                    if let Some(key) = self.clip_key_of(r) {
+                    if let Some(key) = self.live_clip_key(r) {
                         self.set_pianoroll_target_clip(key);
                     }
                     if let Some(dur) = self
                         .song_doc.song()
-                        .tracks
-                        .get(r.track as usize)
-                        .and_then(|t| t.clips.get(r.clip as usize))
+                        .track_by_id(r.track_id)
+                        .and_then(|t| t.clip_by_id(r.clip_id))
                         .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.duration_beats))
                     {
                         self.ui_prefs.last_note_duration_beats =
@@ -1571,6 +1570,9 @@ impl AppData {
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
+            }
+            AppEvent::LauncherRowsTick(rows) => {
+                self.on_launcher_rows_tick(rows);
             }
             AppEvent::MetricsTick {
                 dsp_load_peak,
@@ -1884,8 +1886,8 @@ impl AppData {
                 let _ = self.edit_song(|song| {
                     let mut changed = false;
                     for target in targets {
-                        if let Some(track) = song.tracks.get_mut(target.track as usize)
-                            && let Some(clip) = track.clips.get_mut(target.clip as usize)
+                        if let Some(track) = song.track_by_id_mut(target.track_id)
+                            && let Some(clip) = track.clip_by_id_mut(target.clip_id)
                             && clip.muted != muted
                         {
                             clip.muted = muted;

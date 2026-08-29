@@ -187,7 +187,7 @@ impl AppData {
             return 0;
         }
         tracks.sort_by_key(|t| t.order);
-        // audio editor は positional な ClipRef を持つので index が動く編集では貼り直す。
+        // audio editor は positional な ClipKey を持つので index が動く編集では貼り直す。
         let audio_editor_key = self.audio_editor_target_key();
         let Some(new_ids) = self.edit_song(|song| {
             let same_project = src_pid == song.project_id;
@@ -520,7 +520,7 @@ impl AppData {
         let Some(idx) = self.song_doc.song().track_index_by_id(track_id) else {
             return;
         };
-        // Audio Editor の対象は positional な `ClipRef`。 track を remove すると
+        // Audio Editor の対象は positional な `ClipKey`。 track を remove すると
         // index が詰まって **別トラックのクリップを指す** ので、 安定 key を
         // 退避しておき末尾で貼り直す (undo 経路 `after_undo_redo` と同じガード)。
         let audio_editor_key = self.audio_editor_target_key();
@@ -691,7 +691,7 @@ impl AppData {
         if a >= n || b >= n {
             return;
         }
-        // audio editor は positional な ClipRef を持つので index が動く編集では貼り直す。
+        // audio editor は positional な ClipKey を持つので index が動く編集では貼り直す。
         let audio_editor_key = self.audio_editor_target_key();
         self.edit_song(|song| song.tracks.swap(a as usize, b as usize));
         self.reanchor_audio_editor(audio_editor_key);
@@ -723,7 +723,7 @@ impl AppData {
             .tracks
             .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
-        // audio editor は positional な ClipRef を持つので index が動く編集では貼り直す。
+        // audio editor は positional な ClipKey を持つので index が動く編集では貼り直す。
         let audio_editor_key = self.audio_editor_target_key();
         // selected_clips / selected_clip は stable ClipKey 保持なので reorder
         // (track の index 変化) に自動追従する。 旧実装の id ラウンドトリップ
@@ -1006,12 +1006,11 @@ impl AppData {
             .unwrap_or_else(|| self.song_doc.song().content_name(content_id).to_string())
     }
 
-    pub(crate) fn begin_rename_clip(&mut self, target: ClipRef) {
+    pub(crate) fn begin_rename_clip(&mut self, target: ClipKey) {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
@@ -1041,9 +1040,8 @@ impl AppData {
         self.ui_ephemeral.clip_rename_text.clear();
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;

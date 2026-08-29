@@ -37,7 +37,24 @@ pub fn collect_row_midi(
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
     let bpf = beats_per_frame(current_bpm, sample_rate);
+    // 直前の区間 (`(実効拍, セル id)`)。区間の切れ目で鳴っている note を止めるのに使う。
+    let mut prev: Option<(f64, u32)> = None;
+    // 区間が届いた最後の frame。ここが `frames` に届かない = **その先は無音**。
+    let mut covered_to: u32 = 0;
     for_each_segment(src, playhead_beats, bpf, frames, |seg| {
+        // **区間の切れ目では鳴っている note を必ず止める。**
+        // ループで巻き戻る / 別のセルへ乗り換える瞬間は、次の区間の窓にその note の
+        // Off が入らない (セル末尾ぴったりの note は「窓の右端」= 排他境界に居るため
+        // 二度と出ない)。止めないと鳴りっぱなしになり、次の周の On も同じ音として
+        // 潰れて **「1 小節しか鳴らない / セル全長の note が鳴らない」** になる。
+        // アレンジのループ端で `queue_all_notes_off` がやっているのと同じ始末。
+        if let Some((prev_beat, prev_cell)) = prev
+            && (seg.beat < prev_beat || seg.cell_clip_id != prev_cell)
+        {
+            flush_active(out, active_notes, seg.start_frame);
+        }
+        prev = Some((seg.beat, seg.cell_clip_id));
+        covered_to = seg.end_frame.min(frames);
         let clips = match seg.cell_clip_id {
             0 => track.clips.as_slice(),
             id => match cell_clip(&track.session_clips, id) {
@@ -58,6 +75,13 @@ pub fn collect_row_midi(
             active_notes,
         );
     });
+    // **無音へ落ちる buffer では区間が 1 つも出ない** (行の停止 / 空セルのシーン
+    // 発火 / ワンショットの終端 / フォローアクションの Stop / セルが消えた)。
+    // 区間が来ないと上の切れ目 flush も走らないので、鳴っている note の Off が
+    // 二度と出ず**鳴りっぱなし**になる。届かなかった frame から止める。
+    if covered_to < frames {
+        flush_active(out, active_notes, covered_to);
+    }
 }
 
 /// この行のオーディオクリップを 1 buffer 分描く。
@@ -99,6 +123,20 @@ pub fn render_row_audio(
             state,
         );
     });
+}
+
+/// 鳴っている note を `at` frame で全部止める (区間の切れ目の始末)。
+///
+/// `note_id` は 0 (= 未指定) — builtin / プラグインとも key 一致で voice を止める
+/// (`process_track_owned` の `pending_offs` と同じ約束)。
+fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut Vec<u8>, at: u32) {
+    for &key in active_notes.iter() {
+        out.push(TimedNoteEvent {
+            time: at,
+            event: crate::sequencer::NoteTransition::Off { note_id: 0, key },
+        });
+    }
+    active_notes.clear();
 }
 
 /// オートメーションレーン行の値。
@@ -250,6 +288,97 @@ mod tests {
             )),
             "窓の外の note が鳴った: {out:?}"
         );
+    }
+
+    /// **セルいっぱいの長さの note** (4 拍セルに 0..4 の note) が鳴り、
+    /// ループ端でちゃんと Off → On が出る。
+    #[test]
+    fn セル全長の_note_が鳴りループ端で撃ち直される() {
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent {
+                notes: vec![Note {
+                    id: 1,
+                    start_beat: 0.0,
+                    duration_beats: 4.0,
+                    pitch: 60,
+                    ..Note::default()
+                }],
+                next_note_id: 2,
+            }),
+        );
+        let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
+        // 撃った直後の buffer: On が出る。
+        let mut out = Vec::with_capacity(256);
+        let mut active = Vec::with_capacity(256);
+        collect_row_midi(Some(&song), 0, src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        assert!(
+            out.iter().any(|e| matches!(
+                e.event,
+                crate::sequencer::NoteTransition::On { key: 60, .. }
+            )),
+            "セル全長の note が鳴らない: {out:?}"
+        );
+        // ループ端を跨ぐ buffer: Off と次の周の On が両方出る。
+        let mut out = Vec::with_capacity(256);
+        collect_row_midi(Some(&song), 0, src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
+        assert!(
+            out.iter().any(|e| matches!(
+                e.event,
+                crate::sequencer::NoteTransition::Off { key: 60, .. }
+            )),
+            "ループ端で Off が出ない (= 鳴りっぱなし): {out:?}"
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e.event,
+                crate::sequencer::NoteTransition::On { key: 60, .. }
+            )),
+            "次の周の On が出ない: {out:?}"
+        );
+    }
+
+    /// **frame グリッドに乗らない発火拍でも、セル頭の note が毎周鳴る。**
+    /// 区間の開始拍は frame 境界の切り上げのぶん原点をわずかに越えるので、
+    /// 吸着 (`snap_to_cell_origin`) が無いと content 拍 0 の note が
+    /// 「撃った瞬間」も「2 周目以降」も丸ごと落ちる (キックが消える)。
+    #[test]
+    fn 発火拍が_frame_境界に乗らなくてもセル頭の_note_が毎周鳴る() {
+        let song = song_with_cell();
+        // 4 拍のセルを **中途半端な拍**で撃つ。
+        let launch = 1.234_567;
+        let src = RowTimeSource::uniform(RowKey::track(1), {
+            RowPhase::Cell {
+                clip_id: 5,
+                launch_beat: launch,
+                loop_len: 4.0,
+                cell_start_beat: 0.0,
+                looping: true,
+            }
+        });
+        // 120 BPM / 48 kHz / 512 frame = 0.0213333… 拍。
+        let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
+        let mut active = Vec::with_capacity(256);
+        let mut ons = 0usize;
+        let mut beat = launch;
+        // 3 周ぶん (原点は 0 / 4 / 8 拍の 3 回) 刻む。11 拍で止めるのは、
+        // 12 拍ちょうどまで回すと 4 周目の原点も窓に入るから。
+        while beat < launch + 11.0 {
+            let mut out = Vec::with_capacity(64);
+            collect_row_midi(
+                Some(&song), 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
+            );
+            ons += out
+                .iter()
+                .filter(|e| {
+                    matches!(e.event, crate::sequencer::NoteTransition::On { key: 60, .. })
+                })
+                .count();
+            beat += bpf;
+        }
+        assert_eq!(ons, 3, "3 周ぶん刻んだらセル頭の note は 3 回鳴る");
     }
 
     /// アレンジ行はセルを 1 つも見ない (= 供給元の切り替えが効いている)。

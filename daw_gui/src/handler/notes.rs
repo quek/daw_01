@@ -26,8 +26,8 @@ impl AppData {
         if self.selection.selected_notes.is_empty() {
             return None;
         }
-        let track = self.song_doc.song().tracks.get(r.track as usize)?;
-        let clip = track.clips.get(r.clip as usize)?;
+        let track = self.song_doc.song().track_by_id(r.track_id)?;
+        let clip = track.clip_by_id(r.clip_id)?;
         let notes = self.song_doc.song().clip_notes(clip);
         let mut copied: Vec<Note> = self
             .selection.selected_notes
@@ -76,7 +76,7 @@ impl AppData {
         // 貼り付け先 clip が実在しなければ (edit 前に判定して) spurious な
         // undo snapshot を積まない。
         let Some(local_sel) = self.edit_song(|song| {
-            let dest = midi_content_in_clip_mut(song, r.track as usize, r.clip as usize)?;
+            let dest = midi_content_in_clip_mut(song, r)?;
             let mut new_indices = Vec::with_capacity(notes.len());
             for src in &mut notes {
                 src.start_beat += anchor;
@@ -108,7 +108,7 @@ impl AppData {
             return;
         }
         let _ = self.edit_song(|song| {
-            let Some(notes) = song.notes_in_clip_mut(r.track as usize, r.clip as usize) else {
+            let Some(notes) = song.notes_in_clip_mut(r) else {
                 return false;
             };
             let Some(note) = notes.get_mut(note_idx as usize) else {
@@ -134,7 +134,7 @@ impl AppData {
             |app, _slot, r, items| {
                 app.edit_song(|song| {
                     if let Some(notes) =
-                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                        song.notes_in_clip_mut(r)
                     {
                         for &(local, vel) in items {
                             if let Some(note) = notes.get_mut(local) {
@@ -224,9 +224,8 @@ impl AppData {
             let Some(clip) = self
                 .song_doc
                 .song()
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
+                .track_by_id(r.track_id)
+                .and_then(|t| t.clip_by_id(r.clip_id))
             else {
                 continue;
             };
@@ -387,9 +386,8 @@ impl AppData {
                 .and_then(|t| {
                     self.song_doc
                         .song()
-                        .tracks
-                        .get(t.track as usize)
-                        .and_then(|tr| tr.clips.get(t.clip as usize))
+                        .track_by_id(t.track_id)
+                        .and_then(|tr| tr.clip_by_id(t.clip_id))
                 })
                 .map_or(0.0, |c| c.start_beat)
         };
@@ -421,17 +419,16 @@ impl AppData {
     }
 
     /// 選択のアンカー (= `selected_notes` の末尾、`SetNoteSelection` が anchor として扱う音) を
-    /// `(packed id, 所属 ClipRef, start_beat, duration_beats, pitch)` で返す。
-    fn anchor_selected_note(&self) -> Option<(u32, ClipRef, f64, f64, u8)> {
+    /// `(packed id, 所属 ClipKey, start_beat, duration_beats, pitch)` で返す。
+    fn anchor_selected_note(&self) -> Option<(u32, ClipKey, f64, f64, u8)> {
         let &id = self.selection.selected_notes.last()?;
         let shown = self.shown_pianoroll_clips();
         let (r, local) = Self::decode_note_id_in(&shown, id)?;
         let clip = self
             .song_doc
             .song()
-            .tracks
-            .get(r.track as usize)
-            .and_then(|t| t.clips.get(r.clip as usize))?;
+            .track_by_id(r.track_id)
+            .and_then(|t| t.clip_by_id(r.clip_id))?;
         let n = self.song_doc.song().clip_notes(clip).get(local)?;
         Some((id, r, n.start_beat, n.duration_beats, n.pitch))
     }
@@ -453,8 +450,7 @@ impl AppData {
         let Some(track_id) = self
             .song_doc
             .song()
-            .tracks
-            .get(r.track as usize)
+            .track_by_id(r.track_id)
             .map(|t| t.id)
         else {
             return;
@@ -554,10 +550,10 @@ impl AppData {
                 "Scale が設定されていません (Transport bar の Key dropdown で設定)".to_string();
             return;
         }
-        let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
+        let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
             return;
         };
-        let Some(clip) = track.clips.get(r.clip as usize) else {
+        let Some(clip) = track.clip_by_id(r.clip_id) else {
             return;
         };
         // r.md #44: note は content-local なので song-absolute 化は content 原点基準。
@@ -602,7 +598,7 @@ impl AppData {
         let winners: Vec<u32> = snaps.iter().map(|&(i, _)| i).collect();
         let remap = self
             .edit_song(move |song| {
-                let notes = song.notes_in_clip_mut(r.track as usize, r.clip as usize)?;
+                let notes = song.notes_in_clip_mut(r)?;
                 for (i, new_pitch) in snaps {
                     if let Some(n) = notes.get_mut(i as usize) {
                         n.pitch = new_pitch;
@@ -621,15 +617,14 @@ impl AppData {
 
     pub(crate) fn add_note(
         &mut self,
-        track_idx: u32,
-        clip_idx: u32,
+        key: ClipKey,
         start_beat: f64,
         duration: f64,
         pitch: u8,
     ) {
         // r.md #64: ロック中トラックへは鉛筆 / Insert でも描けない
         // (既存ノートが掴めないのに新規だけ描ける、 という判定の食い違いを消す)。
-        if self.reject_write_if_pianoroll_locked(ClipRef { track: track_idx, clip: clip_idx }) {
+        if self.reject_write_if_pianoroll_locked(key) {
             return;
         }
         let start_beat = start_beat.max(0.0);
@@ -640,9 +635,7 @@ impl AppData {
         let pitch = if self.ui_prefs.snap_on_draw {
             let clip_start_beat = self
                 .song_doc.song()
-                .tracks
-                .get(track_idx as usize)
-                .and_then(|t| t.clips.get(clip_idx as usize))
+                .clip_by_key(key)
                 .map(common::model::Clip::content_origin_beat)
                 .unwrap_or(0.0);
             let global_beat = clip_start_beat + start_beat;
@@ -655,7 +648,7 @@ impl AppData {
         };
         let Some(Some(selected)) = self.edit_song(|song| {
             let content =
-                midi_content_in_clip_mut(song, track_idx as usize, clip_idx as usize)?;
+                midi_content_in_clip_mut(song, key)?;
             // v29: 新規 note は allocator で安定 id を採番する。
             let note_id = content.alloc_note_id();
             let notes = &mut content.notes;
@@ -675,21 +668,15 @@ impl AppData {
         }) else {
             return;
         };
-        let r = ClipRef {
-            track: track_idx,
-            clip: clip_idx,
-        };
         // 新規ノートは「対象クリップ」(= anchor) へ入る。anchor をこのクリップに
         // 揃えるが、複数選択 (selected_clips) は **縮小しない** (複数同時表示を保持)。対象が
         // まだ選択集合に無ければ追加する (他クリップは残す)。
-        if let Some(key) = self.clip_key_of(r) {
-            self.selection.selected_clip = Some(key);
-            if !self.selection.selected_clips.contains(&key) {
-                self.selection.selected_clips.push(key);
-            }
+        self.selection.selected_clip = Some(key);
+        if !self.selection.selected_clips.contains(&key) {
+            self.selection.selected_clips.push(key);
         }
         // 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
-        self.selection.selected_notes = self.pack_clip_selection(r, &selected);
+        self.selection.selected_notes = self.pack_clip_selection(key, &selected);
         self.ui_prefs.last_note_duration_beats = duration;
     }
 
@@ -785,7 +772,7 @@ impl AppData {
                 let locals: Vec<u32> = items.iter().map(|&(local, ())| local as u32).collect();
                 let packed = app.edit_song(move |song| {
                     let Some(content) =
-                        midi_content_in_clip_mut(song, r.track as usize, r.clip as usize)
+                        midi_content_in_clip_mut(song, r)
                     else {
                         return Vec::new();
                     };
@@ -826,7 +813,7 @@ impl AppData {
                     .collect();
                 let packed = app.edit_song(move |song| {
                     let Some(content) =
-                        midi_content_in_clip_mut(song, r.track as usize, r.clip as usize)
+                        midi_content_in_clip_mut(song, r)
                     else {
                         return Vec::new();
                     };
@@ -851,21 +838,15 @@ impl AppData {
         }
     }
 
-    pub(crate) fn resize_note(
-        &mut self,
-        track_idx: u32,
-        clip_idx: u32,
-        note_idx: u32,
-        new_duration: f64,
-    ) {
+    pub(crate) fn resize_note(&mut self, key: ClipKey, note_idx: u32, new_duration: f64) {
         // r.md #64: ロック中トラックの note は編集不可 (batch 版 `resize_notes` と同じ扱い)。
-        if self.reject_write_if_pianoroll_locked(ClipRef { track: track_idx, clip: clip_idx }) {
+        if self.reject_write_if_pianoroll_locked(key) {
             return;
         }
         let new_duration = new_duration.max(common::model::MIN_NOTE_LEN_BEATS);
         let remap = self
             .edit_song(|song| {
-                let notes = song.notes_in_clip_mut(track_idx as usize, clip_idx as usize)?;
+                let notes = song.notes_in_clip_mut(key)?;
                 let note = notes.get_mut(note_idx as usize)?;
                 note.duration_beats = new_duration;
                 // リサイズした note を勝者として重なり解消。既存選択は remap で追従。
@@ -893,7 +874,7 @@ impl AppData {
                 locals.sort_unstable_by(|a, b| b.cmp(a));
                 app.edit_song(move |song| {
                     if let Some(notes) =
-                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                        song.notes_in_clip_mut(r)
                     {
                         for i in locals {
                             if i < notes.len() {
@@ -916,14 +897,13 @@ impl AppData {
         singer_name: String,
         style_name: String,
     ) {
-        let Some(r) = self.clip_ref_of(key) else {
+        let Some(r) = self.live_clip_key(key) else {
             return;
         };
         let changed = self.edit_song_checked(move |song| {
             let Some(clip) = song
-                .tracks
-                .get_mut(r.track as usize)
-                .and_then(|t| t.clips.get_mut(r.clip as usize))
+                .track_by_id_mut(r.track_id)
+                .and_then(|t| t.clip_by_id_mut(r.clip_id))
             else {
                 return false;
             };
@@ -956,14 +936,13 @@ impl AppData {
         param: TalkParamKind,
         value: f32,
     ) {
-        let Some(r) = self.clip_ref_of(key) else {
+        let Some(r) = self.live_clip_key(key) else {
             return;
         };
         let changed = self.edit_song_checked(|song| {
             let Some(clip) = song
-                .tracks
-                .get_mut(r.track as usize)
-                .and_then(|t| t.clips.get_mut(r.clip as usize))
+                .track_by_id_mut(r.track_id)
+                .and_then(|t| t.clip_by_id_mut(r.clip_id))
             else {
                 return false;
             };
@@ -1029,7 +1008,7 @@ impl AppData {
     /// commit で発行する歌詞分配 batch を、 指定 `clip_ref` 内の note に
     /// 適用。 各 entry は `(note_index, Option<String>)`、 widget 側で空文字列
     /// は `None` に正規化済み (= 歌詞削除)。 clip_ref が無効なら no-op。
-    pub(crate) fn set_note_lyrics(&mut self, clip_ref: ClipRef, updates: &[(u32, Option<String>)]) {
+    pub(crate) fn set_note_lyrics(&mut self, clip_ref: ClipKey, updates: &[(u32, Option<String>)]) {
         // r.md #64: ロック中トラックの note は編集不可。 歌詞編集 (L) は選択ノートから
         // 起動するので通常ここへ来ないが、 選択したまま L でロックすると stale な選択が
         // 残るので、 書き込み口でも塞ぐ。
@@ -1038,7 +1017,7 @@ impl AppData {
         }
         self.edit_song_checked(|song| {
             let Some(notes) =
-                song.notes_in_clip_mut(clip_ref.track as usize, clip_ref.clip as usize)
+                song.notes_in_clip_mut(clip_ref)
             else {
                 return false;
             };

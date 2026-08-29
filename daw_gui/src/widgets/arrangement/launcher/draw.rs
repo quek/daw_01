@@ -55,6 +55,8 @@ pub(crate) fn dispatch(
 ) {
     response.launcher.pane_rect = f.launcher.pane;
     response.launcher.grid_rect = f.launcher.grid;
+    response.launcher.col_w = f.launcher.col_w;
+    response.launcher.scroll_scene = f.launcher.scroll_scene;
     if f.launcher.pane.w <= 0.0 {
         return;
     }
@@ -158,8 +160,18 @@ fn head_row(
     let (first, last) = l.visible_cols();
     hctx.with_clip_rect(scene_head, |hctx| {
         for i in first..last {
-            let Some(scene) = f.launcher_view.scenes.get(i) else {
-                continue;
+            // 実体のある列はそのまま、無い列は placeholder を組んで **必ず描く**。
+            // 描かないと、シーンが 0 個のプロジェクトで見出し行が丸ごと空になり
+            // 「名前も ▶ も無い」ように見える。
+            let placeholder;
+            let scene = match f.launcher_view.scenes.get(i) {
+                Some(s) => s,
+                None => {
+                    // 色は付けない (= 見出しのクローム面と同色にして
+                    // 「まだ実体が無い列」を色ストライプの不在で示す)。
+                    placeholder = LauncherSceneView::placeholder(i, f.style.header_bg);
+                    &placeholder
+                }
             };
             let r = Rect {
                 x: l.col_x(i) + 1.0,
@@ -170,7 +182,16 @@ fn head_row(
             if r.x + r.w < scene_head.x || r.x > scene_head.x + scene_head.w {
                 continue;
             }
-            out.scene_rects.push((scene.id, r));
+            // **返す rect は見出し帯でクリップする。** 未クリップのまま返すと、
+            // 右端の部分表示列の rect がグローバル「アレンジへ返す」ボタンや
+            // つかみ代の上まで伸び、そこを右クリックするとシーンのメニューが出る
+            // (描画は clip されているので見た目と食い違う)。
+            let hit = r.intersect(scene_head);
+            if hit.w <= 1.0 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            out.scene_rects.push((scene.id, i as u32, hit));
             draw_scene_head(hctx, r, scene, f.style);
         }
     });
@@ -247,7 +268,14 @@ fn grid_rows(
                 continue;
             }
             row_buttons(hctx, f, top, row.height, view);
-            row_cells(hctx, app, tempo_map, f, row, top, view, out);
+            // **セルは格子の中だけに描く。** 帯全体でクリップすると、右端の
+            // 部分表示列が「アレンジへ返す」ボタンと幅ドラッグのつかみ代を
+            // 塗りつぶし、見えている場所 (セル) と押せる場所 (返す列 /
+            // スプリッタ) が最大 28px ズレる。
+            let grid_band = Rect { x: l.grid.x, y: l.grid.y, w: l.grid.w, h: l.grid.h };
+            hctx.with_clip_rect(grid_band, |hctx| {
+                row_cells(hctx, app, tempo_map, f, row, top, view, out);
+            });
         }
     });
 }
@@ -453,8 +481,8 @@ fn cell_content(
         .song()
         .tracks
         .iter()
-        .find(|t| t.id == clip_key.track)
-        .and_then(|t| t.session_clip_by_id(clip_key.clip))
+        .find(|t| t.id == clip_key.track_id)
+        .and_then(|t| t.session_clip_by_id(clip_key.clip_id))
     else {
         return;
     };
@@ -529,12 +557,15 @@ fn draw_group_cell(
     key: LauncherCellKey,
     col: usize,
 ) {
-    if key.scene_id == 0 {
-        return;
-    }
     let ArrangementRowKey::Track(group_id) = key.row else {
         return;
     };
+    if key.scene_id == 0 {
+        // 実体の無い列 = 空セルと同じ見た目 (押すと子行が一斉停止するので、
+        // 「押せるのに何も見えない」状態を作らない)。
+        draw_empty_cell(hctx, f, r, false);
+        return;
+    }
     let stripes: Vec<Color> = f
         .tracks
         .iter()
@@ -548,6 +579,8 @@ fn draw_group_cell(
         })
         .collect();
     if stripes.is_empty() {
+        // 子が誰もこの列にセルを持たない = 押すと一斉停止。空セルとして描く。
+        draw_empty_cell(hctx, f, r, false);
         return;
     }
     #[allow(clippy::cast_precision_loss)]
@@ -699,6 +732,17 @@ fn push_progress(hctx: &mut HeavyCtx<'_, '_, AppData>, cell: Rect, fill: Color, 
         Color::TRANSPARENT,
         1.0,
     );
+    // **セルを横切る縦線 (プレイヘッド)。** 下端の細いバーだけだと「いまセルの
+    // どこを鳴らしているか」がひと目で分からない (アレンジのレーンには縦線が
+    // 出るのに、セルだけ出ないのは非対称)。色は再生の意味色を実塗り色から
+    // 寄せるので、どの塗りの上でもコントラストが立つ
+    // (`feedback_ui_indicator_contrast_on_variable_bg`)。
+    let x = cell.x + (cell.w * t.clamp(0.0, 1.0)).clamp(0.0, (cell.w - PLAYHEAD_W).max(0.0));
+    push_filled_rect(
+        hctx,
+        Rect { x, y: cell.y + 1.0, w: PLAYHEAD_W, h: (cell.h - 2.0).max(1.0) },
+        bar,
+    );
 }
 
 // ============================================================
@@ -711,6 +755,14 @@ fn drag_overlays(
     sessions: &LauncherSessions,
 ) {
     if let Some(sr) = sessions.live_scene_reorder.as_ref() {
+        // **preview と commit は同じ閾値を使う** (`geometry::REORDER_DRAG_THRESHOLD_PX`
+        // の doc)。押しただけで線が出ると「線は出ているのに離しても動かない」に
+        // 見える (確定は 16px 動かしてから)。
+        let dx = sr.last_mouse.0 - sr.anchor_mouse.0;
+        let dy = sr.last_mouse.1 - sr.anchor_mouse.1;
+        if (dx * dx + dy * dy).sqrt() < REORDER_DRAG_THRESHOLD_PX {
+            return;
+        }
         // 落とし先の縦線 (commit と同じ `drop_scene_index` を通すので指す位置 = 着地位置)。
         let idx = drag::drop_scene_index(f, sr.last_mouse.0);
         let x = f.launcher.col_x(idx);

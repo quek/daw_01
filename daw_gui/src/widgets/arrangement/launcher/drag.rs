@@ -38,7 +38,7 @@ fn update_sessions(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
 
 /// 帯幅 drag の per-frame 反映。**端まで寄せたらレイアウトそのものを切り替える**
 /// (左端 = アレンジのみ / 右端 = ランチャーのみ、計画書 Q5)。「両方」のときの幅は
-/// `launcher_width` に覚えたままにするので、`Ctrl+Tab` で一巡して戻ると同じ幅に戻る。
+/// `launcher_width` に覚えたままにするので、`Tab` で一巡して戻ると同じ幅に戻る。
 fn emit_pane_width(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     let Some((px, _)) = f.pointer.pos else { return };
     if f.pointer.primary_just_released {
@@ -116,8 +116,10 @@ fn scroll_scenes(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
         return;
     }
     let cur = f.launcher.scroll_scene;
+    // 実シーンが 0 でも右にはプレースホルダ列が並んでいるので、最低 1 列ぶんは
+    // スクロールできる (0 だと「空の曲では横スクロールが一切効かない」)。
     #[allow(clippy::cast_precision_loss)]
-    let max = f.launcher_view.scenes.len() as f32;
+    let max = (f.launcher_view.scenes.len() as f32).max(1.0);
     let next = (cur - delta / f.launcher.col_w).clamp(0.0, max);
     if (next - cur).abs() < 1e-4 {
         return;
@@ -145,9 +147,13 @@ pub(super) fn drop_scene_index(f: &ArrangementFrame<'_>, x: f32) -> usize {
         return 0;
     }
     let l = &f.launcher;
+    // 列の**中心**を境に着地先を決める (中心より右なら 1 つ右の列)。
+    // `Song::move_scene` は remove → insert なので、指標線を「列の左端」に出す
+    // だけだと右方向のドラッグで 1 列ずれて着地する。
+    let rel = ((x - l.grid.x) / l.col_w.max(1.0) + l.scroll_scene).max(0.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let raw = ((x - l.grid.x) / l.col_w.max(1.0) + l.scroll_scene).max(0.0) as usize;
-    raw.min(n - 1)
+    let raw = (rel + 0.5).floor() as usize;
+    raw.min(n.saturating_sub(1))
 }
 
 /// session の overlay 用スナップショットと release take。

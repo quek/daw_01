@@ -253,9 +253,9 @@ impl AppData {
                                 .clips
                                 .iter()
                                 .position(|c| c.id == p.clip_id)
-                                .map(|ci| ClipRef {
-                                    track: ti as u32,
-                                    clip: ci as u32,
+                                .map(|ci| ClipKey {
+                                    track_id: ti as u32,
+                                    clip_id: ci as u32,
                                 })
                         });
                     match resolved {

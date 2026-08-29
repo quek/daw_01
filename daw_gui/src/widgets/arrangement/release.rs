@@ -140,9 +140,9 @@ pub(super) fn commit_releases(
                         let new_idx_u = new_idx.max(0) as usize;
                         let new_track_id = visible_tracks
                             .get(new_idx_u)
-                            .map_or(a.key.track, |t| t.id);
+                            .map_or(a.key.track_id, |t| t.id);
                         let moved = (new_start - a.start_beat).abs() > 1e-6
-                            || new_track_id != a.key.track;
+                            || new_track_id != a.key.track_id;
                         if moved {
                             deltas.push(MoveClipDelta {
                                 from: a.key,
@@ -160,10 +160,10 @@ pub(super) fn commit_releases(
                         // 無効のみ) で、 既に上の `compute_clip_drag_beat_delta` で適用済。
                         let req = if nd.last_ctrl && nd.last_shift {
                             Edit::mutate(move |app: &mut AppData| {
-                                let entries: Vec<(ClipRef, u32, f64)> = deltas
+                                let entries: Vec<(ClipKey, u32, f64)> = deltas
                                     .iter()
                                     .filter_map(|d| {
-                                        clip_key_to_ref(app, d.from)
+                                        live_clip_key(app, d.from)
                                             .map(|r| (r, d.to_track, d.next_start_beat))
                                     })
                                     .collect();
@@ -173,10 +173,10 @@ pub(super) fn commit_releases(
                             })
                         } else if nd.last_ctrl {
                             Edit::mutate(move |app: &mut AppData| {
-                                let entries: Vec<(ClipRef, u32, f64)> = deltas
+                                let entries: Vec<(ClipKey, u32, f64)> = deltas
                                     .iter()
                                     .filter_map(|d| {
-                                        clip_key_to_ref(app, d.from)
+                                        live_clip_key(app, d.from)
                                             .map(|r| (r, d.to_track, d.next_start_beat))
                                     })
                                     .collect();
@@ -186,10 +186,10 @@ pub(super) fn commit_releases(
                             })
                         } else {
                             Edit::mutate(move |app: &mut AppData| {
-                                let entries: Vec<(ClipRef, u32, f64)> = deltas
+                                let entries: Vec<(ClipKey, u32, f64)> = deltas
                                     .iter()
                                     .filter_map(|d| {
-                                        clip_key_to_ref(app, d.from)
+                                        live_clip_key(app, d.from)
                                             .map(|r| (r, d.to_track, d.next_start_beat))
                                     })
                                     .collect();
@@ -229,7 +229,7 @@ pub(super) fn commit_releases(
                         }
                     }
                     if !deltas.is_empty() {
-                        ui.push_edit({ let v_d = deltas; Edit::mutate(move |app: &mut AppData| { for d in &v_d { if let Some(target) = clip_key_to_ref(app, d.key) { app.handle_event(AppEvent::ResizeClip { target, start_beat: d.next_start, length: d.next_len, stretch: d.stretch }); } } }) });
+                        ui.push_edit({ let v_d = deltas; Edit::mutate(move |app: &mut AppData| { for d in &v_d { if let Some(target) = live_clip_key(app, d.key) { app.handle_event(AppEvent::ResizeClip { target, start_beat: d.next_start, length: d.next_len, stretch: d.stretch }); } } }) });
                     }
                 }
             }
@@ -245,7 +245,7 @@ pub(super) fn commit_releases(
         {
             match out {
                 // r.md #38: fade の commit 先は掴んだ **event 1 つ** (`event_index`)。
-                // 以前は ClipRef だけを載せ、 handler 側が clip 内全 event に broadcast して
+                // 以前は ClipKey だけを載せ、 handler 側が clip 内全 event に broadcast して
                 // いたため、 複数 event を持つ clip では「掴んだ event と書き換わる event」 が
                 // 一致しなかった。
                 AudioDragOutcome::FadeLength { edge, next_beats } => {
@@ -263,13 +263,13 @@ pub(super) fn commit_releases(
                         prev_beats,
                         next_beats,
                     };
-                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipEventRef, FadeEdgeKind, f64)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (ClipEventRef { clip: t, event: d.event_index }, edge, d.next_beats) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeBeatsBatch(entries)); } }) });
+                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipEventRef, FadeEdgeKind, f64)> = v_d.iter().filter_map(|d| live_clip_key(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (ClipEventRef { clip: t, event: d.event_index }, edge, d.next_beats) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeBeatsBatch(entries)); } }) });
                     }
                 }
                 AudioDragOutcome::FadeCurve { edge, next_curve } => {
                     if let Some(anchor) = ad.anchor_fade {
                     let delta = ClipFadeCurveDelta { key: ad.key, event_index: anchor.event_index, edge, next_curve };
-                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipEventRef, FadeEdgeKind, common::model::FadeCurve)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (ClipEventRef { clip: t, event: d.event_index }, edge, d.next_curve) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeCurveBatch(entries)); } }) });
+                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipEventRef, FadeEdgeKind, common::model::FadeCurve)> = v_d.iter().filter_map(|d| live_clip_key(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (ClipEventRef { clip: t, event: d.event_index }, edge, d.next_curve) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeCurveBatch(entries)); } }) });
                     }
                 }
             }
@@ -757,19 +757,19 @@ pub(super) fn commit_releases(
                     Vec::new()
                 };
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let anchor = app.selection.clip_anchor.map(clip_key_from_model);
+                    let anchor = app.selection.clip_anchor;
                     let next = modifier.resolve(&prev, hit_key, || {
                         range_block(&items, anchor?, hit_key)
                     });
                     if next != prev {
-                        let next_refs: Vec<ClipRef> =
-                            next.iter().filter_map(|key| clip_key_to_ref(app, *key)).collect();
+                        let next_refs: Vec<ClipKey> =
+                            next.iter().filter_map(|key| live_clip_key(app, *key)).collect();
                         app.handle_event(AppEvent::SetClipSelection(next_refs));
                     }
                     // アンカー更新: Single / Toggle で clicked へ、 Range は据え置き (§3.1)。
                     // `SetClipSelection` はアンカーを触らないので順序依存は無い。
                     if modifier.updates_anchor() {
-                        app.selection.clip_anchor = Some(clip_key_to_model(hit_key));
+                        app.selection.clip_anchor = Some(hit_key);
                     }
                 }));
                 response.selection_changed = true;
@@ -882,7 +882,7 @@ pub(super) fn commit_releases(
             && clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px).is_none()
             && !selected_clips.is_empty()
         {
-            ui.push_edit({ let v_next = Vec::new(); Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipRef> = v_next.iter().filter_map(|key| clip_key_to_ref(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
+            ui.push_edit({ let v_next = Vec::new(); Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipKey> = v_next.iter().filter_map(|key| live_clip_key(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
             response.selection_changed = true;
         }
 
@@ -956,7 +956,7 @@ pub(super) fn commit_releases(
                     for c in &t.clips {
                         let r = clip_to_rect(row_top, row_h, c, view, lanes);
                         if rects_intersect(r, drag_rect) {
-                            inside.push(ClipKey { track: t.id, clip: c.id });
+                            inside.push(ClipKey { track_id: t.id, clip_id: c.id });
                         }
                     }
                 }
@@ -984,7 +984,7 @@ pub(super) fn commit_releases(
                     inside // REPLACE (zero-rect なら空 = clear)
                 };
                 if next != prev {
-                    ui.push_edit({ let v_next = next; Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipRef> = v_next.iter().filter_map(|key| clip_key_to_ref(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
+                    ui.push_edit({ let v_next = next; Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipKey> = v_next.iter().filter_map(|key| live_clip_key(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
                     response.selection_changed = true;
                 }
             }
@@ -1205,7 +1205,7 @@ pub(super) fn commit_releases(
             if let Some((hit_key, _)) =
                 clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px)
             {
-                ui.push_edit({ let v_key = hit_key; Edit::mutate(move |app: &mut AppData| { if let Some(target) = clip_key_to_ref(app, v_key) { app.handle_event(AppEvent::SelectClip { target, additive: false }); if app.is_audio_clip(target) { app.handle_event(AppEvent::OpenAudioEditor(target)); } else { app.handle_event(AppEvent::CloseAudioEditor); app.handle_event(AppEvent::SelectBottomPanel(1)); } } }) });
+                ui.push_edit({ let v_key = hit_key; Edit::mutate(move |app: &mut AppData| { if let Some(target) = live_clip_key(app, v_key) { app.handle_event(AppEvent::SelectClip { target, additive: false }); if app.is_audio_clip(target) { app.handle_event(AppEvent::OpenAudioEditor(target)); } else { app.handle_event(AppEvent::CloseAudioEditor); app.handle_event(AppEvent::SelectBottomPanel(1)); } } }) });
             } else if let Some((pt_key, _)) = automation_point_at(
                 visible_tracks,
                 press_tops,

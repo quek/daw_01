@@ -357,7 +357,7 @@ pub enum AppEvent {
     /// 右クリック menu「Make Unique」 → 共有中 (`refcount >= 2`) の
     /// automation clip の content を deep clone (新 `ContentId`)、独立化。
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
-    /// `MakeClipUnique(ClipRef)` と同 idiom の lane 版。
+    /// `MakeClipUnique(ClipKey)` と同 idiom の lane 版。
     MakeAutomationClipUnique(common::model::AutomationClipKey),
     /// D shortcut: 選択中の automation clip 群をまとめて共有コピー。
     /// MIDI 用 `DuplicateClipsShared` の automation lane 版。 選択ブロック span
@@ -441,11 +441,11 @@ pub enum AppEvent {
     /// `SetClipText{X,Y,W,H,Rotation}` 群 (= image と同 idiom)。 lane が
     /// effective なら handler 側で「TextEvent.field を直接書く」 動作で、
     /// lane override が drag を隠す挙動も同様。
-    SetClipTextX { target: ClipRef, value: f32 },
-    SetClipTextY { target: ClipRef, value: f32 },
-    SetClipTextW { target: ClipRef, value: f32 },
-    SetClipTextH { target: ClipRef, value: f32 },
-    SetClipTextRotation { target: ClipRef, value: f32 },
+    SetClipTextX { target: ClipKey, value: f32 },
+    SetClipTextY { target: ClipKey, value: f32 },
+    SetClipTextW { target: ClipKey, value: f32 },
+    SetClipTextH { target: ClipKey, value: f32 },
+    SetClipTextRotation { target: ClipKey, value: f32 },
 
     /// preview window で PiP rect の drag 操作を始めた瞬間に発火する
     /// marker event (`docs/plan_image_overlay.md` §4 P5)。 handler 本体
@@ -479,18 +479,18 @@ pub enum AppEvent {
     /// 発火 (= 旧 buffer 経路 `ClipTextNumEditChanged` / `CommitClipTextNumEdit`
     /// は撤去)。 lane override 経由でも同様、 lane が effective なら
     /// TextEvent.field の直接書き込みは preview に反映されない。
-    SetClipTextMuted { target: ClipRef, muted: bool },
-    SetClipTextContent { target: ClipRef, value: String },
-    SetClipTextFontFamily { target: ClipRef, value: String },
-    SetClipTextAlign { target: ClipRef, value: common::model::TextAlign },
-    SetClipTextFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
-    SetClipTextFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
+    SetClipTextMuted { target: ClipKey, muted: bool },
+    SetClipTextContent { target: ClipKey, value: String },
+    SetClipTextFontFamily { target: ClipKey, value: String },
+    SetClipTextAlign { target: ClipKey, value: common::model::TextAlign },
+    SetClipTextFadeInCurve { target: ClipKey, curve: common::model::FadeCurve },
+    SetClipTextFadeOutCurve { target: ClipKey, curve: common::model::FadeCurve },
 
     /// text inspector の scrubable_number on_change から発火
     /// (drag 中 per-frame / text commit)。 `set_clip_text_num_field` で
     /// `value` (= Rotation は radians) を clamp + 全 TextEvent に書く。
     /// 非 undoable (= drag stroke を `Begin/EndInspectorScrub` で bracket)。
-    SetClipTextNumField { target: ClipRef, field: TextNumField, value: f32 },
+    SetClipTextNumField { target: ClipKey, field: TextNumField, value: f32 },
 
     ClipTextContentEditChanged(String),
     ClipTextFontFamilyEditChanged(String),
@@ -502,7 +502,7 @@ pub enum AppEvent {
     /// Redo の効果を反映するときに呼ぶ。 25 numeric field は
     /// scrubable_number 化され現値を summary から直接読むため、 数値 buffer
     /// の再生成は不要になった。
-    ResyncClipTextEditBuffers(ClipRef),
+    ResyncClipTextEditBuffers(ClipKey),
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode の
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
@@ -601,7 +601,7 @@ pub enum AppEvent {
     SetSectionColor { id: u32, color: [f32; 3] },
     /// clip rename (track rename の clip 版)。 右クリックメニュー "Rename"
     /// または F2 で開始、 該当 clip rect に inline text_input を重ねる。
-    BeginRenameClip(ClipRef),
+    BeginRenameClip(ClipKey),
     RenameClipChanged(String),
     CommitRenameClip,
     CancelRenameClip,
@@ -650,8 +650,8 @@ pub enum AppEvent {
     SelectBottomPanel(u8),
 
     // -------- Arrangement / clip operations -------------------------------
-    SelectClip { target: ClipRef, additive: bool },
-    SetClipSelection(Vec<ClipRef>),
+    SelectClip { target: ClipKey, additive: bool },
+    SetClipSelection(Vec<ClipKey>),
     /// Ctrl+A (クリップ領域): 曲全体・全トラックの全クリップを選択。
     /// 一括選択なので view ジャンプ (fit_piano_roll / select_track) は
     /// 起こさない。 既に全選択なら冪等。 selection のみ更新で非 undoable。
@@ -660,7 +660,7 @@ pub enum AppEvent {
     /// 右クリック「共有を一括選択」 — target と同じ `content_id` を持つ
     /// 全 clip (linked clip group) を選択する。 refcount==1 なら自身 1 個。
     /// 共有グループの可視化 / まとめ移動・削除に使う。
-    SelectLinkedClips(ClipRef),
+    SelectLinkedClips(ClipKey),
     /// Clip の右端 trim (= `start_beat` 同値、 `length_beats` のみ更新) と
     /// 左端 trim (= `start_beat` を進めて `length_beats` を縮める) の両方を
     /// カバー。 audio clip の場合は handler が delta_start を計算して各
@@ -674,7 +674,7 @@ pub enum AppEvent {
     /// source 窓固定で event 長のみ変更し render が stretch_ratio で warp、 MIDI は
     /// note の start/length を比例 scale)。 Shift + 端 drag で `true` (Ableton 流)。
     ResizeClip {
-        target: ClipRef,
+        target: ClipKey,
         start_beat: f64,
         length: f64,
         stretch: bool,
@@ -682,7 +682,7 @@ pub enum AppEvent {
     /// `(source_ref, to_track_id, next_start_beat)` のタプル列。
     /// to_track_id == source の track id なら同 track 内 move、 違えば
     /// track 跨ぎ move (clip 自体を別 track の `clips: Vec<Clip>` に移す)。
-    SetClipPositions(Vec<(ClipRef, u32, f64)>),
+    SetClipPositions(Vec<(ClipKey, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     DeleteSelectedClip,
     /// 選択中の clip 群をまとめて共有コピー (linked clip) する
@@ -690,27 +690,26 @@ pub enum AppEvent {
     /// span だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じ
     /// セマンティクス)、 複製を選択集合にする。 単一 clip では span = clip 長で
     /// 旧 `DuplicateClipShared` と完全一致。 source の `content_id` を流用。
-    DuplicateClipsShared(Vec<ClipRef>),
+    DuplicateClipsShared(Vec<ClipKey>),
     /// 選択中の clip 群をまとめて独立コピー (deep clone + 新 ContentId)
     /// する (Alt+D shortcut / §3.3)。 配置・選択は `DuplicateClipsShared` と同じ。
-    DuplicateClipsUnique(Vec<ClipRef>),
-    /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipRef,
+    DuplicateClipsUnique(Vec<ClipKey>),
+    /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipKey,
     /// to_track_id, drop_start_beat)` (snap 済み)、 元 clip は残し、 drop 位置に
     /// 共有コピー を to_track 上で生成。 (§3.4)
-    CloneClipsLinked(Vec<(ClipRef, u32, f64)>),
+    CloneClipsLinked(Vec<(ClipKey, u32, f64)>),
     /// arrangement Ctrl+Shift+drag → release。 同上だが content は deep clone
     /// + 新 ContentId 採番で独立化。 (§3.5)
-    CloneClipsIndependent(Vec<(ClipRef, u32, f64)>),
+    CloneClipsIndependent(Vec<(ClipKey, u32, f64)>),
     /// 右クリック「Make Unique」 — 共有 clip を独立化。 refcount==1 の場合は
     /// no-op (§3.6)。
-    MakeClipUnique(ClipRef),
+    MakeClipUnique(ClipKey),
 
     // -------- Piano roll / note operations --------------------------------
     SelectNote { note: u32, additive: bool },
     ClearNoteSelection,
     AddNote {
-        track: u32,
-        clip: u32,
+        key: ClipKey,
         start_beat: f64,
         duration: f64,
         pitch: u8,
@@ -718,8 +717,7 @@ pub enum AppEvent {
     SetNotePositions(Vec<(u32, f64, u8)>),
     SetNoteSelection(Vec<u32>),
     ResizeNote {
-        track: u32,
-        clip: u32,
+        key: ClipKey,
         note: u32,
         duration: f64,
     },
@@ -739,7 +737,7 @@ pub enum AppEvent {
     /// `clip_ref` 内で更新。 widget が空文字列を `None` に正規化済みなので
     /// daw_01 側で `is_empty` 判定不要 (None = 歌詞削除)。 1 batch = 1 undo。
     SetNoteLyrics {
-        clip_ref: ClipRef,
+        clip_ref: ClipKey,
         lyrics: Vec<(u32, Option<String>)>,
     },
     /// 複数表示ピアノロールの凡例 (legend) で対象 (target) クリップを切り替える。
@@ -1035,6 +1033,15 @@ pub enum AppEvent {
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
     TrackPeaksTick(Vec<(f32, f32)>),
+    /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
+    /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`
+    /// を ~30Hz で読んだもの。
+    ///
+    /// **`Song` には入らない表示専用データ** (計画書 §1.4)。`Song.launcher` が持つのは
+    /// 「ユーザーが最後に撃った状態」= 再生の起点で、フォローアクションで移った先は
+    /// engine の走行状態にしか無い。これを取り込まないと、音だけ次のセルへ進んで
+    /// グリッドと映像が前のセルに取り残される。
+    LauncherRowsTick(Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>),
     /// docs/plan_modulation.md §4.2: latest per-`ModSource` envelope follower
     /// scalars (indexed by `ModSource` position), polled ~30Hz from
     /// `AudioBridge::mod_scalars`. Drives visual modulation each frame.
@@ -1384,16 +1391,16 @@ pub enum AppEvent {
     /// audio clip. Non-audio clips no-op. `docs/plan_audio_clip.md`
     /// §3.8: Reverse は destructive ではなく、 再生時に source を逆方向
     /// 走査する flag。
-    SetClipReversed { target: ClipRef, reversed: bool },
+    SetClipReversed { target: ClipKey, reversed: bool },
 
     /// clip 全体の mute を設定 (`Clip.muted` = clip-level mute の SSoT)。
     /// 旧 (v26 以前) は per-event `AudioEvent.muted` を立てていたが、v27 で `Clip.muted` に
     /// 一本化したので audio inspector の "Mute" トグルもここを設定する。track-mute とは独立。
-    SetClipMuted { target: ClipRef, muted: bool },
+    SetClipMuted { target: ClipKey, muted: bool },
 
     /// 複数 clip の mute を一括設定 (= `q` ショートカットで選択 clip / カーソル
     /// 直下 clip を toggle した結果)。各 target の `Clip.muted` に `muted` を設定する。
-    SetClipsMuted { targets: Vec<ClipRef>, muted: bool },
+    SetClipsMuted { targets: Vec<ClipKey>, muted: bool },
 
     /// 表示中ピアノロールの note 群 (**packed note id**) の `Note.muted` を
     /// 一括設定 (= `q` で選択 note / カーソル直下 note を toggle した結果)。packed id は
@@ -1407,13 +1414,13 @@ pub enum AppEvent {
     /// v18 (`docs/plan_track_clip_color.md`): clip の表示色を設定。
     /// `color == None` でトラック色継承に戻す (Ableton "match track color")。
     /// model field のみ更新。Undo 対象。
-    SetClipColor { target: ClipRef, color: Option<[f32; 3]> },
+    SetClipColor { target: ClipKey, color: Option<[f32; 3]> },
 
     /// Set `AudioEvent.stretch_mode` for every event in the selected
     /// audio clip. Phase 1 で再生に効くのは `Raw` / `Repitch` のみ;
     /// `Stretch` / `Slice` は §3.7 に従って Raw 同等で再生される
     /// (Phase 3+ で本実装)。
-    SetClipStretchMode { target: ClipRef, mode: common::model::StretchMode },
+    SetClipStretchMode { target: ClipKey, mode: common::model::StretchMode },
 
     // ---- Audio event 数値 field 編集 (Phase 2 PR2) ----------------------
     /// audio / image inspector が `clip_edit_buffer_target` を
@@ -1421,18 +1428,18 @@ pub enum AppEvent {
     /// scrubable_number 化され現値を summary から直接読むため buffer 再生成
     /// は不要だが、 text section と共有する `clip_edit_buffer_target` を
     /// 正しい clip に向けておくために残す。 `is_undoable` ではない。
-    ResyncClipEditBuffers(ClipRef),
+    ResyncClipEditBuffers(ClipKey),
 
     /// scrubable_number の on_change が発火する programmatic な
     /// field 設定 (drag 中 per-frame / text commit)。 全 event に broadcast
     /// (`SetClipReversed` 等と同じ semantics)。 非 undoable (= drag stroke
     /// を `Begin/EndInspectorScrub` で 1 undo step に bracket)。
-    SetClipGainDb { target: ClipRef, gain_db: f32 },
-    SetClipPan { target: ClipRef, pan: f32 },
-    SetClipPitchSemitones { target: ClipRef, semitones: f32 },
+    SetClipGainDb { target: ClipKey, gain_db: f32 },
+    SetClipPan { target: ClipKey, pan: f32 },
+    SetClipPitchSemitones { target: ClipKey, semitones: f32 },
     /// r.md #40: スペクトル包絡 (フォルマント) の移調量。 音程とは独立に
     /// 「声質」 だけを動かす。
-    SetClipFormantSemitones { target: ClipRef, semitones: f32 },
+    SetClipFormantSemitones { target: ClipKey, semitones: f32 },
 
     // ---- Audio event fade 編集 (Phase 2 PR3) ----------------------------
     /// Fade length / curve の programmatic 設定。 `SetClipGainDb` 等と
@@ -1442,10 +1449,10 @@ pub enum AppEvent {
     /// `target` の `ClipContent` が `Audio` / `Image` のいずれであっても
     /// fade フィールドが存在するので kind-aware に書き分ける (handler
     /// 側で resolve)。
-    SetClipFadeInBeats { target: ClipRef, beats: f64 },
-    SetClipFadeOutBeats { target: ClipRef, beats: f64 },
-    SetClipFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
-    SetClipFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
+    SetClipFadeInBeats { target: ClipKey, beats: f64 },
+    SetClipFadeOutBeats { target: ClipKey, beats: f64 },
+    SetClipFadeInCurve { target: ClipKey, curve: common::model::FadeCurve },
+    SetClipFadeOutCurve { target: ClipKey, curve: common::model::FadeCurve },
 
     // ---- Image event 編集 (`docs/plan_image_overlay.md` §4 P4) -----------
     /// PiP rect / opacity / rotation の programmatic 設定 (Inspector の
@@ -1455,14 +1462,14 @@ pub enum AppEvent {
     /// `-π..=π` で wrap (= 360° 連続入力可)。 inspector の
     /// scrubable 化で `ClipImage*EditChanged` / `CommitClipImage*Edit` は
     /// 撤去 (drag stroke を `Begin/EndInspectorScrub` で bracket)。
-    SetClipImageX { target: ClipRef, value: f32 },
-    SetClipImageY { target: ClipRef, value: f32 },
-    SetClipImageW { target: ClipRef, value: f32 },
-    SetClipImageH { target: ClipRef, value: f32 },
-    SetClipImageOpacity { target: ClipRef, value: f32 },
+    SetClipImageX { target: ClipKey, value: f32 },
+    SetClipImageY { target: ClipKey, value: f32 },
+    SetClipImageW { target: ClipKey, value: f32 },
+    SetClipImageH { target: ClipKey, value: f32 },
+    SetClipImageOpacity { target: ClipKey, value: f32 },
     /// `value` は radians 単位 (= 内部単位)。 inspector は degree で
     /// 入力するが commit で radians に変換してから発火する。
-    SetClipImageRotation { target: ClipRef, value: f32 },
+    SetClipImageRotation { target: ClipKey, value: f32 },
 
     // ---- Auto-Fade / Auto-Crossfade (Phase 2 PR5) -----------------------
     /// 全選択 audio clip に短 (≒4 ms 相当) fade を一括適用 (`docs
@@ -1484,7 +1491,7 @@ pub enum AppEvent {
     /// `audio_editor_clip = Some(target)` + bottom_panel を tab 1
     /// (Piano Roll 切替先) に切り替え。 ClipContent::Audio 以外を渡された
     /// 場合は no-op (status_message 出さず silent skip)。
-    OpenAudioEditor(ClipRef),
+    OpenAudioEditor(ClipKey),
 
     /// Audio Editor を閉じる (Esc shortcut / 切替操作経由)。
     /// `audio_editor_clip = None` に戻して bottom_panel は現在のタブ
@@ -1496,7 +1503,7 @@ pub enum AppEvent {
     /// Inspector でも同 field は編集できるが、 メニューから 1 操作で
     /// 切り替えられる UX を提供。 内部的には現値を読んで
     /// `SetClipReversed` を呼ぶのと等価で、 全 event に broadcast。
-    ToggleClipReversed(ClipRef),
+    ToggleClipReversed(ClipKey),
 
     /// Bounce In Place (Pre-FX、 `docs/plan_audio_clip.md` §3.8)。
     /// `target` clip 内の全 events を offline mix して 1 つの WAV
@@ -1506,7 +1513,7 @@ pub enum AppEvent {
     /// fx_chain) を通さない、 source の events を mix しただけの
     /// snapshot。 同 ContentId を共有していた linked clip も同じ新
     /// content に置換される (= 既存 ContentId を上書き)。
-    BounceClipInPlace(ClipRef),
+    BounceClipInPlace(ClipKey),
 
     // ---- Bounce (with FX) — Phase 2 PR-C --------------------------------
     /// audio clip を **plugin chain 込み** で render し、 結果を **新 track**
@@ -1514,7 +1521,7 @@ pub enum AppEvent {
     /// async (= IPC freewheel render → AudioEvent::BounceClipFxComplete)。
     /// `is_undoable` には入れず、 完了通知 handler 内で
     /// `push_undo_snapshot` を明示呼び出し (= 1 完了 = 1 Undo step)。
-    BounceClipWithFx(ClipRef),
+    BounceClipWithFx(ClipKey),
 
     // ---- multi-clip drag batch (Phase 2 PR-B) ---------------------------
     // r.md #73: `SetClipGainDbBatch` は撤去した。唯一の発行元がアレンジメントの
@@ -1532,7 +1539,7 @@ pub enum AppEvent {
     /// auto-push で N スナップになるため、 これ 1 つで 1 スナップにまとめ、 handler 内で
     /// per-clip setter (variant-safe) をループする。
     BroadcastDiscreteClipEdit {
-        targets: Vec<ClipRef>,
+        targets: Vec<ClipKey>,
         edit: DiscreteClipEdit,
     },
 
@@ -1595,7 +1602,7 @@ pub enum AppEvent {
     /// 設定。 範囲外 / 非 audio clip / event_idx 範囲外なら no-op。
     /// clip.length_beats は新 event の終端を含むよう自動拡張。
     SetAudioEventStart {
-        clip: ClipRef,
+        clip: ClipKey,
         event_idx: usize,
         new_start_beats: f64,
     },
@@ -1606,7 +1613,7 @@ pub enum AppEvent {
     /// `audio_sources` から sample_rate を取って delta_beats → frames
     /// 変換。 clip.length_beats は必要に応じて拡張。
     SetAudioEventTrim {
-        clip: ClipRef,
+        clip: ClipKey,
         event_idx: usize,
         side: AudioEventTrimSide,
         delta_beats: f64,
@@ -1618,7 +1625,7 @@ pub enum AppEvent {
     /// と同 pipeline)。 失敗時は status_message にエラー、 selection は
     /// 新 event に移す。 clip.length_beats は必要に応じて拡張。
     AddAudioEventFromFile {
-        clip: ClipRef,
+        clip: ClipKey,
         path: PathBuf,
         position_in_clip_beats: f64,
     },

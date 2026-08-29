@@ -375,7 +375,7 @@ if dup_shared && !dup_devices {
         // それ以外 (アレンジ文脈 / ピアノロールでもノート未選択) は選択中の
         // MIDI/Audio/Vocal clip と automation clip の両方を同時に共有複製
         // (Ableton/REAPER 流)。
-        let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
+        let midi_sources: Vec<crate::app::ClipKey> = app.selected_clip_refs();
         let automation_sources: Vec<common::model::AutomationClipKey> =
             app.selection.selected_automation_clips.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -396,7 +396,7 @@ if dup_unique && !dup_devices {
             app.handle_event(AppEvent::DuplicateTracksUnique(ids));
         }));
     } else {
-        let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
+        let midi_sources: Vec<crate::app::ClipKey> = app.selected_clip_refs();
         let automation_sources: Vec<common::model::AutomationClipKey> =
             app.selection.selected_automation_clips.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {

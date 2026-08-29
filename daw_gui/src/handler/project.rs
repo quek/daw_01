@@ -78,7 +78,7 @@ impl AppData {
         self.selection.last_edit_select = None;
 
         // -- 開いているエディタ / インスペクタの対象 ------------------------
-        // `audio_editor_clip` は positional `ClipRef` なので、開いたままだと
+        // `audio_editor_clip` は positional `ClipKey` なので、開いたままだと
         // 新 project の track[i].clip[j] を編集対象にしてしまう。
         self.ui_ephemeral.audio_editor_clip = None;
         self.ui_ephemeral.armed_mod_source = None;
@@ -191,7 +191,7 @@ impl AppData {
     }
 
     pub(crate) fn undo(&mut self) {
-        // audio editor の対象は positional な `ClipRef` なので、 song を差し替える
+        // audio editor の対象は positional な `ClipKey` なので、 song を差し替える
         // **前** に安定 key を退避して `after_undo_redo` で貼り直す。
         let key = self.audio_editor_target_key();
         if !self.song_doc.undo() {
@@ -244,7 +244,7 @@ impl AppData {
 
     /// `audio_editor_key` は song を差し替える **前** に退避した安定 `ClipKey`
     /// (`AppData::audio_editor_target_key`)。 audio editor の対象は positional な
-    /// `ClipRef` なので、 これで貼り直さないと index が詰まって別クリップを指す。
+    /// `ClipKey` なので、 これで貼り直さないと index が詰まって別クリップを指す。
     pub(crate) fn after_undo_redo(&mut self, audio_editor_key: Option<common::model::ClipKey>) {
         // (epoch bump / gesture chain 切断は SongDoc::undo/redo が実施済み。)
         // selected_clip が undo 後も存在するなら維持、消えていれば None。
@@ -673,7 +673,7 @@ impl AppData {
                 self.restore_view_state(view, loop_region);
                 // 復元した選択クリップのトラックを追従選択 (= select_clip と同じ文脈復元)。
                 if let Some(r) = self.selected_clip_ref() {
-                    self.select_track(r.track);
+                    self.select_track(r.track_id);
                 }
                 self.resize_track_peak_display();
                 self.resync_song_edit_texts();
@@ -932,7 +932,7 @@ impl AppData {
         // recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
         self.restore_view_state(view, loop_region);
         if let Some(r) = self.selected_clip_ref() {
-            self.select_track(r.track);
+            self.select_track(r.track_id);
         }
         self.resize_track_peak_display();
         self.resync_song_edit_texts();

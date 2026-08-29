@@ -87,7 +87,16 @@ fn 帯は停止列とセル格子と返す列にちょうど分かれる() {
     let view = view_with_scenes(3);
     let r = layout::split(rect, 160.0, 300.0, 38.0, 38.0, 562.0, &view);
     assert!((r.pane.w - 300.0).abs() < 1e-3);
-    assert!((r.stop_col.w + r.grid.w + r.return_col.w - r.pane.w).abs() < 1e-3);
+    // 帯 = 停止列 + 格子 + 返す列 + **スプリッタ専用のつかみ代** (右端)。
+    // つかみ代を列に食わせると「幅を変えるドラッグ」と「アレンジへ返す」ボタンが
+    // 同じ場所に居て、ボタンが押せなくなる。
+    let cols = r.stop_col.w + r.grid.w + r.return_col.w;
+    assert!((cols + PANE_SPLITTER_HANDLE - r.pane.w).abs() < 1e-3, "cols={cols}");
+    assert!(
+        (r.return_col.x + r.return_col.w + PANE_SPLITTER_HANDLE - (r.pane.x + r.pane.w)).abs()
+            < 1e-3,
+        "返す列の右にちょうどつかみ代が残る"
+    );
     assert!((r.grid.x - (r.stop_col.x + r.stop_col.w)).abs() < 1e-3);
     assert!((r.return_col.x - (r.grid.x + r.grid.w)).abs() < 1e-3);
     assert!(!r.collapsed, "300px あれば格子は描ける");
@@ -193,7 +202,7 @@ fn 帯の行とアレンジの行は同じ縦位置に並ぶ() {
 fn 実シーンの右にプレースホルダ列が並ぶ() {
     let rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
     let view = view_with_scenes(1);
-    // 格子幅 = 300 - 16 - 16 = 268px、列幅 96px → 3 列ぶん見える。
+    // 格子幅 = 300 - 12 (つかみ代) - 16 - 16 = 256px、列幅 96px → 3 列ぶん見える。
     let r = layout::split(rect, 160.0, 300.0, 38.0, 38.0, 562.0, &view);
     let (first, last) = r.visible_cols();
     assert_eq!(first, 0);
@@ -260,6 +269,7 @@ fn グループ行のまとめセルは子行へ展開される() {
             follow: false,
             content_offset_beats: 0.0,
             len_beats: 4.0,
+            looping: true,
             curve: Vec::new(),
         },
     );

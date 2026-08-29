@@ -28,8 +28,7 @@ impl AppData {
         };
         let track_id_opt = self
             .song_doc.song()
-            .tracks
-            .get(target_clip.track as usize)
+            .track_by_id(target_clip.track_id)
             .map(|t| t.id);
         let Some(track_id) = track_id_opt else {
             return;
@@ -146,7 +145,7 @@ impl AppData {
         let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
-        let Some(track) = self.song_doc.song().tracks.get(target_clip.track as usize) else {
+        let Some(track) = self.song_doc.song().track_by_id(target_clip.track_id) else {
             return;
         };
         let track_id = track.id;
@@ -218,7 +217,7 @@ impl AppData {
         let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
-        let Some(track) = self.song_doc.song().tracks.get(target_clip.track as usize) else {
+        let Some(track) = self.song_doc.song().track_by_id(target_clip.track_id) else {
             return;
         };
         let track_id = track.id;
@@ -301,7 +300,7 @@ impl AppData {
         };
         let target = AutomationTarget::ImageBuiltin(field);
         let removed = self.edit_song_checked(|song| {
-            let Some(track) = song.tracks.get_mut(target_clip.track as usize) else {
+            let Some(track) = song.track_by_id_mut(target_clip.track_id) else {
                 return false;
             };
             let before = track.automation_lanes.len();
@@ -790,8 +789,7 @@ impl AppData {
         };
         let track_id_opt = self
             .song_doc.song()
-            .tracks
-            .get(target_clip.track as usize)
+            .track_by_id(target_clip.track_id)
             .map(|t| t.id);
         let Some(track_id) = track_id_opt else {
             return;
@@ -867,7 +865,7 @@ impl AppData {
         };
         let target = AutomationTarget::TextBuiltin(field);
         let removed = self.edit_song_checked(|song| {
-            let Some(track) = song.tracks.get_mut(target_clip.track as usize) else {
+            let Some(track) = song.track_by_id_mut(target_clip.track_id) else {
                 return false;
             };
             let before = track.automation_lanes.len();

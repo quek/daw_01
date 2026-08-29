@@ -374,6 +374,9 @@ pub fn sanitize_automation_clips(clips: Vec<AutomationClipCopy>) -> Vec<Automati
         .collect()
 }
 
+/// 貼り付けの相対座標の上限 (行 / 列とも)。
+const MAX_PASTE_OFFSET: i64 = 256;
+
 /// r.md #87: 外部 clipboard 由来の `LauncherCellCopy` 群を sanitize。
 /// 中身の検証は [`sanitize_clips`] / [`sanitize_automation_clips`] に委譲し
 /// (規則を二重に持たない)、ここは **セル固有の 2 点**だけを見る:
@@ -385,7 +388,11 @@ pub fn sanitize_launcher_cells(cells: Vec<LauncherCellCopy>) -> Vec<LauncherCell
         .filter_map(|mut c| {
             // 相対位置は選択群の広がりぶんしか出ない。桁違いの値は改竄なので捨てる
             // (`ensure_scene_at` に巨大 index を渡すと列を大量生成してしまう)。
-            if !(0..4096).contains(&c.row_offset) || !(0..4096).contains(&c.scene_offset) {
+            // 相対座標の上限。外部由来の JSON で数千列が生えるのを防ぐ
+            // (現実の選択でこの値を超えることはない)。
+            if !(0..MAX_PASTE_OFFSET).contains(&c.row_offset)
+                || !(0..MAX_PASTE_OFFSET).contains(&c.scene_offset)
+            {
                 return None;
             }
             c.launch.follow.chance_a = c.launch.follow.chance_a.min(100);

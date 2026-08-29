@@ -13,7 +13,7 @@ impl AppData {
     /// 非 audio (MIDI / Vocal / 範囲外) なら silent no-op。 bottom_panel
     /// を tab 1 (= 通常 Piano Roll、 audio_editor_clip is Some なら
     /// audio_editor view に切り替わる) に揃える。
-    pub(crate) fn open_audio_editor(&mut self, target: ClipRef) {
+    pub(crate) fn open_audio_editor(&mut self, target: ClipKey) {
         if !self.is_audio_clip(target) {
             return;
         }
@@ -27,15 +27,14 @@ impl AppData {
         self.ui_prefs.bottom_panel = 1;
         // per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
         // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
-        let Some(key) = self.clip_key_of(target) else { return };
+        let Some(key) = self.live_clip_key(target) else { return };
         if !self.ui_prefs.audio_editor_views.contains_key(&key) {
             // r.md #44: view は content-local 軸なので、初期 view は clip の窓
             // (`[content_offset_beats, +length_beats)`) をそのまま全体表示する。
             let (start_beat, len_beats) = self
                 .song_doc.song()
-                .tracks
-                .get(target.track as usize)
-                .and_then(|t| t.clips.get(target.clip as usize))
+                .track_by_id(target.track_id)
+                .and_then(|t| t.clip_by_id(target.clip_id))
                 .map_or((0.0, 0.0), |c| (c.content_offset_beats, c.length_beats));
             self.ui_prefs.audio_editor_views.insert(
                 key,
@@ -66,10 +65,10 @@ impl AppData {
     pub(crate) fn audio_editor_target_key(&self) -> Option<common::model::ClipKey> {
         self.ui_ephemeral
             .audio_editor_clip
-            .and_then(|r| self.clip_key_of(r))
+            .and_then(|r| self.live_clip_key(r))
     }
 
-    /// `ui_ephemeral.audio_editor_clip` は **positional な `ClipRef`** (track/clip とも
+    /// `ui_ephemeral.audio_editor_clip` は **positional な `ClipKey`** (track/clip とも
     /// Vec index) なので、 トラック削除 / undo / redo / load で Vec が詰まると
     /// **黙って別のクリップを指す**。 index の妥当性だけを見る旧ガードでは、
     /// 「詰まった先にたまたま別の audio clip が居る」 ケースを取りこぼし、
@@ -91,7 +90,7 @@ impl AppData {
             .map(|c| c.content_id)
             .and_then(|cid| self.song_doc.song().clip_contents.get(&cid))
             .is_some_and(|c| matches!(c, common::model::ClipContent::Audio(_)));
-        match self.clip_ref_of(key) {
+        match self.live_clip_key(key) {
             Some(r) if still_audio => self.ui_ephemeral.audio_editor_clip = Some(r),
             _ => self.close_audio_editor(),
         }
@@ -101,14 +100,13 @@ impl AppData {
     /// で clamp。 `audio_editor_clip` が None / clip が解決できない場合は no-op。
     pub(crate) fn set_audio_editor_scroll(&mut self, new_start: f64) {
         let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
-        let Some(key) = self.clip_key_of(target) else { return };
+        let Some(key) = self.live_clip_key(target) else { return };
         // r.md #44: view は content-local 軸で、clip が見せる窓
         // `[content_offset_beats, +length_beats)` に clamp する。
         let Some((min_start, total)) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| (c.content_offset_beats, c.length_beats.max(0.0)))
         else {
             return;
@@ -130,12 +128,11 @@ impl AppData {
     /// `view_start` は `[0, clip.length - view_len]` で clamp。
     pub(crate) fn set_audio_editor_zoom(&mut self, new_start: f64, new_len: f64) {
         let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
-        let Some(key) = self.clip_key_of(target) else { return };
+        let Some(key) = self.live_clip_key(target) else { return };
         let Some((min_start, total)) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| (c.content_offset_beats, c.length_beats.max(0.0)))
         else {
             return;
@@ -162,9 +159,7 @@ impl AppData {
             return;
         };
         let Some(Some(insert_at)) = self.edit_song(|song| {
-            let track = song.tracks.get_mut(target.track as usize)?;
-            let clip = track.clips.get_mut(target.clip as usize)?;
-            let content_id = clip.content_id;
+            let content_id = song.clip_by_key(target)?.content_id;
             let Some(common::model::ClipContent::Audio(audio)) =
                 song.clip_contents.get_mut(&content_id)
             else {
@@ -190,7 +185,9 @@ impl AppData {
             let needed = new_start + src.event_length_beats;
             // r.md #44: `needed` は content-local。 clip の窓の末尾
             // (`content_offset_beats + length_beats`) を基準に伸ばす。
-            if needed > clip.content_offset_beats + clip.length_beats {
+            if let Some(clip) = song.clip_by_key_mut(target)
+                && needed > clip.content_offset_beats + clip.length_beats
+            {
                 clip.length_beats = needed - clip.content_offset_beats;
             }
             Some(insert_at)
@@ -209,15 +206,15 @@ impl AppData {
     /// なら no-op。 clip.length_beats は新 event 終端を含むよう自動拡張。
     pub(crate) fn set_audio_event_start(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         event_idx: usize,
         new_start_beats: f64,
     ) {
         let changed = self.edit_song_checked(|song| {
-            let Some(track) = song.tracks.get_mut(target.track as usize) else {
+            let Some(track) = song.track_by_id_mut(target.track_id) else {
                 return false;
             };
-            let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            let Some(clip) = track.clip_by_id_mut(target.clip_id) else {
                 return false;
             };
             let content_id = clip.content_id;
@@ -234,7 +231,9 @@ impl AppData {
             let needed = new_start + event.event_length_beats;
             // r.md #44: `needed` は content-local。 clip の窓の末尾
             // (`content_offset_beats + length_beats`) を基準に伸ばす。
-            if needed > clip.content_offset_beats + clip.length_beats {
+            if let Some(clip) = song.clip_by_key_mut(target)
+                && needed > clip.content_offset_beats + clip.length_beats
+            {
                 clip.length_beats = needed - clip.content_offset_beats;
             }
             true
@@ -253,7 +252,7 @@ impl AppData {
     /// (0..total_frames) と event_length_beats > 0 を保つ clamp 込み。
     pub(crate) fn set_audio_event_trim(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         event_idx: usize,
         side: AudioEventTrimSide,
         delta_beats: f64,
@@ -261,10 +260,10 @@ impl AppData {
         let bpm = self.song_doc.song().bpm.max(1.0) as f64;
         // source 情報を先に snapshot (= 後の mut borrow と分離)。
         let (sr_hz, total_frames) = {
-            let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+            let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
                 return;
             };
-            let Some(clip) = track.clips.get(target.clip as usize) else {
+            let Some(clip) = track.clip_by_id(target.clip_id) else {
                 return;
             };
             let Some(common::model::ClipContent::Audio(audio)) =
@@ -283,10 +282,10 @@ impl AppData {
         let delta_frames = (delta_beats * 60.0 / bpm * sr_hz).round() as i64;
 
         let changed = self.edit_song_checked(|song| {
-            let Some(track) = song.tracks.get_mut(target.track as usize) else {
+            let Some(track) = song.track_by_id_mut(target.track_id) else {
                 return false;
             };
-            let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+            let Some(clip) = track.clip_by_id_mut(target.clip_id) else {
                 return false;
             };
             let content_id = clip.content_id;
@@ -344,7 +343,9 @@ impl AppData {
             let needed = event.event_start_in_clip_beats + event.event_length_beats;
             // r.md #44: `needed` は content-local。 clip の窓の末尾
             // (`content_offset_beats + length_beats`) を基準に伸ばす。
-            if needed > clip.content_offset_beats + clip.length_beats {
+            if let Some(clip) = song.clip_by_key_mut(target)
+                && needed > clip.content_offset_beats + clip.length_beats
+            {
                 clip.length_beats = needed - clip.content_offset_beats;
             }
             true
@@ -361,7 +362,7 @@ impl AppData {
     /// 移す。 clip.length_beats は新 event 終端を含むよう自動拡張。
     pub(crate) fn add_audio_event_from_file(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         path: PathBuf,
         position_in_clip_beats: f64,
     ) {
@@ -398,9 +399,7 @@ impl AppData {
         let position = position_in_clip_beats.max(0.0);
         let source_end_frames = imported.buffer.frames;
         let Some(Some(new_idx)) = self.edit_song(|song| {
-            let track = song.tracks.get_mut(target.track as usize)?;
-            let clip = track.clips.get_mut(target.clip as usize)?;
-            let content_id = clip.content_id;
+            let content_id = song.clip_by_key(target)?.content_id;
             let Some(common::model::ClipContent::Audio(audio)) =
                 song.clip_contents.get_mut(&content_id)
             else {
@@ -422,7 +421,9 @@ impl AppData {
             let needed = position + length_beats;
             // r.md #44: `needed` は content-local。 clip の窓の末尾
             // (`content_offset_beats + length_beats`) を基準に伸ばす。
-            if needed > clip.content_offset_beats + clip.length_beats {
+            if let Some(clip) = song.clip_by_key_mut(target)
+                && needed > clip.content_offset_beats + clip.length_beats
+            {
                 clip.length_beats = needed - clip.content_offset_beats;
             }
             Some(new_idx)
@@ -458,9 +459,8 @@ impl AppData {
         };
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
@@ -502,7 +502,7 @@ impl AppData {
         let auto_fade_beats = 0.004 * bpm / 60.0; // 4 ms 相当
         let mut applied = 0usize;
         // borrow checker: target list を先に固める。
-        let targets: Vec<ClipRef> = if self.selection.selected_clips.is_empty() {
+        let targets: Vec<ClipKey> = if self.selection.selected_clips.is_empty() {
             self.selected_clip_ref().into_iter().collect()
         } else {
             self.selected_clip_refs()
@@ -510,9 +510,8 @@ impl AppData {
         for target in targets {
             let Some(content_id) = self
                 .song_doc.song()
-                .tracks
-                .get(target.track as usize)
-                .and_then(|t| t.clips.get(target.clip as usize))
+                .track_by_id(target.track_id)
+                .and_then(|t| t.clip_by_id(target.clip_id))
                 .map(|c| c.content_id)
             else {
                 continue;
@@ -559,16 +558,16 @@ impl AppData {
     pub(crate) fn auto_crossfade_selected_clips(&mut self) {
         // (track_idx, clip_idx, start_beat, end_beat, content_id) を集める
         let mut entries: Vec<(u32, u32, f64, f64, u32)> = Vec::new();
-        let targets: Vec<ClipRef> = if self.selection.selected_clips.is_empty() {
+        let targets: Vec<ClipKey> = if self.selection.selected_clips.is_empty() {
             self.selected_clip_ref().into_iter().collect()
         } else {
             self.selected_clip_refs()
         };
         for target in &targets {
-            let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+            let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
                 continue;
             };
-            let Some(clip) = track.clips.get(target.clip as usize) else {
+            let Some(clip) = track.clip_by_id(target.clip_id) else {
                 continue;
             };
             let Some(common::model::ClipContent::Audio(_)) =
@@ -577,8 +576,8 @@ impl AppData {
                 continue;
             };
             entries.push((
-                target.track,
-                target.clip,
+                target.track_id,
+                target.clip_id,
                 clip.start_beat,
                 clip.start_beat + clip.length_beats,
                 clip.content_id,

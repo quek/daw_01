@@ -8,11 +8,10 @@ use crate::event::*;
 impl AppData {
     /// `target` clip の first event の `reversed` 値を読む。 audio で
     /// ない / event が空 / 範囲外なら `false`。 メニューの toggle 用。
-    pub(crate) fn is_clip_audio_event_reversed(&self, target: ClipRef) -> bool {
+    pub(crate) fn is_clip_audio_event_reversed(&self, target: ClipKey) -> bool {
         self.song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .and_then(|c| {
                 if let Some(common::model::ClipContent::Audio(audio)) =
                     self.song_doc.song().clip_contents.get(&c.content_id)
@@ -29,19 +28,18 @@ impl AppData {
     /// audio_editor で event を選択中なら当該 event のみ、 さもなくば
     /// 全 event に broadcast (= multi-event 対応 / 1 clip 1 event 互換、
     /// PR-D 段階 2)。
-    pub(crate) fn set_clip_audio_event_reversed(&mut self, target: ClipRef, reversed: bool) {
+    pub(crate) fn set_clip_audio_event_reversed(&mut self, target: ClipKey, reversed: bool) {
         self.mutate_audio_events_in_clip(target, |e| e.reversed = reversed);
     }
 
     /// `targets` の clip が **全て** muted なら `true` (空なら `false`)。`q` の
     /// toggle 方向決定用 (全 muted → unmute、 1 つでも非 muted → 全 mute)。
-    pub fn all_clips_muted(&self, targets: &[ClipRef]) -> bool {
+    pub fn all_clips_muted(&self, targets: &[ClipKey]) -> bool {
         !targets.is_empty()
             && targets.iter().all(|t| {
                 self.song_doc.song()
-                    .tracks
-                    .get(t.track as usize)
-                    .and_then(|tr| tr.clips.get(t.clip as usize))
+                    .track_by_id(t.track_id)
+                    .and_then(|tr| tr.clip_by_id(t.clip_id))
                     .is_some_and(|c| c.muted)
             })
     }
@@ -60,9 +58,8 @@ impl AppData {
                 return false;
             };
             self.song_doc.song()
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
+                .track_by_id(r.track_id)
+                .and_then(|t| t.clip_by_id(r.clip_id))
                 .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.muted))
                 .unwrap_or(false)
         })
@@ -74,10 +71,10 @@ impl AppData {
     /// `SetClipMuted` / `SetClipTextMuted` event がすべてここを経由する。変更があれば
     /// `flush_song_sync` で daw_audio へ LoadSong flush し、再生・書き出しに反映する
     /// (is_dirty もそこで立つ)。
-    pub(crate) fn set_clip_muted(&mut self, target: ClipRef, muted: bool) {
+    pub(crate) fn set_clip_muted(&mut self, target: ClipKey, muted: bool) {
         self.edit_song_checked(|song| {
-            if let Some(track) = song.tracks.get_mut(target.track as usize)
-                && let Some(clip) = track.clips.get_mut(target.clip as usize)
+            if let Some(track) = song.track_by_id_mut(target.track_id)
+                && let Some(clip) = track.clip_by_id_mut(target.clip_id)
                 && clip.muted != muted
             {
                 clip.muted = muted;
@@ -101,7 +98,7 @@ impl AppData {
             |app, _slot, r, items| {
                 app.edit_song_checked(|song| {
                     let Some(clip_notes) =
-                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                        song.notes_in_clip_mut(r)
                     else {
                         return false;
                     };
@@ -125,7 +122,7 @@ impl AppData {
     /// 再計算が走る。 Phase 1 で再生に効くのは Raw / Repitch のみ。
     pub(crate) fn set_clip_audio_event_stretch_mode(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         mode: common::model::StretchMode,
     ) {
         self.mutate_audio_events_in_clip(target, |e| e.stretch_mode = mode);
@@ -141,12 +138,11 @@ impl AppData {
     /// `detect_onsets`、 grid 整列は純関数 `warp_markers_from_onsets`。 warp が効くよう
     /// 該当 event を `Stretch` mode に切替える。 transient が無い event は markers 空
     /// (= uniform stretch のまま)。 OFF-RT。 buffer 未 decode の event は skip。
-    pub(crate) fn auto_warp_clip(&mut self, target: ClipRef) {
+    pub(crate) fn auto_warp_clip(&mut self, target: ClipKey) {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
@@ -235,12 +231,11 @@ impl AppData {
     /// base、 `slice_sample_at` の contract に一致) を埋める。 既に onsets を持つ
     /// event は前回検出 / 将来の user 編集を尊重して skip。 OFF-RT (buffer を 1 回
     /// scan)。 buffer 未 decode の event は skip (= 空 onsets で Raw 等価のまま)。
-    pub(crate) fn detect_onsets_for_clip(&mut self, target: ClipRef) {
+    pub(crate) fn detect_onsets_for_clip(&mut self, target: ClipKey) {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
@@ -304,19 +299,19 @@ impl AppData {
             .unwrap_or(false);
     }
 
-    pub(crate) fn set_clip_audio_event_gain_db(&mut self, target: ClipRef, gain_db: f32) {
+    pub(crate) fn set_clip_audio_event_gain_db(&mut self, target: ClipKey, gain_db: f32) {
         let gain_db = gain_db.clamp(-80.0, 24.0);
         self.mutate_audio_events_in_clip(target, |e| e.gain_db = gain_db);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_audio_event_pan(&mut self, target: ClipRef, pan: f32) {
+    pub(crate) fn set_clip_audio_event_pan(&mut self, target: ClipKey, pan: f32) {
         let pan = pan.clamp(-1.0, 1.0);
         self.mutate_audio_events_in_clip(target, |e| e.pan = pan);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_audio_event_pitch_semitones(&mut self, target: ClipRef, semitones: f32) {
+    pub(crate) fn set_clip_audio_event_pitch_semitones(&mut self, target: ClipKey, semitones: f32) {
         // 範囲の SSoT は `common::model::PITCH_SEMITONES_LIMIT`
         // (inspector の range / 貼り付け sanitize も同じ定数を引く)。
         let semitones =
@@ -329,7 +324,7 @@ impl AppData {
     /// stretch mode で変わる (`common::model::AudioEvent::formant_semitones` の表)。
     pub(crate) fn set_clip_audio_event_formant_semitones(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         semitones: f32,
     ) {
         let semitones =
@@ -343,12 +338,11 @@ impl AppData {
     /// は text section と共有する `clip_edit_buffer_target` を current audio
     /// clip に同期する純 marker (= 多数の audio 編集パス / song 差し替えから
     /// 呼ばれる)。 target が audio clip を解決できなければ `None` 化する。
-    pub(crate) fn resync_clip_audio_event_edit_buffers(&mut self, target: ClipRef) {
+    pub(crate) fn resync_clip_audio_event_edit_buffers(&mut self, target: ClipKey) {
         let resolved = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .is_some_and(|content| matches!(content, common::model::ClipContent::Audio(_)));
         self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
@@ -371,9 +365,8 @@ impl AppData {
         let Some(content_id) = self
             .song_doc
             .song()
-            .tracks
-            .get(target.clip.track as usize)
-            .and_then(|t| t.clips.get(target.clip.clip as usize))
+            .track_by_id(target.clip.track_id)
+            .and_then(|t| t.clip_by_id(target.clip.clip_id))
             .map(|c| c.content_id)
         else {
             return;
@@ -390,7 +383,7 @@ impl AppData {
         self.resync_clip_audio_event_edit_buffers(target.clip);
     }
 
-    pub(crate) fn set_clip_audio_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
+    pub(crate) fn set_clip_audio_event_fade_in_beats(&mut self, target: ClipKey, beats: f64) {
         // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) は event 長基準で
         // fade を掛けるので、 clip 長で clamp すると clip より短い event
         // (trim / split 後) で fade がフルゲインに到達せず絵と音がずれる。
@@ -400,7 +393,7 @@ impl AppData {
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
+    pub(crate) fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipKey, beats: f64) {
         self.mutate_audio_events_in_clip(target, |e| {
             e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
         });
@@ -409,7 +402,7 @@ impl AppData {
 
     pub(crate) fn set_clip_audio_event_fade_in_curve(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         curve: common::model::FadeCurve,
     ) {
         self.mutate_audio_events_in_clip(target, |e| e.fade_in_curve = curve);
@@ -417,7 +410,7 @@ impl AppData {
 
     pub(crate) fn set_clip_audio_event_fade_out_curve(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         curve: common::model::FadeCurve,
     ) {
         self.mutate_audio_events_in_clip(target, |e| e.fade_out_curve = curve);
@@ -425,37 +418,37 @@ impl AppData {
 
     // -------- Image event editors (`docs/plan_image_overlay.md` §4 P4) ----
 
-    pub(crate) fn set_clip_image_event_x(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_image_event_x(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_image_events_in_clip(target, |e| e.x = value);
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_image_event_y(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_image_event_y(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_image_events_in_clip(target, |e| e.y = value);
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_image_event_w(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_image_event_w(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_image_events_in_clip(target, |e| e.w = value);
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_image_event_h(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_image_event_h(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_image_events_in_clip(target, |e| e.h = value);
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_image_event_opacity(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_image_event_opacity(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_image_events_in_clip(target, |e| e.opacity = value);
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_image_event_rotation_radians(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_image_event_rotation_radians(&mut self, target: ClipKey, value: f32) {
         // -π..=π で wrap して保存。 lane override 経由でも同じ wrap が
         // composite で適用される (= preview 表示は modulo 2π)。
         let two_pi = std::f32::consts::TAU;
@@ -468,15 +461,14 @@ impl AppData {
     /// docs/plan_text_overlay.md §4 P6: image と同 idiom の text event
     /// setter 群。 drag / inspector commit / lane override 経由のいずれも
     /// このパスで TextEvent.field を直接書く。
-    pub(crate) fn mutate_text_events_in_clip<F>(&mut self, target: ClipRef, mut f: F) -> bool
+    pub(crate) fn mutate_text_events_in_clip<F>(&mut self, target: ClipKey, mut f: F) -> bool
     where
         F: FnMut(&mut common::model::TextEvent),
     {
         let Some(content_id) = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return false;
@@ -498,34 +490,34 @@ impl AppData {
         })
     }
 
-    pub(crate) fn set_clip_text_event_x(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_text_event_x(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_text_events_in_clip(target, |e| e.x = value);
     }
 
-    pub(crate) fn set_clip_text_event_y(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_text_event_y(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_text_events_in_clip(target, |e| e.y = value);
     }
 
-    pub(crate) fn set_clip_text_event_w(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_text_event_w(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_text_events_in_clip(target, |e| e.w = value);
     }
 
-    pub(crate) fn set_clip_text_event_h(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_text_event_h(&mut self, target: ClipKey, value: f32) {
         let value = value.clamp(0.0, 1.0);
         self.mutate_text_events_in_clip(target, |e| e.h = value);
     }
 
-    pub(crate) fn set_clip_text_event_rotation_radians(&mut self, target: ClipRef, value: f32) {
+    pub(crate) fn set_clip_text_event_rotation_radians(&mut self, target: ClipKey, value: f32) {
         let two_pi = std::f32::consts::TAU;
         let wrapped =
             ((value + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI;
         self.mutate_text_events_in_clip(target, |e| e.rotation_radians = wrapped);
     }
 
-    pub(crate) fn set_clip_text_event_content(&mut self, target: ClipRef, value: String) {
+    pub(crate) fn set_clip_text_event_content(&mut self, target: ClipKey, value: String) {
         // 単一行 text のみ (`plan_text_overlay.md` §1.1)、 '\n' は除外。
         let value = value.replace(['\n', '\r'], " ");
         if self.mutate_text_events_in_clip(target, |e| e.text = value.clone()) {
@@ -539,18 +531,18 @@ impl AppData {
         self.resync_clip_text_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_text_event_font_family(&mut self, target: ClipRef, value: String) {
+    pub(crate) fn set_clip_text_event_font_family(&mut self, target: ClipKey, value: String) {
         self.mutate_text_events_in_clip(target, |e| e.font_family = value.clone());
         self.resync_clip_text_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_text_event_align(&mut self, target: ClipRef, value: common::model::TextAlign) {
+    pub(crate) fn set_clip_text_event_align(&mut self, target: ClipKey, value: common::model::TextAlign) {
         self.mutate_text_events_in_clip(target, |e| e.align = value);
     }
 
     pub(crate) fn set_clip_text_event_fade_in_curve(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         curve: common::model::FadeCurve,
     ) {
         self.mutate_text_events_in_clip(target, |e| e.fade_in_curve = curve);
@@ -558,7 +550,7 @@ impl AppData {
 
     pub(crate) fn set_clip_text_event_fade_out_curve(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         curve: common::model::FadeCurve,
     ) {
         self.mutate_text_events_in_clip(target, |e| e.fade_out_curve = curve);
@@ -570,7 +562,7 @@ impl AppData {
     /// を回避。
     pub(crate) fn set_clip_text_num_field(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         field: TextNumField,
         value: f32,
     ) {
@@ -688,11 +680,10 @@ impl AppData {
 
     /// 編集対象 text クリップの現在のフォント名 (先頭 event)。text クリップで
     /// なければ `None`。
-    pub(crate) fn clip_text_font_family(&self, target: ClipRef) -> Option<String> {
+    pub(crate) fn clip_text_font_family(&self, target: ClipKey) -> Option<String> {
         self.song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
@@ -830,12 +821,11 @@ impl AppData {
     /// 化され現値を summary から直接読むため、 数値 buffer の再生成は不要に
     /// なった。 target が Text variant でないなら文字列 buffer を空にして
     /// `clip_edit_buffer_target` を `None`。
-    pub(crate) fn resync_clip_text_event_edit_buffers(&mut self, target: ClipRef) {
+    pub(crate) fn resync_clip_text_event_edit_buffers(&mut self, target: ClipKey) {
         let event_snapshot = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
@@ -858,8 +848,8 @@ impl AppData {
     /// 存在するか。
     pub fn inspector_text_event_summary(&self) -> Option<InspectorTextEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song_doc.song().tracks.get(cref.track as usize)?;
-        let clip = track.clips.get(cref.clip as usize)?;
+        let track = self.song_doc.song().track_by_id(cref.track_id)?;
+        let clip = track.clip_by_id(cref.clip_id)?;
         let common::model::ClipContent::Text(t) =
             self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
@@ -885,7 +875,7 @@ impl AppData {
         })
     }
 
-    pub(crate) fn set_clip_image_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
+    pub(crate) fn set_clip_image_event_fade_in_beats(&mut self, target: ClipKey, beats: f64) {
         // r.md #38: image_compose も event 長基準で fade を適用するので上限は event 長。
         self.mutate_image_events_in_clip(target, |e| {
             e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
@@ -893,7 +883,7 @@ impl AppData {
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    pub(crate) fn set_clip_image_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
+    pub(crate) fn set_clip_image_event_fade_out_beats(&mut self, target: ClipKey, beats: f64) {
         self.mutate_image_events_in_clip(target, |e| {
             e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
         });
@@ -902,7 +892,7 @@ impl AppData {
 
     pub(crate) fn set_clip_image_event_fade_in_curve(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         curve: common::model::FadeCurve,
     ) {
         self.mutate_image_events_in_clip(target, |e| e.fade_in_curve = curve);
@@ -910,7 +900,7 @@ impl AppData {
 
     pub(crate) fn set_clip_image_event_fade_out_curve(
         &mut self,
-        target: ClipRef,
+        target: ClipKey,
         curve: common::model::FadeCurve,
     ) {
         self.mutate_image_events_in_clip(target, |e| e.fade_out_curve = curve);
@@ -921,12 +911,11 @@ impl AppData {
     /// は text section と共有する `clip_edit_buffer_target` を current image
     /// clip に同期する純 marker (= image 編集パス各所から呼ばれる)。 target
     /// が image clip を解決できなければ `None` 化する。
-    pub(crate) fn resync_clip_image_event_edit_buffers(&mut self, target: ClipRef) {
+    pub(crate) fn resync_clip_image_event_edit_buffers(&mut self, target: ClipKey) {
         let resolved = self
             .song_doc.song()
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
+            .track_by_id(target.track_id)
+            .and_then(|t| t.clip_by_id(target.clip_id))
             .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .is_some_and(|content| matches!(content, common::model::ClipContent::Image(_)));
         self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
@@ -934,11 +923,11 @@ impl AppData {
 
     /// `target` が指す clip が `ClipContent::Image` か。 commit / fade /
     /// mute handler の kind dispatch で使う。 範囲外 / 別 variant は false。
-    pub fn is_image_clip(&self, target: ClipRef) -> bool {
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+    pub fn is_image_clip(&self, target: ClipKey) -> bool {
+        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
+        let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         matches!(
@@ -949,11 +938,11 @@ impl AppData {
 
     /// audio clip 判定。 `target` が指す clip が `ClipContent::Audio` か。
     /// MIDI / Vocal / 範囲外は false。 Audio Editor の open 判定で使う。
-    pub fn is_audio_clip(&self, target: ClipRef) -> bool {
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+    pub fn is_audio_clip(&self, target: ClipKey) -> bool {
+        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
+        let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         matches!(
@@ -964,11 +953,11 @@ impl AppData {
 
     /// ピアノロール対象 (= MIDI content) クリップか。歌唱 (VOICEVOX) クリップも
     /// MIDI content なので true (歌詞付き note としてピアノロールに出る)。範囲外 / 非 MIDI は false。
-    pub fn is_midi_clip(&self, target: ClipRef) -> bool {
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
+    pub fn is_midi_clip(&self, target: ClipKey) -> bool {
+        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
+        let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         matches!(

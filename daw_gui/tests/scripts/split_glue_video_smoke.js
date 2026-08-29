@@ -91,7 +91,7 @@ expectEq(s.tracks.length, 1, "initial tracks");
 expectEq(s.tracks[0].clips.length, 1, "initial clips");
 
 // ---- 3. hover を clip 中央 (beat 2.0) に置いて split --------------------
-daw.setHoverClip(JSON.stringify({ track: 0, clip: 0 }));
+daw.setHoverClip(JSON.stringify({ track_id: 1, clip_id: 1 }));
 daw.setHoverBeat(2.0);
 daw.dispatchSplit(false);
 
@@ -119,8 +119,8 @@ expectNear(bEv.source_end_micros, 4000000, 1, "back source_end");
 
 // ---- 4. 両方選択して glue → 1 つに戻る ---------------------------------
 daw.setSelection(JSON.stringify([
-  { track: 0, clip: 0 },
-  { track: 0, clip: 1 },
+  { track_id: 1, clip_id: 1 },
+  { track_id: 1, clip_id: 2 },
 ]));
 daw.dispatchGlue();
 

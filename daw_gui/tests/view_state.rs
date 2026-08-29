@@ -13,13 +13,13 @@ use common::model::PianoRollViewState;
 use common::protocol::PluginCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, ClipRef};
+use daw_gui::app::{AppData, AppEvent, ClipKey};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
 
-const CLIP_A: ClipRef = ClipRef { track: 0, clip: 0 };
-const CLIP_B: ClipRef = ClipRef { track: 1, clip: 0 };
+const CLIP_A: ClipKey = ClipKey { track_id: 1, clip_id: 1 };
+const CLIP_B: ClipKey = ClipKey { track_id: 2, clip_id: 1 };
 
 fn build_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
@@ -84,7 +84,7 @@ fn piano_roll_zoom_is_remembered_per_clip() {
 #[test]
 fn view_state_snapshot_restore_roundtrips() {
     let (mut app, _rx) = build_two_clip_app();
-    let key_a = app.clip_key_of(CLIP_A).expect("clip A は解決できる");
+    let key_a = app.live_clip_key(CLIP_A).expect("clip A は解決できる");
 
     // 代表的な表示状態を仕込む。
     app.ui_prefs.arrange_zoom_x = 50.0;
@@ -192,7 +192,7 @@ fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
 #[test]
 fn restore_none_clears_per_clip_but_keeps_globals() {
     let (mut app, _rx) = build_two_clip_app();
-    let key_a = app.clip_key_of(CLIP_A).expect("clip A は解決できる");
+    let key_a = app.live_clip_key(CLIP_A).expect("clip A は解決できる");
     app.ui_prefs.arrange_zoom_x = 42.0;
     app.ui_prefs.piano_roll_views.insert(key_a, PianoRollViewState::default());
 

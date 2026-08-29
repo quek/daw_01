@@ -79,8 +79,8 @@ daw.appLoadSongJson(JSON.stringify(song));
 let s = JSON.parse(daw.inspectSongJson());
 expectEq(s.tracks[0].clips[0].name, "clip1", "initial name");
 
-// ClipRef は index ベース (track 0 / clip 0)。
-const ref = JSON.stringify({ track: 0, clip: 0 });
+// ClipKey は index ベース (track 0 / clip 0)。
+const ref = JSON.stringify({ track_id: 1, clip_id: 1 });
 
 // ---- 3. rename ----------------------------------------------------------
 daw.dispatchRenameClip(ref, "Verse A");

@@ -62,8 +62,8 @@ const song = {
 };
 daw.appLoadSongJson(JSON.stringify(song));
 
-const bell = JSON.stringify({ track: 0, clip: 0 });
-const vox = JSON.stringify({ track: 1, clip: 0 });
+const bell = JSON.stringify({ track_id: 1, clip_id: 1 });
+const vox = JSON.stringify({ track_id: 2, clip_id: 1 });
 
 // ---- 2. 明示名優先: Bell は歌詞「あかねに」でなく明示名 "Bell" を表示 (#69) ----
 expectEq(daw.clipDisplayLabel(bell), "Bell", "Bell: explicit name beats lyric");

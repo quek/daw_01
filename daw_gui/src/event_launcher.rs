@@ -17,14 +17,13 @@
 //! - **束 C (widget)**: `ArrangementResponse` に `pub launcher: Vec<LauncherEvent>`
 //!   を足し、`arrangement_view` で
 //!   [`crate::view::launcher_keys::dispatch_launcher_events`] へ流す。
-//! - **束 B (engine)**: [`LauncherAudioCommand`] が `common::protocol::AudioCommand`
-//!   へ足してほしい variant の形。 protocol に入ったら
-//!   [`AppData::send_launcher_audio`](crate::state::AppData::send_launcher_audio)
-//!   の中身だけを差し替える (送信側はその 1 関数に閉じている)。
-//! - **モデル層**: [`LauncherBinding`] は `common::model::MidiBinding` を
-//!   ノート対応に拡張したときにそこへ移す。読み書きは
-//!   `AppData::launcher_bindings` / `add_launcher_binding` /
-//!   `clear_launcher_bindings` の 3 本だけを通す。
+//! - **engine への送信**: [`LauncherAudioCommand`] を
+//!   [`AppData::send_launcher_audio`](crate::state::AppData::send_launcher_audio) が
+//!   `common::protocol::AudioCommand` へ 1:1 で写す (送信側はその 1 関数に閉じている)。
+//! - **MIDI 割り当て**: 表は `Song.midi_bindings` **1 本**で、連続値のパラメータ (CC) と
+//!   ランチャー操作 (ノート / CC) が同じ場所に載る (`common::model::MidiBindInput` /
+//!   `BindingTarget`)。読み書きは `AppData::launcher_bindings` /
+//!   `add_launcher_binding` / `clear_launcher_bindings` の 3 本だけを通す。
 
 use common::model::{
     AutomationClipKey, AutomationLaneKey, ClipKey, FollowAction, FollowActionKind, LaunchMode,
@@ -160,6 +159,25 @@ pub struct LauncherCellMove {
     pub to_scene_index: usize,
 }
 
+/// アレンジのクリップを**セルへ**落とした 1 件。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipToCellDrop {
+    /// 掴んだアレンジのクリップ。
+    pub from: common::model::ClipKey,
+    pub to_row: LauncherRow,
+    /// [`LauncherCellMove::to_scene_index`] と同じ理由で **表示順 index**。
+    pub to_scene_index: usize,
+}
+
+/// セルを**アレンジのレーンへ**落とした 1 件。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellToArrangerDrop {
+    pub from: LauncherCellKey,
+    pub to_row: LauncherRow,
+    /// 落とした先の開始拍 (widget が snap 済で渡す)。
+    pub to_start_beat: f64,
+}
+
 /// ドロップの意味。 既存のクリップ規約そのまま (素で移動 / `Ctrl` でリンクコピー /
 /// `Ctrl+Shift` で独立コピー、`docs/plan_clip_share_clone.md`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,73 +187,11 @@ pub enum LauncherDropMode {
     CopyIndependent,
 }
 
-/// MIDI Learn で受ける入力の種類。 パッドはノートで撃つので **CC だけでは
-/// 足りない** (計画書 §3.5)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LauncherBindInput {
-    /// ノート番号 0..=127 (note-on で発火 / note-off で離す)。
-    Note(u8),
-    /// CC 番号 0..=127 (値 >= 64 で押下、 < 64 で離す)。
-    ControlChange(u8),
-}
-
-/// パッドから撃てるランチャー操作 (= `BindingTarget` へ足してほしい variant)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LauncherBindTarget {
-    /// 行 × 列 でセルを 1 つ指す。**セルの id ではなく `(track_id, scene_id)`**
-    /// にしてあるのは、パッドの物理位置が「このトラックのこの列」に対応するから
-    /// (セルを差し替えても同じパッドが新しいセルを撃つ)。
-    LaunchCell { track_id: u32, scene_id: u32 },
-    LaunchScene { scene_id: u32 },
-    StopRow { track_id: u32 },
-    StopAllRows,
-    SwitchRowToArranger { track_id: u32 },
-    SwitchAllToArranger,
-}
-
-impl LauncherBindTarget {
-    /// Learn ボタン / status 表示に出す日本語ラベル。
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::LaunchCell { .. } => "セルを撃つ",
-            Self::LaunchScene { .. } => "シーンを撃つ",
-            Self::StopRow { .. } => "行を止める",
-            Self::StopAllRows => "全行を止める",
-            Self::SwitchRowToArranger { .. } => "行をアレンジへ戻す",
-            Self::SwitchAllToArranger => "全行をアレンジへ戻す",
-        }
-    }
-}
-
-/// MIDI 入力 → ランチャー操作の binding 1 件。
+/// handler が engine へ送るランチャー操作の **GUI 側の形**。
 ///
-/// **`Song.midi_bindings` へ移すまでの暫定の置き場**
-/// (`MidiBinding` が CC 専用なので今は載らない)。 読み書きは
-/// `AppData::launcher_bindings` / `add_launcher_binding` /
-/// `clear_launcher_bindings` の 3 本だけ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LauncherBinding {
-    /// MIDI channel 0..=15、`16` = any-channel (既存 `MidiBinding` と同じ規約)。
-    pub channel: u8,
-    pub input: LauncherBindInput,
-    pub target: LauncherBindTarget,
-}
-
-impl LauncherBinding {
-    /// 受信した MIDI がこの binding に当たるか。
-    #[must_use]
-    pub fn matches(self, channel: u8, input: LauncherBindInput) -> bool {
-        (self.channel == channel || self.channel == 16) && self.input == input
-    }
-}
-
-/// 束 B が `common::protocol::AudioCommand` へ足すまでの **送信の形**。
-///
-/// engine 側の実装はこの 7 つを受ければ足りる (計画書 §2.2)。 protocol に
-/// 入ったら [`AppData::send_launcher_audio`](crate::state::AppData::send_launcher_audio)
-/// の中身を `self.send_audio(AudioCommand::…)` に差し替えるだけで、
-/// 呼び出し側 (handler) は 1 行も変わらない。
+/// [`AppData::send_launcher_audio`](crate::state::AppData::send_launcher_audio) が
+/// `common::protocol::AudioCommand` へ 1:1 で写す。行を `LauncherRow` (GUI の語彙) の
+/// まま持てるので、呼び出し側が `(track_id, lane_id)` へ潰す必要がない。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LauncherAudioCommand {
     /// セルを撃つ / 離す。`pressed` の解釈 (Trigger / Gate / Toggle / Repeat) は
@@ -247,7 +203,6 @@ pub enum LauncherAudioCommand {
     StopAllRows,
     SwitchRowToArranger { row: LauncherRow },
     SwitchAllToArranger,
-    SetGlobalLaunchQuantize(LaunchQuantize),
 }
 
 /// ランチャーの GUI イベント。 発生源は 4 つ — ランチャー widget (束 C) /
@@ -275,12 +230,16 @@ pub enum LauncherEvent {
 
     // ---- 表示 (計画書 Q5 / Q5-b) --------------------------------------
     SetLayout(common::model::LauncherLayout),
-    /// `Ctrl+Tab` / View メニュー: 両方 → ランチャーのみ → アレンジのみ。
+    /// `Tab` / View メニュー: 両方 → ランチャーのみ → アレンジのみ。
     CycleLayout,
 
     // ---- 選択とフォーカス ---------------------------------------------
     /// セル本体クリック = 選択 (修飾キーは既存のクリップ規約どおり)。
     SelectCell { cell: LauncherCellKey, modifier: SelectModifier },
+    /// セルのダブルクリック = 選択してからそのセルの編集面を開く
+    /// (MIDI ならピアノロール / オーディオならオーディオエディタ)。
+    /// アレンジのクリップのダブルクリックと**同じ到達先**。
+    OpenCellEditor(LauncherCellKey),
     /// キーボード操作の起点を置く (セル click / 矢印移動の着地点)。
     /// 空セルにも置けるので id ではなく **行 + 列 index**。
     FocusCell { row: LauncherRow, scene_index: usize },
@@ -295,6 +254,9 @@ pub enum LauncherEvent {
 
     // ---- 列 (シーン) の CRUD (計画書 §6) ------------------------------
     AddScene,
+    /// 表示順 `index` の位置に列を実体化する (プレースホルダ列の右クリック)。
+    /// 末尾追加 (`AddScene`) だと「列 5 を右クリックしたのに列 1 が生える」。
+    AddSceneAt(usize),
     DeleteScenes(Vec<u32>),
     /// 表示順の並べ替え (見出しのドラッグ)。
     MoveScene { scene_id: u32, to_index: usize },
@@ -318,13 +280,22 @@ pub enum LauncherEvent {
     DuplicateCells { cells: Vec<LauncherCellKey>, unique: bool },
     /// ドラッグの release で確定する移動 / コピー。
     MoveCells { moves: Vec<LauncherCellMove>, mode: LauncherDropMode },
+    /// アレンジのクリップをセルへ運んだ (帯とレーンを跨ぐドラッグ)。
+    DropClipsToCells { drops: Vec<ClipToCellDrop>, mode: LauncherDropMode },
+    /// セルをアレンジのレーンへ運んだ。
+    DropCellsToArranger { drops: Vec<CellToArrangerDrop>, mode: LauncherDropMode },
 
     // ---- ローンチ設定 (計画書 §3.4) ------------------------------------
     SetLaunchSettings { cells: Vec<LauncherCellKey>, edit: LaunchEdit },
+    /// セルの長さ (= ループ長、拍)。アレンジのクリップは端をドラッグして変えるが、
+    /// セルは格子の中の固定サイズなので**掴む端が無い**。インスペクタの数値欄が
+    /// 唯一の口 (これが無いと新規セルは既定長のまま変えられず、
+    /// 「4 小節書いても 1 小節でループする」になる)。
+    SetCellLength { cells: Vec<LauncherCellKey>, beats: f64 },
 
     // ---- MIDI (計画書 §3.5) --------------------------------------------
     /// 次に届いたノート / CC をこの操作へ bind する。
-    StartLearn(LauncherBindTarget),
+    StartLearn(common::model::BindingTarget),
     CancelLearn,
     /// bind 表を空にする (インスペクタの「割り当てを消す」)。
     ClearBindings,
@@ -340,7 +311,7 @@ impl LauncherEvent {
             E::LaunchCell { .. } | E::LaunchScene { .. } | E::LaunchFocused => "セルを撃つ",
             E::StopRow { .. } | E::StopAllRows => "ランチャーを止める",
             E::RowToArranger { .. } | E::AllToArranger => "アレンジに戻す",
-            E::AddScene | E::CaptureScene => "シーン追加",
+            E::AddScene | E::AddSceneAt(..) | E::CaptureScene => "シーン追加",
             E::DeleteScenes(..) => "シーン削除",
             E::MoveScene { .. } => "シーン並べ替え",
             E::SetSceneColor { .. } => "シーン色変更",
@@ -349,7 +320,10 @@ impl LauncherEvent {
             E::DeleteCells(..) => "セル削除",
             E::DuplicateCells { .. } => "セル複製",
             E::MoveCells { .. } => "セル移動",
+            E::DropClipsToCells { .. } => "セルへ運ぶ",
+            E::DropCellsToArranger { .. } => "アレンジへ運ぶ",
             E::SetLaunchSettings { .. } => "ローンチ設定",
+            E::SetCellLength { .. } => "セルの長さ",
             E::SetSceneFollow { .. } => "フォローアクション",
             // 非編集 (表示 / 選択 / MIDI learn) は snapshot を積まないので
             // ラベルは記録されない。

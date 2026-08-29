@@ -17,7 +17,7 @@ use daw_ui_core::{
 use daw_ui_renderer::Rect;
 
 use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ChainEntry, ClipRef, ColorPickerTarget,
+    text_num_to_builtin, AppData, AppEvent, ChainEntry, ClipKey, ColorPickerTarget,
     DeviceDragPayload, DiscreteClipEdit, FadeEdgeKind, InspectorScrubField, RelocateDevices,
     TalkParamKind, TextNumField,
 };
@@ -88,7 +88,7 @@ fn scrub_field(
     fmt: ScrubableNumberFormat,
     style: &ScrubableNumberStyle,
     scrub_key: InspectorScrubField,
-    make_event: impl Fn(ClipRef, f64) -> AppEvent + Clone + Send + Sync + 'static,
+    make_event: impl Fn(ClipKey, f64) -> AppEvent + Clone + Send + Sync + 'static,
 ) {
     // 複数選択時は inspector_target_refs 全体へ broadcast する。 値が
     // 割れている field は `value == None` で渡され、 placeholder「—」を表示 (編集

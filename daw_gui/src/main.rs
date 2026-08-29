@@ -430,6 +430,9 @@ fn spawn_playhead_poller(
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
+        // r.md #87: ランチャーの走行状態 (行数ぶん)。peaks / mod と同じく使い回す。
+        let mut launcher_buf: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)> =
+            Vec::with_capacity(common::audio_bridge::MAX_LAUNCHER_ROWS);
         // r.md #50: マスター出力サンプルのリング読み手と、そこから全メーターを
         // 導く解析器。ここが唯一の読み手 (単一 reader 前提のカーソル)。
         let mut scope_reader = scope.reader();
@@ -519,6 +522,17 @@ fn spawn_playhead_poller(
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             if proxy
                 .send_event(AppEvent::TrackPeaksTick(std::mem::take(&mut peaks_buf)))
+                .is_err()
+            {
+                break;
+            }
+            // r.md #87: ランチャーの走行状態 (いま鳴っているセル / 予約 / 進捗)。
+            // **`Song` には入らない表示専用データ** (計画書 §1.4) なので、peaks と
+            // 同じ観測面で 30Hz で流す。フォローアクションで移った先はここにしか
+            // 出ないため、これが無いとグリッドと映像だけ前のセルに取り残される。
+            bridge.launcher_row_snapshots(&mut launcher_buf);
+            if proxy
+                .send_event(AppEvent::LauncherRowsTick(std::mem::take(&mut launcher_buf)))
                 .is_err()
             {
                 break;

@@ -197,19 +197,28 @@ pub fn buffer_is_idle(
 ///
 /// - loop が有効なら loop 終端で wrap する (録音中も同じ — ループ録音は
 ///   「範囲を繰り返す」意図なので、そこで曲末判定を持ち出さない)。
-/// - loop が無効なら曲末で停止する。ただし **録音中は停止しない**: 録音は曲の
-///   後ろへ素材を継ぎ足す操作でもあり、最後のクリップの末尾で勝手に止まると
-///   曲の続きを録れない (参照 DAW 5 製品とも曲末で録音を止めない)。
+/// - loop が無効なら曲末で停止する。ただし **`keep_rolling` なら停止しない**。
+///
+/// `keep_rolling` に含まれるのは 2 つ:
+/// - **録音中** — 録音は曲の後ろへ素材を継ぎ足す操作でもあり、最後のクリップの
+///   末尾で勝手に止まると曲の続きを録れない (参照 DAW 5 製品とも曲末で録音を
+///   止めない)。
+/// - **ランチャーが鳴っている** (r.md #87) — セルはアレンジのクリップの外側で
+///   自分の時間軸を回すので、「アレンジの曲末」は再生をやめる理由にならない。
+///   ここを見落とすと、アレンジが空の曲でセルを撃った瞬間に曲末判定が立ち、
+///   **1 小節ほど鳴ってから勝手に停止する** (= ループしないように見える。
+///   トランスポートのループを ON にすると曲末判定が使われなくなるので直る、
+///   という紛らわしい症状になる)。
 #[must_use]
 pub fn reached_transport_end(
-    recording_requested: bool,
+    keep_rolling: bool,
     active_loop_end: Option<u64>,
     new_playhead: u64,
     song_has_ended: bool,
 ) -> bool {
     match active_loop_end {
         Some(end) => new_playhead >= end,
-        None => !recording_requested && song_has_ended,
+        None => !keep_rolling && song_has_ended,
     }
 }
 
@@ -263,7 +272,8 @@ mod idle_park_tests {
     fn recording_suppresses_song_end_stop_but_not_loop_wrap() {
         // (recording, loop_end, playhead, song_ended, expect_reached_end)
         let cases = [
-            // ループ無し + 曲末: 再生は止まる / 録音は止まらない (継ぎ足せる)。
+            // ループ無し + 曲末: 再生は止まる / 録音中とランチャー走行中は止まらない
+            // (`keep_rolling`)。
             (false, None, 1_000, true, true),
             (true, None, 1_000, true, false),
             // ループ無し + 曲の途中: どちらも止まらない。
@@ -273,11 +283,11 @@ mod idle_park_tests {
             (true, Some(900), 1_000, false, true),
             (true, Some(1_200), 1_000, true, false),
         ];
-        for (recording, loop_end, playhead, ended, expect) in cases {
+        for (keep_rolling, loop_end, playhead, ended, expect) in cases {
             assert_eq!(
-                reached_transport_end(recording, loop_end, playhead, ended),
+                reached_transport_end(keep_rolling, loop_end, playhead, ended),
                 expect,
-                "recording={recording} loop_end={loop_end:?} ph={playhead} ended={ended}"
+                "keep_rolling={keep_rolling} loop_end={loop_end:?} ph={playhead} ended={ended}"
             );
         }
     }
@@ -546,12 +556,6 @@ pub struct EngineShared {
     /// export 共通 (§5 — 旧実装は CPAL interleave 段のみで export に乗らず、
     /// master gain が WAV に反映されなかった)。
     pub master_gain: AtomicU32,
-    /// r.md #87: グローバルローンチ量子化 (`crate::launcher::quantize::encode` の
-    /// 1 ワード表現)。セルの [`common::model::LaunchQuantize::Global`] がここへ
-    /// 解決される。**live (audio thread) と書き出し (freewheel) の両方が読む**ので
-    /// `EngineShared` に置く (不変条件 6 — 片方だけ別の値で走ると音が変わる)。
-    /// 起動時は `Global` の encode = 0 で、解決側が既定 (1 小節) へ倒す。
-    pub global_launch_quantize: AtomicU32,
     /// 安定 `device_id` → プラグインが報告した processing latency (samples)。
     /// `AudioCommand::SetDeviceLatency` で recv loop が差し替え、
     /// `compile_schedule` (live publish / export の両方) が PDC の入力に読む。
@@ -625,7 +629,6 @@ impl EngineShared {
             preroll_remaining_samples: AtomicU64::new(0),
             recording_requested: AtomicBool::new(false),
             master_gain: AtomicU32::new(1.0_f32.to_bits()),
-            global_launch_quantize: AtomicU32::new(0),
             device_latencies: ArcSwap::from_pointee(HashMap::new()),
             last_buffer_frames: AtomicU32::new(0),
             mmcss_join_failed: AtomicBool::new(false),
@@ -1147,12 +1150,16 @@ impl LocalState {
         let loop_region = **shared.loop_region.load();
         let looping = loop_region.enabled;
         let metronome_enabled = shared.metronome_enabled.load(Ordering::Acquire);
-        // r.md #87: グローバルローンチ量子化も同じ「buffer 頭で 1 回だけ読む」
-        // 規約に乗せる (行ごとに load すると、同じ buffer 内で行ごとに別の格子へ
-        // 発火しうる)。
-        let global_launch_quantize = crate::launcher::quantize::decode(
-            self.shared.global_launch_quantize.load(Ordering::Acquire),
-        );
+        // r.md #87: グローバルローンチ量子化。**SSoT は `Song`** — セルの量子化が
+        // `Global` のとき「いつ鳴り始めるか」がこれで決まり、書き出す音が変わるので
+        // 曲の一部 (計画書 Q9 / Q10)。`SetGlobalLaunchQuantize` は同じ値を即時に
+        // 効かせるための速報で、`LoadSong` が届けば必ず上書きされる。
+        // buffer 頭で 1 回だけ読む (行ごとに読むと、同じ buffer 内で行ごとに別の
+        // 格子へ発火しうる)。
+        let global_launch_quantize = song_snapshot
+            .as_ref()
+            .map(|s| s.global_launch_quantize)
+            .unwrap_or(common::model::DEFAULT_GLOBAL_LAUNCH_QUANTIZE);
 
         // r.md #51: transport の要求 (Play / Stop) と seek の消費、および
         // 「今どういう状態か」の publish は **どの早期 return よりも先に**行う。
@@ -1162,6 +1169,12 @@ impl LocalState {
         // - count-in を取り消したのに preroll が 0 になった瞬間に曲が鳴り出す
         // - 書き出しが終わった瞬間に (誰も押していないのに) 再生が再開する
         // という 2 つの取りこぼしが起きていた。要求は届いた順に必ず消費する。
+        // r.md #87: 「停止中に撃ったか」は **transport 要求を消費する前**の状態でしか
+        // 分からない。GUI はセル / シーンの発火と同時に Play を送る (停止したまま
+        // ▶ を押しても鳴らないのは操作として壊れている) ので、消費後に見ると
+        // 「再生中に撃った」と区別がつかず、量子化待ちに入って最大 1 小節鳴らない。
+        // 発火拍の解決 (`launcher.update`) だけがこの値を使う。
+        let was_playing = self.playing;
         self.consume_transport_requests(shared);
         let recording_requested = self.shared.recording_requested.load(Ordering::Acquire);
         let preroll =
@@ -1182,6 +1195,9 @@ impl LocalState {
         // collision on the shared plugin-host worker slots).
         if export_running {
             self.shared.live_parked.store(true, Ordering::Release);
+            // r.md #87: 書き出し中に届いたローンチ操作は捨てる。溜めておくと
+            // 書き出し明けに **全部同時に**発火し、64 件で溢れた分は無言で消える。
+            self.launcher.clear_requests();
             return;
         }
         self.shared.live_parked.store(false, Ordering::Release);
@@ -1232,6 +1248,8 @@ impl LocalState {
                 .preroll_remaining_samples
                 .store(new_preroll, Ordering::Release);
             bridge.set_preroll_remaining(new_preroll);
+            // count-in 中のローンチ操作も溜めない (上と同じ理由)。
+            self.launcher.clear_requests();
             return;
         }
 
@@ -1251,7 +1269,12 @@ impl LocalState {
         // していなければ (= IPC SeekTo / Play edge / loop wrap / 起動直後)
         // tempo map で正確に beat を逆算する (A10 r.md #8)。
         if playhead != self.last_known_playhead {
+            let prev_beats = self.playhead_beats;
             self.playhead_beats = self.tempo_map.samples_to_beat(playhead, sample_rate);
+            // r.md #87: 跳んだぶんだけランチャーの絶対拍も動かす (`on_transport_jump`
+            // の doc — これが無いと seek の後にセルが 1 周無音になり、予約と
+            // フォローアクションを跳び越して二度と発火しない)。
+            self.launcher.on_transport_jump(self.playhead_beats - prev_beats);
         }
         // 今 buffer の effective bpm を SongTempo lane から評価する。
         // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
@@ -1319,7 +1342,7 @@ impl LocalState {
                 sample_rate,
                 n as u32,
             );
-            self.launcher.update(song, span, global_launch_quantize, playing);
+            self.launcher.update(song, span, global_launch_quantize, was_playing);
 
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
             // master fx → master gain。
@@ -1469,8 +1492,9 @@ impl LocalState {
             } else {
                 None
             };
+            // r.md #87: ランチャーが鳴っている間は曲末で止めない (上の doc)。
             let reached_end = reached_transport_end(
-                recording_requested,
+                recording_requested || self.launcher.any_cell_playing(),
                 active_end,
                 new_ph,
                 song_ended(song_ref, sample_rate, new_ph),
@@ -1495,7 +1519,11 @@ impl LocalState {
                     // A10 (r.md #8): loop start の beat も tempo map で正確に
                     // 逆算 (constant-bpm 線形推定は tempo automation 中の loop
                     // boundary でズレた)。
+                    let prev_beats = self.playhead_beats;
                     self.playhead_beats = self.tempo_map.samples_to_beat(new_ph, sample_rate);
+                    // r.md #87: ループで巻き戻したぶん、ランチャーの絶対拍も戻す
+                    // (セルの位相はループを跨いでも連続する)。
+                    self.launcher.on_transport_jump(self.playhead_beats - prev_beats);
                 } else {
                     self.playing = false;
                     shared

@@ -8,12 +8,16 @@
 use common::model::{AudioContent, AudioEvent, Clip, ClipContent, MidiContent, Note};
 
 use daw_gui::app::AppEvent;
-use daw_gui::app_types::ClipRef;
+use daw_gui::app_types::ClipKey;
 
 use super::support;
 
-const A: ClipRef = ClipRef { track: 0, clip: 0 };
-const B: ClipRef = ClipRef { track: 0, clip: 1 };
+const A: ClipKey = ClipKey { track_id: TRACK_ID, clip_id: 1 };
+const B: ClipKey = ClipKey { track_id: TRACK_ID, clip_id: 2 };
+/// `support::build_app` の既定トラックの id (住所は index ではなく安定 id)。
+/// 起動時の 1 本目は allocator から採るので 1 (r.md #87 — id 0 は未採番の
+/// sentinel で、実トラックの住所に使うとランチャーの行キーと衝突する)。
+const TRACK_ID: u32 = 1;
 
 /// 48kHz / 120bpm → 1 拍 = 24000 frame。 8 拍ぶんの source を丸ごと鳴らす
 /// audio event 1 つを、content を共有する 2 clip (A: 0 拍 / B: 16 拍) が見る。
@@ -66,8 +70,9 @@ fn shared_event(app: &daw_gui::app::AppData) -> AudioEvent {
     }
 }
 
-fn clip(app: &daw_gui::app::AppData, r: ClipRef) -> Clip {
-    app.song_doc.song().tracks[0].clips[r.clip as usize].clone()
+fn clip(app: &daw_gui::app::AppData, r: ClipKey) -> Clip {
+    // 住所は安定 id (index ではない)。
+    app.song_doc.song().clip_by_key(r).expect("clip exists").clone()
 }
 
 /// A の右端を 8 → 4 拍に縮めても、共有 content と相方 B の窓は一切変わらない。

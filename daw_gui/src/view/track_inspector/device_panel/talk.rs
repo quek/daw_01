@@ -23,11 +23,11 @@ pub(super) fn draw_talk(
         return y;
     }
     let Some(r) = app.selected_clip_ref() else { return y };
-    let Some(track) = app.song_doc.song().tracks.get(r.track as usize) else { return y };
+    let Some(track) = app.song_doc.song().track_by_id(r.track_id) else { return y };
     if !track.is_voicevox_vocal() {
         return y;
     }
-    let Some(clip) = track.clips.get(r.clip as usize) else { return y };
+    let Some(clip) = track.clip_by_id(r.clip_id) else { return y };
     if !app
         .song_doc
         .song()

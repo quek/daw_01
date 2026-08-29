@@ -106,17 +106,17 @@ impl AppData {
         }
 
         // Group selected clips by track.
-        let mut by_track: std::collections::BTreeMap<u32, Vec<ClipRef>> =
+        let mut by_track: std::collections::BTreeMap<u32, Vec<ClipKey>> =
             std::collections::BTreeMap::new();
         for r in self.selected_clip_refs() {
-            by_track.entry(r.track).or_default().push(r);
+            by_track.entry(r.track_id).or_default().push(r);
         }
 
-        let mut new_refs: Vec<ClipRef> = Vec::new();
+        let mut new_refs: Vec<ClipKey> = Vec::new();
         let mut glued_count = 0usize;
         let mut had_mixed_kind = false;
 
-        for (track_idx, mut refs) in by_track {
+        for (track_id, mut refs) in by_track {
             if refs.len() < 2 {
                 continue;
             }
@@ -124,16 +124,14 @@ impl AppData {
             refs.sort_by(|a, b| {
                 let ta = self
                     .song_doc.song()
-                    .tracks
-                    .get(a.track as usize)
-                    .and_then(|t| t.clips.get(a.clip as usize))
+                    .track_by_id(a.track_id)
+                    .and_then(|t| t.clip_by_id(a.clip_id))
                     .map(|c| c.start_beat)
                     .unwrap_or(f64::INFINITY);
                 let tb = self
                     .song_doc.song()
-                    .tracks
-                    .get(b.track as usize)
-                    .and_then(|t| t.clips.get(b.clip as usize))
+                    .track_by_id(b.track_id)
+                    .and_then(|t| t.clip_by_id(b.clip_id))
                     .map(|c| c.start_beat)
                     .unwrap_or(f64::INFINITY);
                 ta.total_cmp(&tb)
@@ -153,10 +151,10 @@ impl AppData {
             }
             let mut glue_kind: Option<GlueKind> = None;
             for r in &refs {
-                let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
+                let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
                     continue;
                 };
-                let Some(clip) = track.clips.get(r.clip as usize) else {
+                let Some(clip) = track.clip_by_id(r.clip_id) else {
                     continue;
                 };
                 let Some(content) = self.song_doc.song().clip_contents.get(&clip.content_id)
@@ -214,10 +212,10 @@ impl AppData {
             let mut frags = Fragments::default();
 
             for r in &refs {
-                let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
+                let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
                     continue;
                 };
-                let Some(clip) = track.clips.get(r.clip as usize) else {
+                let Some(clip) = track.clip_by_id(r.clip_id) else {
                     continue;
                 };
                 let s = clip.start_beat;
@@ -377,11 +375,9 @@ impl AppData {
                 // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
                 // merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
                 let (glue_speaker, glue_singer, glue_style, glue_talk, glue_muted) = {
-                    let track = &song.tracks[track_idx as usize];
-                    refs.iter()
-                        .map(|r| r.clip as usize)
-                        .min()
-                        .and_then(|i| track.clips.get(i))
+                    // `refs` は上で start_beat 昇順に並べ替え済みなので先頭が代表。
+                    refs.first()
+                        .and_then(|r| song.clip_by_key(*r))
                         .map(|c| {
                             (
                                 c.speaker_id,
@@ -393,21 +389,16 @@ impl AppData {
                         })
                         .unwrap_or((0, String::new(), String::new(), None, false))
                 };
-                // Remove source clips (descending index to keep earlier
-                // indices stable).
-                let track = &mut song.tracks[track_idx as usize];
-                let mut indices: Vec<usize> =
-                    refs.iter().map(|r| r.clip as usize).collect();
-                indices.sort_unstable();
-                indices.dedup();
-                for &idx in indices.iter().rev() {
-                    if idx < track.clips.len() {
-                        track.clips.remove(idx);
-                    }
+                // 元クリップを消す。住所が id なので「後ろから消して index の
+                // 詰まりを避ける」儀式は要らない。
+                let Some(track) = song.track_by_id_mut(track_id) else {
+                    return;
+                };
+                for r in &refs {
+                    track.remove_clip_by_id(r.clip_id);
                 }
                 // Append the merged clip.
                 let new_clip_id = track.alloc_clip_id();
-                let new_idx = track.clips.len() as u32;
                 track.clips.push(Clip {
                     id: new_clip_id,
                     start_beat: combined_start,
@@ -424,10 +415,7 @@ impl AppData {
                     style_name: glue_style,
                     talk: glue_talk,
                 });
-                new_refs.push(ClipRef {
-                    track: track_idx,
-                    clip: new_idx,
-                });
+                new_refs.push(ClipKey { track_id, clip_id: new_clip_id });
                 glued_count += 1;
             });
         }

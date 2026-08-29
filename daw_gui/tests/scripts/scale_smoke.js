@@ -58,7 +58,7 @@ const song = {
 daw.appLoadSongJson(JSON.stringify(song));
 
 // selected_clip を必須にする (= setNotePositions / quantize の前提)
-daw.setSelection(JSON.stringify([{ track: 0, clip: 0 }]));
+daw.setSelection(JSON.stringify([{ track_id: 1, clip_id: 1 }]));
 
 // ---- 2. scale 設定: C Major ---------------------------------------------
 daw.setScaleAtPlayhead(0, "Major");
@@ -69,7 +69,7 @@ expectEq(s.scale_changes[0].root, 0, "scale_changes[0].root");
 expectEq(s.scale_changes[0].scale, "Major", "scale_changes[0].scale");
 
 // ---- 3. snap OFF 状態 (default) で out-of-scale pitch 追加 → raw のまま -
-daw.addNote(0, 0, 0.0, 1.0, 61); // C# (C Major で out)
+daw.addNote(1, 1, 0.0, 1.0, 61); // C# (C Major で out)
 s = JSON.parse(daw.inspectSongJson());
 let notes = s.clip_contents["1"].notes;
 expectEq(notes.length, 1, "after first addNote: count");
@@ -77,7 +77,7 @@ expectEq(notes[0].pitch, 61, "snap OFF: pitch unchanged (61=C#)");
 
 // ---- 4. Snap on Draw ON で out-of-scale 入力 → in-scale snap ------------
 daw.toggleSnapOnDraw();
-daw.addNote(0, 0, 1.0, 1.0, 61); // C# → 期待 D (62、 同距離 up 優先)
+daw.addNote(1, 1, 1.0, 1.0, 61); // C# → 期待 D (62、 同距離 up 優先)
 s = JSON.parse(daw.inspectSongJson());
 notes = s.clip_contents["1"].notes;
 expectEq(notes.length, 2, "after second addNote: count");
@@ -95,8 +95,8 @@ expectEq(notes[0].pitch, 67, "snap ON: 66 (F#) → 67 (G, up 優先)");
 // ---- 6. quantize: out-of-scale note を一括補正 --------------------------
 // snap OFF に戻して out-of-scale note を直接追加 (= snap がかかってない note)
 daw.toggleSnapOnDraw(); // OFF
-daw.addNote(0, 0, 3.0, 1.0, 68); // G# (out)
-daw.addNote(0, 0, 4.0, 1.0, 70); // A# (out)
+daw.addNote(1, 1, 3.0, 1.0, 68); // G# (out)
+daw.addNote(1, 1, 4.0, 1.0, 70); // A# (out)
 s = JSON.parse(daw.inspectSongJson());
 notes = s.clip_contents["1"].notes;
 expectEq(notes.length, 4, "after out-of-scale adds");
@@ -121,7 +121,7 @@ expectEq(s.scale_changes.length, 0, "scale_changes cleared");
 
 // ---- 8. scale 空 + Snap on Draw ON → snap が no-op (raw pitch) ----------
 daw.toggleSnapOnDraw(); // 再 ON
-daw.addNote(0, 0, 6.0, 1.0, 61); // C#、 scale 空なので snap が unwrap_or で raw
+daw.addNote(1, 1, 6.0, 1.0, 61); // C#、 scale 空なので snap が unwrap_or で raw
 s = JSON.parse(daw.inspectSongJson());
 notes = s.clip_contents["1"].notes;
 const last = notes[notes.length - 1];

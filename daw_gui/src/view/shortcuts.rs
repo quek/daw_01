@@ -125,8 +125,6 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "select_all", keys: &["Ctrl+A"], category: ShortcutCategory::Edit, description: "すべて選択 (文脈依存)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "delete", keys: &["Delete"], category: ShortcutCategory::Edit, description: "削除 (選択中の面)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "escape", keys: &["Esc"], category: ShortcutCategory::Edit, description: "閉じる / 選択解除 / 編集をキャンセル", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
-    ShortcutDef { name: "tab_next", keys: &["Tab"], category: ShortcutCategory::Edit, description: "次の入力欄へ", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
-    ShortcutDef { name: "tab_prev", keys: &["Shift+Tab"], category: ShortcutCategory::Edit, description: "前の入力欄へ", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // ----- 再生 -----
     ShortcutDef { name: "daw.play_toggle", keys: &["Space"], category: ShortcutCategory::Transport, description: "再生 / 停止", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_loop", keys: &["P"], category: ShortcutCategory::Transport, description: "ループ ON / OFF", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
@@ -183,10 +181,14 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.toggle_preview_window", keys: &["F12"], category: ShortcutCategory::GridView, description: "ビデオプレビューウィンドウを開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_master_panel", keys: &["Ctrl+Alt+M"], category: ShortcutCategory::GridView, description: "マスターパネル (フェーダー + 各種メーター) を開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // r.md #87 (クリップランチャー、計画書 Q5-b): 両方 → ランチャーのみ → アレンジのみ を巡回。
-    // **`Tab` 単体は入力欄の移動 (`tab_next`) に取られている**ので使えない。修飾付きの
-    // `Ctrl+Tab` は `Shortcut::matches` が修飾を完全一致で見るので `tab_next` とは衝突しない。
-    // `typing_only` は立てない — テキスト編集中の Ctrl+Tab に編集側の意味は無い。
-    ShortcutDef { name: "daw.cycle_launcher_layout", keys: &["Ctrl+Tab"], category: ShortcutCategory::GridView, description: "ランチャー帯の表示を巡回 (両方 → ランチャーのみ → アレンジのみ)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // Ableton と同じ `Tab` 単体。daw-ui core の default binding には `tab_next` / `tab_prev`
+    // (Tab focus traversal) があるが、**daw_gui はこの表からしか map を組まない**
+    // (`daw_shortcut_map` は `ShortcutMap::new()` 始まり) ので、ここに宣言しなければ
+    // Tab は完全にこちらのもの。traversal 側は `Ui::focusable` の登録が daw_gui / daw-ui
+    // widget に 1 つも無く実挙動が無かったため、宣言ごと落とした。
+    // `typing_only` は立てる — 名前の編集中に Tab で帯が飛ぶのは事故なので、
+    // テキスト入力中は shortcut 層で消費しない。
+    ShortcutDef { name: "daw.cycle_launcher_layout", keys: &["Tab"], category: ShortcutCategory::GridView, description: "ランチャー帯の表示を巡回 (両方 → ランチャーのみ → アレンジのみ)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     // ランチャーのセルを撃つ。矢印での選択移動は **既存の nudge 系 binding
     // (`daw.nudge_note_*`) を文脈で振り分ける** ので、ここに行を足さない —
     // `ShortcutMap::matches` は同じキーに複数の name が bind されていても

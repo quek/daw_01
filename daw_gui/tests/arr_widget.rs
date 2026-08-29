@@ -1278,8 +1278,9 @@ fn header_splitter_in_arranger_band_does_not_start_section_drag() {
     add_section(&mut app, 1, 0.0, 4.0);
     let start_before = section_start(&app, 1);
     let mut host = UiHost::no_redraw();
-    // header splitter の hot zone は境界 ±`header_resize_handle_px/2`。
-    let bx = header_right(HEADER_W) + 1.0;
+    // r.md #87: header splitter の hot zone は **境界の左** `header_resize_handle_px`
+    // (右はランチャーの停止列なので食わない)。
+    let bx = header_right(HEADER_W) - 1.0;
     drive(&mut host, &mut app, press(bx, SEC_Y, no_mods()));
     drive(&mut host, &mut app, hold(bx + 59.0, SEC_Y, no_mods()));
     drive(&mut host, &mut app, release(bx + 59.0, SEC_Y, no_mods()));
@@ -1300,7 +1301,8 @@ fn header_splitter_in_ruler_does_not_seek_playhead() {
     let before = app.transport.playhead_beat;
     let mut host = UiHost::no_redraw();
     let ruler_y = 10.0;
-    let bx = header_right(HEADER_W) + 1.0;
+    // hot zone は境界の左 (r.md #87)。
+    let bx = header_right(HEADER_W) - 1.0;
     drive(&mut host, &mut app, press(bx, ruler_y, no_mods()));
     drive(&mut host, &mut app, hold(bx + 59.0, ruler_y, no_mods()));
     drive(&mut host, &mut app, release(bx + 59.0, ruler_y, no_mods()));
@@ -2165,5 +2167,67 @@ fn launcher_empty_cell_double_click_reports_create_cell() {
     assert!(
         app.song_doc.song().scenes.is_empty(),
         "widget は列を実体化しない (開いただけで `*` が立たない)"
+    );
+}
+
+/// ランチャー帯を出していても、**アレンジのクリップ**のダブルクリックはピアノロールを開く
+/// (帯の挿入で `lanes` の原点が右へずれるので、当たり判定がずれていないかの回帰)。
+#[test]
+fn アレンジのクリップのダブルクリックは帯を出していてもピアノロールを開く() {
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    app.ui_prefs.bottom_panel = 0;
+    let mut host = UiHost::no_redraw();
+    let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
+    let (_, rect) = r0.clip_rects.first().copied().expect("アレンジのクリップ rect が返る");
+    let (x, y) = (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+    for p in [
+        press(x, y, no_mods()),
+        release(x, y, no_mods()),
+        press(x, y, no_mods()),
+        release(x, y, no_mods()),
+    ] {
+        drive_response(&mut host, &mut app, p);
+    }
+    assert_eq!(app.ui_prefs.bottom_panel, 1, "ピアノロールのタブが開く");
+}
+
+/// セル (クリップ有り) のダブルクリック → `OpenCellEditor` の意図。
+/// 実際に編集面が開くところは `launcher_wiring.rs` (handler 側) が見る。
+#[test]
+fn セルのダブルクリックは編集面を開く意図を出す() {
+    use daw_gui::widgets::arrangement::LauncherIntent;
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    add_session_cell(&mut app, 1, 9, 4.0);
+    app.ui_prefs.bottom_panel = 0;
+    let mut host = UiHost::no_redraw();
+    let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
+    let (_, rect) = r0
+        .launcher
+        .cell_rects
+        .iter()
+        .copied()
+        .find(|(k, _)| k.clip_id == 9)
+        .expect("置いたセルの rect が返る");
+    // ▶ を外した本体中央。
+    let (x, y) = (rect.x + rect.w * 0.7, rect.y + rect.h * 0.5);
+    let mut last = None;
+    for p in [
+        press(x, y, no_mods()),
+        release(x, y, no_mods()),
+        press(x, y, no_mods()),
+        release(x, y, no_mods()),
+    ] {
+        last = Some(drive_response(&mut host, &mut app, p));
+    }
+    let r = last.expect("4 フレーム走らせた");
+    assert!(
+        r.launcher
+            .intents
+            .iter()
+            .any(|i| matches!(i, LauncherIntent::OpenCellEditor(c) if c.clip_id == 9)),
+        "セルのダブルクリックで OpenCellEditor: {:?}",
+        r.launcher.intents
     );
 }

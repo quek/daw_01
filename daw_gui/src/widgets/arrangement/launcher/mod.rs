@@ -94,6 +94,10 @@ pub(super) const CELL_RADIUS: f32 = 3.0;
 /// 走行中セルの進捗バーの高さ (px)。
 pub(super) const PROGRESS_BAR_H: f32 = 3.0;
 
+/// 走行中セルを横切るプレイヘッド線の太さ (px)。アレンジのプレイヘッドと同じ
+/// 意味の標識なので、細すぎて見失わない太さにする。
+pub(super) const PLAYHEAD_W: f32 = 2.0;
+
 /// ドラッグを「移動」と認めるまでの移動量 (px)。これ未満は click 扱い。
 pub(super) const CELL_DRAG_SLOP_PX: f32 = 4.0;
 
@@ -129,7 +133,7 @@ impl LauncherCellKey {
     pub fn clip_key(self) -> Option<ClipKey> {
         match self.row {
             ArrangementRowKey::Track(track) if self.clip_id != 0 => {
-                Some(ClipKey { track, clip: self.clip_id })
+                Some(ClipKey { track_id: track, clip_id: self.clip_id })
             }
             _ => None,
         }
@@ -181,9 +185,9 @@ pub struct LauncherCellMove {
     pub from: LauncherCellKey,
     /// 行き先の行。
     pub to_row: ArrangementRowKey,
-    /// 行き先の列 (表示 index。`to_scene_id == 0` ならプレースホルダ = 実体化が要る)。
+    /// 行き先の列 (**表示 index**)。プレースホルダ列も指せるので id では持たない
+    /// — 実体化は handler の `Song::ensure_scene_at` が行う (住所を 2 つ運ばない)。
     pub to_scene_index: u32,
-    pub to_scene_id: u32,
 }
 
 /// アレンジのクリップをセルへ落とした 1 件。
@@ -192,7 +196,6 @@ pub struct ClipToCellDrop {
     pub from: ClipKey,
     pub to_row: ArrangementRowKey,
     pub to_scene_index: u32,
-    pub to_scene_id: u32,
 }
 
 /// セルをアレンジのレーンへ落とした 1 件。
@@ -262,8 +265,15 @@ pub struct LauncherResponse {
     /// inline rename overlay を重ねる用 (`clip_rects` と同 semantics)。
     /// **空セル / プレースホルダ列も含む** (右クリックで「セルを作る」を出せるように)。
     pub cell_rects: Vec<(LauncherCellKey, Rect)>,
-    /// シーン見出しの rect (`(scene_id, rect)`、実在する列のみ)。
-    pub scene_rects: Vec<(u32, Rect)>,
+    /// シーン見出しの rect (`(scene_id, 表示順 index, rect)`)。
+    /// **プレースホルダ列 (`scene_id == 0`) も含む** — 右クリックで
+    /// 「ここに列を作る」を出すために index が要る。
+    pub scene_rects: Vec<(u32, u32, Rect)>,
+    /// 列 1 本の幅 (px) と横スクロール位置 (列数、小数可)。
+    /// **caller が「セルの rect に当たらなかった点」の列を解く**のに要る
+    /// (ファイル drop はセルの隙間にも、行が 1 つも無い余白にも落ちる)。
+    pub col_w: f32,
+    pub scroll_scene: f32,
     /// ポインタ下のセル。
     pub hovered_cell: Option<LauncherCellKey>,
     /// このフレームに発生した意図 (発生順)。
@@ -277,6 +287,8 @@ impl Default for LauncherResponse {
             grid_rect: ZERO_RECT,
             cell_rects: Vec::new(),
             scene_rects: Vec::new(),
+            col_w: DEFAULT_COL_W,
+            scroll_scene: 0.0,
             hovered_cell: None,
             intents: Vec::new(),
         }
@@ -303,6 +315,9 @@ pub(super) struct LauncherCellView {
     /// 中身の窓 (`Clip::content_offset_beats` / `length_beats`)。ミニ表示の写像に使う。
     pub content_offset_beats: f64,
     pub len_beats: f64,
+    /// ループするセルか (`LaunchSettings::looping`)。進捗の位相を解くのに要る
+    /// (ワンショットは終端で止まるので、位相の折り返しがない)。
+    pub looping: bool,
     /// **オートメーションレーン行のセルだけ**が持つ曲線 (content-local 拍, 正規化値)。
     /// トラック行のセルは空 (中身は波形 / MIDI で、描画時に
     /// [`content_build::build_one`](super::content_build::build_one) から組む)。
@@ -346,6 +361,24 @@ pub(super) struct LauncherSceneView {
     pub color: Color,
     /// シーンにフォローアクションが設定されている (▶ を縞にする)。
     pub follow: bool,
+}
+
+impl LauncherSceneView {
+    /// 表示順 `index` の列がまだ `Song.scenes` に無いとき (= 空きプレースホルダ列) の
+    /// 見出し。**名前の作り方は実体のある列と同じ**
+    /// ([`common::model::Scene::display_name`]) — ここで別の式を書くと、セルを置いて
+    /// 実体化した瞬間に見出しの名前が変わってしまう。
+    ///
+    /// `id == 0` が「まだ実体が無い」印。撃つと全行が停止になる (その列のセルは
+    /// 定義上どれも空なので、`Q11` の「空セル = 停止」がそのまま効く)。
+    pub(super) fn placeholder(index: usize, color: Color) -> Self {
+        Self {
+            id: 0,
+            name: Arc::from(common::model::Scene::new(0).display_name(index)),
+            color,
+            follow: false,
+        }
+    }
 }
 
 /// `AppData` から派生した 1 フレーム分のランチャービュー。
