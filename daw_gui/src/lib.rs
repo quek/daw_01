@@ -34,6 +34,7 @@ pub mod group_compose;
 pub mod image_compose;
 pub mod import_audio;
 pub mod import_image;
+pub mod launcher_time;
 pub mod text_compose;
 #[cfg(windows)]
 pub mod import_video;

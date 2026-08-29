@@ -27,8 +27,12 @@
 use std::collections::HashMap;
 
 use common::automation;
-use common::model::{AutomationLane, AutomationTarget, GroupTransform, ModRouting, Song, Track};
+use common::model::{
+    AutomationLane, AutomationTarget, GroupTransform, MASTER_TRACK_ID, ModRouting, Song, Track,
+};
 use common::video_fx::{PassKind, VideoFxCategory, VideoFxDef, VideoFxPass, def_by_id};
+
+use crate::launcher_time::RowTimeline;
 
 /// chain_key for the master fx chain (track chains use the track id, which is a
 /// `u32` and never collides with this reserved value). B9 feedback / r.md #8.
@@ -177,13 +181,15 @@ pub struct ResolvedEffect {
 /// （`track.automation_lanes` / `track.mod_routings`）か master の（`song.song_lanes` /
 /// `song.song_mod_routings`）。`device_id` は当該 device の安定 id
 /// （v29 — [`AutomationTarget::PluginParam`] は id addressing）。
+#[allow(clippy::too_many_arguments)]
 fn resolve_device_real_params(
     song: &Song,
+    row_track: u32,
     lanes: &[AutomationLane],
     mod_routings: &[ModRouting],
     device_id: u64,
     def: &VideoFxDef,
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Vec<f32> {
     def.params
@@ -195,12 +201,14 @@ fn resolve_device_real_params(
                 legacy_device_index: None,
             };
             // base = lane の default/curve (0..=1)、無ければ manifest default (0..=1)。
+            // r.md #87: lane の値はレーン行の主導権で供給元が変わる (アレンジ行は
+            // song 拍で `lane.clips`、ランチャー行はセル 1 つ、停止中は既定値)。
             let base = lanes
                 .iter()
                 .find(|l| l.target == target)
                 .map_or_else(
                     || p.kind.default_norm(),
-                    |l| automation::lane_value_at(l, &song.clip_contents, song_beat),
+                    |l| rows.lane_value(row_track, l, song),
                 );
             // 変調を 0..=1 領域で合成 (PluginParam は plain==norm なので恒等)。
             let eff_norm = automation::apply_modulation_with_scalars(
@@ -217,12 +225,14 @@ fn resolve_device_real_params(
 
 /// `devices` 列のうち映像効果 device を [`ResolvedEffect`] に解決する共通ロジック。
 /// Transform 配置 device は除外（GPU シェーダではない）。track / master で共有。
+#[allow(clippy::too_many_arguments)]
 fn resolve_video_chain(
     song: &Song,
+    row_track: u32,
     devices: &[common::model::PluginInstance],
     lanes: &[AutomationLane],
     mod_routings: &[ModRouting],
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Vec<ResolvedEffect> {
     let mut out = Vec::new();
@@ -237,7 +247,7 @@ fn resolve_video_chain(
             continue; // 配置 device は apply_chain 非対象（合成段で GroupTransform として消費）。
         }
         let params = resolve_device_real_params(
-            song, lanes, mod_routings, inst.id, def, song_beat, mod_scalars,
+            song, row_track, lanes, mod_routings, inst.id, def, rows, mod_scalars,
         );
         out.push(ResolvedEffect { def, params });
     }
@@ -249,15 +259,16 @@ fn resolve_video_chain(
 pub fn resolve_track_effects(
     song: &Song,
     track: &Track,
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Vec<ResolvedEffect> {
     resolve_video_chain(
         song,
+        track.id,
         &track.devices,
         &track.automation_lanes,
         &track.mod_routings,
-        song_beat,
+        rows,
         mod_scalars,
     )
 }
@@ -268,15 +279,16 @@ pub fn resolve_track_effects(
 #[must_use]
 pub fn resolve_master_effects(
     song: &Song,
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Vec<ResolvedEffect> {
     resolve_video_chain(
         song,
+        MASTER_TRACK_ID,
         &song.master_fx_chain,
         &song.song_lanes,
         &song.song_mod_routings,
-        song_beat,
+        rows,
         mod_scalars,
     )
 }
@@ -291,7 +303,7 @@ pub fn resolve_master_effects(
 pub fn resolve_track_transform(
     song: &Song,
     track: &Track,
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Option<GroupTransform> {
     let has_transform_device = track
@@ -301,7 +313,7 @@ pub fn resolve_track_transform(
     if !has_transform_device {
         return None;
     }
-    crate::group_compose::group_active_transform(track, song, song_beat, mod_scalars)
+    crate::group_compose::group_active_transform(track, song, rows, mod_scalars)
 }
 
 // ============================================================================

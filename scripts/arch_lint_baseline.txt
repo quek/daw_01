@@ -322,9 +322,7 @@ FN-NESTING | daw_audio/src/graph/compile.rs::compute_path_latency         | 7/12
 FN-NESTING | daw_gui/src/view/preview_window.rs::PreviewWindowState::render        | 8/30 | 映像パイプライン。未起票
 FN-NESTING | daw_gui/src/video_fx/mod.rs::VideoFxEngine::ensure_common             | 7/28 | 映像パイプライン。未起票
 FN-NESTING | daw_gui/src/video_fx/mod.rs::VideoFxEngine::apply_chain               | 7/25 | 映像パイプライン。未起票
-FN-NESTING | daw_gui/src/video_playback.rs::VideoPlaybackEngine::active_sources_at | 7/20 | 映像パイプライン。未起票
 FN-NESTING | daw_gui/src/group_compose.rs::composite_and_place                     | 7/18 | 映像パイプライン。未起票
-FN-NESTING | daw_gui/src/video_playback.rs::VideoPlaybackEngine::active_source_at  | 7/14 | 映像パイプライン。未起票
 FN-NESTING | daw_gui/src/libav_decoder.rs::SourceDecoder::forward_walk             | 7/9  | 映像パイプライン。未起票
 FN-NESTING | daw_gui/src/view/runner.rs::Runner::sync_preview_window               | 7/7  | 映像パイプライン。未起票
 

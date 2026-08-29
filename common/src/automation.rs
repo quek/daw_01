@@ -344,10 +344,28 @@ pub fn lane_value_at(
     clip_contents: &HashMap<ContentId, ClipContent>,
     song_beat: f64,
 ) -> f64 {
+    lane_value_over(lane, &lane.clips, clip_contents, song_beat)
+}
+
+/// [`lane_value_at`] の **クリップ列を差し替えられる**形。値の決め方 (bypass /
+/// 窓の外 / content 不在 / point 0 個 → `default_value`、さもなくば content 原点
+/// 基準の curve 評価) は完全に同じで、走査する `clips` だけが引数になる。
+///
+/// r.md #87 クリップランチャー: レーン行の主導権がランチャーへ移ると、値の供給元が
+/// `lane.clips` (アレンジ) から `lane.session_clips` の 1 セルへ切り替わる。判定規則を
+/// 2 本に割らないため、**両方がこの 1 本を通る** (`lane_value_at` はアレンジ側の
+/// 薄いラッパ)。`beat` は `clips` の座標系の拍 — アレンジなら song 拍、セルなら
+/// セル内の位相 (セルの `start_beat` は常に 0)。
+pub fn lane_value_over(
+    lane: &AutomationLane,
+    clips: &[AutomationClip],
+    clip_contents: &HashMap<ContentId, ClipContent>,
+    beat: f64,
+) -> f64 {
     if !lane.enabled {
         return lane.default_value;
     }
-    let Some(clip) = clip_covering(&lane.clips, song_beat) else {
+    let Some(clip) = clip_covering(clips, beat) else {
         return lane.default_value;
     };
     let Some(content) = clip_contents.get(&clip.content_id) else {
@@ -361,7 +379,7 @@ pub fn lane_value_at(
     }
     // r.md #44: curve 上の位置は clip 開始ではなく **content 原点** 基準
     // (左端 trim した clip は窓の分だけ curve の先を見せる)。
-    let local = clip.song_to_content_beat(song_beat);
+    let local = clip.song_to_content_beat(beat);
     evaluate_clip(auto, local)
 }
 

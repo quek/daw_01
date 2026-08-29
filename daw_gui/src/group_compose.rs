@@ -17,6 +17,7 @@
 use common::model::{AutomationTarget, GroupTransform, GroupTransformParam, Song, Track};
 use daw_ui_renderer::{Color, GlyphArea, Rect, Scene, TextureHandle, TexturedQuad, VAlign};
 
+use crate::launcher_time::RowTimeline;
 use crate::video_fx::{VideoFxEngine, VideoFxRenderer};
 
 /// 1 トラックの合成画に積む 1 アイテム。座標は合成キャンバス（= project
@@ -78,7 +79,7 @@ impl TrackComposite {
 pub fn group_active_transform(
     group_track: &Track,
     song: &Song,
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Option<GroupTransform> {
     let has_lane = group_track
@@ -100,10 +101,12 @@ pub fn group_active_transform(
         let target = AutomationTarget::GroupTransform(param);
         // base = lane があれば lane 値 (plain)、無ければ group_transform の値。
         // そこに当該 GroupTransform 変調を正規化領域で合成 (lane 無しでも)。
+        // r.md #87: lane の値はレーン行の主導権で供給元が変わる (アレンジ行は
+        // song 拍で `lane.clips`、ランチャー行はセル 1 つ、停止中は既定値)。
         let base = match group_track.automation_lanes.iter().find(
             |l| matches!(l.target, AutomationTarget::GroupTransform(p) if p == param),
         ) {
-            Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, song_beat),
+            Some(lane) => rows.lane_value(group_track.id, lane, song),
             None => f64::from(fallback),
         };
         common::automation::apply_modulation_with_scalars(
@@ -133,9 +136,11 @@ pub fn is_group_track(song: &Song, track_id: u32) -> bool {
 }
 
 /// track が image / video / text クリップを 1 つでも持つか（§5.6 visual 判定の部品）。
+/// v35 (r.md #87): ランチャーのセルも数える (`Track::all_clips`) — 視覚素材が
+/// セルにしか無い group も合成対象になる。セルが空なら従来と同じ結果。
 fn track_has_visual_clip(track: &Track, song: &Song) -> bool {
     use common::model::ClipContent;
-    track.clips.iter().any(|c| {
+    track.all_clips().any(|c| {
         matches!(
             song.clip_contents.get(&c.content_id),
             Some(ClipContent::Image(_))
@@ -188,7 +193,7 @@ pub fn group_has_visual_content(song: &Song, group_track_id: u32) -> bool {
 /// 合成され、選択時にバウンディングボックスが出る）。純 audio バスは除外。
 pub fn active_visual_groups(
     song: &Song,
-    song_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> std::collections::HashMap<u32, GroupTransform> {
     use std::collections::{HashMap, HashSet};
@@ -239,7 +244,7 @@ pub fn active_visual_groups(
         if !visual {
             continue;
         }
-        let gt = group_active_transform(track, song, song_beat, mod_scalars).unwrap_or_default();
+        let gt = group_active_transform(track, song, rows, mod_scalars).unwrap_or_default();
         out.insert(track.id, gt);
     }
     out
@@ -731,9 +736,9 @@ mod tests {
     fn none_transform_is_inactive() {
         let mut track = crate::app::track_with(|t| t.id = 7);
         let song = Song::default();
-        assert!(group_active_transform(&track, &song, 0.0, &[]).is_none());
+        assert!(group_active_transform(&track, &song, &RowTimeline::preview(0.0), &[]).is_none());
         track.group_transform = Some(ident());
-        assert!(group_active_transform(&track, &song, 0.0, &[]).is_some());
+        assert!(group_active_transform(&track, &song, &RowTimeline::preview(0.0), &[]).is_some());
     }
 
     /// 子トラックを 1 本ぶら下げた group を作る。`visual` なら子に image clip を、
@@ -809,9 +814,65 @@ mod tests {
         let (song, group_id) = song_with_group(true);
         assert!(is_group_track(&song, group_id));
         assert!(group_has_visual_content(&song, group_id));
-        let active = active_visual_groups(&song, 0.0, &[]);
+        let active = active_visual_groups(&song, &RowTimeline::preview(0.0), &[]);
         let gt = active.get(&group_id).expect("visual group must be active");
         assert_eq!(*gt, GroupTransform::default(), "未設定なら identity");
+    }
+
+    /// r.md #87: グループの変形オートメーションもレーン行の主導権に従う。
+    /// レーン行をランチャーへ渡すと、セルのカーブが `group_transform` を動かす。
+    #[test]
+    fn グループ変形レーンもランチャーのセルで動く() {
+        use common::model::{
+            AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+            ClipContent, LaunchSettings, RowPlayback, SessionAutomationClip,
+        };
+        let (mut song, group_id) = song_with_group(true);
+        // Scale X を動かすレーン: アレンジ側は空 (= default 1.0)、セルは 2.0 一定。
+        let cell_content = song.alloc_content_id();
+        song.clip_contents.insert(
+            cell_content,
+            ClipContent::Automation(AutomationContent {
+                points: vec![AutomationPoint {
+                    id: 1,
+                    time_beat: 0.0,
+                    value: 2.0,
+                    curve: AutomationCurve::Linear,
+                }],
+                next_point_id: 2,
+            }),
+        );
+        let mut lane =
+            AutomationLane::new(AutomationTarget::GroupTransform(GroupTransformParam::ScaleX), 1.0);
+        lane.id = 1;
+        lane.session_clips.push(SessionAutomationClip {
+            scene_id: 1,
+            clip: AutomationClip {
+                id: 1,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cell_content,
+                ..AutomationClip::default()
+            },
+            launch: LaunchSettings::default(),
+        });
+        lane.launcher = RowPlayback::Launcher { clip_id: 1 };
+        let group = song.tracks.iter_mut().find(|t| t.id == group_id).expect("group");
+        group.group_transform = Some(ident());
+        group.automation_lanes.push(lane);
+
+        let group = song.track_by_id(group_id).expect("group");
+        let t = group_active_transform(group, &song, &RowTimeline::preview(9.0), &[])
+            .expect("transform is active");
+        assert_eq!(t.scale_x, 2.0, "セルのカーブが効く (拍 9 → 位相 1.0)");
+
+        // 行を止めるとレーン既定値へ戻る (計画書 Q11)。
+        let group = song.tracks.iter_mut().find(|t| t.id == group_id).expect("group");
+        group.automation_lanes[0].launcher = RowPlayback::LauncherStopped;
+        let group = song.track_by_id(group_id).expect("group");
+        let t = group_active_transform(group, &song, &RowTimeline::preview(9.0), &[])
+            .expect("transform is active");
+        assert_eq!(t.scale_x, 1.0);
     }
 
     #[test]
@@ -820,6 +881,6 @@ mod tests {
         let (song, group_id) = song_with_group(false);
         assert!(is_group_track(&song, group_id));
         assert!(!group_has_visual_content(&song, group_id));
-        assert!(!active_visual_groups(&song, 0.0, &[]).contains_key(&group_id));
+        assert!(!active_visual_groups(&song, &RowTimeline::preview(0.0), &[]).contains_key(&group_id));
     }
 }
