@@ -166,7 +166,7 @@ def check_registry():
             if r.get("action") not in ("warn", "block"):
                 bad("registry:%s-action" % rid, "action=%r" % r.get("action"))
             if r.get("field") not in ("command", "command_code", "text", "file_path",
-                                      "ask_options", "worktree_outside", "cd_redundant",
+                                      "ask_options", "worktree_outside",
                                       "ask_multi", None):
                 bad("registry:%s-field" % rid, "field=%r" % r.get("field"))
             pats = []
@@ -198,9 +198,6 @@ CASES = [
     # no-ps1-file
     ("ps1-file/pos", "Write", {"file_path": "scripts/foo.ps1", "content": "x"}, 2, {"no-ps1-file"}, set()),
     ("ps1-file/neg", "Write", {"file_path": "scripts/foo.py", "content": "x"}, 0, set(), {"no-ps1-file"}),
-    # no-command-chaining
-    ("chain/pos", "Bash", {"command": "cargo build && cargo test"}, 2, {"no-command-chaining"}, set()),
-    ("chain/neg", "Bash", {"command": "cargo build"}, 0, set(), {"no-command-chaining"}),
     # launch-no-tail-pipe
     ("tail/pos", "Bash", {"command": "cargo run -p daw_gui | tail -f log"}, 2, {"launch-no-tail-pipe"}, set()),
     ("tail/neg-notail", "Bash", {"command": "cargo run -p daw_gui"}, 0, set(), {"launch-no-tail-pipe"}),
@@ -214,7 +211,7 @@ CASES = [
     ("dup/pos-run", "Bash", {"command": "cargo run -p daw_gui"}, 0, {"no-duplicate-app-launch"}, set()),
     ("dup/pos-exe", "Bash", {"command": "./target/debug/daw_gui.exe"}, 0, {"no-duplicate-app-launch"}, set()),
     ("dup/none-suppress", "Bash", {"command": "tasklist | grep daw_gui ; ./target/debug/daw_gui.exe"},
-     2, set(), {"no-duplicate-app-launch"}),   # exit 2 は連結ガード由来
+     0, set(), {"no-duplicate-app-launch"}),
     ("dup/neg-build", "Bash", {"command": "cargo build -p daw_gui"}, 0, set(), {"no-duplicate-app-launch"}),
     # git-add-broad
     ("add/pos-A", "Bash", {"command": "git add -A"}, 0, {"git-add-broad"}, set()),
@@ -310,14 +307,6 @@ CASES = [
      0, set(), {"launch-no-tail-pipe"}),
     ("fix/grep-daw_gui-tail", "Bash", {"command": "grep daw_gui Cargo.lock | tail -5"},
      0, set(), {"launch-no-tail-pipe"}),
-    ("fix/chain-in-commit-msg", "Bash",
-     {"command": "git commit -m \"feat: gate audio && video preview behind smoke test\""},
-     0, set(), {"no-command-chaining"}),
-    ("fix/chain-in-heredoc", "Bash",
-     {"command": "cat > scripts/check.sh <<'EOF'\nif [ -f a ] && [ -f b ]; then echo ok; fi\nEOF"},
-     0, set(), {"no-command-chaining"}),
-    ("fix/chain-in-gitgrep", "Bash", {"command": "git log --grep='Acquire && Release'"},
-     0, set(), {"no-command-chaining"}),
     ("fix/ps-mention-in-heredoc", "Bash",
      {"command": "cat > docs/migration.md <<'EOF'\n旧 hook は powershell -File x.ps1 で起動。bash へ移行済み。\nEOF"},
      0, set(), {"no-powershell-invoke", "no-ps1-via-bash"}),
@@ -359,10 +348,6 @@ CASES = [
     ("gap/pwsh-shebang", "Write",
      {"file_path": "scripts/release.sh", "content": "#!/usr/bin/env pwsh\nWrite-Host build\n"}, 2,
      {"no-pwsh-shebang"}, set()),
-    ("gap/chain-semicolon", "Bash", {"command": "git add a.rs ; git status"}, 2,
-     {"no-command-chaining"}, set()),
-    ("gap/chain-or", "Bash", {"command": "cargo build || echo failed"}, 2,
-     {"no-command-chaining"}, set()),
     ("gap/launch-pipe-head", "Bash", {"command": "cargo run -p daw_gui 2>&1 | head -30"}, 2,
      {"launch-no-tail-pipe"}, set()),
     ("gap/kill-killall", "Bash", {"command": "killall daw_gui.exe"}, 2, {"no-kill-running-app"}, set()),
@@ -401,28 +386,6 @@ CASES = [
      {"file_path": f"{SYN_ROOT}/docs/gui_01_conversation.md",
       "content": "## 要望: track 名の自動コントラスト 2026-06-15\n"},
      0, {"gui-conv-entry-format"}, set()),
-    # ---- no-command-chaining の絞り込み (メモリが許容している形は発火しない) ----
-    # メモリ feedback_no_command_chaining は「**独立した**コマンドの連結」を禁じ、
-    # 「シェル変数の共有や順序依存がある場合のみ連結を検討」と明示的に許容している。
-    # block へ上げた以上、許容形で誤爆すると正当な作業が止まるので全部固定する。
-    ("chain/neg-for-loop", "Bash", {"command": "for f in a b; do echo $f; done"}, 0,
-     set(), {"no-command-chaining"}),
-    ("chain/neg-if-then", "Bash", {"command": "if [ -f x ]; then echo y; fi"}, 0,
-     set(), {"no-command-chaining"}),
-    # 制御構文はキーワード単体ではなく対で判定する。単体だと `echo done` の done に当たって
-    # 「done を含む連結コマンド」が丸ごと素通りする (実装時に踏んだ)。
-    ("chain/pos-done-as-word", "Bash", {"command": "echo done ; echo more"}, 2,
-     {"no-command-chaining"}, set()),
-    ("chain/neg-fallback-true", "Bash", {"command": "cargo build || true"}, 0,
-     set(), {"no-command-chaining"}),
-    ("chain/neg-pipe-only", "Bash", {"command": "ls -la | head -5"}, 0,
-     set(), {"no-command-chaining"}),
-    ("chain/neg-varshare-single", "Bash", {"command": 'SP="/tmp/x"; ls "$SP"'}, 0,
-     set(), {"no-command-chaining"}),
-    ("chain/pos-varshare-multi", "Bash", {"command": 'SP="/tmp/x"; ls "$SP"; echo done'}, 2,
-     {"no-command-chaining"}, set()),
-    ("chain/neg-declared", "Bash", {"command": "DAW01_CHAIN=1 rm -rf x && mkdir x"}, 0,
-     set(), {"no-command-chaining"}),
     # ---- 検査系が自分自身を検査対象にしてしまう問題 (fixture の自己発火) ----
     # compromise-smell の検出語は、この harness の fixture とレジストリ本体に必ず出てくる。
     # 除外が将来外れたら気付けるよう、除外側と **肯定側 (対照)** を対にして固定する。
@@ -712,7 +675,7 @@ def check_destruct():
 
 
 # ---------------------------------------------------------------- 4. escalation
-RULE_ESCALATE = {"id": "test-escalate", "source": "feedback_no_command_chaining",
+RULE_ESCALATE = {"id": "test-escalate", "source": "feedback_no_full_disk_find",
                  "tool": ["Bash"], "field": "command", "all": ["&&"],
                  "action": "warn", "msg": "test"}
 
@@ -837,44 +800,6 @@ def check_worktree_guard():
             ok("wtguard:%s" % label)
 
 
-# ------------------------------------------------------- no-cd-prefix (cwd-relational)
-def check_cd_guard():
-    """`cd` is only a violation RELATIVE to where the session already is: cd'ing to the
-    cwd is redundant, and cd'ing from a worktree to the main checkout or a sibling is
-    the cross-agent hazard. `cd /tmp` or `cd build/` is legitimate and must stay silent
-    -- which is why this is a logic guard, not a regex on "^cd "."""
-    WT = f"{SYN_ROOT}/.claude/worktrees/foo"
-    CCASES = [
-        ("cd/pos-same", f'cd {WT} && cargo build', WT, 2, True),
-        ("cd/pos-same-quoted", f'cd "{WT}" && cargo build', WT, 2, True),
-        ("cd/pos-same-trailing-slash", f'cd {WT}/ && cargo build', WT, 2, True),
-        ("cd/pos-main-from-worktree", f'cd {SYN_ROOT} && git status', WT, 2, True),
-        ("cd/pos-sibling-worktree", f'cd {SYN_ROOT}/.claude/worktrees/bar && ls', WT, 2, True),
-        ("cd/pos-backslash", f'cd {SYN_ROOT_BS}\\.claude\\worktrees\\foo && ls', WT, 2, True),
-        ("cd/pos-same-in-main-session", f'cd {SYN_ROOT} && git status', SYN_ROOT, 2, True),
-        ("cd/neg-elsewhere", "cd /tmp", WT, 0, False),
-        ("cd/neg-subdir", "cd daw_gui", WT, 0, False),
-        ("cd/neg-own-subdir-abs", f"cd {WT}/daw_gui", WT, 0, False),
-        ("cd/neg-not-a-cd", "cargo build", WT, 0, False),
-        ("cd/neg-no-cwd", f"cd {WT}", None, 0, False),
-    ]
-    for label, cmd, cwd, exp_exit, should in CCASES:
-        rc, out = run_engine("Bash", {"command": cmd}, cwd=cwd)
-        f = fired_ids(out)
-        problems = []
-        if rc != exp_exit:
-            problems.append("exit=%d want %d" % (rc, exp_exit))
-        fired = "no-cd-prefix" in f
-        if should and not fired:
-            problems.append("expected fire")
-        if not should and fired:
-            problems.append("unexpected fire")
-        if problems:
-            bad("cdguard:%s" % label, "; ".join(problems) + " | fired=%s" % sorted(f))
-        else:
-            ok("cdguard:%s" % label)
-
-
 # --------------------------------------- app-launching test targets stay in sync
 def check_launching_targets_list():
     """The registry enumerates the daw_gui test targets that spawn the app. That list
@@ -961,7 +886,6 @@ def main():
     check_engine_robustness()
     check_registry_defect_is_reported()
     check_worktree_guard()
-    check_cd_guard()
     check_destruct()
     check_escalation()
     shutil.rmtree(_sandbox, ignore_errors=True)
