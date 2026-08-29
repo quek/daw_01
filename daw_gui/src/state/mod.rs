@@ -15,6 +15,8 @@ pub mod recording;
 pub mod ui_prefs;
 pub mod ui_ephemeral;
 pub mod activity;
+/// r.md #87: クリップランチャーの session-only な UI 状態。
+pub mod launcher_ui;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
@@ -27,6 +29,7 @@ pub use media::MediaState;
 pub use recording::RecordingState;
 pub use ui_prefs::UiPrefs;
 pub use ui_ephemeral::UiEphemeral;
+pub use launcher_ui::{LauncherFocus, LauncherUiState};
 
 /// GUI プロセスの全アプリ状態 (composition of state groups)。
 pub struct AppData {
@@ -48,6 +51,10 @@ pub struct AppData {
     pub ui_prefs: UiPrefs,
     /// 一時 UI 状態 (hover / picker / rename / menu / modal / scrub)。
     pub ui_ephemeral: UiEphemeral,
+    /// r.md #87: クリップランチャーの一時状態 (フォーカス / hover / 列名の
+    /// 編集中テキスト / MIDI bind 表)。曲の中身は `Song`、見方の都合は
+    /// `UiPrefs` なので、ここは **保存しないもの**だけ。
+    pub launcher: LauncherUiState,
     /// r.md #49: アプリの窓がアクティブか (省電力判定の材料)。
     pub activity: ActivityState,
     /// r.md #61: 終了シーケンス。全終了経路 (✕ / Alt+F4 / File > 終了 /

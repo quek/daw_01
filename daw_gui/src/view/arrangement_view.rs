@@ -1090,6 +1090,13 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
             .iter()
             .find(|s| s.id == id)
             .map(|s| Color { r: s.color[0], g: s.color[1], b: s.color[2], a: 1.0 }),
+        // r.md #87: ランチャーの列。`Scene::color` は `None` = パレット既定なので、
+        // 未設定のときは並び順から導いた既定色を初期値に見せる (トラック色と同流儀)。
+        ColorPickerTarget::Scene(id) => app.song_doc.song().scenes.iter().position(|s| s.id == id).map(|i| {
+            let s = &app.song_doc.song().scenes[i];
+            let rgb = s.color.unwrap_or(track_color::PALETTE[i % track_color::PALETTE.len()]);
+            Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
+        }),
     };
 
     let Some(current) = current else {
@@ -1112,6 +1119,12 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
             ColorPickerTarget::Section(id) => {
                 app.handle_event(AppEvent::SetSectionColor { id, color: rgb });
             }
+            // r.md #87: ランチャーの列。
+            ColorPickerTarget::Scene(scene_id) => {
+                app.handle_event(AppEvent::Launcher(
+                    crate::event_launcher::LauncherEvent::SetSceneColor { scene_id, color: rgb },
+                ));
+            }
         }));
     }
     if r.dismissed {
@@ -1128,6 +1141,7 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
         ColorPickerTarget::Track(id) => (1u64 << 63) | id as u64,
         ColorPickerTarget::Clip(r) => ((r.track as u64) << 32) | r.clip as u64,
         ColorPickerTarget::Section(id) => (1u64 << 62) | id as u64,
+        ColorPickerTarget::Scene(id) => (1u64 << 61) | id as u64,
     }
 }
 

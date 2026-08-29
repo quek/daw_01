@@ -14,6 +14,12 @@ pub mod export;
 pub mod glue;
 pub mod grouping;
 pub mod ipc;
+/// r.md #87: クリップランチャーの発火 / 行の主導権 / 列 (シーン) の CRUD。
+pub mod launcher;
+/// r.md #87: ランチャーのセル CRUD とローンチ設定。
+pub mod launcher_cells;
+/// r.md #87: ランチャーのセルの copy / cut / paste。
+pub mod launcher_clipboard;
 pub mod loudness;
 pub mod master_panel;
 pub mod media;

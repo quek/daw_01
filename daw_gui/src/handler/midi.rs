@@ -21,7 +21,18 @@ impl AppData {
     /// 記録するかどうかは `recording.live` (= engine の観測値) だけで決める。
     /// 「録音したい」意思 (`requested`) で判定すると、停止中 / count-in 中 /
     /// 読み込み待ちの一時停止中に、凍ったプレイヘッドへノートが積み上がる。
-    pub(crate) fn handle_midi_note_on(&mut self, pitch: u8, velocity: u8) {
+    ///
+    /// r.md #87: **ランチャーの binding が最優先で、当たったらノートを飲む**。
+    /// パッドで撃ったノートがトラックの音源も鳴らしてしまうと、セルを 1 つ撃つ
+    /// たびに余計な音が出る。Learn 待ちのときも同じくここで消費する。
+    pub(crate) fn handle_midi_note_on(&mut self, channel: u8, pitch: u8, velocity: u8) {
+        if self.consume_launcher_midi(
+            channel,
+            crate::event_launcher::LauncherBindInput::Note(pitch),
+            true,
+        ) {
+            return;
+        }
         self.monitor_note_on(pitch, velocity);
         if self.recording.live {
             self.record_midi_note_on(pitch, velocity);
@@ -34,7 +45,17 @@ impl AppData {
 
     /// Phase 7 B4 Step D: MIDI input note_off dispatcher。 録音中は length 確定、
     /// step-input mode は no-op (既存挙動)。 モニターの消音は常に行う。
-    pub(crate) fn handle_midi_note_off(&mut self, pitch: u8) {
+    pub(crate) fn handle_midi_note_off(&mut self, channel: u8, pitch: u8) {
+        // r.md #87: note-on を飲んだ binding は note-off も飲む (`Gate` の
+        // 「離すと停止」がここを通る)。Learn は note-on だけで確定するので、
+        // ここでは新規 bind はしない。
+        if self.fire_launcher_bindings(
+            channel,
+            crate::event_launcher::LauncherBindInput::Note(pitch),
+            false,
+        ) {
+            return;
+        }
         self.monitor_note_off(pitch);
         if self.recording.live {
             self.record_midi_note_off(pitch);
@@ -136,6 +157,15 @@ impl AppData {
         controller: u8,
         value: u8,
     ) {
+        // r.md #87: ランチャーの binding / Learn が先。CC でセルを撃つときは
+        // 値 >= 64 を「押下」、< 64 を「離す」とみなす (パッドの CC モードの慣例)。
+        if self.consume_launcher_midi(
+            channel,
+            crate::event_launcher::LauncherBindInput::ControlChange(controller),
+            value >= 64,
+        ) {
+            return;
+        }
         if let Some(target) = self.recording.midi_learn_target.take() {
             // Learn mode: 既存 同 (channel, controller) を retain で除外 +
             // 新 binding push。 status_message は次 frame の通常 status に上書き

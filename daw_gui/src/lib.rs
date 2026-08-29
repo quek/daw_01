@@ -13,12 +13,16 @@
 pub mod app;
 pub mod app_config;
 pub mod app_types;
+/// 色編集の宛先 (`color_picker` overlay の対象、`app_types` から切り出し)。
+pub mod color_target;
 pub mod device_addr;
 pub mod recent;
 pub mod window_state;
 #[cfg(test)]
 mod app_tests;
 pub mod event;
+/// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
+pub mod event_launcher;
 pub mod handler;
 pub mod audio_source_cache;
 pub mod automation_value;

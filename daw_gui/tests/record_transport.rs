@@ -281,6 +281,7 @@ fn count_in_中の入力は記録されない() {
     tick(&mut app, true, false, 0);
 
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 60,
         velocity: 100,
     });
@@ -293,6 +294,7 @@ fn count_in_中の入力は記録されない() {
     // count-in 明け。
     tick(&mut app, true, true, samples_at_beat(4.0));
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 60,
         velocity: 100,
     });
@@ -315,21 +317,23 @@ fn 同位置同ピッチでも_note_off_は正しいノートを確定する() {
 
     // 1 本目: beat 0 で on → beat 1 で off。
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 60,
         velocity: 100,
     });
     tick(&mut app, true, true, samples_at_beat(1.0));
-    app.handle_event(AppEvent::MidiNoteOff { pitch: 60 });
+    app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 60 });
 
     // 2 本目: 同じ beat 0 へ戻して on → beat 3 で off (= オーバーダブ)。
     // 再生中はプレイヘッドが Tick 追従なので、巻き戻した Tick を届ければよい。
     tick(&mut app, true, true, samples_at_beat(0.0));
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 60,
         velocity: 100,
     });
     tick(&mut app, true, true, samples_at_beat(3.0));
-    app.handle_event(AppEvent::MidiNoteOff { pitch: 60 });
+    app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 60 });
 
     let notes = recorded_notes(&app);
     assert_eq!(notes.len(), 2, "オーバーダブは重ねたまま残す");
@@ -347,6 +351,7 @@ fn 押しっぱなしのノートは録音終了で長さが確定する() {
     app.handle_event(AppEvent::ToggleMidiRecording);
     tick(&mut app, true, true, samples_at_beat(0.0));
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 64,
         velocity: 100,
     });
@@ -373,6 +378,7 @@ fn 録音待機トラックは停止中でも弾いた音を鳴らす() {
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 60,
         velocity: 90,
     });
@@ -386,7 +392,7 @@ fn 録音待機トラックは停止中でも弾いた音を鳴らす() {
         "停止中でもモニターへ流す: {sent:?}"
     );
 
-    app.handle_event(AppEvent::MidiNoteOff { pitch: 60 });
+    app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 60 });
     let sent = drain(&mut audio_rx);
     assert!(
         sent.contains(&AudioCommand::PreviewNoteOff {
@@ -398,6 +404,7 @@ fn 録音待機トラックは停止中でも弾いた音を鳴らす() {
 
     // arm を外したら、押しっぱなしでも消音する (note-off はもう届かない)。
     app.handle_event(AppEvent::MidiNoteOn {
+        channel: 0,
         pitch: 62,
         velocity: 90,
     });

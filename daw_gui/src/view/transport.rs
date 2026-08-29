@@ -13,6 +13,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
+use crate::event_launcher::LauncherEvent;
 use crate::theme::Theme;
 use crate::view::param_gesture::push_param_gesture_edges;
 
@@ -93,6 +94,23 @@ static SCALE_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 /// 毎フレームの collect を避けるため一度だけ生成する。
 static REC_LABELS: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| RECORDING_MODES.iter().map(|(_, l)| *l).collect());
+
+/// r.md #87: グローバルローンチ量子化の選択肢。
+/// `LAUNCH_QUANTIZE_CHOICES` (モデル側の SSoT) から
+/// [`LaunchQuantize::Global`] だけを除いたもの — グローバル設定自身が
+/// 「グローバルに従う」 では意味を成さない。
+static GLOBAL_QUANTIZE_CHOICES: LazyLock<Vec<(common::model::LaunchQuantize, &'static str)>> =
+    LazyLock::new(|| {
+        common::model::LAUNCH_QUANTIZE_CHOICES
+            .iter()
+            .filter(|(q, _)| *q != common::model::LaunchQuantize::Global)
+            .copied()
+            .collect()
+    });
+
+/// [`GLOBAL_QUANTIZE_CHOICES`] のラベル列。
+static GLOBAL_QUANTIZE_LABELS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| GLOBAL_QUANTIZE_CHOICES.iter().map(|(_, l)| *l).collect());
 
 /// transport のボタン共通形 (角丸 4 / 中立の off 面)。 各ボタンは `on_color` と
 /// `font_size` だけを上書きして意味色を足す。
@@ -267,9 +285,51 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("transport_bg", area, p.header, 0.0);
 
     let pad = 12.0;
-    let mut x = area.x + pad;
     let cy = area.y + (area.h - 28.0) * 0.5;
     let bh = 28.0;
+
+    // 左詰め列は 4 つのまとまりに分けて、running `x` をバケツリレーする。
+    // 分けてあるのは実コード 300 行 budget (不変条件 9) のため — r.md #87 の
+    // ランチャー用コントロールを足す前に、既存の `draw` を責務ごとに割った。
+    // **並び順はこの 4 行が SSoT**。
+    let mut x = area.x + pad;
+    x = draw_tempo_and_key(app, ui, area, x, cy, bh);
+    x = draw_playback_buttons(app, ui, area, x, cy, bh);
+    x = draw_recording_controls(app, ui, x, cy, bh);
+    // 左詰め列の最後尾。 ここで `x` を進めても誰も読まないので捨てる —
+    // この右に要素を足すときは、この行を `x = ...` に戻してから足すこと。
+    let _ = draw_launcher_controls(app, ui, area, x, cy, bh);
+
+    // Panic ボタンは transport バーの **一番右** に右端揃えで固定配置する
+    // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
+    // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (`style_panic`)。
+    // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。
+    let panic_w = 28.0;
+    ui.toggle_button_at(
+        "transport_panic",
+        "!",
+        Rect {
+            x: area.x + area.w - pad - panic_w,
+            y: cy,
+            w: panic_w,
+            h: bh,
+        },
+        false,
+        &style_panic(&app.theme),
+        |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Panic)),
+    );
+}
+
+/// テンポ / 拍子 / キー (スケール)。 バー左端のまとまり。
+fn draw_tempo_and_key(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    mut x: f32,
+    cy: f32,
+    bh: f32,
+) -> f32 {
+    let p = &app.theme.core;
 
     // BPM ラベル + 入力欄
     ui.label_at(
@@ -487,7 +547,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         }));
     }
-    x += scale_w + 12.0;
+    x + scale_w + 12.0
+}
+
+/// 再生位置の読み値 + Play / Rec / Loop / Follow のまとまり。
+fn draw_playback_buttons(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    mut x: f32,
+    cy: f32,
+    bh: f32,
+) -> f32 {
+    let p = &app.theme.core;
 
     // r.md #56: 再生位置 (音楽的位置 = 小節.拍.1/100拍 と 絶対時間 = 分:秒.ミリ秒) を
     // **再生ボタンの左** に置く。 旧位置はバー右端で、 目線が「操作するボタン」 と
@@ -588,8 +660,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &style_follow(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CycleArrangeFollow)),
     );
-    x += follow_w + 12.0;
+    x + follow_w + 12.0
+}
 
+/// 録音まわり (録音モード / メトロノーム / カウントイン / Snap Live / MIDI Learn)。
+/// このまとまりは全部 running `x` に載る固定幅ボタンなので `area` を読まない。
+fn draw_recording_controls(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    mut x: f32,
+    cy: f32,
+    bh: f32,
+) -> f32 {
     // Phase 4 (`docs/plan_automation.md` §6): automation recording mode
     // 4 択 (Read / Touch / Latch / Write) を dropdown 化。 排他選択なので
     // dropdown が UI 的に自然 + 横幅を 1/4 以下に圧縮できる。
@@ -720,11 +802,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         },
     );
-    // MIDI Learn がバー左詰め列の最後尾。 r.md #56 で再生位置表示を Play の左へ移した
-    // 結果、 この右にはもう running x で置く要素が無い (Panic は右端固定)。 ここで
-    // `x` を進めても誰も読まないので進めない — 左詰め列に要素を足すときは、 直前の
-    // 要素の `x += w + gap;` を復活させてから足すこと。
-
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
 
@@ -740,25 +817,76 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 旧実装は「右端の Panic から逆算した残り幅」 に置かれたバー唯一の伸縮要素で、
     // 狭い窓では ellipsis して耐えていた。 移設に伴い固定幅 + 右寄せへ作り替えてある
     // (`BEAT_READOUT_W` / `TIME_READOUT_W` の doc 参照)。
+    x + learn_w + 12.0
+}
 
-    // Panic ボタンは transport バーの **一番右** に右端揃えで固定配置する
-    // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
-    // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (`style_panic`)。
-    // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。
-    let panic_w = 28.0;
-    ui.toggle_button_at(
-        "transport_panic",
-        "!",
-        Rect {
-            x: area.x + area.w - pad - panic_w,
-            y: cy,
-            w: panic_w,
-            h: bh,
-        },
-        false,
-        &style_panic(&app.theme),
-        |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Panic)),
+/// r.md #87 クリップランチャー (計画書 §3.5): **グローバルローンチ量子化**の
+/// dropdown と「アレンジに戻す (全行)」ボタン。
+///
+/// - 量子化はセルの [`LaunchQuantize::Global`] が従う実効値。既定は 1 小節。
+///   選択肢は `LAUNCH_QUANTIZE_CHOICES` が SSoT で、そこから `Global`
+///   (= 「自分自身に従う」という無意味な値) だけを除いて出す。
+/// - 「アレンジに戻す」は **ランチャーが主導権を持つ行が 1 つでもあれば点灯**。
+///   押すと全行を [`RowPlayback::Arranger`](common::model::RowPlayback::Arranger)
+///   に戻す (Bitwig の Switch Playback to Arranger のグローバル版)。
+fn draw_launcher_controls(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    mut x: f32,
+    cy: f32,
+    bh: f32,
+) -> f32 {
+    let p = &app.theme.core;
+    ui.label_at(
+        "transport_launch_q_label",
+        "Launch",
+        x,
+        area.y + (area.h - 12.0) * 0.5,
+        12.0,
+        p.text,
     );
+    x += 46.0;
+
+    // "8 Bars" = 6 字 * 14 * 0.527 = 44.3px。 dropdown の文字領域は
+    // w - PAD_X(8) - ARROW_W(16) なので 76 - 24 = 52px で収まる。
+    let q_w = 76.0;
+    let cur = app.global_launch_quantize();
+    let cur_idx = GLOBAL_QUANTIZE_CHOICES.iter().position(|(q, _)| *q == cur).unwrap_or(0);
+    if let Some(i) = ui.dropdown(
+        "transport_launch_quantize",
+        Rect { x, y: cy, w: q_w, h: bh },
+        GLOBAL_QUANTIZE_LABELS.as_slice(),
+        cur_idx,
+    ) && let Some((q, _)) = GLOBAL_QUANTIZE_CHOICES.get(i)
+    {
+        let q = *q;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::Launcher(LauncherEvent::SetGlobalQuantize(q)));
+        }));
+    }
+    x += q_w + 6.0;
+
+    // 記号だけの 36px ボタン (Play / Loop / Follow / メトロノームと同じ寸法)。
+    // `⇥` はランチャー帯の「返す列」と **同じ字**を使う — 格子の中とバーの上で
+    // 同じ記号が同じ意味 (Switch Playback to Arranger) になるので、
+    // 文字を足さなくても対応が読める。バーの左詰め列はもともと 1280px 幅で
+    // ほぼ埋まっているので、ここを 4 文字ぶん広げると右端の Panic に食い込む。
+    let back_w = 36.0;
+    let active = app.launcher_has_active_row();
+    ui.toggle_button_at(
+        "transport_launcher_to_arranger",
+        "\u{21E5}",
+        Rect { x, y: cy, w: back_w, h: bh },
+        active,
+        &style_rec_mode(&app.theme),
+        |_| {
+            Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::Launcher(LauncherEvent::AllToArranger));
+            })
+        },
+    );
+    x + back_w + 12.0
 }
 
 #[cfg(test)]

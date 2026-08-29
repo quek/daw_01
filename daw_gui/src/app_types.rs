@@ -13,6 +13,8 @@ pub use crate::device_addr::{
     DEVICE_DRAG_KIND, DeviceDragPayload, LoadedDeviceInfo, RelocateDevices, SlotReconcileAction,
     compute_slot_reconcile_actions, device_at, device_id_at, device_mut_by_id, find_device_by_id,
 };
+/// 色編集の宛先は [`crate::color_target`] が持つ (同じく不変条件 9 で切り出した)。
+pub use crate::color_target::ColorPickerTarget;
 
 /// `plan_track_removal_ipc` の出力。 順序が deadlock 防止に必須なので
 /// テスト可能な enum で表現する。
@@ -807,18 +809,6 @@ pub struct ClipRef {
 pub struct ClipEventRef {
     pub clip: ClipRef,
     pub event: u32,
-}
-
-/// v18 (`docs/plan_track_clip_color.md`): color_picker overlay (gui_01 #058)
-/// の編集対象。`Some` の間 arrangement_view が 1 フレームごとに
-/// `ui.color_picker` を呼んで overlay を描画する。`Track` は track id、
-/// `Clip` は index ベース `ClipRef`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorPickerTarget {
-    Track(u32),
-    Clip(ClipRef),
-    /// Arranger セクション帯の色。
-    Section(u32),
 }
 
 /// gui_01 #028: 1 point の addressing。daw_01 側は `(track_id, lane_id,

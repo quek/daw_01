@@ -14,6 +14,8 @@ pub mod export_overlay;
 pub mod shutdown_overlay;
 pub mod export_range_modal;
 pub mod font_picker;
+/// r.md #87: クリップランチャーのキーボード操作と widget イベントの流し込み。
+pub mod launcher_keys;
 pub mod load_overlay;
 pub mod loudness_report;
 pub mod master_panel;

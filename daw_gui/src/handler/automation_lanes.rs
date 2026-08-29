@@ -1368,7 +1368,14 @@ impl AppData {
                 if let Some(idx) = lane.clip_index_by_id(k.clip) {
                     lane.clips.remove(idx);
                 }
+                // r.md #87: 同じ key 空間に **ランチャーのセル**も居る
+                // (`clips` と `session_clips` は id 空間を共有し、1 つの id は
+                // どちらか一方にしか居ない)。 ここを落とすと「レーン行のセルを
+                // 選んで Delete しても何も起きない」 になる。
+                lane.session_clips.retain(|c| c.clip.id != k.clip);
             }
+            // 鳴っていたセルが消えた行を `LauncherStopped` へ落とす (冪等)。
+            song.normalize_session();
         });
         // 選択中だった clip があれば selection からも除く。
         self.selection.selected_automation_clips

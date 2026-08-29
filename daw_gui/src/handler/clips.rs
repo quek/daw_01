@@ -631,6 +631,11 @@ impl AppData {
         // ClipKey → 現在の index ClipRef に解決し、 同 track 内は高 clip index
         // から remove して shift を回避する。
         let mut targets: Vec<ClipRef> = self.selected_clip_refs();
+        // r.md #87: 同じ選択集合に **ランチャーのセル**も混ざる (セルは
+        // `ClipKey` で指せて `clips` と id 空間を共有するが、`clip_ref_of` は
+        // `clips` しか見ないので `targets` には出てこない)。 ここを落とすと
+        // 「セルを選んで Delete しても何も起きない」 になる。
+        let cells: Vec<common::model::ClipKey> = self.selection.selected_clips.clone();
         self.selection.selected_clips.clear();
         targets.sort_by(|a, b| a.track.cmp(&b.track).then(b.clip.cmp(&a.clip)));
         self.edit_song(|song| {
@@ -640,6 +645,18 @@ impl AppData {
                 {
                     track.clips.remove(target.clip as usize);
                 }
+            }
+            let mut removed_cell = false;
+            for key in &cells {
+                if let Some(track) = song.track_by_id_mut(key.track_id) {
+                    let before = track.session_clips.len();
+                    track.session_clips.retain(|c| c.clip.id != key.clip_id);
+                    removed_cell |= track.session_clips.len() != before;
+                }
+            }
+            if removed_cell {
+                // 鳴っていたセルが消えた行を `LauncherStopped` へ落とす (冪等)。
+                song.normalize_session();
             }
         });
         self.selection.selected_clip = None;
