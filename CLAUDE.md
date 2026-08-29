@@ -29,6 +29,7 @@ make test-nolaunch  # そのうち daw_gui を起動しない target だけ
 make clippy         # -D warnings
 make check          # 型検査のみ
 make arch-lint      # アーキテクチャ不変条件の機械検査
+make gates          # 常設ゲート (clippy / test / test-nolaunch の前提条件)
 make license-check  # ライセンス表示 (REUSE / GPLv3 互換性)
 make audit          # 依存の脆弱性・供給網攻撃 (network 要)
 make fetch-ffmpeg   # third_party/ffmpeg 取得 (gitignore なので fresh machine で必須)
@@ -37,8 +38,15 @@ make fetch-ffmpeg   # third_party/ffmpeg 取得 (gitignore なので fresh machi
 特定 crate / test だけなら `cargo check -p <crate>` / `cargo test -p <crate> --test <name>` に
 絞ってよい。避けるのは `--workspace` の無条件多用。
 
-`cargo update` を打ったら必ず `make audit`。方針は `deny.toml`、`ignore` を足すときは
-「RUSTSEC-ID: 理由 / 見直し期限」をコメントで必ず書く (無言の ignore は禁止)。
+**`gates` は `clippy` / `test` / `test-nolaunch` の前提条件**なので、意識せず必ず通る
+(license-check + lockfile-guard + 「`Cargo.lock` を変えたのに `make audit` を通していない」の検出)。
+`audit` 本体は advisory DB にネットワークが要るので前提条件にはしない — 代わりに
+**lock が HEAD と違うのに監査済みスタンプと一致しなければ落ちる**。`cargo update` を打ったら
+`make audit`。方針は `deny.toml`、`ignore` を足すときは「RUSTSEC-ID: 理由 / 見直し期限」を
+コメントで必ず書く (無言の ignore は禁止)。
+
+`worktree-rm` / `worktree-rm-merged` は `test-worktree-rm` (削除ツールの回帰テスト、約 25 秒) を
+前提条件に持つ。取り返しがつかない操作なので、その直前が唯一漏れない位置。
 
 ### `make test` は daw_gui を起動する
 
@@ -83,7 +91,7 @@ SSoT は `scripts/fetch_ffmpeg.sh`。詳細と LGPL 上の義務は [docs/ffmpeg
 **PowerShell 禁止。bash を既定**とし、**JSON を構造的にパースするものだけ Python (stdlib のみ)**
 で書く (Linux でも動くこと。[[feedback_no_powershell_cross_platform]])。
 
-**hook は使わない** (`.claude/settings.json` は `{}`)。強制は `make` の検査と `/review` skill が
+**hook は使わない** (`.claude/settings.json` を置かない)。強制は `make` の検査と `/review` skill が
 担う。どちらも結果が出力に出るので、黙って壊れても気付ける。出力に出ない検査は、壊れていても
 誰も気付けない。
 

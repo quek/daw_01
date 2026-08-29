@@ -1,4 +1,4 @@
-.PHONY: help build run test test-nolaunch test-rt preflight-no-app clippy license-check audit clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror worktree-rm worktree-rm-merged
+.PHONY: help build run test test-nolaunch test-rt preflight-no-app gates clippy license-check audit arch-lint clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror test-worktree-rm worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
 # `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
@@ -240,9 +240,13 @@ help:
 	@echo "  make run           daw_gui をビルド × 起動 (debug)"
 	@echo "  make release       実行 3 exe (daw_gui/daw_audio/daw_plugin_host) を release ビルド"
 	@echo "  make run-release   daw_gui をビルド × 起動 (release)"
-	@echo "  make test          テストを持つ package のみ実行 (TEST_PKGS、#[test]0個の examples 等は除外)"
-	@echo "  make test-rt       RT (audio thread) の無確保検査 (rt-assert feature、make test から呼ばれる)"
+	@echo "  make test          テストを持つ package のみ実行 (daw_gui を起動する)"
+	@echo "  make test-nolaunch そのうち daw_gui を起動しない target だけ"
+	@echo "  make test-rt       RT (audio thread) の無確保検査 (test / test-nolaunch から呼ばれる)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
+	@echo "  make gates         常設ゲート (license-check + lockfile-guard + audit スタンプ)"
+	@echo "                     clippy / test / test-nolaunch の前提条件。単体でも打てる"
+	@echo "  make arch-lint     アーキテクチャ不変条件の機械検査 (baseline 比の行単位 ratchet)"
 	@echo "  make license-check ライセンス表示の検査 (REUSE 準拠 / 依存の GPLv3 互換性)"
 	@echo "  make audit         依存の脆弱性 / 供給網攻撃の検査 (network 要、cargo-deny 必須)"
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
@@ -251,6 +255,7 @@ help:
 	@echo "  make fetch-ffmpeg-force  third_party/ffmpeg を取り直す"
 	@echo "  make ffmpeg-mirror ミラー用の成果物を dist/ffmpeg-mirror/ に用意 (上げはしない)"
 	@echo "  make clean         target/ を削除"
+	@echo "  make test-worktree-rm         削除ツールの回帰テスト (worktree-rm* の前提条件、約 25 秒)"
 	@echo "  make worktree-rm NAME=<name>   マージ済み worktree を安全に削除 (junction 安全 + ロック解除 + branch 削除)"
 	@echo "  make worktree-rm-merged       マージ済み worktree を全部削除"
 
@@ -296,12 +301,12 @@ preflight-no-app:
 # preflight は **prerequisite に置く**。recipe の 1 行目に置くと build / test-rt が先に
 # 走ってしまい、実機が動いている最中に 40 秒ビルドしてから止まる (2026-08-22 に実測)。
 # build 自体も daw_gui 起動中は ERROR 5 で落ちうるので、先に止めるのが正しい。
-test: preflight-no-app build test-rt
+test: preflight-no-app gates build test-rt
 	cargo test $(TEST_PKGS) --features daw_gui/script
 
 # 起動を伴わない検証だけを回す。`make test` が前提条件で止まる状況 (実機を触っている
 # 最中) でも安全に通せる。対象 target は上の DAW_GUI_SAFE_TESTS が基準から導く。
-test-nolaunch: test-rt
+test-nolaunch: gates test-rt
 	cargo test $(TEST_PKGS_NO_GUI)
 	cargo test -p daw_gui --features daw_gui/script --lib --bins $(DAW_GUI_SAFE_TESTS)
 
@@ -323,7 +328,7 @@ test-rt:
 # ゲートを素通りする (2026-08-22 に発覚。実際 11 件が溜まっていた)。
 # ビルドはするが**実行はしない**ので、daw_gui を起動する test target を持つ
 # crate でもアプリは立ち上がらない。
-clippy:
+clippy: gates
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # ライセンス表示の機械検査 (r.md #60)。clippy / arch-lint と同格の常設ゲート。
@@ -370,6 +375,42 @@ audit:
 	"$(PYTHON)" scripts/lockfile_guard.py
 	@command -v cargo-deny >/dev/null 2>&1 || { 		echo "ERROR: cargo-deny が入っていません。advisories の検査は skip しません。" >&2; 		echo "       インストール: cargo install --locked cargo-deny" >&2; 		exit 1; 	}
 	cargo deny --all-features check advisories
+	@$(PYTHON) -c "import hashlib,pathlib,sys; p=pathlib.Path('$(AUDIT_STAMP)'); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest())"
+	@echo "audit: OK (Cargo.lock の監査済みスタンプを更新しました)"
+
+# ---- 常設ゲート (人が意識せず必ず通る場所) ----
+# `license-check` と `audit` は「clippy / arch-lint と同格の常設ゲート」を自称しながら、
+# **どの target・skill からも呼ばれていなかった** (2026-08-29 に実測)。人が手で打つ検査は
+# 打たれない。だから clippy / test / test-nolaunch の前提条件に置く。
+#
+# **audit は前提条件にしない** — advisory DB の取得にネットワークが要るので、オフラインの
+# 環境で clippy が通らなくなる。守りたいのは「`cargo update` を打ったのに audit を通して
+# いない」状態なので、それだけをネットワーク無しで検出する:
+#   Cargo.lock が HEAD と違う (= 依存を動かした) のに、audit が書いたスタンプの内容ハッシュと
+#   一致しない → 落とす。
+# fresh clone では lock == HEAD なので何も要求しない (= オフラインでも通る)。
+# スタンプは git dir 配下に置く (追跡外・checkout ごと・`make clean` で消えない)。
+AUDIT_STAMP := $(shell git rev-parse --git-path daw01_audit_ok 2>/dev/null)
+
+#
+# **順序が意味を持つ**: lock の検査を license-check より先に置くこと。license-check は
+# 内部で cargo (cargo metadata / cargo-deny) を起動し、**cargo が Cargo.lock を正規化して
+# 書き戻す**。後ろに置くと「lock を汚してから gates を打つ」テストが自分で証拠を消して
+# 緑になる (2026-08-29 に実際に踏んだ。canary が発火せず、原因は検査ではなく順序だった)。
+gates:
+	@[ -n "$(PYTHON)" ] || { echo "ERROR: python が見つかりません。make gates PYTHON=/path/to/python3" >&2; exit 1; }
+	@"$(PYTHON)" scripts/lockfile_guard.py
+	@if ! git diff --quiet HEAD -- Cargo.lock 2>/dev/null; then \
+	  want=$$("$(PYTHON)" -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest())"); \
+	  have=$$(cat "$(AUDIT_STAMP)" 2>/dev/null || echo none); \
+	  if [ "$$want" != "$$have" ]; then \
+	    echo "ERROR: Cargo.lock を変更したのに make audit を通していません。" >&2; \
+	    echo "       依存を動かしたら advisory を確認すること: make audit" >&2; \
+	    exit 1; \
+	  fi; \
+	fi
+	@$(MAKE) --no-print-directory license-check
+	@echo "gates: OK (lockfile-guard / audit-stamp / license-check)"
 
 # アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
 # docs/plan_arch_refactor.md §11)。**exit 0 = 「違反ゼロ、または
@@ -409,10 +450,19 @@ clean:
 BASH := /usr/bin/bash
 CLEANUP_WT := $(CURDIR)/scripts/cleanup_worktree.sh
 
+# cleanup_worktree.sh の回帰テスト (24 シナリオ / 実測 25 秒)。**削除の直前に必ず通す。**
+# この script は worktree ディレクトリと branch を消す = 取り返しがつかない操作なのに、
+# 唯一の回帰テストがどこからも呼ばれていなかった (2026-08-29 に実測)。
+# clippy / test の前提条件には**しない** — 25 秒は lint に載せる長さではないし、守る対象は
+# 「削除ツールの挙動」なので、削除の直前が唯一漏れない位置。テスト自身は mktemp -d の
+# 使い捨て repo 内で完結し、実 repo には触れない。
+test-worktree-rm:
+	$(BASH) "$(CURDIR)/scripts/test_cleanup_worktree.sh"
+
 # マージ済み worktree を安全に削除する (vendored ffmpeg を巻き込まず、rust-analyzer /
 # daw exe のロックを外し、git worktree 解除 + branch 削除まで一括)。手動で消したいときだけ使う。
 # 使い方: make worktree-rm NAME=fixme-64-...   (未マージ/dirty は拒否。FORCE=1 で強制)
-worktree-rm:
+worktree-rm: test-worktree-rm
 	@[ -n "$(NAME)" ] || { echo "usage: make worktree-rm NAME=<worktree-name> [FORCE=1]"; exit 1; }
 	$(BASH) "$(CLEANUP_WT)" --name "$(NAME)" $(if $(FORCE),--force,)
 
@@ -424,5 +474,5 @@ worktree-rm:
 # 結果) も削除対象 — これが「マージしたのに消えない」の正体だった。未保存/dirty/locked は
 # remove_one のガードが守る。さらに git 登録が外れた空ディレクトリ
 # (.claude/worktrees/<dir>) も掃除する (prune_orphan_dirs)。
-worktree-rm-merged:
+worktree-rm-merged: test-worktree-rm
 	$(BASH) "$(CLEANUP_WT)" --all

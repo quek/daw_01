@@ -55,12 +55,12 @@ VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**
 
 ## Claude Code の hook は同梱していない
 
-このリポジトリは [`.claude/settings.json`](.claude/settings.json) を git 追跡しているが、
-**hook は 1 本も登録していない** (`{}`)。clone したツリーを Claude Code で開いても、
-ツール呼び出しに割り込むローカルスクリプトは走らない。外部通信もしない。
+このリポジトリは `.claude/settings.json` を**同梱していない**。clone したツリーを Claude Code で
+開いても、ツール呼び出しに割り込むローカルスクリプトは走らない。外部通信もしない。
 
-コード品質の強制は `make` の検査 (`arch-lint` / `clippy` / `test` / `license-check` / `audit`) が
-担う。どれも実行結果が出力に出るので、黙って壊れても気付ける。
+コード品質の強制は `make` の検査が担う。`clippy` / `test` / `test-nolaunch` は `gates`
+(ライセンス表示 + `Cargo.lock` の監査状態) を前提条件に持ち、`worktree-rm*` は削除ツールの
+回帰テストを前提条件に持つ。どれも実行結果が出力に出るので、黙って壊れても気付ける。
 
 ## ライセンス
 
