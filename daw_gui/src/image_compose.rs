@@ -16,6 +16,8 @@ use common::model::{
     Song, Track,
 };
 
+use crate::launcher_time::RowTimeline;
+
 /// One image event active at the current playhead. Mirrors
 /// `video_playback::ActiveVideoFrame` so the caller can merge video +
 /// image layers in a single composite pass by sorting on `z_index`.
@@ -60,16 +62,20 @@ pub struct ActiveImageFrame {
 }
 
 /// Walk the song bottom-up (= `track[N-1]` first → `track[0]` last)
-/// and emit one `ActiveImageFrame` per active image event at
-/// `playhead_beat`. Mirrors `video_playback::active_sources_at` for
-/// image clips so the two are interleaved by the caller via
-/// `z_index`.
+/// and emit one `ActiveImageFrame` per active image event.
+/// Mirrors `video_playback::active_sources_at` for image clips so the
+/// two are interleaved by the caller via `z_index`.
+///
+/// v35 (r.md #87): 「どのクリップを、どの拍で見るか」は
+/// [`RowTimeline::track_scan`] が、オートメーションレーンの値は
+/// [`RowTimeline::lane_value`] が行ごとに解く — 映像 / 字幕と**同じ 1 本**。
+/// アレンジ主導の行は従来と完全に同一の経路になる。
 ///
 /// Muted events and events whose fade envelope evaluates to 0 are
 /// dropped from the result entirely.
 pub fn active_image_sources_at(
     song: &Song,
-    playhead_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Vec<ActiveImageFrame> {
     let bpm = song.bpm as f64;
@@ -98,23 +104,27 @@ pub fn active_image_sources_at(
             continue;
         }
         let z_index = idx as u32;
+        // r.md #87: ランチャーが握っていて無音の行は 1 枚も出さない。
+        let Some(scan) = rows.track_scan(track) else {
+            continue;
+        };
         // Build the per-track `ImageBuiltin` lane index once (= a single
         // pass over `track.automation_lanes`) instead of re-`find`ing
         // each of the 6 fields for every event below (`[Mid]`).
         let lanes = ImageLaneIndex::build(track);
-        for clip in &track.clips {
+        for clip in scan.clips {
             // muted clip は image overlay から除外する。
             if clip.muted {
                 continue;
             }
             let clip_start = clip.start_beat;
             let clip_end = clip.start_beat + clip.length_beats;
-            if playhead_beat < clip_start || playhead_beat >= clip_end {
+            if scan.clip_beat < clip_start || scan.clip_beat >= clip_end {
                 continue;
             }
             // r.md #44: content 上の位置は clip 開始ではなく content 原点基準
             // (= 左端 trim した clip は窓の分だけ content の先を見せる)。
-            let clip_local = clip.song_to_content_beat(playhead_beat);
+            let clip_local = clip.song_to_content_beat(scan.clip_beat);
             let Some(content) = song.clip_contents.get(&clip.content_id) else {
                 continue;
             };
@@ -142,9 +152,9 @@ pub fn active_image_sources_at(
                 let (x, y, w, h, opacity, rotation) = resolve_image_fields(
                     &lanes,
                     song,
-                    &track.mod_routings,
+                    track,
+                    rows,
                     event,
-                    playhead_beat,
                     mod_scalars,
                 );
                 let alpha = opacity * env;
@@ -220,13 +230,13 @@ impl<'a> ImageLaneIndex<'a> {
 /// lane で override する。 lane が存在し enabled / clip カバー範囲内 /
 /// point 列を持つ場合のみ lane の値、 さもなくば event の値を返す。 lane
 /// 探索は呼び出し前に [`ImageLaneIndex`] へ済ませてあるので、 ここでは
-/// index 参照 + `lane_value_at` のみ。
+/// index 参照 + `RowTimeline::lane_value` のみ。
 fn resolve_image_fields(
     lanes: &ImageLaneIndex<'_>,
     song: &Song,
-    track_mod_routings: &[common::model::ModRouting],
+    track: &Track,
+    rows: &RowTimeline<'_>,
     event: &ImageEvent,
-    song_beat: f64,
     mod_scalars: &[f32],
 ) -> (f32, f32, f32, f32, f32, f32) {
     // docs/plan_modulation_routing_redesign.md §3.1: base = lane があれば lane 値、
@@ -239,15 +249,17 @@ fn resolve_image_fields(
                    clamp01: bool|
      -> f32 {
         let target = AutomationTarget::ImageBuiltin(param);
+        // r.md #87: lane の値はレーン行の主導権で供給元が変わる (アレンジ行は
+        // song 拍で `lane.clips`、ランチャー行はセル 1 つ、停止中は既定値)。
         let base = match lane {
-            Some(l) => common::automation::lane_value_at(l, &song.clip_contents, song_beat),
+            Some(l) => rows.lane_value(track.id, l, song),
             None => f64::from(fallback),
         };
         let v = common::automation::apply_modulation_with_scalars(
             song,
             &target,
             base,
-            track_mod_routings,
+            &track.mod_routings,
             mod_scalars,
         ) as f32;
         if clamp01 { v.clamp(0.0, 1.0) } else { v }
@@ -375,7 +387,7 @@ mod tests {
     #[test]
     fn active_image_returns_single_layer_inside_event() {
         let song = make_song_with_one_image(0.1, 0.2, 0.5, 0.5, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, 4.0, &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         assert_eq!(frames.len(), 1);
         let f = frames[0];
         assert_eq!(f.x, 0.1);
@@ -389,14 +401,14 @@ mod tests {
     #[test]
     fn active_image_returns_empty_outside_event() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, 16.0, &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(16.0), &[]);
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_image_applies_opacity_multiplier() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, 4.0, &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -405,7 +417,7 @@ mod tests {
     fn active_image_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha = opacity * 0.5
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_image_sources_at(&song, 2.0, &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(2.0), &[]);
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -423,7 +435,65 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_image_sources_at(&song, 4.0, &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         assert!(frames.is_empty());
+    }
+
+    /// r.md #87: ランチャー主導の行は、アレンジのクリップではなくセルを映す。
+    /// 映像 / 字幕と同じ [`RowTimeline`] を通っていることの確認。
+    #[test]
+    fn ランチャー主導の行はセルの画像を位相で映す() {
+        use common::model::{LaunchSettings, RowPlayback, SessionClip};
+        // アレンジ: 拍 [0, 8) で x=0.1 の画像。セル: 長さ 4 拍・拍 [2, 4) だけ
+        // 見える x=0.9 の画像 (= 位相が効いているかを x で見分ける)。
+        let mut song = make_song_with_one_image(0.1, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
+        let img_id = *song.media.image_sources.keys().next().unwrap();
+        let cell_content = song.alloc_content_id();
+        song.clip_contents.insert(
+            cell_content,
+            ClipContent::Image(ImageContent {
+                events: vec![ImageEvent {
+                    source_id: img_id,
+                    event_start_in_clip_beats: 2.0,
+                    event_length_beats: 2.0,
+                    x: 0.9,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    opacity: 1.0,
+                    rotation_radians: 0.0,
+                    muted: false,
+                    fade_in_beats: 0.0,
+                    fade_out_beats: 0.0,
+                    fade_in_curve: FadeCurve::Linear,
+                    fade_out_curve: FadeCurve::Linear,
+                }],
+            }),
+        );
+        let cell_clip_id = song.tracks[0].alloc_clip_id();
+        song.tracks[0].session_clips.push(SessionClip {
+            scene_id: 1,
+            clip: Clip {
+                id: cell_clip_id,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cell_content,
+                ..Clip::default()
+            },
+            launch: LaunchSettings::default(),
+        });
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: cell_clip_id };
+
+        // 拍 3 → 位相 3.0 → セルの event 窓 [2, 4) の中 → x = 0.9。
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(3.0), &[]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].x, 0.9, "アレンジの画像 (x=0.1) ではなくセルが出る");
+        // 拍 5 → 位相 1.0 → セルの event 窓の外 → 何も出ない
+        // (アレンジのクリップは拍 5 を覆っているが、行はランチャー主導)。
+        assert!(active_image_sources_at(&song, &RowTimeline::preview(5.0), &[]).is_empty());
+        // 拍 7 → 位相 3.0 (ループ 2 周目) → また出る。
+        let looped = active_image_sources_at(&song, &RowTimeline::preview(7.0), &[]);
+        assert_eq!(looped.len(), 1);
+        assert_eq!(looped[0].x, 0.9);
     }
 }

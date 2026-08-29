@@ -43,6 +43,7 @@ fn export_error(e: &RenderError, frame_index: u64) -> String {
     }
 }
 
+use crate::launcher_time::RowTimeline;
 use crate::video_playback::VideoPlaybackEngine;
 
 /// Render configuration. All fields are derived from `Song` except
@@ -389,6 +390,14 @@ pub fn render_mp4_cancellable(
         // docs/plan_modulation.md §7: sample the baked follower envelopes at
         // this frame's beat (step / sample-and-hold), same composition as live.
         mod_sidecar.sample_at(playhead_beat, &mut mod_scalars_buf);
+        // r.md #87 (計画書 Q9 / §2.5): 書き出しは「範囲の先頭で今の `Track.launcher`
+        // を一斉に撃った」状態から始まる。走行位置を `Song` に保存しないので、同じ
+        // プロジェクトなら何度書き出しても同じ絵になる。
+        // **フォローアクションによる遷移はまだ絵に出ない** — 遷移を決めるのは
+        // daw_audio の走行状態で、GUI 側はそれを受け取る口
+        // (`RowTimeline::with_running`) を用意しただけ。現状は「範囲の先頭で撃った
+        // セルがループし続ける」絵になる (音は engine が正しく遷移する)。
+        let rows = RowTimeline::export(start_beat, playhead_beat);
         scene.primitives.clear();
         build_frame_scene(
             cfg.song,
@@ -398,7 +407,7 @@ pub fn render_mp4_cancellable(
             &mut fx_engine,
             &mut video_textures,
             &image_textures,
-            playhead_beat,
+            &rows,
             start_secs + frame_seconds,
             &mod_scalars_buf,
             out_w,
@@ -506,8 +515,10 @@ pub struct RenderStats {
     pub output_path: PathBuf,
 }
 
-/// Build the `Scene` for one playhead beat by walking active video +
-/// image layers and pushing one textured-quad per layer. Bottom-up
+/// Build the `Scene` for one output frame by walking active video +
+/// image layers and pushing one textured-quad per layer. 「どの行が今
+/// 何を映すか」は `rows` ([`RowTimeline`]) が解く — preview と同じ 1 本
+/// (r.md #87)。Bottom-up
 /// order (= `active_*_sources_at` returns `z_index` ascending) drives
 /// gui_01's call-order interleave so the top track wins at
 /// `alpha = 1.0` and crossfades blend at intermediate alphas. Image
@@ -523,7 +534,7 @@ fn build_frame_scene(
     fx_engine: &mut crate::video_fx::VideoFxEngine,
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
-    playhead_beat: f64,
+    rows: &RowTimeline<'_>,
     playhead_secs: f64,
     mod_scalars: &[f32],
     out_w: u32,
@@ -544,7 +555,7 @@ fn build_frame_scene(
     let mut buckets: HashMap<u32, Vec<CompositeItem>> = HashMap::new();
 
     // 動画フレーム (in-process libav software decode → BGRA texture) → owning track bucket。
-    let video_layers = VideoPlaybackEngine::active_sources_at(song, playhead_beat);
+    let video_layers = VideoPlaybackEngine::active_sources_at(song, rows);
     for layer in video_layers {
         let Some(path) =
             resolve_video_source_path(song, layer.video_source_id, project_dir)
@@ -593,11 +604,10 @@ fn build_frame_scene(
 
     // active visual groups (preview と同一 gate `active_visual_groups`、SSoT)。
     // mod_scalars は render_mp4 が baked env sidecar から sample (空 = 変調なし)。
-    let active_groups = crate::group_compose::active_visual_groups(song, playhead_beat, mod_scalars);
+    let active_groups = crate::group_compose::active_visual_groups(song, rows, mod_scalars);
 
     // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning track bucket。
-    let image_layers =
-        crate::image_compose::active_image_sources_at(song, playhead_beat, mod_scalars);
+    let image_layers = crate::image_compose::active_image_sources_at(song, rows, mod_scalars);
     for layer in image_layers {
         let Some((texture, _iw, _ih)) = image_textures.get(&layer.image_source_id) else {
             continue; // not decoded / failed import
@@ -616,8 +626,7 @@ fn build_frame_scene(
     }
 
     // テキスト → owning track bucket (合成画に焼き込んで track 効果を乗せる)。
-    let text_layers =
-        crate::text_compose::active_text_sources_at(song, playhead_beat, mod_scalars);
+    let text_layers = crate::text_compose::active_text_sources_at(song, rows, mod_scalars);
     for tf in text_layers {
         buckets.entry(tf.owning_track_id).or_default().push(CompositeItem::Text(tf));
     }
@@ -631,8 +640,8 @@ fn build_frame_scene(
             continue; // export は overlay 不要なので空 bucket は skip。
         }
         // 配置 transform は Transform device から解決（preview と同一 SSoT）。
-        let transform = crate::video_fx::resolve_track_transform(song, track, playhead_beat, mod_scalars);
-        let fx = crate::video_fx::resolve_track_effects(song, track, playhead_beat, mod_scalars);
+        let transform = crate::video_fx::resolve_track_transform(song, track, rows, mod_scalars);
+        let fx = crate::video_fx::resolve_track_effects(song, track, rows, mod_scalars);
         let tc = crate::group_compose::TrackComposite {
             track_id: track.id,
             items,
@@ -653,7 +662,7 @@ fn build_frame_scene(
     // マスター映像チェーン。全トラック合成後の scene を 1 枚の master
     // canvas へ集約 → master fx をチェーン順適用 → scene を master 1 quad で置換（preview と
     // 同一 SSoT）。空なら何もしない。
-    let master_fx = crate::video_fx::resolve_master_effects(song, playhead_beat, mod_scalars);
+    let master_fx = crate::video_fx::resolve_master_effects(song, rows, mod_scalars);
     if !master_fx.is_empty() {
         match offscreen.composite_scene_to_texture(scene, out_w, out_h) {
             Ok(handle) => {

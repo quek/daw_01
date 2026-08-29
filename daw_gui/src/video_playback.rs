@@ -14,7 +14,10 @@
 
 use std::path::Path;
 
-use common::model::{FadeCurve, Song, VideoEvent, VideoSourceId};
+use common::model::{Clip, FadeCurve, Song, VideoEvent, VideoSourceId};
+use common::tempo_map::TempoMap;
+
+use crate::launcher_time::{RowScan, RowTimeline};
 
 /// Default forward-walk budget (µs) handed to [`VideoPlaybackEngine::decode_at`].
 /// Retained for the worker/decode signature; the libav decoder makes its own
@@ -83,16 +86,21 @@ impl VideoPlaybackEngine {
     }
 
     /// Pure helper: walk the song bottom-up and return every video
-    /// clip active at `playhead_beat`, with a per-event `alpha`
-    /// derived from the clip's `fade_in_beats` / `fade_out_beats` (=
-    /// MVP crossfade behaviour). Returns a `Vec<ActiveVideoFrame>`
-    /// ordered from lowest to topmost track so the caller can
-    /// composite by call-order (= last pushed quad ends up on top).
+    /// clip active now, with a per-event `alpha` derived from the
+    /// clip's `fade_in_beats` / `fade_out_beats` (= MVP crossfade
+    /// behaviour). Returns a `Vec<ActiveVideoFrame>` ordered from
+    /// lowest to topmost track so the caller can composite by
+    /// call-order (= last pushed quad ends up on top).
     /// v12 (`docs/plan_video.md` §4 P7).
     ///
-    /// Muted events are dropped from the result entirely (= same as
-    /// the singular `active_source_at` MVP behaviour).
-    pub fn active_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveVideoFrame> {
+    /// v35 (r.md #87): 「どのクリップを、どの拍で見るか」は
+    /// [`RowTimeline::track_scan`] が行ごとに解く。アレンジ主導の行
+    /// (`RowPlayback::Arranger`) では `track.clips` を song の playhead で見る
+    /// **従来と同一**の経路になり、ランチャー主導の行では源が
+    /// `track.session_clips` のセル 1 つ・拍がセル内の位相に切り替わる。
+    ///
+    /// Muted events are dropped from the result entirely.
+    pub fn active_sources_at(song: &Song, rows: &RowTimeline<'_>) -> Vec<ActiveVideoFrame> {
         let bpm = song.bpm as f64;
         if bpm <= 0.0 {
             return Vec::new();
@@ -100,7 +108,6 @@ impl VideoPlaybackEngine {
         // A4 (r.md #8): tempo automation がある曲は映像 source 時間 (秒) を tempo
         // 積分で求める (= 映像が音とズレない)。 constant 曲は従来の高速 60/bpm 経路。
         let tempo_map = song_tempo_map_if_automated(song);
-        let playhead_secs = tempo_map.as_ref().map(|m| m.beat_to_seconds(playhead_beat));
         let mut out: Vec<ActiveVideoFrame> = Vec::new();
         // `song.tracks[0]` is the top of the arrangement, so iterating
         // `.rev()` yields bottom-most → topmost. Each video track gets
@@ -119,147 +126,33 @@ impl VideoPlaybackEngine {
             if song.track_visually_silenced(track.id) {
                 continue;
             }
+            // r.md #87: ランチャーが握っていて無音の行 (Stop Clips / ワンショット
+            // 終端) は 1 枚も出さない。
+            let Some(scan) = rows.track_scan(track) else {
+                continue;
+            };
             let mut track_emitted = false;
-            for clip in &track.clips {
+            for clip in scan.clips {
                 // muted clip は video composite から除外する (黒/下層が出る)。
                 if clip.muted {
                     continue;
                 }
-                let clip_start = clip.start_beat;
-                let clip_end = clip.start_beat + clip.length_beats;
-                if playhead_beat < clip_start || playhead_beat >= clip_end {
-                    continue;
-                }
-                // r.md #44: content 上の位置は clip 開始ではなく content 原点基準
-                // (= 左端 trim した clip は窓の分だけ content の先を見せる)。
-                let clip_local = clip.song_to_content_beat(playhead_beat);
-                let Some(content) = song.clip_contents.get(&clip.content_id) else {
-                    continue;
-                };
-                let Some(events) = content.video_events() else {
-                    continue;
-                };
-                for event in events {
-                    let event_end =
-                        event.event_start_in_clip_beats + event.event_length_beats;
-                    if clip_local < event.event_start_in_clip_beats
-                        || clip_local >= event_end
-                    {
-                        continue;
-                    }
-                    if event.muted {
-                        continue;
-                    }
-                    let event_progress_beats =
-                        clip_local - event.event_start_in_clip_beats;
-                    let event_progress_secs = match (&tempo_map, playhead_secs) {
-                        (Some(m), Some(ph_secs)) => {
-                            let event_start = clip_start + event.event_start_in_clip_beats;
-                            (ph_secs - m.beat_to_seconds(event_start)).max(0.0)
-                        }
-                        _ => event_progress_beats * 60.0 / bpm,
-                    };
-                    let event_progress_micros =
-                        (event_progress_secs * 1_000_000.0).round() as u64;
-                    let source_micros = event
-                        .source_start_micros
-                        .saturating_add(event_progress_micros)
-                        .min(event.source_end_micros);
-                    let alpha = event_alpha(event, clip_local);
-                    if alpha <= 0.0 {
-                        continue;
-                    }
-                    out.push(ActiveVideoFrame {
-                        video_source_id: event.source_id,
-                        owning_track_id: track.id,
-                        source_micros,
-                        alpha,
-                        z_index,
-                    });
-                    track_emitted = true;
-                }
+                track_emitted |= push_clip_video_frames(
+                    song,
+                    track.id,
+                    clip,
+                    &scan,
+                    tempo_map.as_ref(),
+                    bpm,
+                    z_index,
+                    &mut out,
+                );
             }
             if track_emitted {
                 z_index += 1;
             }
         }
         out
-    }
-
-    /// Backwards-compatible singular accessor (`docs/plan_video.md`
-    /// P5 baseline). Equivalent to `active_sources_at(...).last()` —
-    /// the topmost active layer wins, with its alpha taken into
-    /// account so a faded-out top clip with alpha < threshold defers
-    /// to whatever is underneath. Kept around for callers that don't
-    /// composite (= e.g. arrangement thumbnail picker).
-    pub fn active_source_at(
-        song: &Song,
-        playhead_beat: f64,
-    ) -> Option<(VideoSourceId, u64)> {
-        let bpm = song.bpm as f64;
-        if bpm <= 0.0 {
-            return None;
-        }
-        // A4 (r.md #8): tempo automation 時は映像 source 時間を tempo 積分で求める。
-        let tempo_map = song_tempo_map_if_automated(song);
-        let playhead_secs = tempo_map.as_ref().map(|m| m.beat_to_seconds(playhead_beat));
-        for track in &song.tracks {
-            // v16: TrackKind 廃止後は「video_events を持つ clip がある
-            // track」 が visual composite に参加する。 `content.video
-            // _events()` で None を skip する経路に統合。
-            if track.muted {
-                continue;
-            }
-            for clip in &track.clips {
-                // muted clip は video composite から除外する。
-                if clip.muted {
-                    continue;
-                }
-                let clip_start = clip.start_beat;
-                let clip_end = clip.start_beat + clip.length_beats;
-                if playhead_beat < clip_start || playhead_beat >= clip_end {
-                    continue;
-                }
-                // r.md #44: content 上の位置は clip 開始ではなく content 原点基準
-                // (= 左端 trim した clip は窓の分だけ content の先を見せる)。
-                let clip_local = clip.song_to_content_beat(playhead_beat);
-                let Some(content) = song.clip_contents.get(&clip.content_id) else {
-                    continue;
-                };
-                let Some(events) = content.video_events() else {
-                    continue;
-                };
-                for event in events {
-                    let event_end =
-                        event.event_start_in_clip_beats + event.event_length_beats;
-                    if clip_local < event.event_start_in_clip_beats
-                        || clip_local >= event_end
-                    {
-                        continue;
-                    }
-                    if event.muted {
-                        return None;
-                    }
-                    let event_progress_beats =
-                        clip_local - event.event_start_in_clip_beats;
-                    let event_progress_secs = match (&tempo_map, playhead_secs) {
-                        (Some(m), Some(ph_secs)) => {
-                            let event_start = clip_start + event.event_start_in_clip_beats;
-                            (ph_secs - m.beat_to_seconds(event_start)).max(0.0)
-                        }
-                        _ => event_progress_beats * 60.0 / bpm,
-                    };
-                    let event_progress_micros =
-                        (event_progress_secs * 1_000_000.0).round() as u64;
-                    let source_micros = event
-                        .source_start_micros
-                        .saturating_add(event_progress_micros)
-                        .min(event.source_end_micros);
-                    return Some((event.source_id, source_micros));
-                }
-            }
-        }
-        None
     }
 
     /// Decode the frame at `target_micros` (source time) for `source_path` via
@@ -295,6 +188,79 @@ impl Default for VideoPlaybackEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `clip` が `scan.clip_beat` を覆っているなら、その中で active な video event を
+/// `out` へ積む。1 枚でも積んだら `true` (呼び側の `z_index` 前進の判定に使う)。
+///
+/// `active_sources_at` から切り出したのは、アレンジ行 (`track.clips` を song 拍で
+/// 走査) とランチャー行 (セル 1 つをセル内位相で走査) が **同じ 1 本**を通るように
+/// するため。`scan` が座標系の違いを吸収するので、ここから下は完全に共通。
+#[allow(clippy::too_many_arguments)]
+fn push_clip_video_frames(
+    song: &Song,
+    track_id: u32,
+    clip: &Clip,
+    scan: &RowScan<'_, Clip>,
+    tempo_map: Option<&TempoMap>,
+    bpm: f64,
+    z_index: u32,
+    out: &mut Vec<ActiveVideoFrame>,
+) -> bool {
+    let clip_start = clip.start_beat;
+    let clip_end = clip.start_beat + clip.length_beats;
+    if scan.clip_beat < clip_start || scan.clip_beat >= clip_end {
+        return false;
+    }
+    // r.md #44: content 上の位置は clip 開始ではなく content 原点基準
+    // (= 左端 trim した clip は窓の分だけ content の先を見せる)。
+    let clip_local = clip.song_to_content_beat(scan.clip_beat);
+    let Some(content) = song.clip_contents.get(&clip.content_id) else {
+        return false;
+    };
+    let Some(events) = content.video_events() else {
+        return false;
+    };
+    // tempo 積分は song-absolute な拍でしか意味を持たないので、ランチャー行では
+    // 「セルを撃った拍 + 位相」(= 計画書 §2.1 の effective_beat) で写像する。
+    let row_secs = tempo_map.map(|m| m.beat_to_seconds(scan.song_beat));
+    let mut emitted = false;
+    for event in events {
+        let event_end = event.event_start_in_clip_beats + event.event_length_beats;
+        if clip_local < event.event_start_in_clip_beats || clip_local >= event_end {
+            continue;
+        }
+        if event.muted {
+            continue;
+        }
+        let event_progress_beats = clip_local - event.event_start_in_clip_beats;
+        let event_progress_secs = match (tempo_map, row_secs) {
+            (Some(m), Some(now_secs)) => {
+                let event_start =
+                    scan.song_origin() + clip_start + event.event_start_in_clip_beats;
+                (now_secs - m.beat_to_seconds(event_start)).max(0.0)
+            }
+            _ => event_progress_beats * 60.0 / bpm,
+        };
+        let event_progress_micros = (event_progress_secs * 1_000_000.0).round() as u64;
+        let source_micros = event
+            .source_start_micros
+            .saturating_add(event_progress_micros)
+            .min(event.source_end_micros);
+        let alpha = event_alpha(event, clip_local);
+        if alpha <= 0.0 {
+            continue;
+        }
+        out.push(ActiveVideoFrame {
+            video_source_id: event.source_id,
+            owning_track_id: track_id,
+            source_micros,
+            alpha,
+            z_index,
+        });
+        emitted = true;
+    }
+    emitted
 }
 
 /// tempo automation (SongTempo lane) があれば `TempoMap` を build する (= 映像
@@ -501,19 +467,10 @@ mod tests {
         song
     }
 
-    #[test]
-    fn active_source_at_returns_none_outside_clip() {
-        let song = song_with_video_clip(120.0, 1);
-        // playhead before clip start
-        assert!(VideoPlaybackEngine::active_source_at(&song, 0.0).is_none());
-        // playhead after clip end
-        assert!(VideoPlaybackEngine::active_source_at(&song, 100.0).is_none());
-    }
-
     /// r.md #8 A4: tempo automation 下では映像 source 時間が tempo 積分で進む
     /// (= 一定 bpm 換算の `progress*60/bpm` とズレ、 映像が音と同期し続ける)。
     #[test]
-    fn active_source_at_honors_tempo_automation() {
+    fn active_sources_at_honors_tempo_automation() {
         // base 60bpm の video clip (clip/event は beat 4 始まり) に、 60→180 linear
         // の SongTempo lane [0,12) を載せる。 beat 4..8 は 100..140 bpm。
         let mut song = song_with_video_clip(60.0, 1);
@@ -541,8 +498,9 @@ mod tests {
             }],
             ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
         });
-        let (_id, micros) = VideoPlaybackEngine::active_source_at(&song, 8.0).unwrap();
-        let secs = micros as f64 / 1_000_000.0;
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(8.0));
+        assert_eq!(active.len(), 1, "beat 8 は clip [4, 12) の中");
+        let secs = active[0].source_micros as f64 / 1_000_000.0;
         // 期待値 = tempo 積分した beat 4→8 の実時間。
         let m = common::tempo_map::TempoMap::from_song(&song);
         let expected = m.beat_to_seconds(8.0) - m.beat_to_seconds(4.0);
@@ -552,45 +510,19 @@ mod tests {
     }
 
     #[test]
-    fn active_source_at_returns_source_inside_clip() {
+    fn active_sources_at_maps_clip_local_beat_to_source_micros() {
         // 120 bpm, clip starts at beat 4 (= 2s), playhead at beat 5 (=
         // 2.5s) → clip-local = 1 beat = 0.5s = 500_000μs.
         let song = song_with_video_clip(120.0, 7);
-        let result = VideoPlaybackEngine::active_source_at(&song, 5.0)
-            .expect("clip should be active at playhead 5.0");
-        assert_eq!(result.0, 7);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0));
+        assert_eq!(active.len(), 1, "clip should be active at playhead 5.0");
+        assert_eq!(active[0].video_source_id, 7);
         // Allow ±1μs rounding from f64 → u64.
         assert!(
-            (result.1 as i64 - 500_000_i64).abs() <= 1,
+            (active[0].source_micros as i64 - 500_000_i64).abs() <= 1,
             "expected ~500_000μs, got {}",
-            result.1
+            active[0].source_micros
         );
-    }
-
-    #[test]
-    fn active_source_at_skips_audio_tracks() {
-        let mut song = song_with_video_clip(120.0, 1);
-        // Stick an Audio track at the top — must be skipped.
-        let audio_track = crate::app::track_with(|t| {
-            t.id = 2;
-            t.name = "A".into();
-        });
-        song.tracks.insert(0, audio_track);
-        let result = VideoPlaybackEngine::active_source_at(&song, 5.0);
-        assert!(result.is_some(), "video track should still be found");
-        assert_eq!(result.unwrap().0, 1);
-    }
-
-    #[test]
-    fn active_source_at_honors_event_muted() {
-        let mut song = song_with_video_clip(120.0, 3);
-        // Mute the only event → no source returned.
-        let cid = song.tracks[0].clips[0].content_id;
-        let Some(ClipContent::Video(content)) = song.clip_contents.get_mut(&cid) else {
-            panic!("expected Video content");
-        };
-        content.events[0].muted = true;
-        assert!(VideoPlaybackEngine::active_source_at(&song, 5.0).is_none());
     }
 
     #[test]
@@ -729,15 +661,15 @@ mod tests {
     fn active_sources_at_returns_empty_when_no_video_active() {
         let song = song_with_video_clip(120.0, 1);
         // playhead outside clip → empty
-        assert!(VideoPlaybackEngine::active_sources_at(&song, 0.0).is_empty());
-        assert!(VideoPlaybackEngine::active_sources_at(&song, 100.0).is_empty());
+        assert!(VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(0.0)).is_empty());
+        assert!(VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(100.0)).is_empty());
     }
 
     #[test]
     fn active_sources_at_returns_single_with_alpha_one_outside_fades() {
         // No fade_in / fade_out → alpha == 1.0 everywhere inside the clip.
         let song = song_with_video_clip(120.0, 5);
-        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0));
         assert_eq!(active.len(), 1);
         let frame = active[0];
         assert_eq!(frame.video_source_id, 5);
@@ -760,7 +692,7 @@ mod tests {
             c.events[0].fade_in_curve = common::model::FadeCurve::Linear;
         }
         // clip starts at beat 4, playhead at 5 → clip-local = 1 beat
-        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0));
         assert_eq!(active.len(), 1);
         assert!(
             (active[0].alpha - 0.5).abs() < 1e-3,
@@ -779,7 +711,7 @@ mod tests {
             c.events[0].fade_out_beats = 2.0;
             c.events[0].fade_out_curve = common::model::FadeCurve::SCurve;
         }
-        let active = VideoPlaybackEngine::active_sources_at(&song, 11.0);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(11.0));
         assert_eq!(active.len(), 1);
         assert!(
             (active[0].alpha - 0.5).abs() < 1e-3,
@@ -837,7 +769,7 @@ mod tests {
         // Insert at position 0 = top of arrangement.
         song.tracks.insert(0, top_track);
 
-        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0));
         assert_eq!(active.len(), 2, "both tracks should be active at 5.0");
         // z_index=0 is the bottom track (original source_id=1),
         // z_index=1 is the top (source_id=2). Caller renders in
@@ -855,7 +787,7 @@ mod tests {
         if let Some(ClipContent::Video(c)) = song.clip_contents.get_mut(&cid) {
             c.events[0].muted = true;
         }
-        let active = VideoPlaybackEngine::active_sources_at(&song, 5.0);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0));
         assert!(active.is_empty(), "muted event should be dropped");
     }
 
@@ -869,24 +801,100 @@ mod tests {
             c.events[0].fade_in_beats = 2.0;
         }
         // clip starts at beat 4 — playhead exactly at 4 = clip-local 0
-        let active = VideoPlaybackEngine::active_sources_at(&song, 4.0);
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(4.0));
         assert!(active.is_empty(), "alpha=0 frame should be dropped");
     }
 
     #[test]
-    fn active_source_at_clamps_to_event_end_micros() {
+    fn active_sources_at_clamps_to_event_end_micros() {
         // Playhead right at the end of the event — source_micros should
         // clamp to source_end_micros (= 4_000_000 here, not extrapolate
         // beyond).
         let song = song_with_video_clip(120.0, 1);
         // 8 beats long at 120bpm = 4s. Clip starts at beat 4. End is
         // beat 12 (just after, so use beat 11.9 to stay inside).
-        let result = VideoPlaybackEngine::active_source_at(&song, 11.9)
-            .expect("should be inside clip");
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(11.9));
+        assert_eq!(active.len(), 1, "should be inside clip");
         assert!(
-            result.1 <= 4_000_000,
+            active[0].source_micros <= 4_000_000,
             "source_micros should be clamped to source_end_micros, got {}",
-            result.1
+            active[0].source_micros
+        );
+    }
+
+    // ====================================================================
+    // r.md #87 クリップランチャー: 行ごとの実効拍とイベント源
+    // ====================================================================
+
+    #[test]
+    fn ランチャー主導の行はセルの映像をループで映す() {
+        use common::model::{LaunchSettings, RowPlayback, SessionClip};
+        // アレンジのクリップ (拍 4 から 8 拍) と、別 source を指す 4 拍のセルを
+        // 同じトラックに置く。
+        let mut song = song_with_video_clip(120.0, 1);
+        let cell_content = song.alloc_content_id();
+        song.clip_contents.insert(
+            cell_content,
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent {
+                    source_id: 42,
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 4.0,
+                    source_start_micros: 0,
+                    source_end_micros: 4_000_000,
+                    ..VideoEvent::default()
+                }],
+            }),
+        );
+        song.tracks[0].session_clips.push(SessionClip {
+            scene_id: 1,
+            clip: Clip {
+                id: 9,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cell_content,
+                ..Clip::default()
+            },
+            launch: LaunchSettings::default(),
+        });
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 9 };
+
+        // 拍 5: 起点 (曲頭) から 5 拍 → 4 拍セルの位相 1.0 → 0.5s。
+        // アレンジのクリップ (source 1) ではなくセル (source 42) が映る。
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0));
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].video_source_id, 42, "源はセル 1 つ");
+        assert!(
+            (active[0].source_micros as i64 - 500_000).abs() <= 1,
+            "位相 1 拍 = 0.5s, got {}",
+            active[0].source_micros
+        );
+
+        // 拍 9: 位相 1.0 に巻き戻る (ループ跨ぎ) — 拍 5 と同じ絵。
+        let looped = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(9.0));
+        assert_eq!(looped[0].source_micros, active[0].source_micros);
+
+        // ワンショットにすると拍 8 以降は何も映さない。
+        song.tracks[0].session_clips[0].launch.looping = false;
+        assert!(
+            VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(9.0)).is_empty(),
+            "ワンショットは終端で消える"
+        );
+    }
+
+    #[test]
+    fn 停止したランチャー行はアレンジのクリップも映さない() {
+        use common::model::RowPlayback;
+        let mut song = song_with_video_clip(120.0, 1);
+        // 拍 5 はアレンジのクリップの中 (通常なら 1 枚出る)。
+        assert_eq!(
+            VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0)).len(),
+            1
+        );
+        song.tracks[0].launcher = RowPlayback::LauncherStopped;
+        assert!(
+            VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(5.0)).is_empty(),
+            "ランチャーが握ったまま無音の行はアレンジへ戻らない"
         );
     }
 }

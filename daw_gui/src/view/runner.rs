@@ -28,6 +28,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::app::{AppData, AppEvent, ClipRef};
+use crate::launcher_time::RowTimeline;
 use crate::view::shortcuts::daw_shortcut_map;
 use daw_ui_platform::WinitWindow;
 use daw_ui_platform::winit_backend::{
@@ -1711,7 +1712,7 @@ impl Runner {
                         && let Some(transform) = crate::video_fx::resolve_track_transform(
                             state.app.song_doc.song(),
                             track,
-                            state.app.transport.playhead_beat.map(f64::from).unwrap_or(0.0),
+                            &RowTimeline::at_playhead(state.app.transport.playhead_beat),
                             &state.app.transport.mod_scalars,
                         )
                     {
@@ -1937,10 +1938,12 @@ impl Runner {
             preview.set_track_composites(Vec::new());
             return;
         };
-        let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(
-            state.app.song_doc.song(),
-            playhead_beat,
-        );
+        let song = state.app.song_doc.song();
+        let mods = &state.app.transport.mod_scalars;
+        // r.md #87: 「どの行が今なにを、どの拍で映すか」の解決器。映像 / 画像 / 字幕 /
+        // グループ変換 / 映像効果が全部これを通る (書き出しは `RowTimeline::export`)。
+        let rows = RowTimeline::preview(playhead_beat);
+        let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(song, &rows);
         let project_dir = state
             .app
             .song_doc.file_path
@@ -1953,11 +1956,9 @@ impl Runner {
         // project doesn't request empty decodes.
         if !active.is_empty() {
             for frame_info in &active {
-                let Some(abs_path) = resolve_video_path(
-                    state.app.song_doc.song(),
-                    frame_info.video_source_id,
-                    project_dir.as_deref(),
-                ) else {
+                let Some(abs_path) =
+                    resolve_video_path(song, frame_info.video_source_id, project_dir.as_deref())
+                else {
                     tracing::warn!(
                         video_source_id = frame_info.video_source_id,
                         "video path unresolved (unsaved project + ProjectRelative?), \
@@ -1981,7 +1982,7 @@ impl Runner {
         // fast-path = 回帰なし・クリスプ・無コスト)。これで spatial 効果 (blur/歪み) が
         // 個別素材でなく「トラックの最終見た目 1 枚」に正しくかかる。
         use crate::group_compose::CompositeItem;
-        let (proj_w, proj_h) = state.app.song_doc.song().video_resolution;
+        let (proj_w, proj_h) = song.video_resolution;
         let canvas = (proj_w.max(1) as f32, proj_h.max(1) as f32);
         let mut buckets: std::collections::HashMap<u32, Vec<CompositeItem>> =
             std::collections::HashMap::new();
@@ -2011,19 +2012,11 @@ impl Runner {
         // transform を 1 回解決（group track id → resolved transform）。gate は
         // `group_has_visual_content`。transform / lane 未設定の visual group も identity
         // として含む。export と同一述語（SSoT）。
-        let active_groups = crate::group_compose::active_visual_groups(
-            state.app.song_doc.song(),
-            playhead_beat,
-            &state.app.transport.mod_scalars,
-        );
+        let active_groups = crate::group_compose::active_visual_groups(song, &rows, mods);
 
         // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning
         // track の bucket。
-        let image_frames = crate::image_compose::active_image_sources_at(
-            state.app.song_doc.song(),
-            playhead_beat,
-            &state.app.transport.mod_scalars,
-        );
+        let image_frames = crate::image_compose::active_image_sources_at(song, &rows, mods);
         for frame_info in image_frames {
             // **preview 自身の** texture を引く。`image_texture_cache` は main renderer 用
             // なので、ここで使うと renderer 間で id が別名衝突する (r.md #42 レビュー指摘)。
@@ -2032,9 +2025,7 @@ impl Runner {
             else {
                 continue; // texture not yet uploaded
             };
-            let dims = state
-                .app
-                .song_doc.song()
+            let dims = song
                 .media.image_sources
                 .get(&frame_info.image_source_id)
                 .map(|s| (s.width, s.height))
@@ -2042,9 +2033,7 @@ impl Runner {
             if dims.0 == 0 || dims.1 == 0 {
                 continue;
             }
-            let target_track = state
-                .app
-                .song_doc.song()
+            let target_track = song
                 .track_by_id(frame_info.owning_track_id)
                 .and_then(|t| t.parent_group_id)
                 .filter(|g| active_groups.contains_key(g))
@@ -2058,11 +2047,7 @@ impl Runner {
         }
 
         // テキスト → owning track の bucket (合成画に焼き込んで track 効果を乗せる)。
-        let text_frames = crate::text_compose::active_text_sources_at(
-            state.app.song_doc.song(),
-            playhead_beat,
-            &state.app.transport.mod_scalars,
-        );
+        let text_frames = crate::text_compose::active_text_sources_at(song, &rows, mods);
         for tf in text_frames {
             buckets.entry(tf.owning_track_id).or_default().push(CompositeItem::Text(tf));
         }
@@ -2071,26 +2056,16 @@ impl Runner {
         // 吸収した子 + group affine、通常 track は自分の視覚アイテム + identity 配置。
         // 選択中 group は children 空でも bounding box 用に emit。
         let mut composites: Vec<crate::group_compose::TrackComposite> = Vec::new();
-        for track in state.app.song_doc.song().tracks.iter().rev() {
+        for track in song.tracks.iter().rev() {
             let items = buckets.remove(&track.id).unwrap_or_default();
             // 配置 transform は **どのトラックでも** Transform device から
             // 解決（立ち絵 group も通常トラックも統一）。device が無ければ None = identity 配置。
-            let transform = crate::video_fx::resolve_track_transform(
-                state.app.song_doc.song(),
-                track,
-                playhead_beat,
-                &state.app.transport.mod_scalars,
-            );
+            let transform = crate::video_fx::resolve_track_transform(song, track, &rows, mods);
             let selected = state.app.cursor_track_id() == Some(track.id);
             if items.is_empty() && !(transform.is_some() && selected) {
                 continue;
             }
-            let fx = crate::video_fx::resolve_track_effects(
-                state.app.song_doc.song(),
-                track,
-                playhead_beat,
-                &state.app.transport.mod_scalars,
-            );
+            let fx = crate::video_fx::resolve_track_effects(song, track, &rows, mods);
             composites.push(crate::group_compose::TrackComposite {
                 track_id: track.id,
                 items,
@@ -2103,22 +2078,16 @@ impl Runner {
         // preview/export 一致のため wall-clock でなく song 時間。 tempo automation
         // がある曲は積分写像 (constant-bpm 線形だと export = TempoMap 積分と
         // 効果進行がズレる。 映像 source 時間の A4 と同じ扱い)。
-        preview.fx_engine.set_time(common::tempo_map::song_beat_to_seconds(
-            state.app.song_doc.song(),
-            playhead_beat,
-        ) as f32);
+        let fx_secs = common::tempo_map::song_beat_to_seconds(song, playhead_beat);
+        preview.fx_engine.set_time(fx_secs as f32);
         preview.set_track_composites(composites);
         // マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
         // 空でなければ preview が全トラック合成画を master canvas 1 枚に集約してから適用する。
-        preview.set_master_fx(crate::video_fx::resolve_master_effects(
-            state.app.song_doc.song(),
-            playhead_beat,
-            &state.app.transport.mod_scalars,
-        ));
+        preview.set_master_fx(crate::video_fx::resolve_master_effects(song, &rows, mods));
         // PiP rect の normalized 座標は project_resolution の letterbox
         // 内で展開される (= window resize しても画像 aspect が崩れない)。
         // Song.video_resolution を毎 frame 同期。
-        preview.set_project_resolution(state.app.song_doc.song().video_resolution);
+        preview.set_project_resolution(song.video_resolution);
 
         // `docs/plan_image_overlay.md` §4 P5: 選択中 image event の
         // PiP rect を preview window 上に縁取り + handle で描画する。
@@ -2135,9 +2104,9 @@ impl Runner {
             .app
             .selected_clip_ref()
             .and_then(|cref| {
-                let track = state.app.song_doc.song().tracks.get(cref.track as usize)?;
+                let track = song.tracks.get(cref.track as usize)?;
                 let clip = track.clips.get(cref.clip as usize)?;
-                let content = state.app.song_doc.song().clip_contents.get(&clip.content_id)?;
+                let content = song.clip_contents.get(&clip.content_id)?;
                 if let Some(events) = content.image_events() {
                     let ev = events.first()?;
                     Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
@@ -2167,9 +2136,9 @@ impl Runner {
         // 判定条件（owning track の parent_group_id ∈ active_groups）は子を
         // group へ bucket する partition（上の image_frames ループ）と同一。
         let selection_group = state.app.selected_clip_ref().and_then(|cref| {
-            let track = state.app.song_doc.song().tracks.get(cref.track as usize)?;
+            let track = song.tracks.get(cref.track as usize)?;
             let clip = track.clips.get(cref.clip as usize)?;
-            let content = state.app.song_doc.song().clip_contents.get(&clip.content_id)?;
+            let content = song.clip_contents.get(&clip.content_id)?;
             // text overlay は group 合成パスに乗らないので image の子のみ写像。
             content.image_events()?;
             let gid = track.parent_group_id?;

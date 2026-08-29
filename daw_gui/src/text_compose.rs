@@ -20,6 +20,8 @@ use common::model::{
     Track,
 };
 
+use crate::launcher_time::RowTimeline;
+
 /// One text event active at the current playhead. Shares the
 /// `z_index` numbering with `ActiveVideoFrame` / `ActiveImageFrame`
 /// so caller can interleave all three by ascending `z_index` and
@@ -68,12 +70,16 @@ pub struct ActiveTextFrame {
 }
 
 /// Walk the song bottom-up and return one `ActiveTextFrame` per text
-/// event that is active at `playhead_beat`. Muted events, events with
-/// alpha == 0 (= opacity × fade resolves to 0), and events on muted
-/// tracks are dropped. Mirrors `image_compose::active_image_sources_at`.
+/// event that is active now. Muted events, events with alpha == 0
+/// (= opacity × fade resolves to 0), and events on muted tracks are
+/// dropped. Mirrors `image_compose::active_image_sources_at`.
+///
+/// v35 (r.md #87): 「どのクリップを、どの拍で見るか」は
+/// [`RowTimeline::track_scan`] が、オートメーションレーンの値は
+/// [`RowTimeline::lane_value`] が行ごとに解く — 映像 / 画像と**同じ 1 本**。
 pub fn active_text_sources_at(
     song: &Song,
-    playhead_beat: f64,
+    rows: &RowTimeline<'_>,
     mod_scalars: &[f32],
 ) -> Vec<ActiveTextFrame> {
     let bpm = song.bpm as f64;
@@ -96,16 +102,20 @@ pub fn active_text_sources_at(
         if !track.has_subtitle_device() {
             continue;
         }
+        // r.md #87: ランチャーが握っていて無音の行は 1 枚も出さない。
+        let Some(scan) = rows.track_scan(track) else {
+            continue;
+        };
         let mut track_emitted = false;
-        for clip in &track.clips {
+        for clip in scan.clips {
             let clip_start = clip.start_beat;
             let clip_end = clip.start_beat + clip.length_beats;
-            if playhead_beat < clip_start || playhead_beat >= clip_end {
+            if scan.clip_beat < clip_start || scan.clip_beat >= clip_end {
                 continue;
             }
             // r.md #44: content 上の位置は clip 開始ではなく content 原点基準
             // (= 左端 trim した clip は窓の分だけ content の先を見せる)。
-            let clip_local = clip.song_to_content_beat(playhead_beat);
+            let clip_local = clip.song_to_content_beat(scan.clip_beat);
             let Some(content) = song.clip_contents.get(&clip.content_id) else {
                 continue;
             };
@@ -124,7 +134,7 @@ pub fn active_text_sources_at(
                     continue;
                 }
                 let env = event_alpha_envelope(event, clip_local);
-                let resolved = resolve_text_fields(track, song, event, playhead_beat, mod_scalars);
+                let resolved = resolve_text_fields(track, song, rows, event, mod_scalars);
                 let alpha = resolved.opacity * env;
                 if alpha <= 0.0 {
                     continue;
@@ -199,8 +209,8 @@ struct ResolvedText {
 fn resolve_text_fields(
     track: &Track,
     song: &Song,
+    rows: &RowTimeline<'_>,
     event: &TextEvent,
-    song_beat: f64,
     mod_scalars: &[f32],
 ) -> ResolvedText {
     // Index the track's `TextBuiltin` lanes once (single pass) so the 23
@@ -216,9 +226,11 @@ fn resolve_text_fields(
     // 無ければ event の field 値。そこに `Track.mod_routings` の当該 `TextBuiltin`
     // 変調を正規化領域で乗せる (lane 無しでも変調)。lane も routing も無ければ
     // apply_modulation は base を返すので従来挙動 (= 無回帰)。
+    // r.md #87: lane の値はレーン行の主導権で供給元が変わる (アレンジ行は song 拍で
+    // `lane.clips`、ランチャー行はセル 1 つ、停止中は既定値)。
     let base_for = |field: TextBuiltinParam, fallback: f32| -> f64 {
         match lane_index.get(&field) {
-            Some(l) => common::automation::lane_value_at(l, &song.clip_contents, song_beat),
+            Some(l) => rows.lane_value(track.id, l, song),
             None => f64::from(fallback),
         }
     };
@@ -395,7 +407,7 @@ mod tests {
     #[test]
     fn active_text_returns_single_layer_inside_event() {
         let song = make_song_with_one_text("Hello", 0.1, 0.4, 0.8, 0.2, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, 4.0, &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         assert_eq!(frames.len(), 1);
         let f = &frames[0];
         assert_eq!(&*f.text, "Hello");
@@ -410,14 +422,14 @@ mod tests {
     #[test]
     fn active_text_returns_empty_outside_event() {
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, 16.0, &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(16.0), &[]);
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_text_applies_opacity_multiplier() {
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, 4.0, &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -426,7 +438,7 @@ mod tests {
     fn active_text_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha ~= opacity * 0.5.
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_text_sources_at(&song, 2.0, &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(2.0), &[]);
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -443,7 +455,7 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_text_sources_at(&song, 4.0, &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         assert!(frames.is_empty());
     }
 
@@ -462,7 +474,7 @@ mod tests {
             0.0,
             0.0,
         );
-        let frames = active_text_sources_at(&song, 4.0, &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
         let f = &frames[0];
         // TextEvent::default() defaults — see common/src/model.rs.
         assert_eq!(f.font_size_px, 64.0);
@@ -471,5 +483,50 @@ mod tests {
         assert_eq!(f.shadow_blur_px, 0.0);
         assert_eq!(f.shadow_offset_px, (0.0, 0.0));
         assert_eq!(f.align, TextAlign::Center);
+    }
+
+    /// r.md #87: ランチャー主導の行は、アレンジのクリップではなくセルの字幕を出す。
+    /// 映像 / 画像と同じ [`RowTimeline`] を通っていることの確認。
+    #[test]
+    fn ランチャー主導の行はセルの字幕を位相で出す() {
+        use common::model::{Clip, LaunchSettings, RowPlayback, SessionClip};
+        // アレンジ: 拍 [0, 8) で "アレンジ"。セル: 長さ 4 拍、拍 [0, 2) だけ "セル"。
+        let mut song = make_song_with_one_text("アレンジ", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
+        let cell_content = song.alloc_content_id();
+        song.clip_contents.insert(
+            cell_content,
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent {
+                    text: "セル".into(),
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 2.0,
+                    ..TextEvent::default()
+                }],
+            }),
+        );
+        let cell_clip_id = song.tracks[0].alloc_clip_id();
+        song.tracks[0].session_clips.push(SessionClip {
+            scene_id: 1,
+            clip: Clip {
+                id: cell_clip_id,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cell_content,
+                ..Clip::default()
+            },
+            launch: LaunchSettings::default(),
+        });
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: cell_clip_id };
+
+        // 拍 5 → 位相 1.0 → セルの event 窓 [0, 2) の中。
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(5.0), &[]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(&*frames[0].text, "セル");
+        // 拍 7 → 位相 3.0 → セルの event 窓の外 → 何も出ない
+        // (アレンジ側は拍 7 を覆っているが、行はランチャー主導)。
+        assert!(active_text_sources_at(&song, &RowTimeline::preview(7.0), &[]).is_empty());
+        // 行を止めるとアレンジへは戻らず、やはり何も出ない。
+        song.tracks[0].launcher = RowPlayback::LauncherStopped;
+        assert!(active_text_sources_at(&song, &RowTimeline::preview(5.0), &[]).is_empty());
     }
 }
