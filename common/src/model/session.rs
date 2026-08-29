@@ -332,6 +332,38 @@ impl RowPlayback {
     }
 }
 
+/// ランチャー帯とアレンジのレーンの見せ方 (`docs/plan_rmd_87_clip_launcher.md` Q5 / Q5-b)。
+///
+/// 境界 1 本のドラッグで 3 つとも出せる (左端 = アレンジのみ / 中間 = 両方 /
+/// 右端 = ランチャーのみ)。`Ctrl+Tab` はこの 3 つを巡回し、`Both` へ戻ったときは
+/// [`ViewState::launcher_width`](crate::model::ViewState::launcher_width) に
+/// 覚えてある幅へ復帰する。
+///
+/// **`ViewState` 側 (= `*` を立てない)**。どちらを見ているかは「見方の都合」で、
+/// 出てくる音は変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LauncherLayout {
+    /// ランチャー帯とアレンジのレーンを両方出す (既定)。
+    #[default]
+    Both,
+    /// ランチャー帯だけ (アレンジのレーンは幅 0)。
+    LauncherOnly,
+    /// アレンジのレーンだけ (ランチャー帯は幅 0)。
+    ArrangerOnly,
+}
+
+impl LauncherLayout {
+    /// `Ctrl+Tab` の巡回順: 両方 → ランチャーのみ → アレンジのみ → 両方…
+    #[must_use]
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Both => Self::LauncherOnly,
+            Self::LauncherOnly => Self::ArrangerOnly,
+            Self::ArrangerOnly => Self::Both,
+        }
+    }
+}
+
 /// フォローアクションのグループ = **空セルに区切られた連続した塊** (Q13)。
 ///
 /// `scene_ids` は表示順の列 id 列 (`Song.scenes` の順)、`occupied` は

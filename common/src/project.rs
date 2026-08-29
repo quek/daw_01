@@ -923,6 +923,10 @@ mod tests {
                 (7, EditorWindowGeometry { x: 240, y: 160, width: 880, height: 162 }),
                 (11, EditorWindowGeometry { x: -40, y: 900, width: 1105, height: 687 }),
             ],
+            launcher_layout: crate::model::LauncherLayout::LauncherOnly,
+            launcher_width: 420.0,
+            launcher_scene_col_w: 96.0,
+            launcher_scroll_scene: 2.5,
         }
     }
 

@@ -498,6 +498,24 @@ pub struct ViewState {
     /// (per-clip view と同じ orphan GC + 決定的順序の idiom)。
     #[serde(default)]
     pub plugin_editor_windows: Vec<(u64, EditorWindowGeometry)>,
+    // ---- クリップランチャー (r.md #87) ----
+    // どれも「聴き方 / 見方の都合」なので **`*` は立てない**が保存はする
+    // (ズーム / スクロールと同じ扱い、`docs/plan_rmd_87_clip_launcher.md` §1.3)。
+    // 曲の一部 (列・セル・主導権) は `Song` 側に居る。
+    /// ランチャー帯とアレンジのレーンをどう見せるか。
+    #[serde(default)]
+    pub launcher_layout: LauncherLayout,
+    /// [`LauncherLayout::Both`] のときのランチャー帯の幅 (px)。`Ctrl+Tab` で
+    /// レイアウトを一巡して戻ってきたとき、手で決めたこの幅に復帰する。
+    /// `0` 以下 = 未設定 (表示側の既定幅)。
+    #[serde(default)]
+    pub launcher_width: f32,
+    /// シーン 1 列の幅 (px)。全列共通。`0` 以下 = 未設定 (表示側の既定幅)。
+    #[serde(default)]
+    pub launcher_scene_col_w: f32,
+    /// ランチャー帯の横スクロール位置 (列数、小数可)。
+    #[serde(default)]
+    pub launcher_scroll_scene: f32,
 }
 
 /// Arranger セクション (曲のパート =

@@ -291,6 +291,11 @@ impl AppData {
                 arrange_track_top: 0.0,
                 arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
                 arrange_header_w: 160.0,
+                // r.md #87: 0 = 未設定 → widget が既定幅を使う。
+                launcher_layout: common::model::LauncherLayout::default(),
+                launcher_width: 0.0,
+                launcher_scene_col_w: 0.0,
+                launcher_scroll_scene: 0.0,
                 piano_roll_views: std::collections::HashMap::new(),
                 plugin_editor_windows: std::collections::HashMap::new(),
                 multi_clip_view: common::model::PianoRollViewState::default(),

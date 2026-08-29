@@ -213,4 +213,18 @@ pub struct UiPrefs {
     /// piano_roll snap toolbar の「Fold」 toggle で切替、 session-only state。
     /// `Song.scale_changes` が空のときは `view.scale = None` で機能 OFF。
     pub piano_roll_fold: bool,
+
+    // ---- クリップランチャー (r.md #87、`docs/plan_rmd_87_clip_launcher.md`) ----
+    // どれも「見方の都合」なので dirty は立てない (`project_dirty_flag_rule`)。
+    // 曲の一部 (列・セル・主導権) は `Song` 側に居る。永続は `ViewState` の
+    // 同名 field。
+    /// ランチャー帯とアレンジのレーンをどう見せるか (`Ctrl+Tab` で巡回)。
+    pub launcher_layout: common::model::LauncherLayout,
+    /// [`LauncherLayout::Both`](common::model::LauncherLayout::Both) のときの
+    /// ランチャー帯の幅 (px)。`0` 以下 = 未設定 (widget の既定幅)。
+    pub launcher_width: f32,
+    /// シーン 1 列の幅 (px、全列共通)。`0` 以下 = 未設定 (widget の既定幅)。
+    pub launcher_scene_col_w: f32,
+    /// ランチャー帯の横スクロール位置 (列数、小数可)。
+    pub launcher_scroll_scene: f32,
 }
