@@ -162,6 +162,9 @@ pub(super) fn dispatch(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     };
     let mut actions = PressActions::default();
     splitter(ui, f, &hit, &mut claim);
+    // r.md #87: ランチャー帯 (ヘッダとレーンの間) の press。 帯は他ペインと x が排他なので、
+    // 競合するのは全高に張るヘッダ境界スプリッタだけで、それは上の `splitter` が先に取る。
+    launcher::press::dispatch(ui, f, &hit, &mut claim);
     press_lanes::clip_zone(ui, f, &hit, &mut claim);
     arranger(ui, f, &hit, &mut claim);
     ruler(ui, f, &hit, &mut claim, &mut actions);

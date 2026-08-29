@@ -40,6 +40,8 @@ pub(super) struct BuiltArrangement {
     pub selected_automation_clips: Vec<AutomationClipKey>,
     pub selected_automation_points: Vec<AutomationPointKey>,
     pub master_row: ArrangementMasterRow,
+    /// r.md #87: クリップランチャー帯の 1 フレーム分のビュー。
+    pub launcher: super::launcher::LauncherView,
 }
 
 /// `AppData` から widget 入力を組み立てる (旧 `arrangement_view::draw` L106-568)。
@@ -65,19 +67,23 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         }
         depth
     };
+    // r.md #87: 参照数え上げは **`all_clips()` を通す** (arrangement + launcher の両方)。
+    // 片方を数え落とすと共有マーク (`⇌`) がランチャーを跨いだ共有で出ないし、同じ
+    // 数え落としが GC 側では「セルの中身が黙って消える」に化ける
+    // (`common/src/model/track.rs::all_clips` の doc)。
     let mut refcount_by_content: HashMap<common::model::ContentId, usize> = HashMap::new();
     for t in &app.song_doc.song().tracks {
-        for c in &t.clips {
+        for c in t.all_clips() {
             *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
         }
         for lane in &t.automation_lanes {
-            for c in &lane.clips {
+            for c in lane.all_clips() {
                 *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
             }
         }
     }
     for lane in &app.song_doc.song().song_lanes {
-        for c in &lane.clips {
+        for c in lane.all_clips() {
             *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
         }
     }
@@ -261,7 +267,16 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
 
     let zoom = app.ui_prefs.arrange_zoom_x.max(1.0);
     let row_h = app.ui_prefs.arrange_track_row_h.max(1.0);
-    let lanes_w = (area.w - app.ui_prefs.arrange_header_w).max(1.0);
+    // r.md #87: アレンジのレーンの幅は **ランチャー帯を引いた残り**。 ここが帯を
+    // 引き忘れると、 描画と hit-test は自分同士では揃うのに `view.len_beats` の分母
+    // だけ広く、 `arrange_zoom_x` の 1 拍あたり px と実際の描画が食い違う (auto-fit が
+    // 毎回わずかに外す形で出る)。 帯幅の式は `resolve_pane_w_raw` の 1 本だけ。
+    let launcher_pane_w = super::launcher::layout::resolve_pane_w_raw(
+        app.ui_prefs.launcher_layout,
+        app.ui_prefs.launcher_width,
+        (area.w - app.ui_prefs.arrange_header_w).max(1.0),
+    );
+    let lanes_w = (area.w - app.ui_prefs.arrange_header_w - launcher_pane_w).max(1.0);
     let loop_range = app.transport.loop_region.range();
     let data_generation = data_generation(&tracks);
 
@@ -349,6 +364,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         })
         .collect();
 
+    let launcher = super::launcher::build::build(app, &tracks, &master_row.automation_lanes);
+
     BuiltArrangement {
         tracks,
         sections,
@@ -359,6 +376,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         selected_automation_clips,
         selected_automation_points,
         master_row,
+        launcher,
     }
 }
 
