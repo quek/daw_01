@@ -91,10 +91,6 @@ SSoT は `scripts/fetch_ffmpeg.sh`。詳細と LGPL 上の義務は [docs/ffmpeg
 **PowerShell 禁止。bash を既定**とし、**JSON を構造的にパースするものだけ Python (stdlib のみ)**
 で書く (Linux でも動くこと。[[feedback_no_powershell_cross_platform]])。
 
-**hook は使わない** (`.claude/settings.json` を置かない)。強制は `make` の検査と `/review` skill が
-担う。どちらも結果が出力に出るので、黙って壊れても気付ける。出力に出ない検査は、壊れていても
-誰も気付けない。
-
 ## 応答・コミット
 
 - 応答は日本語 / コミットメッセージは日本語 / 技術用語は英語のまま可
