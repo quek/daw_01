@@ -759,7 +759,7 @@ impl AppData {
     /// Audio Editor の選択 anchor (= Inspector / footer / nav の代表 event
     /// index)。 選択集合の last (= 最後に選択した event)。 空なら None。
     pub fn audio_editor_anchor_event(&self) -> Option<usize> {
-        self.selection.audio_editor_selected_events.last().copied()
+        self.selected_audio_event_indices().last().copied()
     }
 
     /// `selected_clip` が `ClipContent::Image` の clip を指していて、
@@ -819,10 +819,10 @@ impl AppData {
     /// 前に immutable get で取得)。
     pub(crate) fn audio_event_target_indices(&self, target: ClipKey, n_events: usize) -> Vec<usize> {
         if self.ui_ephemeral.audio_editor_clip == Some(target)
-            && !self.selection.audio_editor_selected_events.is_empty()
+            && !self.selected_audio_event_indices().is_empty()
         {
             let mut v: Vec<usize> = self
-                .selection.audio_editor_selected_events
+                .selected_audio_event_indices()
                 .iter()
                 .copied()
                 .filter(|&i| i < n_events)

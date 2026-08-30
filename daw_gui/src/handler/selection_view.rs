@@ -51,13 +51,16 @@ impl AppData {
         // 選択集合は面を跨いで共存できる (lasso は automation の点とクリップを両方拾う、
         // clip 選択は automation 選択を消さない)。
         let audio_events = self.ui_ephemeral.audio_editor_clip.is_some()
-            && !self.selection.audio_editor_selected_events.is_empty();
-        let notes = !self.selection.selected_notes.is_empty();
+            && !self.selected_audio_event_indices().is_empty();
+        // 面は範囲のレーン種別が持つ (`time_selection_surface`)。
+        let time_face = self.time_selection_surface();
+        let notes = time_face == Some(S::Notes) && !self.selected_note_ids().is_empty();
         let points = !self.selection.selected_automation_points.is_empty();
         let auto_clips = !self.selection.selected_automation_clips.is_empty();
-        // 安価な空判定 (selected_clip_refs() は Vec を確保するので避ける)。
-        let clips =
-            self.selection.selected_clip.is_some() || !self.selection.selected_clips.is_empty();
+        // 範囲面 (アレンジャーのトラック行 / オートメーションレーン行)。
+        let time_range = time_face == Some(S::TimeRange);
+        // ランチャーのセル面 (時間軸を持たない唯一のオブジェクト選択)。
+        let cells = !self.selection.selected_launcher_cells.is_empty();
         let tracks = !self.selection.selected_track_ids.is_empty();
         let sections = !self.selection.selected_section_ids.is_empty();
         let devices = !self.live_device_ids().is_empty();
@@ -87,7 +90,8 @@ impl AppData {
             Some(S::Notes) if notes => Some(S::Notes),
             Some(S::AutomationPoints) if points => Some(S::AutomationPoints),
             Some(S::AutomationClips) if auto_clips => Some(S::AutomationClips),
-            Some(S::Clips) if clips => Some(S::Clips),
+            Some(S::TimeRange) if time_range => Some(S::TimeRange),
+            Some(S::LauncherCells) if cells => Some(S::LauncherCells),
             Some(S::Tracks) if tracks => Some(S::Tracks),
             Some(S::Sections) if sections => Some(S::Sections),
             Some(S::Devices) if devices => Some(S::Devices),
@@ -110,8 +114,11 @@ impl AppData {
         if notes {
             return Some(S::Notes);
         }
-        if clips {
-            return Some(S::Clips);
+        if time_range {
+            return Some(S::TimeRange);
+        }
+        if cells {
+            return Some(S::LauncherCells);
         }
         if auto_clips {
             return Some(S::AutomationClips);
@@ -153,7 +160,9 @@ impl AppData {
             EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
                 keys: self.selection.selected_automation_clips.clone(),
             },
-            EditSurface::Clips => AppEvent::DeleteSelectedClip,
+            // 範囲: 境界で分割して範囲部分だけ削除 (時間は詰めない)。
+            EditSurface::TimeRange => AppEvent::DeleteTimeSelection,
+            EditSurface::LauncherCells => AppEvent::DeleteSelectedClip,
             // r.md #71 (プラグインのコピー / 移動): チェーンで選んだプラグインを
             // 1 undo step で削除する。 対象 id は正規化を通す (= いま表示している
             // チェーンに実在するものだけ)。
@@ -197,14 +206,91 @@ impl AppData {
         self.song_doc.song().clip_by_key(key).map(|_| key)
     }
 
-    /// 選択 anchor (`selected_clip` = 末尾) を現在の `ClipKey` へ解決。
+    /// 対象 (代表) クリップ = **範囲の先頭に最も近い**交差クリップ。
+    ///
+    /// 旧「最後にクリックした anchor」 の後継。 選択の SSoT が範囲 1 本になったので
+    /// 代表も範囲から導出する — クリップヘッダをクリックすれば範囲はそのクリップの
+    /// 占有区間になるので、結果は「クリックしたクリップ」で一致する。
     pub fn selected_clip_ref(&self) -> Option<ClipKey> {
-        self.selection.selected_clip.and_then(|k| self.live_clip_key(k))
+        let song = self.song_doc.song();
+        self.selected_clip_refs()
+            .into_iter()
+            .min_by(|a, b| {
+                let sa = song.clip_by_key(*a).map_or(f64::INFINITY, |c| c.start_beat);
+                let sb = song.clip_by_key(*b).map_or(f64::INFINITY, |c| c.start_beat);
+                sa.total_cmp(&sb)
+            })
+    }
+
+    /// 選択範囲から**消えた行**を落とす (トラック削除 / undo / グループ解除の後始末)。
+    ///
+    /// 範囲はクリップ id を持たず「区間 × 行」しか持たないので、後始末は
+    /// 「行がまだ在るか」 を見るだけで済む。 行が全部消えたら選択解除。
+    /// **冪等** — 何度呼んでも同じ結果。
+    pub(crate) fn prune_selection_lanes(&mut self) {
+        let Some(sel) = self.selection.time.as_mut() else {
+            return;
+        };
+        let song = self.song_doc.song();
+        sel.lanes.retain(|lane| match *lane {
+            common::model::LaneRef::Track(id) => song.track_by_id(id).is_some(),
+            common::model::LaneRef::Automation(key) => {
+                song.automation_lane_by_key(key.track, key.lane).is_some()
+            }
+            common::model::LaneRef::KeyTrack { clip, .. }
+            | common::model::LaneRef::AudioLane(clip) => song.clip_by_key(clip).is_some(),
+        });
+        if sel.lanes.is_empty() {
+            self.selection.time = None;
+            self.selection.range_anchor = None;
+        }
+    }
+
+    /// 選択範囲そのもの (SSoT)。
+    #[must_use]
+    pub fn time_selection(&self) -> Option<&common::model::TimeSelection> {
+        self.selection.time.as_ref()
+    }
+
+    /// 選択範囲を差し替える**唯一の口**。
+    ///
+    /// 範囲が非空なら `last_edit_select` を `TimeRange` に倒し、掛かっている
+    /// トラックを追従選択する (旧 `set_clip_selection` の副作用と同じ)。
+    pub(crate) fn set_time_selection(&mut self, next: Option<common::model::TimeSelection>) {
+        let first_track = next.as_ref().and_then(|t| t.track_ids().next());
+        self.selection.time = next;
+        if let Some(face) = self.time_selection_surface() {
+            self.selection.last_edit_select = Some(face);
+            if let Some(tid) = first_track {
+                self.select_track(tid);
+            }
+        }
+    }
+
+    /// 範囲が**どの面**の上に居るかは、掛かっているレーンの種類が既に持っている
+    /// (`docs/plan_range_selection.md` §2.2)。 面ごとのタイブレークは要らない。
+    ///
+    /// | レーン | 面 |
+    /// |---|---|
+    /// | 鍵盤行 ([`LaneRef::KeyTrack`]) | [`EditSurface::Notes`] |
+    /// | 波形行 ([`LaneRef::AudioLane`]) | [`EditSurface::AudioEvents`] |
+    /// | トラック行 / オートメーションレーン行 | [`EditSurface::TimeRange`] |
+    #[must_use]
+    pub fn time_selection_surface(&self) -> Option<EditSurface> {
+        use common::model::LaneRef as L;
+        let sel = self.selection.time.as_ref()?;
+        if sel.lanes.iter().any(|l| matches!(l, L::KeyTrack { .. })) {
+            return Some(EditSurface::Notes);
+        }
+        if sel.lanes.iter().any(|l| matches!(l, L::AudioLane(_))) {
+            return Some(EditSurface::AudioEvents);
+        }
+        Some(EditSurface::TimeRange)
     }
 
     // -------- per-clip piano roll / audio editor view 状態 --------
 
-    /// 現在ピアノロールで開いている (= 選択 anchor) クリップの表示状態。
+    /// 現在ピアノロールで開いている (= 対象) クリップの表示状態。
     /// entry が無ければ `PianoRollViewState::default()` (= 64/14/84/0)。
     pub fn piano_roll_view_state(&self) -> common::model::PianoRollViewState {
         // 複数表示は共有 viewport (`multi_clip_view`、song-absolute scroll)、
@@ -212,7 +298,7 @@ impl AppData {
         if self.shown_pianoroll_clips().len() >= 2 {
             self.ui_prefs.multi_clip_view
         } else {
-            self.selection.selected_clip
+            self.pianoroll_target_clip()
                 .and_then(|k| self.ui_prefs.piano_roll_views.get(&k).copied())
                 .unwrap_or_default()
         }
@@ -227,7 +313,7 @@ impl AppData {
         if self.shown_pianoroll_clips().len() >= 2 {
             return Some(&mut self.ui_prefs.multi_clip_view);
         }
-        let key = self.selection.selected_clip?;
+        let key = self.pianoroll_target_clip()?;
         Some(self.ui_prefs.piano_roll_views.entry(key).or_default())
     }
 
@@ -270,56 +356,95 @@ impl AppData {
         self.audio_editor_view_state().len_beats
     }
 
-    /// 選択集合 (`selected_clips`) を現在の `ClipKey` 群へ解決 (解決でき
-    /// ない stale key は除外)。 owned `Vec` を返す。
+    /// 選択範囲と**交差**するアレンジのクリップ群 (開始拍順)。
+    ///
+    /// これが「選択されているクリップ」の定義 — 別の集合を持たず、範囲から毎回導出する。
+    /// 交差 (完全内包ではない) なので、範囲をかすめただけのクリップもインスペクタや
+    /// 改名の対象に入る (`docs/plan_range_selection.md` §3)。 一方 Delete / `J` /
+    /// ミュートなどの**範囲操作は範囲そのものに効く**ので、かすめたクリップが
+    /// 丸ごと消えることはない。
     pub fn selected_clip_refs(&self) -> Vec<ClipKey> {
-        self.selection.selected_clips
-            .iter()
-            .filter_map(|k| self.live_clip_key(*k))
-            .collect()
-    }
-
-    /// ピアノロールに同時表示する MIDI クリップ群を順序付きで返す
-    /// (`selected_clips` を `ClipKey` 解決 → MIDI のみ filter)。anchor (`selected_clip`) は
-    /// `selected_clips` の末尾なので、末尾要素 = 新規ノートの所属先 (= 対象/target クリップ)。
-    /// `selected_clips` が空の単一選択経路では `selected_clip` にフォールバックする。
-    /// **この順序が packed note id の `clip_slot` の SSoT** (`decode_note_id` と必ず一致させる)。
-    #[must_use]
-    pub fn shown_pianoroll_clips(&self) -> Vec<ClipKey> {
-        let mut out = Vec::new();
-        if self.selection.selected_clips.is_empty() {
-            if let Some(r) = self.selected_clip_ref()
-                && self.is_midi_clip(r)
-            {
-                out.push(r);
-            }
-        } else {
-            for k in &self.selection.selected_clips {
-                if let Some(r) = self.live_clip_key(*k)
-                    && self.is_midi_clip(r)
-                {
-                    out.push(r);
+        let Some(sel) = self.selection.time.as_ref() else {
+            return Vec::new();
+        };
+        let song = self.song_doc.song();
+        let mut out: Vec<(f64, ClipKey)> = Vec::new();
+        for lane in &sel.lanes {
+            let common::model::LaneRef::Track(track_id) = lane else {
+                continue;
+            };
+            let Some(track) = song.track_by_id(*track_id) else {
+                continue;
+            };
+            for clip in &track.clips {
+                if sel.intersects(clip.start_beat, clip.length_beats) {
+                    out.push((
+                        clip.start_beat,
+                        ClipKey { track_id: *track_id, clip_id: clip.id },
+                    ));
                 }
             }
         }
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out.into_iter().map(|(_, k)| k).collect()
+    }
+
+    /// ピアノロールに同時表示する MIDI クリップ群を開始拍順で返す
+    /// (範囲と交差するクリップ → MIDI のみ filter)。
+    ///
+    /// 範囲が部分的にしか掛かっていないクリップも**表示する** — 範囲でノートを
+    /// 編集する用途 (Live §10.8.3 の multi-clip editing) がそこで成立する。
+    /// **この順序が packed note id の `clip_slot` の SSoT** (`decode_note_id` と必ず一致させる)。
+    #[must_use]
+    pub fn shown_pianoroll_clips(&self) -> Vec<ClipKey> {
+        // ランチャーのセルを選んでいるときは**そのセル**を開く。 グリッドに時間軸が
+        // 無いのでセルは範囲では表せず、唯一のオブジェクト選択として残っている
+        // (`docs/plan_range_selection.md` §2.2)。
+        if self.selection.last_edit_select == Some(EditSurface::LauncherCells)
+            && !self.selection.selected_launcher_cells.is_empty()
+        {
+            return self
+                .selection
+                .selected_launcher_cells
+                .iter()
+                .copied()
+                .filter(|k| self.live_clip_key(*k).is_some() && self.is_midi_clip(*k))
+                .collect();
+        }
+        // トラック行から拾ったクリップに加えて、**鍵盤行が直接指しているクリップ**も
+        // 表示集合に入れる。 ノート選択の範囲は鍵盤行が主役なので、これが無いと
+        // 「ノートを選んだ瞬間にピアノロールが空になる」。
+        let mut out = self.selected_clip_refs();
+        if let Some(sel) = self.selection.time.as_ref() {
+            for lane in &sel.lanes {
+                if let common::model::LaneRef::KeyTrack { clip, .. } = lane
+                    && !out.contains(clip)
+                    && self.live_clip_key(*clip).is_some()
+                {
+                    out.push(*clip);
+                }
+            }
+        }
+        out.retain(|r| self.is_midi_clip(*r));
         out
     }
 
     /// 現在の対象 (target) クリップ = 新規ノートの所属先・凡例で強調される行。
-    /// SSoT は選択 anchor (`selected_clip`)。anchor が表示 MIDI クリップ集合に含まれていれば
-    /// それを、含まれなければ末尾 (= 旧挙動) を返す。表示 MIDI クリップが無いときは `None`。
+    /// focus ヒント (`ui_ephemeral.pianoroll_focus_clip`) が表示集合に含まれていれば
+    /// それを、含まれなければ**範囲の先頭に最も近い**表示クリップを返す。
+    /// 表示 MIDI クリップが無いときは `None`。
     /// **target を切り替えても `shown_pianoroll_clips` の順序 (= packed id の clip_slot) は
     /// 変わらない** ので、target 変更で `selected_notes` を clear する必要はない (anchor の
     /// ポインタが動くだけ)。
     #[must_use]
     pub fn pianoroll_target_clip(&self) -> Option<ClipKey> {
         let shown = self.shown_pianoroll_clips();
-        if let Some(a) = self.selected_clip_ref()
-            && shown.contains(&a)
+        if let Some(focus) = self.ui_ephemeral.pianoroll_focus_clip
+            && shown.contains(&focus)
         {
-            return Some(a);
+            return Some(focus);
         }
-        shown.last().copied()
+        shown.first().copied()
     }
 
     /// piano_roll widget へ渡す **グローバル note id**。
@@ -347,9 +472,17 @@ impl AppData {
     /// `resolve_note_overlaps` がクリップ `slot` に返した remap を、packed な
     /// `selected_notes` のうち当該クリップ部分にだけ適用する (他クリップは不変)。
     /// `remap[old_local] = Some(new_local)` は追従、None / 範囲外は選択から落とす。
-    pub(crate) fn remap_packed_selection_for_clip(&mut self, slot: usize, remap: &[Option<u32>]) {
-        let mut out = Vec::with_capacity(self.selection.selected_notes.len());
-        for &packed in &self.selection.selected_notes {
+    /// `prev` は **編集前** に読んだ選択 (packed id)。 選択は範囲からの導出なので、
+    /// ノートが動いた後に読むと「動く前の範囲」で解決してしまい、移動・移調のたびに
+    /// 選択が外れる。 呼び出し側が編集の前に捕まえて渡すこと。
+    pub(crate) fn remap_packed_selection_for_clip(
+        &mut self,
+        slot: usize,
+        remap: &[Option<u32>],
+        prev: &[u32],
+    ) {
+        let mut out = Vec::with_capacity(prev.len());
+        for &packed in prev {
             if Self::note_id_clip_slot(packed) == slot {
                 let local = Self::note_id_local_index(packed);
                 if let Some(Some(new_local)) = remap.get(local) {
@@ -359,7 +492,7 @@ impl AppData {
                 out.push(packed);
             }
         }
-        self.selection.selected_notes = out;
+        self.set_note_selection(&(out));
     }
 
     /// クリップ `slot` (= `r`) の notes に `f` を適用 (local index ベースで編集し、
@@ -367,6 +500,8 @@ impl AppData {
     /// 重なりを解消 → packed `selected_notes` の当該クリップ部分を remap、という複数クリップ
     /// note 編集の共通基盤。snap 等の immutable 計算は呼び出し側で済ませて `f` に閉じ込める。
     pub(crate) fn edit_clip_notes(&mut self, slot: usize, r: ClipKey, f: impl FnOnce(&mut Vec<Note>) -> Vec<u32>) {
+        // **編集前**の選択を捕まえてから編集する (`remap_packed_selection_for_clip` の doc)。
+        let prev = self.selected_note_ids();
         let Some(Some(remap)) = self.edit_song(move |song| {
             let notes = song.notes_in_clip_mut(r)?;
             let winners = f(notes);
@@ -374,7 +509,7 @@ impl AppData {
         }) else {
             return;
         };
-        self.remap_packed_selection_for_clip(slot, &remap);
+        self.remap_packed_selection_for_clip(slot, &remap, &prev);
     }
 
     /// クリップの **content 原点** の song-absolute 拍。content-local note ⇄
@@ -578,17 +713,16 @@ impl AppData {
         self.ui_prefs.locked_pr_tracks.contains(&track_id)
     }
 
-    /// 凡例から対象 (target) クリップを切り替える。anchor (`selected_clip`) を
-    /// `key` にするだけで、選択集合 (`selected_clips`) は変えない (= `shown_pianoroll_clips`
-    /// の順序 = packed id slot 不変 → `selected_notes` 維持)。新規ノートの所属先・凡例強調が
-    /// この clip になる。集合に居ない / 単一表示で anchor と異なる key は no-op。track も追従。
+    /// 凡例から対象 (target) クリップを切り替える。 **選択 (範囲) は変えない** —
+    /// focus ヒント (`ui_ephemeral.pianoroll_focus_clip`) を動かすだけなので
+    /// `shown_pianoroll_clips` の順序 (= packed id の clip_slot) は不変で、
+    /// `selected_notes` も維持される。 表示集合に居ない key は no-op。 track も追従。
     pub(crate) fn set_pianoroll_target_clip(&mut self, key: common::model::ClipKey) {
         // 凡例は常に表示集合内のクリップしか出さないが、stale 入力に備えて検証する。
-        let in_set = self.selection.selected_clips.contains(&key) || self.selection.selected_clip == Some(key);
-        if !in_set {
+        if !self.shown_pianoroll_clips().contains(&key) {
             return;
         }
-        self.selection.selected_clip = Some(key);
+        self.ui_ephemeral.pianoroll_focus_clip = Some(key);
         if let Some(r) = self.live_clip_key(key) {
             self.select_track(r.track_id);
         }
@@ -603,24 +737,13 @@ impl AppData {
         }
     }
 
-    /// inspector の編集対象クリップ群。 複数選択 (`selected_clips`) 全体を
-    /// 編集対象にする。 アンカー (`selected_clip`) は `select_clip` / `set_clip_selection`
-    /// の構築上 `selected_clips` の末尾にいるので別途足す必要はない。 `selected_clips`
-    /// が空 (= 単一選択経路のみ) のときだけ `selected_clip` にフォールバックする。
-    /// inspector 編集対象クリップを **alloc せず** 順に渡す。 `selected_clips`
-    /// 全体 (空なら `selected_clip` 単体) を走査する。 mixed 検出 (`inspector_fold`) は
-    /// 毎フレーム全 field で呼ばれるので、 Vec を作らないこの基盤を使う。
+    /// inspector の編集対象クリップ群 = **範囲と交差するクリップ全体**
+    /// (`docs/plan_range_selection.md` 質問 27b)。 範囲をかすめただけのクリップも
+    /// 対象に入る — 属性操作 (改名 / 色 / ゲイン / 声) はクリップというオブジェクトに
+    /// 効くので、範囲操作 (Delete / `J` / ミュート) とは対象の決め方が違う。
     pub(crate) fn for_each_inspector_target(&self, mut f: impl FnMut(ClipKey)) {
-        if self.selection.selected_clips.is_empty() {
-            if let Some(r) = self.selected_clip_ref() {
-                f(r);
-            }
-        } else {
-            for k in &self.selection.selected_clips {
-                if let Some(r) = self.live_clip_key(*k) {
-                    f(r);
-                }
-            }
+        for r in self.selected_clip_refs() {
+            f(r);
         }
     }
 
@@ -717,125 +840,113 @@ impl AppData {
             .and_then(|t| t.clip_by_id(key.clip_id))
     }
 
+    /// クリップを選択する。 `additive` (Ctrl+クリック) なら**範囲を外接まで広げる** —
+    /// 離れた 2 クリップを拾うと間のクリップも入る (Live 実機と同じ)。
+    /// 既に範囲がそのクリップだけを覆っているところへ additive で同じクリップを
+    /// 指した場合は選択解除 (トグル)。
     pub(crate) fn select_clip(&mut self, target: ClipKey, additive: bool) {
-        let Some(key) = self.live_clip_key(target) else {
+        let Some(clip) = self.clip_at(target) else {
             return;
         };
-        let mut keys = self.selection.selected_clips.clone();
-        if additive {
-            if let Some(pos) = keys.iter().position(|k| *k == key) {
-                keys.remove(pos);
-            } else {
-                keys.push(key);
+        let (start, end) = clip.song_window();
+        if additive && let Some(sel) = self.selection.time.as_mut() {
+            sel.extend(start, end, [common::model::LaneRef::Track(target.track_id)]);
+            let first = sel.track_ids().next();
+            self.selection.last_edit_select = Some(EditSurface::TimeRange);
+            if let Some(tid) = first {
+                self.select_track(tid);
             }
-        } else {
-            keys = vec![key];
-        }
-        let primary = keys.last().copied();
-        self.selection.selected_clips = keys;
-        self.selection.selected_clip = primary;
-        self.selection.selected_notes.clear();
-        if primary.is_some() {
-            self.selection.last_edit_select = Some(EditSurface::Clips);
-        }
-        self.recording.step_cursor_beat = 0.0;
-        if let Some(r) = self.selected_clip_ref() {
-            self.select_track(r.track_id);
-        }
-        // per-clip view を記憶するので、初めて開くクリップ (= entry 無し)
-        // のときだけ auto-fit する。 既に記憶があれば draw が `piano_roll_views` を
-        // 読んで前回の zoom/scroll を復元する (= 再選択で view が飛ばない)。 明示的な
-        // 再 fit は `X` キー / Fit ボタン (`FitPianoRollToClip`)。
-        if let Some(p) = primary
-            && !self.ui_prefs.piano_roll_views.contains_key(&p)
-        {
-            self.fit_piano_roll_to_clip();
-        }
-    }
-
-    pub(crate) fn set_clip_selection(&mut self, targets: Vec<ClipKey>) {
-        let keys: Vec<common::model::ClipKey> =
-            targets.iter().filter_map(|r| self.live_clip_key(*r)).collect();
-        let primary = keys.last().copied();
-        self.selection.selected_clips = keys;
-        self.selection.selected_clip = primary;
-        self.selection.selected_notes.clear();
-        if primary.is_some() {
-            self.selection.last_edit_select = Some(EditSurface::Clips);
-        }
-        self.recording.step_cursor_beat = 0.0;
-        if let Some(r) = self.selected_clip_ref() {
-            self.select_track(r.track_id);
-        }
-        // 初回 (entry 無し) のみ fit。 記憶があれば復元 (select_clip と同方針)。
-        if let Some(p) = primary
-            && !self.ui_prefs.piano_roll_views.contains_key(&p)
-        {
-            self.fit_piano_roll_to_clip();
-        }
-    }
-
-    /// Ctrl+A (クリップ領域): 曲全体・全トラックの全クリップを選択。
-    /// 全選択は一括操作なので `set_clip_selection` と違い view ジャンプ
-    /// (fit_piano_roll_to_clip / select_track) を起こさない (= 表示を
-    /// 飛ばさない、 grill-me 2026-06-09 決定)。 既に全選択なら冪等。
-    /// anchor (末尾) は inspector 表示用に維持。 selection のみで非 undoable。
-    pub(crate) fn select_all_clips(&mut self) {
-        let all: Vec<common::model::ClipKey> = self
-            .song_doc.song()
-            .tracks
-            .iter()
-            .flat_map(|t| {
-                t.clips
-                    .iter()
-                    .map(|c| common::model::ClipKey {
-                        track_id: t.id,
-                        clip_id: c.id,
-                    })
-            })
-            .collect();
-        if all.is_empty() {
+            self.recording.step_cursor_beat = 0.0;
             return;
         }
-        // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
-        // 「Ctrl+A = クリップ面を選んだ」 という意図は確定している)。
-        self.selection.last_edit_select = Some(EditSurface::Clips);
-        // 既に全選択なら冪等 (集合一致を順序非依存で判定)。
-        if self.selection.selected_clips.len() == all.len() {
-            let cur: std::collections::HashSet<common::model::ClipKey> =
-                self.selection.selected_clips.iter().copied().collect();
-            if all.iter().all(|k| cur.contains(k)) {
-                return;
+        self.apply_clip_range(&[target], true);
+    }
+
+    /// クリップ群を「選択」する = 範囲をその**外接区間 × それらのトラック**へ張り直す。
+    /// 空を渡すと選択解除。
+    pub(crate) fn set_clip_selection(&mut self, targets: Vec<ClipKey>) {
+        self.apply_clip_range(&targets, true);
+    }
+
+    /// 新規 clip 群 (`ClipKey`) を選択にする (view ジャンプ無し)。
+    /// clone / split / glue / bounce の結果選択用。
+    pub(crate) fn select_new_clips(&mut self, refs: &[ClipKey]) {
+        self.apply_clip_range(refs, false);
+    }
+
+    /// 単一 clip (新規作成直後) を選択にする (view ジャンプ無し)。
+    pub(crate) fn set_single_clip_selection(&mut self, r: ClipKey) {
+        self.apply_clip_range(&[r], false);
+    }
+
+    /// クリップ群 → 範囲への変換 (上の 4 経路の実体)。
+    ///
+    /// `jump_view` が `true` で、対象クリップの per-clip view をまだ記憶していない
+    /// (= 初めて開く) ときだけピアノロールを auto-fit する。 記憶があれば復元に任せ、
+    /// 再選択で view が飛ばないようにする (明示的な再 fit は `X` キー)。
+    fn apply_clip_range(&mut self, targets: &[ClipKey], jump_view: bool) {
+        let song = self.song_doc.song();
+        let mut start = f64::INFINITY;
+        let mut end = f64::NEG_INFINITY;
+        let mut lanes: Vec<common::model::LaneRef> = Vec::new();
+        for key in targets {
+            let Some(clip) = song.clip_by_key(*key) else {
+                continue;
+            };
+            let (s, e) = clip.song_window();
+            start = start.min(s);
+            end = end.max(e);
+            let lane = common::model::LaneRef::Track(key.track_id);
+            if !lanes.contains(&lane) {
+                lanes.push(lane);
             }
         }
-        self.selection.selected_clip = all.last().copied();
-        self.selection.selected_clips = all;
-        self.selection.selected_notes.clear();
-    }
-
-    /// 単一 clip (新規作成直後の `ClipKey`) を選択集合にする。 ClipRef→ClipKey
-    /// 変換して anchor + set を更新 (view ジャンプ無し)。 create / duplicate の
-    /// 結果選択用。
-    pub(crate) fn set_single_clip_selection(&mut self, r: ClipKey) {
-        let key = self.live_clip_key(r);
-        self.selection.selected_clip = key;
-        self.selection.selected_clips = key.into_iter().collect();
-        if key.is_some() {
-            self.selection.last_edit_select = Some(EditSurface::Clips);
+        let next = if lanes.is_empty() {
+            None
+        } else {
+            common::model::TimeSelection::new(start, end, lanes)
+        };
+        self.set_time_selection(next);
+        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.recording.step_cursor_beat = 0.0;
+        if jump_view
+            && let Some(p) = self.selected_clip_ref()
+            && !self.ui_prefs.piano_roll_views.contains_key(&p)
+        {
+            self.fit_piano_roll_to_clip();
         }
     }
 
-    /// 新規 clip 群 (`ClipKey`) を選択集合にする (anchor = 末尾、 view ジャンプ
-    /// 無し)。 ClipRef→ClipKey 変換。 clone / split / glue の結果選択用。
-    pub(crate) fn select_new_clips(&mut self, refs: &[ClipKey]) {
-        let keys: Vec<common::model::ClipKey> =
-            refs.iter().filter_map(|r| self.live_clip_key(*r)).collect();
-        self.selection.selected_clip = keys.last().copied();
-        if self.selection.selected_clip.is_some() {
-            self.selection.last_edit_select = Some(EditSurface::Clips);
+    /// Ctrl+A (クリップ領域): 曲全体 × 全トラックを範囲にする。
+    /// 全選択は一括操作なので view ジャンプ (fit / トラック追従) を起こさない。
+    /// 既に全選択なら冪等。
+    pub(crate) fn select_all_clips(&mut self) {
+        let song = self.song_doc.song();
+        let mut end = 0.0_f64;
+        let lanes: Vec<common::model::LaneRef> = song
+            .tracks
+            .iter()
+            .map(|t| {
+                for c in &t.clips {
+                    end = end.max(c.start_beat + c.length_beats);
+                }
+                common::model::LaneRef::Track(t.id)
+            })
+            .collect();
+        if lanes.is_empty() || end <= 0.0 {
+            return;
         }
-        self.selection.selected_clips = keys;
+        let next = common::model::TimeSelection::new(0.0, end, lanes);
+        // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
+        // 「Ctrl+A = 範囲面を選んだ」 という意図は確定している)。
+        self.selection.last_edit_select = Some(EditSurface::TimeRange);
+        if self.selection.time == next {
+            return;
+        }
+        self.selection.time = next;
+        self.selection.range_anchor = Some(0.0);
     }
+
 
     /// Ctrl+A (ピアノロール): **表示中の全 MIDI クリップ** の全ノートを packed note id で返す。
     /// 各 id = `pack_note_id(clip_slot, local_index)`。ロック中クリップは選択対象に
@@ -928,50 +1039,86 @@ impl AppData {
             .collect()
     }
 
-    /// 右クリック「共有を一括選択」: `target` と同じ `content_id` を持つ
-    /// main clip を全 track から集めて選択する (linked clip group)。
-    /// `content_id` は payload 種別ごとに別空間なので automation clip 等と
-    /// 混ざらない。 refcount==1 のときは自身 1 個の選択 (= 無害)。 clicked
-    /// `target` を末尾 (= primary) に置いて piano_roll fit 対象を維持する。
-    pub(crate) fn select_linked_clips(&mut self, target: ClipKey) {
-        let Some(content_id) = self
-            .song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .map(|c| c.content_id)
-        else {
+
+    /// 選択**範囲**にピアノロールを合わせる (`docs/plan_range_selection.md` §3)。
+    ///
+    /// [`Self::fit_piano_roll_to_clip`] がクリップ全体を映すのに対し、こちらは
+    /// **範囲そのもの**を横幅いっぱいに映す。 アレンジャーで範囲を引いたときは
+    /// 「その範囲を見たい」 のであって、掛かったクリップ全体を見たいわけではない。
+    /// 縦は範囲の中に居るノートで合わせ、無ければ表示クリップのノート全体に倒す。
+    pub(crate) fn fit_piano_roll_to_range(&mut self) {
+        let Some(sel) = self.selection.time.clone() else {
             return;
         };
-        let mut linked = Vec::new();
-        for track in &self.song_doc.song().tracks {
-            for clip in &track.clips {
-                if clip.content_id == content_id {
-                    linked.push(ClipKey { track_id: track.id, clip_id: clip.id });
+        let shown = self.shown_pianoroll_clips();
+        if shown.is_empty() {
+            return;
+        }
+        let (grid_w, grid_h) = self.ui_ephemeral.last_pianoroll_grid_size;
+        if grid_w < 16.0 || grid_h < 16.0 {
+            self.ui_ephemeral.pending_pianoroll_fit = true;
+            return;
+        }
+        // 横: 範囲そのもの (前後に 1 拍の余白)。 scroll の座標系は読み出し
+        // (`piano_roll_view_state`) と view (`view_start_beat`) の multi/single 分岐に合わせる。
+        let multi = shown.len() >= 2;
+        let origin = if multi {
+            0.0
+        } else {
+            self.clip_at(shown[0]).map_or(0.0, |c| c.start_beat - c.content_offset_beats)
+        };
+        let span_beats = (sel.len_beats() + 2.0).max(1.0);
+        // 縦: 範囲に入っているノートの音域 (無ければ表示クリップ全体)。
+        let (mut lo, mut hi) = (u8::MAX, u8::MIN);
+        {
+            let song = self.song_doc.song();
+            for key in &shown {
+                let Some(clip) = song.clip_by_key(*key) else {
+                    continue;
+                };
+                for n in song.clip_notes(clip) {
+                    let start = clip.content_to_song_beat(n.start_beat);
+                    if !sel.intersects(start, n.duration_beats) {
+                        continue;
+                    }
+                    lo = lo.min(n.pitch);
+                    hi = hi.max(n.pitch);
+                }
+            }
+            if lo > hi {
+                for key in &shown {
+                    let Some(clip) = song.clip_by_key(*key) else {
+                        continue;
+                    };
+                    for n in song.clip_notes(clip) {
+                        lo = lo.min(n.pitch);
+                        hi = hi.max(n.pitch);
+                    }
                 }
             }
         }
-        if linked.is_empty() {
-            return;
-        }
-        if let Some(pos) = linked.iter().position(|r| *r == target) {
-            let last = linked.len() - 1;
-            linked.swap(pos, last);
-        }
-        let count = linked.len();
-        self.set_clip_selection(linked);
-        self.ui_ephemeral.status_message = if count <= 1 {
-            "共有クリップはありません (この clip は単独)".to_string()
+        let (top_pitch, zoom_y) = if lo > hi {
+            (84, 14.0)
         } else {
-            format!("共有クリップ {count} 個を選択しました")
+            let span_pitch = (i32::from(hi) - i32::from(lo) + 4).max(4);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            let z = (grid_h / span_pitch as f32).clamp(6.0, 40.0);
+            ((i32::from(hi) + 2).clamp(11, 127) as u8, z)
         };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let fitted = common::model::PianoRollViewState {
+            scroll_beat: (sel.start_beat - 1.0 - origin).max(0.0) as f32,
+            zoom_x: (f64::from(grid_w) / span_beats).clamp(8.0, 400.0) as f32,
+            top_pitch,
+            zoom_y,
+        };
+        if multi {
+            self.ui_prefs.multi_clip_view = fitted;
+        } else {
+            self.ui_prefs.piano_roll_views.insert(shown[0], fitted);
+        }
     }
 
-    /// 現 selected_clip のノート bounding box が piano_roll grid 領域に
-    /// 収まるよう zoom_x / zoom_y / scroll_beat / top_pitch を自動調整する。
-    /// ノート無しの clip は clip 全長が見える初期 zoom にフォールバック。
-    /// `last_pianoroll_grid_size` が未測定 (= 0) の場合は `pending_pianoroll_fit`
-    /// を立てて return → piano_roll が初めて描画され grid_size が確定したフレームの
-    /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [`crate::widgets::piano_roll::piano_roll`] 参照)。
     pub(crate) fn fit_piano_roll_to_clip(&mut self) {
         // 表示中の **全 MIDI クリップ** の note bbox を union して zoom/scroll/pitch を
         // 算出する。複数表示は song-absolute (note.start + clip.start_beat) で集計し共有 transient
@@ -1050,7 +1197,7 @@ impl AppData {
 
         if multi {
             self.ui_prefs.multi_clip_view = fitted;
-        } else if let Some(key) = self.selection.selected_clip {
+        } else if let Some(key) = self.pianoroll_target_clip() {
             self.ui_prefs.piano_roll_views.insert(key, fitted);
         }
     }
@@ -1392,8 +1539,8 @@ impl AppData {
     /// / 対象面)。 これが変わると別対象とみなして段階 0 (横ズーム) から仕切り直す。
     pub(crate) fn current_zoom_selection_sig(&self, automation: bool) -> ZoomSelectionSig {
         ZoomSelectionSig {
-            clips: self.selection.selected_clips.clone(),
-            clip: self.selection.selected_clip,
+            clips: self.selected_clip_refs(),
+            clip: self.selected_clip_ref(),
             automation: self.selection.selected_automation_clips.clone(),
             target_automation: automation,
         }
@@ -1421,11 +1568,9 @@ impl AppData {
         if automation {
             track_ids.extend(self.selection.selected_automation_clips.iter().map(|k| k.track));
         } else {
-            track_ids.extend(self.selection.selected_clips.iter().map(|k| k.track_id));
-            if track_ids.is_empty()
-                && let Some(k) = self.selection.selected_clip
-            {
-                track_ids.insert(k.track_id);
+            // 範囲が掛かっている行のトラック (クリップが 1 つも無い行でも数える)。
+            if let Some(sel) = self.selection.time.as_ref() {
+                track_ids.extend(sel.track_ids());
             }
         }
         if track_ids.is_empty() {
@@ -1471,16 +1616,11 @@ impl AppData {
                 }
             }
         } else {
-            // 通常 clip: selected_clips 優先、 空なら primary selected_clip 単独。
-            let mut clip_keys = self.selection.selected_clips.clone();
-            if clip_keys.is_empty() {
-                clip_keys.extend(self.selection.selected_clip);
-            }
-            for key in clip_keys {
-                if let Some(clip) = self.clip_at(key) {
-                    min_start = min_start.min(clip.start_beat);
-                    max_end = max_end.max(clip.start_beat + clip.length_beats);
-                }
+            // 通常面: **範囲そのもの**が span (空き領域に引いた範囲でも `R` / `Z` が効く、
+            // `docs/plan_range_selection.md` 質問 26)。
+            if let Some(sel) = self.selection.time.as_ref() {
+                min_start = sel.start_beat;
+                max_end = sel.end_beat;
             }
         }
         (min_start.is_finite() && max_end > min_start).then_some((min_start, max_end))

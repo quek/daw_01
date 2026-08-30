@@ -193,8 +193,10 @@ fn left_trim_of_a_midi_clip_hides_notes_without_moving_them() {
 fn shared_duplicate_carries_the_window() {
     let mut app = app_with_two_linked_audio_clips();
     app.handle_event(AppEvent::ResizeClip { target: A, start_beat: 2.0, length: 4.0, stretch: false });
-    app.handle_event(AppEvent::SetClipSelection(vec![A]));
-    app.handle_event(AppEvent::DuplicateClipsShared(vec![A]));
+    app.handle_event(AppEvent::SelectClip { target: A, additive: false });
+    // D = 範囲を 1 つ後ろへ複製 (`docs/plan_range_selection.md` §6)。 窓 [2,6) が
+    // そのまま [6,10) へ写る。
+    app.copy_time_range(2.0, 6.0, 4.0, &[(A.track_id, A.track_id)], false);
 
     let clips = &app.song_doc.song().tracks[0].clips;
     assert_eq!(clips.len(), 3, "複製 clip が末尾に 1 本増える");

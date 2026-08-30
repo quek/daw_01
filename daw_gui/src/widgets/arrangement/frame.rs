@@ -28,6 +28,8 @@ pub(super) struct ArrangementFrame<'a> {
     /// `Option` を落とさないこと — `commit_releases` が `Option<&ArrangementMasterRow>` で受ける。
     pub master_row: Option<&'a ArrangementMasterRow>,
     pub selected_clips: &'a [ClipKey],
+    /// 選択の SSoT (時間範囲)。`None` なら選択なし。
+    pub time_selection: Option<&'a common::model::TimeSelection>,
     pub selected_tracks: &'a [u32],
     pub selected_automation_clips: &'a [AutomationClipKey],
     pub selected_automation_points: &'a [AutomationPointKey],
@@ -90,6 +92,7 @@ pub(super) fn build<'a>(
     let sections: &[SectionView] = &built.sections;
     let view = built.view;
     let selected_clips: &[ClipKey] = &built.selected_clips;
+    let time_selection = built.time_selection.as_ref();
     let selected_tracks: &[u32] = &built.selected_tracks;
     let selected_automation_clips: &[AutomationClipKey] = &built.selected_automation_clips;
     let selected_automation_points: &[AutomationPointKey] = &built.selected_automation_points;
@@ -186,6 +189,7 @@ pub(super) fn build<'a>(
         style,
         master_row,
         selected_clips,
+        time_selection,
         selected_tracks,
         selected_automation_clips,
         selected_automation_points,

@@ -23,50 +23,57 @@ impl AppData {
                 .then_with(|| b.0.clip_id.cmp(&a.0.clip_id))
         });
 
+        let follow_automation = self.ui_prefs.automation_follows_clips;
         let Some(new_refs) = self.edit_song(move |song| {
-            let mut new_refs: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
+            // **まず動かすクリップを全部外し、外し終えてから置く。** 1 つずつ
+            // 「外して置く」 を繰り返すと、先に置いたクリップが *まだ動いていない仲間* を
+            // 非重なり規則で削ってしまう (ブロック選択をまとめてドラッグすると多発する)。
+            let mut moving: Vec<(u32, bool, common::model::Clip)> =
+                Vec::with_capacity(entries.len());
             for (source, to_track_id, new_start_beat) in entries {
-                let new_start = new_start_beat.max(0.0);
-                let Some(source_track_id) = song
-                    .track_by_id(source.track_id)
-                    .map(|t| t.id)
+                let same_track = source.track_id == to_track_id;
+                let old_window = song.clip_by_key(source).map(common::model::Clip::song_window);
+                let Some((mut removed, _)) = song
+                    .track_by_id_mut(source.track_id)
+                    .and_then(|t| t.remove_clip_by_id(source.clip_id))
                 else {
                     continue;
                 };
-                if source_track_id == to_track_id {
-                    if let Some(track) = song.track_by_id_mut(source.track_id)
-                        && let Some(clip) = track.clip_by_id_mut(source.clip_id)
-                    {
-                        clip.start_beat = new_start;
-                        new_refs.push((source.track_id, clip.id));
-                    }
-                } else {
-                    let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
-                        continue;
-                    };
-                    let Some((removed, _)) = song
-                        .track_by_id_mut(source.track_id)
-                        .and_then(|t| t.remove_clip_by_id(source.clip_id))
-                    else {
-                        continue;
-                    };
-                    let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
-                        continue;
-                    };
-                    let new_clip_id = to_track.alloc_clip_id();
-                    let mut new_clip = removed;
-                    new_clip.id = new_clip_id;
-                    new_clip.start_beat = new_start;
-                    to_track.clips.push(new_clip);
-                    new_refs.push((to_track_idx as u32, new_clip_id));
+                let new_start = new_start_beat.max(0.0);
+                // **オートメーション追従** (`docs/plan_range_selection.md` §5)。
+                // 同じトラック内の移動だけが対象 — トラックを跨ぐと、移動先の
+                // どのレーンへ移すかが一意に決まらない。
+                if follow_automation
+                    && same_track
+                    && let Some((old_start, old_end)) = old_window
+                {
+                    move_track_automation(song, source.track_id, old_start, old_end, new_start - old_start);
                 }
+                removed.start_beat = new_start;
+                moving.push((to_track_id, same_track, removed));
+            }
+            let mut new_refs: Vec<(u32, u32)> = Vec::with_capacity(moving.len());
+            for (to_track_id, same_track, mut clip) in moving {
+                let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
+                    continue;
+                };
+                // トラックを跨ぐときは id を採り直す (移動先の別クリップと
+                // 衝突しうるため)。同トラック内なら id を保って選択を安定させる。
+                if !same_track {
+                    clip.id = 0;
+                }
+                let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
+                    continue;
+                };
+                let new_clip_id = to_track.place_clip(clip);
+                new_refs.push((to_track_idx as u32, new_clip_id));
             }
             new_refs
         }) else {
             return;
         };
-        // 新 clip 群を stable ClipKey (track.id + clip.id) で選択。
-        self.selection.selected_clips = new_refs
+        // 新 clip 群を包む範囲を選択にする (stable ClipKey で解決)。
+        let keys: Vec<common::model::ClipKey> = new_refs
             .iter()
             .filter_map(|(t_idx, c_id)| {
                 let track = self.song_doc.song().tracks.get(*t_idx as usize)?;
@@ -80,7 +87,7 @@ impl AppData {
                     })
             })
             .collect();
-        self.selection.selected_clip = self.selection.selected_clips.last().copied();
+        self.select_new_clips(&keys);
     }
 
     /// Bounce In Place (Pre-FX、 `docs/plan_audio_clip.md` §3.8 / §13 Q8)。
@@ -504,9 +511,8 @@ impl AppData {
 
                 self.edit_song(|song| {
                     let new_track_mut = &mut song.tracks[new_track_idx];
-                    let new_clip_id = new_track_mut.alloc_clip_id();
-                    new_track_mut.clips.push(common::model::Clip {
-                        id: new_clip_id,
+                    new_track_mut.place_clip(common::model::Clip {
+                        id: 0,
                         start_beat: pending.start_beat,
                         length_beats: pending.clip_length_beats,
                         content_id: new_content_id,
@@ -552,4 +558,45 @@ impl AppData {
         }
     }
 
+}
+
+/// **オートメーション追従**: `[start, end)` に居た automation を `delta` 拍ずらす。
+///
+/// 境界でクリップを割ってから、区間に完全に入るものだけを動かす。 移動先は上書き規則で
+/// 削ってから置く (automation クリップも `Track.clips` と同じ非重なり不変条件を持つ)。
+/// **閉じているレーンも含めて**そのトラックの全レーンに効く (設定が ON のときだけ呼ばれる)。
+fn move_track_automation(
+    song: &mut common::model::Song,
+    track_id: u32,
+    start: f64,
+    end: f64,
+    delta: f64,
+) {
+    const EPS: f64 = 1e-9;
+    if delta.abs() <= EPS || end <= start + EPS {
+        return;
+    }
+    let Some(track) = song.track_by_id_mut(track_id) else {
+        return;
+    };
+    for lane in &mut track.automation_lanes {
+        lane.split_at(start);
+        lane.split_at(end);
+        let mut moving: Vec<common::model::AutomationClip> = Vec::new();
+        lane.clips.retain(|c| {
+            let inside = c.start_beat >= start - EPS && c.start_beat + c.length_beats <= end + EPS;
+            if inside {
+                moving.push(c.clone());
+            }
+            !inside
+        });
+        if moving.is_empty() {
+            continue;
+        }
+        lane.carve_clip_range(start + delta, end + delta, None);
+        for mut c in moving {
+            c.start_beat += delta;
+            lane.clips.push(c);
+        }
+    }
 }

@@ -81,14 +81,6 @@ impl AppData {
             snap_on_draw: self.ui_prefs.snap_on_draw,
             snap_live_input: self.recording.snap_live_input,
             bottom_panel: self.ui_prefs.bottom_panel,
-            // 開いていたクリップを復元できるよう選択も保存 (現存クリップのみ)。
-            selected_clip: self.selection.selected_clip.filter(|k| self.live_clip_key(*k).is_some()),
-            selected_clips: self
-                .selection.selected_clips
-                .iter()
-                .copied()
-                .filter(|k| self.live_clip_key(*k).is_some())
-                .collect(),
             piano_roll_views,
             audio_editor_views,
             plugin_editor_windows,
@@ -170,14 +162,8 @@ impl AppData {
         self.ui_prefs.launcher_scene_col_w = sanitize_launcher_px(v.launcher_scene_col_w);
         self.ui_prefs.launcher_scroll_scene =
             if v.launcher_scroll_scene.is_finite() { v.launcher_scroll_scene.max(0.0) } else { 0.0 };
-        // 開いていたクリップ選択を復元 (現存しない stale key は除外)。 これでピアノロールが
-        // 開き直し直後に「前回編集していたクリップ」をその per-clip view で表示する。
-        self.selection.selected_clips = v
-            .selected_clips
-            .into_iter()
-            .filter(|k| self.live_clip_key(*k).is_some())
-            .collect();
-        self.selection.selected_clip = v.selected_clip.filter(|k| self.live_clip_key(*k).is_some());
+        // 選択 (時間範囲) は session-only なので復元しない
+        // (`docs/plan_range_selection.md` §2.3)。
         for (k, mut pv) in v.piano_roll_views {
             pv.zoom_x = pv.zoom_x.clamp(8.0, 400.0);
             pv.zoom_y = pv.zoom_y.clamp(6.0, 40.0);

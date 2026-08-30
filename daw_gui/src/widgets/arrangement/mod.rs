@@ -113,23 +113,6 @@ pub(crate) fn live_clip_key(app: &AppData, key: ClipKey) -> Option<ClipKey> {
     app.live_clip_key(key)
 }
 
-/// r.md #35: Shift+click 範囲選択 (長方形ブロック) 用に、 可視 track 上の全 clip を
-/// 「行 = 可視 track index / 時間 = clip の開始〜終了拍」 として並べる。 並び順は
-/// 描画順 (行 → track 内 clip 順) なので、 `range_block` の結果もその順になる。
-pub(crate) fn clip_range_items(visible_tracks: &[ArrangementTrack]) -> Vec<RangeItem<ClipKey>> {
-    let mut out = Vec::new();
-    for (row, t) in visible_tracks.iter().enumerate() {
-        for c in &t.clips {
-            out.push(RangeItem {
-                key: ClipKey { track_id: t.id, clip_id: c.id },
-                row: row as i64,
-                start: c.start_beat,
-                end: c.start_beat + c.len_beats,
-            });
-        }
-    }
-    out
-}
 
 fn widget_to_model_clip_key(k: AutomationClipKey) -> common::model::AutomationClipKey {
     common::model::AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip }
@@ -788,6 +771,10 @@ pub struct ArrangementRow {
 #[derive(Clone, Debug)]
 pub struct ArrangementResponse {
     pub hovered_track: Option<u32>,
+    /// クリップの**本体** (ヘッダ帯より下) にポインタが乗っているか。
+    /// ヘッダ = 掴んで動かす / 本体 = ドラッグで時間範囲、と役割が違うので
+    /// カーソル形状で示す (`docs/plan_range_selection.md` §4 — 帯は不可視のまま)。
+    pub hovered_clip_body: bool,
     /// ポインタ下の clip。 r.md #58 以降、 widget 内部でもフェードの掴む正方形を出す
     /// ゲートに使っている。 **caller はこれ (やそのミラー) を `data_generation` などの
     /// heavy cache キーに混ぜないこと** — 混ぜるとマウスを動かすたびにアレンジ全体が
@@ -908,6 +895,7 @@ impl Default for ArrangementResponse {
     fn default() -> Self {
         Self {
             hovered_track: None,
+            hovered_clip_body: false,
             hovered_clip: None,
             hovered_zone: None,
             dragging: None,
@@ -1183,6 +1171,12 @@ pub struct ArrangementStyle {
     /// M14 Phase 63n-8 (#033): lasso 矩形 (空き automation lane zone での drag) の fill (半透明)。
     /// 既定は `accent` の 12% alpha (MIDI rect select と同じ選択の色言語)。 widget は drag 中
     /// cached 外で overlay 描画する。
+    /// **時間範囲**の帯 (半透明、クリップの上に重ねる)。
+    /// `docs/plan_range_selection.md` §5 — 部分的に覆っているとき「どこからどこまでが
+    /// 範囲か」 が見えるよう、クリップより手前に塗る。
+    pub time_range_fill: Color,
+    /// 時間範囲の左右端の縦線 (その行の中だけに引く。ルーラーまでは貫通させない)。
+    pub time_range_edge: Color,
     pub automation_lasso_fill: Color,
     /// M14 Phase 63n-8 (#033): lasso 矩形の border。 既定は `accent` の 60% alpha + 1px。
     pub automation_lasso_border: Color,
@@ -1403,6 +1397,8 @@ impl ArrangementStyle {
             automation_point_selected_border: p.ink_on_dark,
             // M14 Phase 63n-8 (#033): lasso 矩形は accent で MIDI rect_select と視覚的に共通の言語、
             // ただし fill alpha 12% で透明感を強め overlay と分かりやすく。
+            time_range_fill: p.accent.with_alpha(0.18),
+            time_range_edge: p.accent.with_alpha(0.85),
             automation_lasso_fill: p.accent.with_alpha(0.12),
             automation_lasso_border: p.accent.with_alpha(0.60),
             automation_default_line_color: p.grid_line.with_alpha(0.18),
@@ -1595,6 +1591,11 @@ struct ClipDragSession {
     /// `CloneClipsLinked` (ctrl のみ) と `CloneClipsIndependent` (ctrl + shift) を識別する。
     /// 保持仕組みは `last_alt` / `last_ctrl` と同じ (continuation で update / release で skip)。
     last_shift: bool,
+    /// Move が動かす**時間範囲** (`docs/plan_range_selection.md` §6)。 press 時に確定する
+    /// — いまの選択範囲がこのクリップに掛かっていればその範囲、掛かっていなければ
+    /// 掴んだクリップの占有区間。 `anchors` はこの範囲でクリップを切った断片なので、
+    /// ゴーストも確定後と同じ「範囲ぶんだけ」を描く。 Resize では使わない。
+    move_range: (f64, f64),
     anchors: Vec<ClipDragAnchor>,
 }
 
@@ -1879,9 +1880,28 @@ struct AutomationClipDragSession {
     last_shift: bool,
 }
 
+/// **時間範囲のドラッグ session** (`docs/plan_range_selection.md` §3.1)。
+///
+/// 起動点は 4 つ — トラックレーンの空き / クリップの本体 (ヘッダ以外) /
+/// クリップのヘッダ + Alt / オートメーションレーンの空き。 どれも同じ session を張る。
+/// ジェスチャの種類は**押した瞬間の Alt** で決まり、以降の Alt は範囲のスナップ
+/// on/off だけを制御する (離す = スナップ有効 / 押す = 無効)。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RangeDragSession {
+    /// 掴んだ拍 (song-absolute、未スナップ)。
+    anchor_beat: f64,
+    /// 掴んだ画面 y (行の帯を決める端)。
+    anchor_y: f32,
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt (スナップ一時無効)。
+    last_alt: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ArrangementState {
     clip_drag: Option<ClipDragSession>,
+    /// 時間範囲のドラッグ (矩形選択 / 投げ縄を置き換えたもの)。
+    range_drag: Option<RangeDragSession>,
     loop_drag: Option<LoopDragSession>,
     track_reorder: Option<TrackReorderSession>,
     track_volume_drag: Option<TrackVolumeDragSession>,

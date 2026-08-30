@@ -172,6 +172,14 @@ pub struct UiEphemeral {
     /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
     /// Editor close で `None` に戻る。
     pub audio_editor_clip: Option<ClipKey>,
+    /// ピアノロールの**対象 (target) クリップ**の focus ヒント。
+    ///
+    /// 選択そのものではない (選択の SSoT は `SelectionState::time` 1 本) —
+    /// 「同時表示している MIDI クリップのうち、どれを編集の主対象にするか」 という
+    /// カーソル位置に相当する。 凡例の行クリック (`SetPianoRollTargetClip`) で動き、
+    /// 表示集合に居ない値は [`AppData::pianoroll_target_clip`] が無視するので stale で
+    /// 壊れない。 `None` なら「範囲の先頭に最も近いクリップ」 が対象になる。
+    pub pianoroll_focus_clip: Option<ClipKey>,
     /// Audio Editor 内のマウス hover 位置を clip 内 beat (clip 始端 = 0)
     /// に変換した値。 audio_editor.rs が毎フレーム push、 マウスが
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック

@@ -697,8 +697,8 @@ impl AppData {
             return;
         }
         // 列を選んだらセル側は空にする (上記の排他)。
-        self.selection.selected_clip = None;
-        self.selection.selected_clips.clear();
+        self.selection.selected_launcher_cells.clear();
+        self.selection.launcher_cell_anchor = None;
         self.selection.selected_automation_clips.clear();
     }
 

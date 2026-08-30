@@ -1447,8 +1447,12 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         // これで「トリムしても中身は 1px も動かない」 が式として成り立ち、 中身は
         // ゴースト矩形で切り抜かれるだけになる。
         let src_offset = src.map_or(0.0, |(_, c)| c.content_offset_beats);
+        // Move の anchor は**範囲で切った断片**なので、 元クリップの先頭からずれた分だけ
+        // content 原点も進める (`docs/plan_range_selection.md` §6)。 範囲がクリップ全体を
+        // 覆っていれば 0 で、従来どおり「窓ごと動く = 原点据え置き」になる。
+        let anchor_lead = src.map_or(0.0, |(_, c)| a.start_beat - c.start_beat);
         let preview_offset = match nd.kind {
-            ClipDragKind::Move => src_offset,
+            ClipDragKind::Move => src_offset + anchor_lead,
             ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => {
                 src_offset + (start - a.start_beat)
             }
@@ -2114,5 +2118,62 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
                 clip_rect: Some(clip_rect),
             });
         }
+    }
+}
+
+/// **時間範囲の帯**を描く (`docs/plan_range_selection.md` §5)。
+///
+/// 半透明の明色で塗り、左右端に縦線を引く。**クリップの上に重ねる**ので、
+/// 範囲がクリップを部分的に覆っているときに境目が見える。塗るのは
+/// **範囲が実際に掛かっている行**だけで、行の高さいっぱい。縦線もその行の中だけ
+/// (ルーラーまで貫通させると、範囲に入っていない行にも線が走って縦の広がりが
+/// 読めなくなる)。
+pub(super) fn draw_time_range_overlay<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    rows: &[ArrangementRow],
+    sel: &common::model::TimeSelection,
+    view: ArrangementView,
+    lanes: Rect,
+    style: &ArrangementStyle,
+) {
+    // 拍 → px (`px_to_beat` の逆写像。ズームとスクロールはすべて `view` が持つ)。
+    let px_per_beat = f64::from(lanes.w.max(1.0)) / view.len_beats.max(1e-9);
+    let to_px = |beat: f64| lanes.x + ((beat - view.start_beat) * px_per_beat) as f32;
+    let x0 = to_px(sel.start_beat);
+    let x1 = to_px(sel.end_beat);
+    let (x0, x1) = (x0.max(lanes.x), x1.min(lanes.x + lanes.w));
+    if x1 <= x0 {
+        return;
+    }
+    for row in rows {
+        let covered = match row.key {
+            ArrangementRowKey::Track(id) => sel.has_lane(common::model::LaneRef::Track(id)),
+            ArrangementRowKey::Lane(key) => sel.has_lane(common::model::LaneRef::Automation(key)),
+        };
+        if !covered {
+            continue;
+        }
+        let top = lanes.y - view.track_top + row.content_top;
+        if top + row.height <= lanes.y || top >= lanes.y + lanes.h {
+            continue;
+        }
+        let y0 = top.max(lanes.y);
+        let y1 = (top + row.height).min(lanes.y + lanes.h);
+        if y1 <= y0 {
+            continue;
+        }
+        let band = Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        push_filled_rect(hctx, band, style.time_range_fill);
+        // 左右端の縦線 (1px)。
+        push_filled_rect(
+            hctx,
+            Rect { x: x0, y: y0, w: 1.0, h: y1 - y0 },
+            style.time_range_edge,
+        );
+        push_filled_rect(
+            hctx,
+            Rect { x: x1 - 1.0, y: y0, w: 1.0, h: y1 - y0 },
+            style.time_range_edge,
+        );
     }
 }

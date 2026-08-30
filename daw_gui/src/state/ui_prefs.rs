@@ -230,4 +230,15 @@ pub struct UiPrefs {
     pub launcher_scene_col_w: f32,
     /// ランチャー帯の横スクロール位置 (列数、小数可)。
     pub launcher_scroll_scene: f32,
+    /// **オートメーションをクリップに追従させるか**
+    /// (`docs/plan_range_selection.md` §5)。 Cubase の *Automation Follows Events* /
+    /// REAPER の *Move envelope points with media items* に相当し、アレンジャー上部の
+    /// Snap toolbar にトグルとして常時出る。既定 ON。
+    ///
+    /// **効くのは編集だけ** — 範囲のハイライトは常に「ドラッグが実際に横切った行」で、
+    /// この設定では変わらない。ON のとき、トラック行に掛かった範囲への Delete / Cut /
+    /// Copy / 移動 / Duplicate / `J` が、**閉じているレーンも含めて**そのトラックの
+    /// automation に同じ範囲で適用される。オートメーションレーン行を直接選んだ場合は
+    /// 設定に関係なくその automation だけが対象。
+    pub automation_follows_clips: bool,
 }

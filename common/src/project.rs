@@ -22,6 +22,11 @@ pub struct LoadedProject {
     /// ヘッダ幅まで既定値へ潰れてしまうため (= `view: None` の「globals は現状維持」
     /// 挙動が壊れる)。
     pub loop_region: LoopRegion,
+    /// 読み込み時に**クリップの重なりを解消したか**
+    /// (`docs/plan_range_selection.md` §6.4)。 `true` なら中身が変わっているので
+    /// 開いた時点で `*` (未保存) を立てる。 冪等なので、そのまま保存して開き直せば
+    /// 二度目は `false`。
+    pub overlaps_resolved: bool,
 }
 
 /// Oldest project-file version `load` will accept. Versions below this
@@ -857,8 +862,8 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     // (track/clip/parent_group_id consistency), and the scale-change /
     // automation-point sort invariants. Idempotent — safe if a caller
     // (e.g. `daw_gui::app::open_project`) re-runs it.
-    song.normalize_after_load();
-    Ok(LoadedProject { song, view, loop_region })
+    let overlaps_resolved = song.normalize_after_load();
+    Ok(LoadedProject { song, view, loop_region, overlaps_resolved })
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -905,11 +910,6 @@ mod tests {
             snap_on_draw: true,
             snap_live_input: false,
             bottom_panel: 1,
-            selected_clip: Some(ClipKey { track_id: 2, clip_id: 1 }),
-            selected_clips: vec![
-                ClipKey { track_id: 1, clip_id: 1 },
-                ClipKey { track_id: 2, clip_id: 1 },
-            ],
             piano_roll_views: vec![
                 (
                     ClipKey { track_id: 1, clip_id: 1 },
@@ -1478,6 +1478,9 @@ mod tests {
                 length_beats: 16.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                // 新規クリップにクロスフェードの張り出しは無い。
+                xfade_lead_beats: 0.0,
+                xfade_tail_beats: 0.0,
                 color: None,
                 auto_lipsync: false,
                 lipsync_gen: 0,

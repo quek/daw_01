@@ -82,7 +82,7 @@ impl AppData {
     /// を残して面を切り出す。インスペクタの「ローンチ」セクションと
     /// `Delete` / `Ctrl+D` / copy の対象がこれ。
     ///
-    /// トラック行のセル (`selected_clips`) とオートメーションレーン行のセル
+    /// トラック行のセル (`selected_launcher_cells`) とオートメーションレーン行のセル
     /// (`selected_automation_clips`) は **共存できる**ので、どちらを対象に
     /// するかは `last_edit_select` (= 直近に確定した面) で決める
     /// (`feedback_selection_action_last_wins`)。 タグが無い / 別の面を指して
@@ -98,11 +98,11 @@ impl AppData {
         // 状態の `Ctrl+C` / `Ctrl+X` / `D` が (セルが選択に残っているだけで)
         // ノートではなくセルに効いてしまう — `Ctrl+X` は消えるので実害が大きい
         // (`feedback_selection_action_last_wins` の "直近確定面で決める")。
-        if !matches!(last, Some(S::Clips) | Some(S::AutomationClips)) {
+        if !matches!(last, Some(S::LauncherCells) | Some(S::AutomationClips)) {
             return out;
         }
         if last != Some(S::AutomationClips) {
-            for key in &self.selection.selected_clips {
+            for key in &self.selection.selected_launcher_cells {
                 if song
                     .track_by_id(key.track_id)
                     .is_some_and(|t| t.session_clip_by_id(key.clip_id).is_some())
@@ -111,7 +111,7 @@ impl AppData {
                 }
             }
         }
-        if last != Some(S::Clips) {
+        if last != Some(S::LauncherCells) {
             for key in &self.selection.selected_automation_clips {
                 if song
                     .automation_lane_by_key(key.track, key.lane)
@@ -191,26 +191,27 @@ impl AppData {
         match cell {
             LauncherCellKey::Track(key) => {
                 let items = self.launcher_range_items();
-                let anchor = self.selection.clip_anchor;
-                let next = modifier.resolve(&self.selection.selected_clips, key, || {
+                let anchor = self.selection.launcher_cell_anchor;
+                let next = modifier.resolve(&self.selection.selected_launcher_cells, key, || {
                     let a = anchor?;
                     crate::widgets::select_modifier::range_block(&items, a, key)
                 });
-                self.selection.selected_clip = next.last().copied();
-                self.selection.selected_clips = next;
+                let anchor_track = next.last().map(|k| k.track_id);
+                self.selection.selected_launcher_cells = next;
                 if modifier.updates_anchor() {
-                    self.selection.clip_anchor = Some(key);
+                    self.selection.launcher_cell_anchor = Some(key);
                 }
-                if self.selection.selected_clip.is_some() {
-                    self.selection.last_edit_select = Some(crate::app::EditSurface::Clips);
+                if !self.selection.selected_launcher_cells.is_empty() {
+                    self.selection.last_edit_select =
+                        Some(crate::app::EditSurface::LauncherCells);
                 }
                 // アレンジのクリップ選択 (`select_clip` / `set_clip_selection`) と
                 // 同じく、 anchor のトラックへカーソルを追従させる。 これが無いと
                 // インスペクタの上半分 (トラック名・色・デバイスチェーン) だけが
                 // 前のトラックのまま残り、 下半分 (クリップ / ローンチ設定) と
                 // 混ざって見える。 `Clips` タグを立てた **直後**に呼ぶ約束も同じ。
-                if let Some(r) = self.selected_clip_ref() {
-                    self.select_track(r.track_id);
+                if let Some(track_id) = anchor_track {
+                    self.select_track(track_id);
                 }
             }
             LauncherCellKey::Lane(key) => {
@@ -334,7 +335,7 @@ impl AppData {
             })
         };
         let clips: Vec<ClipKey> =
-            self.selection.selected_clips.iter().copied().filter(clip_alive).collect();
+            self.selection.selected_launcher_cells.iter().copied().filter(clip_alive).collect();
         let autos: Vec<AutomationClipKey> = self
             .selection
             .selected_automation_clips
@@ -342,14 +343,14 @@ impl AppData {
             .copied()
             .filter(auto_alive)
             .collect();
-        self.selection.selected_clip = self.selection.selected_clip.filter(clip_alive);
         // **範囲選択の起点 (anchor) も掃除する。** 消えたセルを指したままだと
         // 次の `Shift+click` が範囲を解けず、単一選択に落ちる (「範囲選択が
         // 時々効かない」の正体)。
-        self.selection.clip_anchor = self.selection.clip_anchor.filter(clip_alive);
+        self.selection.launcher_cell_anchor =
+            self.selection.launcher_cell_anchor.filter(clip_alive);
         self.selection.automation_clip_anchor =
             self.selection.automation_clip_anchor.filter(auto_alive);
-        self.selection.selected_clips = clips;
+        self.selection.selected_launcher_cells = clips;
         self.selection.selected_automation_clips = autos;
     }
 
@@ -614,9 +615,8 @@ impl AppData {
         let anchor_track =
             autos.last().map(|k| k.track).or_else(|| clips.last().map(|k| k.track_id));
         if !clips.is_empty() {
-            self.selection.selected_clip = clips.last().copied();
-            self.selection.selected_clips = clips;
-            self.selection.last_edit_select = Some(crate::app::EditSurface::Clips);
+            self.selection.selected_launcher_cells = clips;
+            self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
         }
         if !autos.is_empty() {
             self.selection.selected_automation_clips = autos;
@@ -979,8 +979,7 @@ fn drop_one_cell_to_arranger(
                 .and_then(|t| t.session_clip_by_id(from.clip_id))
                 .map(|c| c.clip.clone())?;
             let track = song.track_by_id_mut(dest_track)?;
-            let id = track.alloc_clip_id();
-            track.clips.push(Clip { id, start_beat: start, ..src });
+            let id = track.place_clip(Clip { id: 0, start_beat: start, ..src });
             if mode == LauncherDropMode::CopyIndependent {
                 fork_clip_content(song, ClipKey { track_id: dest_track, clip_id: id });
             }

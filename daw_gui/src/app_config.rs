@@ -13,6 +13,11 @@ pub struct AppConfig {
     /// status bar のリソースモニター常駐表示を出すか。 default = true。
     #[serde(default = "default_true")]
     pub resource_monitor_enabled: bool,
+    /// **オートメーションをクリップに追従させるか** (`docs/plan_range_selection.md` §5)。
+    /// プロジェクトではなく**この人の作業のしかた**なのでアプリ設定側に持つ
+    /// (Cubase の *Automation Follows Events* も環境設定)。 default = true。
+    #[serde(default = "default_true")]
+    pub automation_follows_clips: bool,
     /// r.md #29: 編集履歴 window が開いているか (再起動を跨いで復元)。 default = false。
     #[serde(default)]
     pub undo_history_open: bool,
@@ -77,6 +82,7 @@ impl AppConfig {
     pub fn from_prefs(prefs: &crate::state::UiPrefs, theme_id: String) -> Self {
         Self {
             resource_monitor_enabled: prefs.resource_monitor_enabled,
+            automation_follows_clips: prefs.automation_follows_clips,
             undo_history_open: prefs.undo_history_open,
             undo_history_rect: prefs.undo_history_rect.map(|r| [r.x, r.y, r.w, r.h]),
             theme: theme_id,
@@ -118,6 +124,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             resource_monitor_enabled: true,
+            automation_follows_clips: true,
             undo_history_open: false,
             undo_history_rect: None,
             theme: default_theme(),
@@ -175,6 +182,7 @@ mod tests {
         let path = dir.path().join("app_config.json");
         let cfg = AppConfig {
             resource_monitor_enabled: false,
+            automation_follows_clips: false,
             undo_history_open: true,
             undo_history_rect: Some([10.0, 20.0, 260.0, 360.0]),
             theme: "light".to_string(),

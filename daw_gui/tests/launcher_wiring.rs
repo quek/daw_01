@@ -727,14 +727,14 @@ fn 列を選ぶとセルの選択は落ちその逆も同じ() {
         cell,
         modifier: SelectModifier::Single,
     }));
-    assert!(!app.selection.selected_clips.is_empty(), "セルが選ばれている");
+    assert!(!app.selection.selected_launcher_cells.is_empty(), "セルが選ばれている");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
         scene_id: scene,
         modifier: SelectModifier::Single,
     }));
     assert_eq!(app.selection.selected_scene_ids, vec![scene]);
-    assert!(app.selection.selected_clips.is_empty(), "列を選んだらセルの選択は落ちる");
+    assert!(app.selection.selected_launcher_cells.is_empty(), "列を選んだらセルの選択は落ちる");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
         cell,

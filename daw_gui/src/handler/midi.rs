@@ -345,7 +345,7 @@ impl AppData {
         };
         let next_cursor = cursor + step;
         // selected_notes は packed note id。入力先 (target) clip の slot で pack。
-        self.selection.selected_notes = self.pack_clip_selection(target, &selected);
+        self.set_note_selection(&(self.pack_clip_selection(target, &selected)));
         self.recording.step_cursor_beat = next_cursor;
     }
 
@@ -489,6 +489,10 @@ impl AppData {
                 })
             {
                 clip.length_beats = playhead - clip.start_beat + 4.0;
+                let (id, start, len) = (clip.id, clip.start_beat, clip.length_beats);
+                // 延長先に居た次のクリップは上書き規則で削る (録音も例外にしない、
+                // `docs/plan_range_selection.md` §6.3)。
+                song.tracks[track_idx].carve_clip_range(start, start + len, Some(id));
                 return true;
             }
             // 新規 clip 作成。
@@ -501,16 +505,13 @@ impl AppData {
                 }),
             );
             let track = &mut song.tracks[track_idx];
-            let new_clip_id = track.next_clip_id;
-            track.next_clip_id += 1;
-            let new_clip = common::model::Clip {
-                id: new_clip_id,
+            track.place_clip(common::model::Clip {
+                id: 0,
                 start_beat: playhead,
                 length_beats: 4.0,
                 content_id: cid,
                 ..Default::default()
-            };
-            track.clips.push(new_clip);
+            });
             true
         });
         // content_name は **明示 rename 専用**。 ここで自動名

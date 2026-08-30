@@ -465,6 +465,12 @@ fn render_arrangement_heavy(
             lanes,
             f.style,
         );
+        // 時間範囲の帯は**選択リングより後 = 手前**に描く (クリップを部分的に
+        // 覆っているときに境目が見える、`docs/plan_range_selection.md` §5)。
+        // ドラッグ中はプレビュー (release commit と同じ値) を、それ以外は確定した範囲を出す。
+        if let Some(sel) = overlays.range_preview.as_ref().or(f.time_selection) {
+            draw_time_range_overlay(hctx, &f.rows, sel, f.view, lanes, f.style);
+        }
         // r.md #58: フェードの掴む正方形は hover 中の clip (+ フェードをドラッグ中の
         // clip) にだけ出す。 選択リングより後 = 手前に描き、 ドラッグ ghost より前に
         // 置く (掴む対象が最前面、 ドラッグ中のプレビューはさらにその上)。

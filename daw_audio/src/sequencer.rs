@@ -162,6 +162,12 @@ pub fn collect_events_for_buffer(
         // 共有するが窓は clip ごとに独立する。
         let (win_start, win_end) = clip.content_window();
 
+        // 非重なり不変条件 (`Track::clips`) が入ったので、同じトラックで 2 つの clip が
+        // 同時に鳴ることは無い。 これに依存しているのが下の `active_notes` —
+        // pitch を refcount せず `swap_remove` するので、重なった clip が同ピッチを
+        // 鳴らすと Off が 1 本だけ外れて早切れ / stuck になる
+        // (`docs/plan_range_selection.md` §10)。 重なりを許す方向へ戻すなら、
+        // ここを (pitch, clip) の多重集合にすること。
         for note in notes {
             let note_id = common::plugin_metadata::sing_note_id(clip.id, note.id);
             // muted note は On/Off を一切 emit しない (On を出さないので

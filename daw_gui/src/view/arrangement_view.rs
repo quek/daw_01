@@ -227,7 +227,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &[
                 "Rename",
                 "Make Unique",
-                "共有を一括選択",
                 "Auto-Fade",
                 "Auto-Crossfade",
                 "Reverse",
@@ -245,30 +244,30 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // clip 版、 F2 でも起動)。
                         0 => app.handle_event(AppEvent::BeginRenameClip(target)),
                         1 => app.handle_event(AppEvent::MakeClipUnique(target)),
-                        // 共有を一括選択: 同 content_id の linked clip group を
-                        // まとめて選択 (`docs/plan_clip_shared_name.md` §2)。
-                        2 => app.handle_event(AppEvent::SelectLinkedClips(target)),
-                        3 => app.handle_event(AppEvent::AutoFadeSelectedClips),
-                        4 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
+                        // 「共有を一括選択」 は撤去した — リンク先は曲のあちこちに
+                        // 散らばっており、選択が単一の時間範囲になった今は表現できない
+                        // (`docs/plan_range_selection.md` §9)。
+                        2 => app.handle_event(AppEvent::AutoFadeSelectedClips),
+                        3 => app.handle_event(AppEvent::AutoCrossfadeSelectedClips),
                         // Reverse は右クリック対象 clip 1 つだけを toggle
                         // (Auto-Fade と違って selection 全体ではなく当該
                         // clip のみ。 Bitwig clip メニューでも同様)。
-                        5 => app.handle_event(AppEvent::ToggleClipReversed(target)),
+                        4 => app.handle_event(AppEvent::ToggleClipReversed(target)),
                         // Bounce In Place: Pre-FX (= plugin chain 通さず)、
                         // 当該 clip の content を 1 event の baked audio に
                         // 置換 (= 元 track 内で同 path)。 Phase 2 PR9
                         // (`docs/plan_audio_clip.md` §3.8)。
-                        6 => app.handle_event(AppEvent::BounceClipInPlace(target)),
+                        5 => app.handle_event(AppEvent::BounceClipInPlace(target)),
                         // Bounce (with FX): plugin chain を **通した** 結果を
                         // **新 track + 新 Clip** に書き出す (元 clip は不変)。
                         // async (= IPC freewheel render → 完了通知)。
                         // Phase 2 PR-C (`docs/plan_audio_followup.md`)。
-                        7 => app.handle_event(AppEvent::BounceClipWithFx(target)),
+                        6 => app.handle_event(AppEvent::BounceClipWithFx(target)),
                         // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
                         // (anchor = 右クリックした clip rect)。個別 clip 色の上書き。
                         // 「トラック色に戻す」 (継承へ) は Ableton と同様に track 側
                         // context menu (= 全 clip 一括) に置く。
-                        8 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
+                        7 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
                         _ => {}
                     }
                 }));
@@ -1186,7 +1185,7 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
 
 
 /// 上部 24 px の Snap toolbar を描画。
-/// 配置: [Snap toggle 60px] [snap unit dropdown 90px] [Fit button 50px]
+/// 配置: [Snap toggle 60px] [snap unit dropdown 90px] [Fit button 50px] [Auto 追従 100px]
 fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     // クロームのバー類は `header` (transport / ruler / menu bar と同じ面)。
     ui.panel("arr_toolbar_bg", rect, app.theme.core.header, 0.0);
@@ -1243,6 +1242,29 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             app.handle_event(AppEvent::FitArrangeToContent);
         })
     });
+
+    // **オートメーションをクリップに追従させるか** (`docs/plan_range_selection.md` §5)。
+    // Cubase の *Automation Follows Events* 相当。 いま ON なのか OFF なのかが常に
+    // 見えるよう、メニューではなくここに常時出す (質問 25 = 3)。 効くのは編集だけで、
+    // 範囲のハイライトはこの設定では変わらない。
+    let follow_rect = Rect {
+        x: fit_rect.x + fit_rect.w + pad,
+        y,
+        w: 100.0,
+        h,
+    };
+    ui.toggle_button_at(
+        "arr_automation_follow",
+        "Auto 追従",
+        follow_rect,
+        app.ui_prefs.automation_follows_clips,
+        &snap_toggle_style(&app.theme),
+        |new| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetAutomationFollowsClips(new));
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

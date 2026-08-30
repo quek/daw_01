@@ -427,7 +427,7 @@ fn duplicate_section_inserts_linked_copy_with_ripple() {
 }
 
 #[test]
-fn split_clips_at_forks_straddling_clip_content() {
+fn split_clips_at_は窓を割り跨ぐノートだけを切る() {
     let mut song = Song::default();
     let cid = song.alloc_content_id();
     song.clip_contents.insert(
@@ -470,35 +470,131 @@ fn split_clips_at_forks_straddling_clip_content() {
     };
     song.tracks = vec![track];
 
-    // clip [2,6) を beat 4 (clip-local 2.0) で分割。
+    // clip [2,6) を beat 4 (content-local 2.0) で分割。
     song.split_clips_at(4.0);
 
-    let mut cs: Vec<(f64, f64, u32)> = song.tracks[0]
+    let mut cs: Vec<(f64, f64, f64, ContentId)> = song.tracks[0]
         .clips
         .iter()
-        .map(|c| (c.start_beat, c.length_beats, c.content_id))
+        .map(|c| (c.start_beat, c.length_beats, c.content_offset_beats, c.content_id))
         .collect();
-    cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    cs.sort_by(|a, b| a.0.total_cmp(&b.0));
     assert_eq!(cs.len(), 2);
-    // 左 [2,4) は元 content を保持、 右 [4,6) は fork content。
-    assert_eq!((cs[0].0, cs[0].1, cs[0].2), (2.0, 2.0, cid));
-    assert_eq!((cs[1].0, cs[1].1), (4.0, 2.0));
-    let right_cid = cs[1].2;
-    assert_ne!(right_cid, cid);
-
-    // 右 content の note は cut(2.0) 左シフト (3.0→1.0)、 0.0 の note は drop。
-    let ClipContent::Midi(m) = &song.clip_contents[&right_cid] else {
+    // 両断片は **同じ content を別の窓で**見る (content は割らない)。
+    assert_eq!(cs[0], (2.0, 2.0, 0.0, cid));
+    assert_eq!(cs[1], (4.0, 2.0, 2.0, cid));
+    // 跨ぐノートが無いので content は無傷 (窓の外の note も失われない)。
+    let ClipContent::Midi(m) = &song.clip_contents[&cid] else {
         panic!("midi")
     };
-    assert_eq!(m.notes.len(), 1);
-    assert_eq!(m.notes[0].start_beat, 1.0);
-    assert_eq!(m.notes[0].pitch, 62);
+    assert_eq!(m.notes.len(), 2);
+    assert_eq!(song.clip_contents.len(), 1, "fork していない");
+}
 
-    // 元 content は pooled で不変 (2 note のまま)。
+#[test]
+fn split_clips_at_は跨ぐノートを切って後半を鳴らせるようにする() {
+    let mut song = Song::default();
+    let cid = song.alloc_content(
+        ClipContent::Midi(MidiContent {
+            // content-local 1.0 から 3 拍 = 分割点 (2.0) を跨ぐ。
+            notes: vec![Note {
+                id: 1,
+                start_beat: 1.0,
+                duration_beats: 3.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("あ".to_string()),
+                muted: false,
+            }],
+            next_note_id: 2,
+        }),
+        String::new(),
+    );
+    song.tracks = vec![Track {
+        id: 1,
+        clips: vec![Clip {
+            id: 1,
+            start_beat: 2.0,
+            length_beats: 4.0,
+            content_id: cid,
+            ..Default::default()
+        }],
+        next_clip_id: 2,
+        ..Track::default()
+    }];
+
+    song.split_clips_at(4.0);
+
+    let ClipContent::Midi(m) = &song.clip_contents[&cid] else {
+        panic!("midi")
+    };
+    let mut spans: Vec<(f64, f64, Option<String>)> = m
+        .notes
+        .iter()
+        .map(|n| (n.start_beat, n.duration_beats, n.lyric.clone()))
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    assert_eq!(
+        spans,
+        vec![
+            (1.0, 1.0, Some("あ".to_string())),
+            // 後半は継続なので歌詞を持たない (VOICEVOX が二重に歌わない)。
+            (2.0, 2.0, None),
+        ]
+    );
+    // 後半の窓 [2,4) に発音開始が入るので、後半クリップでも鳴る。
+    let right = song.tracks[0]
+        .clips
+        .iter()
+        .find(|c| c.start_beat == 4.0)
+        .expect("後半クリップ");
+    let (win_start, win_end) = right.content_window();
+    assert_eq!((win_start, win_end), (2.0, 4.0));
+    assert!(m.notes.iter().any(|n| n.start_beat >= win_start && n.start_beat < win_end));
+}
+
+#[test]
+fn split_content_at_は共有されている_content_を_fork_する() {
+    let mut song = Song::default();
+    let cid = song.alloc_content(
+        ClipContent::Midi(MidiContent {
+            notes: vec![Note {
+                id: 1,
+                start_beat: 0.0,
+                duration_beats: 4.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: None,
+                muted: false,
+            }],
+            next_note_id: 2,
+        }),
+        String::new(),
+    );
+    // 同じ content を 2 クリップが共有 (linked clip)。
+    song.tracks = vec![Track {
+        id: 1,
+        clips: vec![
+            Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: cid, ..Default::default() },
+            Clip { id: 2, start_beat: 8.0, length_beats: 4.0, content_id: cid, ..Default::default() },
+        ],
+        next_clip_id: 3,
+        ..Track::default()
+    }];
+
+    let forked = song.split_content_at(cid, 2.0);
+    assert_ne!(forked, cid, "共有されていれば fork してから切る");
+    // 元 content (もう一方の linked clip が見ている) は無傷。
     let ClipContent::Midi(orig) = &song.clip_contents[&cid] else {
         panic!("midi")
     };
-    assert_eq!(orig.notes.len(), 2);
+    assert_eq!(orig.notes.len(), 1);
+    assert_eq!(orig.notes[0].duration_beats, 4.0);
+    // fork した側だけが切れている。
+    let ClipContent::Midi(new) = &song.clip_contents[&forked] else {
+        panic!("midi")
+    };
+    assert_eq!(new.notes.len(), 2);
 }
 
 #[test]
@@ -2636,4 +2732,118 @@ fn legacy_reported_latency_keys_are_ignored_and_never_written_back() {
             .is_none(),
         "track の報告 latency は保存しない"
     );
+}
+
+// ---- 非重なり不変条件 (docs/plan_range_selection.md §6) ----
+
+/// `(id, start, len)` の並びからトラックを作る (重なりチェックを通さない生の push)。
+fn track_with_raw_clips(clips: &[(u32, f64, f64)]) -> Track {
+    let mut t = Track { id: 1, next_clip_id: 100, ..Track::default() };
+    for &(id, start, len) in clips {
+        t.clips.push(Clip { id, start_beat: start, length_beats: len, ..Clip::default() });
+    }
+    t
+}
+
+/// `(start, len)` を開始拍順で取り出す。
+fn clip_spans(t: &Track) -> Vec<(f64, f64)> {
+    let mut v: Vec<(f64, f64)> = t.clips.iter().map(|c| (c.start_beat, c.length_beats)).collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v
+}
+
+#[test]
+fn place_clip_は上書き規則で既存クリップを削る() {
+    // (既存クリップ群, 置くクリップ (start, len), 期待する結果 (start, len) 群)
+    /// (既存クリップ群, 置くクリップ, 期待する結果)。
+    type Case = (&'static [(u32, f64, f64)], (f64, f64), &'static [(f64, f64)]);
+    let cases: &[Case] = &[
+        // 完全被覆 → 消える
+        (&[(1, 4.0, 4.0)], (0.0, 16.0), &[(0.0, 16.0)]),
+        // 右端が食い込まれる → 縮む
+        (&[(1, 0.0, 8.0)], (4.0, 8.0), &[(0.0, 4.0), (4.0, 8.0)]),
+        // 左端が食い込まれる → 縮む
+        (&[(1, 8.0, 8.0)], (4.0, 8.0), &[(4.0, 8.0), (12.0, 4.0)]),
+        // 真ん中を覆われる → 2 分割
+        (&[(1, 0.0, 16.0)], (4.0, 8.0), &[(0.0, 4.0), (4.0, 8.0), (12.0, 4.0)]),
+        // 隣接 (端が触れるだけ) は削らない
+        (&[(1, 0.0, 4.0), (2, 8.0, 4.0)], (4.0, 4.0), &[(0.0, 4.0), (4.0, 4.0), (8.0, 4.0)]),
+        // 複数にまたがる
+        (
+            &[(1, 0.0, 4.0), (2, 4.0, 4.0), (3, 8.0, 4.0)],
+            (2.0, 8.0),
+            &[(0.0, 2.0), (2.0, 8.0), (10.0, 2.0)],
+        ),
+    ];
+    for (existing, (start, len), expected) in cases {
+        let mut t = track_with_raw_clips(existing);
+        t.place_clip(Clip { id: 0, start_beat: *start, length_beats: *len, ..Clip::default() });
+        assert_eq!(
+            clip_spans(&t),
+            expected.to_vec(),
+            "existing={existing:?} place=({start}, {len})"
+        );
+    }
+}
+
+#[test]
+fn 左端を削られたクリップはcontentの窓だけが進む() {
+    // content は触らず `content_offset_beats` で窓を右へ動かす (窓モデル)。
+    let mut t = track_with_raw_clips(&[(1, 8.0, 8.0)]);
+    t.clips[0].content_offset_beats = 2.0;
+    t.place_clip(Clip { id: 0, start_beat: 4.0, length_beats: 8.0, ..Clip::default() });
+    let survivor = t.clips.iter().find(|c| c.id == 1).expect("左端を削られた側は残る");
+    assert_eq!(survivor.start_beat, 12.0);
+    assert_eq!(survivor.length_beats, 4.0);
+    // 8.0 → 12.0 へ 4 拍進んだぶん、窓も 4 拍進む。
+    assert_eq!(survivor.content_offset_beats, 6.0);
+}
+
+#[test]
+fn 真ん中を抜かれた両断片は同じcontentを別の窓で見る() {
+    let mut t = track_with_raw_clips(&[(1, 0.0, 16.0)]);
+    t.clips[0].content_id = 7;
+    t.place_clip(Clip { id: 0, start_beat: 4.0, length_beats: 4.0, content_id: 9, ..Clip::default() });
+    let mut frags: Vec<&Clip> = t.clips.iter().filter(|c| c.content_id == 7).collect();
+    frags.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+    assert_eq!(frags.len(), 2, "左右の断片が残る");
+    assert_eq!((frags[0].start_beat, frags[0].length_beats), (0.0, 4.0));
+    assert_eq!(frags[0].content_offset_beats, 0.0);
+    assert_eq!((frags[1].start_beat, frags[1].length_beats), (8.0, 8.0));
+    assert_eq!(frags[1].content_offset_beats, 8.0, "右断片は窓が 8 拍進む");
+    assert_ne!(frags[0].id, frags[1].id, "断片には別々の id が振られる");
+}
+
+#[test]
+fn 読み込み時の重なり解消は後ろのクリップが勝ち冪等() {
+    let mut t = track_with_raw_clips(&[(1, 0.0, 16.0), (2, 4.0, 4.0)]);
+    assert!(t.resolve_clip_overlaps(), "重なりがあれば変更したと報告する");
+    assert_eq!(clip_spans(&t), vec![(0.0, 4.0), (4.0, 4.0), (8.0, 8.0)]);
+    let before = t.clips.clone();
+    assert!(!t.resolve_clip_overlaps(), "2 回目は変更なし (開き直しで * が立たない)");
+    assert_eq!(t.clips, before);
+}
+
+#[test]
+fn split_content_at_は跨ぐノートを二つに割る() {
+    let mut song = Song::default();
+    let cid = song.alloc_content(
+        ClipContent::Midi(MidiContent {
+            notes: vec![
+                Note { id: 1, start_beat: 0.0, duration_beats: 8.0, pitch: 60, ..Note::default() },
+                Note { id: 2, start_beat: 8.0, duration_beats: 2.0, pitch: 62, ..Note::default() },
+            ],
+            next_note_id: 3,
+        }),
+        String::new(),
+    );
+    assert_eq!(song.split_content_at(cid, 4.0), cid, "共有されていなければ fork しない");
+    let ClipContent::Midi(m) = &song.clip_contents[&cid] else { panic!("midi") };
+    let spans: Vec<(f64, f64)> =
+        m.notes.iter().map(|n| (n.start_beat, n.duration_beats)).collect();
+    assert_eq!(spans, vec![(0.0, 4.0), (4.0, 4.0), (8.0, 2.0)]);
+    // 跨ぐ要素が無ければ何もしない (冪等)。
+    assert_eq!(song.split_content_at(cid, 4.0), cid);
+    let ClipContent::Midi(m) = &song.clip_contents[&cid] else { panic!("midi") };
+    assert_eq!(m.notes.len(), 3);
 }

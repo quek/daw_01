@@ -152,10 +152,14 @@ fn setup_clip(app: &mut AppData, track_id: u32, clip_id: u32, notes: Vec<Note>) 
         }));
     });
     let key = common::model::ClipKey { track_id, clip_id };
-    app.selection.selected_clips = vec![key];
-    // per-clip view-state accessor (zoom/scroll) は `selected_clip` を anchor key に使うので
-    // 両方セットする (未設定だと SetPianoRollScrollX 等が no-op、view state は常に default)。
-    app.selection.selected_clip = Some(key);
+    // per-clip view を **先に** 既定値で登録してから選択する。 未登録のクリップを
+    // 初めて開くと `set_clip_selection` が auto-fit してズームが変わり、
+    // px → 拍の換算が既定 (ZOOM) からずれる。
+    app.ui_prefs
+        .piano_roll_views
+        .insert(key, common::model::PianoRollViewState::default());
+    // 選択の SSoT は時間範囲 1 本 — クリップ選択はその特殊形として張り直す。
+    app.handle_event(daw_gui::app::AppEvent::SetClipSelection(vec![key]));
 }
 
 fn mk_note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
@@ -251,7 +255,7 @@ fn delete_shortcut_removes_selected_note() {
     let (mut app, _a, _p) = build_app();
     setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100)]);
     // note index 0 (clip_slot 0) = packed id 0 を選択。
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(daw_gui::app::AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
     let mut host = UiHost::<AppData>::no_redraw();
     host.shortcut_map_mut().bind("delete", "Delete");
     let mut input = pointer_input(PointerFrame {
@@ -276,10 +280,10 @@ fn note_short_click_selects() {
     drive_pointer(&mut host, &mut app, press(216.0, y, no_mods()));
     drive_pointer(&mut host, &mut app, release(217.0, y, no_mods())); // <4px → click
     assert_eq!(
-        app.selection.selected_notes,
+        app.selected_note_ids(),
         vec![AppData::pack_note_id(0, 0)],
         "note id 0 が選択される: got {:?}",
-        app.selection.selected_notes
+        app.selected_note_ids()
     );
 }
 
@@ -288,56 +292,57 @@ fn empty_marquee_plain_is_replace() {
     let (mut app, _a, _p) = build_app();
     // 既存選択を置換 (marquee が note を囲む)。note は x[184,248] y(pitch60)。
     setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100)]);
-    app.selection.selected_notes = vec![999]; // 存在しない id (置換で消える)
+    app.handle_event(daw_gui::app::AppEvent::SetNoteSelection(vec![999])); // 存在しない id (置換で消える)
     let mut host = UiHost::<AppData>::no_redraw();
     // 空白 (150,100) から note を囲む矩形へ。
     drive_pointer(&mut host, &mut app, press(150.0, 100.0, no_mods()));
     drive_pointer(&mut host, &mut app, hold(300.0, 400.0, no_mods()));
     drive_pointer(&mut host, &mut app, release(300.0, 400.0, no_mods()));
     assert_eq!(
-        app.selection.selected_notes,
+        app.selected_note_ids(),
         vec![AppData::pack_note_id(0, 0)],
         "REPLACE で note 0 のみ: got {:?}",
-        app.selection.selected_notes
+        app.selected_note_ids()
     );
 }
 
 #[test]
-fn empty_marquee_shift_is_union() {
+fn 範囲ドラッグは修飾キーに関係なく引き直す() {
+    // 選択の SSoT は範囲 1 本なので、ドラッグは常に「引き直し」。 足すのは
+    // Ctrl・Shift+**クリック** (`docs/plan_range_selection.md` §3.1)。
+    // アレンジャーの範囲ドラッグと同じ規約 (面で操作感が割れない)。
     let (mut app, _a, _p) = build_app();
     setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100), mk_note(67, 6.0, 1.0, 100)]);
-    // 既に note 1 (index 1) を選択済。Shift+marquee で note 0 を union。
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 1)];
+    app.handle_event(daw_gui::app::AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 1)]));
     let mut host = UiHost::<AppData>::no_redraw();
-    let m = modifiers(false, true, false);
-    // note 0 (x[184,248]) だけを囲む (note1 は x[440,504] で範囲外)。
-    drive_pointer(&mut host, &mut app, press(150.0, 100.0, m));
-    drive_pointer(&mut host, &mut app, hold(300.0, 400.0, m));
-    drive_pointer(&mut host, &mut app, release(300.0, 400.0, m));
-    let mut got = app.selection.selected_notes.clone();
+    for m in [modifiers(false, true, false), modifiers(true, false, false)] {
+        // note 0 (x[184,248]) だけを囲む (note1 は x[440,504] で範囲外)。
+        drive_pointer(&mut host, &mut app, press(150.0, 100.0, m));
+        drive_pointer(&mut host, &mut app, hold(300.0, 400.0, m));
+        drive_pointer(&mut host, &mut app, release(300.0, 400.0, m));
+        assert_eq!(
+            app.selected_note_ids(),
+            vec![AppData::pack_note_id(0, 0)],
+            "囲んだ note だけになる (UNION / XOR はしない)"
+        );
+    }
+}
+
+#[test]
+fn ノートの_ctrl_クリックは範囲を外接まで広げる() {
+    let (mut app, _a, _p) = build_app();
+    setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100), mk_note(67, 6.0, 1.0, 100)]);
+    app.handle_event(daw_gui::app::AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
+    app.handle_event(daw_gui::app::AppEvent::SelectNote {
+        note: AppData::pack_note_id(0, 1),
+        additive: true,
+    });
+    let mut got = app.selected_note_ids();
     got.sort_unstable();
     assert_eq!(
         got,
         vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(0, 1)],
-        "UNION で note 0 と 1: got {got:?}"
-    );
-}
-
-#[test]
-fn empty_marquee_ctrl_is_xor() {
-    let (mut app, _a, _p) = build_app();
-    setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100)]);
-    // note 0 を選択済 → Ctrl+marquee で囲むと XOR で外れる。
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
-    let mut host = UiHost::<AppData>::no_redraw();
-    let m = modifiers(true, false, false);
-    drive_pointer(&mut host, &mut app, press(150.0, 100.0, m));
-    drive_pointer(&mut host, &mut app, hold(300.0, 400.0, m));
-    drive_pointer(&mut host, &mut app, release(300.0, 400.0, m));
-    assert!(
-        app.selection.selected_notes.is_empty(),
-        "XOR で note 0 が外れる: got {:?}",
-        app.selection.selected_notes
+        "2 音とも入る: got {got:?}"
     );
 }
 
@@ -381,7 +386,7 @@ fn repro33_marquee_then_velocity_drag_all_selected() {
     drive_pointer(&mut host, &mut app, press(100.0, 100.0, no_mods()));
     drive_pointer(&mut host, &mut app, hold(460.0, 400.0, no_mods()));
     drive_pointer(&mut host, &mut app, release(460.0, 400.0, no_mods()));
-    let mut sel = app.selection.selected_notes.clone();
+    let mut sel = app.selected_note_ids();
     sel.sort_unstable();
     eprintln!("selected after marquee = {sel:?}");
     // velocity drag: note1 の bar (x=184) を press → 上端付近 (高 vel) へ。
@@ -416,10 +421,10 @@ fn repro33_velocity_same_beat_prefers_selection() {
     drive_pointer(&mut host, &mut app, hold(300.0, 400.0, no_mods()));
     drive_pointer(&mut host, &mut app, release(300.0, 400.0, no_mods()));
     assert_eq!(
-        app.selection.selected_notes,
+        app.selected_note_ids(),
         vec![AppData::pack_note_id(0, 0)],
         "pitch60 (local 0) だけ選択されるべき: got {:?}",
-        app.selection.selected_notes
+        app.selected_note_ids()
     );
     // velocity drag: 重なった bar (x=184) を掴んで上げる。選択 (pitch60) が編集されるべき。
     drive_pointer(&mut host, &mut app, press(184.0, 590.0, no_mods()));

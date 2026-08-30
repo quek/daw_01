@@ -16,6 +16,68 @@ const NOTE_MIN_LEN_BEATS: f64 = 0.0625;
 /// 消音は `on_tick` (33ms 間隔) が拾うので、それより十分長く取る。
 const NUDGE_AUDITION_LEN: std::time::Duration = std::time::Duration::from_millis(220);
 
+/// クリップ `r` で「複製の行き先」を出す。 返り値は
+/// `(content-local な行き先区間, 範囲が掛かっている鍵盤行)`。
+fn dup_dest_in_clip(
+    app: &AppData,
+    sel: &common::model::TimeSelection,
+    r: ClipKey,
+    offset: f64,
+) -> Option<((f64, f64), Vec<u8>)> {
+    let clip = app.song_doc.song().clip_by_key(r)?;
+    let dest = (
+        clip.song_to_content_beat(sel.start_beat) + offset,
+        clip.song_to_content_beat(sel.end_beat) + offset,
+    );
+    let pitches: Vec<u8> = sel
+        .lanes
+        .iter()
+        .filter_map(|l| match *l {
+            common::model::LaneRef::KeyTrack { clip, pitch } if clip == r => Some(pitch),
+            _ => None,
+        })
+        .collect();
+    Some((dest, pitches))
+}
+
+/// `locals` のノートを `offset` 拍先へ複製し、**行き先に上書き規則を当てる**。
+///
+/// `dest` は content-local な行き先区間、`pitches` は対象の鍵盤行。 クリップと同じで、
+/// 複製が乗る区間に元から居たノートは (同じ鍵盤行なら) 消える。 これが無いと、
+/// 行き先に居たノートが次の `D` で一緒に複製されて雪だるまになる (実機で報告)。
+fn duplicate_notes_over(
+    content: &mut common::model::MidiContent,
+    locals: &[u32],
+    offset: f64,
+    dest: (f64, f64),
+    pitches: &[u8],
+) {
+    let new_ids = duplicate_notes_into(content, locals, offset);
+    if new_ids.is_empty() {
+        return;
+    }
+    // 複製は index で受け取るが、この後の削除でずれるので id で追う。
+    let fresh: Vec<u32> = new_ids
+        .iter()
+        .filter_map(|&i| content.notes.get(i as usize).map(|n| n.id))
+        .collect();
+    content.notes.retain(|n| {
+        fresh.contains(&n.id)
+            || !(pitches.contains(&n.pitch)
+                && n.start_beat < dest.1
+                && n.start_beat + n.duration_beats > dest.0)
+    });
+    // 窓からはみ出す長いノートが端で複製に掛かるケースは重なり解消に任せる。
+    let moved: Vec<u32> = content
+        .notes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| fresh.contains(&n.id))
+        .map(|(i, _)| u32::try_from(i).unwrap_or(u32::MAX))
+        .collect();
+    resolve_note_overlaps(&mut content.notes, &moved);
+}
+
 impl AppData {
     /// 選択中ノートを clipboard envelope (`ClipboardPayload::Notes`) JSON に。
     /// 何も copy できない (選択無し / クリップ未選択 / シリアライズ失敗) 場合は `None`。
@@ -23,14 +85,14 @@ impl AppData {
     /// 時間は選択群の最早 start を 0 とした相対に正規化する (paste でマウス拍に置く)。
     pub fn copy_notes_clip(&self) -> Option<(String, usize)> {
         let r = self.selected_clip_ref()?;
-        if self.selection.selected_notes.is_empty() {
+        if self.selected_note_ids().is_empty() {
             return None;
         }
         let track = self.song_doc.song().track_by_id(r.track_id)?;
         let clip = track.clip_by_id(r.clip_id)?;
         let notes = self.song_doc.song().clip_notes(clip);
         let mut copied: Vec<Note> = self
-            .selection.selected_notes
+            .selected_note_ids()
             .iter()
             .filter_map(|i| notes.get(*i as usize).cloned())
             .collect();
@@ -94,7 +156,7 @@ impl AppData {
             return 0;
         };
         // selected_notes は packed note id。貼り付け先 (anchor) clip の slot で pack。
-        self.selection.selected_notes = self.pack_clip_selection(r, &local_sel);
+        self.set_note_selection(&(self.pack_clip_selection(r, &local_sel)));
         count
     }
 
@@ -150,11 +212,11 @@ impl AppData {
     pub(crate) fn quantize_selected_notes(&mut self, div: u8) {
         // 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
         // 量子化。重なりは edit_clip_notes が解消し選択 (packed) を remap で追従。
-        if self.selection.selected_notes.is_empty() {
+        if self.selected_note_ids().is_empty() {
             return;
         }
         let div = div.max(1) as f64;
-        let selected = self.selection.selected_notes.clone();
+        let selected = self.selected_note_ids();
         self.for_each_note_clip_group(
             selected.into_iter().map(|id| (id, ())),
             |app, slot, r, items| {
@@ -213,8 +275,8 @@ impl AppData {
     /// やる** のが要点で、 ロック中の音が端に居るせいで選択全体が動かない、 を防ぐ。
     fn editable_selected_notes(&self) -> Vec<(u32, f64, f64, u8)> {
         let shown = self.shown_pianoroll_clips();
-        let mut out = Vec::with_capacity(self.selection.selected_notes.len());
-        for &id in &self.selection.selected_notes {
+        let mut out = Vec::with_capacity(self.selected_note_ids().len());
+        for &id in &self.selected_note_ids() {
             let Some((r, local)) = Self::decode_note_id_in(&shown, id) else {
                 continue;
             };
@@ -421,7 +483,7 @@ impl AppData {
     /// 選択のアンカー (= `selected_notes` の末尾、`SetNoteSelection` が anchor として扱う音) を
     /// `(packed id, 所属 ClipKey, start_beat, duration_beats, pitch)` で返す。
     fn anchor_selected_note(&self) -> Option<(u32, ClipKey, f64, f64, u8)> {
-        let &id = self.selection.selected_notes.last()?;
+        let &id = self.selected_note_ids().last()?;
         let shown = self.shown_pianoroll_clips();
         let (r, local) = Self::decode_note_id_in(&shown, id)?;
         let clip = self
@@ -490,13 +552,11 @@ impl AppData {
 
     // -------- Note operations ----------------------------------------------
 
+    /// ノートを選択する (`additive` = Ctrl・Shift+クリックで足す)。
+    /// 選択の SSoT は範囲 1 本なので、範囲を張り直す / 外接まで広げるだけ
+    /// (`docs/plan_range_selection.md` §1)。
     pub(crate) fn select_note(&mut self, note: u32, additive: bool) {
-        if !additive {
-            self.selection.selected_notes.clear();
-        }
-        if !self.selection.selected_notes.contains(&note) {
-            self.selection.selected_notes.push(note);
-        }
+        self.select_note_in_range(note, additive);
     }
 
     // -------- Phase 7 B5 (`docs/plan_scale.html`): Scale operations -------
@@ -564,7 +624,7 @@ impl AppData {
         let snaps: Vec<(u32, u8)> = {
             let notes = self.song_doc.song().clip_notes(clip);
             let target_indices: Vec<u32> = match target {
-                QuantizePitchTarget::SelectedNotes => self.selection.selected_notes.clone(),
+                QuantizePitchTarget::SelectedNotes => self.selected_note_ids(),
                 QuantizePitchTarget::SelectedClipAllNotes => {
                     (0..notes.len() as u32).collect()
                 }
@@ -596,6 +656,8 @@ impl AppData {
         // pitch 補正で異なる pitch が同一 pitch に丸まると同一ピッチの
         // 重なりが生じ得るので、補正した note を勝者として重なり解消する。
         let winners: Vec<u32> = snaps.iter().map(|&(i, _)| i).collect();
+        // 選択は範囲からの導出なので、編集の**前**に捕まえる。
+        let sel = self.selected_note_ids();
         let remap = self
             .edit_song(move |song| {
                 let notes = song.notes_in_clip_mut(r)?;
@@ -608,8 +670,7 @@ impl AppData {
             })
             .flatten();
         if let Some(remap) = remap {
-            let sel = std::mem::take(&mut self.selection.selected_notes);
-            self.selection.selected_notes = remap_indices(&remap, &sel);
+            self.set_note_selection(&(remap_indices(&remap, &sel)));
         }
         self.ui_ephemeral.status_message =
             format!("{count} 件の note を scale に補正しました");
@@ -668,15 +729,11 @@ impl AppData {
         }) else {
             return;
         };
-        // 新規ノートは「対象クリップ」(= anchor) へ入る。anchor をこのクリップに
-        // 揃えるが、複数選択 (selected_clips) は **縮小しない** (複数同時表示を保持)。対象が
-        // まだ選択集合に無ければ追加する (他クリップは残す)。
-        self.selection.selected_clip = Some(key);
-        if !self.selection.selected_clips.contains(&key) {
-            self.selection.selected_clips.push(key);
-        }
+        // 新規ノートは「対象クリップ」へ入る。 focus をこのクリップに揃えるだけで
+        // 選択 (範囲) は縮小しない (複数同時表示を保持)。
+        self.ui_ephemeral.pianoroll_focus_clip = Some(key);
         // 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
-        self.selection.selected_notes = self.pack_clip_selection(key, &selected);
+        self.set_note_selection(&(self.pack_clip_selection(key, &selected)));
         self.ui_prefs.last_note_duration_beats = duration;
     }
 
@@ -754,47 +811,101 @@ impl AppData {
         }
     }
 
-    /// ピアノロールで選択中ノート (`selected_notes`) を複製する (D キー)。
-    /// 複製は選択範囲の beat span ぶん後ろにずらし、元ノートは据え置き、
-    /// 複製を新しい選択にする (連打で後方へ連鎖)。selected_clip 無し /
-    /// 選択空 / clip 解決失敗なら no-op。
+    /// ピアノロールの D = **範囲を 1 つ後ろへ複製**する
+    /// (`docs/plan_range_selection.md` §6)。
+    ///
+    /// 送る量は**選択範囲の長さ**で、ノートの外接 span ではない。 裏拍のパターンは
+    /// 頭と尻に空白があるので、外接 span で送ると 1 回ごとに詰まってグリッドから
+    /// 外れる (実機で報告された症状)。 範囲そのものも同じだけ後ろへ動くので、
+    /// D 連打でパターンが後方へ連鎖する。
+    ///
+    /// 行き先が窓 (クリップ) の外へ出るなら**窓を伸ばして**鳴るようにする。
+    /// 伸ばせるのは隣のクリップの手前まで (`Track::clips` の非重なり不変条件)。
     pub(crate) fn duplicate_selected_notes(&mut self) {
-        // 選択 (packed) を所属クリップごとに複製。各クリップ内でその選択分の
-        // beat span ぶん後ろへずらす (元は据え置き)。新しい選択 = 全クリップの複製 (packed)。
-        if self.selection.selected_notes.is_empty() {
+        let Some(sel) = self.selection.time.clone() else {
+            return;
+        };
+        let offset = sel.len_beats();
+        let selected: Vec<u32> = self.selected_note_ids();
+        if selected.is_empty() || offset <= f64::EPSILON {
             return;
         }
-        let selected: Vec<u32> = self.selection.selected_notes.clone();
-        let mut new_selection: Vec<u32> = Vec::new();
+        // クリップごとの `edit_song` + 窓伸ばしで snapshot が何段も積まれるので、
+        // 1 回の D を **1 undo step** に畳む (`J` と同じ扱い)。
+        self.song_doc.begin_gesture();
         self.for_each_note_clip_group(
             selected.into_iter().map(|id| (id, ())),
-            |app, slot, r, items| {
+            |app, _slot, r, items| {
                 let locals: Vec<u32> = items.iter().map(|&(local, ())| local as u32).collect();
-                let packed = app.edit_song(move |song| {
-                    let Some(content) =
-                        midi_content_in_clip_mut(song, r)
-                    else {
-                        return Vec::new();
-                    };
-                    let new_ids = duplicate_notes_into(content, &locals);
-                    if new_ids.is_empty() {
-                        return Vec::new();
+                let Some((dest, pitches)) = dup_dest_in_clip(app, &sel, r, offset) else {
+                    return;
+                };
+                app.edit_song(move |song| {
+                    if let Some(content) = midi_content_in_clip_mut(song, r) {
+                        duplicate_notes_over(content, &locals, offset, dest, &pitches);
                     }
-                    // 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
-                    let remap = resolve_note_overlaps(&mut content.notes, &new_ids);
-                    remap_indices(&remap, &new_ids)
-                        .into_iter()
-                        .map(|nid| Self::pack_note_id(slot, nid as usize))
-                        .collect::<Vec<u32>>()
                 });
-                if let Some(packed) = packed {
-                    new_selection.extend(packed);
-                }
             },
         );
-        if !new_selection.is_empty() {
-            self.selection.selected_notes = new_selection;
+        self.extend_clips_to_cover(&sel, offset);
+        self.song_doc.end_gesture();
+        // 範囲を 1 つ後ろへ送る。 選択されたノートは範囲から導出されるので、
+        // これだけで「複製が新しい選択」になる。
+        if let Some(t) = self.selection.time.as_mut() {
+            t.start_beat += offset;
+            t.end_beat += offset;
         }
+        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+    }
+
+    /// 範囲を `offset` 拍後ろへ複製したときに、行き先が窓の外へ出るクリップの
+    /// 窓を伸ばす。 伸ばせるのは**隣のクリップの手前まで**。
+    fn extend_clips_to_cover(&mut self, sel: &common::model::TimeSelection, offset: f64) {
+        let need_end = sel.end_beat + offset;
+        let clips: Vec<ClipKey> = sel
+            .lanes
+            .iter()
+            .filter_map(|l| match l {
+                common::model::LaneRef::KeyTrack { clip, .. } => Some(*clip),
+                _ => None,
+            })
+            .fold(Vec::new(), |mut acc, k| {
+                if !acc.contains(&k) {
+                    acc.push(k);
+                }
+                acc
+            });
+        if clips.is_empty() {
+            return;
+        }
+        self.edit_song(move |song| {
+            for key in clips {
+                let Some(track) = song.track_by_id_mut(key.track_id) else {
+                    continue;
+                };
+                let Some(cur) = track.clip_by_id(key.clip_id).map(common::model::Clip::song_window)
+                else {
+                    continue;
+                };
+                if cur.1 >= need_end {
+                    continue;
+                }
+                // 直後のクリップの頭が上限 (削って広げたりはしない)。
+                let limit = track
+                    .clips
+                    .iter()
+                    .filter(|c| c.id != key.clip_id && c.start_beat >= cur.1)
+                    .map(|c| c.start_beat)
+                    .fold(f64::INFINITY, f64::min);
+                let next_end = need_end.min(limit);
+                if next_end <= cur.1 {
+                    continue;
+                }
+                if let Some(clip) = track.clip_by_id_mut(key.clip_id) {
+                    clip.length_beats = next_end - clip.start_beat;
+                }
+            }
+        });
     }
 
     /// gui_01 #054 (Ctrl+drag コピー): `entries` = [(source note index,
@@ -834,7 +945,7 @@ impl AppData {
             },
         );
         if !new_selection.is_empty() {
-            self.selection.selected_notes = new_selection;
+            self.set_note_selection(&(new_selection));
         }
     }
 
@@ -856,17 +967,17 @@ impl AppData {
         let Some(remap) = remap else {
             return;
         };
-        let sel = std::mem::take(&mut self.selection.selected_notes);
-        self.selection.selected_notes = remap_indices(&remap, &sel);
+        let sel = self.selected_note_ids();
+        self.set_note_selection(&(remap_indices(&remap, &sel)));
     }
 
     pub(crate) fn delete_selected_notes(&mut self) {
         // 選択 (packed) を所属クリップごとに分配し、各クリップ内で index 降順に
         // remove (削除で後続 index がずれない)。複数クリップに跨る選択をまとめて消す。
-        if self.selection.selected_notes.is_empty() {
+        if self.selected_note_ids().is_empty() {
             return;
         }
-        let ids = std::mem::take(&mut self.selection.selected_notes);
+        let ids = self.selected_note_ids();
         self.for_each_note_clip_group(
             ids.into_iter().map(|id| (id, ())),
             |app, _slot, r, items| {
@@ -1038,4 +1149,87 @@ impl AppData {
         });
     }
 
+}
+
+impl AppData {
+    /// ピアノロールの `j` = **Join Notes** (Live §10.5.8.3 の `Ctrl+J`)。
+    ///
+    /// 選択中のノートのうち**同じピッチのもの**を 1 本に繋げる。 結果は
+    /// 「最も早い開始 〜 最も遅い終了」 の 1 ノートで、ベロシティ / 歌詞 / mute は
+    /// 最も早いノートのものを引き継ぐ (間に隙間があっても 1 本に繋がる — Live と同じ)。
+    /// 同じピッチのノートが 2 本未満のピッチは何もしない。
+    ///
+    /// アレンジャーの `j` (= 範囲を 1 クリップへ焼き込む) とはビューで意味が分かれる
+    /// (`docs/plan_range_selection.md` §7.4)。
+    pub(crate) fn action_join_selected_notes(&mut self) {
+        let selected = self.selected_note_ids();
+        if selected.len() < 2 {
+            self.ui_ephemeral.status_message =
+                "Join: 同じ音のノートを 2 つ以上選択してください".into();
+            return;
+        }
+        let mut joined = 0usize;
+        self.for_each_note_clip_group(
+            selected.into_iter().map(|id| (id, ())),
+            |app, _slot, key, items| {
+                let indices: Vec<usize> = items.iter().map(|(i, ())| *i).collect();
+                app.edit_song_checked(|song| {
+                    let Some(notes) = song.notes_in_clip_mut(key) else {
+                        return false;
+                    };
+                    // ピッチごとに「開始が最も早いノート」へ畳み込む。
+                    let mut by_pitch: std::collections::BTreeMap<u8, Vec<usize>> =
+                        std::collections::BTreeMap::new();
+                    for i in &indices {
+                        if let Some(n) = notes.get(*i) {
+                            by_pitch.entry(n.pitch).or_default().push(*i);
+                        }
+                    }
+                    let mut drop: Vec<usize> = Vec::new();
+                    let mut changed = false;
+                    for (_, mut group) in by_pitch {
+                        if group.len() < 2 {
+                            continue;
+                        }
+                        group.sort_by(|a, b| {
+                            notes[*a].start_beat.total_cmp(&notes[*b].start_beat)
+                        });
+                        let start = group
+                            .iter()
+                            .map(|i| notes[*i].start_beat)
+                            .fold(f64::INFINITY, f64::min);
+                        let end = group
+                            .iter()
+                            .map(|i| notes[*i].start_beat + notes[*i].duration_beats)
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let keep = group[0];
+                        notes[keep].start_beat = start;
+                        notes[keep].duration_beats = (end - start).max(0.0);
+                        drop.extend(group.into_iter().skip(1));
+                        changed = true;
+                    }
+                    if !changed {
+                        return false;
+                    }
+                    // index が動かないよう後ろから削る。
+                    drop.sort_unstable();
+                    drop.dedup();
+                    for i in drop.into_iter().rev() {
+                        if i < notes.len() {
+                            notes.remove(i);
+                        }
+                    }
+                    notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                    true
+                });
+                joined += 1;
+            },
+        );
+        // (選択は範囲 1 本なので、ノートを結合しても指す先は変わらない。 捨てない。)
+        self.ui_ephemeral.status_message = if joined == 0 {
+            "Join: 同じ音のノートが 2 つ以上ありません".into()
+        } else {
+            "Join: ノートを結合しました".into()
+        };
+    }
 }

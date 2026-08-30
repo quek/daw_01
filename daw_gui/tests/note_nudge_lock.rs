@@ -67,8 +67,7 @@ fn setup_tracks(app: &mut AppData, specs: &[Vec<Note>]) -> Vec<ClipKey> {
 }
 
 fn show_clips(app: &mut AppData, keys: &[ClipKey]) {
-    app.selection.selected_clips = keys.to_vec();
-    app.selection.selected_clip = keys.last().copied();
+    app.handle_event(AppEvent::SetClipSelection(keys.to_vec()));
 }
 
 fn notes_of(app: &AppData, track: usize) -> Vec<Note> {
@@ -157,8 +156,10 @@ fn locked_track_rejects_new_notes_from_every_path() {
         app.ui_ephemeral.status_message
     );
 
-    // (b) 貼り付け (対象 = anchor クリップ = ロック中トラック)
-    app.selection.selected_clip = Some(keys[0]);
+    // (b) 貼り付け (対象 = focus クリップ = ロック中トラック)。
+    // 選択 (範囲) は両クリップを覆ったまま、focus だけをロック中クリップへ寄せる —
+    // ロックは「複数表示中に他トラックを守る」 機構なので、表示集合は縮めない。
+    app.handle_event(AppEvent::SetPianoRollTargetClip(keys[0]));
     assert_eq!(app.paste_notes_at(vec![mk_note(62, 0.0, 1.0)], 4.0), 0, "貼り付けも拒否される");
     assert!(notes_of(&app, 0).is_empty());
 
@@ -184,7 +185,7 @@ fn arrow_moves_selection_by_one_grid_step() {
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 1.0, 1.0)]]);
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Grid, steps: 1 });
     assert!((notes_of(&app, 0)[0].start_beat - 1.25).abs() < 1e-9, "1/16 = 0.25 拍 右へ");
@@ -209,8 +210,7 @@ fn chord_keeps_its_shape_at_the_left_edge() {
     );
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
-    app.selection.selected_notes =
-        (0..3).map(|i| AppData::pack_note_id(0, i)).collect();
+    app.handle_event(AppEvent::SetNoteSelection((0..3).map(|i| AppData::pack_note_id(0, i)).collect()));
 
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Bar, steps: -1 });
     let starts: Vec<f64> = notes_of(&app, 0).iter().map(|n| n.start_beat).collect();
@@ -231,7 +231,7 @@ fn arrow_transposes_by_semitone_and_octave() {
     let mut app = build_app();
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 1.0, 1.0), mk_note(120, 2.0, 1.0)]]);
     show_clips(&mut app, &keys);
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNotePitch { octave: false, steps: 1 });
     assert_eq!(notes_of(&app, 0)[0].pitch, 61, "半音上");
@@ -239,8 +239,7 @@ fn arrow_transposes_by_semitone_and_octave() {
     assert_eq!(notes_of(&app, 0)[0].pitch, 49, "1 オクターブ下");
 
     // 2 音選択で上端に当てる: pitch 120 が 127 に当たるので delta 全体が縮む。
-    app.selection.selected_notes =
-        vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(0, 1)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(0, 1)]));
     app.handle_event(AppEvent::NudgeSelectedNotePitch { octave: true, steps: 1 });
     let pitches: Vec<u8> = notes_of(&app, 0).iter().map(|n| n.pitch).collect();
     assert_eq!(pitches, vec![56, 127], "上端に当たった分だけ delta を縮める (相対 7 半音を維持)");
@@ -256,7 +255,7 @@ fn arrow_walks_the_scale_when_folded() {
         song.scale_changes.push(ScaleChange { beat: 0.0, root: 0, scale: Scale::Major });
     });
     app.ui_prefs.piano_roll_fold = true;
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNotePitch { octave: false, steps: 1 });
     assert_eq!(notes_of(&app, 0)[0].pitch, 62, "C → D (C# は飛ばす)");
@@ -275,8 +274,7 @@ fn ctrl_arrow_resizes_notes_as_a_set() {
         setup_tracks(&mut app, &[vec![mk_note(60, 0.0, 1.0), mk_note(64, 4.0, 0.5)]]);
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
-    app.selection.selected_notes =
-        vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(0, 1)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(0, 1)]));
 
     app.handle_event(AppEvent::NudgeSelectedNoteLength { step: NudgeStep::Grid, steps: 1 });
     let lens: Vec<f64> = notes_of(&app, 0).iter().map(|n| n.duration_beats).collect();
@@ -303,7 +301,7 @@ fn nudge_may_push_notes_outside_the_clip_window() {
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 31.5, 1.0)]]); // clip 長 32 拍の末尾
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Bar, steps: 2 });
     assert!(
@@ -332,8 +330,7 @@ fn locked_notes_do_not_hold_back_the_rest_of_the_selection() {
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
     app.handle_event(AppEvent::TogglePianoRollTrackLock(1));
-    app.selection.selected_notes =
-        vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(1, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0), AppData::pack_note_id(1, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Bar, steps: -1 });
     assert!(
@@ -354,7 +351,7 @@ fn consecutive_nudges_collapse_into_one_undo_step() {
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 4.0, 1.0)]]);
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     let before = app.song_doc.history_current();
     for _ in 0..8 {
@@ -379,7 +376,7 @@ fn nudge_at_the_edge_does_not_push_undo_steps() {
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 0.0, 1.0)]]);
     show_clips(&mut app, &keys);
     enable_grid(&mut app);
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     let before = app.song_doc.history_current();
     for _ in 0..5 {
@@ -409,7 +406,7 @@ fn fine_step_is_one_sixteenth_of_the_grid() {
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 4.0, 1.0)]]);
     show_clips(&mut app, &keys);
     enable_grid(&mut app); // 1/16 = 0.25 拍 → fine = 0.015625 拍
-    app.selection.selected_notes = vec![AppData::pack_note_id(0, 0)];
+    app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Fine, steps: 1 });
     assert!(

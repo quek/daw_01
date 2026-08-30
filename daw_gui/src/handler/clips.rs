@@ -3,7 +3,7 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use common::model::{AudioContent, AudioEvent, Clip, ClipContent, MidiContent, Note};
+use common::model::{Clip, ClipContent};
 
 impl AppData {
     /// Clip の左右端 trim ハンドラ。 caller (arrangement widget) は
@@ -50,12 +50,20 @@ impl AppData {
                 clip.start_beat = new_start_beat;
                 clip.length_beats = new_length_beats;
                 clip.content_offset_beats += delta_start;
-                Some((
+                let out = (
                     clip.content_id,
                     prev_start_beat,
                     prev_length_beats,
                     clip.content_offset_beats,
-                ))
+                );
+                // 伸ばした先に居た隣のクリップを上書き規則で削る (自分自身は除く)。
+                // `Track.clips` の非重なり不変条件は trim でも保たれる。
+                track.carve_clip_range(
+                    new_start_beat,
+                    new_start_beat + new_length_beats,
+                    Some(target.clip_id),
+                );
+                Some(out)
             })
         else {
             return;
@@ -180,176 +188,6 @@ impl AppData {
         });
     }
 
-    /// 共有コピー (D shortcut): 末尾直後 (start+length) に同サイズの clip を
-    /// 1 つ生成、 `content_id` を流用。 `docs/plan_clip_share_clone.md` §3.2。
-    /// 選択 clip 群の bounding span (`max_end - min_start`)。 複製を選択ブロック
-    /// 直後に並べるためのオフセット (相対位置を保ったままブロック複製)。 単一
-    /// clip では clip 長と一致する (= 旧 single duplicate と同挙動)。 解決でき
-    /// ない stale ref は無視、 有効 clip が 1 つも無ければ `None`。
-    pub(crate) fn clip_block_span(&self, sources: &[ClipKey]) -> Option<f64> {
-        let mut min_start = f64::MAX;
-        let mut max_end = f64::MIN;
-        for &src in sources {
-            let Some(clip) = self
-                .song_doc.song()
-                .track_by_id(src.track_id)
-                .and_then(|t| t.clip_by_id(src.clip_id))
-            else {
-                continue;
-            };
-            min_start = min_start.min(clip.start_beat);
-            max_end = max_end.max(clip.start_beat + clip.length_beats);
-        }
-        (max_end >= min_start).then_some(max_end - min_start)
-    }
-
-    /// `source` の共有コピーを `new_start_beat` に 1 つ生成し、 新 `ClipKey` を
-    /// 返す (選択・sync は呼び出し側)。 同 `content_id` を流用 → 名前 (content_id
-    /// 単位 SSoT) も共有、 色 (per-clip) は source 引き継ぎ。
-    pub(crate) fn duplicate_one_clip_shared_at(
-        &mut self,
-        source: ClipKey,
-        new_start_beat: f64,
-    ) -> Option<ClipKey> {
-        let src_clip = self
-            .song_doc.song()
-            .track_by_id(source.track_id)?
-            .clip_by_id(source.clip_id)?;
-        let new_length = src_clip.length_beats;
-        let content_id = src_clip.content_id;
-        // trim 済み clip の複製は **同じ窓** を見せる (r.md #44)。
-        let src_offset = src_clip.content_offset_beats;
-        let src_color = src_clip.color;
-        // mute 状態も複製先へ引き継ぐ (color / 声 と同様)。
-        let src_muted = src_clip.muted;
-        // per-clip 声を複製先へ引き継ぐ。
-        let src_speaker = src_clip.speaker_id;
-        let src_singer = src_clip.singer_name.clone();
-        let src_style = src_clip.style_name.clone();
-        let src_talk = src_clip.talk;
-        let new_clip_id = self.edit_song(move |song| {
-            let track = song.track_by_id_mut(source.track_id)?;
-            let new_clip_id = track.alloc_clip_id();
-            track.clips.push(Clip {
-                id: new_clip_id,
-                start_beat: new_start_beat,
-                length_beats: new_length,
-                content_id,
-                content_offset_beats: src_offset,
-                color: src_color,
-                auto_lipsync: false,
-                lipsync_gen: 0,
-                muted: src_muted,
-                speaker_id: src_speaker,
-                singer_name: src_singer,
-                style_name: src_style,
-                talk: src_talk,
-            });
-            Some(new_clip_id)
-        })??;
-        Some(ClipKey { track_id: source.track_id, clip_id: new_clip_id })
-    }
-
-    /// `source` の独立コピー (content を deep clone + 新 ContentId 採番) を
-    /// `new_start_beat` に 1 つ生成し、 新 `ClipKey` を返す。 §3.3。
-    pub(crate) fn duplicate_one_clip_unique_at(
-        &mut self,
-        source: ClipKey,
-        new_start_beat: f64,
-    ) -> Option<ClipKey> {
-        let src_clip = self
-            .song_doc.song()
-            .track_by_id(source.track_id)?
-            .clip_by_id(source.clip_id)?;
-        let new_length = src_clip.length_beats;
-        let src_content_id = src_clip.content_id;
-        // content は fork するが窓 (offset) は同じものを見せる。
-        let src_offset = src_clip.content_offset_beats;
-        let src_color = src_clip.color;
-        // mute 状態も複製先へ引き継ぐ。
-        let src_muted = src_clip.muted;
-        // per-clip 声を複製先へ引き継ぐ。
-        let src_speaker = src_clip.speaker_id;
-        let src_singer = src_clip.singer_name.clone();
-        let src_style = src_clip.style_name.clone();
-        let src_talk = src_clip.talk;
-        let new_clip_id = self.edit_song(move |song| {
-            let new_content_id = song.fork_content(src_content_id);
-            let track = song.track_by_id_mut(source.track_id)?;
-            let new_clip_id = track.alloc_clip_id();
-            track.clips.push(Clip {
-                id: new_clip_id,
-                start_beat: new_start_beat,
-                length_beats: new_length,
-                content_id: new_content_id,
-                content_offset_beats: src_offset,
-                color: src_color,
-                auto_lipsync: false,
-                lipsync_gen: 0,
-                muted: src_muted,
-                speaker_id: src_speaker,
-                singer_name: src_singer,
-                style_name: src_style,
-                talk: src_talk,
-            });
-            Some(new_clip_id)
-        })??;
-        Some(ClipKey { track_id: source.track_id, clip_id: new_clip_id })
-    }
-
-    /// 選択 clip 群をまとめて共有複製 (D shortcut)。 選択ブロック span
-    /// だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じセマンティ
-    /// クス)、 複製群を選択にする。 D 連打で後方連鎖する。
-    pub(crate) fn duplicate_clips_shared(&mut self, sources: &[ClipKey]) {
-        let Some(offset) = self.clip_block_span(sources) else {
-            return;
-        };
-        let mut new_refs = Vec::with_capacity(sources.len());
-        for &src in sources {
-            let Some(new_start) = self
-                .song_doc.song()
-                .track_by_id(src.track_id)
-                .and_then(|t| t.clip_by_id(src.clip_id))
-                .map(|c| c.start_beat + offset)
-            else {
-                continue;
-            };
-            if let Some(r) = self.duplicate_one_clip_shared_at(src, new_start) {
-                new_refs.push(r);
-            }
-        }
-        if !new_refs.is_empty() {
-            self.select_new_clips(&new_refs);
-            self.selection.selected_notes.clear();
-        }
-    }
-
-    /// 選択 clip 群をまとめて独立複製 (Alt+D shortcut)。 配置・選択は
-    /// `duplicate_clips_shared` と同じ、 各 clip の content を独立化する点が違う。
-    pub(crate) fn duplicate_clips_unique(&mut self, sources: &[ClipKey]) {
-        let Some(offset) = self.clip_block_span(sources) else {
-            return;
-        };
-        let mut new_refs = Vec::with_capacity(sources.len());
-        for &src in sources {
-            let Some(new_start) = self
-                .song_doc.song()
-                .track_by_id(src.track_id)
-                .and_then(|t| t.clip_by_id(src.clip_id))
-                .map(|c| c.start_beat + offset)
-            else {
-                continue;
-            };
-            if let Some(r) = self.duplicate_one_clip_unique_at(src, new_start) {
-                new_refs.push(r);
-            }
-        }
-        if !new_refs.is_empty() {
-            self.select_new_clips(&new_refs);
-            self.selection.selected_notes.clear();
-        }
-    }
-
     /// arrangement Ctrl+drag → release: 各 (source, drop_start_beat) で
     /// 共有コピーを生成。 元 clip 群はそのまま、 selected_clips は新 clip
     /// 群に置き換える (drag 後に選択が新 clip に移るのは MoveClips と同じ semantics)。
@@ -386,13 +224,15 @@ impl AppData {
                 let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
                     continue;
                 };
-                let new_clip_id = to_track.alloc_clip_id();
-                to_track.clips.push(Clip {
-                    id: new_clip_id,
+                let new_clip_id = to_track.place_clip(Clip {
+                    id: 0,
                     start_beat: drop_start.max(0.0),
                     length_beats: new_length,
                     content_id,
                     content_offset_beats: src_offset,
+                    // 新規クリップにクロスフェードの張り出しは無い。
+                    xfade_lead_beats: 0.0,
+                    xfade_tail_beats: 0.0,
                     color: src_color,
                     auto_lipsync: false,
                     lipsync_gen: 0,
@@ -410,7 +250,6 @@ impl AppData {
         };
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selection.selected_notes.clear();
         }
     }
 
@@ -448,13 +287,15 @@ impl AppData {
                 let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
                     continue;
                 };
-                let new_clip_id = to_track.alloc_clip_id();
-                to_track.clips.push(Clip {
-                    id: new_clip_id,
+                let new_clip_id = to_track.place_clip(Clip {
+                    id: 0,
                     start_beat: drop_start.max(0.0),
                     length_beats: new_length,
                     content_id: new_content_id,
                     content_offset_beats: src_offset,
+                    // 新規クリップにクロスフェードの張り出しは無い。
+                    xfade_lead_beats: 0.0,
+                    xfade_tail_beats: 0.0,
                     color: src_color,
                     auto_lipsync: false,
                     lipsync_gen: 0,
@@ -472,7 +313,6 @@ impl AppData {
         };
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selection.selected_notes.clear();
         }
     }
 
@@ -487,11 +327,8 @@ impl AppData {
     pub(crate) fn make_clip_unique(&mut self, target: ClipKey) {
         // 対象集合: 複数選択があれば選択全体を、 無ければ右クリックした clip 単体を
         // 独立化する (Auto-Fade / Auto-Crossfade と同じ「選択集合に効く」idiom)。
-        let targets: Vec<ClipKey> = if self.selection.selected_clips.is_empty() {
-            vec![target]
-        } else {
-            self.selected_clip_refs()
-        };
+        let selected = self.selected_clip_refs();
+        let targets: Vec<ClipKey> = if selected.is_empty() { vec![target] } else { selected };
         // status message 用: 「他と共有していて独立化される」clip 数を編集前に数える。
         // (逐次 fork では共有群の最後の 1 つは fork せず独立になるので、 fork 回数だと
         // 1 つ少なく報告してしまう。 元の refcount で「独立化される clip」を数える。)
@@ -548,15 +385,17 @@ impl AppData {
             song.clip_contents.insert(content_id, ClipContent::default());
             let track = song.tracks.get_mut(track_idx as usize)?;
             let track_id = track.id;
-            let new_clip_id = track.alloc_clip_id();
             let (speaker_id, singer_name, style_name) = inherited_voice(track);
-            track.clips.push(Clip {
-                id: new_clip_id,
+            let new_clip_id = track.place_clip(Clip {
+                id: 0,
                 start_beat,
                 length_beats: DEFAULT_CLIP_LENGTH,
                 content_id,
                 // 新規 clip は content 先頭から見せる。
                 content_offset_beats: 0.0,
+                // 新規クリップにクロスフェードの張り出しは無い。
+                xfade_lead_beats: 0.0,
+                xfade_tail_beats: 0.0,
                 color: None,
                 auto_lipsync: false,
                 lipsync_gen: 0,
@@ -575,20 +414,23 @@ impl AppData {
             return;
         };
         self.set_single_clip_selection(r);
-        self.selection.selected_notes.clear();
         self.select_track(r.track_id);
     }
 
+    /// ランチャー (セッション) のセルを削除する。
+    ///
+    /// アレンジのクリップは**範囲操作**で消える (`apply_delete_time_selection`)。
+    /// セルはグリッドに時間軸が無く範囲では表せないので、唯一のオブジェクト選択
+    /// (`selected_launcher_cells`) をそのまま対象にする。
     pub(crate) fn delete_selected_clip(&mut self) {
-        if self.selection.selected_clips.is_empty() {
+        if self.selection.selected_launcher_cells.is_empty() {
             return;
         }
         // 住所は安定 id 1 本なので、アレンジのクリップも**ランチャーのセル**も
         // 同じループで消える (`Track::remove_clip_by_id` がどちらの Vec に居るかを
         // 解決する)。index 時代に必要だった「高 index から消して詰まりを避ける」
         // 儀式も、セル専用の第 2 ループも要らない。
-        let targets: Vec<ClipKey> = self.selected_clip_refs();
-        self.selection.selected_clips.clear();
+        let targets: Vec<ClipKey> = self.selection.selected_launcher_cells.clone();
         self.edit_song(|song| {
             let mut removed_cell = false;
             for target in &targets {
@@ -601,8 +443,8 @@ impl AppData {
                 song.normalize_session();
             }
         });
-        self.selection.selected_clip = None;
-        self.selection.selected_notes.clear();
+        self.selection.selected_launcher_cells.clear();
+        self.selection.launcher_cell_anchor = None;
     }
 
     /// Split clip(s) at the cursor (= mouse hover beat).
@@ -657,7 +499,7 @@ impl AppData {
         // Build targets list. Prefer hover clip, fall back to selection.
         let targets: Vec<ClipKey> = if let Some(hover) = self.ui_ephemeral.arrangement_hover_clip {
             vec![hover]
-        } else if !self.selection.selected_clips.is_empty() {
+        } else if self.selection.time.is_some() {
             self.selected_clip_refs()
         } else {
             self.ui_ephemeral.status_message =
@@ -678,7 +520,6 @@ impl AppData {
         }
         if !new_selection.is_empty() {
             self.select_new_clips(&new_selection);
-            self.selection.selected_notes.clear();
         }
         self.ui_ephemeral.status_message = format!("Split: {split_count} clip を分割しました");
     }
@@ -803,7 +644,7 @@ impl AppData {
 
         // 選択は後半 event (= ユーザーは「分割直後に新規 event を編集
         // したい」 ことが多い、 Reaper / Bitwig 流)。
-        self.selection.audio_editor_selected_events = vec![event_idx + 1];
+        self.set_audio_event_selection(&[event_idx + 1]);
         self.ui_ephemeral.status_message = "Split: event を分割しました".into();
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
@@ -811,332 +652,68 @@ impl AppData {
         true
     }
 
-    /// Single-clip split helper. Returns `true` iff the playhead lay
-    /// strictly inside the clip and the split actually happened. The
-    /// new (back-half) clip is appended to `new_selection` so the
-    /// caller can update the selection afterwards.
+    /// クリップを `playhead` で 2 つに割る。 返り値は実際に分割したか
+    /// (端ぴったり / 範囲外なら `false`)。
+    ///
+    /// **content は切り口だけを切り、窓を 2 つに割る** (`docs/plan_range_selection.md` §10)。
+    /// `playhead` を跨ぐ note / event は [`Song::split_content_at`] が 2 つに割る
+    /// (共有されていれば CoW で fork するので linked clip は無傷)。 両断片は
+    /// **同じ content を別の窓で見る**ので、窓の外に隠れていた素材は失われず、
+    /// 分割してから結合し直せば元に戻る。 旧実装は両半を新 content へ fork し、
+    /// content 側の位置を左シフトしていたため、共有関係が毎回壊れていた。
+    ///
+    /// 後半の新クリップは `new_selection` に積まれる。
     pub(crate) fn split_clip_at_beat(
         &mut self,
         target: ClipKey,
         playhead: f64,
         new_selection: &mut Vec<ClipKey>,
     ) -> bool {
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
-            return false;
-        };
-        let Some(clip) = track.clip_by_id(target.clip_id) else {
-            return false;
-        };
-        let clip_start = clip.start_beat;
-        let clip_len = clip.length_beats;
-        let clip_end = clip_start + clip_len;
-        // 色 (per-clip) は両半が引き継ぐ (= 色付き clip を split したら両方同色)。
-        // front は clip_mut をそのまま使うので色は不変、 back の新 clip にこれを写す。
-        let src_color = clip.color;
-        if !(playhead > clip_start && playhead < clip_end) {
-            return false; // playhead 範囲外 / 端ぴったりは split 不要
-        }
-        let front_len = playhead - clip_start;
-        let back_len = clip_len - front_len;
-        // content を切る位置は **content-local** 拍 (= 窓の offset ぶん進んだ位置)。
-        // 左端 trim 済み clip では clip-local (`playhead - clip_start`) と一致しない
-        // (r.md #44)。 前半は元の窓 offset をそのまま保ち、 後半 content は
-        // `split_offset` ぶん左シフトして作られるので窓 offset は 0 になる。
-        let src_offset = clip.content_offset_beats;
-        let split_offset = src_offset + front_len;
-        let src_content_id = clip.content_id;
-        // 名前は content_id 単位 SSoT から取得 (legacy clip.name は v20 で空)。
-        let src_name = self.song_doc.song().content_name(src_content_id).to_string();
-        let Some(src_content) = self.song_doc.song().clip_contents.get(&src_content_id).cloned()
-        else {
-            return false;
-        };
-
-        // Build the back-half ClipContent by partitioning the source
-        // content at `split_offset` (clip-local beats).
-        self.edit_song_checked(|song| {
-        let back_content = match src_content.clone() {
-            ClipContent::Midi(mut midi) => {
-                let mut back_notes: Vec<Note> = Vec::new();
-                let mut keep_front: Vec<Note> = Vec::new();
-                for note in midi.notes.drain(..) {
-                    let n_start = note.start_beat;
-                    let n_end = note.start_beat + note.duration_beats;
-                    if n_end <= split_offset {
-                        keep_front.push(note);
-                    } else if n_start >= split_offset {
-                        back_notes.push(Note {
-                            start_beat: n_start - split_offset,
-                            ..note
-                        });
-                    } else {
-                        // Note straddles the split point — front half
-                        // keeps lyric, back half is a continuation
-                        // (no lyric so VOICEVOX doesn't sing it twice).
-                        let front_dur = split_offset - n_start;
-                        let back_dur = n_end - split_offset;
-                        keep_front.push(Note {
-                            start_beat: n_start,
-                            duration_beats: front_dur,
-                            ..note.clone()
-                        });
-                        back_notes.push(Note {
-                            start_beat: 0.0,
-                            duration_beats: back_dur,
-                            lyric: None,
-                            ..note
-                        });
-                    }
-                }
-                // Trim the original (front) content in place so the
-                // share group keeps the front half only — but only
-                // for THIS clip's content; if other clips share the
-                // same `content_id` we must fork via a fresh id. We
-                // always fork here for simplicity (= split always
-                // promotes both halves to fresh ContentIds, which is
-                // safer for shared-clip semantics).
-                // v29: 両半とも元 content の allocator counter を引き継ぐ
-                // (既存 note id はそのまま持ち出すので、 counter も既存 id を
-                // カバーする値でなければ次の採番が衝突する)。
-                let mut front = MidiContent {
-                    notes: keep_front,
-                    next_note_id: midi.next_note_id,
-                };
-                front.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                let mut back = MidiContent {
-                    notes: back_notes,
-                    next_note_id: midi.next_note_id,
-                };
-                back.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                let front_id = song.alloc_content_id();
-                song.clip_contents
-                    .insert(front_id, ClipContent::Midi(front));
-                ClipContent::Midi(back)
-            }
-            ClipContent::Audio(mut audio) => {
-                let mut back_events: Vec<AudioEvent> = Vec::new();
-                let mut keep_front: Vec<AudioEvent> = Vec::new();
-                for ev in audio.events.drain(..) {
-                    let e_start = ev.event_start_in_clip_beats;
-                    let e_end = e_start + ev.event_length_beats;
-                    if e_end <= split_offset {
-                        keep_front.push(ev);
-                    } else if e_start >= split_offset {
-                        back_events.push(AudioEvent {
-                            event_start_in_clip_beats: e_start - split_offset,
-                            ..ev
-                        });
-                    } else {
-                        // Event straddles the split: split source range
-                        // proportionally by the source-frame stride
-                        // implied by this event's pitch_ratio is
-                        // approximated as a simple linear partition
-                        // (good enough for Phase 1 default Raw mode
-                        // where source beats == clip beats × bpm).
-                        let frac_front = (split_offset - e_start) / ev.event_length_beats;
-                        let total_src = ev
-                            .source_end_frames
-                            .saturating_sub(ev.source_start_frames);
-                        let split_src_offset =
-                            (total_src as f64 * frac_front).round() as u64;
-                        let mid_src_frame = ev.source_start_frames + split_src_offset;
-                        let mut front_ev = ev.clone();
-                        front_ev.event_length_beats = split_offset - e_start;
-                        front_ev.source_end_frames = mid_src_frame;
-                        keep_front.push(front_ev);
-                        back_events.push(AudioEvent {
-                            event_start_in_clip_beats: 0.0,
-                            event_length_beats: e_end - split_offset,
-                            source_start_frames: mid_src_frame,
-                            ..ev
-                        });
-                    }
-                }
-                // v29: split 両半は元 allocator counter を引き継ぐ (上の MIDI と同理)。
-                let front = AudioContent {
-                    events: keep_front,
-                    next_event_id: audio.next_event_id,
-                };
-                let back = AudioContent {
-                    events: back_events,
-                    next_event_id: audio.next_event_id,
-                };
-                let front_id = song.alloc_content_id();
-                song.clip_contents
-                    .insert(front_id, ClipContent::Audio(front));
-                ClipContent::Audio(back)
-            }
-            // Automation clips live on `Track.automation_lanes`, not in
-            // `Track.clips`. Reaching here means the content store has
-            // a stale Automation entry referenced from a MIDI/Audio
-            // clip — refuse to split rather than guess.
-            ClipContent::Automation(_) => return false,
-            // Video clip split (docs/plan_video.md §4 P6). Mirrors the
-            // Audio path: partition events front/back by split_offset,
-            // straddling events get source_micros range proportionally
-            // bisected (= linear partition; CFR assumption holds since
-            // MVP doesn't expose time-stretch). Both halves allocate
-            // fresh content_ids so the linked-clip semantics of the
-            // source clip don't follow the split.
-            ClipContent::Video(mut video) => {
-                let mut back_events: Vec<common::model::VideoEvent> = Vec::new();
-                let mut keep_front: Vec<common::model::VideoEvent> = Vec::new();
-                for ev in video.events.drain(..) {
-                    let e_start = ev.event_start_in_clip_beats;
-                    let e_end = e_start + ev.event_length_beats;
-                    if e_end <= split_offset {
-                        keep_front.push(ev);
-                    } else if e_start >= split_offset {
-                        back_events.push(common::model::VideoEvent {
-                            event_start_in_clip_beats: e_start - split_offset,
-                            ..ev
-                        });
-                    } else {
-                        let frac_front = (split_offset - e_start) / ev.event_length_beats;
-                        let total_src =
-                            ev.source_end_micros.saturating_sub(ev.source_start_micros);
-                        let split_src_offset =
-                            (total_src as f64 * frac_front).round() as u64;
-                        let mid_src_micros = ev.source_start_micros + split_src_offset;
-                        let mut front_ev = ev.clone();
-                        front_ev.event_length_beats = split_offset - e_start;
-                        front_ev.source_end_micros = mid_src_micros;
-                        keep_front.push(front_ev);
-                        back_events.push(common::model::VideoEvent {
-                            event_start_in_clip_beats: 0.0,
-                            event_length_beats: e_end - split_offset,
-                            source_start_micros: mid_src_micros,
-                            ..ev
-                        });
-                    }
-                }
-                let front = common::model::VideoContent {
-                    events: keep_front,
-                };
-                let back = common::model::VideoContent {
-                    events: back_events,
-                };
-                let front_id = song.alloc_content_id();
-                song.clip_contents
-                    .insert(front_id, ClipContent::Video(front));
-                ClipContent::Video(back)
-            }
-            // Image clip Split (`docs/plan_image_overlay.md` §4 P4)。
-            // Audio / Video と同じ「event を split_offset で前後に振り分け」
-            // pattern。 ImageEvent は単一画像 source への参照 + PiP rect /
-            // opacity のみ持つので、 source 切り出し位置 (source_*_frames /
-            // source_*_micros) のような時間軸 attribute は無い。 そのため
-            // straddle event は時間長 (event_length_beats) だけを 2 つに
-            // 分割し、 PiP rect / opacity / source_id は両 event が共有
-            // (= 同じ画像を 2 つの時間 region で表示し続ける)。 fade_out
-            // (前半側) / fade_in (後半側) は 0 にリセット (Audio / Video
-            // と同じ split 慣行)。
-            ClipContent::Image(mut image) => {
-                let mut back_events: Vec<common::model::ImageEvent> = Vec::new();
-                let mut keep_front: Vec<common::model::ImageEvent> = Vec::new();
-                for ev in image.events.drain(..) {
-                    let e_start = ev.event_start_in_clip_beats;
-                    let e_end = e_start + ev.event_length_beats;
-                    if e_end <= split_offset {
-                        keep_front.push(ev);
-                    } else if e_start >= split_offset {
-                        back_events.push(common::model::ImageEvent {
-                            event_start_in_clip_beats: e_start - split_offset,
-                            ..ev
-                        });
-                    } else {
-                        let mut front_ev = ev.clone();
-                        front_ev.event_length_beats = split_offset - e_start;
-                        front_ev.fade_out_beats = 0.0;
-                        keep_front.push(front_ev);
-                        back_events.push(common::model::ImageEvent {
-                            event_start_in_clip_beats: 0.0,
-                            event_length_beats: e_end - split_offset,
-                            fade_in_beats: 0.0,
-                            ..ev
-                        });
-                    }
-                }
-                let front = common::model::ImageContent { events: keep_front };
-                let back = common::model::ImageContent { events: back_events };
-                let front_id = song.alloc_content_id();
-                song.clip_contents
-                    .insert(front_id, ClipContent::Image(front));
-                ClipContent::Image(back)
-            }
-            // Text clip Split (`docs/plan_text_overlay.md` §2.2)。 image
-            // split と同 idiom: event を split_offset で前後に振り分け。
-            // text 内容 / font / color 等は両半が共有 (= 同 text の 2 つ
-            // の時間 region で表示)、 fade_out (前半) / fade_in (後半) は
-            // 0 リセット。 後 commit で実装、 まずは split skip で
-            // build を通す。
-            ClipContent::Text(_) => return false,
-        };
-
-        // Allocate fresh ContentIds for both halves (front was just
-        // inserted into clip_contents above with a placeholder id —
-        // we now rewrite the clip's content_id to point at it).
-        // Strategy: walk back the last alloc'd id we just inserted.
-        // The id list above used `alloc_content_id()` so the most
-        // recent one is `next_content_id - 1`.
-        let front_content_id = song.ids.next_content_id.saturating_sub(1);
-        let back_content_id = song.alloc_content_id();
-        song.clip_contents
-            .insert(back_content_id, back_content);
-        // 両半は元 clip の共有名を引き継ぐ (split は両側を fresh content_id に
-        // fork するので、 名前も両方へ複製する)。
-        if !src_name.is_empty() {
-            song.set_content_name(front_content_id, src_name.clone());
-            song.set_content_name(back_content_id, src_name.clone());
-        }
-
-        // Mutate the clip in place: front half stays as `clip`
-        // (length / content_id rewritten), and a new clip for the
-        // back half is appended on the same track.
-        let Some(track) = song.track_by_id_mut(target.track_id) else {
-            return false;
-        };
-        // 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
-        // その声を引き継ぐ。
-        // 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
-        let (src_speaker, src_singer, src_style, src_talk, src_muted) = {
-            let Some(clip_mut) = track.clip_by_id_mut(target.clip_id) else {
+        let mut back_key: Option<ClipKey> = None;
+        let ok = self.edit_song_checked(|song| {
+            let Some((start, len, off, src_content_id)) = song
+                .track_by_id(target.track_id)
+                .and_then(|t| t.clip_by_id(target.clip_id))
+                .map(|c| (c.start_beat, c.length_beats, c.content_offset_beats, c.content_id))
+            else {
                 return false;
             };
-            clip_mut.length_beats = front_len;
-            clip_mut.content_id = front_content_id;
-            (
-                clip_mut.speaker_id,
-                clip_mut.singer_name.clone(),
-                clip_mut.style_name.clone(),
-                clip_mut.talk,
-                clip_mut.muted,
-            )
-        };
-        let new_clip_id = track.alloc_clip_id();
-        track.clips.push(Clip {
-            id: new_clip_id,
-            start_beat: clip_start + front_len,
-            length_beats: back_len,
-            content_id: back_content_id,
-            // 後半 content は split 位置ぶん左シフト済みなので窓は先頭から。
-            content_offset_beats: 0.0,
-            color: src_color,
-            auto_lipsync: false,
-            lipsync_gen: 0,
-            muted: src_muted,
-            speaker_id: src_speaker,
-            singer_name: src_singer,
-            style_name: src_style,
-            talk: src_talk,
+            if !(playhead > start && playhead < start + len) {
+                return false; // playhead 範囲外 / 端ぴったりは split 不要
+            }
+            let cut = playhead - start;
+            // 切る位置は **content-local** 拍 (= 窓の offset ぶん進んだ位置)。
+            // 左端 trim 済み clip では clip-local (`playhead - start`) と一致しない。
+            let content_id = song.split_content_at(src_content_id, off + cut);
+            let Some(track) = song.track_by_id_mut(target.track_id) else {
+                return false;
+            };
+            let Some(mut back) = track.clip_by_id(target.clip_id).cloned() else {
+                return false;
+            };
+            if let Some(front) = track.clip_by_id_mut(target.clip_id) {
+                front.content_id = content_id;
+                front.length_beats = cut;
+            }
+            back.id = 0;
+            back.content_id = content_id;
+            back.start_beat = playhead;
+            back.length_beats = len - cut;
+            back.content_offset_beats = off + cut;
+            // 後半は口パク自動生成の再生成対象から外す (前半と同じ規約)。
+            back.auto_lipsync = false;
+            back.lipsync_gen = 0;
+            let back_id = track.place_clip(back);
+            back_key = Some(ClipKey { track_id: target.track_id, clip_id: back_id });
+            true
         });
-        new_selection.push(target);
-        new_selection.push(ClipKey {
-            track_id: target.track_id,
-            clip_id: new_clip_id,
-        });
-        true
-        })
+        if ok {
+            new_selection.push(target);
+            if let Some(key) = back_key {
+                new_selection.push(key);
+            }
+        }
+        ok
     }
 
 }

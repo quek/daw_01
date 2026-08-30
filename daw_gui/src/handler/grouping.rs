@@ -377,18 +377,8 @@ impl AppData {
             self.selection.selected_track_ids.push(t.id);
         }
         self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));
-        // selected_clips / selected_clip は stable ClipKey 保持。 削除された
-        // track の clip を指す選択だけ落とす (track は上で pop 済なので clip_at が
-        // 解決できない)。 残りは index 変化に自動追従。
-        let mut keys = std::mem::take(&mut self.selection.selected_clips);
-        keys.retain(|k| self.clip_at(*k).is_some());
-        self.selection.selected_clips = keys;
-        if let Some(k) = self.selection.selected_clip
-            && self.clip_at(k).is_none()
-        {
-            self.selection.selected_clip = self.selection.selected_clips.last().copied();
-            self.selection.selected_notes.clear();
-        }
+        // 範囲は「区間 × 行」しか持たないので、消えたトラックの行を落とすだけ。
+        self.prune_selection_lanes();
         self.resize_track_peak_display();
     }
 

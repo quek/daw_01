@@ -21,7 +21,7 @@ impl AppData {
         // (同 clip の再 open は選択を保持)。 index ベース選択は context が
         // 変わると意味を失う (= close / undo と同方針)。
         if self.ui_ephemeral.audio_editor_clip != Some(target) {
-            self.selection.audio_editor_selected_events.clear();
+            self.set_audio_event_selection(&[]);
         }
         self.ui_ephemeral.audio_editor_clip = Some(target);
         self.ui_prefs.bottom_panel = 1;
@@ -49,7 +49,7 @@ impl AppData {
     pub(crate) fn close_audio_editor(&mut self) {
         // view 状態は `audio_editor_views` に残す (= 次回 open で復元)。
         self.ui_ephemeral.audio_editor_clip = None;
-        self.selection.audio_editor_selected_events.clear();
+        self.set_audio_event_selection(&[]);
         self.ui_ephemeral.audio_editor_hover_beat_in_clip = None;
         // 面そのものが消えたので last-wins タグも降ろす。 残すと
         // 「閉じた audio editor の面」 を指したまま `edit_surface` が空判定で
@@ -194,7 +194,7 @@ impl AppData {
         }) else {
             return;
         };
-        self.selection.audio_editor_selected_events = vec![insert_at];
+        self.set_audio_event_selection(&[insert_at]);
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
@@ -430,7 +430,7 @@ impl AppData {
         }) else {
             return;
         };
-        self.selection.audio_editor_selected_events = vec![new_idx];
+        self.set_audio_event_selection(&[new_idx]);
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
@@ -444,8 +444,8 @@ impl AppData {
     pub(crate) fn set_audio_editor_event_selection(&mut self, indices: Vec<usize>) {
         let mut seen = std::collections::HashSet::new();
         let deduped: Vec<usize> = indices.into_iter().filter(|i| seen.insert(*i)).collect();
-        self.selection.audio_editor_selected_events = deduped;
-        if !self.selection.audio_editor_selected_events.is_empty() {
+        self.set_audio_event_selection(&(deduped));
+        if !self.selected_audio_event_indices().is_empty() {
             self.selection.last_edit_select = Some(EditSurface::AudioEvents);
         }
     }
@@ -465,7 +465,7 @@ impl AppData {
         else {
             return;
         };
-        let mut indices: Vec<usize> = self.selection.audio_editor_selected_events.clone();
+        let mut indices: Vec<usize> = self.selected_audio_event_indices();
         indices.sort_unstable();
         indices.dedup();
         if indices.is_empty() {
@@ -487,7 +487,7 @@ impl AppData {
         if !removed {
             return;
         }
-        self.selection.audio_editor_selected_events.clear();
+        self.set_audio_event_selection(&[]);
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
@@ -502,11 +502,7 @@ impl AppData {
         let auto_fade_beats = 0.004 * bpm / 60.0; // 4 ms 相当
         let mut applied = 0usize;
         // borrow checker: target list を先に固める。
-        let targets: Vec<ClipKey> = if self.selection.selected_clips.is_empty() {
-            self.selected_clip_ref().into_iter().collect()
-        } else {
-            self.selected_clip_refs()
-        };
+        let targets: Vec<ClipKey> = self.selected_clip_refs();
         for target in targets {
             let Some(content_id) = self
                 .song_doc.song()
@@ -549,25 +545,30 @@ impl AppData {
         }
     }
 
-    /// 隣接 audio clip ペアに crossfade を作成 (`docs/plan_audio_clip
-    /// .md` §3.5 Auto-Crossfade)。 selected_clips のうち audio clip を
-    /// track 別に集めて start_beat 順に並べ、 ペアごとに `prev_end >
-    /// next_start` (= overlap 中) のみ overlap_beats を fade_out / fade_in
-    /// に設定する。 隙間ペアは no-op、 完全重なり (next が prev に
-    /// 内包される) はサポート対象外で skip + 警告。
+    /// Auto-Crossfade — **隣接する audio クリップの境界**にクロスフェードを掛ける。
+    ///
+    /// クリップ同士は重ならない (`Track::clips` の不変条件) ので、境界で音を途切れ
+    /// させないには **鳴らす範囲だけ**を境界の向こうへ伸ばす。 1 ペアにつき:
+    ///
+    /// - 前のクリップ: `xfade_tail_beats = N/2` (境界の先まで鳴らす) + 末尾 event の
+    ///   `fade_out_beats = N`
+    /// - 次のクリップ: `xfade_lead_beats = N/2` (境界の手前から鳴らす) + 先頭 event の
+    ///   `fade_in_beats = N`
+    ///
+    /// これで境界を中心に左が下がりながら右が上がる = 真のクロスフェードになる
+    /// (`docs/plan_range_selection.md` §6.5)。 張り出しは再生側が**隣が実在するときだけ**
+    /// 使うので、後でクリップを動かしても音が漏れない。
+    ///
+    /// Live の「隣接クリップに自動で 4ms が付く」 (§6.8) は入れていない — フェードは
+    /// ユーザーが明示的に掛けたときだけ付く。
     pub(crate) fn auto_crossfade_selected_clips(&mut self) {
-        // (track_idx, clip_idx, start_beat, end_beat, content_id) を集める
-        let mut entries: Vec<(u32, u32, f64, f64, u32)> = Vec::new();
-        let targets: Vec<ClipKey> = if self.selection.selected_clips.is_empty() {
-            self.selected_clip_ref().into_iter().collect()
-        } else {
-            self.selected_clip_refs()
-        };
-        for target in &targets {
-            let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
-                continue;
-            };
-            let Some(clip) = track.clip_by_id(target.clip_id) else {
+        // クロスフェード長 (拍)。 4 ms 相当を拍へ換算 (Auto-Fade と同じ尺度)。
+        let bpm = f64::from(self.song_doc.song().bpm.max(1.0));
+        let xfade_beats = (0.004 * bpm / 60.0).max(1e-4);
+        // (track_id, clip_id, start, end, content_id) を集める。
+        let mut entries: Vec<(u32, u32, f64, f64, common::model::ContentId)> = Vec::new();
+        for target in self.selected_clip_refs() {
+            let Some(clip) = self.song_doc.song().clip_by_key(target) else {
                 continue;
             };
             let Some(common::model::ClipContent::Audio(_)) =
@@ -588,59 +589,64 @@ impl AppData {
                 "Auto-Crossfade: 隣接判定には audio clip が 2 つ以上必要です".into();
             return;
         }
-        // track ごとに sort して隣接ペアを抽出
-        entries.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        let mut applied = 0usize;
-        for window in entries.windows(2) {
-            let (prev_track, _, prev_start, prev_end, prev_content) = window[0];
-            let (next_track, _, next_start, next_end, next_content) = window[1];
-            if prev_track != next_track {
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)));
+        let mut pairs: Vec<(u32, u32, u32, common::model::ContentId, common::model::ContentId)> =
+            Vec::new();
+        for w in entries.windows(2) {
+            let (prev_track, prev_id, _, prev_end, prev_content) = w[0];
+            let (next_track, next_id, next_start, _, next_content) = w[1];
+            // **隣接** = 端が触れている (重なりは不変条件で存在しない)。
+            if prev_track != next_track || (next_start - prev_end).abs() > 1e-6 {
                 continue;
             }
-            if next_start >= prev_end {
-                continue; // 隙間あり、 crossfade 対象外
-            }
-            if next_end <= prev_end {
-                tracing::warn!(
-                    prev_start, prev_end, next_start, next_end,
-                    "Auto-Crossfade: next clip が prev に内包されているため skip"
-                );
-                continue;
-            }
-            let overlap = (prev_end - next_start).max(0.0);
-            self.edit_song(|song| {
-                // prev clip の末尾 fade_out
+            pairs.push((prev_track, prev_id, next_id, prev_content, next_content));
+        }
+        if pairs.is_empty() {
+            self.ui_ephemeral.status_message =
+                "Auto-Crossfade: 隣接しているペアがありません".into();
+            return;
+        }
+        let applied = pairs.len();
+        let half = xfade_beats * 0.5;
+        self.edit_song(move |song| {
+            for (track_id, prev_id, next_id, prev_content, next_content) in pairs {
+                if let Some(clip) = song
+                    .track_by_id_mut(track_id)
+                    .and_then(|t| t.clip_by_id_mut(prev_id))
+                {
+                    clip.xfade_tail_beats = half;
+                }
+                if let Some(clip) = song
+                    .track_by_id_mut(track_id)
+                    .and_then(|t| t.clip_by_id_mut(next_id))
+                {
+                    clip.xfade_lead_beats = half;
+                }
+                // ランプは event 側に持たせる (fade の SSoT は event)。 境界を挟んで
+                // 左が下がり右が上がるよう、両側とも長さ N を掛ける。
                 if let Some(common::model::ClipContent::Audio(audio)) =
                     song.clip_contents.get_mut(&prev_content)
+                    && let Some(last) = audio.events.iter_mut().max_by(|a, b| {
+                        (a.event_start_in_clip_beats + a.event_length_beats)
+                            .total_cmp(&(b.event_start_in_clip_beats + b.event_length_beats))
+                    })
                 {
-                    for event in &mut audio.events {
-                        event.fade_out_beats = overlap.min(event.event_length_beats);
-                    }
+                    last.fade_out_beats = xfade_beats;
                 }
-                // next clip の先頭 fade_in
                 if let Some(common::model::ClipContent::Audio(audio)) =
                     song.clip_contents.get_mut(&next_content)
+                    && let Some(first) = audio.events.iter_mut().min_by(|a, b| {
+                        a.event_start_in_clip_beats.total_cmp(&b.event_start_in_clip_beats)
+                    })
                 {
-                    for event in &mut audio.events {
-                        event.fade_in_beats = overlap.min(event.event_length_beats);
-                    }
+                    first.fade_in_beats = xfade_beats;
                 }
-            });
-            applied += 1;
-        }
-        if applied > 0 {
-            if let Some(target) = self.ui_ephemeral.clip_edit_buffer_target {
-                self.resync_clip_audio_event_edit_buffers(target);
             }
-            self.ui_ephemeral.status_message =
-                format!("Auto-Crossfade: {applied} ペアに crossfade を適用");
-        } else {
-            self.ui_ephemeral.status_message =
-                "Auto-Crossfade: 重なっている隣接ペアがありません".into();
+        });
+        if let Some(target) = self.ui_ephemeral.clip_edit_buffer_target {
+            self.resync_clip_audio_event_edit_buffers(target);
         }
+        self.ui_ephemeral.status_message =
+            format!("Auto-Crossfade: {applied} ペアの境界にクロスフェードを掛けました");
     }
-
 }

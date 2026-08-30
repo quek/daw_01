@@ -271,6 +271,11 @@ fn track0_y() -> f32 {
     38.0 + ROW_H + ROW_H * 0.5
 }
 
+/// track0 行の**上端**。 クリップのヘッダ帯 (ラベル帯) はここから数 px。
+fn track0_y_top() -> f32 {
+    38.0 + ROW_H
+}
+
 fn add_midi_track_with_clip(app: &mut AppData, track_id: u32, clip_id: u32, start: f64, len: f64) {
     app.edit_song(|song| {
         // AppData::new の既定 "Track 1" を除去し、追加 track を row 0 (master 直下) に固定する。
@@ -312,12 +317,15 @@ fn clip_start(app: &AppData, track_id: u32, clip_id: u32) -> Option<f64> {
         .map(|c| c.start_beat)
 }
 
-/// clip 中央 drag → 位置移動 (start_beat が移動先へ)。
+/// clip の **ヘッダ帯** を drag → 位置移動 (start_beat が移動先へ)。
+/// 本体 (ヘッダ以外) の drag は時間範囲になるので、移動はヘッダからだけ
+/// (`docs/plan_range_selection.md` §3.1)。
 #[test]
-fn clip_center_drag_moves_clip() {
+fn clip_header_drag_moves_clip() {
     let (mut app, _a, _p) = build_app();
     add_midi_track_with_clip(&mut app, 1, 10, 2.0, 4.0); // x∈[128,384], center 256
-    let y = track0_y();
+    // 行の上端 +2px = ラベル帯 (ヘッダ) の中。
+    let y = track0_y_top() + 2.0;
     let mut host = UiHost::no_redraw();
     drive(&mut host, &mut app, press(256.0, y, no_mods()));
     drive(&mut host, &mut app, hold(320.0, y, no_mods()));
@@ -326,6 +334,25 @@ fn clip_center_drag_moves_clip() {
         clip_start(&app, 1, 10).is_some_and(|s| (s - 4.0).abs() < 1e-3),
         "clip は 2.0 → 4.0 へ移動: got {:?}",
         clip_start(&app, 1, 10)
+    );
+}
+
+/// clip の **本体** を drag → 時間範囲になる (クリップは動かない)。
+#[test]
+fn clip_body_drag_makes_a_time_range() {
+    let (mut app, _a, _p) = build_app();
+    add_midi_track_with_clip(&mut app, 1, 10, 2.0, 4.0);
+    let y = track0_y(); // 行の縦中央 = 本体
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(256.0, y, no_mods()));
+    drive(&mut host, &mut app, hold(320.0, y, no_mods()));
+    drive(&mut host, &mut app, release(384.0, y, no_mods()));
+    assert_eq!(clip_start(&app, 1, 10), Some(2.0), "クリップは動かない");
+    let sel = app.selection.time.as_ref().expect("時間範囲が立つ");
+    assert!(
+        (sel.start_beat - 4.0).abs() < 1e-3 && (sel.end_beat - 6.0).abs() < 1e-3,
+        "掴んだ拍 4 〜 離した拍 6 が範囲: got {:?}",
+        (sel.start_beat, sel.end_beat)
     );
 }
 
@@ -360,9 +387,9 @@ fn clip_short_click_selects() {
     drive(&mut host, &mut app, press(256.0, y, no_mods()));
     drive(&mut host, &mut app, release(258.0, y, no_mods()));
     assert!(
-        app.selection.selected_clips.iter().any(|k| k.track_id == 1 && k.clip_id == 10),
+        app.selected_clip_refs().iter().any(|k| k.track_id == 1 && k.clip_id == 10),
         "clip (1,10) が選択される: got {:?}",
-        app.selection.selected_clips
+        app.selected_clip_refs()
     );
 }
 
@@ -378,7 +405,7 @@ fn popup_open_click_does_not_clear_clip_selection() {
     // まず clip を選択。
     drive(&mut host, &mut app, press(256.0, y, no_mods()));
     drive(&mut host, &mut app, release(258.0, y, no_mods()));
-    assert!(!app.selection.selected_clips.is_empty(), "precondition: clip 選択済み");
+    assert!(!app.selected_clip_refs().is_empty(), "precondition: clip 選択済み");
 
     // popup を開いた状態で「空きレーン上の click」相当 (clip の無い x) を送る。
     // ガードが効いていれば選択はクリアされない。
@@ -393,7 +420,7 @@ fn popup_open_click_does_not_clear_clip_selection() {
         });
     }
     assert!(
-        !app.selection.selected_clips.is_empty(),
+        !app.selected_clip_refs().is_empty(),
         "popup が開いている間の click では clip 選択がクリアされない (r.md #14)"
     );
 }
@@ -1374,21 +1401,26 @@ fn drag_on_automation_clip_moves_it_instead_of_lassoing() {
     );
 }
 
-/// **空き lane zone の drag は lasso**。clip の外 (拍 8 以降) から掴んで point の上まで
-/// 引くと、囲まれた point が選択される。
+/// **空き lane zone の drag は時間範囲**。投げ縄 (lasso) は撤去され、
+/// オートメーションレーンも同じ範囲選択になった
+/// (`docs/plan_range_selection.md` §3.3)。
 #[test]
-fn drag_on_empty_lane_zone_lassos_points() {
+fn drag_on_empty_lane_zone_makes_a_time_range() {
     let (mut app, _a, _p) = app_with_lane(0.0);
-    app.selection.selected_automation_points.clear();
     let mut host = UiHost::no_redraw();
     let y_top = track0_bottom() + 4.0;
     let y_bottom = lane_bottom() - 6.0;
     drive(&mut host, &mut app, press(9.0 * ZOOM, y_top, no_mods()));
     drive(&mut host, &mut app, hold(0.5 * ZOOM, y_bottom, no_mods()));
     drive(&mut host, &mut app, release(0.5 * ZOOM, y_bottom, no_mods()));
+    let sel = app.selection.time.as_ref().expect("時間範囲が立つ");
+    assert!(sel.end_beat > sel.start_beat, "幅のある範囲になる");
     assert!(
-        !app.selection.selected_automation_points.is_empty(),
-        "空き zone の drag で lasso が走り point が選択される"
+        sel.lanes
+            .iter()
+            .any(|l| matches!(l, common::model::LaneRef::Automation(_))),
+        "横切ったオートメーションレーン行が範囲に入る: {:?}",
+        sel.lanes
     );
 }
 

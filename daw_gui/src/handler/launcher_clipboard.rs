@@ -182,6 +182,9 @@ fn paste_one(
                     length_beats: c.length_beats,
                     content_id,
                     content_offset_beats: c.content_offset_beats,
+                    // 新規クリップにクロスフェードの張り出しは無い。
+                    xfade_lead_beats: 0.0,
+                    xfade_tail_beats: 0.0,
                     color: c.color,
                     auto_lipsync: false,
                     lipsync_gen: 0,

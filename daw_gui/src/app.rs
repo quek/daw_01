@@ -207,18 +207,15 @@ impl AppData {
                 selected_automation_clips: Vec::new(),
                 last_edit_select: None,
                 selected_automation_points: Vec::new(),
-                selected_clip: None,
-                selected_clips: Vec::new(),
-                selected_notes: Vec::new(),
-                audio_editor_selected_events: Vec::new(),
+                time: None,
+                range_anchor: None,
+                selected_launcher_cells: Vec::new(),
+                launcher_cell_anchor: None,
                 selected_device_ids: Vec::new(),
-                clip_anchor: None,
-                note_anchor: None,
                 track_anchor: None,
                 section_anchor: None,
                 automation_point_anchor: None,
                 automation_clip_anchor: None,
-                audio_editor_anchor: None,
                 device_anchor: None,
                 scene_anchor: None,
             },
@@ -286,6 +283,9 @@ impl AppData {
             },
             ui_prefs: UiPrefs {
                 preview_window_visible: false,
+                // 既定 ON: クリップを動かしたら automation も付いてくる方が期待に近い。
+                // アプリ設定 (`AppConfig`) から復元する。
+                automation_follows_clips: app_config.automation_follows_clips,
                 collapsed_groups: std::collections::HashSet::new(),
                 expanded_automation_tracks: std::collections::HashSet::new(),
                 master_row_automation_expanded: false,
@@ -389,6 +389,7 @@ impl AppData {
                 piano_roll_lyric_editing: false,
                 pianoroll_viewport: None,
                 audio_editor_clip: None,
+                pianoroll_focus_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 inspector_body_h: 800.0,
                 inspector_device_panel_h: 0.0,
@@ -1221,19 +1222,30 @@ impl AppData {
             AppEvent::SetClipSelection(targets) => {
                 self.set_clip_selection(targets);
             }
+            AppEvent::SetAutomationFollowsClips(on) => {
+                self.ui_prefs.automation_follows_clips = on;
+                // 「この人の作業のしかた」なのでアプリ設定側へ永続する。
+                self.persist_app_config();
+            }
+            AppEvent::SetTimeSelection { start_beat, end_beat, lanes } => {
+                let next = common::model::TimeSelection::new(start_beat, end_beat, lanes);
+                self.set_time_selection(next);
+                self.selection.range_anchor =
+                    self.selection.time.as_ref().map(|t| t.start_beat);
+                // 範囲を引いたら、ピアノロールは**その範囲**を映す (掛かったクリップ全体
+                // ではない)。 ビューが曲頭のままだとノートが画面外で空に見えるので、
+                // 範囲を張り直すたびに合わせ直す。
+                self.fit_piano_roll_to_range();
+            }
             AppEvent::SelectAllClips => {
                 self.select_all_clips();
             }
             AppEvent::ClearSelection => {
-                self.selection.selected_clip = None;
-                self.selection.selected_clips.clear();
-                self.selection.selected_notes.clear();
-                // (r.md #35) 選択を捨てたら Shift+click 範囲選択の基点も捨てる。
-                self.selection.clip_anchor = None;
-                self.selection.note_anchor = None;
-            }
-            AppEvent::SelectLinkedClips(target) => {
-                self.select_linked_clips(target);
+                self.selection.time = None;
+                self.selection.selected_launcher_cells.clear();
+                // 選択を捨てたら Shift+click 範囲選択の基点も捨てる。
+                self.selection.range_anchor = None;
+                self.selection.launcher_cell_anchor = None;
             }
             AppEvent::ResizeClip {
                 target,
@@ -1250,10 +1262,11 @@ impl AppData {
                 self.create_clip(track, start_beat);
             }
             AppEvent::DeleteSelectedClip => self.delete_selected_clip(),
+            AppEvent::DeleteTimeSelection => self.apply_delete_time_selection(),
             AppEvent::SelectNote { note, additive } => {
                 self.select_note(note, additive);
             }
-            AppEvent::ClearNoteSelection => self.selection.selected_notes.clear(),
+            AppEvent::ClearNoteSelection => self.clear_note_selection(),
             AppEvent::AddNote { key, start_beat, duration, pitch } => {
                 self.add_note(key, start_beat, duration, pitch);
             }
@@ -1267,15 +1280,15 @@ impl AppData {
                 self.resize_notes(&entries);
             }
             AppEvent::SetNoteSelection(targets) => {
-                self.selection.selected_notes = targets;
-                if !self.selection.selected_notes.is_empty() {
+                self.set_note_selection(&(targets));
+                if !self.selected_note_ids().is_empty() {
                     self.selection.last_edit_select = Some(EditSurface::Notes);
                 }
                 // last (anchor) は packed note id。所属クリップを decode し、
                 // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
                 //     そちらへ移る (plan §D/E。selected_clips は不変なので slot/selected_notes は維持)、
                 // (2) 既定 note 長をそのクリップから引く。
-                if let Some(&last) = self.selection.selected_notes.last()
+                if let Some(&last) = self.selected_note_ids().last()
                     && let Some((r, local)) = self.decode_note_id(last)
                 {
                     if let Some(key) = self.live_clip_key(r) {
@@ -2052,8 +2065,8 @@ impl AppData {
                 self.set_audio_editor_zoom(view_start_beat, view_len_beats);
             }
             AppEvent::SelectAudioEditorEvent(idx) => {
-                self.selection.audio_editor_selected_events = idx.into_iter().collect();
-                if !self.selection.audio_editor_selected_events.is_empty() {
+                self.set_audio_event_selection(&idx.into_iter().collect::<Vec<usize>>());
+                if !self.selected_audio_event_indices().is_empty() {
                     self.selection.last_edit_select = Some(EditSurface::AudioEvents);
                 }
             }
@@ -2318,12 +2331,6 @@ impl AppData {
             }
             AppEvent::ArrangeZoomBack => {
                 self.arrange_zoom_back();
-            }
-            AppEvent::DuplicateClipsShared(sources) => {
-                self.duplicate_clips_shared(&sources);
-            }
-            AppEvent::DuplicateClipsUnique(sources) => {
-                self.duplicate_clips_unique(&sources);
             }
             AppEvent::CloneClipsLinked(entries) => {
                 self.clone_clips_linked(&entries);

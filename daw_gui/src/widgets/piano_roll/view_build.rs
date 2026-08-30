@@ -206,7 +206,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         })
         .collect();
 
-    let selected: Vec<NoteId> = app.selection.selected_notes.clone();
+    let selected: Vec<NoteId> = app.selected_note_ids();
 
     BuiltPianoRoll {
         toolbar_rect,

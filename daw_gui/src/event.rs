@@ -360,7 +360,7 @@ pub enum AppEvent {
     /// `MakeClipUnique(ClipKey)` と同 idiom の lane 版。
     MakeAutomationClipUnique(common::model::AutomationClipKey),
     /// D shortcut: 選択中の automation clip 群をまとめて共有コピー。
-    /// MIDI 用 `DuplicateClipsShared` の automation lane 版。 選択ブロック span
+    /// automation lane 版のブロック複製。 選択ブロック span
     /// だけ後ろにずらして複製し、 新 key 群を `selected_automation_clips` に
     /// 上書きする (D 連打で後方連鎖)。
     DuplicateAutomationClipsShared(Vec<common::model::AutomationClipKey>),
@@ -652,15 +652,17 @@ pub enum AppEvent {
     // -------- Arrangement / clip operations -------------------------------
     SelectClip { target: ClipKey, additive: bool },
     SetClipSelection(Vec<ClipKey>),
+    /// 範囲選択を差し替える (`docs/plan_range_selection.md`)。 `lanes` が空なら選択解除。
+    /// アレンジャーの範囲ドラッグ / 伸縮がこれを発火する。
+    SetTimeSelection { start_beat: f64, end_beat: f64, lanes: Vec<common::model::LaneRef> },
+    /// **オートメーションをクリップに追従させるか** のトグル
+    /// (`docs/plan_range_selection.md` §5)。 アプリ設定として永続する。
+    SetAutomationFollowsClips(bool),
     /// Ctrl+A (クリップ領域): 曲全体・全トラックの全クリップを選択。
     /// 一括選択なので view ジャンプ (fit_piano_roll / select_track) は
     /// 起こさない。 既に全選択なら冪等。 selection のみ更新で非 undoable。
     SelectAllClips,
     ClearSelection,
-    /// 右クリック「共有を一括選択」 — target と同じ `content_id` を持つ
-    /// 全 clip (linked clip group) を選択する。 refcount==1 なら自身 1 個。
-    /// 共有グループの可視化 / まとめ移動・削除に使う。
-    SelectLinkedClips(ClipKey),
     /// Clip の右端 trim (= `start_beat` 同値、 `length_beats` のみ更新) と
     /// 左端 trim (= `start_beat` を進めて `length_beats` を縮める) の両方を
     /// カバー。 audio clip の場合は handler が delta_start を計算して各
@@ -685,15 +687,9 @@ pub enum AppEvent {
     SetClipPositions(Vec<(ClipKey, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     DeleteSelectedClip,
-    /// 選択中の clip 群をまとめて共有コピー (linked clip) する
-    /// (D shortcut / `docs/plan_clip_share_clone.md` §3.2)。 選択ブロック全体の
-    /// span だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じ
-    /// セマンティクス)、 複製を選択集合にする。 単一 clip では span = clip 長で
-    /// 旧 `DuplicateClipShared` と完全一致。 source の `content_id` を流用。
-    DuplicateClipsShared(Vec<ClipKey>),
-    /// 選択中の clip 群をまとめて独立コピー (deep clone + 新 ContentId)
-    /// する (Alt+D shortcut / §3.3)。 配置・選択は `DuplicateClipsShared` と同じ。
-    DuplicateClipsUnique(Vec<ClipKey>),
+    /// 範囲がアクティブなときの Delete: 範囲の境界で分割し、範囲部分だけを消す
+    /// (`docs/plan_range_selection.md` §8)。時間は詰めない。
+    DeleteTimeSelection,
     /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipKey,
     /// to_track_id, drop_start_beat)` (snap 済み)、 元 clip は残し、 drop 位置に
     /// 共有コピー を to_track 上で生成。 (§3.4)
@@ -1712,7 +1708,7 @@ impl AppEvent {
             E::SetClipPositions(..) => "クリップ移動",
             E::ResizeClip { .. } => "クリップ長さ変更",
             E::DeleteSelectedClip => "クリップ削除",
-            E::DuplicateClipsShared(..) | E::DuplicateClipsUnique(..) => "クリップ複製",
+            E::DeleteTimeSelection => "範囲の削除",
             E::CloneClipsLinked(..) | E::CloneClipsIndependent(..) => "クリップ複製",
             E::MakeClipUnique(..) => "クリップを独立化",
             E::CommitRenameClip => "クリップ名変更",

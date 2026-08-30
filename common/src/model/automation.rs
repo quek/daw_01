@@ -369,10 +369,20 @@ impl AutomationLane {
     }
 
     /// Allocate a new stable clip id within this lane.
+    ///
+    /// **既に使われている id は返さない** ([`crate::model::Track::alloc_clip_id`] と同じ規則) —
+    /// counter が実在クリップより遅れていると、採番が既存 id と衝突して分割断片が
+    /// 別のクリップを上書きする。
     pub fn alloc_clip_id(&mut self) -> u32 {
-        let id = self.next_clip_id.max(1);
+        let id = self.next_free_clip_id();
         self.next_clip_id = id.saturating_add(1);
         id
+    }
+
+    /// 実在 id と衝突しない次の clip id (counter が遅れていても安全)。
+    fn next_free_clip_id(&self) -> u32 {
+        let max_used = self.all_clips().map(|c| c.id).max().unwrap_or(0);
+        self.next_clip_id.max(1).max(max_used.saturating_add(1))
     }
 
     /// Re-assign stable ids to all clips inside the lane. Idempotent.
@@ -536,4 +546,97 @@ impl AutomationClipKey {
 pub struct AutomationPointKey {
     pub clip: AutomationClipKey,
     pub point_idx: u32,
+}
+
+impl crate::model::ClipWindow for AutomationClip {
+    fn window_id(&self) -> u32 {
+        self.id
+    }
+    fn set_window_id(&mut self, id: u32) {
+        self.id = id;
+    }
+    fn window_start(&self) -> f64 {
+        self.start_beat
+    }
+    fn set_window_start(&mut self, v: f64) {
+        self.start_beat = v;
+    }
+    fn window_len(&self) -> f64 {
+        self.length_beats
+    }
+    fn set_window_len(&mut self, v: f64) {
+        self.length_beats = v;
+    }
+    fn window_offset(&self) -> f64 {
+        self.content_offset_beats
+    }
+    fn set_window_offset(&mut self, v: f64) {
+        self.content_offset_beats = v;
+    }
+}
+
+impl AutomationLane {
+    /// `[start, end)` に掛かる automation クリップを上書き規則で削り取る
+    /// ([`crate::model::carve_range`] — アレンジのクリップと同じ 1 本の実装)。
+    pub fn carve_clip_range(&mut self, start: f64, end: f64, except_clip_id: Option<u32>) -> bool {
+        // 断片の id は実在 id と衝突させない (`Track::carve_clip_range` と同じ規則)。
+        let mut next = self.next_free_clip_id();
+        let changed = crate::model::carve_range(&mut self.clips, start, end, except_clip_id, || {
+            let id = next;
+            next += 1;
+            id
+        });
+        self.next_clip_id = next;
+        changed
+    }
+
+    /// `beat` を厳密にまたぐ automation クリップを 2 つに割る (**窓を割るだけ**)。
+    ///
+    /// automation の point は幅を持たないので content は切らない — 窓の外の point も
+    /// 補間には効くので、境界に point を挿す必要も無い。 返り値は分割したか。
+    pub fn split_at(&mut self, beat: f64) -> bool {
+        const EPS: f64 = 1e-9;
+        let targets: Vec<usize> = self
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.start_beat < beat - EPS && c.start_beat + c.length_beats > beat + EPS
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let mut next = self.next_free_clip_id();
+        let mut rights: Vec<AutomationClip> = Vec::new();
+        for i in targets {
+            let c = &mut self.clips[i];
+            let (start, len, off) = (c.start_beat, c.length_beats, c.content_offset_beats);
+            let cut = beat - start;
+            let mut right = c.clone();
+            c.length_beats = cut;
+            right.id = next;
+            next += 1;
+            right.start_beat = beat;
+            right.length_beats = len - cut;
+            right.content_offset_beats = off + cut;
+            rights.push(right);
+        }
+        self.next_clip_id = next;
+        self.clips.extend(rights);
+        true
+    }
+
+    /// 既存の重なりを解消する (読み込み時の移行、後ろ勝ち・冪等)。
+    pub fn resolve_clip_overlaps(&mut self) -> bool {
+        let mut next = self.next_free_clip_id();
+        let changed = crate::model::resolve_overlaps(&mut self.clips, || {
+            let id = next;
+            next += 1;
+            id
+        });
+        self.next_clip_id = next;
+        changed
+    }
 }

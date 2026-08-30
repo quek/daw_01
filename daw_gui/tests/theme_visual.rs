@@ -101,7 +101,7 @@ fn populate(app: &mut AppData) {
         && let Some(c) = t.clips.first()
     {
         let key = common::model::ClipKey { track_id: t.id, clip_id: c.id };
-        app.selection.selected_clips = vec![key];
+        app.handle_event(AppEvent::SetClipSelection(vec![key]));
     }
 }
 

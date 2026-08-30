@@ -351,9 +351,8 @@ impl AppData {
                     t.id = video_track_id;
                     t.name = format!("{display_name} (Video)");
                 });
-                let v_clip_id = video_track.alloc_clip_id();
-                video_track.clips.push(Clip {
-                    id: v_clip_id,
+                video_track.place_clip(Clip {
+                    id: 0,
                     start_beat: next_start_beat,
                     length_beats: video_length_beats,
                     content_id: v_content_id,
@@ -396,9 +395,8 @@ impl AppData {
                         t.id = audio_track_id;
                         t.name = format!("{display_name} (Audio)");
                     });
-                    let a_clip_id = audio_track.alloc_clip_id();
-                    audio_track.clips.push(Clip {
-                        id: a_clip_id,
+                    audio_track.place_clip(Clip {
+                        id: 0,
                         start_beat: next_start_beat,
                         length_beats: audio_length_beats,
                         content_id: a_content_id,
@@ -648,17 +646,15 @@ impl AppData {
             );
 
             let track = &mut song.tracks[track_idx];
-            let clip_id = track.alloc_clip_id();
-            track.clips.push(common::model::Clip {
-                id: clip_id,
+            track.place_clip(common::model::Clip {
+                id: 0,
                 start_beat,
                 length_beats,
                 content_id,
                 color: None,
                 auto_lipsync: false,
                 ..Default::default()
-            });
-            clip_id
+            })
         }) else {
             return;
         };
@@ -669,7 +665,6 @@ impl AppData {
         // (= inspector に本文欄が出ない) になる。
         let r = ClipKey { track_id, clip_id: new_clip_id };
         self.set_single_clip_selection(r);
-        self.selection.selected_notes.clear();
         self.select_track(track_id);
 
         self.ui_ephemeral.status_message = "Text clip 追加".into();
@@ -1168,7 +1163,10 @@ pub(crate) fn place_imported_clip(
             clip: Clip { start_beat: 0.0, ..clip },
             launch: common::model::LaunchSettings::default(),
         }),
-        None => track.clips.push(clip),
+        // アレンジ側は非重なり不変条件があるので `place_clip` (上書き規則) を通す。
+        None => {
+            track.place_clip(clip);
+        }
     }
 }
 

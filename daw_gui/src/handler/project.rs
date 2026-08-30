@@ -62,21 +62,20 @@ impl AppData {
         self.selection.selected_scene_ids.clear();
         self.selection.selected_automation_clips.clear();
         self.selection.selected_automation_points.clear();
-        self.selection.selected_clip = None;
-        self.selection.selected_clips.clear();
-        self.selection.selected_notes.clear();
-        self.selection.audio_editor_selected_events.clear();
+        self.selection.time = None;
+        self.selection.range_anchor = None;
+        self.selection.selected_launcher_cells.clear();
+        self.selection.launcher_cell_anchor = None;
+        // (`time = None` が範囲の SSoT を既に捨てている。 ノート / audio event の
+        // 選択はそこから導出されるので、追加で clear する口は要らない。)
         // r.md #71 (プラグインのコピー / 移動): device 選択も project スコープ。
         self.selection.selected_device_ids.clear();
         self.selection.device_anchor = None;
-        self.selection.clip_anchor = None;
-        self.selection.note_anchor = None;
         self.selection.track_anchor = None;
         self.selection.section_anchor = None;
         self.selection.scene_anchor = None;
         self.selection.automation_point_anchor = None;
         self.selection.automation_clip_anchor = None;
-        self.selection.audio_editor_anchor = None;
         self.selection.last_edit_select = None;
 
         // -- 開いているエディタ / インスペクタの対象 ------------------------
@@ -253,18 +252,13 @@ impl AppData {
         // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
         // stable ClipKey 保持なので並べ替え / undo を跨いでも追従する。 clip が
         // 削除されて解決できない key のみ落とす。
-        if let Some(k) = self.selection.selected_clip
-            && self.clip_at(k).is_none()
-        {
-            self.selection.selected_clip = None;
-        }
-        let mut keys = std::mem::take(&mut self.selection.selected_clips);
-        keys.retain(|k| self.clip_at(*k).is_some());
-        self.selection.selected_clips = keys;
-        // note の index は undo で容易にずれるため、安全側で clear する。
-        self.selection.selected_notes.clear();
-        // audio event の選択 index も同様に undo でずれるため clear。
-        self.selection.audio_editor_selected_events.clear();
+        self.prune_selection_lanes();
+        // **ノート / audio event の選択は捨てない。** 選択の SSoT は範囲 1 本
+        // (`docs/plan_range_selection.md`) で、時間は song 絶対拍・レーンは安定 id
+        // なので undo でずれようがない。 消えたクリップ / トラックを指す行は上の
+        // `prune_selection_lanes` が落とす。 旧実装は positional な note index を
+        // 選択に持っていた時代の名残で clear しており、undo のたびに範囲ごと消えて
+        // **ピアノロールが閉じていた** (実機で報告)。
         // (review) automation point 選択 (`point_idx` positional) と inline 編集中
         // point も undo でずれるため clear (notes / audio events と同じ扱い)。
         self.selection.selected_automation_points.clear();
@@ -347,8 +341,8 @@ impl AppData {
         self.selection.selected_track_ids.clear();
         self.selection.selected_scene_ids.clear();
         self.ui_prefs.collapsed_groups.clear();
-        self.selection.selected_clip = None;
-        self.selection.selected_notes.clear();
+        self.selection.time = None;
+        self.selection.range_anchor = None;
         // 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
         // (globals は現状維持 = 従来挙動)。`None` 経路 = action_open_path の旧ファイルと同じ。
         // ループは New で必ず初期化する (前プロジェクトの範囲を持ち越さない)。
@@ -646,6 +640,7 @@ impl AppData {
         match common::project::load_project(&path) {
             Ok(loaded) => {
                 let (mut song, view, loop_region) = (loaded.song, loaded.view, loaded.loop_region);
+                let overlaps_resolved = loaded.overlaps_resolved;
                 tracing::info!(path = %path.display(), "loaded project");
                 song.ensure_ids();
                 Self::migrate_legacy_vocal_tracks(&mut song);
@@ -665,6 +660,13 @@ impl AppData {
                 // 直後にそのキャッシュが捨てられ、decode job も無いまま波形が
                 // 永久に出ない状態になる。
                 self.after_song_replaced();
+                // 重なっていたクリップを上書き規則で解消していたら、中身が変わって
+                // いるので正直に `*` を立てる (`docs/plan_range_selection.md` §6.4)。
+                if overlaps_resolved {
+                    self.song_doc.mark_dirty_after_load_fixup();
+                    self.ui_ephemeral.status_message =
+                        "重なっていたクリップを解消しました (上のクリップが優先)".to_string();
+                }
                 // audio / image / video サムネイルの decode は重いので background
                 // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像 /
                 // サムネイルは streaming で順次出る (begin_asset_decode →

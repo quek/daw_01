@@ -26,6 +26,11 @@ pub const MIN_CLIP_LEN_BEATS: f64 = 0.0625;
 /// ので、**固定していたはずの右端が動く**。
 pub const MIN_NOTE_LEN_BEATS: f64 = 0.0625;
 
+/// `skip_serializing_if` 用: 既定 (張り出しなし) の拍量か。
+fn is_zero_beats(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// A clip is a free-time container of notes positioned along the song
 /// timeline. `start_beat` and `length_beats` define where the clip lives;
 /// the actual notes are stored in `Song.clip_contents` keyed by
@@ -69,6 +74,22 @@ pub struct Clip {
     /// `None` (= inherit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// **隣接クリップとのクロスフェード**で、クリップの窓の**外へ**鳴らし進める量 (拍)。
+    /// `xfade_lead_beats` は先頭側 (手前へ)、`xfade_tail_beats` は末尾側 (先へ)。
+    /// `0.0` = 通常 (窓ぴったりで切る)。
+    ///
+    /// クリップ同士は重ならない (`Track::clips` の不変条件) ので、境界で音を途切れさせない
+    /// には**鳴らす範囲だけ**を境界の向こうへ伸ばす必要がある
+    /// (`docs/plan_range_selection.md` §6.5)。 伸ばした区間は event 側の
+    /// `fade_in_beats` / `fade_out_beats` のランプが覆うので、境界を中心に
+    /// 左が下がりながら右が上がる = 真のクロスフェードになる。
+    ///
+    /// **再生側は隣接クリップが実在するときだけこの値を使う** — クリップを動かして
+    /// 隣が居なくなったら値が残っていても無視されるので、stale で音が漏れない。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub xfade_lead_beats: f64,
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub xfade_tail_beats: f64,
     /// v21 (`docs/plan_pakupaku.md`): 口パク自動生成 clip の印。`true` ⇒ この
     /// clip は vocal の notes+歌詞+`mouth_map` から導出された派生物で、再生成時に
     /// 口 track 上の `auto_lipsync == true` clip は全削除 → 再構築される
@@ -1308,3 +1329,30 @@ pub struct Note {
 //   curve data. `#[serde(untagged)]` dispatch on `ClipContent` picks the
 //   variant based on the disjoint field set (`notes` / `events` / `points`).
 
+
+impl crate::model::ClipWindow for Clip {
+    fn window_id(&self) -> u32 {
+        self.id
+    }
+    fn set_window_id(&mut self, id: u32) {
+        self.id = id;
+    }
+    fn window_start(&self) -> f64 {
+        self.start_beat
+    }
+    fn set_window_start(&mut self, v: f64) {
+        self.start_beat = v;
+    }
+    fn window_len(&self) -> f64 {
+        self.length_beats
+    }
+    fn set_window_len(&mut self, v: f64) {
+        self.length_beats = v;
+    }
+    fn window_offset(&self) -> f64 {
+        self.content_offset_beats
+    }
+    fn set_window_offset(&mut self, v: f64) {
+        self.content_offset_beats = v;
+    }
+}

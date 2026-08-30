@@ -301,7 +301,9 @@ fn アレンジから帯へ運ぶとゴーストが着地スロットに出る()
         .find(|(k, _)| k.row == row2)
         .map(|(_, r)| *r)
         .expect("トラック 2 の行が帯に出ている");
-    let clip_y = row2_rect.y + row2_rect.h * 0.5;
+    // クリップを掴めるのは **ヘッダ帯 (ラベル帯)** だけ — 本体を掴むと時間範囲になる
+    // (`docs/plan_range_selection.md` §3.1)。 行の上端から数 px を狙う。
+    let clip_y = row2_rect.y + 2.0;
 
     // アレンジのクリップを掴む → 帯のスロットへ運ぶ (中心からずらす)。
     let _ = drive(&mut host, &mut app, press(lanes.x + 20.0, clip_y));

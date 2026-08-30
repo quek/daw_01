@@ -1303,8 +1303,9 @@ fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
         // 消えた key は落とす (住所は安定 id なので変換は要らない)。
         let keys: Vec<common::model::ClipKey> =
             refs.iter().filter_map(|r| host.app.live_clip_key(*r)).collect();
-        host.app.selection.selected_clip = keys.last().copied();
-        host.app.selection.selected_clips = keys;
+        // 選択の SSoT は時間範囲 1 本 — クリップ選択はその特殊形として張り直す
+        // (`docs/plan_range_selection.md`)。 production の click と同じ経路を通す。
+        host.app.handle_event(crate::app::AppEvent::SetClipSelection(keys));
     });
     Ok(JsValue::undefined())
 }

@@ -1,5 +1,5 @@
 //! lane 領域 (clip 描画域 = `f.lanes`) の press 振り分け。 ゾーンごとに排他なチェーンで、
-//! 優先順位は audio grip > clip > automation point > **区間 bend** > automation clip > lasso。
+//! 優先順位は audio grip > clip > automation point > **区間 bend** > automation clip > 時間範囲。
 //! 各分岐は消費したことを `PressClaim` に立てて後続を止める。
 //!
 //! r.md #73: 旧 `curve_handle` (選択済 point の中央ハンドル) と `alt_resize`
@@ -10,6 +10,13 @@
 //! が引き続き担う。
 
 use super::*;
+
+/// クリップの占有区間 `[start, end)`。 見えている行に居ないなら `None`。
+fn clip_span(f: &ArrangementFrame<'_>, key: ClipKey) -> Option<(f64, f64)> {
+    let t = f.visible_tracks.iter().find(|t| t.id == key.track_id)?;
+    let c = t.clips.iter().find(|c| c.id == key.clip_id)?;
+    Some((c.start_beat, c.start_beat + c.len_beats))
+}
 
 /// audio grip (gain band / fade corner) → MIDI/Audio clip の Move/Resize。
 /// audio grip が先勝したら clip drag は起動しない (`else if` の排他をそのまま維持)。
@@ -97,26 +104,80 @@ pub(super) fn clip_zone(
         // Shift+press でも drag session を張り、 release の短 click 格下げ経路
         // (`clip_short_click_pos` が `(ctrl, shift)` を持ち回る) で範囲選択に解決する。
         // Shift+Move ドラッグは通常の移動、 Shift+resize は従来どおり time-stretch (#61)。
-        let drag_keys: Vec<ClipKey> = if f.selected_clips.contains(&hit_key) {
-            f.selected_clips.to_vec()
-        } else {
-            vec![hit_key]
+        // クリップの**ヘッダ帯 (ラベル帯) を掴んだときだけ移動**にする。
+        // 本体 (波形 / MIDI 表示部) を掴んだら時間範囲のドラッグへ委譲し、
+        // ヘッダを Alt 付きで掴んだ場合も範囲にする (Live と同じ、
+        // `docs/plan_range_selection.md` §3.1)。 行が低くて本体が消えたら
+        // クリップ全体がヘッダ = 常に移動になる (Live も unfold しないと
+        // クリップ内の時間は選べない)。 端の resize ハンドルは従来どおり。
+        if matches!(kind, ClipDragKind::Move) {
+            let in_header = f
+                .visible_tracks
+                .iter()
+                .enumerate()
+                .find(|(_, t)| t.id == hit_key.track_id)
+                .is_none_or(|(t_idx, t)| {
+                    let row_h = effective_track_row_h(t, f.view.track_row_h);
+                    let header_h = draw::clip_content_inset_top(f.style).min(row_h);
+                    py < f.tops[t_idx] + header_h
+                });
+            if !in_header || f.pointer.modifiers.alt {
+                return; // range_zone が拾う
+            }
+        }
+        // 動かすのは**常に範囲** (`docs/plan_range_selection.md` §6)。「クリップを
+        // 動かす」操作は無く、クリップ 1 つを選んだ状態は範囲がその占有区間と
+        // 一致しているだけ。 掴んだクリップに範囲が掛かっていなければ、そのクリップの
+        // 占有区間を範囲として扱う (release で選択もそこへ張り直る)。
+        // Resize (端ハンドル) はクリップの窓そのものを変える操作なので範囲に関与しない。
+        // 掴んだクリップの**トラック行**に範囲が掛かっているときだけ、その範囲を採る。
+        // オートメーションレーン行だけ掛かっている状態はクリップに関与しない。
+        let live_range = f.time_selection.filter(|sel| {
+            sel.has_lane(common::model::LaneRef::Track(hit_key.track_id))
+                && clip_span(f, hit_key).is_some_and(|(s, e)| sel.intersects(s, e - s))
+        });
+        let (ra, rb) = match live_range {
+            Some(sel) => (sel.start_beat, sel.end_beat),
+            None => clip_span(f, hit_key).unwrap_or((0.0, 0.0)),
         };
         let mut anchors: Vec<ClipDragAnchor> = Vec::new();
-        for k in &drag_keys {
+        if matches!(kind, ClipDragKind::Move) {
+            // 範囲が掛かっているトラック行のクリップを、範囲で切った断片として拾う。
+            // ゴーストが「確定後に動くもの」そのものになる。
+            let tracks: Vec<u32> = match live_range {
+                Some(sel) => sel.track_row_ids().collect(),
+                None => vec![hit_key.track_id],
+            };
+            for (t_idx, t) in f.visible_tracks.iter().enumerate() {
+                if !tracks.contains(&t.id) {
+                    continue;
+                }
+                for c in &t.clips {
+                    let (s, e) = (c.start_beat, c.start_beat + c.len_beats);
+                    let (cs, ce) = (s.max(ra), e.min(rb));
+                    if ce - cs <= 1e-9 {
+                        continue;
+                    }
+                    anchors.push(ClipDragAnchor {
+                        key: ClipKey { track_id: t.id, clip_id: c.id },
+                        start_beat: cs,
+                        len_beats: ce - cs,
+                        track_index: t_idx,
+                    });
+                }
+            }
+        } else if let Some((t_idx, t)) =
+            f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == hit_key.track_id)
+            && let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip_id)
+        {
             // visible_tracks の visible-idx を anchor.track_index に保存 (release frame の
             // delta 計算 + draw_drag_preview の new_idx も同じ visible-idx で動く)。
-            if let Some((t_idx, t)) =
-                f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == k.track_id)
-                && let Some(c) = t.clips.iter().find(|c| c.id == k.clip_id)
-            {
-                anchors.push(ClipDragAnchor {
-                    key: *k,
-                    start_beat: c.start_beat,
-                    len_beats: c.len_beats,
-                    track_index: t_idx,
-                });
-            }
+            anchors.push(ClipDragAnchor {
+                key: hit_key,
+                start_beat: c.start_beat,
+                len_beats: c.len_beats,
+                track_index: t_idx,
+            });
         }
         if !anchors.is_empty() {
             let press_alt = f.pointer.modifiers.alt;
@@ -130,6 +191,7 @@ pub(super) fn clip_zone(
                 last_alt: press_alt,
                 last_ctrl: press_ctrl,
                 last_shift: press_shift,
+                move_range: (ra, rb),
                 anchors,
             });
             claim.session = true;
@@ -138,7 +200,7 @@ pub(super) fn clip_zone(
 }
 
 /// automation 系 4 本 + lasso。
-/// 内部で `point` → `segment_bend` → `automation_clip` → `lasso` を
+/// 内部で `point` → `segment_bend` → `automation_clip` を
 /// **この順**で呼ぶ (優先順位そのもの)。
 pub(super) fn automation(
     ui: &mut Ui<'_, AppData>,
@@ -150,7 +212,6 @@ pub(super) fn automation(
     point(ui, f, hit, claim, actions);
     segment_bend(ui, f, hit, claim);
     automation_clip(ui, f, hit, claim);
-    lasso(ui, f, hit, claim, actions);
 }
 
 /// M14 Phase 63n-8 (#033): point press は **Shift / Ctrl 修飾も accept** (release 時 短 click
@@ -413,60 +474,37 @@ fn automation_clip(
     }
 }
 
-/// M14 Phase 63n-8 (#033): automation point の lasso press — **空き automation lane zone**
-/// (= lane body && !clip && !point && !lane resize splitter) の drag で起動。 Q2=A の zone 排他
-/// 設計: clip / point / splitter 上は既存 drag (move / move-points / resize) を最優先で起動済、
-/// ここはそれら全てが起動しなかった場合の lane body fallback。 既存 MIDI clip rect_select は
-/// automation lane 内では起動しない (= 後段の rect_select block で `!in_automation_lane` で
-/// guard)、 automation lane では空き zone drag が **修飾なしで lasso** (= Shift / Ctrl は
-/// release 時 next 計算で union / XOR 分岐)、 #033 Q2 回答 A と整合。
+/// **時間範囲のドラッグ開始** (`docs/plan_range_selection.md` §3.1)。
 ///
-/// r.md #73: **`!alt` ゲートを外した。** 旧コメントは「Alt は lane resize に予約済
-/// (上の Alt+drag fallback で先勝) なので `!alt` で除外」と書いていたが、 その
-/// Alt+drag resize を撤去したので予約が無効になった。 残すと空き lane zone の
-/// Alt+drag が何も起こさない死角になる。 lasso に snap の概念は無いので Alt に別の
-/// 意味は無く、 線の上の Alt+drag は `segment_bend` が先に `claim.session` を立てて
-/// ここへ来ない (`no_session` 相当のゲートは下の `claim.session` チェック)。
-///
-/// **`automation_lasso_drag` は 11 列挙外なので `claim` は立てない。**
-///
-/// 旧実装はここで `primary_just_pressed` / `pointer.pos` を再テストして `px`/`py` を
-/// 同値 shadow していたが、 `dispatch` 冒頭と同一条件の再評価なので落とした。
-fn lasso(
+/// press 分岐の **最後**に呼ぶ — ここまでで誰も session を張らなかった press
+/// (= 空きレーン / クリップの本体 / Alt+ヘッダ / 空きオートメーションレーン) が
+/// すべて範囲になる。 旧・矩形選択 (marquee) と投げ縄 (lasso) を置き換えた 1 本。
+pub(super) fn range_zone(
     ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
     hit: &PressHit,
-    claim: &PressClaim,
-    actions: &PressActions,
+    claim: &mut PressClaim,
 ) {
-    let (px, py) = (hit.px, hit.py);
-    if !(!claim.splitter && !claim.point && hit.in_lanes) {
+    if claim.splitter || claim.session || claim.point || !hit.in_lanes {
         return;
     }
-    if claim.session || actions.any() {
+    // popup (コンテキストメニュー等) が開いている間は背景の press を拾わない。
+    // context menu は `capture_input == false` で背景 pointer を mask しないので、
+    // item の click が下の arrangement にも届き、範囲が張り直されて選択が消える
+    // (`feedback_popup_click_leaks_to_background`)。
+    if ui.has_open_popups() {
         return;
     }
-    let lane_at = automation_lane_at(
-        &f.visible_tracks,
-        &f.tops,
-        f.view.track_row_h,
-        f.header_pane.x,
-        f.header_pane.w,
-        f.lanes.x,
-        f.lanes.w,
-        f.style,
-        py,
-    );
-    if let Some((_t_idx, _l_idx, _h_rect, body_rect)) = lane_at
-        && px >= body_rect.x
-        && px < body_rect.x + body_rect.w
-    {
-        // body x range 内 (= lane header 外)、 clip / point / splitter は上で先勝で
-        // 既に session 起動 (claim.session で除外済) なので、 lane body の **真の空き zone**
-        // で press したことが確定。 lasso session 起動。
-        let start_modifiers = f.pointer.modifiers;
-        let state: &mut ArrangementState = ui.widget_state(f.wid);
-        state.automation_lasso_drag =
-            Some(AutomationLassoSession { anchor: (px, py), last_mouse: (px, py), start_modifiers });
-    }
+    let anchor_beat = px_to_beat(hit.px, f.lanes.x, f.lanes.w, f.view);
+    let press_alt = f.pointer.modifiers.alt;
+    // **既にある範囲の内側でも新しく引き直す** (Live と同じ) — 素材を動かすのは
+    // クリップの**ヘッダ**を掴んだときだけ。 ヘッダ以外はどこも「範囲を引き直す」。
+    let state: &mut ArrangementState = ui.widget_state(f.wid);
+    state.range_drag = Some(RangeDragSession {
+        anchor_beat,
+        anchor_y: hit.py,
+        last_mouse: (hit.px, hit.py),
+        last_alt: press_alt,
+    });
+    claim.session = true;
 }

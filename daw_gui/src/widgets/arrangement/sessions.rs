@@ -25,6 +25,8 @@ use super::*;
 #[derive(Default)]
 pub(super) struct LiveSessions {
     pub clip_drag: Option<ClipDragSession>,
+    /// 時間範囲のドラッグ (描画中のプレビュー帯に使う)。
+    pub range_drag: Option<RangeDragSession>,
     pub loop_drag: Option<LoopDragSession>,
     pub section_drag: Option<SectionDragSession>,
     pub track_reorder: Option<TrackReorderSession>,
@@ -41,6 +43,8 @@ pub(super) struct LiveSessions {
 #[derive(Default)]
 pub(super) struct ReleasedSessions {
     pub clip_drag: Option<ClipDragSession>,
+    /// 時間範囲のドラッグ (release で `SetTimeSelection` を 1 件発火)。
+    pub range_drag: Option<RangeDragSession>,
     /// 短クリックに格下げされた clip drag の `(last_mouse, last_ctrl, last_shift)`。
     pub clip_short_click_pos: Option<((f32, f32), bool, bool)>,
     pub audio_drag: Option<AudioDragSession>,
@@ -113,6 +117,16 @@ pub(super) fn take(
         }
     }
 
+    live.range_drag = {
+        let state: &mut ArrangementState = ui.widget_state(wid);
+        state.range_drag
+    };
+    released.range_drag = if pointer.primary_just_released {
+        let state: &mut ArrangementState = ui.widget_state(wid);
+        state.range_drag.take()
+    } else {
+        None
+    };
     live.loop_drag = {
         let state: &mut ArrangementState = ui.widget_state(wid);
         state.loop_drag
@@ -330,6 +344,8 @@ pub(super) struct Overlays {
     pub reorder: Option<ReorderOverlay>,
     /// snap 適用済の loop preview 範囲 (commit と同一値)。
     pub loop_preview: Option<(f64, f64)>,
+    /// ドラッグ中の**時間範囲プレビュー** (release の commit と同じ値を先に描く)。
+    pub range_preview: Option<common::model::TimeSelection>,
     /// `released.pending_reorder_hash` の写し (`viewport_key` の材料)。
     pub reorder_hash: u64,
 }
@@ -352,6 +368,34 @@ pub(super) fn overlays(
     // `draw_drag_preview` が **中身入りの半透明コピー** を描くようにしたため (旧: 中身の無い
     // 不透明 ghost が元 clip を覆い隠していた = #24 の主因)。 閾値ゲートは張らない
     // (張ると mouse down のハイライトが消える)。
+    // 時間範囲: release の commit (`release::commit_releases`) と同じ式で先に組む。
+    // 値が食い違うと「ドラッグ中に見えていた範囲と確定した範囲が違う」 になる。
+    let range_preview: Option<common::model::TimeSelection> = live.range_drag.map(|rd| {
+        let cur_beat = px_to_beat(rd.last_mouse.0, f.lanes.x, f.lanes.w, f.view);
+        let a = f.view.snap.snap_beat(rd.anchor_beat, rd.last_alt, f.zoom_x_px_per_beat);
+        let b = f.view.snap.snap_beat(cur_beat, rd.last_alt, f.zoom_x_px_per_beat);
+        let (y0, y1) = if rd.anchor_y <= rd.last_mouse.1 {
+            (rd.anchor_y, rd.last_mouse.1)
+        } else {
+            (rd.last_mouse.1, rd.anchor_y)
+        };
+        let mut lanes: Vec<common::model::LaneRef> = Vec::new();
+        for row in &f.rows {
+            let top = f.lanes.y - f.view.track_top + row.content_top;
+            if top + row.height <= y0 || top >= y1 {
+                continue;
+            }
+            lanes.push(match row.key {
+                ArrangementRowKey::Track(id) => common::model::LaneRef::Track(id),
+                ArrangementRowKey::Lane(key) => common::model::LaneRef::Automation(key),
+            });
+        }
+        common::model::TimeSelection {
+            start_beat: a.min(b).max(0.0),
+            end_beat: a.max(b).max(0.0),
+            lanes,
+        }
+    });
     let clip: Option<(ClipDragSession, f64, i32)> = live.clip_drag.as_ref().map(|nd| {
         let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
         let raw = f64::from(dx) * f.beat_per_px;
@@ -462,6 +506,7 @@ pub(super) fn overlays(
         section: live.section_drag,
         reorder,
         loop_preview,
+        range_preview,
         reorder_hash: released.pending_reorder_hash,
     }
 }

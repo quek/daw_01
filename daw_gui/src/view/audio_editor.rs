@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use crate::widgets::select_modifier::{SelectModifier, range_ordered};
 
 use daw_ui_core::{
     ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformInk,
@@ -363,7 +362,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         return;
     }
     let selected_set: std::collections::HashSet<usize> =
-        app.selection.audio_editor_selected_events.iter().copied().collect();
+        app.selected_audio_event_indices().iter().copied().collect();
     let anchor_idx = app.audio_editor_anchor_event();
     // 矩形選択 (lasso) の hit-test 用に、 描画した event の rect を収集する。
     let mut event_rects: Vec<(usize, Rect)> = Vec::new();
@@ -439,7 +438,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // (r.md #35) Shift+click の範囲選択が使う「event の並び」。 index が時間順なので
     // 0..len がそのまま順序列 (`range_ordered` の入力)。
-    let event_total = audio.events.len();
     // r.md #41: 波形描画の span 列 (event ごとに `event_wave_spans` で埋め直す
     // 使い回しバッファ。 毎フレーム全 event ぶん確保しないため)。
     let mut wave_spans: Vec<common::audio_render::WaveSpan> = Vec::new();
@@ -925,28 +923,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 // Ctrl = Toggle / Shift = RangeFromAnchor。 event は 1 clip 内で時間順に
                 // 並ぶ index なので範囲は 1 次元 (`range_ordered`)。
                 if kind == DragKind::Started {
-                    let modifier = SelectModifier::from_modifiers(
-                        drag.start_modifiers.shift,
-                        drag.start_modifiers.ctrl,
-                    );
-                    let order: Vec<usize> = (0..event_total).collect();
+                    // 選択の SSoT は範囲 1 本なので、修飾キーの意味は 2 つだけ:
+                    // 無修飾 = その event だけ / Ctrl・Shift = 外接まで広げる
+                    // (`docs/plan_range_selection.md` §3.1)。
+                    let additive =
+                        drag.start_modifiers.shift || drag.start_modifiers.ctrl;
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        let prev = app.selection.audio_editor_selected_events.clone();
-                        let anchor = app.selection.audio_editor_anchor;
-                        let next = modifier
-                            .resolve(&prev, idx, || range_ordered(&order, anchor?, idx));
-                        if next != prev {
-                            app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
+                        let mut next = if additive {
+                            app.selected_audio_event_indices()
+                        } else {
+                            Vec::new()
+                        };
+                        if !next.contains(&idx) {
+                            next.push(idx);
                         }
-                        if modifier.updates_anchor() {
-                            app.selection.audio_editor_anchor = Some(idx);
-                        }
+                        app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
                     }));
                 }
             } else if kind == DragKind::Started {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
-                    app.selection.audio_editor_anchor = Some(idx);
                 }));
             } else if kind == DragKind::Continuing && dx.abs() > 1.0 {
                 pending_ghost = Some(PendingGhost::Move { event_rect, dx });
@@ -1026,7 +1022,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .map(|(i, _)| *i)
             .collect();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            let prev = app.selection.audio_editor_selected_events.clone();
+            let prev = app.selected_audio_event_indices();
             let next: Vec<usize> = if union {
                 let mut out = prev.clone();
                 for i in &hit {

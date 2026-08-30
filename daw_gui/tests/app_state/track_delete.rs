@@ -86,7 +86,7 @@ fn header_click_makes_tracks_the_delete_surface() {
     });
     assert_eq!(
         app.edit_surface(false),
-        Some(EditSurface::Clips),
+        Some(EditSurface::TimeRange),
         "前提: click 前の対象面はクリップ"
     );
 
@@ -212,24 +212,28 @@ fn clip_selection_never_targets_the_track_surface() {
     );
     assert_eq!(
         app.edit_surface(false),
-        Some(EditSurface::Clips),
+        Some(EditSurface::TimeRange),
         "それでも Delete の対象はクリップ面"
     );
 
-    // 1 回目の Delete = クリップ削除。
-    app.handle_event(AppEvent::DeleteSelectedClip);
+    // 1 回目の Delete = 範囲の削除 (production の Delete shortcut と同じ関数)。
+    app.delete_current_surface(false);
     let after_clip_delete = visible_ids(&app);
+    assert!(
+        app.selected_clip_refs().is_empty(),
+        "範囲の中のクリップは消える"
+    );
     assert!(
         !app.selection.selected_track_ids.is_empty(),
         "クリップを消してもトラック選択は残る (= 危険な前提が生きている)"
     );
 
-    // 2 回目の Delete: クリップ選択は空、 トラック選択だけが残る。 対象面は
-    // **None** (クリップ面が空になっただけで別の面へ飛ばない) でなければならない。
+    // 2 回目の Delete: 範囲はそのまま残る (Live と同じ) ので対象面は **範囲のまま**。
+    // ここでトラック面へ飛ぶと、Delete 連打でトラックが消える (#43 の回帰)。
     assert_eq!(
         app.edit_surface(false),
-        None,
-        "クリップを消した直後の Delete は対象なし (トラック面へ飛ばない)"
+        Some(EditSurface::TimeRange),
+        "クリップを消しても対象面は範囲のまま (トラック面へ飛ばない)"
     );
 
     // 実際に 2 回目の Delete を撃つ (production の Delete shortcut と同じ関数)。
@@ -260,7 +264,7 @@ fn selecting_a_clip_after_a_header_click_moves_the_surface_back_to_clips() {
 
     assert_eq!(
         app.edit_surface(false),
-        Some(EditSurface::Clips),
+        Some(EditSurface::TimeRange),
         "後からクリップを選べば last-wins でクリップ面が勝つ"
     );
 }
@@ -277,7 +281,7 @@ fn header_click_after_a_clip_selection_moves_the_surface_to_tracks() {
         target: clip_ref(&app, ids[0], clip_id),
         additive: false,
     });
-    assert_eq!(app.edit_surface(false), Some(EditSurface::Clips));
+    assert_eq!(app.edit_surface(false), Some(EditSurface::TimeRange));
 
     select_track_single(&mut app, 1);
 
@@ -387,7 +391,7 @@ fn section_selection_wins_without_clearing_other_surfaces() {
         "セクションを選んだら Delete はセクション面"
     );
     assert!(
-        !app.selection.selected_clips.is_empty(),
+        !app.selected_clip_refs().is_empty(),
         "クリップ選択は破壊されない (強制クリアの撤去)"
     );
 }
@@ -517,13 +521,13 @@ fn master_row_selection_does_not_capture_the_delete_surface() {
     );
     assert_eq!(
         app.edit_surface(false),
-        Some(EditSurface::Clips),
+        Some(EditSurface::TimeRange),
         "が、 対象面は奪わない (クリップ面のまま)"
     );
 
     app.delete_current_surface(false);
     assert!(
-        app.selection.selected_clips.is_empty(),
+        app.selected_clip_refs().is_empty(),
         "Delete はクリップに効く (master 行 click で殺されない)"
     );
     assert_eq!(visible_ids(&app), ids, "トラックは消えない");

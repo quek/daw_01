@@ -844,11 +844,19 @@ pub struct AutomationPointKeyRef {
 /// に分裂し、 `edit_surface` が 1:1 で翻訳する mirror 型になっていた)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditSurface {
+    /// **時間範囲面** (`docs/plan_range_selection.md`)。 クリップ / ノート /
+    /// automation 点 / automation クリップ / audio event の選択はすべてこの 1 面に
+    /// 畳まれた — 「どの面か」 は範囲が掛かっているレーンの種類が既に持っているので、
+    /// 面ごとのタイブレークが要らない。
+    TimeRange,
     AudioEvents,
     Notes,
     AutomationPoints,
     AutomationClips,
-    Clips,
+    /// ランチャー (セッション) のセル面。 グリッドに時間軸が無いので範囲では
+    /// 表せず、唯一「オブジェクト選択」 のまま残る面
+    /// (`docs/plan_range_selection.md` §2.2)。
+    LauncherCells,
     /// トラック面 (ヘッダ / ミキサーストリップ)。 **明示的に選んだときだけ**
     /// 立つ — `selected_track_ids` はクリップ選択の追従 (`select_track`) や
     /// 削除後の自動再選択でも非空になるので、 非空を「削除意図」 の代理にできない
@@ -1815,27 +1823,26 @@ pub(crate) fn load_recent_list(path: Option<PathBuf>) -> crate::recent::RecentFi
 }
 
 /// 選択ノートを複製して `notes` 末尾に追加するピュアロジック (D キー複製の core)。
-/// `selected` の各 index のノートを clone し、選択範囲の beat span
-/// (`max(start+dur) - min(start)`、最低 1/16 拍) ぶん後ろへずらして append する。
+/// `selected` の各 index のノートを clone し、`offset` 拍ぶん後ろへずらして append する。
+///
+/// `offset` は**選択範囲の長さ**を呼び出し側が渡す (`docs/plan_range_selection.md` §6)。
+/// ノートの外接 span から計算してはいけない — 裏拍のパターンは頭と尻に空白があり、
+/// 外接 span で送ると 1 回ごとに詰まってグリッドから外れる。
+///
 /// 元ノートは不変。戻り値は複製ノートの新 index (= 複製後の選択)。
-/// 選択が空 / 該当 index 無しなら `notes` 不変で空 Vec を返す。
-pub(crate) fn duplicate_notes_into(content: &mut MidiContent, selected: &[u32]) -> Vec<u32> {
+/// 選択が空 / 該当 index 無し / `offset <= 0` なら `notes` 不変で空 Vec を返す。
+pub(crate) fn duplicate_notes_into(
+    content: &mut MidiContent,
+    selected: &[u32],
+    offset: f64,
+) -> Vec<u32> {
     let mut clones: Vec<Note> = selected
         .iter()
         .filter_map(|&idx| content.notes.get(idx as usize).cloned())
         .collect();
-    if clones.is_empty() {
+    if clones.is_empty() || offset <= 0.0 {
         return Vec::new();
     }
-    let min_start = clones
-        .iter()
-        .map(|n| n.start_beat)
-        .fold(f64::INFINITY, f64::min);
-    let max_end = clones
-        .iter()
-        .map(|n| n.start_beat + n.duration_beats)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let offset = (max_end - min_start).max(0.0625);
     for n in &mut clones {
         n.start_beat += offset;
         // clone は元 note の `id` も複製する。 per-content 一意 note id 不変条件

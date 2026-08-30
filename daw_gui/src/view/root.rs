@@ -526,6 +526,55 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
 ///
 /// 修飾キーの規約 (daw_01 全体と共通): 無修飾 = 位置 / Ctrl = そのノート自身の量 (長さ) /
 /// Shift = 大きいステップ / Alt = スナップ一時無効。
+/// 範囲がアクティブなときの矢印キー (`docs/plan_range_selection.md` §3.2)。
+///
+/// - 素の ←→ … **範囲内の素材**をグリッド 1 つ分ナッジ (Live §6.9)
+/// - `Alt`+←→ … 同じくナッジ、ただしスナップ無効 (微小量)
+/// - `Shift`+←→ … 範囲の右端を伸縮
+///
+/// ノート面と同じ 12 本のバインドを**面で振り分ける**だけなので、キー割り当ては増えない。
+fn dispatch_range_nudge(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    if !matches!(surface, Some(EditSurface::TimeRange)) {
+        return;
+    }
+    // グリッド 1 つ分 (スナップ OFF なら 1 拍)。 Alt 版は微小量。
+    let snap = crate::view::snap::arrange_snap_config(app);
+    let grid = snap.beat_unit(app.ui_prefs.arrange_zoom_x).unwrap_or(1.0);
+    const FINE: f64 = 1.0 / 64.0;
+    let takes: [(&'static str, f64, bool); 6] = [
+        ("daw.nudge_note_left", -grid, false),
+        ("daw.nudge_note_right", grid, false),
+        ("daw.nudge_note_left_fine", -FINE, false),
+        ("daw.nudge_note_right_fine", FINE, false),
+        ("daw.nudge_note_left_bar", -grid, true),
+        ("daw.nudge_note_right_bar", grid, true),
+    ];
+    // ↑↓ = 範囲をレーン方向へ伸ばす。
+    for (name, dir) in [("daw.nudge_note_up", -1_i32), ("daw.nudge_note_down", 1_i32)] {
+        let n = ui.take_shortcut_count(name).min(64);
+        for _ in 0..n {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.extend_time_selection_lanes(dir);
+            }));
+        }
+    }
+    for (name, delta, is_resize) in takes {
+        let n = ui.take_shortcut_count(name).min(64);
+        if n == 0 {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let total = delta * n as f64;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if is_resize {
+                app.resize_time_selection(total);
+            } else {
+                app.nudge_time_selection(total);
+            }
+        }));
+    }
+}
+
 fn dispatch_note_nudge(ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
     if !matches!(surface, Some(EditSurface::Notes)) {
         return;
@@ -647,7 +696,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // note pitch を最寄り in-scale に一括補正。 selected_notes が空なら
     // clip 全 note、 そうでなければ選択 note のみ。
     if ui.take_shortcut("daw.quantize_pitches_to_scale") {
-        let target = if app.selection.selected_notes.is_empty() {
+        let target = if app.selected_note_ids().is_empty() {
             crate::app::QuantizePitchTarget::SelectedClipAllNotes
         } else {
             crate::app::QuantizePitchTarget::SelectedNotes
@@ -954,8 +1003,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
             // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
             // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
-            let notes: Vec<u32> = if !app.selection.selected_notes.is_empty() {
-                app.selection.selected_notes.clone()
+            let notes: Vec<u32> = if !app.selected_note_ids().is_empty() {
+                app.selected_note_ids()
             } else {
                 app.ui_ephemeral.pianoroll_hover_note.into_iter().collect()
             };
@@ -969,22 +1018,29 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 }));
             }
         } else {
-            let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {
-                // audio waveform editor を開いている: その clip を mute。
-                app.ui_ephemeral.audio_editor_clip.into_iter().collect()
-            } else if app.selection.selected_clip.is_some() || !app.selection.selected_clips.is_empty() {
-                app.selected_clip_refs()
-            } else {
-                app.ui_ephemeral.arrangement_hover_clip.into_iter().collect()
-            };
-            if !targets.is_empty() {
-                let new_muted = !app.all_clips_muted(&targets);
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetClipsMuted {
-                        targets,
-                        muted: new_muted,
-                    });
+            // 範囲が立っていれば **範囲操作** — 境界で分割して範囲部分だけをミュートする
+            // (Live §6.9 "deactivates a selection of material"、
+            // `docs/plan_range_selection.md` §8)。
+            if !is_pianoroll_active && app.selection.time.is_some() {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.apply_mute_time_selection();
                 }));
+            } else {
+                let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {
+                    // audio waveform editor を開いている: その clip を mute。
+                    app.ui_ephemeral.audio_editor_clip.into_iter().collect()
+                } else {
+                    app.ui_ephemeral.arrangement_hover_clip.into_iter().collect()
+                };
+                if !targets.is_empty() {
+                    let new_muted = !app.all_clips_muted(&targets);
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetClipsMuted {
+                            targets,
+                            muted: new_muted,
+                        });
+                    }));
+                }
             }
         }
     }
@@ -993,6 +1049,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // **note nudge より先に**呼ぶ (矢印の取り合いをここで決める)。 対象面が
     // `Notes` のときはランチャーが矢印を取らないので、両者は排他になる。
     crate::view::launcher_keys::dispatch_launcher_keys(app, ui, surface);
+    // 範囲がアクティブなら矢印は範囲操作 (ノート nudge と面で排他)。
+    dispatch_range_nudge(app, ui, surface);
 
     // ----- r.md #67: カーソルキーでノートを移動 / 伸縮 / 音程変更 -----
     dispatch_note_nudge(ui, surface);
@@ -1009,9 +1067,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
             }));
         } else if is_pianoroll_active {
-            let ids = app.all_shown_pianoroll_note_ids();
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetNoteSelection(ids.clone()));
+            // 表示中クリップの全ノートを覆う範囲にする (`docs/plan_range_selection.md` §3.2)。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.select_all_shown_notes();
             }));
         } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
             // automation lane 上: 段階拡大 (#071 で clip 段を追加)。
@@ -1090,18 +1148,6 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     }
 
     // ----- 共有を一括選択 (Shift+L) ------------------------------------------
-    // 選択中 clip と同じ content_id の linked clip group をまとめて選択
-    // (右クリックメニュー「共有を一括選択」と同経路)。 selected_clip が
-    // 無ければ no-op。 text_input focus 中は gui_01 が shortcut を抑制する
-    // ので rename 編集中の Shift+L は発火しない。
-    if ui.take_shortcut("daw.select_linked_clips")
-        && let Some(target) = app.selected_clip_ref()
-    {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SelectLinkedClips(target));
-        }));
-    }
-
     // ----- Automation: A キー (gui_01 #028 §7.3) ----------------------------
     // last-touched parameter (volume / pan / lane default knob 操作で更新) の
     // lane を所有 track に追加。 既存の lane は visible / enabled = true で
@@ -1128,10 +1174,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::SplitClipAtPlayhead { snap: false });
         }));
     }
+    // `j` はビューで意味が分かれる — アレンジャー = 範囲を 1 クリップへ焼き込む /
+    // ピアノロール = **Join Notes** (同じ音のノートを 1 本に結合)。
+    // Live も `Ctrl+J` を Consolidate / Join Notes に振り分けている
+    // (`docs/plan_range_selection.md` §7.4)。
     if ui.take_shortcut("daw.glue_selected_clips") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::GlueSelectedClips);
-        }));
+        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.action_join_selected_notes();
+            }));
+        } else {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::GlueSelectedClips);
+            }));
+        }
     }
 
     // ----- Help -----
@@ -1255,9 +1311,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleSettings)
             }));
-        } else if !app.selection.selected_clips.is_empty()
-            || app.selection.selected_clip.is_some()
-            || !app.selection.selected_notes.is_empty()
+        } else if app.selection.time.is_some()
+            || !app.selection.selected_launcher_cells.is_empty()
+            || !app.selected_note_ids().is_empty()
             || !app.selection.selected_automation_points.is_empty()
             || !app.selection.selected_automation_clips.is_empty()
         {
@@ -1399,8 +1455,7 @@ mod tests {
             }));
         });
         let key = common::model::ClipKey { track_id: 1, clip_id: 10 };
-        app.selection.selected_clip = Some(key);
-        app.selection.selected_clips = vec![key];
+        app.set_clip_selection(vec![key]);
         app.ui_prefs.pianoroll_snap_enabled = true;
         app.ui_prefs.pianoroll_snap_choice = crate::view::snap::CHOICE_PIANOROLL_DEFAULT; // 1/16
         app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
@@ -1451,14 +1506,14 @@ mod tests {
     /// 編集中 clip が deselect → MIDI エディタが空表示になる回帰を防ぐ。
     #[test]
     fn escape_during_lyric_edit_is_not_consumed_by_global_dispatch() {
-        let mut app = build_app();
+        // 選択は範囲からの導出なので、ダミー id ではなく **実在するノート** を選ぶ。
+        let mut app = app_with_selected_note(4.0);
         app.ui_prefs.bottom_panel = 1; // Piano Roll タブ
         app.ui_ephemeral.piano_roll_lyric_editing = true; // 歌詞編集中
-        app.selection.selected_notes = vec![1];
         dispatch_escape(&mut app);
         assert_eq!(
-            app.selection.selected_notes,
-            vec![1],
+            app.selected_note_ids(),
+            vec![AppData::pack_note_id(0, 0)],
             "歌詞編集中の Esc は global dispatch で消費されず note 選択は維持される",
         );
     }
@@ -1470,10 +1525,10 @@ mod tests {
         let mut app = build_app();
         app.ui_prefs.bottom_panel = 1;
         app.ui_ephemeral.piano_roll_lyric_editing = false; // 非編集
-        app.selection.selected_notes = vec![1];
+        app.handle_event(AppEvent::SetNoteSelection(vec![1]));
         dispatch_escape(&mut app);
         assert!(
-            app.selection.selected_notes.is_empty(),
+            app.selected_note_ids().is_empty(),
             "非編集時の Esc は従来どおり note 選択を解除する",
         );
     }
@@ -1499,14 +1554,13 @@ mod tests {
     /// 次の Esc が選択解除に回る)。
     #[test]
     fn escape_closes_resource_panel_before_clearing_selection() {
-        let mut app = build_app();
+        let mut app = app_with_selected_note(4.0);
         app.ui_ephemeral.resource_panel_open = true;
-        app.selection.selected_notes = vec![1];
         dispatch_escape(&mut app);
         assert!(!app.ui_ephemeral.resource_panel_open, "Esc は開いている詳細パネルを閉じる");
         assert_eq!(
-            app.selection.selected_notes,
-            vec![1],
+            app.selected_note_ids(),
+            vec![AppData::pack_note_id(0, 0)],
             "パネルを閉じる Esc は選択を解除しない",
         );
     }
@@ -1516,14 +1570,13 @@ mod tests {
     /// 代わりに選択が消える。
     #[test]
     fn escape_closes_settings_window_before_clearing_selection() {
-        let mut app = build_app();
+        let mut app = app_with_selected_note(4.0);
         app.ui_prefs.settings_open = true;
-        app.selection.selected_notes = vec![1];
         dispatch_escape(&mut app);
         assert!(!app.ui_prefs.settings_open, "Esc は開いている設定 window を閉じる");
         assert_eq!(
-            app.selection.selected_notes,
-            vec![1],
+            app.selected_note_ids(),
+            vec![AppData::pack_note_id(0, 0)],
             "設定 window を閉じる Esc は選択を解除しない",
         );
     }

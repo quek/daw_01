@@ -795,7 +795,7 @@ impl AppData {
     /// (`ClipboardPayload::AudioEvents`) JSON に。最早 start を 0 とした相対に正規化。
     pub fn copy_events_clip(&self) -> Option<(String, usize)> {
         let r = self.ui_ephemeral.audio_editor_clip?;
-        if self.selection.audio_editor_selected_events.is_empty() {
+        if self.selected_audio_event_indices().is_empty() {
             return None;
         }
         let track = self.song_doc.song().track_by_id(r.track_id)?;
@@ -803,7 +803,7 @@ impl AppData {
         let content = self.song_doc.song().clip_contents.get(&clip.content_id)?;
         let events = content.audio_events()?;
         let mut copied: Vec<AudioEvent> = self
-            .selection.audio_editor_selected_events
+            .selected_audio_event_indices()
             .iter()
             .filter_map(|i| events.get(*i).cloned())
             .collect();
@@ -886,7 +886,7 @@ impl AppData {
         }) else {
             return 0;
         };
-        self.selection.audio_editor_selected_events = new_indices;
+        self.set_audio_event_selection(&(new_indices));
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
@@ -1025,14 +1025,16 @@ impl AppData {
                     continue;
                 };
                 let to_track_id = to_track.id;
-                let new_clip_id = to_track.alloc_clip_id();
-                to_track.clips.push(common::model::Clip {
-                    id: new_clip_id,
+                let new_clip_id = to_track.place_clip(common::model::Clip {
+                    id: 0,
                     start_beat: (at_beat + cc.start_beat).max(0.0),
                     length_beats: cc.length_beats,
                     content_id,
                     // clipboard が運んできた窓をそのまま復元 (r.md #44)。
                     content_offset_beats: cc.content_offset_beats,
+                    // 新規クリップにクロスフェードの張り出しは無い。
+                    xfade_lead_beats: 0.0,
+                    xfade_tail_beats: 0.0,
                     color: cc.color,
                     // paste した clip は派生データではなくユーザーの持ち物
                     // (clipboard は `auto_lipsync` を運ばない — clipboard.rs 参照)。
@@ -1059,7 +1061,6 @@ impl AppData {
         let pasted = new_refs.len();
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selection.selected_notes.clear();
         }
         pasted
     }

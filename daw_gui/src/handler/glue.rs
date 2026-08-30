@@ -97,19 +97,48 @@ impl AppData {
     /// rejected with a status message. See `docs/plan_audio_clip.md`
     /// §3.3 / §3.3.2.
     pub(crate) fn action_glue_selected_clips(&mut self) {
-        if self.selection.selected_clips.len() < 2 {
-            self.ui_ephemeral.status_message = format!(
-                "Glue: 2 つ以上の clip を選択してください (現在 {} 個)",
-                self.selection.selected_clips.len()
-            );
+        let Some(sel) = self.selection.time.clone() else {
+            self.ui_ephemeral.status_message = "Glue: 範囲を選択してください".to_string();
             return;
+        };
+        // `J` は 1 回の操作なので **1 undo step** に束ねる。 境界の分割 (1 回) と
+        // トラックごとの結合 (N 回) が別々の step になると、1 回の `J` を戻すのに
+        // N+1 回 Undo が要る。
+        self.song_doc.begin_gesture();
+        // **範囲の境界でクリップを割ってから集める。** はみ出した部分は元のクリップと
+        // して残り、範囲の中身だけが 1 クリップへ焼き込まれる (Live の `Ctrl+E`
+        // "Split Clip at Selection" と同じ切り出し、`docs/plan_range_selection.md` §7.1)。
+        let range_tracks: Vec<u32> = sel
+            .lanes
+            .iter()
+            .filter_map(|l| match l {
+                common::model::LaneRef::Track(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        {
+            let (a, b) = (sel.start_beat, sel.end_beat);
+            let tracks = range_tracks.clone();
+            self.edit_song(|song| {
+                for track_id in &tracks {
+                    crate::handler::range_ops::split_track_at(song, *track_id, a);
+                    crate::handler::range_ops::split_track_at(song, *track_id, b);
+                }
+            });
         }
 
-        // Group selected clips by track.
+        // 範囲に**完全に入る**クリップだけをトラック別に集める (境界で割った後なので
+        // 部分的に掛かるクリップはもう無い)。
         let mut by_track: std::collections::BTreeMap<u32, Vec<ClipKey>> =
             std::collections::BTreeMap::new();
         for r in self.selected_clip_refs() {
-            by_track.entry(r.track_id).or_default().push(r);
+            let Some(clip) = self.song_doc.song().clip_by_key(r) else {
+                continue;
+            };
+            let (s, e) = clip.song_window();
+            if s >= sel.start_beat - 1e-9 && e <= sel.end_beat + 1e-9 {
+                by_track.entry(r.track_id).or_default().push(r);
+            }
         }
 
         let mut new_refs: Vec<ClipKey> = Vec::new();
@@ -117,9 +146,13 @@ impl AppData {
         let mut had_mixed_kind = false;
 
         for (track_id, mut refs) in by_track {
-            if refs.len() < 2 {
+            if refs.is_empty() {
                 continue;
             }
+            // 混在フラグは**トラックごとに閉じる**。 ループの外で持つと、1 トラックの
+            // 混在で以降の全トラックが skip され、しかも先に結合済みのトラックの編集は
+            // 残ったまま「Glue できません」で終わっていた (旧バグ)。
+            let mut mixed_in_track = false;
             // Sort by start_beat ascending (clip indices may differ).
             refs.sort_by(|a, b| {
                 let ta = self
@@ -148,6 +181,7 @@ impl AppData {
                 Audio,
                 Video,
                 Image,
+                Text,
             }
             let mut glue_kind: Option<GlueKind> = None;
             for r in &refs {
@@ -170,27 +204,22 @@ impl AppData {
                     // stale link here is unreachable, but be defensive
                     // and treat as a kind change to abort.
                     ClipContent::Automation(_) => {
-                        had_mixed_kind = true;
+                        mixed_in_track = true;
                         break;
                     }
-                    // Text clip Glue は後 commit で実装。 まずは「混在」
-                    // 扱いで abort、 Image / Video / Audio / MIDI 同士は
-                    // 動作維持。
-                    ClipContent::Text(_) => {
-                        had_mixed_kind = true;
-                        break;
-                    }
+                    ClipContent::Text(_) => GlueKind::Text,
                 };
                 match glue_kind {
                     None => glue_kind = Some(this_kind),
                     Some(prev) if prev != this_kind => {
-                        had_mixed_kind = true;
+                        mixed_in_track = true;
                         break;
                     }
                     _ => {}
                 }
             }
-            if had_mixed_kind {
+            if mixed_in_track {
+                had_mixed_kind = true;
                 continue;
             }
             let glue_kind = match glue_kind {
@@ -198,9 +227,11 @@ impl AppData {
                 None => continue,
             };
 
-            // Compute combined range + collect content fragments.
-            let mut combined_start = f64::INFINITY;
-            let mut combined_end = f64::NEG_INFINITY;
+            // **結合範囲 = 選択範囲そのもの** (`docs/plan_range_selection.md` §7.1)。
+            // 範囲が中身より広ければ、前後の空白は content 内の「何も無い区間」として
+            // 自然に表現される (`content_offset_beats` を負にする必要は無い)。
+            let combined_start = sel.start_beat;
+            let combined_end = sel.end_beat;
             let mut combined_name = String::new();
             #[derive(Default)]
             struct Fragments {
@@ -208,6 +239,7 @@ impl AppData {
                 audio_events: Vec<AudioEvent>,
                 video_events: Vec<common::model::VideoEvent>,
                 image_events: Vec<common::model::ImageEvent>,
+                text_events: Vec<common::model::TextEvent>,
             }
             let mut frags = Fragments::default();
 
@@ -218,14 +250,10 @@ impl AppData {
                 let Some(clip) = track.clip_by_id(r.clip_id) else {
                     continue;
                 };
-                let s = clip.start_beat;
-                let e = s + clip.length_beats;
                 if combined_name.is_empty() {
                     combined_name =
                         self.song_doc.song().content_name(clip.content_id).to_string();
                 }
-                combined_start = combined_start.min(s);
-                combined_end = combined_end.max(e);
                 let Some(content) = self.song_doc.song().clip_contents.get(&clip.content_id)
                 else {
                     continue;
@@ -307,10 +335,23 @@ impl AppData {
                             frags.video_events.push(cropped);
                         }
                     }
-                    // Text clip Glue は後 commit で実装。 abort 済み
-                    // (had_mixed_kind = true) なので reach 不能、 防衛的
-                    // に no-op。
-                    ClipContent::Text(_) => {}
+                    // Text (字幕 / タイトル) は時間軸 source を持たないので、
+                    // image と同じく窓との交差で表示区間を切るだけ。
+                    ClipContent::Text(text) => {
+                        for ev in &text.events {
+                            let e0 = ev.event_start_in_clip_beats.max(win_start);
+                            let e1 = (ev.event_start_in_clip_beats + ev.event_length_beats)
+                                .min(win_end);
+                            if e1 <= e0 {
+                                continue;
+                            }
+                            frags.text_events.push(common::model::TextEvent {
+                                event_start_in_clip_beats: e0 + offset_into_combined,
+                                event_length_beats: e1 - e0,
+                                ..ev.clone()
+                            });
+                        }
+                    }
                 }
             }
             if !combined_start.is_finite() || !combined_end.is_finite() {
@@ -345,6 +386,9 @@ impl AppData {
                 }),
                 GlueKind::Image => ClipContent::Image(common::model::ImageContent {
                     events: frags.image_events,
+                }),
+                GlueKind::Text => ClipContent::Text(common::model::TextContent {
+                    events: frags.text_events,
                 }),
                 GlueKind::Midi => {
                     let mut notes = frags.midi_notes;
@@ -398,14 +442,16 @@ impl AppData {
                     track.remove_clip_by_id(r.clip_id);
                 }
                 // Append the merged clip.
-                let new_clip_id = track.alloc_clip_id();
-                track.clips.push(Clip {
-                    id: new_clip_id,
+                let new_clip_id = track.place_clip(Clip {
+                    id: 0,
                     start_beat: combined_start,
                     length_beats: combined_len,
                     content_id: new_content_id,
                     // 結合 content は combined_start を原点に組み直したので窓は先頭から。
                     content_offset_beats: 0.0,
+                    // 新規クリップにクロスフェードの張り出しは無い。
+                    xfade_lead_beats: 0.0,
+                    xfade_tail_beats: 0.0,
                     color: None,
                     auto_lipsync: false,
                     lipsync_gen: 0,
@@ -422,22 +468,31 @@ impl AppData {
 
         if had_mixed_kind {
             tracing::warn!("Glue rejected: mixed kinds");
-            self.ui_ephemeral.status_message =
-                "Glue: MIDI / Audio / Video / Image / Vocal clip が混在しているため Glue できません"
-                    .into();
-            return;
+            // 混在したトラックだけを飛ばし、他のトラックの結合は活かす
+            // (旧実装は 1 トラックの混在で以降の全トラックを skip しつつ、
+            // 先に結合済みのトラックの編集は残したまま中断していた)。
+            if glued_count == 0 {
+                self.ui_ephemeral.status_message =
+                    "Glue: 種類が混在しているため結合できません".into();
+                return;
+            }
         }
         if glued_count == 0 {
-            tracing::warn!("Glue: glued_count==0 (no track had 2+ clips)");
+            self.song_doc.end_gesture();
+            tracing::warn!("Glue: glued_count==0 (範囲内にクリップが無い)");
             self.ui_ephemeral.status_message =
-                "Glue: 同じ track 上で 2 つ以上の clip を選択してください".into();
+                "Glue: 範囲の中にクリップがありません".into();
             return;
         }
 
+        self.song_doc.end_gesture();
         tracing::info!(glued_count, ?new_refs, "Glue completed");
         self.select_new_clips(&new_refs);
-        self.selection.selected_notes.clear();
-        self.ui_ephemeral.status_message = format!("Glue: {glued_count} 箇所を結合しました");
+        self.ui_ephemeral.status_message = if had_mixed_kind {
+            format!("Glue: {glued_count} 箇所を結合しました (種類が混在したトラックは除外)")
+        } else {
+            format!("Glue: {glued_count} 箇所を結合しました")
+        };
     }
 
 }

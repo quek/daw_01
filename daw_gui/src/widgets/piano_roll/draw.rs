@@ -633,3 +633,50 @@ pub(super) fn draw_velocity_lane<M: ?Sized + 'static>(
         });
     }
 }
+
+/// **時間範囲の帯**をピアノロールに描く (`docs/plan_range_selection.md` §4)。
+///
+/// アレンジャーと同じ見た目 — 半透明の明色で塗り、左右端に縦線。 ただし「レーン」 は
+/// **鍵盤の行** (Live の "key track") なので、範囲に入っている鍵盤の行だけを塗る。
+/// ノートより手前に重ねるので、範囲がノートを部分的に覆っているときも境目が見える。
+pub(super) fn draw_time_range_overlay<M: ?Sized + 'static>(
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
+    grid: Rect,
+    view: PianoRollView,
+    range: (f64, f64),
+    pitches: &[u8],
+    style: &PianoRollStyle,
+) {
+    if pitches.is_empty() {
+        return;
+    }
+    let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
+    let x0 = (grid.x + ((range.0 - view.start_beat) * beat_to_px) as f32).max(grid.x);
+    let x1 = (grid.x + ((range.1 - view.start_beat) * beat_to_px) as f32).min(grid.x + grid.w);
+    if x1 <= x0 {
+        return;
+    }
+    let geom = RowGeometry::compute(view, grid);
+    for pitch in pitches {
+        let (y, h) = geom.pitch_to_y_and_h(*pitch);
+        // 行の実効高 (fold では圧縮される) ぶんを塗る。 grid の外は clip する。
+        let y0 = y.max(grid.y);
+        let y1 = (y + h).min(grid.y + grid.h);
+        if y1 <= y0 {
+            continue;
+        }
+        hctx.push_rect(note_rect_command(
+            Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+            style.time_range_fill,
+            0.0,
+        ));
+    }
+    // 左右端の縦線は grid の縦いっぱいに 1 本ずつ (どこからどこまでが範囲かを示す)。
+    for x in [x0, x1 - 1.0] {
+        hctx.push_rect(note_rect_command(
+            Rect { x, y: grid.y, w: 1.0, h: grid.h },
+            style.time_range_edge,
+            0.0,
+        ));
+    }
+}

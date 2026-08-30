@@ -94,9 +94,6 @@ fn view_state_snapshot_restore_roundtrips() {
     app.ui_prefs.expanded_automation_tracks.insert(2);
     let pv = PianoRollViewState { zoom_x: 111.0, zoom_y: 20.0, top_pitch: 70, scroll_beat: 2.0 };
     app.ui_prefs.piano_roll_views.insert(key_a, pv);
-    // 開いていたクリップ (= 開き直しで復元されるべき選択)。
-    app.selection.selected_clip = Some(key_a);
-    app.selection.selected_clips = vec![key_a];
     // ループ (ON/OFF + 範囲) も表示状態と同じ扱いで往復する。
     app.handle_event(AppEvent::SetLoopRange { start: 3.0, end: 11.0 });
     app.handle_event(AppEvent::ToggleLoop);
@@ -110,8 +107,6 @@ fn view_state_snapshot_restore_roundtrips() {
     app.ui_prefs.master_row_automation_expanded = false;
     app.ui_prefs.expanded_automation_tracks.clear();
     app.ui_prefs.piano_roll_views.clear();
-    app.selection.selected_clip = None;
-    app.selection.selected_clips.clear();
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 0.0 });
     app.handle_event(AppEvent::ToggleLoop);
 
@@ -128,12 +123,6 @@ fn view_state_snapshot_restore_roundtrips() {
         Some(pv),
         "per-clip piano roll view が復元される"
     );
-    assert_eq!(
-        app.selection.selected_clip,
-        Some(key_a),
-        "開いていたクリップ選択が復元される (= 開き直しでピアノロールが空にならない)"
-    );
-    assert_eq!(app.selection.selected_clips, vec![key_a]);
     assert_eq!(
         app.transport.loop_region,
         common::model::LoopRegion { enabled: true, start_beat: 3.0, end_beat: 11.0 },

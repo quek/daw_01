@@ -211,7 +211,7 @@ fn z_は対象面ごとに片方の選択だけを_framing_する() {
             ..Default::default()
         });
     });
-    app.selection.selected_clips = vec![ClipKey { track_id, clip_id: 1 }];
+    app.handle_event(AppEvent::SetClipSelection(vec![ClipKey { track_id, clip_id: 1 }]));
     // automation clip を beat 8..12 に。 両方が同時選択された状態。
     add_track_automation_clip(&mut app, 0, 1, 1, 8.0, 4.0);
     app.selection.selected_automation_clips = vec![AutomationClipKey { track: track_id, lane: 1, clip: 1 }];
@@ -305,7 +305,7 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
     assert_eq!(app.ui_prefs.automation_lane_row_overrides.get(&lane_key).copied(), Some(600));
 
     // 別対象 (MIDI clip) を選んで fresh な Z → 横ズーム開始で override 破棄。
-    app.selection.selected_clips = vec![ClipKey { track_id, clip_id: 1 }];
+    app.handle_event(AppEvent::SetClipSelection(vec![ClipKey { track_id, clip_id: 1 }]));
     app.handle_event(AppEvent::ZoomArrangeToSelectedClip { automation: false });
     assert!(
         app.ui_prefs.automation_lane_row_overrides.is_empty(),
@@ -317,7 +317,7 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
     // r.md #63: 行は widget が積んだ 3 行 (master + track + lane)、 行高に上限は無いので
     // 600/3 = 200 が均等高 (旧実装の clamp(16, 96) は「全体表示なのに下半分が空く」
     // 原因だったので撤去)。
-    app.selection.selected_clips.clear();
+    app.handle_event(AppEvent::SetClipSelection(Vec::new()));
     app.selection.selected_automation_clips = vec![AutomationClipKey { track: track_id, lane: 1, clip: 1 }];
     set_arrange_layout(&mut app, 800.0, 600.0, &rows);
     app.handle_event(AppEvent::ZoomArrangeToSelectedClip { automation: true });
@@ -365,7 +365,7 @@ fn z_縦ズームは展開レーンを含めて行位置と行高を決める() 
             }));
         });
         let sel_track = if sel == 0 { track_a } else { TRACK_B };
-        app.selection.selected_clips = vec![ClipKey { track_id: sel_track, clip_id: 1 }];
+        app.handle_event(AppEvent::SetClipSelection(vec![ClipKey { track_id: sel_track, clip_id: 1 }]));
         set_arrange_layout(
             &mut app,
             800.0,

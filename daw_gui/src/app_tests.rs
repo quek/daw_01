@@ -476,10 +476,10 @@ mod note_duplicate_tests {
     #[test]
     fn single_note_duplicated_after_itself() {
         let mut c = content(vec![note(0.0, 1.0, 60)]);
-        let new_ids = duplicate_notes_into(&mut c, &[0]);
+        let new_ids = duplicate_notes_into(&mut c, &[0], 1.0);
         assert_eq!(new_ids, vec![1]);
         assert_eq!(c.notes.len(), 2);
-        // offset = (0+1) - 0 = 1 → 複製は start 1.0、長さ/pitch は維持
+        // offset = 範囲の長さ 1.0 → 複製は start 1.0、長さ/pitch は維持
         assert_eq!(c.notes[1].start_beat, 1.0);
         assert_eq!(c.notes[1].duration_beats, 1.0);
         assert_eq!(c.notes[1].pitch, 60);
@@ -490,9 +490,9 @@ mod note_duplicate_tests {
 
     #[test]
     fn multi_note_keeps_relative_positions_and_shifts_by_span() {
-        // [0,1) と [2,3)。選択範囲 span = 3 - 0 = 3。
+        // [0,1) と [2,3)。範囲の長さ = 3。
         let mut c = content(vec![note(0.0, 1.0, 60), note(2.0, 1.0, 64)]);
-        let new_ids = duplicate_notes_into(&mut c, &[0, 1]);
+        let new_ids = duplicate_notes_into(&mut c, &[0, 1], 3.0);
         assert_eq!(new_ids, vec![2, 3]);
         assert_eq!(c.notes.len(), 4);
         assert_eq!(c.notes[2].start_beat, 3.0); // 0 + 3
@@ -504,9 +504,9 @@ mod note_duplicate_tests {
 
     #[test]
     fn subset_selection_duplicates_only_selected() {
-        // 3 ノート、index 0 と 2 だけ選択。選択範囲 span = (2+1) - 0 = 3。
+        // 3 ノート、index 0 と 2 だけ選択。範囲の長さ = 3。
         let mut c = content(vec![note(0.0, 1.0, 60), note(1.0, 1.0, 62), note(2.0, 1.0, 64)]);
-        let new_ids = duplicate_notes_into(&mut c, &[0, 2]);
+        let new_ids = duplicate_notes_into(&mut c, &[0, 2], 3.0);
         assert_eq!(new_ids, vec![3, 4]);
         assert_eq!(c.notes.len(), 5);
         assert_eq!(c.notes[3].start_beat, 3.0); // 0 + 3
@@ -521,7 +521,7 @@ mod note_duplicate_tests {
     #[test]
     fn empty_selection_is_noop() {
         let mut c = content(vec![note(0.0, 1.0, 60)]);
-        let new_ids = duplicate_notes_into(&mut c, &[]);
+        let new_ids = duplicate_notes_into(&mut c, &[], 1.0);
         assert!(new_ids.is_empty());
         assert_eq!(c.notes.len(), 1);
     }
@@ -529,7 +529,7 @@ mod note_duplicate_tests {
     #[test]
     fn out_of_range_index_ignored() {
         let mut c = content(vec![note(0.0, 1.0, 60)]);
-        let new_ids = duplicate_notes_into(&mut c, &[5]);
+        let new_ids = duplicate_notes_into(&mut c, &[5], 1.0);
         assert!(new_ids.is_empty());
         assert_eq!(c.notes.len(), 1);
     }

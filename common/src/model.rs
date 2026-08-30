@@ -13,18 +13,23 @@ use crate::scale::ScaleChange;
 // 絶対パスは不変。wire 型を含むため common/build.rs の WIRE_SOURCES にも 4 ファイルを
 // 登録している (invariant #7: fingerprint handshake の検出網に穴を開けない)。
 mod automation;
+mod clip_window;
 mod content;
+mod content_split;
 mod ids;
 mod midi_bind;
 mod modulation;
 mod session;
+mod time_selection;
 mod track;
 pub use automation::*;
+pub use clip_window::*;
 pub use content::*;
 pub use ids::*;
 pub use midi_bind::*;
 pub use modulation::*;
 pub use session::*;
+pub use time_selection::*;
 pub use track::*;
 
 /// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。
@@ -498,13 +503,6 @@ pub struct ViewState {
     // ---- 下部パネル ----
     #[serde(default)]
     pub bottom_panel: u8,
-    // ---- クリップ選択 (= 開き直したとき「編集していたクリップ」を復元する) ----
-    /// 選択 anchor (= ピアノロール / インスペクタが表示するクリップ)。
-    #[serde(default)]
-    pub selected_clip: Option<ClipKey>,
-    /// 選択集合。
-    #[serde(default)]
-    pub selected_clips: Vec<ClipKey>,
     // ---- per-clip view (Ableton Live / Bitwig 流) ----
     #[serde(default)]
     pub piano_roll_views: Vec<(ClipKey, PianoRollViewState)>,
@@ -1108,7 +1106,9 @@ impl Song {
         for (tid, mut c) in taken_clips {
             c.start_beat += dest2;
             if let Some(t) = self.tracks.iter_mut().find(|t| t.id == tid) {
-                t.clips.push(c);
+                // 非重なり不変条件はここも通す (帯は ripple で空けた所へ戻すので
+                // 実際には削られないが、規則の適用点を 1 つに保つ)。
+                t.place_clip(c);
             }
         }
         for (tid, lid, mut c) in taken_auto {
@@ -1188,9 +1188,10 @@ impl Song {
             let tid = t.id;
             let srcs: Vec<Clip> = t.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
             for mut c in srcs {
-                let id = t.next_clip_id.max(1);
-                t.next_clip_id = id + 1;
-                c.id = id;
+                // 実在 id と衝突しない採番 (`Track::alloc_clip_id`)。 counter だけを
+                // 信じると、複製が既存クリップと同じ id を持ち `place_clip` で
+                // 元クリップを消してしまう。
+                c.id = t.alloc_clip_id();
                 c.start_beat -= a;
                 copies_clips.push((tid, c));
             }
@@ -1242,7 +1243,9 @@ impl Song {
         for (tid, mut c) in copies_clips {
             c.start_beat += dest_start;
             if let Some(t) = self.tracks.iter_mut().find(|t| t.id == tid) {
-                t.clips.push(c);
+                // 非重なり不変条件はここも通す (帯は ripple で空けた所へ戻すので
+                // 実際には削られないが、規則の適用点を 1 つに保つ)。
+                t.place_clip(c);
             }
         }
         for (tid, lid, mut c) in copies_auto {
@@ -1325,9 +1328,11 @@ impl Song {
 
     /// 全トラック clip / track automation clip /
     /// `song_lanes` clip のうち `beat` を**厳密にまたぐ** (`start < beat < start+len`) ものを
-    /// 2 つに分割する。 左 clip は元 `content_id` を保持して長さを `beat` まで詰め (= content の
-    /// 先頭部分のみ再生)、 右 clip は `cut = beat - start` ぶん左シフトした **fork content** を
-    /// 新規採番して持つ (元 content は pooled で他 clip が共有するため不変)。 セクション移動の
+    /// 2 つに分割する。 **content は一切触らず、窓 (`start_beat` / `length_beats` /
+    /// `content_offset_beats`) を 2 つに割るだけ** — 左断片は長さを `beat` まで詰め、
+    /// 右断片は `content_offset_beats` を `cut = beat - start` ぶん進める。 両断片は同じ
+    /// `content_id` を共有した 2 つの窓になるので、 linked clip の関係も、 窓の外に隠れて
+    /// いた素材も壊れない (窓モデル、 `docs/plan_clip_content_window.md`)。 セクション移動の
     /// 前にこれを境界 `a` / `b` で呼ぶと、 以降の「`start_beat ∈ [a,b)`」 membership 抽出が
     /// 境界跨ぎ clip でも正確になる。 歌声 clip も MIDI として分割され、 右断片は note 集合が
     /// 変わるのでキャッシュ key が変化し自動で再合成される。
@@ -1341,17 +1346,17 @@ impl Song {
                 };
                 if start < beat && beat < start + len {
                     let cut = beat - start;
-                    // r.md #44: content を切る位置は content-local (窓 offset ぶん進む)。
-                    // 右断片の content は `cut` ぶん左シフト済なので窓は先頭から。
-                    let right_cid =
-                        self.fork_content_shifted_left(cid, off + cut);
+                    // 跨ぐ note / event は content 側で切る (共有されていれば CoW)。
+                    // その上で窓を 2 つに割る — 両断片は同じ content を別の窓で見る。
+                    let cid = self.split_content_at(cid, off + cut);
                     let right_id = self.tracks[ti].alloc_clip_id();
                     let mut right = self.tracks[ti].clips[i].clone();
                     right.id = right_id;
-                    right.content_id = right_cid;
+                    right.content_id = cid;
                     right.start_beat = beat;
                     right.length_beats = len - cut;
-                    right.content_offset_beats = 0.0;
+                    right.content_offset_beats = off + cut;
+                    self.tracks[ti].clips[i].content_id = cid;
                     self.tracks[ti].clips[i].length_beats = cut;
                     self.tracks[ti].clips.insert(i + 1, right);
                     i += 2;
@@ -1362,22 +1367,19 @@ impl Song {
             for li in 0..self.tracks[ti].automation_lanes.len() {
                 let mut j = 0;
                 while j < self.tracks[ti].automation_lanes[li].clips.len() {
-                    let (start, len, cid, off) = {
+                    let (start, len, off) = {
                         let c = &self.tracks[ti].automation_lanes[li].clips[j];
-                        (c.start_beat, c.length_beats, c.content_id, c.content_offset_beats)
+                        (c.start_beat, c.length_beats, c.content_offset_beats)
                     };
                     if start < beat && beat < start + len {
                         let cut = beat - start;
-                        let right_cid = self.fork_content_shifted_left(cid, off + cut);
                         let lane = &mut self.tracks[ti].automation_lanes[li];
-                        let right_id = lane.next_clip_id.max(1);
-                        lane.next_clip_id = right_id + 1;
+                        let right_id = lane.alloc_clip_id();
                         let mut right = lane.clips[j].clone();
                         right.id = right_id;
-                        right.content_id = right_cid;
                         right.start_beat = beat;
                         right.length_beats = len - cut;
-                        right.content_offset_beats = 0.0;
+                        right.content_offset_beats = off + cut;
                         lane.clips[j].length_beats = cut;
                         lane.clips.insert(j + 1, right);
                         j += 2;
@@ -1390,22 +1392,19 @@ impl Song {
         for li in 0..self.song_lanes.len() {
             let mut j = 0;
             while j < self.song_lanes[li].clips.len() {
-                let (start, len, cid, off) = {
+                let (start, len, off) = {
                     let c = &self.song_lanes[li].clips[j];
-                    (c.start_beat, c.length_beats, c.content_id, c.content_offset_beats)
+                    (c.start_beat, c.length_beats, c.content_offset_beats)
                 };
                 if start < beat && beat < start + len {
                     let cut = beat - start;
-                    let right_cid = self.fork_content_shifted_left(cid, off + cut);
                     let lane = &mut self.song_lanes[li];
-                    let right_id = lane.next_clip_id.max(1);
-                    lane.next_clip_id = right_id + 1;
+                    let right_id = lane.alloc_clip_id();
                     let mut right = lane.clips[j].clone();
                     right.id = right_id;
-                    right.content_id = right_cid;
                     right.start_beat = beat;
                     right.length_beats = len - cut;
-                    right.content_offset_beats = 0.0;
+                    right.content_offset_beats = off + cut;
                     lane.clips[j].length_beats = cut;
                     lane.clips.insert(j + 1, right);
                     j += 2;
@@ -1413,85 +1412,6 @@ impl Song {
                     j += 1;
                 }
             }
-        }
-    }
-
-    /// `content_id` の content を clip-local で `cut` 左シフトした新 content を
-    /// 採番して返す (clip 分割の右側用)。 元 content は不変 (pooled 共有のため)。 linked clip
-    /// 名も引き継ぐ。
-    fn fork_content_shifted_left(&mut self, content_id: ContentId, cut: f64) -> ContentId {
-        let mut content = self.clip_contents.get(&content_id).cloned().unwrap_or_default();
-        Self::shift_content_left(&mut content, cut);
-        let new_id = self.alloc_content_id();
-        self.clip_contents.insert(new_id, content);
-        if let Some(name) = self.clip_content_names.get(&content_id).cloned() {
-            self.clip_content_names.insert(new_id, name);
-        }
-        new_id
-    }
-
-    /// clip content を clip-local で `cut` 拍ぶん左へずらす。 `cut` より前で完全に
-    /// 終わる event/note/point は落とし、 `cut` をまたぐものは先頭 `0` にクランプして長さを
-    /// 詰める。 audio は trim 分を `source_start_frames` に按分換算して進める (非ストレッチ前提の
-    /// 線形近似)。 automation は `cut` 前の point を落とす (境界値の補間 point 挿入は次段)。
-    fn shift_content_left(content: &mut ClipContent, cut: f64) {
-        macro_rules! shift_overlay {
-            ($events:expr) => {{
-                $events.retain_mut(|ev| {
-                    let new_end = (ev.event_start_in_clip_beats + ev.event_length_beats) - cut;
-                    if new_end <= 0.0 {
-                        return false;
-                    }
-                    let new_start = (ev.event_start_in_clip_beats - cut).max(0.0);
-                    ev.event_start_in_clip_beats = new_start;
-                    ev.event_length_beats = new_end - new_start;
-                    true
-                });
-            }};
-        }
-        match content {
-            ClipContent::Midi(m) => {
-                m.notes.retain_mut(|n| {
-                    let new_end = (n.start_beat + n.duration_beats) - cut;
-                    if new_end <= 0.0 {
-                        return false;
-                    }
-                    let new_start = (n.start_beat - cut).max(0.0);
-                    n.start_beat = new_start;
-                    n.duration_beats = new_end - new_start;
-                    true
-                });
-            }
-            ClipContent::Audio(a) => {
-                a.events.retain_mut(|ev| {
-                    let new_end = (ev.event_start_in_clip_beats + ev.event_length_beats) - cut;
-                    if new_end <= 0.0 {
-                        return false;
-                    }
-                    let new_start = ev.event_start_in_clip_beats - cut;
-                    if new_start < 0.0 {
-                        let trimmed = -new_start;
-                        let total = ev.event_length_beats.max(f64::EPSILON);
-                        let frames = ev.source_end_frames.saturating_sub(ev.source_start_frames);
-                        let adv = (trimmed / total * frames as f64) as u64;
-                        ev.source_start_frames = ev.source_start_frames.saturating_add(adv);
-                        ev.event_start_in_clip_beats = 0.0;
-                        ev.event_length_beats = new_end;
-                    } else {
-                        ev.event_start_in_clip_beats = new_start;
-                    }
-                    true
-                });
-            }
-            ClipContent::Automation(a) => {
-                for p in &mut a.points {
-                    p.time_beat -= cut;
-                }
-                a.points.retain(|p| p.time_beat >= 0.0);
-            }
-            ClipContent::Video(c) => shift_overlay!(c.events),
-            ClipContent::Image(c) => shift_overlay!(c.events),
-            ClipContent::Text(c) => shift_overlay!(c.events),
         }
     }
 
@@ -1590,7 +1510,10 @@ impl Song {
         }
     }
 
-    pub fn normalize_after_load(&mut self) {
+    /// 返り値は **クリップの重なりを解消したか** (= 開いた時点で `*` を立てるべきか)。
+    /// それ以外の正規化はすべて冪等な no-op になるよう作られているので、
+    /// 「開いただけで `*`」 が立つ理由はここ 1 つに絞られる。
+    pub fn normalize_after_load(&mut self) -> bool {
         self.ensure_project_id();
         self.sanitize_ranges();
         self.ensure_clip_contents();
@@ -1602,7 +1525,23 @@ impl Song {
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
+        // 重なり解消は id 採番の後 (分割断片に id を振るため)、 overlay の
+        // カバレッジ補完の前 (窓を縮めてから覆う長さを決めるため)。
+        let resolved = self.resolve_clip_overlaps();
         self.ensure_overlay_event_coverage();
+        resolved
+    }
+
+    /// 全トラックのクリップの重なりを上書き規則で解消する
+    /// ([`Track::resolve_clip_overlaps`])。 **冪等** — 2 回目は `false` を返す。
+    pub fn resolve_clip_overlaps(&mut self) -> bool {
+        let mut changed = false;
+        for track in &mut self.tracks {
+            if track.resolve_clip_overlaps() {
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// overlay clip (image / video / text) は「clip 長 = 表示長」が

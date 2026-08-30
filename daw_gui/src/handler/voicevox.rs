@@ -156,9 +156,8 @@ fn rebuild_mouth_clip(
                 "口パク".to_string(),
             );
             let m = &mut song.tracks[m_idx];
-            let clip_id = m.alloc_clip_id();
-            m.clips.push(Clip {
-                id: clip_id,
+            m.place_clip(Clip {
+                id: 0,
                 start_beat: *new_start,
                 length_beats: *new_len,
                 content_id,

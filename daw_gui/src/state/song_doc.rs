@@ -60,6 +60,9 @@ pub enum StreamGesture {
     NoteNudgeMove,
     /// r.md #67: カーソルキーによるノート長の伸縮 (移動とは別 step にする)。
     NoteNudgeLength,
+    /// カーソルキーによる**範囲内の素材のナッジ** (`docs/plan_range_selection.md` §3.2)。
+    /// ノートの nudge と同じ理由で、押しっぱなしのキーリピートを 1 step に畳む。
+    RangeNudge,
 }
 
 /// undo / redo スタックの 1 要素。 過去 (または未来) の Song snapshot と、
@@ -409,6 +412,16 @@ impl SongDoc {
         self.last_gesture = None;
         self.edit_epoch += 1;
         self.saved_epoch = self.edit_epoch;
+    }
+
+    /// 読み込み時の**不変条件の回復**で中身が変わったことを記録し、`*` (未保存) を立てる。
+    /// クリップの重なり解消 (`docs/plan_range_selection.md` §6.4) がこれを使う。
+    ///
+    /// 履歴 (undo) は積まない — 「元に戻せる編集」 ではなく、不変条件を満たさない
+    /// ファイルを読み込んだ結果の修復だから。 解消は冪等なので、一度保存すれば
+    /// 次に開いたときは立たない。
+    pub fn mark_dirty_after_load_fixup(&mut self) {
+        self.edit_epoch += 1;
     }
 
     // -------- gesture scopes -------------------------------------------------

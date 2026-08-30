@@ -5,6 +5,23 @@ use crate::app::{AutomationPointKeyRef, EditSurface};
 
 #[derive(Debug)]
 pub struct SelectionState {
+    /// **選択の SSoT** — 「時間区間 × レーン集合」1 本
+    /// (`docs/plan_range_selection.md`)。 クリップ / ノート / automation 点 /
+    /// automation クリップ / audio event の選択はすべてここからの**導出**で、
+    /// 面ごとの選択集合とアンカーは持たない。 session-only (保存しない)。
+    ///
+    /// 「レーン」 は面ごとに読み替える — アレンジャーはトラック行 /
+    /// オートメーションレーン行、 ピアノロールは鍵盤行、 オーディオエディタは波形行。
+    pub time: Option<common::model::TimeSelection>,
+    /// Shift+クリックで範囲を伸縮するときの基点 (拍)。 無修飾 click / Ctrl+click で
+    /// 更新し、 Shift+click では更新しない (= 同じ基点から繰り返し伸縮できる)。
+    /// 面ごとに 9 本あったアンカーはこの 1 本に畳まれた。
+    pub range_anchor: Option<f64>,
+    /// ランチャー (セッション) のセル選択。 **グリッドに時間軸が無いので範囲では
+    /// 表せない**唯一の「オブジェクト選択」。 末尾 = anchor。 session-only。
+    pub selected_launcher_cells: Vec<common::model::ClipKey>,
+    /// ランチャーセル選択のアンカー (Shift+click の基点)。
+    pub launcher_cell_anchor: Option<common::model::ClipKey>,
 
     // -------- Selection --------
     /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
@@ -43,20 +60,6 @@ pub struct SelectionState {
     /// 入力として動くので先行実装する。 widget からは
     /// `SelectAutomationPoints` (#033) で上書き。 session-only。
     pub selected_automation_points: Vec<AutomationPointKeyRef>,
-    /// 選択 anchor (= 末尾)。 stable `ClipKey` (track_id + clip_id) 保持で
-    /// 並べ替え / undo を跨いでも壊れない。 index 解決は `selected_clip_ref()`。
-    pub selected_clip: Option<common::model::ClipKey>,
-    /// 選択集合。 stable `ClipKey` 保持。 index 解決は `selected_clip_refs()`。
-    pub selected_clips: Vec<common::model::ClipKey>,
-    pub selected_notes: Vec<u32>,
-    /// Audio Editor で選択中の event index 群 (`audio_editor_clip` の clip
-    /// 内 events Vec への index)。 複数選択対応: click = 単一、 Shift+click =
-    /// トグル、 空き領域 drag = 矩形選択、 Ctrl+A = 全選択。 空 Vec で
-    /// 「未選択」。 anchor (= Inspector / footer / nav の代表) は last()
-    /// (= `audio_editor_anchor_event`)。 編集 (gain/pan/fade 等) は選択集合
-    /// 全体に broadcast (`audio_event_target_indices`)。 close で clear、
-    /// undo でも clear (index は容易にずれるため、 ノート選択と同方針)。
-    pub audio_editor_selected_events: Vec<usize>,
     /// r.md #71 (プラグインのコピー / 移動): インスペクタのチェーンで選択中の
     /// device (安定 `PluginInstance::id`)。 末尾 = 「最後にクリックした anchor」。
     /// session-only (保存しない)。
@@ -72,10 +75,6 @@ pub struct SelectionState {
     // Explorer / Finder / REAPER と同じ)。 「選択集合の末尾 = アンカー」 という旧 idiom は
     // RangeFromAnchor が集合ごと書き換えるので基点に使えず、 面ごとの明示フィールドが所有する。
     // すべて session-only (保存しない)。 対象が消えたら range 解決が None に倒れて Single 相当。
-    /// クリップ選択のアンカー。
-    pub clip_anchor: Option<common::model::ClipKey>,
-    /// ノート選択のアンカー (packed note id、 `selected_notes` と同空間)。
-    pub note_anchor: Option<u32>,
     /// トラック選択のアンカー (`Track::id`)。 旧 `ArrangementState.selection_anchor` から移設。
     pub track_anchor: Option<u32>,
     /// Arranger セクション選択のアンカー (`Section::id`)。
@@ -84,8 +83,6 @@ pub struct SelectionState {
     pub automation_point_anchor: Option<AutomationPointKeyRef>,
     /// automation clip 選択のアンカー。
     pub automation_clip_anchor: Option<common::model::AutomationClipKey>,
-    /// Audio Editor event 選択のアンカー (`audio_editor_selected_events` と同じ index 空間)。
-    pub audio_editor_anchor: Option<usize>,
     /// r.md #71 (プラグインのコピー / 移動): device 選択のアンカー
     /// (Shift+click 範囲選択の基点)。
     pub device_anchor: Option<u64>,

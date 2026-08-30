@@ -80,6 +80,19 @@ fn update_sessions(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
             nd.last_shift = shift_now;
         }
     }
+    // 時間範囲のドラッグ: last_mouse は常に、 alt (= 範囲のスナップ on/off) は
+    // continuation でだけ更新する (release frame の生読みは modifier race で化ける)。
+    if let Some(ref mut rd) = state.range_drag {
+        if accept_release_pos(
+            is_release,
+            RewindAxes::BothExact { cur: (px, py), anchor: (rd.last_mouse.0, rd.last_mouse.1) },
+        ) {
+            rd.last_mouse = (px, py);
+        }
+        if !is_release {
+            rd.last_alt = alt_now;
+        }
+    }
     // M14 Phase 127 (daw_01 #105): section drag continuation。 clip_drag と同じく continuation で
     // last_mouse / last_alt / last_ctrl を update、 release frame は巻き戻し検知時のみ update。
     if let Some(ref mut sd) = state.section_drag {

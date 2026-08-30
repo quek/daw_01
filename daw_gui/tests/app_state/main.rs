@@ -25,6 +25,7 @@ mod modulation_arm;
 mod open_stays_clean;
 mod pending_state_queue;
 mod plugin_load_failure;
+mod range_edit;
 mod shutdown_sequence;
 mod state_roundtrip_watchdog;
 mod sync_flush;

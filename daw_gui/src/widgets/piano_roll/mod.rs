@@ -423,6 +423,11 @@ pub struct PianoRollStyle {
     /// note は clip より小さいので clip ハッチより密にする。
     pub note_muted_hatch_spacing_px: f32,
     pub note_muted_hatch_width_px: f32,
+    /// **時間範囲**の帯 (半透明、ノートの上に重ねる)。 アレンジャーの
+    /// `ArrangementStyle::time_range_fill` と同じ役割・同じ色。
+    pub time_range_fill: Color,
+    /// 時間範囲の左右端の縦線。
+    pub time_range_edge: Color,
     pub note_selected_fill: Color,
     pub note_selected_border: Color,
     pub note_selected_border_w: f32,
@@ -570,6 +575,8 @@ impl PianoRollStyle {
             note_muted_hatch_color: p.hatch_ink.with_alpha(0.40),
             note_muted_hatch_spacing_px: 5.0,
             note_muted_hatch_width_px: 1.0,
+            time_range_fill: p.accent.with_alpha(0.18),
+            time_range_edge: p.accent.with_alpha(0.85),
             note_selected_fill: p.selection_warm,
             // 選択リングは velocity / クリップ色で着色された note の上に乗るので極性固定 (常に明)。
             note_selected_border: p.selection_ring_outer,
@@ -1030,11 +1037,29 @@ struct VelocityDragSession {
     last_mouse: (f32, f32),
 }
 
+/// **時間範囲のドラッグ** session (`docs/plan_range_selection.md` §3.1)。
+///
+/// アレンジャーの `RangeDragSession` と同じ形。 ピアノロールでは「レーン」 が鍵盤の行に
+/// なるだけで、規約 (押した瞬間の Alt でジェスチャ確定 / ドラッグ中の Alt はスナップ
+/// on/off / release で 1 件 commit) は同じ。 旧・矩形選択 (`drag_rect`) を置き換えた。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrRangeDragSession {
+    /// 掴んだ拍 (song-absolute、未スナップ)。
+    anchor_beat: f64,
+    /// 掴んだ画面 y (鍵盤行の帯を決める端)。
+    anchor_y: f32,
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt (スナップ一時無効)。
+    last_alt: bool,
+}
+
 /// piano_roll widget の永続状態 (`UiHost.state` に置かれる)。
 #[derive(Debug, Default)]
 pub(crate) struct PianoRollState {
     /// note drag (Move / ResizeLeft / ResizeRight) の anchor。drag release で None に戻す。
     note_drag: Option<NoteDragSession>,
+    /// 時間範囲のドラッグ (空き grid の press で張る)。
+    range_drag: Option<PrRangeDragSession>,
     /// (M14 Phase 59 / daw_01 #017) 歌詞編集中の note id (text_input overlay 表示中)。
     /// L キー検知で `Some(selected[0])` に遷移 (`selected.len() == 1` のときのみ)、
     /// Enter で 1) commit + 分配 → 2) 次 note へ移動 or `None` 復帰、Esc で `None`、

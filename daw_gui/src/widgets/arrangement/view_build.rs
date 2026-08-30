@@ -36,6 +36,8 @@ pub(super) struct BuiltArrangement {
     pub view: ArrangementView,
     pub style: ArrangementStyle,
     pub selected_clips: Vec<ClipKey>,
+    /// 選択の SSoT (時間範囲)。描画はこれを帯として出す。
+    pub time_selection: Option<common::model::TimeSelection>,
     pub selected_tracks: Vec<u32>,
     pub selected_automation_clips: Vec<AutomationClipKey>,
     pub selected_automation_points: Vec<AutomationPointKey>,
@@ -89,7 +91,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     }
 
     // gui_01 #068 連動ハイライト: {選択 clip} ∪ {前フレーム hover clip} の content_id (refcount>=2)。
-    let active_groups: HashSet<common::model::ContentId> = if app.selection.selected_clips.is_empty()
+    let active_groups: HashSet<common::model::ContentId> = if app.selection.time.is_none()
         && app.ui_ephemeral.arrange_hover_content.is_none()
     {
         HashSet::new()
@@ -257,9 +259,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         .collect();
 
     let selected_clips: Vec<ClipKey> = app
-        .selection
-        .selected_clips
-        .iter()
+        .selected_clip_refs()
+        .into_iter()
         .map(|k| ClipKey { track_id: k.track_id, clip_id: k.clip_id })
         .collect();
 
@@ -377,6 +378,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         view,
         style,
         selected_clips,
+        time_selection: app.selection.time.clone(),
         selected_tracks,
         selected_automation_clips,
         selected_automation_points,

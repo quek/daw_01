@@ -574,19 +574,8 @@ impl AppData {
         self.send_track_removal_ipc(&removal_plan);
         self.forget_removed_track_devices(&removal_plan);
 
-        // selected_clip / selected_clips は stable ClipKey 保持なので、 残った
-        // track の index shift には自動追従する (再マッピング不要)。 ただし
-        // 削除された track を指す key は解決不能になるので、 set / anchor 双方
-        // から落とす (after_undo_redo / action_remove_last_track と同方針)。
-        let mut keys = std::mem::take(&mut self.selection.selected_clips);
-        keys.retain(|k| self.clip_at(*k).is_some());
-        self.selection.selected_clips = keys;
-        if let Some(k) = self.selection.selected_clip
-            && self.clip_at(k).is_none()
-        {
-            self.selection.selected_clip = None;
-            self.selection.selected_notes.clear();
-        }
+        // 範囲は「区間 × 行」しか持たないので、消えたトラックの行を落とすだけ。
+        self.prune_selection_lanes();
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
         // 残りが空なら **削除位置に繰り上がった隣接トラック** を選ぶ

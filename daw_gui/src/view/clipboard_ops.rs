@@ -33,7 +33,9 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
         EditSurface::AutomationPoints => app
             .copy_points_clip()
             .map(|(j, c)| (j, c, "オートメーションポイント")),
-        EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
+        // 範囲: 形のまま (前後の空白込みで) コピーする。
+        EditSurface::TimeRange => app.copy_time_selection_clip().map(|(j, c)| (j, c, "範囲")),
+        EditSurface::LauncherCells => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
         EditSurface::AutomationClips => app
             .copy_automation_clips_clip()
             .map(|(j, c)| (j, c, "オートメーションクリップ")),
@@ -95,7 +97,9 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
         EditSurface::AutomationPoints => app
             .copy_points_clip()
             .map(|(j, c)| (j, c, "オートメーションポイント")),
-        EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
+        // 範囲: 形のまま (前後の空白込みで) コピーする。
+        EditSurface::TimeRange => app.copy_time_selection_clip().map(|(j, c)| (j, c, "範囲")),
+        EditSurface::LauncherCells => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
         EditSurface::AutomationClips => app
             .copy_automation_clips_clip()
             .map(|(j, c)| (j, c, "オートメーションクリップ")),
@@ -112,7 +116,8 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
             EditSurface::AutomationPoints => AppEvent::DeleteAutomationPoints {
                 points: app.selection.selected_automation_points.clone(),
             },
-            EditSurface::Clips => AppEvent::DeleteSelectedClip,
+            EditSurface::TimeRange => AppEvent::DeleteTimeSelection,
+            EditSurface::LauncherCells => AppEvent::DeleteSelectedClip,
             EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
                 keys: app.selection.selected_automation_clips.clone(),
             },
@@ -342,7 +347,7 @@ if dup_devices {
     duplicate_devices(app, ui);
 }
 // r.md #87: ランチャーのセルを選んでいるなら D / Alt+D はセルの複製
-// (共有 / 独立の区別はアレンジのクリップと同じ)。 セルは `EditSurface::Clips` を
+// (共有 / 独立の区別はアレンジのクリップと同じ)。 セルは `EditSurface::LauncherCells` を
 // 共有するので、ここで先に裁かないと下の clip 複製が `selected_clip_refs()` の
 // 空リストで無音の no-op になる。
 let launcher_cells = if dup_devices { Vec::new() } else { app.selected_launcher_cells() };
@@ -366,26 +371,21 @@ if dup_shared && !dup_devices {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateTracksShared(ids));
         }));
-    } else if is_pianoroll_active && !app.selection.selected_notes.is_empty() {
-        // ピアノロール上 + ノート選択中なら D = ノート複製。
+    } else if is_pianoroll_active
+        && matches!(app.time_selection_surface(), Some(EditSurface::Notes))
+    {
+        // ピアノロール上で範囲が鍵盤行に掛かっているなら D = **範囲の複製**
+        // (`docs/plan_range_selection.md` §6)。 範囲に音が 1 つも無くても、
+        // 「クリップ全体を複製」へ落ちてはいけない (面が違う)。
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateSelectedNotes);
         }));
     } else {
-        // それ以外 (アレンジ文脈 / ピアノロールでもノート未選択) は選択中の
-        // MIDI/Audio/Vocal clip と automation clip の両方を同時に共有複製
-        // (Ableton/REAPER 流)。
-        let midi_sources: Vec<crate::app::ClipKey> = app.selected_clip_refs();
-        let automation_sources: Vec<common::model::AutomationClipKey> =
-            app.selection.selected_automation_clips.clone();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if !midi_sources.is_empty() {
-                app.handle_event(AppEvent::DuplicateClipsShared(midi_sources));
-            }
-            if !automation_sources.is_empty() {
-                app.handle_event(AppEvent::DuplicateAutomationClipsShared(automation_sources));
-            }
-        }));
+        // それ以外 (アレンジ文脈) は **範囲を 1 つ後ろへ複製**する
+        // (`docs/plan_range_selection.md` §6)。 複製する対象も、送る量も、複製後の
+        // 選択も範囲 1 本で決まる。 クリップ集合から外接 span を出していた旧実装は、
+        // 行き先に元から居たクリップを次の D で巻き込んで雪だるまになっていた。
+        duplicate_time_range(app, ui, false);
     }
 }
 if dup_unique && !dup_devices {
@@ -395,18 +395,46 @@ if dup_unique && !dup_devices {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateTracksUnique(ids));
         }));
-    } else {
-        let midi_sources: Vec<crate::app::ClipKey> = app.selected_clip_refs();
-        let automation_sources: Vec<common::model::AutomationClipKey> =
-            app.selection.selected_automation_clips.clone();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if !midi_sources.is_empty() {
-                app.handle_event(AppEvent::DuplicateClipsUnique(midi_sources));
-            }
-            if !automation_sources.is_empty() {
-                app.handle_event(AppEvent::DuplicateAutomationClipsUnique(automation_sources));
-            }
+    } else if is_pianoroll_active
+        && matches!(app.time_selection_surface(), Some(EditSurface::Notes))
+    {
+        // ノートに「リンク / 独立」の区別は無いので Alt+D も D と同じ (device 面と同規約)。
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::DuplicateSelectedNotes);
         }));
+    } else {
+        duplicate_time_range(app, ui, true);
     }
 }
+}
+
+/// アレンジャーの `D` / `Alt+D` = **範囲を 1 つ後ろへ複製**する
+/// (`docs/plan_range_selection.md` §6)。
+///
+/// 送る量は範囲の長さ。 行き先は上書き規則で削られるので、複製後の範囲には
+/// **複製したものしか居ない** — 次の `D` が元から居たクリップを巻き込まない。
+/// 選択中の automation クリップ (範囲に畳まれていない唯一の面) は従来どおり別に複製する。
+fn duplicate_time_range(app: &AppData, ui: &mut Ui<'_, AppData>, unique: bool) {
+    let automation_sources: Vec<common::model::AutomationClipKey> =
+        app.selection.selected_automation_clips.clone();
+    let Some(sel) = app.time_selection() else {
+        return;
+    };
+    let (a, b) = (sel.start_beat, sel.end_beat);
+    let map: Vec<(u32, u32)> = sel.track_row_ids().map(|id| (id, id)).collect();
+    let offset = b - a;
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        // クリップと automation で `edit_song` が 2 回走るので 1 undo step に畳む。
+        app.song_doc.begin_gesture();
+        app.copy_time_range(a, b, offset, &map, unique);
+        if !automation_sources.is_empty() {
+            let ev = if unique {
+                AppEvent::DuplicateAutomationClipsUnique(automation_sources.clone())
+            } else {
+                AppEvent::DuplicateAutomationClipsShared(automation_sources.clone())
+            };
+            app.handle_event(ev);
+        }
+        app.song_doc.end_gesture();
+    }));
 }

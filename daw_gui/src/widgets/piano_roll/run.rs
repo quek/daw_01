@@ -15,7 +15,7 @@ use crate::app::{AppData, AppEvent, ClipKey};
 use crate::theme::Palette;
 use crate::view::snap::{self, SNAP_LABELS};
 use crate::view::track_color;
-use crate::widgets::select_modifier::{RangeItem, SelectModifier, range_block};
+use crate::widgets::select_modifier::SelectModifier;
 
 /// Snap toolbar / legend の小さめトグル (標準の角丸 6px・14px 文字より 1 段小さい)。
 /// 色は毎フレームのパレットから引く (r.md #48: `const` はテーマ切替に追従できない)。
@@ -864,16 +864,12 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // ため、 前方 bool での抑制が必須 — daw_01 #102「二重 emit 抑制」)。 `note_hit().is_none()` は
         // load-bearing: note MOVE は !shift gate なので hit-test 無しだと Shift+note press が誤って marquee
         // 起動する。 Alt は除外、 `note_drag` が press 時 None (= 真の空き press) を要求。
-        let drag_rect_wid = wid.child(b"rect_select");
-        let shift_rect_active = {
-            let state: &mut daw_ui_core::widgets::drag_rect::DragRectState =
-                ui.widget_state(drag_rect_wid);
-            state.drag_start.is_some()
-        };
-        let marquee_press = if !editing_mode
+        // 空き grid の press で **時間範囲のドラッグ** を張る (アレンジャーと同じ規約)。
+        // 旧・矩形選択 (`drag_rect` の cyan 矩形) は撤去した — 選択はグリッドにスナップした
+        // 範囲 1 本で、見た目もアレンジャーと同じ帯になる。
+        let range_press = if !editing_mode
             && pointer.primary_just_pressed
-            && !pointer.modifiers.alt
-            // この press が「ダブルクリック作成」 のものなら marquee を起動しない
+            // この press が「ダブルクリック作成」 のものなら範囲を張らない
             // (作成 session が press を所有。 二重所有を防ぐ load-bearing gate)。
             && note_create_press.is_none()
             && let Some((px, py)) = pointer.pos
@@ -885,7 +881,40 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         } else {
             false
         };
-        let marquee_active = marquee_press || shift_rect_active;
+        if range_press
+            && let Some((px, py)) = pointer.pos
+        {
+            let beat_per_px_local = view.len_beats / f64::from(grid.w.max(1.0));
+            let anchor_beat = view.start_beat + f64::from(px - grid.x) * beat_per_px_local;
+            let press_alt = pointer.modifiers.alt;
+            let state: &mut PianoRollState = ui.widget_state(wid);
+            state.range_drag = Some(PrRangeDragSession {
+                anchor_beat,
+                anchor_y: py,
+                last_mouse: (px, py),
+                last_alt: press_alt,
+            });
+        }
+        // continuation: last_mouse は常に、alt (= スナップ on/off) は release 以外で更新。
+        let range_live: Option<PrRangeDragSession> = {
+            let state: &mut PianoRollState = ui.widget_state(wid);
+            if let Some(ref mut rd) = state.range_drag
+                && let Some((px, py)) = pointer.pos
+            {
+                rd.last_mouse = (px, py);
+                if !pointer.primary_just_released {
+                    rd.last_alt = pointer.modifiers.alt;
+                }
+            }
+            state.range_drag
+        };
+        let range_release: Option<PrRangeDragSession> = if pointer.primary_just_released {
+            let state: &mut PianoRollState = ui.widget_state(wid);
+            state.range_drag.take()
+        } else {
+            None
+        };
+        let marquee_active = range_live.is_some();
 
         // ----- pending click 判定 -----
         // 2 通り: (a) drag が起こらなかった pure release、(b) drag は始まったが <16px で
@@ -1066,6 +1095,41 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             note_geometry_to_rect(start_beat, len_beats, pitch, view, grid)
         });
 
+        // 時間範囲の帯 (`docs/plan_range_selection.md` §4)。 レーンは鍵盤行なので、
+        // 範囲に入っている **ピッチだけ** を塗る。 closure へ move するので先に畳む。
+        // ドラッグ中は **release の commit と同じ式** でプレビュー帯を出す
+        // (preview ≠ commit にならないよう、snap も同じ)。
+        let range_preview: Option<((f64, f64), Vec<u8>)> = range_live.map(|rd| {
+            let beat_per_px_local = view.len_beats / f64::from(grid.w.max(1.0));
+            let cur = view.start_beat + f64::from(rd.last_mouse.0 - grid.x) * beat_per_px_local;
+            let a = view.snap.snap_beat(rd.anchor_beat, rd.last_alt, zoom_x_px_per_beat);
+            let b = view.snap.snap_beat(cur, rd.last_alt, zoom_x_px_per_beat);
+            let geom = RowGeometry::compute(view, grid);
+            let (y0, y1) = if rd.anchor_y <= rd.last_mouse.1 {
+                (rd.anchor_y, rd.last_mouse.1)
+            } else {
+                (rd.last_mouse.1, rd.anchor_y)
+            };
+            let (lo, hi) = (geom.y_to_pitch(y1), geom.y_to_pitch(y0));
+            ((a.min(b), a.max(b)), (lo..=hi).collect::<Vec<u8>>())
+        });
+        let time_range: Option<((f64, f64), Vec<u8>)> = app.selection.time.as_ref().and_then(|sel| {
+            let mut pitches: Vec<u8> = sel
+                .lanes
+                .iter()
+                .filter_map(|l| match l {
+                    common::model::LaneRef::KeyTrack { pitch, .. } => Some(*pitch),
+                    _ => None,
+                })
+                .collect();
+            if pitches.is_empty() {
+                return None;
+            }
+            pitches.sort_unstable();
+            pitches.dedup();
+            Some(((sel.start_beat, sel.end_beat), pitches))
+        });
+        let time_range = range_preview.or(time_range);
         ui.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
@@ -1198,6 +1262,11 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     loop_handle_w,
                 );
             }
+            // 時間範囲の帯は **ノートより手前・playhead より奥**。 範囲がノートを部分的に
+            // 覆っているとき、どこからどこまでが範囲かが見える。
+            if let Some((range, ref pitches)) = time_range {
+                draw_time_range_overlay(hctx, grid, view_copy, range, pitches, &style_copy);
+            }
             // M9 Phase 45c: playhead 線 (time で動くので cache 対象外、毎フレーム描画)。
             // 範囲外なら描画スキップ。grid と vel_area を縦断する 1 本。
             if let Some(b) = view_copy.playhead_beat
@@ -1292,40 +1361,18 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 // marquee と同じく範囲選択からも除外する (`note_hit` も locked を弾くので
                 // hit 自身が locked になることはない)。 表は Shift のときだけ組む (無修飾 /
                 // Ctrl の click ごとに全 note を走査するのは無駄)。
-                let items: Vec<RangeItem<NoteId>> =
-                    if modifier == SelectModifier::RangeFromAnchor {
-                        notes
-                            .iter()
-                            .filter(|n| !n.style.locked)
-                            .map(|n| RangeItem {
-                                key: n.id,
-                                row: i64::from(n.pitch),
-                                start: n.start_beat,
-                                end: n.start_beat + n.len_beats,
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                // 選択の SSoT は範囲 1 本なので、修飾キーの意味は 2 つだけ:
+                // 無修飾 = そのノートだけ / Ctrl・Shift = 外接まで広げる
+                // (`docs/plan_range_selection.md` §3.1、アレンジャーの clip click と同規則)。
+                let additive = modifier != SelectModifier::Single;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let anchor = app.selection.note_anchor;
-                    let next = modifier
-                        .resolve(&prev, hit_id, || range_block(&items, anchor?, hit_id));
-                    if next != prev {
-                        app.handle_event(AppEvent::SetNoteSelection(next));
-                    }
-                    // アンカー更新: Single / Toggle で clicked へ、 Range は据え置き (§3.1)。
-                    // `SetNoteSelection` はアンカーを触らないので順序依存は無い。
-                    if modifier.updates_anchor() {
-                        app.selection.note_anchor = Some(hit_id);
-                    }
+                    app.handle_event(AppEvent::SelectNote { note: hit_id, additive });
                 }));
                 response.selection_changed = true;
             } else if !prev.is_empty() {
                 // grid の空白 click → 選択クリア + アンカー破棄 (旧挙動と同じ)。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::SetNoteSelection(Vec::new()));
-                    app.selection.note_anchor = None;
                 }));
                 response.selection_changed = true;
             }
@@ -1537,80 +1584,29 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             }));
         }
 
-        // ----- M14 Phase 125 (#102): marquee commit (plain=REPLACE / Shift=UNION / Ctrl=XOR) -----
-        // gate `marquee_active` / `drag_rect_wid` は pending_click 計算の前で算出済 (空き grid press のみ)。
-        // `take_drag_rect_in_rect` は呼ぶだけで cyan 半透明 overlay を自動描画し、 press 時 modifier を
-        // `DragRect.modifiers` に snapshot する。 release frame (`drag.finished`) に inside を集めて修飾で
-        // next を分岐 (`sort_unstable` 後に `prev != next` で no-op 抑制)。 REPLACE は inside そのまま
-        // (zero-rect → 空 = 選択 clear)。 editing_mode 中は marquee_press が false なので走らない。
-        //
-        // r.md #35: **右 drag** の marquee も同じ commit を通す。 左 drag が空き grid 専用なのに対し、
-        // 右 drag は `grid` 全域 = **note の上からでも** 起動できる (REAPER 既定と同じ配置。
-        // 右ボタンなので note の move / resize と衝突しない)。 動かさずに離した右ボタンは
-        // context menu 側が拾い、 ここには来ない。 `DragRectState` を共有しないよう id を分ける。
-        let left_marquee = if !editing_mode && marquee_active {
-            ui.take_drag_rect_in_rect(drag_rect_wid, grid)
-        } else {
-            None
-        };
-        // 右ボタンを **動かさずに** 離したフレームは「右クリック = context menu」 なので、
-        // 0 サイズ矩形の REPLACE で選択を消してしまわないよう commit を捨てる
-        // (session 自体は take して state を畳む必要があるので呼び出しは行う)。
-        let secondary_was_click = ui.pending_secondary_click_pos().is_some();
-        let right_marquee = if editing_mode {
-            None
-        } else {
-            ui.take_secondary_drag_rect_in_rect(wid.child(b"rect_select_rmb"), grid)
-                .filter(|d| !(d.finished && secondary_was_click))
-        };
-        for drag in [left_marquee, right_marquee].into_iter().flatten() {
-            response.rect_select_active = true;
-            if drag.finished {
-                let drag_rect = drag.rect();
-                let mut inside: Vec<NoteId> = Vec::new();
-                for n in visible {
-                    // lock クリップの note は marquee 矩形選択からも除外。
-                    if n.style.locked {
-                        continue;
-                    }
-                    let r = note_to_rect(n, view, grid);
-                    if rects_intersect(r, drag_rect) {
-                        inside.push(n.id);
-                    }
-                }
-                let prev: Vec<NoteId> = selected.to_vec();
-                let mut next: Vec<NoteId> = if drag.modifiers.shift {
-                    // UNION: prev に inside の新規だけ append。
-                    let mut out = prev.clone();
-                    for id in &inside {
-                        if !out.contains(id) {
-                            out.push(*id);
-                        }
-                    }
-                    out
-                } else if drag.modifiers.ctrl {
-                    // XOR: prev に在って inside にも在る id を除き、 inside の新規を追加。
-                    let mut out: Vec<NoteId> =
-                        prev.iter().copied().filter(|id| !inside.contains(id)).collect();
-                    for id in &inside {
-                        if !prev.contains(id) {
-                            out.push(*id);
-                        }
-                    }
-                    out
-                } else {
-                    inside // REPLACE (zero-rect → 空 = clear)
-                };
-                next.sort_unstable();
-                let mut prev_sorted = prev.clone();
-                prev_sorted.sort_unstable();
-                if prev_sorted != next {
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetNoteSelection(next.clone()));
-                    }));
-                    response.selection_changed = true;
-                }
-            }
+        // ----- 時間範囲のドラッグ release → 範囲を張り直す -----
+        // 旧・矩形選択 (cyan の矩形 + REPLACE/UNION/XOR) を置き換えた 1 本
+        // (`docs/plan_range_selection.md` §3.1)。 x は **グリッドにスナップ**し、
+        // y は描画と同じ写像 (`RowGeometry`) で鍵盤行に落とす。 ドラッグ中の Alt で
+        // スナップを一時無効にできる (離す = 有効 / 押す = 無効)。
+        if let Some(rd) = range_release {
+            let beat_per_px_local = view.len_beats / f64::from(grid.w.max(1.0));
+            let cur_beat = view.start_beat + f64::from(rd.last_mouse.0 - grid.x) * beat_per_px_local;
+            let a_beat = view.snap.snap_beat(rd.anchor_beat, rd.last_alt, zoom_x_px_per_beat);
+            let b_beat = view.snap.snap_beat(cur_beat, rd.last_alt, zoom_x_px_per_beat);
+            let geom = RowGeometry::compute(view, grid);
+            let (y0, y1) = if rd.anchor_y <= rd.last_mouse.1 {
+                (rd.anchor_y, rd.last_mouse.1)
+            } else {
+                (rd.last_mouse.1, rd.anchor_y)
+            };
+            let hi = geom.y_to_pitch(y0);
+            let lo = geom.y_to_pitch(y1);
+            let (s0, s1) = (a_beat.min(b_beat), a_beat.max(b_beat));
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.set_pianoroll_rect_selection(s0, s1, lo, hi);
+            }));
+            response.selection_changed = true;
         }
 
         // ===== M14 Phase 59 / daw_01 #017: 歌詞 inline 編集 overlay (text_input + commit dispatch) =====

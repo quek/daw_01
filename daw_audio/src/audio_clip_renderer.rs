@@ -335,14 +335,50 @@ pub fn compile_audio_schedule(
     let mut schedule: Vec<RenderedEvent> = Vec::new();
     for (track_idx, track) in song.tracks.iter().enumerate() {
         for clip in &track.clips {
-            push_clip_events(&mut schedule, song, &sources, track_idx, clip, 0, engine_sample_rate);
+            // 隣接クリップとのクロスフェード: **隣が実在するときだけ**窓を外へ緩める。
+            // これで、クリップを動かして隣が居なくなったら `xfade_*` が残っていても
+            // 無視され、stale な音漏れが起きない (`Clip::xfade_lead_beats` の doc)。
+            // 隣接走査は **張り出しを要求しているクリップだけ** に絞る
+            // (要求ゼロが普通なので、クリップ数の 2 乗走査を実質 O(N) にする)。
+            let want_lead = clip.xfade_lead_beats > 0.0;
+            let want_tail = clip.xfade_tail_beats > 0.0;
+            let (s0, e0) = clip.song_window();
+            let has_prev = want_lead
+                && track.clips.iter().any(|o| {
+                    o.id != clip.id && (o.start_beat + o.length_beats - s0).abs() < 1e-6
+                });
+            let has_next = want_tail
+                && track
+                    .clips
+                    .iter()
+                    .any(|o| o.id != clip.id && (o.start_beat - e0).abs() < 1e-6);
+            let lead = if has_prev { clip.xfade_lead_beats.max(0.0) } else { 0.0 };
+            let tail = if has_next { clip.xfade_tail_beats.max(0.0) } else { 0.0 };
+            push_clip_events(
+                &mut schedule,
+                song,
+                &sources,
+                track_idx,
+                clip,
+                engine_sample_rate,
+                ClipPlacement { cell_clip_id: 0, xfade: (lead, tail) },
+            );
         }
         // r.md #87: ランチャーのセルも同じ schedule に載せる。`clip.start_beat` は
         // 0 なので窓は `[0, length)` = セル自身の座標になり、行の実効拍を渡すだけで
         // 鳴る。走査時は `cell_clip_id` で選り分けるので、アレンジ行には漏れない。
         for cell in &track.session_clips {
             let id = cell.clip.id;
-            push_clip_events(&mut schedule, song, &sources, track_idx, &cell.clip, id, engine_sample_rate);
+            // セルは隣接という概念が無い (グリッドに時間軸が無い) ので張り出しゼロ。
+            push_clip_events(
+                &mut schedule,
+                song,
+                &sources,
+                track_idx,
+                &cell.clip,
+                engine_sample_rate,
+                ClipPlacement { cell_clip_id: id, xfade: (0.0, 0.0) },
+            );
         }
     }
     schedule.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
@@ -373,15 +409,27 @@ pub fn compile_audio_schedule(
 /// `compile_audio_schedule` の二重ループから切り出したのは、そこへセル用の
 /// ループを入れ子で足すと `scripts/arch_lint_baseline.txt` の FN-NESTING 天井
 /// (`compile_audio_schedule 7/5`) を即座に超えるため (不変条件 9)。
+/// 1 クリップを schedule へ載せるときの「置かれ方」。
+///
+/// `cell_clip_id` は 0 = アレンジのクリップ、それ以外 = そのランチャーセルの `clip.id`。
+/// `xfade` は隣接クリップとのクロスフェードで窓の外へ鳴らし進める量 `(先頭側, 末尾側)` (拍)
+/// で、**隣が実在するときだけ**非ゼロで渡ってくる。
+#[derive(Clone, Copy)]
+struct ClipPlacement {
+    cell_clip_id: u32,
+    xfade: (f64, f64),
+}
+
 fn push_clip_events(
     schedule: &mut Vec<RenderedEvent>,
     song: &Song,
     sources: &HashMap<AudioSourceId, Arc<AudioSourceBuffer>>,
     track_idx: usize,
     clip: &common::model::Clip,
-    cell_clip_id: u32,
     engine_sample_rate: u32,
+    placement: ClipPlacement,
 ) {
+    let ClipPlacement { cell_clip_id, xfade } = placement;
     let Some(content) = song.clip_contents.get(&clip.content_id) else {
         return;
     };
@@ -398,7 +446,13 @@ fn push_clip_events(
     // (`start_beat` 起点の source 読み出し / fade) は **一切動かさず**、
     // 出力範囲だけを交差させる (source 窓を切り詰めると warp marker /
     // slice onset / spectral stretch の写像が壊れるため)。
-    let (clip_gate_start, clip_gate_end) = clip.song_window();
+    let (clip_gate_start, clip_gate_end) = {
+        let (s, e) = clip.song_window();
+        // クリップ同士は重ならないので、境界で音を途切れさせないには **鳴らす範囲だけ**
+        // を隣の側へ伸ばす (`docs/plan_range_selection.md` §6.5)。 伸ばした区間は
+        // event の fade ランプが覆うので、境界を挟んで左が下がり右が上がる。
+        (s - xfade.0, e + xfade.1)
+    };
     for (event_seq, event) in audio.events.iter().enumerate() {
         let Some(buffer) = sources.get(&event.source_id) else {
             continue;

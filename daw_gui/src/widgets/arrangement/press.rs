@@ -93,13 +93,6 @@ pub(super) struct PressActions {
 }
 
 impl PressActions {
-    /// 旧 `no_press_action` の否定。
-    pub(super) fn any(&self) -> bool {
-        self.seek_beat.is_some()
-            || self.lane_toggle.is_some()
-            || self.lane_button.is_some()
-            || self.delete_point.is_some()
-    }
 
     /// 旧実装と **同じ順** (seek → lane_toggle → lane_button → delete_point) で発行。
     /// `push_edit` の発行順が `Edit` の適用順を決めるので、 この順序は挙動そのもの。
@@ -170,6 +163,8 @@ pub(super) fn dispatch(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     ruler(ui, f, &hit, &mut claim, &mut actions);
     press_header::dispatch(ui, f, &hit, &mut claim, &mut actions);
     press_lanes::automation(ui, f, &hit, &mut claim, &mut actions);
+    // 誰も session を張らなかった press は時間範囲のドラッグになる (最後に置く)。
+    press_lanes::range_zone(ui, f, &hit, &mut claim);
     actions.emit(ui);
 }
 

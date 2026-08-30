@@ -32,6 +32,20 @@ pub(super) fn hover(
         ) {
             response.hovered_clip = Some(hit_key);
             response.hovered_zone = Some(hit_kind);
+            // Move ゾーン (= 端の resize ハンドル以外) は、ヘッダ帯なら「動かす」、
+            // 本体なら「時間範囲を引く」。帯は不可視なのでカーソルで区別を示す。
+            if matches!(hit_kind, ClipDragKind::Move) {
+                response.hovered_clip_body = f
+                    .visible_tracks
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| t.id == hit_key.track_id)
+                    .is_some_and(|(t_idx, t)| {
+                        let row_h = effective_track_row_h(t, f.view.track_row_h);
+                        let header_h = draw::clip_content_inset_top(f.style).min(row_h);
+                        cy >= f.tops[t_idx] + header_h
+                    });
+            }
         } else {
             // M14 Phase 116 (daw_01 #090): clip-first first-hit。 clip に当たらなかったときだけ
             // ポインタ下の automation lane body を公開する (`hovered_clip` と排他)。 `cx` は既に
@@ -178,6 +192,10 @@ pub(super) fn apply(
         ui.set_cursor(CursorIcon::Move);
     } else if response.dragging_track_volume.is_some() {
         ui.set_cursor(CursorIcon::EwResize);
+    } else if response.hovered_clip_body {
+        // クリップ本体 = ドラッグで時間範囲。 選択の I ビームで「掴んで動かす」 では
+        // ないことを示す (空きレーンも同じカーソルなので、範囲を引ける所が一目で分かる)。
+        ui.set_cursor(CursorIcon::Text);
     } else if let Some(zone) = response.hovered_zone {
         ui.set_cursor(drag_kind_cursor(zone));
     } else if let Some(zone) = response.hovered_section_zone {

@@ -32,7 +32,6 @@ pub(super) fn commit_releases(
     response: &mut ArrangementResponse,
     released: ReleasedSessions,
 ) {
-    let wid: WidgetId = f.wid;
     let pointer: PointerFrame = f.pointer;
     let view: ArrangementView = f.view;
     let style: &ArrangementStyle = f.style;
@@ -52,6 +51,7 @@ pub(super) fn commit_releases(
     let zoom_x_px_per_beat: f32 = f.zoom_x_px_per_beat;
     let ReleasedSessions {
         clip_drag: clip_drag_release,
+        range_drag: range_drag_release,
         clip_short_click_pos,
         audio_drag: audio_drag_release,
         point_drag: point_drag_release,
@@ -86,7 +86,6 @@ pub(super) fn commit_releases(
         // 化けることがあるため信用しない。 `last_alt` は continuation frame で更新され release frame
         // では `allow_update = false` で保持されるので OS event 順序に依存しない。 overlay の snap
         // 判定とも同一値で確定し、 「release で grid に飛ぶ」 不整合が起きない。
-        let clip_drag_release_was_some = clip_drag_release.is_some();
         // r.md #87: ランチャー帯の上で離したら、アレンジ側の移動ではなく
         // 「セルへ落とした」意図 (`DropClipsToCells`) に振り替える。
         let clip_drag_release = clip_drag_release
@@ -117,6 +116,9 @@ pub(super) fn commit_releases(
                 min_clip_len
             };
             match nd.kind {
+                // 動かすのは**常に範囲** (`docs/plan_range_selection.md` §6)。
+                // press 時に確定した `move_range` を、拍 delta とトラック写像で運ぶ。
+                // Ctrl / Ctrl+Shift は「動かす」代わりに「複製して置く」。
                 ClipDragKind::Move => {
                     // M14 Phase 63c (#016): visible_tracks (collapsed 親の subtree skip 後) で
                     // index → track_id を解決。 anchor.track_index が visible-idx なので、
@@ -130,75 +132,39 @@ pub(super) fn commit_releases(
                     // min まで底上げして fallback (visible_tracks.get(1) = None → 元 track id)。
                     let min_idx_i32 = i32::from(master_row.is_some());
                     let clamp_max = max_idx_i32.max(min_idx_i32);
-                    let mut deltas: Vec<MoveClipDelta> = Vec::new();
+                    // 範囲が掛かっているトラック行の写像 `(移動元, 行き先)`。
+                    // anchor.track_index は visible-idx なので、そこへ track_delta を
+                    // 足して visible domain のまま clamp してから track id へ戻す。
+                    let mut track_map: Vec<(u32, u32)> = Vec::new();
                     for a in &nd.anchors {
-                        let new_start = (a.start_beat + beat_delta).max(0.0);
+                        if track_map.iter().any(|(from, _)| *from == a.key.track_id) {
+                            continue;
+                        }
                         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                         let press_i32 = a.track_index as i32;
                         let new_idx = (press_i32 + track_delta).clamp(min_idx_i32, clamp_max);
                         #[allow(clippy::cast_sign_loss)]
                         let new_idx_u = new_idx.max(0) as usize;
-                        let new_track_id = visible_tracks
-                            .get(new_idx_u)
-                            .map_or(a.key.track_id, |t| t.id);
-                        let moved = (new_start - a.start_beat).abs() > 1e-6
-                            || new_track_id != a.key.track_id;
-                        if moved {
-                            deltas.push(MoveClipDelta {
-                                from: a.key,
-                                to_track: new_track_id,
-                                prev_start_beat: a.start_beat,
-                                next_start_beat: new_start,
-                            });
-                        }
+                        let to = visible_tracks.get(new_idx_u).map_or(a.key.track_id, |t| t.id);
+                        track_map.push((a.key.track_id, to));
                     }
-                    if !deltas.is_empty() {
-                        // M14 Phase 63e (#019): Move + Ctrl + Shift → CloneClipsIndependent、
-                        // Move + Ctrl → CloneClipsLinked、 それ以外 → 既存 MoveClips。
+                    let (ra, rb) = nd.move_range;
+                    let moved = beat_delta.abs() > 1e-6
+                        || track_map.iter().any(|(from, to)| from != to);
+                    if !track_map.is_empty() && moved {
+                        // M14 Phase 63e (#019): Move + Ctrl + Shift → 独立コピー、
+                        // Move + Ctrl → リンクコピー、 それ以外 → 移動。
                         // `last_ctrl` / `last_shift` は overlay と同じ真値を読むので、 release
                         // frame の OS event 順序問題に依存せず確定する。 Alt は直交 (snap 一時
                         // 無効のみ) で、 既に上の `compute_clip_drag_beat_delta` で適用済。
-                        let req = if nd.last_ctrl && nd.last_shift {
-                            Edit::mutate(move |app: &mut AppData| {
-                                let entries: Vec<(ClipKey, u32, f64)> = deltas
-                                    .iter()
-                                    .filter_map(|d| {
-                                        live_clip_key(app, d.from)
-                                            .map(|r| (r, d.to_track, d.next_start_beat))
-                                    })
-                                    .collect();
-                                if !entries.is_empty() {
-                                    app.handle_event(AppEvent::CloneClipsIndependent(entries));
-                                }
-                            })
-                        } else if nd.last_ctrl {
-                            Edit::mutate(move |app: &mut AppData| {
-                                let entries: Vec<(ClipKey, u32, f64)> = deltas
-                                    .iter()
-                                    .filter_map(|d| {
-                                        live_clip_key(app, d.from)
-                                            .map(|r| (r, d.to_track, d.next_start_beat))
-                                    })
-                                    .collect();
-                                if !entries.is_empty() {
-                                    app.handle_event(AppEvent::CloneClipsLinked(entries));
-                                }
-                            })
-                        } else {
-                            Edit::mutate(move |app: &mut AppData| {
-                                let entries: Vec<(ClipKey, u32, f64)> = deltas
-                                    .iter()
-                                    .filter_map(|d| {
-                                        live_clip_key(app, d.from)
-                                            .map(|r| (r, d.to_track, d.next_start_beat))
-                                    })
-                                    .collect();
-                                if !entries.is_empty() {
-                                    app.handle_event(AppEvent::SetClipPositions(entries));
-                                }
-                            })
-                        };
-                        ui.push_edit(req);
+                        let (ctrl, shift) = (nd.last_ctrl, nd.last_shift);
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            if ctrl {
+                                app.copy_time_range(ra, rb, beat_delta, &track_map, shift);
+                            } else {
+                                app.move_time_range(ra, rb, beat_delta, &track_map);
+                            }
+                        }));
                     }
                 }
                 // r.md #68: 端 drag の (start, len) は **preview と同じ関数** で出す
@@ -747,37 +713,20 @@ pub(super) fn commit_releases(
             // 流さず **Edit closure 内で apply 時に読む**、 = 同 frame の他 Edit と順序が付き、
             // 「選択集合の末尾」 のような派生値に依存しない。
             let hit = clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px);
-            let modifier = SelectModifier::from_modifiers(click_shift, click_ctrl);
             if let Some((hit_key, _)) = hit {
-                // 範囲表は Shift のときだけ組む (無修飾 / Ctrl の click ごとに全 clip を
-                // 走査して Vec を作るのは無駄。 closure へ move する都合で遅延生成にはできない)。
-                let items = if modifier == SelectModifier::RangeFromAnchor {
-                    clip_range_items(visible_tracks)
-                } else {
-                    Vec::new()
-                };
+                // 選択の SSoT は時間範囲 1 本なので、修飾キーの意味は 2 つだけ:
+                // 無修飾 = そのクリップの占有区間へ張り直す / Ctrl・Shift = 外接まで広げる。
+                // Live 実機と同じく、離れた 2 クリップを拾うと**間のクリップも入る**
+                // (`docs/plan_range_selection.md` §3)。
+                let additive = click_ctrl || click_shift;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let anchor = app.selection.clip_anchor;
-                    let next = modifier.resolve(&prev, hit_key, || {
-                        range_block(&items, anchor?, hit_key)
-                    });
-                    if next != prev {
-                        let next_refs: Vec<ClipKey> =
-                            next.iter().filter_map(|key| live_clip_key(app, *key)).collect();
-                        app.handle_event(AppEvent::SetClipSelection(next_refs));
-                    }
-                    // アンカー更新: Single / Toggle で clicked へ、 Range は据え置き (§3.1)。
-                    // `SetClipSelection` はアンカーを触らないので順序依存は無い。
-                    if modifier.updates_anchor() {
-                        app.selection.clip_anchor = Some(hit_key);
-                    }
+                    app.handle_event(AppEvent::SelectClip { target: hit_key, additive });
                 }));
                 response.selection_changed = true;
             } else if !prev.is_empty() {
-                // 空きレーンの短 click → 選択クリア + アンカー破棄 (旧挙動と同じ)。
+                // 空きレーンの短 click → 選択クリア。
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetClipSelection(Vec::new()));
-                    app.selection.clip_anchor = None;
                 }));
                 response.selection_changed = true;
             }
@@ -789,100 +738,45 @@ pub(super) fn commit_releases(
             }
         }
 
-        // ---- M14 Phase 125 (#102) + daw_01 #75: drag marquee gate ----
-        // 旧設計は rect-select 起動に Shift 必須だったが、 標準 DAW (REAPER/Live/Bitwig) に倣い
-        // **空き zone を無修飾 drag → 範囲選択** にする。 修飾は release 時の next 計算で
-        // plain=REPLACE / Shift=UNION / Ctrl=XOR に分岐し、 press 時 modifier は
-        // `take_drag_rect_in_rect` が `DragRect.modifiers` に snapshot する (下の commit block で読む)。
-        // gate を **clear の前** で評価して `marquee_active` を作り、 同フレーム二重 emit を防ぐ。
+        // ---- 時間範囲のドラッグ release → SetTimeSelection ----
+        // 旧・矩形選択 (marquee) と投げ縄 (lasso) を置き換えた 1 本
+        // (`docs/plan_range_selection.md` §3.1 / §3.3)。 起動は `press_lanes::range_zone`。
         //
-        // r.md #35: **左** drag の marquee は空き zone 専用に戻す。 #75 は「clip の Move zone を
-        // Shift+drag しても marquee」 としていたが、 Shift+click が範囲選択になったので衝突する
-        // (一次情報でもどの DAW も Shift+drag で marquee を起動しない — Shift は選択の意味に予約)。
-        // clip の **上から** の範囲選択は **右 drag** が担う (下の secondary marquee、 REAPER 既定と
-        // 同じ配置)。 よって起動 zone は「clip 無し (空き zone)」 のみ。
-        // 二重防御として下の no-session ガード (全 session None) でも弾く。 automation lane は lasso が
-        // 所有するため `!press_in_automation_lane` で除外 (no_session は `automation_lasso_drag` を
-        // 含まないのでこの zone 除外が必須)。 splitter / 他 drag も no-session で除外。
-        let drag_rect_wid = wid.child(b"rect_select");
-        let shift_rect_active = {
-            let state: &mut daw_ui_core::widgets::drag_rect::DragRectState =
-                ui.widget_state(drag_rect_wid);
-            state.drag_start.is_some()
-        };
-        // automation lane 行かどうか (y だけで決まる)。 左 marquee の press gate と、
-        // 右 marquee の commit gate (press y で判定) の両方が使う。
-        let in_automation_lane = |py: f32| {
-            automation_lane_at(
-                visible_tracks,
-                press_tops,
-                view.track_row_h,
-                header_pane.x,
-                header_pane.w,
-                lanes.x,
-                lanes.w,
-                style,
-                py,
-            )
-            .is_some()
-        };
-        let press_in_automation_lane = pointer.primary_just_pressed
-            && pointer.pos.is_some_and(|(_, py)| in_automation_lane(py));
-        // r.md #73: Alt を弾いていたのは空き track row の Alt+drag が行高さ変更に
-        // 予約されていたから。 その機能を撤去したので、 ここで弾くと Alt+drag が
-        // 何も起こさない死角になる。 marquee に snap は無いので Alt に別の意味は無い。
-        // `lanes.contains(px, py)` を要求するのでヘッダ列には元から届かない。
-        let marquee_zone_ok = pointer.primary_just_pressed
-            && !press_in_automation_lane
-            && pointer.pos.is_some_and(|(px, py)| {
-                lanes.contains(px, py)
-                    && clip_hit(
-                        visible_tracks,
-                        press_tops,
-                        view,
-                        lanes,
-                        px,
-                        py,
-                        style.resize_handle_px,
-                    )
-                    .is_none()
-            });
-        let marquee_press = if marquee_zone_ok {
-            let s: &ArrangementState = ui.widget_state(wid);
-            s.track_volume_drag.is_none()
-                && s.track_reorder.is_none()
-                && s.audio_drag.is_none()
-                && s.clip_drag.is_none()
-                && s.automation_point_drag.is_none()
-                && s.automation_clip_drag.is_none()
-                && s.automation_lane_resize_drag.is_none()
-                && s.track_row_resize_drag.is_none()
-                && s.playhead_drag.is_none()
-                && s.loop_drag.is_none()
-                // r.md #73: 旧 `automation_curve_param_drag` の差し替え。 **これを忘れると
-                // 線の上の Alt+drag で bend と marquee が同フレームで両方起動する。**
-                && s.automation_segment_bend.is_none()
-        } else {
-            false
-        };
-        let marquee_active = marquee_press || shift_rect_active;
-
-        // ---- pure release on empty lanes (no drag started) → SelectClips clear ----
-        // clip_drag_session が無い + 空白 release + Shift なし。 #102: marquee がこの空き zone press を
-        // 所有する frame (`marquee_active`) は下の commit が zero-rect REPLACE で clear するため、 ここでは
-        // push しない (= 同フレーム二重 emit / undo 二重を防ぐ。 daw_01 #102「二重 emit 抑制」)。
-        if pointer.primary_just_released
-            && clip_short_click_pos.is_none()
-            && !clip_drag_release_was_some
-            && !pointer.modifiers.shift
-            && !marquee_active
-            && !ui.has_open_popups() // popup (context menu 等) の item click で clear しない (r.md #14)
-            && let Some((cx, cy)) = pointer.pos
-            && lanes.contains(cx, cy)
-            && clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px).is_none()
-            && !selected_clips.is_empty()
-        {
-            ui.push_edit({ let v_next = Vec::new(); Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipKey> = v_next.iter().filter_map(|key| live_clip_key(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
+        // 範囲 = 「掴んだ拍 〜 いまの拍」 × 「掴んだ y 〜 いまの y が横切った行」。
+        // 行はトラック行とオートメーションレーン行の両方で、**実際に横切った行だけ**が
+        // 入る (追従設定は編集にだけ効き、範囲の見た目は変えない)。
+        // スナップは drag 中の Alt が真値 (`rd.last_alt`、離す = 有効 / 押す = 無効)。
+        // 幅ゼロ (= ただのクリック) なら選択解除。
+        if let Some(rd) = range_drag_release {
+            let cur_beat = px_to_beat(rd.last_mouse.0, lanes.x, lanes.w, view);
+            let (a_beat, b_beat) = (
+                view.snap.snap_beat(rd.anchor_beat, rd.last_alt, zoom_x_px_per_beat),
+                view.snap.snap_beat(cur_beat, rd.last_alt, zoom_x_px_per_beat),
+            );
+            let (y0, y1) = if rd.anchor_y <= rd.last_mouse.1 {
+                (rd.anchor_y, rd.last_mouse.1)
+            } else {
+                (rd.last_mouse.1, rd.anchor_y)
+            };
+            let rows = arrangement_row_layout(visible_tracks, view.track_row_h);
+            let mut lane_refs: Vec<common::model::LaneRef> = Vec::new();
+            for row in &rows {
+                let top = lanes.y - view.track_top + row.content_top;
+                if top + row.height <= y0 || top >= y1 {
+                    continue;
+                }
+                lane_refs.push(match row.key {
+                    ArrangementRowKey::Track(id) => common::model::LaneRef::Track(id),
+                    ArrangementRowKey::Lane(key) => common::model::LaneRef::Automation(key),
+                });
+            }
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetTimeSelection {
+                    start_beat: a_beat.min(b_beat).max(0.0),
+                    end_beat: a_beat.max(b_beat).max(0.0),
+                    lanes: lane_refs,
+                });
+            }));
             response.selection_changed = true;
         }
 
@@ -914,79 +808,6 @@ pub(super) fn commit_releases(
             let end = volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w);
             if (end - tv.anchor_volume).abs() > 1e-4 {
                 ui.push_edit({ let v_track = tv.track_id; let v_next = end; Edit::mutate(move |app: &mut AppData| { let amp = MeterScale::default().frac_to_amp(v_next.clamp(0.0, 1.0)); app.handle_event(AppEvent::SetTrackVolume { track: v_track, amp }); }) });
-            }
-        }
-
-        // ---- M14 Phase 125 (#102): marquee commit (modifier 分岐: plain=REPLACE / Shift=UNION / Ctrl=XOR) ----
-        // gate `marquee_active` と `drag_rect_wid` は上の clear ガード手前で計算済 (空き zone press のみ所有)。
-        // `take_drag_rect_in_rect` は呼ぶだけで cyan overlay を自動描画し、 press 時 modifier を
-        // `DragRect.modifiers` に snapshot する。 release frame (`drag.finished`) に inside を計算して修飾で
-        // next を分岐。 REPLACE は inside そのまま (zero-rect → 空 → 選択 clear)。 `prev != next` ガードで
-        // no-op を抑制 (automation lasso #033 と同 idiom)。 Ctrl+Shift clone は clip HIT 時のみ (gate の
-        // `clip_hit().is_none()`) なので、 ここに来る press は必ず空き zone = clone と競合しない。
-        //
-        // r.md #35: **右 drag** の marquee も同じ commit を通す。 左 drag が空き zone 専用なのに対し、
-        // 右 drag は `lanes` 全域 = **clip の上からでも** 起動できる (REAPER 既定と同じ配置。
-        // 右ボタンなので clip の move / resize と衝突しない)。 動かさずに離した右ボタンは
-        // `take_secondary_click_in_rect` (= context menu) 側が拾い、 ここには来ない。
-        // `DragRectState` を共有しないよう widget id は左 drag と分ける。
-        let left_marquee =
-            if marquee_active { ui.take_drag_rect_in_rect(drag_rect_wid, lanes) } else { None };
-        // 右ボタンを **動かさずに** 離したフレームは「右クリック = context menu」 なので、
-        // 0 サイズ矩形の REPLACE で選択を消してしまわないよう commit を捨てる
-        // (session 自体は take して state を畳む必要があるので呼び出しは行う)。
-        // 左 marquee の空き zone click が選択 clear になるのは従来どおりの設計で、 こちらとは別物。
-        // automation lane 上から始めた右 drag は clip の marquee にしない (その帯は
-        // automation lasso の領分。 左 marquee の `!press_in_automation_lane` と同じ除外を、
-        // 右は session を畳む必要があるので **press y (`d.start.1`) で commit 側から** 掛ける)。
-        let secondary_was_click = ui.pending_secondary_click_pos().is_some();
-        let right_marquee = ui
-            .take_secondary_drag_rect_in_rect(wid.child(b"rect_select_rmb"), lanes)
-            .filter(|d| !(d.finished && secondary_was_click))
-            .filter(|d| !in_automation_lane(d.start.1));
-        for drag in [left_marquee, right_marquee].into_iter().flatten() {
-            response.rect_select_active = true;
-            if drag.finished {
-                let drag_rect = drag.rect();
-                let mut inside: Vec<ClipKey> = Vec::new();
-                for (i, t) in visible_tracks.iter().enumerate() {
-                    let row_top = press_tops[i];
-                    // 描画と同じ per-track 実効行高で交差判定する。
-                    let row_h = effective_track_row_h(t, view.track_row_h);
-                    for c in &t.clips {
-                        let r = clip_to_rect(row_top, row_h, c, view, lanes);
-                        if rects_intersect(r, drag_rect) {
-                            inside.push(ClipKey { track_id: t.id, clip_id: c.id });
-                        }
-                    }
-                }
-                let prev: Vec<ClipKey> = selected_clips.to_vec();
-                let next: Vec<ClipKey> = if drag.modifiers.shift {
-                    // UNION: prev 順を保持しつつ inside の新規だけ append。
-                    let mut out = prev.clone();
-                    for k in inside {
-                        if !out.contains(&k) {
-                            out.push(k);
-                        }
-                    }
-                    out
-                } else if drag.modifiers.ctrl {
-                    // XOR: prev に在って inside にも在る key を除き、 inside の新規を追加。
-                    let mut out: Vec<ClipKey> =
-                        prev.iter().copied().filter(|k| !inside.contains(k)).collect();
-                    for k in inside {
-                        if !prev.contains(&k) {
-                            out.push(k);
-                        }
-                    }
-                    out
-                } else {
-                    inside // REPLACE (zero-rect なら空 = clear)
-                };
-                if next != prev {
-                    ui.push_edit({ let v_next = next; Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipKey> = v_next.iter().filter_map(|key| live_clip_key(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
-                    response.selection_changed = true;
-                }
             }
         }
 

@@ -77,6 +77,16 @@ pub struct Track {
     /// plugin.
     #[serde(default)]
     pub source: InstrumentSource,
+    /// アレンジのクリップ。
+    ///
+    /// **不変条件: 同一トラックのクリップは時間的に重ならない**
+    /// (`docs/plan_range_selection.md` §6)。 1 トラックの 1 時点に鳴るクリップは 1 つ。
+    /// 重なりを作りうる編集 (移動 / trim / 貼り付け / 複製 / 録音 / import / 新規作成 /
+    /// ランチャーからの drop) は **必ず [`Track::place_clip`] を通す** —
+    /// そこが上書き規則 (完全被覆で削除 / 端の食い込みで trim / 中央で 2 分割) を
+    /// 無条件に適用する。 `clips.push` を直に書くと不変条件に穴が開く。
+    ///
+    /// 順序は保証しない (住所は `Clip::id`)。 開始拍順が要る処理はその場で sort する。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clips: Vec<Clip>,
     /// Per-track stable id allocator for `Clip`. Bumped each time a new
@@ -419,8 +429,15 @@ impl Track {
     }
 
     /// Allocate a new stable clip id, bumping the per-track counter.
+    ///
+    /// **既に使われている id は返さない。** counter が実際のクリップより遅れている
+    /// (旧ファイル / テスト fixture / 手組みの `Track`) と、採番が既存 id と衝突して
+    /// [`Track::place_clip`] の「同じ id を置き直す」規則に巻き込まれ、無関係な
+    /// クリップが黙って消える。 採番のたびに実在 id の最大を見て counter を押し上げる
+    /// (クリップ数は小さいので線形走査で足りる)。
     pub fn alloc_clip_id(&mut self) -> u32 {
-        let id = self.next_clip_id.max(1);
+        let max_used = self.all_clips().map(|c| c.id).max().unwrap_or(0);
+        let id = self.next_clip_id.max(1).max(max_used.saturating_add(1));
         self.next_clip_id = id.saturating_add(1);
         id
     }
@@ -474,6 +491,70 @@ impl Track {
         }
         let i = self.session_clips.iter().position(|c| c.clip.id == clip_id)?;
         Some((self.session_clips.remove(i).clip, true))
+    }
+
+    /// アレンジにクリップを置く**唯一の口**。
+    ///
+    /// `clip` の占有区間に掛かる既存クリップを上書き規則で削り取ってから push する
+    /// (`Track::clips` の非重なり不変条件)。 同じ id のクリップが既に居れば取り除いてから
+    /// 置き直すので、「このクリップをここへ動かす」にもそのまま使える (冪等)。
+    /// `id == 0` なら採番する。 返り値は確定した `Clip::id`。
+    pub fn place_clip(&mut self, mut clip: Clip) -> u32 {
+        if clip.id == 0 {
+            clip.id = self.alloc_clip_id();
+        }
+        let id = clip.id;
+        self.clips.retain(|c| c.id != id);
+        let (start, end) = clip.song_window();
+        self.carve_clip_range(start, end, None);
+        self.clips.push(clip);
+        id
+    }
+
+    /// `[start, end)` に掛かる既存クリップを**上書き規則**で削り取る。
+    /// 規則の実装は [`crate::model::carve_range`] 1 本
+    /// (automation クリップと共有 — 2 か所に書くと片方だけ直って静かに食い違う)。
+    ///
+    /// `except_clip_id` はその id のクリップを対象から外す (自分自身を削らないため)。
+    /// 返り値は 1 つでも変更したか。
+    pub fn carve_clip_range(
+        &mut self,
+        start: f64,
+        end: f64,
+        except_clip_id: Option<u32>,
+    ) -> bool {
+        // 分割断片の id は **実在 id と衝突させない** ([`Track::alloc_clip_id`] と同じ規則)。
+        // counter だけを信じると、counter が遅れている Track (旧ファイル / 手組み) で
+        // 断片が既存クリップと同じ id を持ち、`place_clip` の「同じ id を置き直す」
+        // 規則に巻き込まれて無関係なクリップが黙って消える。
+        let mut next = self.next_clip_id.max(1).max(
+            self.all_clips().map(|c| c.id).max().unwrap_or(0).saturating_add(1),
+        );
+        let changed = crate::model::carve_range(&mut self.clips, start, end, except_clip_id, || {
+            let id = next;
+            next = next.saturating_add(1);
+            id
+        });
+        self.next_clip_id = next;
+        changed
+    }
+
+    /// 既存の重なりを解消する (プロジェクト読み込み時の移行)。
+    ///
+    /// **配列順で後ろにあるもの (= 描画で前面に来ているもの) が勝つ。** 返り値は
+    /// 1 つでも変更したか (= `*` を立てるか)。 **冪等** — 2 回目以降は重なりが無いので
+    /// `false` を返す (開き直すだけで `*` が立たない)。
+    pub fn resolve_clip_overlaps(&mut self) -> bool {
+        let mut next = self.next_clip_id.max(1).max(
+            self.all_clips().map(|c| c.id).max().unwrap_or(0).saturating_add(1),
+        );
+        let changed = crate::model::resolve_overlaps(&mut self.clips, || {
+            let id = next;
+            next = next.saturating_add(1);
+            id
+        });
+        self.next_clip_id = next;
+        changed
     }
 
     /// Allocate a new stable lane id, bumping the per-track counter.
