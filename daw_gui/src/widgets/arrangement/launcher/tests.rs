@@ -21,6 +21,7 @@ fn view_with_scenes(n: usize) -> LauncherView {
                 name: Arc::from(format!("Scene {}", i + 1)),
                 color: Color::rgb(0.5, 0.5, 0.5),
                 follow: false,
+                selected: false,
             })
             .collect(),
         ..LauncherView::default()

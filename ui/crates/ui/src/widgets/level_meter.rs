@@ -54,15 +54,15 @@ const SCALE_TICK_LEN: f32 = 5.0;
 /// dB ラベルの font サイズ。
 const SCALE_FONT_PX: f32 = 9.0;
 /// peak readout の font サイズ。
-const READOUT_FONT_PX: f32 = 10.0;
+pub(crate) const READOUT_FONT_PX: f32 = 10.0;
 /// peak readout の行の高さ。
-const READOUT_H: f32 = 13.0;
+pub(crate) const READOUT_H: f32 = 13.0;
 /// peak readout 専用帯の高さ (行 + 上下余白)。 バー/目盛りはこのぶん下げる。
-const READOUT_BAND_H: f32 = READOUT_H + 3.0;
+pub(crate) const READOUT_BAND_H: f32 = READOUT_H + 3.0;
 /// scale 時の上下パディング (px)。 端ラベル (+6 / -60) を rect の端に貼り付けない。
 const SCALE_VPAD: f32 = 6.0;
 /// 文字幅の近似係数 (固定幅前提、 chip 幅 / 中央寄せ用)。
-const CHAR_W_RATIO: f32 = 0.62;
+pub(crate) const CHAR_W_RATIO: f32 = 0.62;
 
 /// `MeterScale` の default ラベル dB 列 (上 → 下)。 均等 6dB 間隔 (+6 → -60)。
 const DEFAULT_SCALE_DB: &[f32] =
@@ -659,25 +659,41 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 1.27:1 に潰れていた。 `adapt_on` が救おうとしても図形基準 3:1 止まりで、 実効 2.5:1 の
     /// 読めない淡いピンクにしかならない (r.md #50)。
     fn draw_meter_readout(&mut self, rect: Rect, long_peak_value: f32, style: &LevelMeterStyle) {
-        let p = self.palette();
         let (text, over) = format_peak_readout(long_peak_value);
-        // over は色相 (赤 = 警告) を保ったまま、 文字として読める明度まで寄せる。
-        // 通常時は「この面の上の本文インク」 = ink_for に委ねる (答えを 2 つ持たない)。
-        let color = if over {
-            p.adapt_text_on(style.bg, p.text_error)
-        } else {
-            p.ink_for(style.bg)
-        };
+        let band = Rect { x: rect.x, y: rect.y, w: rect.w, h: READOUT_BAND_H };
+        self.draw_readout_text(band, rect, &text, style.bg, over);
+    }
+
+    /// readout 帯 1 つぶんの数値を、 帯の幅に中央寄せで描く。
+    ///
+    /// `bg` は **その文字の背後に実際にある面**。 インクはそこから導出するので、
+    /// 呼ぶ側は「自分が敷いた面」 を渡すこと (上の `draw_meter_readout` の rationale が
+    /// そのまま効く — 極性固定インク + 暗チップは使わない)。 `error` は色相 (赤 = 警告) を
+    /// 保ったまま読める明度へ寄せる経路で、 通常時は `ink_for` 1 本に委ねる
+    /// (答えを 2 つ持たない)。
+    ///
+    /// `clip` を `band` と別に取るのは、 メーター列の peak が「帯の高さ」 ではなく
+    /// 「メーター列全体」 でクリップされているのを変えないため。
+    pub(crate) fn draw_readout_text(
+        &mut self,
+        band: Rect,
+        clip: Rect,
+        text: &str,
+        bg: Color,
+        error: bool,
+    ) {
+        let p = self.palette();
+        let color = if error { p.adapt_text_on(bg, p.text_error) } else { p.ink_for(bg) };
         let text_w = text.chars().count() as f32 * READOUT_FONT_PX * CHAR_W_RATIO;
-        let text_x = rect.x + (rect.w - text_w).max(0.0) * 0.5;
+        let text_x = band.x + (band.w - text_w).max(0.0) * 0.5;
         self.push_text(GlyphArea {
             text: text.into(),
             left: text_x,
-            top: rect.y + 1.0 + (READOUT_H - READOUT_FONT_PX) * 0.5 - 1.0,
+            top: band.y + 1.0 + (READOUT_H - READOUT_FONT_PX) * 0.5 - 1.0,
             font_size: READOUT_FONT_PX,
             line_height: READOUT_H,
             color,
-            clip_rect: Some(rect),
+            clip_rect: Some(clip),
             ..GlyphArea::default()
         });
     }
@@ -779,13 +795,21 @@ fn format_scale_db(db: f32) -> String {
     format!("{}", db.abs().round() as i32)
 }
 
+/// dB 数値の readout 文字列。 無音 (非有限) は `"-inf"`、 それ以外は小数 1 桁。
+///
+/// **peak readout と fader readout が同じ書式を共有する** (`channel_fader_meter` は
+/// この 2 つを同じ帯に横並びで出すので、 桁と読み方が食い違うと 1 つの帯に見えない)。
+pub(crate) fn format_db_readout(db: f32) -> String {
+    if db.is_finite() { format!("{db:.1}") } else { "-inf".to_string() }
+}
+
 /// peak readout 文字列と over フラグ。 無音なら `("-inf", false)`、 else `("{db:.1}", db >= 0.0)`。
 fn format_peak_readout(long_peak_linear: f32) -> (String, bool) {
     if long_peak_linear <= 1e-6 {
         return ("-inf".to_string(), false);
     }
     let db = linear_to_db(long_peak_linear);
-    (format!("{db:.1}"), db >= 0.0)
+    (format_db_readout(db), db >= 0.0)
 }
 
 #[cfg(test)]

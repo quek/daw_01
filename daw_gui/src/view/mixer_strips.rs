@@ -72,12 +72,16 @@ const PAN_READOUT_PAD_X: f32 = 4.0;
 /// Pan 数値欄の scrub 感度 (units_per_pixel、 pan は plain -1..=1)。 inspector の
 /// Pan 欄 (`track_inspector::scrub_style`) と同値 = 同じ param は同じ手応え。
 const PAN_READOUT_SENSITIVITY: f32 = 0.004;
-const FADER_W: f32 = 18.0;
+/// フェーダー列の幅 (px)。 つまみ (28px) が収まり、 かつ **上端の帯にフェーダー dB 値
+/// (`-60.0` = 10px フォントで 31px) が読める幅**。 以前は 18px で、 (a) 28px のつまみが
+/// 列から左右へはみ出してメーター列に食い込み、 (b) 帯の左半分が空いたままだった。
+/// ストリップ幅 (80px) は据え置きで、 左右に捨てていた 12.5px ずつの余白から取る。
+const FADER_W: f32 = 31.0;
 const METER_GAP: f32 = 2.0;
 /// scale 付きステレオメーターの box 幅 (px)。 widget が内部で
 /// `[tick ~6 | L バー | R バー | 数字 ~18]` に配分する。 全 ch に dB 目盛りを
-/// 付けつつ現 80px ストリップ (fader 18 と並べて) に収まる幅。 数字 "-60" が
-/// 読める最小幅で、 バーは ~5px ずつ残る。
+/// 付けつつ 80px ストリップ (fader 31 + gap 2 と並べて左右 6px 余白) に収まる幅。
+/// 数字 "-60" が読める最小幅で、 バーは ~5px ずつ残る。
 const METER_SCALE_W: f32 = 35.0;
 /// Sends セクション 1 行の高さ (= 宛先名 + × の header 行 + knob / Pre-Post / M の
 /// controls 行)。 2 行構成にして Pre/Post トグルに "Post" が省略されない幅を確保する。
@@ -712,7 +716,7 @@ fn draw_strip(
     let is_master_for_vol = is_master;
     // fader ハンドル・L/R メーター・dB 目盛り・0dB 線・
     // peak を「ただ一つの dB→ピクセル y 写像」から配置する単一 widget に統一。
-    // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 55) を渡すと
+    // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 68) を渡すと
     // widget が内部で fader 列 (fader_w) と meter 列に分割し、両者の高さ写像が
     // 構造的に一致する (旧 fader_at + level_meter_stereo 別置きの ~13px ズレ解消)。
     let vol_scale = MeterScale::default();

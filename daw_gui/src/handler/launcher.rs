@@ -24,6 +24,7 @@ use crate::event_launcher::{
     LauncherAudioCommand, LauncherCellKey, LauncherEvent, LauncherRow,
 };
 use crate::state::{AppData, LauncherFocus};
+use crate::widgets::select_modifier::SelectModifier;
 
 impl AppData {
     // ------------------------------------------------------------------
@@ -257,6 +258,7 @@ impl AppData {
 
             // ---- 選択とフォーカス ----
             E::SelectCell { cell, modifier } => self.select_launcher_cell(cell, modifier),
+            E::SelectScene { scene_id, modifier } => self.select_scene(scene_id, modifier),
             E::OpenCellEditor(cell) => self.open_cell_editor(cell),
             E::FocusCell { row, scene_index } => {
                 self.launcher.focus = Some(LauncherFocus { row, scene_index });
@@ -429,7 +431,9 @@ impl AppData {
                 self.set_row_playback(row, next);
             }
         }
-        if pressed {
+        // 実体の無い列 (`scene_id == 0`) を撃つのは「全行停止」なので、**これで
+        // 再生を始めない** — 止めるつもりの操作が再生の開始になってしまう。
+        if pressed && scene_id != 0 {
             self.ensure_transport_rolling();
         }
         self.send_launcher_audio(LauncherAudioCommand::LaunchScene { scene_id, pressed });
@@ -666,6 +670,36 @@ impl AppData {
     #[must_use]
     pub fn scene_ids(&self) -> Vec<u32> {
         self.song_doc.song().scenes.iter().map(|s| s.id).collect()
+    }
+
+    /// シーン見出しの click による列選択 (無修飾 = 置換 / Ctrl = トグル / Shift = 範囲)。
+    ///
+    /// **セルの選択は落とす。** 列とセルはインスペクタの同じ面 (ローンチ) を使うので、
+    /// 両方が非空だと「セルの設定」と「列の設定」が同時に出て、どちらを触っているのか
+    /// 分からなくなる (`SelectionState::selected_scene_ids` の doc)。
+    ///
+    /// 範囲は表示順の連続区間 (トラック / セクションと同じ 1 次元の面)。
+    pub fn select_scene(&mut self, scene_id: u32, modifier: SelectModifier) {
+        let order = self.scene_ids();
+        if !order.contains(&scene_id) {
+            return;
+        }
+        let anchor = self.selection.scene_anchor;
+        let next = modifier.resolve(&self.selection.selected_scene_ids, scene_id, || {
+            let a = anchor?;
+            crate::widgets::select_modifier::range_ordered(&order, a, scene_id)
+        });
+        self.selection.selected_scene_ids = next;
+        if modifier.updates_anchor() {
+            self.selection.scene_anchor = Some(scene_id);
+        }
+        if self.selection.selected_scene_ids.is_empty() {
+            return;
+        }
+        // 列を選んだらセル側は空にする (上記の排他)。
+        self.selection.selected_clip = None;
+        self.selection.selected_clips.clear();
+        self.selection.selected_automation_clips.clear();
     }
 
     /// 行 `row` の列 `scene_id` にあるセル。

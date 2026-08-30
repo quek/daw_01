@@ -576,7 +576,7 @@ impl AppData {
         };
         self.set_single_clip_selection(r);
         self.selection.selected_notes.clear();
-        self.select_track(track_idx);
+        self.select_track(r.track_id);
     }
 
     pub(crate) fn delete_selected_clip(&mut self) {

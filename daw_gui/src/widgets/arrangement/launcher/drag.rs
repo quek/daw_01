@@ -33,6 +33,8 @@ fn update_sessions(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     }
     if let Some(d) = s.scene_reorder.as_mut() {
         d.last_mouse = pos;
+        d.last_ctrl = m.ctrl;
+        d.last_shift = m.shift;
     }
 }
 
@@ -164,6 +166,8 @@ pub(crate) fn take(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) -> Launch
     let mut out = LauncherSessions {
         live_cell_drag: s.cell_drag.clone(),
         live_scene_reorder: s.scene_reorder,
+        // 押下中の見た目に使うので **take せず覗くだけ** (take は release 時のみ)。
+        live_held_button: s.held_button,
         ..LauncherSessions::default()
     };
     if released {

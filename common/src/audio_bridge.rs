@@ -28,7 +28,7 @@ pub const MAX_MOD_SOURCES: usize = 64;
 /// **engine 側の走行状態の器 (`launcher::MAX_ROWS`) も同じ値**なので、溢れると
 /// 表示が出ないだけでは済まず、その行はランチャーを持てない (= セルを撃っても
 /// アレンジのクリップが鳴り続ける)。32 トラック × 15 レーンぶんを確保して、
-/// 現実的な曲で溢れないようにする (1 行 32 バイト = 16 KB)。
+/// 現実的な曲で溢れないようにする (1 行 48 バイト = 24 KB)。
 pub const MAX_LAUNCHER_ROWS: usize = 512;
 
 /// [`LauncherRowState::state`] の値。**engine と GUI が共有する唯一の定義**。
@@ -64,6 +64,16 @@ pub struct LauncherRowState {
     /// 量子化境界待ちのセルの `clip.id` (0 = なし / `LAUNCHER_QUEUED_STOP` /
     /// `LAUNCHER_QUEUED_ARRANGER`)。
     pub queued_clip_id: AtomicU32,
+    /// 予約が **発火する song 拍** (`f64::to_bits`)。`queued_clip_id == 0` の
+    /// ときは意味を持たない (0)。
+    ///
+    /// **GUI のカウントダウンはこれを引き算するだけ**にするためにある。engine は
+    /// 量子化境界・シーンのフォローアクション・legato・repeat を全部畳んだ結果の
+    /// 「実際に鳴る拍」を既に持っているので、GUI が
+    /// [`LaunchQuantize`](crate::model::LaunchQuantize) から境界を解き直すと
+    /// **同じ答えを 2 本の式で出すことになり、フォローアクション経由の予約
+    /// (グローバル量子化を迂回する) で必ず食い違う**。
+    pub queued_at_beat_bits: AtomicU64,
     /// いま鳴っているセルの中の進捗 `0..1` (`f32::to_bits`)。停止中は 0。
     pub progress_bits: AtomicU32,
     /// いま鳴っているセルを **撃った song 拍** (`f64::to_bits`)。停止中は 0。
@@ -140,13 +150,15 @@ impl AudioBridge {
 }
 
 /// r.md #87: [`AudioBridgeHandle::launcher_row`] が返す 1 行ぶんの値
-/// (atomic を 4 つ読んだ結果の組)。
+/// ([`LauncherRowState`] の atomic を全部読んだ結果の組)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LauncherRowSnapshot {
     /// `LAUNCHER_STATE_*`。
     pub state: u32,
     pub playing_clip_id: u32,
     pub queued_clip_id: u32,
+    /// 予約が発火する song 拍 (`queued_clip_id == 0` のときは `0.0`)。
+    pub queued_at_beat: f64,
     /// セル内の進捗 `0..1`。
     pub progress: f32,
     /// 鳴っているセルを撃った song 拍 (停止中は `0.0`)。
@@ -293,6 +305,7 @@ impl AudioBridgeHandle {
         state: u32,
         playing_clip_id: u32,
         queued_clip_id: u32,
+        queued_at_beat: f64,
         progress: f32,
         launch_beat: f64,
     ) {
@@ -302,6 +315,7 @@ impl AudioBridgeHandle {
         cell.state.store(state, Ordering::Release);
         cell.playing_clip_id.store(playing_clip_id, Ordering::Release);
         cell.queued_clip_id.store(queued_clip_id, Ordering::Release);
+        cell.queued_at_beat_bits.store(queued_at_beat.to_bits(), Ordering::Release);
         cell.progress_bits.store(progress.to_bits(), Ordering::Release);
         cell.launch_beat_bits.store(launch_beat.to_bits(), Ordering::Release);
         // `row_key` は **最後に**書く — GUI は「使用中か」を見てから残りを読むので、
@@ -341,6 +355,9 @@ impl AudioBridgeHandle {
                     state: cell.state.load(Ordering::Acquire),
                     playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
                     queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
+                    queued_at_beat: f64::from_bits(
+                        cell.queued_at_beat_bits.load(Ordering::Acquire),
+                    ),
                     progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
                     launch_beat: f64::from_bits(
                         cell.launch_beat_bits.load(Ordering::Acquire),
@@ -374,6 +391,9 @@ impl AudioBridgeHandle {
                     state: cell.state.load(Ordering::Acquire),
                     playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
                     queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
+                    queued_at_beat: f64::from_bits(
+                        cell.queued_at_beat_bits.load(Ordering::Acquire),
+                    ),
                     progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
                     launch_beat: f64::from_bits(
                         cell.launch_beat_bits.load(Ordering::Acquire),
@@ -414,8 +434,8 @@ mod tests {
     fn 行キー_0_の行も読み出せる() {
         let name = format!("daw01_test_bridge_{}", std::process::id());
         let h = AudioBridgeHandle::create(&name).expect("bridge");
-        h.set_launcher_row(0, 0, LAUNCHER_STATE_PLAYING, 7, 0, 0.25, 4.0);
-        h.set_launcher_row(1, (1_u64 << 32) | 2, LAUNCHER_STATE_STOPPED, 0, 0, 0.0, 0.0);
+        h.set_launcher_row(0, 0, LAUNCHER_STATE_PLAYING, 7, 0, 0.0, 0.25, 4.0);
+        h.set_launcher_row(1, (1_u64 << 32) | 2, LAUNCHER_STATE_STOPPED, 0, 9, 12.0, 0.0, 0.0);
         h.clear_launcher_rows_from(2);
 
         let mut out = Vec::new();
@@ -424,6 +444,9 @@ mod tests {
         assert_eq!(out[0].0, 0, "1 行目の key は 0 (track_id 0 / lane_id 0)");
         assert_eq!(out[0].1.playing_clip_id, 7);
         assert_eq!(out[1].0, (1_u64 << 32) | 2);
+        // 予約は「どのセルか」と「いつ鳴るか」が組で届く (GUI のカウントダウン)。
+        assert_eq!(out[1].1.queued_clip_id, 9);
+        assert!((out[1].1.queued_at_beat - 12.0).abs() < 1e-9);
         // 単発引きも同じ行を引ける。
         let one = h.launcher_row(0, 0).expect("row_key 0 も引ける");
         assert_eq!(one.playing_clip_id, 7);

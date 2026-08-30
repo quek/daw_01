@@ -186,6 +186,8 @@ impl AppData {
     /// 範囲は「行 × 列」の長方形ブロック。 アレンジのクリップ選択と同じ
     /// [`SelectModifier`] を使うので、修飾キーの意味が面ごとに割れない。
     pub fn select_launcher_cell(&mut self, cell: LauncherCellKey, modifier: SelectModifier) {
+        // 列 (シーン) 選択とは排他 (`SelectionState::selected_scene_ids` の doc)。
+        self.selection.selected_scene_ids.clear();
         match cell {
             LauncherCellKey::Track(key) => {
                 let items = self.launcher_range_items();
@@ -201,6 +203,14 @@ impl AppData {
                 }
                 if self.selection.selected_clip.is_some() {
                     self.selection.last_edit_select = Some(crate::app::EditSurface::Clips);
+                }
+                // アレンジのクリップ選択 (`select_clip` / `set_clip_selection`) と
+                // 同じく、 anchor のトラックへカーソルを追従させる。 これが無いと
+                // インスペクタの上半分 (トラック名・色・デバイスチェーン) だけが
+                // 前のトラックのまま残り、 下半分 (クリップ / ローンチ設定) と
+                // 混ざって見える。 `Clips` タグを立てた **直後**に呼ぶ約束も同じ。
+                if let Some(r) = self.selected_clip_ref() {
+                    self.select_track(r.track_id);
                 }
             }
             LauncherCellKey::Lane(key) => {
@@ -221,6 +231,13 @@ impl AppData {
                 if !self.selection.selected_automation_clips.is_empty() {
                     self.selection.last_edit_select =
                         Some(crate::app::EditSurface::AutomationClips);
+                }
+                // automation セルも同じ — レーンは必ずどれか 1 トラックに属するので、
+                // 別トラックのレーンのセルを選んだらカーソルもそのトラックへ動く。
+                if let Some(track_id) =
+                    self.selection.selected_automation_clips.last().map(|k| k.track)
+                {
+                    self.select_track(track_id);
                 }
             }
         }
@@ -298,6 +315,12 @@ impl AppData {
 
     /// 消えたセルを選択集合から落とす (列削除 / セル削除の後始末)。
     pub(crate) fn prune_launcher_selection(&mut self) {
+        let song = self.song_doc.song();
+        // 消えた列を指したままだと、インスペクタが存在しない列の設定を出す。
+        let live_scenes: Vec<u32> = song.scenes.iter().map(|s| s.id).collect();
+        self.selection.selected_scene_ids.retain(|id| live_scenes.contains(id));
+        self.selection.scene_anchor =
+            self.selection.scene_anchor.filter(|id| live_scenes.contains(id));
         let song = self.song_doc.song();
         let clip_alive = |k: &ClipKey| {
             song.track_by_id(k.track_id).is_some_and(|t| {
@@ -568,6 +591,8 @@ impl AppData {
         if cells.is_empty() {
             return;
         }
+        // click 経路と同じく列選択とは排他。
+        self.selection.selected_scene_ids.clear();
         let clips: Vec<ClipKey> = cells
             .iter()
             .filter_map(|c| match c {
@@ -582,6 +607,12 @@ impl AppData {
                 LauncherCellKey::Track(_) => None,
             })
             .collect();
+        // click 経路 (`select_launcher_cell`) と同じくカーソルトラックを追従させる。
+        // 別トラックへセルを複製 / 移動したら、 インスペクタもその行に付いていく。
+        // anchor は「最後に置いたセル」 = 集合の末尾で、 automation が後勝ち
+        // (下の `last_edit_select` の優先順と同じ)。
+        let anchor_track =
+            autos.last().map(|k| k.track).or_else(|| clips.last().map(|k| k.track_id));
         if !clips.is_empty() {
             self.selection.selected_clip = clips.last().copied();
             self.selection.selected_clips = clips;
@@ -590,6 +621,9 @@ impl AppData {
         if !autos.is_empty() {
             self.selection.selected_automation_clips = autos;
             self.selection.last_edit_select = Some(crate::app::EditSurface::AutomationClips);
+        }
+        if let Some(track_id) = anchor_track {
+            self.select_track(track_id);
         }
     }
 

@@ -299,12 +299,17 @@ impl LauncherRuntime {
                 Some(QueueTarget::Arranger) => ab::LAUNCHER_QUEUED_ARRANGER,
                 None => 0,
             };
+            // **発火拍もそのまま渡す。** GUI のカウントダウンはこれを引くだけで、
+            // 量子化境界を GUI 側で解き直さない (シーンのフォローアクション由来の
+            // 予約はグローバル量子化を迂回するので、解き直すと必ず食い違う)。
+            let queued_at = row.queued.map_or(0.0, |q| q.at_beat);
             bridge.set_launcher_row(
                 slot,
                 row.key.packed(),
                 state,
                 clip_id,
                 queued,
+                queued_at,
                 progress,
                 launch_beat,
             );

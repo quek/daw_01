@@ -943,13 +943,10 @@ impl AppData {
             return;
         };
         let mut linked = Vec::new();
-        for (t_idx, track) in self.song_doc.song().tracks.iter().enumerate() {
-            for (c_idx, clip) in track.clips.iter().enumerate() {
+        for track in &self.song_doc.song().tracks {
+            for clip in &track.clips {
                 if clip.content_id == content_id {
-                    linked.push(ClipKey {
-                        track_id: t_idx as u32,
-                        clip_id: c_idx as u32,
-                    });
+                    linked.push(ClipKey { track_id: track.id, clip_id: clip.id });
                 }
             }
         }

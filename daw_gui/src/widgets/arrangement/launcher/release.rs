@@ -94,6 +94,15 @@ fn commit_scene_reorder(
     let dx = sr.last_mouse.0 - sr.anchor_mouse.0;
     let dy = sr.last_mouse.1 - sr.anchor_mouse.1;
     if (dx * dx + dy * dy).sqrt() < REORDER_DRAG_THRESHOLD_PX {
+        // 短クリックは **列の選択**に格下げ (セル本体の drag と同じ demote)。
+        // 以前はここで黙って捨てていたので、シーン見出しは押しても何も起きず、
+        // 列を選ぶ手段が存在しなかった (= 列のフォローアクションは「その列に
+        // セルを持つ行を選ぶ」経由でしか触れず、空の列は設定できなかった)。
+        response.launcher.intents.push(LauncherIntent::SelectScene {
+            scene_id: sr.scene_id,
+            additive: sr.last_ctrl && !sr.last_shift,
+            range: sr.last_shift,
+        });
         return;
     }
     // overlay の指標線と **同じ 1 本** を通す (指した位置 = 着地位置)。

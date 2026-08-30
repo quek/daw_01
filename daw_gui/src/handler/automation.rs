@@ -1024,8 +1024,8 @@ impl AppData {
                 let Some(to_track) = song.tracks.get_mut(target_idx) else {
                     continue;
                 };
+                let to_track_id = to_track.id;
                 let new_clip_id = to_track.alloc_clip_id();
-                let new_idx = to_track.clips.len() as u32;
                 to_track.clips.push(common::model::Clip {
                     id: new_clip_id,
                     start_beat: (at_beat + cc.start_beat).max(0.0),
@@ -1047,10 +1047,10 @@ impl AppData {
                     // (talk) per-clip 読み上げスケールも引き継ぐ。
                     talk: cc.talk,
                 });
-                new_refs.push(ClipKey {
-                    track_id: target_idx as u32,
-                    clip_id: new_idx,
-                });
+                // 住所は **安定 id**。 index (`target_idx` / `clips.len()`) で組むと
+                // paste 直後の選択が別のクリップを指す (= 貼った先ではないものが
+                // 選択され、 続く操作がそちらに当たる)。
+                new_refs.push(ClipKey { track_id: to_track_id, clip_id: new_clip_id });
             }
             new_refs
         }) else {

@@ -239,6 +239,10 @@ pub enum LauncherIntent {
     SwitchAllToArranger,
     /// セル本体クリックによる選択。`additive` = `Ctrl`、`range` = `Shift`。
     SelectCell { cell: LauncherCellKey, additive: bool, range: bool },
+    /// シーン見出しの本体を **短くクリック**した = 列 (シーン) の選択。
+    /// 動かせば並べ替え (`ReorderScene`) になるので、セル本体の drag → 選択への
+    /// 格下げと同じ閾値・同じ修飾キー規約を通る。
+    SelectScene { scene_id: u32, additive: bool, range: bool },
     /// 空セルのダブルクリック → 空クリップを作る。
     /// `scene_index` がプレースホルダ列を指していたら `Song::ensure_scene_at` で実体化する。
     CreateCell { row: ArrangementRowKey, scene_index: u32 },
@@ -361,6 +365,8 @@ pub(super) struct LauncherSceneView {
     pub color: Color,
     /// シーンにフォローアクションが設定されている (▶ を縞にする)。
     pub follow: bool,
+    /// この列が選択されている (見出しに選択枠を出す)。
+    pub selected: bool,
 }
 
 impl LauncherSceneView {
@@ -377,6 +383,8 @@ impl LauncherSceneView {
             name: Arc::from(common::model::Scene::new(0).display_name(index)),
             color,
             follow: false,
+            // 実体の無い列は選べない (選択は列 id で持つので `0` は指せない)。
+            selected: false,
         }
     }
 }
@@ -405,6 +413,44 @@ pub(super) struct LauncherView {
     /// (計画書 §1.4: 走行位置は `Song` に入れない)。空のあいだ進捗バーは描かれず、
     /// 「どのセルを握っているか」だけが [`LauncherRowView::playback`] から出る。
     pub progress: HashMap<ArrangementRowKey, f32>,
+    /// 量子化境界待ちの予約 (行 → 予約)。engine が publish するまで空。
+    pub queued: HashMap<ArrangementRowKey, QueuedView>,
+}
+
+/// 「押したがまだ鳴っていない」行の予約 ([`LauncherView::queued`])。
+///
+/// 量子化が 1 小節なら、押してから最大 1 小節ぶん**何も起きない時間**がある。
+/// そこを無表示にすると「押せていないのでは」としか見えないので、予約中の
+/// セルは点滅し、発火までの残り拍を数字で出す。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct QueuedView {
+    /// 予約されたセルの `clip.id`。`LAUNCHER_QUEUED_STOP` / `_ARRANGER` は
+    /// セルではなく「行を止める / アレンジへ返す」の予約 (停止列 / 返す列が光る)。
+    pub clip_id: u32,
+    /// 発火までの残り拍。**engine が publish した発火拍から引いた値**で、
+    /// GUI 側で量子化境界を解き直したものではない
+    /// (`common::audio_bridge::LauncherRowState::queued_at_beat_bits` の doc)。
+    pub remaining_beats: f64,
+}
+
+impl QueuedView {
+    /// 予約が「行の停止」か。
+    #[must_use]
+    pub(super) fn is_stop(self) -> bool {
+        self.clip_id == common::audio_bridge::LAUNCHER_QUEUED_STOP
+    }
+
+    /// 予約が「アレンジへ返す」か。
+    #[must_use]
+    pub(super) fn is_arranger(self) -> bool {
+        self.clip_id == common::audio_bridge::LAUNCHER_QUEUED_ARRANGER
+    }
+
+    /// 残り拍の表示文字列 (小数 1 桁、負なら `0.0`)。
+    #[must_use]
+    pub(super) fn label(self) -> String {
+        format!("{:.1}", self.remaining_beats.max(0.0))
+    }
 }
 
 // ============================================================
@@ -438,6 +484,10 @@ pub(super) struct SceneReorderSession {
     pub anchor_index: u32,
     pub anchor_mouse: (f32, f32),
     pub last_mouse: (f32, f32),
+    /// 短クリックを**列の選択**へ格下げするときの修飾キー (セルの drag と同 idiom)。
+    /// release フレームでは更新しない (`drag` module doc の race)。
+    pub last_ctrl: bool,
+    pub last_shift: bool,
 }
 
 /// セルを掴んだ drag (ランチャー内の移動 / 複製 / アレンジへの持ち出し)。
@@ -459,7 +509,7 @@ pub(super) struct CellDragSession {
 
 /// ▶ / 停止 / 返す ボタンの押下。`LaunchMode::Gate` の「離すと停止」を出すために、
 /// 離しのフレームまで何を押していたかを覚えておく。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LauncherButton {
     Cell(LauncherCellKey),
     Scene(u32),
@@ -489,4 +539,10 @@ pub(super) struct LauncherSessions {
     pub released_cell_drag: Option<CellDragSession>,
     pub released_scene_reorder: Option<SceneReorderSession>,
     pub released_button: Option<LauncherButton>,
+    /// **いま押されたままのボタン** (押下フィードバックの描画用)。
+    ///
+    /// `released_button` は離した瞬間の 1 フレームしか出ないので、これが無いと
+    /// 「押している間の見た目」を作れない — 量子化待ちのあいだ画面が 1px も
+    /// 変わらず、押せたかどうかが分からない。
+    pub live_held_button: Option<LauncherButton>,
 }

@@ -121,6 +121,10 @@ fn convert(intent: &LauncherIntent) -> Option<LauncherEvent> {
                 scene_index: cell.scene_index as usize,
             },
         },
+        LauncherIntent::SelectScene { scene_id, additive, range } => LauncherEvent::SelectScene {
+            scene_id: *scene_id,
+            modifier: SelectModifier::from_modifiers(*range, *additive),
+        },
         LauncherIntent::CreateCell { row, scene_index } => LauncherEvent::CreateCell {
             row: row_of(*row),
             scene_index: *scene_index as usize,

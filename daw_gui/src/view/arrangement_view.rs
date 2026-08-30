@@ -895,12 +895,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let (_, py) = ui.pointer().pos?;
         let track_idx = track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, py)?;
         let track = app.song_doc.song().tracks.get(track_idx)?;
-        for (clip_idx, clip) in track.clips.iter().enumerate() {
+        // hit-test の入口は表示順の index だが、 **返す住所は安定 id**
+        // (`arrangement_hover_clip` は Split (E) 等の対象解決に使われるので、
+        // index で返すと「カーソルの下ではないクリップが切られる」)。
+        for clip in &track.clips {
             if beat >= clip.start_beat && beat < clip.start_beat + clip.length_beats {
-                return Some(ClipKey {
-                    track_id: track_idx as u32,
-                    clip_id: clip_idx as u32,
-                });
+                return Some(ClipKey { track_id: track.id, clip_id: clip.id });
             }
         }
         None

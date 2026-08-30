@@ -79,7 +79,7 @@ enum FollowTarget {
 }
 
 /// 「ローンチ」セクションを 1 本の y カーソルに積む。
-/// 選択にランチャーのセルが 1 つも無ければ何も描かず `y` をそのまま返す。
+/// セルも列も選ばれていなければ何も描かず `y` をそのまま返す。
 pub(super) fn draw_launch_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -88,9 +88,55 @@ pub(super) fn draw_launch_section(
     mut y: f32,
 ) -> f32 {
     let cells = app.selected_launcher_cells();
-    if cells.is_empty() {
+    let scene_ids = scenes_of(app, &cells);
+    if cells.is_empty() && scene_ids.is_empty() {
         return y;
     }
+    // セル側の行は **セルを選んでいるときだけ**出す。列見出しだけを選んだときに
+    // セルの量子化 / 長さ / ループを出すと、触れる対象が無いのに操作できてしまう。
+    if !cells.is_empty() {
+        y = draw_cell_rows(app, ui, area, pad, y, &cells);
+    }
+    y = draw_scene_follow_rows(app, ui, area, pad, y, &cells, &scene_ids);
+    draw_midi_rows(app, ui, area, pad, y, &cells)
+}
+
+/// 列 (シーン) のフォローアクション。**走行中のクリップのそれより優先する**
+/// (Live 12 の規則) ので、セル側の下に並べる。
+fn draw_scene_follow_rows(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    pad: f32,
+    mut y: f32,
+    cells: &[LauncherCellKey],
+    scene_ids: &[u32],
+) -> f32 {
+    if scene_ids.is_empty() {
+        return y;
+    }
+    let scene_follow = fold_scene_follow(app, scene_ids).unwrap_or_default();
+    // 見出しは「どこから来た列か」で書き分ける — セル経由なら「この列」、
+    // 列を直接選んでいるなら選んだ列そのもの。
+    let label = if cells.is_empty() {
+        "選択中の列 (シーン) のフォローアクション"
+    } else {
+        "この列 (シーン) のフォローアクション"
+    };
+    ui.label_at("inspector_scene_follow_label", label, area.x + pad, y, 12.0, app.theme.core.text);
+    y += LABEL_H;
+    draw_follow_rows(app, ui, area, pad, y, &scene_follow, FollowTarget::Scenes, cells)
+}
+
+/// 選択セルのローンチ設定 (量子化 / モード / 長さ / ループ / レガート / フォロー)。
+fn draw_cell_rows(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    pad: f32,
+    mut y: f32,
+    cells: &[LauncherCellKey],
+) -> f32 {
     let p = &app.theme.core;
     let row_w = area.w - pad * 2.0;
     let half = (row_w - ROW_GAP) * 0.5;
@@ -99,7 +145,7 @@ pub(super) fn draw_launch_section(
     y += LABEL_H;
 
     // ---- 量子化 / モード ----
-    let quantize = app.launch_fold(&cells, |s| s.quantize);
+    let quantize = app.launch_fold(cells, |s| s.quantize);
     let q_idx = quantize
         .and_then(|q| LAUNCH_QUANTIZE_CHOICES.iter().position(|(c, _)| *c == q))
         // 値が割れているときは選択なし (dropdown は範囲外 index で空表示になる)。
@@ -111,9 +157,9 @@ pub(super) fn draw_launch_section(
         q_idx,
     ) && let Some((q, _)) = LAUNCH_QUANTIZE_CHOICES.get(i)
     {
-        push_cell_edit(ui, &cells, LaunchEdit::Quantize(*q));
+        push_cell_edit(ui, cells, LaunchEdit::Quantize(*q));
     }
-    let mode = app.launch_fold(&cells, |s| s.mode);
+    let mode = app.launch_fold(cells, |s| s.mode);
     let m_idx = mode
         .and_then(|m| MODE_CHOICES.iter().position(|(c, _)| *c == m))
         .unwrap_or(usize::MAX);
@@ -124,7 +170,7 @@ pub(super) fn draw_launch_section(
         m_idx,
     ) && let Some((m, _)) = MODE_CHOICES.get(i)
     {
-        push_cell_edit(ui, &cells, LaunchEdit::Mode(*m));
+        push_cell_edit(ui, cells, LaunchEdit::Mode(*m));
     }
     y += ROW_H + ROW_GAP;
 
@@ -140,14 +186,14 @@ pub(super) fn draw_launch_section(
         11.0,
         app.theme.core.text_dim,
     );
-    let len = app.launch_cell_length_fold(&cells).unwrap_or(0.0);
+    let len = app.launch_cell_length_fold(cells).unwrap_or(0.0);
     {
         let style = ScrubableNumberStyle {
             sensitivity: 0.05,
             range: Some((f64::from(common::model::MIN_CLIP_LEN_BEATS as f32), 4096.0)),
             ..super::scrub_style(&app.theme)
         };
-        let cells_for_len = cells.clone();
+        let cells_for_len = cells.to_vec();
         ui.scrubable_number_at(
             ("inspector_launch_len", "cells"),
             Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
@@ -173,7 +219,7 @@ pub(super) fn draw_launch_section(
     // ---- ループ / レガート ----
     // 値が割れているときは OFF 表示にして、押すと「全部 ON」 に揃える
     // (トグルは 3 状態を持てないので、揃える方向を 1 つに決める)。
-    let looping = app.launch_fold(&cells, |s| s.looping).unwrap_or(false);
+    let looping = app.launch_fold(cells, |s| s.looping).unwrap_or(false);
     toggle(
         ui,
         app,
@@ -181,10 +227,10 @@ pub(super) fn draw_launch_section(
         "ループ",
         Rect { x: area.x + pad, y, w: half, h: ROW_H },
         looping,
-        &cells,
+        cells,
         LaunchEdit::Looping(!looping),
     );
-    let legato = app.launch_fold(&cells, |s| s.legato).unwrap_or(false);
+    let legato = app.launch_fold(cells, |s| s.legato).unwrap_or(false);
     toggle(
         ui,
         app,
@@ -192,13 +238,13 @@ pub(super) fn draw_launch_section(
         "レガート",
         Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
         legato,
-        &cells,
+        cells,
         LaunchEdit::Legato(!legato),
     );
     y += ROW_H + ROW_GAP;
 
     // ---- フォローアクション (セル) ----
-    let cell_follow = app.launch_fold(&cells, |s| s.follow.clone()).unwrap_or_default();
+    let cell_follow = app.launch_fold(cells, |s| s.follow.clone()).unwrap_or_default();
     ui.label_at(
         "inspector_follow_label",
         "フォローアクション",
@@ -208,34 +254,7 @@ pub(super) fn draw_launch_section(
         p.text,
     );
     y += LABEL_H;
-    y = draw_follow_rows(app, ui, area, pad, y, &cell_follow, FollowTarget::Cells, &cells);
-
-    // ---- フォローアクション (列) ----
-    let scene_ids = scenes_of(app, &cells);
-    if !scene_ids.is_empty() {
-        let scene_follow = fold_scene_follow(app, &scene_ids).unwrap_or_default();
-        ui.label_at(
-            "inspector_scene_follow_label",
-            "この列 (シーン) のフォローアクション",
-            area.x + pad,
-            y,
-            12.0,
-            p.text,
-        );
-        y += LABEL_H;
-        y = draw_follow_rows(
-            app,
-            ui,
-            area,
-            pad,
-            y,
-            &scene_follow,
-            FollowTarget::Scenes,
-            &cells,
-        );
-    }
-
-    draw_midi_rows(app, ui, area, pad, y, &cells)
+    draw_follow_rows(app, ui, area, pad, y, &cell_follow, FollowTarget::Cells, cells)
 }
 
 /// フォローアクションの 3 行 (有効 / 発火条件 / 動作 A・B) を積む。
@@ -627,8 +646,20 @@ fn num_field(
     );
 }
 
-/// 選択セルが乗っている列 id (重複なし、表示順)。
+/// 編集対象の列 (シーン) id (重複なし、表示順)。
+///
+/// **明示的な列選択があればそれ**、無ければ「選択セルが乗っている列」。列を直接
+/// 選べるようになる前 (r.md #87 初版) は後者しか無く、セルを 1 つも持たない列の
+/// フォローアクションを設定する手段が存在しなかった。
+///
+/// 表示 (`draw_launch_section`) と書き込み (`push_follow_edit`) が **同じこの 1 本**を
+/// 通るので、「見えている値」と「書き込み先」が食い違わない。
 fn scenes_of(app: &AppData, cells: &[LauncherCellKey]) -> Vec<u32> {
+    if !app.selection.selected_scene_ids.is_empty() {
+        let mut ids = app.selection.selected_scene_ids.clone();
+        ids.sort_by_key(|id| app.song_doc.song().scene_index(*id).unwrap_or(usize::MAX));
+        return ids;
+    }
     let mut ids: Vec<u32> = Vec::new();
     for c in cells {
         if let Some(s) = app.scene_of_cell(*c)

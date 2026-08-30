@@ -76,11 +76,20 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
             w: (head_cell.w - 3.0).max(2.0),
             ..head_cell
         });
-        if btn.contains(x, y) || scene_id == 0 {
-            // 実体の無い列 (プレースホルダ) は並び順を持たないので、本体を掴んでも
-            // 並べ替えない。押したら「全停止」= `SceneLaunch(0)` に倒す
-            // (掴めるように見えて何も起きない、を無くす)。
+        // **押せる場所は列の実体の有無で変わらない** — プレースホルダ列も実体のある
+        // 列と見た目がほぼ同じ (名前も ▶ も出る) ので、当たり判定だけ違うと
+        // 「同じに見えるのに押した結果が違う」になる。
+        //
+        // 以前はプレースホルダの本体ぜんぶを `SceneLaunch(0)` (= 全行停止) に倒して
+        // いた。列の空き部分をクリックしただけで全行が止まり、しかも `launch_scene` が
+        // transport を回すので「止めるつもりで再生が始まる」という形で出ていた。
+        if btn.contains(x, y) {
             return Some(Zone::SceneLaunch(scene_id));
+        }
+        if scene_id == 0 {
+            // 実体の無い列は並び順も id も持たないので、掴めず選べない。
+            // 列を足したいときは右クリックメニュー (「シーンを追加」) が担う。
+            return None;
         }
         #[allow(clippy::cast_possible_truncation)]
         return Some(Zone::SceneBody { scene_id, index: i as u32 });
@@ -104,10 +113,18 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
     if f.launcher_view.rows.get(&row.key).is_some_and(|r| r.group) {
         return Some(Zone::CellLaunch(key));
     }
-    // 空セルも本体ぜんぶがボタン (Bitwig の空スロット = 停止 ■ / アーム中は録音 ●)。
-    // 中身が無いので選ぶものも運ぶものも無い。新規作成はダブルクリックが担う。
+    // 空セルは **記号 (■ / ●) の上だけ**がボタン。中身のあるセルと同じ分割で、
+    // 記号の外は「焦点を移すだけ」の本体になる (Live / Bitwig の空スロットと同じ)。
+    //
+    // 以前は空セルの本体ぜんぶをボタンにしていたが、空スロットのボタンは
+    // 「その行を止める」なので、**列の空きを掴もうとしただけで再生が止まる**。
+    // 押せる場所を記号に限れば、止めたいときだけ止まる。
     if key.is_empty() {
-        return Some(Zone::CellLaunch(key));
+        return Some(if layout::launch_button_rect(rect).contains(x, y) {
+            Zone::CellLaunch(key)
+        } else {
+            Zone::CellBody(key)
+        });
     }
     if layout::launch_button_rect(rect).contains(x, y) {
         Some(Zone::CellLaunch(key))
@@ -229,6 +246,8 @@ pub(crate) fn dispatch(
                 anchor_index: index,
                 anchor_mouse: (px, py),
                 last_mouse: (px, py),
+                last_ctrl: ctrl,
+                last_shift: shift,
             });
             claim.session = true;
         }
@@ -248,6 +267,17 @@ pub(crate) fn dispatch(
                 s.pending_intents.push(LauncherIntent::Launch { cell: c, pressed: true });
             }
             s.held_button = Some(LauncherButton::Cell(cell));
+            claim.session = true;
+        }
+        Zone::CellBody(cell) if cell.is_empty() => {
+            // 空セルの本体には運ぶ実体が無いので drag は始めない。**焦点だけ移す**
+            // (`launcher_bridge` が空セルの `SelectCell` を `FocusCell` に倒す) ので、
+            // 矢印 / `Enter` の起点は押した場所に付いてくる。新規作成はダブルクリック。
+            s.pending_intents.push(LauncherIntent::SelectCell {
+                cell,
+                additive: false,
+                range: false,
+            });
             claim.session = true;
         }
         Zone::CellBody(cell) => {
@@ -311,6 +341,8 @@ pub(crate) fn cursor(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     let Some((x, y)) = f.pointer.pos else { return };
     match zone_at(f, x, y) {
         Some(Zone::PaneSplitter | Zone::ColSplitter(_)) => ui.set_cursor(CursorIcon::EwResize),
+        // 空セルの本体は運ぶ実体が無い (焦点が動くだけ) ので Move を出さない。
+        Some(Zone::CellBody(c)) if c.is_empty() => {}
         Some(Zone::SceneBody { .. } | Zone::CellBody(_)) => ui.set_cursor(CursorIcon::Move),
         _ => {}
     }

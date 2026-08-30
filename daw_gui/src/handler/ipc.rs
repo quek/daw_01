@@ -240,25 +240,13 @@ impl AppData {
                 }
                 // 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
                 // device_id は echo back 用。 pending があれば offline render を開始する。
-                // 合成待ち中の編集で index が動いていても stable id で現在位置へ解決する。
+                // 合成待ち中に編集が入っていても、 住所が安定 id なので解決は
+                // 「まだ在るか」 の確認だけで足りる。 **index へ落とし直さない** —
+                // 落とすと `ClipKey` が index の住所を持つことになり、 合成中に
+                // クリップが 1 つ増減しただけで bounce が別のクリップに当たる。
                 if let Some(p) = self.ipc.pending_vocal_synth_bounce.take() {
-                    let resolved = self
-                        .song_doc
-                        .song()
-                        .tracks
-                        .iter()
-                        .position(|t| t.id == p.track_id)
-                        .and_then(|ti| {
-                            self.song_doc.song().tracks[ti]
-                                .clips
-                                .iter()
-                                .position(|c| c.id == p.clip_id)
-                                .map(|ci| ClipKey {
-                                    track_id: ti as u32,
-                                    clip_id: ci as u32,
-                                })
-                        });
-                    match resolved {
+                    let key = ClipKey { track_id: p.track_id, clip_id: p.clip_id };
+                    match self.live_clip_key(key) {
                         Some(target) => self.start_clip_bounce(target, p.mode),
                         None => {
                             self.ui_ephemeral.status_message =

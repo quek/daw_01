@@ -59,6 +59,7 @@ impl AppData {
         // 解決できてしまうので、残すと Delete / Cut が非選択対象に当たる。
         self.selection.selected_track_ids.clear();
         self.selection.selected_section_ids.clear();
+        self.selection.selected_scene_ids.clear();
         self.selection.selected_automation_clips.clear();
         self.selection.selected_automation_points.clear();
         self.selection.selected_clip = None;
@@ -72,6 +73,7 @@ impl AppData {
         self.selection.note_anchor = None;
         self.selection.track_anchor = None;
         self.selection.section_anchor = None;
+        self.selection.scene_anchor = None;
         self.selection.automation_point_anchor = None;
         self.selection.automation_clip_anchor = None;
         self.selection.audio_editor_anchor = None;
@@ -343,6 +345,7 @@ impl AppData {
         self.song_doc.replace_song(song);
         self.song_doc.file_path = None;
         self.selection.selected_track_ids.clear();
+        self.selection.selected_scene_ids.clear();
         self.ui_prefs.collapsed_groups.clear();
         self.selection.selected_clip = None;
         self.selection.selected_notes.clear();

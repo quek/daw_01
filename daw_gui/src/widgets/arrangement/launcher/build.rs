@@ -31,6 +31,7 @@ pub(crate) fn build(
                 .color
                 .map_or_else(|| app.theme.core.accent, track_color::to_renderer),
             follow: s.follow.enabled,
+            selected: app.selection.selected_scene_ids.contains(&s.id),
         })
         .collect();
 
@@ -112,7 +113,7 @@ pub(crate) fn build(
 
     // engine の走行状態を最後に被せる (`Song` は「撃った起点」しか持たないので、
     // フォローアクションで移った先はこちらにしか出ない)。
-    let progress = apply_running(app, &mut rows);
+    let (progress, queued) = apply_running(app, &mut rows);
 
     LauncherView {
         scenes,
@@ -122,6 +123,7 @@ pub(crate) fn build(
         col_w: app.ui_prefs.launcher_scene_col_w,
         scroll_scene: app.ui_prefs.launcher_scroll_scene,
         progress,
+        queued,
     }
 }
 
@@ -192,7 +194,8 @@ fn is_shared(
     refcounts.get(&id).copied().unwrap_or(0) >= 2
 }
 
-/// engine が publish した**走行状態**を各行に被せ、進捗 (行 → `0..1`) を返す。
+/// engine が publish した**走行状態**を各行に被せ、進捗 (行 → `0..1`) と
+/// 予約 (行 → [`QueuedView`]) を返す。
 ///
 /// `Song.launcher` が持つのは「ユーザーが最後に撃った状態」= 再生の起点だけで、
 /// **フォローアクションで移った先はここにしか出ない** (計画書 §1.4)。被せないと
@@ -203,9 +206,10 @@ fn is_shared(
 fn apply_running(
     app: &AppData,
     rows: &mut HashMap<ArrangementRowKey, LauncherRowView>,
-) -> HashMap<ArrangementRowKey, f32> {
+) -> (HashMap<ArrangementRowKey, f32>, HashMap<ArrangementRowKey, QueuedView>) {
     use common::audio_bridge::{LAUNCHER_STATE_PLAYING, LAUNCHER_STATE_STOPPED};
     let mut progress = HashMap::new();
+    let mut queued = HashMap::new();
     for (key, row) in rows.iter_mut() {
         let (track_id, lane_id) = match key {
             ArrangementRowKey::Track(id) => (*id, 0),
@@ -214,6 +218,20 @@ fn apply_running(
         let Some(snap) = app.launcher_running_row(track_id, lane_id) else {
             continue;
         };
+        // 予約 (量子化境界待ち)。**残り拍は engine の発火拍から引くだけ** —
+        // GUI 側で境界を解き直すと、グローバル量子化を迂回するシーンの
+        // フォローアクション由来の予約で必ず食い違う。
+        if snap.queued_clip_id != 0
+            && let Some(ph) = app.transport.playhead_beat
+        {
+            let remaining = snap.queued_at_beat - f64::from(ph);
+            if remaining.is_finite() {
+                queued.insert(
+                    *key,
+                    QueuedView { clip_id: snap.queued_clip_id, remaining_beats: remaining },
+                );
+            }
+        }
         row.playback = match snap.state {
             LAUNCHER_STATE_PLAYING => {
                 common::model::RowPlayback::Launcher { clip_id: snap.playing_clip_id }
@@ -246,5 +264,5 @@ fn apply_running(
             progress.insert(*key, p.clamp(0.0, 1.0));
         }
     }
-    progress
+    (progress, queued)
 }

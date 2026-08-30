@@ -17,6 +17,7 @@ use daw_gui::event_launcher::{
     LaunchEdit, LauncherCellKey, LauncherEvent, LauncherRow,
 };
 use daw_gui::state::LauncherFocus;
+use daw_gui::widgets::select_modifier::SelectModifier;
 
 fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel();
@@ -648,4 +649,141 @@ fn 再生中に撃っても_play_を重ねない() {
         sent.push(c);
     }
     assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play)), "Play は出ない: {sent:?}");
+}
+
+/// 別トラックのセルを選ぶと、インスペクタが見ているトラック (= カーソル) も
+/// そのトラックへ動く。
+///
+/// 追従が無いと、インスペクタの上半分 (トラック名 / 色 / デバイスチェーン) が
+/// **前のトラックのまま**で、下半分 (クリップ / ローンチ設定) だけ新しいセルに
+/// なる = 2 つのトラックの情報が 1 画面に混ざる。アレンジのクリップ選択
+/// (`select_clip`) は最初から追従していたので、ランチャーだけが非対称だった。
+#[test]
+fn 別トラックのセルを選ぶとカーソルトラックも追従する() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 3, 2);
+    let first = put_cell(&mut app, 1, 0);
+    let third = put_cell(&mut app, 3, 1);
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell: first,
+        modifier: SelectModifier::Single,
+    }));
+    assert_eq!(app.cursor_track_id(), Some(1), "選んだセルのトラックがカーソルになる");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell: third,
+        modifier: SelectModifier::Single,
+    }));
+    assert_eq!(
+        app.cursor_track_id(),
+        Some(3),
+        "別トラックのセルへ移ったらカーソルも移る (前のトラックが残らない)"
+    );
+}
+
+/// シーン見出しをクリックすると列が選択され、**セルを 1 つも持たない列でも**
+/// インスペクタがその列のフォローアクションを出せる。
+///
+/// 列の選択が無かった頃は、列のフォローアクションへ届く唯一の経路が
+/// 「その列にセルを持つ行を選ぶ」だった = 空の列は設定不能だった。
+#[test]
+fn シーンを選ぶと列のフォローアクションが編集対象になる() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 2, 3);
+    let empty_scene = app.song_doc.song().scenes[2].id;
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
+        scene_id: empty_scene,
+        modifier: SelectModifier::Single,
+    }));
+
+    assert_eq!(app.selection.selected_scene_ids, vec![empty_scene]);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetSceneFollow {
+        scene_ids: app.selection.selected_scene_ids.clone(),
+        edit: LaunchEdit::FollowEnabled(true),
+    }));
+    let scene = app
+        .song_doc
+        .song()
+        .scenes
+        .iter()
+        .find(|s| s.id == empty_scene)
+        .expect("列は残っている");
+    assert!(scene.follow.enabled, "セルの無い列にもフォローアクションを設定できる");
+}
+
+/// 列とセルの選択は排他。同じインスペクタ面 (ローンチ) を使うので、両方が
+/// 非空だと「セルの設定」と「列の設定」が同時に出てどちらを触っているか
+/// 分からなくなる。
+#[test]
+fn 列を選ぶとセルの選択は落ちその逆も同じ() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 2, 2);
+    let cell = put_cell(&mut app, 1, 0);
+    let scene = app.song_doc.song().scenes[1].id;
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell,
+        modifier: SelectModifier::Single,
+    }));
+    assert!(!app.selection.selected_clips.is_empty(), "セルが選ばれている");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
+        scene_id: scene,
+        modifier: SelectModifier::Single,
+    }));
+    assert_eq!(app.selection.selected_scene_ids, vec![scene]);
+    assert!(app.selection.selected_clips.is_empty(), "列を選んだらセルの選択は落ちる");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell,
+        modifier: SelectModifier::Single,
+    }));
+    assert!(app.selection.selected_scene_ids.is_empty(), "セルを選んだら列の選択は落ちる");
+}
+
+/// 列を消したら、その列を指していた選択も一緒に落ちる
+/// (残すとインスペクタが存在しない列の設定を出す)。
+#[test]
+fn 消えた列は選択からも落ちる() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 2);
+    let scene = app.song_doc.song().scenes[1].id;
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
+        scene_id: scene,
+        modifier: SelectModifier::Single,
+    }));
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteScenes(vec![scene])));
+
+    assert!(app.selection.selected_scene_ids.is_empty(), "消えた列は選択に残らない");
+}
+
+/// 実体の無い列 (右側のプレースホルダ) を撃つのは「全行停止」なので、
+/// **それで再生を始めない**。止めるつもりの操作が鳴り出すのは操作の意味が逆。
+#[test]
+fn 実体の無い列を撃っても再生は始まらない() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 2, 1);
+    put_cell(&mut app, 1, 0);
+    while audio_rx.try_recv().is_ok() {}
+    assert!(!app.transport.is_playing, "前提: 停止している");
+
+    // `scene_id = 0` = まだ `Song.scenes` に無い列 (widget の placeholder)。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
+        scene_id: 0,
+        pressed: true,
+    }));
+
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(
+        !sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        "全停止で Play を送らない: {sent:?}"
+    );
+    assert!(!app.transport.is_playing, "全停止で再生が始まらない");
+    assert_eq!(launcher_of(&app, 1), RowPlayback::LauncherStopped, "行は停止に落ちる");
 }

@@ -203,6 +203,7 @@ impl AppData {
             selection: SelectionState {
                 selected_track_ids: Vec::new(),
                 selected_section_ids: Vec::new(),
+                selected_scene_ids: Vec::new(),
                 selected_automation_clips: Vec::new(),
                 last_edit_select: None,
                 selected_automation_points: Vec::new(),
@@ -219,6 +220,7 @@ impl AppData {
                 automation_clip_anchor: None,
                 audio_editor_anchor: None,
                 device_anchor: None,
+                scene_anchor: None,
             },
             ipc: IpcState {
                 sample_rate,

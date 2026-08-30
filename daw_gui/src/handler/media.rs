@@ -633,7 +633,7 @@ impl AppData {
         let start_beat = start_beat.max(0.0);
         let length_beats = DEFAULT_CLIP_LENGTH;
 
-        let Some(new_clip_idx) = self.edit_song(|song| {
+        let Some(new_clip_id) = self.edit_song(|song| {
             let content_id = song.alloc_content(
                 common::model::ClipContent::Text(common::model::TextContent {
                     events: vec![common::model::TextEvent {
@@ -649,7 +649,6 @@ impl AppData {
 
             let track = &mut song.tracks[track_idx];
             let clip_id = track.alloc_clip_id();
-            let new_clip_idx = track.clips.len() as u32;
             track.clips.push(common::model::Clip {
                 id: clip_id,
                 start_beat,
@@ -659,19 +658,19 @@ impl AppData {
                 auto_lipsync: false,
                 ..Default::default()
             });
-            new_clip_idx
+            clip_id
         }) else {
             return;
         };
 
         // create_clip と同様、 生成直後の clip を選択して inspector に出す。
-        let r = ClipKey {
-            track_id: track_idx as u32,
-            clip_id: new_clip_idx,
-        };
+        // 住所は **安定 id** (`Track::id` / `Clip::id`)。 index で組むと
+        // `live_clip_key` の解決に失敗して「作った直後の Text クリップが選ばれない」
+        // (= inspector に本文欄が出ない) になる。
+        let r = ClipKey { track_id, clip_id: new_clip_id };
         self.set_single_clip_selection(r);
         self.selection.selected_notes.clear();
-        self.select_track(track_idx as u32);
+        self.select_track(track_id);
 
         self.ui_ephemeral.status_message = "Text clip 追加".into();
     }

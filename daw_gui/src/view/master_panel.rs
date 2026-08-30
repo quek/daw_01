@@ -45,9 +45,12 @@ const HEADER_FONT: f32 = 10.0;
 /// 数値読み出しの font / 行高。
 const READ_FONT: f32 = 10.0;
 const READ_LINE_H: f32 = 13.0;
-/// フェーダー列の幅 (fader 18 + gap 2 + meter 35 = mixer strip と同じ内訳)。
-const FADER_W: f32 = 18.0;
-const FADER_GROUP_W: f32 = 55.0;
+/// フェーダー列の幅 (fader 31 + gap 2 + meter 35 = mixer strip と同じ内訳)。
+/// fader 列の 31px は、 上端の帯に出るフェーダー dB 値 (`-60.0`) が読める幅
+/// (`mixer_strips::FADER_W` と根拠を共有する — 片方だけ変えると同じフェーダーが
+/// 2 種類の見た目になる)。
+const FADER_W: f32 = 31.0;
+const FADER_GROUP_W: f32 = 68.0;
 /// ラウドネス LU バーの幅 (バー + 目盛り数字)。
 const LOUDNESS_BAR_W: f32 = 46.0;
 /// 数値読み出し列に最低限必要な幅。

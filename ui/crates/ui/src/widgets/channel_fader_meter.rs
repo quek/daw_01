@@ -16,8 +16,13 @@
 //! ## レイアウト
 //!
 //! group rect を横に `[fader_w | METER_GAP | meter (tick|L|R|数字)]` に分割する。 fader 列は thumb +
-//! track、 meter 列は `level_meter_stereo` と同一の `[tick | L | R | 数字]`。 peak readout チップと
-//! dB 目盛りは meter 列のみ (fader 列にグリッドは引かない)。 縦の dB→y 領域だけが共有される。
+//! track、 meter 列は `level_meter_stereo` と同一の `[tick | L | R | 数字]`。 dB 目盛りは meter 列のみ
+//! (fader 列にグリッドは引かない)。 縦の dB→y 領域だけが共有される。
+//!
+//! `style.peak_readout` が立つと上端に `READOUT_BAND_H` の帯が空くが、 これは **両列** に空く。
+//! 右 (meter 列) がピーク値、 左 (fader 列) が **フェーダー自身の dB 値**で、 2 つの数値が
+//! 横並びで 1 本の帯を作る。 したがって `fader_w` は「つまみが入る幅」 だけでなく
+//! **`-60.0` が読める幅** (10px フォントで約 31px) を要求する。
 //!
 //! ## 操作 (DAW 標準、 `fader_at` 再利用)
 //!
@@ -30,13 +35,15 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::Rect;
+use daw_ui_renderer::{Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::ui::Ui;
 use crate::widgets::fader::FaderResponse;
-use crate::widgets::level_meter::{LevelMeterStyle, MeterBallistic, meter_content_region};
+use crate::widgets::level_meter::{
+    LevelMeterStyle, MeterBallistic, READOUT_BAND_H, format_db_readout, meter_content_region,
+};
 use crate::widgets::scrubable_number::Modulation;
 
 /// fader 列と meter 列の間の隙間 (px)。 daw_01 の従来 `METER_GAP` と一致 (group_w 55 =
@@ -131,6 +138,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // fader_core が内部で既に consume 済なので、 ここは base drag だけを見れば足りる。
         if fader.dragging && self.pointer.primary_just_pressed {
             self.consume_pointer_click();
+        }
+
+        // fader 列の readout 帯: **ピーク値のすぐ左**にフェーダー自身の dB を出す。
+        //
+        // 値は入力の `volume_db` ではなく `fader.displayed_value` から取る — drag 中は
+        // そちらだけが「いまつまんでいる値」 を持つ (入力側は model 更新が 1 フレーム遅れる
+        // ので、 そのまま出すとドラッグ中だけ数字が 1 フレーム古い)。
+        //
+        // 数値の背後には meter 列と同じクローム面を敷く。 fader 列の地は strip 側の面
+        // (トラック色 / テーマで変わりうる) なので、 敷かずに書くと「可変背景の上の標識」
+        // になってコントラストを保証できない。 敷けば `ink_for` の基準面が peak 側と揃い、
+        // 隣り合う 2 つの数値が 1 本の帯に見える。
+        if style.peak_readout {
+            let band = Rect { x: fader_col.x, y: fader_col.y, w: fader_col.w, h: READOUT_BAND_H };
+            let border = self.palette().border;
+            self.push_rect(RectCommand {
+                rect: band,
+                fill: style.bg,
+                border,
+                border_width: 1.0,
+                radius: [2.0; 4],
+                clip_rect: None,
+            });
+            let text = format_db_readout(fader.displayed_value);
+            self.draw_readout_text(band, band, &text, style.bg, false);
         }
 
         // meter (右列): 同じ region.y / region.h を縦 content として meter_body に渡す。
@@ -228,6 +260,96 @@ mod tests {
 
     fn hold_at(pos: (f32, f32)) -> PointerFrame {
         PointerFrame { pos: Some(pos), primary_pressed: true, ..PointerFrame::default() }
+    }
+
+    /// フェーダーの dB 値が **fader 列の帯**に出て、ピーク値の左に並ぶ。
+    ///
+    /// 「押した値がどこにも数字で出ない」 を防ぐのが目的なので、 見るのは 3 点:
+    /// 値が出ていること / それが meter 列に食い込んでいないこと / 帯の中に収まること。
+    #[test]
+    fn fader_db_readout_sits_left_of_the_peak_readout() {
+        let mut host: UiHost<Vol> = UiHost::no_redraw();
+        let model = Vol { db: -12.3 };
+        let (scene, _) = run(&mut host, &model, PointerFrame::default(), 0.0, 0.0);
+        let g = scene
+            .iter_glyphs()
+            .find(|g| g.text.as_ref() == "-12.3")
+            .expect("フェーダー値が数字で出る");
+        let rect = group_rect();
+        let meter_x = rect.x + FADER_W + METER_GAP;
+        assert!(
+            g.left >= rect.x - 0.5 && g.left < meter_x,
+            "fader 列の中に置く (meter 列へ食い込まない): left={} meter_x={meter_x}",
+            g.left
+        );
+        let band_bottom = rect.y + crate::widgets::level_meter::READOUT_BAND_H;
+        assert!(
+            g.top >= rect.y - 0.5 && g.top < band_bottom,
+            "上端の帯に収まる: top={} band_bottom={band_bottom}",
+            g.top
+        );
+    }
+
+    /// 無音 (`-inf`) でも数字欄は空にしない。**空欄は「値が無い」ではなく
+    /// 「壊れている」に見える**ので、下端でも必ず何か出す。
+    #[test]
+    fn fader_db_readout_shows_minus_inf_at_silence() {
+        let mut host: UiHost<Vol> = UiHost::no_redraw();
+        let model = Vol { db: f32::NEG_INFINITY };
+        let (scene, _) = run(&mut host, &model, PointerFrame::default(), 0.0, 0.0);
+        let rect = group_rect();
+        let meter_x = rect.x + FADER_W + METER_GAP;
+        assert!(
+            scene
+                .iter_glyphs()
+                .any(|g| g.text.as_ref() == "-inf" && g.left < meter_x),
+            "無音は fader 列に `-inf` を出す"
+        );
+    }
+
+    /// 数字は自分が敷いたチップ面の上で読める明度にある (ダーク / ライト両方)。
+    /// 極性固定のインクを置くと、どちらかのテーマで必ず沈む。
+    #[test]
+    fn fader_db_readout_meets_text_contrast_in_both_themes() {
+        for (name, palette) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            let mut host: UiHost<Vol> = UiHost::no_redraw();
+            host.set_palette(std::sync::Arc::new(palette.clone()));
+            let model = Vol { db: -12.3 };
+            let style = LevelMeterStyle {
+                scale: Some(MeterScale::default()),
+                peak_readout: true,
+                ..LevelMeterStyle::from_palette(&palette)
+            };
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 200, height: 320 };
+            let _ = host.frame_to_edits(
+                &model,
+                &mut scene,
+                screen,
+                FrameInput { pointer: PointerFrame::default(), ..Default::default() },
+                |m: &Vol, ui| {
+                    ui.channel_fader_meter(
+                        "cfm",
+                        group_rect(),
+                        FADER_W,
+                        m.db,
+                        0.0,
+                        0.0,
+                        0.0,
+                        MeterBallistic::Peak,
+                        style,
+                        |new_db| Edit::mutate(move |m: &mut Vol| m.db = new_db),
+                        None,
+                    );
+                },
+            );
+            let g = scene
+                .iter_glyphs()
+                .find(|g| g.text.as_ref() == "-12.3")
+                .unwrap_or_else(|| panic!("{name}: フェーダー値が出る"));
+            let ratio = crate::theme::contrast_ratio(g.color, style.bg);
+            assert!(ratio >= 4.5, "{name}: 数字が読めない ({ratio:.2}:1)");
+        }
     }
 
     /// **本 widget の存在理由**: 0dB で fader thumb 中心と meter 0dB 線が画素整合する。

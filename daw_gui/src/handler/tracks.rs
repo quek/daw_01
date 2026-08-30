@@ -887,22 +887,27 @@ impl AppData {
         }
     }
 
-    /// **クリップ選択に追従する暗黙のトラック選択** (単独選択、 index ベース)。
+    /// **クリップ選択に追従する暗黙のトラック選択** (単独選択、 安定 `Track::id`)。
     /// 明示的なトラック選択は [`Self::set_track_selection`] /
     /// [`Self::apply_select_tracks`]。
+    ///
+    /// 引数は **id であって index ではない** (不変条件 1)。 呼び側はほぼ全部
+    /// `ClipKey::track_id` を渡すので、 index を取ると `ClipKey` 側の住所を
+    /// index に読み替える口がここに 1 つだけ残り、 「クリップを選ぶと隣の
+    /// トラックがカーソルになる」 形で出る (id は 1 始まり / index は 0 始まりなので
+    /// 常に 1 つずれ、 末尾トラックでは存在せず前の選択が残る)。
     ///
     /// last-wins タグは立てない。 むしろ立っている [`EditSurface::Tracks`] を
     /// **降ろす** — 直前のユーザー意図は「クリップを触った」 なので、 タグが
     /// Tracks のままだとクリップを消すつもりの Delete でトラックが消える。
-    /// (`apply_select_clip` / `set_clip_selection` は `Clips` タグを立てた **直後**
-    /// にここを呼ぶので、 そちらのタグは上書きされない。)
-    pub(crate) fn select_track(&mut self, idx: u32) {
-        let Some(t) = self.song_doc.song().tracks.get(idx as usize) else {
+    /// (`select_clip` / `set_clip_selection` / `select_launcher_cell` は `Clips`
+    /// タグを立てた **直後**にここを呼ぶので、 そちらのタグは上書きされない。)
+    pub(crate) fn select_track(&mut self, track_id: u32) {
+        if self.song_doc.song().track_by_id(track_id).is_none() {
             return;
-        };
-        let id = t.id;
-        if self.selection.selected_track_ids.as_slice() != [id] {
-            self.selection.selected_track_ids = vec![id];
+        }
+        if self.selection.selected_track_ids.as_slice() != [track_id] {
+            self.selection.selected_track_ids = vec![track_id];
         }
         if self.selection.last_edit_select == Some(EditSurface::Tracks) {
             self.selection.last_edit_select = None;

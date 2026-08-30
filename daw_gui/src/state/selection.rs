@@ -16,6 +16,14 @@ pub struct SelectionState {
     /// 末尾 = anchor)。 gui_01 の `SelectSection` で更新、 帯のハイライト + キーボード Delete
     /// の対象。 section を選ぶと他面 (clip/note/track) の選択はクリアして Delete の曖昧さを避ける。
     pub selected_section_ids: Vec<u32>,
+    /// r.md #87: 選択中の列 (シーン) id 集合。末尾 = anchor。
+    ///
+    /// **セル選択とは排他**にする — 列とセルはインスペクタの同じ面 (ローンチ) を
+    /// 使うので、両方を非空にすると「セルの設定」と「列の設定」が同時に出て
+    /// どちらを触っているのか分からなくなる。列を選べばセルの選択は落ち、
+    /// セルを選べば列の選択は落ちる (`select_scene` / `select_launcher_cell`)。
+    /// session-only (保存しない)。
+    pub selected_scene_ids: Vec<u32>,
     /// gui_01 #028 (M14 Phase 63n-3): 選択中の automation clip。 MIDI
     /// clip 用 `selected_clips` と直交 (= 同時に両方を持てる、 他 DAW
     /// 互換)。 widget の `SelectAutomationClips` で上書き、 widget へは
@@ -81,4 +89,6 @@ pub struct SelectionState {
     /// r.md #71 (プラグインのコピー / 移動): device 選択のアンカー
     /// (Shift+click 範囲選択の基点)。
     pub device_anchor: Option<u64>,
+    /// r.md #87: 選択中の列 (シーン) 選択のアンカー。
+    pub scene_anchor: Option<u32>,
 }

@@ -25,6 +25,63 @@ pub(super) struct Indicator {
     pub ink: Color,
 }
 
+/// このフレームのポインタ状態 (どこに乗っているか / 何を押しているか)。
+///
+/// hover は **押せる場所の判定 ([`press::zone_at`]) をそのまま通す**ので、光る場所と
+/// 効く場所が構造的に一致する (「光ったのに効かない」/「効くのに光らない」が
+/// 起きない)。
+#[derive(Clone, Copy, Default)]
+pub(super) struct LauncherFeedback {
+    pub hover: Option<press::Zone>,
+    /// 押されたままのボタン (離すまで出しっぱなし)。
+    pub held: Option<LauncherButton>,
+    /// 予約中の標識を光らせるフレームか。
+    ///
+    /// **位相は壁時計ではなく拍から取る** (`dispatch`)。量子化の待ちは音楽的な
+    /// 長さなので、点滅もテンポに乗っているほうが「あと何拍か」が体で分かる。
+    /// 壁時計だとテンポと無関係に瞬いて、カウントダウンの数字と噛み合わない。
+    pub blink: bool,
+}
+
+impl LauncherFeedback {
+    /// `btn` に対応する押下中フラグ。
+    #[must_use]
+    fn is_held(self, btn: LauncherButton) -> bool {
+        self.held == Some(btn)
+    }
+
+    /// セルの ▶ に乗っているか。
+    #[must_use]
+    fn hovers_cell_launch(self, key: LauncherCellKey) -> bool {
+        self.hover == Some(press::Zone::CellLaunch(key))
+    }
+
+    /// セル本体 (▶ を除く) に乗っているか。
+    #[must_use]
+    fn hovers_cell_body(self, key: LauncherCellKey) -> bool {
+        self.hover == Some(press::Zone::CellBody(key))
+    }
+}
+
+/// ボタンの「押されている / 乗っている」を、可変背景の上でも沈まない形で出す。
+///
+/// **チップの濃さだけで表す。** 記号の色や大きさを変えると、クリップ色によって
+/// 見え方が反転する (明るい塗りの上では濃くしたつもりが薄く見える)。チップは
+/// [`Palette::scrim`] の重ね塗りなので、どの塗りの上でも「押すほど沈む」向きが
+/// 保たれる。
+#[must_use]
+fn interactive_indicator(p: &Palette, bg: Color, hovered: bool, held: bool) -> Indicator {
+    let base = indicator_on(p, bg);
+    if !hovered && !held {
+        return base;
+    }
+    // 押下 = チップ 2 枚重ね / hover = 1.5 枚相当。合成後の実効背景から
+    // インクを引き直すので、濃くしてもコントラストは保たれる。
+    let extra = if held { p.scrim } else { p.scrim.with_alpha(p.scrim.a * 0.5) };
+    let eff_bg = composite_over(extra, base.eff_bg);
+    Indicator { chip: base.chip, eff_bg, ink: p.adapt_on(eff_bg, p.ink_for(eff_bg)) }
+}
+
 /// 可変背景 `bg` の上に標識を置くための材料を作る。
 ///
 /// チップ (`Palette::scrim`) を 1 枚敷いて背景を正規化し、**その合成結果から**
@@ -70,12 +127,22 @@ pub(crate) fn dispatch(
         return;
     }
     let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
+    // 押下 / hover / 点滅位相は 1 度だけ解いて、全部の描画関数へ同じ値を配る。
+    // hover の判定は press と **同じ `zone_at`** を通す (光る場所 = 効く場所)。
+    let fb = LauncherFeedback {
+        hover: f.pointer.pos.and_then(|(x, y)| press::zone_at(f, x, y)),
+        held: sessions.live_held_button,
+        blink: app
+            .transport
+            .playhead_beat
+            .is_none_or(|b| f64::from(b).rem_euclid(1.0) < 0.5),
+    };
     let out = &mut response.launcher;
     ui.heavy(("arrangement_launcher", &f.id), |hctx| {
         chrome(hctx, f);
         dim_launcher_rows(hctx, f);
-        head_row(hctx, f, out);
-        grid_rows(hctx, app, &tempo_map, f, out);
+        head_row(hctx, f, fb, out);
+        grid_rows(hctx, app, &tempo_map, f, fb, out);
         drag_overlays(hctx, f, sessions);
     });
 }
@@ -141,17 +208,22 @@ fn dim_launcher_rows(hctx: &mut HeavyCtx<'_, '_, AppData>, f: &ArrangementFrame<
 fn head_row(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
     out: &mut LauncherResponse,
 ) {
     let l = &f.launcher;
     let p = hctx.palette();
     // グローバル停止 / グローバル「アレンジへ返す」。停止列 / 返す列の上端に置く
     // (各行のボタンの真上 = 「この列を全部」という読み方が視線どおり)。
-    let ind = indicator_on(p, f.style.header_bg);
+    let bg = f.style.header_bg;
     let stop_hit = Rect { x: l.stop_col.x, y: l.head.y, w: l.stop_col.w, h: l.head.h };
-    push_stop_glyph(hctx, square_in(stop_hit, 10.0), ind);
+    let stop_ind =
+        interactive_indicator(p, bg, fb.hover == Some(press::Zone::GlobalStop), false);
+    push_stop_glyph(hctx, square_in(stop_hit, 10.0), stop_ind);
     let ret_hit = Rect { x: l.return_col.x, y: l.head.y, w: l.return_col.w, h: l.head.h };
-    push_return_glyph(hctx, square_in(ret_hit, 12.0), ind, false, f.style);
+    let ret_ind =
+        interactive_indicator(p, bg, fb.hover == Some(press::Zone::GlobalReturn), false);
+    push_return_glyph(hctx, square_in(ret_hit, 12.0), ret_ind, false, f.style);
 
     if l.scene_head.w <= 0.0 {
         return;
@@ -192,7 +264,7 @@ fn head_row(
             }
             #[allow(clippy::cast_possible_truncation)]
             out.scene_rects.push((scene.id, i as u32, hit));
-            draw_scene_head(hctx, r, scene, f.style);
+            draw_scene_head(hctx, r, scene, f.style, fb);
         }
     });
 }
@@ -202,13 +274,20 @@ fn draw_scene_head(
     r: Rect,
     scene: &LauncherSceneView,
     style: &ArrangementStyle,
+    fb: LauncherFeedback,
 ) {
     let p = hctx.palette();
     // 色ストライプ (左端 3px) — 列の identity。塗り全面ではなく帯にするのは、
     // 見出しの文字がクローム面の上に乗ったままになるようにするため。
     push_filled_rect(hctx, Rect { w: 3.0, ..r }, p.adapt_on(style.header_bg, scene.color));
     let btn = layout::launch_button_rect(Rect { x: r.x + 3.0, w: (r.w - 3.0).max(2.0), ..r });
-    push_launch_glyph(hctx, btn, indicator_on(p, style.header_bg), scene.follow);
+    let ind = interactive_indicator(
+        p,
+        style.header_bg,
+        fb.hover == Some(press::Zone::SceneLaunch(scene.id)),
+        fb.is_held(LauncherButton::Scene(scene.id)),
+    );
+    push_launch_glyph(hctx, btn, ind, scene.follow);
     let label = Rect {
         x: btn.x + btn.w + 2.0,
         y: r.y,
@@ -227,6 +306,42 @@ fn draw_scene_head(
             ..GlyphArea::default()
         });
     }
+    // 選択中の列は枠で示す。**セルの選択枠と同じ語彙**にするので、
+    // 「いまインスペクタが何を出しているか」が帯の上だけで読める。
+    if scene.selected {
+        push_selection_ring(hctx, r, style, CELL_RADIUS, None);
+    }
+}
+
+/// 予約の残り拍を小さく出す (`anchor` の下端に右寄せ)。
+///
+/// 高さが足りない行では **何も描かない** — 潰れた数字を出すより、点滅だけで
+/// 「待っている」を伝えるほうが読み違えが少ない。
+fn push_countdown(hctx: &mut HeavyCtx<'_, '_, AppData>, anchor: Rect, bg: Color, text: &str) {
+    const FONT: f32 = 9.0;
+    if anchor.h < FONT * 2.2 || anchor.w < FONT * 1.5 {
+        return;
+    }
+    let ind = indicator_on(hctx.palette(), bg);
+    #[allow(clippy::cast_precision_loss)]
+    let w = (text.chars().count() as f32 * FONT * 0.62).min(anchor.w - 2.0);
+    let chip = Rect {
+        x: anchor.x + anchor.w - w - 1.0,
+        y: anchor.y + anchor.h - FONT * 1.3 - 1.0,
+        w,
+        h: FONT * 1.3,
+    };
+    push_rounded(hctx, chip, ind.chip, Color::TRANSPARENT, 2.0);
+    hctx.push_text(GlyphArea {
+        text: text.into(),
+        left: chip.x,
+        top: chip.y,
+        font_size: FONT,
+        line_height: FONT * 1.3,
+        color: ind.ink,
+        clip_rect: Some(chip),
+        ..GlyphArea::default()
+    });
 }
 
 // ============================================================
@@ -238,6 +353,7 @@ fn grid_rows(
     app: &AppData,
     tempo_map: &common::audio_render::TempoMap,
     f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
     out: &mut LauncherResponse,
 ) {
     let l = &f.launcher;
@@ -267,36 +383,61 @@ fn grid_rows(
             if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) {
                 continue;
             }
-            row_buttons(hctx, f, top, row.height, view);
+            row_buttons(hctx, f, fb, row.key, top, row.height, view);
             // **セルは格子の中だけに描く。** 帯全体でクリップすると、右端の
             // 部分表示列が「アレンジへ返す」ボタンと幅ドラッグのつかみ代を
             // 塗りつぶし、見えている場所 (セル) と押せる場所 (返す列 /
             // スプリッタ) が最大 28px ズレる。
             let grid_band = Rect { x: l.grid.x, y: l.grid.y, w: l.grid.w, h: l.grid.h };
             hctx.with_clip_rect(grid_band, |hctx| {
-                row_cells(hctx, app, tempo_map, f, row, top, view, out);
+                row_cells(hctx, app, tempo_map, f, fb, row, top, view, out);
             });
         }
     });
 }
 
 /// 停止列 / 返す列の 1 行ぶんのボタン。
+#[allow(clippy::too_many_arguments)]
 fn row_buttons(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
+    row_key: ArrangementRowKey,
     top: f32,
     height: f32,
     view: &LauncherRowView,
 ) {
     let l = &f.launcher;
     let p = hctx.palette();
-    let ind = indicator_on(p, f.style.header_bg);
-    let stop = square_in(Rect { x: l.stop_col.x, y: top, w: l.stop_col.w, h: height }, 8.0);
-    push_stop_glyph(hctx, stop, ind);
+    let bg = f.style.header_bg;
+    // この行に「止める」/「アレンジへ返す」の予約が入っているか。予約中は点滅させる
+    // — 量子化が 1 小節なら押してから最大 1 小節ぶん何も起きないので、押せたことが
+    // その場で見えないと「効いていない」としか読めない。
+    let queued = f.launcher_view.queued.get(&row_key).copied();
+    let stop_queued = queued.is_some_and(QueuedView::is_stop);
+    let ret_queued = queued.is_some_and(QueuedView::is_arranger);
+    let stop_rect = Rect { x: l.stop_col.x, y: top, w: l.stop_col.w, h: height };
+    let stop_ind = interactive_indicator(
+        p,
+        bg,
+        fb.hover == Some(press::Zone::RowStop(row_key)),
+        stop_queued && fb.blink,
+    );
+    push_stop_glyph(hctx, square_in(stop_rect, 8.0), stop_ind);
     // 「アレンジへ返す」は主導権がランチャーにある行だけ点灯する (Bitwig と同じ =
     // 押して意味がある行が一目で分かる)。
-    let ret = square_in(Rect { x: l.return_col.x, y: top, w: l.return_col.w, h: height }, 10.0);
-    push_return_glyph(hctx, ret, ind, view.launcher_owns(), f.style);
+    let ret_rect = Rect { x: l.return_col.x, y: top, w: l.return_col.w, h: height };
+    let ret_ind = interactive_indicator(
+        p,
+        bg,
+        fb.hover == Some(press::Zone::RowReturn(row_key)),
+        ret_queued && fb.blink,
+    );
+    push_return_glyph(hctx, square_in(ret_rect, 10.0), ret_ind, view.launcher_owns(), f.style);
+    // **残り拍の数字はここに出さない。** 停止列 / 返す列は 16px しか無く、
+    // `2.3` (9px フォントで約 17px) が必ず切れる。数字は `row_cells` が
+    // 「これから止まる当のセル」 の上に出す — 変わる対象の上に出るほうが、
+    // 列の記号の下に潰れた数字を置くより読み違えが少ない。
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -305,6 +446,7 @@ fn row_cells(
     app: &AppData,
     tempo_map: &common::audio_render::TempoMap,
     f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
     row: &ArrangementRow,
     top: f32,
     view: &LauncherRowView,
@@ -314,6 +456,8 @@ fn row_cells(
     let (first, last) = l.visible_cols();
     let playing = view.playing_clip_id();
     let progress = f.launcher_view.progress.get(&row.key).copied();
+    // 「このセルが予約されている」は行に高々 1 件 (engine の予約は行ごとに 1 つ)。
+    let queued = f.launcher_view.queued.get(&row.key).copied();
     for i in first..last {
         let r = layout::cell_rect(l, top, row.height, i);
         if r.x + r.w < l.grid.x || r.x > l.grid.x + l.grid.w {
@@ -322,28 +466,40 @@ fn row_cells(
         let key = layout::cell_key(f.launcher_view, row.key, i);
         out.cell_rects.push((key, r));
         if view.group {
-            draw_group_cell(hctx, f, r, key, i);
+            draw_group_cell(hctx, f, fb, r, key, i);
             continue;
         }
         let cell = (key.scene_id != 0).then(|| view.cells.get(&key.scene_id)).flatten();
-        match cell {
-            Some(cell) => {
-                let is_playing = playing == Some(cell.clip_id);
-                draw_filled_cell(
-                    hctx,
-                    app,
-                    tempo_map,
-                    f,
-                    r,
-                    key,
-                    cell,
-                    is_playing,
-                    if is_playing { progress } else { None },
-                );
-            }
-            None => draw_empty_cell(hctx, f, r, view.armed),
-        }
+        let Some(cell) = cell else {
+            draw_empty_cell(hctx, f, fb, r, key, view.armed);
+            continue;
+        };
+        let is_playing = playing == Some(cell.clip_id);
+        let d = CellDraw {
+            rect: r,
+            key,
+            playing: is_playing,
+            progress: if is_playing { progress } else { None },
+            queued: queued_for_cell(queued, cell.clip_id, is_playing),
+        };
+        draw_filled_cell(hctx, app, tempo_map, f, fb, d, cell);
     }
+}
+
+/// このセルに残り拍を出すか。
+///
+/// 発火予約は **そのセル自身**に、停止 / アレンジへ返す予約は **いま鳴っている
+/// セル** (= これから止まる当のもの) に出す。後者を行の停止列に出さないのは、
+/// 16px の列では数字が必ず切れるため (`row_buttons` の doc)。
+#[must_use]
+fn queued_for_cell(
+    queued: Option<QueuedView>,
+    clip_id: u32,
+    is_playing: bool,
+) -> Option<QueuedView> {
+    queued.filter(|q| {
+        if q.is_stop() || q.is_arranger() { is_playing } else { q.clip_id == clip_id }
+    })
 }
 
 // ============================================================
@@ -354,38 +510,66 @@ fn row_cells(
 fn draw_empty_cell(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
     r: Rect,
+    key: LauncherCellKey,
     armed: bool,
 ) {
     let p = hctx.palette();
     let bg = f.style.bg;
-    push_rounded(hctx, r, p.control.with_alpha(0.25), Color::TRANSPARENT, 0.0);
+    // 本体に乗っているだけでも薄く起こす (「ここは押せる場所です」を示す面)。
+    // **記号の上と本体では濃さを変える** — 押して起きることが違うので
+    // (記号 = その行を止める / 本体 = 焦点を移すだけ)、同じ見た目にしない。
+    let body_hover = fb.hovers_cell_body(key);
+    let base = if body_hover { 0.40 } else { 0.25 };
+    push_rounded(hctx, r, p.control.with_alpha(base), Color::TRANSPARENT, 0.0);
     let btn = layout::launch_button_rect(r);
+    let btn_ind = interactive_indicator(
+        p,
+        bg,
+        fb.hovers_cell_launch(key),
+        fb.is_held(LauncherButton::Cell(key)),
+    );
+    push_rounded(hctx, btn, btn_ind.chip, Color::TRANSPARENT, 2.0);
     let s = (btn.w * 0.6).max(3.0);
     let inner = Rect { x: btn.x + (btn.w - s) * 0.5, y: btn.y + (btn.h - s) * 0.5, w: s, h: s };
     if armed {
         // 録音の丸。**赤は「アーム」の意味色なので、面から離れる明度へ寄せて必ず立たせる**
         // (`adapt_on` は色相を保つので赤のままコントラストだけが上がる)。
-        let dot = p.adapt_on(bg, p.meter_red);
+        let dot = p.adapt_on(btn_ind.eff_bg, p.meter_red);
         push_rounded(hctx, inner, dot, Color::TRANSPARENT, s * 0.5);
     } else {
-        push_rounded(hctx, inner, p.text_faint, Color::TRANSPARENT, 0.0);
+        push_rounded(hctx, inner, btn_ind.ink, Color::TRANSPARENT, 0.0);
     }
 }
 
+/// [`draw_filled_cell`] に渡す「このセルの今の状態」。
+///
+/// 個別引数で並べると 10 個を超えて、呼び出し側で順番を取り違えても型が同じ
+/// (`bool` が 2 つ) ので気付けない。
+#[derive(Clone, Copy)]
+struct CellDraw {
+    rect: Rect,
+    key: LauncherCellKey,
+    /// 走行中 (engine が握って鳴らしている)。
+    playing: bool,
+    /// 走行中セルの進捗 `0..1`。
+    progress: Option<f32>,
+    /// **このセル**の発火予約 (量子化境界待ち)。
+    queued: Option<QueuedView>,
+}
+
 /// クリップのあるセル。
-#[allow(clippy::too_many_arguments)]
 fn draw_filled_cell(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     app: &AppData,
     tempo_map: &common::audio_render::TempoMap,
     f: &ArrangementFrame<'_>,
-    r: Rect,
-    key: LauncherCellKey,
+    fb: LauncherFeedback,
+    d: CellDraw,
     cell: &LauncherCellView,
-    playing: bool,
-    progress: Option<f32>,
 ) {
+    let (r, key) = (d.rect, d.key);
     let fill = if cell.muted { muted_dim_fill(cell.color) } else { cell.color };
     push_rounded(hctx, r, fill, f.style.clip_border, CELL_RADIUS);
     if cell.muted {
@@ -408,8 +592,26 @@ fn draw_filled_cell(
     cell_content(hctx, app, tempo_map, f, key, cell, label, fill);
     let text_color = clip_text_color_for(hctx.palette(), f.style, fill, f.style.bg);
     draw_clip_label(hctx, label, &cell.name, cell.linked, text_color, f.style);
-    push_launch_glyph(hctx, btn, indicator_on(hctx.palette(), fill), cell.follow);
-    if playing {
+    // ▶ は hover / 押下 / **発火待ちの点滅** を同じチップ 1 枚で表す。
+    // 予約中の点滅が無いと、量子化 1 小節で押した直後は画面が 1px も変わらず
+    // 「押せていない」としか読めない (実際は engine が既に受け取っている)。
+    // ▶ を点滅させるのは **このセルの発火予約**だけ。停止 / 返す予約で ▶ を
+    // 点滅させると「もうすぐ鳴る」に読めてしまう (実際は止まる) ので、
+    // そちらは数字だけ出して行の停止 / 返すボタン側を点滅させる。
+    let blink_queued =
+        d.queued.is_some_and(|q| !q.is_stop() && !q.is_arranger()) && fb.blink;
+    let ind = interactive_indicator(
+        hctx.palette(),
+        fill,
+        fb.hovers_cell_launch(key),
+        fb.is_held(LauncherButton::Cell(key)) || blink_queued,
+    );
+    push_launch_glyph(hctx, btn, ind, cell.follow);
+    // 残り拍 (発火まで)。セル右端に置く = ラベルの右、進捗バーの上。
+    if let Some(q) = d.queued {
+        push_countdown(hctx, Rect { h: (r.h - PROGRESS_BAR_H).max(0.0), ..r }, fill, &q.label());
+    }
+    if d.playing {
         // **走行中の印は縁**。進捗バーは束 B が `audio_bridge` で位置を publish する
         // まで出ないので、これが無いと「どのセルが鳴っているか」が一切見えない。
         // 色は再生の意味色を実塗り色から寄せる (`adapt_on` は色相を保つ)。
@@ -424,7 +626,7 @@ fn draw_filled_cell(
             clip_rect: Some(f.launcher.grid),
         });
     }
-    if let Some(t) = progress {
+    if let Some(t) = d.progress {
         push_progress(hctx, r, fill, t);
     }
     if is_cell_selected(f, key) {
@@ -553,6 +755,7 @@ fn draw_cell_curve(
 fn draw_group_cell(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
     r: Rect,
     key: LauncherCellKey,
     col: usize,
@@ -563,7 +766,7 @@ fn draw_group_cell(
     if key.scene_id == 0 {
         // 実体の無い列 = 空セルと同じ見た目 (押すと子行が一斉停止するので、
         // 「押せるのに何も見えない」状態を作らない)。
-        draw_empty_cell(hctx, f, r, false);
+        draw_empty_cell(hctx, f, fb, r, key, false);
         return;
     }
     let stripes: Vec<Color> = f
@@ -580,7 +783,7 @@ fn draw_group_cell(
         .collect();
     if stripes.is_empty() {
         // 子が誰もこの列にセルを持たない = 押すと一斉停止。空セルとして描く。
-        draw_empty_cell(hctx, f, r, false);
+        draw_empty_cell(hctx, f, fb, r, key, false);
         return;
     }
     #[allow(clippy::cast_precision_loss)]
