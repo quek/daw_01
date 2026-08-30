@@ -37,7 +37,14 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     header::commit_clicks(ui, &f, clicks, &mut response);
     // 6b. ランチャー帯 (r.md #87)。 帯はヘッダ / レーンと x が排他なので z の競合は無いが、
     //     ランチャー主導の行の減光だけはアレンジのクリップの上に乗るので **この位置**。
-    launcher::draw::dispatch(ui, app, &f, &launcher_sessions, &mut response);
+    launcher::draw::dispatch(
+        ui,
+        app,
+        &f,
+        &launcher_sessions,
+        live.clip_drag.as_ref(),
+        &mut response,
+    );
     launcher::release::commit(ui, &f, launcher_sessions, &mut response);
     // 7. caller 向け rect 群の収集。
     rects::collect(&f, &live, &mut response);

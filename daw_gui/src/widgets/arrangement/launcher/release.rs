@@ -189,19 +189,35 @@ fn drop_to_cells(
     mode: ClipCopyMode,
     response: &mut ArrangementResponse,
 ) {
+    let moves = plan_cell_moves(f, cd);
+    if !moves.is_empty() {
+        response.launcher.intents.push(LauncherIntent::MoveCells { moves, mode });
+    }
+}
+
+/// 帯の中で運んでいるセルの **着地先**。
+///
+/// **`draw::drag_overlays` のプレビューと `drop_to_cells` の確定が同じこの 1 本を
+/// 通る**ので、ゴーストが乗っているスロットと実際に落ちるスロットが構造的に
+/// 一致する (別々に解くと、掴んだセルと落とし先の相対位置の計算がどこかでずれて
+/// 「見えている場所と違うところに落ちる」になる)。
+#[must_use]
+pub(super) fn plan_cell_moves(
+    f: &ArrangementFrame<'_>,
+    cd: &CellDragSession,
+) -> Vec<LauncherCellMove> {
     let (mx, my) = cd.last_mouse;
     let Some(target) = layout::drop_cell_at(f, mx, my) else {
-        return;
+        return Vec::new();
     };
     let Some(base_idx) = row_index(f, target.row) else {
-        return;
+        return Vec::new();
     };
     let Some(anchor_idx) = row_index(f, cd.primary.row) else {
-        return;
+        return Vec::new();
     };
     let col_delta = i64::from(target.scene_index) - i64::from(cd.primary.scene_index);
-    let moves: Vec<LauncherCellMove> = cd
-        .cells
+    cd.cells
         .iter()
         .filter_map(|cell| {
             let idx = row_index(f, cell.row)?;
@@ -209,17 +225,10 @@ fn drop_to_cells(
             let col = (i64::from(cell.scene_index) + col_delta).max(0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let to_scene_index = col as u32;
-            Some(LauncherCellMove {
-                from: *cell,
-                to_row,
-                to_scene_index,
-            })
+            Some(LauncherCellMove { from: *cell, to_row, to_scene_index })
         })
         .filter(|m| m.to_row != m.from.row || m.to_scene_index != m.from.scene_index)
-        .collect();
-    if !moves.is_empty() {
-        response.launcher.intents.push(LauncherIntent::MoveCells { moves, mode });
-    }
+        .collect()
 }
 
 // ============================================================
@@ -240,6 +249,7 @@ pub(crate) fn take_arrangement_drop(
         return false;
     }
     let (mx, my) = nd.last_mouse;
+
     // **帯の上で離したら必ずここで受け止める。** 格子の外 (停止列 / 返す列 /
     // 見出し行 / つかみ代) はセルにできないので「移動をキャンセル」として吸収する
     // — 素通りさせるとアレンジ側の move が走り、掴んだクリップが帯まで戻した
@@ -247,17 +257,42 @@ pub(crate) fn take_arrangement_drop(
     if !f.launcher.pane.contains(mx, my) {
         return false;
     }
+    let drops = plan_clip_drops(f, nd);
+    let mode = ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift);
+    if !drops.is_empty() {
+        response.launcher.intents.push(LauncherIntent::DropClipsToCells { drops, mode });
+    }
+    true
+}
+
+/// アレンジから帯へ運んでいるクリップの **着地先**。
+///
+/// `plan_cell_moves` と同じ理由でプレビューと確定が共有する 1 本
+/// (`draw::drag_overlays` がこれを rect に直してゴーストを置く)。格子の外
+/// (停止列 / 返す列 / 見出し行) を指しているときは空 = 落ちる先が無いので
+/// ゴーストも出ない。
+#[must_use]
+pub(super) fn plan_clip_drops(
+    f: &ArrangementFrame<'_>,
+    nd: &ClipDragSession,
+) -> Vec<ClipToCellDrop> {
+    // 端を掴んだ resize は帯へ落とせない (`take_arrangement_drop` の同じゲート)。
+    // ここを緩めると「ゴーストは出るのに離しても何も起きない」になる。
+    if f.launcher.collapsed || !matches!(nd.kind, ClipDragKind::Move) {
+        return Vec::new();
+    }
+    let (mx, my) = nd.last_mouse;
     let Some(target) = layout::drop_cell_at(f, mx, my) else {
-        return true;
+        return Vec::new();
     };
     let Some(base_idx) = row_index(f, target.row) else {
-        return true;
+        return Vec::new();
     };
     let Some(first) = nd.anchors.first() else {
-        return true;
+        return Vec::new();
     };
     let Some(anchor_idx) = track_row_index(f, first.key.track_id) else {
-        return true;
+        return Vec::new();
     };
     // 同じトラックの複数クリップは、開始拍の順に隣の列へ並べる (Live と同じ
     // 「時間軸を列に開く」写像)。ランチャーには時間軸が無いので、これ以外に
@@ -286,11 +321,7 @@ pub(crate) fn take_arrangement_drop(
         drops.push(ClipToCellDrop { from: a.key, to_row, to_scene_index });
         rank += 1;
     }
-    let mode = ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift);
-    if !drops.is_empty() {
-        response.launcher.intents.push(LauncherIntent::DropClipsToCells { drops, mode });
-    }
-    true
+    drops
 }
 
 // ============================================================

@@ -35,6 +35,18 @@ impl AppData {
             .map(|(k, v)| (*k, *v))
             .collect();
         audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
+        // Fit / `Z` 縦ズームが張った lane 行高。**現存するレーンの分だけ**書き出し
+        // (消えたレーンの orphan を溜めない)、キー順で並べて save 差分を安定させる。
+        let mut lane_row_overrides: Vec<(common::model::AutomationLaneKey, u16)> = self
+            .ui_prefs
+            .automation_lane_row_overrides
+            .iter()
+            .filter(|(k, _)| {
+                self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some()
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        lane_row_overrides.sort_unstable_by_key(|(k, _)| (k.track, k.lane));
         // r.md #65: エディタ窓のジオメトリ。per-clip view と同じく **現存する
         // device の分だけ**を書き出し (削除済み device の orphan を溜めない)、
         // device_id 昇順で並べて save 差分を安定させる。
@@ -48,6 +60,7 @@ impl AppData {
         plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
         common::model::ViewState {
             arrange_zoom_x: self.ui_prefs.arrange_zoom_x,
+            arrangement_split_ratio: self.ui_prefs.arrangement_split_ratio,
             arrange_scroll_beat: self.ui_prefs.arrange_scroll_beat,
             arrange_follow: self.ui_prefs.arrange_follow,
             // 再生ループ (ON/OFF + 範囲) は transport が live SSoT。 ここへ書くことで
@@ -58,6 +71,7 @@ impl AppData {
             arrange_header_w: self.ui_prefs.arrange_header_w,
             track_row_overrides: self.ui_prefs.track_row_overrides.clone(),
             expanded_automation_tracks: expanded,
+            automation_lane_row_overrides: lane_row_overrides,
             master_row_automation_expanded: self.ui_prefs.master_row_automation_expanded,
             arrange_snap_enabled: self.ui_prefs.arrange_snap_enabled,
             arrange_snap_choice: self.ui_prefs.arrange_snap_choice,
@@ -111,6 +125,13 @@ impl AppData {
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
         self.ui_prefs.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
+        // `0.0` / NaN は「未設定」 (旧ファイル)。view 側が既定比率へ倒すので
+        // ここで 0.05 に clamp しない (するとアレンジが潰れて開く)。
+        self.ui_prefs.arrangement_split_ratio = if v.arrangement_split_ratio.is_finite() {
+            v.arrangement_split_ratio.clamp(0.0, 0.95)
+        } else {
+            0.0
+        };
         self.ui_prefs.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
         self.ui_prefs.arrange_follow = v.arrange_follow;
         self.ui_prefs.arrange_track_top = v.arrange_track_top.max(0.0);
@@ -123,6 +144,16 @@ impl AppData {
             .map(|(k, h)| (k, h.max(16)))
             .collect();
         self.ui_prefs.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
+        // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
+        // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
+        self.ui_prefs.automation_lane_row_overrides = v
+            .automation_lane_row_overrides
+            .into_iter()
+            .filter(|(k, _)| {
+                self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some()
+            })
+            .map(|(k, h)| (k, h.max(16)))
+            .collect();
         self.ui_prefs.master_row_automation_expanded = v.master_row_automation_expanded;
         self.ui_prefs.arrange_snap_enabled = v.arrange_snap_enabled;
         self.ui_prefs.arrange_snap_choice = v.arrange_snap_choice.min(max_choice);

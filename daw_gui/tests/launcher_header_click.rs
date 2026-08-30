@@ -71,6 +71,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         }
         song.ids.next_track_id = 3;
         song.push_scene();
+        song.push_scene();
     });
     app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
         row: LauncherRow::Track(1),
@@ -115,6 +116,36 @@ fn click_intents(
     let mut out = drive(host, app, press(x, y)).launcher.intents;
     out.extend(drive(host, app, release(x, y)).launcher.intents);
     out
+}
+
+fn hold(x: f32, y: f32) -> PointerFrame {
+    PointerFrame { pos: Some((x, y)), primary_pressed: true, ..PointerFrame::default() }
+}
+
+/// 1 フレーム走らせて **描かれた Scene** を返す (`drive` の描画版)。
+fn drive_scene(host: &mut UiHost<AppData>, app: &mut AppData, p: PointerFrame) -> Scene {
+    let mut scene = Scene::new();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+    let input = FrameInput { pointer: p, ..FrameInput::default() };
+    host.frame(app, &mut scene, screen, input, |app, ui| {
+        let _ = arrangement(app, ui, WIDGET_RECT);
+    });
+    scene
+}
+
+/// `(掴むセルの rect, 運ぶ先の空きスロットの rect)`。どちらも同じ行の隣り合う列。
+fn drag_cells(host: &mut UiHost<AppData>, app: &mut AppData) -> (Rect, Rect) {
+    let resp = drive(host, app, PointerFrame::default());
+    let row = daw_gui::widgets::arrangement::ArrangementRowKey::Track(1);
+    let at = |col: u32| {
+        resp.launcher
+            .cell_rects
+            .iter()
+            .find(|(k, _)| k.row == row && k.scene_index == col)
+            .map(|(_, r)| *r)
+    };
+    (at(0).expect("列 0 にセルがある"), at(1).expect("列 1 のスロットがある"))
 }
 
 /// 見出しの rect を `(実シーンの rect, プレースホルダ列の rect)` で返す。
@@ -211,5 +242,82 @@ fn 実シーンの記号はそのシーンを撃つ() {
             |i| matches!(i, LauncherIntent::LaunchScene { scene_id: s, pressed: true } if *s == scene_id)
         ),
         "▶ はそのシーンを撃つ: {intents:?}"
+    );
+}
+
+// ============================================================
+// D&D の着地プレビュー
+// ============================================================
+
+/// 帯の中でセルを運ぶあいだ、ゴーストは **落ちるスロットに吸着する**。
+///
+/// 以前はカーソル中心の矩形が浮くだけで、どのスロットに入るのかが分からなかった。
+/// スロットの中心から**ずらした**位置で掴んでいることが要点 — 中心で持つと
+/// 「カーソル中心」と「スロット吸着」がたまたま一致して差が出ない。
+#[test]
+fn 帯の中のドラッグはゴーストがスロットに吸着する() {
+    let (mut app, _a, _p) = build_app();
+    let mut host: UiHost<AppData> = UiHost::no_redraw();
+    let (from, to) = drag_cells(&mut host, &mut app);
+
+    // 掴む → 目標スロットの中心から (20, 8) ずらした位置まで運ぶ。
+    let _ = drive(&mut host, &mut app, press(from.x + from.w - 8.0, from.y + from.h * 0.5));
+    let scene = drive_scene(
+        &mut host,
+        &mut app,
+        hold(to.x + to.w * 0.5 + 20.0, to.y + to.h * 0.5 + 8.0),
+    );
+
+    assert!(
+        scene.iter_rects().any(|r| {
+            r.border.a > 0.0
+                && (r.rect.x - to.x).abs() < 0.5
+                && (r.rect.y - to.y).abs() < 0.5
+                && (r.rect.w - to.w).abs() < 0.5
+        }),
+        "ゴーストが目標スロットにぴったり乗る (カーソル追従ではない)"
+    );
+}
+
+/// **アレンジのクリップを帯へ運ぶあいだも、着地スロットにゴーストが出る。**
+///
+/// 帯側に描く口が無かったため、ポインタが帯へ入った瞬間にプレビューが消え、
+/// どのスロットに落ちるか分からないまま離すことになっていた。
+#[test]
+fn アレンジから帯へ運ぶとゴーストが着地スロットに出る() {
+    let (mut app, _a, _p) = build_app();
+    let mut host: UiHost<AppData> = UiHost::no_redraw();
+    // トラック 2 のアレンジに掴めるクリップを 1 本置く。
+    app.handle_event(AppEvent::CreateClip { track: 1, start_beat: 0.0 });
+    let (_, to) = drag_cells(&mut host, &mut app);
+    let resp = drive(&mut host, &mut app, PointerFrame::default());
+    let lanes = resp.lanes_rect;
+    // トラック 2 の行の中心 y は、その行のセル rect から引く (行モデルは共有)。
+    let row2 = daw_gui::widgets::arrangement::ArrangementRowKey::Track(2);
+    let row2_rect = resp
+        .launcher
+        .cell_rects
+        .iter()
+        .find(|(k, _)| k.row == row2)
+        .map(|(_, r)| *r)
+        .expect("トラック 2 の行が帯に出ている");
+    let clip_y = row2_rect.y + row2_rect.h * 0.5;
+
+    // アレンジのクリップを掴む → 帯のスロットへ運ぶ (中心からずらす)。
+    let _ = drive(&mut host, &mut app, press(lanes.x + 20.0, clip_y));
+    let scene = drive_scene(
+        &mut host,
+        &mut app,
+        hold(to.x + to.w * 0.5 + 20.0, to.y + to.h * 0.5 + 8.0),
+    );
+
+    assert!(
+        scene.iter_rects().any(|r| {
+            r.border.a > 0.0
+                && (r.rect.x - to.x).abs() < 0.5
+                && (r.rect.y - to.y).abs() < 0.5
+                && (r.rect.w - to.w).abs() < 0.5
+        }),
+        "帯の上に着地スロットのゴーストが出る"
     );
 }

@@ -125,11 +125,26 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // ないので split (= arrangement / bottom panel widget) より前に描いてよい。
     track_inspector::draw(app, ui, inspector_rect);
 
+    // 比率は **アプリが所有する** (widget は覚えない)。`ui_prefs` に置くことで
+    // `ViewState` 経由でプロジェクトに保存され、開き直しても境界が戻らない。
+    // `0.0` = 未設定 (新規 / 旧ファイル) なので既定比率へ倒す。
+    let split_ratio = if app.ui_prefs.arrangement_split_ratio > 0.0 {
+        app.ui_prefs.arrangement_split_ratio
+    } else {
+        ARRANGEMENT_SPLIT_DEFAULT_RATIO
+    };
     ui.split_view(
         "root_arrange_bottom",
         right_rect,
         Orientation::Vertical,
-        ARRANGEMENT_SPLIT_DEFAULT_RATIO,
+        split_ratio,
+        |next| {
+            // 「見方の都合」なので `*` は立てない (ズーム / スクロールと同じ扱い、
+            // `project_dirty_flag_rule`)。
+            Edit::mutate(move |app: &mut AppData| {
+                app.ui_prefs.arrangement_split_ratio = next;
+            })
+        },
         |ui, arrangement_rect, bottom_rect| {
             // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面が
             // あるため、 先に root レベルで shortcut を捌いて広域の挙動を確定

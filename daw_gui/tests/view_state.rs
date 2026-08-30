@@ -204,3 +204,36 @@ fn restore_none_clears_per_clip_but_keeps_globals() {
     );
     assert_eq!(app.ui_prefs.arrange_zoom_x, 42.0, "globals は現状維持 (従来挙動)");
 }
+
+/// アレンジと下部パネルの境界比率がプロジェクトに保存され、開き直しても戻らない。
+///
+/// 以前は比率が `split_view` widget の一時状態にしか無く、アプリを起動し直すと
+/// **必ず既定位置へ戻っていた**。行高やズームを保存していても縦に見える範囲が
+/// 毎回変わるので、「保存したのに一部しか映らない」という形で出る。
+#[test]
+fn arrangement_split_ratio_survives_save_and_reopen() {
+    let (mut app, _rx) = build_app();
+    app.ui_prefs.arrangement_split_ratio = 0.88;
+
+    let snap = app.snapshot_view_state();
+    assert!((snap.arrangement_split_ratio - 0.88).abs() < 1e-6, "保存に載る");
+
+    // 別セッションで開き直した状況 (widget state も ui_prefs も初期値)。
+    let (mut fresh, _rx2) = build_app();
+    assert_eq!(fresh.ui_prefs.arrangement_split_ratio, 0.0, "既定は未設定");
+    fresh.restore_view_state(Some(snap), common::model::LoopRegion::default());
+    assert!(
+        (fresh.ui_prefs.arrangement_split_ratio - 0.88).abs() < 1e-6,
+        "開き直しても境界が既定へ戻らない"
+    );
+}
+
+/// 旧ファイル (比率を持たない) は `0.0` = 未設定として読める。view 側が
+/// 既定比率へ倒すので、ここで `0.05` へ clamp してアレンジを潰さない。
+#[test]
+fn legacy_file_leaves_split_ratio_unset() {
+    let (mut app, _rx) = build_app();
+    let v = common::model::ViewState { arrangement_split_ratio: 0.0, ..Default::default() };
+    app.restore_view_state(Some(v), common::model::LoopRegion::default());
+    assert_eq!(app.ui_prefs.arrangement_split_ratio, 0.0, "未設定のまま (既定は view が決める)");
+}

@@ -108,6 +108,9 @@ pub(crate) fn dispatch(
     app: &AppData,
     f: &ArrangementFrame<'_>,
     sessions: &LauncherSessions,
+    // アレンジのクリップドラッグ。帯の上へ持ってきたときの着地プレビューに要る
+    // (帯とレーンは別 session なので、帯側は自分の session だけでは何も知れない)。
+    clip_drag: Option<&ClipDragSession>,
     response: &mut ArrangementResponse,
 ) {
     response.launcher.pane_rect = f.launcher.pane;
@@ -143,7 +146,7 @@ pub(crate) fn dispatch(
         dim_launcher_rows(hctx, f);
         head_row(hctx, f, fb, out);
         grid_rows(hctx, app, &tempo_map, f, fb, out);
-        drag_overlays(hctx, f, sessions);
+        drag_overlays(hctx, f, sessions, clip_drag);
     });
 }
 
@@ -956,7 +959,24 @@ fn drag_overlays(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,
     sessions: &LauncherSessions,
+    clip_drag: Option<&ClipDragSession>,
 ) {
+    // アレンジから帯へ運んできているクリップの着地プレビュー。
+    //
+    // **帯側に描く口が無いと何も出ない。** アレンジのゴーストはレーンの中だけに
+    // 描かれるので、ポインタが帯へ入った瞬間にプレビューが消え、「どのスロットに
+    // 落ちるのか分からないまま離す」ことになっていた。着地先は release と同じ
+    // `plan_clip_drops` から取る。
+    if let Some(nd) = clip_drag {
+        let slots: Vec<(ArrangementRowKey, u32)> = release::plan_clip_drops(f, nd)
+            .into_iter()
+            .map(|d| (d.to_row, d.to_scene_index))
+            .collect();
+        if !slots.is_empty() {
+            let mode = ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift);
+            push_slot_ghosts(hctx, f, &slots, ghost_style(f, mode));
+        }
+    }
     if let Some(sr) = sessions.live_scene_reorder.as_ref() {
         // **preview と commit は同じ閾値を使う** (`geometry::REORDER_DRAG_THRESHOLD_PX`
         // の doc)。押しただけで線が出ると「線は出ているのに離しても動かない」に
@@ -986,19 +1006,68 @@ fn drag_overlays(
         if dx.abs() + dy.abs() < CELL_DRAG_SLOP_PX {
             return;
         }
-        let mode = ClipCopyMode::from_modifiers(cd.last_ctrl, cd.last_shift);
-        let (fill, border) = match mode {
-            ClipCopyMode::Move => (f.style.clip_selected_fill, f.style.clip_selected_border),
-            ClipCopyMode::CloneLinked => {
-                (f.style.clip_clone_linked_fill, f.style.clip_clone_linked_border)
-            }
-            ClipCopyMode::CloneIndependent => {
-                (f.style.clip_clone_indep_fill, f.style.clip_clone_indep_border)
-            }
-        };
-        let w = (f.launcher.col_w - 2.0).max(8.0);
-        let h = f.view.track_row_h.max(8.0) - 4.0;
-        let ghost = Rect { x: cd.last_mouse.0 - w * 0.5, y: cd.last_mouse.1 - h * 0.5, w, h };
-        push_rounded(hctx, ghost, fill.with_alpha(DRAG_PREVIEW_FILL_ALPHA), border, CELL_RADIUS);
+        let style = ghost_style(f, ClipCopyMode::from_modifiers(cd.last_ctrl, cd.last_shift));
+        // 格子の上ならスロットへスナップする。**着地先は commit と同じ
+        // `plan_cell_moves` から取る**ので、ゴーストが乗っているスロットが
+        // そのまま落ちる先になる。
+        let slots: Vec<(ArrangementRowKey, u32)> = release::plan_cell_moves(f, cd)
+            .into_iter()
+            .map(|m| (m.to_row, m.to_scene_index))
+            .collect();
+        if slots.is_empty() {
+            // 格子の外 (= アレンジのレーンへ持ち出している最中 / 停止列の上)。
+            // 落ちるスロットが無いので、従来どおりカーソルに付くゴーストを出す。
+            let w = (f.launcher.col_w - 2.0).max(8.0);
+            let h = f.view.track_row_h.max(8.0) - 4.0;
+            let ghost = Rect { x: cd.last_mouse.0 - w * 0.5, y: cd.last_mouse.1 - h * 0.5, w, h };
+            push_rounded(hctx, ghost, style.0, style.1, CELL_RADIUS);
+            return;
+        }
+        push_slot_ghosts(hctx, f, &slots, style);
     }
+}
+
+/// ドラッグ中のゴーストの `(塗り, 縁)`。運び方 (移動 / リンク複製 / 独立複製) で
+/// 色が変わるのはアレンジのクリップドラッグと同じ語彙。
+#[must_use]
+fn ghost_style(f: &ArrangementFrame<'_>, mode: ClipCopyMode) -> (Color, Color) {
+    let (fill, border) = match mode {
+        ClipCopyMode::Move => (f.style.clip_selected_fill, f.style.clip_selected_border),
+        ClipCopyMode::CloneLinked => {
+            (f.style.clip_clone_linked_fill, f.style.clip_clone_linked_border)
+        }
+        ClipCopyMode::CloneIndependent => {
+            (f.style.clip_clone_indep_fill, f.style.clip_clone_indep_border)
+        }
+    };
+    (fill.with_alpha(DRAG_PREVIEW_FILL_ALPHA), border)
+}
+
+/// 着地先のスロットにゴーストを敷く。
+///
+/// rect は **描画と当たり判定が共有する `layout::cell_rect`** から取るので、
+/// ゴーストは実際のセルとぴったり重なる。見えていない行 / 列は描かない。
+fn push_slot_ghosts(
+    hctx: &mut HeavyCtx<'_, '_, AppData>,
+    f: &ArrangementFrame<'_>,
+    slots: &[(ArrangementRowKey, u32)],
+    (fill, border): (Color, Color),
+) {
+    let grid = f.launcher.grid;
+    hctx.with_clip_rect(grid, |hctx| {
+        for (row_key, col) in slots {
+            let Some(row) = f.rows.iter().find(|r| r.key == *row_key) else {
+                continue;
+            };
+            if !layout::row_visible(f, row) {
+                continue;
+            }
+            let top = layout::row_screen_top(f, row);
+            let r = layout::cell_rect(&f.launcher, top, row.height, *col as usize);
+            if r.x + r.w < grid.x || r.x > grid.x + grid.w {
+                continue;
+            }
+            push_rounded(hctx, r, fill, border, CELL_RADIUS);
+        }
+    });
 }

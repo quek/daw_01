@@ -295,6 +295,8 @@ impl AppData {
                 audio_editor_views: std::collections::HashMap::new(),
                 audio_editor_vertical_gain: 1.0,
                 arrange_zoom_x: ARRANGE_PX_PER_BEAT,
+                // 0.0 = 未設定 (view が既定比率へ倒す)。
+                arrangement_split_ratio: 0.0,
                 arrange_scroll_beat: 0.0,
                 arrange_follow: common::model::FollowMode::default(),
                 arrange_track_top: 0.0,

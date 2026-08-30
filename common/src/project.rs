@@ -882,6 +882,11 @@ mod tests {
     /// per-clip view + globals を含む代表的な `ViewState`。
     fn sample_view_state() -> ViewState {
         ViewState {
+            arrangement_split_ratio: 0.72,
+            automation_lane_row_overrides: vec![(
+                crate::model::AutomationLaneKey { track: 1, lane: 2 },
+                120,
+            )],
             arrange_zoom_x: 37.5,
             arrange_scroll_beat: 12.0,
             arrange_track_top: 48.0,

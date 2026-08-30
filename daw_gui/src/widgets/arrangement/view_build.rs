@@ -123,6 +123,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         refcount_by_content: &refcount_by_content,
         lane_height_overrides: &app.ui_prefs.automation_lane_row_overrides,
         content_names: &labels.content_names,
+        lane_h_bounds: lane_h_bounds(app, area),
     };
     let tracks: Vec<ArrangementTrack> = app
         .song_doc
@@ -510,6 +511,22 @@ pub(crate) fn clip_display_label(clip: &common::model::Clip, song: &common::mode
 // automation lane の派生
 // ---------------------------------------------------------------------------
 
+/// 表示に使うレーン行高の `(min, max)`。
+///
+/// max は **レーンが描かれるペインの高さ** (`geometry::lane_pane_cap_px`) と style の
+/// 絶対上限の小さい方。min を下回らせないのは、ペインが極端に小さいフレーム
+/// (起動直後 / 帯を畳んだ瞬間) で全レーンが 0 px に潰れないようにするため。
+fn lane_h_bounds(app: &AppData, area: Rect) -> (u16, u16) {
+    let style = super::ArrangementStyle::from_theme(&app.theme);
+    let lanes_h = (area.h - RULER_H - SECTION_LANE_H).max(0.0);
+    let min = style.automation_lane_min_height_px;
+    let max = style
+        .automation_lane_max_height_px
+        .min(super::geometry::lane_pane_cap_px(lanes_h))
+        .max(min);
+    (min, max)
+}
+
 /// lane build の context (song + 各 lookup 表)。
 #[derive(Clone, Copy)]
 struct LaneBuildData<'a> {
@@ -517,6 +534,9 @@ struct LaneBuildData<'a> {
     refcount_by_content: &'a HashMap<common::model::ContentId, usize>,
     lane_height_overrides: &'a HashMap<common::model::AutomationLaneKey, u16>,
     content_names: &'a HashMap<common::model::ContentId, Arc<str>>,
+    /// 表示に使うレーン行高の上下限 `(min, max)`。max は **今のペイン高**なので、
+    /// 保存済みの巨大な高さもペインに収まる (`geometry::lane_pane_cap_px` の doc)。
+    lane_h_bounds: (u16, u16),
 }
 
 fn build_arrangement_automation_lanes(
@@ -559,7 +579,13 @@ fn build_arrangement_lanes_from_slice(
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
     param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
 ) -> Vec<ArrangementAutomationLane> {
-    let LaneBuildData { song, refcount_by_content, lane_height_overrides, content_names } = data;
+    let LaneBuildData {
+        song,
+        refcount_by_content,
+        lane_height_overrides,
+        content_names,
+        lane_h_bounds,
+    } = data;
     lanes
         .iter()
         .map(|lane| {
@@ -614,10 +640,12 @@ fn build_arrangement_lanes_from_slice(
                 color: display.color,
                 enabled: lane.enabled,
                 visible: lane.visible,
+                // session override → model の順で解き、**最後にペイン高で頭打ち**にする。
                 height_px: lane_height_overrides
                     .get(&common::model::AutomationLaneKey { track: track_id, lane: lane.id })
                     .copied()
-                    .unwrap_or(lane.height_px),
+                    .unwrap_or(lane.height_px)
+                    .clamp(lane_h_bounds.0, lane_h_bounds.1),
                 default_value_norm,
                 clips,
             }

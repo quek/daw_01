@@ -222,6 +222,9 @@ pub struct UiPrefs {
     pub launcher_layout: common::model::LauncherLayout,
     /// [`LauncherLayout::Both`](common::model::LauncherLayout::Both) のときの
     /// ランチャー帯の幅 (px)。`0` 以下 = 未設定 (widget の既定幅)。
+    /// アレンジと下部パネルの境界比率 (上の取り分)。`ViewState` に保存され、
+    /// プロジェクトを開き直しても境界位置が戻らない。`0.0` = 未設定。
+    pub arrangement_split_ratio: f32,
     pub launcher_width: f32,
     /// シーン 1 列の幅 (px、全列共通)。`0` 以下 = 未設定 (widget の既定幅)。
     pub launcher_scene_col_w: f32,

@@ -677,11 +677,23 @@ pub(super) fn clamp_height_px(raw: f32, min: u16, max: u16) -> u16 {
 /// なるよう clamp_height_px 側で補正されるため、 ここでは `lanes.h.round() as u16` を返すだけで OK。
 #[inline]
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(super) fn effective_lane_max_height(style: &ArrangementStyle, lanes: Rect) -> u16 {
-    let style_cap = style.automation_lane_max_height_px;
-    let pane_cap = lanes.h.round().max(0.0) as u32; // u16 overflow 防止に u32 経由で min 計算
-    style_cap.min(u16::try_from(pane_cap).unwrap_or(u16::MAX))
+    style.automation_lane_max_height_px.min(lane_pane_cap_px(lanes.h))
+}
+
+/// 「レーンは描画 pane より高くならない」 の pane 側の項 (px)。
+///
+/// **drag 時だけでなく、保存済み高さを表示に解決するときも通す**
+/// (`view_build`)。ここを drag だけに掛けていたので、drag のあとで pane が
+/// 縮む (下部パネルを開く / 窓を小さくする / 別プロジェクトを開く) と、
+/// pane より高いレーンが 1 本でビューポートを占有して **全トラックが画面外へ
+/// 押し出される**。上限は pane 高そのものなので、pane が変われば追従する。
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(super) fn lane_pane_cap_px(lanes_h: f32) -> u16 {
+    let pane = lanes_h.round().max(0.0) as u32; // u16 overflow 防止に u32 経由
+    u16::try_from(pane).unwrap_or(u16::MAX)
 }
 
 /// M10 Phase 47b: `mouse_x` から band 内の volume 値 (`0.0..=1.0`) を計算。

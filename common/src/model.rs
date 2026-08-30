@@ -458,6 +458,16 @@ pub struct ViewState {
     /// automation lane を展開中の track_id (順序非依存、save 時に sort)。
     #[serde(default)]
     pub expanded_automation_tracks: Vec<u32>,
+    /// オートメーションレーンの表示行高 (`track_row_overrides` のレーン版)。
+    ///
+    /// **model の `AutomationLane.height_px` とは別の面**で、こちらは「見方の都合」
+    /// (Fit / `Z` 縦ズームの結果) を持つ。ここが保存されないと、Fit した直後に
+    /// 保存しても開き直しで model の `height_px` が復活する — 過去に `Z` で
+    /// 画面いっぱいへ拡大したレーンがあると、**そのレーン 1 本がビューポートを
+    /// 占有して全トラックが画面外へ押し出される**。トラック行高
+    /// (`arrange_track_row_h`) は保存されるので、片側だけ Fit が効いた状態になる。
+    #[serde(default)]
+    pub automation_lane_row_overrides: Vec<(AutomationLaneKey, u16)>,
     #[serde(default)]
     pub master_row_automation_expanded: bool,
     /// 再生中プレイヘッド追従スクロールの方式 (Alt+F で循環)。旧 .daw は
@@ -511,6 +521,14 @@ pub struct ViewState {
     // (ズーム / スクロールと同じ扱い、`docs/plan_rmd_87_clip_launcher.md` §1.3)。
     // 曲の一部 (列・セル・主導権) は `Song` 側に居る。
     /// ランチャー帯とアレンジのレーンをどう見せるか。
+    /// アレンジと下部パネル (ピアノロール / ミキサー / オーディオエディタ) の
+    /// 境界比率 (上の取り分、`0.05..=0.95`)。`0.0` = 未設定でアプリ既定に倒す。
+    ///
+    /// **これが無いと、境界をどこへ動かして保存してもアプリを起動し直すたびに
+    /// 既定位置へ戻る** — 比率は widget の一時状態にしか無かった (縦に見える
+    /// 範囲が毎回変わるので、行高を保存していても「一部しか映らない」)。
+    #[serde(default)]
+    pub arrangement_split_ratio: f32,
     #[serde(default)]
     pub launcher_layout: LauncherLayout,
     /// [`LauncherLayout::Both`] のときのランチャー帯の幅 (px)。`Tab` で
