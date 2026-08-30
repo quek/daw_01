@@ -332,6 +332,47 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
     assert_eq!(app.ui_prefs.arrange_track_row_h, 200.0);
 }
 
+/// 実機報告 (2026-08-30):「1 回目の `Z` でオートメーションレーンが高くなる」。
+/// `automation_lane_row_overrides` には `Z` の縦ズームが広げた行と **fit (`X`) が
+/// 縮めた行**が同居するのに、fresh な `Z` が map ごと捨てていた。 fit の行高は
+/// fit の持ち物なので、横ズームは触ってはいけない。
+#[test]
+fn fit_が縮めたレーン高は_fresh_zoom_で消えない() {
+    let (mut app, _rx) = build_app();
+    let track_id = app.song_doc.song().tracks[0].id;
+    app.edit_song(|song| {
+        song.tracks[0].automation_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 }],
+            next_clip_id: 2,
+            ..AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                0.0,
+            )
+        });
+        song.tracks[0].clips.push(Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() });
+    });
+    app.ui_prefs.expanded_automation_tracks.insert(track_id);
+    let lane_key = AutomationLaneKey { track: track_id, lane: 1 };
+    let rows = [
+        (ArrangementRowKey::Track(MASTER_TRACK_ID), 100.0),
+        (ArrangementRowKey::Track(track_id), 150.0),
+        (ArrangementRowKey::Lane(lane_key), 60.0),
+    ];
+    set_arrange_layout(&mut app, 800.0, 600.0, &rows);
+    // X (全体フィット) がレーン高を 600/3 = 200 に張る。
+    app.handle_event(AppEvent::FitArrangeToContent);
+    assert_eq!(app.ui_prefs.automation_lane_row_overrides.get(&lane_key).copied(), Some(200));
+    // MIDI クリップを選んで 1 回目の Z (= 横ズームだけ)。
+    app.handle_event(AppEvent::SetClipSelection(vec![ClipKey { track_id, clip_id: 1 }]));
+    app.handle_event(AppEvent::ZoomArrangeToSelectedClip { automation: false });
+    assert_eq!(
+        app.ui_prefs.automation_lane_row_overrides.get(&lane_key).copied(),
+        Some(200),
+        "1 段目 (横ズーム) は行高に触らない",
+    );
+}
+
 /// r.md #63: `Z` の縦ズームは、 選択 track の **上に展開中の automation lane がある** ときも
 /// スクロール位置がズレない (行 top を「一様行高 × 行番号」 で再導出せず、 widget が積んだ行を
 /// 新しい行高で数え直す)。 選択 track 自身のレーンは Ardour `Editor::fit_tracks` の

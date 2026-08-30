@@ -103,7 +103,7 @@ FILE-BUDGET | daw_gui/src/view/runner.rs               | 1618 | #71 で drag pay
 FILE-BUDGET | daw_gui/src/handler/automation.rs        | 1410 | 巨大 draw / match。未起票
 FILE-BUDGET | daw_gui/src/script.rs                    | 1227 | #71 で script API `relocateDevices` +10。binding は 1 か所に並べる規約なので割らない。未起票
 FILE-BUDGET | daw_gui/src/handler/project.rs           | 1188 | 巨大 draw / match。未起票
-FILE-BUDGET | daw_gui/src/handler/selection_view.rs    | 1205 | #71 で `live_device_ids` (既存 `live_track_ids` と対の正規化) +21。兄弟と離すと面の SSoT が割れる。未起票
+FILE-BUDGET | daw_gui/src/handler/selection_view.rs    | 1237 | 範囲選択 (`docs/plan_range_selection.md`) で automation 選択の剪定 + automation クリップ→範囲の変換 +15。面の SSoT (`set_time_selection` 1 本) と離せない。分割はユーザー判断で保留
 FILE-BUDGET | daw_gui/src/handler/automation_lanes.rs  | 1170 | 巨大 draw / match。未起票
 # #71 は **天井へ逃がさず分割した** 2 件。天井は縮んだ実測値へ下げてある
 # (縮んだぶんを残すと、そのぶん黙って太り直せてしまう)。

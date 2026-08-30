@@ -192,6 +192,14 @@ pub struct UiEphemeral {
     /// `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
     /// 次の Z で選択 or view が食い違えば段階 0 (横) から仕切り直す。 session-only。
     pub(crate) arrange_zoom_anchor: Option<ArrangeZoomAnchor>,
+    /// `Z` の縦ズームがレーンを viewport 高いっぱいへ広げた**その 1 行**。
+    ///
+    /// 拡大は `ui_prefs.automation_lane_row_overrides` に書くが、あの map には
+    /// **fit (`X`) が縮めた行高**も同居する。 どちらが書いたかを持たずに map ごと
+    /// 捨てると、fit で縮めたレーンが次の `Z` で model 高さへ跳ね上がる
+    /// (実機報告「1 回目の Z でオートメーションレーンが高くなる」)。 誰が書いたかは
+    /// ここが持つ。 session-only。
+    pub(crate) zoom_lane_fill: Option<common::model::AutomationLaneKey>,
     /// inspector の param セクション (title 下〜chain 上) の実描画高さ
     /// (px)。 immediate-mode なので「前フレームに測った高さ」を `scroll_area` の
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。

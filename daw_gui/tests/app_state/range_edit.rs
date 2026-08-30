@@ -313,3 +313,44 @@ fn ピアノロールの複製は行き先のノートを上書きする() {
     starts.sort_by(f64::total_cmp);
     assert_eq!(starts, vec![1.5, 5.5], "行き先に元から居た 5.0 は消える");
 }
+
+#[test]
+fn オートメーションクリップを選ぶと範囲もそこへ移る() {
+    // 実機報告: MIDI クリップを選んだあと Z を押すと、選んで見えていない
+    // オートメーションクリップへズームした。 原因は「範囲は MIDI クリップのまま /
+    // last_edit_select だけ automation」 という食い違い。 選択の SSoT は範囲 1 本
+    // なので、automation クリップを選んだら範囲もそこへ張り直す。
+    use common::model::{AutomationClip, AutomationLane, AutomationTarget, TrackBuiltinParam};
+    let mut app = app_with_clips(&[(1, 0.0, 8.0)]);
+    app.edit_song(|song| {
+        let cid = song.alloc_content(
+            ClipContent::Automation(common::model::AutomationContent::default()),
+            String::new(),
+        );
+        song.tracks[0].automation_lanes = vec![AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: String::new(),
+                start_beat: 12.0,
+                length_beats: 4.0,
+                content_id: cid,
+                content_offset_beats: 0.0,
+            }],
+            next_clip_id: 2,
+            ..AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                1.0,
+            )
+        }];
+    });
+    app.handle_event(AppEvent::SelectClip { target: key(1), additive: false });
+    assert_eq!(app.selected_clip_refs(), vec![key(1)]);
+    app.handle_event(AppEvent::SelectAutomationClips {
+        prev: Vec::new(),
+        next: vec![common::model::AutomationClipKey { track: TRACK, lane: 1, clip: 1 }],
+    });
+    let sel = app.selection.time.as_ref().expect("範囲が立つ");
+    assert_eq!((sel.start_beat, sel.end_beat), (12.0, 16.0), "範囲が automation クリップへ移る");
+    assert!(app.selected_clip_refs().is_empty(), "MIDI クリップの選択表示は外れる");
+}

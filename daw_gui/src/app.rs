@@ -382,6 +382,7 @@ impl AppData {
                 home_toggle_at_first: false,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
+                zoom_lane_fill: None,
                 arrange_hover_content: None,
                 arrange_dragging_track_volume: None,
                 arrange_default_scrub_active: None,
@@ -926,6 +927,10 @@ impl AppData {
                 self.delete_automation_clips(&keys)
             }
             AppEvent::SelectAutomationClips { prev: _, next } => {
+                // 選択の SSoT は範囲 1 本なので、**範囲もそのクリップ群へ張り直す**。
+                // これを飛ばすと、前に選んでいた MIDI クリップが選択表示のまま残り、
+                // `Z` が「選んで見えているクリップ」ではない方へズームする (実機で報告)。
+                self.select_automation_clip_range(&next);
                 // 直近に選択した編集面を記録 (= 共存選択されたときの
                 // copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
                 if !next.is_empty() {

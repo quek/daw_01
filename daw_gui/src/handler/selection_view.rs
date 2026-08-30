@@ -66,7 +66,28 @@ impl AppData {
         let devices = !self.live_device_ids().is_empty();
         let auto_prefer_clips = auto_clips
             && (!points || self.selection.last_edit_select == Some(S::AutomationClips));
-        // 1. ポインタが乗っている面を最優先 (選択が非空な面に限る)。
+        // 1. **最後に選んだ面**がまだ非空ならそれ ([[feedback_selection_action_last_wins]])。
+        //
+        // ポインタが乗っている面より先に見る。 逆順だと、オートメーションレーン行の上に
+        // マウスが乗っているだけで、その後に選び直したクリップ / 範囲を差し置いて
+        // automation 面が勝ってしまう。 ポインタ位置は**タイブレーク**であって、
+        // 直近の明示的な選択を上書きしてよい根拠ではない。
+        let last_wins = match self.selection.last_edit_select {
+            Some(S::AudioEvents) if audio_events => Some(S::AudioEvents),
+            Some(S::Notes) if notes => Some(S::Notes),
+            Some(S::AutomationPoints) if points => Some(S::AutomationPoints),
+            Some(S::AutomationClips) if auto_clips => Some(S::AutomationClips),
+            Some(S::TimeRange) if time_range => Some(S::TimeRange),
+            Some(S::LauncherCells) if cells => Some(S::LauncherCells),
+            Some(S::Tracks) if tracks => Some(S::Tracks),
+            Some(S::Sections) if sections => Some(S::Sections),
+            Some(S::Devices) if devices => Some(S::Devices),
+            _ => None,
+        };
+        if let Some(surface) = last_wins {
+            return Some(surface);
+        }
+        // 2. 直近の面が空になった / まだ何も選んでいないとき、ポインタが乗っている面。
         if is_pianoroll_active {
             if self.ui_ephemeral.audio_editor_clip.is_some() {
                 if audio_events {
@@ -83,22 +104,6 @@ impl AppData {
             if points {
                 return Some(S::AutomationPoints);
             }
-        }
-        // 2. 「最後に選んだ面」 がまだ非空ならそれ。
-        let last_wins = match self.selection.last_edit_select {
-            Some(S::AudioEvents) if audio_events => Some(S::AudioEvents),
-            Some(S::Notes) if notes => Some(S::Notes),
-            Some(S::AutomationPoints) if points => Some(S::AutomationPoints),
-            Some(S::AutomationClips) if auto_clips => Some(S::AutomationClips),
-            Some(S::TimeRange) if time_range => Some(S::TimeRange),
-            Some(S::LauncherCells) if cells => Some(S::LauncherCells),
-            Some(S::Tracks) if tracks => Some(S::Tracks),
-            Some(S::Sections) if sections => Some(S::Sections),
-            Some(S::Devices) if devices => Some(S::Devices),
-            _ => None,
-        };
-        if let Some(surface) = last_wins {
-            return Some(surface);
         }
         // 3. タグが無いときだけ 非空優先順 (従来順)。 タグがあるのにここへ来たのは
         //    「その面が空になった」 = 対象なし。
@@ -259,12 +264,101 @@ impl AppData {
     pub(crate) fn set_time_selection(&mut self, next: Option<common::model::TimeSelection>) {
         let first_track = next.as_ref().and_then(|t| t.track_ids().next());
         self.selection.time = next;
+        // 範囲を張り直したら、そこに**入っていない** automation クリップ / 点の選択は
+        // 落とす。 選択の SSoT は範囲 1 本なので、範囲の外に残った選択は
+        // 「クリップを選んだのに Z が別のオートメーションクリップへ飛ぶ」
+        // 「Delete が範囲でなく古い点を消す」 の形で顔を出す (実機で報告)。
+        self.prune_automation_selection();
         if let Some(face) = self.time_selection_surface() {
             self.selection.last_edit_select = Some(face);
             if let Some(tid) = first_track {
                 self.select_track(tid);
             }
         }
+    }
+
+    /// automation クリップ群を「選択」する = 範囲をその**外接区間 × それらのレーン行**へ
+    /// 張り直す (クリップ選択の `apply_clip_range` と同じ規約)。
+    /// 空を渡したら範囲は触らない (選択解除は空きレーン click 側の仕事)。
+    pub(crate) fn select_automation_clip_range(
+        &mut self,
+        keys: &[common::model::AutomationClipKey],
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        let (mut start, mut end) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut lanes: Vec<common::model::LaneRef> = Vec::new();
+        {
+            let song = self.song_doc.song();
+            for k in keys {
+                let Some(clip) = song
+                    .automation_lane_by_key(k.track, k.lane)
+                    .and_then(|l| l.clip_by_id(k.clip))
+                else {
+                    continue;
+                };
+                start = start.min(clip.start_beat);
+                end = end.max(clip.start_beat + clip.length_beats);
+                let lane = common::model::LaneRef::Automation(k.lane_key());
+                if !lanes.contains(&lane) {
+                    lanes.push(lane);
+                }
+            }
+        }
+        if !start.is_finite() || end <= start {
+            return;
+        }
+        self.set_time_selection(common::model::TimeSelection::new(start, end, lanes));
+    }
+
+    /// 範囲の外に残った automation クリップ / 点の選択を落とす。
+    ///
+    /// 「入っている」= そのレーン行が範囲に掛かっていて、かつ位置が範囲に重なること。
+    /// 範囲そのものが無ければ全部落とす。
+    fn prune_automation_selection(&mut self) {
+        let Some(sel) = self.selection.time.clone() else {
+            self.selection.selected_automation_clips.clear();
+            self.selection.selected_automation_points.clear();
+            return;
+        };
+        let song = self.song_doc.song();
+        let on_lane = |lane: common::model::AutomationLaneKey| {
+            sel.has_lane(common::model::LaneRef::Automation(lane))
+        };
+        let keep_clips: Vec<common::model::AutomationClipKey> = self
+            .selection
+            .selected_automation_clips
+            .iter()
+            .filter(|k| {
+                song.automation_lane_by_key(k.track, k.lane)
+                    .and_then(|l| l.clip_by_id(k.clip))
+                    .is_some_and(|c| {
+                        on_lane(k.lane_key()) && sel.intersects(c.start_beat, c.length_beats)
+                    })
+            })
+            .copied()
+            .collect();
+        let keep_points: Vec<crate::app_types::AutomationPointKeyRef> = self
+            .selection
+            .selected_automation_points
+            .iter()
+            .filter(|k| {
+                let lane = common::model::AutomationLaneKey { track: k.track_id, lane: k.lane_id };
+                song.automation_lane_by_key(k.track_id, k.lane_id)
+                    .and_then(|l| l.clip_by_id(k.clip_id))
+                    .and_then(|c| {
+                        let pts = song.clip_contents.get(&c.content_id)?.automation_points()?;
+                        let p = pts.get(k.point_idx as usize)?;
+                        Some(c.content_to_song_beat(p.time_beat))
+                    })
+                    // 点は幅ゼロなので端に乗るのが普通 — 両端を含む判定にする。
+                    .is_some_and(|beat| on_lane(lane) && sel.contains_beat(beat))
+            })
+            .copied()
+            .collect();
+        self.selection.selected_automation_clips = keep_clips;
+        self.selection.selected_automation_points = keep_points;
     }
 
     /// 範囲が**どの面**の上に居るかは、掛かっているレーンの種類が既に持っている
@@ -1386,6 +1480,8 @@ impl AppData {
         for k in fit_lane_keys {
             self.ui_prefs.automation_lane_row_overrides.insert(k, lane_px);
         }
+        // ここから先の override は fit が所有する (Z が捨ててよいものは無い)。
+        self.ui_ephemeral.zoom_lane_fill = None;
     }
 
     /// `Z` キーの段階ズーム。 選択素材 (通常 clip + automation
@@ -1407,6 +1503,21 @@ impl AppData {
     pub(crate) fn zoom_arrange_to_selected_clip(&mut self, automation: bool) {
         // Z (zoom-to-selection) は明示的な view 操作なので再生中は追従を解除する。
         self.cancel_follow_on_manual_view_change();
+        // 「どこへズームするか」を決める入力を 1 行に出す。 Z は明示操作なので
+        // 毎フレームは走らない。 「選んだものと違うところへ飛んだ」 類の切り分けは
+        // この 1 行が無いと画面から逆算できない (実際、行高の跳ねはここで確定した)。
+        tracing::info!(
+            automation,
+            range = ?self.selection.time.as_ref().map(|t| (t.start_beat, t.end_beat, t.lanes.len())),
+            span = ?self.arrange_selection_beat_span(automation),
+            auto_clips = self.selection.selected_automation_clips.len(),
+            auto_points = self.selection.selected_automation_points.len(),
+            last_face = ?self.selection.last_edit_select,
+            hovered_lane = ?self.ui_ephemeral.arrange_hovered_automation_lane,
+            lane_overrides = self.ui_prefs.automation_lane_row_overrides.len(),
+            lane_fill = ?self.ui_ephemeral.zoom_lane_fill,
+            "Z: zoom to selection"
+        );
         let sig = self.current_zoom_selection_sig(automation);
         // 直近アンカーと同じ選択 + view が手付かずなら段階を継続、 それ以外は仕切り直し。
         let stage = match self.ui_ephemeral.arrange_zoom_anchor.take() {
@@ -1439,11 +1550,19 @@ impl AppData {
         if lanes_w < 16.0 {
             return false;
         }
-        // fresh な横ズームは新しい zoom セッションの起点。 前セッションの lane 拡大
-        // (一時 override) を破棄してから snapshot を撮る — snapshot に古い拡大を
-        // 持ち越さないことで、 後で `X` / fit したとき automation レーンだけ高いまま
-        // 残るのを防ぐ。 override は lane-fill 中だけ存在する一時状態。
-        self.ui_prefs.automation_lane_row_overrides.clear();
+        // **1 段目は横だけ。 行高には他人の分まで触らない。**
+        //
+        // 以前はここで `automation_lane_row_overrides` を map ごと捨てていた
+        // (前セッションの lane 拡大を持ち越さないため)。 だがあの map には `Z` の
+        // 縦ズームが広げた行だけでなく **fit (`X`) が縮めた行高**も同居するので、
+        // 捨てると「1 回目の Z でオートメーションレーンだけ急に高くなる」
+        // (= model の `height_px` へ戻る) になる (実機で報告)。 捨ててよいのは
+        // **自分が広げた 1 行だけ**で、誰が書いたかは `ui_ephemeral.zoom_lane_fill`
+        // が持つ。 fit は自分で clear + 張り直し、 `X` は履歴の snapshot
+        // (`lane_row_overrides` 込み) を丸ごと復元するので、そちらの後始末は不要。
+        if let Some(key) = self.ui_ephemeral.zoom_lane_fill.take() {
+            self.ui_prefs.automation_lane_row_overrides.remove(&key);
+        }
         let snap = self.capture_arrange_view();
         self.ui_ephemeral.arrange_zoom_history.push(snap);
         let span = max_end - min_start;
@@ -1489,6 +1608,8 @@ impl AppData {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let lane_px = lanes_h.clamp(MIN_ARRANGE_ROW_H, f32::from(u16::MAX)) as u16;
             self.ui_prefs.automation_lane_row_overrides.insert(lane_key, lane_px);
+            // 「この 1 行は Z が広げた」と記録する (次の fresh な Z が捨てる対象)。
+            self.ui_ephemeral.zoom_lane_fill = Some(lane_key);
             self.ui_prefs.arrange_track_top = content_top.max(0.0);
             return true;
         }
@@ -1650,6 +1771,8 @@ impl AppData {
             self.ui_prefs.arrange_track_top = v.track_top;
             self.ui_prefs.track_row_overrides = v.row_overrides;
             self.ui_prefs.automation_lane_row_overrides = v.lane_row_overrides;
+            // 復元した行高は snapshot の持ち物 (Z が捨ててよいものは無い)。
+            self.ui_ephemeral.zoom_lane_fill = None;
         } else {
             self.fit_arrange_to_content();
         }
