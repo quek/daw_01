@@ -44,6 +44,9 @@ impl AppData {
         if self.offline_render_busy() {
             self.ui_ephemeral.status_message = if self.loudness.phase.is_busy() {
                 "ラウドネス解析中は再生できません".into()
+            } else if !self.export_or_analysis_busy() {
+                // bounce / Glue の焼き込みも同じ freewheel を占有する。
+                "焼き込み中は再生できません".into()
             } else {
                 "書き出し中は再生できません".into()
             };

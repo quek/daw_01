@@ -235,6 +235,7 @@ impl AppData {
                 audio_tx: Some(audio_tx),
                 plugin_tx: Some(plugin_tx),
                 pending_clip_fx_bounce: None,
+                pending_glue_bake: None,
                 pending_vocal_synth_bounce: None,
                 pending_vocal_synth_export: std::collections::HashSet::new(),
                 open_plugin_guis: std::collections::HashSet::new(),
@@ -574,7 +575,10 @@ impl AppData {
         // 「新 variant の分類し忘れ = deadlock」 という故障モードが構造的に消える。
         // r.md #54: 範囲ラウドネス解析も同じ freewheel 経路 (engine の
         // `export_running` を共有) なので、同じ block-list を適用する。
-        if self.offline_render_busy() {
+        // **書き出し / 解析だけ**を見る (bounce / Glue の焼き込みは含めない) —
+        // それらは自分の `BounceClipFxComplete` で engine song を復元するので、
+        // 広い述語で捨てると自分の完了を握り潰して永久に終わらない。
+        if self.export_or_analysis_busy() {
             let block = matches!(
                 event,
                 AppEvent::Plugin(common::protocol::PluginEvent::SlotPluginLoaded { .. })

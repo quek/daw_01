@@ -105,13 +105,16 @@ expectEq(c0.length_beats, 2.0, "front clip length");
 expectEq(c1.start_beat, 2.0, "back clip start");
 expectEq(c1.length_beats, 2.0, "back clip length");
 
+// Split は **同じ content を 2 つの窓で見る** 形 (r.md #68 / plan_range_selection.md §10)
+// なので、両クリップの content_id は同じで、events[0] / events[1] が各半分になる。
+expectEq(c0.content_id, c1.content_id, "split keeps one shared content");
+const splitEvents = s.clip_contents[c0.content_id].events;
+expectEq(splitEvents.length, 2, "split event count");
 // VideoEvent の source_micros が比例分割されたことを確認:
 //   front : source [0, 2_000_000)
 //   back  : source [2_000_000, 4_000_000)
-const c0_content = s.clip_contents[c0.content_id];
-const c1_content = s.clip_contents[c1.content_id];
-const fEv = c0_content.events[0];
-const bEv = c1_content.events[0];
+const fEv = splitEvents[0];
+const bEv = splitEvents[1];
 expectNear(fEv.source_start_micros, 0, 1, "front source_start");
 expectNear(fEv.source_end_micros, 2000000, 1, "front source_end");
 expectNear(bEv.source_start_micros, 2000000, 1, "back source_start");

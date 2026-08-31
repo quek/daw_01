@@ -123,6 +123,11 @@ impl AppData {
                 error,
                 frames,
             } => {
+                // Glue の焼き込みも同じ offline render / 完了通知を使うので、
+                // 先に Glue 側へ照合させる (`docs/plan_glue_bake.md` §4)。
+                if self.handle_glue_bake_complete(&path, source_track, error.as_deref(), frames) {
+                    return;
+                }
                 self.handle_bounce_clip_fx_complete(path, source_track, source_clip, error, frames);
             }
             AudioEvent::PluginUnresponsive { device_id } => {

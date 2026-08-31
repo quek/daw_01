@@ -247,8 +247,17 @@ impl ScriptHost {
     }
 
     fn handle_incoming(&mut self, msg: &ChildEvent) {
-        let ChildEvent::Plugin(msg) = msg else {
-            return; // audio 側 event は script bookkeeping に不要。
+        let msg = match msg {
+            // production (GUI runner) と同じく app へ dispatch する。 audio 側の
+            // 完了通知で song を書き換える非同期フロー (bounce / `J` Glue の焼き込み)
+            // は、 これが無いと headless では**永久に完了しない** — script モードは
+            // 実機と同じ経路を通ってこそ検証になる。 走行中でない export の完了等は
+            // app 側が stale ガードで無視する (`handler::ipc`)。
+            ChildEvent::Audio(ev) => {
+                self.app.handle_event(AppEvent::Audio(ev.clone()));
+                return;
+            }
+            ChildEvent::Plugin(msg) => msg,
         };
         match msg {
             PluginEvent::SlotPluginLoaded {
@@ -491,6 +500,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             NativeFunction::from_fn_ptr(daw_set_selection),
             js_string!("setSelection"),
             1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_set_time_selection),
+            js_string!("setTimeSelection"),
+            3,
         )
         .function(
             NativeFunction::from_fn_ptr(daw_duplicate_tracks),
@@ -1306,6 +1320,31 @@ fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
         // 選択の SSoT は時間範囲 1 本 — クリップ選択はその特殊形として張り直す
         // (`docs/plan_range_selection.md`)。 production の click と同じ経路を通す。
         host.app.handle_event(crate::app::AppEvent::SetClipSelection(keys));
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.setTimeSelection(startBeat, endBeat, trackIdsJson)` — 選択の SSoT である
+/// **時間範囲 × レーン**を直接張る (`docs/plan_range_selection.md`)。
+///
+/// `setSelection` はクリップ選択 (= 範囲の特殊形) しか表せないので、**クリップ境界に
+/// 揃っていない範囲**を要求する操作 (範囲 Glue / 範囲削除 / 範囲書き出し) を headless
+/// で駆動できなかった。production の drag と同じ `set_time_selection` を通す。
+fn daw_set_time_selection(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let start = f64::try_from_js(args.get_or_undefined(0), ctx)?;
+    let end = f64::try_from_js(args.get_or_undefined(1), ctx)?;
+    let ids_json = arg_to_string(args, 2, ctx)?;
+    let ids: Vec<u32> = serde_json::from_str(&ids_json)
+        .map_err(|e| js_native(format!("setTimeSelection: parse ids: {e}")))?;
+    let lanes: Vec<common::model::LaneRef> =
+        ids.into_iter().map(common::model::LaneRef::Track).collect();
+    with_host(|host| {
+        host.app
+            .set_time_selection(common::model::TimeSelection::new(start, end, lanes));
     });
     Ok(JsValue::undefined())
 }

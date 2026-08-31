@@ -175,11 +175,12 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
     let mut peak_l = 0.0_f32;
     let mut peak_r = 0.0_f32;
     for i in 0..n {
-        let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        // pan 則の SSoT は `common::audio_render::pan_gains` (焼き込み側が
+        // これを打ち消すので、式を 2 か所に持たない)。
+        let (pan_l, pan_r) = common::audio_render::pan_gains(scratch.pan_per_sample[i]);
         let vol = scratch.volume_per_sample[i];
-        let gain_l = angle.cos() * vol;
-        let gain_r = angle.sin() * vol;
+        let gain_l = pan_l * vol;
+        let gain_r = pan_r * vol;
         let l = scratch.track_l[i] * gain_l;
         let r = scratch.track_r[i] * gain_r;
         scratch.track_l[i] = l;

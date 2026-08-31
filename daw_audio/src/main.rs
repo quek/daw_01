@@ -1589,6 +1589,7 @@ async fn recv_loop(
                 source_clip,
                 start_beat,
                 end_beat,
+                warm,
             }) => {
                 // Reserve the engine (same atomic reservation as ExportWav —
                 // bounce and WAV export share EngineShared / the CPAL-silence
@@ -1650,15 +1651,21 @@ async fn recv_loop(
                     .spawn(move || {
                         let path_for_complete = path_for_thread.clone();
                         // Clip-FX bounce: warm walk from frame 0 so plugin tails /
-                        // sidechain state at the clip start are correct. No video
-                        // consumer, so no modulation sidecar.
+                        // sidechain state at the clip start are correct. Glue の
+                        // 焼き込みは insert を外した素材だけなので cold (= 範囲頭から)。
+                        // No video consumer, so no modulation sidecar.
+                        let span = if warm {
+                            export::RenderSpan::RangeWarm { start_beat, end_beat }
+                        } else {
+                            export::RenderSpan::RangeCold { start_beat, end_beat }
+                        };
                         let result = export::run_export(
                             path_for_thread,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            export::RenderSpan::RangeWarm { start_beat, end_beat },
+                            span,
                             false,
                             // Clip-range bounce has no progress overlay (it
                             // completes quickly and replaces the clip in place).

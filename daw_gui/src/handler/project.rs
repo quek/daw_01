@@ -102,9 +102,16 @@ impl AppData {
         self.ipc.ara_doc_cache.clear();
         self.ipc.ara_pcm_materialized.clear();
         self.ipc.gui_open_requests.clear();
-        // 進行中 bounce の完了通知を新 project に適用しない。
+        // 進行中 bounce / Glue の焼き込みの完了通知を新 project に適用しない
+        // (放置すると、前の曲の選択拍で新しい曲のクリップが削除され、前の曲の音を
+        // 指すクリップが置かれる = 開いた直後の曲が黙って壊れる)。
         self.ipc.pending_clip_fx_bounce = None;
         self.ipc.pending_vocal_synth_bounce = None;
+        if self.ipc.pending_glue_bake.is_some() {
+            self.abort_glue_bake(
+                "プロジェクトを切り替えたので Glue の焼き込みを中止しました".into(),
+            );
+        }
         // r.md #54: 前の曲のラウドネスレポート (数値も「範囲 x – y」の拍も) を
         // 新しい曲のものとして見せない。走査中なら engine ごと畳む。
         self.abort_loudness_analysis("プロジェクトを切り替えたのでラウドネス解析を中止しました".into());

@@ -107,13 +107,30 @@ daw.setSelection(
     { track_id: 1, clip_id: 2 },
   ]),
 );
+// audio の Glue は **焼き込み** (offline render) なので非同期。
+// 完了 (= 1 クリップに戻る) まで IPC を汲みながら待つ。
 daw.dispatchGlue();
 
-s = JSON.parse(daw.inspectSongJson());
+let waited = 0;
+while (waited < 30000) {
+  s = JSON.parse(daw.inspectSongJson());
+  if (s.tracks[0].clips.length === 1) {
+    break;
+  }
+  daw.sleepMs(200);
+  waited += 200;
+}
 expectEq(s.tracks[0].clips.length, 1, "after glue clips count");
 const merged = s.tracks[0].clips[0];
 expectEq(merged.start_beat, 0.0, "merged clip start");
 expectEq(merged.length_beats, 4.0, "merged clip length");
+
+// 焼き込みなので中身は **1 event ちょうど** (= 継ぎ目のフェードハンドルが残らない、
+// docs/plan_glue_bake.md)。 旧実装は元クリップの event を並べるだけで 2 つ残っていた。
+const mergedContent = s.clip_contents[String(merged.content_id)];
+expectEq(mergedContent.events.length, 1, "merged content event count");
+expectEq(mergedContent.events[0].event_start_in_clip_beats, 0.0, "baked event start");
+expectEq(mergedContent.events[0].event_length_beats, 4.0, "baked event length");
 
 // ---- 5. 異 kind 混在 Glue が reject されることを確認 (補足) ------------
 // ここでは省略 (= MIDI clip 構築が必要、 今後 PR で追加)。

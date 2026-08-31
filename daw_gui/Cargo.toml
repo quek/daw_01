@@ -105,6 +105,10 @@ name = "split_glue_smoke"
 required-features = ["script"]
 
 [[test]]
+name = "glue_bake_parity"
+required-features = ["script"]
+
+[[test]]
 name = "split_glue_video_smoke"
 required-features = ["script"]
 

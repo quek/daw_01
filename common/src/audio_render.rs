@@ -39,6 +39,22 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
     fade_curve_at((t as f32) / (fade_len as f32), curve)
 }
 
+/// トラック / バスの **pan 則 (equal-power)** — `pan` (`-1.0`..=`1.0`) に対する
+/// `(左ゲイン, 右ゲイン)`。中央 (`0.0`) は両チャンネル `cos(π/4) ≈ 0.707` (= -3dB)。
+///
+/// **これが pan 則の SSoT**。掛ける側 (`daw_audio::mixer::apply_strip`) と、
+/// **打ち消したい側** (pre-FX の焼き込み = `AppData::isolated_track_song`。 strip を
+/// 通った音を焼くと、再生時にもう一度掛かって二重になる) が同じ式を見る必要がある
+/// — 式を 2 か所に書くと、pan 則を変えた日に焼き込みだけ静かに 3dB ずれる。
+///
+/// RT path (per-sample) から呼ばれるので確保・分岐なし。
+#[inline]
+#[must_use]
+pub fn pan_gains(pan: f32) -> (f32, f32) {
+    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (angle.cos(), angle.sin())
+}
+
 /// Fade カーブそのもの: 正規化した進度 `progress` (0 = fade 開始 = 無音、
 /// 1 = fade 終了 = フル) を 0..=1 のゲインへ写す。 **fade の形を決める唯一の式**。
 ///

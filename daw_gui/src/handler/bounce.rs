@@ -9,6 +9,17 @@ use common::model::{AudioEvent, Song};
 use common::protocol::{AudioCommand, PluginCommand};
 use crate::import_audio;
 
+/// そのオートメーションレーンがトラックのフェーダー / pan を動かすものか
+/// (= pre-FX render で外す対象)。
+fn is_fader_lane(target: &common::model::AutomationTarget) -> bool {
+    matches!(
+        target,
+        common::model::AutomationTarget::TrackBuiltin(
+            common::model::TrackBuiltinParam::Volume | common::model::TrackBuiltinParam::Pan
+        )
+    )
+}
+
 impl AppData {
     pub(crate) fn set_clip_positions(&mut self, entries: &[(ClipKey, u32, f64)]) {
         // track 跨ぎ move: source track と to_track が異なれば clip を remove +
@@ -90,65 +101,83 @@ impl AppData {
         self.select_new_clips(&keys);
     }
 
-    /// Bounce In Place (Pre-FX、 `docs/plan_audio_clip.md` §3.8 / §13 Q8)。
-    /// `target` clip 内の全 events を engine sample_rate で stereo mix
-    /// して WAV 32-bit float ファイルに書き出し、 新 `AudioSource` を
-    /// 採番して `Song.audio_sources` に insert、 `audio_source_cache` に
-    /// 登録、 `ClipContent::Audio { events: [単一新 event] }` で置換、
-    /// audio engine に `SetGeneratedAudio` で配信する。 同 `ContentId` を
-    /// 共有していた linked clip も新 content で同期される (= `clip_contents`
-    /// は `ContentId` 単位の pool)。
+    /// offline render 用に「そのトラックだけ」を残した Song を組む
+    /// (bounce = `docs/plan_audio_clip.md` §3.8 / Glue の焼き込み =
+    /// `docs/plan_glue_bake.md`)。
     ///
-    /// 出力先: project_dir があれば `<project_dir>/bounce/<name>_<ts>.wav`、
-    /// 未保存 project は `%LOCALAPPDATA%/daw_01/bounce_cache/<filename>.wav`
-    /// (= `import_cache` と同じ fallback、 save 時に
-    /// `migrate_unsaved_bounce_sources_into` が `<project_dir>/bounce/` へ
-    /// 移動 + path を ProjectRelative 化する)。
+    /// 他トラック・`master_fx_chain`・master 音量・group/send/sidechain 参照を全て落とすので、
+    /// engine の offline render はそのトラック単独の音だけを焼く (= isolate、 他トラックが
+    /// 混ざらない)。元トラックの mute / solo も解除する (= with-FX bounce で mute 済みでも
+    /// isolate render は鳴らす)。
     ///
-    /// Pre-FX なので plugin chain (instrument / fx_chain) は通さない。
-    /// source の events を fade / gain / pan / pitch_ratio で mix した
-    /// snapshot のみ。 plugin 効果込みの bounce は spec §3.8 "Bounce"
-    /// (= 新 Clip + 新 track) で別 PR。
-    /// bounce 用に「対象クリップの 1 トラックだけ」を残した Song を組む。
-    /// 他トラック・`master_fx_chain`・group/send/sidechain 参照を全て落とすので、engine の
-    /// offline render はそのトラック単独の音だけを焼く (= clip isolate、 他トラックが
-    /// 混ざらない)。`bypass_inserts == true` (Bounce In Place) のとき、残すトラックの
-    /// insert FX device (= `ports.has_audio_input`) を `PortConfig::default()` で中和して
-    /// 「音源/synth の素の音」だけにする。**device は削除しない**: engine は plugin を
-    /// 安定 `device_id` で解決するので、device を消すと host 側 instance との対応が
-    /// 切れる。並びを保ったまま ports を空にして dispatch を無害化する。元トラックの mute も解除する
-    /// (= 元トラックが with-FX bounce で mute 済みでも isolate render は鳴らす)。
-    pub(crate) fn isolated_bounce_song(&self, target: ClipKey, bypass_inserts: bool) -> Option<Song> {
-        let track = self.song_doc.song().track_by_id(target.track_id)?;
+    /// **ランチャーの主導権は必ずアレンジへ戻す**: 行が [`RowPlayback::Launcher`] /
+    /// `LauncherStopped` のままだと、offline 走査は「今のセッションの状態」を再現する
+    /// (= セルの音が鳴り、アレンジのクリップは鳴らない) ので、焼く対象が丸ごと入れ替わる。
+    ///
+    /// `pre_fx == true` (Bounce In Place / Glue) は「素材の素の音」だけを焼く:
+    /// - insert FX device (= `ports.has_audio_input`) を `PortConfig::default()` で中和。
+    ///   **device は削除しない** — engine は plugin を安定 `device_id` で解決するので、
+    ///   消すと host 側 instance との対応が切れる。並びを保ったまま ports を空にして
+    ///   dispatch を無害化する。
+    /// - **フェーダー / pan とそのオートメーションを外す**。焼き込むと、再生時に同じ
+    ///   フェーダーが**もう一度**掛かって二重に効く (master 音量を外すのと同じ理由)。
+    ///
+    /// `pre_fx == false` (Bounce with FX) は結果を**別トラック**に置いて元をミュートする
+    /// ので、フェーダーまで焼かないと音が変わる。ここでは外さない。
+    pub(crate) fn isolated_track_song(&self, track_id: u32, pre_fx: bool) -> Option<Song> {
+        let track = self.song_doc.song().track_by_id(track_id)?;
         let mut isolated = self.song_doc.song().clone();
         isolated.master_fx_chain.clear();
-        // master fx と同じ理由でマスター音量も外す。焼き込むと、再生時に
-        // マスターフェーダーが**もう一度**掛かって二重に効く。
-        // (master_gain が Song に入る前は engine の atomic 経由で漏れていた。)
         isolated.master_gain = 1.0;
         let mut kept = track.clone();
         kept.parent_group_id = None;
         kept.sends.clear();
         kept.muted = false;
         kept.solo = false;
+        kept.launcher = common::model::RowPlayback::Arranger;
+        for lane in &mut kept.automation_lanes {
+            lane.launcher = common::model::RowPlayback::Arranger;
+        }
         for d in &mut kept.devices {
             d.aux_inputs.clear();
-            if bypass_inserts && d.ports.has_audio_input {
+            if pre_fx && d.ports.has_audio_input {
                 d.ports = common::port_config::PortConfig::default();
             }
+        }
+        if pre_fx {
+            // pan は中央、音量は **strip を打ち消す値**。 equal-power の pan 則は
+            // 中央でも -3dB 掛かる (`common::audio_render::pan_gains`) ので、
+            // `volume = 1.0` にすると -3dB 焼き込まれた音を再生時にもう一度
+            // strip に通すことになり、結合 / bounce のたびに 3dB 下がる。
+            kept.pan = 0.0;
+            let (center, _) = common::audio_render::pan_gains(0.0);
+            kept.volume = if center > 0.0 { 1.0 / center } else { 1.0 };
+            kept.automation_lanes.retain(|l| !is_fader_lane(&l.target));
+            // **変調も同じ理由で外す。** engine の `fill_builtin` は lane が無くても
+            // `mod_routings` があれば per-sample に変調を掛けるので、lane だけ落として
+            // 変調を残すと、フェーダーに刺した LFO が焼き込みと再生で二重に掛かる
+            // (トレモロの深さが二乗になる / pan が二重に振れる)。
+            kept.mod_routings.retain(|r| !is_fader_lane(&r.target));
         }
         isolated.tracks = vec![kept];
         Some(isolated)
     }
 
-    /// bounce 出力 WAV の path と `AudioSourcePath` を決める。保存済み
-    /// project は `<dir>/bounce/<name>[_fx]_<ts>.wav`、未保存は bounce_cache (save 時に
+    /// render 出力 WAV の path と `AudioSourcePath` を決める。保存済み
+    /// project は `<dir>/bounce/<name><infix>_<ts>.wav`、未保存は bounce_cache (save 時に
     /// `migrate_unsaved_bounce_sources_into` が project へ移動 + ProjectRelative 化)。
-    /// With FX は suffix `_fx` で In Place と区別する。失敗時は status_message を立てて `None`。
+    /// `infix` は種別の区別 (In Place = `""` / With FX = `"_fx"` / Glue = `"_glue"`)。
+    /// 失敗時は status_message を立てて `None`。
+    ///
+    /// **名前は必ず未使用のものを返す。** 一意化が「サニタイズ済みクリップ名 + ミリ秒」
+    /// だけだった頃は、Glue が同名トラックを **同じミリ秒内に**連続採番するので
+    /// 2 トラックが同じ WAV を掴み、後の render が前の render を上書きして
+    /// 「別トラックの音が鳴る」形で無言に壊れた (同名 clip / 無名 clip / 非 ASCII 名は
+    /// サニタイズで潰れて同名になるので、通常操作で普通に踏む)。
     pub(crate) fn bounce_output_path(
         &mut self,
         clip_name: &str,
-        mode: BounceMode,
+        infix: &str,
     ) -> Option<(PathBuf, common::model::AudioSourcePath)> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -159,15 +188,36 @@ impl AppData {
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
         let safe_name = if safe_name.is_empty() { "bounce".into() } else { safe_name };
-        let infix = match mode {
-            BounceMode::InPlace => "",
-            BounceMode::WithFx => "_fx",
-        };
-        let filename = format!("{safe_name}{infix}_{ts:08}.wav");
         let project_dir = self
             .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        // **空ファイルを作って名前を予約する。** `exists()` を見るだけでは足りない —
+        // Glue は render を 1 本も走らせる前に全 job の path を採番するので、
+        // まだ誰もファイルを書いていない時点で同じ名前を 2 回返してしまう。
+        // `create_new` は「無いときだけ作る」ので、同一ミリ秒でも他プロセスとでも衝突しない
+        // (render の `WavWriter::create` がこの空ファイルを上書きする)。
+        let unique_in = |dir: &std::path::Path| -> String {
+            let mut n = 0u32;
+            loop {
+                let filename = if n == 0 {
+                    format!("{safe_name}{infix}_{ts:08}.wav")
+                } else {
+                    format!("{safe_name}{infix}_{ts:08}_{n}.wav")
+                };
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dir.join(&filename))
+                {
+                    Ok(_) => return filename,
+                    // 予約できない (権限等) なら名前だけ返す — render 側が同じ理由で
+                    // 失敗して status に出る。無限ループにはしない。
+                    Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return filename,
+                    Err(_) => n += 1,
+                }
+            }
+        };
         match project_dir.as_deref() {
             Some(dir) => {
                 let bounce_dir = dir.join("bounce");
@@ -175,6 +225,7 @@ impl AppData {
                     self.ui_ephemeral.status_message = format!("Bounce: bounce/ 作成失敗: {e}");
                     return None;
                 }
+                let filename = unique_in(&bounce_dir);
                 Some((
                     bounce_dir.join(&filename),
                     common::model::AudioSourcePath::ProjectRelative(
@@ -188,9 +239,51 @@ impl AppData {
                     self.ui_ephemeral.status_message = format!("Bounce: bounce_cache/ 作成失敗: {e}");
                     return None;
                 }
-                let dst = cache.join(&filename);
+                let dst = cache.join(unique_in(&cache));
                 Some((dst.clone(), common::model::AudioSourcePath::Absolute(dst)))
             }
+        }
+    }
+
+    /// 焼いた WAV を指す **単一 audio event** を組む (bounce / `J` Glue 共通の SSoT)。
+    ///
+    /// - `window` = 焼いた song 絶対拍の範囲 `[start, end)`。
+    /// - `event_start_in_clip_beats` = content 内でこの event を置く位置 (窓の起点)。
+    /// - `file_frames` = 実際に書かれた WAV の長さ。
+    ///
+    /// **`source_end_frames` は「書き出し窓ちょうど」に切る。** render は減衰 tail の
+    /// ぶん窓より長く書く (`RenderWindow::resolve` の `TAIL_MAX_SECONDS`、無音でも
+    /// 最低 0.5 秒) ので、ファイル長をそのまま載せると伸縮比
+    /// (= source 秒 / event 秒、`stretch_ratio_for`) が 1.0 を超え、**置換後のクリップが
+    /// 速く鳴る** (120BPM の 4 拍で実測 +25%)。拍→サンプル換算は engine が窓を
+    /// 決めたのと同じ SSoT (`beats_to_samples` = tempo automation の積分) を通す。
+    ///
+    /// **`stretch_mode` は `Raw`。** 焼いた音は「そのときの tempo で描いた実時間の
+    /// 波形」なので、拍に対して線形に読み直す `Stretch` を通すと、テンポカーブのある曲で
+    /// 中身が内部でずれる (両端だけ合って中盤が数百 ms 動く)。定テンポでも `Stretch` は
+    /// 位相ボコーダを必ず通るのでトランジェントがにじむ。テンポ追従させたければ
+    /// 焼いたあとに inspector で切り替えられる (`AudioSource.original_bpm` は入れてある)。
+    pub(crate) fn baked_audio_event(
+        &self,
+        source_id: common::model::AudioSourceId,
+        window: (f64, f64),
+        event_start_in_clip_beats: f64,
+        file_frames: u64,
+    ) -> AudioEvent {
+        let sr = self.ipc.sample_rate;
+        let song = self.song_doc.song();
+        let window_frames = common::automation::beats_to_samples(song, sr, window.1)
+            .saturating_sub(common::automation::beats_to_samples(song, sr, window.0));
+        AudioEvent {
+            // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
+            id: 1,
+            source_id,
+            event_start_in_clip_beats,
+            event_length_beats: window.1 - window.0,
+            source_start_frames: 0,
+            source_end_frames: window_frames.min(file_frames).max(1),
+            stretch_mode: common::model::StretchMode::Raw,
+            ..AudioEvent::default()
         }
     }
 
@@ -202,7 +295,8 @@ impl AppData {
     /// 「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
     pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
-        if self.ipc.pending_clip_fx_bounce.is_some() {
+        // Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
+        if self.ipc.pending_clip_fx_bounce.is_some() || self.ipc.pending_glue_bake.is_some() {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
@@ -232,10 +326,15 @@ impl AppData {
             self.ui_ephemeral.status_message = "Bounce: clip 長が 0 です".into();
             return;
         }
-        let Some((out_path, source_path)) = self.bounce_output_path(&clip_name, mode) else {
+        let infix = match mode {
+            BounceMode::InPlace => "",
+            BounceMode::WithFx => "_fx",
+        };
+        let Some((out_path, source_path)) = self.bounce_output_path(&clip_name, infix) else {
             return;
         };
-        let Some(isolated) = self.isolated_bounce_song(target, mode == BounceMode::InPlace) else {
+        let Some(isolated) = self.isolated_track_song(target.track_id, mode == BounceMode::InPlace)
+        else {
             return;
         };
         self.ipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
@@ -270,6 +369,9 @@ impl AppData {
             source_clip: target.clip_id,
             start_beat,
             end_beat,
+            // clip bounce は plugin 状態 (tail / ramp / sidechain) を積み上げてから
+            // 範囲に入る必要があるので曲頭から走る。
+            warm: true,
         });
         let label = match mode {
             BounceMode::InPlace => "Bounce In Place",
@@ -305,7 +407,10 @@ impl AppData {
     /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
     /// または plugin_id 未確定なら即 `start_clip_bounce`。
     pub(crate) fn request_bounce(&mut self, target: ClipKey, mode: BounceMode) {
-        if self.ipc.pending_clip_fx_bounce.is_some() || self.ipc.pending_vocal_synth_bounce.is_some() {
+        if self.ipc.pending_clip_fx_bounce.is_some()
+            || self.ipc.pending_vocal_synth_bounce.is_some()
+            || self.ipc.pending_glue_bake.is_some()
+        {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
@@ -468,18 +573,14 @@ impl AppData {
         }
 
         // 新 Clip / 置換に使う共通 audio event (single-event = bounce 結果は flat な audio)。
-        // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
-        let new_event = AudioEvent {
-            id: 1,
-            source_id: new_source_id,
-            // r.md #44: 元 clip の窓の起点に置く (In Place 置換で窓と一致させる)。
-            // With FX の新 clip は窓 offset をそのまま引き継ぐ。
-            event_start_in_clip_beats: pending.content_offset_beats,
-            event_length_beats: pending.clip_length_beats,
-            source_start_frames: 0,
-            source_end_frames: frames,
-            ..AudioEvent::default()
-        };
+        // r.md #44: 元 clip の窓の起点に置く (In Place 置換で窓と一致させる)。
+        // With FX の新 clip は窓 offset をそのまま引き継ぐ。
+        let new_event = self.baked_audio_event(
+            new_source_id,
+            (pending.start_beat, pending.start_beat + pending.clip_length_beats),
+            pending.content_offset_beats,
+            frames,
+        );
 
         match pending.mode {
             BounceMode::WithFx => {

@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::{
     LoadedDeviceInfo, PendingClipFxBounce, PendingStateRequest, PendingVocalSynthBounce,
 };
+use crate::handler::glue::PendingGlueBake;
 use crate::dispatcher::BackgroundDispatcher;
 
 /// `(device_id, param_id)` の複合キー。 生タプルにしないのは、 positional
@@ -126,6 +127,11 @@ pub struct IpcState {
     /// 配置。 path / source_track / source_clip は IPC echo back と
     /// pending entry を identifier 照合するために保持。
     pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
+    /// `J` (Glue) の焼き込みが進行中なら `Some` (`docs/plan_glue_bake.md`)。
+    /// clip bounce と同じ offline render を共有するので**同時には走らせない**
+    /// (どちらかが `Some` の間は新規を受け付けない)。トラックを 1 本ずつ焼き、
+    /// 最後の `BounceClipFxComplete` で song へ適用してから `None` に戻す。
+    pub pending_glue_bake: Option<PendingGlueBake>,
     /// 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
     /// `VocalSynthReady` を待つ間 stable id を退避し、 ready 受信で現在位置へ
     /// 解決して `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。

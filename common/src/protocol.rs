@@ -281,17 +281,25 @@ pub enum AudioCommand {
     /// Abort the in-flight offline render (= `ExportWav` / `AnalyzeLoudness`).
     /// No-op when no offline render is running.
     CancelExport,
-    /// Offline-render a clip range with the **full plugin chain** (= post-FX)
-    /// to a WAV file (`Bounce (with FX)`, `docs/plan_audio_clip.md` §3.8).
-    /// Walks the song from frame 0 so plugin state at `start_frame` is fully
-    /// accumulated. Replies with `AudioEvent::BounceClipFxComplete`.
+    /// Offline-render a range of the **currently loaded song** to a WAV file
+    /// (`Bounce`, `docs/plan_audio_clip.md` §3.8 / `J` Glue の焼き込み、
+    /// `docs/plan_glue_bake.md`)。 送り手が先に `LoadSong` で対象トラックだけを
+    /// 残した song を積むので、ここでは「今の song の `[start_beat, end_beat)` を
+    /// 焼く」以上の意味は持たない。 Replies with `AudioEvent::BounceClipFxComplete`。
     /// 範囲は拍 (`ExportWav` と同じく換算は engine 側 SSoT)。
+    ///
+    /// `warm` = 曲頭から走査するか。 plugin chain を通す bounce は tail /
+    /// sidechain / パラメータランプが `start_beat` 時点で積み上がっている必要が
+    /// あるので `true`。 insert を外して素材だけを焼く Glue は「その位置で再生を
+    /// 押した音」が欲しいので `false` (= 範囲頭から cold で走る。 曲頭からの空走査を
+    /// トラック数ぶん繰り返さない)。
     BounceClipFxOnline {
         path: std::path::PathBuf,
         source_track: u32,
         source_clip: u32,
         start_beat: f64,
         end_beat: f64,
+        warm: bool,
     },
     /// Reposition the audio engine's playhead. `samples` is the absolute
     /// frame offset at the engine sample rate. Takes effect on the next

@@ -169,13 +169,32 @@ impl AppData {
         self.song_doc.set_export_lock(self.offline_render_busy());
     }
 
-    /// オフライン走査 (WAV / video 書き出し・範囲ラウドネス解析) のいずれかが
-    /// 進行中か。engine は `export_running` でこれらを排他しているので、GUI 側も
-    /// 「編集を止める / 再生を止める / 背景を遮断する」判断を 1 つの述語に集約する。
+    /// **書き出し / 解析**が進行中か (WAV / video 書き出し・範囲ラウドネス解析)。
+    ///
+    /// [`Self::offline_render_busy`] との違いは clip bounce / Glue の焼き込みを
+    /// 含まないこと。「走行中の plugin instance を再構成する round-trip を捨てる」
+    /// 判断 (`app.rs` の block-list) はこちらを見る — bounce / 焼き込みは
+    /// **自分の完了通知でその round-trip を行う**ので、広い述語で捨てると
+    /// 自分の完了を握り潰して永久に終わらなくなる。
     #[must_use]
-    pub fn offline_render_busy(&self) -> bool {
+    pub fn export_or_analysis_busy(&self) -> bool {
         self.transport.pending_video_export.is_some()
             || self.transport.export_stage.is_some()
             || self.loudness.phase.is_busy()
+    }
+
+    /// engine の offline render (`export_running`) を占有する処理が進行中か。
+    /// 書き出し / 解析に加えて **clip bounce と `J` (Glue) の焼き込み**を含む。
+    ///
+    /// engine は offline render を 1 本しか走らせられず、しかも bounce / 焼き込みは
+    /// 「対象トラックだけを残した song」を `LoadSong` してから焼く。走行中に GUI が
+    /// 編集すると frame flush が `LoadSong(full song)` を送って **render 中の song を
+    /// 差し替える**ので、焼く対象が途中から変わる。よって「編集を止める / 再生を
+    /// 止める / 別の走査を始めさせない」判断はこの 1 つの述語に集約する。
+    #[must_use]
+    pub fn offline_render_busy(&self) -> bool {
+        self.export_or_analysis_busy()
+            || self.ipc.pending_clip_fx_bounce.is_some()
+            || self.ipc.pending_glue_bake.is_some()
     }
 }

@@ -172,7 +172,7 @@ import するファイルは **`<project_dir>/samples/<basename>_<hash8>.<ext>`*
 | kind | 結合 ClipContent の構築 |
 |---|---|
 | MIDI / Vocal | 全 Clip の notes を時間軸で順次連結、 `start_beat` を各 Clip の元 `start_beat` 起点で再計算。 lyric は note ごとに保持 |
-| Audio | 全 Clip の events を時間軸で順次連結、 `event_start_in_clip_beats` を再計算 |
+| Audio | **焼き込み** — 選択範囲を 1 本の WAV へ offline render して 1 clip / 1 event に置換。正本は [plan_glue_bake.md](plan_glue_bake.md) |
 
 連続していない (= 隙間がある) Clip 群を Glue した場合、 隙間は **無音 / 空 ClipContent
 範囲** として扱う (= MIDI なら notes 無し、 audio なら event 無し)。 結果 Clip の長さは

@@ -43,6 +43,13 @@ pub enum EditScope {
     Gesture(u64),
 }
 
+/// [`SongDoc::enter_own_gesture`] が退避した bracket 状態。
+#[derive(Debug, Clone, Copy)]
+pub struct GestureSave {
+    gesture: Option<u64>,
+    scope: EditScope,
+}
+
 /// Begin/End bracket を持たない連続編集源の識別子
 /// ([`SongDoc::stream_scope`] のキー)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -463,6 +470,28 @@ impl SongDoc {
     /// interaction gesture (Begin/End bracket) が進行中か。
     pub fn gesture_active(&self) -> bool {
         self.active_gesture.is_some()
+    }
+
+    /// **進行中の Begin/End bracket を壊さずに**、以後の編集を 1 undo step へ束ねる。
+    /// 戻り値を [`Self::leave_own_gesture`] へ渡して必ず閉じること。
+    ///
+    /// `begin_gesture` / `end_gesture` を直に使うと、**非同期の完了ハンドラ**
+    /// (Glue の焼き込み適用など、ユーザー操作と無関係な時点で走るもの) が
+    /// ユーザーのドラッグ中の bracket を横取りして閉じてしまい、以降のドラッグが
+    /// 1 フレーム 1 undo step に割れる。ここは前の状態を退避して必ず戻す。
+    #[must_use]
+    pub fn enter_own_gesture(&mut self) -> GestureSave {
+        let save = GestureSave { gesture: self.active_gesture, scope: self.event_scope };
+        let id = self.alloc_gesture();
+        self.active_gesture = Some(id);
+        self.event_scope = EditScope::Gesture(id);
+        save
+    }
+
+    /// [`Self::enter_own_gesture`] の対。退避しておいた bracket を戻す。
+    pub fn leave_own_gesture(&mut self, save: GestureSave) {
+        self.active_gesture = save.gesture;
+        self.event_scope = save.scope;
     }
 
     /// Begin/End bracket を持たない連続編集源 (MIDI CC / BPM scrub /

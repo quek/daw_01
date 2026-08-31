@@ -101,7 +101,7 @@ FILE-BUDGET | daw_gui/src/view/track_inspector/mod.rs  | 2214 | 巨大 draw / ma
 FILE-BUDGET | daw_gui/src/app.rs                       | 1993 | 巨大 draw / match。未起票
 FILE-BUDGET | daw_gui/src/view/runner.rs               | 1618 | #71 で drag payload の frame ライフサイクル配線 +3。分割は runner の責務分けごと別タスク。未起票
 FILE-BUDGET | daw_gui/src/handler/automation.rs        | 1410 | 巨大 draw / match。未起票
-FILE-BUDGET | daw_gui/src/script.rs                    | 1227 | #71 で script API `relocateDevices` +10。binding は 1 か所に並べる規約なので割らない。未起票
+FILE-BUDGET | daw_gui/src/script.rs                    | 1248 | Glue の焼き込み検証で `setTimeSelection` (選択の SSoT = 範囲 × レーンを headless で張る口) +21。binding は 1 か所に並べる規約なので割らない。未起票
 FILE-BUDGET | daw_gui/src/handler/project.rs           | 1188 | 巨大 draw / match。未起票
 FILE-BUDGET | daw_gui/src/handler/selection_view.rs    | 1237 | 範囲選択 (`docs/plan_range_selection.md`) で automation 選択の剪定 + automation クリップ→範囲の変換 +15。面の SSoT (`set_time_selection` 1 本) と離せない。分割はユーザー判断で保留
 FILE-BUDGET | daw_gui/src/handler/automation_lanes.rs  | 1170 | 巨大 draw / match。未起票
@@ -242,7 +242,6 @@ FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result |
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi                     | 9/42 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::inspector_plugin_params     | 9/31 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/glue.rs::AppData::action_glue_selected_clips              | 8/79 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/tick.rs::AppData::ensure_recording_lane_clip              | 8/64 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_video[cfg(windows)]      | 8/34 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
@@ -361,7 +360,6 @@ FN-NESTING | ui/crates/ui/src/widgets/goniometer.rs::Ui::goniometer             
 # --- 時間範囲選択 (docs/plan_range_selection.md) で増えた分 ---------------------
 # ユーザー判断で「ソース規模による分割は行わない」。 機能が landing した後の整理課題として残す。
 FILE-BUDGET | daw_gui/src/view/arrangement_view.rs | 1005 | 範囲選択のツールバー追加で +30。分割は後回し (ユーザー判断)
-FN-BUDGET | daw_gui/src/handler/glue.rs::AppData::action_glue_selected_clips | 316 | 範囲駆動化 + Text 対応で増加。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::action_join_selected_notes | 7/28 | Join Notes (ピアノロールの j)。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/range_ops.rs::AppData::apply_delete_time_selection | 7/11 | 範囲削除のレーン別分岐。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/range_ops.rs::AppData::apply_mute_time_selection | 7/4 | 同上

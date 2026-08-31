@@ -193,6 +193,15 @@ impl AppData {
     /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
     pub(crate) fn abort_inflight_renders_on_disconnect(&mut self) -> bool {
         let mut aborted = false;
+        // `J` (Glue) の焼き込みも同じ offline render を使う。 自前の後始末
+        // (出力ファイルの削除 + bookend + engine song 復元) を持っているので、
+        // pending を落とすだけでなくそちらへ委ねる。
+        if self.ipc.pending_glue_bake.is_some() {
+            self.abort_glue_bake(
+                "音声エンジンが切断されたため Glue の焼き込みを中止しました".into(),
+            );
+            aborted = true;
+        }
         if self.ipc.pending_clip_fx_bounce.take().is_some()
             || self.ipc.pending_vocal_synth_bounce.take().is_some()
         {

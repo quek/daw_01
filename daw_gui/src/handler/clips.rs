@@ -658,9 +658,11 @@ impl AppData {
     /// **content は切り口だけを切り、窓を 2 つに割る** (`docs/plan_range_selection.md` §10)。
     /// `playhead` を跨ぐ note / event は [`Song::split_content_at`] が 2 つに割る
     /// (共有されていれば CoW で fork するので linked clip は無傷)。 両断片は
-    /// **同じ content を別の窓で見る**ので、窓の外に隠れていた素材は失われず、
-    /// 分割してから結合し直せば元に戻る。 旧実装は両半を新 content へ fork し、
-    /// content 側の位置を左シフトしていたため、共有関係が毎回壊れていた。
+    /// **同じ content を別の窓で見る**ので、窓の外に隠れていた素材は失われない
+    /// (旧実装は両半を新 content へ fork し、content 側の位置を左シフトしていたため、
+    /// 共有関係が毎回壊れていた)。 なお audio を `J` で結合し直すと、中身は
+    /// **焼き込み結果の 1 event** になる (聞こえる音は同じ、
+    /// `docs/plan_glue_bake.md`)。
     ///
     /// 後半の新クリップは `new_selection` に積まれる。
     pub(crate) fn split_clip_at_beat(
