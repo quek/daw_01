@@ -820,15 +820,15 @@ fn draw_recording_controls(
     x + learn_w + 12.0
 }
 
-/// r.md #87 クリップランチャー (計画書 §3.5): **グローバルローンチ量子化**の
-/// dropdown と「アレンジに戻す (全行)」ボタン。
+/// r.md #87 クリップランチャー (計画書 §3.5): **グローバルローンチ量子化**の dropdown。
 ///
-/// - 量子化はセルの [`LaunchQuantize::Global`] が従う実効値。既定は 1 小節。
-///   選択肢は `LAUNCH_QUANTIZE_CHOICES` が SSoT で、そこから `Global`
-///   (= 「自分自身に従う」という無意味な値) だけを除いて出す。
-/// - 「アレンジに戻す」は **ランチャーが主導権を持つ行が 1 つでもあれば点灯**。
-///   押すと全行を [`RowPlayback::Arranger`](common::model::RowPlayback::Arranger)
-///   に戻す (Bitwig の Switch Playback to Arranger のグローバル版)。
+/// 量子化はセルの [`LaunchQuantize::Global`] が従う実効値。既定は 1 小節。
+/// 選択肢は `LAUNCH_QUANTIZE_CHOICES` が SSoT で、そこから `Global`
+/// (= 「自分自身に従う」という無意味な値) だけを除いて出す。
+///
+/// **「アレンジに戻す (全行)」はここには置かない。** ランチャー帯の「返す列」上端が
+/// 唯一の口で、各行の返すボタンの真上にあるぶん「この列を全部」が視線どおりに読める
+/// (バー上の同義ボタンは行側と重複していた)。
 fn draw_launcher_controls(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -865,28 +865,7 @@ fn draw_launcher_controls(
             app.handle_event(AppEvent::Launcher(LauncherEvent::SetGlobalQuantize(q)));
         }));
     }
-    x += q_w + 6.0;
-
-    // 記号だけの 36px ボタン (Play / Loop / Follow / メトロノームと同じ寸法)。
-    // `⇥` はランチャー帯の「返す列」と **同じ字**を使う — 格子の中とバーの上で
-    // 同じ記号が同じ意味 (Switch Playback to Arranger) になるので、
-    // 文字を足さなくても対応が読める。バーの左詰め列はもともと 1280px 幅で
-    // ほぼ埋まっているので、ここを 4 文字ぶん広げると右端の Panic に食い込む。
-    let back_w = 36.0;
-    let active = app.launcher_has_active_row();
-    ui.toggle_button_at(
-        "transport_launcher_to_arranger",
-        "\u{21E5}",
-        Rect { x, y: cy, w: back_w, h: bh },
-        active,
-        &style_rec_mode(&app.theme),
-        |_| {
-            Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::Launcher(LauncherEvent::AllToArranger));
-            })
-        },
-    );
-    x + back_w + 12.0
+    x + q_w + 12.0
 }
 
 #[cfg(test)]

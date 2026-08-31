@@ -359,18 +359,6 @@ impl AppData {
         })
     }
 
-    /// ランチャーが主導権を握っている行が 1 つでもあるか
-    /// (トランスポートの「アレンジに戻す (全行)」 の点灯条件)。
-    #[must_use]
-    pub fn launcher_has_active_row(&self) -> bool {
-        let song = self.song_doc.song();
-        song.song_lanes.iter().any(|l| l.launcher.is_launcher())
-            || song.tracks.iter().any(|t| {
-                t.launcher.is_launcher()
-                    || t.automation_lanes.iter().any(|l| l.launcher.is_launcher())
-            })
-    }
-
     /// セルを撃つ / 離す。
     ///
     /// `Song` に書くのは **「ユーザーが最後に撃った状態」** だけ。押下の解釈は

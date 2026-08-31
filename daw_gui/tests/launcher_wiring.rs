@@ -89,11 +89,9 @@ fn セルを撃つと行の主導権がランチャーへ移り全行戻すで�
         RowPlayback::Arranger,
         "撃っていない行はアレンジ主導のまま (主導権は行単位)"
     );
-    assert!(app.launcher_has_active_row(), "「アレンジに戻す」ボタンが点灯する条件");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::AllToArranger));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Arranger);
-    assert!(!app.launcher_has_active_row(), "全行戻したら点灯しない");
 }
 
 /// シーンを撃つと **全行がランチャーへ移る**。その列にセルがある行は鳴り、
