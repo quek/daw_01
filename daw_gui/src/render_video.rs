@@ -370,6 +370,21 @@ pub fn render_mp4_cancellable(
         .and_then(|p| common::mod_sidecar::ModEnvSidecar::read(&p).ok())
         .unwrap_or_default();
     let mut mod_scalars_buf: Vec<f32> = Vec::new();
+    // r.md #87 §3.6: 音声書き出しが焼いた **行ごとの走行状態の遷移列** を読む。
+    // フォローアクションでどこの列へ移ったかを決めているのは daw_audio の
+    // `LauncherRuntime` で、GUI 側に同じ式は無い。これを差さないと
+    // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
+    // 無い / 読めない (単体 WAV 書き出し・クリップ bounce は `.launcher` を
+    // 書かない) → 空 = 走行状態なしで、下の `RowTimeline` が `Song.launcher`
+    // (= 範囲の先頭で一斉に撃った状態) へ倒れる = 従来と同じ絵。
+    let launcher_sidecar = cfg
+        .audio_wav_path
+        .map(common::launcher_sidecar::LauncherSidecar::sidecar_path)
+        .and_then(|p| common::launcher_sidecar::LauncherSidecar::read(&p).ok())
+        .unwrap_or_default();
+    // フレームごとに使い回す 2 本 (sidecar の行状態 → `RowTimeline` の入力形)。
+    let mut launcher_states_buf: Vec<common::launcher_sidecar::LauncherRowState> = Vec::new();
+    let mut launcher_rows_buf: Vec<crate::launcher_time::RunningRow> = Vec::new();
     // トラック映像効果の GPU 実行基盤 (preview と同一の VideoFxEngine)。
     // pipeline cache + ping-pong pool を frame 跨ぎ保持。export 終了で offscreen
     // と共に drop (= pool target も解放)。
@@ -391,13 +406,16 @@ pub fn render_mp4_cancellable(
         // this frame's beat (step / sample-and-hold), same composition as live.
         mod_sidecar.sample_at(playhead_beat, &mut mod_scalars_buf);
         // r.md #87 (計画書 Q9 / §2.5): 書き出しは「範囲の先頭で今の `Track.launcher`
-        // を一斉に撃った」状態から始まる。走行位置を `Song` に保存しないので、同じ
-        // プロジェクトなら何度書き出しても同じ絵になる。
-        // **フォローアクションによる遷移はまだ絵に出ない** — 遷移を決めるのは
-        // daw_audio の走行状態で、GUI 側はそれを受け取る口
-        // (`RowTimeline::with_running`) を用意しただけ。現状は「範囲の先頭で撃った
-        // セルがループし続ける」絵になる (音は engine が正しく遷移する)。
-        let rows = RowTimeline::export(start_beat, playhead_beat);
+        // を一斉に撃った」状態から始まり、以降はフォローアクションが決定的に進む。
+        // その遷移列は sidecar が持っているので、このフレームの拍で差す
+        // (= 音と絵が同じ 1 本の走行を見る)。sidecar が空なら `running` も空で、
+        // `RowTimeline` は `origin_beat = start_beat` + `Song.launcher` へ倒れる。
+        launcher_sidecar.sample_at(playhead_beat, &mut launcher_states_buf);
+        launcher_rows_buf.clear();
+        launcher_rows_buf.extend(
+            launcher_states_buf.iter().copied().map(crate::launcher_time::RunningRow::from),
+        );
+        let rows = RowTimeline::with_running(start_beat, playhead_beat, &launcher_rows_buf);
         scene.primitives.clear();
         build_frame_scene(
             cfg.song,

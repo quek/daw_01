@@ -790,6 +790,55 @@ fn ensure_image_video_event_coverage_extend_only_across_linked_clips() {
 }
 
 #[test]
+fn ensure_overlay_event_coverage_counts_launcher_cells() {
+    // r.md #87: 画像トラックのクリップ (4 拍) をランチャーのセルへリンクコピーし、
+    // セルのループ長を 16 拍にした形。セルを数え落とすと event は 4 拍のまま =
+    // 撃った直後の 4 拍だけ画像が出て残り 12 拍は真っ暗になる (image_compose の
+    // `clip_local >= event_start + event_length` gate)。
+    let mut song = Song::default();
+    let cid = song.alloc_content_id();
+    song.clip_contents.insert(
+        cid,
+        ClipContent::Image(ImageContent {
+            events: vec![ImageEvent {
+                event_start_in_clip_beats: 0.0,
+                event_length_beats: 4.0,
+                ..ImageEvent::default()
+            }],
+        }),
+    );
+    let tid = song.alloc_track_id();
+    let mut track = Track { id: tid, ..Track::default() };
+    let clip_id = track.alloc_clip_id();
+    track.clips.push(Clip {
+        id: clip_id,
+        start_beat: 0.0,
+        length_beats: 4.0,
+        content_id: cid,
+        ..Clip::default()
+    });
+    let cell_id = track.alloc_clip_id();
+    track.session_clips.push(SessionClip {
+        scene_id: 1,
+        clip: Clip {
+            id: cell_id,
+            start_beat: 0.0,
+            length_beats: 16.0,
+            content_id: cid,
+            ..Clip::default()
+        },
+        launch: LaunchSettings::default(),
+    });
+    song.tracks.push(track);
+
+    song.ensure_overlay_event_coverage();
+    let ClipContent::Image(c) = &song.clip_contents[&cid] else {
+        panic!("expected image content");
+    };
+    assert_eq!(c.events[0].event_length_beats, 16.0, "セルの窓まで event を伸ばす");
+}
+
+#[test]
 fn ensure_overlay_event_coverage_extends_text_clip() {
     // (Text 版): クレジット text clip @0+48 だが event_length=4 →
     // bar2 (beat4) で event 範囲を抜けて消える。event を 48 まで extend する。

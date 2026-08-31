@@ -19,10 +19,10 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
     let Some(surface) = surface else {
         return;
     };
-    // r.md #87: 選択が **ランチャーのセル**ならセルとしてコピーする。 セルは
-    // アレンジのクリップと `ClipKey` / `AutomationClipKey` を共有するので面が
-    // 同じ (`Clips` / `AutomationClips`) になるが、貼り先の座標系が
-    // (トラック, 拍) ではなく (行, 列) なので payload を分ける。
+    // r.md #87: 選択が **ランチャーのセル** (`EditSurface::LauncherCells`) なら
+    // セルとしてコピーする。貼り先の座標系が (トラック, 拍) ではなく (行, 列) なので
+    // payload がアレンジのクリップと別 (`copy_launcher_cells_clip` は面タグを見るので
+    // 別の面を選んでいるときは `None` を返す)。
     if let Some((json, count)) = app.copy_launcher_cells_clip() {
         finish_copy(ui, json, count, "セル");
         return;
@@ -35,14 +35,23 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         // 範囲: 形のまま (前後の空白込みで) コピーする。
         EditSurface::TimeRange => app.copy_time_selection_clip().map(|(j, c)| (j, c, "範囲")),
-        EditSurface::LauncherCells => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
+        // セル面はこの関数の頭で捌き済 (`copy_launcher_cells_clip`)。ここへ来るのは
+        // 「面はセルだが実在するセルが 1 つも無い」ときだけなので何もしない —
+        // アレンジのクリップの copy へ落とすと、帯を触っていたつもりの `Ctrl+C` が
+        // 黙って別の面のものを載せる。
+        EditSurface::LauncherCells => None,
         EditSurface::AutomationClips => app
             .copy_automation_clips_clip()
             .map(|(j, c)| (j, c, "オートメーションクリップ")),
         // r.md #71 (プラグインのコピー / 移動): device の copy は **最新 plugin state が
         // 要るので非同期** (トラック copy と同じ round-trip 待ち)。 ここでは `None` に
         // 落とし、実処理は下の `matches!` ブロックが `&mut AppData` 越しに呼ぶ。
-        EditSurface::Tracks | EditSurface::Sections | EditSurface::Devices => None,
+        // 列 (シーン) は clipboard の payload を持たない (列そのものを他所へ
+        // 貼る意味が無く、中身はセル面のコピーで運べる) ので `None`。
+        EditSurface::Tracks
+        | EditSurface::Sections
+        | EditSurface::Scenes
+        | EditSurface::Devices => None,
     };
     if let Some((json, count, label)) = synced {
         finish_copy(ui, json, count, label);
@@ -99,14 +108,23 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         // 範囲: 形のまま (前後の空白込みで) コピーする。
         EditSurface::TimeRange => app.copy_time_selection_clip().map(|(j, c)| (j, c, "範囲")),
-        EditSurface::LauncherCells => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
+        // セル面はこの関数の頭で捌き済 (`copy_launcher_cells_clip`)。ここへ来るのは
+        // 「面はセルだが実在するセルが 1 つも無い」ときだけなので何もしない —
+        // アレンジのクリップの copy へ落とすと、帯を触っていたつもりの `Ctrl+C` が
+        // 黙って別の面のものを載せる。
+        EditSurface::LauncherCells => None,
         EditSurface::AutomationClips => app
             .copy_automation_clips_clip()
             .map(|(j, c)| (j, c, "オートメーションクリップ")),
         // r.md #71 (プラグインのコピー / 移動): device の copy は **最新 plugin state が
         // 要るので非同期** (トラック copy と同じ round-trip 待ち)。 ここでは `None` に
         // 落とし、実処理は下の `matches!` ブロックが `&mut AppData` 越しに呼ぶ。
-        EditSurface::Tracks | EditSurface::Sections | EditSurface::Devices => None,
+        // 列 (シーン) は clipboard の payload を持たない (列そのものを他所へ
+        // 貼る意味が無く、中身はセル面のコピーで運べる) ので `None`。
+        EditSurface::Tracks
+        | EditSurface::Sections
+        | EditSurface::Scenes
+        | EditSurface::Devices => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -117,7 +135,6 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
                 points: app.selection.selected_automation_points.clone(),
             },
             EditSurface::TimeRange => AppEvent::DeleteTimeSelection,
-            EditSurface::LauncherCells => AppEvent::DeleteSelectedClip,
             EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
                 keys: app.selection.selected_automation_clips.clone(),
             },
@@ -237,13 +254,13 @@ pub(crate) fn paste_from_clipboard(
             }
             paste_noop(ui);
         }
-        P::Tracks(tracks) => {
+        P::Tracks(payload) => {
             if !is_pianoroll_active
                 && let Some(above) = app.ui_ephemeral.arrange_hovered_track
             {
-                let tracks = crate::clipboard::sanitize_tracks(tracks);
+                let payload = crate::clipboard::sanitize_tracks(payload);
                 ui.push_edit(paste_edit("トラック", move |app| {
-                    app.paste_tracks_at(tracks, src_pid, above)
+                    app.paste_tracks_at(payload, src_pid, above)
                 }));
                 return;
             }

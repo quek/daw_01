@@ -1432,6 +1432,13 @@ impl Runner {
             },
         );
 
+        // undo bracket の寿命回収 (`view::scrub_gesture`): このフレームで所有者が
+        // 自分を描き直さなかった (= 欄が画面から消えた) なら gesture を閉じる。
+        // ここに置くのは、view の Edit が全部適用され終わった直後で、かつ
+        // `flush_song_sync` より前 — 閉じる側の副作用 (変調の割り当て確定など) も
+        // このフレームの LoadSong に載る。
+        crate::view::scrub_gesture::sweep(&mut state.app);
+
         // 子プロセス sync の pull 一本化 (docs/plan_arch_refactor.md §7.5): この frame の
         // user_event dispatch と ui.frame 内の view Edit がすべて適用された後・render の
         // 直前に 1 回だけ flush する。 flush_song_sync は epoch 差 (edit_epoch !=
@@ -1944,7 +1951,8 @@ impl Runner {
         let song = state.app.song_doc.song();
         let mods = &state.app.transport.mod_scalars;
         // r.md #87: 「どの行が今なにを、どの拍で映すか」の解決器。映像 / 画像 / 字幕 /
-        // グループ変換 / 映像効果が全部これを通る (書き出しは `RowTimeline::export`)。
+        // グループ変換 / 映像効果が全部これを通る (書き出しは `render_video` が
+        // `LauncherSidecar` から差した `RowTimeline::with_running`)。
         // engine の走行状態を差す (フォローアクションで移った先まで絵が追う)。
         // publish されていない行は `RowTimeline` が `Song.launcher` へ倒す。
         let running = state.app.launcher_running_rows();

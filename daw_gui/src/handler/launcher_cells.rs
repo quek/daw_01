@@ -7,10 +7,14 @@
 //!
 //! セルの `clip.id` は `clips` と **同じ id 空間**から採るので、
 //! `ClipKey { track_id, clip_id }` / `AutomationClipKey` がそのまま通る
-//! (計画書 §3.3)。選択集合 (`SelectionState::selected_clips` /
-//! `selected_automation_clips`) もアレンジのクリップと共有していて、
-//! **1 つの key はアレンジのクリップか セルの どちらか一方**なので、
+//! (計画書 §3.3)。**1 つの key はアレンジのクリップかセルのどちらか一方**なので、
 //! 削除 / 色 / 名前などは「両方の入れ物を key で引く」だけで曖昧にならない。
+//!
+//! ただし **選択集合は共有しない**。セルは
+//! [`SelectionState::selected_launcher_cells`](crate::state::SelectionState::selected_launcher_cells)
+//! 1 本 ([`LauncherCellKey`] = トラック行 / レーン行の両方) を持ち、面タグも
+//! [`EditSurface::LauncherCells`](crate::app::EditSurface::LauncherCells) 1 つ。
+//! 鍵の型を共有できること (= 引ける) と、集合を共有してよいこと (= 面が同じ) は別。
 //!
 //! ## 列の遅延実体化
 //!
@@ -37,6 +41,45 @@ use crate::widgets::select_modifier::SelectModifier;
 /// 「1 小節と 1 拍」の半端なループになる。
 fn new_cell_length_beats(song: &Song) -> f64 {
     common::model::beats_per_bar(song.time_sig)
+}
+
+/// 長さを書き換えて「実際に変わったか」を返す (変わらないなら `*` も undo step も
+/// 積まない)。[`resize_cell`] のトラック行 / レーン行の 2 分岐が同じ判定を持つための 1 本。
+fn set_len(slot: &mut f64, beats: f64) -> bool {
+    if (*slot - beats).abs() <= f64::EPSILON {
+        return false;
+    }
+    *slot = beats;
+    true
+}
+
+/// セル 1 つの長さを `beats` にする。実際に変わったら
+/// `(content_id, 窓の末尾)` を返す (呼び側が overlay の event 長を補完する)。
+fn resize_cell(
+    song: &mut Song,
+    cell: LauncherCellKey,
+    beats: f64,
+) -> Option<(common::model::ContentId, f64)> {
+    match cell {
+        LauncherCellKey::Track(k) => {
+            let c = song
+                .track_by_id_mut(k.track_id)?
+                .session_clips
+                .iter_mut()
+                .find(|c| c.clip.id == k.clip_id)?;
+            set_len(&mut c.clip.length_beats, beats)
+                .then_some((c.clip.content_id, c.clip.content_offset_beats + beats))
+        }
+        LauncherCellKey::Lane(k) => {
+            let c = song
+                .automation_lane_by_key_mut(k.track, k.lane)?
+                .session_clips
+                .iter_mut()
+                .find(|c| c.clip.id == k.clip)?;
+            set_len(&mut c.clip.length_beats, beats)
+                .then_some((c.clip.content_id, c.clip.content_offset_beats + beats))
+        }
+    }
 }
 
 impl AppData {
@@ -76,52 +119,44 @@ impl AppData {
         }
     }
 
+    /// 選択集合に居る **実在するセル**。面タグは見ない。
+    ///
+    /// 呼んでよいのは「対象面が既にセル面だと分かっている」場所だけ
+    /// (`delete_current_surface` が解決した後の削除経路など)。
+    /// それ以外は [`Self::selected_launcher_cells`] を使う。
+    #[must_use]
+    pub fn live_launcher_cells(&self) -> Vec<LauncherCellKey> {
+        let song = self.song_doc.song();
+        self.selection
+            .selected_launcher_cells
+            .iter()
+            .copied()
+            .filter(|cell| cell_exists(song, *cell))
+            .collect()
+    }
+
+    /// 選択集合に **実在するセルが 1 つでも居るか** ([`Self::live_launcher_cells`] の
+    /// 非空判定を確保なしで)。`edit_surface` が毎フレーム引くのでここは短絡させる。
+    #[must_use]
+    pub fn has_live_launcher_cells(&self) -> bool {
+        let song = self.song_doc.song();
+        self.selection.selected_launcher_cells.iter().any(|c| cell_exists(song, *c))
+    }
+
     /// いま選択されている **セル** (アレンジのクリップは除く)。
     ///
-    /// 選択集合はアレンジのクリップと共有なので、「セルの入れ物に居る key だけ」
-    /// を残して面を切り出す。インスペクタの「ローンチ」セクションと
-    /// `Delete` / `Ctrl+D` / copy の対象がこれ。
-    ///
-    /// トラック行のセル (`selected_launcher_cells`) とオートメーションレーン行のセル
-    /// (`selected_automation_clips`) は **共存できる**ので、どちらを対象に
-    /// するかは `last_edit_select` (= 直近に確定した面) で決める
-    /// (`feedback_selection_action_last_wins`)。 タグが無い / 別の面を指して
-    /// いるときだけ両方返す。
+    /// セル面は行の種類に関わらず [`EditSurface::LauncherCells`](crate::app::EditSurface::LauncherCells)
+    /// 1 面なので、**直近に確定した面がセル面のときだけ**返す。ここを
+    /// 「別の面でも中身が非空なら返す」にすると、ピアノロールでノートを選んだ
+    /// 状態の `Ctrl+C` / `Ctrl+X` / `D` が (セルが選択に残っているだけで)
+    /// ノートではなくセルに効いてしまう — `Ctrl+X` は消えるので実害が大きい
+    /// (`feedback_selection_action_last_wins` の "直近確定面で決める")。
     #[must_use]
     pub fn selected_launcher_cells(&self) -> Vec<LauncherCellKey> {
-        use crate::app::EditSurface as S;
-        let song = self.song_doc.song();
-        let last = self.selection.last_edit_select;
-        let mut out: Vec<LauncherCellKey> = Vec::new();
-        // **直近に確定した面がクリップ系のときだけ**セルを返す。
-        // ここを「別の面なら両方返す」にしていると、ピアノロールでノートを選んだ
-        // 状態の `Ctrl+C` / `Ctrl+X` / `D` が (セルが選択に残っているだけで)
-        // ノートではなくセルに効いてしまう — `Ctrl+X` は消えるので実害が大きい
-        // (`feedback_selection_action_last_wins` の "直近確定面で決める")。
-        if !matches!(last, Some(S::LauncherCells) | Some(S::AutomationClips)) {
-            return out;
+        if self.selection.last_edit_select != Some(crate::app::EditSurface::LauncherCells) {
+            return Vec::new();
         }
-        if last != Some(S::AutomationClips) {
-            for key in &self.selection.selected_launcher_cells {
-                if song
-                    .track_by_id(key.track_id)
-                    .is_some_and(|t| t.session_clip_by_id(key.clip_id).is_some())
-                {
-                    out.push(LauncherCellKey::Track(*key));
-                }
-            }
-        }
-        if last != Some(S::LauncherCells) {
-            for key in &self.selection.selected_automation_clips {
-                if song
-                    .automation_lane_by_key(key.track, key.lane)
-                    .is_some_and(|l| l.session_clips.iter().any(|c| c.clip.id == key.clip))
-                {
-                    out.push(LauncherCellKey::Lane(*key));
-                }
-            }
-        }
-        out
+        self.live_launcher_cells()
     }
 
     /// セルの長さ (= ループ長) を変える。選択している全セルへ一括で効く。
@@ -129,6 +164,12 @@ impl AppData {
     /// セルの `start_beat` は常に 0 なので、変わるのは `length_beats` だけ
     /// (窓の開始 `content_offset_beats` は据え置き = 「どこから鳴らすか」は
     /// 変えずに「どこまで鳴らすか」だけを変える)。
+    ///
+    /// アレンジの `resize_clip` と同じく、伸ばしたあとは overlay (画像 / 映像 /
+    /// 字幕) の末尾 event を窓の末尾まで伸ばす — 「クリップ長 = 表示長」が
+    /// overlay の不変条件で、伸ばした分が空白になると**セルの後半だけ絵が消える**。
+    /// extend-only なので共有 content を伸ばしてもリンク先は自分の窓で clamp される
+    /// ([`ClipContent::ensure_event_covers_clip`](common::model::ClipContent::ensure_event_covers_clip) の契約)。
     pub fn set_cell_length(&mut self, cells: &[LauncherCellKey], beats: f64) {
         if cells.is_empty() || !beats.is_finite() {
             return;
@@ -136,26 +177,19 @@ impl AppData {
         let beats = beats.max(common::model::MIN_CLIP_LEN_BEATS);
         let cells = cells.to_vec();
         self.edit_song_checked(|song| {
-            let mut changed = false;
-            for cell in &cells {
-                let len = match cell {
-                    LauncherCellKey::Track(k) => song
-                        .track_by_id_mut(k.track_id)
-                        .and_then(|t| t.session_clips.iter_mut().find(|c| c.clip.id == k.clip_id))
-                        .map(|c| &mut c.clip.length_beats),
-                    LauncherCellKey::Lane(k) => song
-                        .automation_lane_by_key_mut(k.track, k.lane)
-                        .and_then(|l| l.session_clips.iter_mut().find(|c| c.clip.id == k.clip))
-                        .map(|c| &mut c.clip.length_beats),
-                };
-                if let Some(len) = len
-                    && (*len - beats).abs() > f64::EPSILON
-                {
-                    *len = beats;
-                    changed = true;
+            // content の可変借用がセルの可変借用と重なるので、先に
+            // 「(content_id, 窓の末尾)」を集めてから content を触る。
+            let covers: Vec<(common::model::ContentId, f64)> =
+                cells.iter().filter_map(|c| resize_cell(song, *c, beats)).collect();
+            if covers.is_empty() {
+                return false;
+            }
+            for (content_id, window_end) in covers {
+                if let Some(content) = song.clip_contents.get_mut(&content_id) {
+                    content.ensure_event_covers_clip(window_end);
                 }
             }
-            changed
+            true
         });
     }
 
@@ -188,59 +222,32 @@ impl AppData {
     pub fn select_launcher_cell(&mut self, cell: LauncherCellKey, modifier: SelectModifier) {
         // 列 (シーン) 選択とは排他 (`SelectionState::selected_scene_ids` の doc)。
         self.selection.selected_scene_ids.clear();
-        match cell {
-            LauncherCellKey::Track(key) => {
-                let items = self.launcher_range_items();
-                let anchor = self.selection.launcher_cell_anchor;
-                let next = modifier.resolve(&self.selection.selected_launcher_cells, key, || {
-                    let a = anchor?;
-                    crate::widgets::select_modifier::range_block(&items, a, key)
-                });
-                let anchor_track = next.last().map(|k| k.track_id);
-                self.selection.selected_launcher_cells = next;
-                if modifier.updates_anchor() {
-                    self.selection.launcher_cell_anchor = Some(key);
-                }
-                if !self.selection.selected_launcher_cells.is_empty() {
-                    self.selection.last_edit_select =
-                        Some(crate::app::EditSurface::LauncherCells);
-                }
-                // アレンジのクリップ選択 (`select_clip` / `set_clip_selection`) と
-                // 同じく、 anchor のトラックへカーソルを追従させる。 これが無いと
-                // インスペクタの上半分 (トラック名・色・デバイスチェーン) だけが
-                // 前のトラックのまま残り、 下半分 (クリップ / ローンチ設定) と
-                // 混ざって見える。 `Clips` タグを立てた **直後**に呼ぶ約束も同じ。
-                if let Some(track_id) = anchor_track {
-                    self.select_track(track_id);
-                }
-            }
-            LauncherCellKey::Lane(key) => {
-                let items = self.launcher_lane_range_items();
-                let anchor = self.selection.automation_clip_anchor;
-                let next = modifier.resolve(
-                    &self.selection.selected_automation_clips,
-                    key,
-                    || {
-                        let a = anchor?;
-                        crate::widgets::select_modifier::range_block(&items, a, key)
-                    },
-                );
-                self.selection.selected_automation_clips = next;
-                if modifier.updates_anchor() {
-                    self.selection.automation_clip_anchor = Some(key);
-                }
-                if !self.selection.selected_automation_clips.is_empty() {
-                    self.selection.last_edit_select =
-                        Some(crate::app::EditSurface::AutomationClips);
-                }
-                // automation セルも同じ — レーンは必ずどれか 1 トラックに属するので、
-                // 別トラックのレーンのセルを選んだらカーソルもそのトラックへ動く。
-                if let Some(track_id) =
-                    self.selection.selected_automation_clips.last().map(|k| k.track)
-                {
-                    self.select_track(track_id);
-                }
-            }
+        // **行の種類で分岐しない** — セル面は 1 面 1 集合なので、トラック行と
+        // レーン行を跨ぐ Shift+click の長方形もそのまま解ける (分けていた頃は
+        // 「トラック行のセルからその下のオートメーションレーン行のセルまで」が
+        // 範囲選択できなかった)。
+        let items = self.launcher_range_items();
+        let anchor = self.selection.launcher_cell_anchor;
+        let next = modifier.resolve(&self.selection.selected_launcher_cells, cell, || {
+            let a = anchor?;
+            crate::widgets::select_modifier::range_block(&items, a, cell)
+        });
+        let anchor_track = next.last().map(|k| k.row().track_id());
+        self.selection.selected_launcher_cells = next;
+        if modifier.updates_anchor() {
+            self.selection.launcher_cell_anchor = Some(cell);
+        }
+        if !self.selection.selected_launcher_cells.is_empty() {
+            self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
+        }
+        // アレンジのクリップ選択 (`select_clip` / `set_clip_selection`) と
+        // 同じく、 anchor のトラックへカーソルを追従させる。 これが無いと
+        // インスペクタの上半分 (トラック名・色・デバイスチェーン) だけが
+        // 前のトラックのまま残り、 下半分 (クリップ / ローンチ設定) と
+        // 混ざって見える。 面タグを立てた **直後**に呼ぶ約束も同じ。
+        // レーン行のセルも同じ — レーンは必ずどれか 1 トラックに属する。
+        if let Some(track_id) = anchor_track {
+            self.select_track(track_id);
         }
         // 撃つ / 設定を出す起点をクリックしたセルへ移す。
         if let (Some(scene_id), row) = (self.scene_of_cell(cell), cell.row())
@@ -253,24 +260,37 @@ impl AppData {
     /// Shift+click の範囲計算に渡す「行 × 列」のグリッド。
     /// `row` は表示順の行 index、時間軸には **列 index** を入れる
     /// (セルは全部 `start_beat = 0` なので拍では並ばない)。
+    ///
+    /// **トラック行のセルもレーン行のセルも同じ 1 本の表に載せる。** 種類ごとに
+    /// 分けると「トラック行のセルから、その下のオートメーションレーン行のセルまで」
+    /// の長方形が解けず、Shift+click が片方の種類でしか効かない。
+    ///
+    /// 行の数え方は [`Self::launcher_rows`] (= 画面に出ている行だけ)。
+    /// `all_launcher_rows` で数えると、長方形が **畳んで見えていない行のセルまで
+    /// 飲み込み**、続く Delete が見ていないセルを消す。
     fn launcher_range_items(
         &self,
-    ) -> Vec<crate::widgets::select_modifier::RangeItem<ClipKey>> {
+    ) -> Vec<crate::widgets::select_modifier::RangeItem<LauncherCellKey>> {
         let song = self.song_doc.song();
         let mut items = Vec::new();
         for (row_i, row) in self.launcher_rows().into_iter().enumerate() {
-            let LauncherRow::Track(track_id) = row else {
-                continue;
+            // 行の種別ごとの「セルの列 id と clip id」だけが違う。
+            let cells: Vec<(u32, u32)> = match row {
+                LauncherRow::Track(track_id) => song
+                    .track_by_id(track_id)
+                    .map(|t| t.session_clips.iter().map(|c| (c.scene_id, c.clip.id)).collect())
+                    .unwrap_or_default(),
+                LauncherRow::Lane(lane_key) => song
+                    .automation_lane_by_key(lane_key.track, lane_key.lane)
+                    .map(|l| l.session_clips.iter().map(|c| (c.scene_id, c.clip.id)).collect())
+                    .unwrap_or_default(),
             };
-            let Some(track) = song.track_by_id(track_id) else {
-                continue;
-            };
-            for cell in &track.session_clips {
-                let Some(col) = song.scene_index(cell.scene_id) else {
+            for (scene_id, clip_id) in cells {
+                let Some(col) = song.scene_index(scene_id) else {
                     continue;
                 };
                 items.push(crate::widgets::select_modifier::RangeItem {
-                    key: ClipKey { track_id, clip_id: cell.clip.id },
+                    key: cell_key_in_row(row, clip_id),
                     row: row_i as i64,
                     start: col as f64,
                     end: col as f64 + 1.0,
@@ -280,41 +300,12 @@ impl AppData {
         items
     }
 
-    /// [`Self::launcher_range_items`] のレーン行版。トラック行と別なのは
-    /// 鍵の型が違うだけで、行 × 列の長方形という規則は同じ
-    /// (**片方だけ範囲選択できない**という非対称を残さない)。
-    fn launcher_lane_range_items(
-        &self,
-    ) -> Vec<crate::widgets::select_modifier::RangeItem<AutomationClipKey>> {
-        let song = self.song_doc.song();
-        let mut items = Vec::new();
-        for (row_i, row) in self.all_launcher_rows().into_iter().enumerate() {
-            let LauncherRow::Lane(lane_key) = row else {
-                continue;
-            };
-            let Some(lane) = song.automation_lane_by_key(lane_key.track, lane_key.lane) else {
-                continue;
-            };
-            for cell in &lane.session_clips {
-                let Some(col) = song.scene_index(cell.scene_id) else {
-                    continue;
-                };
-                items.push(crate::widgets::select_modifier::RangeItem {
-                    key: AutomationClipKey {
-                        track: lane_key.track,
-                        lane: lane_key.lane,
-                        clip: cell.clip.id,
-                    },
-                    row: row_i as i64,
-                    start: col as f64,
-                    end: col as f64 + 1.0,
-                });
-            }
-        }
-        items
-    }
-
-    /// 消えたセルを選択集合から落とす (列削除 / セル削除の後始末)。
+    /// 消えたセル / 列を選択集合から落とす (列削除 / セル削除の後始末)。
+    ///
+    /// **アレンジの automation クリップ選択 (`selected_automation_clips`) は
+    /// 触らない** — セルは自分の集合を持つので、ここで他面の集合を掃除する理由が
+    /// 無い (掃除していた頃は「セル面が automation 面へ相乗りしている」ことの
+    /// 帳尻合わせだった)。
     pub(crate) fn prune_launcher_selection(&mut self) {
         let song = self.song_doc.song();
         // 消えた列を指したままだと、インスペクタが存在しない列の設定を出す。
@@ -323,35 +314,15 @@ impl AppData {
         self.selection.scene_anchor =
             self.selection.scene_anchor.filter(|id| live_scenes.contains(id));
         let song = self.song_doc.song();
-        let clip_alive = |k: &ClipKey| {
-            song.track_by_id(k.track_id).is_some_and(|t| {
-                t.clips.iter().any(|c| c.id == k.clip_id)
-                    || t.session_clip_by_id(k.clip_id).is_some()
-            })
-        };
-        let auto_alive = |k: &AutomationClipKey| {
-            song.automation_lane_by_key(k.track, k.lane).is_some_and(|l| {
-                l.all_clips().any(|c| c.id == k.clip)
-            })
-        };
-        let clips: Vec<ClipKey> =
-            self.selection.selected_launcher_cells.iter().copied().filter(clip_alive).collect();
-        let autos: Vec<AutomationClipKey> = self
-            .selection
-            .selected_automation_clips
-            .iter()
-            .copied()
-            .filter(auto_alive)
-            .collect();
+        let alive = |k: &LauncherCellKey| cell_exists(song, *k);
+        let cells: Vec<LauncherCellKey> =
+            self.selection.selected_launcher_cells.iter().copied().filter(alive).collect();
         // **範囲選択の起点 (anchor) も掃除する。** 消えたセルを指したままだと
         // 次の `Shift+click` が範囲を解けず、単一選択に落ちる (「範囲選択が
         // 時々効かない」の正体)。
         self.selection.launcher_cell_anchor =
-            self.selection.launcher_cell_anchor.filter(clip_alive);
-        self.selection.automation_clip_anchor =
-            self.selection.automation_clip_anchor.filter(auto_alive);
-        self.selection.selected_launcher_cells = clips;
-        self.selection.selected_automation_clips = autos;
+            self.selection.launcher_cell_anchor.filter(alive);
+        self.selection.selected_launcher_cells = cells;
     }
 
     // ------------------------------------------------------------------
@@ -458,11 +429,19 @@ impl AppData {
         let mut made: Vec<LauncherCellKey> = Vec::new();
         self.edit_song_checked(|song| {
             // **2 パスで処理する。**
-            // 1 パス目で受理できる move だけを選び、`Move` なら元セルを *先に全部*
-            // 抜き取る。1 件ずつ「置いてから消す」と、移動元と移動先が重なる複数
-            // 選択のドラッグ (列 1・2 を選んで右へ 1 列) で、先に置いたセルが次の
-            // move の元セルを上書きして **選択が 1 つ減る**。
-            let mut pending: Vec<(LauncherCellMove, u32)> = Vec::new();
+            //
+            // 1 パス目で受理できる move を選び、その場で中身を [`CellPayload`] へ
+            // 退避する (`Move` なら元セルを抜き取る)。2 パス目は退避した中身だけを
+            // 置くので **`song` のセル置き場を一切読まない**。
+            //
+            // 1 件ずつ「読んで置く」と、移動元と移動先が重なる複数選択のドラッグ
+            // (列 1・2 を選んで右へ 1 列) で壊れる —
+            // [`Track::put_session_clip`](common::model::Track::put_session_clip) は
+            // 落とし先の既存セルを捨てるので、先に置いた列 1→2 が **まだ動かして
+            // いない列 2 のセルを消し**、その後の列 2→3 は読むものが無くなって
+            // セルが 1 つ消滅する。**順序で回避しない** — 右送りを順序で直しても
+            // 左送りで再発するので、「置く側が読まない」形にして構造的に潰す。
+            let mut pending: Vec<(LauncherCellMove, u32, CellPayload)> = Vec::new();
             for m in &moves {
                 let Some(from_scene) = scene_of(song, m.from) else {
                     continue; // 元セルが消えている。
@@ -474,41 +453,47 @@ impl AppData {
                 {
                     continue;
                 }
-                // 種別が合わない drop (MIDI セル → オートメーションレーン行) は
-                // **列を実体化する前**に弾く (後で弾くと空の列だけが残る)。
-                if !row_accepts(matches!(m.from, LauncherCellKey::Track(_)), m.to_row) {
+                // 種別が合わない drop (MIDI セル → オートメーションレーン行) と、
+                // そもそもセルを置けない行への drop は **列を実体化する前**に弾く
+                // (後で弾くと空の列だけが残る)。抜き取りより先に弾くのも必須 —
+                // 置けない先へ運ぼうとして元セルだけ消えると、セルが宙に消える。
+                if !row_accepts(matches!(m.from, LauncherCellKey::Track(_)), m.to_row)
+                    || !row_accepts_cells(song, m.to_row)
+                {
                     continue;
                 }
+                let Some(payload) = clone_cell_payload(song, m.from) else {
+                    continue;
+                };
+                if mode == LauncherDropMode::Move {
+                    remove_cell(song, m.from);
+                }
                 let dest_scene = song.ensure_scene_at(m.to_scene_index);
-                pending.push((*m, dest_scene));
+                pending.push((*m, dest_scene, payload));
             }
-            for (m, dest_scene) in &pending {
-                let same_row = m.from.row() == m.to_row;
-                let new_id = if mode == LauncherDropMode::Move && same_row {
-                    // **同じ行の中の移動は id を保つ** — 採り直すと
-                    // `RowPlayback::Launcher { clip_id }` が消えた id を指し、
-                    // `normalize_session` が行を停止に落とす (= 鳴っているセルを
-                    // 1 列ずらしただけで音が止まる)。
-                    match move_cell_to_scene(song, m.from, *dest_scene) {
-                        Some(id) => id,
-                        None => continue,
-                    }
-                } else {
-                    let Some(id) = transplant_cell(song, m.from, m.to_row, *dest_scene) else {
-                        continue;
-                    };
-                    if mode == LauncherDropMode::Move {
-                        remove_cell(song, m.from);
-                    }
-                    id
+            // **編集したかは `pending` で判定する。** 1 パス目は受理した時点で
+            // 元セルを抜き取り列を実体化して *もう song を変えている* ので、
+            // 2 パス目の成否 (`made`) で `false` を返すと `edit_song_checked` が
+            // snapshot だけ捨て、抜き取ったセルが undo できずに消える。
+            if pending.is_empty() {
+                return false;
+            }
+            for (m, dest_scene, payload) in pending {
+                // **同じ行の中の移動は id を保つ** — 採り直すと
+                // `RowPlayback::Launcher { clip_id }` が消えた id を指し、
+                // `normalize_session` が行を停止に落とす (= 鳴っているセルを
+                // 1 列ずらしただけで音が止まる)。行を跨いだ移動とコピーは
+                // 落とし先の行で採り直す (id 空間が行ごとなので)。
+                let keep_id = (mode == LauncherDropMode::Move && m.from.row() == m.to_row)
+                    .then(|| m.from.clip_id());
+                let Some(new_id) = place_cell(song, m.to_row, dest_scene, payload, keep_id)
+                else {
+                    continue;
                 };
                 if mode == LauncherDropMode::CopyIndependent {
                     make_cell_content_unique(song, m.to_row, new_id);
                 }
                 made.push(cell_key_in_row(m.to_row, new_id));
-            }
-            if made.is_empty() {
-                return false;
             }
             song.normalize_session();
             true
@@ -520,8 +505,9 @@ impl AppData {
     /// アレンジのクリップを**セルへ**運ぶ (帯とレーンを跨ぐドラッグの release)。
     ///
     /// 行き先の列が空きプレースホルダなら `Song::ensure_scene_at` で実体化する。
-    /// 落とし先に既にセルがあれば置き換える (`transplant_cell` と同じ「ドロップは
-    /// 置き換え」規約)。`mode` は既存のクリップ規約そのまま。
+    /// 落とし先に既にセルがあれば置き換える (`Track::put_session_clip` /
+    /// `AutomationLane::put_session_clip` が担う「ドロップは置き換え」規約)。
+    /// `mode` は既存のクリップ規約そのまま。
     pub fn drop_clips_to_cells(&mut self, drops: &[ClipToCellDrop], mode: LauncherDropMode) {
         if drops.is_empty() {
             return;
@@ -594,35 +580,12 @@ impl AppData {
         }
         // click 経路と同じく列選択とは排他。
         self.selection.selected_scene_ids.clear();
-        let clips: Vec<ClipKey> = cells
-            .iter()
-            .filter_map(|c| match c {
-                LauncherCellKey::Track(k) => Some(*k),
-                LauncherCellKey::Lane(_) => None,
-            })
-            .collect();
-        let autos: Vec<AutomationClipKey> = cells
-            .iter()
-            .filter_map(|c| match c {
-                LauncherCellKey::Lane(k) => Some(*k),
-                LauncherCellKey::Track(_) => None,
-            })
-            .collect();
+        self.selection.selected_launcher_cells = cells.to_vec();
+        self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
         // click 経路 (`select_launcher_cell`) と同じくカーソルトラックを追従させる。
         // 別トラックへセルを複製 / 移動したら、 インスペクタもその行に付いていく。
-        // anchor は「最後に置いたセル」 = 集合の末尾で、 automation が後勝ち
-        // (下の `last_edit_select` の優先順と同じ)。
-        let anchor_track =
-            autos.last().map(|k| k.track).or_else(|| clips.last().map(|k| k.track_id));
-        if !clips.is_empty() {
-            self.selection.selected_launcher_cells = clips;
-            self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
-        }
-        if !autos.is_empty() {
-            self.selection.selected_automation_clips = autos;
-            self.selection.last_edit_select = Some(crate::app::EditSurface::AutomationClips);
-        }
-        if let Some(track_id) = anchor_track {
+        // anchor は「最後に置いたセル」 = 集合の末尾。
+        if let Some(track_id) = cells.last().map(|c| c.row().track_id()) {
             self.select_track(track_id);
         }
     }
@@ -701,16 +664,38 @@ impl AppData {
 // Song 上の純粋操作 (`edit_song` の closure から呼ぶ)
 // ----------------------------------------------------------------------
 
+/// 行 `row` が **そもそもセルを持てるか**。列とは無関係な、行そのものの性質。
+///
+/// - 行が実在すること
+/// - **グループトラックでないこと** — daw_01 のグループトラックは自分のクリップを
+///   鳴らさない (`process_track_owned` が `track_has_children` で pass 1 を抜ける)
+///   ので、置いたセルは保存はされるのに永久に鳴らない。帯はグループ行を「子の
+///   まとめセル」として描く (計画書 §0 / §3.2)
+/// - レーン行なら
+///   [`AutomationTarget::accepts_launcher_cells`](common::model::AutomationTarget::accepts_launcher_cells)
+///   が `true` であること (テンポ / 拍子レーンはランチャーが握れない — 量子化
+///   グリッドが自己参照し、GUI と engine で時間軸が食い違う)
+///
+/// **セルを置く口はすべてこれを引く** (作成 / 移動 / drop / 貼り付け / 取り込み)。
+/// widget 側が rect を出さないことに頼ると、口が 1 つ増えるたびに穴が開く。
+pub(crate) fn row_accepts_cells(song: &Song, row: LauncherRow) -> bool {
+    match row {
+        LauncherRow::Track(id) => {
+            song.track_by_id(id).is_some() && !song.track_has_children(id)
+        }
+        LauncherRow::Lane(k) => song
+            .automation_lane_by_key(k.track, k.lane)
+            .is_some_and(|l| l.target.accepts_launcher_cells()),
+    }
+}
+
 /// 行 `row` の表示順 `scene_index` にセルを **置けるか**。
 ///
-/// 「列を実体化する前に判定する」ためだけの述語。行が実在し、かつその位置に
-/// まだセルが無ければ `true` (プレースホルダ列 = まだ実体の無い列は常に空)。
+/// 「列を実体化する前に判定する」ためだけの述語。行がセルを持てて
+/// ([`row_accepts_cells`])、かつその位置にまだセルが無ければ `true`
+/// (プレースホルダ列 = まだ実体の無い列は常に空)。
 fn can_place_cell(song: &Song, row: LauncherRow, scene_index: usize) -> bool {
-    let row_exists = match row {
-        LauncherRow::Track(id) => song.track_by_id(id).is_some(),
-        LauncherRow::Lane(k) => song.automation_lane_by_key(k.track, k.lane).is_some(),
-    };
-    if !row_exists {
+    if !row_accepts_cells(song, row) {
         return false;
     }
     let Some(scene) = song.scenes.get(scene_index) else {
@@ -733,6 +718,15 @@ fn row_accepts(cell_is_track_row: bool, row: LauncherRow) -> bool {
         (cell_is_track_row, row),
         (true, LauncherRow::Track(_)) | (false, LauncherRow::Lane(_))
     )
+}
+
+/// そのセルが **いまも `session_clips` に居るか**。
+///
+/// 生存確認はこの 1 本だけを通す — 「アレンジのクリップにも居ればよい」 と
+/// 緩めると、セルをアレンジのレーンへ運んだ (= セルは消えてクリップになった) 後も
+/// 選択にセル key が残り、インスペクタが存在しないセルのローンチ設定を出す。
+fn cell_exists(song: &Song, cell: LauncherCellKey) -> bool {
+    scene_of(song, cell).is_some()
 }
 
 /// セルが乗っている列。
@@ -858,69 +852,63 @@ fn create_cell_in(song: &mut Song, row: LauncherRow, scene_id: u32) -> Option<La
     }
 }
 
-/// 同じ行の中でセルを列 `dest_scene` へ動かす。**id を保つ** ので、その行が
-/// そのセルを鳴らしていれば鳴り続ける (`RowPlayback` を貼り替えなくてよい)。
-/// 落とし先に別のセルが居れば退ける (ドロップは「置き換え」)。戻り値 = 動かした id。
-fn move_cell_to_scene(song: &mut Song, cell: LauncherCellKey, dest_scene: u32) -> Option<u32> {
+/// セル 1 つの中身。**置く側が `song` を読まないため**の退避入れ物で、
+/// [`AppData::move_launcher_cells`] の 1 パス目が作り 2 パス目が消費する
+/// (`put_session_clip` が落とし先の既存セルを捨てるので、置きながら読むと
+/// まだ動かしていない元セルを潰す)。
+enum CellPayload {
+    Track(SessionClip),
+    Lane(SessionAutomationClip),
+}
+
+/// セルの中身を複製して取り出す (元は消さない)。`Move` の呼び側はこの直後に
+/// [`remove_cell`] を呼ぶ。
+fn clone_cell_payload(song: &Song, cell: LauncherCellKey) -> Option<CellPayload> {
     match cell {
-        LauncherCellKey::Track(k) => {
-            let track = song.track_by_id_mut(k.track_id)?;
-            let moved = track.session_clips.iter().position(|c| c.clip.id == k.clip_id)?;
-            let mut payload = track.session_clips.remove(moved);
-            payload.scene_id = dest_scene;
-            track.put_session_clip(payload);
-            Some(k.clip_id)
-        }
-        LauncherCellKey::Lane(k) => {
-            let lane = song.automation_lane_by_key_mut(k.track, k.lane)?;
-            let moved = lane.session_clips.iter().position(|c| c.clip.id == k.clip)?;
-            let mut payload = lane.session_clips.remove(moved);
-            payload.scene_id = dest_scene;
-            lane.put_session_clip(payload);
-            Some(k.clip)
-        }
+        LauncherCellKey::Track(k) => song
+            .track_by_id(k.track_id)
+            .and_then(|t| t.session_clip_by_id(k.clip_id))
+            .map(|c| CellPayload::Track(c.clone())),
+        LauncherCellKey::Lane(k) => song
+            .automation_lane_by_key(k.track, k.lane)
+            .and_then(|l| l.session_clips.iter().find(|c| c.clip.id == k.clip))
+            .map(|c| CellPayload::Lane(c.clone())),
     }
 }
 
-/// `from` のセルを `to_row` の列 `dest_scene` へ **写す** (元は消さない)。
-/// 行を跨ぐので id は落とし先の行で採り直す。落とし先に既にセルがあれば
-/// 上書きする (ドロップは「置き換え」が自然)。戻り値 = 新しい clip id。
-fn transplant_cell(
+/// 退避した中身を行 `to_row` の列 `dest_scene` へ置く。落とし先に既にセルが
+/// あれば置き換える (ドロップは「置き換え」規約)。
+///
+/// `keep_id` が `Some` ならその id のまま置く — 同じ行の中の移動で id を採り直すと
+/// `RowPlayback::Launcher { clip_id }` が消えた id を指し、鳴っているセルを 1 列
+/// ずらしただけで音が止まる。`None` なら落とし先の行で採り直す (id 空間が行ごと)。
+///
+/// 中身と行の種別が食い違うときは置かない (呼び側が [`row_accepts`] で先に
+/// 弾いているので、ここは防御)。
+fn place_cell(
     song: &mut Song,
-    from: LauncherCellKey,
     to_row: LauncherRow,
     dest_scene: u32,
+    payload: CellPayload,
+    keep_id: Option<u32>,
 ) -> Option<u32> {
-    if from.row() == to_row {
-        return crate::handler::launcher::clone_cell_into_scene(song, from, dest_scene);
-    }
-    match (from, to_row) {
-        (LauncherCellKey::Track(k), LauncherRow::Track(dest_track)) => {
-            let src = song
-                .track_by_id(k.track_id)
-                .and_then(|t| t.session_clip_by_id(k.clip_id))?
-                .clone();
-            let track = song.track_by_id_mut(dest_track)?;
-            let id = track.alloc_clip_id();
-            track.put_session_clip(SessionClip {
-                scene_id: dest_scene,
-                clip: Clip { id, start_beat: 0.0, ..src.clip },
-                launch: src.launch,
-            });
+    match (to_row, payload) {
+        (LauncherRow::Track(track_id), CellPayload::Track(mut cell)) => {
+            let track = song.track_by_id_mut(track_id)?;
+            let id = keep_id.unwrap_or_else(|| track.alloc_clip_id());
+            cell.scene_id = dest_scene;
+            cell.clip.id = id;
+            cell.clip.start_beat = 0.0;
+            track.put_session_clip(cell);
             Some(id)
         }
-        (LauncherCellKey::Lane(k), LauncherRow::Lane(dest)) => {
-            let src = song
-                .automation_lane_by_key(k.track, k.lane)
-                .and_then(|l| l.session_clips.iter().find(|c| c.clip.id == k.clip))?
-                .clone();
-            let lane = song.automation_lane_by_key_mut(dest.track, dest.lane)?;
-            let id = lane.alloc_clip_id();
-            lane.put_session_clip(SessionAutomationClip {
-                scene_id: dest_scene,
-                clip: AutomationClip { id, start_beat: 0.0, ..src.clip },
-                launch: src.launch,
-            });
+        (LauncherRow::Lane(k), CellPayload::Lane(mut cell)) => {
+            let lane = song.automation_lane_by_key_mut(k.track, k.lane)?;
+            let id = keep_id.unwrap_or_else(|| lane.alloc_clip_id());
+            cell.scene_id = dest_scene;
+            cell.clip.id = id;
+            cell.clip.start_beat = 0.0;
+            lane.put_session_clip(cell);
             Some(id)
         }
         // 種別が違う行への drop (MIDI セル → オートメーションレーン行 など) は
@@ -939,6 +927,10 @@ fn drop_one_clip_to_cell(
     let LauncherRow::Track(dest_track) = d.to_row else {
         return None;
     };
+    // セルを置けない行 (グループ) は **列を実体化する前**に弾く。
+    if !row_accepts_cells(song, d.to_row) {
+        return None;
+    }
     let src = song.clip_by_key(d.from).cloned()?;
     let dest_scene = song.ensure_scene_at(d.to_scene_index);
     let track = song.track_by_id_mut(dest_track)?;

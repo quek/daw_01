@@ -142,9 +142,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 #068 連動ハイライト: 今フレームの hovered clip の content_id を
     // 次フレームの active group 計算用に保持 (変化時のみ Edit を発火、 毎フレーム
     // の無駄な mutate を避ける)。
+    // content を引く口なので `Track::clip_by_id` (= `all_clips` 契約) を通す。
+    // hover 源はアレンジ帯なので今はセルが来ないが、 `clips` を直に走査すると
+    // 「content を参照するものは `all_clips` 1 本」 の契約から外れた口が 1 つ残る。
     let hover_content = resp.hovered_clip.and_then(|k| {
-        let t = app.song_doc.song().tracks.iter().find(|t| t.id == k.track_id)?;
-        t.clips.iter().find(|c| c.id == k.clip_id).map(|c| c.content_id)
+        let t = app.song_doc.song().track_by_id(k.track_id)?;
+        t.clip_by_id(k.clip_id).map(|c| c.content_id)
     });
     if hover_content != app.ui_ephemeral.arrange_hover_content {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -209,10 +212,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`docs/plan_audio_clip.md` §3.5)。 選択 clip 群に対して動くので、
     // 右クリックされた clip 自体の selection を変える/変えないは handler
     // 側に任せる (= MakeClipUnique も同 pattern)。
-    // rename overlay 判定用に clip_rename (index ベース ClipKey) を 1 回だけ
-    // ClipKey (id ベース) に解決する (selected_clips と同 idiom)。 track rename
-    // の renaming_track_id と同パターンで、 ループ内で live_clip_key を毎
-    // clip 呼ぶ線形探索を避ける。
+    // rename overlay 判定用に clip_rename の生存確認を 1 回だけ済ませる
+    // (selected_clips と同 idiom)。 track rename の renaming_track_id と同
+    // パターンで、 ループ内で live_clip_key を毎 clip 呼ぶ線形探索を避ける。
     let renaming_clip_key = app.ui_ephemeral.clip_rename.and_then(|r| {
         let t = app.song_doc.song().track_by_id(r.track_id)?;
         let c = t.clip_by_id(r.clip_id)?;
@@ -495,22 +497,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             None,
             None,
         );
-        // undo bracket: drag / text 編集の active edge で BeginInspectorScrub (= Song snapshot)
-        // / EndInspectorScrub を発火し、 一連の SetLaneDefault を undo 1 step にまとめる
-        // (scrub_field と同 idiom)。
-        let active = resp_s.dragging || resp_s.editing_text;
-        let was_active = app.ui_ephemeral.arrange_default_scrub_active == Some(model_key);
-        if active && !was_active {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.arrange_default_scrub_active = Some(model_key);
-                app.handle_event(AppEvent::BeginInspectorScrub);
-            }));
-        } else if !active && was_active {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.arrange_default_scrub_active = None;
-                app.handle_event(AppEvent::EndInspectorScrub);
-            }));
-        }
+        // undo bracket: 一連の SetLaneDefault を undo 1 step にまとめる
+        // (`view::scrub_gesture` が寿命ごと持つ 1 本、 scrub_field と同 idiom)。
+        crate::view::scrub_gesture::push(
+            ui,
+            app,
+            crate::app::ScrubGesture::LaneDefault(model_key),
+            resp_s.dragging || resp_s.editing_text,
+        );
     }
 
     // (c) point drag 中の現値表示 (人間可読単位、 カーソル近傍)。
@@ -783,7 +777,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let drop_y = drop.position.1;
         // r.md #87: ランチャーのセルに当たったらそのセルへ入れる。
         let cell_target =
-            crate::view::launcher_bridge::cell_drop_target(&resp, drop.position);
+            crate::view::launcher_bridge::cell_drop_target(app, &resp, drop.position);
         let target = match cell_target {
             Some(t) => t,
             None => {

@@ -9,8 +9,8 @@ impl AppData {
 
     /// `AppEvent::DeleteTracks` の dispatcher (r.md #43)。 plugin が song に居る
     /// 場合は `RequestAllStates` を投げて、 受信時に最新 plugin state
-    /// を Song に書き込んでから [`Self::push_undo_snapshot`] + 削除を
-    /// 実行する。 これで「knob を回した状態で track 削除 → Undo」 で
+    /// を Song に書き込んでから、 `edit_song` チョークポイント (= undo snapshot を
+    /// 無条件に積む、 不変条件 5) を通して削除を実行する。 これで「knob を回した状態で track 削除 → Undo」 で
     /// knob 値が復元される。 plugin 無しの song は即時実行 (= state を
     /// 取りに行く相手が居ない)。
     ///
@@ -109,11 +109,20 @@ impl AppData {
         self.delete_tracks_inner(track_ids);
     }
 
-    /// 指定トラック群を `TrackCopy` list に組み立てる (clipboard serialize と
-    /// in-app duplicate の共通口)。`order` は現在の Vec 順 (上から)。各トラックの
-    /// clips / automation lanes が参照する content を inline 同梱 (別プロジェクト /
-    /// 独立複製の復元用)。`state` は呼び出し時点で最新化済み前提。
-    pub(crate) fn collect_track_copies(&self, track_ids: &[u32]) -> Vec<crate::clipboard::TrackCopy> {
+    /// 指定トラック群を [`crate::clipboard::TracksCopy`] に組み立てる (clipboard
+    /// serialize と in-app duplicate の共通口)。`order` は現在の Vec 順 (上から)。
+    /// 各トラックの clips / automation lanes / **ランチャーのセル** が参照する content を
+    /// inline 同梱 (別プロジェクト / 独立複製の復元用)。`state` は呼び出し時点で
+    /// 最新化済み前提。
+    ///
+    /// v35 (r.md #87): content の数え上げは `Track::all_clips` /
+    /// `AutomationLane::all_clips` を通す (= arrangement + launcher)。セルを数え
+    /// 落とすと、別プロジェクトへ貼ったセルが元プロジェクトの `content_id` を
+    /// 保ったまま落ちて、無関係な中身を鳴らすか無音になる。
+    ///
+    /// `scenes` (コピー元の列の並び) も一緒に載せる — セルの着地列を決める唯一の
+    /// 手がかり ([`crate::clipboard::TracksCopy`])。
+    pub(crate) fn collect_track_copies(&self, track_ids: &[u32]) -> crate::clipboard::TracksCopy {
         let mut out: Vec<crate::clipboard::TrackCopy> = Vec::new();
         for t in self.song_doc.song().tracks.iter() {
             if !track_ids.contains(&t.id) {
@@ -123,9 +132,9 @@ impl AppData {
                 std::collections::HashSet::new();
             let mut contents: Vec<crate::clipboard::ContentEntry> = Vec::new();
             let mut cids: Vec<common::model::ContentId> =
-                t.clips.iter().map(|c| c.content_id).collect();
+                t.all_clips().map(|c| c.content_id).collect();
             for lane in &t.automation_lanes {
-                for ac in &lane.clips {
+                for ac in lane.all_clips() {
                     cids.push(ac.content_id);
                 }
             }
@@ -151,18 +160,20 @@ impl AppData {
                 contents,
             });
         }
-        out
+        crate::clipboard::TracksCopy {
+            tracks: out,
+            scenes: self.song_doc.song().scenes.iter().map(|s| s.id).collect(),
+        }
     }
 
-    /// 指定トラック群を `ClipboardPayload::Tracks` envelope JSON に。`order` は現在の
-    /// Vec 順 (上から)。各トラックの clips / automation lanes が参照する content を
-    /// inline 同梱 (別プロジェクト独立復元用)。`state` は呼び出し時点で最新化済み前提。
+    /// 指定トラック群を `ClipboardPayload::Tracks` envelope JSON に。中身の組み立ては
+    /// [`Self::collect_track_copies`] (content の inline 同梱とコピー元の列の並び) が持つ。
     pub(crate) fn serialize_tracks_to_envelope(&self, track_ids: &[u32]) -> Option<(String, usize)> {
         let out = self.collect_track_copies(track_ids);
-        if out.is_empty() {
+        if out.tracks.is_empty() {
             return None;
         }
-        let count = out.len();
+        let count = out.tracks.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
             self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::Tracks(out),
@@ -177,17 +188,25 @@ impl AppData {
     /// インスタンス化。track 内参照 (parent_group / sends / sidechain / lipsync) は copy
     /// 集合内のものを新 id へ remap、集合外は同一プロジェクトなら据え置き (実在)、別
     /// プロジェクトなら drop。挿入したトラック群を新選択にする。戻り値は挿入数。
+    ///
+    /// v35 (r.md #87): ランチャーのセルの列 (`scene_id`) は
+    /// [`Self::remap_pasted_scenes`] が `payload.scenes` (コピー元の列の並び) から
+    /// 貼り先の列へ張り替える。
     pub fn paste_tracks_at(
         &mut self,
-        mut tracks: Vec<crate::clipboard::TrackCopy>,
+        payload: crate::clipboard::TracksCopy,
         src_pid: u64,
         above_track: u32,
     ) -> usize {
+        let crate::clipboard::TracksCopy {
+            mut tracks,
+            scenes: src_scenes,
+        } = payload;
         if tracks.is_empty() {
             return 0;
         }
         tracks.sort_by_key(|t| t.order);
-        // audio editor は positional な ClipKey を持つので index が動く編集では貼り直す。
+        // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
         let audio_editor_key = self.audio_editor_target_key();
         let Some(new_ids) = self.edit_song(|song| {
             let same_project = src_pid == song.project_id;
@@ -197,12 +216,17 @@ impl AppData {
                 .track_index_by_id(above_track)
                 .unwrap_or(song.tracks.len());
             // paste は content 流用ポリシー (same_project で現存 content はリンク共有)。
-            let built = Self::build_pasted_tracks(song, &tracks, same_project, false, drop_parent);
+            let mut built =
+                Self::build_pasted_tracks(song, &tracks, same_project, false, drop_parent);
+            Self::remap_pasted_scenes(song, &mut built, &src_scenes, same_project);
             let new_ids: Vec<u32> = built.iter().map(|(_, t)| t.id).collect();
             // above_track の直上に order 昇順を維持して連続挿入。
             for (off, (_, t)) in built.into_iter().enumerate() {
                 song.tracks.insert((insert_idx + off).min(song.tracks.len()), t);
             }
+            // 行の不変条件 (孤児セル / 消えたセルを指す主導権 / 死んだ列への Jump) は
+            // model が持つ。貼り付けた行にも同じ規則を通す (冪等なので既存行は不変)。
+            song.normalize_session();
             new_ids
         }) else {
             return 0;
@@ -359,13 +383,16 @@ impl AppData {
                 Some(old) if same_project && song.track_by_id(old).is_some() => Some(old),
                 _ => None,
             };
-            for c in &mut t.clips {
+            // v35 (r.md #87): content の張り替えは `all_clips_mut` (= arrangement +
+            // launcher のセル) を通す。セルを落とすと、独立複製 (Alt+D) でセルだけが
+            // 元トラックと content を共有したまま残り、片方の編集がもう片方へ漏れる。
+            for c in t.all_clips_mut() {
                 if let Some(&new) = content_remap.get(&c.content_id) {
                     c.content_id = new;
                 }
             }
             for lane in &mut t.automation_lanes {
-                for ac in &mut lane.clips {
+                for ac in lane.all_clips_mut() {
                     if let Some(&new) = content_remap.get(&ac.content_id) {
                         ac.content_id = new;
                     }
@@ -374,6 +401,138 @@ impl AppData {
             built.push((tc.track.id, t));
         }
         built
+    }
+
+    /// v35 (r.md #87): 組み立て済みトラックのランチャーのセルを、**貼り先の列**へ
+    /// 張り替える。`src_scenes` はコピー元 `Song.scenes` の id を表示順に並べたもの
+    /// ([`crate::clipboard::TracksCopy::scenes`])。
+    ///
+    /// 列 id はプロジェクトごとの id 空間 (設計正本 §1.1) なので、別プロジェクトの
+    /// id をそのまま持ち込むと意味の違う列を指す。解けるのは「元で何列目だったか」
+    /// だけなので、その index を [`common::model::Song::ensure_scene_at`] で実体化して
+    /// 張り替える (セル単体の貼り付け `paste_launcher_cells` と同じ数え方)。
+    ///
+    /// **列を解けなかったセルはここで落とす。** 残すと実在しない列を指したまま
+    /// 保存され、次に開いたときに `Song::normalize_session` の孤児掃除が黙って消す
+    /// (dirty も立たないので、保存前に気付く機会が無い)。
+    ///
+    /// フォローアクションの `Jump { scene_id }` も同じ表で解く — 同じ id 空間の
+    /// 参照なので、片方だけ直すと「貼ったセルが無関係な列へ飛ぶ」形で残る。
+    fn remap_pasted_scenes(
+        song: &mut common::model::Song,
+        built: &mut [(u32, common::model::Track)],
+        src_scenes: &[u32],
+        same_project: bool,
+    ) {
+        // old → new の解は列ごとに 1 つ。行をまたいで解き直すと、同じ列のセルが
+        // 行ごとに違う列へ着地し得る。
+        let mut cache: std::collections::HashMap<u32, Option<u32>> =
+            std::collections::HashMap::new();
+        for (_, t) in built.iter_mut() {
+            let cells = std::mem::take(&mut t.session_clips);
+            for mut cell in cells {
+                let Some(new) = Self::resolve_pasted_scene(
+                    song,
+                    &mut cache,
+                    src_scenes,
+                    same_project,
+                    cell.scene_id,
+                ) else {
+                    continue;
+                };
+                cell.scene_id = new;
+                Self::remap_follow_jump(
+                    song,
+                    &mut cache,
+                    src_scenes,
+                    same_project,
+                    &mut cell.launch,
+                );
+                // 「1 行 1 列 1 セル」の維持は model の口に任せる (別々の列が同じ
+                // 列へ解けたときの置き換え規約も、主導権の引き継ぎもここが持つ)。
+                t.put_session_clip(cell);
+            }
+            for lane in &mut t.automation_lanes {
+                let cells = std::mem::take(&mut lane.session_clips);
+                for mut cell in cells {
+                    let Some(new) = Self::resolve_pasted_scene(
+                        song,
+                        &mut cache,
+                        src_scenes,
+                        same_project,
+                        cell.scene_id,
+                    ) else {
+                        continue;
+                    };
+                    cell.scene_id = new;
+                    Self::remap_follow_jump(
+                        song,
+                        &mut cache,
+                        src_scenes,
+                        same_project,
+                        &mut cell.launch,
+                    );
+                    lane.put_session_clip(cell);
+                }
+            }
+        }
+    }
+
+    /// コピー元の列 id → 貼り先の列 id。解けなければ `None` (= そのセルは貼らない)。
+    ///
+    /// 同一プロジェクトで列が現存すれば **その列のまま** (列を並べ替えていても
+    /// ユーザーが見ていた列に着地する)。それ以外は元の表示 index で実体化する。
+    fn resolve_pasted_scene(
+        song: &mut common::model::Song,
+        cache: &mut std::collections::HashMap<u32, Option<u32>>,
+        src_scenes: &[u32],
+        same_project: bool,
+        old: u32,
+    ) -> Option<u32> {
+        if let Some(&hit) = cache.get(&old) {
+            return hit;
+        }
+        let resolved = if old == 0 {
+            // 未採番 sentinel (= sanitize が潰した重複列 / 壊れた JSON)。
+            None
+        } else if same_project && song.scene_index(old).is_some() {
+            Some(old)
+        } else {
+            // 元で何列目だったか → 貼り先の同じ index を実体化する。
+            src_scenes
+                .iter()
+                .position(|&id| id == old)
+                .map(|index| song.ensure_scene_at(index))
+        };
+        cache.insert(old, resolved);
+        resolved
+    }
+
+    /// セルのフォローアクションが指す `Jump` の飛び先を貼り先の列へ張り替える。
+    /// 解けない飛び先は `NoAction` へ倒す (`Song::normalize_session` が dangling な
+    /// `scene_id` に対して行うのと同じ判断)。
+    fn remap_follow_jump(
+        song: &mut common::model::Song,
+        cache: &mut std::collections::HashMap<u32, Option<u32>>,
+        src_scenes: &[u32],
+        same_project: bool,
+        launch: &mut common::model::LaunchSettings,
+    ) {
+        use common::model::FollowActionKind;
+        for kind in [&mut launch.follow.a, &mut launch.follow.b] {
+            if let FollowActionKind::Jump { scene_id } = *kind {
+                *kind = match Self::resolve_pasted_scene(
+                    song,
+                    cache,
+                    src_scenes,
+                    same_project,
+                    scene_id,
+                ) {
+                    Some(new) => FollowActionKind::Jump { scene_id: new },
+                    None => FollowActionKind::NoAction,
+                };
+            }
+        }
     }
 
     /// トラック複製 (r.md #30) の dispatcher。plugin があれば最新 state を取ってから
@@ -437,7 +596,7 @@ impl AppData {
             .filter(|id| full.contains(id))
             .collect();
         let copies = self.collect_track_copies(&full_ordered);
-        if copies.is_empty() {
+        if copies.tracks.is_empty() {
             return;
         }
 
@@ -446,7 +605,11 @@ impl AppData {
             // same_project=true (元と同一 project)、 独立/リンクは force_independent で
             // 切替、 drop_parent=None で top-level は top-level のまま (group child は
             // 元 parent を継承)。
-            let built = Self::build_pasted_tracks(song, &copies, true, !linked, None);
+            let mut built = Self::build_pasted_tracks(song, &copies.tracks, true, !linked, None);
+            // 同一プロジェクトなので列はそのまま解ける (= 実質 no-op) が、複製も
+            // 貼り付けと同じ 1 本を通す — 列を消した直後に複製した場合も、規則が
+            // 2 本に割れずに済む。
+            Self::remap_pasted_scenes(song, &mut built, &copies.scenes, true);
             let mut built_by_src: std::collections::HashMap<u32, common::model::Track> =
                 built.into_iter().collect();
             // 各 root の subtree を、 元 subtree の直下へ挿入する。 挿入で下方の index が
@@ -513,16 +676,16 @@ impl AppData {
     }
 
     /// 実際の削除処理。 [`Self::on_all_states_from_child`] か上の
-    /// dispatcher の即時 fallback path から呼ばれる。 どちらでも呼び出し
-    /// 側で `push_undo_snapshot` 済みである前提なので、 ここでは push
-    /// しない。
+    /// dispatcher の即時 fallback path から呼ばれる。 undo snapshot は
+    /// どちらの経路でも呼び出し側の `edit_song` が積むので、 ここは
+    /// `song` を書き換えるだけ。
     pub(crate) fn delete_track_inner(&mut self, track_id: u32) {
         let Some(idx) = self.song_doc.song().track_index_by_id(track_id) else {
             return;
         };
-        // Audio Editor の対象は positional な `ClipKey`。 track を remove すると
-        // index が詰まって **別トラックのクリップを指す** ので、 安定 key を
-        // 退避しておき末尾で貼り直す (undo 経路 `after_undo_redo` と同じガード)。
+        // Audio Editor が開いていたら、対象が消える / audio でなくなる場合に閉じる
+        // (undo 経路 `after_undo_redo` と同じガード)。key は安定 id なので
+        // 「詰まって別トラックのクリップを指す」 ことは無い。
         let audio_editor_key = self.audio_editor_target_key();
         let idx = idx as u32;
         if idx as usize >= self.song_doc.song().tracks.len() {
@@ -604,6 +767,12 @@ impl AppData {
         for id in orphan_source_ids {
             self.remove_mod_source(id);
         }
+        // r.md #87: 消えたトラックが口パクのソースだったなら、出力先の口 track に
+        // 残った生成物 (`auto_lipsync` の clip / セル) も道連れにする。 残すと
+        // **歌が無いのに口だけ動く** — しかも再生成の経路 (`mark_lipsync_dirty`)
+        // は binding を持つ track が居なければ何もしないので、二度と片付かない。
+        // 消えたのが口 track 側だったときの dangling binding も同じ 1 本が落とす。
+        self.reap_orphan_lipsync();
         self.selection.selected_track_ids
             .retain(|id| !subtree_ids_set.contains(id));
         if self.selection.selected_track_ids.is_empty()
@@ -680,7 +849,7 @@ impl AppData {
         if a >= n || b >= n {
             return;
         }
-        // audio editor は positional な ClipKey を持つので index が動く編集では貼り直す。
+        // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
         let audio_editor_key = self.audio_editor_target_key();
         self.edit_song(|song| song.tracks.swap(a as usize, b as usize));
         self.reanchor_audio_editor(audio_editor_key);
@@ -712,7 +881,7 @@ impl AppData {
             .tracks
             .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
-        // audio editor は positional な ClipKey を持つので index が動く編集では貼り直す。
+        // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
         let audio_editor_key = self.audio_editor_target_key();
         // selected_clips / selected_clip は stable ClipKey 保持なので reorder
         // (track の index 変化) に自動追従する。 旧実装の id ラウンドトリップ
@@ -1082,4 +1251,105 @@ impl AppData {
         }
     }
 
+}
+
+/// r.md #87: トラックの copy/paste/複製が **ランチャーのセル** を落とさないこと。
+///
+/// セルは `Track.session_clips` に居るので、`clips` だけを歩く走査からは静かに
+/// 抜ける。抜けた結果は「貼った直後は一見正しく、次に開くと消える / 独立コピー
+/// のはずが元と連動する」という **その場では見えない** 壊れ方をするので、
+/// 走査経路そのものをテストで留める。
+#[cfg(test)]
+mod launcher_track_paste_tests {
+    use crate::app::AppData;
+    use crate::app_types::track_with;
+    use crate::clipboard::{ContentEntry, TrackCopy, TracksCopy};
+    use common::model::{
+        Clip, ClipContent, ContentId, LaunchSettings, RowPlayback, SessionClip, Song,
+    };
+
+    /// 3 列あり、3 列目にセルを 1 つ持つトラックの Song。
+    /// 戻り値は `(song, track id, content id, 列 id 列)`。
+    fn song_with_cell() -> (Song, u32, ContentId, Vec<u32>) {
+        let mut song = Song::default();
+        // 先に 1 件捨てて採番をずらす — content id はプロジェクトごとの id 空間
+        // なので、貼り先の採番と偶然一致すると「remap していないのに通る」
+        // テストになる (この bug で壊れるのはまさに id が衝突したとき)。
+        song.alloc_content(ClipContent::default(), String::new());
+        let cid = song.alloc_content(ClipContent::default(), String::new());
+        let scenes: Vec<u32> = (0..3).map(|_| song.push_scene()).collect();
+        let tid = song.alloc_track_id();
+        song.tracks.push(track_with(|t| {
+            t.id = tid;
+            t.name = "T".into();
+            t.session_clips = vec![SessionClip {
+                scene_id: scenes[2],
+                clip: Clip { id: 1, content_id: cid, length_beats: 4.0, ..Clip::default() },
+                launch: LaunchSettings::default(),
+            }];
+            t.launcher = RowPlayback::Launcher { clip_id: 1 };
+        }));
+        (song, tid, cid, scenes)
+    }
+
+    fn copies_of(song: &Song, tid: u32, cid: ContentId, scenes: &[u32]) -> TracksCopy {
+        let content = song.clip_contents.get(&cid).cloned().unwrap_or_default();
+        TracksCopy {
+            tracks: vec![TrackCopy {
+                order: 0,
+                track: song.track_by_id(tid).unwrap().clone(),
+                contents: vec![ContentEntry { content_id: cid, content, name: None }],
+            }],
+            scenes: scenes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn cross_project_paste_lands_cell_on_the_same_column_index() {
+        let (src, tid, cid, scenes) = song_with_cell();
+        let copies = copies_of(&src, tid, cid, &scenes);
+        // 貼り先は列 1 本しか無い別プロジェクト。
+        let mut dst = Song::default();
+        dst.push_scene();
+
+        let mut built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, false, false, None);
+        AppData::remap_pasted_scenes(&mut dst, &mut built, &copies.scenes, false);
+
+        // 元で 3 列目 (index 2) だったので、貼り先も 3 列目まで実体化して着地する。
+        assert_eq!(dst.scenes.len(), 3);
+        let cell = &built[0].1.session_clips[0];
+        assert_eq!(cell.scene_id, dst.scenes[2].id);
+        // 別プロジェクトなのでセルの content も新採番 (元 id を持ち込まない)。
+        assert_ne!(cell.clip.content_id, cid);
+        assert!(dst.clip_contents.contains_key(&cell.clip.content_id));
+    }
+
+    #[test]
+    fn cell_with_unresolvable_column_is_dropped_at_paste() {
+        let (src, tid, cid, scenes) = song_with_cell();
+        let mut copies = copies_of(&src, tid, cid, &scenes);
+        // コピー元の列の並びが壊れている (セルの指す列が表に無い) ケース。
+        copies.scenes = vec![scenes[0]];
+        let mut dst = Song::default();
+
+        let mut built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, false, false, None);
+        AppData::remap_pasted_scenes(&mut dst, &mut built, &copies.scenes, false);
+
+        assert!(built[0].1.session_clips.is_empty(), "解けない列のセルは残さない");
+        assert_eq!(dst.scenes.len(), 0, "解けないセルのために列を作らない");
+    }
+
+    #[test]
+    fn independent_duplicate_forks_cell_content() {
+        let (mut song, tid, cid, scenes) = song_with_cell();
+        let copies = copies_of(&song, tid, cid, &scenes);
+        // 同一プロジェクトの独立複製 (Alt+D) = force_independent_content。
+        let mut built = AppData::build_pasted_tracks(&mut song, &copies.tracks, true, true, None);
+        AppData::remap_pasted_scenes(&mut song, &mut built, &copies.scenes, true);
+
+        let cell = &built[0].1.session_clips[0];
+        assert_ne!(cell.clip.content_id, cid, "独立複製はセルの content も fork する");
+        assert_eq!(cell.scene_id, scenes[2], "同一プロジェクトなら列はそのまま");
+        assert_eq!(song.scenes.len(), 3, "列は増えない");
+    }
 }

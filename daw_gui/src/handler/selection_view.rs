@@ -4,6 +4,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::AppEvent;
+use crate::event_launcher::LauncherEvent;
 use common::model::Note;
 
 impl AppData {
@@ -42,10 +43,12 @@ impl AppData {
     pub fn edit_surface(&self, is_pianoroll_active: bool) -> Option<EditSurface> {
         use EditSurface as S;
         // 0. inline リネーム中はどの面も対象にしない (上記 doc 参照)。
-        if self.ui_ephemeral.track_rename_id.is_some()
-            || self.ui_ephemeral.section_rename_id.is_some()
-            || self.ui_ephemeral.clip_rename.is_some()
-        {
+        //    r.md #87 の列見出し rename も 4 つ目の rename 状態として同列に扱う —
+        //    列見出しの rect は可視列ぶんしか積まれないので、打っている途中に帯を
+        //    横スクロールするだけで入力欄が描かれなくなり、typing lock が外れて
+        //    Delete が選択セルの削除に化ける (view の描画状態に依存しない
+        //    ドメイン側のガードがここに要る理由そのもの)。
+        if self.ui_ephemeral.inline_rename_active() || self.launcher.scene_rename_id.is_some() {
             return None;
         }
         // 選択集合は面を跨いで共存できる (lasso は automation の点とクリップを両方拾う、
@@ -60,32 +63,41 @@ impl AppData {
         // 範囲面 (アレンジャーのトラック行 / オートメーションレーン行)。
         let time_range = time_face == Some(S::TimeRange);
         // ランチャーのセル面 (時間軸を持たない唯一のオブジェクト選択)。
-        let cells = !self.selection.selected_launcher_cells.is_empty();
+        // **実在まで見る** — トラック / レーンごと消えたセルの key が残っていると、
+        // 面は「生きている」のに Delete が 1 件も消せず、他の面へも落ちない
+        // (`Devices` 面が `live_device_ids()` を引くのと同じ理由)。
+        let cells = self.has_live_launcher_cells();
         let tracks = !self.selection.selected_track_ids.is_empty();
         let sections = !self.selection.selected_section_ids.is_empty();
         let devices = !self.live_device_ids().is_empty();
         let auto_prefer_clips = auto_clips
             && (!points || self.selection.last_edit_select == Some(S::AutomationClips));
+        // 面が **まだ生きているか** (= その面の選択集合が非空か) の唯一の表。
+        // last-wins も非空優先順 fallback もここを引く — 同じ条件を 2 か所に書くと、
+        // 面を足したときに片方だけ更新されて静かに食い違う。
+        let live = |s: S| match s {
+            S::AudioEvents => audio_events,
+            S::Notes => notes,
+            S::AutomationPoints => points,
+            S::AutomationClips => auto_clips,
+            S::TimeRange => time_range,
+            S::LauncherCells => cells,
+            // ランチャーの列 (シーン)。セル面とは `SelectionState` 上で排他。
+            S::Scenes => !self.selection.selected_scene_ids.is_empty(),
+            S::Tracks => tracks,
+            S::Sections => sections,
+            S::Devices => devices,
+        };
         // 1. **最後に選んだ面**がまだ非空ならそれ ([[feedback_selection_action_last_wins]])。
         //
         // ポインタが乗っている面より先に見る。 逆順だと、オートメーションレーン行の上に
         // マウスが乗っているだけで、その後に選び直したクリップ / 範囲を差し置いて
         // automation 面が勝ってしまう。 ポインタ位置は**タイブレーク**であって、
         // 直近の明示的な選択を上書きしてよい根拠ではない。
-        let last_wins = match self.selection.last_edit_select {
-            Some(S::AudioEvents) if audio_events => Some(S::AudioEvents),
-            Some(S::Notes) if notes => Some(S::Notes),
-            Some(S::AutomationPoints) if points => Some(S::AutomationPoints),
-            Some(S::AutomationClips) if auto_clips => Some(S::AutomationClips),
-            Some(S::TimeRange) if time_range => Some(S::TimeRange),
-            Some(S::LauncherCells) if cells => Some(S::LauncherCells),
-            Some(S::Tracks) if tracks => Some(S::Tracks),
-            Some(S::Sections) if sections => Some(S::Sections),
-            Some(S::Devices) if devices => Some(S::Devices),
-            _ => None,
-        };
-        if let Some(surface) = last_wins {
-            return Some(surface);
+        if let Some(s) = self.selection.last_edit_select
+            && live(s)
+        {
+            return Some(s);
         }
         // 2. 直近の面が空になった / まだ何も選んでいないとき、ポインタが乗っている面。
         if is_pianoroll_active {
@@ -110,25 +122,18 @@ impl AppData {
         if self.selection.last_edit_select.is_some() {
             return None;
         }
-        if audio_events {
-            return Some(S::AudioEvents);
-        }
-        if points {
-            return Some(S::AutomationPoints);
-        }
-        if notes {
-            return Some(S::Notes);
-        }
-        if time_range {
-            return Some(S::TimeRange);
-        }
-        if cells {
-            return Some(S::LauncherCells);
-        }
-        if auto_clips {
-            return Some(S::AutomationClips);
-        }
-        None
+        // **明示的に選んだときだけ立つ面 (`Tracks` / `Sections` / `Scenes` /
+        // `Devices`) はここに入れない** — それらの選択集合は追従や自動再選択でも
+        // 非空になるので、非空を「その面を操作したい意図」の代理にできない。
+        const FALLBACK: [S; 6] = [
+            S::AudioEvents,
+            S::AutomationPoints,
+            S::Notes,
+            S::TimeRange,
+            S::LauncherCells,
+            S::AutomationClips,
+        ];
+        FALLBACK.into_iter().find(|s| live(*s))
     }
 
     /// Delete キー / Edit メニューの「削除」: [`Self::edit_surface`] が解決した面の
@@ -167,7 +172,19 @@ impl AppData {
             },
             // 範囲: 境界で分割して範囲部分だけ削除 (時間は詰めない)。
             EditSurface::TimeRange => AppEvent::DeleteTimeSelection,
-            EditSurface::LauncherCells => AppEvent::DeleteSelectedClip,
+            // セル面: セルを消す口は [`LauncherEvent::DeleteCells`] 1 本
+            // (右クリックメニュー / `Ctrl+X` と同じ)。対象の解決だけここで済ませる
+            // — 「選択中のセルを消す」専用イベントを別に持つと、undo ラベルや
+            // 前処理が片方だけ育つ (実際 `DeleteSelectedClip` は「クリップ削除」と
+            // 名乗っていた)。
+            EditSurface::LauncherCells => {
+                AppEvent::Launcher(LauncherEvent::DeleteCells(self.live_launcher_cells()))
+            }
+            // 列 (シーン): 選択中の列を削除する。その列のセルも一緒に消える
+            // (`delete_scenes` が `normalize_session` を通す)。
+            EditSurface::Scenes => AppEvent::Launcher(LauncherEvent::DeleteScenes(
+                self.selection.selected_scene_ids.clone(),
+            )),
             // r.md #71 (プラグインのコピー / 移動): チェーンで選んだプラグインを
             // 1 undo step で削除する。 対象 id は正規化を通す (= いま表示している
             // チェーンに実在するものだけ)。
@@ -497,11 +514,16 @@ impl AppData {
         if self.selection.last_edit_select == Some(EditSurface::LauncherCells)
             && !self.selection.selected_launcher_cells.is_empty()
         {
+            // レーン行のセルはピアノロールを持たない (曲線はレーン上で直接編集する)
+            // ので、トラック行のセルだけを残す。
             return self
                 .selection
                 .selected_launcher_cells
                 .iter()
-                .copied()
+                .filter_map(|cell| match cell {
+                    crate::event_launcher::LauncherCellKey::Track(k) => Some(*k),
+                    crate::event_launcher::LauncherCellKey::Lane(_) => None,
+                })
                 .filter(|k| self.live_clip_key(*k).is_some() && self.is_midi_clip(*k))
                 .collect();
         }

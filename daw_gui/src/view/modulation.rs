@@ -117,44 +117,45 @@ pub(crate) fn build_mod(
     ModBuild { entries, live: d.live_display, edit }
 }
 
-/// 自コントロールの modulation depth ドラッグの立ち上がり / 立ち下がり edge を
-/// 追跡する (`app.ui_ephemeral.mod_depth_scrub_active` を **(track_id, target) key**
-/// で保持)。 かつては drag-end で `sync_song_to_plugin_host` を撃って engine に新
-/// depth を届けていたが、 sync 一本化 (docs/plan_arch_refactor.md §7.5) で
-/// `SetModRoutingDepth` の edit_song が bump した epoch を runner の frame flush
-/// (`flush_song_sync`) が 1 frame 1 回で LoadSong する構造になったため、 ここでの
-/// 明示 resync は不要になった (drag 中も per-frame で構造的に coalesce される)。
+/// 自コントロールの modulation depth ドラッグを **(track_id, target)** を所有者と
+/// して [`crate::view::scrub_gesture`] へ申告する
+/// ([`ScrubGesture::ModDepth`](crate::state::ScrubGesture))。
 ///
-/// r.md #78: 加えて **立ち下がり edge で待受 (◉) を解除**する。 arm は
-/// 「触ったツマミ 1 個に繋ぐ」ワンショットだが、 depth ドラッグ中は毎フレーム
-/// `AddModRouting` + `SetModRoutingDepth` を撃つので、 繋いだ瞬間に解除すると
-/// 自分のドラッグを切ってしまう。 よって解除は **ドラッグを離した瞬間**。
-pub(crate) fn push_mod_drag_resync(
+/// **undo bracket**: depth ドラッグは毎フレーム `SetModRoutingDepth`
+/// (= `edit_song`) を撃つので、束ねないと 1 ドラッグで数十 undo step が積まれ
+/// `UNDO_LIMIT` を溢れさせる。 base 値の scrub (`dragging`) と depth ドラッグ
+/// (`mod_dragging`) は widget 側で排他 (`scrubable_number.rs` の
+/// `anchor.depth_drag`) なので、[`super::track_inspector::push_scrub_bracket`] の
+/// bracket と重ならない。 ツマミ / フェーダー / 数値欄すべてがこの 1 本を通る。
+///
+/// **立ち下がりの副作用** (r.md #78): 待受 (◉) の解除。 arm は「触ったツマミ
+/// 1 個に繋ぐ」ワンショットだが、 depth ドラッグ中は毎フレーム `AddModRouting` +
+/// `SetModRoutingDepth` を撃つので、 繋いだ瞬間に解除すると自分のドラッグを
+/// 切ってしまう。 よって解除は **ドラッグを離した瞬間**
+/// ([`crate::view::scrub_gesture::close`] が持つ = 欄が消えて閉じたときも同じ
+/// 処理を通る)。
+///
+/// engine への再同期は**ここでは撃たない**。 sync 一本化
+/// (docs/plan_arch_refactor.md §7.5) で `edit_song` が bump した epoch を runner の
+/// frame flush が 1 frame 1 回で LoadSong するので、 drag 中も per-frame で
+/// 構造的に coalesce される。
+pub(crate) fn push_mod_depth_bracket(
     ui: &mut Ui<'_, AppData>,
     app: &AppData,
     track_id: u32,
     target: &AutomationTarget,
     mod_dragging: bool,
 ) {
-    let is_active = app
-        .ui_ephemeral.mod_depth_scrub_active
-        .as_ref()
-        .is_some_and(|(t, tgt)| *t == track_id && tgt == target);
-    if mod_dragging == is_active {
-        return;
-    }
-    let key = (track_id, target.clone());
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        if mod_dragging {
-            app.ui_ephemeral.mod_depth_scrub_active = Some(key);
-        } else {
-            app.ui_ephemeral.mod_depth_scrub_active = None;
-            // 立ち下がり = このツマミへの割り当てが完了した瞬間。
-            // routing 自体は drag 中に作られているので、 ここは解除と通知だけ。
-            let (track_id, target) = key;
-            app.connect_armed_mod_source_to(track_id, target);
-        }
-    }));
+    // 所有者は **(track_id, target)**。ミキサーは同じ target (例
+    // `TrackBuiltin(Pan)`) を全ストリップに描くので、target だけを鍵にすると
+    // 全部が 1 本の bracket を取り合い、どれか 1 つを drag しただけで他ストリップの
+    // 欄が「非 active」として閉じてしまう。
+    crate::view::scrub_gesture::push(
+        ui,
+        app,
+        crate::app::ScrubGesture::ModDepth { track_id, target: target.clone() },
+        mod_dragging,
+    );
 }
 
 /// `scrub_field` の `scrub_key` から modulation target と表示↔model 変換を導く。

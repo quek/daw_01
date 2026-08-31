@@ -236,8 +236,15 @@ fn push_clip_video_frames(
         let event_progress_beats = clip_local - event.event_start_in_clip_beats;
         let event_progress_secs = match (tempo_map, row_secs) {
             (Some(m), Some(now_secs)) => {
-                let event_start =
-                    scan.song_origin() + clip_start + event.event_start_in_clip_beats;
+                // content-local 拍 → song-absolute 拍は `content_to_song_beat` が
+                // 唯一の口 (r.md #44)。`clip.start_beat + <content-local>` と直に
+                // 書くと **左端を trim したクリップで `content_offset_beats` ぶん
+                // 起点が後ろへずれ**、テンポ自動化のある曲だけ映像 source 時刻が
+                // ずれる (`event_progress_beats` を使う定 BPM 経路は content-local
+                // の引き算なので正しく、この経路だけが食い違っていた)。
+                // ランチャー行ではさらに `song_origin()` (= セルを撃った拍) を足す。
+                let event_start = scan.song_origin()
+                    + clip.content_to_song_beat(event.event_start_in_clip_beats);
                 (now_secs - m.beat_to_seconds(event_start)).max(0.0)
             }
             _ => event_progress_beats * 60.0 / bpm,
@@ -507,6 +514,54 @@ mod tests {
         assert!((secs - expected).abs() < 0.02, "secs={secs} expected={expected}");
         // 一定 60bpm 換算 (4 拍 = 4.0s) より明確に短い (テンポが速いので)。
         assert!(secs < 3.5, "tempo-integrated should beat constant-60 (4.0s), got {secs}");
+    }
+
+    /// 左端を trim したクリップ (`content_offset_beats > 0`) の source 時刻は、
+    /// **テンポ自動化のある曲でも** content 原点基準で進む (r.md #44)。
+    ///
+    /// この経路だけが `clip.start_beat + <content-local 拍>` を直に組み立てていて、
+    /// `content_offset_beats` ぶん起点が後ろへずれていた。定 BPM 経路は
+    /// content-local の引き算なので正しく、**テンポ自動化を載せたときだけ**
+    /// 映像が音とズレる = build / clippy / 既存テストを全部すり抜ける。
+    #[test]
+    fn 左端_trim_した映像はテンポ自動化下でも_content_原点基準で進む() {
+        let mut song = song_with_video_clip(60.0, 1);
+        song.length_beats = 12.0;
+        // clip を左端 2 拍ぶん trim (content 原点 = 拍 2、窓は [4, 12))。
+        song.tracks[0].clips[0].content_offset_beats = 2.0;
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint { id: 1, time_beat: 0.0, value: 60.0, curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 2, time_beat: 12.0, value: 180.0, curve: AutomationCurve::Linear },
+                ],
+                next_point_id: 3,
+            }),
+        );
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "t".into(),
+                start_beat: 0.0,
+                length_beats: 12.0,
+                content_id: cid,
+                content_offset_beats: 0.0,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
+        });
+        let active = VideoPlaybackEngine::active_sources_at(&song, &RowTimeline::preview(8.0));
+        assert_eq!(active.len(), 1);
+        let secs = active[0].source_micros as f64 / 1_000_000.0;
+        let m = common::tempo_map::TempoMap::from_song(&song);
+        // event の content-local 0.0 が置かれる song 拍 = content 原点 = 2.0。
+        let expected = m.beat_to_seconds(8.0) - m.beat_to_seconds(2.0);
+        assert!((secs - expected).abs() < 0.02, "secs={secs} expected={expected}");
+        // 旧実装 (`clip.start_beat` 起点 = 拍 4) との差は誤差ではなく秒単位。
+        let wrong = m.beat_to_seconds(8.0) - m.beat_to_seconds(4.0);
+        assert!((secs - wrong).abs() > 0.5, "content_offset を落としている");
     }
 
     #[test]

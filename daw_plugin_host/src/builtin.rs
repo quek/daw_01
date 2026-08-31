@@ -256,6 +256,7 @@ mod tests {
         h.out_r[1] = -0.4;
         let transport = crate::plugin_instance::TransportContext::from_process_data(
             &common::process_data::ProcessData::empty(),
+            false,
         );
         h.process(128, &[], &[], &[], &[], &transport).unwrap();
         assert!(h.out_l[..128].iter().all(|&v| v == 0.0));

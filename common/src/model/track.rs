@@ -319,9 +319,16 @@ impl Track {
     /// v35 (r.md #87): arrangement (`clips`) と launcher (`session_clips`) の
     /// **全 Clip**。
     ///
-    /// **content の参照数え上げ / GC / content_id 採番はこの 1 本を通すこと。**
-    /// 片方を数え落とすと、保存時に GC が「誰も参照していない content」と判定して
-    /// **セルの中身が黙って消える**。
+    /// **content を参照するもの — 数え上げ / GC / content_id 採番 / 「どの clip が
+    /// content のどこまでを見せるか」 (`Song::ensure_overlay_event_coverage`) — は
+    /// この 1 本を通すこと。** 片方を数え落とすと、保存時に GC が「誰も参照して
+    /// いない content」と判定して**セルの中身が黙って消える**か、overlay の event が
+    /// セルの窓に届かず**撃った直後だけ絵が出て残りは真っ暗**になる。
+    ///
+    /// 逆に **arrangement の時間軸そのものを扱うものは `clips` だけを見る** —
+    /// セルの `start_beat` は常に `0` で song-absolute な位置を持たないので、
+    /// ripple / 範囲コピー / 曲の長さ (`common::timing`) / 立ち絵の body 範囲
+    /// (`common::lipsync`) に混ぜると意味を成さない。
     pub fn all_clips(&self) -> impl Iterator<Item = &Clip> {
         self.clips.iter().chain(self.session_clips.iter().map(|s| &s.clip))
     }

@@ -258,6 +258,9 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         })
         .collect();
 
+    // **アレンジのクリップ選択だけ** (時間範囲からの導出)。ランチャーのセル選択は
+    // 別の面なので混ぜない — 帯へは `LauncherView::selected` が別口で運ぶ
+    // (混ぜたときに何が壊れるかは同フィールドの doc)。
     let selected_clips: Vec<ClipKey> = app
         .selected_clip_refs()
         .into_iter()
@@ -315,6 +318,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         ..ArrangementStyle::from_theme(&app.theme)
     };
 
+    // `selected_clips` と同じく **アレンジ側だけ** (レーン行のセルは混ぜない)。
     let selected_automation_clips: Vec<AutomationClipKey> = app
         .selection
         .selected_automation_clips

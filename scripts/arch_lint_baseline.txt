@@ -188,6 +188,8 @@ FN-BUDGET | ui/crates/ui/src/widgets/text_input.rs::Ui::text_input_at | 375 | da
 #    その代わり、切り出された `press_header.rs::lane_header` と `rects.rs::push_point_rects`
 #    が独立した関数として表に出た (どちらも元は `arrangement()` の中で 11 段だった部分で、
 #    7 段まで下がっている = 改善の途中経過)。piano_roll は未着手。
+#    `push_point_rects` は r.md #87 のレビュー修正 (帯の外へはみ出す rect の絞り込み) で
+#    6 段まで下がったので、この表から外した。
 FN-NESTING | daw_gui/src/widgets/arrangement/release.rs::commit_releases              | 11/338 | #77 の対象外 (本体未分割)。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy      | 10/220 | #77 で 12/399 から改善。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build                     | 10/67  | #77 の対象外。未起票
@@ -198,7 +200,6 @@ FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect
 FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | #77 と同型の分割が未着手
 FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/press_header.rs::lane_header             | 7/14   | #77 が 11 段から切り出した残り。未起票
-FN-NESTING | daw_gui/src/widgets/arrangement/rects.rs::push_point_rects               | 7/10   | #77 が 11 段から切り出した残り。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash       | 7/8    | #77 の対象外。未起票
 
 # 2. view の巨大 draw。1 関数が 1 画面ぶんの UI を組み立てるので、
@@ -255,7 +256,6 @@ FN-NESTING | daw_gui/src/handler/notes.rs::AppData::delete_selected_notes       
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::resize_notes                           | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_velocities                    | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::lane_default_for_target     | 7/36 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::regenerate_lipsync_for_track        | 7/28 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clips.rs::AppData::stretch_clip_content                   | 7/24 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/devices.rs::AppData::on_plugin_loaded_from_child          | 7/24 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/bounce.rs::AppData::handle_bounce_clip_fx_complete        | 7/20 | edit_song 多重ループ。未起票
@@ -267,7 +267,6 @@ FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_image         
 FN-NESTING | daw_gui/src/handler/tracks.rs::AppData::build_pasted_tracks                   | 7/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_automation_clips_at         | 7/14 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/tick.rs::AppData::current_plain_value                     | 7/12 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::track_mix                         | 7/12 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_open_path                     | 7/12 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/sync.rs::AppData::collect_ara_clips_for_track             | 7/11 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::quantize_selected_automation_points | 7/10 | edit_song 多重ループ。未起票
@@ -359,7 +358,6 @@ FN-NESTING | ui/crates/ui/src/shortcut.rs::Shortcut::try_parse                  
 FN-NESTING | ui/crates/ui/src/widgets/goniometer.rs::Ui::goniometer                                 | 7/5   | daw-ui core。未起票
 # --- 時間範囲選択 (docs/plan_range_selection.md) で増えた分 ---------------------
 # ユーザー判断で「ソース規模による分割は行わない」。 機能が landing した後の整理課題として残す。
-FILE-BUDGET | daw_gui/src/view/arrangement_view.rs | 1005 | 範囲選択のツールバー追加で +30。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::action_join_selected_notes | 7/28 | Join Notes (ピアノロールの j)。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/range_ops.rs::AppData::apply_delete_time_selection | 7/11 | 範囲削除のレーン別分岐。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/range_ops.rs::AppData::apply_mute_time_selection | 7/4 | 同上

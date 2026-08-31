@@ -101,10 +101,10 @@ impl AppData {
                 }
                 Some((i as usize).min(n_tracks - 1))
             }
-            // セルへの drop は **安定 id** で来る。解決できない (消えた) なら
-            // 一番下に新規トラックを作る側へ倒す。
+            // セルへの drop は **安定 id** で来る。解決できない (消えた /
+            // セルを持てない行) なら一番下に新規トラックを作る側へ倒す。
             ImportTrackTarget::LauncherCell { track_id, .. } => {
-                self.song_doc.song().track_index_of(track_id)
+                cell_dest_index(self.song_doc.song(), track_id)
             }
             ImportTrackTarget::NoHint => {
                 if n_tracks == 0 {
@@ -477,7 +477,7 @@ impl AppData {
         // r.md #87: セルへの drop は安定 id なので、まず id → index を解く。
         let cell_track_idx = match target {
             ImportTrackTarget::LauncherCell { track_id, .. } => {
-                self.song_doc.song().track_index_of(track_id)
+                cell_dest_index(self.song_doc.song(), track_id)
             }
             _ => None,
         };
@@ -928,10 +928,19 @@ impl AppData {
 /// 曲にクリップが 1 つも無いか (= MIDI import がテンポ / 拍子を取り込んでよいか)。
 /// track の clip、track automation lane の clip、song automation lane の clip を
 /// すべて見る (「クリップが 1 つも無い曲」というユーザー向けの定義そのまま)。
+///
+/// r.md #87: **ランチャーのセルと列も「クリップ」に数える** — `Track::all_clips`
+/// (= `clips` + `session_clips`) を通し、列 (`Song::scenes`) が 1 つでもあれば
+/// その時点で「空でない」。アレンジを使わずセルだけで組んだ曲を「空」と誤判定
+/// すると、SMF を落としただけで曲の BPM と拍子が置き換わり、全セルの Raw
+/// オーディオが伸縮して `LaunchQuantize::Bars` の境界まで動く。
 pub(crate) fn song_has_no_clips(song: &common::model::Song) -> bool {
-    song.tracks.iter().all(|t| {
-        t.clips.is_empty() && t.automation_lanes.iter().all(|l| l.clips.is_empty())
-    }) && song.song_lanes.iter().all(|l| l.clips.is_empty())
+    song.scenes.is_empty()
+        && song.tracks.iter().all(|t| {
+            t.all_clips().next().is_none()
+                && t.automation_lanes.iter().all(|l| l.all_clips().next().is_none())
+        })
+        && song.song_lanes.iter().all(|l| l.all_clips().next().is_none())
 }
 
 /// import した track の表示名。SMF の TrackName meta を優先し、無ければファイル名。
@@ -1168,6 +1177,20 @@ pub(crate) fn place_imported_clip(
             track.place_clip(clip);
         }
     }
+}
+
+/// セルへの取り込み先トラック (表示順 index)。**セルを置けない行 (グループ) は
+/// 「行が消えている」のと同じ扱い**にして `None` を返す — 呼び側はそのとき
+/// 一番下に新規トラックを作る側へ倒すので、置いても鳴らないセルが生まれない
+/// (判定の SSoT は `launcher_cells::row_accepts_cells`)。
+fn cell_dest_index(song: &common::model::Song, track_id: u32) -> Option<usize> {
+    if !crate::handler::launcher_cells::row_accepts_cells(
+        song,
+        crate::event_launcher::LauncherRow::Track(track_id),
+    ) {
+        return None;
+    }
+    song.track_index_of(track_id)
 }
 
 /// 取り込み先の列 (表示順 index)。ランチャーのセル / 新規トラック行への drop の

@@ -272,14 +272,22 @@ impl AudioProcessorHalf for Vst3AudioHalf {
         self.process_context.tempo = b.bpm;
         self.process_context.timeSigNumerator = i32::from(b.tsig_num);
         self.process_context.timeSigDenominator = i32::from(b.tsig_denom);
-        // `projectTimeSamples` derives from the authoritative song_pos_beats
-        // (the engine leaves `steady_time` at 0), keeping it consistent with
-        // `projectTimeMusic` and the ARA playback regions. Without this,
-        // ARA plug-ins (Melodyne) see a frozen position 0 and render the
-        // region's first frame forever.
-        self.process_context.projectTimeSamples = b.song_pos_samples;
-        self.process_context.continousTimeSamples = b.song_pos_samples;
-        self.process_context.projectTimeMusic = b.song_pos_beats;
+        // `projectTimeSamples` derives from the same beat position as
+        // `projectTimeMusic` (the engine leaves `steady_time` at 0), keeping the
+        // two consistent with each other and with the ARA playback regions.
+        // Without this, ARA plug-ins (Melodyne) see a frozen position 0 and
+        // render the region's first frame forever.
+        //
+        // r.md #87: この拍は**行のタイムライン** (`TransportBlock` の doc)。ただし
+        // ARA を bind した instance は song 時間に固定される
+        // (`PluginEntry::transport_pinned_to_song`) — playback region が song 時間に
+        // 置かれているため。結果として **ARA を挿した行をランチャーで撃っても
+        // ARA 側はアレンジを鳴らし続ける**: ARA のセル対応は未実装で (計画書に項目が
+        // 無く per-cell の playback region を切る設計判断が要る)、ここは従来の挙動を
+        // 保つ方に倒してある。
+        self.process_context.projectTimeSamples = b.pos_samples;
+        self.process_context.continousTimeSamples = b.pos_samples;
+        self.process_context.projectTimeMusic = b.pos_beats;
         self.process_context.barPositionMusic = b.bar_start_beats;
         self.process_context.cycleStartMusic = b.loop_start_beats;
         self.process_context.cycleEndMusic = b.loop_end_beats;

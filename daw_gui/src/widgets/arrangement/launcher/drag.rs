@@ -39,14 +39,21 @@ fn update_sessions(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
 }
 
 /// 帯幅 drag の per-frame 反映。**端まで寄せたらレイアウトそのものを切り替える**
-/// (左端 = アレンジのみ / 右端 = ランチャーのみ、計画書 Q5)。「両方」のときの幅は
-/// `launcher_width` に覚えたままにするので、`Tab` で一巡して戻ると同じ幅に戻る。
+/// (左端 = アレンジのみ / 右端 = ランチャーのみ、計画書 Q5)。
+///
+/// **「表示に使う幅」と「『両方』として覚える幅」を分ける。** ポインタは掴み代
+/// ([`layout::pane_w_bounds`]) まで連続に追従するが、`ui_prefs.launcher_width` へ書くのは
+/// 両側が実用幅で収まる範囲 ([`layout::both_pane_w_bounds`]) に居るあいだだけ。
+/// 分けないと、端まで引く途中の「格子が 1 列も入らない幅」で最後の書き込みが起き、
+/// `Tab` で「両方」へ戻したとき掴み代だけの帯が出る (計画書 Q5-b の
+/// 「『両方』の比率は覚えている」が成り立たない)。
 fn emit_pane_width(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     let Some((px, _)) = f.pointer.pos else { return };
     if f.pointer.primary_just_released {
         return;
     }
-    let (lo, hi) = pane_w_bounds(f);
+    let avail = (f.rect.w - f.header_w).max(1.0);
+    let (lo, hi) = layout::pane_w_bounds(avail);
     let mut emit: Option<f32> = None;
     {
         let state: &mut ArrangementState = ui.widget_state(f.wid);
@@ -59,9 +66,12 @@ fn emit_pane_width(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
         }
     }
     let Some(next) = emit else { return };
-    let layout = if next <= lo + 1.0 {
+    let (both_lo, both_hi) = layout::both_pane_w_bounds(avail);
+    // 「両方」として成立しない幅まで引いたら、その時点で端へ吸着する
+    // (`|| next <= lo + 1.0` は窓が狭くて両側の最低幅を取れないときの退化ケース)。
+    let layout = if next < both_lo || next <= lo + 1.0 {
         LauncherLayout::ArrangerOnly
-    } else if next >= hi - 1.0 {
+    } else if next > both_hi || next >= hi - 1.0 {
         LauncherLayout::LauncherOnly
     } else {
         LauncherLayout::Both
@@ -129,15 +139,6 @@ fn scroll_scenes(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         app.ui_prefs.launcher_scroll_scene = next;
     }));
-}
-
-/// 帯幅の下限 / 上限。**どちらの端でも [`GRAB_W`] を残す** ([`layout::resolve_pane_w`] と
-/// 同じ式 — ここだけ別の式にすると「掴めるのに動かない端」ができる)。
-#[must_use]
-pub(super) fn pane_w_bounds(f: &ArrangementFrame<'_>) -> (f32, f32) {
-    let avail = (f.rect.w - f.header_w).max(1.0);
-    let lo = GRAB_W.min(avail * 0.5).max(0.0);
-    ((lo), (avail - GRAB_W).max(lo))
 }
 
 /// シーン並べ替えの落とし先 (表示 index)。**overlay の指標線と commit が同じこの 1 本を通る**

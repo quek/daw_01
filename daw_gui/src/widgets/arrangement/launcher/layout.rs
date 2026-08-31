@@ -66,16 +66,45 @@ pub(crate) fn resolve_pane_w(view: &LauncherView, avail_w: f32) -> f32 {
 /// クリップは揃っているのに `arrange_zoom_x` の意味だけ静かにズレる」状態になる。
 #[must_use]
 pub(crate) fn resolve_pane_w_raw(layout: LauncherLayout, width: f32, avail_w: f32) -> f32 {
-    let lo = GRAB_W.min(avail_w * 0.5).max(0.0);
-    let hi = (avail_w - GRAB_W).max(lo);
+    let (lo, hi) = pane_w_bounds(avail_w);
     match layout {
         LauncherLayout::ArrangerOnly => lo,
         LauncherLayout::LauncherOnly => hi,
         LauncherLayout::Both => {
             let w = if width > 0.0 { width } else { DEFAULT_PANE_W };
-            w.clamp(lo, hi)
+            // **「両方」は両側が実用幅のときだけ成立する** ([`MIN_BOTH_PANE_W`])。
+            // 素の `lo`/`hi` で clamp すると、記憶が潰れた値 (端まで引く途中の 13px 等) を
+            // そのまま採用して格子が 1 列も描けない「両方」になる。
+            let (blo, bhi) = both_pane_w_bounds(avail_w);
+            w.clamp(blo, bhi)
         }
     }
+}
+
+/// 帯幅の絶対的な下限 / 上限。**どちらの端でも [`GRAB_W`] を残す** (計画書 Q5)。
+///
+/// 端に吸着したレイアウト (`ArrangerOnly` / `LauncherOnly`) の帯幅そのものでもある。
+#[must_use]
+pub(crate) fn pane_w_bounds(avail_w: f32) -> (f32, f32) {
+    let lo = GRAB_W.min(avail_w * 0.5).max(0.0);
+    (lo, (avail_w - GRAB_W).max(lo))
+}
+
+/// 「両方」レイアウトで帯幅に許す範囲。
+///
+/// 帯とアレンジの**両側**が [`MIN_BOTH_PANE_W`] を満たす範囲。窓がそれを 2 つ取れない
+/// ほど狭いときは [`pane_w_bounds`] に落ちる (少なくともスプリッタは掴めるので戻せる)。
+///
+/// **「表示に使う幅」ではなく「『両方』として記憶してよい幅」の SSoT。**
+/// `drag::emit_pane_width` の吸着判定と [`resolve_pane_w_raw`] が同じこの 1 本を通るので、
+/// 「覚えた幅で復元したら畳まれていた」が構造的に起きない。
+#[must_use]
+pub(crate) fn both_pane_w_bounds(avail_w: f32) -> (f32, f32) {
+    let (lo, hi) = pane_w_bounds(avail_w);
+    if avail_w < MIN_BOTH_PANE_W * 2.0 {
+        return (lo, hi);
+    }
+    (MIN_BOTH_PANE_W.max(lo), (avail_w - MIN_BOTH_PANE_W).min(hi))
 }
 
 /// 列幅を `ui_prefs` から解く (未設定 / 壊れた値は既定幅)。
@@ -209,6 +238,22 @@ pub(crate) fn row_at_y(f: &ArrangementFrame<'_>, y: f32) -> Option<ArrangementRo
 // セル
 // ============================================================
 
+/// この行が **自分のセルを所有できる**か (= 落とし先 / 作成 / 編集 / メニューの対象)。
+///
+/// **「押せるか」とは別の問い。** グループ行のまとめセルは押せる (子行へ展開して一斉発火)
+/// が、グループトラックは自分のクリップを鳴らさない (`process_track_owned` が
+/// `track_has_children` で pass 1 を抜ける) ので、そこに作られたセルは
+/// **見えない・撃てない・鳴らない**。マスター行はそもそもクリップを持たない。
+///
+/// 落とし先 ([`drop_cell_at`]) / caller へ返す rect (`draw::row_cells` の `cell_rects`) /
+/// ダブルクリックの作成 (`release::double_click`) が **すべてこの 1 本**を通る。
+/// 判定を口ごとに書くと「押下側は弾くのに rect 経由の口だけ素通りする」食い違いが
+/// 生まれ、右クリックメニューやファイル drop からだけ不可視のセルを作れてしまう。
+#[must_use]
+pub(crate) fn row_takes_cells(f: &ArrangementFrame<'_>, row_key: ArrangementRowKey) -> bool {
+    f.launcher_view.rows.get(&row_key).is_some_and(|r| r.takes_cells)
+}
+
 /// 行 × 列のセル矩形。クリップと同じ上下インセット (`clip_to_rect` の `+2 / -4`) を
 /// 使うので、帯とアレンジでクリップの高さが揃う。
 #[must_use]
@@ -290,12 +335,8 @@ pub(crate) fn drop_cell_at(
     }
     let col = rects.col_index_at_x(x)?;
     let row = row_at_y(f, y)?;
-    if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) {
-        return None;
-    }
-    // グループ行は自分のクリップを鳴らさない (まとめセルは「子を一斉に」の意味
-    // しか持たない) ので、落とし先にはしない。
-    if f.launcher_view.rows.get(&row.key).is_some_and(|r| r.group) {
+    // マスター行 / グループ行はセルを所有できない ([`row_takes_cells`] が唯一の判定)。
+    if !row_takes_cells(f, row.key) {
         return None;
     }
     Some(cell_key(f.launcher_view, row.key, col))

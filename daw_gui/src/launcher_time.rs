@@ -38,20 +38,25 @@
 //! # 起点 (`launch_beat`) をどこから取るか
 //!
 //! 走行中のセル位置は `Song` に入らない (計画書 §1.4 — 保存すると「何秒鳴らして
-//! から書き出したか」で出力が変わり、Q9 の再現性が壊れる)。よってここは
-//! **`Song` 起点の決定的解決**を既定にする:
+//! から書き出したか」で出力が変わり、Q9 の再現性が壊れる)。だから起点は
+//! **走行状態 ([`RunningRow`]) が持ち**、それを [`RowTimeline::with_running`] へ
+//! 差す。走行状態に載っていない行だけが `Song` 起点の決定的解決へ倒れる:
 //!
-//! - プレビュー ([`RowTimeline::preview`]) … 起点 = 曲頭 (拍 0)。
-//! - 書き出し ([`RowTimeline::export`]) … 起点 = 書き出し範囲の先頭
-//!   (計画書 Q9 / §2.5「範囲の先頭で今の `Track.launcher` を一斉に撃った」)。
+//! - プレビュー ([`RowTimeline::preview`]) … 走行状態 = 実行中の engine が
+//!   shmem へ publish した表 (`AppData::launcher_running_rows`)。倒れ先の起点は
+//!   曲頭 (拍 0)。
+//! - 動画書き出し (`render_video`) … 走行状態 = 音声書き出しが焼いた sidecar
+//!   ([`common::launcher_sidecar::LauncherSidecar`])。倒れ先の起点は書き出し
+//!   範囲の先頭 (計画書 Q9 / §2.5「範囲の先頭で今の `Track.launcher` を一斉に
+//!   撃った」)。
 //!
-//! 束 B (daw_audio) が `common::audio_bridge` へ走行状態を publish したら、
-//! [`RunningRow`] の列を [`RowTimeline::with_running`] へ渡すだけで、フォロー
-//! アクションで遷移した先まで絵が追う。**未接続でも既定値でコンパイルが通る**。
+//! **走行状態を差さない書き出し経路を新設しないこと** — フォローアクションの
+//! 遷移を決めているのは `daw_audio::launcher::LauncherRuntime` だけなので、
+//! 起点だけで解くと「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
 
 use common::model::{
-    AutomationClip, AutomationLane, Clip, RowPlayback, SessionAutomationClip, SessionClip, Song,
-    Track,
+    AutomationClip, AutomationLane, Clip, LAUNCH_EPSILON_BEATS, RowPlayback, SessionAutomationClip,
+    SessionClip, Song, Track,
 };
 
 /// 行の identity。行 = arrangement の 1 行と 1:1 で、トラック行と展開した
@@ -98,6 +103,24 @@ pub struct RunningRow {
     pub launch_beat: f64,
 }
 
+impl From<common::launcher_sidecar::LauncherRowState> for RunningRow {
+    /// 動画書き出しの入口 — 音声書き出しが焼いた sidecar の 1 行を走行状態へ直す
+    /// (r.md #87 §3.6)。`lane_id == 0` がトラック行という規約は
+    /// `common::launcher_sidecar::LauncherRowState` / `daw_audio::launcher::RowKey` と
+    /// 共通で、その対応表はここ 1 本だけが持つ。
+    fn from(s: common::launcher_sidecar::LauncherRowState) -> Self {
+        Self {
+            row: if s.lane_id == 0 {
+                RowId::track(s.track_id)
+            } else {
+                RowId::lane(s.track_id, s.lane_id)
+            },
+            state: s.playback,
+            launch_beat: s.launch_beat,
+        }
+    }
+}
+
 /// 1 行を解いた結果 = 「どのクリップ列を、どの拍で走査するか」。
 ///
 /// アレンジ行では `clips = &track.clips` / `clip_beat = song の playhead` なので
@@ -140,25 +163,14 @@ pub struct RowTimeline<'a> {
 }
 
 impl RowTimeline<'static> {
-    /// プレビュー用。走行状態が未接続なので「曲頭で `Track.launcher` を一斉に
-    /// 撃った」決定的解決になる (module doc「起点をどこから取るか」)。
+    /// 走行状態を差さない解決 — 「曲頭で `Track.launcher` を一斉に撃った」
+    /// 決定的解決 (module doc「起点をどこから取るか」)。**engine が走っている
+    /// 画面のプレビューは使わないこと** (`AppData::launcher_timeline` が
+    /// 走行状態を差した形を作る)。用途は engine の観測値が無い場所
+    /// — テストと、まだ再生していない曲の静止プレビュー。
     #[must_use]
     pub fn preview(playhead_beat: f64) -> Self {
         Self::with_running(0.0, playhead_beat, &[])
-    }
-
-    /// GUI の `TransportState::playhead_beat` (停止中は `None`) からの近道。
-    /// `None` は拍 0 として解く。
-    #[must_use]
-    pub fn at_playhead(playhead_beat: Option<f32>) -> Self {
-        Self::preview(playhead_beat.map(f64::from).unwrap_or(0.0))
-    }
-
-    /// 動画書き出し用。起点は **書き出し範囲の先頭** (計画書 Q9 / §2.5)。
-    /// 同じプロジェクトなら何度書き出しても同じ絵になる。
-    #[must_use]
-    pub fn export(origin_beat: f64, playhead_beat: f64) -> Self {
-        Self::with_running(origin_beat, playhead_beat, &[])
     }
 }
 
@@ -283,16 +295,6 @@ enum RowState {
     Cell { clip_id: u32, launch_beat: f64 },
 }
 
-/// 撃った拍と playhead が「同時」とみなされる許容幅 (拍)。
-///
-/// **これが無いと範囲書き出しの 1 フレーム目が全ランチャー行で無地になる。**
-/// `render_video` の frame 0 は `seconds_to_beat(beat_to_seconds(start_beat))` で
-/// 拍へ戻すが、`TempoMap` は 1/16 拍刻みの表を線形補間するので往復は厳密でない —
-/// 実測で **1/16 拍に乗らない拍の約 6% が最大 5.7e-14 拍ぶん下振れ**する。
-/// 素朴に `elapsed < 0.0` で切ると、その下振れが「まだ撃たれていない」と判定される。
-/// `1e-9` 拍は 120 BPM で 0.5 ns — 浮動小数の雑音より遥かに大きく、
-/// 音楽的に意味のある間隔より遥かに小さい。
-const LAUNCH_EPSILON_BEATS: f64 = 1e-9;
 
 /// **実効拍の式そのもの** (計画書 §2.1)。返すのは
 /// `effective_beat - launch_beat` = セル内の位相で、値域は `[0, loop_len)`。
@@ -421,13 +423,13 @@ mod tests {
         let mut track = track_with_cell();
         track.launcher = RowPlayback::Launcher { clip_id: 2 };
         // 書き出し範囲 [10, ..) の 1 拍目 → 位相 1.0、song 拍 11.0。
-        let rows = RowTimeline::export(10.0, 11.0);
+        let rows = RowTimeline::with_running(10.0, 11.0, &[]);
         let scan = rows.track_scan(&track).expect("鳴っている");
         assert_eq!(scan.clip_beat, 1.0);
         assert_eq!(scan.song_beat, 11.0, "テンポ写像は song-absolute で行う");
         assert_eq!(scan.song_origin(), 10.0);
         // 範囲の先頭ちょうどはセルの頭。
-        let head = RowTimeline::export(10.0, 10.0).track_scan(&track).unwrap();
+        let head = RowTimeline::with_running(10.0, 10.0, &[]).track_scan(&track).unwrap();
         assert_eq!(head.clip_beat, 0.0);
     }
 
@@ -496,11 +498,61 @@ mod tests {
     fn 撃った拍のわずかな下振れは頭として扱う() {
         let mut track = track_with_cell();
         track.launcher = RowPlayback::Launcher { clip_id: 2 };
-        let rows = RowTimeline::export(10.0, 10.0 - 5.7e-14);
+        let rows = RowTimeline::with_running(10.0, 10.0 - 5.7e-14, &[]);
         let scan = rows.track_scan(&track).expect("1 フレーム目が消えてはいけない");
         assert_eq!(scan.clip_beat, 0.0, "セルの頭に丸める");
         // 本物の「まだ撃たれていない」(量子化予約など) は従来どおり無音。
-        assert!(RowTimeline::export(10.0, 9.9).track_scan(&track).is_none());
+        assert!(RowTimeline::with_running(10.0, 9.9, &[]).track_scan(&track).is_none());
+    }
+
+    /// 動画書き出しの実配線 — 音声書き出しが焼いた sidecar をフレームの拍で
+    /// 差すと、**フォローアクションで移った先のセルが映る**。
+    ///
+    /// ここが切れていると「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」に
+    /// なるが、build / clippy / 既存テストは全部通ってしまう (絵が違うだけ)。
+    /// `lane_id == 0` = トラック行の対応表 ([`RunningRow::from`]) も同時に見る。
+    #[test]
+    fn sidecar_の遷移列を差すと書き出しの絵が次のセルへ移る() {
+        use common::launcher_sidecar::{LauncherRowState, LauncherSidecar};
+
+        let mut track = track_with_cell();
+        track.launcher = RowPlayback::Launcher { clip_id: 2 };
+        track.session_clips.push(SessionClip {
+            scene_id: 2,
+            clip: Clip { id: 3, start_beat: 0.0, length_beats: 4.0, ..Clip::default() },
+            launch: LaunchSettings::default(),
+        });
+
+        // engine 側の走行: 拍 10 (書き出し範囲の先頭) でセル 2、拍 14 で
+        // フォローアクションがセル 3 へ移した。
+        let mut sidecar = LauncherSidecar::new();
+        let row = |clip_id, launch_beat| LauncherRowState {
+            track_id: 7,
+            lane_id: 0,
+            playback: RowPlayback::Launcher { clip_id },
+            launch_beat,
+        };
+        sidecar.push(10.0, row(2, 10.0));
+        sidecar.push(14.0, row(3, 14.0));
+
+        let mut states = Vec::new();
+        let mut running = Vec::new();
+        let mut scan_at = |beat: f64| {
+            sidecar.sample_at(beat, &mut states);
+            running.clear();
+            running.extend(states.iter().copied().map(RunningRow::from));
+            let rows = RowTimeline::with_running(10.0, beat, &running);
+            rows.track_scan(&track).map(|s| (s.clips[0].id, s.clip_beat, s.song_beat))
+        };
+
+        assert_eq!(scan_at(11.0), Some((2, 1.0, 11.0)), "遷移前はセル 2");
+        assert_eq!(scan_at(15.0), Some((3, 1.0, 15.0)), "遷移後はセル 3 (位相も撃ち直し)");
+        // 遷移拍ちょうどは新しいセルの頭 (区分定数の境界は `beat` 以下で最後の遷移)。
+        assert_eq!(scan_at(14.0), Some((3, 0.0, 14.0)));
+        // sidecar の最初の遷移より手前は表が空 → `Song.launcher` + `origin_beat` へ倒れる
+        // (= 従来の絵。単体 WAV 書き出しで `.launcher` が無いときと同じ経路)。
+        assert_eq!(scan_at(9.5), None, "起点 10 より手前はまだ撃たれていない");
+        assert_eq!(scan_at(10.5), Some((2, 0.5, 10.5)));
     }
 
     // ---- オートメーションレーン行 ------------------------------------------

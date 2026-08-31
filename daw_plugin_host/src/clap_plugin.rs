@@ -1547,8 +1547,8 @@ fn build_clap_transport_event(
     _frames: u32,
 ) -> clap_event_transport {
     let b = TransportBlock::derive(transport, f64::from(transport.sample_rate));
-    let song_pos_beats: i64 = (b.song_pos_beats * CLAP_BEATTIME_FACTOR as f64) as i64;
-    let song_pos_seconds: i64 = (b.song_pos_seconds * CLAP_SECTIME_FACTOR as f64) as i64;
+    let song_pos_beats: i64 = (b.pos_beats * CLAP_BEATTIME_FACTOR as f64) as i64;
+    let song_pos_seconds: i64 = (b.pos_seconds * CLAP_SECTIME_FACTOR as f64) as i64;
     let bar_start: i64 = (b.bar_start_beats * CLAP_BEATTIME_FACTOR as f64) as i64;
     let mut flags = CLAP_TRANSPORT_HAS_TEMPO
         | CLAP_TRANSPORT_HAS_BEATS_TIMELINE
@@ -2027,6 +2027,12 @@ mod tests {
             is_looping: false,
             loop_start_beats: 0.0,
             loop_end_beats: 0.0,
+            // アレンジ主導の行 = 行の実効拍は song 拍と同値 (engine の写像)。
+            row: common::process_data::RowTransport {
+                pos_beats: 999.0,
+                ..Default::default()
+            },
+            pin_to_song: false,
         }
     }
 

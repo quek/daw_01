@@ -17,7 +17,7 @@ use common::automation::{norm_to_plain, plain_to_norm};
 
 use crate::automation_value::automation_value_display;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
-use crate::view::modulation::{build_mod, push_mod_drag_resync};
+use crate::view::modulation::{build_mod, push_mod_depth_bracket};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
 use daw_ui_renderer::{Color, Rect, RectCommand};
@@ -622,7 +622,7 @@ fn draw_strip(
             },
             Some(pan_mod.modulation()),
         );
-        push_mod_drag_resync(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
+        push_mod_depth_bracket(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
 
         // Pan の数値欄 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
         // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
@@ -772,7 +772,7 @@ fn draw_strip(
             was_dragging_vol,
             resp.fader.dragging,
         );
-        push_mod_drag_resync(ui, app, track_idx, &vol_target, resp.mod_dragging);
+        push_mod_depth_bracket(ui, app, track_idx, &vol_target, resp.mod_dragging);
     }
 }
 

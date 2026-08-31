@@ -142,7 +142,12 @@ impl LaunchSettings {
 ///
 /// **`Bars` を beats へ落とすのに拍子が要る**ので、換算は
 /// [`LaunchQuantize::beats`] を唯一の口にすること (`4.0` 決め打ちを散らさない)。
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode)]
+// `Eq` / `Hash`: 中身は整数と bool だけ。口パクの入力 fingerprint
+// (`AppData::lipsync_input_fingerprint`) が、生成する口パクセルへ写す発火設定として
+// この値を直接ハッシュする。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Encode, Decode,
+)]
 pub enum LaunchQuantize {
     /// トランスポートのグローバル設定に従う (セルの既定)。
     #[default]
@@ -216,6 +221,31 @@ pub const LAUNCH_QUANTIZE_CHOICES: &[(LaunchQuantize, &str)] = &[
 
 /// グローバルローンチ量子化の既定 (= 1 小節)。Live / Bitwig / Studio One と同じ。
 pub const DEFAULT_GLOBAL_LAUNCH_QUANTIZE: LaunchQuantize = LaunchQuantize::Bars(1);
+
+/// 「撃った拍」と playhead が**同時**とみなされる許容幅 (拍)。発火判定・ループ端・
+/// ワンショット終端の比較はすべてこの幅で行う。
+///
+/// **GUI (`daw_gui::launcher_time`) と engine (`daw_audio::launcher`) が同じ値を
+/// 使うこと。片方だけ変えると、ランチャー行の映像が音より 1 フレーム早く / 遅く
+/// 切り替わる** (絵は GUI の判定、音は engine の判定で決まるため)。だから定数は
+/// ここ 1 本にあり、両側は必ずこれを引く。
+///
+/// 値の根拠 — 吸収すべき誤差の上限と、飲み込んではいけない下限の間で決める:
+///
+/// - **吸収する側 (下限)**: engine は発火時刻を frame へ floor するので、発火 frame の
+///   拍は発火拍のわずか手前に来る。加えて frame ↔ 拍の往復で数 ULP、`TempoMap` の
+///   1/16 拍テーブルの線形補間で最大 ~6e-14 拍ぶん下振れする。素朴に `elapsed < 0.0`
+///   で切ると、これらが「まだ撃たれていない」と判定されて 1 フレーム無地になる。
+/// - **飲み込まない側 (上限)**: 1 frame の拍数は `bpm / (60 * sr)`。
+///   [`Song::sanitize_ranges`](crate::model::Song::sanitize_ranges) が bpm を
+///   `1000` で clamp するので、最悪 (1000 BPM / 48 kHz) でも `3.5e-4` 拍。
+///   192 kHz なら `8.7e-5` 拍。許容幅がこれを超えると **1 frame まるごと**
+///   飲み込めてしまう。
+///
+/// `1e-5` 拍は最悪ケースの 1 frame の 1/3 未満 (通常の 48 kHz / 120 BPM では 1/8)、
+/// 実時間では 120 BPM で 5 µs = 1 sample 未満。誤差より遥かに大きく、
+/// 音楽的に意味のある最小単位 (1/128 3 連 ≒ 0.02 拍) より遥かに小さい。
+pub const LAUNCH_EPSILON_BEATS: f64 = 1e-5;
 
 /// セルを押した / 離したときの解釈 (Live の Launch Mode)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode)]
@@ -480,10 +510,20 @@ impl super::Song {
     /// 4. 実在しないセルを指す主導権を [`RowPlayback::LauncherStopped`] へ落とす。
     ///    [`RowPlayback::Arranger`] へは戻さない — 戻すと「ランチャーに渡した行」の
     ///    アレンジのクリップが黙って鳴り出す
+    /// 5. **セルを置けない行** ([`AutomationTarget::accepts_launcher_cells`](super::AutomationTarget::accepts_launcher_cells) が `false` =
+    ///    テンポ / 拍子レーン) のセルを捨て、主導権を [`RowPlayback::Arranger`] へ戻す。
+    ///    ここだけ `Arranger` へ戻すのは、その行はそもそもランチャーが握れない
+    ///    (握ると量子化グリッドが自己参照する) から
+    /// 6. 消えた列を指す `last_launched_scene_id` を `0` (未発火) へ落とす
     pub fn normalize_session(&mut self) {
         self.ensure_scene_ids();
         let live_scenes: std::collections::HashSet<u32> =
             self.scenes.iter().map(|s| s.id).collect();
+        if self.last_launched_scene_id != 0
+            && !live_scenes.contains(&self.last_launched_scene_id)
+        {
+            self.last_launched_scene_id = 0;
+        }
         for track in &mut self.tracks {
             normalize_row(
                 &mut track.session_clips,
@@ -493,6 +533,10 @@ impl super::Song {
                 |c| c.clip.id,
             );
             for lane in &mut track.automation_lanes {
+                if !lane.target.accepts_launcher_cells() {
+                    reject_launcher_row(&mut lane.session_clips, &mut lane.launcher);
+                    continue;
+                }
                 normalize_row(
                     &mut lane.session_clips,
                     &mut lane.launcher,
@@ -539,6 +583,10 @@ impl super::Song {
         // マスターレーンのセルだけが孤児として残り、鳴っていたセルを消しても
         // `RowPlayback` が消えた id を指したまま保存される。
         for lane in &mut self.song_lanes {
+            if !lane.target.accepts_launcher_cells() {
+                reject_launcher_row(&mut lane.session_clips, &mut lane.launcher);
+                continue;
+            }
             normalize_row(
                 &mut lane.session_clips,
                 &mut lane.launcher,
@@ -548,6 +596,16 @@ impl super::Song {
             );
         }
     }
+}
+
+/// セルを置けない行 ([`AutomationTarget::accepts_launcher_cells`](super::AutomationTarget::accepts_launcher_cells) が `false`) の掃除。
+///
+/// セルを捨てるだけでなく主導権も [`RowPlayback::Arranger`] へ戻す —
+/// [`RowPlayback::LauncherStopped`] のまま残すと、テンポレーンが `default_value` を
+/// 出し続けて**曲全体のテンポが黙って変わる**。
+fn reject_launcher_row<C>(cells: &mut Vec<C>, launcher: &mut RowPlayback) {
+    cells.clear();
+    *launcher = RowPlayback::Arranger;
 }
 
 /// [`Song::normalize_session`] の 1 行分。トラック行とオートメーションレーン行で
@@ -751,6 +809,60 @@ mod tests {
         let once = song.clone();
         song.normalize_after_load();
         assert_eq!(song, once, "2 回目の正規化で Song が変わると『開いただけで *』になる");
+    }
+
+    #[test]
+    fn テンポ拍子レーンのセルは掃除され主導権はアレンジへ戻る() {
+        // GUI / engine が同じ判定 (`accepts_launcher_cells`) を引くので、置けたのは
+        // 旧 file か手編集だけ。放置すると「保存されるのに永久に鳴らないセル」と、
+        // `LauncherStopped` で `default_value` に張り付いたテンポが残る。
+        let mut song = song_with_cell();
+        for target in [AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator] {
+            let mut lane = AutomationLane::new(target, 120.0);
+            lane.id = song.song_lanes.len() as u32 + 1;
+            lane.session_clips.push(SessionAutomationClip {
+                scene_id: song.scenes[0].id,
+                clip: AutomationClip { id: 1, ..AutomationClip::default() },
+                launch: LaunchSettings::default(),
+            });
+            lane.launcher = RowPlayback::Launcher { clip_id: 1 };
+            song.song_lanes.push(lane);
+        }
+        // 置ける行 (トラックの Volume レーン) は掃除されないことも同時に見る。
+        let mut ok_lane =
+            AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
+        ok_lane.id = 1;
+        ok_lane.session_clips.push(SessionAutomationClip {
+            scene_id: song.scenes[0].id,
+            clip: AutomationClip { id: 1, ..AutomationClip::default() },
+            launch: LaunchSettings::default(),
+        });
+        song.tracks[0].automation_lanes.push(ok_lane);
+
+        song.normalize_session();
+
+        for lane in &song.song_lanes {
+            assert!(lane.session_clips.is_empty(), "{:?} にセルは置けない", lane.target);
+            assert_eq!(
+                lane.launcher,
+                RowPlayback::Arranger,
+                "{:?} は LauncherStopped で止めてはいけない (テンポが default_value に張り付く)",
+                lane.target
+            );
+        }
+        assert_eq!(song.tracks[0].automation_lanes[0].session_clips.len(), 1);
+    }
+
+    #[test]
+    fn 最後に撃った列は消えたら未発火へ落ちる() {
+        let mut song = song_with_cell();
+        song.last_launched_scene_id = song.scenes[0].id;
+        song.normalize_session();
+        assert_eq!(song.last_launched_scene_id, song.scenes[0].id, "実在する列は触らない");
+
+        song.scenes.clear();
+        song.normalize_session();
+        assert_eq!(song.last_launched_scene_id, 0, "消えた列を指したままだと書き出しが再現しない");
     }
 
     #[test]

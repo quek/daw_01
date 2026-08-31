@@ -18,13 +18,14 @@
 //! |---|---|---|
 //! | 矢印 | `daw.nudge_note_*` | 対象面が `Notes` **でない** かつ ランチャーが操作対象 |
 //! | `Enter` | `daw.launcher_fire` (新規) | ランチャーが操作対象 |
-//! | `Delete` | `delete` → `DeleteSelectedClip` | セルを選んでいる (handler 側で入れ物を判別) |
+//! | `Delete` | `delete` → `LauncherEvent::DeleteCells` | セルを選んでいる (対象面の解決は `delete_current_surface`) |
 //! | `Ctrl+D` | `daw.duplicate_audio_event` | セルを選んでいる (オーディオエディタの選択より優先) |
 //! | `D` / `Alt+D` | `daw.duplicate_clip_*` | セルを選んでいる (`clipboard_ops::dispatch_duplicate`) |
 //!
-//! 「ランチャーが操作対象」 = フォーカスがある **かつ** (ポインタがランチャー帯に
-//! 乗っている または セルを選んでいる)。フォーカスだけを条件にすると、
-//! 一度セルを触った後アレンジで作業していても矢印がランチャーを動かしてしまう。
+//! 「ランチャーが操作対象」の判定は [`launcher_is_target`] 1 本。解決順は
+//! `AppData::edit_surface` と同じ **1. 直近確定面 → 2. ポインタ位置** で
+//! ([[feedback_selection_action_last_wins]])、ポインタは面が 1 つも生きていない
+//! ときのタイブレークにしか使わない。
 
 use daw_ui_core::{Edit, Ui};
 
@@ -33,6 +34,31 @@ use crate::event_launcher::LauncherEvent;
 
 /// 1 フレームに積める repeat 数の上限 (`dispatch_note_nudge` と同じ理由)。
 const MAX_REPEATS_PER_FRAME: usize = 64;
+
+/// **直近に確定した面がランチャーのセル面か。**
+///
+/// セル面は行の種類 (トラック行 / オートメーションレーン行) に関わらず
+/// [`EditSurface::LauncherCells`] 1 面なので、タグ 1 つを見れば決まる。
+#[must_use]
+fn launcher_owns_surface(surface: Option<EditSurface>) -> bool {
+    matches!(surface, Some(EditSurface::LauncherCells))
+}
+
+/// **ランチャーが今の操作対象か** (矢印 / `Enter` / `Ctrl+D` = *既にある選択に
+/// 効く*操作)。
+///
+/// 解決順は `AppData::edit_surface` と同じ **1. 直近確定面 → 2. ポインタ位置**
+/// ([[feedback_selection_action_last_wins]])。「セルを選んでいる」だけを条件に
+/// したり、ポインタを先に見たりすると、アレンジで範囲を選び直した後も矢印が帯を
+/// 動かし続ける (= 固定 tier、規範が禁じている形)。
+///
+/// **選択を作る操作 (`Ctrl+A`) はこれを使わない** — 順序が逆
+/// ([`select_all_cells_if_launcher`])。
+#[must_use]
+pub(crate) fn launcher_is_target(app: &AppData, surface: Option<EditSurface>) -> bool {
+    launcher_owns_surface(surface)
+        || (surface.is_none() && app.launcher.hover.is_some())
+}
 
 /// ランチャーのキーボード操作を消費する。`dispatch_shortcuts` の途中から
 /// **`dispatch_note_nudge` より先に**呼ぶこと (矢印の取り合いをここで決める)。
@@ -47,15 +73,8 @@ pub(crate) fn dispatch_launcher_keys(
             app.handle_event(AppEvent::Launcher(LauncherEvent::CycleLayout));
         }));
     }
-    // ここから下は **ランチャーが今の操作対象** のときだけ。
-    //
-    // フォーカスはセルを 1 度クリックしたら残り続けるので、それだけを条件に
-    // すると「セルを触った後、アレンジで作業していても矢印がランチャーを動かす」
-    // という位置依存の取り違えになる。 対象面の判定は copy / delete と同じ
-    // 流儀 (ポインタが乗っている面 → 選択が生きている面) に揃える。
-    let active = app.launcher.focus.is_some()
-        && (app.launcher.hover.is_some() || !app.selected_launcher_cells().is_empty());
-    if !active {
+    // ここから下は **ランチャーが今の操作対象** のときだけ ([`launcher_is_target`])。
+    if !launcher_is_target(app, surface) {
         return;
     }
     if ui.take_shortcut("daw.launcher_fire") {
@@ -88,17 +107,70 @@ pub(crate) fn dispatch_launcher_keys(
     }
 }
 
+/// `Ctrl+A` (既存 name = `select_all`) をランチャーが取るか。取ったら
+/// **帯のセルを全部選択**して `true` を返す (呼び側は従来の文脈別全選択へ落とさない)。
+///
+/// これが無いと帯の上での `Ctrl+A` が `SelectAllClips` に落ち、曲全体 × 全トラックの
+/// 時間範囲が張られて `last_edit_select` が範囲面へ移る — 画面上は何も変わらないのに
+/// **次の `Delete` がアレンジの全クリップを消す**。
+///
+/// 対象は曲の **全行** (トラック行 + オートメーションレーン行) のセル全部。
+/// 表示の折りたたみを見ないのはアレンジ側の全選択
+/// (`select_all_clips` が `song.tracks` を全部見る) と同じ規約。
+///
+/// レーン行のセルを混ぜられるのは、セル面が
+/// [`EditSurface::LauncherCells`] 1 面 1 集合になったから — 面が 2 つに割れて
+/// いた頃は混ぜると `set_launcher_cell_selection` がタグを片方へ倒し、続く
+/// `Delete` が選んだうちの半分しか消さなかった。
+pub(crate) fn select_all_cells_if_launcher(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    surface: Option<EditSurface>,
+) -> bool {
+    // **ここだけポインタが先**。`Ctrl+A` は選択を*作る*操作なので、既存の文脈別
+    // 全選択と同じく「いまどこを指しているか」が文脈 (選択前なので非空集合では
+    // 振り分けられない、`root.rs` の `select_all` の doc)。 last-wins だけで判定
+    // すると、帯にポインタを置いたままの `Ctrl+A` が `SelectAllClips` に落ちて
+    // 曲全体 × 全トラックの範囲が張られ、面が黙って範囲へ移る (画面は変わらない
+    // のに、続く `Delete` がアレンジの全クリップを消す)。
+    if app.launcher.hover.is_none() && !launcher_owns_surface(surface) {
+        return false;
+    }
+    let scene_ids = app.scene_ids();
+    let cells: Vec<_> = app
+        .all_launcher_rows()
+        .into_iter()
+        .flat_map(|row| {
+            scene_ids
+                .iter()
+                .filter_map(move |s| app.cell_in_row_at_scene(row, *s))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if cells.is_empty() {
+        // 帯が対象なのにセルが 1 つも無いときは **何もしない** — ここで `false` を
+        // 返すと、結局アレンジ全体の範囲選択に落ちて上記の事故がそのまま起きる。
+        return true;
+    }
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.set_launcher_cell_selection(&cells);
+    }));
+    true
+}
+
 /// `Ctrl+D` (既存 name = `daw.duplicate_audio_event`) をランチャーが取るか。
 ///
-/// セルを 1 つでも選んでいれば取る。取らなかった場合は呼び側が従来どおり
-/// オーディオイベントの複製へ流す。 **shortcut は呼び側が 1 度だけ take して
-/// bool を渡す** (take は消費するので 2 度読むと 2 回目が必ず false になる)。
+/// 取るのは **帯が今の操作対象** ([`launcher_is_target`]) でセルを選んでいるとき。
+/// 取らなかった場合は呼び側が従来どおりオーディオイベントの複製へ流す。
+/// **shortcut は呼び側が 1 度だけ take して bool を渡す**
+/// (take は消費するので 2 度読むと 2 回目が必ず false になる)。
 pub(crate) fn duplicate_cells_if_launcher(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
+    surface: Option<EditSurface>,
     pressed: bool,
 ) -> bool {
-    if !pressed {
+    if !pressed || !launcher_is_target(app, surface) {
         return false;
     }
     let cells = app.selected_launcher_cells();

@@ -203,3 +203,23 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
         scratch.peak_r = 0.0;
     }
 }
+
+/// 鳴っている全 note を「次の drain (= 各 track の process 冒頭、frame 0)」で出す
+/// NoteOff として予約し、追跡集合を空にする。
+///
+/// **stuck note を防ぐ全経路が共有する唯一の実装。** live は Stop / loop wrap / seek
+/// ([`crate::engine::LocalState::queue_all_notes_off`])、書き出しは走査が
+/// `write_end` を越えた瞬間 (= live の Stop に対応する点) で通る。手写しすると
+/// どれかが必ず漏れ、跳び越された Off が二度と emit されず note が鳴り続ける。
+///
+/// RT-safe: `pending_offs` は `process_track_owned` の冒頭で毎 buffer drain + clear
+/// されるので push 時点では空。`active_notes` は `PerTrackState::with_capacity` の
+/// 確保量でクランプ済みなので push で再確保しない。
+pub fn queue_all_notes_off(scratch: &mut [TrackScratch]) {
+    for s in scratch.iter_mut() {
+        for &k in &s.state.active_notes {
+            s.state.pending_offs.push(k);
+        }
+        s.state.active_notes.clear();
+    }
+}

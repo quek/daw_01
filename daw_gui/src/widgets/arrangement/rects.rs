@@ -14,6 +14,23 @@
 
 use super::*;
 
+/// caller が **当たり判定 / メニューのアンカー**に使う rect を、それが乗っている面で
+/// クリップする。面から出た部分が残ると `w <= 1.0` で捨てる。
+///
+/// **描画は scissor で切られるのに返す rect は切られない、を作らないための 1 本。**
+/// r.md #87 でヘッダとレーンの間にランチャー帯が挟まったので、ビューの左外へ伸びた
+/// クリップ / 点の rect は**帯やヘッダの上まで届く** — そこを右クリックすると、見えて
+/// いないアレンジのクリップのメニューが、帯のセルのメニューと同時に開く
+/// (`take_secondary_click_in_rect` は consume しない)。
+///
+/// **レイアウトのミラー (`automation_lane_rects` / `response.rows`) には使わない** —
+/// あれは「行が実際にどこにあるか」を返す値で、切ると縦ズームの写像が狂う。
+#[must_use]
+fn hit_rect(r: Rect, surface: Rect) -> Option<Rect> {
+    let hit = r.intersect(surface);
+    (hit.w > 1.0 && hit.h > 1.0).then_some(hit)
+}
+
 pub(super) fn collect(
     f: &ArrangementFrame<'_>,
     live: &LiveSessions,
@@ -33,8 +50,10 @@ pub(super) fn collect(
 
 /// M14 Phase 63f (#020): clip_rects を visible-tracks 順 (= 描画順) で積む。
 /// draw_clips と同じ culling: row が lanes 外 / clip が view beat 範囲外なら除外。
-/// 部分カリングは full rect を返す (caller の context_menu_for は popup_rect_clamped_at で
-/// 画面外はみ出しを吸収するため、 視野内に少しでも見えていれば十分操作可能)。
+/// 部分的に見えている clip は **lanes で切った可視部分**を返す ([`hit_rect`]) —
+/// full rect のままだと、ビューの左外へ伸びたクリップの当たり判定がランチャー帯や
+/// トラックヘッダの上まで届く。caller の `context_menu_for` は可視部分をアンカーに
+/// すれば十分で、はみ出しは `popup_rect_clamped_at` が吸収する。
 fn push_clip_rects(f: &ArrangementFrame<'_>, response: &mut ArrangementResponse) {
     let view_end = f.view.start_beat + f.view.len_beats;
     for (i, t) in f.visible_tracks.iter().enumerate() {
@@ -49,7 +68,10 @@ fn push_clip_rects(f: &ArrangementFrame<'_>, response: &mut ArrangementResponse)
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, f.view, f.lanes);
-            response.clip_rects.push((ClipKey { track_id: t.id, clip_id: c.id }, r));
+            let Some(hit) = hit_rect(r, f.lanes) else {
+                continue;
+            };
+            response.clip_rects.push((ClipKey { track_id: t.id, clip_id: c.id }, hit));
         }
     }
 }
@@ -72,6 +94,8 @@ fn push_lane_default_rects(f: &ArrangementFrame<'_>, response: &mut ArrangementR
             if h_rect.y + h_rect.h < f.lanes.y || h_rect.y > f.lanes.y + f.lanes.h {
                 return;
             }
+            // **ここは `hit_rect` を通さない。** caller は数値入力欄を「この rect に
+            // 描く」ので、切ると欄そのものが潰れる (当たり判定だけの rect とは別の口)。
             if let Some(layout) = automation_lane_header_layout(h_rect, f.style)
                 && let Some(field) = layout.default_field_rect
             {
@@ -147,32 +171,50 @@ fn push_point_rects(f: &ArrangementFrame<'_>, response: &mut ArrangementResponse
                 if end < f.view.start_beat || clip_in.start_beat > view_end {
                     continue;
                 }
-                for (p_idx, p) in clip_in.points.iter().enumerate() {
-                    let abs_beat = clip_in.start_beat + p.time_beat;
-                    if abs_beat < f.view.start_beat - 1e-6
-                        || abs_beat > f.view.start_beat + f.view.len_beats + 1e-6
-                    {
-                        continue;
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    let px = body_rect.x + ((abs_beat - f.view.start_beat) * beat_to_px) as f32;
-                    let py = clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
-                    let key = AutomationPointKey {
-                        clip: AutomationClipKey {
-                            track: track_id,
-                            lane: lane.id,
-                            clip: clip_in.id,
-                        },
-                        #[allow(clippy::cast_possible_truncation)]
-                        point_idx: p_idx as u32,
-                    };
-                    let r =
-                        Rect { x: px - radius, y: py - radius, w: radius * 2.0, h: radius * 2.0 };
-                    response.automation_point_rects.push((key, r));
-                }
+                let key = AutomationClipKey { track: track_id, lane: lane.id, clip: clip_in.id };
+                // 点を置く帯 (x / w は lane body、y / h は縦 padding 適用後)。
+                let band = Rect { y: clip_y, h: clip_h, ..body_rect };
+                push_clip_point_rects(f, response, key, clip_in, band, beat_to_px, radius);
             }
         },
     );
+}
+
+/// automation clip 1 本ぶんの point rect を積む ([`push_point_rects`] の内側)。
+///
+/// **切り出しの理由はネスト段数** — 呼び出し側は「レーン closure → クリップ」で既に
+/// 段を使い切っていて、点のループを畳み込むと不変条件 9 のインデント上限を超える。
+fn push_clip_point_rects(
+    f: &ArrangementFrame<'_>,
+    response: &mut ArrangementResponse,
+    key: AutomationClipKey,
+    clip: &ArrangementAutomationClip,
+    band: Rect,
+    beat_to_px: f64,
+    radius: f32,
+) {
+    for (p_idx, p) in clip.points.iter().enumerate() {
+        let abs_beat = clip.start_beat + p.time_beat;
+        if abs_beat < f.view.start_beat - 1e-6
+            || abs_beat > f.view.start_beat + f.view.len_beats + 1e-6
+        {
+            continue;
+        }
+        // **式は描画側 (`draw.rs` の point dot) と 1 文字も変えない。** 丸めの位置が
+        // 違うだけで、拍が大きいところで点と当たり判定が 1px ずれる。
+        #[allow(clippy::cast_possible_truncation)]
+        let px = band.x + ((abs_beat - f.view.start_beat) * beat_to_px) as f32;
+        let py = band.y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * band.h;
+        let r = Rect { x: px - radius, y: py - radius, w: radius * 2.0, h: radius * 2.0 };
+        // ビュー左端の点は正方形の半分が lanes の外 (= ランチャー帯 / ヘッダ) へ
+        // はみ出す。当たり判定なので可視部分だけ返す ([`hit_rect`])。
+        let Some(hit) = hit_rect(r, f.lanes) else {
+            continue;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let point_key = AutomationPointKey { clip: key, point_idx: p_idx as u32 };
+        response.automation_point_rects.push((point_key, hit));
+    }
 }
 
 /// M14 Phase 63n-3 (#028): automation_clip_rects を毎 frame 積む。
@@ -220,9 +262,12 @@ fn push_automation_clip_and_lane_rects(
                 let cw = ((clip_in.len_beats * beat_to_px) as f32).max(2.0);
                 let key =
                     AutomationClipKey { track: track_id, lane: lane.id, clip: clip_in.id };
-                response
-                    .automation_clip_rects
-                    .push((key, Rect { x: cx_clip, y: clip_y, w: cw, h: clip_h }));
+                // clip_rects と同じ理由で lanes で切る (右クリックメニューのアンカー)。
+                let Some(hit) = hit_rect(Rect { x: cx_clip, y: clip_y, w: cw, h: clip_h }, f.lanes)
+                else {
+                    continue;
+                };
+                response.automation_clip_rects.push((key, hit));
             }
         },
     );

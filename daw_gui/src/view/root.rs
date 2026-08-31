@@ -1061,7 +1061,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 下部パネル + piano roll: 全ノート、 それ以外 (アレンジ): 全クリップ。
     // (automation lane 上の「全ポイント → 全クリップ」段階拡大は後続で追加。)
     if ui.take_shortcut("select_all") {
-        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_some() {
+        // 帯が今の操作対象なら **ランチャーのセルを全選択**する。落とすと
+        // `SelectAllClips` に流れて曲全体の範囲が張られ、面が黙って範囲へ移る
+        // (画面は変わらないのに、次の Delete がアレンジの全クリップを消す)。
+        if crate::view::launcher_keys::select_all_cells_if_launcher(app, ui, surface) {
+            // 帯が取った (選択は helper が積む)。
+        } else if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_some() {
             let indices = app.all_audio_event_indices();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
@@ -1212,7 +1217,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 宣言できない (`ShortcutMap::matches` は先勝ち) ので、take は 1 度だけ行い
     // 行き先をここで振り分ける。
     let dup_pressed = ui.take_shortcut("daw.duplicate_audio_event");
-    if !crate::view::launcher_keys::duplicate_cells_if_launcher(app, ui, dup_pressed)
+    if !crate::view::launcher_keys::duplicate_cells_if_launcher(app, ui, surface, dup_pressed)
         && dup_pressed
         && app.ui_ephemeral.audio_editor_clip.is_some()
     {

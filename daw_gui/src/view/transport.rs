@@ -384,7 +384,7 @@ fn draw_tempo_and_key(
         None,
         Some(bpm_mod.modulation()),
     );
-    crate::view::modulation::push_mod_drag_resync(
+    crate::view::modulation::push_mod_depth_bracket(
         ui,
         app,
         MASTER_TRACK_ID,

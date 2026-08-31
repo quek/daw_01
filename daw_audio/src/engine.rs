@@ -1054,12 +1054,7 @@ impl LocalState {
     /// `ACTIVE_NOTES_CAP` (= `PerTrackState::with_capacity` の確保量) でクランプ
     /// 済みなので、push で再確保しない。
     fn queue_all_notes_off(&mut self) {
-        for s in self.scratch.iter_mut() {
-            for &k in &s.state.active_notes {
-                s.state.pending_offs.push(k);
-            }
-            s.state.active_notes.clear();
-        }
+        crate::mixer::queue_all_notes_off(&mut self.scratch);
     }
 
     /// Drain pending preview commands. Called at the top of `process_buffer`.
@@ -1369,9 +1364,8 @@ impl LocalState {
                 master_gain,
             );
 
-            // r.md #87: 走行状態 (鳴っているセル / 予約 / 進捗) を GUI へ publish。
-            // `Song` には入れない (§1.4 — 遷移先を保存すると書き出しの再現性が壊れる)。
-            self.launcher.publish(bridge, span);
+            // 走行状態の GUI への publish は **transport を進めた後** (この関数の末尾)。
+            // 理由は同所のコメントと [`crate::launcher::LauncherRuntime::publish`] の doc。
 
             // r.md #50: マスター出力サンプルを GUI のメーター解析リングへ流す。
             // **metronome click を重ねる前** に取るのがこのタップ位置の要点で、
@@ -1540,6 +1534,22 @@ impl LocalState {
             // last_known_playhead を同期し、次 Play 開始時の seek 検出を
             // 誤発火させない。
             self.last_known_playhead = playhead;
+        }
+
+        // r.md #87: 走行状態 (鳴っているセル / 予約 / 進捗) を GUI へ publish。
+        // `Song` には入れない (§1.4 — 遷移先を保存すると書き出しの再現性が壊れる)。
+        //
+        // **`shared.playhead` を store した後、同じ時間軸で publish する。**
+        // GUI は `playhead` と publish 値 (`launch_beat`) を組にして `cell_phase` を
+        // 解くので、2 つが別の時間軸を指した 1 フレームは位相が解けず、
+        // **ランチャー行の映像 / 画像 / 字幕とピアノロールの再生線がまるごと消える**。
+        // 以前は publish が buffer の中ほど、ループの巻き戻し
+        // (`on_transport_jump`) と `playhead` の store が末尾にあったので、
+        // ループ端の 1 buffer は必ず「playhead はループ先頭 / launch_beat は
+        // 巻き戻し前の絶対拍」の組になっていた (30Hz の poll で数周に 1 回、
+        // そのまま画面に出る)。
+        if song_snapshot.is_some() {
+            self.launcher.publish(bridge, self.playhead_beats);
         }
     }
 }

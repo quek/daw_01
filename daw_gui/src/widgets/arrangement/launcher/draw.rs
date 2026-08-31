@@ -370,6 +370,17 @@ fn grid_rows(
             let Some(view) = f.launcher_view.rows.get(&row.key) else {
                 continue;
             };
+            // 行の y 帯は **セルを置けない行も含めて**返す (`LauncherResponse::row_bands`
+            // の doc)。格子で上下をクリップするので、シーン見出しやアレンジ側へは
+            // はみ出さない。
+            let y0 = top.max(l.grid.y);
+            let y1 = (top + row.height).min(l.grid.y + l.grid.h);
+            if y1 > y0 {
+                out.row_bands.push((
+                    row.key,
+                    Rect { x: l.grid.x, y: y0, w: l.grid.w, h: y1 - y0 },
+                ));
+            }
             // 行下端の区切り (アレンジのレーンと同じ語彙)。
             push_filled_rect(
                 hctx,
@@ -383,7 +394,11 @@ fn grid_rows(
             );
             // マスター行はクリップを持たない (`song_lanes` = オートメーションのみ) ので、
             // セルも停止 / 返すボタンも出さない。行としては並ぶ (縦位置を欠かさない)。
-            if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) {
+            // テンポ / 拍子レーン行 (`launchable == false`) も同じ — engine が行として
+            // 登録しないので、押せるものを出すと「押しても何も起きない」だけになる
+            // (`AutomationTarget::accepts_launcher_cells` の doc: GUI は描かない /
+            // 落とせない / 作れない)。
+            if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) || !view.launchable {
                 continue;
             }
             row_buttons(hctx, f, fb, row.key, top, row.height, view);
@@ -461,13 +476,26 @@ fn row_cells(
     let progress = f.launcher_view.progress.get(&row.key).copied();
     // 「このセルが予約されている」は行に高々 1 件 (engine の予約は行ごとに 1 つ)。
     let queued = f.launcher_view.queued.get(&row.key).copied();
+    // caller へ rect を返してよい行か。**押下側と同じ 1 本** (`row_takes_cells`) を通す
+    // — グループ行の rect を返すと、`cell_overlays` の右クリックメニューと
+    // `cell_drop_target` のファイル drop だけが `drop_cell_at` / `zone_at` の除外を
+    // 素通りし、見えず撃てず鳴らないセルを作れてしまう。
+    let takes_cells = layout::row_takes_cells(f, row.key);
     for i in first..last {
         let r = layout::cell_rect(l, top, row.height, i);
         if r.x + r.w < l.grid.x || r.x > l.grid.x + l.grid.w {
             continue;
         }
         let key = layout::cell_key(f.launcher_view, row.key, i);
-        out.cell_rects.push((key, r));
+        // **返す rect は格子でクリップする。** 描画は `grid_band` で切られるので
+        // 見た目は正しいが、未クリップの rect は右端の部分表示列で「アレンジへ返す」
+        // ボタン / つかみ代 / アレンジのレーンの上まで、縦スクロール中はシーン見出し
+        // 行まで伸びる。そこを右クリックするとセルのメニューが出る
+        // (`head_row` の `scene_rects` が同じ理由で既にクリップ済)。
+        let hit = r.intersect(l.grid);
+        if takes_cells && hit.w > 1.0 && hit.h > 1.0 {
+            out.cell_rects.push((key, hit));
+        }
         if view.group {
             draw_group_cell(hctx, f, fb, r, key, i);
             continue;
@@ -614,37 +642,47 @@ fn draw_filled_cell(
     if let Some(q) = d.queued {
         push_countdown(hctx, Rect { h: (r.h - PROGRESS_BAR_H).max(0.0), ..r }, fill, &q.label());
     }
+    let selected = is_cell_selected(f, key);
     if d.playing {
         // **走行中の印は縁**。進捗バーは束 B が `audio_bridge` で位置を publish する
         // まで出ないので、これが無いと「どのセルが鳴っているか」が一切見えない。
         // 色は再生の意味色を実塗り色から寄せる (`adapt_on` は色相を保つ)。
+        //
+        // **選択枠と同じ矩形には描かない。** `push_selection_ring` は外 2px + 内 2px で
+        // `r` の縁を完全に覆うので、同じ矩形に描くと選択中のセルでは走行中リングが
+        // 1px も残らず、「選択した停止セル」と見分けが付かなくなる。選択と走行は
+        // 直交する状態なので、走行側を選択枠の内側へ寄せて両方残す。
+        let inset = if selected { f.style.clip_selected_border_w * 2.0 } else { 0.0 };
+        let ring_rect =
+            Rect { x: r.x + inset, y: r.y + inset, w: r.w - inset * 2.0, h: r.h - inset * 2.0 };
         let p = hctx.palette();
         let ring = p.adapt_on(fill, p.meter_green);
-        hctx.push_rect(RectCommand {
-            rect: r,
-            fill: Color::TRANSPARENT,
-            border: ring,
-            border_width: 2.0,
-            radius: [CELL_RADIUS; 4],
-            clip_rect: Some(f.launcher.grid),
-        });
+        if ring_rect.w > 2.0 && ring_rect.h > 2.0 {
+            hctx.push_rect(RectCommand {
+                rect: ring_rect,
+                fill: Color::TRANSPARENT,
+                border: ring,
+                border_width: 2.0,
+                radius: [(CELL_RADIUS - inset).max(0.0); 4],
+                clip_rect: Some(f.launcher.grid),
+            });
+        }
     }
     if let Some(t) = d.progress {
         push_progress(hctx, r, fill, t);
     }
-    if is_cell_selected(f, key) {
+    if selected {
         push_selection_ring(hctx, r, f.style, CELL_RADIUS, Some(f.launcher.grid));
     }
 }
 
-/// セルが選択集合に入っているか。**arrangement の選択 SSoT をそのまま引く** —
-/// セルのクリップ id はアレンジのクリップと同じ id 空間なので、`ClipKey` /
-/// `AutomationClipKey` がそのまま鍵になる (計画書 §3.3)。
+/// セルが選択集合に入っているか。
+///
+/// 見るのは **帯が自分で運んできた集合** ([`LauncherView::selected`]) 1 本。
+/// アレンジ側の `selected_clips` / `selected_automation_clips` は別の面なので
+/// 覗かない (`LauncherView::selected` の doc)。
 fn is_cell_selected(f: &ArrangementFrame<'_>, key: LauncherCellKey) -> bool {
-    key.clip_key().is_some_and(|k| f.selected_clips.contains(&k))
-        || key
-            .automation_clip_key()
-            .is_some_and(|k| f.selected_automation_clips.contains(&k))
+    key.model_key().is_some_and(|k| f.launcher_view.selected.contains(&k))
 }
 
 /// セルの中身のミニ表示 (行が低いときは何も描かない = 名前だけになる)。
@@ -798,7 +836,19 @@ fn draw_group_cell(
     }
     let base = stripes[0];
     let btn = layout::launch_button_rect(r);
-    push_launch_glyph(hctx, btn, indicator_on(hctx.palette(), base), false);
+    // **まとめセルも押せる場所なので、押せるように見せる。** `zone_at` は
+    // グループ行のセル本体ぜんぶを `Zone::CellLaunch` に倒すのに、ここだけ
+    // `indicator_on` (= フィードバック無し) で描いていたので、押下中も hover 中も
+    // 画面が 1px も変わらなかった (量子化 1 小節なら最大 1 小節「押せていない」
+    // ようにしか見えず、連打で二重発火する)。本体全体がボタンなので判定は
+    // `CellLaunch(key)` だけで足りる。
+    let ind = interactive_indicator(
+        hctx.palette(),
+        base,
+        fb.hovers_cell_launch(key),
+        fb.is_held(LauncherButton::Cell(key)),
+    );
+    push_launch_glyph(hctx, btn, ind, false);
     let label = Rect {
         x: btn.x + btn.w + 2.0,
         y: r.y,
@@ -987,18 +1037,24 @@ fn drag_overlays(
             return;
         }
         // 落とし先の縦線 (commit と同じ `drop_scene_index` を通すので指す位置 = 着地位置)。
+        //
+        // **帯でクリップする。** `drag_overlays` は `with_clip_rect` の外で呼ばれ、
+        // `push_filled_rect` は `clip_rect: None` なので、そのまま積むと線が帯の外へ出る
+        // — 横スクロール中にポインタをヘッダ側へ引くと `col_x` が負方向へ回り、
+        // トラックヘッダ列や widget の左外に縦線が立つ (`push_slot_ghosts` は
+        // 既に `with_clip_rect(grid, ..)` を張っているのに、ここだけ非対称だった)。
         let idx = drag::drop_scene_index(f, sr.last_mouse.0);
         let x = f.launcher.col_x(idx);
-        push_filled_rect(
-            hctx,
-            Rect {
-                x: x - f.style.reorder_drop_indicator_h * 0.5,
-                y: f.launcher.head.y,
-                w: f.style.reorder_drop_indicator_h,
-                h: f.launcher.pane.h,
-            },
-            f.style.reorder_drop_indicator,
-        );
+        let line = Rect {
+            x: x - f.style.reorder_drop_indicator_h * 0.5,
+            y: f.launcher.head.y,
+            w: f.style.reorder_drop_indicator_h,
+            h: f.launcher.pane.h,
+        };
+        let pane = f.launcher.pane;
+        hctx.with_clip_rect(pane, |hctx| {
+            push_filled_rect(hctx, line, f.style.reorder_drop_indicator);
+        });
     }
     if let Some(cd) = sessions.live_cell_drag.as_ref() {
         let dx = cd.last_mouse.0 - cd.anchor_mouse.0;

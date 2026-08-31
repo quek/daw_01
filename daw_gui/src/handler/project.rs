@@ -66,6 +66,10 @@ impl AppData {
         self.selection.range_anchor = None;
         self.selection.selected_launcher_cells.clear();
         self.selection.launcher_cell_anchor = None;
+        // r.md #87: ランチャーの一時状態も Song スコープの id を持つ
+        // (フォーカス行 / Learn 待ちの宛先 / rename 中の列 / engine の走行状態)。
+        // 捨てる規則は `LauncherUiState::reset_song_scoped` が持つ。
+        self.launcher.reset_song_scoped();
         // (`time = None` が範囲の SSoT を既に捨てている。 ノート / audio event の
         // 選択はそこから導出されるので、追加で clear する口は要らない。)
         // r.md #71 (プラグインのコピー / 移動): device 選択も project スコープ。
@@ -199,8 +203,8 @@ impl AppData {
     }
 
     pub(crate) fn undo(&mut self) {
-        // audio editor の対象は positional な `ClipKey` なので、 song を差し替える
-        // **前** に安定 key を退避して `after_undo_redo` で貼り直す。
+        // audio editor の対象は song を差し替えると消えている可能性があるので、
+        // **前** に key を退避して `after_undo_redo` で引き直す。
         let key = self.audio_editor_target_key();
         if !self.song_doc.undo() {
             return;
@@ -270,11 +274,10 @@ impl AppData {
         // point も undo でずれるため clear (notes / audio events と同じ扱い)。
         self.selection.selected_automation_points.clear();
         self.ui_ephemeral.editing_automation_point = None;
-        // audio_editor_clip は index ベース ClipRef。 undo で track/clip が詰まると
-        // 別 clip を編集してしまうので、 **安定 key で貼り直す** (解決不能 / 非 audio
-        // なら閉じる)。 旧実装は「その index に audio clip が居るか」 しか見ておらず、
-        // 詰まった先に別の audio clip が居るケースを取りこぼしていた
-        // (track 削除経路と共通のガード = `reanchor_audio_editor`)。
+        // audio_editor_clip は安定 id (`ClipKey`) なので、undo で track/clip の
+        // 並びが詰まっても別 clip を指すことは無い。残る失敗は「対象そのものが
+        // 消える / audio でなくなる」なので、退避した key で引き直して解決不能なら
+        // 閉じる (track 削除経路と共通のガード = `reanchor_audio_editor`)。
         self.reanchor_audio_editor(audio_editor_key);
         self.ui_ephemeral.track_rename_id = None;
         self.ui_ephemeral.track_rename_text.clear();
@@ -285,6 +288,10 @@ impl AppData {
             .retain(|id| self.song_doc.song().sections.iter().any(|s| s.id == *id));
         self.ui_ephemeral.clip_rename = None;
         self.ui_ephemeral.clip_rename_text.clear();
+        // r.md #87: 列見出しの rename も同じ (undo で列が消えれば commit 先が
+        // 無くなり、消えた id に別の列が採り直されれば別の列へ commit される)。
+        self.launcher.scene_rename_id = None;
+        self.launcher.scene_rename_text.clear();
         // selected_track_ids: undo で track が消えていたら除外。 残りが
         // 空なら「最後の track をカーソル」 にフォールバック (UI が
         // 完全選択ゼロでフリーズしないため)。

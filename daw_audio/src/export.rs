@@ -146,9 +146,10 @@ pub struct LoudnessOutcome {
 /// `span` selects the written window and where the walk starts (see
 /// [`RenderSpan`]): `Full` (whole song), `RangeCold` (user export range —
 /// walk from the range start), or `RangeWarm` (clip bounce — walk from 0 to
-/// warm plugin state). `write_mod_sidecar` persists the modulation-envelope
-/// sidecar (`.modenv`) next to the WAV; only the offline video render reads
-/// it, so standalone WAV exports / clip bounces pass `false`.
+/// warm plugin state). `write_video_sidecars` persists the sidecars the offline
+/// video render needs next to the WAV — `.modenv` (modulation envelopes) と
+/// `.launcher` (r.md #87: ランチャーの走行状態の遷移列)。動画書き出しだけが
+/// 読むので、単体の WAV 書き出し / クリップ bounce は `false` を渡す。
 ///
 /// Returns the number of frames written to the WAV (= can be less than
 /// the requested range if tail silence is detected and the render
@@ -173,7 +174,7 @@ pub fn run_export(
     sample_rate: u32,
     max_frames: usize,
     span: RenderSpan,
-    write_mod_sidecar: bool,
+    write_video_sidecars: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
     let win = RenderWindow::resolve(&song, sample_rate, span, true)?;
@@ -182,6 +183,7 @@ pub fn run_export(
     // docs/plan_modulation.md §7: derive the modulation sidecar path up front,
     // before `path` is moved into the WAV writer below.
     let sidecar_path = common::mod_sidecar::ModEnvSidecar::sidecar_path(&path);
+    let launcher_sidecar_path = common::launcher_sidecar::LauncherSidecar::sidecar_path(&path);
     let n_tracks = song.tracks.len().min(MAX_TRACKS);
     let song_length_samples = win.song_length_samples;
 
@@ -193,7 +195,7 @@ pub fn run_export(
         write_start,
         write_end,
         walk_start,
-        write_mod_sidecar,
+        write_video_sidecars,
         "starting offline WAV export"
     );
 
@@ -223,13 +225,14 @@ pub fn run_export(
             write_start,
             write_end,
             walk_start,
-            write_mod_sidecar,
+            write_video_sidecars,
             &mut sink,
             on_progress,
         )
     };
 
-    let (frames_written, env_sidecar, cancelled) = render_result?;
+    let RenderOutcome { frames_written, env_sidecar, launcher_sidecar, cancelled } =
+        render_result?;
 
     // User aborted mid-render: discard the partial WAV (don't finalize —
     // an un-finalized hound header would leave a corrupt file) and report
@@ -253,6 +256,19 @@ pub fn run_export(
             error = %e,
             path = %sidecar_path.display(),
             "failed to write modulation env sidecar"
+        );
+    }
+
+    // r.md #87 §3.6: ランチャーの走行状態も同じ best-effort で隣へ置く。
+    // 読めなければ動画側は `Song.launcher` (= 撃った起点) へ倒れるので、
+    // 書けなかったことで書き出し自体を失敗させない。
+    if !launcher_sidecar.is_empty()
+        && let Err(e) = launcher_sidecar.write(&launcher_sidecar_path)
+    {
+        tracing::warn!(
+            error = %e,
+            path = %launcher_sidecar_path.display(),
+            "failed to write launcher sidecar"
         );
     }
 
@@ -389,7 +405,7 @@ pub fn run_loudness_analysis(
         on_progress,
         last_at: std::time::Instant::now(),
     };
-    let (_frames, _sidecar, cancelled) = render_loop(
+    let RenderOutcome { cancelled, .. } = render_loop(
         &engine_shared,
         &song,
         sample_rate,
@@ -441,6 +457,17 @@ fn shift_window_for_master_latency(
     )
 }
 
+/// [`render_loop`] の結果。sidecar が 2 種類あるのでタプルを畳んで名前を付ける。
+struct RenderOutcome {
+    frames_written: u64,
+    env_sidecar: common::mod_sidecar::ModEnvSidecar,
+    /// r.md #87: 動画書き出しが差す走行状態の遷移列 (`write_video_sidecars` が
+    /// false のときは空)。
+    launcher_sidecar: common::launcher_sidecar::LauncherSidecar,
+    /// `true` = ユーザーが中断した (`AudioCommand::CancelExport`)。
+    cancelled: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
     engine_shared: &EngineShared,
@@ -451,10 +478,10 @@ fn render_loop(
     write_start: u64,
     write_end: u64,
     walk_start: u64,
-    write_mod_sidecar: bool,
+    write_video_sidecars: bool,
     sink: &mut dyn RenderSink,
     mut on_progress: impl FnMut(u64, u64),
-) -> Result<(u64, common::mod_sidecar::ModEnvSidecar, bool)> {
+) -> Result<RenderOutcome> {
     // heap 確保はここで一度だけ (この走査は off-RT)。
     let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
     let mut master_l: Vec<f32> = vec![0.0; max_frames];
@@ -553,14 +580,18 @@ fn render_loop(
     // docs/plan_modulation.md §7: bake each `ModSource`'s follower envelope per
     // render buffer (keyed by beat) so the offline video render reproduces the
     // live preview's modulation. Written to a sidecar next to the WAV — but
-    // only when a video render will consume it (`write_mod_sidecar`). A
+    // only when a video render will consume it (`write_video_sidecars`). A
     // standalone WAV export skips it (n_sources = 0 → no recording, no file):
     // the modulation is already baked into the rendered audio below regardless.
-    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_mod_sidecar {
+    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_video_sidecars {
         schedule.follower_slots.len()
     } else {
         0
     });
+    // r.md #87 §3.6: 同じ理由でランチャーの走行状態も焼く — 動画書き出しは
+    // フォローアクションがどこで次の列へ移ったかを知らないので、焼かないと
+    // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
+    let mut launcher_sidecar = crate::launcher::sidecar::SidecarRecorder::new();
     // docs/plan_modulation.md §5: reusable per-buffer follower scalar snapshot
     // (prev buffer's env) for audio-param modulation, mirroring the live engine.
     let mut mod_scalars_snapshot: Vec<f32> = Vec::with_capacity(schedule.follower_slots.len());
@@ -595,16 +626,44 @@ fn render_loop(
     // 書き出しは曲頭から freewheel で描き直すので、実行時の速報ではなく
     // 保存された値で決まる必要がある (= 同じプロジェクトなら同じファイル)。
     let global_launch_quantize = song.global_launch_quantize;
+    // 走査が `write_end` を越えたか (= 曲 / 範囲の本体を描き終えたか)。
+    //
+    // ここから先は **減衰だけを録る区間**で、live で言えば「Stop を押した後」に
+    // あたる。走査を続けるのはプラグインのリリースを取り込むためであって、
+    // 音源を鳴らし続けるためではない。だから live の Stop と同じことをする —
+    // 鳴っている note を全部 Off にし、以降の buffer は `playing = false` で描き、
+    // ランチャーの走行状態を黙らせる。
+    //
+    // これをやらないと、`RowPhase::Cell { looping: true }` の行は曲末と無関係に
+    // 鳴り続けるので **tail-silence 判定 (0.5 秒以上ピーク < -60dB) が永久に立たず、
+    // WAV が必ず 10 秒伸びて末尾にループがそのまま入る**
+    // (8 小節の範囲書き出しでも「8 小節 + 10 秒」)。アレンジ側も同じで、範囲
+    // 書き出しの tail には範囲の**続きの小節**がそのまま入っていた。
+    // sink 側で `write_end` を切ると減衰まで消えるので、「鳴らすのをやめる」側で解く。
+    let mut tail_started = false;
 
     while playhead < total_samples {
         // User abort (`AudioCommand::CancelExport`). Checked before any
         // work this buffer so the render stops promptly; `run_export`
         // discards the partial WAV on the `cancelled = true` return.
         if engine_shared.export_cancel.load(Ordering::Acquire) {
-            return Ok((frames_written, env_sidecar, true));
+            return Ok(RenderOutcome {
+                frames_written,
+                env_sidecar,
+                launcher_sidecar: launcher_sidecar.finish(),
+                cancelled: true,
+            });
         }
         let remaining = total_samples - playhead;
         let frames = (remaining as usize).min(max_frames);
+
+        // 本体を描き終えた最初の buffer で 1 度だけ transport を止める (上の doc)。
+        if !tail_started && playhead >= write_end {
+            tail_started = true;
+            crate::mixer::queue_all_notes_off(scratch);
+            launcher.silence_all();
+        }
+        let playing = !tail_started;
 
         // Snapshot the same wait-free state the notify thread sees (mirrors —
         // this thread is off-RT, so ArcSwap loads are fine here).
@@ -654,7 +713,10 @@ fn render_loop(
             sample_rate,
             frames as u32,
         );
-        launcher.update(song, span, global_launch_quantize, true);
+        launcher.update(song, span, global_launch_quantize, playing);
+        if write_video_sidecars {
+            launcher_sidecar.record(launcher.rows(), span);
+        }
         render_master_buffer(
             song,
             &mut schedule,
@@ -666,7 +728,9 @@ fn render_loop(
             &mut master_r[..frames],
             sample_rate,
             frames as u32,
-            true,
+            // `write_end` を越えたら false = live の Stop と同じ状態 (上の
+            // `tail_started` の doc)。tail は減衰だけを録る。
+            playing,
             // export (freewheel render) は loop しない。
             common::model::LoopRegion::default(),
             &empty_recording_lanes,
@@ -762,7 +826,12 @@ fn render_loop(
     // docs/plan_modulation.md §7: hand the baked envelope sidecar back to
     // `run_export`, which owns the WAV path and persists it next to the WAV.
     // `false` = ran to completion (not cancelled).
-    Ok((frames_written, env_sidecar, false))
+    Ok(RenderOutcome {
+        frames_written,
+        env_sidecar,
+        launcher_sidecar: launcher_sidecar.finish(),
+        cancelled: false,
+    })
 }
 
 #[cfg(test)]

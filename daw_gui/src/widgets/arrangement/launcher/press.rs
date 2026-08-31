@@ -97,7 +97,11 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
     let row = layout::row_at_y(f, y)?;
     // マスター行はクリップを持たないので、停止 / 返す / セルのどれも押せない
     // (描画側も同じ条件で何も出さない)。
-    if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) {
+    // マスター行と、ランチャーが握れない行 (テンポ / 拍子レーン) には
+    // 押せるものが無い (`draw::grid_rows` が同じ条件で描画も飛ばす)。
+    if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID)
+        || !f.launcher_view.rows.get(&row.key).is_some_and(|r| r.launchable)
+    {
         return None;
     }
     if l.stop_col.contains(x, y) {
@@ -183,7 +187,16 @@ pub(crate) fn dispatch(
     hit: &PressHit,
     claim: &mut PressClaim,
 ) {
-    if claim.splitter {
+    // popup (コンテキストメニュー等) が開いている間は背景の press を拾わない。
+    // daw-ui の context menu は `open_popup(.., modal = true)` だが
+    // `capture_input == false` なので、背景の pointer をマスクするのは **anchor の中だけ**
+    // (`Ui::pointer_blocked_by_modal_popup`)。メニューはポインタ位置から下へ開くので、
+    // 項目は必ず anchor の外 = 帯の下の行のセルに重なる。ガードが無いと「削除」を
+    // 選んだだけで無関係なセルが発火し (`ensure_transport_rolling` で再生まで始まる)、
+    // ▶ の外なら `cell_drag` が起動して選択がそのセルに置き換わる。
+    // アレンジ側の同種の口 (`press_lanes::range_zone` / `press_header::dispatch` /
+    // `release.rs` のクリップ短クリック) と同じガード。
+    if claim.splitter || ui.has_open_popups() {
         return;
     }
     let Some(zone) = zone_at(f, hit.px, hit.py) else {
@@ -299,26 +312,34 @@ pub(crate) fn dispatch(
 
 /// いま選択されているセル (このフレームの格子の上に居るものだけ)。
 ///
-/// 選択 SSoT は arrangement と同じ `selected_clips` / `selected_automation_clips` で、
-/// セルのクリップ id はアレンジのクリップと同じ id 空間なので**そのまま照合できる**。
+/// 照合先は **帯が自分で運んできた集合** ([`LauncherView::selected`]) 1 本
+/// (`draw::is_cell_selected` と同じ)。
+///
+/// **走査順は (行の表示順, 列の表示 index) で決定的**。`LauncherView::rows` と
+/// `LauncherRowView::cells` はどちらも `HashMap` なので、そこを走査順にすると
+/// 運ぶセルの並びがフレームごとに変わる。この並びは `CellDragSession::cells` を通って
+/// handler の `MoveCells` にそのまま渡り、**同じ行 / 列を通過する移動の適用順**を決める
+/// ので、非決定だと「同じ操作なのにセルが消えたり残ったりする」形で出る。
+/// 行を `f.rows` から引くので、畳んだグループの子など**このフレームの格子に居ない行**は
+/// 自然に落ちる (どのみち `release::row_index` が `None` にして運べない)。
 fn selected_cells(f: &ArrangementFrame<'_>) -> Vec<LauncherCellKey> {
     let mut out = Vec::new();
-    for (row_key, row) in &f.launcher_view.rows {
-        for (scene_id, cell) in &row.cells {
-            let Some(index) = f.launcher_view.scenes.iter().position(|s| s.id == *scene_id) else {
+    for row in &f.rows {
+        let Some(view) = f.launcher_view.rows.get(&row.key) else {
+            continue;
+        };
+        for (index, scene) in f.launcher_view.scenes.iter().enumerate() {
+            let Some(cell) = view.cells.get(&scene.id) else {
                 continue;
             };
             #[allow(clippy::cast_possible_truncation)]
             let key = LauncherCellKey {
-                row: *row_key,
+                row: row.key,
                 scene_index: index as u32,
-                scene_id: *scene_id,
+                scene_id: scene.id,
                 clip_id: cell.clip_id,
             };
-            let hit = key.clip_key().is_some_and(|k| f.selected_clips.contains(&k))
-                || key
-                    .automation_clip_key()
-                    .is_some_and(|k| f.selected_automation_clips.contains(&k));
+            let hit = key.model_key().is_some_and(|k| f.launcher_view.selected.contains(&k));
             if hit {
                 out.push(key);
             }

@@ -90,8 +90,12 @@ impl AppData {
         if !outcome.lane_remap.is_empty() {
             // 「いまポインタがどこを指しているか」 の観測値は写像せず捨てる
             // (次のフレームで再計算される)。
+            //
+            // 開いていた undo bracket をここで畳む必要は無い — 運ばれたレーンの
+            // 既定値欄は次のフレームで元の key のまま描かれなくなるので、
+            // `view::scrub_gesture::sweep` が必ず閉じる (寿命は「所有者が今フレーム
+            // も描かれている間」)。
             self.ui_ephemeral.arrange_hovered_automation_lane = None;
-            self.ui_ephemeral.arrange_default_scrub_active = None;
         }
 
         for &(src_track, dst_track, device_id) in &outcome.moved_devices {

@@ -19,7 +19,7 @@ use daw_ui_renderer::Rect;
 use crate::app::{
     text_num_to_builtin, AppData, AppEvent, ChainEntry, ClipKey, ColorPickerTarget,
     DeviceDragPayload, DiscreteClipEdit, FadeEdgeKind, InspectorScrubField, RelocateDevices,
-    TalkParamKind, TextNumField,
+    ScrubGesture, TalkParamKind, TextNumField,
 };
 use crate::widgets::select_modifier::SelectModifier;
 use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
@@ -70,13 +70,36 @@ pub(super) fn scrub_style(theme: &crate::theme::Theme) -> ScrubableNumberStyle {
     }
 }
 
+/// `scrubable_number` の drag / text 編集 stroke を **undo 1 step に bracket** する
+/// **唯一の実装**。実体は [`crate::view::scrub_gesture::push`] 1 本で、ここは
+/// [`InspectorScrubField`] を所有者へ包むだけ。
+///
+/// これが無いと `Song` を per-frame に書く数値欄は **1 ドラッグで数十 undo step** を
+/// 積み、`UNDO_LIMIT` (200) を溢れさせて**それ以前の実編集履歴を捨てる**。
+/// inspector / 変調ラック / 「ローンチ」 セクションが同じ 1 本を通るので、
+/// 欄を足すたびに bracket を書き写して 1 か所だけ忘れる、が起きない。
+///
+/// `key` は **同時に描かれる別の欄と必ず違う値**にすること — 同じ key を 2 つの欄が
+/// 使うと、片方の drag 中にもう片方が「非 active」として閉じ、bracket が
+/// 1 フレームで切れる。
+///
+/// **`active` が false のフレームも呼ぶこと** — 呼ばないと「欄が消えた」と
+/// 判定されて gesture が閉じる ([`crate::view::scrub_gesture`] の寿命規約)。
+pub(crate) fn push_scrub_bracket(
+    ui: &mut Ui<'_, AppData>,
+    app: &AppData,
+    key: InspectorScrubField,
+    active: bool,
+) {
+    crate::view::scrub_gesture::push(ui, app, ScrubGesture::Inspector(key), active);
+}
+
 /// audio / image / text inspector
 /// の数値 field を 1 行ぶん描く共通 helper。 `ui.scrubable_number_at` を呼び、
 /// on_change で `make_event(v)` が返す `AppEvent` を全 event に broadcast、
-/// drag / text 編集の開始・終了 edge で `BeginInspectorScrub` /
-/// `EndInspectorScrub` を発火して一連の操作を undo 1 step に bracket する
-/// (= Group Transform セクションと同 idiom)。 `scrub_key` は
-/// `app.ui_ephemeral.inspector_scrub_active` の識別に使う。
+/// drag / text 編集の一連を [`push_scrub_bracket`] で undo 1 step に bracket する。
+/// `scrub_key` はその bracket の**所有者を名指しする鍵**
+/// ([`ScrubGesture::Inspector`](crate::state::ScrubGesture) の中身)。
 #[allow(clippy::too_many_arguments)]
 fn scrub_field(
     ui: &mut Ui<'_, AppData>,
@@ -132,23 +155,11 @@ fn scrub_field(
         modulation,
     );
     // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
-    let active = resp.dragging || resp.editing_text;
-    let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
-    if active && !was_active {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
-            app.handle_event(AppEvent::BeginInspectorScrub);
-        }));
-    } else if !active && was_active {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.inspector_scrub_active = None;
-            app.handle_event(AppEvent::EndInspectorScrub);
-        }));
-    }
+    push_scrub_bracket(ui, app, scrub_key, resp.dragging || resp.editing_text);
     // modulation depth ドラッグの falling edge で host 再同期 (自コントロールの
     // target を key に、他コントロールと干渉せず drag-end で 1 回だけ recompile)。
     if let Some((target, _)) = &mod_spec {
-        mod_widget::push_mod_drag_resync(ui, app, cursor_track, target, resp.mod_dragging);
+        mod_widget::push_mod_depth_bracket(ui, app, cursor_track, target, resp.mod_dragging);
     }
 }
 

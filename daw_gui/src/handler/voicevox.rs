@@ -1,6 +1,8 @@
 //! handler::voicevox — VOICEVOX 歌唱/トーク status + vocal metadata + lipsync
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
+//! 口パクの**生成物を組み立てる純関数**は [`mouth_rebuild`] に分けてある
+//! (`&mut Song` を目標形へ畳むだけの側と、発注 / debounce / IPC の側)。
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
@@ -8,170 +10,198 @@ use common::model::Clip;
 use common::plugin_format::PluginFormat;
 use common::protocol::{PluginCommand, VocalSynthFailure};
 
-/// 2 つの口 ImageEvent 列が「実質同一」か (source_id は厳密一致、 時間/幾何は
-/// 1e-6 許容)。 idempotency 判定で exact `==` を使うと、 load 時に
-/// `(clip.start + ev.start) - r0` が float 非結合性で元の `ev.start` と bit 単位で
-/// 一致せず、 無変更のはずのプロジェクトが開いただけで dirty 化してしまう
-/// (r.md #9 違反)。 rebuild が書く field (source_id / 時間 / rect) のみ比較すれば
-/// 足りる (他 field は生成時に常に `ImageEvent::default()`)。
-fn mouth_events_equivalent(
-    a: &[common::model::ImageEvent],
-    b: &[common::model::ImageEvent],
-) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            x.source_id == y.source_id
-                && (x.event_start_in_clip_beats - y.event_start_in_clip_beats).abs() <= 1e-6
-                && (x.event_length_beats - y.event_length_beats).abs() <= 1e-6
-                && (x.x - y.x).abs() <= 1e-6
-                && (x.y - y.y).abs() <= 1e-6
-                && (x.w - y.w).abs() <= 1e-6
-                && (x.h - y.h).abs() <= 1e-6
-        })
-}
+/// 口パクの生成物 (アレンジの clip / 列のセル) を目標形へ畳む純関数群。
+/// `AppData` 側の面倒 (発注 / debounce / binding) とは分けて持つ。
+mod mouth_rebuild;
 
-/// `spans` (song-absolute の口画像区間) の全体の広がり `(min start, max end)`。
-/// 空なら `None`。
-fn open_span_extent(spans: &[(f64, f64, u32)]) -> Option<(f64, f64)> {
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &(s, e, _) in spans {
-        lo = lo.min(s);
-        hi = hi.max(e);
+use mouth_rebuild::{rebuild_mouth_clip, rebuild_mouth_containers, split_spans_by_container};
+
+/// 口パクの入力 clip / セル 1 つを fingerprint へ混ぜる
+/// ([`AppData::lipsync_input_fingerprint`] の 1 要素ぶん)。
+///
+/// 混ぜるのは **出力を変える値だけ**。位置はセルとアレンジで意味が違う —
+/// セルは song 絶対位置を持たない (`start_beat` は常に 0) ので列 id が位置そのもので、
+/// アレンジの clip は `start_beat` が効く。
+fn hash_lipsync_clip(
+    h: &mut std::collections::hash_map::DefaultHasher,
+    clip: &Clip,
+    place: &common::lipsync::FlatPlacement,
+    source: &common::lipsync::LipsyncSource<'_>,
+) {
+    use std::hash::Hash;
+    place.container.hash(h);
+    if place.container == common::lipsync::LipsyncContainer::Arrangement {
+        clip.start_beat.to_bits().hash(h);
     }
-    (hi > lo).then_some((lo, hi))
+    // r.md #44: 窓 (offset) も配置に効くので fingerprint に含める
+    // (含めないと端 trim しても口パクが再生成されない)。
+    clip.length_beats.to_bits().hash(h);
+    clip.content_offset_beats.to_bits().hash(h);
+    match source {
+        // sing: build_sing_query が読む note フィールドのみ
+        // (`velocity` / `muted` は phoneme へ影響しないので含めない)。
+        common::lipsync::LipsyncSource::Sing { notes, .. } => {
+            for n in *notes {
+                n.start_beat.to_bits().hash(h);
+                n.duration_beats.to_bits().hash(h);
+                n.pitch.hash(h);
+                n.lyric.hash(h);
+            }
+        }
+        // talk: 先頭の非空 TextEvent + 声 + 話速のみ (pitch / intonation / volume は
+        // phoneme 長に効かないので含めない)。
+        common::lipsync::LipsyncSource::Talk(ev) => {
+            ev.text.hash(h);
+            ev.event_start_in_clip_beats.to_bits().hash(h);
+            clip.speaker_id.hash(h);
+            clip.talk.unwrap_or_default().speed_scale.to_bits().hash(h);
+        }
+    }
 }
 
-/// 口 track (`mouth_track_id`) の `auto_lipsync` clip 群を、 与えられた非重複な
-/// 口画像区間 `open` (song-absolute、 start 昇順) と立ち絵 body 範囲から、
-/// **閉じ口で隙間を埋めた単一の連続 auto_lipsync clip** に再構築する。
-///
-/// - r.md #17: 常に「高々 1 本」に畳むので `auto_lipsync` clip が重なり得ない。
-/// - r.md #18: `fill_mouth_timeline` が歌/セリフの無い区間 (open の隙間 + 立ち絵
-///   範囲の余白) を閉じ口で埋めるので、 立ち絵が映っている間は口が消えない。
-///
-/// 目標形が現状 (ちょうど 1 本の同一 clip) と一致するなら **何もせず `false`**
-/// を返す (idempotent → load 時の collapse や無変更再生成で '*' を付けない)。
-/// 実際に clip 集合が変わったら `true`。 `mouth_map` 未設定なら生成不能なので、
-/// 残っている auto clip を掃除するだけ (あれば `true`)。
-fn rebuild_mouth_clip(
-    song: &mut common::model::Song,
-    mouth_track_id: u32,
-    open: Vec<(f64, f64, u32)>,
-) -> bool {
-    let Some(m_idx) = song.tracks.iter().position(|t| t.id == mouth_track_id) else {
-        return false;
-    };
-    // 閉じ口 image。 mouth_map 未設定 or Closed 未割当なら 0 (= 埋めない)。
-    let closed_id = song.tracks[m_idx]
-        .mouth_map
-        .as_ref()
-        .map_or(0, |m| m.resolve(common::model::MouthShape::Closed));
+/// 歌の phoneme query 1 件ぶんの発注:
+/// `(clip_start_beat, clip_len_beats, first_phoneme_local_beat, priority, notes)`。
+/// 前 3 つの意味は [`LipsyncClipResult`] と同じ (背景スレッドがそのまま詰め替える)。
+type SingSnap = (f64, f64, f64, u32, Vec<common::model::Note>);
 
-    // 充填範囲: 立ち絵 body が映る範囲 (閉じ口を敷く) ∪ open 区間の広がり。
-    // 閉じ口が未割当 (closed_id == 0) のときは body へ広げても埋められないので open のみ。
-    let body = if closed_id != 0 {
-        common::lipsync::tachie_body_range(song, mouth_track_id)
-    } else {
-        None
-    };
-    let fill_range = match (body, open_span_extent(&open)) {
-        (Some(b), Some(o)) => Some((b.0.min(o.0), b.1.max(o.1))),
-        (Some(b), None) => Some(b),
-        (None, Some(o)) => Some(o),
-        (None, None) => None,
-    };
+/// 読み上げ (talk) の発注。[`SingSnap`] の notes を
+/// `(text, speaker_id, talk スケール)` に置き換えたもの。
+type TalkSnap = (f64, f64, f64, u32, String, u32, common::model::TalkParams);
 
-    // 目標イベント列 (clip-local) を組む。
-    let res = song.video_resolution;
-    let target: Option<(f64, f64, Vec<common::model::ImageEvent>)> =
-        fill_range.and_then(|(r0, r1)| {
-            let filled = common::lipsync::fill_mouth_timeline(&open, (r0, r1), closed_id);
-            if filled.is_empty() {
-                return None;
+/// 口 track `target_id` の口パクを作り直すのに要る phoneme query の発注を組む。
+///
+/// (talk) target 中心: 出力先が `target_id` の **全ソーストラック**をまとめる
+/// (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority にし、apply 側で
+/// 重なりを上位優先で解決する。各 clip は notes (歌唱) があれば sing、無く Text なら talk。
+///
+/// r.md #87: アレンジの clip とランチャーのセルを **1 本の平坦化タイムライン**へ並べる
+/// ([`common::lipsync::LipsyncLayout`] の doc に理由)。セルの区間は「撃った瞬間 = 0」の
+/// 位相座標で、`place.shift` (= セルの `content_offset_beats`) を引くことで**窓の外の
+/// note が隣の列の帯へはみ出さない**。
+fn collect_lipsync_snaps(
+    song: &common::model::Song,
+    target_id: u32,
+    bpm: f32,
+) -> (Vec<SingSnap>, Vec<TalkSnap>) {
+    let mut snaps: Vec<SingSnap> = Vec::new();
+    let mut talk_snaps: Vec<TalkSnap> = Vec::new();
+    let layout = common::lipsync::LipsyncLayout::build(song, target_id);
+    for (idx, src) in song.tracks.iter().enumerate() {
+        if src.lipsync_target_track != Some(target_id) {
+            continue;
+        }
+        let priority = idx as u32;
+        for (clip, place) in layout.placements(src) {
+            match common::lipsync::lipsync_source_of(song, clip) {
+                // sing: phoneme 列 frame 0 は「基準ノートの `REST_FRAMES` 手前」に来る
+                // (= 合成 wav 先頭と同じ位置、r.md #39)。r.md #44: phoneme は
+                // content-local 起点なので原点基準で置き、長さの上限は窓の末尾にする。
+                Some(common::lipsync::LipsyncSource::Sing { notes, base_beat }) => {
+                    let head = common::voicevox::sing_head_beat(base_beat, bpm) - place.shift;
+                    snaps.push((place.origin, place.window_len, head, priority, notes.to_vec()));
+                }
+                // talk: phoneme 列 frame 0 = wav 先頭 = 「発話開始の pre-silence 分手前」
+                // (現行 pre-silence は 0 なので event 開始)。
+                Some(common::lipsync::LipsyncSource::Talk(ev)) => {
+                    let scales = clip.talk.unwrap_or_default();
+                    let pre_frames = common::voicevox::talk_pre_silence_frames(scales.speed_scale);
+                    let pre = common::voicevox::frames_to_beats(f64::from(pre_frames), bpm);
+                    let head = ev.event_start_in_clip_beats - pre - place.shift;
+                    talk_snaps.push((
+                        place.origin,
+                        place.window_len,
+                        head,
+                        priority,
+                        ev.text.clone(),
+                        clip.speaker_id,
+                        scales,
+                    ));
+                }
+                None => {}
             }
-            let events: Vec<common::model::ImageEvent> = filled
-                .iter()
-                .map(|&(s, e, img)| {
-                    let mut ev = common::model::ImageEvent {
-                        source_id: img,
-                        event_start_in_clip_beats: s - r0,
-                        event_length_beats: e - s,
-                        ..common::model::ImageEvent::default()
-                    };
-                    // build_mouth_events は rect を全画面 default で返すので、 素材寸法から
-                    // aspect-fit rect を計算して上書き (立ち絵の他の子レイヤーと収まりを揃える)。
-                    if let Some(src) = song.media.image_sources.get(&img) {
-                        let (x, y, w, h) = aspect_fit_pip_rect(res, (src.width, src.height));
-                        ev.x = x;
-                        ev.y = y;
-                        ev.w = w;
-                        ev.h = h;
-                    }
-                    ev
-                })
-                .collect();
-            Some((r0, r1 - r0, events))
-        });
+        }
+    }
+    (snaps, talk_snaps)
+}
 
-    // idempotency: 既に「ちょうど 1 本の auto clip」で目標と一致するなら触らない。
-    let auto_positions: Vec<usize> = song.tracks[m_idx]
+
+/// r.md #87: ランチャーのセル用の仮想区間どうし (およびアレンジとの間) に空ける隙間 (秒)。
+///
+/// フレーズ分割 (`common::voicevox_phrase::split_into_phrases`) は note の隙間で必ず
+/// 切れ、継ぎ目のクロスフェード (`phrase_window`) も `PHRASE_PAD_FRAMES` (= 47 frame
+/// ≒ 0.5 秒) 程度までしか届かない。2 秒あればセル同士・セルとアレンジのフレーズが
+/// 混ざらない (歌の先頭 rest `REST_FRAMES` ≒ 0.107 秒も含めて余裕がある)。
+const CELL_REGION_GAP_SECS: f64 = 2.0;
+
+/// この track の「合成対象クリップ」と、それを合成タイムラインへ置く**区間の原点** (拍)。
+///
+/// - アレンジのクリップ (`Track::clips`) は原点 `0.0` = song 拍そのまま。
+/// - ランチャーのセル (`Track::session_clips`) は song 絶対位置を持たない
+///   (`clip.start_beat` は常に 0) ので、**アレンジの終端より後ろ**へセルごとの
+///   専用区間を確保し、その先頭を原点にする。ここを 0 のままにすると、撃って
+///   いないセルの歌声が曲頭から鳴る (= 無音を幻の歌声に置き換えるだけ)。
+///
+/// 配置は `clip.id` 昇順の決定論。フレーズ WAV のキャッシュキーは平行移動不変
+/// (`voicevox_render` の「単体 query は平行移動不変」) なので、アレンジを伸ばして
+/// 区間がずれても再合成は起きない (mix し直すだけ)。
+fn synth_clips_with_base<'a>(
+    song: &common::model::Song,
+    track: &'a common::model::Track,
+    bpm: f32,
+) -> Vec<(&'a Clip, f64)> {
+    let bpm = bpm.max(0.001);
+    let gap = CELL_REGION_GAP_SECS * f64::from(bpm) / 60.0;
+    let mut out: Vec<(&Clip, f64)> = track.clips.iter().map(|c| (c, 0.0)).collect();
+    if track.session_clips.is_empty() {
+        return out;
+    }
+    // アレンジが占める拍の終端 (クリップが 1 つも無ければ曲頭)。
+    let arrangement_end = track
         .clips
         .iter()
-        .enumerate()
-        .filter(|(_, c)| c.auto_lipsync)
-        .map(|(i, _)| i)
-        .collect();
-    match &target {
-        None => {
-            // 目標 = clip 無し。 既存 auto があれば削除、 無ければ no-op。
-            if auto_positions.is_empty() {
-                return false;
-            }
-            song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
-            song.gc_clip_contents();
-            true
-        }
-        Some((new_start, new_len, new_events)) => {
-            if auto_positions.len() == 1 {
-                let c = &song.tracks[m_idx].clips[auto_positions[0]];
-                // 許容付き比較 (r.md #9: load 時の float 再構成差で無変更を dirty 化しない)。
-                let same_geom = (c.start_beat - new_start).abs() <= 1e-6
-                    && (c.length_beats - new_len).abs() <= 1e-6;
-                let same_events = song
-                    .clip_contents
-                    .get(&c.content_id)
-                    .and_then(|cc| cc.image_events())
-                    .is_some_and(|ev| mouth_events_equivalent(ev, new_events));
-                if same_geom && same_events {
-                    return false;
-                }
-            }
-            // 置換: 既存 auto を全削除 → 単一 clip を追加。
-            song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
-            let content_id = song.alloc_content(
-                common::model::ClipContent::Image(common::model::ImageContent {
-                    events: new_events.clone(),
-                }),
-                "口パク".to_string(),
-            );
-            let m = &mut song.tracks[m_idx];
-            m.place_clip(Clip {
-                id: 0,
-                start_beat: *new_start,
-                length_beats: *new_len,
-                content_id,
-                color: None,
-                auto_lipsync: true,
-                // 生成した配置ルールの世代を焼き込む (r.md #39)。load 時に
-                // 古い世代を見つけたら一度だけ再生成する。
-                lipsync_gen: common::lipsync::PLACEMENT_GEN,
-                ..Default::default()
-            });
-            song.gc_clip_contents();
-            true
+        .map(|c| arrangement_synth_end_beat(song, c, bpm))
+        .fold(0.0_f64, f64::max);
+    let mut cells: Vec<&common::model::SessionClip> = track.session_clips.iter().collect();
+    cells.sort_by_key(|s| s.clip.id);
+    let mut cursor = arrangement_end + gap;
+    for s in cells {
+        out.push((&s.clip, cursor));
+        cursor += s.clip.length_beats.max(0.0) + gap;
+    }
+    out
+}
+
+/// 読み上げ (talk) の WAV 長は **合成してみるまで分からない** (テキスト → 秒の
+/// 予測式を持たない) ので、Text クリップを持つトラックではセル区間をこの秒数ぶん
+/// 余分に後ろへずらす。1 つの `TextEvent` = 字幕 1 行なので、これを超える発話は
+/// 現実的に無い。足りなかった場合も builtin 側が区間の境界で書き込みを打ち切るので
+/// **セルの音に混ざることはない** (末尾が切れるだけ)。
+const TALK_TAIL_ALLOWANCE_SECS: f64 = 60.0;
+
+/// アレンジのクリップ 1 つが合成タイムラインで占める終端の拍。
+///
+/// **クリップの窓だけでは足りない** — [`collect_sing_metadata`] /
+/// [`collect_talk_metadata`] は窓の外にある content の note / TextEvent も
+/// metadata に載せるので、窓の終端で測るとセルの仮想区間がアレンジの尻尾に
+/// 食い込む (= セルの歌に前の歌が混ざる)。実際に置かれる拍で測る。
+fn arrangement_synth_end_beat(song: &common::model::Song, clip: &Clip, bpm: f32) -> f64 {
+    let mut end = clip.start_beat + clip.length_beats;
+    let Some(content) = song.clip_contents.get(&clip.content_id) else {
+        return end;
+    };
+    if let Some(notes) = content.notes() {
+        for n in notes {
+            end = end.max(clip.content_to_song_beat(n.start_beat) + n.duration_beats);
         }
     }
+    if let Some(events) = content.text_events() {
+        let allowance = TALK_TAIL_ALLOWANCE_SECS * f64::from(bpm) / 60.0;
+        for ev in events.iter().filter(|e| !e.text.is_empty()) {
+            end = end
+                .max(clip.content_to_song_beat(ev.event_start_in_clip_beats) + allowance);
+        }
+    }
+    end
 }
 
 /// 1 clip の notes を builtin VOICEVOX 向けの [`NoteMetadata`] へ変換する。
@@ -181,12 +211,15 @@ fn rebuild_mouth_clip(
 /// sequencer が **同じ関数**で同じ値を作るので、「クリップ先頭に 1 音足すと以降の
 /// 全 note_id がずれる」が起きない。
 ///
-/// `start_beat` は content-local → song-absolute (r.md #44: note は content 原点基準)。
+/// `start_beat` は content-local → song-absolute (r.md #44: note は content 原点基準)、
+/// さらに `base_beat` (= [`synth_clips_with_base`] が割り当てた区間の原点) を足す。
+/// アレンジのクリップは `base_beat == 0.0` なので従来と同じ値になる。
 /// `clip_id` は `note_id` の導出元であり、合成進捗のクリップ帰属にも使う (r.md #75)。
 /// `speaker_id` は per-clip 歌唱声 (`0` = builtin 側で `DEFAULT_SINGER_ID` へフォールバック)。
 fn collect_sing_metadata(
     song: &common::model::Song,
     clip: &Clip,
+    base_beat: f64,
 ) -> Vec<common::plugin_metadata::NoteMetadata> {
     let notes: &[common::model::Note] = song
         .clip_contents
@@ -197,13 +230,14 @@ fn collect_sing_metadata(
         .iter()
         .map(|n| common::plugin_metadata::NoteMetadata {
             note_id: common::plugin_metadata::sing_note_id(clip.id, n.id),
-            start_beat: clip.content_to_song_beat(n.start_beat),
+            start_beat: base_beat + clip.content_to_song_beat(n.start_beat),
             duration_beats: n.duration_beats,
             pitch: n.pitch,
             velocity: n.velocity,
             lyric: n.lyric.clone().unwrap_or_default(),
             clip_id: clip.id,
             speaker_id: clip.speaker_id,
+            cell_base_beat: base_beat,
         })
         .collect()
 }
@@ -219,6 +253,7 @@ fn collect_sing_metadata(
 fn collect_talk_metadata(
     song: &common::model::Song,
     clip: &Clip,
+    base_beat: f64,
 ) -> Vec<common::plugin_metadata::TalkMetadata> {
     let Some(events) = song
         .clip_contents
@@ -234,7 +269,7 @@ fn collect_talk_metadata(
         .filter(|(_, ev)| !ev.text.is_empty())
         .map(|(event_index, ev)| common::plugin_metadata::TalkMetadata {
             event_id: common::plugin_metadata::talk_event_id(clip.id, event_index as u32),
-            start_beat: clip.content_to_song_beat(ev.event_start_in_clip_beats),
+            start_beat: base_beat + clip.content_to_song_beat(ev.event_start_in_clip_beats),
             text: ev.text.clone(),
             speaker_id: clip.speaker_id,
             speed_scale: scales.speed_scale,
@@ -242,6 +277,7 @@ fn collect_talk_metadata(
             intonation_scale: scales.intonation_scale,
             volume_scale: scales.volume_scale,
             clip_id: clip.id,
+            cell_base_beat: base_beat,
         })
         .collect()
 }
@@ -459,17 +495,19 @@ impl AppData {
             };
 
             let song = self.song_doc.song();
-            // 全 clip の notes / TextEvent を metadata 配列へ flatten する
-            // (組み立ての規則は下の 2 つの純粋関数が持つ)。
-            let entries: Vec<common::plugin_metadata::NoteMetadata> = track
-                .clips
+            // 全 clip (アレンジ + ランチャーのセル) の notes / TextEvent を metadata
+            // 配列へ flatten する (組み立ての規則は下の 3 つの純粋関数が持つ)。
+            // **セルを落とすと撃っても無音**、**原点を 0 のまま足すと撃たなくても
+            // 曲頭で歌い出す** ので、走査と原点は必ず `synth_clips_with_base` 1 本で
+            // 揃える (r.md #87)。
+            let clips = synth_clips_with_base(song, track, bpm);
+            let entries: Vec<common::plugin_metadata::NoteMetadata> = clips
                 .iter()
-                .flat_map(|clip| collect_sing_metadata(song, clip))
+                .flat_map(|&(clip, base)| collect_sing_metadata(song, clip, base))
                 .collect();
-            let talk: Vec<common::plugin_metadata::TalkMetadata> = track
-                .clips
+            let talk: Vec<common::plugin_metadata::TalkMetadata> = clips
                 .iter()
-                .flat_map(|clip| collect_talk_metadata(song, clip))
+                .flat_map(|&(clip, base)| collect_talk_metadata(song, clip, base))
                 .collect();
             // r.md #27: この device の歌唱/読み上げ入力 (bpm/notes/talk) が前回送信から
             // 変わっていなければ再送しない (= builtin plugin が不要な再合成を走らせない)。
@@ -494,6 +532,19 @@ impl AppData {
                 host_plugin_id,
                 (bpm, chunk_secs, entries.clone(), talk.clone()),
             );
+            // r.md #87: 順序ヒントは metadata より **先に**送る。合成順序は job を
+            // 積んだ瞬間に 1 度だけ決まる (`PhraseRenderer::new` が hint を読む) ので、
+            // 「busy になってから送る」経路 (`send_vocal_synth_priority_if_moved`) だけ
+            // だと、**その job には前回の位置が効く**。セルに歌詞を書いた最初の 1 回が
+            // 一番待たされるのに、そこだけ効かないことになる。同じ channel の FIFO
+            // なので、先に送れば host は必ず先に atomic へ書く。
+            if let Some(beat) = self.vocal_synth_priority_beat(track, bpm) {
+                self.voicevox.priority_sent.insert(host_plugin_id, beat);
+                self.send_plugin(PluginCommand::SetVocalSynthPriority {
+                    device_id: host_plugin_id,
+                    playhead_beats: beat,
+                });
+            }
             self.send_plugin(PluginCommand::SetBuiltinPluginNoteMetadata {
                 device_id: host_plugin_id,
                 bpm,
@@ -504,41 +555,125 @@ impl AppData {
         }
     }
 
-    /// 合成中の builtin VOICEVOX へ再生ヘッド位置を送る (r.md #75)。前回送信から
-    /// **1 拍以上動いたときだけ**送るので、トランスポート中でも IPC は数 Hz 以下に収まる。
-    /// busy な device が 1 つも無ければ何もしない。
+    /// 合成中の builtin VOICEVOX へ「その行がいま鳴らしている位置」を送る
+    /// (r.md #75 / #87)。前回送信から **1 拍以上動いたときだけ**送るので、
+    /// トランスポート中でも IPC は数 Hz 以下に収まる。busy な device が 1 つも
+    /// 無ければ何もしない。
     ///
     /// **再合成はトリガしない** (`SetVocalSynthPriority` は順序ヒント専用)。停止 / seek でも
-    /// `playhead_beat` が動くので、同じ経路で届く。
+    /// 位置が動くので、同じ経路で届く。
     pub(crate) fn send_vocal_synth_priority_if_moved(&mut self) {
         if self.voicevox.voicevox_synth_status.is_empty() {
             return;
         }
-        let Some(playhead) = self.transport.playhead_beat.map(f64::from) else {
-            return;
-        };
-        let busy: Vec<u64> = self
-            .voicevox
-            .voicevox_synth_status
+        let bpm = self.song_doc.song().bpm;
+        // 位置は **device (= track) ごと**に違う (行ごとに時間軸の供給元が違うため)。
+        // 借用を跨がないよう先に解いてから送る。
+        let targets: Vec<(u64, f64)> = self
+            .song_doc
+            .song()
+            .tracks
             .iter()
-            .filter(|(_, s)| s.progress.busy)
-            .map(|(id, _)| *id)
+            .filter_map(|track| {
+                let device_id = self.voicevox_plugin_id_for_track(track)?;
+                if !self
+                    .voicevox
+                    .voicevox_synth_status
+                    .get(&device_id)
+                    .is_some_and(|s| s.progress.busy)
+                {
+                    return None;
+                }
+                Some((device_id, self.vocal_synth_priority_beat(track, bpm)?))
+            })
             .collect();
-        for device_id in busy {
+        for (device_id, beat) in targets {
             let moved = self
                 .voicevox
                 .priority_sent
                 .get(&device_id)
-                .is_none_or(|prev| (playhead - prev).abs() >= 1.0);
+                .is_none_or(|prev| (beat - prev).abs() >= 1.0);
             if !moved {
                 continue;
             }
-            self.voicevox.priority_sent.insert(device_id, playhead);
+            self.voicevox.priority_sent.insert(device_id, beat);
             self.send_plugin(PluginCommand::SetVocalSynthPriority {
                 device_id,
-                playhead_beats: playhead,
+                playhead_beats: beat,
             });
         }
+    }
+
+    /// この track の合成順序ヒント (`SetVocalSynthPriority`) に載せる
+    /// **合成タイムラインの拍** — [`synth_clips_with_base`] と同じ座標系。
+    ///
+    /// 送るのは「合成タイムライン上の距離」ではなく **ユーザーがいま聴こうとして
+    /// いるもの**の位置。ランチャーのセルはアレンジの終端より後ろの仮想区間に
+    /// 置かれるので、song の playhead をそのまま送ると距離が常に最大 =
+    /// **セルは撃っても最後まで合成されない** (「▶ を押しても当分歌わない」)。
+    ///
+    /// 判断の SSoT は行の主導権 ([`common::model::RowPlayback`]) —
+    /// 「この行がいま何を鳴らす行か」そのものだから:
+    ///
+    /// 1. 行がセルを鳴らしている (engine 観測、届いていなければ `Song` の起点) →
+    ///    **そのセルの位相**。この行のアレンジのクリップはそもそも鳴らないので、
+    ///    playhead を送る意味が無い
+    /// 2. 行がアレンジのままでも、**セル面を最後に触っていて**この track のセルを
+    ///    選んでいる → そのセルの先頭 (= これから撃つ / 歌詞を書いている最中)。
+    ///    面の判定は last-wins タグ (`feedback_selection_action_last_wins`) —
+    ///    古い選択が残っているだけでアレンジ側の合成を後回しにしないため
+    /// 3. どちらでもない → song の playhead (= 従来どおり。アレンジを普通に作って
+    ///    いる間はセルが遠いので自然に後回しになる)
+    fn vocal_synth_priority_beat(&self, track: &common::model::Track, bpm: f32) -> Option<f64> {
+        let playhead = self.transport.playhead_beat.map(f64::from);
+        let Some((clip_id, phase)) = self.focused_synth_cell(track) else {
+            return playhead;
+        };
+        let base = synth_clips_with_base(self.song_doc.song(), track, bpm)
+            .into_iter()
+            .find_map(|(c, base)| (c.id == clip_id).then_some(base));
+        match base {
+            Some(base) => Some(base + phase),
+            None => playhead,
+        }
+    }
+
+    /// この track で **ユーザーがいま聴こうとしているセル** と、その中の位相
+    /// (`None` = アレンジを聴いている)。判断の順は
+    /// [`Self::vocal_synth_priority_beat`] の doc。
+    fn focused_synth_cell(&self, track: &common::model::Track) -> Option<(u32, f64)> {
+        use crate::event_launcher::{LauncherCellKey, LauncherRow};
+        let row = LauncherRow::Track(track.id);
+        if let Some(clip_id) = self.running_playback(row).playing_clip_id()
+            && track.session_clip_by_id(clip_id).is_some()
+        {
+            // 位相は編集面のプレイヘッドと同じ 1 本で解く (式を写さない)。
+            // 走行状態が届いていない (= 撃った起点のまま停止中) なら先頭。
+            let phase = self
+                .editor_playhead_beat(common::model::ClipKey {
+                    track_id: track.id,
+                    clip_id,
+                })
+                .unwrap_or(0.0);
+            return Some((clip_id, phase));
+        }
+        if self.selection.last_edit_select != Some(EditSurface::LauncherCells) {
+            return None;
+        }
+        // 末尾 = 最後に click したセル。
+        let clip_id = self
+            .selection
+            .selected_launcher_cells
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                LauncherCellKey::Track(k) if k.track_id == track.id => Some(k.clip_id),
+                _ => None,
+            })?;
+        track
+            .session_clip_by_id(clip_id)
+            .is_some()
+            .then_some((clip_id, 0.0))
     }
 
     /// `target` (口 track) の口パク出力を決定する入力すべての 64-bit fingerprint。
@@ -556,9 +691,17 @@ impl AppData {
     ///       および clip の `speaker_id` / `talk.speed_scale` (= `query_talk_phonemes` が
     ///       phoneme 長に使う値。pitch / intonation / volume は無関係なので含めない)
     ///
+    /// - r.md #87: 上の走査は**ランチャーのセルも含む** (アレンジの clip と同じ規則。
+    ///   ただしセルは song 絶対位置を持たないので `start_beat` の代わりに列 id)。
+    ///   加えて、列ごとに作る口パクセルの**長さと発火設定**
+    ///   ([`common::lipsync::mouth_cell_shape`]) も入力に含める
+    ///
     /// track 名 / 色 / mute / volume / plugin 等の **非入力** は含めないので、それらの
     /// 編集では fingerprint が不変 → `LipsyncDebounceFired` が再生成をスキップする。
-    /// 走査順は下の `regenerate_lipsync_for_track` の snap 収集ループと一致させること。
+    /// 走査は `regenerate_lipsync_for_track` の snap 収集と**同じ**
+    /// [`common::lipsync::LipsyncLayout::placements`] /
+    /// [`common::lipsync::lipsync_source_of`] を通す (対象が食い違うと、
+    /// 「入力を変えたのに再生成されない」が静かに起きる)。
     pub(crate) fn lipsync_input_fingerprint(song: &common::model::Song, target_id: u32) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -578,49 +721,32 @@ impl AppData {
         }
         song.video_resolution.0.hash(&mut h);
         song.video_resolution.1.hash(&mut h);
+        // r.md #87: アレンジの clip とランチャーのセルの**両方**が入力。走査は
+        // `LipsyncLayout::placements` 1 本で、`regenerate_lipsync_for_track` の
+        // snap 収集と**同じ関数**を通る (片方だけ条件が変わる余地を無くす)。
+        let layout = common::lipsync::LipsyncLayout::build(song, target_id);
         for (idx, src) in song.tracks.iter().enumerate() {
             if src.lipsync_target_track != Some(target_id) {
                 continue;
             }
             (idx as u32).hash(&mut h); // priority (= トラック並び順)
-            // snap を生成する clip (notes 有り / 非空 text 有り) だけが出力に効く。
-            // `regenerate_lipsync_for_track` の収集と同条件で、その clip の位置と
-            // 内容のみをハッシュする (= 非対象 clip の移動では fingerprint 不変)。
-            for clip in &src.clips {
-                let content = song.clip_contents.get(&clip.content_id);
-                if let Some(notes) = content
-                    .and_then(|c| c.notes())
-                    .filter(|n| common::voicevox::sing_base_beat(n).is_some())
-                {
-                    // sing: clip 位置 + build_sing_query が読む note フィールドのみ。
-                    // r.md #44: 窓 (offset) も配置に効くので fingerprint に含める
-                    // (含めないと端 trim しても口パクが再生成されない)。
-                    clip.start_beat.to_bits().hash(&mut h);
-                    clip.length_beats.to_bits().hash(&mut h);
-                    clip.content_offset_beats.to_bits().hash(&mut h);
-                    for n in notes {
-                        n.start_beat.to_bits().hash(&mut h);
-                        n.duration_beats.to_bits().hash(&mut h);
-                        n.pitch.hash(&mut h);
-                        n.lyric.hash(&mut h);
-                    }
-                } else if let Some(ev) = content
-                    .and_then(|c| c.text_events())
-                    .and_then(|events| events.iter().find(|e| !e.text.is_empty()))
-                {
-                    // talk: clip 位置 + 先頭の非空 TextEvent + 声 + 話速のみ。
-                    clip.start_beat.to_bits().hash(&mut h);
-                    clip.length_beats.to_bits().hash(&mut h);
-                    clip.content_offset_beats.to_bits().hash(&mut h);
-                    ev.text.hash(&mut h);
-                    ev.event_start_in_clip_beats.to_bits().hash(&mut h);
-                    clip.speaker_id.hash(&mut h);
-                    clip.talk
-                        .unwrap_or_default()
-                        .speed_scale
-                        .to_bits()
-                        .hash(&mut h);
+            for (clip, place) in layout.placements(src) {
+                // snap を生成する clip (notes 有り / 非空 text 有り) だけが出力に効く。
+                if let Some(source) = common::lipsync::lipsync_source_of(song, clip) {
+                    hash_lipsync_clip(&mut h, clip, &place, &source);
                 }
+            }
+        }
+        // 列ごとに作る口パクセルの形 (長さ + 写す発火設定) も出力を決める入力。
+        // ここを落とすと、立ち絵セルを伸ばしたりローンチ量子化を変えても口パクセルが
+        // 追従しない (歌と口の発火がズレたまま直らない)。
+        for scene in &song.scenes {
+            if let Some(shape) = common::lipsync::mouth_cell_shape(song, target_id, scene.id) {
+                scene.id.hash(&mut h);
+                shape.len_beats.to_bits().hash(&mut h);
+                shape.quantize.hash(&mut h);
+                shape.looping.hash(&mut h);
+                shape.legato.hash(&mut h);
             }
         }
         h.finish()
@@ -779,73 +905,16 @@ impl AppData {
             return;
         }
         let bpm = self.song_doc.song().bpm;
-        // (talk) target 中心: 出力先が `target_id` の **全ソーストラック** をまとめて
-        // 再生成する (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority に
-        // し、apply 側で重なりを上位優先で解決する。各 clip は notes (歌唱) があれば sing、
-        // 無く Text なら talk として扱う。
-        let mut snaps: Vec<(f64, f64, f64, u32, Vec<common::model::Note>)> = Vec::new();
-        let mut talk_snaps: Vec<(f64, f64, f64, u32, String, u32, common::model::TalkParams)> =
-            Vec::new();
-        for (idx, src) in self.song_doc.song().tracks.iter().enumerate() {
-            if src.lipsync_target_track != Some(target_id) {
-                continue;
-            }
-            let priority = idx as u32;
-            for clip in &src.clips {
-                // sing: notes を持つ clip。phoneme 列 frame 0 は「基準ノートの
-                // `REST_FRAMES` 手前」に来る (= 合成 wav 先頭と同じ位置、r.md #39)。
-                if let Some(notes) = self
-                    .song_doc.song()
-                    .clip_contents
-                    .get(&clip.content_id)
-                    .and_then(|c| c.notes())
-                    && let Some(base) = common::voicevox::sing_base_beat(notes)
-                {
-                    // r.md #44: phoneme は content-local 起点なので原点基準で置き、
-                    // 長さの上限は窓の末尾 (content-local) にする。
-                    snaps.push((
-                        clip.content_origin_beat(),
-                        clip.content_offset_beats + clip.length_beats,
-                        common::voicevox::sing_head_beat(base, bpm),
-                        priority,
-                        notes.to_vec(),
-                    ));
-                    continue;
-                }
-                // talk: Text clip の先頭の非空 TextEvent。phoneme 列 frame 0 = wav 先頭 =
-                // 「発話開始の pre-silence 分手前」(現行 pre-silence は 0 なので event 開始)。
-                if let Some(events) = self
-                    .song_doc.song()
-                    .clip_contents
-                    .get(&clip.content_id)
-                    .and_then(|c| c.text_events())
-                    && let Some(ev) = events.iter().find(|e| !e.text.is_empty())
-                {
-                    let scales = clip.talk.unwrap_or_default();
-                    let pre_beats = common::voicevox::frames_to_beats(
-                        f64::from(common::voicevox::talk_pre_silence_frames(
-                            scales.speed_scale,
-                        )),
-                        bpm,
-                    );
-                    talk_snaps.push((
-                        clip.content_origin_beat(),
-                        clip.content_offset_beats + clip.length_beats,
-                        ev.event_start_in_clip_beats - pre_beats,
-                        priority,
-                        ev.text.clone(),
-                        clip.speaker_id,
-                        scales,
-                    ));
-                }
-            }
-        }
+        let (snaps, talk_snaps) = collect_lipsync_snaps(self.song_doc.song(), target_id, bpm);
         if snaps.is_empty() && talk_snaps.is_empty() {
             // r.md #18: 開き口ソースが 1 つも無くても、 立ち絵が映っている間は口を
             // 消さない。 HTTP は不要 (phoneme が無い) ので、 立ち絵範囲を閉じ口だけで
             // 埋めた単一 clip を同期適用する (body / closed 未設定なら rebuild が
-            // 既存 auto clip を掃除するだけ)。
-            self.normalize_song_checked(|song| rebuild_mouth_clip(song, target_id, Vec::new()));
+            // 既存 auto clip を掃除するだけ)。r.md #87: 列の生成物も同じ規則で
+            // 通す (歌のセルを最後の 1 つまで消したときに取り残さない)。
+            self.normalize_song_checked(|song| {
+                rebuild_mouth_containers(song, target_id, Vec::new(), Vec::new())
+            });
             return;
         }
         self.ensure_voicevox_engine();
@@ -964,20 +1033,81 @@ impl AppData {
             // 上位優先で重なりを解決した非重複な開き口区間。 これを立ち絵範囲まで
             // 閉じ口で埋めて **1 本の連続 auto_lipsync clip** に畳む (r.md #17/#18)。
             let open = merge_lipsync_events_by_priority(spans);
-            rebuild_mouth_clip(song, target_id, open)
+            // r.md #87: マージは 1 本の平坦化タイムラインの上でやり (= 複数ソースの
+            // 重なりが列を跨いでも上位優先で正しく解ける)、ここで帯ごとに切り分けて
+            // 入れ物へ戻す。帯は重ならないので、切り分けはマージ結果を壊さない。
+            let layout = common::lipsync::LipsyncLayout::build(song, target_id);
+            let (arrangement, cells) = split_spans_by_container(&layout, open);
+            rebuild_mouth_containers(song, target_id, arrangement, cells)
         });
+    }
+
+    /// **入力を失った口パクの生成物** (`auto_lipsync` の clip / セル) と、
+    /// **実在しない口 track を指す binding** を掃除する。戻り値 = 掃除したか。
+    ///
+    /// 生成物の存在条件は「その口 track を出力先にするソーストラックが在ること」
+    /// 1 つ。ソースがゼロになった口 track の生成物は**誰も作り直さない** —
+    /// [`Self::mark_lipsync_dirty`] は binding を持つ track が 1 つも無ければ
+    /// 何もしないので、再生成の経路に落ちてこない。残ると **歌が無いのに口だけ
+    /// 動く** (アレンジの clip でも列のセルでも同じ)。
+    ///
+    /// **どの経路が孤児を作ったかを数え上げない。** 「入力の無い生成物は在っては
+    /// いけない」という規則 1 本で終端させる — producer 側 (トラック削除 /
+    /// binding 解除 / トラックの貼り付け…) に散らすと必ず 1 つ漏れる
+    /// ([`feedback_sibling_occurrence_check`])。呼ぶのは**ソースが消え得る編集の
+    /// 直後**だけで、load 時には呼ばない (開いただけで `*` を立てない、r.md #9)。
+    ///
+    /// 「閉じ口だけ残す」(= 空の入力で作り直す) ではなく**消す**のは、binding が
+    /// どこにも無くなった状態は *一度も bind していない状態* と同じだから。口の
+    /// 画像は auto clip だけが置くので、bind していない立ち絵にはそもそも口の層が
+    /// 無い。ここで閉じ口を残すと、以後**誰も追従させない**置き土産になる
+    /// (body を動かしても付いてこない = r.md #9 の「静かに食い違う」側)。
+    ///
+    /// 派生データの後始末なので undo step は積まない (`normalize_song_checked`)。
+    /// 消した生成物を主導権が指していた行は `normalize_session` が停止へ落とす。
+    pub(crate) fn reap_orphan_lipsync(&mut self) -> bool {
+        self.normalize_song_checked(|song| {
+            let live: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
+            let mut changed = false;
+            // (a) 消えた口 track を指す binding。残すと編集のたびに口パク再生成の
+            //     debounce (400ms の thread) が空回りし続ける。
+            for t in &mut song.tracks {
+                if t.lipsync_target_track.is_some_and(|id| !live.contains(&id)) {
+                    t.lipsync_target_track = None;
+                    changed = true;
+                }
+            }
+            // (b) ソースを 1 つも持たない口 track の生成物。
+            let sourced: Vec<u32> = song
+                .tracks
+                .iter()
+                .filter_map(|t| t.lipsync_target_track)
+                .collect();
+            let mut cells_removed = false;
+            for t in &mut song.tracks {
+                if sourced.contains(&t.id) {
+                    continue;
+                }
+                let before = (t.clips.len(), t.session_clips.len());
+                t.clips.retain(|c| !c.auto_lipsync);
+                t.session_clips.retain(|c| !c.clip.auto_lipsync);
+                cells_removed |= t.session_clips.len() != before.1;
+                changed |= (t.clips.len(), t.session_clips.len()) != before;
+            }
+            if cells_removed {
+                song.normalize_session();
+            }
+            if changed {
+                song.gc_clip_contents();
+            }
+            changed
+        }) == Some(true)
     }
 
     /// `SetLipsyncTarget` handler。vocal track の出力先 binding を更新し、
     /// 設定時は口パクを再生成する (snapshot は `is_undoable` 経由で handler
     /// 前に取得済み = binding 変更を undo 可能)。
     pub(crate) fn set_lipsync_target(&mut self, track_id: u32, target: Option<u32>) {
-        // 変更前の出力先を控える (retarget / unbind で旧 track の掃除に使う)。
-        let old_target = self
-            .song_doc
-            .song()
-            .track_by_id(track_id)
-            .and_then(|t| t.lipsync_target_track);
         let applied = self.edit_song(|song| {
             let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
                 return false;
@@ -991,30 +1121,10 @@ impl AppData {
         if !applied {
             return;
         }
-        // r.md #17 (retarget leak): 出力先を変更/解除したら、 旧口 track に残った
-        // 生成済み auto clip を掃除する — ただし他の vocal がまだ旧 track を出力先に
-        // していなければ (共有していれば温存)。 applied なので old != target が確定。
-        if let Some(old) = old_target
-            && !self
-                .song_doc
-                .song()
-                .tracks
-                .iter()
-                .any(|t| t.lipsync_target_track == Some(old))
-        {
-            self.normalize_song_checked(|song| {
-                let mut removed = false;
-                if let Some(m) = song.tracks.iter_mut().find(|t| t.id == old) {
-                    let before = m.clips.len();
-                    m.clips.retain(|c| !c.auto_lipsync);
-                    removed = m.clips.len() != before;
-                }
-                if removed {
-                    song.gc_clip_contents();
-                }
-                removed
-            });
-        }
+        // r.md #17 (retarget leak): 出力先を変更/解除したら、入力を失った旧口 track の
+        // 生成物を掃除する (他の vocal がまだ旧 track を出力先にしていれば温存)。
+        // 判断は [`Self::reap_orphan_lipsync`] 1 本 (旧出力先を控えて数えない)。
+        self.reap_orphan_lipsync();
         if target.is_some() {
             self.regenerate_lipsync_for_track(track_id);
         }
@@ -1096,202 +1206,57 @@ impl AppData {
 }
 
 #[cfg(test)]
-mod rebuild_mouth_clip_tests {
-    //! r.md #17/#18: `rebuild_mouth_clip` が口 track を「高々 1 本の連続
-    //! auto_lipsync clip・隙間は閉じ口」に畳むことの回帰テスト。
-    use super::rebuild_mouth_clip;
-    use common::model::{Clip, ClipContent, ImageContent, MouthMap, Song, Track};
+mod cell_region_tests {
+    //! r.md #87: ランチャーのセルを合成タイムラインへ置く区間の割り当て。
+    //!
+    //! ここが壊れると**静かに**壊れる — 区間がアレンジと重なれば「撃っていないのに
+    //! 曲頭で歌い出す」、セル同士が重なれば「別のセルの声が混ざる」。どちらも
+    //! コンパイルもテストも素通りして、実機で耳で気付くしかない種類の欠陥。
+    use super::{CELL_REGION_GAP_SECS, synth_clips_with_base};
+    use common::model::{Clip, SessionClip, Track};
 
-    fn image_content(song: &mut Song) -> u32 {
-        let cid = song.alloc_content_id();
-        song.clip_contents
-            .insert(cid, ClipContent::Image(ImageContent { events: vec![] }));
-        cid
-    }
-
-    /// group G(1) + body 立ち絵 track(2, [0,8)) + 口 track(3, closed=99)。
-    fn tachie_song(closed: u32) -> Song {
-        let mut song = Song::default();
-        let body_cid = image_content(&mut song);
-        song.tracks = vec![
-            Track { id: 1, ..Default::default() },
-            Track {
-                id: 2,
-                parent_group_id: Some(1),
-                clips: vec![Clip {
-                    id: 1,
-                    start_beat: 0.0,
-                    length_beats: 8.0,
-                    content_id: body_cid,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            Track {
-                id: 3,
-                parent_group_id: Some(1),
-                mouth_map: Some(MouthMap { closed, ..Default::default() }),
-                ..Default::default()
-            },
-        ];
-        song
-    }
-
-    /// 口 track 上の (start, end, source_id) を返す (auto clip の events)。
-    fn mouth_triples(song: &Song) -> Vec<(f64, f64, u32)> {
-        let m = song.track_by_id(3).unwrap();
-        assert_eq!(m.clips.len(), 1, "auto_lipsync clip はちょうど 1 本 (r.md #17)");
-        let clip = &m.clips[0];
-        assert!(clip.auto_lipsync);
-        song.clip_contents
-            .get(&clip.content_id)
-            .unwrap()
-            .image_events()
-            .unwrap()
-            .iter()
-            .map(|e| {
-                (
-                    clip.content_to_song_beat(e.event_start_in_clip_beats),
-                    clip.content_to_song_beat(e.event_start_in_clip_beats) + e.event_length_beats,
-                    e.source_id,
-                )
-            })
-            .collect()
+    fn cell(id: u32, len: f64) -> SessionClip {
+        SessionClip {
+            scene_id: id,
+            clip: Clip { id, start_beat: 0.0, length_beats: len, ..Default::default() },
+            launch: common::model::LaunchSettings::default(),
+        }
     }
 
     #[test]
-    fn single_open_span_is_closed_filled_over_tachie_range() {
-        // 開き口 [2,4) img5 のみ。 立ち絵 [0,8) の残りは閉じ口(99)で埋まり、
-        // 全体が 1 本の連続 clip [0,8) になる (r.md #18 option1)。
-        let mut song = tachie_song(99);
-        assert!(rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]));
-        assert_eq!(
-            mouth_triples(&song),
-            vec![(0.0, 2.0, 99), (2.0, 4.0, 5), (4.0, 8.0, 99)],
-        );
-    }
-
-    #[test]
-    fn rebuild_stamps_the_current_placement_generation() {
-        // r.md #39: 再生成した clip には現行の配置ルール世代を焼き込む。これで
-        // 「古い世代を見つけたら load 時に一度だけ作り直す」検出が終端する
-        // (焼き込みを忘れると毎回 open のたびに再生成 = '*' が付き続ける)。
-        let mut song = tachie_song(99);
-        assert!(rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]));
-        let clip = &song.track_by_id(3).unwrap().clips[0];
-        assert!(clip.auto_lipsync);
-        assert_eq!(clip.lipsync_gen, common::lipsync::PLACEMENT_GEN);
-        // 世代が現行なので、もう再生成対象にならない。
-        assert!(common::lipsync::vocal_tracks_with_outdated_lipsync(&song).is_empty());
-    }
-
-    #[test]
-    fn rebuild_is_idempotent() {
-        // 同じ入力での再構築は clip を作り直さず false を返す (load collapse /
-        // 無変更再生成で '*' を付けない = r.md #9 の contract)。
-        let mut song = tachie_song(99);
-        assert!(rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]));
-        let before = mouth_triples(&song);
-        assert!(
-            !rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]),
-            "同一入力の再構築は no-op"
-        );
-        assert_eq!(mouth_triples(&song), before);
-    }
-
-    #[test]
-    fn closed_unassigned_leaves_gaps_and_no_tachie_extend() {
-        // 閉じ口 未割当 (closed=0) → 隙間を埋めず、 立ち絵範囲へも広げない。
-        // clip は open span [2,4) だけ (従来どおり隙間は口なし)。
-        let mut song = tachie_song(0);
-        assert!(rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]));
-        assert_eq!(mouth_triples(&song), vec![(2.0, 4.0, 5)]);
-    }
-
-    #[test]
-    fn overlapping_legacy_span_collapses_to_single_clip() {
-        // 旧 per-clip 生成を模し、 複数 auto clip が既にある状態から呼んでも
-        // 1 本に畳まれる (呼び出し側が merge 済みの非重複 span を渡す前提)。
-        let mut song = tachie_song(99);
-        // 既存の重複 auto clip を 2 本仕込む。
-        let c1 = image_content(&mut song);
-        let c2 = image_content(&mut song);
-        let m_idx = song.tracks.iter().position(|t| t.id == 3).unwrap();
-        song.tracks[m_idx].clips = vec![
-            Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: c1, auto_lipsync: true, ..Default::default() },
-            Clip { id: 2, start_beat: 2.0, length_beats: 4.0, content_id: c2, auto_lipsync: true, ..Default::default() },
-        ];
-        // 非重複 open span を渡して再構築 → 1 本に。
-        assert!(rebuild_mouth_clip(&mut song, 3, vec![(1.0, 3.0, 5)]));
-        assert_eq!(song.track_by_id(3).unwrap().clips.len(), 1);
-        assert_eq!(
-            mouth_triples(&song),
-            vec![(0.0, 1.0, 99), (1.0, 3.0, 5), (3.0, 8.0, 99)],
-        );
-    }
-
-    #[test]
-    fn empty_open_fills_whole_body_with_closed() {
-        // r.md #18: 開き口が 1 つも無くても、 立ち絵範囲を閉じ口 1 本で覆う。
-        let mut song = tachie_song(99);
-        assert!(rebuild_mouth_clip(&mut song, 3, Vec::new()));
-        assert_eq!(mouth_triples(&song), vec![(0.0, 8.0, 99)]);
-        // 同じ状態なら no-op。
-        assert!(!rebuild_mouth_clip(&mut song, 3, Vec::new()));
-    }
-
-    #[test]
-    fn idempotent_after_load_reconstruction_with_fractional_beats() {
-        // r.md #9 回帰: body が非整数 beat 始まり + fractional な open だと、 load の
-        // span 再構成 `clip.start + ev.start` が float 非結合性で元の値と bit 単位で
-        // ズレる。 exact `==` だと無変更でも rebuild → dirty 化していたが、 許容比較
-        // (mouth_events_equivalent) で「無変更」と判定して epoch を進めない。
-        let mut song = Song::default();
-        let body_cid = image_content(&mut song);
-        song.tracks = vec![
-            Track { id: 1, ..Default::default() },
-            Track {
-                id: 2,
-                parent_group_id: Some(1),
-                clips: vec![Clip {
-                    id: 1,
-                    start_beat: 16.5,
-                    length_beats: 8.0,
-                    content_id: body_cid,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            Track {
-                id: 3,
-                parent_group_id: Some(1),
-                mouth_map: Some(MouthMap { closed: 99, a: 5, ..Default::default() }),
-                ..Default::default()
-            },
-        ];
-        // fractional な open 区間で最初の生成。
-        assert!(rebuild_mouth_clip(&mut song, 3, vec![(16.5 + 2.3333333, 16.5 + 3.1666667, 5)]));
-        // load 相当: mouth clip の **開き口** event を (clip.start + ev.start) で再構成
-        // (= normalize_lipsync_clips_on_load と同じ、 closed は除外)。
-        let recon: Vec<(f64, f64, u32)> = {
-            let m = song.track_by_id(3).unwrap();
-            let clip = &m.clips[0];
-            song.clip_contents
-                .get(&clip.content_id)
-                .unwrap()
-                .image_events()
-                .unwrap()
-                .iter()
-                .filter(|e| e.source_id != 99)
-                .map(|e| {
-                    let s = clip.content_to_song_beat(e.event_start_in_clip_beats);
-                    (s, s + e.event_length_beats, e.source_id)
-                })
-                .collect()
+    fn cell_regions_never_overlap_the_arrangement_or_each_other() {
+        let bpm = 120.0_f32;
+        let gap = CELL_REGION_GAP_SECS * f64::from(bpm) / 60.0;
+        let track = Track {
+            clips: vec![
+                Clip { id: 1, start_beat: 0.0, length_beats: 8.0, ..Default::default() },
+                Clip { id: 2, start_beat: 16.0, length_beats: 4.0, ..Default::default() },
+            ],
+            // わざと id 昇順でない順で持たせる (並び順ではなく id で決まること)。
+            session_clips: vec![cell(5, 4.0), cell(3, 2.0)],
+            ..Default::default()
         };
-        assert!(
-            !rebuild_mouth_clip(&mut song, 3, recon),
-            "load 再構成後の rebuild は no-op でなければならない (r.md #9)"
-        );
+        let placed = synth_clips_with_base(&common::model::Song::default(), &track, bpm);
+        assert_eq!(placed.len(), 4);
+        // アレンジのクリップは原点 0 (= song 拍そのまま)。
+        assert!(placed[..2].iter().all(|&(_, base)| base == 0.0));
+        // セルは id 昇順で、アレンジ終端 (20 拍) の後ろへ隙間を空けて並ぶ。
+        let cells: Vec<(u32, f64)> = placed[2..].iter().map(|&(c, b)| (c.id, b)).collect();
+        assert_eq!(cells[0].0, 3);
+        assert_eq!(cells[1].0, 5);
+        assert!(cells[0].1 >= 20.0 + gap, "セル 3 がアレンジに食い込んでいる: {cells:?}");
+        // セル 3 は 2 拍ぶん占めるので、次の原点はそれ + 隙間より後ろ。
+        assert!(cells[1].1 >= cells[0].1 + 2.0 + gap, "セル同士が重なっている: {cells:?}");
+    }
+
+    #[test]
+    fn cells_stay_after_the_arrangement_even_when_it_is_empty() {
+        // アレンジのクリップが 1 つも無い (= セルだけのトラック) でも、原点は必ず
+        // 正 — `cell_base_beat > 0.0` が builtin 側の「セルか」の判定なので、0 に
+        // なると再生側がアレンジと取り違える。
+        let track = Track { session_clips: vec![cell(1, 4.0)], ..Default::default() };
+        let placed = synth_clips_with_base(&common::model::Song::default(), &track, 120.0);
+        assert_eq!(placed.len(), 1);
+        assert!(placed[0].1 > 0.0, "原点が 0 だとアレンジと区別できない");
     }
 }

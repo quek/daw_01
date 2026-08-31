@@ -3,6 +3,7 @@ pub mod audio_bridge;
 pub mod audio_decode;
 pub mod audio_render;
 pub mod automation;
+pub mod launcher_sidecar;
 pub mod logging;
 pub mod loudness;
 pub mod loudness_report;

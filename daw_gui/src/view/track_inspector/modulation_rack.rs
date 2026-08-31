@@ -777,80 +777,8 @@ pub(super) fn draw_modulation_rack(
         // 実際に作れる。 旧実装はカーソルトラックの routing しか描かなかったため、
         // それらはどこにも出ず削除できない孤児になっていた。
         for row in app.mod_source_routings(sid) {
-            let row_y = y;
-            ui.label_at_clipped(
-                ("inspector_mod_rt_lbl", route_i),
-                &format!("\u{2192} {}", row.label),
-                Rect {
-                    x: lx + MOD_NAME_INSET,
-                    y: row_y + 4.0,
-                    // 右側の depth / 極性 / × と重ねない (幅は下の x 計算と対)。
-                    w: (row_w - MOD_NAME_INSET - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
-                    h: 11.0 * 1.2,
-                },
-                11.0,
-                p.text,
-            );
-            let rm_x = area.x + area.w - pad - 20.0;
-            let pol_x = rm_x - 4.0 - 22.0;
-            let depth_x = pol_x - 4.0 - 46.0;
-            let (t, s) = (row.track_id, sid);
-            let tgt = row.target.clone();
-            ui.scrubable_number_at(
-                ("inspector_mod_rt_depth", route_i),
-                Rect { x: depth_x, y: row_y, w: 46.0, h: 20.0 },
-                f64::from(row.depth),
-                1.0,
-                ScrubableNumberFormat::Decimal(2),
-                &scrub_style(&app.theme),
-                move |v| {
-                    let tgt = tgt.clone();
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetModRoutingDepth {
-                            track_id: t,
-                            target: tgt,
-                            source_id: s,
-                            depth: v as f32,
-                        });
-                    })
-                },
-                None,
-                None,
-            );
-            let bip = row.bipolar;
-            let tgt_pol = row.target.clone();
-            ui.button_at(
-                ("inspector_mod_rt_pol", route_i),
-                if bip { "\u{00b1}" } else { "+" },
-                Rect { x: pol_x, y: row_y, w: 22.0, h: 20.0 },
-                move || {
-                    let tgt_pol = tgt_pol.clone();
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetModRoutingPolarity {
-                            track_id: t,
-                            target: tgt_pol,
-                            source_id: s,
-                            bipolar: !bip,
-                        });
-                    })
-                },
-            );
-            let tgt_rm = row.target.clone();
-            ui.button_at(
-                ("inspector_mod_rt_rm", route_i),
-                "\u{00d7}",
-                Rect { x: rm_x, y: row_y, w: 20.0, h: 20.0 },
-                move || {
-                    let tgt_rm = tgt_rm.clone();
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::RemoveModRouting {
-                            track_id: t,
-                            target: tgt_rm,
-                            source_id: s,
-                        });
-                    })
-                },
-            );
+            let g = RoutingRowGeom { area, pad, lx, row_w, y };
+            any_mod_drag |= routing_row(ui, app, g, &row, sid, route_i);
             y += 22.0;
             route_i += 1;
         }
@@ -858,11 +786,117 @@ pub(super) fn draw_modulation_rack(
     }
 
     // drag-end edge で sync (scrub 中は dirty のみ)。
-    if any_mod_drag != app.ui_ephemeral.mod_follower_scrub_active {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SetModFollowerScrubbing(any_mod_drag));
-        }));
-    }
+    //
+    // **同じ edge で undo も bracket する** — ラックの数値欄は毎フレーム
+    // `EditModSource` / `SetModRoutingDepth` (= `edit_song`) を撃つので、束ねないと
+    // 1 ドラッグで数十 undo step が積まれ `UNDO_LIMIT` を溢れさせる。ラック内で
+    // 同時にドラッグできる欄は 1 つなので、集約フラグ 1 本で足りる。
+    crate::view::scrub_gesture::push(
+        ui,
+        app,
+        crate::app::ScrubGesture::ModRack,
+        any_mod_drag,
+    );
 
     y
+}
+
+/// routing 1 行の配置 (呼び側の y カーソルと幅をそのまま渡す)。
+struct RoutingRowGeom {
+    area: Rect,
+    pad: f32,
+    lx: f32,
+    row_w: f32,
+    y: f32,
+}
+
+/// ソース直下の routing 1 行 (対象名 / depth / 極性 / 削除) を描く。
+///
+/// 戻り値 = depth 欄をドラッグ / 数値入力中か。呼び側が集約して
+/// **1 ドラッグ = 1 undo step** の bracket を張る (束ねないと
+/// `SetModRoutingDepth` が毎フレーム undo step を積む)。
+fn routing_row(
+    ui: &mut Ui<'_, AppData>,
+    app: &AppData,
+    g: RoutingRowGeom,
+    row: &crate::app::ModRoutingRow,
+    sid: u32,
+    route_i: usize,
+) -> bool {
+    let RoutingRowGeom { area, pad, lx, row_w, y: row_y } = g;
+    let p = &app.theme.core;
+    ui.label_at_clipped(
+        ("inspector_mod_rt_lbl", route_i),
+        &format!("\u{2192} {}", row.label),
+        Rect {
+            x: lx + MOD_NAME_INSET,
+            y: row_y + 4.0,
+            // 右側の depth / 極性 / × と重ねない (幅は下の x 計算と対)。
+            w: (row_w - MOD_NAME_INSET - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
+            h: 11.0 * 1.2,
+        },
+        11.0,
+        p.text,
+    );
+    let rm_x = area.x + area.w - pad - 20.0;
+    let pol_x = rm_x - 4.0 - 22.0;
+    let depth_x = pol_x - 4.0 - 46.0;
+    let (t, s) = (row.track_id, sid);
+    let tgt = row.target.clone();
+    let depth_resp = ui.scrubable_number_at(
+        ("inspector_mod_rt_depth", route_i),
+        Rect { x: depth_x, y: row_y, w: 46.0, h: 20.0 },
+        f64::from(row.depth),
+        1.0,
+        ScrubableNumberFormat::Decimal(2),
+        &scrub_style(&app.theme),
+        move |v| {
+            let tgt = tgt.clone();
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetModRoutingDepth {
+                    track_id: t,
+                    target: tgt,
+                    source_id: s,
+                    depth: v as f32,
+                });
+            })
+        },
+        None,
+        None,
+    );
+    let bip = row.bipolar;
+    let tgt_pol = row.target.clone();
+    ui.button_at(
+        ("inspector_mod_rt_pol", route_i),
+        if bip { "\u{00b1}" } else { "+" },
+        Rect { x: pol_x, y: row_y, w: 22.0, h: 20.0 },
+        move || {
+            let tgt_pol = tgt_pol.clone();
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetModRoutingPolarity {
+                    track_id: t,
+                    target: tgt_pol,
+                    source_id: s,
+                    bipolar: !bip,
+                });
+            })
+        },
+    );
+    let tgt_rm = row.target.clone();
+    ui.button_at(
+        ("inspector_mod_rt_rm", route_i),
+        "\u{00d7}",
+        Rect { x: rm_x, y: row_y, w: 20.0, h: 20.0 },
+        move || {
+            let tgt_rm = tgt_rm.clone();
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::RemoveModRouting {
+                    track_id: t,
+                    target: tgt_rm,
+                    source_id: s,
+                });
+            })
+        },
+    );
+    depth_resp.dragging || depth_resp.editing_text
 }

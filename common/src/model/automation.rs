@@ -63,6 +63,29 @@ pub enum AutomationTarget {
     GroupTransform(GroupTransformParam),
 }
 
+impl AutomationTarget {
+    /// このレーン行に**ランチャーのセルを置けるか** (r.md #87 Q4 の例外)。
+    ///
+    /// [`Self::SongTempo`] / [`Self::SongTimeSigNumerator`] だけが `false`。理由は 2 つ:
+    ///
+    /// 1. **循環になる。** ローンチ量子化の境界は `TempoMap` 由来の小節グリッドで解く
+    ///    (`docs/plan_rmd_87_clip_launcher.md` §2.2)。テンポ / 拍子がランチャー駆動だと
+    ///    「グリッド ← テンポ ← どのセルが鳴っているか ← グリッド」と自分に戻る。
+    /// 2. **GUI と engine で時間軸が食い違う。** [`crate::automation::evaluate_song_tempo`]
+    ///    は GUI 側の拍 ↔ サンプル換算 (ルーラー / 波形レイアウト / 書き出し範囲) の
+    ///    土台でもある。engine だけが知る走行状態に依存させると、同じ拍が 2 つの
+    ///    別の時刻を指す。
+    ///
+    /// **GUI (セルを描かない / 落とせない / 作れない) と engine (行として登録しない) の
+    /// 両方がこの 1 本を引くこと** — 片方だけで弾くと、もう片方に置けてしまったセルが
+    /// 「保存はされるのに永久に鳴らない」形で残る。[`crate::model::Song::normalize_session`]
+    /// が load 時の掃除も同じ判定で行う。
+    #[must_use]
+    pub fn accepts_launcher_cells(&self) -> bool {
+        !matches!(self, Self::SongTempo | Self::SongTimeSigNumerator)
+    }
+}
+
 /// Built-in track parameter selector for `AutomationTarget::TrackBuiltin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum TrackBuiltinParam {

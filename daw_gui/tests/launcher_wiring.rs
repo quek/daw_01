@@ -70,6 +70,30 @@ fn launcher_of(app: &AppData, track_id: u32) -> RowPlayback {
     app.song_doc.song().track_by_id(track_id).expect("track").launcher
 }
 
+/// 行 `track_id` の表示順 `scene_index` に居るセル (無ければ `None`)。
+fn cell_at(app: &AppData, track_id: u32, scene_index: usize) -> Option<LauncherCellKey> {
+    let scene_id = app.song_doc.song().scenes.get(scene_index)?.id;
+    app.cell_in_row_at_scene(LauncherRow::Track(track_id), scene_id)
+}
+
+/// 素のドラッグ (= 移動) で `(from, 落とし先の列 index)` をまとめて動かす。
+fn move_cells(
+    app: &mut AppData,
+    row: LauncherRow,
+    moves: &[(LauncherCellKey, usize)],
+    mode: daw_gui::event_launcher::LauncherDropMode,
+) {
+    let moves = moves
+        .iter()
+        .map(|(from, to)| daw_gui::event_launcher::LauncherCellMove {
+            from: *from,
+            to_row: row,
+            to_scene_index: *to,
+        })
+        .collect();
+    app.handle_event(AppEvent::Launcher(LauncherEvent::MoveCells { moves, mode }));
+}
+
 /// セルを撃つとその行だけがランチャー主導になり、「アレンジに戻す (全行)」で戻る。
 #[test]
 fn セルを撃つと行の主導権がランチャーへ移り全行戻すで戻る() {
@@ -301,10 +325,15 @@ fn ローンチ設定は複数選択へ一括で効く() {
 
 /// `Gate` のセルは離すと止まり、`Toggle` のセルはもう一度押すと止まる。
 /// GUI 側が `Song` に書く「ユーザーが最後に撃った状態」がモードで変わる。
+///
+/// `Toggle` の「もう一度」は **鳴っている間だけ**なので、engine が走っている状態
+/// (`transport.is_playing`) を先に作る (停止中の挙動は
+/// [`停止中の_toggle_は止めずに撃ち直す`])。
 #[test]
 fn gate_は離すと止まり_toggle_は再押下で止まる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 2);
+    app.transport.is_playing = true;
     let gate = put_cell(&mut app, 1, 0);
     app.handle_event(AppEvent::Launcher(LauncherEvent::SetLaunchSettings {
         cells: vec![gate],
@@ -331,6 +360,36 @@ fn gate_は離すと止まり_toggle_は再押下で止まる() {
     );
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::LauncherStopped, "Toggle は再押下で止まる");
+}
+
+/// 停止中の `Toggle` の ▶ は「鳴っているセルをもう一度押した」ではない。
+///
+/// ランチャーの走行状態は停止で消えない (計画書 §0) ので、Space で止めた行の
+/// `Song` は `Launcher { clip_id }` のまま残る。それを押し直しと読むと GUI が
+/// `LauncherStopped` を書き、engine にも `Stop` が積まれて **▶ を押してもその行
+/// だけ 1 回鳴らない**。engine (`LauncherRuntime::press_cell`) と対で直しているので、
+/// 片側だけ戻すと `sync_saved_rows` の差分適用でセルが消える形で静かに再発する。
+#[test]
+fn 停止中の_toggle_は止めずに撃ち直す() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    app.transport.is_playing = true;
+    let toggle = put_cell(&mut app, 1, 0);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetLaunchSettings {
+        cells: vec![toggle],
+        edit: LaunchEdit::Mode(LaunchMode::Toggle),
+    }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
+    assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: toggle.clip_id() });
+
+    // Space で停止 (engine の観測値を `Tick` 経由で受けたのと同じ状態)。
+    app.transport.is_playing = false;
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
+    assert_eq!(
+        launcher_of(&app, 1),
+        RowPlayback::Launcher { clip_id: toggle.clip_id() },
+        "停止中の ▶ は止めずに撃ち直す"
+    );
 }
 
 /// Capture: いま鳴っているセルを新しい列として取り込む。**再生は止めない**
@@ -784,4 +843,237 @@ fn 実体の無い列を撃っても再生は始まらない() {
     );
     assert!(!app.transport.is_playing, "全停止で再生が始まらない");
     assert_eq!(launcher_of(&app, 1), RowPlayback::LauncherStopped, "行は停止に落ちる");
+}
+
+/// 同じ行の隣り合う 2 セルを **まとめて 1 列ずらしても、どちらも消えない**。
+///
+/// `Track::put_session_clip` は落とし先の既存セルを捨てるので、move を 1 件ずつ
+/// 「song から読んで置く」実装だと、先に置いた列 1→2 が **まだ動かしていない
+/// 列 2 のセル**を潰し、その後の列 2→3 は読むものが無くて `continue` する
+/// (= セルが 1 つ消滅する)。順序で回避しても逆方向のドラッグで再発するので、
+/// 「置く側が song を読まない」形になっていることをここで押さえる。
+#[test]
+fn 隣り合うセルをまとめてずらしても消えない() {
+    // ---- 右へ 1 列 (列 0,1 → 列 1,2) ----
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 3);
+    let a = put_cell(&mut app, 1, 0);
+    let b = put_cell(&mut app, 1, 1);
+
+    move_cells(
+        &mut app,
+        LauncherRow::Track(1),
+        &[(a, 1), (b, 2)],
+        daw_gui::event_launcher::LauncherDropMode::Move,
+    );
+
+    assert_eq!(app.song_doc.song().tracks[0].session_clips.len(), 2, "2 つとも残る");
+    assert!(cell_at(&app, 1, 0).is_none(), "元の列 0 は空く");
+    assert_eq!(cell_at(&app, 1, 1), Some(a), "A は列 1 へ (id も保つ)");
+    assert_eq!(cell_at(&app, 1, 2), Some(b), "B は列 2 へ (id も保つ)");
+
+    // ---- 左へ 1 列 (列 1,2 → 列 0,1) ----
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 3);
+    let a = put_cell(&mut app, 1, 1);
+    let b = put_cell(&mut app, 1, 2);
+
+    move_cells(
+        &mut app,
+        LauncherRow::Track(1),
+        &[(a, 0), (b, 1)],
+        daw_gui::event_launcher::LauncherDropMode::Move,
+    );
+
+    assert_eq!(app.song_doc.song().tracks[0].session_clips.len(), 2, "2 つとも残る");
+    assert_eq!(cell_at(&app, 1, 0), Some(a), "A は列 0 へ");
+    assert_eq!(cell_at(&app, 1, 1), Some(b), "B は列 1 へ");
+    assert!(cell_at(&app, 1, 2).is_none(), "元の列 2 は空く");
+}
+
+/// `Ctrl` (リンクコピー) でも同じ — 上書きされる列のセルの複製が作れないと
+/// **コピーが 1 つしかできない**。元セルは残るので、落とし先が元セルと重なる分は
+/// 「ドロップは置き換え」で入れ替わる。
+#[test]
+fn 隣り合うセルのリンクコピーは_2_つとも作られる() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 3);
+    let a = put_cell(&mut app, 1, 0);
+    let b = put_cell(&mut app, 1, 1);
+
+    move_cells(
+        &mut app,
+        LauncherRow::Track(1),
+        &[(a, 1), (b, 2)],
+        daw_gui::event_launcher::LauncherDropMode::CopyLinked,
+    );
+
+    assert_eq!(app.song_doc.song().tracks[0].session_clips.len(), 3, "元 1 つ + 複製 2 つ");
+    assert_eq!(cell_at(&app, 1, 0), Some(a), "元の A はその場に残る");
+    assert!(cell_at(&app, 1, 2).is_some(), "B の複製が列 2 に出来る");
+}
+
+/// **セルを置けない行**にはどの口からも置けない。
+///
+/// グループトラックは自分のクリップを鳴らさない (`process_track_owned` が
+/// `track_has_children` で pass 1 を抜ける) ので、置いたセルは保存はされるのに
+/// 永久に鳴らない。テンポ / 拍子レーンはランチャーが握ると量子化グリッドが
+/// 自己参照する (`AutomationTarget::accepts_launcher_cells`)。
+#[test]
+fn セルを置けない行には作れない() {
+    use common::model::{AutomationLane, AutomationTarget};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 2, 1);
+    app.edit_song(|song| {
+        // track 1 を track 2 の親 = グループにする。
+        song.tracks[1].parent_group_id = Some(1);
+        // マスター行にテンポレーンを 1 本。
+        song.song_lanes
+            .push(AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::SongTempo, 120.0) });
+    });
+    app.song_doc.mark_saved();
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
+        row: LauncherRow::Track(1),
+        scene_index: 0,
+    }));
+    assert!(
+        app.song_doc.song().tracks[0].session_clips.is_empty(),
+        "グループトラックの行にセルは置けない"
+    );
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
+        row: LauncherRow::Lane(common::model::AutomationLaneKey {
+            track: common::model::MASTER_TRACK_ID,
+            lane: 1,
+        }),
+        scene_index: 0,
+    }));
+    assert!(
+        app.song_doc.song().song_lanes[0].session_clips.is_empty(),
+        "テンポレーンの行にセルは置けない"
+    );
+    assert!(!app.song_doc.is_dirty(), "置けないので `*` も立たない");
+}
+
+/// 列の連鎖の起点 (`Song.last_launched_scene_id`) は **ユーザーが撃った列だけ**を
+/// 覚え、全停止 / 全行アレンジ復帰で降りる。engine の `seed_from_song` が
+/// 停止 → 再生 / 書き出しのたびにここからシーンのフォローアクションを arm し直すので、
+/// 残したままだと「全部止めたのに書き出すと鳴り出す」になる (§1.4 / Q9)。
+#[test]
+fn 撃った列だけが連鎖の起点として残る() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 2, 2);
+    put_cell(&mut app, 1, 0);
+    let scene = app.song_doc.song().scenes[0].id;
+    assert_eq!(app.song_doc.song().last_launched_scene_id, 0, "前提: まだ撃っていない");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
+        scene_id: scene,
+        pressed: true,
+    }));
+    assert_eq!(app.song_doc.song().last_launched_scene_id, scene, "撃った列が起点になる");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::StopAllRows));
+    assert_eq!(app.song_doc.song().last_launched_scene_id, 0, "全停止で起点は降りる");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
+        scene_id: scene,
+        pressed: true,
+    }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::AllToArranger));
+    assert_eq!(
+        app.song_doc.song().last_launched_scene_id,
+        0,
+        "全行アレンジ復帰でも起点は降りる"
+    );
+}
+
+/// **セル面は 1 面**: トラック行のセルとオートメーションレーン行のセルを一緒に
+/// 選んで `Delete` すると、両方消える。
+///
+/// 以前はレーン行のセルだけアレンジの automation クリップ集合 / 面タグ
+/// (`AutomationClips`) に相乗りしていたため、両方を選ぶと last-wins が片方を
+/// 捨て、**選んだうちの半分しか消えない**。画面上は選択リングが両方に出るので
+/// 「消えなかった」に気付けない = 静かに壊れる形。
+#[test]
+fn 両方の行のセルを選んだ_delete_は両方消す() {
+    use common::model::{AutomationLane, AutomationLaneKey, AutomationTarget};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 2);
+    app.edit_song(|song| {
+        song.tracks[0]
+            .automation_lanes
+            .push(AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume), 0.0) });
+    });
+    let lane = AutomationLaneKey { track: 1, lane: 1 };
+
+    let track_cell = put_cell(&mut app, 1, 0);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
+        row: LauncherRow::Lane(lane),
+        scene_index: 1,
+    }));
+    let lane_cell = app
+        .cell_in_row_at_scene(LauncherRow::Lane(lane), app.song_doc.song().scenes[1].id)
+        .expect("レーン行にセルが出来ている");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell: track_cell,
+        modifier: SelectModifier::Single,
+    }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell: lane_cell,
+        modifier: SelectModifier::Toggle,
+    }));
+    assert_eq!(app.selected_launcher_cells().len(), 2, "2 つとも選択の対象になっている");
+
+    app.delete_current_surface(false);
+    assert!(
+        app.song_doc.song().tracks[0].session_clips.is_empty(),
+        "トラック行のセルが消えている"
+    );
+    assert!(
+        app.song_doc.song().tracks[0].automation_lanes[0].session_clips.is_empty(),
+        "オートメーションレーン行のセルも同じ Delete で消えている"
+    );
+}
+
+/// アレンジで範囲を引き直しても、ランチャーのセル選択は消えない。
+///
+/// 以前はレーン行のセルがアレンジの automation クリップ集合に居たため、
+/// `prune_automation_selection` (= 範囲の外の automation 選択を落とす) が
+/// **範囲と無関係なセルまで巻き込んで**消していた。
+#[test]
+fn アレンジの範囲操作はセル選択を消さない() {
+    use common::model::{AutomationLane, AutomationLaneKey, AutomationTarget};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    app.edit_song(|song| {
+        song.tracks[0]
+            .automation_lanes
+            .push(AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume), 0.0) });
+    });
+    let lane = AutomationLaneKey { track: 1, lane: 1 };
+    app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
+        row: LauncherRow::Lane(lane),
+        scene_index: 0,
+    }));
+    let lane_cell = app
+        .cell_in_row_at_scene(LauncherRow::Lane(lane), app.song_doc.song().scenes[0].id)
+        .expect("レーン行にセルが出来ている");
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
+        cell: lane_cell,
+        modifier: SelectModifier::Single,
+    }));
+
+    app.handle_event(AppEvent::SetTimeSelection {
+        start_beat: 8.0,
+        end_beat: 16.0,
+        lanes: vec![common::model::LaneRef::Automation(lane)],
+    });
+    assert_eq!(
+        app.selection.selected_launcher_cells,
+        vec![lane_cell],
+        "アレンジの範囲を引いてもセルの選択は残る"
+    );
 }

@@ -188,10 +188,18 @@ fn convert(intent: &LauncherIntent) -> Option<LauncherEvent> {
 
 /// ファイルを落とした座標がランチャーのセルに当たっていれば、その取り込み先。
 ///
-/// **行はセルの実 rect で解く** — Y だけで解くと、停止列 / 返す列に落としたときまで
-/// セル扱いになる。オートメーションレーン行はメディアを置けないので `None`
-/// (呼び側が従来どおりトラック行として扱う)。
+/// **行は帯が返した行の y 帯 (`row_bands`) で解く** — X だけで解くと停止列 /
+/// 返す列に落としたときまでセル扱いになるし、`cell_rects` (= セルを置ける行しか
+/// 載らない) で解くと **グループ行 / マスター行 / テンポ・拍子レーン行に落とした
+/// ファイルが「一番下に新トラックを作る」に化ける** (セルの上下インセットで空く
+/// 行間 4px の隙間でも同じ)。
+///
+/// 「その行にセルを置けるか」は [`row_accepts_cells`](crate::handler::launcher_cells::row_accepts_cells)
+/// **1 本だけ**を引く (作成 / 移動 / drop / 貼り付けと同じ判定)。置けない行は
+/// `None` = 何もしない。オートメーションレーン行はメディア (オーディオ / 画像 /
+/// MIDI) を置けないのでこれも `None`。
 pub(crate) fn cell_drop_target(
+    app: &AppData,
     resp: &ArrangementResponse,
     pos: (f32, f32),
 ) -> Option<ImportTrackTarget> {
@@ -214,18 +222,21 @@ pub(crate) fn cell_drop_target(
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scene_index = rel.floor() as u32;
-    // 行は「その y を含むセル rect」から引く。1 つも無ければ **一番下に
-    // 新しいトラックを作って、その行のセル**にする (アレンジ側の
+    // 行は「その y を含む行の帯」から引く。**行が 1 つも無い下の余白**のときだけ
+    // 一番下に新しいトラックを作って、その行のセルにする (アレンジ側の
     // `NewTrackBottom` と同じ約束を、ランチャーの語彙で持つ)。
     let row = resp
         .launcher
-        .cell_rects
+        .row_bands
         .iter()
         .find(|(_, r)| pos.1 >= r.y && pos.1 < r.y + r.h)
-        .map(|(k, _)| k.row);
+        .map(|(k, _)| *k);
     match row {
         Some(ArrangementRowKey::Track(track_id)) => {
-            Some(ImportTrackTarget::LauncherCell { track_id, scene_index })
+            // グループ行 / マスター行はセルを持てない (置いても鳴らない)。
+            let row = LauncherRow::Track(track_id);
+            crate::handler::launcher_cells::row_accepts_cells(app.song_doc.song(), row)
+                .then_some(ImportTrackTarget::LauncherCell { track_id, scene_index })
         }
         // オートメーションレーン行にはオーディオ / 画像 / MIDI を置けない。
         Some(ArrangementRowKey::Lane(_)) => None,
@@ -368,5 +379,119 @@ fn scene_rename_input(
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::Launcher(LauncherEvent::CommitRenameScene));
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use common::protocol::{AudioCommand, PluginCommand};
+    use tokio::sync::mpsc;
+
+    use crate::dispatcher::{
+        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+    };
+    use crate::widgets::arrangement::LauncherResponse;
+
+    fn build_app() -> AppData {
+        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<AudioCommand>();
+        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<PluginCommand>();
+        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+        AppData::new(
+            audio_tx,
+            plugin_tx,
+            None,
+            None,
+            event_dispatcher,
+            job_dispatcher,
+            None,
+            None,
+            common::audio_bridge::DEFAULT_SAMPLE_RATE,
+        )
+    }
+
+    /// 行 `10` = グループ (子 `11` を持つ) / 行 `11` = 通常トラック。
+    /// 帯は 1 列ぶんだけ描かれていて、行の帯は y = 0..20 / 20..40。
+    fn app_and_resp() -> (AppData, ArrangementResponse) {
+        let mut app = build_app();
+        app.edit_song(|song| {
+            song.tracks.clear();
+            song.tracks.push(common::model::Track {
+                id: 10,
+                name: "group".into(),
+                ..common::model::Track::default()
+            });
+            song.tracks.push(common::model::Track {
+                id: 11,
+                name: "child".into(),
+                parent_group_id: Some(10),
+                ..common::model::Track::default()
+            });
+        });
+        let launcher = LauncherResponse {
+            grid_rect: Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 },
+            col_w: 100.0,
+            scroll_scene: 0.0,
+            row_bands: vec![
+                (
+                    ArrangementRowKey::Track(10),
+                    Rect { x: 0.0, y: 0.0, w: 100.0, h: 20.0 },
+                ),
+                (
+                    ArrangementRowKey::Track(11),
+                    Rect { x: 0.0, y: 20.0, w: 100.0, h: 20.0 },
+                ),
+            ],
+            ..LauncherResponse::default()
+        };
+        let resp = ArrangementResponse { launcher, ..ArrangementResponse::default() };
+        (app, resp)
+    }
+
+    /// **グループ行へ落としたファイルが「一番下に新トラックを作る」に化けない。**
+    ///
+    /// 行の解決を `cell_rects` (= セルを置ける行しか載らない) で行うと、グループ行も
+    /// 「行が 1 つも無い余白」も同じ「当たらなかった」に潰れ、グループ行への drop が
+    /// 黙って新トラックの作成になる。 画面上は「落とした場所と関係ないところに
+    /// トラックが生える」形でしか出ないので、気付くのは実機だけ。
+    #[test]
+    fn グループ行へのファイル_dropは新トラックを作らない() {
+        let (app, resp) = app_and_resp();
+        assert_eq!(cell_drop_target(&app, &resp, (10.0, 10.0)), None);
+    }
+
+    /// 通常トラック行はそのままセルの取り込み先になる。
+    #[test]
+    fn 通常トラック行へのファイル_dropはその行のセルになる() {
+        let (app, resp) = app_and_resp();
+        assert_eq!(
+            cell_drop_target(&app, &resp, (10.0, 30.0)),
+            Some(ImportTrackTarget::LauncherCell { track_id: 11, scene_index: 0 }),
+        );
+    }
+
+    /// **行と行の隙間**でも行は決まる (セルの上下インセット 4px に落ちても、
+    /// 新トラックの作成に化けない)。
+    #[test]
+    fn 行の境目に落としてもその行のセルになる() {
+        let (app, resp) = app_and_resp();
+        assert_eq!(
+            cell_drop_target(&app, &resp, (10.0, 21.0)),
+            Some(ImportTrackTarget::LauncherCell { track_id: 11, scene_index: 0 }),
+        );
+    }
+
+    /// 行が 1 つも無い下の余白だけが「一番下に新トラックを作る」。
+    #[test]
+    fn 行の無い余白へのファイル_dropは新トラックになる() {
+        let (app, resp) = app_and_resp();
+        assert_eq!(
+            cell_drop_target(&app, &resp, (10.0, 80.0)),
+            Some(ImportTrackTarget::LauncherNewTrack { scene_index: 0 }),
+        );
     }
 }

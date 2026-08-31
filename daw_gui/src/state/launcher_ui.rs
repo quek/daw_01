@@ -57,3 +57,31 @@ pub struct LauncherUiState {
     /// (計画書 §1.4)。
     pub running: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>,
 }
+
+impl LauncherUiState {
+    /// **Song スコープの id を持つフィールドを全部落とす** (プロジェクトを開く /
+    /// 保存版へ戻す / recovery 復元)。
+    ///
+    /// `focus` / `hover` (行 = `track_id` + `lane_id`)、`scene_rename_id`
+    /// (`Scene::id`)、`learn_target` (`track_id` / `scene_id` を内包)、
+    /// `running` (行 key) はどれも **別プロジェクトでも「解決できてしまう」** —
+    /// id はプロジェクトごとに 1 から採り直されるので、持ち越すと前の曲の番号が
+    /// 新しい曲の別物を指す (Learn 待ちのまま曲を開き替えてパッドを叩くと、
+    /// 新しい曲の無関係なセルに割り当てが書かれて `*` が立つ)。
+    ///
+    /// **捨てる口はこの 1 本**。ここを通せば、フィールドを足したときに
+    /// `reset_song_scoped_state` 側を直し忘れても漏れない。
+    pub fn reset_song_scoped(&mut self) {
+        self.focus = None;
+        self.hover = None;
+        self.scene_rename_id = None;
+        self.scene_rename_text.clear();
+        self.learn_target = None;
+        // engine は 30Hz で丸ごと入れ替えるが、次の tick までは前の曲の行を
+        // 見せてしまう (グリッドが鳴ってもいないセルを光らせる)。
+        self.running.clear();
+        // MIDI の押下エッジも曲を跨いで持ち越さない (bind 表が入れ替わるので
+        // 「前の曲で押しっぱなし」の記憶に意味が無い)。
+        self.cc_pressed.clear();
+    }
+}

@@ -37,7 +37,6 @@ pub(super) fn commit_releases(
     let style: &ArrangementStyle = f.style;
     let master_row: Option<&ArrangementMasterRow> = f.master_row;
     let sections: &[SectionView] = f.sections;
-    let selected_clips: &[ClipKey] = f.selected_clips;
     let selected_automation_clips: &[AutomationClipKey] = f.selected_automation_clips;
     let selected_automation_points: &[AutomationPointKey] = f.selected_automation_points;
     let visible_tracks: &[ArrangementTrack] = &f.visible_tracks;
@@ -700,7 +699,11 @@ pub(super) fn commit_releases(
             && lanes.contains(cx, cy)
             && !ui.has_open_popups()
         {
-            let prev = selected_clips.to_vec();
+            // 「消すものがあるか」は **選択の SSoT (時間範囲)** で見る。
+            // 導出値の `selected_clips` で代用すると、範囲だけ引いてクリップに
+            // 掛かっていないとき (= 導出が空) にその範囲がハイライトされたまま
+            // 消せない。
+            let had_range = f.time_selection.is_some();
             // r.md #35: clip click を全選択面共通の `SelectModifier` に統一
             // (`docs/plan_selection_modifiers.md` §3)。 無修飾 = Single / Ctrl = Toggle /
             // Shift = RangeFromAnchor (= 可視 track 行 × 時間の長方形ブロック)。
@@ -723,7 +726,7 @@ pub(super) fn commit_releases(
                     app.handle_event(AppEvent::SelectClip { target: hit_key, additive });
                 }));
                 response.selection_changed = true;
-            } else if !prev.is_empty() {
+            } else if had_range {
                 // 空きレーンの短 click → 選択クリア。
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetClipSelection(Vec::new()));

@@ -32,7 +32,11 @@
 //! # RT 規約
 //!
 //! 走行状態も [`RowSourceTable`] もすべて事前確保。audio thread では確保・ロック・
-//! I/O・`format!` を行わない (`make test-rt` の `assert_no_alloc` が検査)。
+//! I/O・`format!` を行わない。**この主張は検査に裏打ちされている** —
+//! `render.rs` の `rt_assert_tests` が [`runtime::LauncherRuntime::update`] /
+//! `publish` / [`render::collect_row_midi`] / [`render::render_row_audio`] を
+//! `assert_no_alloc` で包んで `make test-rt` から回る (定常 / セル発火 /
+//! シーン発火 / フォローアクションの遷移 / ループ端の跨ぎを 1 本で通す)。
 //! 乱数はグローバル状態を持たず `f(seed, 発火拍)` の純ハッシュ
 //! ([`common::modulators::random_unit`]) — 書き出しを 2 回やれば同じ結果になる (Q9)。
 
@@ -41,8 +45,14 @@ pub mod ipc;
 pub mod quantize;
 pub mod render;
 pub mod runtime;
+pub mod sidecar;
 
 pub use runtime::{LaunchRequest, LauncherRuntime};
+
+// 発火拍 / ループ端の丸め誤差を吸収する幅 (拍)。**GUI と engine で同じ値を使う**
+// ため定数の SSoT は `common::model` 側 1 本 — 以前はここと
+// `daw_gui::launcher_time` に別々の値 (1e-5 / 1e-9) が居て 4 桁食い違っていた。
+use common::model::LAUNCH_EPSILON_BEATS;
 
 /// 走行状態を持てる行数の上限。`common::audio_bridge::MAX_LAUNCHER_ROWS` と
 /// 揃える (publish できない行を engine だけが持っても表示できない)。
@@ -51,13 +61,6 @@ pub const MAX_ROWS: usize = common::audio_bridge::MAX_LAUNCHER_ROWS;
 /// 拍数 / 長さとして使える値か (有限かつ正)。
 ///
 /// `!(x > 0.0)` と書くと NaN も弾けるが clippy の `neg_cmp_op_on_partial_ord` に
-/// 発火拍 / ループ端の丸め誤差を吸収する幅 (拍)。frame → 拍 の往復で
-/// 数 ULP ずれるのと、`switch_frame` が floor である (= 発火 frame の拍は
-/// 発火拍のわずか手前) の 2 つを吸収する。48 kHz / 120 BPM の 1 frame が
-/// 約 8.3e-5 拍なので、その 1/8 を採る。**GUI 側 (`launcher_time`) の
-/// 同名定数と意味を揃えること。**
-pub const LAUNCH_EPSILON_BEATS: f64 = 1e-5;
-
 /// 当たる。判定を 1 か所に閉じて、呼び側は `!is_positive(x)` と書く。
 #[must_use]
 #[inline]
@@ -126,6 +129,30 @@ impl RowPhase {
         match self {
             Self::Cell { clip_id, .. } => Some(clip_id),
             _ => None,
+        }
+    }
+
+    /// この供給元を **`Song` の主導権の語彙** ([`common::model::RowPlayback`]) で表す。
+    ///
+    /// GUI へ渡る形はどれもこの語彙 (shmem publish / 書き出しの sidecar / `Song`) なので、
+    /// 対応表はここ 1 本だけが持つ。**保存はしない** — 走行位置を `Song` へ書き戻すと
+    /// 書き出しの再現性が壊れる (計画書 §1.4)。
+    #[must_use]
+    pub fn playback(self) -> common::model::RowPlayback {
+        use common::model::RowPlayback;
+        match self {
+            Self::Arranger => RowPlayback::Arranger,
+            Self::Silent => RowPlayback::LauncherStopped,
+            Self::Cell { clip_id, .. } => RowPlayback::Launcher { clip_id },
+        }
+    }
+
+    /// セルを撃った song 拍 (`Arranger` / `Silent` は `0.0`)。位相の原点。
+    #[must_use]
+    pub fn launch_beat(self) -> f64 {
+        match self {
+            Self::Cell { launch_beat, .. } => launch_beat,
+            _ => 0.0,
         }
     }
 
@@ -356,20 +383,37 @@ impl RowSourceTable {
         }
     }
 
-    /// 1 トラック分の行 (トラック行 + そのレーン行)。範囲外は空 =
-    /// すべて `Arranger` (= 従来の挙動)。
+    /// 1 グループ分の行。範囲外は空 = すべて `Arranger` (= 従来の挙動)。
+    ///
+    /// **「トラック行 + レーン行」の切り分けはここ 1 か所だけ**が知っている。
+    /// マスター行群は `Song.song_lanes` が実体でトラック行を持たないので、
+    /// そこだけ [`TrackRows::track`] が既定 (`Arranger`) になる。以前は
+    /// `TrackRows` 側が「先頭がトラック行」を暗黙に仮定して `+1` していて、
+    /// トラック行を積まないマスター群だけ 1 本ずれて読まれていた。
     #[must_use]
-    pub fn track_rows(&self, track_idx: usize) -> TrackRows<'_> {
-        let Some(&base) = self.offsets.get(track_idx) else {
+    pub fn track_rows(&self, group_idx: usize) -> TrackRows<'_> {
+        let Some(&base) = self.offsets.get(group_idx) else {
             return TrackRows::default();
         };
         #[allow(clippy::cast_possible_truncation)]
-        let end = self.offsets.get(track_idx + 1).copied().unwrap_or(self.sources.len() as u32);
+        let end = self.offsets.get(group_idx + 1).copied().unwrap_or(self.sources.len() as u32);
         let (a, b) = (base as usize, (end as usize).min(self.sources.len()));
-        if a >= b {
+        let Some(group) = self.sources.get(a..b).filter(|g| !g.is_empty()) else {
             return TrackRows::default();
+        };
+        if self.master_group == Some(group_idx) {
+            return TrackRows { track: RowTimeSource::default(), lanes: group };
         }
-        TrackRows { rows: &self.sources[a..b] }
+        TrackRows { track: group[0], lanes: &group[1..] }
+    }
+
+    /// 全行の供給元を並び順に見る (書き出しの sidecar 記録用)。
+    ///
+    /// 順序は `build_table` が積んだ順 = `song.tracks` → 各トラックの
+    /// `automation_lanes` → マスターの `song_lanes`。消費側は
+    /// [`RowTimeSource::key`] (安定 id) で行を識別するので、この並びに依存しない。
+    pub fn iter(&self) -> impl Iterator<Item = &RowTimeSource> {
+        self.sources.iter()
     }
 
     /// トラック行の供給元 (単発参照用)。
@@ -387,27 +431,35 @@ impl RowSourceTable {
     }
 }
 
-/// 1 トラック分の行のビュー (`Copy`)。**先頭がトラック行**、以降が
-/// `automation_lanes` と同じ順のレーン行。
+/// 1 グループ分の行のビュー (`Copy`)。
+///
+/// **添字の暗黙前提を型で消す** — 「先頭がトラック行、以降がレーン行」という
+/// 規約を `+1` で表現せず、トラック行とレーン行を別のフィールドに分けて持つ。
+/// レーン行の添字は `automation_lanes` (マスターは `song_lanes`) の並びと
+/// **そのまま一致**するので、消費側 (`fill_pd_param_events` /
+/// `fill_track_param_ramps` / send gain) は `enumerate()` の index をそのまま渡せる。
 ///
 /// worker へ渡すのはこの形 — トラックごとに 1 つの `Copy` 値で済むので、
 /// `process_track_owned` から automation の評価まで引数 1 本で通る。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrackRows<'a> {
-    rows: &'a [RowTimeSource],
+    /// トラック行。マスター行群は持たない (= `Arranger`)。
+    track: RowTimeSource,
+    /// `automation_lanes` / `song_lanes` と同じ順のレーン行。
+    lanes: &'a [RowTimeSource],
 }
 
 impl TrackRows<'_> {
     /// トラック行。無ければ `Arranger`。
     #[must_use]
     pub fn track(self) -> RowTimeSource {
-        self.rows.first().copied().unwrap_or_default()
+        self.track
     }
 
     /// `lane_idx` 番目のオートメーションレーン行。無ければ `Arranger`。
     #[must_use]
     pub fn lane(self, lane_idx: usize) -> RowTimeSource {
-        self.rows.get(lane_idx + 1).copied().unwrap_or_default()
+        self.lanes.get(lane_idx).copied().unwrap_or_default()
     }
 }
 
@@ -542,5 +594,43 @@ mod tests {
         assert_eq!(t.track_row(1).key, RowKey::track(2));
         // 存在しないトラックも既定。
         assert_eq!(t.track_row(9).head, RowPhase::Arranger);
+    }
+
+    /// **マスター行群 (`Song.song_lanes`) はトラック行を持たない。**
+    /// 消費側 (`fill_pd_param_events`) は `song_lanes` を `enumerate()` して
+    /// `lane(i)` を引くので、ここが 1 本ずれると「セルを撃っているのに
+    /// アレンジのカーブが鳴る」「最後のレーンが範囲外で既定に落ちる」になる。
+    /// レーンが 2 本以上ないとズレが観測できないので 2 本置く。
+    #[test]
+    fn マスター行のレーンは添字がずれない() {
+        const M: u32 = common::model::MASTER_TRACK_ID;
+        let mut t = RowSourceTable::new();
+        t.begin_track();
+        t.push(RowTimeSource::uniform(RowKey::track(1), RowPhase::Arranger));
+        t.begin_master();
+        t.push(RowTimeSource::uniform(RowKey::lane(M, 3), RowPhase::Silent));
+        t.push(RowTimeSource::uniform(RowKey::lane(M, 4), cell(0.0, 4.0, true)));
+
+        let m = t.master_rows();
+        // `song_lanes[0]` / `[1]` がそのまま `lane(0)` / `lane(1)`。
+        assert_eq!(m.lane(0).key, RowKey::lane(M, 3));
+        assert_eq!(m.lane(0).head, RowPhase::Silent);
+        assert_eq!(m.lane(1).key, RowKey::lane(M, 4));
+        assert_eq!(m.lane(1).head.cell_clip_id(), Some(7));
+        // マスターにトラック行は無い → 既定 (`Arranger`)。
+        assert_eq!(m.track(), RowTimeSource::default());
+        // 範囲外は既定。
+        assert_eq!(m.lane(2), RowTimeSource::default());
+        // 通常トラック側は従来どおり (先頭がトラック行)。
+        assert_eq!(t.track_row(0).key, RowKey::track(1));
+    }
+
+    #[test]
+    fn マスター行を積んでいなければ全部アレンジ() {
+        let mut t = RowSourceTable::new();
+        t.begin_track();
+        t.push(RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent));
+        assert_eq!(t.master_rows().lane(0), RowTimeSource::default());
+        assert_eq!(t.master_rows().track(), RowTimeSource::default());
     }
 }

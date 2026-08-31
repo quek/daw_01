@@ -112,7 +112,77 @@ pub struct ProcessData {
     /// loop_start_beats` だけでは「loop region は設定したが loop button は
     /// off」 ケースと区別できないので独立フラグで持つ。
     pub looping: u8,
-    pub _pad_transport: [u8; 5],
+    pub _pad_transport: [u8; 7],
+    /// r.md #87: **この device が載っている「行」の時間軸**。
+    /// `song_pos_beats` (曲全体の位置) と意味が違うので型で分けてある。
+    pub row: RowTransport,
+}
+
+/// r.md #87 (クリップランチャー): 1 行ぶんの時間軸
+/// (`docs/plan_rmd_87_clip_launcher.md` §2.1)。
+///
+/// ランチャーは「行ごとに時間軸の供給元を切り替える機構」なので、行の主導権を
+/// ランチャーが握っている間、その行の device が見るべき musical time は
+/// **曲の拍ではなくセルの実効拍**。engine (`daw_audio::launcher::RowPhase`) が
+/// 毎 buffer 解いた結果をここへ載せて plugin host へ渡す。
+///
+/// **位相の式 (`launch_beat + ((playhead - launch_beat) mod loop_len)`) の SSoT は
+/// engine 1 本**で、プロセス境界の向こうでは書き直さない — ここに載るのは
+/// 解決済みの値だけ。値は **buffer 頭のもの**で、buffer 内のループ端跨ぎは
+/// 反映しない (アレンジのループ wrap も buffer 境界でしか起きない = 同じ粒度)。
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct RowTransport {
+    /// buffer 頭におけるこの行の実効拍。ランチャーが主導権を持たない行
+    /// (= アレンジ) では `ProcessData::song_pos_beats` と一致する。
+    pub pos_beats: f64,
+    /// **この行自身のループ区間** (拍)。セルを鳴らしている行はセルの窓
+    /// `[cell_start, cell_start + loop_len)`、ワンショットのセルと
+    /// アレンジ主導の行は `0.0 / 0.0` (= 自前のループ無し)。
+    ///
+    /// `pos_beats` がセルの窓の中を回っているのに曲のループ区間を名乗り続けると、
+    /// plugin から見て「拍がループの外を回っている」不整合になるので、位置と
+    /// 対で運ぶ。曲のループ (`ProcessData::loop_*`) を置き換えるものではない
+    /// — アレンジ主導の行ではそちらがそのまま使われる。
+    pub loop_start_beats: f64,
+    pub loop_end_beats: f64,
+    /// 行のイベント源。`0` = アレンジのタイムライン、それ以外 = いま鳴っている
+    /// セルの `Clip::id` (`Clip::id` は 1 から採番されるので 0 と衝突しない)。
+    pub cell_clip_id: u32,
+    /// `1` = この buffer でこの行は無音 (Stop Clips / 空セルのシーンを撃った /
+    /// ワンショットが終端を越えた)。**行のタイムラインから音を作る device**
+    /// (builtin VOICEVOX の連続再生) は出力を止める。エフェクトは止めない
+    /// — 直前まで鳴っていた音のテールを切ってしまう。
+    pub silent: u8,
+    pub _pad: [u8; 3],
+}
+
+/// [`RowTransport::cell_clip_id`] が「アレンジのタイムライン」を表す値。
+/// engine (書き手) と plugin host (読み手) で同じ意味を持つ必要があるので
+/// 定義はここ 1 本。
+pub const ARRANGER_CELL_ID: u32 = 0;
+
+impl RowTransport {
+    /// 供給元がアレンジのタイムラインか (= セルを鳴らしていない)。
+    #[must_use]
+    #[inline]
+    pub fn is_arrangement(self) -> bool {
+        self.cell_clip_id == ARRANGER_CELL_ID
+    }
+
+    /// この buffer でこの行は無音か。
+    #[must_use]
+    #[inline]
+    pub fn is_silent(self) -> bool {
+        self.silent != 0
+    }
+
+    /// この行が自前のループ区間を持つか (= ループするセルを鳴らしている)。
+    #[must_use]
+    #[inline]
+    pub fn has_loop(self) -> bool {
+        self.loop_end_beats > self.loop_start_beats
+    }
 }
 
 #[repr(C)]
@@ -187,7 +257,15 @@ impl ProcessData {
             loop_end_beats: 0.0,
             song_pos_beats: 0.0,
             looping: 0,
-            _pad_transport: [0; 5],
+            _pad_transport: [0; 7],
+            row: RowTransport {
+                pos_beats: 0.0,
+                loop_start_beats: 0.0,
+                loop_end_beats: 0.0,
+                cell_clip_id: 0,
+                silent: 0,
+                _pad: [0; 3],
+            },
         }
     }
 

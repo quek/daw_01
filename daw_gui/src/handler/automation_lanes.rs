@@ -60,13 +60,15 @@ impl AppData {
         }
 
         // default_value: 同 track 上の first image event の field 値。
+        // r.md #87: 走査は `all_clips` (= clips + session_clips) — content を探す
+        // 走査なので、素材がランチャーのセルにしか無い track で常識値へ落ちない。
         // image event が無ければ field ごとの常識値。 clamp 範囲は field
         // 種別で異なる (x/y/w/h/opacity = [0,1]、 rotation = [-π, π])。
         let default_value: f64 = {
             let Some(track) = self.song_doc.song().track_by_id(track_id) else {
                 return;
             };
-            let event = track.clips.iter().find_map(|c| {
+            let event = track.all_clips().find_map(|c| {
                 self.song_doc.song().clip_contents.get(&c.content_id).and_then(|content| {
                     match content {
                         ClipContent::Image(img) => img.events.first(),
@@ -1247,7 +1249,7 @@ impl AppData {
                 let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
-                let event = track.clips.iter().find_map(|c| {
+                let event = track.all_clips().find_map(|c| {
                     self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
@@ -1266,7 +1268,7 @@ impl AppData {
                     ImageBuiltinParam::Rotation => ev.rotation_radians,
                 })
             }
-            // Text default: 同 track の first text event の field 値。
+            // Text default: 同 track の first text event (セル込み) の field 値。
             // text clip が無い (= lane を空 track で先行追加) は field
             // ごとの常識値 (色 RGBA は (1,1,1,1) や (0,0,0,1) 等)。
             AutomationTarget::TextBuiltin(field) => {
@@ -1274,7 +1276,7 @@ impl AppData {
                 let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
-                let event = track.clips.iter().find_map(|c| {
+                let event = track.all_clips().find_map(|c| {
                     self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
@@ -1354,6 +1356,12 @@ impl AppData {
         }
     }
 
+    /// **アレンジの** automation クリップ (`lane.clips`) を消す。
+    ///
+    /// ランチャーのレーン行のセル (`lane.session_clips`) はここでは消えない —
+    /// セルを消す口は [`AppData::delete_launcher_cells`] 1 本
+    /// ([`EditSurface::LauncherCells`](crate::app::EditSurface::LauncherCells) の
+    /// 削除経路) で、`normalize_session` もそちらが通す。
     pub(crate) fn delete_automation_clips(&mut self, keys: &[common::model::AutomationClipKey]) {
         if keys.is_empty() {
             return;
@@ -1366,14 +1374,7 @@ impl AppData {
                 if let Some(idx) = lane.clip_index_by_id(k.clip) {
                     lane.clips.remove(idx);
                 }
-                // r.md #87: 同じ key 空間に **ランチャーのセル**も居る
-                // (`clips` と `session_clips` は id 空間を共有し、1 つの id は
-                // どちらか一方にしか居ない)。 ここを落とすと「レーン行のセルを
-                // 選んで Delete しても何も起きない」 になる。
-                lane.session_clips.retain(|c| c.clip.id != k.clip);
             }
-            // 鳴っていたセルが消えた行を `LauncherStopped` へ落とす (冪等)。
-            song.normalize_session();
         });
         // 選択中だった clip があれば selection からも除く。
         self.selection.selected_automation_clips

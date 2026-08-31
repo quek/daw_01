@@ -225,6 +225,10 @@ pub use track::*;
 /// `RowPlayback::Arranger` = 従来どおりアレンジだけが鳴る)。**load 時に列を補わない**
 /// ので、開いただけでは `*` が立たない (r.md #9)。
 ///
+/// `Song.last_launched_scene_id` (最後にユーザーが撃った列、`0` = 未発火) も同じ
+/// 理由で保存する — 書き出しはこの列を範囲の先頭で撃った状態から走り出すので、
+/// 落とすとシーン連鎖が再現できない。v34 以前は `0` で forward-migrate する。
+///
 /// あわせて `Song.global_launch_quantize` (グローバルローンチ量子化、既定 = 1 小節) と、
 /// `MidiBinding` の入力が CC 固定 (`controller: u8`) から `MidiBindInput` (CC / ノート) へ
 /// 変わり、`BindingTarget` にランチャー操作 6 種が加わる。パッドはノートで撃つので
@@ -732,6 +736,23 @@ pub struct Song {
     /// 来ても [`LaunchQuantize::beats`] が `None` を返して量子化なしに倒れる。
     #[serde(default = "default_global_launch_quantize")]
     pub global_launch_quantize: LaunchQuantize,
+    /// v35 (r.md #87): **ユーザーが最後に撃った [`Scene`] の id**。`0` = 未発火。
+    ///
+    /// `Track.launcher` / `AutomationLane.launcher` が「行ごとの起点」を持つのと
+    /// 対になる **曲全体の起点** で、シーン連鎖 (シーンのフォローアクション) が
+    /// どこから始まるかを決める。書き出しは範囲の先頭でこの列を撃った状態から
+    /// 走り出すので、これを保存しないと「聴こえている連鎖」を再現できない
+    /// (`docs/plan_rmd_87_clip_launcher.md` Q9)。
+    ///
+    /// **フォローアクションによる遷移先を書いてはいけない** (同 §1.4)。書くと
+    /// 「何秒鳴らしてから書き出したか」で出力が変わり、同じプロジェクト →
+    /// 同じファイルという再現性が壊れる。走行中の現在位置は `audio_bridge` の
+    /// atomic で GUI へ publish するだけで `Song` には入れない。
+    ///
+    /// 曲の一部なので変更で `*` が立つ (`Track.launcher` と同じ扱い、Q10)。
+    /// 消えた列を指していたら [`Song::normalize_session`] が `0` へ落とす。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub last_launched_scene_id: u32,
 }
 
 /// v34 以前の `.daw` に無いので 1 小節へ forward-migrate (Live / Bitwig / Studio One と同じ既定)。
@@ -787,6 +808,7 @@ impl Default for Song {
             song_mod_routings: Vec::new(),
             scenes: Vec::new(),
             global_launch_quantize: DEFAULT_GLOBAL_LAUNCH_QUANTIZE,
+            last_launched_scene_id: 0,
         }
     }
 }
@@ -1558,7 +1580,11 @@ impl Song {
         // 最大値を集める (r.md #44: 左端 trim した clip は content の先の方を見せる)。
         let mut max_len: HashMap<ContentId, f64> = HashMap::new();
         for track in &self.tracks {
-            for clip in &track.clips {
+            // v35 (r.md #87): **`all_clips` を通す** — ランチャーのセル
+            // (`session_clips`) も同じ content を指すので、セルの窓のほうが長いと
+            // event が届かず「撃った直後だけ絵が出て残りは真っ暗」になる
+            // (`content` を数えるものは `all_clips` を通す、`Track::all_clips` の契約)。
+            for clip in track.all_clips() {
                 let e = max_len.entry(clip.content_id).or_insert(0.0);
                 let win_end = clip.content_offset_beats + clip.length_beats;
                 if win_end > *e {

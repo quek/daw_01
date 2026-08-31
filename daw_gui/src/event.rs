@@ -686,6 +686,9 @@ pub enum AppEvent {
     /// track 跨ぎ move (clip 自体を別 track の `clips: Vec<Clip>` に移す)。
     SetClipPositions(Vec<(ClipKey, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
+    /// ランチャーのセル削除 (`AppData::delete_selected_clip` →
+    /// `AppData::delete_launcher_cells`)。名前に反してアレンジのクリップは
+    /// 触らない — アレンジ側は範囲操作 (`DeleteTimeSelection`) で消える。
     DeleteSelectedClip,
     /// 範囲がアクティブなときの Delete: 範囲の境界で分割し、範囲部分だけを消す
     /// (`docs/plan_range_selection.md` §8)。時間は詰めない。
@@ -1707,7 +1710,7 @@ impl AppEvent {
             E::AddTextClipAt { .. } => "テキストクリップ追加",
             E::SetClipPositions(..) => "クリップ移動",
             E::ResizeClip { .. } => "クリップ長さ変更",
-            E::DeleteSelectedClip => "クリップ削除",
+            E::DeleteSelectedClip => "セル削除",
             E::DeleteTimeSelection => "範囲の削除",
             E::CloneClipsLinked(..) | E::CloneClipsIndependent(..) => "クリップ複製",
             E::MakeClipUnique(..) => "クリップを独立化",

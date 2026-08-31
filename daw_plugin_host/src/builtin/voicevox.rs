@@ -103,6 +103,9 @@ pub(super) struct TalkSynthSpec {
     pub(super) scales: TalkParams,
     /// 進捗のクリップ帰属 (`VocalSynthProgress::pending_clips`)。
     pub(super) clip_id: u32,
+    /// r.md #87: 合成タイムライン上の区間の原点 (拍)。`0.0` = アレンジのクリップ。
+    /// 意味は [`common::plugin_metadata::NoteMetadata::cell_base_beat`]。
+    pub(super) cell_base_beat: f64,
 }
 
 /// 歌グループ wav の配置位置 = **wav frame 0 が来る曲 sample 位置**
@@ -151,6 +154,43 @@ pub(super) struct SynthResult {
     pub(super) samples_per_beat: f64,
     /// `note_id → synth wav 内 frame offset`。
     pub(super) note_offsets: Arc<HashMap<u32, u64>>,
+    /// r.md #87: `セルの clip_id → そのセルの仮想区間の原点 (拍)`。
+    /// [`read_window`] が行の実効拍をここへ写して buffer を読む。
+    pub(super) cell_bases: Arc<HashMap<u32, f64>>,
+    /// r.md #87: **アレンジのタイムラインが読んでよい上限** (buffer sample)。
+    /// これより後ろはセル専用の仮想区間なので、playhead が曲の終端より後ろへ
+    /// 行っても撃っていないセルの歌声が漏れない。セルが 1 つも無ければ
+    /// [`u64::MAX`] (= 従来どおり buffer 末尾まで)。
+    pub(super) arrangement_limit_sample: u64,
+}
+
+/// 行の供給元が「アレンジのタイムライン」であることを表す `cell_clip_id`。
+/// **定義は engine と共有** ([`common::process_data::ARRANGER_CELL_ID`]) —
+/// 書き手 (daw_audio) と読み手 (ここ) で意味が食い違うと、撃っていないセルの
+/// 歌声が曲頭から鳴る形で静かに壊れる。
+pub(super) use common::process_data::ARRANGER_CELL_ID as ROW_SOURCE_ARRANGER;
+
+/// 合成 buffer を読む窓 `(先頭 sample, 上限 sample)` を、行の供給元 (r.md #87) から
+/// **1 か所で**解く。`None` = この行はいま無音。
+///
+/// - `cell_clip_id == `[`ROW_SOURCE_ARRANGER`] — `beat` は song 拍そのもの。上限は
+///   [`SynthResult::arrangement_limit_sample`] (= セル区間の手前で打ち切る)。
+/// - セル — `beat` は engine が `RowPhase::effective_beat` で解いた**セル内の実効拍**
+///   (位相の式の SSoT は engine 側。ここでは書き直さない)。そのセルの区間の原点を
+///   足すだけ。まだ合成されていないセルは `None` = 無音。
+#[must_use]
+pub(super) fn read_window(res: &SynthResult, cell_clip_id: u32, beat: f64) -> Option<(f64, f64)> {
+    if !beat.is_finite() || res.samples_per_beat <= 0.0 {
+        return None;
+    }
+    let len = res.samples.len() as f64;
+    if cell_clip_id == ROW_SOURCE_ARRANGER {
+        #[allow(clippy::cast_precision_loss)]
+        let limit = (res.arrangement_limit_sample as f64).min(len);
+        return Some((beat * res.samples_per_beat, limit));
+    }
+    let base = *res.cell_bases.get(&cell_clip_id)?;
+    Some(((base + beat) * res.samples_per_beat, len))
 }
 
 /// 停止中 (transport stopped) の鍵盤プレビュー用 voice。 note_on で張り替え、
@@ -285,38 +325,46 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
             // lead-in を全ソース共通に足しており、talk が話速依存で -53〜+96ms ずれていた。
             // `samples_per_beat` は配置時 (synth 時 job.bpm) の値を SynthResult に持ち回る
             // (再生時 transport.bpm ではなく = tempo 変更過渡の drift を避ける、 下記参照)。
-            if let Some(res) = snapshot.as_ref() {
+            //
+            // r.md #87: 読む窓は **行の供給元** (`ProcessData::row`) が決める。
+            // engine (`launcher::RowPhase`) が毎 buffer 解いた「鳴っているセルの
+            // clip_id」と「行の実効拍」がそのまま届くので、位相の式はここには無い
+            // (SSoT は engine 1 本)。`row.silent` = ランチャーが行を握って黙らせた
+            // (Stop Clips / 空セルのシーン / ワンショットの終端) — アレンジの歌声を
+            // 鳴らし続けてはいけないので読み出しごと止める。
+            if !transport.row.is_silent()
+                && let Some(res) = snapshot.as_ref()
+                && host_sr > 0.0
+                && res.sample_rate > 0
+                && let Some((base, limit)) =
+                    read_window(res, transport.row.cell_clip_id, transport.row.pos_beats)
+            {
                 let src_len = res.samples.len();
-                if host_sr > 0.0 && res.sample_rate > 0 && res.samples_per_beat > 0.0 && src_len > 0
-                {
-                    let src_sr = f64::from(res.sample_rate);
-                    // 拍→buffer 位置は **synth 時の** samples_per_beat を使う (transport.bpm ではない)。
-                    // buffer は job.bpm で配置され、 song_pos_beats は tempo 積分済の真の拍位置なので、
-                    // これで定テンポは常に厳密、 tempo 変更過渡でも base が各 buffer で song_pos_beats から
-                    // 再同期する。
-                    let base = transport.song_pos_beats * res.samples_per_beat;
-                    let ratio = src_sr / host_sr;
-                    for k in 0..out_n {
-                        let pos = base + k as f64 * ratio;
-                        if pos < 0.0 {
-                            continue;
-                        }
-                        let i0 = pos.floor() as usize;
-                        if i0 >= src_len {
-                            // pos は単調増加なので以降も全て範囲外 = 無音。
-                            break;
-                        }
-                        let frac = (pos - i0 as f64) as f32;
-                        // 末尾サンプルは自身を hold (端の補間を安定化)。
-                        let s1 = if i0 + 1 < src_len {
-                            res.samples[i0 + 1]
-                        } else {
-                            res.samples[i0]
-                        };
-                        let s = res.samples[i0] * (1.0 - frac) + s1 * frac;
-                        self.out_l[k] += s;
-                        self.out_r[k] += s;
+                let ratio = f64::from(res.sample_rate) / host_sr;
+                for k in 0..out_n {
+                    let pos = base + k as f64 * ratio;
+                    if pos < 0.0 {
+                        continue;
                     }
+                    // 読み出し窓の外 (buffer 末尾 / セル区間の手前)。pos は単調増加
+                    // なので以降も全て無音。
+                    if pos >= limit {
+                        break;
+                    }
+                    let i0 = pos.floor() as usize;
+                    if i0 >= src_len {
+                        break;
+                    }
+                    let frac = (pos - i0 as f64) as f32;
+                    // 末尾サンプルは自身を hold (端の補間を安定化)。
+                    let s1 = if i0 + 1 < src_len {
+                        res.samples[i0 + 1]
+                    } else {
+                        res.samples[i0]
+                    };
+                    let s = res.samples[i0] * (1.0 - frac) + s1 * frac;
+                    self.out_l[k] += s;
+                    self.out_r[k] += s;
                 }
             }
         } else {
@@ -843,6 +891,7 @@ impl VocalSynth for VoicevoxBuiltin {
                     volume_scale: t.volume_scale,
                 },
                 clip_id: t.clip_id,
+                cell_base_beat: t.cell_base_beat,
             })
             .collect();
 
@@ -1027,16 +1076,33 @@ mod tests {
     fn transport() -> crate::plugin_instance::TransportContext {
         crate::plugin_instance::TransportContext::from_process_data(
             &common::process_data::ProcessData::empty(),
+            false,
         )
     }
 
-    /// 再生中 (playing) transport を指定 playhead 拍位置で組む (連続再生パス検証用)。
-    fn transport_playing(song_pos_beats: f64) -> crate::plugin_instance::TransportContext {
+    /// 再生中 (playing) transport を、指定した行の供給元で組む。
+    fn transport_row(
+        song_pos_beats: f64,
+        row: common::process_data::RowTransport,
+    ) -> crate::plugin_instance::TransportContext {
         let mut pd = common::process_data::ProcessData::empty();
         pd.playing = 1;
         pd.bpm = 120.0;
         pd.song_pos_beats = song_pos_beats;
-        crate::plugin_instance::TransportContext::from_process_data(&pd)
+        pd.row = row;
+        crate::plugin_instance::TransportContext::from_process_data(&pd, false)
+    }
+
+    /// 再生中 (playing) transport を指定 playhead 拍位置で組む (連続再生パス検証用)。
+    /// r.md #87: アレンジ主導の行なので行の実効拍は song 拍と同値 (engine の写像)。
+    fn transport_playing(song_pos_beats: f64) -> crate::plugin_instance::TransportContext {
+        transport_row(
+            song_pos_beats,
+            common::process_data::RowTransport {
+                pos_beats: song_pos_beats,
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
@@ -1135,6 +1201,7 @@ mod tests {
             intonation_scale: 1.0,
             volume_scale: 1.0,
             clip_id: 1,
+            cell_base_beat: 0.0,
         }];
         p.set_note_metadata(120.0, 60.0, &[], &talk);
         // synth thread (background, blocking HTTP) の完了を待つ。
@@ -1167,6 +1234,97 @@ mod tests {
         (0..len).map(|i| i as f32).collect()
     }
 
+    /// r.md #87: 合成タイムラインは「アレンジの区間 + セルごとの仮想区間」。
+    /// [`read_window`] がその境界を持つ唯一の場所なので、写像と打ち切りをここで固定する。
+    #[test]
+    fn read_window_separates_the_arrangement_from_the_cell_regions() {
+        let res = SynthResult {
+            samples: Arc::new(ramp_buf(8192)),
+            sample_rate: 48_000,
+            samples_per_beat: 24_000.0, // 48000*60/120
+            note_offsets: Arc::new(HashMap::new()),
+            cell_bases: Arc::new(HashMap::from([(7u32, 10.0_f64)])),
+            arrangement_limit_sample: 4096,
+        };
+        // アレンジ: 恒等写像。上限はセル区間の手前で、buffer 末尾ではない。
+        let (base, limit) = read_window(&res, ROW_SOURCE_ARRANGER, 2.0).expect("アレンジは常に読める");
+        assert!((base - 48_000.0).abs() < 1e-9);
+        assert!((limit - 4096.0).abs() < 1e-9);
+        // セル: 区間の原点 (10 拍) + 行の実効拍 (0.5 拍)。
+        let (base, limit) = read_window(&res, 7, 0.5).expect("合成済みのセルは読める");
+        assert!((base - 10.5 * 24_000.0).abs() < 1e-9);
+        assert!((limit - 8192.0).abs() < 1e-9);
+        // まだ合成されていないセルは無音 (曲頭から鳴らさない)。
+        assert!(read_window(&res, 9, 0.0).is_none());
+    }
+
+    /// 上の境界が **実際に音を止める**こと (「呼んだ」ではなく「効いた」の確認)。
+    /// playhead が曲の終端より後ろへ行っても、そこに置いてあるセルの歌声は漏れない。
+    #[test]
+    fn playhead_past_the_song_does_not_leak_cell_audio() {
+        let (mut h, result) = mk_half(48_000.0);
+        result.store(Some(Arc::new(SynthResult {
+            samples: Arc::new(ramp_buf(8192)),
+            sample_rate: 48_000,
+            samples_per_beat: 24_000.0,
+            note_offsets: Arc::new(HashMap::new()),
+            cell_bases: Arc::new(HashMap::from([(7u32, 0.25_f64)])),
+            // 拍 0.25 = sample 6000 からがセル専用区間。
+            arrangement_limit_sample: 6_000,
+        })));
+        // 拍 0.25 ちょうど = 区間の先頭。1 sample も鳴ってはいけない。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.25)).unwrap();
+        assert!(
+            h.out_l[..64].iter().all(|&v| v == 0.0),
+            "セル区間の音がアレンジの再生に漏れている: {:?}",
+            &h.out_l[..8]
+        );
+        // 手前 (拍 0.2 = sample 4800) は従来どおり鳴る。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.2)).unwrap();
+        assert!((h.out_l[0] - 4_800.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+    }
+
+    /// r.md #87 の配線そのもの: **`ProcessData::row` が届いて初めてセルが歌う**。
+    /// 合成 (波D) は完成していたが engine → plugin host の経路が無く、セルの ▶ は
+    /// 完全な無音だった。ここが切れると「合成は済んでいるのに鳴らない」という
+    /// 静かな壊れ方をするので、3 状態 (アレンジ / セル / 停止) を 1 本で固定する。
+    #[test]
+    fn row_transport_selects_the_arrangement_the_cell_or_silence() {
+        use common::process_data::RowTransport;
+
+        let (mut h, result) = mk_half(48_000.0);
+        result.store(Some(Arc::new(SynthResult {
+            // セル区間 (sample 18000 付近) まで届く長さが要る。
+            samples: Arc::new(ramp_buf(32_768)),
+            sample_rate: 48_000,
+            samples_per_beat: 24_000.0,
+            // セル 7 の仮想区間は拍 0.25 (= sample 6000) から。
+            cell_bases: Arc::new(HashMap::from([(7u32, 0.25_f64)])),
+            note_offsets: Arc::new(HashMap::new()),
+            arrangement_limit_sample: 6_000,
+        })));
+
+        // (1) アレンジ主導の行: song 拍 0.1 = sample 2400 から読む。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.1)).unwrap();
+        assert!((h.out_l[0] - 2_400.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+
+        // (2) セルを鳴らしている行: song 拍は同じ 0.1 のままでも、行の実効拍
+        //     (セル内 0.5 拍) + 区間の原点 0.25 拍 = sample 18000 を読む。
+        //     **song 拍を見ていたらここは 2400 のままになる。**
+        let cell = RowTransport { pos_beats: 0.5, cell_clip_id: 7, ..Default::default() };
+        h.process(64, &[], &[], &[], &[], &transport_row(0.1, cell)).unwrap();
+        assert!((h.out_l[0] - 18_000.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+
+        // (3) ランチャーが握って黙らせた行: アレンジの歌声が鳴り続けてはいけない。
+        let stopped = RowTransport { pos_beats: 0.1, silent: 1, ..Default::default() };
+        h.process(64, &[], &[], &[], &[], &transport_row(0.1, stopped)).unwrap();
+        assert!(
+            h.out_l[..64].iter().all(|&v| v == 0.0),
+            "停止した行でアレンジの歌声が鳴り止まっていない: {:?}",
+            &h.out_l[..8]
+        );
+    }
+
     /// r.md #39: 再生中の読み出しは `buf index = 曲 sample` の恒等写像。読み出し側は
     /// 補正オフセットを **一切持たない** (先頭無音は配置側が吸収済み)。
     #[test]
@@ -1177,6 +1335,8 @@ mod tests {
             sample_rate: 48_000,
             samples_per_beat: 24_000.0, // 48000*60/120
             note_offsets: Arc::new(HashMap::new()),
+            cell_bases: Arc::new(HashMap::new()),
+            arrangement_limit_sample: u64::MAX,
         })));
         // playhead = 拍 0 → base = 0。 host==synth なので ratio=1 → out[k] = buf[k]。
         h.process(64, &[], &[], &[], &[], &transport_playing(0.0)).unwrap();
@@ -1201,6 +1361,8 @@ mod tests {
             sample_rate: 48_000,
             samples_per_beat: 24_000.0, // 48000*60/120
             note_offsets: Arc::new(HashMap::new()),
+            cell_bases: Arc::new(HashMap::new()),
+            arrangement_limit_sample: u64::MAX,
         })));
         // base = 拍 0.25 × 24000 = 6000。 ratio 2.0 → out frame k = buf[6000 + 2k]。
         h.process(64, &[], &[], &[], &[], &transport_playing(0.25)).unwrap();
@@ -1246,6 +1408,8 @@ mod tests {
             sample_rate: sr,
             samples_per_beat: 24_000.0,
             note_offsets: Arc::new(offsets),
+            cell_bases: Arc::new(HashMap::new()),
+            arrangement_limit_sample: u64::MAX,
         })));
         h.process(64, &[], &[], &[], &[], &transport_playing(2.0)).unwrap();
         assert!(
@@ -1311,6 +1475,8 @@ mod tests {
             sample_rate: 48_000,
             samples_per_beat: 24_000.0, // 48000*60/120
             note_offsets: Arc::new(offsets),
+            cell_bases: Arc::new(HashMap::new()),
+            arrangement_limit_sample: u64::MAX,
         })));
         let events = vec![TimedNoteEvent {
             time: 0,

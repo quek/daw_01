@@ -18,10 +18,19 @@ pub struct SelectionState {
     /// 面ごとに 9 本あったアンカーはこの 1 本に畳まれた。
     pub range_anchor: Option<f64>,
     /// ランチャー (セッション) のセル選択。 **グリッドに時間軸が無いので範囲では
-    /// 表せない**唯一の「オブジェクト選択」。 末尾 = anchor。 session-only。
-    pub selected_launcher_cells: Vec<common::model::ClipKey>,
+    /// 表せない**唯一の「オブジェクト選択」。 session-only。
+    ///
+    /// **行の種類でここを割らない。** トラック行のセルもオートメーションレーン行の
+    /// セルも [`LauncherCellKey`](crate::event_launcher::LauncherCellKey) 1 本で入る。
+    /// 以前はレーン行のセルだけ [`Self::selected_automation_clips`]
+    /// (= アレンジの automation クリップの集合) に相乗りしていたため、
+    /// 1 つの集合が 2 つの意味を持ち、
+    /// **両方の行のセルを選ぶと Delete / Copy が片方にしか効かない**、
+    /// アレンジで範囲を引き直すだけで (`prune_automation_selection` が)
+    /// レーン行のセル選択が消える、という形で出ていた。
+    pub selected_launcher_cells: Vec<crate::event_launcher::LauncherCellKey>,
     /// ランチャーセル選択のアンカー (Shift+click の基点)。
-    pub launcher_cell_anchor: Option<common::model::ClipKey>,
+    pub launcher_cell_anchor: Option<crate::event_launcher::LauncherCellKey>,
 
     // -------- Selection --------
     /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
@@ -46,6 +55,9 @@ pub struct SelectionState {
     /// 互換)。 widget の `SelectAutomationClips` で上書き、 widget へは
     /// 毎フレーム `&[AutomationClipKey]` で渡して selected highlight を
     /// 描画させる。 session-only。
+    ///
+    /// **アレンジの `lane.clips` だけ**が入る。ランチャーのセル
+    /// (`lane.session_clips`) は [`Self::selected_launcher_cells`] が持つ。
     pub selected_automation_clips: Vec<common::model::AutomationClipKey>,
     /// 直近に確定した編集面 (clip / automation 点 / automation クリップ / note /
     /// audio event)。 これらは共存選択できる (lasso は点とクリップを両方拾う、

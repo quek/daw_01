@@ -98,26 +98,18 @@ pub(super) fn draw_plugin_params(
                 modulation,
             );
             // drag / text 編集 stroke を undo 1 step に bracket (`SetPluginParam` は
-            // per-frame 非 undoable)。 終端で host へ 1 回 resync して音に反映する
-            // (映像 FX と違い audio plugin は daw_audio が lane を読むため要 push)。
-            let active = resp.dragging || resp.editing_text;
+            // per-frame 非 undoable)。 確定値の host push は不要: scrub 中の edit_song が
+            // bump した epoch を runner の frame flush が per-frame で LoadSong する
+            // (sync 一本化)。 bracket の実装は inspector 共通の 1 本を通す。
             let scrub_key = crate::app::InspectorScrubField::PluginParam { device_id, param_id };
-            let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
-            if active && !was_active {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
-                    app.handle_event(AppEvent::BeginInspectorScrub);
-                }));
-            } else if !active && was_active {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.ui_ephemeral.inspector_scrub_active = None;
-                    app.handle_event(AppEvent::EndInspectorScrub);
-                    // 確定値の host push は不要: scrub 中の edit_song が bump した epoch を
-                    // runner の frame flush が per-frame で LoadSong する (sync 一本化)。
-                }));
-            }
+            super::super::push_scrub_bracket(
+                ui,
+                app,
+                scrub_key,
+                resp.dragging || resp.editing_text,
+            );
             // 変調 depth ドラッグの falling edge で host 再同期。
-            mod_widget::push_mod_drag_resync(ui, app, track_id, &target, resp.mod_dragging);
+            mod_widget::push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
             y += input_h + 4.0;
         }
         y += 8.0;

@@ -568,6 +568,10 @@ pub fn thin_collinear_and_insert(
 /// 等に渡す。 RT 安全 (= heap alloc 無し、 lane_value_at の浮動小数演算のみ)。
 ///
 /// `beat` は累積 beat-domain playhead (= engine が integrate 維持)。
+///
+/// **ランチャーの走行状態は見ない** (`lane.clips` = アレンジのカーブだけを引く)。
+/// テンポ / 拍子レーンにセルは置けないので、見るべきものが無い — 判定の SSoT は
+/// [`AutomationTarget::accepts_launcher_cells`]。
 pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
     if !has_song_tempo_automation(song) {
         return song.bpm;

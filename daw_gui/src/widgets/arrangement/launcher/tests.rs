@@ -108,6 +108,39 @@ fn 帯は停止列とセル格子と返す列にちょうど分かれる() {
     assert!(collapsed.collapsed, "つかみ代だけの幅では格子を描けない");
 }
 
+/// **「両方」レイアウトは必ず格子を描ける** (計画書 Q5-b の「比率を覚えている」が
+/// 成り立つ前提)。
+///
+/// スプリッタを端まで引くと、吸着で `ArrangerOnly` / `LauncherOnly` に切り替わる直前まで
+/// 「両方」のまま `ui_prefs.launcher_width` が更新される。閾値と復元の clamp が別々の値を
+/// 見ていると、記憶に残るのが「格子が 1 列も入らない幅」になり、`Tab` で戻したとき
+/// 掴み代だけの帯が出る — 一度踏むと手でスプリッタを掴み直すまで使えない。
+/// **壊れても build も clippy も通る**ので機械で止める。
+#[test]
+fn 両方レイアウトの帯幅は必ず格子を描ける() {
+    let rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
+    let header_w = 160.0;
+    let avail = rect.w - header_w;
+    let view = view_with_scenes(2);
+    // 記憶が壊れた値 (負 / 0 / 吸着直前の幅 / 画面より広い) も含める。
+    for w in [-10.0_f32, 0.0, 1.0, GRAB_W, GRAB_W + 1.0, 40.0, 300.0, 5_000.0] {
+        let pane_w = layout::resolve_pane_w_raw(LauncherLayout::Both, w, avail);
+        let r = layout::split(rect, header_w, pane_w, 38.0, 38.0, 562.0, &view);
+        assert!(!r.collapsed, "覚えた幅 {w} で「両方」が畳まれている (pane_w={pane_w})");
+        assert!(
+            r.grid.w >= MIN_COL_W,
+            "覚えた幅 {w} で列が 1 本も入らない (grid.w={})",
+            r.grid.w
+        );
+        // アレンジ側も潰れない (右端へ引き切った記憶で戻ったときの対称形)。
+        assert!(
+            avail - pane_w >= MIN_BOTH_PANE_W,
+            "覚えた幅 {w} でアレンジ側が {}px しか残らない",
+            avail - pane_w
+        );
+    }
+}
+
 // ============================================================
 // 行 — 「1 段ズレる」を止める
 // ============================================================
@@ -254,6 +287,8 @@ fn グループ行のまとめセルは子行へ展開される() {
         playback: RowPlayback::Arranger,
         armed: false,
         group: true,
+        launchable: true,
+        takes_cells: false,
         cells: HashMap::new(),
     };
     view.rows.insert(ArrangementRowKey::Track(10), group_row);
@@ -280,6 +315,8 @@ fn グループ行のまとめセルは子行へ展開される() {
             playback: RowPlayback::Arranger,
             armed: false,
             group: false,
+            launchable: true,
+            takes_cells: true,
             cells: child,
         },
     );
@@ -289,6 +326,8 @@ fn グループ行のまとめセルは子行へ展開される() {
             playback: RowPlayback::Arranger,
             armed: false,
             group: false,
+            launchable: true,
+            takes_cells: true,
             cells: HashMap::new(),
         },
     );

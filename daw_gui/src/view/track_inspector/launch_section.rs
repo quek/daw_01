@@ -25,7 +25,7 @@ use daw_ui_renderer::Rect;
 
 use common::model::{FollowAction, FollowActionKind, LaunchMode, LAUNCH_QUANTIZE_CHOICES};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, InspectorScrubField};
 use crate::event_launcher::{LaunchEdit, LauncherCellKey, LauncherEvent};
 
 /// 1 行の高さ (dropdown / toggle / 数値欄で共通)。
@@ -98,7 +98,7 @@ pub(super) fn draw_launch_section(
         y = draw_cell_rows(app, ui, area, pad, y, &cells);
     }
     y = draw_scene_follow_rows(app, ui, area, pad, y, &cells, &scene_ids);
-    draw_midi_rows(app, ui, area, pad, y, &cells)
+    draw_midi_rows(app, ui, area, pad, y, &cells, &scene_ids)
 }
 
 /// 列 (シーン) のフォローアクション。**走行中のクリップのそれより優先する**
@@ -194,7 +194,7 @@ fn draw_cell_rows(
             ..super::scrub_style(&app.theme)
         };
         let cells_for_len = cells.to_vec();
-        ui.scrubable_number_at(
+        let resp = ui.scrubable_number_at(
             ("inspector_launch_len", "cells"),
             Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
             len,
@@ -212,6 +212,14 @@ fn draw_cell_rows(
             },
             None,
             None,
+        );
+        // 4 → 64 の 1 ドラッグで undo が数十 step 積まれないよう bracket する
+        // (`super::push_scrub_bracket` が inspector 共通の 1 本)。
+        super::push_scrub_bracket(
+            ui,
+            app,
+            InspectorScrubField::Launch(("inspector_launch_len", "cells")),
+            resp.dragging || resp.editing_text,
         );
     }
     y += ROW_H + ROW_GAP;
@@ -424,6 +432,7 @@ fn draw_follow_action_row(
 /// MIDI Learn の 6 ボタン + 消去 (計画書 §3.5)。
 /// パッドで撃てないランチャーは半分の機能しかないので、
 /// **セル / シーン / 行停止 / 行→アレンジ / 全停止 / 全→アレンジ** を全部出す。
+#[allow(clippy::too_many_arguments)]
 fn draw_midi_rows(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -431,6 +440,7 @@ fn draw_midi_rows(
     pad: f32,
     mut y: f32,
     cells: &[LauncherCellKey],
+    scene_ids: &[u32],
 ) -> f32 {
     let p = &app.theme.core;
     let row_w = area.w - pad * 2.0;
@@ -442,7 +452,16 @@ fn draw_midi_rows(
         LauncherCellKey::Track(k) => Some(*k),
         LauncherCellKey::Lane(_) => None,
     });
-    let scene_id = anchor.map(LauncherCellKey::Track).and_then(|c| app.scene_of_cell(c));
+    // 列の宛先は **セル経由と直接選択の両方**から取る ([`scenes_of`] が同じ 1 本)。
+    // セル経由だけにしていると、列見出しを選んだときに「シーン」 の Learn が
+    // 押せず (宛先 `None`)、**セルを 1 つも持たない列は永久に MIDI へ割り当て
+    // られない** — 列を直接選べるようにした意味が半分無くなる。
+    // 行の宛先 (セル / 行を止める / 行→アレンジ) は行が要るので、列だけの選択では
+    // `None` のまま (押しても何も起きないのが正しい)。
+    let scene_id = anchor
+        .map(LauncherCellKey::Track)
+        .and_then(|c| app.scene_of_cell(c))
+        .or_else(|| scene_ids.last().copied());
     let learning = app.launcher.learn_target;
     let n = app.launcher_bindings().len();
 
@@ -611,6 +630,11 @@ fn toggle(
 }
 
 /// 数値欄 1 つ (drag scrub + click で数値入力)。
+///
+/// **drag / テキスト編集の stroke は必ず undo 1 step に bracket する** — フォロー
+/// アクションの確率 / 時間 / 倍率は per-frame に `SetLaunchSettings` (= `edit_song`)
+/// を撃つので、束ねないと 1 ドラッグで `UNDO_LIMIT` (200) を溢れさせ、それ以前の
+/// 実編集履歴が `pop_front` で捨てられる。
 #[allow(clippy::too_many_arguments)]
 fn num_field(
     ui: &mut Ui<'_, AppData>,
@@ -633,7 +657,7 @@ fn num_field(
     };
     let cells = cells.to_vec();
     let scene_ids = scenes_of(app, &cells);
-    ui.scrubable_number_at(
+    let resp = ui.scrubable_number_at(
         id,
         rect,
         value,
@@ -643,6 +667,13 @@ fn num_field(
         move |v| launch_edit_for(target, &cells, &scene_ids, make(v)),
         None,
         None,
+    );
+    // key は欄の widget id そのもの (`tag` に宛先が入っているので列側と衝突しない)。
+    super::push_scrub_bracket(
+        ui,
+        app,
+        InspectorScrubField::Launch(id),
+        resp.dragging || resp.editing_text,
     );
 }
 

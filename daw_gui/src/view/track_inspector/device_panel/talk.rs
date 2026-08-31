@@ -293,19 +293,7 @@ pub(super) fn draw_talk(
         // で 1 drag = 1 undo step にする — これが無いと talk 4 項目だけ
         // Ctrl+Z で戻せない (review)。
         let scrub_key = crate::app::InspectorScrubField::Talk(kind);
-        let active = resp.dragging || resp.editing_text;
-        let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
-        if active && !was_active {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
-                app.handle_event(AppEvent::BeginInspectorScrub);
-            }));
-        } else if !active && was_active {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.inspector_scrub_active = None;
-                app.handle_event(AppEvent::EndInspectorScrub);
-            }));
-        }
+        super::super::push_scrub_bracket(ui, app, scrub_key, resp.dragging || resp.editing_text);
         y += 24.0;
     }
     y

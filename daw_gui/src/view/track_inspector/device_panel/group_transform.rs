@@ -134,21 +134,15 @@ pub(super) fn draw_group_transform(
             );
             // modulation depth ドラッグの falling edge で host 再同期 (audio target の
             // depth 反映用。visual group transform は compose が即読みするので視覚は即時)。
-            mod_widget::push_mod_drag_resync(ui, app, track_id, &g_target, resp.mod_dragging);
-            // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
-            let active = resp.dragging || resp.editing_text;
-            let was_active = app.ui_ephemeral.group_scrub_active == Some(param);
-            if active && !was_active {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.ui_ephemeral.group_scrub_active = Some(param);
-                    app.handle_event(AppEvent::BeginGroupTransformDrag);
-                }));
-            } else if !active && was_active {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.ui_ephemeral.group_scrub_active = None;
-                    app.handle_event(AppEvent::EndGroupTransformDrag);
-                }));
-            }
+            mod_widget::push_mod_depth_bracket(ui, app, track_id, &g_target, resp.mod_dragging);
+            // drag / text 編集を undo 1 step に bracket
+            // (`view::scrub_gesture` が寿命ごと持つ 1 本)。
+            crate::view::scrub_gesture::push(
+                ui,
+                app,
+                crate::app::ScrubGesture::GroupTransform(param),
+                resp.dragging || resp.editing_text,
+            );
             let auto_on = summary.automated[idx];
             ui.toggle_button_at(
                 (param, "group_auto"),

@@ -375,9 +375,23 @@ impl AppData {
         // Toggle の判定は **いま鳴っているセル** で行う。`Song` 側 (= 最後に撃った
         // 起点) だけで見ると、フォローアクションで別のセルへ移った後に engine と
         // 判断が食い違い、「鳴っているセルをもう一度押したのに止まらない」になる。
-        let playing_this = self.running_playback(row) == RowPlayback::Launcher { clip_id };
+        //
+        // **停止中は「鳴っている」ではない。** ランチャーの走行状態は停止で消えない
+        // (計画書 §0) ので、Space で止めた行の publish は `Cell` のまま残る。それを
+        // そのまま Toggle の「もう一度押した」と読むと、停止 → ▶ が停止予約になり
+        // その行だけ 1 回鳴らない。engine の `press_cell` も同じ値
+        // (`FireAt::is_playing` = transport 要求を消費する前の `playing`) で判断する
+        // ので、**両側を同時に直さないと** GUI が書いた `LauncherStopped` を
+        // `sync_saved_rows` が後から適用してセルが消える。
+        let playing_this = self.transport.is_playing
+            && self.running_playback(row) == RowPlayback::Launcher { clip_id };
+        // Gate の離しは **その行がまだこのセルを起点にしているとき**だけ止める。
+        // 間に別のセルを撃った行を止めてしまうと、engine (`release_cell` の
+        // `held_clip_id` ガード) と `Song` が食い違い、停止 → 再生で音が変わる。
+        let holds_this = self.row_playback(row) == RowPlayback::Launcher { clip_id };
         let next = match (mode, pressed) {
-            (LaunchMode::Gate, false) => Some(RowPlayback::LauncherStopped),
+            (LaunchMode::Gate, false) if holds_this => Some(RowPlayback::LauncherStopped),
+            (LaunchMode::Gate, false) => None,
             (LaunchMode::Toggle, true) if playing_this => Some(RowPlayback::LauncherStopped),
             (_, true) => Some(RowPlayback::Launcher { clip_id }),
             (_, false) => None,
@@ -418,6 +432,11 @@ impl AppData {
             for (row, next) in plan {
                 self.set_row_playback(row, next);
             }
+            // 列の連鎖の起点も同時に確定する (行の起点と対、§1.4)。実体の無い列
+            // (`scene_id == 0` = 全行停止) は「起点なし」なのでそのまま 0 が入る。
+            self.set_last_launched_scene(scene_id);
+        } else {
+            self.release_scene(scene_id);
         }
         // 実体の無い列 (`scene_id == 0`) を撃つのは「全行停止」なので、**これで
         // 再生を始めない** — 止めるつもりの操作が再生の開始になってしまう。
@@ -425,6 +444,36 @@ impl AppData {
             self.ensure_transport_rolling();
         }
         self.send_launcher_audio(LauncherAudioCommand::LaunchScene { scene_id, pressed });
+    }
+
+    /// 列の **離し**。engine の `release_scene` → `release_cell` と同じ解釈を
+    /// `Song` 側にも書く: その列の [`LaunchMode::Gate`](common::model::LaunchMode::Gate)
+    /// のセルを起点にしている行は停止へ落ちる。書かないと「起点」だけ鳴りっぱなしの
+    /// まま残り、停止 → 再生と書き出しが **離したはずのセルから始まる** (§1.4 / Q9)。
+    ///
+    /// 「まだその起点か」で絞るのは engine が `held_clip_id` で見ている条件と同じ —
+    /// 間に別のセルを撃った行は、列の離しの対象ではない。走行位置ではなく起点
+    /// (`Song`) で見るのは、フォローアクションで音が次のセルへ移っても
+    /// **押しているのは最初に撃ったセル**だから (走行位置は `Song` に無い)。
+    fn release_scene(&mut self, scene_id: u32) {
+        let stop: Vec<LauncherRow> = self
+            .all_launcher_rows()
+            .into_iter()
+            .filter(|row| self.scene_cell_is_held_gate(*row, scene_id))
+            .collect();
+        for row in stop {
+            self.set_row_playback(row, RowPlayback::LauncherStopped);
+        }
+    }
+
+    /// 行 `row` の列 `scene_id` のセルが **Gate** で、かつその行の起点が
+    /// まだそのセルか ([`Self::release_scene`] の絞り込み条件)。
+    fn scene_cell_is_held_gate(&self, row: LauncherRow, scene_id: u32) -> bool {
+        let Some(cell) = self.cell_in_row_at_scene(row, scene_id) else {
+            return false;
+        };
+        self.launch_settings_of(cell).map(|s| s.mode) == Some(common::model::LaunchMode::Gate)
+            && self.row_playback(row) == (RowPlayback::Launcher { clip_id: cell.clip_id() })
     }
 
     /// 停止中にセル / シーンを撃ったら、その操作自体が再生の開始になる
@@ -449,10 +498,15 @@ impl AppData {
     }
 
     /// 全行の Stop Clips。
+    ///
+    /// 列の連鎖の起点も降ろす — 残すと、engine の `seed_from_song` が停止 → 再生 /
+    /// 書き出しのたびにその列のフォローアクションを arm し直し、**全部止めたはずの
+    /// 行が勝手に鳴り出す** (§1.4 / Q9 の「聴こえている通りに書き出す」が破れる)。
     pub fn stop_all_launcher_rows(&mut self) {
         for row in self.all_launcher_rows() {
             self.set_row_playback(row, RowPlayback::LauncherStopped);
         }
+        self.set_last_launched_scene(0);
         self.send_launcher_audio(LauncherAudioCommand::StopAllRows);
     }
 
@@ -463,11 +517,29 @@ impl AppData {
     }
 
     /// 全行をアレンジ主導へ戻す (トランスポートのボタン)。
+    /// 列の連鎖の起点も降ろす ([`Self::stop_all_launcher_rows`] と同じ理由)。
     pub fn all_rows_to_arranger(&mut self) {
         for row in self.all_launcher_rows() {
             self.set_row_playback(row, RowPlayback::Arranger);
         }
+        self.set_last_launched_scene(0);
         self.send_launcher_audio(LauncherAudioCommand::SwitchAllToArranger);
+    }
+
+    /// 列の連鎖の起点 (`Song.last_launched_scene_id`) を書く。
+    ///
+    /// **ユーザーが撃った列だけ**を書く (`0` = 起点なし)。フォローアクションで
+    /// 移った先は engine の走行状態にしか無く、ここへ書いてはいけない — 書くと
+    /// 「何秒鳴らしてから書き出したか」で出力が変わり、Q9 の再現性が壊れる
+    /// (計画書 §1.4、`Song::last_launched_scene_id` の doc)。
+    fn set_last_launched_scene(&mut self, scene_id: u32) -> bool {
+        self.edit_song_checked(|song| {
+            if song.last_launched_scene_id == scene_id {
+                return false;
+            }
+            song.last_launched_scene_id = scene_id;
+            true
+        })
     }
 
     // ------------------------------------------------------------------
@@ -475,6 +547,12 @@ impl AppData {
     // ------------------------------------------------------------------
 
     /// セルを持ちうる **全部の行** (曲の構造そのもの)。
+    ///
+    /// 集合の定義は engine の `for_each_launcher_row` と同じ — 「通常トラック行 +
+    /// オートメーションレーン行 + マスター行 (`song_lanes`)」から、テンポ / 拍子
+    /// レーンだけを [`AutomationTarget::accepts_launcher_cells`](common::model::AutomationTarget::accepts_launcher_cells)
+    /// で外す。外さないと、シーン発火 / 全停止がそこへ `RowPlayback` を書いて
+    /// `*` が立つのに engine は無視する (= 押しても音が変わらない編集が積まれる)。
     ///
     /// [`Self::launcher_rows`] と違って **表示の折りたたみを一切見ない**。
     /// シーン発火 / 全停止 / 全行アレンジ復帰 / Capture は「いま画面に出ている行」
@@ -485,7 +563,7 @@ impl AppData {
     pub fn all_launcher_rows(&self) -> Vec<LauncherRow> {
         let song = self.song_doc.song();
         let mut rows = Vec::new();
-        for lane in &song.song_lanes {
+        for lane in song.song_lanes.iter().filter(|l| l.target.accepts_launcher_cells()) {
             rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
                 track: MASTER_TRACK_ID,
                 lane: lane.id,
@@ -493,7 +571,11 @@ impl AppData {
         }
         for track in &song.tracks {
             rows.push(LauncherRow::Track(track.id));
-            for lane in &track.automation_lanes {
+            for lane in track
+                .automation_lanes
+                .iter()
+                .filter(|l| l.target.accepts_launcher_cells())
+            {
                 rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
                     track: track.id,
                     lane: lane.id,
@@ -614,7 +696,11 @@ impl AppData {
         let song = self.song_doc.song();
         let mut rows = Vec::new();
         if self.ui_prefs.master_row_automation_expanded {
-            for lane in song.song_lanes.iter().filter(|l| l.visible) {
+            for lane in song
+                .song_lanes
+                .iter()
+                .filter(|l| l.visible && l.target.accepts_launcher_cells())
+            {
                 rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
                     track: MASTER_TRACK_ID,
                     lane: lane.id,
@@ -629,7 +715,11 @@ impl AppData {
             if !self.ui_prefs.expanded_automation_tracks.contains(&track.id) {
                 continue;
             }
-            for lane in track.automation_lanes.iter().filter(|l| l.visible) {
+            for lane in track
+                .automation_lanes
+                .iter()
+                .filter(|l| l.visible && l.target.accepts_launcher_cells())
+            {
                 rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
                     track: track.id,
                     lane: lane.id,
@@ -682,12 +772,22 @@ impl AppData {
             self.selection.scene_anchor = Some(scene_id);
         }
         if self.selection.selected_scene_ids.is_empty() {
+            // 空になったら、自分が立てたタグだけ降ろす (`select_track` と同じ作法)。
+            // 残すと `edit_surface` が「タグはあるが面は空」で `None` を返し続け、
+            // Delete が無反応になる。
+            if self.selection.last_edit_select == Some(crate::app::EditSurface::Scenes) {
+                self.selection.last_edit_select = None;
+            }
             return;
         }
-        // 列を選んだらセル側は空にする (上記の排他)。
+        // **直近確定面を列へ移す** ([[feedback_selection_action_last_wins]])。
+        // これを書かないと、列を選んでも `last_edit_select` が前の面 (アレンジの
+        // 範囲など) を指したままになり、続く Delete がそちらを消す。
+        self.selection.last_edit_select = Some(crate::app::EditSurface::Scenes);
+        // 列を選んだらセル側は空にする (上記の排他)。セルは行の種類に関わらず
+        // この 1 本に居るので、ここで落とすのも 1 本で足りる。
         self.selection.selected_launcher_cells.clear();
         self.selection.launcher_cell_anchor = None;
-        self.selection.selected_automation_clips.clear();
     }
 
     /// 行 `row` の列 `scene_id` にあるセル。
@@ -893,12 +993,18 @@ impl AppData {
     /// (同じ `content_id` を共有) してその列に置く。 再生は止めない / 主導権も
     /// 動かさない — 「今の音をシーンとして保存する」だけの操作なので、
     /// 押した瞬間に音が変わらないことを優先する。
+    ///
+    /// 取り込む中身は [`Self::running_playback`] (= engine の観測値) で決める。
+    /// `Song` 側 (= ユーザーが最後に撃った起点) を読むと、フォローアクションで
+    /// 別のセルへ移った後の Capture が **鳴っていないセル**を取り込む
+    /// (§1.4: 遷移先は `Song` に書かれない)。engine が publish していない行は
+    /// `running_playback` が `Song` へ倒すので、停止中の挙動は変わらない。
     pub fn capture_scene(&mut self) {
         let sources: Vec<LauncherCellKey> = self
             .all_launcher_rows()
             .into_iter()
             .filter_map(|row| {
-                let clip_id = self.row_playback(row).playing_clip_id()?;
+                let clip_id = self.running_playback(row).playing_clip_id()?;
                 Some(crate::handler::launcher_cells::cell_key_in_row(row, clip_id))
             })
             .collect();

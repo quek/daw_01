@@ -487,18 +487,26 @@ fn ara_render_concurrency_test(plugin: &dyn LoadedPlugin, step: &dyn Fn(&str)) {
         let input: Vec<&[f32]> = vec![&silence, &silence];
         let mut playhead = 0u64;
         while !st.load(Ordering::Relaxed) {
+            let song_pos_beats = playhead as f64 * 120.0 / (60.0 * f64::from(sr));
             let transport = crate::plugin_instance::TransportContext {
                 bpm: 120.0,
                 sample_rate: sr,
-                // Mimic the real engine: the true position lives in
-                // `song_pos_beats` alone.
-                song_pos_beats: playhead as f64 * 120.0 / (60.0 * f64::from(sr)),
+                // Mimic the real engine: the true song position lives in
+                // `song_pos_beats` alone, and an arranger-driven row mirrors it
+                // into `row.pos_beats` (r.md #87). ARA regions sit on the song
+                // timeline, so this harness always drives an arranger row.
+                song_pos_beats,
                 tsig_num: 4,
                 tsig_denom: 4,
                 is_playing: true,
                 is_looping: false,
                 loop_start_beats: 0.0,
                 loop_end_beats: 0.0,
+                row: common::process_data::RowTransport {
+                    pos_beats: song_pos_beats,
+                    ..Default::default()
+                },
+                pin_to_song: false,
             };
             ip.store(true, Ordering::SeqCst);
             // SAFETY: this render thread is the only accessor of the audio
@@ -1346,6 +1354,10 @@ impl PluginHost {
         let has_embedded_gui = plugin.gui_is_embed_supported();
         let audio = plugin.audio_half();
         let pd_ptr = shmem.ptr();
+        // r.md #87: ARA を bind した instance は musical timeline を song に
+        // 固定する (`PluginEntry::transport_pinned_to_song`)。判定は
+        // `self.instances` へ move する前に取る。
+        let transport_pinned_to_song = plugin.has_ara_session();
 
         self.instances.insert(
             device_id,
@@ -1369,6 +1381,7 @@ impl PluginHost {
                 process_data: pd_ptr,
                 err_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 metric_slot: Arc::new(std::sync::atomic::AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
+                transport_pinned_to_song,
             },
         );
 

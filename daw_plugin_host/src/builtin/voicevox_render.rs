@@ -131,6 +131,17 @@ pub(super) fn phrase_window(
     }
 }
 
+/// r.md #87: `place` から書き始める item が、どの sample で打ち切られるか。
+///
+/// `bounds` は昇順のセル区間の境界 (= 各セルの中身が始まる sample)。自分の開始位置
+/// より後ろにある最初の境界がそれ。境界が無ければ [`i64::MAX`] (= 無制限)。
+/// **アレンジの item も同じ関数で解ける** — 開始位置が全境界より手前なので先頭の
+/// 境界が返る (= セル区間の手前で止まる)。
+#[must_use]
+fn region_end(bounds: &[i64], place: i64) -> i64 {
+    bounds.iter().copied().find(|&b| b > place).unwrap_or(i64::MAX)
+}
+
 /// クロスフェードの半幅 (sample)。継ぎ目を中心に前後この長さのランプになる。
 fn xfade_half(sr: u32) -> i64 {
     (SEAM_XFADE_SECS * 0.5 * f64::from(sr)).round().max(1.0) as i64
@@ -315,6 +326,11 @@ pub(super) struct PhraseRenderState {
     /// clip id → その clip に残っている仕事 (フレーズ / talk 発話) の数。
     outstanding_clips: HashMap<u32, u32>,
     note_offsets: HashMap<u32, u64>,
+    /// r.md #87: `セルの clip_id → 仮想区間の原点 (拍)`。metadata から拾った値を
+    /// そのまま `SynthResult` へ渡す (再生側の読み出し写像)。
+    cell_bases: HashMap<u32, f64>,
+    /// r.md #87: アレンジのタイムラインが読んでよい上限 (buffer sample)。
+    arrangement_limit_sample: u64,
     sample_rate: u32,
     samples_per_beat: f64,
     xf: i64,
@@ -466,6 +482,8 @@ impl PhraseRenderState {
             sample_rate: self.sample_rate,
             samples_per_beat: self.samples_per_beat,
             note_offsets: Arc::new(self.note_offsets.clone()),
+            cell_bases: Arc::new(self.cell_bases.clone()),
+            arrangement_limit_sample: self.arrangement_limit_sample,
         });
         let prev = result_arc.swap(Some(res));
         // swap の **後** に読むこと (これが quiesce 判定の基準点)。
@@ -530,6 +548,9 @@ pub(super) struct PhraseRenderer<'a> {
     talk: &'a [TalkSynthSpec],
     /// 合成順序 (phrases への index)。
     order: Vec<usize>,
+    /// r.md #87: 区間の境界 (昇順の buffer sample)。各セルの中身が始まる位置。
+    /// 書き込みは「自分の開始位置より後ろにある最初の境界」で打ち切る。
+    region_bounds: Vec<i64>,
     cache: Option<VoiceVoxDiskCache>,
     client: Option<reqwest::blocking::Client>,
     state: PhraseRenderState,
@@ -633,6 +654,55 @@ impl<'a> PhraseRenderer<'a> {
             *outstanding_clips.entry(t.clip_id).or_insert(0) += 1;
         }
 
+        // r.md #87: ランチャーのセルは曲の終端より後ろの専用区間へ置かれている
+        // (`NoteMetadata::cell_base_beat`)。原点は必ず正 (= アレンジ終端 + 隙間) なので
+        // `> 0.0` が「セルか」の判定になる。
+        let cell_bases: HashMap<u32, f64> = entries
+            .iter()
+            .filter(|e| e.cell_base_beat > 0.0)
+            .map(|e| (e.clip_id, e.cell_base_beat))
+            .chain(
+                talk.iter()
+                    .filter(|t| t.cell_base_beat > 0.0)
+                    .map(|t| (t.clip_id, t.cell_base_beat)),
+            )
+            .collect();
+        // セルごとの「中身が始まる最初の sample」= **区間の境界**。実際に置いた位置から
+        // 取る (原点から拍で逆算すると、歌の先頭 rest / フレーズの pad ぶん手前へ
+        // はみ出す実配置とズレて、境界すれすれで歌声が漏れる)。
+        let mut cell_starts: HashMap<u32, i64> = HashMap::new();
+        for (sp, ph) in solo.iter().zip(&phrases) {
+            for cid in ph.clip_ids.iter().filter(|c| cell_bases.contains_key(c)) {
+                let e = cell_starts.entry(*cid).or_insert(i64::MAX);
+                *e = (*e).min(sp.placement.place);
+            }
+        }
+        for t in talk.iter().filter(|t| t.cell_base_beat > 0.0) {
+            let place = talk_place_samples(t.start_beat, t.scales.speed_scale, bpm, sr).0;
+            let e = cell_starts.entry(t.clip_id).or_insert(i64::MAX);
+            *e = (*e).min(place);
+        }
+        let mut region_bounds: Vec<i64> = cell_starts.into_values().collect();
+        region_bounds.sort_unstable();
+        region_bounds.dedup();
+        #[allow(clippy::cast_sign_loss)]
+        let arrangement_limit_sample =
+            region_bounds.first().map_or(u64::MAX, |&p| p.max(0) as u64);
+
+        // **区間をまたぐ書き込みを構造的に潰す。** 読み上げ (talk) の WAV 長は合成して
+        // みるまで分からず、歌も content が窓より長ければフレーズが伸びる。はみ出しを
+        // 許すと隣の区間 (= 別のセル / アレンジ) の音に混ざり、原因の分からない
+        // 「別のセルの声が乗る」になる。切るのは末尾だけなので、はみ出していない
+        // 通常のフレーズは 1 sample も変わらない。
+        let xf = xfade_half(sr);
+        for sp in &mut solo {
+            let bound = region_end(&region_bounds, sp.placement.place).saturating_sub(xf);
+            if sp.placement.keep.end > bound {
+                sp.placement.keep.end = bound.max(sp.placement.keep.start);
+                sp.placement.fade_out = true;
+            }
+        }
+
         let total = (phrases.len() + talk.len()) as u32;
         let state = PhraseRenderState {
             rendered: Vec::with_capacity(phrases.len() + talk.len()),
@@ -643,6 +713,8 @@ impl<'a> PhraseRenderer<'a> {
             done: 0,
             outstanding_clips,
             note_offsets: HashMap::new(),
+            cell_bases,
+            arrangement_limit_sample,
             sample_rate: sr,
             samples_per_beat: f64::from(sr) * 60.0 / f64::from(bpm.max(0.001)),
             xf: xfade_half(sr),
@@ -661,6 +733,7 @@ impl<'a> PhraseRenderer<'a> {
             chunk_state,
             talk,
             order,
+            region_bounds,
             cache: VoiceVoxDiskCache::production(),
             client: None,
             state,
@@ -978,13 +1051,19 @@ impl<'a> PhraseRenderer<'a> {
         self.state
             .note_offsets
             .insert(spec.event_id, speech_start.max(0) as u64);
+        // r.md #87: 区間 (アレンジ / セル) をまたいで書かない。talk の WAV 長は
+        // 合成してみるまで分からないので、ここが唯一の防壁 (はみ出せば隣の区間の
+        // 音に混ざる)。切ったときだけ末尾にフェードを掛けて click を消す。
+        let bound = region_end(&self.region_bounds, head).saturating_sub(self.state.xf);
+        let full_end = head.saturating_add(len);
+        let keep_end = full_end.min(bound).max(head);
         self.state.rendered.push(RenderedPhrase {
             samples: Arc::new(samples),
             place: head,
             // talk は全域を残しフェードも掛けない (歌唱の継ぎ目とは無関係)。
-            keep: head..head + len,
+            keep: head..keep_end,
             fade_in: false,
-            fade_out: false,
+            fade_out: keep_end < full_end,
         });
         let clip_id = spec.clip_id;
         self.state.finish_item(&[clip_id]);
@@ -1173,6 +1252,8 @@ mod tests {
             total: 0,
             done: 0,
             outstanding_clips: HashMap::new(),
+            cell_bases: HashMap::new(),
+            arrangement_limit_sample: u64::MAX,
             note_offsets: HashMap::new(),
             sample_rate: SR,
             samples_per_beat: f64::from(SR) * 60.0 / f64::from(BPM),
@@ -1249,6 +1330,60 @@ mod tests {
         assert_eq!(order_by_priority(&phs, Some(8.5)), vec![2, 3, 1, 0]);
     }
 
+    /// r.md #87: ランチャーのセルは曲の終端より後ろの仮想区間へ置かれる。
+    /// **アレンジの読み出し上限がセルの実配置より手前に来る**ことを固定する
+    /// (走査を落として `u64::MAX` のままになると、playhead を曲の後ろへ動かした
+    /// だけで撃っていないセルが歌い出す — ビルドもテストも素通りする種類の欠陥)。
+    #[test]
+    fn cell_regions_bound_the_arrangement_read() {
+        use common::voicevox::DEFAULT_SINGER_ID;
+
+        let mk = |note_id: u32, clip_id: u32, start: f64, base: f64| NoteMetadata {
+            note_id,
+            start_beat: start,
+            duration_beats: 0.5,
+            pitch: 60,
+            velocity: 100,
+            lyric: "ら".into(),
+            clip_id,
+            speaker_id: DEFAULT_SINGER_ID,
+            cell_base_beat: base,
+        };
+        // アレンジ (clip 1) は 0..1 拍、セル (clip 2) は原点 40 拍の区間に 0..1 拍。
+        let entries = vec![
+            mk(0, 1, 0.0, 0.0),
+            mk(1, 1, 0.5, 0.0),
+            mk(2, 2, 40.0, 40.0),
+            mk(3, 2, 40.5, 40.0),
+        ];
+        let talk: Vec<TalkSynthSpec> = Vec::new();
+        let r = PhraseRenderer::new(120.0, 60.0, &entries, &talk, None, Arc::new(AtomicU64::new(0)));
+        let limit = r.state.arrangement_limit_sample;
+        assert_ne!(limit, u64::MAX, "セルを走査し落としている");
+
+        // アレンジのフレーズ (index 0) は上限より手前で完結し、セルのフレーズ
+        // (index 1) は上限のところから始まる。
+        let arrangement = &r.solo[0].placement;
+        let cell = &r.solo[1].placement;
+        assert!(
+            arrangement.place + arrangement.len <= limit as i64,
+            "アレンジのフレーズが上限を越えている: {arrangement:?} limit={limit}"
+        );
+        assert_eq!(limit as i64, cell.place, "上限はセルの実配置ちょうど");
+
+        // セルが無ければ従来どおり buffer 末尾まで読める。
+        let only_arrangement = vec![mk(0, 1, 0.0, 0.0)];
+        let r2 = PhraseRenderer::new(
+            120.0,
+            60.0,
+            &only_arrangement,
+            &talk,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(r2.state.arrangement_limit_sample, u64::MAX);
+    }
+
     // ---- 実 engine を要する統合テスト (既定では走らせない) -------------------
 
     /// 受け入れ条件を機械で測る: 同じ楽譜を
@@ -1283,6 +1418,7 @@ mod tests {
                     lyric: "ら".into(),
                     clip_id: 1,
                     speaker_id: DEFAULT_SINGER_ID,
+                    cell_base_beat: 0.0,
                 });
                 id += 1;
             }
@@ -1397,6 +1533,7 @@ mod tests {
                     lyric: "ら".into(),
                     clip_id: 1,
                     speaker_id: DEFAULT_SINGER_ID,
+                    cell_base_beat: 0.0,
                 });
                 id += 1;
             }

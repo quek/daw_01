@@ -323,8 +323,9 @@ impl HostCallbacks {
 
 /// Per-buffer transport snapshot fed into [`AudioProcessorHalf::process`].
 ///
-/// 真の再生位置は `song_pos_beats` 一本 (= daw_audio が tempo automation を
-/// 積分した累積拍位置)。sample / seconds / bar 表現は
+/// 曲の再生位置は `song_pos_beats` 一本 (= daw_audio が tempo automation を
+/// 積分した累積拍位置)。r.md #87 以降はこれと別に**行の時間軸** (`row`) が
+/// 載る — plugin が musical time として見るのはそちら。sample / seconds / bar 表現は
 /// [`crate::process_scaffold::TransportBlock`] がここから導出する
 /// (`ProcessData::steady_time` は engine が設定しない = 常に 0 なので
 /// sample 由来の位置は運ばない)。
@@ -340,11 +341,26 @@ pub struct TransportContext {
     pub is_looping: bool,
     pub loop_start_beats: f64,
     pub loop_end_beats: f64,
+    /// r.md #87 (クリップランチャー): **この device が載っている行の時間軸**
+    /// ([`common::process_data::RowTransport`])。ランチャーが行の主導権を
+    /// 握っている間はセルの実効拍で、アレンジ主導の行では `song_pos_beats`
+    /// と一致する。plugin へ渡す musical time はこちら
+    /// ([`crate::process_scaffold::TransportBlock::derive`]) — `song_pos_beats`
+    /// は「曲のどこか」を意味する用途のためにそのまま残してある。
+    pub row: common::process_data::RowTransport,
+    /// musical time を **曲全体の位置に固定**するか
+    /// ([`crate::process_server::PluginEntry::transport_pinned_to_song`])。
+    /// ARA を bind した instance だけ `true`。
+    pub pin_to_song: bool,
 }
 
 impl TransportContext {
-    /// Build from a `ProcessData` populated by daw_audio.
-    pub fn from_process_data(pd: &common::process_data::ProcessData) -> Self {
+    /// Build from a `ProcessData` populated by daw_audio. `pin_to_song` comes
+    /// from the registry entry (ARA-bound instances keep the song timeline).
+    pub fn from_process_data(
+        pd: &common::process_data::ProcessData,
+        pin_to_song: bool,
+    ) -> Self {
         Self {
             bpm: pd.bpm.max(1.0),
             sample_rate: pd.sample_rate.max(1),
@@ -355,8 +371,52 @@ impl TransportContext {
             is_looping: pd.looping != 0,
             loop_start_beats: pd.loop_start_beats,
             loop_end_beats: pd.loop_end_beats,
+            row: pd.row,
+            pin_to_song,
         }
     }
+
+    /// plugin へ渡す musical timeline (r.md #87)。
+    ///
+    /// 既定はこの device が載っている **行**の時間軸。セルを鳴らしている行は
+    /// 位置もループも**セルの窓** — 位置だけ差し替えて曲のループ区間を名乗ると、
+    /// plugin から見て「拍がループの外を回っている」不整合になる。
+    /// アレンジ主導の行と停止した行は従来どおり曲の位置 + 曲のループなので、
+    /// ランチャーを使わない曲の transport は byte 単位で従来と同じ。
+    ///
+    /// ARA を bind した instance (`pin_to_song`) だけは常に曲の時間軸 — ARA の
+    /// playback region は song 時間に固定で、行の拍を渡すと Melodyne が別の
+    /// 位置を鳴らす (ARA のセル対応は未実装)。
+    #[must_use]
+    pub fn plugin_timeline(&self) -> PluginTimeline {
+        if self.pin_to_song || self.row.is_arrangement() {
+            return PluginTimeline {
+                pos_beats: if self.pin_to_song { self.song_pos_beats } else { self.row.pos_beats },
+                loop_start_beats: self.loop_start_beats,
+                loop_end_beats: self.loop_end_beats,
+                is_looping: self.is_looping,
+            };
+        }
+        PluginTimeline {
+            pos_beats: self.row.pos_beats,
+            loop_start_beats: self.row.loop_start_beats,
+            loop_end_beats: self.row.loop_end_beats,
+            // ワンショットのセルはループを名乗らない (窓が 0/0)。
+            is_looping: self.row.has_loop(),
+        }
+    }
+}
+
+/// [`TransportContext::plugin_timeline`] の結果 — plugin へ実際に渡る
+/// 「どの時間軸のどこを鳴らしているか」。
+#[derive(Debug, Clone, Copy)]
+pub struct PluginTimeline {
+    pub pos_beats: f64,
+    pub loop_start_beats: f64,
+    pub loop_end_beats: f64,
+    /// user がループを有効にしているか (CLAP `IS_LOOPING` / VST3 `kCycleActive`
+    /// の材料。区間が定義済みかは別途 `end > start` で判定する)。
+    pub is_looping: bool,
 }
 
 // ====================================================================

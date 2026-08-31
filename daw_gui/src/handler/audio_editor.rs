@@ -17,9 +17,8 @@ impl AppData {
         if !self.is_audio_clip(target) {
             return;
         }
-        // 別 clip を開くときは前 clip の選択 index は stale なので clear
-        // (同 clip の再 open は選択を保持)。 index ベース選択は context が
-        // 変わると意味を失う (= close / undo と同方針)。
+        // 別 clip を開くときは前 clip の event 選択 (クリップ内 index) が stale に
+        // なるので clear する (同 clip の再 open は選択を保持)。 = close / undo と同方針。
         if self.ui_ephemeral.audio_editor_clip != Some(target) {
             self.set_audio_event_selection(&[]);
         }
@@ -68,15 +67,15 @@ impl AppData {
             .and_then(|r| self.live_clip_key(r))
     }
 
-    /// `ui_ephemeral.audio_editor_clip` は **positional な `ClipKey`** (track/clip とも
-    /// Vec index) なので、 トラック削除 / undo / redo / load で Vec が詰まると
-    /// **黙って別のクリップを指す**。 index の妥当性だけを見る旧ガードでは、
-    /// 「詰まった先にたまたま別の audio clip が居る」 ケースを取りこぼし、
-    /// エディタ上の Delete が無関係なクリップのイベントを消す。
+    /// `ui_ephemeral.audio_editor_clip` は安定 id (`ClipKey`) なので、トラック削除 /
+    /// undo / redo / load で Vec が詰まっても**別のクリップを指すことはない**
+    /// (index 時代はここが黙ってずれ、エディタ上の Delete が無関係なクリップの
+    /// イベントを消していた)。残る失敗は「対象そのものが消える / 種別が変わる」で、
+    /// それをここで畳む。
     ///
-    /// そこで編集前に退避した安定 `ClipKey` で **貼り直す**: 同じクリップが生きて
-    /// いれば新しい index に付け替え (エディタは開いたまま)、 消えた / audio で
-    /// なくなった / そもそも key が取れなかったなら閉じる。
+    /// 編集前に退避した key (`audio_editor_target_key`) で引き直し、同じクリップが
+    /// 生きていて **まだ audio なら開いたまま**、消えた / audio でなくなった /
+    /// そもそも key が取れなかったなら閉じる。
     pub(crate) fn reanchor_audio_editor(&mut self, key: Option<common::model::ClipKey>) {
         if self.ui_ephemeral.audio_editor_clip.is_none() {
             return;

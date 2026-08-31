@@ -364,6 +364,7 @@ mod tests {
             lyric: lyric.to_string(),
             clip_id,
             speaker_id,
+            cell_base_beat: 0.0,
         }
     }
 

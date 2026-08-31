@@ -511,13 +511,13 @@ impl AppData {
                     param_id: *param_id,
                 })
                 .copied(),
-            // Image PiP: 同 track の first image event の field 値を現在値とする
+            // Image PiP: 同 track の first image event (セル込み) の field 値を現在値とする
             // (`docs/plan_image_automation.md` §4)。 drag が ImageEvent.field を
             // 更新 → ここで再読み込み → record_automation_points_for_tick が
             // point を打つ、 という pipeline。
             common::model::AutomationTarget::ImageBuiltin(field) => {
                 let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
-                let event = track.clips.iter().find_map(|c| {
+                let event = track.all_clips().find_map(|c| {
                     self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
@@ -535,13 +535,13 @@ impl AppData {
                     ImageBuiltinParam::Rotation => event.rotation_radians,
                 }))
             }
-            // Text PiP: 同 track の first text event の field 値 (image と同
+            // Text PiP: 同 track の first text event (セル込み) の field 値 (image と同
             // idiom)。 23 field 全部を返す (= color / shadow も lane に流す
             // ため)。
             common::model::AutomationTarget::TextBuiltin(field) => {
                 use common::model::TextBuiltinParam as T;
                 let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
-                let event = track.clips.iter().find_map(|c| {
+                let event = track.all_clips().find_map(|c| {
                     self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)

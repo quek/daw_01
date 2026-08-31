@@ -119,9 +119,30 @@ impl AppData {
     /// 変調 (`Track.mod_routings`) は各ノブの per-control modulation overlay
     /// (`view::modulation::build_mod` の live_display) が別途表示するので、 ここは
     /// **lane 値のみ**返して二重適用を避ける。
-    #[allow(clippy::cast_possible_truncation)]
+    ///
+    /// r.md #87: レーンの値は **行の主導権込み**で解く
+    /// ([`crate::launcher_time::RowTimeline`]) — ランチャー主導のレーン行では
+    /// engine が `lane.session_clips` のセルを、停止させた行ではレーン既定値 (Q11)
+    /// を出すので、ここで `lane.clips` を song の playhead で読むと
+    /// 「聴こえている音量 ≠ フェーダーが指す値」になる。走行状態の表は
+    /// [`Self::launcher_running_rows`] が 1 回組んで配る。
     pub(crate) fn live_param_value(
         &self,
+        track: &Track,
+        target: &common::model::AutomationTarget,
+        fallback: f32,
+    ) -> f32 {
+        let running = self.launcher_running_rows();
+        self.live_param_value_on(&self.launcher_timeline(&running), track, target, fallback)
+    }
+
+    /// 走行状態の表を **呼び側が 1 回だけ組む**版 ([`Self::live_param_value`] の本体)。
+    /// `track_mix()` はトラックごとに 2 回呼ぶので、毎回 `launcher_running_rows()`
+    /// を組むと行数 × トラック数の O(N²) になる。
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn live_param_value_on(
+        &self,
+        rows: &crate::launcher_time::RowTimeline<'_>,
         track: &Track,
         target: &common::model::AutomationTarget,
         fallback: f32,
@@ -149,8 +170,20 @@ impl AppData {
         else {
             return fallback;
         };
-        let beat = f64::from(self.transport.playhead_beat.unwrap_or(0.0));
-        common::automation::lane_value_at(lane, &self.song_doc.song().clip_contents, beat) as f32
+        rows.lane_value(track.id, lane, self.song_doc.song()) as f32
+    }
+
+    /// いまの playhead と engine の走行状態から組んだ行解決器。
+    /// `running` は借用なので呼び側が持つ ([`Self::launcher_running_rows`] の戻り値)。
+    pub(crate) fn launcher_timeline<'a>(
+        &self,
+        running: &'a [crate::launcher_time::RunningRow],
+    ) -> crate::launcher_time::RowTimeline<'a> {
+        crate::launcher_time::RowTimeline::with_running(
+            0.0,
+            f64::from(self.transport.playhead_beat.unwrap_or(0.0)),
+            running,
+        )
     }
 
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
@@ -194,6 +227,14 @@ impl AppData {
             }
             depth
         };
+        // r.md #87: 行の主導権込みでレーン値を解く表は **1 フレームに 1 回**組む
+        // (トラックごとに組むと行数 × トラック数の O(N²) になる)。
+        let running = self.launcher_running_rows();
+        let rows = self.launcher_timeline(&running);
+        let live = |t: &common::model::Track, p: common::model::TrackBuiltinParam, fallback: f32| {
+            let target = common::model::AutomationTarget::TrackBuiltin(p);
+            self.live_param_value_on(&rows, t, &target, fallback)
+        };
         self.song_doc.song()
             .tracks
             .iter()
@@ -211,20 +252,8 @@ impl AppData {
                     // 再生中はオートメーション lane の playhead 値を表示
                     // (= audio と一致してフェーダー / パンノブが動く)。 停止中・非
                     // automation・書き込み中は静的値。
-                    volume: self.live_param_value(
-                        t,
-                        &common::model::AutomationTarget::TrackBuiltin(
-                            common::model::TrackBuiltinParam::Volume,
-                        ),
-                        t.volume,
-                    ),
-                    pan: self.live_param_value(
-                        t,
-                        &common::model::AutomationTarget::TrackBuiltin(
-                            common::model::TrackBuiltinParam::Pan,
-                        ),
-                        t.pan,
-                    ),
+                    volume: live(t, common::model::TrackBuiltinParam::Volume, t.volume),
+                    pan: live(t, common::model::TrackBuiltinParam::Pan, t.pan),
                     muted: t.muted,
                     solo: t.solo,
                     peak_l_raw: l,

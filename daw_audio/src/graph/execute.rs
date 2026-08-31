@@ -71,6 +71,12 @@ fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry) -> bool {
 /// at the buffer-start beat (= what the plugin sees as `clap_event_transport
 /// .tempo`)。 引数で受け取るのは song-domain の `song.bpm` (= constant
 /// base BPM) と区別するため。
+///
+/// r.md #87: transport には**曲全体の位置** (`song_pos_beats`) と**行の時間軸**
+/// (`pd.row`、[`common::process_data::RowTransport`]) の 2 つが載る。plugin が
+/// musical time として見るのは後者 — 行の主導権をランチャーが握っている間、
+/// その行の device はセルの拍で動くべきだから。前者は「曲のどこか」を意味する
+/// 用途 (録音位置 / ARA の playback region) が読む。
 pub fn set_pd_transport(
     pd: &mut common::process_data::ProcessData,
     song: Option<&Song>,
@@ -81,7 +87,15 @@ pub fn set_pd_transport(
     // 再生ループの状態 (= `shared.loop_region`)。 ループは `Song` ではなく GUI の
     // session state が所有するので、 song からは取れず engine が持ち回った値を渡す。
     loop_region: LoopRegion,
+    // r.md #87: この device が載っている行の供給元。行の実効拍 / 鳴っているセル /
+    // 無音かを `pd.row` へ載せて plugin host へ渡す (`ProcessData::row` の doc)。
+    // アレンジ主導の行では `pd.row.pos_beats == song_pos_beats` になるので、
+    // ランチャーを使わない曲の transport は byte 単位で従来と同じ。
+    row: crate::launcher::RowTimeSource,
 ) {
+    // song が無い (engine init) 段階でも行の transport は残さない — 前の buffer の
+    // セル情報が居座ると、song を読み込む前の 1 buffer が幽霊セルを鳴らす。
+    pd.row = crate::launcher::render::row_transport(row, song_pos_beats);
     let Some(song) = song else { return };
     pd.bpm = effective_bpm.max(1.0);
     pd.tsig_num = song.time_sig.0 as u16;
@@ -312,7 +326,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region);
+        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region, rows.track());
         // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
         // M1 (r.md #8): note を param automation より **先に** push する。 B4 の
         // sub-buffer param automation は events_in (MAX_EVENTS=256) を最大
@@ -506,7 +520,7 @@ pub fn process_master_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region);
+        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region, master_rows.track());
         // master fx param automation (`song_lanes` の PluginParam lane) + 変調
         // (`song_mod_routings`) を MASTER_TRACK_ID 経路で適用 (r.md #8、 track/group
         // fx と同一 idiom)。
@@ -877,7 +891,7 @@ fn run_group_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, loop_region);
+        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, loop_region, rows.track());
         // Phase 2b: group fx 宛 PluginParam automation + B3 (r.md #8) follower 変調。
         crate::automation::fill_pd_param_events(
             pd,
@@ -1155,8 +1169,12 @@ mod sidechain_tests {
         let region = LoopRegion { enabled: true, start_beat: 4.0, end_beat: 8.0 };
         let mut pd = common::process_data::ProcessData::empty();
         // playhead_beats = 12.5 は constant-tempo 逆算とは無関係な「真の拍」。
-        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, region);
+        let arranger = crate::launcher::RowTimeSource::default();
+        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, region, arranger);
         assert_eq!(pd.song_pos_beats, 12.5);
+        // r.md #87: アレンジ主導の行は行の実効拍 == song 拍 (= 従来と同じ音)。
+        assert_eq!(pd.row.pos_beats, 12.5);
+        assert!(pd.row.is_arrangement() && !pd.row.is_silent());
         assert_eq!(pd.bpm, 90.0);
         assert_eq!(pd.tsig_num, 3);
         assert_eq!(pd.tsig_denom, 4);
@@ -1165,7 +1183,14 @@ mod sidechain_tests {
         assert_eq!(pd.looping, 1);
         // loop region は定義済のまま enabled=false にすると pd.looping=0
         // (= region heuristic を使っていれば 1 のままになる、 という回帰検出)。
-        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, LoopRegion { enabled: false, ..region });
+        set_pd_transport(
+            &mut pd,
+            Some(&song),
+            90.0,
+            12.5,
+            LoopRegion { enabled: false, ..region },
+            arranger,
+        );
         assert_eq!(pd.looping, 0);
     }
 

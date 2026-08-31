@@ -9,6 +9,35 @@ use crate::app::{
     SendPickerState, TempoMapCache, TouchedParam,
 };
 
+/// **いま 1 本の undo step へ束ねている UI ジェスチャの所有者。**
+///
+/// スクラブ / ドラッグ中の欄は `Song` を毎フレーム書くので、
+/// [`SongDoc::begin_gesture`](crate::state::SongDoc::begin_gesture) で束ねないと
+/// 1 ドラッグで数十 undo step が積まれ `UNDO_LIMIT` を溢れさせる。
+///
+/// **開始と終了の「対」に頼らない。** 欄が画面から消えると (選択が変わる /
+/// パネルが閉じる / トラックが削除される) 終了側が二度と呼ばれず、
+/// **以降の編集が全部 1 undo step に束ねられ続ける**。所有者をこの 1 本で持ち、
+/// 「所有者が今フレームも描かれている間だけ生きる」
+/// ([`crate::view::scrub_gesture`]) に縛ることで、消えたら必ず閉じる。
+///
+/// 面ごとに別フィールドを持たないのも同じ理由 —
+/// `SongDoc` の bracket は 1 本しか無いので、追跡側が 5 本あると
+/// 「A が開けたまま B が閉じる」が黙って作れてしまう。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScrubGesture {
+    /// インスペクタ (audio / image / text / plugin param / ローンチ) の数値欄。
+    Inspector(InspectorScrubField),
+    /// アレンジャーのオートメーションレーン見出しの「既定値」欄。
+    LaneDefault(common::model::AutomationLaneKey),
+    /// ツマミ / フェーダーの **変調深さ** ドラッグ (`docs/plan_modulation.md`)。
+    ModDepth { track_id: u32, target: common::model::AutomationTarget },
+    /// 変調ラックの数値欄 (ラック内で同時にドラッグできる欄は 1 つなので集約 1 本)。
+    ModRack,
+    /// 立ち絵グループ変換 (`docs/plan_tachie_group_transform.md`)。
+    GroupTransform(common::model::GroupTransformParam),
+}
+
 pub struct UiEphemeral {
     /// D3/D4: track/clip 名の `Arc<str>` キャッシュ ([`ArrLabelCache`])。 view から
     /// (`&self`) 更新するので `RefCell`。 AppData は GUI メインスレッド専有なので可。
@@ -141,11 +170,6 @@ pub struct UiEphemeral {
     /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
     /// session-only (`arrange_hover_content` と同 idiom)。
     pub arrange_dragging_track_volume: Option<u32>,
-    /// レーンヘッダの default value scrubable がドラッグ / テキスト編集中の
-    /// lane (`Some` の間 1 つだけ)。`inspector_scrub_active` と同 idiom で、 active 立ち上がり
-    /// で `BeginInspectorScrub` (= Song snapshot)、 立ち下がりで `EndInspectorScrub` を発火し、
-    /// 一連の `SetLaneDefault` を undo 1 step に bracket する。session-only。
-    pub arrange_default_scrub_active: Option<common::model::AutomationLaneKey>,
     /// piano_roll widget が歌詞 inline 編集 (gui_01 #017、 note 上の L キー編集) の
     /// text_input overlay を出している間 `true`。 widget 内部状態 (`PianoRollState`) の
     /// session-only ミラーで、 `piano_roll` widget が毎フレーム `resp.lyric_editing`
@@ -320,8 +344,7 @@ pub struct UiEphemeral {
 
     /// 編集中の clip rename。 `Some` のとき該当 clip rect に inline
     /// text_input を重ね描きする (track rename の clip 版)。 `ClipKey` は
-    /// index ベースなので rename mode 中の track/clip reorder は track
-    /// rename と同様に想定しない。
+    /// 安定 id なので rename 中に並べ替えても対象は動かない。
     pub clip_rename: Option<ClipKey>,
     pub clip_rename_text: String,
 
@@ -383,22 +406,29 @@ pub struct UiEphemeral {
     /// content / font_family 文字列 buffer の resync 判定に引き続き使う。
     pub clip_edit_buffer_target: Option<ClipKey>,
 
-    /// v19 (`docs/plan_tachie_group_transform.md` §5.5): inspector の
-    /// scrubable_number で transform を drag / text 編集中の param。drag・編集の
-    /// 開始/終了 edge を検知して `BeginGroupTransformDrag` / `End` を発火し、
-    /// 一連の操作を undo 1 step に bracket するための tracker（`None` = idle）。
-    pub group_scrub_active: Option<common::model::GroupTransformParam>,
-
-    /// audio / image / text
-    /// inspector の scrubable_number で drag / text 編集中の field。 drag・
-    /// 編集の開始/終了 edge を検知して `BeginInspectorScrub` /
-    /// `EndInspectorScrub` を発火し、 一連の操作を undo 1 step に bracket
-    /// する tracker（`None` = idle）。 group_scrub_active と同 idiom。
-    pub inspector_scrub_active: Option<InspectorScrubField>,
+    /// **いま開いている undo bracket の所有者** (`None` = idle)。
+    ///
+    /// インスペクタ / レーン既定値 / 変調深さ / 変調ラック / グループ変換の
+    /// スクラブは、どれも `Song` を毎フレーム書くので 1 本の gesture に束ねる。
+    /// 追跡側を面ごとに分けていた頃は、`SongDoc` の bracket が 1 本しか無いのに
+    /// tracker が 5 本あり「A が開けたまま B が閉じる」が黙って作れた。
+    /// 出入りは [`crate::view::scrub_gesture`] だけを通す。 session-only。
+    pub scrub_gesture: Option<ScrubGesture>,
+    /// [`Self::scrub_gesture`] の所有者が **今フレームも自分を描いたか**。
+    ///
+    /// 毎フレーム末に [`crate::view::scrub_gesture::sweep`] が見て、描かれて
+    /// いなければ gesture を閉じる。開始と終了の対に頼ると、欄が画面から消えた
+    /// (選択が変わる / パネルが閉じる / トラックが削除される) ときに終了が
+    /// 来ず、**以降の編集が全部 1 undo step へ束ねられ続ける**。
+    pub scrub_gesture_seen: bool,
     /// docs/plan_modulation.md §3: true while an envelope-follower attack /
     /// release scrub is being dragged. The scrub mutates the value + marks
     /// dirty each frame but defers the (recompiling) `flush_song_sync`
     /// to the drag-end edge, avoiding a per-frame LoadSong storm.
+    ///
+    /// **undo bracket のエッジ検出には使わない** — それは
+    /// [`Self::scrub_gesture`] ([`ScrubGesture::ModRack`]) が持つ。ここは
+    /// `SetModFollowerScrubbing` が記録する事実だけ。
     pub mod_follower_scrub_active: bool,
     /// docs/plan_modulation_routing_redesign.md §6: the `ModSource` currently
     /// **armed** for assignment (Bitwig 流). `Some(id)` ⇒ every modulatable
@@ -414,14 +444,6 @@ pub struct UiEphemeral {
     /// 中身が下に開くので開示軸 Block = 折り畳み中 ▶ / 展開中 ▼) クリックで toggle。
     /// session-only (not persisted)。
     pub expanded_mod_sources: std::collections::HashSet<u32>,
-    /// The `(track_id, target)` whose per-control modulation depth drag is in
-    /// progress (gui_01 `mod_dragging`), or `None`. Keyed by **track + target**
-    /// (not target alone) because the mixer draws the same target — e.g.
-    /// `TrackBuiltin(Pan)` — on every strip; a target-only key would make all of
-    /// them fight over one flag and fire a host resync every frame during any one
-    /// drag. Each control reacts only to *its own* drag edge, deferring the host
-    /// resync to that control's drag-end. session-only.
-    pub mod_depth_scrub_active: Option<(u32, common::model::AutomationTarget)>,
     /// Export WAV / Video のレンジピッカーモーダルの状態。 `Some` の
     /// 間だけ `export_range_modal` を描画してレンジ確定を待つ。 確定後は元の
     /// export action (file dialog) を `kind` に応じて起動する。 `None` = 非表示。
@@ -477,4 +499,20 @@ pub struct UiEphemeral {
     /// dialog 解決後 (`SaveAsResolved`) の begin_save 完了で action を実行するよう
     /// `guard_after_save` を立てる判定に使う。 `SaveAsResolved` 受信でクリアする。
     pub save_as_dialog_open: bool,
+}
+
+impl UiEphemeral {
+    /// inline リネームの入力欄が出ているか (トラック名 / セクション名 / クリップ名)。
+    ///
+    /// **rename 状態を足したらここへ足す。** `AppData::edit_surface` の手順 0 は
+    /// この述語で「リネーム中はどの面も対象にしない」を決めており、漏らすと
+    /// 入力欄が画面外へ出た瞬間に typing lock が外れて Delete が編集面へ抜ける
+    /// (r.md #87 の列見出し rename は `LauncherUiState` 側にあるので、面の
+    /// arbiter がその 1 つを別に足している)。
+    #[must_use]
+    pub fn inline_rename_active(&self) -> bool {
+        self.track_rename_id.is_some()
+            || self.section_rename_id.is_some()
+            || self.clip_rename.is_some()
+    }
 }

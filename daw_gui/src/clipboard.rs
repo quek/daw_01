@@ -56,7 +56,7 @@ pub enum ClipboardPayload {
     AudioEvents(Vec<AudioEvent>),
     Clips(Vec<ClipCopy>),
     AutomationClips(Vec<AutomationClipCopy>),
-    Tracks(Vec<TrackCopy>),
+    Tracks(TracksCopy),
     /// r.md #87 (クリップランチャー): ランチャーのセル。
     /// アレンジのクリップ (`Clips`) とは **貼り先の座標系が違う** ので別 variant に
     /// する — アレンジは (トラック, 拍)、ランチャーは (行, 列) で、同じ payload に
@@ -180,10 +180,28 @@ pub enum LauncherCellPayload {
     Lane(AutomationClipCopy),
 }
 
+/// r.md #87: トラックまるごとのコピー 1 回ぶん。`tracks` に加えて **コピー元の
+/// 列の並び** (`scenes`) を運ぶ。
+///
+/// `Track::session_clips` の `scene_id` は **プロジェクトごとの id 空間**
+/// (設計正本 §1.1 の「Scene は Song 内で安定 id」) なので、別プロジェクトへ
+/// そのまま持ち込むと意味の違う列を指す。貼り先の列を決められるのは
+/// 「元で何列目だったか」だけなので、id → 表示 index を解く表をコピー側で
+/// 1 度だけ載せる (トラックごとに持たせると同じ表が N 本に複製される)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracksCopy {
+    pub tracks: Vec<TrackCopy>,
+    /// コピー元 `Song.scenes` の id を **表示順**に並べたもの。`0` は
+    /// 「解けない列」の sentinel ([`sanitize_tracks`] が重複を潰すのに使う)。
+    #[serde(default)]
+    pub scenes: Vec<u32>,
+}
+
 /// 正規化済みトラックまるごと。`track` は raw (旧 legacy field は skip_serializing で
 /// 落ちる)。`order` は選択群内の相対順 (上から 0,1,2...) で、paste で相対順を保つ。
-/// `contents` は track の clips / automation lanes が参照する content payload を
-/// cross-project 独立復元のため同梱する。
+/// `contents` は track の clips / automation lanes / **ランチャーのセル** が参照する
+/// content payload を cross-project 独立復元のため同梱する
+/// (数え上げは `Track::all_clips` / `AutomationLane::all_clips` を通すこと)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackCopy {
     pub order: usize,
@@ -395,12 +413,7 @@ pub fn sanitize_launcher_cells(cells: Vec<LauncherCellCopy>) -> Vec<LauncherCell
             {
                 return None;
             }
-            c.launch.follow.chance_a = c.launch.follow.chance_a.min(100);
-            c.launch.follow.multiplier = c.launch.follow.multiplier.max(1);
-            if !c.launch.follow.time_beats.is_finite() {
-                c.launch.follow.time_beats = 4.0;
-            }
-            c.launch.follow.time_beats = c.launch.follow.time_beats.clamp(0.0625, 512.0);
+            sanitize_launch(&mut c.launch);
             c.cell = match c.cell {
                 LauncherCellPayload::Track(cc) => {
                     LauncherCellPayload::Track(sanitize_clips(vec![cc]).pop()?)
@@ -414,21 +427,77 @@ pub fn sanitize_launcher_cells(cells: Vec<LauncherCellCopy>) -> Vec<LauncherCell
         .collect()
 }
 
-/// 外部 clipboard 由来の `TrackCopy` 群を sanitize。各 clip / automation lane clip の
-/// length_beats を検証 (不正は破棄)、volume/pan を clamp、content payload を sanitize する。
-pub fn sanitize_tracks(mut tracks: Vec<TrackCopy>) -> Vec<TrackCopy> {
-    for tc in &mut tracks {
+/// [`common::model::LaunchSettings`] の値域を正す。セル単体の貼り付け
+/// ([`sanitize_launcher_cells`]) とトラックまるごとの貼り付け ([`sanitize_tracks`]) が
+/// **同じ規則**を見るように 1 本にする (片方だけ直すと、同じ壊れた JSON でも
+/// どちらの経路で入ったかで結果が変わる)。
+pub fn sanitize_launch(launch: &mut common::model::LaunchSettings) {
+    launch.follow.chance_a = launch.follow.chance_a.min(100);
+    launch.follow.multiplier = launch.follow.multiplier.max(1);
+    if !launch.follow.time_beats.is_finite() {
+        launch.follow.time_beats = 4.0;
+    }
+    launch.follow.time_beats = launch.follow.time_beats.clamp(0.0625, 512.0);
+}
+
+/// クリップの窓 (`start_beat` / `content_offset_beats`) の非有限を正す。
+/// 長さは「捨てる」判断が入れ物ごとに違うので呼び出し側の `retain` が見る。
+fn sanitize_clip_window(start_beat: &mut f64, content_offset_beats: &mut f64) {
+    if !start_beat.is_finite() {
+        *start_beat = 0.0;
+    }
+    // 窓 offset は負も正当 (左端を外へ伸ばした clip) だが、非有限は先頭扱い。
+    if !content_offset_beats.is_finite() {
+        *content_offset_beats = 0.0;
+    }
+}
+
+/// 外部 clipboard 由来の [`TracksCopy`] を sanitize。各 clip / automation lane clip /
+/// **ランチャーのセル** の length_beats を検証 (不正は破棄)、窓を正し、volume/pan を
+/// clamp、content payload を sanitize する。
+pub fn sanitize_tracks(mut payload: TracksCopy) -> TracksCopy {
+    // 列の並びは貼り先で `Song::ensure_scene_at` に渡す index になるので、
+    // 長さに上限を掛けないと 1 回の貼り付けで列が大量に生える
+    // (`sanitize_launcher_cells` の相対座標上限と同じ考え方)。
+    payload.scenes.truncate(MAX_PASTE_OFFSET as usize);
+    // 重複した列 id は「元で何列目だったか」を一意に解けなくする。index を詰めると
+    // 他のセルの着地列までずれるので、**2 度目以降を未採番 sentinel (`0`) に潰す**
+    // — そこを指すセルだけが貼り付け時に落ちる。
+    let mut seen_scene: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for id in &mut payload.scenes {
+        if *id == 0 || !seen_scene.insert(*id) {
+            *id = 0;
+        }
+    }
+    for tc in &mut payload.tracks {
         tc.track
             .clips
             .retain(|c| c.length_beats.is_finite() && c.length_beats > 0.0);
         for c in &mut tc.track.clips {
-            if !c.start_beat.is_finite() {
-                c.start_beat = 0.0;
-            }
+            sanitize_clip_window(&mut c.start_beat, &mut c.content_offset_beats);
+        }
+        // v35 (r.md #87): ランチャーのセルも同じ検査を通す。セルの長さは
+        // **そのまま engine のループ長**になるので、NaN / 0 長を素通しすると
+        // 「撃った瞬間に固まる行」を外部 JSON から作れてしまう。
+        tc.track
+            .session_clips
+            .retain(|s| s.clip.length_beats.is_finite() && s.clip.length_beats > 0.0);
+        for s in &mut tc.track.session_clips {
+            sanitize_clip_window(&mut s.clip.start_beat, &mut s.clip.content_offset_beats);
+            // セルは「撃った瞬間」が原点 (`SessionClip::clip` の契約)。
+            s.clip.start_beat = 0.0;
+            sanitize_launch(&mut s.launch);
         }
         for lane in &mut tc.track.automation_lanes {
             lane.clips
                 .retain(|c| c.length_beats.is_finite() && c.length_beats > 0.0);
+            lane.session_clips
+                .retain(|s| s.clip.length_beats.is_finite() && s.clip.length_beats > 0.0);
+            for s in &mut lane.session_clips {
+                sanitize_clip_window(&mut s.clip.start_beat, &mut s.clip.content_offset_beats);
+                s.clip.start_beat = 0.0;
+                sanitize_launch(&mut s.launch);
+            }
         }
         for ce in &mut tc.contents {
             sanitize_content(&mut ce.content);
@@ -444,7 +513,7 @@ pub fn sanitize_tracks(mut tracks: Vec<TrackCopy>) -> Vec<TrackCopy> {
             0.0
         };
     }
-    tracks
+    payload
 }
 
 /// 外部 clipboard 由来の `DeviceCopy` 群を sanitize (`sanitize_tracks` と同じ流儀)。

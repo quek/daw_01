@@ -127,10 +127,10 @@ impl AppData {
                 if !compatible {
                     continue;
                 }
-                // **行が実在するかも列を実体化する前に確かめる。** 後で失敗すると
+                // **行がセルを持てるかも列を実体化する前に確かめる。** 後で失敗すると
                 // 「貼れていないのに列だけ増え、undo もできない」状態が残る
                 // (`edit_song_checked` は snapshot を捨てるだけで巻き戻さない)。
-                if !row_exists(song, row) {
+                if !crate::handler::launcher_cells::row_accepts_cells(song, row) {
                     continue;
                 }
                 let scene_id = song.ensure_scene_at(dest.scene_index + cc.scene_offset as usize);
@@ -308,10 +308,3 @@ fn automation_points_of(
         .collect()
 }
 
-/// 貼り付け先の行が実在するか (トラック / レーンとも)。
-fn row_exists(song: &common::model::Song, row: LauncherRow) -> bool {
-    match row {
-        LauncherRow::Track(id) => song.track_by_id(id).is_some(),
-        LauncherRow::Lane(k) => song.automation_lane_by_key(k.track, k.lane).is_some(),
-    }
-}

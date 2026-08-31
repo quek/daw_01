@@ -63,15 +63,30 @@ fn double_click(
     f: &ArrangementFrame<'_>,
     response: &mut ArrangementResponse,
 ) {
-    if f.launcher.collapsed {
+    // popup が開いているフレームは背景の入力を拾わない (`press::dispatch` と同じ理由 —
+    // context menu は anchor の外で背景の pointer をマスクしない)。項目の連打が
+    // 「空セルのダブルクリック」に化けると、押した覚えのないセルが作られる。
+    if f.launcher.collapsed || ui.has_open_popups() {
         return;
     }
     let Some((cx, cy)) = ui.take_double_click_in_rect(f.launcher.grid) else {
         return;
     };
-    let Some((key, _)) = layout::cell_at(f, cx, cy) else {
+    let Some((key, rect)) = layout::cell_at(f, cx, cy) else {
         return;
     };
+    // ▶ (発火ボタン) の上は「撃つ」だけの場所。**press と同じ 1 本の分割規則**
+    // (`launch_button_rect`) を通す — 通さないと、クリップを撃ち直す 2 連打が
+    // そのまま `OpenCellEditor` になり、空セルの ■ を 2 度叩いて行を止める操作が
+    // `CreateCell` になる (止める / 撃ち直すつもりの操作が曲の中身を変える)。
+    if layout::launch_button_rect(rect).contains(cx, cy) {
+        return;
+    }
+    // セルを所有できない行 (マスター行 / グループ行) には作らない・開かない。
+    // 落とし先 (`drop_cell_at`) と caller へ返す rect が通るのと同じ 1 本。
+    if !layout::row_takes_cells(f, key.row) {
+        return;
+    }
     if key.is_empty() {
         response
             .launcher

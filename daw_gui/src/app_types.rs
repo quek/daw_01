@@ -374,11 +374,12 @@ pub fn text_num_to_builtin(field: TextNumField) -> Option<common::model::TextBui
 }
 
 /// inspector の scrubable_number
-/// で drag / text 編集中の field を識別する key。 group transform の
-/// `group_scrub_active: Option<GroupTransformParam>` と同 idiom で、 各
-/// scrubable の active edge を検知して `BeginInspectorScrub` /
-/// `EndInspectorScrub` を 1 undo step に bracket する。 audio / image は
-/// fixed な variant、 text は 25 numeric field を `TextNumField` で内包。
+/// で drag / text 編集中の field を識別する key。
+/// [`ScrubGesture::Inspector`](crate::state::ScrubGesture) の中身として
+/// [`crate::view::scrub_gesture`] に渡り、drag / text 編集の一連を 1 undo step に
+/// bracket する (面ごとに追跡フィールドを分けない理由は `ScrubGesture` の doc)。
+/// audio / image は fixed な variant、 text は 25 numeric field を
+/// `TextNumField` で内包。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectorScrubField {
     Gain,
@@ -403,6 +404,16 @@ pub enum InspectorScrubField {
     PluginParam { device_id: u64, param_id: u32 },
     /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub。
     Talk(TalkParamKind),
+    /// r.md #87: インスペクタ「ローンチ」セクションの数値欄 (セル長 /
+    /// フォローアクションの倍率・時間・確率)。
+    ///
+    /// 中身は **その欄の widget id そのもの** (例
+    /// `("inspector_follow_chance", "cell_a")`)。 別 enum を立てず id を key に
+    /// するのは、bracket の要件が「同じ key ⇔ 同じ widget」 だから — 欄は id で
+    /// 一意なので、id を写すだけで「欄を足したのに key を足し忘れた」 も
+    /// 「セル側と列側で同じ key を使った」 (= 片方の drag 中にもう片方が
+    /// `EndInspectorScrub` を撃って bracket が 1 フレームで閉じる) も起きない。
+    Launch((&'static str, &'static str)),
 }
 
 /// docs/plan_modulation.md §9: one row of the inspector
@@ -800,8 +811,11 @@ pub struct ExportRangePicker {
 /// [`Track::all_clips`](common::model::Track::all_clips) が
 /// アレンジのクリップとセルを 1 つの id 空間として引ける)。
 ///
-/// 解決は [`AppData::clip_of`](crate::state::AppData::clip_of) /
-/// `clip_of_mut` / `track_index_of` を通す (index が要るのは行レイアウトだけ)。
+/// 解決は [`Song::clip_by_key`](common::model::Song::clip_by_key) /
+/// `clip_by_key_mut` (中身) と
+/// [`AppData::live_clip_key`](crate::state::AppData::live_clip_key) (生存確認) を
+/// 通す。index が要るのは行レイアウトとクリップボードの相対トラックだけで、
+/// そこは [`Song::track_index_of`](common::model::Song::track_index_of) を明示的に通す。
 pub use common::model::ClipKey;
 
 /// r.md #38: clip 内の 1 event を指す参照。 `ClipKey` の延長で、
@@ -852,10 +866,20 @@ pub enum EditSurface {
     AudioEvents,
     Notes,
     AutomationPoints,
+    /// **アレンジの** automation クリップ面 (`lane.clips`)。 ランチャーの
+    /// レーン行のセル (`lane.session_clips`) はここではなく
+    /// [`Self::LauncherCells`]。
     AutomationClips,
-    /// ランチャー (セッション) のセル面。 グリッドに時間軸が無いので範囲では
+    /// ランチャー (セッション) の**セル面**。 グリッドに時間軸が無いので範囲では
     /// 表せず、唯一「オブジェクト選択」 のまま残る面
     /// (`docs/plan_range_selection.md` §2.2)。
+    ///
+    /// **行の種類で面を割らない** — トラック行のセルもオートメーションレーン行の
+    /// セルもこの 1 面。 以前はレーン行のセルだけ [`Self::AutomationClips`] を
+    /// 立てていたため、両方の行のセルを選ぶと last-wins が片方を捨て、
+    /// **Delete / Copy が選んだうちの半分にしか効かなかった** (計画書 §3.3 の
+    /// 「セルは `ClipKey` で指せるので選択 SSoT が追加実装ゼロで通る」 は
+    /// *鍵の型*の話で、集合をアレンジと共有しろという意味ではない)。
     LauncherCells,
     /// トラック面 (ヘッダ / ミキサーストリップ)。 **明示的に選んだときだけ**
     /// 立つ — `selected_track_ids` はクリップ選択の追従 (`select_track`) や
@@ -864,6 +888,14 @@ pub enum EditSurface {
     Tracks,
     /// Arranger セクション帯 (選択中なら Delete で帯削除)。
     Sections,
+    /// r.md #87: ランチャーの **列 (シーン) 見出し**の面。
+    ///
+    /// セル面 ([`EditSurface::LauncherCells`]) と別に要る — 列とセルは
+    /// `SelectionState` 上で排他だが、 タグを分けないと「列を選んでも直前の面が
+    /// Delete の対象のまま残る」 (= 列を選んだ次の Delete がアレンジのクリップを
+    /// 消す)。 列は時間軸を持たないので範囲では表せず、 セル面と同じく
+    /// オブジェクト選択のまま残る面。
+    Scenes,
     /// r.md #71 (プラグインのコピー / 移動): インスペクタの Chain 行
     /// (選択中のプラグイン)。 **明示的に行を click したときだけ**立つので、
     /// `edit_surface` の非空優先順 fallback には入れない (タグ経由の
@@ -1267,25 +1299,25 @@ pub type PendingExport = (std::path::PathBuf, Option<(f64, f64)>, bool);
 /// D3/D4: arrangement build のラベルキャッシュ。 `arrangement_view` の build は
 /// 毎フレーム全 track×clip ぶん track 名 `Arc::from` と `clip_display_label`
 /// (= `Arc::from` + 歌詞連結) を呼び再確保していた。 名前は編集時しか変わらない
-/// ので、 `song_epoch` が進んだとき (= undo 境界をまたぐ編集) だけ作り直し、
+/// ので、 `SongDoc::edit_epoch` が進んだとき (= undo 境界をまたぐ編集) だけ作り直し、
 /// 通常フレームは `Arc` の clone (refcount bump) で済ませる。 `clip_display_label`
 /// は `clip.content_id` のみに依存するので content 単位で 1 回だけ算出する。
 #[derive(Default)]
 pub(crate) struct ArrLabelCache {
-    /// このキャッシュ内容が対応する `AppData::song_epoch`。 一致する間は再計算しない。
+    /// このキャッシュ内容が対応する `SongDoc::edit_epoch`。 一致する間は再計算しない。
     pub(crate) epoch: u64,
     pub(crate) track_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
     pub(crate) content_labels:
         std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
     /// D4 同件: section ruler / automation clip も同じ per-frame `Arc::from(&str)`
     /// だった。 user 編集可能 (= intern 不可・無制限成長する) なので track/clip 名と
-    /// 同じ `song_epoch` 世代キャッシュで持つ。
+    /// 同じ `edit_epoch` 世代キャッシュで持つ。
     pub(crate) section_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
     pub(crate) content_names:
         std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
 }
 
-/// r.md #56: 再生位置の秒表示用 [`common::tempo_map::TempoMap`] の `song_epoch`
+/// r.md #56: 再生位置の秒表示用 [`common::tempo_map::TempoMap`] の `edit_epoch`
 /// 世代キャッシュ。
 ///
 /// `song_beat_to_seconds` は SongTempo automation lane がある曲で毎回
@@ -1298,7 +1330,7 @@ pub(crate) struct ArrLabelCache {
 /// 高速経路 (table を張らない) にそのまま落ちる。
 #[derive(Default)]
 pub(crate) struct TempoMapCache {
-    /// このキャッシュ内容が対応する `AppData::song_epoch`。
+    /// このキャッシュ内容が対応する `SongDoc::edit_epoch`。
     pub(crate) epoch: u64,
     /// 一度でも構築したか。 `epoch` の初期値 0 と実際の epoch 0 を区別する。
     pub(crate) built: bool,
@@ -1442,8 +1474,10 @@ pub enum PendingStateRequest {
         snap_epoch: u64,
     },
     /// plugin が **削除される** 編集操作の Undo snapshot 作成。
-    /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
-    /// を呼ぶことで、 削除直前の knob 値等を Undo で復元できる。
+    /// state を Song に書き込んでから
+    /// [`AppData::edit_song`](crate::state::AppData::edit_song) を通すことで、
+    /// 削除直前の knob 値等を Undo で復元できる (undo snapshot はこの
+    /// チョークポイントが無条件で積む、 不変条件 5)。
     Deferred(DeferredEdit),
     /// copy (Ctrl+C)。state 書き戻し後の live song から対象を最新 plugin state
     /// 込みで serialize して `pending_clipboard_write` に積むだけ (Song 不変)。
@@ -2035,6 +2069,12 @@ pub(crate) fn remap_indices(remap: &[Option<u32>], idxs: &[u32]) -> Vec<u32> {
 /// 「クリップ色をトラックに揃える」(`ResetTrackClipColors`) は逆に **track-scoped** で
 /// 他 track の共有 clip を変えない — 色は per-clip 所有 (`Clip.color`) なので、 SET 伝播 /
 /// RESET track-local の両立ができる (`docs/plan_track_clip_color.md` 追加要件)。
+///
+/// r.md #87: 対象の探索 (`Track::clip_by_id`) も伝播ループも
+/// [`Track::all_clips_mut`](common::model::Track::all_clips_mut) を通す — 探索だけが
+/// セルを引いて伝播が `clips` だけだと、**セルの色を変えてもセル自身が塗られない**
+/// (リンク先のアレンジのクリップだけ色が変わる) 非対称になる。計画書 §3.3
+/// 「クリップ色 / Mute / 名前 / リンク表示が追加実装ゼロで通る」。
 pub(crate) fn propagate_clip_color(tracks: &mut [Track], target: ClipKey, color: Option<[f32; 3]>) {
     let content_id = tracks
         .iter()
@@ -2044,7 +2084,7 @@ pub(crate) fn propagate_clip_color(tracks: &mut [Track], target: ClipKey, color:
     match content_id {
         Some(cid) if cid != 0 => {
             for t in tracks.iter_mut() {
-                for clip in t.clips.iter_mut().filter(|c| c.content_id == cid) {
+                for clip in t.all_clips_mut().filter(|c| c.content_id == cid) {
                     clip.color = color;
                 }
             }

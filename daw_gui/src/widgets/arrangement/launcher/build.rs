@@ -5,6 +5,8 @@
 
 use super::*;
 
+use crate::event_launcher::LauncherRow;
+use crate::handler::launcher_cells::row_accepts_cells;
 use crate::view::track_color;
 
 /// `view_build::build` の末尾で呼ぶ。
@@ -45,6 +47,9 @@ pub(crate) fn build(
             playback: RowPlayback::Arranger,
             armed: false,
             group: false,
+            // マスターのトラック行はセルも主導権も持たない。
+            launchable: false,
+            takes_cells: false,
             cells: HashMap::new(),
         },
     );
@@ -52,13 +57,8 @@ pub(crate) fn build(
         let Some(ml) = song.song_lanes.iter().find(|l| l.id == lane.id) else {
             continue;
         };
-        rows.insert(
-            ArrangementRowKey::Lane(common::model::AutomationLaneKey {
-                track: MASTER_TRACK_ID,
-                lane: lane.id,
-            }),
-            lane_row(ml, lane, song, refcounts),
-        );
+        let key = common::model::AutomationLaneKey { track: MASTER_TRACK_ID, lane: lane.id };
+        rows.insert(ArrangementRowKey::Lane(key), lane_row(ml, lane, key, song, refcounts));
     }
 
     for t in tracks {
@@ -94,6 +94,8 @@ pub(crate) fn build(
                 playback: mt.launcher,
                 armed: t.armed,
                 group,
+                launchable: true,
+                takes_cells: row_accepts_cells(song, LauncherRow::Track(t.id)),
                 cells,
             },
         );
@@ -101,13 +103,8 @@ pub(crate) fn build(
             let Some(ml) = mt.automation_lanes.iter().find(|l| l.id == lane.id) else {
                 continue;
             };
-            rows.insert(
-                ArrangementRowKey::Lane(common::model::AutomationLaneKey {
-                    track: t.id,
-                    lane: lane.id,
-                }),
-                lane_row(ml, lane, song, refcounts),
-            );
+            let key = common::model::AutomationLaneKey { track: t.id, lane: lane.id };
+            rows.insert(ArrangementRowKey::Lane(key), lane_row(ml, lane, key, song, refcounts));
         }
     }
 
@@ -124,6 +121,7 @@ pub(crate) fn build(
         scroll_scene: app.ui_prefs.launcher_scroll_scene,
         progress,
         queued,
+        selected: app.selection.selected_launcher_cells.clone(),
     }
 }
 
@@ -131,6 +129,7 @@ pub(crate) fn build(
 fn lane_row(
     ml: &common::model::AutomationLane,
     lane: &ArrangementAutomationLane,
+    key: common::model::AutomationLaneKey,
     song: &common::model::Song,
     refcounts: &HashMap<common::model::ContentId, usize>,
 ) -> LauncherRowView {
@@ -174,6 +173,9 @@ fn lane_row(
         // レーン行は録音アームを持たない (空セルは常に停止 ■)。
         armed: false,
         group: false,
+        // テンポ / 拍子レーンだけ `false` (engine の `for_each_launcher_row` と同じ 1 本)。
+        launchable: ml.target.accepts_launcher_cells(),
+        takes_cells: row_accepts_cells(song, LauncherRow::Lane(key)),
         cells,
     }
 }

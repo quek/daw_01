@@ -75,6 +75,27 @@ pub struct NoteMetadata {
     /// the same value. Other builtins ignore this.
     #[serde(default)]
     pub speaker_id: u32,
+    /// r.md #87 (クリップランチャー): このノートを合成タイムラインへ置いた
+    /// **区間の原点** (拍)。`0.0` = アレンジのクリップ。
+    ///
+    /// builtin の合成 buffer は「index N = 合成タイムラインの sample N」という
+    /// 契約の 1 本の mono buffer で、アレンジのクリップは song 拍そのままの位置に
+    /// 置かれる。ランチャーのセル (`Track::session_clips`) は **song 絶対位置を
+    /// 持たない** (`clip.start_beat` は常に 0 で、いつ鳴るかは撃った拍で決まる)
+    /// ので、そのまま置くと曲頭に重なって「撃っていないのに歌い出す」。そこで
+    /// セルごとに **曲の終端より後ろへ専用の仮想区間**を確保し、その先頭の拍を
+    /// ここに入れる:
+    ///
+    /// ```text
+    /// アレンジ: cell_base_beat = 0.0       start_beat = song 拍
+    /// セル    : cell_base_beat = 区間先頭   start_beat = cell_base_beat + セル内拍
+    /// ```
+    ///
+    /// 再生側は行の実効拍 (engine の `RowPhase::effective_beat`) にこの値を足して
+    /// buffer を読む。区間の割り当ては daw_gui (`handler::voicevox`) が Song から
+    /// **決定論的に**決めるので、同じプロジェクト → 同じ配置 → 同じキャッシュ。
+    #[serde(default)]
+    pub cell_base_beat: f64,
 }
 
 /// (talk) 1 件の読み上げ (= `ClipContent::Text` の 1 `TextEvent`) を builtin VOICEVOX
@@ -108,6 +129,10 @@ pub struct TalkMetadata {
     /// 含むので逆関数が全域では正しくない。持っている情報を捨てない)。
     #[serde(default)]
     pub clip_id: u32,
+    /// r.md #87: この発話を合成タイムラインへ置いた**区間の原点** (拍)。
+    /// `0.0` = アレンジのクリップ。意味は [`NoteMetadata::cell_base_beat`] と同じ。
+    #[serde(default)]
+    pub cell_base_beat: f64,
 }
 
 /// (talk) `event_id` の high band 起点。sing の `note_id`
@@ -216,6 +241,7 @@ mod tests {
             intonation_scale: 1.0,
             volume_scale: 1.0,
             clip_id: 3,
+            cell_base_beat: 0.0,
         };
         let cfg = bincode::config::standard();
         let bytes = bincode::encode_to_vec(&m, cfg).unwrap();
@@ -235,6 +261,7 @@ mod tests {
             lyric: "あ".to_string(),
             clip_id: 7,
             speaker_id: 3061,
+            cell_base_beat: 128.0,
         };
         let cfg = bincode::config::standard();
         let bytes = bincode::encode_to_vec(&m, cfg).unwrap();
@@ -254,5 +281,7 @@ mod tests {
         assert!(m.lyric.is_empty());
         assert_eq!(m.clip_id, 0);
         assert_eq!(m.speaker_id, 0);
+        // 既定は「アレンジのクリップ」 = 原点が曲頭。
+        assert_eq!(m.cell_base_beat, 0.0);
     }
 }

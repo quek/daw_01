@@ -38,7 +38,18 @@ pub fn collect_row_midi(
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
     let bpf = beats_per_frame(current_bpm, sample_rate);
     // 直前の区間 (`(実効拍, セル id)`)。区間の切れ目で鳴っている note を止めるのに使う。
-    let mut prev: Option<(f64, u32)> = None;
+    //
+    // **`src.head` の状態で初期化する。** `switch_frame == 0` (= 発火拍が buffer 先頭
+    // ちょうど。量子化 Off や、境界が frame 0 に落ちたとき) だと head の区間が
+    // 1 つも出ない (`emit_phase` の `from >= to`) ので、`None` 始まりだと tail の
+    // 最初の区間で切れ目 flush が走らず、head で鳴っていた note の Off が
+    // **二度と出ない** (次の停止 / seek / ループ巻き戻しまで鳴りっぱなし)。
+    // `switch_frame > 0` のときは head の最初の区間がこれと同じ値を書くので、
+    // 余計な flush は起きない (比較は厳密な `<` / `!=`)。
+    let mut prev: Option<(f64, u32)> = src
+        .head
+        .effective_beat(playhead_beats)
+        .map(|b| (b, src.head.cell_clip_id().unwrap_or(0)));
     // 区間が届いた最後の frame。ここが `frames` に届かない = **その先は無音**。
     let mut covered_to: u32 = 0;
     for_each_segment(src, playhead_beats, bpf, frames, |seg| {
@@ -172,6 +183,53 @@ pub fn phase_at_frame(src: RowTimeSource, frame: u32) -> RowPhase {
     if frame < src.switch_frame { src.head } else { src.tail }
 }
 
+/// 行の供給元を、プロセス境界を渡る形 ([`common::process_data::RowTransport`]) へ写す。
+///
+/// **写像だけで、位相の式は書かない** — 実効拍は [`RowPhase::effective_beat`] が
+/// 唯一の定義。値は buffer 頭のもの (plugin へ渡す transport は 1 buffer 1 値で、
+/// アレンジのループ wrap も buffer 境界でしか起きない = 同じ粒度)。
+///
+/// 無音の行 (`Silent` / ワンショットの終端) は `silent = 1` を立てつつ拍は
+/// **song のもの**を残す。行が黙ってもエフェクトのテンポ同期は走り続けるべきで、
+/// 拍を 0 に落とすとディレイのグリッドが飛ぶ。
+#[must_use]
+pub fn row_transport(
+    src: RowTimeSource,
+    playhead_beats: f64,
+) -> common::process_data::RowTransport {
+    use common::process_data::{ARRANGER_CELL_ID, RowTransport};
+
+    let phase = phase_at_frame(src, 0);
+    let Some(pos_beats) = phase.effective_beat(playhead_beats) else {
+        // 無音の行。拍は song のものを残し、ループも曲のもの (= 呼び側が
+        // `pd.loop_*` を使う) に任せる。
+        return RowTransport {
+            pos_beats: playhead_beats,
+            cell_clip_id: ARRANGER_CELL_ID,
+            silent: 1,
+            ..RowTransport::default()
+        };
+    };
+    // ループするセルだけが自前のループ区間を持つ。ワンショットとアレンジは
+    // `0.0 / 0.0` (= 自前のループ無し)。
+    let (loop_start_beats, loop_end_beats) = match phase {
+        RowPhase::Cell { cell_start_beat, loop_len, looping: true, .. }
+            if super::is_positive(loop_len) =>
+        {
+            (cell_start_beat, cell_start_beat + loop_len)
+        }
+        _ => (0.0, 0.0),
+    };
+    RowTransport {
+        pos_beats,
+        loop_start_beats,
+        loop_end_beats,
+        cell_clip_id: phase.cell_clip_id().unwrap_or(ARRANGER_CELL_ID),
+        silent: 0,
+        _pad: [0; 3],
+    }
+}
+
 /// セル 1 つを実効拍で評価する。窓の外はレーン既定値。
 fn cell_value(
     lane: &AutomationLane,
@@ -217,6 +275,53 @@ mod tests {
         AutomationClip, AutomationContent, AutomationCurve, AutomationPoint, AutomationTarget,
         LaunchSettings, MidiContent, Note, SessionAutomationClip, Track, TrackBuiltinParam,
     };
+
+    /// r.md #87: 行の供給元 → `ProcessData::row` の写像。plugin host (VOICEVOX の
+    /// 連続再生 / CLAP・VST3 の transport) はこの 3 状態しか見ないので、ここが
+    /// 崩れると「合成済みなのにセルが鳴らない」「停止した行のアレンジが鳴り止まない」
+    /// という静かな壊れ方をする。
+    #[test]
+    fn 行の供給元は拍とセル_id_と無音フラグへ写る() {
+        let key = RowKey::track(1);
+        // アレンジ: song 拍そのまま / セル無し / 自前のループ無し。
+        let r = row_transport(RowTimeSource::uniform(key, RowPhase::Arranger), 12.5);
+        assert_eq!(r.pos_beats, 12.5);
+        assert!(r.is_arrangement() && !r.is_silent() && !r.has_loop());
+
+        // 4 拍のループするセルを拍 8 で撃ち、いま拍 10.5 → セル内 2.5 拍。
+        let cell = RowPhase::Cell {
+            clip_id: 7,
+            launch_beat: 8.0,
+            loop_len: 4.0,
+            cell_start_beat: 0.0,
+            looping: true,
+        };
+        let r = row_transport(RowTimeSource::uniform(key, cell), 10.5);
+        assert!((r.pos_beats - 2.5).abs() < 1e-9, "{}", r.pos_beats);
+        assert_eq!(r.cell_clip_id, 7);
+        assert!(!r.is_silent());
+        // ループ区間は**セルの窓**であって曲のループではない。
+        assert_eq!((r.loop_start_beats, r.loop_end_beats), (0.0, 4.0));
+
+        // ワンショットは自前のループを名乗らない。
+        let one_shot = RowPhase::Cell {
+            clip_id: 7,
+            launch_beat: 8.0,
+            loop_len: 4.0,
+            cell_start_beat: 0.0,
+            looping: false,
+        };
+        let r = row_transport(RowTimeSource::uniform(key, one_shot), 10.5);
+        assert!(!r.has_loop());
+        // 終端を越えたら無音 (拍は song のまま = エフェクトのグリッドを飛ばさない)。
+        let r = row_transport(RowTimeSource::uniform(key, one_shot), 13.0);
+        assert!(r.is_silent() && r.is_arrangement());
+        assert_eq!(r.pos_beats, 13.0);
+
+        // Stop Clips / 空セルのシーン。
+        let r = row_transport(RowTimeSource::uniform(key, RowPhase::Silent), 4.0);
+        assert!(r.is_silent());
+    }
 
     /// 4 拍のセル 1 つを持つ track 1 本。セルの content には拍 0 と 2 に note。
     fn song_with_cell() -> Song {
@@ -381,6 +486,59 @@ mod tests {
         assert_eq!(ons, 3, "3 周ぶん刻んだらセル頭の note は 3 回鳴る");
     }
 
+    /// **供給元が buffer 先頭ちょうどで切り替わっても note-off が出る。**
+    ///
+    /// `switch_frame == 0` だと head の区間が 1 つも出ない (`emit_phase` の
+    /// `from >= to`) ので、切れ目 flush の判定を「1 つ前の区間」だけに頼ると
+    /// head で鳴っていた note の Off が二度と出ない (= 停止 / seek / ループ
+    /// 巻き戻しまで鳴りっぱなし)。量子化 Off で行を撃つ / アレンジへ返すと、
+    /// 発火拍は必ず buffer 先頭になるのでこの経路が常用される。
+    #[test]
+    fn buffer_先頭での供給元切替でも_note_off_が出る() {
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        // セル全長 (4 拍) の note = buffer を跨いで鳴り続ける音。
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent {
+                notes: vec![Note {
+                    id: 1,
+                    start_beat: 0.0,
+                    duration_beats: 4.0,
+                    pitch: 60,
+                    ..Note::default()
+                }],
+                next_note_id: 2,
+            }),
+        );
+        let mut out = Vec::with_capacity(256);
+        let mut active = Vec::with_capacity(256);
+
+        // 1 buffer 目: セルが鳴り出す。
+        let playing = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
+        collect_row_midi(Some(&song), 0, playing, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        assert_eq!(active.as_slice(), &[60], "セルの note が鳴っていない: {out:?}");
+
+        // 2 buffer 目: 先頭ちょうどでアレンジへ返す (`switch_frame == 0`)。
+        out.clear();
+        let switch = RowTimeSource {
+            key: RowKey::track(1),
+            head: cell_phase(0.0),
+            tail: RowPhase::Arranger,
+            switch_frame: 0,
+        };
+        collect_row_midi(Some(&song), 0, switch, 48_000, 2.0, 120.0, 512, &mut out, &mut active);
+        let offs: Vec<u32> = out
+            .iter()
+            .filter(|e| {
+                matches!(e.event, crate::sequencer::NoteTransition::Off { key: 60, .. })
+            })
+            .map(|e| e.time)
+            .collect();
+        assert_eq!(offs.as_slice(), &[0], "切り替えの瞬間に Off が出ない: {out:?}");
+        assert!(active.is_empty(), "鳴っている note が残った: {active:?}");
+    }
+
     /// アレンジ行はセルを 1 つも見ない (= 供給元の切り替えが効いている)。
     #[test]
     fn アレンジ行はセルの_note_を出さない() {
@@ -532,5 +690,151 @@ mod tests {
         let b = render_once();
         assert_eq!(a, b, "同じ起点から 2 回描いて違う = 書き出しが再現しない");
         assert!(!a.is_empty(), "1 音も鳴っていない (テストが何も検証していない)");
+    }
+}
+
+/// RT 無確保検査 (`make test-rt`) 用の Song ビルダー。
+#[cfg(all(test, feature = "rt-assert"))]
+mod tests_support {
+    use common::model::{
+        Clip, FollowAction, FollowActionKind, LaunchSettings, MidiContent, Note, SessionClip,
+        Track,
+    };
+
+    use super::{ClipContent, Song};
+
+    /// 1 トラック / 2 列。両セルに「クリップ終端で次の列へ」を付けてあるので、
+    /// 走らせるだけでフォローアクションの遷移とループ端を何度も通る。
+    #[must_use]
+    pub fn rt_song() -> Song {
+        let mut song = Song { bpm: 120.0, project_id: 1, ..Song::default() };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent {
+                notes: vec![
+                    Note { id: 1, start_beat: 0.0, duration_beats: 2.0, pitch: 60, ..Note::default() },
+                    Note { id: 2, start_beat: 2.0, duration_beats: 2.0, pitch: 64, ..Note::default() },
+                ],
+                next_note_id: 3,
+            }),
+        );
+        let s1 = song.push_scene();
+        let s2 = song.push_scene();
+        let mut track = Track { id: 1, next_clip_id: 100, ..Track::default() };
+        for (id, scene_id, len) in [(10u32, s1, 4.0), (11, s2, 2.0)] {
+            track.session_clips.push(SessionClip {
+                scene_id,
+                clip: Clip {
+                    id,
+                    start_beat: 0.0,
+                    length_beats: len,
+                    content_id: cid,
+                    ..Clip::default()
+                },
+                launch: LaunchSettings {
+                    follow: FollowAction {
+                        enabled: true,
+                        a: FollowActionKind::Next,
+                        chance_a: 100,
+                        ..FollowAction::default()
+                    },
+                    ..LaunchSettings::default()
+                },
+            });
+        }
+        song.tracks.push(track);
+        song
+    }
+}
+
+/// **ランチャーの RT 経路が 1 バイトも確保しないこと** (`make test-rt`)。
+///
+/// `launcher/mod.rs` の RT 規約はこの検査があって初めて主張になる。包むのは
+/// audio callback がこの順で通る 4 本すべて — 走行状態の解決 ([`LauncherRuntime::update`])、
+/// GUI への publish、MIDI の収集、オーディオの描画。
+#[cfg(all(test, feature = "rt-assert"))]
+mod rt_assert_tests {
+    use super::tests_support::*;
+    use super::*;
+    use crate::audio_clip_renderer::{AudioClipRenderer, ClipRenderState};
+    use crate::launcher::runtime::{BufferSpan, LaunchRequest, LauncherRuntime};
+    use crate::launcher::{RowKey, RowSourceTable};
+    use common::model::LaunchQuantize;
+
+    #[test]
+    fn ランチャーの_rt_経路は確保しない() {
+        let song = rt_song();
+        let mut rt = LauncherRuntime::new();
+        // 事前確保は off-RT (live では publish 側 / export では walk の頭)。
+        let mut out = Vec::with_capacity(4096);
+        let mut active = Vec::with_capacity(1024);
+        let renderer = AudioClipRenderer::empty();
+        let mut accum: Vec<(u64, f64)> = Vec::with_capacity(8);
+        let mut engines = Vec::new();
+        let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
+        let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
+        let mut l = vec![0.0f32; 512];
+        let mut r = vec![0.0f32; 512];
+        let mut render_seq = 0u64;
+        let name = format!("daw01-rt-launcher-{}", std::process::id());
+        let bridge = common::audio_bridge::AudioBridgeHandle::create(&name).expect("bridge");
+
+        // 1 buffer 目は行の生成 (`Vec::push`) を含むので検査の外で回す。
+        rt.update(&song, BufferSpan::new(0.0, 120.0, 48_000, 512), LaunchQuantize::Off, true);
+
+        // 以降が定常。セル発火 / シーン発火 / フォローアクションの遷移 /
+        // ループ端を何度も跨ぐ描画を、まとめて 1 つの検査に入れる。
+        assert_no_alloc::assert_no_alloc(|| {
+            let mut beat = 0.0_f64;
+            for i in 0..400usize {
+                match i {
+                    8 => rt.push_request(LaunchRequest::Cell {
+                        key: RowKey::track(1),
+                        clip_id: 10,
+                        pressed: true,
+                    }),
+                    24 => rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true }),
+                    64 => rt.push_request(LaunchRequest::StopAll),
+                    96 => rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true }),
+                    200 => rt.on_transport_jump(-8.0),
+                    _ => {}
+                }
+                if i == 200 {
+                    beat -= 8.0;
+                }
+                let span = BufferSpan::new(beat, 120.0, 48_000, 512);
+                rt.update(&song, span, LaunchQuantize::Off, true);
+                rt.publish(&bridge, span.start_beat);
+                let src = rt.rows().track_row(0);
+                out.clear();
+                collect_row_midi(
+                    Some(&song), 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
+                );
+                render_row_audio(
+                    &renderer,
+                    0,
+                    src,
+                    &mut l,
+                    &mut r,
+                    beat,
+                    120.0,
+                    48_000,
+                    512,
+                    &mut ClipRenderState {
+                        repitch_accum: &mut accum,
+                        engines: &mut engines,
+                        event_l: &mut event_l,
+                        event_r: &mut event_r,
+                        render_seq: &mut render_seq,
+                    },
+                );
+                beat += 512.0 * 120.0 / (60.0 * 48_000.0);
+            }
+            // 検査の中で本当に走ったことを確かめる (何も鳴っていないと
+            // `for_each_segment` が即 return して素通りする)。
+            assert!(!active.is_empty() || !out.is_empty());
+        });
+        let _: &RowSourceTable = rt.rows();
     }
 }

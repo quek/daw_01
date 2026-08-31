@@ -28,7 +28,7 @@ pub use voicevox::VoicevoxState;
 pub use media::MediaState;
 pub use recording::RecordingState;
 pub use ui_prefs::UiPrefs;
-pub use ui_ephemeral::UiEphemeral;
+pub use ui_ephemeral::{ScrubGesture, UiEphemeral};
 pub use launcher_ui::{LauncherFocus, LauncherUiState};
 
 /// GUI プロセスの全アプリ状態 (composition of state groups)。

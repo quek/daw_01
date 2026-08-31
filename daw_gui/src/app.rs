@@ -90,8 +90,8 @@ pub use crate::event::{
 };
 
 pub use crate::state::{
-    AppData, DeviceParamKey, EditScope, IpcState, MediaState, RecordingState, SelectionState,
-    SongDoc, StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
+    AppData, DeviceParamKey, EditScope, IpcState, MediaState, RecordingState, ScrubGesture,
+    SelectionState, SongDoc, StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
 };
 
 
@@ -386,7 +386,6 @@ impl AppData {
                 zoom_lane_fill: None,
                 arrange_hover_content: None,
                 arrange_dragging_track_volume: None,
-                arrange_default_scrub_active: None,
                 arrange_hovered_automation_lane: None,
                 piano_roll_lyric_editing: false,
                 pianoroll_viewport: None,
@@ -439,12 +438,11 @@ impl AppData {
                 clip_edit_buffer_target: None,
                 clip_text_content_edit_text: String::new(),
                 clip_text_font_family_edit_text: String::new(),
-                group_scrub_active: None,
-                inspector_scrub_active: None,
+                scrub_gesture: None,
+                scrub_gesture_seen: false,
                 mod_follower_scrub_active: false,
                 armed_mod_source: None,
                 expanded_mod_sources: std::collections::HashSet::new(),
-                mod_depth_scrub_active: None,
                 export_range_picker: None,
                 recovery_candidates,
                 show_recovery_modal,

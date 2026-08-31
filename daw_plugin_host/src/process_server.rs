@@ -70,6 +70,13 @@ pub struct PluginEntry {
     /// (`u32::MAX` = 未 claim)。 worker が初回 `process()` で
     /// `MetricsBridge::claim_plugin_metric_slot` を呼んで確定し、 以後 O(1) store。
     pub metric_slot: Arc<AtomicU32>,
+    /// r.md #87: この instance へ渡す musical timeline を **曲全体の位置に固定**
+    /// するか。既定 (`false`) は行の時間軸 = ランチャーで撃った行の plugin は
+    /// セルの拍で動く。`true` になるのは **ARA を bind した instance だけ** —
+    /// ARA の playback region は song 時間に固定されており、行の拍を渡すと
+    /// Melodyne が曲頭付近を鳴らす (ARA のセル対応は未実装、`vst3_plugin.rs`
+    /// の注記)。load 時の ARA bind 結果で確定する定数。
+    pub transport_pinned_to_song: bool,
 }
 
 /// `PluginEntry::metric_slot` の未 claim sentinel。
@@ -82,6 +89,7 @@ impl Clone for PluginEntry {
             process_data: self.process_data,
             err_logged: Arc::clone(&self.err_logged),
             metric_slot: Arc::clone(&self.metric_slot),
+            transport_pinned_to_song: self.transport_pinned_to_song,
         }
     }
 }
@@ -670,7 +678,10 @@ fn run_worker(
             *flag = 0;
         }
 
-        let transport = crate::plugin_instance::TransportContext::from_process_data(pd);
+        let transport = crate::plugin_instance::TransportContext::from_process_data(
+            pd,
+            entry.transport_pinned_to_song,
+        );
         // builtin / Rust 製 plugin の panic で worker thread を殺さない
         // (以後の dispatch が誰も done を signal しなくなる)。
         let proc_start = std::time::Instant::now();
@@ -1032,6 +1043,7 @@ mod tests {
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
             metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
+            transport_pinned_to_song: false,
         };
         registry_insert(&registry, 42, entry);
         assert!(registry.load().contains_key(&42));
@@ -1046,6 +1058,7 @@ mod tests {
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
             metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
+            transport_pinned_to_song: false,
         };
         registry_insert(&registry, 7, entry2);
         let all = registry_take_all(&registry);

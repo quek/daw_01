@@ -266,8 +266,17 @@ pub enum AudioCommand {
     ExportWav {
         path: std::path::PathBuf,
         range: Option<(f64, f64)>,
-        /// Write the modulation-envelope sidecar (`.modenv`) next to the WAV.
-        /// Only the offline video render consumes it.
+        /// **オフラインの動画書き出しが差す sidecar 一式**を WAV の隣へ書くか。
+        ///
+        /// - `.modenv` — 変調エンベロープ
+        ///   ([`common::mod_sidecar::ModEnvSidecar`](crate::mod_sidecar::ModEnvSidecar))
+        /// - `.launcher` — ランチャーの走行状態の遷移列 (r.md #87)
+        ///   ([`common::launcher_sidecar::LauncherSidecar`](crate::launcher_sidecar::LauncherSidecar))
+        ///
+        /// どちらも「動画側は live の shmem 平面を読めない」という同じ理由で焼く。
+        /// 単体の WAV 書き出し / クリップ bounce は消費者が居ないので `false`。
+        /// (フィールド名は `.modenv` しか無かった頃のまま — GUI 側の呼び名を
+        /// 変えると 2 つの束が同時に触ることになるので、名前は据え置いてある)
         write_mod_sidecar: bool,
     },
     /// (r.md #54) 範囲のラウドネスをオフラインで解析する。`ExportWav` と
@@ -554,14 +563,22 @@ pub enum PluginCommand {
     /// 歌唱 bounce / 曲全体の WAV 書き出しの前に builtin VOICEVOX の合成完了を
     /// 要求する。 完了で `PluginEvent::VocalSynthReady` が返る。
     PrepareVocalSynth { device_id: u64 },
-    /// builtin VOICEVOX の合成順序ヒント。再生位置に近いフレーズから合成させる
-    /// (本家 `selectPriorPhrase`: 再生位置を含む → 後ろ → 前)。
+    /// builtin VOICEVOX の合成順序ヒント。ここに近いフレーズから合成させる
+    /// (本家 `selectPriorPhrase`: その位置を含む → 後ろ → 前)。
     ///
     /// **`SetBuiltinPluginNoteMetadata` に相乗りさせてはいけない** — あちらは
     /// daw_gui 側で `(bpm, chunk_secs, entries, talk)` の一致による再送デデュープが
     /// 掛かっており、playhead を比較に入れれば**トランスポートを動かすたびに再合成**、
     /// 入れなければ **playhead が永久に stale** になる。どちらも壊れているので、
     /// 合成をトリガしない専用の軽量メッセージにする。
+    ///
+    /// r.md #87: `playhead_beats` は **合成タイムラインの拍** —
+    /// [`crate::plugin_metadata::NoteMetadata::start_beat`] と同じ座標系で、
+    /// song の再生位置とは限らない。ランチャーのセルはアレンジの終端より後ろの
+    /// 仮想区間 (`cell_base_beat`) に置かれるので、song の playhead を送ると
+    /// **セルは常に最遠 = 最後**になり、撃っても当分歌わない。送り手
+    /// (`daw_gui::AppData::vocal_synth_priority_beat`) が「その行がいま何を
+    /// 鳴らす行か」で座標を選ぶ。 (名前は song の playhead を送っていた頃の名残)
     SetVocalSynthPriority { device_id: u64, playhead_beats: f64 },
     /// Load / replace the plugin instance for device `device_id` (安定 id、
     /// `Song.next_device_id` 採番)。 `generation` は per-device 単調増加の
@@ -1114,6 +1131,7 @@ mod tests {
                 lyric: "あ".to_string(),
                 clip_id: 5,
                 speaker_id: 3061,
+                cell_base_beat: 0.0,
             }],
             talk: vec![crate::plugin_metadata::TalkMetadata {
                 event_id: crate::plugin_metadata::talk_event_id(7, 0),
@@ -1125,6 +1143,7 @@ mod tests {
                 intonation_scale: 1.0,
                 volume_scale: 1.0,
                 clip_id: 7,
+                cell_base_beat: 0.0,
             }],
         };
         assert_eq!(roundtrip(&msg), msg);

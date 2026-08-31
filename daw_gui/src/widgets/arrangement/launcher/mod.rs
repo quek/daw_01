@@ -85,6 +85,18 @@ pub(super) const DEFAULT_COL_W: f32 = 96.0;
 pub(super) const MIN_COL_W: f32 = 36.0;
 pub(super) const MAX_COL_W: f32 = 400.0;
 
+/// 「両方」レイアウトが成立する最小の面幅 (px)。帯側は
+/// 「停止列 + 列 1 本 + 返す列 + つかみ代」で、アレンジ側にも同じ値を最低幅として要求する。
+///
+/// **これを下回る幅は「両方」ではなく端に吸着した状態**として扱う (`drag::emit_pane_width`)。
+/// そうしないと、スプリッタを端まで引く途中の「格子が 1 列も入らない幅」が
+/// `ui_prefs.launcher_width` に書き込まれ、`Tab` で「両方」へ戻したとき掴み代だけの帯が
+/// 出る = 計画書 Q5-b「『両方』の比率は覚えている」が成り立たない。
+/// [`layout::resolve_pane_w_raw`] も同じ下限で clamp するので、壊れた `ui_prefs` を
+/// 読み込んでも「両方」は必ず格子を描ける。
+pub(super) const MIN_BOTH_PANE_W: f32 =
+    STOP_COL_W + MIN_COL_W + RETURN_COL_W + PANE_SPLITTER_HANDLE;
+
 /// セル左端の ▶ (発火ボタン) の一辺 (px)。行が低いときは行高で頭打ちにする。
 pub(super) const LAUNCH_BTN_W: f32 = 14.0;
 
@@ -154,6 +166,18 @@ impl LauncherCellKey {
     #[must_use]
     pub fn is_empty(self) -> bool {
         self.clip_id == 0
+    }
+
+    /// 選択集合が使う **モデル側の鍵** ([`crate::event_launcher::LauncherCellKey`])。
+    /// 空セル (`clip_id == 0`) は選択できないので `None`。
+    #[must_use]
+    pub(super) fn model_key(self) -> Option<crate::event_launcher::LauncherCellKey> {
+        use crate::event_launcher::LauncherCellKey as Model;
+        if let Some(k) = self.clip_key() {
+            return Some(Model::Track(k));
+        }
+        // widget 層の `AutomationClipKey` はモデルと別型なので既存の変換を通す。
+        self.automation_clip_key().map(|k| Model::Lane(widget_to_model_clip_key(k)))
     }
 }
 
@@ -268,7 +292,21 @@ pub struct LauncherResponse {
     /// 各セルの rect (描画順 = 上から下・左から右)。 caller が `context_menu_for` /
     /// inline rename overlay を重ねる用 (`clip_rects` と同 semantics)。
     /// **空セル / プレースホルダ列も含む** (右クリックで「セルを作る」を出せるように)。
+    ///
+    /// **格子 ([`Self::grid_rect`]) でクリップ済** — 部分表示の列 / 行の rect が
+    /// 「アレンジへ返す」ボタンやシーン見出しの上まで伸びない。
+    /// **セルを所有できない行 (マスター行 / グループ行) は入らない**
+    /// (`layout::row_takes_cells`。落とし先の除外と同じ 1 本を通す)。
     pub cell_rects: Vec<(LauncherCellKey, Rect)>,
+    /// 帯に積んだ **全部の行** の y 帯 (`(row, 格子でクリップ済 rect)`、描画順)。
+    ///
+    /// `cell_rects` と違い **セルを置けない行 (マスター行 / グループ行 /
+    /// テンポ・拍子レーン行) も入る**。 caller (ファイル drop の落とし先解決) が
+    /// 「行が 1 つも無い下の余白」と「セルを置けない行」を区別するのに要る —
+    /// 潰すと、グループ行へ落としたファイルが「一番下に新トラックを作る」に化ける
+    /// (`cell_rects` はセルの上下インセットで行間に 4px の隙間も空くので、
+    /// 行と行の境目に落としただけで同じ事故になる)。
+    pub row_bands: Vec<(ArrangementRowKey, Rect)>,
     /// シーン見出しの rect (`(scene_id, 表示順 index, rect)`)。
     /// **プレースホルダ列 (`scene_id == 0`) も含む** — 右クリックで
     /// 「ここに列を作る」を出すために index が要る。
@@ -290,6 +328,7 @@ impl Default for LauncherResponse {
             pane_rect: ZERO_RECT,
             grid_rect: ZERO_RECT,
             cell_rects: Vec::new(),
+            row_bands: Vec::new(),
             scene_rects: Vec::new(),
             col_w: DEFAULT_COL_W,
             scroll_scene: 0.0,
@@ -337,6 +376,24 @@ pub(super) struct LauncherRowView {
     pub armed: bool,
     /// 子を持つトラック行 (= グループ)。まとめセルを描く。
     pub group: bool,
+    /// この行を **ランチャーが握れるか** (= engine が行として登録するか)。
+    ///
+    /// `false` はマスターのトラック行とテンポ / 拍子レーン行
+    /// ([`AutomationTarget::accepts_launcher_cells`](common::model::AutomationTarget::accepts_launcher_cells)
+    /// が SSoT)。 判定を GUI 側にも持たせるのは同 doc の契約 —
+    /// **GUI が描かない / 落とせない / 作れない**ようにしないと、engine が無視する
+    /// セルを置けてしまい「保存はされるのに永久に鳴らない」形で残る。
+    ///
+    /// **グループ行は `true`** (まとめセルを押すと子行を一斉に撃つ) — 「押せるか」と
+    /// 「自分のセルを持てるか」は別の問いなので、後者は [`Self::takes_cells`]。
+    pub launchable: bool,
+    /// この行が **自分のセルを所有できる**か (落とし先 / 作成 / 編集 / rect の対象)。
+    ///
+    /// 値は model 側の
+    /// [`row_accepts_cells`](crate::handler::launcher_cells::row_accepts_cells) を
+    /// そのまま写す。**帯が独自の式を持たない**のが肝で、持たせると
+    /// 「置く口 (handler) は弾くのに、落とし先 (widget) は受け付ける」がいつか作れる。
+    pub takes_cells: bool,
     /// 列 id → セル。空セルはキーが無い。
     pub cells: HashMap<u32, LauncherCellView>,
 }
@@ -415,6 +472,15 @@ pub(super) struct LauncherView {
     pub progress: HashMap<ArrangementRowKey, f32>,
     /// 量子化境界待ちの予約 (行 → 予約)。engine が publish するまで空。
     pub queued: HashMap<ArrangementRowKey, QueuedView>,
+    /// **セル面の選択** (`SelectionState::selected_launcher_cells` の写し)。
+    ///
+    /// 帯の選択はアレンジのクリップ選択と **別の面**なので、`ArrangementFrame`
+    /// の `selected_clips` / `selected_automation_clips` に混ぜない
+    /// ([`LauncherSceneView::selected`] と同じ流儀)。混ぜると「アレンジに選択が
+    /// あるか」を見ている側 (空きレーンの短 click / 四角ドラッグの `prev`) が
+    /// 帯のセルを数えてしまい、四角ドラッグの Shift 追加では**セルの key が
+    /// アレンジの automation クリップ選択へ流れ込む**。
+    pub selected: Vec<crate::event_launcher::LauncherCellKey>,
 }
 
 /// 「押したがまだ鳴っていない」行の予約 ([`LauncherView::queued`])。

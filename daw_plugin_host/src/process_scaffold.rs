@@ -115,16 +115,23 @@ fn sanitize_pos(v: f64) -> f64 {
 /// VST3 は `ProcessContext` へ写像する。**両 format とも非有限 sanitize 済み
 /// の値だけを見る** (旧実装は CLAP のみ sanitize し VST3 は
 /// `projectTimeMusic` を無検査で渡す非対称だった)。
+///
+/// r.md #87: ここに載る拍は **plugin が載っている行の musical time**
+/// ([`TransportContext::row`]) であって曲全体の位置ではない。ランチャーが
+/// 行の主導権を握っている間、その行のテンポ同期ディレイ / LFO / アルペジエータは
+/// セルの拍で動く (= 聞こえているセルとグリッドが揃う)。アレンジ主導の行では
+/// 両者が一致するので、ランチャーを使わない曲の挙動は従来と同一。
 #[derive(Debug, Clone, Copy)]
 pub struct TransportBlock {
     pub bpm: f64,
-    /// 曲頭からの拍位置 (sanitized)。
-    pub song_pos_beats: f64,
-    /// 曲頭からの秒位置 (= beats × 60 / bpm、sanitized)。engine は
+    /// この行のタイムライン上の拍位置 (sanitized)。CLAP
+    /// `clap_event_transport.song_pos_beats` / VST3 `projectTimeMusic` へ入る。
+    pub pos_beats: f64,
+    /// 同じ位置の秒表現 (= beats × 60 / bpm、sanitized)。engine は
     /// `steady_time` を設定しないので sample 由来の秒は使えない。
-    pub song_pos_seconds: f64,
-    /// 曲頭からの sample 位置 (= seconds × sample_rate、非負)。
-    pub song_pos_samples: i64,
+    pub pos_seconds: f64,
+    /// 同じ位置の sample 表現 (= seconds × sample_rate、非負)。
+    pub pos_samples: i64,
     /// 現在の小節 index (floor(beats / tsig_num))。
     pub bar_number: f64,
     /// 小節頭の拍位置。
@@ -142,25 +149,28 @@ impl TransportBlock {
     /// `sample_rate` は backend の activate 時レート (Hz)。
     pub fn derive(t: &TransportContext, sample_rate: f64) -> Self {
         let bpm = f64::from(t.bpm).max(1.0);
-        let song_pos_beats = sanitize_pos(t.song_pos_beats);
-        let song_pos_seconds = sanitize_pos(song_pos_beats * 60.0 / bpm);
-        let song_pos_samples = (song_pos_seconds * sample_rate.max(0.0)).max(0.0) as i64;
+        // r.md #87: 位置もループも「この行の時間軸」から 1 度に取る
+        // (アレンジ主導の行 / ARA では曲の値と同値)。
+        let tl = t.plugin_timeline();
+        let pos_beats = sanitize_pos(tl.pos_beats);
+        let pos_seconds = sanitize_pos(pos_beats * 60.0 / bpm);
+        let pos_samples = (pos_seconds * sample_rate.max(0.0)).max(0.0) as i64;
         let tsig_num = t.tsig_num.max(1);
-        let bar_number = (song_pos_beats / f64::from(tsig_num)).floor();
+        let bar_number = (pos_beats / f64::from(tsig_num)).floor();
         let bar_start_beats = bar_number * f64::from(tsig_num);
-        let loop_start_beats = sanitize_pos(t.loop_start_beats);
-        let loop_end_beats = sanitize_pos(t.loop_end_beats);
+        let loop_start_beats = sanitize_pos(tl.loop_start_beats);
+        let loop_end_beats = sanitize_pos(tl.loop_end_beats);
         Self {
             bpm,
-            song_pos_beats,
-            song_pos_seconds,
-            song_pos_samples,
+            pos_beats,
+            pos_seconds,
+            pos_samples,
             bar_number,
             bar_start_beats,
             tsig_num,
             tsig_denom: t.tsig_denom.max(1),
             is_playing: t.is_playing,
-            cycle_active: t.is_looping && loop_end_beats > loop_start_beats,
+            cycle_active: tl.is_looping && loop_end_beats > loop_start_beats,
             loop_start_beats,
             loop_end_beats,
         }
@@ -208,33 +218,71 @@ mod tests {
             is_looping: false,
             loop_start_beats: 0.0,
             loop_end_beats: 0.0,
+            // アレンジ主導の行 = 行の実効拍は song 拍と同値 (engine の写像)。
+            row: common::process_data::RowTransport {
+                pos_beats: 999.0,
+                ..Default::default()
+            },
+            pin_to_song: false,
         }
     }
 
     #[test]
     fn transport_block_derives_seconds_and_bars_from_beats() {
         let b = TransportBlock::derive(&ctx(), 48_000.0);
-        assert_eq!(b.song_pos_beats, 999.0);
+        assert_eq!(b.pos_beats, 999.0);
         // 999 拍 ÷ (120bpm/60) = 499.5 秒。
-        assert!((b.song_pos_seconds - 499.5).abs() < 1e-9);
-        assert_eq!(b.song_pos_samples, (499.5 * 48_000.0) as i64);
+        assert!((b.pos_seconds - 499.5).abs() < 1e-9);
+        assert_eq!(b.pos_samples, (499.5 * 48_000.0) as i64);
         // 999 / 4 = 249.75 → bar 249、小節頭 = 996 拍。
         assert_eq!(b.bar_number, 249.0);
         assert_eq!(b.bar_start_beats, 996.0);
         assert!(!b.cycle_active);
     }
 
+    /// r.md #87: ランチャーで撃った行の plugin は **セルの窓**で動く。位置だけ
+    /// 行に切り替えて曲のループ区間を名乗ると「拍がループの外を回っている」
+    /// 不整合になるので、位置とループを 1 つの timeline から取ることを固定する。
+    #[test]
+    fn a_launched_cell_row_uses_the_cell_window_not_the_song_loop() {
+        let mut c = ctx();
+        // 曲のループは 4..8 拍で on。
+        c.loop_start_beats = 4.0;
+        c.loop_end_beats = 8.0;
+        c.is_looping = true;
+        // 行は 2 拍長のセルを鳴らしていて、いまセル内 0.5 拍。
+        c.row = common::process_data::RowTransport {
+            pos_beats: 0.5,
+            loop_start_beats: 0.0,
+            loop_end_beats: 2.0,
+            cell_clip_id: 7,
+            ..Default::default()
+        };
+        let b = TransportBlock::derive(&c, 48_000.0);
+        assert_eq!(b.pos_beats, 0.5);
+        assert_eq!(b.loop_start_beats, 0.0);
+        assert_eq!(b.loop_end_beats, 2.0);
+        assert!(b.cycle_active);
+
+        // ARA を bind した instance は曲の時間軸に固定 (playback region が song 時間)。
+        c.pin_to_song = true;
+        let b = TransportBlock::derive(&c, 48_000.0);
+        assert_eq!(b.pos_beats, 999.0);
+        assert_eq!(b.loop_start_beats, 4.0);
+        assert_eq!(b.loop_end_beats, 8.0);
+    }
+
     /// 非有限 sanitize は CLAP / VST3 共通でここ一箇所 (旧 VST3 は未検査)。
     #[test]
     fn transport_block_sanitizes_non_finite() {
         let mut c = ctx();
-        c.song_pos_beats = f64::NAN;
+        c.row.pos_beats = f64::NAN;
         c.loop_start_beats = f64::INFINITY;
         c.is_looping = true;
         let b = TransportBlock::derive(&c, 48_000.0);
-        assert_eq!(b.song_pos_beats, 0.0);
-        assert_eq!(b.song_pos_seconds, 0.0);
-        assert_eq!(b.song_pos_samples, 0);
+        assert_eq!(b.pos_beats, 0.0);
+        assert_eq!(b.pos_seconds, 0.0);
+        assert_eq!(b.pos_samples, 0);
         assert_eq!(b.loop_start_beats, 0.0);
         assert!(!b.cycle_active, "inf loop range must not activate cycle");
     }

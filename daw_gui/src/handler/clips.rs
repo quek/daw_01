@@ -417,34 +417,20 @@ impl AppData {
         self.select_track(r.track_id);
     }
 
-    /// ランチャー (セッション) のセルを削除する。
+    /// ランチャー (セッション) のセルを削除する (`Delete` / `Ctrl+X`)。
     ///
     /// アレンジのクリップは**範囲操作**で消える (`apply_delete_time_selection`)。
     /// セルはグリッドに時間軸が無く範囲では表せないので、唯一のオブジェクト選択
     /// (`selected_launcher_cells`) をそのまま対象にする。
+    ///
+    /// 実処理は [`AppData::delete_launcher_cells`] 1 本へ委譲する — トラック行の
+    /// セルとレーン行のセルで消し方が割れていると、両方を選んだ `Delete` が
+    /// 片方しか消さない (以前はここがトラック行のセルしか見ていなかった)。
+    /// 対象面の解決は呼び側が済ませている前提なので、ここでは面タグを見ない
+    /// [`AppData::live_launcher_cells`] を使う。
     pub(crate) fn delete_selected_clip(&mut self) {
-        if self.selection.selected_launcher_cells.is_empty() {
-            return;
-        }
-        // 住所は安定 id 1 本なので、アレンジのクリップも**ランチャーのセル**も
-        // 同じループで消える (`Track::remove_clip_by_id` がどちらの Vec に居るかを
-        // 解決する)。index 時代に必要だった「高 index から消して詰まりを避ける」
-        // 儀式も、セル専用の第 2 ループも要らない。
-        let targets: Vec<ClipKey> = self.selection.selected_launcher_cells.clone();
-        self.edit_song(|song| {
-            let mut removed_cell = false;
-            for target in &targets {
-                if let Some(track) = song.track_by_id_mut(target.track_id) {
-                    removed_cell |= track.remove_clip_by_id(target.clip_id).is_some_and(|r| r.1);
-                }
-            }
-            if removed_cell {
-                // 鳴っていたセルが消えた行を `LauncherStopped` へ落とす (冪等)。
-                song.normalize_session();
-            }
-        });
-        self.selection.selected_launcher_cells.clear();
-        self.selection.launcher_cell_anchor = None;
+        let cells = self.live_launcher_cells();
+        self.delete_launcher_cells(&cells);
     }
 
     /// Split clip(s) at the cursor (= mouse hover beat).
