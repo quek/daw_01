@@ -180,25 +180,32 @@ pub fn build_plan(
         }
     }
 
-    // 3. 輪に属するノードを塗る (back-edge の両端から到達可能な範囲)。
+    // 3. 輪に属するノードを塗る。
+    //
+    // back-edge `(dst, src)` は「`src` が `dst` を変調し、かつ `dst` から辿ると
+    // `src` に戻る」= 輪 `dst ⟶ … ⟶ src ⟶ dst` を意味する。輪に載るのは
+    // **dst から流れが届き、かつ src へ流れが届く**ノード。
+    //
+    // `adj` は **入力辺** (`adj[x]` = x を変調するノード) なので向きが逆になる:
+    // 「dst から v へ流れる」= `reaches(v, dst)`、「v から src へ流れる」=
+    // `v` が `src` の上流 = `reaches(src, v)` ではなく src から adj を辿って v に届くこと。
     let mut in_cycle = vec![false; n];
     for &(dst, src) in &back_edges {
-        in_cycle[dst] = true;
-        in_cycle[src] = true;
-        // src から dst へ辿れる経路上のノードも輪の一部。
-        let mut seen = vec![false; n];
-        let mut stack = vec![dst];
+        // src の上流 (= src へ流れ込む全ノード)。dst も必ず含む。
+        let mut upstream_of_src = vec![false; n];
+        upstream_of_src[src] = true;
+        let mut stack = vec![src];
         while let Some(v) = stack.pop() {
             for &(u, ..) in &adj[v] {
-                if !seen[u] {
-                    seen[u] = true;
+                if !upstream_of_src[u] {
+                    upstream_of_src[u] = true;
                     stack.push(u);
                 }
             }
         }
-        for (i, &s) in seen.iter().enumerate() {
-            if s && reaches(&adj, i, src) {
-                in_cycle[i] = true;
+        for (v, &up) in upstream_of_src.iter().enumerate() {
+            if up && reaches(&adj, v, dst) {
+                in_cycle[v] = true;
             }
         }
     }
@@ -921,6 +928,39 @@ mod tests {
                 assert_eq!(rt.value(0), closed, "rate={rate:?} tick={k}");
             }
         }
+    }
+
+    /// 3 ノードの輪 (1→2→3→1) で **中間ノードにも** ⟳ 印が立ち、輪の外側
+    /// (輪の下流にぶら下がっているだけ) には立たないこと。
+    #[test]
+    fn 輪の中間ノードにも印が立つ() {
+        let edge = |id, from, to| ModRouting {
+            id,
+            target: AutomationTarget::ModSourceParam { source_id: to, param: ModParam::Rate },
+            source_id: from,
+            depth: 0.2,
+            polarity: Polarity::Bipolar,
+        };
+        let song = song_with(
+            vec![
+                lfo_source(1, quarter()),
+                lfo_source(2, quarter()),
+                lfo_source(3, quarter()),
+                // 輪の外側に 1 本ぶら下げる (こちらには印が立たないこと)。
+                lfo_source(4, quarter()),
+            ],
+            vec![edge(1, 1, 2), edge(2, 2, 3), edge(3, 3, 1), edge(4, 3, 4)],
+        );
+        let plan = build_plan(&song, 1, |_| 0.0);
+        for id in [1u32, 2, 3] {
+            let slot = plan.slot_of(id).unwrap();
+            assert!(plan.nodes[usize::from(slot)].in_cycle, "id={id} は輪の一部");
+        }
+        let outside = plan.slot_of(4).unwrap();
+        assert!(
+            !plan.nodes[usize::from(outside)].in_cycle,
+            "輪の下流にぶら下がっているだけのノードには印を立てない"
+        );
     }
 
     /// 設計正本 §8-3: 輪は back-edge が 1 刻み遅延で開き、両端に `in_cycle` が立つ。
