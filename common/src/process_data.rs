@@ -14,6 +14,17 @@
 pub const MAX_FRAMES: usize = 1024;
 pub const MAX_CHANNELS: usize = 2;
 pub const MAX_EVENTS: usize = 256;
+/// r.md #89 (`docs/plan_rmd_88_89_cross_modulation.md` §2.2): capacity of the
+/// **dedicated** parameter-modulation array.
+///
+/// 変調は 1 buffer 1 発ではなく制御グリッド (64 サンプル刻み = 1024 frame buffer で
+/// 最大 16 刻み) × 変調中の param 数ぶん出る。これを `events_in` (`MAX_EVENTS` = 256)
+/// に相乗りさせていると、溢れたぶんが黙って捨てられる先に**ノートが並んでいる** —
+/// 変調が NoteOff を押し出してハングノートになる。専用配列に分けて、その事故を
+/// 構造的に起こせなくする。
+///
+/// 容量は 16 刻み × 64 param。1 件 16 バイトなので 16 KB / plugin instance。
+pub const MAX_PARAM_MODS: usize = 1024;
 /// PR4 sidechain: how many `is_main=false` aux input ports per plugin
 /// the host reserves shmem for. 1 covers the typical "single sidechain
 /// trigger" use case (compressor / gate / ducker); we allocate one
@@ -49,6 +60,19 @@ pub struct ProcessData {
     pub events_in: [Event; MAX_EVENTS],
     pub n_events_out: u32,
     pub events_out: [Event; MAX_EVENTS],
+
+    /// r.md #89: **lane 非依存モジュレーション専用**の配列 (`events_in` とは別枠)。
+    /// 有効なのは [`ProcessData::param_mods_iter`] が返す `n_param_mods` 件で、
+    /// `param_mods_head` から始まるリングとして並ぶ。
+    pub param_mods: [ParamMod; MAX_PARAM_MODS],
+    /// 有効件数 (`<= MAX_PARAM_MODS`)。
+    pub n_param_mods: u32,
+    /// リングの先頭 (= 最も古い有効要素) の index。溢れていなければ `0`。
+    pub param_mods_head: u32,
+    /// 溢れて捨てた件数 (この buffer 内)。`prepare()` で 0 に戻る。
+    /// 0 以外なら制御グリッドの前半が落ちている (最新は残る)。
+    pub param_mods_dropped: u32,
+    pub _pad_param_mods: [u8; 4],
 
     /// Planar f32 input audio (channel × frame).
     pub buffer_in: [[f32; MAX_FRAMES]; MAX_CHANNELS],
@@ -222,14 +246,33 @@ pub enum EventKind {
     /// daw's parameter domain (plugin host converts per-format to CLAP plain /
     /// VST3 normalized).
     ParamValue = 3,
-    /// **lane 非依存モジュレーション** (`docs/plan_modulation_routing_redesign.md`
-    /// §3.2): a *normalized* (`-1..=1`) modulation offset for `param_id`. The
-    /// plugin host applies it per-format — CLAP modulatable params get a
-    /// non-destructive `clap_event_param_mod` (`amount = value·(max−min)`),
-    /// other params have it folded into the absolute value the host sends.
-    /// `value` carries the offset.
-    ParamMod = 4,
 }
+
+/// **lane 非依存モジュレーション** 1 件
+/// (`docs/plan_modulation_routing_redesign.md` §3.2 /
+/// `docs/plan_rmd_88_89_cross_modulation.md` §2.2)。
+///
+/// `value` は正規化 (`-1..=1`) オフセット。plugin host が per-format に適用する
+/// — CLAP の modulatable param には非破壊の `clap_event_param_mod`
+/// (`amount = value·(max−min)`)、それ以外は絶対値へ畳み込む。
+///
+/// `events_in` の [`Event`] と分けてあるのは容量の共有を断つため
+/// ([`MAX_PARAM_MODS`] の doc)。
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ParamMod {
+    /// Frame offset within the buffer (`< frames`).
+    pub time: u32,
+    pub param_id: u32,
+    /// Normalized (`-1..=1`) offset.
+    pub value: f64,
+}
+
+const EMPTY_PARAM_MOD: ParamMod = ParamMod {
+    time: 0,
+    param_id: 0,
+    value: 0.0,
+};
 
 impl ProcessData {
     pub const fn empty() -> Self {
@@ -243,6 +286,11 @@ impl ProcessData {
             events_in: [EMPTY_EVENT; MAX_EVENTS],
             n_events_out: 0,
             events_out: [EMPTY_EVENT; MAX_EVENTS],
+            param_mods: [EMPTY_PARAM_MOD; MAX_PARAM_MODS],
+            n_param_mods: 0,
+            param_mods_head: 0,
+            param_mods_dropped: 0,
+            _pad_param_mods: [0; 4],
             buffer_in: [[0.0; MAX_FRAMES]; MAX_CHANNELS],
             buffer_out: [[0.0; MAX_FRAMES]; MAX_CHANNELS],
             buffer_aux_in: [[[0.0; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_IN],
@@ -275,6 +323,9 @@ impl ProcessData {
     pub fn prepare(&mut self) {
         self.n_events_in = 0;
         self.n_events_out = 0;
+        self.n_param_mods = 0;
+        self.param_mods_head = 0;
+        self.param_mods_dropped = 0;
     }
 
     /// Push a NoteOn into `events_in`. Silently truncates if the buffer is
@@ -350,29 +401,54 @@ impl ProcessData {
         self.n_events_in += 1;
     }
 
-    /// Push a **normalized modulation offset** for `param_id`
-    /// (`docs/plan_modulation_routing_redesign.md` §3.2). `offset_norm` is in
-    /// the `-1..=1` normalized domain; the plugin host converts it per-format
+    /// Push a **normalized modulation offset** for `param_id` into the
+    /// dedicated [`ProcessData::param_mods`] array
+    /// (`docs/plan_modulation_routing_redesign.md` §3.2 /
+    /// `docs/plan_rmd_88_89_cross_modulation.md` §2.2). `offset_norm` is in the
+    /// `-1..=1` normalized domain; the plugin host converts it per-format
     /// (CLAP `param_mod` for modulatable params, else folded into the absolute
-    /// value). Same RT-safe truncation contract as `push_param`.
+    /// value).
+    ///
+    /// 溢れたときは **最も古い 1 件を捨てて最新を入れる** (先頭を進めるだけの
+    /// O(1)。捨てるのは古い側 = 制御グリッドの前半で、buffer 末に効く最新の
+    /// offset は必ず残る)。黙って**新しい方**を捨てると解除されない mod offset が
+    /// 居座るので、向きはこちらでなければならない。
+    ///
+    /// RT 安全: 固定長配列への書き込みのみ (確保・ロック無し)。
     pub fn push_param_mod(&mut self, time: u32, param_id: u32, offset_norm: f64) {
-        let i = self.n_events_in as usize;
-        if i >= MAX_EVENTS {
-            return;
-        }
-        self.events_in[i] = Event {
-            kind: EventKind::ParamMod,
-            _pad: [0; 3],
+        let n = self.n_param_mods as usize;
+        let head = self.param_mods_head as usize % MAX_PARAM_MODS;
+        let slot = if n < MAX_PARAM_MODS {
+            self.n_param_mods += 1;
+            (head + n) % MAX_PARAM_MODS
+        } else {
+            #[cfg(debug_assertions)]
+            if self.param_mods_dropped == 0 {
+                tracing::warn!(
+                    param_id,
+                    cap = MAX_PARAM_MODS,
+                    "param_mods が溢れた (古い側を捨てる)"
+                );
+            }
+            self.param_mods_dropped = self.param_mods_dropped.saturating_add(1);
+            self.param_mods_head = ((head + 1) % MAX_PARAM_MODS) as u32;
+            head
+        };
+        self.param_mods[slot] = ParamMod {
             time,
-            key: 0,
-            channel: 0,
-            _pad1: [0; 2],
-            velocity: 0.0,
             param_id,
-            note_id: 0,
             value: offset_norm,
         };
-        self.n_events_in += 1;
+    }
+
+    /// 積んだ順 (= `time` 昇順) に param modulation を読む。
+    ///
+    /// shmem 越しに届いた `n_param_mods` / `param_mods_head` は信頼境界の外なので
+    /// ここで clamp する (`process_server` が `frames` を clamp するのと同じ規約)。
+    pub fn param_mods_iter(&self) -> impl Iterator<Item = &ParamMod> + '_ {
+        let head = self.param_mods_head as usize % MAX_PARAM_MODS;
+        let n = (self.n_param_mods as usize).min(MAX_PARAM_MODS);
+        (0..n).map(move |i| &self.param_mods[(head + i) % MAX_PARAM_MODS])
     }
 }
 
@@ -429,3 +505,46 @@ mod shmem_handle {
 
 #[cfg(windows)]
 pub use shmem_handle::ProcessDataHandle;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r.md #89: **溢れたら古い側が落ち、最新は必ず残る。**
+    /// 逆向き (新しい方を捨てる) だと、変調が 0 に戻る最後の offset が届かず
+    /// 解除されない mod がパラメータに居座る。
+    #[test]
+    fn param_mods_が溢れたら古い側から捨てる() {
+        let mut pd = ProcessData::empty();
+        pd.prepare();
+        // 容量 +3 件積む。
+        for i in 0..(MAX_PARAM_MODS + 3) {
+            pd.push_param_mod(i as u32, 1, i as f64);
+        }
+        assert_eq!(pd.n_param_mods as usize, MAX_PARAM_MODS);
+        assert_eq!(pd.param_mods_dropped, 3);
+        let got: Vec<f64> = pd.param_mods_iter().map(|m| m.value).collect();
+        assert_eq!(got.len(), MAX_PARAM_MODS);
+        // 先頭は 3 件ぶん進み、末尾は最後に積んだもの。
+        assert_eq!(got[0], 3.0);
+        assert_eq!(got[MAX_PARAM_MODS - 1], (MAX_PARAM_MODS + 2) as f64);
+        // prepare() でリングごと巻き戻る (次 buffer に持ち越さない)。
+        pd.prepare();
+        assert_eq!(pd.param_mods_iter().count(), 0);
+        assert_eq!(pd.param_mods_head, 0);
+    }
+
+    /// 変調をいくら積んでも `events_in` (ノート枠) を食わない
+    /// — 分離したことの唯一の目的。
+    #[test]
+    fn param_mods_は_events_in_を消費しない() {
+        let mut pd = ProcessData::empty();
+        pd.prepare();
+        for i in 0..MAX_PARAM_MODS {
+            pd.push_param_mod(0, i as u32, 0.5);
+        }
+        assert_eq!(pd.n_events_in, 0);
+        pd.push_note_on(0, 60, 1.0, 0, 1);
+        assert_eq!(pd.n_events_in, 1);
+    }
+}

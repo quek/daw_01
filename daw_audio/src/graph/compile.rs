@@ -577,16 +577,17 @@ pub fn compile_schedule(
     // docs/plan_modulation.md §3/§5: per-`ModSource` envelope follower.
     // Emit `EnvelopeFollow` at the very end of the (post-PDC) schedule — all
     // scratches are settled and the follower only produces a control-rate
-    // scalar (no audio feedback, so no ordering / cycle constraint). `slot` =
-    // the source's index in `Song::mod_sources` (capped at MAX_MOD_SOURCES);
-    // it indexes both `follower_slots` and `AudioBridge::mod_scalars`.
+    // scalar (no audio feedback, so no ordering / cycle constraint).
     // Coefficients are baked here (recompile-time) so the RT path never
-    // derives them (§10).
-    // `follower_slots` は全 `ModSource` と 1:1 (slot 順 = source 位置 =
-    // `AudioBridge::mod_scalars` index)。envelope follower の slot は EnvelopeFollow
-    // node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の slot は inert
-    // で、 engine が `common::modulators::generator_scalar` を `song_beat` から評価して
-    // publish する (`mod_kinds` を保持)。
+    // derives them (§10)。
+    //
+    // `slot` は **schedule の内部 index** で、`follower_slots` / `follower_keys` /
+    // `mod_kinds` の 3 本が同じ並び。外へ出る値 (GUI へ publish する面 / sidecar) は
+    // `follower_keys[slot]` = `ModSource::id` を組にして運ぶ
+    // (`crate::mod_tick::eval_plane`、アーキ不変条件 1)。envelope follower の slot は
+    // EnvelopeFollow node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の
+    // slot は inert で、engine が `common::modulators::generator_scalar` を刻みの
+    // song 位置から評価して載せる (`mod_kinds` を保持)。
     let mut follower_slots: Vec<super::follower::FollowerSlot> = Vec::new();
     let mut follower_keys: Vec<u32> = Vec::new();
     let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();

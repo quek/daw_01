@@ -423,8 +423,8 @@ pub enum InspectorScrubField {
 pub struct ModSourceRow {
     pub id: u32,
     pub color: [f32; 3],
-    /// Live scalar (`0..=1`) from the polled `mod_scalars` plane — follower env
-    /// または generator 値 (engine が全種別を publish)。
+    /// Live scalar (`0..=1`)。engine が publish した変調値面から **`id` で**
+    /// 引いた実測値 — follower env または generator 値 (engine が全種別を publish)。
     pub scalar: f32,
     /// 変調器種別 + 設定。follower の tap_point (PreFx/PostFx/PostFader、
     /// docs/plan_modulation_followups.md §1) は `EnvelopeFollower { tap }` 内に内包。

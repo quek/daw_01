@@ -86,7 +86,7 @@ compose / `fill_track_param_ramps` が base（lane or モデル値）に乗せ�
 調査で確定したアーキテクチャ:
 - **daw_audio は format 非依存**。plugin param の変調を **正規化オフセット 1 個**
   `offset_norm = Σ depth·polarity·scalar`（depth が既に正規化領域なので min/max 不要）に畳んで
-  `EventKind::ParamMod(param_id, offset_norm)` で送る。**lane が無くても** Track.mod_routings に
+  `push_param_mod(time, param_id, offset_norm)` で送る。**lane が無くても** Track.mod_routings に
   plugin param target があれば emit（= lane-free）。lane があれば従来 PARAM_VALUE(base) も従来通り emit。
 - **plugin_host が per-format に変換**（`PluginParamInfo` の min/max/modulatable を所有）:
   - **CLAP modulatable**: `clap_event_param_mod{ amount = offset_norm·(max−min), PCKN 全 -1 }`。
@@ -117,18 +117,19 @@ compose / `fill_track_param_ramps` が base（lane or モデル値）に乗せ�
 
 ## 5. IPC / shmem 改修
 
-現状 `process_data.rs` の `EventKind` は `NoteOn/NoteOff/ParamValue`。**`ParamMod` を追加**:
+変調は `ProcessData::param_mods`（`events_in` とは別枠の専用配列）で運ぶ。器と溢れ規約の
+SSoT は `common/src/process_data.rs`（[plan_rmd_88_89_cross_modulation.md](plan_rmd_88_89_cross_modulation.md) §2.2）。
 
-```rust
-pub enum EventKind { NoteOn=1, NoteOff=2, ParamValue=3, ParamMod=4 }  // ParamMod: value = offset_norm (正規化オフセット)
-```
+> 旧: `EventKind::ParamMod = 4` を `events_in` に相乗りさせていた。制御グリッド化で
+> ノート枠を押し出す事故が起きるため r.md #89 で撤去済み。
 
 - 音声側（**format 非依存**）:
   - 非プラグイン → §3.1（engine 内で完結、IPC 不要）。
   - plugin param に変調があれば `push_param_mod(time, param_id, offset_norm)`（**lane 有無問わず** =
     Track.mod_routings を走査）。lane があれば従来 `push_param(time, param_id, base)` も従来通り emit。
-- plugin_host: `TimedParamEvent` に種別（value/mod）を持たせ、`EventKind::ParamMod` を per-format 変換
-  （§3.2）。CLAP modulatable は `clap_event_param_mod`、それ以外は base⊕offset を合成して既存 value 経路へ。
+- plugin_host: `TimedParamEvent` に種別（value/mod）を持たせ、`ProcessData::param_mods_iter()` を
+  per-format 変換（§3.2）。CLAP modulatable は `clap_event_param_mod`、それ以外は base⊕offset を
+  合成して既存 value 経路へ。
 - protocol/shmem 型変更 → `cargo build --workspace`（`feedback_workspace_build_for_protocol_changes`）。
 
 ## 6. UI — Bitwig 風 widget レベル modulation（最終形）
@@ -168,11 +169,11 @@ per-param に depth 入力を継ぎ足すのは SSoT 分裂 + interim（`feedbac
    base = lane があれば `lane_value_at`、無ければモデル現在値。
 3. **非プラグイン配線**: image/text/group compose + `fill_track_param_ramps` を「モデル base ⊕ mod」へ
    （Track.mod_routings から、**lane 無しでも変調**）。
-4. **IPC**: `EventKind::ParamMod` + `push_param_mod` + `TimedParamEvent` に種別（value/mod）。`cargo build --workspace`。
-5. **daw_audio**: `fill_pd_param_events` が plugin param の `offset_norm` を `ParamMod` で emit
+4. **IPC**: `ProcessData::param_mods` + `push_param_mod` + `TimedParamEvent` に種別（value/mod）。`make build`。
+5. **daw_audio**: `fill_pd_param_events` が plugin param の `offset_norm` を `param_mods` へ emit
    （**Track.mod_routings 走査、lane 有無問わず**）。lane があれば base を従来 `push_param`。
 6. **plugin_host**: load 時に `PluginParamInfo`(min/max/modulatable) を cache + last-set 値 cache を新設。
-   `process()` で `ParamMod` を per-format 変換（CLAP modulatable=`clap_event_param_mod`、それ以外=合成）。
+   `process()` で param modulation を per-format 変換（CLAP modulatable=`clap_event_param_mod`、それ以外=合成）。
 7. **(UI polish 任意)** critique #5: daw_gui の plugin-param `plain_to_norm`/curve 表示を `plugin_params`
    cache の min/max で正す（変調はブロックしないが inspector 表示の正確性向上）。
 8. **source 色 + arm 状態**: `Song.mod_sources[*].color` 割当、arm（割当モード）state を daw に追加。

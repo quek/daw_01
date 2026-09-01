@@ -188,7 +188,7 @@ impl AppData {
                 panic_release_pending: false,
                 master_meter: crate::master_meter::MasterMeterSnapshot::default(),
                 track_peak_display: initial_peak_display,
-                mod_scalars: Vec::new(),
+                mod_plane: common::mod_plane::ModPlane::default(),
                 pending_play: false,
                 pending_play_record: None,
                 export_stage: None,
@@ -1623,11 +1623,11 @@ impl AppData {
             AppEvent::ToggleResourcePanel => {
                 self.ui_ephemeral.resource_panel_open = !self.ui_ephemeral.resource_panel_open;
             }
-            AppEvent::ModScalarsTick(scalars) => {
-                // docs/plan_modulation.md §4.2: snapshot the latest follower
-                // scalars (already attack/release-smoothed by the engine — no
-                // extra GUI smoothing). Zero-copy: move the polled Vec in.
-                self.transport.mod_scalars = scalars;
+            AppEvent::ModScalarsTick(plane) => {
+                // docs/plan_modulation.md §4.2: snapshot the latest modulator
+                // values (already attack/release-smoothed by the engine — no
+                // extra GUI smoothing). Zero-copy: move the polled plane in。
+                self.transport.mod_plane = plane;
             }
             AppEvent::AddReturnTrack => {
                 self.action_add_return_track();
@@ -1860,10 +1860,8 @@ impl AppData {
             AppEvent::ExportFinished { result } => {
                 self.transport.export_stage = None;
                 self.transport.export_cancel = None;
-                // 自動レンダリングした音声 temp WAV を削除。
-                if let Some(wav) = self.transport.export_temp_wav.take() {
-                    let _ = std::fs::remove_file(&wav);
-                }
+                // 自動レンダリングした音声 temp 一式 (WAV + sidecar) を削除。
+                self.remove_export_temp_wav();
                 match result {
                     Ok(path) => {
                         self.ui_ephemeral.status_message =

@@ -29,6 +29,8 @@ use crate::graph::mix::{
 };
 use crate::graph::{BufRef, NodeOp, Schedule};
 use crate::launcher::{RowSourceTable, TrackRows};
+use common::mod_plane::ModTickPlaneRef;
+use crate::mod_tick::FollowerDrive;
 use crate::mixer::{TrackScratch, apply_strip};
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
 
@@ -154,11 +156,10 @@ pub fn process_track_owned(
     playhead_beats: f64,
     // 再生ループの状態 (= `shared.loop_region`)。 set_pd_transport に渡す。
     loop_region: LoopRegion,
-    // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
-    // snapshot, slot = `Song::mod_sources` position). fill_track_param_ramps /
-    // fill_pd_param_events に渡して volume/pan/plugin param を follower 変調する。
-    // 空なら変調なし (= 既存挙動と byte 同一)。
-    mod_scalars: &[f32],
+    // docs/plan_modulation.md §5 / r.md #89: 変調ソースの値面 (**`ModSource::id`
+    // キー**、block-rate snapshot)。fill_track_param_ramps / fill_pd_param_events に
+    // 渡して volume/pan/plugin param を変調する。空なら変調なし。
+    mod_plane: ModTickPlaneRef<'_>,
     // r.md #87: この track の行 (トラック行 + レーン行) の時間軸の供給元。
     // ループ端での buffer 分割は `crate::launcher::render` が持つ。
     // 空 (`TrackRows::default()`) で全部アレンジ = 従来の挙動。
@@ -358,7 +359,7 @@ pub fn process_track_owned(
                 playhead_beats,
                 frames,
                 recording_lanes,
-                mod_scalars,
+                mod_plane,
             );
         }
         if ports.has_audio_input {
@@ -390,7 +391,7 @@ pub fn process_track_owned(
                             key: ev.key,
                         },
                     },
-                    EventKind::ParamValue | EventKind::ParamMod => continue,
+                    EventKind::ParamValue => continue,
                 };
                 scratch.midi_bus_b.push(timed);
             }
@@ -470,7 +471,7 @@ pub fn process_track_owned(
         &mut scratch.volume_per_sample,
         &mut scratch.pan_per_sample,
         recording_lanes,
-        mod_scalars,
+        mod_plane,
     );
     apply_strip(scratch, n, muted, effective_mute);
 }
@@ -501,7 +502,7 @@ pub fn process_master_fx_chain(
     playhead_beats: f64,
     loop_region: LoopRegion,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    mod_scalars: &[f32],
+    mod_plane: ModTickPlaneRef<'_>,
     // r.md #87: マスター行 (`song_lanes`) の供給元。ランチャーで撃った行は
     // アレンジのカーブではなくセルのカーブを使う。
     master_rows: TrackRows<'_>,
@@ -536,7 +537,7 @@ pub fn process_master_fx_chain(
                 playhead_beats,
                 frames,
                 recording_lanes,
-                mod_scalars,
+                mod_plane,
             );
         }
         pd.buffer_in[0][..n].copy_from_slice(&master_l[..n]);
@@ -573,9 +574,12 @@ pub fn execute_schedule_post_dispatch(
     // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
     loop_region: LoopRegion,
-    // B3 (r.md #8): group fx の PluginParam follower 変調 snapshot (track fx と同じ
-    // `mod_scalars_snapshot`)。 post-dispatch 段への plumbing。 空なら変調なし。
-    mod_scalars: &[f32],
+    // B3 (r.md #8): group fx の PluginParam 変調の値面 (track fx と同じ面)。
+    // post-dispatch 段への plumbing。 空なら変調なし。
+    mod_plane: ModTickPlaneRef<'_>,
+    // r.md #89: フォロワーを刻みごとに進めるための係数表 (空なら従来どおり
+    // buffer 全体を 1 回で舐める)。
+    follower_drive: FollowerDrive<'_>,
     // r.md #87: 行ごとの時間軸の供給元 (group の automation レーン行に効く)。
     rows: &RowSourceTable,
 ) {
@@ -659,7 +663,7 @@ pub fn execute_schedule_post_dispatch(
                     current_bpm,
                     playhead_beats,
                     loop_region,
-                    mod_scalars,
+                    mod_plane,
                     *start_device,
                     rows.track_rows(*track_idx as usize),
                 );
@@ -801,8 +805,8 @@ pub fn execute_schedule_post_dispatch(
                 // docs/plan_modulation.md §3/§6: advance this source's envelope
                 // follower over its (settled) scratch, picking the buffer by
                 // tap point. The smoothed envelope lands in
-                // `follower_slots[slot].env`; the engine publishes it to
-                // `AudioBridge::mod_scalars` after this walk. RT-safe: pure
+                // `follower_slots[slot].env`; the engine publishes it into the
+                // modulation plane after this walk. RT-safe: pure
                 // arithmetic, no alloc / lock.
                 let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
                     continue;
@@ -810,7 +814,7 @@ pub fn execute_schedule_post_dispatch(
                 let Some(fs) = follower_slots.get_mut(*slot as usize) else {
                     continue;
                 };
-                fs.process_block(src_l, src_r, n);
+                advance_follower(fs, src_l, src_r, n, *slot, follower_drive, sample_rate);
             }
         }
     }
@@ -838,8 +842,8 @@ fn run_group_fx_chain(
     // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
     loop_region: LoopRegion,
-    // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot。
-    mod_scalars: &[f32],
+    // B3 (r.md #8): group fx PluginParam の変調の値面。
+    mod_plane: ModTickPlaneRef<'_>,
     // パラアウト (docs/plan_paraout.md): first device index to run. `0` for a
     // pure group / return (whole chain is bus FX). For a group-with-instrument
     // it's the prefix split point — the instrument `[0..start_device]` ran in
@@ -904,7 +908,7 @@ fn run_group_fx_chain(
             playhead_beats,
             frames,
             recording_lanes,
-            mod_scalars,
+            mod_plane,
         );
         if ports.has_audio_input {
             pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
@@ -962,9 +966,44 @@ fn run_group_fx_chain(
         &mut scratch.pan_per_sample,
         recording_lanes,
         // group/master bus の volume/pan follower 変調は follow-up。
-        &[],
+        ModTickPlaneRef::default(),
     );
     apply_strip(scratch, n, muted, effective_mute);
+}
+
+/// r.md #89: 1 つの envelope follower を進める。
+///
+/// A / R / ゲイン / 帯域が**変調されている**フォロワーは係数を刻みごとに引き直し
+/// ながら区間で進める。変調されていないフォロワーは buffer 全体を 1 回で舐める
+/// 従来経路 — **変調していないソースのコストはゼロのまま**。
+fn advance_follower(
+    fs: &mut super::follower::FollowerSlot,
+    src_l: &[f32],
+    src_r: &[f32],
+    n: usize,
+    slot: u32,
+    drive: FollowerDrive<'_>,
+    sample_rate: u32,
+) {
+    let driven = !drive.spans.is_empty()
+        && drive
+            .col_of_slot
+            .get(slot as usize)
+            .is_some_and(|c| *c != u16::MAX);
+    if !driven {
+        fs.process_block(src_l, src_r, n);
+        return;
+    }
+    for span in drive.spans {
+        if let Some(eff) = drive.eff_for(slot, span.row) {
+            fs.set_effective(eff, sample_rate);
+        }
+        let a = span.frame as usize;
+        let b = (a + span.frames as usize).min(n);
+        if a < b {
+            fs.process_block(&src_l[a..b], &src_r[a..b], b - a);
+        }
+    }
 }
 
 /// live (CPAL callback 経由の `LocalState::process_buffer`) と offline export
@@ -996,7 +1035,9 @@ pub fn render_master_buffer(
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
     playhead_beats: f64,
-    mod_scalars: &[f32],
+    mod_plane: ModTickPlaneRef<'_>,
+    // r.md #89: フォロワーの刻みごとの係数 (`ModTickRunner::follower_drive`)。
+    follower_drive: FollowerDrive<'_>,
     // r.md #87: 行ごとの時間軸の供給元。**live と export は同じ経路** (不変条件 6)
     // なので、両方がここへ同じ形で渡す。空なら全部アレンジ = 従来の挙動。
     rows: &RowSourceTable,
@@ -1029,7 +1070,7 @@ pub fn render_master_buffer(
             current_bpm,
             playhead_beats,
             &loop_region,
-            mod_scalars,
+            mod_plane,
             rows,
         );
         // stall した pool は scratch を更新しない (dispatch_and_wait が冒頭で
@@ -1070,7 +1111,7 @@ pub fn render_master_buffer(
                 current_bpm,
                 playhead_beats,
                 loop_region,
-                mod_scalars,
+                mod_plane,
                 rows.track_rows(track_idx),
             );
         }
@@ -1094,7 +1135,8 @@ pub fn render_master_buffer(
         current_bpm,
         playhead_beats,
         loop_region,
-        mod_scalars,
+        mod_plane,
+        follower_drive,
         rows,
     );
 
@@ -1115,7 +1157,7 @@ pub fn render_master_buffer(
         playhead_beats,
         loop_region,
         recording_lanes,
-        mod_scalars,
+        mod_plane,
         rows.master_rows(),
     );
 
@@ -1267,7 +1309,8 @@ mod sidechain_tests {
             song.bpm,
             0.0,
             LoopRegion::default(),
-            &[],
+            ModTickPlaneRef::default(),
+            FollowerDrive::default(),
             &RowSourceTable::default(),
         );
 
@@ -1342,7 +1385,8 @@ mod sidechain_tests {
             song.bpm,
             0.0,
             LoopRegion::default(),
-            &[],
+            ModTickPlaneRef::default(),
+            FollowerDrive::default(),
             &RowSourceTable::default(),
         );
 
@@ -1660,7 +1704,8 @@ mod render_master_tests {
             &std::collections::HashSet::new(),
             120.0,
             0.0,
-            &[],
+            ModTickPlaneRef::default(),
+            FollowerDrive::default(),
             &RowSourceTable::default(),
             0.5,
         );

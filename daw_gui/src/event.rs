@@ -1041,10 +1041,10 @@ pub enum AppEvent {
     /// engine の走行状態にしか無い。これを取り込まないと、音だけ次のセルへ進んで
     /// グリッドと映像が前のセルに取り残される。
     LauncherRowsTick(Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>),
-    /// docs/plan_modulation.md §4.2: latest per-`ModSource` envelope follower
-    /// scalars (indexed by `ModSource` position), polled ~30Hz from
-    /// `AudioBridge::mod_scalars`. Drives visual modulation each frame.
-    ModScalarsTick(Vec<f32>),
+    /// docs/plan_modulation.md §4.2 / r.md #89: latest per-`ModSource` scalars
+    /// (**`ModSource::id` キー**)、polled ~30Hz from the `AudioBridge` modulation
+    /// plane. Drives visual modulation each frame.
+    ModScalarsTick(common::mod_plane::ModPlane),
     /// resource monitor (r.md #3): poller が ~30Hz で読む全体メトリクス
     /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate)。
     MetricsTick {

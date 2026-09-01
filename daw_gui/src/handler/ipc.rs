@@ -60,9 +60,7 @@ impl AppData {
                     if cancelled {
                         // 前段（音声）でキャンセル → video export 全体を中止し、
                         // 映像 render には進まない。
-                        if let Some(t) = self.transport.export_temp_wav.take() {
-                            let _ = std::fs::remove_file(&t);
-                        }
+                        self.remove_export_temp_wav();
                         let _ = (mp4_path, range_beats, dims);
                         self.ui_ephemeral.status_message = "Video export をキャンセルしました".into();
                     } else {
@@ -77,9 +75,7 @@ impl AppData {
                                 self.ui_ephemeral.status_message = format!(
                                     "音声レンダリング失敗 ({err}); 映像のみで書き出します"
                                 );
-                                if let Some(t) = self.transport.export_temp_wav.take() {
-                                    let _ = std::fs::remove_file(&t);
-                                }
+                                self.remove_export_temp_wav();
                                 None
                             }
                             None => self.transport.export_temp_wav.clone(),

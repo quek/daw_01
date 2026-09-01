@@ -642,15 +642,18 @@ fn run_worker(
                         kind: crate::plugin_instance::ParamEventKind::Value,
                     });
                 }
-                EventKind::ParamMod => {
-                    param_events_in.push(crate::plugin_instance::TimedParamEvent {
-                        time: ev.time,
-                        param_id: ev.param_id,
-                        value: ev.value,
-                        kind: crate::plugin_instance::ParamEventKind::Mod,
-                    });
-                }
             }
+        }
+        // r.md #89: lane 非依存モジュレーションは `events_in` ではなく専用配列で
+        // 届く (`docs/plan_rmd_88_89_cross_modulation.md` §2.2)。制御グリッドが
+        // 64 サンプル刻みになるとノート枠を押し出すので枠を分けてある。
+        for m in pd.param_mods_iter() {
+            param_events_in.push(crate::plugin_instance::TimedParamEvent {
+                time: m.time,
+                param_id: m.param_id,
+                value: m.value,
+                kind: crate::plugin_instance::ParamEventKind::Mod,
+            });
         }
         events_in.sort_unstable_by_key(|e| e.time);
         param_events_in.sort_unstable_by_key(|e| e.time);

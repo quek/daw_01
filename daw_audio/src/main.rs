@@ -32,6 +32,8 @@ mod graph;
 mod launcher;
 mod metronome;
 mod mixer;
+mod mod_plan_publish;
+mod mod_tick;
 mod sequencer;
 mod song_values;
 mod stretch_engine;
@@ -41,6 +43,7 @@ use engine::{
     SyncSlot, WorkerRig,
 };
 use graph::{DelayLine, Schedule, compile_schedule};
+use mod_plan_publish::{ModPhaseTableBuilder, ModPlanPublisher};
 
 /// A1 (r.md #8): 出力ストリームを開く前にデフォルト出力デバイスの実サンプルレートを
 /// 問い合わせる (stream は開かない)。 Hello で親へ報告し、 session.sample_rate の SSoT に
@@ -577,6 +580,8 @@ fn spawn_notify_thread(
 struct BundlePublisher {
     tx: rtrb::Producer<RtBundle>,
     parked: Option<RtBundle>,
+    /// r.md #89: クロス変調の評価計画の publish 状態 (内容が変わったときだけ載せる)。
+    mod_plans: ModPlanPublisher,
     /// 直近 topology compile に使った `buffer_frames` (leaf 宛 sidechain tap
     /// の 1-buffer 補償量)。 実測値との drift を検知して再 compile する。
     last_compiled_frames: Option<u32>,
@@ -587,6 +592,7 @@ impl BundlePublisher {
         Self {
             tx,
             parked: None,
+            mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
         }
     }
@@ -678,6 +684,7 @@ fn publish_bundle(
     song: Option<Arc<common::model::Song>>,
     sample_rate: u32,
     topology: Topology,
+    phase_tables: &ModPhaseTableBuilder,
 ) {
     shared.song.store(song.clone());
     let tempo_map = match song.as_deref() {
@@ -709,10 +716,24 @@ fn publish_bundle(
     } else {
         (None, Vec::new())
     };
+    // r.md #89: クロス変調の評価計画。`Song::mod_sources` / `mod_routings` /
+    // automation lane から決まるので **値のみ更新でも変わりうる** (schedule と
+    // 違って topology 限定ではない)。作るのは安いが、内容が変わっていないのに
+    // 載せると RT が毎 buffer 位相を捨てて張り直すので、前回と同じなら載せない。
+    let mod_plan = song
+        .as_deref()
+        .and_then(|sg| publisher.mod_plans.build(sg, sample_rate));
+    // 位相表は曲長ぶんの刻みループなので **必ず off-thread**。構築中は旧表 +
+    // 閉形式シードで凌ぎ、完成したら housekeeping が次の便で載せる。
+    if let (Some((plan, _)), Some(sg)) = (mod_plan.as_ref(), song.as_ref()) {
+        phase_tables.request(Arc::clone(plan), sg, sample_rate);
+    }
     publisher.send(RtBundle {
         song,
         tempo_map,
         schedule,
+        mod_plan,
+        mod_phase_table: None,
         reset_song_scoped_state: matches!(
             topology,
             Topology::Recompile {
@@ -733,6 +754,7 @@ fn update_song_values<F>(
     shared: &SharedState,
     engine_shared: &EngineShared,
     sample_rate: u32,
+    phase_tables: &ModPhaseTableBuilder,
     f: F,
 ) where
     F: FnOnce(&mut common::model::Song),
@@ -750,6 +772,7 @@ fn update_song_values<F>(
         Some(Arc::new(next)),
         sample_rate,
         Topology::Unchanged,
+        phase_tables,
     );
 }
 
@@ -784,11 +807,31 @@ fn recv_loop_housekeeping(
     shared: &Arc<SharedState>,
     engine_shared: &Arc<EngineShared>,
     session_sample_rate: u32,
+    phase_tables: &ModPhaseTableBuilder,
 ) {
     while let Ok(old) = bundle_recycle_rx.pop() {
         drop(old);
     }
     publisher.flush();
+    // r.md #89: off-thread で張り終えた位相表を RT へ載せる (構築中は旧表 +
+    // 閉形式シードで凌いでいる)。plan と別便なのは、表の構築が曲長ぶんの
+    // 刻みループで、plan の配送を待たせたくないから (設計正本 §2.4)。
+    if let Some(table) = phase_tables.take_finished() {
+        publisher.send(RtBundle {
+            song: shared.song.load_full(),
+            tempo_map: match shared.song.load().as_deref() {
+                Some(s) => common::tempo_map::TempoMap::from_song(s),
+                None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
+            },
+            schedule: None,
+            reset_song_scoped_state: false,
+            input_delay_replacements: Vec::new(),
+            plugin_refs: engine_shared.plugin_refs.load_full(),
+            worker: engine_shared.worker.load_full(),
+            mod_plan: None,
+            mod_phase_table: Some(table),
+        });
+    }
     // leaf 宛 sidechain tap の 1-buffer 補償量 (= 実測 buffer frames) が
     // compile 時の仮定から変わっていたら topology を再 publish する
     // (初回 publish が stream 実測前に走った場合の是正)。
@@ -807,6 +850,7 @@ fn recv_loop_housekeeping(
                 Topology::Recompile {
                     reset_song_scoped_state: false,
                 },
+                phase_tables,
             );
         }
     }
@@ -863,6 +907,8 @@ async fn recv_loop(
     park: Park,
 ) {
     let mut publisher = BundlePublisher::new(bundle_tx);
+    // r.md #89: 位相表を張る専用スレッド (最新の要求だけ残す郵便受け)。
+    let phase_tables = ModPhaseTableBuilder::spawn();
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     // 遅延して詰まった tick を burst で取り戻さない (drain は冪等なので
     // 取り戻す意味が無く、CPU を無駄に食うだけ)。
@@ -874,6 +920,7 @@ async fn recv_loop(
             &shared,
             &engine_shared,
             session_sample_rate,
+            &phase_tables,
         );
         // `read_msg` (= `read_exact` 2 回) は **cancel-safe ではない**ので、
         // select の枝に直接置くと timer が先に発火したときに読みかけの
@@ -893,6 +940,7 @@ async fn recv_loop(
                         &shared,
                         &engine_shared,
                         session_sample_rate,
+                        &phase_tables,
                     ),
                 }
             }
@@ -1060,6 +1108,7 @@ async fn recv_loop(
                     Topology::Recompile {
                         reset_song_scoped_state: project_switched,
                     },
+                    &phase_tables,
                 );
                 // Phase 2: hand off to the background worker for full decode of
                 // any missing source. Skipped when everything was reusable
@@ -1132,6 +1181,7 @@ async fn recv_loop(
                             Topology::Recompile {
                                 reset_song_scoped_state: false,
                             },
+                            &phase_tables,
                         );
                     }
                 }
@@ -1167,6 +1217,7 @@ async fn recv_loop(
                             song,
                             session_sample_rate,
                             Topology::Unchanged,
+                    &phase_tables,
                         );
                     }
                     Err(e) => {
@@ -1184,6 +1235,7 @@ async fn recv_loop(
                     song,
                     session_sample_rate,
                     Topology::Unchanged,
+                    &phase_tables,
                 );
             }
             Ok(AudioCommand::OpenPluginShmem { device_id, shmem_id }) => {
@@ -1207,6 +1259,7 @@ async fn recv_loop(
                             song,
                             session_sample_rate,
                             Topology::Unchanged,
+                    &phase_tables,
                         );
                         tracing::info!(device_id, "plugin shmem registered");
                     }
@@ -1227,6 +1280,7 @@ async fn recv_loop(
                     song,
                     session_sample_rate,
                     Topology::Unchanged,
+                    &phase_tables,
                 );
                 // 旧 entry (shmem mapping) は RT が新 bundle を install して
                 // recycle が drain された時点で off-thread unmap される
@@ -1246,7 +1300,7 @@ async fn recv_loop(
                 | AudioCommand::SetSendEnabled { .. }
                 | AudioCommand::SetSongBpm { .. }
                 | AudioCommand::SetSongTimeSigNumerator { .. })) => {
-                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, &phase_tables, |s| {
                     song_values::apply(&cmd, s);
                 });
             }
@@ -2218,6 +2272,8 @@ mod tests {
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(std::collections::HashMap::new()),
             worker: None,
+            mod_plan: None,
+            mod_phase_table: None,
         };
         publisher.send(bundle()); // fills the 1-slot ring
         publisher.send(bundle()); // full → parked

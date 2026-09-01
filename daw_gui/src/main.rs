@@ -429,7 +429,9 @@ fn spawn_playhead_poller(
 ) {
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
-        let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
+        let mut mod_buf = common::mod_plane::ModPlane::with_capacity(
+            common::audio_bridge::MAX_MOD_SOURCES,
+        );
         // r.md #87: ランチャーの走行状態 (行数ぶん)。peaks / mod と同じく使い回す。
         let mut launcher_buf: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)> =
             Vec::with_capacity(common::audio_bridge::MAX_LAUNCHER_ROWS);
@@ -507,10 +509,13 @@ fn spawn_playhead_poller(
             // docs/plan_modulation.md §4.2: poll the modulation scalars on the
             // same ~30Hz tick as peaks and stream them to the model so visual
             // modulation (image / group / video fx) can apply per frame.
-            bridge.mod_scalars(&mut mod_buf);
-            if proxy
-                .send_event(AppEvent::ModScalarsTick(std::mem::take(&mut mod_buf)))
-                .is_err()
+            // r.md #89: 値面は id 表と値の組なので seqlock で読む。書き込み中に
+            // 当たって読めなかった tick は **送らない** (GUI 側の前回値が残る) —
+            // 破れた組を送ると 1 フレームだけ別のソースの値で絵が動く。
+            if bridge.read_mod_plane(&mut mod_buf)
+                && proxy
+                    .send_event(AppEvent::ModScalarsTick(std::mem::take(&mut mod_buf)))
+                    .is_err()
             {
                 break;
             }

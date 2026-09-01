@@ -369,7 +369,7 @@ pub fn render_mp4_cancellable(
         .map(common::mod_sidecar::ModEnvSidecar::sidecar_path)
         .and_then(|p| common::mod_sidecar::ModEnvSidecar::read(&p).ok())
         .unwrap_or_default();
-    let mut mod_scalars_buf: Vec<f32> = Vec::new();
+    let mut mod_plane_buf = common::mod_plane::ModPlane::default();
     // r.md #87 §3.6: 音声書き出しが焼いた **行ごとの走行状態の遷移列** を読む。
     // フォローアクションでどこの列へ移ったかを決めているのは daw_audio の
     // `LauncherRuntime` で、GUI 側に同じ式は無い。これを差さないと
@@ -404,7 +404,7 @@ pub fn render_mp4_cancellable(
         let playhead_beat = tempo_map.seconds_to_beat(start_secs + frame_seconds);
         // docs/plan_modulation.md §7: sample the baked follower envelopes at
         // this frame's beat (step / sample-and-hold), same composition as live.
-        mod_sidecar.sample_at(playhead_beat, &mut mod_scalars_buf);
+        mod_sidecar.sample_at(playhead_beat, &mut mod_plane_buf);
         // r.md #87 (計画書 Q9 / §2.5): 書き出しは「範囲の先頭で今の `Track.launcher`
         // を一斉に撃った」状態から始まり、以降はフォローアクションが決定的に進む。
         // その遷移列は sidecar が持っているので、このフレームの拍で差す
@@ -427,7 +427,7 @@ pub fn render_mp4_cancellable(
             &image_textures,
             &rows,
             start_secs + frame_seconds,
-            &mod_scalars_buf,
+            mod_plane_buf.as_ref(),
             out_w,
             out_h,
             &mut scene,
@@ -554,7 +554,7 @@ fn build_frame_scene(
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
     rows: &RowTimeline<'_>,
     playhead_secs: f64,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
     out_w: u32,
     out_h: u32,
     scene: &mut Scene,
@@ -621,11 +621,11 @@ fn build_frame_scene(
     }
 
     // active visual groups (preview と同一 gate `active_visual_groups`、SSoT)。
-    // mod_scalars は render_mp4 が baked env sidecar から sample (空 = 変調なし)。
-    let active_groups = crate::group_compose::active_visual_groups(song, rows, mod_scalars);
+    // mod_plane は render_mp4 が baked env sidecar から sample (空 = 変調なし)。
+    let active_groups = crate::group_compose::active_visual_groups(song, rows, mod_plane);
 
     // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning track bucket。
-    let image_layers = crate::image_compose::active_image_sources_at(song, rows, mod_scalars);
+    let image_layers = crate::image_compose::active_image_sources_at(song, rows, mod_plane);
     for layer in image_layers {
         let Some((texture, _iw, _ih)) = image_textures.get(&layer.image_source_id) else {
             continue; // not decoded / failed import
@@ -644,7 +644,7 @@ fn build_frame_scene(
     }
 
     // テキスト → owning track bucket (合成画に焼き込んで track 効果を乗せる)。
-    let text_layers = crate::text_compose::active_text_sources_at(song, rows, mod_scalars);
+    let text_layers = crate::text_compose::active_text_sources_at(song, rows, mod_plane);
     for tf in text_layers {
         buckets.entry(tf.owning_track_id).or_default().push(CompositeItem::Text(tf));
     }
@@ -658,8 +658,8 @@ fn build_frame_scene(
             continue; // export は overlay 不要なので空 bucket は skip。
         }
         // 配置 transform は Transform device から解決（preview と同一 SSoT）。
-        let transform = crate::video_fx::resolve_track_transform(song, track, rows, mod_scalars);
-        let fx = crate::video_fx::resolve_track_effects(song, track, rows, mod_scalars);
+        let transform = crate::video_fx::resolve_track_transform(song, track, rows, mod_plane);
+        let fx = crate::video_fx::resolve_track_effects(song, track, rows, mod_plane);
         let tc = crate::group_compose::TrackComposite {
             track_id: track.id,
             items,
@@ -680,7 +680,7 @@ fn build_frame_scene(
     // マスター映像チェーン。全トラック合成後の scene を 1 枚の master
     // canvas へ集約 → master fx をチェーン順適用 → scene を master 1 quad で置換（preview と
     // 同一 SSoT）。空なら何もしない。
-    let master_fx = crate::video_fx::resolve_master_effects(song, rows, mod_scalars);
+    let master_fx = crate::video_fx::resolve_master_effects(song, rows, mod_plane);
     if !master_fx.is_empty() {
         match offscreen.composite_scene_to_texture(scene, out_w, out_h) {
             Ok(handle) => {

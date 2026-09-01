@@ -137,9 +137,10 @@ pub enum NodeOp {
     /// `ModSource` at `slot` over `src`'s final scratch. Emitted at the end
     /// of the schedule (all scratches are settled) since the follower only
     /// produces a control-rate scalar — it never feeds back into the audio
-    /// graph. `slot` indexes both `Schedule::follower_slots` and the
-    /// `AudioBridge::mod_scalars` plane (= the `ModSource`'s position in
-    /// `Song::mod_sources`).
+    /// graph. `slot` は `Schedule::follower_slots` / `follower_keys` /
+    /// `mod_kinds` の index。**この slot 番号は schedule の内部表現であって、
+    /// 外へ出るときは必ず `follower_keys[slot]` (= `ModSource::id`) に変換する**
+    /// (`common/src/mod_plane.rs`、アーキ不変条件 1)。
     EnvelopeFollow { src: BufRef, slot: u32 },
 }
 
@@ -190,17 +191,17 @@ pub struct Schedule {
     /// (out of scope for PR4.5).
     pub input_delay_per_track: Vec<u32>,
     /// docs/plan_modulation.md §3: per-`ModSource` envelope follower state +
-    /// baked coefficients, indexed by slot (= `ModSource` position in
-    /// `Song::mod_sources`). `NodeOp::EnvelopeFollow { slot, .. }` advances
-    /// `follower_slots[slot].env` each buffer; the engine publishes that env
-    /// to `AudioBridge::mod_scalars[slot]`. 再 compile 時は
-    /// `adopt_state_from` が stable id (`follower_keys`) で走行状態を移送する。
+    /// baked coefficients, indexed by slot。`NodeOp::EnvelopeFollow { slot, .. }`
+    /// advances `follower_slots[slot].env` each buffer; engine はそれを
+    /// `follower_keys[slot]` (= `ModSource::id`) と組にして変調値面へ載せる
+    /// (`crate::mod_tick::eval_plane`)。再 compile 時は `adopt_state_from` が
+    /// 同じ stable id で走行状態を移送する。
     pub follower_slots: Vec<super::follower::FollowerSlot>,
     /// `follower_slots` と平行な stable `ModSource::id` (§5 D 状態移送用)。
     /// `0` は未採番 sentinel (移送対象外)。
     pub follower_keys: Vec<u32>,
-    /// per-`ModSource` の種別を
-    /// slot 順 (= `follower_slots` / `AudioBridge::mod_scalars` と 1:1) に保持。
+    /// per-`ModSource` の種別を slot 順 (= `follower_slots` / `follower_keys` と
+    /// 1:1) に保持。
     /// generator (LFO/Random/MSEG/Steps) は `common::modulators::generator_scalar`
     /// で `song_beat` から直接算出され、その slot の `follower_slots` 値は使われない
     /// (inert)。envelope follower の slot は `follower_slots[slot].env` を使う。

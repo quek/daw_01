@@ -63,9 +63,10 @@ impl Band {
 
 /// Per-`ModSource` envelope follower. Coefficients are baked at compile time
 /// (`from_config`); the audio thread advances [`Self::env`] each buffer via
-/// [`Self::process_block`]. `env` is published block-rate to the GUI
-/// (`AudioBridge::mod_scalars`) and, from Phase 5, sampled per-control-rate
-/// for audio-param modulation.
+/// [`Self::process_block`]. `env` は block-rate で変調値面
+/// ([`common::mod_plane::ModPlane`]) に載って GUI へ publish され、param 変調では
+/// 制御刻みごとにサンプルされる。**値面のアドレスは `ModSource::id`**
+/// (SSoT は `common/src/mod_plane.rs` の module doc)。
 #[derive(Debug, Clone, Copy)]
 pub struct FollowerSlot {
     atk: f32,
@@ -89,6 +90,28 @@ impl FollowerSlot {
             rectify: cfg.rectify,
             band: cfg.band_filter.as_ref().map(|f| Band::new(f, sample_rate)),
             env: 0.0,
+        }
+    }
+
+    /// r.md #89: **変調された係数を刻みごとに差し込む。**
+    ///
+    /// `from_config` が compile 時に焼いた係数だけを読む作りだと、フォロワーの
+    /// A / R / ゲイン / 帯域を変調先にしても何も起きない (器だけあって効かない)。
+    /// 走行状態 (`env` と帯域フィルタの内部状態) は触らないので、刻みごとに
+    /// 呼んでも滑らかに繋がる。
+    ///
+    /// 帯域フィルタは **compile 時に有効だったときだけ**係数を差し替える —
+    /// 変調で `Some`/`None` が切り替わると走行状態が飛ぶうえ、`BandFilter` の
+    /// 有無は config の構造 (topology) であって連続量ではない。
+    ///
+    /// RT-safe: 係数の算術のみ (確保・ロック無し)。
+    pub fn set_effective(&mut self, e: crate::mod_tick::FollowerEff, sample_rate: u32) {
+        self.atk = time_coeff(e.attack_ms, sample_rate);
+        self.rel = time_coeff(e.release_ms, sample_rate);
+        self.gain = e.gain;
+        if let Some(b) = self.band.as_mut() {
+            b.a_hp = one_pole_coeff(e.hp_hz, sample_rate);
+            b.a_lp = one_pole_coeff(e.lp_hz, sample_rate);
         }
     }
 

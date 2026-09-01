@@ -91,11 +91,22 @@ pub struct DispatchShared {
     /// that as 0 delay for every track.
     pub input_delays_base: AtomicPtr<u32>,
     pub n_input_delays: AtomicU32,
-    /// docs/plan_modulation.md §5: per-`ModSource` follower scalar snapshot
-    /// (block-rate) published by the master each dispatch; workers read it for
-    /// audio-param modulation. Null + len 0 = no modulation.
+    /// docs/plan_modulation.md §5 / r.md #89: 変調ソースの値面
+    /// ([`common::mod_plane::ModPlaneRef`]) の 2 本のポインタ。master が dispatch
+    /// ごとに publish し、worker が lock-free に読む。
+    ///
+    /// **id 表 (`mod_ids_base`) と値 (`mod_scalars_base`) は同じ長さ
+    /// (`n_mod_scalars`) で対**。値だけ渡していた頃は「worker が見た slot 番号」を
+    /// `Song::mod_sources` の位置と読み替えていて、位置が動くと別のソースの値で
+    /// 変調していた (アーキ不変条件 1)。null + len 0 = 変調なし。
     pub mod_scalars_base: AtomicPtr<f32>,
+    pub mod_ids_base: AtomicPtr<u32>,
     pub n_mod_scalars: AtomicU32,
+    /// r.md #89: 値面の行数 (= この buffer が踏む刻みの数)。`values` の長さは
+    /// `n_mod_scalars * n_mod_rows`。
+    pub n_mod_rows: AtomicU32,
+    /// r.md #89: buffer 頭から最初の刻み境界までの frame 数。
+    pub mod_lead: AtomicU32,
     /// Phase 4 Step C-2: 「現在 recording 中の lane」 set への ptr
     /// (= `SharedState.recording_lanes.load()` 結果)。 master が dispatch
     /// 前に store、 workers + master が `fill_track_param_ramps` の引数に
@@ -142,7 +153,10 @@ impl DispatchShared {
             input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
             n_input_delays: AtomicU32::new(0),
             mod_scalars_base: AtomicPtr::new(std::ptr::null_mut()),
+            mod_ids_base: AtomicPtr::new(std::ptr::null_mut()),
             n_mod_scalars: AtomicU32::new(0),
+            n_mod_rows: AtomicU32::new(0),
+            mod_lead: AtomicU32::new(common::mod_graph::MOD_TICK_FRAMES),
             recording_lanes_ptr: AtomicPtr::new(std::ptr::null_mut()),
             current_bpm_bits: AtomicU32::new(120.0_f32.to_bits()),
             playhead_beats_bits: std::sync::atomic::AtomicU64::new(
@@ -260,7 +274,7 @@ impl AudioWorkerPool {
         current_bpm: f32,
         playhead_beats: f64,
         loop_region: &common::model::LoopRegion,
-        mod_scalars: &[f32],
+        mod_plane: common::mod_plane::ModTickPlaneRef<'_>,
         rows: &crate::launcher::RowSourceTable,
     ) {
         // plan §4: stalled pool は二度と dispatch しない (worker thread の
@@ -339,20 +353,36 @@ impl AudioWorkerPool {
                 .n_input_delays
                 .store(input_delay_per_track.len() as u32, Ordering::Release);
         }
-        // docs/plan_modulation.md §5: publish the follower scalar snapshot so
-        // workers read it lock-free. Empty (no sources) → null + len 0.
-        if mod_scalars.is_empty() {
+        // docs/plan_modulation.md §5 / r.md #89: publish the modulation plane
+        // (id 表 + 刻みごとの値) so workers read it lock-free. Empty → null + len 0。
+        // **列数 × 行数 = 値の長さ**が成り立つぶんだけ publish する
+        // (端数の行を worker に見せない — `from_raw_parts` の長さは検証してから)。
+        let cols = mod_plane.ids.len();
+        let rows = mod_plane.values.len().checked_div(cols).unwrap_or(0);
+        let n_plane = if rows == 0 { 0 } else { cols };
+        if n_plane == 0 {
             self.shared
                 .mod_scalars_base
                 .store(std::ptr::null_mut(), Ordering::Release);
+            self.shared
+                .mod_ids_base
+                .store(std::ptr::null_mut(), Ordering::Release);
             self.shared.n_mod_scalars.store(0, Ordering::Release);
+            self.shared.n_mod_rows.store(0, Ordering::Release);
         } else {
             self.shared
                 .mod_scalars_base
-                .store(mod_scalars.as_ptr() as *mut f32, Ordering::Release);
+                .store(mod_plane.values.as_ptr() as *mut f32, Ordering::Release);
+            self.shared
+                .mod_ids_base
+                .store(mod_plane.ids.as_ptr() as *mut u32, Ordering::Release);
             self.shared
                 .n_mod_scalars
-                .store(mod_scalars.len() as u32, Ordering::Release);
+                .store(n_plane as u32, Ordering::Release);
+            self.shared.n_mod_rows.store(rows as u32, Ordering::Release);
+            self.shared
+                .mod_lead
+                .store(mod_plane.lead, Ordering::Release);
         }
 
         let n_workers = self.workers.len() as u32;
@@ -509,20 +539,34 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
     // in which case every track gets 0 delay.
     let input_delays_base = shared.input_delays_base.load(Ordering::Acquire);
     let n_input_delays = shared.n_input_delays.load(Ordering::Acquire);
-    // docs/plan_modulation.md §5: follower scalar snapshot (null = none). One
-    // global slice (not per-track), reconstructed once for the work loop.
+    // docs/plan_modulation.md §5 / r.md #89: 変調値面 (null = 変調なし)。
+    // track 単位ではなく 1 本のグローバル面なので、work loop の頭で 1 度だけ復元する。
     let mod_scalars_base = shared.mod_scalars_base.load(Ordering::Acquire);
+    let mod_ids_base = shared.mod_ids_base.load(Ordering::Acquire);
     let n_mod_scalars = shared.n_mod_scalars.load(Ordering::Acquire);
-    let mod_scalars: &[f32] = if mod_scalars_base.is_null() || n_mod_scalars == 0 {
-        &[]
-    } else {
-        // SAFETY: the master holds the snapshot Vec
-        // (`LocalState::mod_scalars_snapshot`) alive for the dispatch window via
-        // `dispatch_and_wait`'s borrow, and `n_mod_scalars` is its real length.
-        unsafe {
-            std::slice::from_raw_parts(mod_scalars_base as *const f32, n_mod_scalars as usize)
-        }
-    };
+    let n_mod_rows = shared.n_mod_rows.load(Ordering::Acquire);
+    let mod_lead = shared.mod_lead.load(Ordering::Acquire);
+    let mod_plane: common::mod_plane::ModTickPlaneRef<'_> =
+        if mod_scalars_base.is_null() || mod_ids_base.is_null() || n_mod_scalars == 0 || n_mod_rows == 0
+        {
+            common::mod_plane::ModTickPlaneRef::default()
+        } else {
+            // SAFETY: the master holds the plane (`ModTickRunner::plane`) alive
+            // for the dispatch window via `dispatch_and_wait`'s borrow.
+            // `dispatch_and_wait` publishes `n_mod_scalars` = 列数 と
+            // `n_mod_rows` = 値の長さ / 列数 なので、`列数 * 行数` は必ず値配列の
+            // 長さ以下 (= 端数の行は publish されない)。id 側は列数ぶん。
+            unsafe {
+                common::mod_plane::ModTickPlaneRef::new(
+                    std::slice::from_raw_parts(mod_ids_base as *const u32, n_mod_scalars as usize),
+                    std::slice::from_raw_parts(
+                        mod_scalars_base as *const f32,
+                        (n_mod_scalars as usize) * (n_mod_rows as usize),
+                    ),
+                    mod_lead,
+                )
+            }
+        };
     // Phase 4 Step C-2: recording lane snapshot ptr。 null なら 空 set 相当
     // (= 全 lane の curve eval する)。 master が `dispatch_and_wait` 内で
     // store、 ここでは &HashSet として復元する。
@@ -639,7 +683,7 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
             current_bpm,
             playhead_beats,
             loop_region,
-            mod_scalars,
+            mod_plane,
             rows.track_rows(track_idx as usize),
         );
     }

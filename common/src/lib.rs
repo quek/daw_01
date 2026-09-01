@@ -10,6 +10,7 @@ pub mod loudness_report;
 pub mod meter;
 pub mod metrics_bridge;
 pub mod mod_graph;
+pub mod mod_plane;
 pub mod mod_sidecar;
 pub mod model;
 pub mod modulators;

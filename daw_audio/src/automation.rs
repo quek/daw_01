@@ -11,7 +11,8 @@
 
 #![allow(dead_code)]
 
-use common::automation::{apply_modulation_with_scalars, modulation_offset_norm_with_scalars};
+use common::automation::{apply_modulation, modulation_offset_norm};
+use common::mod_plane::ModTickPlaneRef;
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
 
@@ -56,10 +57,11 @@ pub fn fill_track_param_ramps(
     volume_per_sample: &mut [f32],
     pan_per_sample: &mut [f32],
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
-    // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
-    // snapshot, slot = `Song::mod_sources` position) so volume/pan lanes with
-    // `mod_routings` get modulated. Empty = no modulation.
-    mod_scalars: &[f32],
+    // docs/plan_modulation.md §5 / r.md #89: **刻みごとの**変調値面
+    // (`ModSource::id` キー)。volume/pan lane の `mod_routings` がこれを引く。
+    // 刻みの間は線形補間する — 64 サンプルの段 (48kHz で 750Hz) をそのまま
+    // 音量に当てると段差が音として出る。空 = 変調なし。
+    mod_plane: ModTickPlaneRef<'_>,
 ) {
     let frames = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
     if frames == 0 {
@@ -120,9 +122,11 @@ pub fn fill_track_param_ramps(
                 }
                 None => f64::from(track_const),
             };
-            *slot =
-                apply_modulation_with_scalars(song, &target, base, &track.mod_routings, mod_scalars)
-                    as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let f = i as u32;
+            *slot = apply_modulation(&target, base, &track.mod_routings, |id| {
+                mod_plane.scalar_at_frame(id, f)
+            }) as f32;
         }
     };
     fill_builtin(
@@ -170,9 +174,9 @@ pub fn fill_pd_param_events(
     playhead_beats: f64,
     frames: u32,
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
-    // docs/plan_modulation.md §5: follower scalars (block-rate snapshot) so
-    // PluginParam lanes with `mod_routings` get modulated. Empty = none.
-    mod_scalars: &[f32],
+    // docs/plan_modulation.md §5 / r.md #89: **刻みごとの**変調値面 (id キー)。
+    // PluginParam lane の `mod_routings` がこれを引く。空 = 変調なし。
+    mod_plane: ModTickPlaneRef<'_>,
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -230,7 +234,11 @@ pub fn fill_pd_param_events(
         // frame 0 の 1 回のみで、 速い automation が階段状 (zipper) になっていた。
         // 静的セグメントは値不変なので 1 event に縮退 (events_in=256 を無駄に食わない)。
         // push_param は満杯時 drop のみ (panic なし) なので RT 安全。
-        const SUB_FRAMES: u32 = 64;
+        //
+        // r.md #89: 刻み幅の SSoT は `crate::mod_tick::MOD_TICK_FRAMES`。automation の
+        // サブバッファ刻みと変調の制御グリッドは **同じ格子でなければならない**
+        // (設計正本 §2.2) — 別々の 64 を持つと、片方を変えたときに黙って食い違う。
+        const SUB_FRAMES: u32 = crate::mod_tick::MOD_TICK_FRAMES;
         // r.md #87: このレーン行の供給元 (ランチャー主導ならセルのカーブ)。
         let src = rows.lane(lane_idx);
         let mut f = 0u32;
@@ -265,8 +273,21 @@ pub fn fill_pd_param_events(
         if mod_routings[..i].iter().any(|p| p.target == r.target) {
             continue;
         }
-        let offset = modulation_offset_norm_with_scalars(song, &r.target, mod_routings, mod_scalars);
-        pd.push_param_mod(0, *param_id, f64::from(offset));
+        // r.md #89: **刻みごとに** frame offset 付きで送る。1 buffer 1 発だと
+        // 変調の解像度が buffer 長 (≒46Hz) に落ち、Hz 指定の LFO が原理的に
+        // 鳴らないうえ live (device buffer 長) と書き出し (1024 固定) で段差の
+        // 位置が違う。値が変わらない刻みは縮退させる (automation 側の
+        // `push_param` と同じ idiom — `param_mods` の枠を無駄に食わない)。
+        let mut last = f64::NAN;
+        for f in mod_plane.starts(frames) {
+            let offset = f64::from(modulation_offset_norm(&r.target, mod_routings, |id| {
+                mod_plane.scalar_at_frame(id, f)
+            }));
+            if last.is_nan() || (offset - last).abs() > 1e-6 {
+                pd.push_param_mod(f, *param_id, offset);
+                last = offset;
+            }
+        }
     }
 }
 
@@ -289,6 +310,10 @@ mod tests {
         recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
         mod_scalars: &[f32],
     ) {
+        let ids: Vec<u32> = song
+            .map(|s| s.mod_sources.iter().map(|m| m.id).collect())
+            .unwrap_or_default();
+        let mod_plane = ModTickPlaneRef::new(&ids, mod_scalars, 64);
         fill_track_param_ramps(
             song,
             track_idx,
@@ -300,7 +325,7 @@ mod tests {
             volume_per_sample,
             pan_per_sample,
             recording_lanes,
-            mod_scalars,
+            mod_plane,
         );
     }
 
@@ -317,6 +342,8 @@ mod tests {
         recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
         mod_scalars: &[f32],
     ) {
+        let ids: Vec<u32> = song.mod_sources.iter().map(|m| m.id).collect();
+        let mod_plane = ModTickPlaneRef::new(&ids, mod_scalars, 64);
         fill_pd_param_events(
             pd,
             song,
@@ -328,7 +355,7 @@ mod tests {
             playhead_beats,
             frames,
             recording_lanes,
-            mod_scalars,
+            mod_plane,
         );
     }
     use common::model::{

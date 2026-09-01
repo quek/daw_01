@@ -583,18 +583,46 @@ fn render_loop(
     // only when a video render will consume it (`write_video_sidecars`). A
     // standalone WAV export skips it (n_sources = 0 → no recording, no file):
     // the modulation is already baked into the rendered audio below regardless.
+    // r.md #89: 列のキーは `ModSource::id` (`follower_keys`)。位置キーだった頃は、
+    // 書き出し後にソースを 1 つ消してから動画を描くと列が丸ごとずれた。
     let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_video_sidecars {
-        schedule.follower_slots.len()
+        schedule.follower_keys.clone()
     } else {
-        0
+        Vec::new()
     });
     // r.md #87 §3.6: 同じ理由でランチャーの走行状態も焼く — 動画書き出しは
     // フォローアクションがどこで次の列へ移ったかを知らないので、焼かないと
     // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
     let mut launcher_sidecar = crate::launcher::sidecar::SidecarRecorder::new();
-    // docs/plan_modulation.md §5: reusable per-buffer follower scalar snapshot
-    // (prev buffer's env) for audio-param modulation, mirroring the live engine.
-    let mut mod_scalars_snapshot: Vec<f32> = Vec::with_capacity(schedule.follower_slots.len());
+    // r.md #89: 変調の制御グリッド。**live engine と同じ 1 本** (`crate::mod_tick`、
+    // アーキ不変条件 6) を通すので、刻みの割り方も transport の進め方も
+    // buffer 長 (export 1024 固定 / live は device 実測長) に依存しない。
+    let mut mod_tick = crate::mod_tick::ModTickRunner::new();
+    {
+        let plan = std::sync::Arc::new(common::mod_graph::build_plan(song, 1, |beat| {
+            common::automation::beats_to_samples(song, sample_rate, beat) as f64
+                / f64::from(sample_rate.max(1))
+        }));
+        let mut rt = common::mod_graph::ModRuntime::default();
+        rt.install(&plan);
+        let length_secs = common::automation::beats_to_samples(song, sample_rate, song.length_beats)
+            as f64
+            / f64::from(sample_rate.max(1));
+        let table = std::sync::Arc::new(common::mod_graph::ModPhaseTable::build(
+            &plan,
+            song,
+            sample_rate,
+            length_secs,
+        ));
+        mod_tick.install(plan, rt);
+        mod_tick.set_table(Some(table));
+    }
+    // `Schedule` の follower slot → 係数表の列 (刻みごとにフォロワー係数を引く)。
+    let mut follower_cols: Vec<u16> = Vec::new();
+    mod_tick.build_follower_cols(&schedule.follower_keys, &mut follower_cols);
+    // plan slot → `Schedule::follower_slots` の index (刻みごとの線形探索を避ける)。
+    let mut follower_env_of_slot: Vec<u16> = Vec::new();
+    mod_tick.build_follower_env_map(&schedule.follower_keys, &mut follower_env_of_slot);
 
     // Phase 4 Step C-2: offline export 中は recording lane なし
     // (= GUI が active gesture を持たない、 transport が freewheel)。
@@ -612,6 +640,10 @@ fn render_loop(
     // integrate して進める (= sample↔beat 対応が tempo automation に追従)。 曲中から
     // 始まる range 書き出しは walk_start に対応する beat で seed する。
     let mut playhead_beats = common::automation::samples_to_beats(song, sample_rate, walk_start);
+    // r.md #89: 変調の位相と transport を走査開始位置で張る (範囲書き出しは曲頭
+    // から始まらない)。live の seek と同じ `locate` を通すので、同じ位置から
+    // 再生したときと位相が一致する。
+    mod_tick.locate(song, walk_start, playhead_beats, sample_rate);
 
     // r.md #87 (Q9 / §2.5): 書き出しは **今のランチャーの状態を反映する**。
     // 走査の先頭で `Track.launcher` / `AutomationLane.launcher` を一斉に撃った
@@ -673,34 +705,22 @@ fn render_loop(
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
-        // A2 (r.md #8): 当該 buffer の effective tempo を SongTempo カーブから取り、
-        // live 再生と同じ sample↔beat 対応にする。 B11 (r.md #8): export も再生と
-        // 同じく song-level tempo modulation を base tempo に焼く。
-        // `mod_scalars_snapshot` は前 iteration 値 (engine と同じ 1-buffer lag)。
-        let base_bpm_freewheel =
-            f64::from(common::automation::evaluate_song_tempo(song, playhead_beats));
-        let smoothed_current_bpm_freewheel = common::automation::apply_modulation_with_scalars(
-            song,
-            &common::model::AutomationTarget::SongTempo,
-            base_bpm_freewheel,
-            &song.song_mod_routings,
-            &mod_scalars_snapshot,
-        );
-
-        // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
-        // (slot order) so audio-param modulation renders into the WAV too.
-        // follower は env、 generator は song 位置から直接算出 (live と同経路)。
-        let export_song_secs = playhead as f64 / sample_rate as f64;
-        mod_scalars_snapshot.clear();
-        for (fs, kind) in schedule
-            .follower_slots
-            .iter()
-            .zip(schedule.mod_kinds.iter())
-        {
-            let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(playhead_beats, export_song_secs))
-                .unwrap_or(fs.env);
-            mod_scalars_snapshot.push(v);
-        }
+        // r.md #89: 刻みを回して、この buffer の変調値面と transport を解く
+        // (live engine と同じ `ModTickRunner`)。テンポも `next_mark` が解くので、
+        // ここで `evaluate_song_tempo` を別に呼ぶと live と規則が食い違う。
+        let head_mark = {
+            let sched = &schedule;
+            let env_of = &follower_env_of_slot;
+            let follower_env = |plan_slot: u16| match env_of.get(usize::from(plan_slot)).copied() {
+                Some(i) if i != u16::MAX => {
+                    sched.follower_slots.get(usize::from(i)).map_or(0.0, |f| f.env)
+                }
+                _ => 0.0,
+            };
+            mod_tick.run_buffer(song, playhead, frames as u32, sample_rate, follower_env)
+        };
+        playhead_beats = head_mark.beat;
+        let smoothed_current_bpm_freewheel = head_mark.bpm;
 
         // live と同一の単一 render 経路 (§5): dispatch → schedule → master fx
         // → master gain。 export (freewheel render) は loop しない。
@@ -740,27 +760,19 @@ fn render_loop(
             // automation 中の書き出しでノートが欠落 / 二重発音する。
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
-            &mod_scalars_snapshot,
+            mod_tick.plane(),
+            mod_tick.follower_drive(&follower_cols),
             launcher.rows(),
             master_gain,
         );
 
-        // docs/plan_modulation.md §7: record this buffer's follower envelopes
-        // (block-rate `env`, same value the live engine publishes to
-        // `mod_scalars`) keyed by the block beat.
-        if env_sidecar.n_sources > 0 {
-            env_sidecar.beats.push(playhead_beats as f32);
-            // follower は env、 generator は song 位置から算出して焼き込む
-            // (render_video は sidecar を sample するだけで全種別を再現)。
-            for (fs, kind) in schedule
-                .follower_slots
-                .iter()
-                .zip(schedule.mod_kinds.iter())
-            {
-                let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(playhead_beats, export_song_secs))
-                    .unwrap_or(fs.env);
-                env_sidecar.scalars.push(v);
-            }
+        // docs/plan_modulation.md §7: record this buffer's modulator values
+        // (buffer 頭の刻みの値 — live engine が GUI へ publish するのと同じ点)
+        // keyed by the block beat。動画は 30〜60fps でサンプルするので、刻み
+        // (750Hz) ではなく buffer (≒50〜100Hz) の粒度で足りる。
+        if env_sidecar.n_sources() > 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            env_sidecar.push(playhead_beats as f32, mod_tick.publish_plane().values());
         }
 
         // Compute block peak across the full block (for tail-silence
@@ -787,12 +799,11 @@ fn render_loop(
         }
 
         playhead += frames as u64;
-        // A2 (r.md #8): beat 累算器を当該 buffer の tempo で進める (live engine の
-        // buffer 末 `playhead_beats += n*bpm/(60*SR)` と同一式)。
-        if sample_rate > 0 {
-            playhead_beats +=
-                frames as f64 * smoothed_current_bpm_freewheel / (60.0 * f64::from(sample_rate));
-        }
+        // r.md #89: 拍は **刻みが進める** — 次の iteration の頭で
+        // `ModTickRunner::run_buffer` が `next_mark` の規則で解いた値を
+        // `playhead_beats` に入れる。ここで buffer 単位に足し込むと、
+        // live (`engine.rs`) と規則が食い違って書き出しの拍軸だけずれる
+        // (アーキ不変条件 6 — 刻みの割り方も進め方も 1 本)。
 
         // Report song-body render progress to the host (the caller's
         // sender throttles the actual IPC send). `done` caps at
