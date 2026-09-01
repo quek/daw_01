@@ -200,6 +200,35 @@ pub fn automation_value_display(
             to_display: id,
             from_display: id,
         },
+        // r.md #89: モジュレーターのツマミ。値域と log/恒等の別は
+        // `common::automation::mod_param_range` が SSoT。
+        T::ModSourceParam { param, .. } => {
+            use common::model::ModParam;
+            let (unit, format) = match param {
+                ModParam::Rate => ("Hz", ScrubableNumberFormat::Decimal(3)),
+                ModParam::FollowerAttack | ModParam::FollowerRelease => {
+                    ("ms", ScrubableNumberFormat::Decimal(1))
+                }
+                ModParam::FollowerHpHz | ModParam::FollowerLpHz => {
+                    ("Hz", ScrubableNumberFormat::Decimal(0))
+                }
+                _ => ("", ScrubableNumberFormat::Decimal(2)),
+            };
+            AutomationValueDisplay {
+                unit,
+                format,
+                range: common::automation::mod_param_range(*param).unwrap_or((0.0, 1.0)),
+                to_display: id,
+                from_display: id,
+            }
+        }
+        T::ModRoutingDepth { .. } => AutomationValueDisplay {
+            unit: "",
+            format: ScrubableNumberFormat::Decimal(2),
+            range: (-1.0, 1.0),
+            to_display: id,
+            from_display: id,
+        },
         T::SongTempo => AutomationValueDisplay {
             unit: "BPM",
             format: ScrubableNumberFormat::Decimal(1),

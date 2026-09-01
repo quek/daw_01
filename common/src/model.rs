@@ -790,6 +790,7 @@ impl Default for Song {
                 next_song_lane_id: 1,
                 next_section_id: 1,
                 next_mod_source_id: 1,
+                next_mod_routing_id: 1,
                 next_scene_id: 1,
             },
             clip_contents: HashMap::new(),
@@ -930,6 +931,52 @@ impl Song {
         let id = self.ids.next_mod_source_id.max(1);
         self.ids.next_mod_source_id = id.saturating_add(1);
         id
+    }
+
+    /// r.md #89: allocate a new stable `ModRouting` id。`0` は "未採番" sentinel なので
+    /// 最低 `1` から返す。[`AutomationTarget::ModRoutingDepth`] の参照先。
+    pub fn alloc_mod_routing_id(&mut self) -> u32 {
+        let id = self.ids.next_mod_routing_id.max(1);
+        self.ids.next_mod_routing_id = id.saturating_add(1);
+        id
+    }
+
+    /// 全 `ModRouting` を (置き場に関係なく) 走査する。
+    pub fn all_mod_routings(&self) -> impl Iterator<Item = &ModRouting> {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.mod_routings.iter())
+            .chain(self.song_mod_routings.iter())
+    }
+
+    /// `routing_id` の変調が置かれている track id (`MASTER_TRACK_ID` = song 側)。
+    ///
+    /// **置き場を `target` だけから決める全域関数は作らない** (master fx chain の
+    /// `PluginParam` が乗らない)。実際に置かれている場所を引くこの述語が SSoT。
+    #[must_use]
+    pub fn mod_routing_owner(&self, routing_id: u32) -> Option<u32> {
+        for t in &self.tracks {
+            if t.mod_routings.iter().any(|r| r.id == routing_id) {
+                return Some(t.id);
+            }
+        }
+        self.song_mod_routings
+            .iter()
+            .any(|r| r.id == routing_id)
+            .then_some(MASTER_TRACK_ID)
+    }
+
+    /// `source_id` のモジュレーターのツマミ (lane / routing) が置かれる track id。
+    /// ソースの `owner_track_id` そのもの (`0` = legacy は `MASTER_TRACK_ID` に倒す)。
+    #[must_use]
+    pub fn mod_source_owner(&self, source_id: u32) -> Option<u32> {
+        self.mod_sources.iter().find(|m| m.id == source_id).map(|m| {
+            if m.owner_track_id == 0 {
+                MASTER_TRACK_ID
+            } else {
+                m.owner_track_id
+            }
+        })
     }
 
     /// `sections` の invariant を回復する: `start_beat` 昇順、互いに非交差
@@ -1544,6 +1591,9 @@ impl Song {
         self.ensure_image_source_ids();
         self.ensure_ids();
         self.ensure_midi_binding_inputs();
+        // r.md #89: クロス変調の dangling を掃除する。id 採番の後 (routing id が
+        // 確定してから ModRoutingDepth を解決する) でなければならない。
+        self.prune_dangling_mod_targets();
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
@@ -1552,6 +1602,58 @@ impl Song {
         let resolved = self.resolve_clip_overlaps();
         self.ensure_overlay_event_coverage();
         resolved
+    }
+
+    /// r.md #89: クロス変調の **dangling 参照を固定点まで掃除**する。 **冪等** —
+    /// 2 回目は `false` を返す (派生データ load collapse の契約、r.md #9)。
+    ///
+    /// 消すのは 3 種類:
+    /// 1. `source_id` が実在しない `ModRouting` (既存の掃除)。
+    /// 2. `target` が `ModSourceParam { source_id }` で、そのソースが実在しないもの。
+    /// 3. `target` が `ModRoutingDepth { routing_id }` で、その変調が実在しないもの。
+    ///
+    /// 2 と 3 は **連鎖する** — 変調を 1 本消すと、その深さを指していた別の変調が
+    /// dangling になる。だから変化が無くなるまで回す。automation lane 側も同じ判定で
+    /// 落とす (残すと「保存はされるのに永久に効かないレーン」になる)。
+    ///
+    /// `ModParam` が種別に存在しない組み合わせ (LFO に `RandomSmooth` 等) は
+    /// **消さない** — 種別を戻せば復活する。評価と UI が
+    /// [`ModParam::exists_on`] で無視するだけ。
+    pub fn prune_dangling_mod_targets(&mut self) -> bool {
+        let mut changed_any = false;
+        loop {
+            let live_sources: std::collections::HashSet<u32> =
+                self.mod_sources.iter().map(|m| m.id).collect();
+            let live_routings: std::collections::HashSet<u32> =
+                self.all_mod_routings().map(|r| r.id).collect();
+            let dangling = |t: &AutomationTarget| match t {
+                AutomationTarget::ModSourceParam { source_id, .. } => {
+                    !live_sources.contains(source_id)
+                }
+                AutomationTarget::ModRoutingDepth { routing_id } => {
+                    !live_routings.contains(routing_id)
+                }
+                _ => false,
+            };
+            let mut changed = false;
+            let mut sweep = |routings: &mut Vec<ModRouting>, lanes: &mut Vec<AutomationLane>| {
+                let before = routings.len();
+                routings.retain(|r| live_sources.contains(&r.source_id) && !dangling(&r.target));
+                let lanes_before = lanes.len();
+                lanes.retain(|l| !dangling(&l.target));
+                if routings.len() != before || lanes.len() != lanes_before {
+                    changed = true;
+                }
+            };
+            for t in &mut self.tracks {
+                sweep(&mut t.mod_routings, &mut t.automation_lanes);
+            }
+            sweep(&mut self.song_mod_routings, &mut self.song_lanes);
+            if !changed {
+                return changed_any;
+            }
+            changed_any = true;
+        }
     }
 
     /// 全トラックのクリップの重なりを上書き規則で解消する
@@ -1808,6 +1910,33 @@ impl Song {
         }
         if self.ids.next_mod_source_id == 0 {
             self.ids.next_mod_source_id = 1;
+        }
+
+        // r.md #89: ModRouting id も同 idiom で採番する。sentinel (0) と **重複 id** を
+        // 上書きする — 重複を放置すると `ModRoutingDepth { routing_id }` がどちらの
+        // 変調を指すか決まらない (device id と同じ理由)。
+        {
+            let mut next = self.ids.next_mod_routing_id;
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut assign = |r: &mut ModRouting| {
+                if r.id == 0 || !seen.insert(r.id) {
+                    let new_id = next.max(1);
+                    next = new_id + 1;
+                    r.id = new_id;
+                    seen.insert(r.id);
+                } else if r.id >= next {
+                    next = r.id + 1;
+                }
+            };
+            for track in &mut self.tracks {
+                for r in &mut track.mod_routings {
+                    assign(r);
+                }
+            }
+            for r in &mut self.song_mod_routings {
+                assign(r);
+            }
+            self.ids.next_mod_routing_id = next.max(1);
         }
 
         // v29: device 安定 id (`PluginInstance::id`) を採番する。 track devices

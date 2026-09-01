@@ -697,7 +697,7 @@ fn render_loop(
             .iter()
             .zip(schedule.mod_kinds.iter())
         {
-            let v = common::modulators::generator_scalar(kind, playhead_beats, export_song_secs)
+            let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(playhead_beats, export_song_secs))
                 .unwrap_or(fs.env);
             mod_scalars_snapshot.push(v);
         }
@@ -757,7 +757,7 @@ fn render_loop(
                 .iter()
                 .zip(schedule.mod_kinds.iter())
             {
-                let v = common::modulators::generator_scalar(kind, playhead_beats, export_song_secs)
+                let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(playhead_beats, export_song_secs))
                     .unwrap_or(fs.env);
                 env_sidecar.scalars.push(v);
             }

@@ -198,6 +198,21 @@ impl AppData {
         // follower の attack/release と同流儀)。
     }
 
+    /// r.md #89: モジュレーターのツマミの **今の値** (plain)。ラックのツマミ・
+    /// オートメーションレーンの既定値・変調の base が全部ここを通る
+    /// (値の SSoT は `common::mod_graph::param_plain`)。
+    pub(crate) fn mod_param_plain_value(
+        &self,
+        source_id: u32,
+        param: common::model::ModParam,
+    ) -> f64 {
+        let song = self.song_doc.song();
+        let Some(m) = song.mod_sources.iter().find(|m| m.id == source_id) else {
+            return 0.0;
+        };
+        common::mod_graph::param_plain(&m.kind, param, f64::from(song.bpm))
+    }
+
     /// r.md #78: **待受中 (◉) のソースを `target` に繋ぐ唯一の口**。
     ///
     /// arm は「触ったツマミ 1 個に繋ぐ」ワンショットなので、 繋いだ時点で自動
@@ -255,6 +270,10 @@ impl AppData {
                 t.mod_routings.retain(|r| r.source_id != id);
             }
             song.song_mod_routings.retain(|r| r.source_id != id);
+            // r.md #89: このソースの **ツマミ** を指していた変調 / レーンと、
+            // 消えた変調の **深さ** を指していた変調まで連鎖して掃除する
+            // (source_id だけ見ると幽霊 routing が残る)。
+            song.prune_dangling_mod_targets();
         });
     }
 
@@ -288,21 +307,41 @@ impl AppData {
     ) -> bool {
         // 実際に追加したときだけ recompile (per-control depth ドラッグは毎フレーム
         // AddModRouting を呼ぶので、no-op add で sync すると LoadSong 連発になる)。
-        self.edit_mod_routings(track_id, |routings| {
-            if routings
-                .iter()
-                .any(|r| r.source_id == source_id && r.target == target)
-            {
-                false
+        //
+        // r.md #89: id は **足すこの 1 箇所**で採番する (`AutomationTarget::ModRoutingDepth`
+        // が 1 本の変調を指すので、後から `ensure_ids` 任せにすると採番前の一瞬だけ
+        // 深さを変調先にできない窓ができる)。
+        self.edit_song(move |song| {
+            let exists = if track_id == common::model::MASTER_TRACK_ID {
+                &song.song_mod_routings
             } else {
-                routings.push(common::model::ModRouting {
-                    target,
-                    source_id,
-                    depth: 1.0,
-                    polarity: common::model::Polarity::Unipolar,
-                });
-                true
+                match song.track_by_id(track_id) {
+                    Some(t) => &t.mod_routings,
+                    None => return false,
+                }
             }
+            .iter()
+            .any(|r| r.source_id == source_id && r.target == target);
+            if exists {
+                return false;
+            }
+            let id = song.alloc_mod_routing_id();
+            let routings = if track_id == common::model::MASTER_TRACK_ID {
+                &mut song.song_mod_routings
+            } else {
+                match song.track_by_id_mut(track_id) {
+                    Some(t) => &mut t.mod_routings,
+                    None => return false,
+                }
+            };
+            routings.push(common::model::ModRouting {
+                id,
+                target,
+                source_id,
+                depth: 1.0,
+                polarity: common::model::Polarity::Unipolar,
+            });
+            true
         })
         .unwrap_or(false)
     }
@@ -316,6 +355,8 @@ impl AppData {
         self.edit_mod_routings(track_id, |routings| {
             routings.retain(|r| !(r.source_id == source_id && r.target == target));
         });
+        // r.md #89: 消した変調の **深さ** を指していた変調も連鎖して落とす。
+        self.edit_song(|song| song.prune_dangling_mod_targets());
     }
 
     pub(crate) fn set_mod_routing_depth(

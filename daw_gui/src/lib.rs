@@ -25,6 +25,7 @@ pub mod event;
 pub mod event_launcher;
 pub mod handler;
 pub mod audio_source_cache;
+pub mod automation_label;
 pub mod automation_value;
 pub mod bootstrap;
 pub mod clipboard;

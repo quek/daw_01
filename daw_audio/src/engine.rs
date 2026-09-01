@@ -1323,7 +1323,7 @@ impl LocalState {
                 .iter()
                 .zip(self.cached_schedule.mod_kinds.iter())
             {
-                let v = common::modulators::generator_scalar(kind, self.playhead_beats, song_secs)
+                let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(self.playhead_beats, song_secs))
                     .unwrap_or(fs.env);
                 self.mod_scalars_snapshot.push(v);
             }
@@ -1422,7 +1422,7 @@ impl LocalState {
                 .zip(self.cached_schedule.mod_kinds.iter())
                 .enumerate()
             {
-                let v = common::modulators::generator_scalar(kind, self.playhead_beats, pub_song_secs)
+                let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(self.playhead_beats, pub_song_secs))
                     .unwrap_or(fs.env);
                 bridge.set_mod_scalar(slot, v);
             }

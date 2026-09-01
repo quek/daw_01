@@ -15,7 +15,7 @@
 
 use crate::model::{
     AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationTarget,
-    ClipContent, ContentId, ModRouting, Polarity, Song, TrackBuiltinParam,
+    ClipContent, ContentId, ModParam, ModRouting, Polarity, Song, TrackBuiltinParam,
 };
 use std::collections::HashMap;
 
@@ -107,8 +107,54 @@ pub fn plain_to_norm_ranged(
         // 潰れる (画面内 0..1 の範囲でのみ正確)。将来 X/Y に実座標レンジを与えて
         // affine 化する余地あり (今回スコープ外)。
         AutomationTarget::GroupTransform(_) => plain,
+        // r.md #89: モジュレーター自身のツマミ。値域の SSoT は [`mod_param_range`]
+        // (log か恒等かも含めてここ 1 箇所)。
+        AutomationTarget::ModSourceParam { param, .. } => mod_param_norm(*param, plain),
+        // 深さは -1..=1 (Pan と同 idiom)。
+        AutomationTarget::ModRoutingDepth { .. } => (plain + 1.0) / 2.0,
     };
     v.clamp(0.0, 1.0) as f32
+}
+
+/// [`ModParam`] の plain 値域。`Some((min, max))` は **log 正規化** (min > 0 が前提)、
+/// `None` は 0..=1 の恒等。`plain_to_norm` / `norm_to_plain` / UI のスクラブレンジが
+/// この 1 本を引く (SSoT)。
+#[must_use]
+pub fn mod_param_range(param: ModParam) -> Option<(f64, f64)> {
+    match param {
+        // 実効周波数 (Hz)。Free の指定レンジと同じ (`MOD_RATE_HZ_MIN`..=`MOD_RATE_HZ_MAX`)。
+        ModParam::Rate => Some((
+            f64::from(crate::model::MOD_RATE_HZ_MIN),
+            f64::from(crate::model::MOD_RATE_HZ_MAX),
+        )),
+        ModParam::LfoPhase
+        | ModParam::LfoPulseWidth
+        | ModParam::RandomSmooth
+        | ModParam::StepsSlew => None,
+        // フォロワーの時定数 (ms)。UI のスクラブ上限と揃える。
+        ModParam::FollowerAttack | ModParam::FollowerRelease => Some((0.1, 60_000.0)),
+        ModParam::FollowerGain => Some((0.01, 8.0)),
+        ModParam::FollowerHpHz | ModParam::FollowerLpHz => Some((20.0, 20_000.0)),
+    }
+}
+
+/// [`ModParam`] の plain → 正規化 0..=1。log 値域は対数、それ以外は恒等。
+/// [`mod_param_plain`] の厳密逆 (`clamp` の外側を除く)。
+#[must_use]
+pub fn mod_param_norm(param: ModParam, plain: f64) -> f64 {
+    match mod_param_range(param) {
+        Some((min, max)) => (plain.clamp(min, max) / min).ln() / (max / min).ln(),
+        None => plain,
+    }
+}
+
+/// [`mod_param_norm`] の逆。
+#[must_use]
+pub fn mod_param_plain(param: ModParam, norm: f64) -> f64 {
+    match mod_param_range(param) {
+        Some((min, max)) => min * (max / min).powf(norm.clamp(0.0, 1.0)),
+        None => norm.clamp(0.0, 1.0),
+    }
 }
 
 /// `plain_to_norm_ranged` が **表示窓の内側で affine** (`α·plain + β` の 1 次式) か。
@@ -120,18 +166,21 @@ pub fn plain_to_norm_ranged(
 /// 端点が窓の内側であることを別途確かめること
 /// (`daw_gui/src/widgets/arrangement/curve.rs::segment_is_straight_on_screen`)。
 ///
-/// 窓の内側でも非 affine なのは `GroupTransform::ScaleX` / `ScaleY` (log 空間) と
-/// `TrackBuiltin::Mute` (0.5 閾値の階段) の 2 つだけ。
+/// 窓の内側でも非 affine なのは `GroupTransform::ScaleX` / `ScaleY` (log 空間)、
+/// `TrackBuiltin::Mute` (0.5 閾値の階段)、そして log 値域を持つ
+/// [`AutomationTarget::ModSourceParam`] (r.md #89)。
 #[must_use]
 pub fn norm_mapping_is_affine(target: &AutomationTarget) -> bool {
-    !matches!(
-        target,
+    match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute)
-            | AutomationTarget::GroupTransform(
-                crate::model::GroupTransformParam::ScaleX
-                    | crate::model::GroupTransformParam::ScaleY
-            )
-    )
+        | AutomationTarget::GroupTransform(
+            crate::model::GroupTransformParam::ScaleX
+            | crate::model::GroupTransformParam::ScaleY,
+        ) => false,
+        // log 値域を持つ param だけ非 affine。0..=1 恒等の param は affine。
+        AutomationTarget::ModSourceParam { param, .. } => mod_param_range(*param).is_none(),
+        _ => true,
+    }
 }
 
 /// `plain_to_norm_ranged` が **狭義単調 (= 逆写像 `norm_to_plain_ranged` を持つ)** か。
@@ -200,6 +249,9 @@ pub fn norm_to_plain_ranged(
             crate::model::GroupTransformParam::ScaleX | crate::model::GroupTransformParam::ScaleY,
         ) => 0.1 * 100.0_f64.powf(n),
         AutomationTarget::GroupTransform(_) => n,
+        // r.md #89: `plain_to_norm_ranged` の厳密逆 (値域の SSoT は `mod_param_range`)。
+        AutomationTarget::ModSourceParam { param, .. } => mod_param_plain(*param, n),
+        AutomationTarget::ModRoutingDepth { .. } => n * 2.0 - 1.0,
     }
 }
 
@@ -1577,6 +1629,7 @@ mod tests {
         // No routings → base regardless of scalars.
         assert_eq!(apply_modulation(&target, base, &[], |_| 0.5), base);
         let routings = vec![ModRouting {
+            id: 1,
             target: target.clone(),
             source_id: 5,
             depth: 0.5,
