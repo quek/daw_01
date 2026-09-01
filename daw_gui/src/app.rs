@@ -380,6 +380,7 @@ impl AppData {
                 pending_clipboard_write: None,
                 editing_automation_point: None,
                 last_touched_param: None,
+                preview_secs_memo: std::cell::Cell::new(None),
                 home_toggle_at_first: false,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
@@ -1506,6 +1507,12 @@ impl AppData {
             }
             AppEvent::SetModSourceAttack { id, ms } => self.set_mod_source_attack(id, ms),
             AppEvent::SetModSourceRelease { id, ms } => self.set_mod_source_release(id, ms),
+            AppEvent::SetModSourceGain { id, gain } => self.set_mod_source_gain(id, gain),
+            AppEvent::SetModSourceMode { id, mode } => self.set_mod_source_mode(id, mode),
+            AppEvent::SetModSourceRectify { id, rectify } => {
+                self.set_mod_source_rectify(id, rectify)
+            }
+            AppEvent::SetModSourceBand { id, band } => self.set_mod_source_band(id, band),
             AppEvent::SetModFollowerScrubbing(active) => self.set_mod_follower_scrubbing(active),
             AppEvent::SetModSourceTapPoint { id, tap_point } => {
                 self.set_mod_source_tap_point(id, tap_point)

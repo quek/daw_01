@@ -439,6 +439,9 @@ pub struct ModSourceRow {
 /// どちらのインスペクタにも出ず**削除できなかった** (孤児)。
 #[derive(Debug, Clone)]
 pub struct ModRoutingRow {
+    /// r.md #89: 1 本の変調の安定 id (`ModRouting::id`)。widget id と
+    /// `AutomationTarget::ModRoutingDepth` (= 深さ自体を変調先にする) が指す鍵。
+    pub id: u32,
     /// この routing を保持しているトラック (`MASTER_TRACK_ID` → `song_mod_routings`)。
     /// depth / 極性 / 削除の宛先。
     pub track_id: u32,

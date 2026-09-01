@@ -916,6 +916,15 @@ pub enum AppEvent {
     /// `SetModFollowerScrubbing`).
     SetModSourceAttack { id: u32, ms: f32 },
     SetModSourceRelease { id: u32, ms: f32 },
+    /// r.md #88: envelope follower の検出前ゲイン (線形倍率、
+    /// `MOD_FOLLOWER_GAIN_MIN..=MOD_FOLLOWER_GAIN_MAX`)。
+    SetModSourceGain { id: u32, gain: f32 },
+    /// r.md #88: envelope follower の検出モード (Peak / RMS)。
+    SetModSourceMode { id: u32, mode: common::model::FollowerMode },
+    /// r.md #88: envelope follower の検出前全波整流。
+    SetModSourceRectify { id: u32, rectify: bool },
+    /// r.md #88: envelope follower の検出前帯域制限 (`None` で全帯域)。
+    SetModSourceBand { id: u32, band: Option<common::model::BandFilter> },
     /// docs/plan_modulation.md §3: follower attack/release scrub drag edge.
     /// `false` after `true` = drag-end → recompile follower coefficients once
     /// (`flush_song_sync`). Avoids a per-frame LoadSong storm.
@@ -1817,6 +1826,10 @@ impl AppEvent {
             E::EditModSource { .. }
             | E::SetModSourceAttack { .. }
             | E::SetModSourceRelease { .. }
+            | E::SetModSourceGain { .. }
+            | E::SetModSourceMode { .. }
+            | E::SetModSourceRectify { .. }
+            | E::SetModSourceBand { .. }
             | E::SetModSourceTapPoint { .. }
             | E::SetModSourceTrack { .. } => "モジュレーション編集",
             E::AddModRouting { .. } | E::RemoveModRouting { .. } => "モジュレーション接続",

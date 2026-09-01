@@ -490,6 +490,7 @@ impl AppData {
                     format!("{} \u{25b8} {label}", self.track_display_name(track_id))
                 };
                 out.push(ModRoutingRow {
+                    id: r.id,
                     track_id,
                     target: r.target.clone(),
                     label,

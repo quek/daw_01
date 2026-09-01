@@ -132,10 +132,21 @@ pub fn mod_param_range(param: ModParam) -> Option<(f64, f64)> {
         | ModParam::LfoPulseWidth
         | ModParam::RandomSmooth
         | ModParam::StepsSlew => None,
-        // フォロワーの時定数 (ms)。UI のスクラブ上限と揃える。
-        ModParam::FollowerAttack | ModParam::FollowerRelease => Some((0.1, 60_000.0)),
-        ModParam::FollowerGain => Some((0.01, 8.0)),
-        ModParam::FollowerHpHz | ModParam::FollowerLpHz => Some((20.0, 20_000.0)),
+        // フォロワーの時定数 / ゲイン / 帯域。端点は `common::model` の定数が SSoT で、
+        // UI のスクラブレンジも同じ 1 本を引く (数値を写すと、ツマミの端と変調の端が
+        // 静かにずれる)。
+        ModParam::FollowerAttack | ModParam::FollowerRelease => Some((
+            f64::from(crate::model::MOD_FOLLOWER_TIME_MS_MIN),
+            f64::from(crate::model::MOD_FOLLOWER_TIME_MS_MAX),
+        )),
+        ModParam::FollowerGain => Some((
+            f64::from(crate::model::MOD_FOLLOWER_GAIN_MIN),
+            f64::from(crate::model::MOD_FOLLOWER_GAIN_MAX),
+        )),
+        ModParam::FollowerHpHz | ModParam::FollowerLpHz => Some((
+            f64::from(crate::model::MOD_BAND_HZ_MIN),
+            f64::from(crate::model::MOD_BAND_HZ_MAX),
+        )),
     }
 }
 

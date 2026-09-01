@@ -138,6 +138,27 @@ impl Default for FollowerConfig {
     }
 }
 
+// ---------------------------------------------------------------------
+// モジュレーターのツマミの plain 値範囲 (r.md #88、
+// `docs/plan_rmd_88_89_cross_modulation.md` §3.3)
+// ---------------------------------------------------------------------
+//
+// **UI のスクラブ範囲と `automation::plain_to_norm` の対数正規化が同じ端点を使う**
+// ための SSoT。 片方だけ動かすと「ツマミの端」 と「変調の端」 がずれ、 深さ 1.0 の
+// routing がツマミの端に届かない (または届く前に飽和する) 形で静かに壊れる。
+
+// Free rate (Hz) の下端 / 上端は generator 節の `MOD_RATE_HZ_MIN` / `MOD_RATE_HZ_MAX`。
+
+/// フォロワーの attack / release (ms) の下端 / 上端。 対数目盛。
+pub const MOD_FOLLOWER_TIME_MS_MIN: f32 = 0.1;
+pub const MOD_FOLLOWER_TIME_MS_MAX: f32 = 60_000.0;
+/// フォロワーの検出前ゲインの下端 / 上端 (線形倍率)。 対数目盛。
+pub const MOD_FOLLOWER_GAIN_MIN: f32 = 0.01;
+pub const MOD_FOLLOWER_GAIN_MAX: f32 = 8.0;
+/// フォロワーの帯域フィルタ cutoff (Hz) の下端 / 上端。 対数目盛。
+pub const MOD_BAND_HZ_MIN: f32 = 20.0;
+pub const MOD_BAND_HZ_MAX: f32 = 20_000.0;
+
 /// source rack の色割当 palette (Bitwig 流、 作成順に循環)。
 pub const MOD_SOURCE_PALETTE: [[f32; 3]; 8] = [
     [0.30, 0.69, 1.00], // 青

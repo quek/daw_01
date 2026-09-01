@@ -491,26 +491,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
     /// 読み取り専用の波形プレビュー (LFO / Random)。`samples` をポリラインで描き、
     /// `phase` があれば縦カーソルを重ねる。
+    ///
+    /// `reference` は `samples` の **背後に薄く重ねる比較用の系列** (空で描かない)。
+    /// 「いま出ている形」 と「基準の形」 を同じ面で見比べさせるためのもので、 前景と
+    /// 同じ `line_color` の低アルファ版を使う (別の色を足すと、 どちらが基準か色の
+    /// 語彙を新しく覚えることになる)。 前景と同じ x 領域 `0..=1` で渡すこと。
     pub fn signal_preview(
         &mut self,
         id: impl Hash,
         rect: Rect,
         samples: &[(f32, f32)],
+        reference: &[(f32, f32)],
         phase: Option<f32>,
         style: MsegEditorStyle,
     ) {
         let wid = WidgetId::ROOT.child((b"signal_preview", &id));
         let sample_bits: Vec<u32> = samples
             .iter()
+            .chain(reference.iter())
             .flat_map(|&(x, y)| [x.to_bits(), y.to_bits()])
             .collect();
         let input_hash = hash_inputs((
             b"signal_preview",
             (rect.x.to_bits(), rect.y.to_bits(), rect.w.to_bits(), rect.h.to_bits()),
             sample_bits,
+            // 系列の境目を fold する (前景と背景の点数が入れ替わっただけの差を拾う)。
+            samples.len(),
             phase.map_or(u32::MAX, f32::to_bits),
         ));
         let samples_owned: Vec<(f32, f32)> = samples.to_vec();
+        let reference_owned: Vec<(f32, f32)> = reference.to_vec();
         self.with_widget_node(wid, input_hash, move |ui| {
             ui.push_rect(RectCommand {
                 rect,
@@ -528,6 +538,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 line_width_px: 1.0,
                 clip_rect: Some(rect),
             });
+            // 比較用の系列は前景の **下** に、 同じインクの薄い版で先に描く。
+            if reference_owned.len() >= 2 {
+                let faint = Color { a: style.line_color.a * 0.3, ..style.line_color };
+                let segs: Vec<LineSegment> = reference_owned
+                    .windows(2)
+                    .map(|w| {
+                        let (ax, ay) = (rect.x + w[0].0 * rect.w, rect.y + (1.0 - w[0].1) * rect.h);
+                        let (bx, by) = (rect.x + w[1].0 * rect.w, rect.y + (1.0 - w[1].1) * rect.h);
+                        LineSegment { a: [ax, ay], b: [bx, by], color: faint }
+                    })
+                    .collect();
+                ui.push_lines(LineBatch {
+                    segments: segs.into(),
+                    line_width_px: style.line_width_px.max(1.0),
+                    clip_rect: Some(rect),
+                });
+            }
             if samples_owned.len() >= 2 {
                 let segs: Vec<LineSegment> = samples_owned
                     .windows(2)

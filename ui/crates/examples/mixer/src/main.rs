@@ -12,8 +12,8 @@ use std::sync::Arc;
 use daw_ui_core::{Edit, FlexDirection, Gap, InputAccumulator, LayoutPass, NodeId, Padding, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
 use daw_ui_core::{
-    FaderResponse, KnobResponse, KnobStyle, ScrubableNumberFormat, TextInputResponse,
-    ToggleButtonStyle,
+    FaderResponse, KnobResponse, KnobStyle, ScrubCurve, ScrubableNumberFormat,
+    ScrubableNumberStyle, TextInputResponse, ToggleButtonStyle,
 };
 
 /// pan の表記 (`"L50"` / `"C"` / `"R100"`)。 knob の値は 0..=1 なので `pan_lr` で
@@ -24,6 +24,42 @@ const PAN_FORMAT: ScrubableNumberFormat = ScrubableNumberFormat::SignedLabeled {
     center: "C",
     scale: 100.0,
 };
+
+/// M14 Phase 134 の動作確認欄: `0.001..=128 Hz` を対数目盛 + 単位 `"Hz"` + 有効数字 3 桁で。
+///
+/// **線形**で置くと `sensitivity` が意味を持たない (全域を舐めるのに実用感度で数十万 px
+/// 要る)。 `Log` はドラッグ量が正規化領域で効くので `sensitivity = 1/250` なら 250px で
+/// 全域。 表示が有効数字なので、 下端 `0.001` も上端 `128` も同じ情報量で欄に収まる
+/// (固定小数だと下端が `"0.00"` に潰れる)。
+///
+/// `build_ui` の strip ループの中に直接書かない — 閉包が 2 段重なってインデントが深くなり、
+/// daw_01 側の arch-lint (1 関数 6 段) を割るため。
+fn draw_freq_field(ui: &mut daw_ui_core::Ui<'_, MixerModel>, i: usize, rect: Rect, value: f64) {
+    let style = ScrubableNumberStyle {
+        font_size: 12.0,
+        sensitivity: 1.0 / 250.0,
+        range: Some((0.001, 128.0)),
+        curve: ScrubCurve::Log,
+        unit: "Hz",
+        ..ScrubableNumberStyle::from_palette(ui.palette())
+    };
+    let _ = ui.scrubable_number_at(
+        ("ch_freq", i),
+        rect,
+        value,
+        1.0,
+        ScrubableNumberFormat::Significant { digits: 3 },
+        &style,
+        move |v| {
+            Edit::mutate(move |m: &mut MixerModel| {
+                m.freqs[i] = v;
+                m.last_action = format!("ch{} freq = {v} Hz", i + 1);
+            })
+        },
+        None,
+        None,
+    );
+}
 
 /// knob の正規化値 (0..=1) → 中央 0 の L/R 値 (-1..=1)。
 fn pan_lr(norm: f32) -> f64 {
@@ -46,6 +82,10 @@ struct MixerModel {
     pans: [f32; 8],
     /// M3 動作確認用: 8 ch の mute フラグ。
     mutes: [bool; 8],
+    /// M14 Phase 134: 8 ch の `ScrubCurve::Log` 動作確認用の周波数 (Hz)。
+    /// 下端と上端が 5 桁離れる範囲 (`0.001..=128`) を 1 本のドラッグで舐められるか、
+    /// 単位 `"Hz"` が数値の右に薄く出るか、 編集モードで単位が消えるかを見る。
+    freqs: [f64; 8],
     /// M9 Phase 43: debug overlay の表示状態 (Ctrl+F1 で toggle)。
     show_debug_overlay: bool,
     /// M9 Phase 43: 直近フレームの所要時間 (debug overlay 表示用)。
@@ -62,6 +102,7 @@ impl MixerModel {
             faders: [0.50, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],
             pans: [0.50, 0.40, 0.60, 0.55, 0.30, 0.70, 0.50, 0.45],
             mutes: [false; 8],
+            freqs: [0.001, 0.05, 0.5, 1.0, 4.0, 12.5, 60.0, 128.0],
             show_debug_overlay: false,
             last_frame_ms: 0.0,
         }
@@ -227,7 +268,7 @@ impl App {
 
                 // LayoutPass で各 ch のサブノードと列ノードを作る。
                 let mut layout = LayoutPass::new();
-                let mut sub_nodes: Vec<(NodeId, NodeId, NodeId, NodeId, NodeId)> =
+                let mut sub_nodes: Vec<(NodeId, NodeId, NodeId, NodeId, NodeId, NodeId)> =
                     Vec::with_capacity(8);
                 let mut col_nodes: Vec<NodeId> = Vec::with_capacity(8);
                 for _ in 0..8 {
@@ -235,13 +276,14 @@ impl App {
                     let pct_n   = layout.leaf(60.0, 26.0);
                     let knob_n  = layout.leaf(60.0, 56.0);
                     let pan_n   = layout.leaf(60.0, 16.0);
+                    let freq_n  = layout.leaf(60.0, 20.0);
                     let mute_n  = layout.leaf(60.0, 24.0);
-                    sub_nodes.push((fader_n, pct_n, knob_n, pan_n, mute_n));
+                    sub_nodes.push((fader_n, pct_n, knob_n, pan_n, freq_n, mute_n));
                     col_nodes.push(layout.flex(
                         FlexDirection::Column,
                         Gap::all(6.0),
                         Padding::ZERO,
-                        &[fader_n, pct_n, knob_n, pan_n, mute_n],
+                        &[fader_n, pct_n, knob_n, pan_n, freq_n, mute_n],
                     ));
                 }
                 let root = layout.flex(
@@ -260,11 +302,12 @@ impl App {
                 );
 
                 for i in 0..8 {
-                    let (fader_n, pct_n, knob_n, pan_n, mute_n) = sub_nodes[i];
+                    let (fader_n, pct_n, knob_n, pan_n, freq_n, mute_n) = sub_nodes[i];
                     let fader_rect = layout.rect(fader_n);
                     let pct_rect   = layout.rect(pct_n);
                     let knob_rect  = layout.rect(knob_n);
                     let pan_rect   = layout.rect(pan_n);
+                    let freq_rect  = layout.rect(freq_n);
                     let mute_rect  = layout.rect(mute_n);
 
                     let resp: FaderResponse =
@@ -316,6 +359,9 @@ impl App {
                             Color::rgb(0.65, 0.68, 0.72)
                         },
                     );
+
+                    // M14 Phase 134: `ScrubCurve::Log` + `unit` + `Significant` の動作確認欄。
+                    draw_freq_field(ui, i, freq_rect, m.freqs[i]);
 
                     // M9 Phase 45b: toggle_button_at で DAW 慣習の M (mute) ボタン。
                     let mute_style = ToggleButtonStyle {

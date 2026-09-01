@@ -3,6 +3,22 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
+use common::model::{
+    MOD_BAND_HZ_MAX, MOD_BAND_HZ_MIN, MOD_FOLLOWER_GAIN_MAX, MOD_FOLLOWER_GAIN_MIN, ModParam,
+};
+
+/// Pulse の duty を 0..=1 に収めた shape。 duty は「値」 なので、兄弟 param
+/// (phase / smooth / slew) と同じく **書き戻しのチョークポイントで** clamp する。
+/// 評価側 (`lfo_shape_value`) も clamp するが、範囲外のまま保存されると欄の表示と
+/// 実出力が食い違ったまま残る (欄は "1.50"、音は常時 1.0 の直線)。
+fn clamped_lfo_shape(shape: common::model::LfoShape) -> common::model::LfoShape {
+    match shape {
+        common::model::LfoShape::Pulse { width } => {
+            common::model::LfoShape::Pulse { width: width.clamp(0.0, 1.0) }
+        }
+        other => other,
+    }
+}
 
 impl AppData {
     // ---- docs/plan_modulation.md §9: modulation source / routing CRUD ----
@@ -94,7 +110,7 @@ impl AppData {
             }
             ModSourceEdit::LfoShape(shape) => {
                 if let ModSourceKind::Lfo(c) = &mut m.kind {
-                    c.shape = shape;
+                    c.shape = clamped_lfo_shape(shape);
                 }
             }
             ModSourceEdit::LfoPhase(p) => {
@@ -471,10 +487,74 @@ impl AppData {
         // LoadSong を避けるため dirty マークのみ (= edit_song が epoch を bump)。
         // drag-end に sync する (track_inspector の mod_follower_scrub_active エッジ検出)。
         self.edit_mod_source_follower(id, |_, follower| follower.attack_ms = ms.max(0.0));
+        self.note_touched_mod_param(id, ModParam::FollowerAttack);
     }
 
     pub(crate) fn set_mod_source_release(&mut self, id: u32, ms: f32) {
         self.edit_mod_source_follower(id, |_, follower| follower.release_ms = ms.max(0.0));
+        self.note_touched_mod_param(id, ModParam::FollowerRelease);
+    }
+
+    /// r.md #88: 検出前ゲイン。 attack/release と同じく係数は recompile で bake される
+    /// (`daw_audio/src/graph/follower.rs` の `from_config`)。
+    pub(crate) fn set_mod_source_gain(&mut self, id: u32, gain: f32) {
+        self.edit_mod_source_follower(id, |_, follower| {
+            follower.gain = gain.clamp(MOD_FOLLOWER_GAIN_MIN, MOD_FOLLOWER_GAIN_MAX);
+        });
+        self.note_touched_mod_param(id, ModParam::FollowerGain);
+    }
+
+    /// r.md #88: 検出モード (Peak / RMS)。 **値ではない編集**なので「触った parameter」
+    /// には記録しない (`edit_touched_param` が形 / 種別を `None` に落とすのと同じ規約)。
+    pub(crate) fn set_mod_source_mode(&mut self, id: u32, mode: common::model::FollowerMode) {
+        self.edit_mod_source_follower(id, |_, follower| follower.mode = mode);
+    }
+
+    /// r.md #88: 検出前の全波整流。 これも値ではないので記録しない。
+    pub(crate) fn set_mod_source_rectify(&mut self, id: u32, rectify: bool) {
+        self.edit_mod_source_follower(id, |_, follower| follower.rectify = rectify);
+    }
+
+    /// r.md #88: 検出前の帯域制限 (`None` で全帯域)。 `hp <= lp` に整えてから入れる —
+    /// 逆転した帯域は一次フィルタ 2 段が互いを打ち消して**無音を検出し続ける**ので、
+    /// 「効かない」 が値からは読めない状態になる。
+    ///
+    /// 「触った parameter」は **前後を突き合わせて動いた側だけ** 記録する。 両方書くと
+    /// `A` キーが常に片方のレーンを作ることになるし、 on/off の切替は値ではない。
+    pub(crate) fn set_mod_source_band(
+        &mut self,
+        id: u32,
+        band: Option<common::model::BandFilter>,
+    ) {
+        let band = band.map(|b| common::model::BandFilter {
+            hp_hz: b.hp_hz.clamp(MOD_BAND_HZ_MIN, MOD_BAND_HZ_MAX),
+            lp_hz: b.lp_hz.clamp(b.hp_hz.clamp(MOD_BAND_HZ_MIN, MOD_BAND_HZ_MAX), MOD_BAND_HZ_MAX),
+        });
+        let prev = self
+            .song_doc
+            .song()
+            .mod_sources
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.follower().and_then(|(_, f)| f.band_filter));
+        let touched = match (prev, band) {
+            (Some(a), Some(b)) if a.hp_hz != b.hp_hz => Some(ModParam::FollowerHpHz),
+            (Some(a), Some(b)) if a.lp_hz != b.lp_hz => Some(ModParam::FollowerLpHz),
+            _ => None,
+        };
+        self.edit_mod_source_follower(id, |_, follower| follower.band_filter = band);
+        if let Some(param) = touched {
+            self.note_touched_mod_param(id, param);
+        }
+    }
+
+    /// フォロワーのツマミを触ったことを記録する薄いラッパ。 `note_touched_mod_target`
+    /// が唯一の記録口なので、 ここは `AutomationTarget` を組み立てるだけ。
+    fn note_touched_mod_param(&mut self, source_id: u32, param: ModParam) {
+        self.note_touched_mod_target(common::model::AutomationTarget::ModSourceParam {
+            source_id,
+            param,
+        });
     }
 
     pub(crate) fn set_mod_follower_scrubbing(&mut self, active: bool) {
