@@ -72,6 +72,9 @@ impl AppData {
         if !self.song_doc.song().mod_sources.iter().any(|m| m.id == id) {
             return;
         }
+        // r.md #89: 「最後に触った parameter」の記録はここ 1 箇所に集める
+        // (`A` キーでオートメーションレーンを作れるのは記録された param だけ)。
+        let touched = Self::edit_touched_param(&edit);
         let _ = self
             .edit_song(move |song| {
                 let Some(m) = song.mod_sources.iter_mut().find(|m| m.id == id) else {
@@ -196,6 +199,12 @@ impl AppData {
         // 変更は recompile で engine に反映する。 連続ドラッグ系は per-frame LoadSong
         // を避け dirty のみ (= edit_song が epoch bump、 drag-end edge で sync、
         // follower の attack/release と同流儀)。
+        if let Some(param) = touched {
+            self.note_touched_mod_target(common::model::AutomationTarget::ModSourceParam {
+                source_id: id,
+                param,
+            });
+        }
     }
 
     /// r.md #89: モジュレーターのツマミの **今の値** (plain)。ラックのツマミ・
@@ -211,6 +220,54 @@ impl AppData {
             return 0.0;
         };
         common::mod_graph::param_plain(&m.kind, param, f64::from(song.bpm))
+    }
+
+    /// r.md #89: `ModSourceEdit` が動かす [`common::model::ModParam`]。
+    /// 「触った parameter」の記録を **`edit_mod_source` の 1 箇所**に集めるための写像
+    /// (ラックの各ツマミに記録を書かせると、足し忘れたツマミだけ `A` が効かなくなる)。
+    /// 形 / 種別 / 点の追加削除など「値ではない編集」は `None`。
+    fn edit_touched_param(edit: &ModSourceEdit) -> Option<common::model::ModParam> {
+        use common::model::ModParam;
+        match edit {
+            ModSourceEdit::Rate(_) => Some(ModParam::Rate),
+            ModSourceEdit::LfoPhase(_) => Some(ModParam::LfoPhase),
+            // Pulse の duty は shape に載っているので、Pulse を選び直したときだけ拾う。
+            ModSourceEdit::LfoShape(common::model::LfoShape::Pulse { .. }) => {
+                Some(ModParam::LfoPulseWidth)
+            }
+            ModSourceEdit::RandomSmooth(_) => Some(ModParam::RandomSmooth),
+            ModSourceEdit::StepsSlew(_) => Some(ModParam::StepsSlew),
+            _ => None,
+        }
+    }
+
+    /// r.md #89: モジュレーターのツマミ / 変調の深さを触ったことを記録する。
+    /// `A` キーの「最後に触った parameter のオートメーションレーンを追加」が
+    /// これを見るので、**ラックのツマミを動かしたら必ず呼ぶこと**
+    /// (呼ばないと、そのツマミだけ `A` でレーンを作れない片手落ちになる)。
+    ///
+    /// `track_id` はレーン / routing の置き場 (= ソースの帰属トラック、master なら
+    /// `MASTER_TRACK_ID`)。`add_automation_from_last_touched` の song-level 判定が
+    /// これをそのまま使う。
+    pub(crate) fn note_touched_mod_target(
+        &mut self,
+        target: common::model::AutomationTarget,
+    ) {
+        use common::model::AutomationTarget as T;
+        let song = self.song_doc.song();
+        let track_id = match &target {
+            T::ModSourceParam { source_id, .. } => song.mod_source_owner(*source_id),
+            T::ModRoutingDepth { routing_id } => song.mod_routing_owner(*routing_id),
+            _ => None,
+        };
+        let Some(track_id) = track_id else { return };
+        let display_name = self.automation_target_label(&target);
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+            track_id,
+            target,
+            display_name,
+            touched_at: std::time::Instant::now(),
+        });
     }
 
     /// r.md #78: **待受中 (◉) のソースを `target` に繋ぐ唯一の口**。
@@ -369,14 +426,19 @@ impl AppData {
         // depth は GUI compose が毎フレーム読む visual-only 値 (Phase 4)。 scrub
         // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる
         // (= edit_song が epoch を bump)。
-        self.edit_mod_routings(track_id, |routings| {
-            if let Some(r) = routings
+        let touched = self.edit_mod_routings(track_id, |routings| {
+            let r = routings
                 .iter_mut()
-                .find(|r| r.source_id == source_id && r.target == target)
-            {
-                r.depth = depth.clamp(-1.0, 1.0);
-            }
+                .find(|r| r.source_id == source_id && r.target == target)?;
+            r.depth = depth.clamp(-1.0, 1.0);
+            Some(r.id)
         });
+        // r.md #89: 深さ自体も変調先 / オートメーション先なので、触ったことを記録する。
+        if let Some(Some(routing_id)) = touched {
+            self.note_touched_mod_target(common::model::AutomationTarget::ModRoutingDepth {
+                routing_id,
+            });
+        }
     }
 
     pub(crate) fn set_mod_routing_polarity(
