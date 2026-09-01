@@ -545,9 +545,8 @@ fn run_worker(
     // r.md #89: param modulation は制御グリッド化で 1 buffer あたり最大
     // `MAX_PARAM_MODS` 件届く (刻みごと × param 数)。`MAX_EVENTS` (= ノート側の
     // 上限) のままだと audio worker thread で realloc する。
-    let mut param_events_in: Vec<crate::plugin_instance::TimedParamEvent> = Vec::with_capacity(
-        common::process_data::MAX_EVENTS + common::process_data::MAX_PARAM_MODS,
-    );
+    let mut param_events_in: Vec<crate::plugin_instance::TimedParamEvent> =
+        Vec::with_capacity(common::process_data::MAX_RT_EVENT_BUFFER);
     let mut events_out: Vec<TimedNoteEvent> = Vec::with_capacity(common::process_data::MAX_EVENTS);
     let mut out_param_touches: Vec<u32> = Vec::with_capacity(64);
     let mut out_param_values: Vec<(u32, f64)> = Vec::with_capacity(common::process_data::MAX_EVENTS);

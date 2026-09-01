@@ -48,6 +48,26 @@ struct ModParamField<'a> {
     on_change: &'a dyn Fn(f64) -> Edit<AppData>,
 }
 
+/// この欄が **値そのものを編集できるか**。
+///
+/// 速さ (`ModParam::Rate`) の欄は両モードで出すが、音価同期のときは
+/// 「今の実効の速さ」を見せる読み取り専用になる (直接 Hz を打つのは Hz モードだけ)。
+/// 読み取り専用でも ◉ 待受中の深さドラッグは通るので、音価同期の LFO の速さも
+/// ここから変調先にできる (r.md #89)。
+fn param_is_read_only(cx: &ModBodyCtx<'_>, sid: u32, param: ModParam) -> bool {
+    use common::model::ModRateMode;
+    param == ModParam::Rate
+        && cx
+            .app
+            .song_doc
+            .song()
+            .mod_sources
+            .iter()
+            .find(|m| m.id == sid)
+            .and_then(|m| m.kind.rate())
+            .is_some_and(|r| r.mode != ModRateMode::Free)
+}
+
 /// モジュレーターのツマミ 1 本を描く。 **値もレンジも SSoT を引き、 そのまま変調先になる。**
 ///
 /// - 値 = `common::mod_graph::param_plain` (ラック / レーンの既定値 / 変調の base が同じ 1 本)。
@@ -68,6 +88,7 @@ fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: ModParamFie
         range: Some(log.unwrap_or((0.0, 1.0))),
         curve: if log.is_some() { ScrubCurve::Log } else { ScrubCurve::Linear },
         unit: f.unit,
+        read_only: param_is_read_only(cx, f.sid, f.param),
         // 対数欄は正規化領域の units_per_pixel なので、 何桁またいでも全域 250px。
         // 恒等 0..=1 の欄は従来の細かい感度を保つ。
         sensitivity: if log.is_some() { 1.0 / 250.0 } else { 0.006 },
@@ -318,11 +339,12 @@ fn mod_rate_full(
     rate: &common::model::ModRate,
     sid: u32,
 ) -> bool {
-    use common::model::{ModRate, ModRateMode};
+    use common::model::ModRate;
     mod_rate_control(ui, Rect { x, y, w: MOD_RATE_DROPDOWN_W, h: ROW_H }, rate, sid);
-    if rate.mode != ModRateMode::Free {
-        return false;
-    }
+    // r.md #89: **速さ欄は両モードで常に出す。** 音価モードでは「今の実効の速さ」を
+    // 読み取り専用で見せる欄になり、そこを ◉ 待受中にドラッグすれば変調が乗る。
+    // ここを Hz モードのときだけ出していた頃は、音価同期の LFO の速さを ◉ で
+    // 掴む場所がどこにも無かった (Q1 で決めた「音価から連続に外れる」が作れない)。
     // 音価に戻しても `hz` は残る (`ModRate` が両方持つ) ので、 `..base` で他方を保つ。
     let base = *rate;
     mod_param_field(

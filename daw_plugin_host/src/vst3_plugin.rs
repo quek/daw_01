@@ -691,9 +691,7 @@ impl Vst3Plugin {
             // MAX_EVENTS (256) automation/mod events + up to 64 folded-in
             // GUI edits → never reallocs on the RT path.
             // r.md #89: 制御グリッド化で param mod は 1 buffer 最大 `MAX_PARAM_MODS` 件。
-            folded_param_events: Vec::with_capacity(
-                common::process_data::MAX_EVENTS + common::process_data::MAX_PARAM_MODS,
-            ),
+            folded_param_events: Vec::with_capacity(common::process_data::MAX_RT_EVENT_BUFFER),
             gui_param_edits: Arc::clone(&gui_param_edits),
             gui_edit_scratch: Vec::with_capacity(64),
             param_pool_overflowed: Arc::clone(&param_pool_overflowed),

@@ -25,6 +25,12 @@ pub const MAX_EVENTS: usize = 256;
 ///
 /// 容量は 16 刻み × 64 param。1 件 16 バイトなので 16 KB / plugin instance。
 pub const MAX_PARAM_MODS: usize = 1024;
+
+/// RT の event 変換バッファの推奨容量 = ノート ([`MAX_EVENTS`]) と param modulation
+/// ([`MAX_PARAM_MODS`]) が同時に満杯でも確保が起きない大きさ。
+/// **plugin host 側の事前確保はこの 1 本を引くこと** — 片方の上限だけ上げると、
+/// 変換先の `Vec` が audio worker thread で realloc する (r.md #89)。
+pub const MAX_RT_EVENT_BUFFER: usize = MAX_EVENTS + MAX_PARAM_MODS;
 /// PR4 sidechain: how many `is_main=false` aux input ports per plugin
 /// the host reserves shmem for. 1 covers the typical "single sidechain
 /// trigger" use case (compressor / gate / ducker); we allocate one

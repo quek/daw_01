@@ -198,6 +198,16 @@ pub struct ScrubableNumberStyle {
     /// parse は末尾の単位を大文字小文字を無視して剥がすので、 表示のまま `"12.5 Hz"` と
     /// 打っても通る (`SignedLabeled` の WYSIWYG と同じ姿勢)。
     pub unit: &'static str,
+    /// **値そのものは編集できない欄** (読み取り専用の実測値表示)。
+    ///
+    /// `true` にすると base のドラッグ / dblclick リセット / テキスト入力が入らず、
+    /// 数値は薄いインクで描かれる。**変調の深さドラッグ (`modulation.edit` が
+    /// `Some`) は通る** — 「今この値がいくつか」は読めて、そこに変調を掛けることは
+    /// できる、という欄のため (r.md #89: 音価同期の LFO の実効速さ)。
+    ///
+    /// `on_change` を no-op にして塞ぐのは禁じる — 掴めるのに何も起きない欄になり、
+    /// 効かない理由が画面から読めない。
+    pub read_only: bool,
 }
 
 impl ScrubableNumberStyle {
@@ -223,6 +233,7 @@ impl ScrubableNumberStyle {
             range: None,
             curve: ScrubCurve::Linear,
             unit: "",
+            read_only: false,
         }
     }
 }
@@ -628,7 +639,14 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                         && (c.pos.0 - px).hypot(c.pos.1 - py) < DOUBLE_CLICK_PX
                 });
 
-                if is_double && !depth_mode {
+                if style.read_only && !depth_mode {
+                    // 読み取り専用の欄は base を掴ませない (深さドラッグだけ通す)。
+                    state.last_click = None;
+                    state.drag_anchor = None;
+                    state.drag_initial_value = None;
+                    state.drag_distance = 0.0;
+                    state.editing = false;
+                } else if is_double && !depth_mode {
                     // dblclick → default reset (= editing も解除)。 depth-edit 中は base を
                     // 触らない (非破壊) ので dblclick reset は抑止し下の通常 press 扱いにする。
                     state.last_click = None;
@@ -950,11 +968,15 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
     let line_h = style.font_size * 1.2;
     let tx = rect.x + pad_x;
     let ty = rect.y + (rect.h - line_h) * 0.5;
-    let text_color = if bg_fill == style.bg_color {
+    let mut text_color = if bg_fill == style.bg_color {
         style.text_color
     } else {
         ui.palette().ink_for(bg_fill)
     };
+    // 読み取り専用の欄は薄いインクで描く — 掴めない理由が画面から読めるように。
+    if style.read_only {
+        text_color.a *= 0.65;
+    }
     ui.push_text(GlyphArea {
         text: text.into(),
         left: tx,
