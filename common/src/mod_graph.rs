@@ -216,11 +216,43 @@ pub fn build_plan(
         slot_of_pos[pos] = u16::try_from(slot).unwrap_or(u16::MAX);
     }
 
-    // 5. tier: 「rate に入る辺の推移閉包に follower が居るか」。
+    // 5. tier 判定。
+    //
+    // 位相の積分が要るのは **rate が動くとき**だけ。動かす経路は 2 つある:
+    // 変調の辺 (`ModParam::Rate` に入る辺) と、`ModParam::Rate` の automation lane。
+    // lane を数えないと「レーンで速さを描いたのに閉形式で評価される」= 位相が跳ぶ。
     let rate_modulated: Vec<bool> = (0..n)
-        .map(|i| adj[i].iter().any(|(_, p, ..)| *p == ModParam::Rate))
+        .map(|i| {
+            adj[i].iter().any(|(_, p, ..)| *p == ModParam::Rate)
+                || song_has_lane(
+                    song,
+                    song.mod_sources[i].owner_track_id,
+                    &AutomationTarget::ModSourceParam {
+                        source_id: song.mod_sources[i].id,
+                        param: ModParam::Rate,
+                    },
+                )
+        })
         .collect();
+    // `audio_dep[x]` = x の **出力**が音に依存するか (どの param 経由でも伝播する)。
     let audio_dep = audio_dependency(song, &adj);
+    // テンポそのものが音で動くなら、刻みの `dt_beats` が音依存になる。
+    // 位相表はフォロワーを 0 として焼くので、この曲では **どのソースも**表で
+    // 再現できない (レビュー確定: サイドチェイン → SongTempo の構成で seek のたびに
+    // 全 Integrated の位相が飛ぶのに「位置依存」バッジが出なかった)。
+    let tempo_is_audio_driven = song.song_mod_routings.iter().any(|r| {
+        r.target == AutomationTarget::SongTempo
+            && pos_of(r.source_id).is_some_and(|p| audio_dep[p])
+    });
+    // **位相**が音に依存するのは「rate に入る辺の上流に follower が居る」ときだけ。
+    // 位相と無関係な param (φ / 幅 / なめらかさ) に follower を挿しただけで
+    // 位置依存へ落とすと、表で厳密一致できるはずの構成が seek で飛ぶ。
+    let rate_chain_is_audio = |i: usize| {
+        tempo_is_audio_driven
+            || adj[i]
+                .iter()
+                .any(|&(s, p, ..)| p == ModParam::Rate && audio_dep[s])
+    };
 
     let mut nodes = Vec::with_capacity(n);
     let mut slot_ids = Vec::with_capacity(n);
@@ -230,7 +262,7 @@ pub fn build_plan(
         let slot_u16 = u16::try_from(slot).unwrap_or(u16::MAX);
         let tier = if !rate_modulated[pos] {
             ModTier::Closed
-        } else if audio_dep[pos] {
+        } else if rate_chain_is_audio(pos) {
             ModTier::Audio
         } else {
             ModTier::Integrated
@@ -412,6 +444,11 @@ pub struct ModRuntime {
     /// envelope follower の出力 (engine ring が `set_follower` で書く)。
     follower: Vec<f32>,
     base: Vec<[f64; MOD_PARAM_COUNT]>,
+    /// その param の base を **automation lane が上書きしたか** ([`ModPlan::lane_params`])。
+    /// `Rate` の base は tempo 依存で `ModRate::base_hz` から毎刻み求めるので、
+    /// 「レーンが書いたのか、まだ誰も書いていない 0.0 なのか」を値では区別できない。
+    /// `install` で false に戻り、[`ModRuntime::set_base`] で立つ。
+    base_from_lane: Vec<[bool; MOD_PARAM_COUNT]>,
     /// 各ソースの実効パラメータ (フォロワー係数の再計算に engine が使う)。
     eff: Vec<[f64; MOD_PARAM_COUNT]>,
     /// 次に来るはずの刻み。ずれたら位相を張り直す (locate / ループ折返し)。
@@ -433,6 +470,8 @@ impl ModRuntime {
         self.follower.resize(n, 0.0);
         self.base.clear();
         self.base.extend(plan.nodes.iter().map(|node| node.base));
+        self.base_from_lane.clear();
+        self.base_from_lane.resize(n, [false; MOD_PARAM_COUNT]);
         self.eff.clear();
         self.eff.resize(n, [0.0; MOD_PARAM_COUNT]);
         self.generation = plan.generation;
@@ -444,6 +483,9 @@ impl ModRuntime {
     pub fn set_base(&mut self, slot: u16, param: ModParam, plain: f64) {
         if let Some(row) = self.base.get_mut(usize::from(slot)) {
             row[param.index()] = plain;
+        }
+        if let Some(row) = self.base_from_lane.get_mut(usize::from(slot)) {
+            row[param.index()] = true;
         }
     }
 
@@ -532,7 +574,14 @@ pub fn tick(
         }
 
         // --- 2. 位相 / 周期位置 ---
-        let base_hz = node.rate.map_or(0.0, |r| r.base_hz(ctx.bpm));
+        // `Rate` の base は tempo 依存なので毎刻み `base_hz` から求める。ただし
+        // **automation lane が書いていればそちらが base** (レーンの plain 単位は Hz)。
+        // これを見ないと `ModPlan::lane_params` が Rate を集めても評価に効かない。
+        let base_hz = if rt.base_from_lane[slot][ModParam::Rate.index()] {
+            rt.base[slot][ModParam::Rate.index()]
+        } else {
+            node.rate.map_or(0.0, |r| r.base_hz(ctx.bpm))
+        };
         let hz_eff = if off[ModParam::Rate.index()] == 0.0 {
             base_hz
         } else {
@@ -725,6 +774,14 @@ pub fn locate(
             rt.phase[slot] = p;
         }
     }
+    // 輪 (`ModEdge::delayed`) は「1 刻み前の値」を読む。位相だけ戻して replay を
+    // 始めると、replay 1 刻み目の遅延辺が 0 か前回再生の残骸を読み、そこで入った
+    // 誤差が積分器に残って輪で増幅される。位相と同じ格子で焼いた値を一緒に戻す。
+    if let Some(prev) = table.prev_at(target_tick)
+        && prev.len() == rt.prev.len()
+    {
+        rt.prev.copy_from_slice(prev);
+    }
     let dt_secs = f64::from(MOD_TICK_FRAMES) / f64::from(sample_rate.max(1));
     let start = b as i64 * MOD_PHASE_BREAKPOINT_TICKS;
     rt.next_tick = start;
@@ -760,6 +817,17 @@ pub struct ModPhaseTable {
     /// `phases[slot][b]` = breakpoint b (= tick `b * MOD_PHASE_BREAKPOINT_TICKS`) の位相。
     /// `Closed` / `Audio` の slot は空 `Vec`。
     phases: Vec<Vec<f64>>,
+    /// breakpoint 時点の **1 刻み前の出力** (= その刻みの [`ModRuntime::prev`])。
+    ///
+    /// 輪 (`ModEdge::delayed`) は `rt.prev` を読むので、位相だけ戻して replay を
+    /// 始めると **replay 1 刻み目の遅延辺が 0 か前回再生の残骸を読む**。そこで入った
+    /// 誤差は積分器に残り、輪で増幅されて成長する (実測: 1/4 sync・depth 0.2 の
+    /// 相互 rate 変調で tick 4000 のとき 0.015 周期)。位相と同じ格子で焼いて
+    /// [`locate`] が一緒に戻すことで、通し再生と厳密に一致させる。
+    ///
+    /// `[breakpoint][slot]` の並び (slot 数は plan 全体ぶん — 遅延辺の src は
+    /// `Closed` tier のこともあるので Integrated だけでは足りない)。
+    prevs: Vec<Vec<f32>>,
     /// breakpoint での transport 状態 (再現 walk の起点)。`phases` と同じ長さ。
     marks: Vec<PhaseMark>,
     pub generation: u64,
@@ -788,6 +856,7 @@ impl ModPhaseTable {
     pub fn build(plan: &ModPlan, song: &Song, sample_rate: u32, length_secs: f64) -> Self {
         let n = plan.nodes.len();
         let mut phases: Vec<Vec<f64>> = vec![Vec::new(); n];
+        let mut prevs: Vec<Vec<f32>> = Vec::new();
         let mut marks: Vec<PhaseMark> = Vec::new();
         let integrated: Vec<bool> =
             plan.nodes.iter().map(|x| x.tier == ModTier::Integrated).collect();
@@ -797,7 +866,7 @@ impl ModPhaseTable {
             || length_secs <= 0.0
             || length_secs > MOD_PHASE_TABLE_MAX_SECS
         {
-            return Self { phases, marks, generation: plan.generation };
+            return Self { phases, prevs, marks, generation: plan.generation };
         }
         let sr = f64::from(sample_rate);
         let dt_secs = f64::from(MOD_TICK_FRAMES) / sr;
@@ -809,6 +878,7 @@ impl ModPhaseTable {
                 phases[slot] = Vec::with_capacity(n_breakpoints);
             }
         }
+        prevs.reserve(n_breakpoints);
         let mut rt = ModRuntime::default();
         rt.install(plan);
         let mark0 = PhaseMark {
@@ -822,9 +892,12 @@ impl ModPhaseTable {
                     phases[slot].push(rt.phase(u16::try_from(slot).unwrap_or(u16::MAX)));
                 }
             }
+            // 遅延辺が読む「1 刻み前の値」。この callback は刻み `k` を評価する **前**に
+            // 呼ばれるので、`rt.prev` はちょうど刻み `k-1` の出力になっている。
+            prevs.push(rt.prev.clone());
             marks.push(mark);
         });
-        Self { phases, marks, generation: plan.generation }
+        Self { phases, prevs, marks, generation: plan.generation }
     }
 
     /// `tick_index` 以下の直近 breakpoint の index と transport 状態。
@@ -855,6 +928,16 @@ impl ModPhaseTable {
     #[must_use]
     pub fn slots(&self) -> usize {
         self.phases.len()
+    }
+
+    /// `tick_index` 以下の直近 breakpoint 時点の「1 刻み前の出力」(遅延辺が読む値)。
+    #[must_use]
+    pub fn prev_at(&self, tick_index: i64) -> Option<&[f32]> {
+        if tick_index < 0 {
+            return None;
+        }
+        let b = usize::try_from(tick_index / MOD_PHASE_BREAKPOINT_TICKS).ok()?;
+        self.prevs.get(b).map(Vec::as_slice)
     }
 
     /// 表が張られている slot か。
@@ -1019,6 +1102,134 @@ mod tests {
     /// 設計正本 §8-4: rate を変調しているソースの位相が、**表の breakpoint から前進した場合**と
     /// **曲頭から通しで再生した場合**で厳密に一致すること (= どこから再生しても同じ位相)。
     /// 近似ではなく bit 一致であることが「位置依存にしない」の担保。
+    #[test]
+    /// tier は **位相が何に依存するか**だけで決まること。
+    ///
+    /// レビューで確定した 3 つの取り違えを固定する:
+    /// - rate と無関係な param (φ) に follower を挿しただけで `Audio` に落ちる
+    ///   (= 表で厳密一致できるはずの構成が seek で飛び、誤った「位置依存」バッジが出る)。
+    /// - `ModParam::Rate` の automation lane を数えないので `Closed` のまま
+    ///   (= レーンで速さを描くと閉形式評価に倒れて位相が跳ぶ)。
+    /// - テンポ自体が音で動く曲を数えないので `Integrated` のまま
+    ///   (= 表はフォロワー 0 で焼くので実演奏と食い違う)。
+    #[test]
+    fn tierは位相が何に依存するかだけで決まる() {
+        let follower = |id: u32| ModSource {
+            id,
+            owner_track_id: 1,
+            color: [0.0; 3],
+            kind: ModSourceKind::EnvelopeFollower {
+                tap: crate::model::AudioTap::post_fader(1),
+                follower: crate::model::FollowerConfig::default(),
+            },
+        };
+        let edge = |id: u32, from: u32, to: u32, param: ModParam| ModRouting {
+            id,
+            target: AutomationTarget::ModSourceParam { source_id: to, param },
+            source_id: from,
+            depth: 0.3,
+            polarity: Polarity::Bipolar,
+        };
+        let tier_of = |song: &Song, id: u32| {
+            let plan = build_plan(song, 1, |_| 0.0);
+            let slot = plan.slot_of(id).unwrap();
+            plan.nodes[usize::from(slot)].tier
+        };
+
+        // 1) rate を純 LFO が変調 + φ を follower が変調 → 位相の鎖は clean なので Integrated。
+        let song = song_with(
+            vec![lfo_source(1, quarter()), lfo_source(2, quarter()), follower(3)],
+            vec![
+                edge(1, 1, 2, ModParam::Rate),
+                edge(2, 3, 2, ModParam::LfoPhase),
+            ],
+        );
+        assert_eq!(tier_of(&song, 2), ModTier::Integrated, "φ の follower は位相に無関係");
+
+        // 2) rate の鎖に follower が居る → Audio。
+        let song = song_with(
+            vec![lfo_source(1, quarter()), lfo_source(2, quarter()), follower(3)],
+            vec![
+                edge(1, 3, 1, ModParam::LfoPhase),
+                edge(2, 1, 2, ModParam::Rate),
+            ],
+        );
+        assert_eq!(tier_of(&song, 2), ModTier::Audio, "rate の上流に follower");
+
+        // 3) 変調は無いが `Rate` の automation lane がある → Closed ではない。
+        let mut song = song_with(vec![lfo_source(1, quarter())], vec![]);
+        song.tracks[0].automation_lanes.push(crate::model::AutomationLane::new(
+            AutomationTarget::ModSourceParam { source_id: 1, param: ModParam::Rate },
+            2.0,
+        ));
+        assert_eq!(tier_of(&song, 1), ModTier::Integrated, "レーンで速さが動く");
+
+        // 4) テンポ自体が音で動く → 表で再現できないので Audio。
+        let mut song = song_with(
+            vec![lfo_source(1, quarter()), lfo_source(2, quarter()), follower(3)],
+            vec![edge(1, 1, 2, ModParam::Rate)],
+        );
+        song.song_mod_routings.push(ModRouting {
+            id: 9,
+            target: AutomationTarget::SongTempo,
+            source_id: 3,
+            depth: 0.2,
+            polarity: Polarity::Unipolar,
+        });
+        assert_eq!(tier_of(&song, 2), ModTier::Audio, "テンポが音で動く曲は表を使えない");
+    }
+
+    /// **輪があっても** locate が通し再生と厳密に一致すること。
+    ///
+    /// 輪の遅延辺は `ModRuntime::prev` (1 刻み前の出力) を読む。位相だけ表から戻して
+    /// replay を始めると replay 1 刻み目が 0 か前回再生の残骸を読み、その誤差が
+    /// 積分器に残って輪で増幅される (レビュー確定: tick 4000 で 0.015 周期)。
+    /// breakpoint ちょうど (replay 0 刻み) では露見しないので、**途中の刻み**で見る。
+    #[test]
+    fn 輪があってもlocateが通し再生と一致する() {
+        let mk = |id: u32, from: u32, to: u32| ModRouting {
+            id,
+            target: AutomationTarget::ModSourceParam { source_id: to, param: ModParam::Rate },
+            source_id: from,
+            depth: 0.2,
+            polarity: Polarity::Bipolar,
+        };
+        let song = song_with(
+            vec![lfo_source(1, quarter()), lfo_source(2, quarter())],
+            vec![mk(1, 1, 2), mk(2, 2, 1)],
+        );
+        let plan = build_plan(&song, 1, |_| 0.0);
+        assert!(plan.nodes.iter().all(|n| n.in_cycle), "輪になっている");
+        assert!(
+            plan.nodes.iter().all(|n| n.tier == ModTier::Integrated),
+            "follower が居ないので位置非依存であるべき"
+        );
+        let sr = 48_000u32;
+        let dt_secs = f64::from(MOD_TICK_FRAMES) / f64::from(sr);
+        let table = ModPhaseTable::build(&plan, &song, sr, dt_secs * 4096.0);
+        let mark0 = PhaseMark {
+            beat: 0.0,
+            secs: 0.0,
+            bpm: f64::from(crate::automation::evaluate_song_tempo(&song, 0.0)).max(1.0),
+        };
+        // breakpoint 直後 (1025) / 途中 (1300) / 遠く (4000) の 3 点で見る。
+        for target in [1025i64, 1300, 4000] {
+            let mut walked = ModRuntime::default();
+            walked.install(&plan);
+            walk(&plan, &mut walked, &song, dt_secs, mark0, 0..target, |_, _| {});
+            let mut located = ModRuntime::default();
+            located.install(&plan);
+            locate(&plan, &mut located, Some(&table), &song, sr, target);
+            for slot in [0u16, 1] {
+                assert_eq!(
+                    located.phase(slot),
+                    walked.phase(slot),
+                    "target={target} slot={slot}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn rate変調時の位相がbreakpointからの前進と通し再生で一致する() {
         let song = song_with(
