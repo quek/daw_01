@@ -63,11 +63,11 @@ pub struct TransportState {
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
-    /// docs/plan_modulation.md §4.2: latest envelope-follower scalars from the
-    /// audio engine, indexed by `ModSource` position in `Song::mod_sources`.
-    /// Refreshed each ~30Hz `ModScalarsTick`; read by the compose paths via
-    /// `mod_scalar_for_source` when applying modulation to params.
-    pub mod_scalars: Vec<f32>,
+    /// docs/plan_modulation.md §4.2 / r.md #89: audio engine が publish した
+    /// 変調値面 (**`ModSource::id` キー** — SSoT は `common/src/mod_plane.rs`)。
+    /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が
+    /// `ModPlane::scalar(id)` で引く。
+    pub mod_plane: common::mod_plane::ModPlane,
     /// `play()` was called while `pending_plugin_loads` was non-empty;
     /// re-fire it once the last `SlotPluginLoaded` arrives.
     pub pending_play: bool,

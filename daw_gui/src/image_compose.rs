@@ -76,7 +76,7 @@ pub struct ActiveImageFrame {
 pub fn active_image_sources_at(
     song: &Song,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<ActiveImageFrame> {
     let bpm = song.bpm as f64;
     if bpm <= 0.0 {
@@ -155,7 +155,7 @@ pub fn active_image_sources_at(
                     track,
                     rows,
                     event,
-                    mod_scalars,
+                    mod_plane,
                 );
                 let alpha = opacity * env;
                 if alpha <= 0.0 {
@@ -237,7 +237,7 @@ fn resolve_image_fields(
     track: &Track,
     rows: &RowTimeline<'_>,
     event: &ImageEvent,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> (f32, f32, f32, f32, f32, f32) {
     // docs/plan_modulation_routing_redesign.md §3.1: base = lane があれば lane 値、
     // 無ければ event の field 値。そこに `Track.mod_routings` の当該 `ImageBuiltin`
@@ -255,12 +255,11 @@ fn resolve_image_fields(
             Some(l) => rows.lane_value(track.id, l, song),
             None => f64::from(fallback),
         };
-        let v = common::automation::apply_modulation_with_scalars(
-            song,
+        let v = common::automation::apply_modulation_with_plane(
             &target,
             base,
             &track.mod_routings,
-            mod_scalars,
+            mod_plane,
         ) as f32;
         if clamp01 { v.clamp(0.0, 1.0) } else { v }
     };
@@ -387,7 +386,7 @@ mod tests {
     #[test]
     fn active_image_returns_single_layer_inside_event() {
         let song = make_song_with_one_image(0.1, 0.2, 0.5, 0.5, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         let f = frames[0];
         assert_eq!(f.x, 0.1);
@@ -401,14 +400,14 @@ mod tests {
     #[test]
     fn active_image_returns_empty_outside_event() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(16.0), &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(16.0), common::mod_plane::ModPlaneRef::default());
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_image_applies_opacity_multiplier() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -417,7 +416,7 @@ mod tests {
     fn active_image_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha = opacity * 0.5
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(2.0), &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(2.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -435,7 +434,7 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         assert!(frames.is_empty());
     }
 
@@ -485,14 +484,14 @@ mod tests {
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: cell_clip_id };
 
         // 拍 3 → 位相 3.0 → セルの event 窓 [2, 4) の中 → x = 0.9。
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(3.0), &[]);
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(3.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].x, 0.9, "アレンジの画像 (x=0.1) ではなくセルが出る");
         // 拍 5 → 位相 1.0 → セルの event 窓の外 → 何も出ない
         // (アレンジのクリップは拍 5 を覆っているが、行はランチャー主導)。
-        assert!(active_image_sources_at(&song, &RowTimeline::preview(5.0), &[]).is_empty());
+        assert!(active_image_sources_at(&song, &RowTimeline::preview(5.0), common::mod_plane::ModPlaneRef::default()).is_empty());
         // 拍 7 → 位相 3.0 (ループ 2 周目) → また出る。
-        let looped = active_image_sources_at(&song, &RowTimeline::preview(7.0), &[]);
+        let looped = active_image_sources_at(&song, &RowTimeline::preview(7.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(looped.len(), 1);
         assert_eq!(looped[0].x, 0.9);
     }

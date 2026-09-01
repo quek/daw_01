@@ -791,13 +791,17 @@ pub struct LocalState {
     /// 供給元)。**`Song` には書き戻さない** — 詳細は
     /// [`crate::launcher::LauncherRuntime`] の doc。事前確保のみで RT で伸びない。
     pub launcher: crate::launcher::LauncherRuntime,
-    /// docs/plan_modulation.md §5: reusable per-buffer snapshot of follower
-    /// scalars (slot = `ModSource` position), filled from
-    /// `cached_schedule.follower_slots` before dispatch (= the previous
-    /// buffer's envelopes) and published to the audio workers so volume / pan /
-    /// plugin-param lanes with `mod_routings` modulate. Reused across buffers
-    /// (no per-buffer allocation once warmed).
-    pub mod_scalars_snapshot: Vec<f32>,
+    /// docs/plan_modulation.md §5 / r.md #89: 使い回しの変調値面
+    /// (**`ModSource::id` キー**)。dispatch の前に
+    /// [`crate::mod_tick::eval_plane`] で満たし (= follower は前 buffer の
+    /// envelope、generator はこの刻みの song 位置から算出)、audio worker へ
+    /// 渡して volume / pan / plugin param の `mod_routings` を変調する。
+    /// buffer をまたいで再利用する (warm 後は確保が起きない)。
+    pub mod_plane: common::mod_plane::ModPlane,
+    /// r.md #89: GUI へ publish する値面。`mod_plane` (dispatch 前 = follower が
+    /// 1 buffer 遅れ) と **中身が違う** ので器を分ける — 同じ器を使い回すと、
+    /// publish 用に上書きした値が次 buffer の param 変調へ漏れる。
+    pub published_mod_plane: common::mod_plane::ModPlane,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -843,7 +847,12 @@ impl LocalState {
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
             launcher: crate::launcher::LauncherRuntime::new(),
-            mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
+            mod_plane: common::mod_plane::ModPlane::with_capacity(
+                common::audio_bridge::MAX_MOD_SOURCES,
+            ),
+            published_mod_plane: common::mod_plane::ModPlane::with_capacity(
+                common::audio_bridge::MAX_MOD_SOURCES,
+            ),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -1286,15 +1295,14 @@ impl LocalState {
             Some(s) => {
                 let base = common::automation::evaluate_song_tempo(s, self.playhead_beats);
                 // B11 (r.md #8): song-level modulation (LFO/Random/MSEG/follower →
-                // `SongTempo`) を base tempo に適用。 `mod_scalars_snapshot` は前
+                // `SongTempo`) を base tempo に適用。 `mod_plane` は前
                 // buffer 値 (followers は元々 1-buffer lag)。 `SongTempo` を target に
                 // する song_mod_routing が無ければ offset 0 = no-op。 RT-safe。
-                common::automation::apply_modulation_with_scalars(
-                    s,
+                common::automation::apply_modulation_with_plane(
                     &common::model::AutomationTarget::SongTempo,
                     f64::from(base),
                     &s.song_mod_routings,
-                    &self.mod_scalars_snapshot,
+                    self.mod_plane.as_ref(),
                 ) as f32
             }
             None => 120.0,
@@ -1308,24 +1316,24 @@ impl LocalState {
             let audio_renderer_g = self.shared.audio_clip_renderer.load();
             let audio_renderer: &AudioClipRenderer = &audio_renderer_g;
 
-            // docs/plan_modulation.md §5: snapshot the previous buffer's
-            // follower envelopes (slot order = `ModSource` position) for audio-
-            // param modulation, reusing the buffer (no per-buffer alloc). The
-            // EnvelopeFollow nodes for THIS buffer run post-dispatch, so param
-            // events see the prior buffer's env — a ~1-buffer (block-rate) lag.
-            // generator (LFO/Random/MSEG/Steps) は `song_beat`/`song_secs` から
-            // この buffer の値を直接算出する (状態レス・lag なし、 決定論)。
-            self.mod_scalars_snapshot.clear();
-            let song_secs = playhead as f64 / sample_rate as f64;
-            for (fs, kind) in self
-                .cached_schedule
-                .follower_slots
-                .iter()
-                .zip(self.cached_schedule.mod_kinds.iter())
-            {
-                let v = common::modulators::generator_scalar(kind, self.playhead_beats, song_secs)
-                    .unwrap_or(fs.env);
-                self.mod_scalars_snapshot.push(v);
+            // docs/plan_modulation.md §5 / r.md #89: この buffer の変調値面を作る。
+            // envelope follower は **前 buffer の** env (`EnvelopeFollow` ノードは
+            // post-dispatch に走るので、param イベントが見るのは 1 buffer 前 =
+            // block-rate の遅れ)。generator (LFO/Random/MSEG/Steps) は刻みの
+            // song 位置から直接算出する (状態レス・lag なし・決定論)。
+            //
+            // 刻みの割り方と面の作り方は **live と書き出しで同じ 1 本**
+            // (`crate::mod_tick`、アーキ不変条件 6)。第 1 便では buffer 全体で
+            // 1 刻みなので、従来の「buffer 頭で 1 回評価」と bit 同一。
+            let beats_per_frame = f64::from(current_bpm) / (60.0 * f64::from(sample_rate));
+            for tick in crate::mod_tick::buffer_ticks(
+                playhead,
+                n as u32,
+                self.playhead_beats,
+                beats_per_frame,
+                sample_rate,
+            ) {
+                crate::mod_tick::eval_plane(&self.cached_schedule, tick, &mut self.mod_plane);
             }
 
             // r.md #87: 行ごとの時間軸を **dispatch より前に**確定させる
@@ -1359,7 +1367,7 @@ impl LocalState {
                 recording_lanes,
                 current_bpm,
                 self.playhead_beats,
-                &self.mod_scalars_snapshot,
+                self.mod_plane.as_ref(),
                 self.launcher.rows(),
                 master_gain,
             );
@@ -1410,22 +1418,26 @@ impl LocalState {
                 bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
             }
 
-            // docs/plan_modulation.md §4.2: publish each ModSource's envelope
-            // follower scalar (block-rate, `env` after this buffer) so the GUI
-            // poller can apply visual/param modulation. Atomic stores, RT-safe.
-            // follower は env、 generator は song 位置から直接算出して publish。
-            let pub_song_secs = playhead as f64 / sample_rate as f64;
-            for (slot, (fs, kind)) in self
-                .cached_schedule
-                .follower_slots
-                .iter()
-                .zip(self.cached_schedule.mod_kinds.iter())
-                .enumerate()
-            {
-                let v = common::modulators::generator_scalar(kind, self.playhead_beats, pub_song_secs)
-                    .unwrap_or(fs.env);
-                bridge.set_mod_scalar(slot, v);
+            // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する
+            // (block-rate)。follower は **この buffer 後の** env (EnvelopeFollow ノードは
+            // 上の render で走り終えている) なので、dispatch 前に作った
+            // `self.mod_plane` とは別に引き直す。値と id を組で書く seqlock なので、
+            // GUI が「新しい id と古い値」を掴むことはない。
+            // Atomic store のみ = RT 安全。
+            for tick in crate::mod_tick::buffer_ticks(
+                playhead,
+                n as u32,
+                self.playhead_beats,
+                beats_per_frame,
+                sample_rate,
+            ) {
+                crate::mod_tick::eval_plane(
+                    &self.cached_schedule,
+                    tick,
+                    &mut self.published_mod_plane,
+                );
             }
+            bridge.publish_mod_plane(&self.published_mod_plane);
 
             // Debug-only heartbeat. RT 規約上 audio thread での tracing は
             // 望ましくないが、開発時に engine 状態を可視化できる利点が

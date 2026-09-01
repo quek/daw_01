@@ -1723,7 +1723,7 @@ impl Runner {
                             state.app.song_doc.song(),
                             track,
                             &rows,
-                            &state.app.transport.mod_scalars,
+                            state.app.transport.mod_plane.as_ref(),
                         )
                     {
                         let size = preview.renderer.size();
@@ -1949,7 +1949,7 @@ impl Runner {
             return;
         };
         let song = state.app.song_doc.song();
-        let mods = &state.app.transport.mod_scalars;
+        let mods = state.app.transport.mod_plane.as_ref();
         // r.md #87: 「どの行が今なにを、どの拍で映すか」の解決器。映像 / 画像 / 字幕 /
         // グループ変換 / 映像効果が全部これを通る (書き出しは `render_video` が
         // `LauncherSidecar` から差した `RowTimeline::with_running`)。

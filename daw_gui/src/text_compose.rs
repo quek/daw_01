@@ -80,7 +80,7 @@ pub struct ActiveTextFrame {
 pub fn active_text_sources_at(
     song: &Song,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<ActiveTextFrame> {
     let bpm = song.bpm as f64;
     if bpm <= 0.0 {
@@ -134,7 +134,7 @@ pub fn active_text_sources_at(
                     continue;
                 }
                 let env = event_alpha_envelope(event, clip_local);
-                let resolved = resolve_text_fields(track, song, rows, event, mod_scalars);
+                let resolved = resolve_text_fields(track, song, rows, event, mod_plane);
                 let alpha = resolved.opacity * env;
                 if alpha <= 0.0 {
                     continue;
@@ -211,7 +211,7 @@ fn resolve_text_fields(
     song: &Song,
     rows: &RowTimeline<'_>,
     event: &TextEvent,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> ResolvedText {
     // Index the track's `TextBuiltin` lanes once (single pass) so the 23
     // field resolutions below are O(1) hashmap lookups instead of 23
@@ -236,23 +236,21 @@ fn resolve_text_fields(
     };
     let resolve_norm = |field: TextBuiltinParam, fallback: f32| -> f32 {
         let target = AutomationTarget::TextBuiltin(field);
-        (common::automation::apply_modulation_with_scalars(
-            song,
+        (common::automation::apply_modulation_with_plane(
             &target,
             base_for(field, fallback),
             &track.mod_routings,
-            mod_scalars,
+            mod_plane,
         ) as f32)
             .clamp(0.0, 1.0)
     };
     let resolve_plain = |field: TextBuiltinParam, fallback: f32| -> f32 {
         let target = AutomationTarget::TextBuiltin(field);
-        common::automation::apply_modulation_with_scalars(
-            song,
+        common::automation::apply_modulation_with_plane(
             &target,
             base_for(field, fallback),
             &track.mod_routings,
-            mod_scalars,
+            mod_plane,
         ) as f32
     };
     ResolvedText {
@@ -407,7 +405,7 @@ mod tests {
     #[test]
     fn active_text_returns_single_layer_inside_event() {
         let song = make_song_with_one_text("Hello", 0.1, 0.4, 0.8, 0.2, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         let f = &frames[0];
         assert_eq!(&*f.text, "Hello");
@@ -422,14 +420,14 @@ mod tests {
     #[test]
     fn active_text_returns_empty_outside_event() {
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(16.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(16.0), common::mod_plane::ModPlaneRef::default());
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_text_applies_opacity_multiplier() {
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -438,7 +436,7 @@ mod tests {
     fn active_text_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha ~= opacity * 0.5.
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(2.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(2.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -455,7 +453,7 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         assert!(frames.is_empty());
     }
 
@@ -474,7 +472,7 @@ mod tests {
             0.0,
             0.0,
         );
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
         let f = &frames[0];
         // TextEvent::default() defaults — see common/src/model.rs.
         assert_eq!(f.font_size_px, 64.0);
@@ -519,14 +517,14 @@ mod tests {
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: cell_clip_id };
 
         // 拍 5 → 位相 1.0 → セルの event 窓 [0, 2) の中。
-        let frames = active_text_sources_at(&song, &RowTimeline::preview(5.0), &[]);
+        let frames = active_text_sources_at(&song, &RowTimeline::preview(5.0), common::mod_plane::ModPlaneRef::default());
         assert_eq!(frames.len(), 1);
         assert_eq!(&*frames[0].text, "セル");
         // 拍 7 → 位相 3.0 → セルの event 窓の外 → 何も出ない
         // (アレンジ側は拍 7 を覆っているが、行はランチャー主導)。
-        assert!(active_text_sources_at(&song, &RowTimeline::preview(7.0), &[]).is_empty());
+        assert!(active_text_sources_at(&song, &RowTimeline::preview(7.0), common::mod_plane::ModPlaneRef::default()).is_empty());
         // 行を止めるとアレンジへは戻らず、やはり何も出ない。
         song.tracks[0].launcher = RowPlayback::LauncherStopped;
-        assert!(active_text_sources_at(&song, &RowTimeline::preview(5.0), &[]).is_empty());
+        assert!(active_text_sources_at(&song, &RowTimeline::preview(5.0), common::mod_plane::ModPlaneRef::default()).is_empty());
     }
 }

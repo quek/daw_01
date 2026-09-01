@@ -13,6 +13,7 @@
 //!   `lane.default_value` when no clip covers the beat or the lane is
 //!   disabled.
 
+use crate::mod_plane::ModPlaneRef;
 use crate::model::{
     AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationTarget,
     ClipContent, ContentId, ModRouting, Polarity, Song, TrackBuiltinParam,
@@ -402,8 +403,9 @@ pub fn song_lane_value_at(song: &Song, lane: &AutomationLane, song_beat: f64) ->
 /// Composition happens in the normalized domain so a given `depth` means the
 /// same fraction of range across heterogeneous targets (volume `0..2`, rotation
 /// `-π..π`, image x `0..1`). `scalar` resolves a `ModRouting::source_id` to its
-/// latest follower value (live `AudioBridge::mod_scalars` in preview, baked
-/// sidecar in export). Returns `0.0` when no routing matches. Pure / RT-safe.
+/// latest value — 実体は [`crate::mod_plane::ModPlane`] (live は engine が publish
+/// した面、書き出しは焼いた sidecar)。Returns `0.0` when no routing matches.
+/// Pure / RT-safe.
 pub fn modulation_offset_norm(
     target: &AutomationTarget,
     routings: &[ModRouting],
@@ -451,43 +453,30 @@ pub fn apply_modulation(
     norm_to_plain(target, norm_eff)
 }
 
-/// Resolve a `ModRouting::source_id` to its latest follower scalar from
-/// `Song::mod_sources` (slot = position in the Vec) against a polled
-/// `mod_scalars` plane (e.g. `AppData::mod_scalars`). Dangling / out-of-range
-/// sources read as `0`.
-#[inline]
-pub fn source_scalar(song: &Song, mod_scalars: &[f32], source_id: u32) -> f32 {
-    song.mod_sources
-        .iter()
-        .position(|m| m.id == source_id)
-        .and_then(|i| mod_scalars.get(i))
-        .copied()
-        .unwrap_or(0.0)
-}
-
-/// [`apply_modulation`] resolving follower scalars from `Song::mod_sources`.
-pub fn apply_modulation_with_scalars(
-    song: &Song,
+/// [`apply_modulation`] resolving modulator scalars from an **id キーの値面**
+/// ([`ModPlaneRef`], `docs/plan_rmd_88_89_cross_modulation.md` §4-2)。
+///
+/// 旧 `apply_modulation_with_scalars(song, ..)` は `Song::mod_sources` を
+/// `position(|m| m.id == source_id)` で走査していた。per-sample 経路
+/// (`daw_audio::automation::fill_track_param_ramps`) に乗る探索なのに、
+/// 走査対象が `String` / `Vec` を抱えた太い struct だった。値面が id を
+/// 自分で持つようになったので `song` 引数ごと消える。
+pub fn apply_modulation_with_plane(
     target: &AutomationTarget,
     base: f64,
     routings: &[ModRouting],
-    mod_scalars: &[f32],
+    plane: ModPlaneRef<'_>,
 ) -> f64 {
-    apply_modulation(target, base, routings, |source_id| {
-        source_scalar(song, mod_scalars, source_id)
-    })
+    apply_modulation(target, base, routings, |source_id| plane.scalar(source_id))
 }
 
-/// [`modulation_offset_norm`] resolving follower scalars from `Song::mod_sources`.
-pub fn modulation_offset_norm_with_scalars(
-    song: &Song,
+/// [`modulation_offset_norm`] の値面版 ([`apply_modulation_with_plane`] と対)。
+pub fn modulation_offset_norm_with_plane(
     target: &AutomationTarget,
     routings: &[ModRouting],
-    mod_scalars: &[f32],
+    plane: ModPlaneRef<'_>,
 ) -> f32 {
-    modulation_offset_norm(target, routings, |source_id| {
-        source_scalar(song, mod_scalars, source_id)
-    })
+    modulation_offset_norm(target, routings, |source_id| plane.scalar(source_id))
 }
 
 /// Phase 4 Step D (`docs/plan_automation.md` §6): recording 中の point 列に

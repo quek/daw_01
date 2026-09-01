@@ -11,7 +11,8 @@
 
 #![allow(dead_code)]
 
-use common::automation::{apply_modulation_with_scalars, modulation_offset_norm_with_scalars};
+use common::automation::{apply_modulation_with_plane, modulation_offset_norm_with_plane};
+use common::mod_plane::ModPlaneRef;
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
 
@@ -56,10 +57,10 @@ pub fn fill_track_param_ramps(
     volume_per_sample: &mut [f32],
     pan_per_sample: &mut [f32],
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
-    // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
-    // snapshot, slot = `Song::mod_sources` position) so volume/pan lanes with
-    // `mod_routings` get modulated. Empty = no modulation.
-    mod_scalars: &[f32],
+    // docs/plan_modulation.md §5 / r.md #89: 変調ソースの値面 (**`ModSource::id`
+    // キー**、block-rate snapshot)。volume/pan lane の `mod_routings` がこれを引く。
+    // 空 = 変調なし。
+    mod_plane: ModPlaneRef<'_>,
 ) {
     let frames = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
     if frames == 0 {
@@ -121,8 +122,7 @@ pub fn fill_track_param_ramps(
                 None => f64::from(track_const),
             };
             *slot =
-                apply_modulation_with_scalars(song, &target, base, &track.mod_routings, mod_scalars)
-                    as f32;
+                apply_modulation_with_plane(&target, base, &track.mod_routings, mod_plane) as f32;
         }
     };
     fill_builtin(
@@ -170,9 +170,9 @@ pub fn fill_pd_param_events(
     playhead_beats: f64,
     frames: u32,
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
-    // docs/plan_modulation.md §5: follower scalars (block-rate snapshot) so
-    // PluginParam lanes with `mod_routings` get modulated. Empty = none.
-    mod_scalars: &[f32],
+    // docs/plan_modulation.md §5 / r.md #89: 変調ソースの値面 (id キー)。
+    // PluginParam lane の `mod_routings` がこれを引く。空 = 変調なし。
+    mod_plane: ModPlaneRef<'_>,
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -230,7 +230,11 @@ pub fn fill_pd_param_events(
         // frame 0 の 1 回のみで、 速い automation が階段状 (zipper) になっていた。
         // 静的セグメントは値不変なので 1 event に縮退 (events_in=256 を無駄に食わない)。
         // push_param は満杯時 drop のみ (panic なし) なので RT 安全。
-        const SUB_FRAMES: u32 = 64;
+        //
+        // r.md #89: 刻み幅の SSoT は `crate::mod_tick::MOD_TICK_FRAMES`。automation の
+        // サブバッファ刻みと変調の制御グリッドは **同じ格子でなければならない**
+        // (設計正本 §2.2) — 別々の 64 を持つと、片方を変えたときに黙って食い違う。
+        const SUB_FRAMES: u32 = crate::mod_tick::MOD_TICK_FRAMES;
         // r.md #87: このレーン行の供給元 (ランチャー主導ならセルのカーブ)。
         let src = rows.lane(lane_idx);
         let mut f = 0u32;
@@ -265,7 +269,7 @@ pub fn fill_pd_param_events(
         if mod_routings[..i].iter().any(|p| p.target == r.target) {
             continue;
         }
-        let offset = modulation_offset_norm_with_scalars(song, &r.target, mod_routings, mod_scalars);
+        let offset = modulation_offset_norm_with_plane(&r.target, mod_routings, mod_plane);
         pd.push_param_mod(0, *param_id, f64::from(offset));
     }
 }
@@ -289,6 +293,10 @@ mod tests {
         recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
         mod_scalars: &[f32],
     ) {
+        let ids: Vec<u32> = song
+            .map(|s| s.mod_sources.iter().map(|m| m.id).collect())
+            .unwrap_or_default();
+        let mod_plane = ModPlaneRef::new(&ids, mod_scalars);
         fill_track_param_ramps(
             song,
             track_idx,
@@ -300,7 +308,7 @@ mod tests {
             volume_per_sample,
             pan_per_sample,
             recording_lanes,
-            mod_scalars,
+            mod_plane,
         );
     }
 
@@ -317,6 +325,8 @@ mod tests {
         recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
         mod_scalars: &[f32],
     ) {
+        let ids: Vec<u32> = song.mod_sources.iter().map(|m| m.id).collect();
+        let mod_plane = ModPlaneRef::new(&ids, mod_scalars);
         fill_pd_param_events(
             pd,
             song,
@@ -328,7 +338,7 @@ mod tests {
             playhead_beats,
             frames,
             recording_lanes,
-            mod_scalars,
+            mod_plane,
         );
     }
     use common::model::{

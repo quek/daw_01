@@ -63,9 +63,10 @@ impl Band {
 
 /// Per-`ModSource` envelope follower. Coefficients are baked at compile time
 /// (`from_config`); the audio thread advances [`Self::env`] each buffer via
-/// [`Self::process_block`]. `env` is published block-rate to the GUI
-/// (`AudioBridge::mod_scalars`) and, from Phase 5, sampled per-control-rate
-/// for audio-param modulation.
+/// [`Self::process_block`]. `env` は block-rate で変調値面
+/// ([`common::mod_plane::ModPlane`]) に載って GUI へ publish され、param 変調では
+/// 制御刻みごとにサンプルされる。**値面のアドレスは `ModSource::id`**
+/// (SSoT は `common/src/mod_plane.rs` の module doc)。
 #[derive(Debug, Clone, Copy)]
 pub struct FollowerSlot {
     atk: f32,

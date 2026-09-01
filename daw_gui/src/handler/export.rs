@@ -8,6 +8,25 @@ use std::path::{Path, PathBuf};
 use common::protocol::{AudioCommand, PluginCommand};
 
 impl AppData {
+    /// 動画書き出しの前段で作った **temp 一式** (WAV + その隣の sidecar) を消す。
+    ///
+    /// WAV だけ消して sidecar を残していた箇所が 3 つあり (完了 / 音声キャンセル /
+    /// 音声失敗)、`%TEMP%\daw01_export_audio_{pid}.wav` は pid が同じ間ずっと同じ名前が
+    /// 再利用されるので、消し残しがそのまま溜まっていた。「何を消すか」を 1 か所に
+    /// 集めて、sidecar が増えたときに 3 箇所へ足し忘れないようにする。
+    pub(crate) fn remove_export_temp_wav(&mut self) {
+        let Some(wav) = self.transport.export_temp_wav.take() else {
+            return;
+        };
+        let _ = std::fs::remove_file(
+            common::mod_sidecar::ModEnvSidecar::sidecar_path(&wav),
+        );
+        let _ = std::fs::remove_file(
+            common::launcher_sidecar::LauncherSidecar::sidecar_path(&wav),
+        );
+        let _ = std::fs::remove_file(&wav);
+    }
+
     /// レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定されていれば
     /// それを既定にし、 無ければ全曲 (0..length_beats) にフォールバックする。
     /// ループ範囲は session state (`transport.loop_region`) が所有する SSoT で、

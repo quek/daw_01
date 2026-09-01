@@ -1,7 +1,8 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use anyhow::Result;
 
+use crate::mod_plane::ModPlane;
 use crate::shmem::NamedShmem;
 
 /// (A1 r.md #8) フォールバック既定サンプルレート。 通常はランタイムで
@@ -19,8 +20,15 @@ pub const CHANNELS: u32 = 2;
 pub const MAX_TRACKS: usize = 32;
 /// docs/plan_modulation.md §4.2: hard cap for the modulation-scalar ring in
 /// shmem. `Song::mod_sources` beyond this index don't publish a scalar (their
-/// `EnvelopeFollow` node isn't emitted). Indexed by `ModSource` position.
+/// `EnvelopeFollow` node isn't emitted). スロットの**並び**は engine の compile 順
+/// だが、読み手は並びではなく [`AudioBridge::mod_slot_ids`] の id で引く
+/// (`docs/plan_rmd_88_89_cross_modulation.md` §4-2、アーキ不変条件 1)。
 pub const MAX_MOD_SOURCES: usize = 64;
+
+/// [`AudioBridgeHandle::read_mod_plane`] が seqlock の読み直しを諦めるまでの回数。
+/// 書き手は 1 buffer に 1 回しか面を触らないので、30Hz の読み手が 8 回連続で
+/// 書き込み中に当たることは実質ない (当たったら「今回は更新なし」に倒す)。
+const MOD_PLANE_READ_RETRIES: usize = 8;
 
 /// r.md #87 (クリップランチャー): 走行状態を publish できる行数の上限。
 /// 行 = トラック行 + オートメーションレーン行なので、`MAX_TRACKS` (= 32) では足りない。
@@ -114,12 +122,29 @@ pub struct AudioBridge {
     /// its UI tick。(v29: 旧 daw_plugin_host request/ready data plane 撤去に伴い
     /// writer は daw_audio に一本化 — module doc 参照。)
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
-    /// docs/plan_modulation.md §4.2: per-`ModSource` envelope follower scalar
-    /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer
-    /// (`env[frames-1]` of the source's follower), polled by the GUI at ~30Hz
-    /// alongside `track_peaks` and applied to modulated params. Indexed by
-    /// `ModSource` position in `Song::mod_sources` (= `EnvelopeFollow::slot`).
+    /// docs/plan_modulation.md §4.2: per-`ModSource` modulator scalar
+    /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer,
+    /// polled by the GUI at ~30Hz alongside `track_peaks` and applied to
+    /// modulated params.
+    ///
+    /// **slot の意味は [`AudioBridge::mod_slot_ids`] が持つ。** 位置で引かないこと
+    /// (`docs/plan_rmd_88_89_cross_modulation.md` §4-2)。
     pub mod_scalars: [AtomicU32; MAX_MOD_SOURCES],
+    /// r.md #89: `mod_scalars[i]` が**どのソースの値か** (`ModSource::id`)。
+    /// `0` = 空きスロット。
+    ///
+    /// これが無かった頃は「engine が書いた slot 番号」= 「GUI が持つ
+    /// `Song::mod_sources` の位置」という暗黙の前提で読んでいた。ソースを 1 つ
+    /// 消して LoadSong が届くまでの間 (数フレーム) は前提が崩れ、**変調が別の
+    /// ソースの値で動く**。id を値と同じ面に載せてその窓を閉じる (不変条件 1)。
+    pub mod_slot_ids: [AtomicU32; MAX_MOD_SOURCES],
+    /// r.md #89: `mod_slot_ids` + `mod_scalars` を**組で**読むための seqlock 世代。
+    ///
+    /// 奇数 = 書き込み中。読み手は「世代を読む → 面を読む → 世代を読み直して
+    /// 一致を確認」で、id 表と値面が別 buffer のものになった組み合わせを弾く。
+    /// 面は 2 配列に分かれているので、単発の atomic では「新しい id と古い値」の
+    /// 組を防げない。
+    pub mod_plane_generation: AtomicU64,
     /// Phase 7 B4 Step C (2026-05-13): count-in 残り samples mirror (audio
     /// thread が `process_buffer` で書く、 GUI が on_tick で poll)。
     /// 0 = count-in 中ではない / 完了済。 `StartRecording` 受信時に audio
@@ -275,21 +300,60 @@ impl AudioBridgeHandle {
         }
     }
 
-    /// docs/plan_modulation.md §4.2: publish one `ModSource`'s envelope
-    /// follower scalar. Out-of-range slots (beyond `MAX_MOD_SOURCES`) are
-    /// silently dropped. RT-safe atomic store.
-    pub fn set_mod_scalar(&self, slot: usize, v: f32) {
-        let Some(cell) = self.bridge().mod_scalars.get(slot) else {
-            return;
-        };
-        cell.store(v.to_bits(), Ordering::Release);
+    /// r.md #89: 変調ソースの値面 (id 表 + 値) を**丸ごと** publish する。
+    /// audio thread が毎 buffer 1 回だけ呼ぶ (seqlock の書き手)。
+    ///
+    /// `MAX_MOD_SOURCES` を超えるぶんは捨てる。溢れなかった残りの slot は
+    /// `id = 0` (空き) で潰す — 消えたソースの値が面に残り続けると、id を
+    /// 使い回した別のソースがその値を拾う。
+    ///
+    /// RT 安全: atomic store のみ (確保・ロック・I/O なし)。
+    pub fn publish_mod_plane(&self, plane: &ModPlane) {
+        let b = self.bridge();
+        let g = b.mod_plane_generation.load(Ordering::Relaxed);
+        // 奇数 = 書き込み中。以降のデータ書き込みがこの store より前へ回らない
+        // ように Release fence で仕切る (store 自体は Relaxed で十分)。
+        b.mod_plane_generation
+            .store(g.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        let ids = plane.ids();
+        let values = plane.values();
+        for i in 0..MAX_MOD_SOURCES {
+            let id = ids.get(i).copied().unwrap_or(0);
+            let v = values.get(i).copied().unwrap_or(0.0);
+            b.mod_slot_ids[i].store(id, Ordering::Relaxed);
+            b.mod_scalars[i].store(v.to_bits(), Ordering::Relaxed);
+        }
+        b.mod_plane_generation
+            .store(g.wrapping_add(2), Ordering::Release);
     }
 
-    pub fn mod_scalar(&self, slot: usize) -> f32 {
-        let Some(cell) = self.bridge().mod_scalars.get(slot) else {
-            return 0.0;
-        };
-        f32::from_bits(cell.load(Ordering::Acquire))
+    /// r.md #89: 値面を seqlock で読む (GUI の 30Hz poller)。
+    ///
+    /// 書き込み中に当たったら読み直し、[`MOD_PLANE_READ_RETRIES`] 回とも
+    /// 破れたら `false` を返して `out` は触らない (= 前回値を保つ)。
+    /// `out` は使い回すので確保は起きない。
+    pub fn read_mod_plane(&self, out: &mut ModPlane) -> bool {
+        let b = self.bridge();
+        for _ in 0..MOD_PLANE_READ_RETRIES {
+            let g0 = b.mod_plane_generation.load(Ordering::Acquire);
+            if g0 & 1 != 0 {
+                continue; // 書き込み中
+            }
+            out.clear();
+            for i in 0..MAX_MOD_SOURCES {
+                let id = b.mod_slot_ids[i].load(Ordering::Relaxed);
+                let v = f32::from_bits(b.mod_scalars[i].load(Ordering::Relaxed));
+                if id != 0 {
+                    out.push(id, v);
+                }
+            }
+            fence(Ordering::Acquire);
+            if b.mod_plane_generation.load(Ordering::Relaxed) == g0 {
+                return true;
+            }
+        }
+        false
     }
 
     /// r.md #87: 1 行ぶんの走行状態を publish する。`slot` は engine が毎 buffer
@@ -402,16 +466,6 @@ impl AudioBridgeHandle {
             ));
         }
     }
-
-    /// Fills `out` with the modulation scalars for slots `0..MAX_MOD_SOURCES`.
-    pub fn mod_scalars(&self, out: &mut Vec<f32>) {
-        out.clear();
-        for i in 0..MAX_MOD_SOURCES {
-            out.push(f32::from_bits(
-                self.bridge().mod_scalars[i].load(Ordering::Acquire),
-            ));
-        }
-    }
 }
 
 // The underlying shared memory is safe to share across threads; every
@@ -450,5 +504,37 @@ mod tests {
         // 単発引きも同じ行を引ける。
         let one = h.launcher_row(0, 0).expect("row_key 0 も引ける");
         assert_eq!(one.playing_clip_id, 7);
+    }
+
+    /// r.md #89: **値面は id で引ける。** slot の並びが変わっても、消えたソースの
+    /// 値が残っても、id が一致するものだけが返る。
+    #[test]
+    fn 変調値面は_id_で往復し消えたソースは残らない() {
+        let name = format!("daw01_test_modplane_{}", std::process::id());
+        let h = AudioBridgeHandle::create(&name).expect("bridge");
+
+        let mut published = crate::mod_plane::ModPlane::default();
+        published.push(11, 0.25);
+        published.push(4, 0.5);
+        published.push(9, 0.75);
+        h.publish_mod_plane(&published);
+
+        let mut got = crate::mod_plane::ModPlane::default();
+        assert!(h.read_mod_plane(&mut got), "seqlock が破れていない");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.scalar(4), 0.5);
+        assert_eq!(got.scalar(9), 0.75);
+
+        // ソースを 1 つ消して並べ替えた面を publish し直す。
+        let mut next = crate::mod_plane::ModPlane::default();
+        next.push(9, 0.1);
+        next.push(11, 0.2);
+        h.publish_mod_plane(&next);
+        assert!(h.read_mod_plane(&mut got));
+        assert_eq!(got.len(), 2, "空いた slot は id 0 で潰れている");
+        assert_eq!(got.scalar(9), 0.1);
+        assert_eq!(got.scalar(11), 0.2);
+        // 消えた id は 0 (= 変調なし) に倒れる。前の値 0.5 が残っていない。
+        assert_eq!(got.scalar(4), 0.0);
     }
 }

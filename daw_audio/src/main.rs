@@ -32,6 +32,7 @@ mod graph;
 mod launcher;
 mod metronome;
 mod mixer;
+mod mod_tick;
 mod sequencer;
 mod song_values;
 mod stretch_engine;

@@ -583,18 +583,25 @@ fn render_loop(
     // only when a video render will consume it (`write_video_sidecars`). A
     // standalone WAV export skips it (n_sources = 0 → no recording, no file):
     // the modulation is already baked into the rendered audio below regardless.
+    // r.md #89: 列のキーは `ModSource::id` (`follower_keys`)。位置キーだった頃は、
+    // 書き出し後にソースを 1 つ消してから動画を描くと列が丸ごとずれた。
     let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_video_sidecars {
-        schedule.follower_slots.len()
+        schedule.follower_keys.clone()
     } else {
-        0
+        Vec::new()
     });
     // r.md #87 §3.6: 同じ理由でランチャーの走行状態も焼く — 動画書き出しは
     // フォローアクションがどこで次の列へ移ったかを知らないので、焼かないと
     // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
     let mut launcher_sidecar = crate::launcher::sidecar::SidecarRecorder::new();
-    // docs/plan_modulation.md §5: reusable per-buffer follower scalar snapshot
-    // (prev buffer's env) for audio-param modulation, mirroring the live engine.
-    let mut mod_scalars_snapshot: Vec<f32> = Vec::with_capacity(schedule.follower_slots.len());
+    // docs/plan_modulation.md §5 / r.md #89: 使い回しの変調値面 (id キー)。
+    // dispatch 前 = follower は前 buffer の env。live engine と同じ形。
+    let mut mod_plane =
+        common::mod_plane::ModPlane::with_capacity(schedule.follower_slots.len());
+    // sidecar へ焼く面 (dispatch **後** = follower が今 buffer の env)。
+    // live engine の `published_mod_plane` に対応する器。
+    let mut baked_mod_plane =
+        common::mod_plane::ModPlane::with_capacity(schedule.follower_slots.len());
 
     // Phase 4 Step C-2: offline export 中は recording lane なし
     // (= GUI が active gesture を持たない、 transport が freewheel)。
@@ -679,27 +686,27 @@ fn render_loop(
         // `mod_scalars_snapshot` は前 iteration 値 (engine と同じ 1-buffer lag)。
         let base_bpm_freewheel =
             f64::from(common::automation::evaluate_song_tempo(song, playhead_beats));
-        let smoothed_current_bpm_freewheel = common::automation::apply_modulation_with_scalars(
-            song,
+        let smoothed_current_bpm_freewheel = common::automation::apply_modulation_with_plane(
             &common::model::AutomationTarget::SongTempo,
             base_bpm_freewheel,
             &song.song_mod_routings,
-            &mod_scalars_snapshot,
+            mod_plane.as_ref(),
         );
 
-        // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
-        // (slot order) so audio-param modulation renders into the WAV too.
-        // follower は env、 generator は song 位置から直接算出 (live と同経路)。
-        let export_song_secs = playhead as f64 / sample_rate as f64;
-        mod_scalars_snapshot.clear();
-        for (fs, kind) in schedule
-            .follower_slots
-            .iter()
-            .zip(schedule.mod_kinds.iter())
-        {
-            let v = common::modulators::generator_scalar(kind, playhead_beats, export_song_secs)
-                .unwrap_or(fs.env);
-            mod_scalars_snapshot.push(v);
+        // docs/plan_modulation.md §5 / r.md #89: この buffer の変調値面を作る。
+        // **live engine と同じ 1 本** (`crate::mod_tick`、アーキ不変条件 6) を通すので、
+        // 刻みの割り方が buffer 長 (export 1024 固定 / live は device 実測長) に
+        // 依存しない。follower は前 buffer の env、generator は刻みの song 位置から。
+        let export_beats_per_frame =
+            smoothed_current_bpm_freewheel / (60.0 * f64::from(sample_rate));
+        for tick in crate::mod_tick::buffer_ticks(
+            playhead,
+            frames as u32,
+            playhead_beats,
+            export_beats_per_frame,
+            sample_rate,
+        ) {
+            crate::mod_tick::eval_plane(&schedule, tick, &mut mod_plane);
         }
 
         // live と同一の単一 render 経路 (§5): dispatch → schedule → master fx
@@ -740,27 +747,26 @@ fn render_loop(
             // automation 中の書き出しでノートが欠落 / 二重発音する。
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
-            &mod_scalars_snapshot,
+            mod_plane.as_ref(),
             launcher.rows(),
             master_gain,
         );
 
-        // docs/plan_modulation.md §7: record this buffer's follower envelopes
-        // (block-rate `env`, same value the live engine publishes to
-        // `mod_scalars`) keyed by the block beat.
-        if env_sidecar.n_sources > 0 {
-            env_sidecar.beats.push(playhead_beats as f32);
-            // follower は env、 generator は song 位置から算出して焼き込む
-            // (render_video は sidecar を sample するだけで全種別を再現)。
-            for (fs, kind) in schedule
-                .follower_slots
-                .iter()
-                .zip(schedule.mod_kinds.iter())
-            {
-                let v = common::modulators::generator_scalar(kind, playhead_beats, export_song_secs)
-                    .unwrap_or(fs.env);
-                env_sidecar.scalars.push(v);
+        // docs/plan_modulation.md §7: record this buffer's modulator values
+        // (block-rate — follower は **この buffer 後の** env で、live engine が
+        // GUI へ publish するのと同じ値) keyed by the block beat。
+        if env_sidecar.n_sources() > 0 {
+            for tick in crate::mod_tick::buffer_ticks(
+                playhead,
+                frames as u32,
+                playhead_beats,
+                export_beats_per_frame,
+                sample_rate,
+            ) {
+                crate::mod_tick::eval_plane(&schedule, tick, &mut baked_mod_plane);
             }
+            #[allow(clippy::cast_possible_truncation)]
+            env_sidecar.push(playhead_beats as f32, baked_mod_plane.values());
         }
 
         // Compute block peak across the full block (for tail-silence

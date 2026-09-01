@@ -124,7 +124,7 @@ impl AppData {
             mix(quantize(meter_norm(*r), METER_STEPS));
         }
         // 変調スカラーは画像 / グループ / 映像効果の見た目を直接動かすので細かく見る。
-        for v in &self.transport.mod_scalars {
+        for v in self.transport.mod_plane.values() {
             mix(quantize(*v, 4096.0));
         }
         // リソースモニターの表示粒度 = 整数パーセント。

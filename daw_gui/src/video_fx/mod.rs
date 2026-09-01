@@ -190,7 +190,7 @@ fn resolve_device_real_params(
     device_id: u64,
     def: &VideoFxDef,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<f32> {
     def.params
         .iter()
@@ -211,12 +211,11 @@ fn resolve_device_real_params(
                     |l| rows.lane_value(row_track, l, song),
                 );
             // 変調を 0..=1 領域で合成 (PluginParam は plain==norm なので恒等)。
-            let eff_norm = automation::apply_modulation_with_scalars(
-                song,
+            let eff_norm = automation::apply_modulation_with_plane(
                 &target,
                 base,
                 mod_routings,
-                mod_scalars,
+                mod_plane,
             );
             p.kind.norm_to_real(eff_norm)
         })
@@ -233,7 +232,7 @@ fn resolve_video_chain(
     lanes: &[AutomationLane],
     mod_routings: &[ModRouting],
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<ResolvedEffect> {
     let mut out = Vec::new();
     for inst in devices.iter() {
@@ -247,7 +246,7 @@ fn resolve_video_chain(
             continue; // 配置 device は apply_chain 非対象（合成段で GroupTransform として消費）。
         }
         let params = resolve_device_real_params(
-            song, row_track, lanes, mod_routings, inst.id, def, rows, mod_scalars,
+            song, row_track, lanes, mod_routings, inst.id, def, rows, mod_plane,
         );
         out.push(ResolvedEffect { def, params });
     }
@@ -260,7 +259,7 @@ pub fn resolve_track_effects(
     song: &Song,
     track: &Track,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<ResolvedEffect> {
     resolve_video_chain(
         song,
@@ -269,7 +268,7 @@ pub fn resolve_track_effects(
         &track.automation_lanes,
         &track.mod_routings,
         rows,
-        mod_scalars,
+        mod_plane,
     )
 }
 
@@ -280,7 +279,7 @@ pub fn resolve_track_effects(
 pub fn resolve_master_effects(
     song: &Song,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<ResolvedEffect> {
     resolve_video_chain(
         song,
@@ -289,7 +288,7 @@ pub fn resolve_master_effects(
         &song.song_lanes,
         &song.song_mod_routings,
         rows,
-        mod_scalars,
+        mod_plane,
     )
 }
 
@@ -304,7 +303,7 @@ pub fn resolve_track_transform(
     song: &Song,
     track: &Track,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Option<GroupTransform> {
     let has_transform_device = track
         .devices
@@ -313,7 +312,7 @@ pub fn resolve_track_transform(
     if !has_transform_device {
         return None;
     }
-    crate::group_compose::group_active_transform(track, song, rows, mod_scalars)
+    crate::group_compose::group_active_transform(track, song, rows, mod_plane)
 }
 
 // ============================================================================

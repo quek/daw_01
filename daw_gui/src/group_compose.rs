@@ -80,7 +80,7 @@ pub fn group_active_transform(
     group_track: &Track,
     song: &Song,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Option<GroupTransform> {
     let has_lane = group_track
         .automation_lanes
@@ -109,12 +109,11 @@ pub fn group_active_transform(
             Some(lane) => rows.lane_value(group_track.id, lane, song),
             None => f64::from(fallback),
         };
-        common::automation::apply_modulation_with_scalars(
-            song,
+        common::automation::apply_modulation_with_plane(
             &target,
             base,
             &group_track.mod_routings,
-            mod_scalars,
+            mod_plane,
         ) as f32
     };
     t.x = resolve(GroupTransformParam::X, t.x);
@@ -194,7 +193,7 @@ pub fn group_has_visual_content(song: &Song, group_track_id: u32) -> bool {
 pub fn active_visual_groups(
     song: &Song,
     rows: &RowTimeline<'_>,
-    mod_scalars: &[f32],
+    mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> std::collections::HashMap<u32, GroupTransform> {
     use std::collections::{HashMap, HashSet};
 
@@ -244,7 +243,7 @@ pub fn active_visual_groups(
         if !visual {
             continue;
         }
-        let gt = group_active_transform(track, song, rows, mod_scalars).unwrap_or_default();
+        let gt = group_active_transform(track, song, rows, mod_plane).unwrap_or_default();
         out.insert(track.id, gt);
     }
     out
@@ -736,9 +735,9 @@ mod tests {
     fn none_transform_is_inactive() {
         let mut track = crate::app::track_with(|t| t.id = 7);
         let song = Song::default();
-        assert!(group_active_transform(&track, &song, &RowTimeline::preview(0.0), &[]).is_none());
+        assert!(group_active_transform(&track, &song, &RowTimeline::preview(0.0), common::mod_plane::ModPlaneRef::default()).is_none());
         track.group_transform = Some(ident());
-        assert!(group_active_transform(&track, &song, &RowTimeline::preview(0.0), &[]).is_some());
+        assert!(group_active_transform(&track, &song, &RowTimeline::preview(0.0), common::mod_plane::ModPlaneRef::default()).is_some());
     }
 
     /// 子トラックを 1 本ぶら下げた group を作る。`visual` なら子に image clip を、
@@ -814,7 +813,7 @@ mod tests {
         let (song, group_id) = song_with_group(true);
         assert!(is_group_track(&song, group_id));
         assert!(group_has_visual_content(&song, group_id));
-        let active = active_visual_groups(&song, &RowTimeline::preview(0.0), &[]);
+        let active = active_visual_groups(&song, &RowTimeline::preview(0.0), common::mod_plane::ModPlaneRef::default());
         let gt = active.get(&group_id).expect("visual group must be active");
         assert_eq!(*gt, GroupTransform::default(), "未設定なら identity");
     }
@@ -862,7 +861,7 @@ mod tests {
         group.automation_lanes.push(lane);
 
         let group = song.track_by_id(group_id).expect("group");
-        let t = group_active_transform(group, &song, &RowTimeline::preview(9.0), &[])
+        let t = group_active_transform(group, &song, &RowTimeline::preview(9.0), common::mod_plane::ModPlaneRef::default())
             .expect("transform is active");
         assert_eq!(t.scale_x, 2.0, "セルのカーブが効く (拍 9 → 位相 1.0)");
 
@@ -870,7 +869,7 @@ mod tests {
         let group = song.tracks.iter_mut().find(|t| t.id == group_id).expect("group");
         group.automation_lanes[0].launcher = RowPlayback::LauncherStopped;
         let group = song.track_by_id(group_id).expect("group");
-        let t = group_active_transform(group, &song, &RowTimeline::preview(9.0), &[])
+        let t = group_active_transform(group, &song, &RowTimeline::preview(9.0), common::mod_plane::ModPlaneRef::default())
             .expect("transform is active");
         assert_eq!(t.scale_x, 1.0);
     }
@@ -881,6 +880,6 @@ mod tests {
         let (song, group_id) = song_with_group(false);
         assert!(is_group_track(&song, group_id));
         assert!(!group_has_visual_content(&song, group_id));
-        assert!(!active_visual_groups(&song, &RowTimeline::preview(0.0), &[]).contains_key(&group_id));
+        assert!(!active_visual_groups(&song, &RowTimeline::preview(0.0), common::mod_plane::ModPlaneRef::default()).contains_key(&group_id));
     }
 }

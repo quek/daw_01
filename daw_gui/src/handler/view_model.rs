@@ -418,22 +418,22 @@ impl AppData {
     /// Sidechain source picker choices: "—" (None) followed by every
     /// track in the song **except** the cursor track itself.
     /// docs/plan_modulation.md §9: one inspector row per `ModSource`. `scalar`
-    /// is the live follower value read from `mod_scalars` at the source's slot
-    /// (= position in `Song::mod_sources`).
+    /// は engine が publish した値面から **`ModSource::id` で** 引いた実測値
+    /// (r.md #89)。
     pub fn mod_source_display(&self) -> Vec<ModSourceRow> {
         // docs/plan_modulation_routing_redesign.md §6: 帰属トラック (= カーソル
-        // トラック) のソースだけ列挙する。`enumerate()` の index はグローバル位置の
-        // ままなので `mod_scalars` lookup は正しい (follower plane はグローバル順)。
+        // トラック) のソースだけ列挙する。値は id 引きなので、絞り込みで位置が
+        // 詰まっても正しいソースの値が出る (旧実装は `enumerate()` の位置で
+        // 引いていて、engine 側の slot 数と食い違うと別のソースの値を表示した)。
         let owner = self.cursor_track_id();
         self.song_doc.song()
             .mod_sources
             .iter()
-            .enumerate()
-            .filter(|(_, m)| Some(m.owner_track_id) == owner)
-            .map(|(i, m)| ModSourceRow {
+            .filter(|m| Some(m.owner_track_id) == owner)
+            .map(|m| ModSourceRow {
                 id: m.id,
                 color: m.color,
-                scalar: self.transport.mod_scalars.get(i).copied().unwrap_or(0.0),
+                scalar: self.transport.mod_plane.scalar(m.id),
                 kind: m.kind.clone(),
             })
             .collect()
@@ -671,12 +671,11 @@ impl AppData {
         // Live tick only when this target actually has modulation (otherwise the
         // modulated value equals the base and the tick is redundant noise).
         let live_display = (!entries.is_empty()).then(|| {
-            let live_model = common::automation::apply_modulation_with_scalars(
-                self.song_doc.song(),
+            let live_model = common::automation::apply_modulation_with_plane(
                 target,
                 model_base,
                 routings,
-                &self.transport.mod_scalars,
+                self.transport.mod_plane.as_ref(),
             );
             domain.to_display(target, live_model)
         });
