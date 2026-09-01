@@ -102,6 +102,11 @@ pub struct DispatchShared {
     pub mod_scalars_base: AtomicPtr<f32>,
     pub mod_ids_base: AtomicPtr<u32>,
     pub n_mod_scalars: AtomicU32,
+    /// r.md #89: 値面の行数 (= この buffer が踏む刻みの数)。`values` の長さは
+    /// `n_mod_scalars * n_mod_rows`。
+    pub n_mod_rows: AtomicU32,
+    /// r.md #89: buffer 頭から最初の刻み境界までの frame 数。
+    pub mod_lead: AtomicU32,
     /// Phase 4 Step C-2: 「現在 recording 中の lane」 set への ptr
     /// (= `SharedState.recording_lanes.load()` 結果)。 master が dispatch
     /// 前に store、 workers + master が `fill_track_param_ramps` の引数に
@@ -150,6 +155,8 @@ impl DispatchShared {
             mod_scalars_base: AtomicPtr::new(std::ptr::null_mut()),
             mod_ids_base: AtomicPtr::new(std::ptr::null_mut()),
             n_mod_scalars: AtomicU32::new(0),
+            n_mod_rows: AtomicU32::new(0),
+            mod_lead: AtomicU32::new(common::mod_graph::MOD_TICK_FRAMES),
             recording_lanes_ptr: AtomicPtr::new(std::ptr::null_mut()),
             current_bpm_bits: AtomicU32::new(120.0_f32.to_bits()),
             playhead_beats_bits: std::sync::atomic::AtomicU64::new(
@@ -267,7 +274,7 @@ impl AudioWorkerPool {
         current_bpm: f32,
         playhead_beats: f64,
         loop_region: &common::model::LoopRegion,
-        mod_plane: common::mod_plane::ModPlaneRef<'_>,
+        mod_plane: common::mod_plane::ModTickPlaneRef<'_>,
         rows: &crate::launcher::RowSourceTable,
     ) {
         // plan §4: stalled pool は二度と dispatch しない (worker thread の
@@ -347,9 +354,12 @@ impl AudioWorkerPool {
                 .store(input_delay_per_track.len() as u32, Ordering::Release);
         }
         // docs/plan_modulation.md §5 / r.md #89: publish the modulation plane
-        // (id 表 + 値) so workers read it lock-free. Empty → null + len 0。
-        // 長さは 2 本の短い方に揃える (片方だけ長い面を worker に見せない)。
-        let n_plane = mod_plane.ids.len().min(mod_plane.values.len());
+        // (id 表 + 刻みごとの値) so workers read it lock-free. Empty → null + len 0。
+        // **列数 × 行数 = 値の長さ**が成り立つぶんだけ publish する
+        // (端数の行を worker に見せない — `from_raw_parts` の長さは検証してから)。
+        let cols = mod_plane.ids.len();
+        let rows = mod_plane.values.len().checked_div(cols).unwrap_or(0);
+        let n_plane = if rows == 0 { 0 } else { cols };
         if n_plane == 0 {
             self.shared
                 .mod_scalars_base
@@ -358,6 +368,7 @@ impl AudioWorkerPool {
                 .mod_ids_base
                 .store(std::ptr::null_mut(), Ordering::Release);
             self.shared.n_mod_scalars.store(0, Ordering::Release);
+            self.shared.n_mod_rows.store(0, Ordering::Release);
         } else {
             self.shared
                 .mod_scalars_base
@@ -368,6 +379,10 @@ impl AudioWorkerPool {
             self.shared
                 .n_mod_scalars
                 .store(n_plane as u32, Ordering::Release);
+            self.shared.n_mod_rows.store(rows as u32, Ordering::Release);
+            self.shared
+                .mod_lead
+                .store(mod_plane.lead, Ordering::Release);
         }
 
         let n_workers = self.workers.len() as u32;
@@ -529,21 +544,26 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
     let mod_scalars_base = shared.mod_scalars_base.load(Ordering::Acquire);
     let mod_ids_base = shared.mod_ids_base.load(Ordering::Acquire);
     let n_mod_scalars = shared.n_mod_scalars.load(Ordering::Acquire);
-    let mod_plane: common::mod_plane::ModPlaneRef<'_> =
-        if mod_scalars_base.is_null() || mod_ids_base.is_null() || n_mod_scalars == 0 {
-            common::mod_plane::ModPlaneRef::default()
+    let n_mod_rows = shared.n_mod_rows.load(Ordering::Acquire);
+    let mod_lead = shared.mod_lead.load(Ordering::Acquire);
+    let mod_plane: common::mod_plane::ModTickPlaneRef<'_> =
+        if mod_scalars_base.is_null() || mod_ids_base.is_null() || n_mod_scalars == 0 || n_mod_rows == 0
+        {
+            common::mod_plane::ModTickPlaneRef::default()
         } else {
-            // SAFETY: the master holds the snapshot (`LocalState::mod_plane`)
-            // alive for the dispatch window via `dispatch_and_wait`'s borrow,
-            // and `n_mod_scalars` is the length **both** arrays are known to
-            // have (`dispatch_and_wait` publishes the min of the two).
+            // SAFETY: the master holds the plane (`ModTickRunner::plane`) alive
+            // for the dispatch window via `dispatch_and_wait`'s borrow.
+            // `dispatch_and_wait` publishes `n_mod_scalars` = 列数 と
+            // `n_mod_rows` = 値の長さ / 列数 なので、`列数 * 行数` は必ず値配列の
+            // 長さ以下 (= 端数の行は publish されない)。id 側は列数ぶん。
             unsafe {
-                common::mod_plane::ModPlaneRef::new(
+                common::mod_plane::ModTickPlaneRef::new(
                     std::slice::from_raw_parts(mod_ids_base as *const u32, n_mod_scalars as usize),
                     std::slice::from_raw_parts(
                         mod_scalars_base as *const f32,
-                        n_mod_scalars as usize,
+                        (n_mod_scalars as usize) * (n_mod_rows as usize),
                     ),
+                    mod_lead,
                 )
             }
         };

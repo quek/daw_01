@@ -162,3 +162,184 @@ mod tests {
         assert_eq!(a.scalar(0), 0.0);
     }
 }
+
+/// buffer 1 個ぶんの **刻みごとの**値面 (r.md #89 §2.2)。
+///
+/// 行 = 制御刻み (64 サンプル)、列 = slot。行 `i` は **絶対 song サンプル位置**
+/// `(first_tick + i) * MOD_TICK_FRAMES` **時点の**値で、その間は隣り合う 2 行の
+/// 線形補間で埋める。ZOH (段) にすると刻み周期 (48kHz で 750Hz) の段差が音になって
+/// 出るので、変調は必ず補間して当てる。
+///
+/// 「刻み境界が絶対サンプル位置に整列している」ので、行の中身は buffer の切り方に
+/// 依存しない — live (device buffer 長) と書き出し (1024 固定) が同じ値を踏む。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ModTickPlane {
+    ids: Vec<u32>,
+    /// `rows * ids.len()` の row-major。
+    values: Vec<f32>,
+    /// buffer 頭から **最初の刻み境界**までの frame 数。
+    /// buffer 頭がちょうど境界なら [`crate::mod_graph::MOD_TICK_FRAMES`]
+    /// (= 行 0 が buffer 頭の値、行 1 が 64 frame 目の値)。
+    lead: u32,
+}
+
+impl ModTickPlane {
+    #[must_use]
+    pub fn with_capacity(sources: usize, ticks: usize) -> Self {
+        Self {
+            ids: Vec::with_capacity(sources),
+            values: Vec::with_capacity(sources * ticks),
+            lead: crate::mod_graph::MOD_TICK_FRAMES,
+        }
+    }
+
+    /// 列 (= slot の id 表) を張り直し、行を空にする。確保は起きない。
+    pub fn reset(&mut self, ids: &[u32], lead: u32) {
+        self.ids.clear();
+        self.ids.extend_from_slice(ids);
+        self.values.clear();
+        self.lead = lead.max(1);
+    }
+
+    /// 行を 1 本足す (`values` は `ids` と同じ並び)。長さが足りなければ 0 で埋め、
+    /// 余りは捨てる (行の長さが列数と食い違った表を作らない)。
+    pub fn push_row(&mut self, values: &[f32]) {
+        debug_assert_eq!(values.len(), self.ids.len());
+        let cols = self.ids.len();
+        let n = values.len().min(cols);
+        self.values.extend_from_slice(&values[..n]);
+        for _ in n..cols {
+            self.values.push(0.0);
+        }
+    }
+
+    /// 先頭 `n` 行を捨てる (buffer をまたいで持ち越した古い刻みの掃除)。
+    /// `Vec::drain` は確保しないので RT 安全。
+    pub fn drop_leading_rows(&mut self, n: usize) {
+        let cols = self.ids.len();
+        if cols == 0 || n == 0 {
+            return;
+        }
+        let cut = (n * cols).min(self.values.len());
+        self.values.drain(..cut);
+    }
+
+    pub fn set_lead(&mut self, lead: u32) {
+        self.lead = lead.max(1);
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        if self.ids.is_empty() {
+            0
+        } else {
+            self.values.len() / self.ids.len()
+        }
+    }
+
+    #[must_use]
+    pub fn as_ref(&self) -> ModTickPlaneRef<'_> {
+        ModTickPlaneRef {
+            ids: &self.ids,
+            values: &self.values,
+            lead: self.lead,
+        }
+    }
+}
+
+/// [`ModTickPlane`] の `Copy` な借用ビュー (RT パスはこれを回す)。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ModTickPlaneRef<'a> {
+    pub ids: &'a [u32],
+    pub values: &'a [f32],
+    /// buffer 頭から最初の刻み境界までの frame 数 (境界に乗っているなら 64)。
+    pub lead: u32,
+}
+
+impl<'a> ModTickPlaneRef<'a> {
+    #[must_use]
+    pub const fn new(ids: &'a [u32], values: &'a [f32], lead: u32) -> Self {
+        Self { ids, values, lead }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty() || self.values.is_empty()
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        if self.ids.is_empty() {
+            0
+        } else {
+            self.values.len() / self.ids.len()
+        }
+    }
+
+    /// 行 `i` の面 (= その刻み境界ちょうどの値)。
+    #[must_use]
+    pub fn row(&self, i: usize) -> ModPlaneRef<'a> {
+        let cols = self.ids.len();
+        let start = i * cols;
+        match self.values.get(start..start + cols) {
+            Some(v) => ModPlaneRef { ids: self.ids, values: v },
+            None => ModPlaneRef { ids: self.ids, values: &[] },
+        }
+    }
+
+    /// `frame` を挟む 2 行と、その間の位置 `0..1`。
+    #[must_use]
+    #[inline]
+    pub fn segment(&self, frame: u32) -> (usize, usize, f32) {
+        let tick = f32::from(u16::try_from(crate::mod_graph::MOD_TICK_FRAMES).unwrap_or(64));
+        if frame < self.lead {
+            // buffer 頭〜最初の境界。行 0 の値へ向かって補間する材料が無いので、
+            // 行 0 (= 前 buffer 末の刻み) と行 1 の間として扱う。
+            let t = if self.lead == 0 {
+                0.0
+            } else {
+                1.0 - (self.lead - frame) as f32 / tick
+            };
+            return (0, 1, t.clamp(0.0, 1.0));
+        }
+        let off = frame - self.lead;
+        let i = 1 + (off / crate::mod_graph::MOD_TICK_FRAMES) as usize;
+        let t = (off % crate::mod_graph::MOD_TICK_FRAMES) as f32 / tick;
+        (i, i + 1, t)
+    }
+
+    /// buffer 内の **刻み区間の開始 frame** (`0, lead, lead+64, ...`)。
+    /// plugin param の変調を刻みごとに送るときの frame offset。
+    pub fn starts(&self, frames: u32) -> impl Iterator<Item = u32> + '_ {
+        let lead = self.lead;
+        (0..).map_while(move |i: u32| {
+            let f = if i == 0 {
+                0
+            } else {
+                lead.saturating_add((i - 1).saturating_mul(crate::mod_graph::MOD_TICK_FRAMES))
+            };
+            (f < frames).then_some(f)
+        })
+    }
+
+    /// `frame` における `source_id` のスカラー (刻みの間は線形補間)。
+    ///
+    /// 最終行より後ろ (= この buffer で先の刻みをまだ評価していない範囲) は
+    /// 最終行を保持する。呼び出し側が **buffer 末より 1 刻み先まで**評価して
+    /// おけば保持区間は生じない (= live と書き出しで同じ値になる)。
+    #[must_use]
+    #[inline]
+    pub fn scalar_at_frame(&self, source_id: u32, frame: u32) -> f32 {
+        let rows = self.rows();
+        if rows == 0 {
+            return 0.0;
+        }
+        let (a, b, t) = self.segment(frame);
+        let va = self.row(a.min(rows - 1)).scalar(source_id);
+        if b >= rows {
+            return va;
+        }
+        let vb = self.row(b).scalar(source_id);
+        va + (vb - va) * t
+    }
+}

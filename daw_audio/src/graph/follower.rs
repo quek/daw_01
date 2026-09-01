@@ -93,6 +93,28 @@ impl FollowerSlot {
         }
     }
 
+    /// r.md #89: **変調された係数を刻みごとに差し込む。**
+    ///
+    /// `from_config` が compile 時に焼いた係数だけを読む作りだと、フォロワーの
+    /// A / R / ゲイン / 帯域を変調先にしても何も起きない (器だけあって効かない)。
+    /// 走行状態 (`env` と帯域フィルタの内部状態) は触らないので、刻みごとに
+    /// 呼んでも滑らかに繋がる。
+    ///
+    /// 帯域フィルタは **compile 時に有効だったときだけ**係数を差し替える —
+    /// 変調で `Some`/`None` が切り替わると走行状態が飛ぶうえ、`BandFilter` の
+    /// 有無は config の構造 (topology) であって連続量ではない。
+    ///
+    /// RT-safe: 係数の算術のみ (確保・ロック無し)。
+    pub fn set_effective(&mut self, e: crate::mod_tick::FollowerEff, sample_rate: u32) {
+        self.atk = time_coeff(e.attack_ms, sample_rate);
+        self.rel = time_coeff(e.release_ms, sample_rate);
+        self.gain = e.gain;
+        if let Some(b) = self.band.as_mut() {
+            b.a_hp = one_pole_coeff(e.hp_hz, sample_rate);
+            b.a_lp = one_pole_coeff(e.lp_hz, sample_rate);
+        }
+    }
+
     /// Schedule 再 compile 間の状態移送 (`Schedule::adopt_state_from`)。
     /// 係数 (attack/release/gain/band cutoff — 新 config 由来) は保持した
     /// まま、走行状態 (`env` + band filter state) だけを `old` から引き継ぐ。

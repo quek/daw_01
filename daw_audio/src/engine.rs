@@ -687,6 +687,17 @@ pub struct RtBundle {
     pub plugin_refs: Arc<PluginRefs>,
     /// worker rig (Arc clone)。`None` = pool 未 open / close 済。
     pub worker: Option<Arc<WorkerRig>>,
+    /// **delta**: r.md #89 のクロス変調評価計画と、それに合わせて
+    /// **off-thread で `install` 済み**の RT 状態。`None` = 据え置き。
+    ///
+    /// `ModRuntime::install` は `Vec::resize` するので RT では走らせない。
+    /// 走行状態 (位相) は install で捨たれるが、次の buffer で `locate` が
+    /// 位相表から張り直すので聴感上の段差にはならない。
+    pub mod_plan: Option<(Arc<common::mod_graph::ModPlan>, common::mod_graph::ModRuntime)>,
+    /// **delta**: 積分 tier の位相表 (off-thread build)。`None` = 据え置き。
+    /// plan とは別便で届く — 表の構築は曲長ぶんの刻みループなので、plan の
+    /// 配送を待たせない (構築中は旧表 + 閉形式シードで凌ぐ)。
+    pub mod_phase_table: Option<Arc<common::mod_graph::ModPhaseTable>>,
 }
 
 impl RtBundle {
@@ -718,6 +729,15 @@ impl RtBundle {
                 &mut self.input_delay_replacements,
                 &mut older.input_delay_replacements,
             );
+        }
+        // r.md #89: plan / 位相表も delta (`None` = 据え置き)。新しい便が
+        // 持っていなければ古い便のものを引き継ぐ — 落とすと「plan を差し替えた
+        // のに RT が旧 plan のまま」になり、変調が別のソースを指す。
+        if self.mod_plan.is_none() {
+            self.mod_plan = older.mod_plan.take();
+        }
+        if self.mod_phase_table.is_none() {
+            self.mod_phase_table = older.mod_phase_table.take();
         }
         // 「捨てろ」は一度でも要求されたら畳み込み後も残す (OR)。落とすと
         // project 切替の走行状態リセットが coalescing で消える。
@@ -797,11 +817,14 @@ pub struct LocalState {
     /// envelope、generator はこの刻みの song 位置から算出)、audio worker へ
     /// 渡して volume / pan / plugin param の `mod_routings` を変調する。
     /// buffer をまたいで再利用する (warm 後は確保が起きない)。
-    pub mod_plane: common::mod_plane::ModPlane,
-    /// r.md #89: GUI へ publish する値面。`mod_plane` (dispatch 前 = follower が
-    /// 1 buffer 遅れ) と **中身が違う** ので器を分ける — 同じ器を使い回すと、
-    /// publish 用に上書きした値が次 buffer の param 変調へ漏れる。
-    pub published_mod_plane: common::mod_plane::ModPlane,
+    pub mod_tick: crate::mod_tick::ModTickRunner,
+    /// r.md #89: `Schedule` の follower slot → 係数表の列。plan / schedule の
+    /// どちらかが変わったら作り直す (`ModTickRunner::build_follower_cols`)。
+    pub follower_cols: Vec<u16>,
+    /// r.md #89: plan slot → `Schedule::follower_slots` の index
+    /// (`ModTickRunner::build_follower_env_map`)。刻みごとの線形探索を避けるため
+    /// plan / schedule の差し替え時に 1 度だけ作る。
+    pub follower_env_of_slot: Vec<u16>,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -847,12 +870,9 @@ impl LocalState {
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
             launcher: crate::launcher::LauncherRuntime::new(),
-            mod_plane: common::mod_plane::ModPlane::with_capacity(
-                common::audio_bridge::MAX_MOD_SOURCES,
-            ),
-            published_mod_plane: common::mod_plane::ModPlane::with_capacity(
-                common::audio_bridge::MAX_MOD_SOURCES,
-            ),
+            mod_tick: crate::mod_tick::ModTickRunner::new(),
+            follower_cols: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
+            follower_env_of_slot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -894,6 +914,23 @@ impl LocalState {
         let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
         let old_refs = std::mem::replace(&mut self.plugin_refs, Arc::clone(&new.plugin_refs));
         let old_worker = std::mem::replace(&mut self.worker, new.worker.take());
+
+        // r.md #89: plan / 位相表の差し替え。旧 RT 状態と旧表は recycle bundle に
+        // 載せて off-thread で drop する (`ModRuntime` は `Vec` を 6 本持つ)。
+        let mut retired_plan: Option<(
+            Arc<common::mod_graph::ModPlan>,
+            common::mod_graph::ModRuntime,
+        )> = None;
+        let mut plan_or_schedule_changed = false;
+        if let Some((plan, rt)) = new.mod_plan.take() {
+            let old_rt = self.mod_tick.install(plan, rt);
+            retired_plan = Some((Arc::clone(&self.mod_tick.plan), old_rt));
+            plan_or_schedule_changed = true;
+        }
+        let retired_table = new
+            .mod_phase_table
+            .take()
+            .and_then(|t| self.mod_tick.set_table(Some(t)));
 
         let mut old_schedule: Option<Schedule> = None;
         let mut retired_lines: Vec<Option<DelayLine>> = Vec::new();
@@ -950,6 +987,17 @@ impl LocalState {
                 }
             }
             retired_lines = std::mem::take(&mut new.input_delay_replacements);
+            plan_or_schedule_changed = true;
+        }
+        // r.md #89: 「schedule の follower slot」と「plan の slot」の写像は
+        // どちらが変わっても張り直す (刻みごとの線形探索を避けるための表)。
+        if plan_or_schedule_changed {
+            self.mod_tick
+                .build_follower_cols(&self.cached_schedule.follower_keys, &mut self.follower_cols);
+            self.mod_tick.build_follower_env_map(
+                &self.cached_schedule.follower_keys,
+                &mut self.follower_env_of_slot,
+            );
         }
 
         // Recycle the superseded snapshot off the audio thread. The very first
@@ -967,8 +1015,55 @@ impl LocalState {
             input_delay_replacements: retired_lines,
             plugin_refs: old_refs,
             worker: old_worker,
+            mod_plan: retired_plan,
+            mod_phase_table: retired_table,
         };
         let _ = self.bundle_recycle_tx.push(recycled);
+    }
+
+    /// r.md #89: 変調の位相と transport を `sample` 位置で張り直す
+    /// (シーク / ループ折返し / 再生開始)。song が無ければ何もしない。
+    ///
+    /// **`self.playhead_beats` は呼ぶ前に tempo map で同期しておくこと** —
+    /// 刻み境界へ丸めた拍をここで求める起点になる。
+    fn locate_mod(&mut self, song: Option<&Song>, sample: u64, sample_rate: u32) {
+        if let Some(s) = song {
+            self.mod_tick
+                .locate(s, sample, self.playhead_beats, sample_rate);
+        }
+    }
+
+    /// r.md #89: この buffer が踏む制御刻みを回して、値面と transport を解く。
+    ///
+    /// envelope follower の値は `ModRuntime::set_follower` 経由でしか `tick` に
+    /// 渡らない (plan の slot 順と `Song::mod_sources` の位置順の取り違えを型で
+    /// 防ぐ設計) ので、`follower_env_of_slot` の写像で引いて渡す。
+    ///
+    /// 戻り値は buffer 頭の transport (`beat` / `bpm`)。
+    fn run_mod_ticks(
+        &mut self,
+        song: &Song,
+        playhead: u64,
+        frames: u32,
+        sample_rate: u32,
+    ) -> common::mod_graph::PhaseMark {
+        // install 直後 (plan 差し替え / 起動直後) は着地していないので、
+        // まず現在位置で位相と transport を張る。
+        if self.mod_tick.needs_locate() {
+            self.mod_tick
+                .locate(song, playhead, self.playhead_beats, sample_rate);
+        }
+        let sched = &self.cached_schedule;
+        let env_of = &self.follower_env_of_slot;
+        let follower_env = |plan_slot: u16| match env_of.get(usize::from(plan_slot)).copied() {
+            Some(i) if i != u16::MAX => sched
+                .follower_slots
+                .get(usize::from(i))
+                .map_or(0.0, |f| f.env),
+            _ => 0.0,
+        };
+        self.mod_tick
+            .run_buffer(song, playhead, frames, sample_rate, follower_env)
     }
 
     /// r.md #40: off-thread が確保した stretch engine を `TrackScratch` へ取り込む。
@@ -1279,6 +1374,10 @@ impl LocalState {
             // の doc — これが無いと seek の後にセルが 1 周無音になり、予約と
             // フォローアクションを跳び越して二度と発火しない)。
             self.launcher.on_transport_jump(self.playhead_beats - prev_beats);
+            // r.md #89: 変調の位相も張り直す。積分 tier は位相表の breakpoint から
+            // **同じ漸化式で**前進するので、曲頭から通しで再生したときと厳密に
+            // 一致する (= どこから再生しても同じ位相)。
+            self.locate_mod(song_ref, playhead, sample_rate);
         }
         // 今 buffer の effective bpm を SongTempo lane から評価する。
         // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
@@ -1290,21 +1389,29 @@ impl LocalState {
             common::model::MASTER_TRACK_ID,
             common::model::AutomationTarget::SongTempo,
         ));
+        // r.md #89: この buffer の変調と transport は**制御グリッド**で解く。
+        // `ModTickRunner` が刻み (64 サンプル、絶対位置に整列) ごとに
+        // `mod_graph::tick` を回し、`next_mark` の規則で拍とテンポを進める。
+        // **ここで `playhead_beats += frames * bpm / (60·SR)` と自前に進めては
+        // いけない** — `ModPhaseTable` / `locate` が同じ漸化式で位相を張るので、
+        // 進め方が 1 つでもずれると「どこから再生しても同じ位相」が壊れる。
+        let head_mark = match song_ref {
+            Some(s) => self.run_mod_ticks(s, playhead, n as u32, sample_rate),
+            None => common::mod_graph::PhaseMark {
+                beat: self.playhead_beats,
+                secs: 0.0,
+                bpm: 120.0,
+            },
+        };
+        // 刻みが解いた buffer 頭の拍。ここが以降の描画の SSoT。
+        if song_ref.is_some() {
+            self.playhead_beats = head_mark.beat;
+        }
+        #[allow(clippy::cast_possible_truncation)]
         let current_bpm: f32 = match song_ref {
+            // Tempo lane を録音中は curve eval を skip して constant fallback。
             Some(s) if tempo_recording => s.bpm,
-            Some(s) => {
-                let base = common::automation::evaluate_song_tempo(s, self.playhead_beats);
-                // B11 (r.md #8): song-level modulation (LFO/Random/MSEG/follower →
-                // `SongTempo`) を base tempo に適用。 `mod_plane` は前
-                // buffer 値 (followers は元々 1-buffer lag)。 `SongTempo` を target に
-                // する song_mod_routing が無ければ offset 0 = no-op。 RT-safe。
-                common::automation::apply_modulation_with_plane(
-                    &common::model::AutomationTarget::SongTempo,
-                    f64::from(base),
-                    &s.song_mod_routings,
-                    self.mod_plane.as_ref(),
-                ) as f32
-            }
+            Some(_) => head_mark.bpm as f32,
             None => 120.0,
         };
 
@@ -1315,26 +1422,6 @@ impl LocalState {
             // live until the end of the call so workers can safely deref it.
             let audio_renderer_g = self.shared.audio_clip_renderer.load();
             let audio_renderer: &AudioClipRenderer = &audio_renderer_g;
-
-            // docs/plan_modulation.md §5 / r.md #89: この buffer の変調値面を作る。
-            // envelope follower は **前 buffer の** env (`EnvelopeFollow` ノードは
-            // post-dispatch に走るので、param イベントが見るのは 1 buffer 前 =
-            // block-rate の遅れ)。generator (LFO/Random/MSEG/Steps) は刻みの
-            // song 位置から直接算出する (状態レス・lag なし・決定論)。
-            //
-            // 刻みの割り方と面の作り方は **live と書き出しで同じ 1 本**
-            // (`crate::mod_tick`、アーキ不変条件 6)。第 1 便では buffer 全体で
-            // 1 刻みなので、従来の「buffer 頭で 1 回評価」と bit 同一。
-            let beats_per_frame = f64::from(current_bpm) / (60.0 * f64::from(sample_rate));
-            for tick in crate::mod_tick::buffer_ticks(
-                playhead,
-                n as u32,
-                self.playhead_beats,
-                beats_per_frame,
-                sample_rate,
-            ) {
-                crate::mod_tick::eval_plane(&self.cached_schedule, tick, &mut self.mod_plane);
-            }
 
             // r.md #87: 行ごとの時間軸を **dispatch より前に**確定させる
             // (worker はこのテーブルをポインタで読む)。予約の発火 / フォロー
@@ -1367,7 +1454,8 @@ impl LocalState {
                 recording_lanes,
                 current_bpm,
                 self.playhead_beats,
-                self.mod_plane.as_ref(),
+                self.mod_tick.plane(),
+                self.mod_tick.follower_drive(&self.follower_cols),
                 self.launcher.rows(),
                 master_gain,
             );
@@ -1418,26 +1506,11 @@ impl LocalState {
                 bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
             }
 
-            // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する
-            // (block-rate)。follower は **この buffer 後の** env (EnvelopeFollow ノードは
-            // 上の render で走り終えている) なので、dispatch 前に作った
-            // `self.mod_plane` とは別に引き直す。値と id を組で書く seqlock なので、
-            // GUI が「新しい id と古い値」を掴むことはない。
-            // Atomic store のみ = RT 安全。
-            for tick in crate::mod_tick::buffer_ticks(
-                playhead,
-                n as u32,
-                self.playhead_beats,
-                beats_per_frame,
-                sample_rate,
-            ) {
-                crate::mod_tick::eval_plane(
-                    &self.cached_schedule,
-                    tick,
-                    &mut self.published_mod_plane,
-                );
-            }
-            bridge.publish_mod_plane(&self.published_mod_plane);
+            // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。
+            // 刻みが解いた buffer 頭の値をそのまま出す (GUI は 30Hz なので
+            // 刻みの粒度は要らない)。値と id を組で書く seqlock なので、
+            // GUI が「新しい id と古い値」を掴むことはない。Atomic store のみ。
+            bridge.publish_mod_plane(self.mod_tick.publish_plane());
 
             // Debug-only heartbeat. RT 規約上 audio thread での tracing は
             // 望ましくないが、開発時に engine 状態を可視化できる利点が
@@ -1505,13 +1578,14 @@ impl LocalState {
                 new_ph,
                 song_ended(song_ref, sample_rate, new_ph),
             );
-            // Phase 5 Step 5.2: playhead_beats を current_bpm で 1 buffer 分
-            // advance する。 sub-buffer の tempo 変化は scope 外 (= 1 buffer
-            // ~5..20ms 内 constant)。
+            // r.md #89: `playhead_beats` は **刻みが進める** (この buffer の頭で
+            // `ModTickRunner::run_buffer` が解いた値を入れてある)。ここで
+            // buffer 単位に足し込むと、位相表と実演奏の拍軸が食い違う
+            // (= シークすると変調の位相が飛ぶ)。song が無いときだけ、
+            // 従来どおり buffer 定数で進める。
             let sr = sample_rate as f64;
-            if sr > 0.0 {
-                self.playhead_beats +=
-                    n as f64 * f64::from(current_bpm) / (60.0 * sr);
+            if sr > 0.0 && song_ref.is_none() {
+                self.playhead_beats += n as f64 * f64::from(current_bpm) / (60.0 * sr);
             }
             if reached_end {
                 self.queue_all_notes_off();
@@ -1530,6 +1604,8 @@ impl LocalState {
                     // r.md #87: ループで巻き戻したぶん、ランチャーの絶対拍も戻す
                     // (セルの位相はループを跨いでも連続する)。
                     self.launcher.on_transport_jump(self.playhead_beats - prev_beats);
+                    // r.md #89: 変調の位相も折返し位置で張り直す (seek と同じ扱い)。
+                    self.locate_mod(song_ref, new_ph, sample_rate);
                 } else {
                     self.playing = false;
                     shared
@@ -1636,6 +1712,8 @@ mod bundle_install_tests {
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
+            mod_plan: None,
+            mod_phase_table: None,
         }
     }
 
@@ -1760,6 +1838,8 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                mod_plan: None,
+                mod_phase_table: None,
             })
             .unwrap();
         local.refresh_bundle();
@@ -1812,6 +1892,8 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                mod_plan: None,
+                mod_phase_table: None,
             })
             .unwrap();
         local.refresh_bundle();
@@ -1980,6 +2062,8 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                mod_plan: None,
+                mod_phase_table: None,
             })
             .unwrap();
         local.refresh_bundle();
@@ -2025,6 +2109,8 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                mod_plan: None,
+                mod_phase_table: None,
             })
             .unwrap();
 
