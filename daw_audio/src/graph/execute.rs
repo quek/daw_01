@@ -991,7 +991,7 @@ fn advance_follower(
             .get(slot as usize)
             .is_some_and(|c| *c != u16::MAX);
     if !driven {
-        fs.process_block(src_l, src_r, n);
+        fs.process_block(src_l, src_r, n, drive.first_sample);
         return;
     }
     for span in drive.spans {
@@ -1001,7 +1001,12 @@ fn advance_follower(
         let a = span.frame as usize;
         let b = (a + span.frames as usize).min(n);
         if a < b {
-            fs.process_block(&src_l[a..b], &src_r[a..b], b - a);
+            fs.process_block(
+                &src_l[a..b],
+                &src_r[a..b],
+                b - a,
+                drive.first_sample + a as u64,
+            );
         }
     }
 }

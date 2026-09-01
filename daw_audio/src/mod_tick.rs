@@ -249,7 +249,7 @@ impl ModTickRunner {
         start_sample: u64,
         frames: u32,
         sample_rate: u32,
-        mut follower_env: impl FnMut(u16) -> f32,
+        mut follower_env: impl FnMut(u16, i64) -> f32,
     ) -> PhaseMark {
         let k0 = tick_of(start_sample);
         if self.first_tick == i64::MIN || k0 < self.first_tick {
@@ -307,15 +307,19 @@ impl ModTickRunner {
         song: &Song,
         k: i64,
         dt: f64,
-        follower_env: &mut impl FnMut(u16) -> f32,
+        follower_env: &mut impl FnMut(u16, i64) -> f32,
     ) {
         // envelope follower の出力を先に書く (`tick` は引数で取らない —
         // plan の slot 順と `Song::mod_sources` の位置順の取り違えを防ぐため)。
         // 上限を超えるソースにも書く — 値面には載らないが、`tick` の入力辺として
         // 上限内のソースを変調しうるので評価自体は正しく回す必要がある。
+        // **遅れは刻み固定** (`FOLLOWER_LAG_TICKS`)。同じ buffer の env は原理的に
+        // 使えない (値面は音を描く前に作る) ので遡って読むが、遡る量を buffer 長では
+        // なく刻み数で決めることで live (可変長) と書き出し (1024 固定) が一致する。
+        let env_tick = k - crate::graph::follower::FOLLOWER_LAG_TICKS;
         for slot in 0..self.plan.nodes.len() {
             let Ok(s) = u16::try_from(slot) else { continue };
-            self.rt.set_follower(s, follower_env(s));
+            self.rt.set_follower(s, follower_env(s, env_tick));
         }
         // automation lane が base を上書きする param を解決する (r.md #89 Q4)。
         for i in 0..self.plan.lane_params.len() {
@@ -420,9 +424,10 @@ impl ModTickRunner {
     /// フォロワーを刻みごとに進めるための view。`col_of_slot` は engine が
     /// `Schedule::follower_keys` から解決した写像 (schedule slot → 列)。
     #[must_use]
-    pub fn follower_drive<'a>(&'a self, col_of_slot: &'a [u16]) -> FollowerDrive<'a> {
+    pub fn follower_drive<'a>(&'a self, col_of_slot: &'a [u16], first_sample: u64) -> FollowerDrive<'a> {
         FollowerDrive {
             spans: &self.spans,
+            first_sample,
             col_of_slot,
             eff: &self.follower_eff,
             n_cols: self.follower_cols.len(),
@@ -494,6 +499,9 @@ impl ModTickRunner {
 pub struct FollowerDrive<'a> {
     /// buffer の区間割り。空なら「刻みに割らない」= 従来どおり 1 回で舐める。
     pub spans: &'a [TickSpan],
+    /// この buffer の先頭の **絶対 song サンプル位置**。フォロワーが刻み境界の
+    /// envelope を記録するのに要る (境界は絶対位置で決まる = buffer 非依存)。
+    pub first_sample: u64,
     /// `Schedule` の follower slot → [`Self::eff`] の列。`u16::MAX` = 係数が
     /// 変調されていない (compile 時の値のまま)。
     pub col_of_slot: &'a [u16],
@@ -662,7 +670,7 @@ mod tests {
             let mut out = Vec::new();
             let mut at = 0u64;
             for &n in chunks {
-                r.run_buffer(&song, at, n, sr, |_| 0.0);
+                r.run_buffer(&song, at, n, sr, |_, _| 0.0);
                 // buffer 内の各 frame の値を絶対サンプル位置つきで記録する。
                 let plane = r.plane();
                 for f in 0..n {

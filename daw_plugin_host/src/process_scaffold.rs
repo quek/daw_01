@@ -185,13 +185,19 @@ impl TransportBlock {
 /// 後段の Mod folding が (unstable な time sort 順に依存せず) 最新 base を
 /// 見られるようにする。cache は load 時に全 param の default で seed 済み
 /// なので、ここでは既存 key の更新のみ (= RT heap alloc なし)。
-pub fn update_param_base_cache(cache: &mut HashMap<u32, f64>, param_events: &[TimedParamEvent]) {
-    for ev in param_events {
-        if ev.kind == ParamEventKind::Value
-            && let Some(slot) = cache.get_mut(&ev.param_id)
-        {
-            *slot = ev.value;
-        }
+/// r.md #89: **1 イベントぶんだけ** base を進める。
+///
+/// buffer 全体を先に畳んでから Mod を畳むと、どの刻みの Mod も「buffer 末の
+/// automation 値」を base にする。automation と変調を同じ param に併用すると、
+/// プラグインには「その時刻の automation 値」と「buffer 末 + 変調」が刻みごとに
+/// 交互に届く = 48kHz で 750Hz のジッパーになる。イベント列を時刻順に舐めながら
+/// この関数で進めれば、Mod は **その時刻までの** automation 値に畳まれる。
+#[inline]
+pub fn advance_param_base(cache: &mut HashMap<u32, f64>, ev: &TimedParamEvent) {
+    if ev.kind == ParamEventKind::Value
+        && let Some(slot) = cache.get_mut(&ev.param_id)
+    {
+        *slot = ev.value;
     }
 }
 
@@ -308,9 +314,41 @@ mod tests {
             // Mod は base を動かさない。
             TimedParamEvent { time: 0, param_id: 1, value: -0.2, kind: ParamEventKind::Mod },
         ];
-        update_param_base_cache(&mut cache, &evs);
+        for ev in &evs {
+            advance_param_base(&mut cache, ev);
+        }
         assert_eq!(cache.len(), 1);
         assert_eq!(cache[&1], 0.9);
+    }
+
+    /// r.md #89: **Mod は「その時刻までの」automation 値に畳む。**
+    ///
+    /// buffer 全体を先に畳んでから Mod を処理すると、どの刻みの Mod も buffer 末の
+    /// automation 値を base にしてしまい、プラグインには「その時刻の automation 値」と
+    /// 「buffer 末 + 変調」が刻みごとに交互に届く (= ジッパー)。
+    #[test]
+    fn modは同時刻までのautomation値に畳まれる() {
+        let mut cache = HashMap::from([(1u32, 0.0f64)]);
+        // 刻み 0 で automation 0.2、刻み 512 で 0.9。各刻みに Mod +0.05。
+        let evs = [
+            TimedParamEvent { time: 0, param_id: 1, value: 0.2, kind: ParamEventKind::Value },
+            TimedParamEvent { time: 0, param_id: 1, value: 0.05, kind: ParamEventKind::Mod },
+            TimedParamEvent { time: 512, param_id: 1, value: 0.9, kind: ParamEventKind::Value },
+            TimedParamEvent { time: 512, param_id: 1, value: 0.05, kind: ParamEventKind::Mod },
+        ];
+        let mut folded = Vec::new();
+        for ev in &evs {
+            advance_param_base(&mut cache, ev);
+            if ev.kind == ParamEventKind::Mod {
+                folded.push(fold_mod_offset(cache[&1], ev.value, 0.0, 1.0));
+            }
+        }
+        // 期待値: 刻み 0 は 0.2+0.05、刻み 512 は 0.9+0.05 (buffer 末の 0.9 を
+        // 刻み 0 にも使っていた頃は [0.95, 0.95] になっていた)。
+        assert!(
+            (folded[0] - 0.25).abs() < 1e-9 && (folded[1] - 0.95).abs() < 1e-9,
+            "各 Mod はその時刻の automation 値に乗る: {folded:?}"
+        );
     }
 
     #[test]

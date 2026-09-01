@@ -7,6 +7,24 @@
 
 use common::model::{BandFilter, FollowerConfig, FollowerMode};
 
+/// 刻み境界の envelope を保持する本数 (2 の冪、剰余を安く取るため)。
+/// **1 buffer で踏む刻み数 + 遅れ**より大きいこと。
+const FOLLOWER_HIST: usize = 64;
+
+/// **変調がフォロワーの値を読むときの遅れ (刻み数)。**
+///
+/// フォロワーの env は「その buffer の音」を通してからでないと出ない。一方
+/// 変調の値面は**描く前に**作る必要がある (描画がそれを消費する) ので、
+/// 同じ buffer の env は原理的に使えない。そこで **buffer 長に依存しない
+/// 固定の刻み数**だけ遡って読む。
+///
+/// 1 buffer で踏む刻み数 (最大 [`crate::mod_tick::MAX_TICKS_PER_BUFFER`]) 以上に
+/// しておけば、要求する刻みは必ず**前の buffer で記録済み**になる。これで
+/// live (device buffer 長は可変) と書き出し (1024 固定) の遅れ量が一致する —
+/// 以前は「1 buffer 前」だったので 480 frame なら 10ms、1024 frame なら 21.3ms と
+/// 環境で変わり、サイドチェインの立ち上がりが聴いた音と書き出しでずれていた。
+pub const FOLLOWER_LAG_TICKS: i64 = crate::mod_tick::MAX_TICKS_PER_BUFFER as i64;
+
 /// One-pole smoothing coefficient for a cutoff `fc` Hz at `sample_rate`
 /// (`y += a*(x - y)`). Clamped to a stable `[0, 1]` range.
 fn one_pole_coeff(fc_hz: f32, sample_rate: u32) -> f32 {
@@ -78,6 +96,11 @@ pub struct FollowerSlot {
     /// Running smoothed envelope (`>= 0`). Persists across buffers; reset to
     /// `0` only when the schedule is recompiled.
     pub env: f32,
+    /// 刻み境界ごとの envelope (絶対刻み番号 % [`FOLLOWER_HIST`] で引く)。
+    /// 変調はここを [`FOLLOWER_LAG_TICKS`] だけ遡って読む。
+    hist: [f32; FOLLOWER_HIST],
+    /// `hist` に書いた最新の絶対刻み番号 (`i64::MIN` = まだ 1 つも無い)。
+    hist_tick: i64,
 }
 
 impl FollowerSlot {
@@ -90,6 +113,8 @@ impl FollowerSlot {
             rectify: cfg.rectify,
             band: cfg.band_filter.as_ref().map(|f| Band::new(f, sample_rate)),
             env: 0.0,
+            hist: [0.0; FOLLOWER_HIST],
+            hist_tick: i64::MIN,
         }
     }
 
@@ -122,6 +147,8 @@ impl FollowerSlot {
     /// 踏む問題が消える。RT-safe: f32 コピーのみ。
     pub fn adopt_state_from(&mut self, old: &FollowerSlot) {
         self.env = old.env;
+        self.hist = old.hist;
+        self.hist_tick = old.hist_tick;
         if let (Some(nb), Some(ob)) = (self.band.as_mut(), old.band.as_ref()) {
             nb.lp_hp = ob.lp_hp;
             nb.lp = ob.lp;
@@ -132,9 +159,13 @@ impl FollowerSlot {
     /// scratch. Order matches docs/plan_modulation.md §3: stereo detector →
     /// optional band filter → pre-gain → rectify → attack/release one-pole.
     /// RT-safe: pure arithmetic over the provided slices, no alloc / lock.
+    /// `first_sample` は `l[0]` の **絶対 song サンプル位置** — 刻み境界を跨ぐたびに
+    /// その時点の envelope を [`Self::hist`] へ記録するために要る (境界は絶対位置で
+    /// 決まるので、buffer の切り方に依存しない)。
     #[inline]
-    pub fn process_block(&mut self, l: &[f32], r: &[f32], n: usize) {
+    pub fn process_block(&mut self, l: &[f32], r: &[f32], n: usize, first_sample: u64) {
         let n = n.min(l.len()).min(r.len());
+        let tick_frames = u64::from(crate::mod_tick::MOD_TICK_FRAMES);
         let mut env = self.env;
         for i in 0..n {
             let det = match self.mode {
@@ -149,7 +180,94 @@ impl FollowerSlot {
             let t = if self.rectify { det.abs() } else { det };
             let coeff = if t > env { self.atk } else { self.rel };
             env += coeff * (t - env);
+            // サンプル `abs` を通した直後が刻み境界 `abs+1` なら、その境界の値を記録。
+            let boundary = first_sample + i as u64 + 1;
+            if boundary.is_multiple_of(tick_frames) {
+                #[allow(clippy::cast_possible_wrap)]
+                let tick = (boundary / tick_frames) as i64;
+                self.hist[(tick as usize) % FOLLOWER_HIST] = env;
+                self.hist_tick = tick;
+            }
         }
         self.env = env;
+    }
+
+    /// 絶対刻み `tick` 時点の envelope。
+    ///
+    /// 記録の窓 (直近 [`FOLLOWER_HIST`] 刻み) の外なら直近値へ倒す — シーク直後や
+    /// 再生開始直後は履歴が無いので、そこだけ「今の値」で始まる。
+    #[must_use]
+    #[inline]
+    pub fn env_at_tick(&self, tick: i64) -> f32 {
+        // **窓の外でも buffer 非依存の値へ倒す。** ここで走行中の `self.env` を返すと
+        // 「今どこまで音を通したか」= buffer の切り方が滲み出て、live と書き出しが
+        // 食い違う (この関数はそれを消すためにある)。
+        if tick < 0 || self.hist_tick == i64::MIN {
+            // 曲頭より前 / まだ 1 つも記録が無い = 無音。
+            return 0.0;
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let cap = FOLLOWER_HIST as i64;
+        // 記録済みの窓へクランプ (端は「記録した中でいちばん近い刻み」)。
+        let t = tick.clamp((self.hist_tick - cap + 1).max(0), self.hist_tick);
+        self.hist[(t as usize) % FOLLOWER_HIST]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TICK: usize = crate::mod_tick::MOD_TICK_FRAMES as usize;
+
+    fn cfg() -> FollowerConfig {
+        FollowerConfig { attack_ms: 1.0, release_ms: 50.0, ..FollowerConfig::default() }
+    }
+
+    /// **フォロワーの遅れが buffer の切り方に依存しない**こと (r.md #89)。
+    ///
+    /// 変調の値面は音を描く**前**に作るので、同じ buffer の env は原理的に使えない。
+    /// 遡る量を「1 buffer」で決めていた頃は live (480 frame = 10ms) と書き出し
+    /// (1024 frame = 21.3ms) でサイドチェインの立ち上がりがずれていた。
+    ///
+    /// ここでは実際の消費順を再現する — buffer ごとに **先に**その buffer の刻みが
+    /// 読む env を集め、**後で**その buffer の音を通す。集めた列を絶対刻み番号で
+    /// 突き合わせるので、切り方を変えても一致しなければ落ちる。
+    #[test]
+    fn 変調が読むenvはbufferの切り方に依存しない() {
+        let sr = 48_000;
+        let n = 40 * TICK;
+        // 立ち上がりの位置がはっきり出る断続入力 (キック相当)。
+        let sig: Vec<f32> = (0..n).map(|i| if i % 800 < 100 { 0.9 } else { 0.0 }).collect();
+        let run = |chunks: &[usize]| {
+            let mut fs = FollowerSlot::from_config(&cfg(), sr);
+            let mut seen: Vec<(i64, f32)> = Vec::new();
+            let mut at = 0usize;
+            for &c in chunks {
+                let end = (at + c).min(n);
+                if at >= end {
+                    continue;
+                }
+                // 1) この buffer が踏む刻みが読む env (= 音を通す前)。
+                let first_tick = (at / TICK) as i64;
+                let last_tick = ((end - 1) / TICK) as i64;
+                for k in first_tick..=last_tick {
+                    seen.push((k, fs.env_at_tick(k - FOLLOWER_LAG_TICKS)));
+                }
+                // 2) そのあとで音を通す。
+                fs.process_block(&sig[at..end], &sig[at..end], end - at, at as u64);
+                at = end;
+            }
+            seen
+        };
+        let a = run(&[1024, 1024, 512]);
+        let b = run(&[480, 544, 512, 1024, 2]);
+        // 刻み番号で突き合わせる (切り方が違うと踏む刻みの重複の仕方が変わる)。
+        for (k, va) in &a {
+            if let Some((_, vb)) = b.iter().find(|(kk, _)| kk == k) {
+                assert_eq!(va, vb, "tick={k} の env が buffer の切り方で変わった");
+            }
+        }
+        assert!(a.iter().any(|(_, v)| *v > 0.01), "そもそも env が動いている");
     }
 }

@@ -659,7 +659,11 @@ fn run_worker(
             });
         }
         events_in.sort_unstable_by_key(|e| e.time);
-        param_events_in.sort_unstable_by_key(|e| e.time);
+        // r.md #89: 同時刻は **Value を先に**。Mod は「その時刻の automation 値」を
+        // base に畳むので、同時刻の Value より先に来ると 1 刻み古い base で畳まれる。
+        param_events_in.sort_unstable_by_key(|e| {
+            (e.time, u8::from(e.kind == crate::plugin_instance::ParamEventKind::Mod))
+        });
 
         let (in_a, in_b) = pd.buffer_in.split_at(1);
         let input_audio: [&[f32]; 2] = [&in_a[0][..n], &in_b[0][..n]];

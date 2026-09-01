@@ -174,7 +174,6 @@ impl AudioProcessorHalf for Vst3AudioHalf {
                 *slot = val;
             }
         }
-        process_scaffold::update_param_base_cache(&mut self.param_mod_base, param_events);
 
         self.folded_param_events.clear();
         // GUI edits first, at sample offset 0, so a non-automated knob turn
@@ -189,6 +188,8 @@ impl AudioProcessorHalf for Vst3AudioHalf {
             });
         }
         for ev in param_events {
+            // base は **時刻順に 1 件ずつ**進める (buffer 末の値を全刻みに使わない)。
+            process_scaffold::advance_param_base(&mut self.param_mod_base, ev);
             match ev.kind {
                 ParamEventKind::Value => self.folded_param_events.push(*ev),
                 ParamEventKind::Mod => {

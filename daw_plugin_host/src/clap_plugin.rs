@@ -157,7 +157,6 @@ impl AudioProcessorHalf for ClapAudioHalf {
         // offset·(max−min)); non-modulatable params get the offset folded
         // into an absolute value over the cached base (scaffold helpers).
         use crate::plugin_instance::ParamEventKind;
-        process_scaffold::update_param_base_cache(&mut self.last_param_value, param_events);
         self.pending_param_events.clear();
         self.pending_param_mods.clear();
         let param_value_header = |time: u32| clap_event_header {
@@ -168,6 +167,9 @@ impl AudioProcessorHalf for ClapAudioHalf {
             flags: 0,
         };
         for ev in param_events {
+            // base は **時刻順に 1 件ずつ**進める (buffer 末の automation 値を
+            // 全刻みの Mod の base に使わない — r.md #89)。
+            process_scaffold::advance_param_base(&mut self.last_param_value, ev);
             match ev.kind {
                 ParamEventKind::Value => {
                     self.pending_param_events.push(clap_event_param_value {

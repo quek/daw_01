@@ -1054,12 +1054,14 @@ impl LocalState {
         }
         let sched = &self.cached_schedule;
         let env_of = &self.follower_env_of_slot;
-        let follower_env = |plan_slot: u16| match env_of.get(usize::from(plan_slot)).copied() {
-            Some(i) if i != u16::MAX => sched
-                .follower_slots
-                .get(usize::from(i))
-                .map_or(0.0, |f| f.env),
-            _ => 0.0,
+        let follower_env = |plan_slot: u16, tick: i64| {
+            match env_of.get(usize::from(plan_slot)).copied() {
+                Some(i) if i != u16::MAX => sched
+                    .follower_slots
+                    .get(usize::from(i))
+                    .map_or(0.0, |f| f.env_at_tick(tick)),
+                _ => 0.0,
+            }
         };
         self.mod_tick
             .run_buffer(song, playhead, frames, sample_rate, follower_env)
@@ -1454,7 +1456,7 @@ impl LocalState {
                 current_bpm,
                 self.playhead_beats,
                 self.mod_tick.plane(),
-                self.mod_tick.follower_drive(&self.follower_cols),
+                self.mod_tick.follower_drive(&self.follower_cols, playhead),
                 self.launcher.rows(),
                 master_gain,
             );

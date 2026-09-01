@@ -713,11 +713,14 @@ fn render_loop(
         let head_mark = {
             let sched = &schedule;
             let env_of = &follower_env_of_slot;
-            let follower_env = |plan_slot: u16| match env_of.get(usize::from(plan_slot)).copied() {
-                Some(i) if i != u16::MAX => {
-                    sched.follower_slots.get(usize::from(i)).map_or(0.0, |f| f.env)
+            let follower_env = |plan_slot: u16, tick: i64| {
+                match env_of.get(usize::from(plan_slot)).copied() {
+                    Some(i) if i != u16::MAX => sched
+                        .follower_slots
+                        .get(usize::from(i))
+                        .map_or(0.0, |f| f.env_at_tick(tick)),
+                    _ => 0.0,
                 }
-                _ => 0.0,
             };
             mod_tick.run_buffer(song, playhead, frames as u32, sample_rate, follower_env)
         };
@@ -763,7 +766,7 @@ fn render_loop(
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
             mod_tick.plane(),
-            mod_tick.follower_drive(&follower_cols),
+            mod_tick.follower_drive(&follower_cols, playhead),
             launcher.rows(),
             master_gain,
         );
