@@ -227,6 +227,10 @@ impl AppData {
             // 行の不変条件 (孤児セル / 消えたセルを指す主導権 / 死んだ列への Jump) は
             // model が持つ。貼り付けた行にも同じ規則を通す (冪等なので既存行は不変)。
             song.normalize_session();
+            // r.md #89: `rehome_pasted_modulation` が落とした変調の **深さ**を指していた
+            // 変調 / レーンを連鎖して掃除する (固定点の SSoT はこの 1 本。冪等なので
+            // 既存の健全な曲では no-op)。
+            song.prune_dangling_mod_targets();
             new_ids
         }) else {
             return 0;
@@ -364,20 +368,7 @@ impl AppData {
                     remap_target(&mut r.target);
                 }
             }
-            for dev in &mut t.devices {
-                for slot in &mut dev.aux_inputs {
-                    if let Some(route) = slot {
-                        let old = route.tap.source_track;
-                        if let Some(&new) = track_remap.get(&old) {
-                            route.tap.source_track = new;
-                        } else if !(same_project && song.track_by_id(old).is_some()) {
-                            // dangling after paste: drop the route (keep tap_point
-                            // intact when the source survives).
-                            *slot = None;
-                        }
-                    }
-                }
-            }
+            Self::resolve_pasted_aux_refs(song, &track_remap, same_project, &mut t);
             t.lipsync_target_track = match t.lipsync_target_track {
                 Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),
                 Some(old) if same_project && song.track_by_id(old).is_some() => Some(old),
@@ -400,7 +391,126 @@ impl AppData {
             }
             built.push((tc.track.id, t));
         }
+
+        // 4) r.md #89: 変調の id 衛生。**集合全体を 1 度に**処理する
+        //    (`ModRoutingDepth` は「その変調が置かれているトラック」に載る規約
+        //    = `Song::mod_routing_owner` だが、track ごとに分けて解くと集合内の
+        //    別トラックを指す形を黙って落とすので、表は set スコープで持つ)。
+        Self::rehome_pasted_modulation(song, &mut built, same_project);
         built
+    }
+
+    /// 貼り付けた track の device の aux 参照を解決する。**sidechain (aux 入力) と
+    /// パラアウト (aux 出力) を対称に扱うのがこの 1 本の要点** — 片方だけ見ていた
+    /// 頃は、別プロジェクトへ貼ったパラアウトが id だけ一致する**無関係なトラック**
+    /// へ音を流していた (`handler/device_relocate.rs` の
+    /// `resolve_aux_refs_after_paste` が既に「`aux_outputs` も見ること」と書いている
+    /// 取りこぼし)。
+    ///
+    /// 規約は sends / lipsync と同じ: 集合内なら新 id へ、集合外は `same_project` で
+    /// 実在するときだけ据え置き、それ以外は route ごと落とす (入力側は source が
+    /// 生き残るなら `tap_point` をそのまま保つ)。
+    fn resolve_pasted_aux_refs(
+        song: &common::model::Song,
+        track_remap: &std::collections::HashMap<u32, u32>,
+        same_project: bool,
+        t: &mut common::model::Track,
+    ) {
+        let resolve = |old: u32| -> Option<u32> {
+            if let Some(&new) = track_remap.get(&old) {
+                return Some(new);
+            }
+            (same_project && song.track_by_id(old).is_some()).then_some(old)
+        };
+        for dev in &mut t.devices {
+            for slot in &mut dev.aux_inputs {
+                let Some(route) = slot else { continue };
+                match resolve(route.tap.source_track) {
+                    Some(new) => route.tap.source_track = new,
+                    None => *slot = None,
+                }
+            }
+            for slot in &mut dev.aux_outputs {
+                let Some(route) = slot else { continue };
+                match resolve(route.dest_track) {
+                    Some(new) => route.dest_track = new,
+                    None => *slot = None,
+                }
+            }
+        }
+    }
+
+    /// [`Self::build_pasted_tracks`] step 4: 貼り付け集合の **変調参照**を解決する。
+    ///
+    /// 2 つの id 空間を見る:
+    ///
+    /// - `source_id` (→ `Song.mod_sources[*].id`) … モジュレーター本体は Song 直下で
+    ///   payload に載らないので、集合内へ貼り替える先が無い。sends / lipsync と同じ
+    ///   規約で「`same_project` かつ実在」だけ残す。**別プロジェクトでは必ず落とす** —
+    ///   据え置くと、たまたま同じ id の**無関係なモジュレーター**に結線される。
+    /// - `ModSourceParam { source_id }` を **指す** lane / routing … こちらは
+    ///   `same_project` でも必ず落とす。モジュレーターが複製されない以上、コピーは
+    ///   元と**同じ 1 個のモジュレーターの同じツマミ**を指す重複でしかない。
+    ///   `mod_graph::build_plan` は `ModSourceParam` の辺を `all_mod_routings()` から
+    ///   **置き場に関係なく**集め、`mod_tick` がそれを加算するので、残すと複製する
+    ///   たびに変調が 1 段ずつ深くなる (レーン側は `mod_source_owner` 側しか読まれ
+    ///   ないので、残しても永久に効かない行になる)。
+    /// - `ModRouting.id` … Song-global unique が不変条件 (device id と同じ)。clone した
+    ///   ままだと `mod_routing_owner` / `all_mod_routings().find` が先頭 (= 元トラック)
+    ///   に解決し、複製側の深さレーンの既定値・ラベル・置き場が元トラックを指す。
+    ///   保存 → 再読込では `ensure_ids` の重複解決が複製側だけを改番するので、
+    ///   **複製側の深さ参照が元トラックの変調を指したまま固定**される。再採番して
+    ///   集合内の `ModRoutingDepth { routing_id }` を新 id へ貼り替え、集合外を指す
+    ///   ものは落とす。
+    ///
+    /// ここで変調を落とすと、その深さを指していた別の変調が dangling になる
+    /// (連鎖)。固定点まで回すのは [`common::model::Song::prune_dangling_mod_targets`]
+    /// が SSoT なので、**挿入後に呼び出し側が 1 回通す** (ここでは複製しない)。
+    fn rehome_pasted_modulation(
+        song: &mut common::model::Song,
+        built: &mut [(u32, common::model::Track)],
+        same_project: bool,
+    ) {
+        use common::model::AutomationTarget as T;
+        // 別プロジェクトからはモジュレーターを 1 つも持ち込めない (= 全滅)。
+        let live_sources: std::collections::HashSet<u32> = if same_project {
+            song.mod_sources.iter().map(|m| m.id).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        // モジュレーター自身のツマミを指すものは、集合に本体が来ない以上ただの重複。
+        let targets_a_modulator = |target: &T| matches!(target, T::ModSourceParam { .. });
+        for (_, t) in built.iter_mut() {
+            t.mod_routings
+                .retain(|r| live_sources.contains(&r.source_id) && !targets_a_modulator(&r.target));
+            t.automation_lanes.retain(|l| !targets_a_modulator(&l.target));
+        }
+        // 生き残った変調にだけ新 id を配る (落とした分の id を消費しない)。
+        let mut routing_remap: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        for (_, t) in built.iter_mut() {
+            for r in &mut t.mod_routings {
+                let new_id = song.alloc_mod_routing_id();
+                if r.id != 0 {
+                    routing_remap.insert(r.id, new_id);
+                }
+                r.id = new_id;
+            }
+        }
+        let depth_resolves = |target: &mut T| match target {
+            T::ModRoutingDepth { routing_id } => match routing_remap.get(routing_id) {
+                Some(&new) => {
+                    *routing_id = new;
+                    true
+                }
+                None => false,
+            },
+            _ => true,
+        };
+        for (_, t) in built.iter_mut() {
+            t.mod_routings.retain_mut(|r| depth_resolves(&mut r.target));
+            t.automation_lanes.retain_mut(|l| depth_resolves(&mut l.target));
+        }
     }
 
     /// v35 (r.md #87): 組み立て済みトラックのランチャーのセルを、**貼り先の列**へ
@@ -642,6 +752,9 @@ impl AppData {
                     }
                 }
             }
+            // r.md #89: paste と同じ連鎖掃除 (`rehome_pasted_modulation` の drop で
+            // 深さ参照が dangling になり得る)。
+            song.prune_dangling_mod_targets();
             new_ids
         });
         let Some(new_ids) = new_ids else {
@@ -727,6 +840,9 @@ impl AppData {
         for &i in subtree_idxs.iter().rev() {
             self.edit_song(|song| song.tracks.remove(i as usize));
         }
+        // 消えたトラックが所有していたモジュレーターと、その変調の深さを指していた
+        // レーン / 変調の後始末 (トラックを外す全経路共通の 1 本)。
+        self.cleanup_modulation_after_track_removal();
         // (b) LoadSong で audio engine を新 schedule に
         // (c) **重要 (deadlock 防止)**: RemoveSlotPlugin 送信前に daw_audio
         // に直接 ClosePluginShmem を送って plugin_refs から stale entry
@@ -750,23 +866,9 @@ impl AppData {
         // 通さない = タグを触らない) ため、 **次の Delete が画面外の最下段トラックを
         // 消す**。 Ableton / REAPER と同じく削除位置の直後 (無ければ直前) へ倒す。
         let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
-        // r.md #78: 消えたトラックが所有していた変調ソースも道連れにする。
-        // ソースはラックで **所有トラックの下にしか列挙されない** ので、 残すと
-        // どの画面にも出ず削除できないまま、 生き残ったトラックの param を変調し
-        // 続ける (LFO / Random / MSEG / Steps は song 位置の純関数なので、 所有
-        // トラックが消えても値を出し続ける)。 接続行をソース側へ寄せて孤児を
-        // 潰したのと同じ穴。 `remove_mod_source` が参照 routing の掃除まで担う。
-        let orphan_source_ids: Vec<u32> = self
-            .song_doc
-            .song()
-            .mod_sources
-            .iter()
-            .filter(|m| subtree_ids_set.contains(&m.owner_track_id))
-            .map(|m| m.id)
-            .collect();
-        for id in orphan_source_ids {
-            self.remove_mod_source(id);
-        }
+        // r.md #78 の孤児モジュレーター掃除は上の
+        // `cleanup_modulation_after_track_removal` が担う (グループ解除 / 末尾削除と
+        // 同じ 1 本。ここで「消した id の集合」から作り直すと経路ごとに分岐が増える)。
         // r.md #87: 消えたトラックが口パクのソースだったなら、出力先の口 track に
         // 残った生成物 (`auto_lipsync` の clip / セル) も道連れにする。 残すと
         // **歌が無いのに口だけ動く** — しかも再生成の経路 (`mark_lipsync_dirty`)

@@ -1037,6 +1037,11 @@ impl AppData {
                         if *device_id == removed_device_id
                 )
             });
+            // r.md #89: 上で落とした変調の **深さ**を指していた変調 / レーンを連鎖して
+            // 掃除する。device_id 一致だけで retain すると、`Mod #N depth` という
+            // **何も動かさないレーン行**が残って保存され、次に開くと `normalize_after_load`
+            // が無言で捨てる (dirty も立たないので消えたことに気付けない)。
+            song.prune_dangling_mod_targets();
         });
     }
 

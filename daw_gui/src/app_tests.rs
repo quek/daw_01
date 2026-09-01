@@ -1071,6 +1071,72 @@ mod track_duplicate_tests {
         let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None);
         assert_eq!(built[0].1.parent_group_id, Some(gid), "同じ group 内に残る");
     }
+
+    /// パラアウト (`PluginInstance::aux_outputs` の `dest_track`) も sidechain
+    /// (`aux_inputs`) と **対称に** 解決する: 集合内なら新 id へ remap、集合外は
+    /// same_project で実在するときだけ据え置き、それ以外は落とす。
+    ///
+    /// 片方だけ見ていた頃は、別プロジェクトへ貼ったパラアウトが id だけ一致する
+    /// **無関係なトラック**へ音を流していた (貼った瞬間に鳴る配線なので、ユーザーは
+    /// 自分が繋いだものだと思い込む)。
+    #[test]
+    fn pasted_aux_outputs_are_remapped_or_dropped() {
+        use common::model::{AuxOutputRoute, PluginInstance};
+        use common::plugin_format::PluginFormat;
+        use common::port_config::PortConfig;
+
+        // dest(集合外・実在) と、パラアウトを 2 本持つ src を用意する。
+        let mut song = Song::default();
+        let dest = song.alloc_track_id();
+        let src = song.alloc_track_id();
+        song.tracks.push(track_with(|t| {
+            t.id = dest;
+            t.name = "D".into();
+        }));
+        song.tracks.push(track_with(|t| {
+            t.id = src;
+            t.name = "S".into();
+            t.devices.push(PluginInstance {
+                // port 0 = 自分自身 (= 集合内) 宛て / port 1 = dest (= 集合外) 宛て。
+                aux_outputs: vec![
+                    Some(AuxOutputRoute::to_track(src)),
+                    Some(AuxOutputRoute::to_track(dest)),
+                ],
+                ..PluginInstance::with_ports(
+                    "test.fx".into(),
+                    PluginFormat::Clap,
+                    PortConfig::default(),
+                )
+            });
+        }));
+        let tc = TrackCopy {
+            order: 0,
+            track: song.track_by_id(src).unwrap().clone(),
+            contents: vec![],
+        };
+
+        // 同一プロジェクト: 集合内は新 id へ、集合外は実在するので据え置き。
+        let built = AppData::build_pasted_tracks(&mut song, std::slice::from_ref(&tc), true, true, None);
+        let new_id = built[0].1.id;
+        assert_eq!(
+            built[0].1.devices[0].aux_outputs,
+            vec![
+                Some(AuxOutputRoute::to_track(new_id)),
+                Some(AuxOutputRoute::to_track(dest)),
+            ],
+            "集合内は複製後のトラックへ、集合外は実在するのでそのまま"
+        );
+
+        // 別プロジェクト: 集合外の id は解決できない。**据え置くと無関係なトラックへ
+        // 音が流れる**ので落とす。
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], false, true, None);
+        let new_id = built[0].1.id;
+        assert_eq!(
+            built[0].1.devices[0].aux_outputs,
+            vec![Some(AuxOutputRoute::to_track(new_id)), None],
+            "別プロジェクト由来の集合外パラアウトは落とす"
+        );
+    }
 }
 
 

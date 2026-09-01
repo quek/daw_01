@@ -496,7 +496,7 @@ fn relocate_in_song(
             // トラックに置いたまま device だけ移すと、 その lane は永久に効かない
             // (`daw_audio/src/automation.rs` が track から lane を引いてから
             //  device_id で絞るため)。
-            let (lanes, routings) = extract_device_bindings(song, src_track, inst.id);
+            let (lanes, mut routings) = extract_device_bindings(song, src_track, inst.id);
             for lane in lanes {
                 let old_id = lane.id;
                 let new_id = push_lane_to(song, dest_track, lane);
@@ -504,10 +504,30 @@ fn relocate_in_song(
                     .lane_remap
                     .push((src_track, old_id, dest_track, new_id));
             }
-            for routing in routings {
-                // `ModRouting.source_id` は `Song.mod_sources` の song-global id
-                // なのでそのまま生きる (再キー不要)。
-                push_routing_to(song, dest_track, routing);
+            // r.md #89: 移した変調の **深さ** を指すレーン / 変調も一緒に運ぶ。深さの
+            // 深さ (= 連鎖) もあり得るので、抜き取るものが無くなるまで回す (src の
+            // routing 数は毎周必ず減るので必ず止まる)。
+            while !routings.is_empty() {
+                let mut moved_ids: Vec<u32> = Vec::new();
+                for routing in routings {
+                    // `ModRouting.source_id` は `Song.mod_sources` の song-global id
+                    // なのでそのまま生きる (再キー不要)。`ModRouting.id` も Song-global
+                    // なので移送で変えない (`ModRoutingDepth` の参照が切れる)。
+                    if routing.id != 0 {
+                        moved_ids.push(routing.id);
+                    }
+                    push_routing_to(song, dest_track, routing);
+                }
+                let (dep_lanes, dep_routings) =
+                    extract_depth_bindings(song, src_track, &moved_ids);
+                for lane in dep_lanes {
+                    let old_id = lane.id;
+                    let new_id = push_lane_to(song, dest_track, lane);
+                    outcome
+                        .lane_remap
+                        .push((src_track, old_id, dest_track, new_id));
+                }
+                routings = dep_routings;
             }
             outcome.moved_devices.push((src_track, dest_track, inst.id));
             left_by_track
@@ -546,12 +566,45 @@ fn extract_device_bindings(
     Vec<common::model::AutomationLane>,
     Vec<common::model::ModRouting>,
 ) {
-    let hits = |target: &common::model::AutomationTarget| {
+    extract_bindings(song, track_id, |target| {
         matches!(
             target,
             common::model::AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id
         )
-    };
+    })
+}
+
+/// r.md #89: `routing_ids` の変調の **深さ** を指す automation lane / mod routing を
+/// 所有者から抜き取る。深さの置き場はその変調が置かれているトラック
+/// (`Song::mod_routing_owner`) なので、変調だけ移して深さを元トラックに残すと、
+/// そのレーン / 変調は **二度と評価されない** (engine はトラックから lane を引く)。
+fn extract_depth_bindings(
+    song: &mut common::model::Song,
+    track_id: u32,
+    routing_ids: &[u32],
+) -> (
+    Vec<common::model::AutomationLane>,
+    Vec<common::model::ModRouting>,
+) {
+    extract_bindings(song, track_id, |target| {
+        matches!(
+            target,
+            common::model::AutomationTarget::ModRoutingDepth { routing_id }
+                if routing_ids.contains(routing_id)
+        )
+    })
+}
+
+/// `hits` が真になる target を持つ lane / routing を `track_id`
+/// (`MASTER_TRACK_ID` なら song 側) から抜き取る。
+fn extract_bindings(
+    song: &mut common::model::Song,
+    track_id: u32,
+    hits: impl Fn(&common::model::AutomationTarget) -> bool,
+) -> (
+    Vec<common::model::AutomationLane>,
+    Vec<common::model::ModRouting>,
+) {
     let (lanes_src, routings_src): (
         &mut Vec<common::model::AutomationLane>,
         &mut Vec<common::model::ModRouting>,
