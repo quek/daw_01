@@ -34,6 +34,10 @@ pub struct IdAllocators {
     pub next_section_id: u32,
     #[serde(default)]
     pub next_mod_source_id: u32,
+    /// r.md #89: `ModRouting::id` の採番。`0` は未採番 sentinel。
+    /// [`crate::model::AutomationTarget::ModRoutingDepth`] が 1 本の変調を指すために要る。
+    #[serde(default)]
+    pub next_mod_routing_id: u32,
     /// v35 (r.md #87): ランチャーの列 [`Scene`] の採番。`0` は未採番 sentinel。
     #[serde(default)]
     pub next_scene_id: u32,

@@ -2896,3 +2896,40 @@ fn split_content_at_は跨ぐノートを二つに割る() {
     let ClipContent::Midi(m) = &song.clip_contents[&cid] else { panic!("midi") };
     assert_eq!(m.notes.len(), 3);
 }
+
+/// `docs/plan_rmd_88_89_cross_modulation.md` §8-2 (r.md #88):
+/// `ModRate` を enum から「拍と Hz を両方保持する struct」へ変えたので、
+/// **旧 .daw の 2 形式と新形式の 3 つが同じ値へ load される**こと。
+/// generator の保存往復テストは 1 本も無かった (だから壊れても build も test も素通りした)。
+#[test]
+fn modrateの旧形式2種と新形式が同じ値へloadされる() {
+    use crate::model::{ModRate, ModRateMode};
+    let cases = [
+        // 旧 externally-tagged enum (Sync)。欠けている hz 側は既定 1.0 で補完。
+        (
+            r#"{"Sync":{"numerator":3,"denominator":8}}"#,
+            ModRate { mode: ModRateMode::Sync, numerator: 3, denominator: 8, hz: 1.0 },
+        ),
+        // 旧 enum (Free)。欠けている音価側は既定 1/4 で補完。
+        (
+            r#"{"Free":{"hz":3.5}}"#,
+            ModRate { mode: ModRateMode::Free, numerator: 1, denominator: 4, hz: 3.5 },
+        ),
+        // 新 struct。両方の値を保持する。
+        (
+            r#"{"mode":"Free","numerator":1,"denominator":12,"hz":7.25}"#,
+            ModRate { mode: ModRateMode::Free, numerator: 1, denominator: 12, hz: 7.25 },
+        ),
+    ];
+    let cfg = bincode::config::standard();
+    for (json, expected) in cases {
+        let got: ModRate = serde_json::from_str(json).unwrap();
+        assert_eq!(got, expected, "json={json}");
+        // save → load 往復 (serde) と wire 往復 (bincode) の両方。
+        let re: ModRate = serde_json::from_str(&serde_json::to_string(&got).unwrap()).unwrap();
+        assert_eq!(re, expected, "serde 往復 json={json}");
+        let bytes = bincode::encode_to_vec(got, cfg).unwrap();
+        let (dec, _): (ModRate, usize) = bincode::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(dec, expected, "bincode 往復 json={json}");
+    }
+}

@@ -61,6 +61,23 @@ pub enum AutomationTarget {
     /// 関係なく、グループが子を描画している間ずっと適用される。純粋に visual で
     /// daw_audio は評価しない (`daw_audio/src/automation.rs` の `_ => continue`)。
     GroupTransform(GroupTransformParam),
+    /// r.md #89: **モジュレーター自身のツマミ**。`source_id` = [`crate::model::ModSource::id`]。
+    /// レーン / routing の置き場はそのソースの `owner_track_id`
+    /// (`MASTER_TRACK_ID` なら song 側)。
+    ///
+    /// `target` だけから track/song を決める**全域関数を作ってはならない** — master fx chain の
+    /// [`Self::PluginParam`] は Track ではないので同じ写像に乗らない
+    /// (`daw_audio/src/automation.rs` の `MASTER_TRACK_ID` 分岐)。置き場の解決は
+    /// 「対象の `ModSource` を引いてその `owner_track_id` を返す」限定述語で行う。
+    ModSourceParam {
+        source_id: u32,
+        param: ModParam,
+    },
+    /// r.md #89: **変調 1 本の深さ** (Bitwig の modulation scaling)。
+    /// `routing_id` = [`crate::model::ModRouting::id`]。置き場はその routing と同じ。
+    ModRoutingDepth {
+        routing_id: u32,
+    },
 }
 
 impl AutomationTarget {

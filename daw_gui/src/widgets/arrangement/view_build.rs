@@ -735,6 +735,18 @@ fn lane_target_display(
             icon_glyph: 'F',
             color: Color::rgb(0.78, 0.55, 0.92),
         },
+        // r.md #89: モジュレーターのツマミ / 変調の深さ。ソース名まで入った表示は
+        // song を引ける側 (`AppData::automation_target_label`) が担う。
+        AutomationTarget::ModSourceParam { source_id, param } => LaneDisplay {
+            label: intern_label(&format!("Mod {source_id} \u{25b8} {}", param.label())),
+            icon_glyph: '~',
+            color: Color::rgb(0.55, 0.80, 0.95),
+        },
+        AutomationTarget::ModRoutingDepth { routing_id } => LaneDisplay {
+            label: intern_label(&format!("Mod #{routing_id} depth")),
+            icon_glyph: '~',
+            color: Color::rgb(0.55, 0.80, 0.95),
+        },
         AutomationTarget::SongTempo => LaneDisplay {
             label: intern_label("Tempo"),
             icon_glyph: 'T',

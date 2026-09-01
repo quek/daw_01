@@ -16,39 +16,132 @@ use crate::model::{
 
 use std::f64::consts::TAU;
 
-/// generator の出力スカラー (unipolar 0..=1)。 envelope follower は engine ring が
-/// 算出するので `None` を返す (ここでは扱わない)。
-#[inline]
-pub fn generator_scalar(kind: &ModSourceKind, song_beat: f64, song_secs: f64) -> Option<f32> {
-    match kind {
-        ModSourceKind::EnvelopeFollower { .. } => None,
-        ModSourceKind::Lfo(c) => Some(eval_lfo(c, song_beat, song_secs)),
-        ModSourceKind::Random(c) => Some(eval_random(c, song_beat, song_secs)),
-        ModSourceKind::Mseg(c) => Some(eval_mseg(c, song_beat, song_secs)),
-        ModSourceKind::Steps(c) => Some(eval_steps(c, song_beat, song_secs)),
+/// tick 時点で解決済みの生成器パラメータ。RT で [`ModSourceKind`] を clone しないために
+/// **`Copy` なオーバーライドだけ**を運ぶ (`MsegConfig.points` / `StepsConfig.values` は
+/// `Vec` なので RT clone は heap 確保になる)。
+///
+/// `cycle_pos` は「未ラップの周期位置」で、rate が未変調なら [`cycle_pos`] の閉形式、
+/// 変調されていれば [`crate::mod_graph`] の積分位相が入る。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GenParams {
+    pub cycle_pos: f64,
+    /// LFO の開始位相 (0..=1)。
+    pub lfo_phase: f32,
+    /// LFO Pulse の duty (0..=1)。
+    pub pulse_width: f32,
+    /// Random の Stepped↔Smoothed モーフ (0..=1)。
+    pub random_smooth: f32,
+    /// Steps の slew (0..=1)。
+    pub steps_slew: f32,
+}
+
+impl GenParams {
+    /// 変調が無いときの値 (config そのまま)。
+    #[must_use]
+    pub fn from_config(kind: &ModSourceKind, cycle_pos: f64) -> Self {
+        let (lfo_phase, pulse_width) = match kind {
+            ModSourceKind::Lfo(c) => (
+                c.phase,
+                match c.shape {
+                    LfoShape::Pulse { width } => width,
+                    _ => 0.5,
+                },
+            ),
+            _ => (0.0, 0.5),
+        };
+        Self {
+            cycle_pos,
+            lfo_phase,
+            pulse_width,
+            random_smooth: match kind {
+                ModSourceKind::Random(c) => c.smooth,
+                _ => 0.0,
+            },
+            steps_slew: match kind {
+                ModSourceKind::Steps(c) => c.slew,
+                _ => 0.0,
+            },
+        }
     }
 }
 
-/// `rate` に応じた **未ラップの周期位置** (= 何周したか、 1.0 = 1 周)。
-/// Sync は song_beat、 Free は song_secs の関数。 どちらも transport の関数なので
-/// 決定論的 (壁時計を使わない、 plan §0)。
+/// 解決済みパラメータで generator を評価する (unipolar 0..=1)。 envelope follower は
+/// engine ring が算出するので `None`。 **クロス変調の唯一の評価点**
+/// ([`crate::mod_graph::tick`] が呼ぶ)。
 #[inline]
-pub fn cycle_pos(rate: &ModRate, song_beat: f64, song_secs: f64, retrigger: &RetriggerMode) -> f64 {
-    match rate {
-        ModRate::Sync {
-            numerator,
-            denominator,
-        } => {
-            let period_beats = 4.0 * (*numerator as f64) / (*denominator).max(1) as f64;
+pub fn eval_generator(kind: &ModSourceKind, p: GenParams) -> Option<f32> {
+    match kind {
+        ModSourceKind::EnvelopeFollower { .. } => None,
+        ModSourceKind::Lfo(c) => Some(eval_lfo(c, p)),
+        ModSourceKind::Random(c) => Some(eval_random(c, p)),
+        ModSourceKind::Mseg(c) => Some(eval_mseg(c, p)),
+        ModSourceKind::Steps(c) => Some(eval_steps(c, p)),
+    }
+}
+
+/// 変調が無い generator の出力スカラー (unipolar 0..=1)。閉形式なので O(1)。
+/// envelope follower は `None`。
+#[inline]
+pub fn generator_scalar(kind: &ModSourceKind, t: ModTime) -> Option<f32> {
+    let (rate, retrig) = match (kind.rate(), kind.retrigger()) {
+        (Some(r), Some(rt)) => (r, rt),
+        _ => return None,
+    };
+    let cp = cycle_pos(&rate, t, &retrig);
+    eval_generator(kind, GenParams::from_config(kind, cp))
+}
+
+/// 生成器を評価する時刻。`anchor_secs` は [`RetriggerMode::FromBeat`] の
+/// `anchor_beat` を **秒へ換算した値** で、テンポマップが要るので off-RT の
+/// 呼び出し側 (plan 構築 / GUI プレビュー) が解決して渡す。
+///
+/// r.md #88: 旧実装は Free のとき retrigger を丸ごと無視していたため、
+/// `⟲here` が音にも波形にも効かない silent no-op だった
+/// (`docs/plan_fixme_56_modulators.md` が要求していた beat→secs 換算が未実装)。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModTime {
+    pub beat: f64,
+    pub secs: f64,
+    /// `FromBeat { anchor_beat }` を秒へ換算したもの。`FreeRun` では使わない。
+    pub anchor_secs: f64,
+}
+
+impl ModTime {
+    /// テンポ一定 (または Sync のみ使う) 文脈の簡易構築。
+    #[must_use]
+    pub fn new(beat: f64, secs: f64) -> Self {
+        Self { beat, secs, anchor_secs: 0.0 }
+    }
+}
+
+/// `rate` に応じた **未ラップの周期位置** (= 何周したか、 1.0 = 1 周) の **閉形式**。
+/// Sync は song_beat、 Free は song_secs の関数。 どちらも transport の関数なので
+/// 決定論的 (壁時計を使わない)。
+///
+/// **rate が変調されていないときだけ正しい。** 変調されているときは瞬時周波数の
+/// 積分でしか位相が定まらないので [`crate::mod_graph`] の位相アキュムレータを使う
+/// (`docs/plan_rmd_88_89_cross_modulation.md` §2)。未変調ならこの閉形式と積分は
+/// **厳密に一致する**ので、既存曲の音は 1 サンプルも変わらない。
+#[inline]
+pub fn cycle_pos(rate: &ModRate, t: ModTime, retrigger: &RetriggerMode) -> f64 {
+    match rate.mode {
+        crate::model::ModRateMode::Sync => {
             let beat = match retrigger {
-                RetriggerMode::FreeRun => song_beat,
-                RetriggerMode::FromBeat { anchor_beat } => song_beat - anchor_beat,
+                RetriggerMode::FreeRun => t.beat,
+                RetriggerMode::FromBeat { anchor_beat } => t.beat - anchor_beat,
             };
-            beat / period_beats.max(f64::MIN_POSITIVE)
+            beat / rate.period_beats()
         }
-        // Free Hz は秒で評価。 FromBeat の anchor は beat なので Free 文脈では
-        // 秒換算できず、 OneShot(=Sync 前提) 以外では FreeRun と同義に倒す。
-        ModRate::Free { hz } => song_secs * (*hz as f64),
+        crate::model::ModRateMode::Free => {
+            let secs = match retrigger {
+                RetriggerMode::FreeRun => t.secs,
+                RetriggerMode::FromBeat { .. } => t.secs - t.anchor_secs,
+            };
+            secs * f64::from(rate.hz.clamp(
+                crate::model::MOD_RATE_HZ_MIN,
+                crate::model::MOD_RATE_HZ_MAX,
+            ))
+        }
     }
 }
 
@@ -80,9 +173,14 @@ pub fn lfo_shape_value(shape: LfoShape, p: f64) -> f32 {
 }
 
 #[inline]
-fn eval_lfo(c: &LfoConfig, song_beat: f64, song_secs: f64) -> f32 {
-    let p = cycle_pos(&c.rate, song_beat, song_secs, &c.retrigger) + c.phase as f64;
-    lfo_shape_value(c.shape, p)
+fn eval_lfo(c: &LfoConfig, g: GenParams) -> f32 {
+    let p = g.cycle_pos + f64::from(g.lfo_phase);
+    // Pulse の duty は変調されうるので `GenParams` 側を使う (config の値は base)。
+    let shape = match c.shape {
+        LfoShape::Pulse { .. } => LfoShape::Pulse { width: g.pulse_width },
+        other => other,
+    };
+    lfo_shape_value(shape, p)
 }
 
 /// SplitMix64: seed から step ごとに決定論的な乱数を引く (依存追加なし)。
@@ -120,14 +218,14 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 #[inline]
-fn eval_random(c: &RandomConfig, song_beat: f64, song_secs: f64) -> f32 {
-    let cp = cycle_pos(&c.rate, song_beat, song_secs, &c.retrigger);
+fn eval_random(c: &RandomConfig, g: GenParams) -> f32 {
+    let cp = g.cycle_pos;
     let step = cp.floor();
     let frac = (cp - step) as f32;
     let a = random_unit(c.seed, step as i64);
     // Bitwig 流 Stepped↔Smoothed 連続モーフ: smooth=0 で完全階段 (S&H = `a`)、
     // smooth=1 で隣接 step を smoothstep 補間、 中間は両者を lerp。
-    let smooth = c.smooth.clamp(0.0, 1.0);
+    let smooth = g.random_smooth.clamp(0.0, 1.0);
     let v = if smooth <= 0.0 {
         a
     } else {
@@ -159,7 +257,7 @@ fn step_index(direction: StepsDirection, k: i64, n: usize) -> usize {
 /// Steps の現在アクティブな step index (UI の走査ハイライト用)。 `eval_steps` の
 /// index 計算と同一ロジック (direction / PingPong period を反映)。
 #[inline]
-pub fn steps_active_index(c: &StepsConfig, song_beat: f64, song_secs: f64) -> usize {
+pub fn steps_active_index(c: &StepsConfig, cycle_pos: f64) -> usize {
     let n = c.values.len();
     if n == 0 {
         return 0;
@@ -168,13 +266,13 @@ pub fn steps_active_index(c: &StepsConfig, song_beat: f64, song_secs: f64) -> us
         StepsDirection::PingPong if n > 1 => 2 * n - 2,
         _ => n,
     };
-    let pos = cycle_pos(&c.rate, song_beat, song_secs, &c.retrigger).rem_euclid(1.0);
+    let pos = cycle_pos.rem_euclid(1.0);
     let k = (pos * count as f64).floor() as i64;
     step_index(c.direction, k, n)
 }
 
 #[inline]
-fn eval_steps(c: &StepsConfig, song_beat: f64, song_secs: f64) -> f32 {
+fn eval_steps(c: &StepsConfig, g: GenParams) -> f32 {
     let n = c.values.len();
     if n == 0 {
         return 0.0;
@@ -183,17 +281,18 @@ fn eval_steps(c: &StepsConfig, song_beat: f64, song_secs: f64) -> f32 {
         StepsDirection::PingPong if n > 1 => 2 * n - 2,
         _ => n,
     };
-    let pos = cycle_pos(&c.rate, song_beat, song_secs, &c.retrigger).rem_euclid(1.0);
+    let pos = g.cycle_pos.rem_euclid(1.0);
     let fidx = pos * count as f64;
     let k = fidx.floor() as i64;
     let frac = fidx.fract() as f32;
     let cur = c.values[step_index(c.direction, k, n)];
-    let v = if c.slew <= 0.0 {
+    let slew = g.steps_slew.clamp(0.0, 1.0);
+    let v = if slew <= 0.0 {
         cur
     } else {
         let next = c.values[step_index(c.direction, k + 1, n)];
         let smoothed = lerp(cur, next, smoothstep(frac));
-        lerp(cur, smoothed, c.slew.clamp(0.0, 1.0))
+        lerp(cur, smoothed, slew)
     };
     v.clamp(0.0, 1.0)
 }
@@ -239,8 +338,8 @@ pub fn mseg_sample(points: &[MsegPoint], q: f32) -> f32 {
 }
 
 #[inline]
-fn eval_mseg(c: &MsegConfig, song_beat: f64, song_secs: f64) -> f32 {
-    let cp = cycle_pos(&c.rate, song_beat, song_secs, &c.retrigger);
+fn eval_mseg(c: &MsegConfig, g: GenParams) -> f32 {
+    let cp = g.cycle_pos;
     let q = match c.play_mode {
         MsegPlayMode::OneShot => cp.clamp(0.0, 1.0),
         MsegPlayMode::Loop => cp.rem_euclid(1.0),
@@ -259,10 +358,7 @@ mod tests {
 
     // Sync 1/4 note: period = 1 beat。 secs は無関係 (0 を渡す)。
     fn sync_quarter() -> ModRate {
-        ModRate::Sync {
-            numerator: 1,
-            denominator: 4,
-        }
+        ModRate::default()
     }
 
     #[test]
@@ -302,7 +398,7 @@ mod tests {
         // SawUp なので scalar == phase。 1/4 note 周期 = 1 beat。
         let cases = [(0.0, 0.0), (0.25, 0.25), (0.5, 0.5), (1.0, 0.0), (2.5, 0.5)];
         for (beat, expected) in cases {
-            let got = generator_scalar(&ModSourceKind::Lfo(c), beat, 0.0).unwrap();
+            let got = generator_scalar(&ModSourceKind::Lfo(c), ModTime::new(beat, 0.0)).unwrap();
             assert!(
                 (got - expected).abs() < 1e-6,
                 "beat={beat} got={got} expected={expected}"
@@ -319,7 +415,7 @@ mod tests {
             retrigger: RetriggerMode::FreeRun,
         };
         // beat=0 で phase=0.25。
-        let got = generator_scalar(&ModSourceKind::Lfo(c), 0.0, 0.0).unwrap();
+        let got = generator_scalar(&ModSourceKind::Lfo(c), ModTime::new(0.0, 0.0)).unwrap();
         assert!((got - 0.25).abs() < 1e-6, "got={got}");
     }
 
@@ -327,12 +423,12 @@ mod tests {
     fn lfo_free_hzは秒の関数() {
         let c = LfoConfig {
             shape: LfoShape::SawUp,
-            rate: ModRate::Free { hz: 2.0 },
+            rate: ModRate { mode: crate::model::ModRateMode::Free, hz: 2.0, ..ModRate::default() },
             phase: 0.0,
             retrigger: RetriggerMode::FreeRun,
         };
         // 2 Hz: 0.25 秒で半周 → SawUp=0.5。
-        let got = generator_scalar(&ModSourceKind::Lfo(c), 0.0, 0.25).unwrap();
+        let got = generator_scalar(&ModSourceKind::Lfo(c), ModTime::new(0.0, 0.25)).unwrap();
         assert!((got - 0.5).abs() < 1e-6, "got={got}");
     }
 
@@ -344,10 +440,10 @@ mod tests {
             seed,
             retrigger: RetriggerMode::FreeRun,
         };
-        let a1 = generator_scalar(&ModSourceKind::Random(mk(42)), 3.2, 0.0).unwrap();
-        let a2 = generator_scalar(&ModSourceKind::Random(mk(42)), 3.2, 0.0).unwrap();
+        let a1 = generator_scalar(&ModSourceKind::Random(mk(42)), ModTime::new(3.2, 0.0)).unwrap();
+        let a2 = generator_scalar(&ModSourceKind::Random(mk(42)), ModTime::new(3.2, 0.0)).unwrap();
         assert_eq!(a1, a2, "同 seed・同 beat は bit 再現");
-        let b = generator_scalar(&ModSourceKind::Random(mk(43)), 3.2, 0.0).unwrap();
+        let b = generator_scalar(&ModSourceKind::Random(mk(43)), ModTime::new(3.2, 0.0)).unwrap();
         assert!(a1 != b, "別 seed は別値 (a={a1} b={b})");
     }
 
@@ -361,16 +457,16 @@ mod tests {
             retrigger: RetriggerMode::FreeRun,
         };
         // 同じ step (beat 0.1 と 0.9 は period=1 beat の step 0) → 同値。
-        let v1 = generator_scalar(&ModSourceKind::Random(sh), 0.1, 0.0).unwrap();
-        let v2 = generator_scalar(&ModSourceKind::Random(sh), 0.9, 0.0).unwrap();
+        let v1 = generator_scalar(&ModSourceKind::Random(sh), ModTime::new(0.1, 0.0)).unwrap();
+        let v2 = generator_scalar(&ModSourceKind::Random(sh), ModTime::new(0.9, 0.0)).unwrap();
         assert_eq!(v1, v2, "stepped (smooth=0) は step 内一定");
         // step 境界の値そのもの (frac=0)。
-        let edge = generator_scalar(&ModSourceKind::Random(sh), 0.0, 0.0).unwrap();
+        let edge = generator_scalar(&ModSourceKind::Random(sh), ModTime::new(0.0, 0.0)).unwrap();
         assert_eq!(edge, random_unit(7, 0));
         // smooth=1 は step 始点で a、 次 step 始点で b。
         let smooth = RandomConfig { smooth: 1.0, ..sh };
-        let s0 = generator_scalar(&ModSourceKind::Random(smooth), 0.0, 0.0).unwrap();
-        let s1 = generator_scalar(&ModSourceKind::Random(smooth), 1.0, 0.0).unwrap();
+        let s0 = generator_scalar(&ModSourceKind::Random(smooth), ModTime::new(0.0, 0.0)).unwrap();
+        let s1 = generator_scalar(&ModSourceKind::Random(smooth), ModTime::new(1.0, 0.0)).unwrap();
         assert!((s0 - random_unit(7, 0)).abs() < 1e-6);
         assert!((s1 - random_unit(7, 1)).abs() < 1e-6);
     }
@@ -386,12 +482,12 @@ mod tests {
         };
         // step 中央 (frac=0.5) で stepped=a、 fully-smoothed=lerp(a,b,smoothstep(0.5))。
         let beat = 0.5;
-        let stepped = generator_scalar(&ModSourceKind::Random(base), beat, 0.0).unwrap();
+        let stepped = generator_scalar(&ModSourceKind::Random(base), ModTime::new(beat, 0.0)).unwrap();
         let smoothed =
-            generator_scalar(&ModSourceKind::Random(RandomConfig { smooth: 1.0, ..base }), beat, 0.0)
+            generator_scalar(&ModSourceKind::Random(RandomConfig { smooth: 1.0, ..base }), ModTime::new(beat, 0.0))
                 .unwrap();
         let mid =
-            generator_scalar(&ModSourceKind::Random(RandomConfig { smooth: 0.5, ..base }), beat, 0.0)
+            generator_scalar(&ModSourceKind::Random(RandomConfig { smooth: 0.5, ..base }), ModTime::new(beat, 0.0))
                 .unwrap();
         // 中間 morph は両端の中点 (lerp(stepped, smoothed, 0.5))。
         assert!(
@@ -413,13 +509,13 @@ mod tests {
         // Forward: beat 0,0.25,0.5,0.75 → step 0,1,2,3。
         let fwd = mk(StepsDirection::Forward);
         for (i, beat) in [0.0, 0.25, 0.5, 0.75].into_iter().enumerate() {
-            let got = generator_scalar(&ModSourceKind::Steps(fwd.clone()), beat, 0.0).unwrap();
+            let got = generator_scalar(&ModSourceKind::Steps(fwd.clone()), ModTime::new(beat, 0.0)).unwrap();
             assert!((got - values[i]).abs() < 1e-6, "fwd beat={beat} got={got}");
         }
         // Backward: step 3,2,1,0。
         let bwd = mk(StepsDirection::Backward);
         for (i, beat) in [0.0, 0.25, 0.5, 0.75].into_iter().enumerate() {
-            let got = generator_scalar(&ModSourceKind::Steps(bwd.clone()), beat, 0.0).unwrap();
+            let got = generator_scalar(&ModSourceKind::Steps(bwd.clone()), ModTime::new(beat, 0.0)).unwrap();
             assert!(
                 (got - values[3 - i]).abs() < 1e-6,
                 "bwd beat={beat} got={got}"
@@ -430,7 +526,7 @@ mod tests {
         let expect_idx = [0usize, 1, 2, 3, 2, 1];
         for (k, ei) in expect_idx.into_iter().enumerate() {
             let beat = k as f64 / 6.0;
-            let got = generator_scalar(&ModSourceKind::Steps(pp.clone()), beat, 0.0).unwrap();
+            let got = generator_scalar(&ModSourceKind::Steps(pp.clone()), ModTime::new(beat, 0.0)).unwrap();
             assert!(
                 (got - values[ei]).abs() < 1e-6,
                 "pp k={k} beat={beat} got={got} expect_idx={ei}"
@@ -444,7 +540,7 @@ mod tests {
         // q == cycle_pos の小数部 (period 1 beat)。
         let cases = [(0.0, 0.0), (0.25, 0.5), (0.5, 1.0), (0.75, 0.5), (1.0, 0.0)];
         for (beat, expected) in cases {
-            let got = generator_scalar(&ModSourceKind::Mseg(c.clone()), beat, 0.0).unwrap();
+            let got = generator_scalar(&ModSourceKind::Mseg(c.clone()), ModTime::new(beat, 0.0)).unwrap();
             assert!(
                 (got - expected).abs() < 1e-6,
                 "beat={beat} got={got} expected={expected}"
@@ -473,7 +569,7 @@ mod tests {
             retrigger: RetriggerMode::FreeRun,
         };
         // OneShot: beat 1.5 (cp=1.5) → clamp 1.0 → value 1.0。
-        let got = generator_scalar(&ModSourceKind::Mseg(one.clone()), 1.5, 0.0).unwrap();
+        let got = generator_scalar(&ModSourceKind::Mseg(one.clone()), ModTime::new(1.5, 0.0)).unwrap();
         assert!((got - 1.0).abs() < 1e-6, "oneshot got={got}");
         // Loop: beat 1.5 → frac 0.5 → 0.5。
         let lp = MsegConfig {
@@ -481,7 +577,7 @@ mod tests {
             play_mode: MsegPlayMode::Loop,
             ..one
         };
-        let got = generator_scalar(&ModSourceKind::Mseg(lp), 1.5, 0.0).unwrap();
+        let got = generator_scalar(&ModSourceKind::Mseg(lp), ModTime::new(1.5, 0.0)).unwrap();
         assert!((got - 0.5).abs() < 1e-6, "loop got={got}");
     }
 
@@ -499,6 +595,6 @@ mod tests {
     #[test]
     fn follower種別はnoneを返す() {
         let f = ModSourceKind::default(); // EnvelopeFollower
-        assert!(generator_scalar(&f, 1.0, 1.0).is_none());
+        assert!(generator_scalar(&f, ModTime::new(1.0, 1.0)).is_none());
     }
 }

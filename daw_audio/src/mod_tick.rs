@@ -172,8 +172,11 @@ pub fn eval_plane(schedule: &Schedule, tick: ModTick, out: &mut ModPlane) {
         .zip(schedule.mod_kinds.iter())
         .zip(schedule.follower_keys.iter())
     {
-        let v = common::modulators::generator_scalar(kind, tick.song_beat, tick.song_secs)
-            .unwrap_or(fs.env);
+        let v = common::modulators::generator_scalar(
+            kind,
+            common::modulators::ModTime::new(tick.song_beat, tick.song_secs),
+        )
+        .unwrap_or(fs.env);
         out.push(*id, v);
     }
 }

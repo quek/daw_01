@@ -41,25 +41,22 @@ fn mod_rate_control(
     use common::model::ModRate;
     let mut labels: Vec<&str> = MOD_RATE_DIVS.iter().map(|(l, _, _)| *l).collect();
     labels.push("Free");
-    let sel = match rate {
-        ModRate::Sync {
-            numerator,
-            denominator,
-        } => MOD_RATE_DIVS
+    use common::model::ModRateMode;
+    let sel = match rate.mode {
+        ModRateMode::Sync => MOD_RATE_DIVS
             .iter()
-            .position(|(_, n, d)| n == numerator && d == denominator)
+            .position(|(_, n, d)| *n == rate.numerator && *d == rate.denominator)
             .unwrap_or(4),
-        ModRate::Free { .. } => MOD_RATE_DIVS.len(),
+        ModRateMode::Free => MOD_RATE_DIVS.len(),
     };
     if let Some(picked) = ui.dropdown(("inspector_mod_rate", id_seed), rect, &labels, sel) {
+        // r.md #88: 拍と Hz の値は **両方保持**する。切り替えても値が消えない。
+        let base = *rate;
         let new_rate = if picked < MOD_RATE_DIVS.len() {
             let (_, n, d) = MOD_RATE_DIVS[picked];
-            ModRate::Sync {
-                numerator: n,
-                denominator: d,
-            }
+            ModRate { mode: ModRateMode::Sync, numerator: n, denominator: d, ..base }
         } else {
-            ModRate::Free { hz: 1.0 }
+            ModRate { mode: ModRateMode::Free, ..base }
         };
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::EditModSource {
@@ -140,17 +137,17 @@ fn cp_to_pos(
     retrig: &common::model::RetriggerMode,
     cp: f64,
 ) -> (f64, f64) {
-    use common::model::{ModRate, RetriggerMode};
-    match rate {
-        ModRate::Sync { numerator, denominator } => {
-            let period = 4.0 * f64::from(*numerator) / f64::from((*denominator).max(1));
+    use common::model::RetriggerMode;
+    match rate.mode {
+        common::model::ModRateMode::Sync => {
+            let period = rate.period_beats();
             let anchor = match retrig {
                 RetriggerMode::FromBeat { anchor_beat } => *anchor_beat,
                 RetriggerMode::FreeRun => 0.0,
             };
             (cp * period + anchor, 0.0)
         }
-        ModRate::Free { hz } => (0.0, cp / f64::from(hz.max(1e-6))),
+        common::model::ModRateMode::Free => (0.0, cp / f64::from(rate.hz.max(1e-6))),
     }
 }
 
@@ -177,7 +174,7 @@ fn generator_cycle_samples(
     let span = preview_cycles(kind);
     // Random だけ再生位置中心の窓 (左端 0 未満は clamp)。 周期波は 0 起点固定。
     let win_start = if matches!(kind, K::Random(_)) {
-        let cp_now = common::modulators::cycle_pos(&rate, beat, secs, &retrig);
+        let cp_now = common::modulators::cycle_pos(&rate, common::modulators::ModTime::new(beat, secs), &retrig);
         (cp_now - span * 0.5).max(0.0)
     } else {
         0.0
@@ -187,7 +184,7 @@ fn generator_cycle_samples(
             let f = i as f32 / n as f32;
             let cp_s = win_start + f64::from(f) * span;
             let (b, s) = cp_to_pos(&rate, &retrig, cp_s);
-            let v = common::modulators::generator_scalar(kind, b, s).unwrap_or(0.0);
+            let v = common::modulators::generator_scalar(kind, common::modulators::ModTime::new(b, s)).unwrap_or(0.0);
             (f, v)
         })
         .collect()
@@ -203,7 +200,7 @@ fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) ->
         K::Mseg(c) => (c.rate, c.retrigger),
         K::EnvelopeFollower { .. } => return None,
     };
-    let cp = common::modulators::cycle_pos(&rate, beat, secs, &retrig);
+    let cp = common::modulators::cycle_pos(&rate, common::modulators::ModTime::new(beat, secs), &retrig);
     let q = match kind {
         K::Mseg(c) => match c.play_mode {
             MsegPlayMode::OneShot => cp.clamp(0.0, 1.0),
@@ -237,7 +234,9 @@ fn mod_rate_full(
 ) -> bool {
     use common::model::ModRate;
     mod_rate_control(ui, id_seed, Rect { x, y, w: 52.0, h: 20.0 }, rate, sid);
-    if let ModRate::Free { hz } = rate {
+    if rate.mode == common::model::ModRateMode::Free {
+        let hz = &rate.hz;
+        let base = *rate;
         let hz_style = ScrubableNumberStyle {
             range: Some((0.01, 50.0)),
             sensitivity: 0.05,
@@ -254,7 +253,7 @@ fn mod_rate_full(
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::EditModSource {
                         id: sid,
-                        edit: crate::app::ModSourceEdit::Rate(ModRate::Free { hz: v as f32 }),
+                        edit: crate::app::ModSourceEdit::Rate(ModRate { hz: v as f32, ..base }),
                     });
                 })
             },
@@ -692,7 +691,7 @@ pub(super) fn draw_modulation_rack(
             }
             K::Steps(c) => {
                 let canvas = Rect { x: lx, y, w: row_w, h: MOD_CANVAS_H };
-                let current = Some(common::modulators::steps_active_index(c, beat, secs));
+                let current = Some(common::modulators::steps_active_index(c, common::modulators::cycle_pos(&c.rate, common::modulators::ModTime::new(beat, secs), &c.retrigger)));
                 let resp = ui.step_grid(
                     ("inspector_steps_grid", sid),
                     canvas,

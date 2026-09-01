@@ -19,6 +19,13 @@
   retrigger は無く、Sync LFO は本質的に「transport 位相連動の free-run」(Ableton は Sync 時に
   retrigger ボタンを無効化)。
 
+> **r.md #89 で上書きされた**: rate をクロス変調すると位相は「瞬時周波数の積分」でしか
+> 定まらないので、下の「`song_beat` の純粋関数」は **rate が未変調のときだけ**成立する
+> (未変調なら積分と閉形式は厳密に一致するので、下の記述と挙動は変わらない)。
+> `ModRate` が拍と Hz を両方保持する struct になった点、64 サンプル制御グリッド、
+> 位相表、輪の 1 刻み遅延は
+> [plan_rmd_88_89_cross_modulation.md](plan_rmd_88_89_cross_modulation.md) が正本。
+
 **核心 SSoT**: generator (LFO/Random/MSEG/Steps) は **`song_beat` の純粋関数**。audio 入力にも
 engine ring にも依存しない (follower との決定的な違い)。よって:
 - follower → engine 所有 ring が `env` を算出 (既存、不変)。

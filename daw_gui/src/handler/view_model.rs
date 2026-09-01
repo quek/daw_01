@@ -611,8 +611,51 @@ impl AppData {
     /// `PluginParam` は完全修飾名 (`plugin_param_name`) を、 解決できなければ
     /// generic「Param N」を返す。 status_message / clip 名 / mod routing 表示用。
     pub fn automation_target_label(&self, target: &common::model::AutomationTarget) -> String {
+        // r.md #89: モジュレーターは song を引かないと種別も通し番号も出せない
+        // (`automation_target_display_name` は song 非依存の pure label なので
+        // "変調 3 ▸ 速さ" までしか出せない)。ここが人間向け表示の SSoT。
+        if let Some(name) = self.mod_target_label(target) {
+            return name;
+        }
         self.plugin_param_name(target)
             .unwrap_or_else(|| automation_target_display_name(target))
+    }
+
+    /// r.md #89: `ModSourceParam` / `ModRoutingDepth` の song 依存ラベル。
+    /// 種別 + 作成順の通し番号で `"LFO 2 ▸ 速さ"` / `"LFO 2 → Volume の深さ"` を作る。
+    fn mod_target_label(&self, target: &common::model::AutomationTarget) -> Option<String> {
+        use common::model::AutomationTarget as T;
+        let song = self.song_doc.song();
+        match target {
+            T::ModSourceParam { source_id, param } => {
+                Some(format!("{} \u{25b8} {}", self.mod_source_name(*source_id)?, param.label()))
+            }
+            T::ModRoutingDepth { routing_id } => {
+                let r = song.all_mod_routings().find(|r| r.id == *routing_id)?;
+                let src = self.mod_source_name(r.source_id)?;
+                // 深さの表示は「どのソースが何を変調しているか」が読めないと意味が無い。
+                let dest = self.plugin_param_name(&r.target).unwrap_or_else(|| {
+                    self.mod_target_label(&r.target)
+                        .unwrap_or_else(|| automation_target_display_name(&r.target))
+                });
+                Some(format!("{src} \u{2192} {dest} の深さ"))
+            }
+            _ => None,
+        }
+    }
+
+    /// 種別ラベル + 同種内の作成順 (1 始まり)。ラック / レーン / ステータスで共有する。
+    pub fn mod_source_name(&self, source_id: u32) -> Option<String> {
+        let song = self.song_doc.song();
+        let src = song.mod_sources.iter().find(|m| m.id == source_id)?;
+        let kind_label = src.kind.short_label();
+        let ordinal = song
+            .mod_sources
+            .iter()
+            .filter(|m| m.kind.short_label() == kind_label)
+            .position(|m| m.id == source_id)
+            .map_or(1, |i| i + 1);
+        Some(format!("{kind_label} {ordinal}"))
     }
 
     pub fn inspector_mod_data(
