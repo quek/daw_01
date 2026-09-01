@@ -10,10 +10,7 @@
 //! ソースを消したり並べ替えたりした瞬間にドラッグ状態 / テキストバッファ / 開いて
 //! いる dropdown popup が別ソースの欄へ乗り移る (不変条件 1)。
 
-use common::model::{
-    MOD_BAND_HZ_MAX, MOD_BAND_HZ_MIN, MOD_FOLLOWER_GAIN_MAX, MOD_FOLLOWER_GAIN_MIN,
-    MOD_FOLLOWER_TIME_MS_MAX, MOD_FOLLOWER_TIME_MS_MIN, MOD_RATE_HZ_MAX, MOD_RATE_HZ_MIN,
-};
+use common::model::{AutomationTarget, ModParam};
 use daw_ui_core::{
     Edit, MsegAction, MsegNode, ScrubCurve, ScrubableNumberFormat, ScrubableNumberStyle, Ui,
 };
@@ -22,12 +19,108 @@ use daw_ui_renderer::Rect;
 use common::modulators::ModTime;
 
 use crate::app::{AppData, AppEvent, ModSourceRow};
+
+use super::preview::Series;
 use crate::view::track_inspector::{scrub_style, toggle_audio_style};
 
 use super::{
     GAP, MOD_BAND_DEFAULT, MOD_CANVAS_H, MOD_HZ_W, MOD_RATE_DROPDOWN_W, ModBodyCtx, ROW_H,
     ROW_PITCH,
 };
+
+// ラベルについて: ラックのツマミは **1 文字〜数文字の記号**で呼ぶ (`φ` / `w` / `A` /
+// `R` / `G` / `HP` / `LP` / `Smooth` / `slew`)。 インスペクタの実効幅は 256px しかなく、
+// `ModParam::label()` の全名 (`位相` / `なめらかさ` / `Attack` …) を並べると 1 行に
+// 収まらない。 **`label()` は「幅のある場所」 の SSoT** — オートメーションレーン名と
+// `automation_target_label` — で、 ここはその短縮表示という関係。 どちらかを直すときは
+// 両方を見ること (ラックだけ変えると、 レーン名と呼び名が食い違う)。
+
+/// モジュレーターのツマミ 1 本の記述 ([`mod_param_field`] の引数)。
+struct ModParamField<'a> {
+    sid: u32,
+    param: ModParam,
+    rect: Rect,
+    /// dblclick リセット先 (plain 単位)。
+    default_plain: f64,
+    /// 値の後ろに出す単位 (`"Hz"` / `"ms"` / `"\u{00d7}"`)。恒等 0..=1 の欄は空。
+    unit: &'static str,
+    /// 値を書き戻す `Edit` を作る (種別ごとに撃つ event が違うので caller が渡す)。
+    on_change: &'a dyn Fn(f64) -> Edit<AppData>,
+}
+
+/// モジュレーターのツマミ 1 本を描く。 **値もレンジも SSoT を引き、 そのまま変調先になる。**
+///
+/// - 値 = `common::mod_graph::param_plain` (ラック / レーンの既定値 / 変調の base が同じ 1 本)。
+/// - レンジと対数 / 恒等の別 = `common::automation::mod_param_range`。 `plain_to_norm` が
+///   同じ 1 本を引くので、 **ツマミの端と変調の端が必ず一致する** (片方に数値を写すと、
+///   深さ 1.0 の変調がツマミの端に届かない / 届く前に飽和する形で静かに壊れる)。
+/// - 変調は既存の per-control idiom (`build_mod` → `Modulation`) をそのまま渡すだけ。
+///   ◉ で待受中は press+drag が depth 編集に切り替わる (bespoke な widget は作らない)。
+///
+/// 戻り値 = ドラッグ / 数値入力中か。
+fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: ModParamField<'_>) -> bool {
+    // `mod_param_range` の `None` は「レンジ無し」 ではなく **0..=1 の恒等** (同関数の契約)。
+    // widget へ `None` をそのまま渡すと `clamp_opt` が素通しになり、 (a) 0..=1 の外の値が
+    // モデルへ入り、 (b) 値→x 写像が立たないので変調の色帯と live tick が描かれない。
+    // 対数かどうかの判定だけを別に持ち、 widget には必ず実レンジを渡す。
+    let log = common::automation::mod_param_range(f.param);
+    let style = ScrubableNumberStyle {
+        range: Some(log.unwrap_or((0.0, 1.0))),
+        curve: if log.is_some() { ScrubCurve::Log } else { ScrubCurve::Linear },
+        unit: f.unit,
+        // 対数欄は正規化領域の units_per_pixel なので、 何桁またいでも全域 250px。
+        // 恒等 0..=1 の欄は従来の細かい感度を保つ。
+        sensitivity: if log.is_some() { 1.0 / 250.0 } else { 0.006 },
+        ..scrub_style(&cx.app.theme)
+    };
+    let fmt = if log.is_some() {
+        ScrubableNumberFormat::Significant { digits: 3 }
+    } else {
+        ScrubableNumberFormat::Decimal(2)
+    };
+    let base = cx.app.mod_param_plain_value(f.sid, f.param);
+    // 置き場は「そのソースが属するトラック」。 target だけから決める全域関数は作らない。
+    let track_id = cx
+        .app
+        .song_doc
+        .song()
+        .mod_source_owner(f.sid)
+        .unwrap_or(common::model::MASTER_TRACK_ID);
+    let target = AutomationTarget::ModSourceParam { source_id: f.sid, param: f.param };
+    let mb = crate::view::modulation::build_mod(
+        cx.app,
+        target.clone(),
+        base,
+        crate::view::modulation::PLAIN_IDENT,
+        track_id,
+    );
+    let resp = ui.scrubable_number_at(
+        ("inspector_mod_param", f.sid, f.param),
+        f.rect,
+        base,
+        f.default_plain,
+        fmt,
+        &style,
+        f.on_change,
+        None,
+        Some(mb.modulation()),
+    );
+    // 深さドラッグの立ち下がりが **◉ を解除する唯一の口** (`ScrubGesture::ModDepth` →
+    // `connect_armed_mod_source_to`)。 他の全 per-control 呼び出し元と同じ idiom。
+    //
+    // **`mod_dragging` を `any_mod_drag` (= `ScrubGesture::ModRack`) に混ぜないこと** —
+    // gesture の所有者は 1 度に 1 本で `open()` が既存を必ず `close()` するので、 同じ
+    // フレームで両方 active にすると後勝ちで ModDepth が即 close され、 ドラッグの初回
+    // フレームで arm が外れて以降の深さが追従しなくなる。
+    crate::view::modulation::push_mod_depth_bracket(
+        ui,
+        cx.app,
+        track_id,
+        &target,
+        resp.mod_dragging,
+    );
+    resp.dragging || resp.editing_text
+}
 
 // generator の rate (tempo 同期 division か Free Hz) 選択肢。
 const MOD_RATE_DIVS: [(&str, u32, u32); 9] = [
@@ -170,9 +263,25 @@ fn generator_cycle_samples(
         .collect()
 }
 
+/// MSEG の周期位置 → カーソルの 0..=1 位置 (play_mode の折り返しを含む)。
+/// 閉形式と積分位相の **どちらを渡しても同じ折り方**になるよう 1 本にしてある。
+fn mseg_cursor_phase(c: &common::model::MsegConfig, cp: f64) -> Option<f32> {
+    use common::model::MsegPlayMode;
+    let q = match c.play_mode {
+        MsegPlayMode::OneShot => cp.clamp(0.0, 1.0),
+        MsegPlayMode::Loop => cp.rem_euclid(1.0),
+        MsegPlayMode::PingPong => {
+            let t = cp.rem_euclid(2.0);
+            if t <= 1.0 { t } else { 2.0 - t }
+        }
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    Some(q as f32)
+}
+
 /// generator の現在位相 (0..=1、 ライブカーソル用)。 MSEG は play_mode の fold も反映。
 fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) -> Option<f32> {
-    use common::model::{MsegPlayMode, ModSourceKind as K};
+    use common::model::ModSourceKind as K;
     let (rate, retrig) = match kind {
         K::Lfo(c) => (c.rate, c.retrigger),
         K::Random(c) => (c.rate, c.retrigger),
@@ -182,14 +291,7 @@ fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) ->
     };
     let cp = common::modulators::cycle_pos(&rate, ModTime::new(beat, secs), &retrig);
     let q = match kind {
-        K::Mseg(c) => match c.play_mode {
-            MsegPlayMode::OneShot => cp.clamp(0.0, 1.0),
-            MsegPlayMode::Loop => cp.rem_euclid(1.0),
-            MsegPlayMode::PingPong => {
-                let t = cp.rem_euclid(2.0);
-                if t <= 1.0 { t } else { 2.0 - t }
-            }
-        },
+        K::Mseg(c) => f64::from(mseg_cursor_phase(c, cp).unwrap_or(0.0)),
         // Random は preview が再生位置中心のスクロール窓なので、 カーソルも同じ窓内の相対位置
         // (= 常に実値の上)。 generator_cycle_samples の win_start と一致させる。
         K::Random(_) => {
@@ -210,7 +312,7 @@ fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) ->
 /// 兄弟欄 (`φ` / `w` / `Smooth`) と非対称だった (r.md #88-1/2)。
 fn mod_rate_full(
     ui: &mut Ui<'_, AppData>,
-    theme: &crate::theme::Theme,
+    cx: &ModBodyCtx<'_>,
     x: f32,
     y: f32,
     rate: &common::model::ModRate,
@@ -223,31 +325,25 @@ fn mod_rate_full(
     }
     // 音価に戻しても `hz` は残る (`ModRate` が両方持つ) ので、 `..base` で他方を保つ。
     let base = *rate;
-    let hz_style = ScrubableNumberStyle {
-        range: Some((f64::from(MOD_RATE_HZ_MIN), f64::from(MOD_RATE_HZ_MAX))),
-        curve: ScrubCurve::Log,
-        unit: "Hz",
-        ..scrub_style(theme)
-    };
-    let resp = ui.scrubable_number_at(
-        ("inspector_mod_hz", sid),
-        Rect { x: x + MOD_RATE_DROPDOWN_W + 4.0, y, w: MOD_HZ_W, h: ROW_H },
-        f64::from(base.hz),
-        1.0,
-        ScrubableNumberFormat::Significant { digits: 3 },
-        &hz_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::EditModSource {
-                    id: sid,
-                    edit: crate::app::ModSourceEdit::Rate(ModRate { hz: v as f32, ..base }),
-                });
-            })
+    mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::Rate,
+            rect: Rect { x: x + MOD_RATE_DROPDOWN_W + 4.0, y, w: MOD_HZ_W, h: ROW_H },
+            default_plain: 1.0,
+            unit: "Hz",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::EditModSource {
+                        id: sid,
+                        edit: crate::app::ModSourceEdit::Rate(ModRate { hz: v as f32, ..base }),
+                    });
+                })
+            },
         },
-        None,
-        None,
-    );
-    resp.dragging || resp.editing_text
+    )
 }
 
 /// rate 行の総幅 (dropdown + 間隔 + Hz 欄)。 隣に何かを置く行 (MSEG / Steps) が
@@ -284,6 +380,60 @@ fn mod_retrigger_toggle(
     );
 }
 
+/// ソースの **周期位置** (未ラップ、 cycles)。 MSEG のカーソルと Steps の点灯段が
+/// これを引く。
+///
+/// 速さが変調されている間、 閉形式の `cycle_pos` は engine の積分位相と食い違う —
+/// カーブ / 段の形は base 値の静的表示なので正しいのに、 **カーソルと点灯段だけが嘘**
+/// になる。 変調が掛かっているソースは窓と同じ walk で積分位相を読む
+/// (`preview::cross_mod_phase`)。 掛かっていなければ従来どおり閉形式 (O(1))。
+fn source_cycle_pos(
+    cx: &ModBodyCtx<'_>,
+    src: &ModSourceRow,
+    rate: &common::model::ModRate,
+    retrig: &common::model::RetriggerMode,
+) -> f64 {
+    if is_cross_modulated(cx, src.id)
+        && let Some(p) = super::preview::cross_mod_phase(cx.app, cx.plan, src.id, cx.beat, cx.secs)
+    {
+        return p;
+    }
+    common::modulators::cycle_pos(rate, ModTime::new(cx.beat, cx.secs), retrig)
+}
+
+/// このソースに変調が掛かっているか (plan の入力辺が 1 本でもあるか)。
+fn is_cross_modulated(cx: &ModBodyCtx<'_>, sid: u32) -> bool {
+    cx.plan
+        .nodes
+        .iter()
+        .find(|n| n.source_id == sid)
+        .is_some_and(|n| !n.in_edges.is_empty())
+}
+
+/// プレビューの 2 系列 `(前景, 薄く重ねる基準)` とカーソル位置を出す。
+///
+/// **クロス変調が掛かっているソース** (= plan の入力辺が 1 本でもある) は、 周期的で
+/// なくなるので固定窓では今鳴っている形を描けない。 再生位置中心の時間窓へ倒し、
+/// 変調前の形を薄く重ねる (r.md #89 Q8)。 掛かっていなければ従来どおり 1 周期を固定表示
+/// (基準系列は空 = 描かない)。
+fn preview_series(
+    cx: &ModBodyCtx<'_>,
+    src: &ModSourceRow,
+) -> (Series, Series, Option<f32>) {
+    if is_cross_modulated(cx, src.id) {
+        let (fg, ghost) =
+            super::preview::cross_mod_window(cx.app, cx.plan, src.id, cx.beat, cx.secs);
+        let cursor = super::preview::cross_mod_cursor(cx.app, cx.plan, src.id, cx.secs);
+        (fg, ghost, cursor)
+    } else {
+        (
+            generator_cycle_samples(&src.kind, 160, cx.beat, cx.secs),
+            Series::new(),
+            generator_phase(&src.kind, cx.beat, cx.secs),
+        )
+    }
+}
+
 /// LFO 本体 (プレビュー / shape / rate / φ / Pulse width / retrigger)。
 pub(super) fn draw_lfo_body(
     ui: &mut Ui<'_, AppData>,
@@ -296,11 +446,13 @@ pub(super) fn draw_lfo_body(
     let (sid, lx, p) = (src.id, cx.lx, &cx.app.theme.core);
     let mut drag = false;
 
+    let (fg, ghost, cursor) = preview_series(cx, src);
     ui.signal_preview(
         ("inspector_lfo_prev", sid),
         Rect { x: lx, y, w: cx.row_w, h: MOD_CANVAS_H },
-        &generator_cycle_samples(&src.kind, 160, cx.beat, cx.secs),
-        generator_phase(&src.kind, cx.beat, cx.secs),
+        &fg,
+        &ghost,
+        cursor,
         cx.editor,
     );
     y += MOD_CANVAS_H + 4.0;
@@ -335,38 +487,60 @@ pub(super) fn draw_lfo_body(
             app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoShape(shape) });
         }));
     }
-    drag |= mod_rate_full(ui, &cx.app.theme, lx + 62.0, y, &c.rate, sid);
+    drag |= mod_rate_full(ui, cx, lx + 62.0, y, &c.rate, sid);
     y += ROW_PITCH;
 
     // row B: φ phase + (Pulse width) + retrig
     ui.label_at(("inspector_lfo_ph_lbl", sid), "\u{03c6}", lx, y + 4.0, 10.0, p.text);
-    let ph_resp = ui.scrubable_number_at(
-        ("inspector_lfo_phase", sid),
-        Rect { x: lx + 12.0, y, w: 50.0, h: ROW_H },
-        f64::from(c.phase),
-        0.0,
-        ScrubableNumberFormat::Decimal(2),
-        &cx.unit_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoPhase(v as f32) });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::LfoPhase,
+            rect: Rect { x: lx + 12.0, y, w: 50.0, h: ROW_H },
+            default_plain: 0.0,
+            unit: "",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::EditModSource {
+                        id: sid,
+                        edit: E::LfoPhase(v as f32),
+                    });
+                })
+            },
         },
-        None,
-        None,
     );
-    drag |= ph_resp.dragging || ph_resp.editing_text;
     let mut next_x = lx + 68.0;
-    if let common::model::LfoShape::Pulse { width } = c.shape {
+    if matches!(c.shape, common::model::LfoShape::Pulse { .. }) {
         ui.label_at(("inspector_lfo_w_lbl", sid), "w", next_x, y + 4.0, 10.0, p.text);
-        let w_resp = ui.scrubable_number_at(
-            ("inspector_lfo_width", sid),
-            Rect { x: next_x + 12.0, y, w: 46.0, h: ROW_H },
-            f64::from(width),
-            0.5,
-            ScrubableNumberFormat::Decimal(2),
-            &cx.unit_style,
-            move |v| {
+        drag |= draw_lfo_width_field(ui, cx, sid, next_x + 12.0, y);
+        next_x += 64.0;
+    }
+    mod_retrigger_toggle(ui, Rect { x: next_x, y, w: 56.0, h: ROW_H }, &c.retrigger, sid, cx.beat);
+    (y + ROW_PITCH, drag)
+}
+
+/// Pulse の duty (`w`) 欄。 **`draw_lfo_body` の `if` の中に置かない** — 閉包 + 構造体
+/// リテラルが重なってインデントが 7 段に届き、 1 関数 6 段の budget を割る (不変条件 9)。
+fn draw_lfo_width_field(
+    ui: &mut Ui<'_, AppData>,
+    cx: &ModBodyCtx<'_>,
+    sid: u32,
+    x: f32,
+    y: f32,
+) -> bool {
+    use crate::app::ModSourceEdit as E;
+    mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::LfoPulseWidth,
+            rect: Rect { x, y, w: 46.0, h: ROW_H },
+            default_plain: 0.5,
+            unit: "",
+            on_change: &move |v| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::EditModSource {
                         id: sid,
@@ -374,14 +548,8 @@ pub(super) fn draw_lfo_body(
                     });
                 })
             },
-            None,
-            None,
-        );
-        drag |= w_resp.dragging || w_resp.editing_text;
-        next_x += 64.0;
-    }
-    mod_retrigger_toggle(ui, Rect { x: next_x, y, w: 56.0, h: ROW_H }, &c.retrigger, sid, cx.beat);
-    (y + ROW_PITCH, drag)
+        },
+    )
 }
 
 /// Random 本体 (プレビュー / Smooth / rate / 引き直し / retrigger)。
@@ -396,37 +564,39 @@ pub(super) fn draw_random_body(
     let (sid, lx, p) = (src.id, cx.lx, &cx.app.theme.core);
     let mut drag = false;
 
+    let (fg, ghost, cursor) = preview_series(cx, src);
     ui.signal_preview(
         ("inspector_rand_prev", sid),
         Rect { x: lx, y, w: cx.row_w, h: MOD_CANVAS_H },
-        &generator_cycle_samples(&src.kind, 160, cx.beat, cx.secs),
-        generator_phase(&src.kind, cx.beat, cx.secs),
+        &fg,
+        &ghost,
+        cursor,
         cx.editor,
     );
     y += MOD_CANVAS_H + 4.0;
 
     // row A: Stepped↔Smooth morph (0=階段/S&H, 1=滑らか) + rate(+Hz)
     ui.label_at(("inspector_rand_sm_lbl", sid), "Smooth", lx, y + 4.0, 10.0, p.text);
-    let sm_resp = ui.scrubable_number_at(
-        ("inspector_rand_smooth", sid),
-        Rect { x: lx + 48.0, y, w: 44.0, h: ROW_H },
-        f64::from(c.smooth),
-        1.0,
-        ScrubableNumberFormat::Decimal(2),
-        &cx.unit_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::EditModSource {
-                    id: sid,
-                    edit: E::RandomSmooth(v as f32),
-                });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::RandomSmooth,
+            rect: Rect { x: lx + 48.0, y, w: 44.0, h: ROW_H },
+            default_plain: 1.0,
+            unit: "",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::EditModSource {
+                        id: sid,
+                        edit: E::RandomSmooth(v as f32),
+                    });
+                })
+            },
         },
-        None,
-        None,
     );
-    drag |= sm_resp.dragging || sm_resp.editing_text;
-    drag |= mod_rate_full(ui, &cx.app.theme, lx + 96.0, y, &c.rate, sid);
+    drag |= mod_rate_full(ui, cx, lx + 96.0, y, &c.rate, sid);
     y += ROW_PITCH;
 
     // row B: 「別の乱数パターンを引き直す」 ボタン (raw seed は内部値なので隠す) + retrig
@@ -463,7 +633,7 @@ pub(super) fn draw_mseg_body(
 
     let nodes = mseg_nodes(c);
     let samples = mseg_samples(c, 160);
-    let phase = generator_phase(&src.kind, cx.beat, cx.secs);
+    let phase = mseg_cursor_phase(c, source_cycle_pos(cx, src, &c.rate, &c.retrigger));
     let resp = ui.mseg_editor(
         ("inspector_mseg_canvas", sid),
         Rect { x: lx, y, w: cx.row_w, h: MOD_CANVAS_H },
@@ -512,7 +682,7 @@ pub(super) fn draw_mseg_body(
     }
     // retrig の x は rate 行の実寸から出す (手写しの定数だと Hz 欄と重なる)。
     let rate_x = lx + 62.0;
-    drag |= mod_rate_full(ui, &cx.app.theme, rate_x, y, &c.rate, sid);
+    drag |= mod_rate_full(ui, cx, rate_x, y, &c.rate, sid);
     mod_retrigger_toggle(
         ui,
         Rect { x: rate_x + MOD_RATE_FULL_W + GAP, y, w: 56.0, h: ROW_H },
@@ -534,11 +704,7 @@ pub(super) fn draw_steps_body(
     use crate::app::ModSourceEdit as E;
     let (sid, lx, p) = (src.id, cx.lx, &cx.app.theme.core);
 
-    let cp = common::modulators::cycle_pos(
-        &c.rate,
-        ModTime::new(cx.beat, cx.secs),
-        &c.retrigger,
-    );
+    let cp = source_cycle_pos(cx, src, &c.rate, &c.retrigger);
     let current = Some(common::modulators::steps_active_index(c, cp));
     let resp = ui.step_grid(
         ("inspector_steps_grid", sid),
@@ -605,27 +771,30 @@ pub(super) fn draw_steps_body(
             app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsDirection(dir) });
         }));
     }
-    drag |= mod_rate_full(ui, &cx.app.theme, lx + 130.0, y, &c.rate, sid);
+    drag |= mod_rate_full(ui, cx, lx + 130.0, y, &c.rate, sid);
     y += ROW_PITCH;
 
     // row B: slew + retrig
     ui.label_at(("inspector_steps_sl_lbl", sid), "slew", lx, y + 4.0, 10.0, p.text);
-    let sl_resp = ui.scrubable_number_at(
-        ("inspector_steps_slew", sid),
-        Rect { x: lx + 32.0, y, w: 44.0, h: ROW_H },
-        f64::from(c.slew),
-        0.0,
-        ScrubableNumberFormat::Decimal(2),
-        &cx.unit_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsSlew(v as f32) });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::StepsSlew,
+            rect: Rect { x: lx + 32.0, y, w: 44.0, h: ROW_H },
+            default_plain: 0.0,
+            unit: "",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::EditModSource {
+                        id: sid,
+                        edit: E::StepsSlew(v as f32),
+                    });
+                })
+            },
         },
-        None,
-        None,
     );
-    drag |= sl_resp.dragging || sl_resp.editing_text;
     mod_retrigger_toggle(
         ui,
         Rect { x: lx + 82.0, y, w: 56.0, h: ROW_H },
@@ -634,22 +803,6 @@ pub(super) fn draw_steps_body(
         cx.beat,
     );
     (y + ROW_PITCH, drag)
-}
-
-/// 対数目盛 + 単位付きのスクラバ style。 フォロワーの A / R / gain / 帯域はどれも
-/// 下端と上端が 3〜5 桁離れるので、 線形だと実用感度で全域に数万〜数十万 px 要る。
-fn log_scrub_style(
-    theme: &crate::theme::Theme,
-    lo: f32,
-    hi: f32,
-    unit: &'static str,
-) -> ScrubableNumberStyle {
-    ScrubableNumberStyle {
-        range: Some((f64::from(lo), f64::from(hi))),
-        curve: ScrubCurve::Log,
-        unit,
-        ..scrub_style(theme)
-    }
 }
 
 /// エンベロープフォロワー本体 (tap / A / R / mode / rectify / gain / 帯域)。
@@ -698,42 +851,42 @@ pub(super) fn draw_follower_body(
     }
     let rest_x = lx + tap_w + GAP;
     let half = (right - rest_x - GAP) / 2.0;
-    let ar_style =
-        log_scrub_style(theme, MOD_FOLLOWER_TIME_MS_MIN, MOD_FOLLOWER_TIME_MS_MAX, "ms");
+    let field_w = (half - 12.0).max(20.0);
     ui.label_at(("inspector_mod_a_lbl", sid), "A", rest_x, y + 4.0, 10.0, p.text);
-    let a_resp = ui.scrubable_number_at(
-        ("inspector_mod_attack", sid),
-        Rect { x: rest_x + 12.0, y, w: (half - 12.0).max(20.0), h: ROW_H },
-        f64::from(f.attack_ms),
-        1.0,
-        ScrubableNumberFormat::Significant { digits: 3 },
-        &ar_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetModSourceAttack { id: sid, ms: v as f32 });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::FollowerAttack,
+            rect: Rect { x: rest_x + 12.0, y, w: field_w, h: ROW_H },
+            default_plain: 1.0,
+            unit: "ms",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetModSourceAttack { id: sid, ms: v as f32 });
+                })
+            },
         },
-        None,
-        None,
     );
     let r_x = rest_x + half + GAP;
     ui.label_at(("inspector_mod_r_lbl", sid), "R", r_x, y + 4.0, 10.0, p.text);
-    let r_resp = ui.scrubable_number_at(
-        ("inspector_mod_release", sid),
-        Rect { x: r_x + 12.0, y, w: (half - 12.0).max(20.0), h: ROW_H },
-        f64::from(f.release_ms),
-        100.0,
-        ScrubableNumberFormat::Significant { digits: 3 },
-        &ar_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetModSourceRelease { id: sid, ms: v as f32 });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::FollowerRelease,
+            rect: Rect { x: r_x + 12.0, y, w: field_w, h: ROW_H },
+            default_plain: 100.0,
+            unit: "ms",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetModSourceRelease { id: sid, ms: v as f32 });
+                })
+            },
         },
-        None,
-        None,
     );
-    drag |= a_resp.dragging || a_resp.editing_text || r_resp.dragging || r_resp.editing_text;
     y += ROW_PITCH;
 
     // --- row 2: 検出モード + 整流 + ゲイン + 帯域の on/off ---
@@ -767,24 +920,22 @@ pub(super) fn draw_follower_body(
         },
     );
     ui.label_at(("inspector_mod_g_lbl", sid), "G", lx + 108.0, y + 4.0, 10.0, p.text);
-    let gain_style =
-        log_scrub_style(theme, MOD_FOLLOWER_GAIN_MIN, MOD_FOLLOWER_GAIN_MAX, "\u{00d7}");
-    let g_resp = ui.scrubable_number_at(
-        ("inspector_mod_gain", sid),
-        Rect { x: lx + 120.0, y, w: 52.0, h: ROW_H },
-        f64::from(f.gain),
-        1.0,
-        ScrubableNumberFormat::Significant { digits: 3 },
-        &gain_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetModSourceGain { id: sid, gain: v as f32 });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::FollowerGain,
+            rect: Rect { x: lx + 120.0, y, w: 52.0, h: ROW_H },
+            default_plain: 1.0,
+            unit: "\u{00d7}",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetModSourceGain { id: sid, gain: v as f32 });
+                })
+            },
         },
-        None,
-        None,
     );
-    drag |= g_resp.dragging || g_resp.editing_text;
     let band_on = f.band_filter.is_some();
     ui.toggle_button_at(
         ("inspector_mod_band", sid),
@@ -808,41 +959,41 @@ pub(super) fn draw_follower_body(
     let Some(band) = f.band_filter else {
         return (y, drag);
     };
-    let band_style = log_scrub_style(theme, MOD_BAND_HZ_MIN, MOD_BAND_HZ_MAX, "Hz");
     ui.label_at(("inspector_mod_hp_lbl", sid), "HP", lx, y + 4.0, 10.0, p.text);
-    let hp_resp = ui.scrubable_number_at(
-        ("inspector_mod_hp", sid),
-        Rect { x: lx + 18.0, y, w: 64.0, h: ROW_H },
-        f64::from(band.hp_hz),
-        f64::from(MOD_BAND_DEFAULT.hp_hz),
-        ScrubableNumberFormat::Significant { digits: 3 },
-        &band_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                let next = BandFilter { hp_hz: v as f32, lp_hz: band.lp_hz };
-                app.handle_event(AppEvent::SetModSourceBand { id: sid, band: Some(next) });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::FollowerHpHz,
+            rect: Rect { x: lx + 18.0, y, w: 64.0, h: ROW_H },
+            default_plain: f64::from(MOD_BAND_DEFAULT.hp_hz),
+            unit: "Hz",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let next = BandFilter { hp_hz: v as f32, lp_hz: band.lp_hz };
+                    app.handle_event(AppEvent::SetModSourceBand { id: sid, band: Some(next) });
+                })
+            },
         },
-        None,
-        None,
     );
     ui.label_at(("inspector_mod_lp_lbl", sid), "LP", lx + 90.0, y + 4.0, 10.0, p.text);
-    let lp_resp = ui.scrubable_number_at(
-        ("inspector_mod_lp", sid),
-        Rect { x: lx + 108.0, y, w: 64.0, h: ROW_H },
-        f64::from(band.lp_hz),
-        f64::from(MOD_BAND_DEFAULT.lp_hz),
-        ScrubableNumberFormat::Significant { digits: 3 },
-        &band_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                let next = BandFilter { hp_hz: band.hp_hz, lp_hz: v as f32 };
-                app.handle_event(AppEvent::SetModSourceBand { id: sid, band: Some(next) });
-            })
+    drag |= mod_param_field(
+        ui,
+        cx,
+        ModParamField {
+            sid,
+            param: ModParam::FollowerLpHz,
+            rect: Rect { x: lx + 108.0, y, w: 64.0, h: ROW_H },
+            default_plain: f64::from(MOD_BAND_DEFAULT.lp_hz),
+            unit: "Hz",
+            on_change: &move |v| {
+                Edit::mutate(move |app: &mut AppData| {
+                    let next = BandFilter { hp_hz: band.hp_hz, lp_hz: v as f32 };
+                    app.handle_event(AppEvent::SetModSourceBand { id: sid, band: Some(next) });
+                })
+            },
         },
-        None,
-        None,
     );
-    drag |= hp_resp.dragging || hp_resp.editing_text || lp_resp.dragging || lp_resp.editing_text;
     (y + ROW_PITCH, drag)
 }

@@ -428,12 +428,13 @@ fn format_significant(value: f64, digits: u8) -> String {
         0
     };
     let s = format!("{value:.decimals$}");
-    if !s.contains('.') {
-        return s;
-    }
-    let t = s.trim_end_matches('0').trim_end_matches('.');
-    // "-0.000" が "-" に潰れる / 空になる退化を潰す。
-    if t.is_empty() || t == "-" { "0".to_string() } else { t.to_string() }
+    let t = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        s.as_str()
+    };
+    // 符号だけが残る退化を潰す ("-0.000" → "-"、 `format!("{:.0}", -0.0)` は "-0")。
+    if t.is_empty() || t == "-" || t == "-0" { "0".to_string() } else { t.to_string() }
 }
 
 /// 零点対称の符号付き値 → `"L50"` / `"C"` / `"R100"` 形式。 数字は `|value| × scale` の

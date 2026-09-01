@@ -11,6 +11,7 @@
 //! (不変条件 9)。
 
 mod bodies;
+mod preview;
 
 use daw_ui_core::{Edit, MsegEditorStyle, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 use daw_ui_renderer::Rect;
@@ -91,8 +92,6 @@ struct ModBodyCtx<'a> {
     app: &'a AppData,
     /// canvas 系 (signal_preview / mseg_editor / step_grid) のスタイル。
     editor: MsegEditorStyle,
-    /// 0..=1 の正規化欄 (φ / w / Smooth / slew) の共通スタイル。
-    unit_style: ScrubableNumberStyle,
     area: Rect,
     pad: f32,
     /// 行左端。
@@ -102,6 +101,9 @@ struct ModBodyCtx<'a> {
     /// ライブカーソル用 transport 位置。 `beat` と `secs` は同じ tempo map の 1 点。
     beat: f64,
     secs: f64,
+    /// 輪 / tier / 入力辺の **唯一の判定者** (`mod_graph::build_plan` の結果)。
+    /// GUI は読むだけで、 自前で輪や tier を判定しない。
+    plan: &'a common::mod_graph::ModPlan,
 }
 
 /// プレビューの transport 位置 `(beat, secs)` を **engine / export と同じ写像** で出す。
@@ -119,12 +121,32 @@ struct ModBodyCtx<'a> {
 /// `beats_to_samples` が閉形式に落ちるので、 既存曲のプレビューは 1 サンプルも動かない。
 fn mod_preview_pos(app: &AppData) -> (f64, f64) {
     let beat = f64::from(app.transport.playhead_beat.unwrap_or(0.0));
+    (beat, song_secs_at_beat(app, beat))
+}
+
+/// `beat` を engine / export と同じ写像で song 秒へ落とす。
+///
+/// テンポカーブのある曲では `beats_to_samples` が 1/64 拍刻みの積分 = **O(拍)** で、
+/// 描画は毎フレーム走る。 拍は 1 フレームの間に何度も同じ値で問われる (transport 位置 +
+/// `build_plan` の anchor) ので、 **直近 1 件だけ memo** する。 曲を編集したら
+/// `edit_epoch` が変わるので、 テンポカーブを引き直したときは自動で無効になる。
+fn song_secs_at_beat(app: &AppData, beat: f64) -> f64 {
     let sr = app.ipc.sample_rate;
-    if sr == 0 {
-        return (beat, 0.0);
+    if sr == 0 || !beat.is_finite() {
+        return 0.0;
+    }
+    let epoch = app.song_doc.edit_epoch();
+    if let Some((e, b, secs)) = app.ui_ephemeral.preview_secs_memo.get()
+        && e == epoch
+        && b.to_bits() == beat.to_bits()
+    {
+        return secs;
     }
     let samples = common::automation::beats_to_samples(app.song_doc.song(), sr, beat);
-    (beat, samples as f64 / f64::from(sr))
+    #[allow(clippy::cast_precision_loss)]
+    let secs = samples as f64 / f64::from(sr);
+    app.ui_ephemeral.preview_secs_memo.set(Some((epoch, beat, secs)));
+    secs
 }
 
 /// モジュレーションラックを **スクロール viewport の top-down
@@ -148,14 +170,22 @@ pub(super) fn draw_modulation_rack(
     // ライブカーソル用の transport 位置。 beat と秒は **同じ tempo map の 1 点**
     // ([`mod_preview_pos`])。
     let (beat, secs) = mod_preview_pos(app);
+    // 輪 (⟳) と位置依存 (audio tier) の **判定はここではしない**。
+    // `mod_graph::build_plan` が唯一の判定者で、 GUI / engine / export が同じ 1 本を
+    // 引く規約 (片側だけで判定すると、 バッジが出ていないのに音が位置依存になる /
+    // その逆が起きる)。 バッジは plan を読むだけ。
+    //
+    // `anchor_secs` は `FromBeat` の anchor の秒換算。 バッジ (`in_cycle` / `tier`) は
+    // 読まないが、 **この plan はプレビューの評価入力でもある** (`preview::cross_mod_window`
+    // → `mod_graph::tick`)。 0 で埋めると Hz モードの ⟲here がプレビュー上だけ
+    // FreeRun として描かれるので、 transport 位置と同じ写像で解決する。
+    let plan = common::mod_graph::build_plan(app.song_doc.song(), 0, |anchor_beat| {
+        song_secs_at_beat(app, anchor_beat)
+    });
     let cx = ModBodyCtx {
         app,
+        plan: &plan,
         editor: mod_editor_style(&app.theme),
-        unit_style: ScrubableNumberStyle {
-            range: Some((0.0, 1.0)),
-            sensitivity: 0.006,
-            ..scrub_style(&app.theme)
-        },
         area,
         pad,
         lx,
@@ -210,6 +240,8 @@ pub(super) fn draw_modulation_rack(
         ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, p.text);
         let arm_w = 24.0;
         let arm_x = meter_x - 4.0 - arm_w;
+        let node = plan.nodes.iter().find(|n| n.source_id == sid);
+        let badge_w = draw_mod_badges(ui, &app.theme, sid, node, arm_x - 4.0, y);
         let armed = app.ui_ephemeral.armed_mod_source == Some(sid);
         ui.button_at(
             ("inspector_mod_src_arm", sid),
@@ -241,7 +273,9 @@ pub(super) fn draw_modulation_rack(
             },
         );
         let name_x = lx + MOD_NAME_INSET;
-        let name_rect = Rect { x: name_x, y, w: (arm_x - 4.0 - name_x).max(40.0), h: 20.0 };
+        // バッジが出ている分だけ名前 / track dropdown を詰める (行は太らせない)。
+        let name_rect =
+            Rect { x: name_x, y, w: (arm_x - 4.0 - badge_w - name_x).max(40.0), h: 20.0 };
         if let K::EnvelopeFollower { tap, .. } = &src.kind {
             let sel = mod_track_choices
                 .iter()
@@ -321,6 +355,58 @@ pub(super) fn draw_modulation_rack(
     y
 }
 
+/// ヘッダ行の右寄せバッジ。 **判定はしない** — `mod_graph::build_plan` が出した
+/// [`ModNode`] を読んで描くだけ (輪 → `\u{27f3}` / audio tier → 「位置依存」)。
+///
+/// `right` から左へ積み、 **消費した幅** を返す (呼び側が名前欄をその分詰める)。
+/// 暗いチップ + `ink_for` の自動コントラスト文字なので、 ライト / ダークどちらの
+/// テーマでも読める (色を直書きすると片方のテーマで沈む)。
+fn draw_mod_badges(
+    ui: &mut Ui<'_, AppData>,
+    theme: &crate::theme::Theme,
+    sid: u32,
+    node: Option<&common::mod_graph::ModNode>,
+    right: f32,
+    y: f32,
+) -> f32 {
+    let Some(node) = node else { return 0.0 };
+    let mut labels: Vec<&'static str> = Vec::new();
+    if node.in_cycle {
+        // 輪の 1 箇所が 1 制御刻み前の値で回っている (r.md #89 Q2)。
+        labels.push("\u{27f3}");
+    }
+    if node.tier == common::mod_graph::ModTier::Audio {
+        // 速さの鎖にフォロワーが居る = 位相が「どこから再生したか」に依存する (Q7)。
+        labels.push("位置依存");
+    }
+    if labels.is_empty() {
+        return 0.0;
+    }
+    let p = &theme.core;
+    let chip = p.inset_bg;
+    let ink = p.ink_for(chip);
+    const FONT: f32 = 9.0;
+    const PAD: f32 = 4.0;
+    let mut x = right;
+    let mut used = 0.0;
+    for (i, label) in labels.iter().enumerate() {
+        let w = ui.measure_text(label, FONT) + PAD * 2.0;
+        x -= w;
+        ui.push_rect(daw_ui_renderer::RectCommand {
+            rect: Rect { x, y: y + 3.0, w, h: 14.0 },
+            fill: chip,
+            border: daw_ui_renderer::Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [3.0; 4],
+            clip_rect: None,
+        });
+        ui.label_at(("inspector_mod_badge", sid, i), label, x + PAD, y + 4.0, FONT, ink);
+        used += w + 3.0;
+        x -= 3.0;
+    }
+    used
+}
+
 /// routing 1 行の配置 (呼び側の y カーソルと幅をそのまま渡す)。
 struct RoutingRowGeom {
     area: Rect,
@@ -344,10 +430,10 @@ fn draw_routing_row(
 ) -> bool {
     let RoutingRowGeom { area, pad, lx, row_w, y: row_y } = g;
     let p = &app.theme.core;
-    // widget id は **モデルが routing を指すのと同じ鍵** `(source_id, track_id, target)`。
-    // 旧実装は全ソースを通したグローバル連番 `route_i` で、 routing を 1 本消すと
-    // それ以降の行の depth ドラッグ / テキストバッファが 1 つ隣へずれた (不変条件 1)。
-    let rid = (sid, row.track_id, &row.target);
+    // widget id は **1 本の変調の安定 id** (`ModRouting::id`)。 旧実装は全ソースを
+    // 通したグローバル連番 `route_i` で、 routing を 1 本消すとそれ以降の行の depth
+    // ドラッグ / テキストバッファが 1 つ隣へずれた (不変条件 1)。
+    let rid = row.id;
     ui.label_at_clipped(
         ("inspector_mod_rt_lbl", rid),
         &format!("\u{2192} {}", row.label),
@@ -366,13 +452,34 @@ fn draw_routing_row(
     let depth_x = pol_x - 4.0 - 46.0;
     let (t, s) = (row.track_id, sid);
     let tgt = row.target.clone();
+    // r.md #89 Q9: **深さ欄も普通のツマミ**として扱う (◉ 待受中にドラッグすれば
+    // 深さ自体が変調先になる)。 置き場はその変調が置かれている所そのもの
+    // (`mod_routing_owner`)。 target だけから決める全域関数は作らない。
+    let depth_style = ScrubableNumberStyle {
+        // 深さは -1..=1。 帯 / live tick の写像に range が要る (無いと帯が出ない)。
+        range: Some((-1.0, 1.0)),
+        sensitivity: 0.006,
+        ..scrub_style(&app.theme)
+    };
+    let depth_owner = app
+        .song_doc
+        .song()
+        .mod_routing_owner(row.id)
+        .unwrap_or(common::model::MASTER_TRACK_ID);
+    let depth_mod = crate::view::modulation::build_mod(
+        app,
+        common::model::AutomationTarget::ModRoutingDepth { routing_id: row.id },
+        f64::from(row.depth),
+        crate::view::modulation::PLAIN_IDENT,
+        depth_owner,
+    );
     let depth_resp = ui.scrubable_number_at(
         ("inspector_mod_rt_depth", rid),
         Rect { x: depth_x, y: row_y, w: 46.0, h: 20.0 },
         f64::from(row.depth),
         1.0,
         ScrubableNumberFormat::Decimal(2),
-        &scrub_style(&app.theme),
+        &depth_style,
         move |v| {
             let tgt = tgt.clone();
             Edit::mutate(move |app: &mut AppData| {
@@ -385,7 +492,7 @@ fn draw_routing_row(
             })
         },
         None,
-        None,
+        Some(depth_mod.modulation()),
     );
     let bip = row.bipolar;
     let tgt_pol = row.target.clone();
@@ -420,6 +527,15 @@ fn draw_routing_row(
                 });
             })
         },
+    );
+    // 深さ欄も他の per-control と同じく、 立ち下がりで ◉ を解除する
+    // (`mod_param_field` と同じ理由で `any_mod_drag` には混ぜない)。
+    crate::view::modulation::push_mod_depth_bracket(
+        ui,
+        app,
+        depth_owner,
+        &common::model::AutomationTarget::ModRoutingDepth { routing_id: row.id },
+        depth_resp.mod_dragging,
     );
     depth_resp.dragging || depth_resp.editing_text
 }

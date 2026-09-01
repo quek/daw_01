@@ -7,6 +7,19 @@ use common::model::{
     MOD_BAND_HZ_MAX, MOD_BAND_HZ_MIN, MOD_FOLLOWER_GAIN_MAX, MOD_FOLLOWER_GAIN_MIN, ModParam,
 };
 
+/// Pulse の duty を 0..=1 に収めた shape。 duty は「値」 なので、兄弟 param
+/// (phase / smooth / slew) と同じく **書き戻しのチョークポイントで** clamp する。
+/// 評価側 (`lfo_shape_value`) も clamp するが、範囲外のまま保存されると欄の表示と
+/// 実出力が食い違ったまま残る (欄は "1.50"、音は常時 1.0 の直線)。
+fn clamped_lfo_shape(shape: common::model::LfoShape) -> common::model::LfoShape {
+    match shape {
+        common::model::LfoShape::Pulse { width } => {
+            common::model::LfoShape::Pulse { width: width.clamp(0.0, 1.0) }
+        }
+        other => other,
+    }
+}
+
 impl AppData {
     // ---- docs/plan_modulation.md §9: modulation source / routing CRUD ----
     // すべて `Song` を mutate して `flush_song_sync` で締める
@@ -97,7 +110,7 @@ impl AppData {
             }
             ModSourceEdit::LfoShape(shape) => {
                 if let ModSourceKind::Lfo(c) = &mut m.kind {
-                    c.shape = shape;
+                    c.shape = clamped_lfo_shape(shape);
                 }
             }
             ModSourceEdit::LfoPhase(p) => {

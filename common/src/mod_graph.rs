@@ -355,10 +355,14 @@ pub fn param_plain(kind: &ModSourceKind, param: ModParam, bpm: f64) -> f64 {
             f64::from(follower.gain)
         }
         (ModParam::FollowerHpHz, ModSourceKind::EnvelopeFollower { follower, .. }) => {
-            follower.band_filter.map_or(20.0, |b| f64::from(b.hp_hz))
+            follower
+                .band_filter
+                .map_or(f64::from(crate::model::MOD_BAND_HZ_MIN), |b| f64::from(b.hp_hz))
         }
         (ModParam::FollowerLpHz, ModSourceKind::EnvelopeFollower { follower, .. }) => {
-            follower.band_filter.map_or(20_000.0, |b| f64::from(b.lp_hz))
+            follower
+                .band_filter
+                .map_or(f64::from(crate::model::MOD_BAND_HZ_MAX), |b| f64::from(b.lp_hz))
         }
         _ => 0.0,
     }

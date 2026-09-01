@@ -25,6 +25,42 @@ const PAN_FORMAT: ScrubableNumberFormat = ScrubableNumberFormat::SignedLabeled {
     scale: 100.0,
 };
 
+/// M14 Phase 134 の動作確認欄: `0.001..=128 Hz` を対数目盛 + 単位 `"Hz"` + 有効数字 3 桁で。
+///
+/// **線形**で置くと `sensitivity` が意味を持たない (全域を舐めるのに実用感度で数十万 px
+/// 要る)。 `Log` はドラッグ量が正規化領域で効くので `sensitivity = 1/250` なら 250px で
+/// 全域。 表示が有効数字なので、 下端 `0.001` も上端 `128` も同じ情報量で欄に収まる
+/// (固定小数だと下端が `"0.00"` に潰れる)。
+///
+/// `build_ui` の strip ループの中に直接書かない — 閉包が 2 段重なってインデントが深くなり、
+/// daw_01 側の arch-lint (1 関数 6 段) を割るため。
+fn draw_freq_field(ui: &mut daw_ui_core::Ui<'_, MixerModel>, i: usize, rect: Rect, value: f64) {
+    let style = ScrubableNumberStyle {
+        font_size: 12.0,
+        sensitivity: 1.0 / 250.0,
+        range: Some((0.001, 128.0)),
+        curve: ScrubCurve::Log,
+        unit: "Hz",
+        ..ScrubableNumberStyle::from_palette(ui.palette())
+    };
+    let _ = ui.scrubable_number_at(
+        ("ch_freq", i),
+        rect,
+        value,
+        1.0,
+        ScrubableNumberFormat::Significant { digits: 3 },
+        &style,
+        move |v| {
+            Edit::mutate(move |m: &mut MixerModel| {
+                m.freqs[i] = v;
+                m.last_action = format!("ch{} freq = {v} Hz", i + 1);
+            })
+        },
+        None,
+        None,
+    );
+}
+
 /// knob の正規化値 (0..=1) → 中央 0 の L/R 値 (-1..=1)。
 fn pan_lr(norm: f32) -> f64 {
     f64::from(norm) * 2.0 - 1.0
@@ -325,36 +361,7 @@ impl App {
                     );
 
                     // M14 Phase 134: `ScrubCurve::Log` + `unit` + `Significant` の動作確認欄。
-                    //
-                    // `0.001..=128 Hz` を **線形**で置くと `sensitivity` に意味が無くなる
-                    // (全域を舐めるのに実用感度で数十万 px 要る)。 `Log` はドラッグ量が
-                    // 正規化領域で効くので、 `sensitivity = 1/250` なら 250px で全域。
-                    // 表示は有効数字 3 桁なので、 下端 `0.001` も上端 `128` も同じ情報量で
-                    // 欄に収まる (固定小数だと下端が `"0.00"` に潰れる)。
-                    let freq_style = ScrubableNumberStyle {
-                        font_size: 12.0,
-                        sensitivity: 1.0 / 250.0,
-                        range: Some((0.001, 128.0)),
-                        curve: ScrubCurve::Log,
-                        unit: "Hz",
-                        ..ScrubableNumberStyle::from_palette(ui.palette())
-                    };
-                    let _ = ui.scrubable_number_at(
-                        ("ch_freq", i),
-                        freq_rect,
-                        m.freqs[i],
-                        1.0,
-                        ScrubableNumberFormat::Significant { digits: 3 },
-                        &freq_style,
-                        move |v| {
-                            Edit::mutate(move |m: &mut MixerModel| {
-                                m.freqs[i] = v;
-                                m.last_action = format!("ch{} freq = {v} Hz", i + 1);
-                            })
-                        },
-                        None,
-                        None,
-                    );
+                    draw_freq_field(ui, i, freq_rect, m.freqs[i]);
 
                     // M9 Phase 45b: toggle_button_at で DAW 慣習の M (mute) ボタン。
                     let mute_style = ToggleButtonStyle {

@@ -380,6 +380,7 @@ impl AppData {
                 pending_clipboard_write: None,
                 editing_automation_point: None,
                 last_touched_param: None,
+                preview_secs_memo: std::cell::Cell::new(None),
                 home_toggle_at_first: false,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
