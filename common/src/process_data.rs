@@ -422,14 +422,10 @@ impl ProcessData {
             self.n_param_mods += 1;
             (head + n) % MAX_PARAM_MODS
         } else {
-            #[cfg(debug_assertions)]
-            if self.param_mods_dropped == 0 {
-                tracing::warn!(
-                    param_id,
-                    cap = MAX_PARAM_MODS,
-                    "param_mods が溢れた (古い側を捨てる)"
-                );
-            }
+            // **ここで tracing を呼ばない。** `push_param_mod` は audio callback から
+            // 走るので、subscriber がファイルへ書いていればその buffer で I/O
+            // ブロックする (CLAUDE.md「RT では I/O 禁止」)。溢れは
+            // `param_mods_dropped` に数えるだけにして、報告は off-RT の読み手に任せる。
             self.param_mods_dropped = self.param_mods_dropped.saturating_add(1);
             self.param_mods_head = ((head + 1) % MAX_PARAM_MODS) as u32;
             head

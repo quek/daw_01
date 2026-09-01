@@ -923,8 +923,7 @@ impl LocalState {
         )> = None;
         let mut plan_or_schedule_changed = false;
         if let Some((plan, rt)) = new.mod_plan.take() {
-            let old_rt = self.mod_tick.install(plan, rt);
-            retired_plan = Some((Arc::clone(&self.mod_tick.plan), old_rt));
+            retired_plan = Some(self.mod_tick.install(plan, rt));
             plan_or_schedule_changed = true;
         }
         let retired_table = new

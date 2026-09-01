@@ -694,10 +694,13 @@ impl ClapPlugin {
             // expansion never allocate on the audio thread.
             pending_events: Vec::with_capacity(256),
             pending_param_events: Vec::with_capacity(256),
-            pending_param_mods: Vec::with_capacity(256),
+            // r.md #89: 制御グリッド化で 1 buffer 最大 `MAX_PARAM_MODS` 件。
+            pending_param_mods: Vec::with_capacity(common::process_data::MAX_PARAM_MODS),
             param_meta,
             last_param_value,
-            event_order: Vec::with_capacity(512),
+            event_order: Vec::with_capacity(
+                common::process_data::MAX_EVENTS + common::process_data::MAX_PARAM_MODS,
+            ),
             collected_out_notes: Vec::with_capacity(256),
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),

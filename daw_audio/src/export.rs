@@ -583,13 +583,6 @@ fn render_loop(
     // only when a video render will consume it (`write_video_sidecars`). A
     // standalone WAV export skips it (n_sources = 0 → no recording, no file):
     // the modulation is already baked into the rendered audio below regardless.
-    // r.md #89: 列のキーは `ModSource::id` (`follower_keys`)。位置キーだった頃は、
-    // 書き出し後にソースを 1 つ消してから動画を描くと列が丸ごとずれた。
-    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_video_sidecars {
-        schedule.follower_keys.clone()
-    } else {
-        Vec::new()
-    });
     // r.md #87 §3.6: 同じ理由でランチャーの走行状態も焼く — 動画書き出しは
     // フォローアクションがどこで次の列へ移ったかを知らないので、焼かないと
     // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
@@ -614,9 +607,18 @@ fn render_loop(
             sample_rate,
             length_secs,
         ));
-        mod_tick.install(plan, rt);
+        let _ = mod_tick.install(plan, rt);
         mod_tick.set_table(Some(table));
     }
+    // r.md #89: 列のキーは `ModSource::id`。**値を出す面そのものから取る** —
+    // `schedule.follower_keys` は `Song::mod_sources` の位置順、面は plan の
+    // トポロジカル順なので、クロス変調で順序が変わると列と値が入れ替わる
+    // (書き出した動画で別のソースの波形が絵を動かす)。
+    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_video_sidecars {
+        mod_tick.publish_plane().ids().to_vec()
+    } else {
+        Vec::new()
+    });
     // `Schedule` の follower slot → 係数表の列 (刻みごとにフォロワー係数を引く)。
     let mut follower_cols: Vec<u16> = Vec::new();
     mod_tick.build_follower_cols(&schedule.follower_keys, &mut follower_cols);

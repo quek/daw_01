@@ -153,33 +153,54 @@ impl ModTickRunner {
 
     /// 新しい plan と、それに合わせて **off-thread で `install` 済み**の RT 状態を
     /// 差し込む (`ModRuntime::install` は `Vec::resize` するので RT では走らせない)。
-    /// 走行状態は捨てて次の buffer で張り直す。戻り値は旧 RT 状態 (recycle 用)。
-    pub fn install(&mut self, plan: Arc<ModPlan>, rt: ModRuntime) -> ModRuntime {
+    /// 走行状態は捨てて次の buffer で張り直す。
+    ///
+    /// 戻り値は **旧 plan と旧 RT 状態** — どちらも `Vec` を抱えるので、
+    /// audio thread で drop させず呼び出し側が recycle 経路へ渡すこと
+    /// (`self.plan = plan` の代入で旧 `Arc` を落とすと、最後の参照だったときに
+    /// `Vec<ModNode>` / 各 `in_edges` / MSEG の `points` が RT で free される)。
+    pub fn install(&mut self, plan: Arc<ModPlan>, rt: ModRuntime) -> (Arc<ModPlan>, ModRuntime) {
         self.follower_cols.clear();
         for (slot, node) in plan.nodes.iter().enumerate().take(MAX_SLOTS) {
-            let modulated = node
+            let Ok(s) = u16::try_from(slot) else { continue };
+            // 係数が **動く** フォロワーだけ刻みごとに引き直す。動かす経路は
+            // 変調の辺と automation lane の 2 つ (r.md #89 Q4)。lane を数えないと
+            // 「レーンで Attack を描いたのに compile 時の係数のまま鳴る」になる。
+            let by_edge = node
                 .in_edges
                 .iter()
                 .any(|e| FOLLOWER_PARAMS.contains(&e.param));
-            if modulated
-                && let Ok(s) = u16::try_from(slot)
-            {
+            let by_lane = plan
+                .lane_params
+                .iter()
+                .any(|(ls, p)| *ls == s && FOLLOWER_PARAMS.contains(p));
+            if by_edge || by_lane {
                 self.follower_cols.push(s);
             }
         }
-        self.plan = plan;
+        let old_plan = std::mem::replace(&mut self.plan, plan);
         self.depth_ids.clear();
         self.depth_ids
             .extend(self.plan.depth_groups.iter().map(|g| g.routing_id));
         self.marks.clear();
         self.plane.reset(&[], &[], MOD_TICK_FRAMES);
         self.first_tick = i64::MIN;
-        std::mem::replace(&mut self.rt, rt)
+        (old_plan, std::mem::replace(&mut self.rt, rt))
     }
 
     /// 位相表を差し替える (旧表を返す — 呼び出し側が recycle する)。
+    ///
+    /// **差し替えたら走行を張り直す。** 表は off-thread で数十万刻みを回して作るので、
+    /// 曲を開いた直後や Hz を動かした直後は「表が届く前に再生が始まる」。その間
+    /// [`common::mod_graph::locate`] は表無しで閉形式シードに倒れるので、表が届いても
+    /// 張り直さないと **積分 tier がシークするまで別の位相で鳴り続ける**
+    /// (= 聴いた音と書き出しが一致しない)。
     pub fn set_table(&mut self, table: Option<Arc<ModPhaseTable>>) -> Option<Arc<ModPhaseTable>> {
-        std::mem::replace(&mut self.table, table)
+        let prev = std::mem::replace(&mut self.table, table);
+        if self.plan.needs_integration() {
+            self.first_tick = i64::MIN;
+        }
+        prev
     }
 
     /// **シーク / ループ折返し / 再生開始で位相と transport を張り直す。**
@@ -568,14 +589,16 @@ mod tests {
     /// 絶対サンプル位置で決まる、というのがその担保。
     #[test]
     fn 刻み番号は_buffer_の切り方に依存しない() {
-        let one: Vec<i64> = (0u64..1024).map(tick_of).collect();
-        let split: Vec<i64> = (0u64..480)
-            .map(tick_of)
-            .chain((480u64..1024).map(tick_of))
-            .collect();
-        assert_eq!(one, split);
-        assert_eq!(tick_of(63), 0);
-        assert_eq!(tick_of(64), 1);
+        // 刻み番号は **絶対サンプル位置**だけで決まる = buffer の切れ目に依存しない。
+        // 「同じ写像を 2 通りに並べ替えて比べる」形だと `tick_of` が何であっても
+        // 通ってしまうので、境界そのものを固定する。
+        assert_eq!(MOD_TICK_FRAMES, 64, "刻み幅が変わったら下の期待値も変える");
+        for (sample, want) in [(0u64, 0i64), (63, 0), (64, 1), (479, 7), (480, 7), (1023, 15)] {
+            assert_eq!(tick_of(sample), want, "sample={sample}");
+        }
+        // buffer 480 で切っても 1024 で切っても、同じ絶対位置は同じ刻みに落ちる。
+        assert_eq!(tick_of(480), tick_of(480), "境界は buffer 長に依存しない");
+        assert_eq!(tick_of(1024), 16);
     }
 
     /// 変調の rate を変調した (= 積分 tier の) 曲で、**buffer の切り方を変えても

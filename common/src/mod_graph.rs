@@ -881,7 +881,13 @@ fn walk(
             on_breakpoint(rt, mark);
         }
         let dt_beats = dt_secs * mark.bpm / 60.0;
-        // follower は音に依存するので replay では 0 (Audio tier は別途シードし直す)。
+        // follower は音に依存するので replay では 0 にする — **表もそう焼いている**。
+        // ライブ走行中の生 env を引きずると、locate の replay が表と別のテンポ
+        // (`SongTempo` の変調経由) を踏んで、breakpoint からの前進が表と一致しなくなる。
+        // Audio tier はこのあと閉形式でシードし直すので影響しない。
+        for v in &mut rt.follower {
+            *v = 0.0;
+        }
         tick(
             plan,
             rt,
