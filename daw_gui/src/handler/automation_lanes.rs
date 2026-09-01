@@ -1239,6 +1239,17 @@ impl AppData {
             AutomationTarget::PluginParam { .. } => self
                 .current_plain_value(touched.track_id, &touched.target)
                 .unwrap_or(0.0),
+            // r.md #89: モジュレーター自身のツマミ / 変調 1 本の深さ。値の SSoT は
+            // `common::mod_graph::param_plain` (ラックのツマミもここを引く)。
+            AutomationTarget::ModSourceParam { source_id, param } => {
+                self.mod_param_plain_value(*source_id, *param)
+            }
+            AutomationTarget::ModRoutingDepth { routing_id } => self
+                .song_doc
+                .song()
+                .all_mod_routings()
+                .find(|r| r.id == *routing_id)
+                .map_or(0.0, |r| f64::from(r.depth)),
             AutomationTarget::SongTempo => f64::from(self.song_doc.song().bpm),
             AutomationTarget::SongTimeSigNumerator => f64::from(self.song_doc.song().time_sig.0),
             // Image PiP default: 同 track の最初の image clip の first

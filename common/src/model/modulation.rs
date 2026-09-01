@@ -147,9 +147,8 @@ impl Default for FollowerConfig {
 // ための SSoT。 片方だけ動かすと「ツマミの端」 と「変調の端」 がずれ、 深さ 1.0 の
 // routing がツマミの端に届かない (または届く前に飽和する) 形で静かに壊れる。
 
-/// generator の Free rate (Hz) の下端 / 上端。 対数目盛 (Vital 準拠)。
-pub const MOD_RATE_HZ_MIN: f32 = 0.001;
-pub const MOD_RATE_HZ_MAX: f32 = 128.0;
+// Free rate (Hz) の下端 / 上端は generator 節の `MOD_RATE_HZ_MIN` / `MOD_RATE_HZ_MAX`。
+
 /// フォロワーの attack / release (ms) の下端 / 上端。 対数目盛。
 pub const MOD_FOLLOWER_TIME_MS_MIN: f32 = 0.1;
 pub const MOD_FOLLOWER_TIME_MS_MAX: f32 = 60_000.0;
@@ -245,6 +244,11 @@ pub enum Polarity {
 /// 値キャッシュ)。`AutomationTarget` を内包するため `Copy` ではない。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ModRouting {
+    /// 安定 id (r.md #89)。`0` は "未採番" sentinel、`ensure_ids` が採番。
+    /// [`AutomationTarget::ModRoutingDepth`] が **この 1 本の深さ**を変調先として
+    /// 指すために要る (Bitwig の modulation scaling)。
+    #[serde(default)]
+    pub id: u32,
     /// 変調先 param。lane と独立に param を直接指す。
     pub target: AutomationTarget,
     /// → `Song.mod_sources[*].id`。
@@ -267,24 +271,145 @@ pub struct ModRouting {
 // `common::modulators::generator_scalar`。出力は常に unipolar 0..=1 で、極性は
 // 後段の `ModRouting.polarity` が担う (SSoT、 follower と同じ契約)。
 
-/// 全 generator 共通の rate。 free-running な絶対周波数か、 tempo-synced な音価。
-/// free でも壁時計でなく **song 秒** で評価するので決定論的 (plan §0)。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
-pub enum ModRate {
-    /// transport 非同期の絶対周波数 (Hz)。 phase = `frac(song_secs * hz + phase0)`。
-    Free { hz: f32 },
-    /// 音価同期。 `period_beats = 4.0 * numerator / denominator`
+/// Free (Hz) 指定の下限。`docs/plan_rmd_88_89_cross_modulation.md` Q6 (Vital 準拠)。
+pub const MOD_RATE_HZ_MIN: f32 = 0.001;
+/// Free (Hz) 指定の上限。制御グリッド 750Hz (64 sample @48k) の Nyquist 375Hz を十分下回る。
+pub const MOD_RATE_HZ_MAX: f32 = 128.0;
+
+/// rate をどちらの流儀で読むか。**両方の値は常に保持される** (r.md #88 Q5)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum ModRateMode {
+    /// 音価同期 (`numerator` / `denominator` を使う)。
+    #[default]
+    Sync,
+    /// 絶対周波数 (`hz` を使う)。
+    Free,
+}
+
+/// 全 generator 共通の rate。 tempo-synced な音価と free-running な絶対周波数の
+/// **両方の値を常に保持**し、`mode` でどちらを使うかだけを切り替える (r.md #88 Q5)。
+/// 行き来しても値が消えない (Vital と同じ 2 コントロール構成)。
+///
+/// free でも壁時計でなく **song 秒** で評価するので決定論的。どちらの mode でも
+/// 評価は「瞬時周波数 [`Self::base_hz`] の積分」に統一される
+/// (`docs/plan_rmd_88_89_cross_modulation.md` §2.1)。未変調なら積分は閉形式と
+/// 厳密に一致するので、既存曲の音は 1 サンプルも変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Encode, Decode)]
+pub struct ModRate {
+    pub mode: ModRateMode,
+    /// 音価同期の分子。 `period_beats = 4.0 * numerator / denominator`
     /// (1/4=(1,4)→1拍, 1bar=(1,1)→4拍, 1/8三連=(1,12), 付点1/4=(3,8))。
-    Sync { numerator: u32, denominator: u32 },
+    pub numerator: u32,
+    pub denominator: u32,
+    /// Free の絶対周波数 (Hz)。[`MOD_RATE_HZ_MIN`]..=[`MOD_RATE_HZ_MAX`]。
+    pub hz: f32,
 }
 
 impl Default for ModRate {
     fn default() -> Self {
-        // 1/4 note。
-        ModRate::Sync {
+        // 1/4 note + 1Hz。
+        Self {
+            mode: ModRateMode::Sync,
             numerator: 1,
             denominator: 4,
+            hz: 1.0,
         }
+    }
+}
+
+impl ModRate {
+    /// 音価同期の 1 周期 (拍)。`mode` に依らず `numerator`/`denominator` から決まる。
+    #[must_use]
+    pub fn period_beats(&self) -> f64 {
+        let den = f64::from(self.denominator.max(1));
+        (4.0 * f64::from(self.numerator) / den).max(f64::MIN_POSITIVE)
+    }
+
+    /// **変調前の瞬時周波数 (Hz)**。Sync は `bpm / (60 · period_beats)` で tempo に追従し、
+    /// Free は `hz` そのもの。位相はこの値の積分で求める (§2.1)。
+    #[must_use]
+    pub fn base_hz(&self, bpm: f64) -> f64 {
+        match self.mode {
+            ModRateMode::Sync => bpm / (60.0 * self.period_beats()),
+            ModRateMode::Free => f64::from(self.hz.clamp(MOD_RATE_HZ_MIN, MOD_RATE_HZ_MAX)),
+        }
+    }
+
+    /// 音価を差し替える (mode は変えない)。
+    pub fn with_division(mut self, numerator: u32, denominator: u32) -> Self {
+        self.numerator = numerator;
+        self.denominator = denominator.max(1);
+        self
+    }
+}
+
+// ---- 旧形式 (externally-tagged enum) からの migration -------------------
+//
+// v37 以前の .daw は `ModRate` を enum で保存していた:
+//   {"Sync":{"numerator":1,"denominator":4}} / {"Free":{"hz":1.0}}
+// 新形式は struct ({"mode":"Sync","numerator":1,"denominator":4,"hz":1.0})。
+// 旧 2 形式と新形式の **3 つを受ける**。旧 Sync は hz を既定 1.0 で、旧 Free は
+// 音価を既定 1/4 で埋める (欠けている側の値を既定で補完するだけで、使う側の値は不変)。
+
+#[derive(Deserialize)]
+struct LegacySyncBody {
+    numerator: u32,
+    denominator: u32,
+}
+
+#[derive(Deserialize)]
+struct LegacyFreeBody {
+    hz: f32,
+}
+
+/// **`serde(untagged)` は使わない。** untagged の判別は field 集合の pairwise 非交差に
+/// 依存するので、`ModRate` に field を 1 つ足しただけで旧形式が silent に misparse
+/// されうる (`scripts/arch_lint.sh` の UNTAGGED チェックが禁じているのはこれ)。
+/// キーを直接見る visitor なら、新旧どちらの形も **明示的に**判別できる。
+struct ModRateVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ModRateVisitor {
+    type Value = ModRate;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ModRate (struct 形式、または旧 enum の {\"Sync\":..} / {\"Free\":..})")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<ModRate, A::Error> {
+        let mut out = ModRate::default();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "mode" => out.mode = map.next_value()?,
+                "numerator" => out.numerator = map.next_value()?,
+                "denominator" => out.denominator = map.next_value()?,
+                "hz" => out.hz = map.next_value()?,
+                // 旧 externally-tagged enum。欠けている側は `default()` のまま。
+                "Sync" => {
+                    let b: LegacySyncBody = map.next_value()?;
+                    out.mode = ModRateMode::Sync;
+                    out.numerator = b.numerator;
+                    out.denominator = b.denominator;
+                }
+                "Free" => {
+                    let b: LegacyFreeBody = map.next_value()?;
+                    out.mode = ModRateMode::Free;
+                    out.hz = b.hz;
+                }
+                _ => {
+                    let _: serde::de::IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+        out.denominator = out.denominator.max(1);
+        Ok(out)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModRate {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_map(ModRateVisitor)
     }
 }
 
@@ -464,6 +589,106 @@ impl Default for StepsConfig {
     }
 }
 
+/// **モジュレーター自身のツマミ** (r.md #89 クロスモジュレーション)。
+/// [`AutomationTarget::ModSourceParam`] が `ModSource::id` と組で指す。
+///
+/// 「名前の付いたツマミ」だけを対象にする (`docs/plan_rmd_88_89_cross_modulation.md` Q3)。
+/// MSEG の 1 点 / Steps の 1 段は対象外 — 参照実装 (Bitwig / Vital / Surge) も同じ線引きで、
+/// 対象にすると新しい永続 positional 参照が要る (不変条件 1)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum ModParam {
+    /// 実効周波数。log2 領域で正規化する ([`crate::automation::plain_to_norm`])。
+    /// LFO / Random / MSEG / Steps 共通。Sync mode でも効き、音価から**連続に**外れる (Q1)。
+    Rate,
+    /// LFO の開始位相 φ (0..=1)。
+    LfoPhase,
+    /// LFO Pulse の duty (0..=1)。shape が `Pulse` でないときは無視される。
+    LfoPulseWidth,
+    /// Random の Stepped↔Smoothed モーフ (0..=1)。
+    RandomSmooth,
+    /// Steps の slew (0..=1)。
+    StepsSlew,
+    /// フォロワー attack (ms)。
+    FollowerAttack,
+    /// フォロワー release (ms)。
+    FollowerRelease,
+    /// フォロワーの検出前ゲイン。
+    FollowerGain,
+    /// 帯域フィルタ HP cutoff (Hz)。`band_filter` が `None` のときは無視される。
+    FollowerHpHz,
+    /// 帯域フィルタ LP cutoff (Hz)。同上。
+    FollowerLpHz,
+}
+
+impl ModParam {
+    /// 全 variant (RT の固定長配列を張るための SSoT。順序 = 配列の添字)。
+    pub const ALL: [ModParam; 10] = [
+        Self::Rate,
+        Self::LfoPhase,
+        Self::LfoPulseWidth,
+        Self::RandomSmooth,
+        Self::StepsSlew,
+        Self::FollowerAttack,
+        Self::FollowerRelease,
+        Self::FollowerGain,
+        Self::FollowerHpHz,
+        Self::FollowerLpHz,
+    ];
+
+    /// [`Self::ALL`] 内の添字。固定長配列のキーに使う。
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Rate => 0,
+            Self::LfoPhase => 1,
+            Self::LfoPulseWidth => 2,
+            Self::RandomSmooth => 3,
+            Self::StepsSlew => 4,
+            Self::FollowerAttack => 5,
+            Self::FollowerRelease => 6,
+            Self::FollowerGain => 7,
+            Self::FollowerHpHz => 8,
+            Self::FollowerLpHz => 9,
+        }
+    }
+
+    /// UI ラベル (ラック / レーン名で共有する SSoT)。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rate => "速さ",
+            Self::LfoPhase => "位相",
+            Self::LfoPulseWidth => "幅",
+            Self::RandomSmooth => "なめらかさ",
+            Self::StepsSlew => "スルー",
+            Self::FollowerAttack => "Attack",
+            Self::FollowerRelease => "Release",
+            Self::FollowerGain => "Gain",
+            Self::FollowerHpHz => "HP",
+            Self::FollowerLpHz => "LP",
+        }
+    }
+
+    /// この param が `kind` に存在するか。存在しない組み合わせの routing / lane は
+    /// 評価時に無視され、UI にも出さない (掃除の対象ではない — 種別を戻せば復活する)。
+    #[must_use]
+    pub fn exists_on(self, kind: &ModSourceKind) -> bool {
+        match self {
+            Self::Rate => kind.rate().is_some(),
+            Self::LfoPhase | Self::LfoPulseWidth => matches!(kind, ModSourceKind::Lfo(_)),
+            Self::RandomSmooth => matches!(kind, ModSourceKind::Random(_)),
+            Self::StepsSlew => matches!(kind, ModSourceKind::Steps(_)),
+            Self::FollowerAttack
+            | Self::FollowerRelease
+            | Self::FollowerGain
+            | Self::FollowerHpHz
+            | Self::FollowerLpHz => matches!(kind, ModSourceKind::EnvelopeFollower { .. }),
+        }
+    }
+}
+
 /// `ModSource` の変調器種別 (plan §1)。 envelope follower は既存を内包し、
 /// generator 4 種を追加。 `Vec` を持つため `Copy` 不可 (`ModRouting` と同じ)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -489,6 +714,30 @@ impl Default for ModSourceKind {
 }
 
 impl ModSourceKind {
+    /// generator 共通の rate (follower は `None`)。
+    #[must_use]
+    pub fn rate(&self) -> Option<ModRate> {
+        match self {
+            ModSourceKind::Lfo(c) => Some(c.rate),
+            ModSourceKind::Random(c) => Some(c.rate),
+            ModSourceKind::Mseg(c) => Some(c.rate),
+            ModSourceKind::Steps(c) => Some(c.rate),
+            ModSourceKind::EnvelopeFollower { .. } => None,
+        }
+    }
+
+    /// generator 共通の retrigger (follower は `None`)。
+    #[must_use]
+    pub fn retrigger(&self) -> Option<RetriggerMode> {
+        match self {
+            ModSourceKind::Lfo(c) => Some(c.retrigger),
+            ModSourceKind::Random(c) => Some(c.retrigger),
+            ModSourceKind::Mseg(c) => Some(c.retrigger),
+            ModSourceKind::Steps(c) => Some(c.retrigger),
+            ModSourceKind::EnvelopeFollower { .. } => None,
+        }
+    }
+
     /// generator 共通の rate (follower は `None`)。
     pub fn rate_mut(&mut self) -> Option<&mut ModRate> {
         match self {

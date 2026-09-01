@@ -54,6 +54,10 @@ pub struct ModRouting {
 - `target: AutomationTarget` は既存 enum（TrackBuiltin / PluginParam / ImageBuiltin /
   TextBuiltin / GroupTransform / SongTempo …）。**lane が無くても target を直接指せる**。
 - 機能未リリース → 旧 test project の `AutomationLane.mod_routings` は load 時に無視（migration 不要）。
+- **r.md #89 で追加**: `ModRouting` に安定 `id` が付き、`AutomationTarget` に
+  `ModSourceParam { source_id, param }` / `ModRoutingDepth { routing_id }` が加わった
+  （モジュレーター自身のツマミと、変調 1 本の深さが変調先になる）。正本は
+  [plan_rmd_88_89_cross_modulation.md](plan_rmd_88_89_cross_modulation.md)。
 
 ## 3. 実効値の出し方（target 種別で分岐）
 
