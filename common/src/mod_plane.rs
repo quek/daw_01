@@ -435,4 +435,22 @@ impl<'a> ModTickPlaneRef<'a> {
         let vb = self.row(b).scalar(source_id);
         va + (vb - va) * t
     }
+
+    /// `frame` における `routing_id` の実効深さ (r.md #89 Q9)。深さが動かない
+    /// 変調は `None` = 呼び出し側が `ModRouting::depth` を使う。
+    #[must_use]
+    #[inline]
+    pub fn depth_at_frame(&self, routing_id: u32, frame: u32) -> Option<f32> {
+        let rows = self.rows();
+        if rows == 0 {
+            return None;
+        }
+        let (a, b, t) = self.segment(frame);
+        let va = self.row(a.min(rows - 1)).depth(routing_id)?;
+        if b >= rows {
+            return Some(va);
+        }
+        let vb = self.row(b).depth(routing_id).unwrap_or(va);
+        Some(va + (vb - va) * t)
+    }
 }

@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use common::automation::{apply_modulation, modulation_offset_norm};
+use common::automation::apply_modulation_with;
 use common::mod_plane::ModTickPlaneRef;
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
@@ -124,9 +124,14 @@ pub fn fill_track_param_ramps(
             };
             #[allow(clippy::cast_possible_truncation)]
             let f = i as u32;
-            *slot = apply_modulation(&target, base, &track.mod_routings, |id| {
-                mod_plane.scalar_at_frame(id, f)
-            }) as f32;
+            // r.md #89 Q9: 深さ自体が動く変調も刻みごとに解決する。
+            *slot = apply_modulation_with(
+                &target,
+                base,
+                &track.mod_routings,
+                |id| mod_plane.scalar_at_frame(id, f),
+                |r| mod_plane.depth_at_frame(r.id, f).unwrap_or(r.depth),
+            ) as f32;
         }
     };
     fill_builtin(
@@ -262,6 +267,23 @@ pub fn fill_pd_param_events(
     // 送る。**lane の有無に関わらず** (= lane-free モジュレーション)。plugin_host が
     // per-format に CLAP `param_mod` / 合成へ変換する。follower が 0 に戻った時も
     // offset 0 を送って mod を解除するため、毎バッファ無条件に emit する。
+    // r.md #89: **溢れさせない**。`param_mods` はリングなので、満杯だと古い側が
+    // 落ちる。積む順は param ごと (外) × 刻み (内) なので、落ちるのは「先頭 param の
+    // 全刻み」= その param に 1 件も届かず、前 buffer の offset が解除されないまま
+    // 居座る (毎 buffer 同じ順で溢れるので永久に戻らない)。件数が枠を超えるときは
+    // **刻みを間引いて解像度を落とす** — どの param にも必ず最後の刻みが届く。
+    let n_ticks = mod_plane.starts(frames).count().max(1);
+    let n_params = mod_routings
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            matches!(&r.target, AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id)
+                && !mod_routings[..*i].iter().any(|p| p.target == r.target)
+        })
+        .count()
+        .max(1);
+    let budget = (common::process_data::MAX_PARAM_MODS / n_params).max(1);
+    let stride = n_ticks.div_ceil(budget).max(1);
     for (i, r) in mod_routings.iter().enumerate() {
         let AutomationTarget::PluginParam { device_id: d, param_id, .. } = &r.target else {
             continue;
@@ -279,10 +301,19 @@ pub fn fill_pd_param_events(
         // 位置が違う。値が変わらない刻みは縮退させる (automation 側の
         // `push_param` と同じ idiom — `param_mods` の枠を無駄に食わない)。
         let mut last = f64::NAN;
-        for f in mod_plane.starts(frames) {
-            let offset = f64::from(modulation_offset_norm(&r.target, mod_routings, |id| {
-                mod_plane.scalar_at_frame(id, f)
-            }));
+        for (t, f) in mod_plane.starts(frames).enumerate() {
+            // 間引くのは中間の刻みだけ。**最後の刻みは必ず送る** (解除されない
+            // offset が居座らないように)。
+            if t % stride != 0 && t + 1 != n_ticks {
+                continue;
+            }
+            // r.md #89 Q9: 深さ自体が動く変調は面が持つ実効値を使う。
+            let offset = f64::from(common::automation::modulation_offset_norm_with(
+                &r.target,
+                mod_routings,
+                |id| mod_plane.scalar_at_frame(id, f),
+                |rr| mod_plane.depth_at_frame(rr.id, f).unwrap_or(rr.depth),
+            ));
             if last.is_nan() || (offset - last).abs() > 1e-6 {
                 pd.push_param_mod(f, *param_id, offset);
                 last = offset;

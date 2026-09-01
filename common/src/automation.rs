@@ -524,7 +524,18 @@ pub fn apply_modulation(
     routings: &[ModRouting],
     scalar: impl Fn(u32) -> f32,
 ) -> f64 {
-    let offset = modulation_offset_norm_with(target, routings, scalar, |r| r.depth);
+    apply_modulation_with(target, base, routings, scalar, |r| r.depth)
+}
+
+/// [`apply_modulation`] の **深さも解決する**版 (r.md #89 Q9)。
+pub fn apply_modulation_with(
+    target: &AutomationTarget,
+    base: f64,
+    routings: &[ModRouting],
+    scalar: impl Fn(u32) -> f32,
+    depth: impl Fn(&ModRouting) -> f32,
+) -> f64 {
+    let offset = modulation_offset_norm_with(target, routings, scalar, depth);
     if offset == 0.0 && !routings.iter().any(|r| &r.target == target) {
         return base;
     }
