@@ -3,6 +3,9 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
+use common::model::{
+    MOD_BAND_HZ_MAX, MOD_BAND_HZ_MIN, MOD_FOLLOWER_GAIN_MAX, MOD_FOLLOWER_GAIN_MIN,
+};
 
 impl AppData {
     // ---- docs/plan_modulation.md §9: modulation source / routing CRUD ----
@@ -372,6 +375,39 @@ impl AppData {
 
     pub(crate) fn set_mod_source_release(&mut self, id: u32, ms: f32) {
         self.edit_mod_source_follower(id, |_, follower| follower.release_ms = ms.max(0.0));
+    }
+
+    /// r.md #88: 検出前ゲイン。 attack/release と同じく係数は recompile で bake される
+    /// (`daw_audio/src/graph/follower.rs` の `from_config`)。
+    pub(crate) fn set_mod_source_gain(&mut self, id: u32, gain: f32) {
+        self.edit_mod_source_follower(id, |_, follower| {
+            follower.gain = gain.clamp(MOD_FOLLOWER_GAIN_MIN, MOD_FOLLOWER_GAIN_MAX);
+        });
+    }
+
+    /// r.md #88: 検出モード (Peak / RMS)。
+    pub(crate) fn set_mod_source_mode(&mut self, id: u32, mode: common::model::FollowerMode) {
+        self.edit_mod_source_follower(id, |_, follower| follower.mode = mode);
+    }
+
+    /// r.md #88: 検出前の全波整流。
+    pub(crate) fn set_mod_source_rectify(&mut self, id: u32, rectify: bool) {
+        self.edit_mod_source_follower(id, |_, follower| follower.rectify = rectify);
+    }
+
+    /// r.md #88: 検出前の帯域制限 (`None` で全帯域)。 `hp <= lp` に整えてから入れる —
+    /// 逆転した帯域は一次フィルタ 2 段が互いを打ち消して**無音を検出し続ける**ので、
+    /// 「効かない」 が値からは読めない状態になる。
+    pub(crate) fn set_mod_source_band(
+        &mut self,
+        id: u32,
+        band: Option<common::model::BandFilter>,
+    ) {
+        let band = band.map(|b| common::model::BandFilter {
+            hp_hz: b.hp_hz.clamp(MOD_BAND_HZ_MIN, MOD_BAND_HZ_MAX),
+            lp_hz: b.lp_hz.clamp(b.hp_hz.clamp(MOD_BAND_HZ_MIN, MOD_BAND_HZ_MAX), MOD_BAND_HZ_MAX),
+        });
+        self.edit_mod_source_follower(id, |_, follower| follower.band_filter = band);
     }
 
     pub(crate) fn set_mod_follower_scrubbing(&mut self, active: bool) {

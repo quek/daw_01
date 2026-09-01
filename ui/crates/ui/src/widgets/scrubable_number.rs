@@ -46,6 +46,14 @@ pub enum ScrubableNumberFormat {
     Integer,
     /// 小数 N 桁 (例: `Decimal(1)` で `"120.0"`、 `Decimal(3)` で `"120.345"`)。
     Decimal(u8),
+    /// **有効数字 N 桁** で、 末尾の 0 と小数点を落とす (`Significant { digits: 3 }` で
+    /// `0.001` → `"0.001"`、 `1.234` → `"1.23"`、 `12.34` → `"12.3"`、 `128.0` → `"128"`)。
+    ///
+    /// [`ScrubCurve::Log`] の欄のための書式。 下端と上端が何桁も離れる range
+    /// (Hz の `0.001..=128`、 ms の `0.1..=60000`) を固定小数で描くと、 上端に合わせれば
+    /// 下端が `"0.00"` に潰れ、 下端に合わせれば上端が欄からはみ出す。 有効数字なら
+    /// **どこを掴んでも同じ桁数の情報**が出て、 幅もほぼ一定に収まる。
+    Significant { digits: u8 },
     /// 1-based **小節.拍** 表記。 内部値は 4 分音符 beat、 `beats_per_bar` は 1 小節
     /// の beat 数 (4/4 → 4)。 表示は末尾の不要な 0 / 小数点を落とす (例 `8.0` beat →
     /// `"3.1"`、 `9.5` beat → `"3.2.5"`)。 入力は最初の `.` で小節と拍を分割し、
@@ -91,6 +99,62 @@ impl ScrubableNumberFormat {
     }
 }
 
+/// ドラッグと帯描画の **値目盛**。
+///
+/// `Linear` は値そのものの空間で動く (= [`ScrubableNumberStyle::sensitivity`] は
+/// units_per_pixel)。 `Log` は **正規化領域** — `range` を対数で `0..=1` に写した空間 —
+/// で動くので、 `sensitivity` は「1px あたりの正規化量」 になり、 何桁またぐ range でも
+/// `1.0 / sensitivity` px で全域を舐められる (Hz / ms / gain のように下端と上端が 5 桁
+/// 離れる欄は、 線形だと全域に数十万 px のドラッグが要る)。
+///
+/// `Log` は `range` が `Some((min, max))` かつ **`min > 0` かつ `max > min`** のときだけ
+/// 効く。 満たさない range (`None` / 0 以下 / 反転 / 非有限) では **`Linear` に縮退**する
+/// — 対数写像が定義できない range を渡された widget が NaN 座標を描くより、 従来挙動へ
+/// 落ちるほうが安全 (`clamp_opt` と同じ姿勢)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrubCurve {
+    /// 値そのものの空間で等間隔 (既定)。
+    #[default]
+    Linear,
+    /// 対数目盛 (`range` の下端 > 0 が前提)。
+    Log,
+}
+
+/// `range` を対数で `0..=1` に写す写像。 [`ScrubCurve::Log`] かつ range が
+/// 正で単調のときだけ `Some`。 `None` = 線形として扱う。
+#[derive(Debug, Clone, Copy)]
+struct LogMap {
+    ln_min: f64,
+    ln_span: f64,
+}
+
+impl LogMap {
+    /// `curve` / `range` から写像を作る。 対数化できない組み合わせは `None`。
+    fn new(curve: ScrubCurve, range: Option<(f64, f64)>) -> Option<Self> {
+        if !matches!(curve, ScrubCurve::Log) {
+            return None;
+        }
+        let (min, max) = range?;
+        if !(min.is_finite() && max.is_finite() && min > 0.0 && max > min) {
+            return None;
+        }
+        Some(Self { ln_min: min.ln(), ln_span: max.ln() - min.ln() })
+    }
+
+    /// plain 値 → 正規化 `0..=1`。 非有限 / 0 以下は下端に丸める (NaN を外へ出さない)。
+    fn to_norm(self, v: f64) -> f64 {
+        if !v.is_finite() || v <= 0.0 {
+            return 0.0;
+        }
+        ((v.ln() - self.ln_min) / self.ln_span).clamp(0.0, 1.0)
+    }
+
+    /// 正規化 `0..=1` → plain 値。
+    fn to_plain(self, n: f64) -> f64 {
+        (self.ln_min + n.clamp(0.0, 1.0) * self.ln_span).exp()
+    }
+}
+
 /// `scrubable_number_at` のスタイル + sensitivity + range。
 #[derive(Debug, Clone, Copy)]
 pub struct ScrubableNumberStyle {
@@ -121,6 +185,19 @@ pub struct ScrubableNumberStyle {
     /// Optional 値範囲 (clamp 用、 widget が `on_change` 呼び出し前に clamp する)。 `None` で
     /// clamp 無し (= caller 責任で on_change 受信側 / parse 時に clamp)。 daw_01 #035 Q3 = yes 確定。
     pub range: Option<(f64, f64)>,
+    /// ドラッグと帯描画の値目盛 ([`ScrubCurve`])。 既定 `Linear`。
+    ///
+    /// `Log` にすると **ドラッグ / modulation 帯 / live tick の位置がすべて**同じ対数軸を
+    /// 通る (片方だけ対数にすると、 掴んだ場所と帯の伸び方が食い違う)。
+    pub curve: ScrubCurve,
+    /// 数値の後ろに描く単位 (`"Hz"` / `"ms"` / `"dB"`)。 空文字列で描かない。
+    ///
+    /// 数値と同じインクの薄い版で描く (DAW 慣習: 単位は数値より弱い)。 **text input
+    /// モードでは出さない** — 編集中の文字列は `format` が生む素の数値表記で、 そこに
+    /// 単位が混ざると「見えている文字列 == 打ち直せる文字列」 が崩れる。 逆に確定時の
+    /// parse は末尾の単位を大文字小文字を無視して剥がすので、 表示のまま `"12.5 Hz"` と
+    /// 打っても通る (`SignedLabeled` の WYSIWYG と同じ姿勢)。
+    pub unit: &'static str,
 }
 
 impl ScrubableNumberStyle {
@@ -144,6 +221,8 @@ impl ScrubableNumberStyle {
             pad_x: 4.0,
             sensitivity: 0.5,
             range: None,
+            curve: ScrubCurve::Linear,
+            unit: "",
         }
     }
 }
@@ -286,6 +365,7 @@ fn format_value(value: f64, format: ScrubableNumberFormat) -> String {
             // `n` は表示桁数 (例: 1 で "120.0")。
             format!("{:.*}", usize::from(n), value)
         }
+        ScrubableNumberFormat::Significant { digits } => format_significant(value, digits),
         ScrubableNumberFormat::BarBeat { beats_per_bar } => format_bar_beat(value, beats_per_bar),
         ScrubableNumberFormat::SignedLabeled { neg, pos, center, scale } => {
             format_signed_labeled(value, neg, pos, center, scale)
@@ -298,12 +378,62 @@ fn parse_value(text: &str, format: ScrubableNumberFormat) -> Option<f64> {
     let trimmed = text.trim();
     match format {
         ScrubableNumberFormat::Integer => trimmed.parse::<i64>().ok().map(|v| v as f64),
-        ScrubableNumberFormat::Decimal(_) => trimmed.parse::<f64>().ok(),
+        ScrubableNumberFormat::Decimal(_) | ScrubableNumberFormat::Significant { .. } => {
+            trimmed.parse::<f64>().ok()
+        }
         ScrubableNumberFormat::BarBeat { beats_per_bar } => parse_bar_beat(trimmed, beats_per_bar),
         ScrubableNumberFormat::SignedLabeled { neg, pos, center, scale } => {
             parse_signed_labeled(trimmed, neg, pos, center, scale)
         }
     }
+}
+
+/// 確定テキストを parse する前に **末尾の単位表記を剥がす** ([`ScrubableNumberStyle::unit`])。
+/// 大文字小文字は無視 (`"12.5 hz"` も通る)。 `unit` が空なら [`parse_value`] と同一。
+///
+/// 表示は `"12.5 Hz"`、 編集の種は `"12.5"` (単位抜き) なので、 単位を打たない限りここは
+/// 素通りする。 剥がすのは「表示のまま打ち直した」 入力を落とさないため
+/// (`SignedLabeled` が `"L50"` を受けるのと同じ WYSIWYG の姿勢)。
+fn parse_with_unit(text: &str, format: ScrubableNumberFormat, unit: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    if unit.is_empty() {
+        return parse_value(trimmed, format);
+    }
+    // ASCII 小文字化は byte 長を変えないので、 一致したぶんの byte 数で切っても
+    // char 境界を割らない (非 ASCII 単位はそのまま byte 一致で判定される)。
+    let stripped = if trimmed.to_ascii_lowercase().ends_with(&unit.to_ascii_lowercase()) {
+        trimmed[..trimmed.len() - unit.len()].trim_end()
+    } else {
+        trimmed
+    };
+    parse_value(stripped, format)
+}
+
+/// 有効数字 `digits` 桁で文字列化し、 末尾の 0 と小数点を落とす
+/// ([`ScrubableNumberFormat::Significant`])。 非有限値は `"0"`。
+fn format_significant(value: f64, digits: u8) -> String {
+    if !value.is_finite() {
+        return "0".to_string();
+    }
+    let mag = value.abs();
+    // 有効数字 `digits` 桁に必要な小数点以下桁数 = digits - 1 - floor(log10|v|)。
+    // 0 は指数が取れないので小数 0 桁、 極小値は 9 桁で頭打ち (欄に入らない桁は無意味)。
+    let decimals = if mag > 0.0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let exp = mag.log10().floor() as i32;
+        #[allow(clippy::cast_sign_loss)]
+        let d = (i32::from(digits.max(1)) - 1 - exp).clamp(0, 9) as usize;
+        d
+    } else {
+        0
+    };
+    let s = format!("{value:.decimals$}");
+    if !s.contains('.') {
+        return s;
+    }
+    let t = s.trim_end_matches('0').trim_end_matches('.');
+    // "-0.000" が "-" に潰れる / 空になる退化を潰す。
+    if t.is_empty() || t == "-" { "0".to_string() } else { t.to_string() }
 }
 
 /// 零点対称の符号付き値 → `"L50"` / `"C"` / `"R100"` 形式。 数字は `|value| × scale` の
@@ -474,13 +604,16 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let depth_sens = mod_edit
             .and_then(|e| e.depth_sensitivity)
             .unwrap_or(style.sensitivity);
+        // 対数目盛の写像 (`Linear` / 対数化できない range では `None` = 従来の線形挙動)。
+        // base scrub / depth scrub / overlay の `value_to_x` が **同じ 1 本**を通る。
+        let log_map = LogMap::new(style.curve, style.range);
 
         // ---- press / drag / release 処理 (knob と同 pattern + drag distance 計測) ----
         let mut reset_fired = false;
         let mut release_initial_value: Option<f64> = None;
         let mut short_click_release = false;
-        // depth gesture の release frame で確定する最終 depth (= pointer の最終位置から再計算)。
-        let mut release_depth: Option<f64> = None;
+        // depth gesture の release frame の pointer 位置 (= 最終 depth をブロックの外で再計算する)。
+        let mut release_anchor: Option<(DragAnchor, f32, f32)> = None;
         let (drag_anchor, drag_distance, was_editing) = {
             let state: &mut ScrubableNumberState = self.widget_state(wid);
 
@@ -562,8 +695,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                     if dist >= DRAG_THRESHOLD_PX
                         && let (Some(anchor), Some((px, py))) = (anchor_opt, pointer.pos)
                     {
-                        release_depth =
-                            Some(clamp_opt(raw_drag_value(anchor, px, py, depth_sens), depth_range));
+                        release_anchor = Some((anchor, px, py));
                     }
                 } else {
                     // base scrub のみ release で undoable wrap するため release_initial_value を残し、
@@ -590,10 +722,16 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             && !anchor.depth_drag
             && drag_distance >= DRAG_THRESHOLD_PX
         {
-            clamp_opt(raw_drag_value(anchor, px, py, style.sensitivity), style.range)
+            clamp_opt(base_from_drag(anchor, px, py, style.sensitivity, log_map), style.range)
         } else {
             value
         };
+
+        // depth gesture の release 最終値。 per-frame 発火は anchor が None になる release
+        // frame で止まるので、 pointer の最終位置からここで 1 度だけ確定させる (daw_01 #107)。
+        let release_depth = release_anchor.map(|(a, px, py)| {
+            clamp_opt(depth_from_drag(a, px, py, depth_sens, value, log_map), depth_range)
+        });
 
         // depth 値 (= modulation 帯 + on_mod_change): depth-edit gesture drag 中のみ更新。
         // base と同じく閾値 gate (release 側の `dist >= DRAG_THRESHOLD_PX` と対)。
@@ -601,7 +739,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             && anchor.depth_drag
             && drag_distance >= DRAG_THRESHOLD_PX
         {
-            clamp_opt(raw_drag_value(anchor, px, py, depth_sens), depth_range)
+            clamp_opt(depth_from_drag(anchor, px, py, depth_sens, value, log_map), depth_range)
         } else {
             current_depth
         };
@@ -685,7 +823,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             // 確定 (Enter / 外 click による blur) の text を parse + clamp + on_change 発火。
             if (inner_resp.committed || inner_resp.blurred)
                 && let Some(text) = &inner_resp.committed_text
-                && let Some(parsed) = parse_value(text, format)
+                && let Some(parsed) = parse_with_unit(text, format, style.unit)
             {
                 // clamp_opt と同じ防御 (反転 / 非有限 range で panic しない)。
                 let final_value = clamp_opt(parsed, style.range);
@@ -724,6 +862,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 Some(ph) => ph.to_string(),
                 None => format_value(displayed_value, format),
             };
+            // 単位は **数値のとき** だけ。 placeholder (`"—"` = 値が割れている) の後ろに
+            // 単位を出すと「割れているのに 1 つの量が確定している」 という嘘になる。
+            let unit = if show_placeholder.is_some() { "" } else { style.unit };
             // input_hash で cache: 同じ表示値 / 同じ rect / 同じ bg なら再描画 skip。
             let input_hash = hash_inputs((
                 b"scrubable_number",
@@ -741,10 +882,13 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 // "-0.50" と `SignedLabeled` の "L50" は別物)、 (b) placeholder ⇔ 数値の切替も
                 // 取りこぼす。 text は両方を包含するので placeholder 用の fold は不要。
                 text.as_str(),
+                // 単位も描画文字列の一部。 fold しないと `unit` だけ差し替えたとき
+                // cache HIT で旧単位が残る (placeholder ⇔ 数値の切替と同じ理屈)。
+                unit,
             ));
             let style_copy = *style;
             self.with_widget_node(wid, input_hash, |ui| {
-                draw_scrubable_number(ui, rect, &text, bg_fill, &style_copy);
+                draw_scrubable_number(ui, rect, &text, unit, bg_fill, &style_copy);
             });
 
             // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
@@ -781,6 +925,7 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
     ui: &mut Ui<'_, M>,
     rect: Rect,
     text: &str,
+    unit: &str,
     bg_fill: Color,
     style: &ScrubableNumberStyle,
 ) {
@@ -819,6 +964,25 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
         clip_rect: Some(rect),
         ..GlyphArea::default()
     });
+
+    // 単位 (`"Hz"` / `"ms"`) は数値の実 advance の右へ、 **同じインクの薄い版** で描く。
+    // 数値と別 run にするのは、 (a) 単位だけ弱めて数字を読みやすくする DAW 慣習と、
+    // (b) 数値文字列に混ぜると text input の種と食い違うため。 `clip_rect` が rect なので
+    // 狭い欄では単位から先に切れる (= 数値は必ず読める)。
+    if !unit.is_empty() {
+        let gap = style.font_size * 0.25;
+        let ux = tx + ui.measure_text(text, style.font_size) + gap;
+        ui.push_text(GlyphArea {
+            text: unit.into(),
+            left: ux,
+            top: ty,
+            font_size: style.font_size,
+            line_height: line_h,
+            color: text_color.with_alpha(text_color.a * 0.62),
+            clip_rect: Some(rect),
+            ..GlyphArea::default()
+        });
+    }
 }
 
 /// anchor + 現 pointer から raw drag 値を出す (base / depth 共用)。 **縦横両方向** で値変化させる
@@ -835,6 +999,46 @@ fn raw_drag_value(anchor: DragAnchor, px: f32, py: f32, sensitivity: f32) -> f64
     // 右 (px > anchor_x) で増加、 上 (py < anchor_y) で増加 (= DAW 慣習)。
     let delta_px = (px - anchor.pointer_x) - (py - anchor.pointer_y);
     anchor.value + f64::from(delta_px) * f64::from(sensitivity) * f64::from(scale)
+}
+
+/// base scrub の drag 値を **カーブ込み** で出す。
+///
+/// `log_map` が `None` (= [`ScrubCurve::Linear`]、 または対数化できない range) なら
+/// [`raw_drag_value`] そのもの — 既存の欄は 1bit も変わらない。 `Some` なら anchor 値を
+/// 正規化領域へ写し、 そこで [`raw_drag_value`] と同じ px 合成 / Ctrl fine を効かせてから
+/// plain へ戻す。 よって **軸合成 (#108) と Ctrl fine は両カーブで完全に共通**。
+fn base_from_drag(
+    anchor: DragAnchor,
+    px: f32,
+    py: f32,
+    sensitivity: f32,
+    log_map: Option<LogMap>,
+) -> f64 {
+    let Some(map) = log_map else {
+        return raw_drag_value(anchor, px, py, sensitivity);
+    };
+    let norm_anchor = DragAnchor { value: map.to_norm(anchor.value), ..anchor };
+    map.to_plain(raw_drag_value(norm_anchor, px, py, sensitivity))
+}
+
+/// depth scrub の drag 値 (plain 単位の符号付き到達量) を **カーブ込み** で出す。
+///
+/// `Log` では depth そのものでなく **到達点 `base + depth`** を正規化領域で動かす。
+/// 帯 / live tick を描く `value_to_x` が同じ対数軸なので、 こうして初めて「掴んだ帯の端が
+/// 指に付いてくる」。 depth を線形に動かすと、 対数軸で描いた帯だけが指から離れる。
+fn depth_from_drag(
+    anchor: DragAnchor,
+    px: f32,
+    py: f32,
+    sensitivity: f32,
+    base: f64,
+    log_map: Option<LogMap>,
+) -> f64 {
+    let Some(map) = log_map else {
+        return raw_drag_value(anchor, px, py, sensitivity);
+    };
+    let norm_anchor = DragAnchor { value: map.to_norm(base + anchor.value), ..anchor };
+    map.to_plain(raw_drag_value(norm_anchor, px, py, sensitivity)) - base
 }
 
 /// `Some(range)` かつ `min <= max` のとき clamp、 それ以外 (`None` / 反転 bound / 非有限 bound) は
@@ -884,14 +1088,21 @@ fn draw_modulation_overlay<M: ?Sized + 'static>(
     }
     let inset = 2.0_f32;
     let track_w = (rect.w - inset * 2.0).max(0.0);
+    // 帯 / tick は **ドラッグと同じ目盛** で置く。 対数欄で写像を分けると、 掴んだ位置と
+    // 帯の伸び方が食い違う (`Log` の詳細は [`ScrubCurve`])。
+    let log_map = LogMap::new(style.curve, style.range);
     let value_to_x = |v: f64| -> f32 {
         // 非有限 (NaN/Inf) は track 左端に丸めて renderer に NaN 座標を渡さない
         // (caller bug 防御、 format_value と同じ姿勢)。
         if !v.is_finite() {
             return rect.x + inset;
         }
+        let t = match log_map {
+            Some(m) => m.to_norm(v),
+            None => ((v - min) / (max - min)).clamp(0.0, 1.0),
+        };
         #[allow(clippy::cast_possible_truncation)]
-        let t = (((v - min) / (max - min)) as f32).clamp(0.0, 1.0);
+        let t = t as f32;
         rect.x + inset + t * track_w
     };
 
@@ -2018,5 +2229,161 @@ mod tests {
         );
         for e in edits { e.apply(&mut model); }
         assert!((model.depth - 1.0).abs() < 1e-5, "Ctrl 横右 depth = +1.0 (got {})", model.depth);
+    }
+
+    // ---- ScrubCurve::Log + unit (r.md #88) ----
+
+    /// 対数目盛の欄は **range 全域を数百 px で舐められる**。 これがカーブを入れた理由
+    /// そのもの (線形の `0.001..=128` は units_per_pixel が意味を持たず、 実用感度では
+    /// 全域に数十万 px 要る)。 併せて中間位置が **幾何平均** に乗ることも見る
+    /// (= 正規化領域で等間隔 = 対数目盛の定義)。
+    #[test]
+    fn log_curve_sweeps_whole_range_in_a_few_hundred_px() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        // sensitivity 0.004 (= inspector の既定) → 全域 1/0.004 = 250px。
+        let style = ScrubableNumberStyle {
+            sensitivity: 0.004,
+            range: Some((0.001, 128.0)),
+            curve: ScrubCurve::Log,
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
+        };
+        let rect = rect_default();
+        let center = (40.0_f32, 14.0_f32);
+        let mut model = BpmModel { bpm: 0.001 };
+
+        for e in run_frame(
+            &mut host, &model, rect, model.bpm, 1.0,
+            ScrubableNumberFormat::Significant { digits: 3 }, &style, press_at(center, false), None,
+        ) { e.apply(&mut model); }
+
+        // 上へ 125px = 正規化 0.5 → 幾何平均 sqrt(0.001 * 128) ≈ 0.3578。
+        for e in run_frame(
+            &mut host, &model, rect, 0.001, 1.0,
+            ScrubableNumberFormat::Significant { digits: 3 }, &style,
+            hold_at((center.0, center.1 - 125.0), false), None,
+        ) { e.apply(&mut model); }
+        let geo = (0.001_f64 * 128.0).sqrt();
+        assert!(
+            (model.bpm - geo).abs() < geo * 1e-3,
+            "半分のドラッグで幾何平均 {geo} (got {})",
+            model.bpm
+        );
+
+        // 上へ 250px = 全域。 上端に届く (clamp)。
+        for e in run_frame(
+            &mut host, &model, rect, 0.001, 1.0,
+            ScrubableNumberFormat::Significant { digits: 3 }, &style,
+            hold_at((center.0, center.1 - 250.0), false), None,
+        ) { e.apply(&mut model); }
+        assert!(
+            (model.bpm - 128.0).abs() < 1e-6,
+            "250px で range 上端 128 に届く (got {})",
+            model.bpm
+        );
+    }
+
+    /// `unit` は数値の後ろに **別 run** で出る。 text input モードでは出ない (編集中の
+    /// 文字列は単位抜きの素の数値表記で、 そこに単位が混ざると打ち直せない)。
+    #[test]
+    fn unit_is_drawn_beside_the_number_but_not_while_typing() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let model = BpmModel { bpm: 12.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle {
+            unit: "Hz",
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
+        };
+        let center = (40.0_f32, 14.0_f32);
+
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 12.0, 1.0,
+            ScrubableNumberFormat::Decimal(1), &style, PointerFrame::default(), None, &mut scene,
+        );
+        let num = scene.iter_glyphs().find(|g| g.text.as_ref() == "12.0").expect("数値 glyph").clone();
+        let unit = scene.iter_glyphs().find(|g| g.text.as_ref() == "Hz").expect("単位 glyph").clone();
+        assert!(unit.left > num.left, "単位は数値の右 (num {} / unit {})", num.left, unit.left);
+        assert!(unit.left < rect.x + rect.w, "単位が欄からはみ出さない (got {})", unit.left);
+
+        // 短 click で編集モードへ → 単位は消える。
+        run_frame_scene(
+            &mut host, &model, rect, 12.0, 1.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+            &mut Scene::new(),
+        );
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 12.0, 1.0,
+            ScrubableNumberFormat::Decimal(1), &style, release_at(center), None, &mut scene,
+        );
+        let t = glyph_texts(&scene);
+        assert!(!t.iter().any(|s| s == "Hz"), "編集中は単位を出さない (got {t:?})");
+    }
+
+    /// 対数欄では modulation の live tick も **対数軸** に乗る。 帯だけ線形だと、
+    /// 掴んだ位置と伸び方が食い違う (これがカーブを style 側に置いた理由)。
+    #[test]
+    fn log_curve_places_live_tick_on_the_log_axis() {
+        let style = ScrubableNumberStyle {
+            sensitivity: 0.004,
+            range: Some((0.001, 128.0)),
+            curve: ScrubCurve::Log,
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
+        };
+        let rect = rect_default();
+        // base は下端、 live は幾何平均 → tick は track の中央。
+        let model = ModModel { bpm: 0.001, depth: 0.0 };
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let geo = (0.001_f64 * 128.0).sqrt();
+        run_mod_frame(
+            &mut host, &model, rect, &style, PointerFrame::default(), false, &[], Some(geo),
+            &mut scene,
+        );
+        // live tick は幅 1.5 の縦線 (`draw_modulation_overlay`)。
+        let tick = scene
+            .iter_rects()
+            .find(|r| (r.rect.w - 1.5).abs() < 1e-6)
+            .expect("live tick rect")
+            .rect;
+        let inset = 2.0_f32;
+        let want = rect.x + inset + (rect.w - inset * 2.0) * 0.5;
+        assert!(
+            ((tick.x + 0.75) - want).abs() < 0.5,
+            "幾何平均の tick は track 中央 {want} (got {})",
+            tick.x + 0.75
+        );
+    }
+
+    /// 表示のまま打ち直せる: `"25 Hz"` / `"25hz"` も確定する (末尾単位を剥がす)。
+    #[test]
+    fn text_commit_accepts_the_displayed_unit_suffix() {
+        assert_eq!(
+            parse_with_unit("25 Hz", ScrubableNumberFormat::Decimal(2), "Hz"),
+            Some(25.0)
+        );
+        assert_eq!(
+            parse_with_unit("25hz", ScrubableNumberFormat::Decimal(2), "Hz"),
+            Some(25.0)
+        );
+        // 単位を打たない通常入力も素通り。
+        assert_eq!(parse_with_unit("25", ScrubableNumberFormat::Decimal(2), "Hz"), Some(25.0));
+        // 単位を持たない欄では剥がさない (= 従来と同一)。
+        assert_eq!(parse_with_unit("25", ScrubableNumberFormat::Decimal(2), ""), Some(25.0));
+    }
+
+    /// 有効数字書式は **どの桁でも同じ情報量** を出す (対数欄が固定小数だと、 下端が
+    /// `"0.00"` に潰れるか上端が欄から溢れるかの二択になる)。
+    #[test]
+    fn significant_format_keeps_precision_across_decades() {
+        let f = ScrubableNumberFormat::Significant { digits: 3 };
+        assert_eq!(f.format_value(0.001), "0.001");
+        assert_eq!(f.format_value(0.0123), "0.0123");
+        assert_eq!(f.format_value(1.2345), "1.23");
+        assert_eq!(f.format_value(12.345), "12.3");
+        assert_eq!(f.format_value(128.0), "128");
+        assert_eq!(f.format_value(0.0), "0");
+        assert_eq!(f.format_value(f64::NAN), "0");
+        assert_eq!(f.parse_value("12.3"), Some(12.3));
     }
 }

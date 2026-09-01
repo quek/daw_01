@@ -54,6 +54,10 @@ text_input を TSF text store として OS IME に公開し、rtry (Try-Code TIP
   瞬間だけ文字が 14px に跳ねる** (inspector の 11px 欄で実際に起きていた)、(b) 狭い欄に入力を
   置けない (`pad 8 + "L100"@14px = 37px` 必要)、という 2 つの欠陥があった。色は palette が SSoT
   なので style には入れない (r.md #48)。
+- **`ScrubableNumberStyle::unit` は編集モードで描かない**。表示は `"12.5 Hz"` でも編集の種は
+  `format` が生む素の `"12.5"` なので、単位まで描くと「見えている文字列 == 打ち直せる文字列」が
+  崩れる (上の font_size 跳ねと同じ「編集に入った瞬間の連続性」の話)。代わりに確定時の parse が
+  末尾の単位を大文字小文字無視で剥がすので、表示のまま `"12.5 Hz"` と打っても通る。
 - **cursor 高は `font_size * 1.2` を rect 中央に置く** (`caret_rect`)。旧 `rect.h - 8.0` は
   font 14 / 高さ 22-28px の欄でしか成立せず、小さい欄では文字より短い caret になる。描画と
   IME 候補位置要求 (`request_ime`) が同じ helper を共有する。
