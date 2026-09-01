@@ -16,6 +16,10 @@
 //! 3. **別プロジェクトからはモジュレーターを持ち込めない。** `source_id` は
 //!    `Song.mod_sources` の id なので、検証せずに貼ると**たまたま同じ id の無関係な
 //!    モジュレーター**に結線される。
+//! 4. **トラックを外す全経路が、そのトラック所有のモジュレーターを道連れにする**
+//!    (r.md #78)。ソースはラックで所有トラックの下にしか出ないので、残すとどの画面
+//!    にも出ず削除できないまま、生き残ったトラックを変調し続ける。削除だけが掃除
+//!    していて、**グループ解除**と**末尾削除**が漏れていた。
 
 use common::model::{
     AutomationTarget, ModRouting, ModSource, ModSourceKind, PluginInstance, Polarity, Track,
@@ -266,4 +270,86 @@ fn pasting_across_projects_drops_modulation_it_cannot_resolve() {
     let ids: Vec<u32> = app.song_doc.song().all_mod_routings().map(|r| r.id).collect();
     let uniq: std::collections::HashSet<u32> = ids.iter().copied().collect();
     assert_eq!(ids.len(), uniq.len(), "貼り付けた変調にも一意な id が配られる: {ids:?}");
+}
+
+const GROUP: u32 = 300;
+const CHILD: u32 = 301;
+
+/// グループ (`GROUP`) と子 (`CHILD`) の 2 本。グループが LFO を 1 個所有し、
+/// その LFO が **子トラックの** Volume を変調している (= グループが消えても
+/// 変調先は生き残る形)。戻り値は source id。
+fn group_owning_a_modulator() -> (AppData, u32) {
+    let (mut app, _audio_rx, _plugin_rx, _disp) = build_app();
+    app.edit_song(|song| {
+        song.tracks.clear();
+        song.tracks
+            .push(Track { id: GROUP, name: "G".into(), ..Track::default() });
+        song.tracks.push(Track {
+            id: CHILD,
+            name: "C".into(),
+            parent_group_id: Some(GROUP),
+            ..Track::default()
+        });
+    });
+    let source_id = add_source(&mut app, GROUP);
+    app.handle_event(AppEvent::AddModRouting {
+        track_id: CHILD,
+        target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+        source_id,
+    });
+    assert_eq!(
+        app.song_doc.song().all_mod_routings().count(),
+        1,
+        "前提: グループ所有の LFO が子の Volume を変調している"
+    );
+    (app, source_id)
+}
+
+fn assert_no_orphan_modulator(app: &AppData, what: &str) {
+    let song = app.song_doc.song();
+    let orphans: Vec<u32> = song
+        .mod_sources
+        .iter()
+        .filter(|m| song.track_by_id(m.owner_track_id).is_none())
+        .map(|m| m.id)
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "{what}: 所有トラックが消えたモジュレーターが残っている \
+         (ラックは所有トラックの下にしか出さないので、二度と削除できない): {orphans:?}"
+    );
+    assert!(
+        song.all_mod_routings().count() == 0,
+        "{what}: 消えたソースを指す変調も道連れになる"
+    );
+}
+
+/// グループ解除でグループトラックが消えたら、それが所有していたモジュレーターも
+/// 道連れになる (トラック削除と同じ規約)。
+#[test]
+fn ungrouping_reaps_the_group_tracks_modulators() {
+    let (mut app, _source_id) = group_owning_a_modulator();
+
+    app.handle_event(AppEvent::UngroupTracks { track_ids: vec![GROUP] });
+
+    assert!(
+        app.song_doc.song().track_by_id(GROUP).is_none(),
+        "前提: グループトラックが消えている"
+    );
+    assert_no_orphan_modulator(&app, "グループ解除");
+}
+
+/// 末尾トラック削除 (`RemoveLastTrack`) も同じ。`delete_tracks` とは別経路なので、
+/// 掃除を 1 本に寄せていないと片方だけ漏れる。
+#[test]
+fn removing_the_last_track_reaps_its_modulators() {
+    let (mut app, _source_id) = group_owning_a_modulator();
+    // 末尾 = CHILD なので、先に CHILD を消してから GROUP を末尾にする。
+    app.handle_event(AppEvent::RemoveLastTrack);
+    assert_eq!(app.song_doc.song().tracks.len(), 1, "前提: 子が消えて GROUP が末尾");
+
+    app.handle_event(AppEvent::RemoveLastTrack);
+
+    assert!(app.song_doc.song().tracks.is_empty(), "前提: 全トラックが消えている");
+    assert_no_orphan_modulator(&app, "末尾トラック削除");
 }

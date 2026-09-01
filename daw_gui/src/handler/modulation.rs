@@ -350,6 +350,45 @@ impl AppData {
         });
     }
 
+    /// **トラックが `song.tracks` から消えた後の変調の後始末**。トラックを外す
+    /// 全経路がこの 1 本を通る (削除 / グループ解除 / 末尾削除)。2 段ある:
+    ///
+    /// 1. **所有トラックが居なくなったモジュレーターを道連れにする** (r.md #78)。
+    ///    ソースはラックで **所有トラックの下にしか列挙されない**ので、残すとどの
+    ///    画面にも出ず削除できないまま、生き残ったトラックの param を変調し続ける
+    ///    (LFO / Random / MSEG / Steps は song 位置の純関数なので、所有トラックが
+    ///    消えても値を出し続ける)。
+    /// 2. **深さ参照の連鎖掃除** (r.md #89)。消えたトラックの変調を
+    ///    [`common::model::AutomationTarget::ModRoutingDepth`] で指していたレーン /
+    ///    変調を落とす。1 で 1 件も消えなくても要る (ソースを持たないトラックを
+    ///    消した場合)。
+    ///
+    /// **判定は「消した id の集合」ではなく `owner_track_id` が実在するか**。集合を
+    /// 各経路から配る形だと経路ごとに集合の作り方が要り、1 つ忘れると孤児が残る
+    /// (実際 グループ解除 と 末尾削除 が漏れていた)。`owner_track_id` の `0`
+    /// (legacy) と `MASTER_TRACK_ID` は master 所有なのでトラック不在ではない。
+    ///
+    /// 冪等 — 健全な曲では no-op。
+    pub(crate) fn cleanup_modulation_after_track_removal(&mut self) {
+        let orphans: Vec<u32> = self
+            .song_doc
+            .song()
+            .mod_sources
+            .iter()
+            .filter(|m| {
+                m.owner_track_id != 0
+                    && m.owner_track_id != common::model::MASTER_TRACK_ID
+                    && self.song_doc.song().track_by_id(m.owner_track_id).is_none()
+            })
+            .map(|m| m.id)
+            .collect();
+        for id in orphans {
+            // 参照 routing の除去と 2 の連鎖掃除まで `remove_mod_source` が担う。
+            self.remove_mod_source(id);
+        }
+        self.edit_song(|song| song.prune_dangling_mod_targets());
+    }
+
     /// Resolve `track_id` to its mutable `mod_routings` Vec
     /// (`MASTER_TRACK_ID` → `Song.song_mod_routings`,
     /// `docs/plan_modulation_routing_redesign.md` §2).

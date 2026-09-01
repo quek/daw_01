@@ -368,20 +368,7 @@ impl AppData {
                     remap_target(&mut r.target);
                 }
             }
-            for dev in &mut t.devices {
-                for slot in &mut dev.aux_inputs {
-                    if let Some(route) = slot {
-                        let old = route.tap.source_track;
-                        if let Some(&new) = track_remap.get(&old) {
-                            route.tap.source_track = new;
-                        } else if !(same_project && song.track_by_id(old).is_some()) {
-                            // dangling after paste: drop the route (keep tap_point
-                            // intact when the source survives).
-                            *slot = None;
-                        }
-                    }
-                }
-            }
+            Self::resolve_pasted_aux_refs(song, &track_remap, same_project, &mut t);
             t.lipsync_target_track = match t.lipsync_target_track {
                 Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),
                 Some(old) if same_project && song.track_by_id(old).is_some() => Some(old),
@@ -411,6 +398,46 @@ impl AppData {
         //    別トラックを指す形を黙って落とすので、表は set スコープで持つ)。
         Self::rehome_pasted_modulation(song, &mut built, same_project);
         built
+    }
+
+    /// 貼り付けた track の device の aux 参照を解決する。**sidechain (aux 入力) と
+    /// パラアウト (aux 出力) を対称に扱うのがこの 1 本の要点** — 片方だけ見ていた
+    /// 頃は、別プロジェクトへ貼ったパラアウトが id だけ一致する**無関係なトラック**
+    /// へ音を流していた (`handler/device_relocate.rs` の
+    /// `resolve_aux_refs_after_paste` が既に「`aux_outputs` も見ること」と書いている
+    /// 取りこぼし)。
+    ///
+    /// 規約は sends / lipsync と同じ: 集合内なら新 id へ、集合外は `same_project` で
+    /// 実在するときだけ据え置き、それ以外は route ごと落とす (入力側は source が
+    /// 生き残るなら `tap_point` をそのまま保つ)。
+    fn resolve_pasted_aux_refs(
+        song: &common::model::Song,
+        track_remap: &std::collections::HashMap<u32, u32>,
+        same_project: bool,
+        t: &mut common::model::Track,
+    ) {
+        let resolve = |old: u32| -> Option<u32> {
+            if let Some(&new) = track_remap.get(&old) {
+                return Some(new);
+            }
+            (same_project && song.track_by_id(old).is_some()).then_some(old)
+        };
+        for dev in &mut t.devices {
+            for slot in &mut dev.aux_inputs {
+                let Some(route) = slot else { continue };
+                match resolve(route.tap.source_track) {
+                    Some(new) => route.tap.source_track = new,
+                    None => *slot = None,
+                }
+            }
+            for slot in &mut dev.aux_outputs {
+                let Some(route) = slot else { continue };
+                match resolve(route.dest_track) {
+                    Some(new) => route.dest_track = new,
+                    None => *slot = None,
+                }
+            }
+        }
     }
 
     /// [`Self::build_pasted_tracks`] step 4: 貼り付け集合の **変調参照**を解決する。
@@ -813,11 +840,9 @@ impl AppData {
         for &i in subtree_idxs.iter().rev() {
             self.edit_song(|song| song.tracks.remove(i as usize));
         }
-        // r.md #89 (同件): 消えたトラックの変調を **深さ**で参照していた、生き残った
-        // トラック側のレーン / 変調を落とす。下の `remove_mod_source` は「消えた
-        // トラックがソースを所有していたとき」しか走らないので、ソースを持たない
-        // トラックを消すとここを通らずに幽霊行が残っていた。
-        self.edit_song(|song| song.prune_dangling_mod_targets());
+        // 消えたトラックが所有していたモジュレーターと、その変調の深さを指していた
+        // レーン / 変調の後始末 (トラックを外す全経路共通の 1 本)。
+        self.cleanup_modulation_after_track_removal();
         // (b) LoadSong で audio engine を新 schedule に
         // (c) **重要 (deadlock 防止)**: RemoveSlotPlugin 送信前に daw_audio
         // に直接 ClosePluginShmem を送って plugin_refs から stale entry
@@ -841,23 +866,9 @@ impl AppData {
         // 通さない = タグを触らない) ため、 **次の Delete が画面外の最下段トラックを
         // 消す**。 Ableton / REAPER と同じく削除位置の直後 (無ければ直前) へ倒す。
         let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
-        // r.md #78: 消えたトラックが所有していた変調ソースも道連れにする。
-        // ソースはラックで **所有トラックの下にしか列挙されない** ので、 残すと
-        // どの画面にも出ず削除できないまま、 生き残ったトラックの param を変調し
-        // 続ける (LFO / Random / MSEG / Steps は song 位置の純関数なので、 所有
-        // トラックが消えても値を出し続ける)。 接続行をソース側へ寄せて孤児を
-        // 潰したのと同じ穴。 `remove_mod_source` が参照 routing の掃除まで担う。
-        let orphan_source_ids: Vec<u32> = self
-            .song_doc
-            .song()
-            .mod_sources
-            .iter()
-            .filter(|m| subtree_ids_set.contains(&m.owner_track_id))
-            .map(|m| m.id)
-            .collect();
-        for id in orphan_source_ids {
-            self.remove_mod_source(id);
-        }
+        // r.md #78 の孤児モジュレーター掃除は上の
+        // `cleanup_modulation_after_track_removal` が担う (グループ解除 / 末尾削除と
+        // 同じ 1 本。ここで「消した id の集合」から作り直すと経路ごとに分岐が増える)。
         // r.md #87: 消えたトラックが口パクのソースだったなら、出力先の口 track に
         // 残った生成物 (`auto_lipsync` の clip / セル) も道連れにする。 残すと
         // **歌が無いのに口だけ動く** — しかも再生成の経路 (`mark_lipsync_dirty`)

@@ -256,9 +256,9 @@ impl AppData {
             });
             if let Some(pos) = self.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
                 self.edit_song(|song| song.tracks.remove(pos));
-                // r.md #89 (同件): 消えた group track の変調を **深さ**で参照していた
-                // レーン / 変調を落とす (track 削除経路と同じ規約)。
-                self.edit_song(|song| song.prune_dangling_mod_targets());
+                // 消えた group track が所有していたモジュレーターと、その変調の深さを
+                // 指していたレーン / 変調の後始末 (track 削除経路と同じ 1 本)。
+                self.cleanup_modulation_after_track_removal();
             }
             self.ui_prefs.collapsed_groups.remove(group_id);
         }
@@ -363,6 +363,9 @@ impl AppData {
             name = %removed.name,
             "removed last track"
         );
+        // 消えたトラックが所有していたモジュレーターと、その変調の深さを指していた
+        // レーン / 変調の後始末 (track 削除 / グループ解除と同じ 1 本)。
+        self.cleanup_modulation_after_track_removal();
         // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ。 この経路は
         // 以前 `ClosePluginShmem` を送っておらず (= 順序仕様が守られていなかった)、
         // plan 経由に統一したことで穴も塞がる。
