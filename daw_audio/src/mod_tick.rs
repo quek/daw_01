@@ -43,6 +43,16 @@ use common::model::{AutomationTarget, MASTER_TRACK_ID, ModParam, Song};
 pub const MAX_TICKS_PER_BUFFER: usize =
     common::process_data::MAX_FRAMES / MOD_TICK_FRAMES as usize + 2;
 
+/// 値面に載せるソース数の上限。
+///
+/// **`mod_graph::build_plan` は `Song::mod_sources` を切らない** (グラフの
+/// 正しさに上限は要らないので)。一方 RT 側の器はここで事前確保するので、
+/// 切らずに回すと 64 を超える曲で **audio thread が再確保する**。
+/// `compile_schedule` の `follower_slots` と `AudioBridge::mod_scalars` が
+/// 既に同じ上限で切っているので、値面もそこに合わせる
+/// (= 65 個目以降のソースは値を publish しない、という既存の契約)。
+const MAX_SLOTS: usize = common::audio_bridge::MAX_MOD_SOURCES;
+
 /// フォロワー係数のうち変調できるもの (刻みごとに引き直す)。
 pub const FOLLOWER_PARAMS: [ModParam; 5] = [
     ModParam::FollowerAttack,
@@ -127,12 +137,19 @@ impl ModTickRunner {
         }
     }
 
+    /// 値面に載せる slot 数 (`MAX_SLOTS` で切った plan の node 数)。
+    #[must_use]
+    #[inline]
+    fn n_slots(&self) -> usize {
+        self.plan.nodes.len().min(MAX_SLOTS)
+    }
+
     /// 新しい plan と、それに合わせて **off-thread で `install` 済み**の RT 状態を
     /// 差し込む (`ModRuntime::install` は `Vec::resize` するので RT では走らせない)。
     /// 走行状態は捨てて次の buffer で張り直す。戻り値は旧 RT 状態 (recycle 用)。
     pub fn install(&mut self, plan: Arc<ModPlan>, rt: ModRuntime) -> ModRuntime {
         self.follower_cols.clear();
-        for (slot, node) in plan.nodes.iter().enumerate() {
+        for (slot, node) in plan.nodes.iter().enumerate().take(MAX_SLOTS) {
             let modulated = node
                 .in_edges
                 .iter()
@@ -179,7 +196,8 @@ impl ModTickRunner {
         let bpm = f64::from(common::automation::evaluate_song_tempo(song, boundary_beat)).max(1.0);
         self.first_tick = k;
         self.marks.clear();
-        self.plane.reset(&self.plan.slot_ids, MOD_TICK_FRAMES);
+        let n = self.n_slots();
+        self.plane.reset(&self.plan.slot_ids[..n], MOD_TICK_FRAMES);
         self.follower_eff.clear();
         self.next_mark = PhaseMark {
             beat: boundary_beat,
@@ -207,7 +225,8 @@ impl ModTickRunner {
             // 走行が途切れている (install 直後 / 巻き戻し)。次の評価から張り直す。
             self.first_tick = k0;
             self.marks.clear();
-            self.plane.reset(&self.plan.slot_ids, MOD_TICK_FRAMES);
+            let n = self.n_slots();
+            self.plane.reset(&self.plan.slot_ids[..n], MOD_TICK_FRAMES);
             self.follower_eff.clear();
         } else {
             // 前 buffer から持ち越した、もう参照しない行を捨てる。
@@ -261,6 +280,8 @@ impl ModTickRunner {
     ) {
         // envelope follower の出力を先に書く (`tick` は引数で取らない —
         // plan の slot 順と `Song::mod_sources` の位置順の取り違えを防ぐため)。
+        // 上限を超えるソースにも書く — 値面には載らないが、`tick` の入力辺として
+        // 上限内のソースを変調しうるので評価自体は正しく回す必要がある。
         for slot in 0..self.plan.nodes.len() {
             let Ok(s) = u16::try_from(slot) else { continue };
             self.rt.set_follower(s, follower_env(s));
@@ -286,7 +307,7 @@ impl ModTickRunner {
             },
         );
         self.row.clear();
-        for slot in 0..self.plan.nodes.len() {
+        for slot in 0..self.n_slots() {
             self.row
                 .push(self.rt.value(u16::try_from(slot).unwrap_or(u16::MAX)));
         }
@@ -370,7 +391,7 @@ impl ModTickRunner {
     /// ために plan / schedule の差し替え時に 1 度だけ作る。
     pub fn build_follower_env_map(&self, follower_keys: &[u32], out: &mut Vec<u16>) {
         out.clear();
-        out.resize(self.plan.nodes.len(), u16::MAX);
+        out.resize(self.plan.nodes.len().min(MAX_SLOTS), u16::MAX);
         for (i, id) in follower_keys.iter().enumerate() {
             if let Some(slot) = self.plan.slot_of(*id)
                 && let Ok(idx) = u16::try_from(i)
@@ -401,7 +422,7 @@ impl ModTickRunner {
     pub fn publish_plane(&mut self) -> &ModPlane {
         self.publish.clear();
         let row = self.plane.as_ref().row(0);
-        for (i, id) in self.plan.slot_ids.iter().enumerate() {
+        for (i, id) in self.plan.slot_ids.iter().enumerate().take(MAX_SLOTS) {
             self.publish
                 .push(*id, row.values.get(i).copied().unwrap_or(0.0));
         }

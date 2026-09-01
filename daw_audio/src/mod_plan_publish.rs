@@ -94,7 +94,7 @@ impl ModPhaseTableBuilder {
     ///
     /// 積分が要らない plan (= rate を変調していない曲) では何もしない —
     /// **既存曲のコストはゼロ**。
-    pub fn request(&self, plan: Arc<ModPlan>, song: &Song, sample_rate: u32) {
+    pub fn request(&self, plan: Arc<ModPlan>, song: &Arc<Song>, sample_rate: u32) {
         if !plan.needs_integration() {
             return;
         }
@@ -106,7 +106,10 @@ impl ModPhaseTableBuilder {
         if let Ok(mut slot) = lock.lock() {
             *slot = Some(Request {
                 plan,
-                song: Arc::new(song.clone()),
+                // `publish_bundle` が持っている `Arc<Song>` をそのまま共有する。
+                // deep clone すると、ツマミを動かすたびに曲まるごとの複製が
+                // IPC スレッドで走る。
+                song: Arc::clone(song),
                 sample_rate,
                 length_secs,
             });

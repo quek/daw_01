@@ -725,7 +725,7 @@ fn publish_bundle(
         .and_then(|sg| publisher.mod_plans.build(sg, sample_rate));
     // 位相表は曲長ぶんの刻みループなので **必ず off-thread**。構築中は旧表 +
     // 閉形式シードで凌ぎ、完成したら housekeeping が次の便で載せる。
-    if let (Some((plan, _)), Some(sg)) = (mod_plan.as_ref(), song.as_deref()) {
+    if let (Some((plan, _)), Some(sg)) = (mod_plan.as_ref(), song.as_ref()) {
         phase_tables.request(Arc::clone(plan), sg, sample_rate);
     }
     publisher.send(RtBundle {
