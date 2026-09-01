@@ -87,7 +87,11 @@ pub(super) fn draw_launch_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
-    let cells = app.selected_launcher_cells();
+    // 表示は **セル選択が生きているか** で決める (`shown_pianoroll_clips` と同じ判定)。
+    // last-wins タグ付きの `selected_launcher_cells()` は Delete / Cut の宛先用なので、
+    // セルのピアノロールでノートを選ぶと `Notes` へ倒れ、**セルを編集している最中に
+    // ローンチ設定だけが消える**。
+    let cells = app.live_launcher_cells();
     let scene_ids = scenes_of(app, &cells);
     if cells.is_empty() && scene_ids.is_empty() {
         return y;

@@ -45,6 +45,19 @@ impl LaneRef {
             LaneRef::KeyTrack { clip, .. } | LaneRef::AudioLane(clip) => clip.track_id,
         }
     }
+
+    /// **アレンジャーの行**か (= 時間軸を持つ面の行)。`false` はエディタ内の行
+    /// (ピアノロールの鍵盤行 / オーディオエディタの波形行) で、開いているクリップの
+    /// 中を指すだけ。
+    ///
+    /// 「範囲がアレンジの面を指しているか」の判定はこの 1 式が SSoT。
+    /// ランチャーのセル選択との排他 (`AppData::set_time_selection`) がここを引く —
+    /// ピアノロールでノートを選んだだけでセル選択が降りると、セルを開いたまま
+    /// 中をクリックした瞬間にエディタが空になる。
+    #[must_use]
+    pub fn is_arrangement_row(self) -> bool {
+        matches!(self, LaneRef::Track(_) | LaneRef::Automation(_))
+    }
 }
 
 /// 選択の SSoT。

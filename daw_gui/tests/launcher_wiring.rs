@@ -1038,13 +1038,14 @@ fn 両方の行のセルを選んだ_delete_は両方消す() {
     );
 }
 
-/// アレンジで範囲を引き直しても、ランチャーのセル選択は消えない。
+/// アレンジで範囲を引いたらセル選択は降り、エディタ内 (鍵盤行) の範囲では降りない。
 ///
-/// 以前はレーン行のセルがアレンジの automation クリップ集合に居たため、
-/// `prune_automation_selection` (= 範囲の外の automation 選択を落とす) が
-/// **範囲と無関係なセルまで巻き込んで**消していた。
+/// オブジェクト選択は常に 1 面だけ (r.md #90 / `drop_cell_selection_if_arrangement`)。
+/// 一方、ピアノロールでノートを選んだだけの範囲は「アレンジの面を選ぶ操作」ではない
+/// ので、**セルを開いたままその中を編集できる**。 ここを一緒くたにすると、セルを
+/// 開いた直後にピアノロール内をクリックしただけでエディタが空になる。
 #[test]
-fn アレンジの範囲操作はセル選択を消さない() {
+fn アレンジの範囲はセル選択を降ろしエディタ内の範囲は降ろさない() {
     use common::model::{AutomationLane, AutomationLaneKey, AutomationTarget};
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
@@ -1066,14 +1067,29 @@ fn アレンジの範囲操作はセル選択を消さない() {
         modifier: SelectModifier::Single,
     }));
 
+    // 鍵盤行だけの範囲 (= ピアノロールでノートを選んだ状態) では降りない。
+    app.handle_event(AppEvent::SetTimeSelection {
+        start_beat: 0.0,
+        end_beat: 1.0,
+        lanes: vec![common::model::LaneRef::KeyTrack {
+            clip: common::model::ClipKey { track_id: 1, clip_id: 1 },
+            pitch: 60,
+        }],
+    });
+    assert_eq!(
+        app.selection.selected_launcher_cells,
+        vec![lane_cell],
+        "エディタ内の行だけの範囲ではセルの選択は残る"
+    );
+
+    // アレンジのレーン行に範囲を引いたら降りる。
     app.handle_event(AppEvent::SetTimeSelection {
         start_beat: 8.0,
         end_beat: 16.0,
         lanes: vec![common::model::LaneRef::Automation(lane)],
     });
-    assert_eq!(
-        app.selection.selected_launcher_cells,
-        vec![lane_cell],
-        "アレンジの範囲を引いてもセルの選択は残る"
+    assert!(
+        app.selection.selected_launcher_cells.is_empty(),
+        "アレンジの範囲を引いたらセルの選択は降りる"
     );
 }

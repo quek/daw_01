@@ -618,10 +618,10 @@ impl AppData {
     /// 1. 行がセルを鳴らしている (engine 観測、届いていなければ `Song` の起点) →
     ///    **そのセルの位相**。この行のアレンジのクリップはそもそも鳴らないので、
     ///    playhead を送る意味が無い
-    /// 2. 行がアレンジのままでも、**セル面を最後に触っていて**この track のセルを
-    ///    選んでいる → そのセルの先頭 (= これから撃つ / 歌詞を書いている最中)。
-    ///    面の判定は last-wins タグ (`feedback_selection_action_last_wins`) —
-    ///    古い選択が残っているだけでアレンジ側の合成を後回しにしないため
+    /// 2. 行がアレンジのままでも、**この track のセルを選んでいる** → そのセルの先頭
+    ///    (= これから撃つ / 歌詞を書いている最中)。 セル選択はアレンジの範囲選択と
+    ///    排他 (`drop_cell_selection_if_arrangement`) なので、古い選択が残って
+    ///    アレンジ側の合成を後回しにすることは無い
     /// 3. どちらでもない → song の playhead (= 従来どおり。アレンジを普通に作って
     ///    いる間はセルが遠いので自然に後回しになる)
     fn vocal_synth_priority_beat(&self, track: &common::model::Track, bpm: f32) -> Option<f64> {
@@ -657,13 +657,15 @@ impl AppData {
                 .unwrap_or(0.0);
             return Some((clip_id, phase));
         }
-        if self.selection.last_edit_select != Some(EditSurface::LauncherCells) {
-            return None;
-        }
+        // 面の判定は **セル選択が生きているか** 1 つ (`shown_pianoroll_clips` と同じ
+        // 判定)。 last-wins タグは Delete / Cut の宛先を持つ別の関心事で、セルの
+        // ピアノロールで歌詞を打つ (= ノートを選ぶ) だけで `Notes` へ倒れるので、
+        // これを使うと **歌詞を書いている最中のセルだけが合成の後回し** になる。
+        // アレンジの面を選べばセル選択は排他で降りるので、古い選択が残って
+        // アレンジ側の合成を後回しにすることも無い。
+        let cells = self.live_launcher_cells();
         // 末尾 = 最後に click したセル。
-        let clip_id = self
-            .selection
-            .selected_launcher_cells
+        let clip_id = cells
             .iter()
             .rev()
             .find_map(|c| match c {

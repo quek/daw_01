@@ -159,6 +159,33 @@ impl AppData {
         self.live_launcher_cells()
     }
 
+    /// **オブジェクト選択の排他**: 範囲がアレンジの行 ([`LaneRef::is_arrangement_row`])
+    /// を持ったら、ランチャーのセル選択を降ろす。
+    ///
+    /// 選択されているクリップは常に 1 つの面だけ (Live: "The Clip View always shows
+    /// the currently selected clip")。 セル面とアレンジ面が同時に立てると、
+    /// ピアノロールがどちらを映すかを last-wins タグ頼みで決めることになり、
+    /// **セルを開いたままピアノロール内をクリックした瞬間にタグがアレンジへ倒れて
+    /// エディタが空になる** (r.md #90)。
+    ///
+    /// 逆向き (セルを選んだら範囲を降ろす) は `select_launcher_cell` 側。
+    /// 鍵盤行 / 波形行だけの範囲 (= エディタ内でノート・イベントを選んだ状態) では
+    /// 降ろさない — それはアレンジの面を選ぶ操作ではない。
+    ///
+    /// **範囲を書き換える経路はすべてここを通すこと。** 現在値から毎回判定するので
+    /// 冪等で、どこから呼んでも安全。
+    pub(crate) fn drop_cell_selection_if_arrangement(&mut self) {
+        let arrangement = self
+            .selection
+            .time
+            .as_ref()
+            .is_some_and(|t| t.lanes.iter().copied().any(common::model::LaneRef::is_arrangement_row));
+        if arrangement {
+            self.selection.selected_launcher_cells.clear();
+            self.selection.launcher_cell_anchor = None;
+        }
+    }
+
     /// セルの長さ (= ループ長) を変える。選択している全セルへ一括で効く。
     ///
     /// セルの `start_beat` は常に 0 なので、変わるのは `length_beats` だけ
@@ -222,6 +249,10 @@ impl AppData {
     pub fn select_launcher_cell(&mut self, cell: LauncherCellKey, modifier: SelectModifier) {
         // 列 (シーン) 選択とは排他 (`SelectionState::selected_scene_ids` の doc)。
         self.selection.selected_scene_ids.clear();
+        // アレンジの範囲選択とも排他 (`drop_cell_selection_if_arrangement` の逆向き)。
+        // 選択されているクリップは常に 1 つの面だけなので、セルを選んだらアレンジの
+        // 範囲は降りる。 残すとインスペクタ / ピアノロールが 2 つの面を同時に指す。
+        self.set_time_selection(None);
         // **行の種類で分岐しない** — セル面は 1 面 1 集合なので、トラック行と
         // レーン行を跨ぐ Shift+click の長方形もそのまま解ける (分けていた頃は
         // 「トラック行のセルからその下のオートメーションレーン行のセルまで」が
@@ -578,8 +609,9 @@ impl AppData {
         if cells.is_empty() {
             return;
         }
-        // click 経路と同じく列選択とは排他。
+        // click 経路と同じく列選択・アレンジの範囲選択とは排他。
         self.selection.selected_scene_ids.clear();
+        self.set_time_selection(None);
         self.selection.selected_launcher_cells = cells.to_vec();
         self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
         // click 経路 (`select_launcher_cell`) と同じくカーソルトラックを追従させる。

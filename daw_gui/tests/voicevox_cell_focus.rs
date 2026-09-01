@@ -181,9 +181,11 @@ fn 選んだセルが合成順序ヒントの座標を決める() {
         "選んだセルの区間の先頭を指す: hint={hint} base={base}"
     );
 
-    // アレンジ側へ戻る (セル面のタグを降ろす) → ヒントは song の playhead。
+    // アレンジ側へ戻る (= セル選択が降りる) → ヒントは song の playhead。
+    // セル選択とアレンジの選択は排他なので、「アレンジを触った」は選択を捨てる
+    // ことで表す (r.md #90 / `drop_cell_selection_if_arrangement`)。
     app.voicevox.voicevox_metadata_sent.clear();
-    app.selection.last_edit_select = None;
+    app.handle_event(AppEvent::ClearSelection);
     app.sync_vocal_metadata();
     let msgs = drain(&mut rx);
     let (hint, base) = priority_and_cell_base(&msgs, 2);

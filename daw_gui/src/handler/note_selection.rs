@@ -73,10 +73,7 @@ impl AppData {
             let s = clip.content_to_song_beat(note.start_beat);
             start = start.min(s);
             end = end.max(s + note.duration_beats);
-            for lane in [
-                LaneRef::KeyTrack { clip: key, pitch: note.pitch },
-                LaneRef::Track(key.track_id),
-            ] {
+            for lane in song.content_lanes_for(key, LaneRef::KeyTrack { clip: key, pitch: note.pitch }) {
                 if !lanes.contains(&lane) {
                     lanes.push(lane);
                 }
@@ -100,6 +97,15 @@ impl AppData {
         let mut end = f64::NEG_INFINITY;
         let mut lanes: Vec<LaneRef> = Vec::new();
         for key in shown {
+            // ランチャーのセルは曲の時間軸に居ないので、落とせる範囲が無い
+            // ([`Song::content_lanes_for`] と同じ理由)。 セルを開いているときはセル選択
+            // (`live_launcher_cells`) が表示を支えるので、範囲は捨ててよい —
+            // ここで無理にトラック行の区間を張ると、面タグがアレンジへ倒れて
+            // **セルのピアノロールで空白を 1 回クリックしただけで
+            // 「クリップが選択されていません」** になる (r.md #90)。
+            if song.is_session_clip(*key) {
+                continue;
+            }
             let Some(clip) = song.clip_by_key(*key) else {
                 continue;
             };
@@ -174,14 +180,16 @@ impl AppData {
         };
         let s = clip.content_to_song_beat(note.start_beat);
         let e = s + note.duration_beats;
-        let lane = LaneRef::KeyTrack { clip: key, pitch: note.pitch };
+        let lanes: Vec<LaneRef> = song
+            .content_lanes_for(key, LaneRef::KeyTrack { clip: key, pitch: note.pitch })
+            .collect();
         if additive && let Some(sel) = self.selection.time.as_mut() {
-            sel.extend(s, e, [lane, LaneRef::Track(key.track_id)]);
+            sel.extend(s, e, lanes);
             self.selection.last_edit_select = Some(crate::app::EditSurface::TimeRange);
+            self.drop_cell_selection_if_arrangement();
             return;
         }
-        let next =
-            common::model::TimeSelection::new(s, e, vec![lane, LaneRef::Track(key.track_id)]);
+        let next = common::model::TimeSelection::new(s, e, lanes);
         self.set_time_selection(next);
         self.selection.range_anchor = Some(s);
     }
@@ -201,10 +209,9 @@ impl AppData {
                 let s = clip.content_to_song_beat(note.start_beat);
                 start = start.min(s);
                 end = end.max(s + note.duration_beats);
-                for lane in [
-                    LaneRef::KeyTrack { clip: *key, pitch: note.pitch },
-                    LaneRef::Track(key.track_id),
-                ] {
+                for lane in
+                    song.content_lanes_for(*key, LaneRef::KeyTrack { clip: *key, pitch: note.pitch })
+                {
                     if !lanes.contains(&lane) {
                         lanes.push(lane);
                     }
@@ -311,12 +318,18 @@ impl AppData {
                 end = end.max(s + e.event_length_beats);
             }
         }
+        let cell = song.is_session_clip(key);
         let next = if start.is_finite() && end > start {
             common::model::TimeSelection::new(
                 start,
                 end,
-                vec![LaneRef::AudioLane(key), LaneRef::Track(key.track_id)],
+                song.content_lanes_for(key, LaneRef::AudioLane(key)).collect(),
             )
+        } else if cell {
+            // セルは曲の時間軸に居ないので落とせる区間が無い
+            // ([`Song::content_lanes_for`] と同じ理由)。 エディタの表示は
+            // `ui_ephemeral.audio_editor_clip` が支えるので範囲は捨てる。
+            None
         } else {
             // 選択解除: クリップの区間へ落とす (エディタの表示は保つ)。
             let (s, e) = clip.song_window();
@@ -324,5 +337,161 @@ impl AppData {
         };
         self.set_time_selection(next);
         self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+    }
+}
+
+#[cfg(test)]
+mod launcher_cell_editing_tests {
+    //! r.md #90: ランチャーのセルをピアノロールで開いた後、**ピアノロールの中を
+    //! 触ってもセルが開いたまま**であること。
+    //!
+    //! セルは曲の時間軸に居ない (`start_beat` は常に 0 / `track.clips` にも居ない)
+    //! ので、セルのノート選択をアレンジの時間範囲として書き戻すと壊れる。
+    //! 壊れ方は 2 通りあって、どちらも同じ根 (`Song::content_lanes_for`) を持つ。
+    use std::sync::Arc;
+
+    use common::model::{Clip, ClipKey, Track};
+    use common::protocol::{AudioCommand, PluginCommand};
+    use tokio::sync::mpsc;
+
+    use crate::app::{AppData, AppEvent};
+    use crate::dispatcher::{
+        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+    };
+    use crate::event_launcher::{LauncherCellKey, LauncherEvent, LauncherRow};
+
+    fn build_app() -> AppData {
+        let (audio_tx, _a) = mpsc::unbounded_channel::<AudioCommand>();
+        let (plugin_tx, _p) = mpsc::unbounded_channel::<PluginCommand>();
+        let events: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+        let jobs: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+        AppData::new(
+            audio_tx,
+            plugin_tx,
+            None,
+            None,
+            events,
+            jobs,
+            None,
+            None,
+            common::audio_bridge::DEFAULT_SAMPLE_RATE,
+        )
+    }
+
+    /// トラック 1 本 + 列 1 本の曲を作り、その行にセルを 1 つ置く。
+    fn seed_with_cell(app: &mut AppData) -> ClipKey {
+        app.edit_song(|song| {
+            song.tracks.clear();
+            song.scenes.clear();
+            song.tracks.push(Track { id: 1, next_clip_id: 1, ..Track::default() });
+            song.ids.next_track_id = 2;
+            song.push_scene();
+        });
+        app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
+            row: LauncherRow::Track(1),
+            scene_index: 0,
+        }));
+        let scene_id = app.song_doc.song().scenes[0].id;
+        let cell = app
+            .cell_in_row_at_scene(LauncherRow::Track(1), scene_id)
+            .expect("セルが作られている");
+        let LauncherCellKey::Track(key) = cell else {
+            panic!("トラック行のセル");
+        };
+        key
+    }
+
+    /// アレンジ側の 0..4 拍に MIDI クリップを 1 つ置く (セルの窓と重なる位置)。
+    fn put_arrangement_clip(app: &mut AppData) -> ClipKey {
+        let mut key = ClipKey { track_id: 1, clip_id: 0 };
+        app.edit_song(|song| {
+            let content_id = song.alloc_content_id();
+            song.clip_contents.insert(content_id, common::model::ClipContent::default());
+            let track = song.track_by_id_mut(1).expect("track");
+            let id = track.alloc_clip_id();
+            track.clips.push(Clip {
+                id,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id,
+                ..Clip::default()
+            });
+            key.clip_id = id;
+        });
+        key
+    }
+
+    /// セルを開いた後にグリッドの空白をクリックしても、セルは開いたまま。
+    ///
+    /// 空白クリックは幅ゼロの範囲ドラッグ (widget の `range_release`) として届く。
+    /// 以前はここでセルの窓をアレンジのトラック行の区間として張り直していたため、
+    /// 面タグが `TimeRange` へ倒れて表示集合が空になり、ピアノロールが
+    /// 「(クリップが選択されていません)」 になっていた。
+    #[test]
+    fn セルを開いた後に空白をクリックしてもセルは開いたまま() {
+        let mut app = build_app();
+        let cell = seed_with_cell(&mut app);
+        app.open_cell_editor(LauncherCellKey::Track(cell));
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell], "ダブルクリックで開く");
+
+        app.set_pianoroll_rect_selection(2.0, 2.0, 60, 60);
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell], "空白クリック後も開いたまま");
+
+        // ノートを選んで (= 面タグが Notes へ移る) から、もう一度空白クリック。
+        app.handle_event(AppEvent::AddNote {
+            key: cell,
+            start_beat: 1.0,
+            duration: 1.0,
+            pitch: 60,
+        });
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell]);
+        app.set_pianoroll_rect_selection(2.0, 2.0, 60, 60);
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell], "ノート選択を解除しても開いたまま");
+    }
+
+    /// セルのノートを選んでも、アレンジのクリップは巻き込まれない。
+    ///
+    /// セルの窓は常に 0 拍始まりなので、トラック行の区間として張ると「曲頭に
+    /// 居るだけの無関係なクリップ」が表示集合に割り込む。 しかも開始拍順に
+    /// 並ぶので先頭に入り、packed note id の `clip_slot` がずれて
+    /// ノート選択が別のクリップを指す。
+    #[test]
+    fn セルのノートを選んでもアレンジのクリップは混ざらない() {
+        let mut app = build_app();
+        let cell = seed_with_cell(&mut app);
+        let arranged = put_arrangement_clip(&mut app);
+        app.open_cell_editor(LauncherCellKey::Track(cell));
+
+        app.handle_event(AppEvent::AddNote {
+            key: cell,
+            start_beat: 1.0,
+            duration: 1.0,
+            pitch: 60,
+        });
+
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell], "映るのはセルだけ");
+        assert!(
+            !app.selected_clip_refs().contains(&arranged),
+            "アレンジのクリップは選択されない"
+        );
+    }
+
+    /// アレンジのクリップを選んだらセル選択は降り、ピアノロールもそちらへ移る
+    /// (オブジェクト選択は 1 面だけ)。
+    #[test]
+    fn アレンジのクリップを選ぶとセル選択は降りる() {
+        let mut app = build_app();
+        let cell = seed_with_cell(&mut app);
+        let arranged = put_arrangement_clip(&mut app);
+        app.open_cell_editor(LauncherCellKey::Track(cell));
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell]);
+
+        app.handle_event(AppEvent::SelectClip { target: arranged, additive: false });
+
+        assert!(
+            app.selection.selected_launcher_cells.is_empty(),
+            "セル選択は降りる (選択枠も消える)"
+        );
+        assert_eq!(app.shown_pianoroll_clips(), vec![arranged], "ピアノロールはアレンジへ移る");
     }
 }

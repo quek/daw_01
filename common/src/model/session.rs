@@ -18,7 +18,7 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use super::{AutomationClip, Clip};
+use super::{AutomationClip, Clip, ClipKey, LaneRef, Song};
 
 /// ランチャーの 1 列。`Song.scenes` に `Vec` 順 = 表示順で保持する
 /// (並べ替えは `Vec` 内の move、 参照は常に `id`)。
@@ -645,6 +645,52 @@ impl SessionCell for SessionClip {
 impl SessionCell for SessionAutomationClip {
     fn scene_id(&self) -> u32 {
         self.scene_id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// セル ⇄ 選択範囲: 「セルは曲の時間軸に居ない」ことから来る規則
+// ---------------------------------------------------------------------------
+
+impl Song {
+    /// [`ClipKey`] が **ランチャーのセル** を指しているか (アレンジのクリップなら `false`)。
+    ///
+    /// セルは `start_beat` を持たない (常に 0 = 「撃った瞬間が原点」) ので、
+    /// **曲の時間軸の上の区間として扱ってはいけない**。 選択範囲の
+    /// [`LaneRef::Track`] 行はアレンジのクリップを指す住所なので、セルのノートを
+    /// 選ぶときにこれを混ぜると「曲頭に居るだけの無関係なクリップ」が一緒に
+    /// 選ばれる (ピアノロールに他人のクリップが割り込む)。
+    #[must_use]
+    pub fn is_session_clip(&self, key: ClipKey) -> bool {
+        self.track_by_id(key.track_id)
+            .is_some_and(|t| t.session_clip_by_id(key.clip_id).is_some())
+    }
+
+    /// クリップ `key` の**中身**(ノート / オーディオイベント)を選ぶときに選択範囲へ
+    /// 入れるレーン群 = エディタ内の行 `inner`
+    /// ([`LaneRef::KeyTrack`] / [`LaneRef::AudioLane`]) + **アレンジのクリップの
+    /// ときだけ**そのトラック行。
+    ///
+    /// アレンジのクリップにトラック行を足すのは、アレンジ側でもそのクリップが選択
+    /// 表示になり、ピアノロールの表示集合がトラック行から解決できるから。
+    /// **ランチャーのセルには足さない** — セルは曲の時間軸に居ない
+    /// ([`Self::is_session_clip`]) ので、セルの窓 (常に 0 拍始まり) をトラック行の
+    /// 区間として張ると、曲頭に居るだけの無関係なアレンジのクリップがピアノロールに
+    /// 割り込み、`clip_slot` (= packed note id の上位 8bit) までずれて
+    /// ノート選択が別のクリップを指す (r.md #90)。
+    ///
+    /// 「セルの中身を選んでもアレンジの面は選ばれない」という契約の SSoT。
+    ///
+    /// note 1 つごとに呼ばれる (`Ctrl+A` は全 note を走る) ので確保しない。
+    /// `use<>` で `&self` を捕まえない — 呼び出し側が `song` の借用を返した直後に
+    /// `self` を可変で触る (選択の書き戻し) ため。
+    pub fn content_lanes_for(
+        &self,
+        key: ClipKey,
+        inner: LaneRef,
+    ) -> impl Iterator<Item = LaneRef> + use<> {
+        let outer = (!self.is_session_clip(key)).then_some(LaneRef::Track(key.track_id));
+        std::iter::once(inner).chain(outer)
     }
 }
 

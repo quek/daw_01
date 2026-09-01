@@ -281,6 +281,7 @@ impl AppData {
     pub(crate) fn set_time_selection(&mut self, next: Option<common::model::TimeSelection>) {
         let first_track = next.as_ref().and_then(|t| t.track_ids().next());
         self.selection.time = next;
+        self.drop_cell_selection_if_arrangement();
         // 範囲を張り直したら、そこに**入っていない** automation クリップ / 点の選択は
         // 落とす。 選択の SSoT は範囲 1 本なので、範囲の外に残った選択は
         // 「クリップを選んだのに Z が別のオートメーションクリップへ飛ぶ」
@@ -511,20 +512,25 @@ impl AppData {
         // ランチャーのセルを選んでいるときは**そのセル**を開く。 グリッドに時間軸が
         // 無いのでセルは範囲では表せず、唯一のオブジェクト選択として残っている
         // (`docs/plan_range_selection.md` §2.2)。
-        if self.selection.last_edit_select == Some(EditSurface::LauncherCells)
-            && !self.selection.selected_launcher_cells.is_empty()
-        {
+        //
+        // 判定は **セル選択が生きているか** 1 つだけ。 last-wins タグ
+        // (`last_edit_select`) は「Delete / Cut がどの面に効くか」を持つ別の関心事で、
+        // ピアノロール内でノートを選んだだけで `Notes` へ倒れる。 これを表示の
+        // 判定に流用していたので、**セルを開いた直後にピアノロール内をクリック
+        // しただけで「クリップが選択されていません」** になっていた (r.md #90)。
+        // アレンジの面を選んだらセル選択は排他で降りる
+        // (`drop_cell_selection_if_arrangement`) ので、タグ無しでも取り違えない。
+        if self.has_live_launcher_cells() {
             // レーン行のセルはピアノロールを持たない (曲線はレーン上で直接編集する)
             // ので、トラック行のセルだけを残す。
             return self
-                .selection
-                .selected_launcher_cells
-                .iter()
+                .live_launcher_cells()
+                .into_iter()
                 .filter_map(|cell| match cell {
-                    crate::event_launcher::LauncherCellKey::Track(k) => Some(*k),
+                    crate::event_launcher::LauncherCellKey::Track(k) => Some(k),
                     crate::event_launcher::LauncherCellKey::Lane(_) => None,
                 })
-                .filter(|k| self.live_clip_key(*k).is_some() && self.is_midi_clip(*k))
+                .filter(|k| self.is_midi_clip(*k))
                 .collect();
         }
         // トラック行から拾ったクリップに加えて、**鍵盤行が直接指しているクリップ**も
@@ -969,6 +975,7 @@ impl AppData {
             sel.extend(start, end, [common::model::LaneRef::Track(target.track_id)]);
             let first = sel.track_ids().next();
             self.selection.last_edit_select = Some(EditSurface::TimeRange);
+            self.drop_cell_selection_if_arrangement();
             if let Some(tid) = first {
                 self.select_track(tid);
             }
@@ -1056,11 +1063,12 @@ impl AppData {
         // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
         // 「Ctrl+A = 範囲面を選んだ」 という意図は確定している)。
         self.selection.last_edit_select = Some(EditSurface::TimeRange);
-        if self.selection.time == next {
-            return;
+        if self.selection.time != next {
+            self.selection.time = next;
+            self.selection.range_anchor = Some(0.0);
         }
-        self.selection.time = next;
-        self.selection.range_anchor = Some(0.0);
+        // 冪等 early-return より後 (既に全選択でも「アレンジの面を選んだ」は確定)。
+        self.drop_cell_selection_if_arrangement();
     }
 
 
