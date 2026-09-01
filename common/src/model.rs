@@ -2547,6 +2547,13 @@ impl Song {
     /// (positional 時代の「後続 index を詰める」 reindex 儀式は不要になった —
     /// r.md #8 A5 で実際に壊れた class の構造的解消)。
     /// 削除成功で `true`、 track 不在 / id 不在なら `false`。
+    ///
+    /// **ここが落とすのはこの send を狙う 1 段だけ。** r.md #89 で変調が安定 id を
+    /// 持ったので、落とした変調の **深さ**を指していた別の変調 / レーンが dangling に
+    /// なる。その連鎖掃除 ([`Self::prune_dangling_mod_targets`]) は song 全体を固定点
+    /// まで回す別種の操作なので、他の呼び出し箇所と同じく**編集の口**が担う
+    /// (`daw_gui/src/handler/mixer.rs` の `remove_send`)。呼び出し元を増やすなら
+    /// そこでも通すこと。
     pub fn remove_track_send(&mut self, track_id: u32, send_id: u32) -> bool {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
             return false;

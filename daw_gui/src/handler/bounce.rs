@@ -160,6 +160,10 @@ impl AppData {
             kept.mod_routings.retain(|r| !is_fader_lane(&r.target));
         }
         isolated.tracks = vec![kept];
+        // r.md #89 (同件): 外した変調の **深さ**を指していた変調 / レーンと、他トラック
+        // ごと落ちた変調への参照を連鎖して掃除する。render 用の使い捨て Song でも、
+        // dangling を残すと engine が「効かない行」を schedule に載せる。
+        isolated.prune_dangling_mod_targets();
         Some(isolated)
     }
 

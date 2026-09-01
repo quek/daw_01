@@ -444,7 +444,14 @@ impl AppData {
             return;
         };
         let removed = self
-            .edit_song(|song| song.remove_track_send(track_id, send_id))
+            .edit_song(|song| {
+                let removed = song.remove_track_send(track_id, send_id);
+                // r.md #89 (同件): 落とした SendGain 変調の **深さ**を指していた変調 /
+                // レーンを連鎖して掃除する (残すと何も動かさない行が保存され、次に
+                // 開いたときに無言で消える)。冪等なので健全な曲では no-op。
+                song.prune_dangling_mod_targets();
+                removed
+            })
             .unwrap_or(false);
         if removed {
             tracing::info!(track_id, send_idx, send_id, "removed send");

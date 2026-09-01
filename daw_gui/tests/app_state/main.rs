@@ -23,6 +23,7 @@ mod linked_clip_bounds;
 mod make_unique;
 mod modulation_arm;
 mod modulation_follower_edit;
+mod modulation_id_hygiene;
 mod open_stays_clean;
 mod pending_state_queue;
 mod plugin_load_failure;

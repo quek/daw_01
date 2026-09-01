@@ -256,6 +256,9 @@ impl AppData {
             });
             if let Some(pos) = self.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
                 self.edit_song(|song| song.tracks.remove(pos));
+                // r.md #89 (同件): 消えた group track の変調を **深さ**で参照していた
+                // レーン / 変調を落とす (track 削除経路と同じ規約)。
+                self.edit_song(|song| song.prune_dangling_mod_targets());
             }
             self.ui_prefs.collapsed_groups.remove(group_id);
         }
