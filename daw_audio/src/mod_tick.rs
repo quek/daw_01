@@ -106,6 +106,10 @@ pub struct ModTickRunner {
     plane: ModTickPlane,
     /// 1 行ぶんの scratch。
     row: Vec<f32>,
+    /// r.md #89 Q9: 深さの 1 行ぶん scratch (列 = `plan.depth_groups`)。
+    depth_row: Vec<f32>,
+    /// 同上の列 id (`plane.reset` に渡す。plan 差し替え時にだけ作り直す)。
+    depth_ids: Vec<u32>,
     /// フォロワー係数の刻みごとの表 (行 = 刻み、列 = `follower_cols`)。
     /// 係数が変調されているフォロワーが 1 つも無ければ空 = ゼロコスト。
     follower_eff: Vec<FollowerEff>,
@@ -130,6 +134,9 @@ impl ModTickRunner {
             next_mark: PhaseMark::default(),
             plane: ModTickPlane::with_capacity(n, MAX_TICKS_PER_BUFFER),
             row: Vec::with_capacity(n),
+            // 深さが動く変調はソース数より多くなり得ないので同じ器で足りる。
+            depth_row: Vec::with_capacity(n),
+            depth_ids: Vec::with_capacity(n),
             follower_eff: Vec::with_capacity(n * MAX_TICKS_PER_BUFFER),
             follower_cols: Vec::with_capacity(n),
             publish: ModPlane::with_capacity(n),
@@ -161,8 +168,11 @@ impl ModTickRunner {
             }
         }
         self.plan = plan;
+        self.depth_ids.clear();
+        self.depth_ids
+            .extend(self.plan.depth_groups.iter().map(|g| g.routing_id));
         self.marks.clear();
-        self.plane.reset(&[], MOD_TICK_FRAMES);
+        self.plane.reset(&[], &[], MOD_TICK_FRAMES);
         self.first_tick = i64::MIN;
         std::mem::replace(&mut self.rt, rt)
     }
@@ -197,7 +207,7 @@ impl ModTickRunner {
         self.first_tick = k;
         self.marks.clear();
         let n = self.n_slots();
-        self.plane.reset(&self.plan.slot_ids[..n], MOD_TICK_FRAMES);
+        self.plane.reset(&self.plan.slot_ids[..n], &self.depth_ids, MOD_TICK_FRAMES);
         self.follower_eff.clear();
         self.next_mark = PhaseMark {
             beat: boundary_beat,
@@ -226,7 +236,7 @@ impl ModTickRunner {
             self.first_tick = k0;
             self.marks.clear();
             let n = self.n_slots();
-            self.plane.reset(&self.plan.slot_ids[..n], MOD_TICK_FRAMES);
+            self.plane.reset(&self.plan.slot_ids[..n], &self.depth_ids, MOD_TICK_FRAMES);
             self.follower_eff.clear();
         } else {
             // 前 buffer から持ち越した、もう参照しない行を捨てる。
@@ -292,6 +302,16 @@ impl ModTickRunner {
             let plain = lane_base(song, &self.plan, slot, param, self.next_mark.beat);
             self.rt.set_base(slot, param, plain);
         }
+        // r.md #89 Q9: 深さの automation lane も同じ刻みで解決する。
+        for i in 0..self.plan.depth_groups.len() {
+            if !self.plan.depth_groups[i].has_lane {
+                continue;
+            }
+            let rid = self.plan.depth_groups[i].routing_id;
+            let base = self.plan.depth_groups[i].base_depth;
+            let plain = depth_lane_base(song, rid, base, self.next_mark.beat);
+            self.rt.set_depth_base(&self.plan, rid, plain);
+        }
         let mark = self.next_mark;
         common::mod_graph::tick(
             &self.plan,
@@ -311,7 +331,13 @@ impl ModTickRunner {
             self.row
                 .push(self.rt.value(u16::try_from(slot).unwrap_or(u16::MAX)));
         }
-        self.plane.push_row(&self.row);
+        // r.md #89 Q9: 深さも刻みごとに動く (深さを動かしていなければ空 = ゼロコスト)。
+        self.depth_row.clear();
+        for g in &self.plan.depth_groups {
+            self.depth_row
+                .push(self.rt.depth_for(&self.plan, g.routing_id).unwrap_or(g.base_depth));
+        }
+        self.plane.push_row(&self.row, &self.depth_row);
         for i in 0..self.follower_cols.len() {
             let s = self.follower_cols[i];
             #[allow(clippy::cast_possible_truncation)]
@@ -426,6 +452,14 @@ impl ModTickRunner {
             self.publish
                 .push(*id, row.values.get(i).copied().unwrap_or(0.0));
         }
+        // r.md #89 Q9: 深さの実効値も一緒に出す — GUI の深さリング / 到達値表示が
+        // 「動いている深さ」を見られないと、ラックの表示と音が食い違う。
+        for (i, g) in self.plan.depth_groups.iter().enumerate() {
+            self.publish.push_depth(
+                g.routing_id,
+                row.depths.get(i).copied().unwrap_or(g.base_depth),
+            );
+        }
         &self.publish
     }
 }
@@ -495,6 +529,25 @@ fn lane_base(song: &Song, plan: &ModPlan, slot: u16, param: ModParam, beat: f64)
     match lanes.iter().find(|l| l.enabled && l.target == target) {
         Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, beat),
         None => fallback_base(plan, slot, param),
+    }
+}
+
+/// `ModRoutingDepth` の automation lane を解決する (r.md #89 Q9)。
+/// 置き場は **その変調が置かれている所** (`Song::mod_routing_owner`)。
+fn depth_lane_base(song: &Song, routing_id: u32, base: f32, beat: f64) -> f32 {
+    let target = AutomationTarget::ModRoutingDepth { routing_id };
+    let lanes = match song.mod_routing_owner(routing_id) {
+        Some(MASTER_TRACK_ID) => song.song_lanes.as_slice(),
+        Some(track_id) => match song.tracks.iter().find(|t| t.id == track_id) {
+            Some(t) => t.automation_lanes.as_slice(),
+            None => return base,
+        },
+        None => return base,
+    };
+    match lanes.iter().find(|l| l.enabled && l.target == target) {
+        #[allow(clippy::cast_possible_truncation)]
+        Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32,
+        None => base,
     }
 }
 

@@ -23,6 +23,10 @@
 pub struct ModPlane {
     ids: Vec<u32>,
     values: Vec<f32>,
+    /// r.md #89 Q9: 深さが動く変調の `ModRouting::id`。
+    depth_ids: Vec<u32>,
+    /// 上と対の実効深さ。空なら「深さは全部モデル値のまま」。
+    depths: Vec<f32>,
 }
 
 impl ModPlane {
@@ -31,6 +35,8 @@ impl ModPlane {
         Self {
             ids: Vec::with_capacity(n),
             values: Vec::with_capacity(n),
+            depth_ids: Vec::with_capacity(n),
+            depths: Vec::with_capacity(n),
         }
     }
 
@@ -38,6 +44,21 @@ impl ModPlane {
     pub fn clear(&mut self) {
         self.ids.clear();
         self.values.clear();
+        self.depth_ids.clear();
+        self.depths.clear();
+    }
+
+    /// 深さが動く変調 1 本を追加する (r.md #89 Q9)。
+    pub fn push_depth(&mut self, routing_id: u32, depth: f32) {
+        self.depth_ids.push(routing_id);
+        self.depths.push(depth);
+    }
+
+    /// `routing_id` の実効深さ。深さが動かない変調は `None` (モデル値を使う)。
+    #[must_use]
+    #[inline]
+    pub fn depth(&self, routing_id: u32) -> Option<f32> {
+        self.as_ref().depth(routing_id)
     }
 
     /// 1 slot 追加する。`id == 0` (未採番 sentinel) も受けるが引けはしない。
@@ -79,6 +100,8 @@ impl ModPlane {
         ModPlaneRef {
             ids: &self.ids,
             values: &self.values,
+            depth_ids: &self.depth_ids,
+            depths: &self.depths,
         }
     }
 
@@ -108,12 +131,41 @@ impl ModPlane {
 pub struct ModPlaneRef<'a> {
     pub ids: &'a [u32],
     pub values: &'a [f32],
+    /// r.md #89 Q9: 深さが動く変調の id と実効深さ (対)。空なら全部モデル値のまま。
+    pub depth_ids: &'a [u32],
+    pub depths: &'a [f32],
 }
 
 impl<'a> ModPlaneRef<'a> {
     #[must_use]
     pub const fn new(ids: &'a [u32], values: &'a [f32]) -> Self {
-        Self { ids, values }
+        Self { ids, values, depth_ids: &[], depths: &[] }
+    }
+
+    /// 深さの面も持つビュー (r.md #89 Q9)。
+    #[must_use]
+    pub const fn with_depths(
+        ids: &'a [u32],
+        values: &'a [f32],
+        depth_ids: &'a [u32],
+        depths: &'a [f32],
+    ) -> Self {
+        Self { ids, values, depth_ids, depths }
+    }
+
+    /// `routing_id` の実効深さ。未知の id は `None` (= モデル値のまま)。
+    /// `depth_ids` は「深さを動かしている変調」だけなので通常 0〜数本。
+    #[must_use]
+    #[inline]
+    pub fn depth(&self, routing_id: u32) -> Option<f32> {
+        let mut i = 0;
+        while i < self.depth_ids.len() {
+            if self.depth_ids[i] == routing_id {
+                return self.depths.get(i).copied();
+            }
+            i += 1;
+        }
+        None
     }
 
     #[must_use]
@@ -177,6 +229,10 @@ pub struct ModTickPlane {
     ids: Vec<u32>,
     /// `rows * ids.len()` の row-major。
     values: Vec<f32>,
+    /// r.md #89 Q9: 深さが動く変調の `ModRouting::id` (列)。
+    depth_ids: Vec<u32>,
+    /// `rows * depth_ids.len()` の row-major。深さも刻みごとに動く。
+    depths: Vec<f32>,
     /// buffer 頭から **最初の刻み境界**までの frame 数。
     /// buffer 頭がちょうど境界なら [`crate::mod_graph::MOD_TICK_FRAMES`]
     /// (= 行 0 が buffer 頭の値、行 1 が 64 frame 目の値)。
@@ -189,27 +245,39 @@ impl ModTickPlane {
         Self {
             ids: Vec::with_capacity(sources),
             values: Vec::with_capacity(sources * ticks),
+            depth_ids: Vec::with_capacity(sources),
+            depths: Vec::with_capacity(sources * ticks),
             lead: crate::mod_graph::MOD_TICK_FRAMES,
         }
     }
 
     /// 列 (= slot の id 表) を張り直し、行を空にする。確保は起きない。
-    pub fn reset(&mut self, ids: &[u32], lead: u32) {
+    pub fn reset(&mut self, ids: &[u32], depth_ids: &[u32], lead: u32) {
         self.ids.clear();
         self.ids.extend_from_slice(ids);
         self.values.clear();
+        self.depth_ids.clear();
+        self.depth_ids.extend_from_slice(depth_ids);
+        self.depths.clear();
         self.lead = lead.max(1);
     }
 
     /// 行を 1 本足す (`values` は `ids` と同じ並び)。長さが足りなければ 0 で埋め、
     /// 余りは捨てる (行の長さが列数と食い違った表を作らない)。
-    pub fn push_row(&mut self, values: &[f32]) {
+    pub fn push_row(&mut self, values: &[f32], depths: &[f32]) {
         debug_assert_eq!(values.len(), self.ids.len());
         let cols = self.ids.len();
         let n = values.len().min(cols);
         self.values.extend_from_slice(&values[..n]);
         for _ in n..cols {
             self.values.push(0.0);
+        }
+        // r.md #89 Q9: 深さの実効値も同じ行数で持つ (刻みごとに動くので面と対)。
+        let dcols = self.depth_ids.len();
+        let dn = depths.len().min(dcols);
+        self.depths.extend_from_slice(&depths[..dn]);
+        for _ in dn..dcols {
+            self.depths.push(0.0);
         }
     }
 
@@ -222,6 +290,11 @@ impl ModTickPlane {
         }
         let cut = (n * cols).min(self.values.len());
         self.values.drain(..cut);
+        let dcols = self.depth_ids.len();
+        if dcols > 0 {
+            let dcut = (n * dcols).min(self.depths.len());
+            self.depths.drain(..dcut);
+        }
     }
 
     pub fn set_lead(&mut self, lead: u32) {
@@ -242,6 +315,8 @@ impl ModTickPlane {
         ModTickPlaneRef {
             ids: &self.ids,
             values: &self.values,
+            depth_ids: &self.depth_ids,
+            depths: &self.depths,
             lead: self.lead,
         }
     }
@@ -252,6 +327,9 @@ impl ModTickPlane {
 pub struct ModTickPlaneRef<'a> {
     pub ids: &'a [u32],
     pub values: &'a [f32],
+    /// r.md #89 Q9: 深さが動く変調の id と、行ごとの実効深さ。
+    pub depth_ids: &'a [u32],
+    pub depths: &'a [f32],
     /// buffer 頭から最初の刻み境界までの frame 数 (境界に乗っているなら 64)。
     pub lead: u32,
 }
@@ -259,7 +337,19 @@ pub struct ModTickPlaneRef<'a> {
 impl<'a> ModTickPlaneRef<'a> {
     #[must_use]
     pub const fn new(ids: &'a [u32], values: &'a [f32], lead: u32) -> Self {
-        Self { ids, values, lead }
+        Self { ids, values, depth_ids: &[], depths: &[], lead }
+    }
+
+    /// 深さの面も持つビュー (r.md #89 Q9)。
+    #[must_use]
+    pub const fn with_depths(
+        ids: &'a [u32],
+        values: &'a [f32],
+        depth_ids: &'a [u32],
+        depths: &'a [f32],
+        lead: u32,
+    ) -> Self {
+        Self { ids, values, depth_ids, depths, lead }
     }
 
     #[must_use]
@@ -281,9 +371,12 @@ impl<'a> ModTickPlaneRef<'a> {
     pub fn row(&self, i: usize) -> ModPlaneRef<'a> {
         let cols = self.ids.len();
         let start = i * cols;
+        let dcols = self.depth_ids.len();
+        let dstart = i * dcols;
+        let d = self.depths.get(dstart..dstart + dcols).unwrap_or(&[]);
         match self.values.get(start..start + cols) {
-            Some(v) => ModPlaneRef { ids: self.ids, values: v },
-            None => ModPlaneRef { ids: self.ids, values: &[] },
+            Some(v) => ModPlaneRef::with_depths(self.ids, v, self.depth_ids, d),
+            None => ModPlaneRef::with_depths(self.ids, &[], self.depth_ids, d),
         }
     }
 

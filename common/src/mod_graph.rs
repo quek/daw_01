@@ -40,6 +40,13 @@ pub const MOD_PHASE_TABLE_MAX_SECS: f64 = 24.0 * 3600.0;
 /// 変調できる param の数 ([`ModParam::ALL`] と同じ)。
 pub const MOD_PARAM_COUNT: usize = 10;
 
+/// `build_plan` の作業用: 1 本の入力辺 (変調元の位置, param, 深さ, 極性, `ModRouting::id`)。
+type RawEdge = (usize, ModParam, f32, Polarity, u32);
+/// `adj[dst]` = dst に入ってくる辺。
+type Adjacency = [Vec<RawEdge>];
+/// 深さが動く変調の作業用 (`ModRouting::id`, 深さを動かす辺, lane があるか)。
+type RawDepth = (u32, Vec<(usize, f32, Polarity)>, bool);
+
 /// このソースの位相が何に依存するか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModTier {
@@ -59,10 +66,42 @@ pub struct ModEdge {
     pub param: ModParam,
     /// 変調元の slot ([`ModPlan::nodes`] 内の位置)。
     pub src_slot: u16,
+    /// この辺の **静止した**深さ。深さ自体が変調 / オートメーションされている辺は
+    /// `depth_group` が `Some` になり、刻みごとの実効値がそちらに入る。
     pub depth: f32,
     pub polarity: Polarity,
     /// 輪を開くために **1 刻み前の値**を読む辺 (DFS の back-edge)。
     pub delayed: bool,
+    /// 深さが動く辺なら [`ModPlan::depth_groups`] の添字 (r.md #89 Q9)。
+    pub depth_group: Option<u16>,
+}
+
+/// **深さ自体が動く変調 1 本** (r.md #89 Q9 = Bitwig の modulation scaling)。
+///
+/// `ModRouting` の深さは、`AutomationTarget::ModRoutingDepth { routing_id }` を
+/// 指す変調とオートメーションレーンで動かせる。動く深さは
+/// [`ModRuntime::depth_for`] が刻みごとに解決し、変調先が
+/// モジュレーターのツマミなら [`tick`] が、track / plugin param なら
+/// [`crate::automation::modulation_offset_norm`] 系がそれを使う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepthGroup {
+    /// 深さが動く対象の `ModRouting::id`。
+    pub routing_id: u32,
+    /// モデル上の深さ (レーンが無ければこれが base)。
+    pub base_depth: f32,
+    /// この深さを動かす変調の辺。加算スタック (`modulation_offset_norm` と同契約)。
+    pub edges: Vec<DepthEdge>,
+    /// `ModRoutingDepth` の automation lane があるか (engine が刻みごとに
+    /// [`ModRuntime::set_depth_base`] へ書く)。
+    pub has_lane: bool,
+}
+
+/// [`DepthGroup`] に入る 1 本の辺。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthEdge {
+    pub src_slot: u16,
+    pub depth: f32,
+    pub polarity: Polarity,
 }
 
 /// トポロジカル順に並んだ 1 ソース。
@@ -96,6 +135,9 @@ pub struct ModPlan {
     /// automation lane が base を上書きする param の一覧 (engine が刻みごとに解決して
     /// [`ModRuntime::set_base`] へ書く)。`(slot, param)`。
     pub lane_params: Vec<(u16, ModParam)>,
+    /// **深さが動く変調** (r.md #89 Q9)。添字が [`ModEdge::depth_group`] /
+    /// [`ModRuntime::depth_for`] の鍵。
+    pub depth_groups: Vec<DepthGroup>,
 }
 
 impl ModPlan {
@@ -112,6 +154,15 @@ impl ModPlan {
     #[must_use]
     pub fn needs_integration(&self) -> bool {
         self.nodes.iter().any(|n| n.tier != ModTier::Closed)
+    }
+
+    /// `routing_id` の深さが動くなら [`Self::depth_groups`] の添字。
+    #[must_use]
+    pub fn depth_group_of(&self, routing_id: u32) -> Option<u16> {
+        self.depth_groups
+            .iter()
+            .position(|g| g.routing_id == routing_id)
+            .and_then(|i| u16::try_from(i).ok())
     }
 }
 
@@ -134,7 +185,7 @@ pub fn build_plan(
     // 1. 辺を集める。id → 元の位置。
     let pos_of = |id: u32| song.mod_sources.iter().position(|m| m.id == id);
     // adj[dst] = 入ってくる (src_pos, param, depth, polarity)
-    let mut adj: Vec<Vec<(usize, ModParam, f32, Polarity)>> = vec![Vec::new(); n];
+    let mut adj: Vec<Vec<RawEdge>> = vec![Vec::new(); n];
     for r in song.all_mod_routings() {
         let AutomationTarget::ModSourceParam { source_id, param } = &r.target else {
             continue;
@@ -146,8 +197,47 @@ pub fn build_plan(
         if !param.exists_on(&song.mod_sources[dst].kind) {
             continue;
         }
-        adj[dst].push((src, *param, r.depth, r.polarity));
+        adj[dst].push((src, *param, r.depth, r.polarity, r.id));
     }
+
+    // 1.5. r.md #89 Q9: **深さが動く変調**を集める。
+    //
+    // 深さは (a) `ModRoutingDepth { routing_id }` を指す変調と (b) 同 target の
+    // automation lane で動く。ここで拾わないと routing も lane も保存されるのに
+    // 深さは永久に静止したまま = 設計正本が禁じている「保存はされるのに効かない」。
+    let mut depth_src: Vec<RawDepth> = Vec::new();
+    fn depth_slot(
+        v: &mut Vec<RawDepth>,
+        rid: u32,
+    ) -> usize {
+        match v.iter().position(|(id, ..)| *id == rid) {
+            Some(i) => i,
+            None => {
+                v.push((rid, Vec::new(), false));
+                v.len() - 1
+            }
+        }
+    }
+    for r in song.all_mod_routings() {
+        if let AutomationTarget::ModRoutingDepth { routing_id } = &r.target
+            && let Some(src) = pos_of(r.source_id)
+        {
+            let i = depth_slot(&mut depth_src, *routing_id);
+            depth_src[i].1.push((src, r.depth, r.polarity));
+        }
+    }
+    // lane 側 (置き場は対象 routing と同じ)。
+    for rid in song.all_mod_routings().map(|r| r.id).collect::<Vec<_>>() {
+        let target = AutomationTarget::ModRoutingDepth { routing_id: rid };
+        let owner = song.mod_routing_owner(rid).unwrap_or(MASTER_TRACK_ID);
+        if song_has_lane(song, owner, &target) {
+            let i = depth_slot(&mut depth_src, rid);
+            depth_src[i].2 = true;
+        }
+    }
+    let base_depth_of = |rid: u32| {
+        song.all_mod_routings().find(|r| r.id == rid).map_or(0.0, |r| r.depth)
+    };
 
     // 2. DFS でトポロジカル順を作り、back-edge を delayed に落とす。
     let mut order: Vec<usize> = Vec::with_capacity(n);
@@ -274,12 +364,16 @@ pub fn build_plan(
         };
         let in_edges = adj[pos]
             .iter()
-            .map(|&(s, param, depth, polarity)| ModEdge {
+            .map(|&(s, param, depth, polarity, routing_id)| ModEdge {
                 param,
                 src_slot: slot_of_pos[s],
                 depth,
                 polarity,
                 delayed: back_edges.contains(&(pos, s)),
+                depth_group: depth_src
+                    .iter()
+                    .position(|(rid, ..)| *rid == routing_id)
+                    .and_then(|i| u16::try_from(i).ok()),
             })
             .collect();
         // lane 上書きの対象を集める (engine が刻みごとに解決する)。
@@ -305,11 +399,28 @@ pub fn build_plan(
         });
         slot_ids.push(src.id);
     }
-    ModPlan { nodes, slot_ids, generation, lane_params }
+    // 深さの群は slot 割当のあとで組む (辺の src を slot で持つため)。
+    let depth_groups = depth_src
+        .into_iter()
+        .map(|(routing_id, edges, has_lane)| DepthGroup {
+            routing_id,
+            base_depth: base_depth_of(routing_id),
+            edges: edges
+                .into_iter()
+                .map(|(s, depth, polarity)| DepthEdge {
+                    src_slot: slot_of_pos[s],
+                    depth,
+                    polarity,
+                })
+                .collect(),
+            has_lane,
+        })
+        .collect();
+    ModPlan { nodes, slot_ids, generation, lane_params, depth_groups }
 }
 
 /// `from` から辺を辿って `to` に到達できるか (輪の塗り分け用)。
-fn reaches(adj: &[Vec<(usize, ModParam, f32, Polarity)>], from: usize, to: usize) -> bool {
+fn reaches(adj: &Adjacency, from: usize, to: usize) -> bool {
     let mut seen = vec![false; adj.len()];
     let mut stack = vec![from];
     while let Some(v) = stack.pop() {
@@ -329,7 +440,7 @@ fn reaches(adj: &[Vec<(usize, ModParam, f32, Polarity)>], from: usize, to: usize
 /// 各ソースが「audio に依存する鎖」に載っているか (follower から到達可能か)。
 fn audio_dependency(
     song: &Song,
-    adj: &[Vec<(usize, ModParam, f32, Polarity)>],
+    adj: &Adjacency,
 ) -> Vec<bool> {
     let n = song.mod_sources.len();
     let mut dep: Vec<bool> = song
@@ -451,6 +562,11 @@ pub struct ModRuntime {
     base_from_lane: Vec<[bool; MOD_PARAM_COUNT]>,
     /// 各ソースの実効パラメータ (フォロワー係数の再計算に engine が使う)。
     eff: Vec<[f64; MOD_PARAM_COUNT]>,
+    /// 深さが動く変調の **base** (`ModPlan::depth_groups` と同じ並び)。
+    /// レーンがあれば engine が刻みごとに [`Self::set_depth_base`] で上書きする。
+    depth_base: Vec<f32>,
+    /// 深さが動く変調の **実効値** (同上)。[`tick`] が刻みの先頭で解決する。
+    depth: Vec<f32>,
     /// 次に来るはずの刻み。ずれたら位相を張り直す (locate / ループ折返し)。
     next_tick: i64,
     generation: u64,
@@ -472,6 +588,12 @@ impl ModRuntime {
         self.base.extend(plan.nodes.iter().map(|node| node.base));
         self.base_from_lane.clear();
         self.base_from_lane.resize(n, [false; MOD_PARAM_COUNT]);
+        self.depth_base.clear();
+        self.depth_base
+            .extend(plan.depth_groups.iter().map(|g| g.base_depth));
+        self.depth.clear();
+        self.depth
+            .extend(plan.depth_groups.iter().map(|g| g.base_depth));
         self.eff.clear();
         self.eff.resize(n, [0.0; MOD_PARAM_COUNT]);
         self.generation = plan.generation;
@@ -487,6 +609,24 @@ impl ModRuntime {
         if let Some(row) = self.base_from_lane.get_mut(usize::from(slot)) {
             row[param.index()] = true;
         }
+    }
+
+    /// `ModRoutingDepth` の automation lane が書いた深さ (r.md #89 Q9)。
+    /// `plan.depth_groups` に居ない `routing_id` は no-op。
+    pub fn set_depth_base(&mut self, plan: &ModPlan, routing_id: u32, plain: f32) {
+        if let Some(i) = plan.depth_group_of(routing_id)
+            && let Some(v) = self.depth_base.get_mut(usize::from(i))
+        {
+            *v = plain.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// `routing_id` の **刻み時点の実効深さ**。深さが動かない変調は `None`
+    /// (呼び出し側は `ModRouting::depth` をそのまま使う)。
+    #[must_use]
+    pub fn depth_for(&self, plan: &ModPlan, routing_id: u32) -> Option<f32> {
+        let i = plan.depth_group_of(routing_id)?;
+        self.depth.get(usize::from(i)).copied()
     }
 
     /// 直近の刻みの出力 (unipolar 0..=1)。
@@ -548,6 +688,22 @@ pub fn tick(
     if ctx.tick_index != rt.next_tick {
         seed_phases(plan, rt, table, ctx);
     }
+    // r.md #89 Q9: **深さの実効値**を刻みの先頭で解決する。
+    //
+    // 深さを動かすソースは、その深さが効く辺の下流にも居られる (深さの輪)。
+    // だから深さは **1 刻み前の値** (`rt.prev`) から作る — 辺の評価順に依存せず、
+    // 輪の 1 刻み遅延と同じ規則なので刻みが絶対位置に整列している限り決定論的。
+    for (i, g) in plan.depth_groups.iter().enumerate() {
+        let mut d = rt.depth_base[i];
+        for e in &g.edges {
+            let s = rt.prev[usize::from(e.src_slot)].clamp(0.0, 1.0);
+            d += match e.polarity {
+                Polarity::Unipolar => e.depth * s,
+                Polarity::Bipolar => e.depth * (2.0 * s - 1.0),
+            };
+        }
+        rt.depth[i] = d.clamp(-1.0, 1.0);
+    }
     for (slot, node) in plan.nodes.iter().enumerate() {
         // --- 1. 入力辺を畳んで実効パラメータを出す ---
         let mut off = [0.0f32; MOD_PARAM_COUNT];
@@ -558,9 +714,14 @@ pub fn tick(
                 rt.value[usize::from(e.src_slot)]
             }
             .clamp(0.0, 1.0);
+            // 深さが動く辺は刻みの実効値を使う (r.md #89 Q9)。
+            let depth = match e.depth_group {
+                Some(i) => rt.depth[usize::from(i)],
+                None => e.depth,
+            };
             off[e.param.index()] += match e.polarity {
-                Polarity::Unipolar => e.depth * s,
-                Polarity::Bipolar => e.depth * (2.0 * s - 1.0),
+                Polarity::Unipolar => depth * s,
+                Polarity::Bipolar => depth * (2.0 * s - 1.0),
             };
         }
         let base = rt.base[slot];
@@ -1097,6 +1258,75 @@ mod tests {
             out
         };
         assert_eq!(run(), run(), "同じ刻み列は bit 一致");
+    }
+
+    /// r.md #89 Q9: **変調 1 本の深さ**を別のモジュレーターで動かせること。
+    ///
+    /// 深さは plan 構築時の静止値ではなく刻みごとの実効値で効く。ここが繋がって
+    /// いないと routing もレーンも保存されるのに深さは永久に動かない
+    /// (設計正本が `accepts_launcher_cells` の教訓として禁じている
+    /// 「保存はされるのに永久に効かない」)。
+    #[test]
+    fn 変調の深さを別のモジュレーターで動かせる() {
+        // #1 が #2 の φ を深さ 0.5 で変調し、その **深さ** を #3 が動かす。
+        let song = song_with(
+            vec![
+                lfo_source(1, quarter()),
+                lfo_source(2, quarter()),
+                lfo_source(3, quarter()),
+            ],
+            vec![
+                ModRouting {
+                    id: 10,
+                    target: AutomationTarget::ModSourceParam {
+                        source_id: 2,
+                        param: ModParam::LfoPhase,
+                    },
+                    source_id: 1,
+                    depth: 0.5,
+                    polarity: Polarity::Unipolar,
+                },
+                ModRouting {
+                    id: 11,
+                    target: AutomationTarget::ModRoutingDepth { routing_id: 10 },
+                    source_id: 3,
+                    depth: -0.5,
+                    polarity: Polarity::Unipolar,
+                },
+            ],
+        );
+        let plan = build_plan(&song, 1, |_| 0.0);
+        assert_eq!(plan.depth_groups.len(), 1, "深さが動く変調を 1 本拾う");
+        assert_eq!(plan.depth_groups[0].routing_id, 10);
+        let slot2 = plan.slot_of(2).unwrap();
+        let mut rt = ModRuntime::default();
+        rt.install(&plan);
+        // 実効深さが刻みごとに動く (= 0.5 に張り付かない)。
+        let mut seen: Vec<f32> = Vec::new();
+        for k in 0..64 {
+            tick(&plan, &mut rt, None, ctx_at(k, 120.0, 48_000.0));
+            seen.push(rt.depth_for(&plan, 10).unwrap());
+        }
+        assert!(
+            seen.iter().any(|d| (*d - 0.5).abs() > 1e-6),
+            "深さが静止したままなら Q9 は成立していない: {seen:?}"
+        );
+        // 深さが動いた結果、変調先の出力も静止値のときと違う値になる。
+        let mut flat = song.clone();
+        flat.tracks[0].mod_routings.retain(|r| r.id != 11);
+        let flat_plan = build_plan(&flat, 1, |_| 0.0);
+        let mut flat_rt = ModRuntime::default();
+        flat_rt.install(&flat_plan);
+        let flat_slot2 = flat_plan.slot_of(2).unwrap();
+        let mut differed = false;
+        for k in 0..64 {
+            tick(&plan, &mut rt, None, ctx_at(k, 120.0, 48_000.0));
+            tick(&flat_plan, &mut flat_rt, None, ctx_at(k, 120.0, 48_000.0));
+            if (rt.value(slot2) - flat_rt.value(flat_slot2)).abs() > 1e-6 {
+                differed = true;
+            }
+        }
+        assert!(differed, "深さの変調が変調先の出力に届いていない");
     }
 
     /// tier は **位相が何に依存するか**だけで決まること。

@@ -474,15 +474,31 @@ pub fn modulation_offset_norm(
     routings: &[ModRouting],
     scalar: impl Fn(u32) -> f32,
 ) -> f32 {
+    modulation_offset_norm_with(target, routings, scalar, |r| r.depth)
+}
+
+/// [`modulation_offset_norm`] の **深さも解決する**版 (r.md #89 Q9)。
+///
+/// 深さは `AutomationTarget::ModRoutingDepth { routing_id }` を指す変調と
+/// オートメーションレーンで動く。`depth` はその実効値を返す resolver で、
+/// 動かない変調では `r.depth` をそのまま返す。合成そのものは 1 本のままにして、
+/// 「深さがどこから来るか」だけを差し替える (SSoT)。
+pub fn modulation_offset_norm_with(
+    target: &AutomationTarget,
+    routings: &[ModRouting],
+    scalar: impl Fn(u32) -> f32,
+    depth: impl Fn(&ModRouting) -> f32,
+) -> f32 {
     let mut sum = 0.0f32;
     for r in routings {
         if &r.target != target {
             continue;
         }
         let s = scalar(r.source_id).clamp(0.0, 1.0);
+        let d = depth(r);
         sum += match r.polarity {
-            Polarity::Unipolar => r.depth * s,
-            Polarity::Bipolar => r.depth * (2.0 * s - 1.0),
+            Polarity::Unipolar => d * s,
+            Polarity::Bipolar => d * (2.0 * s - 1.0),
         };
     }
     sum
@@ -508,7 +524,7 @@ pub fn apply_modulation(
     routings: &[ModRouting],
     scalar: impl Fn(u32) -> f32,
 ) -> f64 {
-    let offset = modulation_offset_norm(target, routings, scalar);
+    let offset = modulation_offset_norm_with(target, routings, scalar, |r| r.depth);
     if offset == 0.0 && !routings.iter().any(|r| &r.target == target) {
         return base;
     }
@@ -530,7 +546,12 @@ pub fn apply_modulation_with_plane(
     routings: &[ModRouting],
     plane: ModPlaneRef<'_>,
 ) -> f64 {
-    apply_modulation(target, base, routings, |source_id| plane.scalar(source_id))
+    let offset = modulation_offset_norm_with_plane(target, routings, plane);
+    if offset == 0.0 && !routings.iter().any(|r| &r.target == target) {
+        return base;
+    }
+    let norm_eff = (plain_to_norm(target, base) + offset).clamp(0.0, 1.0);
+    norm_to_plain(target, norm_eff)
 }
 
 /// [`modulation_offset_norm`] の値面版 ([`apply_modulation_with_plane`] と対)。
@@ -539,7 +560,13 @@ pub fn modulation_offset_norm_with_plane(
     routings: &[ModRouting],
     plane: ModPlaneRef<'_>,
 ) -> f32 {
-    modulation_offset_norm(target, routings, |source_id| plane.scalar(source_id))
+    // r.md #89 Q9: 深さが動く変調は面が持つ実効値を使う (動かない変調はモデル値)。
+    modulation_offset_norm_with(
+        target,
+        routings,
+        |source_id| plane.scalar(source_id),
+        |r| plane.depth(r.id).unwrap_or(r.depth),
+    )
 }
 
 /// Phase 4 Step D (`docs/plan_automation.md` §6): recording 中の point 列に
