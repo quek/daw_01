@@ -398,6 +398,8 @@ pub struct ModRuntime {
     phase: Vec<f64>,
     value: Vec<f32>,
     prev: Vec<f32>,
+    /// envelope follower の出力 (engine ring が `set_follower` で書く)。
+    follower: Vec<f32>,
     base: Vec<[f64; MOD_PARAM_COUNT]>,
     /// 各ソースの実効パラメータ (フォロワー係数の再計算に engine が使う)。
     eff: Vec<[f64; MOD_PARAM_COUNT]>,
@@ -416,6 +418,8 @@ impl ModRuntime {
         self.value.resize(n, 0.0);
         self.prev.clear();
         self.prev.resize(n, 0.0);
+        self.follower.clear();
+        self.follower.resize(n, 0.0);
         self.base.clear();
         self.base.extend(plan.nodes.iter().map(|node| node.base));
         self.eff.clear();
@@ -458,9 +462,13 @@ impl ModRuntime {
         self.phase.get(usize::from(slot)).copied().unwrap_or(0.0)
     }
 
-    /// follower の出力を書き込む (engine ring が算出した env)。
+    /// envelope follower の出力を書き込む (engine ring が算出した `env`)。
+    ///
+    /// **`slot` は [`ModPlan`] の slot** — `Song::mod_sources` の位置ではない
+    /// (plan はトポロジカル順に並べ替える)。engine は `plan.slot_of(source_id)` で
+    /// 解決してから呼ぶこと。次の [`tick`] がこの値をそのままそのソースの出力にする。
     pub fn set_follower(&mut self, slot: u16, env: f32) {
-        if let Some(v) = self.value.get_mut(usize::from(slot)) {
+        if let Some(v) = self.follower.get_mut(usize::from(slot)) {
             *v = env.clamp(0.0, 1.0);
         }
     }
@@ -468,14 +476,15 @@ impl ModRuntime {
 
 /// 1 制御刻みを進める。**クロス変調の評価点はここ 1 つ**。
 ///
-/// `follower_env` は slot 順の envelope follower 出力 (engine ring が算出)。
+/// envelope follower の出力は事前に [`ModRuntime::set_follower`] で書いておく
+/// (引数で渡さないのは、plan の slot 順と `Song::mod_sources` の順が違うため —
+/// 呼び出し側に `plan.slot_of(id)` を通させて取り違えを構造的に防ぐ)。
 /// `table` があれば locate 時の位相を厳密に張り直す ([`ModTier::Integrated`])。
 ///
 /// RT 安全: alloc / lock / I/O 無し。`ModSourceKind` を clone しない。
 pub fn tick(
     plan: &ModPlan,
     rt: &mut ModRuntime,
-    follower_env: &[f32],
     table: Option<&ModPhaseTable>,
     ctx: TickCtx,
 ) {
@@ -543,7 +552,7 @@ pub fn tick(
         // --- 3. 出力 ---
         let v = match &node.kind {
             ModSourceKind::EnvelopeFollower { .. } => {
-                follower_env.get(slot).copied().unwrap_or(0.0).clamp(0.0, 1.0)
+                rt.follower[slot]
             }
             kind => {
                 let g = GenParams {
@@ -655,7 +664,6 @@ fn walk(
         tick(
             plan,
             rt,
-            &[],
             None,
             TickCtx {
                 beat: mark.beat,
@@ -904,7 +912,7 @@ mod tests {
             rt.install(&plan);
             for k in [0i64, 1, 17, 1000] {
                 let ctx = ctx_at(k, 120.0, 48_000.0);
-                tick(&plan, &mut rt, &[], None, ctx);
+                tick(&plan, &mut rt, None, ctx);
                 let closed = crate::modulators::generator_scalar(
                     &plan.nodes[0].kind,
                     ModTime::new(ctx.beat, ctx.secs),
@@ -956,7 +964,7 @@ mod tests {
             rt.install(&plan);
             let mut out = Vec::new();
             for k in 0..64 {
-                tick(&plan, &mut rt, &[], None, ctx_at(k, 120.0, 48_000.0));
+                tick(&plan, &mut rt, None, ctx_at(k, 120.0, 48_000.0));
                 out.push((rt.value(0), rt.value(1)));
             }
             out
