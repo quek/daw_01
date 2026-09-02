@@ -78,7 +78,9 @@ const PAN_READOUT_SENSITIVITY: f32 = 0.004;
 /// 列から左右へはみ出してメーター列に食い込み、 (b) 帯の左半分が空いたままだった。
 /// ストリップ幅 (80px) は据え置きで、 左右に捨てていた 12.5px ずつの余白から取る。
 const FADER_W: f32 = 31.0;
-const METER_GAP: f32 = 2.0;
+/// fader 列と meter 列の隙間。widget 内部の分割 (`channel_fader_meter`) と同じ値を
+/// 引く (ここだけ変えると group 幅と内部分割がずれる)。
+const METER_GAP: f32 = daw_ui_core::FADER_METER_GAP;
 /// scale 付きステレオメーターの box 幅 (px)。 widget が内部で
 /// `[tick ~6 | L バー | R バー | 数字 ~18]` に配分する。 全 ch に dB 目盛りを
 /// 付けつつ 80px ストリップ (fader 31 + gap 2 と並べて左右 6px 余白) に収まる幅。

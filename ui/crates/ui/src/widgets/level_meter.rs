@@ -64,6 +64,29 @@ const SCALE_VPAD: f32 = 6.0;
 /// 文字幅の近似係数 (固定幅前提、 chip 幅 / 中央寄せ用)。
 pub(crate) const CHAR_W_RATIO: f32 = 0.62;
 
+/// 目盛りガター `(tick 側, 数字側)` の幅。目盛り無しなら両方 0。
+/// 極小 rect では両方まとめて `rect_w - 4` に潰す (バーの居場所を最低 4px 残す)。
+fn scale_gutters(rect_w: f32, has_scale: bool) -> (f32, f32) {
+    if !has_scale {
+        return (0.0, 0.0);
+    }
+    let total = (SCALE_TICK_GUTTER_W + SCALE_NUM_GUTTER_W).min((rect_w - 4.0).max(0.0));
+    let tg = SCALE_TICK_GUTTER_W.min(total);
+    (tg, total - tg)
+}
+
+/// 幅 `rect_w` のステレオメーターで **1 チャンネルのバーが何 px になるか**。
+///
+/// `level_meter_stereo` / `channel_fader_meter` の内部レイアウトと同じ式。隣に別種の
+/// メーター (ラウドネスバー等) を並べる caller がこれを引くと、太さを揃えられる
+/// (太さを推測して定数で書くと、こちらの gutter を変えた瞬間にずれる)。
+#[must_use]
+pub fn stereo_bar_width(rect_w: f32, has_scale: bool) -> f32 {
+    let (tick_g, num_g) = scale_gutters(rect_w, has_scale);
+    let bars_w = (rect_w - tick_g - num_g).max(0.0);
+    (bars_w - STEREO_BAR_GAP).max(0.0) * 0.5
+}
+
 /// `MeterScale` の default ラベル dB 列 (上 → 下)。 均等 6dB 間隔 (+6 → -60)。
 const DEFAULT_SCALE_DB: &[f32] =
     &[6.0, 0.0, -6.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0];
@@ -420,18 +443,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // 2. 横レイアウト: [tick ガター(左) | L バー | R バー | 数字ガター(右)]。
         let has_scale = style.scale.is_some();
-        let (tick_g, num_g) = if has_scale {
-            let total = (SCALE_TICK_GUTTER_W + SCALE_NUM_GUTTER_W).min((rect.w - 4.0).max(0.0));
-            let tg = SCALE_TICK_GUTTER_W.min(total);
-            (tg, total - tg)
-        } else {
-            (0.0, 0.0)
-        };
-        // bar_each は利用可能幅から導出 (floor は max(0.0))。 これで 2*bar_each + gap == bars_w と
-        // なり、 bars_right == rect.x + tick_g + bars_w <= rect 右端 = 横方向も矩形内に収まる
-        // (degenerate な極小 rect.w でもバーが矩形外に出ない)。
-        let bars_w = (rect.w - tick_g - num_g).max(0.0);
-        let bar_each = (bars_w - STEREO_BAR_GAP).max(0.0) * 0.5;
+        let (tick_g, _num_g) = scale_gutters(rect.w, has_scale);
+        // bar_each は利用可能幅から導出 (`stereo_bar_width` と同じ式 = 隣に置く別
+        // メーターがこの太さに揃えられる)。 2*bar_each + gap == bars_w となり、
+        // bars_right <= rect 右端 = 横方向も矩形内に収まる (極小 rect.w でも出ない)。
+        let bar_each = stereo_bar_width(rect.w, has_scale);
         let left_x = rect.x + tick_g;
         let right_x = left_x + bar_each + STEREO_BAR_GAP;
         let bars_right = right_x + bar_each;

@@ -19,8 +19,9 @@
 //! 設定は各メーターの**右クリック**で変える (`AppEvent::SetMeterSettings`)。
 
 use daw_ui_core::{
-    CorrelationStyle, Edit, GoniometerStyle, LevelMeterStyle, LoudnessMeterStyle, MeterBallistic,
-    MeterScale, OscilloscopeStyle, SpectrumStyle, ToggleButtonStyle, Ui,
+    CorrelationStyle, Edit, FADER_METER_GAP, GoniometerStyle, LevelMeterStyle,
+    LoudnessMeterStyle, MeterBallistic, MeterScale, OscilloscopeStyle, SpectrumStyle,
+    ToggleButtonStyle, Ui, loudness_meter_label_w, stereo_bar_width,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
@@ -52,8 +53,11 @@ const READ_LINE_H: f32 = 13.0;
 /// 2 種類の見た目になる)。
 const FADER_W: f32 = 31.0;
 const FADER_GROUP_W: f32 = 68.0;
-/// ラウドネス LU バーの幅 (バー + 目盛り数字)。
-const LOUDNESS_BAR_W: f32 = 46.0;
+/// LU バーの列と数値欄の間 (px)。数字がバーの目盛りに食い込まない最小。
+/// LU バーの列幅そのものは定数ではなく、ピークメーター 1ch の太さ
+/// (`stereo_bar_width`) + 枠 + 目盛り数字幅 (`loudness_meter_label_w`) から
+/// 毎フレーム導く (旧 `LOUDNESS_BAR_W = 46` は残り全部がバーになり 22px の帯だった)。
+const LU_READOUT_GAP: f32 = 4.0;
 /// 数値読み出し列に最低限必要な幅。
 const READOUT_MIN_W: f32 = 84.0;
 /// Reset ボタンの高さ。
@@ -361,16 +365,22 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
     level_context_menu(ui, fader_rect, settings);
 
     // ---- ラウドネス ----
-    let rest_x = body.x + FADER_GROUP_W + 8.0;
+    // LU バーは **ピークメーター 1ch と同じ太さ**で、ピークメーターとの隙間は
+    // フェーダーとピークメーターの隙間 (`FADER_METER_GAP`) と同じ。太さも隙間も
+    // 定数で推測せず、ピークメーターが実際に使っている式 / 値から引く
+    // (ずれた瞬間に「なぜこの帯だけ太いのか」になる)。
+    let peak_bar_w = stereo_bar_width(FADER_GROUP_W - FADER_W - FADER_METER_GAP, true);
+    let lu_col_w = peak_bar_w + 2.0 + loudness_meter_label_w();
+    let rest_x = body.x + FADER_GROUP_W + FADER_METER_GAP;
     let rest_w = (body.x + body.w - rest_x).max(0.0);
     if rest_w < READOUT_MIN_W {
         return;
     }
-    let (bar_w, read_x, read_w) = if rest_w >= LOUDNESS_BAR_W + 6.0 + READOUT_MIN_W {
+    let (bar_w, read_x, read_w) = if rest_w >= lu_col_w + LU_READOUT_GAP + READOUT_MIN_W {
         (
-            LOUDNESS_BAR_W,
-            rest_x + LOUDNESS_BAR_W + 6.0,
-            rest_w - LOUDNESS_BAR_W - 6.0,
+            lu_col_w,
+            rest_x + lu_col_w + LU_READOUT_GAP,
+            rest_w - lu_col_w - LU_READOUT_GAP,
         )
     } else {
         (0.0, rest_x, rest_w)
@@ -381,6 +391,7 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
         let lu = |v: f32| if v.is_finite() { v - target } else { f32::NEG_INFINITY };
         let style = LoudnessMeterStyle {
             range_lu: settings.loudness_scale.range_lu(),
+            bar_w: peak_bar_w,
             ..LoudnessMeterStyle::from_palette(p)
         };
         ui.loudness_meter(

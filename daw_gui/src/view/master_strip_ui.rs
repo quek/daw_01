@@ -167,7 +167,8 @@ fn draw_comp<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, strip: 
             range: (0.0, MASTER_GR_METER_RANGE_DB),
             // Reason の文字盤と同じ刻み。
             ticks: &[(0.0, "0"), (2.0, "2"), (4.0, "4"), (8.0, "8"), (12.0, "12"), (20.0, "20")],
-            unit: "dB COMPRESSION",
+            // 単位ラベルは置かない (文字盤が小さく、数字と重なって読みにくい)。
+            unit: "",
         },
         &style,
     );

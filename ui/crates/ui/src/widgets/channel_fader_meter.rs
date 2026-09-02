@@ -48,7 +48,10 @@ use crate::widgets::scrubable_number::Modulation;
 
 /// fader 列と meter 列の間の隙間 (px)。 daw_01 の従来 `METER_GAP` と一致 (group_w 55 =
 /// fader 18 + gap 2 + meter 35 を内部分割で踏襲)。
-const METER_GAP: f32 = 2.0;
+///
+/// `pub`: 隣にメーターを並べる caller (mixer strip の group 幅 / マスターパネルの
+/// LU バー) が同じ隙間を使うための SSoT。
+pub const METER_GAP: f32 = 2.0;
 
 /// [`Ui::channel_fader_meter`] の戻り値。
 pub struct ChannelFaderMeterResponse {

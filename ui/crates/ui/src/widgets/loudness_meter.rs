@@ -43,6 +43,12 @@ pub struct LoudnessMeterStyle {
     pub range_lu: (f32, f32),
     /// 目盛りの数字を描くか。
     pub show_labels: bool,
+    /// バー (塗り) の幅の上限 (px)。
+    ///
+    /// 旧実装は「rect から目盛り数字を引いた**残り全部**」をバーにしていたため、
+    /// 太さが rect 幅の成り行きで決まり、隣のピークメーター (1ch ≈ 10px) の 2 倍
+    /// 以上に膨れた。太さは caller が意図して決めるものなので style に持つ。
+    pub bar_w: f32,
 }
 
 impl LoudnessMeterStyle {
@@ -59,8 +65,23 @@ impl LoudnessMeterStyle {
             label: p.text_dim.with_alpha(0.9),
             range_lu: (-18.0, 9.0),
             show_labels: true,
+            // 既定は上限なし (= 数字を引いた残り全部 = 従来の見え方)。太さは caller が
+            // 隣のメーターに揃えて決めるもので、ここで適当な px を置くと「揃えたつもり
+            // の推測値」が残る (daw_01 のマスターパネルは `stereo_bar_width` で導出)。
+            bar_w: f32::INFINITY,
         }
     }
+}
+
+/// 目盛り数字の列に要る幅 (px)。`loudness_meter` はこの幅をバーの右に確保する。
+/// caller が列幅を `bar_w + 枠 2 + この値` で決めれば、右に余白が残らない。
+///
+/// = 最長ラベル 3 文字 (`-18` / `-36`) の字幅 + バーとの隙間 2px。字幅はピーク
+/// メーターの目盛りと同じ近似 (`CHAR_W_RATIO`) で見積もる。旧 `font × 2.4` は
+/// 4 文字ぶん近くあり、右端に 3〜5px の空きが残っていた。
+#[must_use]
+pub fn loudness_meter_label_w() -> f32 {
+    LABEL_FONT_PX * super::level_meter::CHAR_W_RATIO * 3.0 + 2.0
 }
 
 /// LU → rect 内の y 座標 (上が大きい値)。
@@ -94,14 +115,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             clip_rect: None,
         });
         let label_w = if style.show_labels {
-            (LABEL_FONT_PX * 2.4).min(rect.w * 0.55)
+            loudness_meter_label_w().min(rect.w * 0.55)
         } else {
             0.0
         };
+        // バーは `style.bar_w` を上限に、目盛り数字の左に置く。rect が余っても
+        // バーは太らせない (余白は caller の列配分の問題で、メーターの太さではない)。
         let bar = Rect {
             x: rect.x + 1.0,
             y: rect.y + VPAD,
-            w: (rect.w - 2.0 - label_w).max(2.0),
+            w: (rect.w - 2.0 - label_w).max(2.0).min(style.bar_w.max(2.0)),
             h: (rect.h - VPAD * 2.0).max(2.0),
         };
 
