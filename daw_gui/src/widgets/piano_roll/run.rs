@@ -974,10 +974,18 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             (sc.root, sc.in_scale_mask, mode_tag)
         });
         let snap_drag_key: u8 = u8::from(view.snap_pitch_during_drag);
-        // (M14 Phase 124 / daw_01 #100) subdivision 間隔を cache key に含める。 cached() は
-        // viewport_key 一致時に内側 (bar_beat_grid 含む) を完全 skip するので、 bar_beat_grid 内の
-        // input_hash だけでは足りず、 ここで invalidate 経路を張る必要がある。 None=0 / Some=bits。
-        let sub_grid_key: u64 = view.sub_grid_interval_beats.map_or(0, f64::to_bits);
+        // 線の打ち方: Adaptive は線 = 吸着単位 (`GridLines::Unit`)、 固定 snap は bar/beat +
+        // 3 段目 (M14 Phase 124 / #100)。 cached() は viewport_key 一致時に内側 (bar_beat_grid 含む)
+        // を完全 skip するので、 線の集合を決める key をここで viewport_key に入れる
+        // (bar_beat_grid 内の input_hash だけでは効かない)。
+        let grid_lines_pr = GridLines::from_snap(
+            &view.snap,
+            zoom_x_px_per_beat,
+            view.sub_grid_interval_beats,
+            style.sub_line,
+            style.sub_line_width_px,
+        );
+        let sub_grid_key: u64 = grid_lines_pr.cache_key();
         // S4c: `PianoRollView.notes_generation` を撤去。cached 層が依存する note 内容 + 表示状態
         // (dimmed / locked / track color / mute) は `internal_note_hash` (fold_piano_roll_note_hash)
         // が全て覆うので、 view 側の世代 hook は不要 (correct-by-construction)。tuple 構造変更で v5 へ。
@@ -1029,17 +1037,6 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // M14 Phase 63m (daw_01 #027): zoom 連動の beat 線間引き (default 4px)。
             ..BarBeatGridStyle::from_palette(p)
         };
-        // M14 Phase 124 (#100): 3 段目 subdivision。 caller が拍間隔を渡したときだけ構築
-        // (ズーム退避は bar_beat_grid 内の px_per_interval 判定に委ねる)。 cache 無効化は
-        // viewport_key に interval を含めて行う (下記、 cached が viewport_key で short-circuit
-        // するため bar_beat_grid 内の input_hash だけでは効かない)。
-        let sub_grid_pr: Option<SubGridSpec> = view.sub_grid_interval_beats.and_then(|iv| {
-            (iv > 0.0).then_some(SubGridSpec {
-                interval_beats: iv,
-                color: style.sub_line,
-                line_width: style.sub_line_width_px,
-            })
-        });
         let ruler_style_pr = TimeRulerStyle {
             bg: style.ruler_bg,
             tick_color: style.bar_line,
@@ -1140,7 +1137,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     mapping,
                     sample_viewport,
                     grid_style_pr,
-                    sub_grid_pr,
+                    grid_lines_pr,
                 );
                 if ruler_h > 0.0 {
                     hctx.ui_mut().time_ruler(

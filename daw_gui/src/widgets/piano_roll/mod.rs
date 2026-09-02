@@ -41,7 +41,7 @@ use crate::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, loop_band_hit_kind,
 };
-use crate::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeGridExt, TimeRulerStyle};
+use crate::widgets::time_grid::{BarBeatGridStyle, GridLines, TimeGridExt, TimeRulerStyle};
 
 pub(crate) mod view_build;
 mod draw;

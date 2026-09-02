@@ -70,9 +70,19 @@ pub(super) fn dispatch(
             |a, &x| a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x)),
         )
     });
+    // 線の打ち方。 Adaptive snap は線 = 吸着単位 (`GridLines::Unit`: ズームインで拍より細かい線、
+    // ズームアウトで小節線の間引き)。 固定 snap はアレンジでは 2 段のまま (#100: 3 段目は
+    // ピアノロール限定)。 cached 層が描くので線の集合を決める key を viewport_key に入れる。
+    let grid_lines = GridLines::from_snap(
+        &f.view.snap,
+        f.zoom_x_px_per_beat,
+        None,
+        f.style.sub_line,
+        f.style.sub_line_width_px,
+    );
     let viewport_key = (
         (
-            b"arrangement_widget_v8" as &[u8],
+            b"arrangement_widget_v9" as &[u8],
             f.rect.w.to_bits(),
             f.rect.h.to_bits(),
             f.view.start_beat.to_bits(),
@@ -95,6 +105,7 @@ pub(super) fn dispatch(
         // 変化で旧座標に描かれるのを correct-by-construction で防ぐ。
         (f.rect.x.to_bits(), f.rect.y.to_bits(), f.view.arranger_lane_h.to_bits()),
         bend_skip_hash,
+        grid_lines.cache_key(),
     );
 
     // M14 Phase 63n-3 (#028) / 63c (#016) / 63n-8 (#033): heavy 用 selection 集合。
@@ -187,6 +198,7 @@ pub(super) fn dispatch(
         mapping,
         sample_viewport,
         grid_style,
+        grid_lines,
         ruler_style,
     };
 
@@ -226,6 +238,8 @@ pub(super) struct HeavyInput {
     pub mapping: TimeMapping,
     pub sample_viewport: ViewportState1D,
     pub grid_style: BarBeatGridStyle,
+    /// 線の打ち方 (snap 設定から `GridLines::from_snap` で組んだもの)。 `viewport_key` の材料。
+    pub grid_lines: GridLines,
     pub ruler_style: TimeRulerStyle,
 }
 
@@ -268,8 +282,7 @@ fn render_arrangement_heavy(
                 heavy.mapping,
                 heavy.sample_viewport,
                 heavy.grid_style,
-                // M14 Phase 124 (#100): subdivision はピアノロール限定なので arrangement は None。
-                None,
+                heavy.grid_lines,
             );
             draw_clips(hctx, &f.visible_tracks, &f.tops, f.view, lanes, f.style);
             // M14 Phase 63k (#025): fade を持つ clip に envelope を重ねる。

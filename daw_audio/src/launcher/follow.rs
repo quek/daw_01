@@ -174,6 +174,11 @@ fn pick(len: usize, seed: u64, step: i64) -> usize {
 /// - Unlinked: `time_beats` ごと
 #[must_use]
 pub fn due_beat(action: &FollowAction, launch_beat: f64, loop_len: f64) -> Option<f64> {
+    span_beats(action, loop_len).map(|span| launch_beat + span)
+}
+
+/// 発火の周期 (拍)。`None` = 発火しない (無効 / 周期が定まらない)。
+fn span_beats(action: &FollowAction, loop_len: f64) -> Option<f64> {
     if !action.enabled {
         return None;
     }
@@ -182,7 +187,18 @@ pub fn due_beat(action: &FollowAction, launch_beat: f64, loop_len: f64) -> Optio
     } else {
         action.time_beats
     };
-    (span.is_finite() && span > 0.0).then_some(launch_beat + span)
+    (span.is_finite() && span > 0.0).then_some(span)
+}
+
+/// **走行中に設定が変わった**ときの張り直し: `launch_beat` を起点に周期を刻み、`now` 以降で
+/// 最初に来る発火拍 (`launch_beat + k * span`, k >= 1) を返す。過去の拍に張ると
+/// その場で暴発するので、起点からの k 周目へ進める。
+#[must_use]
+pub fn next_due_beat(action: &FollowAction, launch_beat: f64, loop_len: f64, now: f64) -> Option<f64> {
+    let span = span_beats(action, loop_len)?;
+    let k = ((now - launch_beat) / span).ceil().max(1.0);
+    let at = launch_beat + k * span;
+    at.is_finite().then_some(at)
 }
 
 #[cfg(test)]

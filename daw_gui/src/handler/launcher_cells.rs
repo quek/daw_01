@@ -29,8 +29,8 @@ use common::model::{
 };
 
 use crate::event_launcher::{
-    CellToArrangerDrop, ClipToCellDrop, LaunchEdit, LauncherCellKey, LauncherCellMove,
-    LauncherDropMode, LauncherRow,
+    ArrangementClipRef, CellToArrangerDrop, ClipToCellDrop, LaunchEdit, LauncherCellKey,
+    LauncherCellMove, LauncherDropMode, LauncherRow,
 };
 use crate::app::AppEvent;
 use crate::state::AppData;
@@ -544,10 +544,11 @@ impl AppData {
             return;
         }
         let drops = drops.to_vec();
+        let follow = self.ui_prefs.automation_follows_clips;
         let mut made: Vec<LauncherCellKey> = Vec::new();
         self.edit_song_checked(|song| {
             for d in &drops {
-                if let Some(key) = drop_one_clip_to_cell(song, d, mode) {
+                if let Some(key) = drop_one_clip_with_follow(song, d, mode, follow) {
                     made.push(key);
                 }
             }
@@ -949,42 +950,96 @@ fn place_cell(
     }
 }
 
+/// [`drop_one_clip_to_cell`] + **オートメーション追従** (`docs/plan_range_selection.md` §5)。
+/// 追従は同じトラックの行へ運ぶときだけ (アレンジ内の移動と同じ規則 — 別トラックの行へは、
+/// どのレーンへ移すかが一意に決まらない)。窓は Move で消える前に取る。
+fn drop_one_clip_with_follow(
+    song: &mut Song,
+    d: &ClipToCellDrop,
+    mode: LauncherDropMode,
+    follow: bool,
+) -> Option<LauncherCellKey> {
+    let follow_window = match (follow, d.from, d.to_row) {
+        (true, ArrangementClipRef::Track(from), LauncherRow::Track(dest))
+            if dest == from.track_id =>
+        {
+            song.clip_by_key(from).map(Clip::song_window)
+        }
+        _ => None,
+    };
+    let key = drop_one_clip_to_cell(song, d, mode)?;
+    if let Some((start, end)) = follow_window
+        && let Some(scene) = song.scenes.get(d.to_scene_index).map(|s| s.id)
+    {
+        super::launcher_cells_automation::carry_track_automation_to_cells(
+            song,
+            d.to_row.track_id(),
+            start,
+            end,
+            scene,
+            mode,
+        );
+    }
+    Some(key)
+}
+
 /// アレンジのクリップ 1 つをセルへ運ぶ。置けたら新しいセルの key。
 fn drop_one_clip_to_cell(
     song: &mut Song,
     d: &ClipToCellDrop,
     mode: LauncherDropMode,
 ) -> Option<LauncherCellKey> {
-    // アレンジの (MIDI / オーディオ) クリップが行けるのはトラック行だけ。
-    let LauncherRow::Track(dest_track) = d.to_row else {
-        return None;
-    };
-    // セルを置けない行 (グループ) は **列を実体化する前**に弾く。
+    // セルを置けない行 (グループ / テンポ・拍子レーン) は **列を実体化する前**に弾く。
     if !row_accepts_cells(song, d.to_row) {
         return None;
     }
-    let src = song.clip_by_key(d.from).cloned()?;
-    let dest_scene = song.ensure_scene_at(d.to_scene_index);
-    let track = song.track_by_id_mut(dest_track)?;
-    let id = track.alloc_clip_id();
-    track.put_session_clip(SessionClip {
-        scene_id: dest_scene,
-        // セルは「先頭から鳴らす」ので開始拍は捨てる (窓 = そのまま)。
-        clip: Clip { id, start_beat: 0.0, ..src },
-        launch: LaunchSettings::default(),
-    });
-    match mode {
-        LauncherDropMode::Move => {
-            if let Some(t) = song.track_by_id_mut(d.from.track_id) {
-                t.remove_clip_by_id(d.from.clip_id);
+    // 種別が違う行への drop (MIDI クリップ → レーン行 / オートメーション → トラック行) は
+    // 中身の意味が変わるので受けない (`place_cell_payload` と同じ規約)。
+    let made = match (d.from, d.to_row) {
+        (ArrangementClipRef::Track(from), LauncherRow::Track(dest_track)) => {
+            let src = song.clip_by_key(from).cloned()?;
+            let dest_scene = song.ensure_scene_at(d.to_scene_index);
+            let track = song.track_by_id_mut(dest_track)?;
+            let id = track.alloc_clip_id();
+            track.put_session_clip(SessionClip {
+                scene_id: dest_scene,
+                // セルは「先頭から鳴らす」ので開始拍は捨てる (窓 = そのまま)。
+                clip: Clip { id, start_beat: 0.0, ..src },
+                launch: LaunchSettings::default(),
+            });
+            if mode == LauncherDropMode::Move
+                && let Some(t) = song.track_by_id_mut(from.track_id)
+            {
+                t.remove_clip_by_id(from.clip_id);
             }
+            LauncherCellKey::Track(ClipKey { track_id: dest_track, clip_id: id })
         }
-        LauncherDropMode::CopyLinked => {}
-        LauncherDropMode::CopyIndependent => {
-            make_cell_content_unique(song, d.to_row, id);
+        (ArrangementClipRef::Lane(from), LauncherRow::Lane(dest)) => {
+            let src = song
+                .automation_lane_by_key(from.track, from.lane)
+                .and_then(|l| l.clips.iter().find(|c| c.id == from.clip))
+                .cloned()?;
+            let dest_scene = song.ensure_scene_at(d.to_scene_index);
+            let lane = song.automation_lane_by_key_mut(dest.track, dest.lane)?;
+            let id = lane.alloc_clip_id();
+            lane.put_session_clip(common::model::SessionAutomationClip {
+                scene_id: dest_scene,
+                clip: AutomationClip { id, start_beat: 0.0, ..src },
+                launch: LaunchSettings::default(),
+            });
+            if mode == LauncherDropMode::Move
+                && let Some(l) = song.automation_lane_by_key_mut(from.track, from.lane)
+            {
+                l.clips.retain(|c| c.id != from.clip);
+            }
+            LauncherCellKey::Lane(AutomationClipKey { track: dest.track, lane: dest.lane, clip: id })
         }
+        _ => return None,
+    };
+    if mode == LauncherDropMode::CopyIndependent {
+        make_cell_content_unique(song, d.to_row, made.clip_id());
     }
-    Some(LauncherCellKey::Track(ClipKey { track_id: dest_track, clip_id: id }))
+    Some(made)
 }
 
 /// セル 1 つをアレンジのレーンへ運ぶ。

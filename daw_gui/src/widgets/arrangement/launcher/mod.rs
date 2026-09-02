@@ -214,10 +214,20 @@ pub struct LauncherCellMove {
     pub to_scene_index: u32,
 }
 
+/// アレンジ側で掴んだクリップ。トラック行の MIDI / オーディオ ([`ClipKey`]) と、
+/// オートメーションレーン行のクリップ ([`AutomationClipKey`]) — セルもこの 2 種
+/// ([`LauncherRow`](crate::event_launcher::LauncherRow) の Track / Lane) なので、
+/// 帯へ落とせるのはどちらも同じ。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArrangementClipRef {
+    Track(ClipKey),
+    Lane(AutomationClipKey),
+}
+
 /// アレンジのクリップをセルへ落とした 1 件。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ClipToCellDrop {
-    pub from: ClipKey,
+    pub from: ArrangementClipRef,
     pub to_row: ArrangementRowKey,
     pub to_scene_index: u32,
 }

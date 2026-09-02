@@ -111,6 +111,8 @@ pub(crate) fn dispatch(
     // アレンジのクリップドラッグ。帯の上へ持ってきたときの着地プレビューに要る
     // (帯とレーンは別 session なので、帯側は自分の session だけでは何も知れない)。
     clip_drag: Option<&ClipDragSession>,
+    // オートメーションクリップのドラッグ (レーン行のセルへの着地プレビュー)。
+    automation_clip_drag: Option<&AutomationClipDragSession>,
     response: &mut ArrangementResponse,
 ) {
     response.launcher.pane_rect = f.launcher.pane;
@@ -146,7 +148,7 @@ pub(crate) fn dispatch(
         dim_launcher_rows(hctx, f);
         head_row(hctx, f, fb, out);
         grid_rows(hctx, app, &tempo_map, f, fb, out);
-        drag_overlays(hctx, f, sessions, clip_drag);
+        drag_overlays(hctx, f, sessions, clip_drag, automation_clip_drag);
     });
 }
 
@@ -1010,20 +1012,29 @@ fn drag_overlays(
     f: &ArrangementFrame<'_>,
     sessions: &LauncherSessions,
     clip_drag: Option<&ClipDragSession>,
+    automation_clip_drag: Option<&AutomationClipDragSession>,
 ) {
     // アレンジから帯へ運んできているクリップの着地プレビュー。
     //
     // **帯側に描く口が無いと何も出ない。** アレンジのゴーストはレーンの中だけに
     // 描かれるので、ポインタが帯へ入った瞬間にプレビューが消え、「どのスロットに
     // 落ちるのか分からないまま離す」ことになっていた。着地先は release と同じ
-    // `plan_clip_drops` から取る。
-    if let Some(nd) = clip_drag {
-        let slots: Vec<(ArrangementRowKey, u32)> = release::plan_clip_drops(f, nd)
-            .into_iter()
-            .map(|d| (d.to_row, d.to_scene_index))
-            .collect();
+    // `plan_clip_drops` / `plan_automation_clip_drops` から取る。
+    let planned: Option<(Vec<ClipToCellDrop>, ClipCopyMode)> = match (clip_drag, automation_clip_drag) {
+        (Some(nd), _) => Some((
+            release::plan_clip_drops(f, nd),
+            ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift),
+        )),
+        (None, Some(acd)) => Some((
+            release::plan_automation_clip_drops(f, acd),
+            ClipCopyMode::from_modifiers(acd.last_ctrl, acd.last_shift),
+        )),
+        (None, None) => None,
+    };
+    if let Some((drops, mode)) = planned {
+        let slots: Vec<(ArrangementRowKey, u32)> =
+            drops.into_iter().map(|d| (d.to_row, d.to_scene_index)).collect();
         if !slots.is_empty() {
-            let mode = ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift);
             push_slot_ghosts(hctx, f, &slots, ghost_style(f, mode));
         }
     }

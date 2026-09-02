@@ -42,7 +42,7 @@ use crate::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, draw_loop_band, loop_band_hit_kind,
 };
-use crate::widgets::time_grid::{BarBeatGridStyle, TimeGridExt, TimeRulerStyle};
+use crate::widgets::time_grid::{BarBeatGridStyle, GridLines, TimeGridExt, TimeRulerStyle};
 use daw_ui_core::widgets::toggle_button::ToggleButtonStyle;
 use daw_ui_core::{
     ChannelLayout, MeterScale, SampleSlices, WaveformRenderMode, WaveformSegment, WaveformSource,
@@ -84,8 +84,8 @@ mod header;
 // (不変条件 9)。 帯の型は caller が読むので選んで re-export する。
 mod launcher;
 pub use launcher::{
-    ClipCopyMode, ClipToCellDrop, CellToClipDrop, LauncherCellKey, LauncherCellMove,
-    LauncherIntent, LauncherResponse,
+    ArrangementClipRef, ClipCopyMode, ClipToCellDrop, CellToClipDrop, LauncherCellKey,
+    LauncherCellMove, LauncherIntent, LauncherResponse,
 };
 mod press;
 use press::*;
@@ -782,6 +782,10 @@ pub struct ArrangementResponse {
     pub hovered_clip: Option<ClipKey>,
     pub hovered_zone: Option<ClipDragKind>,
     pub dragging: Option<ClipDragKind>,
+    /// 端オートスクロールの対象になるドラッグ (`arrangement_edge_scroll_axes` が `Some` を
+    /// 返す session) が進行中か。caller は再生追従をこの間だけ止める
+    /// (`ui_ephemeral.arrange_drag_active`)。
+    pub edge_scroll_drag: bool,
     pub rect_select_active: bool,
     pub selection_changed: bool,
     pub clicked_at_track_beat: Option<(u32, f64)>,
@@ -899,6 +903,7 @@ impl Default for ArrangementResponse {
             hovered_clip: None,
             hovered_zone: None,
             dragging: None,
+            edge_scroll_drag: false,
             rect_select_active: false,
             selection_changed: false,
             clicked_at_track_beat: None,
@@ -955,6 +960,10 @@ pub struct ArrangementStyle {
     pub beat_line: Color,
     pub bar_line_width_px: f32,
     pub beat_line_width_px: f32,
+    /// Adaptive snap で拍より細かい位置に打つ線の色 (`GridLines::Unit`)。固定 snap では
+    /// アレンジは 3 段目を描かない (#100: ピアノロール限定) のでこの色は出ない。
+    pub sub_line: Color,
+    pub sub_line_width_px: f32,
     pub lane_line: Color,
     pub lane_line_width_px: f32,
     pub clip_default_fill: Color,
@@ -1291,6 +1300,8 @@ impl ArrangementStyle {
             beat_line: p.grid_line,
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
+            sub_line: p.grid_line_faint,
+            sub_line_width_px: 1.0,
             lane_line: p.grid_line,
             lane_line_width_px: 1.0,
             clip_default_fill: d.clip_default,

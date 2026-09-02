@@ -1374,7 +1374,11 @@ impl LocalState {
         // していなければ (= IPC SeekTo / Play edge / loop wrap / 起動直後)
         // tempo map で正確に beat を逆算する (A10 r.md #8)。
         if playhead != self.last_known_playhead {
-            let prev_beats = self.playhead_beats;
+            // 跳びの起点は **前 buffer の末尾** (`last_known_playhead`)。`playhead_beats` は
+            // 前 buffer の**頭**の拍 (song があるとき刻みが buffer 頭で解いた値のまま) なので、
+            // それを起点にすると跳び量が 1 buffer ぶん多くなり、ランチャーの時計が
+            // 毎回 1 buffer 遅れる (位相が ~10ms 繰り返す / フォローが 1 buffer 遅れる)。
+            let prev_beats = self.tempo_map.samples_to_beat(self.last_known_playhead, sample_rate);
             self.playhead_beats = self.tempo_map.samples_to_beat(playhead, sample_rate);
             // r.md #87: 跳んだぶんだけランチャーの絶対拍も動かす (`on_transport_jump`
             // の doc — これが無いと seek の後にセルが 1 周無音になり、予約と
@@ -1609,11 +1613,14 @@ impl LocalState {
                     None
                 };
                 if let Some(start) = wrap_to {
+                    // 巻き戻しの起点は **この buffer の末尾** (`new_ph` = 進めた後の位置)。
+                    // `playhead_beats` (buffer 頭の拍) を起点にすると跳び量が 1 buffer ぶん
+                    // 多くなり、ランチャーの時計が周回ごとに 1 buffer 遅れて累積する。
+                    let prev_beats = self.tempo_map.samples_to_beat(new_ph, sample_rate);
                     new_ph = start;
                     // A10 (r.md #8): loop start の beat も tempo map で正確に
                     // 逆算 (constant-bpm 線形推定は tempo automation 中の loop
                     // boundary でズレた)。
-                    let prev_beats = self.playhead_beats;
                     self.playhead_beats = self.tempo_map.samples_to_beat(new_ph, sample_rate);
                     // r.md #87: ループで巻き戻したぶん、ランチャーの絶対拍も戻す
                     // (セルの位相はループを跨いでも連続する)。

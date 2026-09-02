@@ -120,14 +120,28 @@ fn draw_scene_follow_rows(
         return y;
     }
     let scene_follow = fold_scene_follow(app, scene_ids).unwrap_or_default();
-    // 見出しは「どこから来た列か」で書き分ける — セル経由なら「この列」、
-    // 列を直接選んでいるなら選んだ列そのもの。
-    let label = if cells.is_empty() {
-        "選択中の列 (シーン) のフォローアクション"
-    } else {
-        "この列 (シーン) のフォローアクション"
+    // 見出しに **列の名前** を出す (無名なら "Scene N")。列を直接選んだときはペインの
+    // タイトルがトラック名のままなので、ここが「どの列をいじっているか」の唯一の手掛かり。
+    let song = app.song_doc.song();
+    let names: Vec<String> = song
+        .scenes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| scene_ids.contains(&s.id))
+        .map(|(i, s)| s.display_name(i))
+        .collect();
+    let label = match names.as_slice() {
+        [] => "選択中の列 (シーン) のフォローアクション".to_string(),
+        [one] => format!("列「{one}」のフォローアクション"),
+        many => format!("列 {} 本 ({}) のフォローアクション", many.len(), many.join(", ")),
     };
-    ui.label_at("inspector_scene_follow_label", label, area.x + pad, y, 12.0, app.theme.core.text);
+    ui.label_at_clipped(
+        "inspector_scene_follow_label",
+        &label,
+        Rect { x: area.x + pad, y, w: (area.w - pad * 2.0).max(0.0), h: LABEL_H },
+        12.0,
+        app.theme.core.text,
+    );
     y += LABEL_H;
     draw_follow_rows(app, ui, area, pad, y, &scene_follow, FollowTarget::Scenes, cells)
 }

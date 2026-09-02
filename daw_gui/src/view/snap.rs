@@ -109,16 +109,19 @@ pub fn arrange_snap_config(app: &AppData) -> SnapConfig {
 /// 1.5 本 = 非整数 per-beat) も正しく描ける。`interval_beats < 1.0` (= 拍より細かい) の
 /// ときだけ `Some` を返し、3 段目を追加する (= 合意した「拍より細かいときだけ」ルール)。
 ///
-/// - Straight / Triplet / Adaptive / Bars → snap unit (`beat_unit`) をそのまま線間隔に。
+/// - Straight / Triplet / Bars → snap unit (`beat_unit`) をそのまま線間隔に。
 ///   例: 1/16 → 0.25, 1/8T → 0.333, 1/4T → 0.667, 1/2T → 1.333(→None), 1/4 → 1.0(→None)。
 /// - Dotted{div} → 付点間隔 (`6/div`) は不規則格子なので使わず、**内包する直線格子**
 ///   `2/div` 拍 (1/8. → 0.25 = 1/16 線、1/16. → 0.125 = 1/32 線) を返す。
+/// - Adaptive → `None`。3 段目ではなく「線 = 吸着単位」の `GridLines::Unit` で描く
+///   (`GridLines::from_snap` が `beat_unit` から組む)。
 #[must_use]
 pub fn subgrid_interval_beats(cfg: SnapConfig, zoom_x_px_per_beat: f32) -> Option<f64> {
     if !cfg.is_active(false) {
         return None;
     }
     let interval = match cfg.mode {
+        SnapMode::Adaptive => return None,
         SnapMode::Dotted { div } => 2.0 / f64::from(div.max(1)),
         _ => cfg.beat_unit(zoom_x_px_per_beat)?,
     };
@@ -320,14 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn subgrid_adaptive_matches_beat_unit() {
-        // Adaptive は beat_unit をそのまま (拍より細かいときだけ) 使う。zoom に応じた
-        // unit 値そのものは gui_01 の責務なので、ここでは「beat_unit を <1 で filter した値」
-        // と一致することだけ確認 (adaptive カーブの実装に依存しない)。
+    fn subgrid_adaptive_is_none() {
+        // Adaptive は 3 段目ではなく `GridLines::Unit` (線 = 吸着単位) で描くので、どの zoom でも None。
         let c = cfg(SnapMode::Adaptive);
         for zoom in [0.001_f32, 1.0, 50.0, 1000.0, 100_000.0] {
-            let expected = c.beat_unit(zoom).filter(|u| *u < 1.0 - 1e-6);
-            assert_eq!(subgrid_interval_beats(c, zoom), expected, "zoom {zoom}");
+            assert_eq!(subgrid_interval_beats(c, zoom), None, "zoom {zoom}");
         }
     }
 }

@@ -93,9 +93,10 @@ fn dotted_8_unit() {
 #[test]
 fn adaptive_picks_coarser_at_low_zoom() {
     let cfg = SnapConfig::DEFAULT;
-    // zoom_x = 4 px/beat (極端に zoom out): unit_px = 4 * 1 = 4 < 12 で 1.0 維持
+    // zoom_x = 4 px/beat (zoom out): 1 拍 = 4px、 2 拍 = 8px はどちらも 12px 未満 → 1 bar (4 拍 = 16px)。
+    // 旧実装は 1 拍で止まり、小節線しか見えないのに 1 拍に吸着していた。
     let unit = cfg.beat_unit(4.0).unwrap();
-    assert!((unit - 1.0).abs() < 1e-12);
+    assert!((unit - 4.0).abs() < 1e-12, "got {unit}");
 
     // zoom_x = 64: 64 * 1/8 = 8 < 12, 64 * 1/4 = 16 >= 12 → unit = 1/4
     let unit = cfg.beat_unit(64.0).unwrap();
@@ -104,6 +105,41 @@ fn adaptive_picks_coarser_at_low_zoom() {
     // zoom_x = 1600: 1600 * 1/128 = 12.5 >= 12 → unit = 1/128
     let unit = cfg.beat_unit(1600.0).unwrap();
     assert!((unit - (1.0 / 128.0)).abs() < 1e-9);
+}
+
+#[test]
+fn adaptive_goes_coarser_than_a_beat_when_zoomed_out() {
+    use common::snap::adaptive_unit_beats;
+    // 4/4: 1 拍 → 2 拍 (半小節) → 1 bar → 2 bar → 4 bar。常に「12px 以上になる最も細かい段」。
+    assert_eq!(adaptive_unit_beats(12.0, 4.0), 1.0);
+    assert_eq!(adaptive_unit_beats(6.0, 4.0), 2.0);
+    assert_eq!(adaptive_unit_beats(3.0, 4.0), 4.0);
+    assert_eq!(adaptive_unit_beats(1.5, 4.0), 8.0);
+    assert_eq!(adaptive_unit_beats(0.75, 4.0), 16.0);
+    // 3/4: 半小節 (1.5 拍) は整数拍でないので段に無い → 1 拍の次は 1 bar (3 拍)。
+    assert_eq!(adaptive_unit_beats(6.0, 3.0), 3.0);
+    assert_eq!(adaptive_unit_beats(4.0, 3.0), 3.0);
+    assert_eq!(adaptive_unit_beats(3.0, 3.0), 6.0);
+    // 6/4 (6 拍): 3 拍 (半小節) の段がある。
+    assert_eq!(adaptive_unit_beats(4.0, 6.0), 3.0);
+    // 極端な zoom out でも有限の最粗段で止まる。
+    assert!(adaptive_unit_beats(1e-6, 4.0).is_finite());
+}
+
+#[test]
+fn adaptive_unit_spacing_is_at_least_min_px_and_monotonic() {
+    use common::snap::adaptive_unit_beats;
+    // どの zoom でも線間隔 >= 12px、 かつ zoom を上げると単位は単調に細かくなる (段が入れ替わらない)。
+    let mut prev = f64::INFINITY;
+    let mut zoom = 0.05_f32;
+    while zoom < 5000.0 {
+        let u = adaptive_unit_beats(zoom, 4.0);
+        let px = f64::from(zoom) * u;
+        assert!(px >= 12.0 - 1e-9, "zoom {zoom}: unit {u} → {px}px");
+        assert!(u <= prev, "zoom {zoom}: {u} > {prev}");
+        prev = u;
+        zoom *= 1.1;
+    }
 }
 
 #[test]

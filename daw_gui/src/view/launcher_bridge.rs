@@ -17,12 +17,13 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, ImportTrackTarget};
 use crate::state::LauncherFocus;
 use crate::event_launcher::{
-    CellToArrangerDrop as EvCellToArranger, ClipToCellDrop as EvClipToCell,
-    LauncherCellKey as EvCellKey, LauncherCellMove as EvCellMove, LauncherDropMode, LauncherEvent,
-    LauncherRow,
+    ArrangementClipRef as EvClipRef, CellToArrangerDrop as EvCellToArranger,
+    ClipToCellDrop as EvClipToCell, LauncherCellKey as EvCellKey, LauncherCellMove as EvCellMove,
+    LauncherDropMode, LauncherEvent, LauncherRow,
 };
 use crate::widgets::arrangement::{
-    ArrangementResponse, ArrangementRowKey, ClipCopyMode, LauncherCellKey, LauncherIntent,
+    ArrangementClipRef as WidgetClipRef, ArrangementResponse, ArrangementRowKey, ClipCopyMode,
+    LauncherCellKey, LauncherIntent,
 };
 use crate::widgets::select_modifier::SelectModifier;
 
@@ -52,6 +53,19 @@ fn cell_of(cell: LauncherCellKey) -> Option<EvCellKey> {
             clip: k.clip,
         })
     })
+}
+
+/// widget が掴んだアレンジのクリップ → handler の参照 (レーンの key は widget の mirror 型
+/// から common の型へ詰め替える、`cell_of` と同じ理由)。
+fn clip_ref_of(r: WidgetClipRef) -> EvClipRef {
+    match r {
+        WidgetClipRef::Track(k) => EvClipRef::Track(k),
+        WidgetClipRef::Lane(k) => EvClipRef::Lane(common::model::AutomationClipKey {
+            track: k.track,
+            lane: k.lane,
+            clip: k.clip,
+        }),
+    }
 }
 
 fn drop_mode_of(mode: ClipCopyMode) -> LauncherDropMode {
@@ -153,7 +167,7 @@ fn convert(intent: &LauncherIntent) -> Option<LauncherEvent> {
             let drops: Vec<EvClipToCell> = drops
                 .iter()
                 .map(|d| EvClipToCell {
-                    from: d.from,
+                    from: clip_ref_of(d.from),
                     to_row: row_of(d.to_row),
                     to_scene_index: d.to_scene_index as usize,
                 })

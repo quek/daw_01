@@ -18,6 +18,8 @@ pub mod ipc;
 pub mod launcher;
 /// r.md #87: ランチャーのセル CRUD とローンチ設定。
 pub mod launcher_cells;
+/// r.md #87: クリップをセルへ運ぶときのオートメーション追従 (`plan_range_selection.md` §5)。
+pub mod launcher_cells_automation;
 /// r.md #87: ランチャーのセルの copy / cut / paste。
 pub mod launcher_clipboard;
 pub mod loudness;

@@ -1,8 +1,10 @@
 //! ドラッグ端オートスクロール (edge auto-scroll) の純粋ロジック。
 //!
-//! arrangement / piano_roll の drag 中、ポインタが表示領域の端 hot-zone に入ったとき、その frame で
-//! view が動くべき content px を軸ごとに返す。速度は zone 内の近接度に線形比例 (zone 境界で 0、端で
-//! `max_speed_px`)。zone を越えて領域外に出ても `max_speed_px` で頭打ち。
+//! arrangement / piano_roll の drag 中、ポインタが表示領域の**内側**の端 hot-zone に入ったとき、その
+//! frame で view が動くべき content px を軸ごとに返す。速度は zone 内の近接度に線形比例 (zone 境界で
+//! 0、端で `max_speed_px`)。**領域の外に出たら 0** — 隣のペイン (アレンジの左のランチャー帯、
+//! ピアノロールの鍵盤列) へ drag を持ち出した瞬間に端スクロールが暴走しないため。hot-zone は
+//! 領域の内側にしか無い、が唯一のルール (外側に速度を残すと「持ち出し先で静止しても巻き戻り続ける」)。
 //!
 //! widget 側はこの関数の戻り値を使って scroll を emit し、相対 delta で対象位置を決める drag は
 //! 同 px ぶん anchor を逆方向に shift して「掴んでいる対象がカーソルに追従」 を実現する
@@ -51,9 +53,9 @@ fn axis_delta(p: f32, lo: f32, hi: f32, cfg: EdgeScrollCfg) -> f32 {
     }
 }
 
-/// ポインタ `pos` が `rect` の端 hot-zone に入っているとき、その frame で view が動くべき content px を
-/// 軸ごとに返す。`+dx` = 右端側 (横 view を奥 = 後ろの拍へ)、`+dy` = 下端側 (縦下方向)。
-/// `pos == None` / zone 外 / 軸 disable は 0。
+/// ポインタ `pos` が `rect` の内側の端 hot-zone に入っているとき、その frame で view が動くべき
+/// content px を軸ごとに返す。`+dx` = 右端側 (横 view を奥 = 後ろの拍へ)、`+dy` = 下端側 (縦下方向)。
+/// `pos == None` / `rect` の外 / zone 外 / 軸 disable は 0。
 pub fn edge_scroll_delta(
     pos: Option<(f32, f32)>,
     rect: Rect,
@@ -64,6 +66,11 @@ pub fn edge_scroll_delta(
     let Some((px, py)) = pos else {
         return (0.0, 0.0);
     };
+    // 領域外は両軸 0 (端は含む)。片軸だけ外れていても、もう片方の軸も止める:
+    // ランチャー帯へ持ち出した drag が縦方向にだけ流れ続けるのも同じ暴走。
+    if px < rect.x || px > rect.x + rect.w || py < rect.y || py > rect.y + rect.h {
+        return (0.0, 0.0);
+    }
     let dx = if axis_x { axis_delta(px, rect.x, rect.x + rect.w, cfg) } else { 0.0 };
     let dy = if axis_y { axis_delta(py, rect.y, rect.y + rect.h, cfg) } else { 0.0 };
     (dx, dy)
@@ -100,18 +107,35 @@ mod tests {
     fn 各端の符号と頭打ち() {
         let c = cfg();
         let r = rect();
-        // 右端 (x=500) のさらに外 = +max。
-        let (dx, _) = edge_scroll_delta(Some((600.0, 200.0)), r, c, true, true);
+        // 右端 (x=500) ちょうど = +max。
+        let (dx, _) = edge_scroll_delta(Some((500.0, 200.0)), r, c, true, true);
         assert_eq!(dx, 10.0);
-        // 左端 (x=100) の外 = -max。
-        let (dx, _) = edge_scroll_delta(Some((0.0, 200.0)), r, c, true, true);
+        // 左端 (x=100) ちょうど = -max。
+        let (dx, _) = edge_scroll_delta(Some((100.0, 200.0)), r, c, true, true);
         assert_eq!(dx, -10.0);
-        // 下端 (y=350) の外 = +max。
-        let (_, dy) = edge_scroll_delta(Some((300.0, 400.0)), r, c, true, true);
+        // 下端 (y=350) ちょうど = +max。
+        let (_, dy) = edge_scroll_delta(Some((300.0, 350.0)), r, c, true, true);
         assert_eq!(dy, 10.0);
-        // 上端 (y=50) の外 = -max。
-        let (_, dy) = edge_scroll_delta(Some((300.0, 0.0)), r, c, true, true);
+        // 上端 (y=50) ちょうど = -max。
+        let (_, dy) = edge_scroll_delta(Some((300.0, 50.0)), r, c, true, true);
         assert_eq!(dy, -10.0);
+    }
+
+    /// 領域の外は両軸 0。アレンジの lanes から左のランチャー帯へ clip を持ち出したとき、
+    /// 旧実装 (外側でも max で頭打ち) は帯の上で静止しても拍 0 まで巻き戻り続けた。
+    #[test]
+    fn 領域外はゼロ() {
+        let c = cfg();
+        let r = rect();
+        // 左の外 (ランチャー帯 / 鍵盤列の位置)。
+        assert_eq!(edge_scroll_delta(Some((99.0, 200.0)), r, c, true, true), (0.0, 0.0));
+        assert_eq!(edge_scroll_delta(Some((0.0, 200.0)), r, c, true, true), (0.0, 0.0));
+        // 右 / 上 / 下の外も同じ。
+        assert_eq!(edge_scroll_delta(Some((600.0, 200.0)), r, c, true, true), (0.0, 0.0));
+        assert_eq!(edge_scroll_delta(Some((300.0, 0.0)), r, c, true, true), (0.0, 0.0));
+        assert_eq!(edge_scroll_delta(Some((300.0, 400.0)), r, c, true, true), (0.0, 0.0));
+        // 片軸だけ外れていても、内側の軸も止まる (右下隅の外)。
+        assert_eq!(edge_scroll_delta(Some((600.0, 400.0)), r, c, true, true), (0.0, 0.0));
     }
 
     #[test]
@@ -133,12 +157,12 @@ mod tests {
     fn 軸ディスエーブルで片軸のみ() {
         let c = cfg();
         let r = rect();
-        // 右下隅。axis_x のみ有効。
-        let (dx, dy) = edge_scroll_delta(Some((600.0, 400.0)), r, c, true, false);
+        // 右下隅 (領域の端ちょうど)。axis_x のみ有効。
+        let (dx, dy) = edge_scroll_delta(Some((500.0, 350.0)), r, c, true, false);
         assert_eq!(dx, 10.0);
         assert_eq!(dy, 0.0);
         // axis_y のみ有効。
-        let (dx, dy) = edge_scroll_delta(Some((600.0, 400.0)), r, c, false, true);
+        let (dx, dy) = edge_scroll_delta(Some((500.0, 350.0)), r, c, false, true);
         assert_eq!(dx, 0.0);
         assert_eq!(dy, 10.0);
     }
@@ -147,7 +171,7 @@ mod tests {
     fn 両端同時_右下隅は両正() {
         let c = cfg();
         let r = rect();
-        let (dx, dy) = edge_scroll_delta(Some((600.0, 400.0)), r, c, true, true);
+        let (dx, dy) = edge_scroll_delta(Some((500.0, 350.0)), r, c, true, true);
         assert_eq!(dx, 10.0);
         assert_eq!(dy, 10.0);
     }

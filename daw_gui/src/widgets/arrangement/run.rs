@@ -28,6 +28,12 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     let overlays = sessions::overlays(&f, &live, &released);
     // 5. hover 判定 → cursor 決定 (cursor は hover が書いた response を読む)。
     cursor::hover(&f, &live, &mut response);
+    // 端オートスクロールの対象ドラッグが生きているか。判定は `arrangement_edge_scroll_axes`
+    // 1 本 (端スクロール本体と同じ SSoT) — caller はこの間だけ再生追従を止める。
+    response.edge_scroll_drag = {
+        let state: &mut ArrangementState = ui.widget_state(f.wid);
+        arrangement_edge_scroll_axes(state).is_some()
+    };
     cursor::apply(ui, &f, &live, &response);
     launcher::press::cursor(ui, &f);
     // 6. heavy 描画 → release commit → track header 描画 (この 3 つの順が z 順)。
@@ -43,6 +49,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         &f,
         &launcher_sessions,
         live.clip_drag.as_ref(),
+        live.automation_clip_drag.as_ref(),
         &mut response,
     );
     launcher::release::commit(ui, &f, launcher_sessions, &mut response);

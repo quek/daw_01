@@ -114,6 +114,68 @@ pub struct SubGridSpec {
     pub line_width: f32,
 }
 
+/// `bar_beat_grid` の線の打ち方。snap 設定から [`GridLines::from_snap`] で組む (SSoT)。
+#[derive(Debug, Clone, Copy)]
+pub enum GridLines {
+    /// 固定 snap / snap OFF: 小節線 + 拍線 (`min_beat_line_px` で退避) + 任意の 3 段目
+    /// (`min_sub_line_px` で退避)。線の密度は snap 単位と独立に決まる。
+    BarBeat { sub: Option<SubGridSpec> },
+    /// Adaptive snap: 線を `unit_beats` の倍数 (曲頭原点) **だけ** に打つ。小節頭は bar 色、
+    /// 整数拍は beat 色、拍より細かい位置は `sub_color`。`unit_beats` は snap が丸める単位
+    /// そのもの ([`common::snap::adaptive_unit_beats`]) なので「見えている線 = 吸着位置」が
+    /// 構造的に成り立つ。単位が小節以上なら、単位の倍数でない小節の線は描かない
+    /// (zoom out で小節線も間引かれる)。
+    Unit { unit_beats: f64, sub_color: Color, sub_line_width: f32 },
+}
+
+impl GridLines {
+    /// snap 設定 → 線の打ち方。Adaptive が有効なら `beat_unit` (= 吸着単位) をそのまま線間隔に、
+    /// それ以外は bar/beat + caller が決めた固定 3 段目 (`fixed_sub_interval_beats`、無ければ 2 段)。
+    #[must_use]
+    pub fn from_snap(
+        snap: &common::snap::SnapConfig,
+        zoom_x_px_per_beat: f32,
+        fixed_sub_interval_beats: Option<f64>,
+        sub_color: Color,
+        sub_line_width: f32,
+    ) -> Self {
+        if matches!(snap.mode, common::snap::SnapMode::Adaptive)
+            && let Some(unit) = snap.beat_unit(zoom_x_px_per_beat)
+        {
+            return Self::Unit { unit_beats: unit, sub_color, sub_line_width };
+        }
+        let sub = fixed_sub_interval_beats.filter(|iv| *iv > 0.0).map(|iv| SubGridSpec {
+            interval_beats: iv,
+            color: sub_color,
+            line_width: sub_line_width,
+        });
+        Self::BarBeat { sub }
+    }
+
+    /// cache key 用の値 (描かれる線の集合を決める全入力)。`hctx.cached(viewport_key)` は一致時に
+    /// `bar_beat_grid` ごと skip するので、caller は viewport_key にこれを含める。
+    #[must_use]
+    pub fn cache_key(&self) -> u64 {
+        hash_inputs(self.key_tuple())
+    }
+
+    fn key_tuple(&self) -> (u8, u64, [u32; 4], u32) {
+        match *self {
+            Self::BarBeat { sub: None } => (0, 0, [0; 4], 0),
+            Self::BarBeat { sub: Some(s) } => {
+                (1, s.interval_beats.to_bits(), color_bits(s.color), s.line_width.to_bits())
+            }
+            Self::Unit { unit_beats, sub_color, sub_line_width } => {
+                (2, unit_beats.to_bits(), color_bits(sub_color), sub_line_width.to_bits())
+            }
+        }
+    }
+}
+
+fn color_bits(c: Color) -> [u32; 4] {
+    [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]
+}
+
 /// `min_label_spacing_px` から 2 のべき乗 step (1, 2, 4, 8, ...) を求める。
 /// `px_per_bar * step >= min_spacing_px` を満たす最小値を返す。
 /// `px_per_bar <= 0.0` または `min_spacing_px <= 0.0` なら 1 を返す (= 間引き無し)。
@@ -147,7 +209,7 @@ pub trait TimeGridExt {
         viewport: ViewportState1D,
         style: TimeRulerStyle,
     );
-    /// bar/beat grid widget。`rect` 内に縦線で拍 / 小節 (+ 任意の subdivision) を描画する。
+    /// bar/beat grid widget。`rect` 内に縦線を描画する。線の打ち方は [`GridLines`]。
     fn bar_beat_grid(
         &mut self,
         id: impl Hash,
@@ -155,7 +217,7 @@ pub trait TimeGridExt {
         mapping: TimeMapping,
         viewport: ViewportState1D,
         style: BarBeatGridStyle,
-        sub: Option<SubGridSpec>,
+        lines: GridLines,
     );
 }
 
@@ -293,11 +355,13 @@ impl<'a, M: ?Sized + 'static> TimeGridExt for Ui<'a, M> {
     /// M14 Phase 63m (daw_01 #027): 1 beat 表示幅 < `min_beat_line_px` で beat 線を非表示
     /// (= bar 線のみ残る)。 zoom 小での beat 線密集を防ぎ描画コストも削減。
     ///
-    /// M14 Phase 124 (daw_01 #100): `sub: Option<SubGridSpec>` で **3 段目** (subdivision) 線を
-    /// 追加できる。 `Some` のとき小節原点からの `interval_beats` 倍数 (拍線・小節線と一致しない位置)
-    /// に淡い縦線を打つ。 push 順は subdivision → beat → bar (subdivision が最背面・最も淡い)。
-    /// `px_per_interval < style.min_sub_line_px` の frame では subdivision を描かず 2 段に退避する。
-    /// 既存 caller は `None` を渡す (非破壊)。
+    /// M14 Phase 124 (daw_01 #100): `GridLines::BarBeat { sub: Some(_) }` で **3 段目**
+    /// (subdivision) 線を追加できる。小節原点からの `interval_beats` 倍数 (拍線・小節線と一致しない
+    /// 位置) に淡い縦線を打つ。 `px_per_interval < style.min_sub_line_px` の frame では subdivision を
+    /// 描かず 2 段に退避する。
+    ///
+    /// `GridLines::Unit` (Adaptive snap) は線を吸着単位の倍数だけに打つ ([`GridLines`])。
+    /// push 順はどちらも subdivision → beat → bar (subdivision が最背面・最も淡い)。
     fn bar_beat_grid(
         &mut self,
         id: impl Hash,
@@ -305,22 +369,10 @@ impl<'a, M: ?Sized + 'static> TimeGridExt for Ui<'a, M> {
         mapping: TimeMapping,
         viewport: ViewportState1D,
         style: BarBeatGridStyle,
-        sub: Option<SubGridSpec>,
+        lines: GridLines,
     ) {
         let wid = WidgetId::ROOT.child((b"bar_beat_grid", &id));
-        // M14 Phase 124 (#100): sub が変わると描画 line 数が変わるので hash に含める
-        // (= スナップ変更で subdivision 間隔が変わったとき確実に再描画される)。
-        let sub_key = sub.map_or((0_u8, 0_u64, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32), |s| {
-            (
-                1,
-                s.interval_beats.to_bits(),
-                s.color.r.to_bits(),
-                s.color.g.to_bits(),
-                s.color.b.to_bits(),
-                s.color.a.to_bits(),
-                s.line_width.to_bits(),
-            )
-        });
+        // 線の集合を決める入力を全部 hash に (snap 変更 / zoom で確実に再描画される)。
         let input_hash = hash_inputs((
             b"bar_beat_grid",
             (rect.x.to_bits(), rect.y.to_bits(), rect.w.to_bits(), rect.h.to_bits()),
@@ -328,68 +380,44 @@ impl<'a, M: ?Sized + 'static> TimeGridExt for Ui<'a, M> {
             (viewport.view_start.to_bits(), viewport.view_len.to_bits()),
             // M14 Phase 63m: beat 線 on/off threshold が変わると描画 line 数も変わるので hash に含める。
             style.min_beat_line_px.to_bits(),
-            (style.min_sub_line_px.to_bits(), sub_key),
+            (style.min_sub_line_px.to_bits(), lines.key_tuple()),
         ));
         self.with_widget_node(wid, input_hash, |ui| {
-            let view_end = viewport.view_start + viewport.view_len;
             let spb = mapping.samples_per_beat();
             let beats_per_bar =
                 f64::from(mapping.time_sig.0) * 4.0 / f64::from(mapping.time_sig.1);
-            let beat_index_start = (viewport.view_start / spb).floor() as i64;
-            let beat_index_end = (view_end / spb).ceil() as i64;
-
-            // M14 Phase 63m: 1 beat 表示幅 < min_beat_line_px なら beat 線を skip。
             let view_len_safe = viewport.view_len.max(1e-9);
             let px_per_beat = ((spb / view_len_safe) as f32) * rect.w;
-            let draw_beat_lines =
-                style.min_beat_line_px <= 0.0 || px_per_beat >= style.min_beat_line_px;
 
-            // M14 Phase 124 (#100): subdivision (3 段目)。 ズーム退避 + px 変換は helper に委譲。
-            // beat / bar より背面 = 先に push する。
-            let sub_segs = sub.map_or_else(Vec::new, |s| {
-                build_sub_segments(
-                    rect,
-                    viewport,
-                    spb,
-                    beats_per_bar,
-                    beat_index_start,
-                    beat_index_end,
-                    px_per_beat,
-                    style.min_sub_line_px,
-                    s,
-                )
-            });
-
-            let mut bar_segs: Vec<LineSegment> = Vec::new();
-            let mut beat_segs: Vec<LineSegment> = Vec::new();
-            for bi in beat_index_start..=beat_index_end {
-                let s = (bi as f64) * spb;
-                if s < viewport.view_start || s > view_end {
-                    continue;
+            let (sub_segs, beat_segs, bar_segs, sub_line_width) = match lines {
+                GridLines::Unit { unit_beats, sub_color, sub_line_width } => {
+                    let (s, b, r) = build_unit_segments(
+                        rect,
+                        viewport,
+                        spb,
+                        beats_per_bar,
+                        unit_beats,
+                        sub_color,
+                        style,
+                    );
+                    (s, b, r, sub_line_width)
                 }
-                let local_x = viewport.unit_to_px(s, rect.w);
-                let x = rect.x + local_x;
-                if x < rect.x || x > rect.x + rect.w {
-                    continue;
+                GridLines::BarBeat { sub } => {
+                    let (s, b, r) = build_bar_beat_segments(
+                        rect,
+                        viewport,
+                        spb,
+                        beats_per_bar,
+                        px_per_beat,
+                        style,
+                        sub,
+                    );
+                    (s, b, r, sub.map_or(1.0, |s| s.line_width))
                 }
-                let is_bar = ((bi as f64).rem_euclid(beats_per_bar)).abs() < 1e-6;
-                if is_bar {
-                    bar_segs.push(LineSegment {
-                        a: [x, rect.y],
-                        b: [x, rect.y + rect.h],
-                        color: style.bar_color,
-                    });
-                } else if draw_beat_lines {
-                    beat_segs.push(LineSegment {
-                        a: [x, rect.y],
-                        b: [x, rect.y + rect.h],
-                        color: style.beat_color,
-                    });
-                }
-            }
+            };
             // push 順 = subdivision (最背面) → beat → bar (最前面)。
             if !sub_segs.is_empty() {
-                let line_width_px = sub.map_or(1.0, |s| s.line_width);
+                let line_width_px = sub_line_width;
                 ui.push_lines(LineBatch {
                     segments: sub_segs.into(),
                     line_width_px,
@@ -412,6 +440,103 @@ impl<'a, M: ?Sized + 'static> TimeGridExt for Ui<'a, M> {
             }
         });
     }
+}
+
+fn vline(rect: Rect, x: f32, color: Color) -> LineSegment {
+    LineSegment { a: [x, rect.y], b: [x, rect.y + rect.h], color }
+}
+
+/// `GridLines::BarBeat`: 小節線 + 拍線 (+ 固定 3 段目) の線分 `(sub, beat, bar)`。
+/// M14 Phase 63m (#027): 1 beat 表示幅 < `min_beat_line_px` なら beat 線を skip。
+fn build_bar_beat_segments(
+    rect: Rect,
+    viewport: ViewportState1D,
+    spb: f64,
+    beats_per_bar: f64,
+    px_per_beat: f32,
+    style: BarBeatGridStyle,
+    sub: Option<SubGridSpec>,
+) -> (Vec<LineSegment>, Vec<LineSegment>, Vec<LineSegment>) {
+    let view_end = viewport.view_start + viewport.view_len;
+    let beat_index_start = (viewport.view_start / spb).floor() as i64;
+    let beat_index_end = (view_end / spb).ceil() as i64;
+    let draw_beat_lines = style.min_beat_line_px <= 0.0 || px_per_beat >= style.min_beat_line_px;
+    // M14 Phase 124 (#100): subdivision (3 段目)。 ズーム退避 + px 変換は helper に委譲。
+    let sub_segs = sub.map_or_else(Vec::new, |s| {
+        build_sub_segments(
+            rect,
+            viewport,
+            spb,
+            beats_per_bar,
+            beat_index_start,
+            beat_index_end,
+            px_per_beat,
+            style.min_sub_line_px,
+            s,
+        )
+    });
+    let mut bar_segs: Vec<LineSegment> = Vec::new();
+    let mut beat_segs: Vec<LineSegment> = Vec::new();
+    for bi in beat_index_start..=beat_index_end {
+        let s = (bi as f64) * spb;
+        if s < viewport.view_start || s > view_end {
+            continue;
+        }
+        let x = rect.x + viewport.unit_to_px(s, rect.w);
+        if x < rect.x || x > rect.x + rect.w {
+            continue;
+        }
+        let is_bar = ((bi as f64).rem_euclid(beats_per_bar)).abs() < 1e-6;
+        if is_bar {
+            bar_segs.push(vline(rect, x, style.bar_color));
+        } else if draw_beat_lines {
+            beat_segs.push(vline(rect, x, style.beat_color));
+        }
+    }
+    (sub_segs, beat_segs, bar_segs)
+}
+
+/// `GridLines::Unit` (Adaptive): `unit_beats` の倍数 (曲頭原点) だけに線を打つ `(sub, beat, bar)`。
+/// 色は位置の種類で決まる: 小節頭 → bar、整数拍 → beat、それ以外 → `sub_color`。
+/// ズーム退避は無い (単位そのものが `MIN_VISIBLE_GRID_PX` 以上になるよう選ばれている)。
+fn build_unit_segments(
+    rect: Rect,
+    viewport: ViewportState1D,
+    spb: f64,
+    beats_per_bar: f64,
+    unit_beats: f64,
+    sub_color: Color,
+    style: BarBeatGridStyle,
+) -> (Vec<LineSegment>, Vec<LineSegment>, Vec<LineSegment>) {
+    let mut sub_segs = Vec::new();
+    let mut beat_segs = Vec::new();
+    let mut bar_segs = Vec::new();
+    if !(unit_beats > 0.0 && unit_beats.is_finite() && spb > 0.0 && beats_per_bar > 0.0) {
+        return (sub_segs, beat_segs, bar_segs);
+    }
+    let view_end = viewport.view_start + viewport.view_len;
+    let k_start = (viewport.view_start / spb / unit_beats).floor() as i64;
+    let k_end = (view_end / spb / unit_beats).ceil() as i64;
+    for k in k_start..=k_end {
+        let b = k as f64 * unit_beats;
+        let s = b * spb;
+        if s < viewport.view_start || s > view_end {
+            continue;
+        }
+        let x = rect.x + viewport.unit_to_px(s, rect.w);
+        if x < rect.x || x > rect.x + rect.w {
+            continue;
+        }
+        let bar_pos = b / beats_per_bar;
+        if (bar_pos - bar_pos.round()).abs() < 1e-6 {
+            bar_segs.push(vline(rect, x, style.bar_color));
+        } else if (b - b.round()).abs() < 1e-6 {
+            beat_segs.push(vline(rect, x, style.beat_color));
+        } else {
+            sub_segs.push(vline(rect, x, sub_color));
+        }
+    }
+    (sub_segs, beat_segs, bar_segs)
 }
 
 /// (M14 Phase 124 / daw_01 #100) subdivision 線分を `rect` 内に構築する。 ズーム退避
@@ -578,12 +703,12 @@ mod tests {
         scene.iter_glyphs().count()
     }
 
-    /// `bar_beat_grid` の bar / beat / subdivision 線を色で分けて数える。
-    fn grid_segment_counts(
+    /// `bar_beat_grid` (4/4、 `view_len_beats` 拍を 800px) を render して全線分を返す。
+    fn grid_segments(
         view_len_beats: f64,
         style: BarBeatGridStyle,
-        sub: Option<SubGridSpec>,
-    ) -> (usize, usize, usize) {
+        lines: GridLines,
+    ) -> Vec<LineSegment> {
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
         let mut model = TestModel;
         let mapping = TimeMapping {
@@ -596,24 +721,41 @@ mod tests {
         let viewport = ViewportState1D::new(0.0, view_len_beats * spb);
         let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 200.0 };
         let scene = run_frame(&mut host, &mut model, |_, ui| {
-            ui.bar_beat_grid("grid", rect, mapping, viewport, style, sub);
+            ui.bar_beat_grid("grid", rect, mapping, viewport, style, lines);
         });
+        scene.iter_lines().flat_map(|b| b.segments.iter().copied()).collect()
+    }
+
+    fn sub_color_of(lines: GridLines) -> Option<Color> {
+        match lines {
+            GridLines::BarBeat { sub } => sub.map(|s| s.color),
+            GridLines::Unit { sub_color, .. } => Some(sub_color),
+        }
+    }
+
+    /// `bar_beat_grid` の bar / beat / subdivision 線を色で分けて数える。
+    fn grid_segment_counts(
+        view_len_beats: f64,
+        style: BarBeatGridStyle,
+        lines: GridLines,
+    ) -> (usize, usize, usize) {
+        let sub_color = sub_color_of(lines);
         let mut bars = 0usize;
         let mut beats = 0usize;
         let mut subs = 0usize;
-        for batch in scene.iter_lines() {
-            for seg in batch.segments.iter() {
-                if seg.color == style.bar_color {
-                    bars += 1;
-                } else if seg.color == style.beat_color {
-                    beats += 1;
-                } else if sub.is_some_and(|s| seg.color == s.color) {
-                    subs += 1;
-                }
+        for seg in grid_segments(view_len_beats, style, lines) {
+            if seg.color == style.bar_color {
+                bars += 1;
+            } else if seg.color == style.beat_color {
+                beats += 1;
+            } else if sub_color.is_some_and(|c| seg.color == c) {
+                subs += 1;
             }
         }
         (bars, beats, subs)
     }
+
+    const NO_SUB: GridLines = GridLines::BarBeat { sub: None };
 
     #[test]
     fn ruler_no_thinning_when_bars_wide_enough() {
@@ -725,12 +867,12 @@ mod tests {
     fn grid_no_beat_lines_on_extreme_zoom_out() {
         let style = BarBeatGridStyle::from_palette(&Palette::dark());
         // 1 bar = 800px → 1 beat = 200px → beat 線 描画。
-        let (bars_close, beats_close, _) = grid_segment_counts(4.0, style, None);
+        let (bars_close, beats_close, _) = grid_segment_counts(4.0, style, NO_SUB);
         assert!(bars_close >= 1);
         assert!(beats_close >= 3, "1 bar ズーム時は beat 線も描画: got {beats_close}");
 
         // 200 bar = 800px → 1 beat = 1px (< 4px threshold) → beat 線 OFF。
-        let (bars_far, beats_far, _) = grid_segment_counts(800.0, style, None);
+        let (bars_far, beats_far, _) = grid_segment_counts(800.0, style, NO_SUB);
         assert_eq!(beats_far, 0, "zoom out で beat 線消える: got {beats_far}");
         assert!(bars_far >= 1, "ただし bar 線は残る: got {bars_far}");
     }
@@ -742,8 +884,82 @@ mod tests {
             ..BarBeatGridStyle::from_palette(&Palette::dark())
         };
         // 200 bar = 800 beats、 1 beat = 1px。 threshold 0 で常に描画 → beat 線 600 本程度。
-        let (_bars, beats, _) = grid_segment_counts(800.0, style, None);
+        let (_bars, beats, _) = grid_segment_counts(800.0, style, NO_SUB);
         assert!(beats > 100, "min_beat_line_px=0 で zoom out でも beat 線描画: got {beats}");
+    }
+
+    // ============================================================
+    // Adaptive: 線 = 吸着単位 (GridLines::Unit)
+    // ============================================================
+
+    fn sub_c() -> Color {
+        Color::rgba(0.5, 0.5, 0.5, 0.5) // bar/beat と別色
+    }
+
+    /// 単位 1/2 拍: 小節頭 / 整数拍 / 半拍で色が分かれ、線は単位の倍数だけ。
+    #[test]
+    fn unit_grid_half_beat_tiers() {
+        let style = BarBeatGridStyle::from_palette(&Palette::dark());
+        let lines = GridLines::Unit { unit_beats: 0.5, sub_color: sub_c(), sub_line_width: 1.0 };
+        // 1 bar (4 拍) を 800px。位置 0, 0.5, …, 4.0: 小節頭 0 と 4 = 2 本、整数拍 1,2,3 = 3 本、半拍 4 本。
+        let counts = grid_segment_counts(4.0, style, lines);
+        assert_eq!(counts, (2, 3, 4), "(bars, beats, subs)");
+    }
+
+    /// 単位 2 bar: 単位の倍数でない小節線は描かない (zoom out で小節線も間引かれる)、拍線 0。
+    #[test]
+    fn unit_grid_two_bars_thins_bar_lines() {
+        let style = BarBeatGridStyle::from_palette(&Palette::dark());
+        let lines = GridLines::Unit { unit_beats: 8.0, sub_color: sub_c(), sub_line_width: 1.0 };
+        // 8 bar (32 拍) を 800px: 小節 0,2,4,6,8 = 5 本。1 拍 25px (>= min_beat_line_px) でも
+        // Unit では拍線を描かない。
+        let counts = grid_segment_counts(32.0, style, lines);
+        assert_eq!(counts, (5, 0, 0), "(bars, beats, subs)");
+    }
+
+    /// Adaptive の不変条件: どの zoom でも「描かれた線の位置」= 「snap が動かさない位置」の集合
+    /// (`from_snap` と `snap_beat` が同じ `beat_unit` から出ていることの end-to-end 確認)。
+    #[test]
+    fn adaptive_lines_equal_snap_positions() {
+        let style = BarBeatGridStyle::from_palette(&Palette::dark());
+        let snap = common::snap::SnapConfig::DEFAULT; // Adaptive ON, 4/4
+        for view_len_beats in [2.0_f64, 4.0, 13.0, 64.0, 400.0, 3200.0] {
+            let zoom = (800.0 / view_len_beats) as f32;
+            let lines = GridLines::from_snap(&snap, zoom, None, sub_c(), 1.0);
+            assert!(matches!(lines, GridLines::Unit { .. }), "Adaptive は Unit で描く");
+            let unit = snap.beat_unit(zoom).unwrap();
+            let mut xs: Vec<f32> =
+                grid_segments(view_len_beats, style, lines).iter().map(|s| s.a[0]).collect();
+            xs.sort_by(f32::total_cmp);
+            xs.dedup();
+            // 各線の拍位置は snap の固定点。
+            for &x in &xs {
+                let b = f64::from(x) / 800.0 * view_len_beats;
+                let snapped = snap.snap_beat(b, false, zoom);
+                assert!(
+                    (snapped - b).abs() < unit * 1e-3,
+                    "len {view_len_beats}: line at {b} snaps to {snapped}"
+                );
+            }
+            // 線の本数 = view 内の単位の倍数の個数 (0 と view_end を含む) = 吸着位置を漏らさない。
+            let expected = (view_len_beats / unit).floor() as usize + 1;
+            assert_eq!(xs.len(), expected, "len {view_len_beats} unit {unit}");
+            // 線間隔は MIN_VISIBLE_GRID_PX (12px) 以上。
+            assert!(f64::from(zoom) * unit >= 12.0 - 1e-9, "len {view_len_beats} unit {unit}");
+        }
+    }
+
+    /// 固定 snap (Straight) は従来通り bar/beat (+3 段目)、 snap OFF の Adaptive も 2 段に戻る。
+    #[test]
+    fn from_snap_non_adaptive_is_bar_beat() {
+        let fixed = common::snap::SnapConfig {
+            mode: common::snap::SnapMode::Straight { div: 16 },
+            ..common::snap::SnapConfig::DEFAULT
+        };
+        let lines = GridLines::from_snap(&fixed, 100.0, Some(0.25), sub_c(), 1.0);
+        assert!(matches!(lines, GridLines::BarBeat { sub: Some(s) } if (s.interval_beats - 0.25).abs() < 1e-9));
+        let off = common::snap::SnapConfig { enabled: false, ..common::snap::SnapConfig::DEFAULT };
+        assert!(matches!(GridLines::from_snap(&off, 100.0, None, sub_c(), 1.0), GridLines::BarBeat { sub: None }));
     }
 
     // ============================================================
@@ -784,7 +1000,7 @@ mod tests {
             line_width: 1.0,
         };
         // 1 bar (4 拍) を 800px → 1 beat = 200px、 px_per_interval = 50px >= 6px → 描画。
-        let (bars, beats, subs) = grid_segment_counts(4.0, style, Some(sub));
+        let (bars, beats, subs) = grid_segment_counts(4.0, style, GridLines::BarBeat { sub: Some(sub) });
         assert!(bars >= 1, "bar 線あり");
         assert!(beats >= 3, "beat 線あり");
         assert_eq!(subs, 12, "subdivision 12 本 (拍内 3 本 × 4 拍): got {subs}");
@@ -800,7 +1016,7 @@ mod tests {
             line_width: 1.0,
         };
         // 100 bar (400 拍) を 800px → 1 beat = 2px、 px_per_interval = 0.5px < 6px → subdivision OFF。
-        let (bars, _beats, subs) = grid_segment_counts(400.0, style, Some(sub));
+        let (bars, _beats, subs) = grid_segment_counts(400.0, style, GridLines::BarBeat { sub: Some(sub) });
         assert_eq!(subs, 0, "ズーム退避で subdivision 0 本: got {subs}");
         assert!(bars >= 1, "bar 線は残る (2 段に退避): got {bars}");
     }

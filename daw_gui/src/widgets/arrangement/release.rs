@@ -500,6 +500,10 @@ pub(super) fn commit_releases(
         // `last_*` を真値とし pointer.modifiers を直接見ない (race 回避、 ClipDragSession と同 pattern)。
         // beat_to_px は anchor 固定 `body_rect_anchor` から計算 (view scroll 耐性)、 absolute snap で
         // grid 吸着、 cross-lane Move は release y から `automation_lane_key_at_y` で drop lane 解決。
+        // r.md #87: ランチャー帯の上で離したら、レーン行のセルへ落とした意図
+        // (`DropClipsToCells`) に振り替える (MIDI / オーディオの clip drag と同じ口)。
+        let automation_clip_drag_release = automation_clip_drag_release
+            .filter(|acd| !launcher::release::take_automation_drop(f, acd, response));
         if let Some(acd) = automation_clip_drag_release {
             let release_alt = acd.last_alt;
             let dx = acd.last_mouse.0 - acd.anchor_mouse.0;

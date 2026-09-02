@@ -956,6 +956,209 @@ fn セルを置けない行には作れない() {
     assert!(!app.song_doc.is_dirty(), "置けないので `*` も立たない");
 }
 
+/// **オートメーション追従**: MIDI クリップをセルへ運ぶと、その窓に完全に入るオートメーション
+/// クリップも同じ列のレーン行セルへ付いてくる (`plan_range_selection.md` §5 のランチャー版)。
+/// 窓とぴったり同じ 1 つなら中身を共有したまま運ぶ、それ以外は窓全体を覆う 1 つの content に
+/// 畳む (クリップの無い区間はレーン既定値)。
+#[test]
+fn クリップをセルへ運ぶとオートメーションが追従する() {
+    use common::model::{
+        AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+        AutomationTarget, ClipKey, TrackBuiltinParam,
+    };
+    use daw_gui::event_launcher::{ArrangementClipRef, ClipToCellDrop, LauncherDropMode};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    app.ui_prefs.automation_follows_clips = true;
+    let mut ids = (0, 0, 0, 0);
+    app.edit_song(|song| {
+        // MIDI クリップ [8, 12)。
+        let mcid = song.alloc_content_id();
+        song.clip_contents.insert(mcid, ClipContent::Midi(common::model::MidiContent::default()));
+        song.tracks[0].clips.push(Clip {
+            id: 1,
+            content_id: mcid,
+            start_beat: 8.0,
+            length_beats: 4.0,
+            ..Clip::default()
+        });
+        // 値 v の点 1 つを持つ automation content。
+        let mk = |song: &mut common::model::Song, v: f64| {
+            let mut c = AutomationContent::default();
+            let id = c.alloc_point_id();
+            c.points.push(AutomationPoint { id, time_beat: 0.0, value: v, curve: AutomationCurve::Linear });
+            let cid = song.alloc_content_id();
+            song.clip_contents.insert(cid, ClipContent::Automation(c));
+            cid
+        };
+        let lane = |id: u32, p: TrackBuiltinParam, default: f64| AutomationLane {
+            id,
+            ..AutomationLane::new(AutomationTarget::TrackBuiltin(p), default)
+        };
+        // レーン A (既定 1.0): 窓の途中の 1 つ ([9, 11) 値 0.5) と、窓の外の 1 つ ([0, 4))。
+        let a_in = mk(song, 0.5);
+        let a_out = mk(song, 0.3);
+        let mut lane_a = lane(1, TrackBuiltinParam::Volume, 1.0);
+        lane_a.clips.push(AutomationClip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: a_out, ..AutomationClip::default() });
+        lane_a.clips.push(AutomationClip { id: 2, start_beat: 9.0, length_beats: 2.0, content_id: a_in, ..AutomationClip::default() });
+        // レーン B (既定 0.0): 窓の中に 2 つ ([8, 10) 値 0.2、[10, 12) 値 0.8)。
+        let b1 = mk(song, 0.2);
+        let b2 = mk(song, 0.8);
+        let mut lane_b = lane(2, TrackBuiltinParam::Pan, 0.0);
+        lane_b.clips.push(AutomationClip { id: 1, start_beat: 8.0, length_beats: 2.0, content_id: b1, ..AutomationClip::default() });
+        lane_b.clips.push(AutomationClip { id: 2, start_beat: 10.0, length_beats: 2.0, content_id: b2, ..AutomationClip::default() });
+        // レーン C: 窓とぴったり同じ 1 つ ([8, 12))。
+        let c1 = mk(song, 0.7);
+        let mut lane_c = lane(3, TrackBuiltinParam::Mute, 0.0);
+        lane_c.clips.push(AutomationClip { id: 1, start_beat: 8.0, length_beats: 4.0, content_id: c1, ..AutomationClip::default() });
+        song.tracks[0].automation_lanes.push(lane_a);
+        song.tracks[0].automation_lanes.push(lane_b);
+        song.tracks[0].automation_lanes.push(lane_c);
+        ids = (a_in, b1, b2, c1);
+    });
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::DropClipsToCells {
+        drops: vec![ClipToCellDrop {
+            from: ArrangementClipRef::Track(ClipKey { track_id: 1, clip_id: 1 }),
+            to_row: LauncherRow::Track(1),
+            to_scene_index: 0,
+        }],
+        mode: LauncherDropMode::Move,
+    }));
+
+    let song = app.song_doc.song();
+    let scene = song.scenes[0].id;
+    let track = &song.tracks[0];
+    assert_eq!(track.session_clips.len(), 1, "MIDI のセルが出来る");
+    // セルの中身を窓の先頭からの拍 t で評価する。
+    let value_at = |cell: &common::model::SessionAutomationClip, t: f64| -> f64 {
+        let Some(ClipContent::Automation(a)) = song.clip_contents.get(&cell.clip.content_id) else {
+            panic!("content が無い")
+        };
+        common::automation::evaluate_clip(a, cell.clip.song_to_content_beat(t))
+    };
+    // レーン A: 窓の途中から始まるので窓全体 [0, 4) を覆う content に畳む。
+    // クリップの無い区間 ([0,1) / [3,4)) はレーン既定値 1.0、[1,3) は 0.5。
+    let lane_a = &track.automation_lanes[0];
+    assert_eq!(lane_a.session_clips.len(), 1, "レーン A のセル");
+    let cell_a = &lane_a.session_clips[0];
+    assert_eq!(cell_a.scene_id, scene);
+    assert!((cell_a.clip.start_beat).abs() < 1e-9 && (cell_a.clip.length_beats - 4.0).abs() < 1e-9);
+    assert_ne!(cell_a.clip.content_id, ids.0, "畳んだ中身は新規");
+    assert!((value_at(cell_a, 0.5) - 1.0).abs() < 1e-9, "手前は既定値: {}", value_at(cell_a, 0.5));
+    assert!((value_at(cell_a, 1.5) - 0.5).abs() < 1e-9, "クリップの中: {}", value_at(cell_a, 1.5));
+    assert!((value_at(cell_a, 3.5) - 1.0).abs() < 1e-9, "後ろは既定値: {}", value_at(cell_a, 3.5));
+    assert_eq!(lane_a.clips.len(), 1, "窓の外のクリップだけ残る (Move)");
+    assert!((lane_a.clips[0].start_beat - 0.0).abs() < 1e-9);
+    // レーン B: 2 つ → 1 つの content に畳む。値は元の曲線どおり。
+    let lane_b = &track.automation_lanes[1];
+    assert_eq!(lane_b.session_clips.len(), 1, "レーン B のセル");
+    let cell_b = &lane_b.session_clips[0];
+    assert!((cell_b.clip.length_beats - 4.0).abs() < 1e-9);
+    assert!(cell_b.clip.content_id != ids.1 && cell_b.clip.content_id != ids.2, "畳んだ中身は新規");
+    assert!((value_at(cell_b, 0.5) - 0.2).abs() < 1e-9, "前半は 0.2: {}", value_at(cell_b, 0.5));
+    assert!((value_at(cell_b, 1.99) - 0.2).abs() < 1e-9, "前半の末尾まで 0.2: {}", value_at(cell_b, 1.99));
+    assert!((value_at(cell_b, 2.5) - 0.8).abs() < 1e-9, "後半は 0.8: {}", value_at(cell_b, 2.5));
+    assert!(lane_b.clips.is_empty(), "Move なので元は消える");
+    // レーン C: 窓とぴったり同じ 1 つ → 中身は共有 (リンク)。
+    let lane_c = &track.automation_lanes[2];
+    assert_eq!(lane_c.session_clips.len(), 1, "レーン C のセル");
+    assert_eq!(lane_c.session_clips[0].clip.content_id, ids.3, "ぴったり同じ 1 つは中身を共有");
+    assert!(lane_c.clips.is_empty(), "Move なので元は消える");
+}
+
+/// 追従 OFF なら MIDI のセルだけが出来て、レーンには触らない。
+#[test]
+fn 追従_off_ならオートメーションはセルへ運ばない() {
+    use common::model::{AutomationClip, AutomationLane, AutomationTarget, ClipKey, TrackBuiltinParam};
+    use daw_gui::event_launcher::{ArrangementClipRef, ClipToCellDrop, LauncherDropMode};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    app.ui_prefs.automation_follows_clips = false;
+    app.edit_song(|song| {
+        let mcid = song.alloc_content_id();
+        song.clip_contents.insert(mcid, ClipContent::Midi(common::model::MidiContent::default()));
+        song.tracks[0].clips.push(Clip { id: 1, content_id: mcid, start_beat: 8.0, length_beats: 4.0, ..Clip::default() });
+        let acid = song.alloc_content_id();
+        song.clip_contents.insert(acid, ClipContent::default());
+        let mut lane = AutomationLane {
+            id: 1,
+            ..AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0)
+        };
+        lane.clips.push(AutomationClip { id: 1, start_beat: 8.0, length_beats: 4.0, content_id: acid, ..AutomationClip::default() });
+        song.tracks[0].automation_lanes.push(lane);
+    });
+    app.handle_event(AppEvent::Launcher(LauncherEvent::DropClipsToCells {
+        drops: vec![ClipToCellDrop {
+            from: ArrangementClipRef::Track(ClipKey { track_id: 1, clip_id: 1 }),
+            to_row: LauncherRow::Track(1),
+            to_scene_index: 0,
+        }],
+        mode: LauncherDropMode::Move,
+    }));
+    let lane = &app.song_doc.song().tracks[0].automation_lanes[0];
+    assert!(lane.session_clips.is_empty(), "追従 OFF ではレーンのセルは作らない");
+    assert_eq!(lane.clips.len(), 1, "レーンのクリップもそのまま");
+}
+
+/// アレンジの**オートメーションクリップ**もレーン行のセルへ落とせる (MIDI / オーディオと
+/// 同じ `DropClipsToCells` の口)。モデルと engine はレーン行のセルを持てるのに、drop の
+/// 経路だけが `ClipKey` しか運べず、レーンのクリップは帯へ持ち込めなかった。
+#[test]
+fn オートメーションクリップをレーン行のセルへ落とせる() {
+    use common::model::{
+        AutomationClip, AutomationClipKey, AutomationLane, AutomationLaneKey, AutomationTarget,
+        TrackBuiltinParam,
+    };
+    use daw_gui::event_launcher::{ArrangementClipRef, ClipToCellDrop, LauncherDropMode};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let mut cid = 0;
+    app.edit_song(|song| {
+        cid = song.alloc_content_id();
+        song.clip_contents.insert(cid, ClipContent::default());
+        let mut lane = AutomationLane {
+            id: 1,
+            ..AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0)
+        };
+        lane.clips.push(AutomationClip {
+            id: 5,
+            start_beat: 8.0,
+            length_beats: 4.0,
+            content_id: cid,
+            ..AutomationClip::default()
+        });
+        song.tracks[0].automation_lanes.push(lane);
+    });
+    let lane_key = AutomationLaneKey { track: 1, lane: 1 };
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::DropClipsToCells {
+        drops: vec![ClipToCellDrop {
+            from: ArrangementClipRef::Lane(AutomationClipKey { track: 1, lane: 1, clip: 5 }),
+            to_row: LauncherRow::Lane(lane_key),
+            to_scene_index: 0,
+        }],
+        mode: LauncherDropMode::Move,
+    }));
+
+    let song = app.song_doc.song();
+    let lane = &song.tracks[0].automation_lanes[0];
+    assert_eq!(lane.session_clips.len(), 1, "レーン行の列 0 にセルが出来る");
+    assert!(lane.clips.is_empty(), "移動なので元のクリップはレーンから消える");
+    let cell = &lane.session_clips[0];
+    assert_eq!(cell.scene_id, song.scenes[0].id);
+    assert_eq!(cell.clip.start_beat, 0.0, "セルは先頭から鳴らす");
+    assert_eq!(cell.clip.length_beats, 4.0, "長さは持ち込む");
+    assert_eq!(cell.clip.content_id, cid, "素の移動は中身を共有したまま");
+    assert!(
+        app.live_launcher_cells().iter().any(|c| matches!(
+            c,
+            LauncherCellKey::Lane(k) if k.track == 1 && k.lane == 1 && k.clip == cell.clip.id
+        )),
+        "落としたセルが選択される"
+    );
+}
+
 /// 列の連鎖の起点 (`Song.last_launched_scene_id`) は **ユーザーが撃った列だけ**を
 /// 覚え、全停止 / 全行アレンジ復帰で降りる。engine の `seed_from_song` が
 /// 停止 → 再生 / 書き出しのたびにここからシーンのフォローアクションを arm し直すので、

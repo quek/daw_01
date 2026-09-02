@@ -133,8 +133,20 @@ impl LaunchEdit {
     pub fn apply_follow(self, f: &mut FollowAction) -> bool {
         match self {
             Self::FollowEnabled(v) => f.enabled = v,
-            Self::FollowA(k) => f.a = k,
-            Self::FollowB(k) => f.b = k,
+            // 行動を選んだら有効にする (EQ / Comp のノブと同じ「触ったら ON」)。「次のセル」を
+            // 選んだのに別の 有効 トグルを押すまで何も起きない、が「効かない」に見えていた。
+            Self::FollowA(k) => {
+                f.a = k;
+                if k != FollowActionKind::NoAction {
+                    f.enabled = true;
+                }
+            }
+            Self::FollowB(k) => {
+                f.b = k;
+                if k != FollowActionKind::NoAction {
+                    f.enabled = true;
+                }
+            }
             Self::FollowChanceA(v) => f.chance_a = v.min(100),
             Self::FollowLinked(v) => f.linked = v,
             // 0 拍は「間隔ゼロで無限に発火」になるので下限を切る。
@@ -159,11 +171,20 @@ pub struct LauncherCellMove {
     pub to_scene_index: usize,
 }
 
+/// アレンジ側で掴んだクリップ。トラック行の MIDI / オーディオと、オートメーション
+/// レーン行のクリップ — セルの 2 種 ([`LauncherCellKey`]) と 1:1 で、帯へ落とせるのは
+/// どちらも同じ (行き先は同じ種別の行だけ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrangementClipRef {
+    Track(ClipKey),
+    Lane(AutomationClipKey),
+}
+
 /// アレンジのクリップを**セルへ**落とした 1 件。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClipToCellDrop {
     /// 掴んだアレンジのクリップ。
-    pub from: common::model::ClipKey,
+    pub from: ArrangementClipRef,
     pub to_row: LauncherRow,
     /// [`LauncherCellMove::to_scene_index`] と同じ理由で **表示順 index**。
     pub to_scene_index: usize,

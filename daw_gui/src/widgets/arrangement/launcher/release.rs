@@ -260,10 +260,36 @@ pub(crate) fn take_arrangement_drop(
     nd: &ClipDragSession,
     response: &mut ArrangementResponse,
 ) -> bool {
-    if f.launcher.collapsed || !matches!(nd.kind, ClipDragKind::Move) {
+    take_drop(f, nd.kind, nd.last_mouse, (nd.last_ctrl, nd.last_shift), response, || {
+        plan_clip_drops(f, nd)
+    })
+}
+
+/// [`take_arrangement_drop`] のオートメーションクリップ版 (レーン行 → レーン行のセル)。
+/// `release::commit_releases` の automation_clip_drag ブロックの手前で呼ばれる。
+pub(crate) fn take_automation_drop(
+    f: &ArrangementFrame<'_>,
+    acd: &AutomationClipDragSession,
+    response: &mut ArrangementResponse,
+) -> bool {
+    take_drop(f, acd.kind, acd.last_mouse, (acd.last_ctrl, acd.last_shift), response, || {
+        plan_automation_clip_drops(f, acd)
+    })
+}
+
+/// 2 種のドラッグで共通の「帯の上で離したか」判定と意図の積み込み。
+fn take_drop(
+    f: &ArrangementFrame<'_>,
+    kind: ClipDragKind,
+    last_mouse: (f32, f32),
+    (ctrl, shift): (bool, bool),
+    response: &mut ArrangementResponse,
+    plan: impl FnOnce() -> Vec<ClipToCellDrop>,
+) -> bool {
+    if f.launcher.collapsed || !matches!(kind, ClipDragKind::Move) {
         return false;
     }
-    let (mx, my) = nd.last_mouse;
+    let (mx, my) = last_mouse;
 
     // **帯の上で離したら必ずここで受け止める。** 格子の外 (停止列 / 返す列 /
     // 見出し行 / つかみ代) はセルにできないので「移動をキャンセル」として吸収する
@@ -272,15 +298,23 @@ pub(crate) fn take_arrangement_drop(
     if !f.launcher.pane.contains(mx, my) {
         return false;
     }
-    let drops = plan_clip_drops(f, nd);
-    let mode = ClipCopyMode::from_modifiers(nd.last_ctrl, nd.last_shift);
+    let drops = plan();
+    let mode = ClipCopyMode::from_modifiers(ctrl, shift);
     if !drops.is_empty() {
         response.launcher.intents.push(LauncherIntent::DropClipsToCells { drops, mode });
     }
     true
 }
 
-/// アレンジから帯へ運んでいるクリップの **着地先**。
+/// 帯へ運んでいるクリップ 1 つ (行 / 開始拍 / 何を掴んだか)。2 種のドラッグ session を
+/// 同じ写像に通すための共通形。
+struct DropSource {
+    row: ArrangementRowKey,
+    start_beat: f64,
+    from: ArrangementClipRef,
+}
+
+/// アレンジから帯へ運んでいる (MIDI / オーディオ) クリップの **着地先**。
 ///
 /// `plan_cell_moves` と同じ理由でプレビューと確定が共有する 1 本
 /// (`draw::drag_overlays` がこれを rect に直してゴーストを置く)。格子の外
@@ -291,49 +325,98 @@ pub(super) fn plan_clip_drops(
     f: &ArrangementFrame<'_>,
     nd: &ClipDragSession,
 ) -> Vec<ClipToCellDrop> {
-    // 端を掴んだ resize は帯へ落とせない (`take_arrangement_drop` の同じゲート)。
+    let mut sources: Vec<DropSource> = nd
+        .anchors
+        .iter()
+        .map(|a| DropSource {
+            row: ArrangementRowKey::Track(a.key.track_id),
+            start_beat: a.start_beat,
+            from: ArrangementClipRef::Track(a.key),
+        })
+        .collect();
+    // トラック行のクリップが行けるのはトラック行だけ (handler の `drop_one_clip_to_cell`
+    // と同じ規約)。レーン行へ写った分は落とせないのでゴーストも出さない。
+    plan_drops(f, nd.kind, nd.last_mouse, &mut sources, |row| {
+        matches!(row, ArrangementRowKey::Track(_))
+    })
+}
+
+/// [`plan_clip_drops`] のオートメーションクリップ版。行き先はレーン行だけ。
+#[must_use]
+pub(super) fn plan_automation_clip_drops(
+    f: &ArrangementFrame<'_>,
+    acd: &AutomationClipDragSession,
+) -> Vec<ClipToCellDrop> {
+    let mut sources: Vec<DropSource> = acd
+        .anchors
+        .iter()
+        .map(|a| DropSource {
+            // anchor の lane key は widget 内の mirror 型、行キーは common の型。
+            row: ArrangementRowKey::Lane(common::model::AutomationLaneKey {
+                track: a.lane.track,
+                lane: a.lane.lane,
+            }),
+            start_beat: a.start_beat,
+            from: ArrangementClipRef::Lane(a.key),
+        })
+        .collect();
+    plan_drops(f, acd.kind, acd.last_mouse, &mut sources, |row| {
+        matches!(row, ArrangementRowKey::Lane(_))
+    })
+}
+
+/// 掴んだクリップ群を、指している格子のセルを起点に行 / 列へ写す。
+///
+/// 同じ行の複数クリップは、開始拍の順に隣の列へ並べる (Live と同じ「時間軸を列に
+/// 開く」写像)。ランチャーには時間軸が無いので、これ以外に複数クリップを 1 列へ
+/// 落とすと必ずどれかが上書きになる。行は「掴んだ行 → 落とした行」のずれぶん
+/// 全体を平行移動し、`accepts` を満たさない行 (種別違い) へ写ったものは捨てる。
+fn plan_drops(
+    f: &ArrangementFrame<'_>,
+    kind: ClipDragKind,
+    last_mouse: (f32, f32),
+    sources: &mut [DropSource],
+    accepts: impl Fn(ArrangementRowKey) -> bool,
+) -> Vec<ClipToCellDrop> {
+    // 端を掴んだ resize は帯へ落とせない (`take_drop` と同じゲート)。
     // ここを緩めると「ゴーストは出るのに離しても何も起きない」になる。
-    if f.launcher.collapsed || !matches!(nd.kind, ClipDragKind::Move) {
+    if f.launcher.collapsed || !matches!(kind, ClipDragKind::Move) {
         return Vec::new();
     }
-    let (mx, my) = nd.last_mouse;
+    let (mx, my) = last_mouse;
     let Some(target) = layout::drop_cell_at(f, mx, my) else {
         return Vec::new();
     };
     let Some(base_idx) = row_index(f, target.row) else {
         return Vec::new();
     };
-    let Some(first) = nd.anchors.first() else {
+    let Some(anchor_idx) = sources.first().and_then(|s| row_index(f, s.row)) else {
         return Vec::new();
     };
-    let Some(anchor_idx) = track_row_index(f, first.key.track_id) else {
-        return Vec::new();
-    };
-    // 同じトラックの複数クリップは、開始拍の順に隣の列へ並べる (Live と同じ
-    // 「時間軸を列に開く」写像)。ランチャーには時間軸が無いので、これ以外に
-    // 複数クリップを 1 列へ落とすと必ずどれかが上書きになる。
-    let mut sorted: Vec<&ClipDragAnchor> = nd.anchors.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.track_index
-            .cmp(&b.track_index)
+    sources.sort_by(|a, b| {
+        row_index(f, a.row)
+            .cmp(&row_index(f, b.row))
             .then(a.start_beat.total_cmp(&b.start_beat))
     });
-    let mut rank_track: Option<usize> = None;
+    let mut rank_row: Option<ArrangementRowKey> = None;
     let mut rank = 0u32;
     let mut drops: Vec<ClipToCellDrop> = Vec::new();
-    for a in sorted {
-        if rank_track != Some(a.track_index) {
-            rank_track = Some(a.track_index);
+    for s in sources.iter() {
+        if rank_row != Some(s.row) {
+            rank_row = Some(s.row);
             rank = 0;
         }
-        let Some(idx) = track_row_index(f, a.key.track_id) else {
+        let Some(idx) = row_index(f, s.row) else {
             continue;
         };
         let Some(to_row) = shift_row(f, idx, base_idx, anchor_idx) else {
             continue;
         };
+        if !accepts(to_row) {
+            continue;
+        }
         let to_scene_index = target.scene_index.saturating_add(rank);
-        drops.push(ClipToCellDrop { from: a.key, to_row, to_scene_index });
+        drops.push(ClipToCellDrop { from: s.from, to_row, to_scene_index });
         rank += 1;
     }
     drops
@@ -346,11 +429,6 @@ pub(super) fn plan_clip_drops(
 /// 行キー → `ArrangementFrame::rows` の index。
 fn row_index(f: &ArrangementFrame<'_>, key: ArrangementRowKey) -> Option<usize> {
     f.rows.iter().position(|r| r.key == key)
-}
-
-/// トラック id → その**トラック行**の index。
-fn track_row_index(f: &ArrangementFrame<'_>, track: u32) -> Option<usize> {
-    row_index(f, ArrangementRowKey::Track(track))
 }
 
 /// `idx` の行を「掴んだ行 → 落とした行」のぶんだけずらした先の行キー。

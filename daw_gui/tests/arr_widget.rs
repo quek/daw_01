@@ -2116,6 +2116,49 @@ fn launcher_pane_sits_between_header_and_lanes() {
     assert!(!r.launcher.cell_rects.is_empty(), "格子のセルが caller に返る");
 }
 
+/// クリップをレーンから帯 (ランチャー) へ持ち出しても、アレンジは横スクロールしない。
+/// 端オートスクロールの hot-zone は lanes の**内側**にしか無い — 旧実装は lanes の左の
+/// 半平面すべてで最大速度だったので、帯の上で静止しても拍 0 まで巻き戻り続けた。
+#[test]
+fn dragging_a_clip_into_the_launcher_pane_does_not_autoscroll_the_lanes() {
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 200.0);
+    // scroll_beat > 0 で始める: 0 だと下限クランプが症状を隠す。
+    app.ui_prefs.arrange_scroll_beat = 8.0;
+    add_midi_track_with_clip(&mut app, 1, 1, 8.0, 4.0);
+    let mut host = UiHost::no_redraw();
+    let r = drive_response(&mut host, &mut app, PointerFrame::default());
+    let pane = r.launcher.pane_rect;
+    let lanes = r.lanes_rect;
+    // クリップの実 rect から掴む点を取る (帯を出すと行の y が既定 fixture と違う)。
+    // 移動はヘッダ帯 (上端 +2px) から (本体は時間範囲になる)。
+    let (_, clip) = r.clip_rects.first().copied().expect("クリップが描かれている");
+    let grab_x = clip.x + 52.0;
+    let y = clip.y + 2.0;
+    drive(&mut host, &mut app, press(grab_x, y, no_mods()));
+    // lanes の中で 20px 動かして drag を成立させる (端 zone には入らない)。
+    let r = drive_response(&mut host, &mut app, hold(grab_x - 20.0, y, no_mods()));
+    assert!(r.dragging.is_some(), "クリップの drag が始まっていない");
+    assert!((app.ui_prefs.arrange_scroll_beat - 8.0).abs() < 1e-9, "中央では動かない");
+    // 正の対照: lanes の**内側**の左端 hot-zone では動く (= drag が生きていて端スクロールが効く)。
+    for _ in 0..3 {
+        drive(&mut host, &mut app, hold(lanes.x + 2.0, y, no_mods()));
+    }
+    let after_inside = app.ui_prefs.arrange_scroll_beat;
+    assert!(after_inside < 8.0, "レーン内側の端で端スクロールしていない: {after_inside}");
+    // 帯の上で静止 (数フレーム) → もう動かない。
+    let px = pane.x + pane.w * 0.5;
+    for _ in 0..6 {
+        drive(&mut host, &mut app, hold(px, y, no_mods()));
+    }
+    assert!(
+        (app.ui_prefs.arrange_scroll_beat - after_inside).abs() < 1e-9,
+        "帯の上で横スクロールし続けた: {} → {}",
+        after_inside,
+        app.ui_prefs.arrange_scroll_beat
+    );
+    drive(&mut host, &mut app, release(px, y, no_mods()));
+}
+
 /// セルの ▶ を押す → `Launch` の意図が返る。**widget は `Song` を書かない**
 /// (主導権の書き換えと発火は束 D / 束 B の担当)。
 #[test]

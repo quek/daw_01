@@ -42,7 +42,8 @@ pub enum SnapMode {
     /// `count = 0` は `Off` 同等 (`beat_unit` が `None` を返す、 defensive)。
     /// 1/2 bar 等の分数 bar は表現不可 (実需要が出たら fraction Bars を別途検討)。
     Bars { count: u32 },
-    /// zoom (px/beat) に応じて 1/N を自動選択 (`MIN_VISIBLE_GRID_PX = 12.0` 以上を満たす最大 unit)。
+    /// zoom (px/beat) と拍子に応じて単位を自動選択 ([`adaptive_unit_beats`])。表示グリッドも
+    /// 同じ関数の値で線を打つ (daw_gui `GridLines::Unit`) ので「見えている線 = 吸着位置」。
     Adaptive,
 }
 
@@ -62,8 +63,10 @@ pub struct SnapConfig {
     pub time_sig: (u8, u8),
 }
 
-/// `Adaptive` の zoom 閾値。`zoom_x * unit >= MIN_VISIBLE_GRID_PX` を満たす最大 unit を選ぶ。
+/// `Adaptive` の zoom 閾値。`zoom_x * unit >= MIN_VISIBLE_GRID_PX` を満たす最も細かい unit を選ぶ。
 const MIN_VISIBLE_GRID_PX: f64 = 12.0;
+/// `Adaptive` の梯子で小節を倍にしていく上限 (bar × 2^16)。これより粗くはならない。
+const MAX_BAR_DOUBLINGS: u32 = 16;
 
 impl SnapConfig {
     /// デフォルト snap (Adaptive ON、`min_beat_unit = 1/128`、 `time_sig = (4, 4)`)。
@@ -92,6 +95,15 @@ impl SnapConfig {
         !matches!(self.mode, SnapMode::Off)
     }
 
+    /// 1 bar の拍数 (`numerator * 4 / denominator`: 4/4 → 4、 3/4 → 3、 6/8 → 3)。
+    /// 各成分は 0 防御で max(1)。
+    #[must_use]
+    pub fn beats_per_bar(&self) -> f64 {
+        let num = f64::from(self.time_sig.0.max(1));
+        let den = f64::from(self.time_sig.1.max(1));
+        num * 4.0 / den
+    }
+
     /// 現在の snap mode + zoom から 1 unit の長さ (拍) を返す。
     /// `min_beat_unit` で floor。snap が無効 (alt / disabled / Off) なら `None`。
     /// zoom が 0 / 負 / 非有限のときは `MIN_VISIBLE_GRID_PX` 計算が破綻するので `None`。
@@ -116,12 +128,9 @@ impl SnapConfig {
                 if count == 0 {
                     return None;
                 }
-                let num = f64::from(self.time_sig.0.max(1));
-                let den = f64::from(self.time_sig.1.max(1));
-                let beats_per_bar = num * 4.0 / den;
-                beats_per_bar * f64::from(count)
+                self.beats_per_bar() * f64::from(count)
             }
-            SnapMode::Adaptive => beat_unit_for_zoom(zoom_x_px_per_beat),
+            SnapMode::Adaptive => adaptive_unit_beats(zoom_x_px_per_beat, self.beats_per_bar()),
         };
         let unit = raw_unit.max(self.min_beat_unit);
         if unit > 0.0 && unit.is_finite() {
@@ -158,17 +167,51 @@ impl Default for SnapConfig {
     }
 }
 
-/// `Adaptive` 用: `zoom_x * unit >= 12.0` を満たす最大 unit。
-/// 候補は `1, 1/2, 1/4, ..., 1/128` (7 段階)。
-fn beat_unit_for_zoom(zoom_x_px_per_beat: f32) -> f64 {
+/// `Adaptive` の単位 (拍)。snap ([`SnapConfig::beat_unit`]) と表示グリッド (daw_gui
+/// `bar_beat_grid` の `GridLines::Unit`) の両方がこの 1 関数から値を取る =
+/// 「見えている線に吸着する」を構造で保証する。
+///
+/// 梯子 (細 → 粗): `1/128 … 1/2` 拍 → `1` 拍 → 小節を 2 で割り続けて整数拍 (> 1) になる段
+/// (4/4 なら 2 拍、 6/4 なら 3 拍、 3/4 には無い) → `1 bar` → `2 bar` → `4 bar` … 。
+/// `zoom * unit >= MIN_VISIBLE_GRID_PX` を満たす最も細かい段を選ぶ (どの段も満たさない極端な
+/// zoom out は最粗段)。旧実装は 1 拍で止まっていたため、小節線しか見えない zoom でも 1 拍に
+/// 吸着していた。
+#[must_use]
+pub fn adaptive_unit_beats(zoom_x_px_per_beat: f32, beats_per_bar: f64) -> f64 {
     let zoom = f64::from(zoom_x_px_per_beat.max(0.001));
-    let mut unit = 1.0_f64;
-    for _ in 0..7 {
-        let next = unit / 2.0;
-        if zoom * next < MIN_VISIBLE_GRID_PX {
-            break;
+    let bar = if beats_per_bar.is_finite() && beats_per_bar >= 1.0 { beats_per_bar } else { 4.0 };
+    let fits = |unit: f64| zoom * unit >= MIN_VISIBLE_GRID_PX;
+    // 拍以下: 1/128 → … → 1/2 → 1 (2 のべき乗なので浮動小数でも正確)。
+    let mut unit = 1.0 / 128.0;
+    while unit <= 1.0 {
+        if fits(unit) {
+            return unit;
         }
-        unit = next;
+        unit *= 2.0;
     }
-    unit
+    // 拍と小節の間: bar / 2^k が整数拍 (> 1) になる段を、細い順に。
+    let mut halves = [0.0_f64; 8];
+    let mut n = 0;
+    let mut d = bar / 2.0;
+    while d > 1.0 + 1e-9 && n < halves.len() {
+        if (d - d.round()).abs() < 1e-9 {
+            halves[n] = d;
+            n += 1;
+        }
+        d /= 2.0;
+    }
+    for &u in halves[..n].iter().rev() {
+        if fits(u) {
+            return u;
+        }
+    }
+    // 小節以上: bar × 2^k。
+    let mut u = bar;
+    for _ in 0..MAX_BAR_DOUBLINGS {
+        if fits(u) {
+            return u;
+        }
+        u *= 2.0;
+    }
+    u
 }
