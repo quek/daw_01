@@ -412,6 +412,17 @@ impl AppData {
                 Some(StripSection::Comp) => track.strip.comp.on = true,
                 None => {}
             }
+            // HP / LP は既定 OFF のバンドなので、周波数ノブを回したらそのバンドも
+            // ON にする (セクションだけ ON になってフィルタが掛からないのは、
+            // 上と同じ「回したのに何も起きない」に見えるため)。
+            if let StripEdit::Param {
+                param: common::model::TrackBuiltinParam::StripEq { band, .. },
+                ..
+            } = edit
+                && matches!(band, common::model::EqBand::Hp | common::model::EqBand::Lp)
+            {
+                track.strip.eq.band_mut(*band).on = true;
+            }
             changed || track.strip != before
         });
 
@@ -432,6 +443,50 @@ impl AppData {
             let target = common::model::AutomationTarget::TrackBuiltin(*param);
             self.ui_ephemeral.last_touched_param = Some(TouchedParam {
                 track_id,
+                display_name: crate::automation_label::automation_target_display_name(&target),
+                target,
+                touched_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) の 1 パラメータを
+    /// 適用する (`docs/plan_master_strip.md`)。
+    ///
+    /// 経路は通常 ch のストリップと同じ 3 段: `edit_song_checked` → 値のみ更新の
+    /// `AudioCommand::SetMasterStrip` → `last_touched_param` (= `A` キーの起点)。
+    /// **触ったセクションは自動で ON** にする (バイパス中のノブが無反応に見えない)。
+    pub(crate) fn apply_master_strip_edit(
+        &mut self,
+        param: common::model::MasterStripParam,
+        value: f32,
+    ) {
+        use common::model::MasterStripParam as M;
+        self.edit_song_checked(|song| {
+            let before = song.master_strip;
+            song.master_strip.set_param(param, value);
+            // バイパスそのものの操作 (`*On`) は明示指定なので自動 ON の対象外。
+            match param {
+                M::CompThreshold
+                | M::CompRatio
+                | M::CompAttack
+                | M::CompRelease
+                | M::CompMakeup => song.master_strip.comp.on = true,
+                M::EqGain(_) => song.master_strip.eq.on = true,
+                M::LimiterCeiling => song.master_strip.limiter.on = true,
+                M::CompOn | M::EqOn | M::LimiterOn => {}
+            }
+            song.master_strip != before
+        });
+        let strip = self.song_doc.song().master_strip;
+        self.send_audio(AudioCommand::SetMasterStrip { strip });
+
+        // ON/OFF 以外は `A` キーでレーンを作る対象に載せる。master は Track では
+        // ないので track_id は `MASTER_TRACK_ID` (song-level レーンの住所)。
+        if !matches!(param, M::CompOn | M::EqOn | M::LimiterOn) {
+            let target = common::model::AutomationTarget::MasterStrip(param);
+            self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+                track_id: common::model::MASTER_TRACK_ID,
                 display_name: crate::automation_label::automation_target_display_name(&target),
                 target,
                 touched_at: std::time::Instant::now(),
@@ -724,8 +779,16 @@ impl AppData {
     /// 「buffer 内で最も深かった量」を **0 以下の dB** で publish するので、
     /// ここで正の減衰量へ反転してから peak と同じ release で 0 へ戻す
     /// (メーターが 1 buffer だけ跳ねて消えるのを防ぐ)。
-    pub(crate) fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32, f32)]) {
+    pub(crate) fn on_track_peaks_tick(
+        &mut self,
+        peaks: &[(f32, f32, f32)],
+        master_gr: (f32, f32),
+    ) {
         const RELEASE: f32 = 0.85;
+        // マスターストリップの GR も同じ弾道で 0 へ戻す (per-track と同じ規則)。
+        let m = &mut self.transport.master_strip_gr;
+        m.0 = common::meter::update_peak(m.0, (-master_gr.0).max(0.0), RELEASE);
+        m.1 = common::meter::update_peak(m.1, (-master_gr.1).max(0.0), RELEASE);
         let n = self.song_doc.song().tracks.len();
         if self.transport.track_peak_display.len() != n {
             self.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));

@@ -38,6 +38,17 @@ pub fn automation_target_display_name(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
             format!("Comp {}", param.label())
         }
+        // マスターストリップ (docs/plan_master_strip.md)。セクション名 + ノブ名。
+        AutomationTarget::MasterStrip(param) => {
+            use common::model::MasterStripParam as M;
+            let section = match param {
+                M::CompOn | M::CompThreshold | M::CompRatio | M::CompAttack | M::CompRelease
+                | M::CompMakeup => "Master Comp",
+                M::EqOn | M::EqGain(_) => "Master EQ",
+                M::LimiterOn | M::LimiterCeiling => "Master Lim",
+            };
+            format!("{section} {}", param.label())
+        }
         AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
         AutomationTarget::SongTempo => "Tempo".into(),
         AutomationTarget::SongTimeSigNumerator => "Time Sig".into(),

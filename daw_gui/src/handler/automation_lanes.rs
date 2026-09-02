@@ -1261,6 +1261,11 @@ impl AppData {
                 .all_mod_routings()
                 .find(|r| r.id == *routing_id)
                 .map_or(0.0, |r| f64::from(r.depth)),
+            // マスターストリップ: target ↔ フィールドの対応は
+            // `MasterStrip::param` が SSoT (ここで写さない)。
+            AutomationTarget::MasterStrip(param) => {
+                f64::from(self.song_doc.song().master_strip.param(*param))
+            }
             AutomationTarget::SongTempo => f64::from(self.song_doc.song().bpm),
             AutomationTarget::SongTimeSigNumerator => f64::from(self.song_doc.song().time_sig.0),
             // Image PiP default: 同 track の最初の image clip の first

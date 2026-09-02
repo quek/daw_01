@@ -18,6 +18,7 @@
 
 use crate::model::{
     COMP_KNEE_DB, CompSettings, EQ_Q_MAX, EQ_Q_MIN, EQ_SHELF_Q, EqBand, EqSettings,
+    MASTER_AUTO_RELEASE_MAX_MS, MASTER_AUTO_RELEASE_MIN_MS, MasterEqBand, MasterEqSettings,
 };
 
 /// 正規化済み (a0 = 1) のバイクワッド係数。
@@ -306,6 +307,58 @@ pub fn smoothing_coeff(ms: f32, sample_rate: f32) -> f32 {
 #[must_use]
 pub fn amp_to_db(amp: f32) -> f32 {
     if amp <= 1e-6 { -120.0 } else { 20.0 * amp.log10() }
+}
+
+/// マスタートーン EQ の 3 段 ([`MasterEqBand::ALL`] と同順)。
+///
+/// 周波数は固定、ゲインだけが動く (`docs/plan_master_strip.md` §4.2)。
+/// 通常 ch と同じ [`Biquad`] を使うので、カーブ表示も同じ [`eq_magnitude_db`] で描ける。
+#[must_use]
+pub fn master_eq_stages(eq: &MasterEqSettings, sample_rate: f32) -> [Biquad; 3] {
+    let mut out = [Biquad::IDENTITY; 3];
+    if !eq.on {
+        return out;
+    }
+    for (slot, band) in out.iter_mut().zip(MasterEqBand::ALL) {
+        let gain = eq.gain_db(band);
+        let f = band.freq_hz();
+        *slot = match band.bell_q() {
+            Some(q) => Biquad::peaking(sample_rate, f, q, gain),
+            None if band == MasterEqBand::Low => {
+                Biquad::low_shelf(sample_rate, f, EQ_SHELF_Q, gain)
+            }
+            None => Biquad::high_shelf(sample_rate, f, EQ_SHELF_Q, gain),
+        };
+    }
+    out
+}
+
+/// マスタートーン EQ の振幅応答 (dB)。[`eq_magnitude_db`] の 3 段版。
+#[must_use]
+pub fn master_eq_magnitude_db(stages: &[Biquad; 3], sample_rate: f32, freq_hz: f32) -> f32 {
+    stages.iter().map(|s| s.magnitude_db(sample_rate, freq_hz)).sum()
+}
+
+/// `Auto` リリースの時定数 (ms)。
+///
+/// program-adaptive: **深く潰れ続けた後ほど遅く、瞬間的なピークの後ほど速く**戻る
+/// (Reason の Master Bus Compressor と同じ考え方)。`sustained_gr_db` は
+/// 「最近どれくらい潰れ続けているか」の平均 (0 以下の dB) で、呼び出し側が
+/// [`MASTER_AUTO_RELEASE_TRACK_MS`] の時定数で均した値を渡す。
+#[must_use]
+pub fn master_auto_release_ms(sustained_gr_db: f32) -> f32 {
+    // 0dB → 下端 / -12dB 以上潰れ続けていれば上端、その間は線形。
+    const FULL_SLOW_GR_DB: f32 = 12.0;
+    let t = (-sustained_gr_db / FULL_SLOW_GR_DB).clamp(0.0, 1.0);
+    MASTER_AUTO_RELEASE_MIN_MS + t * (MASTER_AUTO_RELEASE_MAX_MS - MASTER_AUTO_RELEASE_MIN_MS)
+}
+
+/// リミッターの静的カーブ: 入力ピーク (dBFS) → 必要なゲイン変化量 (dB、0 以下)。
+///
+/// ニーは持たない (シーリングを 1dB でも超えさせない方が仕事として正しい)。
+#[must_use]
+pub fn limiter_gain_db(peak_db: f32, ceiling_db: f32) -> f32 {
+    (ceiling_db - peak_db).min(0.0)
 }
 
 #[cfg(test)]

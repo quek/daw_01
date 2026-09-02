@@ -638,9 +638,34 @@ pub fn compile_schedule(
         // master fx chain は Mix の後段で直列 process される (`process_master_fx_chain`)
         // ので、その報告 latency も足さないと master に遅延プラグインを挿したときだけ
         // click が先行し、書き出し WAV もその分ずれる。
-        master_latency_samples: master_mix_latency
-            .saturating_add(chain_latency(&song.master_fx_chain, device_latencies)),
+        master_latency_samples:
+            master_output_latency(song, device_latencies, master_mix_latency, sample_rate),
     })
+}
+
+/// master **出力**の遅延量 (`Schedule::master_latency_samples`)。
+///
+/// = master 合流点の path latency + master fx chain の報告 latency +
+/// マスターリミッターのルックアヘッド (ON のときだけ)。click の参照位置と書き出しの
+/// 窓ずらしはどちらもこの 1 値を引くので、遅延源を足すときは必ずここに足す
+/// (r.md #39 / docs/plan_master_strip.md §2)。
+///
+/// リミッターの遅延は OFF なら素通し (0) で、ON/OFF は `edit_song` 経由 = LoadSong で
+/// 再 compile されるため、この値は切り替えに即追従する。
+fn master_output_latency(
+    song: &Song,
+    device_latencies: &DeviceLatencies,
+    master_mix_latency: u32,
+    sample_rate: u32,
+) -> u32 {
+    let limiter = if song.master_strip.limiter.on {
+        common::model::limiter_lookahead_samples(sample_rate)
+    } else {
+        0
+    };
+    master_mix_latency
+        .saturating_add(chain_latency(&song.master_fx_chain, device_latencies))
+        .saturating_add(limiter)
 }
 
 /// docs/plan_modulation.md §5: walk a device `chain` (a track's `devices` or
@@ -1343,6 +1368,20 @@ mod tests {
             compile_schedule(&grouped, &lat, 48_000, 0).unwrap().master_latency_samples,
             512
         );
+
+        // docs/plan_master_strip.md §2: マスターリミッター ON はルックアヘッド (5ms =
+        // 48kHz で 240) を出力遅延として足す。OFF (既定 = 上の全ケース) は足さない。
+        let mut limited = Song {
+            tracks: vec![track(|t| t.id = 1)],
+            ..Song::default()
+        };
+        limited.master_strip.limiter.on = true;
+        assert_eq!(
+            compile_schedule_for_test(&limited, 48_000, 0).unwrap().master_latency_samples,
+            common::model::limiter_lookahead_samples(48_000),
+            "リミッター ON のルックアヘッドは master 出力の遅延"
+        );
+        assert_eq!(common::model::limiter_lookahead_samples(48_000), 240);
     }
 
     /// r.md #39: `master_latency_samples` は master **出力** の遅延量なので、

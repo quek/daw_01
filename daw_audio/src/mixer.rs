@@ -10,6 +10,9 @@
 /// 内蔵チャンネルストリップ (コンプ + EQ) の RT 実行。mixer strip の一部なので
 /// `mixer` の下に置く (`docs/plan_channel_strip.md`)。
 pub mod channel_strip;
+/// マスターストリップ (バスコンプ + トーン EQ + リミッター) の RT 実行
+/// (`docs/plan_master_strip.md`)。
+pub mod master_strip;
 
 use crate::graph::DelayLine;
 use crate::sequencer::{PerTrackState, TimedNoteEvent};

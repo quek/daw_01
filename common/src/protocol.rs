@@ -332,6 +332,9 @@ pub enum AudioCommand {
     /// bulk には当たらず (不変条件 2)、「どのフィールドを送ったか」を送信側と
     /// 受信側の 2 か所で数え合わせる必要も無くなる。
     SetTrackStrip { track: u32, strip: crate::model::ChannelStrip },
+    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) を丸ごと差し替える
+    /// (`docs/plan_master_strip.md`)。`SetTrackStrip` と同じく値のみの更新。
+    SetMasterStrip { strip: crate::model::MasterStrip },
     /// Realtime aux-send level update。 `track` = source の `Track::id`、
     /// `send_id` = その track の `sends` 内 stable `Send::id` (v29)。
     /// 値のみの更新 — graph は再 compile されない。

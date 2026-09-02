@@ -39,6 +39,10 @@ pub enum AutomationTarget {
         #[serde(default, rename = "device_index", skip_serializing)]
         legacy_device_index: Option<u32>,
     },
+    /// マスターストリップ (バスコンプ / トーン EQ / リミッター) のパラメータ
+    /// (`docs/plan_master_strip.md` §5)。master には `Track` が無いので、
+    /// insert プラグインの param と同じ **song-level レーン** (`MASTER_TRACK_ID`) に載る。
+    MasterStrip(super::MasterStripParam),
     /// Song-wide parameters. Lanes targeting these only make sense on
     /// a designated "master" track. M5 scope.
     SongTempo,

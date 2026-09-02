@@ -22,6 +22,7 @@ pub mod list_view;
 pub mod loudness_graph;
 pub mod loudness_meter;
 pub mod menu;
+pub mod needle_meter;
 pub mod modal;
 pub mod modulator_editor;
 pub mod oscilloscope;

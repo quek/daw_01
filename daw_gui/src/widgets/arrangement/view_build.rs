@@ -759,6 +759,17 @@ fn lane_target_display(
                 },
             }
         }
+        // マスターストリップ (docs/plan_master_strip.md)。通常 ch のストリップと
+        // 同系色にしつつ、ラベルで master と分かる (SSoT は automation_label)。
+        AutomationTarget::MasterStrip(param) => LaneDisplay {
+            label: intern_label(&crate::automation_label::automation_target_display_name(target)),
+            icon_glyph: 'M',
+            color: match param {
+                common::model::MasterStripParam::EqOn
+                | common::model::MasterStripParam::EqGain(_) => Color::rgb(0.40, 0.85, 0.80),
+                _ => Color::rgb(0.95, 0.65, 0.35),
+            },
+        },
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
             label: match plugin_param_name {
                 Some(name) => intern_label(name),

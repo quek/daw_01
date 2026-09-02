@@ -55,6 +55,7 @@ pub use widgets::goniometer::{CorrelationStyle, GoniometerStyle};
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic, MeterScale};
 pub use widgets::loudness_graph::LoudnessGraphStyle;
 pub use widgets::loudness_meter::LoudnessMeterStyle;
+pub use widgets::needle_meter::{NeedleMeterStyle, NeedleScale};
 pub use widgets::oscilloscope::{OscilloscopeStyle, ScopeColumn};
 pub use widgets::spectrum::SpectrumStyle;
 pub use widgets::split_view::Orientation;

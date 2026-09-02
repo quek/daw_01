@@ -1079,6 +1079,10 @@ pub fn render_master_buffer(
     // なので、両方がここへ同じ形で渡す。空なら全部アレンジ = 従来の挙動。
     rows: &RowSourceTable,
     master_gain: f32,
+    // マスターストリップ (バスコンプ + トーン EQ + リミッター) の状態
+    // (`docs/plan_master_strip.md`)。live は engine、書き出しは `export` が
+    // 1 個ずつ所有する (書き出しは毎回新品 = 決定論的)。
+    master_strip: &mut crate::mixer::master_strip::MasterStripState,
 ) {
     let n = (frames as usize).min(master_l.len()).min(master_r.len());
     let frames = n as u32;
@@ -1177,6 +1181,30 @@ pub fn render_master_buffer(
         rows,
     );
 
+    // ---- マスターストリップ 前段 (バスコンプ → トーン EQ) ----
+    // docs/plan_master_strip.md §1: master は通常トラックと逆で **内蔵が先・
+    // insert が後**。マキシマイザー等を insert に挿したとき、それが (リミッターを
+    // 除いて) 最後に来るようにするため (Reason のマスターセクションと同じ既定)。
+    //
+    // オートメーション / 変調は buffer 頭で 1 度だけ解決し、前段とリミッターで
+    // **同じ値**を使う (buffer の途中で設定が食い違わない)。
+    let master_settings = crate::automation::resolve_master_strip(
+        song,
+        rows.master_rows(),
+        playhead_beats,
+        recording_lanes,
+        mod_plane,
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let sr_f32 = sample_rate as f32;
+    master_strip.process_pre(
+        &master_settings,
+        &mut master_l[..n],
+        &mut master_r[..n],
+        n,
+        sr_f32,
+    );
+
     // ---- master fx chain ----
     // 全 track mix 後に直列 process。 live/export 両経路で通るので、 master に
     // 挿した limiter / EQ が WAV にも乗る (旧 export は素通りだった)。
@@ -1207,6 +1235,18 @@ pub fn render_master_buffer(
             master_r[i] *= master_gain;
         }
     }
+
+    // ---- マスターリミッター (最終段) ----
+    // **フェーダーの後**が唯一正しい位置 — 前に置くとフェーダーを上げた瞬間に
+    // 「出力を超えさせない」保証が破れる。OFF でもルックアヘッドぶんの遅延は
+    // 通す (切り替えで出力が飛ばないように、同 §2)。
+    master_strip.process_limiter(
+        &master_settings,
+        &mut master_l[..n],
+        &mut master_r[..n],
+        n,
+        sr_f32,
+    );
 }
 
 /// テスト用 `PluginRefs` helper (shmem を立てずに heap の `ProcessData` を
@@ -1745,6 +1785,7 @@ mod render_master_tests {
             FollowerDrive::default(),
             &RowSourceTable::default(),
             0.5,
+            &mut crate::mixer::master_strip::MasterStripState::new(),
         );
         assert!(master_l.iter().all(|&v| v == 0.0), "master must be cleared+silent");
         assert!(master_r.iter().all(|&v| v == 0.0));

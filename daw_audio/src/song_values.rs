@@ -38,6 +38,10 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         AudioCommand::SetTrackStrip { track, strip } => {
             with_track(song, track, |t| t.strip = sanitize_strip(strip));
         }
+        // マスターストリップ (docs/plan_master_strip.md)。同じく IPC 境界で丸める。
+        AudioCommand::SetMasterStrip { strip } => {
+            song.master_strip = sanitize_master_strip(strip);
+        }
         AudioCommand::SetTrackArmed { track, armed } => {
             with_track(song, track, |t| t.armed = armed);
         }
@@ -55,6 +59,26 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         _ => return false,
     }
     true
+}
+
+/// マスターストリップの IPC 境界クランプ ([`sanitize_strip`] の master 版)。
+///
+/// 段階式パラメータ (Ratio / Attack / Release) は enum なので壊れようがなく、
+/// 連続値だけを可動範囲へ丸める。**シーリングが壊れると出力が丸ごと消える**ので、
+/// ここが最後の砦。
+fn sanitize_master_strip(mut strip: common::model::MasterStrip) -> common::model::MasterStrip {
+    use common::model::{MasterEqBand, MasterStripParam as P};
+    let mut fix = |p: P| {
+        let v = strip.param(p);
+        strip.set_param(p, if v.is_finite() { v } else { 0.0 });
+    };
+    fix(P::CompThreshold);
+    fix(P::CompMakeup);
+    fix(P::LimiterCeiling);
+    for band in MasterEqBand::ALL {
+        fix(P::EqGain(band));
+    }
+    strip
 }
 
 /// IPC 境界のクランプ: 各パラメータを可動範囲へ丸める。

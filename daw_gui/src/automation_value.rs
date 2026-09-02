@@ -241,6 +241,24 @@ pub fn automation_value_display(
                 from_display: id,
             }
         }
+        // マスターストリップ (docs/plan_master_strip.md)。段階式は段の index が
+        // plain なので整数表示、連続は dB。レンジの SSoT は `MasterStripParam::range`。
+        T::MasterStrip(param) => {
+            use common::model::MasterStripParam as M;
+            let (unit, format) = match param {
+                M::CompThreshold | M::CompMakeup | M::EqGain(_) | M::LimiterCeiling => {
+                    ("dB", ScrubableNumberFormat::Decimal(1))
+                }
+                _ => ("", ScrubableNumberFormat::Integer),
+            };
+            AutomationValueDisplay {
+                unit,
+                format,
+                range: param.range().display_range(),
+                to_display: id,
+                from_display: id,
+            }
+        }
         // PluginParam は plain = native。実 min/max があればそれを表示レンジに。
         T::PluginParam { .. } => AutomationValueDisplay {
             unit: "",

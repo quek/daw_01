@@ -188,6 +188,7 @@ impl AppData {
                 panic_release_pending: false,
                 master_meter: crate::master_meter::MasterMeterSnapshot::default(),
                 track_peak_display: initial_peak_display,
+                master_strip_gr: (0.0, 0.0),
                 mod_plane: common::mod_plane::ModPlane::default(),
                 pending_play: false,
                 pending_play_record: None,
@@ -375,6 +376,7 @@ impl AppData {
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
                 mixer_hovered_strip_section: None,
+                master_hovered_section: None,
                 master_gain_dragging: false,
                 voicevox_chunk_editing: false,
                 pianoroll_hover_beat: None,
@@ -1605,11 +1607,14 @@ impl AppData {
             AppEvent::StripEdit { track, edit } => {
                 self.apply_strip_edit(track, &edit);
             }
+            AppEvent::MasterStripEdit { param, value } => {
+                self.apply_master_strip_edit(param, value);
+            }
             AppEvent::ToggleStripSection(section) => {
                 self.toggle_strip_section(section);
             }
-            AppEvent::TrackPeaksTick(peaks) => {
-                self.on_track_peaks_tick(&peaks);
+            AppEvent::TrackPeaksTick { tracks, master_gr } => {
+                self.on_track_peaks_tick(&tracks, master_gr);
             }
             AppEvent::LauncherRowsTick(rows) => {
                 self.on_launcher_rows_tick(rows);

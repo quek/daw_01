@@ -1296,6 +1296,7 @@ async fn recv_loop(
                 | AudioCommand::SetTrackMuted { .. }
                 | AudioCommand::SetTrackSolo { .. }
                 | AudioCommand::SetTrackStrip { .. }
+                | AudioCommand::SetMasterStrip { .. }
                 | AudioCommand::SetTrackArmed { .. }
                 | AudioCommand::SetSendGain { .. }
                 | AudioCommand::SetSendEnabled { .. }

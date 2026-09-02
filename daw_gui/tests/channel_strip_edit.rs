@@ -125,6 +125,21 @@ fn 中身を触ったセクションは自動で_on_になる() {
         edit: StripEdit::Param { param: TrackBuiltinParam::StripEqOn, value: 0.0 },
     });
     assert!(!strip(&app, track_id).eq.on, "OFF にしたのに戻っている");
+
+    // HP / LP は既定 OFF のバンド。周波数ノブを回したらそのバンドも ON になる
+    // (セクションだけ ON でフィルタが掛からない、を作らない)。LP は巻き込まない。
+    assert!(!strip(&app, track_id).eq.hp.on);
+    app.handle_event(AppEvent::StripEdit {
+        track: track_id,
+        edit: StripEdit::Param {
+            param: TrackBuiltinParam::StripEq { band: EqBand::Hp, param: EqParam::Freq },
+            value: 120.0,
+        },
+    });
+    let s = strip(&app, track_id);
+    assert!(s.eq.hp.on, "HP のノブを回したのにバンドが OFF のまま");
+    assert!(s.eq.on, "セクションも ON になる");
+    assert!(!s.eq.lp.on, "触っていない LP まで ON になっている");
 }
 
 #[test]

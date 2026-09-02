@@ -22,6 +22,8 @@ const WIRE_SOURCES: &[&str] = &[
     "src/model/track.rs",
     // 内蔵チャンネルストリップ (Track.strip として LoadSong / SetTrackStrip の wire を渡る)。
     "src/model/track/channel_strip.rs",
+    // マスターストリップ (Song.master_strip として LoadSong / SetMasterStrip の wire を渡る)。
+    "src/model/master_strip.rs",
     "src/model/modulation.rs",
     "src/model/content.rs",
     "src/model/automation.rs",

@@ -117,7 +117,7 @@ FILE-BUDGET | daw_gui/src/app_types.rs                 | 1332 | #71 で device_a
 #    CLAP / VST3 の C ABI 実装と、shmem + ring buffer の往復が 1 ファイルに集まっている。
 #    unsafe の塊なので分割の順序を誤ると危険で、切り方の設計から要る。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
-FILE-BUDGET | common/src/model.rs                     | 1805 | #71 で v34 migration (legacy (track, device_index) → device_id) +10。他の版migrationと同居させる規約。未起票
+FILE-BUDGET | common/src/model.rs                     | 1810 | #71 で v34 migration (legacy (track, device_index) → device_id) +10。他の版migrationと同居させる規約。マスターストリップ (docs/plan_master_strip.md) で `Song.master_strip` のフィールド 2 行 + Default 初期化 1 行 + module 宣言 2 行 = +5 (型本体は model/master_strip.rs へ分離、Song 側は住所だけ)。未起票
 FILE-BUDGET | daw_plugin_host/src/main.rs             | 1760 | FFI/IPC 実装。未起票
 FILE-BUDGET | daw_plugin_host/src/clap_plugin.rs      | 1638 | FFI/IPC 実装。未起票
 FILE-BUDGET | daw_audio/src/main.rs                   | 1569 | FFI/IPC 実装。未起票
@@ -162,7 +162,7 @@ FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                        
 # コントロール (グローバルローンチ量子化 / アレンジに戻す) を足す前に、
 # 左詰め列を 4 つの `draw_*(app, ui, [area,] x, cy, bh) -> f32` へ割って running x を
 # バケツリレーする形にしてある (= 「超過したら分割してから足す」 不変条件 9 のとおり)。
-FN-BUDGET | daw_gui/src/app.rs::AppData::new                                          |  343 | #71 で新 state 2 本の初期化 +2 (フィールド初期化は構造体定義と同居させるほかない)。未起票
+FN-BUDGET | daw_gui/src/app.rs::AppData::new                                          |  345 | #71 で新 state 2 本の初期化 +2 (フィールド初期化は構造体定義と同居させるほかない)。マスターストリップで `master_strip_gr` / `master_hovered_section` の初期化 +2 (同じ理由)。未起票
 
 # C. プロセス境界の実装 (IPC 受信ループ / オーディオグラフ構築)。
 #    いつ消えるか: **未起票**。

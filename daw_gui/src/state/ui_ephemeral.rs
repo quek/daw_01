@@ -111,6 +111,10 @@ pub struct UiEphemeral {
     /// ではなく **そのセクションのバイパス**を切り替える。
     /// 算出は `view::strip_sections` の 1 か所 (SSoT)、strip 外は `None`。
     pub mixer_hovered_strip_section: Option<(u32, crate::event::StripSection)>,
+    /// マスターストリップで、いまカーソルが乗っているブロック
+    /// (`docs/plan_master_strip.md` §3)。`Q` がこれを見てそのセクションの
+    /// バイパスを切り替える。算出は `view::master_strip_ui` の 1 か所。
+    pub master_hovered_section: Option<crate::event::MasterSection>,
     /// マスターフェーダーを掴んでいるか (undo gesture の edge 検出用)。
     /// `Song.master_gain` を編集するようになったので、drag 全体を 1 undo step に
     /// bracket しないと per-frame の編集が履歴を埋める (group transform /

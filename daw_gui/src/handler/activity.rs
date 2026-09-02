@@ -130,6 +130,13 @@ impl AppData {
                 METER_STEPS,
             ));
         }
+        // マスターストリップの GR (コンプ / リミッター)。同じ理由で digest に混ぜる。
+        for gr in [self.transport.master_strip_gr.0, self.transport.master_strip_gr.1] {
+            mix(quantize(
+                (gr / common::model::MASTER_GR_METER_RANGE_DB).clamp(0.0, 1.0),
+                METER_STEPS,
+            ));
+        }
         // 変調スカラーは画像 / グループ / 映像効果の見た目を直接動かすので細かく見る。
         for v in self.transport.mod_plane.values() {
             mix(quantize(*v, 4096.0));

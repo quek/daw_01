@@ -127,6 +127,13 @@ pub struct AudioBridge {
     /// GR メーターが読む (`docs/plan_channel_strip.md` §9)。
     /// ストリップを持たない / バイパス中の track は常に `0.0`。
     pub track_gr_db: [AtomicU32; MAX_TRACKS],
+    /// マスターストリップのゲインリダクション `[0] = バスコンプ / [1] = リミッター`
+    /// (dB、0 以下、`f32::to_bits`)。`docs/plan_master_strip.md` §6。
+    ///
+    /// master の他のメーターは daw_gui 側の `MasterAnalyzer` が波形から導くが、
+    /// **GR は波形からは導けない** (どれだけ下げたかは処理した側しか知らない) ので、
+    /// per-track の GR と同じスカラー面に載せる。
+    pub master_gr_db: [AtomicU32; 2],
     /// docs/plan_modulation.md §4.2: per-`ModSource` modulator scalar
     /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer,
     /// polled by the GUI at ~30Hz alongside `track_peaks` and applied to
@@ -244,6 +251,24 @@ impl AudioBridgeHandle {
         slot[1].store(r.to_bits(), Ordering::Release);
     }
 
+    /// マスターストリップの GR を publish する (`[0] = コンプ / [1] = リミッター`、
+    /// dB、0 以下)。audio thread が毎 buffer 呼ぶ。
+    pub fn set_master_gr_db(&self, comp_db: f32, limiter_db: f32) {
+        let slot = &self.bridge().master_gr_db;
+        slot[0].store(comp_db.to_bits(), Ordering::Release);
+        slot[1].store(limiter_db.to_bits(), Ordering::Release);
+    }
+
+    /// マスターストリップの GR `(コンプ, リミッター)` を読む (GUI の UI tick)。
+    #[must_use]
+    pub fn master_gr_db(&self) -> (f32, f32) {
+        let slot = &self.bridge().master_gr_db;
+        (
+            f32::from_bits(slot[0].load(Ordering::Acquire)),
+            f32::from_bits(slot[1].load(Ordering::Acquire)),
+        )
+    }
+
     /// 全 track のメーター面 (peak + GR) を 0 に落とす。
     ///
     /// park (= 再生も録音もしていないので publish を止める) の直前に呼ぶ。
@@ -254,6 +279,7 @@ impl AudioBridgeHandle {
             self.set_track_peak(i, 0.0, 0.0);
             self.set_track_gr_db(i, 0.0);
         }
+        self.set_master_gr_db(0.0, 0.0);
     }
 
     /// Publishes one track's gain reduction (dB, 0 以下)。範囲外の index は捨てる。

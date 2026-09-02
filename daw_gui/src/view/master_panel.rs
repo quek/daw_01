@@ -25,6 +25,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
+use crate::view::master_strip_ui;
 use crate::handler::master_panel::{
     MASTER_PANEL_MAX_W, MASTER_PANEL_MIN_W, MASTER_SECTION_MIN_H, section_heights, section_ratios,
 };
@@ -390,7 +391,21 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
             &style,
         );
     }
-    draw_loudness_readout(app, ui, Rect { x: read_x, y: body.y, w: read_w, h: body.h });
+    // ---- マスターストリップ + ラウドネス数値 (数値欄の列を上下に割る) ----
+    // docs/plan_master_strip.md §3: LU バーとフェーダーは全高のまま、**数値欄の列
+    // だけ**を割ってその上にストリップを積む。ストリップは必要高を取り、残りが
+    // 数値欄。列が低いときはストリップ側が下のブロックから諦める。
+    let read_rect = Rect { x: read_x, y: body.y, w: read_w, h: body.h };
+    let readout_min = READ_LINE_H * 5.0 + RESET_BTN_H + 4.0;
+    let strip_h = master_strip_ui::desired_height().min((body.h - readout_min).max(0.0));
+    if strip_h > 0.0 {
+        master_strip_ui::draw(app, ui, Rect { h: strip_h, ..read_rect });
+    }
+    draw_loudness_readout(
+        app,
+        ui,
+        Rect { y: read_rect.y + strip_h, h: (read_rect.h - strip_h).max(0.0), ..read_rect },
+    );
     loudness_context_menu(ui, loudness_rect, settings);
 }
 

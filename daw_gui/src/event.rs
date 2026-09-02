@@ -1040,6 +1040,10 @@ pub enum AppEvent {
     /// ([`StripEdit`]) — ノブ 1 個ごとに variant を並べると、ここの巨大 match が
     /// さらに 20 行伸びる。Undo 対象 (= 曲の中身が変わる)。
     StripEdit { track: u32, edit: StripEdit },
+    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) の 1 パラメータ変更
+    /// (`docs/plan_master_strip.md`)。段階式は `MasterStrip::set_param` が段へ丸める。
+    /// Undo 対象 (= 曲の中身が変わる)。
+    MasterStripEdit { param: common::model::MasterStripParam, value: f32 },
     /// EQ / Comp セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
     /// 見方の都合なので `UiPrefs` (session-only) に持ち、dirty を立てず Undo にも
     /// 積まない (`collapsed_groups` と同じ扱い)。
@@ -1049,9 +1053,16 @@ pub enum AppEvent {
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
-    /// per-track のメーター値 `(peak L, peak R, ゲインリダクション dB)`。
-    /// GR は内蔵チャンネルストリップのコンプが出す (0 以下、掛かっていなければ 0)。
-    TrackPeaksTick(Vec<(f32, f32, f32)>),
+    /// メーター面の 1 tick。`tracks` は per-track の
+    /// `(peak L, peak R, ゲインリダクション dB)`、`master_gr` は
+    /// マスターストリップの `(バスコンプ, リミッター)` の GR (dB、0 以下)。
+    ///
+    /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ
+    /// 組だから — 別イベントに割ると「同じ buffer の値かどうか」の保証が消える。
+    TrackPeaksTick {
+        tracks: Vec<(f32, f32, f32)>,
+        master_gr: (f32, f32),
+    },
     /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
     /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`
     /// を ~30Hz で読んだもの。
@@ -1805,6 +1816,14 @@ impl AppEvent {
             E::SetTrackVolume { .. } => "音量変更",
             E::SetTrackPan { .. } => "パン変更",
             E::StripEdit { edit, .. } => edit.undo_label(),
+            E::MasterStripEdit { param, .. } => {
+                use common::model::MasterStripParam as M;
+                match param {
+                    M::EqOn | M::EqGain(_) => "マスター EQ 変更",
+                    M::LimiterOn | M::LimiterCeiling => "マスターリミッター変更",
+                    _ => "マスターコンプ変更",
+                }
+            }
             E::ToggleTrackMute(..) => "ミュート切替",
             E::ToggleTrackSolo(..) => "ソロ切替",
             E::SetMasterGain(..) => "マスターゲイン変更",
@@ -1981,6 +2000,15 @@ pub enum StripSwitch {
     Bell(common::model::EqBand),
     /// 検出信号そのものをモニタへ出す。**同時に 1 トラックだけ** (solo と同じ)。
     ScListen,
+}
+
+/// マスターストリップのブロック (`docs/plan_master_strip.md`)。
+/// `Q` キーの対象を「カーソルが乗っているブロック」で決めるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterSection {
+    Comp,
+    Eq,
+    Limiter,
 }
 
 /// mixer strip で開閉するセクション (全 ch 一括)。

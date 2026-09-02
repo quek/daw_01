@@ -38,14 +38,19 @@ use crate::view::param_gesture::push_param_gesture_edges;
 
 /// 常設サムネイル帯の高さ (px)。折り畳んでいてもここだけは必ず出る。
 pub const THUMB_H: f32 = 28.0;
-/// ノブ行の高さ = ラベル行 + ノブ + 隙間。
-const ROW_H: f32 = 32.0;
 /// ノブ 1 個の直径 (px)。3 個並べて strip 内側 68px に収まる最大。
 const KNOB: f32 = 20.0;
 /// ノブ同士の間隔。
 const KNOB_GAP: f32 = 4.0;
-/// 各行のラベル / hover 読み出し行の高さ。
-const LABEL_H: f32 = 10.0;
+/// 各行のラベル / hover 読み出し行の高さ (= [`LABEL_FONT`] の行高)。
+const LABEL_H: f32 = 12.0;
+/// ラベル / hover 読み出しの font size。80px strip でも値 (`Freq 2500Hz`) が
+/// 読める下限。8px では読めないという指摘で 10px に上げた。
+const LABEL_FONT: f32 = 10.0;
+/// ノブ行の高さ = ラベル行 + ノブ + 隙間。
+const ROW_H: f32 = LABEL_H + KNOB + 2.0;
+/// 行内の小ボタン (モード切替 / スイッチ) の font size。
+const SWITCH_FONT: f32 = 9.0;
 /// コンプのモード切替行の高さ。
 const MODE_ROW_H: f32 = 18.0;
 /// コンプの GR メーター行の高さ。
@@ -328,7 +333,7 @@ fn draw_comp_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
         let style = ToggleButtonStyle {
             on_color: p.control_active,
             radius: 2.0,
-            font_size: 8.0,
+            font_size: SWITCH_FONT,
             ..ToggleButtonStyle::from_palette(p)
         };
         ui.toggle_button_at(
@@ -397,7 +402,7 @@ fn draw_sc_listen(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, row: Rect) {
         on_color: p.accent,
         on_text_color: Some(p.ink_for(p.accent)),
         radius: 2.0,
-        font_size: 8.0,
+        font_size: SWITCH_FONT,
         ..ToggleButtonStyle::from_palette(p)
     };
     let on = ctx.strip.comp.sc_listen;
@@ -452,7 +457,7 @@ fn draw_gr_readout(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
         &text,
         rect.x + rect.w - VALUE_W,
         rect.y,
-        9.0,
+        LABEL_FONT,
         p.text_dim,
     );
 }
@@ -627,7 +632,7 @@ fn row_label(
         Some(t) => (t.as_str(), p.text),
         None => (default_text, p.text_dim),
     };
-    ui.label_at_clipped(id, text, Rect { h: LABEL_H, ..row }, 8.0, color);
+    ui.label_at_clipped(id, text, Rect { h: LABEL_H, ..row }, LABEL_FONT, color);
 }
 
 /// ストリップのノブ 1 個。

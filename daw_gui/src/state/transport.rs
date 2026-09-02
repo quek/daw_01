@@ -66,6 +66,10 @@ pub struct TransportState {
     /// GR は **正の減衰量** (0 = 掛かっていない) で持ち、peak と同じ release
     /// 弾道で 0 へ戻る。書き手は `on_track_peaks_tick` の 1 か所。
     pub track_peak_display: Vec<(f32, f32, f32)>,
+    /// マスターストリップのゲインリダクション表示値 `(バスコンプ, リミッター)`。
+    /// per-track と同じく **正の減衰量 dB** で持ち、同じ release 弾道で 0 へ戻る
+    /// (`docs/plan_master_strip.md` §6)。
+    pub master_strip_gr: (f32, f32),
     /// docs/plan_modulation.md §4.2 / r.md #89: audio engine が publish した
     /// 変調値面 (**`ModSource::id` キー** — SSoT は `common/src/mod_plane.rs`)。
     /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が

@@ -527,7 +527,12 @@ fn spawn_playhead_poller(
             // capacity ごと move out するので次 tick で確保し直す = per-tick の
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             if proxy
-                .send_event(AppEvent::TrackPeaksTick(std::mem::take(&mut peaks_buf)))
+                .send_event(AppEvent::TrackPeaksTick {
+                    tracks: std::mem::take(&mut peaks_buf),
+                    // マスターストリップの GR も同じ tick で読む (per-track の
+                    // メーターと同じ buffer の値であることを保つ)。
+                    master_gr: bridge.master_gr_db(),
+                })
                 .is_err()
             {
                 break;

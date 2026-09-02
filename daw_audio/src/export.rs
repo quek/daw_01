@@ -486,6 +486,9 @@ fn render_loop(
     let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
     let mut master_l: Vec<f32> = vec![0.0; max_frames];
     let mut master_r: Vec<f32> = vec![0.0; max_frames];
+    // マスターストリップの状態は **書き出しごとに新品** (`docs/plan_master_strip.md` §6)。
+    // live の状態を引き継ぐと、直前に再生していたかどうかで書き出しの頭が変わる。
+    let mut master_strip = crate::mixer::master_strip::MasterStripState::new();
     let scratch = &mut scratch[..];
     let master_l = &mut master_l[..];
     let master_r = &mut master_r[..];
@@ -769,6 +772,7 @@ fn render_loop(
             mod_tick.follower_drive(&follower_cols, playhead),
             launcher.rows(),
             master_gain,
+            &mut master_strip,
         );
 
         // docs/plan_modulation.md §7: record this buffer's modulator values

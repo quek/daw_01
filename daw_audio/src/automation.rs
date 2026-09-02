@@ -13,7 +13,9 @@
 
 use common::automation::apply_modulation_with;
 use common::mod_plane::ModTickPlaneRef;
-use common::model::{AutomationTarget, ChannelStrip, Song, Track, TrackBuiltinParam};
+use common::model::{
+    AutomationTarget, ChannelStrip, MasterStrip, Song, Track, TrackBuiltinParam,
+};
 use common::process_data::ProcessData;
 
 use crate::launcher::TrackRows;
@@ -212,6 +214,65 @@ pub fn resolve_track_strip(
         );
         #[allow(clippy::cast_possible_truncation)]
         strip.set_target_value(param, v as f32);
+    }
+    strip
+}
+
+/// この buffer で実際に効く **マスターストリップ設定**を解決する
+/// (`docs/plan_master_strip.md` §5)。
+///
+/// master には `Track` が無いので、レーンは `song.song_lanes`、変調は
+/// `song.song_mod_routings` から引く (master fx の param automation と同じ store)。
+/// 構造は [`resolve_track_strip`] と同じ block-rate 解決で、段階式パラメータの
+/// 丸めは `MasterStrip::set_param` が担う。
+///
+/// RT 安全: 確保・ロックなし。`MasterStrip` は `Copy` の値型。
+pub fn resolve_master_strip(
+    song: &Song,
+    rows: TrackRows<'_>,
+    playhead_beats: f64,
+    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    mod_plane: ModTickPlaneRef<'_>,
+) -> MasterStrip {
+    let mut strip = song.master_strip;
+    if song.song_lanes.is_empty() && song.song_mod_routings.is_empty() {
+        return strip;
+    }
+    let master = common::model::MASTER_TRACK_ID;
+
+    for (li, lane) in song.song_lanes.iter().enumerate() {
+        let AutomationTarget::MasterStrip(param) = &lane.target else {
+            continue;
+        };
+        if !lane.enabled {
+            continue;
+        }
+        if recording_lanes.iter().any(|(t, tg)| *t == master && *tg == lane.target) {
+            continue;
+        }
+        let phase = phase_at_frame(rows.lane(li), 0);
+        let v = lane_value(lane, &song.clip_contents, phase, playhead_beats);
+        #[allow(clippy::cast_possible_truncation)]
+        strip.set_param(*param, v as f32);
+    }
+
+    for (i, routing) in song.song_mod_routings.iter().enumerate() {
+        let AutomationTarget::MasterStrip(param) = &routing.target else {
+            continue;
+        };
+        if song.song_mod_routings[..i].iter().any(|q| q.target == routing.target) {
+            continue;
+        }
+        let base = strip.param(*param);
+        let v = apply_modulation_with(
+            &routing.target,
+            f64::from(base),
+            &song.song_mod_routings,
+            |id| mod_plane.scalar_at_frame(id, 0),
+            |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        strip.set_param(*param, v as f32);
     }
     strip
 }

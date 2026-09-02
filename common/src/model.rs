@@ -14,6 +14,7 @@ use crate::scale::ScaleChange;
 // 登録している (invariant #7: fingerprint handshake の検出網に穴を開けない)。
 mod automation;
 mod clip_window;
+mod master_strip;
 mod content;
 mod content_split;
 mod ids;
@@ -24,6 +25,7 @@ mod time_selection;
 mod track;
 pub use automation::*;
 pub use clip_window::*;
+pub use master_strip::*;
 pub use content::*;
 pub use ids::*;
 pub use midi_bind::*;
@@ -694,6 +696,13 @@ pub struct Song {
     /// forward-migrate する (= 旧ファイルの聞こえ方は変わらない)。
     #[serde(default = "default_master_gain")]
     pub master_gain: f32,
+    /// マスターバス専用のストリップ (バスコンプ + トーン EQ + リミッター)。
+    /// 設計正本は `docs/plan_master_strip.md`。信号順は
+    /// `合算 → Comp → EQ → master_fx_chain → master_gain → リミッター`
+    /// (通常トラックと違い **内蔵が先・insert が後**。理由は同文書 §7)。
+    /// 旧 file は `#[serde(default)]` で全バイパスに forward-migrate する。
+    #[serde(default)]
+    pub master_strip: MasterStrip,
     /// v24: プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
     /// クリップボード round-trip で「同一プロジェクト由来か」を判定し、clip/track paste の
     /// リンク共有 (同一) / 独立コピー (別) を分岐する。`0` は未採番 sentinel —
@@ -803,6 +812,7 @@ impl Default for Song {
             video_framerate: default_video_framerate(),
             master_fx_chain: Vec::new(),
             master_gain: default_master_gain(),
+            master_strip: MasterStrip::default(),
             project_id: 0,
             sections: Vec::new(),
             mod_sources: Vec::new(),

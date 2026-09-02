@@ -665,7 +665,24 @@ fn toggle_hovered_strip_section(
     ui: &mut Ui<'_, AppData>,
     mixer_active: bool,
 ) -> bool {
-    use crate::event::{StripEdit, StripSection};
+    use crate::event::{MasterSection, StripEdit, StripSection};
+    // マスターパネルは常時描かれるので hover が古くなることはない。ミキサーより
+    // 先に見る (パネルは mixer / arrangement のどちらの上にも無く、排他)。
+    if let Some(section) = app.ui_ephemeral.master_hovered_section {
+        let param = match section {
+            MasterSection::Comp => common::model::MasterStripParam::CompOn,
+            MasterSection::Eq => common::model::MasterStripParam::EqOn,
+            MasterSection::Limiter => common::model::MasterStripParam::LimiterOn,
+        };
+        let on = app.song_doc.song().master_strip.param(param) >= 0.5;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::MasterStripEdit {
+                param,
+                value: f32::from(u8::from(!on)),
+            });
+        }));
+        return true;
+    }
     // hover 値は strip を描いた frame にしか更新されないので、Mixer タブから
     // 離れた後も最後の値が残る。**タブと pointer 位置で毎回ゲートする**
     // (`mixer_hovered_track` を使う S キーと同じ作法) — 無いと Piano Roll に

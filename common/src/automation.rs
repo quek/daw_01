@@ -85,6 +85,9 @@ pub fn plain_to_norm_ranged(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
             param.range().to_norm(plain)
         }
+        // マスターストリップ: レンジの SSoT は `MasterStripParam::range`
+        // (段階式は段 index のドメイン)。
+        AutomationTarget::MasterStrip(param) => param.range().to_norm(plain),
         AutomationTarget::PluginParam { .. } => plain,
         // Song-level: 旧 placeholder (常に 0) は tempo automation / 変調の値域を
         // 失わせていた。control の表示レンジ (transport.rs SCRUB_STYLE_BPM /
@@ -219,6 +222,9 @@ pub fn norm_mapping_is_affine(target: &AutomationTarget) -> bool {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
             param.range().is_affine()
         }
+        // マスターストリップ: 段階式 (Ratio / Attack / Release / 各 On) は段なので
+        // 直線ではない。連続パラメータは線形レンジなので affine。
+        AutomationTarget::MasterStrip(param) => !param.is_stepped(),
         _ => true,
     }
 }
@@ -238,6 +244,9 @@ pub fn norm_mapping_is_invertible(target: &AutomationTarget) -> bool {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
             param.range().is_invertible()
         }
+        // 段階式は同じ段の中で値が動かないので狭義単調でない (曲線を掴んで
+        // 値を逆算する直接操作が成立しない)。
+        AutomationTarget::MasterStrip(param) => !param.is_stepped(),
         _ => true,
     }
 }
@@ -290,6 +299,9 @@ pub fn norm_to_plain_ranged(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
             param.range().from_norm(n)
         }
+        // `plain_to_norm_ranged` の厳密逆。段階式の丸めは値を書く側
+        // (`MasterStrip::set_param`) が行うので、ここは連続のまま返す。
+        AutomationTarget::MasterStrip(param) => param.range().from_norm(n),
         AutomationTarget::PluginParam { .. } => n,
         // plain_to_norm の厳密逆 (control 表示レンジ)。
         AutomationTarget::SongTempo => 1.0 + n * 399.0,

@@ -755,6 +755,10 @@ pub struct LocalState {
     pub scratch: Vec<TrackScratch>,
     pub master_l: Vec<f32>,
     pub master_r: Vec<f32>,
+    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) の状態
+    /// (`docs/plan_master_strip.md`)。live 用の 1 個 — 書き出しは `export` が
+    /// 別に新品を持つので、書き出しの結果が直前の再生状態に影響されない。
+    pub master_strip: crate::mixer::master_strip::MasterStripState,
     /// Whether the transport was rolling on the previous buffer. Used to
     /// detect Play/Stop transitions and reset the playhead / queue
     /// note-offs cleanly.
@@ -855,6 +859,7 @@ impl LocalState {
             scratch,
             master_l: vec![0.0; max_frames],
             master_r: vec![0.0; max_frames],
+            master_strip: crate::mixer::master_strip::MasterStripState::new(),
             playing: false,
             playhead_beats: 0.0,
             last_known_playhead: u64::MAX,
@@ -1459,6 +1464,7 @@ impl LocalState {
                 self.mod_tick.follower_drive(&self.follower_cols, playhead),
                 self.launcher.rows(),
                 master_gain,
+                &mut self.master_strip,
             );
 
             // 走行状態の GUI への publish は **transport を進めた後** (この関数の末尾)。
@@ -1509,6 +1515,10 @@ impl LocalState {
                 // peak と同じ走査で出す = 同じ buffer の値だと保証される。
                 bridge.set_track_gr_db(i, tr.strip_gr_db);
             }
+            // マスターストリップの GR (docs/plan_master_strip.md §6)。波形からは
+            // 導けない値なので、per-track の GR と同じスカラー面で publish する。
+            let (comp_gr, limiter_gr) = self.master_strip.gain_reduction_db();
+            bridge.set_master_gr_db(comp_gr, limiter_gr);
 
             // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。
             // 刻みが解いた buffer 頭の値をそのまま出す (GUI は 30Hz なので
