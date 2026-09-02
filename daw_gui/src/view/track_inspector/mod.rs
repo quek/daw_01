@@ -232,6 +232,8 @@ fn carried_device_ids(app: &AppData, chain: &[ChainEntry], device_id: u64) -> Ve
 enum ChainRowButton {
     /// `GUI` / `Par` — プラグイン窓 (またはパラメータ欄) の開閉。
     ToggleGui,
+    /// ⌨ (r.md #36) — 「キーを全部プラグインに送る」の on/off (値は次の状態)。
+    SendAllKeys(bool),
     /// `x` — この device を外す。
     Remove,
 }
@@ -248,6 +250,9 @@ fn chain_row_edit(button: ChainRowButton, device_id: u64, popup_open: bool) -> E
         }
         match button {
             ChainRowButton::ToggleGui => app.handle_event(AppEvent::ToggleSlotGui { device_id }),
+            ChainRowButton::SendAllKeys(enabled) => {
+                app.handle_event(AppEvent::SetPluginSendAllKeys { device_id, enabled });
+            }
             ChainRowButton::Remove => app.handle_event(AppEvent::RemoveDevices {
                 device_ids: vec![device_id],
             }),
@@ -1239,6 +1244,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             + 4.0;
         let btn_gui_w = 44.0;
         let btn_x_w = 30.0;
+        // r.md #36: ⌨ = 「キーを全部プラグインに送る」。 埋め込みエディタ窓を開く device
+        // だけに出す (インライン param パネルの device は別窓にフォーカスが行かない)。
+        // 通常はホストがプラグインの消化しなかったキーだけを拾うが、Dear ImGui / GLFW 系の
+        // エディタは「消化したか」を外に出さないので、そのプラグインだけ ON にして全キーを譲る
+        // (REAPER の FX ごとの同名オプションと同じ)。GUI ボタンの隣 = 窓を開く操作の隣。
+        let btn_keys_w = 26.0;
+        let keys_style = toggle_audio_style(&app.theme);
         ui.label_at("inspector_chain_label", "Chain", area.x + pad, y, 12.0, p.text);
         y += 18.0;
         // 他セクションと同じ左右 pad を取る。 旧実装は area 幅いっぱい (280px) だった
@@ -1263,11 +1275,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             |ui, entry, idx, row_rect, _selected, _dragging| {
                 let device_id = entry.device_id;
                 let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
-                // 名前は右の [Par|GUI] / [x] ボタンの手前で打ち切る。 素の label_at だと
+                let keys_x = gui_x - btn_keys_w - 2.0;
+                let shows_keys = entry.has_embedded_gui && !entry.shows_param_panel();
+                // 名前は右の [⌨] [Par|GUI] / [x] ボタンの手前で打ち切る。 素の label_at だと
                 // 長いプラグイン名 (例: "BBC Symphony Orchestra Professional") が
                 // ボタンの上に重なって読めなくなる。
                 let name_x = row_rect.x + 8.0;
-                let buttons_left = if entry.shows_button() {
+                let buttons_left = if shows_keys {
+                    keys_x
+                } else if entry.shows_button() {
                     gui_x
                 } else {
                     row_rect.x + row_rect.w - btn_x_w
@@ -1295,6 +1311,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     if failed { p.text_error } else { p.text },
                 );
                 // 右クリックメニューが開いている frame の抑止は `chain_row_edit` が担う。
+                if shows_keys {
+                    let next = !entry.send_all_keys;
+                    // U+2328 KEYBOARD。Nerd Font の nf-fa-keyboard_o (U+F11C) は 2 セル幅の
+                    // 箱の左寄りに描かれるので、実測幅で中央寄せしても絵が左に寄る。
+                    // 通常の Unicode 記号なら 1 セル幅で中央に来る (無ければ OS の記号フォントに
+                    // fallback する — 他の ⊘ / ➡ / ⇥ と同じ)。
+                    ui.toggle_button_at(
+                        ("inspector_row_keys", idx),
+                        "\u{2328}",
+                        Rect { x: keys_x, y: row_rect.y + 2.0, w: btn_keys_w, h: row_rect.h - 4.0 },
+                        entry.send_all_keys,
+                        &keys_style,
+                        move |_| chain_row_edit(ChainRowButton::SendAllKeys(next), device_id, popup_open),
+                    );
+                }
                 if entry.shows_button() {
                     let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
                     ui.button_at(
@@ -1412,7 +1443,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     y = chain_sections::draw_failed_load_section(app, ui, area, pad, y);
     y = chain_sections::draw_parallel_out_section(app, ui, area, pad, y);
     y = chain_sections::draw_sidechain_section(app, ui, area, pad, y);
-    y = chain_sections::draw_editor_key_section(app, ui, area, pad, y);
 
     let cursor_idx = app.cursor_track_index();
 

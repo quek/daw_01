@@ -85,6 +85,11 @@ pub(super) const DEFAULT_COL_W: f32 = 96.0;
 pub(super) const MIN_COL_W: f32 = 36.0;
 pub(super) const MAX_COL_W: f32 = 400.0;
 
+/// 横スクロールで到達できる列の上限 (表示 index)。プレースホルダ列は無限に続くが、
+/// engine 側のフォローアクションが見る列数の上限 (`daw_audio` の `MAX_SCENES` = 512) と
+/// 揃えて、そこより先へは掴めないようにする。
+pub(super) const MAX_SCROLL_SCENES: f32 = 512.0;
+
 /// 「両方」レイアウトが成立する最小の面幅 (px)。帯側は
 /// 「停止列 + 列 1 本 + 返す列 + つかみ代」で、アレンジ側にも同じ値を最低幅として要求する。
 ///

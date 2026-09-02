@@ -34,6 +34,9 @@ const ROW_H: f32 = 22.0;
 const ROW_GAP: f32 = 4.0;
 /// 見出しラベルの高さ。
 const LABEL_H: f32 = 18.0;
+/// フォローアクション行の dropdown の本体フォント。3 分割の狭い列に「クリップ終端」
+/// 「次のセル」のような語が入るので、既定の 14px では詰まる。
+const FOLLOW_FONT: f32 = 12.0;
 
 /// ローンチモードの表示順 (enum の並びと一致させる)。
 const MODE_CHOICES: &[(LaunchMode, &str)] = &[
@@ -283,8 +286,8 @@ fn draw_cell_rows(
     draw_follow_rows(app, ui, area, pad, y, &cell_follow, FollowTarget::Cells, cells)
 }
 
-/// フォローアクションの 3 行 (有効 / 発火条件 / 動作 A・B) を積む。
-/// セルと列で同じ形なので `target` だけを変えて 2 回呼ぶ。
+/// フォローアクションの 2 行 (有効・発火条件 / 動作 A・確率・動作 B) と、ジャンプの
+/// ときだけ出る飛び先の行を積む。セルと列で同じ形なので `target` だけを変えて 2 回呼ぶ。
 #[allow(clippy::too_many_arguments)]
 fn draw_follow_rows(
     app: &AppData,
@@ -318,11 +321,12 @@ fn draw_follow_rows(
         follow_edit_cb(target, cells, app, ed),
     );
     let link_idx = usize::from(!follow.linked);
-    if let Some(i) = ui.dropdown(
+    if let Some(i) = ui.dropdown_with_font(
         ("inspector_follow_link", tag),
         Rect { x: x1, y, w: third, h: ROW_H },
         LINK_LABELS,
         link_idx,
+        FOLLOW_FONT,
     ) {
         push_follow_edit(ui, target, cells, app, LaunchEdit::FollowLinked(i == 0));
     }
@@ -362,13 +366,14 @@ fn draw_follow_rows(
     }
     y += ROW_H + ROW_GAP;
 
-    // 行 2 / 行 3: 動作 A (+ 確率) / 動作 B。 それぞれの右端に「ジャンプ」の
-    // 飛び先 dropdown を置く (Jump 以外のときは空欄 = 高さは変わらない)。
-    y = draw_follow_action_row(app, ui, area, pad, y, follow, target, cells, true);
-    draw_follow_action_row(app, ui, area, pad, y, follow, target, cells, false)
+    // 行 2: 動作 A / A の確率 / 動作 B を 1 行に。「ジャンプ」の飛び先は、どちらかが
+    // ジャンプのときだけ行 3 に出す (普段は 2 行で収まる)。
+    y = draw_follow_action_row(app, ui, area, pad, y, follow, target, cells);
+    draw_follow_jump_row(app, ui, area, pad, y, follow, target, cells)
 }
 
-/// 動作 A / B の 1 行 (`[動作 ▾][確率 or 空][飛び先 ▾]`)。
+/// 動作 A / B の 1 行 (`[動作 A ▾][A の確率][動作 B ▾]`)。B の確率は `100 - A` なので
+/// 入力欄は 1 つ。
 #[allow(clippy::too_many_arguments)]
 fn draw_follow_action_row(
     app: &AppData,
@@ -379,64 +384,90 @@ fn draw_follow_action_row(
     follow: &FollowAction,
     target: FollowTarget,
     cells: &[LauncherCellKey],
-    is_a: bool,
 ) -> f32 {
     let row_w = area.w - pad * 2.0;
     let third = (row_w - ROW_GAP * 2.0) / 3.0;
     let x0 = area.x + pad;
     let x1 = x0 + third + ROW_GAP;
     let x2 = x1 + third + ROW_GAP;
-    let tag = match (target, is_a) {
-        (FollowTarget::Cells, true) => "cell_a",
-        (FollowTarget::Cells, false) => "cell_b",
-        (FollowTarget::Scenes, true) => "scene_a",
-        (FollowTarget::Scenes, false) => "scene_b",
+    let (tag_a, tag_b) = match target {
+        FollowTarget::Cells => ("cell_a", "cell_b"),
+        FollowTarget::Scenes => ("scene_a", "scene_b"),
     };
-    let kind = if is_a { follow.a } else { follow.b };
+    // 「ジャンプ」を選んだ直後の飛び先は先頭の列 (行 3 の dropdown で変える)。
+    let first_scene = app.song_doc.song().scenes.first().map_or(0, |s| s.id);
+    for (is_a, x, tag) in [(true, x0, tag_a), (false, x2, tag_b)] {
+        let kind = if is_a { follow.a } else { follow.b };
+        if let Some(i) = ui.dropdown_with_font(
+            ("inspector_follow_kind", tag),
+            Rect { x, y, w: third, h: ROW_H },
+            FOLLOW_LABELS,
+            follow_index(kind),
+            FOLLOW_FONT,
+        ) {
+            let next = follow_from_index(i, first_scene);
+            let edit = if is_a { LaunchEdit::FollowA(next) } else { LaunchEdit::FollowB(next) };
+            push_follow_edit(ui, target, cells, app, edit);
+        }
+    }
+    num_field(
+        ui,
+        ("inspector_follow_chance", tag_a),
+        Rect { x: x1, y, w: third, h: ROW_H },
+        f64::from(follow.chance_a),
+        100.0,
+        ScrubableNumberFormat::Integer,
+        (0.0, 100.0),
+        0.3,
+        app,
+        target,
+        cells,
+        |v| LaunchEdit::FollowChanceA(v.round().clamp(0.0, 100.0) as u8),
+    );
+    y + ROW_H + ROW_GAP
+}
 
-    if let Some(i) = ui.dropdown(
-        ("inspector_follow_kind", tag),
-        Rect { x: x0, y, w: third, h: ROW_H },
-        FOLLOW_LABELS,
-        follow_index(kind),
-    ) {
-        // 「ジャンプ」を選んだ直後の飛び先は先頭の列 (右の dropdown で変える)。
-        let first_scene = app.song_doc.song().scenes.first().map_or(0, |s| s.id);
-        let next = follow_from_index(i, first_scene);
-        let edit = if is_a { LaunchEdit::FollowA(next) } else { LaunchEdit::FollowB(next) };
-        push_follow_edit(ui, target, cells, app, edit);
-    }
-    // 確率は A の行だけ (B は `100 - a` なので入力欄を 2 つ置かない)。
-    if is_a {
-        num_field(
-            ui,
-            ("inspector_follow_chance", tag),
-            Rect { x: x1, y, w: third, h: ROW_H },
-            f64::from(follow.chance_a),
-            100.0,
-            ScrubableNumberFormat::Integer,
-            (0.0, 100.0),
-            0.3,
-            app,
-            target,
-            cells,
-            |v| LaunchEdit::FollowChanceA(v.round().clamp(0.0, 100.0) as u8),
-        );
-    }
-    // 飛び先 (Jump のときだけ操作できる)。列が 1 つも無ければ描かない。
+/// 「ジャンプ」の飛び先の行 (`[A の飛び先 ▾][ ][B の飛び先 ▾]`)。A / B のどちらもジャンプで
+/// なければ描かず高さも足さない。列が 1 つも無ければ同じく描かない。
+#[allow(clippy::too_many_arguments)]
+fn draw_follow_jump_row(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    pad: f32,
+    y: f32,
+    follow: &FollowAction,
+    target: FollowTarget,
+    cells: &[LauncherCellKey],
+) -> f32 {
     let scenes = &app.song_doc.song().scenes;
-    if let FollowActionKind::Jump { scene_id } = kind
-        && !scenes.is_empty()
-    {
-        let names: Vec<String> =
-            scenes.iter().enumerate().map(|(i, s)| s.display_name(i)).collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let jump_of = |k: FollowActionKind| match k {
+        FollowActionKind::Jump { scene_id } => Some(scene_id),
+        _ => None,
+    };
+    let (jump_a, jump_b) = (jump_of(follow.a), jump_of(follow.b));
+    if scenes.is_empty() || (jump_a.is_none() && jump_b.is_none()) {
+        return y;
+    }
+    let row_w = area.w - pad * 2.0;
+    let third = (row_w - ROW_GAP * 2.0) / 3.0;
+    let x0 = area.x + pad;
+    let x2 = x0 + (third + ROW_GAP) * 2.0;
+    let (tag_a, tag_b) = match target {
+        FollowTarget::Cells => ("cell_a", "cell_b"),
+        FollowTarget::Scenes => ("scene_a", "scene_b"),
+    };
+    let names: Vec<String> = scenes.iter().enumerate().map(|(i, s)| s.display_name(i)).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    for (is_a, x, tag, jump) in [(true, x0, tag_a, jump_a), (false, x2, tag_b, jump_b)] {
+        let Some(scene_id) = jump else { continue };
         let sel = scenes.iter().position(|s| s.id == scene_id).unwrap_or(usize::MAX);
-        if let Some(i) = ui.dropdown(
+        if let Some(i) = ui.dropdown_with_font(
             ("inspector_follow_jump", tag),
-            Rect { x: x2, y, w: third, h: ROW_H },
+            Rect { x, y, w: third, h: ROW_H },
             &refs,
             sel,
+            FOLLOW_FONT,
         ) && let Some(s) = scenes.get(i)
         {
             let next = FollowActionKind::Jump { scene_id: s.id };

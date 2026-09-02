@@ -131,69 +131,6 @@ pub(super) fn draw_failed_load_section(
     y + 6.0
 }
 
-/// r.md #36: 「キーを全部プラグインに送る」 の per-device トグル。
-///
-/// 通常はホスト側が **プラグインが消化しなかったキーだけ** を拾うので、 エディタ窓に
-/// フォーカスがあっても Space で再生 / 停止でき、 かつプラグインの文字入力欄に空白も
-/// 打てる。 ただし Dear ImGui / GLFW / 自前 OpenGL 系のエディタは 「今テキスト入力中か」
-/// も 「このキーを消化したか」 も外に一切出さないので、 自動判定が効かない。
-/// そのプラグインだけ ON にして全キーを譲る (REAPER の FX ごとの同名オプションと同じ)。
-///
-/// 対象は **埋め込みエディタ窓を開くデバイスだけ**。 インライン param パネルしか持たない
-/// デバイス (映像 FX / VOICEVOX / GUI 無し plugin) は別窓にフォーカスが行かないので無関係。
-pub(super) fn draw_editor_key_section(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-) -> f32 {
-    let p = &app.theme.core;
-    let entries: Vec<crate::app_types::ChainEntry> = app
-        .inspector_chain()
-        .into_iter()
-        .filter(|e| e.has_embedded_gui && !e.shows_param_panel())
-        .collect();
-    if entries.is_empty() {
-        return y;
-    }
-    ui.label_at("inspector_keys_label", "エディタ窓のキー", area.x + pad, y, 12.0, p.text);
-    y += 18.0 + 4.0;
-
-    const ROW_H: f32 = 24.0;
-    const NAME_H: f32 = 14.0;
-    const ROW_GAP: f32 = 6.0;
-    let row_w = area.w - pad * 2.0;
-    for (i, entry) in entries.iter().enumerate() {
-        ui.label_at_clipped(
-            ("inspector_keys_name", i),
-            &entry.plugin_name,
-            Rect { x: area.x + pad, y, w: row_w, h: NAME_H },
-            11.0,
-            p.text,
-        );
-        let device_id = entry.device_id;
-        let next = !entry.send_all_keys;
-        ui.toggle_button_at(
-            ("inspector_keys_toggle", i),
-            "キーを全部プラグインに送る",
-            Rect { x: area.x + pad, y: y + NAME_H, w: row_w, h: ROW_H },
-            entry.send_all_keys,
-            &super::toggle_audio_style(&app.theme),
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetPluginSendAllKeys {
-                        device_id,
-                        enabled: next,
-                    });
-                })
-            },
-        );
-        y += NAME_H + ROW_H + ROW_GAP;
-    }
-    y + 6.0
-}
-
 /// パラアウト (Parallel Out) section (`docs/plan_paraout.md`)。
 ///
 /// multi-out プラグインごとに 「展開」 ボタン (auto-create + group child tracks) と、

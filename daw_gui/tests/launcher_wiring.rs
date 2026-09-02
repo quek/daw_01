@@ -1067,6 +1067,29 @@ fn クリップをセルへ運ぶとオートメーションが追従する() {
     assert!(lane_c.clips.is_empty(), "Move なので元は消える");
 }
 
+/// **初めて開くセルはピアノロールを auto-fit する** (アレンジのクリップと同じ、`X` の機能)。
+/// 2 度目以降は記憶した view を復元する (選ぶたびに飛ばない)。
+#[test]
+fn セルを初めて開くとピアノロールがノートにフィットする() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    let LauncherCellKey::Track(key) = cell else { panic!("トラック行のセル") };
+    // fit はグリッド寸法が要る (無いと保留フラグだけ立つ)。前フレームの描画値を模す。
+    app.ui_ephemeral.last_pianoroll_grid_size = (800.0, 400.0);
+    app.selection.selected_launcher_cells.clear();
+    assert!(!app.ui_prefs.piano_roll_views.contains_key(&key), "前提: まだ view の記憶が無い");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
+    let first = app.ui_prefs.piano_roll_views.get(&key).copied().expect("初回は fit して view を記憶する");
+
+    // view を動かしてから選び直しても飛ばない (記憶を復元)。
+    app.ui_prefs.piano_roll_views.get_mut(&key).expect("view").scroll_beat += 7.0;
+    app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
+    let second = app.ui_prefs.piano_roll_views.get(&key).copied().expect("view");
+    assert!((second.scroll_beat - (first.scroll_beat + 7.0)).abs() < 1e-9, "2 度目は fit し直さない");
+}
+
 /// 追従 OFF なら MIDI のセルだけが出来て、レーンには触らない。
 #[test]
 fn 追従_off_ならオートメーションはセルへ運ばない() {

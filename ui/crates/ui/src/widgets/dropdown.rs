@@ -27,6 +27,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         items: &[&str],
         selected: usize,
     ) -> Option<usize> {
+        self.dropdown_with_font(id, rect, items, selected, DROPDOWN_FONT)
+    }
+
+    /// [`Self::dropdown`] の本体フォントサイズ指定版。狭い列に並べる dropdown
+    /// (インスペクタの 3 分割行など) で既定の 14px が大きすぎるときに使う。
+    /// popup (項目一覧) の文字サイズはメニュー共通のまま — 読む側の一覧は本体の
+    /// 狭さに合わせて縮めない。
+    pub fn dropdown_with_font(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        items: &[&str],
+        selected: usize,
+        font_size: f32,
+    ) -> Option<usize> {
         let pointer = self.pointer;
         // popup state は caller-id ベース (rect 座標を入れると 1px 動いて state 蒸発 / 同位置別
         // dropdown で衝突する)。
@@ -57,13 +72,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             //「widget は自分の rect 境界に責任を持つ」 が dropdown だけ未適用だった)。
             // button / toggle_button と同じ `fit_text_ellipsized` + clip で揃える。
             let text_max_w = (rect.w - DROPDOWN_PAD_X - DROPDOWN_ARROW_W).max(1.0);
-            let (display, _text_w) = self.fit_text_ellipsized(label, DROPDOWN_FONT, text_max_w);
+            let (display, _text_w) = self.fit_text_ellipsized(label, font_size, text_max_w);
             self.push_text(GlyphArea {
                 text: display.as_ref().into(),
                 left: rect.x + DROPDOWN_PAD_X,
-                top: rect.y + (rect.h - DROPDOWN_FONT * 1.2) * 0.5,
-                font_size: DROPDOWN_FONT,
-                line_height: DROPDOWN_FONT * 1.2,
+                top: rect.y + (rect.h - font_size * 1.2) * 0.5,
+                font_size,
+                line_height: font_size * 1.2,
                 color: p.text,
                 clip_rect: Some(Rect {
                     x: rect.x + DROPDOWN_PAD_X,

@@ -2116,6 +2116,51 @@ fn launcher_pane_sits_between_header_and_lanes() {
     assert!(!r.launcher.cell_rects.is_empty(), "格子のセルが caller に返る");
 }
 
+/// 帯の Shift+ホイールで、実シーンの先の空き列 (プレースホルダ) まで到達できる。旧実装は
+/// 実シーン数で止めていたので、実シーン 4 本の曲では Scene 5 が左端に来た所で止まり、
+/// 帯が狭いと Scene 21 などへ一切届かなかった。向きはアレンジと同じ (ホイール下 = 右へ)。
+#[test]
+fn launcher_shift_wheel_reaches_placeholder_scenes_beyond_the_real_ones() {
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 300.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    app.edit_song(|song| {
+        for _ in 0..4 {
+            song.push_scene();
+        }
+    });
+    let mut host = UiHost::no_redraw();
+    let r = drive_response(&mut host, &mut app, PointerFrame::default());
+    let pane = r.launcher.pane_rect;
+    let (px, py) = (pane.x + pane.w * 0.5, pane.y + 10.0);
+    let max_index = |r: &daw_gui::widgets::arrangement::ArrangementResponse| {
+        r.launcher.scene_rects.iter().map(|(_, i, _)| *i).max().unwrap_or(0)
+    };
+    assert!(max_index(&r) < 24, "前提: 最初は 25 列目は見えていない ({})", max_index(&r));
+    let wheel = |dy: f32| PointerFrame {
+        pos: Some((px, py)),
+        scroll_delta: (0.0, dy),
+        modifiers: modifiers(false, true, false),
+        ..PointerFrame::default()
+    };
+    let mut last = r;
+    for _ in 0..60 {
+        last = drive_response(&mut host, &mut app, wheel(-40.0));
+    }
+    assert!(
+        max_index(&last) >= 24,
+        "ホイール下で末尾の列 (index 24) まで届かない: 最大 index {}",
+        max_index(&last)
+    );
+    // 逆向きで先頭へ戻る。
+    for _ in 0..60 {
+        last = drive_response(&mut host, &mut app, wheel(40.0));
+    }
+    assert!(
+        last.launcher.scene_rects.iter().any(|(_, i, _)| *i == 0),
+        "ホイール上で先頭の列へ戻らない"
+    );
+}
+
 /// クリップをレーンから帯 (ランチャー) へ持ち出しても、アレンジは横スクロールしない。
 /// 端オートスクロールの hot-zone は lanes の**内側**にしか無い — 旧実装は lanes の左の
 /// 半平面すべてで最大速度だったので、帯の上で静止しても拍 0 まで巻き戻り続けた。

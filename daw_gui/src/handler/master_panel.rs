@@ -135,7 +135,10 @@ mod tests {
     /// 触っていないセクションまで毎フレーム動く。
     #[test]
     fn heights_and_ratios_round_trip() {
-        for avail in [600.0_f32, 900.0, 1400.0] {
+        // 最低高の合計 (620) を割る高さでは比率を無視して最低高を積む (= 恒等ではない) ので、
+        // 入る高さだけを見る。
+        let min_total: f32 = MASTER_SECTION_MIN_H.iter().sum();
+        for avail in [min_total + 80.0, 900.0, 1400.0] {
             for ratios in [[0.25; 4], [0.34, 0.24, 0.18, 0.24], [0.6, 0.2, 0.1, 0.1]] {
                 let h = section_heights(ratios, avail);
                 let back = section_ratios(h, avail);

@@ -286,6 +286,16 @@ impl AppData {
         {
             self.launcher.focus = Some(crate::state::LauncherFocus { row, scene_index });
         }
+        // アレンジのクリップ選択 (`apply_clip_range`) と同じく、**初めて開く**セルはピアノロールを
+        // auto-fit する (per-clip view の記憶が無いときだけ。記憶があれば復元に任せ、明示的な
+        // 再 fit は `X`)。単一のトラック行 MIDI セルだけ — 複数表示は共有 viewport なので
+        // 選ぶたびに飛ばさない。
+        if let [LauncherCellKey::Track(k)] = self.selection.selected_launcher_cells.as_slice()
+            && self.is_midi_clip(*k)
+            && !self.ui_prefs.piano_roll_views.contains_key(k)
+        {
+            self.fit_piano_roll_to_clip();
+        }
     }
 
     /// Shift+click の範囲計算に渡す「行 × 列」のグリッド。

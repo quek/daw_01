@@ -123,16 +123,18 @@ fn scroll_scenes(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     }
     let (dx, dy) = ui.take_scroll_in_rect(f.launcher.pane);
     // 横成分があればそれを、無ければ縦成分を横へ倒す (ホイールしか無いマウス用)。
-    let delta = if dx.abs() > 0.0 { dx } else { -dy };
+    // 向きはアレンジの Shift+ホイール (`scroll_beat_raw - dy * ...`: ホイール上 = 手前 /
+    // 左へ) と同じ。旧実装は `-dy` で逆向きだった。
+    let delta = if dx.abs() > 0.0 { dx } else { dy };
     if delta.abs() <= 0.0 {
         return;
     }
     let cur = f.launcher.scroll_scene;
-    // 実シーンが 0 でも右にはプレースホルダ列が並んでいるので、最低 1 列ぶんは
-    // スクロールできる (0 だと「空の曲では横スクロールが一切効かない」)。
-    #[allow(clippy::cast_precision_loss)]
-    let max = (f.launcher_view.scenes.len() as f32).max(1.0);
-    let next = (cur - delta / f.launcher.col_w).clamp(0.0, max);
+    // 右にはプレースホルダ列が (実シーンの数に関係なく) 並んでいるので、上限は実シーン数
+    // ではなく列の上限。旧実装は `scenes.len()` で止めていたため、帯が狭いと「最初の空き列が
+    // 左端に来た」ところで止まり、その先の空き列 (実シーン 4 本なら Scene 21 など) へ
+    // 一切届かなかった。
+    let next = (cur - delta / f.launcher.col_w).clamp(0.0, MAX_SCROLL_SCENES);
     if (next - cur).abs() < 1e-4 {
         return;
     }
