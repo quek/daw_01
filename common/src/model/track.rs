@@ -3,6 +3,12 @@
 //! arch-refactor #9 (god-file budget) で model.rs から分割。pure code movement で
 //! 挙動・serialize 形式は不変。sibling 型は `use super::*` 経由で参照する。
 
+/// 内蔵チャンネルストリップ (コンプ + EQ) の設定値。`Track` が 1 個ずつ所有する
+/// ので、その定義の下に置く (`docs/plan_channel_strip.md`)。
+pub mod channel_strip;
+
+pub use channel_strip::*;
+
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +63,13 @@ pub struct Track {
     pub devices: Vec<PluginInstance>,
     pub volume: f32,
     pub pan: f32,
+    /// 内蔵チャンネルストリップ (コンプ + EQ)。全 track が 1 個ずつ持ち、
+    /// 削除できない (バイパスのみ)。信号順は `inserts → Comp → EQ → Pan →
+    /// Fader` で固定 — 設計正本は `docs/plan_channel_strip.md`。
+    /// 旧 file には無いので `serde(default)` で forward-migrate (= 全バイパス
+    /// のフラット設定なので音は変わらない)。
+    #[serde(default)]
+    pub strip: ChannelStrip,
     /// Track silenced by the user. Additive with the global solo rule (see
     /// `solo` below): `effective_mute = muted || (any_solo_on && !solo)`.
     #[serde(default)]
@@ -248,6 +261,7 @@ impl Default for Track {
             devices: Vec::new(),
             volume: 1.0,
             pan: 0.0,
+            strip: ChannelStrip::default(),
             muted: false,
             solo: false,
             armed: false,

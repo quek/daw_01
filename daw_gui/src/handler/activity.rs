@@ -119,9 +119,16 @@ impl AppData {
         mix(self.transport.master_meter.visual_digest);
         // トラックメーターは linear なので dB 経由で正規化してから量子化する
         // (そのまま量子化すると指数減衰が 0 に収束せず永久に描き続ける)。
-        for (l, r) in &self.transport.track_peak_display {
+        for (l, r, gr) in &self.transport.track_peak_display {
             mix(quantize(meter_norm(*l), METER_STEPS));
             mix(quantize(meter_norm(*r), METER_STEPS));
+            // GR も動く表示なので digest に混ぜる (混ぜないとコンプだけが
+            // 動いている間に再描画が止まり、メーターが凍る)。0 に収束するよう
+            // 表示レンジで正規化してから量子化する。
+            mix(quantize(
+                (*gr / common::model::GR_METER_RANGE_DB).clamp(0.0, 1.0),
+                METER_STEPS,
+            ));
         }
         // 変調スカラーは画像 / グループ / 映像効果の見た目を直接動かすので細かく見る。
         for v in self.transport.mod_plane.values() {

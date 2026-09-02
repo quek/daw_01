@@ -547,7 +547,7 @@ impl AppData {
 
     pub(crate) fn resize_track_peak_display(&mut self) {
         let n = self.song_doc.song().tracks.len();
-        self.transport.track_peak_display.resize(n, (0.0, 0.0));
+        self.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));
     }
 
     // -------- Note operations ----------------------------------------------

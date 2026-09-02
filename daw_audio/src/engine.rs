@@ -1505,6 +1505,9 @@ impl LocalState {
             // Tracks with effective_mute already have peak_l/r == 0.
             for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
                 bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
+                // 内蔵チャンネルストリップの GR (docs/plan_channel_strip.md §9)。
+                // peak と同じ走査で出す = 同じ buffer の値だと保証される。
+                bridge.set_track_gr_db(i, tr.strip_gr_db);
             }
 
             // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。

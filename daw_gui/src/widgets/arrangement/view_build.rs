@@ -727,6 +727,38 @@ fn lane_target_display(
             icon_glyph: 'S',
             color: Color::rgb(0.85, 0.75, 0.40),
         },
+        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。EQ は青緑 /
+        // コンプは橙で、fx (紫) や volume (水色) と一目で分かれる色に置く。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEqOn) => LaneDisplay {
+            label: intern_label("EQ On"),
+            icon_glyph: 'E',
+            color: Color::rgb(0.40, 0.85, 0.80),
+        },
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripCompOn) => LaneDisplay {
+            label: intern_label("Comp On"),
+            icon_glyph: 'C',
+            color: Color::rgb(0.95, 0.65, 0.35),
+        },
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
+        | AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { .. }) => {
+            let is_eq = matches!(
+                target,
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
+            );
+            LaneDisplay {
+                // ラベルの組み立ては song 非依存の SSoT
+                // (`crate::automation_label::automation_target_display_name`) を引く。
+                label: intern_label(&crate::automation_label::automation_target_display_name(
+                    target,
+                )),
+                icon_glyph: if is_eq { 'E' } else { 'C' },
+                color: if is_eq {
+                    Color::rgb(0.40, 0.85, 0.80)
+                } else {
+                    Color::rgb(0.95, 0.65, 0.35)
+                },
+            }
+        }
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
             label: match plugin_param_name {
                 Some(name) => intern_label(name),

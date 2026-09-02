@@ -31,7 +31,7 @@ use crate::graph::{BufRef, NodeOp, Schedule};
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
 use crate::mod_tick::FollowerDrive;
-use crate::mixer::{TrackScratch, apply_strip};
+use crate::mixer::{TrackScratch, apply_channel_strip, apply_strip};
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
 
 /// この device / pair が dispatch 可能かどうか (quarantine / poison gate)。
@@ -431,6 +431,23 @@ pub fn process_track_owned(
         }
         return;
     }
+
+    // ---- 内蔵チャンネルストリップ (Comp → EQ) ----
+    // docs/plan_channel_strip.md §1: 信号順は inserts → Comp → EQ → Pan →
+    // Fader。**pre-fader tap より前**に置く — 「pre-fader」 は業界標準では
+    // 「チャンネル処理の後・フェーダーの前」を指すので、send / sidechain には
+    // EQ とコンプを通った音が流れる。
+    apply_channel_strip(
+        scratch,
+        song,
+        song_track,
+        rows,
+        sample_rate,
+        playhead_beats,
+        n,
+        recording_lanes,
+        mod_plane,
+    );
 
     // ---- Pre-fader send tap ----
     // A pre-fader send reads the post-fx, pre-strip signal. Snapshot it
@@ -929,6 +946,21 @@ fn run_group_fx_chain(
             }
         }
     }
+
+    // ---- 内蔵チャンネルストリップ (Comp → EQ) ----
+    // leaf 経路 (`process_track_owned`) と同じ位置 = pre-fader tap の前。
+    apply_channel_strip(
+        scratch,
+        Some(song),
+        song_track,
+        rows,
+        sample_rate,
+        playhead_beats,
+        n,
+        recording_lanes,
+        // group/master bus の変調は follow-up (volume/pan と同じ扱い)。
+        ModTickPlaneRef::default(),
+    );
 
     // ---- Pre-fader send tap (bus / return source) ----
     // A pre-fader send from this bus reads its post-fx, pre-strip signal.

@@ -15,7 +15,8 @@ use crate::view::{
     about, arrangement_view, bottom_panel, clipboard_ops, dirty_guard_modal, export_overlay,
     export_range_modal,
     shutdown_overlay,
-    font_picker, load_overlay, loudness_report, master_panel, plugin_picker, recovery_modal,
+    font_picker, load_overlay, loudness_report, master_panel, mixer_strips, plugin_picker,
+    recovery_modal,
     resource_monitor,
     settings, shortcuts_help, snap, status_bar, track_inspector, track_picker, transport,
     undo_history, voicevox_overlay,
@@ -132,6 +133,21 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
         app.ui_prefs.arrangement_split_ratio
     } else {
         ARRANGEMENT_SPLIT_DEFAULT_RATIO
+    };
+    // 内蔵チャンネルストリップ帯 (docs/plan_channel_strip.md §4): EQ / Comp を
+    // 開いたら、**開いた帯の高さぶんだけ**下ペインを広げる。こうするとフェーダー /
+    // メーター / Sends は開閉で 1px も動かない (strip 全体が同じ量だけ伸びるため)。
+    //
+    // **保存された比率は書き換えず**、描画時に差し引くだけにする — 閉じた瞬間に
+    // ユーザーの比率へ自動で戻り、復元用の状態を別に持たずに済む。アレンジ側が
+    // 潰れきらないよう下限だけ置く (画面が足りないときはそこで頭打ちになり、
+    // 以降はフェーダーが縮む)。
+    let split_ratio = if app.ui_prefs.bottom_panel == 0 && right_rect.h > 0.0 {
+        const MIN_ARRANGEMENT_FRAC: f32 = 0.15;
+        let extra = mixer_strips::extra_head_height(app) / right_rect.h;
+        (split_ratio - extra).max(MIN_ARRANGEMENT_FRAC)
+    } else {
+        split_ratio
     };
     ui.split_view(
         "root_arrange_bottom",
@@ -638,6 +654,48 @@ fn dispatch_note_nudge(ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
 /// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
 /// (mutation は `Ui::push_edit(Edit::mutate(...))` 経由)。
 ///
+/// Q (= 「カーソル直下のものを無効化 / 有効化」) を内蔵チャンネルストリップに
+/// 割り当てる。カーソルが Comp / EQ のセクション本体か常設帯の上にあれば、
+/// そのセクションのバイパスを切り替えて `true`。対象が無ければ `false` で、
+/// 呼び出し側は従来どおり note / clip の mute へ進む。
+///
+/// 対象面の算出は `view::strip_sections` (`mixer_hovered_strip_section`) が SSoT。
+fn toggle_hovered_strip_section(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    mixer_active: bool,
+) -> bool {
+    use crate::event::{StripEdit, StripSection};
+    // hover 値は strip を描いた frame にしか更新されないので、Mixer タブから
+    // 離れた後も最後の値が残る。**タブと pointer 位置で毎回ゲートする**
+    // (`mixer_hovered_track` を使う S キーと同じ作法) — 無いと Piano Roll に
+    // 切り替えた後の Q がノート mute ではなくストリップ切替になる。
+    if !mixer_active {
+        return false;
+    }
+    let Some((track_id, section)) = app.ui_ephemeral.mixer_hovered_strip_section else {
+        return false;
+    };
+    let param = match section {
+        StripSection::Comp => common::model::TrackBuiltinParam::StripCompOn,
+        StripSection::Eq => common::model::TrackBuiltinParam::StripEqOn,
+    };
+    let on = app
+        .song_doc
+        .song()
+        .track_by_id(track_id)
+        .and_then(|t| t.strip.target_value(&param))
+        .unwrap_or(0.0)
+        >= 0.5;
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::StripEdit {
+            track: track_id,
+            edit: StripEdit::Param { param, value: f32::from(u8::from(!on)) },
+        });
+    }));
+    true
+}
+
 /// `bottom_rect` は piano_roll active 判定用。マウスが bottom_panel 領域内 + Piano Roll
 /// タブが選択中なら G/X/1/2/3 を piano_roll 系に流す。それ以外は arrange 系。
 fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect) {
@@ -998,7 +1056,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     //   (`arrangement_hover_clip`)。
     // toggle 方向は「対象が全部 muted なら unmute、 1 つでも非 muted なら全 mute」。
     // text_input フォーカス中は gui_01 が単キーを抑制する。
-    if ui.take_shortcut("daw.toggle_mute") {
+    // 内蔵チャンネルストリップ (docs/plan_channel_strip.md) が Q を先取りする:
+    // カーソルが Comp / EQ の上にあればそのセクションのバイパスを切り替え、
+    // 下の clip / note の mute へは落とさない。
+    let mixer_active = app.ui_prefs.bottom_panel == 0 && pointer_in_bottom;
+    if ui.take_shortcut("daw.toggle_mute") && !toggle_hovered_strip_section(app, ui, mixer_active) {
         if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
             // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
             // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、

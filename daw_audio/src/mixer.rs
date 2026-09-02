@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+/// 内蔵チャンネルストリップ (コンプ + EQ) の RT 実行。mixer strip の一部なので
+/// `mixer` の下に置く (`docs/plan_channel_strip.md`)。
+pub mod channel_strip;
+
 use crate::graph::DelayLine;
 use crate::sequencer::{PerTrackState, TimedNoteEvent};
 
@@ -103,6 +107,14 @@ pub struct TrackScratch {
     /// allocated once. docs/plan_modulation_followups.md §1.
     pub pre_fx_l: Vec<f32>,
     pub pre_fx_r: Vec<f32>,
+    /// 内蔵チャンネルストリップ (コンプ + EQ) の状態 (`docs/plan_channel_strip.md`)。
+    /// バイクワッドの遅延・平滑済みゲイン・係数キャッシュを buffer 間で保つ。
+    /// 固定サイズなので `TrackScratch` に埋めても RT で確保は起きない。
+    pub strip: channel_strip::StripState,
+    /// 直前 buffer の最大ゲインリダクション (dB、0 以下)。
+    /// `engine` が peak と一緒に `AudioBridge` へ publish し、mixer strip の
+    /// GR メーターになる。
+    pub strip_gr_db: f32,
 }
 
 impl TrackScratch {
@@ -140,6 +152,8 @@ impl TrackScratch {
             pre_fader_r: vec![0.0; MAX_FRAMES],
             pre_fx_l: vec![0.0; MAX_FRAMES],
             pre_fx_r: vec![0.0; MAX_FRAMES],
+            strip: channel_strip::StripState::default(),
+            strip_gr_db: 0.0,
         }
     }
 }
@@ -202,6 +216,58 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
         scratch.peak_l = 0.0;
         scratch.peak_r = 0.0;
     }
+}
+
+/// 内蔵チャンネルストリップ (コンプ → EQ) を scratch に in-place 適用し、
+/// この buffer の最大ゲインリダクション (dB、0 以下) を `strip_gr_db` に残す。
+///
+/// 設計正本は `docs/plan_channel_strip.md`。呼び出し位置は leaf / bus とも
+/// **pre-fader tap の直前** (= inserts の後、フェーダーの前) で、両経路が
+/// この 1 実装を共有する ([`apply_strip`] と同じ理由 — 同文のインライン展開を
+/// 作らない)。
+///
+/// オートメーションと変調の解決は [`crate::automation::resolve_track_strip`]
+/// (block-rate)。`song` が無い (= 初期化中) ときは何もしない。
+///
+/// RT-safe: 確保・ロック・I/O なし。係数の組み直しは `StripState` が
+/// 「値が変わった buffer だけ」に絞る。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_channel_strip(
+    scratch: &mut TrackScratch,
+    song: Option<&common::model::Song>,
+    song_track: &common::model::Track,
+    rows: crate::launcher::TrackRows<'_>,
+    sample_rate: u32,
+    playhead_beats: f64,
+    n: usize,
+    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    mod_plane: common::mod_plane::ModTickPlaneRef<'_>,
+) {
+    let Some(song) = song else {
+        scratch.strip_gr_db = 0.0;
+        return;
+    };
+    if song_track.strip.is_bypassed()
+        && song_track.automation_lanes.is_empty()
+        && song_track.mod_routings.is_empty()
+    {
+        // 触られていないトラック (= 大多数) はここで抜ける。
+        scratch.strip_gr_db = 0.0;
+        return;
+    }
+    let resolved = crate::automation::resolve_track_strip(
+        song,
+        song_track,
+        rows,
+        playhead_beats,
+        recording_lanes,
+        mod_plane,
+    );
+    // `strip` (状態) と `track_l/r` (信号) を同時に可変で借りるので分解する。
+    let TrackScratch { strip, track_l, track_r, strip_gr_db, .. } = scratch;
+    #[allow(clippy::cast_precision_loss)]
+    let sr = sample_rate as f32;
+    *strip_gr_db = strip.process(&resolved, track_l, track_r, n, sr);
 }
 
 /// 鳴っている全 note を「次の drain (= 各 track の process 冒頭、frame 0)」で出す

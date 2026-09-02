@@ -68,6 +68,23 @@ pub fn plain_to_norm_ranged(
             }
         }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
+        // 内蔵チャンネルストリップ: レンジの SSoT は `EqParam::range` /
+        // `CompParam::range` (`common::model::channel_strip`)。ここで式を持たない。
+        AutomationTarget::TrackBuiltin(
+            TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
+        ) => {
+            if plain >= 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
+            param.range(*band).to_norm(plain)
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
+            param.range().to_norm(plain)
+        }
         AutomationTarget::PluginParam { .. } => plain,
         // Song-level: 旧 placeholder (常に 0) は tempo automation / 変調の値域を
         // 失わせていた。control の表示レンジ (transport.rs SCRUB_STYLE_BPM /
@@ -191,6 +208,17 @@ pub fn norm_mapping_is_affine(target: &AutomationTarget) -> bool {
         ) => false,
         // log 値域を持つ param だけ非 affine。0..=1 恒等の param は affine。
         AutomationTarget::ModSourceParam { param, .. } => mod_param_range(*param).is_none(),
+        // 内蔵ストリップ: 判定は `ParamRange` 自身が持つ (周波数 / 時定数 /
+        // レシオ / Q は log、ゲイン / スレッショルドは線形)。
+        AutomationTarget::TrackBuiltin(
+            TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
+        ) => false,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
+            param.range(*band).is_affine()
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
+            param.range().is_affine()
+        }
         _ => true,
     }
 }
@@ -202,7 +230,16 @@ pub fn norm_mapping_is_affine(target: &AutomationTarget) -> bool {
 /// (Mute lane の曲線は必ず 0 / 1 の段なので、指に追従させる連続解が無い)。
 #[must_use]
 pub fn norm_mapping_is_invertible(target: &AutomationTarget) -> bool {
-    !matches!(target, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute))
+    match target {
+        AutomationTarget::TrackBuiltin(
+            TrackBuiltinParam::Mute | TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
+        ) => false,
+        // 検出フィルタ周波数は左端に OFF の平らな帯があるので狭義単調でない。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
+            param.range().is_invertible()
+        }
+        _ => true,
+    }
 }
 
 /// Normalized 0..=1 → plain (target's native unit)。`plain_to_norm` の
@@ -237,6 +274,22 @@ pub fn norm_to_plain_ranged(
             }
         }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => n * 2.0,
+        // `plain_to_norm_ranged` の厳密逆 (レンジは channel_strip 側が SSoT)。
+        AutomationTarget::TrackBuiltin(
+            TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
+        ) => {
+            if n >= 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
+            param.range(*band).from_norm(n)
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
+            param.range().from_norm(n)
+        }
         AutomationTarget::PluginParam { .. } => n,
         // plain_to_norm の厳密逆 (control 表示レンジ)。
         AutomationTarget::SongTempo => 1.0 + n * 399.0,

@@ -192,6 +192,55 @@ pub fn automation_value_display(
             to_display: id,
             from_display: id,
         },
+        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。plain = 表示単位
+        // そのもの (Hz / dB / ms / 比) なので変換は恒等。**レンジは
+        // `ParamRange` が SSoT** — ここで数値を書かない。
+        T::TrackBuiltin(TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn) => {
+            AutomationValueDisplay {
+                unit: "",
+                format: ScrubableNumberFormat::Integer,
+                range: (0.0, 1.0),
+                to_display: id,
+                from_display: id,
+            }
+        }
+        T::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
+            use common::model::EqParam;
+            let (unit, format) = match param {
+                // Hz は下端 20 と上端 20k が 3 桁離れるので有効数字表記
+                // (固定小数だと下端が潰れるか上端が欄に入らない)。
+                EqParam::Freq => ("Hz", ScrubableNumberFormat::Significant { digits: 3 }),
+                EqParam::Gain => ("dB", ScrubableNumberFormat::Decimal(1)),
+                EqParam::Q => ("", ScrubableNumberFormat::Decimal(2)),
+            };
+            AutomationValueDisplay {
+                unit,
+                format,
+                range: param.range(*band).display_range(),
+                to_display: id,
+                from_display: id,
+            }
+        }
+        T::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
+            use common::model::CompParam;
+            let (unit, format) = match param {
+                CompParam::Threshold | CompParam::Makeup => {
+                    ("dB", ScrubableNumberFormat::Decimal(1))
+                }
+                CompParam::Ratio => (":1", ScrubableNumberFormat::Decimal(1)),
+                CompParam::Attack | CompParam::Release => {
+                    ("ms", ScrubableNumberFormat::Significant { digits: 3 })
+                }
+                CompParam::ScFreq => ("Hz", ScrubableNumberFormat::Significant { digits: 3 }),
+            };
+            AutomationValueDisplay {
+                unit,
+                format,
+                range: param.range().display_range(),
+                to_display: id,
+                from_display: id,
+            }
+        }
         // PluginParam は plain = native。実 min/max があればそれを表示レンジに。
         T::PluginParam { .. } => AutomationValueDisplay {
             unit: "",

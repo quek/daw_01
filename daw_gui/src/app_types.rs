@@ -48,6 +48,9 @@ pub struct TrackMixEntry {
     /// `Ui::level_meter` は内部で dB 変換するので、view 側ではこのまま渡す。
     pub peak_l_raw: f32,
     pub peak_r_raw: f32,
+    /// 内蔵チャンネルストリップのゲインリダクション (**正の減衰量 dB**、
+    /// 0 = 掛かっていない)。strip のサムネイル帯 / Comp 帯の GR メーターが読む。
+    pub gain_reduction_db: f32,
     /// `kind == Group` のとき mixer strip / arrangement で別色表示し、
     /// 子トラックを束ねる sub-mix bus として識別する。
     pub is_group: bool,
@@ -77,6 +80,7 @@ impl Default for TrackMixEntry {
             solo: false,
             peak_l_raw: 0.0,
             peak_r_raw: 0.0,
+            gain_reduction_db: 0.0,
             is_group: false,
             is_return: false,
             depth: 0,

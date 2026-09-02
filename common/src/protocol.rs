@@ -324,6 +324,14 @@ pub enum AudioCommand {
     SetTrackPan { track: u32, pan: f32 },
     SetTrackMuted { track: u32, muted: bool },
     SetTrackSolo { track: u32, solo: bool },
+    /// 内蔵チャンネルストリップ (コンプ + EQ) の設定を丸ごと差し替える
+    /// (`docs/plan_channel_strip.md`)。値のみの更新 — graph は再 compile しない。
+    ///
+    /// パラメータ 1 個ごとの variant を並べず **構造体 1 個**を送る:
+    /// `ChannelStrip` は 20 個ほどの数値だけの `Copy` 型 (数十バイト) なので
+    /// bulk には当たらず (不変条件 2)、「どのフィールドを送ったか」を送信側と
+    /// 受信側の 2 か所で数え合わせる必要も無くなる。
+    SetTrackStrip { track: u32, strip: crate::model::ChannelStrip },
     /// Realtime aux-send level update。 `track` = source の `Track::id`、
     /// `send_id` = その track の `sends` 内 stable `Send::id` (v29)。
     /// 値のみの更新 — graph は再 compile されない。

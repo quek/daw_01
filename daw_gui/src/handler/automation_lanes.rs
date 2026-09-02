@@ -1204,35 +1204,46 @@ impl AppData {
         );
     }
 
+    /// track-builtin target の現在値 (plain)。`lane_default_for_target` から
+    /// 切り出したのは、内側の match がネスト段数の予算 (不変条件 9) を
+    /// 押し上げるため — 値の取り出しはこの 1 段で完結する。
+    fn track_builtin_plain_value(
+        &self,
+        track_id: u32,
+        param: &common::model::TrackBuiltinParam,
+    ) -> f64 {
+        use common::model::TrackBuiltinParam as P;
+        let Some(track) = self.song_doc.song().track_by_id(track_id) else {
+            return 0.0;
+        };
+        match param {
+            P::Volume => f64::from(track.volume),
+            P::Pan => f64::from(track.pan),
+            P::Mute => f64::from(u8::from(track.muted)),
+            // A6 (r.md #8): send gain の現在値は model にある。
+            // v29: 安定 send id 一致で引く。
+            P::SendGain { send_id, .. } => track
+                .sends
+                .iter()
+                .find(|s| s.id == *send_id)
+                .map_or(0.0, |s| f64::from(s.gain)),
+            // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
+            // `ChannelStrip::target_value` が SSoT (ここで写さない)。
+            P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {
+                track.strip.target_value(param).map_or(0.0, f64::from)
+            }
+        }
+    }
+
     /// `AddAutomationFromLastTouched` の補助。target の現在値を plain
     /// 単位で取得 (lane.default_value 初期化用)。 track-builtin は track の strip 値、
     /// send gain は `track.sends[idx].gain`、 plugin param は `current_plain_value`
     /// の cache (A6 r.md #8)、 song-level は `song.bpm` / `song.time_sig.0`。
     pub(crate) fn lane_default_for_target(&self, touched: &TouchedParam) -> f64 {
-        use common::model::{AutomationTarget, TrackBuiltinParam};
+        use common::model::AutomationTarget;
         match &touched.target {
             AutomationTarget::TrackBuiltin(param) => {
-                let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
-                    return 0.0;
-                };
-                match param {
-                    TrackBuiltinParam::Volume => f64::from(track.volume),
-                    TrackBuiltinParam::Pan => f64::from(track.pan),
-                    TrackBuiltinParam::Mute => {
-                        if track.muted {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    // A6 (r.md #8): send gain の現在値は model にある。
-                    // v29: 安定 send id 一致で引く。
-                    TrackBuiltinParam::SendGain { send_id, .. } => track
-                        .sends
-                        .iter()
-                        .find(|s| s.id == *send_id)
-                        .map_or(0.0, |s| f64::from(s.gain)),
-                }
+                self.track_builtin_plain_value(touched.track_id, param)
             }
             // A6 (r.md #8): plugin param は GUI の現在値 cache を引く
             // (`current_plain_value` が `plugin_param_values` から解決)。

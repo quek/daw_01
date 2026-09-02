@@ -19,6 +19,7 @@ use crate::automation_value::automation_value_display;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 use crate::view::modulation::{build_mod, push_mod_depth_bracket};
 use crate::view::param_gesture::push_param_gesture_edges;
+use crate::view::strip_sections;
 use crate::view::track_color;
 use daw_ui_renderer::{Color, Rect, RectCommand};
 use crate::theme::Theme;
@@ -156,6 +157,20 @@ fn style_send_prepost(theme: &Theme) -> ToggleButtonStyle {
     }
 }
 
+/// strip 帯の外側 (mixer ビューの上下左右) に取る余白 (px)。
+const INNER_PAD: f32 = 8.0;
+
+/// EQ / Comp セクションを開いたことで strip が **余分に** 要る高さ (px)。
+/// 全部折り畳んでいれば `0`。
+///
+/// `root` がこの分だけ下ペインを広げるので、**フェーダー / メーター / Sends の
+/// 高さは開閉で一切変わらない** (`docs/plan_channel_strip.md` §4)。strip の
+/// geometry を知っているのはこの module だけなので、算出もここに置く。
+#[must_use]
+pub fn extra_head_height(app: &AppData) -> f32 {
+    (strip_sections::head_height(app) - strip_sections::THUMB_H).max(0.0)
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let p = &app.theme.core;
     // mixer ビューの最下層 backdrop (= strip が浮く床)。strip 本体 = panel より
@@ -170,7 +185,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let ptr = pointer.pos;
     let mut hovered_strip: Option<u32> = None;
 
-    let inner_pad = 8.0;
+    let inner_pad = INNER_PAD;
     let strip_y = area.y + inner_pad;
     let strip_h = area.h - inner_pad * 2.0;
     let pitch = STRIP_WIDTH + STRIP_GAP;
@@ -363,7 +378,10 @@ fn draw_track_strip(
     // send 2 本以上でフェーダー / メーターと Sends セクションが重なって描かれ、
     // 重なり領域では先に描かれるフェーダーが press を consume して × / send knob が
     // クリック不能になっていた。
-    let sends_band_h = sends_band_height_fitted(n_sends, rect.h);
+    // 内蔵チャンネルストリップ帯 (docs/plan_channel_strip.md) が上端を食うので、
+    // Sends band に残る余地もその分だけ減る。
+    let sends_band_h =
+        sends_band_height_fitted(n_sends, rect.h - strip_sections::head_height(app));
     draw_strip(
         app,
         ui,
@@ -375,6 +393,7 @@ fn draw_track_strip(
         entry.solo,
         entry.peak_l_raw,
         entry.peak_r_raw,
+        entry.gain_reduction_db,
         rect,
         bg,
         Some(track_color::to_renderer(entry.color)),
@@ -411,6 +430,7 @@ fn draw_return_strip(
         entry.solo,
         entry.peak_l_raw,
         entry.peak_r_raw,
+        entry.gain_reduction_db,
         rect,
         app.theme.daw.strip_return_bg,
         Some(track_color::to_renderer(entry.color)),
@@ -447,6 +467,9 @@ fn draw_strip(
     solo: bool,
     peak_l_raw: f32,
     peak_r_raw: f32,
+    // 内蔵コンプのゲインリダクション (正の減衰量 dB)。ストリップ帯の GR メーター
+    // が読む (docs/plan_channel_strip.md §3)。
+    gain_reduction_db: f32,
     rect: Rect,
     bg: Color,
     // track の effective 色。 `Some(c)` で strip 左端に縦カラーストライプを
@@ -504,7 +527,20 @@ fn draw_strip(
     }
 
     let pad = STRIP_PAD;
-    let mut y = rect.y + pad;
+
+    // 内蔵チャンネルストリップ帯 (Comp / EQ / 常設サムネイル) を strip 上端に積む。
+    // **既存 strip の中身は変えず、その上に足すだけ** (docs/plan_channel_strip.md §2)。
+    let head_h = strip_sections::head_height(app);
+    strip_sections::draw_head(
+        app,
+        ui,
+        track_idx,
+        Rect { h: head_h, ..rect },
+        pad,
+        bg,
+        gain_reduction_db,
+    );
+    let mut y = rect.y + head_h + pad;
 
     // 名前 (group strip は左に折り畳み disclosure を置く)。 mixer は strip が
     // **横** に並び、 group の子は右に現れるので開示軸は Inline
@@ -702,7 +738,7 @@ fn draw_strip(
     // `sends_band_height_fitted` はこの積み上げを定数化した値で band 高を決める。
     // 片方だけ変えると band とフェーダーが重なるので、 非 master 経路で一致を固定する。
     debug_assert!(
-        is_master || (fader_top - (rect.y + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
+        is_master || (fader_top - (rect.y + head_h + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
         "STRIP_FADER_TOP_OFFSET が draw_strip の y 積み上げとずれている"
     );
     let fader_bottom = rect.y + rect.h - pad - 12.0 - sends_band_h;

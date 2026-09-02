@@ -32,6 +32,12 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         AudioCommand::SetTrackSolo { track, solo } => {
             with_track(song, track, |t| t.solo = solo);
         }
+        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。IPC は信頼境界
+        // なので、各パラメータを可動範囲へ丸めてから載せる。丸め方の SSoT は
+        // `common::model::channel_strip` の `ParamRange`。
+        AudioCommand::SetTrackStrip { track, strip } => {
+            with_track(song, track, |t| t.strip = sanitize_strip(strip));
+        }
         AudioCommand::SetTrackArmed { track, armed } => {
             with_track(song, track, |t| t.armed = armed);
         }
@@ -49,6 +55,32 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         _ => return false,
     }
     true
+}
+
+/// IPC 境界のクランプ: 各パラメータを可動範囲へ丸める。
+///
+/// 範囲外の周波数や負の時定数がそのまま係数計算に入ると、フィルタが発散して
+/// **NaN が master バスまで伝播する** (一度混ざると停止するまで無音)。
+fn sanitize_strip(mut strip: common::model::ChannelStrip) -> common::model::ChannelStrip {
+    use common::model::{CompParam, EqBand, EqParam};
+    for band in EqBand::ALL {
+        for param in [EqParam::Freq, EqParam::Gain, EqParam::Q] {
+            let v = strip.eq.param(band, param);
+            strip.eq.set_param(band, param, if v.is_finite() { v } else { 0.0 });
+        }
+    }
+    for param in [
+        CompParam::Threshold,
+        CompParam::Ratio,
+        CompParam::Attack,
+        CompParam::Release,
+        CompParam::Makeup,
+        CompParam::ScFreq,
+    ] {
+        let v = strip.comp.param(param);
+        strip.comp.set_param(param, if v.is_finite() { v } else { 0.0 });
+    }
+    strip
 }
 
 /// 安定 `Track::id` で引いて適用する (見つからなければ何もしない)。
@@ -111,5 +143,29 @@ mod tests {
         assert!(!song.tracks[0].muted);
         // 値のみ更新でないコマンドは扱わない。
         assert!(!apply(&AudioCommand::Play, &mut song));
+    }
+
+
+    /// IPC は信頼境界。壊れた値 (NaN / 範囲外) が係数計算へ入るとフィルタが発散し、
+    /// **NaN が master まで伝播して停止するまで無音**になる。ここで必ず潰す。
+    #[test]
+    fn ストリップの値は_ipc_境界で丸められる() {
+        use common::model::{ChannelStrip, EqBand, EqParam};
+
+        let mut song = Song::default();
+        song.tracks.push(Track { id: 7, ..Track::default() });
+
+        let mut strip = ChannelStrip::default();
+        strip.eq.hmf.freq_hz = f32::NAN;
+        strip.eq.hmf.gain_db = 999.0;
+        strip.comp.attack_ms = -5.0;
+        strip.comp.sc_freq_hz = 1.0; // 20Hz 未満は OFF へ
+
+        assert!(apply(&AudioCommand::SetTrackStrip { track: 7, strip }, &mut song));
+        let got = song.tracks[0].strip;
+        assert!(got.eq.param(EqBand::Hmf, EqParam::Freq).is_finite());
+        assert!((got.eq.param(EqBand::Hmf, EqParam::Gain) - 15.0).abs() < 1e-6);
+        assert!((got.comp.attack_ms - 0.1).abs() < 1e-6, "{}", got.comp.attack_ms);
+        assert_eq!(got.comp.sc_freq_hz, 0.0);
     }
 }

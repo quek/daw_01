@@ -35,8 +35,13 @@ const DRAG_THRESHOLD_PX: f32 = 4.0;
 /// 可動範囲のスイープ角 (rad) = 300° (7 時 → 5 時)。 残る 60° (5 時 → 6 時 → 7 時) は範囲外で
 /// 弧が届かない (= "切れて見える") DAW 標準の見え方。
 const SWEEP: f32 = 5.0 * PI / 3.0;
-/// 値弧 / track 弧の線幅 (px)。
+/// 値弧 / track 弧の線幅 (px)。**基準径 [`STROKE_REFERENCE_SIZE_PX`] での値**で、
+/// 実際の線幅は [`stroke_scale`] を掛けて求める。
 const ARC_WIDTH_PX: f32 = 4.0;
+/// 指針 (中心から外周へ伸びる太線) の線幅 (px)。基準径での値。
+const INDICATOR_WIDTH_PX: f32 = 4.0;
+/// 線幅を調律した基準のノブ径 (px)。mixer の pan ノブがこの径。
+const STROKE_REFERENCE_SIZE_PX: f32 = 32.0;
 /// 起点 notch の線幅 (px)。 値弧より細く、 指針より細い「パネル刻印」の太さ。
 const NOTCH_WIDTH_PX: f32 = 1.5;
 /// 弧を折れ線近似するときの 1 segment の目標弦長 (px)。 **1px を下回らせない** ことが要点
@@ -54,6 +59,20 @@ const NOTCH_INNER_PX: f32 = 3.0;
 /// センタから 1e-5 ずれただけで「センタなのに片側に 1px の欠片が光る」 のを防ぐ。 DAW 実装の
 /// 慣習値: nih-plug `ParamSlider` は 1e-3、 iced_audio の bipolar 判定は ±0.001。
 const ARC_DEAD_BAND: f32 = 1e-3;
+/// 線幅倍率の下限 / 上限。細くしすぎると line pipeline の quad が sub-pixel になって
+/// 弧が途切れ、太くしすぎると大径ノブで円面が塗り潰される。
+const STROKE_SCALE_MIN: f32 = 0.55;
+/// 線幅倍率の上限 ([`STROKE_SCALE_MIN`] 参照)。
+const STROKE_SCALE_MAX: f32 = 1.25;
+
+/// ノブ径に応じた線幅の倍率。
+///
+/// 弧も指針も刻印も **径に比例** させる。基準 (32px) で調律した太さをそのまま
+/// 20px のノブに使うと、線が太すぎて円面が潰れ「小さいノブほど塗り絵に見える」。
+/// caller に線幅を持たせないのは、同じ見た目の調律を使う側全員に写させないため。
+fn stroke_scale(size: f32) -> f32 {
+    (size / STROKE_REFERENCE_SIZE_PX).clamp(STROKE_SCALE_MIN, STROKE_SCALE_MAX)
+}
 /// knob の drag 感度 (値/px)。 **ノブの大きさに依らない定数** = 可動域全体を 250px で走る。
 ///
 /// 一次情報: x42 robtk `robtk_dial.h` の `d->base_mult *= 0.004; // 250px` (= 25〜40px の dial を
@@ -555,6 +574,9 @@ fn draw_knob<M: ?Sized + 'static>(
     let cx = rect.x + rect.w * 0.5;
     let cy = rect.y + rect.h * 0.5;
     let r = (size * 0.5 - 2.0).max(2.0); // 2px の周囲余白
+    // 線幅はノブ径に比例させる (基準 32px = mixer の pan ノブ)。
+    let lw = stroke_scale(size);
+    let arc_w = ARC_WIDTH_PX * lw;
     let circle_rect = Rect { x: cx - r, y: cy - r, w: r * 2.0, h: r * 2.0 };
 
     // Ableton 流: 中立な `control` の円 + 円周上に `accent` の arc。
@@ -611,7 +633,7 @@ fn draw_knob<M: ?Sized + 'static>(
         end_angle,
         start_angle + 2.0 * PI,
         surface_color,
-        ARC_WIDTH_PX,
+        arc_w,
     );
 
     // 1-2. 弧は 2 色で可動範囲 300° を **過不足なく 1 周** 分だけ描く:
@@ -626,14 +648,14 @@ fn draw_knob<M: ?Sized + 'static>(
     // (mixer の strip 数だけ効く)。 同じ見た目を区間分割で得られるなら分割する。
     let (fill_lo, fill_hi) = if (value - arc_origin).abs() >= ARC_DEAD_BAND {
         let (lo, hi) = (origin_angle.min(val_angle), origin_angle.max(val_angle));
-        push_arc(ui, cx, cy, arc_radius, lo, hi, active_color, ARC_WIDTH_PX);
+        push_arc(ui, cx, cy, arc_radius, lo, hi, active_color, arc_w);
         (lo, hi)
     } else {
         // 値弧なし = track が全 span (dead band 内は起点角で 0 幅の切れ目を作らない)。
         (origin_angle, origin_angle)
     };
-    push_arc(ui, cx, cy, arc_radius, start_angle, fill_lo, inactive_color, ARC_WIDTH_PX);
-    push_arc(ui, cx, cy, arc_radius, fill_hi, end_angle, inactive_color, ARC_WIDTH_PX);
+    push_arc(ui, cx, cy, arc_radius, start_angle, fill_lo, inactive_color, arc_w);
+    push_arc(ui, cx, cy, arc_radius, fill_hi, end_angle, inactive_color, arc_w);
 
     // 3. 起点 notch: 起点が可動範囲の内側 (= bipolar) のときだけ、 零点の位置を刻印する。
     //    値弧の**内縁より内側からリング外縁まで**を横切る細線で、 値弧 (2) の上に描く。
@@ -642,8 +664,8 @@ fn draw_knob<M: ?Sized + 'static>(
     if arc_origin > 0.0 && arc_origin < 1.0 {
         let dx = origin_angle.sin();
         let dy = -origin_angle.cos();
-        let inner = (arc_radius - ARC_WIDTH_PX * 0.5 - NOTCH_INNER_PX).max(1.0);
-        let outer = arc_radius + ARC_WIDTH_PX * 0.5;
+        let inner = (arc_radius - arc_w * 0.5 - NOTCH_INNER_PX * lw).max(1.0);
+        let outer = arc_radius + arc_w * 0.5;
         ui.push_lines(LineBatch {
             segments: vec![LineSegment {
                 a: [cx + dx * inner, cy + dy * inner],
@@ -651,7 +673,7 @@ fn draw_knob<M: ?Sized + 'static>(
                 color: p.text_dim,
             }]
             .into(),
-            line_width_px: NOTCH_WIDTH_PX,
+            line_width_px: NOTCH_WIDTH_PX * lw,
             clip_rect: None,
         });
     }
@@ -669,7 +691,7 @@ fn draw_knob<M: ?Sized + 'static>(
     };
     ui.push_lines(LineBatch {
         segments: vec![indicator].into(),
-        line_width_px: 4.0,
+        line_width_px: INDICATOR_WIDTH_PX * lw,
         clip_rect: None,
     });
 }
@@ -816,7 +838,9 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
                 color: ui.palette().modulation_live.with_alpha(1.0),
             }]
             .into(),
-            line_width_px: 2.5,
+            // 弧 (`arc_lw`) と同じく径に追従させる。小径ノブで指針だけ太いと
+            // 「値がどこか」より線そのものが目立つ。
+            line_width_px: (arc_lw * 0.7).max(1.0),
             clip_rect: None,
         });
     }

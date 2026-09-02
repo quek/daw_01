@@ -121,6 +121,15 @@ pub enum TrackBuiltinParam {
         #[serde(default, rename = "send_idx", skip_serializing)]
         legacy_send_idx: Option<u8>,
     },
+    /// 内蔵チャンネルストリップの EQ セクション ON/OFF (`Mute` と同じ 0.5 閾値の階段)。
+    StripEqOn,
+    /// 内蔵チャンネルストリップの Comp セクション ON/OFF。
+    StripCompOn,
+    /// 内蔵 EQ の連続パラメータ。**住所はバンドの enum** (配列 index ではない、
+    /// 不変条件 1)。レンジは `EqParam::range(band)` が SSoT。
+    StripEq { band: super::EqBand, param: super::EqParam },
+    /// 内蔵コンプの連続パラメータ。レンジは `CompParam::range()` が SSoT。
+    StripComp { param: super::CompParam },
 }
 
 /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field

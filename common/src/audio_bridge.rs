@@ -122,6 +122,11 @@ pub struct AudioBridge {
     /// its UI tick。(v29: 旧 daw_plugin_host request/ready data plane 撤去に伴い
     /// writer は daw_audio に一本化 — module doc 参照。)
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
+    /// Per-track のゲインリダクション (dB、0 以下、`f32::to_bits`)。
+    /// 内蔵チャンネルストリップのコンプが buffer ごとに書き、mixer strip の
+    /// GR メーターが読む (`docs/plan_channel_strip.md` §9)。
+    /// ストリップを持たない / バイパス中の track は常に `0.0`。
+    pub track_gr_db: [AtomicU32; MAX_TRACKS],
     /// docs/plan_modulation.md §4.2: per-`ModSource` modulator scalar
     /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer,
     /// polled by the GUI at ~30Hz alongside `track_peaks` and applied to
@@ -239,6 +244,26 @@ impl AudioBridgeHandle {
         slot[1].store(r.to_bits(), Ordering::Release);
     }
 
+    /// 全 track のメーター面 (peak + GR) を 0 に落とす。
+    ///
+    /// park (= 再生も録音もしていないので publish を止める) の直前に呼ぶ。
+    /// これが無いと GUI は最後の値を読み続け、**止まったメーターが点いたまま
+    /// 凍る**。peak と GR を別々に消すと片方だけ残るので 1 本にまとめてある。
+    pub fn clear_track_meters(&self) {
+        for i in 0..MAX_TRACKS {
+            self.set_track_peak(i, 0.0, 0.0);
+            self.set_track_gr_db(i, 0.0);
+        }
+    }
+
+    /// Publishes one track's gain reduction (dB, 0 以下)。範囲外の index は捨てる。
+    pub fn set_track_gr_db(&self, track: usize, gr_db: f32) {
+        let Some(slot) = self.bridge().track_gr_db.get(track) else {
+            return;
+        };
+        slot.store(gr_db.to_bits(), Ordering::Release);
+    }
+
     pub fn track_peak(&self, track: usize) -> (f32, f32) {
         let Some(slot) = self.bridge().track_peaks.get(track) else {
             return (0.0, 0.0);
@@ -290,13 +315,18 @@ impl AudioBridgeHandle {
         self.bridge().recording_live.load(Ordering::Acquire) != 0
     }
 
-    pub fn track_peaks(&self, out: &mut Vec<(f32, f32)>) {
+    /// Fills `out` with `(peak L, peak R, gain reduction dB)` for every track slot.
+    ///
+    /// メーター 3 値を **1 回の走査で**取る (peak と GR を別々に読むと、同じ
+    /// buffer の値かどうかの保証が無いまま 2 面を混ぜることになる)。
+    pub fn track_meters(&self, out: &mut Vec<(f32, f32, f32)>) {
         out.clear();
         for i in 0..MAX_TRACKS {
             let slot = &self.bridge().track_peaks[i];
             let l = f32::from_bits(slot[0].load(Ordering::Acquire));
             let r = f32::from_bits(slot[1].load(Ordering::Acquire));
-            out.push((l, r));
+            let gr = f32::from_bits(self.bridge().track_gr_db[i].load(Ordering::Acquire));
+            out.push((l, r, gr));
         }
     }
 

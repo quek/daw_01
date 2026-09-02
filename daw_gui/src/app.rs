@@ -131,7 +131,7 @@ impl AppData {
         // 起動時の初期プロジェクトにも安定 project_id を採番する
         // (clipboard の同一プロジェクト判定用)。
         song.ensure_project_id();
-        let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
+        let initial_peak_display = vec![(0.0, 0.0, 0.0); song.tracks.len()];
         let initial_bpm = song.bpm;
         let initial_time_sig_num = song.time_sig.0;
         let recovery_candidates = app_dirs
@@ -283,6 +283,8 @@ impl AppData {
                 snap_live_input: false,
             },
             ui_prefs: UiPrefs {
+                strip_comp_open: false,
+                strip_eq_open: false,
                 preview_window_visible: false,
                 // 既定 ON: クリップを動かしたら automation も付いてくる方が期待に近い。
                 // アプリ設定 (`AppConfig`) から復元する。
@@ -372,6 +374,7 @@ impl AppData {
                 arrangement_hover_clip: None,
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
+                mixer_hovered_strip_section: None,
                 master_gain_dragging: false,
                 voicevox_chunk_editing: false,
                 pianoroll_hover_beat: None,
@@ -1598,6 +1601,12 @@ impl AppData {
             }
             AppEvent::ToggleTrackArmed(track) => {
                 self.toggle_track_armed(track);
+            }
+            AppEvent::StripEdit { track, edit } => {
+                self.apply_strip_edit(track, &edit);
+            }
+            AppEvent::ToggleStripSection(section) => {
+                self.toggle_strip_section(section);
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);

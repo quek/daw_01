@@ -1295,6 +1295,7 @@ async fn recv_loop(
                 | AudioCommand::SetTrackPan { .. }
                 | AudioCommand::SetTrackMuted { .. }
                 | AudioCommand::SetTrackSolo { .. }
+                | AudioCommand::SetTrackStrip { .. }
                 | AudioCommand::SetTrackArmed { .. }
                 | AudioCommand::SetSendGain { .. }
                 | AudioCommand::SetSendEnabled { .. }
@@ -2131,9 +2132,7 @@ fn build_stream(
                         // r.md #50 のマスターメーターはここで何もしない: 解析器は
                         // 「新しいフレームが来なかった経過時間ぶんの無音」を自分で
                         // 流し込んで落ちるので、書き手側の後始末が要らない。
-                        for t in 0..common::audio_bridge::MAX_TRACKS {
-                            bridge.set_track_peak(t, 0.0, 0.0);
-                        }
+                        bridge.clear_track_meters();
                         dsp_load_ema = 0.0;
                         metrics.set_dsp_load_avg(0.0);
                     }

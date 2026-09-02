@@ -1035,12 +1035,23 @@ pub enum AppEvent {
     ResetTrackClipColors { track: u32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
+    /// 内蔵チャンネルストリップ (コンプ + EQ) の編集
+    /// (`docs/plan_channel_strip.md`)。**中身はサブ enum 側**が持つ
+    /// ([`StripEdit`]) — ノブ 1 個ごとに variant を並べると、ここの巨大 match が
+    /// さらに 20 行伸びる。Undo 対象 (= 曲の中身が変わる)。
+    StripEdit { track: u32, edit: StripEdit },
+    /// EQ / Comp セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
+    /// 見方の都合なので `UiPrefs` (session-only) に持ち、dirty を立てず Undo にも
+    /// 積まない (`collapsed_groups` と同じ扱い)。
+    ToggleStripSection(StripSection),
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
     /// caller 側で前状態を反転、 audio engine には `AudioCommand::SetTrackArmed`
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
-    TrackPeaksTick(Vec<(f32, f32)>),
+    /// per-track のメーター値 `(peak L, peak R, ゲインリダクション dB)`。
+    /// GR は内蔵チャンネルストリップのコンプが出す (0 以下、掛かっていなければ 0)。
+    TrackPeaksTick(Vec<(f32, f32, f32)>),
     /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
     /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`
     /// を ~30Hz で読んだもの。
@@ -1793,6 +1804,7 @@ impl AppEvent {
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",
             E::SetTrackPan { .. } => "パン変更",
+            E::StripEdit { edit, .. } => edit.undo_label(),
             E::ToggleTrackMute(..) => "ミュート切替",
             E::ToggleTrackSolo(..) => "ソロ切替",
             E::SetMasterGain(..) => "マスターゲイン変更",
@@ -1902,6 +1914,80 @@ impl AppEvent {
             _ => "編集",
         }
     }
+}
+
+/// 内蔵チャンネルストリップの 1 操作 ([`AppEvent::StripEdit`] の中身)。
+///
+/// 連続パラメータは `TrackBuiltinParam` をそのまま住所に使う — オートメーション
+/// / 変調の target と同じ型なので、「ノブが動かす値」と「レーンが動かす値」が
+/// 構造的に一致する (対応表を 2 つ持たない)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum StripEdit {
+    /// 連続パラメータ (EQ の Freq/Gain/Q、Comp の Thr/Ratio/Atk/Rel/Gain/SC) と
+    /// セクションのバイパス。値は plain 単位で、可動範囲へは model 側がクランプする。
+    Param { param: common::model::TrackBuiltinParam, value: f32 },
+    /// オートメーションに載せないスイッチ (バンドの ON、シェルフ/ベル、SC Listen)。
+    Switch { switch: StripSwitch, on: bool },
+    /// コンプの動作モード (Leveler / Compressor / Limiter)。
+    CompMode(common::model::CompMode),
+}
+
+impl StripEdit {
+    /// この操作が「どちらのセクションの中身を触ったか」。
+    ///
+    /// 触られたセクションは handler が自動で ON にする (バイパス中にノブを回して
+    /// 無音のままだと、操作が効かなかったようにしか見えない)。**バイパス
+    /// トグルそのもの** (`StripEqOn` / `StripCompOn`) は明示指定なので `None`。
+    #[must_use]
+    pub fn section_touched(&self) -> Option<StripSection> {
+        match self {
+            Self::Param { param, .. } => match param {
+                common::model::TrackBuiltinParam::StripEq { .. } => Some(StripSection::Eq),
+                common::model::TrackBuiltinParam::StripComp { .. } => Some(StripSection::Comp),
+                _ => None,
+            },
+            Self::Switch { switch, .. } => match switch {
+                StripSwitch::BandOn(_) | StripSwitch::Bell(_) => Some(StripSection::Eq),
+                // 検出信号の試聴はコンプが動いていないと意味がない。
+                StripSwitch::ScListen => Some(StripSection::Comp),
+            },
+            Self::CompMode(_) => Some(StripSection::Comp),
+        }
+    }
+
+    #[must_use]
+    pub fn undo_label(&self) -> &'static str {
+        match self {
+            Self::Param { param, .. } => match param {
+                common::model::TrackBuiltinParam::StripCompOn
+                | common::model::TrackBuiltinParam::StripComp { .. } => "コンプ変更",
+                _ => "EQ 変更",
+            },
+            Self::Switch { switch, .. } => match switch {
+                StripSwitch::ScListen => "検出信号の試聴",
+                StripSwitch::BandOn(_) | StripSwitch::Bell(_) => "EQ 変更",
+            },
+            Self::CompMode(_) => "コンプ変更",
+        }
+    }
+}
+
+/// オートメーション対象にしないストリップのスイッチ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripSwitch {
+    /// EQ 1 バンドの ON/OFF (HP / LP は既定 OFF)。
+    BandOn(common::model::EqBand),
+    /// 両端バンドのシェルフ ⇄ ベル切替。
+    Bell(common::model::EqBand),
+    /// 検出信号そのものをモニタへ出す。**同時に 1 トラックだけ** (solo と同じ)。
+    ScListen,
+}
+
+/// mixer strip で開閉するセクション (全 ch 一括)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripSection {
+    Comp,
+    Eq,
 }
 
 /// r.md #67: カーソルキー 1 押しでノートが動く / 伸びる量。

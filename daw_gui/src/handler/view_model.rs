@@ -240,7 +240,8 @@ impl AppData {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let (l, r) = self.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0));
+                let (l, r, gr) =
+                    self.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
                 TrackMixEntry {
                     index: i as u32,
                     track_id: t.id,
@@ -258,6 +259,7 @@ impl AppData {
                     solo: t.solo,
                     peak_l_raw: l,
                     peak_r_raw: r,
+                    gain_reduction_db: gr,
                     is_group: is_group_set.contains(&t.id),
                     is_return: is_return_set.contains(&t.id),
                     depth: compute_depth(t.id),

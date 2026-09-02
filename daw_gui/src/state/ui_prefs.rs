@@ -16,6 +16,12 @@ pub struct UiPrefs {
     /// session-only: プロジェクト load / New で clear、 track 削除 / ungroup /
     /// undo-redo 後の照合で生存 id へ prune。 save / Undo 対象外。
     pub collapsed_groups: std::collections::HashSet<u32>,
+    /// mixer strip の Comp セクションを開いているか (**全 ch 一括**、
+    /// `docs/plan_channel_strip.md` §4)。既定は折り畳み。
+    /// session-only: 保存 / Undo 対象外 (見方の都合)。
+    pub strip_comp_open: bool,
+    /// mixer strip の EQ セクションを開いているか (同上)。
+    pub strip_eq_open: bool,
     /// gui_01 #028 (M14 Phase 63n-1): automation lane 群を **展開中** の
     /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
     /// `automation_lanes_collapsed = true` を widget へ渡す。 `+` / `-` click

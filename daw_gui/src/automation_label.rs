@@ -22,6 +22,22 @@ pub fn automation_target_display_name(
             // の pure label なので id をそのまま出す)。
             format!("Send {send_id}")
         }
+        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。ラベルは strip の
+        // ノブ表記と同じ短縮形を組み合わせる ("EQ HMF Freq" / "Comp Thr")。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEqOn) => "EQ On".into(),
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripCompOn) => "Comp On".into(),
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
+            use common::model::EqParam;
+            let p = match param {
+                EqParam::Freq => "Freq",
+                EqParam::Gain => "Gain",
+                EqParam::Q => "Q",
+            };
+            format!("EQ {} {p}", band.label())
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
+            format!("Comp {}", param.label())
+        }
         AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
         AutomationTarget::SongTempo => "Tempo".into(),
         AutomationTarget::SongTimeSigNumerator => "Time Sig".into(),

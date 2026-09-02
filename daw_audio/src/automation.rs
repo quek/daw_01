@@ -13,7 +13,7 @@
 
 use common::automation::apply_modulation_with;
 use common::mod_plane::ModTickPlaneRef;
-use common::model::{AutomationTarget, Song, TrackBuiltinParam};
+use common::model::{AutomationTarget, ChannelStrip, Song, Track, TrackBuiltinParam};
 use common::process_data::ProcessData;
 
 use crate::launcher::TrackRows;
@@ -144,6 +144,76 @@ pub fn fill_track_param_ramps(
         pan_per_sample,
         track_pan,
     );
+}
+
+/// この buffer で実際に効く **チャンネルストリップ設定**を解決する
+/// (`docs/plan_channel_strip.md` §7)。
+///
+/// 出発点は `track.strip` の静的値。そこへ (1) 有効なオートメーションレーンの
+/// カーブ値、(2) `mod_routings` の変調 を順に重ねる。target ↔ フィールドの対応は
+/// `ChannelStrip::{target_value, set_target_value}` が SSoT なので、ここは
+/// 「どの target を、どの順で解決するか」だけを持つ。
+///
+/// **block-rate (buffer 先頭で 1 回)**。EQ 係数とコンプの時定数は buffer ごとに
+/// 組み直すので、サンプル単位のランプは要らない (音量 / パンと違い、係数を
+/// サンプルごとに引き直す意味が無い)。
+///
+/// RT 安全: 確保・ロックなし。`ChannelStrip` は `Copy` の値型。
+pub fn resolve_track_strip(
+    song: &Song,
+    track: &Track,
+    rows: TrackRows<'_>,
+    playhead_beats: f64,
+    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    mod_plane: ModTickPlaneRef<'_>,
+) -> ChannelStrip {
+    let mut strip = track.strip;
+    if track.automation_lanes.is_empty() && track.mod_routings.is_empty() {
+        return strip;
+    }
+
+    // (1) レーン: 有効かつ録音中でないものだけがカーブ値で上書きする
+    // (録音中は GUI のノブ操作を素通しさせる = fill_track_param_ramps と同じ規則)。
+    for (li, lane) in track.automation_lanes.iter().enumerate() {
+        let AutomationTarget::TrackBuiltin(param) = &lane.target else {
+            continue;
+        };
+        if !lane.enabled || strip.target_value(param).is_none() {
+            continue;
+        }
+        if recording_lanes.iter().any(|(t, tg)| *t == track.id && *tg == lane.target) {
+            continue;
+        }
+        let phase = phase_at_frame(rows.lane(li), 0);
+        let v = lane_value(lane, &song.clip_contents, phase, playhead_beats);
+        #[allow(clippy::cast_possible_truncation)]
+        strip.set_target_value(param, v as f32);
+    }
+
+    // (2) 変調: base は (1) まで解決済みの現在値。`apply_modulation_with` は
+    // 同じ target の routing を内部で全部畳むので、target ごとに 1 度だけ呼ぶ
+    // (同じ target の 2 本目以降は skip)。
+    for (i, routing) in track.mod_routings.iter().enumerate() {
+        let AutomationTarget::TrackBuiltin(param) = &routing.target else {
+            continue;
+        };
+        let Some(base) = strip.target_value(param) else {
+            continue;
+        };
+        if track.mod_routings[..i].iter().any(|q| q.target == routing.target) {
+            continue;
+        }
+        let v = apply_modulation_with(
+            &routing.target,
+            f64::from(base),
+            &track.mod_routings,
+            |id| mod_plane.scalar_at_frame(id, 0),
+            |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        strip.set_target_value(param, v as f32);
+    }
+    strip
 }
 
 /// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
@@ -688,6 +758,81 @@ mod tests {
     /// One track (id 7) with a single `PluginParam` (device_id 40, param 5)
     /// automation lane ramping 0.25 → 0.75 over beats 0..4.
     const DEVICE_ID: u64 = 40;
+
+    /// レーンとノブ (静的値) の優先順位: 有効なレーンがあればカーブ値が勝ち、
+    /// 録音中はノブが素通しになる (= `fill_track_param_ramps` と同じ規則)。
+    #[test]
+    fn ストリップのレーンはカーブ値で上書きし録音中は素通しする() {
+        use common::model::{CompParam, EqBand, EqParam};
+
+        let target =
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param: CompParam::Threshold });
+        let mut song = Song { bpm: 120.0, ..Song::default() };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![AutomationPoint {
+                    id: 1,
+                    time_beat: 0.0,
+                    // 正規化 0.5 = -30dB (Threshold は -60..0 の線形)。
+                    value: -30.0,
+                    curve: AutomationCurve::Linear,
+                }],
+                next_point_id: 2,
+            }),
+        );
+        let lane = AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "thr".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+                content_offset_beats: 0.0,
+            }],
+            next_clip_id: 2,
+            ..AutomationLane::new(target.clone(), -30.0)
+        };
+        song.tracks.push(track(|t| {
+            t.id = 1;
+            t.strip.comp.on = true;
+            t.strip.comp.threshold_db = -6.0;
+            // EQ の値はレーンが無いので静的値のまま残ること (巻き添え確認)。
+            t.strip.eq.hmf.gain_db = 4.0;
+            t.automation_lanes = vec![lane];
+            t.next_lane_id = 2;
+        }));
+
+        let empty = empty_recording_lanes();
+        let resolved = resolve_track_strip(
+            &song,
+            &song.tracks[0],
+            TrackRows::default(),
+            0.0,
+            &empty,
+            ModTickPlaneRef::default(),
+        );
+        assert!((resolved.comp.threshold_db - -30.0).abs() < 1e-4, "{}", resolved.comp.threshold_db);
+        assert!(
+            (resolved.eq.param(EqBand::Hmf, EqParam::Gain) - 4.0).abs() < 1e-6,
+            "レーンの無い param まで書き換わっている"
+        );
+
+        // 録音中 (= ノブを掴んでいる) はカーブを評価せず静的値が残る。
+        let mut recording = std::collections::HashSet::new();
+        recording.insert((1_u32, target));
+        let touched = resolve_track_strip(
+            &song,
+            &song.tracks[0],
+            TrackRows::default(),
+            0.0,
+            &recording,
+            ModTickPlaneRef::default(),
+        );
+        assert!((touched.comp.threshold_db - -6.0).abs() < 1e-6, "{}", touched.comp.threshold_db);
+    }
 
     fn one_plugin_param_lane_song() -> Song {
         let mut song = Song {

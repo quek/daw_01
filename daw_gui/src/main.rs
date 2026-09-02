@@ -428,7 +428,8 @@ fn spawn_playhead_poller(
     awake: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
+        let mut peaks_buf: Vec<(f32, f32, f32)> =
+            Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf = common::mod_plane::ModPlane::with_capacity(
             common::audio_bridge::MAX_MOD_SOURCES,
         );
@@ -519,7 +520,7 @@ fn spawn_playhead_poller(
             {
                 break;
             }
-            bridge.track_peaks(&mut peaks_buf);
+            bridge.track_meters(&mut peaks_buf);
             // `peaks_buf` を毎 tick clone せず move でイベントに渡す。 次 tick の
             // `track_peaks` が `out.clear()` + push で再充填するので、 take 後に
             // 空になっても問題ない。 clone の memcpy を省く効果のみ (take は

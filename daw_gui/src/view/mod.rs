@@ -36,6 +36,7 @@ pub mod shortcuts;
 pub mod shortcuts_help;
 pub mod snap;
 pub mod status_bar;
+pub mod strip_sections;
 pub mod track_color;
 pub mod undo_history;
 pub mod track_inspector;

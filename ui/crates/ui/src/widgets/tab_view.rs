@@ -14,7 +14,11 @@ use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 use crate::id::WidgetId;
 use crate::ui::Ui;
 
-const TAB_BAR_H: f32 = 32.0;
+/// タブバー (見出し行) の高さ。中身の pane はこの下から始まる。
+///
+/// 呼び出し側が「pane に何 px 残るか」を先に知りたいことがある (例: 中身の
+/// 必要高からウィンドウ分割比を決める) ので公開する。
+pub const TAB_BAR_H: f32 = 32.0;
 const TAB_FONT: f32 = 14.0;
 const TAB_PAD_X: f32 = 16.0;
 

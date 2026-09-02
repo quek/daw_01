@@ -348,6 +348,108 @@ impl AppData {
         });
     }
 
+    // -------- 内蔵チャンネルストリップ (docs/plan_channel_strip.md) ---------
+
+    /// ストリップの 1 操作を適用する。
+    ///
+    /// 経路は音量 / パンと同じ 3 段: `edit_song_checked` (undo / dirty / epoch) →
+    /// `AudioCommand::SetTrackStrip` (値のみ更新、graph は再 compile しない) →
+    /// `last_touched_param` (= `A` キーでオートメーションレーンを生やす起点)。
+    ///
+    /// 「どのフィールドを触るか」は `ChannelStrip::set_target_value` が SSoT なので、
+    /// ここは **どのトラックへ / どの副作用を出すか**だけを持つ。
+    pub(crate) fn apply_strip_edit(&mut self, track_id: u32, edit: &StripEdit) {
+        if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
+            return;
+        }
+        // SC Listen は solo と同じ排他: 別トラックで点いていたら必ず消す
+        // (2 本同時に検出信号を出すと、何を聴いているのか分からなくなる)。
+        let exclusive_listen =
+            matches!(edit, StripEdit::Switch { switch: StripSwitch::ScListen, on: true });
+        // 消灯させる相手は編集**前**に読む (編集後は全部 false になっていて
+        // 「誰を送り直すべきか」が分からなくなる)。
+        let listen_cleared: Vec<u32> = if exclusive_listen {
+            self.song_doc
+                .song()
+                .tracks
+                .iter()
+                .filter(|t| t.id != track_id && t.strip.comp.sc_listen)
+                .map(|t| t.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        self.edit_song_checked(|song| {
+            let mut changed = false;
+            if exclusive_listen {
+                for t in song.tracks.iter_mut().filter(|t| t.id != track_id) {
+                    changed |= std::mem::replace(&mut t.strip.comp.sc_listen, false);
+                }
+            }
+            let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return changed;
+            };
+            let before = track.strip;
+            match edit {
+                StripEdit::Param { param, value } => {
+                    track.strip.set_target_value(param, *value);
+                }
+                StripEdit::Switch { switch, on } => match switch {
+                    StripSwitch::BandOn(band) => track.strip.eq.band_mut(*band).on = *on,
+                    StripSwitch::Bell(band) => track.strip.eq.band_mut(*band).bell = *on,
+                    StripSwitch::ScListen => track.strip.comp.sc_listen = *on,
+                },
+                StripEdit::CompMode(mode) => track.strip.comp.mode = *mode,
+            }
+            // セクションの中身を触ったら、そのセクションを **自動で ON** にする。
+            // バイパス中のノブを回して「何も起きない」のは操作の取りこぼしにしか
+            // 見えないため。バイパスそのものの操作 (`StripEqOn` / `StripCompOn`、
+            // = `Q` キー) はユーザーの明示指定なのでここから除く
+            // (`StripEdit::section_touched` が `None` を返す)。
+            match edit.section_touched() {
+                Some(StripSection::Eq) => track.strip.eq.on = true,
+                Some(StripSection::Comp) => track.strip.comp.on = true,
+                None => {}
+            }
+            changed || track.strip != before
+        });
+
+        // **変わったトラックだけ** audio へ送る。操作対象に加えて、SC Listen の
+        // 排他で消灯させた側も送らないと engine 側では 2 本鳴ったままになる。
+        // 全トラックを送ると 1 クリックで 32 通の IPC が飛ぶので、消灯対象は
+        // 編集前に読んだ id (`listen_cleared`) に限る。
+        for id in listen_cleared.into_iter().chain(std::iter::once(track_id)) {
+            if let Some(t) = self.song_doc.song().track_by_id(id) {
+                let strip = t.strip;
+                self.send_audio(AudioCommand::SetTrackStrip { track: id, strip });
+            }
+        }
+
+        // 連続パラメータだけ last-touched に載せる (`A` キーでレーンを作る対象)。
+        // スイッチ / モードはオートメーション対象ではないので載せない。
+        if let StripEdit::Param { param, .. } = edit {
+            let target = common::model::AutomationTarget::TrackBuiltin(*param);
+            self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+                track_id,
+                display_name: crate::automation_label::automation_target_display_name(&target),
+                target,
+                touched_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    /// EQ / Comp セクションの開閉 (全 ch 一括)。`UiPrefs` だけを触るので
+    /// dirty も Undo も動かさない (`docs/plan_channel_strip.md` §8)。
+    pub(crate) fn toggle_strip_section(&mut self, section: StripSection) {
+        match section {
+            StripSection::Comp => {
+                self.ui_prefs.strip_comp_open = !self.ui_prefs.strip_comp_open;
+            }
+            StripSection::Eq => self.ui_prefs.strip_eq_open = !self.ui_prefs.strip_eq_open,
+        }
+    }
+
     // -------- Aux send / return -------------------------------------------
 
     /// Ableton "Add Return" 相当。 master 直下の通常 track を 1 本作って
@@ -616,16 +718,23 @@ impl AppData {
         }
     }
 
-    pub(crate) fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {
+    /// audio から届いた per-track メーター値を表示用の弾道に通す。
+    ///
+    /// 3 つ目は内蔵チャンネルストリップのゲインリダクション。engine は
+    /// 「buffer 内で最も深かった量」を **0 以下の dB** で publish するので、
+    /// ここで正の減衰量へ反転してから peak と同じ release で 0 へ戻す
+    /// (メーターが 1 buffer だけ跳ねて消えるのを防ぐ)。
+    pub(crate) fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32, f32)]) {
         const RELEASE: f32 = 0.85;
         let n = self.song_doc.song().tracks.len();
         if self.transport.track_peak_display.len() != n {
-            self.transport.track_peak_display.resize(n, (0.0, 0.0));
+            self.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));
         }
         for (i, d) in self.transport.track_peak_display.iter_mut().enumerate() {
-            let (l, r) = peaks.get(i).copied().unwrap_or((0.0, 0.0));
+            let (l, r, gr_db) = peaks.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
             d.0 = common::meter::update_peak(d.0, l, RELEASE);
             d.1 = common::meter::update_peak(d.1, r, RELEASE);
+            d.2 = common::meter::update_peak(d.2, (-gr_db).max(0.0), RELEASE);
         }
     }
 

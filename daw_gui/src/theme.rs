@@ -98,6 +98,12 @@ palette! {
         strip_return_bg: Color::rgb(0.18, 0.28, 0.22), srgb(0.863, 0.922, 0.878);
         /// returns 帯と通常帯を分ける縦 divider。
         strip_return_divider: Color::rgb(0.30, 0.40, 0.32), srgb(0.561, 0.690, 0.604);
+        /// 内蔵チャンネルストリップの EQ カーブ線 (docs/plan_channel_strip.md §3)。
+        /// automation (藤) / fx タグ (青) と衝突しない teal に置く。
+        strip_eq_curve: Color::rgb(0.40, 0.85, 0.80), srgb(0.043, 0.451, 0.420);
+        /// 内蔵コンプの GR メーターの塗り。減衰量 = 「熱」なので暖色、ただし
+        /// record (赤) / solo (黄) の予約色とは別の琥珀。
+        strip_gr: Color::rgb(0.95, 0.62, 0.28), srgb(0.729, 0.388, 0.031);
 
         // ===== ピアノロール =====
 

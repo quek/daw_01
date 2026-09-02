@@ -36,12 +36,18 @@ const H: u32 = 900;
 /// 下のアサーションが落ちるので、 定数の意図しない変更も検知できる。
 const STRIP_WIDTH: f32 = 80.0;
 const KNOB_SIZE: f32 = 32.0;
+/// strip 上端から「既存 strip の中身」が始まるまでの距離 (px)。
+/// docs/plan_channel_strip.md: 内蔵チャンネルストリップの **常設サムネイル帯**
+/// (EQ カーブ + GR) が必ず上端に乗る。EQ / Comp セクションはこのテストでは
+/// 折り畳んだまま (`UiPrefs` の既定) なので、頭は帯 1 本ぶん。
+const STRIP_HEAD_H: f32 = daw_gui::view::strip_sections::THUMB_H;
 /// strip 上端から pan 数値の **文字の top** までの距離 (px)。
-/// `pad 6 + 名前 18 + M/S 22 + 余白 6` で pan 行 (= ノブ 32px) が始まり、 数値欄 (16px) は
-/// ノブと縦センタなので `+8`、 その中で 1 行 (font 10 → 12px) が縦センタなので `+2`。
-const READOUT_TOP_IN_STRIP: f32 = 6.0 + 18.0 + 22.0 + 6.0 + 8.0 + 2.0;
+/// 頭の帯 + `pad 6 + 名前 18 + M/S 22 + 余白 6` で pan 行 (= ノブ 32px) が始まり、
+/// 数値欄 (16px) はノブと縦センタなので `+8`、 その中で 1 行 (font 10 → 12px) が
+/// 縦センタなので `+2`。
+const READOUT_TOP_IN_STRIP: f32 = STRIP_HEAD_H + 6.0 + 18.0 + 22.0 + 6.0 + 8.0 + 2.0;
 /// strip 上端から pan 行 (= ノブの rect 上端) までの距離 (px)。
-const KNOB_TOP_IN_STRIP: f32 = 6.0 + 18.0 + 22.0 + 6.0;
+const KNOB_TOP_IN_STRIP: f32 = STRIP_HEAD_H + 6.0 + 18.0 + 22.0 + 6.0;
 /// strip 左端から pan 行の左端 (= ノブの rect 左端) までの距離 (px)。
 /// `(STRIP_WIDTH - PAN_ROW_W) / 2` = `(80 - 66) / 2`。
 const KNOB_LEFT_IN_STRIP: f32 = 7.0;

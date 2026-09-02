@@ -105,6 +105,12 @@ pub struct UiEphemeral {
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
     /// strip は solo を持たないので None 扱い。
     pub mixer_hovered_track: Option<u32>,
+    /// mixer strip の内蔵チャンネルストリップ帯で、いまカーソルが乗っている
+    /// `(track_id, セクション)` (`docs/plan_channel_strip.md`)。常設帯 (GR / カーブ) と
+    /// 開いているセクションの両方が対象。`Q` (mute) がこれを見て、トラックの mute
+    /// ではなく **そのセクションのバイパス**を切り替える。
+    /// 算出は `view::strip_sections` の 1 か所 (SSoT)、strip 外は `None`。
+    pub mixer_hovered_strip_section: Option<(u32, crate::event::StripSection)>,
     /// マスターフェーダーを掴んでいるか (undo gesture の edge 検出用)。
     /// `Song.master_gain` を編集するようになったので、drag 全体を 1 undo step に
     /// bracket しないと per-frame の編集が履歴を埋める (group transform /
