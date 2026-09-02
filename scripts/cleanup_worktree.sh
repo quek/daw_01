@@ -254,11 +254,15 @@ remove_one() {
     #   * target/ build caches -- including NESTED ones such as ui/target/, hence the
     #     (.*/)? prefix (a bare `target/` anchor missed ui/target/ and skipped every wt).
     #   * third_party/ (vendored ffmpeg, a real copy restorable via `make fetch-ffmpeg`).
+    #   * __pycache__/ (any depth) -- Python bytecode cache that `make arch-lint` /
+    #     `scripts/loc_budget.py` leave behind in scripts/. Same class as target/:
+    #     regenerated on the next run, never a deliverable. Without this exclusion
+    #     every worktree that ever ran arch-lint was SKIPped (2026-09-02, 8 of 12).
     #   * .claude/settings.local.json -- the gitignored, harness-synced per-machine
     #     permissions allowlist. It exists in EVERY worktree, so without this exclusion
     #     `--all` always finds a "leftover" and skips every worktree (the bug behind
     #     "make worktree-rm-merged したけど消えなかった"). It is config, not a deliverable.
-    if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null | grep -vE '^!! ((.*/)?target/|third_party/|\.claude/settings\.local\.json$)')" ]; then
+    if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null | grep -vE '^!! ((.*/)?target/|(.*/)?__pycache__/|third_party/|\.claude/settings\.local\.json$)')" ]; then
       log "SKIP (uncommitted or unsaved gitignored changes, use --force): $wt"; return
     fi
   fi

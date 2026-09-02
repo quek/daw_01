@@ -18,7 +18,9 @@
 #                      indistinguishable from a fresh worktree, user chose to remove),
 #                      E dirty (tracked) skipped, I_notes dirty gitignored deliverable
 #                      skipped, I_target dirty regenerable-ignored (target/) NOT a
-#                      blocker -> removed, I_local machine-local config
+#                      blocker -> removed, I_pycache dirty nested regenerable-ignored
+#                      (scripts/__pycache__/, left by arch-lint) NOT a blocker -> removed,
+#                      I_local machine-local config
 #                      (.claude/settings.local.json, present in EVERY real worktree)
 #                      NOT a blocker -> removed, F orphan (no merge-base) kept,
 #                      L locked-without-pid conservatively skipped, L_STALE locked by a
@@ -38,7 +40,16 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cleanup="$here/cleanup_worktree.sh"
 [ -f "$cleanup" ] || { echo "FATAL: cannot find $cleanup" >&2; exit 2; }
 
-scratch="$(mktemp -d)"
+# scratch は **checkout 内 (target/)** に取る。`mktemp -d` の /tmp は使わない:
+# make 配下では bash が MSYS2 runtime、PATH の coreutils (mkdir / find / mktemp) が
+# Git for Windows runtime になり、両者の `/tmp` マウント先が別 (MSYS2 = C:\msys64\tmp、
+# Git = %TEMP% 由来) なので、`mkdir -p /tmp/x` は成功するのに bash のリダイレクト
+# `> /tmp/x/f` が "No such file" になる。実パス (F:/...) なら runtime が違っても一致する。
+# 直接 bash から回すと両方 Git runtime で揃うため再現しない (2026-09-02 に make 経由でだけ
+# 「非 empty な orphan dir が消された」と誤検出して発覚)。
+scratch_root="$here/../target"
+mkdir -p "$scratch_root"
+scratch="$(mktemp -d "$scratch_root/wt-test.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 
 fail=0
@@ -81,11 +92,15 @@ C0="$(git -C "$scratch" rev-parse HEAD)"
 # We ALSO track a real file under .claude/ (mirroring the repo's .claude/settings.json):
 # without a tracked sibling, git collapses an all-ignored dir to "!! .claude/" instead
 # of reporting "!! .claude/settings.local.json", and the I_local scenario would not
-# exercise the actual path the exclusion regex matches.
-printf 'notes.md\ntarget/\nthird_party/\n.claude/settings.local.json\n' > "$scratch/.gitignore"
-mkdir -p "$scratch/.claude"
+# exercise the actual path the exclusion regex matches. Same for scripts/: the real
+# repo tracks scripts/loc_budget.py next to the __pycache__/ it leaves behind, so git
+# reports "!! scripts/__pycache__/" (not a collapsed "!! scripts/") -- I_pycache must
+# hit that shape.
+printf 'notes.md\ntarget/\n__pycache__/\nthird_party/\n.claude/settings.local.json\n' > "$scratch/.gitignore"
+mkdir -p "$scratch/.claude" "$scratch/scripts"
 printf '{}\n' > "$scratch/.claude/settings.json"
-git -C "$scratch" add .gitignore .claude/settings.json
+printf '# stub\n' > "$scratch/scripts/loc_budget.py"
+git -C "$scratch" add .gitignore .claude/settings.json scripts/loc_budget.py
 git -C "$scratch" commit -q -m "add .gitignore"
 GI="$(git -C "$scratch" rev-parse HEAD)"
 
@@ -162,6 +177,7 @@ git -C "$scratch" checkout -q main
 # every worktree ("make worktree-rm-merged したけど消えなかった").
 git -C "$scratch" branch ignNotes "$GI"
 git -C "$scratch" branch ignTarget "$GI"
+git -C "$scratch" branch ignPycache "$GI"
 git -C "$scratch" branch ignLocal "$GI"
 
 # Scenario L "locked": content-merged + clean, but git-locked with NO reason. A lock
@@ -202,6 +218,7 @@ git -C "$scratch" worktree add -q "$(wt G)" netG
 git -C "$scratch" worktree add -q "$(wt H)" featH
 git -C "$scratch" worktree add -q "$(wt I_notes)" ignNotes
 git -C "$scratch" worktree add -q "$(wt I_target)" ignTarget
+git -C "$scratch" worktree add -q "$(wt I_pycache)" ignPycache
 git -C "$scratch" worktree add -q "$(wt I_local)" ignLocal
 git -C "$scratch" worktree add -q "$(wt L)" lockL
 git -C "$scratch" worktree add -q "$(wt L_STALE)" lockStale
@@ -213,6 +230,8 @@ printf 'dirty\n' >> "$(wt E)/base"                 # E: uncommitted TRACKED chan
 printf 'precious notes\n' > "$(wt I_notes)/notes.md"   # I_notes: gitignored deliverable
 mkdir -p "$(wt I_target)/target"
 printf 'cache\n' > "$(wt I_target)/target/out.bin"     # I_target: regenerable ignored only
+mkdir -p "$(wt I_pycache)/scripts/__pycache__"
+printf 'pyc\n' > "$(wt I_pycache)/scripts/__pycache__/loc_budget.cpython-312.pyc"  # I_pycache: nested regenerable ignored only
 mkdir -p "$(wt I_local)/.claude"
 printf '{}\n' > "$(wt I_local)/.claude/settings.local.json"  # I_local: machine-local config only
 printf 'det work\n' > "$(wt DET)/det.txt"              # DET: commit unique to detached HEAD
@@ -225,9 +244,22 @@ git -C "$scratch" worktree lock "$(wt L)"
 # at /proc/<pid>/winpid); on Linux/macOS it uses kill -0 on the native pid directly. The
 # LIVE pid is this test shell ($$, alive for the whole run); the DEAD pid is a throwaway
 # process we spawn and immediately reap.
-native_pid() { if [ -r "/proc/$1/winpid" ]; then cat "/proc/$1/winpid"; else printf '%s' "$1"; fi; }
+# /proc は **bash の組み込み** (`[ -r ]` / `read`) で開く。PATH 上の `cat` は別 runtime
+# (make 配下では Git の coreutils、シェルは MSYS2 の bash) になりうるので、pid 空間が
+# 合わず「/proc/<pid>/winpid: No such file」になる。組み込みなら常にシェル自身の runtime。
+native_pid() {
+  local w
+  if [ -r "/proc/$1/winpid" ] && read -r w < "/proc/$1/winpid" 2>/dev/null; then
+    printf '%s' "$w"
+  else
+    printf '%s' "$1"
+  fi
+}
 live_pid="$(native_pid "$$")"
-sleep 60 & dead_bg=$!
+# 捨てプロセスは **このシェルと同じ bash** で起こす。素の `sleep &` は PATH 上の (Git
+# runtime の) sleep になり、MSYS2 bash の /proc にはそのプロセスが載らないので
+# `/proc/<pid>/winpid` が読めず、dead pid が取れない (make 配下でだけ起きる runtime 混在)。
+"$BASH" -c 'exec sleep 60' & dead_bg=$!
 dead_pid="$(native_pid "$dead_bg")"
 kill "$dead_bg" 2>/dev/null; wait "$dead_bg" 2>/dev/null
 git -C "$scratch" worktree lock --reason "claude session L_STALE (pid $dead_pid start 0)" "$(wt L_STALE)"
@@ -263,6 +295,7 @@ wt_gone    "$(wt H)"  && pass "H squash-merged removed (patch-id)"   || die "H s
                       && pass "H squashed content survives in main"  || die "H squashed content MISSING from main (DATA LOSS)"
 wt_present "$(wt I_notes)"  && pass "I_notes dirty-gitignored kept"  || die "I_notes WRONGLY removed (lost notes.md)"
 wt_gone    "$(wt I_target)" && pass "I_target (only target/) removed" || die "I_target NOT removed (regenerable ignored should not block)"
+wt_gone    "$(wt I_pycache)" && pass "I_pycache (only scripts/__pycache__/) removed" || die "I_pycache NOT removed (nested __pycache__ should not block)"
 wt_gone    "$(wt I_local)"  && pass "I_local (only .claude/settings.local.json) removed" || die "I_local NOT removed (machine-local config should not block)"
 wt_present "$(wt L)"  && pass "L locked-without-pid kept"            || die "L locked-without-pid WRONGLY removed"
 wt_gone    "$(wt L_STALE)" && pass "L_STALE stale-locked (dead pid) auto-cleared -> removed" || die "L_STALE stale-locked NOT removed (auto-unlock regression)"
