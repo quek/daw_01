@@ -338,8 +338,9 @@ fn edge_autoscroll(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
             applied_beat_px = adx;
             ui.push_edit({
                 let v_b = new_start;
+                // 端スクロールは「運んでいる」だけなので追従を解除しない (`AutoScrollArrange`)。
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetArrangeScroll(v_b as f32));
+                    app.handle_event(AppEvent::AutoScrollArrange(v_b as f32));
                 })
             });
         }

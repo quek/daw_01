@@ -162,7 +162,7 @@ FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                        
 # コントロール (グローバルローンチ量子化 / アレンジに戻す) を足す前に、
 # 左詰め列を 4 つの `draw_*(app, ui, [area,] x, cy, bh) -> f32` へ割って running x を
 # バケツリレーする形にしてある (= 「超過したら分割してから足す」 不変条件 9 のとおり)。
-FN-BUDGET | daw_gui/src/app.rs::AppData::new                                          |  345 | #71 で新 state 2 本の初期化 +2 (フィールド初期化は構造体定義と同居させるほかない)。マスターストリップで `master_strip_gr` / `master_hovered_section` の初期化 +2 (同じ理由)。未起票
+FN-BUDGET | daw_gui/src/app.rs::AppData::new                                          |  346 | #71 で新 state 2 本の初期化 +2 (フィールド初期化は構造体定義と同居させるほかない)。マスターストリップで `master_strip_gr` / `master_hovered_section` の初期化 +2 (同じ理由)。再生追従のドラッグ中一時停止 `arrange_drag_active` の初期化 +1 (同じ理由)。未起票
 
 # C. プロセス境界の実装 (IPC 受信ループ / オーディオグラフ構築)。
 #    いつ消えるか: **未起票**。

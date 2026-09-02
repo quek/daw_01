@@ -975,7 +975,13 @@ pub enum AppEvent {
     PluginDbRescanCompleted,
 
     // -------- Scroll / zoom -----------------------------------------------
+    /// ユーザーの横スクロール (wheel / ズーム時の原点補正)。再生中なら追従を解除する。
     SetArrangeScroll(f32),
+    /// ドラッグ中の端オートスクロール。**追従は解除しない** — ユーザーは「クリップを運んで
+    /// いる」だけで、view を動かす意図ではない (運び終えたら追従が続くのが Live の挙動)。
+    /// ドラッグ中に追従が view を引き戻さないよう、追従の一時停止は
+    /// `ui_ephemeral.arrange_drag_active` (widget が毎フレーム鏡写し) が担う。
+    AutoScrollArrange(f32),
     SetArrangeZoom(f32),
     /// 再生追従スクロールの方式を `Off → Scroll → Page → Off` と循環
     /// (`Alt+F` / トランスポートの追従ボタン、クリックごとに切替)。

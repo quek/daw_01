@@ -95,6 +95,11 @@ pub struct UiEphemeral {
     /// clip is split. Falls back to the existing `selected_clips`
     /// when no clip is under the cursor.
     pub arrangement_hover_clip: Option<ClipKey>,
+    /// アレンジで端オートスクロールの対象になるドラッグ (クリップ / オートメーション /
+    /// リージョン / ルーラー等) が進行中か (`ArrangementResponse.edge_scroll_drag` の mirror)。
+    /// 再生追従はこの間だけ**一時停止**する — 止めないと Scroll 追従が毎 tick 中央へ
+    /// 引き戻し、端スクロールと綱引きになる。離せば追従が続く (解除はしない)。
+    pub arrange_drag_active: bool,
     /// ポインタ下のトラック id (`ArrangementResponse.hovered_track` の
     /// mirror)。トラック paste の挿入先 (= マウス下トラックの直上) に使う。
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの

@@ -908,16 +908,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let idx = track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, py)?;
         app.song_doc.song().tracks.get(idx).map(|t| t.id)
     });
+    let drag_active = resp.edge_scroll_drag;
     if app.ui_ephemeral.arrangement_hover_beat != snapped_beat
         || app.ui_ephemeral.arrangement_hover_beat_raw != raw_beat
         || app.ui_ephemeral.arrangement_hover_clip != hover_clip
         || app.ui_ephemeral.arrange_hovered_track != hovered_track_id
+        || app.ui_ephemeral.arrange_drag_active != drag_active
     {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.ui_ephemeral.arrangement_hover_beat = snapped_beat;
             app.ui_ephemeral.arrangement_hover_beat_raw = raw_beat;
             app.ui_ephemeral.arrangement_hover_clip = hover_clip;
             app.ui_ephemeral.arrange_hovered_track = hovered_track_id;
+            app.ui_ephemeral.arrange_drag_active = drag_active;
         }));
     }
 }

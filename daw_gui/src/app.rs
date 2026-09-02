@@ -373,6 +373,7 @@ impl AppData {
                 arrangement_hover_beat: None,
                 arrangement_hover_beat_raw: None,
                 arrangement_hover_clip: None,
+                arrange_drag_active: false,
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
                 mixer_hovered_strip_section: None,
@@ -1385,6 +1386,10 @@ impl AppData {
                 self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
                 // 再生中の手動横スクロールは追従を解除する (ユーザー選択の挙動)。
                 self.cancel_follow_on_manual_view_change();
+            }
+            // ドラッグの端オートスクロールは view を動かすだけ (追従は解除しない)。
+            AppEvent::AutoScrollArrange(scroll) => {
+                self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
             }
             AppEvent::CycleArrangeFollow => self.cycle_arrange_follow(),
             AppEvent::SetArrangeTrackRowH(h) => {

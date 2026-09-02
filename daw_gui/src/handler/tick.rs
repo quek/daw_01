@@ -122,8 +122,10 @@ impl AppData {
         // (last_arrange_lanes_size.0)。 手動スクロール / ズームで follow が Off に落ちる
         // のは各 view 操作 handler 側 (cancel_follow_on_manual_view_change)。 follow が
         // 直接 arrange_scroll_beat を書く (= SetArrangeScroll event を経由しない) ので
-        // 自分自身で Off に落ちることはない。
+        // 自分自身で Off に落ちることはない。ドラッグ中 (`arrange_drag_active`) は一時停止
+        // — 端オートスクロールと綱引きにならないため。離せばそのまま追従が続く。
         if self.transport.is_playing
+            && !self.ui_ephemeral.arrange_drag_active
             && let Some(ph) = self.transport.playhead_beat
         {
             let visible_beats = self.ui_ephemeral.last_arrange_lanes_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);

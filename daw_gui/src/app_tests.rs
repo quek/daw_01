@@ -208,6 +208,43 @@ mod follow_scroll_tests {
     use crate::app::AppData;
     use common::model::FollowMode;
 
+    /// ドラッグの端オートスクロール (`AutoScrollArrange`) は追従を解除しない。手動スクロール
+    /// (`SetArrangeScroll`) は解除する。旧実装は端スクロールも手動扱いで、クリップを端まで
+    /// 運ぶと再生追従が黙って OFF になっていた。
+    #[test]
+    fn edge_autoscroll_keeps_follow_but_manual_scroll_cancels_it() {
+        use std::sync::Arc;
+
+        use crate::app::AppEvent;
+        use crate::dispatcher::{
+            BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+        };
+        let (audio_tx, _audio_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (plugin_tx, _plugin_rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+        let mut app = AppData::new(
+            audio_tx,
+            plugin_tx,
+            None,
+            None,
+            event_dispatcher,
+            job_dispatcher,
+            None,
+            None,
+            common::audio_bridge::DEFAULT_SAMPLE_RATE,
+        );
+        app.ui_prefs.arrange_follow = FollowMode::Scroll;
+        app.transport.is_playing = true;
+
+        app.handle_event(AppEvent::AutoScrollArrange(5.0));
+        assert_eq!(app.ui_prefs.arrange_follow, FollowMode::Scroll, "端スクロールで追従が消えた");
+        assert!((app.ui_prefs.arrange_scroll_beat - 5.0).abs() < 1e-6, "view は動く");
+
+        app.handle_event(AppEvent::SetArrangeScroll(6.0));
+        assert_eq!(app.ui_prefs.arrange_follow, FollowMode::Off, "手動スクロールは追従を解除する");
+    }
+
     /// 再生追従スクロールの scroll_beat 計算 (純関数)。Page のページめくり境界、
     /// Scroll の中央固定 + 頭打ち、Off / 可視幅 0 の退化を 1 表で網羅する。
     #[test]
