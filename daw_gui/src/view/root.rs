@@ -10,7 +10,7 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::event::NudgeStep;
-use crate::event_launcher::LauncherEvent;
+use crate::event_launcher::{LauncherCellKey, LauncherEvent};
 use crate::view::{
     about, arrangement_view, bottom_panel, clipboard_ops, dirty_guard_modal, export_overlay,
     export_range_modal,
@@ -713,6 +713,47 @@ fn toggle_hovered_strip_section(
     true
 }
 
+/// `f` キーが発火するイベント。カーソル直下の拍を現在の snap 設定で吸着し
+/// (`alt` = 一時 snap 解除)、どこで押したかで 2 通りに解決する:
+///
+/// - **ピアノロールで開いているのがランチャーのセル** — 全体を「カーソルの拍から」
+///   ([`LauncherEvent::PlayFromCellBeat`]: そのセルをその拍から撃ち、鳴っている他の
+///   全行も同じ拍へ揃え、song も seek)。song の seek だけでは足りない — セルは
+///   `start_beat = 0` の自分の時間軸で走り、seek は engine が位相を平行移動して吸収する
+///   (`on_transport_jump`) ので、再生位置が動かない。ピアノロールの拍はセルの
+///   `start_beat` 原点 (= `editor_playhead_beat` と同じ空間) なので、そのままセル内の
+///   位相になる。
+/// - **それ以外** (アレンジのクリップ / アレンジ面) — song-absolute 拍へ seek して再生
+///   ([`AppEvent::PlayFromCursor`])。停止中 play() / 再生中 seek 継続は handler 側。
+///
+/// grid 外 (hover が `None`) なら何もしない。
+fn play_from_cursor_event(app: &AppData, alt: bool, is_pianoroll_active: bool) -> Option<AppEvent> {
+    if !is_pianoroll_active {
+        let raw = app.ui_ephemeral.arrangement_hover_beat_raw?;
+        let beat = snap::arrange_snap_config(app).snap_beat(
+            raw,
+            alt,
+            app.ui_prefs.arrange_zoom_x.max(1.0),
+        );
+        return Some(AppEvent::PlayFromCursor { beat });
+    }
+    let raw = app.ui_ephemeral.pianoroll_hover_beat_song_raw?;
+    let beat = snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x());
+    let cell = app.pianoroll_target_clip().filter(|k| {
+        app.song_doc
+            .song()
+            .track_by_id(k.track_id)
+            .is_some_and(|t| t.session_clip_by_id(k.clip_id).is_some())
+    });
+    Some(match cell {
+        Some(key) => AppEvent::Launcher(LauncherEvent::PlayFromCellBeat {
+            cell: LauncherCellKey::Track(key),
+            phase_beats: beat - app.clip_start_beat_of(key),
+        }),
+        None => AppEvent::PlayFromCursor { beat },
+    })
+}
+
 /// `bottom_rect` は piano_roll active 判定用。マウスが bottom_panel 領域内 + Piano Roll
 /// タブが選択中なら G/X/1/2/3 を piano_roll 系に流す。それ以外は arrange 系。
 fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect) {
@@ -897,27 +938,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (`is_pianoroll_active` / `surface` / `zoom_automation` は関数冒頭で算出済 —
     // `R` loop が先頭ブロックで使うため。)
 
-    // f キー。カーソル直下の拍 (song-absolute) を現在の snap 設定で吸着して
-    // プレイヘッドを移動し再生する。piano_roll active ならピアノロールの hover (song-raw)、
-    // それ以外はアレンジの hover (raw) を使い、view 層でここで snap + routing を解決して
-    // song-absolute beat にする。どちらの grid 外でも hover は None なので no-op。
-    // Alt はライブ取得 (一時 snap 解除)。再生中 seek 継続 / 停止中 play() は handler 側。
-    if ui.take_shortcut("daw.play_from_cursor") {
-        let alt = ui.pointer().modifiers.alt;
-        let target_beat = if is_pianoroll_active {
-            app.ui_ephemeral.pianoroll_hover_beat_song_raw.map(|raw| {
-                snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x())
-            })
-        } else {
-            app.ui_ephemeral.arrangement_hover_beat_raw.map(|raw| {
-                snap::arrange_snap_config(app).snap_beat(raw, alt, app.ui_prefs.arrange_zoom_x.max(1.0))
-            })
-        };
-        if let Some(beat) = target_beat {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::PlayFromCursor { beat });
-            }));
-        }
+    // f キー: カーソル位置から再生 (アレンジ / アレンジのクリップは seek、ランチャーの
+    // セルはそのセルを途中から撃つ)。解決は `play_from_cursor_event`。
+    if ui.take_shortcut("daw.play_from_cursor")
+        && let Some(ev) = play_from_cursor_event(app, ui.pointer().modifiers.alt, is_pianoroll_active)
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(ev)));
     }
 
     // Home / End: プレイヘッドをタイムラインの端へ移動 (r.md #10)。 typing 中は
@@ -1032,8 +1058,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // S キーで「マウス直下のトラック」を solo toggle する (mixer / arrangement の
     // S ボタンと同じ ToggleTrackSolo を発火)。 対象 track は pointer の位置で決まる:
     // - piano roll active (= pointer が bottom panel 内 + Piano Roll タブ。 audio
-    //   editor は MIDI 編集文脈ではないので除外): 編集中 clip の所属 track
-    //   (ClipKey.track は index なので id へ解決)。
+    //   editor は MIDI 編集文脈ではないので除外): **編集対象 clip**
+    //   (`pianoroll_target_clip` = 新規ノートの所属先・凡例の強調行) の所属 track。
+    //   時間範囲選択から引くと、 ノートを選んだ瞬間 (レーンが KeyTrack に変わる) や
+    //   ランチャーセル編集中に None になって効かない。
     // - mixer (= pointer が bottom panel 内 + Mixer タブ): マウス直下のストリップ
     //   (`mixer_hovered_track`)。 master strip / strip 外は None で no-op。
     // - それ以外 (= pointer がアレンジ上): マウス直下のトラック
@@ -1046,7 +1074,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             if app.ui_ephemeral.audio_editor_clip.is_some() {
                 None
             } else {
-                app.selected_clip_ref()
+                app.pianoroll_target_clip()
                     .and_then(|c| app.song_doc.song().track_by_id(c.track_id))
                     .map(|t| t.id)
             }

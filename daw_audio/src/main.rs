@@ -1308,8 +1308,8 @@ async fn recv_loop(
             }
             // r.md #87: クリップランチャーの操作。発火の判断には Song が要るので
             // ここでは audio thread へ積むだけ (`launcher::ipc` が唯一の口)。
-            Ok(cmd @ (AudioCommand::LaunchCell { .. }
-                | AudioCommand::LaunchScene { .. }
+            Ok(cmd @ (AudioCommand::LaunchCell { .. } | AudioCommand::LaunchCellFrom { .. }
+                | AudioCommand::LaunchScene { .. } | AudioCommand::RephaseLauncherRows { .. }
                 | AudioCommand::StopRow { .. }
                 | AudioCommand::StopAllRows
                 | AudioCommand::SwitchRowToArranger { .. }

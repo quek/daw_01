@@ -216,6 +216,13 @@ impl AppData {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
                 A::LaunchCell { track_id, lane_id, clip_id, pressed }
             }
+            LauncherAudioCommand::LaunchCellFrom { row, clip_id, phase_beats } => {
+                let (track_id, lane_id) = Self::launcher_row_ids(row);
+                A::LaunchCellFrom { track_id, lane_id, clip_id, phase_beats }
+            }
+            LauncherAudioCommand::RephaseRows { phase_beats } => {
+                A::RephaseLauncherRows { phase_beats }
+            }
             LauncherAudioCommand::LaunchScene { scene_id, pressed } => {
                 A::LaunchScene { scene_id, pressed }
             }
@@ -243,6 +250,7 @@ impl AppData {
         match ev {
             // ---- 発火 ----
             E::LaunchCell { cell, pressed } => self.launch_cell(cell, pressed),
+            E::PlayFromCellBeat { cell, phase_beats } => self.play_from_cell_beat(cell, phase_beats),
             E::LaunchScene { scene_id, pressed } => self.launch_scene(scene_id, pressed),
             E::StopRow { row } => self.stop_launcher_row(row),
             E::StopAllRows => self.stop_all_launcher_rows(),
@@ -403,6 +411,78 @@ impl AppData {
             self.ensure_transport_rolling();
         }
         self.send_launcher_audio(LauncherAudioCommand::LaunchCell { row, clip_id, pressed });
+    }
+
+    /// ピアノロールの `f`: **全体を `phase_beats` (セルの `start_beat` からの拍) から再生**
+    /// ([`LauncherEvent::PlayFromCellBeat`])。
+    ///
+    /// 1. song の playhead を **相対 seek** する ([`Self::cell_beat_to_song_beat`]:
+    ///    `cell` が今 song 上のどこで鳴っているかを基準に、同じ周回の中でその拍に当たる
+    ///    song 位置へ)。アレンジは今いる場所の近くに留まり、アレンジ主導の行はこれで
+    ///    動く。`cell` が鳴っていなければ基準が無いので seek しない (停止中なら現在位置から
+    ///    再生を始めるだけ)。
+    /// 2. `cell` をその拍から撃つ。`Song` へは [`Self::launch_cell`] の押下と同じ
+    ///    「このセルを撃った」だけを書く (走行位置は engine が持つ、計画書 §1.4)。
+    ///    [`LaunchMode`](common::model::LaunchMode) は見ない — 「ここから鳴らせ」に
+    ///    押下 / 離しの対は無いので、Toggle で鳴っているセルを止めたり Gate で握ったり
+    ///    しない (engine の `launch_cell_from` も同じ)。
+    /// 3. セルを鳴らしている他の全行も同じ拍へ揃える (engine の `rephase_running`。
+    ///    停止中の行は鳴らさない)。`Song` 側の「最後に撃った状態」は変わらないので書かない。
+    pub fn play_from_cell_beat(&mut self, cell: LauncherCellKey, phase_beats: f64) {
+        let row = cell.row();
+        let clip_id = cell.clip_id();
+        self.set_row_playback(row, RowPlayback::Launcher { clip_id });
+        match self.cell_beat_to_song_beat(cell, phase_beats) {
+            Some(song_beat) => self.action_play_from_cursor(song_beat),
+            None => self.ensure_transport_rolling(),
+        }
+        self.send_launcher_audio(LauncherAudioCommand::LaunchCellFrom { row, clip_id, phase_beats });
+        self.send_launcher_audio(LauncherAudioCommand::RephaseRows { phase_beats });
+    }
+
+    /// 鳴っているセル `cell` の「セル内の拍 `phase_beats`」に当たる song の拍。
+    ///
+    /// 今の周回を基準にする: `song 拍 = 今の playhead - 今のセル内位相 + 目的の位相`
+    /// (目的の位相はループ長で折り返し、ワンショットは末尾で切る — engine の
+    /// `CellRef::phase_from` と同じ規則)。位相は engine の publish (`launch_beat`) から
+    /// 映像 / 編集面と同じ式 ([`crate::launcher_time::cell_phase`]) で解く。
+    /// セルが鳴っていない (行が publish されていない / 別のセル / 停止中) なら `None`。
+    #[must_use]
+    fn cell_beat_to_song_beat(&self, cell: LauncherCellKey, phase_beats: f64) -> Option<f64> {
+        let (track_id, lane_id) = Self::launcher_row_ids(cell.row());
+        let snap = self.launcher_running_row(track_id, lane_id)?;
+        if snap.state != common::audio_bridge::LAUNCHER_STATE_PLAYING
+            || snap.playing_clip_id != cell.clip_id()
+        {
+            return None;
+        }
+        let (len, looping) = self.cell_loop_of(cell)?;
+        let playhead = f64::from(self.transport.playhead_beat?);
+        let now = crate::launcher_time::cell_phase(snap.launch_beat, playhead, len, looping)?;
+        let want = if !len.is_finite() || len <= 0.0 || !phase_beats.is_finite() {
+            0.0
+        } else if looping {
+            phase_beats.rem_euclid(len)
+        } else {
+            phase_beats.clamp(0.0, len)
+        };
+        Some(playhead - now + want)
+    }
+
+    /// セルのループ長と looping 設定。セルが無ければ `None`。
+    #[must_use]
+    fn cell_loop_of(&self, cell: LauncherCellKey) -> Option<(f64, bool)> {
+        let song = self.song_doc.song();
+        match cell {
+            LauncherCellKey::Track(k) => song
+                .track_by_id(k.track_id)
+                .and_then(|t| t.session_clip_by_id(k.clip_id))
+                .map(|c| (c.clip.length_beats, c.launch.looping)),
+            LauncherCellKey::Lane(k) => song
+                .automation_lane_by_key(k.track, k.lane)
+                .and_then(|l| l.session_clips.iter().find(|c| c.clip.id == k.clip))
+                .map(|c| (c.clip.length_beats, c.launch.looping)),
+        }
     }
 
     /// 列 (シーン) を撃つ。

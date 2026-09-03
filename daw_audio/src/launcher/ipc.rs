@@ -27,6 +27,12 @@ pub fn dispatch(
         AudioCommand::LaunchCell { track_id, lane_id, clip_id, pressed } => {
             LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed }
         }
+        AudioCommand::LaunchCellFrom { track_id, lane_id, clip_id, phase_beats } => {
+            LaunchRequest::CellFrom { key: RowKey::lane(track_id, lane_id), clip_id, phase_beats }
+        }
+        AudioCommand::RephaseLauncherRows { phase_beats } => {
+            LaunchRequest::RephaseRunning { phase_beats }
+        }
         AudioCommand::LaunchScene { scene_id, pressed } => {
             LaunchRequest::Scene { scene_id, pressed }
         }

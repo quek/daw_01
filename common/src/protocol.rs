@@ -428,6 +428,28 @@ pub enum AudioCommand {
         clip_id: u32,
         pressed: bool,
     },
+    /// セルを **セル内の拍 `phase_beats` から** 鳴らす (ピアノロールの `f` =
+    /// Live のクリップビューでの頭出し)。
+    ///
+    /// [`LaunchCell`](Self::LaunchCell) と違い **[`LaunchMode`](crate::model::LaunchMode)
+    /// を見ない** — 「ここから鳴らせ」に押下 / 離しの対は無く、Toggle で鳴っている
+    /// セルを止めたり Gate で握ったりしてはいけない。量子化はセルの設定に従う。
+    /// `phase_beats` はセルの `start_beat` からの拍で、engine がループ長へ折り返す
+    /// (ワンショットは末尾で切る)。
+    LaunchCellFrom {
+        track_id: u32,
+        lane_id: u32,
+        clip_id: u32,
+        phase_beats: f64,
+    },
+    /// ランチャーが**セルを鳴らしている全行**を、それぞれのセル内の拍 `phase_beats`
+    /// へ揃える (ピアノロールの `f` = 「全体をカーソルの拍から」)。
+    ///
+    /// 対象は供給元がセルの行だけ — 停止中 (Stop Clips) の行とアレンジ主導の行は
+    /// 触らない (アレンジ側は同時に送る `SeekTo` が動かす)。予約が生きている行は
+    /// その予約の発火位置に位相を載せる。折り返し / 量子化は
+    /// [`LaunchCellFrom`](Self::LaunchCellFrom) と同じ。
+    RephaseLauncherRows { phase_beats: f64 },
     /// r.md #87: 列 ([`Scene::id`](crate::model::Scene)) をまとめて撃つ / 離す。
     /// その列にセルを持たない行は **停止**する (Q11、空セル = 停止)。
     LaunchScene { scene_id: u32, pressed: bool },

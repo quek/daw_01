@@ -722,6 +722,54 @@ fn 停止中にセルを撃つと再生が始まる() {
     );
 }
 
+/// ピアノロールの `f` (全体をセル内の拍から再生) は、停止中なら再生を始め、
+/// そのセルの位相付き発火 (`LaunchCellFrom`) と他行の揃え (`RephaseLauncherRows`) を
+/// 送り、`Song` には「このセルを撃った」だけを書く。song の seek は**相対** (鳴っている
+/// セルの今の周回が基準) なので、セルがまだ鳴っていなければ seek しない。
+#[test]
+fn セルを途中から撃つと再生開始と位相付き発火が出る() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    while audio_rx.try_recv().is_ok() {}
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::PlayFromCellBeat { cell, phase_beats: 1.5 }));
+
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(
+        !sent.iter().any(|c| matches!(c, AudioCommand::SeekTo { .. })),
+        "鳴っていないセルには seek の基準が無い (song を 1 小節目へ戻さない): {sent:?}"
+    );
+    assert!(
+        sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        "撃った瞬間に Play が出る: {sent:?}"
+    );
+    let clip_id = cell.clip_id();
+    assert!(
+        sent.iter().any(|c| matches!(
+            c,
+            AudioCommand::LaunchCellFrom { track_id: 1, lane_id: 0, clip_id: id, phase_beats }
+                if *id == clip_id && (*phase_beats - 1.5).abs() < 1e-9
+        )),
+        "位相付きの発火を送る: {sent:?}"
+    );
+    assert!(
+        sent.iter().any(|c| matches!(
+            c,
+            AudioCommand::RephaseLauncherRows { phase_beats } if (*phase_beats - 1.5).abs() < 1e-9
+        )),
+        "他行も同じ拍へ揃える: {sent:?}"
+    );
+    assert_eq!(
+        app.song_doc.song().tracks[0].launcher,
+        RowPlayback::Launcher { clip_id },
+        "Song 側は「このセルを撃った」"
+    );
+}
+
 /// 再生中に撃ったときは Play を重ねて送らない (二重に送ると開始位置が戻る)。
 #[test]
 fn 再生中に撃っても_play_を重ねない() {

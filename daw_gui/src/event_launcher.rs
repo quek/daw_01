@@ -218,6 +218,11 @@ pub enum LauncherAudioCommand {
     /// セルを撃つ / 離す。`pressed` の解釈 (Trigger / Gate / Toggle / Repeat) は
     /// engine 側がセルの [`LaunchMode`] を見て行う。
     LaunchCell { row: LauncherRow, clip_id: u32, pressed: bool },
+    /// セルを `phase_beats` (セルの `start_beat` からの拍) の位置から鳴らす。
+    /// [`LaunchMode`] は見ない (押下 / 離しの対を持たない操作)。
+    LaunchCellFrom { row: LauncherRow, clip_id: u32, phase_beats: f64 },
+    /// セルを鳴らしている全行を、それぞれのセル内の拍 `phase_beats` へ揃える。
+    RephaseRows { phase_beats: f64 },
     /// 列を丸ごと撃つ。空セルの行は停止 (計画書 Q11)。
     LaunchScene { scene_id: u32, pressed: bool },
     StopRow { row: LauncherRow },
@@ -236,6 +241,18 @@ pub enum LauncherEvent {
     /// セルを撃つ / 離す。`Song` 側は「ユーザーが最後に撃った状態」だけを
     /// 書き換える (走行位置は engine が持つ、計画書 §1.4)。
     LaunchCell { cell: LauncherCellKey, pressed: bool },
+    /// ピアノロールの `f` = **全体をセル内の拍 `phase_beats` から再生**。
+    /// 3 つを同時に行う:
+    /// - `cell` をその拍から撃つ ([`LauncherAudioCommand::LaunchCellFrom`]。`Song` 側は
+    ///   [`Self::LaunchCell`] と同じく「最後に撃った状態」だけを書く。[`LaunchMode`] は
+    ///   見ない — Toggle で鳴っているセルを止めたり Gate で握ったりしない)
+    /// - セルを鳴らしている他の全行も同じ拍へ揃える ([`LauncherAudioCommand::RephaseRows`])
+    /// - song の playhead を **相対 seek** する (鳴っている `cell` の今の周回を基準に、
+    ///   その拍に当たる song 位置へ。アレンジは今いる場所の近くに留まる)。`cell` が
+    ///   鳴っていなければ seek せず、停止中なら現在位置から再生を始める
+    ///
+    /// 量子化はセルの設定に従う。
+    PlayFromCellBeat { cell: LauncherCellKey, phase_beats: f64 },
     /// 列 (シーン) を撃つ / 離す。
     LaunchScene { scene_id: u32, pressed: bool },
     /// 行の Stop Clips (ランチャーが握ったまま無音)。
@@ -337,7 +354,10 @@ impl LauncherEvent {
         match self {
             // 再生状態だけを書く event は undo step を積まない (`edit_playback`)。
             // ラベルは match の網羅性のためだけに残す。
-            E::LaunchCell { .. } | E::LaunchScene { .. } | E::LaunchFocused => "セルを撃つ",
+            E::LaunchCell { .. }
+            | E::PlayFromCellBeat { .. }
+            | E::LaunchScene { .. }
+            | E::LaunchFocused => "セルを撃つ",
             E::StopRow { .. } | E::StopAllRows => "ランチャーを止める",
             E::RowToArranger { .. } | E::AllToArranger => "アレンジに戻す",
             E::AddScene | E::AddSceneAt(..) | E::CaptureScene => "シーン追加",

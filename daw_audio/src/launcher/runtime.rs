@@ -9,8 +9,8 @@
 //! RT 規約: すべて事前確保。`update` の中で確保・ロック・I/O・`format!` を行わない。
 
 use common::model::{
-    AutomationLane, FollowAction, FollowActionKind, LaunchMode, LaunchQuantize, LaunchSettings,
-    RowPlayback, SessionAutomationClip, SessionClip, Song, Track,
+    AutomationLane, FollowAction, FollowActionKind, LaunchMode, LaunchQuantize, RowPlayback, Song,
+    Track,
 };
 
 use super::follow::{self, FollowOutcome};
@@ -21,6 +21,10 @@ use super::{MAX_ROWS, RowKey, RowPhase, RowSourceTable, RowTimeSource, is_positi
 // 行のそれ (`RowRuntime` / `arm_timers` / `apply_follow`) と対の、独立した寿命。
 mod scene_follow;
 use scene_follow::{SceneRun, scene_longest};
+
+// 行のセル列 / 発火判断用のセル (`RowCells` / `CellRef`)。
+mod cells;
+pub use cells::{CellRef, RowCells};
 
 /// グループ判定 ([`common::model::launch_group`]) の作業領域の大きさ =
 /// フォローアクションが見る列数の上限。これを超える列にあるセルは
@@ -40,6 +44,12 @@ const SCENE_SEED_SALT: u64 = 0x5CE7_E5EE_D0F0_1234;
 pub enum LaunchRequest {
     /// セルの押下 / 離し。モードの解釈は engine 側 ([`LaunchMode`])。
     Cell { key: RowKey, clip_id: u32, pressed: bool },
+    /// セルを **セル内の拍 `phase_beats` から** 鳴らす (ピアノロールの `f`)。
+    /// [`LaunchMode`] を見ない — Toggle の停止 / Gate の握りは起きない。
+    CellFrom { key: RowKey, clip_id: u32, phase_beats: f64 },
+    /// セルを鳴らしている全行を、それぞれのセル内の拍 `phase_beats` へ揃える。
+    /// 停止中 / アレンジ主導の行は触らない。
+    RephaseRunning { phase_beats: f64 },
     /// 列をまとめて撃つ。その列にセルを持たない行は停止する (Q11)。
     Scene { scene_id: u32, pressed: bool },
     /// 1 行を止める (アレンジへは戻さない)。
@@ -60,6 +70,9 @@ struct Queued {
     legato: bool,
     /// [`LaunchMode::Repeat`] の自動再予約。離したときに取り消す対象。
     from_repeat: bool,
+    /// セルのどの拍から鳴らすか (セルの `start_beat` からの拍、`0` = 頭)。
+    /// [`LaunchRequest::CellFrom`] だけが `0` 以外を置く。
+    start_phase: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +657,12 @@ impl LauncherRuntime {
             LaunchRequest::Cell { key, clip_id, pressed } => {
                 self.press_cell(song, at, key, clip_id, pressed);
             }
+            LaunchRequest::CellFrom { key, clip_id, phase_beats } => {
+                self.launch_cell_from(song, at, key, clip_id, phase_beats);
+            }
+            LaunchRequest::RephaseRunning { phase_beats } => {
+                self.rephase_running(song, at, phase_beats);
+            }
             LaunchRequest::Scene { scene_id, pressed } => {
                 if pressed {
                     self.launch_scene(song, at, scene_id, span.start_beat);
@@ -720,6 +739,7 @@ impl LauncherRuntime {
                 row.queued = Some(Queued {
                     target: QueueTarget::Stop,
                     at_beat: at,
+                    start_phase: 0.0,
                     legato: false,
                     from_repeat: false,
                 });
@@ -801,7 +821,72 @@ impl LauncherRuntime {
     /// 予約を置く (行ごとに高々 1 件、新しい発火が前を置き換える)。
     fn queue(&mut self, key: RowKey, target: QueueTarget, at: f64, legato: bool, rep: bool) {
         if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
-            row.queued = Some(Queued { target, at_beat: at, legato, from_repeat: rep });
+            row.queued =
+                Some(Queued { target, at_beat: at, legato, from_repeat: rep, start_phase: 0.0 });
+        }
+    }
+
+    /// [`LaunchRequest::CellFrom`]: セルを `phase_beats` の位置から鳴らす予約。
+    ///
+    /// [`Self::press_cell`] と違い [`LaunchMode`] を見ない (Toggle の「もう一度
+    /// 押したら止める」/ Gate の握り / Repeat の撃ち直しは起きない) — 「ここから
+    /// 鳴らせ」は押下 / 離しの対を持たない操作なので、鳴っているセルを止める
+    /// 解釈が入る余地は無い。量子化はセル自身の設定に従う (Live のクリップビューの
+    /// 頭出しと同じ)。位相の折り返しは発火時 ([`CellRef::phase_from`]) に行う。
+    fn launch_cell_from(
+        &mut self,
+        song: &Song,
+        fire: FireAt,
+        key: RowKey,
+        clip_id: u32,
+        phase_beats: f64,
+    ) {
+        let Some((cells, _)) = row_of(song, key) else { return };
+        let Some(cell) = cells.find_by_clip(clip_id) else { return };
+        let at = fire.beat(cell.quantize, song.time_sig);
+        if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
+            row.queued = Some(Queued {
+                target: QueueTarget::Cell(clip_id),
+                at_beat: at,
+                legato: false,
+                from_repeat: false,
+                start_phase: if phase_beats.is_finite() { phase_beats.max(0.0) } else { 0.0 },
+            });
+        }
+    }
+
+    /// [`LaunchRequest::RephaseRunning`]: セルを鳴らしている全行を、それぞれのセル内の
+    /// 拍 `phase_beats` へ揃える (「全体をカーソルの拍から」)。
+    ///
+    /// 対象は供給元がセル (`RowPhase::Cell`) の行だけ — 停止中 (Silent) と
+    /// アレンジ主導の行は触らない (アレンジ側は同時に届く `SeekTo` が動かす)。
+    /// 停止中の transport で `Cell` のまま残っている行も対象 (再生を始めた瞬間に
+    /// その拍から鳴る)。既に予約が生きている行 (量子化待ち / 列の発火) は、その予約の
+    /// 行き先と発火拍を保ったまま位相だけ載せる — ここで予約を置き換えると、直前に
+    /// 撃った別のセルへの遷移が消える。
+    ///
+    /// RT 安全: 行の線形走査のみ。
+    fn rephase_running(&mut self, song: &Song, fire: FireAt, phase_beats: f64) {
+        let start_phase = if phase_beats.is_finite() { phase_beats.max(0.0) } else { 0.0 };
+        for idx in 0..self.rows.len() {
+            if let Some(q) = &mut self.rows[idx].queued {
+                if matches!(q.target, QueueTarget::Cell(_)) {
+                    q.start_phase = start_phase;
+                }
+                continue;
+            }
+            let RowPhase::Cell { clip_id, .. } = self.rows[idx].phase else { continue };
+            let key = self.rows[idx].key;
+            let Some((cells, _)) = row_of(song, key) else { continue };
+            let Some(cell) = cells.find_by_clip(clip_id) else { continue };
+            let at = fire.beat(cell.quantize, song.time_sig);
+            self.rows[idx].queued = Some(Queued {
+                target: QueueTarget::Cell(clip_id),
+                at_beat: at,
+                legato: false,
+                from_repeat: false,
+                start_phase,
+            });
         }
     }
 
@@ -810,7 +895,13 @@ impl LauncherRuntime {
     fn queue_all(&mut self, target: QueueTarget, at: f64) {
         self.disarm_scene();
         for row in &mut self.rows {
-            row.queued = Some(Queued { target, at_beat: at, legato: false, from_repeat: false });
+            row.queued = Some(Queued {
+                target,
+                at_beat: at,
+                legato: false,
+                from_repeat: false,
+                start_phase: 0.0,
+            });
             row.held_clip_id = 0;
             row.repeating = false;
         }
@@ -910,7 +1001,7 @@ impl LauncherRuntime {
                 let Some(q) = self.rows[idx].queued.take() else {
                     return self.rows[idx].phase;
                 };
-                self.enter(idx, cells, q.target, at, q.legato, global_q, song.time_sig)
+                self.enter(idx, cells, q.target, at, q.legato, q.start_phase, global_q, song.time_sig)
             }
             // **ワンショットの終端は「鳴り終わった」だけ。** フォローの予定
             // (`follow_clip_id` / `follow_at`) は別の寿命なのでそのまま残す —
@@ -1002,10 +1093,14 @@ impl LauncherRuntime {
             self.queue(key, QueueTarget::Cell(id), at, legato, false);
             return phase;
         }
-        self.enter(idx, cells, QueueTarget::Cell(id), fire, legato, global_q, song.time_sig)
+        self.enter(idx, cells, QueueTarget::Cell(id), fire, legato, 0.0, global_q, song.time_sig)
     }
 
     /// 予約 / フォローアクションの行き先へ実際に入る。
+    ///
+    /// `start_phase` はセルのどの拍から鳴らすか ([`Queued::start_phase`])。`0` なら
+    /// 頭 (Legato ならその位相引き継ぎ)、それ以外は [`CellRef::phase_from`] で
+    /// 起点を過去へ置いて「途中から」にする。
     #[allow(clippy::too_many_arguments)]
     fn enter(
         &mut self,
@@ -1014,6 +1109,7 @@ impl LauncherRuntime {
         target: QueueTarget,
         at: f64,
         legato: bool,
+        start_phase: f64,
         global_q: LaunchQuantize,
         time_sig: (u8, u8),
     ) -> RowPhase {
@@ -1029,7 +1125,11 @@ impl LauncherRuntime {
         let carry = legato
             .then(|| prev.effective_beat(at).map(|b| (prev, b)))
             .flatten();
-        let phase = cell.phase_at(at, carry);
+        let phase = if start_phase > 0.0 {
+            cell.phase_from(at, start_phase)
+        } else {
+            cell.phase_at(at, carry)
+        };
         let out = self.set_phase(idx, phase, cells);
         if self.rows[idx].repeating
             && self.rows[idx].held_clip_id == clip_id
@@ -1252,117 +1352,21 @@ fn repeat_queue(
         None if is_positive(cell.length_beats) => at + cell.length_beats,
         None => return None,
     };
-    (next > at).then_some(Queued { target, at_beat: next, legato: false, from_repeat: true })
-}
-
-/// 行のセル列。トラック行とレーン行で型が違うだけで規則は同じ (Q4) なので、
-/// 判定は 1 本にまとめる。
-#[derive(Debug, Clone, Copy)]
-pub enum RowCells<'a> {
-    Track(&'a [SessionClip]),
-    Lane(&'a [SessionAutomationClip]),
-}
-
-impl RowCells<'_> {
-    /// `clip.id` でセルを引く (行の中で一意)。
-    #[must_use]
-    pub fn find_by_clip(&self, clip_id: u32) -> Option<CellRef> {
-        self.find(|id, _| id == clip_id)
-    }
-
-    /// 列 (`scene_id`) でセルを引く。
-    #[must_use]
-    pub fn find_by_scene(&self, scene_id: u32) -> Option<CellRef> {
-        self.find(|_, sid| sid == scene_id)
-    }
-
-    /// この行のセルが使っている列 id を全部見る (列の占有判定用)。
-    pub fn for_each_scene_id(&self, mut f: impl FnMut(u32)) {
-        match self {
-            Self::Track(v) => v.iter().for_each(|c| f(c.scene_id)),
-            Self::Lane(v) => v.iter().for_each(|c| f(c.scene_id)),
-        }
-    }
-
-    fn find(&self, pred: impl Fn(u32, u32) -> bool) -> Option<CellRef> {
-        match self {
-            Self::Track(v) => v
-                .iter()
-                .find(|c| pred(c.clip.id, c.scene_id))
-                .map(|c| CellRef::of(c.scene_id, &c.launch, &c.clip.id, c.clip.start_beat, c.clip.length_beats)),
-            Self::Lane(v) => v
-                .iter()
-                .find(|c| pred(c.clip.id, c.scene_id))
-                .map(|c| CellRef::of(c.scene_id, &c.launch, &c.clip.id, c.clip.start_beat, c.clip.length_beats)),
-        }
-    }
-}
-
-/// セル 1 つから、発火の判断に要る値だけを抜いたもの。
-#[derive(Debug, Clone)]
-pub struct CellRef {
-    pub clip_id: u32,
-    pub scene_id: u32,
-    /// セル自身の拍原点。正規化済みなら 0 だが、IPC は信頼境界なので値を持ち回る。
-    pub start_beat: f64,
-    pub length_beats: f64,
-    pub quantize: LaunchQuantize,
-    pub mode: LaunchMode,
-    pub looping: bool,
-    pub legato: bool,
-    pub follow: FollowAction,
-}
-
-impl CellRef {
-    fn of(
-        scene_id: u32,
-        launch: &LaunchSettings,
-        clip_id: &u32,
-        start_beat: f64,
-        length_beats: f64,
-    ) -> Self {
-        Self {
-            clip_id: *clip_id,
-            scene_id,
-            start_beat,
-            length_beats,
-            quantize: launch.quantize,
-            mode: launch.mode,
-            looping: launch.looping,
-            legato: launch.legato,
-            follow: launch.follow.clone(),
-        }
-    }
-
-    /// このセルを `at` 拍で撃った状態。
-    ///
-    /// `prev` を渡すと **Legato** — 前のセルの位相 (`(前の供給元, その実効拍)`) を
-    /// 引き継ぐように `launch_beat` を逆算する。同じ小節位置のまま別のループへ
-    /// 乗り換えるのが Legato の定義なので、位相は移る先のセル長で折り返す。
-    #[must_use]
-    pub fn phase_at(&self, at: f64, prev: Option<(RowPhase, f64)>) -> RowPhase {
-        let launch_beat = match prev {
-            Some((RowPhase::Cell { cell_start_beat, .. }, eff)) if self.length_beats > 0.0 => {
-                at - (eff - cell_start_beat).rem_euclid(self.length_beats)
-            }
-            _ => at,
-        };
-        RowPhase::Cell {
-            clip_id: self.clip_id,
-            launch_beat,
-            loop_len: self.length_beats,
-            cell_start_beat: self.start_beat,
-            looping: self.looping,
-        }
-    }
+    (next > at).then_some(Queued {
+        target,
+        at_beat: next,
+        legato: false,
+        from_repeat: true,
+        start_phase: 0.0,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::model::{
-        AutomationClip, AutomationTarget, Clip, FollowActionKind, Scene, Track,
-        TrackBuiltinParam,
+        AutomationClip, AutomationTarget, Clip, FollowActionKind, LaunchSettings, Scene,
+        SessionAutomationClip, SessionClip, Track, TrackBuiltinParam,
     };
 
     const SR: u32 = 48_000;
@@ -1404,6 +1408,89 @@ mod tests {
 
     fn press(rt: &mut LauncherRuntime, track_id: u32, clip_id: u32, pressed: bool) {
         rt.push_request(LaunchRequest::Cell { key: RowKey::track(track_id), clip_id, pressed });
+    }
+
+    fn press_from(rt: &mut LauncherRuntime, track_id: u32, clip_id: u32, phase: f64) {
+        rt.push_request(LaunchRequest::CellFrom {
+            key: RowKey::track(track_id),
+            clip_id,
+            phase_beats: phase,
+        });
+    }
+
+    fn cell_launch_beat(phase: RowPhase) -> f64 {
+        let RowPhase::Cell { launch_beat, .. } = phase else { panic!("セルでない: {phase:?}") };
+        launch_beat
+    }
+
+    /// **`CellFrom` はセルの途中から鳴らす** — 起点 (`launch_beat`) が位相ぶん過去に置かれ、
+    /// 実効拍がその位置になる。ループ長を超える位相は折り返す。
+    #[test]
+    fn セルを途中から撃つと起点が位相ぶん過去に置かれる() {
+        let song = two_rows();
+        let mut rt = LauncherRuntime::new();
+        step(&mut rt, &song, 0.0);
+
+        press_from(&mut rt, 1, 10, 1.5);
+        step(&mut rt, &song, 1.0);
+        let tail = rt.rows().track_row(0).tail;
+        assert!((cell_launch_beat(tail) - (1.0 - 1.5)).abs() < 1e-9, "{tail:?}");
+        assert_eq!(tail.effective_beat(1.0), Some(1.5), "撃った瞬間にセルの 1.5 拍目");
+
+        // 4 拍ループのセルに 5.5 拍を指せば 1.5 拍目 (折り返し)。
+        press_from(&mut rt, 1, 10, 5.5);
+        step(&mut rt, &song, 2.0);
+        let tail = rt.rows().track_row(0).tail;
+        assert!((cell_launch_beat(tail) - (2.0 - 1.5)).abs() < 1e-9, "{tail:?}");
+    }
+
+    /// **`CellFrom` は [`LaunchMode`] を見ない。** Toggle のセルが鳴っているときに
+    /// 「ここから鳴らせ」と言われても止めず、位相だけ差し替える。
+    #[test]
+    fn 途中から撃つのは_toggle_で鳴っているセルを止めない() {
+        let mut song = two_rows();
+        song.tracks[0].session_clips[0].launch.mode = LaunchMode::Toggle;
+        let mut rt = LauncherRuntime::new();
+        step(&mut rt, &song, 0.0);
+        press(&mut rt, 1, 10, true);
+        step(&mut rt, &song, 0.0);
+        assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
+
+        press_from(&mut rt, 1, 10, 3.0);
+        step(&mut rt, &song, 2.0);
+        let tail = rt.rows().track_row(0).tail;
+        assert_eq!(tail.cell_clip_id(), Some(10), "Toggle の停止として解釈した: {tail:?}");
+        assert!((cell_launch_beat(tail) - (2.0 - 3.0)).abs() < 1e-9, "{tail:?}");
+    }
+
+    /// **`RephaseRunning` はセルを鳴らしている全行を同じ拍へ揃える。** 停止中 (Silent) の
+    /// 行は触らず、予約が生きている行はその予約に位相を載せる (行き先は変えない)。
+    #[test]
+    fn 鳴っている全行を同じ拍へ揃える() {
+        let song = two_rows();
+        let mut rt = LauncherRuntime::new();
+        step(&mut rt, &song, 0.0);
+        press(&mut rt, 1, 10, true);
+        press(&mut rt, 2, 20, true);
+        step(&mut rt, &song, 0.0);
+        // track 2 は止めておく (Silent)。
+        rt.push_request(LaunchRequest::StopRow { key: RowKey::track(2) });
+        step(&mut rt, &song, 1.0);
+        assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent);
+
+        rt.push_request(LaunchRequest::RephaseRunning { phase_beats: 2.5 });
+        step(&mut rt, &song, 3.0);
+        let t1 = rt.rows().track_row(0).tail;
+        assert!((cell_launch_beat(t1) - (3.0 - 2.5)).abs() < 1e-9, "{t1:?}");
+        assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent, "止めた行を鳴らした");
+
+        // 予約が生きている行: 行き先 (11) はそのまま、位相だけ載る。
+        rt.push_request(LaunchRequest::Cell { key: RowKey::track(1), clip_id: 11, pressed: true });
+        rt.push_request(LaunchRequest::RephaseRunning { phase_beats: 1.0 });
+        step(&mut rt, &song, 4.0);
+        let t1 = rt.rows().track_row(0).tail;
+        assert_eq!(t1.cell_clip_id(), Some(11), "予約の行き先が消えた: {t1:?}");
+        assert!((cell_launch_beat(t1) - (4.0 - 1.0)).abs() < 1e-9, "{t1:?}");
     }
 
     /// 列 1 に「1 周したら次の列へ」を付け、`Song` 側は「列 1 を撃った状態」に
