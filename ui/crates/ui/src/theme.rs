@@ -363,6 +363,13 @@ impl Palette {
     }
 
     /// `bg` の上に置く**本文インク**。明るい背景なら暗インク、暗い背景なら明インク。
+    /// テーマ調のインクが図形基準 3:1 に届かない中間輝度の背景 (減光したクリップ色など) では、
+    /// 同じ極性の極端 (純黒 / 純白) へ寄せて **どんな `bg` でも 3:1 を保証する**。
+    ///
+    /// 極性は輝度の閾値 (= 純黒と純白のコントラストが等しくなる点) で決める。閾値の側の極端は
+    /// 必ず 3:1 以上 (閾値上で両者 4.6:1) なので、寄せれば到達する。「今のインク同士の比」で
+    /// 極性を選ぶと、極端が弱い側を選んで届かない帯が残る。極端な背景では寄せが恒等
+    /// (= テーマ調のインクそのまま)。
     ///
     /// 呼び出し側に明暗 2 色を渡させる旧 `pick_contrast(bg, light, dark)` を畳んだもの。
     /// 引数を取り違えて「どちらも暗色」になる事故 (ライトテーマでクリップ名が消える) が
@@ -370,11 +377,12 @@ impl Palette {
     /// 背後と合成してから渡すこと。
     #[must_use]
     pub fn ink_for(&self, bg: Color) -> Color {
-        if relative_luminance(bg.r, bg.g, bg.b) > CONTRAST_LUMINANCE_THRESHOLD {
+        let ink = if relative_luminance(bg.r, bg.g, bg.b) > CONTRAST_LUMINANCE_THRESHOLD {
             self.ink_on_bright
         } else {
             self.ink_on_dark
-        }
+        };
+        adapt_to(bg, ink, MIN_GRAPHIC_CONTRAST)
     }
 
     /// `accent` 塗り (選択行 / menu hover / アクティブトグル) の上に置くインク。
@@ -447,9 +455,11 @@ fn adapt_to(bg: Color, identity: Color, min_ratio: f32) -> Color {
     let bg_l = relative_luminance(bg.r, bg.g, bg.b);
     let target = if bg_l > CONTRAST_LUMINANCE_THRESHOLD { Color::BLACK } else { Color::WHITE };
     let mut out = identity;
-    // 8% 刻みで target 方向へ寄せる (最大 96%)。決定論的で、テストで固定できる。
-    for step in 0..=12 {
-        out = identity.lerp(target.with_alpha(identity.a), step as f32 * 0.08);
+    // 8% 刻みで target 方向へ寄せ、最後は target そのもの (100%)。決定論的で、テストで
+    // 固定できる。純黒 / 純白はどんな bg でも 3:1 を満たす (L=0.179 で両者 4.6:1) ので、
+    // 極端まで許せば図形基準は必ず到達する。
+    for step in 0..=13 {
+        out = identity.lerp(target.with_alpha(identity.a), (step as f32 * 0.08).min(1.0));
         if contrast_ratio(out, bg) >= min_ratio {
             break;
         }

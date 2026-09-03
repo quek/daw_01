@@ -131,7 +131,10 @@ pub use track::*;
 /// derived palette color and clips inherit. The color is a model value
 /// only; the renderer-side `daw_ui_renderer::Color` conversion and the
 /// palette live in `daw_gui` (view layer). See
-/// `docs/plan_track_clip_color.md`.
+/// `docs/plan_track_clip_color.md`. 2026-09-03 (no version bump):
+/// `AutomationLane.color` / `AutomationClip.color` follow the same two-level
+/// scheme — lane `None` = per-target identity color (derived in the view
+/// layer), clip `None` = inherit the lane's effective color.
 ///
 ///   `17` Aux send / return: `Track.sends: Vec<Send>` is added — each
 /// `Send` is a parallel, gain-scaled copy of the track's signal routed

@@ -404,6 +404,51 @@ mod clip_color_tests {
     }
 
     #[test]
+    fn automation_color_propagates_across_lanes_and_session_cells() {
+        use common::model::{
+            AutomationClip, AutomationClipKey, AutomationLane, AutomationTarget, MASTER_TRACK_ID,
+            SessionAutomationClip, Song, TrackBuiltinParam,
+        };
+        let aclip = |id: u32, content_id: u32| AutomationClip {
+            id,
+            content_id,
+            length_beats: 4.0,
+            ..AutomationClip::default()
+        };
+        let mut lane_a = AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
+        lane_a.id = 1;
+        lane_a.clips = vec![aclip(1, 7), aclip(2, 9)];
+        lane_a.session_clips = vec![SessionAutomationClip {
+            scene_id: 1,
+            clip: aclip(3, 7),
+            launch: Default::default(),
+        }];
+        let mut song_lane = AutomationLane::new(AutomationTarget::SongTempo, 120.0);
+        song_lane.id = 5;
+        song_lane.clips = vec![aclip(1, 7)];
+        let mut song = Song::default();
+        let mut t = track(1, vec![]);
+        t.automation_lanes = vec![lane_a];
+        song.tracks = vec![t];
+        song.song_lanes = vec![song_lane];
+
+        crate::handler::colors::propagate_automation_clip_color(
+            &mut song,
+            AutomationClipKey { track: 1, lane: 1, clip: 1 },
+            Some([0.9, 0.3, 0.3]),
+        );
+        let lane = song.automation_lane_by_key(1, 1).unwrap();
+        // content 7 は arrangement / session / song lane を跨いで同色、content 9 は不変。
+        assert_eq!(lane.clips[0].color, Some([0.9, 0.3, 0.3]));
+        assert_eq!(lane.session_clips[0].clip.color, Some([0.9, 0.3, 0.3]));
+        assert_eq!(lane.clips[1].color, None);
+        assert_eq!(
+            song.automation_lane_by_key(MASTER_TRACK_ID, 5).unwrap().clips[0].color,
+            Some([0.9, 0.3, 0.3])
+        );
+    }
+
+    #[test]
     fn set_color_content_id_zero_colors_only_target() {
         // content_id == 0 (未採番 sentinel) は伝播せず target のみ (別の cid==0 を巻き込まない)。
         let mut tracks =

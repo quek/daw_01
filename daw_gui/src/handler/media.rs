@@ -1027,6 +1027,7 @@ fn install_song_tempo_lane(
         length_beats: (end_beat - start_beat).max(bar),
         content_id,
         content_offset_beats: 0.0,
+        color: None,
     });
     end_beat
 }

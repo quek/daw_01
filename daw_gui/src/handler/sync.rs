@@ -55,7 +55,7 @@ impl AppData {
     /// `pub`: runner (frame flush) と各 handler (ensure-synced) のほか、 headless
     /// 統合テストが frame 境界を模して呼ぶ (`tests/app_state/*`)。
     pub fn flush_song_sync(&mut self) {
-        if self.song_doc.edit_epoch() == self.ipc.last_synced_epoch {
+        if self.song_doc.sync_epoch() == self.ipc.last_synced_epoch {
             return;
         }
         // v23 (review fix #4/#5/#6): daw_audio は各 device の役割を `ports` から
@@ -95,7 +95,7 @@ impl AppData {
         // choreography 完了。 現 epoch を synced ベースラインにする
         // (resolve_default_device_ports の normalize bump も含めて吸収する
         // ため末尾で読む = 次 frame で epoch 一致 → no-op に収束)。
-        self.ipc.last_synced_epoch = self.song_doc.edit_epoch();
+        self.ipc.last_synced_epoch = self.song_doc.sync_epoch();
     }
 
     /// (r.md #5 ARA2) Expose each ARA-capable device's track audio clips to the

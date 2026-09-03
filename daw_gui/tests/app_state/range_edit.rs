@@ -336,6 +336,7 @@ fn オートメーションクリップを選ぶと範囲もそこへ移る() {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(

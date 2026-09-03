@@ -7,7 +7,7 @@
 
 use crate::widgets::arrangement::live_clip_key;
 use daw_ui_core::{
-    ColorPickerStyle, Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
+    Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
@@ -549,7 +549,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     // gui_01 #028 (M14 Phase 63n-3): automation clip 上の右クリック →
-    // Make Unique / Delete。 ただし上で point popup を先に register してい
+    // Make Unique / Delete / 色... / レーン色に戻す。 ただし上で point popup を先に register してい
     // て、 同 frame で右クリックが **point rect 上** だったら clip popup の
     // 登録を skip する (= 同位置で 2 つの popup が同時 open する bug 回避)。
     // r.md #35: context menu は右ボタン **release** (かつ移動 4px 未満) で開くようになったので、
@@ -562,9 +562,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if !suppress_clip_menu {
         for (auto_key, rect) in &resp.automation_clip_rects {
             let widget_key = *auto_key;
+            // color_picker の anchor 用 (通常 clip の「色...」と同じ)。
+            let menu_rect = *rect;
             ui.context_menu_for(
                 *rect,
-                &["Make Unique", "Delete"],
+                &["Make Unique", "Delete", "色...", "レーン色に戻す"],
                 move |idx, ui| {
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         let model_key = common::model::AutomationClipKey {
@@ -579,12 +581,38 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             1 => app.handle_event(AppEvent::DeleteAutomationClips {
                                 keys: vec![model_key],
                             }),
+                            // 個別 clip 色の上書き (通常 clip の「色...」と同じ picker)。
+                            2 => app.open_color_picker(
+                                ColorPickerTarget::AutomationClip(model_key),
+                                menu_rect,
+                            ),
+                            // 上書きを外してレーン識別色へ (レーンには header メニューが
+                            // 無いので、通常 clip の「トラックに揃える」に当たる口をここに置く)。
+                            3 => app.handle_event(AppEvent::SetAutomationClipColor {
+                                target: model_key,
+                                color: None,
+                            }),
                             _ => {}
                         }
                     }));
                 },
             );
         }
+    }
+
+    // automation lane header の右クリックメニュー (track header の「色... / クリップ色を
+    // トラックに揃える」のレーン版)。widget は rect を返すだけ (track_header_rects と同 idiom)。
+    for (lane_key, rect) in &resp.automation_lane_header_rects {
+        // widget の AutomationLaneKey を common の同型へ field コピー (hover_lane と同 idiom)。
+        let lane_key = common::model::AutomationLaneKey { track: lane_key.track, lane: lane_key.lane };
+        let rect = *rect;
+        ui.context_menu_for(rect, &["色...", "クリップ色をレーンに揃える"], move |idx, ui| {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| match idx {
+                0 => app.open_color_picker(ColorPickerTarget::AutomationLane(lane_key), rect),
+                1 => app.handle_event(AppEvent::ResetAutomationLaneClipColors { lane: lane_key }),
+                _ => {}
+            }));
+        });
     }
 
     device_drag_over_headers(app, ui, &resp);
@@ -712,7 +740,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    render_color_picker_overlay(app, ui);
+    crate::view::color_picker_overlay::render(app, ui);
 
     // gui_01 #071: 空きレーン右クリック (`SecondaryClickEmpty`) → clip 生成 context menu。
     render_clip_create_menu_overlay(app, ui);
@@ -1077,94 +1105,6 @@ fn render_section_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     );
 }
 
-/// v18 (`docs/plan_track_clip_color.md`, gui_01 #058): `color_picker_target` が
-/// `Some` の間、保存した anchor (開いた場所 = header / clip / inspector swatch の
-/// rect) に color_picker overlay を描画する。`picked` は live で
-/// `SetTrackColor`/`SetClipColor` に流す (open 中 widget 側は `current` を無視
-/// するので flicker しない)、`dismissed` で target を `None` に戻す。対象 track /
-/// clip が削除された (= 現在色を引けない) ときは picker を閉じる。
-fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
-    let (Some(target), Some(anchor)) = (app.ui_ephemeral.color_picker_target, app.ui_ephemeral.color_picker_anchor)
-    else {
-        return;
-    };
-    let style = ColorPickerStyle::from_palette(&app.theme.core);
-    let palette = track_color::palette_colors();
-
-    // 対象の現在色を引く。対象が消えていれば picker を閉じる。
-    let current: Option<Color> = match target {
-        ColorPickerTarget::Track(track_id) => app
-            .song_doc.song()
-            .track_by_id(track_id)
-            .map(|t| track_color::to_renderer(track_color::effective_track_color(t))),
-        ColorPickerTarget::Clip(clip_ref) => app
-            .song_doc.song()
-            .track_by_id(clip_ref.track_id)
-            .and_then(|t| {
-                t.clip_by_id(clip_ref.clip_id).map(|c| {
-                    track_color::to_renderer(track_color::effective_clip_color(t, c))
-                })
-            }),
-        ColorPickerTarget::Section(id) => app
-            .song_doc.song()
-            .sections
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| Color { r: s.color[0], g: s.color[1], b: s.color[2], a: 1.0 }),
-        // r.md #87: ランチャーの列。`Scene::color` は `None` = パレット既定なので、
-        // 未設定のときは並び順から導いた既定色を初期値に見せる (トラック色と同流儀)。
-        ColorPickerTarget::Scene(id) => app.song_doc.song().scenes.iter().position(|s| s.id == id).map(|i| {
-            let s = &app.song_doc.song().scenes[i];
-            let rgb = s.color.unwrap_or(track_color::PALETTE[i % track_color::PALETTE.len()]);
-            Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
-        }),
-    };
-
-    let Some(current) = current else {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.ui_ephemeral.color_picker_target = None;
-        }));
-        return;
-    };
-
-    let r = ui.color_picker(("arr_color_picker", target_id_hash(target)), anchor, current, &palette, &style);
-    if let Some(c) = r.picked {
-        let rgb = track_color::from_renderer(c);
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| match target {
-            ColorPickerTarget::Track(track) => {
-                app.handle_event(AppEvent::SetTrackColor { track, color: Some(rgb) });
-            }
-            ColorPickerTarget::Clip(clip_ref) => {
-                app.handle_event(AppEvent::SetClipColor { target: clip_ref, color: Some(rgb) });
-            }
-            ColorPickerTarget::Section(id) => {
-                app.handle_event(AppEvent::SetSectionColor { id, color: rgb });
-            }
-            // r.md #87: ランチャーの列。
-            ColorPickerTarget::Scene(scene_id) => {
-                app.handle_event(AppEvent::Launcher(
-                    crate::event_launcher::LauncherEvent::SetSceneColor { scene_id, color: rgb },
-                ));
-            }
-        }));
-    }
-    if r.dismissed {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.ui_ephemeral.color_picker_target = None;
-        }));
-    }
-}
-
-/// color_picker の widget id 用に target を一意な数値へ畳む (track / clip で衝突
-/// しないよう track は最上位 bit を立てる)。
-fn target_id_hash(target: ColorPickerTarget) -> u64 {
-    match target {
-        ColorPickerTarget::Track(id) => (1u64 << 63) | id as u64,
-        ColorPickerTarget::Clip(r) => ((r.track_id as u64) << 32) | r.clip_id as u64,
-        ColorPickerTarget::Section(id) => (1u64 << 62) | id as u64,
-        ColorPickerTarget::Scene(id) => (1u64 << 61) | id as u64,
-    }
-}
 
 
 

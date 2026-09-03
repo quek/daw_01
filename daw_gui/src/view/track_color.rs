@@ -10,7 +10,7 @@
 //! - `Clip.color  == None`  ⇒ 所属トラックの effective 色を継承
 //! - `Clip.color  == Some`  ⇒ クリップ個別上書き
 
-use common::model::{Clip, Track};
+use common::model::{AutomationClip, AutomationLane, Clip, Track};
 use daw_ui_renderer::Color;
 
 /// トラック / クリップの自動割り当て + ピッカーで共有する 16 色パレット
@@ -57,6 +57,22 @@ pub fn effective_track_color(track: &Track) -> [f32; 3] {
 #[must_use]
 pub fn effective_clip_color(track: &Track, clip: &Clip) -> [f32; 3] {
     clip.color.unwrap_or_else(|| effective_track_color(track))
+}
+
+/// オートメーションレーンの実効色: 明示上書き (`Some`) か、無ければ対象種別ごとの
+/// 識別色 (`lane_identity_color`、widget と同じ 1 本)。`effective_track_color` のレーン版。
+#[must_use]
+pub fn effective_lane_color(lane: &AutomationLane) -> [f32; 3] {
+    lane.color.unwrap_or_else(|| {
+        from_renderer(crate::widgets::arrangement::view_build::lane_identity_color(&lane.target))
+    })
+}
+
+/// オートメーションクリップの実効色: 明示上書き (`Some`) か、無ければ所属レーンの実効色を
+/// 継承。`effective_clip_color` のオートメーション版。
+#[must_use]
+pub fn effective_automation_clip_color(lane: &AutomationLane, clip: &AutomationClip) -> [f32; 3] {
+    clip.color.unwrap_or_else(|| effective_lane_color(lane))
 }
 
 /// model の `[f32; 3]` を renderer `Color` (不透明) に変換。

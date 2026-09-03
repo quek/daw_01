@@ -97,6 +97,13 @@ impl AppData {
         self.song_doc.edit_checked(scope, f) == Some(true)
     }
 
+    /// ランチャーの再生状態だけを書く ([`SongDoc::edit_playback`] 参照): undo に積まず
+    /// `*` も立てず、子プロセス sync だけ走る。戻り値 = 実際に書き換わったか。
+    pub fn edit_playback(&mut self, f: impl FnOnce(&mut common::model::Song) -> bool) -> bool {
+        self.sync_export_lock();
+        self.song_doc.edit_playback(f) == Some(true)
+    }
+
     /// タイムラインを ripple する Song 編集 (セクションの移動 / 複製 / 範囲削除) の
     /// 標準口。 closure が返した [`common::model::Ripple`] 列を、 **`Song` の外に住む
     /// 時間位置** — 再生ループ範囲 (session state、`common::model::LoopRegion`) —

@@ -1884,6 +1884,7 @@ fn automation_clip_content_roundtrip() {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(
@@ -1933,6 +1934,7 @@ fn automation_clip_counts_toward_clip_content_refcount() {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -1965,6 +1967,7 @@ fn gc_clip_contents_keeps_automation_clip_references() {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -2080,6 +2083,7 @@ fn gc_clip_contents_keeps_song_lane_references() {
             length_beats: 4.0,
             content_id: cid,
             content_offset_beats: 0.0,
+            color: None,
         }],
         ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
     });
@@ -2110,6 +2114,7 @@ fn ensure_clip_contents_reassigns_song_lane_sentinel_ids() {
             length_beats: 4.0,
             content_id: 0,
             content_offset_beats: 0.0,
+            color: None,
         }],
         ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
     });

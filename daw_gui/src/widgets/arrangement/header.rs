@@ -63,7 +63,14 @@ fn draw_rows_inner(
         // M14 Phase 63n-1 (#028): row top は `frame::build` の prefix sum tops をそのまま使う
         // (`header_pane.y == lanes.y` は rect 分割の y 原点共通から自明)。
         let row_y = f.tops[visible_i];
-        let row = Rect { x: header_pane.x, y: row_y, w: header_pane.w, h: view.track_row_h };
+        // 行高は per-track override 込みの実効値 (lane 行と同じ規則)。`view.track_row_h` 直参照だと
+        // 縮めた行で header rect が下の lane header に食い込み、右クリックメニューが 2 つ開く。
+        let row = Rect {
+            x: header_pane.x,
+            y: row_y,
+            w: header_pane.w,
+            h: effective_track_row_h(t, view.track_row_h),
+        };
         if row.y + row.h < header_pane.y || row.y > header_pane.y + header_pane.h {
             continue;
         }

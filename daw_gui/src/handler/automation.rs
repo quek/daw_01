@@ -1119,6 +1119,7 @@ impl AppData {
                 source_content_id: clip.content_id,
                 points,
                 name,
+                color: clip.color,
             });
         }
         let count = out.len();
@@ -1198,6 +1199,7 @@ impl AppData {
                     length_beats: cc.length_beats,
                     content_id,
                     content_offset_beats: 0.0,
+                    color: cc.color,
                 };
                 let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
                 lane.clips.insert(pos, new_clip);
@@ -1264,20 +1266,8 @@ impl AppData {
         }
         self.edit_song(|song| {
             for d in deltas {
-                let template = {
-                    let Some(source_lane) =
-                        song.automation_lane_by_key(d.from.track, d.from.lane)
-                    else {
-                        continue;
-                    };
-                    let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
-                        continue;
-                    };
-                    (
-                        source_clip.content_id,
-                        source_clip.name.clone(),
-                        source_clip.length_beats,
-                    )
+                let Some(template) = automation_clip_template(song, d.from) else {
+                    continue;
                 };
                 let Some(target_lane) =
                     song.automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
@@ -1287,11 +1277,13 @@ impl AppData {
                 let new_id = target_lane.alloc_clip_id();
                 let new_clip = common::model::AutomationClip {
                     id: new_id,
-                    name: template.1,
+                    name: template.name,
                     start_beat: d.next_start_beat,
-                    length_beats: template.2,
-                    content_id: template.0,
+                    length_beats: template.length_beats,
+                    content_id: template.content_id,
                     content_offset_beats: 0.0,
+                    // 複製は元 clip の色を引き継ぐ (`Clip` の複製と同じ)。
+                    color: template.color,
                 };
                 let start = new_clip.start_beat;
                 let pos = target_lane
@@ -1313,33 +1305,17 @@ impl AppData {
         }
         self.edit_song(|song| {
             for d in deltas {
-                let template = {
-                    let Some(source_lane) =
-                        song.automation_lane_by_key(d.from.track, d.from.lane)
-                    else {
-                        continue;
-                    };
-                    let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
-                        continue;
-                    };
-                    (
-                        source_clip.content_id,
-                        source_clip.name.clone(),
-                        source_clip.length_beats,
-                    )
+                let Some(template) = automation_clip_template(song, d.from) else {
+                    continue;
                 };
                 // Content を deep clone (`ClipContent` enum 全体の clone なので
                 // Midi/Audio/Automation いずれも対応)。content が無い場合は空
                 // Automation で作成。
                 let cloned_content = song
                     .clip_contents
-                    .get(&template.0)
+                    .get(&template.content_id)
                     .cloned()
-                    .unwrap_or_else(|| {
-                        common::model::ClipContent::Automation(
-                            common::model::AutomationContent::default(),
-                        )
-                    });
+                    .unwrap_or_else(empty_automation_content);
                 let new_content_id = song.alloc_content_id();
                 song.clip_contents.insert(new_content_id, cloned_content);
                 let Some(target_lane) =
@@ -1350,11 +1326,12 @@ impl AppData {
                 let new_id = target_lane.alloc_clip_id();
                 let new_clip = common::model::AutomationClip {
                     id: new_id,
-                    name: template.1,
+                    name: template.name,
                     start_beat: d.next_start_beat,
-                    length_beats: template.2,
+                    length_beats: template.length_beats,
                     content_id: new_content_id,
                     content_offset_beats: 0.0,
+                    color: template.color,
                 };
                 let start = new_clip.start_beat;
                 let pos = target_lane
@@ -1391,10 +1368,10 @@ impl AppData {
         source: common::model::AutomationClipKey,
         new_start_beat: f64,
     ) -> Option<common::model::AutomationClipKey> {
-        let (content_id, name, length) = {
+        let (content_id, name, length, color) = {
             let lane = self.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
             let src_clip = lane.clip_by_id(source.clip)?;
-            (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
+            (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats, src_clip.color)
         };
         self.edit_song(move |song| {
             let lane = song.automation_lane_by_key_mut(source.track, source.lane)?;
@@ -1406,6 +1383,7 @@ impl AppData {
                 length_beats: length,
                 content_id,
                 content_offset_beats: 0.0,
+                color,
             };
             let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
             lane.clips.insert(pos, new_clip);
@@ -1424,21 +1402,17 @@ impl AppData {
         source: common::model::AutomationClipKey,
         new_start_beat: f64,
     ) -> Option<common::model::AutomationClipKey> {
-        let (src_content_id, name, length) = {
+        let (src_content_id, name, length, color) = {
             let lane = self.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
             let src_clip = lane.clip_by_id(source.clip)?;
-            (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
+            (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats, src_clip.color)
         };
         let cloned_content = self
             .song_doc.song()
             .clip_contents
             .get(&src_content_id)
             .cloned()
-            .unwrap_or_else(|| {
-                common::model::ClipContent::Automation(
-                    common::model::AutomationContent::default(),
-                )
-            });
+            .unwrap_or_else(empty_automation_content);
         self.edit_song(move |song| {
             let new_content_id = song.alloc_content_id();
             song.clip_contents.insert(new_content_id, cloned_content);
@@ -1451,6 +1425,7 @@ impl AppData {
                 length_beats: length,
                 content_id: new_content_id,
                 content_offset_beats: 0.0,
+                color,
             };
             let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
             lane.clips.insert(pos, new_clip);
@@ -1638,6 +1613,7 @@ impl AppData {
                 length_beats: len_beats,
                 content_id: new_content_id,
                 content_offset_beats: 0.0,
+                color: None,
             };
             let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
             lane.clips.insert(pos, new_clip);
@@ -1645,4 +1621,32 @@ impl AppData {
         });
     }
 
+}
+
+/// 複製元 automation clip の「新 clip へ写す属性」 (Ctrl+drag / Ctrl+Shift+drag の
+/// clone が共有する)。位置 (`start_beat`) と `content_offset_beats` は写さない。
+struct AutomationClipTemplate {
+    content_id: common::model::ContentId,
+    name: String,
+    length_beats: f64,
+    color: Option<[f32; 3]>,
+}
+
+fn automation_clip_template(
+    song: &common::model::Song,
+    key: common::model::AutomationClipKey,
+) -> Option<AutomationClipTemplate> {
+    let clip = song.automation_lane_by_key(key.track, key.lane)?.clip_by_id(key.clip)?;
+    Some(AutomationClipTemplate {
+        content_id: clip.content_id,
+        name: clip.name.clone(),
+        length_beats: clip.length_beats,
+        color: clip.color,
+    })
+}
+
+/// deep clone 元の content が無いときの空 automation content (`ClipContent::default()` は
+/// Midi なので使えない)。
+fn empty_automation_content() -> common::model::ClipContent {
+    common::model::ClipContent::Automation(common::model::AutomationContent::default())
 }

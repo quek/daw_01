@@ -21,6 +21,11 @@ use crate::app_types::ClipKey;
 pub enum ColorPickerTarget {
     Track(u32),
     Clip(ClipKey),
+    /// オートメーションクリップ (`AutomationClip::color`)。arrangement / session 両方の
+    /// 右クリックメニュー「色...」から開く。
+    AutomationClip(common::model::AutomationClipKey),
+    /// オートメーションレーン (`AutomationLane::color`)。lane header の右クリックから開く。
+    AutomationLane(common::model::AutomationLaneKey),
     /// Arranger セクション帯の色。
     Section(u32),
     /// r.md #87: ランチャーの列 (シーン) の色ストライプ (`Scene::id`)。

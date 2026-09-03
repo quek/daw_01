@@ -264,6 +264,7 @@ mod tests {
                 length_beats: 64.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
         });

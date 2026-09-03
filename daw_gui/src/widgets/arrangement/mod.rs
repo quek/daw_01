@@ -456,6 +456,9 @@ pub struct ArrangementAutomationClip {
     /// link glyph を描く (audio clip と同 path)。 fill / border は `lane.color` が source で、 hue 値は
     /// 描画に使わない (リンク識別のみ。 audio clip の `share_group_color` と同方針)。
     pub share_group_color: Option<f32>,
+    /// per-clip 色上書き (`AutomationClip::color`)。`None` = `lane.color` (レーン識別色) を継承。
+    /// 通常 clip の `ArrangementClip::color` に当たる。
+    pub color: Option<Color>,
 }
 
 /// M14 Phase 63n-1 (#028): automation lane。
@@ -881,6 +884,9 @@ pub struct ArrangementResponse {
     /// ドラッグ/数値入力で編集する (旧スライダー帯は廃止)。 `automation_point_rects`
     /// と同 semantics (描画順 = 上から下、 hidden / collapsed / 行高不足の lane は除外)。
     pub automation_lane_default_rects: Vec<(AutomationLaneKey, Rect)>,
+    /// 各 visible automation lane の **header 全体** rect (caller が `context_menu_for` を
+    /// 重ねる用。`track_header_rects` のレーン版、同 semantics)。
+    pub automation_lane_header_rects: Vec<(AutomationLaneKey, Rect)>,
     /// point drag セッション進行中の live 値 (`Some` のとき caller は
     /// `cursor` 近傍に `value_norm` を人間可読単位で表示する)。 release frame では `None`。
     pub automation_point_drag: Option<AutomationPointDragInfo>,
@@ -926,6 +932,7 @@ impl Default for ArrangementResponse {
             dragging_section: None,
             section_rects: Vec::new(),
             automation_lane_default_rects: Vec::new(),
+            automation_lane_header_rects: Vec::new(),
             automation_point_drag: None,
             hovered_automation_segment: None,
             launcher: LauncherResponse::default(),
@@ -2221,6 +2228,20 @@ fn compute_section_drag_beat_delta(
 /// FNV-1a 風 fold (大きな素数倍 + xor)。 100 clip × 4 fold step = ~100ns @ 4GHz、 16ms 予算
 /// の 0.001%。 `ClipView` は gui_01 公開型なので widget が hash する権利あり (no-Clone
 /// 不変条件にも触れない、 `u32`/`f64` は Copy)。
+/// `fold_arrangement_clip_hash` 用: clip 色 (`Option<Color>`) の marker。`None` は
+/// `u64::MAX` sentinel、`Some` は 4 成分の bit 列を畳む。通常 clip / automation clip で共有。
+fn clip_color_marker(color: Option<Color>) -> u64 {
+    const PRIME: u64 = 0x100_0000_01B3;
+    color.map_or(u64::MAX, |col| {
+        let mut a: u64 = 0xA5A5_5A5A_A5A5_5A5A;
+        for ch in [col.r, col.g, col.b, col.a] {
+            a ^= u64::from(ch.to_bits());
+            a = a.wrapping_mul(PRIME);
+        }
+        a
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
     const PRIME: u64 = 0x100_0000_01B3; // FNV-1a 64bit prime
@@ -2267,23 +2288,8 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             // new Arc → ptr 変化)。 内容 hash は O(n) で過剰、 ptr 比較で十分。
             h ^= c.name.as_ptr() as u64;
             h = h.wrapping_mul(PRIME);
-            // color / share_group_color: 描画色変化を検知 (automation clip arm と対称、
-            // None は u64::MAX sentinel)。
-            let color_marker = match c.color {
-                None => u64::MAX,
-                Some(col) => {
-                    let mut a: u64 = 0xA5A5_5A5A_A5A5_5A5A;
-                    a ^= u64::from(col.r.to_bits());
-                    a = a.wrapping_mul(PRIME);
-                    a ^= u64::from(col.g.to_bits());
-                    a = a.wrapping_mul(PRIME);
-                    a ^= u64::from(col.b.to_bits());
-                    a = a.wrapping_mul(PRIME);
-                    a ^= u64::from(col.a.to_bits());
-                    a
-                }
-            };
-            h ^= color_marker;
+            // color / share_group_color: 描画色変化を検知 (automation clip arm と対称)。
+            h ^= clip_color_marker(c.color);
             h = h.wrapping_mul(PRIME);
             h ^= c.share_group_color.map_or(u64::MAX, |hue| u64::from(hue.to_bits()));
             h = h.wrapping_mul(PRIME);
@@ -2358,6 +2364,10 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
                 h ^= ac.start_beat.to_bits();
                 h = h.wrapping_mul(PRIME);
                 h ^= ac.len_beats.to_bits();
+                h = h.wrapping_mul(PRIME);
+                // color: 通常 clip と同じ marker。「clip 個別の変化は widget が吸収」 の
+                // 契約どおり fold 側でも拾う。
+                h ^= clip_color_marker(ac.color);
                 h = h.wrapping_mul(PRIME);
                 h ^= ac.share_group_color.map_or(u64::MAX, |hue| u64::from(hue.to_bits()));
                 h = h.wrapping_mul(PRIME);

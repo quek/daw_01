@@ -430,9 +430,13 @@ pub(super) fn data_generation(tracks: &[ArrangementTrack]) -> u64 {
         }
         for lane in &t.automation_lanes {
             lane.label.hash(&mut h);
+            [lane.color.r, lane.color.g, lane.color.b].map(f32::to_bits).hash(&mut h);
             for ac in &lane.clips {
                 ac.id.hash(&mut h);
                 ac.name.hash(&mut h);
+                if let Some(col) = ac.color {
+                    [col.r, col.g, col.b, col.a].map(f32::to_bits).hash(&mut h);
+                }
             }
         }
     }
@@ -631,6 +635,7 @@ fn build_arrangement_lanes_from_slice(
                         } else {
                             None
                         },
+                        color: c.color.map(track_color::to_renderer),
                     }
                 })
                 .collect();
@@ -643,7 +648,8 @@ fn build_arrangement_lanes_from_slice(
                 plugin_range: range,
                 label: display.label,
                 icon_glyph: display.icon_glyph,
-                color: display.color,
+                // ユーザー上書き > 対象種別の識別色 (`track_color::effective_lane_color` と同じ規則)。
+                color: lane.color.map_or(display.color, track_color::to_renderer),
                 enabled: lane.enabled,
                 visible: lane.visible,
                 // session override → model の順で解き、**最後にペイン高で頭打ち**にする。
@@ -657,6 +663,13 @@ fn build_arrangement_lanes_from_slice(
             }
         })
         .collect()
+}
+
+/// レーンの識別色 (対象種別ごとの固定色)。`AutomationClip::color == None` のときの実効色で、
+/// color_picker の初期値 (`render_color_picker_overlay`) が widget と同じ 1 本から引くための口。
+#[must_use]
+pub fn lane_identity_color(target: &common::model::AutomationTarget) -> Color {
+    lane_target_display(target, None).color
 }
 
 struct LaneDisplay {

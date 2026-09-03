@@ -336,6 +336,12 @@ pub struct AutomationLane {
     /// Phase 1+.
     #[serde(default = "default_lane_height_px")]
     pub height_px: u16,
+    /// レーンの色上書き (`docs/plan_track_clip_color.md` 「オートメーションクリップ」)。
+    /// `None` = 対象種別ごとの識別色 (Volume は青、Pan は緑 …、view 層が導出)。
+    /// トラックの `Track::color` に当たる: `AutomationClip::color == None` の clip は
+    /// この実効色を継承する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
     /// Automation clips placed along the track timeline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clips: Vec<AutomationClip>,
@@ -375,6 +381,7 @@ impl AutomationLane {
             enabled: true,
             visible: true,
             height_px: default_lane_height_px(),
+            color: None,
             clips: Vec::new(),
             next_clip_id: 1,
             session_clips: Vec::new(),
@@ -463,12 +470,16 @@ impl AutomationLane {
         self.clips.iter().position(|c| c.id == clip_id)
     }
 
+    /// id で clip を引く。**アレンジの `clips` とセッションのセル両方**を探す
+    /// ([`Track::clip_by_id`](crate::model::Track::clip_by_id) と同じ `all_clips` 契約 —
+    /// 2 つは同じ id 空間なので曖昧にならない)。アレンジ側だけを見たいときは
+    /// [`Self::clip_index_by_id`]。
     pub fn clip_by_id(&self, clip_id: u32) -> Option<&AutomationClip> {
-        self.clips.iter().find(|c| c.id == clip_id)
+        self.all_clips().find(|c| c.id == clip_id)
     }
 
     pub fn clip_by_id_mut(&mut self, clip_id: u32) -> Option<&mut AutomationClip> {
-        self.clips.iter_mut().find(|c| c.id == clip_id)
+        self.all_clips_mut().find(|c| c.id == clip_id)
     }
 }
 
@@ -502,6 +513,12 @@ pub struct AutomationClip {
     /// と完全に同一 (`AutomationClip` は `Clip` と同形なので窓も対称)。
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub content_offset_beats: f64,
+    /// per-clip の色上書き (`docs/plan_track_clip_color.md` 「オートメーションクリップ」)。
+    /// `None` = レーン識別色 (対象種別ごとの固定色) を継承、`Some(rgb)` = 明示上書き。
+    /// 意味・伝播規則は [`Clip::color`](crate::model::Clip::color) と同一
+    /// (SET は content 共有クリップ全体へ伝播、複製 / 分割は引き継ぐ)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 3]>,
 }
 
 impl AutomationClip {

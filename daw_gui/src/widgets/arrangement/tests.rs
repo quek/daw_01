@@ -1317,24 +1317,27 @@
         let theme = test_theme();
         let p = &theme.core;
         let style = ArrangementStyle::from_theme(&theme);
+        // `ink_for` は足りなければ純黒 / 純白へ寄せるので、テーマのインクと完全一致では
+        // なく **極性** (暗インクか明インクか) を見る。
+        let is_dark = |c: Color| {
+            daw_ui_core::color::relative_luminance(c.r, c.g, c.b)
+                <= daw_ui_core::color::CONTRAST_LUMINANCE_THRESHOLD
+        };
 
         // 明るい fill (黄 selected) → 暗インク。
-        assert_eq!(
-            clip_text_color_for(p, &style, style.clip_selected_fill, style.bg),
-            p.ink_on_bright,
+        assert!(
+            is_dark(clip_text_color_for(p, &style, style.clip_selected_fill, style.bg)),
             "明るい黄 fill には暗インク"
         );
         // 既定 fill (スチールブルー) は画面上明るい (sRGB 127,157,190) → 暗インク。
         // かつて明インクが選ばれていたが実効 2.8:1 で AA を大きく割っていた。
-        assert_eq!(
-            clip_text_color_for(p, &style, style.clip_default_fill, style.bg),
-            p.ink_on_bright,
+        assert!(
+            is_dark(clip_text_color_for(p, &style, style.clip_default_fill, style.bg)),
             "既定 fill は画面上明るいので暗インク"
         );
         // 画面上も暗い fill → 明インク。
-        assert_eq!(
-            clip_text_color_for(p, &style, daw_ui_core::theme::srgb(0.10, 0.14, 0.22), style.bg),
-            p.ink_on_dark,
+        assert!(
+            !is_dark(clip_text_color_for(p, &style, daw_ui_core::theme::srgb(0.10, 0.14, 0.22), style.bg)),
             "暗い紺 fill には明インク"
         );
         // 半透明の薄緑 share fill: 不透明なら明るく暗インク寄りだが、 暗い lane bg と薄い alpha で
@@ -1472,6 +1475,42 @@
             fold_arrangement_clip_hash(&before),
             fold_arrangement_clip_hash(&after),
             "clip.color 変化で hash が変わる",
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_automation_clip_color() {
+        let lane = |color: Option<Color>| ArrangementAutomationLane {
+            id: 11,
+            target: volume_target(),
+            plugin_range: None,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: vec![ArrangementAutomationClip {
+                id: 1,
+                start_beat: 0.0,
+                len_beats: 4.0,
+                name: Arc::from("c"),
+                points: Vec::new(),
+                share_group_color: None,
+                color,
+            }],
+        };
+        let mk = |color: Option<Color>| {
+            let mut t = track(10, "t0", vec![]);
+            t.automation_lanes_collapsed = false;
+            t.automation_lanes = vec![lane(color)];
+            vec![t]
+        };
+        assert_ne!(
+            fold_arrangement_clip_hash(&mk(None)),
+            fold_arrangement_clip_hash(&mk(Some(Color::rgb(0.8, 0.2, 0.2)))),
+            "automation clip.color 変化で hash が変わる",
         );
     }
 

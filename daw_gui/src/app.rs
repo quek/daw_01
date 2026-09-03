@@ -430,7 +430,6 @@ impl AppData {
                 track_rename_id: None,
                 color_picker_target: None,
                 color_picker_anchor: None,
-                color_picker_session_dirty: false,
                 clip_create_menu: None,
                 clip_create_menu_open: false,
                 section_menu: None,
@@ -1583,23 +1582,8 @@ impl AppData {
             AppEvent::SetTrackPan { track, pan } => {
                 self.set_track_pan(track, pan);
             }
-            AppEvent::SetTrackColor { track, color } => {
-                self.edit_song(|song| {
-                    if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track) {
-                        t.color = color;
-                    }
-                });
-            }
-            AppEvent::ResetTrackClipColors { track } => {
-                // 全 clip の上書きを外す (= track 色継承)。undo は is_undoable で取得済。
-                self.edit_song(|song| {
-                    if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track) {
-                        for clip in &mut t.clips {
-                            clip.color = None;
-                        }
-                    }
-                });
-            }
+            AppEvent::SetTrackColor { track, color } => self.set_track_color(track, color),
+            AppEvent::ResetTrackClipColors { track } => self.reset_track_clip_colors(track),
             AppEvent::ToggleTrackMute(track) => {
                 self.toggle_track_mute(track);
             }
@@ -1922,8 +1906,15 @@ impl AppData {
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
             }
-            AppEvent::SetClipColor { target, color } => {
-                self.edit_song(|song| propagate_clip_color(&mut song.tracks, target, color));
+            AppEvent::SetClipColor { target, color } => self.set_clip_color(target, color),
+            AppEvent::SetAutomationClipColor { target, color } => {
+                self.set_automation_clip_color(target, color);
+            }
+            AppEvent::SetAutomationLaneColor { lane, color } => {
+                self.set_automation_lane_color(lane, color);
+            }
+            AppEvent::ResetAutomationLaneClipColors { lane } => {
+                self.reset_automation_lane_clip_colors(lane);
             }
             AppEvent::SetClipMuted { target, muted } => {
                 // clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。

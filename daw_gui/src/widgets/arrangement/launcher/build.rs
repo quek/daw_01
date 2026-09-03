@@ -157,7 +157,8 @@ fn lane_row(
             LauncherCellView {
                 clip_id: sc.clip.id,
                 name: Arc::from(song.content_name(sc.clip.content_id)),
-                color: lane.color,
+                // per-clip 上書き > レーン識別色 (アレンジの automation clip と同じ優先順)。
+                color: sc.clip.color.map_or(lane.color, track_color::to_renderer),
                 muted: false,
                 linked: is_shared(refcounts, sc.clip.content_id),
                 follow: sc.launch.follow.enabled,

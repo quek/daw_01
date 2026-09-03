@@ -352,6 +352,7 @@ impl AppData {
                         length_beats: clip_len,
                         content_id,
                         content_offset_beats: 0.0,
+                        color: None,
                     });
                 } else {
                     let lid = song.alloc_song_lane_id();
@@ -364,6 +365,7 @@ impl AppData {
                             length_beats: clip_len,
                             content_id,
                             content_offset_beats: 0.0,
+                            color: None,
                         }],
                         next_clip_id: 2,
                         ..AutomationLane::new(target.clone(), default_value)
@@ -390,6 +392,7 @@ impl AppData {
                             length_beats: clip_len,
                             content_id,
                             content_offset_beats: 0.0,
+                            color: None,
                         });
                     } else {
                         let lid = track.alloc_lane_id();
@@ -402,6 +405,7 @@ impl AppData {
                                 length_beats: clip_len,
                                 content_id,
                                 content_offset_beats: 0.0,
+                                color: None,
                             }],
                             next_clip_id: 2,
                             ..AutomationLane::new(target.clone(), default_value)

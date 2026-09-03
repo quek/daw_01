@@ -598,6 +598,34 @@ impl super::Song {
     }
 }
 
+impl Song {
+    /// **再生状態** (`Track.launcher` / `AutomationLane.launcher` /
+    /// `last_launched_scene_id`) を `live` から写す。undo / redo で Song を履歴の
+    /// snapshot に差し替えるとき、「何が鳴っているか」は文書の履歴に属さない
+    /// (`docs/plan_rmd_87_clip_launcher.md` §1.3) ので、差し替え後の Song に**今の**
+    /// 再生状態を持ち越すために使う。id で突き合わせ、snapshot 側に無い行は触らない。
+    /// 写した先のセルが snapshot に存在しないときの整合 (`LauncherStopped` へ落とす)
+    /// は続けて [`Song::normalize_session`] が担う。
+    pub fn carry_playback_state_from(&mut self, live: &Song) {
+        self.last_launched_scene_id = live.last_launched_scene_id;
+        for t in &mut self.tracks {
+            let Some(lt) = live.track_by_id(t.id) else { continue };
+            t.launcher = lt.launcher;
+            for lane in &mut t.automation_lanes {
+                if let Some(ll) = lt.lane_by_id(lane.id) {
+                    lane.launcher = ll.launcher;
+                }
+            }
+        }
+        for lane in &mut self.song_lanes {
+            if let Some(ll) = live.song_lane_by_id(lane.id) {
+                lane.launcher = ll.launcher;
+            }
+        }
+        self.normalize_session();
+    }
+}
+
 /// セルを置けない行 ([`AutomationTarget::accepts_launcher_cells`](super::AutomationTarget::accepts_launcher_cells) が `false`) の掃除。
 ///
 /// セルを捨てるだけでなく主導権も [`RowPlayback::Arranger`] へ戻す —

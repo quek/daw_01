@@ -1192,6 +1192,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(
@@ -1223,6 +1224,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -1561,6 +1563,7 @@ mod tests {
             length_beats: clip_length,
             content_id: cid,
             content_offset_beats: 0.0,
+            color: None,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);
@@ -1698,6 +1701,7 @@ mod tests {
             length_beats: 4.0,
             content_id: cid,
             content_offset_beats: 0.0,
+            color: None,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);

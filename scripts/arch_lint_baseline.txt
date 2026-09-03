@@ -269,7 +269,6 @@ FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_open_path          
 FN-NESTING | daw_gui/src/handler/sync.rs::AppData::collect_ara_clips_for_track             | 7/11 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::quantize_selected_automation_points | 7/10 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::ensure_voicevox_engine                 | 7/10 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/automation.rs::AppData::clone_automation_clips_independent | 7/9 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_save_as                       | 7/9  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::copy_automation_clips_clip        | 7/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::set_notes_muted                  | 7/8  | edit_song 多重ループ。未起票

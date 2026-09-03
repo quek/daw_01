@@ -1078,8 +1078,17 @@ impl AppData {
     ) {
         self.ui_ephemeral.color_picker_target = Some(target);
         self.ui_ephemeral.color_picker_anchor = Some(anchor);
-        // picker session 全体を 1 undo step に bracket する (dismiss で end)。
+        // picker session 全体を 1 undo step に bracket する (`close_color_picker` で end)。
         self.song_doc.begin_gesture();
+    }
+
+    /// color_picker を閉じる唯一の口 (dismiss / 対象消失の両方)。`open_color_picker` の
+    /// gesture をここで閉じる — 閉じ忘れると以後の離散編集が同じ gesture id に squash され
+    /// 1 undo step に潰れる (旧実装は view が target を None にするだけで End が無かった)。
+    pub fn close_color_picker(&mut self) {
+        self.ui_ephemeral.color_picker_target = None;
+        self.ui_ephemeral.color_picker_anchor = None;
+        self.song_doc.end_gesture();
     }
 
     // -------- Undo/Redo ----------------------------------------------------

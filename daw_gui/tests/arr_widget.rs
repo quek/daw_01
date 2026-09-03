@@ -932,6 +932,7 @@ fn add_expanded_automation_lane(app: &mut AppData, track_id: u32, lane_id: u32) 
                     length_beats: 8.0,
                     content_id: AUTOMATION_CONTENT_ID,
                     content_offset_beats: 0.0,
+                    color: None,
                 }],
                 next_clip_id: 2,
                 ..AutomationLane::new(
@@ -1514,6 +1515,7 @@ fn add_bend_lane(app: &mut AppData, values: (f64, f64), curve: AutomationCurve) 
                     length_beats: 8.0,
                     content_id: AUTOMATION_CONTENT_ID,
                     content_offset_beats: 0.0,
+                    color: None,
                 }],
                 next_clip_id: 2,
                 ..AutomationLane::new(

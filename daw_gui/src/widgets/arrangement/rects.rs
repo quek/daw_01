@@ -96,11 +96,14 @@ fn push_lane_default_rects(f: &ArrangementFrame<'_>, response: &mut ArrangementR
             }
             // **ここは `hit_rect` を通さない。** caller は数値入力欄を「この rect に
             // 描く」ので、切ると欄そのものが潰れる (当たり判定だけの rect とは別の口)。
+            let key = AutomationLaneKey { track: f.visible_tracks[t_idx].id, lane: lane.id };
+            // header 全体 (右クリックメニュー用) は当たり判定なので pane で切る。
+            if let Some(hit) = hit_rect(h_rect, f.header_pane) {
+                response.automation_lane_header_rects.push((key, hit));
+            }
             if let Some(layout) = automation_lane_header_layout(h_rect, f.style)
                 && let Some(field) = layout.default_field_rect
             {
-                let key =
-                    AutomationLaneKey { track: f.visible_tracks[t_idx].id, lane: lane.id };
                 response.automation_lane_default_rects.push((key, field));
             }
         },

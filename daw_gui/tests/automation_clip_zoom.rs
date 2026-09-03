@@ -104,6 +104,7 @@ fn add_track_automation_clip(
                 length_beats: len,
                 content_id: 0,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: clip_id + 1,
             ..AutomationLane::new(
@@ -173,6 +174,7 @@ fn z_縦ズームは_master_行の_automation_clip_を行_0_として扱う() {
                 length_beats: 4.0,
                 content_id: 0,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
@@ -279,7 +281,7 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
     app.edit_song(|song| {
         song.tracks[0].automation_lanes.push(AutomationLane {
             id: 1,
-            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 }],
+            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0, color: None }],
             next_clip_id: 2,
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -343,7 +345,7 @@ fn fit_が縮めたレーン高は_fresh_zoom_で消えない() {
     app.edit_song(|song| {
         song.tracks[0].automation_lanes.push(AutomationLane {
             id: 1,
-            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 }],
+            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0, color: None }],
             next_clip_id: 2,
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -497,8 +499,8 @@ fn z_は別_clip_を選び直すと新しい選択へ横ズームし直す() {
         song.tracks[0].automation_lanes.push(AutomationLane {
             id: 1,
             clips: vec![
-                AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 },
-                AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 },
+                AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0, color: None },
+                AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0, color: None },
             ],
             next_clip_id: 3,
             ..AutomationLane::new(

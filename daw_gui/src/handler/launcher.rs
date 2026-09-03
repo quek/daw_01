@@ -340,10 +340,10 @@ impl AppData {
         }
     }
 
-    /// 行の主導権を書く。値が変わらなければ `Song` を触らない (= 空の undo step を
-    /// 積まない)。戻り値 = 実際に書き換わったか。
+    /// 行の主導権を書く。再生状態なので undo にも `*` にも入れない
+    /// (`edit_playback`、計画書 §1.3)。戻り値 = 実際に書き換わったか。
     fn set_row_playback(&mut self, row: LauncherRow, next: RowPlayback) -> bool {
-        self.edit_song_checked(|song| match row {
+        self.edit_playback(|song| match row {
             LauncherRow::Track(id) => song.track_by_id_mut(id).is_some_and(|t| {
                 let changed = t.launcher != next;
                 t.launcher = next;
@@ -533,7 +533,7 @@ impl AppData {
     /// 「何秒鳴らしてから書き出したか」で出力が変わり、Q9 の再現性が壊れる
     /// (計画書 §1.4、`Song::last_launched_scene_id` の doc)。
     fn set_last_launched_scene(&mut self, scene_id: u32) -> bool {
-        self.edit_song_checked(|song| {
+        self.edit_playback(|song| {
             if song.last_launched_scene_id == scene_id {
                 return false;
             }

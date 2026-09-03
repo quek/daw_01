@@ -838,12 +838,11 @@ fn draw_group_cell(
     }
     let base = stripes[0];
     let btn = layout::launch_button_rect(r);
-    // **まとめセルも押せる場所なので、押せるように見せる。** `zone_at` は
-    // グループ行のセル本体ぜんぶを `Zone::CellLaunch` に倒すのに、ここだけ
+    // **まとめセルも押せる場所なので、押せるように見せる。** 以前はここだけ
     // `indicator_on` (= フィードバック無し) で描いていたので、押下中も hover 中も
     // 画面が 1px も変わらなかった (量子化 1 小節なら最大 1 小節「押せていない」
-    // ようにしか見えず、連打で二重発火する)。本体全体がボタンなので判定は
-    // `CellLaunch(key)` だけで足りる。
+    // ようにしか見えず、連打で二重発火する)。ボタンは通常セルと同じ ▶ 矩形
+    // (`zone_at` が `launch_button_rect` で本体と分ける) なので判定は `CellLaunch(key)`。
     let ind = interactive_indicator(
         hctx.palette(),
         base,

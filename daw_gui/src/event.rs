@@ -1451,6 +1451,14 @@ pub enum AppEvent {
     /// `color == None` でトラック色継承に戻す (Ableton "match track color")。
     /// model field のみ更新。Undo 対象。
     SetClipColor { target: ClipKey, color: Option<[f32; 3]> },
+    /// オートメーションクリップの色上書き (`AutomationClip::color`)。`None` = レーン識別色へ戻す。
+    /// `SetClipColor` と同じく **content を共有する全クリップへ伝播**する。
+    SetAutomationClipColor { target: common::model::AutomationClipKey, color: Option<[f32; 3]> },
+    /// オートメーションレーンの色上書き (`AutomationLane::color`)。`None` = 識別色へ戻す。
+    SetAutomationLaneColor { lane: common::model::AutomationLaneKey, color: Option<[f32; 3]> },
+    /// レーンの全 clip (arrangement + session) の色上書きを外してレーン色継承に戻す
+    /// (`ResetTrackClipColors` のレーン版、lane-scoped)。
+    ResetAutomationLaneClipColors { lane: common::model::AutomationLaneKey },
 
     /// Set `AudioEvent.stretch_mode` for every event in the selected
     /// audio clip. Phase 1 で再生に効くのは `Raw` / `Repitch` のみ;
@@ -1755,6 +1763,9 @@ impl AppEvent {
             E::SplitClipAtPlayhead { .. } => "クリップ分割",
             E::GlueSelectedClips => "クリップ結合",
             E::SetClipColor { .. } => "クリップ色変更",
+            E::SetAutomationClipColor { .. } => "オートメーションクリップ色変更",
+            E::SetAutomationLaneColor { .. } => "レーン色変更",
+            E::ResetAutomationLaneClipColors { .. } => "クリップ色リセット",
             E::SetClipMuted { .. } | E::SetClipsMuted { .. } => "クリップミュート",
             E::SetClipReversed { .. } | E::ToggleClipReversed(..) => "クリップ逆再生",
             E::SetClipStretchMode { .. } => "ストレッチモード変更",

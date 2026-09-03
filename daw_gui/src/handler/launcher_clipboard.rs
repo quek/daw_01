@@ -234,6 +234,7 @@ fn paste_one(
                     content_id,
                     content_offset_beats: 0.0,
                     name: String::new(),
+                    color: a.color,
                 },
                 launch: cc.launch.clone(),
             });
@@ -285,6 +286,7 @@ fn lane_cell_payload(
         source_content_id: c.clip.content_id,
         points,
         name: song.clip_content_names.get(&c.clip.content_id).cloned(),
+        color: c.clip.color,
     }))
 }
 

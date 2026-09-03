@@ -2928,6 +2928,7 @@ mod wave_span_binding_tests {
             length_beats: len_beats,
             content_id: cid,
             content_offset_beats: 0.0,
+            color: None,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);

@@ -143,37 +143,36 @@ pub(super) fn automation_clip_rect(
     Rect { x, y: body_rect.y + pad, w, h: (body_rect.h - pad * 2.0).max(2.0) }
 }
 
-/// automation clip の `(fill, border)`。優先順は **selected > disabled > lane 識別色**。
+/// automation clip の `(fill, border)`。**通常 clip (`clip_effective_fill` / `draw_clip`) と同形**:
 ///
-/// M14 Phase 114 (daw_01 #086): automation clip は専用の `color` field を持たず `lane.color` が
-/// fill / border の唯一 source (audio clip の `clip.color` に相当)。 `share_group_color` は fill /
-/// border を上書きせず、 リンク識別は ⇌ glyph + #068 hover 強調のみが担う (#086)。 disabled lane は
-/// **clip rect の fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の
-/// lane 識別色のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
-/// r.md #48: 識別色は lane 面に合わせて明度を寄せた `lane_ink` (ダークでは恒等)。
+/// - fill は **不透明な clip 色** — `clip.color` (per-clip 上書き)、無ければ `lane.color`
+///   (= レーンの実効色。audio clip の `clip.color` → track 色継承に相当)。
+///   旧実装 (識別色 alpha 0.20 の wash + 1px 枠) は、パレット 16 色を塗り分けても wash 同士の
+///   輝度比が 1.0〜1.3 で **色を変えても見分けが付かなかった** (2026-09-03 実測)。
+/// - **選択でも fill は潰さない** — 選択表示は通常 clip と同じくリングのみ
+///   (`draw_automation_selection_overlay`、cached 外)。旧実装は選択中を `clip_selected_fill` で
+///   塗っていたので、「選択 → 右クリック → 色...」 の操作では色が一切見えなかった。
+/// - disabled lane (bypass) は muted clip と同じ `muted_dim_fill` で沈め、枠を
+///   `automation_lane_disabled_color` にして bypass を示す。中身 (curve / point / clip 名) の
+///   インクは通常どおり実効 fill から導く (固定灰は可変 fill の上で沈む)。
+/// - `share_group_color` は fill / border を上書きせず、 リンク識別は ⇌ glyph + #068 hover 強調
+///   のみが担う (#086)。
 ///
 /// r.md #73: **cached 側の curve と cached 外の強調 / preview が共有する SSoT**。
 /// 「その clip が実際に何色で塗られているか」を 1 か所で決めないと、
 /// 強調の色を実効背景から導けない (= 塗りと同色になって中抜けする)。
 #[must_use]
 pub(super) fn automation_clip_colors(
-    p: &Palette,
     lane: &ArrangementAutomationLane,
-    is_selected: bool,
+    clip_color: Option<Color>,
     style: &ArrangementStyle,
 ) -> (Color, Color) {
-    if is_selected {
-        return (style.clip_selected_fill, style.clip_selected_border);
-    }
+    let base = clip_color.unwrap_or(lane.color);
     if lane.enabled {
-        let lane_ink = p.adapt_on(style.automation_lane_bg, lane.color);
-        return (lane_ink.with_alpha(0.20), lane_ink);
+        (base, style.clip_border)
+    } else {
+        (muted_dim_fill(base), style.automation_lane_disabled_color)
     }
-    // disabled: fill = 灰色 alpha 0.10 (lane_bg がほぼ透ける、 中身可読) + border = 灰色
-    // alpha 1.0 (識別 marker、 不透明で確実に見える)。 fill alpha 0 だと renderer が rect 全体を
-    // skip する可能性があるので非ゼロを保つ (#028 user 指摘 3 = 配色で見えない)。
-    let dc = style.automation_lane_disabled_color;
-    (Color { r: dc.r, g: dc.g, b: dc.b, a: 0.10 }, Color { r: dc.r, g: dc.g, b: dc.b, a: 1.0 })
 }
 
 /// automation clip の塗りを lane 面に合成した **実効背景**。
@@ -1248,6 +1247,54 @@ pub(super) fn draw_selection_overlay<M: ?Sized + 'static>(
     }
 }
 
+/// automation clip の選択リング (通常 clip の [`draw_selection_overlay`] と同 idiom、cached 外)。
+/// fill は選択で潰さない (`automation_clip_colors`) ので、選択表示はこの 2 重リングだけ。
+/// clip rect の式は cached 側 (`draw_automation_lane` → `automation_clip_rect`) と同じ。
+pub(super) fn draw_automation_selection_overlay<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    selected: &HashSet<AutomationClipKey>,
+    view: ArrangementView,
+    lanes: Rect,
+    style: &ArrangementStyle,
+) {
+    if selected.is_empty() {
+        return;
+    }
+    for (i, t) in visible_tracks.iter().enumerate() {
+        if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+            continue;
+        }
+        if tops[i + 1] < lanes.y || tops[i] > lanes.y + lanes.h {
+            continue;
+        }
+        let mut lane_y = tops[i] + effective_track_row_h(t, view.track_row_h);
+        for lane in &t.automation_lanes {
+            if !lane.visible {
+                continue;
+            }
+            let lh = f32::from(lane.height_px);
+            let body_rect = Rect { x: lanes.x, y: lane_y, w: lanes.w, h: lh };
+            lane_y += lh;
+            if body_rect.y + lh < lanes.y || body_rect.y > lanes.y + lanes.h {
+                continue;
+            }
+            for c in &lane.clips {
+                let key = AutomationClipKey { track: t.id, lane: lane.id, clip: c.id };
+                if !selected.contains(&key) {
+                    continue;
+                }
+                let r = automation_clip_rect(body_rect, view, c.start_beat, c.len_beats, style);
+                if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                    continue;
+                }
+                push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
+            }
+        }
+    }
+}
+
 /// M14 Phase 96 (daw_01 #068): 共有グループ「連動ハイライト」overlay。
 /// `clip.in_active_group == true` かつ `share_group_color.is_some()` の clip に、 selection
 /// (黄塗り) とは **別レイヤ** の強調 (glow wash + bright thick border) を重ねる。
@@ -1856,15 +1903,15 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     view: ArrangementView,
     style: &ArrangementStyle,
     lanes_clip: Rect,
-    selected_clips_set: &HashSet<AutomationClipKey>,
     bend_skip: Option<AutomationPointIdKey>,
 ) {
     let p = hctx.palette();
     // r.md #48: `lane.color` は「どのパラメータのレーンか」 を運ぶ **アイデンティティ色** で
     // テーマ非従属。ただしライトテーマの薄い lane 面の上ではそのままだと沈むので、
     // 色相・彩度を保ったままコントラストが足りるまで明度だけ寄せる (`adapt_on` は既に
-    // 足りていれば恒等 = ダークテーマでは何も変わらない)。 icon glyph / clip 枠 / clip の
-    // 薄い wash はすべてこの 1 本から引く (= 同じレーンが 3 箇所で違う色にならない)。
+    // 足りていれば恒等 = ダークテーマでは何も変わらない)。 header の icon glyph (細い字) だけが
+    // これを使う。色ストライプと clip の塗り (`automation_clip_colors`) は面積のある塗りなので
+    // 通常 clip / track の帯と同じく生の色 (adapt は掛けない)。
     let lane_ink = p.adapt_on(style.automation_lane_bg, lane.color);
     // ---- 背景 (lane 行 全幅) ----
     push_filled_rect(
@@ -1877,6 +1924,27 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         },
         style.automation_lane_bg,
     );
+    // ---- レーン色ストライプ (track header の `track_color_strip_w` と同 idiom、#059 / #069) ----
+    // `header_rect.x` は親 track の depth ぶん indent 済みなので、そのまま置けば子 track の
+    // lane も名前と同じだけネストする。track は「色未指定 = ストライプ無し」だが、lane は
+    // 色未指定 = 識別色 (常に実効色がある) なので常に描く。
+    // 色は track の帯と同じく **生の `lane.color`** (面積のある塗りなので `adapt_on` の明度補正は
+    // 掛けない — 掛けると同じ色を指定しても track の帯と違う色になる)。
+    if style.track_color_strip_w > 0.0 {
+        hctx.push_rect(RectCommand {
+            rect: Rect {
+                x: header_rect.x,
+                y: header_rect.y,
+                w: style.track_color_strip_w,
+                h: header_rect.h,
+            },
+            fill: lane.color,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: Some(header_rect),
+        });
+    }
 
     // ---- header: ★ icon label slider 帯 👁▣✕ (描画 + Phase 63n-2 hit-test 対応) ----
     // M14 Phase 63n-2 (#028): 描画と hit-test の SSoT を `automation_lane_header_layout` に集約。
@@ -1985,13 +2053,10 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         let clip_rect = automation_clip_rect(body_rect, view, c.start_beat, c.len_beats, style);
         let (w, ch) = (clip_rect.w, clip_rect.h);
 
-        // M14 Phase 63n-3 (#028): selected な automation clip は selected_fill / selected_border で
-        // 描画 (priority: selected > disabled > share_group > lane.color)。
-        let clip_key = AutomationClipKey { track: track_id, lane: lane.id, clip: c.id };
-        let is_selected = selected_clips_set.contains(&clip_key);
         // 塗り / 枠の決め方は `automation_clip_colors` が SSoT (cached 外の bend 強調が
-        // 「実際に塗られた色」を必要とするので、式をここに閉じ込めない)。
-        let (fill, border) = automation_clip_colors(p, lane, is_selected, style);
+        // 「実際に塗られた色」を必要とするので、式をここに閉じ込めない)。選択は cached 外の
+        // リング (`draw_automation_selection_overlay`) で、ここでは選択を見ない (通常 clip と同じ)。
+        let (fill, border) = automation_clip_colors(lane, c.color, style);
         hctx.push_rect(RectCommand {
             rect: clip_rect,
             fill,
@@ -2013,9 +2078,8 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         //     (`clip_auto_contrast_text == false`) は automation 専用の `automation_lane_text_color` に
         //     フォールバック (= clip 全般の `clip_text_color` ではなく従来色を維持)。
         if w > 24.0 && ch > style.clip_text_size + 2.0 {
-            let glyph_color = if !lane.enabled {
-                style.automation_lane_disabled_color
-            } else if style.clip_auto_contrast_text {
+            // 文字色は実効 fill から (disabled の減光 fill でも同じ規則で読める)。
+            let glyph_color = if style.clip_auto_contrast_text {
                 clip_text_color_for(p, style, fill, style.automation_lane_bg)
             } else {
                 style.automation_lane_text_color
@@ -2051,13 +2115,12 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         // 極性固定インクを使う (r.md #48)。 disabled lane は bypass marker として従来の灰色
         // (`automation_lane_disabled_color`) を維持 (= clip 名と同方針)、 その枠だけはクローム面
         // の上に乗る細線なので `text` (テーマ従属) で薄く縁取る。
-        let (curve_line_color, point_fill, point_border) = if lane.enabled {
+        // disabled lane も同じ規則 (fill が減光しているので curve / point も一緒に沈む =
+        // bypass の見え方。固定灰は可変 fill の上で沈むので使わない)。
+        let (curve_line_color, point_fill, point_border) = {
             let neutral = p.ink_for(automation_clip_eff_bg(fill, style));
             let edge = p.ink_for(neutral);
             (neutral, neutral, edge)
-        } else {
-            let dc = style.automation_lane_disabled_color;
-            (dc, dc, p.text.with_alpha(0.4))
         };
 
         // curve flatten (clip 内描画域 = clip_rect 全体)。 caller の screen-wide な beat_to_px

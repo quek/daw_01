@@ -589,6 +589,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             },
             launch: LaunchSettings::default(),
         });

@@ -48,17 +48,6 @@ pub(super) fn dispatch(
         f.selected_tracks.iter().fold(0xCBF2_9CE4_8422_2325_u64, |a, &x| {
             a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x))
         });
-    // M14 Phase 63n-3 (#028): selected_automation_clips を fold して cache 再構築を保証 (= 選択
-    // 変化時に lane の clip rect 描画が selected_fill / selected_border に切り替わる)。
-    let selected_automation_clips_hash: u64 =
-        f.selected_automation_clips.iter().fold(0xCBF2_9CE4_8422_2325_u64, |a, k| {
-            a.wrapping_mul(0x100_0000_01B3)
-                .wrapping_add(u64::from(k.track))
-                .wrapping_mul(0x100_0000_01B3)
-                .wrapping_add(u64::from(k.lane))
-                .wrapping_mul(0x100_0000_01B3)
-                .wrapping_add(u64::from(k.clip))
-        });
     // r.md #73: 曲げている最中の区間は cached 層が base curve を描かない (2 重線の防止)。
     // **cached の中身が変わるので key に入れる**。 hover (`hovered_segment`) を意図的に外して
     // あるのと対照的だが、こちらは値が変わるのが drag の開始と終了の 2 回だけなので、
@@ -98,7 +87,6 @@ pub(super) fn dispatch(
         overlays.reorder_hash,
         (f.view.bpm.to_bits(), u32::from(f.view.time_sig.0), u32::from(f.view.time_sig.1)),
         internal_clip_hash,
-        selected_automation_clips_hash,
         // (review) cached primitives は絶対座標で再生されるため、 widget の
         // 位置 (rect.x/y) と arranger lane 高さ (lanes.y のオフセット成分) も
         // key に含める — 「サイズ不変で位置 / lane 高さだけ変わる」 layout
@@ -393,7 +381,6 @@ fn render_arrangement_heavy(
                         f.view,
                         f.style,
                         lanes,
-                        &heavy.selected_automation_clip_set,
                         heavy.bend_skip,
                     );
                     lane_y += lh;
@@ -474,6 +461,17 @@ fn render_arrangement_heavy(
             &f.visible_tracks,
             &f.tops,
             &heavy.selected_clip_set,
+            f.view,
+            lanes,
+            f.style,
+        );
+        // automation clip の選択も通常 clip と同じくリングのみ (fill は cached 側が clip 色で塗る)。
+        // 選択変化で heavy cache は無効化しない (通常 clip と同 idiom)。
+        draw_automation_selection_overlay(
+            hctx,
+            &f.visible_tracks,
+            &f.tops,
+            &heavy.selected_automation_clip_set,
             f.view,
             lanes,
             f.style,
@@ -603,7 +601,6 @@ fn render_arrangement_heavy(
             f,
             heavy.hovered_segment,
             overlays.segment_bend.as_ref(),
-            &heavy.selected_automation_clip_set,
         );
         if let Some((nd, bd, td)) = overlays.clip.as_ref() {
             draw_drag_preview(
@@ -902,16 +899,11 @@ fn draw_bend_overlays(
     f: &ArrangementFrame<'_>,
     hovered: Option<AutomationPointIdKey>,
     bend: Option<&AutomationSegmentBendSession>,
-    selected_clips: &HashSet<AutomationClipKey>,
 ) {
-    // 強調 / preview の色は「その区間が乗っている面の実効背景」から導くので、
-    // 幾何を引く段階でパレットが要る (`hctx.palette()` は host 寿命の借用なので
-    // 以降 `hctx` を可変で使っても問題ない)。
-    let p = hctx.palette();
     // (1) hover 強調。 drag 中は preview が同じ区間を上塗りするので出さない。
     if let Some(key) = hovered
         && bend.is_none()
-        && let Some(seg) = resolve_bend_segment(p, f, key, selected_clips)
+        && let Some(seg) = resolve_bend_segment(f, key)
     {
         draw_segment_polyline(
             hctx,
@@ -923,7 +915,7 @@ fn draw_bend_overlays(
     }
     // (2) drag 中の preview。 `preview_curve` は毎フレーム逆算済 (drag.rs)。
     if let Some(bd) = bend
-        && let Some(mut seg) = resolve_bend_segment(p, f, bd.point, selected_clips)
+        && let Some(mut seg) = resolve_bend_segment(f, bd.point)
     {
         // 値と clip 描画域は press 時の anchor を使う (drag 中 model は不変なので同値だが、
         // 縦スクロール / lane 高さ変更が同時に起きても preview が飛ばない)。
@@ -944,10 +936,8 @@ fn draw_bend_overlays(
 /// `automation_segment_at` と **同じ式**で x / clip_rect を出す (point dot と curve の x が
 /// ずれる既知バグ #028 user 指摘 2 の再発防止)。
 fn resolve_bend_segment<'a>(
-    p: &daw_ui_core::theme::Palette,
     f: &'a ArrangementFrame<'a>,
     key: AutomationPointIdKey,
-    selected_clips: &HashSet<AutomationClipKey>,
 ) -> Option<ResolvedSegment<'a>> {
     let (lane, clip) = find_lane_clip(&f.visible_tracks, key.clip)?;
     let (p_prev, p_next) = curve::find_automation_segment_by_id(&f.visible_tracks, key)?;
@@ -977,10 +967,9 @@ fn resolve_bend_segment<'a>(
     let x_next = body_rect.x
         + ((clip.start_beat + p_next.time_beat - f.view.start_beat) * beat_to_px) as f32;
     // r.md #73: 強調 / preview の色は **その clip が実際に塗られている色**から導く。
-    // 塗りの決め方 (selected > disabled > lane 識別色) と、それを lane 面に合成する式は
+    // 塗りの決め方 (clip 色 > lane 色、disabled は減光) と、それを lane 面に合成する式は
     // cached 側の curve と同じ `draw.rs` のヘルパを通す (2 か所で書くと極性がずれる)。
-    let is_selected = selected_clips.contains(&key.clip);
-    let (fill, _) = automation_clip_colors(p, lane, is_selected, f.style);
+    let (fill, _) = automation_clip_colors(lane, clip.color, f.style);
     let eff_bg = automation_clip_eff_bg(fill, f.style);
     Some(ResolvedSegment {
         lane,

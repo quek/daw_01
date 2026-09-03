@@ -75,7 +75,8 @@ fn track_row(
         x: f.header_pane.x + indent,
         y: row_top,
         w: (f.header_pane.w - indent).max(2.0),
-        h: f.view.track_row_h,
+        // 描画 (`header.rs`) と同じ実効行高 (per-track override 込み)。
+        h: effective_track_row_h(t, f.view.track_row_h),
     };
     let band_h = if matches!(t.kind, TrackKind::Video) || t.id == MASTER_TRACK_ID {
         // M14 Phase 72 (#044): video track では volume slider band を非表示

@@ -370,18 +370,14 @@ pub struct UiEphemeral {
     pub clip_rename_text: String,
 
     /// v18 (`docs/plan_track_clip_color.md`): color_picker (gui_01 #058) の
-    /// 開いている編集対象。`None` で非表示。`open_color_picker` で `Some` に、
-    /// picker の `dismissed` で `None` に戻す。
+    /// 開いている編集対象 (track / clip / automation lane / automation clip / section /
+    /// scene)。`None` で非表示。`open_color_picker` で `Some` に、`close_color_picker`
+    /// (dismiss / 対象消失) で `None` に戻す。
     pub color_picker_target: Option<ColorPickerTarget>,
     /// color_picker overlay の anchor 矩形 (popup を出す基準位置)。開いた場所
     /// (右クリックした header / clip rect、inspector のスウォッチ rect) を保持し、
     /// どの view から開いても同じ位置に popup が出るようにする。
     pub color_picker_anchor: Option<daw_ui_renderer::Rect>,
-    /// color_picker session 中に既に undo snapshot を取ったか。`open_color_picker`
-    /// で `false` にリセットし、最初の色変更 (`SetTrackColor`/`SetClipColor`) で
-    /// 1 度だけ snapshot を取って `true` にする。これで「drag 開始〜終了」 が
-    /// 1 undo step にまとまり、 変更しないまま閉じても dead step が増えない。
-    pub color_picker_session_dirty: bool,
 
     /// gui_01 #071: 空きレーン右クリック (空きレーン右クリック SecondaryClickEmpty)
     /// で開く clip 生成コンテキストメニューの stash。`Some((track_id, snap 済み beat,

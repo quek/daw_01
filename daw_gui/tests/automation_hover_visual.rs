@@ -107,6 +107,7 @@ fn add_automation_lane(app: &mut AppData) {
                     length_beats: 8.0,
                     content_id: CONTENT_ID,
                     content_offset_beats: 0.0,
+                    color: None,
                 }],
                 next_clip_id: 2,
                 ..AutomationLane::new(
@@ -457,6 +458,7 @@ fn add_bend_lane(app: &mut AppData) {
                     length_beats: 8.0,
                     content_id: CONTENT_ID,
                     content_offset_beats: 0.0,
+                    color: None,
                 }],
                 next_clip_id: 2,
                 ..AutomationLane::new(

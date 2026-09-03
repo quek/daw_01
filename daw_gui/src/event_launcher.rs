@@ -335,6 +335,8 @@ impl LauncherEvent {
     pub fn undo_label(&self) -> &'static str {
         use LauncherEvent as E;
         match self {
+            // 再生状態だけを書く event は undo step を積まない (`edit_playback`)。
+            // ラベルは match の網羅性のためだけに残す。
             E::LaunchCell { .. } | E::LaunchScene { .. } | E::LaunchFocused => "セルを撃つ",
             E::StopRow { .. } | E::StopAllRows => "ランチャーを止める",
             E::RowToArranger { .. } | E::AllToArranger => "アレンジに戻す",

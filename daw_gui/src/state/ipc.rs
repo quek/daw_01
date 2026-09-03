@@ -194,8 +194,8 @@ pub struct IpcState {
     pub is_rescanning: bool,
     /// 子プロセス sync (pull 型、 docs/plan_arch_refactor.md §7.5) の世代キー。
     /// [`AppData::flush_song_sync`] が最後に 6 段 choreography を実行したときの
-    /// `SongDoc::edit_epoch()`。 runner の frame flush が `edit_epoch !=
-    /// last_synced_epoch` を見て 1 frame 1 回だけ LoadSong を送り、 scrub / MIDI-CC
+    /// `SongDoc::sync_epoch()` (= 中身が変わった世代、再生状態の変更を含む)。
+    /// runner の frame flush が `sync_epoch != last_synced_epoch` を見て 1 frame 1 回だけ LoadSong を送り、 scrub / MIDI-CC
     /// 等の連続編集を構造的に coalesce する (旧 `pending_host_sync` flag +
     /// `flush_pending_host_sync` 経路の置換)。 初期値 0 (SongDoc の epoch は 1 始まり
     /// なので初回 flush が必ず走る)。 session-only。

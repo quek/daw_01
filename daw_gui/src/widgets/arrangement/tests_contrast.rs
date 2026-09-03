@@ -86,6 +86,59 @@ fn clip_face_indicators_are_readable_on_every_clip_fill() {
     }
 }
 
+/// automation clip の中身 (curve / point / clip 名) のインクは **実効 fill から導く**。
+///
+/// fill はユーザーが palette 16 色 + レーン識別色で自由に塗り分ける可変背景。
+/// enabled / disabled (減光) のどちらの fill でも、`ink_for(automation_clip_eff_bg(fill))`
+/// が背景に対して読めることを確かめる (旧実装の disabled は固定灰で、暗い減光 fill の上で沈んだ)。
+#[test]
+fn automation_clip_inks_are_readable_on_every_clip_fill() {
+    let style = ArrangementStyle::from_theme(&theme());
+    let mut fills: Vec<(String, Color)> = crate::view::track_color::PALETTE
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (format!("palette[{i}]"), Color::rgb(c[0], c[1], c[2])))
+        .collect();
+    fills.push(("識別色 Volume".into(), view_build::lane_identity_color(
+        &common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume),
+    )));
+    for p in [Palette::dark(), Palette::light()] {
+        for enabled in [true, false] {
+            let lane = ArrangementAutomationLane {
+                id: 1,
+                target: common::model::AutomationTarget::TrackBuiltin(
+                    common::model::TrackBuiltinParam::Volume,
+                ),
+                plugin_range: None,
+                label: Arc::from("Volume"),
+                icon_glyph: 'V',
+                color: Color::rgb(0.5, 0.5, 0.5),
+                enabled,
+                visible: true,
+                height_px: 60,
+                default_value_norm: 0.5,
+                clips: Vec::new(),
+            };
+            for (name, fill_color) in &fills {
+                let (fill, _) = automation_clip_colors(&lane, Some(*fill_color), &style);
+                let eff = automation_clip_eff_bg(fill, &style);
+                assert_readable(
+                    &format!("automation clip の curve インク (enabled={enabled})"),
+                    name,
+                    p.ink_for(eff),
+                    eff,
+                );
+                assert_readable(
+                    &format!("automation clip 名 (enabled={enabled})"),
+                    name,
+                    clip_text_color_for(&p, &style, fill, style.automation_lane_bg),
+                    eff,
+                );
+            }
+        }
+    }
+}
+
 /// #7 トグルの ON 時の文字色は **ON 塗りから自動で決める**。
 ///
 /// `ToggleButtonStyle::from_palette` の既定が `None` = 「ON 塗りの輝度から

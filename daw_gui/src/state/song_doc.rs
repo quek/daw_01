@@ -9,9 +9,13 @@
 //!
 //! - dirty は `edit_epoch != saved_epoch` の O(1) 派生 (毎フレームの Song
 //!   全比較 `recompute_dirty` を置換)。
-//! - 子プロセス sync は runner の frame flush が `edit_epoch !=
-//!   last_synced_epoch` を見て pull する (state/sync.rs)。
-//! - undo/redo も epoch を bump する (= flush が LoadSong を再送する)。
+//! - 子プロセス sync は runner の frame flush が `sync_epoch !=
+//!   last_synced_epoch` を見て pull する (handler/sync.rs)。`sync_epoch` は
+//!   「Song の中身が変わった」世代で、`edit_epoch` (文書の履歴 = undo / dirty) の
+//!   上位集合。差は [`SongDoc::edit_playback`] — ランチャーの再生状態
+//!   (`Track.launcher` 等) は Song に住み保存もされるが、撃つ / 止めるは
+//!   「聴き方」なので履歴にも `*` にも入れない (`docs/plan_rmd_87_clip_launcher.md` §1.3)。
+//! - undo/redo も両 epoch を bump する (= flush が LoadSong を再送する)。
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -94,6 +98,9 @@ pub struct SongDoc {
     edit_epoch: u64,
     /// 最後に save / load / new した時点の `edit_epoch`。 dirty = 不一致。
     saved_epoch: u64,
+    /// 「Song の中身が変わった」世代 (子プロセス sync が読む)。`edit_epoch` が進む
+    /// ときは必ず進み、加えて [`SongDoc::edit_playback`] でも進む。
+    sync_epoch: u64,
     /// 保存先 (.daw)。 未保存プロジェクトは `None`。
     pub file_path: Option<PathBuf>,
 
@@ -148,6 +155,7 @@ impl SongDoc {
             song,
             edit_epoch: 1,
             saved_epoch: 1,
+            sync_epoch: 1,
             file_path: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -226,7 +234,7 @@ impl SongDoc {
                 EditScope::Discrete => None,
                 EditScope::Gesture(id) => Some(id),
             };
-            self.edit_epoch += 1;
+            self.bump_edit_epoch();
             // 上限適用は **編集が確定してから** (push で高々 +1 したぶんを削る)。
             // closure 前に pop_front すると、 no-op (changed=false) 時に push 分だけ
             // 戻しても最古 step の evict は戻らず、 何も起きていないのに undo 履歴の
@@ -252,7 +260,7 @@ impl SongDoc {
             return None;
         }
         let r = f(&mut self.song);
-        self.edit_epoch += 1;
+        self.bump_edit_epoch();
         Some(r)
     }
 
@@ -274,9 +282,36 @@ impl SongDoc {
         }
         let changed = f(&mut self.song);
         if changed {
-            self.edit_epoch += 1;
+            self.bump_edit_epoch();
         }
         Some(changed)
+    }
+
+    /// ランチャーの**再生状態** (`Track.launcher` / `AutomationLane.launcher` /
+    /// `last_launched_scene_id`) の書き換え専用。Song に住み `.daw` にも保存されるが、
+    /// 撃つ / 止める / アレンジへ返すは「聴き方」であって曲の中身ではない
+    /// (`docs/plan_rmd_87_clip_launcher.md` §1.3) ので、**undo 履歴に積まず `*` も
+    /// 立てない**。子プロセス sync だけは走らせる (`sync_epoch` を進める =
+    /// 書き出しは今の再生状態を反映する、Q9)。closure が `false` (= 変化なし) なら
+    /// 何も進めない。戻り値: `None` = export 中拒否、`Some(changed)`。
+    /// 他の field に使わないこと — 曲の中身は必ず [`SongDoc::edit`]。
+    pub fn edit_playback(&mut self, f: impl FnOnce(&mut Song) -> bool) -> Option<bool> {
+        if self.export_lock {
+            self.rejection = Some("書き出し中は編集できません");
+            return None;
+        }
+        let changed = f(&mut self.song);
+        if changed {
+            self.sync_epoch += 1;
+        }
+        Some(changed)
+    }
+
+    /// 文書の履歴が進んだ: dirty / 派生キャッシュ用の `edit_epoch` と、子プロセス
+    /// sync 用の `sync_epoch` を一緒に進める (後者は前者の上位集合)。
+    fn bump_edit_epoch(&mut self) {
+        self.edit_epoch += 1;
+        self.sync_epoch += 1;
     }
 
     /// plugin state blob の write-back (`RequestAllStates` 応答) **専用**。
@@ -289,6 +324,11 @@ impl SongDoc {
 
     pub fn edit_epoch(&self) -> u64 {
         self.edit_epoch
+    }
+
+    /// 「Song の中身が変わった」世代 (再生状態の変更を含む)。子プロセス sync の鍵。
+    pub fn sync_epoch(&self) -> u64 {
+        self.sync_epoch
     }
 
     /// dirty = 「最後に保存した epoch から編集が進んだ」 の O(1) 派生。
@@ -327,6 +367,9 @@ impl SongDoc {
     fn step_backward(&mut self) {
         let prev = self.undo_stack.pop_back().expect("caller guarantees non-empty");
         let current = std::mem::replace(&mut self.song, prev.song);
+        // 再生状態は履歴に属さない — 差し替えた Song に今の状態を持ち越す
+        // (undo でセルが止まったり鳴り出したりしない)。
+        self.song.carry_playback_state_from(&current);
         self.redo_stack.push_back(HistoryEntry {
             song: current,
             label: self.current_label,
@@ -338,6 +381,7 @@ impl SongDoc {
     fn step_forward(&mut self) {
         let next = self.redo_stack.pop_back().expect("caller guarantees non-empty");
         let current = std::mem::replace(&mut self.song, next.song);
+        self.song.carry_playback_state_from(&current);
         self.undo_stack.push_back(HistoryEntry {
             song: current,
             label: self.current_label,
@@ -403,7 +447,7 @@ impl SongDoc {
         // saved_epoch とは一致しなくなるので dirty になる (epoch 方式では
         // 「undo で保存時点に戻ったら clean」 は表現しない — O(1) 化の意図的
         // トレードオフ、 docs/plan_arch_refactor.md §7.5)。
-        self.edit_epoch += 1;
+        self.bump_edit_epoch();
         // gesture squash chain は履歴 jump を跨がない (跨ぐと drag 再開時の
         // snapshot が skip され、 undo 1 回分の状態が履歴から欠落する)。
         self.last_gesture = None;
@@ -417,7 +461,7 @@ impl SongDoc {
         self.redo_stack.clear();
         self.current_label = BASELINE_LABEL;
         self.last_gesture = None;
-        self.edit_epoch += 1;
+        self.bump_edit_epoch();
         self.saved_epoch = self.edit_epoch;
     }
 
@@ -428,7 +472,7 @@ impl SongDoc {
     /// ファイルを読み込んだ結果の修復だから。 解消は冪等なので、一度保存すれば
     /// 次に開いたときは立たない。
     pub fn mark_dirty_after_load_fixup(&mut self) {
-        self.edit_epoch += 1;
+        self.bump_edit_epoch();
     }
 
     // -------- gesture scopes -------------------------------------------------

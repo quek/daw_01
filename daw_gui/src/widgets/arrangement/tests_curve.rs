@@ -401,6 +401,7 @@ fn automation_segment_at_hits_the_drawn_curve() {
         start_beat: 0.0,
         len_beats: 4.0,
         name: Arc::from("c"),
+        color: None,
         points: vec![
             ArrangementAutomationPoint {
                 id: 1,

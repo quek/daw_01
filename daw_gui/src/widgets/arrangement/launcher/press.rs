@@ -111,18 +111,17 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
         return Some(Zone::RowReturn(row.key));
     }
     let (key, rect) = layout::cell_at(f, x, y)?;
-    // グループ行の「まとめセル」は本体ぜんぶが発火ボタン。グループトラックは自分の
-    // クリップを鳴らさない (`process_track_owned` が `track_has_children` で pass 1 を
-    // 抜ける) ので、選んだり運んだりする中身が無い。
-    if f.launcher_view.rows.get(&row.key).is_some_and(|r| r.group) {
-        return Some(Zone::CellLaunch(key));
-    }
     // 空セルは **記号 (■ / ●) の上だけ**がボタン。中身のあるセルと同じ分割で、
     // 記号の外は「焦点を移すだけ」の本体になる (Live / Bitwig の空スロットと同じ)。
     //
     // 以前は空セルの本体ぜんぶをボタンにしていたが、空スロットのボタンは
     // 「その行を止める」なので、**列の空きを掴もうとしただけで再生が止まる**。
     // 押せる場所を記号に限れば、止めたいときだけ止まる。
+    //
+    // グループ行の「まとめセル」 (`clip_id == 0` なので `is_empty`) も同じ分割。グループ
+    // トラックは自分のクリップを鳴らさない (`process_track_owned` が `track_has_children`
+    // で pass 1 を抜ける) ので運ぶ中身は無いが、**本体ぜんぶをボタンにすると子が鳴る列を
+    // 掴もうとしただけで再生が始まる** (空セル / シーン見出しで潰したのと同じ症状)。
     if key.is_empty() {
         return Some(if layout::launch_button_rect(rect).contains(x, y) {
             Zone::CellLaunch(key)

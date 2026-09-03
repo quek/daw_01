@@ -535,25 +535,57 @@ fn 独立複製したセルは元と_content_を共有しない() {
     assert_ne!(dup_content, src_content);
 }
 
-/// 撃った状態は「ユーザーが最後に撃ったもの」なので `Song` に入り、
-/// **保存対象 (= `*` が立つ)**。フォローアクションの遷移先は入らない
-/// (それは engine の走行状態) — ここでは前者だけを固定する。
+/// 撃った状態は「ユーザーが最後に撃ったもの」なので `Song` に入り保存されるが、
+/// 撃つ / 止めるは「聴き方」なので **`*` も undo も付けない** (計画書 §1.3)。
+/// 子プロセスへの sync だけは走る (書き出しが今の状態を反映する、Q9)。
 #[test]
-fn セル発火は未保存マークを立てる() {
+fn セル発火は未保存マークも_undo_も付けない() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
     // seed / put_cell で立った dirty をここで一度落とす。
     app.song_doc.mark_saved();
     assert!(!app.song_doc.is_dirty());
+    let depth = app.song_doc.undo_depth();
+    let sync = app.song_doc.sync_epoch();
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
-    assert!(app.song_doc.is_dirty(), "撃った状態は曲の一部 (Q10)");
+    assert!(!app.song_doc.is_dirty(), "再生状態は `*` を立てない");
+    assert_eq!(app.song_doc.undo_depth(), depth, "再生状態は undo に積まない");
+    assert_ne!(app.song_doc.sync_epoch(), sync, "子プロセスには届ける");
+    assert!(matches!(
+        app.song_doc.song().tracks[0].launcher,
+        common::model::RowPlayback::Launcher { .. }
+    ));
 
-    // 同じセルをもう一度撃っても状態は変わらないので、余計な undo step は積まない。
-    let epoch = app.song_doc.edit_epoch();
+    // 同じセルをもう一度撃っても状態は変わらないので sync も進めない。
+    let sync = app.song_doc.sync_epoch();
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
-    assert_eq!(app.song_doc.edit_epoch(), epoch, "同じ状態への再発火で履歴を伸ばさない");
+    assert_eq!(app.song_doc.sync_epoch(), sync, "同じ状態への再発火で sync を進めない");
+
+    // 行の停止も同じ扱い。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::StopRow { row: LauncherRow::Track(1) }));
+    assert!(!app.song_doc.is_dirty(), "停止ボタンでも `*` を立てない");
+    assert_eq!(app.song_doc.undo_depth(), depth);
+}
+
+/// undo / redo は文書を履歴の snapshot に差し替えるが、再生状態は履歴に属さない
+/// ので差し替え後も**今の**状態を持ち越す (undo でセルが止まらない)。
+#[test]
+fn undo_は再生状態を巻き戻さない() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    // 撃つ前に 1 つ文書編集 (undo 対象) を積む。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::AddScene));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    let before = app.song_doc.song().tracks[0].launcher;
+    assert!(matches!(before, common::model::RowPlayback::Launcher { .. }));
+
+    assert!(app.song_doc.undo());
+    assert_eq!(app.song_doc.song().tracks[0].launcher, before, "undo で再生状態は変わらない");
+    assert!(app.song_doc.redo());
+    assert_eq!(app.song_doc.song().tracks[0].launcher, before, "redo でも変わらない");
 }
 
 /// 空セルの上で `Enter` を押すとその行が止まる (= 空セルは停止)。

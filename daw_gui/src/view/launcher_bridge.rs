@@ -299,17 +299,19 @@ fn empty_cell_menu_edit(idx: usize, row: LauncherRow, scene_index: usize) -> Edi
 fn cell_menu_edit(idx: usize, cell: EvCellKey, rect: Rect) -> Edit<AppData> {
     Edit::mutate(move |app: &mut AppData| match idx {
         0 => app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell))),
-        1 => {
-            // 色は既存のカラーピッカーへ (クリップと同じ対象種別)。
-            if let EvCellKey::Track(k) = cell {
+        // 色は既存のカラーピッカーへ (クリップと同じ対象種別)。
+        1 => match cell {
+            EvCellKey::Track(k) => {
                 app.open_color_picker(crate::app::ColorPickerTarget::Clip(k), rect);
             }
-        }
-        2 => {
-            if let EvCellKey::Track(k) = cell {
-                app.handle_event(AppEvent::MakeClipUnique(k));
+            EvCellKey::Lane(k) => {
+                app.open_color_picker(crate::app::ColorPickerTarget::AutomationClip(k), rect);
             }
-        }
+        },
+        2 => match cell {
+            EvCellKey::Track(k) => app.handle_event(AppEvent::MakeClipUnique(k)),
+            EvCellKey::Lane(k) => app.handle_event(AppEvent::MakeAutomationClipUnique(k)),
+        },
         3 => app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteCells(vec![cell]))),
         _ => {}
     })

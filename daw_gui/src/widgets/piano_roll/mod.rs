@@ -1483,11 +1483,16 @@ mod tests {
             Some(style.root_row_overlay),
             style.root_label_fg,
         );
-        assert_eq!(on_black_root, p.ink_on_bright, "黒鍵 root + warm overlay 行 → 暗ラベル");
+        // `ink_for` は足りなければ純黒へ寄せるので、テーマのインクとの完全一致ではなく極性で見る。
+        let is_dark = |c: daw_ui_renderer::Color| {
+            daw_ui_core::color::relative_luminance(c.r, c.g, c.b)
+                <= daw_ui_core::color::CONTRAST_LUMINANCE_THRESHOLD
+        };
+        assert!(is_dark(on_black_root), "黒鍵 root + warm overlay 行 → 暗ラベル");
         // 白鍵 in-scale (overlay 無し) → 明るい → 暗ラベル (旧 in_scale_label_fg の明文字が潰れる症状も解消)。
         let on_white =
             keyboard_label_color(p, &style, style.white_key, None, style.in_scale_label_fg);
-        assert_eq!(on_white, p.ink_on_bright, "白鍵 in-scale 行 → 暗ラベル");
+        assert!(is_dark(on_white), "白鍵 in-scale 行 → 暗ラベル");
         // opt-out: fallback 固定色をそのまま返す。
         let off = PianoRollStyle { label_auto_contrast: false, ..style };
         assert_eq!(

@@ -562,6 +562,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(
@@ -852,6 +853,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(target.clone(), -30.0)
@@ -935,6 +937,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(target, 0.5)
@@ -1047,6 +1050,7 @@ mod tests {
                 length_beats: 4.0,
                 content_id: cid,
                 content_offset_beats: 0.0,
+                color: None,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(target, 0.5)

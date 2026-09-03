@@ -154,6 +154,10 @@ pub struct AutomationClipCopy {
     pub points: Vec<CopiedPoint>,
     /// 共有名 (`Song.clip_content_names` 由来)。
     pub name: Option<String>,
+    /// per-clip 色上書き (`AutomationClip::color`)。paste 先へ引き継ぐ。
+    /// 旧 clipboard JSON との互換のため serde default (`None`)。
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
 }
 
 /// r.md #87: ランチャーのセル 1 つ。位置は **選択群の左上を (0, 0) とした相対
@@ -687,6 +691,7 @@ mod tests {
             source_content_id: 0 as ContentId,
             points: pts,
             name: None,
+            color: None,
         };
         let out = sanitize_automation_clips(vec![
             mk(4.0, 0.0, vec![pt(0.0, 2.0), pt(-1.0, 0.5)]), // valid; point clamp + drop bad time
@@ -716,6 +721,7 @@ mod tests {
                     curve: AutomationCurve::Linear,
                 }],
                 name: Some("Volume curve".to_string()),
+                color: None,
             }]),
         );
         let json = env.to_json().unwrap();

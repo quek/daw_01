@@ -202,6 +202,43 @@ bump も無し。
 - SET 伝播 / RESET track-scoped は handler 挙動 (実機 + 目視で検証)。
 - gui_01 側は #086/#087 の unit test + offscreen PNG + `color_picker_verify` で検証済。
 
+## 追加要件 (2026-09-03): オートメーションクリップにも同じ色指定
+
+それまで automation clip は色 field を持たず、レーンの**識別色** (対象種別ごとの固定色、
+`view_build::lane_target_display`) が fill / border の唯一 source だった。ユーザー要望
+「他のクリップと同じがシンプル」で、通常クリップと同じ **継承 + 上書き** を入れる。
+
+- **データ**: `AutomationLane.color` / `AutomationClip.color: Option<[f32; 3]>` (serde default /
+  None は非 serialize、version bump 無し)。`Track.color → Clip.color` と完全に同形:
+  `lane.color == None` = 対象種別ごとの識別色 (`lane_identity_color`、テーマ非従属の
+  カテゴリ色 r.md #48)、`clip.color == None` = レーンの実効色を継承
+  (`track_color::effective_lane_color` / `effective_automation_clip_color`)。
+- **SET は content 共有クリップ全体へ伝播** (`propagate_automation_clip_color`、通常 clip の
+  `propagate_clip_color` と同じ規則)。対象は track lanes + song lanes、arrangement + session。
+- **RESET**: lane header 右クリック「クリップ色をレーンに揃える」 (`ResetAutomationLaneClipColors`、
+  lane-scoped で arrangement + session の全 clip、track 版と同じ) に加えて、clip 右クリック
+  「レーン色に戻す」 (= `SetAutomationClipColor { color: None }`、伝播) も置く。
+- **UI 入口**: lane header 右クリック「色...」 (`ColorPickerTarget::AutomationLane`、widget は
+  `automation_lane_header_rects` を返すだけ)、アレンジの automation clip 右クリック
+  「色...」/「レーン色に戻す」、ランチャーのレーン行セル右クリック「色...」
+  (`ColorPickerTarget::AutomationClip`)。picker の初期値は各実効色。
+- `AutomationLane::clip_by_id` は `Track::clip_by_id` と同じ **`all_clips` 契約** (session の
+  セルも引く)。arrangement だけを見ていたため、セルの「色...」が対象を見つけられず picker が
+  即閉じていた (2026-09-03 に修正)。
+- **描画**: `automation_clip_colors(lane, clip.color, style)` — **通常 clip と同形**: fill は
+  不透明な clip 色 (clip.color > lane 実効色)、選択でも潰さない (選択は cached 外のリング
+  `draw_automation_selection_overlay`、通常 clip の `draw_selection_overlay` と同 idiom。選択集合を
+  heavy cache key から外した)。disabled lane は `muted_dim_fill` + 灰枠。curve / point / clip 名の
+  インクは常に実効 fill から (`ink_for` / `clip_text_color_for`、固定灰は廃止)。
+  旧実装 (識別色 alpha 0.20 の wash + 1px 枠 + 選択で黄塗り) は色を変えても見分けが付かず、
+  「選択 → 右クリック → 色...」では一切見えなかった (2026-09-03 実測、`tests_contrast.rs` で固定)。
+  ランチャーのレーン行セルも同じ優先順。
+- **レーン header の色ストライプ**: track header の `track_color_strip_w` と同 idiom で
+  `lane_ink` (実効レーン色) を左端に描く。track は「未指定 = 無し」だが lane は常に実効色が
+  あるので常に描く。arrangement / session view は header pane を共有するので 1 箇所。
+- **複製 / クローン / 貼り付けは色を引き継ぐ** (D / Alt+D / Ctrl+drag / Ctrl+Shift+drag /
+  clipboard `AutomationClipCopy.color` / セルのコピー)。
+
 ## 参考
 
 - REAPER: track color + item「inherit track color / custom color」(右クリック)。
