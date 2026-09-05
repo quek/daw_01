@@ -296,6 +296,9 @@ pub struct InspectorImageEventSummary {
     pub rotation_radians: f32,
     pub fade_in_beats: f64,
     pub fade_out_beats: f64,
+    /// r.md #98: 左右 / 上下反転 toggle の表示状態 (first event 代表値)。
+    pub flip_h: bool,
+    pub flip_v: bool,
     /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
     /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
     /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と

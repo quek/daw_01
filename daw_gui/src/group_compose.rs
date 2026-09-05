@@ -34,6 +34,11 @@ pub enum CompositeItem {
         alpha: f32,
         /// rect 中心回転（radians）。
         rotation_radians: f32,
+        /// r.md #98: 左右 / 上下反転。UV で反転する（[`flip_uv`]）ので texture は
+        /// 1 つのまま。回転との順序は **反転 → 回転**（shader は回転前の corner で
+        /// UV を引くため、反転した画を rect ごと剛体回転する）。
+        flip_h: bool,
+        flip_v: bool,
     },
     /// テキストオーバーレイ（canvas-normalized rect + project-px font）。合成画へ
     /// 焼き込むことで track 効果がテキストにも乗る（plan_video_fx §3）。
@@ -399,6 +404,44 @@ pub fn group_composite_canvas(proj: (u32, u32), t: &GroupTransform) -> (u32, u32
     (w, h)
 }
 
+/// r.md #98: 反転フラグ → `TexturedQuad` の `(uv_min, uv_max)`。
+///
+/// 反転は texture を作り直さず UV で行う。shader (`texture.wgsl`) は
+/// `uv = uv_min + corner * (uv_max - uv_min)` を **回転前の corner** で引くので、
+/// `uv_min.x > uv_max.x` にすれば左端の corner が texture 右端をサンプルする =
+/// 左右反転。回転はその後に rect 中心 (pivot) 基準でかかるため、合成順は
+/// 「反転 → 回転」で固定（Resolve / Premiere の Flip + Rotation と同じ）。
+#[must_use]
+pub fn flip_uv(flip_h: bool, flip_v: bool) -> ((f32, f32), (f32, f32)) {
+    let (u0, u1) = if flip_h { (1.0, 0.0) } else { (0.0, 1.0) };
+    let (v0, v1) = if flip_v { (1.0, 0.0) } else { (0.0, 1.0) };
+    ((u0, v0), (u1, v1))
+}
+
+/// [`CompositeItem::Quad`] 1 件を `rect` (px) に置く `TexturedQuad`。passthrough
+/// (screen px) と合成 canvas (canvas px) の両分岐がここを通る（反転 / 回転の
+/// 適用の仕方が 2 経路で食い違わないための単一の口）。
+fn item_quad(
+    rect: Rect,
+    texture: TextureHandle,
+    alpha: f32,
+    rotation_radians: f32,
+    flip_h: bool,
+    flip_v: bool,
+) -> TexturedQuad {
+    let (uv_min, uv_max) = flip_uv(flip_h, flip_v);
+    TexturedQuad {
+        rect,
+        texture,
+        alpha,
+        uv_min,
+        uv_max,
+        clip_rect: None,
+        rotation_radians,
+        rotation_pivot: None,
+    }
+}
+
 /// 1 [`TrackComposite`] を `scene` に描く
 /// **preview / export 共通の SSoT 経路**。
 ///
@@ -428,25 +471,23 @@ pub(crate) fn composite_and_place<R: VideoFxRenderer>(
         };
         for item in &tc.items {
             match item {
-                CompositeItem::Quad { texture, dest, alpha, rotation_radians } => {
+                CompositeItem::Quad { texture, dest, alpha, rotation_radians, flip_h, flip_v } => {
                     if *alpha <= 0.0 {
                         continue;
                     }
-                    scene.push_textured_quad(TexturedQuad {
-                        rect: Rect::new(
+                    scene.push_textured_quad(item_quad(
+                        Rect::new(
                             project_box.0 + dest.0 * project_box.2,
                             project_box.1 + dest.1 * project_box.3,
                             dest.2 * project_box.2,
                             dest.3 * project_box.3,
                         ),
-                        texture: *texture,
-                        alpha: *alpha,
-                        uv_min: (0.0, 0.0),
-                        uv_max: (1.0, 1.0),
-                        clip_rect: None,
-                        rotation_radians: *rotation_radians,
-                        rotation_pivot: None,
-                    });
+                        *texture,
+                        *alpha,
+                        *rotation_radians,
+                        *flip_h,
+                        *flip_v,
+                    ));
                 }
                 CompositeItem::Text(tf) => push_text_glyph(scene, tf, project_box, pscale),
             }
@@ -465,22 +506,20 @@ pub(crate) fn composite_and_place<R: VideoFxRenderer>(
     let mut sub = Scene::new();
     for item in &tc.items {
         match item {
-            CompositeItem::Quad { texture, dest, alpha, rotation_radians } => {
-                sub.push_textured_quad(TexturedQuad {
-                    rect: Rect::new(
+            CompositeItem::Quad { texture, dest, alpha, rotation_radians, flip_h, flip_v } => {
+                sub.push_textured_quad(item_quad(
+                    Rect::new(
                         dest.0 * cw as f32,
                         dest.1 * ch as f32,
                         dest.2 * cw as f32,
                         dest.3 * ch as f32,
                     ),
-                    texture: *texture,
-                    alpha: *alpha,
-                    uv_min: (0.0, 0.0),
-                    uv_max: (1.0, 1.0),
-                    clip_rect: None,
-                    rotation_radians: *rotation_radians,
-                    rotation_pivot: None,
-                });
+                    *texture,
+                    *alpha,
+                    *rotation_radians,
+                    *flip_h,
+                    *flip_v,
+                ));
             }
             CompositeItem::Text(tf) => {
                 push_text_glyph(&mut sub, tf, (0.0, 0.0, cw as f32, ch as f32), canvas_scale);
@@ -782,6 +821,8 @@ mod tests {
                         h: 0.5,
                         opacity: 1.0,
                         rotation_radians: 0.0,
+                        flip_h: false,
+                        flip_v: false,
                         muted: false,
                         fade_in_beats: 0.0,
                         fade_out_beats: 0.0,
@@ -881,5 +922,40 @@ mod tests {
         assert!(is_group_track(&song, group_id));
         assert!(!group_has_visual_content(&song, group_id));
         assert!(!active_visual_groups(&song, &RowTimeline::preview(0.0), common::mod_plane::ModPlaneRef::default()).contains_key(&group_id));
+    }
+
+    /// r.md #98: 反転は UV の端を入れ替えるだけ (texture は 1 つのまま)。
+    #[test]
+    fn flip_uv_swaps_only_the_flipped_axis() {
+        // (flip_h, flip_v, uv_min, uv_max)
+        let cases = [
+            (false, false, (0.0, 0.0), (1.0, 1.0)),
+            (true, false, (1.0, 0.0), (0.0, 1.0)),
+            (false, true, (0.0, 1.0), (1.0, 0.0)),
+            (true, true, (1.0, 1.0), (0.0, 0.0)),
+        ];
+        for (fh, fv, min, max) in cases {
+            assert_eq!(flip_uv(fh, fv), (min, max), "flip_h={fh} flip_v={fv}");
+        }
+    }
+
+    /// r.md #98: 反転 → 回転の順序。`texture.wgsl` は UV を **回転前の corner** で
+    /// `uv_min + corner * (uv_max - uv_min)` と引き、その後 pivot 基準で頂点を回す。
+    /// したがって quad に載せるべきは「反転済み UV + 元の rotation + 中心 pivot」で、
+    /// 反転のために rotation や pivot を触ってはいけない (触ると 90° 回転 + Flip H が
+    /// Resolve / Premiere と違う向きになる)。この契約を quad の構築で固定する。
+    #[test]
+    fn item_quad_flips_uv_and_keeps_rotation_about_rect_center() {
+        let tex = TextureHandle::from_raw(std::num::NonZeroU32::new(7).unwrap());
+        let rect = Rect::new(10.0, 20.0, 200.0, 100.0);
+        let rot = std::f32::consts::FRAC_PI_2;
+        let q = item_quad(rect, tex, 0.5, rot, true, false);
+        assert_eq!(q.rect, rect);
+        assert_eq!(q.texture, tex);
+        assert_eq!(q.alpha, 0.5);
+        assert_eq!((q.uv_min, q.uv_max), ((1.0, 0.0), (0.0, 1.0)), "左右反転は UV の x だけ");
+        assert_eq!(q.rotation_radians, rot, "回転は反転の影響を受けない");
+        assert_eq!(q.rotation_pivot, None, "pivot は rect 中心のまま");
+        assert_eq!(q.clip_rect, None);
     }
 }

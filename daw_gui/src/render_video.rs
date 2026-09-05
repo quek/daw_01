@@ -617,6 +617,8 @@ fn build_frame_scene(
             dest,
             alpha: layer.alpha,
             rotation_radians: 0.0,
+            flip_h: false,
+            flip_v: false,
         });
     }
 
@@ -640,6 +642,8 @@ fn build_frame_scene(
             dest: (layer.x, layer.y, layer.w, layer.h),
             alpha: layer.alpha,
             rotation_radians: layer.rotation_radians,
+            flip_h: layer.flip_h,
+            flip_v: layer.flip_v,
         });
     }
 

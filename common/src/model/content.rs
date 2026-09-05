@@ -1083,6 +1083,18 @@ pub struct ImageEvent {
     #[serde(default)]
     pub rotation_radians: f32,
 
+    /// r.md #98: 左右反転 (Flip Horizontal)。 texture のピクセルは触らず
+    /// UV の x を反転してサンプルする (`group_compose::flip_uv`)。 回転と
+    /// 組み合わせたときは **反転 → 回転** (rect 中心基準) の順 — shader が
+    /// UV を回転前の corner で計算するので、 反転した画を rect ごと剛体回転
+    /// する Resolve / Premiere の Flip Horizontal と同じ見え方になる。
+    #[serde(default)]
+    pub flip_h: bool,
+    /// r.md #98: 上下反転 (Flip Vertical)。 順序・実装は `flip_h` と同じ
+    /// (UV の y を反転)。
+    #[serde(default)]
+    pub flip_v: bool,
+
     pub muted: bool,
     pub fade_in_beats: f64,
     pub fade_out_beats: f64,
@@ -1105,6 +1117,8 @@ impl Default for ImageEvent {
             h: 1.0,
             opacity: 1.0,
             rotation_radians: 0.0,
+            flip_h: false,
+            flip_v: false,
             muted: false,
             fade_in_beats: 0.0,
             fade_out_beats: 0.0,

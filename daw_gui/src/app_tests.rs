@@ -1263,3 +1263,99 @@ mod gpu_derived_cache_tests {
         assert_eq!(app.ui_ephemeral.pending_texture_destroys.len(), 2);
     }
 }
+
+/// r.md #98: 画像の左右 / 上下反転は inspector の toggle → `BroadcastDiscreteClipEdit`
+/// → `ImageEvent.flip_h` / `flip_v` の 1 経路。undo 1 段 / dirty / 全 event へ broadcast。
+#[cfg(test)]
+mod image_flip_tests {
+    use std::sync::Arc;
+
+    use common::model::{Clip, ClipContent, ClipKey, ImageContent, ImageEvent, Song};
+    use common::protocol::{AudioCommand, PluginCommand};
+    use tokio::sync::mpsc;
+
+    use crate::app::{AppData, AppEvent};
+    use crate::dispatcher::{
+        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+    };
+    use crate::event::DiscreteClipEdit;
+
+    fn build_app_with_image_clip() -> (AppData, ClipKey) {
+        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<AudioCommand>();
+        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<PluginCommand>();
+        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+        let mut app = AppData::new(
+            audio_tx,
+            plugin_tx,
+            None,
+            None,
+            event_dispatcher,
+            job_dispatcher,
+            None,
+            None,
+            common::audio_bridge::DEFAULT_SAMPLE_RATE,
+        );
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        // 2 event の clip: broadcast が first event だけでなく全 event に効くことを見る。
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Image(ImageContent {
+                events: vec![
+                    ImageEvent { source_id: 1, event_length_beats: 4.0, ..ImageEvent::default() },
+                    ImageEvent {
+                        source_id: 1,
+                        event_start_in_clip_beats: 4.0,
+                        event_length_beats: 4.0,
+                        ..ImageEvent::default()
+                    },
+                ],
+            }),
+        );
+        let track_id = song.alloc_track_id();
+        let mut track = crate::app::track_with(|t| t.id = track_id);
+        let clip_id = track.alloc_clip_id();
+        track.clips.push(Clip {
+            id: clip_id,
+            length_beats: 8.0,
+            content_id: cid,
+            ..Clip::default()
+        });
+        song.tracks.push(track);
+        app.song_doc.replace_song(song);
+        app.song_doc.mark_saved();
+        (app, ClipKey { track_id, clip_id })
+    }
+
+    fn flips(app: &AppData, key: ClipKey) -> Vec<(bool, bool)> {
+        let clip = app.song_doc.song().track_by_id(key.track_id).unwrap().clip_by_id(key.clip_id).unwrap();
+        let events = app.song_doc.song().clip_contents[&clip.content_id].image_events().unwrap();
+        events.iter().map(|e| (e.flip_h, e.flip_v)).collect()
+    }
+
+    #[test]
+    fn flip_toggles_broadcast_to_all_events_and_undo_in_one_step() {
+        let (mut app, key) = build_app_with_image_clip();
+        assert!(!app.song_doc.is_dirty());
+
+        app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+            targets: vec![key],
+            edit: DiscreteClipEdit::ImageFlipH(true),
+        });
+        assert_eq!(flips(&app, key), vec![(true, false), (true, false)]);
+        assert!(app.song_doc.is_dirty(), "反転は中身が変わる編集なので dirty");
+
+        app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+            targets: vec![key],
+            edit: DiscreteClipEdit::ImageFlipV(true),
+        });
+        assert_eq!(flips(&app, key), vec![(true, true), (true, true)]);
+
+        // undo 1 段で直前の toggle だけ戻る (H は残る)。
+        app.handle_event(AppEvent::Undo);
+        assert_eq!(flips(&app, key), vec![(true, false), (true, false)]);
+        app.handle_event(AppEvent::Undo);
+        assert_eq!(flips(&app, key), vec![(false, false), (false, false)]);
+    }
+}

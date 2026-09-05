@@ -1201,7 +1201,44 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             }));
         }
-        y += input_h + 12.0;
+        y += input_h + 4.0;
+
+        // r.md #98: Flip H / Flip V (節の末尾、 Mute と同じ toggle 部品 + 同じ broadcast
+        // 経路)。 2 つ横並びで 1 行。
+        let flip_w = (row_w - 4.0) * 0.5;
+        let new_flip_h = !summary.flip_h;
+        ui.toggle_button_at(
+            "inspector_image_flip_h",
+            "Flip H",
+            Rect { x: area.x + pad, y, w: flip_w, h: toggle_h },
+            summary.flip_h,
+            &toggle_audio_style(&app.theme),
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                        targets: app.inspector_target_refs(),
+                        edit: DiscreteClipEdit::ImageFlipH(new_flip_h),
+                    })
+                })
+            },
+        );
+        let new_flip_v = !summary.flip_v;
+        ui.toggle_button_at(
+            "inspector_image_flip_v",
+            "Flip V",
+            Rect { x: area.x + pad + flip_w + 4.0, y, w: flip_w, h: toggle_h },
+            summary.flip_v,
+            &toggle_audio_style(&app.theme),
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                        targets: app.inspector_target_refs(),
+                        edit: DiscreteClipEdit::ImageFlipV(new_flip_v),
+                    })
+                })
+            },
+        );
+        y += toggle_h + 12.0;
     }
 
     // ---- Plugin chain + 行内アコーディオン -----------------

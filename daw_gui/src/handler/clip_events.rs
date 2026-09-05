@@ -458,6 +458,17 @@ impl AppData {
         self.resync_clip_image_event_edit_buffers(target);
     }
 
+    /// r.md #98: 左右反転。 discrete toggle なので edit buffer の resync は不要
+    /// (数値 field ではない)。 image clip 以外は `mutate_image_events_in_clip` が no-op。
+    pub(crate) fn set_clip_image_event_flip_h(&mut self, target: ClipKey, value: bool) {
+        self.mutate_image_events_in_clip(target, |e| e.flip_h = value);
+    }
+
+    /// r.md #98: 上下反転。 `set_clip_image_event_flip_h` と同じ。
+    pub(crate) fn set_clip_image_event_flip_v(&mut self, target: ClipKey, value: bool) {
+        self.mutate_image_events_in_clip(target, |e| e.flip_v = value);
+    }
+
     /// docs/plan_text_overlay.md §4 P6: image と同 idiom の text event
     /// setter 群。 drag / inspector commit / lane override 経由のいずれも
     /// このパスで TextEvent.field を直接書く。
