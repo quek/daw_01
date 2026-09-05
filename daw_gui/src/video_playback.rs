@@ -353,7 +353,7 @@ pub fn bgra_to_rgba(src: &[u8]) -> Vec<u8> {
 /// old x86), or as the reference impl for the SIMD path's unit test.
 fn bgra_to_rgba_scalar(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
-    for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+    for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
         d[0] = s[2];
         d[1] = s[1];
         d[2] = s[0];

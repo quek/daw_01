@@ -136,7 +136,7 @@ fn render_theme(renderer: &mut OffscreenRenderer, theme_id: &str, settings_open:
     let rgba = renderer.render_to_rgba(&scene).expect("offscreen render");
     let mut sum = 0.0_f32;
     let mut uniq: HashSet<u32> = HashSet::new();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         sum += luminance(px[0], px[1], px[2]);
         uniq.insert(u32::from_be_bytes([px[0], px[1], px[2], 0]));
     }

@@ -679,14 +679,10 @@ fn run_worker(
             }
         });
         // Reset aux_in_active for the next buffer (stale routing 防止)。
-        for flag in &mut pd.aux_in_active {
-            *flag = 0;
-        }
+        pd.aux_in_active.fill(0);
         // パラアウト: clear aux_out_active up front (失敗 buffer の stale
         // flag 防止)。
-        for flag in &mut pd.aux_out_active {
-            *flag = 0;
-        }
+        pd.aux_out_active.fill(0);
 
         let transport = crate::plugin_instance::TransportContext::from_process_data(
             pd,

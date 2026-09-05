@@ -2139,7 +2139,7 @@ pub(crate) fn decode_image_to_bgra(abs: &Path) -> Option<(u32, u32, std::sync::A
                 return None;
             }
             let mut bytes = rgba.into_raw();
-            for px in bytes.chunks_exact_mut(4) {
+            for px in bytes.as_chunks_mut::<4>().0 {
                 px.swap(0, 2); // RGBA → BGRA
             }
             Some((w, h, std::sync::Arc::new(bytes)))

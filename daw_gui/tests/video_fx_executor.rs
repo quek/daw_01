@@ -316,7 +316,7 @@ fn all_catalog_effects_compile_and_run() {
 
 fn solid(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
     let mut data = vec![0u8; (w * h * 4) as usize];
-    for chunk in data.chunks_exact_mut(4) {
+    for chunk in data.as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&rgba);
     }
     data

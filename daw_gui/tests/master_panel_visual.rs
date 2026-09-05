@@ -266,7 +266,9 @@ fn the_master_panel_follows_the_light_theme() {
         let r = crop(rgba, x0, x1, y0, y1);
         let sum: f32 = r
             .pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|p| {
                 // readback は `Rgba8UnormSrgb` = sRGB エンコード済みバイト。
                 // `relative_luminance` は linear 入力前提なので decode してから渡す。

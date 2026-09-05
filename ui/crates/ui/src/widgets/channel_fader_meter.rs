@@ -440,7 +440,7 @@ mod tests {
         let thumb_y = region.y + region.h * (1.0 - scale.db_to_frac(0.0));
         // 重なり領域 x: meter_x = 0 + 18 + 2 = 20、 thumb 右端 ≈ 23 → x=21 は両方に属する。
         let overlap_x = rect.x + FADER_W + METER_GAP + 1.0;
-        let thumb_right = rect.x + (FADER_W + 28.0) * 0.5; // THUMB_W = 28
+        let thumb_right = rect.x + f32::midpoint(FADER_W, 28.0); // THUMB_W = 28
         assert!(
             overlap_x >= rect.x + FADER_W + METER_GAP && overlap_x < thumb_right,
             "x が meter 列内かつ thumb 内 (重なり領域)"

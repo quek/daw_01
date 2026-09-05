@@ -16,3 +16,6 @@
 __pycache__/
 # ミラー用の成果物 (make ffmpeg-mirror)。60MB 超のバイナリなので追跡しない。
 /dist/
+
+# Emacs のロックファイル (編集中に現れる。reuse-lint の untracked 判定から外す)
+.#*

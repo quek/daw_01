@@ -165,7 +165,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
         // --- hit-test: tension handle (各セグメント中点、ノードに当たってない時のみ) ---
         let tension_handle_px = |seg: usize| -> (f32, f32) {
-            let mt = (nodes[seg].time + nodes[seg + 1].time) * 0.5;
+            let mt = f32::midpoint(nodes[seg].time, nodes[seg + 1].time);
             to_px(mt, sample_y_at(samples, mt))
         };
         let hovered_tension: Option<usize> = if hovered_node.is_some() {
@@ -341,7 +341,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if (nodes_owned[seg + 1].time - nodes_owned[seg].time).abs() < 1e-3 {
                     continue;
                 }
-                let mt = (nodes_owned[seg].time + nodes_owned[seg + 1].time) * 0.5;
+                let mt = f32::midpoint(nodes_owned[seg].time, nodes_owned[seg + 1].time);
                 let my = sample_y_at(&samples_owned, mt);
                 let (hx, hy) = (rect.x + mt * rect.w, rect.y + (1.0 - my) * rect.h);
                 let r = style.node_radius_px * 0.6;

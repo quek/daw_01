@@ -393,7 +393,9 @@ fn double_buffer_glyph_does_not_leak_across_frames() {
     // 明るい pixel のうち red 寄り / blue 寄りを数える。
     let count = |bytes: &[u8], red: bool| {
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| {
                 let bright = u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]) > 60;
                 bright && if red { px[0] > px[2] } else { px[2] > px[0] }

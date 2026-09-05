@@ -967,9 +967,7 @@ impl LocalState {
                     }
                     // tape 位置 accumulator も同じ理由で無効化する
                     // (添字は track 内 schedule 順 = 位置キー)。
-                    for slot in &mut s.repitch_accum {
-                        *slot = (u64::MAX, 0.0);
-                    }
+                    s.repitch_accum.fill((u64::MAX, 0.0));
                 }
             } else {
                 // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。

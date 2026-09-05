@@ -187,7 +187,7 @@ impl DocState {
         }
         for w in b.windows(2) {
             if x < w[1].0 {
-                let mid = (w[0].0 + w[1].0) * 0.5;
+                let mid = f32::midpoint(w[0].0, w[1].0);
                 let byte = if x < mid { w[0].1 } else { w[1].1 };
                 return Some(self.map.byte_to_acp(byte) as i32);
             }

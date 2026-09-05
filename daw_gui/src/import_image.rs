@@ -210,7 +210,7 @@ pub fn import_one_image(
     // extra allocation beyond the swap), and the result is the same
     // length we hand back to the caller.
     let mut bytes = rgba.into_raw();
-    for px in bytes.chunks_exact_mut(4) {
+    for px in bytes.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
 

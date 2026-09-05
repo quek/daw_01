@@ -585,7 +585,7 @@ fn validate_pixels(
     let mut unique: std::collections::HashSet<(u8, u8, u8)> =
         std::collections::HashSet::with_capacity(cap);
     let mut black_count: usize = 0;
-    for px in frame.bgra.chunks_exact(4) {
+    for px in frame.bgra.as_chunks::<4>().0 {
         // BGRA layout (Windows DIB top-down 32-bit).
         let b = px[0];
         let g = px[1];

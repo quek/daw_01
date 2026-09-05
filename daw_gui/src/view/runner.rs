@@ -1876,7 +1876,7 @@ impl Runner {
         if state.app.media.pending_image_uploads.is_empty() {
             return;
         }
-        let pending: Vec<_> = state.app.media.pending_image_uploads.drain(..).collect();
+        let pending: Vec<_> = std::mem::take(&mut state.app.media.pending_image_uploads);
         for image_source_id in pending {
             let Some((w, h, bgra)) =
                 state.app.media.image_source_bgra.remove(&image_source_id)
@@ -2233,7 +2233,7 @@ impl Runner {
         if app.media.pending_thumbnail_uploads.is_empty() {
             return;
         }
-        let pending: Vec<_> = app.media.pending_thumbnail_uploads.drain(..).collect();
+        let pending: Vec<_> = std::mem::take(&mut app.media.pending_thumbnail_uploads);
         for video_source_id in pending {
             // It's possible the source was unloaded between the
             // import and the next frame (= rapid undo path). Just

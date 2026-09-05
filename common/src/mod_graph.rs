@@ -885,9 +885,7 @@ fn walk(
         // ライブ走行中の生 env を引きずると、locate の replay が表と別のテンポ
         // (`SongTempo` の変調経由) を踏んで、breakpoint からの前進が表と一致しなくなる。
         // Audio tier はこのあと閉形式でシードし直すので影響しない。
-        for v in &mut rt.follower {
-            *v = 0.0;
-        }
+        rt.follower.fill(0.0);
         tick(
             plan,
             rt,

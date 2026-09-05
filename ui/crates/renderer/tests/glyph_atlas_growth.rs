@@ -112,7 +112,7 @@ fn churn_atlas(r: &mut OffscreenRenderer) {
 
 /// 非黒 pixel 数 (= 文字の «インク»)。
 fn ink_pixels(bytes: &[u8]) -> usize {
-    bytes.chunks_exact(4).filter(|p| p[0] > 32 || p[1] > 32 || p[2] > 32).count()
+    bytes.as_chunks::<4>().0.iter().filter(|p| p[0] > 32 || p[1] > 32 || p[2] > 32).count()
 }
 
 /// base `GlyphPipeline` の atlas: zoom 相当で font size を散らしても GPU 確保量が
