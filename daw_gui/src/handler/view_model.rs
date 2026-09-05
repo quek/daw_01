@@ -1115,11 +1115,8 @@ impl AppData {
     }
 
     /// `song_epoch` 世代キャッシュの [`common::tempo_map::TempoMap`]。テンポカーブが
-    /// 無い曲は `None` (= 呼び側は `song.bpm` の定数換算を使う)。毎フレーム
-    /// `TempoMap::from_song` を呼ぶ代わりにこれを引く (Global Sampler の小節線など)。
-    pub(crate) fn tempo_map_cached(
-        &self,
-    ) -> std::cell::Ref<'_, Option<common::tempo_map::TempoMap>> {
+    /// 無い曲は `None` (= 呼び側は `song.bpm` の定数換算を使う)。
+    fn tempo_map_cached(&self) -> std::cell::Ref<'_, Option<common::tempo_map::TempoMap>> {
         let song = self.song_doc.song();
         let epoch = self.song_doc.edit_epoch();
         {
@@ -1134,27 +1131,6 @@ impl AppData {
         std::cell::Ref::map(self.ui_ephemeral.tempo_map_cache.borrow(), |c| &c.map)
     }
 
-    /// song samples → 拍 (テンポカーブ込み、無ければ定数 BPM)。
-    pub(crate) fn song_samples_to_beat(&self, samples: u64, sample_rate: u32) -> f64 {
-        match self.tempo_map_cached().as_ref() {
-            Some(m) => m.samples_to_beat(samples, sample_rate),
-            None => {
-                let song = self.song_doc.song();
-                samples as f64 / f64::from(sample_rate.max(1)) * f64::from(song.bpm.max(1.0)) / 60.0
-            }
-        }
-    }
-
-    /// 拍 → song samples (`song_samples_to_beat` の逆)。
-    pub(crate) fn song_beat_to_samples(&self, beat: f64, sample_rate: u32) -> u64 {
-        match self.tempo_map_cached().as_ref() {
-            Some(m) => m.beat_to_samples(beat, sample_rate),
-            None => {
-                let secs = common::tempo_map::song_beat_to_seconds(self.song_doc.song(), beat);
-                (secs * f64::from(sample_rate)).round().max(0.0) as u64
-            }
-        }
-    }
 
     /// D3/D4: arrangement build 用ラベルキャッシュ ([`ArrLabelCache`])。 `song_epoch`
     /// が進んでいれば全 track 名 + content ラベルを 1 度だけ作り直し、 通常フレームは

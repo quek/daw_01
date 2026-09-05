@@ -37,8 +37,8 @@ const SEGMENT_MASK: u64 = (SEGMENTS as u64) - 1;
 /// 2 秒ごとの再同期で抑える。
 pub const SEGMENT_RESYNC_FRAMES: u64 = 96_000;
 
-/// `Segment::playhead_samples` の「停止中」sentinel。
-pub const STOPPED: u64 = u64::MAX;
+/// `Segment::playhead_beat` の「停止中」sentinel (NaN ではなく明示の bit pattern)。
+const STOPPED_BITS: u64 = u64::MAX;
 
 /// 走行セグメント 1 件 (shmem 上の表現)。
 #[repr(C)]
@@ -47,8 +47,10 @@ pub struct Segment {
     ring_frame: AtomicU64,
     /// そのときの wall-clock (UNIX epoch からの ns)。
     wall_ns: AtomicU64,
-    /// そのときの曲位置 (samples)。停止中は [`STOPPED`]。
-    playhead_samples: AtomicU64,
+    /// そのときの曲位置 (拍、`f64::to_bits`)。停止中は [`STOPPED_BITS`]。
+    playhead_beat_bits: AtomicU64,
+    /// そのときの実効テンポ。区間内は `beat = playhead_beat + frames * bpm / 60 / sr`
+    /// で進む (曲のテンポ表を後から編集しても、録った当時の小節位置が動かない)。
     bpm_bits: AtomicU32,
     _pad: AtomicU32,
 }
@@ -59,8 +61,23 @@ pub struct SegmentInfo {
     pub ring_frame: u64,
     pub wall_ns: u64,
     /// `None` = 停止中。
-    pub playhead_samples: Option<u64>,
+    pub playhead_beat: Option<f64>,
     pub bpm: f32,
+}
+
+impl SegmentInfo {
+    /// セグメント先頭から `frames` 進んだ位置の拍 (停止中は `None`)。
+    pub fn beat_after(&self, frames: u64, sample_rate: u32) -> Option<f64> {
+        let beat0 = self.playhead_beat?;
+        Some(beat0 + frames as f64 * f64::from(self.bpm.max(1.0)) / 60.0 / f64::from(sample_rate.max(1)))
+    }
+
+    /// `beat` がセグメント先頭から何フレーム後か (負なら `None`)。
+    pub fn frames_until(&self, beat: f64, sample_rate: u32) -> Option<u64> {
+        let beat0 = self.playhead_beat?;
+        let frames = (beat - beat0) * 60.0 / f64::from(self.bpm.max(1.0)) * f64::from(sample_rate.max(1));
+        (frames >= 0.0).then_some(frames.round() as u64)
+    }
 }
 
 #[repr(C)]
@@ -102,8 +119,8 @@ impl SamplerRingHandle {
         let size = shmem_size(capacity)
             .ok_or_else(|| anyhow::anyhow!("sampler ring {os_id}: capacity {capacity} too large"))?;
         let shmem = NamedShmem::create(os_id, size)?;
-        // ゼロ初期化: 全 atomic が 0 (= 無音・未書き込み) から始まる。
-        unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, size) };
+        // ページファイル裏付きの section は OS がゼロ初期化済み (全 atomic が 0 =
+        // 無音・未書き込み) なので、数百 MB を GUI スレッドで塗り直さない。
         let h = Self { shmem, capacity };
         h.header().capacity.store(capacity as u64, Ordering::Release);
         h.header().sample_rate.store(sr, Ordering::Release);
@@ -194,8 +211,10 @@ impl SamplerRingHandle {
         let s = &h.segments[(n & SEGMENT_MASK) as usize];
         s.ring_frame.store(seg.ring_frame, Ordering::Relaxed);
         s.wall_ns.store(seg.wall_ns, Ordering::Relaxed);
-        s.playhead_samples
-            .store(seg.playhead_samples.unwrap_or(STOPPED), Ordering::Relaxed);
+        s.playhead_beat_bits.store(
+            seg.playhead_beat.map_or(STOPPED_BITS, f64::to_bits),
+            Ordering::Relaxed,
+        );
         s.bpm_bits.store(seg.bpm.to_bits(), Ordering::Relaxed);
         h.seg_write.store(n + 1, Ordering::Release);
     }
@@ -214,7 +233,7 @@ impl SamplerRingHandle {
     /// `out` は読む前の長さに戻す。
     pub fn read_range(&self, start: u64, end: u64, out: &mut Vec<[f32; 2]>) -> Result<(), RingOverrun> {
         let write = self.write_frames();
-        if start >= end || end > write || start < write.saturating_sub(self.capacity as u64) {
+        if start >= end || end > write || start < self.safe_oldest_frame() {
             return Err(RingOverrun);
         }
         let before = out.len();
@@ -223,11 +242,26 @@ impl SamplerRingHandle {
             out.push(self.read_frame(f).into());
         }
         // 読んでいる間に一周されていたら中身は混ざっている。
-        if start < self.oldest_frame() {
+        if start < self.safe_oldest_frame() {
             out.truncate(before);
             return Err(RingOverrun);
         }
         Ok(())
+    }
+
+    /// 読んで安全な最古フレーム。`write_frames` は 1 ブロック書き終えてから publish
+    /// されるので、publish 前の書き込み中ブロック (最大 `MAX_FRAMES`) が `oldest_frame`
+    /// 直後の slot を上書きしている最中でありうる。その帯を除いた位置。
+    pub fn safe_oldest_frame(&self) -> u64 {
+        let write = self.write_frames();
+        if write <= self.capacity as u64 {
+            // まだ一周していない: 書き込み中の slot は未使用領域で、読める frame と
+            // 重ならない。
+            return 0;
+        }
+        self.oldest_frame()
+            .saturating_add(crate::process_data::MAX_FRAMES as u64)
+            .min(write)
     }
 
     /// セグメントの累積 push 数 (変化検出用)。
@@ -243,11 +277,11 @@ impl SamplerRingHandle {
         let first = n.saturating_sub(SEGMENTS as u64);
         for i in first..n {
             let s = &h.segments[(i & SEGMENT_MASK) as usize];
-            let playhead = s.playhead_samples.load(Ordering::Relaxed);
+            let beat_bits = s.playhead_beat_bits.load(Ordering::Relaxed);
             out.push(SegmentInfo {
                 ring_frame: s.ring_frame.load(Ordering::Relaxed),
                 wall_ns: s.wall_ns.load(Ordering::Relaxed),
-                playhead_samples: (playhead != STOPPED).then_some(playhead),
+                playhead_beat: (beat_bits != STOPPED_BITS).then(|| f64::from_bits(beat_bits)),
                 bpm: f32::from_bits(s.bpm_bits.load(Ordering::Relaxed)),
             });
         }
@@ -306,9 +340,6 @@ impl RingReader {
         (start, (write - start) as usize)
     }
 
-    pub fn cursor(&self) -> u64 {
-        self.cursor
-    }
 }
 
 /// shmem 名。**世代込み** — 長さ / 録音源の変更ごとに `generation` を進める。
@@ -352,17 +383,21 @@ mod tests {
 
     #[test]
     fn read_range_fails_after_overwrite() {
-        let h = ring(1, 100);
-        let block = vec![1.0f32; 60];
+        let h = ring(1, 4096);
+        let block = vec![1.0f32; 3000];
         h.write_block(&block, &block);
-        h.write_block(&block, &block); // 120 frames written, oldest = 20
+        h.write_block(&block, &block); // 6000 frames written, oldest = 1904
+        let guard = crate::process_data::MAX_FRAMES as u64;
+        assert_eq!(h.safe_oldest_frame(), 1904 + guard);
         let mut out = Vec::new();
         assert_eq!(h.read_range(0, 10, &mut out), Err(RingOverrun));
+        // 書き込み中でありうる帯 (oldest 直後の 1 ブロック) も弾く
+        assert_eq!(h.read_range(1904, 2000, &mut out), Err(RingOverrun));
         assert!(out.is_empty());
-        assert!(h.read_range(20, 120, &mut out).is_ok());
-        assert_eq!(out.len(), 100);
+        assert!(h.read_range(1904 + guard, 6000, &mut out).is_ok());
+        assert_eq!(out.len() as u64, 6000 - 1904 - guard);
         // 範囲外 (未来) も弾く
-        assert_eq!(h.read_range(100, 130, &mut Vec::new()), Err(RingOverrun));
+        assert_eq!(h.read_range(5000, 6100, &mut Vec::new()), Err(RingOverrun));
     }
 
     #[test]
@@ -389,13 +424,18 @@ mod tests {
     #[test]
     fn segments_come_back_oldest_first_with_stopped_sentinel() {
         let h = ring(1, 100);
-        h.push_segment(SegmentInfo { ring_frame: 0, wall_ns: 10, playhead_samples: None, bpm: 120.0 });
-        h.push_segment(SegmentInfo { ring_frame: 50, wall_ns: 20, playhead_samples: Some(7), bpm: 90.0 });
+        h.push_segment(SegmentInfo { ring_frame: 0, wall_ns: 10, playhead_beat: None, bpm: 120.0 });
+        h.push_segment(SegmentInfo { ring_frame: 50, wall_ns: 20, playhead_beat: Some(7.5), bpm: 90.0 });
         let mut out = Vec::new();
         h.segments(&mut out);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].playhead_samples, None);
-        assert_eq!(out[1], SegmentInfo { ring_frame: 50, wall_ns: 20, playhead_samples: Some(7), bpm: 90.0 });
+        assert_eq!(out[0].playhead_beat, None);
+        assert_eq!(out[1], SegmentInfo { ring_frame: 50, wall_ns: 20, playhead_beat: Some(7.5), bpm: 90.0 });
+        // 区間内の拍は録った bpm で進む: 90bpm / 100Hz → 1 拍 = 66.67 frame
+        let b = out[1].beat_after(200, 100).unwrap();
+        assert!((b - 10.5).abs() < 1e-9, "{b}");
+        assert_eq!(out[1].frames_until(10.5, 100), Some(200));
+        assert_eq!(out[1].frames_until(7.0, 100), None);
     }
 
     #[test]

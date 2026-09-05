@@ -14,6 +14,8 @@ use std::sync::Arc;
 use daw_ui_core::{DragKind, Edit, Ui};
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
+use common::sampler_ring::SegmentInfo;
+
 use crate::app::{AppData, AppEvent};
 use crate::event_sampler::SamplerEvent;
 use crate::state::midi_capture::{MIDI_CAPTURE_DRAG_KIND, MidiCaptureDragPayload};
@@ -55,12 +57,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         radius: [3.0; 4],
         clip_rect: None,
     });
-    if st.ring.is_none() {
+    if st.generation() == 0 {
         ui.label_at("sampler_none", "音声エンジンに接続していません", body.x + 8.0, body.y + 8.0, FONT, p.text_dim);
         return;
     }
     let sr = st.sample_rate();
-    draw_bar_lines(app, ui, wave, |frame| axis.frame_to_x(frame), &sampler_bar_source(app, sr));
+    draw_bar_lines(app, ui, wave, |frame| axis.frame_to_x(frame), &sampler_bar_source(app));
     draw_seconds_ruler(app, ui, body, RULER_H, |secs_ago| {
         axis.frame_to_x(st.write_frames.saturating_sub((secs_ago * f64::from(sr)) as u64))
     }, st.capacity() as f64 / f64::from(sr.max(1)));
@@ -280,22 +282,25 @@ fn draw_waveform(app: &AppData, ui: &mut Ui<'_, AppData>, wave: Rect, axis: &Rin
     }
 }
 
-/// 小節線の供給元: 「x 座標 → 曲位置 (samples)」を区間ごとに解く。
+/// 小節線の供給元: 再生していた区間 `[start, end)` (frame または ns 座標) と、その
+/// 区間の拍の進み方 (セグメントの拍 + 録った bpm)。曲のテンポ表は使わない —
+/// 録った当時の位置が SSoT で、後からテンポを編集しても線は動かない。
 pub(crate) struct BarSource {
-    /// `(区間の始点 frame/ns, 終点, その始点の曲位置 samples, bpm)`。
-    pub spans: Vec<(u64, u64, u64)>,
-    /// 区間内の単位 (frame なら sample_rate、ns なら 1e9) あたりの samples。
-    pub samples_per_unit: f64,
+    /// `(区間の始点, 終点, セグメント)`。
+    pub spans: Vec<(u64, u64, SegmentInfo)>,
+    /// 区間内の 1 単位あたりのフレーム数 (frame 座標なら 1、ns 座標なら sr / 1e9)。
+    pub frames_per_unit: f64,
 }
 
 /// Sampler タブ用: セグメントをリング frame 座標のまま使う。
-fn sampler_bar_source(app: &AppData, _sr: u32) -> BarSource {
+fn sampler_bar_source(app: &AppData) -> BarSource {
     let st = &app.sampler;
     let spans = segment_spans(&st.segments, st.write_frames)
         .into_iter()
-        .filter_map(|(s, e, seg)| seg.playhead_samples.map(|ph| (s, e, ph)))
+        .filter(|(_, _, seg)| seg.playhead_beat.is_some())
+        .map(|(s, e, seg)| (s, e, *seg))
         .collect();
-    BarSource { spans, samples_per_unit: 1.0 }
+    BarSource { spans, frames_per_unit: 1.0 }
 }
 
 /// 再生していた区間に小節線 + 小節番号を重ねる。`to_x` は区間の単位 (frame / ns) → x。
@@ -307,12 +312,11 @@ pub(crate) fn draw_bar_lines(
     src: &BarSource,
 ) {
     let p = &app.theme.core;
-    let song = app.song_doc.song();
-    let sr = app.ipc.sample_rate.max(1);
-    let bar = common::model::beats_per_bar(song.time_sig).max(1e-6);
+    let sr = app.sampler.sample_rate().max(1);
+    let bar = common::model::beats_per_bar(app.song_doc.song().time_sig).max(1e-6);
     let mut lines: Vec<LineSegment> = Vec::new();
     let mut labels: Vec<(f32, String)> = Vec::new();
-    for &(start, end, ph0) in &src.spans {
+    for &(start, end, seg) in &src.spans {
         // 区間の薄い帯 (= 再生していた)。
         let (x0, x1) = (to_x(start), to_x(end));
         ui.push_rect(RectCommand {
@@ -323,20 +327,18 @@ pub(crate) fn draw_bar_lines(
             radius: [0.0; 4],
             clip_rect: Some(wave),
         });
-        let len_samples = ((end - start) as f64 * src.samples_per_unit) as u64;
-        let beat0 = app.song_samples_to_beat(ph0, sr);
-        let beat1 = app.song_samples_to_beat(ph0 + len_samples, sr);
+        let len_frames = ((end - start) as f64 * src.frames_per_unit) as u64;
+        let (Some(beat0), Some(beat1)) = (seg.playhead_beat, seg.beat_after(len_frames, sr)) else {
+            continue;
+        };
         let first_bar = (beat0 / bar).ceil() as i64;
         let last_bar = (beat1 / bar).floor() as i64;
         // 詰まりすぎたら間引く (ラベルは 40px 以上空いたときだけ)。
         let mut last_label_x = f32::MIN;
         for k in first_bar..=last_bar {
             let beat = k as f64 * bar;
-            let s = app.song_beat_to_samples(beat, sr);
-            if s < ph0 {
-                continue;
-            }
-            let unit = ((s - ph0) as f64 / src.samples_per_unit) as u64;
+            let Some(frames) = seg.frames_until(beat, sr) else { continue };
+            let unit = (frames as f64 / src.frames_per_unit) as u64;
             let x = to_x(start + unit);
             if x < wave.x || x > wave.x + wave.w {
                 continue;

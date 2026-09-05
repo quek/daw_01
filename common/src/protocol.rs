@@ -469,8 +469,6 @@ pub enum AudioCommand {
     /// `source` の音を書き続ける。既に開いているリングは置き換える (旧世代は
     /// off-thread で drop)。一時停止はリングのヘッダ flag (command 不要)。
     OpenSamplerRing { shmem_id: String, source: SamplerSource },
-    /// Global Sampler: リングを閉じる (書き込み停止 + drop)。
-    CloseSamplerRing,
     /// Global Sampler の試聴: リングの `[start_frame, end_frame)` (`write_frames`
     /// 座標) を master 出力へ加算する。リングへの書き込みの **後**に足すので
     /// 試聴音は再録されない。範囲がリングから押し出されたら engine が自分で止める。

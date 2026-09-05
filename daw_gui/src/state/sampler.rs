@@ -75,10 +75,8 @@ impl Overview {
 }
 
 pub struct SamplerState {
-    /// リングの世代 (`sampler_ring::sampler_shmem_id` の suffix)。0 = 未 open。
-    pub generation: u32,
-    /// GUI 側が create した現世代のリング (poller と `shared` で共有)。
-    pub ring: Option<Arc<SamplerRingHandle>>,
+    /// 現世代のリング (世代 + handle) の **唯一の置き場**。GUI スレッドと poller が
+    /// 共有する。世代は `sampler_ring::sampler_shmem_id` の suffix、0 = 未 open。
     pub shared: Arc<SamplerShared>,
     pub source: SamplerSource,
     pub paused: bool,
@@ -96,8 +94,6 @@ pub struct SamplerState {
 impl SamplerState {
     pub fn new() -> Self {
         Self {
-            generation: 0,
-            ring: None,
             shared: Arc::new(SamplerShared::default()),
             source: SamplerSource::Master,
             paused: false,
@@ -109,12 +105,29 @@ impl SamplerState {
         }
     }
 
+    /// 現世代のリング (`None` = 未 open)。
+    pub fn ring(&self) -> Option<Arc<SamplerRingHandle>> {
+        self.shared.current().map(|(_, r)| r)
+    }
+
+    /// 現世代 (0 = 未 open)。
+    pub fn generation(&self) -> u32 {
+        self.shared.current().map_or(0, |(g, _)| g)
+    }
+
+    /// 新世代を据える (poller は次の tick から新しい reader で読む)。
+    pub fn install(&mut self, generation: u32, ring: Arc<SamplerRingHandle>) {
+        if let Ok(mut g) = self.shared.ring.lock() {
+            *g = Some((generation, ring));
+        }
+    }
+
     pub fn capacity(&self) -> u64 {
-        self.ring.as_ref().map_or(0, |r| r.capacity() as u64)
+        self.ring().map_or(0, |r| r.capacity() as u64)
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.ring.as_ref().map_or(48_000, |r| r.sample_rate())
+        self.ring().map_or(48_000, |r| r.sample_rate())
     }
 
     /// 選択がリングから押し出されていたら消す。
@@ -268,22 +281,18 @@ impl RingAxis {
             return self.write_frames;
         }
         let t = ((x - self.x) / self.w).clamp(0.0, 1.0) as f64;
-        self.oldest() + (t * self.capacity as f64).round() as u64
+        // リングが一周する前は右端が write head より先 (未来 = 未書き込み) に写るので、
+        // 選択が書き込み済みの範囲を超えないよう clamp する。
+        (self.oldest() + (t * self.capacity as f64).round() as u64).min(self.write_frames)
     }
 }
 
-/// `frame` の曲位置 (samples) をセグメントから引く。停止中 / 不明は `None`。
-pub fn playhead_at(segments: &[SegmentInfo], frame: u64) -> Option<u64> {
-    let seg = segments.iter().rev().find(|s| s.ring_frame <= frame)?;
-    Some(seg.playhead_samples? + (frame - seg.ring_frame))
-}
-
-/// `frame` の wall-clock (ns) をセグメントから引く。
-pub fn wall_ns_at(segments: &[SegmentInfo], frame: u64, sample_rate: u32) -> Option<u64> {
-    let seg = segments.iter().rev().find(|s| s.ring_frame <= frame)?;
-    let sr = sample_rate.max(1) as u128;
-    let dt = (frame - seg.ring_frame) as u128 * 1_000_000_000 / sr;
-    Some(seg.wall_ns + dt as u64)
+/// wall-clock `at_ns` に曲がどの拍を再生していたか (セグメントから)。
+/// 停止中 / セグメント無しは `None`。
+pub fn beat_at_wall_ns(segments: &[SegmentInfo], at_ns: u64, sample_rate: u32) -> Option<f64> {
+    let seg = segments.iter().rev().find(|s| s.wall_ns <= at_ns)?;
+    let frames = (at_ns - seg.wall_ns) as u128 * u128::from(sample_rate.max(1)) / 1_000_000_000;
+    seg.beat_after(frames as u64, sample_rate)
 }
 
 /// 描画用の 1 セグメント (`[start_frame, end_frame)` の間、曲位置は線形に進む)。
@@ -332,17 +341,18 @@ mod tests {
     }
 
     #[test]
-    fn ring_axis_roundtrip_and_playhead_lookup() {
+    fn ring_axis_roundtrip_and_beat_lookup() {
         let ax = RingAxis { x: 10.0, w: 100.0, write_frames: 1000, capacity: 500 };
         assert_eq!(ax.frame_to_x(500), 10.0);
         assert_eq!(ax.frame_to_x(1000), 110.0);
         assert_eq!(ax.x_to_frame(60.0), 750);
         let segs = vec![
-            SegmentInfo { ring_frame: 0, wall_ns: 0, playhead_samples: None, bpm: 120.0 },
-            SegmentInfo { ring_frame: 600, wall_ns: 5_000, playhead_samples: Some(48_000), bpm: 120.0 },
+            SegmentInfo { ring_frame: 0, wall_ns: 0, playhead_beat: None, bpm: 120.0 },
+            SegmentInfo { ring_frame: 600, wall_ns: 5_000, playhead_beat: Some(16.0), bpm: 120.0 },
         ];
-        assert_eq!(playhead_at(&segs, 599), None);
-        assert_eq!(playhead_at(&segs, 700), Some(48_100));
-        assert_eq!(wall_ns_at(&segs, 600 + 48_000, 48_000), Some(1_000_005_000));
+        assert_eq!(beat_at_wall_ns(&segs, 4_000, 48_000), None, "停止区間");
+        // 5,000ns から 1 秒後 = 120bpm で 2 拍
+        let b = beat_at_wall_ns(&segs, 1_000_005_000, 48_000).unwrap();
+        assert!((b - 18.0).abs() < 1e-6, "{b}");
     }
 }

@@ -701,6 +701,8 @@ pub struct RtBundle {
     /// Global Sampler のリング (Arc clone、`docs/plan_global_sampler.md` §3.2)。
     /// `None` = 開いていない。snapshot field (worker と同じ扱い)。
     pub sampler: Option<Arc<crate::sampler::SamplerRig>>,
+    /// MIDI Capture の試聴シーケンス (Arc clone)。`None` = 停止。snapshot field。
+    pub preview_sequence: Option<Arc<crate::sampler::PreviewSequence>>,
     /// **delta**: r.md #89 のクロス変調評価計画と、それに合わせて
     /// **off-thread で `install` 済み**の RT 状態。`None` = 据え置き。
     ///
@@ -827,6 +829,8 @@ pub struct LocalState {
     pub worker: Option<Arc<WorkerRig>>,
     /// Global Sampler のリング (bundle 由来 Arc clone)。
     pub sampler: Option<Arc<crate::sampler::SamplerRig>>,
+    /// MIDI Capture の試聴シーケンス (bundle 由来 Arc clone)。
+    pub preview_sequence: Option<Arc<crate::sampler::PreviewSequence>>,
     /// Global Sampler の RT 走行状態 (セグメント / 試聴)。
     pub sampler_rt: crate::sampler::SamplerRt,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
@@ -895,6 +899,7 @@ impl LocalState {
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
             sampler: None,
+            preview_sequence: None,
             sampler_rt: crate::sampler::SamplerRt::new(),
             frames_rendered: 0,
             launcher: crate::launcher::LauncherRuntime::new(),
@@ -953,6 +958,8 @@ impl LocalState {
         if sampler_changed {
             self.sampler_rt.reset();
         }
+        let old_preview_sequence =
+            std::mem::replace(&mut self.preview_sequence, new.preview_sequence.take());
 
         // r.md #89: plan / 位相表の差し替え。旧 RT 状態と旧表は recycle bundle に
         // 載せて off-thread で drop する (`ModRuntime` は `Vec` を 6 本持つ)。
@@ -1052,6 +1059,7 @@ impl LocalState {
             plugin_refs: old_refs,
             worker: old_worker,
             sampler: old_sampler,
+            preview_sequence: old_preview_sequence,
             mod_plan: retired_plan,
             mod_phase_table: retired_table,
         };
@@ -1488,16 +1496,15 @@ impl LocalState {
                 Some(song),
                 &mut self.scratch[..MAX_TRACKS],
             );
-            // MIDI Capture の試聴: この buffer に入るノートを pending_preview へ。
-            {
-                let seq = self.shared.preview_sequence.load();
-                self.sampler_rt.step_preview_sequence(
-                    seq.as_deref(),
-                    &mut self.scratch[..MAX_TRACKS],
-                    self.frames_rendered,
-                    n,
-                );
-            }
+            // MIDI Capture の試聴: この buffer に入るノートを pending_preview へ
+            // (シーケンスは bundle の snapshot field で届く = RT で ArcSwap を load しない)。
+            self.sampler_rt.step_preview_sequence(
+                self.preview_sequence.as_deref(),
+                Some(song),
+                &mut self.scratch[..MAX_TRACKS],
+                self.frames_rendered,
+                n,
+            );
 
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
             // master fx → master gain。
@@ -1539,6 +1546,12 @@ impl LocalState {
             // Global Sampler (`docs/plan_global_sampler.md` §3.2): 録音源をリングへ
             // 書き、そのあとで試聴音を master に足す (試聴を再録しない)。scope と
             // 同じく metronome の前 = 曲の音だけ。事前確保済み shmem への store のみ。
+            let transport = crate::sampler::BlockTransport {
+                playing,
+                playhead,
+                playhead_beat: self.playhead_beats,
+                bpm: current_bpm,
+            };
             if let Some(rig) = self.sampler.as_deref() {
                 self.sampler_rt.write_block(
                     rig,
@@ -1547,7 +1560,7 @@ impl LocalState {
                     &self.master_l,
                     &self.master_r,
                     n,
-                    crate::sampler::BlockTransport { playing, playhead, bpm: current_bpm },
+                    transport,
                 );
                 self.sampler_rt
                     .mix_preview(rig, &mut self.master_l[..n], &mut self.master_r[..n], n);
@@ -1808,6 +1821,7 @@ mod bundle_install_tests {
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
             sampler: None,
+            preview_sequence: None,
             mod_plan: None,
             mod_phase_table: None,
         }
@@ -1935,6 +1949,7 @@ mod bundle_install_tests {
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
                 sampler: None,
+                preview_sequence: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })
@@ -1990,6 +2005,7 @@ mod bundle_install_tests {
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
                 sampler: None,
+                preview_sequence: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })
@@ -2161,6 +2177,7 @@ mod bundle_install_tests {
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
                 sampler: None,
+                preview_sequence: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })
@@ -2209,6 +2226,7 @@ mod bundle_install_tests {
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
                 sampler: None,
+                preview_sequence: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })

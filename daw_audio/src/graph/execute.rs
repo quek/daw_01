@@ -981,10 +981,11 @@ fn run_group_fx_chain(
 
     // ---- Pre-fader send tap (bus / return source) ----
     // A pre-fader send from this bus reads its post-fx, pre-strip signal.
-    if song_track
-        .sends
-        .iter()
-        .any(|s| s.mode == common::model::SendMode::PreFader)
+    if scratch.force_prefader_snapshot
+        || song_track
+            .sends
+            .iter()
+            .any(|s| s.mode == common::model::SendMode::PreFader)
     {
         scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);

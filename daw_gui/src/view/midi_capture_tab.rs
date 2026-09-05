@@ -136,19 +136,19 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
     ui.label_at("midi_capture_status", &text, x, y + 5.0, FONT, p.text_dim);
 }
 
-/// 再生していた区間を wall-clock 座標で (`samples_per_unit` = ns → samples)。
+/// 再生していた区間を wall-clock 座標で (`frames_per_unit` = ns → frames)。
 fn wall_bar_source(app: &AppData) -> BarSource {
     let st = &app.sampler;
     let sr = f64::from(st.sample_rate().max(1));
     let spans = segment_spans(&st.segments, st.write_frames)
         .into_iter()
-        .filter_map(|(s, e, seg)| {
-            let ph = seg.playhead_samples?;
+        .filter(|(_, _, seg)| seg.playhead_beat.is_some())
+        .map(|(s, e, seg)| {
             let dur_ns = ((e - s) as f64 * 1e9 / sr) as u64;
-            Some((seg.wall_ns, seg.wall_ns + dur_ns, ph))
+            (seg.wall_ns, seg.wall_ns + dur_ns, *seg)
         })
         .collect();
-    BarSource { spans, samples_per_unit: sr / 1e9 }
+    BarSource { spans, frames_per_unit: sr / 1e9 }
 }
 
 fn draw_notes(app: &AppData, ui: &mut Ui<'_, AppData>, grid: Rect, axis: &WallAxis, now: u64) {

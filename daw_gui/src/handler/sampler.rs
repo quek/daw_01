@@ -39,6 +39,7 @@ impl AppData {
             E::MidiCaptured { at_ns, channel, pitch, velocity } => {
                 self.on_midi_captured(at_ns, channel, pitch, velocity);
             }
+            E::MidiAllNotesOff { at_ns, channel } => self.on_midi_all_notes_off(at_ns, channel),
             E::SetMidiSelection(sel) => self.set_midi_capture_selection(sel),
             E::ToggleMidiPaused => self.toggle_midi_capture_paused(),
             E::ToggleMidiPreview => self.toggle_midi_capture_preview(),
@@ -67,7 +68,7 @@ impl AppData {
         if self.ipc.supervisor.is_none() {
             return;
         }
-        let generation = self.sampler.generation.wrapping_add(1).max(1);
+        let generation = self.sampler.generation().wrapping_add(1).max(1);
         let shmem_id = sampler_shmem_id(std::process::id(), generation);
         let ring = match SamplerRingHandle::create(&shmem_id, self.sampler_seconds(), self.ipc.sample_rate) {
             Ok(r) => Arc::new(r),
@@ -78,26 +79,23 @@ impl AppData {
             }
         };
         ring.set_paused(self.sampler.paused);
-        self.sampler.generation = generation;
         self.sampler.overview = Overview::with_capacity_frames(ring.capacity());
         self.sampler.write_frames = 0;
         self.sampler.segments.clear();
         self.sampler.selection = None;
-        self.sampler.preview_until = None;
-        if let Ok(mut g) = self.sampler.shared.ring.lock() {
-            *g = Some((generation, Arc::clone(&ring)));
-        }
-        self.sampler.ring = Some(ring);
+        self.stop_sampler_preview();
+        self.sampler.install(generation, ring);
         self.send_open_sampler_ring();
     }
 
     /// 現世代の `OpenSamplerRing` を送る (初回 / 再確保 / audio 再起動後の再送)。
     pub(crate) fn send_open_sampler_ring(&self) {
-        if self.sampler.ring.is_none() {
+        let generation = self.sampler.generation();
+        if generation == 0 {
             return;
         }
         self.send_audio(AudioCommand::OpenSamplerRing {
-            shmem_id: sampler_shmem_id(std::process::id(), self.sampler.generation),
+            shmem_id: sampler_shmem_id(std::process::id(), generation),
             source: self.sampler.source,
         });
     }
@@ -107,8 +105,7 @@ impl AppData {
     pub(crate) fn resume_sampler_ring_after_respawn(&mut self) {
         let same_rate = self
             .sampler
-            .ring
-            .as_ref()
+            .ring()
             .is_some_and(|r| r.sample_rate() == self.ipc.sample_rate);
         if same_rate {
             self.send_open_sampler_ring();
@@ -126,22 +123,28 @@ impl AppData {
         self.reopen_sampler_ring();
     }
 
+    /// 「長さ (秒)」。確定 (`commit`) まで prefs に触らない — ドラッグ中の一時値で
+    /// `on_tick` の prune が走ると、通り過ぎた小さい値で捕捉済みノートが消える。
+    /// ドラッグ中の表示は widget が自分で持つ。
     pub(crate) fn set_sampler_seconds(&mut self, seconds: u32, commit: bool) {
-        let next = seconds.clamp(1, common::sampler_ring::MAX_SECONDS);
-        self.ui_prefs.sampler_seconds = next;
         if !commit {
             return;
         }
+        let next = seconds.clamp(1, common::sampler_ring::MAX_SECONDS);
+        if next == self.ui_prefs.sampler_seconds {
+            return;
+        }
+        self.ui_prefs.sampler_seconds = next;
         self.persist_app_config();
         self.midi_capture.prune(wall_clock_ns(), next);
-        if self.sampler.ring.as_ref().is_some_and(|r| r.capacity() as u64 != u64::from(next) * u64::from(r.sample_rate())) {
+        if self.sampler.ring().is_some_and(|r| r.capacity() as u64 != u64::from(next) * u64::from(r.sample_rate())) {
             self.reopen_sampler_ring();
         }
     }
 
     pub(crate) fn toggle_sampler_paused(&mut self) {
         self.sampler.paused = !self.sampler.paused;
-        if let Some(r) = &self.sampler.ring {
+        if let Some(r) = self.sampler.ring() {
             r.set_paused(self.sampler.paused);
         }
     }
@@ -172,7 +175,7 @@ impl AppData {
     }
 
     pub(crate) fn on_sampler_tick(&mut self, tick: SamplerTick) {
-        if tick.generation != self.sampler.generation {
+        if tick.generation != self.sampler.generation() {
             return;
         }
         self.sampler.overview.apply(tick.first_bucket, &tick.buckets);
@@ -183,20 +186,22 @@ impl AppData {
         self.sampler.prune_selection();
     }
 
-    /// `on_tick` から: 試聴の期限切れと MIDI Capture の古いノートの回収。
+    /// `on_tick` から: 試聴の期限切れ (engine 側も止める) と MIDI Capture の古いノートの回収。
     pub(crate) fn sampler_housekeeping(&mut self) {
         let now = std::time::Instant::now();
         if self.sampler.preview_until.is_some_and(|t| t <= now) {
-            self.sampler.preview_until = None;
+            self.stop_sampler_preview();
         }
         if self.midi_capture.preview_until.is_some_and(|t| t <= now) {
-            self.midi_capture.preview_until = None;
+            self.stop_midi_capture_preview();
         }
         let seconds = self.sampler_seconds();
         self.midi_capture.prune(wall_clock_ns(), seconds);
     }
 
-    /// 選択範囲を WAV に書き出し、ファイル取り込みと同じ経路で clip にする。
+    /// 選択範囲をリングから読み、`samples/` (未保存なら import cache) へ WAV を
+    /// **1 回だけ**書いて、ファイル取り込みと同じ配置経路で clip にする
+    /// (temp → decode → hash → copy の往復はしない)。
     pub(crate) fn sampler_drop(
         &mut self,
         start_frame: u64,
@@ -204,7 +209,7 @@ impl AppData {
         target: ImportTrackTarget,
         target_beat: Option<f64>,
     ) {
-        let Some(ring) = self.sampler.ring.clone() else { return };
+        let Some(ring) = self.sampler.ring() else { return };
         let mut frames: Vec<[f32; 2]> = Vec::new();
         if let Err(e) = ring.read_range(start_frame, end_frame, &mut frames) {
             self.ui_ephemeral.status_message = format!("Sampler: {e}");
@@ -215,18 +220,10 @@ impl AppData {
             source_label_short(self.song_doc.song(), self.sampler.source),
             chrono_stamp()
         );
-        let tmp = std::env::temp_dir().join(format!("{name}.wav"));
-        if let Err(e) = write_float_wav(&tmp, &frames, ring.sample_rate()) {
-            self.ui_ephemeral.status_message = format!("Sampler: WAV を書けません ({e})");
-            return;
-        }
-        let project_dir = self.project_dir();
-        let imported = crate::import_audio::import_one(&tmp, project_dir.as_deref());
-        let _ = std::fs::remove_file(&tmp);
-        let imported = match imported {
+        let imported = match materialize_capture(&name, &frames, ring.sample_rate(), self.project_dir().as_deref()) {
             Ok(i) => i,
             Err(e) => {
-                self.ui_ephemeral.status_message = format!("Sampler: 取り込みに失敗 ({e})");
+                self.ui_ephemeral.status_message = format!("Sampler: WAV を書けません ({e})");
                 return;
             }
         };
@@ -251,28 +248,27 @@ impl AppData {
 
     /// wall-clock `at_ns` に曲がどの拍を再生していたか。停止中は `None`。
     ///
-    /// 第一候補は engine の走行セグメント (wall-clock ↔ playhead samples がサンプル精度で
-    /// 対応する SSoT)。まだ届いていない (再生開始直後の ≤33ms) / リング無しのときだけ
+    /// 第一候補は engine の走行セグメント (wall-clock ↔ 拍がサンプル精度で対応する
+    /// SSoT)。まだ届いていない (再生開始直後の ≤33ms) / リング無しのときだけ
     /// 30Hz tick の `transport.playhead_beat` へ落とす。
     fn beat_at_wall_ns(&self, at_ns: u64) -> Option<f64> {
-        let segs = &self.sampler.segments;
-        let idx = segs.iter().rposition(|s| s.wall_ns <= at_ns);
-        let from_segment = idx.and_then(|i| {
-            let seg = &segs[i];
-            // 次のセグメントが既にあり、それが at_ns より前なら i が最新ではない
-            // (rposition なので起きないが、wall_ns の単調性が崩れた場合の保険)。
-            let ph = seg.playhead_samples?;
-            let sr = self.sampler.sample_rate().max(1);
-            let dt = (at_ns - seg.wall_ns) as u128 * u128::from(sr) / 1_000_000_000;
-            let samples = ph.saturating_add(dt as u64);
-            Some(self.song_samples_to_beat(samples, self.ipc.sample_rate.max(1)))
-        });
-        from_segment.or_else(|| {
-            self.transport
-                .is_playing
-                .then(|| self.transport.playhead_beat.map(f64::from))
-                .flatten()
-        })
+        // 「再生中か」の所有者は engine で GUI はその観測 (`is_playing`)。停止していれば
+        // セグメントが古い「再生中」を指していても外挿しない。
+        if !self.transport.is_playing {
+            return None;
+        }
+        crate::state::sampler::beat_at_wall_ns(
+            &self.sampler.segments,
+            at_ns,
+            self.sampler.sample_rate(),
+        )
+        .or_else(|| self.transport.playhead_beat.map(f64::from))
+    }
+
+    /// CC 120 (All Sound Off) / 123 (All Notes Off): そのチャンネルの押しっぱなしを閉じる。
+    pub(crate) fn on_midi_all_notes_off(&mut self, at_ns: u64, channel: u8) {
+        let beat = self.beat_at_wall_ns(at_ns);
+        self.midi_capture.all_notes_off(at_ns, channel, beat);
     }
 
     pub(crate) fn set_midi_capture_selection(&mut self, sel: Option<(u64, u64)>) {
@@ -457,19 +453,79 @@ fn local_utc_offset_secs() -> i64 {
     0
 }
 
-/// 32-bit float / stereo の WAV を書く (取り込み経路が読める形式)。
-fn write_float_wav(path: &std::path::Path, frames: &[[f32; 2]], sample_rate: u32) -> anyhow::Result<()> {
+/// 切り出した PCM を 32-bit float / stereo WAV として **1 回で** 置き場へ書き、
+/// 取り込み済み ([`crate::import_audio::ImportedAudio`]) として返す。
+///
+/// ファイル名 / 置き場 / `AudioSourcePath` の規約は `import_audio::import_one` と同じ
+/// (`<stem>_<sha256 先頭 8 桁>.wav`、保存済みなら `samples/` = `ProjectRelative`、
+/// 未保存なら import cache = `Absolute` で save 時に移動)。decode し直さないので
+/// バッファはメモリ上の PCM から直接組む。
+fn materialize_capture(
+    stem: &str,
+    frames: &[[f32; 2]],
+    sample_rate: u32,
+    project_dir: Option<&std::path::Path>,
+) -> anyhow::Result<crate::import_audio::ImportedAudio> {
+    use sha2::{Digest, Sha256};
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: sample_rate.max(1),
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-    let mut w = hound::WavWriter::create(path, spec)?;
-    for f in frames {
-        w.write_sample(f[0])?;
-        w.write_sample(f[1])?;
+    let mut bytes: Vec<u8> = Vec::with_capacity(44 + frames.len() * 8);
+    {
+        let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut bytes), spec)?;
+        for f in frames {
+            w.write_sample(f[0])?;
+            w.write_sample(f[1])?;
+        }
+        w.finalize()?;
     }
-    w.finalize()?;
-    Ok(())
+    let digest = Sha256::digest(&bytes);
+    let hash8: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let filename = format!("{stem}_{hash8}.wav");
+    let (path_kind, dst) = match project_dir {
+        Some(dir) => {
+            let samples_dir = dir.join("samples");
+            std::fs::create_dir_all(&samples_dir)?;
+            let dst = samples_dir.join(&filename);
+            (
+                common::model::AudioSourcePath::ProjectRelative(
+                    std::path::PathBuf::from("samples").join(&filename),
+                ),
+                dst,
+            )
+        }
+        None => {
+            let cache = crate::import_audio::unsaved_import_cache_dir();
+            std::fs::create_dir_all(&cache)?;
+            let dst = cache.join(&filename);
+            (common::model::AudioSourcePath::Absolute(dst.clone()), dst)
+        }
+    };
+    std::fs::write(&dst, &bytes)?;
+    let n = frames.len() as u64;
+    let buffer = crate::audio_source_cache::AudioSourceBuffer {
+        origin: dst,
+        sample_rate: sample_rate.max(1),
+        channels: 2,
+        frames: n,
+        samples: vec![
+            frames.iter().map(|f| f[0]).collect(),
+            frames.iter().map(|f| f[1]).collect(),
+        ],
+    };
+    Ok(crate::import_audio::ImportedAudio {
+        buffer: Arc::new(buffer),
+        source: common::model::AudioSource {
+            path: path_kind,
+            sample_rate: sample_rate.max(1),
+            channels: 2,
+            frames: n,
+            original_bpm: None,
+            root_key: None,
+        },
+        display_name: stem.to_string(),
+    })
 }

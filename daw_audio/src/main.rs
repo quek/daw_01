@@ -745,6 +745,7 @@ fn publish_bundle(
         plugin_refs: engine_shared.plugin_refs.load_full(),
         worker: engine_shared.worker.load_full(),
         sampler: engine_shared.sampler.load_full(),
+        preview_sequence: engine_shared.preview_sequence.load_full(),
     });
 }
 
@@ -831,6 +832,7 @@ fn recv_loop_housekeeping(
             plugin_refs: engine_shared.plugin_refs.load_full(),
             worker: engine_shared.worker.load_full(),
             sampler: engine_shared.sampler.load_full(),
+            preview_sequence: engine_shared.preview_sequence.load_full(),
             mod_plan: None,
             mod_phase_table: Some(table),
         });
@@ -1235,7 +1237,6 @@ async fn recv_loop(
             // の budget を太らせない)。再 publish は bundle を Unchanged で送り直す閉包。
             Ok(
                 cmd @ (AudioCommand::OpenSamplerRing { .. }
-                | AudioCommand::CloseSamplerRing
                 | AudioCommand::SamplerPreview { .. }
                 | AudioCommand::SamplerPreviewStop
                 | AudioCommand::PreviewSequence { .. }
@@ -1243,7 +1244,6 @@ async fn recv_loop(
             ) => {
                 sampler::handle_command(
                     cmd,
-                    &shared,
                     &engine_shared,
                     &cmd_tx,
                     &mut preview_seq_generation,
@@ -2308,6 +2308,7 @@ mod tests {
             plugin_refs: Arc::new(std::collections::HashMap::new()),
             worker: None,
             sampler: None,
+            preview_sequence: None,
             mod_plan: None,
             mod_phase_table: None,
         };

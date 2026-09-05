@@ -35,6 +35,9 @@ pub enum SamplerEvent {
     /// `velocity == None` は note-off。既存の `MidiNoteOn/Off` (演奏 / 録音 / binding)
     /// とは独立に **常に** 溜める (Q5)。
     MidiCaptured { at_ns: u64, channel: u8, pitch: u8, velocity: Option<u8> },
+    /// CC 120 (All Sound Off) / 123 (All Notes Off): そのチャンネルの押しっぱなしを閉じる
+    /// (閉じないと prune を止める stuck note になる)。
+    MidiAllNotesOff { at_ns: u64, channel: u8 },
     /// MIDI Capture の選択範囲 `[start, end)` (wall-clock ns)。
     SetMidiSelection(Option<(u64, u64)>),
     ToggleMidiPaused,

@@ -94,6 +94,13 @@ fn dispatch(msg: &[u8], proxy: &EventLoopProxy<AppEvent>) {
             else {
                 return;
             };
+            // CC 120 / 123 は「全ノート消音」。MIDI Capture の押しっぱなしも閉じる。
+            if controller == 120 || controller == 123 {
+                let _ = proxy.send_event(AppEvent::Sampler(SamplerEvent::MidiAllNotesOff {
+                    at_ns: crate::state::sampler::wall_clock_ns(),
+                    channel,
+                }));
+            }
             let _ = proxy.send_event(AppEvent::MidiControlChange {
                 channel,
                 controller,

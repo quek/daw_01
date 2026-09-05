@@ -68,8 +68,8 @@ samples: [[AtomicU32; 2]; capacity]   // header 直後、f32::to_bits interleave
 
 ### 3.2 engine 側 (daw_audio)
 
-- `AudioCommand::OpenSamplerRing { shmem_id, source: SamplerSource }` /
-  `CloseSamplerRing` / `SetSamplerPaused(bool)` は **shmem flag** (command 不要)。
+- `AudioCommand::OpenSamplerRing { shmem_id, source: SamplerSource }` で open。閉じる
+  command は無い (世代の置き換えだけ)。一時停止は **shmem flag** (command 不要)。
 - `SamplerSource { Master, Track(AudioTap) }`。Master は `scope.write_block` と同じ
   タップ点 (metronome 前の `master_l/r`)。Track は `resolve_tap_buffers` で
   `TrackScratch` / `PreFaderScratch` / `PreFxScratch` を読む (track index は
@@ -152,7 +152,7 @@ samples: [[AtomicU32; 2]; capacity]   // header 直後、f32::to_bits interleave
 | ファイル | 内容 |
 |---|---|
 | `common/src/sampler_ring.rs` | 新規: リング shmem + セグメント + reader |
-| `common/src/protocol.rs` | `SamplerSource` / `OpenSamplerRing` / `CloseSamplerRing` / `SamplerPreview*` / `PreviewSequence*` |
+| `common/src/protocol.rs` | `SamplerSource` / `OpenSamplerRing` / `SamplerPreview*` / `PreviewSequence*` |
 | `common/build.rs` | `WIRE_SOURCES` 追加 |
 | `daw_audio/src/main.rs` / `engine.rs` | リング open / 毎 block 書き込み / セグメント / 試聴加算 / PreviewSequence |
 | `daw_audio/src/graph/compile.rs` | PreFx tap 要求に sampler source を含める |

@@ -97,24 +97,32 @@ impl MidiCaptureState {
         }
     }
 
-    /// `now - seconds` より前に終わったノートを落とす。押しっぱなしは残す。
+    /// `now - seconds` より前に終わったノートを落とす。
+    ///
+    /// 押しっぱなしのノートは `seconds` を超えたら **その時点で閉じる** (以後は普通の
+    /// ノートとして流れて消える)。note-off が来ない stuck note (抜線 / パニック) が
+    /// 先頭に居座って以後の回収を止め、キャプチャが無制限に肥大するのを防ぐ。
     pub fn prune(&mut self, now_ns: u64, seconds: u32) {
-        let horizon = now_ns.saturating_sub(u64::from(seconds) * 1_000_000_000);
-        while let Some(front) = self.notes.front() {
-            if front.off_ns.is_some_and(|off| off < horizon) {
-                self.notes.pop_front();
-            } else if front.off_ns.is_none() {
-                // 押しっぱなしの後ろに古いノートが残っていても、順序を崩さず
-                // ここで止める (次の prune で拾う)。
-                break;
-            } else {
-                break;
+        let span = u64::from(seconds) * 1_000_000_000;
+        let horizon = now_ns.saturating_sub(span);
+        for n in &mut self.notes {
+            if n.off_ns.is_none() && n.on_ns.saturating_add(span) <= now_ns {
+                n.off_ns = Some(n.on_ns.saturating_add(span));
             }
         }
+        self.notes.retain(|n| !n.off_ns.is_some_and(|off| off < horizon));
         if let Some((s, _)) = self.selection
             && s < horizon
         {
             self.selection = None;
+        }
+    }
+
+    /// CC 120 / 123: `channel` の押しっぱなしを全部閉じる。
+    pub fn all_notes_off(&mut self, at_ns: u64, channel: u8, beat: Option<f64>) {
+        for n in self.notes.iter_mut().filter(|n| n.off_ns.is_none() && n.channel == channel) {
+            n.off_ns = Some(at_ns.max(n.on_ns));
+            n.off_beat = beat;
         }
     }
 
@@ -166,6 +174,37 @@ impl WallAxis {
     }
 }
 
+/// 「再生中の拍」で並べてよいか: 全ノートが拍を持ち、かつ wall-clock 順に拍が単調で、
+/// 各ノートの終端が始端より後。ループ再生中 (拍が巻き戻る) や seek を跨いだ演奏は
+/// 拍軸に載らないので wall-clock へ落とす。
+fn beats_usable(picked: &[&CapturedNote]) -> bool {
+    if !picked.iter().all(|n| n.on_beat.is_some()) {
+        return false;
+    }
+    let mut by_time: Vec<&CapturedNote> = picked.to_vec();
+    by_time.sort_by_key(|n| n.on_ns);
+    let mut last: Option<(u64, f64)> = None;
+    for n in by_time {
+        let Some(on) = n.on_beat else { return false };
+        // 同時に弾いた和音 (数十 ms 以内) は同じ拍でよいが、それより後に来た
+        // ノートの拍が進んでいなければ巻き戻っている (loop wrap / seek)。
+        if let Some((last_ns, last_beat)) = last
+            && n.on_ns.saturating_sub(last_ns) > CHORD_WINDOW_NS
+            && on <= last_beat
+        {
+            return false;
+        }
+        if n.off_beat.is_some_and(|off| off < on) {
+            return false;
+        }
+        last = Some((n.on_ns, last.map_or(on, |(_, b)| b.max(on))));
+    }
+    true
+}
+
+/// 「同時に弾いた」とみなす幅 (ns)。
+const CHORD_WINDOW_NS: u64 = 30_000_000;
+
 /// 選択範囲のノートを clip ローカルの `Note` 列に直す。戻りは `(notes, clip_length_beats)`。
 /// ノートが 1 つも掛からなければ `None`。
 pub fn build_clip_notes(state: &MidiCaptureState, win: CaptureWindow) -> Option<(Vec<Note>, f64)> {
@@ -175,10 +214,9 @@ pub fn build_clip_notes(state: &MidiCaptureState, win: CaptureWindow) -> Option<
     }
     let bpm = win.bpm.max(1.0);
     let ns_to_beats = |ns: u64| ns as f64 * bpm / 60.0 / 1e9;
-    let all_have_beats = picked.iter().all(|n| n.on_beat.is_some());
     let mut notes = Vec::with_capacity(picked.len());
     let sel_len_beats = ns_to_beats(win.end_ns.saturating_sub(win.start_ns));
-    if all_have_beats {
+    if beats_usable(&picked) {
         // 選択開始の拍 = 最初のノートの拍から、選択開始までの wall-clock 差を引く。
         let first = picked.iter().min_by_key(|n| n.on_ns)?;
         let first_beat = first.on_beat?;
@@ -273,12 +311,40 @@ mod tests {
         st.note_on(S, 0, 60, 100, None);
         st.note_on(2 * S, 0, 61, 100, None);
         st.note_off(2 * S + S / 10, 0, 61, None);
-        st.prune(100 * S, 60);
-        // 1s のノートは押しっぱなしなので残り、61 (2.1s に終了) は古いので消える…
-        // ただし順序保持のため押しっぱなしの後ろは次回に回る。
-        assert_eq!(st.notes.len(), 2);
+        // now = 3s: 押しっぱなし (60) は now まで伸びる。
         let (notes, _) = build_clip_notes(&st, CaptureWindow { start_ns: 0, end_ns: 3 * S, bpm: 60.0, beats_per_bar: 4.0, now_ns: 3 * S }).unwrap();
         assert!((notes[0].duration_beats - 2.0).abs() < 1e-9, "1s〜now(3s) = 2 拍 @60bpm");
+        // 60 秒の窓で 100s まで進む: 61 (2.1s に終了) は消え、押しっぱなしの 60 は
+        // 上限 (on + 60s) で閉じられて残る (先頭に居座って回収を止めない)。
+        st.prune(100 * S, 60);
+        assert_eq!(st.notes.len(), 1);
+        assert_eq!(st.notes[0].off_ns, Some(61 * S));
+        // さらに進めば閉じたノートとして流れて消える。
+        st.prune(130 * S, 60);
+        assert!(st.notes.is_empty());
+    }
+
+    #[test]
+    fn looped_playing_notes_fall_back_to_wall_clock() {
+        // loop [0,4) を 2 周: 2 周目の拍は 1 周目より小さい → 拍軸には載せられない。
+        let mut st = MidiCaptureState::new();
+        st.note_on(10 * S, 0, 60, 100, Some(1.0));
+        st.note_off(10 * S + S / 2, 0, 60, Some(2.0));
+        st.note_on(12 * S, 0, 62, 100, Some(1.0)); // 2 周目 (wrap 後)
+        st.note_off(12 * S + S / 2, 0, 62, Some(2.0));
+        let (notes, _) = build_clip_notes(&st, win(10 * S, 13 * S)).unwrap();
+        // wall-clock: 12s - 10s = 2s = 4 拍 @120bpm
+        assert!((notes[1].start_beat - 4.0).abs() < 1e-9, "{}", notes[1].start_beat);
+    }
+
+    #[test]
+    fn all_notes_off_closes_held_notes_on_that_channel() {
+        let mut st = MidiCaptureState::new();
+        st.note_on(S, 0, 60, 100, None);
+        st.note_on(S, 1, 61, 100, None);
+        st.all_notes_off(2 * S, 0, None);
+        assert_eq!(st.notes[0].off_ns, Some(2 * S));
+        assert_eq!(st.notes[1].off_ns, None);
     }
 
     #[test]
