@@ -266,10 +266,15 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     app.handle_event(AppEvent::CloseAllPluginEditors)
                 }));
             });
-            m.item("Toggle Video Preview", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::TogglePreviewWindow)
-                }));
+            m.item_with(daw_ui_core::MenuItemSpec {
+                label: "Video Preview",
+                on_click: Box::new(|ui| {
+                    ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                        app.handle_event(AppEvent::TogglePreviewWindow)
+                    }));
+                }),
+                enabled: true,
+                shortcut_hint: shortcuts::shortcut_hint("daw.toggle_preview_window"),
             });
             // resource monitor (r.md #3): status bar 常駐メーターの on/off (永続化)
             // と、 詳細パネルの開閉。
