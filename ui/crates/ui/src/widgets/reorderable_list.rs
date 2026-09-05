@@ -381,14 +381,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let item_count = items.len();
 
         // ---- frame 開始時の session / pending_order 状態 ----
-        // drag 中 (session あり) or reorder 直後の settle (pending あり) は **全展開を畳む** =
-        // uniform 行高。 これで press / release / drop-indicator は既存の uniform ロジックを
-        // そのまま使え、 可変高は「静止時の表示」 だけに閉じ込められる。
-        let (collapsed, pending_at_start) = {
+        // **本当に drag している** (session が DRAG_THRESHOLD_PX を超えて動いた) or reorder
+        // 直後の settle (pending あり) は **全展開を畳む** = uniform 行高。 これで release /
+        // drop-indicator は既存の uniform ロジックをそのまま使え、 可変高は「静止時の
+        // 表示」 だけに閉じ込められる。
+        //
+        // 押しただけ (閾値未満) では畳まない。 press の瞬間に畳むと、 展開した行より
+        // **下の行が押した瞬間に上へ跳ね**、 その行の button (Par / GUI / x) は press と
+        // release で別の位置にあることになって click が成立しなかった (daw_01 r.md #100)。
+        let collapsed = {
             let state: &mut ReorderableListState = self.widget_state(wid);
-            (state.session.is_some() || state.pending_order.is_some(), state.pending_order.is_some())
+            let dragging = state
+                .session
+                .as_ref()
+                .is_some_and(|s| (s.last_mouse_y - s.anchor_mouse_y).abs() >= DRAG_THRESHOLD_PX);
+            dragging || state.pending_order.is_some()
         };
-        let _ = pending_at_start;
 
         // ---- 各 row の base-top (content 空間) の累積 + content_h ----
         // row i は [tops[i], tops[i]+row_height) が base、 続く extra_h(i) が展開、 末尾 row_gap。
@@ -547,8 +555,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 描いた行の rect (caller が context_menu / overlay を重ねるため)。
         // 描画クロージャの中から書くので `RefCell` (`hovered` が `Cell` なのと同じ理由)。
         let row_rects: RefCell<Vec<(usize, Rect)>> = RefCell::new(Vec::new());
-        // 展開を描くのは「静止時」 のみ (= collapsed=false かつ drag overlay 無し)。
-        let draw_expanded = !collapsed && session_for_overlay.is_none();
+        // 展開を描くのは「静止時」 のみ (= collapsed=false)。 閾値未満の session は
+        // まだ drag ではないので展開のまま (overlay も uniform 分岐でしか描かない)。
+        let draw_expanded = !collapsed;
         let tops_for_draw = tops;
 
         self.scroll_area(
@@ -848,6 +857,65 @@ mod tests {
 
         assert_eq!(resp_clicked.get(), Some(1), "短 release は clicked に格下げ");
         assert!(edit_log.lock().unwrap().is_empty(), "Reorder Edit は発行されない");
+    }
+
+    /// r.md #100 (daw_01): 展開した行の **下**にある行を押しても、 押した瞬間に
+    /// レイアウトが畳まれて行が上へ跳ねない。 press フレームでも release フレームでも
+    /// 行の rect は展開込みの位置のまま = 行内 button の click が成立する。
+    #[test]
+    fn press_below_an_expanded_row_does_not_collapse_the_layout() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
+        let items: Vec<u32> = (0..3).collect();
+        let make_edit = |_req: ReorderableListEditRequest| -> Edit<()> { Edit::mutate(|()| {}) };
+        let row_h = style.row_height + style.row_gap;
+        let extra = 100.0_f32;
+        // 行 0 を展開 → 行 2 の base top は 2 行分 + 展開高。
+        let expected_top = row_h * 2.0 + extra;
+        let press_y = expected_top + style.row_height * 0.5;
+        let row2_top = Cell::new(None::<f32>);
+
+        for frame in 0..3 {
+            // frame 0: press / frame 1: 押したまま静止 / frame 2: release (短 click)。
+            let pointer = PointerFrame {
+                pos: Some((100.0, press_y)),
+                primary_just_pressed: frame == 0,
+                primary_pressed: frame <= 1,
+                primary_just_released: frame == 2,
+                ..PointerFrame::default()
+            };
+            host.frame_to_edits(
+                &(),
+                &mut scene,
+                screen,
+                FrameInput { pointer, ..Default::default() },
+                |(), ui| {
+                    ui.reorderable_list_expandable(
+                        "rl",
+                        Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+                        &items,
+                        &[],
+                        None,
+                        &style,
+                        make_edit,
+                        |_, _, idx, row_rect, _, _| {
+                            if idx == 2 {
+                                row2_top.set(Some(row_rect.y));
+                            }
+                        },
+                        |i| if i == 0 { extra } else { 0.0 },
+                        |_, _, _| {},
+                    );
+                },
+            );
+            assert_eq!(
+                row2_top.get(),
+                Some(expected_top),
+                "frame {frame}: 押しただけでは展開を畳まない (行 2 が跳ねない)"
+            );
+        }
     }
 
     #[test]
