@@ -1130,7 +1130,7 @@ fn fork_automation_clip_content(song: &mut Song, lane_key: AutomationLaneKey, cl
 
 /// セルの中身を **独立コピー**にする (`Ctrl+Shift` ドロップ / `Alt+D` 複製)。
 /// `content_id` を採り直して中身を複製するので、以後の編集は元と連動しない。
-fn make_cell_content_unique(song: &mut Song, row: LauncherRow, clip_id: u32) {
+pub(crate) fn make_cell_content_unique(song: &mut Song, row: LauncherRow, clip_id: u32) {
     let Some(old) = (match row {
         LauncherRow::Track(id) => song
             .track_by_id(id)

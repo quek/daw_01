@@ -264,6 +264,17 @@ fn render_arrangement_heavy(
                 f.selected_tracks,
                 f.style,
             );
+            // r.md #109: オートメーションレーンの背景もグリッドより下に敷く
+            // (トラック行と同じ層)。中身は下の `draw_automation_lane` がグリッドの上に描く。
+            draw_automation_lane_bodies_bg(
+                hctx,
+                &f.visible_tracks,
+                &f.tops,
+                f.view,
+                header_pane,
+                lanes,
+                f.style,
+            );
             hctx.ui_mut().bar_beat_grid(
                 ("arr_grid", heavy.id_hash),
                 lanes,

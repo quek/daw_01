@@ -18,6 +18,15 @@ fn clip_span(f: &ArrangementFrame<'_>, key: ClipKey) -> Option<(f64, f64)> {
     Some((c.start_beat, c.start_beat + c.len_beats))
 }
 
+/// r.md #109: オートメーションクリップの **名前帯** (掴んで動かせる帯) に `py` が入って
+/// いるか。 帯の高さは通常クリップと同じ `clip_content_inset_top`。 クリップが低くて
+/// 本体が消えたらクリップ全体が帯 (= 常に移動) — トラック行の `clip_zone` と同じ規則。
+/// press (`automation_clip`) と hover cursor (`cursor.rs`) の両方がこれを引く。
+pub(super) fn automation_clip_in_header(clip_rect: Rect, py: f32, style: &ArrangementStyle) -> bool {
+    let header_h = draw::clip_content_inset_top(style).min(clip_rect.h);
+    py < clip_rect.y + header_h
+}
+
 /// audio grip (gain band / fade corner) → MIDI/Audio clip の Move/Resize。
 /// audio grip が先勝したら clip drag は起動しない (`else if` の排他をそのまま維持)。
 ///
@@ -408,12 +417,14 @@ fn segment_bend(
 /// 掴んだ clip が選択集合に含まれていれば選択中の全 clip を grabbed-first で `anchors` に
 /// 積み一括 move / resize する (MIDI clip と同 idiom)。
 ///
-/// r.md #73: **`!alt` ゲートを外した。** 旧実装は「Alt 修飾は lane Alt+drag for resize に
-/// 予約する」ために Alt+press を弾いており、 その代償として automation clip の
-/// Alt-snap-off を失っていた。 #73 で Alt+drag resize を撤去したので予約の根拠が消え、
-/// 残すと「Alt を押してドラッグすると何も起きない」死角が新しく生まれる。 外したことで
-/// **Alt = スナップ無効が復活し、 MIDI / audio clip と対称になる**。 線の上の Alt+drag は
-/// 1 段上の `segment_bend` が先勝する (`!claim.session`)。
+/// r.md #109: 掴む場所の規約は **MIDI / audio clip (`clip_zone`) と完全に同じ** —
+/// 名前帯 = 移動、 本体 = 時間範囲 (`range_zone` へ落とす)、 端 = リサイズ、
+/// **押した瞬間の Alt 付きならどこでも範囲** (`docs/plan_range_selection.md` §3.1)。
+/// ドラッグ中の Alt = スナップ切替は `last_alt` の continuation 更新 (`drag.rs`) で
+/// 従来どおり効く。 旧実装は Alt+press を「スナップ無効の移動」として先取りし、
+/// 本体もどこを掴んでも移動だったので、 オートメーションレーンではクリップの上で
+/// 範囲を引く手段が無かった。 線の上の Alt+drag は 1 段上の `segment_bend` が
+/// 先勝する (`!claim.session`)、 点は `automation_point` が先勝する (`!claim.point`)。
 fn automation_clip(
     ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
@@ -425,7 +436,7 @@ fn automation_clip(
         && !claim.point
         && !claim.session
         && hit.in_lanes
-        && let Some((clip_key, kind, _clip_rect, _body_rect_anchor)) = automation_clip_zone_at(
+        && let Some((clip_key, kind, clip_rect, _body_rect_anchor)) = automation_clip_zone_at(
             &f.visible_tracks,
             &f.tops,
             f.view.track_row_h,
@@ -439,6 +450,14 @@ fn automation_clip(
             f.style.resize_handle_px,
         )
     {
+        if f.pointer.modifiers.alt {
+            return; // range_zone が拾う
+        }
+        if matches!(kind, ClipDragKind::Move)
+            && !automation_clip_in_header(clip_rect, py, f.style)
+        {
+            return; // 本体 = 範囲、 range_zone が拾う
+        }
         let press_alt = f.pointer.modifiers.alt;
         let press_ctrl = f.pointer.modifiers.ctrl;
         let press_shift = f.pointer.modifiers.shift;
@@ -482,8 +501,9 @@ fn automation_clip(
 /// **時間範囲のドラッグ開始** (`docs/plan_range_selection.md` §3.1)。
 ///
 /// press 分岐の **最後**に呼ぶ — ここまでで誰も session を張らなかった press
-/// (= 空きレーン / クリップの本体 / Alt+クリップ (ヘッダ・端含む) / 空きオートメーションレーン) が
-/// すべて範囲になる。 旧・矩形選択 (marquee) と投げ縄 (lasso) を置き換えた 1 本。
+/// (= 空きレーン / クリップの本体 / Alt+クリップ (ヘッダ・端含む) / 空きオートメーションレーン /
+/// オートメーションクリップの本体・Alt+オートメーションクリップ) がすべて範囲になる。
+/// 旧・矩形選択 (marquee) と投げ縄 (lasso) を置き換えた 1 本。
 pub(super) fn range_zone(
     ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,

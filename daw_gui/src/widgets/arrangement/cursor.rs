@@ -263,7 +263,7 @@ pub(super) fn apply(
         // lane/row splitter (NsResize) を上で先に判定済なので角の競合は NsResize 優先。
         ui.set_cursor(CursorIcon::EwResize);
     } else if let Some((cx, cy)) = f.pointer.pos
-        && let Some((_key, kind, _clip_rect, _body_rect)) = automation_clip_zone_at(
+        && let Some((_key, kind, clip_rect, _body_rect)) = automation_clip_zone_at(
             &f.visible_tracks,
             &f.tops,
             f.view.track_row_h,
@@ -277,14 +277,23 @@ pub(super) fn apply(
             f.style.resize_handle_px,
         )
     {
-        // automation clip も MIDI clip と同様に端で EwResize / 本体で Move を出す。
-        // press 側は `automation_clip_zone_at` で resize/move を既に判定して clip drag を起動して
-        // いるが、 hover cursor だけ未配線で「端でカーソルが左右矢印にならない」 状態だった。
-        // lane/row/header splitter の resize hover はこの上で先に判定済なので、 角の競合は
-        // それらが優先される (= press 側の splitter 優先順位と一致)。
-        let cur = match kind {
-            ClipDragKind::Move => CursorIcon::Move,
-            ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+        // automation clip も MIDI clip と同じ規約 (r.md #109): 端で EwResize、 名前帯で
+        // Move、 本体と Alt 押下中は時間範囲の I ビーム (`press_lanes::automation_clip` と
+        // 同じ判定)。 lane/row/header splitter の resize hover はこの上で先に判定済なので、
+        // 角の競合はそれらが優先される (= press 側の splitter 優先順位と一致)。
+        let cur = if f.pointer.modifiers.alt {
+            CursorIcon::Text
+        } else {
+            match kind {
+                ClipDragKind::Move => {
+                    if super::press_lanes::automation_clip_in_header(clip_rect, cy, f.style) {
+                        CursorIcon::Move
+                    } else {
+                        CursorIcon::Text
+                    }
+                }
+                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+            }
         };
         ui.set_cursor(cur);
     }

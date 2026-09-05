@@ -323,7 +323,8 @@ fn cell_menu_edit(idx: usize, cell: EvCellKey, rect: Rect) -> Edit<AppData> {
 }
 
 /// シーン見出しの右クリックメニューの項目 (表示順)。
-const SCENE_MENU: &[&str] = &["名前を変更", "色...", "鳴っているセルを取り込む", "削除"];
+const SCENE_MENU: &[&str] =
+    &["名前を変更", "色...", "複製", "鳴っているセルを取り込む", "削除"];
 
 /// [`SCENE_MENU`] の選択 → 適用する編集。メニューのコールバックから **本体を
 /// 引き剥がす**ためのヘルパ (インデント段数を budget 内に収める)。
@@ -331,8 +332,13 @@ fn scene_menu_edit(idx: usize, scene_id: u32, rect: Rect) -> Edit<AppData> {
     Edit::mutate(move |app: &mut AppData| match idx {
         0 => app.handle_event(AppEvent::Launcher(LauncherEvent::BeginRenameScene(scene_id))),
         1 => app.open_color_picker(crate::app::ColorPickerTarget::Scene(scene_id), rect),
-        2 => app.handle_event(AppEvent::Launcher(LauncherEvent::CaptureScene)),
-        3 => app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteScenes(vec![scene_id]))),
+        // r.md #108: `D` と同じリンク複製 (右クリックした列 1 本)。
+        2 => app.handle_event(AppEvent::Launcher(LauncherEvent::DuplicateScenes {
+            scene_ids: vec![scene_id],
+            unique: false,
+        })),
+        3 => app.handle_event(AppEvent::Launcher(LauncherEvent::CaptureScene)),
+        4 => app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteScenes(vec![scene_id]))),
         _ => {}
     })
 }

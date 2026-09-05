@@ -1697,6 +1697,52 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     }
 }
 
+/// r.md #109: 見えている全オートメーションレーンの **body 背景と行下端の区切り線** を
+/// 塗る (`draw_lanes_bg` がトラック行に対してやることと同じ)。
+/// `draw_lanes_bg` の直後・`bar_beat_grid` の **前** に呼ぶ — 背景がグリッド線より
+/// 上に乗るとレーンだけ小節線が消え、トラック行と非対称になる。中身 (線 / 点 /
+/// クリップ) は `draw_automation_lane` がグリッドの後に描く。 行の y 割りは hit-test
+/// と同じ `for_each_visible_lane` (SSoT)。
+/// 区切り線が無いと、 default 値のガイド線 (レーン中程の水平線) だけが横線として
+/// 目に入り、 ヘッダ / ランチャー帯の行境界と「ずれた区切り線」に見える。
+pub(super) fn draw_automation_lane_bodies_bg<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    tracks: &[ArrangementTrack],
+    visible_tops: &[f32],
+    view: ArrangementView,
+    header_pane: Rect,
+    lanes: Rect,
+    style: &ArrangementStyle,
+) {
+    for_each_visible_lane(
+        tracks,
+        visible_tops,
+        view.track_row_h,
+        header_pane.x,
+        header_pane.w,
+        lanes.x,
+        lanes.w,
+        style,
+        |_t_idx, _l_idx, _lane, _header_rect, body_rect| {
+            if body_rect.y + body_rect.h < lanes.y || body_rect.y > lanes.y + lanes.h {
+                return;
+            }
+            push_filled_rect(hctx, body_rect, style.automation_lane_bg);
+            // 行下端の区切り線 (トラック行の `draw_lanes_bg` と同じ色 / 太さ)。
+            push_filled_rect(
+                hctx,
+                Rect {
+                    x: body_rect.x,
+                    y: body_rect.y + body_rect.h - style.lane_line_width_px,
+                    w: body_rect.w,
+                    h: style.lane_line_width_px,
+                },
+                style.lane_line,
+            );
+        },
+    );
+}
+
 /// lane row (= header + body) を 1 つ描画。 `header_rect` は左 (track header と同 x 範囲)、
 /// `body_rect` は右 (clip 描画域と同 x 範囲)。 `view` は arrangement の global view (start_beat /
 /// len_beats / track_top 等を渡す、 lane 描画では `start_beat` / `len_beats` のみ参照)。
@@ -1729,17 +1775,10 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     // これを使う。色ストライプと clip の塗り (`automation_clip_colors`) は面積のある塗りなので
     // 通常 clip / track の帯と同じく生の色 (adapt は掛けない)。
     let lane_ink = p.adapt_on(style.automation_lane_bg, lane.color);
-    // ---- 背景 (lane 行 全幅) ----
-    push_filled_rect(
-        hctx,
-        Rect {
-            x: header_rect.x,
-            y: header_rect.y,
-            w: header_rect.w + body_rect.w,
-            h: header_rect.h,
-        },
-        style.automation_lane_bg,
-    );
+    // ---- 背景 (header 側だけ) ----
+    // body 側は `draw_automation_lane_bodies_bg` がグリッド線より **前** に塗る
+    // (r.md #109)。 ここで全幅を塗るとグリッドを覆い隠す。
+    push_filled_rect(hctx, header_rect, style.automation_lane_bg);
     // ---- レーン色ストライプ (track header の `track_color_strip_w` と同 idiom、#059 / #069) ----
     // `header_rect.x` は親 track の depth ぶん indent 済みなので、そのまま置けば子 track の
     // lane も名前と同じだけネストする。track は「色未指定 = ストライプ無し」だが、lane は
@@ -1835,8 +1874,10 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         }
     }
 
-    // ---- body 背景 (header と区切り線) ----
-    push_filled_rect(hctx, body_rect, style.automation_lane_bg);
+    // ---- body ----
+    // 背景の塗りはここでは行わない — `draw_automation_lane_bodies_bg` がグリッド線より
+    // **前**に塗る (r.md #109: ここで塗るとグリッドを覆い隠し、トラック行だけに
+    // 小節線が出る非対称になっていた)。
     // default_value 水平線。 point dot と同じ **縦 padding スケール** で描く
     // (= clip_rect の `[body.y+pad, body.y+H-pad]`、 5221 と SSoT)。 旧実装は body 全高を使って
     // いたため、 同じ値でも point とガイド線が `pad*(2v-1)` だけ縦にずれていた (user 報告)。

@@ -380,6 +380,20 @@ if (dup_shared || dup_unique) && !launcher_cells.is_empty() {
     }));
     return;
 }
+// r.md #108: ランチャーの列 (シーン) を選んでいるなら D / Alt+D は列ごと複製。
+// 列面はセル面と `SelectionState` 上で排他なので、上のセル分岐とは重ならない。
+if (dup_shared || dup_unique)
+    && matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Scenes))
+{
+    let scene_ids = app.selection.selected_scene_ids.clone();
+    let unique = dup_unique;
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::Launcher(
+            crate::event_launcher::LauncherEvent::DuplicateScenes { scene_ids, unique },
+        ));
+    }));
+    return;
+}
 if dup_shared && !dup_devices {
     // 対象面は copy/cut/delete と同じ last-wins (`edit_surface`)。トラック面なら
     // トラックをリンク複製 (D = 共有、 クリップ複製と同規約)。 それ以外は従来通り。

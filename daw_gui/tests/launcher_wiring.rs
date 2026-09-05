@@ -535,6 +535,93 @@ fn 独立複製したセルは元と_content_を共有しない() {
     assert_ne!(dup_content, src_content);
 }
 
+/// r.md #108: 列の複製は **選んだ列の直後** に入り、名前 / 色と全行のセルを写す
+/// (リンク複製なので content は共有)。複製後は新しい列が選択になる。
+#[test]
+fn 列の複製は直後に入りセルと名前色を写す() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 2, 3);
+    let a = put_cell(&mut app, 1, 0);
+    put_cell(&mut app, 2, 0);
+    let src_id = app.song_doc.song().scenes[0].id;
+    let tail_id = app.song_doc.song().scenes[2].id;
+    app.edit_song(|song| {
+        song.scenes[0].name = "Verse".into();
+        song.scenes[0].color = Some([0.5, 0.25, 0.75]);
+    });
+    let content_a = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
+        scene_id: src_id,
+        modifier: SelectModifier::Single,
+    }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::DuplicateScenes {
+        scene_ids: vec![src_id],
+        unique: false,
+    }));
+
+    let song = app.song_doc.song();
+    assert_eq!(song.scenes.len(), 4, "列が 1 本増える");
+    let dup = &song.scenes[1];
+    assert_ne!(dup.id, src_id);
+    assert_eq!(song.scenes[0].id, src_id, "元の列は動かない");
+    assert_eq!(song.scenes[3].id, tail_id, "後ろの列は 1 つずれるだけ");
+    assert_eq!(dup.name, "Verse");
+    assert_eq!(dup.color, Some([0.5, 0.25, 0.75]));
+    let dup_id = dup.id;
+    let dup_a = app
+        .cell_in_row_at_scene(LauncherRow::Track(1), dup_id)
+        .expect("行 1 のセルが写る");
+    assert!(app.cell_in_row_at_scene(LauncherRow::Track(2), dup_id).is_some(), "行 2 のセルも写る");
+    assert_ne!(dup_a, a);
+    let dup_content = app.song_doc.song().tracks[0]
+        .session_clips
+        .iter()
+        .find(|c| c.clip.id == dup_a.clip_id())
+        .expect("複製セル")
+        .clip
+        .content_id;
+    assert_eq!(dup_content, content_a, "リンク複製は content を共有する");
+    assert_eq!(app.selection.selected_scene_ids, vec![dup_id], "複製後は新しい列が選択");
+}
+
+/// r.md #108: 複数列をまとめて複製すると、表示順のまま**最後に選んだ列の直後**に並ぶ。
+/// 独立複製 (`unique`) はセルの content を採り直す。
+#[test]
+fn 複数列の独立複製は表示順で末尾の後に並ぶ() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 3);
+    put_cell(&mut app, 1, 0);
+    put_cell(&mut app, 1, 1);
+    let ids: Vec<u32> = app.song_doc.song().scenes.iter().map(|s| s.id).collect();
+    let content0 = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+
+    // 選択順は逆 (列 1 → 列 0) でも複製は表示順。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::DuplicateScenes {
+        scene_ids: vec![ids[1], ids[0]],
+        unique: true,
+    }));
+
+    let song = app.song_doc.song();
+    let order: Vec<u32> = song.scenes.iter().map(|s| s.id).collect();
+    assert_eq!(order.len(), 5);
+    assert_eq!(&order[..2], &ids[..2], "元の 2 列は先頭のまま");
+    assert_eq!(order[4], ids[2], "元の列 2 は複製 2 本ぶん後ろへ");
+    let (d0, d1) = (order[2], order[3]);
+    let c0 = app.cell_in_row_at_scene(LauncherRow::Track(1), d0).expect("列 0 の複製");
+    let c1 = app.cell_in_row_at_scene(LauncherRow::Track(1), d1).expect("列 1 の複製");
+    assert_ne!(c0, c1);
+    let dup_content = app.song_doc.song().tracks[0]
+        .session_clips
+        .iter()
+        .find(|c| c.clip.id == c0.clip_id())
+        .expect("複製セル")
+        .clip
+        .content_id;
+    assert_ne!(dup_content, content0, "独立複製は content を採り直す");
+    assert_eq!(app.selection.selected_scene_ids, vec![d0, d1]);
+}
+
 /// 撃った状態は「ユーザーが最後に撃ったもの」なので `Song` に入り保存されるが、
 /// 撃つ / 止めるは「聴き方」なので **`*` も undo も付けない** (計画書 §1.3)。
 /// 子プロセスへの sync だけは走る (書き出しが今の状態を反映する、Q9)。

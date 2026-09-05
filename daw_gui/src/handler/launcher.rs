@@ -282,6 +282,7 @@ impl AppData {
             E::AddScene => self.add_scene(),
             E::AddSceneAt(index) => self.add_scene_at(index),
             E::DeleteScenes(ids) => self.delete_scenes(&ids),
+            E::DuplicateScenes { scene_ids, unique } => self.duplicate_scenes(&scene_ids, unique),
             E::MoveScene { scene_id, to_index } => self.move_scene(scene_id, to_index),
             E::SetSceneColor { scene_id, color } => self.set_scene_color(scene_id, color),
             E::BeginRenameScene(id) => self.begin_rename_scene(id),
@@ -641,28 +642,7 @@ impl AppData {
     /// で戻らなくなったりする (ボタンは点灯し続けるのに押しても直らない)。
     #[must_use]
     pub fn all_launcher_rows(&self) -> Vec<LauncherRow> {
-        let song = self.song_doc.song();
-        let mut rows = Vec::new();
-        for lane in song.song_lanes.iter().filter(|l| l.target.accepts_launcher_cells()) {
-            rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
-                track: MASTER_TRACK_ID,
-                lane: lane.id,
-            }));
-        }
-        for track in &song.tracks {
-            rows.push(LauncherRow::Track(track.id));
-            for lane in track
-                .automation_lanes
-                .iter()
-                .filter(|l| l.target.accepts_launcher_cells())
-            {
-                rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
-                    track: track.id,
-                    lane: lane.id,
-                }));
-            }
-        }
-        rows
+        all_rows_of(self.song_doc.song())
     }
 
     /// ランチャーの行を **アレンジと同じ表示順** で返す。
@@ -1099,6 +1079,109 @@ impl AppData {
                 clone_cell_into_scene(song, *cell, scene_id);
             }
         });
+    }
+}
+
+/// 曲の **全行** (トラック行 + セルを置けるオートメーションレーン行) を
+/// アレンジと同じ順で返す ([`AppData::all_launcher_rows`] の Song 版。
+/// `edit_song` の中から引くときはこちら)。
+pub(crate) fn all_rows_of(song: &common::model::Song) -> Vec<LauncherRow> {
+    let mut rows = Vec::new();
+    for lane in song.song_lanes.iter().filter(|l| l.target.accepts_launcher_cells()) {
+        rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
+            track: MASTER_TRACK_ID,
+            lane: lane.id,
+        }));
+    }
+    for track in &song.tracks {
+        rows.push(LauncherRow::Track(track.id));
+        for lane in track.automation_lanes.iter().filter(|l| l.target.accepts_launcher_cells()) {
+            rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
+                track: track.id,
+                lane: lane.id,
+            }));
+        }
+    }
+    rows
+}
+
+/// 列 `scene_id` に置かれているセルを全行ぶん集める (行の表示順)。
+fn cells_in_scene(song: &common::model::Song, scene_id: u32) -> Vec<LauncherCellKey> {
+    all_rows_of(song)
+        .into_iter()
+        .filter_map(|row| {
+            let clip_id = match row {
+                LauncherRow::Track(id) => song.track_by_id(id)?.session_clip(scene_id)?.clip.id,
+                LauncherRow::Lane(k) => {
+                    song.automation_lane_by_key(k.track, k.lane)?.session_clip(scene_id)?.clip.id
+                }
+            };
+            Some(crate::handler::launcher_cells::cell_key_in_row(row, clip_id))
+        })
+        .collect()
+}
+
+/// 列 `src_id` の複製を表示順 `insert_at` に挿し、新しい列の id を返す
+/// (名前 / 色 / フォローアクション + 全行のセル。`unique` なら content も採り直す)。
+/// 元の列が消えていれば `None` で何もしない。
+fn clone_scene_at(
+    song: &mut common::model::Song,
+    src_id: u32,
+    insert_at: usize,
+    unique: bool,
+) -> Option<u32> {
+    let src = song.scenes.iter().find(|s| s.id == src_id).cloned()?;
+    let cells = cells_in_scene(song, src_id);
+    let new_id = song.alloc_scene_id();
+    song.scenes.insert(insert_at, common::model::Scene { id: new_id, ..src });
+    for cell in cells {
+        let Some(clip_id) = clone_cell_into_scene(song, cell, new_id) else {
+            continue;
+        };
+        if unique {
+            crate::handler::launcher_cells::make_cell_content_unique(song, cell.row(), clip_id);
+        }
+    }
+    Some(new_id)
+}
+
+impl AppData {
+    /// r.md #108: 列を丸ごと複製する。複製は **選んだ列の直後** に表示順のまま並び、
+    /// 名前 / 色 / フォローアクションと全行のセルを写す。`unique` ならセルの content も
+    /// 採り直す ([`Self::duplicate_launcher_cells`] と同じ規約)。複製後は新しい列が
+    /// 選択になる (連打で後方に連なる = クリップの `D` と同じ手触り)。
+    pub fn duplicate_scenes(&mut self, scene_ids: &[u32], unique: bool) {
+        let mut made: Vec<u32> = Vec::new();
+        self.edit_song_checked(|song| {
+            // 表示順に並べ直す (選択集合はクリック順なので、そのまま挿すと列の
+            // 順序が入れ替わる)。消えた列は落とす。
+            let mut sources: Vec<(usize, u32)> = scene_ids
+                .iter()
+                .filter_map(|id| song.scene_index(*id).map(|i| (i, *id)))
+                .collect();
+            sources.sort_unstable();
+            sources.dedup();
+            let Some(&(last_index, _)) = sources.last() else {
+                return false;
+            };
+            let mut insert_at = last_index + 1;
+            for (_, src_id) in sources {
+                if let Some(new_id) = clone_scene_at(song, src_id, insert_at, unique) {
+                    insert_at += 1;
+                    made.push(new_id);
+                }
+            }
+            !made.is_empty()
+        });
+        if made.is_empty() {
+            return;
+        }
+        // 列選択へ倒す手順は `select_scene` と同じ (セル面とは排他、anchor も貼り替え)。
+        self.selection.selected_launcher_cells.clear();
+        self.selection.launcher_cell_anchor = None;
+        self.selection.scene_anchor = made.first().copied();
+        self.selection.selected_scene_ids = made;
+        self.selection.last_edit_select = Some(crate::app::EditSurface::Scenes);
     }
 }
 

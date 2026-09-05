@@ -302,6 +302,10 @@ pub enum LauncherEvent {
     /// 末尾追加 (`AddScene`) だと「列 5 を右クリックしたのに列 1 が生える」。
     AddSceneAt(usize),
     DeleteScenes(Vec<u32>),
+    /// r.md #108: 列を丸ごと複製する (名前 / 色 / フォローアクション + 全行のセル)。
+    /// 複製は **選んだ列の直後** に表示順のまま並び、複製後はそちらが選択になる
+    /// (Live の Duplicate Scene)。`unique` の意味は [`Self::DuplicateCells`] と同じ。
+    DuplicateScenes { scene_ids: Vec<u32>, unique: bool },
     /// 表示順の並べ替え (見出しのドラッグ)。
     MoveScene { scene_id: u32, to_index: usize },
     SetSceneColor { scene_id: u32, color: [f32; 3] },
@@ -362,6 +366,7 @@ impl LauncherEvent {
             E::RowToArranger { .. } | E::AllToArranger => "アレンジに戻す",
             E::AddScene | E::AddSceneAt(..) | E::CaptureScene => "シーン追加",
             E::DeleteScenes(..) => "シーン削除",
+            E::DuplicateScenes { .. } => "シーン複製",
             E::MoveScene { .. } => "シーン並べ替え",
             E::SetSceneColor { .. } => "シーン色変更",
             E::CommitRenameScene => "シーン名変更",
