@@ -111,7 +111,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             if app.ui_ephemeral.plugin_picker_query.is_empty() {
                 ui.label_at(
                     "pp_search_hint",
-                    "Filter by name / vendor  (v␣ video / i␣ instrument / f␣ FX / m␣ MIDI FX)",
+                    "Filter by name / vendor  (v/i/f/m + space = type)",
                     search_rect.x + 8.0,
                     search_rect.y + 6.0,
                     13.0,
