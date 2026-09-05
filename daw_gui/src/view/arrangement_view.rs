@@ -5,7 +5,7 @@
 //! ここに id ↔ index の変換層は無い (トラックの index が要る箇所だけ
 //! `Song::track_index_of` を通す)。
 
-use crate::widgets::arrangement::live_clip_key;
+use crate::widgets::arrangement::{live_clip_key, ArrangementResponse};
 use daw_ui_core::{
     Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
 };
@@ -35,6 +35,40 @@ fn track_index_at_y(
         .iter()
         .find(|(_, r)| y >= r.y && y < r.y + r.h)
         .and_then(|(track_id, _)| tracks.iter().position(|t| t.id == *track_id))
+}
+
+/// ファイルを落とした座標 → 取り込み先。**落ちた面で解決経路を分ける**。
+///
+/// - **ランチャー帯の中** (`pane_rect`): 帯の語彙だけで解く
+///   ([`launcher_bridge::cell_drop_target`]) — セル / 行の無い余白の新トラック。
+///   `None` (停止列 / 返す列 / 見出し / セルを持てない行) は **そのまま `None`** =
+///   何も置かない。ここでアレンジ側の解決へ倒すと、帯の停止列の余白に落とした
+///   ファイルが `track_index_at_y` の y 判定だけで「アレンジの一番下に新トラック」
+///   に化ける (r.md #93 — 「セッションビューに落としたのにアレンジに貼られた」)。
+///   クリップドラッグが帯の上で離されたときの `launcher::release::take_drop`
+///   (「帯の上なら必ず受け止め、置けなければキャンセル」) と同じ契約。
+/// - **アレンジのレーン**: drop 位置 (y) が乗っている track を、widget が返す実際の
+///   header rect (`track_header_rects`) で hit-test する。header_rects は縦スクロール /
+///   個別行高 override / master 行を反映した実描画 y なので、naive な `local_y / row_h`
+///   と違い下方トラックでも正しく当たる (r.md #31 以前の「Track9 にドロップしても
+///   新規 track が作られる」の修正)。当たった track_id を `song.tracks` の index に
+///   変換し、master 行 (`song.tracks` に居ない) や、どの行にも当たらない (= track の
+///   無い下の余白) は `NewTrackBottom` = 一番下に新規 track を作って貼る。
+fn file_drop_target(
+    app: &AppData,
+    resp: &ArrangementResponse,
+    pos: (f32, f32),
+) -> Option<ImportTrackTarget> {
+    let pane = resp.launcher.pane_rect;
+    if pane.w > 0.0 && pane.contains(pos.0, pos.1) {
+        return crate::view::launcher_bridge::cell_drop_target(app, resp, pos);
+    }
+    Some(
+        match track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, pos.1) {
+            Some(idx) => ImportTrackTarget::Track(idx as u32),
+            None => ImportTrackTarget::NewTrackBottom,
+        },
+    )
 }
 
 
@@ -807,45 +841,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // r.md #87: ランチャー帯へのドロップは **帯の矩形で先に受ける**。
     // `canvas_area` (= レーン) だけを見ていると、帯の上に落としたファイルは
     // どの矩形にも当たらず黙って捨てられる (セルへの D&D が効かない原因だった)。
+    // 受けた drop の着地先は `file_drop_target` が **落ちた面ごとに**解く
+    // (r.md #93: 帯に落ちたものはアレンジの解決へ流さない)。着地先が無い drop
+    // (帯の停止列 / 返す列 / 見出し / セルを持てない行) は消費して何もしない。
     let launcher_drop = (resp.launcher.pane_rect.w > 0.0)
         .then(|| ui.take_file_drop_in_rect(resp.launcher.pane_rect))
         .flatten();
-    if let Some(drop) = launcher_drop.or_else(|| ui.take_file_drop_in_rect(canvas_area)) {
-        // drop target 解決: drop 位置 (position.y) が乗っている track を、 widget が
-        // 返す実際の header rect (`resp.track_header_rects`) で hit-test する。
-        // header_rects は縦スクロール (`arrange_track_top`) / 個別行高 override /
-        // master 行を反映した実描画 Y なので、 naive な `local_y / row_h` と違い
-        // 下方トラックでも正しく当たる (= スクロール時や master 行ぶんのズレで
-        // 「Track9 にドロップしても新規 track が作られる」バグの修正)。 lanes 側
-        // drop でも各行の Y レンジは header と共通なので Y のみで判定する。 当たった
-        // track_id を song.tracks の index に変換し、 master 行 (song.tracks に居ない)
-        // や、 どの行にも当たらない (= track の無い下の余白) は `NewTrackBottom` =
-        // 一番下に新規 track を作って貼る (r.md #31: 以前は audio=cursor/先頭 track・
-        // image=一番上 insert とバラバラだったのを「ドロップ位置どおり一番下」へ統一)。
-        //
+    let file_drop = launcher_drop
+        .or_else(|| ui.take_file_drop_in_rect(canvas_area))
+        .and_then(|drop| file_drop_target(app, &resp, drop.position).map(|t| (drop, t)));
+    if let Some((drop, target)) = file_drop {
         // docs/plan_video.md P2: 同じ drop 内で audio file と video file が
         // 混在する場合は extension で partition して個別 AppEvent を発火する。
         // `import_video::looks_like_video` が `mp4 / mov / mkv / webm / m4v /
         // avi` を判定 (= P2.7 wire)。 マッチしない path は従来通り Audio
         // import パイプラインに流す (= `common::audio_decode` が WAV / AIFF /
         // FLAC / MP3 / OGG / M4A をコンテンツ判定でデコード、 r.md #19)。
-        let drop_y = drop.position.1;
-        // r.md #87: ランチャーのセルに当たったらそのセルへ入れる。
-        let cell_target =
-            crate::view::launcher_bridge::cell_drop_target(app, &resp, drop.position);
-        let target = match cell_target {
-            Some(t) => t,
-            None => {
-                match track_index_at_y(
-                    &resp.track_header_rects,
-                    &app.song_doc.song().tracks,
-                    drop_y,
-                ) {
-                    Some(idx) => ImportTrackTarget::Track(idx as u32),
-                    None => ImportTrackTarget::NewTrackBottom,
-                }
-            }
-        };
         // ドロップ X 位置 → beat。 import で生成する clip を「先頭 (playhead) では
         // なくドロップしたカーソル位置」 に置く。 hover-beat (下) と同じ pixel→beat
         // 変換 (canvas 左端基準) + 既存 snap 設定を適用。 header 上に落とした等で
