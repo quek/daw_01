@@ -386,6 +386,13 @@ pub(super) struct LauncherCellView {
     /// トラック行のセルは空 (中身は波形 / MIDI で、描画時に
     /// [`content_build::build_one`](super::content_build::build_one) から組む)。
     pub curve: Vec<(f64, f32)>,
+    /// r.md #94: video / image クリップのセルのサムネイル (アレンジの
+    /// [`ClipView::thumbnail`](super::ClipView::thumbnail) と同じ契約、同じ供給元
+    /// [`view_build::clip_thumbnail`](super::view_build::clip_thumbnail))。
+    /// 描画は共通の [`draw_thumbnail_tiles`](super::draw_thumbnail_tiles) — セルの
+    /// 写像 (content の窓をセル内側幅に引き伸ばしたもの) で敷き詰める。 decode 待ち /
+    /// 音声・MIDI のセルは `None`。
+    pub thumbnail: Option<ClipThumbnail>,
 }
 
 /// ランチャー帯の 1 行。

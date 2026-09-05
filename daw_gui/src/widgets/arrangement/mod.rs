@@ -66,6 +66,10 @@ mod curve;
 use curve::AutomationSegmentBendSession;
 mod draw;
 use draw::*;
+// r.md #94: video / image のサムネイル敷き詰め (アレンジのクリップとランチャーの
+// セルの共通経路)。 `draw.rs` から分離 (ファイル budget)。
+mod thumbnail;
+use thumbnail::*;
 mod share_group;
 use share_group::*;
 mod geometry;

@@ -308,6 +308,7 @@ fn グループ行のまとめセルは子行へ展開される() {
             len_beats: 4.0,
             looping: true,
             curve: Vec::new(),
+            thumbnail: None,
         },
     );
     view.rows.insert(
@@ -401,4 +402,100 @@ fn 進捗バーはどの塗りの上でも溝と区別できる() {
             "進捗バーが「{name}」の上で溝に沈む: {ratio:.2}:1 (最低 {MIN}:1)"
         );
     }
+}
+
+// ============================================================
+// r.md #94: video / image クリップのセルのサムネイル
+// ============================================================
+
+fn build_app() -> AppData {
+    use crate::dispatcher::{
+        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+    };
+    let (audio_tx, _audio_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (plugin_tx, _plugin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+    let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+    AppData::new(
+        audio_tx,
+        plugin_tx,
+        None,
+        None,
+        event_dispatcher,
+        job_dispatcher,
+        None,
+        None,
+        common::audio_bridge::DEFAULT_SAMPLE_RATE,
+    )
+}
+
+/// **セッションビューにしか居ない** 画像クリップのセルにも、アレンジのクリップと同じ
+/// サムネイルが載る (r.md #94 の欠陥そのもの — 旧実装はセルが波形 / MIDI しか描かず、
+/// video / image のセルは名前だけの無地だった)。
+///
+/// 供給元 (`image_texture_cache`) は source 単位で project 共有なので、アレンジに
+/// 同じ content のクリップが 1 つも無くても引ける。
+#[test]
+fn セッションだけの画像クリップのセルにアレンジと同じサムネイルが載る() {
+    use common::model::{
+        Clip, ClipContent, ImageContent, ImageEvent, ImageSource, ImageSourcePath,
+        LaunchSettings, Scene, SessionClip, Track,
+    };
+    let mut app = build_app();
+    let handle = TextureHandle::from_raw(std::num::NonZeroU32::new(7).unwrap());
+    let (track_id, scene_id, source_id) = app
+        .edit_song(|song| {
+            let source_id = song.alloc_image_source_id();
+            song.media.image_sources.insert(
+                source_id,
+                ImageSource {
+                    path: ImageSourcePath::Absolute("logo.png".into()),
+                    name: "logo.png".into(),
+                    width: 1920,
+                    height: 1080,
+                    format: "Png".into(),
+                },
+            );
+            let content_id = song.alloc_content_id();
+            song.clip_contents.insert(
+                content_id,
+                ClipContent::Image(ImageContent {
+                    events: vec![ImageEvent {
+                        source_id,
+                        // content 先頭ではなく 1 拍目から始まる event — サムネイルの
+                        // 位相 (`start_in_content_beats`) がそのまま運ばれることを見る。
+                        event_start_in_clip_beats: 1.0,
+                        event_length_beats: 4.0,
+                        ..ImageEvent::default()
+                    }],
+                }),
+            );
+            let scene_id = song.alloc_scene_id();
+            song.scenes.push(Scene::new(scene_id));
+            let track_id = song.alloc_track_id();
+            let mut track = Track { id: track_id, ..Track::default() };
+            let clip_id = track.alloc_clip_id();
+            track.session_clips.push(SessionClip {
+                scene_id,
+                clip: Clip { id: clip_id, length_beats: 4.0, content_id, ..Clip::default() },
+                launch: LaunchSettings::default(),
+            });
+            song.tracks.push(track);
+            (track_id, scene_id, source_id)
+        })
+        .expect("編集できる");
+
+    let cell_thumbnail = |app: &AppData| {
+        let built = super::super::view_build::build(app, Rect::new(0.0, 0.0, 1200.0, 600.0));
+        built.launcher.rows[&ArrangementRowKey::Track(track_id)].cells[&scene_id].thumbnail
+    };
+    // decode 待ちの間は無地 (fill だけ)。
+    assert_eq!(cell_thumbnail(&app), None, "texture が無いうちはサムネイル無し");
+
+    app.ui_ephemeral.image_texture_cache.insert(source_id, handle);
+    assert_eq!(
+        cell_thumbnail(&app),
+        Some(ClipThumbnail { texture: handle, width: 1920, height: 1080, start_in_content_beats: 1.0 }),
+        "アレンジのクリップと同じ契約 (texture / native size / event の content-local 開始拍)"
+    );
 }
