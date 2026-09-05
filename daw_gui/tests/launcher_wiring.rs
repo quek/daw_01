@@ -685,11 +685,12 @@ fn セルを開くとピアノロールの編集対象になる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
-    app.ui_prefs.bottom_panel = 0;
+    // 閉じていても (r.md #96) セルを開けばピアノロールのタブで開く。
+    app.ui_prefs.bottom_panel = None;
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
 
-    assert_eq!(app.ui_prefs.bottom_panel, 1, "ピアノロールのタブが開く");
+    assert_eq!(app.ui_prefs.bottom_panel, Some(1), "ピアノロールのタブが開く");
     assert_eq!(
         app.pianoroll_target_clip(),
         Some(common::model::ClipKey { track_id: 1, clip_id: cell.clip_id() }),

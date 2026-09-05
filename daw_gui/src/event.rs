@@ -647,7 +647,15 @@ pub enum AppEvent {
     MidiInputOpened(Option<String>),
 
     // -------- Bottom panel -------------------------------------------------
+    /// 下部パネルを開いてタブ `p` (0 = Mixer / 1 = Piano Roll・Audio Editor) にする。
+    /// タブ click / クリップのダブルクリック / ランチャーのセル編集など「このタブを
+    /// 見せたい」経路はすべてここへ集約する (閉じていれば開く)。
     SelectBottomPanel(u8),
+    /// r.md #96: `B` (View メニュー「ミキサー」) で Mixer を開閉する。Mixer が見えて
+    /// いれば下部パネルを閉じ、そうでなければ (閉じている / 別タブ) Mixer タブで開く。
+    /// Bitwig の `B` 流のトグルで、「開く前の状態」は覚えない。見方の都合なので
+    /// Undo / dirty 対象外 (`ViewState` には保存する)。
+    ToggleMixerPanel,
 
     // -------- Arrangement / clip operations -------------------------------
     SelectClip { target: ClipKey, additive: bool },

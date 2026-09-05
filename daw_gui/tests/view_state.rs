@@ -89,7 +89,7 @@ fn view_state_snapshot_restore_roundtrips() {
     // 代表的な表示状態を仕込む。
     app.ui_prefs.arrange_zoom_x = 50.0;
     app.ui_prefs.arrange_scroll_beat = 7.0;
-    app.ui_prefs.bottom_panel = 1;
+    app.ui_prefs.bottom_panel = Some(1);
     app.ui_prefs.master_row_automation_expanded = true;
     app.ui_prefs.expanded_automation_tracks.insert(2);
     let pv = PianoRollViewState { zoom_x: 111.0, zoom_y: 20.0, top_pitch: 70, scroll_beat: 2.0 };
@@ -103,7 +103,7 @@ fn view_state_snapshot_restore_roundtrips() {
     // すべて別の値へ壊してから restore。
     app.ui_prefs.arrange_zoom_x = 999.0;
     app.ui_prefs.arrange_scroll_beat = 0.0;
-    app.ui_prefs.bottom_panel = 0;
+    app.ui_prefs.bottom_panel = None;
     app.ui_prefs.master_row_automation_expanded = false;
     app.ui_prefs.expanded_automation_tracks.clear();
     app.ui_prefs.piano_roll_views.clear();
@@ -115,7 +115,7 @@ fn view_state_snapshot_restore_roundtrips() {
 
     assert_eq!(app.ui_prefs.arrange_zoom_x, 50.0);
     assert_eq!(app.ui_prefs.arrange_scroll_beat, 7.0);
-    assert_eq!(app.ui_prefs.bottom_panel, 1);
+    assert_eq!(app.ui_prefs.bottom_panel, Some(1));
     assert!(app.ui_prefs.master_row_automation_expanded);
     assert!(app.ui_prefs.expanded_automation_tracks.contains(&2));
     assert_eq!(

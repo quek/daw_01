@@ -1,10 +1,11 @@
 //! Bottom panel: Mixer / Piano Roll を切り替えるタブ + 中身。
 //!
 //! gui_01 の `Ui::tab_view_with_state` を使う。selected の永続は `app.ui_prefs.bottom_panel`
-//! (u8) で持ち、widget には `&mut usize` で渡す。タブクリックで `*selected` が
-//! 書き換わるので、変化があれば `AppEvent::SelectBottomPanel` で AppData に
-//! 反映する (`gui_01_conversation_archive_001.md` #004 で gui_01 から共有された
-//! パターン)。
+//! (`Option<u8>`、`None` = 閉じている) で持ち、widget には `&mut usize` で渡す。
+//! タブクリックで `*selected` が書き換わるので、変化があれば
+//! `AppEvent::SelectBottomPanel` で AppData に反映する
+//! (`gui_01_conversation_archive_001.md` #004 で gui_01 から共有されたパターン)。
+//! 閉じているときは root が呼ばない (r.md #96: `B` で Mixer を開閉)。
 
 use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
@@ -12,8 +13,9 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent};
 use crate::view::{audio_editor, mixer_strips};
 
-pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    let prev_tab = app.ui_prefs.bottom_panel as usize;
+/// `tab` は `app.ui_prefs.bottom_panel` の中身 (root が `Some` を剥がして渡す)。
+pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, tab: u8) {
+    let prev_tab = tab as usize;
     let mut tab_idx = prev_tab;
 
     // Phase 2 PR6: audio clip ダブルクリックで `audio_editor_clip` が

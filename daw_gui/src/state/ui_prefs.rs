@@ -46,7 +46,11 @@ pub struct UiPrefs {
     pub track_row_overrides: std::collections::HashMap<u32, u16>,
 
     // -------- View state --------
-    pub bottom_panel: u8,
+    /// 下部パネル。`None` = 閉じている (アレンジが右カラムの全高を使う)、
+    /// `Some(0)` = Mixer タブ、`Some(1)` = Piano Roll (Audio Editor) タブ。
+    /// 閉じている間に「どのタブだったか」は持たない — 開く経路はすべて
+    /// タブを明示する (`SelectBottomPanel` / `ToggleMixerPanel`)。
+    pub bottom_panel: Option<u8>,
     /// (B13 r.md #8) Audio Editor の波形 縦 gain (振幅表示の拡大率)。 Alt+wheel で
     /// 増減。 session-only (描画スケールのみ、 model / 音声には非影響)。
     pub audio_editor_vertical_gain: f32,

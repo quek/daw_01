@@ -2298,7 +2298,7 @@ fn launcher_empty_cell_double_click_reports_create_cell() {
 fn アレンジのクリップのダブルクリックは帯を出していてもピアノロールを開く() {
     let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    app.ui_prefs.bottom_panel = 0;
+    app.ui_prefs.bottom_panel = Some(0);
     let mut host = UiHost::no_redraw();
     let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
     let (_, rect) = r0.clip_rects.first().copied().expect("アレンジのクリップ rect が返る");
@@ -2311,7 +2311,7 @@ fn アレンジのクリップのダブルクリックは帯を出していて�
     ] {
         drive_response(&mut host, &mut app, p);
     }
-    assert_eq!(app.ui_prefs.bottom_panel, 1, "ピアノロールのタブが開く");
+    assert_eq!(app.ui_prefs.bottom_panel, Some(1), "ピアノロールのタブが開く");
 }
 
 /// セル (クリップ有り) のダブルクリック → `OpenCellEditor` の意図。
@@ -2322,7 +2322,7 @@ fn セルのダブルクリックは編集面を開く意図を出す() {
     let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
     add_session_cell(&mut app, 1, 9, 4.0);
-    app.ui_prefs.bottom_panel = 0;
+    app.ui_prefs.bottom_panel = Some(0);
     let mut host = UiHost::no_redraw();
     let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
     let (_, rect) = r0

@@ -23,6 +23,8 @@ pub mod load_overlay;
 pub mod loudness_report;
 pub mod master_panel;
 pub mod master_strip_ui;
+/// 上部 menu bar (File / Edit / View / Help)。root.rs から分離。
+pub mod menu_bar;
 pub mod mixer_strips;
 pub mod modulation;
 pub mod param_gesture;

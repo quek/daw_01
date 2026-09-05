@@ -23,7 +23,7 @@ impl AppData {
             self.set_audio_event_selection(&[]);
         }
         self.ui_ephemeral.audio_editor_clip = Some(target);
-        self.ui_prefs.bottom_panel = 1;
+        self.ui_prefs.bottom_panel = Some(1);
         // per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
         // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
         let Some(key) = self.live_clip_key(target) else { return };
