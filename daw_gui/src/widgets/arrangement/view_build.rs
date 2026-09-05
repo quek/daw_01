@@ -187,38 +187,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                                 })
                                 .collect()
                         }),
-                        // r.md #68: thumbnail も「中身」 なので、 それが表す event の
-                        // content-local 開始拍を添える (widget は content 原点基準で置き、
-                        // clip 矩形で切り抜く = 端 drag しても絵が動かない)。
-                        thumbnail: {
-                            content
-                                .and_then(|ct| ct.video_events())
-                                .and_then(|events| events.first())
-                                .and_then(|ev| {
-                                    let texture =
-                                        *app.ui_ephemeral.video_texture_cache.get(&ev.source_id)?;
-                                    let src = app.song_doc.song().media.video_sources.get(&ev.source_id)?;
-                                    Some(ClipThumbnail {
-                                        texture,
-                                        width: src.width,
-                                        height: src.height,
-                                        start_in_content_beats: ev.event_start_in_clip_beats,
-                                    })
-                                })
-                                .or_else(|| {
-                                    let events = content?.image_events()?;
-                                    let ev = events.first()?;
-                                    let texture =
-                                        *app.ui_ephemeral.image_texture_cache.get(&ev.source_id)?;
-                                    let src = app.song_doc.song().media.image_sources.get(&ev.source_id)?;
-                                    Some(ClipThumbnail {
-                                        texture,
-                                        width: src.width,
-                                        height: src.height,
-                                        start_in_content_beats: ev.event_start_in_clip_beats,
-                                    })
-                                })
-                        },
+                        thumbnail: clip_thumbnail(app, content),
                     }
                 })
                 .collect(),
@@ -369,6 +338,53 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         master_row,
         launcher,
     }
+}
+
+// ---------------------------------------------------------------------------
+// video / image clip のサムネイル (SSoT)
+// ---------------------------------------------------------------------------
+
+/// video / image content の **先頭 event** のサムネイル (GPU texture 上げ済みのものだけ)。
+///
+/// r.md #68: thumbnail も「中身」 なので、 それが表す event の content-local 開始拍を
+/// 添える (widget は content 原点基準で置き、 矩形で切り抜く = 端 drag しても絵が動かない)。
+///
+/// r.md #94: アレンジのクリップ ([`ClipView::thumbnail`]) とランチャーのセル
+/// ([`super::launcher::LauncherCellView::thumbnail`]) の両方がここを通る。 texture の
+/// 供給元 (`ui_ephemeral.video_texture_cache` / `image_texture_cache`) は source 単位で
+/// project 全体に共有されているので、 セッションビューにしか居ないクリップも同じ cache
+/// を引く (decode の work-list は `begin_asset_decode` が `media.*_sources` を全件回す =
+/// クリップの居場所に依らない)。 decode 待ちなら `None` (= fill だけ描かれる)。
+pub(super) fn clip_thumbnail(
+    app: &AppData,
+    content: Option<&common::model::ClipContent>,
+) -> Option<ClipThumbnail> {
+    let media = &app.song_doc.song().media;
+    content
+        .and_then(|ct| ct.video_events())
+        .and_then(|events| events.first())
+        .and_then(|ev| {
+            let texture = *app.ui_ephemeral.video_texture_cache.get(&ev.source_id)?;
+            let src = media.video_sources.get(&ev.source_id)?;
+            Some(ClipThumbnail {
+                texture,
+                width: src.width,
+                height: src.height,
+                start_in_content_beats: ev.event_start_in_clip_beats,
+            })
+        })
+        .or_else(|| {
+            let events = content?.image_events()?;
+            let ev = events.first()?;
+            let texture = *app.ui_ephemeral.image_texture_cache.get(&ev.source_id)?;
+            let src = media.image_sources.get(&ev.source_id)?;
+            Some(ClipThumbnail {
+                texture,
+                width: src.width,
+                height: src.height,
+                start_in_content_beats: ev.event_start_in_clip_beats,
+            })
+        })
 }
 
 // ---------------------------------------------------------------------------

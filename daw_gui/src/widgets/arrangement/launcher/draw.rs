@@ -605,6 +605,20 @@ fn draw_filled_cell(
     let (r, key) = (d.rect, d.key);
     let fill = if cell.muted { muted_dim_fill(cell.color) } else { cell.color };
     push_rounded(hctx, r, fill, f.style.clip_border, CELL_RADIUS);
+    let btn = layout::launch_button_rect(r);
+    let label = Rect {
+        x: btn.x + btn.w + 2.0,
+        y: r.y,
+        w: (r.w - (btn.x + btn.w + 2.0 - r.x) - 1.0).max(0.0),
+        h: r.h,
+    };
+    let map = cell_content_map(label, cell);
+    // r.md #94: video / image のサムネイルはアレンジのクリップと同じ順 — fill の上、
+    // muted ハッチとラベルの **下** (`draw_video_clip`)。 波形 / MIDI はハッチの上に
+    // 描く (アレンジでも content パスがハッチの上に来る) ので、ハッチはこの間に挟む。
+    if let (Some(thumb), Some(map)) = (cell.thumbnail, map) {
+        draw_thumbnail_tiles(hctx, label, label.intersect(f.launcher.grid), map, thumb);
+    }
     if cell.muted {
         push_muted_hatch(
             hctx,
@@ -615,14 +629,9 @@ fn draw_filled_cell(
             f.style.clip_muted_hatch_width_px,
         );
     }
-    let btn = layout::launch_button_rect(r);
-    let label = Rect {
-        x: btn.x + btn.w + 2.0,
-        y: r.y,
-        w: (r.w - (btn.x + btn.w + 2.0 - r.x) - 1.0).max(0.0),
-        h: r.h,
-    };
-    cell_content(hctx, app, tempo_map, f, key, cell, label, fill);
+    if let Some(map) = map {
+        cell_content(hctx, app, tempo_map, f, key, cell, label, map, fill);
+    }
     let text_color = clip_text_color_for(hctx.palette(), f.style, fill, f.style.bg);
     draw_clip_label(hctx, label, &cell.name, cell.linked, text_color, f.style);
     // ▶ は hover / 押下 / **発火待ちの点滅** を同じチップ 1 枚で表す。
@@ -694,7 +703,29 @@ fn is_cell_selected(f: &ArrangementFrame<'_>, key: LauncherCellKey) -> bool {
     key.model_key().is_some_and(|k| f.launcher_view.selected.contains(&k))
 }
 
+/// セルの中身 (波形 / MIDI / 曲線 / サムネイル) の写像。
+///
+/// セルの窓 (`[content_offset, content_offset + len)`) を `area` の内側幅いっぱいに
+/// 引き伸ばした写像。アレンジと違いビューのズームには依存しない — セルは
+/// 「撃った瞬間を原点とするループ 1 周」で、時間軸上の位置を持たないため。
+/// 長さ 0 のセルは写像が定義できない (`None`)。
+#[must_use]
+fn cell_content_map(area: Rect, cell: &LauncherCellView) -> Option<ContentMap> {
+    if cell.len_beats <= 0.0 {
+        return None;
+    }
+    let inner_x = area.x + 2.0;
+    let inner_w = f64::from((area.w - 4.0).max(1.0));
+    let px_per_beat = inner_w / cell.len_beats;
+    #[allow(clippy::cast_possible_truncation)]
+    Some(ContentMap {
+        origin_x: inner_x - (cell.content_offset_beats * px_per_beat) as f32,
+        px_per_beat,
+    })
+}
+
 /// セルの中身のミニ表示 (行が低いときは何も描かない = 名前だけになる)。
+/// サムネイルは含まない (`draw_filled_cell` が muted ハッチの下に描く)。
 #[allow(clippy::too_many_arguments)]
 fn cell_content(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
@@ -704,23 +735,13 @@ fn cell_content(
     key: LauncherCellKey,
     cell: &LauncherCellView,
     area: Rect,
+    map: ContentMap,
     fill: Color,
 ) {
     let inset = clip_content_inset_top(f.style);
-    if area.w <= 8.0 || area.h <= inset + 4.0 || cell.len_beats <= 0.0 {
+    if area.w <= 8.0 || area.h <= inset + 4.0 {
         return;
     }
-    // セルの窓 (`[content_offset, content_offset + len)`) を `area` の内側幅いっぱいに
-    // 引き伸ばした写像。アレンジと違いビューのズームには依存しない — セルは
-    // 「撃った瞬間を原点とするループ 1 周」で、時間軸上の位置を持たないため。
-    let inner_x = area.x + 2.0;
-    let inner_w = f64::from((area.w - 4.0).max(1.0));
-    let px_per_beat = inner_w / cell.len_beats;
-    #[allow(clippy::cast_possible_truncation)]
-    let map = ContentMap {
-        origin_x: inner_x - (cell.content_offset_beats * px_per_beat) as f32,
-        px_per_beat,
-    };
     if !cell.curve.is_empty() {
         draw_cell_curve(hctx, f, area, inset, cell, map, fill);
         return;

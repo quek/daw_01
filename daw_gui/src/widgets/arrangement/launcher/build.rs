@@ -88,6 +88,12 @@ pub(crate) fn build(
                     len_beats: sc.clip.length_beats,
                     looping: sc.launch.looping,
                     curve: Vec::new(),
+                    // r.md #94: アレンジのクリップと同じ resolver (供給元は project 共有の
+                    // texture cache なので、セッションだけに居るクリップにも同じ絵が出る)。
+                    thumbnail: crate::widgets::arrangement::view_build::clip_thumbnail(
+                        app,
+                        song.clip_contents.get(&sc.clip.content_id),
+                    ),
                 },
             );
         }
@@ -171,6 +177,8 @@ fn lane_row(
                 len_beats: sc.clip.length_beats,
                 looping: sc.launch.looping,
                 curve,
+                // オートメーションの content に絵は無い。
+                thumbnail: None,
             },
         );
     }
