@@ -119,7 +119,13 @@ fi
 command -v unzip >/dev/null 2>&1 || die "unzip が要ります"
 command -v curl  >/dev/null 2>&1 || die "curl が要ります"
 
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/fetch_ffmpeg.XXXXXX")"
+# 一時領域は repo 内 (target/tmp) に取り、mixed path (C:/...) で持つ。MSYS の /tmp は
+# 環境ごとに実体が違い (Git Bash = %TEMP%、MSYS2 = <msys root>/tmp)、herdr の worktree では
+# curl が「Failed to open the file」で書けなかった (2026-09-05)。mixed path なら MSYS 版 /
+# Windows 版どちらの curl / unzip でも同じ場所を指す。
+tmp_root="$(cygpath -m "$ROOT" 2>/dev/null || printf '%s' "$ROOT")/target/tmp"
+mkdir -p "$tmp_root"
+tmp="$(mktemp -d "$tmp_root/fetch_ffmpeg.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 zip="$tmp/$FFMPEG_ASSET"
