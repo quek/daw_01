@@ -208,7 +208,6 @@ FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash 
 FN-NESTING | daw_gui/src/view/track_inspector/mod.rs::draw                             | 8/119 | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/audio_editor.rs::draw                                    | 8/95  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/arrangement_view.rs::draw                                | 8/73  | 巨大 draw。未起票
-FN-NESTING | daw_gui/src/view/menu_bar.rs::draw                                           | 8/19  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/plugin_picker.rs::draw                                   | 7/34  | 巨大 draw。未起票
 # draw_strip は r.md #74 で 6 段以上の行が **8 -> 6 に減った** (最大段数 7 は不変)。
 # disclosure クロージャの `if contains { remove } else { insert }` が
@@ -242,7 +241,6 @@ FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result |
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi                     | 9/42 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::inspector_plugin_params     | 9/31 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/tick.rs::AppData::ensure_recording_lane_clip              | 8/64 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_video[cfg(windows)]      | 8/34 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::auto_warp_clip                   | 8/13 | edit_song 多重ループ。未起票

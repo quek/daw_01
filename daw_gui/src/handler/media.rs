@@ -268,10 +268,6 @@ impl AppData {
         target: ImportTrackTarget,
         target_beat: Option<f64>,
     ) {
-        use common::model::{
-            AudioContent, AudioEvent, ClipContent, VideoContent, VideoEvent,
-        };
-
         if paths.is_empty() {
             return;
         }
@@ -361,106 +357,30 @@ impl AppData {
                 self.media.pending_thumbnail_uploads.push(video_source_id);
             }
 
-            // 3) Video clip content → drop 先の行 (無ければ一番下に新規 video track)。
-            let Some(video_track_idx) = self.edit_song(|song| {
-                let v_content_id = song.alloc_content(
-                    ClipContent::Video(VideoContent {
-                        events: vec![VideoEvent {
-                            source_id: video_source_id,
-                            event_start_in_clip_beats: 0.0,
-                            event_length_beats: video_length_beats,
-                            source_start_micros: 0,
-                            source_end_micros: duration_micros,
-                            ..VideoEvent::default()
-                        }],
-                    }),
-                    display_name.clone(),
-                );
-                let video_track_idx = match dest_track_idx {
-                    Some(idx) => idx,
-                    None => {
-                        let video_track_id = song.alloc_track_id();
-                        song.tracks.push(track_with(|t| {
-                            t.id = video_track_id;
-                            t.name = format!("{display_name} (Video)");
-                        }));
-                        song.tracks.len() - 1
-                    }
-                };
-                place_new_clip(
-                    song,
-                    video_track_idx,
-                    cell_idx,
-                    next_start_beat,
-                    video_length_beats,
-                    v_content_id,
-                );
-                video_track_idx
-            }) else {
+            // 3) Video clip + (音声があれば) 対の音声 clip を 1 undo step で置く。
+            let audio_pair = imported.audio.zip(audio_source_id).map(|(audio, id)| {
+                let len = frames_to_beats(audio.buffer.frames, audio.buffer.sample_rate, bpm);
+                PairedAudio { source_id: id, frames: audio.buffer.frames, length_beats: len }
+            });
+            let placement = VideoPlacement {
+                dest_track_idx,
+                cell_idx,
+                start_beat: next_start_beat,
+                audio_tracks_inserted,
+            };
+            let video = VideoToPlace {
+                source_id: video_source_id,
+                duration_micros,
+                length_beats: video_length_beats,
+                display_name,
+            };
+            let Some(inserted_audio_track) =
+                self.edit_song(|song| place_video_pair(song, &video, audio_pair.as_ref(), placement))
+            else {
                 return;
             };
-
-            // 4) Paired audio clip + audio track (only when audio is
-            //    present in the source).
-            if let (Some(audio), Some(audio_src_id)) =
-                (imported.audio, audio_source_id)
-            {
-                let audio_length_beats = frames_to_beats(
-                    audio.buffer.frames,
-                    audio.buffer.sample_rate,
-                    bpm,
-                );
-                self.edit_song(|song| {
-                    let a_content_id = song.alloc_content(
-                        ClipContent::Audio(AudioContent {
-                            events: vec![AudioEvent {
-                                // v29: 新規 content の単一 event = id 1。
-                                id: 1,
-                                source_id: audio_src_id,
-                                event_start_in_clip_beats: 0.0,
-                                event_length_beats: audio_length_beats,
-                                source_start_frames: 0,
-                                source_end_frames: audio.buffer.frames,
-                                ..AudioEvent::default()
-                            }],
-                            next_event_id: 2,
-                        }),
-                        format!("{display_name} (audio)"),
-                    );
-                    // 対の音声トラックは video トラックの **直下** (既存行へ落としたとき) に
-                    // 挿し、 同じグループ階層に入れる (`add_track` の兄弟挿入と同じ規約)。
-                    // 一番下に新設した video トラックの場合は末尾 push = やはり直下。
-                    let audio_insert_at = match dest_track_idx {
-                        Some(idx) => idx + 1 + audio_tracks_inserted,
-                        None => song.tracks.len(),
-                    };
-                    let parent_group_id =
-                        song.tracks.get(video_track_idx).and_then(|t| t.parent_group_id);
-                    let audio_track_id = song.alloc_track_id();
-                    song.tracks.insert(
-                        audio_insert_at,
-                        track_with(|t| {
-                            t.id = audio_track_id;
-                            t.name = format!("{display_name} (Audio)");
-                            t.parent_group_id = parent_group_id;
-                        }),
-                    );
-                    // セルは対で同じ長さにして位相を揃える (セルの長さ = ループ 1 周)。
-                    // アレンジでは各自の自然長 (従来どおり)。
-                    let audio_place_len =
-                        if cell_idx.is_some() { video_length_beats } else { audio_length_beats };
-                    place_new_clip(
-                        song,
-                        audio_insert_at,
-                        cell_idx,
-                        next_start_beat,
-                        audio_place_len,
-                        a_content_id,
-                    );
-                });
-                if dest_track_idx.is_some() {
-                    audio_tracks_inserted += 1;
-                }
+            if inserted_audio_track && dest_track_idx.is_some() {
+                audio_tracks_inserted += 1;
             }
 
             next_start_beat += video_length_beats;
@@ -1211,6 +1131,131 @@ fn fit_to_bars(natural_beats: f64, time_sig: (u8, u8)) -> f64 {
     bars * bar
 }
 
+/// `place_video_pair` に渡す video 側の材料。
+#[cfg(windows)]
+struct VideoToPlace {
+    source_id: common::model::VideoSourceId,
+    duration_micros: u64,
+    length_beats: f64,
+    display_name: String,
+}
+
+/// `place_video_pair` に渡す対の音声 (無ければ `None`)。
+#[cfg(windows)]
+struct PairedAudio {
+    source_id: common::model::AudioSourceId,
+    frames: u64,
+    length_beats: f64,
+}
+
+/// video を置く行 / 列と、同じ drop 内で既に挿した音声トラック数。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct VideoPlacement {
+    /// drop 先の既存行 (index)。`None` = 一番下に新規 video トラック。
+    dest_track_idx: Option<usize>,
+    /// セルへの drop なら列 (表示順 index)。
+    cell_idx: Option<usize>,
+    start_beat: f64,
+    /// 既存行へ落としたとき、対の音声トラックを直下に挿すので 2 本目以降は
+    /// この分だけ下へずらす (video 行自身の index は動かない)。
+    audio_tracks_inserted: usize,
+}
+
+/// video clip を drop 先の行 (無ければ一番下の新規行) に置き、音声があれば対の
+/// 音声 clip を **直下に新設した行** (同じグループ階層) に置く。セルへの drop
+/// では両セルを同じ長さにして位相を揃える。戻り値 = 音声トラックを挿したか。
+#[cfg(windows)]
+fn place_video_pair(
+    song: &mut common::model::Song,
+    video: &VideoToPlace,
+    audio: Option<&PairedAudio>,
+    placement: VideoPlacement,
+) -> bool {
+    use common::model::{AudioContent, AudioEvent, ClipContent, VideoContent, VideoEvent};
+    let v_content_id = song.alloc_content(
+        ClipContent::Video(VideoContent {
+            events: vec![VideoEvent {
+                source_id: video.source_id,
+                event_start_in_clip_beats: 0.0,
+                event_length_beats: video.length_beats,
+                source_start_micros: 0,
+                source_end_micros: video.duration_micros,
+                ..VideoEvent::default()
+            }],
+        }),
+        video.display_name.clone(),
+    );
+    let video_track_idx = match placement.dest_track_idx {
+        Some(idx) => idx,
+        None => {
+            let video_track_id = song.alloc_track_id();
+            song.tracks.push(track_with(|t| {
+                t.id = video_track_id;
+                t.name = format!("{} (Video)", video.display_name);
+            }));
+            song.tracks.len() - 1
+        }
+    };
+    place_new_clip(
+        song,
+        video_track_idx,
+        placement.cell_idx,
+        placement.start_beat,
+        video.length_beats,
+        v_content_id,
+    );
+    let Some(audio) = audio else {
+        return false;
+    };
+    let a_content_id = song.alloc_content(
+        ClipContent::Audio(AudioContent {
+            events: vec![AudioEvent {
+                // v29: 新規 content の単一 event = id 1。
+                id: 1,
+                source_id: audio.source_id,
+                event_start_in_clip_beats: 0.0,
+                event_length_beats: audio.length_beats,
+                source_start_frames: 0,
+                source_end_frames: audio.frames,
+                ..AudioEvent::default()
+            }],
+            next_event_id: 2,
+        }),
+        format!("{} (audio)", video.display_name),
+    );
+    // 対の音声トラックは video トラックの **直下** (既存行へ落としたとき) に挿し、
+    // 同じグループ階層に入れる (`add_track` の兄弟挿入と同じ規約)。一番下に新設した
+    // video トラックの場合は末尾 push = やはり直下。
+    let audio_insert_at = match placement.dest_track_idx {
+        Some(idx) => idx + 1 + placement.audio_tracks_inserted,
+        None => song.tracks.len(),
+    };
+    let parent_group_id = song.tracks.get(video_track_idx).and_then(|t| t.parent_group_id);
+    let audio_track_id = song.alloc_track_id();
+    song.tracks.insert(
+        audio_insert_at,
+        track_with(|t| {
+            t.id = audio_track_id;
+            t.name = format!("{} (Audio)", video.display_name);
+            t.parent_group_id = parent_group_id;
+        }),
+    );
+    // セルは対で同じ長さにして位相を揃える (セルの長さ = ループ 1 周)。
+    // アレンジでは各自の自然長 (従来どおり)。
+    let audio_place_len =
+        if placement.cell_idx.is_some() { video.length_beats } else { audio.length_beats };
+    place_new_clip(
+        song,
+        audio_insert_at,
+        placement.cell_idx,
+        placement.start_beat,
+        audio_place_len,
+        a_content_id,
+    );
+    true
+}
+
 /// 取り込んだクリップを行へ置く **唯一の口**。
 ///
 /// `cell_scene` が `Some` ならランチャーのセルとして置く (`start_beat` は捨てて
@@ -1308,13 +1353,12 @@ mod video_import_target_tests {
             return;
         };
         let mut app = headless_app();
-        app.song_doc.replace_song({
-            let mut song = common::model::Song::default();
-            song.tracks = vec![
+        app.song_doc.replace_song(common::model::Song {
+            tracks: vec![
                 track_with(|t| { t.id = 10; t.name = "A".into(); }),
                 track_with(|t| { t.id = 20; t.name = "B".into(); }),
-            ];
-            song
+            ],
+            ..Default::default()
         });
         app.action_import_video(
             vec![src],
@@ -1349,13 +1393,12 @@ mod video_import_target_tests {
             return;
         };
         let mut app = headless_app();
-        app.song_doc.replace_song({
-            let mut song = common::model::Song::default();
-            song.tracks = vec![
+        app.song_doc.replace_song(common::model::Song {
+            tracks: vec![
                 track_with(|t| { t.id = 10; t.parent_group_id = Some(99); }),
                 track_with(|t| { t.id = 20; }),
-            ];
-            song
+            ],
+            ..Default::default()
         });
         app.action_import_video(vec![src], ImportTrackTarget::Track(0), Some(4.0));
         let song = app.song_doc.song();

@@ -23,12 +23,12 @@ pub(super) const MAX_THUMBNAIL_TILES: u32 = 512;
 /// M14 Phase 72 (daw_01 #044) / r.md #68: video / image clip のサムネイル敷き詰め方。
 ///
 /// **clip 矩形にフィットさせない**。 サムネイルも clip の「中身」 なので、
-/// (a) 1 枚の寸法は **行高 × native aspect** で決まり clip の長さには一切依存しない、
-/// (b) 並べる位相は **content 原点**に固定する、 (c) はみ出す分は clip 矩形で切り抜く。
+/// 1. 1 枚の寸法は **行高 × native aspect** で決まり clip の長さには一切依存しない、
+/// 2. 並べる位相は **content 原点**に固定する、 3. はみ出す分は clip 矩形で切り抜く。
 ///
 /// 旧実装 (`aspect_fit_rect`) は clip 矩形の中央に 1 枚を letterbox 配置していたため、
-/// (a) clip を伸ばすとサムネイルが水平に滑り、 (b) 細い clip では拡大縮小し、
-/// (c) 長い clip を横スクロールして先頭が画面外に出ると 1 枚も見えなくなっていた。
+/// 1. clip を伸ばすとサムネイルが水平に滑り、 2. 細い clip では拡大縮小し、
+/// 3. 長い clip を横スクロールして先頭が画面外に出ると 1 枚も見えなくなっていた。
 ///
 /// 敷き詰めは REAPER の **Preferences → Video/REX/Misc → still image thumbnail
 /// display mode = "Center/tile image"** と同じ流儀 (同じ 1 枚を隙間なく繰り返す)。
