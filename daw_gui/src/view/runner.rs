@@ -1102,8 +1102,13 @@ impl ApplicationHandler<AppEvent> for Runner {
         // r.md #49: tick 系だけは「画面に出る値が変わったか」で再描画を決める。
         // 毎秒 30 回届くのに中身が同じ (停止中は playhead も peak も動かない) ため、
         // 従来はこれだけで 30fps 描き続けていた。他の event は**従来どおり無条件に
-        // 再描画**する — 判定対象を 5 つに閉じ込めることで、残り数百の variant に
-        // 「立て忘れ = 画面が固まる」という新しい失敗モードを持ち込まない。
+        // 再描画**する — 判定対象を「30Hz poll thread が出す tick」に閉じ込めることで、
+        // 残り数百の variant に「立て忘れ = 画面が固まる」という新しい失敗モードを
+        // 持ち込まない。
+        //
+        // `LauncherRowsTick` (r.md #87) と `Sampler(Tick)` (Global Sampler) も同じ
+        // poll thread が毎 tick 送る。ここに入れ忘れると、停止中でも窓がアクティブな
+        // 限り無条件再描画が 30fps で走り続け、#49 の省電力が事実上無効になる。
         let is_tick = matches!(
             event,
             AppEvent::Tick { .. }
@@ -1112,6 +1117,8 @@ impl ApplicationHandler<AppEvent> for Runner {
                 | AppEvent::MasterMeterTick(_)
                 | AppEvent::MetricsTick { .. }
                 | AppEvent::SystemMetricsTick { .. }
+                | AppEvent::LauncherRowsTick(_)
+                | AppEvent::Sampler(crate::event_sampler::SamplerEvent::Tick(_))
         );
         let before = is_tick.then(|| state.app.tick_visual_fingerprint());
         state.app.handle_event(event);

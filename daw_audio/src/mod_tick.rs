@@ -179,9 +179,12 @@ impl ModTickRunner {
             }
         }
         let old_plan = std::mem::replace(&mut self.plan, plan);
+        // 深さが動く変調も slot と同じ `MAX_SLOTS` で切る (`depth_row` / `depth_ids` /
+        // `publish` の器がその大きさ)。溢れた群は「深さが動かない」扱いに degrade する
+        // (= モデルの深さのまま鳴る)。ここは RT なので、切らずに extend すると再確保になる。
         self.depth_ids.clear();
         self.depth_ids
-            .extend(self.plan.depth_groups.iter().map(|g| g.routing_id));
+            .extend(self.plan.depth_groups.iter().take(MAX_SLOTS).map(|g| g.routing_id));
         self.marks.clear();
         self.plane.reset(&[], &[], MOD_TICK_FRAMES);
         self.first_tick = i64::MIN;
@@ -358,7 +361,7 @@ impl ModTickRunner {
         }
         // r.md #89 Q9: 深さも刻みごとに動く (深さを動かしていなければ空 = ゼロコスト)。
         self.depth_row.clear();
-        for g in &self.plan.depth_groups {
+        for g in self.plan.depth_groups.iter().take(MAX_SLOTS) {
             self.depth_row
                 .push(self.rt.depth_for(&self.plan, g.routing_id).unwrap_or(g.base_depth));
         }
@@ -480,7 +483,7 @@ impl ModTickRunner {
         }
         // r.md #89 Q9: 深さの実効値も一緒に出す — GUI の深さリング / 到達値表示が
         // 「動いている深さ」を見られないと、ラックの表示と音が食い違う。
-        for (i, g) in self.plan.depth_groups.iter().enumerate() {
+        for (i, g) in self.plan.depth_groups.iter().enumerate().take(MAX_SLOTS) {
             self.publish.push_depth(
                 g.routing_id,
                 row.depths.get(i).copied().unwrap_or(g.base_depth),

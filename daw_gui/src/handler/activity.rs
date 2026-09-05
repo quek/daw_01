@@ -169,6 +169,34 @@ impl AppData {
         mix(u64::from(self.recording.live));
         mix(u64::from(self.transport.preroll_remaining > 0));
         mix(u64::from(self.transport.is_playing));
+        // r.md #87: ランチャーの走行状態 (`LauncherRowsTick`)。停止中は行が動かない
+        // ので収束する。進捗はセルの幅 (数百 px) より細かく見ても意味が無い。
+        for (key, row) in &self.launcher.running {
+            mix(*key);
+            mix(u64::from(row.state));
+            mix(u64::from(row.playing_clip_id));
+            mix(u64::from(row.queued_clip_id));
+            mix(quantize(row.progress, 1024.0));
+            mix(row.launch_beat.to_bits());
+        }
+        // Global Sampler / MIDI Capture タブ: 見えているときだけ時間軸の進みを混ぜる。
+        // 閉じていれば `Sampler(Tick)` は画面を変えないので描き直さない。
+        // タブ番号は `handler::sampler::toggle_bottom_tab` の引数と同じ (2 = Sampler、
+        // 3 = MIDI Capture)。
+        match self.ui_prefs.bottom_panel {
+            Some(2) => {
+                // 波形は 1 バケツ (`BUCKET_FRAMES`) 単位でしか変わらない。
+                mix(self.sampler.write_frames / crate::state::sampler::BUCKET_FRAMES);
+                mix(self.sampler.segments.len() as u64);
+            }
+            Some(3) => {
+                // 帯は wall-clock で流れる (`midi_capture_tab` が `wall_clock_ns()` を
+                // 引く)。tick 周期 (33ms) で量子化した時刻を混ぜて、開いている間だけ
+                // 毎 tick 描き直す。
+                mix(crate::state::sampler::wall_clock_ns() / 33_000_000);
+            }
+            _ => {}
+        }
         h
     }
 
