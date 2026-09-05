@@ -468,14 +468,48 @@ impl AppData {
         self.audio_editor_view_state().len_beats
     }
 
-    /// 選択範囲と**交差**するアレンジのクリップ群 (開始拍順)。
+    /// 「選択されているクリップ」 (開始拍順)。 **クリップを対象にする操作
+    /// (インスペクタの各節 / 改名 / preview の選択枠 / ノートの貼り付け先 / 声) は
+    /// すべてここから導出する** — 別の集合を持たない。
     ///
-    /// これが「選択されているクリップ」の定義 — 別の集合を持たず、範囲から毎回導出する。
+    /// 選択の SSoT は 2 面あり排他 (`select_launcher_cell` がアレンジの範囲を降ろし、
+    /// [`Self::drop_cell_selection_if_arrangement`] がセルを降ろす) なので、択一で足りる:
+    /// - ランチャーのセル選択が生きていれば**そのセル** (トラック行のみ。 レーン行の
+    ///   セルは `Clip` ではないので入らない)。 判定は **セル選択が生きているか** 1 つだけ
+    ///   で、 last-wins タグ (`last_edit_select`) は見ない — あれは「Delete / Cut が
+    ///   どの面に効くか」 の関心事で、 ピアノロール内でノートを選んだだけで `Notes` へ
+    ///   倒れる (r.md #90)。
+    /// - そうでなければ [`Self::arrangement_selected_clip_refs`]。
+    ///
+    /// 以前はアレンジ側しか導出しておらず、 セルを選ぶとインスペクタの Image / Text /
+    /// Audio Event 節が出ない・preview に選択枠が出ない・F2 改名やノート貼り付けが
+    /// 「クリップ未選択」 になっていた (r.md #97)。 `Track::clip_by_id` はセルも引けるので、
+    /// 呼び出し側は key の出所を区別しなくてよい。
+    pub fn selected_clip_refs(&self) -> Vec<ClipKey> {
+        if self.has_live_launcher_cells() {
+            return self
+                .live_launcher_cells()
+                .into_iter()
+                .filter_map(|cell| match cell {
+                    crate::event_launcher::LauncherCellKey::Track(k) => Some(k),
+                    crate::event_launcher::LauncherCellKey::Lane(_) => None,
+                })
+                .collect();
+        }
+        self.arrangement_selected_clip_refs()
+    }
+
+    /// 選択範囲と**交差**する**アレンジの**クリップ群 (開始拍順)。 セルは含まない。
+    ///
     /// 交差 (完全内包ではない) なので、範囲をかすめただけのクリップもインスペクタや
     /// 改名の対象に入る (`docs/plan_range_selection.md` §3)。 一方 Delete / `J` /
     /// ミュートなどの**範囲操作は範囲そのものに効く**ので、かすめたクリップが
     /// 丸ごと消えることはない。
-    pub fn selected_clip_refs(&self) -> Vec<ClipKey> {
+    ///
+    /// 直接呼んでよいのはアレンジ widget の選択ハイライト
+    /// (`ArrangementFrame::selected_clips` は帯のセルを混ぜない契約 —
+    /// `LauncherView::selected` の doc) だけ。 それ以外は [`Self::selected_clip_refs`]。
+    pub fn arrangement_selected_clip_refs(&self) -> Vec<ClipKey> {
         let Some(sel) = self.selection.time.as_ref() else {
             return Vec::new();
         };
@@ -502,38 +536,17 @@ impl AppData {
     }
 
     /// ピアノロールに同時表示する MIDI クリップ群を開始拍順で返す
-    /// (範囲と交差するクリップ → MIDI のみ filter)。
+    /// ([`Self::selected_clip_refs`] → MIDI のみ filter)。 ランチャーのセルを
+    /// 選んでいるときは**そのセル**が開く (セルは時間軸に居ないので範囲では
+    /// 表せず、唯一のオブジェクト選択として残っている —
+    /// `docs/plan_range_selection.md` §2.2。 判定の根拠は `selected_clip_refs` の doc)。
     ///
     /// 範囲が部分的にしか掛かっていないクリップも**表示する** — 範囲でノートを
     /// 編集する用途 (Live §10.8.3 の multi-clip editing) がそこで成立する。
     /// **この順序が packed note id の `clip_slot` の SSoT** (`decode_note_id` と必ず一致させる)。
     #[must_use]
     pub fn shown_pianoroll_clips(&self) -> Vec<ClipKey> {
-        // ランチャーのセルを選んでいるときは**そのセル**を開く。 グリッドに時間軸が
-        // 無いのでセルは範囲では表せず、唯一のオブジェクト選択として残っている
-        // (`docs/plan_range_selection.md` §2.2)。
-        //
-        // 判定は **セル選択が生きているか** 1 つだけ。 last-wins タグ
-        // (`last_edit_select`) は「Delete / Cut がどの面に効くか」を持つ別の関心事で、
-        // ピアノロール内でノートを選んだだけで `Notes` へ倒れる。 これを表示の
-        // 判定に流用していたので、**セルを開いた直後にピアノロール内をクリック
-        // しただけで「クリップが選択されていません」** になっていた (r.md #90)。
-        // アレンジの面を選んだらセル選択は排他で降りる
-        // (`drop_cell_selection_if_arrangement`) ので、タグ無しでも取り違えない。
-        if self.has_live_launcher_cells() {
-            // レーン行のセルはピアノロールを持たない (曲線はレーン上で直接編集する)
-            // ので、トラック行のセルだけを残す。
-            return self
-                .live_launcher_cells()
-                .into_iter()
-                .filter_map(|cell| match cell {
-                    crate::event_launcher::LauncherCellKey::Track(k) => Some(k),
-                    crate::event_launcher::LauncherCellKey::Lane(_) => None,
-                })
-                .filter(|k| self.is_midi_clip(*k))
-                .collect();
-        }
-        // トラック行から拾ったクリップに加えて、**鍵盤行が直接指しているクリップ**も
+        // トラック行 / セルから拾ったクリップに加えて、**鍵盤行が直接指しているクリップ**も
         // 表示集合に入れる。 ノート選択の範囲は鍵盤行が主役なので、これが無いと
         // 「ノートを選んだ瞬間にピアノロールが空になる」。
         let mut out = self.selected_clip_refs();
@@ -859,10 +872,11 @@ impl AppData {
         }
     }
 
-    /// inspector の編集対象クリップ群 = **範囲と交差するクリップ全体**
-    /// (`docs/plan_range_selection.md` 質問 27b)。 範囲をかすめただけのクリップも
-    /// 対象に入る — 属性操作 (改名 / 色 / ゲイン / 声) はクリップというオブジェクトに
-    /// 効くので、範囲操作 (Delete / `J` / ミュート) とは対象の決め方が違う。
+    /// inspector の編集対象クリップ群 = [`Self::selected_clip_refs`] そのもの
+    /// (セルを選んでいればそのセル群、 アレンジなら**範囲と交差するクリップ全体** —
+    /// `docs/plan_range_selection.md` 質問 27b)。 範囲をかすめただけのクリップも
+    /// 対象に入る — 属性操作 (改名 / 色 / ゲイン / 声 / 画像の位置) はクリップという
+    /// オブジェクトに効くので、範囲操作 (Delete / `J` / ミュート) とは対象の決め方が違う。
     pub(crate) fn for_each_inspector_target(&self, mut f: impl FnMut(ClipKey)) {
         for r in self.selected_clip_refs() {
             f(r);

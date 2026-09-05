@@ -139,16 +139,20 @@ impl AppData {
     ) {
         let (lo, hi) = if pitch_lo <= pitch_hi { (pitch_lo, pitch_hi) } else { (pitch_hi, pitch_lo) };
         let shown = self.shown_pianoroll_clips();
+        let song = self.song_doc.song();
         let mut lanes: Vec<LaneRef> = Vec::new();
         for key in &shown {
+            // 鍵盤行に加えてクリップのトラック行も入れる — アレンジ側でそのクリップが
+            // 選択表示になり、 `shown_pianoroll_clips` もトラック行から解決できる。
+            // **セルには足さない** (`Song::content_lanes_for` が契約の SSoT)。 手で
+            // `LaneRef::Track` を足していたので、 セルのピアノロールでノートを囲んだ
+            // 瞬間にセル選択が排他で降り、 エディタとインスペクタが空になっていた。
             for pitch in lo..=hi {
-                lanes.push(LaneRef::KeyTrack { clip: *key, pitch });
-            }
-            // クリップのトラック行も入れる — アレンジ側でそのクリップが選択表示になり、
-            // `shown_pianoroll_clips` もトラック行から解決できる。
-            let t = LaneRef::Track(key.track_id);
-            if !lanes.contains(&t) {
-                lanes.push(t);
+                for lane in song.content_lanes_for(*key, LaneRef::KeyTrack { clip: *key, pitch }) {
+                    if !lanes.contains(&lane) {
+                        lanes.push(lane);
+                    }
+                }
             }
         }
         match common::model::TimeSelection::new(start_beat, end_beat, lanes) {
@@ -350,7 +354,7 @@ mod launcher_cell_editing_tests {
     //! 壊れ方は 2 通りあって、どちらも同じ根 (`Song::content_lanes_for`) を持つ。
     use std::sync::Arc;
 
-    use common::model::{Clip, ClipKey, Track};
+    use common::model::{Clip, ClipContent, ClipKey, ImageContent, ImageEvent, Track};
     use common::protocol::{AudioCommand, PluginCommand};
     use tokio::sync::mpsc;
 
@@ -359,6 +363,7 @@ mod launcher_cell_editing_tests {
         BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
     };
     use crate::event_launcher::{LauncherCellKey, LauncherEvent, LauncherRow};
+    use crate::widgets::select_modifier::SelectModifier;
 
     fn build_app() -> AppData {
         let (audio_tx, _a) = mpsc::unbounded_channel::<AudioCommand>();
@@ -493,5 +498,75 @@ mod launcher_cell_editing_tests {
             "セル選択は降りる (選択枠も消える)"
         );
         assert_eq!(app.shown_pianoroll_clips(), vec![arranged], "ピアノロールはアレンジへ移る");
+    }
+
+    /// セルの中身を画像 1 event (x = 0.25) にする。
+    fn make_cell_image(app: &mut AppData, cell: ClipKey) {
+        app.edit_song(|song| {
+            let content_id = song
+                .track_by_id(cell.track_id)
+                .and_then(|t| t.clip_by_id(cell.clip_id))
+                .map(|c| c.content_id)
+                .expect("セルが居る");
+            song.clip_contents.insert(
+                content_id,
+                ClipContent::Image(ImageContent {
+                    events: vec![ImageEvent {
+                        x: 0.25,
+                        event_length_beats: 4.0,
+                        ..ImageEvent::default()
+                    }],
+                }),
+            );
+        });
+    }
+
+    /// r.md #97: セルを選ぶとインスペクタの対象になり、 Image Event 節 (x / y ...) が
+    /// 出て、 その編集がセルに効く。 曲頭に居るだけのアレンジのクリップは混ざらない。
+    ///
+    /// 以前は「選択されているクリップ」 の導出 (`selected_clip_refs`) がアレンジの
+    /// 範囲しか見ておらず、 セル選択中はインスペクタが「クリップ未選択」 扱いだった。
+    #[test]
+    fn セルを選ぶと画像パラメータがインスペクタに出て編集がセルに効く() {
+        let mut app = build_app();
+        let cell = seed_with_cell(&mut app);
+        make_cell_image(&mut app, cell);
+        let _arranged = put_arrangement_clip(&mut app);
+
+        app.select_launcher_cell(LauncherCellKey::Track(cell), SelectModifier::Single);
+
+        assert_eq!(app.inspector_target_refs(), vec![cell], "対象はセルだけ");
+        assert_eq!(app.selected_clip_ref(), Some(cell));
+        assert_eq!(
+            app.arrangement_selected_clip_refs(),
+            Vec::<ClipKey>::new(),
+            "アレンジ widget のハイライト集合にセルは混ざらない"
+        );
+        let summary = app.inspector_image_event_summary().expect("Image Event 節が出る");
+        assert_eq!(summary.target, cell);
+        assert_eq!(summary.x, 0.25);
+
+        app.handle_event(AppEvent::SetClipImageX { target: cell, value: 0.75 });
+        assert_eq!(app.image_first_event(cell, |e| e.x), Some(0.75), "編集がセルの event に届く");
+    }
+
+    /// セルを開いたあとピアノロールの中を触っても (= 面タグが `Notes` へ倒れても)
+    /// インスペクタの対象はセルのまま (r.md #90 と同じ根拠、 対象の判定はタグを見ない)。
+    #[test]
+    fn ピアノロール内を触ってもインスペクタの対象はセルのまま() {
+        let mut app = build_app();
+        let cell = seed_with_cell(&mut app);
+        app.open_cell_editor(LauncherCellKey::Track(cell));
+        app.handle_event(AppEvent::AddNote {
+            key: cell,
+            start_beat: 1.0,
+            duration: 1.0,
+            pitch: 60,
+        });
+        app.set_pianoroll_rect_selection(0.5, 1.5, 59, 61);
+
+        assert_eq!(app.shown_pianoroll_clips(), vec![cell], "ノートを囲んでもセルは開いたまま");
+        assert_eq!(app.inspector_target_refs(), vec![cell]);
+        assert_eq!(app.selected_clip_ref(), Some(cell));
     }
 }
