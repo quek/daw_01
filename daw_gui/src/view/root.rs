@@ -133,10 +133,18 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // ユーザーの比率へ自動で戻り、復元用の状態を別に持たずに済む。アレンジ側が
     // 潰れきらないよう下限だけ置く (画面が足りないときはそこで頭打ちになり、
     // 以降はフェーダーが縮む)。
-    let split_ratio = if app.ui_prefs.bottom_panel == Some(0) && right_rect.h > 0.0 {
+    //
+    // r.md #99: split の drag は **表示比率** (= 差し引いた後) で来るので、保存する
+    // ときは差し引いた分を足し戻す。足し戻さないとリリースの次フレームでもう一度
+    // 差し引かれ、EQ / Comp を開いている間だけ「離した瞬間に帯の高さぶん縮む」。
+    let extra_frac = if app.ui_prefs.bottom_panel == Some(0) && right_rect.h > 0.0 {
+        mixer_strips::extra_head_height(app) / right_rect.h
+    } else {
+        0.0
+    };
+    let split_ratio = if extra_frac > 0.0 {
         const MIN_ARRANGEMENT_FRAC: f32 = 0.15;
-        let extra = mixer_strips::extra_head_height(app) / right_rect.h;
-        (split_ratio - extra).max(MIN_ARRANGEMENT_FRAC)
+        (split_ratio - extra_frac).max(MIN_ARRANGEMENT_FRAC)
     } else {
         split_ratio
     };
@@ -153,7 +161,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
                 // 「見方の都合」なので `*` は立てない (ズーム / スクロールと同じ扱い、
                 // `project_dirty_flag_rule`)。
                 Edit::mutate(move |app: &mut AppData| {
-                    app.ui_prefs.arrangement_split_ratio = next;
+                    app.ui_prefs.arrangement_split_ratio = next + extra_frac;
                 })
             },
             |ui, arrangement_rect, bottom_rect| {
