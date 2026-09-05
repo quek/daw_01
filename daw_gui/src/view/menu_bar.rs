@@ -41,6 +41,10 @@ fn event_item<'a>(
 /// `draw` の中に直接書かないのは `add_launcher_layout_items` と同じ理由 (不変条件 9)。
 fn add_mixer_toggle_item<'a>(m: &mut daw_ui_core::widgets::menu::MenuBuilder<'a, AppData>) {
     event_item(m, "ミキサー", "daw.toggle_mixer_panel", AppEvent::ToggleMixerPanel);
+    // Global Sampler / MIDI Capture (`docs/plan_global_sampler.md`): 下部パネルの
+    // タブ 2 / 3。ミキサーと同じトグル規則 (キーは割り当てない = hint 無し)。
+    event_item(m, "Sampler", "daw.toggle_sampler_panel", AppEvent::Sampler(crate::event_sampler::SamplerEvent::TogglePanel));
+    event_item(m, "MIDI Capture", "daw.toggle_midi_capture_panel", AppEvent::Sampler(crate::event_sampler::SamplerEvent::ToggleMidiCapturePanel));
 }
 
 /// r.md #87: View メニューの「両方 / ランチャーのみ / アレンジのみ」 3 項目。

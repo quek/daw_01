@@ -170,6 +170,8 @@ pub struct UiPrefs {
     /// 曲の内容ではなく **合成品質のつまみ**なのでプロジェクトではなく app_config に持つ。
     /// 読むときは `AppData::voicevox_chunk_secs()` (有効範囲へクランプ) を通す。
     pub voicevox_chunk_secs: f32,
+    /// Global Sampler / MIDI Capture が溜める長さ (秒)。SSoT は `app_config.json`。
+    pub sampler_seconds: u32,
 
     pub is_help_open: bool,
 

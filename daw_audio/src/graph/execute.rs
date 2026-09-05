@@ -300,7 +300,10 @@ pub fn process_track_owned(
     // group-with-instrument prefix (`skip_strip`) the meaningful pre-FX tap is
     // the summed bus before the suffix FX, captured in pass 2
     // (`run_group_fx_chain`), so skip the pass-1 capture here.
-    if !skip_strip && song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)) {
+    if !skip_strip
+        && (scratch.force_prefx_snapshot
+            || song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)))
+    {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
@@ -465,6 +468,7 @@ pub fn process_track_owned(
         .iter()
         .any(|s| s.mode == common::model::SendMode::PreFader);
     if has_prefader_send
+        || scratch.force_prefader_snapshot
         || song.is_some_and(|s| track_needs_prefader_snapshot(s, song_track.id))
     {
         scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
@@ -886,7 +890,7 @@ fn run_group_fx_chain(
     // source (guarded — untouched groups skip the memcpy). For a
     // group-with-instrument this is the summed bus *before the suffix FX* (the
     // instrument prefix already ran), which is the right pre-FX tap point.
-    if track_needs_prefx_snapshot(song, track_id) {
+    if scratch.force_prefx_snapshot || track_needs_prefx_snapshot(song, track_id) {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }

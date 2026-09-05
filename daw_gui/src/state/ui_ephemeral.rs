@@ -138,6 +138,8 @@ pub struct UiEphemeral {
     /// 毎フレーム設定ファイルを書くことになる)。マスターフェーダーの undo bracket
     /// (`master_gain_dragging`) と同じ edge 検出の流儀。
     pub voicevox_chunk_editing: bool,
+    /// Global Sampler の「長さ (秒)」欄をドラッグ / 入力中か (立ち下がりで確定)。
+    pub sampler_secs_editing: bool,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。

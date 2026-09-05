@@ -5,6 +5,7 @@ pub mod arrangement_view;
 pub mod color_picker_overlay;
 pub mod audio_editor;
 pub mod bottom_panel;
+pub mod capture_drop;
 /// Ctrl+C / Ctrl+X / Ctrl+V / D — 編集面ごとのクリップボード操作 (root.rs から分離)。
 pub mod clipboard_ops;
 pub mod dirty_guard_modal;
@@ -17,6 +18,8 @@ pub mod export_range_modal;
 pub mod font_picker;
 /// r.md #87: クリップランチャーのキーボード操作と widget イベントの流し込み。
 pub mod launcher_keys;
+pub mod midi_capture_tab;
+pub mod sampler_tab;
 /// ランチャー widget の intent を `AppEvent` へ橋渡しする (view → handler の唯一の口)。
 pub mod launcher_bridge;
 pub mod load_overlay;

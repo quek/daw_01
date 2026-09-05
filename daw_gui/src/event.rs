@@ -656,6 +656,9 @@ pub enum AppEvent {
     /// Bitwig の `B` 流のトグルで、「開く前の状態」は覚えない。見方の都合なので
     /// Undo / dirty 対象外 (`ViewState` には保存する)。
     ToggleMixerPanel,
+    /// Global Sampler / MIDI Capture (`docs/plan_global_sampler.md`)。`Launcher` と同じ
+    /// 「1 arm = 1 サブ enum」。
+    Sampler(crate::event_sampler::SamplerEvent),
 
     // -------- Arrangement / clip operations -------------------------------
     SelectClip { target: ClipKey, additive: bool },
@@ -1848,6 +1851,7 @@ impl AppEvent {
             // ラベルの SSoT はサブ enum 側 (variant が 25 個あるので、
             // ここに並べると「巨大 match」 が 2 か所に増える)。
             E::Launcher(ev) => ev.undo_label(),
+            E::Sampler(ev) => ev.undo_label(),
 
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",

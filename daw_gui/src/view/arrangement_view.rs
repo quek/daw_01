@@ -52,7 +52,7 @@ fn track_index_at_y(
 ///   新規 track が作られる」の修正)。当たった track_id を `song.tracks` の index に
 ///   変換し、master 行 (`song.tracks` に居ない) や、どの行にも当たらない (= track の
 ///   無い下の余白) は `NewTrackBottom` = 一番下に新規 track を作って貼る。
-fn file_drop_target(
+pub(crate) fn file_drop_target(
     app: &AppData,
     resp: &ArrangementResponse,
     pos: (f32, f32),
@@ -924,6 +924,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }));
         }
     }
+    crate::view::capture_drop::take_capture_drops(app, ui, &resp, canvas_area, scroll_beat, zoom, &arr_snap);
 
     // Phase 1 PR7 (`docs/plan_audio_clip.md` §3.3): Split (E) は
     // 「マウスカーソル位置」 で分割するため、 毎フレーム mouse pos →

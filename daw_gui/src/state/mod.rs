@@ -17,6 +17,8 @@ pub mod ui_ephemeral;
 pub mod activity;
 /// r.md #87: クリップランチャーの session-only な UI 状態。
 pub mod launcher_ui;
+pub mod sampler;
+pub mod midi_capture;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
@@ -30,6 +32,8 @@ pub use recording::RecordingState;
 pub use ui_prefs::UiPrefs;
 pub use ui_ephemeral::{ScrubGesture, UiEphemeral};
 pub use launcher_ui::{LauncherFocus, LauncherUiState};
+pub use sampler::SamplerState;
+pub use midi_capture::MidiCaptureState;
 
 /// GUI プロセスの全アプリ状態 (composition of state groups)。
 pub struct AppData {
@@ -73,6 +77,10 @@ pub struct AppData {
     /// `UiHost::set_palette` に流し込む (変化していたら描画キャッシュを捨てる)。
     /// 選択中の id は `theme.id` が持つので別フィールドに複製しない。
     pub theme: crate::theme::Theme,
+    /// Global Sampler (`docs/plan_global_sampler.md`): 常時録音リングの GUI 側状態。
+    pub sampler: SamplerState,
+    /// MIDI Capture: MIDI 入力の常時捕捉。
+    pub midi_capture: MidiCaptureState,
 }
 
 impl AppData {

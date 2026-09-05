@@ -110,6 +110,11 @@ pub struct TrackScratch {
     /// allocated once. docs/plan_modulation_followups.md §1.
     pub pre_fx_l: Vec<f32>,
     pub pre_fx_r: Vec<f32>,
+    /// Global Sampler (`docs/plan_global_sampler.md` §3.2): 録音源がこの track の
+    /// PreFx / PostFx tap のとき engine が buffer ごとに立てる。`Song` に無い tap
+    /// なので `track_needs_*_snapshot` (= `any_tap_at`) では拾えない。
+    pub force_prefx_snapshot: bool,
+    pub force_prefader_snapshot: bool,
     /// 内蔵チャンネルストリップ (コンプ + EQ) の状態 (`docs/plan_channel_strip.md`)。
     /// バイクワッドの遅延・平滑済みゲイン・係数キャッシュを buffer 間で保つ。
     /// 固定サイズなので `TrackScratch` に埋めても RT で確保は起きない。
@@ -155,6 +160,8 @@ impl TrackScratch {
             pre_fader_r: vec![0.0; MAX_FRAMES],
             pre_fx_l: vec![0.0; MAX_FRAMES],
             pre_fx_r: vec![0.0; MAX_FRAMES],
+            force_prefx_snapshot: false,
+            force_prefader_snapshot: false,
             strip: channel_strip::StripState::default(),
             strip_gr_db: 0.0,
         }

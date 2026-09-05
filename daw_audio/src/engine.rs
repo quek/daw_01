@@ -73,6 +73,10 @@ pub enum EngineCommand {
     /// 鍵盤プレビューの note-off (gui_01 #055)。 `track` は note-on と同じ
     /// Vec index。
     PreviewNoteOff { track: usize, pitch: u8 },
+    /// Global Sampler の試聴 (`docs/plan_global_sampler.md` §3.2)。リングの
+    /// `[start, end)` を master へ加算する。
+    SamplerPreview { start: u64, end: u64 },
+    SamplerPreviewStop,
 }
 
 #[repr(u8)]
@@ -462,6 +466,11 @@ pub struct EngineShared {
     pub plugin_refs: ArcSwap<PluginRefs>,
     /// worker rig のミラー (export / notify 用)。
     pub worker: ArcSwapOption<WorkerRig>,
+    /// Global Sampler のリングのミラー (bundle に載せる元)。
+    pub sampler: ArcSwapOption<crate::sampler::SamplerRig>,
+    /// MIDI Capture の試聴シーケンス。recv loop が載せ、RT が buffer 頭で読む
+    /// (`None` = 停止)。差し替えは `generation` で検出する。
+    pub preview_sequence: ArcSwapOption<crate::sampler::PreviewSequence>,
     /// Set by the export thread while it owns the audio path. CPAL
     /// callback skips its `process_buffer` and writes silence so the
     /// export render can drive `plugin.process()` exclusively.
@@ -617,6 +626,8 @@ impl EngineShared {
             delivered_engines_per_track: std::sync::Mutex::new(Vec::new()),
             plugin_refs: ArcSwap::from_pointee(HashMap::new()),
             worker: ArcSwapOption::empty(),
+            sampler: ArcSwapOption::empty(),
+            preview_sequence: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
             export_cancel: AtomicBool::new(false),
             live_parked: AtomicBool::new(false),
@@ -687,6 +698,9 @@ pub struct RtBundle {
     pub plugin_refs: Arc<PluginRefs>,
     /// worker rig (Arc clone)。`None` = pool 未 open / close 済。
     pub worker: Option<Arc<WorkerRig>>,
+    /// Global Sampler のリング (Arc clone、`docs/plan_global_sampler.md` §3.2)。
+    /// `None` = 開いていない。snapshot field (worker と同じ扱い)。
+    pub sampler: Option<Arc<crate::sampler::SamplerRig>>,
     /// **delta**: r.md #89 のクロス変調評価計画と、それに合わせて
     /// **off-thread で `install` 済み**の RT 状態。`None` = 据え置き。
     ///
@@ -811,6 +825,12 @@ pub struct LocalState {
     pub plugin_refs: Arc<PluginRefs>,
     /// RT が使う worker rig (bundle 由来 Arc clone)。
     pub worker: Option<Arc<WorkerRig>>,
+    /// Global Sampler のリング (bundle 由来 Arc clone)。
+    pub sampler: Option<Arc<crate::sampler::SamplerRig>>,
+    /// Global Sampler の RT 走行状態 (セグメント / 試聴)。
+    pub sampler_rt: crate::sampler::SamplerRt,
+    /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
+    pub frames_rendered: u64,
     /// r.md #87: クリップランチャーの走行状態 (行ごとの予約 / フォローアクション /
     /// 供給元)。**`Song` には書き戻さない** — 詳細は
     /// [`crate::launcher::LauncherRuntime`] の doc。事前確保のみで RT で伸びない。
@@ -874,6 +894,9 @@ impl LocalState {
             tempo_map: common::tempo_map::TempoMap::from_song(&Song::default()),
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
+            sampler: None,
+            sampler_rt: crate::sampler::SamplerRt::new(),
+            frames_rendered: 0,
             launcher: crate::launcher::LauncherRuntime::new(),
             mod_tick: crate::mod_tick::ModTickRunner::new(),
             follower_cols: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
@@ -919,6 +942,17 @@ impl LocalState {
         let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
         let old_refs = std::mem::replace(&mut self.plugin_refs, Arc::clone(&new.plugin_refs));
         let old_worker = std::mem::replace(&mut self.worker, new.worker.take());
+        // Global Sampler: 世代が変わった (別 Arc) ら走行状態を捨てる。旧リングは
+        // recycle bundle で off-thread unmap。
+        let sampler_changed = !match (&self.sampler, &new.sampler) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let old_sampler = std::mem::replace(&mut self.sampler, new.sampler.take());
+        if sampler_changed {
+            self.sampler_rt.reset();
+        }
 
         // r.md #89: plan / 位相表の差し替え。旧 RT 状態と旧表は recycle bundle に
         // 載せて off-thread で drop する (`ModRuntime` は `Vec` を 6 本持つ)。
@@ -1017,6 +1051,7 @@ impl LocalState {
             input_delay_replacements: retired_lines,
             plugin_refs: old_refs,
             worker: old_worker,
+            sampler: old_sampler,
             mod_plan: retired_plan,
             mod_phase_table: retired_table,
         };
@@ -1172,6 +1207,10 @@ impl LocalState {
                 // r.md #87: ランチャーの操作。発火拍の解決は buffer 頭の
                 // `launcher.update` (= song snapshot が入ってから) が行う。
                 EngineCommand::Launch(req) => self.launcher.push_request(req),
+                EngineCommand::SamplerPreview { start, end } => {
+                    self.sampler_rt.set_preview(start, end);
+                }
+                EngineCommand::SamplerPreviewStop => self.sampler_rt.stop_preview(),
                 EngineCommand::PreviewNoteOn {
                     track,
                     pitch,
@@ -1442,6 +1481,24 @@ impl LocalState {
             );
             self.launcher.update(song, span, global_launch_quantize, was_playing);
 
+            // Global Sampler: 録音源が PreFx / PostFx tap なら、その track に
+            // snapshot を要求する flag を render の前に立てる。
+            self.sampler_rt.arm_snapshot_flags(
+                self.sampler.as_deref(),
+                Some(song),
+                &mut self.scratch[..MAX_TRACKS],
+            );
+            // MIDI Capture の試聴: この buffer に入るノートを pending_preview へ。
+            {
+                let seq = self.shared.preview_sequence.load();
+                self.sampler_rt.step_preview_sequence(
+                    seq.as_deref(),
+                    &mut self.scratch[..MAX_TRACKS],
+                    self.frames_rendered,
+                    n,
+                );
+            }
+
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
             // master fx → master gain。
             let master_gain =
@@ -1478,6 +1535,23 @@ impl LocalState {
             // (grill-me で確定した測定対象 = 曲の音だけ)。事前確保済み shmem への
             // store のみなので RT 安全 (確保・ロック・I/O 無し)。
             scope.write_block(&self.master_l[..n], &self.master_r[..n]);
+
+            // Global Sampler (`docs/plan_global_sampler.md` §3.2): 録音源をリングへ
+            // 書き、そのあとで試聴音を master に足す (試聴を再録しない)。scope と
+            // 同じく metronome の前 = 曲の音だけ。事前確保済み shmem への store のみ。
+            if let Some(rig) = self.sampler.as_deref() {
+                self.sampler_rt.write_block(
+                    rig,
+                    Some(song),
+                    &self.scratch[..MAX_TRACKS],
+                    &self.master_l,
+                    &self.master_r,
+                    n,
+                    crate::sampler::BlockTransport { playing, playhead, bpm: current_bpm },
+                );
+                self.sampler_rt
+                    .mix_preview(rig, &mut self.master_l[..n], &mut self.master_r[..n], n);
+            }
 
             // metronome click を master mix に重ねる (monitoring 専用 — export
             // 経路には存在しない)。 master mix の最後に重ねる (= track の mute /
@@ -1578,6 +1652,8 @@ impl LocalState {
                 }
             }
         }
+
+        self.frames_rendered = self.frames_rendered.wrapping_add(n as u64);
 
         // Playhead advance + auto-stop / loop wrap.
         if playing {
@@ -1731,6 +1807,7 @@ mod bundle_install_tests {
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
+            sampler: None,
             mod_plan: None,
             mod_phase_table: None,
         }
@@ -1857,6 +1934,7 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                sampler: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })
@@ -1911,6 +1989,7 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                sampler: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })
@@ -2081,6 +2160,7 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                sampler: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })
@@ -2128,6 +2208,7 @@ mod bundle_install_tests {
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
+                sampler: None,
                 mod_plan: None,
                 mod_phase_table: None,
             })

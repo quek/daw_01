@@ -45,6 +45,8 @@ const WIRE_SOURCES: &[&str] = &[
     "src/audio_bridge.rs",
     "src/metrics_bridge.rs",
     "src/scope_bridge.rs",
+    // Global Sampler の音声リング (docs/plan_global_sampler.md §3.1)。
+    "src/sampler_ring.rs",
     "src/worker_bridge.rs",
     "src/plugin_ref.rs",
 ];

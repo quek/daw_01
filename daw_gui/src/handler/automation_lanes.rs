@@ -1068,6 +1068,10 @@ impl AppData {
                 // 実挙動を揃える。
                 if matches!(kind, ChildKind::Audio) {
                     self.set_loop_region(self.transport.loop_region);
+                    // Global Sampler のリングも session state。GUI 側の shmem は
+                    // 生きているので、新しい audio プロセスに同じ世代を open させる
+                    // (デバイスのレートが変わっていたら作り直す)。
+                    self.resume_sampler_ring_after_respawn();
                 }
                 self.ui_ephemeral.status_message = format!(
                     "{}を再起動しました{}{}",

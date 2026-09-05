@@ -250,6 +250,8 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 見せる。view の最後に描くので常に最前面。運搬そのものは daw-ui の drag payload が
     // 持っているので、ここは表示だけ (状態を持たない)。
     draw_device_drag_preview(app, ui);
+    // Global Sampler / MIDI Capture の範囲を運んでいる最中のチップ (同じ理由で最後)。
+    crate::view::sampler_tab::draw_drag_chip(app, ui);
 }
 
 /// 運搬中の device ラベル (D-6)。 波形やクリップ色の上に出るので、 背景に依存しない

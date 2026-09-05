@@ -36,6 +36,7 @@ mod mod_plan_publish;
 mod mod_tick;
 mod sequencer;
 mod song_values;
+mod sampler;
 mod stretch_engine;
 
 use engine::{
@@ -743,6 +744,7 @@ fn publish_bundle(
         input_delay_replacements,
         plugin_refs: engine_shared.plugin_refs.load_full(),
         worker: engine_shared.worker.load_full(),
+        sampler: engine_shared.sampler.load_full(),
     });
 }
 
@@ -780,7 +782,7 @@ fn update_song_values<F>(
 /// の現 song snapshot から track id で引く。 song 未ロード / id 不在 / `MAX_TRACKS`
 /// 超過は `None` (= プレビュー drop)。 id ベースなので GUI 側の track 並べ替えと
 /// race しない (= `SetTrackVolume` 等と同じ方針)。
-fn preview_track_index(shared: &Arc<SharedState>, track_id: u32) -> Option<usize> {
+pub(crate) fn preview_track_index(shared: &Arc<SharedState>, track_id: u32) -> Option<usize> {
     let snapshot = shared.song.load();
     let song = snapshot.as_deref()?;
     song.tracks
@@ -828,6 +830,7 @@ fn recv_loop_housekeeping(
             input_delay_replacements: Vec::new(),
             plugin_refs: engine_shared.plugin_refs.load_full(),
             worker: engine_shared.worker.load_full(),
+            sampler: engine_shared.sampler.load_full(),
             mod_plan: None,
             mod_phase_table: Some(table),
         });
@@ -907,6 +910,8 @@ async fn recv_loop(
     park: Park,
 ) {
     let mut publisher = BundlePublisher::new(bundle_tx);
+    // MIDI Capture の試聴シーケンスの差し替え世代 (`sampler::PreviewSequence`)。
+    let mut preview_seq_generation: u64 = 0;
     // r.md #89: 位相表を張る専用スレッド (最新の要求だけ残す郵便受け)。
     let phase_tables = ModPhaseTableBuilder::spawn();
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
@@ -1224,6 +1229,36 @@ async fn recv_loop(
                         tracing::error!(error = ?e, "failed to open audio-side worker pool");
                     }
                 }
+            }
+            // Global Sampler / MIDI Capture (`docs/plan_global_sampler.md` §3.2):
+            // リングの open / close と試聴。中身は `sampler::handle_command` (recv loop
+            // の budget を太らせない)。再 publish は bundle を Unchanged で送り直す閉包。
+            Ok(
+                cmd @ (AudioCommand::OpenSamplerRing { .. }
+                | AudioCommand::CloseSamplerRing
+                | AudioCommand::SamplerPreview { .. }
+                | AudioCommand::SamplerPreviewStop
+                | AudioCommand::PreviewSequence { .. }
+                | AudioCommand::PreviewSequenceStop),
+            ) => {
+                sampler::handle_command(
+                    cmd,
+                    &shared,
+                    &engine_shared,
+                    &cmd_tx,
+                    &mut preview_seq_generation,
+                    &mut || {
+                        publish_bundle(
+                            &mut publisher,
+                            &shared,
+                            &engine_shared,
+                            shared.song.load_full(),
+                            session_sample_rate,
+                            Topology::Unchanged,
+                            &phase_tables,
+                        );
+                    },
+                );
             }
             Ok(AudioCommand::CloseWorkerPool) => {
                 engine_shared.worker.store(None);
@@ -2272,6 +2307,7 @@ mod tests {
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(std::collections::HashMap::new()),
             worker: None,
+            sampler: None,
             mod_plan: None,
             mod_phase_table: None,
         };

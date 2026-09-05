@@ -12,6 +12,8 @@ impl AppData {
         // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
         // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
         self.expire_nudge_audition(false);
+        // Global Sampler / MIDI Capture: 試聴の期限と古いノートの回収。
+        self.sampler_housekeeping();
 
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を

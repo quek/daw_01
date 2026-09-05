@@ -62,6 +62,14 @@ pub struct AppConfig {
     /// `load` が必ず有効範囲へクランプする (壊れた / 手書きの値で engine を落とさない)。
     #[serde(default = "default_voicevox_chunk_secs")]
     pub voicevox_chunk_secs: f32,
+    /// Global Sampler / MIDI Capture が溜める長さ (秒、`docs/plan_global_sampler.md` Q7)。
+    /// 曲の内容ではなく「この人の作業のしかた」なので app_config。`load` でクランプ。
+    #[serde(default = "default_sampler_seconds")]
+    pub sampler_seconds: u32,
+}
+
+fn default_sampler_seconds() -> u32 {
+    common::sampler_ring::DEFAULT_SECONDS
 }
 
 fn default_voicevox_chunk_secs() -> f32 {
@@ -99,6 +107,7 @@ impl AppConfig {
             loudness_report_rect: prefs.loudness_report_rect.map(|r| [r.x, r.y, r.w, r.h]),
             // r.md #75: 合成の塊の長さ (秒) も「この人の作業のしかた」側。
             voicevox_chunk_secs: prefs.voicevox_chunk_secs,
+            sampler_seconds: prefs.sampler_seconds,
         }
     }
 }
@@ -137,6 +146,7 @@ impl Default for AppConfig {
             loudness_report_open: false,
             loudness_report_rect: None,
             voicevox_chunk_secs: default_voicevox_chunk_secs(),
+            sampler_seconds: default_sampler_seconds(),
         }
     }
 }
@@ -158,6 +168,7 @@ pub fn load(path: impl AsRef<Path>) -> AppConfig {
         common::voicevox_phrase::MIN_CHUNK_SECS,
         common::voicevox_phrase::MAX_CHUNK_SECS,
     );
+    cfg.sampler_seconds = cfg.sampler_seconds.clamp(1, common::sampler_ring::MAX_SECONDS);
     cfg
 }
 
@@ -199,6 +210,7 @@ mod tests {
             loudness_report_open: true,
             loudness_report_rect: Some([5.0, 6.0, 720.0, 500.0]),
             voicevox_chunk_secs: 120.0,
+            sampler_seconds: 60,
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);

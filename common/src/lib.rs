@@ -27,6 +27,7 @@ pub mod project;
 pub mod protocol;
 pub mod recovery;
 pub mod scale;
+pub mod sampler_ring;
 pub mod scope_bridge;
 pub mod shmem;
 pub mod snap;

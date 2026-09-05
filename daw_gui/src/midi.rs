@@ -12,6 +12,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::AppEvent;
+use crate::event_sampler::SamplerEvent;
 
 pub struct MidiInputHandle {
     pub port_name: String,
@@ -55,6 +56,15 @@ fn dispatch(msg: &[u8], proxy: &EventLoopProxy<AppEvent>) {
             let (Some(&pitch), Some(&velocity)) = (msg.get(1), msg.get(2)) else {
                 return;
             };
+            // MIDI Capture (`docs/plan_global_sampler.md` §3.4): 演奏 / 録音 / binding
+            // とは独立に、到着時刻 (wall-clock) 付きで常に溜める。コールバック
+            // スレッドで時刻を取るのは event loop の遅延を載せないため。
+            let _ = proxy.send_event(AppEvent::Sampler(SamplerEvent::MidiCaptured {
+                at_ns: crate::state::sampler::wall_clock_ns(),
+                channel,
+                pitch,
+                velocity: (velocity != 0).then_some(velocity),
+            }));
             // r.md #87: channel も運ぶ (パッドをノートで撃つ binding が
             // 「ch 10 のノート 36」 のように channel 込みで指すため)。
             let event = if velocity == 0 {
@@ -66,6 +76,12 @@ fn dispatch(msg: &[u8], proxy: &EventLoopProxy<AppEvent>) {
         }
         0x80 => {
             let Some(&pitch) = msg.get(1) else { return };
+            let _ = proxy.send_event(AppEvent::Sampler(SamplerEvent::MidiCaptured {
+                at_ns: crate::state::sampler::wall_clock_ns(),
+                channel,
+                pitch,
+                velocity: None,
+            }));
             let _ = proxy.send_event(AppEvent::MidiNoteOff { channel, pitch });
         }
         // Phase 7 B1-M Step 1 (2026-05-13): MIDI Control Change (CC)。 status

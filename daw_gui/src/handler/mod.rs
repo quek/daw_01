@@ -27,6 +27,7 @@ pub mod loudness;
 pub mod master_panel;
 pub mod media;
 pub mod midi;
+pub mod sampler;
 pub mod mixer;
 pub mod modulation;
 pub mod note_selection;

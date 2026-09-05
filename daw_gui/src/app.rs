@@ -344,6 +344,7 @@ impl AppData {
                 meter_settings: app_config.meter,
                 // r.md #75: VOICEVOX 合成の塊の長さ (秒)。load 側でクランプ済。
                 voicevox_chunk_secs: app_config.voicevox_chunk_secs,
+                sampler_seconds: app_config.sampler_seconds,
                 is_help_open: false,
                 is_about_open: false,
                 app_dirs,
@@ -381,6 +382,7 @@ impl AppData {
                 master_hovered_section: None,
                 master_gain_dragging: false,
                 voicevox_chunk_editing: false,
+                sampler_secs_editing: false,
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
@@ -482,12 +484,17 @@ impl AppData {
                     active: app_config.master_panel_open,
                 },
             )),
+            sampler: crate::state::SamplerState::new(),
+            midi_capture: crate::state::MidiCaptureState::new(),
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
+        // Global Sampler は起動時から録り続ける (原典と同じ「常に背後で回っている」)。
+        // 子プロセスが居ない経路 (test / script) では中で no-op。
+        app.reopen_sampler_ring();
         // r.md #48: 設定 window が開いた状態で復元されたときは、最初のフレームまでに
         // テーマ一覧が要る (描画側は毎フレーム作り直さない)。
         if app.ui_prefs.settings_open {
@@ -1236,6 +1243,7 @@ impl AppData {
                 self.ui_prefs.bottom_panel =
                     if self.ui_prefs.bottom_panel == Some(0) { None } else { Some(0) };
             }
+            AppEvent::Sampler(ev) => self.handle_sampler_event(ev),
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);
             }

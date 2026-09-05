@@ -464,9 +464,48 @@ pub enum AudioCommand {
     SwitchRowToArranger { track_id: u32, lane_id: u32 },
     /// r.md #87: 全行の主導権をアレンジへ返す。
     SwitchAllToArranger,
+    /// Global Sampler (`docs/plan_global_sampler.md` §3.2): daw_gui が create した
+    /// 音声リング (`sampler_ring::sampler_shmem_id`) を open し、次の buffer から
+    /// `source` の音を書き続ける。既に開いているリングは置き換える (旧世代は
+    /// off-thread で drop)。一時停止はリングのヘッダ flag (command 不要)。
+    OpenSamplerRing { shmem_id: String, source: SamplerSource },
+    /// Global Sampler: リングを閉じる (書き込み停止 + drop)。
+    CloseSamplerRing,
+    /// Global Sampler の試聴: リングの `[start_frame, end_frame)` (`write_frames`
+    /// 座標) を master 出力へ加算する。リングへの書き込みの **後**に足すので
+    /// 試聴音は再録されない。範囲がリングから押し出されたら engine が自分で止める。
+    SamplerPreview { start_frame: u64, end_frame: u64 },
+    SamplerPreviewStop,
+    /// MIDI Capture の試聴: `track_id` のインストへノート列を送る。`offset_frames`
+    /// は受信時点からのフレーム数。engine は buffer 頭で「この buffer に入る
+    /// ノート」を `pending_preview` に注入する (= buffer 精度)。
+    PreviewSequence { track_id: u32, notes: Vec<PreviewNote> },
+    /// 走行中の `PreviewSequence` を止め、鳴っているノートを消音する。
+    PreviewSequenceStop,
     /// 親が crash した場合の pipe EOF 経路も同じ teardown に合流するので、
     /// 「終わり方」の実装は 1 つしかない。
     Shutdown,
+}
+
+/// Global Sampler の録音源 (`docs/plan_global_sampler.md` Q3)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode, serde::Serialize, serde::Deserialize,
+)]
+pub enum SamplerSource {
+    /// master fx / master gain 適用後、metronome を重ねる前 (= `ScopeBridge` と同じ点)。
+    #[default]
+    Master,
+    /// 任意 track の pre-fx / post-fx / post-fader。
+    Track(crate::model::AudioTap),
+}
+
+/// [`AudioCommand::PreviewSequence`] の 1 ノート。
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+pub struct PreviewNote {
+    pub offset_frames: u64,
+    pub duration_frames: u64,
+    pub pitch: u8,
+    pub velocity: u8,
 }
 
 // =====================================================================

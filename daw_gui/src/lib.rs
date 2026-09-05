@@ -25,6 +25,7 @@ pub(crate) mod test_support;
 pub mod event;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
+pub mod event_sampler;
 pub mod handler;
 pub mod audio_source_cache;
 pub mod automation_label;

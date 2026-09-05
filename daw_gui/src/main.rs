@@ -276,6 +276,7 @@ fn run_gui(
                 Arc::clone(&metrics),
                 scope,
                 Arc::clone(&app.meter_control),
+                Arc::clone(&app.sampler.shared),
                 proxy.clone(),
                 Arc::clone(&awake),
             );
@@ -424,10 +425,14 @@ fn spawn_playhead_poller(
     meter_control: Arc<
         std::sync::Mutex<daw_gui::master_meter::settings::MeterControl>,
     >,
+    sampler_shared: Arc<daw_gui::state::sampler::SamplerShared>,
     proxy: EventLoopProxy<AppEvent>,
     awake: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
+        // Global Sampler (`docs/plan_global_sampler.md` §3.3): 現世代のリングを
+        // 読み進めて波形バケツを作る。世代が変わったら reader を作り直す。
+        let mut sampler_builder: Option<daw_gui::state::sampler::OverviewBuilder> = None;
         let mut peaks_buf: Vec<(f32, f32, f32)> =
             Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf = common::mod_plane::ModPlane::with_capacity(
@@ -547,6 +552,24 @@ fn spawn_playhead_poller(
                 .is_err()
             {
                 break;
+            }
+            // Global Sampler: リングの新着を波形バケツにして流す。1 tick の読み量は
+            // 1 秒ぶんに抑える (省電力からの復帰で一気に読み過ぎない、scope と同じ)。
+            if let Some((generation, ring)) = sampler_shared.current() {
+                if sampler_builder.as_ref().is_none_or(|b| b.generation() != generation) {
+                    sampler_builder =
+                        Some(daw_gui::state::sampler::OverviewBuilder::new(generation, &ring));
+                }
+                let max_frames = ring.sample_rate().max(1) as usize;
+                if let Some(tick) = sampler_builder
+                    .as_mut()
+                    .and_then(|b| b.tick(&ring, max_frames))
+                    && proxy.send_event(AppEvent::Sampler(daw_gui::event_sampler::SamplerEvent::Tick(tick))).is_err()
+                {
+                    break;
+                }
+            } else {
+                sampler_builder = None;
             }
             // resource monitor (r.md #3): DSP load (peak は swap でリセット) /
             // xrun / buffer を読み UI へ流す。

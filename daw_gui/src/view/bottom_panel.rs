@@ -37,6 +37,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, tab: u8) {
                 let _ = crate::widgets::piano_roll::piano_roll(app, ui, pane);
             }
         });
+        // Global Sampler / MIDI Capture (`docs/plan_global_sampler.md` Q1 / Q2):
+        // タブ 2 = 音声リング、タブ 3 = MIDI 入力の常時捕捉。
+        tabs.tab("Sampler", |ui, pane| {
+            crate::view::sampler_tab::draw(app, ui, pane);
+        });
+        tabs.tab("MIDI Capture", |ui, pane| {
+            crate::view::midi_capture_tab::draw(app, ui, pane);
+        });
     });
 
     if tab_idx != prev_tab {
