@@ -368,8 +368,8 @@ impl AppData {
         self.restore_plugin_from_song(&song_snapshot);
         self.resync_song_edit_texts();
         // 新規プロジェクトを clean (= '*' 無し) で開始し、 旧プロジェクトの
-        // Undo/Redo 履歴を破棄する (直前の song 差し替え等で edit_epoch が進むので、
-        // ここで saved_epoch を現 epoch に合わせて dirty を打ち消す)。
+        // Undo/Redo 履歴を破棄する (直前の song 差し替え等で state が進むので、
+        // ここで saved_state_id を現 state に合わせて dirty を打ち消す)。
         self.after_song_replaced();
         tracing::info!("new project");
     }

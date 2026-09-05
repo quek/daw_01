@@ -504,7 +504,7 @@ impl AppData {
             tracing::info!("plugin cache predates port-probe; auto-rescanning to fill port info");
             app.begin_rescan();
         }
-        // 起動直後は clean (SongDoc::new が saved_epoch = edit_epoch で構築)。
+        // 起動直後は clean (SongDoc::new が saved_state_id = state_id で構築)。
         app
     }
 }

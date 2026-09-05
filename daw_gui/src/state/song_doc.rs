@@ -84,6 +84,9 @@ pub enum StreamGesture {
 struct HistoryEntry {
     song: Song,
     label: &'static str,
+    /// この state の識別子 ([`SongDoc::state_id`])。 undo / redo で live に戻すとき
+    /// 一緒に戻し、 保存時点の state と同じなら clean と判定できるようにする。
+    state_id: u64,
 }
 
 /// Song 文書: song 本体 + undo/redo + dirty/epoch + 保存先 path。
@@ -96,8 +99,16 @@ pub struct SongDoc {
     /// 1 始まりで cache (Default epoch 0) と必ず不一致にし、 初回 build で
     /// 一度 regenerate させる。
     edit_epoch: u64,
-    /// 最後に save / load / new した時点の `edit_epoch`。 dirty = 不一致。
-    saved_epoch: u64,
+    /// live state の識別子。 **中身が変わるたびに新しい値**、 undo / redo は履歴に
+    /// 積んであった値を **戻す** (epoch と違って単調でない)。 dirty はこれと
+    /// `saved_state_id` の比較 = 「undo で保存時点に戻ったら clean」 が O(1) で出る
+    /// (r.md #102)。 派生キャッシュの世代キーには使わない (同じ id が再登場するため、
+    /// そちらは単調な `edit_epoch`)。
+    state_id: u64,
+    /// 最後に save / load / new した時点の `state_id`。 dirty = 不一致。
+    saved_state_id: u64,
+    /// `state_id` の allocator (単調)。
+    next_state_id: u64,
     /// 「Song の中身が変わった」世代 (子プロセス sync が読む)。`edit_epoch` が進む
     /// ときは必ず進み、加えて [`SongDoc::edit_playback`] でも進む。
     sync_epoch: u64,
@@ -154,7 +165,9 @@ impl SongDoc {
         Self {
             song,
             edit_epoch: 1,
-            saved_epoch: 1,
+            state_id: 1,
+            saved_state_id: 1,
+            next_state_id: 2,
             sync_epoch: 1,
             file_path: None,
             undo_stack: VecDeque::new(),
@@ -220,10 +233,12 @@ impl SongDoc {
             self.undo_stack.push_back(HistoryEntry {
                 song: self.song.clone(),
                 label: self.current_label,
+                state_id: self.state_id,
             });
         }
         let (r, changed) = f(&mut self.song);
         if changed {
+            self.state_id = self.alloc_state_id();
             // redo は「実際に編集が起きた」 ときだけ無効化する (no-op で
             // redo 履歴を消さない)。
             self.redo_stack.clear();
@@ -260,6 +275,7 @@ impl SongDoc {
             return None;
         }
         let r = f(&mut self.song);
+        self.state_id = self.alloc_state_id();
         self.bump_edit_epoch();
         Some(r)
     }
@@ -282,6 +298,7 @@ impl SongDoc {
         }
         let changed = f(&mut self.song);
         if changed {
+            self.state_id = self.alloc_state_id();
             self.bump_edit_epoch();
         }
         Some(changed)
@@ -314,6 +331,13 @@ impl SongDoc {
         self.sync_epoch += 1;
     }
 
+    /// 新しい live state の識別子を切る (中身が変わった瞬間に呼ぶ)。
+    fn alloc_state_id(&mut self) -> u64 {
+        let id = self.next_state_id;
+        self.next_state_id += 1;
+        id
+    }
+
     /// plugin state blob の write-back (`RequestAllStates` 応答) **専用**。
     /// blob は host が真実源で wire (LoadSong) からも構造的に除外されているため、
     /// undo / epoch / dirty / 子プロセス sync のどれにも影響しない。
@@ -333,12 +357,12 @@ impl SongDoc {
 
     /// dirty = 「最後に保存した epoch から編集が進んだ」 の O(1) 派生。
     pub fn is_dirty(&self) -> bool {
-        self.edit_epoch != self.saved_epoch
+        self.state_id != self.saved_state_id
     }
 
-    /// save 完了時に呼ぶ: 現在の epoch を保存済みベースラインにする。
+    /// save 完了時に呼ぶ: 現在の state を保存済みベースラインにする。
     pub fn mark_saved(&mut self) {
-        self.saved_epoch = self.edit_epoch;
+        self.saved_state_id = self.state_id;
     }
 
     // -------- undo / redo ---------------------------------------------------
@@ -390,8 +414,10 @@ impl SongDoc {
         self.redo_stack.push_back(HistoryEntry {
             song: current,
             label: self.current_label,
+            state_id: self.state_id,
         });
         self.current_label = prev.label;
+        self.state_id = prev.state_id;
     }
 
     /// redo 1 段: [`SongDoc::step_backward`] の対称。
@@ -402,8 +428,10 @@ impl SongDoc {
         self.undo_stack.push_back(HistoryEntry {
             song: current,
             label: self.current_label,
+            state_id: self.state_id,
         });
         self.current_label = next.label;
+        self.state_id = next.state_id;
     }
 
     /// 履歴リスト click 用: `target` 番目の state (0 = baseline、
@@ -460,10 +488,9 @@ impl SongDoc {
     }
 
     fn after_history_jump(&mut self) {
-        // undo/redo も epoch を bump する (frame flush が LoadSong を再送する)。
-        // saved_epoch とは一致しなくなるので dirty になる (epoch 方式では
-        // 「undo で保存時点に戻ったら clean」 は表現しない — O(1) 化の意図的
-        // トレードオフ、 docs/plan_arch_refactor.md §7.5)。
+        // undo/redo も epoch を bump する (frame flush が LoadSong を再送する、
+        // 派生キャッシュも作り直す)。 dirty は epoch ではなく `state_id` で見るので、
+        // 保存時点の state に戻れば clean になる (r.md #102)。
         self.bump_edit_epoch();
         // gesture squash chain は履歴 jump を跨がない (跨ぐと drag 再開時の
         // snapshot が skip され、 undo 1 回分の状態が履歴から欠落する)。
@@ -478,8 +505,9 @@ impl SongDoc {
         self.redo_stack.clear();
         self.current_label = BASELINE_LABEL;
         self.last_gesture = None;
+        self.state_id = self.alloc_state_id();
+        self.saved_state_id = self.state_id;
         self.bump_edit_epoch();
-        self.saved_epoch = self.edit_epoch;
     }
 
     /// 読み込み時の**不変条件の回復**で中身が変わったことを記録し、`*` (未保存) を立てる。
@@ -489,6 +517,7 @@ impl SongDoc {
     /// ファイルを読み込んだ結果の修復だから。 解消は冪等なので、一度保存すれば
     /// 次に開いたときは立たない。
     pub fn mark_dirty_after_load_fixup(&mut self) {
+        self.state_id = self.alloc_state_id();
         self.bump_edit_epoch();
     }
 
@@ -625,6 +654,35 @@ mod tests {
         assert_eq!(r, Some(false));
         assert_eq!(doc.edit_epoch(), before, "no-op は epoch を進めない");
         assert!(!doc.is_dirty(), "no-op normalize は dirty 化しない (r.md #9)");
+    }
+
+    /// r.md #102: undo で保存時点の state に戻れば clean、 redo で先へ進めば dirty。
+    /// 保存後に undo した state を再編集して redo 枝を捨てると、 保存時点には戻れない
+    /// ので dirty のまま。
+    #[test]
+    fn undo_back_to_saved_state_is_clean() {
+        let mut doc = SongDoc::new(Song::default());
+        doc.edit(EditScope::Discrete, |s| s.bpm = 100.0);
+        doc.mark_saved();
+        assert!(!doc.is_dirty());
+        doc.edit(EditScope::Discrete, |s| s.bpm = 110.0);
+        assert!(doc.is_dirty(), "保存後の編集は dirty");
+        assert!(doc.undo());
+        assert!(!doc.is_dirty(), "undo で保存時点に戻ったら clean");
+        assert!(doc.redo());
+        assert!(doc.is_dirty(), "redo で先へ進めば dirty");
+        assert!(doc.undo());
+        assert!(doc.undo(), "保存時点より前へ");
+        assert!(doc.is_dirty(), "保存時点より前も dirty");
+        assert!(doc.redo());
+        assert!(!doc.is_dirty(), "redo で保存時点へ戻れば clean");
+        // 保存時点より前で別の編集 → redo 枝が消え、 保存時点へは戻れない。
+        assert!(doc.undo());
+        doc.edit(EditScope::Discrete, |s| s.bpm = 90.0);
+        assert!(doc.is_dirty());
+        assert!(doc.undo());
+        assert!(doc.is_dirty(), "保存時点の state は履歴から消えたので dirty のまま");
+        assert!(!doc.redo() || doc.is_dirty());
     }
 
     /// 対の保証: 実際に変えた normalize は従来どおり epoch bump + dirty。
