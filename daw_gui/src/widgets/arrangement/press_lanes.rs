@@ -106,10 +106,15 @@ pub(super) fn clip_zone(
         // Shift+Move ドラッグは通常の移動、 Shift+resize は従来どおり time-stretch (#61)。
         // クリップの**ヘッダ帯 (ラベル帯) を掴んだときだけ移動**にする。
         // 本体 (波形 / MIDI 表示部) を掴んだら時間範囲のドラッグへ委譲し、
-        // ヘッダを Alt 付きで掴んだ場合も範囲にする (Live と同じ、
-        // `docs/plan_range_selection.md` §3.1)。 行が低くて本体が消えたら
+        // **Alt 付きならクリップ上のどこ (ヘッダ / 本体 / 端の resize ハンドル) でも範囲**
+        // にする (Live と同じ、 `docs/plan_range_selection.md` §3.1)。 端も Alt で範囲に
+        // 倒すのは、 短いクリップでは端ハンドルがクリップ幅の大半を占め、 Alt+ドラッグで
+        // 範囲を引くのにズームが必須になるのを避けるため。 行が低くて本体が消えたら
         // クリップ全体がヘッダ = 常に移動になる (Live も unfold しないと
-        // クリップ内の時間は選べない)。 端の resize ハンドルは従来どおり。
+        // クリップ内の時間は選べない)。
+        if f.pointer.modifiers.alt {
+            return; // range_zone が拾う
+        }
         if matches!(kind, ClipDragKind::Move) {
             let in_header = f
                 .visible_tracks
@@ -121,7 +126,7 @@ pub(super) fn clip_zone(
                     let header_h = draw::clip_content_inset_top(f.style).min(row_h);
                     py < f.tops[t_idx] + header_h
                 });
-            if !in_header || f.pointer.modifiers.alt {
+            if !in_header {
                 return; // range_zone が拾う
             }
         }
@@ -477,7 +482,7 @@ fn automation_clip(
 /// **時間範囲のドラッグ開始** (`docs/plan_range_selection.md` §3.1)。
 ///
 /// press 分岐の **最後**に呼ぶ — ここまでで誰も session を張らなかった press
-/// (= 空きレーン / クリップの本体 / Alt+ヘッダ / 空きオートメーションレーン) が
+/// (= 空きレーン / クリップの本体 / Alt+クリップ (ヘッダ・端含む) / 空きオートメーションレーン) が
 /// すべて範囲になる。 旧・矩形選択 (marquee) と投げ縄 (lasso) を置き換えた 1 本。
 pub(super) fn range_zone(
     ui: &mut Ui<'_, AppData>,

@@ -1914,7 +1914,7 @@ struct AutomationClipDragSession {
 /// **時間範囲のドラッグ session** (`docs/plan_range_selection.md` §3.1)。
 ///
 /// 起動点は 4 つ — トラックレーンの空き / クリップの本体 (ヘッダ以外) /
-/// クリップのヘッダ + Alt / オートメーションレーンの空き。 どれも同じ session を張る。
+/// クリップのヘッダ・端ハンドル + Alt / オートメーションレーンの空き。 どれも同じ session を張る。
 /// ジェスチャの種類は**押した瞬間の Alt** で決まり、以降の Alt は範囲のスナップ
 /// on/off だけを制御する (離す = スナップ有効 / 押す = 無効)。
 #[derive(Clone, Copy, Debug)]

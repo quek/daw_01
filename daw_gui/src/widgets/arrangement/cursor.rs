@@ -34,7 +34,11 @@ pub(super) fn hover(
             response.hovered_zone = Some(hit_kind);
             // Move ゾーン (= 端の resize ハンドル以外) は、ヘッダ帯なら「動かす」、
             // 本体なら「時間範囲を引く」。帯は不可視なのでカーソルで区別を示す。
-            if matches!(hit_kind, ClipDragKind::Move) {
+            // Alt 押下中はクリップ上のどこ (端ハンドル含む) でも範囲になる
+            // (`press_lanes::clip_zone` と同じ判定)。
+            if f.pointer.modifiers.alt {
+                response.hovered_clip_body = true;
+            } else if matches!(hit_kind, ClipDragKind::Move) {
                 response.hovered_clip_body = f
                     .visible_tracks
                     .iter()
