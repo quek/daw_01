@@ -7,6 +7,42 @@ use common::model::InstrumentSource;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotState};
 
+/// `SlotPluginLoaded` で chain[i] を作り直すときの instance。 **load が権威を持つ
+/// 値だけを差し替え、 それ以外はユーザー所有の既存値を全部温存する**:
+/// - 差し替える: `id` (安定 device id、 `with_ports` は sentinel 0 で作る)、
+///   `plugin_id`、 `aux_output_count` (plugin が報告した aux 出力数)、 `ports`
+///   (解決規則は `PortConfig::resolve` 一本。 DB を優先すると DB と保存値が食い違う
+///   環境で load 応答のたびに書き換わり「開いただけで `*`」)。
+/// - 温存する: `state` / `aux_inputs` / `aux_outputs` (sidechain / パラアウト配線) /
+///   `ara_archive` (r.md #5) / `send_all_keys_to_plugin` (r.md #36) / `bypassed`
+///   (r.md #105) / `format`。 `..prev.clone()` で **field を列挙しない** — 旧実装は
+///   tuple に 1 つずつ書き写しており、 field を足すたびに漏れて「再ロードで設定が消え、
+///   no-op 判定が誤って dirty 化する」 (r.md #9) を繰り返していた。
+///
+/// 既存が無い (`None`) ときは CLAP 既定で新規に作る。
+fn reloaded_instance(
+    prev: Option<&common::model::PluginInstance>,
+    device_id: u64,
+    plugin_id: String,
+    aux_output_count: u8,
+    db_ports: Option<common::port_config::PortConfig>,
+) -> common::model::PluginInstance {
+    use common::port_config::PortConfig;
+    let base = match prev {
+        Some(p) => common::model::PluginInstance {
+            plugin_id,
+            ports: PortConfig::resolve(p.ports, db_ports),
+            ..p.clone()
+        },
+        None => common::model::PluginInstance::with_ports(
+            plugin_id,
+            PluginFormat::Clap,
+            PortConfig::resolve(PortConfig::default(), db_ports),
+        ),
+    };
+    common::model::PluginInstance { id: device_id, aux_output_count, ..base }
+}
+
 impl AppData {
     // -------- Plugin GUI bridge --------------------------------------------
 
@@ -164,65 +200,7 @@ impl AppData {
                     return false;
                 };
                 let i = index as usize;
-                let (
-                    existing_state,
-                    format,
-                    existing_aux,
-                    existing_aux_out,
-                    existing_ports,
-                    existing_ara,
-                    existing_send_all_keys,
-                ) = chain
-                    .get(i)
-                    .map(|p| {
-                        (
-                            p.state.clone(),
-                            p.format,
-                            p.aux_inputs.clone(),
-                            p.aux_outputs.clone(),
-                            p.ports,
-                            p.ara_archive.clone(),
-                            p.send_all_keys_to_plugin,
-                        )
-                    })
-                    .unwrap_or((
-                        None,
-                        PluginFormat::Clap,
-                        Vec::new(),
-                        Vec::new(),
-                        Default::default(),
-                        None,
-                        false,
-                    ));
-                let inst = common::model::PluginInstance {
-                    // v29: 安定 device id を必ず引き継ぐ (with_ports は sentinel 0 で
-                    // 作るので、 ここで焼き込まないと以後の id addressing が全滅する)。
-                    id: device_id,
-                    state: existing_state,
-                    aux_inputs: existing_aux,
-                    aux_outputs: existing_aux_out,
-                    // パラアウト: the just-loaded plugin's authoritative aux output port
-                    // count (overrides whatever the DB / previous instance had).
-                    aux_output_count,
-                    // (r.md #5 ARA2 / #9) 既存 ARA アーカイブを温存する。 `..with_ports`
-                    // は ara_archive を None に落とすので、 明示引き継ぎしないと reload
-                    // の度に Melodyne 等の編集が失われ、 かつ下の no-op 判定が誤って
-                    // 「変化」 に倒れて開くたび dirty 化する。
-                    ara_archive: existing_ara,
-                    // r.md #36: 「キーを全部プラグインに送る」 も既存値を温存する。
-                    // `..with_ports` は false に落とすので、 明示引き継ぎしないと
-                    // 再ロードの度にユーザー設定が消え、 かつ下の no-op 判定が誤って
-                    // 「変化」 に倒れて開くだけで dirty 化する (r.md #9)。
-                    send_all_keys_to_plugin: existing_send_all_keys,
-                    // r.md #9: port 解決の規則は `PortConfig::resolve` に一本化して
-                    // ある。 ここで DB を優先すると、 DB と保存値が食い違う環境で
-                    // load 応答のたびに instance が書き換わり「開いただけで `*`」。
-                    ..common::model::PluginInstance::with_ports(
-                        id,
-                        format,
-                        common::port_config::PortConfig::resolve(existing_ports, db_ports),
-                    )
-                };
+                let inst = reloaded_instance(chain.get(i), device_id, id, aux_output_count, db_ports);
                 // no-op 検出 (r.md #9): 再構築結果が既存と同一なら epoch を bump
                 // させない (= dirty 化 / 冗長な LoadSong 再送をしない)。 内容が本当に
                 // 変わったとき (旧 file の port 解決 / 手動 plugin 挿入) だけ true。
@@ -737,6 +715,45 @@ impl AppData {
             true
         });
         self.send_plugin(PluginCommand::SetEditorSendAllKeys { device_id, enabled });
+    }
+
+    /// r.md #105: `device_ids` を bypass する / 戻す。 変化しない id はそのまま
+    /// (全部同値なら no-op で undo snapshot も積まない)。 engine / 映像 FX への反映は
+    /// `edit_song` の LoadSong 予約が担う (専用 IPC は無い — `PluginInstance.bypassed`
+    /// が唯一の真値で、 daw_audio は dispatch 時にそれを読む)。
+    pub(crate) fn set_devices_bypassed(&mut self, device_ids: &[u64], bypassed: bool) {
+        let ids: Vec<u64> = device_ids.to_vec();
+        self.edit_song_checked(move |song| {
+            let mut changed = false;
+            for &id in &ids {
+                if let Some(inst) = device_mut_by_id(song, id)
+                    && inst.bypassed != bypassed
+                {
+                    inst.bypassed = bypassed;
+                    changed = true;
+                }
+            }
+            changed
+        });
+    }
+
+    /// r.md #105: `device_ids` が全部 bypass 中か (`Q` の toggle 方向。 clip / note の
+    /// `all_clips_muted` と同じ「全部 off なら on、 1 つでも on なら全 off」)。
+    /// 見つからない id は数えない。 空なら `false`。
+    pub(crate) fn all_devices_bypassed(&self, device_ids: &[u64]) -> bool {
+        let song = self.song_doc.song();
+        let mut seen = false;
+        for &id in device_ids {
+            let Some(inst) = find_device_by_id(song, id).and_then(|(t, i)| device_at(song, t, i))
+            else {
+                continue;
+            };
+            if !inst.bypassed {
+                return false;
+            }
+            seen = true;
+        }
+        seen
     }
 
     pub(crate) fn set_sidechain_source(&mut self, device_id: u64, port: u8, source: Option<u32>) {

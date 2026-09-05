@@ -6,9 +6,7 @@
 //! `Song::track_index_of` を通す)。
 
 use crate::widgets::arrangement::{live_clip_key, ArrangementResponse};
-use daw_ui_core::{
-    Edit, ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
-};
+use daw_ui_core::{Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget};
@@ -365,7 +363,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ("clip_rename", key.track_id, key.clip_id),
                 input_rect,
                 &app.ui_ephemeral.clip_rename_text,
-                &TextInputStyle::default(),
+                &ui.text_input_style(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::RenameClipChanged(new.clone()));
@@ -464,7 +462,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ),
                 input_rect,
                 &prefill,
-                &TextInputStyle::default(),
+                &ui.text_input_style(),
                 |_new| Edit::mutate(|_| {}),
             );
             if edit_resp.committed || edit_resp.blurred {
@@ -743,7 +741,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ("track_rename", track_id),
                 input_rect,
                 &app.ui_ephemeral.track_rename_text,
-                &TextInputStyle::default(),
+                &ui.text_input_style(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::RenameTrackChanged(new.clone()));
@@ -781,7 +779,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     ("section_rename", *sid),
                     input_rect,
                     &app.ui_ephemeral.section_rename_text,
-                    &TextInputStyle::default(),
+                    &ui.text_input_style(),
                     |new| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::RenameSectionChanged(new.clone()));

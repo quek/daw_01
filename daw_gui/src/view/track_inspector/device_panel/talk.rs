@@ -120,7 +120,7 @@ pub(super) fn draw_talk(
                 h: 22.0,
             },
             &app.ui_ephemeral.clip_text_content_edit_text,
-            &TextInputStyle::default(),
+            &ui.text_input_style(),
             |s| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ClipTextContentEditChanged(s))

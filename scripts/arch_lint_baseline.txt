@@ -222,7 +222,7 @@ FN-NESTING | daw_gui/src/view/recovery_modal.rs::draw                           
 #    いつ消えるか: **未起票**。
 FN-NESTING | daw_gui/src/app.rs::AppData::handle_event                        | 9/112 | 巨大 match。未起票
 FN-NESTING | daw_audio/src/main.rs::recv_loop                                 | 10/242 | 巨大 match。未起票
-FN-NESTING | daw_gui/src/view/runner.rs::Runner::handle_preview_window_event  | 9/91  | 巨大 match。未起票
+FN-NESTING | daw_gui/src/view/runner/preview_events.rs::Runner::handle_preview_window_event | 9/89 | 巨大 match (r.md #107 で runner.rs から切り出し、負債は同一)。未起票
 FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::handle_command          | 9/39  | 巨大 match。未起票
 FN-NESTING | daw_gui/src/handler/ipc.rs::AppData::dispatch_audio_event        | 9/28  | 巨大 match。未起票
 FN-NESTING | daw_gui/src/handler/ipc.rs::AppData::dispatch_plugin_event       | 9/25  | 巨大 match。未起票

@@ -18,8 +18,11 @@ use crate::ui::Ui;
 ///
 /// 呼び出し側が「pane に何 px 残るか」を先に知りたいことがある (例: 中身の
 /// 必要高からウィンドウ分割比を決める) ので公開する。
-pub const TAB_BAR_H: f32 = 32.0;
-const TAB_FONT: f32 = 14.0;
+///
+/// 24px = メニューバー / ステータスバーと同じ「1 行のクローム」の高さ。旧 32px は
+/// 見出し 1 行に対して余白だけが太り、下部パネル (Mixer / Piano Roll) の縦を無駄に
+/// 食っていた (daw_01 r.md #104)。文字サイズは [`Ui::control_font_size`]。
+pub const TAB_BAR_H: f32 = 24.0;
 const TAB_PAD_X: f32 = 16.0;
 
 /// `Ui::tab_view` の永続状態 (現在選択中の index)。
@@ -55,7 +58,8 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
         // (14px なら 1 文字 ≈ 14px) を大幅に過小評価し、隣のタブの上に文字がはみ出して
         // 重なっていた (daw_01 r.md #60 の About タブで発覚)。ASCII ラベルでは
         // 従来値とほぼ同じ幅になるので既存 caller の見た目は実質不変。
-        let w = self.ui.measure_text(label, TAB_FONT) + TAB_PAD_X * 2.0;
+        let font_size = self.ui.control_font_size();
+        let w = self.ui.measure_text(label, font_size) + TAB_PAD_X * 2.0;
         let tab_rect = Rect { x: self.bar_rect.x + self.next_x, y: self.bar_rect.y, w, h: TAB_BAR_H };
         self.next_x += w;
 
@@ -87,9 +91,9 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
         self.ui.push_text(GlyphArea {
             text: label.into(),
             left: tab_rect.x + TAB_PAD_X,
-            top: tab_rect.y + (tab_rect.h - TAB_FONT * 1.2) * 0.5,
-            font_size: TAB_FONT,
-            line_height: TAB_FONT * 1.2,
+            top: tab_rect.y + (tab_rect.h - font_size * 1.2) * 0.5,
+            font_size,
+            line_height: font_size * 1.2,
             color: if is_sel { p.text } else { p.text_dim },
             clip_rect: None,
             ..GlyphArea::default()
@@ -274,7 +278,7 @@ mod tests {
     #[test]
     fn tab_view_with_state_writes_back_on_click() {
         // tab bar layout: 各 tab 幅 = chars * 8.0 + TAB_PAD_X (16) * 2 = chars*8 + 32
-        // "A" / "B" / "C" は全部 1 char → 各 40px、TAB_BAR_H = 32px
+        // "A" / "B" / "C" は全部 1 char → 各 40px、TAB_BAR_H = 24px
         // tab[0]: x ∈ [0, 40), tab[1]: x ∈ [40, 80), tab[2]: x ∈ [80, 120)
         let mut host: UiHost<Counter> = UiHost::no_redraw();
         let mut scene = Scene::new();

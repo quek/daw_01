@@ -1064,6 +1064,7 @@ impl AppData {
                     has_params,
                     send_all_keys: p.send_all_keys_to_plugin,
                     load_error: self.ipc.failed_plugin_loads.get(&p.id).cloned(),
+                    bypassed: p.bypassed,
                 }
             })
             .collect()

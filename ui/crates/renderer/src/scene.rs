@@ -59,6 +59,22 @@ impl Color {
         }
     }
 
+    /// sRGB 符号化した 8bit RGBA。 **glyphon (`ColorMode::Accurate`) へ渡す色はこれ**
+    /// — glyphon は u8 を sRGB として受け取り shader で linear に戻してから sRGB target へ
+    /// 書く。 `Color` の値は linear (rect / line pipeline は float のまま sRGB target に
+    /// 書いて hardware が符号化する) なので、 linear 値を ×255 で渡すと全テキストが
+    /// palette より暗く出る (ライトテーマの `text_faint` sRGB 0.52 が 0.23 相当 = ほぼ黒に
+    /// なり、 `text` と見分けが付かなかった。 daw_01 r.md #105 実機)。 alpha は linear。
+    #[must_use]
+    pub fn to_srgb8(self) -> [u8; 4] {
+        fn enc(c: f32) -> u8 {
+            let c = c.clamp(0.0, 1.0);
+            let s = if c <= 0.003_130_8 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+            (s * 255.0).round().clamp(0.0, 255.0) as u8
+        }
+        [enc(self.r), enc(self.g), enc(self.b), (self.a.clamp(0.0, 1.0) * 255.0).round() as u8]
+    }
+
     /// 同じ RGB で alpha だけ差し替えた色。半透明 wash / overlay を **元トークンから派生**
     /// させ、値の再宣言 (SSoT 破り) を避けるためのヘルパ。
     #[must_use]

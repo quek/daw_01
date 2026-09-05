@@ -236,7 +236,8 @@ fn resolve_video_chain(
 ) -> Vec<ResolvedEffect> {
     let mut out = Vec::new();
     for inst in devices.iter() {
-        if !inst.ports.is_video() {
+        // r.md #105: bypass 中の映像 FX は解決しない (= 音声 chain の素通しと同じ)。
+        if !inst.ports.is_video() || inst.bypassed {
             continue;
         }
         let Some(def) = def_by_id(&inst.plugin_id) else {
@@ -308,7 +309,7 @@ pub fn resolve_track_transform(
     let has_transform_device = track
         .devices
         .iter()
-        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID);
+        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID && !d.bypassed);
     if !has_transform_device {
         return None;
     }

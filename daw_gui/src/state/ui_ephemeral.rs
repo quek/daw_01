@@ -116,6 +116,11 @@ pub struct UiEphemeral {
     /// ではなく **そのセクションのバイパス**を切り替える。
     /// 算出は `view::strip_sections` の 1 か所 (SSoT)、strip 外は `None`。
     pub mixer_hovered_strip_section: Option<(u32, crate::event::StripSection)>,
+    /// r.md #105: インスペクタのチェーンで、いまカーソルが乗っている行の device id。
+    /// `track_inspector` が毎フレーム更新 (`mixer_hovered_track` と同 idiom)。`Q` が
+    /// これを見て「選択 device があればそれら、無ければこの行」を bypass 切替する。
+    /// チェーン外 / インスペクタ非表示は `None`。
+    pub inspector_hovered_device: Option<u64>,
     /// マスターストリップで、いまカーソルが乗っているブロック
     /// (`docs/plan_master_strip.md` §3)。`Q` がこれを見てそのセクションの
     /// バイパスを切り替える。算出は `view::master_strip_ui` の 1 か所。

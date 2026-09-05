@@ -294,12 +294,11 @@ impl GlyphPipeline {
                     top,
                     scale: 1.0,
                     bounds,
-                    default_color: GlyphColor::rgba(
-                        (area.color.r * 255.0).clamp(0.0, 255.0) as u8,
-                        (area.color.g * 255.0).clamp(0.0, 255.0) as u8,
-                        (area.color.b * 255.0).clamp(0.0, 255.0) as u8,
-                        (area.color.a * 255.0).clamp(0.0, 255.0) as u8,
-                    ),
+                    // linear → sRGB 8bit (`Color::to_srgb8` の doc 参照)。
+                    default_color: {
+                        let [r, g, b, a] = area.color.to_srgb8();
+                        GlyphColor::rgba(r, g, b, a)
+                    },
                     custom_glyphs: &[],
                 }
             })

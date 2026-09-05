@@ -12,7 +12,7 @@ mod modulation_rack;
 
 use daw_ui_core::{
     Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
-    ScrubableNumberStyle, TextInputStyle, ToggleButtonStyle, Ui,
+    ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::Rect;
 
@@ -275,18 +275,23 @@ fn apply_chain_menu_action(
     let chain = app.inspector_chain();
     let ids = carried_device_ids(app, &chain, device_id);
     match idx {
-        0 => app.copy_devices(ids),
-        1 => app.cut_devices(ids),
+        // r.md #105: 無効化 / 有効化 (方向はメニューラベルと同じ `all_devices_bypassed`)。
+        0 => {
+            let bypassed = !app.all_devices_bypassed(&ids);
+            app.handle_event(AppEvent::SetDevicesBypassed { device_ids: ids, bypassed });
+        }
+        1 => app.copy_devices(ids),
+        2 => app.cut_devices(ids),
         // 貼り付け位置は「この device の直前」。 選択をこの device 1 本にしてから
         // **Ctrl+V と同じ経路** を起こす (挿入位置の決定は `paste_devices` が選択から
         // 引くので、規則も経路も 1 本のまま。 OS クリップボードの読み出しは shortcut
         // layer が担うので、ここで二重に読まない)。
-        2 => {
+        3 => {
             app.set_device_selection(vec![device_id]);
             app.ui_ephemeral.pending_shortcut_injections.push("paste");
         }
         // 複製 = 選んだ device の直後にコピーを挿す。
-        3 => duplicate_devices_after(app, ids, device_id, dest_track),
+        4 => duplicate_devices_after(app, ids, device_id, dest_track),
         _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
     }
 }
@@ -1345,7 +1350,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         h: 11.0 * 1.2,
                     },
                     11.0,
-                    if failed { p.text_error } else { p.text },
+                    // r.md #105: bypass 中は最弱可読層 (`text_faint` = disabled label の
+                    // トークン)。トグルは置かず、名前の色だけで示す。`text_dim` は二次
+                    // ラベル用で `text` との差が弱く、実機で「変わらない」と見えた。
+                    if failed {
+                        p.text_error
+                    } else if entry.bypassed {
+                        p.text_faint
+                    } else {
+                        p.text
+                    },
                 );
                 // 右クリックメニューが開いている frame の抑止は `chain_row_edit` が担う。
                 if shows_keys {
@@ -1401,6 +1415,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             },
         );
 
+        // r.md #105: カーソル直下の行を AppData に反映 (変化時のみ Edit、
+        // `mixer_hovered_track` と同じ diff-guard)。 `Q` が読む。
+        let hovered_device = resp.hovered.and_then(|i| chain.get(i)).map(|e| e.device_id);
+        if app.ui_ephemeral.inspector_hovered_device != hovered_device {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.ui_ephemeral.inspector_hovered_device = hovered_device;
+            }));
+        }
+
         // r.md #71 (プラグインのコピー / 移動): 行 click = 選択 (無修飾 / Ctrl / Shift)。
         // 修飾キーは widget が **press フレームで捕まえた値** (`clicked_modifiers`) を
         // 使う — release フレームの生読みは ModifiersChanged 先行 race で Ctrl+click が
@@ -1454,9 +1477,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let Some(e) = chain.get(*i) else { continue };
             let device_id = e.device_id;
             let dest_track = cursor_tid;
+            // r.md #105: 先頭は bypass 切替。 ラベルは **この操作が掛かる集合**
+            // (`carried_device_ids`: 行が選択に含まれていれば選択全体) の現在値から
+            // 決める — 全部 off なら「有効化」、 1 つでも on なら「無効化」 (`Q` と同じ)。
+            let bypass_label = if app.all_devices_bypassed(&carried_device_ids(app, &chain, device_id))
+            {
+                "有効化"
+            } else {
+                "無効化"
+            };
             ui.context_menu_for(
                 *row_rect,
-                &["コピー", "切り取り", "貼り付け", "複製", "削除"],
+                &[bypass_label, "コピー", "切り取り", "貼り付け", "複製", "削除"],
                 move |idx, ui| {
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         apply_chain_menu_action(app, idx, device_id, dest_track);

@@ -311,6 +311,11 @@ pub fn process_track_owned(
         // v29: 安定 device id で直接 lookup。 song.tracks の Vec position にも
         // chain 内 index にも依存しないので、 reorder / 削除で lookup が壊れない。
         let device = &song_track.devices[i];
+        // r.md #105 bypass: dispatch せず次の device へ。 バス (track_l/r /
+        // midi_bus_a) は手前の状態のまま = 音声も MIDI も素通し。
+        if device.bypassed {
+            continue;
+        }
         let ports = device.ports;
         let Some(entry) = plugin_refs.get(&device.id) else {
             continue;
@@ -527,6 +532,10 @@ pub fn process_master_fx_chain(
     let n = frames as usize;
     let Some(ws) = worker_sync else { return };
     for device in master_fx_chain {
+        // r.md #105 bypass: dispatch せず素通し (track chain と同じ)。
+        if device.bypassed {
+            continue;
+        }
         let Some(entry) = plugin_refs.get(&device.id) else {
             continue;
         };
@@ -892,6 +901,10 @@ fn run_group_fx_chain(
     // pass 1) — run only the suffix FX.
     for i in start_device as usize..song_track.devices.len() {
         let device = &song_track.devices[i];
+        // r.md #105 bypass: dispatch せず素通し (leaf chain と同じ)。
+        if device.bypassed {
+            continue;
+        }
         let ports = device.ports;
         if !ports.has_audio_output {
             // No audio output (e.g. a pure MIDI effect) — nothing to contribute

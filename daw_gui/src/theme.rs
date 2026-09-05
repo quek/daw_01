@@ -156,6 +156,14 @@ palette! {
     }
 }
 
+/// 操作 widget (button / dropdown / toggle / tab / text_input) の共通文字サイズ (px)。
+/// transport の読み出し・トグル・Chain 見出し・mixer と同じ 12px。 runner が起動時に
+/// `UiHost::set_control_font_size` へ渡し、 daw-ui の汎用 widget はこの値を既定にする
+/// (r.md #103: dropdown 14 / button 16 が周囲の 11〜12px から跳ねて見えた)。
+/// 意図的に大きくする所 (transport のアイコンボタン 16px 等) は style / `*_sized` で
+/// 個別に上書きする。
+pub const CONTROL_FONT_PX: f32 = 12.0;
+
 /// 組込みテーマの id と表示名 (設定画面の並び順もこの順)。
 pub const BUILTIN_THEMES: &[(&str, &str)] = &[("dark", "ダーク"), ("light", "ライト")];
 

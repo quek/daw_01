@@ -11,7 +11,6 @@ use crate::id::WidgetId;
 use crate::ui::Ui;
 use crate::widgets::menu::draw_items_popup;
 
-const DROPDOWN_FONT: f32 = 14.0;
 const DROPDOWN_PAD_X: f32 = 8.0;
 const DROPDOWN_ARROW_W: f32 = 16.0;
 
@@ -20,6 +19,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 利用者は `Some(idx)` から `Edit::mutate(...)` で Model 側の選択 index を更新する。
     ///
     /// `selected` は現在選択中の index (0-based、`items` 範囲外なら何も表示しない)。
+    /// 本体の文字サイズは [`Ui::control_font_size`] (アプリの操作 widget 共通値)。
     pub fn dropdown(
         &mut self,
         id: impl Hash,
@@ -27,11 +27,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         items: &[&str],
         selected: usize,
     ) -> Option<usize> {
-        self.dropdown_with_font(id, rect, items, selected, DROPDOWN_FONT)
+        let font_size = self.control_font_size();
+        self.dropdown_with_font(id, rect, items, selected, font_size)
     }
 
     /// [`Self::dropdown`] の本体フォントサイズ指定版。狭い列に並べる dropdown
-    /// (インスペクタの 3 分割行など) で既定の 14px が大きすぎるときに使う。
+    /// (インスペクタの 3 分割行など) で共通値が大きすぎるときに使う。
     /// popup (項目一覧) の文字サイズはメニュー共通のまま — 読む側の一覧は本体の
     /// 狭さに合わせて縮めない。
     pub fn dropdown_with_font(

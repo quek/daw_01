@@ -43,6 +43,7 @@ pub mod status_bar;
 pub mod strip_sections;
 pub mod track_color;
 pub mod undo_history;
+pub mod window_placement;
 pub mod track_inspector;
 pub mod track_picker;
 pub mod transport;

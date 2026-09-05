@@ -9,7 +9,7 @@
 
 use super::*;
 
-use daw_ui_core::{ButtonTextAlign, TextInputStyle, ToggleButtonStyle};
+use daw_ui_core::{ButtonTextAlign, ToggleButtonStyle};
 
 use crate::app::{AppData, AppEvent, ClipKey};
 use crate::theme::Palette;
@@ -1645,7 +1645,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                         ("piano_roll_lyric", edit_id),
                         clipped,
                         &prefill,
-                        &TextInputStyle::default(),
+                        &ui.text_input_style(),
                         // on_change は per-keystroke で呼ばれるが、ここでは何もしない
                         // (commit 検出で 1 度だけ SetLyrics 発行 = 1 undo)。
                         |_new_text| Edit::mutate(|_: &mut AppData| {}),

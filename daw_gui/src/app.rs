@@ -377,6 +377,7 @@ impl AppData {
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
                 mixer_hovered_strip_section: None,
+                inspector_hovered_device: None,
                 master_hovered_section: None,
                 master_gain_dragging: false,
                 voicevox_chunk_editing: false,
@@ -1487,6 +1488,9 @@ impl AppData {
             }
             AppEvent::SetPluginSendAllKeys { device_id, enabled } => {
                 self.set_plugin_send_all_keys(device_id, enabled);
+            }
+            AppEvent::SetDevicesBypassed { device_ids, bypassed } => {
+                self.set_devices_bypassed(&device_ids, bypassed);
             }
             AppEvent::AddModSource { kind } => self.add_mod_source(kind),
             AppEvent::EditModSource { id, edit } => self.edit_mod_source(id, edit),

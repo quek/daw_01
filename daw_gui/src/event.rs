@@ -863,6 +863,14 @@ pub enum AppEvent {
         device_id: u64,
         enabled: bool,
     },
+    /// r.md #105: device 群を **信号経路から外す / 戻す** (Live の device off)。
+    /// engine は bypass 中の device を dispatch せず音声も MIDI も素通し、 映像 FX は
+    /// 解決から外れる。 `Q` (選択 device or カーソル直下のチェーン行) と チェーン行の
+    /// 右クリックメニュー「無効化 / 有効化」 から。 値は project に保存され undo 対象。
+    SetDevicesBypassed {
+        device_ids: Vec<u64>,
+        bypassed: bool,
+    },
     /// パラアウト (docs/plan_paraout.md): one-click "explode" — auto-create a
     /// child track per `is_main=false` output port of the plugin `device_id`,
     /// group them under the source track, and wire
@@ -1877,6 +1885,8 @@ impl AppEvent {
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
             E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
             E::SetPluginSendAllKeys { .. } => "プラグインへのキー送出設定",
+            E::SetDevicesBypassed { bypassed: true, .. } => "プラグインを無効化",
+            E::SetDevicesBypassed { bypassed: false, .. } => "プラグインを有効化",
             E::ExplodeParallelOut { .. } => "パラアウト展開",
             E::SetParallelOutputRoute { .. } => "パラアウト経路変更",
 

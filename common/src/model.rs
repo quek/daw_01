@@ -2835,6 +2835,14 @@ pub struct PluginInstance {
     /// 手動で全キーを譲る。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub send_all_keys_to_plugin: bool,
+    /// r.md #105: この device を **信号経路から外す** (Live の device off / Bitwig の
+    /// power ボタン / REAPER の bypass)。`true` の間、 engine はこの device を dispatch
+    /// せず、 音声も MIDI も手前の状態のまま次の device へ流れる (= pass-through)。
+    /// 報告 latency も 0 扱いで PDC から外れる。 映像 FX も同じフラグで解決から外れる。
+    /// プラグイン instance 自体は host に生きたまま (GUI は開ける、 state も保つ)。
+    /// project に保存し undo 対象 (= 「作った中身」)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bypassed: bool,
 }
 
 impl PluginInstance {
@@ -2850,6 +2858,7 @@ impl PluginInstance {
             ports: crate::port_config::PortConfig::default(),
             ara_archive: None,
             send_all_keys_to_plugin: false,
+            bypassed: false,
         }
     }
 
@@ -2869,6 +2878,7 @@ impl PluginInstance {
             ports,
             ara_archive: None,
             send_all_keys_to_plugin: false,
+            bypassed: false,
         }
     }
 
@@ -2882,7 +2892,7 @@ impl PluginInstance {
 /// `LoadSong` は plugin state / ARA アーカイブの肥大に依らず常に小さく、
 /// 16MB wire 上限に構造的に到達しない。encode / decode の field 順は一致
 /// させること (id → plugin_id → format → aux_inputs → aux_outputs →
-/// aux_output_count → ports → send_all_keys_to_plugin)。
+/// aux_output_count → ports → send_all_keys_to_plugin → bypassed)。
 impl bincode::Encode for PluginInstance {
     fn encode<E: bincode::enc::Encoder>(
         &self,
@@ -2895,7 +2905,8 @@ impl bincode::Encode for PluginInstance {
         self.aux_outputs.encode(encoder)?;
         self.aux_output_count.encode(encoder)?;
         self.ports.encode(encoder)?;
-        self.send_all_keys_to_plugin.encode(encoder)
+        self.send_all_keys_to_plugin.encode(encoder)?;
+        self.bypassed.encode(encoder)
     }
 }
 
@@ -2914,6 +2925,7 @@ impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
             ports: bincode::Decode::decode(decoder)?,
             ara_archive: None,
             send_all_keys_to_plugin: bincode::Decode::decode(decoder)?,
+            bypassed: bincode::Decode::decode(decoder)?,
         })
     }
 }

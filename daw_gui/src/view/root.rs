@@ -417,6 +417,14 @@ fn dispatch_note_nudge(ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
 /// 呼び出し側は従来どおり note / clip の mute へ進む。
 ///
 /// 対象面の算出は `view::strip_sections` (`mixer_hovered_strip_section`) が SSoT。
+/// r.md #105: `Q` が bypass 切替する device = **カーソル直下のチェーン行だけ** (S キーの
+/// ソロと同じ「カーソルがある行」規則)。 device の選択集合は使わない — チェーン行の
+/// 選択は画面上で見分けにくく、 選択優先にすると「別の行を指して押したのに前に click
+/// した行が切り替わる」 (実機 2026-09-05)。 空 = device は対象外 (clip / note へ落とす)。
+fn q_device_targets(app: &AppData) -> Vec<u64> {
+    app.ui_ephemeral.inspector_hovered_device.into_iter().collect()
+}
+
 fn toggle_hovered_strip_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -867,9 +875,22 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 内蔵チャンネルストリップ (docs/plan_channel_strip.md) が Q を先取りする:
     // カーソルが Comp / EQ の上にあればそのセクションのバイパスを切り替え、
     // 下の clip / note の mute へは落とさない。
+    // r.md #105: 次にインスペクタのプラグインチェーン。 対象の決め方は clip と同型 —
+    // カーソルがチェーン行の上なら「選択 device があればそれら、無ければその行」、
+    // チェーン外でも **最後に選んだ面が device** (last-wins、 `edit_surface` と同じ
+    // タイブレーカ) なら選択 device。 どちらでもなければ clip / note へ落とす。
     let mixer_active = app.ui_prefs.bottom_panel == Some(0) && pointer_in_bottom;
     if ui.take_shortcut("daw.toggle_mute") && !toggle_hovered_strip_section(app, ui, mixer_active) {
-        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
+        let device_targets = q_device_targets(app);
+        if !device_targets.is_empty() {
+            let bypassed = !app.all_devices_bypassed(&device_targets);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetDevicesBypassed {
+                    device_ids: device_targets,
+                    bypassed,
+                });
+            }));
+        } else if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
             // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
             // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
             // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。

@@ -138,7 +138,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.group_tracks", keys: &["Ctrl+G"], category: ShortcutCategory::Track, description: "選択トラックをグループ化", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.ungroup_tracks", keys: &["Alt+G"], category: ShortcutCategory::Track, description: "グループを解除", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_track_solo", keys: &["S"], category: ShortcutCategory::Track, description: "カーソル直下のトラックをソロ切替", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
-    ShortcutDef { name: "daw.toggle_mute", keys: &["Q"], category: ShortcutCategory::Track, description: "選択/カーソル下のクリップ・ノートをミュート切替", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.toggle_mute", keys: &["Q"], category: ShortcutCategory::Track, description: "選択/カーソル下のクリップ・ノート・プラグインをミュート切替", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // ----- クリップ・ノート -----
     ShortcutDef { name: "daw.duplicate_clip_shared", keys: &["D"], category: ShortcutCategory::ClipNote, description: "クリップ/トラックを複製 (共有・リンク)。ノート選択中はノート複製", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.duplicate_clip_unique", keys: &["Alt+D"], category: ShortcutCategory::ClipNote, description: "クリップ/トラックを複製 (独立コピー)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },

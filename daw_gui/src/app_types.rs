@@ -216,6 +216,9 @@ pub struct ChainEntry {
     /// チェーン行に警告色 + ⚠ を出し、 「読み込み失敗」 セクションで理由と
     /// 「再読込」 ボタンを出す (自動リトライはしない)。
     pub load_error: Option<String>,
+    /// r.md #105: 信号経路から外れている (`PluginInstance::bypassed`)。 行の名前を
+    /// dim 色で描く。 切替は `Q` / 右クリックメニュー (行にトグルは置かない)。
+    pub bypassed: bool,
 }
 
 impl ChainEntry {

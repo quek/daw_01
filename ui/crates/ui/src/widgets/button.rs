@@ -49,7 +49,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// `button_at` の font_size 可変版。 click 判定・外観は `button_at` と完全同一で、
-    /// テキストの font_size だけを呼び出し側が指定する。 16px 固定の `button_at` では
+    /// テキストの font_size だけを呼び出し側が指定する。 共通値の `button_at` では
     /// 大きすぎる狭い領域の小ボタン (mixer send slot の × 等) を、 ボタン外で
     /// `button_at_clicked_sized` + `push_edit` (pub(crate) で view から呼べない) を
     /// 手書きする boilerplate なしに置けるようにする。
@@ -82,16 +82,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         text: &str,
         rect: Rect,
     ) -> bool {
-        // 汎用ボタンの font_size は 16px 固定 (menu / dialog 等が依存)。
-        self.button_at_clicked_sized(id, text, rect, 16.0)
+        // 汎用ボタンの font_size はアプリ共通の操作 widget 文字サイズ
+        // (`UiHost::set_control_font_size`)。widget 側に px を焼き込まない。
+        let font_size = self.control_font_size();
+        self.button_at_clicked_sized(id, text, rect, font_size)
     }
 
     /// `button_at_clicked` の font_size 可変版。click 判定・外観 (fill / border / 角丸) は
     /// `button_at_clicked` と完全同一で、**テキストの font_size だけ**を呼び出し側が指定する。
     ///
-    /// 汎用 `button_at_clicked` は 16px 固定 (menu / dialog 等が依存) なので変えられないが、
-    /// arrangement の track 名のように `style.track_text_size` へ追従させたい widget が
-    /// boilerplate な再実装なしにサイズだけ差し替えられる (daw_01 #076)。
+    /// 汎用 `button_at_clicked` は共通値なので、arrangement の track 名のように
+    /// `style.track_text_size` へ追従させたい widget が boilerplate な再実装なしに
+    /// サイズだけ差し替えられる (daw_01 #076)。
     #[must_use]
     pub fn button_at_clicked_sized(
         &mut self,
@@ -304,8 +306,8 @@ mod tests {
     fn button_text_left_uses_measured_advance_not_approx() {
         // daw_01 #050 regression: `chars * 9.0` 固定 approx 廃止 → measure_text 化。
         // push_text の left が `(rect.w - measure_text) / 2` に一致することを確認。
-        let font_size = 16.0_f32; // button.rs 内 hardcode と同期
         let mut host: UiHost<()> = UiHost::no_redraw();
+        let font_size = host.control_font_size(); // 汎用 button は host 共通値で描く
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
         let rect = Rect { x: 20.0, y: 30.0, w: 100.0, h: 30.0 };
@@ -315,7 +317,7 @@ mod tests {
             measured_w = ui.measure_text("M", font_size);
             let _ = ui.button_at_clicked("btn", "M", rect);
         });
-        assert!(measured_w > 0.0, "measure_text(\"M\", 16) > 0");
+        assert!(measured_w > 0.0, "measure_text(\"M\", {font_size}) > 0");
 
         let glyph = scene.iter_glyphs().next().expect("text should be pushed");
         let expected_left = rect.x + (rect.w - measured_w) * 0.5;
@@ -366,9 +368,12 @@ mod tests {
     }
 
     #[test]
-    fn button_at_clicked_default_stays_16px() {
-        // 汎用 button は font_size 16px 固定のまま (menu / dialog 等が依存、byte-compat)。
+    fn button_at_clicked_default_follows_host_control_font_size() {
+        // daw_01 r.md #103: 汎用 button は px を焼き込まず、host の操作 widget 共通値
+        // (`set_control_font_size`) で描く。アプリが 12 にすれば 12 になる。
         let mut host: UiHost<()> = UiHost::no_redraw();
+        assert!(host.set_control_font_size(12.0));
+        assert!(!host.set_control_font_size(12.0), "同値は no-op");
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
         let rect = Rect { x: 20.0, y: 30.0, w: 100.0, h: 30.0 };
@@ -379,8 +384,8 @@ mod tests {
 
         let glyph = scene.iter_glyphs().next().expect("text should be pushed");
         assert!(
-            (glyph.font_size - 16.0).abs() < 1e-3,
-            "default button must stay 16px: got {}",
+            (glyph.font_size - 12.0).abs() < 1e-3,
+            "default button must follow host control font size: got {}",
             glyph.font_size
         );
     }

@@ -95,7 +95,7 @@ pub(super) fn draw_text_event(
             "inspector_text_content_input",
             Rect { x: input_x, y, w: string_input_w, h: input_h },
             &app.ui_ephemeral.clip_text_content_edit_text,
-            &TextInputStyle::default(),
+            &ui.text_input_style(),
             |s| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ClipTextContentEditChanged(s))

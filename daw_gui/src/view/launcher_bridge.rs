@@ -11,7 +11,7 @@
 //! - 空セル (`clip_id == 0`) の ▶ は「その行を止める」 (計画書 Q11)。
 //! - 空セルの選択は掴む実体が無いので、選択ではなくキーボード焦点の移動にする。
 
-use daw_ui_core::{Edit, TextInputStyle, Ui};
+use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ImportTrackTarget};
@@ -387,7 +387,7 @@ fn scene_rename_input(
         ("launcher_scene_rename", scene_id),
         input_rect,
         &app.launcher.scene_rename_text,
-        &TextInputStyle::default(),
+        &ui.text_input_style(),
         |new| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::Launcher(LauncherEvent::RenameSceneChanged(

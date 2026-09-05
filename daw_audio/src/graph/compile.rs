@@ -44,9 +44,10 @@ pub enum GraphError {
 pub type DeviceLatencies = HashMap<u64, u32>;
 
 /// `chain` 上の device が報告している latency の合計 (samples)。
-/// 未報告 (= 表に無い) device は 0 として扱う。
+/// 未報告 (= 表に無い) device は 0 として扱う。 bypass 中 (r.md #105) の device は
+/// dispatch されない = 遅延を生まないので 0 (Live / Bitwig と同じく PDC から外れる)。
 fn chain_latency(chain: &[common::model::PluginInstance], latencies: &DeviceLatencies) -> u32 {
-    chain.iter().fold(0u32, |acc, d| {
+    chain.iter().filter(|d| !d.bypassed).fold(0u32, |acc, d| {
         acc.saturating_add(latencies.get(&d.id).copied().unwrap_or(0))
     })
 }
@@ -223,7 +224,9 @@ pub fn compile_schedule(
         // v23 single-chain: sidechain wiring lives on every device's
         // `aux_inputs` regardless of its derived role, so a single walk over
         // `devices` covers what the old per-section walks did.
-        for p in &track.devices {
+        // r.md #105: bypass 中の device は dispatch されないので、その sidechain
+        // 配線も依存辺 / tap / latency のどれにも数えない (下の 3 走査と同じ規則)。
+        for p in track.devices.iter().filter(|p| !p.bypassed) {
             for route in p.aux_inputs.iter().flatten() {
                 if let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) {
                     out.push(src_idx);
@@ -558,7 +561,7 @@ pub fn compile_schedule(
     for (i, track) in song.tracks.iter().enumerate() {
         let tap_lag = if bus_flags[i] { 0 } else { buffer_frames };
         let mut max_sc: u32 = 0;
-        for p in &track.devices {
+        for p in track.devices.iter().filter(|p| !p.bypassed) {
             if !(p.ports.has_audio_input && p.ports.has_audio_output) {
                 continue;
             }
@@ -698,7 +701,8 @@ fn emit_aux_input_taps(
     id_to_idx: &HashMap<u32, u32>,
     nodes: &mut Vec<NodeOp>,
 ) {
-    for inst in chain {
+    // r.md #105: bypass 中の device は process されないので tap も staging しない。
+    for inst in chain.iter().filter(|p| !p.bypassed) {
         // aux port は engine が `MAX_AUX_IN` までしか staging しないので
         // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
         // `as u8` の wrap を防ぐ。
@@ -836,7 +840,7 @@ fn compute_path_latency(
     // sidechain source regardless of role (a sidechain edge from any device
     // raises this track's input latency), so a single walk over `devices`
     // replaces the old per-section walks.
-    for p in &track.devices {
+    for p in track.devices.iter().filter(|p| !p.bypassed) {
         for route in p.aux_inputs.iter().flatten() {
             consider(&Some(route.tap.source_track), cache);
         }
@@ -966,6 +970,61 @@ mod tests {
         let mut t = Track::default();
         f(&mut t);
         t
+    }
+
+    #[test]
+    fn bypassed_device_is_excluded_from_pdc_and_sidechain_taps() {
+        // r.md #105: bypass 中の device は dispatch されないので、報告 latency を
+        // PDC に数えず、sidechain tap も staging しない。
+        use common::plugin_format::PluginFormat;
+
+        let mut lat = DeviceLatencies::new();
+        let mut latent = latency_chain(&mut lat, 20, 2048);
+        latent[0].bypassed = true;
+        let song = Song {
+            tracks: vec![
+                track(|t| t.id = 1),
+                track(|t| {
+                    t.id = 2;
+                    t.devices = latent;
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.devices = vec![PluginInstance {
+                        id: 77,
+                        bypassed: true,
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            audio_fx_ports(),
+                        )
+                    }];
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+        assert_eq!(sched.master_latency_samples, 0, "bypass 中の 2048 sample は数えない");
+        assert!(
+            !sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::SidechainTap { device_id: 77, .. })),
+            "bypass 中の device へ SidechainTap を emit しない: nodes={:?}",
+            sched.nodes
+        );
+
+        // 同じ song で bypass を外すと両方が復活する (= 判定がフラグ由来であることの対照)。
+        let mut live = song;
+        live.tracks[1].devices[0].bypassed = false;
+        live.tracks[2].devices[0].bypassed = false;
+        let sched = compile_schedule(&live, &lat, 48_000, 0).unwrap();
+        assert_eq!(sched.master_latency_samples, 2048);
+        assert!(sched
+            .nodes
+            .iter()
+            .any(|op| matches!(op, NodeOp::SidechainTap { device_id: 77, .. })));
     }
 
     /// v23 single-chain: a pure audio-FX device (audio output only, no note

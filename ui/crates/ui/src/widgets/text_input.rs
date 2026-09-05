@@ -179,6 +179,14 @@ pub struct TextInputResponse {
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
+    /// アプリ共通の操作 widget 文字サイズ ([`Ui::control_font_size`]) で組んだ
+    /// [`TextInputStyle`]。`TextInputStyle::default()` はライブラリ単体の見た目
+    /// (14px) なので、アプリの通常欄はこちらを使う (daw_01 r.md #103)。
+    #[must_use]
+    pub fn text_input_style(&self) -> TextInputStyle {
+        TextInputStyle { font_size: self.control_font_size(), ..TextInputStyle::default() }
+    }
+
     /// 矩形指定で 1 行 text_input を描画 + キー入力処理。
     /// 編集が起きたら `on_change(new_text)` を Edit 列に積む。
     /// `style` は font_size / 内側余白 ([`TextInputStyle`])。

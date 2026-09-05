@@ -35,6 +35,10 @@ use crate::text_metrics::TextMetrics;
 use crate::theme::Palette;
 use crate::widgets::WidgetState;
 use crate::widgets::drag_in_rect::{DragInRectState, DragInfo, DragKind};
+
+mod debug_overlay;
+mod typography;
+pub use typography::DEFAULT_CONTROL_FONT_SIZE;
 use crate::widgets::drag_rect::{DragRect, DragRectState};
 
 /// アプリが 1 つ持つ UI ホスト。フレーム間で UI 内部状態を保持する。
@@ -63,6 +67,12 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// 並列スレッドで走るため (可変グローバルだとテーマを差し替えるテストが
     /// 他テストの色アサーションを壊す)。差し替えは [`UiHost::set_palette`]。
     palette: Arc<Palette>,
+    /// 操作 widget (button / dropdown / toggle / tab / text_input) の既定文字サイズ (px)。
+    /// **widget が font を焼き込まないための唯一の出どころ** — 旧実装は dropdown 14 /
+    /// button 16 / tab 14 と widget ごとに const を持ち、アプリ側の 11〜12px の
+    /// 読み出しと並べると 1 つだけ跳ねて見えた (daw_01 r.md #103)。差し替えは
+    /// [`UiHost::set_control_font_size`]、widget は [`Ui::control_font_size`] から読む。
+    control_font_size: f32,
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
     /// キーボードフォーカスを持つウィジェット (`text_input` 等)。
     focused: Option<WidgetId>,
@@ -225,6 +235,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
     pub fn new(redraw_request: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             palette: Arc::new(Palette::dark()),
+            control_font_size: DEFAULT_CONTROL_FONT_SIZE,
             state: HashMap::new(),
             focused: None,
             focus_changed_in_last_frame: false,
@@ -804,6 +815,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
 
         let mut ui = Ui {
             palette: &self.palette,
+            control_font_size: self.control_font_size,
             state: &mut self.state,
             scene,
             edits: &mut edits,
@@ -958,6 +970,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// r.md #48: このフレームで有効な色パレット (`UiHost` 所有の実体への借用)。
     /// widget は [`Ui::palette`] から読む。
     palette: &'a Palette,
+    /// 操作 widget の既定文字サイズ (`UiHost::control_font_size` の値)。
+    control_font_size: f32,
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
     edits: &'a mut Vec<Edit<M>>,
@@ -1716,89 +1730,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// caller は warp 着地を検出するロジック (例: press 位置と warp 先の中点を越えたか) を持つこと。
     pub fn warp_cursor(&mut self, x: f32, y: f32) {
         *self.pending_cursor_pos = Some((x, y));
-    }
-
-    // ============================================================
-    // M9 Phase 43: debug overlay
-    // ============================================================
-
-    /// 直近フレームの統計を `rect` の右上に半透明 overlay として描画する。
-    ///
-    /// `frame_ms` は app 側で測定した frame の所要時間 (window backend / render pipeline
-    /// により計測方法が違うので library は track せず引数で受ける)。`0.0` を渡せば省略。
-    ///
-    /// 表示項目:
-    /// - frame: `{frame_ms:.2}ms` (引数 `frame_ms` < 1e-6 なら省略)
-    /// - cache: `{hits} / {hits+misses}` + ヒット率 `{rate:.0}%`
-    /// - widgets: `{widget_count}` (scenegraph_size と通常一致)
-    ///
-    /// 統計は **前フレーム** の値 (今フレームは描画中でまだ確定していない)。`Ui::take_shortcut`
-    /// を組み合わせると Ctrl+F1 で toggle できる:
-    /// ```ignore
-    /// if ui.take_shortcut("debug_overlay_toggle") {
-    ///     m.show_debug = !m.show_debug;
-    /// }
-    /// if m.show_debug {
-    ///     ui.debug_overlay(area, last_frame_ms);
-    /// }
-    /// ```
-    pub fn debug_overlay(&mut self, rect: Rect, frame_ms: f32) {
-        let stats = self.last_frame_stats;
-        let line_h = 14.0;
-        let pad = 6.0;
-        let font_size = 11.0;
-        let lines: Vec<String> = {
-            let mut v = Vec::with_capacity(5);
-            if frame_ms.abs() > 1e-6 {
-                v.push(format!("frame  {frame_ms:>5.2}ms"));
-            }
-            let total = stats.cache_hits + stats.cache_misses;
-            v.push(format!(
-                "cache  {} / {} ({:>3.0}%)",
-                stats.cache_hits,
-                total,
-                stats.cache_hit_rate() * 100.0
-            ));
-            v.push(format!("wgts   {}", stats.widget_count));
-            v.push(format!("sg     {}", stats.scenegraph_size));
-            v
-        };
-        let lines_n = lines.len() as f32;
-        let bg_w = 200.0_f32.min(rect.w);
-        let bg_h = (lines_n * line_h + pad * 2.0).min(rect.h);
-        let bg_rect = Rect {
-            x: rect.x + rect.w - bg_w - pad,
-            y: rect.y + pad,
-            w: bg_w,
-            h: bg_h,
-        };
-        // M9 Phase 44a: popup buffer (= popup pass) に push して z-order 最前面に。
-        // Phase 43 で発見した「popup pass の glyph buffer 上書き」問題は Phase 44a で
-        // popup_glyph: GlyphPipeline を独立インスタンスにすることで根本解決済み。
-        let prev_in_popup = self.drawing_in_popup;
-        self.drawing_in_popup = true;
-        let p = self.palette();
-        self.push_rect(RectCommand {
-            rect: bg_rect,
-            fill: p.debug_overlay_bg,
-            border: p.debug_overlay_border,
-            border_width: 1.0,
-            radius: [3.0; 4],
-            clip_rect: None,
-        });
-        for (i, text) in lines.iter().enumerate() {
-            self.push_text(GlyphArea {
-                text: text.as_str().into(),
-                left: bg_rect.x + pad,
-                top: bg_rect.y + pad + (i as f32) * line_h,
-                font_size,
-                line_height: line_h,
-                color: p.debug_text,
-                clip_rect: None,
-                ..GlyphArea::default()
-            });
-        }
-        self.drawing_in_popup = prev_in_popup;
     }
 
     // ============================================================

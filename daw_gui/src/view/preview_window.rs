@@ -113,15 +113,25 @@ impl PreviewWindowState {
     /// monitors (the project may be 4K but the preview window
     /// shouldn't bigger than ~half the screen by default; user resize
     /// is allowed and the wgpu surface tracks it).
+    /// `saved` (r.md #107) は前回閉じたとき / 前回終了時の geometry。 あればそこへ
+    /// 復元し (画面外なら主モニタへ寄せる、 r.md #106 と同じ判定)、 無ければ映像解像度
+    /// から既定サイズで OS 任せの位置に出す。
     pub fn create(
         event_loop: &ActiveEventLoop,
         initial_size: (u32, u32),
         owner_hwnd: Option<isize>,
+        saved: Option<crate::window_state::PreviewGeometry>,
     ) -> Result<Self, String> {
         let (w, h) = scale_to_fit_on_screen(initial_size);
-        let attrs = WindowAttributes::default()
+        let mut attrs = WindowAttributes::default()
             .with_title("daw_01 — Video Preview")
             .with_inner_size(LogicalSize::new(w, h));
+        if let Some(g) = saved {
+            attrs = attrs
+                .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
+                .with_inner_size(LogicalSize::new(g.width, g.height));
+            super::window_placement::place_attrs_on_screen(&mut attrs, event_loop);
+        }
         // Windows: owner window を設定すると preview は main より常に前面、
         // main 最小化で preview も最小化、 タスクバーには出ない (= MV
         // プレビューを別ウィンドウで常時見えるようにする UX)。 winit の

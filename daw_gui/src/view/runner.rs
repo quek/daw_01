@@ -29,6 +29,8 @@ use winit::window::{WindowAttributes, WindowId};
 
 use crate::app::{AppData, AppEvent, ClipKey};
 use crate::launcher_time::RowTimeline;
+
+mod preview_events;
 use crate::view::shortcuts::daw_shortcut_map;
 use daw_ui_platform::WinitWindow;
 use daw_ui_platform::winit_backend::{
@@ -53,7 +55,29 @@ const SHUTDOWN_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 /// r.md #61: 終了コードは `AppEvent::Quit` に載って来る (`--smoke-test` が
 /// 判定結果を返すため)。通常の終了は常に 0。
 pub fn run(init: RunnerInit) -> Result<RunnerOutcome, winit::error::EventLoopError> {
-    let event_loop = winit::event_loop::EventLoop::<AppEvent>::with_user_event().build()?;
+    let mut builder = winit::event_loop::EventLoop::<AppEvent>::with_user_event();
+    // r.md #106: モニタ構成の変更 (`WM_DISPLAYCHANGE`) を拾う。winit はこのメッセージを
+    // イベントに翻訳しないので、message loop の hook で旗だけ立て、`new_events` で
+    // 窓が画面外に取り残されていないかを見る。hook は消費せず (`false`) 素通し。
+    let display_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        let flag = Arc::clone(&display_changed);
+        builder.with_msg_hook(move |msg| {
+            if msg.is_null() {
+                return false;
+            }
+            // SAFETY: winit は GetMessage で埋めた `MSG` の pointer を渡す (callback の
+            // 間だけ有効)。null は上で弾いた。読むだけ。
+            let msg = unsafe { &*msg.cast::<windows::Win32::UI::WindowsAndMessaging::MSG>() };
+            if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+            false
+        });
+    }
+    let event_loop = builder.build()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
     let proxy = event_loop.create_proxy();
@@ -61,6 +85,7 @@ pub fn run(init: RunnerInit) -> Result<RunnerOutcome, winit::error::EventLoopErr
         attrs: Some(init.window_attrs),
         build_app: Some(init.build_app),
         proxy,
+        display_changed,
         state: None,
         last_tick: Instant::now(),
         diag_window_start: None,
@@ -111,6 +136,10 @@ struct RunnerState {
     /// を受け付ける。 P5 で video frame、 P7 で composite texture を
     /// `scene` に push する経路がここに繋がる。
     preview: Option<crate::view::preview_window::PreviewWindowState>,
+    /// r.md #107: Video Preview 窓の直近 geometry。起動時に `window_state.json` から
+    /// 読み、閉じる直前 / 終了時に窓から取り直す。開くときの復元元で、終了時に
+    /// main 窓の geometry と一緒に書き戻す。
+    preview_geometry: Option<crate::window_state::PreviewGeometry>,
     /// docs/plan_video.md §3 P5: background worker thread that owns
     /// the per-source IMFSourceReader pool. The GUI thread sends
     /// decode requests via `worker.request(...)` (= non-blocking,
@@ -701,6 +730,9 @@ struct Runner {
     attrs: Option<WindowAttributes>,
     build_app: Option<Box<dyn FnOnce(EventLoopProxy<AppEvent>) -> AppData + Send>>,
     proxy: EventLoopProxy<AppEvent>,
+    /// r.md #106: `WM_DISPLAYCHANGE` を message hook が受けたら立つ。`new_events` が
+    /// 降ろして `ensure_main_window_on_screen` を走らせる。
+    display_changed: Arc<std::sync::atomic::AtomicBool>,
     state: Option<RunnerState>,
     last_tick: Instant,
     /// Diagnostic: rolling 30-frame window for main thread render rate.
@@ -787,7 +819,10 @@ impl ApplicationHandler<AppEvent> for Runner {
         if self.state.is_some() {
             return;
         }
-        let attrs = self.attrs.take().expect("WindowAttributes 既に消費");
+        let mut attrs = self.attrs.take().expect("WindowAttributes 既に消費");
+        // r.md #106: 保存位置がいまのモニタ構成で画面外なら作る前に主モニタへ寄せる
+        // (作ってから動かすと一瞬画面外に出てから戻る)。
+        super::window_placement::place_attrs_on_screen(&mut attrs, event_loop);
         let window = event_loop
             .create_window(attrs)
             .expect("create_window 失敗");
@@ -800,9 +835,11 @@ impl ApplicationHandler<AppEvent> for Runner {
         // 届かず、ピアノロール / アレンジビューの hover / drag でカーソル形状が
         // 変わらない。
         // undo は daw_gui の SongDoc snapshot が SSoT (lib 側 undo は S4a で撤去)。
-        let ui = UiHost::<AppData>::with_window(dwin.clone())
+        let mut ui = UiHost::<AppData>::with_window(dwin.clone())
             .with_shortcut_map(daw_shortcut_map())
             .with_clipboard(ArboardClipboard::new());
+        // r.md #103: 汎用 widget の文字サイズをアプリの読み出し文字 (12px) に揃える。
+        ui.set_control_font_size(crate::theme::CONTROL_FONT_PX);
 
         let build_app = self.build_app.take().expect("build_app 既に消費");
         let app = build_app(self.proxy.clone());
@@ -821,6 +858,14 @@ impl ApplicationHandler<AppEvent> for Runner {
             app
         };
 
+        // r.md #107: preview 窓の復元元。main 窓と同じファイルから読む (main の分は
+        // `main.rs` が起動時に `WindowAttributes` へ焼き込み済み)。
+        let preview_geometry = app
+            .ui_prefs
+            .app_dirs
+            .as_ref()
+            .and_then(|d| crate::window_state::load(d.window_state()))
+            .and_then(|s| s.preview);
         self.state = Some(RunnerState {
             window: dwin,
             renderer,
@@ -831,6 +876,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             ime_enabled: false,
             last_title: "daw_01".to_string(),
             preview: None,
+            preview_geometry,
             #[cfg(windows)]
             playback_worker: crate::video_playback_worker::PreviewDecodeWorker::new(),
             #[cfg(windows)]
@@ -856,6 +902,15 @@ impl ApplicationHandler<AppEvent> for Runner {
     /// 再試行する。 winit は `WaitUntil` の期限到来を `new_events(ResumeTimeReached)` で
     /// 通知するので、 ここが「復旧リトライを時間駆動で回す」 唯一の入口。
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        // r.md #106: モニタが減って窓が画面外に取り残されたら主モニタへ戻す。
+        if self.display_changed.swap(false, std::sync::atomic::Ordering::AcqRel)
+            && let Some(state) = self.state.as_ref()
+        {
+            super::window_placement::ensure_window_on_screen(state.window.inner());
+            if let Some(p) = state.preview.as_ref() {
+                super::window_placement::ensure_window_on_screen(p.window.inner());
+            }
+        }
         let due = self
             .state
             .as_ref()
@@ -981,6 +1036,12 @@ impl ApplicationHandler<AppEvent> for Runner {
                 }
                 WinitIme::Enabled | WinitIme::Disabled => {}
             },
+            // r.md #107: `is_synthetic` = winit がフォーカス移動時に「いま押されている
+            // キー」を合成した press / release。F12 で preview を開くと、まだ F12 を
+            // 押している間に preview へフォーカスが移り、preview 側に合成 press が届く
+            // (→ 転送すると toggle が二度走って開いた瞬間に閉じる)。逆向き (preview を
+            // 閉じて main にフォーカスが戻る) も同じ。実キーだけを shortcut に流す。
+            WindowEvent::KeyboardInput { is_synthetic: true, .. } => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 // ShortcutMap への dispatch は library 側 (UiHost::frame) が処理し、
                 // root.rs::build_root の末尾で `ui.take_shortcut(name)` で消費する。
@@ -1093,29 +1154,18 @@ impl ApplicationHandler<AppEvent> for Runner {
         #[cfg(windows)]
         crate::session_end::uninstall();
         let Some(state) = self.state.as_ref() else { return };
-        save_main_window_state(&state.window, state.app.ui_prefs.app_dirs.as_ref());
-    }
-}
-
-/// メインウィンドウの geometry を `window_state.json` に書く。
-fn save_main_window_state(
-    window: &WinitWindow,
-    app_dirs: Option<&common::app_dirs::AppDirs>,
-) {
-    let Some(path) = app_dirs.map(|d| d.window_state()) else { return };
-    let win = window.inner();
-    let size = win.inner_size();
-    let scale = win.scale_factor();
-    let pos = win.outer_position().unwrap_or(WinitPhysPos { x: 100, y: 100 });
-    let state = crate::window_state::WindowState {
-        width: f64::from(size.width) / scale,
-        height: f64::from(size.height) / scale,
-        x: pos.x,
-        y: pos.y,
-        maximized: win.is_maximized(),
-    };
-    if let Err(e) = crate::window_state::save(&path, &state) {
-        tracing::warn!(error = ?e, "failed to save window_state.json");
+        // r.md #107: preview が開いたまま終了したら、その窓のいまの geometry を保存する
+        // (閉じてから終了した場合は閉じる直前に取った値が `preview_geometry` に残る)。
+        let preview = state
+            .preview
+            .as_ref()
+            .and_then(|p| super::window_placement::preview_geometry_of(p.window.inner()))
+            .or(state.preview_geometry);
+        super::window_placement::save_main_window_state(
+            &state.window,
+            state.app.ui_prefs.app_dirs.as_ref(),
+            preview,
+        );
     }
 }
 
@@ -1542,237 +1592,6 @@ impl Runner {
         keep && (state.app.transport_rolling() || state.app.voicevox_animating(now))
     }
 
-    /// docs/plan_video.md P4: handle a WindowEvent dispatched against
-    /// the preview window. Limited to lifecycle / display events —
-    /// CloseRequested flips `AppData.preview_window_visible` to false
-    /// so the next frame's lifecycle pass destroys the OS window;
-    /// Resized synchronises the wgpu surface; RedrawRequested re-runs
-    /// the placeholder (or, post P5/P7, the composited frame).
-    fn handle_preview_window_event(&mut self, event: WindowEvent) {
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        let Some(preview) = state.preview.as_mut() else {
-            return;
-        };
-        match event {
-            WindowEvent::CloseRequested => {
-                state.app.ui_prefs.preview_window_visible = false;
-                // Lifecycle pass on the next render_frame drops the
-                // preview state; nothing else to do here.
-            }
-            WindowEvent::Resized(size) => {
-                preview.resize(daw_ui_platform::PhysicalSize {
-                    width: size.width,
-                    height: size.height,
-                });
-            }
-            // r.md #49: preview 窓も daw_01 の窓なので、ここを触っている間は
-            // アプリはアクティブ。これを拾わないと preview をクリックした瞬間に
-            // main が `Focused(false)` を受けて「非アクティブ」と誤判定する
-            // (preview 側の `Focused(true)` はどこにも届かない)。
-            WindowEvent::Focused(focused) => {
-                state.app.activity.preview_focused = focused;
-                state.app.sync_app_active_with_audio();
-                if focused {
-                    state.window.request_redraw();
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                // device lost はメインループ側の復旧シーケンスが拾う (ここで再帰的に
-                // request_redraw しないことで、 消失中の preview スピンも止まる)。
-                match preview.render(&state.app.theme) {
-                    Ok(()) => state.preview_error_log.reset(),
-                    // device lost はメインループ側の復旧シーケンスが拾う。
-                    Err(e) if e.is_device_lost() => {}
-                    Err(e) => {
-                        state.preview_error_log.record(
-                            Instant::now(),
-                            "preview render error",
-                            &e,
-                        );
-                    }
-                }
-            }
-            // r.md #26: preview window にフォーカスがあるときの Space で
-            // 再生 / 停止をトグル。 preview には text 入力欄が無いので無条件で
-            // transport に割り当てられる。 auto-repeat (押しっぱなし) は無視して
-            // 1 押下 1 トグルにする。 main window の `daw.play_toggle` と同じ
-            // `AppEvent::PlayToggle` を proxy 経由で送る (user_event 経路を通り、
-            // main window の redraw 要求と再生スレッド起動が同一 SSoT で走る)。
-            WindowEvent::KeyboardInput { event, .. }
-                if matches!(event.state, winit::event::ElementState::Pressed)
-                    && !event.repeat
-                    && matches!(
-                        map_phys_key(event.physical_key),
-                        daw_ui_platform::PhysicalKey::Space
-                    ) =>
-            {
-                let _ = self.proxy.send_event(AppEvent::PlayToggle);
-            }
-            // `docs/plan_image_overlay.md` §4 P5: PiP rect の drag 編集。
-            // CursorMoved / MouseInput を捕捉して、 hit-test → drag
-            // state 開始 → MouseMoved delta から normalized rect 更新
-            // → AppEvent::SetClipImage{X,Y,W,H} 発火。
-            WindowEvent::CursorMoved { position, .. } => {
-                let cursor = (position.x as f32, position.y as f32);
-                state.preview_cursor = Some(cursor);
-                if let Some(drag) = state.preview_drag {
-                    let size = preview.renderer.size();
-                    let project_resolution = state.app.song_doc.song().video_resolution;
-                    let project_box = preview_project_box(
-                        (size.width as f32, size.height as f32),
-                        project_resolution,
-                    );
-                    // 描画 (`draw_selection_overlay`) と同じ **ライブの**
-                    // `selection_group_transform` で逆写像する。こうすると描画・
-                    // hit-test・drag が常に同一の group affine を共有し、再生中に
-                    // automation が group を動かしてもハンドルが cursor とズレない
-                    // （凍結値だと描画はライブ・drag は古い値で不一致になる）。
-                    // 通常 image は None = 恒等写像。
-                    let map = match preview.selection_group_transform {
-                        Some(t) => crate::group_compose::CanvasMap::group(&t, project_box),
-                        None => crate::group_compose::CanvasMap::project(project_box),
-                    };
-                    handle_preview_drag(&state.app, &self.proxy, &drag, cursor, &map);
-                }
-                if let Some(gdrag) = state.preview_group_drag {
-                    let size = preview.renderer.size();
-                    let project_resolution = state.app.song_doc.song().video_resolution;
-                    handle_group_drag(
-                        &self.proxy,
-                        &gdrag,
-                        cursor,
-                        (size.width as f32, size.height as f32),
-                        project_resolution,
-                    );
-                }
-            }
-            WindowEvent::CursorLeft { .. } => {
-                state.preview_cursor = None;
-            }
-            WindowEvent::MouseInput {
-                state: button_state,
-                button: winit::event::MouseButton::Left,
-                ..
-            } => {
-                let pressed = matches!(button_state, winit::event::ElementState::Pressed);
-                if pressed {
-                    if let Some(cursor) = state.preview_cursor
-                        && let Some(overlay) = preview.selection_overlay
-                        && let Some(target) = state.app.selected_clip_ref()
-                    {
-                        let size = preview.renderer.size();
-                        let screen = (size.width as f32, size.height as f32);
-                        let rotation = preview.selection_rotation_radians;
-                        let project_resolution = state.app.song_doc.song().video_resolution;
-                        let project_box = preview_project_box(screen, project_resolution);
-                        // 選択中 clip が active visual group の子なら親 group の
-                        // affine を合成（= ハンドルが立ち絵に重なる）。drag 中は
-                        // 毎 frame ライブの `selection_group_transform` を読み直す
-                        // ので、ここでは凍結しない（描画と完全一致）。
-                        let map = match preview.selection_group_transform {
-                            Some(t) => crate::group_compose::CanvasMap::group(&t, project_box),
-                            None => crate::group_compose::CanvasMap::project(project_box),
-                        };
-                        let mode = hit_test_handles(overlay, rotation, &map, cursor);
-                        if let Some(mode) = mode {
-                            // rect 中心 (canvas→screen 写像後) と cursor の角度を
-                            // 保存 (Rotate mode の delta 計算で使う)。
-                            let (nx, ny, nw, nh) = overlay;
-                            let (cx0, cy0) = map.to_screen(nx + nw * 0.5, ny + nh * 0.5);
-                            let start_cursor_angle =
-                                (cursor.1 - cy0).atan2(cursor.0 - cx0);
-                            state.preview_drag = Some(PreviewDragState {
-                                mode,
-                                start_cursor: cursor,
-                                start_rect: overlay,
-                                start_rotation_radians: rotation,
-                                start_cursor_angle,
-                                target,
-                            });
-                            // drag begin: snapshot 1 個 + lane recording
-                            // seed。 image / text で別 marker event を
-                            // 撃つ (= 後者は `docs/plan_text_overlay.md`
-                            // §4 P6)。 target の clip kind で振り分ける。
-                            let drag_target_kind =
-                                preview_drag_target_kind(&state.app, target);
-                            let begin_ev = match drag_target_kind {
-                                PreviewDragTargetKind::Text => AppEvent::BeginTextPiPDrag,
-                                _ => AppEvent::BeginImagePiPDrag,
-                            };
-                            let _ = self.proxy.send_event(begin_ev);
-                        }
-                    }
-                    // Transform box drag begin（clip drag が始まらなかったときのみ）。
-                    // 選択中トラックに Transform 配置 device が刺さって
-                    // いれば対象（立ち絵 group も通常トラックも）。base group_transform は
-                    // device 追加時に materialize 済なので overlay と同じ effective transform
-                    // で hit-test する（枠が出れば必ず掴める）。
-                    // r.md #87: 行ごとの実効拍。`if let` の鎖に埋めるとネストが 1 段
-                    // 深くなるので手前で組む (engine が publish していない行は
-                    // `RowTimeline` が `Song.launcher` へ倒す)。
-                    let running = state.app.launcher_running_rows();
-                    let beat = state.app.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
-                    let rows = RowTimeline::with_running(0.0, beat, &running);
-                    if state.preview_drag.is_none()
-                        && let Some(cursor) = state.preview_cursor
-                        && let Some(track_id) = state.app.cursor_track_id()
-                        && let Some(track) = state.app.song_doc.song().track_by_id(track_id)
-                        && let Some(transform) = crate::video_fx::resolve_track_transform(
-                            state.app.song_doc.song(),
-                            track,
-                            &rows,
-                            state.app.transport.mod_plane.as_ref(),
-                        )
-                    {
-                        let size = preview.renderer.size();
-                        let screen = (size.width as f32, size.height as f32);
-                        let project_resolution = state.app.song_doc.song().video_resolution;
-                        let project_box = preview_project_box(screen, project_resolution);
-                        if let Some(mode) = group_hit_test(&transform, project_box, cursor) {
-                            let (rx, ry, _rw, _rh, _rot, px, py, _) =
-                                crate::group_compose::group_quad_params(
-                                    &transform,
-                                    project_box,
-                                );
-                            let pivx = rx + px;
-                            let pivy = ry + py;
-                            state.preview_group_drag = Some(GroupDragState {
-                                mode,
-                                start_cursor: cursor,
-                                start_transform: transform,
-                                target_track_id: track_id,
-                                pivot_screen: (pivx, pivy),
-                                start_cursor_angle: (cursor.1 - pivy)
-                                    .atan2(cursor.0 - pivx),
-                                start_pivot_dist: (cursor.0 - pivx)
-                                    .hypot(cursor.1 - pivy),
-                            });
-                            let _ =
-                                self.proxy.send_event(AppEvent::BeginGroupTransformDrag);
-                        }
-                    }
-                } else {
-                    if let Some(drag) = state.preview_drag.take() {
-                        // drag end: lane recording seed のクリア。 begin と同
-                        // kind の End event を送る。
-                        let end_ev =
-                            match preview_drag_target_kind(&state.app, drag.target) {
-                                PreviewDragTargetKind::Text => AppEvent::EndTextPiPDrag,
-                                _ => AppEvent::EndImagePiPDrag,
-                            };
-                        let _ = self.proxy.send_event(end_ev);
-                    }
-                    if state.preview_group_drag.take().is_some() {
-                        let _ = self.proxy.send_event(AppEvent::EndGroupTransformDrag);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// docs/plan_video.md P4: keep the preview window in sync with
     /// `AppData.preview_window_visible`. Called once per frame from
     /// `render_frame`. Creating the window requires an
@@ -1800,6 +1619,7 @@ impl Runner {
                     event_loop,
                     initial_size,
                     owner_hwnd,
+                    state.preview_geometry,
                 ) {
                     Ok(p) => {
                         // Immediately request a redraw so the placeholder
@@ -1822,6 +1642,14 @@ impl Runner {
                 }
             }
             (false, true) => {
+                // r.md #107: 閉じる直前の geometry を次に開くとき / 終了時の保存に使う。
+                if let Some(g) = state
+                    .preview
+                    .as_ref()
+                    .and_then(|p| super::window_placement::preview_geometry_of(p.window.inner()))
+                {
+                    state.preview_geometry = Some(g);
+                }
                 // Dropping `PreviewWindowState` releases the wgpu
                 // Renderer first (struct field order) then the Arc
                 // chain — winit closes the OS window when the last
