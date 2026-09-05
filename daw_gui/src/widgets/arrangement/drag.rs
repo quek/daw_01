@@ -389,8 +389,8 @@ fn emit_lane_height(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     }
     // M14 Phase 63n-6 (#031): max は `min(style.max, lanes.h)` で runtime clamp。
     // style 値は絶対 cap、 lanes.h は描画 pane の現在縦サイズ (= 「画面いっぱい」)。
-    let max_h = effective_lane_max_height(f.style, f.lanes);
-    let min_h = f.style.automation_lane_min_height_px;
+    let max_h = effective_lane_max_height(f.lanes);
+    let min_h = MIN_ARRANGE_LANE_H_PX;
     let mut emit: Option<(AutomationLaneKey, u16, u16)> = None;
     {
         let state: &mut ArrangementState = ui.widget_state(f.wid);

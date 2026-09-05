@@ -38,6 +38,29 @@ impl RecentFiles {
             self.paths.truncate(MAX_RECENT);
         }
     }
+
+    /// Drop every entry whose file no longer exists on disk. Returns whether
+    /// anything was removed so the caller can persist only on change.
+    ///
+    /// Run at startup (the lists are read from disk once) and after a failed
+    /// open from the menu; not per frame, since `is_file()` is a syscall.
+    pub fn retain_existing(&mut self) -> bool {
+        let before = self.paths.len();
+        self.paths.retain(|p| p.is_file());
+        self.paths.len() != before
+    }
+
+    /// Remove `path` (same dedup key as [`push`](Self::push)). Returns whether
+    /// an entry was removed.
+    pub fn remove(&mut self, path: &Path) -> bool {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let before = self.paths.len();
+        self.paths.retain(|p| {
+            let pc = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            pc != canon
+        });
+        self.paths.len() != before
+    }
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<RecentFiles> {
@@ -102,6 +125,20 @@ mod tests {
         save(&path, &r).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.paths, r.paths);
+    }
+
+    #[test]
+    fn retain_existing_drops_missing_files() {
+        let dir = tempdir().unwrap();
+        let present = dir.path().join("present.daw");
+        std::fs::write(&present, b"x").unwrap();
+        let mut r = RecentFiles::default();
+        r.push(dir.path().join("gone.daw"));
+        r.push(present.clone());
+        r.push(dir.path().join("also_gone.daw"));
+        assert!(r.retain_existing());
+        assert_eq!(r.paths, vec![present]);
+        assert!(!r.retain_existing());
     }
 
     #[test]

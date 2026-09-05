@@ -228,7 +228,7 @@ pub enum AppEvent {
     },
     /// gui_01 #030 (M14 Phase 63n-5): lane 高さ drag (Alt+drag or
     /// 下端 splitter)。`prev` / `next` は px、widget 側で
-    /// `[automation_lane_min_height_px, automation_lane_max_height_px]`
+    /// `[MIN_ARRANGE_LANE_H_PX, min(MAX_ARRANGE_LANE_H_PX, lanes pane 高)]`
     /// に clamp 済。drag 中は per-frame 発火 (live preview)、release で
     /// 1 件確定。`SetLaneDefault` と同パターン。
     SetLaneHeight {

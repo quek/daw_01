@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::AppData;
+use crate::app::{AppData, MAX_ARRANGE_LANE_H_PX, MIN_ARRANGE_LANE_H_PX};
 use crate::view::snap;
 use crate::view::track_color;
 
@@ -104,7 +104,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         lane_height_overrides: &app.ui_prefs.automation_lane_row_overrides,
         content_names: &labels.content_names,
         active_groups: &active_groups,
-        lane_h_bounds: lane_h_bounds(app, area),
+        lane_h_bounds: lane_h_bounds(area),
     };
     let tracks: Vec<ArrangementTrack> = app
         .song_doc
@@ -586,17 +586,15 @@ pub(crate) fn clip_display_label(clip: &common::model::Clip, song: &common::mode
 
 /// 表示に使うレーン行高の `(min, max)`。
 ///
-/// max は **レーンが描かれるペインの高さ** (`geometry::lane_pane_cap_px`) と style の
-/// 絶対上限の小さい方。min を下回らせないのは、ペインが極端に小さいフレーム
-/// (起動直後 / 帯を畳んだ瞬間) で全レーンが 0 px に潰れないようにするため。
-fn lane_h_bounds(app: &AppData, area: Rect) -> (u16, u16) {
-    let style = super::ArrangementStyle::from_theme(&app.theme);
+/// min は track 行と同じ `MIN_ARRANGE_ROW_H` (= `MIN_ARRANGE_LANE_H_PX`)。 `X` (fit) が
+/// 全行を同じ高さに敷き詰めるので、 lane 行だけ別の下限を持つと fit の値が押し戻されて
+/// lane 行が他より高くなる。 max は **レーンが描かれるペインの高さ**
+/// (`geometry::lane_pane_cap_px`) と絶対上限の小さい方。min を下回らせないのは、ペインが
+/// 極端に小さいフレーム (起動直後 / 帯を畳んだ瞬間) で全レーンが 0 px に潰れないようにするため。
+fn lane_h_bounds(area: Rect) -> (u16, u16) {
     let lanes_h = (area.h - RULER_H - SECTION_LANE_H).max(0.0);
-    let min = style.automation_lane_min_height_px;
-    let max = style
-        .automation_lane_max_height_px
-        .min(super::geometry::lane_pane_cap_px(lanes_h))
-        .max(min);
+    let min = MIN_ARRANGE_LANE_H_PX;
+    let max = MAX_ARRANGE_LANE_H_PX.min(super::geometry::lane_pane_cap_px(lanes_h)).max(min);
     (min, max)
 }
 

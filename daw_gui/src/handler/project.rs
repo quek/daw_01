@@ -723,7 +723,23 @@ impl AppData {
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to load project");
                 self.ui_ephemeral.status_message = format!("Open 失敗: {e:#}");
+                self.forget_recent_if_missing(&path);
             }
+        }
+    }
+
+    /// 消えた / 移動したファイルを Open Recent / Recently Saved から外す (Reaper と同じ:
+    /// 開けなかった時点で履歴から消す)。 存在するのに読めなかった (壊れている / 権限)
+    /// ものは残す — ユーザーが場所を見失わないため。
+    fn forget_recent_if_missing(&mut self, path: &Path) {
+        if path.is_file() {
+            return;
+        }
+        if self.ui_prefs.recent_files.remove(path) {
+            self.persist_recent_files();
+        }
+        if self.ui_prefs.recent_saved.remove(path) {
+            self.persist_recent_saved();
         }
     }
 
@@ -748,16 +764,40 @@ impl AppData {
     /// `AppData::new` が `recent_files: load_recent_files()` で paths を
     /// 復元するため、 同時に label cache も復元したい。 caller (= bootstrap)
     /// が `app.init_recent_labels()` を 1 回呼ぶ。
+    ///
+    /// 同時に、 disk から消えた / 移動したファイルを両方の履歴から落とす
+    /// (Ableton Live / Bitwig と同じく起動時に整理)。 落としたときだけ書き戻す。
     pub fn init_recent_labels(&mut self) {
-        self.ui_prefs.recent_files_labels =
-            Self::rebuild_recent_labels(&self.ui_prefs.recent_files.paths);
-        self.ui_prefs.recent_saved_labels =
-            Self::rebuild_recent_labels(&self.ui_prefs.recent_saved.paths);
+        if self.ui_prefs.recent_files.retain_existing() {
+            self.persist_recent_files();
+        } else {
+            self.ui_prefs.recent_files_labels =
+                Self::rebuild_recent_labels(&self.ui_prefs.recent_files.paths);
+        }
+        if self.ui_prefs.recent_saved.retain_existing() {
+            self.persist_recent_saved();
+        } else {
+            self.ui_prefs.recent_saved_labels =
+                Self::rebuild_recent_labels(&self.ui_prefs.recent_saved.paths);
+        }
     }
 
     /// 「最近開いたファイル」 履歴に追加。 `recent.json` に永続化。
     pub(crate) fn push_recent(&mut self, path: PathBuf) {
         self.ui_prefs.recent_files.push(path);
+        self.persist_recent_files();
+    }
+
+    /// 「最近保存したファイル」 履歴に追加。 `recent_saved.json` に永続化。
+    /// 開いた履歴 (`recent_files`) と完全に独立。 Save / Save As の両 path
+    /// で実 file 書き込み成功後に呼ぶ。
+    pub(crate) fn push_recent_saved(&mut self, path: PathBuf) {
+        self.ui_prefs.recent_saved.push(path);
+        self.persist_recent_saved();
+    }
+
+    /// `recent_files` の変更を label cache と `recent.json` へ反映する唯一の口。
+    fn persist_recent_files(&mut self) {
         self.ui_prefs.recent_files_labels =
             Self::rebuild_recent_labels(&self.ui_prefs.recent_files.paths);
         if let Some(disk) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recent())
@@ -771,11 +811,8 @@ impl AppData {
         }
     }
 
-    /// 「最近保存したファイル」 履歴に追加。 `recent_saved.json` に永続化。
-    /// 開いた履歴 (`recent_files`) と完全に独立。 Save / Save As の両 path
-    /// で実 file 書き込み成功後に呼ぶ。
-    pub(crate) fn push_recent_saved(&mut self, path: PathBuf) {
-        self.ui_prefs.recent_saved.push(path);
+    /// `recent_saved` の変更を label cache と `recent_saved.json` へ反映する唯一の口。
+    fn persist_recent_saved(&mut self) {
         self.ui_prefs.recent_saved_labels =
             Self::rebuild_recent_labels(&self.ui_prefs.recent_saved.paths);
         if let Some(disk) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recent_saved())

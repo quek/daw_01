@@ -75,6 +75,10 @@ fn draw_rows_inner(
             continue;
         }
 
+        // automation lane header の click も、 その lane を持つ track の選択 (master 行を含む
+        // 全 track 共通なので分岐の前で 1 度だけ判定する)。
+        lane_header_click(ui, f, t, row.y + row.h, clicks);
+
         // M14 Phase 63n-10 (#034): master row 専用 header 描画。 mute/solo button / volume band /
         // group disclosure / row click → トラック選択の全 path を skip し、 neutral gray 背景 +
         // "Master" label + lane disclosure (`+`/`-`) のみを描画する (daw_01 #034 §B 仕様)。
@@ -399,6 +403,59 @@ fn draw_rows_inner(
         {
             clicks.clicked_track = Some(t.id);
         }
+    }
+}
+
+/// automation lane header (track 行の下に展開する lane 行の header 部) の click を、 track
+/// header の row click と同じ `clicked_track` 経路に乗せる (= 修飾 Shift / Ctrl も同じ規則で
+/// 効く)。 lane header の button (★ / 👁 / ▣ / ✕) と default 値フィールド (caller が
+/// scrubable_number_at を overlay する rect) は除外する — 除外しないと button / scrub の
+/// release が選択更新を併発して multi-select が単一に潰れる (track 行の M·S·R / volume band
+/// 除外と同じ理由)。 lane 行の縦範囲は press 側 (`press_header::lane_header`) と同じ積み方。
+fn lane_header_click(
+    ui: &Ui<'_, AppData>,
+    f: &ArrangementFrame<'_>,
+    t: &ArrangementTrack,
+    track_row_bottom: f32,
+    clicks: &mut HeaderClicks,
+) {
+    if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
+        return;
+    }
+    let pointer = f.pointer;
+    if !pointer.primary_just_released || ui.has_open_popups() {
+        return;
+    }
+    let Some((rx, ry)) = pointer.pos else { return };
+    let style = f.style;
+    let header_indent = f32::from(t.depth) * style.indent_px;
+    let mut lane_y = track_row_bottom;
+    for lane in &t.automation_lanes {
+        if !lane.visible {
+            continue;
+        }
+        let lh = f32::from(lane.height_px);
+        let header_rect = Rect {
+            x: f.header_pane.x + header_indent,
+            y: lane_y,
+            w: (f.header_pane.w - header_indent).max(2.0),
+            h: lh,
+        };
+        lane_y += lh;
+        if !header_rect.contains(rx, ry) {
+            continue;
+        }
+        let on_control = automation_lane_header_layout(header_rect, style).is_some_and(|l| {
+            l.enabled_icon_rect.contains(rx, ry)
+                || l.visible_icon_rect.contains(rx, ry)
+                || l.mute_icon_rect.contains(rx, ry)
+                || l.delete_icon_rect.contains(rx, ry)
+                || l.default_field_rect.is_some_and(|r| r.contains(rx, ry))
+        });
+        if !on_control {
+            clicks.clicked_track = Some(t.id);
+        }
+        return;
     }
 }
 

@@ -482,11 +482,7 @@ pub(super) fn commit_releases(
             let dy = rd.last_mouse_y - rd.anchor_mouse_y;
             let raw = f32::from(rd.anchor_height_px) + dy;
             // M14 Phase 63n-6 (#031): release も runtime clamp (style.max ∧ lanes.h)。
-            let end = clamp_height_px(
-                raw,
-                style.automation_lane_min_height_px,
-                effective_lane_max_height(style, lanes),
-            );
+            let end = clamp_height_px(raw, MIN_ARRANGE_LANE_H_PX, effective_lane_max_height(lanes));
             if end != rd.anchor_height_px {
                 ui.push_edit({ let v_lane = rd.lane; let v_prev = rd.anchor_height_px; let v_next = end; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetLaneHeight { track_id: v_lane.track, lane_id: v_lane.lane, prev_px: v_prev, next_px: v_next }); }) });
             }
@@ -877,8 +873,8 @@ pub(super) fn commit_releases(
                 // 残ったまま」 → 各 override を factor 倍する。 個別差は scale 中保持 (lane1=100,
                 // lane2=60 → lane1=70, lane2=42)、 enough wheel で min に収束 (= 個別差は残るが、
                 // ユーザは引き続き wheel で全体を縮められる)。
-                let lane_min = style.automation_lane_min_height_px;
-                let lane_max = effective_lane_max_height(style, lanes);
+                let lane_min = MIN_ARRANGE_LANE_H_PX;
+                let lane_max = effective_lane_max_height(lanes);
                 for t in visible_tracks {
                     // per-track row 高さ override (= `t.row_h.is_some()`) も factor 倍。 None
                     // (= view default 追従) は SetTrackRowH 経由で既に追従するので scale 不要。

@@ -52,8 +52,9 @@ use daw_ui_core::{
 use crate::audio_source_cache::AudioSourceBuffer;
 
 use crate::app::{
-    AppData, AppEvent, AutomationPointKeyRef, ClipEventRef, FadeEdgeKind, MoveAutomationClipEntry,
-    MoveAutomationPointEntry, ResizeAutomationClipEntry,
+    AppData, AppEvent, AutomationPointKeyRef, ClipEventRef, FadeEdgeKind, MAX_ARRANGE_LANE_H_PX,
+    MIN_ARRANGE_LANE_H_PX, MoveAutomationClipEntry, MoveAutomationPointEntry,
+    ResizeAutomationClipEntry,
 };
 
 pub(crate) mod view_build;
@@ -1217,7 +1218,9 @@ pub struct ArrangementStyle {
     pub automation_default_line_color: Color,
     /// default_value 水平線の太さ (px)。 default 1.0。
     pub automation_default_line_width_px: f32,
-    /// lane 内 clip rect の縦 padding (px、 上下にこの px を確保した残りを clip rect の高さに)。 default 6.0。
+    /// lane 内 clip rect の縦 padding (px、 上下にこの px を確保した残りを clip rect の高さに)。
+    /// default は track 行の clip と同じ `geometry::CLIP_V_PAD_PX` (= 2.0)。 point dot
+    /// (半径 4 px) は値 0 / 1 で clip 矩形から 2 px はみ出すが行の中には収まる。
     pub automation_clip_v_pad_px: f32,
     /// M14 Phase 63n-4 (#029): lane body 空き領域の dblclick で発行する `CreateAutomationClip`
     /// の既定長 (拍)。 default 4.0 (= 1 bar @ 4/4)。 caller は受信時に自前のポリシー (例えば「次 clip
@@ -1230,24 +1233,14 @@ pub struct ArrangementStyle {
     pub automation_default_field_h: f32,
     /// M14 Phase 63n-5 (#030): lane 下端 splitter drag の hot zone 高さ (px)。 default 4.0。
     /// `lane_y + lh - handle ≤ py < lane_y + lh` の y 範囲 + body x 範囲が hit zone。
-    /// `automation_clip_v_pad_px` (= 6.0) の bottom padding 内に収まるよう小さめに設定 (clip rect とは
-    /// 衝突しない: clip 縦範囲は body.y+pad..body.y+h-pad)。
+    /// clip 矩形の下端 2 px (`automation_clip_v_pad_px`) と重なるが、 splitter は press 判定の
+    /// 先頭で排他評価されるので track 行の下端 splitter と同じ扱いになる。
     pub automation_lane_resize_handle_px: f32,
     /// M14 Phase 117 (daw_01 #091): track header 列と lanes の境界 (`rect.x + header_w` の縦線) を中心と
     /// した header 幅 drag splitter の hot zone 幅 (px、 横方向)。 default 8.0 → 境界 ±4px。 track header
     /// 右端には常に 4px の inner pad があり、 この splitter の header 側 (±4px の左半分) はその pad に収まる
     /// ので M/S/R ボタン / lane disclosure / volume band と衝突しない。 `0.0` で header 幅 drag を無効化。
     pub header_resize_handle_px: f32,
-    /// M14 Phase 63n-5 (#030): lane 高さ drag の **下限 px** (`SetLaneHeight.next` clamp 用)。 default 30。
-    /// 30 px は header の icon row + label が 1 段で読める最小 (Bitwig "small" preset 相当)。
-    pub automation_lane_min_height_px: u16,
-    /// M14 Phase 63n-5 (#030) / 63n-6 (#031): lane 高さ drag の **上限 px**。 default 2000。
-    /// 実効 max は **`min(style.automation_lane_max_height_px, lanes.h.round())`** (= 描画 pane の
-    /// 縦サイズ以下に runtime clamp される、 daw_01 #031 の「最大は画面いっぱいまで」 要望対応)。
-    /// style 値は「絶対 cap」 として、 lanes.h が極端に小さい場合 (= overflow scroll 中) でも lane が
-    /// 過剰に伸びないようにする safety net。 default 2000 は典型 desktop の縦サイズ (1080〜1440 px) を
-    /// 上回るため事実上無制限。
-    pub automation_lane_max_height_px: u16,
     /// automation lane disclosure (`+` / `-`) glyph の描画 font size。 default = `track_text_size`。
     pub automation_disclosure_size: f32,
     /// lane header に描く icon glyph (`★` / `[V]` / `👁` / `▣` / `✕`) の font size。 default = `track_text_size`。
@@ -1438,13 +1431,11 @@ impl ArrangementStyle {
             automation_lasso_border: p.accent.with_alpha(0.60),
             automation_default_line_color: p.grid_line.with_alpha(0.18),
             automation_default_line_width_px: 1.0,
-            automation_clip_v_pad_px: 6.0,
+            automation_clip_v_pad_px: geometry::CLIP_V_PAD_PX,
             automation_clip_default_len_beats: 4.0,
             automation_default_field_h: 18.0,
             automation_lane_resize_handle_px: 4.0,
             header_resize_handle_px: 8.0,
-            automation_lane_min_height_px: 30,
-            automation_lane_max_height_px: 2000,
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
             automation_lane_text_color: p.text,

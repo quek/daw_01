@@ -78,18 +78,31 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // body text) に統一。MIDI/file ラベルの可読性を上げる。
     // 待受表示が出ると開始位置が右へずれるので、 常駐メーターの手前で切る
     // (長いファイルパスがメーターに重なるのを防ぐ)。
+    //
+    // 幅の配分: MIDI/file 行は実測幅、 status_message はその直後から常駐メーター
+    // まで。 旧実装は message を窓幅の 55% 固定位置から出していたので、 file 行と
+    // の間に大きな空白が残る一方で message の右端がメーターに切られて読めなかった
+    // (ユーザー報告)。 両方が入らないときは message に残り幅の半分を必ず残し、
+    // file 行を省略記号で切る (message は操作の結果 = 今読む必要がある側)。
+    let avail = (meters_left - left_x).max(0.0);
+    let gap = 16.0;
+    let message = &app.ui_ephemeral.status_message;
+    let left_w_natural = ui.measure_text(&left, 11.0);
+    let left_w = if message.is_empty() {
+        left_w_natural.min(avail)
+    } else {
+        let msg_w_natural = ui.measure_text(message, 11.0);
+        let msg_reserve = msg_w_natural.min(avail * 0.5);
+        left_w_natural.min((avail - gap - msg_reserve).max(0.0))
+    };
     ui.label_at_clipped(
         "status_left",
         &left,
-        Rect {
-            x: left_x,
-            y: line_y,
-            w: (meters_left - left_x).max(0.0),
-            h: 11.0 * 1.2,
-        },
+        Rect { x: left_x, y: line_y, w: left_w, h: 11.0 * 1.2 },
         11.0,
         p.text,
     );
+    let message_x = left_x + left_w + gap;
 
     // ----- 常駐リソースメーター (r.md #3) -----
     // 右端に DSP load (peak) / system CPU / FPS / xrun を色付きで常駐表示し、
@@ -174,18 +187,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     if !app.ui_ephemeral.status_message.is_empty() {
         // メーターと被らない **幅** で status_message を出す。 旧実装は開始位置
-        // (mid_x < left_limit) だけを見て label_at (clip も ellipsis も無し) を撃って
-        // いたため、 長い日本語メッセージ (例:「ここには貼り付けできません (…)」= 377px)
-        // が DSP / CPU / fps ラベルの上に重なって双方読めなくなっていた。
-        let mid_x = area.x + area.w * 0.55;
-        if mid_x < left_limit {
+        // だけを見て label_at (clip も ellipsis も無し) を撃っていたため、 長い
+        // 日本語メッセージ (例:「ここには貼り付けできません (…)」= 377px) が
+        // DSP / CPU / fps ラベルの上に重なって双方読めなくなっていた。
+        // 開始位置は MIDI/file 行の直後 (`message_x`、 上で幅配分済み)。
+        if message_x < left_limit {
             ui.label_at_clipped(
                 "status_message",
                 &app.ui_ephemeral.status_message,
                 Rect {
-                    x: mid_x,
+                    x: message_x,
                     y: line_y,
-                    w: (left_limit - mid_x).max(0.0),
+                    w: (left_limit - message_x).max(0.0),
                     h: 11.0 * 1.2,
                 },
                 11.0,

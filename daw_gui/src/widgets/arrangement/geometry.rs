@@ -113,9 +113,15 @@ pub fn clip_to_rect(
     let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
     let x = lanes.x + ((clip.start_beat - view.start_beat) * beat_to_px) as f32;
     let w = ((clip.len_beats * beat_to_px) as f32).max(2.0);
-    let h = (track_row_h - 4.0).max(2.0);
-    Rect { x, y: track_row_top + 2.0, w, h }
+    let h = (track_row_h - CLIP_V_PAD_PX * 2.0).max(2.0);
+    Rect { x, y: track_row_top + CLIP_V_PAD_PX, w, h }
 }
+
+/// 行の中で clip 矩形が上下に空ける余白 (px)。 track 行の clip (`clip_to_rect`) と
+/// automation lane の clip (`ArrangementStyle::automation_clip_v_pad_px` の既定) の SSoT。
+/// 両者が違うと、 `X` で全行を同じ高さに敷き詰めたとき automation clip だけ上下に
+/// 余白が残って細く見える (旧 6 px、 ユーザー報告)。
+pub const CLIP_V_PAD_PX: f32 = 2.0;
 
 /// r.md #68: clip の **中身** (波形 / MIDI ノート / fade / thumbnail) の
 /// 「content-local 拍 → 画面 x」 写像。
@@ -670,15 +676,15 @@ pub(super) fn clamp_height_px(raw: f32, min: u16, max: u16) -> u16 {
     raw.round().clamp(lo, hi) as u16
 }
 
-/// M14 Phase 63n-6 (#031): lane 高さ drag の **実効 max** = `min(style.max, lanes.h.round())`。
+/// M14 Phase 63n-6 (#031): lane 高さ drag の **実効 max** = `min(MAX_ARRANGE_LANE_H_PX, lanes.h.round())`。
 /// 「最大は画面いっぱいまで」 (= lane が描画 pane より高くならない) を runtime clamp で表現。
-/// `lanes.h` が style.max を超えても style 値が absolute cap として作用 (= 異常入力 safety)。
-/// `lanes.h` が極端に小さい (= overflow scroll 中で pane が 30 px 未満等) 場合は `min_height` 以上に
+/// `lanes.h` が定数を超えても定数が absolute cap として作用 (= 異常入力 safety)。
+/// `lanes.h` が極端に小さい (= overflow scroll 中で pane が下限未満等) 場合は下限以上に
 /// なるよう clamp_height_px 側で補正されるため、 ここでは `lanes.h.round() as u16` を返すだけで OK。
 #[inline]
 #[must_use]
-pub(super) fn effective_lane_max_height(style: &ArrangementStyle, lanes: Rect) -> u16 {
-    style.automation_lane_max_height_px.min(lane_pane_cap_px(lanes.h))
+pub(super) fn effective_lane_max_height(lanes: Rect) -> u16 {
+    MAX_ARRANGE_LANE_H_PX.min(lane_pane_cap_px(lanes.h))
 }
 
 /// 「レーンは描画 pane より高くならない」 の pane 側の項 (px)。

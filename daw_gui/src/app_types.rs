@@ -1097,10 +1097,18 @@ pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 /// **上限は設けない** — 「全体表示」 は viewport を埋めるのが定義で、 上限があると
 /// 行数が少ないとき下半分が空く (Ardour `Editor::fit_tracks` も下限のみ)。
 pub const MIN_ARRANGE_ROW_H: f32 = 16.0;
+/// `MIN_ARRANGE_ROW_H` の u16 版 (automation lane の行高は `height_px: u16` で持つ)。
+/// lane の手動 splitter drag / Alt+wheel / 表示時 clamp はここで下げ止まる。 track 行と
+/// 別の下限を持たせない — 別々だと `X` (fit) が track 行を 16 px まで縮めたとき lane 行だけ
+/// 押し戻されて他の行より高くなる。
+pub const MIN_ARRANGE_LANE_H_PX: u16 = MIN_ARRANGE_ROW_H as u16;
 
 /// arrangement の 1 行の最大高さ (px)。 UI 操作 (`SetArrangeTrackRowH`) の暴走ガードで、
 /// 自動フィットは viewport 高さそのものが上限になるので使わない。
 pub const MAX_ARRANGE_ROW_H: f32 = 2000.0;
+/// `MAX_ARRANGE_ROW_H` の u16 版 (lane 用)。 実効上限は `min(これ, lanes pane 高)` で、
+/// 典型 desktop の縦サイズを上回るのでほぼ pane 高だけが効く (異常入力の safety cap)。
+pub const MAX_ARRANGE_LANE_H_PX: u16 = MAX_ARRANGE_ROW_H as u16;
 
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 
