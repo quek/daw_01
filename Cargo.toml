@@ -93,6 +93,9 @@ serde_json = "1"
 # resource monitor (r.md #3): システム CPU / メモリを 3 プロセス分ポーリング。
 # cross-platform (Linux 配慮) で、 daw_gui の UI 側スレッドからのみ使う (RT パス外)。
 sysinfo = "0.33"
+# 保存時の未参照メディア掃除 (daw_gui/src/media_bundle.rs) — 削除でなくゴミ箱へ
+# (Windows: IFileOperation + FOFX_ALLOWUNDO / Linux: freedesktop Trash spec)。
+trash = "5"
 tempfile = "3"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }

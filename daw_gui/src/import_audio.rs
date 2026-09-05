@@ -187,7 +187,7 @@ impl From<common::audio_decode::DecodeError> for ImportError {
 /// Where to copy import files when there is no project_dir yet. Callers
 /// are expected to thread the chosen directory through and migrate the
 /// files into `<project_dir>/samples/` on the next save (see
-/// [`migrate_unsaved_audio_sources_into`]).
+/// [`plan_unsaved_audio_migration`] + [`commit_migration`]).
 ///
 /// 置き場の SSoT は [`common::app_dirs::AppDirs`] (= `dirs::data_local_dir`
 /// = `SHGetKnownFolderPath`)。 **`LOCALAPPDATA` を直読みしない** — env は
@@ -202,63 +202,14 @@ pub fn unsaved_import_cache_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("daw_01").join("import_cache"))
 }
 
-/// Move every `AudioSource` whose path is an `Absolute` pointing into
-/// the unsaved-project import cache into `<project_dir>/samples/` and
-/// rewrite the path to `ProjectRelative("samples/<filename>")`. Called
-/// from the GUI's save flow so that on first save (or save-as from an
-/// in-memory-only state) every imported audio file lands inside the
-/// project bundle (`docs/plan_audio_clip.md` §13 Q2).
-///
-/// `Absolute` entries that point *outside* the import cache are left
-/// alone (= future "link to external sample" use case). `ProjectRelative`
-/// and `Generated` entries are no-ops here.
-///
-/// Returns the number of sources actually migrated. Errors propagate
-/// from filesystem operations (create_dir_all / rename / copy).
-pub fn migrate_unsaved_audio_sources_into(
-    song: &mut common::model::Song,
-    project_dir: &Path,
-) -> Result<usize> {
-    migrate_unsaved_cache_into(
-        song,
-        project_dir,
-        &unsaved_import_cache_dir(),
-        "samples",
-    )
-}
-
 /// Where Bounce In Place / Bounce (with FX) write WAVs in unsaved
 /// projects. Mirror of [`unsaved_import_cache_dir`] for bounce output.
 /// Saving the project later moves the files into `<project_dir>/bounce/`
-/// (see [`migrate_unsaved_bounce_sources_into`]).
+/// (see [`plan_unsaved_bounce_migration`] + [`commit_migration`]).
 pub fn unsaved_bounce_cache_dir() -> PathBuf {
     common::app_dirs::AppDirs::production()
         .map(|d| d.bounce_cache_dir())
         .unwrap_or_else(|| std::env::temp_dir().join("daw_01").join("bounce_cache"))
-}
-
-/// Mirror of [`migrate_unsaved_audio_sources_into`] for the bounce
-/// cache: move every `AudioSource` whose path is an `Absolute`
-/// pointing into the unsaved-project bounce cache into
-/// `<project_dir>/bounce/` and rewrite the path to
-/// `ProjectRelative("bounce/<filename>")`. Called from the GUI save
-/// flow so that on first save every bounced WAV lands inside the
-/// project bundle (= same destination as bounces written when a
-/// project_dir was already known).
-///
-/// `Absolute` entries that point *outside* the bounce cache are left
-/// alone (e.g. import cache entries are migrated by the sibling
-/// `migrate_unsaved_audio_sources_into`).
-pub fn migrate_unsaved_bounce_sources_into(
-    song: &mut common::model::Song,
-    project_dir: &Path,
-) -> Result<usize> {
-    migrate_unsaved_cache_into(
-        song,
-        project_dir,
-        &unsaved_bounce_cache_dir(),
-        "bounce",
-    )
 }
 
 /// Plan an import_cache → samples/ (or bounce_cache → bounce/) migration for
@@ -341,21 +292,6 @@ pub fn commit_migration(moves: &[(PathBuf, PathBuf)]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Plan **and immediately commit** a cache migration for `song` (= the
-/// historical "rewrite paths + move files now" behavior). Used for the live
-/// working song in the save flow, *after* a successful serialize.
-fn migrate_unsaved_cache_into(
-    song: &mut common::model::Song,
-    project_dir: &Path,
-    cache_root: &Path,
-    dst_subdir: &str,
-) -> Result<usize> {
-    let moves = plan_unsaved_cache_migration(song, project_dir, cache_root, dst_subdir);
-    let moved = moves.len();
-    commit_migration(&moves)?;
-    Ok(moved)
 }
 
 /// One-shot helper: hash → copy → decode → build `AudioSource` model.

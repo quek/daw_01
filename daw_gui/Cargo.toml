@@ -36,6 +36,7 @@ hound = "3.5"
 sha2 = "0.10"
 image.workspace = true
 sysinfo.workspace = true
+trash.workspace = true
 
 [features]
 # `--script` headless テスト駆動 (src/script.rs) の JS エンジン boa_engine (単体

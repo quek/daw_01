@@ -2573,6 +2573,13 @@ fn gc_video_sources_drops_orphans() {
             }],
         }),
     );
+    // 到達可能性で数えるので、 content はクリップから参照されていなければならない。
+    song.tracks = vec![Track {
+        id: 1,
+        clips: vec![Clip { id: 1, length_beats: 1.0, content_id: cid, ..Default::default() }],
+        next_clip_id: 2,
+        ..Track::default()
+    }];
 
     song.gc_video_sources();
     assert!(song.media.video_sources.contains_key(&live_id));
@@ -2725,6 +2732,13 @@ fn gc_image_sources_drops_orphans() {
             }],
         }),
     );
+    // 到達可能性で数えるので、 content はクリップから参照されていなければならない。
+    song.tracks = vec![Track {
+        id: 1,
+        clips: vec![Clip { id: 1, length_beats: 1.0, content_id: cid, ..Default::default() }],
+        next_clip_id: 2,
+        ..Track::default()
+    }];
 
     song.gc_image_sources();
     assert!(song.media.image_sources.contains_key(&live_id));
@@ -2937,4 +2951,64 @@ fn modrateの旧形式2種と新形式が同じ値へloadされる() {
         let (dec, _): (ModRate, usize) = bincode::decode_from_slice(&bytes, cfg).unwrap();
         assert_eq!(dec, expected, "bincode 往復 json={json}");
     }
+}
+
+// ---- live_source_ids (保存時 pool GC / bundle 掃除の到達可能性 SSoT) ----
+
+/// 到達可能性で数える: 削除済みクリップの content (pool には残る) の source は
+/// 生きていない。 mouth_map の slot は event を経由しない直接参照として数える。
+#[test]
+fn live_source_ids_follow_reachability_and_mouth_map() {
+    let mut song = Song::default();
+    let live_cid = song.alloc_content_id();
+    let dead_cid = song.alloc_content_id();
+    let mk = |source_id: AudioSourceId| {
+        ClipContent::Audio(AudioContent {
+            events: vec![AudioEvent { source_id, ..Default::default() }],
+            next_event_id: 0,
+        })
+    };
+    song.clip_contents.insert(live_cid, mk(1));
+    // dead_cid はどのクリップからも参照されない (= 削除済みクリップの残骸)。
+    song.clip_contents.insert(dead_cid, mk(2));
+    let img_cid = song.alloc_content_id();
+    song.clip_contents.insert(
+        img_cid,
+        ClipContent::Image(ImageContent {
+            events: vec![ImageEvent { source_id: 10, ..Default::default() }],
+        }),
+    );
+    song.tracks = vec![
+        Track {
+            id: 1,
+            clips: vec![
+                Clip { id: 1, length_beats: 1.0, content_id: live_cid, ..Default::default() },
+                Clip { id: 2, length_beats: 1.0, content_id: img_cid, ..Default::default() },
+            ],
+            next_clip_id: 3,
+            ..Track::default()
+        },
+        Track { id: 2, mouth_map: Some(MouthMap { a: 11, closed: 12, ..Default::default() }), ..Track::default() },
+    ];
+    let live = song.live_source_ids();
+    assert_eq!(live.audio, std::collections::HashSet::from([1]));
+    assert!(live.video.is_empty());
+    assert_eq!(live.image, std::collections::HashSet::from([10, 11, 12]), "mouth_map の slot も参照 (0 は除く)");
+
+    // gc_* は同じ判定を使う: pool の 2 (dead content 由来) は落ち、 mouth_map の 11/12 は残る。
+    for id in [1, 2] {
+        song.media.audio_sources.insert(
+            id,
+            AudioSource {
+                path: AudioSourcePath::ProjectRelative("samples/x.wav".into()),
+                sample_rate: 48_000,
+                channels: 1,
+                frames: 1,
+                original_bpm: None,
+                root_key: None,
+            },
+        );
+    }
+    song.gc_audio_sources();
+    assert_eq!(song.media.audio_sources.keys().copied().collect::<Vec<_>>(), vec![1]);
 }

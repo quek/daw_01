@@ -3,7 +3,7 @@
 **このファイルは生成物です。手で編集しないでください。**
 再生成: `python scripts/dep_licenses.py --write` (`make license-check` が鮮度を検査します)
 
-daw_gui / daw_audio / daw_plugin_host に取り込まれる Rust クレート **389 件** のライセンス一覧です。
+daw_gui / daw_audio / daw_plugin_host に取り込まれる Rust クレート **390 件** のライセンス一覧です。
 依存グラフは `cargo metadata --filter-platform x86_64-pc-windows-msvc --locked` の `resolve` から、normal と build のエッジだけを辿って求めています (dev-dependencies は配布物に入らないので除外)。
 
 crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / VST 3 / CLAP / VOICEVOX) の帰属は [`NOTICE`](NOTICE) にあります。daw_01 自身のライセンスは [`LICENSE`](LICENSE) (GPL-3.0-or-later)。
@@ -13,7 +13,7 @@ crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / V
 | 件数 | ライセンス (SPDX) |
 |---:|---|
 | 184 | `MIT OR Apache-2.0` |
-| 73 | `MIT` |
+| 74 | `MIT` |
 | 22 | `Apache-2.0 OR MIT` |
 | 18 | `Unicode-3.0` |
 | 17 | `MIT/Apache-2.0` |
@@ -258,7 +258,7 @@ crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / V
 | ring | 0.17.14 | `Apache-2.0 AND ISC` | link | <https://github.com/briansmith/ring> |
 | roxmltree | 0.21.1 | `MIT OR Apache-2.0` | link | <https://github.com/RazrFalcon/roxmltree> |
 | rsmpeg | 0.17.0+ffmpeg.7.1 | `MIT` | link | <https://github.com/larksuite/rsmpeg> |
-| rtrb | 0.3.4 | `MIT OR Apache-2.0` | link | <https://github.com/mgeier/rtrb> |
+| rtrb | 0.3.5 | `MIT OR Apache-2.0` | link | <https://github.com/mgeier/rtrb> |
 | rustc-hash | 1.1.0 | `Apache-2.0/MIT` | link | <https://github.com/rust-lang-nursery/rustc-hash> |
 | rustc-hash | 2.1.2 | `Apache-2.0 OR MIT` | link | <https://github.com/rust-lang/rustc-hash> |
 | rustc_version | 0.4.1 | `MIT OR Apache-2.0` | link | <https://github.com/djc/rustc-version-rs> |
@@ -356,6 +356,7 @@ crate ではない第三者コンポーネント (FFmpeg / ARA / Signalsmith / V
 | tracing-log | 0.2.0 | `MIT` | link | <https://github.com/tokio-rs/tracing> |
 | tracing-subscriber | 0.3.23 | `MIT` | link | <https://github.com/tokio-rs/tracing> |
 | transpose | 0.2.3 | `MIT OR Apache-2.0` | link | <https://github.com/ejmahler/transpose> |
+| trash | 5.2.7 | `MIT` | link | <https://github.com/ArturKovacs/trash> |
 | try-lock | 0.2.5 | `MIT` | link | <https://github.com/seanmonstar/try-lock> |
 | ttf-parser | 0.25.1 | `MIT OR Apache-2.0` | link | <https://github.com/harfbuzz/ttf-parser> |
 | typenum | 1.20.0 | `MIT OR Apache-2.0` | link | <https://github.com/paholg/typenum> |

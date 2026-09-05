@@ -33,6 +33,7 @@ pub mod note_selection;
 pub mod notes;
 pub mod project;
 pub mod range_ops;
+pub mod save_bundle;
 pub mod selection_view;
 /// r.md #61: 終了シーケンスの実行 (子プロセス teardown の待ち合わせ)。
 pub mod shutdown;

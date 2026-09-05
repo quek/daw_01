@@ -902,6 +902,14 @@ where
 /// 落とし先は算術で導かれるので、元位置へ寄せ戻された場合でも bit 一致しない。
 const SECTION_MOVE_EPS_BEATS: f64 = 1e-9;
 
+/// [`Song::live_source_ids`] の戻り値: 到達可能な media source id。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LiveSourceIds {
+    pub audio: std::collections::HashSet<AudioSourceId>,
+    pub video: std::collections::HashSet<VideoSourceId>,
+    pub image: std::collections::HashSet<ImageSourceId>,
+}
+
 impl Song {
     /// Allocate a new stable track id, bumping the song-level counter.
     pub fn alloc_track_id(&mut self) -> u32 {
@@ -2601,8 +2609,22 @@ impl Song {
     /// `automation_lanes[].clips` entry — automation clips share the
     /// same content store as MIDI / audio clips.
     pub fn gc_clip_contents(&mut self) {
-        // v35 (r.md #87): launcher のセルも `all_clips` 経由で「生きている」に数える。
-        // 数え落とすと保存のたびにセルの中身が GC で消える。
+        let live = self.live_content_ids();
+        self.clip_contents.retain(|id, _| live.contains(id));
+        // Shared names follow content lifecycle: drop names whose
+        // content_id no longer has any referencing clip.
+        self.clip_content_names.retain(|id, _| live.contains(id));
+    }
+
+    /// クリップ (arrangement / launcher セル / track・song automation lane) から
+    /// 到達できる `ContentId` の集合。 `gc_clip_contents` と [`Song::live_source_ids`] の
+    /// 唯一の「生きている content」 判定。
+    ///
+    /// v35 (r.md #87): launcher のセルも `all_clips` 経由で「生きている」に数える。
+    /// 数え落とすと保存のたびにセルの中身が GC で消える。 Song-level automation lanes
+    /// (SongTempo / TimeSig master lanes) も同じ `clip_contents` store を使うので、
+    /// 歩かないと tempo automation の curve が save 前に dead 判定されて次回 load で消える。
+    pub fn live_content_ids(&self) -> std::collections::HashSet<ContentId> {
         let mut live: std::collections::HashSet<ContentId> = self
             .tracks
             .iter()
@@ -2616,19 +2638,40 @@ impl Song {
                 }
             }
         }
-        // Song-level automation lanes (SongTempo / TimeSig master lanes)
-        // share the same `clip_contents` store. Without walking them, a
-        // tempo-automation curve's `content_id` is judged dead and GC'd
-        // before save, losing the whole curve on next load.
         for lane in &self.song_lanes {
             for clip in lane.all_clips() {
                 live.insert(clip.content_id);
             }
         }
-        self.clip_contents.retain(|id, _| live.contains(id));
-        // Shared names follow content lifecycle: drop names whose
-        // content_id no longer has any referencing clip.
-        self.clip_content_names.retain(|id, _| live.contains(id));
+        live
+    }
+
+    /// 生きている content (= [`Song::live_content_ids`]) の event と、 track の口パク
+    /// `mouth_map` から到達できる media source id。 `gc_*_sources` (保存時の pool 整理)
+    /// と `daw_gui::media_bundle` (保存時の bundle 掃除) が同じ判定を使う — ここが
+    /// ずれると、 pool から落ちた source のファイルが「未参照」 としてゴミ箱へ行く。
+    ///
+    /// 到達可能性で数える (pool の存在ではなく) のは、 in-memory の pool は Undo 用に
+    /// 参照ゼロの entry を保持し続けるため。 `mouth_map` の slot は event を経由しない
+    /// 直接参照なので別途足す (未割当 = `0` は除く)。
+    pub fn live_source_ids(&self) -> LiveSourceIds {
+        let contents = self.live_content_ids();
+        let mut live = LiveSourceIds::default();
+        for (id, content) in &self.clip_contents {
+            if !contents.contains(id) {
+                continue;
+            }
+            match content {
+                ClipContent::Audio(a) => live.audio.extend(a.events.iter().map(|ev| ev.source_id)),
+                ClipContent::Video(v) => live.video.extend(v.events.iter().map(|ev| ev.source_id)),
+                ClipContent::Image(i) => live.image.extend(i.events.iter().map(|ev| ev.source_id)),
+                ClipContent::Midi(_) | ClipContent::Automation(_) | ClipContent::Text(_) => {}
+            }
+        }
+        for map in self.tracks.iter().filter_map(|t| t.mouth_map.as_ref()) {
+            live.image.extend(map.all_ids().filter(|id| *id != 0));
+        }
+        live
     }
 
     /// Allocate a fresh `AudioSourceId`, bumping the song-level counter.
@@ -2660,25 +2703,12 @@ impl Song {
             .count()
     }
 
-    /// Drop `audio_sources` entries no `AudioEvent` references. Mirrors
-    /// `gc_clip_contents` — called before save so the on-disk pool stays
-    /// tidy. In-memory entries with refcount=0 are kept briefly so
-    /// Undo can restore them.
+    /// Drop `audio_sources` entries nothing reachable references
+    /// ([`Song::live_source_ids`]). Called before save so the on-disk pool
+    /// stays tidy. In-memory entries with refcount=0 are kept so Undo can
+    /// restore them.
     pub fn gc_audio_sources(&mut self) {
-        let live: std::collections::HashSet<AudioSourceId> = self
-            .clip_contents
-            .values()
-            .filter_map(|c| match c {
-                ClipContent::Audio(a) => Some(a.events.iter()),
-                ClipContent::Midi(_)
-                | ClipContent::Automation(_)
-                | ClipContent::Video(_)
-                | ClipContent::Image(_)
-                | ClipContent::Text(_) => None,
-            })
-            .flatten()
-            .map(|ev| ev.source_id)
-            .collect();
+        let live = self.live_source_ids().audio;
         self.media.audio_sources.retain(|id, _| live.contains(id));
     }
 
@@ -2738,25 +2768,10 @@ impl Song {
             .count()
     }
 
-    /// v12: drop `video_sources` entries no `VideoEvent` references.
-    /// Mirrors `gc_audio_sources` — called before save so the on-disk
-    /// pool stays tidy. In-memory entries with refcount==0 are kept
-    /// briefly so Undo can restore them.
+    /// v12: drop `video_sources` entries nothing reachable references
+    /// ([`Song::live_source_ids`]). Mirrors `gc_audio_sources`.
     pub fn gc_video_sources(&mut self) {
-        let live: std::collections::HashSet<VideoSourceId> = self
-            .clip_contents
-            .values()
-            .filter_map(|c| match c {
-                ClipContent::Video(v) => Some(v.events.iter()),
-                ClipContent::Midi(_)
-                | ClipContent::Audio(_)
-                | ClipContent::Automation(_)
-                | ClipContent::Image(_)
-                | ClipContent::Text(_) => None,
-            })
-            .flatten()
-            .map(|ev| ev.source_id)
-            .collect();
+        let live = self.live_source_ids().video;
         self.media.video_sources.retain(|id, _| live.contains(id));
     }
 
@@ -2813,23 +2828,12 @@ impl Song {
             .count()
     }
 
-    /// v13: drop `image_sources` entries no `ImageEvent` references.
-    /// Mirrors `gc_video_sources`.
+    /// v13: drop `image_sources` entries nothing reachable references
+    /// ([`Song::live_source_ids`]) — `ImageEvent` に加えて track の `mouth_map`
+    /// (口パク slot) も参照に数える。 event に出ていない口形状の画像が save のたびに
+    /// pool から落ち、 次回 load で mapping が空を指していた。
     pub fn gc_image_sources(&mut self) {
-        let live: std::collections::HashSet<ImageSourceId> = self
-            .clip_contents
-            .values()
-            .filter_map(|c| match c {
-                ClipContent::Image(i) => Some(i.events.iter()),
-                ClipContent::Midi(_)
-                | ClipContent::Audio(_)
-                | ClipContent::Automation(_)
-                | ClipContent::Video(_)
-                | ClipContent::Text(_) => None,
-            })
-            .flatten()
-            .map(|ev| ev.source_id)
-            .collect();
+        let live = self.live_source_ids().image;
         self.media.image_sources.retain(|id, _| live.contains(id));
     }
 

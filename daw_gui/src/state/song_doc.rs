@@ -343,6 +343,23 @@ impl SongDoc {
 
     // -------- undo / redo ---------------------------------------------------
 
+    /// undo / redo に積まれている **live 以外**の全 Song (順不同)。 保存時の
+    /// メディア掃除が「Undo / Redo で戻れる状態が参照するファイル」を残すために読む
+    /// (`crate::media_bundle`)。
+    pub fn history_songs(&self) -> impl Iterator<Item = &Song> {
+        self.undo_stack.iter().chain(self.redo_stack.iter()).map(|e| &e.song)
+    }
+
+    /// undo / redo の全 Song を書き換える。 **epoch / dirty は動かさない** — 用途は
+    /// 保存時の「未保存キャッシュ → project bundle」 path 移行を履歴にも及ぼすことだけで
+    /// (ファイルは移動済みなので、 履歴側の `Absolute(cache)` を残すと Undo で音源を
+    /// 見失う)、 楽曲の編集ではない。
+    pub fn rewrite_history(&mut self, mut f: impl FnMut(&mut Song)) {
+        for e in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+            f(&mut e.song);
+        }
+    }
+
     pub fn undo(&mut self) -> bool {
         if self.undo_stack.is_empty() {
             return false;

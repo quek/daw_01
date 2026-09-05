@@ -972,10 +972,17 @@ import した WAV は `<project_dir>/samples/<sanitized_name>_<short_hash>.wav` 
   - 一時的に `%LOCALAPPDATA%/daw_01/import_cache/<session_id>/<filename>` にコピー
   - `AudioSourcePath::Absolute(cache_path)` で記録
   - save 時に project dir の `samples/` に移動 + `ProjectRelative` に変換 (autosave も同じ)
-- **save as / move project**:
-  - 旧 project dir の `samples/` を新 project dir にコピー (= project 全体 portable)
-- **GC**: save 時に未参照の `samples/<file>` は削除 (`Song::audio_sources` に存在しない物のみ)
-  - 安全側に倒し、 「project_dir/samples/ 内で AudioSource pool に無いもの」 だけ remove
+- **save as / move project** (`daw_gui/src/media_bundle.rs`、 2026-09-05 実装):
+  - 旧 project dir の `samples/` `bounce/` `images/` のうち **live + undo/redo 全段が参照する
+    ファイル**を新 project dir の同じ相対位置へコピー (= project 全体 portable、 元フォルダを
+    消しても開ける)。 dst 既存はスキップ (content addressing)、 src 欠損は log
+- **未保存キャッシュの取り込み**は audio / bounce / video / image の 4 プールすべて
+  (video → `samples/`、 image → `images/`)。 live だけでなく undo/redo の Song も path を
+  書き換える (履歴側に `Absolute(cache)` を残すと Undo で音源を見失う)
+- **GC**: save 時に bundle 内 (`samples/` `bounce/` `images/` 直下) の未参照ファイルを
+  **ゴミ箱へ** (削除しない、 `trash` crate)。 「参照」 = live + undo/redo 全段 +
+  進行中 bounce / glue の予約ファイル。 同じフォルダに別の `.daw` があれば見送る
+  (相乗り project の参照が分からない)。 autosave sidecar は `.daw` でも除外
 
 `AudioSourcePath::Absolute` は型として保持 (未保存プロジェクトの import_cache 用 / 将来の
 "link to external sample" 用)、 通常の import 経路では生成しない。

@@ -185,7 +185,7 @@ impl AppData {
 
     /// render 出力 WAV の path と `AudioSourcePath` を決める。保存済み
     /// project は `<dir>/bounce/<name><infix>_<ts>.wav`、未保存は bounce_cache (save 時に
-    /// `migrate_unsaved_bounce_sources_into` が project へ移動 + ProjectRelative 化)。
+    /// `finish_save` が project へ移動 + ProjectRelative 化)。
     /// `infix` は種別の区別 (In Place = `""` / With FX = `"_fx"` / Glue = `"_glue"`)。
     /// 失敗時は status_message を立てて `None`。
     ///

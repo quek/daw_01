@@ -1169,11 +1169,14 @@ impl MouthMap {
         if id != 0 { id } else { self.closed }
     }
 
+    /// 全 slot の id (未割当の `0` も含む、 順序は a/i/u/e/o/n/closed)。
+    pub fn all_ids(&self) -> impl Iterator<Item = ImageSourceId> {
+        [self.a, self.i, self.u, self.e, self.o, self.n, self.closed].into_iter()
+    }
+
     /// いずれかの slot に割当がある (= 口パクを生成する意味がある)。
     pub fn is_configured(&self) -> bool {
-        [self.a, self.i, self.u, self.e, self.o, self.n, self.closed]
-            .iter()
-            .any(|&id| id != 0)
+        self.all_ids().any(|id| id != 0)
     }
 }
 
