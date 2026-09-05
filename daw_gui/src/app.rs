@@ -2197,6 +2197,8 @@ impl AppData {
                                 }
                             }
                         },
+                        DiscreteClipEdit::ImageFlipH(v) => self.set_clip_image_event_flip_h(t, v),
+                        DiscreteClipEdit::ImageFlipV(v) => self.set_clip_image_event_flip_v(t, v),
                         // 字幕 inspector の "Mute" も clip-level `Clip.muted` に一本化。
                         DiscreteClipEdit::TextMuted(v) => self.set_clip_muted(t, v),
                         DiscreteClipEdit::TextAlign(a) => self.set_clip_text_event_align(t, a),

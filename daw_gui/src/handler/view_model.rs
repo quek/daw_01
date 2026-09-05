@@ -880,6 +880,8 @@ impl AppData {
             rotation_radians: event.rotation_radians,
             fade_in_beats: event.fade_in_beats,
             fade_out_beats: event.fade_out_beats,
+            flip_h: event.flip_h,
+            flip_v: event.flip_v,
             fade_max_beats: event.event_length_beats,
         })
     }

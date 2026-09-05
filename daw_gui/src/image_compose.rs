@@ -53,6 +53,10 @@ pub struct ActiveImageFrame {
     /// `0.0` = axis-aligned。 gui_01 #047 (`TexturedQuad.rotation_radians`)
     /// landing 後に preview / render passes が wire する。
     pub rotation_radians: f32,
+    /// r.md #98: `ImageEvent.flip_h` / `flip_v` をそのまま運ぶ (lane override
+    /// 無し)。 適用は `group_compose::flip_uv` (preview / export 共通)。
+    pub flip_h: bool,
+    pub flip_v: bool,
     /// Bottom-up draw order, same numbering as
     /// `video_playback::ActiveVideoFrame::z_index`. The runner sorts
     /// all (video + image) frames by `z_index` ascending before
@@ -170,6 +174,8 @@ pub fn active_image_sources_at(
                     h,
                     alpha,
                     rotation_radians: rotation,
+                    flip_h: event.flip_h,
+                    flip_v: event.flip_v,
                     z_index,
                 });
             }
@@ -356,6 +362,8 @@ mod tests {
                     h,
                     opacity,
                     rotation_radians: 0.0,
+                    flip_h: false,
+                    flip_v: false,
                     muted: false,
                     fade_in_beats: fade_in,
                     fade_out_beats: fade_out,
@@ -461,6 +469,8 @@ mod tests {
                     h: 1.0,
                     opacity: 1.0,
                     rotation_radians: 0.0,
+                    flip_h: false,
+                    flip_v: false,
                     muted: false,
                     fade_in_beats: 0.0,
                     fade_out_beats: 0.0,

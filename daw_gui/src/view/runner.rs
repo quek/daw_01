@@ -2018,7 +2018,14 @@ impl Runner {
                 (slot.width as f32, slot.height as f32),
             );
             buckets.entry(frame_info.owning_track_id).or_default().push(
-                CompositeItem::Quad { texture: handle, dest, alpha: frame_info.alpha, rotation_radians: 0.0 },
+                CompositeItem::Quad {
+                    texture: handle,
+                    dest,
+                    alpha: frame_info.alpha,
+                    rotation_radians: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                },
             );
         }
 
@@ -2057,6 +2064,8 @@ impl Runner {
                 dest: (frame_info.x, frame_info.y, frame_info.w, frame_info.h),
                 alpha: frame_info.alpha,
                 rotation_radians: frame_info.rotation_radians,
+                flip_h: frame_info.flip_h,
+                flip_v: frame_info.flip_v,
             });
         }
 
