@@ -88,6 +88,13 @@ SPDX-License-Identifier = "GPL-3.0-or-later"
 SPDX-FileComment = "第三者コンポーネントの帰属をまとめた法的文書。中に引用している各社の notice はそれぞれの著作者のもの。拡張子を持たないプレーンテキストなのでコメント構文が無い。"
 
 [[annotations]]
+path = "docs/images/screenshot_*.png"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+SPDX-FileComment = "README 用の実行画面スクリーンショット。映像プレビュー内に写っている VOICEVOX キャラクター (中国うさぎ) の立ち絵は VOICEVOX 側の規約 (https://voicevox.hiroshiba.jp/term/) に従う第三者の著作物で、この宣言はそれを GPL として再許諾するものではない。"
+
+[[annotations]]
 path = "daw_gui/tests/fixtures/smoke_test.mp4"
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (C) 2026 Tahara Yoshinori"

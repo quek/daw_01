@@ -6,6 +6,15 @@ VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。クリップベースの�
 
 設計の正本は [DESIGN.md](DESIGN.md)、開発時の不変条件は [CLAUDE.md](CLAUDE.md)。
 
+## スクリーンショット
+
+アレンジメント (クリップ / オートメーションレーン) + ミキサー + マスターの計測 + 映像プレビュー。
+テーマは `themes/*.json` で切り替えられる (上: dark、下: light)。
+
+![daw_01 (dark theme)](docs/images/screenshot_dark.png)
+
+![daw_01 (light theme)](docs/images/screenshot_light.png)
+
 ## 構成
 
 Cargo workspace (Rust Edition 2024)。実行時は独立した 3 プロセスが協調する。
