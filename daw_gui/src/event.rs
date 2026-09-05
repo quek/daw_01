@@ -1289,6 +1289,10 @@ pub enum AppEvent {
     /// momentary stall instead of a complex completion dispatch.
     ImportVideo {
         paths: Vec<PathBuf>,
+        /// drop 先 (audio / image import と同じ語彙)。 セルへ落としたら video セル +
+        /// 直下の新しい行に対の音声セル、 既存トラックならそのトラック + 直下に対の
+        /// 音声トラック、 それ以外は一番下に video + audio の 2 トラック。
+        target: ImportTrackTarget,
         /// drag&drop の drop X 位置から計算した beat (snap 済み)。 生成する
         /// video / 対 audio clip をこの beat に置く。 `None` なら playhead に
         /// フォールバック (= dialog / File menu / smoke test 経由)。

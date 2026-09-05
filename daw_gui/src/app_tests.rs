@@ -213,27 +213,8 @@ mod follow_scroll_tests {
     /// 運ぶと再生追従が黙って OFF になっていた。
     #[test]
     fn edge_autoscroll_keeps_follow_but_manual_scroll_cancels_it() {
-        use std::sync::Arc;
-
         use crate::app::AppEvent;
-        use crate::dispatcher::{
-            BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-        };
-        let (audio_tx, _audio_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (plugin_tx, _plugin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
-        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-        let mut app = AppData::new(
-            audio_tx,
-            plugin_tx,
-            None,
-            None,
-            event_dispatcher,
-            job_dispatcher,
-            None,
-            None,
-            common::audio_bridge::DEFAULT_SAMPLE_RATE,
-        );
+        let mut app = crate::test_support::headless_app();
         app.ui_prefs.arrange_follow = FollowMode::Scroll;
         app.transport.is_playing = true;
 
@@ -1231,33 +1212,13 @@ mod gpu_derived_cache_tests {
     //! 開き直すたびに VRAM が単調増加する (サムネイルはネイティブ解像度で 4K なら
     //! 1 枚 33MB)。
     use std::num::NonZeroU32;
-    use std::sync::Arc;
 
-    use common::protocol::{AudioCommand, PluginCommand};
     use daw_ui_renderer::TextureHandle;
-    use tokio::sync::mpsc;
 
     use crate::app::AppData;
-    use crate::dispatcher::{
-        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-    };
 
     fn build_app() -> AppData {
-        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<AudioCommand>();
-        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<PluginCommand>();
-        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
-        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-        AppData::new(
-            audio_tx,
-            plugin_tx,
-            None,
-            None,
-            event_dispatcher,
-            job_dispatcher,
-            None,
-            None,
-            common::audio_bridge::DEFAULT_SAMPLE_RATE,
-        )
+        crate::test_support::headless_app()
     }
 
     fn handle(raw: u32) -> TextureHandle {

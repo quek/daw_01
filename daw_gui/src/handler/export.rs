@@ -506,7 +506,8 @@ impl AppData {
             }
             FileDialogKind::ImportVideo => {
                 if !paths.is_empty() {
-                    self.action_import_video(paths, None);
+                    // dialog 経由は位置情報がないので NoHint (= 一番下に video + audio)。
+                    self.action_import_video(paths, ImportTrackTarget::NoHint, None);
                 }
             }
             FileDialogKind::ImportImage => {

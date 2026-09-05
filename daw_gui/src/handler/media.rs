@@ -246,15 +246,28 @@ impl AppData {
     ///      on `Song.video_sources`.
     ///   4. Build one `VideoEvent` covering the whole source and wrap
     ///      it in a fresh `ClipContent::Video`.
-    ///   5. Append a new `TrackKind::Video` track and (when audio is
-    ///      present) a paired `TrackKind::Audio` track. Each carries a
-    ///      single clip starting at the playhead.
+    ///   5. Place the video clip where the drop said (`target`, audio / image
+    ///      import と同じ `ImportTrackTarget` の語彙) and (when audio is present)
+    ///      a paired audio clip **on a new track right below** the video's track:
+    ///      - `Track(idx)`: video clip on that track, paired audio track inserted
+    ///        after it (same group as the video track)。
+    ///      - `LauncherCell { track_id, scene }`: video **cell** in that row /
+    ///        column, paired audio cell in a new row right below, same column
+    ///        (both cells loop with the same length so they stay in phase)。
+    ///      - `NewTrackBottom` / `LauncherNewTrack` / `NoHint`: new video track +
+    ///        paired audio track appended at the bottom (the historical behavior)。
     ///
     /// Subsequent imports stack at the end of the timeline by bumping
-    /// `next_start_beat`. Failures are collected per path and surfaced
-    /// in `status_message` along with the success count.
+    /// `next_start_beat` (cells go to the next column instead). Failures are
+    /// collected per path and surfaced in `status_message` along with the
+    /// success count.
     #[cfg(windows)]
-    pub(crate) fn action_import_video(&mut self, paths: Vec<PathBuf>, target_beat: Option<f64>) {
+    pub(crate) fn action_import_video(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target: ImportTrackTarget,
+        target_beat: Option<f64>,
+    ) {
         use common::model::{
             AudioContent, AudioEvent, ClipContent, VideoContent, VideoEvent,
         };
@@ -267,6 +280,17 @@ impl AppData {
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
+        // 配置先 (image import と同じ解決): セルへの drop は安定 id → index、
+        // 既存トラックへの drop は index、 それ以外は一番下に新規トラック。
+        let cell_track_idx = match target {
+            ImportTrackTarget::LauncherCell { track_id, .. } => {
+                cell_dest_index(self.song_doc.song(), track_id)
+            }
+            _ => None,
+        };
+        let dest_track_idx: Option<usize> = cell_track_idx
+            .or_else(|| resolve_media_drop_target(target, self.song_doc.song().tracks.len()));
+
         // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
         let start_beat_seed: f64 =
             target_beat.unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64);
@@ -274,8 +298,14 @@ impl AppData {
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut next_start_beat = start_beat_seed.max(0.0);
+        // セルへの drop で 2 本目以降を右の列へ送る量 (audio / image import と同じ役割)。
+        let mut cell_offset = 0usize;
+        // 既存トラックへ落としたとき、 対の音声トラックを video トラックの直下に挿すので、
+        // 2 本目以降はその分だけ下へずらす (video トラック自身の index は動かない)。
+        let mut audio_tracks_inserted = 0usize;
 
         for path in paths {
+            let cell_idx = import_cell_index(target, cell_offset);
             let imported = match crate::import_video::import_one_video(
                 &path,
                 project_dir.as_deref(),
@@ -331,8 +361,8 @@ impl AppData {
                 self.media.pending_thumbnail_uploads.push(video_source_id);
             }
 
-            // 3) Video clip content + auto track.
-            self.edit_song(|song| {
+            // 3) Video clip content → drop 先の行 (無ければ一番下に新規 video track)。
+            let Some(video_track_idx) = self.edit_song(|song| {
                 let v_content_id = song.alloc_content(
                     ClipContent::Video(VideoContent {
                         events: vec![VideoEvent {
@@ -346,22 +376,29 @@ impl AppData {
                     }),
                     display_name.clone(),
                 );
-                let video_track_id = song.alloc_track_id();
-                let mut video_track = track_with(|t| {
-                    t.id = video_track_id;
-                    t.name = format!("{display_name} (Video)");
-                });
-                video_track.place_clip(Clip {
-                    id: 0,
-                    start_beat: next_start_beat,
-                    length_beats: video_length_beats,
-                    content_id: v_content_id,
-                    color: None,
-                    auto_lipsync: false,
-                    ..Default::default()
-                });
-                song.tracks.push(video_track);
-            });
+                let video_track_idx = match dest_track_idx {
+                    Some(idx) => idx,
+                    None => {
+                        let video_track_id = song.alloc_track_id();
+                        song.tracks.push(track_with(|t| {
+                            t.id = video_track_id;
+                            t.name = format!("{display_name} (Video)");
+                        }));
+                        song.tracks.len() - 1
+                    }
+                };
+                place_new_clip(
+                    song,
+                    video_track_idx,
+                    cell_idx,
+                    next_start_beat,
+                    video_length_beats,
+                    v_content_id,
+                );
+                video_track_idx
+            }) else {
+                return;
+            };
 
             // 4) Paired audio clip + audio track (only when audio is
             //    present in the source).
@@ -390,25 +427,44 @@ impl AppData {
                         }),
                         format!("{display_name} (audio)"),
                     );
+                    // 対の音声トラックは video トラックの **直下** (既存行へ落としたとき) に
+                    // 挿し、 同じグループ階層に入れる (`add_track` の兄弟挿入と同じ規約)。
+                    // 一番下に新設した video トラックの場合は末尾 push = やはり直下。
+                    let audio_insert_at = match dest_track_idx {
+                        Some(idx) => idx + 1 + audio_tracks_inserted,
+                        None => song.tracks.len(),
+                    };
+                    let parent_group_id =
+                        song.tracks.get(video_track_idx).and_then(|t| t.parent_group_id);
                     let audio_track_id = song.alloc_track_id();
-                    let mut audio_track = track_with(|t| {
-                        t.id = audio_track_id;
-                        t.name = format!("{display_name} (Audio)");
-                    });
-                    audio_track.place_clip(Clip {
-                        id: 0,
-                        start_beat: next_start_beat,
-                        length_beats: audio_length_beats,
-                        content_id: a_content_id,
-                        color: None,
-                        auto_lipsync: false,
-                        ..Default::default()
-                    });
-                    song.tracks.push(audio_track);
+                    song.tracks.insert(
+                        audio_insert_at,
+                        track_with(|t| {
+                            t.id = audio_track_id;
+                            t.name = format!("{display_name} (Audio)");
+                            t.parent_group_id = parent_group_id;
+                        }),
+                    );
+                    // セルは対で同じ長さにして位相を揃える (セルの長さ = ループ 1 周)。
+                    // アレンジでは各自の自然長 (従来どおり)。
+                    let audio_place_len =
+                        if cell_idx.is_some() { video_length_beats } else { audio_length_beats };
+                    place_new_clip(
+                        song,
+                        audio_insert_at,
+                        cell_idx,
+                        next_start_beat,
+                        audio_place_len,
+                        a_content_id,
+                    );
                 });
+                if dest_track_idx.is_some() {
+                    audio_tracks_inserted += 1;
+                }
             }
 
             next_start_beat += video_length_beats;
+            cell_offset += 1;
             imported_ok += 1;
         }
 
@@ -1203,5 +1259,114 @@ pub(crate) fn import_cell_index(target: ImportTrackTarget, offset: usize) -> Opt
             Some(scene_index as usize + offset)
         }
         _ => None,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod video_import_target_tests {
+    use std::path::PathBuf;
+
+    use common::model::{ClipContent, Track};
+
+    use crate::app_types::{ImportTrackTarget, track_with};
+    use crate::test_ffmpeg::{H264_ENCODER, locate_ffmpeg, skip_reason};
+    use crate::test_support::headless_app;
+
+    /// 1 秒の映像 + 220Hz の音声を持つ mp4 を作る (音声が無いと対の行が生まれない)。
+    fn video_with_audio(dir: &std::path::Path) -> Option<PathBuf> {
+        let ffmpeg = locate_ffmpeg()?;
+        let src = dir.join("clip.mp4");
+        let status = std::process::Command::new(ffmpeg)
+            .args([
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=30",
+                "-f", "lavfi", "-i", "sine=frequency=220:duration=1:sample_rate=48000",
+                "-c:v", H264_ENCODER, "-c:a", "aac", "-pix_fmt", "yuv420p", "-shortest", "-y",
+                src.to_str().unwrap(),
+            ])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        status.success().then_some(src)
+    }
+
+    fn kind_of(app: &crate::state::AppData, content_id: common::model::ContentId) -> &'static str {
+        match app.song_doc.song().clip_contents.get(&content_id) {
+            Some(ClipContent::Video(_)) => "video",
+            Some(ClipContent::Audio(_)) => "audio",
+            _ => "other",
+        }
+    }
+
+    /// セルへ落とした動画は **その行のセル**になり、対の音声は直下に新しい行を作って
+    /// 同じ列のセルに入る (アレンジには何も置かない)。両セルは同じ長さ。
+    #[test]
+    fn video_dropped_on_a_cell_lands_in_that_cell_with_audio_cell_below() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(src) = video_with_audio(dir.path()) else {
+            eprintln!("{}", skip_reason("video_dropped_on_a_cell"));
+            return;
+        };
+        let mut app = headless_app();
+        app.song_doc.replace_song({
+            let mut song = common::model::Song::default();
+            song.tracks = vec![
+                track_with(|t| { t.id = 10; t.name = "A".into(); }),
+                track_with(|t| { t.id = 20; t.name = "B".into(); }),
+            ];
+            song
+        });
+        app.action_import_video(
+            vec![src],
+            ImportTrackTarget::LauncherCell { track_id: 10, scene_index: 2 },
+            Some(4.0),
+        );
+        let song = app.song_doc.song();
+        assert_eq!(song.tracks.len(), 3, "対の音声行が 1 本増える: {}", app.ui_ephemeral.status_message);
+        assert_eq!(song.tracks[0].id, 10);
+        assert_eq!(song.tracks[1].name, "clip (Audio)", "音声行は video 行の直下");
+        assert_eq!(song.tracks[2].id, 20);
+        let cells = |t: &Track| t.session_clips.clone();
+        let v = cells(&song.tracks[0]);
+        let a = cells(&song.tracks[1]);
+        assert_eq!(v.len(), 1, "video セル");
+        assert_eq!(a.len(), 1, "audio セル");
+        assert_eq!(v[0].scene_id, a[0].scene_id, "同じ列");
+        assert_eq!(song.scene_index(v[0].scene_id), Some(2), "落とした列");
+        assert_eq!(kind_of(&app, v[0].clip.content_id), "video");
+        assert_eq!(kind_of(&app, a[0].clip.content_id), "audio");
+        assert_eq!(v[0].clip.length_beats, a[0].clip.length_beats, "対のセルは同じ長さで位相を揃える");
+        assert!(song.tracks.iter().all(|t| t.clips.is_empty()), "アレンジには置かない");
+    }
+
+    /// 既存トラックへ落とした動画はそのトラックのクリップになり、対の音声は直下に
+    /// 新しいトラックを作って同じ拍に置く。
+    #[test]
+    fn video_dropped_on_a_track_places_clip_there_and_audio_track_below() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(src) = video_with_audio(dir.path()) else {
+            eprintln!("{}", skip_reason("video_dropped_on_a_track"));
+            return;
+        };
+        let mut app = headless_app();
+        app.song_doc.replace_song({
+            let mut song = common::model::Song::default();
+            song.tracks = vec![
+                track_with(|t| { t.id = 10; t.parent_group_id = Some(99); }),
+                track_with(|t| { t.id = 20; }),
+            ];
+            song
+        });
+        app.action_import_video(vec![src], ImportTrackTarget::Track(0), Some(4.0));
+        let song = app.song_doc.song();
+        assert_eq!(song.tracks.len(), 3);
+        assert_eq!(song.tracks[0].clips.len(), 1, "video clip は落とした行");
+        assert_eq!(song.tracks[0].clips[0].start_beat, 4.0);
+        assert_eq!(kind_of(&app, song.tracks[0].clips[0].content_id), "video");
+        assert_eq!(song.tracks[1].clips.len(), 1, "audio clip は直下の新しい行");
+        assert_eq!(song.tracks[1].clips[0].start_beat, 4.0);
+        assert_eq!(kind_of(&app, song.tracks[1].clips[0].content_id), "audio");
+        assert_eq!(song.tracks[1].parent_group_id, Some(99), "同じグループ階層に入る");
+        assert_eq!(song.tracks[2].id, 20);
     }
 }

@@ -1768,12 +1768,12 @@ impl AppData {
             AppEvent::OpenImportAudioDialog => {
                 self.action_open_import_audio_dialog();
             }
-            AppEvent::ImportVideo { paths, target_beat } => {
+            AppEvent::ImportVideo { paths, target, target_beat } => {
                 #[cfg(windows)]
-                self.action_import_video(paths, target_beat);
+                self.action_import_video(paths, target, target_beat);
                 #[cfg(not(windows))]
                 {
-                    let _ = (paths, target_beat);
+                    let _ = (paths, target, target_beat);
                     self.ui_ephemeral.status_message =
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }

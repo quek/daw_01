@@ -177,6 +177,7 @@ pub fn spawn_orchestrator(fixture: PathBuf, proxy: EventLoopProxy<AppEvent>) {
             if proxy
                 .send_event(AppEvent::ImportVideo {
                     paths: vec![fixture.clone()],
+                    target: crate::app_types::ImportTrackTarget::NoHint,
                     target_beat: None,
                 })
                 .is_err()

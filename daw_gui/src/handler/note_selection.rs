@@ -348,34 +348,13 @@ mod launcher_cell_editing_tests {
     //! セルは曲の時間軸に居ない (`start_beat` は常に 0 / `track.clips` にも居ない)
     //! ので、セルのノート選択をアレンジの時間範囲として書き戻すと壊れる。
     //! 壊れ方は 2 通りあって、どちらも同じ根 (`Song::content_lanes_for`) を持つ。
-    use std::sync::Arc;
-
     use common::model::{Clip, ClipKey, Track};
-    use common::protocol::{AudioCommand, PluginCommand};
-    use tokio::sync::mpsc;
 
     use crate::app::{AppData, AppEvent};
-    use crate::dispatcher::{
-        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-    };
     use crate::event_launcher::{LauncherCellKey, LauncherEvent, LauncherRow};
 
     fn build_app() -> AppData {
-        let (audio_tx, _a) = mpsc::unbounded_channel::<AudioCommand>();
-        let (plugin_tx, _p) = mpsc::unbounded_channel::<PluginCommand>();
-        let events: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
-        let jobs: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-        AppData::new(
-            audio_tx,
-            plugin_tx,
-            None,
-            None,
-            events,
-            jobs,
-            None,
-            None,
-            common::audio_bridge::DEFAULT_SAMPLE_RATE,
-        )
+        crate::test_support::headless_app()
     }
 
     /// トラック 1 本 + 列 1 本の曲を作り、その行にセルを 1 つ置く。

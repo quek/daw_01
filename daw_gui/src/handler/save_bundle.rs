@@ -262,42 +262,13 @@ impl AppData {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
 
     use common::model::{
         AudioContent, AudioEvent, AudioSource, AudioSourcePath, Clip, ClipContent, Song, Track,
     };
     use tempfile::tempdir;
 
-    use crate::dispatcher::{
-        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-    };
-    use crate::state::AppData;
-
-    /// 子プロセス無しの AppData。 IPC channel の受け側は生かしておく
-    /// (`flush_song_sync` の send が Err にならないように)。
-    fn headless_app() -> (
-        AppData,
-        tokio::sync::mpsc::UnboundedReceiver<common::protocol::AudioCommand>,
-        tokio::sync::mpsc::UnboundedReceiver<common::protocol::PluginCommand>,
-    ) {
-        let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (plugin_tx, plugin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
-        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-        let app = AppData::new(
-            audio_tx,
-            plugin_tx,
-            None,
-            None,
-            event_dispatcher,
-            job_dispatcher,
-            None,
-            None,
-            common::audio_bridge::DEFAULT_SAMPLE_RATE,
-        );
-        (app, audio_rx, plugin_rx)
-    }
+    use crate::test_support::headless_app;
 
     fn touch(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -354,7 +325,7 @@ mod tests {
         touch(&old.path().join("samples").join("b.wav"));
         touch(&old.path().join("samples").join("orphan.wav"));
 
-        let (mut app, _audio_rx, _plugin_rx) = headless_app();
+        let mut app = headless_app();
         app.song_doc.file_path = Some(old_daw.clone());
         app.song_doc.replace_song(two_clip_song());
         // clip 2 を消す → b.wav は undo 履歴だけが参照する。
@@ -398,7 +369,7 @@ mod tests {
         let junk = dir.path().join("samples").join("junk.wav");
         touch(&junk);
 
-        let (mut app, _audio_rx, _plugin_rx) = headless_app();
+        let mut app = headless_app();
         app.song_doc.file_path = Some(daw.clone());
         let mut song = two_clip_song();
         song.tracks[0].clips.truncate(1);

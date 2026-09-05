@@ -20,6 +20,8 @@ pub mod recent;
 pub mod window_state;
 #[cfg(test)]
 mod app_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod event;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;

@@ -902,7 +902,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if !video_paths.is_empty() {
             let paths = video_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ImportVideo { paths, target_beat });
+                app.handle_event(AppEvent::ImportVideo { paths, target, target_beat });
             }));
         }
         if !image_paths.is_empty() {
