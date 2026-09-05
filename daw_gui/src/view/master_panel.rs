@@ -629,10 +629,7 @@ fn draw_stereo_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
 // 右クリックメニュー (設定はここでしか変えない)
 // =====================================================================
 
-/// 選択中の項目に ✓ を付けたラベルを作る。
-fn checked(label: &str, on: bool) -> String {
-    if on { format!("\u{2713} {label}") } else { format!("  {label}") }
-}
+use crate::view::checked;
 
 /// `rect` 内の右クリックで `MENU_IDS[slot]` のメニューを開く。
 ///

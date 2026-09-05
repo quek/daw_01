@@ -48,3 +48,9 @@ pub mod track_inspector;
 pub mod track_picker;
 pub mod transport;
 pub mod voicevox_overlay;
+
+/// 右クリックメニューの排他選択項目に ✓ を付けたラベルを作る
+/// (master panel のメーター設定 / transport のカウントイン)。
+pub(crate) fn checked(label: &str, on: bool) -> String {
+    if on { format!("\u{2713} {label}") } else { format!("  {label}") }
+}

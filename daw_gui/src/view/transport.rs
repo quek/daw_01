@@ -15,6 +15,7 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 use crate::event_launcher::LauncherEvent;
 use crate::theme::Theme;
+use crate::view::checked;
 use crate::view::param_gesture::push_param_gesture_edges;
 
 const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
@@ -663,7 +664,31 @@ fn draw_playback_buttons(
     x + follow_w + 12.0
 }
 
-/// 録音まわり (録音モード / メトロノーム / カウントイン / Snap Live / MIDI Learn)。
+/// メトロノームボタンの右クリックでカウントイン小節数 (無し / 1 / 2) を選ぶ。
+///
+/// 録音 trigger 時に preroll bars 分 click のみ流して 0 拍到達で正規録音を開始する
+/// (0 = 即時録音)。 カウントインはメトロノームの click を鳴らす機能なので、 独立した
+/// dropdown ではなくそのボタンの設定として置く (Live / Bitwig と同じ)。
+/// popup id は座標に依らない安定 id (`master_panel::MENU_IDS` と同じ理由)。
+fn count_in_context_menu(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    const COUNT_IN_LABELS: [&str; 3] = ["カウントイン なし", "カウントイン 1 小節", "カウントイン 2 小節"];
+    let cur = usize::from(app.recording.count_in_bars.min(2));
+    let labels: Vec<String> = COUNT_IN_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, l)| checked(l, i == cur))
+        .collect();
+    let items: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let open_at = ui.take_secondary_click_in_rect(rect);
+    ui.context_menu_at("transport_count_in_menu", open_at, &items, |idx, ui| {
+        let bars = idx as u8;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetCountInBars(bars))
+        }));
+    });
+}
+
+/// 録音まわり (録音モード / メトロノーム (右クリック: カウントイン) / Snap Live / MIDI Learn)。
 /// このまとまりは全部 running `x` に載る固定幅ボタンなので `area` を読まない。
 fn draw_recording_controls(
     app: &AppData,
@@ -706,10 +731,11 @@ fn draw_recording_controls(
     // 音符 ×2、 細かい beat 感)、 active 時は黄 LED 風で 「click 鳴動中」 を強調。
     let metro_w = 36.0;
     let metro_active = app.transport.metronome_enabled;
+    let metro_rect = Rect { x, y: cy, w: metro_w, h: bh };
     ui.toggle_button_at(
         "transport_metronome",
         "\u{266C}",
-        Rect { x, y: cy, w: metro_w, h: bh },
+        metro_rect,
         metro_active,
         &style_click(&app.theme),
         move |_| {
@@ -718,31 +744,9 @@ fn draw_recording_controls(
             })
         },
     );
-    x += metro_w + 12.0;
-
-    // Phase 7 B4 Step C (2026-05-13): count-in bars dropdown (Off / 1 / 2 bars)。
-    // 録音 trigger 時に preroll bars 分 click のみ流して 0 拍到達で正規録音
-    // 開始。 0 で count-in 無し (= 即時録音)。 transport の Record button
-    // とセットで業界標準 (Bitwig / Live / Reaper)。
-    // 既定表示 "No count-in" = 11 字 * 14 * 0.527 = 81.2px。 文字領域は
-    // w - PAD_X(8) - ARROW_W(16) なので 110 - 24 = 86px 必要 (旧 90 では 66px しか
-    // 無く、 既定ラベルが ▼ アローに重なっていた)。
-    let count_in_w = 110.0;
-    let count_in_items: &[&str] = &["No count-in", "1 bar", "2 bars"];
-    let cur_count_in_idx = (app.recording.count_in_bars.min(2)) as usize;
-    if let Some(idx) = ui.dropdown(
-        "transport_count_in",
-        Rect { x, y: cy, w: count_in_w, h: bh },
-        count_in_items,
-        cur_count_in_idx,
-    ) {
-        let bars = idx as u8;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SetCountInBars(bars))
-        }));
-    }
+    count_in_context_menu(app, ui, metro_rect);
     // Record button は r.md #52 で再生ボタンの右隣へ移した (この上には無い)。
-    x += count_in_w + 12.0;
+    x += metro_w + 12.0;
 
     // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。
     // ON で MIDI 録音中の note_on pitch を Song.scale_at(playhead).snap(pitch)
