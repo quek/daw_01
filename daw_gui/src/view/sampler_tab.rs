@@ -309,7 +309,6 @@ pub(crate) fn draw_bar_lines(
     let p = &app.theme.core;
     let song = app.song_doc.song();
     let sr = app.ipc.sample_rate.max(1);
-    let tempo = common::tempo_map::TempoMap::from_song(song);
     let bar = common::model::beats_per_bar(song.time_sig).max(1e-6);
     let mut lines: Vec<LineSegment> = Vec::new();
     let mut labels: Vec<(f32, String)> = Vec::new();
@@ -325,15 +324,15 @@ pub(crate) fn draw_bar_lines(
             clip_rect: Some(wave),
         });
         let len_samples = ((end - start) as f64 * src.samples_per_unit) as u64;
-        let beat0 = tempo.samples_to_beat(ph0, sr);
-        let beat1 = tempo.samples_to_beat(ph0 + len_samples, sr);
+        let beat0 = app.song_samples_to_beat(ph0, sr);
+        let beat1 = app.song_samples_to_beat(ph0 + len_samples, sr);
         let first_bar = (beat0 / bar).ceil() as i64;
         let last_bar = (beat1 / bar).floor() as i64;
         // 詰まりすぎたら間引く (ラベルは 40px 以上空いたときだけ)。
         let mut last_label_x = f32::MIN;
         for k in first_bar..=last_bar {
             let beat = k as f64 * bar;
-            let s = tempo.beat_to_samples(beat, sr);
+            let s = app.song_beat_to_samples(beat, sr);
             if s < ph0 {
                 continue;
             }

@@ -265,8 +265,7 @@ impl AppData {
             let sr = self.sampler.sample_rate().max(1);
             let dt = (at_ns - seg.wall_ns) as u128 * u128::from(sr) / 1_000_000_000;
             let samples = ph.saturating_add(dt as u64);
-            let tempo = common::tempo_map::TempoMap::from_song(self.song_doc.song());
-            Some(tempo.samples_to_beat(samples, self.ipc.sample_rate.max(1)))
+            Some(self.song_samples_to_beat(samples, self.ipc.sample_rate.max(1)))
         });
         from_segment.or_else(|| {
             self.transport

@@ -1381,16 +1381,19 @@ fn alt_click_on_point_deletes_without_resizing_the_lane() {
     assert_eq!(lane_height(&app, 1, 1), h_before, "lane の高さは変わらない");
 }
 
-/// **lasso は clip の上では起動しない**。automation clip の上で drag すると
-/// clip が動き、point 選択 (lasso の結果) は起きない。
+/// r.md #109: automation clip の掴み方はトラック行のクリップと同じ — **名前帯 = 移動、
+/// 本体 = 時間範囲**。名前帯を drag すると clip が動き、point 選択 (旧 lasso の結果)
+/// は起きない。本体の drag は移動ではなく範囲選択になる (下の
+/// `drag_on_automation_clip_body_makes_a_range`)。
 #[test]
 fn drag_on_automation_clip_moves_it_instead_of_lassoing() {
     let (mut app, _a, _p) = app_with_lane(0.0);
     app.selection.selected_automation_points.clear();
+    let clip_rect = lane_clip_rect(&mut app);
     let mut host = UiHost::no_redraw();
-    // clip [0,8) の内側で、point (拍 0 / 2 / 6) から離れた拍 4 付近。
+    // clip [0,8) の名前帯 (上端から数 px)、point (拍 0 / 2 / 6) から離れた拍 4 付近。
     let x = 4.0 * ZOOM;
-    let y = track0_bottom() + f32::from(LANE_H) * 0.8;
+    let y = clip_rect.y + 4.0;
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, hold(x + ZOOM, y, no_mods()));
     drive(&mut host, &mut app, release(x + ZOOM, y, no_mods()));
@@ -1399,6 +1402,28 @@ fn drag_on_automation_clip_moves_it_instead_of_lassoing() {
         app.selection.selected_automation_points.is_empty(),
         "lasso は起動しない: {:?}",
         app.selection.selected_automation_points
+    );
+}
+
+/// r.md #109: automation clip の **本体** (名前帯より下、線からも点からも離れた場所) の
+/// drag は移動ではなく時間範囲 (トラック行のクリップ本体と同じ)。
+#[test]
+fn drag_on_automation_clip_body_makes_a_range() {
+    let (mut app, _a, _p) = app_with_lane(0.0);
+    let clip_before = lane_clip_start(&app, 1, 1);
+    let mut host = UiHost::no_redraw();
+    let x = 4.0 * ZOOM;
+    let y = track0_bottom() + f32::from(LANE_H) * 0.8;
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, hold(x + ZOOM, y, no_mods()));
+    drive(&mut host, &mut app, release(x + ZOOM, y, no_mods()));
+    assert_eq!(lane_clip_start(&app, 1, 1), clip_before, "本体の drag では clip は動かない");
+    let sel = app.selection.time.as_ref().expect("時間範囲が立つ");
+    assert!(sel.end_beat > sel.start_beat, "幅のある範囲になる");
+    assert!(
+        sel.lanes.iter().any(|l| matches!(l, common::model::LaneRef::Automation(_))),
+        "オートメーションレーン行が範囲に入る: {:?}",
+        sel.lanes
     );
 }
 
@@ -1825,27 +1850,27 @@ fn alt_drag_in_a_lane_no_longer_resizes_it() {
     assert_eq!(lane_height(&app, 1, 1), before, "レーン本体の Alt+drag で高さは変わらない");
 }
 
-/// r.md #73 (§3.6): 線から離れた場所の Alt+ドラッグは死角にならず、
-/// automation clip が動く。しかも Alt がスナップを無効にしている
-/// (= MIDI / audio clip と対称)。
+/// r.md #73 (§3.6) / #109: 名前帯を掴んだ移動中に Alt を押すとスナップが切れる
+/// (= MIDI / audio clip と対称)。**押した瞬間の Alt は範囲選択** (#109) なので、
+/// Alt は press の後 (continuation) で入れる (`drag.rs` の `last_alt` 更新)。
 ///
 /// **ハーネスの `build_app` は `arrange_snap_enabled = false` なので、
 /// このテストは冒頭で `true` に戻す。** 戻さないと「Alt 無しでもスナップしない」ので
 /// 比較が成立しない (空振りする)。
 #[test]
 fn alt_drag_off_the_line_moves_the_clip_without_snapping() {
-    /// 線から離れた clip 上を 0.3 拍ぶん引いて、着地した clip start を返す。
+    /// 名前帯を 0.3 拍ぶん引いて、着地した clip start を返す。
     fn drag_clip(alt_on: bool) -> f64 {
         let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
         app.ui_prefs.arrange_snap_enabled = true;
         let clip_rect = lane_clip_rect(&mut app);
-        // 線は左下から右上へ上がるので、左半分の **上端寄り** は線から遠い。
+        // 名前帯 (上端から数 px)。線は左下から右上へ上がるので左半分は線から遠い。
         let x = 2.0_f32 * ZOOM;
-        let y = clip_rect.y + clip_rect.h * 0.05;
+        let y = clip_rect.y + 4.0;
         let m = modifiers(false, false, alt_on);
         let dx = ZOOM * 0.3; // グリッドに乗らない移動量
         let mut host = UiHost::no_redraw();
-        drive(&mut host, &mut app, press(x, y, m));
+        drive(&mut host, &mut app, press(x, y, no_mods()));
         drive(&mut host, &mut app, hold(x + dx * 0.5, y, m));
         drive(&mut host, &mut app, release(x + dx, y, m));
         lane_clip_start(&app, 1, 1).expect("automation clip が居る")
