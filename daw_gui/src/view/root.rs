@@ -296,6 +296,23 @@ fn set_launcher_layout(ui: &mut Ui<'_, AppData>, layout: common::model::Launcher
     }));
 }
 
+/// 「最近開いた / 最近保存した」 ファイルを 1 click で開く menu item を 1 つ足す。
+/// File メニュー先頭の直接項目 (r.md #95) と「Recently Saved ►」「Open Recent ►」
+/// の各行はすべてここを通り、 open 経路 (`AppEvent::OpenRecent` → dirty guard →
+/// load) は 1 本だけ。
+fn recent_open_item<'a>(
+    m: &mut daw_ui_core::widgets::menu::MenuBuilder<'a, AppData>,
+    label: &'a str,
+    path: &std::path::Path,
+) {
+    let path = path.to_path_buf();
+    m.item(label, move |ui| {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::OpenRecent(path))
+        }));
+    });
+}
+
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
 /// `Ui<'a, AppData>` の `'a` は `&AppData` borrow 寿命と同一なので、
 /// `app: &'a AppData` を明示して menu の dynamic label (= `&app.ui_prefs.recent_files_labels[i]`)
@@ -328,18 +345,25 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     shortcut_hint: None,
                 });
             } else {
+                // r.md #95: 最後に保存したファイル (= Recently Saved の 1 件目) を
+                // sub menu の **さらに上**に直接開ける 1 行として置く。cascade を
+                // 開かずに 1 click で前回の続きへ戻る導線。label / path / click 経路は
+                // すべて sub menu の 1 件目と同一 (`recent_open_item`) で、別経路を
+                // 作らない。空のときはこの行を出さず、上の disabled 表示だけにする
+                // (empty 表示が二重にならないように)。
+                if let (Some(label), Some(path)) = (
+                    app.ui_prefs.recent_saved_labels.first(),
+                    app.ui_prefs.recent_saved.paths.first(),
+                ) {
+                    recent_open_item(m, label, path);
+                }
                 m.sub_menu("Recently Saved", |sub| {
                     for (label, path) in app
                         .ui_prefs.recent_saved_labels
                         .iter()
                         .zip(app.ui_prefs.recent_saved.paths.iter())
                     {
-                        let path_clone = path.clone();
-                        sub.item(label.as_str(), move |ui| {
-                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                            }));
-                        });
+                        recent_open_item(sub, label, path);
                     }
                 });
             }
@@ -357,12 +381,7 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                         .iter()
                         .zip(app.ui_prefs.recent_files.paths.iter())
                     {
-                        let path_clone = path.clone();
-                        sub.item(label.as_str(), move |ui| {
-                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                            }));
-                        });
+                        recent_open_item(sub, label, path);
                     }
                 });
             }
