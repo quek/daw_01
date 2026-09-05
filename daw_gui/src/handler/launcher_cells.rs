@@ -15,6 +15,10 @@
 //! 1 本 ([`LauncherCellKey`] = トラック行 / レーン行の両方) を持ち、面タグも
 //! [`EditSurface::LauncherCells`](crate::app::EditSurface::LauncherCells) 1 つ。
 //! 鍵の型を共有できること (= 引ける) と、集合を共有してよいこと (= 面が同じ) は別。
+//! 「いま選択されているクリップ」 の導出は
+//! [`AppData::selected_clip_refs`](crate::app::AppData::selected_clip_refs) 1 本が
+//! 両面を見る (セルが生きていればセル) ので、インスペクタ / preview / 改名などの
+//! クリップ操作は面を意識しない。
 //!
 //! ## 列の遅延実体化
 //!

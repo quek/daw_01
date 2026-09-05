@@ -208,9 +208,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
 
     // **アレンジのクリップ選択だけ** (時間範囲からの導出)。ランチャーのセル選択は
     // 別の面なので混ぜない — 帯へは `LauncherView::selected` が別口で運ぶ
-    // (混ぜたときに何が壊れるかは同フィールドの doc)。
+    // (混ぜたときに何が壊れるかは同フィールドの doc)。 `selected_clip_refs()` は
+    // セル選択中にセルの key を返すので、 ここだけはアレンジ限定の導出を使う。
     let selected_clips: Vec<ClipKey> = app
-        .selected_clip_refs()
+        .arrangement_selected_clip_refs()
         .into_iter()
         .map(|k| ClipKey { track_id: k.track_id, clip_id: k.clip_id })
         .collect();
