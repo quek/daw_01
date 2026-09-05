@@ -302,6 +302,7 @@ fn グループ行のまとめセルは子行へ展開される() {
             color: Color::rgb(0.3, 0.4, 0.6),
             muted: false,
             linked: false,
+            in_active_group: false,
             follow: false,
             content_offset_beats: 0.0,
             len_beats: 4.0,

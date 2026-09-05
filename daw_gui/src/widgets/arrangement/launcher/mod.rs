@@ -24,7 +24,7 @@
 //! **「見方の都合」の view 状態だけ** (`ui_prefs.launcher_*`。帯幅 / 列幅 /
 //! 横スクロール / レイアウト。`*` は立たない = `project_dirty_flag_rule`)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use common::model::{LauncherLayout, RowPlayback};
 
@@ -368,6 +368,12 @@ pub(super) struct LauncherCellView {
     pub muted: bool,
     /// 共有 (linked) セル。名前の左に `⇌` を描く。
     pub linked: bool,
+    /// r.md #91: 共有グループ「連動ハイライト」 (`ArrangementClip::in_active_group` と同じ契約)。
+    /// `true` かつ `linked` のとき、アレンジのクリップと同じ glow wash + 明るい枠を重ねる
+    /// (= 「今 hover / 選択している共有グループの member」)。caller が
+    /// `{選択 clip / セル} ∪ {hover 中の clip / セル}` の content 集合から毎フレーム立てる。
+    /// hover 由来で毎フレーム変わるが、帯は cached を張らないので cache key の心配は無い。
+    pub in_active_group: bool,
     /// このセルにフォローアクションが設定されている (▶ を縞にする)。
     pub follow: bool,
     /// 中身の窓 (`Clip::content_offset_beats` / `length_beats`)。ミニ表示の写像に使う。

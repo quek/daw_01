@@ -20,6 +20,8 @@ pub(crate) fn build(
     master_lanes: &[ArrangementAutomationLane],
     // content ごとの参照数 (`view_build` が 1 度だけ作る表)。
     refcounts: &HashMap<common::model::ContentId, usize>,
+    // r.md #91: 連動ハイライトの対象 content (`view_build::active_share_groups`、アレンジと同じ集合)。
+    active_groups: &HashSet<common::model::ContentId>,
 ) -> LauncherView {
     let song = app.song_doc.song();
     let scenes: Vec<LauncherSceneView> = song
@@ -58,7 +60,7 @@ pub(crate) fn build(
             continue;
         };
         let key = common::model::AutomationLaneKey { track: MASTER_TRACK_ID, lane: lane.id };
-        rows.insert(ArrangementRowKey::Lane(key), lane_row(ml, lane, key, song, refcounts));
+        rows.insert(ArrangementRowKey::Lane(key), lane_row(ml, lane, key, song, refcounts, active_groups));
     }
 
     for t in tracks {
@@ -80,6 +82,7 @@ pub(crate) fn build(
                     )),
                     muted: sc.clip.muted,
                     linked: is_shared(refcounts, sc.clip.content_id),
+                    in_active_group: active_groups.contains(&sc.clip.content_id),
                     follow: sc.launch.follow.enabled,
                     content_offset_beats: sc.clip.content_offset_beats,
                     len_beats: sc.clip.length_beats,
@@ -104,7 +107,7 @@ pub(crate) fn build(
                 continue;
             };
             let key = common::model::AutomationLaneKey { track: t.id, lane: lane.id };
-            rows.insert(ArrangementRowKey::Lane(key), lane_row(ml, lane, key, song, refcounts));
+            rows.insert(ArrangementRowKey::Lane(key), lane_row(ml, lane, key, song, refcounts, active_groups));
         }
     }
 
@@ -132,6 +135,7 @@ fn lane_row(
     key: common::model::AutomationLaneKey,
     song: &common::model::Song,
     refcounts: &HashMap<common::model::ContentId, usize>,
+    active_groups: &HashSet<common::model::ContentId>,
 ) -> LauncherRowView {
     let mut cells: HashMap<u32, LauncherCellView> = HashMap::new();
     for sc in &ml.session_clips {
@@ -161,6 +165,7 @@ fn lane_row(
                 color: sc.clip.color.map_or(lane.color, track_color::to_renderer),
                 muted: false,
                 linked: is_shared(refcounts, sc.clip.content_id),
+                in_active_group: active_groups.contains(&sc.clip.content_id),
                 follow: sc.launch.follow.enabled,
                 content_offset_beats: sc.clip.content_offset_beats,
                 len_beats: sc.clip.length_beats,

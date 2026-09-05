@@ -243,3 +243,55 @@ const path2 = JSON.stringify(sources[String(s2)].path);
 if (path1 === path2) {
   fail("2 トラックの焼き込み WAV が同じファイル (後の render が前を上書きする): " + path1);
 }
+
+// ---- 7. マスターストリップが ON でも音が変わらないこと (r.md #92) ------------
+// 焼き込みはトラック単独の isolate render だが、`master_strip` (バスコンプ / リミッター) を
+// 外し忘れると GR が WAV に焼き込まれ、再生時にもう一度マスターを通って二重に掛かる
+// (実機: comp + limiter ON の曲で Glue した Kick が -4.5 dB)。強めの設定で差を露出させる。
+const withMaster = JSON.parse(JSON.stringify(song));
+withMaster.master_strip = {
+  comp: {
+    on: true,
+    threshold_db: -30.0,
+    ratio: "R10",
+    attack: "A3",
+    release: "R300",
+    makeup_db: 0.0,
+  },
+  eq: { on: false, low_db: 0.0, lomid_db: 0.0, high_db: 0.0 },
+  limiter: { on: true, ceiling_db: -20.0 },
+};
+daw.appLoadSongJson(JSON.stringify(withMaster));
+daw.sleepMs(300);
+const masterBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
+if (masterBefore.integrated_lufs === null) fail("master strip ON の song が無音");
+
+daw.setTimeSelection(0.0, 4.0, JSON.stringify([1]));
+daw.dispatchGlue();
+
+waited = 0;
+while (waited < 30000) {
+  s = JSON.parse(daw.inspectSongJson());
+  if (s.tracks[0].clips.length === 1) break;
+  daw.sleepMs(200);
+  waited += 200;
+}
+expectEq(s.tracks[0].clips.length, 1, "master strip ON で Glue 後のクリップ数");
+// ストリップは song 側に残っている (焼き込みが外すのは render 用の使い捨て Song だけ)。
+expectEq(s.master_strip.comp.on, true, "master comp kept");
+expectEq(s.master_strip.limiter.on, true, "master limiter kept");
+
+const masterAfter = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
+if (masterAfter.integrated_lufs === null) fail("master strip ON の Glue 結果が無音");
+const masterDelta = Math.abs(masterAfter.integrated_lufs - masterBefore.integrated_lufs);
+if (masterDelta > 0.5) {
+  fail(
+    "マスターストリップ ON で結合の前後のラウドネスが変わった: before=" +
+      masterBefore.integrated_lufs +
+      " after=" +
+      masterAfter.integrated_lufs +
+      " (差 " +
+      masterDelta.toFixed(2) +
+      " LU)。焼き込みが master_strip を通している (二重適用) を疑う",
+  );
+}

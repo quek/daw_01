@@ -105,10 +105,16 @@ impl AppData {
     /// (bounce = `docs/plan_audio_clip.md` §3.8 / Glue の焼き込み =
     /// `docs/plan_glue_bake.md`)。
     ///
-    /// 他トラック・`master_fx_chain`・master 音量・group/send/sidechain 参照を全て落とすので、
+    /// 他トラック・`master_fx_chain`・master 音量・**マスターストリップ (バスコンプ /
+    /// リミッター) とそのオートメーション / 変調**・group/send/sidechain 参照を全て落とすので、
     /// engine の offline render はそのトラック単独の音だけを焼く (= isolate、 他トラックが
     /// 混ざらない)。元トラックの mute / solo も解除する (= with-FX bounce で mute 済みでも
     /// isolate render は鳴らす)。
+    ///
+    /// r.md #92: マスターストリップを残したまま焼くと、コンプ / リミッターの GR が WAV に
+    /// 焼き込まれ、再生時にもう一度マスターを通って**二重に**掛かる (実測: comp ON +
+    /// limiter ON の曲で Glue した Kick が全ヒット -4.5 dB、peak は ceiling の -1 dB に揃う)。
+    /// master 音量 / `master_fx_chain` を外すのと同じ理由で、ストリップも素通しにする。
     ///
     /// **ランチャーの主導権は必ずアレンジへ戻す**: 行が [`RowPlayback::Launcher`] /
     /// `LauncherStopped` のままだと、offline 走査は「今のセッションの状態」を再現する
@@ -129,6 +135,16 @@ impl AppData {
         let mut isolated = self.song_doc.song().clone();
         isolated.master_fx_chain.clear();
         isolated.master_gain = 1.0;
+        // r.md #92: ストリップ本体 (全 OFF = `is_bypassed`) に加え、ON に戻し得る
+        // song-level のレーン / 変調も落とす (lane が無くても `song_mod_routings` は
+        // per-sample に値を動かす — track 側の `mod_routings` を外すのと同じ理由)。
+        isolated.master_strip = common::model::MasterStrip::default();
+        isolated
+            .song_lanes
+            .retain(|l| !matches!(l.target, common::model::AutomationTarget::MasterStrip(_)));
+        isolated
+            .song_mod_routings
+            .retain(|r| !matches!(r.target, common::model::AutomationTarget::MasterStrip(_)));
         let mut kept = track.clone();
         kept.parent_group_id = None;
         kept.sends.clear();

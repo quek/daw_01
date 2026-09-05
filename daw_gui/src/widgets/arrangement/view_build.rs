@@ -90,33 +90,11 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         }
     }
 
-    // gui_01 #068 連動ハイライト: {選択 clip} ∪ {前フレーム hover clip} の content_id (refcount>=2)。
-    let active_groups: HashSet<common::model::ContentId> = if app.selection.time.is_none()
-        && app.ui_ephemeral.arrange_hover_content.is_none()
-    {
-        HashSet::new()
-    } else {
-        let mut set = HashSet::new();
-        let is_shared =
-            |cid: common::model::ContentId| refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2;
-        for r in app.selected_clip_refs() {
-            if let Some(c) = app
-                .song_doc
-                .song()
-                .track_by_id(r.track_id)
-                .and_then(|t| t.clip_by_id(r.clip_id))
-                && is_shared(c.content_id)
-            {
-                set.insert(c.content_id);
-            }
-        }
-        if let Some(cid) = app.ui_ephemeral.arrange_hover_content
-            && is_shared(cid)
-        {
-            set.insert(cid);
-        }
-        set
-    };
+    // gui_01 #068 / r.md #91 連動ハイライト: {選択 clip / automation clip / ランチャーセル} ∪
+    // {前フレーム hover の clip / automation clip / セル} の content_id (refcount>=2)。
+    // アレンジのクリップ・automation clip・ランチャー帯のセルは同じ content を共有し得るので、
+    // 集合は 1 つ (どの面で触っても、同じ content を持つものが全部の面で光る)。
+    let active_groups = active_share_groups(app, &refcount_by_content);
 
     // D3/D4: track/clip 名の `Arc<str>` キャッシュ (song_epoch 世代キー)。
     let labels = app.arrangement_labels();
@@ -125,6 +103,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         refcount_by_content: &refcount_by_content,
         lane_height_overrides: &app.ui_prefs.automation_lane_row_overrides,
         content_names: &labels.content_names,
+        active_groups: &active_groups,
         lane_h_bounds: lane_h_bounds(app, area),
     };
     let tracks: Vec<ArrangementTrack> = app
@@ -374,6 +353,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         &tracks,
         &master_row.automation_lanes,
         &refcount_by_content,
+        &active_groups,
     );
 
     BuiltArrangement {
@@ -394,6 +374,72 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
 // ---------------------------------------------------------------------------
 // clip 表示名の導出 (SSoT)
 // ---------------------------------------------------------------------------
+
+/// gui_01 #068 / r.md #91: 連動ハイライトの対象 content 集合。
+///
+/// {選択中のアレンジ clip} ∪ {選択中の automation clip} ∪ {選択中のランチャーセル} ∪
+/// {前フレームにポインタが乗っていた clip / automation clip / セル} の `content_id` のうち、
+/// 共有されているもの (refcount >= 2) だけ。アレンジ・automation lane・ランチャー帯の
+/// どの面で触っても、同じ content を持つものが全部の面で光る (集合は 1 つ)。
+///
+/// hover 源は `ui_ephemeral.arrange_hover_content` 1 本 (`arrangement_view` が 3 面の hover を
+/// 解決して 1 フレーム遅れで持つ)。選択は各面の選択集合をここで content へ解く。
+fn active_share_groups(
+    app: &AppData,
+    refcount_by_content: &HashMap<common::model::ContentId, usize>,
+) -> HashSet<common::model::ContentId> {
+    let sel = &app.selection;
+    if sel.time.is_none()
+        && sel.selected_automation_clips.is_empty()
+        && sel.selected_launcher_cells.is_empty()
+        && app.ui_ephemeral.arrange_hover_content.is_none()
+    {
+        return HashSet::new();
+    }
+    let song = app.song_doc.song();
+    let is_shared =
+        |cid: common::model::ContentId| refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2;
+    let mut set = HashSet::new();
+    let mut add = |cid: common::model::ContentId| {
+        if is_shared(cid) {
+            set.insert(cid);
+        }
+    };
+    // content を引く口は `clip_by_id` (= `all_clips` 契約: アレンジのクリップもセルも同じ id 空間)。
+    let track_clip_content = |k: ClipKey| {
+        song.track_by_id(k.track_id)
+            .and_then(|t| t.clip_by_id(k.clip_id))
+            .map(|c| c.content_id)
+    };
+    let lane_clip_content = |k: common::model::AutomationClipKey| {
+        song.automation_lane_by_key(k.track, k.lane)
+            .and_then(|l| l.clip_by_id(k.clip))
+            .map(|c| c.content_id)
+    };
+    for r in app.selected_clip_refs() {
+        if let Some(cid) = track_clip_content(r) {
+            add(cid);
+        }
+    }
+    for k in &sel.selected_automation_clips {
+        if let Some(cid) = lane_clip_content(*k) {
+            add(cid);
+        }
+    }
+    for cell in &sel.selected_launcher_cells {
+        let cid = match *cell {
+            crate::event_launcher::LauncherCellKey::Track(k) => track_clip_content(k),
+            crate::event_launcher::LauncherCellKey::Lane(k) => lane_clip_content(k),
+        };
+        if let Some(cid) = cid {
+            add(cid);
+        }
+    }
+    if let Some(cid) = app.ui_ephemeral.arrange_hover_content {
+        add(cid);
+    }
+    set
+}
 
 /// widget の heavy cache 無効化キー (描画内容そのものを hash)。
 /// 使われるのは `run.rs` の `viewport_key` の 1 成分としてのみ。
@@ -544,6 +590,8 @@ struct LaneBuildData<'a> {
     refcount_by_content: &'a HashMap<common::model::ContentId, usize>,
     lane_height_overrides: &'a HashMap<common::model::AutomationLaneKey, u16>,
     content_names: &'a HashMap<common::model::ContentId, Arc<str>>,
+    /// r.md #91: 連動ハイライトの対象 content 集合 (`active_share_groups`)。
+    active_groups: &'a HashSet<common::model::ContentId>,
     /// 表示に使うレーン行高の上下限 `(min, max)`。max は **今のペイン高**なので、
     /// 保存済みの巨大な高さもペインに収まる (`geometry::lane_pane_cap_px` の doc)。
     lane_h_bounds: (u16, u16),
@@ -594,6 +642,7 @@ fn build_arrangement_lanes_from_slice(
         refcount_by_content,
         lane_height_overrides,
         content_names,
+        active_groups,
         lane_h_bounds,
     } = data;
     lanes
@@ -636,6 +685,7 @@ fn build_arrangement_lanes_from_slice(
                             None
                         },
                         color: c.color.map(track_color::to_renderer),
+                        in_active_group: active_groups.contains(&c.content_id),
                     }
                 })
                 .collect();

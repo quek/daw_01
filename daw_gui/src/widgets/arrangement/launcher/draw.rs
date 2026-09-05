@@ -645,6 +645,13 @@ fn draw_filled_cell(
         push_countdown(hctx, Rect { h: (r.h - PROGRESS_BAR_H).max(0.0), ..r }, fill, &q.label());
     }
     let selected = is_cell_selected(f, key);
+    // r.md #91: 共有グループの連動ハイライト。アレンジの `draw_active_group_overlay` と
+    // 同じ語彙 (glow wash + 明るい中立枠) を、同じ style トークンで重ねる — 面が違っても
+    // 「同じ content を共有している」印は 1 つ。走行リング / 選択リングより **前** に描く
+    // (選択中の member は選択枠が優先、非選択の member がこの強調の主役 = アレンジと同じ順)。
+    if cell.linked && cell.in_active_group {
+        push_active_group_overlay(hctx, r, f.style, Some(f.launcher.grid));
+    }
     if d.playing {
         // **走行中の印は縁**。進捗バーは束 B が `audio_bridge` で位置を publish する
         // まで出ないので、これが無いと「どのセルが鳴っているか」が一切見えない。

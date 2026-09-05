@@ -419,6 +419,7 @@ fn automation_segment_at_hits_the_drawn_curve() {
             },
         ],
         share_group_color: None,
+        in_active_group: false,
     }];
     let tracks = vec![track_with_lane(lane)];
     let tops = vec![0.0_f32, 120.0];

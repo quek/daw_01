@@ -62,6 +62,23 @@ pub(super) fn hover(
                 cy,
             )
             .map(|(key, _body_rect)| key);
+            // r.md #91: lane body 内の automation clip も hover 源にする (共有グループの
+            // 連動ハイライト)。当たりは press / cursor と同じ `automation_clip_zone_at`
+            // (端の resize ハンドル込み = `hovered_clip` の `clip_hit` と同じ幅)。
+            response.hovered_automation_clip = automation_clip_zone_at(
+                &f.visible_tracks,
+                &f.tops,
+                f.view.track_row_h,
+                f.view,
+                f.header_pane.x,
+                f.header_pane.w,
+                f.lanes,
+                f.style,
+                cx,
+                cy,
+                f.style.resize_handle_px,
+            )
+            .map(|(key, _kind, _clip_rect, _body_rect)| key);
         }
     }
     // r.md #73: Alt 押下中に「曲げられる区間」の上にいるかを公開する

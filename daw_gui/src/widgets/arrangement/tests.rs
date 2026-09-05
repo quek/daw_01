@@ -1499,6 +1499,7 @@
                 points: Vec::new(),
                 share_group_color: None,
                 color,
+                in_active_group: false,
             }],
         };
         let mk = |color: Option<Color>| {

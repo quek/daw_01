@@ -113,6 +113,39 @@ fn device_drag_over_headers(
     }));
 }
 
+/// gui_01 #068 / r.md #91: 今フレームにポインタが乗っている **共有 content** の候補
+/// (= 次フレームの連動ハイライト `active_share_groups` の hover 源)。
+///
+/// hover 源は 3 面 — アレンジのクリップ / automation lane の clip / ランチャー帯のセル。
+/// ポインタは 1 か所にしか無いので同時に複数 `Some` にはならず、最初に当たった面を採る。
+/// どの面で触っても同じ held-value (`arrange_hover_content`) に入り、3 面すべての
+/// 同 content が光る。content を引く口は `clip_by_id` (= `all_clips` 契約: アレンジの
+/// クリップもセルも同じ id 空間)。
+fn hovered_share_content(
+    song: &common::model::Song,
+    resp: &crate::widgets::arrangement::ArrangementResponse,
+) -> Option<common::model::ContentId> {
+    let track_clip_content = |k: common::model::ClipKey| {
+        song.track_by_id(k.track_id)
+            .and_then(|t| t.clip_by_id(k.clip_id))
+            .map(|c| c.content_id)
+    };
+    let lane_clip_content = |k: crate::widgets::arrangement::AutomationClipKey| {
+        song.automation_lane_by_key(k.track, k.lane)
+            .and_then(|l| l.clip_by_id(k.clip))
+            .map(|c| c.content_id)
+    };
+    resp.hovered_clip
+        .and_then(track_clip_content)
+        .or_else(|| resp.hovered_automation_clip.and_then(lane_clip_content))
+        .or_else(|| {
+            let cell = resp.launcher.hovered_cell?;
+            cell.clip_key()
+                .and_then(track_clip_content)
+                .or_else(|| cell.automation_clip_key().and_then(lane_clip_content))
+        })
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let p = &app.theme.core;
     // 上部 24 px を Snap toolbar に。残りを arrangement widget に渡す。
@@ -142,13 +175,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 #068 連動ハイライト: 今フレームの hovered clip の content_id を
     // 次フレームの active group 計算用に保持 (変化時のみ Edit を発火、 毎フレーム
     // の無駄な mutate を避ける)。
-    // content を引く口なので `Track::clip_by_id` (= `all_clips` 契約) を通す。
-    // hover 源はアレンジ帯なので今はセルが来ないが、 `clips` を直に走査すると
-    // 「content を参照するものは `all_clips` 1 本」 の契約から外れた口が 1 つ残る。
-    let hover_content = resp.hovered_clip.and_then(|k| {
-        let t = app.song_doc.song().track_by_id(k.track_id)?;
-        t.clip_by_id(k.clip_id).map(|c| c.content_id)
-    });
+    let hover_content = hovered_share_content(app.song_doc.song(), &resp);
     if hover_content != app.ui_ephemeral.arrange_hover_content {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.ui_ephemeral.arrange_hover_content = hover_content;

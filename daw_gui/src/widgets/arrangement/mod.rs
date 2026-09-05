@@ -66,6 +66,8 @@ mod curve;
 use curve::AutomationSegmentBendSession;
 mod draw;
 use draw::*;
+mod share_group;
+use share_group::*;
 mod geometry;
 use geometry::*;
 // r.md #77: `run.rs` (2,699 行 1 関数) をフェーズ軸で分割した兄弟モジュール群。
@@ -459,6 +461,10 @@ pub struct ArrangementAutomationClip {
     /// per-clip 色上書き (`AutomationClip::color`)。`None` = `lane.color` (レーン識別色) を継承。
     /// 通常 clip の `ArrangementClip::color` に当たる。
     pub color: Option<Color>,
+    /// r.md #91: 共有グループ「連動ハイライト」 (`ArrangementClip::in_active_group` と同じ契約、
+    /// 同じ `draw_active_group_overlay` が cached **外**で描く)。`fold_arrangement_clip_hash` /
+    /// caller の `data_generation` には混ぜない (hover 由来で毎フレーム変わる)。
+    pub in_active_group: bool,
 }
 
 /// M14 Phase 63n-1 (#028): automation lane。
@@ -861,6 +867,12 @@ pub struct ArrangementResponse {
     /// `hovered_automation_lane` は `None` (排他、 piano_roll の `hovered_*` と同流儀)。 lane と clip は
     /// 縦に別領域なので通常同時には成立しないが、 構造的に排他を保証する。
     pub hovered_automation_lane: Option<AutomationLaneKey>,
+    /// r.md #91: ポインタが今乗っている automation clip (lane body 内の clip 矩形、端の
+    /// resize ハンドル込み = `automation_clip_zone_at` と同じ当たり)。`hovered_clip` と同じ
+    /// 毎フレーム算出の hover state で、caller は共有グループの連動ハイライト源にする。
+    /// `hovered_clip` とは y 領域が排他 (clip-first first-hit の else 側で算出)。
+    /// **heavy cache キーに混ぜないこと** (`hovered_clip` と同じ罠)。
+    pub hovered_automation_clip: Option<AutomationClipKey>,
     /// M14 Phase 127 (daw_01 #105): ポインタが今 hover している Arranger section の id (`hovered_clip`
     /// と同じ「毎フレーム算出の hover state」 idiom)。 section は ruler と track lanes の中間 lane なので
     /// clip / automation lane とは y 領域が排他 (同時に複数 hover しない)。
@@ -927,6 +939,7 @@ impl Default for ArrangementResponse {
             dragging_automation_clip: None,
             automation_lasso_active: false,
             hovered_automation_lane: None,
+            hovered_automation_clip: None,
             hovered_section: None,
             hovered_section_zone: None,
             dragging_section: None,
