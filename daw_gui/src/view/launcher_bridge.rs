@@ -212,6 +212,11 @@ fn convert(intent: &LauncherIntent) -> Option<LauncherEvent> {
 /// **1 本だけ**を引く (作成 / 移動 / drop / 貼り付けと同じ判定)。置けない行は
 /// `None` = 何もしない。オートメーションレーン行はメディア (オーディオ / 画像 /
 /// MIDI) を置けないのでこれも `None`。
+///
+/// **`None` は「何も置かない」であって「帯の外だった」ではない。** 呼び側
+/// (`arrangement_view::file_drop_target`) は帯の中に落ちた drop をここだけで解き、
+/// `None` をアレンジ側の解決へ倒さない — 倒すと停止列 / 返す列の余白に落とした
+/// ファイルが「アレンジの一番下に新トラック」に化ける (r.md #93)。
 pub(crate) fn cell_drop_target(
     app: &AppData,
     resp: &ArrangementResponse,
