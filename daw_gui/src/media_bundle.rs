@@ -38,7 +38,7 @@ pub const MEDIA_SUBDIRS: [&str; 3] = ["samples", "bounce", "images"];
 pub fn collect_bundle_refs(song: &Song, project_dir: &Path, into: &mut HashSet<PathBuf>) {
     let live = song.live_source_ids();
     let mut push = |rel: Option<PathBuf>| {
-        if let Some(rel) = rel {
+        if let Some(rel) = rel.filter(|r| stays_inside_bundle(r)) {
             into.insert(rel);
         }
     };
@@ -74,6 +74,13 @@ pub fn collect_bundle_refs(song: &Song, project_dir: &Path, into: &mut HashSet<P
 
 fn relative_in(abs: &Path, project_dir: &Path) -> Option<PathBuf> {
     abs.strip_prefix(project_dir).ok().map(Path::to_path_buf)
+}
+
+/// bundle の中を指す相対 path か (`..` / ルート / ドライブを含まない)。 `.daw` は外部入力
+/// なので、 壊れた / 細工された `ProjectRelative("../..")` を Save As の複製で bundle の
+/// 外へ書かせない。
+fn stays_inside_bundle(rel: &Path) -> bool {
+    rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// 未保存 project で import した video (`Absolute(import_cache/..)`) を
@@ -362,6 +369,22 @@ mod tests {
                 PathBuf::from("samples/v.mp4"),
             ]
         );
+    }
+
+    /// `..` を含む参照は bundle の外を指すので、 複製の対象 (= 書き先) にしない。
+    #[test]
+    fn refs_outside_the_bundle_are_ignored() {
+        let dir = tempdir().unwrap();
+        let mut song = song_referencing(&[1, 2], &[], &[]);
+        song.media
+            .audio_sources
+            .insert(1, audio(AudioSourcePath::ProjectRelative("../../etc/x.wav".into())));
+        song.media
+            .audio_sources
+            .insert(2, audio(AudioSourcePath::ProjectRelative("samples/ok.wav".into())));
+        let mut refs = HashSet::new();
+        collect_bundle_refs(&song, dir.path(), &mut refs);
+        assert_eq!(refs.into_iter().collect::<Vec<_>>(), vec![PathBuf::from("samples/ok.wav")]);
     }
 
     #[test]
