@@ -208,7 +208,7 @@ FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash 
 FN-NESTING | daw_gui/src/view/track_inspector/mod.rs::draw                             | 8/119 | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/audio_editor.rs::draw                                    | 8/95  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/arrangement_view.rs::draw                                | 8/73  | 巨大 draw。未起票
-FN-NESTING | daw_gui/src/view/root.rs::draw_menu_bar                                   | 8/19  | 巨大 draw。未起票
+FN-NESTING | daw_gui/src/view/menu_bar.rs::draw                                           | 8/19  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/plugin_picker.rs::draw                                   | 7/34  | 巨大 draw。未起票
 # draw_strip は r.md #74 で 6 段以上の行が **8 -> 6 に減った** (最大段数 7 は不変)。
 # disclosure クロージャの `if contains { remove } else { insert }` が

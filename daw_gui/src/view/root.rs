@@ -15,7 +15,7 @@ use crate::view::{
     about, arrangement_view, bottom_panel, clipboard_ops, dirty_guard_modal, export_overlay,
     export_range_modal,
     shutdown_overlay,
-    font_picker, load_overlay, loudness_report, master_panel, mixer_strips, plugin_picker,
+    font_picker, load_overlay, loudness_report, master_panel, menu_bar, mixer_strips, plugin_picker,
     recovery_modal,
     resource_monitor,
     settings, shortcuts_help, snap, status_bar, track_inspector, track_picker, transport,
@@ -33,15 +33,6 @@ pub const INSPECTOR_W: f32 = 280.0;
 /// を drag すると gui_01 `split_view` widget が state に新比率を持って frame
 /// 越しに保持する (= session 内のみ persist、 project save 不対応は別 phase)。
 const ARRANGEMENT_SPLIT_DEFAULT_RATIO: f32 = 0.65;
-
-/// r.md #87: View メニューに出すランチャー帯の見せ方 3 項目 (計画書 Q5-b)。
-/// 並びは `LauncherLayout::cycle` の巡回順と揃える (メニューとキーで順序が
-/// 食い違うと「Tab を何回押せばどれになるか」が読めない)。
-const LAUNCHER_LAYOUT_MENU: &[(&str, common::model::LauncherLayout)] = &[
-    ("ランチャーとアレンジ (両方)", common::model::LauncherLayout::Both),
-    ("ランチャーのみ", common::model::LauncherLayout::LauncherOnly),
-    ("アレンジのみ", common::model::LauncherLayout::ArrangerOnly),
-];
 
 pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: PhysicalSize) {
     let sw = screen.width as f32;
@@ -91,7 +82,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
         h: STATUS_H,
     };
 
-    draw_menu_bar(app, ui, menu_rect);
+    menu_bar::draw(app, ui, menu_rect);
     transport::draw(app, ui, transport_rect);
 
     // inspector を左カラムにフル高さで配置し、 その右で arrangement
@@ -142,37 +133,41 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // ユーザーの比率へ自動で戻り、復元用の状態を別に持たずに済む。アレンジ側が
     // 潰れきらないよう下限だけ置く (画面が足りないときはそこで頭打ちになり、
     // 以降はフェーダーが縮む)。
-    let split_ratio = if app.ui_prefs.bottom_panel == 0 && right_rect.h > 0.0 {
+    let split_ratio = if app.ui_prefs.bottom_panel == Some(0) && right_rect.h > 0.0 {
         const MIN_ARRANGEMENT_FRAC: f32 = 0.15;
         let extra = mixer_strips::extra_head_height(app) / right_rect.h;
         (split_ratio - extra).max(MIN_ARRANGEMENT_FRAC)
     } else {
         split_ratio
     };
-    ui.split_view(
-        "root_arrange_bottom",
-        right_rect,
-        Orientation::Vertical,
-        split_ratio,
-        |next| {
-            // 「見方の都合」なので `*` は立てない (ズーム / スクロールと同じ扱い、
-            // `project_dirty_flag_rule`)。
-            Edit::mutate(move |app: &mut AppData| {
-                app.ui_prefs.arrangement_split_ratio = next;
-            })
-        },
-        |ui, arrangement_rect, bottom_rect| {
-            // gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面が
-            // あるため、 先に root レベルで shortcut を捌いて広域の挙動を確定
-            // させる。 widget 描画時には消費済みになり、 widget 内蔵の同名
-            // shortcut handler は no-op に縮退する。 bottom_rect 確定後に呼ぶ
-            // (piano_roll active 判定に使う)。
-            dispatch_shortcuts(app, ui, bottom_rect);
-
-            arrangement_view::draw(app, ui, arrangement_rect);
-            bottom_panel::draw(app, ui, bottom_rect);
-        },
-    );
+    // r.md #96: 下部パネルが閉じている (`B` で Mixer を閉じた) ときは split を
+    // 出さず、アレンジが右カラムの全高を使う。保存された比率は触らないので、
+    // 次に開いたときは元の高さに戻る。
+    match app.ui_prefs.bottom_panel {
+        Some(tab) => ui.split_view(
+            "root_arrange_bottom",
+            right_rect,
+            Orientation::Vertical,
+            split_ratio,
+            |next| {
+                // 「見方の都合」なので `*` は立てない (ズーム / スクロールと同じ扱い、
+                // `project_dirty_flag_rule`)。
+                Edit::mutate(move |app: &mut AppData| {
+                    app.ui_prefs.arrangement_split_ratio = next;
+                })
+            },
+            |ui, arrangement_rect, bottom_rect| {
+                draw_arrangement_column(app, ui, arrangement_rect, bottom_rect);
+                bottom_panel::draw(app, ui, bottom_rect, tab);
+            },
+        ),
+        None => {
+            // 高さ 0 の bottom_rect: `dispatch_shortcuts` の「pointer が下部パネル内か」
+            // 判定が必ず偽になり、Mixer / Piano Roll 文脈のショートカットが誤発火しない。
+            let closed_bottom = Rect { x: right_rect.x, y: right_rect.y + right_rect.h, w: right_rect.w, h: 0.0 };
+            draw_arrangement_column(app, ui, right_rect, closed_bottom);
+        }
+    }
 
     // r.md #50: マスターパネル (右端フル高)。split の後に描くのは、
     // 分割 handle の hit 判定より手前で pointer を受けたいから。
@@ -252,6 +247,22 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
 /// 運搬中の device ラベル (D-6)。 波形やクリップ色の上に出るので、 背景に依存しない
 /// 暗いチップ + 明るい文字でコントラストを保証する
 /// (`[[feedback_ui_indicator_contrast_on_variable_bg]]`)。
+/// 右カラムのアレンジ部分: root レベルの shortcut dispatch → arrangement 描画。
+///
+/// gui_01 widget (piano_roll 等) は `take_shortcut` を消費する側面があるため、先に
+/// root レベルで shortcut を捌いて広域の挙動を確定させる。widget 描画時には消費済みに
+/// なり、widget 内蔵の同名 shortcut handler は no-op に縮退する。`bottom_rect` は
+/// 下部パネルの領域 (閉じているときは高さ 0) で、piano_roll / mixer active 判定に使う。
+fn draw_arrangement_column(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    arrangement_rect: Rect,
+    bottom_rect: Rect,
+) {
+    dispatch_shortcuts(app, ui, bottom_rect);
+    arrangement_view::draw(app, ui, arrangement_rect);
+}
+
 fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let Some(p) = ui.drag_payload::<crate::app::DeviceDragPayload>(crate::app::DEVICE_DRAG_KIND)
     else {
@@ -265,268 +276,6 @@ fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let chip = Rect { x: px + 12.0, y: py + 12.0, w: 120.0, h: 22.0 };
     ui.panel_with_border("device_drag_chip", chip, core.panel_raised, core.accent, 1.0, 3.0);
     ui.label_at("device_drag_label", &label, chip.x + 8.0, chip.y + 5.0, 11.0, core.text);
-}
-
-/// r.md #87: View メニューの「両方 / ランチャーのみ / アレンジのみ」 3 項目。
-///
-/// `draw_menu_bar` の中に直接書かないのは不変条件 9 (インデント 6 段) のため
-/// — メニュー構築は `menu_bar → menu → item → push_edit → handle_event` で
-/// 既に 5 段あり、そこにループを足すと即座に超える。
-fn add_launcher_layout_items<'a>(m: &mut daw_ui_core::widgets::menu::MenuBuilder<'a, AppData>) {
-    for (label, layout) in LAUNCHER_LAYOUT_MENU {
-        let layout = *layout;
-        // 巡回キー (`Tab`) のヒントは 3 項目に共通なので、代表して
-        // 「両方」の行にだけ出す。
-        let hint = (layout == common::model::LauncherLayout::Both)
-            .then(|| crate::view::shortcuts::shortcut_hint("daw.cycle_launcher_layout"))
-            .flatten();
-        m.item_with(daw_ui_core::MenuItemSpec {
-            label,
-            on_click: Box::new(move |ui| set_launcher_layout(ui, layout)),
-            enabled: true,
-            shortcut_hint: hint,
-        });
-    }
-}
-
-/// レイアウトを直接その状態にする (巡回順の SSoT は `LauncherLayout::cycle`)。
-fn set_launcher_layout(ui: &mut Ui<'_, AppData>, layout: common::model::LauncherLayout) {
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::Launcher(LauncherEvent::SetLayout(layout)));
-    }));
-}
-
-/// 上部 menu bar (File / Edit / View) を library widget で描画。
-/// `Ui<'a, AppData>` の `'a` は `&AppData` borrow 寿命と同一なので、
-/// `app: &'a AppData` を明示して menu の dynamic label (= `&app.ui_prefs.recent_files_labels[i]`)
-/// が `'a` に乗ることを borrow checker に伝える。
-fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
-    // 「最近開いた / 保存した」 ファイルの label / path は AppData に
-    // キャッシュ済 (= `recent_files_labels` / `recent_saved_labels` /
-    // `recent_files.paths` / `recent_saved.paths`)。 menu_bar API が
-    // `label: &'a str` を要求し 'a が `&AppData` の borrow と一致するため、
-    // AppData 側で String を持つことで lifetime が解決する (= 別解として
-    // String::leak で 'static 化する手もあるが per-frame leak になるので不可)。
-
-    // M9 P1-5 (gui_01 側 breaking 変更): on_click closure に &mut Ui が渡る形に。
-    ui.menu_bar(rect, |mb| {
-        mb.menu("File", |m| {
-            // r.md #69: 「最近保存した」「最近開いた」を **File メニューの先頭**へ。
-            // DAW を開いたら大抵は前回の続きをやるので、最も使う導線を一番上に置く
-            // (Ableton Live / Bitwig / Studio One の起動 Hub と同じ発想)。
-            // New / Open... の相対順序は変えず、2 段ずつ繰り下がるだけ。
-            //
-            // 空のときに項目ごと消さず disabled で残すのは、(a)「そういう機能がある」
-            // と気づけること、(b) 状況で項目位置が動くと誤クリックの元になること、
-            // の 2 点による。空の `sub_menu` は `h: 0` の退化 popup になるので
-            // 代わりに disabled の top-level item へ差し替える。
-            if app.ui_prefs.recent_saved_labels.is_empty() {
-                m.item_with(daw_ui_core::MenuItemSpec {
-                    label: "Recently Saved (empty)",
-                    on_click: Box::new(|_ui| {}),
-                    enabled: false,
-                    shortcut_hint: None,
-                });
-            } else {
-                m.sub_menu("Recently Saved", |sub| {
-                    for (label, path) in app
-                        .ui_prefs.recent_saved_labels
-                        .iter()
-                        .zip(app.ui_prefs.recent_saved.paths.iter())
-                    {
-                        let path_clone = path.clone();
-                        sub.item(label.as_str(), move |ui| {
-                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                            }));
-                        });
-                    }
-                });
-            }
-            if app.ui_prefs.recent_files_labels.is_empty() {
-                m.item_with(daw_ui_core::MenuItemSpec {
-                    label: "Open Recent (empty)",
-                    on_click: Box::new(|_ui| {}),
-                    enabled: false,
-                    shortcut_hint: None,
-                });
-            } else {
-                m.sub_menu("Open Recent", |sub| {
-                    for (label, path) in app
-                        .ui_prefs.recent_files_labels
-                        .iter()
-                        .zip(app.ui_prefs.recent_files.paths.iter())
-                    {
-                        let path_clone = path.clone();
-                        sub.item(label.as_str(), move |ui| {
-                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                                app.handle_event(AppEvent::OpenRecent(path_clone.clone()))
-                            }));
-                        });
-                    }
-                });
-            }
-            m.separator();
-            m.item("New", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::New)));
-            });
-            m.item("Open...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Open)));
-            });
-            m.separator();
-            m.item("Save", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Save)));
-            });
-            m.item("Save As...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::SaveAs)));
-            });
-            m.separator();
-            m.item("Import Audio...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::OpenImportAudioDialog)
-                }));
-            });
-            m.item("Import Video...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::OpenImportVideoDialog)
-                }));
-            });
-            m.item("Import Image...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::OpenImportImageDialog)
-                }));
-            });
-            // r.md #66: Export MIDI と対称の取り込み導線 (D&D と同じ pipeline)。
-            m.item("Import MIDI...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::OpenImportMidiDialog)
-                }));
-            });
-            // Text クリップは File メニューではなく、 アレンジの空きレーン右クリック →
-            // "Text クリップ" で生成する (docs/plan_text_clip_creation.md)。 text トラックは
-            // 存在せず、 他 clip と同じくタイムライン上で生成する。
-            m.separator();
-            m.item("Export WAV...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportWav)));
-            });
-            m.item("Export Video...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::OpenExportMp4Dialog)
-                }));
-            });
-            m.item("Export MIDI...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ExportMidi)));
-            });
-            // r.md #61: 終了導線。旧来は ✕ / Alt+F4 しか無く、メニューにも
-            // ショートカットにも終了が無かった。最下段に置くのは Windows /
-            // Ardour / Cubase の File メニュー慣習どおり。
-            m.separator();
-            m.item_with(daw_ui_core::MenuItemSpec {
-                label: "終了",
-                on_click: Box::new(|ui| {
-                    ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                        app.handle_event(AppEvent::Quit(crate::shutdown::QuitRequest::USER))
-                    }));
-                }),
-                enabled: true,
-                shortcut_hint: crate::view::shortcuts::shortcut_hint("quit"),
-            });
-        });
-        mb.menu("Edit", |m| {
-            m.item("Undo", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Undo)));
-            });
-            m.item("Redo", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Redo)));
-            });
-            m.item("Delete", |ui| {
-                // キーボード Delete と同じ単一 arbiter (`edit_surface` → last-wins →
-                // `delete_for_surface`) を使う。 旧実装は notes + automation clip +
-                // clip を無条件連続発火する別ロジックで、 対象決定規則が 2 系統に
-                // 割れていた (SSoT 崩れ)。 menu 上の pointer は編集面に乗らないので
-                // is_pianoroll_active=false で選択集合ベースの解決になる。
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.delete_current_surface(false);
-                }));
-            });
-            // r.md #48: アプリ全体の設定 (テーマ選択)。 Ardour / Cubase の Windows 版が
-            // Edit > Preferences なので、 DAW に慣れた人が最初に見る場所に置く。
-            m.item("設定...", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleSettings)
-                }));
-            });
-        });
-        mb.menu("View", |m| {
-            // r.md #87: ランチャー帯とアレンジのレーンの見せ方 (Q5-b)。
-            add_launcher_layout_items(m);
-            m.separator();
-            // r.md #29: 編集履歴パネルの開閉。 行 click でその時点へ一発 Undo/Redo。
-            m.item("編集履歴", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleUndoHistory)
-                }));
-            });
-            // r.md #50: 画面右端のマスターパネル (フェーダー + 各種メーター)。
-            m.item("マスターパネル", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleMasterPanel)
-                }));
-            });
-            // r.md #55: 開いているプラグインエディタ窓を一括で閉じる
-            // (Cubase の Window > Close All Plug-in Windows 相当)。
-            m.item("プラグインウィンドウをすべて閉じる", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::CloseAllPluginEditors)
-                }));
-            });
-            m.item("Toggle Video Preview", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::TogglePreviewWindow)
-                }));
-            });
-            // resource monitor (r.md #3): status bar 常駐メーターの on/off (永続化)
-            // と、 詳細パネルの開閉。
-            m.item("Toggle Resource Monitor", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleResourceMonitor)
-                }));
-            });
-            m.item("Performance Panel", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleResourcePanel)
-                }));
-            });
-        });
-        // r.md #54: 解析系はここに集約する (今後の解析機能もこのメニューへ)。
-        mb.menu("解析", |m| {
-            m.item("ラウドネス解析... (Ctrl+L)", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::AnalyzeLoudness)
-                }));
-            });
-            m.item("ラウドネスレポートを開く", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleLoudnessReport)
-                }));
-            });
-        });
-        // r.md #60: GPLv3 §0 は Appropriate Legal Notices を「便利かつ目立つ形で」出せと
-        // 要求し、「メニュー等のリストなら目立つ項目 1 つで基準を満たす」と明記している。
-        // なので奥のサブメニューではなく **トップレベルの Help メニュー**に置く。
-        // ショートカット一覧 (F1) も Ardour / Cubase と同じくここへ集約した
-        // (以前は View > Toggle Help にあった)。
-        mb.menu("Help", |m| {
-            m.item("ショートカット一覧 (F1)", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
-            });
-            m.item("バージョン情報", |ui| {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleAbout)
-                }));
-            });
-        });
-    });
 }
 
 /// r.md #67: カーソルキーで選択ノートを動かす / 伸縮する / 音程を変える。
@@ -783,7 +532,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         .pointer()
         .pos
         .is_some_and(|(px, py)| bottom_rect.contains(px, py));
-    let is_pianoroll_active = app.ui_prefs.bottom_panel == 1 && pointer_in_bottom;
+    let is_pianoroll_active = app.ui_prefs.bottom_panel == Some(1) && pointer_in_bottom;
     let surface = app.edit_surface(is_pianoroll_active);
     // `Z` 段階ズーム / `R` loop の対象面 (通常 clip / automation clip) は
     // copy / cut / delete と同じ `edit_surface` arbiter で解決する (last-selection-wins)。
@@ -909,6 +658,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_master_panel") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleMasterPanel)
+        }));
+    }
+    // r.md #96: B で下部パネルの Mixer を開閉 (Bitwig の B と同キー)。
+    if ui.take_shortcut("daw.toggle_mixer_panel") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleMixerPanel)
         }));
     }
     // r.md #55: Ctrl+Shift+W で開いているプラグインエディタ窓を全部閉じる。
@@ -1078,7 +833,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                     .and_then(|c| app.song_doc.song().track_by_id(c.track_id))
                     .map(|t| t.id)
             }
-        } else if app.ui_prefs.bottom_panel == 0 && pointer_in_bottom {
+        } else if app.ui_prefs.bottom_panel == Some(0) && pointer_in_bottom {
             app.ui_ephemeral.mixer_hovered_track
         } else {
             app.ui_ephemeral.arrange_hovered_track
@@ -1104,7 +859,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 内蔵チャンネルストリップ (docs/plan_channel_strip.md) が Q を先取りする:
     // カーソルが Comp / EQ の上にあればそのセクションのバイパスを切り替え、
     // 下の clip / note の mute へは落とさない。
-    let mixer_active = app.ui_prefs.bottom_panel == 0 && pointer_in_bottom;
+    let mixer_active = app.ui_prefs.bottom_panel == Some(0) && pointer_in_bottom;
     if ui.take_shortcut("daw.toggle_mute") && !toggle_hovered_strip_section(app, ui, mixer_active) {
         if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
             // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
@@ -1370,7 +1125,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 条件は piano_roll widget が実際に走る状況 (Piano Roll タブ + Audio Editor 非表示) に
     // 一致させる (`app.ui_ephemeral.piano_roll_lyric_editing` 単独だと stale-true で誤委譲しうる)。
     let pianoroll_lyric_editing =
-        app.ui_prefs.bottom_panel == 1 && app.ui_ephemeral.audio_editor_clip.is_none() && app.ui_ephemeral.piano_roll_lyric_editing;
+        app.ui_prefs.bottom_panel == Some(1) && app.ui_ephemeral.audio_editor_clip.is_none() && app.ui_ephemeral.piano_roll_lyric_editing;
     if !app.ui_ephemeral.is_plugin_picker_open
         && !app.ui_ephemeral.is_font_picker_open
         && app.ui_ephemeral.send_picker.is_none()
@@ -1536,6 +1291,46 @@ mod tests {
         }
     }
 
+    /// 素キー 1 押しを 1 フレーム流し、`dispatch_shortcuts` が push した Edit を app に
+    /// 適用する。`daw_shortcut_map` (本番と同じ定義) を通る。typing 中の素キー抑止
+    /// (`bare_char_key`) は daw-ui core 側のテストが担う。
+    fn dispatch_char_key(app: &mut AppData, ch: char) {
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+        *host.shortcut_map_mut() = crate::view::shortcuts::daw_shortcut_map();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 1280, height: 720 };
+        let bottom_rect = Rect { x: 0.0, y: 400.0, w: 1280.0, h: 320.0 };
+        let input = FrameInput {
+            keyboard: vec![KeyEvent {
+                state: ElementState::Pressed,
+                text: Some(ch.to_string()),
+                physical_key: PhysicalKey::Char(ch.to_ascii_uppercase()),
+                repeat: false,
+            }],
+            ..FrameInput::default()
+        };
+        let edits = host.frame_to_edits(app, &mut scene, screen, input, |app, ui| {
+            dispatch_shortcuts(app, ui, bottom_rect);
+        });
+        for e in edits {
+            e.apply(app);
+        }
+    }
+
+    /// r.md #96: `B` は Mixer のトグル。閉 → Mixer → 閉、Piano Roll タブ → Mixer。
+    #[test]
+    fn b_toggles_mixer_panel() {
+        let mut app = build_app();
+        app.ui_prefs.bottom_panel = None;
+        dispatch_char_key(&mut app, 'b');
+        assert_eq!(app.ui_prefs.bottom_panel, Some(0), "閉じていれば Mixer で開く");
+        dispatch_char_key(&mut app, 'b');
+        assert_eq!(app.ui_prefs.bottom_panel, None, "Mixer が見えていれば閉じる");
+        app.ui_prefs.bottom_panel = Some(1);
+        dispatch_char_key(&mut app, 'b');
+        assert_eq!(app.ui_prefs.bottom_panel, Some(0), "Piano Roll タブなら Mixer へ切替 (閉じない)");
+    }
+
     /// note を 1 つ持つ MIDI クリップを 1 本置き、その note を選択した状態にする。
     fn app_with_selected_note(start_beat: f64) -> AppData {
         let mut app = build_app();
@@ -1620,7 +1415,7 @@ mod tests {
     fn escape_during_lyric_edit_is_not_consumed_by_global_dispatch() {
         // 選択は範囲からの導出なので、ダミー id ではなく **実在するノート** を選ぶ。
         let mut app = app_with_selected_note(4.0);
-        app.ui_prefs.bottom_panel = 1; // Piano Roll タブ
+        app.ui_prefs.bottom_panel = Some(1); // Piano Roll タブ
         app.ui_ephemeral.piano_roll_lyric_editing = true; // 歌詞編集中
         dispatch_escape(&mut app);
         assert_eq!(
@@ -1635,7 +1430,7 @@ mod tests {
     #[test]
     fn escape_clears_note_selection_when_not_lyric_editing() {
         let mut app = build_app();
-        app.ui_prefs.bottom_panel = 1;
+        app.ui_prefs.bottom_panel = Some(1);
         app.ui_ephemeral.piano_roll_lyric_editing = false; // 非編集
         app.handle_event(AppEvent::SetNoteSelection(vec![1]));
         dispatch_escape(&mut app);
@@ -1651,7 +1446,7 @@ mod tests {
     #[test]
     fn escape_closes_audio_editor_even_if_lyric_flag_is_stale() {
         let mut app = build_app();
-        app.ui_prefs.bottom_panel = 1;
+        app.ui_prefs.bottom_panel = Some(1);
         app.ui_ephemeral.piano_roll_lyric_editing = true; // stale-true を想定
         app.ui_ephemeral.audio_editor_clip = Some(ClipKey { track_id: 0, clip_id: 0 });
         dispatch_escape(&mut app);

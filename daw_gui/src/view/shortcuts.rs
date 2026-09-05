@@ -179,6 +179,9 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.toggle_triplet", keys: &["3"], category: ShortcutCategory::GridView, description: "三連符グリッド ON / OFF", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_preview_window", keys: &["F12"], category: ShortcutCategory::GridView, description: "ビデオプレビューウィンドウを開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_master_panel", keys: &["Ctrl+Alt+M"], category: ShortcutCategory::GridView, description: "マスターパネル (フェーダー + 各種メーター) を開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // r.md #96: Bitwig の `B` (Mixer パネル toggle) 流。素の英字キーなので typing 中は
+    // core の `bare_char_key` 逃がしで自動的に入力欄へ譲る (S / G と同じ扱い)。
+    ShortcutDef { name: "daw.toggle_mixer_panel", keys: &["B"], category: ShortcutCategory::GridView, description: "ミキサーを開く / 閉じる (下部パネル)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // r.md #87 (クリップランチャー、計画書 Q5-b): 両方 → ランチャーのみ → アレンジのみ を巡回。
     // Ableton と同じ `Tab` 単体。daw-ui core の default binding には `tab_next` / `tab_prev`
     // (Tab focus traversal) があるが、**daw_gui はこの表からしか map を組まない**

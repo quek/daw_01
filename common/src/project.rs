@@ -909,7 +909,7 @@ mod tests {
             piano_roll_fold: true,
             snap_on_draw: true,
             snap_live_input: false,
-            bottom_panel: 1,
+            bottom_panel: Some(1),
             piano_roll_views: vec![
                 (
                     ClipKey { track_id: 1, clip_id: 1 },

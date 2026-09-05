@@ -295,7 +295,7 @@ impl AppData {
                 master_row_automation_expanded: false,
                 track_row_overrides: std::collections::HashMap::new(),
                 automation_lane_row_overrides: std::collections::HashMap::new(),
-                bottom_panel: 0,
+                bottom_panel: Some(0),
                 audio_editor_views: std::collections::HashMap::new(),
                 audio_editor_vertical_gain: 1.0,
                 arrange_zoom_x: ARRANGE_PX_PER_BEAT,
@@ -1227,7 +1227,13 @@ impl AppData {
                 }
             }
             AppEvent::SelectBottomPanel(p) => {
-                self.ui_prefs.bottom_panel = p;
+                self.ui_prefs.bottom_panel = Some(p);
+            }
+            // r.md #96: Mixer が見えていれば閉じ、それ以外 (閉じている / Piano Roll タブ)
+            // なら Mixer タブで開く。開く前の状態は覚えない (Bitwig の `B` 流)。
+            AppEvent::ToggleMixerPanel => {
+                self.ui_prefs.bottom_panel =
+                    if self.ui_prefs.bottom_panel == Some(0) { None } else { Some(0) };
             }
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);
