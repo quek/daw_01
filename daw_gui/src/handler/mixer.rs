@@ -822,7 +822,9 @@ impl AppData {
         let master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
         // 検索クエリ (前後空白を除去)。 空なら (master フィルタを除き) 全件、 非空なら
         // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
-        let query = self.ui_ephemeral.plugin_picker_query.trim();
+        // r.md #101: 先頭の `v ` / `i ` / `f ` / `m ` は種別 (Video / Instrument /
+        // FX / MIDI FX) の絞り込みで、 残りが name / vendor のクエリ。
+        let (category, query) = split_picker_query(&self.ui_ephemeral.plugin_picker_query);
         let visible: Vec<PluginPickEntry> = self
             .ui_ephemeral.plugin_picker_entries
             .iter()
@@ -832,6 +834,7 @@ impl AppData {
                         // master には Transform 配置 device を出さない (全画面 master に配置は無意味)。
                         && e.id != common::video_fx::TRANSFORM_ID)
             })
+            .filter(|e| category.is_none_or(|c| e.category == c))
             .filter(|e| {
                 query.is_empty()
                     || crate::fuzzy::subsequence_match(&e.name, query)
@@ -851,4 +854,48 @@ impl AppData {
         crate::app::resolve_plugin_name(&self.ipc.plugin_db, plugin_id)
     }
 
+}
+
+/// r.md #101: プラグインピッカーのクエリ先頭の種別接頭辞を剥がす。
+/// `v ` = 映像効果 / `i ` = 楽器 / `f ` = FX / `m ` = MIDI FX (大文字小文字を区別しない、
+/// 接頭辞の後ろは空でもよい = 種別だけで絞る)。 接頭辞が無ければ `(None, 全文)`。
+/// 「v」 だけ (空白なし) は接頭辞ではなく通常の検索語 (`vocoder` の途中入力)。
+/// 戻りの文字列は前後空白を除いてある (呼び側の `trim()` をここに吸収)。
+pub(crate) fn split_picker_query(query: &str) -> (Option<PluginCategory>, &str) {
+    let query = query.trim_start();
+    let mut chars = query.chars();
+    let (Some(head), Some(' ')) = (chars.next(), chars.next()) else {
+        return (None, query.trim_end());
+    };
+    let category = match head.to_ascii_lowercase() {
+        'v' => PluginCategory::Video,
+        'i' => PluginCategory::Instrument,
+        'f' => PluginCategory::Fx,
+        'm' => PluginCategory::MidiFx,
+        _ => return (None, query.trim_end()),
+    };
+    (Some(category), chars.as_str().trim())
+}
+
+#[cfg(test)]
+mod picker_query_tests {
+    use super::{PluginCategory, split_picker_query};
+
+    #[test]
+    fn prefix_selects_category_and_rest_is_the_text_query() {
+        assert_eq!(split_picker_query("v "), (Some(PluginCategory::Video), ""));
+        assert_eq!(split_picker_query(" v  "), (Some(PluginCategory::Video), ""));
+        assert_eq!(split_picker_query("i  vital"), (Some(PluginCategory::Instrument), "vital"));
+        assert_eq!(split_picker_query("F comp"), (Some(PluginCategory::Fx), "comp"));
+        assert_eq!(split_picker_query("m arp"), (Some(PluginCategory::MidiFx), "arp"));
+    }
+
+    #[test]
+    fn no_prefix_without_the_space_or_with_unknown_letter() {
+        assert_eq!(split_picker_query("v"), (None, "v"));
+        assert_eq!(split_picker_query("vital"), (None, "vital"));
+        assert_eq!(split_picker_query("x comp"), (None, "x comp"));
+        assert_eq!(split_picker_query("  vital "), (None, "vital"));
+        assert_eq!(split_picker_query(""), (None, ""));
+    }
 }
