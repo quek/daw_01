@@ -33,4 +33,6 @@ pub enum ColorPickerTarget {
     Scene(u32),
     /// r.md #110: Parallel chain の色 (`ParallelChain::id`)。 chain 行のスウォッチ / 右クリックから。
     ParallelChain(u64),
+    /// Parallel 自体の色 (`Parallel::id`、 括弧の帯)。 開始行の帯 click / 右クリックから。
+    Parallel(u64),
 }

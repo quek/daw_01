@@ -193,6 +193,19 @@ impl AppData {
         });
     }
 
+    pub(crate) fn set_parallel_color(&mut self, parallel_id: u64, color: Option<[f32; 3]>) {
+        self.edit_song_checked(move |song| {
+            let Some(r) = song.parallel_by_id_mut(parallel_id) else {
+                return false;
+            };
+            if r.color == color {
+                return false;
+            }
+            r.color = color;
+            true
+        });
+    }
+
     /// chain の gain / pan / mute / solo。 Song を書き換え (undo 対象) つつ、 値のみ IPC で
     /// engine へ即時反映する (再 compile なし)。
     pub(crate) fn set_chain_mixer(&mut self, chain_id: u64, edit: ChainMixerEdit) {
@@ -362,6 +375,7 @@ impl AppData {
             index: devices.len() as u32,
             depth: 0,
             bars: Vec::new(),
+            parallel_band: None,
         });
         rows
     }
@@ -382,6 +396,7 @@ impl AppData {
                     index: i as u32,
                     depth,
                     bars: bars.to_vec(),
+                    parallel_band: None,
                 }),
                 Device::Parallel(r) => self.push_parallel_rows(r, chain, i as u32, depth, bars, rows),
             }
@@ -405,6 +420,7 @@ impl AppData {
             index,
             depth,
             bars: bars.to_vec(),
+            parallel_band: Some(r.color),
         };
         let parallel_open = self.parallel_node_open(r.id);
         rows.push(row(ChainRowKind::ParallelBegin {
@@ -452,6 +468,7 @@ impl AppData {
                 index: c.devices.len() as u32,
                 depth: depth + 1,
                 bars: inner,
+                parallel_band: None,
             });
         }
         rows.push(row(ChainRowKind::AddChain { parallel_id: r.id }));
@@ -461,6 +478,7 @@ impl AppData {
             index: index + 1,
             depth,
             bars: bars.to_vec(),
+            parallel_band: Some(r.color),
         });
     }
 

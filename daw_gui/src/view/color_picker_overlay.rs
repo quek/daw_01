@@ -70,6 +70,12 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
                 .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
                 .unwrap_or(app.theme.core.text_dim)
         }),
+        // Parallel 自体 (括弧の帯)。 未設定は chain と同じ中立色。
+        ColorPickerTarget::Parallel(id) => app.song_doc.song().parallel_by_id(id).map(|r| {
+            r.color
+                .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
+                .unwrap_or(app.theme.core.text_dim)
+        }),
     };
 
     let Some(current) = current else {
@@ -105,6 +111,9 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
             ColorPickerTarget::ParallelChain(chain_id) => {
                 app.handle_event(AppEvent::SetParallelChainColor { chain_id, color: Some(rgb) });
             }
+            ColorPickerTarget::Parallel(parallel_id) => {
+                app.handle_event(AppEvent::SetParallelColor { parallel_id, color: Some(rgb) });
+            }
         }));
     }
     if r.dismissed {
@@ -128,5 +137,6 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
         ColorPickerTarget::Section(id) => (1u64 << 62) | id as u64,
         ColorPickerTarget::Scene(id) => (1u64 << 61) | id as u64,
         ColorPickerTarget::ParallelChain(id) => (1u64 << 58) ^ id,
+        ColorPickerTarget::Parallel(id) => (1u64 << 57) ^ id,
     }
 }

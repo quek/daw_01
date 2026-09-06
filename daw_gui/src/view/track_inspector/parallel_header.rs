@@ -1,4 +1,4 @@
-//! Parallel のヘッダ行 (`╭ ▼ 名前 … [Split ▾] [out knob] [Match] [x]`) と、 r.md #112 の入力の
+//! Parallel のヘッダ行 (`「 ▼ 名前 … [Split ▾] [out knob] [Match] [x]`) と、 r.md #112 の入力の
 //! 配り方 (`Split`) の UI — ヘッダ行の dropdown と、 その直下の param 行 (`Frequency3` なら
 //! `Low ◂[200 Hz]▸ Mid ◂[2.0 kHz]▸ High`)。 chain list 本体 (`chain_list.rs`) から Parallel 1 行ぶんの
 //! 描画を切り出したもの (サイズ budget、 不変条件 9)。
@@ -17,7 +17,7 @@ use crate::view::modulation::{PLAIN_IDENT, build_mod, push_mod_depth_bracket};
 use crate::view::param_gesture::push_param_gesture_edges;
 use common::model::{AutomationTarget, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
 
-use super::chain_list::{CHAIN_BTN_W, CHAIN_KNOB, ROW_H, draw_disclosure, draw_rename_input, rgb_or};
+use super::chain_list::{CHAIN_BTN_W, CHAIN_KNOB, ROW_H, draw_disclosure, draw_rename_input};
 use super::{push_scrub_bracket, scrub_style, toggle_audio_style};
 
 /// dropdown の項目 (順序 = [`split_index`] / [`split_from_index`])。
@@ -170,20 +170,18 @@ fn draw_freq_field(
     push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
 }
 
-/// `╭ Parallel名` 行: 名前 (改名中は text_input) + [x]。
 /// Parallel ヘッダ行の表示情報 (`ChainRowKind::ParallelBegin` の中身)。
 pub(super) struct ParallelHead<'a> {
     pub parallel_id: u64,
     pub name: &'a str,
     pub bypassed: bool,
-    pub color: Option<[f32; 3]>,
     pub open: bool,
     pub out_gain: f32,
     pub gain_match: bool,
     pub split: Split,
 }
 
-/// Parallel ヘッダ行: ╭ ▼ 名前 … [Split ▾] [out knob] [Match] [x]。 出力 trim と gain match は
+/// Parallel ヘッダ行: 「 ▼ 名前 … [Split ▾] [out knob] [Match] [x]。 出力 trim と gain match は
 /// 終了行ではなくここ (高さを増やさない)。 Split dropdown (r.md #112) の param 行は直下。
 pub(super) fn draw_parallel_begin_row(
     app: &AppData,
@@ -193,7 +191,7 @@ pub(super) fn draw_parallel_begin_row(
     row: Rect,
     popup_open: bool,
 ) {
-    let ParallelHead { parallel_id, name, bypassed, color, open, out_gain, gain_match, split } = *head;
+    let ParallelHead { parallel_id, name, bypassed, open, out_gain, gain_match, split } = *head;
     let p = &app.theme.core;
     let btn_x_w = 26.0;
     let by = row.y + 2.0;
@@ -258,9 +256,8 @@ pub(super) fn draw_parallel_begin_row(
         split,
         Rect { x: right, y: row.y + (ROW_H - CHAIN_BTN_W) * 0.5, w: SPLIT_DROPDOWN_W, h: CHAIN_BTN_W },
     );
-    // 括弧 (Parallel の色) + 開閉 disclosure + 名前。 折り畳み中は括弧を `╴` にして終了行が無いことを示す。
-    let bracket = if open { "\u{256D}" } else { "\u{2574}" };
-    ui.label_at(("inspector_parallel_bracket", i), bracket, row.x + 2.0, row.y + 7.0, 12.0, rgb_or(color, p.text_dim));
+    // 括弧 `「` は chain_list の `draw_parallel_band` (chain の帯と同じ x / 幅で終了行の `L` まで繋ぐ)。
+    // ここは 開閉 disclosure + 名前。
     draw_disclosure(ui, ("inspector_parallel_disclosure", i), parallel_id, open, row.x + 14.0, row, popup_open, p);
     let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
     if let Some((id, buf)) = &app.ui_ephemeral.renaming_chain

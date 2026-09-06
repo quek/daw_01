@@ -304,6 +304,11 @@ pub struct ChainRow {
     pub depth: u32,
     /// 左端の色帯 (外側の Parallel から順に、 展開中 chain の色)。 深さぶんの本数。
     pub bars: Vec<Option<[f32; 3]>>,
+    /// この行が Parallel の直接の行 (開始 / Split / chain / `+ chain` / 終了) なら、 その Parallel の
+    /// 色。 描画は `bars` の次の位置 (= 行内容の左端、 chain 行の色見本と同じ x / 幅) に Parallel 色の
+    /// 帯を通し、 開始行の `「` から終了行の `L` まで 1 本に繋げる (chain の帯はその上に乗る)。
+    /// chain の中身の行は chain の帯が同じ x を占めるので `None`。
+    pub parallel_band: Option<Option<[f32; 3]>>,
 }
 
 impl ChainRow {

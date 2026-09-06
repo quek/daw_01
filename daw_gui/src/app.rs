@@ -1561,6 +1561,7 @@ impl AppData {
             AppEvent::SetParallelChainColor { chain_id, color } => {
                 self.set_parallel_chain_color(chain_id, color)
             }
+            AppEvent::SetParallelColor { parallel_id, color } => self.set_parallel_color(parallel_id, color),
             AppEvent::SetChainMixer { chain_id, edit } => self.set_chain_mixer(chain_id, edit),
             AppEvent::SetParallelMixer { parallel_id, edit } => self.set_parallel_mixer(parallel_id, edit),
             AppEvent::SetParallelSplit { parallel_id, split } => self.set_parallel_split(parallel_id, split),

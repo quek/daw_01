@@ -2,8 +2,9 @@
 //!
 //! Live の Device View は「Chain List (縦) | 選択 chain の device (横)」 で、 Parallel の中の
 //! Parallel は括弧の中の括弧。 280px のインスペクタでは「隣」を「下」にする: Parallel は
-//! 開始行 `╭` / chain 行 × N / `+ chain` / 選択 chain の device (再帰) / `+ Plugin` /
-//! 終了行 `╰`。 非選択 chain は 1 行だけなので縦にも横にも爆発しない。 展開中 chain の
+//! 開始行 `「` / chain 行 × N / `+ chain` / 選択 chain の device (再帰) / `+ Plugin` /
+//! 終了行 `L`。 括弧は chain の色帯と同じ x / 幅の Parallel 色の帯で、 開始行から終了行まで 1 本に
+//! 繋がる (chain の帯はその上に乗る)。 非選択 chain は 1 行だけなので縦にも横にも爆発しない。 展開中 chain の
 //! device 区間は左端の細い色帯 (chain 色) で示し、 インデントは帯の幅 (4px / 深さ) だけ。
 //!
 //! 行の flatten は view-model ([`AppData::chain_rows`]) が持ち、 ここは描画と入力だけ。
@@ -37,6 +38,8 @@ const END_ROW_H: f32 = 10.0;
 const ROW_GAP: f32 = 3.0;
 /// 深さ 1 段ぶんの色帯の幅 (= インデント)。
 const BAR_W: f32 = 4.0;
+/// Parallel の括弧 (`「` / `L`) の横棒の長さ (開閉 disclosure の手前まで)。
+const BRACKET_STUB_W: f32 = 10.0;
 /// chain 行の mixer: ミニ knob と M / S。
 pub(super) const CHAIN_KNOB: f32 = 18.0;
 pub(super) const CHAIN_BTN_W: f32 = 18.0;
@@ -249,8 +252,8 @@ fn draw_context_menus(
             ChainRowKind::ParallelBegin { parallel_id, bypassed, .. } => {
                 let parallel_id = *parallel_id;
                 let bypass_label = if *bypassed { "有効化" } else { "無効化" };
-                let labels = [bypass_label, "Parallel を解除", "名前変更", "コピー", "切り取り", "複製", "削除"];
-                context_menu(ui, base, &labels, move |app, idx| apply_parallel_menu(app, idx, parallel_id));
+                let labels = [bypass_label, "Parallel を解除", "名前変更", "色...", "コピー", "切り取り", "複製", "削除"];
+                context_menu(ui, base, &labels, move |app, idx| apply_parallel_menu(app, idx, parallel_id, base));
             }
             ChainRowKind::Chain { parallel_id, chain_id, .. } => {
                 let (parallel_id, chain_id) = (*parallel_id, *chain_id);
@@ -340,6 +343,61 @@ fn draw_bars(ui: &mut Ui<'_, AppData>, r: &ChainRow, row_rect: Rect, p: &daw_ui_
             0.0,
         );
     }
+}
+
+/// Parallel の直接の行に、 その Parallel の色の帯を chain 行の色見本と同じ x / 幅で通す。
+/// 開始行は行の中央の `「` から始まり (折り畳み中は横棒だけ = 終了行が無い)、 終了行は `L` で
+/// 閉じる。 途中の行は上下の行と隙間なく繋ぐ。 chain 行の色見本と展開中 chain の帯はこの上に
+/// 乗るので、 chain 同士の切れ目に Parallel の色が覗いて 1 本の括弧に見える。
+/// 開始行の帯 click は Parallel の color picker (chain 行の色見本と同じ操作)。
+fn draw_parallel_band(
+    ui: &mut Ui<'_, AppData>,
+    i: usize,
+    r: &ChainRow,
+    content: Rect,
+    popup_open: bool,
+    p: &daw_ui_core::Palette,
+) {
+    let Some(color) = r.parallel_band else {
+        return;
+    };
+    let col = rgb_or(color, p.text_dim);
+    let w = BAR_W - 1.0;
+    let stub = |ui: &mut Ui<'_, AppData>, y: f32| {
+        ui.panel(("inspector_parallel_stub", i), Rect { x: content.x, y, w: BRACKET_STUB_W, h: w }, col, 0.0);
+    };
+    let mid = content.y + (content.h - w) * 0.5;
+    if let ChainRowKind::ParallelBegin { parallel_id, .. } = &r.kind {
+        // 帯 (と括弧の横棒) の click で picker。 hit は chain の色見本と同じく帯より少し広く。
+        let hit = Rect { x: content.x, y: content.y, w: BRACKET_STUB_W, h: content.h };
+        let pointer = ui.pointer();
+        if pointer.primary_just_released
+            && pointer.pos.is_some_and(|(px, py)| hit.contains(px, py))
+            && !popup_open
+        {
+            let parallel_id = *parallel_id;
+            let anchor = Rect { x: content.x, y: content.y, w, h: content.h };
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.open_color_picker(ColorPickerTarget::Parallel(parallel_id), anchor);
+            }));
+        }
+    }
+    let (top, bottom) = match &r.kind {
+        ChainRowKind::ParallelBegin { open: false, .. } => {
+            stub(ui, mid);
+            return;
+        }
+        ChainRowKind::ParallelBegin { .. } => {
+            stub(ui, mid);
+            (mid, content.y + content.h + ROW_GAP)
+        }
+        ChainRowKind::ParallelEnd { .. } => {
+            stub(ui, mid);
+            (content.y - ROW_GAP, mid + w)
+        }
+        _ => (content.y - ROW_GAP, content.y + content.h + ROW_GAP),
+    };
+    ui.panel(("inspector_parallel_band", i), Rect { x: content.x, y: top, w, h: bottom - top }, col, 0.0);
 }
 
 fn draw_row_bg(
@@ -834,7 +892,7 @@ fn apply_device_menu(app: &mut AppData, idx: usize, device_id: u64) {
     }
 }
 
-fn apply_parallel_menu(app: &mut AppData, idx: usize, parallel_id: u64) {
+fn apply_parallel_menu(app: &mut AppData, idx: usize, parallel_id: u64, anchor: Rect) {
     let rows = app.chain_rows();
     let ids = carried_device_ids(app, &rows, parallel_id);
     match idx {
@@ -847,9 +905,10 @@ fn apply_parallel_menu(app: &mut AppData, idx: usize, parallel_id: u64) {
             let name = app.song_doc.song().parallel_by_id(parallel_id).map(|r| r.name.clone()).unwrap_or_default();
             app.ui_ephemeral.renaming_chain = Some((parallel_id, name));
         }
-        3 => app.copy_devices(ids),
-        4 => app.cut_devices(ids),
-        5 => duplicate_after(app, ids, parallel_id),
+        3 => app.open_color_picker(ColorPickerTarget::Parallel(parallel_id), anchor),
+        4 => app.copy_devices(ids),
+        5 => app.cut_devices(ids),
+        6 => duplicate_after(app, ids, parallel_id),
         _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
     }
 }
@@ -921,21 +980,26 @@ fn draw_row(
         w: (row_rect.w - indent_of(r)).max(1.0),
         h: row_rect.h,
     };
+    // 背景 → Parallel の帯 → 中身、 の順 (chain 行の色見本は中身側で帯の上に描く)。
+    let selected = r.select_id().is_some_and(|id| app.selection.selected_device_ids.contains(&id));
+    match &r.kind {
+        ChainRowKind::Plugin(_) | ChainRowKind::ParallelBegin { .. } => {
+            draw_row_bg(ui, i, content, selected, hovered, dragging, p);
+        }
+        ChainRowKind::Chain { .. } => draw_row_bg(ui, i, content, selected, hovered, false, p),
+        _ => {}
+    }
+    draw_parallel_band(ui, i, r, content, popup_open, p);
     match &r.kind {
         ChainRowKind::Plugin(e) => {
-            let selected = app.selection.selected_device_ids.contains(&e.device_id);
-            draw_row_bg(ui, i, content, selected, hovered, dragging, p);
             draw_plugin_row(app, ui, i, e, content, popup_open, keys_style);
             draw_plugin_expansions(app, ui, ctx, e.device_id, content);
         }
-        ChainRowKind::ParallelBegin { parallel_id, name, bypassed, color, open, out_gain, gain_match, split } => {
-            let selected = app.selection.selected_device_ids.contains(parallel_id);
-            draw_row_bg(ui, i, content, selected, hovered, dragging, p);
+        ChainRowKind::ParallelBegin { parallel_id, name, bypassed, open, out_gain, gain_match, split, .. } => {
             let head = super::parallel_header::ParallelHead {
                 parallel_id: *parallel_id,
                 name,
                 bypassed: *bypassed,
-                color: *color,
                 open: *open,
                 out_gain: *out_gain,
                 gain_match: *gain_match,
@@ -947,8 +1011,6 @@ fn draw_row(
             super::parallel_header::draw_split_row(app, ui, i, *parallel_id, *split, content, popup_open);
         }
         ChainRowKind::Chain { parallel_id, chain_id, name, color, gain, pan, muted, solo, open, n_devices } => {
-            let is_sel = app.selection.selected_device_ids.contains(chain_id);
-            draw_row_bg(ui, i, content, is_sel, hovered, false, p);
             draw_chain_row(
                 app, ui, i, *parallel_id, *chain_id, name, *color, *gain, *pan, *muted, *solo, *open, *n_devices, content, popup_open,
             );
@@ -958,10 +1020,8 @@ fn draw_row(
             let is_master = cursor_tid == Some(common::model::MASTER_TRACK_ID);
             draw_add_plugin_row(ui, i, *chain, is_master, content, popup_open);
         }
-        ChainRowKind::ParallelEnd { color, .. } => {
-            // `╰` — Parallel の終端。 左端の丸角の線で括弧を閉じる (Parallel の色)。
-            ui.label_at(("inspector_parallel_end", i), "\u{2570}", content.x + 2.0, content.y - 6.0, 12.0, rgb_or(*color, p.text_dim));
-        }
+        // 終了行は `draw_parallel_band` の `L` だけ。
+        ChainRowKind::ParallelEnd { .. } => {}
     }
 }
 

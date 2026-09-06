@@ -976,6 +976,8 @@ pub enum AppEvent {
     RenameParallelChain { chain_id: u64, name: String },
     RenameParallel { parallel_id: u64, name: String },
     SetParallelChainColor { chain_id: u64, color: Option<[f32; 3]> },
+    /// Parallel 自体の色 (括弧の帯)。
+    SetParallelColor { parallel_id: u64, color: Option<[f32; 3]> },
     /// chain の gain / pan / mute / solo (Song 書き換え + 値のみ IPC)。
     SetChainMixer { chain_id: u64, edit: crate::handler::parallel::ChainMixerEdit },
     /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC)。
@@ -1910,6 +1912,7 @@ impl AppEvent {
             E::DuplicateParallelChain { .. } => "chain 複製",
             E::RenameParallelChain { .. } | E::RenameParallel { .. } => "名前変更",
             E::SetParallelChainColor { .. } => "chain の色",
+            E::SetParallelColor { .. } => "Parallel の色",
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Gain(_), .. } => "chain gain",
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Pan(_), .. } => "chain pan",
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Muted(_), .. } => "chain mute",

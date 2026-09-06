@@ -4,6 +4,7 @@
 
 use super::*;
 
+use crate::color_target::ColorPickerTarget;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 
 /// この 1 フレームで検出した header の click (loop 内で `push_edit` すると複数発行に
@@ -13,6 +14,9 @@ use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 pub(super) struct HeaderClicks {
     pub clicked_track: Option<u32>,
     pub disclosure: Option<u32>,
+    /// 左端の色ストライプの click → その track の color picker (anchor = ストライプ rect)。
+    /// inspector の色スウォッチ / Parallel chain の帯と同じ操作。
+    pub color_strip: Option<(u32, Rect)>,
 }
 
 /// header 行の描画 + click 検出。 `response.track_header_rects` を積む。
@@ -170,19 +174,30 @@ fn draw_rows_inner(
         if let Some(c) = t.color
             && style.track_color_strip_w > 0.0
         {
+            let strip = Rect {
+                x: row.x + indent,
+                y: row.y,
+                w: style.track_color_strip_w,
+                h: row.h,
+            };
             ui.push_rect(RectCommand {
-                rect: Rect {
-                    x: row.x + indent,
-                    y: row.y,
-                    w: style.track_color_strip_w,
-                    h: row.h,
-                },
+                rect: strip,
                 fill: c,
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [0.0; 4],
                 clip_rect: Some(row),
             });
+            // ストライプの click → color picker。 hit はストライプより少し広く (inspector の
+            // chain 帯と同じ)。 group の disclosure と重なる分は `commit_clicks` で disclosure 優先。
+            let hit = Rect { x: strip.x, y: strip.y, w: strip.w + 4.0, h: strip.h };
+            if pointer.primary_just_released
+                && let Some((rx, ry)) = pointer.pos
+                && hit.contains(rx, ry)
+                && !ui.has_open_popups()
+            {
+                clicks.color_strip = Some((t.id, strip));
+            }
         }
 
         let row_for_layout =
@@ -475,7 +490,17 @@ pub(super) fn commit_clicks(
     clicks: HeaderClicks,
     response: &mut ArrangementResponse,
 ) {
-    let HeaderClicks { mut clicked_track, disclosure } = clicks;
+    let HeaderClicks { mut clicked_track, disclosure, color_strip } = clicks;
+    // 色ストライプの click → color picker (disclosure と重なる帯は disclosure が優先)。 この
+    // frame はトラック選択を走らせない (disclosure と同じ「priority の高い操作」 の形)。
+    if disclosure.is_none()
+        && let Some((tid, strip)) = color_strip
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.open_color_picker(ColorPickerTarget::Track(tid), strip);
+        }));
+        clicked_track = None;
+    }
     // M14 Phase 63c (#016): disclosure click → `AppEvent::ToggleGroupCollapsed`
     // (priority 高、 トラック選択はこの frame では skip = group の collapsed toggle
     // 動作のみで selection は変えない、 Reaper / Live と同じ UX)。 mixer の
