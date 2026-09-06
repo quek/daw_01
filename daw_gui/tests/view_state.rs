@@ -111,7 +111,7 @@ fn view_state_snapshot_restore_roundtrips() {
     app.handle_event(AppEvent::ToggleLoop);
 
     let loop_region = snap.loop_region;
-    app.restore_view_state(Some(snap), loop_region);
+    app.restore_view_state(Some(snap), loop_region, Vec::new());
 
     assert_eq!(app.ui_prefs.arrange_zoom_x, 50.0);
     assert_eq!(app.ui_prefs.arrange_scroll_beat, 7.0);
@@ -163,7 +163,7 @@ fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
     app.ui_prefs.plugin_editor_windows.clear();
     app.ui_prefs.plugin_editor_windows.insert(7, orphan);
     let loop_region = snap.loop_region;
-    app.restore_view_state(Some(snap), loop_region);
+    app.restore_view_state(Some(snap), loop_region, Vec::new());
 
     assert_eq!(
         app.ui_prefs.plugin_editor_windows.get(&42).copied(),
@@ -185,7 +185,7 @@ fn restore_none_clears_per_clip_but_keeps_globals() {
     app.ui_prefs.arrange_zoom_x = 42.0;
     app.ui_prefs.piano_roll_views.insert(key_a, PianoRollViewState::default());
 
-    app.restore_view_state(None, common::model::LoopRegion::default());
+    app.restore_view_state(None, common::model::LoopRegion::default(), Vec::new());
 
     assert!(
         app.ui_prefs.piano_roll_views.is_empty(),
@@ -210,7 +210,7 @@ fn arrangement_split_ratio_survives_save_and_reopen() {
     // 別セッションで開き直した状況 (widget state も ui_prefs も初期値)。
     let (mut fresh, _rx2) = build_app();
     assert_eq!(fresh.ui_prefs.arrangement_split_ratio, 0.0, "既定は未設定");
-    fresh.restore_view_state(Some(snap), common::model::LoopRegion::default());
+    fresh.restore_view_state(Some(snap), common::model::LoopRegion::default(), Vec::new());
     assert!(
         (fresh.ui_prefs.arrangement_split_ratio - 0.88).abs() < 1e-6,
         "開き直しても境界が既定へ戻らない"
@@ -223,6 +223,6 @@ fn arrangement_split_ratio_survives_save_and_reopen() {
 fn legacy_file_leaves_split_ratio_unset() {
     let (mut app, _rx) = build_app();
     let v = common::model::ViewState { arrangement_split_ratio: 0.0, ..Default::default() };
-    app.restore_view_state(Some(v), common::model::LoopRegion::default());
+    app.restore_view_state(Some(v), common::model::LoopRegion::default(), Vec::new());
     assert_eq!(app.ui_prefs.arrangement_split_ratio, 0.0, "未設定のまま (既定は view が決める)");
 }

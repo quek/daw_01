@@ -756,11 +756,13 @@ impl AppData {
         let song = self.song_doc.song();
         let mut rows = Vec::new();
         if self.ui_prefs.master_row_automation_expanded {
-            for lane in song
-                .song_lanes
-                .iter()
-                .filter(|l| l.visible && l.target.accepts_launcher_cells())
-            {
+            for lane in song.song_lanes.iter().filter(|l| {
+                l.target.accepts_launcher_cells()
+                    && !self.ui_prefs.hidden_automation_lanes.contains(&common::model::AutomationLaneKey {
+                        track: MASTER_TRACK_ID,
+                        lane: l.id,
+                    })
+            }) {
                 rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
                     track: MASTER_TRACK_ID,
                     lane: lane.id,
@@ -775,11 +777,13 @@ impl AppData {
             if !self.ui_prefs.expanded_automation_tracks.contains(&track.id) {
                 continue;
             }
-            for lane in track
-                .automation_lanes
-                .iter()
-                .filter(|l| l.visible && l.target.accepts_launcher_cells())
-            {
+            for lane in track.automation_lanes.iter().filter(|l| {
+                l.target.accepts_launcher_cells()
+                    && !self.ui_prefs.hidden_automation_lanes.contains(&common::model::AutomationLaneKey {
+                        track: track.id,
+                        lane: l.id,
+                    })
+            }) {
                 rows.push(LauncherRow::Lane(common::model::AutomationLaneKey {
                     track: track.id,
                     lane: lane.id,

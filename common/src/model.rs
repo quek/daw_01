@@ -250,7 +250,12 @@ pub use view_state::ViewState;
 /// [`Device`] (plugin | Parallel) になり、[`AudioTap`] の source が track | chain の enum になった。
 /// どちらも旧 JSON と byte 互換 (`untagged` / `flatten`) なので migration 関数は不要。
 /// `PluginInstance.aux_input_count` (host 報告値) を追加。
-pub const CURRENT_VERSION: u32 = 36;
+///
+/// v37: `AutomationLane.visible` を撤去し、レーンの非表示を [`ViewState::hidden_automation_lanes`]
+/// (「見方の都合」 = 変えても `*` が立たない) へ移した。旧ファイルの `visible: false` は
+/// `crate::project::load_project` が deserialize 前に拾って
+/// [`crate::project::LoadedProject::hidden_automation_lanes`] へ移す。
+pub const CURRENT_VERSION: u32 = 37;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1590,6 +1595,15 @@ impl Song {
     /// 全オートメーションレーン (トラック + song lane) を走査する。
     pub fn all_automation_lanes(&self) -> impl Iterator<Item = &AutomationLane> {
         self.tracks.iter().flat_map(|t| t.automation_lanes.iter()).chain(self.song_lanes.iter())
+    }
+
+    /// 全レーンの [`AutomationLaneKey`] (track lane は track id、song lane は
+    /// [`MASTER_TRACK_ID`])。表示 / 非表示の集合 (view 側) を全件で操作するときに使う。
+    pub fn all_automation_lane_keys(&self) -> impl Iterator<Item = AutomationLaneKey> + '_ {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.automation_lanes.iter().map(move |l| AutomationLaneKey { track: t.id, lane: l.id }))
+            .chain(self.song_lanes.iter().map(|l| AutomationLaneKey { track: MASTER_TRACK_ID, lane: l.id }))
     }
 
     /// [`Song::all_automation_lanes`] の mut 版。

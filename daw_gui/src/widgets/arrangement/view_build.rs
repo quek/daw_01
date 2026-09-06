@@ -102,6 +102,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         song: app.song_doc.song(),
         refcount_by_content: &refcount_by_content,
         lane_height_overrides: &app.ui_prefs.automation_lane_row_overrides,
+        hidden_lanes: &app.ui_prefs.hidden_automation_lanes,
         content_names: &labels.content_names,
         active_groups: &active_groups,
         lane_h_bounds: lane_h_bounds(area),
@@ -618,6 +619,8 @@ struct LaneBuildData<'a> {
     song: &'a common::model::Song,
     refcount_by_content: &'a HashMap<common::model::ContentId, usize>,
     lane_height_overrides: &'a HashMap<common::model::AutomationLaneKey, u16>,
+    /// アレンジで隠しているレーン (`UiPrefs::hidden_automation_lanes`)。
+    hidden_lanes: &'a HashSet<common::model::AutomationLaneKey>,
     content_names: &'a HashMap<common::model::ContentId, Arc<str>>,
     /// r.md #91: 連動ハイライトの対象 content 集合 (`active_share_groups`)。
     active_groups: &'a HashSet<common::model::ContentId>,
@@ -670,6 +673,7 @@ fn build_arrangement_lanes_from_slice(
         song,
         refcount_by_content,
         lane_height_overrides,
+        hidden_lanes,
         content_names,
         active_groups,
         lane_h_bounds,
@@ -729,7 +733,11 @@ fn build_arrangement_lanes_from_slice(
                 // ユーザー上書き > 対象種別の識別色 (`track_color::effective_lane_color` と同じ規則)。
                 color: lane.color.map_or(display.color, track_color::to_renderer),
                 enabled: lane.enabled,
-                visible: lane.visible,
+                // 非表示は Song ではなく view 側 (`UiPrefs::hidden_automation_lanes`) が持つ。
+                visible: !hidden_lanes.contains(&common::model::AutomationLaneKey {
+                    track: track_id,
+                    lane: lane.id,
+                }),
                 // session override → model の順で解き、**最後にペイン高で頭打ち**にする。
                 height_px: lane_height_overrides
                     .get(&common::model::AutomationLaneKey { track: track_id, lane: lane.id })

@@ -47,7 +47,6 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         let lane = AutomationLane {
             id: 1,
             height_px: HUGE_LANE_PX,
-            visible: true,
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
                 1.0,
@@ -143,7 +142,7 @@ fn fit_したレーン高は保存されて開き直しても保たれる() {
     );
     let (mut reopened, _a2, _p2) = build_app();
     let mut host2: UiHost<AppData> = UiHost::no_redraw();
-    reopened.restore_view_state(Some(snap), common::model::LoopRegion::default());
+    reopened.restore_view_state(Some(snap), common::model::LoopRegion::default(), Vec::new());
     let after = frame(&mut host2, &mut reopened);
     assert!(
         (after - fitted).abs() < 1.5,

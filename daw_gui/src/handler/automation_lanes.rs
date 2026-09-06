@@ -36,21 +36,26 @@ impl AppData {
         let target = AutomationTarget::ImageBuiltin(field);
 
         // 既存 lane を find。 あれば visible / enabled を true に。
-        let found_existing = self.edit_song_checked(|song| {
+        let mut found_id = None;
+        self.edit_song_checked(|song| {
             if let Some(track) = song.track_by_id_mut(track_id)
                 && let Some(lane) = track
                     .automation_lanes
                     .iter_mut()
                     .find(|l| l.target == target)
             {
-                lane.visible = true;
+                found_id = Some(lane.id);
+                let changed = !lane.enabled;
                 lane.enabled = true;
-                true
+                changed
             } else {
                 false
             }
         });
-        if found_existing {
+        if let Some(lane_id) = found_id {
+            self.ui_prefs
+                .hidden_automation_lanes
+                .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Image Automation lane '{}' は既に存在します",
@@ -335,19 +340,24 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::GroupTransform(param);
-        let found_existing = self.edit_song_checked(|song| {
+        let mut found_id = None;
+        self.edit_song_checked(|song| {
             if let Some(track) = song.track_by_id_mut(track_id)
                 && let Some(lane) =
                     track.automation_lanes.iter_mut().find(|l| l.target == target)
             {
-                lane.visible = true;
+                found_id = Some(lane.id);
+                let changed = !lane.enabled;
                 lane.enabled = true;
-                true
+                changed
             } else {
                 false
             }
         });
-        if found_existing {
+        if let Some(lane_id) = found_id {
+            self.ui_prefs
+                .hidden_automation_lanes
+                .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Group Automation lane '{}' は既に存在します",
@@ -567,29 +577,38 @@ impl AppData {
             param_id,
             legacy_device_index: None,
         };
-        self.edit_song(|song| {
+        // 新規作成したレーンは **隠した状態** で始める (触っただけでアレンジに行が
+        // 増えない)。 非表示は見方の都合なので Song ではなく `ui_prefs` に持つ。
+        let created_hidden = self.edit_song(|song| {
             if track_id == common::model::MASTER_TRACK_ID {
                 if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
                     lane.default_value = norm;
+                    None
                 } else {
                     let id = song.alloc_song_lane_id();
                     let mut lane = AutomationLane::new(target.clone(), norm);
                     lane.id = id;
-                    lane.visible = false;
                     song.song_lanes.push(lane);
+                    Some(common::model::AutomationLaneKey { track: common::model::MASTER_TRACK_ID, lane: id })
                 }
             } else if let Some(track) = song.track_by_id_mut(track_id) {
                 if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
                     lane.default_value = norm;
+                    None
                 } else {
                     let id = track.alloc_lane_id();
                     let mut lane = AutomationLane::new(target.clone(), norm);
                     lane.id = id;
-                    lane.visible = false;
                     track.automation_lanes.push(lane);
+                    Some(common::model::AutomationLaneKey { track: track_id, lane: id })
                 }
+            } else {
+                None
             }
         });
+        if let Some(Some(key)) = created_hidden {
+            self.ui_prefs.hidden_automation_lanes.insert(key);
+        }
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
         self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
@@ -740,29 +759,38 @@ impl AppData {
             param_id,
             legacy_device_index: None,
         };
-        self.edit_song(|song| {
+        // 新規作成したレーンは **隠した状態** で始める (触っただけでアレンジに行が
+        // 増えない)。 非表示は見方の都合なので Song ではなく `ui_prefs` に持つ。
+        let created_hidden = self.edit_song(|song| {
             if track_id == common::model::MASTER_TRACK_ID {
                 if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
                     lane.default_value = norm;
+                    None
                 } else {
                     let id = song.alloc_song_lane_id();
                     let mut lane = AutomationLane::new(target.clone(), norm);
                     lane.id = id;
-                    lane.visible = false;
                     song.song_lanes.push(lane);
+                    Some(common::model::AutomationLaneKey { track: common::model::MASTER_TRACK_ID, lane: id })
                 }
             } else if let Some(track) = song.track_by_id_mut(track_id) {
                 if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
                     lane.default_value = norm;
+                    None
                 } else {
                     let id = track.alloc_lane_id();
                     let mut lane = AutomationLane::new(target.clone(), norm);
                     lane.id = id;
-                    lane.visible = false;
                     track.automation_lanes.push(lane);
+                    Some(common::model::AutomationLaneKey { track: track_id, lane: id })
                 }
+            } else {
+                None
             }
         });
+        if let Some(Some(key)) = created_hidden {
+            self.ui_prefs.hidden_automation_lanes.insert(key);
+        }
         // 表示名は `automation_target_label` 1 本に寄せる (r.md #72 / #78)。
         // かつてここだけ `format!("{module} {name}")` を手組みしていたため、
         // 同じ param が経路によって別名で出ていた。
@@ -800,21 +828,26 @@ impl AppData {
         let target = AutomationTarget::TextBuiltin(field);
 
         // 既存 lane があれば visible / enabled だけを true に。
-        let found_existing = self.edit_song_checked(|song| {
+        let mut found_id = None;
+        self.edit_song_checked(|song| {
             if let Some(track) = song.track_by_id_mut(track_id)
                 && let Some(lane) = track
                     .automation_lanes
                     .iter_mut()
                     .find(|l| l.target == target)
             {
-                lane.visible = true;
+                found_id = Some(lane.id);
+                let changed = !lane.enabled;
                 lane.enabled = true;
-                true
+                changed
             } else {
                 false
             }
         });
-        if found_existing {
+        if let Some(lane_id) = found_id {
+            self.ui_prefs
+                .hidden_automation_lanes
+                .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Text Automation lane '{}' は既に存在します",
@@ -1154,12 +1187,17 @@ impl AppData {
             } else {
                 touched.track_id
             };
-            self.edit_song(|song| {
-                if let Some(lane) =
-                    song.automation_lane_by_key_mut(lookup_track_id, lane_id)
+            self.ui_prefs
+                .hidden_automation_lanes
+                .remove(&common::model::AutomationLaneKey { track: lookup_track_id, lane: lane_id });
+            self.edit_song_checked(|song| {
+                if let Some(lane) = song.automation_lane_by_key_mut(lookup_track_id, lane_id)
+                    && !lane.enabled
                 {
-                    lane.visible = true;
                     lane.enabled = true;
+                    true
+                } else {
+                    false
                 }
             });
             if is_song_level {

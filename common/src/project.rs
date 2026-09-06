@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::model::{AuxInputRoute, CURRENT_VERSION, LoopRegion, ProjectFile, Song, ViewState};
+use crate::model::{
+    AutomationLaneKey, AuxInputRoute, CURRENT_VERSION, LoopRegion, MASTER_TRACK_ID, ProjectFile,
+    Song, ViewState,
+};
 
 /// Result of `load_project`: the normalized song plus the optional GUI view
 /// state. `view` is `None` for legacy files / files saved without
@@ -22,6 +25,10 @@ pub struct LoadedProject {
     /// ヘッダ幅まで既定値へ潰れてしまうため (= `view: None` の「globals は現状維持」
     /// 挙動が壊れる)。
     pub loop_region: LoopRegion,
+    /// 隠しているオートメーションレーンの**解決済み**値。v37+ は
+    /// [`ViewState::hidden_automation_lanes`]、v36 以前は `AutomationLane.visible == false`
+    /// (Song 側に居た) からの移行値。`loop_region` と同じ理由で `view` に畳み込まない。
+    pub hidden_automation_lanes: Vec<AutomationLaneKey>,
     /// 読み込み時に**クリップの重なりを解消したか**
     /// (`docs/plan_range_selection.md` §6.4)。 `true` なら中身が変わっているので
     /// 開いた時点で `*` (未保存) を立てる。 冪等なので、そのまま保存して開き直せば
@@ -52,6 +59,11 @@ const CLIP_MUTE_VERSION: u32 = 27;
 /// が保存される、[`LoopRegion`] 参照)。この版未満のファイルは Song 直下にループ範囲を持つので
 /// [`legacy_song_loop_region`] が deserialize 前に拾い上げる。
 const LOOP_IN_VIEW_STATE_VERSION: u32 = 31;
+
+/// v37 で `AutomationLane.visible` を撤去し、レーンの非表示を [`ViewState::hidden_automation_lanes`]
+/// へ移した (「見方の都合」 は dirty を立てない)。この版未満のファイルは lane に `visible` を
+/// 持つので [`legacy_hidden_automation_lanes`] が deserialize 前に拾い上げる。
+const LANE_VISIBILITY_IN_VIEW_STATE_VERSION: u32 = 37;
 
 /// v30 (§10) で `ClipContent` を `#[serde(untagged)]` から tagged (`type` field) 化した。
 /// この版未満のファイルは content を untagged (flat `{"notes":[...]}` 等) で保存しているので、
@@ -740,6 +752,34 @@ fn legacy_song_loop_region(value: &serde_json::Value) -> Option<LoopRegion> {
     region.has_range().then_some(region)
 }
 
+/// v36 以前の `.daw` から `visible: false` のレーンを拾う (track lane は `tracks[].id`、
+/// song lane は [`MASTER_TRACK_ID`])。`visible` 欠落 / `true` は表示なので拾わない。
+fn legacy_hidden_automation_lanes(value: &serde_json::Value) -> Vec<AutomationLaneKey> {
+    let Some(song) = value.get("song") else { return Vec::new() };
+    let lane_id = |lane: &serde_json::Value| {
+        lane.get("id").and_then(serde_json::Value::as_u64).and_then(|id| u32::try_from(id).ok())
+    };
+    let hidden = |lane: &serde_json::Value| {
+        lane.get("visible").and_then(serde_json::Value::as_bool) == Some(false)
+    };
+    let mut out = Vec::new();
+    for track in song.get("tracks").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        let Some(track_id) = track.get("id").and_then(serde_json::Value::as_u64) else { continue };
+        let Ok(track_id) = u32::try_from(track_id) else { continue };
+        for lane in track.get("automation_lanes").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            if hidden(lane) && let Some(lane) = lane_id(lane) {
+                out.push(AutomationLaneKey { track: track_id, lane });
+            }
+        }
+    }
+    for lane in song.get("song_lanes").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        if hidden(lane) && let Some(lane) = lane_id(lane) {
+            out.push(AutomationLaneKey { track: MASTER_TRACK_ID, lane });
+        }
+    }
+    out
+}
+
 /// Load just the song (legacy callers / tests / headless `--script`).
 /// Delegates to `load_project` and drops the view state.
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
@@ -801,6 +841,12 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let legacy_loop = (file_version < u64::from(LOOP_IN_VIEW_STATE_VERSION))
         .then(|| legacy_song_loop_region(&value))
         .flatten();
+    // v37 で `AutomationLane` から消えた `visible` も同じ理由で deserialize 前に救い出す。
+    let legacy_hidden_lanes = if file_version < u64::from(LANE_VISIBILITY_IN_VIEW_STATE_VERSION) {
+        legacy_hidden_automation_lanes(&value)
+    } else {
+        Vec::new()
+    };
     for &(introduced_in, migrate) in VALUE_MIGRATIONS {
         if file_version < u64::from(introduced_in) {
             migrate(&mut value);
@@ -846,6 +892,18 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     if let Some(v) = view.as_mut() {
         v.loop_region = loop_region;
     }
+    // 隠しレーンも同じ形で解決する: v37+ は view が真実源、v36 以前は Song 側の
+    // `visible: false` から移す。解決値は view にも書き戻す。
+    let mut hidden_automation_lanes =
+        view.as_ref().map(|v| v.hidden_automation_lanes.clone()).unwrap_or_default();
+    if hidden_automation_lanes.is_empty() {
+        hidden_automation_lanes = legacy_hidden_lanes;
+    }
+    hidden_automation_lanes.sort_unstable_by_key(|k| (k.track, k.lane));
+    hidden_automation_lanes.dedup();
+    if let Some(v) = view.as_mut() {
+        v.hidden_automation_lanes = hidden_automation_lanes.clone();
+    }
     let mut song = project.song;
     // deserialize 後の Song へ当てる version-gated migration を単一 dispatch table
     // (SONG_MIGRATIONS) から適用する。各 entry は「その挙動が導入されたバージョン」未満の
@@ -863,7 +921,7 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     // automation-point sort invariants. Idempotent — safe if a caller
     // (e.g. `daw_gui::app::open_project`) re-runs it.
     let overlaps_resolved = song.normalize_after_load();
-    Ok(LoadedProject { song, view, loop_region, overlaps_resolved })
+    Ok(LoadedProject { song, view, loop_region, hidden_automation_lanes, overlaps_resolved })
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -900,6 +958,7 @@ mod tests {
             track_row_overrides: [(1u32, 64u16), (3, 120)].into_iter().collect(),
             expanded_automation_tracks: vec![2, 5],
             master_row_automation_expanded: true,
+            hidden_automation_lanes: vec![crate::model::AutomationLaneKey { track: 1, lane: 3 }],
             arrange_follow: FollowMode::Page,
             loop_region: LoopRegion { enabled: true, start_beat: 8.0, end_beat: 24.0 },
             arrange_snap_enabled: false,
@@ -1031,6 +1090,41 @@ mod tests {
         assert_eq!(loaded.view.unwrap().loop_region, loaded.loop_region);
         // 旧 view の他のフィールドは失われない。
         assert_eq!(load_project(&path).unwrap().view.unwrap().arrange_zoom_x, 37.5);
+    }
+
+    /// v36 以前の `.daw` は lane に `visible` を持つ。`false` のレーンだけ
+    /// `hidden_automation_lanes` へ移り (track lane / song lane とも)、`view` にも書き戻る。
+    #[test]
+    fn legacy_lane_visible_false_migrates_to_hidden_automation_lanes() {
+        use crate::model::{AutomationLane, AutomationLaneKey, AutomationTarget, MASTER_TRACK_ID, Track, TrackBuiltinParam};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v36_lanes.daw");
+        let mut song = Song::default();
+        let mut track = Track { id: 1, ..Track::default() };
+        let mut shown = AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
+        shown.id = 1;
+        let mut hidden = AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan), 0.0);
+        hidden.id = 2;
+        track.automation_lanes = vec![shown, hidden];
+        song.tracks.push(track);
+        let mut song_lane = AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
+        song_lane.id = 5;
+        song.song_lanes.push(song_lane);
+        let mut song_value = serde_json::to_value(&song).unwrap();
+        song_value["tracks"][0]["automation_lanes"][0]["visible"] = serde_json::json!(true);
+        song_value["tracks"][0]["automation_lanes"][1]["visible"] = serde_json::json!(false);
+        song_value["song_lanes"][0]["visible"] = serde_json::json!(false);
+        let view_value = serde_json::to_value(ViewState::default()).unwrap();
+        let project = serde_json::json!({ "version": 36, "song": song_value, "view": view_value });
+        std::fs::write(&path, serde_json::to_string(&project).unwrap()).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        let expected = vec![
+            AutomationLaneKey { track: 1, lane: 2 },
+            AutomationLaneKey { track: MASTER_TRACK_ID, lane: 5 },
+        ];
+        assert_eq!(loaded.hidden_automation_lanes, expected);
+        assert_eq!(loaded.view.unwrap().hidden_automation_lanes, expected);
     }
 
     /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。

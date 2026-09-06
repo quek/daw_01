@@ -216,8 +216,8 @@ pub struct AutomationLane {
     /// false のとき lane は無視され、target は default_value で動く
     /// (Bitwig "Disable Automation"、Reaper "Bypass envelope")。
     pub enabled: bool,
-    /// Arrangement 上で lane 行を表示するか。false なら inspector のみ。
-    pub visible: bool,
+    // NOTE: v37 で `visible` は Song から消えた。アレンジでの非表示は
+    // `ViewState::hidden_automation_lanes` (見方の都合 = dirty を立てない) が持つ。
     /// Lane 行の高さ (px)。Bitwig 流に lane ごとに調整可能。default 60。
     pub height_px: u16,
     /// このレーンの automation clip 群。
@@ -1245,10 +1245,9 @@ pub struct ArrangementTrack {
 pub struct ArrangementAutomationLane {
     pub id: u32,
     pub label: Arc<str>,
-    pub icon_glyph: char,
     pub color: Color,
     pub enabled: bool,
-    pub visible: bool,
+    pub visible: bool,             // caller が `UiPrefs::hidden_automation_lanes` から導く
     pub height_px: u16,            // widget は read-only、caller が値を変えると次フレーム反映
     pub default_value_norm: f32,   // 0.0..=1.0、widget 側 sanity clamp
     pub clips: Vec<ArrangementAutomationClip>,
@@ -1300,7 +1299,6 @@ pub enum ArrangementEditRequest {
 
     ToggleTrackAutomationCollapsed { track: u32 },
     SetLaneEnabled  { lane: AutomationLaneKey, enabled: bool },
-    SetLaneVisible  { lane: AutomationLaneKey, visible: bool },
     SetLaneDefault  { lane: AutomationLaneKey, prev: f32, next: f32 },
     DeleteLane(AutomationLaneKey),
 

@@ -206,7 +206,7 @@ impl AppData {
     pub(crate) fn all_automation_lanes_visible(&self) -> Option<bool> {
         let song = self.song_doc.song();
         song.all_automation_lanes().next()?;
-        let all_visible = song.all_automation_lanes().all(|l| l.visible);
+        let all_visible = self.ui_prefs.hidden_automation_lanes.is_empty();
         let all_expanded = song
             .tracks
             .iter()
@@ -220,23 +220,20 @@ impl AppData {
     /// (`visible` を立て、畳まれた行を展開)、 全部出ていれば **全部隠す**
     /// (`visible` を落とす。 行の展開状態はそのまま = 次に出すときの手間を増やさない)。
     ///
-    /// `visible` は Song 側の状態なので `edit_song_checked` を通す (レーン追加と同じ
-    /// 口 = undo / dirty の扱いも同じ)。 展開状態は view の都合なので `ui_prefs`。
+    /// 表示 / 非表示も展開状態も「見方の都合」 なので `ui_prefs` (dirty を立てない、
+    /// `ViewState` で保存)。 Song は触らない。
     pub(crate) fn toggle_all_automation_lanes_visible(&mut self) {
         let Some(all_visible) = self.all_automation_lanes_visible() else {
             return;
         };
         let show = !all_visible;
-        self.edit_song_checked(|song| {
-            let mut changed = false;
-            for lane in song.all_automation_lanes_mut() {
-                if lane.visible != show {
-                    lane.visible = show;
-                    changed = true;
-                }
-            }
-            changed
-        });
+        if show {
+            self.ui_prefs.hidden_automation_lanes.clear();
+        } else {
+            let keys: Vec<common::model::AutomationLaneKey> =
+                self.song_doc.song().all_automation_lane_keys().collect();
+            self.ui_prefs.hidden_automation_lanes.extend(keys);
+        }
         if show {
             let song = self.song_doc.song();
             let with_lanes: Vec<u32> = song

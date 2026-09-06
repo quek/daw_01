@@ -287,6 +287,7 @@ impl AppData {
                 automation_follows_clips: app_config.automation_follows_clips,
                 collapsed_groups: std::collections::HashSet::new(),
                 expanded_automation_tracks: std::collections::HashSet::new(),
+                hidden_automation_lanes: std::collections::HashSet::new(),
                 collapsed_parallel_nodes: std::collections::HashSet::new(),
                 master_row_automation_expanded: false,
                 track_row_overrides: std::collections::HashMap::new(),

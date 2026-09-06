@@ -47,6 +47,12 @@ pub struct ViewState {
     pub automation_lane_row_overrides: Vec<(AutomationLaneKey, u16)>,
     #[serde(default)]
     pub master_row_automation_expanded: bool,
+    /// v37: アレンジで隠しているオートメーションレーン (既定は表示、隠したものだけ持つ)。
+    /// パラメータを触ったときに自動生成されるレーンがここへ入り、Alt+A で全部出す。
+    /// 「見方の都合」 なので dirty は立てないが保存する。save 時に sort、消えたレーンは落とす。
+    /// v36 以前は `AutomationLane.visible` (Song 側) だったので loader が移す。
+    #[serde(default)]
+    pub hidden_automation_lanes: Vec<AutomationLaneKey>,
     /// 再生中プレイヘッド追従スクロールの方式 (Alt+F で循環)。旧 .daw は
     /// フィールド欠落 → `FollowMode::default()` (= Page) で読まれる。
     #[serde(default)]

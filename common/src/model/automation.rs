@@ -339,11 +339,6 @@ pub struct AutomationLane {
     /// "Bypass envelope").
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// When `false` the lane row is hidden in the arrangement (still
-    /// listed in the inspector). Independent of `enabled` — a lane
-    /// can be active but visually collapsed away.
-    #[serde(default = "default_true")]
-    pub visible: bool,
     /// Lane row height in pixels. Default 60. User-resizable in
     /// Phase 1+.
     #[serde(default = "default_lane_height_px")]
@@ -391,7 +386,6 @@ impl AutomationLane {
             target,
             default_value,
             enabled: true,
-            visible: true,
             height_px: default_lane_height_px(),
             color: None,
             clips: Vec::new(),

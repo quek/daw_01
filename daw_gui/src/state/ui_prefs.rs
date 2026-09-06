@@ -39,6 +39,10 @@ pub struct UiPrefs {
     /// `ToggleTrackAutomationCollapsed { track_id: MASTER_TRACK_ID }` で flip。
     /// session-only / Undo / save 対象外。
     pub master_row_automation_expanded: bool,
+    /// v37: アレンジで隠しているオートメーションレーン (既定は表示、隠したものだけ持つ)。
+    /// パラメータを触ったときに自動生成されるレーンが入り、Alt+A (A ボタン) で全部出す /
+    /// 全部隠す。「見方の都合」 なので **Song には置かず dirty も立てない**、`ViewState` で保存。
+    pub hidden_automation_lanes: std::collections::HashSet<common::model::AutomationLaneKey>,
     /// gui_01 #031 (M14 Phase 63n-6): track ごとの row 高さ override。
     /// `Some(px)` で個別 track 高さ、`None` (= map に entry なし) で
     /// global default `arrange_track_row_h` を使う。 widget の Alt+drag

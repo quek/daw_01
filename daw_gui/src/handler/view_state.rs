@@ -61,6 +61,15 @@ impl AppData {
             .map(|(k, v)| (*k, *v))
             .collect();
         lane_row_overrides.sort_unstable_by_key(|(k, _)| (k.track, k.lane));
+        // 隠しレーンも同じ規則 (現存するレーンだけ、キー順)。
+        let mut hidden_automation_lanes: Vec<common::model::AutomationLaneKey> = self
+            .ui_prefs
+            .hidden_automation_lanes
+            .iter()
+            .filter(|k| self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
+            .copied()
+            .collect();
+        hidden_automation_lanes.sort_unstable_by_key(|k| (k.track, k.lane));
         // r.md #65: エディタ窓のジオメトリ。per-clip view と同じく **現存する
         // device の分だけ**を書き出し (削除済み device の orphan を溜めない)、
         // device_id 昇順で並べて save 差分を安定させる。
@@ -87,6 +96,7 @@ impl AppData {
             expanded_automation_tracks: expanded,
             automation_lane_row_overrides: lane_row_overrides,
             master_row_automation_expanded: self.ui_prefs.master_row_automation_expanded,
+            hidden_automation_lanes,
             collapsed_parallel_nodes: self.persisted_collapsed_parallel_nodes(),
             arrange_snap_enabled: self.ui_prefs.arrange_snap_enabled,
             arrange_snap_choice: self.ui_prefs.arrange_snap_choice,
@@ -119,16 +129,26 @@ impl AppData {
     /// ここで `view` から取ると、 旧ファイル用に `ViewState::default()` を合成する
     /// 羽目になり globals が既定値へ潰れる。 engine への `SetLoop` 送出も込みで
     /// [`AppData::set_loop_region`] を通す (= 復元忘れの故障モードを作らない)。
+    ///
+    /// `hidden_automation_lanes` も `loop_region` と同じく `view` と別引数
+    /// ([`common::project::LoadedProject::hidden_automation_lanes`]): v36 以前は
+    /// `AutomationLane.visible` (Song 側) から移行した値なので、`view = None` でも入る。
     pub fn restore_view_state(
         &mut self,
         view: Option<common::model::ViewState>,
         loop_region: common::model::LoopRegion,
+        hidden_automation_lanes: Vec<common::model::AutomationLaneKey>,
     ) {
         self.ui_prefs.piano_roll_views.clear();
         self.ui_prefs.audio_editor_views.clear();
         // r.md #65: 別プロジェクトの窓位置が漏れないよう per-clip view と同様に先にクリア。
         self.ui_prefs.plugin_editor_windows.clear();
         self.set_loop_region(loop_region);
+        // 消えたレーンのキーは捨てる (`automation_lane_row_overrides` と同じ)。
+        self.ui_prefs.hidden_automation_lanes = hidden_automation_lanes
+            .into_iter()
+            .filter(|k| self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
+            .collect();
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
         self.ui_prefs.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);

@@ -95,6 +95,7 @@ impl AppData {
         // するので、ここで消さないと前 project の値が適用され続ける。
         self.ui_prefs.locked_pr_tracks.clear();
         self.ui_prefs.expanded_automation_tracks.clear();
+        self.ui_prefs.hidden_automation_lanes.clear();
         self.ui_prefs.track_row_overrides.clear();
         self.ui_prefs.multi_clip_view_key.clear();
         self.ui_prefs.collapsed_groups.clear();
@@ -359,7 +360,7 @@ impl AppData {
         // 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
         // (globals は現状維持 = 従来挙動)。`None` 経路 = action_open_path の旧ファイルと同じ。
         // ループは New で必ず初期化する (前プロジェクトの範囲を持ち越さない)。
-        self.restore_view_state(None, common::model::LoopRegion::default());
+        self.restore_view_state(None, common::model::LoopRegion::default(), Vec::new());
         self.resize_track_peak_display();
         // sync 前に migrated vocal track の builtin VOICEVOX を SetSlotPlugin
         // で plugin host に load 要求する (= restore_plugin_from_song と同
@@ -652,7 +653,8 @@ impl AppData {
         }
         match common::project::load_project(&path) {
             Ok(loaded) => {
-                let (mut song, view, loop_region) = (loaded.song, loaded.view, loaded.loop_region);
+                let (mut song, view, loop_region, hidden_lanes) =
+                    (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);
                 let overlaps_resolved = loaded.overlaps_resolved;
                 tracing::info!(path = %path.display(), "loaded project");
                 song.ensure_ids();
@@ -688,7 +690,7 @@ impl AppData {
                 // 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
                 // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
                 // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
-                self.restore_view_state(view, loop_region);
+                self.restore_view_state(view, loop_region, hidden_lanes);
                 // 復元した選択クリップのトラックを追従選択 (= select_clip と同じ文脈復元)。
                 if let Some(r) = self.selected_clip_ref() {
                     self.select_track(r.track_id);
@@ -966,7 +968,8 @@ impl AppData {
                 format!("復元失敗: {}", autosave_path.display());
             return;
         };
-        let (mut song, view, loop_region) = (loaded.song, loaded.view, loaded.loop_region);
+        let (mut song, view, loop_region, hidden_lanes) =
+            (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);
         song.ensure_ids();
         // 別プロジェクトへの丸ごと差し替えなので、現プロジェクトの plugin と
         // 開いている editor window を先に全て破棄する (action_open_path /
@@ -985,7 +988,7 @@ impl AppData {
         // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
         self.begin_asset_decode("プロジェクトを読込中");
         // recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
-        self.restore_view_state(view, loop_region);
+        self.restore_view_state(view, loop_region, hidden_lanes);
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track_id);
         }

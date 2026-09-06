@@ -988,7 +988,7 @@ fn point_center(app: &mut AppData, point_idx: u32) -> (f32, f32) {
 }
 
 /// 描かれた glyph を **文字で** 引いてその中心を返す。
-/// lane header の ★ / 👁 / ✕ は右寄せ配置で、座標を当て推量で書くと分岐に届かない
+/// lane header の ✕ は右寄せ配置で、座標を当て推量で書くと分岐に届かない
 /// (実際 1 度外した)。 production が実際に置いた位置を読む。
 fn glyph_center(scene: &Scene, text: &str) -> Option<(f32, f32)> {
     scene.primitives.iter().find_map(|p| match p {
@@ -1001,30 +1001,29 @@ fn glyph_center(scene: &Scene, text: &str) -> Option<(f32, f32)> {
 
 /// header pane 内に描かれた volume band (`arr_tvol_track` の細い帯) の中心。
 /// 行内の他の rect とは **高さ** で切り分ける (band は数 px、行背景 / ボタンは桁違いに高い)。
+/// 同じく薄い rect にヘッダメーターの 0dB 目印 (1px × メーター幅) があるので、
+/// 薄い rect のうち **最も幅の広いもの** を帯とみなす。
 fn volume_band_center(scene: &Scene, row_top: f32) -> Option<(f32, f32)> {
-    scene.primitives.iter().find_map(|p| match p {
-        Primitive::Rect(c)
-            if c.rect.h < 8.0
-                && c.rect.x + c.rect.w <= HEADER_W + 0.5
-                && c.rect.y > row_top
-                && c.rect.y < row_top + ROW_H =>
-        {
-            Some((c.rect.x + c.rect.w * 0.5, c.rect.y + c.rect.h * 0.5))
-        }
-        _ => None,
-    })
+    scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Rect(c)
+                if c.rect.h < 8.0
+                    && c.rect.x + c.rect.w <= HEADER_W + 0.5
+                    && c.rect.y > row_top
+                    && c.rect.y < row_top + ROW_H =>
+            {
+                Some(c.rect)
+            }
+            _ => None,
+        })
+        .max_by(|a, b| a.w.total_cmp(&b.w))
+        .map(|r| (r.x + r.w * 0.5, r.y + r.h * 0.5))
 }
 
 fn track_volume_of(app: &AppData, id: u32) -> f32 {
     app.song_doc.song().tracks.iter().find(|t| t.id == id).expect("track が居る").volume
-}
-
-fn lane_enabled(app: &AppData, track_id: u32, lane_id: u32) -> Option<bool> {
-    lane_field(app, track_id, lane_id, |l| l.enabled)
-}
-
-fn lane_visible(app: &AppData, track_id: u32, lane_id: u32) -> Option<bool> {
-    lane_field(app, track_id, lane_id, |l| l.visible)
 }
 
 fn lane_height(app: &AppData, track_id: u32, lane_id: u32) -> Option<u16> {
@@ -1181,9 +1180,10 @@ fn header_lane_disclosure_click_collapses_lanes() {
     let (mut app, _a, _p) = app_with_lane(HEADER_W);
     assert!(app.ui_prefs.expanded_automation_tracks.contains(&1), "前提: 展開されている");
     let mut host = UiHost::no_redraw();
-    // `layout.lane_disc_rect` は S ボタンの右 = 行の右端寄り。
-    let x = header_right(HEADER_W) - 6.0;
-    let y = track0_y() - ROW_H * 0.25;
+    // `layout.lane_disc_rect` の位置は production が描いた `-` (展開中の disclosure) から引く
+    // (右端は今はレベルメーターが占めるので座標の当て推量では届かない)。
+    let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+    let (x, y) = glyph_center(&scene, "-").expect("track 行に lane disclosure `-` が描かれている");
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert!(
@@ -1192,33 +1192,19 @@ fn header_lane_disclosure_click_collapses_lanes() {
     );
 }
 
-/// lane header の ★ (enabled) / 👁 (visible) / ✕ (delete) がそれぞれ効く。
-/// icon 列は lane header 行の左から順に並ぶ (`automation_lane_header_layout`)。
+/// lane header の唯一のボタン ✕ (delete) が効く。有効 / 非表示のボタンは無い
+/// (バイパスは Q キー、非表示は param touch の自動生成だけ)。
 #[test]
-fn lane_header_icons_toggle_and_delete_the_lane() {
-    /// icon を **描かれた glyph の位置** で click する (★ は左寄せ、👁 / ✕ は右寄せ)。
-    fn click_icon(glyph: &str) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>)
-    {
-        let (mut app, a, p) = app_with_lane(HEADER_W);
-        let mut host = UiHost::no_redraw();
-        let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
-        let (x, y) = glyph_center(&scene, glyph)
-            .unwrap_or_else(|| panic!("lane header に {glyph} が描かれている"));
-        drive(&mut host, &mut app, press(x, y, no_mods()));
-        drive(&mut host, &mut app, release(x, y, no_mods()));
-        (app, a, p)
+fn lane_header_delete_icon_removes_the_lane() {
+    let (mut app, _a, _p) = app_with_lane(HEADER_W);
+    let mut host = UiHost::no_redraw();
+    let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
+    for glyph in ["★", "☆", "👁", "▣"] {
+        assert!(glyph_center(&scene, glyph).is_none(), "lane header に {glyph} は描かれない");
     }
-
-    // ★ (enabled を落とす)
-    let (app, _a, _p) = click_icon("★");
-    assert_eq!(lane_enabled(&app, 1, 1), Some(false), "★ click で lane.enabled が false になる");
-
-    // 👁 (visible を落とす)
-    let (app, _a, _p) = click_icon("👁");
-    assert_eq!(lane_visible(&app, 1, 1), Some(false), "👁 click で lane.visible が false になる");
-
-    // ✕ (lane 削除)
-    let (app, _a, _p) = click_icon("✕");
+    let (x, y) = glyph_center(&scene, "✕").expect("lane header に ✕ が描かれている");
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, release(x, y, no_mods()));
     assert!(!lane_exists(&app, 1, 1), "✕ click で lane が消える");
 }
 
