@@ -135,7 +135,7 @@ daw_01 は **GNU General Public License version 3 or later (GPL-3.0-or-later)** 
 | [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) / [Linear](https://github.com/Signalsmith-Audio/linear) | MIT | `signalsmith-sys/vendor/` に無改変で vendoring |
 | VST 3 SDK (Steinberg) | MIT (SDK 3.8.0 以降) | `vst3` crate 経由。SDK は vendoring しない |
 | [CLAP](https://github.com/free-audio/clap) | MIT | `clap-sys` crate 経由 |
-| Rust クレート 389 件 | MIT / Apache-2.0 / BSD / ISC / Zlib / MPL-2.0 ほか | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) |
+| Rust クレート 390 件 | MIT / Apache-2.0 / BSD / ISC / Zlib / MPL-2.0 ほか | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) |
 
 いずれも GPL-3.0-or-later と互換。Apache-2.0 は GPLv3 とのみ互換なので、**このプロジェクトを
 GPLv2 系へ後退させることはできない**。
