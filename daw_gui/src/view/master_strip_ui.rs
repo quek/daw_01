@@ -277,15 +277,33 @@ fn draw_limiter<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, stri
         });
     }
 
+    // ---- ノブ 1 個 + 常時表示の値 ----
+    // この行はノブが 1 個で右側が空くので、hover を待たずに値をノブの横へ常に出す
+    // (見出しは行名のまま固定)。
     let row = Rect { y: rect.y + LIM_BAR_H, h: ROW_H, ..rect };
-    let hover = knob_row(
+    let knob = Rect {
+        x: row.x + (row.w - KNOB).max(0.0) * 0.5,
+        y: row.y + LABEL_H,
+        w: KNOB,
+        h: KNOB,
+    };
+    let readout = master_knob(
         app,
         ui,
-        ("master_lim_row", 0),
-        row,
-        &[MasterStripParam::LimiterCeiling],
+        ("master_lim_row", 0, 0),
+        knob,
+        MasterStripParam::LimiterCeiling,
     );
-    row_label(app, ui, ("master_lim_label", 0), row, "Limiter Ceiling", hover);
+    let value_rect = Rect {
+        x: knob.x + KNOB + KNOB_GAP,
+        y: knob.y + (KNOB - LABEL_H) * 0.5,
+        w: (row.x + row.w - (knob.x + KNOB + KNOB_GAP)).max(0.0),
+        h: LABEL_H,
+    };
+    let p = &app.theme.core;
+    let color = if readout.active { p.text } else { p.text_dim };
+    ui.label_at_clipped(("master_lim_value", 0), &readout.value, value_rect, LABEL_FONT, color);
+    row_label(app, ui, ("master_lim_label", 0), row, "Limiter Ceiling", None);
     dim_if_off(app, ui, row, strip.limiter.on);
 }
 
@@ -315,11 +333,18 @@ fn knob_row<'a>(
             Rect { x, y: row.y + LABEL_H, w: KNOB, h: KNOB },
             *param,
         );
-        if r.is_some() {
-            hover = r;
+        if r.active {
+            hover = Some(format!("{} {}", param.label(), r.value));
         }
     }
     hover
+}
+
+/// [`master_knob`] の読み出し。`value` は現在 (drag 中は drag 中) の値の表示文字列、
+/// `active` は hover / drag 中か。
+struct KnobReadout {
+    value: String,
+    active: bool,
 }
 
 /// 行の見出し。ノブに触れていない間は行の名前、触れている間はその値。
@@ -347,7 +372,7 @@ fn master_knob<'a>(
     id: (&'static str, usize, usize),
     rect: Rect,
     param: MasterStripParam,
-) -> Option<String> {
+) -> KnobReadout {
     let strip = app.song_doc.song().master_strip;
     let plain = strip.param(param);
     let target = AutomationTarget::MasterStrip(param);
@@ -378,11 +403,11 @@ fn master_knob<'a>(
         },
         None,
     );
-    if !resp.hovered && !resp.dragging {
-        return None;
-    }
     let shown = norm_to_plain(&target, resp.displayed_value);
-    Some(format!("{} {}", param.label(), format_master_value(param, shown)))
+    KnobReadout {
+        value: format_master_value(param, shown),
+        active: resp.hovered || resp.dragging,
+    }
 }
 
 /// 段階式は段のラベル (`4:1` / `30` / `Auto`)、連続は数値 + 単位。
