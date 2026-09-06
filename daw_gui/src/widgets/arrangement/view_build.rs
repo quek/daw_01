@@ -726,7 +726,6 @@ fn build_arrangement_lanes_from_slice(
                 target: lane.target.clone(),
                 plugin_range: range,
                 label: display.label,
-                icon_glyph: display.icon_glyph,
                 // ユーザー上書き > 対象種別の識別色 (`track_color::effective_lane_color` と同じ規則)。
                 color: lane.color.map_or(display.color, track_color::to_renderer),
                 enabled: lane.enabled,
@@ -753,7 +752,6 @@ pub fn lane_identity_color(target: &common::model::AutomationTarget) -> Color {
 
 struct LaneDisplay {
     label: Arc<str>,
-    icon_glyph: char,
     /// lane の **アイデンティティ色** (「どのパラメータのレーンか」 を運ぶカテゴリ色)。
     ///
     /// r.md #48: テーマ非従属 — テーマを切り替えても Volume は青、Pan は緑のままにする
@@ -801,56 +799,46 @@ fn lane_target_display(
     match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => LaneDisplay {
             label: intern_label("Volume"),
-            icon_glyph: 'V',
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => LaneDisplay {
             label: intern_label("Pan"),
-            icon_glyph: 'P',
             color: Color::rgb(0.55, 0.92, 0.55),
         },
         // r.md #110: Parallel chain の gain / pan (Volume / Pan と同じ見た目)。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { .. }) => LaneDisplay {
             label: intern_label("Chain Gain"),
-            icon_glyph: 'V',
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => LaneDisplay {
             label: intern_label("Chain Pan"),
-            icon_glyph: 'P',
             color: Color::rgb(0.55, 0.92, 0.55),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { .. }) => LaneDisplay {
             label: intern_label("Parallel Out"),
-            icon_glyph: 'V',
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         // r.md #112: クロスオーバー周波数 (EQ と同じ青緑系 = 周波数の色)。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { edge, .. }) => LaneDisplay {
             label: intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge))),
-            icon_glyph: 'F',
             color: Color::rgb(0.40, 0.80, 0.75),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
             label: intern_label("Mute"),
-            icon_glyph: 'M',
             color: Color::rgb(0.92, 0.45, 0.40),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id, .. }) => LaneDisplay {
             label: intern_send_label(*send_id),
-            icon_glyph: 'S',
             color: Color::rgb(0.85, 0.75, 0.40),
         },
         // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。EQ は青緑 /
         // コンプは橙で、fx (紫) や volume (水色) と一目で分かれる色に置く。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEqOn) => LaneDisplay {
             label: intern_label("EQ On"),
-            icon_glyph: 'E',
             color: Color::rgb(0.40, 0.85, 0.80),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripCompOn) => LaneDisplay {
             label: intern_label("Comp On"),
-            icon_glyph: 'C',
             color: Color::rgb(0.95, 0.65, 0.35),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
@@ -865,7 +853,6 @@ fn lane_target_display(
                 label: intern_label(&crate::automation_label::automation_target_display_name(
                     target,
                 )),
-                icon_glyph: if is_eq { 'E' } else { 'C' },
                 color: if is_eq {
                     Color::rgb(0.40, 0.85, 0.80)
                 } else {
@@ -877,7 +864,6 @@ fn lane_target_display(
         // 同系色にしつつ、ラベルで master と分かる (SSoT は automation_label)。
         AutomationTarget::MasterStrip(param) => LaneDisplay {
             label: intern_label(&crate::automation_label::automation_target_display_name(target)),
-            icon_glyph: 'M',
             color: match param {
                 common::model::MasterStripParam::EqOn
                 | common::model::MasterStripParam::EqGain(_) => Color::rgb(0.40, 0.85, 0.80),
@@ -889,103 +875,92 @@ fn lane_target_display(
                 Some(name) => intern_label(name),
                 None => intern_label(&format!("Param {param_id}")),
             },
-            icon_glyph: 'F',
             color: Color::rgb(0.78, 0.55, 0.92),
         },
         // r.md #89: モジュレーターのツマミ / 変調の深さ。ソース名まで入った表示は
         // song を引ける側 (`AppData::automation_target_label`) が担う。
         AutomationTarget::ModSourceParam { source_id, param } => LaneDisplay {
             label: intern_label(&format!("Mod {source_id} \u{25b8} {}", param.label())),
-            icon_glyph: '~',
             color: Color::rgb(0.55, 0.80, 0.95),
         },
         AutomationTarget::ModRoutingDepth { routing_id } => LaneDisplay {
             label: intern_label(&format!("Mod #{routing_id} depth")),
-            icon_glyph: '~',
             color: Color::rgb(0.55, 0.80, 0.95),
         },
         AutomationTarget::SongTempo => LaneDisplay {
             label: intern_label("Tempo"),
-            icon_glyph: 'T',
             color: Color::rgb(0.95, 0.85, 0.55),
         },
         AutomationTarget::SongTimeSigNumerator => LaneDisplay {
             label: intern_label("Time Sig"),
-            icon_glyph: 'T',
             color: Color::rgb(0.95, 0.85, 0.55),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::X) => LaneDisplay {
             label: intern_label("Image X"),
-            icon_glyph: 'X',
             color: Color::rgb(0.90, 0.65, 0.85),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y) => LaneDisplay {
             label: intern_label("Image Y"),
-            icon_glyph: 'Y',
             color: Color::rgb(0.90, 0.65, 0.85),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::W) => LaneDisplay {
             label: intern_label("Image W"),
-            icon_glyph: 'W',
             color: Color::rgb(0.85, 0.65, 0.90),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::H) => LaneDisplay {
             label: intern_label("Image H"),
-            icon_glyph: 'H',
             color: Color::rgb(0.85, 0.65, 0.90),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity) => LaneDisplay {
             label: intern_label("Image Opacity"),
-            icon_glyph: 'O',
             color: Color::rgb(0.92, 0.78, 0.70),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => LaneDisplay {
             label: intern_label("Image Rotation"),
-            icon_glyph: 'R',
             color: Color::rgb(0.75, 0.92, 0.92),
         },
         AutomationTarget::TextBuiltin(p) => {
             use common::model::TextBuiltinParam as T;
-            let (label, icon, color): (&'static str, char, Color) = match p {
-                T::X => ("Text X", 'X', Color::rgb(0.85, 0.85, 0.65)),
-                T::Y => ("Text Y", 'Y', Color::rgb(0.85, 0.85, 0.65)),
-                T::W => ("Text W", 'W', Color::rgb(0.80, 0.80, 0.60)),
-                T::H => ("Text H", 'H', Color::rgb(0.80, 0.80, 0.60)),
-                T::Opacity => ("Text Opacity", 'O', Color::rgb(0.92, 0.85, 0.60)),
-                T::Rotation => ("Text Rotation", 'R', Color::rgb(0.65, 0.92, 0.92)),
-                T::FontSize => ("Text Size", 'S', Color::rgb(0.88, 0.78, 0.55)),
-                T::FillR => ("Text Fill R", 'r', Color::rgb(0.95, 0.55, 0.55)),
-                T::FillG => ("Text Fill G", 'g', Color::rgb(0.55, 0.95, 0.55)),
-                T::FillB => ("Text Fill B", 'b', Color::rgb(0.55, 0.55, 0.95)),
-                T::FillA => ("Text Fill A", 'a', Color::rgb(0.85, 0.85, 0.85)),
-                T::OutlineR => ("Text Out R", 'r', Color::rgb(0.85, 0.45, 0.45)),
-                T::OutlineG => ("Text Out G", 'g', Color::rgb(0.45, 0.85, 0.45)),
-                T::OutlineB => ("Text Out B", 'b', Color::rgb(0.45, 0.45, 0.85)),
-                T::OutlineA => ("Text Out A", 'a', Color::rgb(0.75, 0.75, 0.75)),
-                T::OutlineWidth => ("Text Out W", 'w', Color::rgb(0.78, 0.65, 0.55)),
-                T::ShadowR => ("Text Sh R", 'r', Color::rgb(0.65, 0.40, 0.40)),
-                T::ShadowG => ("Text Sh G", 'g', Color::rgb(0.40, 0.65, 0.40)),
-                T::ShadowB => ("Text Sh B", 'b', Color::rgb(0.40, 0.40, 0.65)),
-                T::ShadowA => ("Text Sh A", 'a', Color::rgb(0.55, 0.55, 0.55)),
-                T::ShadowOffsetX => ("Text Sh X", 'x', Color::rgb(0.55, 0.45, 0.45)),
-                T::ShadowOffsetY => ("Text Sh Y", 'y', Color::rgb(0.55, 0.45, 0.45)),
-                T::ShadowBlur => ("Text Sh Blur", 'B', Color::rgb(0.60, 0.55, 0.50)),
+            let (label, color): (&'static str, Color) = match p {
+                T::X => ("Text X", Color::rgb(0.85, 0.85, 0.65)),
+                T::Y => ("Text Y", Color::rgb(0.85, 0.85, 0.65)),
+                T::W => ("Text W", Color::rgb(0.80, 0.80, 0.60)),
+                T::H => ("Text H", Color::rgb(0.80, 0.80, 0.60)),
+                T::Opacity => ("Text Opacity", Color::rgb(0.92, 0.85, 0.60)),
+                T::Rotation => ("Text Rotation", Color::rgb(0.65, 0.92, 0.92)),
+                T::FontSize => ("Text Size", Color::rgb(0.88, 0.78, 0.55)),
+                T::FillR => ("Text Fill R", Color::rgb(0.95, 0.55, 0.55)),
+                T::FillG => ("Text Fill G", Color::rgb(0.55, 0.95, 0.55)),
+                T::FillB => ("Text Fill B", Color::rgb(0.55, 0.55, 0.95)),
+                T::FillA => ("Text Fill A", Color::rgb(0.85, 0.85, 0.85)),
+                T::OutlineR => ("Text Out R", Color::rgb(0.85, 0.45, 0.45)),
+                T::OutlineG => ("Text Out G", Color::rgb(0.45, 0.85, 0.45)),
+                T::OutlineB => ("Text Out B", Color::rgb(0.45, 0.45, 0.85)),
+                T::OutlineA => ("Text Out A", Color::rgb(0.75, 0.75, 0.75)),
+                T::OutlineWidth => ("Text Out W", Color::rgb(0.78, 0.65, 0.55)),
+                T::ShadowR => ("Text Sh R", Color::rgb(0.65, 0.40, 0.40)),
+                T::ShadowG => ("Text Sh G", Color::rgb(0.40, 0.65, 0.40)),
+                T::ShadowB => ("Text Sh B", Color::rgb(0.40, 0.40, 0.65)),
+                T::ShadowA => ("Text Sh A", Color::rgb(0.55, 0.55, 0.55)),
+                T::ShadowOffsetX => ("Text Sh X", Color::rgb(0.55, 0.45, 0.45)),
+                T::ShadowOffsetY => ("Text Sh Y", Color::rgb(0.55, 0.45, 0.45)),
+                T::ShadowBlur => ("Text Sh Blur", Color::rgb(0.60, 0.55, 0.50)),
             };
-            LaneDisplay { label: intern_label(label), icon_glyph: icon, color }
+            LaneDisplay { label: intern_label(label), color }
         }
         AutomationTarget::GroupTransform(p) => {
             use common::model::GroupTransformParam as G;
-            let (label, icon, color): (&'static str, char, Color) = match p {
-                G::X => ("Group X", 'X', Color::rgb(0.55, 0.85, 0.90)),
-                G::Y => ("Group Y", 'Y', Color::rgb(0.55, 0.85, 0.90)),
-                G::Rotation => ("Group Rot", 'R', Color::rgb(0.50, 0.80, 0.95)),
-                G::ScaleX => ("Group ScaleX", 'x', Color::rgb(0.45, 0.82, 0.82)),
-                G::ScaleY => ("Group ScaleY", 'y', Color::rgb(0.45, 0.82, 0.82)),
-                G::AnchorX => ("Group AnchorX", 'a', Color::rgb(0.60, 0.78, 0.88)),
-                G::AnchorY => ("Group AnchorY", 'a', Color::rgb(0.60, 0.78, 0.88)),
-                G::Opacity => ("Group Opacity", 'O', Color::rgb(0.70, 0.80, 0.92)),
+            let (label, color): (&'static str, Color) = match p {
+                G::X => ("Group X", Color::rgb(0.55, 0.85, 0.90)),
+                G::Y => ("Group Y", Color::rgb(0.55, 0.85, 0.90)),
+                G::Rotation => ("Group Rot", Color::rgb(0.50, 0.80, 0.95)),
+                G::ScaleX => ("Group ScaleX", Color::rgb(0.45, 0.82, 0.82)),
+                G::ScaleY => ("Group ScaleY", Color::rgb(0.45, 0.82, 0.82)),
+                G::AnchorX => ("Group AnchorX", Color::rgb(0.60, 0.78, 0.88)),
+                G::AnchorY => ("Group AnchorY", Color::rgb(0.60, 0.78, 0.88)),
+                G::Opacity => ("Group Opacity", Color::rgb(0.70, 0.80, 0.92)),
             };
-            LaneDisplay { label: intern_label(label), icon_glyph: icon, color }
+            LaneDisplay { label: intern_label(label), color }
         }
     }
 }

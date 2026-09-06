@@ -921,6 +921,21 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                     bypassed,
                 });
             }));
+        } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
+            // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
+            // ヘッダにボタンは無く、これが唯一の到達手段。
+            let enabled = app
+                .song_doc
+                .song()
+                .automation_lane_by_key(lane.track, lane.lane)
+                .is_some_and(|l| l.enabled);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetLaneEnabled {
+                    track_id: lane.track,
+                    lane_id: lane.lane,
+                    enabled: !enabled,
+                });
+            }));
         } else if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
             // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
             // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、

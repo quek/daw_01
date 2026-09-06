@@ -415,19 +415,21 @@ CLAP の `CLAP_EVENT_PARAM_GESTURE_BEGIN/END`
 
 ```
 TRK1 ▶ │[こんにちは    ]    │  ┌[━さようなら────]
-       │            (★ V volume     )           │   ← lane 行 (展開時)
+       │            (volume        ✕)           │   ← lane 行 (展開時)
        │                ●─╮               ╭──   │
        │                  ╰────●──────────╯     │
        │                  [Auto Clip 1   ]      │
-       │            (★ P pan        )           │   ← もう 1 lane
+       │            (pan           ✕)           │   ← もう 1 lane
        │                ────────●─────          │
 TRK2   │[━━━━━━━ Bass Loop ━━━━━━━━━━━━━━━━]
 ```
 
 - Track header の `▶ / ▼` toggle で lane 群の表示・折り畳み
-- Lane 1 行は `(★ I name)` のラベル + curve 描画域
-- ★ = enabled toggle、I = lane 種別アイコン (V=Volume, P=Pan, F=plugin filter cutoff
-  などの省略名)、名前は target に応じて display 文字列
+- Lane 1 行は `(name ✕)` のラベル + default 値フィールド + curve 描画域
+  (名前は target に応じて display 文字列、色は lane 識別色)
+- enabled (bypass) の切替はヘッダにボタンを置かず **Q キー (ポインタ下のレーン)**。
+  バイパス中は名前を減光し clip を灰色化する。レーンの非表示はボタンを持たない
+  (param を触った自動生成だけが隠す、戻すのは Alt+A)
 - curve 内で point drag、Shift+click で curve type 切替メニュー、Alt+click で 1 point
   insert、Ctrl+click で point 削除
 
@@ -438,16 +440,15 @@ TRK1 Vocal
   Source: VOICEVOX  Speaker: ずんだもん
   ─────────────────────────────
   Automation:                          last touched: ⌗ Cutoff (Serum)
-    [V] Volume      [○──── 0.85 ]  👁 ▣  ✕
-    [P] Pan         [────●── -0.10]  👁 ▣  ✕
-    [F] Cutoff (Serum)  [○─────  3200Hz]  👁 ▣  ✕
+    Volume          [○──── 0.85 ]  ✕
+    Pan             [────●── -0.10]  ✕
+    Cutoff (Serum)  [○─────  3200Hz]  ✕
                                           [press A to add]
   ─────────────────────────────
   FX: [EQ] > [Reverb]
 ```
 
-- 各行: アイコン + 名前 + knob (= default_value) + 👁 (visible toggle) + ▣ (enabled
-  toggle、Bypass) + ✕ (delete)
+- 各行: 名前 + knob (= default_value) + ✕ (delete)。Bypass は Q キー (§7.1)
 - 末尾の `[press A to add]` ヒントは `last_touched_param` がセットされていて
   かつ対象 track にまだ lane が無いときのみ表示。`last_touched_param` の display 名は
   Automation セクション右上の `last touched: ⌗ ...` に常時表示

@@ -85,6 +85,25 @@ pub(super) fn hover(
             .map(|(key, _kind, _clip_rect, _body_rect)| key);
         }
     }
+    // header pane 側でも同じ行なら lane を公開する (Q キーの「ポインタ下のレーン」 が
+    // 名前の上でも効く)。 body 側で確定済みなら触らない。
+    if response.hovered_automation_lane.is_none()
+        && let Some((cx, cy)) = f.pointer.pos
+        && f.header_pane.contains(cx, cy)
+    {
+        response.hovered_automation_lane = automation_lane_key_at_y(
+            &f.visible_tracks,
+            &f.tops,
+            f.view.track_row_h,
+            f.header_pane.x,
+            f.header_pane.w,
+            f.lanes.x,
+            f.lanes.w,
+            f.style,
+            cy,
+        )
+        .map(|(key, _body_rect)| key);
+    }
     // r.md #73: Alt 押下中に「曲げられる区間」の上にいるかを公開する
     // (overlay の強調 + カーソル形状)。 point が先に当たっていたら None
     // (点の当たり判定が区間より先に効く = Alt+クリックの点削除と共存させるため)。

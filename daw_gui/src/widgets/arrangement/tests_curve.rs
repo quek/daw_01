@@ -25,7 +25,6 @@ fn lane_with(target: AutomationTarget) -> ArrangementAutomationLane {
         target,
         plugin_range: None,
         label: Arc::from("test"),
-        icon_glyph: 'V',
         color: Color::rgb(1.0, 1.0, 1.0),
         enabled: true,
         visible: true,

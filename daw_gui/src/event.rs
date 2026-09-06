@@ -196,17 +196,11 @@ pub enum AppEvent {
     // ----------------------------------------------------------------
     // gui_01 #028 (M14 Phase 63n-2) — automation lane / point 編集
     // ----------------------------------------------------------------
-    /// Lane 全体の bypass。`★`/`☆` icon click。
+    /// Lane 全体の bypass。Q キー (ポインタ下のレーン)。
     SetLaneEnabled {
         track_id: u32,
         lane_id: u32,
         enabled: bool,
-    },
-    /// Lane の表示 / 非表示。`👁` icon click。
-    SetLaneVisible {
-        track_id: u32,
-        lane_id: u32,
-        visible: bool,
     },
     /// Lane header の default value slider drag。`prev` / `next` は
     /// 共に **normalized 0..1** (widget の slider 帯と同単位)。handler
@@ -1033,7 +1027,7 @@ pub enum AppEvent {
     CycleArrangeFollow,
     /// 全オートメーションレーン (全トラック + master) の表示 / 非表示を一括切替
     /// (`Alt+A` / トランスポートの `A` ボタン、Live の automation toggle)。
-    /// 1 本でも隠れている (👁 で非表示 / 行が畳まれている) なら全部出す、
+    /// 1 本でも隠れている (param を触って自動生成された非表示レーン / 行が畳まれている) なら全部出す、
     /// 全部出ているなら全部隠す ([`AppData::toggle_all_automation_lanes_visible`])。
     ToggleAllAutomationLanesVisible,
     /// Live §6.11 "Delete Time": 範囲選択の時間を**全トラック**から取り除いて詰める
@@ -1991,7 +1985,6 @@ impl AppEvent {
             }
             E::MakeAutomationClipUnique(..) => "オートメーションクリップを独立化",
             E::SetLaneEnabled { .. } => "オートメーション有効切替",
-            E::SetLaneVisible { .. } => "レーン表示切替",
             E::ToggleAllAutomationLanesVisible => "全レーン表示切替",
             E::DeleteTime => "時間を削除",
             E::CutTime => "時間をカット",

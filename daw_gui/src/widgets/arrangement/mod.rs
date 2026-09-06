@@ -494,8 +494,6 @@ pub struct ArrangementAutomationLane {
     /// 非 PluginParam は `None`)。`plain_to_norm_ranged` にそのまま渡す。
     pub plugin_range: Option<(f64, f64)>,
     pub label: Arc<str>,
-    /// lane header の icon 用 1 文字 ('V' / 'P' / 'F' 等)。 caller が parameter 種別から決める。
-    pub icon_glyph: char,
     /// lane 識別色 (curve 線 + アクセント)。
     pub color: Color,
     /// `false` で curve / clip / point を灰色描画 (bypass 表示)。
@@ -876,7 +874,8 @@ pub struct ArrangementResponse {
     /// を区別できる (例: Ctrl+A の context 全選択の起点判定)。
     ///
     /// 算出は `automation_lane_key_at_y` を widget 内部で呼ぶ。 **lane body 全域**をカバー (点 / clip が
-    /// 無い空き領域でも `Some`)。 lane header (展開トグル帯) は含まない (= `lanes` pane 内の body のみ)。
+    /// 無い空き領域でも `Some`)。 lane header 帯 (header pane 側の同じ行) も含む — Q キーの
+    /// 「ポインタ下のレーンをバイパス」 が名前の上でも効くように。 track 行のヘッダは含まない。
     /// master row の lane (sentinel `MASTER_TRACK_ID`) も対象。
     ///
     /// **clip-first の first-hit**: `hovered_clip` が `Some` のとき (= ポインタが clip 上) は
@@ -1257,7 +1256,7 @@ pub struct ArrangementStyle {
     pub header_resize_handle_px: f32,
     /// automation lane disclosure (`+` / `-`) glyph の描画 font size。 default = `track_text_size`。
     pub automation_disclosure_size: f32,
-    /// lane header に描く icon glyph (`★` / `[V]` / `👁` / `▣` / `✕`) の font size。 default = `track_text_size`。
+    /// lane header の label / `✕` の font size。 default = `track_text_size`。
     pub automation_lane_icon_size: f32,
     /// lane header の text color (label + icon、 default = `track_text_color`)。
     pub automation_lane_text_color: Color,
@@ -2394,8 +2393,6 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= u64::from(lane.color.g.to_bits());
             h = h.wrapping_mul(PRIME);
             h ^= u64::from(lane.color.b.to_bits());
-            h = h.wrapping_mul(PRIME);
-            h ^= u64::from(lane.icon_glyph as u32);
             h = h.wrapping_mul(PRIME);
             h ^= lane.label.len() as u64; // label の文字列内容変更は label.len() で簡易検知
             h = h.wrapping_mul(PRIME);

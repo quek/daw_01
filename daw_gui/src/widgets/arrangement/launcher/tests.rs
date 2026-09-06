@@ -180,7 +180,6 @@ fn 帯の行とアレンジの行は同じ縦位置に並ぶ() {
         ),
         plugin_range: None,
         label: Arc::from("Volume"),
-        icon_glyph: 'V',
         color: Color::rgb(0.5, 0.5, 0.5),
         enabled: true,
         visible: true,

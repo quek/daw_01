@@ -111,7 +111,6 @@ fn automation_clip_inks_are_readable_on_every_clip_fill() {
                 ),
                 plugin_range: None,
                 label: Arc::from("Volume"),
-                icon_glyph: 'V',
                 color: Color::rgb(0.5, 0.5, 0.5),
                 enabled,
                 visible: true,

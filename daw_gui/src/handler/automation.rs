@@ -199,17 +199,6 @@ impl AppData {
         });
     }
 
-    pub(crate) fn set_lane_visible(&mut self, track_id: u32, lane_id: u32, visible: bool) {
-        self.edit_song_checked(|song| {
-            if let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) {
-                lane.visible = visible;
-                true
-            } else {
-                false
-            }
-        });
-    }
-
     /// 全オートメーションレーンが「見えている」か = 全レーンの `visible` が立っていて、
     /// レーンを持つ行 (トラック / master) がどれも畳まれていない。 レーンが 1 本も無ければ
     /// `None` (トランスポートの `A` ボタンは消灯、押しても何も起きない)。
@@ -228,10 +217,10 @@ impl AppData {
     }
 
     /// Live の automation toggle (`A` ボタン / `Alt+A`): 1 本でも隠れていれば **全部出す**
-    /// (👁 の `visible` を立て、畳まれた行を展開)、 全部出ていれば **全部隠す**
+    /// (`visible` を立て、畳まれた行を展開)、 全部出ていれば **全部隠す**
     /// (`visible` を落とす。 行の展開状態はそのまま = 次に出すときの手間を増やさない)。
     ///
-    /// `visible` は 👁 と同じ Song 側の状態なので `edit_song_checked` を通す (👁 と同じ
+    /// `visible` は Song 側の状態なので `edit_song_checked` を通す (レーン追加と同じ
     /// 口 = undo / dirty の扱いも同じ)。 展開状態は view の都合なので `ui_prefs`。
     pub(crate) fn toggle_all_automation_lanes_visible(&mut self) {
         let Some(all_visible) = self.all_automation_lanes_visible() else {

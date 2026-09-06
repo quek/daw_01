@@ -117,7 +117,7 @@ impl PressActions {
                 })
             });
         }
-        // M14 Phase 63n-2 (#028): lane header button (★/👁/✕) の click を 1 度発行。
+        // M14 Phase 63n-2 (#028): lane header button (✕) の click を 1 度発行。
         if let Some(req) = self.lane_button {
             ui.push_edit(req);
         }

@@ -1242,7 +1242,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 
     // 全オートメーションレーンの表示 / 非表示 (Live の automation toggle、= Alt+A)。
     // 「Auto 追従」の隣 = オートメーションのまとまり。 点灯 = 全レーンが見えている。
-    // 1 本でも隠れていれば消灯し、 押すと全部出る (👁 で消したレーンを戻す唯一の一括手段)。
+    // 1 本でも隠れていれば消灯し、 押すと全部出る (自動生成で隠れたレーンを戻す唯一の手段)。
     // レーンが 1 本も無ければ消灯のまま no-op。
     let lanes_rect = Rect { x: follow_rect.x + follow_rect.w + pad, y, w: 36.0, h };
     let lanes_visible = app.all_automation_lanes_visible().unwrap_or(false);

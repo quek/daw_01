@@ -1,5 +1,5 @@
 //! track header pane (`f.header_pane`) の press 振り分け。 track 行 (volume band /
-//! M·S·R 除外 / group disclosure / lane disclosure / reorder) と lane 行 (★/👁/✕) に分岐する。
+//! M·S·R 除外 / group disclosure / lane disclosure / reorder) と lane 行 (✕) に分岐する。
 //!
 //! **popup が開いているフレームは丸ごと止める** (`ui.has_open_popups()`)。 context menu は
 //! `capture_input == false` で背景 pointer を mask しないので、 menu item の press が背後の行に
@@ -13,7 +13,7 @@ use super::*;
 ///  - 16px 未満 drag は release で click 格下げ (track header click のトラック選択が代替)
 ///
 /// M14 Phase 63n-2 (#028): track 行 と lane 行 で分岐。 lane 行 (= track 行下、 expanded のみ)
-/// では lane header button (★/👁/✕) を扱う。
+/// では lane header button (✕) を扱う。
 ///
 /// r.md #43 review: popup (右クリックメニュー) が開いている frame は header の
 /// press 経路を丸ごと止める。 menu item の press が背後の行に届き
@@ -183,38 +183,17 @@ fn lane_header(
                 w: (f.header_pane.w - header_indent).max(2.0),
                 h: lh,
             };
-            if let Some(layout) = automation_lane_header_layout(header_rect, style) {
-                if layout.enabled_icon_rect.contains(px, py) {
-                    let v_lane = lane_key;
-                    let v_en = !lane.enabled;
-                    actions.lane_button = Some(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetLaneEnabled {
-                            track_id: v_lane.track,
-                            lane_id: v_lane.lane,
-                            enabled: v_en,
-                        });
-                    }));
-                } else if layout.visible_icon_rect.contains(px, py) {
-                    let v_lane = lane_key;
-                    let v_vis = !lane.visible;
-                    actions.lane_button = Some(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetLaneVisible {
-                            track_id: v_lane.track,
-                            lane_id: v_lane.lane,
-                            visible: v_vis,
-                        });
-                    }));
-                } else if layout.delete_icon_rect.contains(px, py) {
-                    let v_lane = lane_key;
-                    actions.lane_button = Some(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::DeleteLane {
-                            track_id: v_lane.track,
-                            lane_id: v_lane.lane,
-                        });
-                    }));
-                }
-                // default value フィールドの press は caller の
-                // scrubable_number_at overlay が直接処理する (widget 内 band drag は廃止)。
+            // default value フィールドの press は caller の
+            // scrubable_number_at overlay が直接処理する (widget 内 band drag は廃止)。
+            if let Some(layout) = automation_lane_header_layout(header_rect, style)
+                && layout.delete_icon_rect.contains(px, py)
+            {
+                actions.lane_button = Some(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::DeleteLane {
+                        track_id: lane_key.track,
+                        lane_id: lane_key.lane,
+                    });
+                }));
             }
             break;
         }

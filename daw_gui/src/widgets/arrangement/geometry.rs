@@ -1036,17 +1036,16 @@ pub(super) fn disclosure_rect_for(name_rect: Rect, style: &ArrangementStyle, _de
     }
 }
 
-/// M14 Phase 63n-2 (#028): lane header の icon / band の rect 一式 (描画 + hit-test の SSoT)。
+/// lane header の label / icon / field の rect 一式 (描画 + hit-test の SSoT)。
+///
+/// 行の中身は **label + ✕ + default 値フィールド** だけ。有効 / バイパスの切替は
+/// ヘッダにボタンを置かず Q キー (ポインタ下のレーン) で行い、状態は label の減光と
+/// clip の灰色化で示す。レーンの非表示は自動生成 (touch した param) だけが使い、
+/// 戻すのは Alt+A。
 #[derive(Clone, Copy, Debug)]
 pub struct AutomationLaneHeaderLayout {
-    /// `★`/`☆` icon (lane.enabled 切替用、 click で `SetLaneEnabled`)。
-    pub enabled_icon_rect: Rect,
-    /// `[V]` icon (lane.icon_glyph、 click 機能なし = visual only)。
-    pub icon_glyph_rect: Rect,
-    /// `👁` icon (lane.visible 切替用、 click で `SetLaneVisible`)。
-    pub visible_icon_rect: Rect,
-    /// `▣` icon (mute、 Phase 63n-2 では描画のみで click 機能なし)。
-    pub mute_icon_rect: Rect,
+    /// パラメータ名の帯 (左端から ✕ の手前まで)。click 機能なし。
+    pub label_rect: Rect,
     /// `✕` icon (lane 削除、 click で `DeleteLane`)。
     pub delete_icon_rect: Rect,
     /// default value の **数値入力フィールド** rect (旧 horizontal slider 帯を置換)。
@@ -1068,27 +1067,18 @@ pub fn automation_lane_header_layout(
     }
     let pad = 4.0_f32;
     let icon_size = style.automation_lane_icon_size.max(4.0);
-    let cx = header_rect.x + pad;
+    // 左端のレーン色ストライプ (`track_color_strip_w`、 draw 側が `header_rect.x` に描く) の
+    // 右から pad を空けて始める。 ストライプ幅を足さないと label がストライプに密着する。
+    let cx = header_rect.x + style.track_color_strip_w.max(0.0) + pad;
     // r.md #37: header の中身は **上寄せ** (icon 行 → default field の top-down フロー)。
     // 旧実装は icon 行を上下中央 (`(h - icon_size) * 0.5`)、 default field を下端から
     // 逆算 (`y + h - field_h - pad`) で置いていたため、 lane を高くリサイズすると
     // 両者が上下に離れて間が空いた。
     let cy = header_rect.y + pad;
-    let enabled_icon_rect = Rect { x: cx, y: cy, w: icon_size, h: icon_size };
-    let icon_glyph_rect = Rect {
-        x: cx + icon_size + pad,
-        y: cy,
-        w: icon_size,
-        h: icon_size,
-    };
-    // 右寄せ: ✕ → ▣ → 👁 の順で右から左へ配置 (描画ループ `icons.iter().rev()` と同じ式)。
-    let step = icon_size + pad * 0.5;
-    let delete_x = header_rect.x + header_rect.w - pad - step;
-    let mute_x = delete_x - step;
-    let visible_x = mute_x - step;
-    let visible_icon_rect = Rect { x: visible_x, y: cy, w: icon_size, h: icon_size };
-    let mute_icon_rect = Rect { x: mute_x, y: cy, w: icon_size, h: icon_size };
+    // ✕ は右寄せ、label はその手前まで。
+    let delete_x = header_rect.x + header_rect.w - pad - icon_size;
     let delete_icon_rect = Rect { x: delete_x, y: cy, w: icon_size, h: icon_size };
+    let label_rect = Rect { x: cx, y: cy, w: (delete_x - pad - cx).max(0.0), h: icon_size };
 
     // default value 数値入力フィールド (旧スライダー帯を置換)。 caller が
     // scrubable_number_at を overlay できる読める高さ。 icon 行の直下に続けて置き、
@@ -1109,10 +1099,7 @@ pub fn automation_lane_header_layout(
     };
 
     Some(AutomationLaneHeaderLayout {
-        enabled_icon_rect,
-        icon_glyph_rect,
-        visible_icon_rect,
-        mute_icon_rect,
+        label_rect,
         delete_icon_rect,
         default_field_rect,
     })

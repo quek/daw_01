@@ -871,11 +871,6 @@ impl AppData {
                 lane_id,
                 enabled,
             } => self.set_lane_enabled(track_id, lane_id, enabled),
-            AppEvent::SetLaneVisible {
-                track_id,
-                lane_id,
-                visible,
-            } => self.set_lane_visible(track_id, lane_id, visible),
             AppEvent::ToggleAllAutomationLanesVisible => self.toggle_all_automation_lanes_visible(),
             ev @ (AppEvent::DeleteTime | AppEvent::CutTime | AppEvent::DuplicateTime | AppEvent::InsertSilence | AppEvent::PasteTime { .. }) => self.handle_time_event(ev),
             AppEvent::SetLaneDefault {

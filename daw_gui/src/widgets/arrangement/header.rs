@@ -512,7 +512,7 @@ fn draw_rows_inner(
 
 /// automation lane header (track 行の下に展開する lane 行の header 部) の click を、 track
 /// header の row click と同じ `clicked_track` 経路に乗せる (= 修飾 Shift / Ctrl も同じ規則で
-/// 効く)。 lane header の button (★ / 👁 / ▣ / ✕) と default 値フィールド (caller が
+/// 効く)。 lane header の button (✕) と default 値フィールド (caller が
 /// scrubable_number_at を overlay する rect) は除外する — 除外しないと button / scrub の
 /// release が選択更新を併発して multi-select が単一に潰れる (track 行の M·S·R / volume band
 /// 除外と同じ理由)。 lane 行の縦範囲は press 側 (`press_header::lane_header`) と同じ積み方。
@@ -550,10 +550,7 @@ fn lane_header_click(
             continue;
         }
         let on_control = automation_lane_header_layout(header_rect, style).is_some_and(|l| {
-            l.enabled_icon_rect.contains(rx, ry)
-                || l.visible_icon_rect.contains(rx, ry)
-                || l.mute_icon_rect.contains(rx, ry)
-                || l.delete_icon_rect.contains(rx, ry)
+            l.delete_icon_rect.contains(rx, ry)
                 || l.default_field_rect.is_some_and(|r| r.contains(rx, ry))
         });
         if !on_control {

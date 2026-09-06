@@ -1801,77 +1801,47 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         });
     }
 
-    // ---- header: ★ icon label slider 帯 👁▣✕ (描画 + Phase 63n-2 hit-test 対応) ----
-    // M14 Phase 63n-2 (#028): 描画と hit-test の SSoT を `automation_lane_header_layout` に集約。
-    // header_rect.w が極狭の場合 (`< automation_lane_header_min_w_px`) は layout が `None` で描画 skip。
-    // curve line / point dot の色は「lane.color 直塗り」 をやめ、 clip ごとに実際の
-    // `fill` 輝度から白/黒 neutral を auto-contrast する (= clip 名 `clip_text_color_for` と同 SSoT)。
-    // 黄など明るい識別色でも常にコントラストを確保する狙い。 実際の色決定は下の clip ループ内
-    // (fill 確定後) で行う。 header の icon glyph 色は lane 識別色 (`lane_ink`) を使う。
+    // ---- header: label ✕ (+ default 値フィールドは caller の overlay) ----
+    // 描画と hit-test の SSoT は `automation_lane_header_layout`。 header_rect.w が極狭の場合
+    // (`< automation_lane_header_min_w_px`) は layout が `None` で描画 skip。
+    // curve line / point dot の色は clip ごとに実際の `fill` 輝度から白/黒 neutral を
+    // auto-contrast する (= clip 名 `clip_text_color_for` と同 SSoT)。 実際の色決定は下の
+    // clip ループ内 (fill 確定後) で行う。
     if let Some(layout) = automation_lane_header_layout(header_rect, style) {
         let icon_size = style.automation_lane_icon_size.max(4.0);
-        let pad = 4.0_f32;
-        // ★ enabled marker (lane.enabled で星塗りつぶし切替)
-        hctx.push_text(GlyphArea {
-            text: Arc::from(if lane.enabled { "★" } else { "☆" }),
-            left: layout.enabled_icon_rect.x,
-            top: layout.enabled_icon_rect.y,
-            font_size: icon_size,
-            line_height: icon_size * 1.2,
-            color: style.automation_lane_text_color,
-            clip_rect: Some(header_rect),
-            ..GlyphArea::default()
-        });
-        // [V] icon glyph (lane.icon_glyph、 lane 識別色)
-        hctx.push_text(GlyphArea {
-            text: Arc::from(lane.icon_glyph.to_string()),
-            left: layout.icon_glyph_rect.x,
-            top: layout.icon_glyph_rect.y,
-            font_size: icon_size,
-            line_height: icon_size * 1.2,
-            color: lane_ink,
-            clip_rect: Some(header_rect),
-            ..GlyphArea::default()
-        });
-        // label (icon_glyph の右、 visible_icon の左までの帯)
-        let label_x = layout.icon_glyph_rect.x + layout.icon_glyph_rect.w + pad;
+        // label (パラメータ名、 lane 識別色)。 バイパス中 (`!lane.enabled`) は
+        // clip の灰色化と揃えて減光する — ヘッダにボタンを置かないので、 clip の無い
+        // レーンでも状態が読める唯一の手がかり。
         let label_clip = Rect {
-            x: label_x,
+            x: layout.label_rect.x,
             y: header_rect.y,
-            w: (layout.visible_icon_rect.x - label_x - pad).max(0.0),
+            w: layout.label_rect.w,
             h: header_rect.h,
         };
         hctx.push_text(GlyphArea {
             text: Arc::clone(&lane.label),
-            left: label_x,
-            top: layout.icon_glyph_rect.y,
+            left: layout.label_rect.x,
+            top: layout.label_rect.y,
             font_size: icon_size,
             line_height: icon_size * 1.2,
-            color: style.automation_lane_text_color,
+            color: if lane.enabled { lane_ink } else { style.automation_lane_disabled_color },
             clip_rect: Some(label_clip),
             ..GlyphArea::default()
         });
         // default value はレーンヘッダの数値入力フィールド (`default_field_rect`) を
-        // caller が scrubable_number_at で overlay する (= 旧スライダー帯描画は廃止)。 widget は
-        // ここで何も描かない (フィールドの bg / 値は overlay 側が持つ)。 本体の水平ガイド線
+        // caller が scrubable_number_at で overlay する。 widget はここで何も描かない
+        // (フィールドの bg / 値は overlay 側が持つ)。 本体の水平ガイド線
         // (下記 default_value_norm 位置) は残す (default 値の視覚位置の手がかり)。
-        // 右寄せ icon 群 (👁 ▣ ✕、 Phase 63n-2 で hit-test 対応)
-        for &(g, r) in &[
-            ('👁', layout.visible_icon_rect),
-            ('▣', layout.mute_icon_rect),
-            ('✕', layout.delete_icon_rect),
-        ] {
-            hctx.push_text(GlyphArea {
-                text: Arc::from(g.to_string()),
-                left: r.x,
-                top: r.y,
-                font_size: icon_size,
-                line_height: icon_size * 1.2,
-                color: style.automation_lane_text_color,
-                clip_rect: Some(header_rect),
-                ..GlyphArea::default()
-            });
-        }
+        hctx.push_text(GlyphArea {
+            text: Arc::from("✕"),
+            left: layout.delete_icon_rect.x,
+            top: layout.delete_icon_rect.y,
+            font_size: icon_size,
+            line_height: icon_size * 1.2,
+            color: style.automation_lane_text_color,
+            clip_rect: Some(header_rect),
+            ..GlyphArea::default()
+        });
     }
 
     // ---- body ----
