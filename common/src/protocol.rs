@@ -355,6 +355,10 @@ pub enum AudioCommand {
     SetParallelOutGain { track: u32, parallel_id: u64, gain: f32 },
     /// r.md #110 Parallel: gain match の on / off (RT は Song snapshot から live-read)。
     SetParallelGainMatch { track: u32, parallel_id: u64, on: bool },
+    /// r.md #112 Parallel: 帯域分割のクロスオーバー周波数 (Hz) の値のみ更新。 順序 (`low <= high`)
+    /// と値域は `Parallel::set_split_freq` が両プロセスで同じ規則を通す。 分割モードの切替
+    /// (`Split` の variant) は構造変更なので `LoadSong` で運ぶ。
+    SetParallelSplitFreq { track: u32, parallel_id: u64, edge: crate::model::SplitEdge, hz: f32 },
     /// Record-arm 状態。 audio thread は track.armed を Song に反映するのみ。
     SetTrackArmed { track: u32, armed: bool },
     /// BPM 軽量更新 (transport scrub 中に毎 frame 流れうる)。値のみ。

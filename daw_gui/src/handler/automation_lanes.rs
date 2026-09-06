@@ -1248,6 +1248,14 @@ impl AppData {
                 .song()
                 .parallel_by_id(*parallel_id)
                 .map_or(1.0, |r| f64::from(r.out_gain)),
+            // r.md #112: 分割が off の Parallel (dangling lane) は既定値を出す。
+            P::ParallelSplitFreq { parallel_id, edge } => self
+                .song_doc
+                .song()
+                .parallel_by_id(*parallel_id)
+                .and_then(|r| r.split.freq(*edge))
+                .or_else(|| common::model::Split::DEFAULT_FREQUENCY3.freq(*edge))
+                .map_or(0.0, f64::from),
             // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
             // `ChannelStrip::target_value` が SSoT (ここで写さない)。
             P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {

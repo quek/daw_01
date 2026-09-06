@@ -262,7 +262,12 @@ pub enum ChainRowKind {
         /// 出力 trim (linear) と gain match (ヘッダ行の knob / Match トグル)。
         out_gain: f32,
         gain_match: bool,
+        /// r.md #112: 入力の配り方 (ヘッダ行の dropdown)。
+        split: common::model::Split,
     },
+    /// r.md #112: Split の param 行 (ヘッダ行の直下、 `Split::None` 以外のときだけ)。
+    /// `Frequency3` なら `Low [hz] Mid [hz] High`。
+    SplitParams { parallel_id: u64, split: common::model::Split },
     /// Parallel の chain 1 本 (名前 / 色 / gain / pan / M / S)。
     Chain {
         parallel_id: u64,
@@ -523,6 +528,8 @@ pub enum InspectorScrubField {
     PluginParam { device_id: u64, param_id: u32 },
     /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub。
     Talk(TalkParamKind),
+    /// r.md #112: Parallel の帯域分割クロスオーバー周波数の欄 (Parallel id + 境界)。
+    ParallelSplit { parallel_id: u64, edge: common::model::SplitEdge },
     /// r.md #87: インスペクタ「ローンチ」セクションの数値欄 (セル長 /
     /// フォローアクションの倍率・時間・確率)。
     ///

@@ -52,6 +52,9 @@ pub struct Parallel {
     pub name: String,            // 既定 "Parallel"
     pub chains: Vec<ParallelChain>,
     pub bypassed: bool,          // r.md #105 と同じ意味 (全体素通し)
+    pub out_gain: f32,           // §4.3c
+    pub gain_match: bool,        // §4.3c
+    pub split: Split,            // §4.3d (r.md #112)
 }
 
 pub struct ParallelChain {
@@ -180,10 +183,45 @@ Wet のように和がそのまま正しい使い方では自動補正が逆に�
 out_gain は automation / 変調の対象 (`TrackBuiltinParam::ParallelOutGain`、住所は `Parallel::id`)、
 値のみ IPC は `SetParallelOutGain` / `SetParallelGainMatch`。
 
+### 4.3d 入力の配り方 `Split` と 3 バンド周波数分割 (r.md #112)
+
+`Parallel { split: Split }` — 入力を chain にどう配るか。 Bitwig は Multiband FX-2/3 / Loudness Split /
+Mid-Side Split / Stereo Split を **別 container** にしているが、 ここでは 1 つの Parallel の
+「配り方」 の切替にする (chain の gain / pan / M / S / SC / automation を container ごとに複製しない)。
+
+```rust
+pub enum Split {
+    None,                                       // 全 chain に同じ入力 (従来)
+    Frequency3 { low_hz: f32, high_hz: f32 },   // 3 バンド (#112)。 将来: Loudness / MidSide / Stereo …
+}
+```
+
+- **出力は chain の並び順に対応**: `Frequency3` なら chain 1 = Low、 2 = Mid、 3 = High。 出力数を
+  超える chain (4 本目以降) は全帯域 (素通し) の入力を受ける (Dry chain を足す使い方)。 band chain
+  を削除した帯域は無音 (ユーザーの明示操作)。
+- **on にしたとき** chain が出力数に足りなければ空 chain を補う (名前は帯域名、 色は自動)。 既存
+  chain は名前も中身も据え置き。 off に戻しても chain は消さない。 モード切替は構造変更なので
+  `LoadSong` (再 compile)、 周波数は値のみ IPC `SetParallelSplitFreq`。
+- **順序**: `low_hz <= high_hz` を `Parallel::set_split_freq` (GUI と `song_values` の共通 setter)
+  が保つ — 片方を相手より先へ動かすと相手が押される (Bitwig の分割点と同じく交差しない)。
+  値域 `SPLIT_FREQ_RANGE` = 20 Hz〜20 kHz (対数)。 automation / 変調の対象
+  (`TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge }`、 Hz 有効数字 3 桁)。
+- **engine** (`graph/band_split.rs`): 4 次 Linkwitz-Riley (Butterworth 2 次 × 2、 24 dB/oct) を
+  2 段。 `Low = AP2(high)(LP4(low)(x))`、 `Mid = LP4(high)(HP4(low)(x))`、
+  `High = HP4(high)(HP4(low)(x))`。 LR4 の LP + HP = 同じ ω0 / Q の 2 次オールパスなので、 低域に
+  上側クロスオーバーのオールパスを掛けると 3 帯域の和は振幅平坦 (Rane Note 160 / KVR N-band LR)。
+  `ParallelBegin` で分割 (係数は buffer 終端の ramp 値、 変わったときだけ組み直す)、 `ChainBegin`
+  が帯域をバスへ載せる。 状態は `Parallel::id` で再 compile を跨いで移送 (gain match の追従値も同じ
+  経路に乗せた)。 band chain の `PreFx` tap = その帯域 (`BufRef::ParallelBand`)。 latency 0。
+- **UI**: ヘッダ行の Match の左に dropdown (`No split` / `3 bands`)。 `Frequency3` ならヘッダ直下に
+  param 行 `Low [200 Hz] Mid [2.0k] High` (`parallel_header.rs`、 inspector 共通の scrubable idiom:
+  対数目盛 / undo bracket / automation gesture / 変調 overlay)。 chain 行は共通。
+
 ### 4.4 値のみ更新 (`song_values.rs`)
 
 `SetChainGain` / `SetChainPan` / `SetChainMuted` / `SetChainSolo { track, chain_id, .. }` を
-`AudioCommand` に追加 (再 compile なし)。
+`AudioCommand` に追加 (再 compile なし)。 Parallel 側は `SetParallelOutGain` / `SetParallelGainMatch` /
+`SetParallelSplitFreq`。
 
 ## 5. Plugin host
 

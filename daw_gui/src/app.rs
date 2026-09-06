@@ -1563,6 +1563,7 @@ impl AppData {
             }
             AppEvent::SetChainMixer { chain_id, edit } => self.set_chain_mixer(chain_id, edit),
             AppEvent::SetParallelMixer { parallel_id, edit } => self.set_parallel_mixer(parallel_id, edit),
+            AppEvent::SetParallelSplit { parallel_id, split } => self.set_parallel_split(parallel_id, split),
             AppEvent::ToggleParallelNodeCollapsed { id } => self.toggle_parallel_node_collapsed(id),
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);

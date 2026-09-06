@@ -980,6 +980,8 @@ pub enum AppEvent {
     SetChainMixer { chain_id: u64, edit: crate::handler::parallel::ChainMixerEdit },
     /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC)。
     SetParallelMixer { parallel_id: u64, edit: crate::handler::parallel::ParallelMixerEdit },
+    /// r.md #112: Parallel の入力の配り方 (帯域分割など) を切り替える (構造変更、 chain を補完)。
+    SetParallelSplit { parallel_id: u64, split: common::model::Split },
     /// 見方の都合: Parallel / chain の中身の開閉 (undo 対象外)。 `id` は Parallel か chain。
     ToggleParallelNodeCollapsed { id: u64 },
     SetMasterGain(f32),
@@ -1914,6 +1916,8 @@ impl AppEvent {
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Solo(_), .. } => "chain solo",
             E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::OutGain(_), .. } => "Parallel 出力",
             E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::GainMatch(_), .. } => "Parallel gain match",
+            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SplitFreq { .. }, .. } => "クロスオーバー周波数",
+            E::SetParallelSplit { .. } => "Parallel の分割",
             E::SetVideoFxParam { .. } => "映像FX変更",
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
             E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",

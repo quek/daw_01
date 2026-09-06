@@ -73,6 +73,10 @@ pub fn plain_to_norm_ranged(
             TrackBuiltinParam::ChainGain { .. } | TrackBuiltinParam::ParallelOutGain { .. },
         ) => plain / 2.0,
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => (plain + 1.0) / 2.0,
+        // r.md #112: クロスオーバー周波数は対数 (レンジの SSoT は `SPLIT_FREQ_RANGE`)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => {
+            crate::model::SPLIT_FREQ_RANGE.to_norm(plain)
+        }
         // 内蔵チャンネルストリップ: レンジの SSoT は `EqParam::range` /
         // `CompParam::range` (`common::model::channel_strip`)。ここで式を持たない。
         AutomationTarget::TrackBuiltin(
@@ -292,6 +296,9 @@ pub fn norm_to_plain_ranged(
             TrackBuiltinParam::ChainGain { .. } | TrackBuiltinParam::ParallelOutGain { .. },
         ) => n * 2.0,
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => n * 2.0 - 1.0,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => {
+            crate::model::SPLIT_FREQ_RANGE.from_norm(n)
+        }
         // `plain_to_norm_ranged` の厳密逆 (レンジは channel_strip 側が SSoT)。
         AutomationTarget::TrackBuiltin(
             TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,

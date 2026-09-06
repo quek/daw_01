@@ -12,6 +12,7 @@
 // unused-import 警告を抑止して re-export 面を安定に保つ。
 #![allow(unused_imports)]
 
+pub mod band_split;
 mod compile;
 mod delay_line;
 pub mod execute;

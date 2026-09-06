@@ -6,7 +6,7 @@
 //! LoadSong の再 compile を待たずに効く)。
 use crate::app_types::*;
 use crate::state::*;
-use common::model::{ChainRef, Device, MASTER_TRACK_ID, Parallel, ParallelChain};
+use common::model::{ChainRef, Device, MASTER_TRACK_ID, Parallel, ParallelChain, Split};
 use common::protocol::AudioCommand;
 
 impl AppData {
@@ -274,6 +274,8 @@ impl AppData {
                     }
                     r.gain_match = on;
                 }
+                // 順序 (`low <= high`) と値域は model の setter が SSoT (engine 側も同じ関数)。
+                ParallelMixerEdit::SplitFreq { edge, hz } => return r.set_split_freq(edge, hz),
             }
             true
         });
@@ -281,9 +283,45 @@ impl AppData {
             let cmd = match edit {
                 ParallelMixerEdit::OutGain(gain) => AudioCommand::SetParallelOutGain { track, parallel_id, gain },
                 ParallelMixerEdit::GainMatch(on) => AudioCommand::SetParallelGainMatch { track, parallel_id, on },
+                ParallelMixerEdit::SplitFreq { edge, hz } => {
+                    AudioCommand::SetParallelSplitFreq { track, parallel_id, edge, hz }
+                }
             };
             self.send_audio(cmd);
         }
+    }
+
+    /// r.md #112: 入力の配り方 (`Split`) を切り替える。 構造変更なので `LoadSong` で運ぶ
+    /// (値のみ IPC ではない)。 出力数より chain が少なければ空 chain を補って
+    /// (名前は帯域名、 色は自動)、 既存 chain は名前も中身もそのまま。 4 本目以降は残す
+    /// (全帯域入力)。 off に戻しても chain は消さない。
+    pub(crate) fn set_parallel_split(&mut self, parallel_id: u64, split: Split) {
+        self.edit_song_checked(move |song| {
+            let Some(r) = song.parallel_by_id(parallel_id) else {
+                return false;
+            };
+            let mut split = split;
+            split.sanitize();
+            if r.split == split {
+                return false;
+            }
+            let missing = split.output_count().saturating_sub(r.chains.len());
+            let ids: Vec<u64> = (0..missing).map(|_| song.alloc_device_id()).collect();
+            let ancestors = ancestor_colors(song, ChainRef::Chain(0), Some(parallel_id));
+            let Some(parallel) = song.parallel_by_id_mut(parallel_id) else {
+                return false;
+            };
+            parallel.split = split;
+            for id in ids {
+                let k = parallel.chains.len();
+                let name = split.output_name(k).map_or_else(|| parallel.next_chain_name(), str::to_string);
+                let mut c = ParallelChain::new(name);
+                c.id = id;
+                c.color = Some(auto_color(&chain_colors(&parallel.chains), &ancestors));
+                parallel.chains.push(c);
+            }
+            true
+        });
     }
 
     /// 見方の都合: Parallel / chain の中身の開閉 (Bitwig の layer の開閉)。 dirty 無し。
@@ -372,10 +410,15 @@ impl AppData {
             open: parallel_open,
             out_gain: r.out_gain,
             gain_match: r.gain_match,
+            split: r.split,
         }));
         // 折り畳んだ Parallel は開始行 1 本だけ (chain も終了行も出さない)。
         if !parallel_open {
             return;
+        }
+        // r.md #112: Split の param 行はヘッダ直下 (chain 行の帯域名と並び順で対応する)。
+        if !r.split.is_none() {
+            rows.push(row(ChainRowKind::SplitParams { parallel_id: r.id, split: r.split }));
         }
         for c in &r.chains {
             let open = self.parallel_node_open(c.id);
@@ -527,6 +570,8 @@ pub enum ChainMixerEdit {
 pub enum ParallelMixerEdit {
     OutGain(f32),
     GainMatch(bool),
+    /// r.md #112: 帯域分割のクロスオーバー周波数 (Hz)。
+    SplitFreq { edge: common::model::SplitEdge, hz: f32 },
 }
 
 /// 自動色 (Bitwig と同じく作った時点で周囲と別の色)。 パレット (色相順) から、 **兄弟にも祖先

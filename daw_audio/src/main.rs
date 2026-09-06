@@ -1341,6 +1341,7 @@ async fn recv_loop(
                 | AudioCommand::SetChainSolo { .. }
                 | AudioCommand::SetParallelOutGain { .. }
                 | AudioCommand::SetParallelGainMatch { .. }
+                | AudioCommand::SetParallelSplitFreq { .. }
                 | AudioCommand::SetSongBpm { .. }
                 | AudioCommand::SetSongTimeSigNumerator { .. })) => {
                 update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, &phase_tables, |s| {

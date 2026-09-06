@@ -133,6 +133,10 @@ pub enum TrackBuiltinParam {
     /// r.md #110: Parallel の出力 trim (linear、`0.0..=MAX_TRACK_GAIN`)。住所は安定
     /// `Parallel::id`。レーンは Parallel を持つ track (master なら song lanes)。
     ParallelOutGain { parallel_id: u64 },
+    /// r.md #112: Parallel の帯域分割クロスオーバー周波数 (Hz、値域は `SPLIT_FREQ_RANGE`、
+    /// 対数)。住所は安定 `Parallel::id` + どちらの境界か。`Split::Frequency3` でない
+    /// Parallel に残った lane は何にも効かない (dangling、削除で消える)。
+    ParallelSplitFreq { parallel_id: u64, edge: super::SplitEdge },
     /// 内蔵チャンネルストリップの EQ セクション ON/OFF (`Mute` と同じ 0.5 閾値の階段)。
     StripEqOn,
     /// 内蔵チャンネルストリップの Comp セクション ON/OFF。

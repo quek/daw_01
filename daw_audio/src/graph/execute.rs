@@ -564,7 +564,8 @@ pub fn execute_schedule_post_dispatch(
                     | BufRef::PreFxScratch(_)
                     | BufRef::ChainPostFx { .. }
                     | BufRef::ChainPostFader { .. }
-                    | BufRef::ParallelInput { .. },
+                    | BufRef::ParallelInput { .. }
+                    | BufRef::ParallelBand { .. },
                 ..
             } => {
                 // Pooled targets land here once pooled-bus routing arrives.

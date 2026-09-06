@@ -48,7 +48,134 @@ pub struct Parallel {
     /// 帯域分割や Dry + Wet のように和がそのまま正しい使い方では **off** にする (既定 off)。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gain_match: bool,
+    /// r.md #112: 入力を chain にどう配るか (帯域分割など)。 既定 [`Split::None`] = 全 chain に
+    /// 同じ入力。 engine は `ChainBegin` で「chain k の入力 = split の k 番目の出力」を作るだけ
+    /// なので、 モードが増えても op 列 / PDC / tap / mixer は変わらない。
+    #[serde(default, skip_serializing_if = "Split::is_none")]
+    pub split: Split,
 }
+
+/// r.md #112: Parallel の入力の配り方。 Bitwig は Multiband FX / Loudness Split / Mid-Side Split /
+/// Stereo Split を別 container にしているが、 ここでは 1 つの Parallel の「配り方」の切替に
+/// する (chain 側の gain / pan / M / S / SC / automation を container ごとに複製しない)。
+///
+/// 配り方の出力は **chain の並び順**に対応する (`Frequency3` なら chain 1 = Low、 2 = Mid、
+/// 3 = High)。 出力数を超える chain (4 本目以降) は全帯域 (= 素通し) の入力を受ける。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode)]
+pub enum Split {
+    /// 全 chain に同じ入力 (従来の Parallel)。
+    #[default]
+    None,
+    /// 3 バンド周波数分割 (Linkwitz-Riley 24 dB/oct、 和は平坦)。 `low_hz` < `high_hz`
+    /// (`Parallel::set_split_freq` が順序を保つ)。 値域は [`SPLIT_FREQ_RANGE`]。
+    Frequency3 { low_hz: f32, high_hz: f32 },
+}
+
+impl Split {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// 既定のクロスオーバー `(low_hz, high_hz)` (200 Hz / 2 kHz)。 非有限値の置換にも使う (SSoT)。
+    pub const DEFAULT_FREQS: (f32, f32) = (200.0, 2_000.0);
+    /// 既定の 3 バンド分割。
+    pub const DEFAULT_FREQUENCY3: Self =
+        Self::Frequency3 { low_hz: Self::DEFAULT_FREQS.0, high_hz: Self::DEFAULT_FREQS.1 };
+
+    /// この配り方の出力数 (= 帯域を受ける chain の本数)。 `None` は 0 (= 全 chain が素通し入力)。
+    pub fn output_count(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Frequency3 { .. } => 3,
+        }
+    }
+
+    /// `index` 番目 (0 始まり) の出力の既定名 (chain を補完するときの名前)。
+    pub fn output_name(&self, index: usize) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Frequency3 { .. } => [SplitBand::Low, SplitBand::Mid, SplitBand::High]
+                .get(index)
+                .map(SplitBand::label),
+        }
+    }
+
+    /// `index` 番目の chain が受ける帯域 (`Frequency3` のみ)。 出力数を超える chain は `None`
+    /// (全帯域)。
+    pub fn band_of(&self, index: usize) -> Option<SplitBand> {
+        match self {
+            Self::None => None,
+            Self::Frequency3 { .. } => match index {
+                0 => Some(SplitBand::Low),
+                1 => Some(SplitBand::Mid),
+                2 => Some(SplitBand::High),
+                _ => None,
+            },
+        }
+    }
+
+    /// クロスオーバー周波数を読む (`Frequency3` 以外は `None`)。
+    pub fn freq(&self, edge: SplitEdge) -> Option<f32> {
+        match self {
+            Self::None => None,
+            Self::Frequency3 { low_hz, high_hz } => Some(match edge {
+                SplitEdge::LowMid => *low_hz,
+                SplitEdge::MidHigh => *high_hz,
+            }),
+        }
+    }
+
+    /// クロスオーバー `(low_hz, high_hz)`。 `Frequency3` 以外は既定値 (engine が分割器を持つのは
+    /// `Frequency3` のときだけなので、 ここへ来る `None` は snapshot の一時的な不一致)。
+    pub fn freqs_or_default(&self) -> (f32, f32) {
+        match self {
+            Self::Frequency3 { low_hz, high_hz } => (*low_hz, *high_hz),
+            Self::None => Self::DEFAULT_FREQS,
+        }
+    }
+
+    /// 値域へ丸め、 `low_hz <= high_hz` を保つ (load / IPC 境界の正規化)。
+    pub fn sanitize(&mut self) {
+        if let Self::Frequency3 { low_hz, high_hz } = self {
+            let fix = |v: f32, d: f32| if v.is_finite() { SPLIT_FREQ_RANGE.clamp(v) } else { d };
+            *low_hz = fix(*low_hz, Self::DEFAULT_FREQS.0);
+            *high_hz = fix(*high_hz, Self::DEFAULT_FREQS.1);
+            if *low_hz > *high_hz {
+                *high_hz = *low_hz;
+            }
+        }
+    }
+}
+
+/// [`Split::Frequency3`] の帯域 (chain の並び順 = Low / Mid / High)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum SplitBand {
+    Low,
+    Mid,
+    High,
+}
+
+impl SplitBand {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Mid => "Mid",
+            Self::High => "High",
+        }
+    }
+}
+
+/// [`Split::Frequency3`] のクロスオーバー (2 つ)。 automation / IPC の住所。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum SplitEdge {
+    /// Low | Mid の境界 (`low_hz`)。
+    LowMid,
+    /// Mid | High の境界 (`high_hz`)。
+    MidHigh,
+}
+
+/// クロスオーバー周波数の可動範囲 (対数)。 ノブ / automation 正規化 / IPC クランプの SSoT。
+pub const SPLIT_FREQ_RANGE: super::ParamRange = super::ParamRange::Log { lo: 20.0, hi: 20_000.0 };
 
 /// Parallel の中の 1 本の並列 chain。Live の Chain List の 1 行 = Bitwig の layer 1 段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -93,12 +220,39 @@ impl Parallel {
             color: None,
             out_gain: 1.0,
             gain_match: false,
+            split: Split::None,
         }
     }
 
     /// Ungroup (Live と同じ): 全 chain の device を chain 順に直列連結した列を返す。
     pub fn flatten(self) -> Vec<Device> {
         self.chains.into_iter().flat_map(|c| c.devices).collect()
+    }
+
+    /// r.md #112: クロスオーバー周波数を 1 つ書く。 値域へ丸め、 もう片方を押して
+    /// `low_hz <= high_hz` を保つ (Bitwig の分割点と同じく交差しない)。 GUI と engine
+    /// (`song_values`) が同じ規則を通る唯一の口。 `Frequency3` でなければ何もしない。
+    /// 戻り値 = 実際に値が変わったか。
+    pub fn set_split_freq(&mut self, edge: SplitEdge, hz: f32) -> bool {
+        let Split::Frequency3 { low_hz, high_hz } = &mut self.split else {
+            return false;
+        };
+        if !hz.is_finite() {
+            return false;
+        }
+        let hz = SPLIT_FREQ_RANGE.clamp(hz);
+        let before = (*low_hz, *high_hz);
+        match edge {
+            SplitEdge::LowMid => {
+                *low_hz = hz;
+                *high_hz = high_hz.max(hz);
+            }
+            SplitEdge::MidHigh => {
+                *high_hz = hz;
+                *low_hz = low_hz.min(hz);
+            }
+        }
+        (*low_hz, *high_hz) != before
     }
 
     /// chain 追加時の既定名 ("Chain N"、N = 既存最大番号 + 1)。
@@ -666,6 +820,7 @@ mod tests {
             color: None,
             out_gain: 1.0,
             gain_match: false,
+            split: Split::None,
             chains: chains
                 .into_iter()
                 .map(|(cid, devices)| ParallelChain {
@@ -725,6 +880,27 @@ mod tests {
         assert_eq!(plugins(&decoded).map(|p| p.id).collect::<Vec<_>>(), vec![1, 2]);
     }
 
+    /// r.md #112: 旧 JSON (split 無し) は `Split::None`、 `Frequency3` は往復し、 setter が順序を保つ。
+    #[test]
+    fn split_defaults_to_none_roundtrips_and_keeps_edge_order() {
+        let legacy = r#"{"Parallel":{"id":1,"name":"P","chains":[]}}"#;
+        let d: Device = serde_json::from_str(legacy).unwrap();
+        assert_eq!(d.as_parallel().unwrap().split, Split::None);
+
+        let mut r = Parallel::new();
+        r.split = Split::DEFAULT_FREQUENCY3;
+        assert!(r.set_split_freq(SplitEdge::MidHigh, 100.0));
+        assert_eq!(r.split, Split::Frequency3 { low_hz: 100.0, high_hz: 100.0 }, "Mid|High が Low|Mid を押し下げる");
+        assert!(!r.set_split_freq(SplitEdge::MidHigh, 100.0), "同値は変更なし");
+        assert!(r.set_split_freq(SplitEdge::LowMid, 5.0));
+        assert_eq!(r.split.freq(SplitEdge::LowMid), Some(20.0), "値域の下端へ");
+        let json = serde_json::to_string(&Device::Parallel(r.clone())).unwrap();
+        let back: Device = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_parallel().unwrap().split, r.split);
+        let mut plain = Parallel::new();
+        assert!(!plain.set_split_freq(SplitEdge::LowMid, 500.0), "None には効かない");
+    }
+
     #[test]
     fn flatten_concatenates_chains_in_order() {
         let r = Parallel {
@@ -738,6 +914,7 @@ mod tests {
             color: None,
             out_gain: 1.0,
             gain_match: false,
+            split: Split::None,
         };
         let flat: Vec<u64> = r.flatten().iter().map(Device::id).collect();
         assert_eq!(flat, vec![5, 6, 7]);

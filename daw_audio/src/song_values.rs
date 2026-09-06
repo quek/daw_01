@@ -74,6 +74,11 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         AudioCommand::SetParallelGainMatch { parallel_id, on, .. } => {
             with_parallel(song, parallel_id, |r| r.gain_match = on);
         }
+        AudioCommand::SetParallelSplitFreq { parallel_id, edge, hz, .. } => {
+            with_parallel(song, parallel_id, |r| {
+                r.set_split_freq(edge, hz);
+            });
+        }
         AudioCommand::SetSongBpm { bpm } => song.bpm = bpm.clamp(1.0, 400.0),
         AudioCommand::SetSongTimeSigNumerator { num } => song.time_sig.0 = num.clamp(1, 32),
         _ => return false,

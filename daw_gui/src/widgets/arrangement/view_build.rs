@@ -811,6 +811,12 @@ fn lane_target_display(
             icon_glyph: 'V',
             color: Color::rgb(0.42, 0.78, 0.95),
         },
+        // r.md #112: クロスオーバー周波数 (EQ と同じ青緑系 = 周波数の色)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { edge, .. }) => LaneDisplay {
+            label: intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge))),
+            icon_glyph: 'F',
+            color: Color::rgb(0.40, 0.80, 0.75),
+        },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
             label: intern_label("Mute"),
             icon_glyph: 'M',

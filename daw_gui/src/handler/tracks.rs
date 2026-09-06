@@ -418,7 +418,7 @@ impl AppData {
                         *chain_id = nid;
                     }
                 }
-                T::TrackBuiltin(P::ParallelOutGain { parallel_id }) => {
+                T::TrackBuiltin(P::ParallelOutGain { parallel_id } | P::ParallelSplitFreq { parallel_id, .. }) => {
                     if let Some(&nid) = device_remap.get(parallel_id) {
                         *parallel_id = nid;
                     }

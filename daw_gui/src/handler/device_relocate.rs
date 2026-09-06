@@ -644,7 +644,11 @@ fn extract_parallel_bindings(
 ) {
     use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
     extract_bindings(song, track_id, |target| {
-        matches!(target, T::TrackBuiltin(P::ParallelOutGain { parallel_id: p }) if *p == parallel_id)
+        matches!(
+            target,
+            T::TrackBuiltin(P::ParallelOutGain { parallel_id: p } | P::ParallelSplitFreq { parallel_id: p, .. })
+                if *p == parallel_id
+        )
     })
 }
 

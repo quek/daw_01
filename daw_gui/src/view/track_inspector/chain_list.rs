@@ -21,7 +21,7 @@ use crate::app::{
     AppData, AppEvent, ChainEntry, ChainRow, ChainRowKind, ColorPickerTarget, DeviceDragPayload,
     RelocateDevices,
 };
-use crate::handler::parallel::{ChainMixerEdit, ParallelMixerEdit};
+use crate::handler::parallel::ChainMixerEdit;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::widgets::select_modifier::SelectModifier;
@@ -30,7 +30,7 @@ use common::model::{AutomationTarget, ChainRef, TapPoint, TapSource, TrackBuilti
 use super::{device_panel, toggle_audio_style};
 
 /// 行高 (plugin / Parallel 開始 / chain 行)。
-const ROW_H: f32 = 26.0;
+pub(super) const ROW_H: f32 = 26.0;
 /// 操作行 (`+ chain` / `+ Plugin`) と終了行の高さ。
 const OP_ROW_H: f32 = 22.0;
 const END_ROW_H: f32 = 10.0;
@@ -38,8 +38,8 @@ const ROW_GAP: f32 = 3.0;
 /// 深さ 1 段ぶんの色帯の幅 (= インデント)。
 const BAR_W: f32 = 4.0;
 /// chain 行の mixer: ミニ knob と M / S。
-const CHAIN_KNOB: f32 = 18.0;
-const CHAIN_BTN_W: f32 = 18.0;
+pub(super) const CHAIN_KNOB: f32 = 18.0;
+pub(super) const CHAIN_BTN_W: f32 = 18.0;
 /// SC パネル 1 port 行の高さ。
 const SC_PORT_H: f32 = 24.0;
 const SC_PAD: f32 = 6.0;
@@ -47,7 +47,10 @@ const SC_PAD: f32 = 6.0;
 /// 展開状態と行の種類から「この行の高さ」を決める。
 fn base_row_h(kind: &ChainRowKind) -> f32 {
     match kind {
-        ChainRowKind::Plugin(_) | ChainRowKind::ParallelBegin { .. } | ChainRowKind::Chain { .. } => ROW_H,
+        ChainRowKind::Plugin(_)
+        | ChainRowKind::ParallelBegin { .. }
+        | ChainRowKind::SplitParams { .. }
+        | ChainRowKind::Chain { .. } => ROW_H,
         ChainRowKind::AddChain { .. } | ChainRowKind::AddPlugin { .. } => OP_ROW_H,
         ChainRowKind::ParallelEnd { .. } => END_ROW_H,
     }
@@ -500,106 +503,6 @@ fn draw_plugin_row(
     );
 }
 
-/// `╭ Parallel名` 行: 名前 (改名中は text_input) + [x]。
-/// Parallel ヘッダ行の表示情報 (`ChainRowKind::ParallelBegin` の中身)。
-struct ParallelHead<'a> {
-    parallel_id: u64,
-    name: &'a str,
-    bypassed: bool,
-    color: Option<[f32; 3]>,
-    open: bool,
-    out_gain: f32,
-    gain_match: bool,
-}
-
-/// Parallel ヘッダ行: ╭ ▼ 名前 … [out knob] [Match] [x]。 出力 trim と gain match は
-/// 終了行ではなくここ (高さを増やさない)。
-fn draw_parallel_begin_row(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    i: usize,
-    head: &ParallelHead<'_>,
-    row: Rect,
-    popup_open: bool,
-) {
-    let ParallelHead { parallel_id, name, bypassed, color, open, out_gain, gain_match } = *head;
-    let p = &app.theme.core;
-    let btn_x_w = 26.0;
-    let by = row.y + 2.0;
-    let mut right = row.x + row.w - btn_x_w;
-    ui.button_at(
-        ("inspector_parallel_remove", i),
-        "x",
-        Rect { x: right, y: by, w: btn_x_w, h: ROW_H - 4.0 },
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![parallel_id] });
-                }
-            })
-        },
-    );
-    // Match トグル + 出力 trim knob (右から)。
-    let match_w = 44.0;
-    right -= match_w + 2.0;
-    ui.toggle_button_at(
-        ("inspector_parallel_match", i),
-        "Match",
-        Rect { x: right, y: row.y + (ROW_H - CHAIN_BTN_W) * 0.5, w: match_w, h: CHAIN_BTN_W },
-        gain_match,
-        &toggle_audio_style(&app.theme),
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(v) });
-                }
-            })
-        },
-    );
-    if let Some(track_id) = app.cursor_track_id() {
-        let track = app.song_doc.song().track_by_id(track_id);
-        let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id });
-        let live = track.map_or(out_gain, |t| app.live_param_value(t, &target, out_gain));
-        right -= CHAIN_KNOB + 4.0;
-        let was = app.recording.active_param_gestures.contains(&(track_id, target.clone()));
-        let resp = ui.knob_at(
-            ("inspector_parallel_out", i),
-            Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
-            (live * 0.5).clamp(0.0, 1.0),
-            0.5,
-            &KnobStyle { surface: Some(p.panel_raised), ..KnobStyle::UNIPOLAR },
-            move |v| {
-                let gain = v * 2.0;
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(gain) });
-                })
-            },
-            None,
-        );
-        push_param_gesture_edges(ui, track_id, target, "Parallel Out", was, resp.dragging);
-    }
-    // 括弧 (Parallel の色) + 開閉 disclosure + 名前。 折り畳み中は括弧を `╴` にして終了行が無いことを示す。
-    let bracket = if open { "\u{256D}" } else { "\u{2574}" };
-    ui.label_at(("inspector_parallel_bracket", i), bracket, row.x + 2.0, row.y + 7.0, 12.0, rgb_or(color, p.text_dim));
-    draw_disclosure(ui, ("inspector_parallel_disclosure", i), parallel_id, open, row.x + 14.0, row, popup_open, p);
-    let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
-    if let Some((id, buf)) = &app.ui_ephemeral.renaming_chain
-        && *id == parallel_id
-    {
-        draw_rename_input(app, ui, ("inspector_parallel_rename", i), name_rect, buf, move |app, text| {
-            app.handle_event(AppEvent::RenameParallel { parallel_id, name: text });
-        });
-    } else {
-        ui.label_at_clipped(
-            ("inspector_parallel_name", i),
-            name,
-            Rect { x: name_rect.x, y: row.y + 8.0, w: name_rect.w, h: 11.0 * 1.2 },
-            11.0,
-            if bypassed { p.text_faint } else { p.text },
-        );
-    }
-}
-
 /// chain 行: [色] ▶ 名前 / preview 四角 / gain knob / pan knob / M / S / x。
 #[allow(clippy::too_many_arguments)]
 fn draw_chain_row(
@@ -765,7 +668,7 @@ fn draw_chain_row(
 /// Parallel / chain 行の開閉 disclosure (▶ / ▼、`view::disclosure` の規則)。 click で
 /// `ToggleParallelNodeCollapsed { id }`。
 #[allow(clippy::too_many_arguments)]
-fn draw_disclosure(
+pub(super) fn draw_disclosure(
     ui: &mut Ui<'_, AppData>,
     key: (&'static str, usize),
     id: u64,
@@ -797,12 +700,12 @@ fn draw_disclosure(
     );
 }
 
-fn rgb_or(color: Option<[f32; 3]>, fallback: Color) -> Color {
+pub(super) fn rgb_or(color: Option<[f32; 3]>, fallback: Color) -> Color {
     color.map_or(fallback, |rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
 }
 
 /// 改名 text_input (初回 show で focus + 全選択)。 Enter / blur で確定、 Esc で取消。
-fn draw_rename_input(
+pub(super) fn draw_rename_input(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     id: (&'static str, usize),
@@ -1025,10 +928,10 @@ fn draw_row(
             draw_plugin_row(app, ui, i, e, content, popup_open, keys_style);
             draw_plugin_expansions(app, ui, ctx, e.device_id, content);
         }
-        ChainRowKind::ParallelBegin { parallel_id, name, bypassed, color, open, out_gain, gain_match } => {
+        ChainRowKind::ParallelBegin { parallel_id, name, bypassed, color, open, out_gain, gain_match, split } => {
             let selected = app.selection.selected_device_ids.contains(parallel_id);
             draw_row_bg(ui, i, content, selected, hovered, dragging, p);
-            let head = ParallelHead {
+            let head = super::parallel_header::ParallelHead {
                 parallel_id: *parallel_id,
                 name,
                 bypassed: *bypassed,
@@ -1036,8 +939,12 @@ fn draw_row(
                 open: *open,
                 out_gain: *out_gain,
                 gain_match: *gain_match,
+                split: *split,
             };
-            draw_parallel_begin_row(app, ui, i, &head, content, popup_open);
+            super::parallel_header::draw_parallel_begin_row(app, ui, i, &head, content, popup_open);
+        }
+        ChainRowKind::SplitParams { parallel_id, split } => {
+            super::parallel_header::draw_split_row(app, ui, i, *parallel_id, *split, content, popup_open);
         }
         ChainRowKind::Chain { parallel_id, chain_id, name, color, gain, pan, muted, solo, open, n_devices } => {
             let is_sel = app.selection.selected_device_ids.contains(chain_id);

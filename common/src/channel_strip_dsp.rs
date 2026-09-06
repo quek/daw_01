@@ -81,6 +81,17 @@ impl Biquad {
         )
     }
 
+    /// 2 次オールパス (振幅 0 dB、位相だけ回す)。 r.md #112 の帯域分割で、 上側クロスオーバー
+    /// の位相回転を低域にも与えて 3 帯域の和を平坦にするために使う: Butterworth 2 次の
+    /// `LP² + HP²` は同じ ω0 / Q のこのオールパスに等しい (Linkwitz-Riley)。
+    #[must_use]
+    pub fn all_pass(sample_rate: f32, freq_hz: f32, q: f32) -> Self {
+        let Some((c, alpha, _)) = Self::prep(sample_rate, freq_hz, q) else {
+            return Self::IDENTITY;
+        };
+        Self::normalized(1.0 - alpha, -2.0 * c, 1.0 + alpha, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+    }
+
     /// ピーク利得 0 dB のバンドパス (検出フィルタ用)。
     #[must_use]
     pub fn band_pass(sample_rate: f32, freq_hz: f32, q: f32) -> Self {

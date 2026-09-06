@@ -59,6 +59,10 @@ pub(super) fn resolve_tap_buffers<'a>(
             let r = program_of(owner)?.parallels.get(slot as usize)?;
             (r.in_l.as_slice(), r.in_r.as_slice())
         }
+        BufRef::ParallelBand { owner, slot, band } => {
+            let r = program_of(owner)?.parallels.get(slot as usize)?;
+            r.split.as_deref()?.band(band)
+        }
         _ => return None,
     })
 }

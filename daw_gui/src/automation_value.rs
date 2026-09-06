@@ -209,6 +209,14 @@ pub fn automation_value_display(
                 from_display: id,
             }
         }
+        // r.md #112: クロスオーバー周波数 (Hz、 対数、 レンジの SSoT は `SPLIT_FREQ_RANGE`)。
+        T::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => AutomationValueDisplay {
+            unit: "Hz",
+            format: ScrubableNumberFormat::Significant { digits: 3 },
+            range: common::model::SPLIT_FREQ_RANGE.display_range(),
+            to_display: id,
+            from_display: id,
+        },
         T::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
             use common::model::EqParam;
             let (unit, format) = match param {

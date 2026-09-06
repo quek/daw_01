@@ -27,6 +27,9 @@ pub fn automation_target_display_name(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id }) => {
             format!("Parallel {parallel_id} Out")
         }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge }) => {
+            format!("Parallel {parallel_id} Split {}", split_edge_label(*edge))
+        }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id, .. }) => {
             // v29: 安定 send id (1 始まり)。 位置ベースの連番表示は S3b で
             // 「track の sends 内位置」 を引く形に戻す予定 (ここは song 非依存
@@ -119,5 +122,13 @@ pub fn automation_target_display_name(
         AutomationTarget::ModRoutingDepth { routing_id } => {
             format!("変調 #{routing_id} の深さ")
         }
+    }
+}
+
+/// r.md #112: クロスオーバー境界の短い表記 (lane ラベル / gesture 名で共有)。
+pub fn split_edge_label(edge: common::model::SplitEdge) -> &'static str {
+    match edge {
+        common::model::SplitEdge::LowMid => "Low|Mid",
+        common::model::SplitEdge::MidHigh => "Mid|High",
     }
 }

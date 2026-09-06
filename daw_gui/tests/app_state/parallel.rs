@@ -85,6 +85,7 @@ fn chain_rows_put_each_open_chains_devices_under_its_row() {
         .map(|r| match &r.kind {
             ChainRowKind::Plugin(e) => format!("P{}", e.device_id),
             ChainRowKind::ParallelBegin { parallel_id, .. } => format!("RB{parallel_id}"),
+            ChainRowKind::SplitParams { parallel_id, .. } => format!("S{parallel_id}"),
             ChainRowKind::Chain { chain_id, open, .. } => {
                 format!("C{chain_id}{}", if *open { "*" } else { "" })
             }
@@ -265,5 +266,90 @@ fn parallel_out_gain_and_gain_match_update_song_and_send_value_only_commands() {
     assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
     // 同じ値をもう一度 → 何も送らない。
     app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) });
+    assert!(super::support::drain(&mut audio_rx).is_empty());
+}
+
+/// r.md #112: 帯域分割 on で chain が 3 本に補われ (既存は据え置き、 補った chain は帯域名)、
+/// Split の param 行がヘッダ直下に出る。 off に戻しても chain は残る。
+#[test]
+fn enabling_frequency_split_pads_chains_to_three_and_shows_the_split_row() {
+    use common::model::Split;
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let (_track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+
+    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.split, Split::Frequency3 { low_hz: 200.0, high_hz: 2_000.0 });
+    assert_eq!(
+        r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["Chain 1", "Mid", "High"],
+        "既存 chain は据え置き、 足りない帯域ぶんだけ帯域名で補う"
+    );
+    assert_eq!(r.chains[0].devices.len(), 1, "既存 chain の中身はそのまま");
+    assert!(r.chains.iter().all(|c| c.id != 0), "補った chain も採番済み");
+    let kinds: Vec<String> = app
+        .chain_rows()
+        .iter()
+        .map(|r| match &r.kind {
+            ChainRowKind::ParallelBegin { .. } => "RB".to_string(),
+            ChainRowKind::SplitParams { split: Split::Frequency3 { .. }, .. } => "SPLIT".to_string(),
+            ChainRowKind::Chain { name, .. } => format!("C:{name}"),
+            _ => "-".to_string(),
+        })
+        .filter(|k| k != "-")
+        .collect();
+    assert_eq!(kinds, vec!["RB", "SPLIT", "C:Chain 1", "C:Mid", "C:High"], "param 行はヘッダ直下");
+
+    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::None });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.split, Split::None);
+    assert_eq!(r.chains.len(), 3, "off に戻しても chain は消さない");
+    assert!(!app.chain_rows().iter().any(|r| matches!(r.kind, ChainRowKind::SplitParams { .. })));
+}
+
+/// r.md #112: クロスオーバーは値のみ IPC (再 compile なし)。 交差させると相手側が押される。
+#[test]
+fn split_frequency_edits_keep_order_and_send_value_only_commands() {
+    use common::model::{Split, SplitEdge};
+    use common::protocol::AudioCommand;
+    use daw_gui::handler::parallel::ParallelMixerEdit;
+    let (mut app, mut audio_rx, _plugin_rx, _proxy) = build_app();
+    let (track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 });
+    let _ = super::support::drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::SetParallelMixer {
+        parallel_id,
+        edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::LowMid, hz: 3_000.0 },
+    });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.split, Split::Frequency3 { low_hz: 3_000.0, high_hz: 3_000.0 }, "Low|Mid が Mid|High を押し上げる");
+    let cmds = super::support::drain(&mut audio_rx);
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            AudioCommand::SetParallelSplitFreq { track, parallel_id: p, edge: SplitEdge::LowMid, hz }
+                if *track == track_id && *p == parallel_id && *hz == 3_000.0
+        )),
+        "{cmds:?}"
+    );
+    assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
+
+    // 値域外は端へ。 同じ値をもう一度 → 何も送らない。
+    app.handle_event(AppEvent::SetParallelMixer {
+        parallel_id,
+        edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::MidHigh, hz: 99_999.0 },
+    });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.split.freq(SplitEdge::MidHigh), Some(20_000.0));
+    let _ = super::support::drain(&mut audio_rx);
+    app.handle_event(AppEvent::SetParallelMixer {
+        parallel_id,
+        edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::MidHigh, hz: 20_000.0 },
+    });
     assert!(super::support::drain(&mut audio_rx).is_empty());
 }

@@ -9,6 +9,7 @@ mod chain_sections;
 mod device_panel;
 /// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
 mod launch_section;
+mod parallel_header;
 mod modulation_rack;
 
 use daw_ui_core::{Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui};

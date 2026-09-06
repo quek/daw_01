@@ -49,6 +49,8 @@ pub enum BufRef {
     ChainPostFader { owner: u32, slot: u32 },
     /// 同 program の Parallel `slot` の入力 (= その Parallel の全 chain の `PreFx`)。
     ParallelInput { owner: u32, slot: u32 },
+    /// r.md #112: 同 program の Parallel `slot` の帯域分割出力 `band` (= band chain の `PreFx`)。
+    ParallelBand { owner: u32, slot: u32, band: common::model::SplitBand },
 }
 
 /// `BufRef::Chain* { owner }` / `ParallelInput { owner }` で master program を指す sentinel。

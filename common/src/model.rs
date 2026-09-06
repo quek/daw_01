@@ -1489,6 +1489,8 @@ impl Song {
         for_each_chain_mut(&mut self.master_fx_chain, &mut fix_chain);
         let mut fix_parallel = |r: &mut Parallel| {
             r.out_gain = if r.out_gain.is_finite() { r.out_gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
+            // r.md #112: クロスオーバーも RT がそのまま係数に使う。
+            r.split.sanitize();
         };
         for t in &mut self.tracks {
             for_each_parallel_mut(&mut t.devices, &mut fix_parallel);

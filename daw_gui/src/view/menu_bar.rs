@@ -93,6 +93,9 @@ fn recent_open_item<'a>(
     });
 }
 
+/// File メニュー先頭に cascade なしで直接並べる「最近保存した」件数 (r.md #111)。
+const RECENT_SAVED_INLINE: usize = 3;
+
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
 /// `Ui<'a, AppData>` の `'a` は `&AppData` borrow 寿命と同一なので、
 /// `app: &'a AppData` を明示して menu の dynamic label (= `&app.ui_prefs.recent_files_labels[i]`)
@@ -125,16 +128,18 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     shortcut_hint: None,
                 });
             } else {
-                // r.md #95: 最後に保存したファイル (= Recently Saved の 1 件目) を
-                // sub menu の **さらに上**に直接開ける 1 行として置く。cascade を
-                // 開かずに 1 click で前回の続きへ戻る導線。label / path / click 経路は
-                // すべて sub menu の 1 件目と同一 (`recent_open_item`) で、別経路を
+                // r.md #95 / #111: 直近に保存したファイル (= Recently Saved の先頭
+                // `RECENT_SAVED_INLINE` 件) を sub menu の **さらに上**に直接開ける行として
+                // 置く。cascade を開かずに 1 click で前回の続きへ戻る導線。label / path /
+                // click 経路はすべて sub menu と同一 (`recent_open_item`) で、別経路を
                 // 作らない。空のときはこの行を出さず、上の disabled 表示だけにする
                 // (empty 表示が二重にならないように)。
-                if let (Some(label), Some(path)) = (
-                    app.ui_prefs.recent_saved_labels.first(),
-                    app.ui_prefs.recent_saved.paths.first(),
-                ) {
+                for (label, path) in app
+                    .ui_prefs.recent_saved_labels
+                    .iter()
+                    .zip(app.ui_prefs.recent_saved.paths.iter())
+                    .take(RECENT_SAVED_INLINE)
+                {
                     recent_open_item(m, label, path);
                 }
                 m.sub_menu("Recently Saved", |sub| {
