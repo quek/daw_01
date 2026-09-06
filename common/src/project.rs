@@ -658,7 +658,7 @@ fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
             .iter()
             .any(|c| text_content_ids.contains(&c.content_id));
         if has_text_clip && !track.has_subtitle_device() {
-            track.devices.push(crate::model::PluginInstance::with_ports(
+            track.devices.push(crate::model::Device::Plugin(crate::model::PluginInstance::with_ports(
                 crate::plugin_db::SUBTITLE_ID.to_string(),
                 crate::plugin_format::PluginFormat::Builtin,
                 crate::port_config::PortConfig {
@@ -666,7 +666,7 @@ fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
                     has_video_output: true,
                     ..Default::default()
                 },
-            ));
+            )));
         }
     }
 }
@@ -932,6 +932,7 @@ mod tests {
             launcher_width: 420.0,
             launcher_scene_col_w: 96.0,
             launcher_scroll_scene: 2.5,
+            collapsed_parallel_nodes: vec![11],
         }
     }
 
@@ -1332,7 +1333,7 @@ mod tests {
         let mut song = song_with_one_text_clip();
         song.tracks[0]
             .devices
-            .push(crate::model::PluginInstance::with_ports(
+            .push(crate::model::Device::Plugin(crate::model::PluginInstance::with_ports(
                 crate::plugin_db::SUBTITLE_ID.to_string(),
                 crate::plugin_format::PluginFormat::Builtin,
                 crate::port_config::PortConfig {
@@ -1340,12 +1341,11 @@ mod tests {
                     has_video_output: true,
                     ..Default::default()
                 },
-            ));
+            )));
         write_project_with_version(&path, &song, 25);
         let loaded = load(&path).unwrap();
         let n = loaded.tracks[0]
-            .devices
-            .iter()
+            .plugins()
             .filter(|d| d.plugin_id == crate::plugin_db::SUBTITLE_ID)
             .count();
         assert_eq!(n, 1, "字幕デバイスは二重挿入されない");
@@ -1380,7 +1380,7 @@ mod tests {
             ..Track::default()
         };
         // VOICEVOX builtin (instrument: note_in → audio_out)。= is_voicevox_vocal。
-        track.devices.push(PluginInstance::with_ports(
+        track.devices.push(crate::model::Device::Plugin(PluginInstance::with_ports(
             crate::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
             crate::plugin_format::PluginFormat::Builtin,
             PortConfig {
@@ -1388,7 +1388,7 @@ mod tests {
                 has_audio_output: true,
                 ..Default::default()
             },
-        ));
+        )));
         track.clips.push(Clip {
             id: 1,
             start_beat: 0.0,

@@ -115,6 +115,10 @@ pub struct ViewState {
     /// ランチャー帯の横スクロール位置 (列数、小数可)。
     #[serde(default)]
     pub launcher_scroll_scene: f32,
+    /// r.md #110: 折り畳んでいる Parallel / chain の id (既定は展開、閉じたものだけ持つ)。
+    /// 「見方の都合」 なので dirty は立てないが保存する。 save 時に sort、消えた id は落とす。
+    #[serde(default)]
+    pub collapsed_parallel_nodes: Vec<u64>,
 }
 
 /// `ViewState.bottom_panel` の serde 既定値 (フィールドが無い旧ファイル = Mixer を開く)。

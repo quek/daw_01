@@ -38,6 +38,20 @@ impl AppData {
         if !keep_open {
             self.ui_ephemeral.is_plugin_picker_open = false;
         }
+        // r.md #110: 「Parallel」 は plugin ではなく container。 picker を開いた chain の末尾に
+        // 空 Parallel (chain 1 本) を挿す。
+        if id == common::plugin_db::PARALLEL_PICKER_ID {
+            self.ensure_first_track();
+            let Some(track_id) = self.cursor_track_id() else { return };
+            let dest = self
+                .ui_ephemeral
+                .plugin_picker_target
+                .filter(|c| self.song_doc.song().chain_devices(*c).is_some())
+                .unwrap_or(common::model::ChainRef::Track(track_id));
+            let at = self.song_doc.song().chain_devices(dest).map_or(0, Vec::len) as u32;
+            self.handle_event(AppEvent::AddParallel { chain: dest, index: at });
+            return;
+        }
         let Some(db) = self.ipc.plugin_db.clone() else {
             tracing::warn!(id, "plugin_db not available");
             return;
@@ -89,13 +103,24 @@ impl AppData {
             id: device_id,
             ..common::model::PluginInstance::with_ports(entry_id, entry_format, ports)
         };
+        // r.md #110: 挿入先は picker を開いた chain (`+ Plugin` の行が指す chain)。
+        // 無指定 / 消えていれば cursor track の top-level 末尾。
+        let dest = self
+            .ui_ephemeral
+            .plugin_picker_target
+            .filter(|c| self.song_doc.song().chain_devices(*c).is_some())
+            .unwrap_or(common::model::ChainRef::Track(track_id));
         if is_master {
-            self.edit_song(|song| song.master_fx_chain.push(new_device));
+            self.edit_song(move |song| {
+                let at = song.chain_devices(dest).map_or(0, Vec::len);
+                song.insert_device(dest, at, common::model::Device::Plugin(new_device));
+            });
         } else if let Some(track_idx) = self.cursor_track_index() {
             self.edit_song(move |song| {
-            let track = &mut song.tracks[track_idx];
             let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
-            track.devices.push(new_device);
+            let at = song.chain_devices(dest).map_or(0, Vec::len);
+            song.insert_device(dest, at, common::model::Device::Plugin(new_device));
+            let track = &mut song.tracks[track_idx];
             // Transform 配置 device を刺したら group_transform を有効化
             // (resolve_track_transform は device-gate + group_transform 値。未初期化なら
             // identity 配置で no-op になり、inspector で編集を始められない)。
@@ -806,10 +831,7 @@ impl AppData {
             self.ui_ephemeral.plugin_picker_entries.clear();
             return;
         };
-        let mut v: Vec<PluginPickEntry> =
-            db.entries.iter().map(PluginPickEntry::from_db_entry).collect();
-        v.sort_by_key(|e| e.name.to_lowercase());
-        self.ui_ephemeral.plugin_picker_entries = v;
+        self.ui_ephemeral.plugin_picker_entries = PluginPickEntry::build_all(db);
     }
 
     pub(crate) fn refresh_picker_visible(&mut self) {

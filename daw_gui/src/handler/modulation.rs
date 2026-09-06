@@ -517,8 +517,9 @@ impl AppData {
         });
     }
 
-    pub(crate) fn set_mod_source_track(&mut self, id: u32, source_track: u32) {
-        self.edit_mod_source_follower(id, |tap, _| tap.source_track = source_track);
+    /// r.md #110: follower の source は track か同 track の Parallel 内 chain。
+    pub(crate) fn set_mod_source_tap_source(&mut self, id: u32, source: common::model::TapSource) {
+        self.edit_mod_source_follower(id, |tap, _| tap.source = source);
     }
 
     pub(crate) fn set_mod_source_attack(&mut self, id: u32, ms: f32) {
@@ -616,11 +617,15 @@ impl AppData {
         tap_point: common::model::TapPoint,
     ) {
         self.edit_song(|song| {
-            if let Some(inst) = device_mut_by_id(song, device_id)
+            let owner = song.device_owner_track(device_id);
+            if let Some(inst) = song.plugin_by_id_mut(device_id)
                 && let Some(route) = inst
                     .aux_inputs
                     .get_mut(port as usize)
                     .and_then(|o| o.as_mut())
+                // 自 track を source にする route は Pre-FX 固定 (他は feedback)。
+                && !(matches!(route.tap.source, common::model::TapSource::Track(t) if Some(t) == owner)
+                    && tap_point != common::model::TapPoint::PreFx)
             {
                 route.tap.tap_point = tap_point;
             }

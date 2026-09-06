@@ -399,10 +399,9 @@ fn source_label_short(song: &common::model::Song, source: SamplerSource) -> Stri
     match source {
         SamplerSource::Master => "Master".to_string(),
         SamplerSource::Track(tap) => {
-            let name = song
-                .tracks
-                .iter()
-                .find(|t| t.id == tap.source_track)
+            let name = tap
+                .source_track()
+                .and_then(|id| song.track_by_id(id))
                 .map(|t| t.name.as_str())
                 .unwrap_or("Track");
             let safe: String = name

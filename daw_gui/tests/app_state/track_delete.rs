@@ -483,7 +483,7 @@ fn deferred_delete_captures_plugin_state_before_removing() {
         .track_by_id(target_id)
         .expect("undo でトラックが戻る");
     assert_eq!(
-        restored.devices[0].state.as_deref(),
+        restored.devices[0].as_plugin().unwrap().state.as_deref(),
         Some(b"knob-turned".as_slice()),
         "削除直前の plugin state が undo で復元される"
     );

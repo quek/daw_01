@@ -336,8 +336,7 @@ impl AppData {
     /// load 確認)。
     pub fn voicevox_plugin_id_for_track(&self, track: &common::model::Track) -> Option<u64> {
         track
-            .devices
-            .iter()
+            .plugins()
             .find(|d| {
                 d.format == PluginFormat::Builtin
                     && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX

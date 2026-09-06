@@ -346,27 +346,15 @@ impl AppData {
             {
                 let mut device_remap: std::collections::HashMap<u64, u64> =
                     std::collections::HashMap::new();
-                for dev in &mut t.devices {
+                // r.md #110: plugin / Parallel / chain の id 全部を振り直す。
+                common::model::for_each_node_id_mut(&mut t.devices, &mut |id| {
                     let new_id = song.alloc_device_id();
-                    if dev.id != 0 {
-                        device_remap.insert(dev.id, new_id);
+                    if *id != 0 {
+                        device_remap.insert(*id, new_id);
                     }
-                    dev.id = new_id;
-                }
-                let remap_target = |target: &mut common::model::AutomationTarget| {
-                    if let common::model::AutomationTarget::PluginParam { device_id, .. } =
-                        target
-                        && let Some(&nid) = device_remap.get(device_id)
-                    {
-                        *device_id = nid;
-                    }
-                };
-                for lane in &mut t.automation_lanes {
-                    remap_target(&mut lane.target);
-                }
-                for r in &mut t.mod_routings {
-                    remap_target(&mut r.target);
-                }
+                    *id = new_id;
+                });
+                Self::remap_pasted_device_refs(&mut t, &device_remap);
             }
             Self::resolve_pasted_aux_refs(song, &track_remap, same_project, &mut t);
             t.lipsync_target_track = match t.lipsync_target_track {
@@ -410,6 +398,47 @@ impl AppData {
     /// 規約は sends / lipsync と同じ: 集合内なら新 id へ、集合外は `same_project` で
     /// 実在するときだけ据え置き、それ以外は route ごと落とす (入力側は source が
     /// 生き残るなら `tap_point` をそのまま保つ)。
+    /// [`Self::build_pasted_tracks`] step 3.5: 複製した device / chain の新 id へ、track 内の
+    /// automation lane / mod routing / 同 track chain を指す sidechain を貼り替える。
+    fn remap_pasted_device_refs(
+        t: &mut common::model::Track,
+        device_remap: &std::collections::HashMap<u64, u64>,
+    ) {
+        let remap_target = |target: &mut common::model::AutomationTarget| {
+            use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
+            match target {
+                T::PluginParam { device_id, .. } => {
+                    if let Some(&nid) = device_remap.get(device_id) {
+                        *device_id = nid;
+                    }
+                }
+                // r.md #110: chain の gain / pan lane も複製後の chain id へ。
+                T::TrackBuiltin(P::ChainGain { chain_id } | P::ChainPan { chain_id }) => {
+                    if let Some(&nid) = device_remap.get(chain_id) {
+                        *chain_id = nid;
+                    }
+                }
+                _ => {}
+            }
+        };
+        for lane in &mut t.automation_lanes {
+            remap_target(&mut lane.target);
+        }
+        for r in &mut t.mod_routings {
+            remap_target(&mut r.target);
+        }
+        // r.md #110: 同 track の chain を source にする sidechain も複製後の chain id へ。
+        common::model::for_each_plugin_mut(&mut t.devices, &mut |dev| {
+            for route in dev.aux_inputs.iter_mut().flatten() {
+                if let common::model::TapSource::Chain(c) = &mut route.tap.source
+                    && let Some(&nid) = device_remap.get(c)
+                {
+                    *c = nid;
+                }
+            }
+        });
+    }
+
     fn resolve_pasted_aux_refs(
         song: &common::model::Song,
         track_remap: &std::collections::HashMap<u32, u32>,
@@ -422,11 +451,31 @@ impl AppData {
             }
             (same_project && song.track_by_id(old).is_some()).then_some(old)
         };
-        for dev in &mut t.devices {
+        // 集合内 (= この track の Parallel) の chain id。 closure が `t.devices` を可変借用する
+        // 前に集めておく。
+        let own_chains: std::collections::HashSet<u64> = {
+            let mut v = std::collections::HashSet::new();
+            common::model::for_each_chain(&t.devices, &mut |_, c| {
+                v.insert(c.id);
+            });
+            v
+        };
+        // chain source: 集合内の chain は既に新 id へ貼り替え済み (呼び出し側)。
+        // 集合外は同一プロジェクトで実在するときだけ据え置き。
+        let resolve_tap = |src: common::model::TapSource| -> Option<common::model::TapSource> {
+            match src {
+                common::model::TapSource::Track(t) => resolve(t).map(common::model::TapSource::Track),
+                common::model::TapSource::Chain(c) => {
+                    (own_chains.contains(&c) || (same_project && song.chain_by_id(c).is_some()))
+                        .then_some(src)
+                }
+            }
+        };
+        common::model::for_each_plugin_mut(&mut t.devices, &mut |dev| {
             for slot in &mut dev.aux_inputs {
                 let Some(route) = slot else { continue };
-                match resolve(route.tap.source_track) {
-                    Some(new) => route.tap.source_track = new,
+                match resolve_tap(route.tap.source) {
+                    Some(src) => route.tap.source = src,
                     None => *slot = None,
                 }
             }
@@ -437,7 +486,7 @@ impl AppData {
                     None => *slot = None,
                 }
             }
-        }
+        });
     }
 
     /// [`Self::build_pasted_tracks`] step 4: 貼り付け集合の **変調参照**を解決する。

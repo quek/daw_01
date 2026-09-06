@@ -106,7 +106,7 @@ pub fn select_track_single(app: &mut AppData, idx: usize) {
 pub fn load_instrument(app: &mut AppData) {
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -141,6 +141,7 @@ pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str
         // None でロードしたのと等価)。
         state_load_error: None,
         aux_output_count: 0,
+        aux_input_count: 0,
         generation,
     }));
     device_id

@@ -1,0 +1,240 @@
+//! r.md #110 (`docs/plan_parallel.md` §7): Parallel の GUI 側 — Group / Ungroup / chain 追加・削除 /
+//! Parallel 内 chain への運搬 / chain rows の flatten / sidechain の chain source。
+
+use common::model::{ChainRef, Device, TapPoint, TapSource};
+use common::protocol::PluginEvent;
+use daw_gui::app::{AppData, AppEvent, ChainRowKind, RelocateDevices};
+
+use super::support::{build_app, fake_plugin_loaded, select_track_single};
+
+/// track 0 に [synth, bitcrush, delay] を picker 経由で載せて load 完了まで進める。
+fn setup_chain(app: &mut AppData) -> (u32, [u64; 3]) {
+    let track_id = app.song_doc.song().tracks[0].id;
+    select_track_single(app, 0);
+    let mut ids = [0u64; 3];
+    for (i, pid) in ["test.synth", "test.bitcrush", "test.delay"].iter().enumerate() {
+        app.handle_event(AppEvent::OpenPluginPicker { chain: None });
+        app.handle_event(AppEvent::SelectPluginFromDb {
+            id: (*pid).into(),
+            keep_open: false,
+            open_gui: false,
+        });
+        ids[i] = fake_plugin_loaded(app, track_id, i as u32, pid);
+    }
+    (track_id, ids)
+}
+
+fn flush_states(app: &mut AppData) {
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
+}
+
+fn plugin_ids_in_order(app: &AppData) -> Vec<String> {
+    app.song_doc.song().tracks[0]
+        .plugins()
+        .map(|p| p.plugin_id.clone())
+        .collect()
+}
+
+#[test]
+fn group_wraps_selected_devices_into_a_parallel_and_ungroup_restores_them() {
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let (_track_id, [synth, bitcrush, delay]) = setup_chain(&mut app);
+
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush, delay] });
+    let song = app.song_doc.song();
+    let devices = &song.tracks[0].devices;
+    assert_eq!(devices.len(), 2, "synth + Parallel");
+    assert_eq!(devices[0].id(), synth);
+    let parallel = devices[1].as_parallel().expect("2 つ目は Parallel");
+    assert_eq!(parallel.chains.len(), 1);
+    assert_eq!(
+        parallel.chains[0].devices.iter().map(Device::id).collect::<Vec<_>>(),
+        vec![bitcrush, delay],
+        "選んだ device が chain 1 本に順序どおり入る"
+    );
+    assert_ne!(parallel.id, 0);
+    assert_ne!(parallel.chains[0].id, 0);
+    // 信号順は変わらない。
+    assert_eq!(plugin_ids_in_order(&app), vec!["test.synth", "test.bitcrush", "test.delay"]);
+
+    let parallel_id = parallel.id;
+    app.handle_event(AppEvent::UngroupParallel { parallel_id });
+    let devices = &app.song_doc.song().tracks[0].devices;
+    assert_eq!(
+        devices.iter().map(Device::id).collect::<Vec<_>>(),
+        vec![synth, bitcrush, delay],
+        "Ungroup で直列に戻る (id は据え置き)"
+    );
+}
+
+#[test]
+fn chain_rows_put_each_open_chains_devices_under_its_row() {
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let (track_id, [synth, bitcrush, delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+    app.handle_event(AppEvent::AddParallelChain { parallel_id });
+    let (chain_a, chain_b) = {
+        let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+        (r.chains[0].id, r.chains[1].id)
+    };
+    // 既定は全 chain 展開: 各 chain の中身はその chain 行の直下、`+ chain` は一番下。
+    let rows = app.chain_rows();
+    let kinds: Vec<String> = rows
+        .iter()
+        .map(|r| match &r.kind {
+            ChainRowKind::Plugin(e) => format!("P{}", e.device_id),
+            ChainRowKind::ParallelBegin { parallel_id, .. } => format!("RB{parallel_id}"),
+            ChainRowKind::Chain { chain_id, open, .. } => {
+                format!("C{chain_id}{}", if *open { "*" } else { "" })
+            }
+            ChainRowKind::AddChain { .. } => "+c".into(),
+            ChainRowKind::AddPlugin { chain } => match chain {
+                ChainRef::Track(_) => "+pT".into(),
+                ChainRef::Chain(c) => format!("+p{c}"),
+            },
+            ChainRowKind::ParallelEnd { .. } => "RE".into(),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            format!("P{synth}"),
+            format!("RB{parallel_id}"),
+            format!("C{chain_a}*"),
+            format!("P{bitcrush}"),
+            format!("+p{chain_a}"),
+            format!("C{chain_b}*"),
+            format!("+p{chain_b}"),
+            "+c".to_string(),
+            "RE".to_string(),
+            format!("P{delay}"),
+            "+pT".to_string(),
+        ],
+    );
+    // A を閉じると bitcrush の行が消え、B は開いたまま。 もう一度で戻る。
+    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: chain_a });
+    let rows = app.chain_rows();
+    assert!(!rows.iter().any(|r| matches!(&r.kind, ChainRowKind::Plugin(e) if e.device_id == bitcrush)));
+    assert!(rows.iter().any(|r| matches!(&r.kind, ChainRowKind::AddPlugin { chain: ChainRef::Chain(c) } if *c == chain_b)));
+    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: chain_a });
+    assert_eq!(app.chain_rows().iter().filter(|r| matches!(r.kind, ChainRowKind::Plugin(_))).count(), 3);
+    // Parallel ごと畳むと開始行 1 本だけ (chain 行も終了行も無い)。
+    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: parallel_id });
+    let rows = app.chain_rows();
+    assert!(rows.iter().any(|r| matches!(&r.kind, ChainRowKind::ParallelBegin { open: false, .. })));
+    assert!(!rows.iter().any(|r| matches!(r.kind, ChainRowKind::Chain { .. } | ChainRowKind::ParallelEnd { .. })));
+    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: parallel_id });
+    // 自動色: Parallel と chain、兄弟 chain、入れ子の Parallel / chain がそれぞれ別の色。
+    let (rc, ca, cb) = {
+        let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+        (r.color.expect("parallel color"), r.chains[0].color.expect("chain color"), r.chains[1].color.expect("chain color"))
+    };
+    assert!(rc != ca && rc != cb && ca != cb, "{rc:?} {ca:?} {cb:?}");
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let inner = app.song_doc.song().chain_by_id(chain_a).unwrap().1.devices[0].as_parallel().unwrap().clone();
+    let (irc, ica) = (inner.color.unwrap(), inner.chains[0].color.unwrap());
+    assert!(![rc, ca].contains(&irc) && ![rc, ca, irc].contains(&ica), "入れ子は外側と別の色: {irc:?} {ica:?}");
+    let _ = track_id;
+}
+
+#[test]
+fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let (track_id, [synth, bitcrush, delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+    let chain_id = app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
+
+    // delay を chain の中 (bitcrush の後ろ) へ。
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![delay],
+        dest: ChainRef::Chain(chain_id),
+        dest_index: 1,
+        copy: false,
+    }));
+    flush_states(&mut app);
+    let song = app.song_doc.song();
+    assert_eq!(song.tracks[0].devices.len(), 2, "top-level は synth + Parallel");
+    let chain = song.chain_by_id(chain_id).unwrap().1;
+    assert_eq!(chain.devices.iter().map(Device::id).collect::<Vec<_>>(), vec![bitcrush, delay]);
+    assert_eq!(song.find_device(delay), Some((ChainRef::Chain(chain_id), 1)));
+
+    // Parallel ごと top-level 先頭へ (synth の前)。
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![parallel_id],
+        dest: ChainRef::Track(track_id),
+        dest_index: 0,
+        copy: false,
+    }));
+    flush_states(&mut app);
+    let ids: Vec<u64> = app.song_doc.song().tracks[0].devices.iter().map(Device::id).collect();
+    assert_eq!(ids, vec![parallel_id, synth]);
+    assert_eq!(plugin_ids_in_order(&app), vec!["test.bitcrush", "test.delay", "test.synth"]);
+
+    // Parallel を自分の中の chain へは落とせない (循環)。
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![parallel_id],
+        dest: ChainRef::Chain(chain_id),
+        dest_index: 0,
+        copy: false,
+    }));
+    flush_states(&mut app);
+    let ids: Vec<u64> = app.song_doc.song().tracks[0].devices.iter().map(Device::id).collect();
+    assert_eq!(ids, vec![parallel_id, synth], "自分の中への移動は無視される");
+}
+
+#[test]
+fn removing_a_chain_unloads_its_plugins_and_keeps_the_parallel() {
+    let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
+    let (_track_id, [_synth, bitcrush, delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush, delay] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+    app.handle_event(AppEvent::AddParallelChain { parallel_id });
+    let chain_a = app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
+    let _ = super::support::drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![chain_a] });
+    flush_states(&mut app);
+    let song = app.song_doc.song();
+    let parallel = song.parallel_by_id(parallel_id).expect("Parallel 自体は残る");
+    assert_eq!(parallel.chains.len(), 1, "chain A が消えて B だけ");
+    assert!(song.plugin_by_id(bitcrush).is_none() && song.plugin_by_id(delay).is_none());
+    let msgs = super::support::drain(&mut plugin_rx);
+    let removed: Vec<u64> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            common::protocol::PluginCommand::RemoveSlotPlugin { device_id } => Some(*device_id),
+            _ => None,
+        })
+        .collect();
+    assert!(removed.contains(&bitcrush) && removed.contains(&delay), "中の plugin は host からも外す: {msgs:?}");
+}
+
+#[test]
+fn sidechain_source_can_be_a_chain_of_the_same_track() {
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let (_track_id, [_synth, bitcrush, delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+    let chain_a = app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
+    // 候補に 「Parallel / Chain 1」 が出る。
+    let choices = app.sidechain_source_choices();
+    assert!(
+        choices.iter().any(|c| c.source == Some(TapSource::Chain(chain_a))),
+        "chain が source 候補に並ぶ: {choices:?}"
+    );
+    app.handle_event(AppEvent::SetSidechainSource {
+        device_id: delay,
+        port: 0,
+        source: Some(TapSource::Chain(chain_a)),
+    });
+    app.handle_event(AppEvent::SetAuxInputTapPoint { device_id: delay, port: 0, tap_point: TapPoint::PostFx });
+    let p = app.song_doc.song().plugin_by_id(delay).unwrap();
+    let tap = p.aux_inputs[0].unwrap().tap;
+    assert_eq!(tap.source, TapSource::Chain(chain_a));
+    assert_eq!(tap.tap_point, TapPoint::PostFx);
+    // 旧 JSON 互換: track source は `source_track`、chain source は `source_chain` で保存される。
+    let json = serde_json::to_string(&tap).unwrap();
+    assert!(json.contains("\"source_chain\""), "{json}");
+}

@@ -33,6 +33,7 @@ pub mod modulation;
 pub mod note_selection;
 pub mod notes;
 pub mod project;
+pub mod parallel;
 pub mod range_ops;
 pub mod save_bundle;
 pub mod selection_view;

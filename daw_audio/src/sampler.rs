@@ -128,7 +128,8 @@ impl SamplerRt {
         }
         let Some(rig) = rig else { return };
         let SamplerSource::Track(tap) = rig.source else { return };
-        let Some(idx) = song.and_then(|s| track_index(s, tap.source_track)) else { return };
+        // r.md #110: chain source は Global Sampler の対象外 (picker が track だけを出す)。
+        let Some(idx) = song.and_then(|s| tap.source_track().and_then(|t| track_index(s, t))) else { return };
         let Some(s) = scratch.get_mut(idx) else { return };
         match tap.tap_point {
             TapPoint::PreFx => s.force_prefx_snapshot = true,
@@ -177,7 +178,7 @@ impl SamplerRt {
             SamplerSource::Master => rig.ring.write_block(&master_l[..n], &master_r[..n]),
             SamplerSource::Track(tap) => {
                 let bufs = song
-                    .and_then(|s| track_index(s, tap.source_track))
+                    .and_then(|s| tap.source_track().and_then(|t| track_index(s, t)))
                     .and_then(|i| scratch.get(i))
                     .map(|s| match tap.tap_point {
                         TapPoint::PostFader => (&s.track_l[..n], &s.track_r[..n]),

@@ -29,6 +29,9 @@ pub struct UiPrefs {
     /// プロジェクト保存対象ではない (= session-only): UI 状態は再起動で
     /// 既定 (全 collapsed) に戻る。
     pub expanded_automation_tracks: std::collections::HashSet<u32>,
+    /// r.md #110: 折り畳んでいる Parallel / chain の id (既定は展開、閉じた id だけ持つ)。
+    /// 「見方の都合」 なので dirty は立てないが `ViewState` で保存する。
+    pub collapsed_parallel_nodes: std::collections::HashSet<u64>,
     /// gui_01 #034 (Phase 63n-10): master row の automation 展開状態。
     /// `expanded_automation_tracks` と直交した 1 bool で持つ (= track id
     /// 集合に MASTER_TRACK_ID を入れる方式は sentinel が混ざって SSoT が

@@ -16,6 +16,7 @@
 //! 併せて r.md #72 (「Dry/Wet」がどのプラグインのものか分からない) の SSoT —
 //! `automation_target_label` がデバイス名を前置きすること — も固定する。
 
+use common::model::Device;
 use common::model::{
     AudioTap, AutomationTarget, FollowerConfig, ModSource, ModSourceKind, PluginInstance, Track,
 };
@@ -35,14 +36,14 @@ const PARAM_ID: u32 = 7;
 
 fn fx_track(id: u32, name: &str, device_id: u64, plugin_id: &str) -> Track {
     let mut track = Track { id, name: name.into(), ..Track::default() };
-    track.devices.push(PluginInstance {
+    track.devices.push(Device::Plugin(PluginInstance {
         id: device_id,
         ..PluginInstance::with_ports(
             plugin_id.to_string(),
             PluginFormat::Clap,
             PortConfig { has_audio_input: true, has_audio_output: true, ..Default::default() },
         )
-    });
+    }));
     track
 }
 

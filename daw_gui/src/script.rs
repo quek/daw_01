@@ -267,6 +267,7 @@ impl ScriptHost {
                 shmem_id,
                 state_load_error,
                 aux_output_count,
+                aux_input_count,
                 generation,
             } => {
                 self.plugin_load_events.loaded.push(*device_id);
@@ -284,6 +285,7 @@ impl ScriptHost {
                         shmem_id: shmem_id.clone(),
                         state_load_error: state_load_error.clone(),
                         aux_output_count: *aux_output_count,
+                        aux_input_count: *aux_input_count,
                         generation: *generation,
                     }));
             }
@@ -1257,8 +1259,8 @@ fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
                     .map(|t| t.devices.as_slice())
                     .unwrap_or(&[])
             };
-        let chain: Vec<ChainDevice> = devices
-            .iter()
+        // r.md #110: Parallel の中の plugin も信号順で並べる (script は plugin 列だけを見る)。
+        let chain: Vec<ChainDevice> = common::model::plugins(devices)
             .map(|d| ChainDevice { plugin_id: d.plugin_id.as_str(), ports: d.ports })
             .collect();
         serde_json::to_string(&chain)
@@ -1300,7 +1302,7 @@ fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
         h.app
             .relocate_devices_inner(&crate::app::RelocateDevices {
                 device_ids,
-                dest_track,
+                dest: common::model::ChainRef::Track(dest_track),
                 dest_index,
                 copy,
             });

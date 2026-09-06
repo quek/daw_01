@@ -123,10 +123,10 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
             common::model::TapPoint::PostFader,
         ] {
             items.push(format!("{} · {}", t.name, crate::handler::sampler::tap_point_label(tp)));
-            sources.push(common::protocol::SamplerSource::Track(common::model::AudioTap {
-                source_track: t.id,
-                tap_point: tp,
-            }));
+            sources.push(common::protocol::SamplerSource::Track(common::model::AudioTap::new(
+                common::model::TapSource::Track(t.id),
+                tp,
+            )));
         }
     }
     let selected = sources.iter().position(|s| *s == app.sampler.source).unwrap_or(0);

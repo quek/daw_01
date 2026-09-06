@@ -4,24 +4,20 @@
 //! - MIDI FX → Instrument → FX のリスト (各行に GUI / × ボタン、drag&drop で reorder)
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
+mod chain_list;
 mod chain_sections;
 mod device_panel;
 /// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
 mod launch_section;
 mod modulation_rack;
 
-use daw_ui_core::{
-    Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
-    ScrubableNumberStyle, ToggleButtonStyle, Ui,
-};
+use daw_ui_core::{Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ChainEntry, ClipKey, ColorPickerTarget,
-    DeviceDragPayload, DiscreteClipEdit, FadeEdgeKind, InspectorScrubField, RelocateDevices,
-    ScrubGesture, TalkParamKind, TextNumField,
+    text_num_to_builtin, AppData, AppEvent, ClipKey, ColorPickerTarget, DiscreteClipEdit,
+    FadeEdgeKind, InspectorScrubField, ScrubGesture, TalkParamKind, TextNumField,
 };
-use crate::widgets::select_modifier::SelectModifier;
 use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
 use crate::view::track_color;
 use common::model::{AutomationTarget, FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
@@ -200,137 +196,6 @@ fn fade_curve_from_index(i: usize) -> FadeCurve {
         _ => FadeCurve::Linear,
     }
 }
-
-/// チェーン (device 一覧) の reorder list style。
-/// 「選択」 は param パネルの開閉で示すので、 選択行は accent で塗らず静止行と同じ面のまま。
-fn chain_list_style(theme: &crate::theme::Theme) -> ReorderableListStyle {
-    ReorderableListStyle {
-        row_gap: 3.0,
-        row_bg_selected: theme.core.panel_raised,
-        radius: 3.0,
-        ..ReorderableListStyle::from_palette(&theme.core)
-    }
-}
-
-/// r.md #71 (プラグインのコピー / 移動): チェーン操作 (運搬 / 右クリックメニュー) が
-/// 対象にする device 集合。 **掴んだ / 右クリックした行が選択に含まれていれば選択全体、
-/// 含まれていなければその行だけ** (トラックヘッダの右クリックメニューと同じ規則、
-/// `arrangement_view.rs`)。 順序は表示チェーン順。
-fn carried_device_ids(app: &AppData, chain: &[ChainEntry], device_id: u64) -> Vec<u64> {
-    if app.selection.selected_device_ids.contains(&device_id) {
-        chain
-            .iter()
-            .filter(|c| app.selection.selected_device_ids.contains(&c.device_id))
-            .map(|c| c.device_id)
-            .collect()
-    } else {
-        vec![device_id]
-    }
-}
-
-/// チェーン行の右端に並ぶボタン。
-enum ChainRowButton {
-    /// `GUI` / `Par` — プラグイン窓 (またはパラメータ欄) の開閉。
-    ToggleGui,
-    /// ⌨ (r.md #36) — 「キーを全部プラグインに送る」の on/off (値は次の状態)。
-    SendAllKeys(bool),
-    /// `x` — この device を外す。
-    Remove,
-}
-
-/// チェーン行のボタンが返す `Edit`。
-///
-/// `[[feedback_popup_click_leaks_to_background]]`: 右クリックメニューが開いている frame は
-/// **描くが発行しない** (項目 click が下の行のボタンを誤発火する)。判定は `Edit` の中で行う
-/// — メニューはこの行より後に描かれるので、ボタンを積む時点ではまだ確定していない。
-fn chain_row_edit(button: ChainRowButton, device_id: u64, popup_open: bool) -> Edit<AppData> {
-    Edit::mutate(move |app: &mut AppData| {
-        if popup_open {
-            return;
-        }
-        match button {
-            ChainRowButton::ToggleGui => app.handle_event(AppEvent::ToggleSlotGui { device_id }),
-            ChainRowButton::SendAllKeys(enabled) => {
-                app.handle_event(AppEvent::SetPluginSendAllKeys { device_id, enabled });
-            }
-            ChainRowButton::Remove => app.handle_event(AppEvent::RemoveDevices {
-                device_ids: vec![device_id],
-            }),
-        }
-    })
-}
-
-/// r.md #71 (プラグインのコピー / 移動): チェーン行の右クリックメニュー
-/// (`コピー / 切り取り / 貼り付け / 複製 / 削除`) 1 項目分の実行。
-///
-/// 対象集合は **項目を選んだときだけ**組む (毎フレーム全行分作ると無駄な確保になる。
-/// arrangement のトラックヘッダメニューが `target_ids()` を遅延させているのと同じ形)。
-/// `idx` は上のラベル配列と同順。
-fn apply_chain_menu_action(
-    app: &mut AppData,
-    idx: usize,
-    device_id: u64,
-    dest_track: Option<u32>,
-) {
-    let chain = app.inspector_chain();
-    let ids = carried_device_ids(app, &chain, device_id);
-    match idx {
-        // r.md #105: 無効化 / 有効化 (方向はメニューラベルと同じ `all_devices_bypassed`)。
-        0 => {
-            let bypassed = !app.all_devices_bypassed(&ids);
-            app.handle_event(AppEvent::SetDevicesBypassed { device_ids: ids, bypassed });
-        }
-        1 => app.copy_devices(ids),
-        2 => app.cut_devices(ids),
-        // 貼り付け位置は「この device の直前」。 選択をこの device 1 本にしてから
-        // **Ctrl+V と同じ経路** を起こす (挿入位置の決定は `paste_devices` が選択から
-        // 引くので、規則も経路も 1 本のまま。 OS クリップボードの読み出しは shortcut
-        // layer が担うので、ここで二重に読まない)。
-        3 => {
-            app.set_device_selection(vec![device_id]);
-            app.ui_ephemeral.pending_shortcut_injections.push("paste");
-        }
-        // 複製 = 選んだ device の直後にコピーを挿す。
-        4 => duplicate_devices_after(app, ids, device_id, dest_track),
-        _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
-    }
-}
-
-/// `device_id` の直後に `ids` のコピーを挿す (チェーン行メニューの「複製」)。
-fn duplicate_devices_after(
-    app: &mut AppData,
-    ids: Vec<u64>,
-    device_id: u64,
-    dest_track: Option<u32>,
-) {
-    let Some(dest_track) = dest_track else { return };
-    let Some(dest_index) = app
-        .song_doc
-        .song()
-        .fx_chain_by_track_id(dest_track)
-        .and_then(|c| c.iter().position(|d| d.id == device_id))
-        .map(|i| i as u32 + 1)
-    else {
-        return;
-    };
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
-        device_ids: ids,
-        dest_track,
-        dest_index,
-        copy: true,
-    }));
-}
-
-// ---- Sidechain セクションの行レイアウト (高さ予約と描画の SSoT) ----------
-/// 1 行目 = プラグイン名 (行幅いっぱい)。
-const SC_NAME_H: f32 = 14.0;
-/// 2 行目 = [tap point | source] のコントロール行。
-const SC_CTL_H: f32 = 24.0;
-/// tap point dropdown の幅。 最長ラベル "Post-Fdr" = 8 字 * 14 * 0.527 = 59.1px、
-/// dropdown の文字領域は w - PAD_X(8) - ARROW_W(16) なので 84px 以上必要。
-const SC_TAP_W: f32 = 88.0;
-const SC_ROW_H: f32 = SC_NAME_H + SC_CTL_H;
-const SC_ROW_GAP: f32 = 6.0;
 
 /// import 済み image source の表示名 (ファイル名)。口パク mapping dropdown 用。
 fn image_source_label(src: &common::model::ImageSource) -> String {
@@ -1246,272 +1111,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += toggle_h + 12.0;
     }
 
-    // ---- Plugin chain + 行内アコーディオン -----------------
-    // チェーン (プラグイン一覧) を viewport 内に出し、 各行の Par で開いたデバイスの
-    // param パネルを **その行の直下** に展開する (`reorderable_list_expandable`)。 開いた
-    // 行だけ `row_extra_h > 0` → expansion クロージャが呼ばれ、 中の各 section gate が
-    // その開いたデバイスの params を描く。 展開高は前フレーム測定値
-    // (`inspector_device_panel_h`、 未測定は default で bootstrap して 1 度描かせる)。
-    {
-        let chain = app.inspector_chain();
-        let cursor_tid = app.cursor_track_id();
-        let chain_style = chain_list_style(&app.theme);
-        let row_total_h = chain_style.row_height + chain_style.row_gap;
-        // 右クリックメニューが開いている frame は行の click / button を評価しない
-        // (`[[feedback_popup_click_leaks_to_background]]`: capture_input=false の popup は
-        // 背景の pointer を mask しないので、項目 click が下の行まで届く)。
-        let popup_open = ui.has_open_popups();
-        // 開いているデバイス (open_plugin_params / open_video_fx_params)。 表示中の
-        // チェーンに居るものだけ展開する (r.md #71: パネルは device_id で開いたまま
-        // にして、 描画側で gate する)。
-        let open_dev: Option<u64> = app
-            .ui_ephemeral.open_plugin_params
-            .or(app.ui_ephemeral.open_video_fx_params)
-            .filter(|id| chain.iter().any(|e| e.device_id == *id));
-        // r.md #71: 選択中の行 (表示チェーンとの交差なので、異トラックの id は出ない
-        // = `live_device_ids()` と同じ正規化になる)。
-        let selected_rows: Vec<usize> = chain
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| app.selection.selected_device_ids.contains(&e.device_id))
-            .map(|(i, _)| i)
-            .collect();
-        let panel_h = if app.ui_ephemeral.inspector_device_panel_h > 1.0 {
-            app.ui_ephemeral.inspector_device_panel_h
-        } else {
-            280.0 // 初回 bootstrap: expansion を 1 度描かせて実測させる
-        };
-        let chain_h = chain.len() as f32 * row_total_h
-            + if open_dev.is_some() { panel_h } else { 0.0 }
-            + 4.0;
-        let btn_gui_w = 44.0;
-        let btn_x_w = 30.0;
-        // r.md #36: ⌨ = 「キーを全部プラグインに送る」。 埋め込みエディタ窓を開く device
-        // だけに出す (インライン param パネルの device は別窓にフォーカスが行かない)。
-        // 通常はホストがプラグインの消化しなかったキーだけを拾うが、Dear ImGui / GLFW 系の
-        // エディタは「消化したか」を外に出さないので、そのプラグインだけ ON にして全キーを譲る
-        // (REAPER の FX ごとの同名オプションと同じ)。GUI ボタンの隣 = 窓を開く操作の隣。
-        let btn_keys_w = 26.0;
-        let keys_style = toggle_audio_style(&app.theme);
-        ui.label_at("inspector_chain_label", "Chain", area.x + pad, y, 12.0, p.text);
-        y += 18.0;
-        // 他セクションと同じ左右 pad を取る。 旧実装は area 幅いっぱい (280px) だった
-        // ため、 inspector 本体が縦スクロールすると右端 10px が scrollbar に隠れ、
-        // その帯 (描画されないのに hit-test は生きている) の click が chain 行の
-        // 「x」 (device 削除) を誤発火しえた。
-        let chain_rect = Rect { x: area.x + pad, y, w: area.w - pad * 2.0, h: chain_h };
-        let resp = ui.reorderable_list_expandable(
-            "inspector_chain",
-            chain_rect,
-            &chain,
-            &selected_rows,
-            Some(crate::app_types::DEVICE_DRAG_KIND),
-            &chain_style,
-            |req| match req {
-                ReorderableListEditRequest::Reorder(order) => {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::ReorderInspectorChain(order.clone()));
-                    })
-                }
-            },
-            |ui, entry, idx, row_rect, _selected, _dragging| {
-                let device_id = entry.device_id;
-                let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
-                let keys_x = gui_x - btn_keys_w - 2.0;
-                let shows_keys = entry.has_embedded_gui && !entry.shows_param_panel();
-                // 名前は右の [⌨] [Par|GUI] / [x] ボタンの手前で打ち切る。 素の label_at だと
-                // 長いプラグイン名 (例: "BBC Symphony Orchestra Professional") が
-                // ボタンの上に重なって読めなくなる。
-                let name_x = row_rect.x + 8.0;
-                let buttons_left = if shows_keys {
-                    keys_x
-                } else if entry.shows_button() {
-                    gui_x
-                } else {
-                    row_rect.x + row_rect.w - btn_x_w
-                };
-                // load に失敗した device は host に instance が無い = 無音。
-                // どの行が死んでいるかを行そのもので示し、 理由と復旧手段
-                // (再読込) は下の 「読み込み失敗」 セクションが出す。
-                let failed = entry.load_error.is_some();
-                // 正常時は借用のまま (毎フレーム全 device 分の String を作らない)。
-                let display_name: std::borrow::Cow<'_, str> = if failed {
-                    format!("[未ロード] {}", entry.plugin_name).into()
-                } else {
-                    entry.plugin_name.as_str().into()
-                };
-                ui.label_at_clipped(
-                    ("inspector_row_name", idx),
-                    &display_name,
-                    Rect {
-                        x: name_x,
-                        y: row_rect.y + 8.0,
-                        w: (buttons_left - 6.0 - name_x).max(1.0),
-                        h: 11.0 * 1.2,
-                    },
-                    11.0,
-                    // r.md #105: bypass 中は最弱可読層 (`text_faint` = disabled label の
-                    // トークン)。トグルは置かず、名前の色だけで示す。`text_dim` は二次
-                    // ラベル用で `text` との差が弱く、実機で「変わらない」と見えた。
-                    if failed {
-                        p.text_error
-                    } else if entry.bypassed {
-                        p.text_faint
-                    } else {
-                        p.text
-                    },
-                );
-                // 右クリックメニューが開いている frame の抑止は `chain_row_edit` が担う。
-                if shows_keys {
-                    let next = !entry.send_all_keys;
-                    // U+2328 KEYBOARD。Nerd Font の nf-fa-keyboard_o (U+F11C) は 2 セル幅の
-                    // 箱の左寄りに描かれるので、実測幅で中央寄せしても絵が左に寄る。
-                    // 通常の Unicode 記号なら 1 セル幅で中央に来る (無ければ OS の記号フォントに
-                    // fallback する — 他の ⊘ / ➡ / ⇥ と同じ)。
-                    ui.toggle_button_at(
-                        ("inspector_row_keys", idx),
-                        "\u{2328}",
-                        Rect { x: keys_x, y: row_rect.y + 2.0, w: btn_keys_w, h: row_rect.h - 4.0 },
-                        entry.send_all_keys,
-                        &keys_style,
-                        move |_| chain_row_edit(ChainRowButton::SendAllKeys(next), device_id, popup_open),
-                    );
-                }
-                if entry.shows_button() {
-                    let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
-                    ui.button_at(
-                        ("inspector_row_gui", idx),
-                        label,
-                        Rect { x: gui_x, y: row_rect.y + 2.0, w: btn_gui_w, h: row_rect.h - 4.0 },
-                        move || chain_row_edit(ChainRowButton::ToggleGui, device_id, popup_open),
-                    );
-                }
-                let xb_x = row_rect.x + row_rect.w - btn_x_w;
-                ui.button_at(
-                    ("inspector_row_remove", idx),
-                    "x",
-                    Rect { x: xb_x, y: row_rect.y + 2.0, w: btn_x_w, h: row_rect.h - 4.0 },
-                    move || chain_row_edit(ChainRowButton::Remove, device_id, popup_open),
-                );
-            },
-            |i| {
-                if chain.get(i).map(|e| e.device_id) == open_dev {
-                    panel_h
-                } else {
-                    0.0
-                }
-            },
-            |ui, _exp_i, exp_rect| {
-                let measured =
-                    (device_panel::draw_device_panel(app, ui, area, pad, exp_rect)
-                        - exp_rect.y)
-                        .max(0.0);
-                // 展開部の実消費高を測って次フレームの row_extra_h に使う (lag-by-one)。
-                if (app.ui_ephemeral.inspector_device_panel_h - measured).abs() > 0.5 {
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.ui_ephemeral.inspector_device_panel_h = measured;
-                    }));
-                }
-            },
-        );
-
-        // r.md #105: カーソル直下の行を AppData に反映 (変化時のみ Edit、
-        // `mixer_hovered_track` と同じ diff-guard)。 `Q` が読む。
-        let hovered_device = resp.hovered.and_then(|i| chain.get(i)).map(|e| e.device_id);
-        if app.ui_ephemeral.inspector_hovered_device != hovered_device {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.inspector_hovered_device = hovered_device;
-            }));
-        }
-
-        // r.md #71 (プラグインのコピー / 移動): 行 click = 選択 (無修飾 / Ctrl / Shift)。
-        // 修飾キーは widget が **press フレームで捕まえた値** (`clicked_modifiers`) を
-        // 使う — release フレームの生読みは ModifiersChanged 先行 race で Ctrl+click が
-        // Single に化ける。
-        if !popup_open
-            && let Some(i) = resp.clicked
-            && let Some(e) = chain.get(i)
-        {
-            let device_id = e.device_id;
-            let m = resp.clicked_modifiers;
-            let modifier = SelectModifier::from_modifiers(m.shift, m.ctrl);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SelectDevice { device_id, modifier });
-            }));
-        }
-        // リスト外へ出た = トラック跨ぎの運搬を始める。運ぶ対象は「掴んだ行が選択に
-        // 含まれていれば選択全体、含まれていなければその行だけ」(トラックヘッダの
-        // 右クリックメニューと同じ規則)。
-        if let Some(i) = resp.dragged_out
-            && let Some(e) = chain.get(i)
-        {
-            let device_ids = carried_device_ids(app, &chain, e.device_id);
-            ui.begin_drag(
-                crate::app_types::DEVICE_DRAG_KIND,
-                DeviceDragPayload {
-                    device_ids,
-                    source_track: cursor_tid.unwrap_or(common::model::MASTER_TRACK_ID),
-                },
-            );
-        }
-        // 落とした = 挿入位置を確定して移動 / コピー。既定は移動、Ctrl でコピー。
-        // 修飾キーは payload が持っている「押されていた最後のフレーム」の値。
-        if let Some(at) = resp.external_dropped_at
-            && let Some(copy) = ui.drag_modifiers().map(|m| m.ctrl)
-            && let Some(dest_track) = cursor_tid
-            && let Some(pl) =
-                ui.take_drag_payload::<DeviceDragPayload>(crate::app_types::DEVICE_DRAG_KIND)
-        {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
-                    device_ids: pl.device_ids.clone(),
-                    dest_track,
-                    dest_index: at as u32,
-                    copy,
-                }));
-            }));
-        }
-        // 右クリックメニューは **widget の外 (caller 側)** で重ねる (arrangement の
-        // `track_header_rects` / `clip_rects` と同じ idiom)。
-        for (i, row_rect) in &resp.row_rects {
-            let Some(e) = chain.get(*i) else { continue };
-            let device_id = e.device_id;
-            let dest_track = cursor_tid;
-            // r.md #105: 先頭は bypass 切替。 ラベルは **この操作が掛かる集合**
-            // (`carried_device_ids`: 行が選択に含まれていれば選択全体) の現在値から
-            // 決める — 全部 off なら「有効化」、 1 つでも on なら「無効化」 (`Q` と同じ)。
-            let bypass_label = if app.all_devices_bypassed(&carried_device_ids(app, &chain, device_id))
-            {
-                "有効化"
-            } else {
-                "無効化"
-            };
-            ui.context_menu_for(
-                *row_rect,
-                &[bypass_label, "コピー", "切り取り", "貼り付け", "複製", "削除"],
-                move |idx, ui| {
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        apply_chain_menu_action(app, idx, device_id, dest_track);
-                    }));
-                },
-            );
-        }
-
-        // チェーン (rows + 開いた展開) ぶん viewport y を進める。
-        y = chain_rect.y + chain_rect.h + 8.0;
-    }
+    // ---- Plugin chain (r.md #110: Parallel 対応の縦回転 Live 型 chain list) ----
+    y = chain_list::draw_chain_list(app, ui, area, pad, y);
 
     // r.md #37: チェーン直下に 「+ Plugin」 → Parallel Out → Sidechain を top-down で
     // 並べる (旧: inspector 下端に pinned)。 「このチェーンの末尾に足す」 「このチェーンの
     // デバイスの配線」 が読み順で自明になる。 各 fn は modulation_rack と同じ
     // `(app, ui, area, pad, y) -> f32` contract。
-    y = chain_sections::draw_add_plugin_button(app, ui, area, pad, y);
     // ロード失敗は他の配線セクションより上 (= チェーンに最も近い位置)。
-    // 「+ Plugin」 だけはチェーン末尾に接していることが座標で意味を持つので
-    // その直後に置く。
     y = chain_sections::draw_failed_load_section(app, ui, area, pad, y);
     y = chain_sections::draw_parallel_out_section(app, ui, area, pad, y);
-    y = chain_sections::draw_sidechain_section(app, ui, area, pad, y);
 
     let cursor_idx = app.cursor_track_index();
 

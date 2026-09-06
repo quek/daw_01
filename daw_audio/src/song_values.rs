@@ -54,6 +54,20 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         AudioCommand::SetSendEnabled { track, send_id, enabled } => {
             with_send(song, track, send_id, |s| s.enabled = enabled);
         }
+        // r.md #110 Parallel chain の mixer (gain / pan / mute / solo)。宛先は安定
+        // `ParallelChain::id` (track は所有者の確認にだけ使う)。
+        AudioCommand::SetChainGain { chain_id, gain, .. } => {
+            with_chain(song, chain_id, |c| c.gain = gain.clamp(0.0, MAX_TRACK_GAIN));
+        }
+        AudioCommand::SetChainPan { chain_id, pan, .. } => {
+            with_chain(song, chain_id, |c| c.pan = pan.clamp(-1.0, 1.0));
+        }
+        AudioCommand::SetChainMuted { chain_id, muted, .. } => {
+            with_chain(song, chain_id, |c| c.muted = muted);
+        }
+        AudioCommand::SetChainSolo { chain_id, solo, .. } => {
+            with_chain(song, chain_id, |c| c.solo = solo);
+        }
         AudioCommand::SetSongBpm { bpm } => song.bpm = bpm.clamp(1.0, 400.0),
         AudioCommand::SetSongTimeSigNumerator { num } => song.time_sig.0 = num.clamp(1, 32),
         _ => return false,
@@ -125,6 +139,13 @@ fn with_send(
         && let Some(s) = t.sends.iter_mut().find(|s| s.id == send_id)
     {
         f(s);
+    }
+}
+
+/// r.md #110: `chain_id` の Parallel chain に `f` を当てる (dangling は no-op)。
+fn with_chain(song: &mut Song, chain_id: u64, f: impl FnOnce(&mut common::model::ParallelChain)) {
+    if let Some(c) = song.chain_by_id_mut(chain_id) {
+        f(c);
     }
 }
 

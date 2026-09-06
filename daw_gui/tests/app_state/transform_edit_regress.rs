@@ -6,6 +6,7 @@
 //! 一律に子プロセス sync を走らせる」設計で、個々の sync step / drag が自分で
 //! 差分・gesture bracket を持つべきだった、という抜け。
 
+use common::model::Device;
 use common::model::{
     Clip, ClipContent, GroupTransformParam, MidiContent, Note, PluginInstance, Track,
 };
@@ -49,14 +50,14 @@ fn add_loaded_vocal_track(app: &mut daw_gui::app::AppData) {
         let mut track = Track::default();
         track.id = VOCAL_ID;
         track.name = "Vocal".into();
-        track.devices.push(PluginInstance {
+        track.devices.push(Device::Plugin(PluginInstance {
             id: VOCAL_DEVICE_ID,
             ..PluginInstance::with_ports(
                 common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
                 PluginFormat::Builtin,
                 PortConfig { has_note_input: true, has_audio_output: true, ..Default::default() },
             )
-        });
+        }));
         let mut clip = Clip::default();
         clip.id = 1;
         clip.length_beats = 4.0;

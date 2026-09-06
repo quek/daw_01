@@ -470,12 +470,12 @@ impl AppData {
         // r.md #71 (プラグインのコピー / 移動): パネルは device_id で開いたまま
         // にして、 **描画側で** 「いま表示しているチェーンの device か」 を gate する
         // (device を別トラックへ移してもパネルが自然に追従する)。
-        let (open_track, open_idx) = find_device_by_id(self.song_doc.song(), open_device)?;
+        let (open_track, _) = find_device_by_id(self.song_doc.song(), open_device)?;
         if self.cursor_track_id() != Some(open_track) {
             return None;
         }
         let track = self.song_doc.song().track_by_id(open_track)?;
-        if track.devices.get(open_idx as usize).map(|d| d.plugin_id.as_str())
+        if self.song_doc.song().plugin_by_id(open_device).map(|d| d.plugin_id.as_str())
             != Some(common::video_fx::TRANSFORM_ID)
         {
             return None;
@@ -498,14 +498,14 @@ impl AppData {
     /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
     pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
         let device_id = self.ui_ephemeral.open_video_fx_params?;
-        let (track_id, device_index) = find_device_by_id(self.song_doc.song(), device_id)?;
+        let (track_id, _) = find_device_by_id(self.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
         let def = self
-            .song_doc.song()
-            .fx_chain_by_track_id(track_id)?
-            .get(device_index as usize)
+            .song_doc
+            .song()
+            .plugin_by_id(device_id)
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))?;
         if def.params.is_empty() {
             return None; // Transform 等は専用セクションで編集。
@@ -547,11 +547,12 @@ impl AppData {
         // lane の所有者 (track / master) は device_id から毎回引き直す
         // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。
         let song = self.song_doc.song();
-        let Some((track_id, device_index)) = find_device_by_id(song, device_id) else {
+        let Some((track_id, _)) = find_device_by_id(song, device_id) else {
             return;
         };
         // def_by_id は &'static を返すので self.song_doc.song() の借用はここで終わる。
-        let Some(def) = device_at(song, track_id, device_index)
+        let Some(def) = song
+            .plugin_by_id(device_id)
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
         else {
             return;
@@ -606,11 +607,11 @@ impl AppData {
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
     pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
         let device_id = self.ui_ephemeral.open_plugin_params?;
-        let (track_id, device_index) = find_device_by_id(self.song_doc.song(), device_id)?;
+        let (track_id, _) = find_device_by_id(self.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        let device = device_at(self.song_doc.song(), track_id, device_index)?;
+        let device = self.song_doc.song().plugin_by_id(device_id)?;
         let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
@@ -685,11 +686,11 @@ impl AppData {
     /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
     pub(crate) fn open_param_panel_plugin_id(&self) -> Option<&str> {
         let device_id = self.ui_ephemeral.open_plugin_params?;
-        let (track_id, index) = find_device_by_id(self.song_doc.song(), device_id)?;
+        let (track_id, _) = find_device_by_id(self.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        device_at(self.song_doc.song(), track_id, index).map(|d| d.plugin_id.as_str())
+        self.song_doc.song().plugin_by_id(device_id).map(|d| d.plugin_id.as_str())
     }
 
     /// VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
@@ -1231,6 +1232,17 @@ impl AppData {
                 .iter()
                 .find(|s| s.id == *send_id)
                 .map_or(0.0, |s| f64::from(s.gain)),
+            // r.md #110: Parallel chain の gain / pan (安定 chain id で引く)。
+            P::ChainGain { chain_id } => self
+                .song_doc
+                .song()
+                .chain_by_id(*chain_id)
+                .map_or(1.0, |(_, c)| f64::from(c.gain)),
+            P::ChainPan { chain_id } => self
+                .song_doc
+                .song()
+                .chain_by_id(*chain_id)
+                .map_or(0.0, |(_, c)| f64::from(c.pan)),
             // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
             // `ChannelStrip::target_value` が SSoT (ここで写さない)。
             P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {

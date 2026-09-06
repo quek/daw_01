@@ -454,6 +454,8 @@ pub struct Vst3Plugin {
     processing: bool,
     /// パラアウト port 数 (bus 構成から load 時に確定)。
     paraout_port_count: usize,
+    /// r.md #110: sidechain 候補 (`is_main=false` audio 入力 bus) 数。
+    aux_input_port_count: usize,
 
     /// Cross-half shared diagnostics / render mode (audio half stores,
     /// this half drains / sets).
@@ -660,6 +662,7 @@ impl Vst3Plugin {
         } else {
             (1 + extra_output_channels.len()).min(common::process_data::MAX_AUX_OUT)
         };
+        let aux_input_port_count = aux_input_channels.len().min(common::process_data::MAX_AUX_IN);
 
         let param_pool_overflowed = Arc::new(AtomicBool::new(false));
         let process_status_err = Arc::new(AtomicI32::new(kResultOk));
@@ -716,6 +719,7 @@ impl Vst3Plugin {
             active: false,
             processing: false,
             paraout_port_count,
+            aux_input_port_count,
             gui_param_edits,
             param_pool_overflowed,
             process_status_err,
@@ -1458,6 +1462,10 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn aux_output_port_count(&self) -> usize {
         self.paraout_port_count
+    }
+
+    fn aux_input_port_count(&self) -> usize {
+        self.aux_input_port_count
     }
 
     fn gui_is_embed_supported(&self) -> bool {

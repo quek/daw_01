@@ -593,11 +593,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 多重選択を実装したので、 selection は `selected_track_ids` から
     // 直接取れる。 空なら no-op。
     if ui.take_shortcut("daw.group_tracks") {
-        let track_ids = app.selection.selected_track_ids.clone();
-        if !track_ids.is_empty() {
+        // r.md #110: 直近の選択面が device (インスペクタの chain 行) なら、選んだ device を
+        // Parallel にまとめる (Live の Ctrl+G と同じ文脈依存)。 それ以外は track のグループ化。
+        let device_ids = app.live_device_ids();
+        if surface == Some(crate::app_types::EditSurface::Devices) && !device_ids.is_empty() {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::GroupSelectedTracks { track_ids });
+                app.handle_event(AppEvent::GroupDevices { device_ids });
             }));
+        } else {
+            let track_ids = app.selection.selected_track_ids.clone();
+            if !track_ids.is_empty() {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::GroupSelectedTracks { track_ids });
+                }));
+            }
         }
     }
     // Alt+G — ungroup the selected group tracks (Ableton Live の

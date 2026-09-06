@@ -65,87 +65,125 @@ pub fn fill_track_param_ramps(
     // 音量に当てると段差が音として出る。空 = 変調なし。
     mod_plane: ModTickPlaneRef<'_>,
 ) {
-    let frames = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
-    if frames == 0 {
-        return;
-    }
     let (track_volume, track_pan) = song
         .and_then(|s| s.tracks.get(track_idx as usize))
         .map(|t| (t.volume, t.pan))
         .unwrap_or((1.0, 0.0));
-    for slot in volume_per_sample.iter_mut().take(frames) {
-        *slot = track_volume;
-    }
-    for slot in pan_per_sample.iter_mut().take(frames) {
-        *slot = track_pan;
-    }
-
-    let Some(song) = song else { return };
-    let Some(track) = song.tracks.get(track_idx as usize) else {
+    let Some(track) = song.and_then(|s| s.tracks.get(track_idx as usize)) else {
+        let n = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
+        volume_per_sample[..n].fill(track_volume);
+        pan_per_sample[..n].fill(track_pan);
         return;
     };
-    let track_id = track.id;
-    if current_bpm <= 0.0 || sample_rate == 0 {
+    let song = song.expect("track resolved from song");
+    fill_target_ramp(
+        song,
+        track.id,
+        &track.automation_lanes,
+        &track.mod_routings,
+        rows,
+        sample_rate,
+        current_bpm,
+        playhead_beats,
+        frames,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+        track_volume,
+        volume_per_sample,
+        recording_lanes,
+        mod_plane,
+    );
+    fill_target_ramp(
+        song,
+        track.id,
+        &track.automation_lanes,
+        &track.mod_routings,
+        rows,
+        sample_rate,
+        current_bpm,
+        playhead_beats,
+        frames,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+        track_pan,
+        pan_per_sample,
+        recording_lanes,
+        mod_plane,
+    );
+}
+
+/// 1 本の builtin target (Volume / Pan / ChainGain / ChainPan) の per-sample ramp を
+/// `buf` に埋める。
+///
+/// docs/plan_modulation_routing_redesign.md §3.1: lane の有無に関わらず変調する。
+/// base = 「enabled かつ非 recording な lane があればその curve 値、無ければ
+/// `constant`」、そこに `mod_routings` の当該 target 変調を正規化領域で乗せる。
+/// lane も mod_routing も無い target は constant fill のままで正しいので per-sample
+/// ループを丸ごと skip (= 無回帰)。
+///
+/// `owner_track_id` / `lanes` / `mod_routings` は所有者の store (track なら
+/// `Track.automation_lanes` / `mod_routings`、master 所有の Parallel chain なら
+/// `Song.song_lanes` / `song_mod_routings` + `MASTER_TRACK_ID`)。
+/// RT 安全: 確保・ロックなし。
+#[allow(clippy::too_many_arguments)]
+pub fn fill_target_ramp(
+    song: &Song,
+    owner_track_id: u32,
+    lanes: &[common::model::AutomationLane],
+    mod_routings: &[common::model::ModRouting],
+    rows: TrackRows<'_>,
+    sample_rate: u32,
+    current_bpm: f64,
+    playhead_beats: f64,
+    frames: u32,
+    target: AutomationTarget,
+    constant: f32,
+    buf: &mut [f32],
+    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    mod_plane: ModTickPlaneRef<'_>,
+) {
+    let frames = (frames as usize).min(buf.len());
+    buf[..frames].fill(constant);
+    if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
     let beats_per_frame = current_bpm / (60.0 * f64::from(sample_rate));
     if beats_per_frame <= 0.0 {
         return;
     }
-
-    // docs/plan_modulation_routing_redesign.md §3.1: Volume / Pan は lane の有無に
-    // 関わらず変調する。base = 「enabled かつ非 recording な lane があればその curve
-    // 値、無ければ track の constant 値」、そこに `Track.mod_routings` の当該 target
-    // 変調を正規化領域で乗せる。lane も mod_routing も無い target は constant fill の
-    // ままで正しいので per-sample ループを丸ごと skip (= 無回帰)。
-    let fill_builtin = |target: AutomationTarget, buf: &mut [f32], track_const: f32| {
-        // 当該 target を駆動する lane (enabled + 非 recording)。
-        let lane = track.automation_lanes.iter().enumerate().find(|(_, l)| {
-            l.enabled
-                && l.target == target
-                && !recording_lanes
-                    .iter()
-                    .any(|(t, tg)| *t == track_id && *tg == l.target)
-        });
-        let has_mod = track.mod_routings.iter().any(|r| r.target == target);
-        if lane.is_none() && !has_mod {
-            // constant fill (上で書いた track.volume / track.pan) がそのまま正しい。
-            return;
-        }
-        // r.md #87: このレーン行の供給元。`switch_frame` を跨ぐと途中で変わる。
-        let src = lane.map(|(li, _)| rows.lane(li)).unwrap_or_default();
-        for (i, slot) in buf.iter_mut().enumerate().take(frames) {
-            let beat = playhead_beats + i as f64 * beats_per_frame;
-            let base = match lane {
-                #[allow(clippy::cast_possible_truncation)]
-                Some((_, l)) => {
-                    let phase = phase_at_frame(src, i as u32);
-                    lane_value(l, &song.clip_contents, phase, beat)
-                }
-                None => f64::from(track_const),
-            };
+    // 当該 target を駆動する lane (enabled + 非 recording)。
+    let lane = lanes.iter().enumerate().find(|(_, l)| {
+        l.enabled
+            && l.target == target
+            && !recording_lanes
+                .iter()
+                .any(|(t, tg)| *t == owner_track_id && *tg == l.target)
+    });
+    let has_mod = mod_routings.iter().any(|r| r.target == target);
+    if lane.is_none() && !has_mod {
+        return;
+    }
+    // r.md #87: このレーン行の供給元。`switch_frame` を跨ぐと途中で変わる。
+    let src = lane.map(|(li, _)| rows.lane(li)).unwrap_or_default();
+    for (i, slot) in buf.iter_mut().enumerate().take(frames) {
+        let beat = playhead_beats + i as f64 * beats_per_frame;
+        let base = match lane {
             #[allow(clippy::cast_possible_truncation)]
-            let f = i as u32;
-            // r.md #89 Q9: 深さ自体が動く変調も刻みごとに解決する。
-            *slot = apply_modulation_with(
-                &target,
-                base,
-                &track.mod_routings,
-                |id| mod_plane.scalar_at_frame(id, f),
-                |r| mod_plane.depth_at_frame(r.id, f).unwrap_or(r.depth),
-            ) as f32;
-        }
-    };
-    fill_builtin(
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-        volume_per_sample,
-        track_volume,
-    );
-    fill_builtin(
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-        pan_per_sample,
-        track_pan,
-    );
+            Some((_, l)) => {
+                let phase = phase_at_frame(src, i as u32);
+                lane_value(l, &song.clip_contents, phase, beat)
+            }
+            None => f64::from(constant),
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let f = i as u32;
+        // r.md #89 Q9: 深さ自体が動く変調も刻みごとに解決する。
+        *slot = apply_modulation_with(
+            &target,
+            base,
+            mod_routings,
+            |id| mod_plane.scalar_at_frame(id, f),
+            |r| mod_plane.depth_at_frame(r.id, f).unwrap_or(r.depth),
+        ) as f32;
+    }
 }
 
 /// この buffer で実際に効く **チャンネルストリップ設定**を解決する

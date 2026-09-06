@@ -16,6 +16,14 @@ pub fn automation_target_display_name(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => "Volume".into(),
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => "Pan".into(),
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => "Mute".into(),
+        // r.md #110: Parallel chain の mixer。 song 非依存の pure label なので chain id を出す
+        // (inspector 側は chain 名で引き直して表示する)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id }) => {
+            format!("Chain {chain_id} Gain")
+        }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { chain_id }) => {
+            format!("Chain {chain_id} Pan")
+        }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id, .. }) => {
             // v29: 安定 send id (1 始まり)。 位置ベースの連番表示は S3b で
             // 「track の sends 内位置」 を引く形に戻す予定 (ここは song 非依存

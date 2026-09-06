@@ -304,6 +304,13 @@ pub struct UiEphemeral {
     /// [`AppData::refresh_picker_visible`] で subsequence マッチに使う。
     pub plugin_picker_query: String,
     pub is_plugin_picker_open: bool,
+    /// r.md #110: picker を開いた `+ Plugin` の chain (挿入先)。 `None` = cursor track の
+    /// top-level 末尾。
+    pub plugin_picker_target: Option<common::model::ChainRef>,
+    /// r.md #110: `SC` パネルを展開中の device (plugin 行の直下に port ごとの配線を出す)。
+    pub open_sidechain_panel: Option<u64>,
+    /// r.md #110: 名前を編集中の chain / Parallel (id) とその編集バッファ。
+    pub renaming_chain: Option<(u64, String)>,
     /// 検索結果リスト ([`plugin_picker_visible`]) 内のカーソル位置 (0-based)。
     /// `text_input` focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up/nav_down`)
     /// で [`AppEvent::MovePluginPickerCursor`] を発火して移動し、 Enter で

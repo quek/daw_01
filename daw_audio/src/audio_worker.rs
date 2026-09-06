@@ -36,7 +36,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::engine::{PluginRefs, SyncSlot};
-use crate::graph::process_track_owned;
+use crate::graph::{ChainProgram, process_track_owned};
 use crate::mixer::TrackScratch;
 
 /// `all_done` 待ちの上限 (plan §4)。 各 pair の dispatch は
@@ -91,6 +91,11 @@ pub struct DispatchShared {
     /// that as 0 delay for every track.
     pub input_delays_base: AtomicPtr<u32>,
     pub n_input_delays: AtomicU32,
+    /// r.md #110 Parallel: `Schedule::track_programs` (track index 順) の生ポインタ。
+    /// worker は自分が claim した track の program だけを `&mut` で触る (scratch と
+    /// 同じ claim-by-index 排他)。null / 範囲外 = その track は走らせない (無音)。
+    pub programs_base: AtomicPtr<ChainProgram>,
+    pub n_programs: AtomicU32,
     /// docs/plan_modulation.md §5 / r.md #89: 変調ソースの値面
     /// ([`common::mod_plane::ModPlaneRef`]) の 2 本のポインタ。master が dispatch
     /// ごとに publish し、worker が lock-free に読む。
@@ -152,6 +157,8 @@ impl DispatchShared {
             loop_region_ptr: AtomicPtr::new(std::ptr::null_mut()),
             input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
             n_input_delays: AtomicU32::new(0),
+            programs_base: AtomicPtr::new(std::ptr::null_mut()),
+            n_programs: AtomicU32::new(0),
             mod_scalars_base: AtomicPtr::new(std::ptr::null_mut()),
             mod_ids_base: AtomicPtr::new(std::ptr::null_mut()),
             n_mod_scalars: AtomicU32::new(0),
@@ -262,6 +269,8 @@ impl AudioWorkerPool {
         &self,
         song: Option<&Song>,
         scratch: &mut [TrackScratch],
+        // r.md #110: track index 順の展開済み device 列 (`Schedule::track_programs`)。
+        programs: &mut [ChainProgram],
         plugin_refs: &PluginRefs,
         audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer,
         slots: &[SyncSlot],
@@ -295,6 +304,12 @@ impl AudioWorkerPool {
         self.shared
             .scratch_base
             .store(scratch.as_mut_ptr(), Ordering::Release);
+        self.shared
+            .programs_base
+            .store(programs.as_mut_ptr(), Ordering::Release);
+        self.shared
+            .n_programs
+            .store(programs.len() as u32, Ordering::Release);
         self.shared.plugin_refs_ptr.store(
             plugin_refs as *const _ as *mut _,
             Ordering::Release,
@@ -539,6 +554,8 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
     // in which case every track gets 0 delay.
     let input_delays_base = shared.input_delays_base.load(Ordering::Acquire);
     let n_input_delays = shared.n_input_delays.load(Ordering::Acquire);
+    let programs_base = shared.programs_base.load(Ordering::Acquire);
+    let n_programs = shared.n_programs.load(Ordering::Acquire);
     // docs/plan_modulation.md §5 / r.md #89: 変調値面 (null = 変調なし)。
     // track 単位ではなく 1 本のグローバル面なので、work loop の頭で 1 度だけ復元する。
     let mod_scalars_base = shared.mod_scalars_base.load(Ordering::Acquire);
@@ -642,6 +659,15 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         // Per-track scratch is exclusive to this dispatch via the
         // claim-by-index counter above.
         let scratch = unsafe { &mut *scratch_base.add(track_idx as usize) };
+        // r.md #110: 同じ claim で program も排他。無ければこの track は走らせない。
+        if programs_base.is_null() || track_idx >= n_programs {
+            continue;
+        }
+        // SAFETY: master holds `Schedule::track_programs` alive (and exclusively
+        // borrowed) for the dispatch window via `dispatch_and_wait`'s `&mut`
+        // borrow; `track_idx < n_programs` keeps us in bounds and the
+        // claim-by-index counter guarantees no other runner touches this entry.
+        let program = unsafe { &mut *programs_base.add(track_idx as usize) };
         // This runner's dedicated SyncSlot (1:1 paired with a
         // plugin-host worker): master = slot 0, worker i = slot i+1.
         // Never select by track index — with work stealing, two runners
@@ -670,6 +696,7 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
             track_idx,
             song_track,
             scratch,
+            program,
             plugin_refs,
             audio_renderer,
             worker_sync,

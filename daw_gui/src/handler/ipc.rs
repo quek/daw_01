@@ -132,11 +132,7 @@ impl AppData {
                 let name = self
                     .song_doc
                     .song()
-                    .tracks
-                    .iter()
-                    .flat_map(|t| t.devices.iter())
-                    .chain(self.song_doc.song().master_fx_chain.iter())
-                    .find(|d| d.id == device_id)
+                    .plugin_by_id(device_id)
                     .map(|d| d.plugin_id.clone())
                     .unwrap_or_else(|| format!("device {device_id}"));
                 self.ui_ephemeral.status_message = format!(
@@ -263,6 +259,7 @@ impl AppData {
                 shmem_id,
                 state_load_error,
                 aux_output_count,
+                aux_input_count,
                 generation,
             } => {
                 self.on_plugin_loaded_from_child(
@@ -272,6 +269,7 @@ impl AppData {
                     shmem_id,
                     state_load_error,
                     aux_output_count,
+                    aux_input_count,
                     generation,
                 );
             }

@@ -59,8 +59,9 @@ pub struct Track {
     pub id: u32,
     pub name: String,
     /// v23: 1 本の線形デバイスチェーン。役割は保持せず ports から位置導出。
+    /// r.md #110: 要素は [`Device`] (plugin か Parallel = 並列 chain の container)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub devices: Vec<PluginInstance>,
+    pub devices: Vec<Device>,
     pub volume: f32,
     pub pan: f32,
     /// 内蔵チャンネルストリップ (コンプ + EQ)。全 track が 1 個ずつ持ち、
@@ -399,10 +400,15 @@ impl Track {
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
     /// source=None + device の実例あり) ため、 装置の実在を真実として判定する。
     pub fn is_voicevox_vocal(&self) -> bool {
-        self.devices.iter().any(|d| {
+        plugins(&self.devices).any(|d| {
             d.format == crate::plugin_format::PluginFormat::Builtin
                 && d.plugin_id == crate::plugin_db::BUILTIN_ID_VOICEVOX
         })
+    }
+
+    /// r.md #110: このトラックの全 plugin (Parallel の中も含む、pre-order = 信号順)。
+    pub fn plugins(&self) -> PluginIter<'_> {
+        plugins(&self.devices)
     }
 
     /// (talk) このトラックが字幕(テキスト表示)デバイスを持つか。SSoT は
@@ -410,7 +416,7 @@ impl Track {
     /// `true` のときだけ、このトラック上の `ClipContent::Text` clip が画面に
     /// overlay 表示される (`docs/plan_voicevox_talk.md` §2、`text_compose` が gate)。
     pub fn has_subtitle_device(&self) -> bool {
-        self.devices.iter().any(|d| {
+        plugins(&self.devices).any(|d| {
             d.format == crate::plugin_format::PluginFormat::Builtin
                 && d.plugin_id == crate::plugin_db::SUBTITLE_ID
         })
@@ -425,10 +431,14 @@ impl Track {
     /// the summed bus (own main plus routed children). `None` when no device
     /// routes an aux output (a plain leaf / pure group). Derived purely from the
     /// explicit routing data (`aux_outputs`), never a role heuristic.
+    ///
+    /// r.md #110: index は **top-level** の `devices` 上。routed aux out を持つ plugin が
+    /// Parallel の中に居れば、その Parallel を含む top-level device の直後が split になる
+    /// (Parallel は分割せず丸ごと pass 1 で走らせる)。
     pub fn paraout_split_device(&self) -> Option<u32> {
         let mut last: Option<u32> = None;
         for (i, d) in self.devices.iter().enumerate() {
-            if d.aux_outputs.iter().any(Option::is_some) {
+            if d.routes_any_aux_output() {
                 last = Some(i as u32);
             }
         }
@@ -444,9 +454,7 @@ impl Track {
     /// signal and sums children on top (instrument-bus, `MixAdditive`). Decided
     /// purely from explicit routing data (`aux_outputs[0]`), no role heuristic.
     pub fn paraout_main_to_child(&self) -> bool {
-        self.devices
-            .iter()
-            .any(|d| matches!(d.aux_outputs.first(), Some(Some(_))))
+        plugins(&self.devices).any(|d| matches!(d.aux_outputs.first(), Some(Some(_))))
     }
 
     /// Allocate a new stable clip id, bumping the per-track counter.

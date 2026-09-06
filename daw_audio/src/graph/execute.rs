@@ -27,7 +27,7 @@ use crate::graph::mix::{
     has_soloed_contributor, mix_into_master, mix_into_track_scratch, mix_send_into_track_scratch,
     resolve_tap_buffers, track_needs_prefader_snapshot, track_needs_prefx_snapshot,
 };
-use crate::graph::{BufRef, NodeOp, Schedule};
+use crate::graph::{BufRef, ChainProgram, NodeOp, ProgramCtx, Schedule, run_chain_program};
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
 use crate::mod_tick::FollowerDrive;
@@ -39,7 +39,7 @@ use crate::sequencer::{NoteTransition, TimedNoteEvent};
 /// した device の `process()` はまだ plugin_host 側で走っている可能性があり、
 /// 入力を書き込むと並行 process と race する (poisoning contract)。
 #[inline]
-fn pair_usable(slot: &SyncSlot, entry: &PluginEntry) -> bool {
+pub(super) fn pair_usable(slot: &SyncSlot, entry: &PluginEntry) -> bool {
     !entry.quarantined.load(Ordering::Acquire) && !slot.poisoned.load(Ordering::Acquire)
 }
 
@@ -49,7 +49,7 @@ fn pair_usable(slot: &SyncSlot, entry: &PluginEntry) -> bool {
 /// 通知は RT からは行わない — flag を notify スレッド (`main.rs`) が poll して
 /// `AudioEvent::PluginUnresponsive` を 1 回だけ送る。 RT-safe: atomic store のみ。
 #[inline]
-fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry) -> bool {
+pub(super) fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry) -> bool {
     match slot.sync.dispatch(entry.plugin_ref.device_id, DISPATCH_TIMEOUT_MS) {
         Ok(DispatchOutcome::Done) => true,
         Ok(DispatchOutcome::TimedOut) => {
@@ -136,6 +136,8 @@ pub fn process_track_owned(
     track_idx: u32,
     song_track: &Track,
     scratch: &mut TrackScratch,
+    // r.md #110: この track の展開済み device 列 (`Schedule::track_programs[track_idx]`)。
+    program: &mut ChainProgram,
     plugin_refs: &PluginRefs,
     audio_renderer: Option<&AudioClipRenderer>,
     worker_sync: Option<&SyncSlot>,
@@ -190,13 +192,15 @@ pub fn process_track_owned(
     // summed bus (own main + children). `device_end` bounds the pass-1 device
     // loop; `skip_strip` defers the volume/pan strip + pre-fader/pre-fx
     // snapshots to pass 2.
-    let (device_end, skip_strip) = match song {
+    // r.md #110: pass 1 で走らせる op 区間。group-with-instrument は instrument prefix
+    // (`program.pass1_end`) まで、leaf は全部。
+    let skip_strip = match song {
         Some(s) => {
             let id = song_track.id;
             let has_children = s.track_has_children(id);
             let split = song_track.paraout_split_device();
             if has_children && split.is_some() {
-                (split.unwrap_or(0) as usize, true)
+                true
             } else if has_children
                 || s.track_receives_send(id)
                 || s.track_receives_paraout(id)
@@ -208,11 +212,12 @@ pub fn process_track_owned(
                 scratch.effective_mute = false;
                 return;
             } else {
-                (song_track.devices.len(), false)
+                false
             }
         }
-        None => (song_track.devices.len(), false),
+        None => false,
     };
+    let op_end = if skip_strip { program.pass1_end } else { program.ops.len() };
 
     // ---- Sequencer: assemble this buffer's MIDI bus ----
     scratch.midi_bus_a.clear();
@@ -300,126 +305,41 @@ pub fn process_track_owned(
     // group-with-instrument prefix (`skip_strip`) the meaningful pre-FX tap is
     // the summed bus before the suffix FX, captured in pass 2
     // (`run_group_fx_chain`), so skip the pass-1 capture here.
-    if !skip_strip
+    let captured_prefx = !skip_strip
         && (scratch.force_prefx_snapshot
-            || song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)))
-    {
+            || song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)));
+    if captured_prefx {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
 
-    // パラアウト: a group-with-instrument runs only its prefix `[0..device_end]`
-    // in pass 1; a leaf runs its whole chain (`device_end == devices.len()`).
-    for i in 0..device_end {
-        // v29: 安定 device id で直接 lookup。 song.tracks の Vec position にも
-        // chain 内 index にも依存しないので、 reorder / 削除で lookup が壊れない。
-        let device = &song_track.devices[i];
-        // r.md #105 bypass: dispatch せず次の device へ。 バス (track_l/r /
-        // midi_bus_a) は手前の状態のまま = 音声も MIDI も素通し。
-        if device.bypassed {
-            continue;
-        }
-        let ports = device.ports;
-        let Some(entry) = plugin_refs.get(&device.id) else {
-            continue;
-        };
-        let Some(ws) = worker_sync else { continue };
-        // quarantine / poison gate — 通らない device は pd にも触らない
-        // (並行 process との race 回避、 冒頭の contract 参照)。
-        if !pair_usable(ws, entry) {
-            continue;
-        }
-
-        let pd = entry.plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region, rows.track());
-        // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
-        // M1 (r.md #8): note を param automation より **先に** push する。 B4 の
-        // sub-buffer param automation は events_in (MAX_EVENTS=256) を最大
-        // frames/64 event/lane 消費するので、 param を先に積むと大量 automation 時に
-        // 後続の NoteOff が溢れて drop → ハングノートになる。 note を先に確保すれば
-        // 溢れるのは automation 側だけ (= 音は詰まらず automation が step するのみ)。
-        // plugin host は event を time 順に sort するので発音順序は不変。
-        if ports.has_note_input {
-            for ev in &scratch.midi_bus_a {
-                match ev.event {
-                    NoteTransition::On { note_id, key, velocity } => {
-                        pd.push_note_on(ev.time, key, velocity, 0, note_id)
-                    }
-                    NoteTransition::Off { note_id, key } => {
-                        pd.push_note_off(ev.time, key, 0, note_id)
-                    }
-                }
-            }
-        }
-        if let Some(song) = song {
-            crate::automation::fill_pd_param_events(
-                pd,
-                song,
-                track_id,
-                rows,
-                device.id,
-                sample_rate,
-                f64::from(current_bpm),
-                playhead_beats,
-                frames,
-                recording_lanes,
-                mod_plane,
-            );
-        }
-        if ports.has_audio_input {
-            pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
-            pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
-        }
-        if !dispatch_bounded(ws, entry) {
-            continue;
-        }
-        // ---- outputs ----
-        // note 出力を持つなら出力 MIDI で次段のバスを置き換える (無ければ素通し)。
-        if ports.has_note_output {
-            scratch.midi_bus_b.clear();
-            let n_out = pd.n_events_out as usize;
-            for ev in &pd.events_out[..n_out.min(pd.events_out.len())] {
-                let timed = match ev.kind {
-                    EventKind::NoteOn => TimedNoteEvent {
-                        time: ev.time,
-                        event: NoteTransition::On {
-                            note_id: ev.note_id,
-                            key: ev.key,
-                            velocity: ev.velocity,
-                        },
-                    },
-                    EventKind::NoteOff => TimedNoteEvent {
-                        time: ev.time,
-                        event: NoteTransition::Off {
-                            note_id: ev.note_id,
-                            key: ev.key,
-                        },
-                    },
-                    EventKind::ParamValue => continue,
-                };
-                scratch.midi_bus_b.push(timed);
-            }
-            scratch.midi_bus_b.sort_unstable_by_key(|e| e.time);
-            std::mem::swap(&mut scratch.midi_bus_a, &mut scratch.midi_bus_b);
-        }
-        // audio 出力を持つなら: audio 入力も持つ機 (= エフェクト) は処理結果で
-        // 置き換え、入力を持たない機 (= 音源/生成器) はソースとして加算する。
-        if ports.has_audio_output {
-            if ports.has_audio_input {
-                scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-                scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-            } else {
-                for j in 0..n {
-                    scratch.track_l[j] += pd.buffer_out[0][j];
-                    scratch.track_r[j] += pd.buffer_out[1][j];
-                }
-            }
-        }
-    }
+    // ---- device chain (r.md #110: 展開済み program を 1 本の walker で走らせる) ----
+    // port 直結規則 / Parallel の fork-join は `run_chain_program` (`program.rs`)。
+    // group-with-instrument は instrument prefix `[0..pass1_end]` だけ (残りは pass 2)。
+    let ctx = ProgramCtx {
+        song,
+        plugin_refs,
+        worker_sync,
+        sample_rate,
+        frames,
+        playing,
+        current_bpm,
+        playhead_beats,
+        loop_region,
+        recording_lanes,
+        mod_plane,
+        rows,
+        own_pre_fx: captured_prefx.then_some((&scratch.pre_fx_l[..], &scratch.pre_fx_r[..])),
+    };
+    run_chain_program(
+        program,
+        0..op_end,
+        &mut scratch.track_l,
+        &mut scratch.track_r,
+        &mut scratch.midi_bus_a,
+        &mut scratch.midi_bus_b,
+        &ctx,
+    );
 
     // パラアウト (docs/plan_paraout.md): a parallel-out source's pass-1 work
     // ends here — its output buses are in `buffer_aux_out` (and, for 楽器兼バス
@@ -515,7 +435,9 @@ pub fn process_track_owned(
 /// `master_l/r` と plugin 側 ProcessData shmem のみを使う。
 #[allow(clippy::too_many_arguments)]
 pub fn process_master_fx_chain(
-    master_fx_chain: &[common::model::PluginInstance],
+    program: &mut ChainProgram,
+    midi_a: &mut Vec<TimedNoteEvent>,
+    midi_b: &mut Vec<TimedNoteEvent>,
     master_l: &mut [f32],
     master_r: &mut [f32],
     plugin_refs: &PluginRefs,
@@ -533,51 +455,25 @@ pub fn process_master_fx_chain(
     // アレンジのカーブではなくセルのカーブを使う。
     master_rows: TrackRows<'_>,
 ) {
-    let n = frames as usize;
-    let Some(ws) = worker_sync else { return };
-    for device in master_fx_chain {
-        // r.md #105 bypass: dispatch せず素通し (track chain と同じ)。
-        if device.bypassed {
-            continue;
-        }
-        let Some(entry) = plugin_refs.get(&device.id) else {
-            continue;
-        };
-        if !pair_usable(ws, entry) {
-            continue;
-        }
-        let pd = entry.plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region, master_rows.track());
-        // master fx param automation (`song_lanes` の PluginParam lane) + 変調
-        // (`song_mod_routings`) を MASTER_TRACK_ID 経路で適用 (r.md #8、 track/group
-        // fx と同一 idiom)。
-        if let Some(song) = song {
-            crate::automation::fill_pd_param_events(
-                pd,
-                song,
-                common::model::MASTER_TRACK_ID,
-                master_rows,
-                device.id,
-                sample_rate,
-                f64::from(current_bpm),
-                playhead_beats,
-                frames,
-                recording_lanes,
-                mod_plane,
-            );
-        }
-        pd.buffer_in[0][..n].copy_from_slice(&master_l[..n]);
-        pd.buffer_in[1][..n].copy_from_slice(&master_r[..n]);
-        if !dispatch_bounded(ws, entry) {
-            continue;
-        }
-        master_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-        master_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-    }
+    // master は note を持たない = 空の MIDI バスで走らせる。
+    midi_a.clear();
+    let ctx = ProgramCtx {
+        song,
+        plugin_refs,
+        worker_sync,
+        sample_rate,
+        frames,
+        playing,
+        current_bpm,
+        playhead_beats,
+        loop_region,
+        recording_lanes,
+        mod_plane,
+        rows: master_rows,
+        own_pre_fx: None,
+    };
+    let len = program.ops.len();
+    run_chain_program(program, 0..len, master_l, master_r, midi_a, midi_b, &ctx);
 }
 
 /// Replay the post-dispatch portion of the routing schedule:
@@ -626,6 +522,10 @@ pub fn execute_schedule_post_dispatch(
         follower_keys: _,
         mod_kinds: _,
         master_latency_samples: _,
+        track_programs,
+        master_program,
+        master_midi_a: _,
+        master_midi_b: _,
     } = schedule;
     for op in nodes.iter() {
         match op {
@@ -661,21 +561,24 @@ pub fn execute_schedule_post_dispatch(
                 dst:
                     BufRef::Pooled(_)
                     | BufRef::PreFaderScratch(_)
-                    | BufRef::PreFxScratch(_),
+                    | BufRef::PreFxScratch(_)
+                    | BufRef::ChainPostFx { .. }
+                    | BufRef::ChainPostFader { .. }
+                    | BufRef::ParallelInput { .. },
                 ..
             } => {
                 // Pooled targets land here once pooled-bus routing arrives.
                 // A Mix into a Pre*Scratch is never emitted (those are written
                 // by ProcessTrack), but the arm keeps the match exhaustive.
             }
-            NodeOp::ProcessGroupFx {
-                track_idx,
-                start_device,
-            } => {
+            NodeOp::ProcessGroupFx { track_idx, start_op } => {
                 let Some(track) = song.tracks.get(*track_idx as usize) else {
                     continue;
                 };
                 let Some(target) = scratch.get_mut(*track_idx as usize) else {
+                    continue;
+                };
+                let Some(program) = track_programs.get_mut(*track_idx as usize) else {
                     continue;
                 };
                 run_group_fx_chain(
@@ -683,6 +586,7 @@ pub fn execute_schedule_post_dispatch(
                     track,
                     song,
                     target,
+                    program,
                     plugin_refs,
                     worker_sync,
                     sample_rate,
@@ -694,7 +598,7 @@ pub fn execute_schedule_post_dispatch(
                     playhead_beats,
                     loop_region,
                     mod_plane,
-                    *start_device,
+                    *start_op as usize,
                     rows.track_rows(*track_idx as usize),
                 );
             }
@@ -736,7 +640,9 @@ pub fn execute_schedule_post_dispatch(
                 // point picks the source buffer — PostFader / PostFx
                 // (pre-fader) / PreFx. v29: 宛先 plugin は安定 device id。
                 // RT path: skip silently on any miss (no per-buffer tracing).
-                let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
+                let Some((src_l, src_r)) =
+                    resolve_tap_buffers(scratch, track_programs, master_program, *src)
+                else {
                     continue;
                 };
                 let port = *aux_in_port as usize;
@@ -838,7 +744,9 @@ pub fn execute_schedule_post_dispatch(
                 // `follower_slots[slot].env`; the engine publishes it into the
                 // modulation plane after this walk. RT-safe: pure
                 // arithmetic, no alloc / lock.
-                let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
+                let Some((src_l, src_r)) =
+                    resolve_tap_buffers(scratch, track_programs, master_program, *src)
+                else {
                     continue;
                 };
                 let Some(fs) = follower_slots.get_mut(*slot as usize) else {
@@ -861,6 +769,7 @@ fn run_group_fx_chain(
     song_track: &Track,
     song: &Song,
     scratch: &mut TrackScratch,
+    program: &mut ChainProgram,
     plugin_refs: &PluginRefs,
     worker_sync: Option<&SyncSlot>,
     sample_rate: u32,
@@ -874,11 +783,11 @@ fn run_group_fx_chain(
     loop_region: LoopRegion,
     // B3 (r.md #8): group fx PluginParam の変調の値面。
     mod_plane: ModTickPlaneRef<'_>,
-    // パラアウト (docs/plan_paraout.md): first device index to run. `0` for a
+    // パラアウト (docs/plan_paraout.md): first program op to run. `0` for a
     // pure group / return (whole chain is bus FX). For a group-with-instrument
-    // it's the prefix split point — the instrument `[0..start_device]` ran in
-    // pass 1, so here we run only the suffix FX `[start_device..]` on the bus.
-    start_device: u32,
+    // it's the prefix split point — the instrument `[0..pass1_end]` ran in
+    // pass 1, so here we run only the suffix FX `[start_op..]` on the bus.
+    start_op: usize,
     // r.md #87: この group の行の供給元 (レーン行の automation に効く)。
     rows: TrackRows<'_>,
 ) {
@@ -890,79 +799,40 @@ fn run_group_fx_chain(
     // source (guarded — untouched groups skip the memcpy). For a
     // group-with-instrument this is the summed bus *before the suffix FX* (the
     // instrument prefix already ran), which is the right pre-FX tap point.
-    if scratch.force_prefx_snapshot || track_needs_prefx_snapshot(song, track_id) {
+    let captured_prefx = scratch.force_prefx_snapshot || track_needs_prefx_snapshot(song, track_id);
+    if captured_prefx {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
 
-    // v23 single-chain: a group / return bus has a summed audio input (no
-    // sequencer notes), so the chain runs entirely in the audio domain. Walk
-    // `devices` once and connect audio ports serially (Reaper 流) — feed the
-    // bus signal into any device that takes audio in, dispatch, then write the
-    // audio out back (replace when the device has an audio input = effect, add
-    // when it has none = pure source). MIDI ports are irrelevant on a bus.
-    // パラアウト: skip the instrument prefix `[0..start_device]` (already run in
-    // pass 1) — run only the suffix FX.
-    for i in start_device as usize..song_track.devices.len() {
-        let device = &song_track.devices[i];
-        // r.md #105 bypass: dispatch せず素通し (leaf chain と同じ)。
-        if device.bypassed {
-            continue;
-        }
-        let ports = device.ports;
-        if !ports.has_audio_output {
-            // No audio output (e.g. a pure MIDI effect) — nothing to contribute
-            // to a bus signal; skip.
-            continue;
-        }
-        // v29: 安定 device id で直接 lookup。
-        let Some(entry) = plugin_refs.get(&device.id) else {
-            continue;
-        };
-        let Some(ws) = worker_sync else { continue };
-        if !pair_usable(ws, entry) {
-            continue;
-        }
-
-        let pd = entry.plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, loop_region, rows.track());
-        // Phase 2b: group fx 宛 PluginParam automation + B3 (r.md #8) follower 変調。
-        crate::automation::fill_pd_param_events(
-            pd,
-            song,
-            track_id,
-            rows,
-            device.id,
-            sample_rate,
-            f64::from(current_bpm),
-            playhead_beats,
-            frames,
-            recording_lanes,
-            mod_plane,
-        );
-        if ports.has_audio_input {
-            pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
-            pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
-        }
-        if !dispatch_bounded(ws, entry) {
-            continue;
-        }
-        if ports.has_audio_input {
-            // effect: 入力を処理した結果で bus を置換。
-            scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-            scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-        } else {
-            // source: 入力を取らず生成する機 → bus に加算。
-            for j in 0..n {
-                scratch.track_l[j] += pd.buffer_out[0][j];
-                scratch.track_r[j] += pd.buffer_out[1][j];
-            }
-        }
-    }
+    // r.md #110: bus の device 列も同じ walker。summed audio を入力に、MIDI バスは空
+    // (bus は note を持たない) で `[start_op..]` を走らせる。
+    scratch.midi_bus_a.clear();
+    let ctx = ProgramCtx {
+        song: Some(song),
+        plugin_refs,
+        worker_sync,
+        sample_rate,
+        frames,
+        playing,
+        current_bpm,
+        playhead_beats,
+        loop_region,
+        recording_lanes,
+        mod_plane,
+        rows,
+        own_pre_fx: captured_prefx.then_some((&scratch.pre_fx_l[..], &scratch.pre_fx_r[..])),
+    };
+    let len = program.ops.len();
+    run_chain_program(
+        program,
+        start_op..len,
+        &mut scratch.track_l,
+        &mut scratch.track_r,
+        &mut scratch.midi_bus_a,
+        &mut scratch.midi_bus_b,
+        &ctx,
+    );
 
     // ---- 内蔵チャンネルストリップ (Comp → EQ) ----
     // leaf 経路 (`process_track_owned`) と同じ位置 = pre-fader tap の前。
@@ -1117,6 +987,7 @@ pub fn render_master_buffer(
         pool.dispatch_and_wait(
             Some(song),
             &mut scratch[..n_tracks],
+            &mut schedule.track_programs,
             plugin_refs,
             audio_renderer,
             slots,
@@ -1153,10 +1024,14 @@ pub fn render_master_buffer(
                 .get(track_idx)
                 .copied()
                 .unwrap_or(0);
+            let Some(program) = schedule.track_programs.get_mut(track_idx) else {
+                continue;
+            };
             process_track_owned(
                 track_idx as u32,
                 song_track,
                 track_scratch,
+                program,
                 plugin_refs,
                 Some(audio_renderer),
                 worker_sync,
@@ -1227,7 +1102,9 @@ pub fn render_master_buffer(
     // 全 track mix 後に直列 process。 live/export 両経路で通るので、 master に
     // 挿した limiter / EQ が WAV にも乗る (旧 export は素通りだった)。
     process_master_fx_chain(
-        &song.master_fx_chain,
+        &mut schedule.master_program,
+        &mut schedule.master_midi_a,
+        &mut schedule.master_midi_b,
         &mut master_l[..n],
         &mut master_r[..n],
         plugin_refs,
@@ -1284,7 +1161,7 @@ pub(crate) fn test_plugin_refs(
 mod sidechain_tests {
     use super::*;
     use crate::graph::compile_schedule_for_test;
-    use common::model::{PluginInstance, Song, Track};
+    use common::model::{Device, PluginInstance, Song, Track};
     use common::plugin_format::PluginFormat;
 
     /// v23 single-chain: `Track::default()` を mutator で埋める helper。 downstream
@@ -1349,7 +1226,7 @@ mod sidechain_tests {
                     t.name = "Dest".into();
                     // v23 single-chain: an audio-FX device (audio_output only,
                     // no note input) → derives as AudioEffect at device 0.
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 42,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
@@ -1365,7 +1242,7 @@ mod sidechain_tests {
                                 has_video_output: false,
                             },
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()
@@ -1429,7 +1306,7 @@ mod sidechain_tests {
                 }),
                 track(|t| {
                     t.id = 2;
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 42,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
@@ -1444,7 +1321,7 @@ mod sidechain_tests {
                                 has_video_output: false,
                             },
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()

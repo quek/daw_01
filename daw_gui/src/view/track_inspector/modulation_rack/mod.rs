@@ -279,14 +279,14 @@ pub(super) fn draw_modulation_rack(
         if let K::EnvelopeFollower { tap, .. } = &src.kind {
             let sel = mod_track_choices
                 .iter()
-                .position(|(tid, _)| *tid == tap.source_track)
+                .position(|(src, _)| *src == tap.source)
                 .unwrap_or(0);
             if let Some(picked) =
                 ui.dropdown(("inspector_mod_src_track", sid), name_rect, &mod_track_labels, sel)
-                && let Some(&(tid, _)) = mod_track_choices.get(picked)
+                && let Some(&(src, _)) = mod_track_choices.get(picked)
             {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetModSourceTrack { id: sid, source_track: tid });
+                    app.handle_event(AppEvent::SetModSourceTap { id: sid, source: src });
                 }));
             }
         } else {

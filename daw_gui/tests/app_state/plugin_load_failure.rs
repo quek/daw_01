@@ -39,7 +39,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
 
     // 1. instrument を picker からロード → SetSlotPlugin 送信、 pending に entry。
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -125,13 +125,13 @@ fn load_failure_keeps_other_pending_unaffected() {
 
     // instrument + Fx の 2 つを順次ロード → pending 2 件。
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
         open_gui: true,
     });
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.fx".into(),
         keep_open: false,
@@ -208,7 +208,7 @@ fn failed_load_is_visible_in_chain_and_reload_retries() {
     let track_id = app.song_doc.song().tracks[0].id;
 
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -268,7 +268,7 @@ fn stale_generation_failure_is_ignored() {
     let track_id = app.song_doc.song().tracks[0].id;
 
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,

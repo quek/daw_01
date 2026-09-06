@@ -4,7 +4,6 @@
 use crate::state::*;
 use crate::app_types::*;
 use common::model::Track;
-use common::plugin_format::PluginFormat;
 
 impl AppData {
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
@@ -294,82 +293,6 @@ impl AppData {
         }
     }
 
-    /// Per-plugin sidechain wiring entries shown in the inspector. One
-    /// entry per chain plugin (MidiFx / Instrument / Fx); each carries
-    /// the plugin's current `aux_inputs[0]` tap source (port 0; PR4
-    /// only exposes the first aux input port through the inspector). The
-    /// track picker UI maps `None` → "—" and `Some(track_id)` → the
-    /// track's name. Self-track is filtered out by the picker because
-    /// feeding a track its own output into a sidechain creates a
-    /// feedback loop the schedule compiler catches with `GraphError::Cycle`.
-    pub fn sidechain_entries(&self) -> Vec<SidechainEntry> {
-        // 単一デバイスチェーン: master bus も通常 track も flat な device 列を
-        // `device_index` でアドレスする (役割は位置から導出するので保持しない)。
-        // master 選択時は track Vec ではなく Song.master_fx_chain を対象にする。
-        let (track_id, devices): (u32, &[common::model::PluginInstance]) =
-            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-                (common::model::MASTER_TRACK_ID, &self.song_doc.song().master_fx_chain)
-            } else {
-                let Some(track) = self
-                    .cursor_track_index()
-                    .and_then(|i| self.song_doc.song().tracks.get(i))
-                else {
-                    return Vec::new();
-                };
-                (track.id, track.devices.as_slice())
-            };
-        let entries: Vec<SidechainEntry> = devices
-            .iter()
-            .map(|p| SidechainEntry {
-                track_id,
-                device_id: p.id,
-                plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
-                current_source: p
-                    .aux_inputs
-                    .first()
-                    .and_then(|o| o.as_ref())
-                    .map(|r| r.tap.source_track),
-                current_tap_point: p
-                    .aux_inputs
-                    .first()
-                    .and_then(|o| o.as_ref())
-                    .map(|r| r.tap.tap_point)
-                    .unwrap_or_default(),
-            })
-            .collect();
-        // PR4.5 diagnostic: if any chain plugin has a non-empty
-        // aux_inputs, log the resolved current_source values once
-        // per inspector_chain rebuild. Helps catch UI ↔ model state
-        // mismatches (= dropdown shows "—" but model has Some(id)).
-        let any_wired = devices.iter().any(|p| !p.aux_inputs.is_empty());
-        if any_wired {
-            // Dump raw model state alongside entries so we can see the
-            // exact values UI is displaying. trace! to avoid frame-rate
-            // spam at default log levels; enable with RUST_LOG=trace.
-            let raw: Vec<(u32, String, Vec<Option<u32>>)> = devices
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        i as u32,
-                        p.plugin_id.clone(),
-                        p.aux_inputs
-                            .iter()
-                            .map(|o| o.as_ref().map(|r| r.tap.source_track))
-                            .collect(),
-                    )
-                })
-                .collect();
-            tracing::trace!(
-                cursor_track_id = track_id,
-                ?raw,
-                ?entries,
-                "sidechain_entries: rebuilt for cursor track"
-            );
-        }
-        entries
-    }
-
     /// パラアウト (docs/plan_paraout.md): one entry per chain device on the
     /// cursor track that declares `is_main=false` audio outputs
     /// (`aux_output_count > 0`). Drives the inspector's "Parallel Out" section
@@ -389,8 +312,7 @@ impl AppData {
         };
         let track_id = track.id;
         track
-            .devices
-            .iter()
+            .plugins()
             .filter(|p| p.aux_output_count > 0)
             .map(|p| {
                 let count = p.aux_output_count as usize;
@@ -445,12 +367,24 @@ impl AppData {
     /// dropdown — `(track_id, name)` for every track (a source may tap any
     /// track, including itself: the follower is control-rate, not a feedback
     /// loop).
-    pub fn mod_source_track_choices(&self) -> Vec<(u32, String)> {
-        self.song_doc.song()
+    /// r.md #110: 他 track に加えて **同 track の Parallel 内 chain** も選べる (Bitwig と同じ)。
+    /// 自 track 自身も可 (follower は control-rate なので feedback にならない)。
+    pub fn mod_source_track_choices(&self) -> Vec<(common::model::TapSource, String)> {
+        let song = self.song_doc.song();
+        let mut out: Vec<(common::model::TapSource, String)> = song
             .tracks
             .iter()
-            .map(|t| (t.id, t.name.clone()))
-            .collect()
+            .map(|t| (common::model::TapSource::Track(t.id), t.name.clone()))
+            .collect();
+        if let Some(devices) = self.cursor_track_id().and_then(|id| song.fx_chain_by_track_id(id)) {
+            common::model::for_each_chain(devices, &mut |parallel, c| {
+                out.push((
+                    common::model::TapSource::Chain(c.id),
+                    format!("{} / {}", parallel.name, c.name),
+                ));
+            });
+        }
+        out
     }
 
     /// r.md #78: `source_id` を参照する **全ての** routing を、 対象がどのトラックに
@@ -588,8 +522,7 @@ impl AppData {
         else {
             return None;
         };
-        let (track_id, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
-        let inst = device_at(self.song_doc.song(), track_id, device_index)?;
+        let inst = self.song_doc.song().plugin_by_id(*device_id)?;
         let device = self.device_label(inst);
         if let Some(def) = common::video_fx::def_by_id(&inst.plugin_id) {
             let param = def.param(*param_id)?;
@@ -741,23 +674,23 @@ impl AppData {
     // プラグイン自身の窓の中のツマミは `PluginParamTouched` が拾う
     // (`handler/ipc.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
 
+    /// r.md #110: sidechain の source 候補 (「—」 + 他 track + 同 track の Parallel 内 chain)。
+    /// sidechain の source 候補 = 「—」 + **このトラックの入力 (Pre-FX)** + 他 track +
+    /// 同 track の Parallel 内 chain。 自 track は Pre-FX だけ (出力側は feedback)。
     pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
-        let cursor_id = self.cursor_track_id();
-        let mut choices: Vec<SidechainSourceChoice> = Vec::with_capacity(self.song_doc.song().tracks.len() + 1);
-        choices.push(SidechainSourceChoice {
-            label: "—".into(),
-            track_id: None,
-        });
-        for t in &self.song_doc.song().tracks {
-            if Some(t.id) == cursor_id {
-                continue;
-            }
-            choices.push(SidechainSourceChoice {
-                label: format!("{} (id {})", t.name, t.id),
-                track_id: Some(t.id),
-            });
+        let mut v = self.tap_source_choices(true);
+        if let Some(tid) = self.cursor_track_id()
+            && tid != common::model::MASTER_TRACK_ID
+        {
+            v.insert(
+                1,
+                SidechainSourceChoice {
+                    label: "このトラックの入力 (Pre-FX)".into(),
+                    source: Some(common::model::TapSource::Track(tid)),
+                },
+            );
         }
-        choices
+        v
     }
 
     /// Audio event field の inspector 表示用ライト read snapshot。
@@ -1024,49 +957,18 @@ impl AppData {
     /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): `Track.devices`
     /// (master bus は `master_fx_chain`) を flat な行として返す。役割の判定は
     /// せず、plugin 名のみを並べる (挙動は engine の port 直結で決まる)。
+    /// r.md #110: cursor track の **全 plugin** (Parallel の中も含む、信号順) の行情報。
+    /// 表示ツリーは [`Self::chain_rows`]。 こちらは「読み込み失敗」 section や
+    /// 選択の正規化のような「plugin の集合」 が欲しい呼び出し側用。
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
         };
-        let devices: &[common::model::PluginInstance] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.song_doc.song().master_fx_chain
-            } else {
-                let Some(idx) = self.cursor_track_index() else {
-                    return Vec::new();
-                };
-                let Some(track) = self.song_doc.song().tracks.get(idx) else {
-                    return Vec::new();
-                };
-                track.devices.as_slice()
-            };
-        devices
-            .iter()
-            .map(|p| {
-                // 埋め込み GUI の有無。 builtin (VOICEVOX / Silence) は
-                // 規定で持たないので format から即断 (= PluginParamList 到着前でも
-                // 正しく「Par」routing)。 外部 CLAP・VST3 は host の通知
-                // (`slot_has_gui`)、 未受信 (load 直後) は楽観的に true で「GUI」のまま。
-                let has_embedded_gui = p.format != PluginFormat::Builtin
-                    && self.ipc.slot_has_gui.get(&p.id).copied().unwrap_or(true);
-                let has_params = self
-                    .ipc.plugin_params
-                    .get(&p.id)
-                    .is_some_and(|v| !v.is_empty());
-                let is_voicevox = p.format == PluginFormat::Builtin
-                    && p.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX;
-                ChainEntry {
-                    device_id: p.id,
-                    plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
-                    has_embedded_gui,
-                    is_video: p.ports.is_video(),
-                    is_voicevox,
-                    has_params,
-                    send_all_keys: p.send_all_keys_to_plugin,
-                    load_error: self.ipc.failed_plugin_loads.get(&p.id).cloned(),
-                    bypassed: p.bypassed,
-                }
-            })
+        let Some(devices) = self.song_doc.song().fx_chain_by_track_id(track_id) else {
+            return Vec::new();
+        };
+        common::model::plugins(devices)
+            .map(|p| self.chain_entry_for(p))
             .collect()
     }
 

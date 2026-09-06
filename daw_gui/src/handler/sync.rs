@@ -124,7 +124,7 @@ impl AppData {
         let mut live: std::collections::HashMap<u64, Vec<common::protocol::AraClipSpec>> =
             std::collections::HashMap::new();
         for track in &self.song_doc.song().tracks {
-            for device in track.devices.iter() {
+            for device in track.plugins() {
                 if device.id == 0
                     || !db.find_by_id(&device.plugin_id).is_some_and(|entry| entry.is_ara())
                 {
@@ -184,11 +184,9 @@ impl AppData {
         for (device_id, clips) in rebuilds {
             // Restore any saved ARA edits for this device alongside the rebuild.
             let archive = self
-                .song_doc.song()
-                .tracks
-                .iter()
-                .flat_map(|t| t.devices.iter())
-                .find(|d| d.id == device_id)
+                .song_doc
+                .song()
+                .plugin_by_id(device_id)
                 .and_then(|d| d.ara_archive.as_deref().map(<[u8]>::to_vec));
             self.send_plugin(PluginCommand::SetupAraDocument {
                 device_id,
@@ -232,8 +230,7 @@ impl AppData {
         let mut todo: Vec<common::model::AudioSourceId> = Vec::new();
         for track in &self.song_doc.song().tracks {
             let has_ara = track
-                .devices
-                .iter()
+                .plugins()
                 .any(|d| db.find_by_id(&d.plugin_id).is_some_and(|e| e.is_ara()));
             if !has_ara {
                 continue;
@@ -413,10 +410,7 @@ impl AppData {
         // 解決済みで no-op に収束する)。
         let needs = {
             let song = self.song_doc.song();
-            song.tracks
-                .iter()
-                .flat_map(|t| t.devices.iter())
-                .chain(song.master_fx_chain.iter())
+            song.all_plugins()
                 .any(|d| d.ports.is_unresolved() && db.find_by_id(&d.plugin_id).is_some())
         };
         if !needs {
@@ -428,12 +422,7 @@ impl AppData {
         // そのときは dirty で正しい (= 再保存で解決済み ports を永続化)。
         self.normalize_song_checked(|song| {
             let mut changed = false;
-            for d in song
-                .tracks
-                .iter_mut()
-                .flat_map(|t| t.devices.iter_mut())
-                .chain(song.master_fx_chain.iter_mut())
-            {
+            song.for_each_plugin_mut(&mut |d| {
                 let resolved = common::port_config::PortConfig::resolve(
                     d.ports,
                     db.find_by_id(&d.plugin_id).map(port_config_of),
@@ -442,7 +431,7 @@ impl AppData {
                     d.ports = resolved;
                     changed = true;
                 }
-            }
+            });
             changed
         });
     }

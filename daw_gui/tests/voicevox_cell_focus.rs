@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use common::model::{Clip, ClipContent, ImageContent, MidiContent, MouthMap, Note, PluginInstance, SessionClip, Track};
+use common::model::Device;
 use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
 use common::protocol::PluginCommand;
@@ -112,7 +113,7 @@ fn app_with_vocal_cell() -> (AppData, UnboundedReceiver<PluginCommand>) {
         song.tracks.push(Track {
             id: 1,
             next_clip_id: 3,
-            devices: vec![PluginInstance {
+            devices: vec![Device::Plugin(PluginInstance {
                 id: 5,
                 ..PluginInstance::with_ports(
                     common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
@@ -123,7 +124,7 @@ fn app_with_vocal_cell() -> (AppData, UnboundedReceiver<PluginCommand>) {
                         ..Default::default()
                     },
                 )
-            }],
+            })],
             clips: vec![Clip {
                 id: 1,
                 start_beat: 0.0,

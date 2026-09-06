@@ -138,7 +138,7 @@ fn device_drag_over_headers(
             .map_or(0, <[_]>::len) as u32;
         app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
             device_ids: payload.device_ids.clone(),
-            dest_track: hover_track,
+            dest: common::model::ChainRef::Track(hover_track),
             dest_index,
             copy,
         }));

@@ -28,7 +28,7 @@ fn make_song_with_one_track(track_id: u32, devices: Vec<PluginInstance>) -> Song
     song.tracks.push(daw_gui::app::track_with(|t| {
         t.id = track_id;
         t.name = "T".into();
-        t.devices = devices;
+        t.devices = devices.into_iter().map(common::model::Device::Plugin).collect();
     }));
     song
 }

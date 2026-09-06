@@ -119,6 +119,7 @@ struct InstanceRecord {
     loaded_id: String,
     name: String,
     aux_output_count: u8,
+    aux_input_count: u8,
     /// この device の `ProcessData` shmem の RAII owner (作成者 = 本
     /// プロセス)。record が生きている間 mapping を保持する。
     _shmem: common::process_data::ProcessDataHandle,
@@ -1236,6 +1237,7 @@ impl PluginHost {
                 // error は常に None。
                 state_load_error: None,
                 aux_output_count: rec.aux_output_count,
+                aux_input_count: rec.aux_input_count,
                 generation,
             };
             self.emit(evt);
@@ -1349,6 +1351,7 @@ impl PluginHost {
         let loaded_id = plugin.id().to_string();
         let loaded_name = plugin.name().to_string();
         let aux_output_count = plugin.aux_output_port_count().min(u8::MAX as usize) as u8;
+        let aux_input_count = plugin.aux_input_port_count().min(u8::MAX as usize) as u8;
         let latency_samples = plugin.query_latency();
         let params = plugin.enumerate_params();
         let has_embedded_gui = plugin.gui_is_embed_supported();
@@ -1368,6 +1371,7 @@ impl PluginHost {
                 loaded_id: loaded_id.clone(),
                 name: loaded_name.clone(),
                 aux_output_count,
+                aux_input_count,
                 _shmem: shmem,
                 shmem_id: shmem_id.clone(),
                 restarts: RestartWindowTracker::default(),
@@ -1392,6 +1396,7 @@ impl PluginHost {
             shmem_id,
             state_load_error,
             aux_output_count,
+            aux_input_count,
             generation,
         });
         tracing::info!(device_id, samples = latency_samples, "plugin reported latency");

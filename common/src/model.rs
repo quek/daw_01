@@ -17,6 +17,7 @@ mod clip_window;
 mod master_strip;
 mod content;
 mod content_split;
+mod device;
 mod ids;
 mod midi_bind;
 mod modulation;
@@ -28,6 +29,7 @@ pub use automation::*;
 pub use clip_window::*;
 pub use master_strip::*;
 pub use content::*;
+pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;
 pub use modulation::*;
@@ -241,7 +243,12 @@ pub use view_state::ViewState;
 /// 変わり、`BindingTarget` にランチャー操作 6 種が加わる。パッドはノートで撃つので
 /// CC だけでは足りない。旧 `controller` は deserialize 専用に降格し、
 /// `Song::ensure_midi_binding_inputs` が load 時に `input` へ移す。
-pub const CURRENT_VERSION: u32 = 35;
+///
+/// v36 (r.md #110 Parallel / `docs/plan_parallel.md`): `Track.devices` / `Song.master_fx_chain` の要素が
+/// [`Device`] (plugin | Parallel) になり、[`AudioTap`] の source が track | chain の enum になった。
+/// どちらも旧 JSON と byte 互換 (`untagged` / `flatten`) なので migration 関数は不要。
+/// `PluginInstance.aux_input_count` (host 報告値) を追加。
+pub const CURRENT_VERSION: u32 = 36;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -583,8 +590,9 @@ pub struct Song {
     /// 既存パターン (`automation_lane_by_key_mut` 参照) の踏襲。 audio engine は全
     /// track mix 後・metronome 前に `(MASTER_TRACK_ID, PluginSlot::Fx(i))` keying で
     /// 直列 process する。 旧 file は `#[serde(default)]` で空 Vec に forward-migrate。
+    /// r.md #110: 要素は [`Device`] (plugin か Parallel)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub master_fx_chain: Vec<PluginInstance>,
+    pub master_fx_chain: Vec<Device>,
     /// v33: master bus の出力音量 (linear amp、`1.0` = 0dB unity、上限
     /// [`MAX_TRACK_GAIN`] = +6dB)。全 track を mix し `master_fx_chain` を通した
     /// **最後**に掛かる。
@@ -1468,6 +1476,17 @@ impl Song {
         if self.video_resolution.0 == 0 || self.video_resolution.1 == 0 {
             self.video_resolution = default_video_resolution();
         }
+        // r.md #110: Parallel chain の gain / pan は RT が snapshot からそのまま掛ける
+        // (IPC の `SetChain*` は境界で clamp するが、LoadSong は素通し) ので、
+        // ここで値域に収める。
+        let mut fix_chain = |c: &mut ParallelChain| {
+            c.gain = if c.gain.is_finite() { c.gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
+            c.pan = if c.pan.is_finite() { c.pan.clamp(-1.0, 1.0) } else { 0.0 };
+        };
+        for t in &mut self.tracks {
+            for_each_chain_mut(&mut t.devices, &mut fix_chain);
+        }
+        for_each_chain_mut(&mut self.master_fx_chain, &mut fix_chain);
     }
 
     /// Single entry point for all pre-save normalization. GC orphan
@@ -1678,7 +1697,7 @@ impl Song {
     /// v23: 非 master track は役割別 3 chain を `devices` に統合済みなので、
     /// 旧 `fx_chain` ではなく chain 全体 (`devices`) を返す。master_fx_chain は
     /// もともと単一 Vec (= 音源境界なしの全 audio FX) なのでそのまま。
-    pub fn fx_chain_by_track_id(&self, track_id: u32) -> Option<&[PluginInstance]> {
+    pub fn fx_chain_by_track_id(&self, track_id: u32) -> Option<&[Device]> {
         if track_id == MASTER_TRACK_ID {
             Some(&self.master_fx_chain)
         } else {
@@ -1687,10 +1706,7 @@ impl Song {
     }
 
     /// read-write counterpart of `fx_chain_by_track_id`。
-    pub fn fx_chain_by_track_id_mut(
-        &mut self,
-        track_id: u32,
-    ) -> Option<&mut Vec<PluginInstance>> {
+    pub fn fx_chain_by_track_id_mut(&mut self, track_id: u32) -> Option<&mut Vec<Device>> {
         if track_id == MASTER_TRACK_ID {
             Some(&mut self.master_fx_chain)
         } else {
@@ -1758,12 +1774,10 @@ impl Song {
         // 変換が無効）。値・automation・変調は GroupTransform 系のまま（破壊的な値
         // migration は不要）。idempotent（device 既存 / group_transform 無しは no-op）。
         for track in &mut self.tracks {
-            let has_transform = track
-                .devices
-                .iter()
-                .any(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
+            let has_transform =
+                plugins(&track.devices).any(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
             if track.group_transform.is_some() && !has_transform {
-                track.devices.push(PluginInstance::with_ports(
+                track.devices.push(Device::Plugin(PluginInstance::with_ports(
                     crate::video_fx::TRANSFORM_ID.to_string(),
                     crate::plugin_format::PluginFormat::Builtin,
                     crate::port_config::PortConfig {
@@ -1771,7 +1785,7 @@ impl Song {
                         has_video_output: true,
                         ..Default::default()
                     },
-                ));
+                )));
             }
         }
 
@@ -1862,36 +1876,29 @@ impl Song {
         // v29: device 安定 id (`PluginInstance::id`) を採番する。 track devices
         // と master_fx_chain が Song-global の `next_device_id` を共有。
         // sentinel (0) と **重複 id** を上書きし、 それ以外は counter を bump する
-        // だけ (他 allocator と同 idiom)。
+        // だけ (他 allocator と同 idiom)。 r.md #110: Parallel / chain の id も同じ空間で
+        // 同じ規則 (`for_each_node_id_mut` が plugin / parallel / chain を全部訪問する)。
         {
-            fn alloc_dev(
-                p: &mut PluginInstance,
-                next: &mut u64,
-                seen: &mut std::collections::HashSet<u64>,
-            ) {
+            let mut next = self.ids.next_device_id;
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut alloc = |id: &mut u64| {
                 // 0 (未採番) と **既出 id** は必ず新採番する。 r.md #71
                 // (プラグインのコピー / 移動): 重複を放置すると plugin host の
                 // dedup (同 device_id + 同 plugin_id) が 2 device を 1 instance へ
                 // silent に merge する (音は出るので気付けない)。
-                if p.id == 0 || !seen.insert(p.id) {
-                    let new_id = (*next).max(1);
-                    *next = new_id + 1;
-                    p.id = new_id;
-                    seen.insert(p.id);
-                } else if p.id >= *next {
-                    *next = p.id + 1;
+                if *id == 0 || !seen.insert(*id) {
+                    let new_id = next.max(1);
+                    next = new_id + 1;
+                    *id = new_id;
+                    seen.insert(*id);
+                } else if *id >= next {
+                    next = *id + 1;
                 }
-            }
-            let mut next = self.ids.next_device_id;
-            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            };
             for track in &mut self.tracks {
-                for p in track.devices.iter_mut() {
-                    alloc_dev(p, &mut next, &mut seen);
-                }
+                for_each_node_id_mut(&mut track.devices, &mut alloc);
             }
-            for p in self.master_fx_chain.iter_mut() {
-                alloc_dev(p, &mut next, &mut seen);
-            }
+            for_each_node_id_mut(&mut self.master_fx_chain, &mut alloc);
             self.ids.next_device_id = next.max(1);
         }
 
@@ -1912,9 +1919,9 @@ impl Song {
         // 「同 track の devices chain 内 index」、 song_lanes /
         // song_mod_routings の PluginParam は master_fx_chain の index。
         {
-            let master_ids: Vec<u64> = self.master_fx_chain.iter().map(|p| p.id).collect();
+            let master_ids: Vec<u64> = plugins(&self.master_fx_chain).map(|p| p.id).collect();
             for track in &mut self.tracks {
-                let dev_ids: Vec<u64> = track.devices.iter().map(|p| p.id).collect();
+                let dev_ids: Vec<u64> = plugins(&track.devices).map(|p| p.id).collect();
                 let send_ids: Vec<u32> = track.sends.iter().map(|s| s.id).collect();
                 for lane in &mut track.automation_lanes {
                     Self::remap_target_ids(&mut lane.target, &dev_ids, &send_ids);
@@ -1934,7 +1941,7 @@ impl Song {
             let track_devs: std::collections::HashMap<u32, Vec<u64>> = self
                 .tracks
                 .iter()
-                .map(|t| (t.id, t.devices.iter().map(|p| p.id).collect()))
+                .map(|t| (t.id, plugins(&t.devices).map(|p| p.id).collect()))
                 .collect();
             for binding in &mut self.midi_bindings {
                 if let BindingTarget::PluginParam {
@@ -1980,28 +1987,17 @@ impl Song {
             // v23: 役割別 3 chain は単一 `devices` に統合済み。各 device の
             // aux_inputs tap の source_track / aux_outputs の dest_track を
             // 1 ループで remap する (パラアウト dest も sentinel→新 id に追従)。
-            for p in track.devices.iter_mut() {
-                for route in p.aux_inputs.iter_mut().flatten() {
-                    if let Some(&new_id) = id_remap.get(&route.tap.source_track) {
-                        route.tap.source_track = new_id;
-                    }
-                }
-                for route in p.aux_outputs.iter_mut().flatten() {
-                    if let Some(&new_id) = id_remap.get(&route.dest_track) {
-                        route.dest_track = new_id;
-                    }
-                }
-            }
         }
-
-        // master bus の fx chain も track fx_chain と同じく aux_inputs tap /
-        // aux_outputs dest を remap する。 master fx が他 track を sidechain
-        // source に取る / パラアウト先に取るケースに備える (track ループ内
-        // closure は loop scope なので再利用不可、 ここで open-code)。
-        for p in self.master_fx_chain.iter_mut() {
+        // 各 device の aux_inputs tap の source track / aux_outputs の dest_track を remap
+        // する (パラアウト dest も sentinel→新 id に追従)。 r.md #110: Parallel の中の plugin も
+        // `for_each_plugin_mut` が辿る。 master fx が他 track を sidechain source /
+        // パラアウト先に取るケースも同じ経路。
+        let mut remap_routes = |p: &mut PluginInstance| {
             for route in p.aux_inputs.iter_mut().flatten() {
-                if let Some(&new_id) = id_remap.get(&route.tap.source_track) {
-                    route.tap.source_track = new_id;
+                if let TapSource::Track(src) = &mut route.tap.source
+                    && let Some(&new_id) = id_remap.get(src)
+                {
+                    *src = new_id;
                 }
             }
             for route in p.aux_outputs.iter_mut().flatten() {
@@ -2009,16 +2005,18 @@ impl Song {
                     route.dest_track = new_id;
                 }
             }
-        }
+        };
+        self.for_each_plugin_mut(&mut remap_routes);
 
         // docs/plan_modulation.md §8: mod_source の tap も track id remap に追従する
-        // (mod_source.id は track id ではないので不変、 tap.source_track のみ)。
+        // (mod_source.id は track id ではないので不変、 tap の source track のみ)。
         for ms in self.mod_sources.iter_mut() {
             // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ remap。
             if let Some(tap) = ms.follower_tap_mut()
-                && let Some(&new_id) = id_remap.get(&tap.source_track)
+                && let TapSource::Track(src) = &mut tap.source
+                && let Some(&new_id) = id_remap.get(src)
             {
-                tap.source_track = new_id;
+                *src = new_id;
             }
         }
 
@@ -2171,10 +2169,7 @@ impl Song {
     /// engine skips its own device chain in pass 1 (like a group / return) to
     /// avoid double-processing stateful FX.
     pub fn track_receives_paraout(&self, track_id: u32) -> bool {
-        self.tracks
-            .iter()
-            .flat_map(|t| t.devices.iter())
-            .chain(self.master_fx_chain.iter())
+        self.all_plugins()
             .any(|p| {
                 p.aux_outputs
                     .iter()
@@ -2814,6 +2809,11 @@ pub struct PluginInstance {
     /// `aux_outputs` + the plugin host's `aux_out_active`).
     #[serde(default)]
     pub aux_output_count: u8,
+    /// r.md #110: `is_main=false` な audio **入力** port の数 (`aux_output_count` と対称、
+    /// host が `SlotPluginLoaded` で報告)。 inspector はこれが 1 以上の device にだけ
+    /// sidechain (SC) 制御を出す。 engine は `aux_inputs` の配線だけを見る。
+    #[serde(default)]
+    pub aux_input_count: u8,
     /// v23: この device の port 構成。役割導出の入力。
     #[serde(default)]
     pub ports: crate::port_config::PortConfig,
@@ -2855,6 +2855,7 @@ impl PluginInstance {
             aux_inputs: Vec::new(),
             aux_outputs: Vec::new(),
             aux_output_count: 0,
+            aux_input_count: 0,
             ports: crate::port_config::PortConfig::default(),
             ara_archive: None,
             send_all_keys_to_plugin: false,
@@ -2875,6 +2876,7 @@ impl PluginInstance {
             aux_inputs: Vec::new(),
             aux_outputs: Vec::new(),
             aux_output_count: 0,
+            aux_input_count: 0,
             ports,
             ara_archive: None,
             send_all_keys_to_plugin: false,
@@ -2892,7 +2894,7 @@ impl PluginInstance {
 /// `LoadSong` は plugin state / ARA アーカイブの肥大に依らず常に小さく、
 /// 16MB wire 上限に構造的に到達しない。encode / decode の field 順は一致
 /// させること (id → plugin_id → format → aux_inputs → aux_outputs →
-/// aux_output_count → ports → send_all_keys_to_plugin → bypassed)。
+/// aux_output_count → ports → send_all_keys_to_plugin → bypassed → aux_input_count)。
 impl bincode::Encode for PluginInstance {
     fn encode<E: bincode::enc::Encoder>(
         &self,
@@ -2906,7 +2908,8 @@ impl bincode::Encode for PluginInstance {
         self.aux_output_count.encode(encoder)?;
         self.ports.encode(encoder)?;
         self.send_all_keys_to_plugin.encode(encoder)?;
-        self.bypassed.encode(encoder)
+        self.bypassed.encode(encoder)?;
+        self.aux_input_count.encode(encoder)
     }
 }
 
@@ -2926,6 +2929,7 @@ impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
             ara_archive: None,
             send_all_keys_to_plugin: bincode::Decode::decode(decoder)?,
             bypassed: bincode::Decode::decode(decoder)?,
+            aux_input_count: bincode::Decode::decode(decoder)?,
         })
     }
 }

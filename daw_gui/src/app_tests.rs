@@ -929,7 +929,7 @@ mod aspect_fit_tests {
 #[cfg(test)]
 mod master_fx_tests {
     use crate::app_types::{compute_slot_reconcile_actions, SlotReconcileAction};
-    use common::model::{PluginInstance, Song};
+    use common::model::{Device, PluginInstance, Song};
     use common::plugin_format::PluginFormat;
     use std::collections::HashMap;
 
@@ -938,14 +938,14 @@ mod master_fx_tests {
         // master_fx_chain に 1 plugin、 host (`loaded_devices`) は空 → その device の
         // 安定 id に対する LoadDevice が 1 件出る。
         let mut song = Song::default();
-        song.master_fx_chain.push(PluginInstance::new(
+        song.master_fx_chain.push(Device::Plugin(PluginInstance::new(
             "vendor.reverb".to_string(),
             PluginFormat::Clap,
-        ));
+        )));
         // `PluginInstance::new` は id == 0 (未採番) を作るので、 assert 対象の
         // device_id を確定させるために採番を通す。
         song.ensure_ids();
-        let expected_id = song.master_fx_chain[0].id;
+        let expected_id = song.master_fx_chain[0].id();
         assert_ne!(expected_id, 0, "ensure_ids が安定 id を振る");
         let loaded = HashMap::new();
         let actions = compute_slot_reconcile_actions(&song, &loaded);
@@ -963,14 +963,14 @@ mod master_fx_tests {
     fn master_fx_chain_survives_serde_roundtrip_and_forward_migrates() {
         // master_fx_chain 付き Song を JSON 経由で往復しても保持される。
         let mut song = Song::default();
-        song.master_fx_chain.push(PluginInstance::new(
+        song.master_fx_chain.push(Device::Plugin(PluginInstance::new(
             "vendor.eq".to_string(),
             PluginFormat::Clap,
-        ));
+        )));
         let json = serde_json::to_string(&song).unwrap();
         let back: Song = serde_json::from_str(&json).unwrap();
         assert_eq!(back.master_fx_chain.len(), 1);
-        assert_eq!(back.master_fx_chain[0].plugin_id, "vendor.eq");
+        assert_eq!(back.master_fx_chain[0].as_plugin().unwrap().plugin_id, "vendor.eq");
 
         // master_fx_chain field を持たない旧 file は空 Vec に forward-migrate。
         let legacy = r#"{"bpm":120.0,"time_sig":[4,4],"length_beats":16.0}"#;
@@ -1144,7 +1144,7 @@ mod track_duplicate_tests {
     /// 自分が繋いだものだと思い込む)。
     #[test]
     fn pasted_aux_outputs_are_remapped_or_dropped() {
-        use common::model::{AuxOutputRoute, PluginInstance};
+        use common::model::{Device, AuxOutputRoute, PluginInstance};
         use common::plugin_format::PluginFormat;
         use common::port_config::PortConfig;
 
@@ -1159,7 +1159,7 @@ mod track_duplicate_tests {
         song.tracks.push(track_with(|t| {
             t.id = src;
             t.name = "S".into();
-            t.devices.push(PluginInstance {
+            t.devices.push(Device::Plugin(PluginInstance {
                 // port 0 = 自分自身 (= 集合内) 宛て / port 1 = dest (= 集合外) 宛て。
                 aux_outputs: vec![
                     Some(AuxOutputRoute::to_track(src)),
@@ -1170,7 +1170,7 @@ mod track_duplicate_tests {
                     PluginFormat::Clap,
                     PortConfig::default(),
                 )
-            });
+            }));
         }));
         let tc = TrackCopy {
             order: 0,
@@ -1182,7 +1182,7 @@ mod track_duplicate_tests {
         let built = AppData::build_pasted_tracks(&mut song, std::slice::from_ref(&tc), true, true, None);
         let new_id = built[0].1.id;
         assert_eq!(
-            built[0].1.devices[0].aux_outputs,
+            built[0].1.devices[0].as_plugin().unwrap().aux_outputs,
             vec![
                 Some(AuxOutputRoute::to_track(new_id)),
                 Some(AuxOutputRoute::to_track(dest)),
@@ -1195,7 +1195,7 @@ mod track_duplicate_tests {
         let built = AppData::build_pasted_tracks(&mut song, &[tc], false, true, None);
         let new_id = built[0].1.id;
         assert_eq!(
-            built[0].1.devices[0].aux_outputs,
+            built[0].1.devices[0].as_plugin().unwrap().aux_outputs,
             vec![Some(AuxOutputRoute::to_track(new_id)), None],
             "別プロジェクト由来の集合外パラアウトは落とす"
         );

@@ -771,7 +771,9 @@ pub enum AppEvent {
     NudgeSelectedNotePitch { octave: bool, steps: i32 },
 
     // -------- Plugin picker / chain ---------------------------------------
-    OpenPluginPicker,
+    /// r.md #110: `chain` = 挿入先 (`+ Plugin` の行が指す chain)。 `None` = cursor track
+    /// の top-level 末尾。
+    OpenPluginPicker { chain: Option<common::model::ChainRef> },
     ClosePluginPicker,
     SelectPluginFromDb {
         id: String,
@@ -857,7 +859,8 @@ pub enum AppEvent {
     SetSidechainSource {
         device_id: u64,
         port: u8,
-        source: Option<u32>,
+        /// r.md #110: 他 track か同 track の Parallel 内 chain。 `None` = 切断。
+        source: Option<common::model::TapSource>,
     },
     /// r.md #36: このプラグインのエディタ窓で **キーを一切横取りしない** (= REAPER の
     /// 「Send all keyboard input to plug-in」)。 消化の有無を外に出さない自前描画 GUI
@@ -927,8 +930,8 @@ pub enum AppEvent {
         source_id: u32,
         bipolar: bool,
     },
-    /// docs/plan_modulation.md §9: change which track a `ModSource` follows.
-    SetModSourceTrack { id: u32, source_track: u32 },
+    /// docs/plan_modulation.md §9: change what a `ModSource` follows (track / Parallel chain)。
+    SetModSourceTap { id: u32, source: common::model::TapSource },
     /// docs/plan_modulation.md §3: envelope follower attack / release (ms).
     /// During a scrub drag these only mark dirty (no per-frame recompile); the
     /// engine recompiles the baked coefficients once on drag-end (see
@@ -961,10 +964,22 @@ pub enum AppEvent {
         port: u8,
         tap_point: common::model::TapPoint,
     },
-    /// inspector chain (= `Track.devices` / `master_fx_chain` を一列にした list)
-    /// の reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。単一デバイス
-    /// チェーン化で **棄却なしの純 permutation** (役割は位置から再導出)。
-    ReorderInspectorChain(Vec<usize>),
+    // -------- r.md #110 Parallel (`docs/plan_parallel.md` §6.3) ------------------
+    /// 空の Parallel (chain 1 本) を `chain` の `index` に挿す。
+    AddParallel { chain: common::model::ChainRef, index: u32 },
+    /// Group (Live の Ctrl+G): 選んだ device を 1 本の chain に入れた Parallel で包む。
+    GroupDevices { device_ids: Vec<u64> },
+    /// Ungroup: Parallel を全 chain の device の直列連結に置換。
+    UngroupParallel { parallel_id: u64 },
+    AddParallelChain { parallel_id: u64 },
+    DuplicateParallelChain { chain_id: u64 },
+    RenameParallelChain { chain_id: u64, name: String },
+    RenameParallel { parallel_id: u64, name: String },
+    SetParallelChainColor { chain_id: u64, color: Option<[f32; 3]> },
+    /// chain の gain / pan / mute / solo (Song 書き換え + 値のみ IPC)。
+    SetChainMixer { chain_id: u64, edit: crate::handler::parallel::ChainMixerEdit },
+    /// 見方の都合: Parallel / chain の中身の開閉 (undo 対象外)。 `id` は Parallel か chain。
+    ToggleParallelNodeCollapsed { id: u64 },
     SetMasterGain(f32),
     /// マスターフェーダーの drag 全体を 1 undo step に bracket する
     /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
@@ -1884,7 +1899,17 @@ impl AppEvent {
                     "デバイス移動"
                 }
             }
-            E::ReorderInspectorChain(..) => "チェーン並べ替え",
+            E::AddParallel { .. } => "Parallel 追加",
+            E::GroupDevices { .. } => "Parallel にまとめる",
+            E::UngroupParallel { .. } => "Parallel を解除",
+            E::AddParallelChain { .. } => "chain 追加",
+            E::DuplicateParallelChain { .. } => "chain 複製",
+            E::RenameParallelChain { .. } | E::RenameParallel { .. } => "名前変更",
+            E::SetParallelChainColor { .. } => "chain の色",
+            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Gain(_), .. } => "chain gain",
+            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Pan(_), .. } => "chain pan",
+            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Muted(_), .. } => "chain mute",
+            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Solo(_), .. } => "chain solo",
             E::SetVideoFxParam { .. } => "映像FX変更",
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
             E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
@@ -1905,7 +1930,7 @@ impl AppEvent {
             | E::SetModSourceRectify { .. }
             | E::SetModSourceBand { .. }
             | E::SetModSourceTapPoint { .. }
-            | E::SetModSourceTrack { .. } => "モジュレーション編集",
+            | E::SetModSourceTap { .. } => "モジュレーション編集",
             E::AddModRouting { .. } | E::RemoveModRouting { .. } => "モジュレーション接続",
             E::SetModRoutingDepth { .. } => "モジュレーション深度変更",
             E::SetModRoutingPolarity { .. } => "モジュレーション極性変更",

@@ -143,7 +143,7 @@ fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
     app.edit_song(|song| {
         let mut dev = PluginInstance::new("test.plugin".into(), PluginFormat::Clap);
         dev.id = 42;
-        song.tracks[0].devices.push(dev);
+        song.tracks[0].devices.push(dev.into());
     });
 
     let live = EditorWindowGeometry { x: 300, y: 180, width: 880, height: 162 };

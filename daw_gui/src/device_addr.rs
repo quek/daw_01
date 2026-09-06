@@ -6,22 +6,22 @@
 //! 安定 `device_id` (`PluginInstance::id`) 一本になり、 「その id はいまどこの
 //! 持ち物か」 を引き直す口がこのファイルの責務として独立した。
 //!
-//! **`(track_id, index)` 座標を保持しない**。 引きたくなったら都度
+//! r.md #110 (Parallel): device は Parallel の中の chain にも居る。 「どの chain か」 は
+//! [`ChainRef`] (`Track(id)` = top-level / `Chain(id)` = Parallel 内) で表し、 位置は
+//! その chain 内 index。 **座標を保持しない** — 引きたくなったら都度
 //! [`find_device_by_id`] で引き直す (保持すると削除 / 並べ替えで stale になり、
 //! 貼り替え補償コードが生える = 不変条件 1 が禁じる形)。
 use std::collections::HashMap;
 
+use common::model::ChainRef;
 
-/// 安定 `device_id` (`PluginInstance::id`) から **いまの** 所属 track と
-/// chain 内位置を引き直す。 track 内 device は `(Track::id, Vec index)`、
-/// master bus の device は `(MASTER_TRACK_ID, master_fx_chain の Vec index)`。
-/// 見つからなければ `None` (= 削除済み device への stale event 等は
-/// 呼び出し側で無視する)。
+/// 安定 `device_id` (plugin / Parallel) から **いまの** 所属を引き直す:
+/// `(所有 track id, 居る chain 内の index)`。 master bus の device は
+/// 所有 track = `MASTER_TRACK_ID`。 見つからなければ `None` (= 削除済み device への
+/// stale event 等は呼び出し側で無視する)。 どの chain かは [`common::model::Song::find_device`]。
 ///
 /// **返り値は保持しないこと。** これは「Song から毎回引き直す一時的な解決」で
-/// あって参照ではない (不変条件 1 が禁じているのは *保持される* positional
-/// 参照)。 automation lane / recording gesture が track 所有である以上、
-/// 「この device はいまどの track の持ち物か」 を知る口は 1 本要る。
+/// あって参照ではない。
 pub fn find_device_by_id(
     song: &common::model::Song,
     device_id: u64,
@@ -29,59 +29,22 @@ pub fn find_device_by_id(
     if device_id == 0 {
         return None;
     }
-    for t in &song.tracks {
-        if let Some(i) = t.devices.iter().position(|d| d.id == device_id) {
-            return Some((t.id, i as u32));
-        }
-    }
-    if let Some(i) = song
-        .master_fx_chain
-        .iter()
-        .position(|d| d.id == device_id)
-    {
-        return Some((common::model::MASTER_TRACK_ID, i as u32));
-    }
-    None
+    let (chain, index) = song.find_device(device_id)?;
+    let owner = song.chain_owner_track(chain)?;
+    Some((owner, index as u32))
 }
 
-/// r.md #36: `(track_id, device_index)` 座標から `PluginInstance` 本体を引く。
-/// `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
-/// device が存在しなければ `None` (id 未採番かどうかは見ない — それは
-/// [`device_id_at`] の責務)。
+/// `device_id` の所有 track (`MASTER_TRACK_ID` = master)。
 #[must_use]
-pub fn device_at(
-    song: &common::model::Song,
-    track_id: u32,
-    device_index: u32,
-) -> Option<&common::model::PluginInstance> {
-    let devices: &[common::model::PluginInstance] =
-        if track_id == common::model::MASTER_TRACK_ID {
-            &song.master_fx_chain
-        } else {
-            song.tracks
-                .iter()
-                .find(|t| t.id == track_id)
-                .map(|t| t.devices.as_slice())?
-        };
-    devices.get(device_index as usize)
+pub fn device_owner_track(song: &common::model::Song, device_id: u64) -> Option<u32> {
+    if device_id == 0 {
+        return None;
+    }
+    song.device_owner_track(device_id)
 }
 
-/// 安定 `device_id` から `PluginInstance` 本体を可変で引く
-/// (`find_device_by_id` + `fx_chain_by_track_id_mut` の合成)。 device の属性を
-/// 書き換える handler (sidechain / パラアウト / キー送出) が共通で使う。
-#[must_use]
-pub fn device_mut_by_id(
-    song: &mut common::model::Song,
-    device_id: u64,
-) -> Option<&mut common::model::PluginInstance> {
-    let (track_id, index) = find_device_by_id(song, device_id)?;
-    song.fx_chain_by_track_id_mut(track_id)?.get_mut(index as usize)
-}
-
-/// 逆方向: 旧 `(track_id, device_index)` 座標から安定 `device_id` を引く。
-/// IPC 送信サイト (SetSlotPlugin / RemoveSlotPlugin / GUI open 等) が
-/// positional な GUI 内部状態から protocol の id addressing へ変換するのに
-/// 使う。 `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
+/// `track_id` の **信号順 (pre-order、Parallel の中も含む)** で `index` 番目の plugin の
+/// 安定 id。 headless script / テストが「N 番目に挿した plugin」 を指すための口。
 /// device が存在しない / id 未採番 (0) なら `None`。
 #[must_use]
 pub fn device_id_at(
@@ -89,19 +52,22 @@ pub fn device_id_at(
     track_id: u32,
     device_index: u32,
 ) -> Option<u64> {
-    // 座標解決は `device_at` 1 本に集約する (同じ走査を 2 度書かない)。
-    device_at(song, track_id, device_index)
+    let chain = song.fx_chain_by_track_id(track_id)?;
+    common::model::plugins(chain)
+        .nth(device_index as usize)
         .map(|d| d.id)
         .filter(|&id| id != 0)
 }
 
 /// r.md #71 (プラグインのコピー / 移動): device の運搬要求 1 件分。 表示順は
 /// `device_ids` の並びが決める (呼び出し側がチェーン表示順に整えて渡す)。
+/// r.md #110: 落とし先は [`ChainRef`] (top-level か Parallel 内 chain か) + その chain 内位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelocateDevices {
+    /// 運ぶ device (plugin / Parallel の安定 id)。
     pub device_ids: Vec<u64>,
-    /// 落とし先チェーンの所有者。`MASTER_TRACK_ID` なら `Song.master_fx_chain`。
-    pub dest_track: u32,
+    /// 落とし先チェーン。
+    pub dest: ChainRef,
     /// 落とし先チェーン内の挿入位置 (`0..=chain.len()`)。
     pub dest_index: u32,
     /// `true` = コピー (新 device id を採番)、`false` = 移動 (id 据え置き = 音を切らない)。
@@ -160,8 +126,8 @@ pub enum SlotReconcileAction {
 /// と Song を揃えるための action 列を返す。 副作用なし (IPC は呼ばない、
 /// AppData にも触らない)。
 ///
-/// 走査順は Song 順 (track → master_fx_chain の Vec 順 = 音の処理順) なので
-/// `LoadDevice` の並びは決定的。 `RemoveDevice` は host 側 map の iteration
+/// 走査順は Song 順 (track → master_fx_chain、Parallel の中は chain 順 = 音の処理順)
+/// なので `LoadDevice` の並びは決定的。 `RemoveDevice` は host 側 map の iteration
 /// 順に依存しないよう id 昇順に sort する。
 pub fn compute_slot_reconcile_actions(
     song: &common::model::Song,
@@ -173,34 +139,24 @@ pub fn compute_slot_reconcile_actions(
     let mut song_host_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut actions = Vec::new();
 
-    let visit = |devices: &[common::model::PluginInstance],
-                 song_host_ids: &mut std::collections::HashSet<u64>,
-                 actions: &mut Vec<SlotReconcileAction>| {
-        for inst in devices {
-            if inst.ports.is_video() {
-                continue;
-            }
-            song_host_ids.insert(inst.id);
-            let need_load = match loaded_devices.get(&inst.id) {
-                None => true,
-                Some(info) => info.plugin_id_str != inst.plugin_id,
-            };
-            if !need_load {
-                continue;
-            }
-            actions.push(SlotReconcileAction::LoadDevice {
-                device_id: inst.id,
-                plugin_id_str: inst.plugin_id.clone(),
-                initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
-            });
+    for inst in song.all_plugins() {
+        if inst.ports.is_video() {
+            continue;
         }
-    };
-
-    for track in &song.tracks {
-        visit(&track.devices, &mut song_host_ids, &mut actions);
+        song_host_ids.insert(inst.id);
+        let need_load = match loaded_devices.get(&inst.id) {
+            None => true,
+            Some(info) => info.plugin_id_str != inst.plugin_id,
+        };
+        if !need_load {
+            continue;
+        }
+        actions.push(SlotReconcileAction::LoadDevice {
+            device_id: inst.id,
+            plugin_id_str: inst.plugin_id.clone(),
+            initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
+        });
     }
-    // master bus fx chain (= 音源境界なしの全 audio FX)。
-    visit(&song.master_fx_chain, &mut song_host_ids, &mut actions);
 
     // (1) host にあるが Song に無い device → RemoveDevice。 **余剰を落として
     //     から load する** 順序は現行仕様なので、 先頭へ差し込む。

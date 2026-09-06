@@ -33,7 +33,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(&mut app, 0);
 
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -41,7 +41,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     });
     fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
 
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.bitcrush".into(),
         keep_open: false,
@@ -49,7 +49,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     });
     fake_plugin_loaded(&mut app, track_id, 1, "test.bitcrush");
 
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.delay".into(),
         keep_open: false,
@@ -181,7 +181,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(app, 0);
 
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -189,7 +189,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
     });
     fake_plugin_loaded(app, track_id, 0, "test.synth");
 
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.bitcrush".into(),
         keep_open: false,
@@ -197,7 +197,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
     });
     fake_plugin_loaded(app, track_id, 1, "test.bitcrush");
 
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.delay".into(),
         keep_open: false,
@@ -277,8 +277,8 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     // index 1 へ shift)。
     let live_track = app.song_doc.song().tracks.iter().find(|t| t.id == track_id).unwrap();
     assert_eq!(live_track.devices.len(), 2, "live: bitcrush removed");
-    assert_eq!(live_track.devices[0].plugin_id, "test.synth");
-    assert_eq!(live_track.devices[1].plugin_id, "test.delay");
+    assert_eq!(live_track.devices[0].as_plugin().unwrap().plugin_id, "test.synth");
+    assert_eq!(live_track.devices[1].as_plugin().unwrap().plugin_id, "test.delay");
 
     // 肝心の検証: Save の snapshot が **削除後** layout (devices = [synth, delay])
     // で凍結されている。 旧 snapshot-at-invoke なら 3 個のままで、 R2 の device
@@ -294,7 +294,7 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
                 2,
                 "snapshot must reflect the post-removal layout (co-temporal with its states)"
             );
-            assert_eq!(st.devices[1].plugin_id, "test.delay");
+            assert_eq!(st.devices[1].as_plugin().unwrap().plugin_id, "test.delay");
         }
         other => panic!("front of queue should be Save, got {other:?}"),
     }
@@ -307,7 +307,7 @@ fn save_and_quit_clean_starts_shutdown() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -342,7 +342,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -384,7 +384,7 @@ fn save_with_idle_queue_freezes_snapshot_at_invoke() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,

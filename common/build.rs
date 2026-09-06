@@ -20,6 +20,9 @@ const WIRE_SOURCES: &[&str] = &[
     "src/protocol.rs",
     "src/model.rs",
     "src/model/track.rs",
+    // r.md #110: Device / Parallel / ParallelChain (Track.devices / master_fx_chain の要素として
+    // LoadSong の wire を渡る)。
+    "src/model/device.rs",
     // 内蔵チャンネルストリップ (Track.strip として LoadSong / SetTrackStrip の wire を渡る)。
     "src/model/track/channel_strip.rs",
     // マスターストリップ (Song.master_strip として LoadSong / SetMasterStrip の wire を渡る)。

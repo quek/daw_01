@@ -154,12 +154,12 @@ impl AppData {
         for lane in &mut kept.automation_lanes {
             lane.launcher = common::model::RowPlayback::Arranger;
         }
-        for d in &mut kept.devices {
+        common::model::for_each_plugin_mut(&mut kept.devices, &mut |d| {
             d.aux_inputs.clear();
             if pre_fx && d.ports.has_audio_input {
                 d.ports = common::port_config::PortConfig::default();
             }
-        }
+        });
         if pre_fx {
             // pan は中央、音量は **strip を打ち消す値**。 equal-power の pan 則は
             // 中央でも -3dB 掛かる (`common::audio_render::pan_gains`) ので、
@@ -411,8 +411,7 @@ impl AppData {
     /// (load 完了通知前 = `loaded_devices` に居ない) なら `None`。
     pub(crate) fn vocal_builtin_plugin_id(&self, track: &common::model::Track) -> Option<u64> {
         track
-            .devices
-            .iter()
+            .plugins()
             .find(|d| {
                 d.format == common::plugin_format::PluginFormat::Builtin
                     && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX

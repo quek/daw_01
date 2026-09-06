@@ -7,6 +7,7 @@
 //! この報告が Song の編集として扱われると、開いた直後に epoch が進み `*` が付く。
 
 use common::model::{MASTER_TRACK_ID, PluginInstance};
+use common::model::Device;
 use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
 use common::protocol::PluginEvent;
@@ -30,7 +31,7 @@ fn add_track_with_plugin(app: &mut AppData, plugin_id: &str) -> (u32, u64) {
         .expect("edit_song");
     let idx = app.song_doc.song().tracks.len() - 1;
     select_track_single(app, idx);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: plugin_id.into(),
         keep_open: false,
@@ -125,7 +126,7 @@ fn reopening_master_only_project_does_not_grow_a_ghost_track() {
     let (mut app, _audio_rx, _plugin_rx, _dispatcher) = support::build_app();
     app.edit_song(|song| {
         song.tracks.clear();
-        song.master_fx_chain.push(PluginInstance {
+        song.master_fx_chain.push(Device::Plugin(PluginInstance {
             id: 4001,
             ..PluginInstance::with_ports(
                 "test.fx".into(),
@@ -136,7 +137,7 @@ fn reopening_master_only_project_does_not_grow_a_ghost_track() {
                     ..PortConfig::default()
                 },
             )
-        });
+        }));
     })
     .expect("edit_song");
     common::project::save(&proj, app.song_doc.song()).expect("write project file");
@@ -173,10 +174,10 @@ fn reopening_project_whose_saved_ports_differ_from_the_db_stays_clean() {
     let device_index = app
         .edit_song(|song| {
             let devices = &mut song.tracks[0].devices;
-            devices.push(PluginInstance {
+            devices.push(Device::Plugin(PluginInstance {
                 id: 5001,
                 ..PluginInstance::with_ports("test.fx".into(), PluginFormat::Clap, saved_ports)
-            });
+            }));
             (devices.len() - 1) as u32
         })
         .expect("edit_song");
@@ -190,7 +191,7 @@ fn reopening_project_whose_saved_ports_differ_from_the_db_stays_clean() {
     let track_id = app.song_doc.song().tracks[0].id;
     fake_plugin_loaded(&mut app, track_id, device_index, "test.fx");
     assert_eq!(
-        app.song_doc.song().tracks[0].devices[device_index as usize].ports, saved_ports,
+        app.song_doc.song().tracks[0].devices[device_index as usize].as_plugin().unwrap().ports, saved_ports,
         "保存済みの port 構成は DB に上書きされない"
     );
     assert!(!app.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");

@@ -1780,7 +1780,7 @@ mod bundle_install_tests {
 
     fn latent_track(id: u32) -> Track {
         let mut t = track(id);
-        t.devices = vec![common::model::PluginInstance {
+        t.devices = vec![common::model::Device::Plugin(common::model::PluginInstance {
             id: LATENT_DEVICE_ID,
             ..common::model::PluginInstance::with_ports(
                 "test.latent".into(),
@@ -1794,7 +1794,7 @@ mod bundle_install_tests {
                     has_video_output: false,
                 },
             )
-        }];
+        })];
         t
     }
 

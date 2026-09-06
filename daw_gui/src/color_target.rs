@@ -31,4 +31,6 @@ pub enum ColorPickerTarget {
     /// r.md #87: ランチャーの列 (シーン) の色ストライプ (`Scene::id`)。
     /// 見出しの右クリックメニューから開く。
     Scene(u32),
+    /// r.md #110: Parallel chain の色 (`ParallelChain::id`)。 chain 行のスウォッチ / 右クリックから。
+    ParallelChain(u64),
 }

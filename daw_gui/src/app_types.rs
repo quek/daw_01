@@ -11,7 +11,7 @@ use common::plugin_db::PluginDatabase;
 /// 名前を引けるよう、ここで再輸出する。
 pub use crate::device_addr::{
     DEVICE_DRAG_KIND, DeviceDragPayload, LoadedDeviceInfo, RelocateDevices, SlotReconcileAction,
-    compute_slot_reconcile_actions, device_at, device_id_at, device_mut_by_id, find_device_by_id,
+    compute_slot_reconcile_actions, device_id_at, device_owner_track, find_device_by_id,
 };
 /// 色編集の宛先は [`crate::color_target`] が持つ (同じく不変条件 9 で切り出した)。
 pub use crate::color_target::ColorPickerTarget;
@@ -174,6 +174,28 @@ pub fn track_with(f: impl FnOnce(&mut Track)) -> Track {
 }
 
 impl PluginPickEntry {
+    /// r.md #110: ピッカーの全項目 = DB の plugin + 「Parallel」。 名前順。 起動時と DB 再走査の
+    /// 両方がこれを通る (SSoT)。
+    pub(crate) fn build_all(db: &common::plugin_db::PluginDatabase) -> Vec<Self> {
+        let mut v: Vec<Self> = db.entries.iter().map(Self::from_db_entry).collect();
+        v.push(Self::parallel_entry());
+        v.sort_by_key(|e| e.name.to_lowercase());
+        v
+    }
+
+    /// 「Parallel」 (`common::plugin_db::PARALLEL_PICKER_ID`): 並列 chain の container。 audio FX 扱い
+    /// (master にも挿せる)。
+    pub(crate) fn parallel_entry() -> Self {
+        Self {
+            id: common::plugin_db::PARALLEL_PICKER_ID.to_string(),
+            name: "Parallel (chains)".to_string(),
+            vendor: "daw_01".to_string(),
+            features: vec!["audio-effect".to_string(), "parallel".to_string()],
+            format_label: "builtin".to_string(),
+            category: PluginCategory::Fx,
+        }
+    }
+
     pub(crate) fn from_db_entry(e: &common::plugin_db::PluginEntry) -> Self {
         Self {
             id: e.id.clone(),
@@ -219,6 +241,84 @@ pub struct ChainEntry {
     /// r.md #105: 信号経路から外れている (`PluginInstance::bypassed`)。 行の名前を
     /// dim 色で描く。 切替は `Q` / 右クリックメニュー (行にトグルは置かない)。
     pub bypassed: bool,
+    /// r.md #110: host が報告した aux 入力 port 数。 1 以上の device にだけ `SC` を出す。
+    pub aux_input_count: u8,
+    /// r.md #110: sidechain が 1 port でも配線済み (`SC` ボタンの強調)。
+    pub sc_wired: bool,
+}
+
+/// r.md #110 (`docs/plan_parallel.md` §6.1): インスペクタの chain list の 1 行の種類。
+/// device ツリーを「縦回転 Live 型」に flatten したもの。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChainRowKind {
+    Plugin(ChainEntry),
+    /// `╭ Parallel名` (開始行)。 `open` = 中身 (chain 行 〜 終了行) を出しているか。
+    ParallelBegin { parallel_id: u64, name: String, bypassed: bool, color: Option<[f32; 3]>, open: bool },
+    /// Parallel の chain 1 本 (名前 / 色 / gain / pan / M / S)。
+    Chain {
+        parallel_id: u64,
+        chain_id: u64,
+        name: String,
+        color: Option<[f32; 3]>,
+        gain: f32,
+        pan: f32,
+        muted: bool,
+        solo: bool,
+        /// 中身 (device 行) を展開しているか。
+        open: bool,
+        /// preview 四角の数 (= chain 直下の device 数)。
+        n_devices: usize,
+    },
+    /// `+ chain`。
+    AddChain { parallel_id: u64 },
+    /// `+ Plugin` (その chain の末尾へ)。
+    AddPlugin { chain: common::model::ChainRef },
+    /// `╰` (終了行)。
+    ParallelEnd { parallel_id: u64, color: Option<[f32; 3]> },
+}
+
+/// chain list の 1 行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainRow {
+    pub kind: ChainRowKind,
+    /// この行が属する chain (ドロップ先 / 挿入先の解決に使う)。
+    pub chain: common::model::ChainRef,
+    /// `chain` 内での位置 (Plugin / ParallelBegin 行 = その device の index、 ParallelEnd = 直後、
+    /// AddPlugin = 末尾)。 ドロップの挿入位置に使う。
+    pub index: u32,
+    /// ネスト深さ (top-level = 0)。
+    pub depth: u32,
+    /// 左端の色帯 (外側の Parallel から順に、 展開中 chain の色)。 深さぶんの本数。
+    pub bars: Vec<Option<[f32; 3]>>,
+}
+
+impl ChainRow {
+    /// 選択集合 (`selected_device_ids`) に入る id (plugin / Parallel / chain)。 操作行は `None`。
+    pub fn select_id(&self) -> Option<u64> {
+        match &self.kind {
+            ChainRowKind::Plugin(e) => Some(e.device_id),
+            ChainRowKind::ParallelBegin { parallel_id, .. } => Some(*parallel_id),
+            ChainRowKind::Chain { chain_id, .. } => Some(*chain_id),
+            _ => None,
+        }
+    }
+
+    /// この行を掴んだときに一緒に運ぶ device の id (Parallel 行は Parallel 1 つ = 中身ごと)。
+    pub fn drag_id(&self) -> Option<u64> {
+        match &self.kind {
+            ChainRowKind::Plugin(e) => Some(e.device_id),
+            ChainRowKind::ParallelBegin { parallel_id, .. } => Some(*parallel_id),
+            _ => None,
+        }
+    }
+}
+
+/// r.md #110: sidechain (aux 入力) 1 port の配線 (SC パネルの 1 行)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidechainPort {
+    pub port: u8,
+    pub source: Option<common::model::TapSource>,
+    pub tap_point: common::model::TapPoint,
 }
 
 impl ChainEntry {
@@ -675,22 +775,6 @@ pub fn text_event_num_value(ev: &common::model::TextEvent, field: TextNumField) 
     }
 }
 
-/// Per-plugin sidechain wiring entry shown in the inspector. One row per
-/// chain device (addressed by stable `device_id`); the `current_source` field
-/// is the value of `PluginInstance::aux_inputs[0]` tap source (port 0; the
-/// inspector only exposes the first aux input port for now). `track_id` は
-/// source picker が自トラックを除外するのに要るので残す (アドレスには使わない)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidechainEntry {
-    pub track_id: u32,
-    pub device_id: u64,
-    pub plugin_name: String,
-    pub current_source: Option<u32>,
-    /// aux_inputs[0] の現 tap point (B8 / r.md #8: inspector で編集可能化)。
-    /// route 未設定は `PostFader` 既定。
-    pub current_tap_point: common::model::TapPoint,
-}
-
 /// Sidechain source picker choice: `None` = "—" (disconnected),
 /// `Some(track_id)` = a specific track. Self-track is filtered out by
 /// the picker because feeding a track its own output into a sidechain
@@ -698,7 +782,8 @@ pub struct SidechainEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidechainSourceChoice {
     pub label: String,
-    pub track_id: Option<u32>,
+    /// `None` = 「—」 (未接続)。 r.md #110: 他 track か同 track の Parallel 内 chain。
+    pub source: Option<common::model::TapSource>,
 }
 
 /// パラアウト (docs/plan_paraout.md): one inspector row group per chain device

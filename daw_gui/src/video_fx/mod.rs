@@ -228,14 +228,20 @@ fn resolve_device_real_params(
 fn resolve_video_chain(
     song: &Song,
     row_track: u32,
-    devices: &[common::model::PluginInstance],
+    devices: &[common::model::Device],
     lanes: &[AutomationLane],
     mod_routings: &[ModRouting],
     rows: &RowTimeline<'_>,
     mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Vec<ResolvedEffect> {
     let mut out = Vec::new();
-    for inst in devices.iter() {
+    // r.md #110: Parallel の中の映像 FX も pre-order (= 信号順) で直列に適用する
+    // (映像を並列合成はしない、`docs/plan_parallel.md` §6.4)。 bypass 中の Parallel は
+    // 中身ごと外れる。
+    for inst in common::model::plugins(devices) {
+        if bypassed_by_parallel(devices, inst.id) {
+            continue;
+        }
         // r.md #105: bypass 中の映像 FX は解決しない (= 音声 chain の素通しと同じ)。
         if !inst.ports.is_video() || inst.bypassed {
             continue;
@@ -252,6 +258,26 @@ fn resolve_video_chain(
         out.push(ResolvedEffect { def, params });
     }
     out
+}
+
+/// `plugin_id` の plugin が bypass 中の Parallel の中に居るか (Parallel の bypass は中身に
+/// 継承される — 音声側は compile が Parallel ごと落とすので、映像側もそれに揃える)。
+fn bypassed_by_parallel(devices: &[common::model::Device], plugin_id: u64) -> bool {
+    for d in devices {
+        if let common::model::Device::Parallel(r) = d {
+            let inside = r
+                .chains
+                .iter()
+                .any(|c| common::model::device_in(&c.devices, plugin_id).is_some());
+            if inside {
+                if r.bypassed {
+                    return true;
+                }
+                return r.chains.iter().any(|c| bypassed_by_parallel(&c.devices, plugin_id));
+            }
+        }
+    }
+    false
 }
 
 /// トラックの video device チェーンを解決して [`ResolvedEffect`] 列を返す。
@@ -307,9 +333,8 @@ pub fn resolve_track_transform(
     mod_plane: common::mod_plane::ModPlaneRef<'_>,
 ) -> Option<GroupTransform> {
     let has_transform_device = track
-        .devices
-        .iter()
-        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID && !d.bypassed);
+        .plugins()
+        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID && !d.bypassed && !bypassed_by_parallel(&track.devices, d.id));
     if !has_transform_device {
         return None;
     }

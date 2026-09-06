@@ -8,9 +8,13 @@
 //! **運搬の Song 側処理は `relocate_in_song` 1 本**に閉じ込めてある (純関数)。
 //! `AppData` 側 (`relocate_devices_inner`) は「plugin state の round-trip 待ちに積む /
 //! 結果を受けて session 状態を再キーする / 子プロセスへ流す」だけを持つ。
+//!
+//! r.md #110 (Parallel): 運ぶ単位は [`common::model::Device`] (plugin か Parallel 丸ごと)、
+//! 落とし先は [`ChainRef`] (top-level か Parallel 内 chain)。 Parallel を自分の中の chain へ
+//! 落とすのは循環なので拒む。
 use crate::app_types::*;
 use crate::state::*;
-use common::model::InstrumentSource;
+use common::model::{ChainRef, Device, InstrumentSource, plugins};
 
 impl AppData {
     // -------- r.md #71: device の運搬 (移動 / コピー) ----------------------
@@ -38,9 +42,12 @@ impl AppData {
     /// 運搬の本体。 **Song の書き換えは 1 回の `edit_song` に閉じ込める**
     /// (不変条件 5、undo 1 step、epoch bump 1 回)。
     pub(crate) fn relocate_devices_inner(&mut self, req: &RelocateDevices) {
-        let RelocateDevices { device_ids, dest_track, dest_index, copy } = req.clone();
+        let RelocateDevices { device_ids, dest, dest_index, copy } = req.clone();
+        let Some(dest_track) = self.song_doc.song().chain_owner_track(dest) else {
+            return;
+        };
         let Some(outcome) = self
-            .edit_song(move |song| relocate_in_song(song, &device_ids, dest_track, dest_index, copy))
+            .edit_song(move |song| relocate_in_song(song, &device_ids, dest, dest_index, copy))
             .flatten()
         else {
             return;
@@ -108,11 +115,14 @@ impl AppData {
         // コピーで作った device を host に実体化する。 **finalize を先に積む**
         // (load 応答が先に届いたときに取りこぼさないため)。 `OpenPluginShmem` は
         // `on_plugin_loaded_from_child` が live な `audio_tx` から送る既存経路に乗る。
-        for inst in &outcome.created {
+        // r.md #110: Parallel を複製したら中の plugin 全部。
+        let created_plugins: Vec<common::model::PluginInstance> =
+            plugins(&outcome.created).cloned().collect();
+        for inst in &created_plugins {
             self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
         }
-        for inst in outcome.created.clone() {
-            self.restore_device(&inst);
+        for inst in &created_plugins {
+            self.restore_device(inst);
         }
 
         // 移動は plugin_host への IPC が 1 通も要らない (device_id は不変で
@@ -181,7 +191,7 @@ impl AppData {
         };
         self.ui_ephemeral.pending_clipboard_write = Some(json);
         self.ui_ephemeral.status_message = if dropped == 0 {
-            format!("{verb}: {count} プラグイン")
+            format!("{verb}: {count} デバイス")
         } else {
             // 黙って切らない — 「貼ったら音色が違う」の原因が見えなくなる。
             format!(
@@ -192,27 +202,28 @@ impl AppData {
     }
 
     /// 指定 device 群を `DeviceCopy` list に組み立てて envelope へ入れる。
-    /// 戻り値は `(json, 件数, blob を落とした device 数)`。
+    /// 戻り値は `(json, 件数, blob を落とした plugin 数)`。
     ///
     /// blob (`state` / `ara_archive`) は base64 テキストとして OS クリップボードへ
     /// 流れるので [`CLIPBOARD_BLOB_BUDGET`](crate::clipboard::CLIPBOARD_BLOB_BUDGET)
-    /// を超える分は運ばない。 落とす順序は決定的に **(1) 全 device の
-    /// `ara_archive`、(2) 全 device の `state`** で、(1) で収まればそこで止める。
+    /// を超える分は運ばない。 落とす順序は決定的に **(1) 全 plugin の
+    /// `ara_archive`、(2) 全 plugin の `state`** で、(1) で収まればそこで止める。
+    /// r.md #110: Parallel は中身ごと 1 件。
     fn serialize_devices_to_envelope(&self, device_ids: &[u64]) -> Option<(String, usize, usize)> {
         let song = self.song_doc.song();
         // 表示順 (= チェーン順) を保つため、 呼び出し側の並びをそのまま使う。
         let mut out: Vec<crate::clipboard::DeviceCopy> = Vec::new();
         for &id in device_ids {
-            let Some((source_track, index)) = find_device_by_id(song, id) else {
+            let Some(source_track) = song.device_owner_track(id) else {
                 continue;
             };
-            let Some(inst) = device_at(song, source_track, index) else {
+            let Some(dev) = song.device_by_id(id) else {
                 continue;
             };
             out.push(crate::clipboard::DeviceCopy {
                 order: out.len(),
                 source_track,
-                device: inst.clone(),
+                device: dev.clone(),
             });
         }
         if out.is_empty() {
@@ -220,25 +231,30 @@ impl AppData {
         }
         let blob_bytes = |ds: &[crate::clipboard::DeviceCopy]| -> usize {
             ds.iter()
-                .map(|d| {
-                    d.device.state.as_ref().map_or(0, |s| s.len())
-                        + d.device.ara_archive.as_ref().map_or(0, |s| s.len())
+                .flat_map(|d| plugins(std::slice::from_ref(&d.device)))
+                .map(|p| {
+                    p.state.as_ref().map_or(0, |s| s.len())
+                        + p.ara_archive.as_ref().map_or(0, |s| s.len())
                 })
                 .sum()
         };
         let mut dropped = 0usize;
         if blob_bytes(&out) > crate::clipboard::CLIPBOARD_BLOB_BUDGET {
             for d in &mut out {
-                if d.device.ara_archive.take().is_some() {
-                    dropped += 1;
-                }
+                common::model::for_each_plugin_mut(std::slice::from_mut(&mut d.device), &mut |p| {
+                    if p.ara_archive.take().is_some() {
+                        dropped += 1;
+                    }
+                });
             }
         }
         if blob_bytes(&out) > crate::clipboard::CLIPBOARD_BLOB_BUDGET {
             for d in &mut out {
-                if d.device.state.take().is_some() {
-                    dropped += 1;
-                }
+                common::model::for_each_plugin_mut(std::slice::from_mut(&mut d.device), &mut |p| {
+                    if p.state.take().is_some() {
+                        dropped += 1;
+                    }
+                });
             }
         }
         let count = out.len();
@@ -251,8 +267,8 @@ impl AppData {
     }
 
     /// Ctrl+V (device 面)。貼り先は「いまインスペクタに出ているチェーン」で、
-    /// 挿入位置は **選んでいるプラグインの直前**、選択が無ければ末尾 (Ableton 流)。
-    /// 戻り値は貼り付けた件数。
+    /// 挿入位置は **選んでいる device の直前** (その device が居る chain へ)、選択が
+    /// 無ければ top-level 末尾 (Ableton 流)。 戻り値は貼り付けた件数。
     pub fn paste_devices(
         &mut self,
         devices: Vec<crate::clipboard::DeviceCopy>,
@@ -261,50 +277,42 @@ impl AppData {
         if devices.is_empty() {
             return 0;
         }
-        let Some(chain_len) = self
-            .song_doc
-            .song()
-            .fx_chain_by_track_id(dest_track)
-            .map(<[_]>::len)
-        else {
+        let song = self.song_doc.song();
+        if song.fx_chain_by_track_id(dest_track).is_none() {
             return 0;
-        };
-        // 挿入位置: 表示チェーンの中で選択されている device の最小 index。
-        // `live_device_ids` を通すので、 別トラックの選択が残っていても末尾に
-        // 落ちる (= 画面と一致する)。
-        let selected = self.live_device_ids();
-        let dest_index = self
-            .song_doc
-            .song()
-            .fx_chain_by_track_id(dest_track)
-            .and_then(|chain| {
-                chain
-                    .iter()
-                    .position(|d| selected.contains(&d.id))
-                    .map(|i| i as u32)
-            })
-            .unwrap_or(chain_len as u32);
+        }
+        // 挿入位置: 選択されている device (表示順の先頭) の直前。 `live_device_ids` を
+        // 通すので、 別トラックの選択が残っていても末尾に落ちる (= 画面と一致する)。
+        let (dest, dest_index) = self
+            .live_device_ids()
+            .first()
+            .and_then(|&id| song.find_device(id))
+            .map(|(chain, i)| (chain, i as u32))
+            .unwrap_or_else(|| {
+                let len = song.fx_chain_by_track_id(dest_track).map_or(0, <[_]>::len);
+                (ChainRef::Track(dest_track), len as u32)
+            });
 
         let mut ordered = devices;
         ordered.sort_by_key(|d| d.order);
         let created = self.edit_song(move |song| {
-            let mut created: Vec<common::model::PluginInstance> = Vec::new();
+            let mut created: Vec<Device> = Vec::new();
             for dc in &ordered {
-                let mut inst = dc.device.clone();
-                inst.id = song.alloc_device_id();
-                // 別トラックへ運んだ ARA アーカイブは復元できない (persistent_id が
-                // 元トラックのクリップを指す) ので落として解析し直させる。
-                if dc.source_track != dest_track {
-                    inst.ara_archive = None;
-                }
-                resolve_aux_refs_after_paste(song, &mut inst);
-                created.push(inst);
+                let mut dev = dc.device.clone();
+                assign_fresh_ids(song, std::slice::from_mut(&mut dev));
+                let from_other_track = dc.source_track != dest_track;
+                common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
+                    // 別トラックへ運んだ ARA アーカイブは復元できない (persistent_id が
+                    // 元トラックのクリップを指す) ので落として解析し直させる。
+                    if from_other_track {
+                        inst.ara_archive = None;
+                    }
+                    resolve_aux_refs_after_paste(song, inst);
+                });
+                created.push(dev);
             }
-            let at = (dest_index as usize).min(
-                song.fx_chain_by_track_id(dest_track)
-                    .map_or(0, <[_]>::len),
-            );
-            if let Some(chain) = song.fx_chain_by_track_id_mut(dest_track) {
+            let at = (dest_index as usize).min(song.chain_devices(dest).map_or(0, Vec::len));
+            if let Some(chain) = song.chain_devices_mut(dest) {
                 chain.splice(at..at, created.iter().cloned());
             }
             apply_dest_side_effects(song, dest_track, &created);
@@ -313,31 +321,33 @@ impl AppData {
         let Some(created) = created else {
             return 0;
         };
-        for inst in &created {
+        let created_plugins: Vec<common::model::PluginInstance> =
+            plugins(&created).cloned().collect();
+        for inst in &created_plugins {
             self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
         }
-        for inst in created.clone() {
-            self.restore_device(&inst);
+        for inst in &created_plugins {
+            self.restore_device(inst);
         }
         self.flush_song_sync();
         // 貼った device を選択に倒す (更新は `set_device_selection` 1 本に通す)。
-        self.selection.device_anchor = created.last().map(|d| d.id);
+        self.selection.device_anchor = created.last().map(Device::id);
         let n = created.len();
-        self.set_device_selection(created.into_iter().map(|d| d.id).collect());
+        self.set_device_selection(created.iter().map(Device::id).collect());
         n
     }
 
     // -------- r.md #71: device 選択 ----------------------------------------
 
     /// チェーン行 click の解決 (無修飾 = Single / Ctrl = Toggle / Shift = 範囲)。
-    /// 範囲の並びは表示チェーンの device id 列で、 解決自体は全選択面共通の
-    /// [`range_ordered`](crate::widgets::select_modifier::range_ordered) に任せる。
+    /// 範囲の並びは表示チェーンの行 (plugin / Parallel / chain) の id 列で、 解決自体は
+    /// 全選択面共通の [`range_ordered`](crate::widgets::select_modifier::range_ordered) に任せる。
     pub(crate) fn apply_select_device(
         &mut self,
         device_id: u64,
         modifier: crate::widgets::select_modifier::SelectModifier,
     ) {
-        let order: Vec<u64> = self.inspector_chain().iter().map(|e| e.device_id).collect();
+        let order: Vec<u64> = self.chain_rows().iter().filter_map(|r| r.select_id()).collect();
         // `prev` は **正規化済み** を渡す (異トラックの stale id は最初の click で落ちる)。
         let prev = self.live_device_ids();
         let next = modifier.resolve(&prev, device_id, || {
@@ -378,7 +388,7 @@ impl AppData {
             .selected_device_ids
             .iter()
             .copied()
-            .filter(|id| find_device_by_id(song, *id).is_some())
+            .filter(|&id| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some())
             .collect();
         if alive.len() != self.selection.selected_device_ids.len() {
             self.set_device_selection(alive);
@@ -386,7 +396,10 @@ impl AppData {
         if self
             .selection
             .device_anchor
-            .is_some_and(|id| find_device_by_id(self.song_doc.song(), id).is_none())
+            .is_some_and(|id| {
+                let song = self.song_doc.song();
+                song.device_by_id(id).is_none() && song.chain_by_id(id).is_none()
+            })
         {
             self.selection.device_anchor = None;
         }
@@ -399,33 +412,54 @@ struct RelocateOutcome {
     result_ids: Vec<u64>,
     /// 移送した automation lane の再キー表 `(src_track, old_lane, dest_track, new_lane)`。
     lane_remap: Vec<(u32, u32, u32, u32)>,
-    /// **トラックを跨いで**移した device `(src_track, dest_track, device_id)`。
+    /// **トラックを跨いで**移した plugin `(src_track, dest_track, device_id)`。
     /// recording gesture の再キーに使う (gesture の鍵は `(track_id, target)` で、
     /// lane が無くても gesture だけ立っていることがあるので、 lane 由来ではなく
     /// device 由来で洗う)。
     moved_devices: Vec<(u32, u32, u64)>,
-    /// コピーで新規に作った device (host へ実体化する対象)。
-    created: Vec<common::model::PluginInstance>,
+    /// コピーで新規に作った device (中の plugin を host へ実体化する対象)。
+    created: Vec<Device>,
+}
+
+/// `devices` 以下の plugin / Parallel / chain 全部に新しい id を振る (コピー / 貼り付け)。
+fn assign_fresh_ids(song: &mut common::model::Song, devices: &mut [Device]) {
+    common::model::for_each_node_id_mut(devices, &mut |id| *id = song.alloc_device_id());
+}
+
+/// `dest` が `device_id` (Parallel) の **中** の chain か (= 自分の中へ落とす循環)。
+fn dest_inside_device(song: &common::model::Song, device_id: u64, dest: ChainRef) -> bool {
+    let ChainRef::Chain(cid) = dest else {
+        return false;
+    };
+    song.parallel_by_id(device_id).is_some_and(|r| {
+        r.chains
+            .iter()
+            .any(|c| c.id == cid || common::model::chain_devices_in(&c.devices, cid).is_some())
+    })
 }
 
 /// 運搬の Song 側処理 (純関数)。 `None` = 落とし先チェーンが無い / 対象ゼロ。
 fn relocate_in_song(
     song: &mut common::model::Song,
     device_ids: &[u64],
-    dest_track: u32,
+    dest: ChainRef,
     dest_index: u32,
     copy: bool,
 ) -> Option<RelocateOutcome> {
+    let dest_track = song.chain_owner_track(dest)?;
     // 解決できない id は捨てる (削除済み device への stale 要求は正常系)。
-    let mut targets: Vec<(u64, u32, u32)> = device_ids
+    // Parallel を自分の中の chain へ落とすのは循環なので、その id も落とす。
+    let targets: Vec<(u64, u32, ChainRef, usize)> = device_ids
         .iter()
-        .filter_map(|&id| find_device_by_id(song, id).map(|(t, i)| (id, t, i)))
+        .filter_map(|&id| {
+            let (chain, index) = song.find_device(id)?;
+            let owner = song.chain_owner_track(chain)?;
+            (!dest_inside_device(song, id, dest)).then_some((id, owner, chain, index))
+        })
         .collect();
     if targets.is_empty() {
         return None;
     }
-    // 落とし先チェーンが無ければ中止 (存在確認だけで値は使わない)。
-    song.fx_chain_by_track_id(dest_track)?;
     // 同一チェーン内の移動は「並べ替え」として正当なので、 無変化の早期 return は
     // しない (普通に処理する)。
 
@@ -437,28 +471,31 @@ fn relocate_in_song(
     };
 
     if copy {
-        let mut copies: Vec<common::model::PluginInstance> = Vec::new();
-        for &(_, src_track, index) in &targets {
-            let Some(src) = device_at(song, src_track, index) else {
+        let mut copies: Vec<Device> = Vec::new();
+        for &(id, src_track, _, _) in &targets {
+            let Some(src) = song.device_by_id(id) else {
                 continue;
             };
-            let mut inst = src.clone();
-            inst.id = song.alloc_device_id();
-            // `state` (= いまのツマミ) は引き継ぐ (`Arc` の clone なのでコストゼロ)。
-            // ARA アーカイブはトラックを跨いだら復元できないので捨てる。
-            if src_track != dest_track {
-                inst.ara_archive = None;
-            }
-            retarget_self_track_aux(&mut inst, src_track, dest_track);
-            copies.push(inst);
+            let mut dev = src.clone();
+            assign_fresh_ids(song, std::slice::from_mut(&mut dev));
+            let cross = src_track != dest_track;
+            common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
+                // `state` (= いまのツマミ) は引き継ぐ (`Arc` の clone なのでコストゼロ)。
+                // ARA アーカイブはトラックを跨いだら復元できないので捨てる。
+                if cross {
+                    inst.ara_archive = None;
+                }
+                retarget_self_track_aux(inst, src_track, dest_track);
+            });
+            copies.push(dev);
         }
-        let at = (dest_index as usize).min(song.fx_chain_by_track_id(dest_track)?.len());
-        if let Some(chain) = song.fx_chain_by_track_id_mut(dest_track) {
+        let at = (dest_index as usize).min(song.chain_devices(dest)?.len());
+        if let Some(chain) = song.chain_devices_mut(dest) {
             chain.splice(at..at, copies.iter().cloned());
         }
         // 副作用は **dest 側だけ** (src はそのまま残るので降ろさない)。
         apply_dest_side_effects(song, dest_track, &copies);
-        outcome.result_ids = copies.iter().map(|d| d.id).collect();
+        outcome.result_ids = copies.iter().map(Device::id).collect();
         outcome.created = copies;
         return Some(outcome);
     }
@@ -468,84 +505,42 @@ fn relocate_in_song(
     // 引く。 忘れると同一チェーン内の移動が 1 個ずれる。
     let removed_before_dest = targets
         .iter()
-        .filter(|&&(_, t, i)| t == dest_track && i < dest_index)
+        .filter(|&&(_, _, chain, i)| chain == dest && (i as u32) < dest_index)
         .count();
-    // src チェーンごとに index 降順で抜く (前から抜くと後続の index がずれる)。
-    targets.sort_by_key(|t| std::cmp::Reverse(t.2));
-    let mut taken: Vec<(common::model::PluginInstance, u32)> = Vec::new();
-    for &(_, src_track, index) in &targets {
-        let Some(chain) = song.fx_chain_by_track_id_mut(src_track) else {
-            continue;
-        };
-        if (index as usize) >= chain.len() {
-            continue;
+    // 指定順 (= チェーン表示順) に抜く。 id で抜くので index のずれは起きない。
+    let mut taken: Vec<(Device, u32)> = Vec::new();
+    for &(id, src_track, _, _) in &targets {
+        if let Some(dev) = song.remove_device(id) {
+            taken.push((dev, src_track));
         }
-        taken.push((chain.remove(index as usize), src_track));
     }
-    // 元の指定順 (= チェーン表示順) に戻す。
-    taken.reverse();
 
-    let mut moved: Vec<common::model::PluginInstance> = Vec::new();
-    // src track ごとに「そのトラックから出ていった device」 を控える
+    let mut moved: Vec<Device> = Vec::new();
+    // src track ごとに「そのトラックから出ていった plugin」 を控える
     // (副作用の判定は種類ごとなので、 出ていった種類だけを見る)。
     let mut left_by_track: std::collections::HashMap<u32, Vec<String>> =
         std::collections::HashMap::new();
-    for (mut inst, src_track) in taken {
+    for (mut dev, src_track) in taken {
         if src_track != dest_track {
-            // automation lane / mod_routing を新しい所有者へ移す。 lane を元
-            // トラックに置いたまま device だけ移すと、 その lane は永久に効かない
-            // (`daw_audio/src/automation.rs` が track から lane を引いてから
-            //  device_id で絞るため)。
-            let (lanes, mut routings) = extract_device_bindings(song, src_track, inst.id);
-            for lane in lanes {
-                let old_id = lane.id;
-                let new_id = push_lane_to(song, dest_track, lane);
-                outcome
-                    .lane_remap
-                    .push((src_track, old_id, dest_track, new_id));
-            }
-            // r.md #89: 移した変調の **深さ** を指すレーン / 変調も一緒に運ぶ。深さの
-            // 深さ (= 連鎖) もあり得るので、抜き取るものが無くなるまで回す (src の
-            // routing 数は毎周必ず減るので必ず止まる)。
-            while !routings.is_empty() {
-                let mut moved_ids: Vec<u32> = Vec::new();
-                for routing in routings {
-                    // `ModRouting.source_id` は `Song.mod_sources` の song-global id
-                    // なのでそのまま生きる (再キー不要)。`ModRouting.id` も Song-global
-                    // なので移送で変えない (`ModRoutingDepth` の参照が切れる)。
-                    if routing.id != 0 {
-                        moved_ids.push(routing.id);
-                    }
-                    push_routing_to(song, dest_track, routing);
-                }
-                let (dep_lanes, dep_routings) =
-                    extract_depth_bindings(song, src_track, &moved_ids);
-                for lane in dep_lanes {
-                    let old_id = lane.id;
-                    let new_id = push_lane_to(song, dest_track, lane);
-                    outcome
-                        .lane_remap
-                        .push((src_track, old_id, dest_track, new_id));
-                }
-                routings = dep_routings;
-            }
-            outcome.moved_devices.push((src_track, dest_track, inst.id));
-            left_by_track
-                .entry(src_track)
-                .or_default()
-                .push(inst.plugin_id.clone());
-            // ARA アーカイブは元トラックのクリップを指す persistent_id で作られて
-            // いるので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
-            inst.ara_archive = None;
-            retarget_self_track_aux(&mut inst, src_track, dest_track);
+            move_device_bindings(song, &dev, src_track, dest_track, &mut outcome);
+            common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
+                left_by_track
+                    .entry(src_track)
+                    .or_default()
+                    .push(inst.plugin_id.clone());
+                // ARA アーカイブは元トラックのクリップを指す persistent_id で作られて
+                // いるので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
+                inst.ara_archive = None;
+                retarget_self_track_aux(inst, src_track, dest_track);
+            });
         }
-        moved.push(inst);
+        moved.push(dev);
     }
 
     let at = ((dest_index as usize).saturating_sub(removed_before_dest))
-        .min(song.fx_chain_by_track_id(dest_track)?.len());
-    outcome.result_ids = moved.iter().map(|d| d.id).collect();
-    if let Some(chain) = song.fx_chain_by_track_id_mut(dest_track) {
+        .min(song.chain_devices(dest)?.len());
+    outcome.result_ids = moved.iter().map(Device::id).collect();
+    if let Some(chain) = song.chain_devices_mut(dest) {
         chain.splice(at..at, moved.iter().cloned());
     }
     // 副作用の対称化: src 側は「他に残っていなければ降ろす」、 dest 側は立てる。
@@ -554,6 +549,60 @@ fn relocate_in_song(
     }
     apply_dest_side_effects(song, dest_track, &moved);
     Some(outcome)
+}
+
+/// track を跨いで運ぶ device (Parallel なら中の plugin / chain 全部) の automation lane /
+/// mod routing を `src_track` から `dest_track` へ移す。 lane を元トラックに置いたまま
+/// device だけ移すと、 その lane は永久に効かない (`daw_audio/src/automation.rs` が
+/// track から lane を引いてから device_id で絞るため)。
+fn move_device_bindings(
+    song: &mut common::model::Song,
+    dev: &Device,
+    src_track: u32,
+    dest_track: u32,
+    outcome: &mut RelocateOutcome,
+) {
+    let mut move_lanes = |song: &mut common::model::Song, lanes: Vec<common::model::AutomationLane>| {
+        for lane in lanes {
+            let old_id = lane.id;
+            let new_id = push_lane_to(song, dest_track, lane);
+            outcome.lane_remap.push((src_track, old_id, dest_track, new_id));
+        }
+    };
+    let plugin_ids: Vec<u64> = plugins(std::slice::from_ref(dev)).map(|p| p.id).collect();
+    for pid in plugin_ids {
+        let (lanes, mut routings) = extract_device_bindings(song, src_track, pid);
+        move_lanes(song, lanes);
+        // r.md #89: 移した変調の **深さ** を指すレーン / 変調も一緒に運ぶ。深さの
+        // 深さ (= 連鎖) もあり得るので、抜き取るものが無くなるまで回す (src の
+        // routing 数は毎周必ず減るので必ず止まる)。
+        while !routings.is_empty() {
+            let mut moved_ids: Vec<u32> = Vec::new();
+            for routing in routings {
+                // `ModRouting.source_id` は `Song.mod_sources` の song-global id
+                // なのでそのまま生きる (再キー不要)。`ModRouting.id` も Song-global
+                // なので移送で変えない (`ModRoutingDepth` の参照が切れる)。
+                if routing.id != 0 {
+                    moved_ids.push(routing.id);
+                }
+                push_routing_to(song, dest_track, routing);
+            }
+            let (dep_lanes, dep_routings) = extract_depth_bindings(song, src_track, &moved_ids);
+            move_lanes(song, dep_lanes);
+            routings = dep_routings;
+        }
+        outcome.moved_devices.push((src_track, dest_track, pid));
+    }
+    // r.md #110: chain の gain / pan のレーン / 変調も所有 track を移る。
+    let mut chain_ids: Vec<u64> = Vec::new();
+    common::model::for_each_chain(std::slice::from_ref(dev), &mut |_, c| chain_ids.push(c.id));
+    for cid in chain_ids {
+        let (lanes, routings) = extract_chain_bindings(song, src_track, cid);
+        move_lanes(song, lanes);
+        for routing in routings {
+            push_routing_to(song, dest_track, routing);
+        }
+    }
 }
 
 /// この device を指す automation lane / mod routing を所有者から **抜き取る**
@@ -570,6 +619,24 @@ fn extract_device_bindings(
         matches!(
             target,
             common::model::AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id
+        )
+    })
+}
+
+/// r.md #110: chain の gain / pan を指す lane / routing を抜き取る。
+fn extract_chain_bindings(
+    song: &mut common::model::Song,
+    track_id: u32,
+    chain_id: u64,
+) -> (
+    Vec<common::model::AutomationLane>,
+    Vec<common::model::ModRouting>,
+) {
+    use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
+    extract_bindings(song, track_id, |target| {
+        matches!(
+            target,
+            T::TrackBuiltin(P::ChainGain { chain_id: c } | P::ChainPan { chain_id: c }) if *c == chain_id
         )
     })
 }
@@ -673,7 +740,9 @@ fn push_routing_to(
 }
 
 /// 自トラックを指していた aux 参照を移動先へ貼り替える。 他トラックを指すものは
-/// 触らない (= その配線はユーザーが意図して張ったもの)。
+/// 触らない (= その配線はユーザーが意図して張ったもの)。 chain source (同 track の
+/// Parallel 内 chain) は運搬で chain が同 track に残るとは限らないが、 id は不変なので
+/// そのまま (dangling なら compile が黙って落とす)。
 fn retarget_self_track_aux(
     inst: &mut common::model::PluginInstance,
     src_track: u32,
@@ -681,9 +750,10 @@ fn retarget_self_track_aux(
 ) {
     for slot in &mut inst.aux_inputs {
         if let Some(route) = slot
-            && route.tap.source_track == src_track
+            && let common::model::TapSource::Track(t) = &mut route.tap.source
+            && *t == src_track
         {
-            route.tap.source_track = dest_track;
+            *t = dest_track;
         }
     }
     for slot in &mut inst.aux_outputs {
@@ -695,18 +765,22 @@ fn retarget_self_track_aux(
     }
 }
 
-/// 貼り付け (別プロジェクト由来もありうる) の aux 参照解決。 実在しない track を
-/// 指す route は落とす。 **`aux_outputs` も見る** — `build_pasted_tracks` は
+/// 貼り付け (別プロジェクト由来もありうる) の aux 参照解決。 実在しない track /
+/// chain を指す route は落とす。 **`aux_outputs` も見る** — `build_pasted_tracks` は
 /// `aux_inputs` しか見ていないが、それは取りこぼしなので真似しない。
 fn resolve_aux_refs_after_paste(
     song: &common::model::Song,
     inst: &mut common::model::PluginInstance,
 ) {
     for slot in &mut inst.aux_inputs {
-        if let Some(route) = slot
-            && song.track_by_id(route.tap.source_track).is_none()
-        {
-            *slot = None;
+        if let Some(route) = slot {
+            let alive = match route.tap.source {
+                common::model::TapSource::Track(t) => song.track_by_id(t).is_some(),
+                common::model::TapSource::Chain(c) => song.chain_by_id(c).is_some(),
+            };
+            if !alive {
+                *slot = None;
+            }
         }
     }
     for slot in &mut inst.aux_outputs {
@@ -724,17 +798,13 @@ fn resolve_aux_refs_after_paste(
 fn apply_dest_side_effects(
     song: &mut common::model::Song,
     dest_track: u32,
-    placed: &[common::model::PluginInstance],
+    placed: &[Device],
 ) {
     if dest_track == common::model::MASTER_TRACK_ID {
         return;
     }
-    let has_voicevox = placed
-        .iter()
-        .any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX);
-    let has_transform = placed
-        .iter()
-        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID);
+    let has_voicevox = plugins(placed).any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX);
+    let has_transform = plugins(placed).any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID);
     let Some(track) = song.tracks.iter_mut().find(|t| t.id == dest_track) else {
         return;
     };
@@ -760,20 +830,10 @@ fn apply_src_side_effects(song: &mut common::model::Song, src_track: u32, left: 
     let Some(track) = song.tracks.iter_mut().find(|t| t.id == src_track) else {
         return;
     };
-    if left_voicevox
-        && !track
-            .devices
-            .iter()
-            .any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX)
-    {
+    if left_voicevox && !track.plugins().any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX) {
         track.source = InstrumentSource::None;
     }
-    if left_transform
-        && !track
-            .devices
-            .iter()
-            .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
-    {
+    if left_transform && !track.plugins().any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID) {
         track.group_transform = None;
     }
 }

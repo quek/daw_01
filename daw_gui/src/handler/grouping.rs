@@ -137,9 +137,10 @@ impl AppData {
     ) -> Vec<TrackRemovalIpc> {
         let mut plan = Vec::new();
         for &track_id in track_ids {
+            // r.md #110: Parallel の中の plugin も全部 (host に居るのは plugin だけ)。
             let ids: Vec<u64> = song
                 .fx_chain_by_track_id(track_id)
-                .map(|c| c.iter().map(|d| d.id).collect())
+                .map(|c| common::model::plugins(c).map(|d| d.id).collect())
                 .unwrap_or_default();
             // (1) audio engine から先に mapping を落とす (use-after-free deadlock 防止)。
             for &device_id in &ids {
@@ -400,13 +401,13 @@ mod tests {
             ..common::model::Track::default()
         };
         for &device_id in device_ids {
-            t.devices.push(common::model::PluginInstance {
+            t.devices.push(common::model::Device::Plugin(common::model::PluginInstance {
                 id: device_id,
                 ..common::model::PluginInstance::new(
                     "test.fx".into(),
                     common::plugin_format::PluginFormat::Clap,
                 )
-            });
+            }));
         }
         t
     }

@@ -652,6 +652,12 @@ pub trait LoadedPlugin: Send {
         0
     }
 
+    /// r.md #110: how many `is_main=false` audio input ports (= sidechain 候補)
+    /// this plugin declared.
+    fn aux_input_port_count(&self) -> usize {
+        0
+    }
+
     /// VOICEVOX capability downcast. Default `None` (external plugins).
     fn as_vocal_synth(&mut self) -> Option<&mut dyn VocalSynth> {
         None

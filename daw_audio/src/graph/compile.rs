@@ -18,10 +18,92 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use common::model::Song;
+use common::model::{AudioTap, PluginInstance, Song, TapPoint, TapSource, plugins};
 
 use super::delay_line::DelayLine;
-use super::schedule::{BufRef, DelayKey, NodeOp, Schedule};
+use super::program::ChainProgram;
+use super::program_build::{ChainLatency, build_program, program_latency};
+use super::schedule::{BufRef, DelayKey, MASTER_OWNER, NodeOp, Schedule};
+
+/// r.md #110: chain id → その chain が居る program と slot (sidechain / follower の
+/// `TapSource::Chain` を `BufRef` へ解決する表)。`owner` = song-track index、master 所有
+/// は [`MASTER_OWNER`]。
+#[derive(Debug, Clone, Copy)]
+struct ChainLoc {
+    owner: u32,
+    chain_slot: u32,
+    parallel_slot: u32,
+    lat: ChainLatency,
+}
+
+type ChainMap = HashMap<u64, ChainLoc>;
+
+/// tap → source buffer。dangling (track / chain が無い) は `None`。
+fn tap_bufref_for(tap: &AudioTap, id_to_idx: &HashMap<u32, u32>, chains: &ChainMap) -> Option<BufRef> {
+    match tap.source {
+        TapSource::Track(t) => id_to_idx.get(&t).map(|&i| tap_bufref(tap.tap_point, i)),
+        TapSource::Chain(c) => chains.get(&c).map(|loc| match tap.tap_point {
+            TapPoint::PreFx => BufRef::ParallelInput {
+                owner: loc.owner,
+                slot: loc.parallel_slot,
+            },
+            TapPoint::PostFx => BufRef::ChainPostFx {
+                owner: loc.owner,
+                slot: loc.chain_slot,
+            },
+            TapPoint::PostFader => BufRef::ChainPostFader {
+                owner: loc.owner,
+                slot: loc.chain_slot,
+            },
+        }),
+    }
+}
+
+/// tap の source が属する **song-track index** (依存辺 / path latency 用)。
+/// master 所有の chain と dangling は `None`。
+fn tap_owner_idx(tap: &AudioTap, id_to_idx: &HashMap<u32, u32>, chains: &ChainMap) -> Option<u32> {
+    match tap.source {
+        TapSource::Track(t) => id_to_idx.get(&t).copied(),
+        TapSource::Chain(c) => chains
+            .get(&c)
+            .map(|loc| loc.owner)
+            .filter(|&o| o != MASTER_OWNER),
+    }
+}
+
+/// chain source の「所有 track の chain 起点からの相対 latency」 (track source は 0 =
+/// 所有 track の path latency がそのまま)。
+fn tap_chain_rel_latency(tap: &AudioTap, chains: &ChainMap) -> u32 {
+    match tap.source {
+        TapSource::Track(_) => 0,
+        TapSource::Chain(c) => chains.get(&c).map_or(0, |loc| match tap.tap_point {
+            TapPoint::PreFx => loc.lat.parallel_input,
+            TapPoint::PostFx => loc.lat.post_fx,
+            TapPoint::PostFader => loc.lat.post_fader,
+        }),
+    }
+}
+
+/// `(chain_id, tap_point)` を誰かが読むか (chain の snapshot flag を焼く入力)。
+fn collect_chain_taps(song: &Song) -> HashSet<(u64, TapPoint)> {
+    let mut set = HashSet::new();
+    let mut add = |tap: &AudioTap| {
+        if let TapSource::Chain(c) = tap.source {
+            set.insert((c, tap.tap_point));
+        }
+    };
+    for p in song.all_plugins().filter(|p| !p.bypassed) {
+        for route in p.aux_inputs.iter().flatten() {
+            add(&route.tap);
+        }
+    }
+    for ms in &song.mod_sources {
+        if let Some((tap, _)) = ms.follower() {
+            add(tap);
+        }
+    }
+    set
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphError {
@@ -42,15 +124,6 @@ pub enum GraphError {
 /// `AudioCommand::SetDeviceLatency` でこの表を更新し、 track / master の合計は
 /// [`chain_latency`] が chain から導出する (GUI 側では集計しない)。
 pub type DeviceLatencies = HashMap<u64, u32>;
-
-/// `chain` 上の device が報告している latency の合計 (samples)。
-/// 未報告 (= 表に無い) device は 0 として扱う。 bypass 中 (r.md #105) の device は
-/// dispatch されない = 遅延を生まないので 0 (Live / Bitwig と同じく PDC から外れる)。
-fn chain_latency(chain: &[common::model::PluginInstance], latencies: &DeviceLatencies) -> u32 {
-    chain.iter().filter(|d| !d.bypassed).fold(0u32, |acc, d| {
-        acc.saturating_add(latencies.get(&d.id).copied().unwrap_or(0))
-    })
-}
 
 /// Compile a `Schedule` from `song`. PR2 supports the group hierarchy:
 /// children → group `Mix` → `ProcessGroupFx` → upstream (parent group or
@@ -76,12 +149,17 @@ pub fn compile_schedule(
     buffer_frames: u32,
 ) -> Result<Schedule, GraphError> {
     let n = song.tracks.len();
+    // r.md #110: device ツリーを program に展開する (`docs/plan_parallel.md` §4.1)。
+    // 並列 chain の PDC と chain tap の snapshot flag はここで焼き込む。
+    let (master_built, built, chain_map) = build_all_programs(song, device_latencies);
     if n == 0 {
         return Ok(Schedule {
             nodes: vec![NodeOp::Mix {
                 srcs: Vec::new(),
                 dst: BufRef::Master,
             }],
+            master_latency_samples: master_output_latency(song, device_latencies, 0, sample_rate),
+            master_program: master_built.program,
             ..Schedule::empty()
         });
     }
@@ -154,8 +232,8 @@ pub fn compile_schedule(
     // B/C while B/C read A's aux) is NOT a cycle.
     let mut incoming_paraout: HashMap<u32, Vec<(u32, u64, u8)>> = HashMap::new();
     {
-        let mut gather = |chain: &[common::model::PluginInstance], src_track_id: u32| {
-            for p in chain {
+        let mut gather = |chain: &[common::model::Device], src_track_id: u32| {
+            for p in plugins(chain) {
                 for (port, route_opt) in p
                     .aux_outputs
                     .iter()
@@ -226,9 +304,13 @@ pub fn compile_schedule(
         // `devices` covers what the old per-section walks did.
         // r.md #105: bypass 中の device は dispatch されないので、その sidechain
         // 配線も依存辺 / tap / latency のどれにも数えない (下の 3 走査と同じ規則)。
-        for p in track.devices.iter().filter(|p| !p.bypassed) {
+        // r.md #110: 同 track の chain を source にする tap は自己辺にしない
+        // (前 buffer の snapshot を読む = 1 buffer 遅れ、cycle ではない)。
+        for p in plugins(&track.devices).filter(|p| !p.bypassed) {
             for route in p.aux_inputs.iter().flatten() {
-                if let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) {
+                if let Some(src_idx) = tap_owner_idx(&route.tap, &id_to_idx, &chain_map)
+                    && src_idx != idx
+                {
                     out.push(src_idx);
                 }
             }
@@ -293,7 +375,7 @@ pub fn compile_schedule(
         // `process()` (i.e. before ProcessTrack / ProcessGroupFx for
         // this track) so the engine can stage the source signal in the
         // plugin's `pd.buffer_aux_in[port]` shmem region.
-        emit_aux_input_taps(&track.devices, &id_to_idx, &mut nodes);
+        emit_aux_input_taps(&track.devices, track.id, &id_to_idx, &chain_map, &mut nodes);
 
         // A bus sums its inputs into its own scratch and runs its fx chain +
         // strip via ProcessGroupFx, rather than rendering its own clips /
@@ -316,8 +398,9 @@ pub fn compile_schedule(
             // sums the whole chain (`start_device = 0`).
             let split = track.paraout_split_device();
             let group_with_instrument = is_group.contains(&track.id) && split.is_some();
-            let start_device = if group_with_instrument {
-                split.unwrap_or(0)
+            // r.md #110: split は展開後の op 列上の位置 (`ChainProgram::pass1_end`)。
+            let start_op = if group_with_instrument {
+                built[i as usize].program.pass1_end as u32
             } else {
                 0
             };
@@ -371,10 +454,7 @@ pub fn compile_schedule(
                     });
                 }
             }
-            nodes.push(NodeOp::ProcessGroupFx {
-                track_idx,
-                start_device,
-            });
+            nodes.push(NodeOp::ProcessGroupFx { track_idx, start_op });
         } else {
             // Leaf track: full chain handled by ProcessTrack op.
             nodes.push(NodeOp::ProcessTrack { track_idx });
@@ -398,7 +478,7 @@ pub fn compile_schedule(
     // `process_master_fx_chain` が plugin process でそれを読む。 dst_track は
     // `MASTER_TRACK_ID` (master は audio fx のみ)。 track 経路と同じ
     // `emit_aux_input_taps` を使う (critique #1: emit site の単一化)。
-    emit_aux_input_taps(&song.master_fx_chain, &id_to_idx, &mut nodes);
+    emit_aux_input_taps(&song.master_fx_chain, common::model::MASTER_TRACK_ID, &id_to_idx, &chain_map, &mut nodes);
 
     // ---- PR3: Plugin Delay Compensation ----
     //
@@ -421,12 +501,12 @@ pub fn compile_schedule(
     // 補償ルール: 各 Mix ノードの srcs の中で `path_latency` が最も小さい側に、
     //   `frames = max_path - this_path` の `ApplyDelay` を **Mix の直前に**
     //   挿入する。 こうすると合流点で全 src の累積 latency が揃う。
-    let track_chain_latency: Vec<u32> = song
-        .tracks
-        .iter()
-        .map(|t| chain_latency(&t.devices, device_latencies))
-        .collect();
+    let track_chain_latency: Vec<u32> = built.iter().map(|b| b.latency).collect();
     let mut path_latency = vec![u32::MAX; n];
+    let tap_ctx = TapCtx {
+        id_to_idx: &id_to_idx,
+        chains: &chain_map,
+    };
     for i in 0..n {
         compute_path_latency(
             i as u32,
@@ -434,7 +514,7 @@ pub fn compile_schedule(
             &track_chain_latency,
             &is_group,
             &children_of,
-            &id_to_idx,
+            &tap_ctx,
             &incoming_sends,
             &bus_flags,
             buffer_frames,
@@ -557,40 +637,146 @@ pub fn compile_schedule(
     // `buffer_frames` を加算して plugin 入力での main vs aux を位相一致させる
     // (compute_path_latency の sidechain edge と同じ規則 — 両者は同値でなければ
     // master 合流の sibling alignment とズレる)。
-    let mut input_delay_per_track = vec![0u32; n];
+    let input_delay_per_track = compute_input_delays(
+        song,
+        &bus_flags,
+        buffer_frames,
+        &id_to_idx,
+        &chain_map,
+        &path_latency,
+        &track_chain_latency,
+    );
+
+    // docs/plan_modulation.md §3/§5: per-`ModSource` envelope follower (末尾に emit)。
+    let (follower_slots, follower_keys, mod_kinds) =
+        emit_followers(song, sample_rate, &id_to_idx, &chain_map, &mut nodes_with_pdc);
+
+    Ok(Schedule {
+        nodes: nodes_with_pdc,
+        delay_lines,
+        delay_keys,
+        port_buffers: super::PortBufferPool::new(),
+        input_delay_per_track,
+        follower_slots,
+        follower_keys,
+        mod_kinds,
+        track_programs: built.into_iter().map(|b| b.program).collect(),
+        master_program: master_built.program,
+        master_midi_a: Vec::with_capacity(crate::mixer::MAX_EVENTS),
+        master_midi_b: Vec::with_capacity(crate::mixer::MAX_EVENTS),
+        // r.md #39: click / export が基準にするのは master **出力** の遅延量。
+        // master fx chain は Mix の後段で直列 process される (`process_master_fx_chain`)
+        // ので、その報告 latency も足さないと master に遅延プラグインを挿したときだけ
+        // click が先行し、書き出し WAV もその分ずれる。
+        master_latency_samples:
+            master_output_latency(song, device_latencies, master_mix_latency, sample_rate),
+    })
+}
+
+/// r.md #110: 全 track + master の device ツリーを program に展開し、chain id → 置き場
+/// (`ChainMap`) を組む。`compile_schedule` の冒頭から切り出した (関数 budget)。
+fn build_all_programs(
+    song: &Song,
+    device_latencies: &DeviceLatencies,
+) -> (super::program_build::BuiltProgram, Vec<super::program_build::BuiltProgram>, ChainMap) {
+    let chain_taps = collect_chain_taps(song);
+    let master_built = build_program(
+        &song.master_fx_chain,
+        common::model::MASTER_TRACK_ID,
+        None,
+        device_latencies,
+        &chain_taps,
+    );
+    let built: Vec<_> = song
+        .tracks
+        .iter()
+        .map(|t| build_program(&t.devices, t.id, t.paraout_split_device(), device_latencies, &chain_taps))
+        .collect();
+    let mut chain_map: ChainMap = HashMap::new();
+    let mut register = |b: &super::program_build::BuiltProgram, owner: u32| {
+        for (&cid, &(chain_slot, parallel_slot)) in &b.chain_slots {
+            chain_map.insert(
+                cid,
+                ChainLoc {
+                    owner,
+                    chain_slot,
+                    parallel_slot,
+                    lat: b.chain_latency.get(&cid).copied().unwrap_or_default(),
+                },
+            );
+        }
+    };
+    for (idx, b) in built.iter().enumerate() {
+        register(b, idx as u32);
+    }
+    register(&master_built, MASTER_OWNER);
+    (master_built, built, chain_map)
+}
+
+/// PR4.5 sidechain plugin-internal alignment: per-track input delay.
+/// The delay is applied to the track's main signal so it lines up with any
+/// sidechain a device reads. Only audio-processing devices (= has both an
+/// audio input and an audio output) can read a sidechain, so only those
+/// contribute (a pure source / MIDI device has no main-in to delay against).
+/// §5 (arch refactor): leaf 宛の tap は staging→消費が 1 buffer ずれるので
+/// `buffer_frames` を加算して plugin 入力での main vs aux を位相一致させる
+/// (compute_path_latency の sidechain edge と同じ規則)。
+/// r.md #110: 同 track の chain source は main と揃えようが無い (chain 出力は main の
+/// 下流) ので数えない。
+#[allow(clippy::too_many_arguments)]
+fn compute_input_delays(
+    song: &Song,
+    bus_flags: &[bool],
+    buffer_frames: u32,
+    id_to_idx: &HashMap<u32, u32>,
+    chain_map: &ChainMap,
+    path_latency: &[u32],
+    track_chain_latency: &[u32],
+) -> Vec<u32> {
+    let mut out = vec![0u32; song.tracks.len()];
     for (i, track) in song.tracks.iter().enumerate() {
         let tap_lag = if bus_flags[i] { 0 } else { buffer_frames };
         let mut max_sc: u32 = 0;
-        for p in track.devices.iter().filter(|p| !p.bypassed) {
-            if !(p.ports.has_audio_input && p.ports.has_audio_output) {
+        let routes = plugins(&track.devices)
+            .filter(|p| !p.bypassed && p.ports.has_audio_input && p.ports.has_audio_output)
+            .flat_map(|p| p.aux_inputs.iter().flatten());
+        for route in routes {
+            let Some(src_idx) = tap_owner_idx(&route.tap, id_to_idx, chain_map) else {
+                continue;
+            };
+            if src_idx as usize == i {
                 continue;
             }
-            for route in p.aux_inputs.iter().flatten() {
-                if let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) {
-                    let l = path_latency[src_idx as usize].saturating_add(tap_lag);
-                    if l > max_sc {
-                        max_sc = l;
-                    }
-                }
-            }
+            let l = tap_source_latency(&route.tap, src_idx, path_latency, track_chain_latency, chain_map)
+                .saturating_add(tap_lag);
+            max_sc = max_sc.max(l);
         }
-        input_delay_per_track[i] = max_sc;
+        out[i] = max_sc;
     }
+    out
+}
 
-    // docs/plan_modulation.md §3/§5: per-`ModSource` envelope follower.
-    // Emit `EnvelopeFollow` at the very end of the (post-PDC) schedule — all
-    // scratches are settled and the follower only produces a control-rate
-    // scalar (no audio feedback, so no ordering / cycle constraint).
-    // Coefficients are baked here (recompile-time) so the RT path never
-    // derives them (§10)。
-    //
-    // `slot` は **schedule の内部 index** で、`follower_slots` / `follower_keys` /
-    // `mod_kinds` の 3 本が同じ並び。外へ出る値 (GUI へ publish する面 / sidecar) は
-    // `follower_keys[slot]` = `ModSource::id` を組にして運ぶ
-    // (`crate::mod_tick::eval_plane`、アーキ不変条件 1)。envelope follower の slot は
-    // EnvelopeFollow node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の
-    // slot は inert で、engine が `common::modulators::generator_scalar` を刻みの
-    // song 位置から評価して載せる (`mod_kinds` を保持)。
+/// docs/plan_modulation.md §3/§5: per-`ModSource` envelope follower.
+/// Emit `EnvelopeFollow` at the very end of the (post-PDC) schedule — all
+/// scratches are settled and the follower only produces a control-rate
+/// scalar (no audio feedback, so no ordering / cycle constraint).
+/// Coefficients are baked here (recompile-time) so the RT path never
+/// derives them (§10)。
+///
+/// `slot` は **schedule の内部 index** で、`follower_slots` / `follower_keys` /
+/// `mod_kinds` の 3 本が同じ並び。外へ出る値 (GUI へ publish する面 / sidecar) は
+/// `follower_keys[slot]` = `ModSource::id` を組にして運ぶ
+/// (`crate::mod_tick::eval_plane`、アーキ不変条件 1)。envelope follower の slot は
+/// EnvelopeFollow node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の
+/// slot は inert で、engine が `common::modulators::generator_scalar` を刻みの
+/// song 位置から評価して載せる (`mod_kinds` を保持)。
+fn emit_followers(
+    song: &Song,
+    sample_rate: u32,
+    id_to_idx: &HashMap<u32, u32>,
+    chain_map: &ChainMap,
+    nodes: &mut Vec<NodeOp>,
+) -> (Vec<super::follower::FollowerSlot>, Vec<u32>, Vec<common::model::ModSourceKind>) {
     let mut follower_slots: Vec<super::follower::FollowerSlot> = Vec::new();
     let mut follower_keys: Vec<u32> = Vec::new();
     let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();
@@ -605,17 +791,11 @@ pub fn compile_schedule(
         follower_keys.push(ms.id);
         match &ms.kind {
             common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
-                follower_slots.push(super::follower::FollowerSlot::from_config(
-                    follower,
-                    sample_rate,
-                ));
+                follower_slots.push(super::follower::FollowerSlot::from_config(follower, sample_rate));
                 // docs/plan_modulation.md §6: tap_point で source buffer を解決。
                 // dangling source は follower node を emit しない (scalar は 0 のまま)。
-                if let Some(&src_idx) = id_to_idx.get(&tap.source_track) {
-                    nodes_with_pdc.push(NodeOp::EnvelopeFollow {
-                        src: tap_bufref(tap.tap_point, src_idx),
-                        slot: slot as u32,
-                    });
+                if let Some(src) = tap_bufref_for(tap, id_to_idx, chain_map) {
+                    nodes.push(NodeOp::EnvelopeFollow { src, slot: slot as u32 });
                 }
             }
             // generator: inert slot (env 未使用、 generator_scalar が値を供給)。
@@ -627,23 +807,7 @@ pub fn compile_schedule(
             }
         }
     }
-
-    Ok(Schedule {
-        nodes: nodes_with_pdc,
-        delay_lines,
-        delay_keys,
-        port_buffers: super::PortBufferPool::new(),
-        input_delay_per_track,
-        follower_slots,
-        follower_keys,
-        mod_kinds,
-        // r.md #39: click / export が基準にするのは master **出力** の遅延量。
-        // master fx chain は Mix の後段で直列 process される (`process_master_fx_chain`)
-        // ので、その報告 latency も足さないと master に遅延プラグインを挿したときだけ
-        // click が先行し、書き出し WAV もその分ずれる。
-        master_latency_samples:
-            master_output_latency(song, device_latencies, master_mix_latency, sample_rate),
-    })
+    (follower_slots, follower_keys, mod_kinds)
 }
 
 /// master **出力**の遅延量 (`Schedule::master_latency_samples`)。
@@ -667,7 +831,7 @@ fn master_output_latency(
         0
     };
     master_mix_latency
-        .saturating_add(chain_latency(&song.master_fx_chain, device_latencies))
+        .saturating_add(program_latency(&song.master_fx_chain, device_latencies))
         .saturating_add(limiter)
 }
 
@@ -697,12 +861,15 @@ fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
 }
 
 fn emit_aux_input_taps(
-    chain: &[common::model::PluginInstance],
+    chain: &[common::model::Device],
+    owner_track_id: u32,
     id_to_idx: &HashMap<u32, u32>,
+    chains: &ChainMap,
     nodes: &mut Vec<NodeOp>,
 ) {
     // r.md #105: bypass 中の device は process されないので tap も staging しない。
-    for inst in chain.iter().filter(|p| !p.bypassed) {
+    // r.md #110: Parallel の中の plugin も `plugins` が辿る。
+    for inst in plugins(chain).filter(|p| !p.bypassed) {
         // aux port は engine が `MAX_AUX_IN` までしか staging しないので
         // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
         // `as u8` の wrap を防ぐ。
@@ -715,7 +882,13 @@ fn emit_aux_input_taps(
             let Some(route) = route_opt else {
                 continue;
             };
-            let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) else {
+            // 自 track の Pre-FX は program が同じ pass の snapshot を直接載せる
+            // (`ChainOp::Plugin::own_prefx_ports`)。 自 track の他の tap 点は出力の
+            // 下流 (= feedback) なので staging しない。
+            if route.tap.source == TapSource::Track(owner_track_id) {
+                continue;
+            }
+            let Some(src) = tap_bufref_for(&route.tap, id_to_idx, chains) else {
                 // dangling reference: silently skip
                 continue;
             };
@@ -723,11 +896,35 @@ fn emit_aux_input_taps(
             // instance は engine 側 lookup が必ず外れる (= 旧来の「lookup miss
             // で skip」と同じ寛容さ) なのでここでは弾かない。
             nodes.push(NodeOp::SidechainTap {
-                src: tap_bufref(route.tap.tap_point, src_idx),
+                src,
                 device_id: inst.id,
                 aux_in_port: port_idx as u8,
             });
         }
+    }
+}
+
+/// `compute_path_latency` が tap の source を解決するのに使う表の束。
+struct TapCtx<'a> {
+    id_to_idx: &'a HashMap<u32, u32>,
+    chains: &'a ChainMap,
+}
+
+/// tap の source 側の絶対 latency (path latency 系): track source は所有 track の
+/// path latency、chain source は所有 track の入力 latency + chain までの相対 latency。
+fn tap_source_latency(
+    tap: &AudioTap,
+    src_idx: u32,
+    path_latency: &[u32],
+    track_chain_latency: &[u32],
+    chains: &ChainMap,
+) -> u32 {
+    let src_path = path_latency[src_idx as usize];
+    match tap.source {
+        TapSource::Track(_) => src_path,
+        TapSource::Chain(_) => src_path
+            .saturating_sub(track_chain_latency[src_idx as usize])
+            .saturating_add(tap_chain_rel_latency(tap, chains)),
     }
 }
 
@@ -773,7 +970,7 @@ fn compute_path_latency(
     track_chain_latency: &[u32],
     is_group: &HashSet<u32>,
     children_of: &HashMap<u32, Vec<u32>>,
-    id_to_idx: &HashMap<u32, u32>,
+    taps: &TapCtx<'_>,
     incoming_sends: &HashMap<u32, Vec<(u32, u32, common::model::SendMode)>>,
     bus_flags: &[bool],
     buffer_frames: u32,
@@ -796,7 +993,7 @@ fn compute_path_latency(
                             track_chain_latency,
                             is_group,
                             children_of,
-                            id_to_idx,
+                            taps,
                             incoming_sends,
                             bus_flags,
                             buffer_frames,
@@ -814,35 +1011,46 @@ fn compute_path_latency(
     // leaf 宛 tap の staging lag (moduleコメント参照)。
     let tap_lag = if bus_flags[idx as usize] { 0 } else { buffer_frames };
     let mut sidechain_input: u32 = 0;
-    let mut consider = |src_id_opt: &Option<u32>, cache: &mut [u32]| {
-        if let Some(src_id) = src_id_opt
-            && let Some(&src_idx) = id_to_idx.get(src_id)
-        {
-            let l = compute_path_latency(
-                src_idx,
-                tracks,
-                track_chain_latency,
-                is_group,
-                children_of,
-                id_to_idx,
-                incoming_sends,
-                bus_flags,
-                buffer_frames,
-                cache,
-            )
-            .saturating_add(tap_lag);
-            if l > sidechain_input {
-                sidechain_input = l;
-            }
+    let mut consider = |tap: &AudioTap, cache: &mut [u32]| {
+        // r.md #110: chain source は所有 track の入力 latency + chain までの相対
+        // latency。同 track の chain (自己参照) は数えない (main の下流なので揃え
+        // ようが無い)。
+        let Some(src_idx) = tap_owner_idx(tap, taps.id_to_idx, taps.chains) else {
+            return;
+        };
+        if src_idx == idx {
+            return;
+        }
+        let src_path = compute_path_latency(
+            src_idx,
+            tracks,
+            track_chain_latency,
+            is_group,
+            children_of,
+            taps,
+            incoming_sends,
+            bus_flags,
+            buffer_frames,
+            cache,
+        );
+        let l = match tap.source {
+            TapSource::Track(_) => src_path,
+            TapSource::Chain(_) => src_path
+                .saturating_sub(track_chain_latency[src_idx as usize])
+                .saturating_add(tap_chain_rel_latency(tap, taps.chains)),
+        }
+        .saturating_add(tap_lag);
+        if l > sidechain_input {
+            sidechain_input = l;
         }
     };
     // v23 single-chain: latency propagation cares about every device's
     // sidechain source regardless of role (a sidechain edge from any device
     // raises this track's input latency), so a single walk over `devices`
-    // replaces the old per-section walks.
-    for p in track.devices.iter().filter(|p| !p.bypassed) {
+    // replaces the old per-section walks. r.md #110: Parallel の中も `plugins` が辿る。
+    for p in plugins(&track.devices).filter(|p| !p.bypassed) {
         for route in p.aux_inputs.iter().flatten() {
-            consider(&Some(route.tap.source_track), cache);
+            consider(&route.tap, cache);
         }
     }
 
@@ -859,7 +1067,7 @@ fn compute_path_latency(
                 track_chain_latency,
                 is_group,
                 children_of,
-                id_to_idx,
+                taps,
                 incoming_sends,
                 bus_flags,
                 buffer_frames,
@@ -939,7 +1147,7 @@ pub(crate) fn compile_schedule_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{PluginInstance, Song, Track};
+    use common::model::{Device, PluginInstance, Song, Track};
     use common::plugin_format::PluginFormat;
     use common::port_config::PortConfig;
 
@@ -950,16 +1158,16 @@ mod tests {
         lat: &mut DeviceLatencies,
         device_id: u64,
         samples: u32,
-    ) -> Vec<PluginInstance> {
+    ) -> Vec<Device> {
         lat.insert(device_id, samples);
-        vec![PluginInstance {
+        vec![Device::Plugin(PluginInstance {
             id: device_id,
             ..PluginInstance::with_ports(
                 format!("test.latent{device_id}"),
                 PluginFormat::Clap,
                 audio_fx_ports(),
             )
-        }]
+        })]
     }
 
     /// v23 single-chain: `Track::default()` を mutator で埋める helper。
@@ -980,7 +1188,7 @@ mod tests {
 
         let mut lat = DeviceLatencies::new();
         let mut latent = latency_chain(&mut lat, 20, 2048);
-        latent[0].bypassed = true;
+        latent[0].set_bypassed(true);
         let song = Song {
             tracks: vec![
                 track(|t| t.id = 1),
@@ -990,7 +1198,7 @@ mod tests {
                 }),
                 track(|t| {
                     t.id = 3;
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 77,
                         bypassed: true,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
@@ -999,7 +1207,7 @@ mod tests {
                             PluginFormat::Vst3,
                             audio_fx_ports(),
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()
@@ -1017,8 +1225,8 @@ mod tests {
 
         // 同じ song で bypass を外すと両方が復活する (= 判定がフラグ由来であることの対照)。
         let mut live = song;
-        live.tracks[1].devices[0].bypassed = false;
-        live.tracks[2].devices[0].bypassed = false;
+        live.tracks[1].devices[0].set_bypassed(false);
+        live.tracks[2].devices[0].set_bypassed(false);
         let sched = compile_schedule(&live, &lat, 48_000, 0).unwrap();
         assert_eq!(sched.master_latency_samples, 2048);
         assert!(sched
@@ -1487,7 +1695,7 @@ mod tests {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 10,
                         aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
                         aux_output_count: 1,
@@ -1496,7 +1704,7 @@ mod tests {
                             PluginFormat::Clap,
                             instrument_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 4;
@@ -1909,7 +2117,7 @@ mod tests {
                 track(|t| {
                     t.id = 2;
                     t.name = "Dest".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 77,
                         // aux input port 0 ← Track 1's output
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
@@ -1918,7 +2126,7 @@ mod tests {
                             PluginFormat::Vst3,
                             audio_fx_ports(),
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()
@@ -1984,7 +2192,7 @@ mod tests {
                 t.id = 1;
                 t.name = "Source".into();
             })],
-            master_fx_chain: vec![PluginInstance {
+            master_fx_chain: vec![Device::Plugin(PluginInstance {
                 id: 900,
                 aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                 ..PluginInstance::with_ports(
@@ -1992,7 +2200,7 @@ mod tests {
                     PluginFormat::Vst3,
                     audio_fx_ports(),
                 )
-            }],
+            })],
             ..Song::default()
         };
         let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
@@ -2078,7 +2286,7 @@ mod tests {
                 track(|t| {
                     t.id = 2;
                     t.name = "Dest".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 20,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
@@ -2086,7 +2294,7 @@ mod tests {
                             PluginFormat::Vst3,
                             audio_fx_ports(),
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()
@@ -2182,7 +2390,7 @@ mod tests {
                 track(|t| {
                     t.id = 2;
                     t.name = "Dest".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 20,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
@@ -2190,7 +2398,7 @@ mod tests {
                             PluginFormat::Vst3,
                             audio_fx_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 3;
@@ -2259,12 +2467,12 @@ mod tests {
                 track(|t| {
                     t.id = 2;
                     t.name = "LeafDest".into();
-                    t.devices = vec![sc_device(20)];
+                    t.devices = vec![sc_device(20).into()];
                 }),
                 track(|t| {
                     t.id = 3;
                     t.name = "BusDest".into();
-                    t.devices = vec![sc_device(30)];
+                    t.devices = vec![sc_device(30).into()];
                 }),
             ],
             ..Song::default()
@@ -2311,14 +2519,14 @@ mod tests {
                     // v23 single-chain: an instrument device (note in + audio
                     // out) → derives as Instrument, NOT AudioEffect, so its
                     // sidechain does not contribute to input_delay_per_track.
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
                             "test.synth".into(),
                             PluginFormat::Vst3,
                             instrument_ports(),
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()
@@ -2349,26 +2557,26 @@ mod tests {
                 track(|t| {
                     t.id = 1;
                     t.name = "A".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(2))],
                         ..PluginInstance::with_ports(
                             "test.compressor".into(),
                             PluginFormat::Vst3,
                             audio_fx_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 2;
                     t.name = "B".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
                             "test.compressor".into(),
                             PluginFormat::Vst3,
                             audio_fx_ports(),
                         )
-                    }];
+                    })];
                 }),
             ],
             ..Song::default()
@@ -2390,7 +2598,7 @@ mod tests {
             tracks: vec![track(|t| {
                 t.id = 1;
                 t.name = "Lone".into();
-                t.devices = vec![PluginInstance {
+                t.devices = vec![Device::Plugin(PluginInstance {
                     // 存在しない track を指す → dangling、 Tap は emit されない
                     aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(99))],
                     ..PluginInstance::with_ports(
@@ -2398,7 +2606,7 @@ mod tests {
                         PluginFormat::Vst3,
                         audio_fx_ports(),
                     )
-                }];
+                })];
             })],
             ..Song::default()
         };
@@ -2750,7 +2958,7 @@ mod tests {
                 track(|t| {
                     t.id = 1;
                     t.name = "Drums".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 10,
                         // port 0 (main) → 子2, port 1 (aux bus 0) → 子3 = 全部子
                         aux_outputs: vec![
@@ -2763,7 +2971,7 @@ mod tests {
                             PluginFormat::Clap,
                             instrument_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 2;
@@ -2809,7 +3017,7 @@ mod tests {
             sched
                 .nodes
                 .iter()
-                .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 0, start_device: 1 })),
+                .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 0, start_op: 1 })),
             "A's suffix FX must start at the split (device 1); nodes={:?}",
             sched.nodes
         );
@@ -2871,7 +3079,7 @@ mod tests {
                 track(|t| {
                     t.id = 1;
                     t.name = "Drums".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 10,
                         aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
                         aux_output_count: 1,
@@ -2880,7 +3088,7 @@ mod tests {
                             PluginFormat::Clap,
                             instrument_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 4;
@@ -2917,8 +3125,8 @@ mod tests {
             sched
                 .nodes
                 .iter()
-                .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1, start_device: 0 })),
-            "D must run as a bus (ProcessGroupFx start_device 0)"
+                .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1, start_op: 0 })),
+            "D must run as a bus (ProcessGroupFx start_op 0)"
         );
     }
 
@@ -2940,7 +3148,7 @@ mod tests {
                 track(|t| {
                     t.id = 1;
                     t.name = "Drums".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         // port 0 (main) unrouted = 楽器兼バス (the kick stays on A);
                         // aux bus 0/1 (port 1/2) → 子2/子3.
                         aux_outputs: vec![
@@ -2954,7 +3162,7 @@ mod tests {
                             PluginFormat::Clap,
                             instrument_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 2;
@@ -3024,7 +3232,7 @@ mod tests {
                 track(|t| {
                     t.id = 1;
                     t.name = "Drums".into();
-                    t.devices = vec![PluginInstance {
+                    t.devices = vec![Device::Plugin(PluginInstance {
                         id: 10,
                         aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
                         aux_output_count: 1,
@@ -3033,7 +3241,7 @@ mod tests {
                             PluginFormat::Clap,
                             instrument_ports(),
                         )
-                    }];
+                    })];
                 }),
                 track(|t| {
                     t.id = 4;
@@ -3073,5 +3281,127 @@ mod tests {
             "the dry track must be delayed 100 to align with the paraout chain (A+D); nodes={:?}",
             sched.nodes
         );
+    }
+
+    // ---- r.md #110 Parallel ----------------------------------------------------
+
+    fn parallel_with_chains(id: u64, chains: Vec<(u64, Vec<Device>)>) -> Device {
+        Device::Parallel(common::model::Parallel {
+            id,
+            name: "Parallel".into(),
+            chains: chains
+                .into_iter()
+                .map(|(cid, devices)| common::model::ParallelChain {
+                    id: cid,
+                    devices,
+                    ..common::model::ParallelChain::new("c")
+                })
+                .collect(),
+            bypassed: false,
+            color: None,
+        })
+    }
+
+    fn comp_tapping(id: u64, tap: common::model::AudioTap) -> Device {
+        Device::Plugin(PluginInstance {
+            id,
+            aux_inputs: vec![Some(common::model::AuxInputRoute { tap })],
+            ..PluginInstance::with_ports("test.compressor".into(), PluginFormat::Vst3, audio_fx_ports())
+        })
+    }
+
+    /// 自 track の Pre-FX を SC の key にする: 依存辺も `SidechainTap` も出さず、 program の
+    /// `Plugin` op に port bit が立つ (同 pass の snapshot を直接載せる)。
+    #[test]
+    fn sidechain_from_own_track_prefx_is_staged_in_program_not_schedule() {
+        let mut song = Song::default();
+        let mut comp = PluginInstance::new("comp".into(), PluginFormat::Clap);
+        comp.id = 77;
+        comp.ports = PortConfig { has_audio_input: true, has_audio_output: true, ..PortConfig::default() };
+        comp.aux_inputs = vec![Some(common::model::AuxInputRoute {
+            tap: AudioTap::new(TapSource::Track(1), TapPoint::PreFx),
+        })];
+        song.tracks.push(Track { id: 1, devices: vec![Device::Plugin(comp)], ..Track::default() });
+        let schedule = compile_schedule(&song, &DeviceLatencies::new(), 48_000, 256).expect("no cycle");
+        assert!(!schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
+        assert!(schedule.track_programs[0].ops.iter().any(|op| matches!(
+            op,
+            super::super::program::ChainOp::Plugin { device_id: 77, own_prefx_ports: 0b1, .. }
+        )));
+        assert_eq!(schedule.input_delay_per_track[0], 0, "自 track の key は main と同じ信号なので遅延不要");
+    }
+
+    #[test]
+    fn sidechain_from_a_sibling_chain_taps_the_chain_snapshot() {
+        use common::model::{AudioTap, TapPoint, TapSource};
+        // track 1: Parallel { Dry (空, id 11), Comp (id 12: comp 77 が Dry chain の PostFx を key に) }
+        let song = Song {
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.devices = vec![parallel_with_chains(
+                    10,
+                    vec![
+                        (11, vec![]),
+                        (12, vec![comp_tapping(77, AudioTap::new(TapSource::Chain(11), TapPoint::PostFx))]),
+                    ],
+                )];
+            })],
+            ..Song::default()
+        };
+        let sched = compile_schedule_for_test(&song, 48_000, 256).unwrap();
+        // (a) tap は chain 11 の PostFx snapshot (owner = track 0, chain slot 0) を指す。
+        assert!(
+            sched.nodes.iter().any(|op| matches!(
+                op,
+                NodeOp::SidechainTap { src: BufRef::ChainPostFx { owner: 0, slot: 0 }, device_id: 77, aux_in_port: 0 }
+            )),
+            "chain tap: nodes={:?}",
+            sched.nodes
+        );
+        // (b) program 側: chain 11 の ChainEnd に PostFx snapshot flag が焼かれている。
+        let prog = &sched.track_programs[0];
+        assert!(prog.ops.iter().any(|op| matches!(
+            op,
+            crate::graph::ChainOp::ChainEnd { chain_id: 11, snapshot_post_fx: true, .. }
+        )));
+        // (c) 同 track の chain source は自己辺にならず (cycle ではない)、main の入力
+        //     alignment にも数えない。
+        assert_eq!(sched.input_delay_per_track[0], 0);
+    }
+
+    #[test]
+    fn sidechain_from_another_tracks_chain_orders_the_owner_first() {
+        use common::model::{AudioTap, TapPoint, TapSource};
+        // track 2 の comp が track 1 の Parallel chain 11 (PostFader) を key にする。
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 2;
+                    t.devices = vec![comp_tapping(77, AudioTap::new(TapSource::Chain(11), TapPoint::PostFader))];
+                }),
+                track(|t| {
+                    t.id = 1;
+                    t.devices = vec![parallel_with_chains(10, vec![(11, vec![])])];
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule_for_test(&song, 48_000, 256).unwrap();
+        let tap_idx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(
+                op,
+                NodeOp::SidechainTap { src: BufRef::ChainPostFader { owner: 1, slot: 0 }, device_id: 77, .. }
+            ))
+            .unwrap_or_else(|| panic!("chain tap missing: {:?}", sched.nodes));
+        let owner_idx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessTrack { track_idx: 1 }))
+            .expect("owner ProcessTrack");
+        assert!(owner_idx < tap_idx, "chain の所有 track が先に走る");
+        // leaf 宛の tap は 1 buffer 遅れの補償が入る (track source と同じ規則)。
+        assert_eq!(sched.input_delay_per_track[0], 256);
     }
 }

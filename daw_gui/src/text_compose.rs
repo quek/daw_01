@@ -378,7 +378,7 @@ mod tests {
             t.id = track_id;
             t.name = "T".into();
             // (v26) 表示は字幕デバイスで gate される → テストトラックにも挿す。
-            t.devices.push(common::model::PluginInstance::with_ports(
+            t.devices.push(common::model::Device::Plugin(common::model::PluginInstance::with_ports(
                 common::plugin_db::SUBTITLE_ID.to_string(),
                 common::plugin_format::PluginFormat::Builtin,
                 common::port_config::PortConfig {
@@ -386,7 +386,7 @@ mod tests {
                     has_video_output: true,
                     ..Default::default()
                 },
-            ));
+            )));
         });
         let cl = track.alloc_clip_id();
         track.clips.push(Clip {

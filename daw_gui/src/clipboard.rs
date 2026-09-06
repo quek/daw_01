@@ -75,7 +75,8 @@ pub struct DeviceCopy {
     /// (別トラックなら捨てて解析し直す — `handler/sync.rs` の persistent_id が
     /// 元トラックのクリップを指すため)。
     pub source_track: u32,
-    pub device: common::model::PluginInstance,
+    /// plugin か Parallel (中身ごと)。 r.md #110。
+    pub device: common::model::Device,
 }
 
 /// 正規化済みオートメーション点。`value_norm` は target 非依存の 0..=1 normalized
@@ -527,13 +528,19 @@ pub fn sanitize_tracks(mut payload: TracksCopy) -> TracksCopy {
 pub fn sanitize_devices(devices: Vec<DeviceCopy>) -> Vec<DeviceCopy> {
     /// aux 入出力ポートの上限 (外部 clipboard が巨大 Vec を送り込むのを防ぐ)。
     const MAX_AUX_PORTS: usize = 64;
+    // r.md #110: Parallel は中の plugin を全部見る。 plugin_id が空の plugin を 1 つでも
+    // 含む device は丸ごと捨てる。 id (plugin / Parallel / chain) は貼り先で採番するので 0 に落とす。
     devices
         .into_iter()
-        .filter(|d| !d.device.plugin_id.is_empty())
+        .filter(|d| {
+            common::model::plugins(std::slice::from_ref(&d.device)).all(|p| !p.plugin_id.is_empty())
+        })
         .map(|mut d| {
-            d.device.id = 0;
-            d.device.aux_inputs.truncate(MAX_AUX_PORTS);
-            d.device.aux_outputs.truncate(MAX_AUX_PORTS);
+            common::model::for_each_node_id_mut(std::slice::from_mut(&mut d.device), &mut |id| *id = 0);
+            common::model::for_each_plugin_mut(std::slice::from_mut(&mut d.device), &mut |p| {
+                p.aux_inputs.truncate(MAX_AUX_PORTS);
+                p.aux_outputs.truncate(MAX_AUX_PORTS);
+            });
             d
         })
         .collect()
@@ -586,7 +593,7 @@ mod tests {
             ClipboardPayload::Devices(vec![DeviceCopy {
                 order: 0,
                 source_track: 3,
-                device: inst,
+                device: inst.into(),
             }]),
         );
         let json = env.to_json().unwrap();
@@ -596,8 +603,9 @@ mod tests {
             ClipboardPayload::Devices(d) => {
                 assert_eq!(d.len(), 1);
                 assert_eq!(d[0].source_track, 3);
-                assert_eq!(d[0].device.plugin_id, "test.comp");
-                assert_eq!(d[0].device.state.as_deref(), Some(&b"knob"[..]));
+                let p = d[0].device.as_plugin().unwrap();
+                assert_eq!(p.plugin_id, "test.comp");
+                assert_eq!(p.state.as_deref(), Some(&b"knob"[..]));
             }
             _ => panic!("wrong payload variant"),
         }
@@ -609,18 +617,19 @@ mod tests {
         let dev = |plugin_id: &str, id: u64| DeviceCopy {
             order: 0,
             source_track: 1,
-            device: common::model::PluginInstance {
+            device: common::model::Device::Plugin(common::model::PluginInstance {
                 id,
                 aux_inputs: vec![None; 200],
                 aux_outputs: vec![None; 200],
                 ..common::model::PluginInstance::new(plugin_id.into(), PluginFormat::Clap)
-            },
+            }),
         };
         let out = sanitize_devices(vec![dev("test.comp", 99), dev("", 1)]);
         assert_eq!(out.len(), 1, "plugin_id が空の device は捨てる");
-        assert_eq!(out[0].device.id, 0, "id は貼り先で採番するので 0 に落とす");
-        assert_eq!(out[0].device.aux_inputs.len(), 64);
-        assert_eq!(out[0].device.aux_outputs.len(), 64);
+        assert_eq!(out[0].device.id(), 0, "id は貼り先で採番するので 0 に落とす");
+        let p = out[0].device.as_plugin().unwrap();
+        assert_eq!(p.aux_inputs.len(), 64);
+        assert_eq!(p.aux_outputs.len(), 64);
     }
 
     #[test]

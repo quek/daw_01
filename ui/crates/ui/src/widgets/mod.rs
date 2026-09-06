@@ -9,6 +9,7 @@ pub mod channel_fader_meter;
 pub mod checkbox;
 pub mod color_picker;
 pub mod drag_in_rect;
+pub mod drag_list;
 pub mod drag_rect;
 pub mod edge_scroll;
 pub mod dropdown;

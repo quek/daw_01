@@ -48,8 +48,7 @@ fn panel_rect(app: &AppData, screen: Rect) -> Rect {
         .tracks
         .iter()
         .map(|t| {
-            t.devices
-                .iter()
+            t.plugins()
                 .filter(|d| app.ipc.loaded_devices.contains_key(&d.id))
                 .count()
         })
@@ -161,10 +160,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
     if let Some(mb) = app.ipc.metrics_bridge.as_ref() {
         let song = app.song_doc.song();
         let live: std::collections::HashSet<u64> = song
-            .tracks
-            .iter()
-            .flat_map(|t| t.devices.iter())
-            .chain(song.master_fx_chain.iter())
+            .all_plugins()
             .map(|d| d.id)
             .filter(|&id| id != 0)
             .collect();
@@ -268,8 +264,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         // host に実体がある device (= `loaded_devices` に居る) だけを出す。
         // device_id そのものが計測キーなので、 chain 順との対応づけは要らない。
         let loaded: Vec<&common::model::PluginInstance> = track
-            .devices
-            .iter()
+            .plugins()
             .filter(|d| app.ipc.loaded_devices.contains_key(&d.id))
             .collect();
         let track_us: u32 = loaded.iter().map(|d| plugin_us(d.id)).sum();

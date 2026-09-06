@@ -176,8 +176,12 @@ pub fn automation_value_display(
         from_display: db_to_lin,
     };
     match target {
-        T::TrackBuiltin(TrackBuiltinParam::Volume | TrackBuiltinParam::SendGain { .. }) => gain_db,
-        T::TrackBuiltin(TrackBuiltinParam::Pan) => AutomationValueDisplay {
+        T::TrackBuiltin(
+            TrackBuiltinParam::Volume
+            | TrackBuiltinParam::SendGain { .. }
+            | TrackBuiltinParam::ChainGain { .. },
+        ) => gain_db,
+        T::TrackBuiltin(TrackBuiltinParam::Pan | TrackBuiltinParam::ChainPan { .. }) => AutomationValueDisplay {
             // 単位は表記自身が持つ (`"L50"`) ので unit ラベルは空。
             unit: "",
             format: PAN_FORMAT,

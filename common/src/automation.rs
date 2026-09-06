@@ -68,6 +68,9 @@ pub fn plain_to_norm_ranged(
             }
         }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
+        // r.md #110: Parallel chain の gain / pan は track volume / pan と同じ値域。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { .. }) => plain / 2.0,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => (plain + 1.0) / 2.0,
         // 内蔵チャンネルストリップ: レンジの SSoT は `EqParam::range` /
         // `CompParam::range` (`common::model::channel_strip`)。ここで式を持たない。
         AutomationTarget::TrackBuiltin(
@@ -283,6 +286,8 @@ pub fn norm_to_plain_ranged(
             }
         }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => n * 2.0,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { .. }) => n * 2.0,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => n * 2.0 - 1.0,
         // `plain_to_norm_ranged` の厳密逆 (レンジは channel_strip 側が SSoT)。
         AutomationTarget::TrackBuiltin(
             TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,

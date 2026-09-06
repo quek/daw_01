@@ -13,6 +13,7 @@
 //!   (= `[[project_plugin_slot_rekey]]` の再発防止)
 //! - device 選択は「いま表示しているチェーン」にスコープされる
 
+use common::model::Device;
 use common::model::{
     AutomationLane, AutomationLaneKey, AutomationTarget, InstrumentSource, PluginInstance,
 };
@@ -51,7 +52,7 @@ fn add_plugin(app: &mut AppData, track_id: u32, plugin_id: &str) -> u64 {
         .expect("track exists");
     select_track_single(app, idx);
     let at = app.song_doc.song().tracks[idx].devices.len() as u32;
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: plugin_id.into(),
         keep_open: false,
@@ -91,7 +92,7 @@ fn track_devices(app: &AppData, track_id: u32) -> Vec<u64> {
         .tracks
         .iter()
         .find(|t| t.id == track_id)
-        .map(|t| t.devices.iter().map(|d| d.id).collect())
+        .map(|t| t.plugins().map(|d| d.id).collect())
         .unwrap_or_default()
 }
 
@@ -122,7 +123,7 @@ fn move_between_tracks_keeps_device_id_and_carries_lane() {
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: false,
     }));
@@ -191,7 +192,7 @@ fn move_across_tracks_rekeys_lane_row_override() {
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: false,
     }));
@@ -234,14 +235,14 @@ fn move_across_tracks_drops_ara_archive() {
     let dev = add_plugin(&mut app, t0, "test.fx");
     let other = add_plugin(&mut app, t0, "test.delay");
     app.edit_song(|song| {
-        let d = daw_gui::app::device_mut_by_id(song, dev).unwrap();
+        let d = song.plugin_by_id_mut(dev).unwrap();
         d.ara_archive = Some(std::sync::Arc::from(&b"melodyne"[..]));
     });
 
     // (1) 同一チェーン内の移動 (= 並べ替え) では残る。
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t0,
+        dest: common::model::ChainRef::Track(t0),
         dest_index: 2,
         copy: false,
     }));
@@ -250,9 +251,8 @@ fn move_across_tracks_drops_ara_archive() {
     ));
     assert_eq!(track_devices(&app, t0), vec![other, dev], "同一チェーン内で並べ替わる");
     let song = app.song_doc.song();
-    let (tr, idx) = daw_gui::app::find_device_by_id(song, dev).unwrap();
     assert!(
-        daw_gui::app::device_at(song, tr, idx)
+        song.plugin_by_id(dev)
             .unwrap()
             .ara_archive
             .is_some(),
@@ -262,7 +262,7 @@ fn move_across_tracks_drops_ara_archive() {
     // (2) トラックを跨いだら捨てる。
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: false,
     }));
@@ -270,10 +270,10 @@ fn move_across_tracks_drops_ara_archive() {
         common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
     ));
     let song = app.song_doc.song();
-    let (tr, idx) = daw_gui::app::find_device_by_id(song, dev).unwrap();
+    let (tr, _) = daw_gui::app::find_device_by_id(song, dev).unwrap();
     assert_eq!(tr, t1);
     assert!(
-        daw_gui::app::device_at(song, tr, idx)
+        song.plugin_by_id(dev)
             .unwrap()
             .ara_archive
             .is_none(),
@@ -291,14 +291,14 @@ fn copy_allocates_new_id_and_keeps_state() {
     let dev = add_plugin(&mut app, t0, "test.fx");
     add_plugin_param_lane(&mut app, t0, dev);
     app.edit_song(|song| {
-        let d = daw_gui::app::device_mut_by_id(song, dev).unwrap();
+        let d = song.plugin_by_id_mut(dev).unwrap();
         d.state = Some(std::sync::Arc::from(&b"abc"[..]));
     });
     let _ = drain(&mut plugin_rx);
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: true,
     }));
@@ -313,9 +313,8 @@ fn copy_allocates_new_id_and_keeps_state() {
     assert_ne!(new_id, dev, "コピーは新 id を採番する");
 
     let song = app.song_doc.song();
-    let (tr, idx) = daw_gui::app::find_device_by_id(song, new_id).unwrap();
     assert_eq!(
-        daw_gui::app::device_at(song, tr, idx)
+        song.plugin_by_id(new_id)
             .unwrap()
             .state
             .as_deref(),
@@ -352,14 +351,14 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
     app.edit_song(|song| {
-        let d = daw_gui::app::device_mut_by_id(song, dev).unwrap();
+        let d = song.plugin_by_id_mut(dev).unwrap();
         d.ara_archive = Some(std::sync::Arc::from(&b"melodyne"[..]));
     });
 
     // 同一トラック内のコピー → 引き継ぐ。
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t0,
+        dest: common::model::ChainRef::Track(t0),
         dest_index: 1,
         copy: true,
     }));
@@ -372,9 +371,8 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
         .expect("same-track copy");
     {
         let song = app.song_doc.song();
-        let (tr, idx) = daw_gui::app::find_device_by_id(song, same_copy).unwrap();
         assert!(
-            daw_gui::app::device_at(song, tr, idx)
+            song.plugin_by_id(same_copy)
                 .unwrap()
                 .ara_archive
                 .is_some(),
@@ -385,7 +383,7 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
     // 別トラックへのコピー → 捨てる。
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: true,
     }));
@@ -394,9 +392,8 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
     ));
     let cross_copy = track_devices(&app, t1)[0];
     let song = app.song_doc.song();
-    let (tr, idx) = daw_gui::app::find_device_by_id(song, cross_copy).unwrap();
     assert!(
-        daw_gui::app::device_at(song, tr, idx)
+        song.plugin_by_id(cross_copy)
             .unwrap()
             .ara_archive
             .is_none(),
@@ -415,13 +412,13 @@ fn move_voicevox_moves_vocal_marker() {
         .edit_song(|song| {
             let id = song.alloc_device_id();
             let t = song.tracks.iter_mut().find(|t| t.id == t0).unwrap();
-            t.devices.push(PluginInstance {
+            t.devices.push(Device::Plugin(PluginInstance {
                 id,
                 ..PluginInstance::new(
                     common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
                     PluginFormat::Builtin,
                 )
-            });
+            }));
             t.source = InstrumentSource::Vocal;
             id
         })
@@ -429,7 +426,7 @@ fn move_voicevox_moves_vocal_marker() {
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: false,
     }));
@@ -455,13 +452,13 @@ fn removing_one_of_two_voicevox_keeps_vocal_marker() {
             let b = song.alloc_device_id();
             let t = song.tracks.iter_mut().find(|t| t.id == t0).unwrap();
             for id in [a, b] {
-                t.devices.push(PluginInstance {
+                t.devices.push(Device::Plugin(PluginInstance {
                     id,
                     ..PluginInstance::new(
                         common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
                         PluginFormat::Builtin,
                     )
-                });
+                }));
             }
             t.source = InstrumentSource::Vocal;
             (a, b)
@@ -493,7 +490,7 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t1,
+        dest: common::model::ChainRef::Track(t1),
         dest_index: 0,
         copy: false,
     }));
@@ -534,7 +531,7 @@ fn master_chain_round_trip() {
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: master,
+        dest: common::model::ChainRef::Track(master),
         dest_index: 0,
         copy: false,
     }));
@@ -542,7 +539,7 @@ fn master_chain_round_trip() {
         common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
     ));
     assert_eq!(
-        app.song_doc.song().master_fx_chain.iter().map(|d| d.id).collect::<Vec<_>>(),
+        app.song_doc.song().master_fx_chain.iter().map(|d| d.id()).collect::<Vec<_>>(),
         vec![dev],
         "master へ移る"
     );
@@ -554,7 +551,7 @@ fn master_chain_round_trip() {
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
-        dest_track: t0,
+        dest: common::model::ChainRef::Track(t0),
         dest_index: 0,
         copy: false,
     }));
@@ -591,7 +588,7 @@ fn paste_devices_inserts_before_selection() {
         vec![daw_gui::clipboard::DeviceCopy {
             order: 0,
             source_track: t0,
-            device: PluginInstance::new("test.fx".into(), PluginFormat::Clap),
+            device: PluginInstance::new("test.fx".into(), PluginFormat::Clap).into(),
         }]
     };
 

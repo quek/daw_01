@@ -341,6 +341,16 @@ pub enum AudioCommand {
     SetSendGain { track: u32, send_id: u32, gain: f32 },
     /// Realtime per-send mute toggle. Same idiom as `SetSendGain`.
     SetSendEnabled { track: u32, send_id: u32, enabled: bool },
+    /// r.md #110 Parallel: chain の gain (linear) の値のみ更新。 `track` = chain を持つ
+    /// track (master は `MASTER_TRACK_ID`)、 `chain_id` = 安定 `ParallelChain::id`。
+    /// graph は再 compile されない (`SetSendGain` と同じ idiom)。
+    SetChainGain { track: u32, chain_id: u64, gain: f32 },
+    /// r.md #110 Parallel: chain の pan (`-1..=1`) の値のみ更新。
+    SetChainPan { track: u32, chain_id: u64, pan: f32 },
+    /// r.md #110 Parallel: chain の mute。 RT は Song snapshot から live-read する。
+    SetChainMuted { track: u32, chain_id: u64, muted: bool },
+    /// r.md #110 Parallel: chain の solo (同じ Parallel 内の他 chain を黙らせる)。
+    SetChainSolo { track: u32, chain_id: u64, solo: bool },
     /// Record-arm 状態。 audio thread は track.armed を Song に反映するのみ。
     SetTrackArmed { track: u32, armed: bool },
     /// BPM 軽量更新 (transport scrub 中に毎 frame 流れうる)。値のみ。
@@ -836,6 +846,9 @@ pub enum PluginEvent {
         /// パラアウト: how many `is_main=false` audio output ports this
         /// plugin declared (0 for the common single-out case)。
         aux_output_count: u8,
+        /// r.md #110: how many `is_main=false` audio **input** ports (= sidechain
+        /// 候補) this plugin declared。 inspector の SC 制御の表示 gate。
+        aux_input_count: u8,
         generation: u64,
     },
     /// `SetSlotPlugin` の load が失敗した。 song の slot は touch されない。
@@ -1049,7 +1062,7 @@ mod tests {
         dev.ara_archive = Some(vec![0xCD; 4 * 1024 * 1024].into());
         song.tracks.push(Track {
             id: 1,
-            devices: vec![dev],
+            devices: vec![dev.into()],
             ..Track::default()
         });
 
@@ -1065,9 +1078,10 @@ mod tests {
         let AudioCommand::LoadSong(s) = decoded else {
             panic!("expected LoadSong");
         };
-        assert_eq!(s.tracks[0].devices[0].id, 1);
-        assert!(s.tracks[0].devices[0].state.is_none());
-        assert!(s.tracks[0].devices[0].ara_archive.is_none());
+        let d = s.tracks[0].devices[0].as_plugin().expect("plugin device");
+        assert_eq!(d.id, 1);
+        assert!(d.state.is_none());
+        assert!(d.ara_archive.is_none());
     }
 
     #[test]

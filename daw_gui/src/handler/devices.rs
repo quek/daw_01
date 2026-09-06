@@ -20,11 +20,34 @@ use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotSt
 ///   no-op 判定が誤って dirty 化する」 (r.md #9) を繰り返していた。
 ///
 /// 既存が無い (`None`) ときは CLAP 既定で新規に作る。
+/// r.md #110: `ids` (plugin / Parallel / chain) を Song から抜き、 消えた plugin を所有 track と
+/// 一緒に返す (副作用 = VOICEVOX / Transform の降ろし判定に使う)。
+fn remove_devices_and_chains(
+    song: &mut common::model::Song,
+    ids: &[u64],
+) -> Vec<(u32, common::model::PluginInstance)> {
+    let mut removed: Vec<(u32, common::model::PluginInstance)> = Vec::new();
+    for &id in ids {
+        // plugin / Parallel は device として、 chain は親 Parallel から抜く。
+        let (track_id, devices): (u32, Vec<common::model::Device>) =
+            if let Some(track_id) = song.device_owner_track(id) {
+                (track_id, song.remove_device(id).into_iter().collect())
+            } else if let Some(track_id) = song.chain_owner_track(common::model::ChainRef::Chain(id)) {
+                (track_id, song.remove_chain(id).map(|c| c.devices).unwrap_or_default())
+            } else {
+                continue;
+            };
+        removed.extend(common::model::plugins(&devices).map(|p| (track_id, p.clone())));
+    }
+    removed
+}
+
 fn reloaded_instance(
     prev: Option<&common::model::PluginInstance>,
     device_id: u64,
     plugin_id: String,
     aux_output_count: u8,
+    aux_input_count: u8,
     db_ports: Option<common::port_config::PortConfig>,
 ) -> common::model::PluginInstance {
     use common::port_config::PortConfig;
@@ -40,7 +63,7 @@ fn reloaded_instance(
             PortConfig::resolve(PortConfig::default(), db_ports),
         ),
     };
-    common::model::PluginInstance { id: device_id, aux_output_count, ..base }
+    common::model::PluginInstance { id: device_id, aux_output_count, aux_input_count, ..base }
 }
 
 impl AppData {
@@ -100,6 +123,8 @@ impl AppData {
         // 再構築する PluginInstance に焼き込み、インスペクタの「パラアウト展開」
         // / ルーティング行が使う。
         aux_output_count: u8,
+        // r.md #110: plugin が宣言した aux 入力ポート数 (SC 制御の表示 gate)。
+        aux_input_count: u8,
         // v29 世代 guard: `SetSlotPlugin` に載せた要求世代の echo。
         generation: u64,
     ) {
@@ -187,29 +212,23 @@ impl AppData {
         // し、 実行された (= export 中でない) なら placed=true。
         let placed = self
             .normalize_song_checked(move |song| {
-                let chain: Option<&mut Vec<common::model::PluginInstance>> =
-                    if track_id == common::model::MASTER_TRACK_ID {
-                        Some(&mut song.master_fx_chain)
-                    } else {
-                        song.tracks
-                            .iter_mut()
-                            .find(|t| t.id == track_id)
-                            .map(|t| &mut t.devices)
-                    };
-                let Some(chain) = chain else {
+                // r.md #110: 所属 chain (top-level / Parallel 内) に関わらず安定 id で引く。
+                let Some(slot) = song.plugin_by_id_mut(device_id) else {
                     return false;
                 };
-                let i = index as usize;
-                let inst = reloaded_instance(chain.get(i), device_id, id, aux_output_count, db_ports);
+                let inst = reloaded_instance(
+                    Some(&*slot),
+                    device_id,
+                    id,
+                    aux_output_count,
+                    aux_input_count,
+                    db_ports,
+                );
                 // no-op 検出 (r.md #9): 再構築結果が既存と同一なら epoch を bump
                 // させない (= dirty 化 / 冗長な LoadSong 再送をしない)。 内容が本当に
                 // 変わったとき (旧 file の port 解決 / 手動 plugin 挿入) だけ true。
-                let is_change = chain.get(i) != Some(&inst);
-                if i < chain.len() {
-                    chain[i] = inst;
-                } else {
-                    chain.push(inst);
-                }
+                let is_change = *slot != inst;
+                *slot = inst;
                 is_change
             })
             .is_some();
@@ -352,10 +371,7 @@ impl AppData {
     /// 失敗 (shmem 名衝突など) から復帰したときは音色も復元される。
     pub(crate) fn reload_device(&mut self, device_id: u64) {
         let song = self.song_doc.song();
-        let Some(inst) = find_device_by_id(song, device_id)
-            .and_then(|(track_id, index)| device_at(song, track_id, index))
-            .cloned()
-        else {
+        let Some(inst) = song.plugin_by_id(device_id).cloned() else {
             return;
         };
         // 内蔵映像 FX は plugin_host に載らない device なので再 load の
@@ -457,8 +473,7 @@ impl AppData {
         // cursor track に依存しないので、 表示チェーンが切り替わっても
         // 「どの device のボタンを押したか」 が変わらない。
         let song = self.song_doc.song();
-        let device = find_device_by_id(song, device_id)
-            .and_then(|(track_id, index)| device_at(song, track_id, index));
+        let device = song.plugin_by_id(device_id);
         // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
         // (`builtin.video.subtitle`) は video device だが video_fx def を持たず、
         // 専用パラメータは Text Event セクション (= Par パネルで描画) なので、 ここで
@@ -582,8 +597,8 @@ impl AppData {
             // r.md #36: 「キーを全部プラグインに送る」 の現在値を open のたびに同期する
             // (plugin-host は再起動で状態を失う / device_id は open まで意味を持たない)。
             let song = self.song_doc.song();
-            let send_all = find_device_by_id(song, device_id)
-                .and_then(|(t, i)| device_at(song, t, i))
+            let send_all = song
+                .plugin_by_id(device_id)
                 .is_some_and(|p| p.send_all_keys_to_plugin);
             self.send_plugin(PluginCommand::SetEditorSendAllKeys {
                 device_id,
@@ -602,10 +617,10 @@ impl AppData {
     #[cfg(windows)]
     fn device_display_name(&self, device_id: u64) -> String {
         let song = self.song_doc.song();
-        let Some((track_id, index)) = find_device_by_id(song, device_id) else {
+        let Some((track_id, _)) = find_device_by_id(song, device_id) else {
             return "(unknown)".into();
         };
-        let Some(name) = device_at(song, track_id, index).map(|p| self.resolve_name(&p.plugin_id))
+        let Some(name) = song.plugin_by_id(device_id).map(|p| self.resolve_name(&p.plugin_id))
         else {
             return "(unknown)".into();
         };
@@ -632,69 +647,6 @@ impl AppData {
         }
     }
 
-    /// inspector chain (= `Track.devices` / `master_fx_chain` を一列で表示) の
-    /// reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。
-    ///
-    /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): **棄却なしの純
-    /// permutation**。役割は位置から再導出されるので、能力チェック / セクション跨ぎ
-    /// 検証は撤廃した (任意の並び替えを許す)。`moves: Vec<(old_index, new_index)>` を
-    /// 組んで 3 プロセスの per-device bookkeeping を貼り直す。
-    pub(crate) fn reorder_inspector_chain(&mut self, order: &[usize]) {
-        let is_master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
-        // 対象チェーン (master / track) の現在の device 列と track_id を解決。
-        let (track_id, old_devices): (u32, Vec<common::model::PluginInstance>) = if is_master {
-            (common::model::MASTER_TRACK_ID, self.song_doc.song().master_fx_chain.clone())
-        } else {
-            let Some(track_idx) = self.cursor_track_index() else {
-                return;
-            };
-            let Some(track) = self.song_doc.song().tracks.get(track_idx) else {
-                return;
-            };
-            (track.id, track.devices.clone())
-        };
-        let n = old_devices.len();
-        // order の妥当性検証 (長さ一致 + 0..n の permutation)。不正なら no-op。
-        if order.len() != n || n == 0 {
-            return;
-        }
-        if order.iter().any(|&o| o >= n) {
-            return;
-        }
-        {
-            let mut seen = vec![false; n];
-            for &o in order {
-                if std::mem::replace(&mut seen[o], true) {
-                    return; // 重複 = 不正 permutation
-                }
-            }
-        }
-
-        // r.md #71 (プラグインのコピー / 移動): 「ロード中は並べ替えできない」
-        // という旧制約は **撤去した**。 理由 (positional cache の再キーがずれる)
-        // が消えたため — 帳簿はすべて安定 device_id keyed で、 並べ替えても
-        // キーが動かない。 プロセス間も device_id addressing なので、
-        // 続く `LoadSong` (epoch flush) が処理順を Song から再 compile するだけ。
-
-        // 新順での device 列を組む (new[i] = old[order[i]])。
-        let new_devices: Vec<common::model::PluginInstance> =
-            order.iter().map(|&o| old_devices[o].clone()).collect();
-
-        // song を書き換え。
-        if is_master {
-            self.edit_song(move |song| song.master_fx_chain = new_devices);
-        } else {
-            self.edit_song_checked(move |song| {
-                if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
-                    t.devices = new_devices;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-    }
-
     /// PR4 sidechain: route a track's output into a plugin's `aux_in_port`.
     /// `source = None` disconnects. The plugin's
     /// `PluginInstance.aux_inputs[port]` slot is created on demand;
@@ -705,7 +657,7 @@ impl AppData {
     /// project に保存し (undo 対象)、 plugin-host にも即時反映する。
     pub(crate) fn set_plugin_send_all_keys(&mut self, device_id: u64, enabled: bool) {
         self.edit_song_checked(|song| {
-            let Some(inst) = device_mut_by_id(song, device_id) else {
+            let Some(inst) = song.plugin_by_id_mut(device_id) else {
                 return false;
             };
             if inst.send_all_keys_to_plugin == enabled {
@@ -726,10 +678,11 @@ impl AppData {
         self.edit_song_checked(move |song| {
             let mut changed = false;
             for &id in &ids {
-                if let Some(inst) = device_mut_by_id(song, id)
-                    && inst.bypassed != bypassed
+                // r.md #110: Parallel 丸ごとの bypass も同じ口 (`Device::set_bypassed`)。
+                if let Some(dev) = song.device_by_id_mut(id)
+                    && dev.bypassed() != bypassed
                 {
-                    inst.bypassed = bypassed;
+                    dev.set_bypassed(bypassed);
                     changed = true;
                 }
             }
@@ -744,11 +697,10 @@ impl AppData {
         let song = self.song_doc.song();
         let mut seen = false;
         for &id in device_ids {
-            let Some(inst) = find_device_by_id(song, id).and_then(|(t, i)| device_at(song, t, i))
-            else {
+            let Some(inst) = song.device_by_id(id) else {
                 continue;
             };
-            if !inst.bypassed {
+            if !inst.bypassed() {
                 return false;
             }
             seen = true;
@@ -756,18 +708,33 @@ impl AppData {
         seen
     }
 
-    pub(crate) fn set_sidechain_source(&mut self, device_id: u64, port: u8, source: Option<u32>) {
+    /// r.md #110: `source` は他 track か同 track の Parallel 内 chain (`TapSource`)。
+    /// tap point は既存 route のものを保ち、 未設定なら `PostFader` 既定。
+    pub(crate) fn set_sidechain_source(
+        &mut self,
+        device_id: u64,
+        port: u8,
+        source: Option<common::model::TapSource>,
+    ) {
         self.edit_song_checked(|song| {
-            let Some(inst) = device_mut_by_id(song, device_id) else {
+            let owner = song.device_owner_track(device_id).unwrap_or(common::model::MASTER_TRACK_ID);
+            let Some(inst) = song.plugin_by_id_mut(device_id) else {
                 return false;
             };
             let port_idx = port as usize;
             if inst.aux_inputs.len() <= port_idx {
                 inst.aux_inputs.resize(port_idx + 1, None);
             }
-            // Phase 1: UI は常に PostFader タップを張る (旧 sidechain と同挙動)。
-            // Pre/PostFx トグルは Phase 6 で追加する (docs/plan_modulation.md §9)。
-            inst.aux_inputs[port_idx] = source.map(common::model::AuxInputRoute::post_fader);
+            let mut tap_point = inst.aux_inputs[port_idx]
+                .map(|r| r.tap.tap_point)
+                .unwrap_or_default();
+            // 自 track を source にできるのは Pre-FX (device chain の入力) だけ。
+            if source == Some(common::model::TapSource::Track(owner)) {
+                tap_point = common::model::TapPoint::PreFx;
+            }
+            inst.aux_inputs[port_idx] = source.map(|src| common::model::AuxInputRoute {
+                tap: common::model::AudioTap::new(src, tap_point),
+            });
             true
         });
     }
@@ -785,7 +752,7 @@ impl AppData {
         dest: Option<u32>,
     ) {
         self.edit_song_checked(|song| {
-            let Some(inst) = device_mut_by_id(song, device_id) else {
+            let Some(inst) = song.plugin_by_id_mut(device_id) else {
                 return false;
             };
             let port_idx = port as usize;
@@ -807,9 +774,7 @@ impl AppData {
     /// are taken at the dispatch choke point (`is_undoable`), so this only
     /// mutates the model and syncs.
     pub(crate) fn explode_parallel_out(&mut self, device_id: u64) {
-        let Some((track_id, device_index)) =
-            find_device_by_id(self.song_doc.song(), device_id)
-        else {
+        let Some((track_id, _)) = find_device_by_id(self.song_doc.song(), device_id) else {
             return;
         };
         // The grouped explode model needs the source to be a real track
@@ -820,7 +785,7 @@ impl AppData {
         let Some(src) = self.song_doc.song().track_by_id(track_id) else {
             return;
         };
-        let Some(inst) = src.devices.get(device_index as usize) else {
+        let Some(inst) = self.song_doc.song().plugin_by_id(device_id) else {
             return;
         };
         let count = inst.aux_output_count as usize;
@@ -877,9 +842,7 @@ impl AppData {
 
         // Wire the source plugin's aux outputs to the (new or kept) children.
         self.edit_song(move |song| {
-            if let Some(track) = song.track_by_id_mut(track_id)
-                && let Some(inst) = track.devices.get_mut(device_index as usize)
-            {
+            if let Some(inst) = song.plugin_by_id_mut(device_id) {
                 inst.aux_outputs = routes;
             }
         });
@@ -914,16 +877,29 @@ impl AppData {
         // 実在する device だけに絞る (stale id は黙って捨てる = 削除済み device
         // への stale event は正常系)。 所属 track も先に控えておく — chain から
         // 外した後では引けない。
+        // r.md #110: 対象は plugin / Parallel (中身ごと) / chain (Parallel の 1 本)。 host に
+        // 居る plugin は「中に含まれる plugin 全部」なので、 先に展開しておく。
+        let song = self.song_doc.song();
         let targets: Vec<(u64, u32)> = device_ids
             .iter()
             .filter_map(|&id| {
-                find_device_by_id(self.song_doc.song(), id).map(|(track_id, _)| (id, track_id))
+                song.device_owner_track(id)
+                    .or_else(|| song.chain_owner_track(common::model::ChainRef::Chain(id)))
+                    .map(|track_id| (id, track_id))
             })
             .collect();
         if targets.is_empty() {
             return;
         }
-        for &(device_id, _) in &targets {
+        let mut plugin_ids: Vec<u64> = Vec::new();
+        for &(id, _) in &targets {
+            if let Some(dev) = song.device_by_id(id) {
+                plugin_ids.extend(common::model::plugins(std::slice::from_ref(dev)).map(|p| p.id));
+            } else if let Some((_, chain)) = song.chain_by_id(id) {
+                plugin_ids.extend(common::model::plugins(&chain.devices).map(|p| p.id));
+            }
+        }
+        for device_id in plugin_ids {
             // **GUI lifecycle**: close the editor BEFORE removing the plugin.
             // cleanup_slot_gui sends CloseSlotGui so the plugin-host tears the
             // editor window down. RemoveSlotPlugin also closes the editor by
@@ -953,16 +929,7 @@ impl AppData {
         // song を書き換え。 全 device を 1 回の edit_song で消す (undo 1 step)。
         let ids: Vec<u64> = targets.iter().map(|&(id, _)| id).collect();
         let removed = self.edit_song(move |song| {
-            let mut removed: Vec<(u32, common::model::PluginInstance)> = Vec::new();
-            for &device_id in &ids {
-                let Some((track_id, index)) = find_device_by_id(song, device_id) else {
-                    continue;
-                };
-                let Some(chain) = song.fx_chain_by_track_id_mut(track_id) else {
-                    continue;
-                };
-                removed.push((track_id, chain.remove(index as usize)));
-            }
+            let removed = remove_devices_and_chains(song, &ids);
             // 副作用は **全部消してから** 評価する。 「2 本ある VOICEVOX の
             // 1 本だけ消す」 が成立するので、 途中の中間状態で判定すると
             // 残っている方まで巻き込む。
@@ -980,8 +947,7 @@ impl AppData {
                 if inst.format == PluginFormat::Builtin
                     && inst.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
                     && !track
-                        .devices
-                        .iter()
+                        .plugins()
                         .any(|d| d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX)
                 {
                     track.source = InstrumentSource::None;
@@ -991,8 +957,7 @@ impl AppData {
                 // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
                 if inst.plugin_id == common::video_fx::TRANSFORM_ID
                     && !track
-                        .devices
-                        .iter()
+                        .plugins()
                         .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
                 {
                     track.group_transform = None;

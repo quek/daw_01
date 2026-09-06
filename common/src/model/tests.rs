@@ -998,7 +998,7 @@ fn ensure_ids_remaps_aux_inputs_and_parent_group_id() {
                 name: "Bass".into(),
                 parent_group_id: Some(0), // points at Kick's old sentinel id
                 // v23: 役割別 chain は廃止。device chain (`devices`) に直接置く。
-                devices: vec![PluginInstance {
+                devices: vec![Device::Plugin(PluginInstance {
                     // points at Kick (sentinel id 0)
                     aux_inputs: vec![Some(AuxInputRoute::post_fader(0))],
                     ..PluginInstance::with_ports(
@@ -1006,7 +1006,7 @@ fn ensure_ids_remaps_aux_inputs_and_parent_group_id() {
                         PluginFormat::Vst3,
                         crate::port_config::PortConfig::default(),
                     )
-                }],
+                })],
                 ..Track::default()
             },
         ],
@@ -1033,7 +1033,7 @@ fn ensure_ids_remaps_aux_inputs_and_parent_group_id() {
         "parent_group_id pointing at sentinel must be remapped to the new id"
     );
     assert_eq!(
-        bass.devices[0].aux_inputs,
+        bass.devices[0].as_plugin().unwrap().aux_inputs,
         vec![Some(AuxInputRoute::post_fader(new_kick_id))],
         "aux_inputs tap pointing at sentinel must be remapped to the new id"
     );
@@ -1061,7 +1061,7 @@ fn ensure_ids_remaps_aux_outputs_dest() {
             Track {
                 id: 1,
                 name: "Drums".into(),
-                devices: vec![PluginInstance {
+                devices: vec![Device::Plugin(PluginInstance {
                     // aux output routed at Snare (sentinel id 0)
                     aux_outputs: vec![Some(AuxOutputRoute::to_track(0))],
                     aux_output_count: 1,
@@ -1070,7 +1070,7 @@ fn ensure_ids_remaps_aux_outputs_dest() {
                         PluginFormat::Clap,
                         crate::port_config::PortConfig::default(),
                     )
-                }],
+                })],
                 ..Track::default()
             },
         ],
@@ -1086,7 +1086,7 @@ fn ensure_ids_remaps_aux_outputs_dest() {
     let snare_id = song.tracks[0].id;
     assert_ne!(snare_id, 0, "ensure_ids should replace sentinel id 0");
     assert_eq!(
-        song.tracks[1].devices[0].aux_outputs,
+        song.tracks[1].devices[0].as_plugin().unwrap().aux_outputs,
         vec![Some(AuxOutputRoute::to_track(snare_id))],
         "aux_outputs dest pointing at sentinel must be remapped to the new id"
     );
@@ -1197,8 +1197,8 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
     assert_ne!(new_kick_id, 0, "Kick sentinel rebased");
     assert_ne!(song.mod_sources[0].id, 0, "mod_source id assigned");
     assert_eq!(
-        song.mod_sources[0].follower().unwrap().0.source_track,
-        new_kick_id,
+        song.mod_sources[0].follower().unwrap().0.source_track(),
+        Some(new_kick_id),
         "mod_source tap.source_track must follow the track id remap"
     );
 }
@@ -1210,7 +1210,7 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
 #[test]
 fn ensure_ids_remaps_lane_device_index_to_device_id() {
     use crate::plugin_format::PluginFormat;
-    let plug = |id: &str| PluginInstance::new(id.into(), PluginFormat::Clap);
+    let plug = |id: &str| Device::Plugin(PluginInstance::new(id.into(), PluginFormat::Clap));
     // 5-device chain; lane が index 2 (synth) を positional index で指す。
     let mut song = Song {
         tracks: vec![Track {
@@ -1245,14 +1245,14 @@ fn ensure_ids_remaps_lane_device_index_to_device_id() {
     song.ensure_ids();
 
     let t = &song.tracks[0];
-    assert_ne!(t.devices[2].id, 0, "devices は安定 id を採番される");
+    assert_ne!(t.devices[2].id(), 0, "devices は安定 id を採番される");
     match t.lane_by_id(1).unwrap().target {
         AutomationTarget::PluginParam {
             device_id,
             legacy_device_index,
             ..
         } => {
-            assert_eq!(device_id, t.devices[2].id, "index 2 → devices[2].id");
+            assert_eq!(device_id, t.devices[2].id(), "index 2 → devices[2].id");
             assert!(
                 legacy_device_index.is_none(),
                 "legacy_device_index は消費される"
@@ -1269,9 +1269,11 @@ fn ensure_ids_remaps_lane_device_index_to_device_id() {
 #[test]
 fn ensure_ids_reallocates_duplicate_device_ids() {
     use crate::plugin_format::PluginFormat;
-    let plug = |id: &str, dev_id: u64| PluginInstance {
-        id: dev_id,
-        ..PluginInstance::new(id.into(), PluginFormat::Clap)
+    let plug = |id: &str, dev_id: u64| {
+        Device::Plugin(PluginInstance {
+            id: dev_id,
+            ..PluginInstance::new(id.into(), PluginFormat::Clap)
+        })
     };
     let mut song = Song {
         tracks: vec![
@@ -1297,9 +1299,9 @@ fn ensure_ids_reallocates_duplicate_device_ids() {
     };
     song.ensure_ids();
 
-    let a = song.tracks[0].devices[0].id;
-    let b = song.tracks[1].devices[0].id;
-    let m = song.master_fx_chain[0].id;
+    let a = song.tracks[0].devices[0].id();
+    let b = song.tracks[1].devices[0].id();
+    let m = song.master_fx_chain[0].id();
     assert_eq!(a, 7, "先に走査した device は id を据え置く");
     assert_ne!(b, a, "重複した 2 つ目は再採番される");
     assert_ne!(m, a, "master_fx_chain の重複も再採番される");
@@ -1315,9 +1317,9 @@ fn ensure_ids_reallocates_duplicate_device_ids() {
     song.ensure_ids();
     assert_eq!(
         (
-            song.tracks[0].devices[0].id,
-            song.tracks[1].devices[0].id,
-            song.master_fx_chain[0].id
+            song.tracks[0].devices[0].id(),
+            song.tracks[1].devices[0].id(),
+            song.master_fx_chain[0].id()
         ),
         before
     );
@@ -1469,7 +1471,10 @@ fn current_version_is_pinned() {
     // `Song.global_launch_quantize` と、`MidiBinding` の入力の `MidiBindInput`
     // (CC / ノート) 化 + `BindingTarget` のランチャー操作 6 種を含む。旧
     // `controller` は deserialize 専用に降格し `ensure_midi_binding_inputs` が移す。
-    assert_eq!(CURRENT_VERSION, 35);
+    // v36 (r.md #110 Parallel / `docs/plan_parallel.md`): `Track.devices` / `master_fx_chain` の
+    // 要素が `Device` (plugin | Parallel) になり、`AudioTap` の source が track | chain の enum に
+    // なった。どちらも旧 JSON と byte 互換 (untagged / flatten) で migration 関数は不要。
+    assert_eq!(CURRENT_VERSION, 36);
 }
 
 #[test]
@@ -1497,8 +1502,7 @@ fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
     song.ensure_ids();
     let t1 = song.track_by_id(1).unwrap();
     assert_eq!(
-        t1.devices
-            .iter()
+        t1.plugins()
             .filter(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID)
             .count(),
         1,
@@ -1506,8 +1510,7 @@ fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
     );
     let t2 = song.track_by_id(2).unwrap();
     assert!(
-        !t2.devices
-            .iter()
+        !t2.plugins()
             .any(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID),
         "group_transform 無しトラックには Transform device を付けない"
     );
@@ -1516,8 +1519,7 @@ fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
     assert_eq!(
         song.track_by_id(1)
             .unwrap()
-            .devices
-            .iter()
+            .plugins()
             .filter(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID)
             .count(),
         1,

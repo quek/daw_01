@@ -151,12 +151,7 @@ impl AppData {
         }
         let plugin_picker_entries = plugin_db
             .as_ref()
-            .map(|db| {
-                let mut v: Vec<PluginPickEntry> =
-                    db.entries.iter().map(PluginPickEntry::from_db_entry).collect();
-                v.sort_by_key(|e| e.name.to_lowercase());
-                v
-            })
+            .map(|db| PluginPickEntry::build_all(db))
             .unwrap_or_default();
 
         // プロジェクト非依存のアプリ設定は **1 回だけ** 読む (旧実装はフィールドごとに
@@ -292,6 +287,7 @@ impl AppData {
                 automation_follows_clips: app_config.automation_follows_clips,
                 collapsed_groups: std::collections::HashSet::new(),
                 expanded_automation_tracks: std::collections::HashSet::new(),
+                collapsed_parallel_nodes: std::collections::HashSet::new(),
                 master_row_automation_expanded: false,
                 track_row_overrides: std::collections::HashMap::new(),
                 automation_lane_row_overrides: std::collections::HashMap::new(),
@@ -414,6 +410,9 @@ impl AppData {
                 plugin_picker_visible: Vec::new(),
                 plugin_picker_query: String::new(),
                 is_plugin_picker_open: false,
+                plugin_picker_target: None,
+                open_sidechain_panel: None,
+                renaming_chain: None,
                 plugin_picker_cursor: 0,
                 font_picker_families: Vec::new(),
                 font_picker_visible: Vec::new(),
@@ -1354,7 +1353,8 @@ impl AppData {
             AppEvent::NudgeSelectedNotePitch { octave, steps } => {
                 self.nudge_selected_notes_pitch(octave, steps);
             }
-            AppEvent::OpenPluginPicker => {
+            AppEvent::OpenPluginPicker { chain } => {
+                self.ui_ephemeral.plugin_picker_target = chain;
                 self.ui_ephemeral.plugin_picker_query.clear();
                 self.refresh_picker_visible();
                 self.ui_ephemeral.is_plugin_picker_open = true;
@@ -1529,8 +1529,8 @@ impl AppData {
                 source_id,
                 bipolar,
             } => self.set_mod_routing_polarity(track_id, target, source_id, bipolar),
-            AppEvent::SetModSourceTrack { id, source_track } => {
-                self.set_mod_source_track(id, source_track)
+            AppEvent::SetModSourceTap { id, source } => {
+                self.set_mod_source_tap_source(id, source)
             }
             AppEvent::SetModSourceAttack { id, ms } => self.set_mod_source_attack(id, ms),
             AppEvent::SetModSourceRelease { id, ms } => self.set_mod_source_release(id, ms),
@@ -1550,9 +1550,19 @@ impl AppData {
                 port,
                 tap_point,
             } => self.set_aux_input_tap_point(device_id, port, tap_point),
-            AppEvent::ReorderInspectorChain(order) => {
-                self.reorder_inspector_chain(&order);
+            // ---- r.md #110 Parallel ----
+            AppEvent::AddParallel { chain, index } => self.add_parallel(chain, index),
+            AppEvent::GroupDevices { device_ids } => self.group_devices(device_ids),
+            AppEvent::UngroupParallel { parallel_id } => self.ungroup_parallel(parallel_id),
+            AppEvent::AddParallelChain { parallel_id } => self.add_parallel_chain(parallel_id),
+            AppEvent::DuplicateParallelChain { chain_id } => self.duplicate_parallel_chain(chain_id),
+            AppEvent::RenameParallelChain { chain_id, name } => self.rename_parallel_chain(chain_id, name),
+            AppEvent::RenameParallel { parallel_id, name } => self.rename_parallel(parallel_id, name),
+            AppEvent::SetParallelChainColor { chain_id, color } => {
+                self.set_parallel_chain_color(chain_id, color)
             }
+            AppEvent::SetChainMixer { chain_id, edit } => self.set_chain_mixer(chain_id, edit),
+            AppEvent::ToggleParallelNodeCollapsed { id } => self.toggle_parallel_node_collapsed(id),
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }

@@ -1143,8 +1143,7 @@ impl AppData {
             // audio_out) を 1 つも持たないなら legacy vocal とみなす (役割判定はせず
             // port を直接見る)。
             let has_sound_source = song.tracks[ti]
-                .devices
-                .iter()
+                .plugins()
                 .any(|p| p.ports.has_note_input && p.ports.has_audio_output);
             let is_legacy_vocal = matches!(
                 song.tracks[ti].source,
@@ -1157,7 +1156,7 @@ impl AppData {
             let track = &mut song.tracks[ti];
             // builtin VOICEVOX は純粋音源 (note_in + audio_out)。チェーン末尾に
             // 追加する (位置で音源として導出される)。
-            track.devices.push(common::model::PluginInstance {
+            track.devices.push(common::model::Device::Plugin(common::model::PluginInstance {
                 id: device_id,
                 ..common::model::PluginInstance::with_ports(
                     common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
@@ -1172,7 +1171,7 @@ impl AppData {
                         has_video_output: false,
                     },
                 )
-            });
+            }));
             tracing::info!(
                 track_id = track.id,
                 track_name = %track.name,
@@ -1191,10 +1190,7 @@ impl AppData {
         // 残っている device」 (Song に居ない) のどちらかを取りこぼす。
         let mut ids: std::collections::HashSet<u64> =
             self.ipc.loaded_devices.keys().copied().collect();
-        for t in &self.song_doc.song().tracks {
-            ids.extend(t.devices.iter().map(|d| d.id));
-        }
-        ids.extend(self.song_doc.song().master_fx_chain.iter().map(|d| d.id));
+        ids.extend(self.song_doc.song().all_plugins().map(|d| d.id));
         for device_id in ids {
             self.send_audio(AudioCommand::ClosePluginShmem { device_id });
         }
@@ -1286,11 +1282,8 @@ impl AppData {
             return;
         }
         // v29: 帰属も chain 内の位置も送らない (host は device_id だけでアドレスする)。
-        let mut to_send: Vec<common::model::PluginInstance> = Vec::new();
-        for track in song.tracks.iter() {
-            to_send.extend(track.devices.iter().cloned());
-        }
-        to_send.extend(song.master_fx_chain.iter().cloned());
+        // r.md #110: Parallel の中の plugin も全部 (`all_plugins` は信号順)。
+        let to_send: Vec<common::model::PluginInstance> = song.all_plugins().cloned().collect();
         for inst in to_send {
             self.restore_device(&inst);
         }
@@ -1307,7 +1300,7 @@ impl AppData {
             .tracks
             .iter()
             .filter(|t| track_ids.contains(&t.id))
-            .flat_map(|t| t.devices.iter().cloned())
+            .flat_map(|t| t.plugins().cloned())
             .collect();
         for inst in to_send {
             self.restore_device(&inst);
@@ -1493,8 +1486,7 @@ impl AppData {
     /// `RequestAllStates` を発行する意味が無いので、 deferred / save の
     /// dispatcher は plugin なしを早期判定して即時実行に切り替える。
     pub(crate) fn song_has_plugin(&self) -> bool {
-        !self.song_doc.song().master_fx_chain.is_empty()
-            || self.song_doc.song().tracks.iter().any(|t| !t.devices.is_empty())
+        self.song_doc.song().all_plugins().next().is_some()
     }
 
     /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
@@ -1520,13 +1512,7 @@ impl AppData {
                 );
                 continue;
             }
-            let device = song
-                .tracks
-                .iter_mut()
-                .flat_map(|t| t.devices.iter_mut())
-                .chain(song.master_fx_chain.iter_mut())
-                .find(|d| d.id == s.device_id);
-            let Some(p) = device else {
+            let Some(p) = song.plugin_by_id_mut(s.device_id) else {
                 tracing::warn!(device_id = s.device_id, "apply_plugin_states: device id not found");
                 continue;
             };

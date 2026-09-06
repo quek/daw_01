@@ -75,15 +75,16 @@ fn build_app(
 #[test]
 fn cursor_starts_at_zero_when_picker_opens() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
-    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 5);
+    // r.md #110: 5 plugin + 「Parallel」。
+    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 6);
 }
 
 #[test]
 fn cursor_moves_down_within_bounds() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 2);
@@ -92,7 +93,7 @@ fn cursor_moves_down_within_bounds() {
 #[test]
 fn cursor_clamps_at_lower_bound() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(-1));
     }
@@ -102,17 +103,17 @@ fn cursor_clamps_at_lower_bound() {
 #[test]
 fn cursor_clamps_at_upper_bound() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(1));
     }
-    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 4); // visible.len() - 1
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 5); // visible.len() - 1 (5 plugin + Parallel)
 }
 
 #[test]
 fn cursor_resets_to_zero_when_query_changes() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 2);
@@ -124,19 +125,20 @@ fn cursor_resets_to_zero_when_query_changes() {
 #[test]
 fn cursor_resets_to_zero_when_picker_reopened() {
     let (mut app, _, _) = build_app(5);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 1);
     // 開き直す → cursor が 0 に戻る
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
 
 #[test]
 fn move_is_noop_when_visible_is_empty() {
     let (mut app, _, _) = build_app(0);
-    app.handle_event(AppEvent::OpenPluginPicker);
-    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 0);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
+    // r.md #110: plugin が 0 件でも 「Parallel」 は常に 1 件並ぶ。
+    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 1);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
@@ -144,9 +146,10 @@ fn move_is_noop_when_visible_is_empty() {
 #[test]
 fn large_delta_clamps_to_bounds() {
     let (mut app, _, _) = build_app(3);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::MovePluginPickerCursor(100));
-    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 2);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 3); // 3 plugin + Parallel
+
     app.handle_event(AppEvent::MovePluginPickerCursor(-100));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }

@@ -18,6 +18,8 @@ pub mod execute;
 pub mod follower;
 mod mix;
 mod port_buffer;
+pub mod program;
+mod program_build;
 mod schedule;
 
 pub use compile::{DeviceLatencies, GraphError, compile_schedule};
@@ -30,4 +32,6 @@ pub use execute::{
 };
 pub use follower::FollowerSlot;
 pub use port_buffer::{PortBuffer, PortBufferPool};
+pub use program::{ChainOp, ChainProgram, ProgramCtx, run_chain_program};
+pub use program_build::{build_program, program_latency};
 pub use schedule::{BufRef, DelayKey, NodeOp, Schedule};

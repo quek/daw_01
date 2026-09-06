@@ -125,6 +125,11 @@ pub enum TrackBuiltinParam {
         #[serde(default, rename = "send_idx", skip_serializing)]
         legacy_send_idx: Option<u8>,
     },
+    /// r.md #110: Parallel 内 chain の gain (linear、`0.0..=MAX_TRACK_GAIN`)。住所は
+    /// 安定 `ParallelChain::id`。レーンは chain を持つ track (master なら song lanes)。
+    ChainGain { chain_id: u64 },
+    /// r.md #110: Parallel 内 chain の pan (`-1.0..=1.0`)。
+    ChainPan { chain_id: u64 },
     /// 内蔵チャンネルストリップの EQ セクション ON/OFF (`Mute` と同じ 0.5 閾値の階段)。
     StripEqOn,
     /// 内蔵チャンネルストリップの Comp セクション ON/OFF。

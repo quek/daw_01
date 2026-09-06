@@ -208,12 +208,17 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
         };
-        let Some(chain) = self.song_doc.song().fx_chain_by_track_id(track_id) else {
+        let song = self.song_doc.song();
+        if song.fx_chain_by_track_id(track_id).is_none() {
             return Vec::new();
-        };
+        }
+        // r.md #110: plugin / Parallel / chain のどれでも「cursor track の持ち物」なら生きている。
         let mut out: Vec<u64> = Vec::with_capacity(self.selection.selected_device_ids.len());
         for &id in &self.selection.selected_device_ids {
-            if chain.iter().any(|d| d.id == id) && !out.contains(&id) {
+            let owner = song
+                .device_owner_track(id)
+                .or_else(|| song.chain_owner_track(common::model::ChainRef::Chain(id)));
+            if owner == Some(track_id) && !out.contains(&id) {
                 out.push(id);
             }
         }

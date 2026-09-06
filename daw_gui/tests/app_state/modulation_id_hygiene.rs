@@ -21,6 +21,7 @@
 //!    にも出ず削除できないまま、生き残ったトラックを変調し続ける。削除だけが掃除
 //!    していて、**グループ解除**と**末尾削除**が漏れていた。
 
+use common::model::Device;
 use common::model::{
     AutomationTarget, ModRouting, ModSource, ModSourceKind, PluginInstance, Polarity, Track,
     TrackBuiltinParam,
@@ -170,14 +171,14 @@ fn removing_a_device_chains_cleanup_to_depth_refs() {
     app.edit_song(|song| {
         song.tracks.clear();
         let mut t = Track { id: TRACK_A, name: "Lead".into(), ..Track::default() };
-        t.devices.push(PluginInstance {
+        t.devices.push(Device::Plugin(PluginInstance {
             id: DEVICE_A,
             ..PluginInstance::with_ports(
                 "test.delay".to_string(),
                 PluginFormat::Clap,
                 PortConfig { has_audio_input: true, has_audio_output: true, ..Default::default() },
             )
-        });
+        }));
         song.tracks.push(t);
     });
     let lfo_a = add_source(&mut app, TRACK_A);

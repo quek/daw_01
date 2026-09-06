@@ -237,6 +237,10 @@ pub fn default_cache_path() -> Option<PathBuf> {
 /// on the URI to construct the Rust implementation.
 pub const BUILTIN_ID_SILENCE: &str = "builtin://daw_01.silence";
 pub const BUILTIN_ID_VOICEVOX: &str = "builtin://daw_01.voicevox";
+/// r.md #110: プラグインピッカーに並ぶ「Parallel」 (並列 chain の container) の id。
+/// plugin ではない (host に load しない、 `PluginDatabase` にも載らない) — picker が
+/// この id を選んだら `Device::Parallel` を挿す。
+pub const PARALLEL_PICKER_ID: &str = "builtin://daw_01.parallel";
 /// (talk) 字幕(テキスト表示)デバイス。`ClipContent::Text` clip を画面 overlay 化
 /// するかの**表示ゲート marker** (`docs/plan_voicevox_talk.md` §1.2/§2)。shader 効果では
 /// なく、`text_compose` が「このトラックに在るか」で表示を gate するだけ。`builtin.video.*`

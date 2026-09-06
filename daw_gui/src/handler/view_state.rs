@@ -15,6 +15,20 @@ impl AppData {
     /// 現在の表示状態 (ズーム / スクロール / 行高 / スナップ等 + per-clip view) を
     /// `ViewState` にスナップショットする。 save / autosave 時に呼ぶ。 per-clip map は
     /// 現存しないクリップの orphan entry を GC して書き出す。
+    /// r.md #110: 保存する折り畳み Parallel / chain — 現存するものだけ、id 順。
+    fn persisted_collapsed_parallel_nodes(&self) -> Vec<u64> {
+        let song = self.song_doc.song();
+        let mut v: Vec<u64> = self
+            .ui_prefs
+            .collapsed_parallel_nodes
+            .iter()
+            .copied()
+            .filter(|id| song.parallel_by_id(*id).is_some() || song.chain_by_id(*id).is_some())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     pub fn snapshot_view_state(&self) -> common::model::ViewState {
         let mut expanded: Vec<u32> = self.ui_prefs.expanded_automation_tracks.iter().copied().collect();
         expanded.sort_unstable();
@@ -73,6 +87,7 @@ impl AppData {
             expanded_automation_tracks: expanded,
             automation_lane_row_overrides: lane_row_overrides,
             master_row_automation_expanded: self.ui_prefs.master_row_automation_expanded,
+            collapsed_parallel_nodes: self.persisted_collapsed_parallel_nodes(),
             arrange_snap_enabled: self.ui_prefs.arrange_snap_enabled,
             arrange_snap_choice: self.ui_prefs.arrange_snap_choice,
             pianoroll_snap_enabled: self.ui_prefs.pianoroll_snap_enabled,
@@ -136,6 +151,7 @@ impl AppData {
             .map(|(k, h)| (k, h.max(16)))
             .collect();
         self.ui_prefs.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
+        self.ui_prefs.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
         // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
         // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
         self.ui_prefs.automation_lane_row_overrides = v

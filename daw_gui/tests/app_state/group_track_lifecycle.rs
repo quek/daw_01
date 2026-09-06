@@ -24,7 +24,7 @@ use common::model::{AutomationLane, AutomationTarget, InstrumentSource};
 use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use daw_gui::app::{device_id_at, AppData, AppEvent};
+use daw_gui::app::{device_id_at, AppData, AppEvent, RelocateDevices};
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 
@@ -37,7 +37,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
 
     // Step 1: track 0 を選択し、 picker から synth を入れる (= device 0 に append)。
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
@@ -132,7 +132,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     );
 
     // Step 4: group が selected な状態で Bitcrush を append (= device 0 on group)。
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.bitcrush".into(),
         keep_open: false,
@@ -153,7 +153,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     fake_plugin_loaded(&mut app, group_id, 0, "test.bitcrush");
 
     // Step 5: 同じく group に Delay を append (= device 1)。
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.delay".into(),
         keep_open: false,
@@ -312,7 +312,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // 念のため song モデル側も instrument device が残っているか。
     let inst_track = &app.song_doc.song().tracks[0];
     assert_eq!(
-        inst_track.devices.first().map(|p| p.plugin_id.as_str()),
+        inst_track.plugins().next().map(|p| p.plugin_id.as_str()),
         Some("test.synth"),
         "instrument device still bound to test.synth: {:?}",
         inst_track.devices
@@ -332,21 +332,21 @@ fn setup_loaded_chain(
 ) -> (u32, [u64; 3]) {
     let track_id = app.song_doc.song().tracks[0].id;
     select_track_single(app, 0);
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
         keep_open: false,
         open_gui: false,
     });
     let synth_dev = fake_plugin_loaded(app, track_id, 0, "test.synth");
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.bitcrush".into(),
         keep_open: false,
         open_gui: false,
     });
     let bitcrush_dev = fake_plugin_loaded(app, track_id, 1, "test.bitcrush");
-    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.delay".into(),
         keep_open: false,
@@ -357,7 +357,7 @@ fn setup_loaded_chain(
     {
         let t = &app.song_doc.song().tracks[0];
         assert_eq!(
-            t.devices.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            t.plugins().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
             vec!["test.synth", "test.bitcrush", "test.delay"]
         );
     }
@@ -380,19 +380,27 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     // Reorder. devices = [synth(0), bitcrush(1), delay(2)]. gui_01 契約は
     // new[i] = items[order[i]]; order [0,2,1] は synth を残して 2 つの FX を入れ替え
     // (delay が bitcrush より前へ)。
-    app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1]));
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![delay_dev],
+        dest: common::model::ChainRef::Track(track_id),
+        dest_index: 1,
+        copy: false,
+    }));
+    // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
+    // 空の AllPluginStates で flush する。
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
 
     // (a) song permutation: device 順が [synth, delay, bitcrush] に。
     {
         let t = &app.song_doc.song().tracks[0];
         assert_eq!(
-            t.devices.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            t.plugins().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
             vec!["test.synth", "test.delay", "test.bitcrush"],
             "devices order permuted in the song model"
         );
         // 安定 device id は device と一緒に動く。
         assert_eq!(
-            t.devices.iter().map(|p| p.id).collect::<Vec<_>>(),
+            t.plugins().map(|p| p.id).collect::<Vec<_>>(),
             vec![synth_dev, delay_dev, bitcrush_dev],
             "device ids move with the devices"
         );
@@ -436,7 +444,7 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
 #[test]
 fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
-    let (_track_id, [_synth_dev, bitcrush_dev, _delay_dev]) =
+    let (track_id, [_synth_dev, bitcrush_dev, delay_dev]) =
         setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
 
     // Automate a param on bitcrush (currently device index 1).
@@ -455,7 +463,15 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     });
 
     // Swap the two FX (delay before bitcrush): order [0,2,1].
-    app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1]));
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![delay_dev],
+        dest: common::model::ChainRef::Track(track_id),
+        dest_index: 1,
+        copy: false,
+    }));
+    // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
+    // 空の AllPluginStates で flush する。
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
 
     // bitcrush moved index 1 -> index 2; the lane still points at bitcrush by id.
     assert_eq!(
@@ -472,7 +488,7 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
         app.song_doc.song().tracks[0]
             .devices
             .iter()
-            .position(|d| d.id == bitcrush_dev),
+            .position(|d| d.id() == bitcrush_dev),
         Some(2),
         "bitcrush now sits at index 2"
     );
@@ -496,23 +512,31 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
             .find(|t| t.id == track_id)
             .unwrap()
             .devices
-            .push(common::model::PluginInstance {
+            .push(common::model::Device::Plugin(common::model::PluginInstance {
                 id,
                 ..common::model::PluginInstance::new(
                     "test.delay".into(),
                     common::plugin_format::PluginFormat::Clap,
                 )
-            });
+            }));
     });
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
 
     // [synth, bitcrush, delay, phantom] の index 1 と 2 を入れ替える。
-    app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1, 3]));
+    let delay_dev = app.song_doc.song().tracks[0].devices[2].id();
+    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![delay_dev],
+        dest: common::model::ChainRef::Track(track_id),
+        dest_index: 1,
+        copy: false,
+    }));
+    // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
+    // 空の AllPluginStates で flush する。
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
 
     let after: Vec<String> = app.song_doc.song().tracks[0]
-        .devices
-        .iter()
+        .plugins()
         .map(|p| p.plugin_id.clone())
         .collect();
     assert_eq!(
@@ -520,11 +544,14 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
         vec!["test.synth", "test.delay", "test.bitcrush", "test.delay"],
         "未ロード device が混じっていても並べ替わる"
     );
-    // plugin_host へは何も送らない (host は順序を持たない)。 audio へは epoch flush で
-    // LoadSong が飛ぶが、 この test は明示 flush しないので何も出ない。
+    // plugin_host へは instance を作り直す IPC (SetSlotPlugin / RemoveSlotPlugin) を送らない
+    // (host は順序を持たない)。 運搬の前に最新 state を undo snapshot へ取り込む
+    // `RequestAllStates` だけは出る (r.md #71 と同じ経路)。
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
-        plugin_msgs.is_empty(),
-        "並べ替えは plugin_host への IPC を伴わない: {plugin_msgs:?}"
+        plugin_msgs
+            .iter()
+            .all(|m| matches!(m, PluginCommand::RequestAllStates)),
+        "並べ替えは plugin instance を作り直さない: {plugin_msgs:?}"
     );
 }

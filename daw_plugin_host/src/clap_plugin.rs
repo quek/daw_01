@@ -461,6 +461,8 @@ pub struct ClapPlugin {
     processing: bool,
     /// パラアウト port 数 (audio half の bus 構成から load 時に確定)。
     paraout_port_count: usize,
+    /// r.md #110: sidechain 候補 (`is_main=false` audio 入力 port) 数。
+    aux_input_port_count: usize,
     gui_ext: Option<*const clap_plugin_gui>,
     gui_created: bool,
     /// r.md #65: `plugin` / `gui_ext` の生ポインタをエディタ窓の WNDPROC へ
@@ -674,6 +676,7 @@ impl ClapPlugin {
         } else {
             (1 + aux_output_channels.len()).min(common::process_data::MAX_AUX_OUT)
         };
+        let aux_input_port_count = aux_input_channels.len().min(common::process_data::MAX_AUX_IN);
 
         let audio = AudioHalf::new(Box::new(ClapAudioHalf {
             plugin: plugin_ptr,
@@ -719,6 +722,7 @@ impl ClapPlugin {
             active: false,
             processing: false,
             paraout_port_count,
+            aux_input_port_count,
             gui_ext,
             gui_created: false,
             gui_alive: Arc::new(AtomicBool::new(false)),
@@ -964,6 +968,10 @@ impl LoadedPlugin for ClapPlugin {
 
     fn aux_output_port_count(&self) -> usize {
         self.paraout_port_count
+    }
+
+    fn aux_input_port_count(&self) -> usize {
+        self.aux_input_port_count
     }
 
     // --- ARA -------------------------------------------------------------

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::model::{Clip, PluginInstance, Track};
+use common::model::Device;
 use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
 use common::protocol::{
@@ -165,14 +166,14 @@ fn app_with_vocal_track(clip_ids: &[u32]) -> (AppData, UnboundedReceiver<PluginC
     track.id = 100;
     track.name = "Vocal".into();
     // v29: device には安定 id を持たせる (host addressing = この id)。
-    track.devices.push(PluginInstance {
+    track.devices.push(Device::Plugin(PluginInstance {
         id: 5,
         ..PluginInstance::with_ports(
             common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
             PluginFormat::Builtin,
             PortConfig { has_note_input: true, has_audio_output: true, ..Default::default() },
         )
-    });
+    }));
     for &cid in clip_ids {
         let mut clip = Clip::default();
         clip.id = cid;

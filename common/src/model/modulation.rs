@@ -32,14 +32,33 @@ pub enum TapPoint {
     PostFader,
 }
 
-/// 「音をどこから取るか」 の SSoT。 source track + タップ点。
+/// 音源 (r.md #110)。 track の出力か、 同 track の Parallel 内 chain の出力。
+///
+/// serde は externally-tagged を `AudioTap` に `flatten` する = JSON は
+/// `{"source_track": N}` / `{"source_chain": C}` になり、 旧 file (`source_track` 直置き)
+/// と byte 互換 (migration 不要)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum TapSource {
+    /// `Track::id`。
+    #[serde(rename = "source_track")]
+    Track(u32),
+    /// `ParallelChain::id` (`docs/plan_parallel.md` §3)。
+    #[serde(rename = "source_chain")]
+    Chain(u64),
+}
+
+/// 「音をどこから取るか」 の SSoT。 source + タップ点。
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
 )]
 pub struct AudioTap {
-    /// 音源となる `Track::id`。
-    pub source_track: u32,
+    #[serde(flatten)]
+    pub source: TapSource,
     /// どの段で拾うか。 旧 file は `PostFader` に forward-migrate。
+    /// chain source では `PreFx` = Parallel 入力、 `PostFx` = chain の device 通過後・gain/pan 前、
+    /// `PostFader` = gain/pan/mute 後。
     #[serde(default)]
     pub tap_point: TapPoint,
 }
@@ -48,8 +67,28 @@ impl AudioTap {
     /// 旧 sidechain (= 常に post-fader) からの lift / 既定構築。
     pub fn post_fader(source_track: u32) -> Self {
         Self {
-            source_track,
+            source: TapSource::Track(source_track),
             tap_point: TapPoint::PostFader,
+        }
+    }
+
+    pub fn new(source: TapSource, tap_point: TapPoint) -> Self {
+        Self { source, tap_point }
+    }
+
+    /// source が track なら `Track::id`。
+    pub fn source_track(&self) -> Option<u32> {
+        match self.source {
+            TapSource::Track(t) => Some(t),
+            TapSource::Chain(_) => None,
+        }
+    }
+
+    /// source が chain なら `ParallelChain::id`。
+    pub fn source_chain(&self) -> Option<u64> {
+        match self.source {
+            TapSource::Chain(c) => Some(c),
+            TapSource::Track(_) => None,
         }
     }
 }

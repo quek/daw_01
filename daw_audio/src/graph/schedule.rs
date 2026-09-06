@@ -13,6 +13,7 @@
 
 use super::delay_line::DelayLine;
 use super::port_buffer::PortBufferPool;
+use super::program::ChainProgram;
 
 /// Reference to a stereo audio buffer.
 ///
@@ -41,7 +42,17 @@ pub enum BufRef {
     /// point is `TapPoint::PreFx`. Indexed by song-track index, parallel to
     /// `TrackScratch`. docs/plan_modulation_followups.md §1.
     PreFxScratch(u32),
+    /// r.md #110 Parallel: `owner` (song-track index、master は [`MASTER_OWNER`]) の
+    /// program の chain `slot` の **PostFx** snapshot (device 通過後・gain/pan 前)。
+    ChainPostFx { owner: u32, slot: u32 },
+    /// 同 chain の **PostFader** snapshot (gain/pan/mute 後)。
+    ChainPostFader { owner: u32, slot: u32 },
+    /// 同 program の Parallel `slot` の入力 (= その Parallel の全 chain の `PreFx`)。
+    ParallelInput { owner: u32, slot: u32 },
 }
+
+/// `BufRef::Chain* { owner }` / `ParallelInput { owner }` で master program を指す sentinel。
+pub const MASTER_OWNER: u32 = u32::MAX;
 
 /// A unit of work in a `Schedule`. The RT thread iterates `Schedule::nodes`
 /// in order and dispatches each variant; the audio worker pool fans
@@ -56,15 +67,16 @@ pub enum NodeOp {
     /// PR2: process a group / return / bus track's audio FX chain on its
     /// already-summed input scratch, then apply its strip.
     ///
-    /// `start_device` = the first index in `Track.devices` to run. `0` for a
-    /// pure group / return (its whole chain is bus FX). For a **パラアウト
-    /// group-with-instrument** (`docs/plan_paraout.md`) the instrument prefix
-    /// `[0..start_device]` already ran in pass 1 (`process_track_owned`,
-    /// producing the main signal + aux outputs), so this op runs only the
-    /// suffix FX `[start_device..]` on the summed bus (instrument main +
-    /// children) — that's how "the instrument track's own FX process the whole
-    /// kit" is realised.
-    ProcessGroupFx { track_idx: u32, start_device: u32 },
+    /// `start_op` = the first op index in the track's `ChainProgram` to run.
+    /// `0` for a pure group / return (its whole chain is bus FX). For a
+    /// **パラアウト group-with-instrument** (`docs/plan_paraout.md`) the
+    /// instrument prefix `[0..pass1_end]` already ran in pass 1
+    /// (`process_track_owned`, producing the main signal + aux outputs), so this
+    /// op runs only the suffix FX `[start_op..]` on the summed bus (instrument
+    /// main + children) — that's how "the instrument track's own FX process the
+    /// whole kit" is realised. r.md #110: index は `Track.devices` ではなく展開後の
+    /// op 列 (`ChainProgram::pass1_end`)。
+    ProcessGroupFx { track_idx: u32, start_op: u32 },
 
     /// Mix `srcs` into `dst` with per-source linear gain (clearing `dst`
     /// first). PR1 emits a single `Mix { dst: Master, ... }` at the end; PR2
@@ -220,6 +232,16 @@ pub struct Schedule {
     /// - WAV 書き出しはこの値だけ書き始めを後ろへずらす (= 先頭の遅延ぶんを捨てる)。
     ///   でないと書き出した wav が丸ごと後ろへずれ、stem を貼り戻すとダブる。
     pub master_latency_samples: u32,
+    /// r.md #110 Parallel: track index 順の展開済み device 列 (`docs/plan_parallel.md` §4.1)。
+    /// pass 1 (worker) / pass 2 (`ProcessGroupFx`) の両方がこれを走らせる。
+    /// scratch (Parallel / chain slot、並列 PDC の delay line) も program が所有する。
+    pub track_programs: Vec<ChainProgram>,
+    /// master fx chain の program (`track_id = MASTER_TRACK_ID`)。
+    pub master_program: ChainProgram,
+    /// master program を走らせるときの MIDI バス (master は note を持たないので常に
+    /// 空だが、walker の契約上バスが要る)。容量 `MAX_EVENTS` で確保済み。
+    pub master_midi_a: Vec<crate::sequencer::TimedNoteEvent>,
+    pub master_midi_b: Vec<crate::sequencer::TimedNoteEvent>,
 }
 
 impl Schedule {
@@ -234,6 +256,10 @@ impl Schedule {
             follower_keys: Vec::new(),
             mod_kinds: Vec::new(),
             master_latency_samples: 0,
+            track_programs: Vec::new(),
+            master_program: ChainProgram::empty(common::model::MASTER_TRACK_ID),
+            master_midi_a: Vec::with_capacity(crate::mixer::MAX_EVENTS),
+            master_midi_b: Vec::with_capacity(crate::mixer::MAX_EVENTS),
         }
     }
 
@@ -264,6 +290,14 @@ impl Schedule {
                 self.follower_slots[i].adopt_state_from(&old.follower_slots[j]);
             }
         }
+        // r.md #110: Parallel の並列 PDC ring と chain の tap snapshot は所有 track id →
+        // chain id で移送する (`ChainProgram::adopt_state_from`)。
+        for p in &mut self.track_programs {
+            if let Some(o) = old.track_programs.iter_mut().find(|o| o.track_id == p.track_id) {
+                p.adopt_state_from(o);
+            }
+        }
+        self.master_program.adopt_state_from(&mut old.master_program);
     }
 }
 

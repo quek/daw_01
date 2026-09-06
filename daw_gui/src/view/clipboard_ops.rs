@@ -306,23 +306,18 @@ pub(crate) fn duplicate_devices(app: &AppData, ui: &mut Ui<'_, AppData>) {
     if ids.is_empty() {
         return;
     }
-    let Some(dest_track) = app.cursor_track_id() else {
-        return;
-    };
-    // 挿入位置 = 選択の末尾 device の直後 (選択ブロック全体の後ろに並べる)。
-    let Some(dest_index) = app
-        .song_doc
-        .song()
-        .fx_chain_by_track_id(dest_track)
-        .and_then(|c| c.iter().rposition(|d| ids.contains(&d.id)))
-        .map(|i| i as u32 + 1)
+    // 挿入位置 = 選択の末尾 device の直後 (その device が居る chain の中)。
+    let Some((dest, dest_index)) = ids
+        .last()
+        .and_then(|&id| app.song_doc.song().find_device(id))
+        .map(|(chain, i)| (chain, i as u32 + 1))
     else {
         return;
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
             device_ids: ids,
-            dest_track,
+            dest,
             dest_index,
             copy: true,
         }));

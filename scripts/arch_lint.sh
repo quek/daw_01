@@ -550,7 +550,7 @@ record LEGACY-PROTOCOL grep "MainToChild/ChildToMain の参照が残存。宛先
 #    しないよう実属性だけを数える。
 #    かつては件数 baseline (`n > 0`) だったが、行単位 ratchet に一本化した
 #    (件数比較は「1 件直して 1 件増やす」が素通りする)。
-hits=$(grep -rnE "$UNTAGGED_RE" --include='*.rs' common/src 2>/dev/null || true)
+hits=$(grep -rnE "$UNTAGGED_RE" --include='*.rs' common/src 2>/dev/null | strip_allowed untagged || true)
 record UNTAGGED grep "新規の serde(untagged)。判別が field 集合の pairwise 非交差に依存し、variant 追加で silent misparse リスクが 2 乗成長する:" "$hits"
 
 # 5. protocol への bulk blob 直載せ (不変条件 2)。
