@@ -351,6 +351,10 @@ pub enum AudioCommand {
     SetChainMuted { track: u32, chain_id: u64, muted: bool },
     /// r.md #110 Parallel: chain の solo (同じ Parallel 内の他 chain を黙らせる)。
     SetChainSolo { track: u32, chain_id: u64, solo: bool },
+    /// r.md #110 Parallel: 出力 trim (linear) の値のみ更新。 `parallel_id` = 安定 `Parallel::id`。
+    SetParallelOutGain { track: u32, parallel_id: u64, gain: f32 },
+    /// r.md #110 Parallel: gain match の on / off (RT は Song snapshot から live-read)。
+    SetParallelGainMatch { track: u32, parallel_id: u64, on: bool },
     /// Record-arm 状態。 audio thread は track.armed を Song に反映するのみ。
     SetTrackArmed { track: u32, armed: bool },
     /// BPM 軽量更新 (transport scrub 中に毎 frame 流れうる)。値のみ。

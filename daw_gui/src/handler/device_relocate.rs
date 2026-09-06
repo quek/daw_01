@@ -596,6 +596,16 @@ fn move_device_bindings(
     // r.md #110: chain の gain / pan のレーン / 変調も所有 track を移る。
     let mut chain_ids: Vec<u64> = Vec::new();
     common::model::for_each_chain(std::slice::from_ref(dev), &mut |_, c| chain_ids.push(c.id));
+    // Parallel の出力 trim のレーン / 変調も (住所は Parallel id)。
+    let mut parallel_ids: Vec<u64> = Vec::new();
+    common::model::for_each_parallel(std::slice::from_ref(dev), &mut |r| parallel_ids.push(r.id));
+    for pid in parallel_ids {
+        let (lanes, routings) = extract_parallel_bindings(song, src_track, pid);
+        move_lanes(song, lanes);
+        for routing in routings {
+            push_routing_to(song, dest_track, routing);
+        }
+    }
     for cid in chain_ids {
         let (lanes, routings) = extract_chain_bindings(song, src_track, cid);
         move_lanes(song, lanes);
@@ -620,6 +630,21 @@ fn extract_device_bindings(
             target,
             common::model::AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id
         )
+    })
+}
+
+/// r.md #110: Parallel の出力 trim を指す lane / routing を抜き取る。
+fn extract_parallel_bindings(
+    song: &mut common::model::Song,
+    track_id: u32,
+    parallel_id: u64,
+) -> (
+    Vec<common::model::AutomationLane>,
+    Vec<common::model::ModRouting>,
+) {
+    use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
+    extract_bindings(song, track_id, |target| {
+        matches!(target, T::TrackBuiltin(P::ParallelOutGain { parallel_id: p }) if *p == parallel_id)
     })
 }
 

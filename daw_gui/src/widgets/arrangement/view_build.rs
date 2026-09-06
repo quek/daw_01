@@ -806,6 +806,11 @@ fn lane_target_display(
             icon_glyph: 'P',
             color: Color::rgb(0.55, 0.92, 0.55),
         },
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { .. }) => LaneDisplay {
+            label: intern_label("Parallel Out"),
+            icon_glyph: 'V',
+            color: Color::rgb(0.42, 0.78, 0.95),
+        },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
             label: intern_label("Mute"),
             icon_glyph: 'M',

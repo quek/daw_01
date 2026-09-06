@@ -238,3 +238,32 @@ fn sidechain_source_can_be_a_chain_of_the_same_track() {
     let json = serde_json::to_string(&tap).unwrap();
     assert!(json.contains("\"source_chain\""), "{json}");
 }
+
+/// ヘッダ行の出力 trim / Match: Song が書き換わり、値のみの IPC が engine へ飛ぶ
+/// (chain mixer と同じ経路、再 compile は要らない)。
+#[test]
+fn parallel_out_gain_and_gain_match_update_song_and_send_value_only_commands() {
+    use common::protocol::AudioCommand;
+    use daw_gui::handler::parallel::ParallelMixerEdit;
+    let (mut app, mut audio_rx, _plugin_rx, _proxy) = build_app();
+    let (track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+    let _ = super::support::drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(0.5) });
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!((r.out_gain, r.gain_match), (0.5, true));
+    let cmds = super::support::drain(&mut audio_rx);
+    assert!(
+        cmds.iter().any(|c| matches!(c, AudioCommand::SetParallelOutGain { track, parallel_id: p, gain }
+            if *track == track_id && *p == parallel_id && *gain == 0.5)),
+        "{cmds:?}"
+    );
+    assert!(cmds.iter().any(|c| matches!(c, AudioCommand::SetParallelGainMatch { parallel_id: p, on: true, .. } if *p == parallel_id)));
+    assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
+    // 同じ値をもう一度 → 何も送らない。
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) });
+    assert!(super::support::drain(&mut audio_rx).is_empty());
+}

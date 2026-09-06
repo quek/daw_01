@@ -68,6 +68,12 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         AudioCommand::SetChainSolo { chain_id, solo, .. } => {
             with_chain(song, chain_id, |c| c.solo = solo);
         }
+        AudioCommand::SetParallelOutGain { parallel_id, gain, .. } => {
+            with_parallel(song, parallel_id, |r| r.out_gain = gain.clamp(0.0, MAX_TRACK_GAIN));
+        }
+        AudioCommand::SetParallelGainMatch { parallel_id, on, .. } => {
+            with_parallel(song, parallel_id, |r| r.gain_match = on);
+        }
         AudioCommand::SetSongBpm { bpm } => song.bpm = bpm.clamp(1.0, 400.0),
         AudioCommand::SetSongTimeSigNumerator { num } => song.time_sig.0 = num.clamp(1, 32),
         _ => return false,
@@ -139,6 +145,13 @@ fn with_send(
         && let Some(s) = t.sends.iter_mut().find(|s| s.id == send_id)
     {
         f(s);
+    }
+}
+
+/// r.md #110: `parallel_id` の Parallel に `f` を当てる (dangling は no-op)。
+fn with_parallel(song: &mut Song, parallel_id: u64, f: impl FnOnce(&mut common::model::Parallel)) {
+    if let Some(r) = song.parallel_by_id_mut(parallel_id) {
+        f(r);
     }
 }
 

@@ -39,6 +39,15 @@ pub struct Parallel {
     /// 括弧行 (開始 / 終了) の色。 作った時点で周囲と別の色を自動で振る (Bitwig)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// 出力 trim (linear、`1.0` = unity、上限 [`MAX_TRACK_GAIN`])。 全 chain の和に掛ける。
+    /// automation / 変調の対象 (`TrackBuiltinParam::ParallelOutGain`)。
+    #[serde(default = "default_chain_gain")]
+    pub out_gain: f32,
+    /// gain match: 並列の和が入力より大きく (小さく) なるぶんを自動で戻す。 入力と出力の
+    /// RMS (遅い窓) の比を出力に掛ける (engine `program.rs` の `update_gain_match`)。
+    /// 帯域分割や Dry + Wet のように和がそのまま正しい使い方では **off** にする (既定 off)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gain_match: bool,
 }
 
 /// Parallel の中の 1 本の並列 chain。Live の Chain List の 1 行 = Bitwig の layer 1 段。
@@ -82,6 +91,8 @@ impl Parallel {
             chains: vec![ParallelChain::new("Chain 1")],
             bypassed: false,
             color: None,
+            out_gain: 1.0,
+            gain_match: false,
         }
     }
 
@@ -257,6 +268,18 @@ pub fn for_each_chain<'a>(devices: &'a [Device], f: &mut impl FnMut(&'a Parallel
             for c in &r.chains {
                 f(r, c);
                 for_each_chain(&c.devices, f);
+            }
+        }
+    }
+}
+
+/// [`for_each_parallel`] の可変版。
+pub fn for_each_parallel_mut(devices: &mut [Device], f: &mut impl FnMut(&mut Parallel)) {
+    for d in devices {
+        if let Device::Parallel(r) = d {
+            f(r);
+            for c in &mut r.chains {
+                for_each_parallel_mut(&mut c.devices, f);
             }
         }
     }
@@ -641,6 +664,8 @@ mod tests {
             id,
             name: "Parallel".into(),
             color: None,
+            out_gain: 1.0,
+            gain_match: false,
             chains: chains
                 .into_iter()
                 .map(|(cid, devices)| ParallelChain {
@@ -711,6 +736,8 @@ mod tests {
             ],
             bypassed: false,
             color: None,
+            out_gain: 1.0,
+            gain_match: false,
         };
         let flat: Vec<u64> = r.flatten().iter().map(Device::id).collect();
         assert_eq!(flat, vec![5, 6, 7]);

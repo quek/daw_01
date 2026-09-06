@@ -978,6 +978,8 @@ pub enum AppEvent {
     SetParallelChainColor { chain_id: u64, color: Option<[f32; 3]> },
     /// chain の gain / pan / mute / solo (Song 書き換え + 値のみ IPC)。
     SetChainMixer { chain_id: u64, edit: crate::handler::parallel::ChainMixerEdit },
+    /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC)。
+    SetParallelMixer { parallel_id: u64, edit: crate::handler::parallel::ParallelMixerEdit },
     /// 見方の都合: Parallel / chain の中身の開閉 (undo 対象外)。 `id` は Parallel か chain。
     ToggleParallelNodeCollapsed { id: u64 },
     SetMasterGain(f32),
@@ -1910,6 +1912,8 @@ impl AppEvent {
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Pan(_), .. } => "chain pan",
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Muted(_), .. } => "chain mute",
             E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Solo(_), .. } => "chain solo",
+            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::OutGain(_), .. } => "Parallel 出力",
+            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::GainMatch(_), .. } => "Parallel gain match",
             E::SetVideoFxParam { .. } => "映像FX変更",
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
             E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",

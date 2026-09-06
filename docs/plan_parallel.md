@@ -169,6 +169,17 @@ main を揃える) だが、 自 track の Pre-FX は **同じ pass で捕捉し
 input delay 不要)。 compile は自 track 宛の route を `SidechainTap` から除外する。 自 track の
 Post-FX / Post-Fader は出力側 (feedback) なので選べない (setter が Pre-FX に固定)。
 
+### 4.3c 出力 trim と gain match (ヘッダ行)
+
+`Parallel { out_gain, gain_match }`。ヘッダ行 (╭ 行) の右に **出力 trim knob** と **Match トグル**
+(終了行には置かない = 高さを増やさない)。engine は `ParallelEnd` op で `sum × out_gain_ramp ×
+match_gain` を出力する。gain match は Parallel の入力と和 (chain gain 込み) の mean square を時定数
+0.5 s の一次 IIR で追い、`sqrt(in/out)` を ±12 dB に収めて buffer 内で線形に追従させる (無音の間は
+保持、off に戻すと 1.0 へ)。音声の純関数なので export でも同じ。**既定 off** — 帯域分割や Dry +
+Wet のように和がそのまま正しい使い方では自動補正が逆に壊すので、Parallel ごとの opt-in。
+out_gain は automation / 変調の対象 (`TrackBuiltinParam::ParallelOutGain`、住所は `Parallel::id`)、
+値のみ IPC は `SetParallelOutGain` / `SetParallelGainMatch`。
+
 ### 4.4 値のみ更新 (`song_values.rs`)
 
 `SetChainGain` / `SetChainPan` / `SetChainMuted` / `SetChainSolo { track, chain_id, .. }` を

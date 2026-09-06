@@ -253,7 +253,16 @@ pub struct ChainEntry {
 pub enum ChainRowKind {
     Plugin(ChainEntry),
     /// `╭ Parallel名` (開始行)。 `open` = 中身 (chain 行 〜 終了行) を出しているか。
-    ParallelBegin { parallel_id: u64, name: String, bypassed: bool, color: Option<[f32; 3]>, open: bool },
+    ParallelBegin {
+        parallel_id: u64,
+        name: String,
+        bypassed: bool,
+        color: Option<[f32; 3]>,
+        open: bool,
+        /// 出力 trim (linear) と gain match (ヘッダ行の knob / Match トグル)。
+        out_gain: f32,
+        gain_match: bool,
+    },
     /// Parallel の chain 1 本 (名前 / 色 / gain / pan / M / S)。
     Chain {
         parallel_id: u64,

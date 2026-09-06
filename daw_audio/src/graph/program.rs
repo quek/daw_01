@@ -64,7 +64,8 @@ pub enum ChainOp {
         /// chain の PostFader tap (gain/pan/mute 後) を誰かが読む。
         snapshot_post_fader: bool,
     },
-    ParallelEnd { parallel_slot: u32 },
+    /// `parallel_id`: 出力 trim / gain match を Song snapshot から live-read するためのキー。
+    ParallelEnd { parallel_slot: u32, parallel_id: u64 },
 }
 
 /// Parallel 1 つぶんの RT scratch。
@@ -79,7 +80,21 @@ pub struct ParallelScratch {
     /// MIDI を置換した chain の出力を集めたもの。
     pub merged_midi: Vec<TimedNoteEvent>,
     pub any_midi_replaced: bool,
+    /// 出力 trim の per-sample ramp (automation + 変調)。
+    pub out_gain_ramp: Vec<f32>,
+    /// gain match の状態: 入力 / 出力の mean square (一次 IIR)、 現在掛けている match gain。
+    pub in_ms: f32,
+    pub out_ms: f32,
+    pub match_gain: f32,
 }
+
+/// gain match の窓 (一次 IIR の時定数、秒)。 ポンピングが出ない程度に遅く。
+const MATCH_TAU_SECS: f32 = 0.5;
+/// gain match が動く下限の mean square (≈ -80 dBFS)。 これ未満 (無音) は直前の gain を保持。
+const MATCH_SILENCE_MS: f32 = 1e-8;
+/// match gain の範囲 (±12 dB)。
+const MATCH_GAIN_MIN: f32 = 0.25;
+const MATCH_GAIN_MAX: f32 = 4.0;
 
 impl ParallelScratch {
     pub fn new() -> Self {
@@ -91,6 +106,34 @@ impl ParallelScratch {
             sum_r: vec![0.0; MAX_FRAMES],
             merged_midi: Vec::with_capacity(MAX_EVENTS),
             any_midi_replaced: false,
+            out_gain_ramp: vec![1.0; MAX_FRAMES],
+            in_ms: 0.0,
+            out_ms: 0.0,
+            match_gain: 1.0,
+        }
+    }
+
+    /// gain match を 1 buffer ぶん進めて、 この buffer の終端で掛ける gain を返す。
+    /// 入力 (`in_l/r`) と和 (`sum_l/r`、chain gain 込み) の mean square を時定数
+    /// [`MATCH_TAU_SECS`] で追い、 `sqrt(in/out)` を [`MATCH_GAIN_MIN`, `MATCH_GAIN_MAX`] に
+    /// 収めたもの。 無音の間は直前の値を保持。 RT 確保なし。
+    fn update_gain_match(&mut self, n: usize, sample_rate: u32) -> f32 {
+        if n == 0 {
+            return self.match_gain;
+        }
+        let (mut in_acc, mut out_acc) = (0.0f32, 0.0f32);
+        for i in 0..n {
+            in_acc += self.in_l[i] * self.in_l[i] + self.in_r[i] * self.in_r[i];
+            out_acc += self.sum_l[i] * self.sum_l[i] + self.sum_r[i] * self.sum_r[i];
+        }
+        let inv = 1.0 / (2 * n) as f32;
+        let a = (n as f32 / (MATCH_TAU_SECS * sample_rate.max(1) as f32)).clamp(0.0, 1.0);
+        self.in_ms += (in_acc * inv - self.in_ms) * a;
+        self.out_ms += (out_acc * inv - self.out_ms) * a;
+        if self.in_ms > MATCH_SILENCE_MS && self.out_ms > MATCH_SILENCE_MS {
+            (self.in_ms / self.out_ms).sqrt().clamp(MATCH_GAIN_MIN, MATCH_GAIN_MAX)
+        } else {
+            self.match_gain
         }
     }
 }
@@ -302,10 +345,26 @@ pub fn run_chain_program(
                     rs.any_midi_replaced = true;
                 }
             }
-            ChainOp::ParallelEnd { parallel_slot } => {
+            ChainOp::ParallelEnd { parallel_slot, parallel_id } => {
                 let Some(rs) = parallels.get_mut(*parallel_slot as usize) else { continue };
-                bus_l[..n].copy_from_slice(&rs.sum_l[..n]);
-                bus_r[..n].copy_from_slice(&rs.sum_r[..n]);
+                // 出力 trim (automation / 変調 ramp) × gain match (buffer 内で線形に追従)。
+                let (out_gain, gain_match) = resolve_parallel_out(ctx, *parallel_id);
+                fill_parallel_out_ramp(ctx, track_id, *parallel_id, out_gain, rs);
+                let mg_from = rs.match_gain;
+                let mg_to = if gain_match {
+                    rs.update_gain_match(n, ctx.sample_rate)
+                } else {
+                    rs.in_ms = 0.0;
+                    rs.out_ms = 0.0;
+                    1.0
+                };
+                rs.match_gain = mg_to;
+                let step = if n > 0 { (mg_to - mg_from) / n as f32 } else { 0.0 };
+                for i in 0..n {
+                    let g = rs.out_gain_ramp[i] * (mg_from + step * (i as f32 + 1.0));
+                    bus_l[i] = rs.sum_l[i] * g;
+                    bus_r[i] = rs.sum_r[i] * g;
+                }
                 if rs.any_midi_replaced {
                     rs.merged_midi.sort_unstable_by_key(|e| e.time);
                     copy_midi(midi_a, &rs.merged_midi);
@@ -364,6 +423,60 @@ fn resolve_chain_mixer(
     (chain.gain, chain.pan, effective_mute)
 }
 
+/// Parallel の (out_gain, gain_match) を Song snapshot から live-read する。無ければ unity / off。
+fn resolve_parallel_out(ctx: &ProgramCtx<'_>, parallel_id: u64) -> (f32, bool) {
+    ctx.song
+        .and_then(|s| s.parallel_by_id(parallel_id))
+        .map_or((1.0, false), |r| (r.out_gain, r.gain_match))
+}
+
+/// 所有 track の lane / routing store (master は song 側)。
+fn track_stores(
+    song: &Song,
+    track_id: u32,
+) -> (&[common::model::AutomationLane], &[common::model::ModRouting]) {
+    if track_id == common::model::MASTER_TRACK_ID {
+        (&song.song_lanes, &song.song_mod_routings)
+    } else {
+        match song.track_by_id(track_id) {
+            Some(t) => (&t.automation_lanes, &t.mod_routings),
+            None => (&[], &[]),
+        }
+    }
+}
+
+/// Parallel の出力 trim ramp を埋める (`fill_chain_ramps` と同じ経路)。
+fn fill_parallel_out_ramp(
+    ctx: &ProgramCtx<'_>,
+    track_id: u32,
+    parallel_id: u64,
+    out_gain: f32,
+    rs: &mut ParallelScratch,
+) {
+    let n = (ctx.frames as usize).min(MAX_FRAMES);
+    let Some(song) = ctx.song else {
+        rs.out_gain_ramp[..n].fill(out_gain);
+        return;
+    };
+    let (lanes, routings) = track_stores(song, track_id);
+    crate::automation::fill_target_ramp(
+        song,
+        track_id,
+        lanes,
+        routings,
+        ctx.rows,
+        ctx.sample_rate,
+        f64::from(ctx.current_bpm),
+        ctx.playhead_beats,
+        ctx.frames,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id }),
+        out_gain,
+        &mut rs.out_gain_ramp,
+        ctx.recording_lanes,
+        ctx.mod_plane,
+    );
+}
+
 /// chain の gain / pan ramp を埋める (automation lane + 変調、`SendGain` と同じ
 /// per-sample 経路)。lane / routing の store は所有 track (master は song 側)。
 fn fill_chain_ramps(
@@ -380,15 +493,7 @@ fn fill_chain_ramps(
         cs.pan_ramp[..n].fill(pan);
         return;
     };
-    let (lanes, routings): (&[common::model::AutomationLane], &[common::model::ModRouting]) =
-        if track_id == common::model::MASTER_TRACK_ID {
-            (&song.song_lanes, &song.song_mod_routings)
-        } else {
-            match song.track_by_id(track_id) {
-                Some(t) => (&t.automation_lanes, &t.mod_routings),
-                None => (&[], &[]),
-            }
-        };
+    let (lanes, routings) = track_stores(song, track_id);
     crate::automation::fill_target_ramp(
         song,
         track_id,
@@ -570,6 +675,8 @@ mod tests {
             chains,
             bypassed: false,
             color: None,
+            out_gain: 1.0,
+            gain_match: false,
         })
     }
 
@@ -634,6 +741,65 @@ mod tests {
         run(&song, 8, &mut bus, &mut midi);
         assert_eq!(bus.0, (0..8).map(|i| 2.0 * i as f32).collect::<Vec<_>>());
         assert_eq!(bus.1, (0..8).map(|i| -2.0 * i as f32).collect::<Vec<_>>());
+    }
+
+    /// gain match: 空 chain 2 本 (和 = 2x) でも、 一定振幅を数秒流せば出力は入力と同じ
+    /// レベルに戻る。 off なら 2x のまま。 out_gain は match の後に掛かる。
+    #[test]
+    fn gain_match_brings_a_two_chain_sum_back_to_the_input_level() {
+        let mut song = song_with(vec![parallel(10, vec![chain(11, vec![]), chain(12, vec![])])]);
+        song.tracks[0].devices[0].as_parallel_mut().unwrap().gain_match = true;
+        // off 側の snapshot (後半で使う): out_gain 0.5、match off。
+        let mut song_off = song.clone();
+        {
+            let r = song_off.tracks[0].devices[0].as_parallel_mut().unwrap();
+            r.gain_match = false;
+            r.out_gain = 0.5;
+        }
+        let frames = 256usize;
+        let mut midi = Vec::with_capacity(MAX_EVENTS);
+        // 同じ program を buffer 跨ぎで回すため `run` ではなく手で組む (`run` は毎回 build する)。
+        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new());
+        let mut program = built.program;
+        let refs: PluginRefs = std::collections::HashMap::new();
+        let lanes = HashSet::new();
+        let ctx = ProgramCtx {
+            song: Some(&song),
+            plugin_refs: &refs,
+            worker_sync: None,
+            sample_rate: 48_000,
+            frames: frames as u32,
+            playing: true,
+            current_bpm: 120.0,
+            playhead_beats: 0.0,
+            loop_region: LoopRegion::default(),
+            recording_lanes: &lanes,
+            mod_plane: ModTickPlaneRef::default(),
+            rows: TrackRows::default(),
+            own_pre_fx: None,
+        };
+        let mut last = 0.0f32;
+        // 3 秒ぶん (時定数 0.5 s の 6 倍) 流す。
+        for _ in 0..(48_000 * 3 / frames) {
+            let mut l = vec![0.5f32; frames];
+            let mut r = vec![0.5f32; frames];
+            let len = program.ops.len();
+            run_chain_program(&mut program, 0..len, &mut l, &mut r, &mut midi, &mut Vec::with_capacity(MAX_EVENTS), &ctx);
+            last = l[frames - 1];
+        }
+        assert!((last - 0.5).abs() < 0.01, "match 後の出力 = 入力 (0.5): {last}");
+
+        // off に戻すと 2x へ戻る (数 buffer で追従)。 out_gain 0.5 は match の後に掛かる。
+        let ctx = ProgramCtx { song: Some(&song_off), ..ctx };
+        let mut last = 0.0f32;
+        for _ in 0..8 {
+            let mut l = vec![0.5f32; frames];
+            let mut r = vec![0.5f32; frames];
+            let len = program.ops.len();
+            run_chain_program(&mut program, 0..len, &mut l, &mut r, &mut midi, &mut Vec::with_capacity(MAX_EVENTS), &ctx);
+            last = l[frames - 1];
+        }
+        assert!((last - 0.5).abs() < 1e-4, "off: 2x × out_gain 0.5 = 0.5: {last}");
     }
 
     #[test]

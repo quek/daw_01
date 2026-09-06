@@ -179,7 +179,8 @@ pub fn automation_value_display(
         T::TrackBuiltin(
             TrackBuiltinParam::Volume
             | TrackBuiltinParam::SendGain { .. }
-            | TrackBuiltinParam::ChainGain { .. },
+            | TrackBuiltinParam::ChainGain { .. }
+            | TrackBuiltinParam::ParallelOutGain { .. },
         ) => gain_db,
         T::TrackBuiltin(TrackBuiltinParam::Pan | TrackBuiltinParam::ChainPan { .. }) => AutomationValueDisplay {
             // 単位は表記自身が持つ (`"L50"`) ので unit ラベルは空。

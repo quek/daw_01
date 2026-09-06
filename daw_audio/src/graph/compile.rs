@@ -3299,6 +3299,8 @@ mod tests {
                 .collect(),
             bypassed: false,
             color: None,
+            out_gain: 1.0,
+            gain_match: false,
         })
     }
 

@@ -248,6 +248,44 @@ impl AppData {
         }
     }
 
+    /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC、chain mixer と同じ)。
+    pub(crate) fn set_parallel_mixer(&mut self, parallel_id: u64, edit: ParallelMixerEdit) {
+        let Some((at, _)) = self.song_doc.song().find_device(parallel_id) else {
+            return;
+        };
+        let Some(track) = self.song_doc.song().chain_owner_track(at) else {
+            return;
+        };
+        let changed = self.edit_song_checked(move |song| {
+            let Some(r) = song.parallel_by_id_mut(parallel_id) else {
+                return false;
+            };
+            match edit {
+                ParallelMixerEdit::OutGain(g) => {
+                    let g = g.clamp(0.0, common::model::MAX_TRACK_GAIN);
+                    if r.out_gain == g {
+                        return false;
+                    }
+                    r.out_gain = g;
+                }
+                ParallelMixerEdit::GainMatch(on) => {
+                    if r.gain_match == on {
+                        return false;
+                    }
+                    r.gain_match = on;
+                }
+            }
+            true
+        });
+        if changed {
+            let cmd = match edit {
+                ParallelMixerEdit::OutGain(gain) => AudioCommand::SetParallelOutGain { track, parallel_id, gain },
+                ParallelMixerEdit::GainMatch(on) => AudioCommand::SetParallelGainMatch { track, parallel_id, on },
+            };
+            self.send_audio(cmd);
+        }
+    }
+
     /// 見方の都合: Parallel / chain の中身の開閉 (Bitwig の layer の開閉)。 dirty 無し。
     pub(crate) fn toggle_parallel_node_collapsed(&mut self, id: u64) {
         if !self.ui_prefs.collapsed_parallel_nodes.remove(&id) {
@@ -332,6 +370,8 @@ impl AppData {
             bypassed: r.bypassed,
             color: r.color,
             open: parallel_open,
+            out_gain: r.out_gain,
+            gain_match: r.gain_match,
         }));
         // 折り畳んだ Parallel は開始行 1 本だけ (chain も終了行も出さない)。
         if !parallel_open {
@@ -480,6 +520,13 @@ pub enum ChainMixerEdit {
     Pan(f32),
     Muted(bool),
     Solo(bool),
+}
+
+/// [`AppData::set_parallel_mixer`] の編集内容。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParallelMixerEdit {
+    OutGain(f32),
+    GainMatch(bool),
 }
 
 /// 自動色 (Bitwig と同じく作った時点で周囲と別の色)。 パレット (色相順) から、 **兄弟にも祖先

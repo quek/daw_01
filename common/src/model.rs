@@ -1487,6 +1487,13 @@ impl Song {
             for_each_chain_mut(&mut t.devices, &mut fix_chain);
         }
         for_each_chain_mut(&mut self.master_fx_chain, &mut fix_chain);
+        let mut fix_parallel = |r: &mut Parallel| {
+            r.out_gain = if r.out_gain.is_finite() { r.out_gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
+        };
+        for t in &mut self.tracks {
+            for_each_parallel_mut(&mut t.devices, &mut fix_parallel);
+        }
+        for_each_parallel_mut(&mut self.master_fx_chain, &mut fix_parallel);
     }
 
     /// Single entry point for all pre-save normalization. GC orphan

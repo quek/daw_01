@@ -181,7 +181,7 @@ impl Builder<'_> {
                 snapshot_post_fader: self.taps.contains(&(c.id, TapPoint::PostFader)),
             });
         }
-        self.program.ops.push(ChainOp::ParallelEnd { parallel_slot });
+        self.program.ops.push(ChainOp::ParallelEnd { parallel_slot, parallel_id: r.id });
         max
     }
 }
@@ -226,6 +226,8 @@ mod tests {
                 .collect(),
             bypassed: false,
             color: None,
+            out_gain: 1.0,
+            gain_match: false,
         })
     }
 
@@ -240,7 +242,7 @@ mod tests {
                     Some((_, f)) => format!("CE{chain_slot}d{f}"),
                     None => format!("CE{chain_slot}"),
                 },
-                ChainOp::ParallelEnd { parallel_slot } => format!("RE{parallel_slot}"),
+                ChainOp::ParallelEnd { parallel_slot, .. } => format!("RE{parallel_slot}"),
             })
             .collect()
     }

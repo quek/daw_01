@@ -130,6 +130,9 @@ pub enum TrackBuiltinParam {
     ChainGain { chain_id: u64 },
     /// r.md #110: Parallel 内 chain の pan (`-1.0..=1.0`)。
     ChainPan { chain_id: u64 },
+    /// r.md #110: Parallel の出力 trim (linear、`0.0..=MAX_TRACK_GAIN`)。住所は安定
+    /// `Parallel::id`。レーンは Parallel を持つ track (master なら song lanes)。
+    ParallelOutGain { parallel_id: u64 },
     /// 内蔵チャンネルストリップの EQ セクション ON/OFF (`Mute` と同じ 0.5 閾値の階段)。
     StripEqOn,
     /// 内蔵チャンネルストリップの Comp セクション ON/OFF。

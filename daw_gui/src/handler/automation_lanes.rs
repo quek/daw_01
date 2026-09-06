@@ -1243,6 +1243,11 @@ impl AppData {
                 .song()
                 .chain_by_id(*chain_id)
                 .map_or(0.0, |(_, c)| f64::from(c.pan)),
+            P::ParallelOutGain { parallel_id } => self
+                .song_doc
+                .song()
+                .parallel_by_id(*parallel_id)
+                .map_or(1.0, |r| f64::from(r.out_gain)),
             // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
             // `ChannelStrip::target_value` が SSoT (ここで写さない)。
             P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {
