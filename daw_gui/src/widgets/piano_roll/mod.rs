@@ -613,8 +613,9 @@ impl PianoRollStyle {
             // M14 Phase 70 / daw_01 #042 + 70a (follow-up): warm tint (root 行) + dim (out 行)。
             // alpha は daw_01 実機 smoke test (#042 follow-up) で「白鍵 row 上の root tint が
             // 見えない / 黒鍵 row との dim 差が 0.015 で out 認識が立たない」 指摘を受けて
-            // 引き上げ済 (0.18 / 0.32 では不可視レベルだった)。
-            root_row_overlay: p.selection_warm.with_alpha(0.32),
+            // 引き上げ済 (0.18 / 0.32 では不可視レベルだった)。 その後 0.32 は「強すぎる」 指摘
+            // (2026-09-06) で 0.14 へ (0.22 でもまだ強い、 と 2 段下げ)。 行が「少し暖色」 と分かる程度。
+            root_row_overlay: p.selection_warm.with_alpha(0.14),
             // out 行は黒鍵 row との差が認識できるまで `row_dim_ink` を濃くした段 (alpha 0.50)。
             out_of_scale_row_overlay: p.row_dim_ink.with_alpha(0.50),
             // 鍵盤レーンラベルの fallback 色 (`label_auto_contrast == false` のときだけ使う)。

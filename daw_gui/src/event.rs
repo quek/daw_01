@@ -149,10 +149,10 @@ pub enum AppEvent {
     /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll widget が毎フレーム
     /// `resp.keyboard_active_pitch` を `preview_note` の pitch と比較し、 変化した
-    /// ときだけ発火する。 `track_idx` は描画中 clip の track (Vec index)、 `pitch`
-    /// は今フレームの押下 pitch (`None` = release / 鍵盤外)。 handler が前回
+    /// ときだけ発火する。 `track_id` は描画中 clip の track (安定 id、 `ClipKey::track_id`)、
+    /// `pitch` は今フレームの押下 pitch (`None` = release / 鍵盤外)。 handler が前回
     /// `preview_note` と差分して note-on/off IPC を送る。 Undo 対象外。
-    PreviewPitchChanged { track_idx: u32, pitch: Option<u8> },
+    PreviewPitchChanged { track_id: u32, pitch: Option<u8> },
     SetNoteVelocity { note: u32, velocity: u8 },
     /// gui_01 #018 (M14 Phase 64): velocity lane drag で 1 batch 更新。
     /// `selected_clip` の note を `(id, velocity)` で一括書き換え。 1 drag =

@@ -680,13 +680,13 @@ impl AppData {
             AppEvent::ToggleLoop => {
                 self.toggle_loop();
             }
-            AppEvent::PreviewPitchChanged { track_idx, pitch } => {
+            AppEvent::PreviewPitchChanged { track_id, pitch } => {
                 // gui_01 #055: 押下 pitch を track id 付き held-value に解決し、
                 // 前回値と差分して note-on/off を音源トラックへ送る。 track id は
                 // reorder race-free な addressing (audio 側で index に再解決)。
                 // 対象 track が存在しない / pitch=None なら next=None (= 発音停止)。
                 let next = pitch
-                    .and_then(|p| self.song_doc.song().tracks.get(track_idx as usize).map(|t| (t.id, p)));
+                    .and_then(|p| self.song_doc.song().track_by_id(track_id).map(|t| (t.id, p)));
                 for action in diff_preview(self.recording.preview_note, next) {
                     match action {
                         PreviewAction::NoteOff { track_id, pitch } => {

@@ -1754,10 +1754,10 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // gui_01 #055: 鍵盤レーン click のピッチプレビュー。前フレーム値 (recording.preview_note の
         // pitch) と差分し、変化した frame だけ PreviewPitchChanged を発火。鳴らす track は描画中 clip の track。
         if response.keyboard_active_pitch != app.recording.preview_note.map(|(_, p)| p) {
-            let track_idx = target.track_id;
+            let track_id = target.track_id;
             let pitch = response.keyboard_active_pitch;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::PreviewPitchChanged { track_idx, pitch });
+                app.handle_event(AppEvent::PreviewPitchChanged { track_id, pitch });
             }));
         }
 
@@ -2052,7 +2052,8 @@ fn draw_legend(
     ui.scroll_area("pr_legend_scroll", list_rect, (list_rect.w, content_h), |ui, scroll_off| {
         let mut y = list_rect.y - scroll_off.1;
         for (row_i, &ti) in track_indices.iter().enumerate() {
-            let Some(track) = app.song_doc.song().tracks.get(ti as usize) else {
+            // `ti` は track の安定 id (`ClipKey::track_id`)。 Vec index ではない。
+            let Some(track) = app.song_doc.song().track_by_id(ti) else {
                 continue;
             };
             let track_id = track.id;
