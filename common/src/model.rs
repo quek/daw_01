@@ -22,6 +22,7 @@ mod ids;
 mod midi_bind;
 mod modulation;
 mod session;
+mod time_ops;
 mod time_selection;
 mod view_state;
 mod track;
@@ -34,6 +35,7 @@ pub use ids::*;
 pub use midi_bind::*;
 pub use modulation::*;
 pub use session::*;
+pub use time_ops::*;
 pub use time_selection::*;
 pub use track::*;
 pub use view_state::ViewState;
@@ -942,6 +944,18 @@ impl Song {
     /// 戻り値は適用した [`Ripple`]。 ループ範囲のように **`Song` の外に住む時間位置**
     /// (session state + `ViewState`) を同じ規則で追従させるために返す。
     pub fn ripple_timeline(&mut self, from_beat: f64, delta: f64) -> Ripple {
+        self.ripple_timeline_with(from_beat, delta, true)
+    }
+
+    /// [`Song::ripple_timeline`] の本体。`shift_sections = false` で **セクション帯だけ
+    /// 動かさない** — 範囲削除 ([`Song::delete_time_range`]) は帯を「重なりぶん縮める」
+    /// 規則で先に計算し終えているので、その上から始点だけずらすと二重に動く。
+    pub(crate) fn ripple_timeline_with(
+        &mut self,
+        from_beat: f64,
+        delta: f64,
+        shift_sections: bool,
+    ) -> Ripple {
         let r = Ripple { from_beat, delta };
         for t in &mut self.tracks {
             for c in &mut t.clips {
@@ -961,8 +975,10 @@ impl Song {
         for sc in &mut self.scale_changes {
             r.shift(&mut sc.beat);
         }
-        for s in &mut self.sections {
-            r.shift(&mut s.start_beat);
+        if shift_sections {
+            for s in &mut self.sections {
+                r.shift(&mut s.start_beat);
+            }
         }
         if self.length_beats >= from_beat {
             self.length_beats = (self.length_beats + delta).max(0.0);
@@ -1172,115 +1188,13 @@ impl Song {
             self.sections.iter().map(|s| (s.start_beat, s.len_beats)),
             dest_start,
         );
-        let in_range = |start: f64| start >= a && start < b;
-
-        // 0. 境界をまたぐ clip を a / b で分割 (move / delete-range と同じ split-at-boundary)。
-        //    これをしないと境界跨ぎ clip が membership から漏れ、 複製で境界の音が欠落する。
-        self.split_clips_at(a);
-        self.split_clips_at(b);
-
-        // 1. 範囲内 content の複製 (linked: content_id 共有、 clip id 新規採番、 a 基準ローカル)。
-        let mut copies_clips: Vec<(u32, Clip)> = Vec::new();
-        for t in &mut self.tracks {
-            let tid = t.id;
-            let srcs: Vec<Clip> = t.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
-            for mut c in srcs {
-                // 実在 id と衝突しない採番 (`Track::alloc_clip_id`)。 counter だけを
-                // 信じると、複製が既存クリップと同じ id を持ち `place_clip` で
-                // 元クリップを消してしまう。
-                c.id = t.alloc_clip_id();
-                c.start_beat -= a;
-                copies_clips.push((tid, c));
-            }
-        }
-        let mut copies_auto: Vec<(u32, u32, AutomationClip)> = Vec::new();
-        for t in &mut self.tracks {
-            let tid = t.id;
-            for lane in &mut t.automation_lanes {
-                let lid = lane.id;
-                let srcs: Vec<AutomationClip> =
-                    lane.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
-                for mut c in srcs {
-                    let id = lane.next_clip_id.max(1);
-                    lane.next_clip_id = id + 1;
-                    c.id = id;
-                    c.start_beat -= a;
-                    copies_auto.push((tid, lid, c));
-                }
-            }
-        }
-        let mut copies_song_auto: Vec<(u32, AutomationClip)> = Vec::new();
-        for lane in &mut self.song_lanes {
-            let lid = lane.id;
-            let srcs: Vec<AutomationClip> =
-                lane.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
-            for mut c in srcs {
-                let id = lane.next_clip_id.max(1);
-                lane.next_clip_id = id + 1;
-                c.id = id;
-                c.start_beat -= a;
-                copies_song_auto.push((lid, c));
-            }
-        }
-        let mut copies_scales: Vec<ScaleChange> = self
-            .scale_changes
-            .iter()
-            .filter(|sc| in_range(sc.beat))
-            .map(|sc| {
-                let mut s = *sc;
-                s.beat -= a;
-                s
-            })
-            .collect();
-
-        // 2. dest に len ぶん空ける (insert)。
-        let open = self.ripple_timeline(dest_start, len);
-
-        // 3. 複製を dest_start 基準で挿入。
-        for (tid, mut c) in copies_clips {
-            c.start_beat += dest_start;
-            if let Some(t) = self.tracks.iter_mut().find(|t| t.id == tid) {
-                // 非重なり不変条件はここも通す (帯は ripple で空けた所へ戻すので
-                // 実際には削られないが、規則の適用点を 1 つに保つ)。
-                t.place_clip(c);
-            }
-        }
-        for (tid, lid, mut c) in copies_auto {
-            c.start_beat += dest_start;
-            if let Some(l) = self
-                .tracks
-                .iter_mut()
-                .find(|t| t.id == tid)
-                .and_then(|t| t.automation_lanes.iter_mut().find(|l| l.id == lid))
-            {
-                l.clips.push(c);
-            }
-        }
-        for (lid, mut c) in copies_song_auto {
-            c.start_beat += dest_start;
-            if let Some(l) = self.song_lanes.iter_mut().find(|l| l.id == lid) {
-                l.clips.push(c);
-            }
-        }
-        for sc in &mut copies_scales {
-            sc.beat += dest_start;
-        }
-        self.scale_changes.append(&mut copies_scales);
-
-        // 4. 新セクションを採番して挿入。
-        let new_id = self.alloc_section_id();
-        self.sections.push(Section {
-            id: new_id,
-            name: sec.name,
-            color: sec.color,
-            start_beat: dest_start,
-            len_beats: len,
-        });
-
-        self.ensure_scale_changes_sorted();
-        self.ensure_automation_points_sorted();
-        self.normalize_sections();
-        Some((new_id, open))
+        // 中身の写しと時間ごとの貼り付けは時間範囲操作と同じ 1 本
+        // ([`Song::copy_time_range`] / [`Song::paste_time_range`])。 帯そのもの (`[a,b)` に
+        // 完全に入る唯一のセクション) も写しに含まれ、 貼り先で新 id を得る。
+        let copy = self.copy_time_range(a, b)?;
+        let pasted = self.paste_time_range(dest_start, &copy, true)?;
+        let new_id = pasted.section_ids.first().copied()?;
+        Some((new_id, pasted.ripple))
     }
 
     /// セクション帯だけ削除する (内容は温存、 Studio One の Backspace 相当)。
@@ -1298,29 +1212,8 @@ impl Song {
     /// (ループ範囲) の追従用。
     pub fn delete_section_range(&mut self, section_id: u32) -> Option<Ripple> {
         let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
-        let (a, len) = (sec.start_beat, sec.len_beats);
-        let b = a + len;
-        if len <= 0.0 {
-            return None;
-        }
-        self.split_clips_at(a);
-        self.split_clips_at(b);
-        let in_range = |s: f64| s >= a && s < b;
-        for t in &mut self.tracks {
-            t.clips.retain(|c| !in_range(c.start_beat));
-            for lane in &mut t.automation_lanes {
-                lane.clips.retain(|c| !in_range(c.start_beat));
-            }
-        }
-        for lane in &mut self.song_lanes {
-            lane.clips.retain(|c| !in_range(c.start_beat));
-        }
-        self.scale_changes.retain(|sc| !in_range(sc.beat));
-        self.sections.retain(|s| s.id != section_id);
-        let close = self.ripple_timeline(b, -len);
-        self.ensure_scale_changes_sorted();
-        self.normalize_sections();
-        Some(close)
+        // 時間を消す規則は [`Song::delete_time_range`] 1 本 (帯は範囲に完全に入るので消える)。
+        self.delete_time_range(sec.start_beat, sec.start_beat + sec.len_beats)
     }
 
     /// 全トラック clip / track automation clip /
@@ -1682,6 +1575,29 @@ impl Song {
             self.track_by_id_mut(track_id)
                 .and_then(|t| t.lane_by_id_mut(lane_id))
         }
+    }
+
+    /// ランチャーが主導権を握っている行 (トラック / オートメーションレーン / song lane) が
+    /// 1 つでもあるか。 GUI が「アレンジのみ」でも『アレンジへ返す』列を残すかの判定
+    /// (帯を隠したままアレンジが鳴らない理由を画面に残す)。
+    #[must_use]
+    pub fn any_launcher_owned_row(&self) -> bool {
+        self.tracks.iter().any(|t| {
+            t.launcher.is_launcher() || t.automation_lanes.iter().any(|l| l.launcher.is_launcher())
+        }) || self.song_lanes.iter().any(|l| l.launcher.is_launcher())
+    }
+
+    /// 全オートメーションレーン (トラック + song lane) を走査する。
+    pub fn all_automation_lanes(&self) -> impl Iterator<Item = &AutomationLane> {
+        self.tracks.iter().flat_map(|t| t.automation_lanes.iter()).chain(self.song_lanes.iter())
+    }
+
+    /// [`Song::all_automation_lanes`] の mut 版。
+    pub fn all_automation_lanes_mut(&mut self) -> impl Iterator<Item = &mut AutomationLane> {
+        self.tracks
+            .iter_mut()
+            .flat_map(|t| t.automation_lanes.iter_mut())
+            .chain(self.song_lanes.iter_mut())
     }
 
     /// Phase 5 Step 5.1: read-only counterpart of `automation_lane_by_key_mut`。

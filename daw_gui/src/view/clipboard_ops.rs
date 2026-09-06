@@ -279,6 +279,65 @@ pub(crate) fn paste_from_clipboard(
             }
             paste_noop(ui);
         }
+        // Cut Time で載せた時間ごとの写しは、 素の Ctrl+V でも Paste Time として貼る
+        // (貼り先は範囲選択の先頭 = ポインタ位置ではない。 `paste_time` と同じ経路)。
+        P::Time(copy) => {
+            let Some(copy) = copy.sanitized() else { return };
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::PasteTime {
+                    copy: Box::new(copy),
+                    source_project_id: src_pid,
+                });
+            }));
+        }
+    }
+}
+
+/// Live §6.11 "…Time" (docs/plan_time_ops.md) のショートカット 5 本。 範囲選択の時間
+/// そのものを全トラック縦断で動かす — 面 (surface) は見ない、 時間区間だけを見る。
+/// `root::dispatch_shortcuts` から 1 行で呼ぶ (巨大 match を太らせない)。
+pub(crate) fn dispatch_time_shortcuts(ui: &mut Ui<'_, AppData>) {
+    if ui.take_shortcut("daw.paste_time")
+        && let Some(text) = ui.read_clipboard_text()
+    {
+        paste_time(ui, &text);
+    }
+    for (name, ev) in [
+        ("daw.cut_time", AppEvent::CutTime),
+        ("daw.duplicate_time", AppEvent::DuplicateTime),
+        ("daw.delete_time", AppEvent::DeleteTime),
+        ("daw.insert_silence", AppEvent::InsertSilence),
+    ] {
+        if ui.take_shortcut(name) {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(ev)));
+        }
+    }
+}
+
+/// Ctrl+Shift+V / Edit メニュー (Live §6.11 "Paste Time"): clipboard の時間ごとの写しを
+/// 範囲選択の先頭に差し込む。 時間の写し以外 (クリップ / ノート …) が載っているときは
+/// 何もしない (素の Ctrl+V へ誘導)。 `text` は `Ui::read_clipboard_text` で読む
+/// (paste 先読みは "paste" ショートカットにしか付かない)。
+pub(crate) fn paste_time(ui: &mut Ui<'_, AppData>, text: &str) {
+    let Some(env) = crate::clipboard::ClipboardEnvelope::from_json(text) else {
+        return;
+    };
+    let src_pid = env.source_project_id;
+    match env.payload {
+        crate::clipboard::ClipboardPayload::Time(copy) => {
+            // 外部入力 (OS clipboard) なので値域を検証してから (他の payload の sanitize_* と同じ)。
+            let Some(copy) = copy.sanitized() else { return };
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::PasteTime {
+                    copy: Box::new(copy),
+                    source_project_id: src_pid,
+                });
+            }));
+        }
+        _ => ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.ui_ephemeral.status_message =
+                "clipboard に時間の写しがありません (Ctrl+Shift+X で時間をカットしてから)".to_string();
+        })),
     }
 }
 

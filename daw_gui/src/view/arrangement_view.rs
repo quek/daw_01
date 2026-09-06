@@ -1239,6 +1239,25 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             })
         },
     );
+
+    // 全オートメーションレーンの表示 / 非表示 (Live の automation toggle、= Alt+A)。
+    // 「Auto 追従」の隣 = オートメーションのまとまり。 点灯 = 全レーンが見えている。
+    // 1 本でも隠れていれば消灯し、 押すと全部出る (👁 で消したレーンを戻す唯一の一括手段)。
+    // レーンが 1 本も無ければ消灯のまま no-op。
+    let lanes_rect = Rect { x: follow_rect.x + follow_rect.w + pad, y, w: 36.0, h };
+    let lanes_visible = app.all_automation_lanes_visible().unwrap_or(false);
+    ui.toggle_button_at(
+        "arr_automation_lanes",
+        "A",
+        lanes_rect,
+        lanes_visible,
+        &snap_toggle_style(&app.theme),
+        |_| {
+            Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleAllAutomationLanesVisible)
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

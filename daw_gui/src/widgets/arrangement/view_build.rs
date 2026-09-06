@@ -111,7 +111,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         .song()
         .tracks
         .iter()
-        .map(|t| ArrangementTrack {
+        .enumerate()
+        .map(|(track_idx, t)| ArrangementTrack {
             id: t.id,
             kind: if t.clips.iter().any(|c| {
                 matches!(
@@ -139,6 +140,12 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             // +6dB へ上げたフェーダーが release で 0dB 位置へ部分的に戻っていた (drag 中は mouse frac
             // 直描画なので露呈せず、 停止中の静的表示だけがずれる = 「スケールが違う」 症状)。 amp を素通し。
             volume: t.volume,
+            // mixer strip (`TrackMixEntry.peak_l_raw`) と同じ表示値 (弾道済み) を同じ index で引く。
+            peak: app
+                .transport
+                .track_peak_display
+                .get(track_idx)
+                .map_or((0.0, 0.0), |&(l, r, _gr)| (l, r)),
             clips: t
                 .clips
                 .iter()
@@ -228,6 +235,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         app.ui_prefs.launcher_layout,
         app.ui_prefs.launcher_width,
         (area.w - app.ui_prefs.arrange_header_w).max(1.0),
+        app.song_doc.song().any_launcher_owned_row(),
     );
     let lanes_w = (area.w - app.ui_prefs.arrange_header_w - launcher_pane_w).max(1.0);
     let loop_range = app.transport.loop_region.range();
@@ -298,6 +306,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     let master_row = ArrangementMasterRow {
         automation_lanes_collapsed: !app.ui_prefs.master_row_automation_expanded,
         automation_lanes: master_row_lanes,
+        peak: {
+            let [l, r] = app.transport.master_meter.peak;
+            (l, r)
+        },
         height_px_override: None,
     };
 

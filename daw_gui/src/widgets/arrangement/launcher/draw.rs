@@ -4,10 +4,13 @@
 //! しかも走行状態 (どのセルを握っているか / 進捗) が毎フレーム変わりうるので、
 //! cache key を作るコストのほうが大きい (アレンジ本体は数千クリップなので事情が逆)。
 //!
-//! 標識 (▶ / 停止 / 録音 / 進捗) は **暗いチップ + そのチップから導いたインク**で描く。
+//! 標識 (▶ / 停止 / 録音 / 進捗) のインクは **必ず実効背景から導く**。
 //! セルの塗りはユーザー着色の可変背景なので、固定トークンを置くと必ずどちらかの
 //! 極性で沈む (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
-//! チップを 1 枚敷けば、記号のコントラストは背景に依らず [`indicator_on`] が決める。
+//! 進捗 / 数字はチップを 1 枚敷いてから ([`indicator_on`])、セルのボタン (▶ / ■ / ●) は
+//! **平常時はチップ無しで塗りの上に直接** ([`bare_indicator`] — Bitwig と同じく枠を
+//! 出さず、中身のノート / 波形をセル全幅に描く)、hover / 押下 / 点滅のときだけ
+//! チップを敷いて沈める。どちらもインクは合成後の背景から選ぶので沈まない。
 
 use super::*;
 
@@ -82,6 +85,22 @@ fn interactive_indicator(p: &Palette, bg: Color, hovered: bool, held: bool) -> I
     Indicator { chip: base.chip, eff_bg, ink: p.adapt_on(eff_bg, p.ink_for(eff_bg)) }
 }
 
+/// セルのボタン (▶ / ■ / ●) の材料。**平常時はチップを敷かない** (`chip` は透明、
+/// 実効背景 = 塗りそのもの) — 枠が無いので中身のノート / 波形がボタンの裏まで
+/// 通り、Bitwig のセルと同じ見え方になる。hover / 押下のときだけ
+/// [`interactive_indicator`] に倒してチップで沈める (押せた / 乗っているの
+/// フィードバックはチップの濃さで表す規則のまま)。
+///
+/// インクは塗りから直接 [`Palette::adapt_on`] で寄せるので、どの塗りでも沈まない
+/// (`tests::セルの標識はどの塗りの上でも読める` がチップ有り / 無しの両方を測る)。
+#[must_use]
+pub(super) fn bare_indicator(p: &Palette, bg: Color, hovered: bool, held: bool) -> Indicator {
+    if hovered || held {
+        return interactive_indicator(p, bg, hovered, held);
+    }
+    Indicator { chip: Color::TRANSPARENT, eff_bg: bg, ink: p.adapt_on(bg, p.ink_for(bg)) }
+}
+
 /// 可変背景 `bg` の上に標識を置くための材料を作る。
 ///
 /// チップ (`Palette::scrim`) を 1 枚敷いて背景を正規化し、**その合成結果から**
@@ -122,16 +141,6 @@ pub(crate) fn dispatch(
     if f.launcher.pane.w <= 0.0 {
         return;
     }
-    if f.launcher.collapsed {
-        // つかみ代だけまで畳んだ状態。格子は描かないが、**ランチャー主導の行の減光は
-        // 出す** — 帯を隠していても「この行はアレンジを鳴らしていない」は要る情報。
-        ui.heavy(("arrangement_launcher", &f.id), |hctx| {
-            chrome(hctx, f);
-            dim_launcher_rows(hctx, f);
-        });
-        return;
-    }
-    let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
     // 押下 / hover / 点滅位相は 1 度だけ解いて、全部の描画関数へ同じ値を配る。
     // hover の判定は press と **同じ `zone_at`** を通す (光る場所 = 効く場所)。
     let fb = LauncherFeedback {
@@ -142,6 +151,22 @@ pub(crate) fn dispatch(
             .playhead_beat
             .is_none_or(|b| f64::from(b).rem_euclid(1.0) < 0.5),
     };
+    if f.launcher.collapsed {
+        // つかみ代だけまで畳んだ状態。格子は描かないが、**ランチャー主導の行の減光は
+        // 出す** — 帯を隠していても「この行はアレンジを鳴らしていない」は要る情報。
+        // 同じ理由で、ランチャー主導の行があるあいだは **「アレンジへ返す」列だけ残す**
+        // (`resolve_pane_w_raw` がそのぶん帯を広げる)。減光された行を見て「なぜ鳴らない」
+        // と思ったとき、戻す手段が同じ場所に無いと帯を開くしかない。
+        ui.heavy(("arrangement_launcher", &f.id), |hctx| {
+            chrome(hctx, f);
+            dim_launcher_rows(hctx, f);
+            if f.launcher.return_col.w > 0.0 {
+                return_col_only(hctx, f, fb);
+            }
+        });
+        return;
+    }
+    let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
     let out = &mut response.launcher;
     ui.heavy(("arrangement_launcher", &f.id), |hctx| {
         chrome(hctx, f);
@@ -225,10 +250,7 @@ fn head_row(
     let stop_ind =
         interactive_indicator(p, bg, fb.hover == Some(press::Zone::GlobalStop), false);
     push_stop_glyph(hctx, square_in(stop_hit, 10.0), stop_ind);
-    let ret_hit = Rect { x: l.return_col.x, y: l.head.y, w: l.return_col.w, h: l.head.h };
-    let ret_ind =
-        interactive_indicator(p, bg, fb.hover == Some(press::Zone::GlobalReturn), false);
-    push_return_glyph(hctx, square_in(ret_hit, 12.0), ret_ind, false, f.style);
+    global_return_button(hctx, f, fb);
 
     if l.scene_head.w <= 0.0 {
         return;
@@ -435,7 +457,6 @@ fn row_buttons(
     // その場で見えないと「効いていない」としか読めない。
     let queued = f.launcher_view.queued.get(&row_key).copied();
     let stop_queued = queued.is_some_and(QueuedView::is_stop);
-    let ret_queued = queued.is_some_and(QueuedView::is_arranger);
     let stop_rect = Rect { x: l.stop_col.x, y: top, w: l.stop_col.w, h: height };
     let stop_ind = interactive_indicator(
         p,
@@ -444,20 +465,73 @@ fn row_buttons(
         stop_queued && fb.blink,
     );
     push_stop_glyph(hctx, square_in(stop_rect, 8.0), stop_ind);
-    // 「アレンジへ返す」は主導権がランチャーにある行だけ点灯する (Bitwig と同じ =
-    // 押して意味がある行が一目で分かる)。
-    let ret_rect = Rect { x: l.return_col.x, y: top, w: l.return_col.w, h: height };
-    let ret_ind = interactive_indicator(
-        p,
-        bg,
-        fb.hover == Some(press::Zone::RowReturn(row_key)),
-        ret_queued && fb.blink,
-    );
-    push_return_glyph(hctx, square_in(ret_rect, 10.0), ret_ind, view.launcher_owns(), f.style);
+    row_return_button(hctx, f, fb, row_key, top, height, view);
     // **残り拍の数字はここに出さない。** 停止列 / 返す列は 16px しか無く、
     // `2.3` (9px フォントで約 17px) が必ず切れる。数字は `row_cells` が
     // 「これから止まる当のセル」 の上に出す — 変わる対象の上に出るほうが、
     // 列の記号の下に潰れた数字を置くより読み違えが少ない。
+}
+
+/// 見出し行のグローバル「アレンジへ返す」ボタン (返す列の上端)。
+fn global_return_button(hctx: &mut HeavyCtx<'_, '_, AppData>, f: &ArrangementFrame<'_>, fb: LauncherFeedback) {
+    let l = &f.launcher;
+    let p = hctx.palette();
+    let ret_hit = Rect { x: l.return_col.x, y: l.head.y, w: l.return_col.w, h: l.head.h };
+    let ret_ind = interactive_indicator(
+        p,
+        f.style.header_bg,
+        fb.hover == Some(press::Zone::GlobalReturn),
+        false,
+    );
+    push_return_glyph(hctx, square_in(ret_hit, 12.0), ret_ind, false, f.style);
+}
+
+/// 1 行ぶんの「アレンジへ返す」ボタン。主導権がランチャーにある行だけ点灯する
+/// (Bitwig と同じ = 押して意味がある行が一目で分かる)。返す予約中は点滅。
+fn row_return_button(
+    hctx: &mut HeavyCtx<'_, '_, AppData>,
+    f: &ArrangementFrame<'_>,
+    fb: LauncherFeedback,
+    row_key: ArrangementRowKey,
+    top: f32,
+    height: f32,
+    view: &LauncherRowView,
+) {
+    let l = &f.launcher;
+    let p = hctx.palette();
+    let ret_queued =
+        f.launcher_view.queued.get(&row_key).copied().is_some_and(QueuedView::is_arranger);
+    let ret_rect = Rect { x: l.return_col.x, y: top, w: l.return_col.w, h: height };
+    let ret_ind = interactive_indicator(
+        p,
+        f.style.header_bg,
+        fb.hover == Some(press::Zone::RowReturn(row_key)),
+        ret_queued && fb.blink,
+    );
+    push_return_glyph(hctx, square_in(ret_rect, 10.0), ret_ind, view.launcher_owns(), f.style);
+}
+
+/// 畳んだ帯に残す「アレンジへ返す」列 (グローバル + 各行)。格子は無いので行の下端線と
+/// セルは描かず、押せる行 (`grid_rows` と同じ除外: マスター / 握れない行) だけ出す。
+fn return_col_only(hctx: &mut HeavyCtx<'_, '_, AppData>, f: &ArrangementFrame<'_>, fb: LauncherFeedback) {
+    global_return_button(hctx, f, fb);
+    let l = &f.launcher;
+    let band = Rect { x: l.return_col.x, y: l.grid.y, w: l.return_col.w, h: l.grid.h };
+    hctx.with_clip_rect(band, |hctx| {
+        for row in &f.rows {
+            if !layout::row_visible(f, row) {
+                continue;
+            }
+            let Some(view) = f.launcher_view.rows.get(&row.key) else {
+                continue;
+            };
+            if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID) || !view.launchable {
+                continue;
+            }
+            let top = layout::row_screen_top(f, row);
+            row_return_button(hctx, f, fb, row.key, top, row.height, view);
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -557,13 +631,13 @@ fn draw_empty_cell(
     let base = if body_hover { 0.40 } else { 0.25 };
     push_rounded(hctx, r, p.control.with_alpha(base), Color::TRANSPARENT, 0.0);
     let btn = layout::launch_button_rect(r);
-    let btn_ind = interactive_indicator(
+    let btn_ind = bare_indicator(
         p,
-        bg,
+        composite_over(p.control.with_alpha(base), bg),
         fb.hovers_cell_launch(key),
         fb.is_held(LauncherButton::Cell(key)),
     );
-    push_rounded(hctx, btn, btn_ind.chip, Color::TRANSPARENT, 2.0);
+    push_chip(hctx, btn, btn_ind);
     let s = (btn.w * 0.6).max(3.0);
     let inner = Rect { x: btn.x + (btn.w - s) * 0.5, y: btn.y + (btn.h - s) * 0.5, w: s, h: s };
     if armed {
@@ -612,12 +686,16 @@ fn draw_filled_cell(
         w: (r.w - (btn.x + btn.w + 2.0 - r.x) - 1.0).max(0.0),
         h: r.h,
     };
-    let map = cell_content_map(label, cell);
+    // 中身 (サムネイル / 波形 / MIDI / 曲線) は **セル全幅** に描く (▶ の裏まで通す)。
+    // ▶ にチップを敷かないので、中身が ▶ の右だけに寄っていると左端に不自然な
+    // 空白が残る (Bitwig のセルは ▶ の裏にもノートが見える)。縦は名前帯の下から
+    // (アレンジのクリップと同じ `clip_content_inset_top`)。
+    let map = cell_content_map(r, cell);
     // r.md #94: video / image のサムネイルはアレンジのクリップと同じ順 — fill の上、
     // muted ハッチとラベルの **下** (`draw_video_clip`)。 波形 / MIDI はハッチの上に
     // 描く (アレンジでも content パスがハッチの上に来る) ので、ハッチはこの間に挟む。
     if let (Some(thumb), Some(map)) = (cell.thumbnail, map) {
-        draw_thumbnail_tiles(hctx, label, label.intersect(f.launcher.grid), map, thumb);
+        draw_thumbnail_tiles(hctx, r, r.intersect(f.launcher.grid), map, thumb);
     }
     if cell.muted {
         push_muted_hatch(
@@ -630,7 +708,7 @@ fn draw_filled_cell(
         );
     }
     if let Some(map) = map {
-        cell_content(hctx, app, tempo_map, f, key, cell, label, map, fill);
+        cell_content(hctx, app, tempo_map, f, key, cell, r, map, fill);
     }
     let text_color = clip_text_color_for(hctx.palette(), f.style, fill, f.style.bg);
     draw_clip_label(hctx, label, &cell.name, cell.linked, text_color, f.style);
@@ -642,7 +720,7 @@ fn draw_filled_cell(
     // そちらは数字だけ出して行の停止 / 返すボタン側を点滅させる。
     let blink_queued =
         d.queued.is_some_and(|q| !q.is_stop() && !q.is_arranger()) && fb.blink;
-    let ind = interactive_indicator(
+    let ind = bare_indicator(
         hctx.palette(),
         fill,
         fb.hovers_cell_launch(key),
@@ -871,7 +949,7 @@ fn draw_group_cell(
     // 画面が 1px も変わらなかった (量子化 1 小節なら最大 1 小節「押せていない」
     // ようにしか見えず、連打で二重発火する)。ボタンは通常セルと同じ ▶ 矩形
     // (`zone_at` が `launch_button_rect` で本体と分ける) なので判定は `CellLaunch(key)`。
-    let ind = interactive_indicator(
+    let ind = bare_indicator(
         hctx.palette(),
         base,
         fb.hovers_cell_launch(key),
@@ -917,7 +995,14 @@ fn push_rounded(
     });
 }
 
-/// ▶ (発火)。`striped` でチップに斜線を重ねる = フォローアクションが設定されている印
+/// 標識のチップ。透明 ([`bare_indicator`] の平常時) なら何も積まない。
+fn push_chip(hctx: &mut HeavyCtx<'_, '_, AppData>, btn: Rect, ind: Indicator) {
+    if ind.chip.a > 0.0 {
+        push_rounded(hctx, btn, ind.chip, Color::TRANSPARENT, 2.0);
+    }
+}
+
+/// ▶ (発火)。`striped` でボタン矩形に斜線を重ねる = フォローアクションが設定されている印
 /// (Live と同じ視覚言語)。
 fn push_launch_glyph(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
@@ -925,7 +1010,7 @@ fn push_launch_glyph(
     ind: Indicator,
     striped: bool,
 ) {
-    push_rounded(hctx, btn, ind.chip, Color::TRANSPARENT, 2.0);
+    push_chip(hctx, btn, ind);
     if striped {
         push_muted_hatch(hctx, btn, btn, ind.ink.with_alpha(0.55), 3.0, 1.0);
     }

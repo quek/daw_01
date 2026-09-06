@@ -330,10 +330,11 @@ impl<'a, M: ?Sized + 'static> TimeGridExt for Ui<'a, M> {
                 let local_x = viewport.unit_to_px(s, rect.w);
                 let x = rect.x + local_x;
                 let label = match mapping.display {
-                    TimeDisplay::BarBeat => {
-                        let (bar_num, _beat) = mapping.samples_to_bar_beat(s);
-                        format!("{bar_num}")
-                    }
+                    // 小節番号は **整数の bar index から直接** (1-based)。以前は
+                    // `s` (= bar × samples_per_bar) を `samples_to_bar_beat` で
+                    // 割り戻していたが、テンポによっては 3.9999… → floor → 3 と
+                    // 1 つ手前の番号になり、「1 2 3 3 5 6 6 8」と重複して見えていた。
+                    TimeDisplay::BarBeat => format!("{}", bar + 1),
                     _ => mapping.format(s),
                 };
                 ui.push_text(GlyphArea {

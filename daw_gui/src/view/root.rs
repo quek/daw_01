@@ -761,6 +761,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::CycleArrangeFollow);
         }));
     }
+    // Alt+A: 全オートメーションレーンの表示 / 非表示 (トランスポートの A ボタンと同じ)。
+    if ui.take_shortcut("daw.toggle_automation_lanes") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleAllAutomationLanesVisible);
+        }));
+    }
 
     // トラック copy/cut の非同期結果 (plugin state 収集後) を OS clipboard へ flush。
     if let Some(text) = app.ui_ephemeral.pending_clipboard_write.clone() {
@@ -786,6 +792,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.delete_current_surface(is_pianoroll_active);
         }));
     }
+    clipboard_ops::dispatch_time_shortcuts(ui);
 
     // ----- Grid snap / fit -----
     // active view 判定は上で算出した `is_pianoroll_active` を共有する

@@ -4,8 +4,91 @@
 
 use super::*;
 
+use daw_ui_core::{LevelMeterStyle, MeterBallistic};
+
 use crate::color_target::ColorPickerTarget;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
+
+/// ヘッダ右端の縦 L/R レベルメーター (通常 track / master 行の両方)。
+///
+/// **写像はミキサーのフェーダー / メーターと同じ `MeterScale::default()` のカーブ**
+/// (`scale_marks = false` で目盛りだけ省く) なので、 volume band の fill 位置と同じ
+/// dB が同じ高さに出る。 0dB の位置は `reference_db` の 1px 線で示す (7px 幅では数字を
+/// 置けないので、 線 1 本が「ここが 0」の唯一の手掛かり)。 弾道は widget の Peak
+/// (peak hold 付き)。
+fn draw_header_meter(ui: &mut Ui<'_, AppData>, t: &ArrangementTrack, meter: Rect) {
+    if meter.w < 3.0 || meter.h < 6.0 {
+        return;
+    }
+    let p = ui.palette();
+    let style = LevelMeterStyle {
+        scale: Some(MeterScale::default()),
+        scale_marks: false,
+        reference_db: Some(0.0),
+        reference_color: p.text,
+        ..LevelMeterStyle::from_palette(p)
+    };
+    ui.level_meter_stereo(("arr_thmeter", t.id), meter, t.peak.0, t.peak.1, MeterBallistic::Peak, style);
+}
+
+/// volume band の 0dB 目印。 band を縦に横切る 1px 線を、 band より上下 1px ずつ長く引く
+/// (fill / 溝のどちらの上でも「目盛り」と読めるように、 band の外へ少しはみ出させる)。
+/// 位置は fill と同じ `MeterScale::default()` の写像 (= drag の `frac_to_amp` と同じ曲線)。
+fn draw_volume_band_zero_mark(ui: &mut Ui<'_, AppData>, track_id: u32, band: Rect, style: &ArrangementStyle) {
+    let x = (band.x + band.w * MeterScale::default().db_to_frac(0.0)).round();
+    ui.panel(
+        ("arr_tvol_zero", track_id),
+        Rect { x, y: band.y - 1.0, w: 1.0, h: band.h + 2.0 },
+        style.track_volume_band_zero,
+        0.0,
+    );
+}
+
+/// volume band を drag している間だけ出す dB 読み出し (fill の先端の真上に小さなチップ)。
+///
+/// band には数字を置く高さが無いので、 mixer のフェーダーのように「今いくつか」が
+/// 見えない。 drag 中だけ、 fill の先端に追従する小さなチップに `+0.0 dB` 形式で出す
+/// (Live の track header ボリュームの drag 中表示と同じ)。 チップは行の中に clamp する。
+fn draw_volume_band_readout(ui: &mut Ui<'_, AppData>, row: Rect, band: Rect, frac: f32) {
+    const FONT: f32 = 10.0;
+    let db = MeterScale::default().frac_to_db(frac.clamp(0.0, 1.0));
+    let text: Arc<str> = if db.is_finite() && db > -60.0 {
+        Arc::from(format!("{db:+.1} dB"))
+    } else {
+        Arc::from("-inf dB")
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let w = text.chars().count() as f32 * FONT * 0.62 + 6.0;
+    let h = FONT * 1.3 + 2.0;
+    let tip_x = band.x + band.w * frac.clamp(0.0, 1.0);
+    let chip = Rect {
+        x: (tip_x - w * 0.5).clamp(row.x, (row.x + row.w - w).max(row.x)),
+        y: (band.y - h - 2.0).max(row.y),
+        w,
+        h,
+    };
+    let p = ui.palette();
+    let (bg, fg) = (p.inset_bg, p.text);
+    let border = p.border;
+    ui.push_rect(RectCommand {
+        rect: chip,
+        fill: bg,
+        border,
+        border_width: 1.0,
+        radius: [2.0; 4],
+        clip_rect: Some(row),
+    });
+    ui.push_text(GlyphArea {
+        text,
+        left: chip.x + 3.0,
+        top: chip.y + 1.0,
+        font_size: FONT,
+        line_height: FONT * 1.3,
+        color: fg,
+        clip_rect: Some(chip),
+        ..GlyphArea::default()
+    });
+}
 
 /// この 1 フレームで検出した header の click (loop 内で `push_edit` すると複数発行に
 /// なるため、 loop 後に 1 度だけ発行する — 旧 `clicked_track_for_select` /
@@ -102,6 +185,7 @@ fn draw_rows_inner(
             let row_for_layout =
                 Rect { x: row.x + indent, y: row.y, w: (row.w - indent).max(2.0), h: row.h };
             let layout = header_row_layout(row_for_layout, 0.0); // volume band 無し
+            draw_header_meter(ui, t, layout.meter_rect);
             // "Master" label を name_rect に push_text (button にはしない = click は selection 経路に
             // 流さない)。 font_size は style.master_row_label_size、 色は master_row_label_color。
             let label_rect = layout.name_rect;
@@ -211,6 +295,7 @@ fn draw_rows_inner(
         let layout = header_row_layout(row_for_layout, band_h);
         let name_rect = layout.name_rect;
         let [m_rect, s_rect, r_rect] = layout.buttons;
+        draw_header_meter(ui, t, layout.meter_rect);
 
         // M10 Phase 47b: track volume band 描画。
         // drag 中の track はその drag session の last_mouse_x で preview volume を計算 (リアルタイム feedback)。
@@ -232,6 +317,10 @@ fn draw_rows_inner(
                     style.track_volume_band_fill,
                     0.0,
                 );
+            }
+            draw_volume_band_zero_mark(ui, t.id, band, style);
+            if dragging_this.is_some() {
+                draw_volume_band_readout(ui, row, band, display_v);
             }
         }
 

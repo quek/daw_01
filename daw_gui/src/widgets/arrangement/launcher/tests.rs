@@ -106,6 +106,27 @@ fn 帯は停止列とセル格子と返す列にちょうど分かれる() {
     // つかみ代だけまで畳んだら「格子は描けない」と判定される。
     let collapsed = layout::split(rect, 160.0, GRAB_W, 38.0, 38.0, 562.0, &view);
     assert!(collapsed.collapsed, "つかみ代だけの幅では格子を描けない");
+    assert!(collapsed.return_col.w <= 0.0, "全行アレンジなら畳んだ帯に返す列は無い");
+}
+
+/// 「アレンジのみ」でもランチャー主導の行があれば **「アレンジへ返す」列だけ残る**
+/// (帯を隠したままアレンジが鳴らない理由と戻す手段を画面に残す)。格子は畳まれたまま、
+/// 停止列は出ない (返す列を先に確保する `split` の順序)。
+#[test]
+fn アレンジのみでもランチャー主導の行があれば返す列が残る() {
+    let rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
+    let avail = rect.w - 160.0;
+    let view = view_with_scenes(2);
+    let pane_w = layout::resolve_pane_w_raw(LauncherLayout::ArrangerOnly, 0.0, avail, true);
+    assert!((pane_w - (GRAB_W + RETURN_COL_W)).abs() < 1e-3, "pane_w={pane_w}");
+    let r = layout::split(rect, 160.0, pane_w, 38.0, 38.0, 562.0, &view);
+    assert!(r.collapsed, "格子は畳まれたまま");
+    assert!((r.return_col.w - RETURN_COL_W).abs() < 1e-3, "返す列が {}px", r.return_col.w);
+    assert!(r.stop_col.w <= 0.0, "停止列は出ない");
+    // 返す列はスプリッタのつかみ代 (帯の右端 PANE_SPLITTER_HANDLE px) と重ならない。
+    assert!(r.return_col.x + r.return_col.w <= r.pane.x + r.pane.w - PANE_SPLITTER_HANDLE + 1e-3);
+    let none = layout::resolve_pane_w_raw(LauncherLayout::ArrangerOnly, 0.0, avail, false);
+    assert!((none - GRAB_W).abs() < 1e-3, "全行アレンジならつかみ代だけ");
 }
 
 /// **「両方」レイアウトは必ず格子を描ける** (計画書 Q5-b の「比率を覚えている」が
@@ -124,7 +145,7 @@ fn 両方レイアウトの帯幅は必ず格子を描ける() {
     let view = view_with_scenes(2);
     // 記憶が壊れた値 (負 / 0 / 吸着直前の幅 / 画面より広い) も含める。
     for w in [-10.0_f32, 0.0, 1.0, GRAB_W, GRAB_W + 1.0, 40.0, 300.0, 5_000.0] {
-        let pane_w = layout::resolve_pane_w_raw(LauncherLayout::Both, w, avail);
+        let pane_w = layout::resolve_pane_w_raw(LauncherLayout::Both, w, avail, false);
         let r = layout::split(rect, header_w, pane_w, 38.0, 38.0, 562.0, &view);
         assert!(!r.collapsed, "覚えた幅 {w} で「両方」が畳まれている (pane_w={pane_w})");
         assert!(
@@ -175,6 +196,7 @@ fn 帯の行とアレンジの行は同じ縦位置に並ぶ() {
         armed: false,
         clips: Vec::new(),
         volume: 1.0,
+        peak: (0.0, 0.0),
         parent_id: None,
         depth: 0,
         collapsed: false,
@@ -267,6 +289,7 @@ fn グループ行のまとめセルは子行へ展開される() {
         armed: false,
         clips: Vec::new(),
         volume: 1.0,
+        peak: (0.0, 0.0),
         parent_id: None,
         depth: 0,
         collapsed: false,
@@ -377,12 +400,18 @@ fn セルの標識はどの塗りの上でも読める() {
     const MIN: f32 = 3.0;
     let p = Palette::dark();
     for (name, bg) in cell_backgrounds() {
-        let ind = draw::indicator_on(&p, bg);
-        let ratio = contrast_ratio(ind.ink, ind.eff_bg);
-        assert!(
-            ratio >= MIN,
-            "▶ / 停止 / 録音 の記号が「{name}」の上で読めない: {ratio:.2}:1 (最低 {MIN}:1)"
-        );
+        // チップ有り (進捗 / 数字 / hover 中のボタン) と、チップ無し (平常時のセルの
+        // ボタン = 塗りの上に直置き) の両方。
+        for (kind, ind) in [
+            ("チップ有り", draw::indicator_on(&p, bg)),
+            ("チップ無し", draw::bare_indicator(&p, bg, false, false)),
+        ] {
+            let ratio = contrast_ratio(ind.ink, ind.eff_bg);
+            assert!(
+                ratio >= MIN,
+                "▶ / 停止 / 録音 の記号 ({kind}) が「{name}」の上で読めない: {ratio:.2}:1 (最低 {MIN}:1)"
+            );
+        }
     }
 }
 

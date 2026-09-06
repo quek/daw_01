@@ -106,6 +106,7 @@
             armed: false,
             clips,
             volume: 1.0,
+            peak: (0.0, 0.0),
             parent_id: None,
             depth: 0,
             automation_lanes_collapsed: true,
@@ -699,6 +700,7 @@
             armed: false,
             clips: Vec::new(),
             volume: 1.0,
+            peak: (0.0, 0.0),
             parent_id: None,
             depth: 0,
             collapsed: false,
@@ -1070,6 +1072,25 @@
         let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 };
         let layout = header_row_layout(row, 0.0);
         assert!(layout.volume_band.is_none(), "band_h=0 で disable");
+    }
+
+    /// ヘッダ右端のレベルメーターは行高 / ヘッダ幅に関係なく常に確保され、 名前帯・M/S/R・
+    /// lane disclosure・volume band のどれとも重ならない (右端を先に切り出して残りを配る)。
+    #[test]
+    fn header_row_layout_reserves_meter_at_right_edge_without_overlap() {
+        for (w, h) in [(200.0, 32.0), (200.0, 48.0), (60.0, 32.0), (30.0, 20.0)] {
+            let row = Rect { x: 10.0, y: 0.0, w, h };
+            let layout = header_row_layout(row, 4.0);
+            let m = layout.meter_rect;
+            assert!(m.w > 0.0 && m.h > 0.0, "{w}x{h}: メーターが無い");
+            assert!((m.x + m.w - (row.x + row.w - 4.0)).abs() < 1e-3, "{w}x{h}: 右端 pad に接していない");
+            let mut others = vec![layout.name_rect, layout.lane_disc_rect];
+            others.extend(layout.buttons);
+            others.extend(layout.volume_band);
+            for o in others.into_iter().filter(|o| o.w > 0.0) {
+                assert!(o.x + o.w <= m.x + 1e-3, "{w}x{h}: {o:?} がメーター {m:?} と重なる");
+            }
+        }
     }
 
     // -------- M13 Phase 55: ruler / time_sig 対応 grid の確認 --------
@@ -1547,6 +1568,7 @@
             armed: false,
             clips: Vec::new(),
             volume: 1.0,
+            peak: (0.0, 0.0),
             parent_id,
             depth,
             collapsed,

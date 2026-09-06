@@ -321,6 +321,10 @@ pub struct ArrangementTrack {
     /// track header rect 内 buttons の下に horizontal slider band として描画される (`row_h` 余裕がある時のみ)。
     /// 将来 `ClipView.volume` を再導入する場合は `effective = track.volume * clip.volume` の乗算 (DAW 標準)。
     pub volume: f32,
+    /// ヘッダ右端の L/R レベルメーターに出す現在値 (線形振幅、 `0.0..`)。 caller が telemetry
+    /// tick ごとに `track_peak_display` から写す (mixer strip の `peak_l_raw` / `peak_r_raw` と
+    /// 同じ値 = 同じ音が 2 つの面で同じ高さに出る)。 弾道 (peak hold) は widget 側。
+    pub peak: (f32, f32),
     /// M14 Phase 63c (#016): 親 track の id (`None` で top-level)。 「ある track が group として
     /// 振る舞う条件」 は **他の track の `parent_id` がこの id を指す** こと (= 子を持つ track が group)。
     /// caller 側は parent_id を model に持つだけ (Reaper folder / Live group と整合)、 widget は逆引きで
@@ -543,6 +547,8 @@ pub struct ArrangementMasterRow {
     /// 何を意味するかを管理)。 各 lane の `AutomationLaneKey { track: MASTER_TRACK_ID, lane: lane.id }`
     /// で EditRequest を発火する。
     pub automation_lanes: Vec<ArrangementAutomationLane>,
+    /// master 出力の L/R レベル (線形振幅)。 通常 track の `ArrangementTrack::peak` と同じ意味。
+    pub peak: (f32, f32),
     /// row 高さの override (= `Some(px)` で固定、 None で global default = `view.track_row_h`)。
     /// 通常 track の `row_h: Option<u16>` (Phase 63n-6) と完全同 idiom。 expanded 時の総高さは
     /// `effective_h + Σ visible_lane.height_px`、 collapsed 時は `effective_h` のみ
@@ -1082,6 +1088,9 @@ pub struct ArrangementStyle {
     pub track_volume_band_track: Color,
     /// volume band の fill (volume 値表示) 色。
     pub track_volume_band_fill: Color,
+    /// volume band の 0dB 目印 (band を縦に横切る 1px 線) の色。 fill と溝の両方から
+    /// 立つ色にする (0dB より上では fill の上、 下では溝の上に乗る)。
+    pub track_volume_band_zero: Color,
     /// M13 Phase 55: ruler の小節番号テキスト色 (`time_ruler` 内の label_color にマップ)。
     pub ruler_label_color: Color,
     /// M14 Phase 63c (#016): group hierarchy で 1 段ネストするごとに track header を右にずらす量 (px)。
@@ -1372,6 +1381,7 @@ impl ArrangementStyle {
             // (fill = accent との明度差がどちらのテーマでも保たれる)。
             track_volume_band_track: p.scrim.with_alpha(0.45),
             track_volume_band_fill: p.accent,
+            track_volume_band_zero: p.text,
             ruler_label_color: p.text_dim,
             indent_px: 16.0,
             disclosure_color: p.text_dim,
@@ -1575,6 +1585,7 @@ fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
         kind: TrackKind::Audio,
         clips: Vec::new(),
         volume: 1.0,
+        peak: master.peak,
         parent_id: None,
         depth: 0,
         collapsed: false,

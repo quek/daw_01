@@ -46,8 +46,26 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
     if layout::pane_splitter_at(f, x, y) {
         return Some(Zone::PaneSplitter);
     }
-    if !f.launcher.pane.contains(x, y) || f.launcher.collapsed {
+    if !f.launcher.pane.contains(x, y) {
         return None;
+    }
+    if f.launcher.collapsed {
+        // 畳んだ帯には「アレンジへ返す」列しか無い (`draw::return_col_only` と同じ
+        // 行の除外)。列が無い (= 全行アレンジ) なら幅 0 で `contains` が false。
+        let l = &f.launcher;
+        if !l.return_col.contains(x, y) {
+            return None;
+        }
+        if y < l.head.y + l.head.h {
+            return Some(Zone::GlobalReturn);
+        }
+        let row = layout::row_at_y(f, y)?;
+        if row.key == ArrangementRowKey::Track(MASTER_TRACK_ID)
+            || !f.launcher_view.rows.get(&row.key).is_some_and(|r| r.launchable)
+        {
+            return None;
+        }
+        return Some(Zone::RowReturn(row.key));
     }
     if let Some(i) = layout::col_splitter_at(f, x, y) {
         return Some(Zone::ColSplitter(i));

@@ -64,6 +64,10 @@ pub enum ClipboardPayload {
     LauncherCells(Vec<LauncherCellCopy>),
     /// r.md #71 (プラグインのコピー / 移動): チェーンから選んだプラグイン。
     Devices(Vec<DeviceCopy>),
+    /// Live §6.11 "Cut Time": 全トラック縦断の **時間ごと** の写し (`docs/plan_time_ops.md`)。
+    /// `Clips` (選んだ行だけ、貼り先はポインタ下) と違い、貼り先は範囲選択の先頭で、
+    /// 貼るときに `span_beats` の時間を差し込んでから元のトラック / レーンへ戻す。
+    Time(common::model::TimeRangeCopy),
 }
 
 /// 正規化済み device。`order` は選択群内の相対順 (上から 0,1,2...) で、貼り付けで

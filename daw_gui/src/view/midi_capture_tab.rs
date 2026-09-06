@@ -55,7 +55,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         radius: [3.0; 4],
         clip_rect: None,
     });
-    draw_bar_lines(app, ui, grid, |ns| axis.ns_to_x(ns), &wall_bar_source(app));
+    draw_bar_lines(
+        app,
+        ui,
+        grid,
+        |ns| axis.ns_to_x(ns),
+        // MIDI Capture はスクロール表示 (右端 = 今) なので区間は折り返さない。
+        |s, e| [Some((axis.ns_to_x(s), axis.ns_to_x(e))), None],
+        &wall_bar_source(app),
+    );
     draw_seconds_ruler(
         app,
         ui,

@@ -32,6 +32,11 @@ impl AppData {
             E::SetSeconds { seconds, commit } => self.set_sampler_seconds(seconds, commit),
             E::TogglePaused => self.toggle_sampler_paused(),
             E::SetSelection(sel) => self.set_sampler_selection(sel),
+            E::ShiftSweep(delta) => {
+                if delta.is_finite() {
+                    self.sampler.sweep_shift = (self.sampler.sweep_shift + delta).rem_euclid(1.0);
+                }
+            }
             E::TogglePreview => self.toggle_sampler_preview(),
             E::Drop { start_frame, end_frame, target, target_beat } => {
                 self.sampler_drop(start_frame, end_frame, target, target_beat);
