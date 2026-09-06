@@ -957,14 +957,16 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // ----- r.md #67: カーソルキーでノートを移動 / 伸縮 / 音程変更 -----
     dispatch_note_nudge(ui, surface);
 
-    // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09) -----
+    // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09 / 段階拡大 2026-09-06) -----
     // マウス位置で対象を判定する (選択前なので Delete の「非空セット」判定は
     // 使えず pointer 位置で振り分け)。 下部パネル + audio editor 開: 全 event、
-    // 下部パネル + piano roll: 全ノート、 それ以外 (アレンジ): 全クリップ。
-    // (automation lane 上の「全ポイント → 全クリップ」段階拡大は後続で追加。)
+    // 下部パネル + piano roll: 全ノート、 それ以外 (アレンジ): 段階拡大。
+    //   トラック行上:      そのトラック (行 + 全 lane) → 全トラック
+    //   automation lane 上: 点 → lane のクリップ → そのトラック → 全トラック
+    // 「そのトラック」 はマウス下の行、行の外ならカーソルトラック (選択末尾)。
     if ui.take_shortcut("select_all") {
         // 帯が今の操作対象なら **ランチャーのセルを全選択**する。落とすと
-        // `SelectAllClips` に流れて曲全体の範囲が張られ、面が黙って範囲へ移る
+        // `SelectAllArrangement` に流れてアレンジの範囲が張られ、面が黙って範囲へ移る
         // (画面は変わらないのに、次の Delete がアレンジの全クリップを消す)。
         if crate::view::launcher_keys::select_all_cells_if_launcher(app, ui, surface) {
             // 帯が取った (選択は helper が積む)。
@@ -979,10 +981,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.select_all_shown_notes();
             }));
         } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
-            // automation lane 上: 段階拡大 (#071 で clip 段を追加)。
+            // automation lane 上: 段階拡大。
             //   1 回目 = lane の全ポイント
             //   2 回目 (全ポイント選択済 or ポイント無し) = lane の全 automation clip
-            //   3 回目 (全 clip 選択済 or clip 無し)     = 曲全体の全 (通常) クリップ
+            //   3 回目以降 (全 clip 選択済 or clip 無し) = そのトラック → 全トラック
+            //   (`select_all_arrangement` が範囲の一致で段を決める)
             // tier2 で点とクリップが両方選択された状態になるが、 直近選択 (= clip) が
             // last-wins で copy/cut/delete の対象になる (edit_surface 参照)。
             let all_points = app.all_automation_points_in_lane(lane);
@@ -1017,14 +1020,16 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                         });
                     }));
                 } else {
-                    ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                        app.handle_event(AppEvent::SelectAllClips);
+                    let track = Some(lane.track);
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SelectAllArrangement { track });
                     }));
                 }
             }
         } else {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::SelectAllClips);
+            let track = app.ui_ephemeral.arrange_hovered_track.or_else(|| app.cursor_track_id());
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SelectAllArrangement { track });
             }));
         }
     }

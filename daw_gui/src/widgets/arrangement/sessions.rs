@@ -47,6 +47,10 @@ pub(super) struct ReleasedSessions {
     pub range_drag: Option<RangeDragSession>,
     /// 短クリックに格下げされた clip drag の `(last_mouse, last_ctrl, last_shift)`。
     pub clip_short_click_pos: Option<((f32, f32), bool, bool)>,
+    /// automation クリップの名前帯から始めた範囲移動が短クリックに格下げされたときの
+    /// `(掴んだクリップ, last_shift, last_ctrl)`。 格下げ先は automation クリップの選択
+    /// (単独 drag の demote と同じ経路) で、 `clip_short_click_pos` とは排他。
+    pub automation_short_click: Option<(AutomationClipKey, bool, bool)>,
     pub audio_drag: Option<AudioDragSession>,
     pub point_drag: Option<AutomationPointDragSession>,
     pub automation_clip_drag: Option<AutomationClipDragSession>,
@@ -111,7 +115,12 @@ pub(super) fn take(
         let is_move = matches!(nd.kind, ClipDragKind::Move);
         let demote = is_move && !nd.last_alt && dist < CLIP_CLICK_DRAG_SLOP_PX;
         if demote {
-            released.clip_short_click_pos = Some((nd.last_mouse, nd.last_ctrl, nd.last_shift));
+            if let Some(key) = nd.origin_automation {
+                released.automation_short_click = Some((key, nd.last_shift, nd.last_ctrl));
+            } else {
+                released.clip_short_click_pos =
+                    Some((nd.last_mouse, nd.last_ctrl, nd.last_shift));
+            }
         } else {
             released.clip_drag = Some(nd);
         }

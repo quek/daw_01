@@ -110,13 +110,13 @@ pub(crate) fn dispatch_launcher_keys(
 /// `Ctrl+A` (既存 name = `select_all`) をランチャーが取るか。取ったら
 /// **帯のセルを全部選択**して `true` を返す (呼び側は従来の文脈別全選択へ落とさない)。
 ///
-/// これが無いと帯の上での `Ctrl+A` が `SelectAllClips` に落ち、曲全体 × 全トラックの
+/// これが無いと帯の上での `Ctrl+A` が `SelectAllArrangement` に落ち、アレンジの
 /// 時間範囲が張られて `last_edit_select` が範囲面へ移る — 画面上は何も変わらないのに
 /// **次の `Delete` がアレンジの全クリップを消す**。
 ///
 /// 対象は曲の **全行** (トラック行 + オートメーションレーン行) のセル全部。
 /// 表示の折りたたみを見ないのはアレンジ側の全選択
-/// (`select_all_clips` が `song.tracks` を全部見る) と同じ規約。
+/// (`select_all_arrangement` が閉じた lane も含めて見る) と同じ規約。
 ///
 /// レーン行のセルを混ぜられるのは、セル面が
 /// [`EditSurface::LauncherCells`] 1 面 1 集合になったから — 面が 2 つに割れて
@@ -130,8 +130,8 @@ pub(crate) fn select_all_cells_if_launcher(
     // **ここだけポインタが先**。`Ctrl+A` は選択を*作る*操作なので、既存の文脈別
     // 全選択と同じく「いまどこを指しているか」が文脈 (選択前なので非空集合では
     // 振り分けられない、`root.rs` の `select_all` の doc)。 last-wins だけで判定
-    // すると、帯にポインタを置いたままの `Ctrl+A` が `SelectAllClips` に落ちて
-    // 曲全体 × 全トラックの範囲が張られ、面が黙って範囲へ移る (画面は変わらない
+    // すると、帯にポインタを置いたままの `Ctrl+A` が `SelectAllArrangement` に落ちて
+    // アレンジの範囲が張られ、面が黙って範囲へ移る (画面は変わらない
     // のに、続く `Delete` がアレンジの全クリップを消す)。
     if app.launcher.hover.is_none() && !launcher_owns_surface(surface) {
         return false;

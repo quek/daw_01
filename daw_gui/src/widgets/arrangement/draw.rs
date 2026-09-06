@@ -2041,6 +2041,85 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     }
 }
 
+/// 範囲移動のゴーストのうち **automation クリップの断片** (`docs/plan_range_selection.md` §6)。
+///
+/// `draw_drag_preview` (トラック行のクリップ断片) と対で、Move のときだけ呼ぶ。
+/// 断片は press 時に確定した `automation_anchors` で、commit (`move_time_range`) が
+/// 動かすものと同じ:
+/// - 明示 lane 行の断片は横だけ動く (縦の track_delta に関与しない)。
+/// - 追従 (`follow`) の断片は**同じトラックへ置くときだけ**動くので、縦に動かしている
+///   間 (`track_delta != 0`) は描かない — commit でも動かないから。
+///
+/// 行は `rows` (このフレームに積んだ行) から引くので、閉じている lane の断片は描かれない
+/// (commit では動く。見えない行のものは見えないままでよい)。
+/// 塗りは automation クリップ単独 drag のゴーストと同じ (選択色 / clone 色 + badge)。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_automation_drag_preview<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    nd: &ClipDragSession,
+    rows: &[ArrangementRow],
+    view: ArrangementView,
+    lanes: Rect,
+    style: &ArrangementStyle,
+    beat_delta: f64,
+    track_delta: i32,
+) {
+    if !matches!(nd.kind, ClipDragKind::Move) {
+        return;
+    }
+    let is_move_clone = nd.last_ctrl;
+    let (fill, border, badge_glyph) = if is_move_clone {
+        if nd.last_shift {
+            (style.clip_clone_indep_fill, style.clip_clone_indep_border, Some('+'))
+        } else {
+            (style.clip_clone_linked_fill, style.clip_clone_linked_border, Some('⇌'))
+        }
+    } else {
+        (style.clip_selected_fill, style.clip_selected_border, None)
+    };
+    for a in &nd.automation_anchors {
+        if a.follow && track_delta != 0 {
+            continue;
+        }
+        let lane_key = common::model::AutomationLaneKey { track: a.key.track, lane: a.key.lane };
+        let Some(row) = rows.iter().find(|r| r.key == ArrangementRowKey::Lane(lane_key)) else {
+            continue;
+        };
+        let top = lanes.y - view.track_top + row.content_top;
+        let body = Rect { x: lanes.x, y: top, w: lanes.w, h: row.height };
+        // 曲頭より前へは出ない (`drag_preview_geometry` の Move と同じ clamp)。
+        let start = (a.start_beat + beat_delta).max(0.0);
+        let ghost_rect = automation_clip_rect(body, view, start, a.len_beats, style);
+        if ghost_rect.x + ghost_rect.w < lanes.x || ghost_rect.x > lanes.x + lanes.w {
+            continue;
+        }
+        hctx.push_rect(RectCommand {
+            rect: ghost_rect,
+            fill,
+            border,
+            border_width: style.clip_selected_border_w,
+            radius: [style.clip_radius; 4],
+            clip_rect: Some(lanes),
+        });
+        if let Some(g) = badge_glyph
+            && ghost_rect.w > style.clip_clone_badge_size + 4.0
+            && ghost_rect.h > style.clip_clone_badge_size + 2.0
+        {
+            let badge_ink = clip_ink_for(hctx.palette(), fill, style.bg);
+            hctx.push_text(GlyphArea {
+                text: Arc::from(g.to_string()),
+                left: ghost_rect.x + 4.0,
+                top: ghost_rect.y + 2.0,
+                font_size: style.clip_clone_badge_size,
+                line_height: style.clip_clone_badge_size * 1.2,
+                color: badge_ink,
+                clip_rect: Some(ghost_rect),
+                ..GlyphArea::default()
+            });
+        }
+    }
+}
+
 /// **時間範囲の帯**を描く (`docs/plan_range_selection.md` §5)。
 ///
 /// 半透明の明色で塗り、左右端に縦線を引く。**クリップの上に重ねる**ので、

@@ -150,67 +150,173 @@ pub(super) fn clip_zone(
             sel.has_lane(common::model::LaneRef::Track(hit_key.track_id))
                 && clip_span(f, hit_key).is_some_and(|(s, e)| sel.intersects(s, e - s))
         });
-        let (ra, rb) = match live_range {
-            Some(sel) => (sel.start_beat, sel.end_beat),
-            None => clip_span(f, hit_key).unwrap_or((0.0, 0.0)),
-        };
-        let mut anchors: Vec<ClipDragAnchor> = Vec::new();
         if matches!(kind, ClipDragKind::Move) {
-            // 範囲が掛かっているトラック行のクリップを、範囲で切った断片として拾う。
-            // ゴーストが「確定後に動くもの」そのものになる。
+            let (ra, rb) = match live_range {
+                Some(sel) => (sel.start_beat, sel.end_beat),
+                None => clip_span(f, hit_key).unwrap_or((0.0, 0.0)),
+            };
             let tracks: Vec<u32> = match live_range {
                 Some(sel) => sel.track_row_ids().collect(),
                 None => vec![hit_key.track_id],
             };
-            for (t_idx, t) in f.visible_tracks.iter().enumerate() {
-                if !tracks.contains(&t.id) {
-                    continue;
-                }
-                for c in &t.clips {
-                    let (s, e) = (c.start_beat, c.start_beat + c.len_beats);
-                    let (cs, ce) = (s.max(ra), e.min(rb));
-                    if ce - cs <= 1e-9 {
-                        continue;
-                    }
-                    anchors.push(ClipDragAnchor {
-                        key: ClipKey { track_id: t.id, clip_id: c.id },
-                        start_beat: cs,
-                        len_beats: ce - cs,
-                        track_index: t_idx,
-                    });
-                }
+            if start_range_move(ui, f, live_range, (ra, rb), &tracks, (px, py), None) {
+                claim.session = true;
             }
-        } else if let Some((t_idx, t)) =
+            return;
+        }
+        let Some((t_idx, t)) =
             f.visible_tracks.iter().enumerate().find(|(_, t)| t.id == hit_key.track_id)
-            && let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip_id)
-        {
-            // visible_tracks の visible-idx を anchor.track_index に保存 (release frame の
-            // delta 計算 + draw_drag_preview の new_idx も同じ visible-idx で動く)。
+        else {
+            return;
+        };
+        let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip_id) else {
+            return;
+        };
+        // visible_tracks の visible-idx を anchor.track_index に保存 (release frame の
+        // delta 計算 + draw_drag_preview の new_idx も同じ visible-idx で動く)。
+        let anchors = vec![ClipDragAnchor {
+            key: hit_key,
+            start_beat: c.start_beat,
+            len_beats: c.len_beats,
+            track_index: t_idx,
+        }];
+        let state: &mut ArrangementState = ui.widget_state(f.wid);
+        state.clip_drag = Some(ClipDragSession {
+            kind,
+            anchor_mouse: (px, py),
+            last_mouse: (px, py),
+            last_alt: f.pointer.modifiers.alt,
+            last_ctrl: f.pointer.modifiers.ctrl,
+            last_shift: f.pointer.modifiers.shift,
+            move_range: (c.start_beat, c.start_beat + c.len_beats),
+            anchors,
+            track_rows: Vec::new(),
+            automation_anchors: Vec::new(),
+            origin_automation: None,
+        });
+        claim.session = true;
+    }
+}
+
+/// **範囲移動の drag session を張る唯一の口** (`docs/plan_range_selection.md` §6)。
+///
+/// MIDI / audio クリップのヘッダと、範囲に入っている automation クリップの名前帯の
+/// **両方**がここへ来る — 動かすのは常に範囲 `[ra, rb)` × `tracks` (+ そこに掛かる
+/// automation lane) で、どこを掴んだかは短 click の格下げ先 (`origin_automation`) にしか
+/// 効かない。 ゴーストは「確定後に動くもの」 そのもの = 範囲で切ったクリップ断片
+/// (トラック行) と automation クリップ断片 (明示 lane 行 + 追従 lane) を積む。
+///
+/// 動くものが 1 つも無ければ session を張らず `false`。
+#[allow(clippy::too_many_arguments)]
+fn start_range_move(
+    ui: &mut Ui<'_, AppData>,
+    f: &ArrangementFrame<'_>,
+    live_range: Option<&common::model::TimeSelection>,
+    (ra, rb): (f64, f64),
+    tracks: &[u32],
+    (px, py): (f32, f32),
+    origin_automation: Option<AutomationClipKey>,
+) -> bool {
+    let mut anchors: Vec<ClipDragAnchor> = Vec::new();
+    let mut track_rows: Vec<(u32, usize)> = Vec::new();
+    for (t_idx, t) in f.visible_tracks.iter().enumerate() {
+        if !tracks.contains(&t.id) {
+            continue;
+        }
+        track_rows.push((t.id, t_idx));
+        for c in &t.clips {
+            let (s, e) = (c.start_beat, c.start_beat + c.len_beats);
+            let (cs, ce) = (s.max(ra), e.min(rb));
+            if ce - cs <= 1e-9 {
+                continue;
+            }
             anchors.push(ClipDragAnchor {
-                key: hit_key,
-                start_beat: c.start_beat,
-                len_beats: c.len_beats,
+                key: ClipKey { track_id: t.id, clip_id: c.id },
+                start_beat: cs,
+                len_beats: ce - cs,
                 track_index: t_idx,
             });
         }
-        if !anchors.is_empty() {
-            let press_alt = f.pointer.modifiers.alt;
-            let press_ctrl = f.pointer.modifiers.ctrl;
-            let press_shift = f.pointer.modifiers.shift;
-            let state: &mut ArrangementState = ui.widget_state(f.wid);
-            state.clip_drag = Some(ClipDragSession {
-                kind,
-                anchor_mouse: (px, py),
-                last_mouse: (px, py),
-                last_alt: press_alt,
-                last_ctrl: press_ctrl,
-                last_shift: press_shift,
-                move_range: (ra, rb),
-                anchors,
+    }
+    let automation_anchors = collect_automation_anchors(f, live_range, tracks, (ra, rb));
+    if anchors.is_empty() && automation_anchors.is_empty() {
+        return false;
+    }
+    let state: &mut ArrangementState = ui.widget_state(f.wid);
+    state.clip_drag = Some(ClipDragSession {
+        kind: ClipDragKind::Move,
+        anchor_mouse: (px, py),
+        last_mouse: (px, py),
+        last_alt: f.pointer.modifiers.alt,
+        last_ctrl: f.pointer.modifiers.ctrl,
+        last_shift: f.pointer.modifiers.shift,
+        move_range: (ra, rb),
+        anchors,
+        track_rows,
+        automation_anchors,
+        origin_automation,
+    });
+    true
+}
+
+/// 範囲移動で一緒に動く automation クリップの断片 (`AutomationDragAnchor`)。
+///
+/// commit (`move_time_range` / `copy_time_range`) と同じ 2 系統を積む:
+/// 1. 範囲に**明示的に入っている lane 行** (`LaneRef::Automation`) — 縦移動でも横だけ動く。
+/// 2. **追従** (`automation_follows_clips`) — `tracks` の全 lane (閉じている lane も)。
+///    同じトラックへ置くときだけ動くので `follow = true` で区別する。
+///
+/// 同じ lane を二度積まない (commit 側の `shifted` と同じ規約)。
+fn collect_automation_anchors(
+    f: &ArrangementFrame<'_>,
+    live_range: Option<&common::model::TimeSelection>,
+    tracks: &[u32],
+    (ra, rb): (f64, f64),
+) -> Vec<AutomationDragAnchor> {
+    let mut out: Vec<AutomationDragAnchor> = Vec::new();
+    let mut done: Vec<common::model::AutomationLaneKey> = Vec::new();
+    let mut push_lane = |key: common::model::AutomationLaneKey, follow: bool| {
+        if done.contains(&key) {
+            return;
+        }
+        done.push(key);
+        let Some(lane) = f
+            .visible_tracks
+            .iter()
+            .find(|t| t.id == key.track)
+            .and_then(|t| t.automation_lanes.iter().find(|l| l.id == key.lane))
+        else {
+            return;
+        };
+        for c in &lane.clips {
+            let (s, e) = (c.start_beat, c.start_beat + c.len_beats);
+            let (cs, ce) = (s.max(ra), e.min(rb));
+            if ce - cs <= 1e-9 {
+                continue;
+            }
+            out.push(AutomationDragAnchor {
+                key: AutomationClipKey { track: key.track, lane: key.lane, clip: c.id },
+                start_beat: cs,
+                len_beats: ce - cs,
+                follow,
             });
-            claim.session = true;
+        }
+    };
+    if let Some(sel) = live_range {
+        for lane in &sel.lanes {
+            if let common::model::LaneRef::Automation(key) = lane {
+                push_lane(*key, false);
+            }
         }
     }
+    if f.view.automation_follows_clips {
+        for t in f.visible_tracks.iter().filter(|t| tracks.contains(&t.id)) {
+            for l in &t.automation_lanes {
+                push_lane(common::model::AutomationLaneKey { track: t.id, lane: l.id }, true);
+            }
+        }
+    }
+    out
 }
 
 /// automation 系 4 本 + lasso。
@@ -457,6 +563,38 @@ fn automation_clip(
             && !automation_clip_in_header(clip_rect, py, f.style)
         {
             return; // 本体 = 範囲、 range_zone が拾う
+        }
+        // 掴んだ automation クリップに**範囲が掛かっている** (= その lane 行が範囲に入り、
+        // 区間が交差する) なら、動かすのは範囲 (`docs/plan_range_selection.md` §6) —
+        // MIDI / audio クリップのヘッダと同じ `start_range_move` へ。 範囲の中のトラック
+        // クリップと automation クリップが全部一緒に動く。 掛かっていなければ従来どおり
+        // 単独 (lane 跨ぎ drop 付き) の automation クリップ drag。
+        if matches!(kind, ClipDragKind::Move)
+            && let Some(sel) = f.time_selection.filter(|sel| {
+                sel.has_lane(common::model::LaneRef::Automation(
+                    common::model::AutomationLaneKey { track: clip_key.track, lane: clip_key.lane },
+                )) && f
+                    .visible_tracks
+                    .iter()
+                    .find(|t| t.id == clip_key.track)
+                    .and_then(|t| t.automation_lanes.iter().find(|l| l.id == clip_key.lane))
+                    .and_then(|l| l.clips.iter().find(|c| c.id == clip_key.clip))
+                    .is_some_and(|c| sel.intersects(c.start_beat, c.len_beats))
+            })
+        {
+            let tracks: Vec<u32> = sel.track_row_ids().collect();
+            if start_range_move(
+                ui,
+                f,
+                Some(sel),
+                (sel.start_beat, sel.end_beat),
+                &tracks,
+                (px, py),
+                Some(clip_key),
+            ) {
+                claim.session = true;
+            }
+            return;
         }
         let press_alt = f.pointer.modifiers.alt;
         let press_ctrl = f.pointer.modifiers.ctrl;

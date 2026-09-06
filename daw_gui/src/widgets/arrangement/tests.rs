@@ -135,6 +135,7 @@
             // 数値検証 test は raw beat 値を期待するので明示 OFF。
             snap: SnapConfig::OFF,
             arranger_lane_h: 0.0,
+            automation_follows_clips: false,
         }
     }
 

@@ -78,6 +78,7 @@ fn hit_view() -> ArrangementView {
         time_sig: (4, 4),
         snap: SnapConfig::OFF,
         arranger_lane_h: 0.0,
+        automation_follows_clips: false,
     }
 }
 

@@ -52,6 +52,7 @@ pub(super) fn commit_releases(
         clip_drag: clip_drag_release,
         range_drag: range_drag_release,
         clip_short_click_pos,
+        automation_short_click,
         audio_drag: audio_drag_release,
         point_drag: point_drag_release,
         automation_clip_drag: automation_clip_drag_release,
@@ -132,25 +133,25 @@ pub(super) fn commit_releases(
                     let min_idx_i32 = i32::from(master_row.is_some());
                     let clamp_max = max_idx_i32.max(min_idx_i32);
                     // 範囲が掛かっているトラック行の写像 `(移動元, 行き先)`。
-                    // anchor.track_index は visible-idx なので、そこへ track_delta を
-                    // 足して visible domain のまま clamp してから track id へ戻す。
+                    // `track_rows` は press 時に確定した範囲の全トラック行 (クリップの
+                    // 有無を問わない) で、visible-idx に track_delta を足して visible
+                    // domain のまま clamp してから track id へ戻す。
                     let mut track_map: Vec<(u32, u32)> = Vec::new();
-                    for a in &nd.anchors {
-                        if track_map.iter().any(|(from, _)| *from == a.key.track_id) {
-                            continue;
-                        }
+                    for &(from, t_idx) in &nd.track_rows {
                         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                        let press_i32 = a.track_index as i32;
+                        let press_i32 = t_idx as i32;
                         let new_idx = (press_i32 + track_delta).clamp(min_idx_i32, clamp_max);
                         #[allow(clippy::cast_sign_loss)]
                         let new_idx_u = new_idx.max(0) as usize;
-                        let to = visible_tracks.get(new_idx_u).map_or(a.key.track_id, |t| t.id);
-                        track_map.push((a.key.track_id, to));
+                        let to = visible_tracks.get(new_idx_u).map_or(from, |t| t.id);
+                        track_map.push((from, to));
                     }
                     let (ra, rb) = nd.move_range;
+                    // automation lane 行だけの範囲 (`track_map` 空) でも横移動は成立する
+                    // (`move_time_range` が範囲の明示 lane を自分で運ぶ)。
                     let moved = beat_delta.abs() > 1e-6
                         || track_map.iter().any(|(from, to)| from != to);
-                    if !track_map.is_empty() && moved {
+                    if moved {
                         // M14 Phase 63e (#019): Move + Ctrl + Shift → 独立コピー、
                         // Move + Ctrl → リンクコピー、 それ以外 → 移動。
                         // `last_ctrl` / `last_shift` は overlay と同じ真値を読むので、 release
@@ -508,45 +509,14 @@ pub(super) fn commit_releases(
             let demote =
                 matches!(acd.kind, ClipDragKind::Move) && !release_alt && dist < 4.0;
             if demote {
-                // short click on automation clip → 修飾で分岐。
-                // r.md #35: 旧実装は Shift も Ctrl も一括 toggle だった。 MIDI clip と同じ
-                // `SelectModifier` に統一する — Ctrl = Toggle / Shift = RangeFromAnchor
-                // (= 可視 lane 行 × 時間の長方形ブロック)。 掴んだ clip (= primary) が対象。
-                let prev = selected_automation_clips.to_vec();
-                let key = acd.primary;
-                let modifier = SelectModifier::from_modifiers(acd.last_shift, acd.last_ctrl);
-                // r.md #73: ここで point 選択を消さない (上の点クリック側と対称)。
-                // 選択集合は面を跨いで共存でき、 Delete / Copy / Cut の宛先は
-                // `edit_surface` の last-wins が解決する。
-                // 範囲表は Shift のときだけ組む (clip click と同じ理由)。
-                let items = if modifier == SelectModifier::RangeFromAnchor {
-                    automation_clip_range_items(visible_tracks)
-                } else {
-                    Vec::new()
-                };
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let anchor = app
-                        .selection
-                        .automation_clip_anchor
-                        .map(|k| AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip });
-                    let next =
-                        modifier.resolve(&prev, key, || range_block(&items, anchor?, key));
-                    if next != prev {
-                        let prev_model: Vec<common::model::AutomationClipKey> =
-                            prev.iter().copied().map(widget_to_model_clip_key).collect();
-                        let next_model: Vec<common::model::AutomationClipKey> =
-                            next.iter().copied().map(widget_to_model_clip_key).collect();
-                        app.handle_event(AppEvent::SelectAutomationClips {
-                            prev: prev_model,
-                            next: next_model,
-                        });
-                    }
-                    if modifier.updates_anchor() {
-                        app.selection.automation_clip_anchor =
-                            Some(widget_to_model_clip_key(key));
-                    }
-                }));
-                response.selection_changed = true;
+                automation_clip_short_click(
+                    ui,
+                    f,
+                    response,
+                    acd.primary,
+                    acd.last_shift,
+                    acd.last_ctrl,
+                );
             } else {
                 // beat_to_px は現在フレームの lanes.w から算出 (全 lane body は幅 lanes.w で同一)。
                 // press 時の anchor 幅でなく現幅を使うことで drag 中の resize に追従する。
@@ -688,6 +658,14 @@ pub(super) fn commit_releases(
                     }
                 }
             }
+        }
+
+        // ---- automation クリップの名前帯から始めた範囲移動の短 click ----
+        // 掴んだ automation クリップの選択 (単独 drag の demote と同じ経路)。
+        if let Some((key, shift, ctrl)) = automation_short_click
+            && !ui.has_open_popups()
+        {
+            automation_clip_short_click(ui, f, response, key, shift, ctrl);
         }
 
         // ---- short click on lanes (drag<16px) → SelectClips ----
@@ -1178,3 +1156,49 @@ pub(super) fn commit_releases(
 // 線の上の Alt+ダブルクリック (`curve::reset_segment_to_linear`) は `curve.rs` が持つ。
 // hit → session → 逆算 → commit がひと続きの subsystem なので、書き込み側だけを
 // この 1,000 行の god function の隣に置くと読めなくなる。
+
+/// automation クリップの**短 click** (= drag に満たない press/release) の格下げ先。
+///
+/// 単独 drag (`AutomationClipDragSession`) の demote と、範囲移動 (`ClipDragSession` を
+/// 名前帯から始めたもの) の demote の**両方**がここへ来る — どちらで掴んだかで
+/// 「クリックしたら選ばれる」 が変わってはいけない。
+///
+/// r.md #35: Ctrl = Toggle / Shift = RangeFromAnchor (= 可視 lane 行 × 時間の長方形ブロック)、
+/// 無修飾 = 単一置換。 r.md #73: ここで point 選択を消さない (点クリック側と対称) —
+/// 選択集合は面を跨いで共存でき、 Delete / Copy / Cut の宛先は `edit_surface` の
+/// last-wins が解決する。
+fn automation_clip_short_click(
+    ui: &mut Ui<'_, AppData>,
+    f: &ArrangementFrame<'_>,
+    response: &mut ArrangementResponse,
+    key: AutomationClipKey,
+    shift: bool,
+    ctrl: bool,
+) {
+    let prev = f.selected_automation_clips.to_vec();
+    let modifier = SelectModifier::from_modifiers(shift, ctrl);
+    // 範囲表は Shift のときだけ組む (clip click と同じ理由)。
+    let items = if modifier == SelectModifier::RangeFromAnchor {
+        automation_clip_range_items(&f.visible_tracks)
+    } else {
+        Vec::new()
+    };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        let anchor = app
+            .selection
+            .automation_clip_anchor
+            .map(|k| AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip });
+        let next = modifier.resolve(&prev, key, || range_block(&items, anchor?, key));
+        if next != prev {
+            let prev_model: Vec<common::model::AutomationClipKey> =
+                prev.iter().copied().map(widget_to_model_clip_key).collect();
+            let next_model: Vec<common::model::AutomationClipKey> =
+                next.iter().copied().map(widget_to_model_clip_key).collect();
+            app.handle_event(AppEvent::SelectAutomationClips { prev: prev_model, next: next_model });
+        }
+        if modifier.updates_anchor() {
+            app.selection.automation_clip_anchor = Some(widget_to_model_clip_key(key));
+        }
+    }));
+    response.selection_changed = true;
+}

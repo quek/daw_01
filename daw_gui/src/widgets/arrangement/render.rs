@@ -629,6 +629,8 @@ fn render_arrangement_heavy(
                 &heavy.clip_content,
                 &heavy.stretch_ghost_content,
             );
+            // 範囲と一緒に動く automation クリップの断片 (Move のみ、関数内で判定)。
+            draw_automation_drag_preview(hctx, nd, &f.rows, f.view, lanes, f.style, *bd, *td);
         }
         // M14 Phase 63k (#025): audio_drag ghost overlay (drag 中の dB / fade preview + label)。
         // commit-by-release のため clip_rect_anchor + 計算済 outcome から preview rect / line を

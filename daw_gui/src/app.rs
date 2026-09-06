@@ -1264,8 +1264,8 @@ impl AppData {
                 // 範囲を張り直すたびに合わせ直す。
                 self.fit_piano_roll_to_range();
             }
-            AppEvent::SelectAllClips => {
-                self.select_all_clips();
+            AppEvent::SelectAllArrangement { track } => {
+                self.select_all_arrangement(track);
             }
             AppEvent::ClearSelection => {
                 self.selection.time = None;

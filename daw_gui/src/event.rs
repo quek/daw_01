@@ -669,10 +669,12 @@ pub enum AppEvent {
     /// **オートメーションをクリップに追従させるか** のトグル
     /// (`docs/plan_range_selection.md` §5)。 アプリ設定として永続する。
     SetAutomationFollowsClips(bool),
-    /// Ctrl+A (クリップ領域): 曲全体・全トラックの全クリップを選択。
-    /// 一括選択なので view ジャンプ (fit_piano_roll / select_track) は
-    /// 起こさない。 既に全選択なら冪等。 selection のみ更新で非 undoable。
-    SelectAllClips,
+    /// Ctrl+A (アレンジ): 段階拡大の全選択 — `track` のトラック 1 本 (行 + 全
+    /// automation lane) → 全トラック × 全 lane。 判定は「今の範囲が前段と一致するか」。
+    /// `track` が `None` なら直接 全トラック。 一括選択なので view ジャンプ
+    /// (fit_piano_roll / select_track) は起こさない。 既に全選択なら冪等。
+    /// selection のみ更新で非 undoable (`AppData::select_all_arrangement`)。
+    SelectAllArrangement { track: Option<u32> },
     ClearSelection,
     /// Clip の右端 trim (= `start_beat` 同値、 `length_beats` のみ更新) と
     /// 左端 trim (= `start_beat` を進めて `length_beats` を縮める) の両方を

@@ -605,6 +605,10 @@ pub struct ArrangementView {
     /// `sections: &[SectionView]` 引数で渡す (`ArrangementView` の `Copy` を壊さないため、 可変長 `Vec`
     /// は view の field には持たせない = `tracks` / `master_row` と同じ「描画対象は別引数」 idiom)。
     pub arranger_lane_h: f32,
+    /// **オートメーションをクリップに追従させるか** (`docs/plan_range_selection.md` §5)。
+    /// 範囲移動のゴーストが「追従で一緒に動く automation クリップ」 を描くかを決める
+    /// (commit 側は `move_time_range` が同じ設定を読む — ゴーストと確定結果を揃える)。
+    pub automation_follows_clips: bool,
 }
 
 impl Default for ArrangementView {
@@ -625,6 +629,7 @@ impl Default for ArrangementView {
             time_sig: (4, 4),
             snap: SnapConfig::DEFAULT,
             arranger_lane_h: 0.0,
+            automation_follows_clips: false,
         }
     }
 }
@@ -1592,6 +1597,21 @@ struct ClipDragAnchor {
     track_index: usize,
 }
 
+/// 範囲移動 (`ClipDragSession` の Move) で**一緒に動く automation クリップの断片**。
+/// ゴースト専用 — commit は `move_time_range` / `copy_time_range` が範囲から自分で
+/// 導く (`docs/plan_range_selection.md` §6)。 ここはその結果を先に描くための写し。
+#[derive(Clone, Copy, Debug)]
+struct AutomationDragAnchor {
+    key: AutomationClipKey,
+    /// 範囲で切った断片 (`shift_one_lane` が `split_at(a)` / `split_at(b)` して動かすもの)。
+    start_beat: f64,
+    len_beats: f64,
+    /// `true` = トラック行の**追従** (`automation_follows_clips`) で動く断片。 追従は
+    /// 「同じトラックへ置くとき」 だけ効くので、縦に動かしている間はゴーストを出さない。
+    /// `false` = 範囲に**明示的に入っている lane 行**の断片 (縦移動でも横だけ動く)。
+    follow: bool,
+}
+
 #[derive(Clone, Debug)]
 struct ClipDragSession {
     kind: ClipDragKind,
@@ -1623,6 +1643,17 @@ struct ClipDragSession {
     /// ゴーストも確定後と同じ「範囲ぶんだけ」を描く。 Resize では使わない。
     move_range: (f64, f64),
     anchors: Vec<ClipDragAnchor>,
+    /// Move が動かす範囲に掛かっている**トラック行** `(track_id, visible-idx)` 全部
+    /// (クリップの有無を問わない)。 release の `track_map` はここから組む — anchor
+    /// (= クリップ断片) から組むと、クリップの無い行が範囲から置き去りになり、
+    /// automation だけの行では `track_map` が空で移動そのものが起きない。
+    track_rows: Vec<(u32, usize)>,
+    /// 範囲と一緒に動く automation クリップの断片 (ゴースト用、Move のみ)。
+    automation_anchors: Vec<AutomationDragAnchor>,
+    /// automation クリップの名前帯から始めた範囲移動なら、その掴んだクリップ。
+    /// 短 click への格下げ先を変える (= automation クリップの選択、MIDI クリップの
+    /// `SelectClip` ではなく) ためだけに持つ。
+    origin_automation: Option<AutomationClipKey>,
 }
 
 /// M14 Phase 127 (daw_01 #105): Arranger section drag の gesture 種別。 Move/ResizeLeft/ResizeRight は

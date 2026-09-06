@@ -255,6 +255,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         time_sig: app.song_doc.song().time_sig,
         snap: snap::arrange_snap_config(app),
         arranger_lane_h: SECTION_LANE_H,
+        automation_follows_clips: app.ui_prefs.automation_follows_clips,
     };
 
     // r.md #48: style の色は **いま有効なテーマ** から組む (`const STYLE` / `Default` は
@@ -267,11 +268,12 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         ..ArrangementStyle::from_theme(&app.theme)
     };
 
-    // `selected_clips` と同じく **アレンジ側だけ** (レーン行のセルは混ぜない)。
+    // `selected_clips` と同じく **時間範囲からの導出**で、**アレンジ側だけ**
+    // (レーン行のセルは混ぜない)。 明示リスト `selection.selected_automation_clips` は
+    // 常にこの部分集合 (根拠は `arrangement_selected_automation_clip_refs` の doc)。
     let selected_automation_clips: Vec<AutomationClipKey> = app
-        .selection
-        .selected_automation_clips
-        .iter()
+        .arrangement_selected_automation_clip_refs()
+        .into_iter()
         .map(|k| AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip })
         .collect();
 

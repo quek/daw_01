@@ -540,6 +540,41 @@ impl AppData {
         out.into_iter().map(|(_, k)| k).collect()
     }
 
+    /// [`Self::arrangement_selected_clip_refs`] の automation クリップ版 — 選択範囲と
+    /// **交差**する、範囲が掛かった lane 行の automation クリップ群 (開始拍順)。
+    ///
+    /// アレンジ widget の選択塗りはこれで描く (MIDI / audio クリップと同じ「範囲からの
+    /// 導出」)。 明示リスト `selection.selected_automation_clips` は copy / cut / delete の
+    /// 宛先 (last-wins) と `Z` のズーム先を決めるために残っており、範囲の張り直しで
+    /// 常にこの導出の部分集合に刈られる (`prune_automation_selection`)。 導出を使わず
+    /// 明示リストだけで塗ると、Ctrl+A でトラック行 + lane 行を範囲に入れたときに
+    /// MIDI クリップは選択表示になるのに automation クリップだけならない (実機で報告)。
+    pub fn arrangement_selected_automation_clip_refs(&self) -> Vec<common::model::AutomationClipKey> {
+        let Some(sel) = self.selection.time.as_ref() else {
+            return Vec::new();
+        };
+        let song = self.song_doc.song();
+        let mut out: Vec<(f64, common::model::AutomationClipKey)> = Vec::new();
+        for lane in &sel.lanes {
+            let common::model::LaneRef::Automation(key) = lane else {
+                continue;
+            };
+            let Some(lane) = song.automation_lane_by_key(key.track, key.lane) else {
+                continue;
+            };
+            for clip in &lane.clips {
+                if sel.intersects(clip.start_beat, clip.length_beats) {
+                    out.push((
+                        clip.start_beat,
+                        common::model::AutomationClipKey { track: key.track, lane: key.lane, clip: clip.id },
+                    ));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out.into_iter().map(|(_, k)| k).collect()
+    }
+
     /// ピアノロールに同時表示する MIDI クリップ群を開始拍順で返す
     /// ([`Self::selected_clip_refs`] → MIDI のみ filter)。 ランチャーのセルを
     /// 選んでいるときは**そのセル**が開く (セルは時間軸に居ないので範囲では
@@ -1058,130 +1093,6 @@ impl AppData {
             self.fit_piano_roll_to_clip();
         }
     }
-
-    /// Ctrl+A (クリップ領域): 曲全体 × 全トラックを範囲にする。
-    /// 全選択は一括操作なので view ジャンプ (fit / トラック追従) を起こさない。
-    /// 既に全選択なら冪等。
-    pub(crate) fn select_all_clips(&mut self) {
-        let song = self.song_doc.song();
-        let mut end = 0.0_f64;
-        let lanes: Vec<common::model::LaneRef> = song
-            .tracks
-            .iter()
-            .map(|t| {
-                for c in &t.clips {
-                    end = end.max(c.start_beat + c.length_beats);
-                }
-                common::model::LaneRef::Track(t.id)
-            })
-            .collect();
-        if lanes.is_empty() || end <= 0.0 {
-            return;
-        }
-        let next = common::model::TimeSelection::new(0.0, end, lanes);
-        // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
-        // 「Ctrl+A = 範囲面を選んだ」 という意図は確定している)。
-        self.selection.last_edit_select = Some(EditSurface::TimeRange);
-        if self.selection.time != next {
-            self.selection.time = next;
-            self.selection.range_anchor = Some(0.0);
-        }
-        // 冪等 early-return より後 (既に全選択でも「アレンジの面を選んだ」は確定)。
-        self.drop_cell_selection_if_arrangement();
-    }
-
-
-    /// Ctrl+A (ピアノロール): **表示中の全 MIDI クリップ** の全ノートを packed note id で返す。
-    /// 各 id = `pack_note_id(clip_slot, local_index)`。ロック中クリップは選択対象に
-    /// しない (掴めないので除外)。表示クリップが無ければ空。
-    pub fn all_shown_pianoroll_note_ids(&self) -> Vec<u32> {
-        let shown = self.shown_pianoroll_clips();
-        let mut out = Vec::new();
-        for (slot, &r) in shown.iter().enumerate() {
-            if self.is_pianoroll_clip_locked_in(&shown, r) {
-                continue;
-            }
-            let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
-                continue;
-            };
-            let Some(clip) = track.clip_by_id(r.clip_id) else {
-                continue;
-            };
-            let n = self.song_doc.song().clip_notes(clip).len();
-            out.extend((0..n).map(|local| Self::pack_note_id(slot, local)));
-        }
-        out
-    }
-
-    /// Ctrl+A (オーディオエディタ): 開いている clip の全 audio event index
-    /// を返す。 audio_editor_clip が無い / 非 audio なら空。
-    pub fn all_audio_event_indices(&self) -> Vec<usize> {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
-            return Vec::new();
-        };
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
-            return Vec::new();
-        };
-        let Some(clip) = track.clip_by_id(target.clip_id) else {
-            return Vec::new();
-        };
-        match self.song_doc.song().clip_contents.get(&clip.content_id) {
-            Some(common::model::ClipContent::Audio(audio)) => (0..audio.events.len()).collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Ctrl+A (automation lane): 指定 lane 内の全ポイントを
-    /// `AutomationPointKeyRef` で列挙する。 lane.clips の各 clip の content
-    /// (`ClipContent::Automation`) points を走査。 master row
-    /// (`MASTER_TRACK_ID`) も `automation_lane_by_key` 経由で対応。
-    /// lane が無い / ポイントが無いなら空。
-    pub fn all_automation_points_in_lane(
-        &self,
-        lane: common::model::AutomationLaneKey,
-    ) -> Vec<AutomationPointKeyRef> {
-        let Some(lane_ref) = self.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for clip in &lane_ref.clips {
-            let n = match self.song_doc.song().clip_contents.get(&clip.content_id) {
-                Some(common::model::ClipContent::Automation(a)) => a.points.len(),
-                _ => 0,
-            };
-            for point_idx in 0..n as u32 {
-                out.push(AutomationPointKeyRef {
-                    track_id: lane.track,
-                    lane_id: lane.lane,
-                    clip_id: clip.id,
-                    point_idx,
-                });
-            }
-        }
-        out
-    }
-
-    /// Ctrl+A (automation lane / #071): 指定 lane 内の全 automation clip を
-    /// `AutomationClipKey` で列挙する。 lane が無い / clip が無いなら空。
-    /// `all_automation_points_in_lane` の clip 版 (= Ctrl+A 段階拡大の clip 段)。
-    pub fn all_automation_clips_in_lane(
-        &self,
-        lane: common::model::AutomationLaneKey,
-    ) -> Vec<common::model::AutomationClipKey> {
-        let Some(lane_ref) = self.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
-            return Vec::new();
-        };
-        lane_ref
-            .clips
-            .iter()
-            .map(|clip| common::model::AutomationClipKey {
-                track: lane.track,
-                lane: lane.lane,
-                clip: clip.id,
-            })
-            .collect()
-    }
-
 
     /// 選択**範囲**にピアノロールを合わせる (`docs/plan_range_selection.md` §3)。
     ///
