@@ -378,13 +378,12 @@ pub(super) fn draw_notes<M: ?Sized + 'static>(
     visible: &[Note],
     view: PianoRollView,
     grid: Rect,
-    velocity_ramp: VelocityRamp,
-    bg: Color,
-    radius_px: f32,
-    muted_hatch_color: Color,
-    muted_hatch_spacing_px: f32,
-    muted_hatch_width_px: f32,
+    style: &PianoRollStyle,
 ) {
+    let velocity_ramp = style.velocity_ramp;
+    let bg = style.bg;
+    let radius_px = style.note_border_radius_px;
+    let p = hctx.palette();
     for note in visible {
         let r = note_to_rect(note, view, grid);
         let x_left = r.x.max(grid.x);
@@ -402,15 +401,22 @@ pub(super) fn draw_notes<M: ?Sized + 'static>(
         };
         // クリップ色 (色 None なら velocity 色) → dim/lock 沈め → mute 沈め。
         let fill = note_fill_color(note, velocity_ramp, bg);
-        hctx.push_rect(note_rect_command(clipped, fill, radius_px));
+        // 輪郭は塗りに対して読めるインク (`ink_for`) を薄めたもの。 隣接 / 分割した音の継ぎ目を
+        // 塗りの中の線として残す (輪郭が無いと同色の 2 音が 1 本に見える)。
+        let mut cmd = note_rect_command(clipped, fill, radius_px);
+        if style.note_outline_w > 0.0 {
+            cmd.border = p.ink_for(fill).with_alpha(style.note_outline_alpha);
+            cmd.border_width = style.note_outline_w;
+        }
+        hctx.push_rect(cmd);
         if note.muted {
             daw_ui_core::widgets::push_muted_hatch(
                 hctx,
                 clipped,
                 clipped,
-                muted_hatch_color,
-                muted_hatch_spacing_px,
-                muted_hatch_width_px,
+                style.note_muted_hatch_color,
+                style.note_muted_hatch_spacing_px,
+                style.note_muted_hatch_width_px,
             );
         }
     }
@@ -496,26 +502,34 @@ pub(super) fn draw_selection_overlay<M: ?Sized + 'static>(
     grid: Rect,
     style: &PianoRollStyle,
 ) {
-    for note in visible {
-        if !selected_set.contains(&note.id) {
-            continue;
-        }
+    // 塗りを全部 → 枠を全部、 の 2 pass。 1 pass だと隣り合う選択ノート (分割直後の両半分など)
+    // の後ろ側の塗りが前の枠を覆って 1 本の黄色い塊に見える。 枠を後から重ねれば継ぎ目に
+    // 両方の枠が残り、 「2 本」 と分かる。
+    let pad = style.note_selected_pad_px;
+    let rect_of = |note: &Note| {
         let r = note_to_rect(note, view, grid);
-        let pad = style.note_selected_pad_px;
+        Rect { x: r.x - pad, y: r.y - pad, w: r.w + pad * 2.0, h: r.h + pad * 2.0 }
+    };
+    // grid で clip する — 他 pass (draw_notes / drag preview / lyrics) は全て clamp/clip 済みで、
+    // ここだけ無 clip だと視界端の選択 note のハイライトが keyboard / ruler / velocity lane に
+    // はみ出す (review)。
+    for note in visible.iter().filter(|n| selected_set.contains(&n.id)) {
         hctx.push_rect(RectCommand {
-            rect: Rect {
-                x: r.x - pad,
-                y: r.y - pad,
-                w: r.w + pad * 2.0,
-                h: r.h + pad * 2.0,
-            },
+            rect: rect_of(note),
             fill: style.note_selected_fill,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [3.0; 4],
+            clip_rect: Some(grid),
+        });
+    }
+    for note in visible.iter().filter(|n| selected_set.contains(&n.id)) {
+        hctx.push_rect(RectCommand {
+            rect: rect_of(note),
+            fill: Color::TRANSPARENT,
             border: style.note_selected_border,
             border_width: style.note_selected_border_w,
             radius: [3.0; 4],
-            // grid で clip する — 他 pass (draw_notes / drag preview / lyrics) は
-            // 全て clamp/clip 済みで、 ここだけ無 clip だと視界端の選択 note の
-            // ハイライトが keyboard / ruler / velocity lane にはみ出す (review)。
             clip_rect: Some(grid),
         });
     }
@@ -567,16 +581,17 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
     }
 }
 
-/// (M9 Phase 45c / M14 Phase 64) velocity lane の描画。`vel_area` は keyboard を除いた grid と同じ x 範囲。
-/// 各 visible note の start_beat 位置に幅 `style.velocity_bar_width_px` の縦 bar を、
-/// `velocity / 127` の比率で高さを決めて bottom-aligned で描画する。
+/// velocity lane: note ごとのロリポップ (柱 + 頭の丸、 頭の中心 y = [`velocity_head_y`])。
 ///
-/// (M14 Phase 64 / daw_01 #018) `velocity_override` が `Some((ids, new_vel))` のとき、
-/// 含まれる id の note は `n.velocity` の代わりに `new_vel` で bar を描画する (drag preview)。
-/// drag 中はこの override が active になり、release で None に戻る (= cache 経由で実値が反映)。
+/// 描き順は **非選択 → 選択** で、 選択中 note は `note_selected_fill` の柱 / 頭 +
+/// `note_selected_border` の輪で最前面に来る。 選択があるときは非選択を
+/// `velocity_unselected_alpha` で沈める。 同じ拍に重なった和音でも頭が velocity の高さで縦に
+/// ばらけるので、 選んだ音の値と掴む先が見える (「線だけ」 だと高い柱の後ろに隠れる)。
+/// `velocity_override` は drag 中の target を pointer.y の値で描く preview。
 pub(super) fn draw_velocity_lane<M: ?Sized + 'static>(
     hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
+    selected: &HashSet<NoteId>,
     view: PianoRollView,
     vel_area: Rect,
     style: &PianoRollStyle,
@@ -592,45 +607,60 @@ pub(super) fn draw_velocity_lane<M: ?Sized + 'static>(
         clip_rect: None,
     });
     let beat_to_px = f64::from(vel_area.w) / view.len_beats.max(1e-6);
-    let half_w = style.velocity_bar_width_px * 0.5;
-    for n in visible {
+    let r = style.velocity_head_radius_px;
+    let stem_w = style.velocity_bar_width_px;
+    let bottom = vel_area.y + vel_area.h;
+    let has_selection = !selected.is_empty();
+    let mut lollipop = |n: &Note, is_sel: bool| {
         let vel = match velocity_override {
             Some((ids, ov)) if ids.contains(&n.id) => ov,
             _ => n.velocity,
         };
-        let bar_h = vel_area.h * (f32::from(vel) / 127.0);
-        if bar_h <= 0.0 {
-            continue;
-        }
         let cx = vel_area.x + ((n.start_beat - view.start_beat) * beat_to_px) as f32;
         // grid 範囲外は skip (visible は端に半分はみ出る note も含み得る)
-        if cx + half_w < vel_area.x || cx - half_w > vel_area.x + vel_area.w {
-            continue;
+        if cx + r < vel_area.x || cx - r > vel_area.x + vel_area.w {
+            return;
         }
-        // bar はそのクリップの色 (色 None なら従来の velocity_bar_color)。
-        // バー高さが既に velocity を表すので velocity 陰影は掛けず、dim/lock のみ反映。
-        let bar_fill = match n.style.color {
-            Some(c) if n.style.locked => dim_toward(c, style.velocity_lane_bg, 0.72),
-            Some(c) if n.style.dimmed => dim_toward(c, style.velocity_lane_bg, 0.48),
-            Some(c) => c,
-            None => style.velocity_bar_color,
+        let head_y = velocity_head_y(vel, vel_area, r);
+        // 色: 選択中は選択色。 それ以外はクリップ色 (無ければ velocity_bar_color) に dim/lock を
+        // 反映し、 選択があるときは沈める。 柱の高さが既に velocity を表すので velocity 陰影は掛けない。
+        let (fill, ring) = if is_sel {
+            (style.note_selected_fill, Some(style.note_selected_border))
+        } else {
+            let base = match n.style.color {
+                Some(c) if n.style.locked => dim_toward(c, style.velocity_lane_bg, 0.72),
+                Some(c) if n.style.dimmed => dim_toward(c, style.velocity_lane_bg, 0.48),
+                Some(c) => c,
+                None => style.velocity_bar_color,
+            };
+            (if has_selection { base.with_alpha(style.velocity_unselected_alpha) } else { base }, None)
         };
+        // 柱: 頭の中心から lane 下端まで。
         hctx.push_rect(RectCommand {
-            rect: Rect {
-                x: cx - half_w,
-                y: vel_area.y + vel_area.h - bar_h,
-                w: style.velocity_bar_width_px,
-                h: bar_h,
-            },
-            fill: bar_fill,
+            rect: Rect { x: cx - stem_w * 0.5, y: head_y, w: stem_w, h: (bottom - head_y).max(0.0) },
+            fill,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
-            // bar は cx を中心に ±half_w なので、 view 先頭 (start_beat == 拍 0) の
-            // note では左半分がレーン外 = 鍵盤の真下の未描画ガターへ出る。
-            // selection overlay (clip_rect: Some(grid)) と同じ SSoT でレーンに閉じる。
+            // view 先頭 (start_beat == 拍 0) の note では左半分がレーン外 = 鍵盤の真下の未描画
+            // ガターへ出る。 selection overlay (clip_rect: Some(grid)) と同じ SSoT でレーンに閉じる。
             clip_rect: Some(vel_area),
         });
+        // 頭: 直径 2r の角丸 = 円。 選択中は輪を付ける。
+        hctx.push_rect(RectCommand {
+            rect: Rect { x: cx - r, y: head_y - r, w: r * 2.0, h: r * 2.0 },
+            fill,
+            border: ring.unwrap_or(Color::TRANSPARENT),
+            border_width: if ring.is_some() { 1.5 } else { 0.0 },
+            radius: [r; 4],
+            clip_rect: Some(vel_area),
+        });
+    };
+    for n in visible.iter().filter(|n| !selected.contains(&n.id)) {
+        lollipop(n, false);
+    }
+    for n in visible.iter().filter(|n| selected.contains(&n.id)) {
+        lollipop(n, true);
     }
 }
 

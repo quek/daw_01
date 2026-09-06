@@ -334,58 +334,84 @@ pub(super) fn note_hit_in(
     hit
 }
 
+/// velocity lane の頭 (ロリポップの丸) の中心 y を velocity から求める。
+///
+/// 丸の半径ぶんを上下に空けた `[vel_area.y + r, vel_area.y + vel_area.h - r]` を 127..0 に
+/// 線形 map する (127 でも丸が lane の上端に切れない)。 [`velocity_from_y`] はこの逆写像。
+pub(super) fn velocity_head_y(vel: u8, vel_area: Rect, head_r: f32) -> f32 {
+    let usable = (vel_area.h - head_r * 2.0).max(0.0);
+    vel_area.y + head_r + (1.0 - f32::from(vel) / 127.0) * usable
+}
+
 /// (M14 Phase 64 / daw_01 #018) `pointer.y` から絶対 velocity (0..=127) を計算。
 ///
-/// `vel_area.y` (lane top) = 127、 `vel_area.y + vel_area.h` (lane bottom) = 0 として
-/// 線形 map。 範囲外は clamp (lane の上を超えて drag したら 127、 下を超えたら 0)。
-/// `vel_area.h <= 0` (= disabled) なら 0 を返す (defensive)。
-pub(super) fn velocity_from_y(py: f32, vel_area: Rect) -> u8 {
+/// [`velocity_head_y`] の逆写像: 頭の可動域の上端 = 127、 下端 = 0。 範囲外は clamp (lane の
+/// 上を超えて drag したら 127、 下を超えたら 0)。 `vel_area.h <= 0` (= disabled) なら 0 (defensive)。
+pub(super) fn velocity_from_y(py: f32, vel_area: Rect, head_r: f32) -> u8 {
     if vel_area.h <= 0.0 {
         return 0;
     }
-    let t = (1.0 - (py - vel_area.y) / vel_area.h).clamp(0.0, 1.0);
+    let usable = (vel_area.h - head_r * 2.0).max(1e-3);
+    let t = (1.0 - (py - vel_area.y - head_r) / usable).clamp(0.0, 1.0);
     (t * 127.0).round() as u8
 }
 
 /// (M14 Phase 64 / daw_01 #018) velocity lane 内の hit-test。
 ///
-/// `cx` 位置にある note の velocity bar に hit するかを判定。 各 note の bar 中央 x は
-/// `vel_area.x + (n.start_beat - view.start_beat) * beat_to_px`。 hit zone は **bar 中央から
-/// 左右 ± `(velocity_bar_width_px / 2 + tolerance)` px**。
+/// 各 note のロリポップは x = `vel_area.x + (n.start_beat - view.start_beat) * beat_to_px` の
+/// 柱と、 その上の頭 ([`velocity_head_y`]、 半径 `head_r`)。 x 方向の hit zone は **柱中央から
+/// 左右 ± `(max(bar_width / 2, head_r) + tolerance)` px**。
 ///
-/// **選択優先 (daw_01 #33)**: velocity lane は note を pitch を無視して start_beat の x に集約
-/// するため、 同じ拍に複数 note (ハーモニー / 密集 / tolerance 重なり) があると 1 本の x 列に
-/// 複数の bar が重なる。 このとき「その x に選択中 note があれば選択中を優先」する
-/// (= `is_selected(id)` が真の note を、 無ければ最後の note を返す)。 これで選択の近くを
-/// 掴めば必ず選択 note が hit し、 caller が選択集合全体を編集対象にできる (選択外の最前面
-/// note が握られて「選択したのに一部しか変わらない」事故を防ぐ)。 選択が無い / その x に
-/// 選択 note が無いときは従来どおり後勝ち (visible 順で前面) の 1 本。
+/// **頭優先**: `(cx, cy)` が候補 note の頭 (± `head_r + tolerance`) に乗っていれば、 頭が最も
+/// 近い note を返す。 同じ拍に重なった和音でも頭は velocity の高さで縦にばらけるので、
+/// 掴んだ頭の 1 音だけを狙える (「一部だけ選んでベロシティを変える」 の入口)。
 ///
-/// `cy` が `vel_area` 内かは caller 側で判定済み前提 (この関数は x 方向のみ判定)。
-/// 戻り値 `None` は「この cx に bar 無し」 (lane 余白のクリック)。
+/// **選択優先 (daw_01 #33)**: 頭に乗っていないとき (柱の途中 / 頭が同じ高さで重なるとき) は
+/// 「その x に選択中 note があれば選択中を優先」 し、 無ければ後勝ち (visible 順で前面) の 1 本。
+/// 選択の近くを掴めば必ず選択 note が hit し、 caller が選択集合全体を編集対象にできる。
+///
+/// `cy` が `vel_area` 内かは caller 側で判定済み前提。 戻り値 `None` は「この cx に柱無し」
+/// (lane 余白のクリック)。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn velocity_bar_hit(
     visible: &[Note],
     view: PianoRollView,
     vel_area: Rect,
     cx: f32,
+    cy: f32,
     bar_width: f32,
     tolerance: f32,
+    head_r: f32,
     is_selected: impl Fn(NoteId) -> bool,
 ) -> Option<NoteId> {
     let beat_to_px = f64::from(vel_area.w) / view.len_beats.max(1e-6);
-    let half_w = bar_width * 0.5 + tolerance;
+    let half_w = (bar_width * 0.5).max(head_r) + tolerance;
     let mut hit: Option<NoteId> = None;
     let mut hit_selected: Option<NoteId> = None;
+    // (dy, 選択か, id): 頭に乗っている候補のうち最も近いもの。 同距離なら選択中を優先。
+    let mut head: Option<(f32, bool, NoteId)> = None;
     for n in visible {
         let nx = vel_area.x + ((n.start_beat - view.start_beat) * beat_to_px) as f32;
-        if (cx - nx).abs() <= half_w {
-            hit = Some(n.id);
-            if is_selected(n.id) {
-                hit_selected = Some(n.id);
+        if (cx - nx).abs() > half_w {
+            continue;
+        }
+        hit = Some(n.id);
+        let sel = is_selected(n.id);
+        if sel {
+            hit_selected = Some(n.id);
+        }
+        let dy = (cy - velocity_head_y(n.velocity, vel_area, head_r)).abs();
+        if dy <= head_r + tolerance {
+            let closer = match head {
+                None => true,
+                Some((best_dy, best_sel, _)) => dy < best_dy - 1e-3 || ((dy - best_dy).abs() <= 1e-3 && (sel || !best_sel)),
+            };
+            if closer {
+                head = Some((dy, sel, n.id));
             }
         }
     }
-    hit_selected.or(hit)
+    head.map(|(_, _, id)| id).or(hit_selected).or(hit)
 }
 
 /// 絶対位置 snap で計算した note drag の beat delta (overlay と release commit で共有)。

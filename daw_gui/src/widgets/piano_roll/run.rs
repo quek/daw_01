@@ -256,9 +256,11 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 view,
                 vel_area,
                 px,
+                py,
                 style.velocity_bar_width_px,
                 4.0,
-                // #33: 同じ x に重なった bar のうち選択中 note を優先 hit する。
+                style.velocity_head_radius_px,
+                // 頭に乗っていればその 1 音。 それ以外は #33: 同じ x に重なった柱のうち選択中 note を優先。
                 |id| selected.contains(&id),
             )
         {
@@ -1067,7 +1069,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // velocity_drag は press 時に vel_area.h > 0 を gate してあるため vel_area.h > 0 が前提。
         let velocity_drag_overlay: Option<(Vec<NoteId>, u8)> =
             velocity_drag_session.as_ref().map(|vd| {
-                let new_vel = velocity_from_y(vd.last_mouse.1, vel_area);
+                let new_vel = velocity_from_y(vd.last_mouse.1, vel_area, style.velocity_head_radius_px);
                 (vd.target_ids.clone(), new_vel)
             });
 
@@ -1148,18 +1150,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                         ruler_style_pr,
                     );
                 }
-                draw_notes(
-                    hctx,
-                    &visible_owned,
-                    view_copy,
-                    grid,
-                    style_copy.velocity_ramp,
-                    style_copy.bg,
-                    style_copy.note_border_radius_px,
-                    style_copy.note_muted_hatch_color,
-                    style_copy.note_muted_hatch_spacing_px,
-                    style_copy.note_muted_hatch_width_px,
-                );
+                draw_notes(hctx, &visible_owned, view_copy, grid, &style_copy);
             });
 
             // === cached の外: 動的 overlay (selection / velocity lane / drag preview / lyric / cursor / playhead) ===
@@ -1171,6 +1162,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 draw_velocity_lane(
                     hctx,
                     &visible_owned,
+                    &selected_set,
                     view_copy,
                     vel_area,
                     &style_copy,
@@ -1525,7 +1517,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let dy = vd.last_mouse.1 - vd.anchor_mouse.1;
             let dist = dx.abs() + dy.abs();
             if dist >= 3.0 {
-                let new_vel = velocity_from_y(vd.last_mouse.1, vel_area);
+                let new_vel = velocity_from_y(vd.last_mouse.1, vel_area, style.velocity_head_radius_px);
                 let mut updates: Vec<VelocityUpdate> = Vec::new();
                 for (id, anchor_vel) in &vd.anchor_velocities {
                     if *anchor_vel != new_vel {

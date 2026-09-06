@@ -1161,6 +1161,99 @@ impl AppData {
     ///
     /// アレンジャーの `j` (= 範囲を 1 クリップへ焼き込む) とはビューで意味が分かれる
     /// (`docs/plan_range_selection.md` §7.4)。
+    /// ノートをカーソル位置で 2 つに割る (`E` / `Alt+E`、 クリップ分割と同じ規則)。
+    ///
+    /// 切る位置はピアノロール上のポインタ拍 (snap 済 / `snap == false` なら生の拍)、 ポインタが
+    /// grid 外なら再生ヘッド。 対象はポインタ直下のノート (選択に入っていれば選択全部、 入って
+    /// いなければその 1 音)、 ポインタ下に無ければ選択ノート全部、 選択も無ければ表示中の全ノート
+    /// (= カーソルの時間を跨ぐ全ノート)。 切り口を跨がないノート (端ぴったり含む) は
+    /// そのまま。 前半は id / 歌詞を保ち、 後半は新 id・歌詞なし (同じ音節を 2 度歌わせない)。
+    /// 選択は範囲 (時間 × 鍵盤行) なので、 割っても両半分が選択されたまま。
+    pub(crate) fn action_split_notes_at_cursor(&mut self, snap: bool) {
+        let Some(raw) = self
+            .ui_ephemeral
+            .pianoroll_hover_beat_song_raw
+            .or_else(|| self.transport.playhead_beat.map(|b| b as f64))
+        else {
+            self.ui_ephemeral.status_message =
+                "Split: マウスをピアノロールに置くか再生中に E を押してください".into();
+            return;
+        };
+        let cut_song = if snap {
+            crate::view::snap::piano_roll_snap_config(self).snap_beat(raw, false, self.pianoroll_zoom_x())
+        } else {
+            raw
+        };
+        // 対象: ポインタ直下のノートが選択に入っていれば選択全体、 入っていなければその 1 音、
+        // ポインタ下に無ければ選択全体 (velocity lane の掴み方と同じ規則)。
+        // どちらも無ければ、 表示中クリップの **全ノート** を対象にする (切り口を跨ぐものだけが
+        // 実際に割れる = 「カーソルの時間にある全ノートを分割」)。
+        let selected = self.selected_note_ids();
+        let targets: Vec<u32> = match self.ui_ephemeral.pianoroll_hover_note {
+            Some(id) if !selected.contains(&id) => vec![id],
+            _ if !selected.is_empty() => selected,
+            _ => {
+                let song = self.song_doc.song();
+                self.shown_pianoroll_clips()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, key)| song.clip_by_key(*key).map(|clip| (slot, clip)))
+                    .flat_map(|(slot, clip)| {
+                        (0..song.clip_notes(clip).len()).map(move |idx| Self::pack_note_id(slot, idx))
+                    })
+                    .collect()
+            }
+        };
+        if targets.is_empty() {
+            self.ui_ephemeral.status_message = "Split: 分割するノートがありません".into();
+            return;
+        }
+        let mut split_count = 0usize;
+        self.for_each_note_clip_group(targets.into_iter().map(|id| (id, ())), |app, _slot, key, items| {
+            let cut = cut_song - app.clip_start_beat_of(key);
+            let mut indices: Vec<usize> = items.iter().map(|(i, ())| *i).collect();
+            indices.sort_unstable();
+            indices.dedup();
+            let mut n_split = 0usize;
+            app.edit_song_checked(|song| {
+                let Some(content) = midi_content_in_clip_mut(song, key) else {
+                    return false;
+                };
+                let mut backs: Vec<Note> = Vec::new();
+                for &i in &indices {
+                    let Some(front) = content.notes.get(i).cloned() else { continue };
+                    let front_start = front.start_beat;
+                    let end = front_start + front.duration_beats;
+                    // 端ぴったり / 範囲外は割らない (最短長未満の断片も作らない)。
+                    if !(cut > front_start + NOTE_MIN_LEN_BEATS && cut < end - NOTE_MIN_LEN_BEATS)
+                    {
+                        continue;
+                    }
+                    let mut back = front;
+                    back.id = content.alloc_note_id();
+                    back.start_beat = cut;
+                    back.duration_beats = end - cut;
+                    back.lyric = None;
+                    content.notes[i].duration_beats = cut - front_start;
+                    backs.push(back);
+                }
+                if backs.is_empty() {
+                    return false;
+                }
+                n_split = backs.len();
+                content.notes.extend(backs);
+                content.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                true
+            });
+            split_count += n_split;
+        });
+        self.ui_ephemeral.status_message = if split_count == 0 {
+            "Split: カーソルがノートの範囲外のため何も分割されませんでした".into()
+        } else {
+            format!("Split: {split_count} ノートを分割しました")
+        };
+    }
+
     pub(crate) fn action_join_selected_notes(&mut self) {
         let selected = self.selected_note_ids();
         if selected.len() < 2 {

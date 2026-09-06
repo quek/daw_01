@@ -416,6 +416,11 @@ pub struct PianoRollStyle {
     /// `NoteStyle::color == None` の note を velocity で塗るランプ (両端はテーマトークン)。
     pub velocity_ramp: VelocityRamp,
     pub note_border_radius_px: f32,
+    /// note の輪郭線の幅 (px)。 色は 1 音ごとに `Palette::ink_for(塗り)` を `note_outline_alpha` で
+    /// 薄めたもの (暗い音には明インク、 明るい音には暗インク)。 隣り合う / 分割した音の継ぎ目が
+    /// 塗りの中に線として残り、 「1 本か 2 本か」 が見える。 `0.0` で輪郭なし。
+    pub note_outline_w: f32,
+    pub note_outline_alpha: f32,
     /// muted note に重ねる斜線ハッチの色 (半透明)。極性固定の `core.hatch_ink` を
     /// note 用の濃さ (alpha 0.40) にしたもの。`Note.muted == true` のときのみ描画。
     pub note_muted_hatch_color: Color,
@@ -466,10 +471,16 @@ pub struct PianoRollStyle {
     pub playhead_width_px: f32,
     /// (M9 Phase 45c) velocity lane の背景色。
     pub velocity_lane_bg: Color,
-    /// (M9 Phase 45c) velocity bar の色。selection 反映は将来 phase (drag editing と一緒)。
+    /// (M9 Phase 45c) velocity ロリポップの色 (クリップ色が無いとき)。 選択中 note は
+    /// `note_selected_fill` / `note_selected_border` で最前面に描く。
     pub velocity_bar_color: Color,
-    /// (M9 Phase 45c) velocity bar の幅 (px)。
+    /// (M9 Phase 45c) velocity ロリポップの柱の幅 (px)。
     pub velocity_bar_width_px: f32,
+    /// velocity ロリポップの頭 (丸) の半径 (px)。 同じ拍に重なった和音でも頭は velocity の高さで
+    /// 縦にばらけるので、 掴む先と値が見える。 hit-test / y↔velocity 写像も同じ半径を使う。
+    pub velocity_head_radius_px: f32,
+    /// note 選択があるときの、 非選択ロリポップの alpha (選択分を最前面で際立たせる)。
+    pub velocity_unselected_alpha: f32,
     /// (M13 Phase 55) ruler 領域の背景色 (`view.ruler_h > 0` のとき `time_ruler` の `bg` に渡す)。
     pub ruler_bg: Color,
     /// (M13 Phase 55) ruler の小節番号テキスト色 (`time_ruler` の `label_color` に渡す)。
@@ -571,6 +582,8 @@ impl PianoRollStyle {
             sub_line_width_px: 1.0,
             velocity_ramp: VelocityRamp { low: d.note_velocity_low, high: d.note_velocity_high },
             note_border_radius_px: 1.5,
+            note_outline_w: 1.0,
+            note_outline_alpha: 0.45,
             // note は clip より小さいので clip ハッチ (alpha 0.34) より一段濃く。
             note_muted_hatch_color: p.hatch_ink.with_alpha(0.40),
             note_muted_hatch_spacing_px: 5.0,
@@ -594,7 +607,9 @@ impl PianoRollStyle {
             playhead_width_px: 2.5,
             velocity_lane_bg: p.panel,
             velocity_bar_color: p.accent,
-            velocity_bar_width_px: 3.0,
+            velocity_bar_width_px: 2.0,
+            velocity_head_radius_px: 4.0,
+            velocity_unselected_alpha: 0.35,
             // 歌詞は velocity / クリップ色で塗られた note の上に乗る = 可変背景。 note fill は
             // 明るい側なので極性固定の暗インク (テーマで反転させるとライトで消える)。
             lyric_color: p.ink_on_bright,
@@ -1560,31 +1575,43 @@ mod tests {
     #[test]
     fn velocity_from_y_at_lane_top_returns_127() {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
-        assert_eq!(velocity_from_y(340.0, area), 127);
+        assert_eq!(velocity_from_y(340.0, area, 0.0), 127);
+        // 頭の半径ぶん内側が可動域の上端 = 127。
+        assert_eq!(velocity_from_y(344.0, area, 4.0), 127);
     }
 
     #[test]
     fn velocity_from_y_at_lane_bottom_returns_0() {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
-        assert_eq!(velocity_from_y(400.0, area), 0);
+        assert_eq!(velocity_from_y(400.0, area, 0.0), 0);
+        assert_eq!(velocity_from_y(396.0, area, 4.0), 0);
     }
 
     #[test]
     fn velocity_from_y_clamps_above_lane_to_127() {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
-        assert_eq!(velocity_from_y(100.0, area), 127, "lane の上を超えても 127 で clamp");
+        assert_eq!(velocity_from_y(100.0, area, 4.0), 127, "lane の上を超えても 127 で clamp");
     }
 
     #[test]
     fn velocity_from_y_clamps_below_lane_to_0() {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
-        assert_eq!(velocity_from_y(500.0, area), 0, "lane の下を超えても 0 で clamp");
+        assert_eq!(velocity_from_y(500.0, area, 4.0), 0, "lane の下を超えても 0 で clamp");
     }
 
     #[test]
     fn velocity_from_y_zero_height_is_defensive_zero() {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 0.0 };
-        assert_eq!(velocity_from_y(340.0, area), 0);
+        assert_eq!(velocity_from_y(340.0, area, 4.0), 0);
+    }
+
+    #[test]
+    fn velocity_head_y_roundtrips_with_velocity_from_y() {
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        for vel in [0u8, 1, 64, 100, 127] {
+            let y = velocity_head_y(vel, area, 4.0);
+            assert_eq!(velocity_from_y(y, area, 4.0), vel);
+        }
     }
 
     /// `velocity_bar_hit` の hit / miss / tolerance。
@@ -1594,10 +1621,10 @@ mod tests {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(7, 1.0, 0.5, 60)]; // bar x = 200
         // 中央は hit
-        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |_| false), Some(7));
-        // 中央 ±5.5px (= bar_width/2 + tolerance) は hit
-        assert_eq!(velocity_bar_hit(&notes, view, area, 195.0, 3.0, 4.0, |_| false), Some(7));
-        assert_eq!(velocity_bar_hit(&notes, view, area, 205.0, 3.0, 4.0, |_| false), Some(7));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 400.0, 3.0, 4.0, 4.0, |_| false), Some(7));
+        // 中央 ±8px (= max(bar_width/2, head_r) + tolerance) は hit
+        assert_eq!(velocity_bar_hit(&notes, view, area, 195.0, 400.0, 3.0, 4.0, 4.0, |_| false), Some(7));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 205.0, 400.0, 3.0, 4.0, 4.0, |_| false), Some(7));
     }
 
     #[test]
@@ -1605,9 +1632,9 @@ mod tests {
         let view = test_view();
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(7, 1.0, 0.5, 60)]; // bar x = 200
-        // hit zone は ±5.5px。 7 px 離れていれば miss。
-        assert_eq!(velocity_bar_hit(&notes, view, area, 207.0, 3.0, 4.0, |_| false), None);
-        assert_eq!(velocity_bar_hit(&notes, view, area, 193.0, 3.0, 4.0, |_| false), None);
+        // hit zone は ±8px。 9 px 離れていれば miss。
+        assert_eq!(velocity_bar_hit(&notes, view, area, 209.0, 400.0, 3.0, 4.0, 4.0, |_| false), None);
+        assert_eq!(velocity_bar_hit(&notes, view, area, 191.0, 400.0, 3.0, 4.0, 4.0, |_| false), None);
     }
 
     #[test]
@@ -1616,7 +1643,7 @@ mod tests {
         let view = test_view();
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(1, 1.0, 0.5, 60), note(2, 1.0, 0.5, 67)];
-        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |_| false), Some(2));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 400.0, 3.0, 4.0, 4.0, |_| false), Some(2));
     }
 
     #[test]
@@ -1626,13 +1653,31 @@ mod tests {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(1, 1.0, 0.5, 60), note(2, 1.0, 0.5, 67)];
         // note 1 (最前面でない) が選択されていれば、 後勝ちの note 2 でなく note 1 を返す。
-        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |id| id == 1), Some(1));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 400.0, 3.0, 4.0, 4.0, |id| id == 1), Some(1));
         // note 2 が選択されていれば note 2 (これは後勝ちとも一致)。
-        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |id| id == 2), Some(2));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 400.0, 3.0, 4.0, 4.0, |id| id == 2), Some(2));
         // 両方選択なら、 選択中の後勝ち = note 2。
         assert_eq!(
-            velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |_| true),
+            velocity_bar_hit(&notes, view, area, 200.0, 400.0, 3.0, 4.0, 4.0, |_| true),
             Some(2)
         );
+    }
+
+    #[test]
+    fn velocity_bar_hit_prefers_the_head_under_the_pointer() {
+        // 同じ拍に重なった 2 音でも頭は velocity で縦にばらける。 頭に乗っていればその 1 音
+        // (選択中の別 note より優先) — 「一部だけ選んでベロシティを変える」 の入口。
+        let view = test_view();
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        let mut low = note(1, 1.0, 0.5, 60);
+        low.velocity = 40;
+        let high = note(2, 1.0, 0.5, 67); // velocity 96
+        let notes = vec![low, high];
+        let y_low = velocity_head_y(40, area, 4.0);
+        let y_high = velocity_head_y(96, area, 4.0);
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, y_low, 2.0, 4.0, 4.0, |id| id == 2), Some(1));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, y_high, 2.0, 4.0, 4.0, |id| id == 1), Some(2));
+        // 頭から外れた柱の途中は従来どおり選択優先。
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 399.0, 2.0, 4.0, 4.0, |id| id == 1), Some(1));
     }
 }

@@ -1071,15 +1071,25 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // ----- Split (E) / Glue (J) — Phase 1 PR7 -------------------------------
     // MIDI / Audio / Vocal すべての clip kind に対して動作する統合操作。
     // 詳細は `docs/plan_audio_clip.md` §3.3。
-    if ui.take_shortcut("daw.split_clip_at_cursor") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::SplitClipAtPlayhead { snap: true });
-        }));
-    }
-    if ui.take_shortcut("daw.split_clip_at_cursor_no_snap") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::SplitClipAtPlayhead { snap: false });
-        }));
+    // `e` も `j` と同じくビューで意味が分かれる — アレンジャー = クリップ分割 /
+    // ピアノロール = **ノート分割** (ポインタ直下 → 選択、 snap は Alt で無効、 の同じ規則)。
+    let split_snap = if ui.take_shortcut("daw.split_clip_at_cursor") {
+        Some(true)
+    } else if ui.take_shortcut("daw.split_clip_at_cursor_no_snap") {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(snap) = split_snap {
+        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.action_split_notes_at_cursor(snap);
+            }));
+        } else {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SplitClipAtPlayhead { snap });
+            }));
+        }
     }
     // `j` はビューで意味が分かれる — アレンジャー = 範囲を 1 クリップへ焼き込む /
     // ピアノロール = **Join Notes** (同じ音のノートを 1 本に結合)。
