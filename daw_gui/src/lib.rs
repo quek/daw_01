@@ -58,6 +58,7 @@ pub mod master_meter;
 pub mod midi;
 pub mod midi_export;
 pub mod midi_import;
+pub mod note_ops;
 // `--script` headless テスト駆動。JS エンジン boa_engine を抱えるので `script`
 // feature 有効時のみコンパイルする (default ビルドのコールド時間短縮)。
 #[cfg(feature = "script")]

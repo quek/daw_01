@@ -98,7 +98,7 @@ FILE-BUDGET | daw_gui/src/view/track_inspector/mod.rs  | 2214 | 巨大 draw / ma
 # **#71 統合後の実測は 1993 で、天井を上げる必要は無くなった** — #71 が app.rs を
 # 5 行 (handle_event を 7 行) 縮めていて、そのぶんを #74 が使い切った形。
 # 天井は据え置き = 実測値そのもの (余裕ゼロ) のまま。
-FILE-BUDGET | daw_gui/src/app.rs                       | 2004 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で Parallel / chain の event arm (Group/Ungroup/AddParallelChain/SetChain*) +11。
+FILE-BUDGET | daw_gui/src/app.rs                       | 1983 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で Parallel / chain の event arm (Group/Ungroup/AddParallelChain/SetChain*) +11。 2026-09-06: ParamGestureBegin/End の arm 本体を handler/param_gesture.rs へ移して 1983 (締まる方向なので実測値へ下げた)。
 FILE-BUDGET | daw_gui/src/view/runner.rs               | 1618 | #71 で drag payload の frame ライフサイクル配線 +3。分割は runner の責務分けごと別タスク。未起票
 FILE-BUDGET | daw_gui/src/handler/automation.rs        | 1410 | 巨大 draw / match。未起票
 FILE-BUDGET | daw_gui/src/script.rs                    | 1249 | Glue の焼き込み検証で `setTimeSelection` (選択の SSoT = 範囲 × レーンを headless で張る口) +21。binding は 1 か所に並べる規約なので割らない。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で picker 引数 `chain` +1。
@@ -111,7 +111,7 @@ FILE-BUDGET | daw_gui/src/handler/automation_lanes.rs  | 1170 | 巨大 draw / ma
 #                              `daw_gui/src/device_addr.rs` へ (不変条件 1 の中枢)。
 #   root.rs      1055 ->  budget 内: Ctrl+C/X/V/D の面別規則を
 #                              `daw_gui/src/view/clipboard_ops.rs` へ (行ごと削除)。
-FILE-BUDGET | daw_gui/src/app_types.rs                 | 1345 | #71 で device_addr.rs を切り出して縮小。残りも責務ごとに割れる。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で `SidechainPort` / `ChainRow` の型 +2。 Parallel ヘッダ行の out_gain / gain_match +8。 r.md #112 (帯域分割) の `SplitParams` 行と scrub field +3。
+FILE-BUDGET | daw_gui/src/app_types.rs                 | 1197 | #71 で device_addr.rs を切り出して縮小。残りも責務ごとに割れる。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で `SidechainPort` / `ChainRow` の型 +2。 Parallel ヘッダ行の out_gain / gain_match +8。 r.md #112 (帯域分割) の `SplitParams` 行と scrub field +3。 2026-09-06: ノート集合のピュア関数 4 本を note_ops.rs へ切り出して 1197 (実測値へ下げた)。
 
 # C. プロセス境界の実装 (FFI / IPC / plugin host / audio engine)。
 #    CLAP / VST3 の C ABI 実装と、shmem + ring buffer の往復が 1 ファイルに集まっている。
@@ -154,7 +154,7 @@ FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy 
 FN-BUDGET | daw_gui/src/view/track_inspector/mod.rs::draw                             | 2063 | 巨大 draw / match。未起票
 # handle_event も #74 の arm で +5 だが、#71 が -7 していたので **#71 統合後の実測は
 # 1621** (旧天井 1623 より低い)。締まる方向なので実測値へ下げる。
-FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1622 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で +1。
+FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1601 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で +1。 2026-09-06: ParamGestureBegin/End を handler/param_gesture.rs へ移して 1601 (実測値へ下げた)。
 FN-BUDGET | daw_gui/src/view/audio_editor.rs::draw                                    |  781 | 巨大 draw / match。未起票
 FN-BUDGET | daw_gui/src/view/arrangement_view.rs::draw                                |  577 | #71 が足したのは dispatch 1 行だけ (本体 57 行は関数外の `device_drag_over_headers`)。未起票
 FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                              |  525 | 巨大 draw / match。未起票
