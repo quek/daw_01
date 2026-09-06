@@ -210,6 +210,60 @@ impl AppData {
         });
     }
 
+    /// 全オートメーションレーンが「見えている」か = 全レーンの `visible` が立っていて、
+    /// レーンを持つ行 (トラック / master) がどれも畳まれていない。 レーンが 1 本も無ければ
+    /// `None` (トランスポートの `A` ボタンは消灯、押しても何も起きない)。
+    #[must_use]
+    pub(crate) fn all_automation_lanes_visible(&self) -> Option<bool> {
+        let song = self.song_doc.song();
+        song.all_automation_lanes().next()?;
+        let all_visible = song.all_automation_lanes().all(|l| l.visible);
+        let all_expanded = song
+            .tracks
+            .iter()
+            .filter(|t| !t.automation_lanes.is_empty())
+            .all(|t| self.ui_prefs.expanded_automation_tracks.contains(&t.id))
+            && (song.song_lanes.is_empty() || self.ui_prefs.master_row_automation_expanded);
+        Some(all_visible && all_expanded)
+    }
+
+    /// Live の automation toggle (`A` ボタン / `Alt+A`): 1 本でも隠れていれば **全部出す**
+    /// (👁 の `visible` を立て、畳まれた行を展開)、 全部出ていれば **全部隠す**
+    /// (`visible` を落とす。 行の展開状態はそのまま = 次に出すときの手間を増やさない)。
+    ///
+    /// `visible` は 👁 と同じ Song 側の状態なので `edit_song_checked` を通す (👁 と同じ
+    /// 口 = undo / dirty の扱いも同じ)。 展開状態は view の都合なので `ui_prefs`。
+    pub(crate) fn toggle_all_automation_lanes_visible(&mut self) {
+        let Some(all_visible) = self.all_automation_lanes_visible() else {
+            return;
+        };
+        let show = !all_visible;
+        self.edit_song_checked(|song| {
+            let mut changed = false;
+            for lane in song.all_automation_lanes_mut() {
+                if lane.visible != show {
+                    lane.visible = show;
+                    changed = true;
+                }
+            }
+            changed
+        });
+        if show {
+            let song = self.song_doc.song();
+            let with_lanes: Vec<u32> = song
+                .tracks
+                .iter()
+                .filter(|t| !t.automation_lanes.is_empty())
+                .map(|t| t.id)
+                .collect();
+            let has_song_lanes = !song.song_lanes.is_empty();
+            self.ui_prefs.expanded_automation_tracks.extend(with_lanes);
+            if has_song_lanes {
+                self.ui_prefs.master_row_automation_expanded = true;
+            }
+        }
+    }
+
     /// Lane header default slider drag (release / live preview)。
     /// `next_norm` は normalized 0..=1、target に応じて plain 単位に
     /// 逆変換してから格納する。同時に last-touched param も更新する

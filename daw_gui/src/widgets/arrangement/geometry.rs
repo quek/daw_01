@@ -923,17 +923,31 @@ pub(super) struct HeaderRowLayout {
     /// `automation_lanes` が空の track でも layout 上の幅は確保 (= 名前領域が track 間で一定)、
     /// 空 lane の track では描画されないが click も反応しない (caller が `lanes.is_empty()` で判定)。
     pub(super) lane_disc_rect: Rect,
+    /// ヘッダ右端の縦 L/R レベルメーター (Bitwig / Live のトラックヘッダと同じ位置)。
+    /// 行高に関係なく常に確保し、 高さは inner いっぱい (名前帯 + volume band を跨ぐ)。
+    /// 幅は [`HEADER_METER_W`] 固定で、 名前帯 / M·S·R / band はこの左に詰める。
+    pub(super) meter_rect: Rect,
 }
+
+/// トラックヘッダ右端のレベルメーターの幅 (px)。 L / R 各 3px + 隙間 1px
+/// (`stereo_bar_width` が `(w - 1) / 2` で割るので 7 → 3px ずつ)。
+pub(super) const HEADER_METER_W: f32 = 7.0;
 
 #[allow(clippy::similar_names)]
 pub(super) fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
     let pad = 4.0_f32;
-    let inner = Rect {
+    let outer = Rect {
         x: row.x + pad,
         y: row.y + pad,
         w: (row.w - pad * 2.0).max(2.0),
         h: (row.h - pad * 2.0).max(2.0),
     };
+    // 右端のメーターを先に切り出し、 残りを従来の inner として配る。 メーターは
+    // progressive disclosure の対象外 (行を潰してもレベルは見えるべき情報)。
+    let meter_gap = 3.0_f32;
+    let meter_w = HEADER_METER_W.min(outer.w);
+    let meter_rect = Rect { x: outer.x + outer.w - meter_w, y: outer.y, w: meter_w, h: outer.h };
+    let inner = Rect { w: (outer.w - meter_w - meter_gap).max(2.0), ..outer };
     // buttons は常に 20px max (band の有無で縮めない)。band は inner.h に余裕があるときだけ表示する。
     let btn_h = inner.h.min(20.0);
     let small = 22.0_f32;
@@ -1001,7 +1015,7 @@ pub(super) fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayou
     } else {
         None
     };
-    HeaderRowLayout { name_rect, buttons, volume_band, lane_disc_rect }
+    HeaderRowLayout { name_rect, buttons, volume_band, lane_disc_rect, meter_rect }
 }
 
 /// M14 Phase 63c (#016): group disclosure アイコンの hit / 描画 rect。

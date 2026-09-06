@@ -56,7 +56,8 @@ impl Default for LauncherRects {
 /// 構造的に防ぐ (計画書 Q5)。
 #[must_use]
 pub(crate) fn resolve_pane_w(view: &LauncherView, avail_w: f32) -> f32 {
-    resolve_pane_w_raw(view.layout, view.width, avail_w)
+    let keep_return_col = view.rows.values().any(LauncherRowView::launcher_owns);
+    resolve_pane_w_raw(view.layout, view.width, avail_w, keep_return_col)
 }
 
 /// [`resolve_pane_w`] の素の入力版。
@@ -64,11 +65,24 @@ pub(crate) fn resolve_pane_w(view: &LauncherView, avail_w: f32) -> f32 {
 /// **`view_build` もここを通す。** アレンジのレーンの幅 (= `view.len_beats` を決める
 /// 分母) は帯のぶんを引いた残りなので、帯幅の式が 2 か所にあると「ルーラーと
 /// クリップは揃っているのに `arrange_zoom_x` の意味だけ静かにズレる」状態になる。
+///
+/// `keep_return_col` = ランチャーが主導権を握っている行が 1 つでもある
+/// (`Song::any_launcher_owned_row` / `LauncherRowView::launcher_owns`)。 このとき
+/// 「アレンジのみ」でも帯を [`RETURN_COL_W`] ぶん残して「アレンジへ返す」列を出す —
+/// 帯を隠した状態でアレンジが鳴らない理由が画面のどこにも無い、を防ぐ。 全行が
+/// アレンジなら従来どおりつかみ代だけ。
 #[must_use]
-pub(crate) fn resolve_pane_w_raw(layout: LauncherLayout, width: f32, avail_w: f32) -> f32 {
+pub(crate) fn resolve_pane_w_raw(
+    layout: LauncherLayout,
+    width: f32,
+    avail_w: f32,
+    keep_return_col: bool,
+) -> f32 {
     let (lo, hi) = pane_w_bounds(avail_w);
     match layout {
-        LauncherLayout::ArrangerOnly => lo,
+        LauncherLayout::ArrangerOnly => {
+            if keep_return_col { (lo + RETURN_COL_W).min(hi) } else { lo }
+        }
         LauncherLayout::LauncherOnly => hi,
         LauncherLayout::Both => {
             let w = if width > 0.0 { width } else { DEFAULT_PANE_W };
@@ -138,8 +152,11 @@ pub(crate) fn split(
     // (幅を変えるドラッグとボタンが同じ場所に居る、が実機で出た)。
     let grab_w = PANE_SPLITTER_HANDLE.min(pane.w);
     let cols_w = (pane.w - grab_w).max(0.0);
-    let stop_w = STOP_COL_W.min(cols_w);
-    let return_w = RETURN_COL_W.min((cols_w - stop_w).max(0.0));
+    // **返す列を先に確保する。** 「アレンジのみ」でランチャー主導の行があるとき、帯は
+    // つかみ代 + 返す列ぶんしか無い (`resolve_pane_w_raw`)。停止列を先に取ると、その
+    // 16px を停止列が食って返す列が 0 になる。両方入る幅では順序に意味は無い。
+    let return_w = RETURN_COL_W.min(cols_w);
+    let stop_w = STOP_COL_W.min((cols_w - return_w).max(0.0));
     let grid_w = (cols_w - stop_w - return_w).max(0.0);
     let stop_col = Rect { x: pane.x, y: rect.y, w: stop_w, h: rect.h };
     let return_col = Rect {

@@ -1,8 +1,12 @@
 //! 下部パネル「Sampler」タブ (`docs/plan_global_sampler.md` §3.3)。
 //!
-//! 常にリング全体を表示する (右端 = 今、Q8 でスクロール / ズーム無し)。
-//! - ヘッダ: 録音源 / 長さ (秒) / 一時停止 / 試聴 / 選択長。
-//! - 本体: 波形オーバービュー + 再生していた区間の小節線 + 秒目盛 + 選択範囲。
+//! 常にリング全体を **スイープ表示** する (書き込み位置が左から右へ進み、右端で左へ戻る。
+//! スクロールしないので鳴っている最中でも範囲選択できる。Q8 でズーム無し)。
+//! 折り返し点をまたぐ範囲はドラッグで選べないので、位相を「半周ずらす」ボタン /
+//! 波形上のホイールで動かす ([`RingAxis::offset`])。
+//! - ヘッダ: 録音源 / 長さ (秒) / 一時停止 / 試聴 / 半周ずらす / 選択長。
+//! - 本体: 波形オーバービュー + 書き込み位置の線 + 再生していた区間の小節線 + 秒目盛 +
+//!   選択範囲 (折り返すときは 2 本)。
 //! - 左ドラッグで範囲選択。選択の上で押してドラッグすると daw-ui の drag payload
 //!   ([`SAMPLER_DRAG_KIND`]) で持ち出し、アレンジ / セルが受ける
 //!   (`arrangement_view::take_capture_drops`)。
@@ -42,11 +46,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     draw_header(app, ui, header);
 
     let st = &app.sampler;
+    let capacity = st.capacity();
     let axis = RingAxis {
         x: body.x,
         w: body.w,
         write_frames: st.write_frames,
-        capacity: st.capacity(),
+        capacity,
+        offset: (f64::from(st.sweep_shift.clamp(0.0, 1.0)) * capacity as f64) as u64,
     };
     let wave = Rect { x: body.x, y: body.y, w: body.w, h: (body.h - RULER_H).max(1.0) };
     ui.push_rect(RectCommand {
@@ -62,22 +68,41 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         return;
     }
     let sr = st.sample_rate();
-    draw_bar_lines(app, ui, wave, |frame| axis.frame_to_x(frame), &sampler_bar_source(app));
+    draw_bar_lines(
+        app,
+        ui,
+        wave,
+        |frame| axis.frame_to_x(frame),
+        |s, e| axis.x_spans(s, e),
+        &sampler_bar_source(app),
+    );
     draw_seconds_ruler(app, ui, body, RULER_H, |secs_ago| {
         axis.frame_to_x(st.write_frames.saturating_sub((secs_ago * f64::from(sr)) as u64))
-    }, st.capacity() as f64 / f64::from(sr.max(1)));
+    }, capacity as f64 / f64::from(sr.max(1)));
     draw_waveform(app, ui, wave, &axis);
 
-    // ---- 選択 / 持ち出し ----
-    let sel_rect = st.selection.map(|(s, e)| Rect {
-        x: axis.frame_to_x(s),
-        y: wave.y,
-        w: (axis.frame_to_x(e) - axis.frame_to_x(s)).max(1.0),
-        h: wave.h,
-    });
-    if let Some(r) = sel_rect {
+    // 波形上のホイールで位相をずらす (1 notch = 1/16 周)。折り返し点をまたぐ範囲を
+    // 選びたいときに、折り返し点のほうを動かす。
+    let (_, wheel) = ui.take_scroll_in_rect(wave);
+    if wheel.abs() > 0.0 {
+        let delta = -wheel.signum() * (1.0 / 16.0);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::Sampler(SamplerEvent::ShiftSweep(delta)));
+        }));
+    }
+
+    // ---- 選択 / 持ち出し (折り返す選択は 2 本の矩形) ----
+    let sel_rects: Vec<Rect> = st
+        .selection
+        .map(|(s, e)| axis.x_spans(s, e))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|(x0, x1)| Rect { x: x0, y: wave.y, w: (x1 - x0).max(1.0), h: wave.h })
+        .collect();
+    for r in &sel_rects {
         ui.push_rect(RectCommand {
-            rect: r,
+            rect: *r,
             fill: p.accent_wash,
             border: p.accent,
             border_width: 1.0,
@@ -87,7 +112,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     let pointer = ui.pointer();
     let press_in_sel = pointer.primary_just_pressed
-        && pointer.pos.is_some_and(|(px, py)| sel_rect.is_some_and(|r| r.contains(px, py)));
+        && pointer.pos.is_some_and(|(px, py)| sel_rects.iter().any(|r| r.contains(px, py)));
     if press_in_sel {
         if let (Some(_), Some((s, e))) = (ui.take_primary_press_in_rect(wave), st.selection) {
             ui.begin_drag(SAMPLER_DRAG_KIND, SamplerDragPayload { start_frame: s, end_frame: e });
@@ -150,6 +175,13 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
         ("sampler_pause", app.sampler.paused, AppEvent::Sampler(SamplerEvent::TogglePaused)),
         ("sampler_preview", app.sampler.preview_until.is_some(), app.sampler.selection.is_some(), AppEvent::Sampler(SamplerEvent::TogglePreview)),
     );
+
+    // スイープの位相を半周ずらす (折り返し点をまたぐ範囲を選ぶため)。
+    let shift = Rect { x, y, w: 84.0, h: 22.0 };
+    ui.button_at("sampler_half_shift", "半周ずらす", shift, || {
+        Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Sampler(SamplerEvent::ShiftSweep(0.5))))
+    });
+    x += shift.w + PAD * 2.0;
 
     if let Some((s, e)) = app.sampler.selection {
         let secs = (e - s) as f64 / f64::from(app.sampler.sample_rate().max(1));
@@ -243,6 +275,8 @@ pub(crate) fn pause_and_preview(
 }
 
 /// 波形オーバービュー: 1 px 列ごとにそこへ落ちるバケツの min/max を縦線で描く。
+/// スイープ表示なので列 = リングの物理位置 (位相込み)。書き込み位置より右は前の周回、
+/// まだ書かれていない位置 (最初の周回) は空白。書き込み位置には縦線を立てる。
 fn draw_waveform(app: &AppData, ui: &mut Ui<'_, AppData>, wave: Rect, axis: &RingAxis) {
     let p = &app.theme.core;
     let st = &app.sampler;
@@ -254,11 +288,12 @@ fn draw_waveform(app: &AppData, ui: &mut Ui<'_, AppData>, wave: Rect, axis: &Rin
     let half = wave.h / 2.0 - 1.0;
     let cols = wave.w.floor() as usize;
     let frames_per_px = axis.capacity as f64 / wave.w as f64;
-    let oldest = axis.oldest();
-    let mut segs: Vec<LineSegment> = Vec::with_capacity(cols);
+    let mut segs: Vec<LineSegment> = Vec::with_capacity(cols + 1);
     for c in 0..cols {
-        let f0 = oldest + (c as f64 * frames_per_px) as u64;
-        let f1 = oldest + ((c + 1) as f64 * frames_per_px) as u64;
+        // 列の左端 x → 物理位置 → 絶対 frame (今の周回 / 前の周回を `phys_to_frame` が解く)。
+        let phys = axis.x_to_phys(wave.x + c as f32);
+        let Some(f0) = axis.phys_to_frame(phys) else { continue };
+        let f1 = f0 + (frames_per_px.ceil() as u64).max(1);
         let (b0, b1) = (f0 / BUCKET_FRAMES, (f1.max(f0 + 1) - 1) / BUCKET_FRAMES + 1);
         let (mut lo, mut hi) = (0.0f32, 0.0f32);
         for b in b0..b1 {
@@ -273,8 +308,12 @@ fn draw_waveform(app: &AppData, ui: &mut Ui<'_, AppData>, wave: Rect, axis: &Rin
             color: ink,
         });
     }
+    // 書き込み位置 (= 今) の縦線。スイープでは波形が流れないので、これが無いと
+    // 「どこまでが新しいか」が読めない。
+    let head_x = axis.phys_to_x(axis.head_phys()).round();
+    segs.push(LineSegment { a: [head_x, wave.y], b: [head_x, wave.y + wave.h], color: p.accent });
     ui.push_lines(LineBatch { segments: Arc::from(segs), line_width_px: 1.0, clip_rect: Some(wave) });
-    // 一時停止中は右端に帯を出す (波形が流れないことの明示)。
+    // 一時停止中は右端に帯を出す (書き込みが止まっていることの明示)。
     if st.paused {
         let r = Rect { x: wave.x + wave.w - 90.0, y: wave.y + 4.0, w: 84.0, h: 18.0 };
         ui.push_rect(RectCommand { rect: r, fill: app.theme.daw.record.with_alpha(0.85), border: Color::TRANSPARENT, border_width: 0.0, radius: [3.0; 4], clip_rect: None });
@@ -303,12 +342,14 @@ fn sampler_bar_source(app: &AppData) -> BarSource {
     BarSource { spans, frames_per_unit: 1.0 }
 }
 
-/// 再生していた区間に小節線 + 小節番号を重ねる。`to_x` は区間の単位 (frame / ns) → x。
+/// 再生していた区間に小節線 + 小節番号を重ねる。`to_x` は区間の単位 (frame / ns) → x、
+/// `to_x_spans` は区間 `[start, end)` → x 区間 (スイープ表示で右端を折り返す区間は 2 本)。
 pub(crate) fn draw_bar_lines(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     wave: Rect,
     to_x: impl Fn(u64) -> f32,
+    to_x_spans: impl Fn(u64, u64) -> [Option<(f32, f32)>; 2],
     src: &BarSource,
 ) {
     let p = &app.theme.core;
@@ -318,15 +359,16 @@ pub(crate) fn draw_bar_lines(
     let mut labels: Vec<(f32, String)> = Vec::new();
     for &(start, end, seg) in &src.spans {
         // 区間の薄い帯 (= 再生していた)。
-        let (x0, x1) = (to_x(start), to_x(end));
-        ui.push_rect(RectCommand {
-            rect: Rect { x: x0, y: wave.y, w: (x1 - x0).max(0.0), h: wave.h },
-            fill: p.accent.with_alpha(0.06),
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [0.0; 4],
-            clip_rect: Some(wave),
-        });
+        for (x0, x1) in to_x_spans(start, end).into_iter().flatten() {
+            ui.push_rect(RectCommand {
+                rect: Rect { x: x0, y: wave.y, w: (x1 - x0).max(0.0), h: wave.h },
+                fill: p.accent.with_alpha(0.06),
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: Some(wave),
+            });
+        }
         let len_frames = ((end - start) as f64 * src.frames_per_unit) as u64;
         let (Some(beat0), Some(beat1)) = (seg.playhead_beat, seg.beat_after(len_frames, sr)) else {
             continue;

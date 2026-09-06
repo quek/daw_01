@@ -3014,3 +3014,117 @@ fn live_source_ids_follow_reachability_and_mouth_map() {
     song.gc_audio_sources();
     assert_eq!(song.media.audio_sources.keys().copied().collect::<Vec<_>>(), vec![1]);
 }
+
+// ---- 時間範囲操作 (Live §6.11 "…Time"、 docs/plan_time_ops.md) ----
+
+/// 3 clip (0-4 / 4-8 / 8-12) と 3 帯、 帯 2 は [2, 10) で範囲をまたぐ。
+fn time_ops_song() -> Song {
+    Song {
+        length_beats: 12.0,
+        sections: vec![mk_section(1, 0.0, 2.0), mk_section(2, 2.0, 8.0), mk_section(3, 10.0, 2.0)],
+        ids: IdAllocators { next_section_id: 4, ..Song::default().ids },
+        tracks: vec![Track {
+            id: 1,
+            clips: (0..3)
+                .map(|i| Clip {
+                    id: i + 1,
+                    start_beat: f64::from(i) * 4.0,
+                    length_beats: 4.0,
+                    content_id: 7,
+                    ..Default::default()
+                })
+                .collect(),
+            next_clip_id: 4,
+            ..Track::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn clip_windows(song: &Song) -> Vec<(f64, f64, f64)> {
+    let mut v: Vec<(f64, f64, f64)> = song.tracks[0]
+        .clips
+        .iter()
+        .map(|c| (c.start_beat, c.length_beats, c.content_offset_beats))
+        .collect();
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    v
+}
+
+fn section_spans(song: &Song) -> Vec<(u32, f64, f64)> {
+    let mut v: Vec<(u32, f64, f64)> =
+        song.sections.iter().map(|s| (s.id, s.start_beat, s.len_beats)).collect();
+    v.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    v
+}
+
+#[test]
+fn delete_time_range_closes_gap_and_shrinks_spanning_sections() {
+    let mut song = time_ops_song();
+    // [3, 9) を消す: clip1 は 3 で切れて残り、 clip2 は消え、 clip3 は 9→3 で 1 拍削られて詰まる。
+    let r = song.delete_time_range(3.0, 9.0).unwrap();
+    assert_eq!((r.from_beat, r.delta), (9.0, -6.0));
+    assert_eq!(clip_windows(&song), vec![(0.0, 3.0, 0.0), (3.0, 3.0, 1.0)]);
+    // 帯: 1 [0,2) はそのまま、 2 [2,10) は重なり 6 拍ぶん縮んで [2,4)、 3 [10,12) → [4,6)。
+    assert_eq!(section_spans(&song), vec![(1, 0.0, 2.0), (2, 2.0, 2.0), (3, 4.0, 2.0)]);
+    assert_eq!(song.length_beats, 6.0);
+    assert!(song.delete_time_range(5.0, 5.0).is_none(), "幅ゼロは no-op");
+}
+
+#[test]
+fn insert_time_splits_spanning_clip_and_grows_spanning_section() {
+    let mut song = time_ops_song();
+    let r = song.insert_time(6.0, 2.0).unwrap();
+    assert_eq!((r.from_beat, r.delta), (6.0, 2.0));
+    // clip2 [4,8) は 6 で割れて左 [4,6) + 右 [8,10) (content_offset 2)。 clip3 は 8→10。
+    assert_eq!(
+        clip_windows(&song),
+        vec![(0.0, 4.0, 0.0), (4.0, 2.0, 0.0), (8.0, 2.0, 2.0), (10.0, 4.0, 0.0)]
+    );
+    // 帯 2 [2,10) は挿入点をまたぐので 2 拍伸びて [2,12)、 帯 3 は 10→12。
+    assert_eq!(section_spans(&song), vec![(1, 0.0, 2.0), (2, 2.0, 10.0), (3, 12.0, 2.0)]);
+    assert_eq!(song.length_beats, 14.0);
+}
+
+#[test]
+fn duplicate_time_range_inserts_copy_right_after_range() {
+    let mut song = time_ops_song();
+    // [2, 6) を複製 → [6, 10) に同じ中身、 以降は 4 拍押し出される。
+    let r = song.duplicate_time_range(2.0, 6.0).unwrap();
+    assert_eq!((r.from_beat, r.delta), (6.0, 4.0));
+    assert_eq!(
+        clip_windows(&song),
+        vec![
+            (0.0, 4.0, 0.0),  // clip1 そのまま (複製元は割らない)
+            (4.0, 2.0, 0.0),  // clip2 の左半分 (挿入点 6 で割れた)
+            (6.0, 2.0, 2.0),  // 複製: clip1 の [2,4) 部分 (窓を詰めた写し)
+            (8.0, 2.0, 0.0),  // 複製: clip2 の [4,6) 部分
+            (10.0, 2.0, 2.0), // clip2 の右半分
+            (12.0, 4.0, 0.0), // clip3
+        ]
+    );
+    // 帯: [2,6) に完全に入る帯は無いので新帯は無し、 帯 2 [2,10) は挿入点 6 をまたぎ 4 拍伸びる。
+    assert_eq!(section_spans(&song), vec![(1, 0.0, 2.0), (2, 2.0, 12.0), (3, 14.0, 2.0)]);
+}
+
+#[test]
+fn paste_time_range_recreates_missing_content_and_copies_inner_sections() {
+    let mut song = time_ops_song();
+    song.clip_contents.insert(7, ClipContent::Midi(MidiContent::default()));
+    song.clip_content_names.insert(7, "melody".into());
+    let copy = song.copy_time_range(0.0, 4.0).unwrap();
+    assert_eq!(copy.span_beats, 4.0);
+    assert_eq!(copy.sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1], "完全に入る帯だけ");
+    assert!(copy.contents.contains_key(&7));
+    // 別プロジェクト扱いで貼る: content は写しから採番し直され、 帯は新 id で置かれる。
+    let mut dest = Song::default();
+    dest.tracks.push(Track { id: 1, ..Track::default() });
+    let pasted = dest.paste_time_range(2.0, &copy, false).unwrap();
+    assert_eq!(pasted.section_ids.len(), 1);
+    let c = &dest.tracks[0].clips[0];
+    assert_eq!((c.start_beat, c.length_beats), (2.0, 4.0));
+    assert_ne!(c.content_id, 0);
+    assert_eq!(dest.clip_content_names.get(&c.content_id).map(String::as_str), Some("melody"));
+    assert_eq!(dest.sections[0].start_beat, 2.0);
+    assert_eq!(dest.sections[0].name, "S1");
+}

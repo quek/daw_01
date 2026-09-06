@@ -108,7 +108,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     {
         // 共有 dB→y 領域: group rect から 1 度だけ導出する。 fader と meter は同じ rect.y / rect.h を
         // 見るので、 この region.y / region.h を両方に渡せば画素整合する (SSoT、 #083 の本質)。
-        let region = meter_content_region(rect, style.scale.is_some(), style.peak_readout);
+        let region = meter_content_region(rect, style.shows_scale_marks(), style.peak_readout);
 
         // 横分割: [fader_w | METER_GAP | meter]。fader_w / meter_x を rect 内に clamp。
         let fader_w = fader_w.clamp(0.0, rect.w);

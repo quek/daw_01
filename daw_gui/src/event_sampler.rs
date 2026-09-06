@@ -22,6 +22,9 @@ pub enum SamplerEvent {
     TogglePaused,
     /// 選択範囲 `[start, end)` (リング絶対フレーム)。`None` で解除。
     SetSelection(Option<(u64, u64)>),
+    /// スイープ表示の位相を `delta` (リング 1 周 = 1.0) だけずらす (`[0, 1)` に折り返す)。
+    /// 「半周ずらす」ボタン = 0.5、波形上のホイール = 小刻み。
+    ShiftSweep(f32),
     /// 選択範囲の試聴 (再押下で停止)。
     TogglePreview,
     /// 選択範囲をアレンジ / セルへ落とした (WAV に書き出して audio clip にする)。

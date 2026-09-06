@@ -133,6 +133,15 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.goto_timeline_home", keys: &["Home"], category: ShortcutCategory::Transport, description: "プレイヘッドを最後のクリップ先頭へ (再押下で 1.1.1)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "daw.goto_timeline_end", keys: &["End"], category: ShortcutCategory::Transport, description: "プレイヘッドを最後のクリップの後ろへ", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "daw.cycle_arrange_follow", keys: &["Alt+F"], category: ShortcutCategory::Transport, description: "再生追従スクロール: OFF → 連続 → ページ を循環", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.toggle_automation_lanes", keys: &["Alt+A"], category: ShortcutCategory::Automation, description: "全オートメーションレーンの表示 / 非表示 (1 本でも隠れていれば全部出す)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // Live §6.11 "…Time" (docs/plan_time_ops.md): 範囲選択の **時間そのもの** を全トラック
+    // 縦断で動かす。 キーは Live と同じ。 `Ctrl+Shift+Delete` は素の Delete と同じく
+    // typing 中に食わないよう typing_only。
+    ShortcutDef { name: "daw.cut_time", keys: &["Ctrl+Shift+X"], category: ShortcutCategory::Edit, description: "時間をカット: 範囲の時間を全トラックから切り取って詰める (clipboard へ)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.paste_time", keys: &["Ctrl+Shift+V"], category: ShortcutCategory::Edit, description: "時間を貼り付け: clipboard の時間を範囲の先頭に差し込む (以降を押し出す)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.duplicate_time", keys: &["Ctrl+Shift+D"], category: ShortcutCategory::Edit, description: "時間を複製: 範囲を直後に時間ごと複製する (以降を押し出す)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.delete_time", keys: &["Ctrl+Shift+Delete"], category: ShortcutCategory::Edit, description: "時間を削除: 範囲の時間を全トラックから取り除いて詰める", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
+    ShortcutDef { name: "daw.insert_silence", keys: &["Ctrl+I"], category: ShortcutCategory::Edit, description: "無音を挿入: 範囲の先頭に範囲の長さぶんの空き時間を差し込む", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // ----- トラック -----
     ShortcutDef { name: "daw.add_track", keys: &["Ctrl+T"], category: ShortcutCategory::Track, description: "トラックを追加", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.group_tracks", keys: &["Ctrl+G"], category: ShortcutCategory::Track, description: "選択トラックをグループ化", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },

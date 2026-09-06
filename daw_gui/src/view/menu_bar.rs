@@ -235,6 +235,25 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 enabled: true,
                 shortcut_hint: shortcuts::shortcut_hint("delete"),
             });
+            // Live §6.11 "…Time" (docs/plan_time_ops.md): 範囲選択の時間そのものを
+            // 全トラック縦断で動かす。 並びは Live の Edit メニューと同じ。
+            m.separator();
+            event_item(m, "時間をカット", "daw.cut_time", AppEvent::CutTime);
+            m.item_with(daw_ui_core::MenuItemSpec {
+                label: "時間を貼り付け",
+                on_click: Box::new(|ui| {
+                    // メニューからは paste 先読みが無いので、 その場で clipboard を読む。
+                    if let Some(text) = ui.read_clipboard_text() {
+                        crate::view::clipboard_ops::paste_time(ui, &text);
+                    }
+                }),
+                enabled: true,
+                shortcut_hint: shortcuts::shortcut_hint("daw.paste_time"),
+            });
+            event_item(m, "時間を複製", "daw.duplicate_time", AppEvent::DuplicateTime);
+            event_item(m, "時間を削除", "daw.delete_time", AppEvent::DeleteTime);
+            event_item(m, "無音を挿入", "daw.insert_silence", AppEvent::InsertSilence);
+            m.separator();
             // r.md #48: アプリ全体の設定 (テーマ選択)。 Ardour / Cubase の Windows 版が
             // Edit > Preferences なので、 DAW に慣れた人が最初に見る場所に置く。
             event_item(m, "設定...", "daw.toggle_settings", AppEvent::ToggleSettings);

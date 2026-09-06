@@ -7,6 +7,7 @@
 //! - 窓 (クリップ) の分割 = [`common::model::carve_range`] (非重なり規則と同じ 1 本)
 //! - content の分割 = [`common::model::Song::split_content_at`] (共有されていれば CoW)
 
+use crate::event::AppEvent;
 use crate::state::*;
 use common::model::{ClipKey, LaneRef, TimeSelection};
 
@@ -695,5 +696,127 @@ fn copy_one_lane(
         c.id = lane.next_clip_id.max(1);
         lane.next_clip_id = c.id + 1;
         lane.clips.push(c);
+    }
+}
+
+// ============================================================
+// Live §6.11 "…Time": 全トラック縦断で時間そのものを動かす (docs/plan_time_ops.md)
+// ============================================================
+
+impl AppData {
+    /// "…Time" 5 コマンドの dispatch (`handle_event` の巨大 match を太らせないための 1 arm)。
+    pub(crate) fn handle_time_event(&mut self, ev: AppEvent) {
+        match ev {
+            AppEvent::DeleteTime => self.delete_time(),
+            AppEvent::CutTime => self.cut_time(),
+            AppEvent::DuplicateTime => self.duplicate_time(),
+            AppEvent::InsertSilence => self.insert_silence(),
+            AppEvent::PasteTime { copy, source_project_id } => {
+                self.paste_time(&copy, source_project_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// 範囲選択の `[start, end)`。無ければ status に理由を出して `None`。
+    ///
+    /// "…Time" コマンド群は**レーンの選択を見ない** (Live §6.11 と同じく全トラックに効く)
+    /// — 見るのは時間区間だけ。
+    fn time_ops_range(&mut self) -> Option<(f64, f64)> {
+        match self.selection.time.as_ref() {
+            Some(sel) if sel.len_beats() > EPS => Some((sel.start_beat, sel.end_beat)),
+            _ => {
+                self.ui_ephemeral.status_message =
+                    "時間範囲を選んでください (アレンジの空きをドラッグ)".to_string();
+                None
+            }
+        }
+    }
+
+    /// Cut Time / Paste Time が運ぶ **全トラック** の時間ごとの写しを clipboard JSON に。
+    /// 範囲が無ければ `None`。
+    pub fn copy_time_clip(&self) -> Option<(String, common::model::TimeRangeCopy)> {
+        let sel = self.selection.time.as_ref()?;
+        let song = self.song_doc.song();
+        let copy = song.copy_time_range(sel.start_beat, sel.end_beat)?;
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            song.project_id,
+            crate::clipboard::ClipboardPayload::Time(copy.clone()),
+        )
+        .to_json()?;
+        Some((json, copy))
+    }
+
+    /// Cut Time (`Ctrl+Shift+X`): 時間ごとの写しを clipboard へ載せてから `delete_time`。
+    /// clipboard 書込は `pending_clipboard_write` (root が OS clipboard へ flush、 トラックの
+    /// cut と同じ経路) なので、 view を通らないメニューからも同じ 1 本で呼べる。
+    pub(crate) fn cut_time(&mut self) {
+        let Some((json, copy)) = self.copy_time_clip() else {
+            let _ = self.time_ops_range();
+            return;
+        };
+        self.ui_ephemeral.pending_clipboard_write = Some(json);
+        self.delete_time();
+        self.ui_ephemeral.status_message = format!("時間をカット: {:.2} 拍", copy.span_beats);
+    }
+
+    /// Delete Time (`Ctrl+Shift+Delete`) / Cut Time の後段: 範囲の時間を全トラックから
+    /// 取り除いて詰める。範囲選択は消す (指していた時間が無くなる)。
+    pub(crate) fn delete_time(&mut self) {
+        let Some((a, b)) = self.time_ops_range() else { return };
+        let changed = self.edit_song_rippling(|song| song.delete_time_range(a, b).into_iter().collect());
+        if changed {
+            self.set_time_selection(None);
+            self.ui_ephemeral.status_message = format!("時間を削除: {:.2} 拍", b - a);
+        }
+    }
+
+    /// Duplicate Time (`Ctrl+Shift+D`): 範囲を直後に時間ごと複製する。範囲選択は複製先へ
+    /// 移す (Live と同じ — 続けて押すと繰り返し複製できる)。
+    pub(crate) fn duplicate_time(&mut self) {
+        let Some((a, b)) = self.time_ops_range() else { return };
+        let changed =
+            self.edit_song_rippling(|song| song.duplicate_time_range(a, b).into_iter().collect());
+        if changed {
+            let len = b - a;
+            self.shift_time_selection(len);
+            self.ui_ephemeral.status_message = format!("時間を複製: {len:.2} 拍");
+        }
+    }
+
+    /// Insert Silence (`Ctrl+I`): 範囲の先頭に範囲の長さぶんの空き時間を差し込む。
+    /// 範囲選択はそのまま (= 差し込んだ空き時間を指す)。
+    pub(crate) fn insert_silence(&mut self) {
+        let Some((a, b)) = self.time_ops_range() else { return };
+        let changed =
+            self.edit_song_rippling(|song| song.insert_time(a, b - a).into_iter().collect());
+        if changed {
+            self.ui_ephemeral.status_message = format!("無音を挿入: {:.2} 拍", b - a);
+        }
+    }
+
+    /// Paste Time (`Ctrl+Shift+V`): clipboard の時間ごとの写しを範囲選択の先頭に差し込む。
+    /// 貼った時間が新しい範囲選択になる。
+    pub(crate) fn paste_time(&mut self, copy: &common::model::TimeRangeCopy, source_project_id: u64) {
+        let Some((a, _)) = self.time_ops_range() else { return };
+        let same_project = source_project_id == self.song_doc.song().project_id;
+        let changed = self.edit_song_rippling(|song| {
+            song.paste_time_range(a, copy, same_project).map(|p| p.ripple).into_iter().collect()
+        });
+        if changed {
+            let lanes = self.selection.time.as_ref().map(|t| t.lanes.clone()).unwrap_or_default();
+            self.set_time_selection(TimeSelection::new(a, a + copy.span_beats, lanes));
+            self.ui_ephemeral.status_message = format!("時間を貼り付け: {:.2} 拍", copy.span_beats);
+        }
+    }
+
+    /// 範囲選択を `delta` 拍ずらす (レーン集合はそのまま)。
+    fn shift_time_selection(&mut self, delta: f64) {
+        let next = self
+            .selection
+            .time
+            .as_ref()
+            .and_then(|t| TimeSelection::new(t.start_beat + delta, t.end_beat + delta, t.lanes.clone()));
+        self.set_time_selection(next);
     }
 }

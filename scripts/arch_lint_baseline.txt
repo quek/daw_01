@@ -98,7 +98,7 @@ FILE-BUDGET | daw_gui/src/view/track_inspector/mod.rs  | 2214 | 巨大 draw / ma
 # **#71 統合後の実測は 1993 で、天井を上げる必要は無くなった** — #71 が app.rs を
 # 5 行 (handle_event を 7 行) 縮めていて、そのぶんを #74 が使い切った形。
 # 天井は据え置き = 実測値そのもの (余裕ゼロ) のまま。
-FILE-BUDGET | daw_gui/src/app.rs                       | 1983 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で Parallel / chain の event arm (Group/Ungroup/AddParallelChain/SetChain*) +11。 2026-09-06: ParamGestureBegin/End の arm 本体を handler/param_gesture.rs へ移して 1983 (締まる方向なので実測値へ下げた)。
+FILE-BUDGET | daw_gui/src/app.rs                       | 1985 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で Parallel / chain の event arm (Group/Ungroup/AddParallelChain/SetChain*) +11。 2026-09-06: ParamGestureBegin/End の arm 本体を handler/param_gesture.rs へ移して 1983 (締まる方向なので実測値へ下げた)。 同日: 全レーン表示切替 (Alt+A) と時間範囲操作 5 本 (docs/plan_time_ops.md、本体は handler/range_ops.rs::handle_time_event に集約) の arm 各 1 行で +2。
 FILE-BUDGET | daw_gui/src/view/runner.rs               | 1618 | #71 で drag payload の frame ライフサイクル配線 +3。分割は runner の責務分けごと別タスク。未起票
 FILE-BUDGET | daw_gui/src/handler/automation.rs        | 1410 | 巨大 draw / match。未起票
 FILE-BUDGET | daw_gui/src/script.rs                    | 1249 | Glue の焼き込み検証で `setTimeSelection` (選択の SSoT = 範囲 × レーンを headless で張る口) +21。binding は 1 か所に並べる規約なので割らない。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で picker 引数 `chain` +1。
@@ -154,7 +154,7 @@ FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy 
 FN-BUDGET | daw_gui/src/view/track_inspector/mod.rs::draw                             | 2063 | 巨大 draw / match。未起票
 # handle_event も #74 の arm で +5 だが、#71 が -7 していたので **#71 統合後の実測は
 # 1621** (旧天井 1623 より低い)。締まる方向なので実測値へ下げる。
-FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1601 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で +1。 2026-09-06: ParamGestureBegin/End を handler/param_gesture.rs へ移して 1601 (実測値へ下げた)。
+FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1603 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で +1。 2026-09-06: ParamGestureBegin/End を handler/param_gesture.rs へ移して 1601 (実測値へ下げた)。 同日: Alt+A (全レーン表示切替) と時間範囲操作の dispatch arm (各 1 行) で +2。
 FN-BUDGET | daw_gui/src/view/audio_editor.rs::draw                                    |  781 | 巨大 draw / match。未起票
 FN-BUDGET | daw_gui/src/view/arrangement_view.rs::draw                                |  577 | #71 が足したのは dispatch 1 行だけ (本体 57 行は関数外の `device_drag_over_headers`)。未起票
 FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                              |  525 | 巨大 draw / match。未起票

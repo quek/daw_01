@@ -850,6 +850,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             shortcut_map: &self.shortcut_map,
             pending_clipboard_paste,
             pending_clipboard_writes: &mut self.transient_clipboard_writes,
+            clipboard: self.clipboard.as_deref_mut(),
             pending_dialog_requests: &mut self.transient_dialog_requests,
             consumed_dialog_results: &mut self.transient_consumed_dialog_results,
             dialog_results: &self.pending_dialog_results,
@@ -1068,6 +1069,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) pending_clipboard_paste: Option<String>,
     /// `set_clipboard_text` で積まれる write リクエスト (frame 末尾に provider.set_text)。
     pub(crate) pending_clipboard_writes: &'a mut Vec<String>,
+    /// OS clipboard provider (`read_clipboard_text` の on-demand 読み出し用)。 `None` なら
+    /// 読めない (test / provider 未設定)。 frame 頭の paste 先読みとは別経路 — 「paste」
+    /// 以外のショートカットやメニュー項目が clipboard を要るときに使う。
+    pub(crate) clipboard: Option<&'a mut (dyn ClipboardProvider + 'static)>,
     // ---- M8 Phase 34 dialog ----
     pub(crate) pending_dialog_requests: &'a mut Vec<DialogRequest>,
     pub(crate) consumed_dialog_results: &'a mut HashSet<&'static str>,
@@ -2107,6 +2112,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             return None;
         }
         self.pending_clipboard_paste.take()
+    }
+
+    /// OS clipboard のテキストを **その場で** 読む (frame 頭の paste 先読みとは独立)。
+    ///
+    /// `paste` 以外のショートカット (例: "時間を貼り付け") やメニュー項目が clipboard を
+    /// 要るときに使う。 provider が無ければ `None`。 モーダル中の遮断は
+    /// [`Ui::take_clipboard_paste`] と同じ。
+    pub fn read_clipboard_text(&mut self) -> Option<String> {
+        if self.keyboard_blocked_by_modal() {
+            return None;
+        }
+        self.clipboard.as_deref_mut().and_then(ClipboardProvider::get_text)
     }
 
     /// 任意の文字列を OS clipboard に書き込む (frame 末尾で provider.set_text)。

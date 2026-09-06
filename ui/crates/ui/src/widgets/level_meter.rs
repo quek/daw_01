@@ -219,8 +219,14 @@ pub struct LevelMeterStyle {
     pub db_range: (f32, f32),
     /// peak hold の保持時間 (ms)
     pub peak_hold_ms: u128,
-    /// `Some` のとき dB 目盛り (tick + 数字 + 0dB 線) を描く。 `None` (default) なら clean bar。
+    /// `Some` のとき dB→高さの写像に `MeterScale.curve` を使い、 `scale_marks` なら
+    /// 目盛り (tick + 数字 + 0dB 線) も描く。 `None` (default) なら線形 `db_range` の clean bar。
     pub scale: Option<MeterScale>,
+    /// `scale = Some` のときに目盛り (tick ガター / 数字ガター / 0dB 線 / 上下 vpad) を
+    /// **描くか**。 `false` なら写像だけを `scale.curve` に揃え、 見た目は clean bar
+    /// (トラックヘッダの 7px メーターのように、 ミキサーと同じカーブで読ませたいが目盛りを
+    /// 置く幅が無い場所向け)。 default `true`。
+    pub scale_marks: bool,
     /// `true` のとき最大到達 dB の数値ピークホールドを上端帯に表示し、 click で reset。 default `false`。
     pub peak_readout: bool,
     /// dB ラベル文字色。
@@ -240,6 +246,13 @@ pub struct LevelMeterStyle {
 }
 
 impl LevelMeterStyle {
+    /// 目盛り (ガター / tick / 数字 / vpad) を描くか = `scale` があり、 かつ `scale_marks`。
+    /// 横レイアウトと縦の content 領域はこの 1 本で決める (写像だけ curve に揃える場合と区別)。
+    #[must_use]
+    pub fn shows_scale_marks(&self) -> bool {
+        self.scale.is_some() && self.scale_marks
+    }
+
     /// パレットから既定スタイルを組む (r.md #48)。
     ///
     /// **`Default` にはしない**: テーマ色を読む `Default::default()` は隠れたグローバル依存で、
@@ -265,6 +278,7 @@ impl LevelMeterStyle {
             db_range: (-60.0, 6.0),
             peak_hold_ms: PEAK_HOLD_DEFAULT_MS,
             scale: None,
+            scale_marks: true,
             peak_readout: false,
             scale_text_color: p.text_dim.with_alpha(0.95),
             scale_tick_color: p.text_dim.with_alpha(0.95),
@@ -393,7 +407,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let wid = WidgetId::ROOT.child((b"level_meter", &id));
         // 縦の dB→y 領域は `rect` から導出 (peak_readout 帯 + scale 上下 vpad)。 standalone では
         // この領域が widget rect 内で完結する。
-        let content = meter_content_region(rect, style.scale.is_some(), style.peak_readout);
+        let content = meter_content_region(rect, style.shows_scale_marks(), style.peak_readout);
         self.meter_body(wid, rect, content, l, r, ballistic, &style)
     }
 
@@ -442,7 +456,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // 2. 横レイアウト: [tick ガター(左) | L バー | R バー | 数字ガター(右)]。
-        let has_scale = style.scale.is_some();
+        let has_scale = style.shows_scale_marks();
         let (tick_g, _num_g) = scale_gutters(rect.w, has_scale);
         // bar_each は利用可能幅から導出 (`stereo_bar_width` と同じ式 = 隣に置く別
         // メーターがこの太さに揃えられる)。 2*bar_each + gap == bars_w となり、
@@ -468,7 +482,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.draw_meter_bar(content, right_x, bar_each, r_disp, r_hold, overlay.map(|o| o.1), style);
 
         // 4. dB 目盛り (tick = L バー左 / 数字 = R バー右 / 0dB 線 = 両バー横断)。
-        if let Some(scale) = style.scale {
+        if let Some(scale) = style.scale.filter(|_| style.scale_marks) {
             self.draw_meter_scale(content, rect, left_x, bars_right, scale, style);
         }
 

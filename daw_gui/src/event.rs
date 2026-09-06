@@ -1028,6 +1028,25 @@ pub enum AppEvent {
     /// 再生追従スクロールの方式を `Off → Scroll → Page → Off` と循環
     /// (`Alt+F` / トランスポートの追従ボタン、クリックごとに切替)。
     CycleArrangeFollow,
+    /// 全オートメーションレーン (全トラック + master) の表示 / 非表示を一括切替
+    /// (`Alt+A` / トランスポートの `A` ボタン、Live の automation toggle)。
+    /// 1 本でも隠れている (👁 で非表示 / 行が畳まれている) なら全部出す、
+    /// 全部出ているなら全部隠す ([`AppData::toggle_all_automation_lanes_visible`])。
+    ToggleAllAutomationLanesVisible,
+    /// Live §6.11 "Delete Time": 範囲選択の時間を**全トラック**から取り除いて詰める
+    /// (`Ctrl+Shift+Delete`)。
+    DeleteTime,
+    /// Live §6.11 "Cut Time": 範囲の時間ごとの写しを clipboard へ載せてから `DeleteTime`
+    /// (`Ctrl+Shift+X`)。clipboard 書込は `pending_clipboard_write` 経由 (root が flush)。
+    CutTime,
+    /// Live §6.11 "Duplicate Time": 範囲選択を直後に時間ごと複製する (`Ctrl+Shift+D`)。
+    DuplicateTime,
+    /// Live §6.11 "Insert Silence": 範囲選択の先頭に範囲の長さぶんの空き時間を差し込む
+    /// (`Ctrl+I`)。
+    InsertSilence,
+    /// Live §6.11 "Paste Time": clipboard の時間ごとの写しを範囲選択の先頭に差し込む
+    /// (`Ctrl+Shift+V`)。`source_project_id` が同じなら content を共有 (linked)。
+    PasteTime { copy: Box<common::model::TimeRangeCopy>, source_project_id: u64 },
     SetArrangeTrackRowH(f32),
     /// arrangement の track header 幅を更新 (gui_01 widget の右端
     /// splitter drag が発火)。 handler 側で 80..480 px に clamp。 session-only。
@@ -1968,6 +1987,12 @@ impl AppEvent {
             E::MakeAutomationClipUnique(..) => "オートメーションクリップを独立化",
             E::SetLaneEnabled { .. } => "オートメーション有効切替",
             E::SetLaneVisible { .. } => "レーン表示切替",
+            E::ToggleAllAutomationLanesVisible => "全レーン表示切替",
+            E::DeleteTime => "時間を削除",
+            E::CutTime => "時間をカット",
+            E::DuplicateTime => "時間を複製",
+            E::InsertSilence => "無音を挿入",
+            E::PasteTime { .. } => "時間を貼り付け",
             E::SetLaneDefault { .. } => "レーン既定値変更",
             E::SetLaneHeight { .. } | E::SetSingleTrackRowH { .. } => "レーン高さ変更",
             E::DeleteLane { .. } => "レーン削除",
