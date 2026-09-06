@@ -46,6 +46,11 @@ impl AppData {
             }
             E::MidiAllNotesOff { at_ns, channel } => self.on_midi_all_notes_off(at_ns, channel),
             E::SetMidiSelection(sel) => self.set_midi_capture_selection(sel),
+            E::ShiftMidiSweep(delta) => {
+                if delta.is_finite() {
+                    self.midi_capture.sweep_shift = (self.midi_capture.sweep_shift + delta).rem_euclid(1.0);
+                }
+            }
             E::ToggleMidiPaused => self.toggle_midi_capture_paused(),
             E::ToggleMidiPreview => self.toggle_midi_capture_preview(),
             E::MidiDrop { start_ns, end_ns, target, target_beat } => {

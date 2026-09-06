@@ -47,8 +47,12 @@ pub struct CaptureWindow {
 pub struct MidiCaptureState {
     pub notes: VecDeque<CapturedNote>,
     pub paused: bool,
-    /// 選択範囲 `[start, end)` (wall-clock ns)。
+    /// 選択範囲 `[start, end)` (wall-clock ns)。スイープ表示ではその場に留まり、
+    /// `sampler_seconds` より古くなった (表示から押し出された) ら消える。
     pub selection: Option<(u64, u64)>,
+    /// スイープ表示の位相 (1 周に対する割合 `[0, 1)`)。Sampler と同じ操作 (「半周ずらす」/
+    /// ホイール) だが、音声リングとは周回の起点が違うので別に持つ。session のみ。
+    pub sweep_shift: f32,
     pub preview_until: Option<std::time::Instant>,
 }
 
@@ -64,6 +68,7 @@ impl MidiCaptureState {
             notes: VecDeque::with_capacity(4096),
             paused: false,
             selection: None,
+            sweep_shift: 0.0,
             preview_until: None,
         }
     }
@@ -142,37 +147,6 @@ pub struct MidiCaptureDragPayload {
 }
 
 pub const MIDI_CAPTURE_DRAG_KIND: &str = "daw_01.midi_capture_range";
-
-/// 描画に使う「wall-clock → x」の写像 (右端 = 今)。
-#[derive(Debug, Clone, Copy)]
-pub struct WallAxis {
-    pub x: f32,
-    pub w: f32,
-    pub now_ns: u64,
-    pub span_ns: u64,
-}
-
-impl WallAxis {
-    pub fn oldest(&self) -> u64 {
-        self.now_ns.saturating_sub(self.span_ns)
-    }
-
-    pub fn ns_to_x(&self, ns: u64) -> f32 {
-        if self.span_ns == 0 {
-            return self.x;
-        }
-        let rel = ns as f64 - self.oldest() as f64;
-        self.x + (rel / self.span_ns as f64) as f32 * self.w
-    }
-
-    pub fn x_to_ns(&self, x: f32) -> u64 {
-        if self.w <= 0.0 || self.span_ns == 0 {
-            return self.now_ns;
-        }
-        let t = ((x - self.x) / self.w).clamp(0.0, 1.0) as f64;
-        self.oldest() + (t * self.span_ns as f64).round() as u64
-    }
-}
 
 /// 「再生中の拍」で並べてよいか: 全ノートが拍を持ち、かつ wall-clock 順に拍が単調で、
 /// 各ノートの終端が始端より後。ループ再生中 (拍が巻き戻る) や seek を跨いだ演奏は

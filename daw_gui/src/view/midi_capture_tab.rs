@@ -1,9 +1,12 @@
 //! 下部パネル「MIDI Capture」タブ (`docs/plan_global_sampler.md` §3.4)。
 //!
-//! 横 = wall-clock (右端 = 今、幅 = 設定秒数)、縦 = ピッチ。MIDI 入力の全ノートを
-//! 常時溜めたものを矩形で描く。押しっぱなしは右端まで伸びる。再生していた区間は
-//! Sampler と同じセグメント (同じ時計) から小節線を重ねる。
-//! 範囲選択 / 持ち出し ([`MIDI_CAPTURE_DRAG_KIND`]) の操作は Sampler タブと同じ。
+//! 横 = wall-clock を Sampler と同じ **スイープ表示** ([`RingAxis`]、1 周 = 設定秒数、
+//! 「今」の縦線が左→右へ進み右端で左へ戻る)、縦 = ピッチ。MIDI 入力の全ノートを
+//! 常時溜めたものを矩形で描く。押しっぱなしは「今」の線まで伸びる (右端で折り返す
+//! ノートは 2 本)。スクロールしないので弾いている最中でも範囲選択できる。再生していた
+//! 区間は Sampler と同じセグメント (同じ時計) から小節線を重ねる。
+//! 範囲選択 / 持ち出し ([`MIDI_CAPTURE_DRAG_KIND`]) / 位相ずらし (「半周ずらす」/
+//! ホイール) の操作は Sampler タブと同じ。
 
 use std::sync::Arc;
 
@@ -12,7 +15,8 @@ use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
 use crate::event_sampler::SamplerEvent;
-use crate::state::midi_capture::{MIDI_CAPTURE_DRAG_KIND, MidiCaptureDragPayload, WallAxis};
+use crate::state::midi_capture::{MIDI_CAPTURE_DRAG_KIND, MidiCaptureDragPayload};
+use crate::state::ring_axis::RingAxis;
 use crate::state::sampler::{segment_spans, wall_clock_ns};
 use crate::view::sampler_tab::{
     BarSource, HEADER_H, draw_bar_lines, draw_seconds_ruler, pause_and_preview, seconds_field,
@@ -40,11 +44,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let st = &app.midi_capture;
     let now = wall_clock_ns();
-    let axis = WallAxis {
+    let span_ns = u64::from(app.sampler_seconds()) * 1_000_000_000;
+    let axis = RingAxis {
         x: body.x,
         w: body.w,
-        now_ns: now,
-        span_ns: u64::from(app.sampler_seconds()) * 1_000_000_000,
+        head: now,
+        capacity: span_ns,
+        offset: (f64::from(st.sweep_shift.clamp(0.0, 1.0)) * span_ns as f64) as u64,
     };
     let grid = Rect { x: body.x, y: body.y, w: body.w, h: (body.h - RULER_H).max(1.0) };
     ui.push_rect(RectCommand {
@@ -59,9 +65,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         app,
         ui,
         grid,
-        |ns| axis.ns_to_x(ns),
-        // MIDI Capture はスクロール表示 (右端 = 今) なので区間は折り返さない。
-        |s, e| [Some((axis.ns_to_x(s), axis.ns_to_x(e))), None],
+        |ns| axis.frame_to_x(ns),
+        |s, e| axis.x_spans(s, e),
         &wall_bar_source(app),
     );
     draw_seconds_ruler(
@@ -69,21 +74,32 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         ui,
         body,
         RULER_H,
-        |secs_ago| axis.ns_to_x(now.saturating_sub((secs_ago * 1e9) as u64)),
+        |secs_ago| axis.frame_to_x(now.saturating_sub((secs_ago * 1e9) as u64)),
         f64::from(app.sampler_seconds()),
     );
     draw_notes(app, ui, grid, &axis, now);
 
-    // ---- 選択 / 持ち出し ----
-    let sel_rect = st.selection.map(|(s, e)| Rect {
-        x: axis.ns_to_x(s),
-        y: grid.y,
-        w: (axis.ns_to_x(e) - axis.ns_to_x(s)).max(1.0),
-        h: grid.h,
-    });
-    if let Some(r) = sel_rect {
+    // グリッド上のホイールで位相をずらす (Sampler と同じ 1 notch = 1/16 周)。
+    let (_, wheel) = ui.take_scroll_in_rect(grid);
+    if wheel.abs() > 0.0 {
+        let delta = -wheel.signum() * (1.0 / 16.0);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::Sampler(SamplerEvent::ShiftMidiSweep(delta)));
+        }));
+    }
+
+    // ---- 選択 / 持ち出し (折り返す選択は 2 本の矩形) ----
+    let sel_rects: Vec<Rect> = st
+        .selection
+        .map(|(s, e)| axis.x_spans(s, e))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|(x0, x1)| Rect { x: x0, y: grid.y, w: (x1 - x0).max(1.0), h: grid.h })
+        .collect();
+    for r in &sel_rects {
         ui.push_rect(RectCommand {
-            rect: r,
+            rect: *r,
             fill: p.accent_wash,
             border: p.accent,
             border_width: 1.0,
@@ -93,14 +109,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     let pointer = ui.pointer();
     let press_in_sel = pointer.primary_just_pressed
-        && pointer.pos.is_some_and(|(px, py)| sel_rect.is_some_and(|r| r.contains(px, py)));
+        && pointer.pos.is_some_and(|(px, py)| sel_rects.iter().any(|r| r.contains(px, py)));
     if press_in_sel {
         if let (Some(_), Some((s, e))) = (ui.take_primary_press_in_rect(grid), st.selection) {
             ui.begin_drag(MIDI_CAPTURE_DRAG_KIND, MidiCaptureDragPayload { start_ns: s, end_ns: e });
         }
     } else if let Some(d) = ui.take_drag_in_rect("midi_capture_select", grid) {
-        let a = axis.x_to_ns(d.anchor.0);
-        let b = axis.x_to_ns(d.current.0);
+        let a = axis.x_to_frame(d.anchor.0);
+        let b = axis.x_to_frame(d.current.0);
         let sel = if d.kind == DragKind::Released && (d.current.0 - d.anchor.0).abs() < 2.0 {
             None
         } else {
@@ -134,6 +150,11 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
             AppEvent::Sampler(SamplerEvent::ToggleMidiPreview),
         ),
     );
+    let shift = Rect { x, y, w: 84.0, h: 22.0 };
+    ui.button_at("midi_capture_half_shift", "半周ずらす", shift, || {
+        Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Sampler(SamplerEvent::ShiftMidiSweep(0.5))))
+    });
+    x += shift.w + PAD * 2.0;
     let text = match app.midi_capture.selection {
         Some((s, e)) => {
             let n = app.midi_capture.notes_in(s, e, wall_clock_ns()).count();
@@ -159,7 +180,7 @@ fn wall_bar_source(app: &AppData) -> BarSource {
     BarSource { spans, frames_per_unit: sr / 1e9 }
 }
 
-fn draw_notes(app: &AppData, ui: &mut Ui<'_, AppData>, grid: Rect, axis: &WallAxis, now: u64) {
+fn draw_notes(app: &AppData, ui: &mut Ui<'_, AppData>, grid: Rect, axis: &RingAxis, now: u64) {
     let p = &app.theme.core;
     let st = &app.midi_capture;
     let oldest = axis.oldest();
@@ -185,19 +206,28 @@ fn draw_notes(app: &AppData, ui: &mut Ui<'_, AppData>, grid: Rect, axis: &WallAx
     let fill = p.accent;
     let held = app.theme.daw.play;
     for n in visible {
-        let x0 = axis.ns_to_x(n.on_ns.max(oldest));
-        let x1 = axis.ns_to_x(n.end_ns(now));
         let y = grid.y + grid.h - (i32::from(n.pitch) - lo + 1) as f32 * row_h;
         let alpha = 0.55 + 0.45 * f32::from(n.velocity) / 127.0;
-        ui.push_rect(RectCommand {
-            rect: Rect { x: x0, y: y + 0.5, w: (x1 - x0).max(2.0), h: (row_h - 1.0).max(1.0) },
-            fill: if n.off_ns.is_none() { held.with_alpha(alpha) } else { fill.with_alpha(alpha) },
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [1.0; 4],
-            clip_rect: Some(grid),
-        });
+        // 右端で折り返すノートは 2 本 (`x_spans` が押し出された分も切り落とす)。
+        for (x0, x1) in axis.x_spans(n.on_ns, n.end_ns(now)).into_iter().flatten() {
+            ui.push_rect(RectCommand {
+                rect: Rect { x: x0, y: y + 0.5, w: (x1 - x0).max(2.0), h: (row_h - 1.0).max(1.0) },
+                fill: if n.off_ns.is_none() { held.with_alpha(alpha) } else { fill.with_alpha(alpha) },
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [1.0; 4],
+                clip_rect: Some(grid),
+            });
+        }
     }
+    // 「今」の縦線。スイープではノートが流れないので、これが無いと「どこまでが
+    // 新しいか」が読めない (Sampler の書き込み位置の線と同じ)。
+    let head_x = axis.phys_to_x(axis.head_phys()).round();
+    ui.push_lines(LineBatch {
+        segments: Arc::from(vec![LineSegment { a: [head_x, grid.y], b: [head_x, grid.y + grid.h], color: p.accent }]),
+        line_width_px: 1.0,
+        clip_rect: Some(grid),
+    });
     if st.paused {
         let r = Rect { x: grid.x + grid.w - 90.0, y: grid.y + 4.0, w: 84.0, h: 18.0 };
         ui.push_rect(RectCommand { rect: r, fill: app.theme.daw.record.with_alpha(0.85), border: Color::TRANSPARENT, border_width: 0.0, radius: [3.0; 4], clip_rect: None });

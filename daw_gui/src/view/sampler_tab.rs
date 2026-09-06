@@ -11,7 +11,7 @@
 //!   ([`SAMPLER_DRAG_KIND`]) で持ち出し、アレンジ / セルが受ける
 //!   (`arrangement_view::take_capture_drops`)。
 //!
-//! 時間軸の写像は [`RingAxis`] 1 本 (描画 / 当たり判定 / drop すべて同じ)。
+//! 時間軸の写像は [`RingAxis`] 1 本 (描画 / 当たり判定 / drop すべて同じ。MIDI Capture も同じ写像)。
 
 use std::sync::Arc;
 
@@ -23,9 +23,8 @@ use common::sampler_ring::SegmentInfo;
 use crate::app::{AppData, AppEvent};
 use crate::event_sampler::SamplerEvent;
 use crate::state::midi_capture::{MIDI_CAPTURE_DRAG_KIND, MidiCaptureDragPayload};
-use crate::state::sampler::{
-    BUCKET_FRAMES, RingAxis, SAMPLER_DRAG_KIND, SamplerDragPayload, segment_spans,
-};
+use crate::state::ring_axis::RingAxis;
+use crate::state::sampler::{BUCKET_FRAMES, SAMPLER_DRAG_KIND, SamplerDragPayload, segment_spans};
 
 pub(crate) const HEADER_H: f32 = 30.0;
 const PAD: f32 = 6.0;
@@ -50,7 +49,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let axis = RingAxis {
         x: body.x,
         w: body.w,
-        write_frames: st.write_frames,
+        head: st.write_frames,
         capacity,
         offset: (f64::from(st.sweep_shift.clamp(0.0, 1.0)) * capacity as f64) as u64,
     };

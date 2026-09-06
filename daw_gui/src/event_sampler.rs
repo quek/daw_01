@@ -43,6 +43,8 @@ pub enum SamplerEvent {
     MidiAllNotesOff { at_ns: u64, channel: u8 },
     /// MIDI Capture の選択範囲 `[start, end)` (wall-clock ns)。
     SetMidiSelection(Option<(u64, u64)>),
+    /// MIDI Capture のスイープ位相を `delta` (1 周 = 1.0) だけずらす ([`Self::ShiftSweep`] と同じ)。
+    ShiftMidiSweep(f32),
     ToggleMidiPaused,
     /// 選択ノートを cursor track のインストで試聴 (再押下で停止)。
     ToggleMidiPreview,

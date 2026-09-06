@@ -19,6 +19,8 @@ pub mod activity;
 pub mod launcher_ui;
 pub mod sampler;
 pub mod midi_capture;
+/// Sampler / MIDI Capture 共通のスイープ表示の時間軸写像。
+pub mod ring_axis;
 /// r.md #113: 仮想鍵盤ウィンドウの session-only な状態。
 pub mod virtual_keyboard;
 
