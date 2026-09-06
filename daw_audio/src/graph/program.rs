@@ -13,8 +13,8 @@
 //!   MIDI 置換、audio_out は audio_in ありなら置換 / 無しなら加算)。
 //! - `ParallelBegin`: 現在のバス (audio L/R + MIDI) を parallel 入力に退避、sum を 0 に。
 //! - `ChainBegin`: バス := parallel 入力のコピー (各 chain は同じ入力を受ける)。 r.md #112 の
-//!   帯域分割 (`Split::Frequency3`) では chain 1/2/3 が Low / Mid / High (`ParallelBegin` で
-//!   `band_split` が作った出力) を受け、 4 本目以降は全帯域のまま。
+//!   `Split` (帯域分割 / Mid-Side) では chain k が `ParallelBegin` で `band_split::Splitter` が
+//!   作った k 番目の出力を受け、 出力数を超える chain は素通し入力のまま。
 //! - `ChainEnd`: 並列 PDC の delay → post-fx snapshot → chain の gain/pan/mute →
 //!   post-fader snapshot → sum に加算。MIDI は「この chain の中で note_out device が
 //!   バスを置換した」ときだけ merged に寄与する。
@@ -26,13 +26,13 @@
 
 use std::ops::Range;
 
-use common::model::{AutomationTarget, LoopRegion, Song, SplitBand, SplitEdge, TrackBuiltinParam};
+use common::model::{AutomationTarget, LoopRegion, Song, SplitEdge, TrackBuiltinParam};
 use common::port_config::PortConfig;
 use common::process_data::EventKind;
 
 use crate::engine::{PluginRefs, SyncSlot};
 use crate::graph::DelayLine;
-use crate::graph::band_split::BandSplit;
+use crate::graph::band_split::Splitter;
 use crate::launcher::TrackRows;
 use crate::mixer::{MAX_EVENTS, MAX_FRAMES};
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
@@ -52,9 +52,9 @@ pub enum ChainOp {
         own_prefx_ports: u8,
     },
     ParallelBegin { parallel_slot: u32 },
-    /// `band`: この chain が受ける帯域 (`Split::Frequency3` の 1〜3 本目)。 `None` = Parallel 入力
-    /// そのもの。 compile 時に chain の並び順から決める。
-    ChainBegin { parallel_slot: u32, chain_slot: u32, band: Option<SplitBand> },
+    /// `output`: この chain が受ける `Split` の出力番号 (`Split::output_of`)。 `None` = Parallel
+    /// 入力そのもの。 compile 時に chain の並び順から決める。
+    ChainBegin { parallel_slot: u32, chain_slot: u32, output: Option<u8> },
     ChainEnd {
         parallel_slot: u32,
         chain_slot: u32,
@@ -93,9 +93,9 @@ pub struct ParallelScratch {
     pub in_ms: f32,
     pub out_ms: f32,
     pub match_gain: f32,
-    /// r.md #112: 帯域分割器 (`Split::Frequency3` のときだけ compile が置く)。 band chain の
+    /// r.md #112: 入力の分割器 (`Split::None` 以外のとき compile が置く)。 分割された chain の
     /// 入力と `PreFx` tap はここから読む。
-    pub split: Option<Box<BandSplit>>,
+    pub split: Option<Splitter>,
 }
 
 /// gain match の窓 (一次 IIR の時定数、秒)。 ポンピングが出ない程度に遅く。
@@ -107,10 +107,10 @@ const MATCH_GAIN_MIN: f32 = 0.25;
 const MATCH_GAIN_MAX: f32 = 4.0;
 
 impl ParallelScratch {
-    pub fn new(parallel_id: u64, split: bool) -> Self {
+    pub fn new(parallel_id: u64, split: common::model::Split) -> Self {
         Self {
             parallel_id,
-            split: split.then(|| Box::new(BandSplit::new())),
+            split: Splitter::new(split),
             in_l: vec![0.0; MAX_FRAMES],
             in_r: vec![0.0; MAX_FRAMES],
             in_midi: Vec::with_capacity(MAX_EVENTS),
@@ -233,7 +233,7 @@ impl ChainProgram {
                 rs.in_ms = o.in_ms;
                 rs.out_ms = o.out_ms;
                 rs.match_gain = o.match_gain;
-                if let (Some(s), Some(os)) = (rs.split.as_deref_mut(), o.split.as_deref()) {
+                if let (Some(s), Some(os)) = (rs.split.as_mut(), o.split.as_ref()) {
                     s.adopt_state_from(os);
                 }
             }
@@ -306,18 +306,23 @@ pub fn run_chain_program(
                 rs.sum_r[..n].fill(0.0);
                 rs.merged_midi.clear();
                 rs.any_midi_replaced = false;
-                // r.md #112: 帯域分割。 クロスオーバーは automation / 変調 ramp の終端値で係数を組む。
+                // r.md #112: 入力の分割。 帯域分割のクロスオーバーは automation / 変調 ramp の
+                // 終端値で係数を組む。
                 let parallel_id = rs.parallel_id;
-                if let Some(split) = rs.split.as_deref_mut() {
-                    let (low, high) = resolve_split_freqs(ctx, parallel_id);
-                    fill_split_ramp(ctx, track_id, parallel_id, SplitEdge::LowMid, low, &mut split.low_ramp);
-                    fill_split_ramp(ctx, track_id, parallel_id, SplitEdge::MidHigh, high, &mut split.high_ramp);
-                    split.process(ctx.sample_rate, &rs.in_l, &rs.in_r, n);
+                match rs.split.as_mut() {
+                    Some(Splitter::Frequency3(bs)) => {
+                        let (low, high) = resolve_split_freqs(ctx, parallel_id);
+                        fill_split_ramp(ctx, track_id, parallel_id, SplitEdge::LowMid, low, &mut bs.low_ramp);
+                        fill_split_ramp(ctx, track_id, parallel_id, SplitEdge::MidHigh, high, &mut bs.high_ramp);
+                        bs.process(ctx.sample_rate, &rs.in_l, &rs.in_r, n);
+                    }
+                    Some(Splitter::MidSide(ms)) => ms.process(&rs.in_l, &rs.in_r, n),
+                    None => {}
                 }
             }
-            ChainOp::ChainBegin { parallel_slot, band, .. } => {
+            ChainOp::ChainBegin { parallel_slot, output, .. } => {
                 let Some(rs) = parallels.get(*parallel_slot as usize) else { continue };
-                match band.and_then(|b| rs.split.as_deref().map(|s| s.band(b))) {
+                match output.and_then(|k| rs.split.as_ref()?.output(k)) {
                     Some((l, r)) => {
                         bus_l[..n].copy_from_slice(&l[..n]);
                         bus_r[..n].copy_from_slice(&r[..n]);
@@ -869,6 +874,22 @@ mod tests {
         song.tracks[0].devices[0].as_parallel_mut().unwrap().chains.push(chain(14, vec![]));
         let db = 20.0 * (steady_rms(&song, 700.0) / in_rms).log10();
         assert!((db - 6.02).abs() < 0.1, "4 本目は全帯域 (+6 dB): {db:.3} dB");
+    }
+
+    /// r.md #112: `MidSide` の空 chain 2 本は `(M+S, M-S) = (L, R)` で入力そのまま。
+    #[test]
+    fn mid_side_split_with_two_empty_chains_is_transparent() {
+        let mut song = song_with(vec![parallel(10, vec![chain(11, vec![]), chain(12, vec![])])]);
+        song.tracks[0].devices[0].as_parallel_mut().unwrap().split = common::model::Split::MidSide;
+        let mut bus = ramp(8);
+        bus.1 = (0..8).map(|i| 0.25 * i as f32 + 1.0).collect(); // L と R を非対称に
+        let expect = bus.clone();
+        let mut midi = Vec::with_capacity(MAX_EVENTS);
+        run(&song, 8, &mut bus, &mut midi);
+        for i in 0..8 {
+            assert!((bus.0[i] - expect.0[i]).abs() < 1e-5, "L[{i}]: {} vs {}", bus.0[i], expect.0[i]);
+            assert!((bus.1[i] - expect.1[i]).abs() < 1e-5, "R[{i}]: {} vs {}", bus.1[i], expect.1[i]);
+        }
     }
 
     /// gain match: 空 chain 2 本 (和 = 2x) でも、 一定振幅を数秒流せば出力は入力と同じ

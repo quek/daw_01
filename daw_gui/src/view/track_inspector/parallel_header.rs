@@ -21,7 +21,7 @@ use super::chain_list::{CHAIN_BTN_W, CHAIN_KNOB, ROW_H, draw_disclosure, draw_re
 use super::{push_scrub_bracket, scrub_style, toggle_audio_style};
 
 /// dropdown の項目 (順序 = [`split_index`] / [`split_from_index`])。
-const SPLIT_LABELS: &[&str] = &["No split", "3 bands"];
+const SPLIT_LABELS: &[&str] = &["No split", "3 bands", "Mid/Side"];
 /// ヘッダ行の dropdown 幅。
 pub(super) const SPLIT_DROPDOWN_W: f32 = 74.0;
 
@@ -29,6 +29,7 @@ fn split_index(split: Split) -> usize {
     match split {
         Split::None => 0,
         Split::Frequency3 { .. } => 1,
+        Split::MidSide => 2,
     }
 }
 
@@ -42,6 +43,7 @@ fn split_from_index(idx: usize, current: Split) -> Split {
                 Split::DEFAULT_FREQUENCY3
             }
         }
+        2 => Split::MidSide,
         _ => Split::None,
     }
 }
@@ -66,7 +68,8 @@ pub(super) fn draw_split_dropdown(
     }
 }
 
-/// Split の param 行 (ヘッダ行の直下)。 `Frequency3`: `Low [hz] Mid [hz] High`。
+/// Split の param 行 (ヘッダ行の直下、 `Split::has_params` のときだけ行がある)。
+/// `Frequency3`: `Low [hz] Mid [hz] High`。
 pub(super) fn draw_split_row(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,

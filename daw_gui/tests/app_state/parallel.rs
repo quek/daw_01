@@ -269,8 +269,9 @@ fn parallel_out_gain_and_gain_match_update_song_and_send_value_only_commands() {
     assert!(super::support::drain(&mut audio_rx).is_empty());
 }
 
-/// r.md #112: 帯域分割 on で chain が 3 本に補われ (既存は据え置き、 補った chain は帯域名)、
-/// Split の param 行がヘッダ直下に出る。 off に戻しても chain は残る。
+/// r.md #112: 帯域分割 on で chain が 3 本に補われ、 既定名の chain は帯域名に付け替わる
+/// (ユーザーが付けた名前は据え置き)。 Split の param 行がヘッダ直下に出る。 off に戻しても chain は
+/// 残り、 既定名は `Chain N` に戻る。
 #[test]
 fn enabling_frequency_split_pads_chains_to_three_and_shows_the_split_row() {
     use common::model::Split;
@@ -284,8 +285,8 @@ fn enabling_frequency_split_pads_chains_to_three_and_shows_the_split_row() {
     assert_eq!(r.split, Split::Frequency3 { low_hz: 200.0, high_hz: 2_000.0 });
     assert_eq!(
         r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-        vec!["Chain 1", "Mid", "High"],
-        "既存 chain は据え置き、 足りない帯域ぶんだけ帯域名で補う"
+        vec!["Low", "Mid", "High"],
+        "既定名 `Chain 1` は帯域名へ、 足りない帯域ぶんは帯域名で補う"
     );
     assert_eq!(r.chains[0].devices.len(), 1, "既存 chain の中身はそのまま");
     assert!(r.chains.iter().all(|c| c.id != 0), "補った chain も採番済み");
@@ -300,12 +301,19 @@ fn enabling_frequency_split_pads_chains_to_three_and_shows_the_split_row() {
         })
         .filter(|k| k != "-")
         .collect();
-    assert_eq!(kinds, vec!["RB", "SPLIT", "C:Chain 1", "C:Mid", "C:High"], "param 行はヘッダ直下");
+    assert_eq!(kinds, vec!["RB", "SPLIT", "C:Low", "C:Mid", "C:High"], "param 行はヘッダ直下");
 
+    // ユーザーが付けた名前は切替で触らない。
+    let mid_id = r.chains[1].id;
+    app.handle_event(AppEvent::RenameParallelChain { chain_id: mid_id, name: "Comp".into() });
     app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::None });
     let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split, Split::None);
-    assert_eq!(r.chains.len(), 3, "off に戻しても chain は消さない");
+    assert_eq!(
+        r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["Chain 1", "Comp", "Chain 3"],
+        "off に戻しても chain は消さず、 既定名だけ `Chain N` に戻る"
+    );
     assert!(!app.chain_rows().iter().any(|r| matches!(r.kind, ChainRowKind::SplitParams { .. })));
 }
 
@@ -352,4 +360,20 @@ fn split_frequency_edits_keep_order_and_send_value_only_commands() {
         edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::MidHigh, hz: 20_000.0 },
     });
     assert!(super::support::drain(&mut audio_rx).is_empty());
+}
+
+/// r.md #112: Mid/Side は chain を 2 本に補い (Mid / Side)、 param 行は出ない。
+#[test]
+fn enabling_mid_side_split_pads_chains_to_two_without_a_params_row() {
+    use common::model::Split;
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let (_track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+
+    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::MidSide });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.split, Split::MidSide);
+    assert_eq!(r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["Mid", "Side"]);
+    assert!(!app.chain_rows().iter().any(|r| matches!(r.kind, ChainRowKind::SplitParams { .. })));
 }

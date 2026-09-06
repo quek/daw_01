@@ -1,4 +1,7 @@
-//! r.md #112: Parallel の 3 バンド周波数分割 (`Split::Frequency3`) の RT 部。
+//! r.md #112: Parallel の入力の分割 (`Split`) の RT 部 — [`Splitter`] が variant ごとの分割器を
+//! 包み、 `ChainBegin` は「k 番目の出力」 を読むだけ。 [`MidSideSplit`] は `M = (L+R)/2`、
+//! `S = (L-R)/2` を Mid chain `(M, M)` / Side chain `(S, -S)` に配る (和は `(L, R)` に戻る)。
+//! 以下は [`BandSplit`] (3 バンド、 `Split::Frequency3`) の説明。
 //!
 //! 4 次 Linkwitz-Riley (Butterworth 2 次 × 2、24 dB/oct) を 2 段で使う。 LR4 の LP と HP の
 //! 和は同じ ω0 / Q の 2 次オールパスに等しい (Rane Note 160 / Linkwitz) ので、
@@ -20,6 +23,98 @@ use common::channel_strip_dsp::{Biquad, BiquadState};
 use common::model::{SPLIT_FREQ_RANGE, Split, SplitBand};
 
 use crate::mixer::MAX_FRAMES;
+
+/// `Split` の variant ごとの分割器。 compile 時に `Split` から作り (`None` は分割器なし)、 RT は
+/// [`Self::output`] で k 番目の出力を読む。
+pub enum Splitter {
+    /// 状態 (biquad 9 段 × 2ch + 出力 6 本) が大きいので Box (variant 間のサイズ差)。
+    Frequency3(Box<BandSplit>),
+    MidSide(MidSideSplit),
+}
+
+impl Splitter {
+    pub fn new(split: Split) -> Option<Self> {
+        match split {
+            Split::None => None,
+            Split::Frequency3 { .. } => Some(Self::Frequency3(Box::default())),
+            Split::MidSide => Some(Self::MidSide(MidSideSplit::new())),
+        }
+    }
+
+    /// k 番目の出力 (L, R)。 出力数を超える k は `None`。
+    pub fn output(&self, k: u8) -> Option<(&[f32], &[f32])> {
+        match self {
+            Self::Frequency3(bs) => {
+                let band = match k {
+                    0 => SplitBand::Low,
+                    1 => SplitBand::Mid,
+                    2 => SplitBand::High,
+                    _ => return None,
+                };
+                Some(bs.band(band))
+            }
+            Self::MidSide(ms) => ms.output(k),
+        }
+    }
+
+    /// 再 compile 跨ぎの状態移送 (同じ variant のときだけ。 違えば新品のまま)。
+    pub fn adopt_state_from(&mut self, old: &Self) {
+        match (self, old) {
+            (Self::Frequency3(a), Self::Frequency3(b)) => a.adopt_state_from(b),
+            (Self::MidSide(a), Self::MidSide(b)) => a.adopt_state_from(b),
+            _ => {}
+        }
+    }
+}
+
+/// Mid / Side 分割 (状態なし、 出力 buffer だけ)。 出力 0 = Mid `(M, M)`、 1 = Side `(S, -S)`。
+pub struct MidSideSplit {
+    /// `[出力][ch]`。
+    out: [[Vec<f32>; 2]; 2],
+}
+
+impl MidSideSplit {
+    pub fn new() -> Self {
+        Self {
+            out: [
+                [vec![0.0; MAX_FRAMES], vec![0.0; MAX_FRAMES]],
+                [vec![0.0; MAX_FRAMES], vec![0.0; MAX_FRAMES]],
+            ],
+        }
+    }
+
+    pub fn process(&mut self, in_l: &[f32], in_r: &[f32], n: usize) {
+        let n = n.min(MAX_FRAMES).min(in_l.len()).min(in_r.len());
+        for i in 0..n {
+            let m = (in_l[i] + in_r[i]) * 0.5;
+            let s = (in_l[i] - in_r[i]) * 0.5;
+            self.out[0][0][i] = m;
+            self.out[0][1][i] = m;
+            self.out[1][0][i] = s;
+            self.out[1][1][i] = -s;
+        }
+    }
+
+    pub fn output(&self, k: u8) -> Option<(&[f32], &[f32])> {
+        let o = self.out.get(k as usize)?;
+        Some((o[0].as_slice(), o[1].as_slice()))
+    }
+
+    /// 前 buffer の出力を引き継ぐ (同 track 内の chain tap が前 buffer の snapshot を読むため)。
+    pub fn adopt_state_from(&mut self, old: &Self) {
+        for k in 0..2 {
+            for ch in 0..2 {
+                self.out[k][ch].copy_from_slice(&old.out[k][ch]);
+            }
+        }
+    }
+}
+
+impl Default for MidSideSplit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Butterworth 2 次の Q (= 1/√2)。 これを 2 段重ねると LR4。
 const Q_BUTTERWORTH: f32 = std::f32::consts::FRAC_1_SQRT_2;
@@ -215,6 +310,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Mid / Side: `(M, M) + (S, -S) = (L, R)`、 Mid は両 ch 同じ、 Side は逆相。
+    #[test]
+    fn mid_side_outputs_reconstruct_the_input_when_summed() {
+        let l = [1.0f32, -0.5, 0.25, 0.0];
+        let r = [0.5f32, 0.5, -0.75, 0.0];
+        let mut ms = MidSideSplit::new();
+        ms.process(&l, &r, 4);
+        let (ml, mr) = ms.output(0).unwrap();
+        let (sl, sr) = ms.output(1).unwrap();
+        for i in 0..4 {
+            assert_eq!(ml[i], mr[i], "Mid は両 ch 同じ");
+            assert_eq!(sl[i], -sr[i], "Side は逆相");
+            assert!((ml[i] + sl[i] - l[i]).abs() < 1e-6);
+            assert!((mr[i] + sr[i] - r[i]).abs() < 1e-6);
+        }
+        assert!(ms.output(2).is_none());
     }
 
     /// クロスオーバー周波数そのものでも和は平坦 (LR の -6 dB × 2 が同相で足し合う)。

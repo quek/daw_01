@@ -60,7 +60,8 @@ pub struct Parallel {
 /// する (chain 側の gain / pan / M / S / SC / automation を container ごとに複製しない)。
 ///
 /// 配り方の出力は **chain の並び順**に対応する (`Frequency3` なら chain 1 = Low、 2 = Mid、
-/// 3 = High)。 出力数を超える chain (4 本目以降) は全帯域 (= 素通し) の入力を受ける。
+/// 3 = High、 `MidSide` なら chain 1 = Mid、 2 = Side)。 出力数を超える chain は素通し
+/// (全帯域 / 元のステレオ) の入力を受ける。 どのモードも **空 chain を出力数ぶん並べれば和は入力**。
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode)]
 pub enum Split {
     /// 全 chain に同じ入力 (従来の Parallel)。
@@ -69,6 +70,9 @@ pub enum Split {
     /// 3 バンド周波数分割 (Linkwitz-Riley 24 dB/oct、 和は平坦)。 `low_hz` < `high_hz`
     /// (`Parallel::set_split_freq` が順序を保つ)。 値域は [`SPLIT_FREQ_RANGE`]。
     Frequency3 { low_hz: f32, high_hz: f32 },
+    /// Mid / Side 分割 (Bitwig Mid-Side Split)。 Mid chain は `(M, M)`、 Side chain は `(S, -S)`
+    /// (`M = (L+R)/2`、 `S = (L-R)/2`) を受け、 和は `(M+S, M-S) = (L, R)` で元に戻る。
+    MidSide,
 }
 
 impl Split {
@@ -82,55 +86,73 @@ impl Split {
     pub const DEFAULT_FREQUENCY3: Self =
         Self::Frequency3 { low_hz: Self::DEFAULT_FREQS.0, high_hz: Self::DEFAULT_FREQS.1 };
 
-    /// この配り方の出力数 (= 帯域を受ける chain の本数)。 `None` は 0 (= 全 chain が素通し入力)。
+    /// この配り方の出力数 (= 分割された入力を受ける chain の本数)。 `None` は 0 (= 全 chain が
+    /// 素通し入力)。
     pub fn output_count(&self) -> usize {
         match self {
             Self::None => 0,
             Self::Frequency3 { .. } => 3,
+            Self::MidSide => 2,
         }
     }
 
-    /// `index` 番目 (0 始まり) の出力の既定名 (chain を補完するときの名前)。
+    /// [`Split::Frequency3`] の出力名 (chain の並び順)。
+    const FREQUENCY3_NAMES: [&'static str; 3] = ["Low", "Mid", "High"];
+    /// [`Split::MidSide`] の出力名。
+    const MID_SIDE_NAMES: [&'static str; 2] = ["Mid", "Side"];
+
+    /// `index` 番目 (0 始まり) の出力の既定名 (chain を補完 / 付け替えるときの名前)。
     pub fn output_name(&self, index: usize) -> Option<&'static str> {
         match self {
             Self::None => None,
-            Self::Frequency3 { .. } => [SplitBand::Low, SplitBand::Mid, SplitBand::High]
-                .get(index)
-                .map(SplitBand::label),
+            Self::Frequency3 { .. } => Self::FREQUENCY3_NAMES.get(index).copied(),
+            Self::MidSide => Self::MID_SIDE_NAMES.get(index).copied(),
         }
     }
 
-    /// `index` 番目の chain が受ける帯域 (`Frequency3` のみ)。 出力数を超える chain は `None`
-    /// (全帯域)。
-    pub fn band_of(&self, index: usize) -> Option<SplitBand> {
-        match self {
-            Self::None => None,
-            Self::Frequency3 { .. } => match index {
-                0 => Some(SplitBand::Low),
-                1 => Some(SplitBand::Mid),
-                2 => Some(SplitBand::High),
-                _ => None,
-            },
+    /// `index` 番目の chain に **この配り方が付ける既定名**: 出力があればその出力名、 無ければ
+    /// `Chain N` (N = index + 1)。 モード切替時に既定名の chain をこれへ付け替える。
+    pub fn default_chain_name(&self, index: usize) -> String {
+        self.output_name(index).map_or_else(|| format!("Chain {}", index + 1), str::to_string)
+    }
+
+    /// `name` が **機械が付けた既定名** か (`Chain N`、 またはどのモードかの出力名)。 モード切替で
+    /// 付け替えてよい名前 = これ。 ユーザーが付けた名前 (それ以外) は据え置く。
+    pub fn is_generated_chain_name(name: &str) -> bool {
+        if let Some(n) = name.strip_prefix("Chain ") {
+            return n.parse::<u32>().is_ok();
         }
+        Self::FREQUENCY3_NAMES.contains(&name) || Self::MID_SIDE_NAMES.contains(&name)
+    }
+
+    /// `index` 番目の chain が受ける出力の番号 (= その chain の index)。 出力数を超える chain は
+    /// `None` (素通し入力)。 engine の `ChainBegin` / `PreFx` tap の住所。
+    pub fn output_of(&self, index: usize) -> Option<u8> {
+        (index < self.output_count()).then_some(index as u8)
+    }
+
+    /// UI に param 行 (ヘッダ直下) が要るか (`Frequency3` のクロスオーバー)。
+    pub fn has_params(&self) -> bool {
+        matches!(self, Self::Frequency3 { .. })
     }
 
     /// クロスオーバー周波数を読む (`Frequency3` 以外は `None`)。
     pub fn freq(&self, edge: SplitEdge) -> Option<f32> {
         match self {
-            Self::None => None,
             Self::Frequency3 { low_hz, high_hz } => Some(match edge {
                 SplitEdge::LowMid => *low_hz,
                 SplitEdge::MidHigh => *high_hz,
             }),
+            Self::None | Self::MidSide => None,
         }
     }
 
-    /// クロスオーバー `(low_hz, high_hz)`。 `Frequency3` 以外は既定値 (engine が分割器を持つのは
-    /// `Frequency3` のときだけなので、 ここへ来る `None` は snapshot の一時的な不一致)。
+    /// クロスオーバー `(low_hz, high_hz)`。 `Frequency3` 以外は既定値 (engine が帯域分割器を持つのは
+    /// `Frequency3` のときだけなので、 ここへ来る他 variant は snapshot の一時的な不一致)。
     pub fn freqs_or_default(&self) -> (f32, f32) {
         match self {
             Self::Frequency3 { low_hz, high_hz } => (*low_hz, *high_hz),
-            Self::None => Self::DEFAULT_FREQS,
+            Self::None | Self::MidSide => Self::DEFAULT_FREQS,
         }
     }
 
@@ -147,7 +169,7 @@ impl Split {
     }
 }
 
-/// [`Split::Frequency3`] の帯域 (chain の並び順 = Low / Mid / High)。
+/// [`Split::Frequency3`] の帯域 (chain の並び順 = Low / Mid / High)。 engine の出力番号 0/1/2。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum SplitBand {
     Low,
@@ -899,6 +921,16 @@ mod tests {
         assert_eq!(back.as_parallel().unwrap().split, r.split);
         let mut plain = Parallel::new();
         assert!(!plain.set_split_freq(SplitEdge::LowMid, 500.0), "None には効かない");
+
+        let ms = Split::MidSide;
+        assert_eq!((ms.output_count(), ms.output_name(0), ms.output_name(1), ms.output_name(2)), (2, Some("Mid"), Some("Side"), None));
+        assert_eq!((ms.default_chain_name(1), ms.default_chain_name(2)), ("Side".to_string(), "Chain 3".to_string()));
+        assert!(Split::is_generated_chain_name("Chain 12") && Split::is_generated_chain_name("High"));
+        assert!(!Split::is_generated_chain_name("Comp") && !Split::is_generated_chain_name("Chain x"));
+        assert_eq!((ms.output_of(1), ms.output_of(2)), (Some(1), None));
+        assert!(!ms.has_params());
+        let json = serde_json::to_string(&ms).unwrap();
+        assert_eq!(serde_json::from_str::<Split>(&json).unwrap(), ms);
     }
 
     #[test]

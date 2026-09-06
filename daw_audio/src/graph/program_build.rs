@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use common::model::{Device, SplitBand, TapPoint, TapSource};
+use common::model::{Device, TapPoint, TapSource};
 
 use super::compile::DeviceLatencies;
 use super::delay_line::DelayLine;
@@ -32,13 +32,13 @@ pub struct BuiltProgram {
     pub chain_slots: HashMap<u64, ChainSlot>,
 }
 
-/// chain の program 内の位置。 `band` = r.md #112 帯域分割でこの chain が受ける帯域
-/// (`PreFx` tap はその帯域の出力を指す)。
+/// chain の program 内の位置。 `output` = r.md #112 `Split` でこの chain が受ける出力番号
+/// (`PreFx` tap はその出力を指す)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainSlot {
     pub chain_slot: u32,
     pub parallel_slot: u32,
-    pub band: Option<SplitBand>,
+    pub output: Option<u8>,
 }
 
 /// `devices` (bypass 中は除く) の直列 latency。Parallel は chain の最大。
@@ -151,7 +151,7 @@ impl Builder<'_> {
     /// Parallel 1 つを emit し、その latency (= chain の最大) を返す。
     fn emit_parallel(&mut self, r: &common::model::Parallel, prefix: u32) -> u32 {
         let parallel_slot = self.program.parallels.len() as u32;
-        self.program.parallels.push(ParallelScratch::new(r.id, !r.split.is_none()));
+        self.program.parallels.push(ParallelScratch::new(r.id, r.split));
         self.program.ops.push(ChainOp::ParallelBegin { parallel_slot });
         let max = r
             .chains
@@ -161,10 +161,10 @@ impl Builder<'_> {
             .unwrap_or(0);
         for (k, c) in r.chains.iter().enumerate() {
             let chain_slot = self.program.chains.len() as u32;
-            let band = r.split.band_of(k);
+            let output = r.split.output_of(k);
             self.program.chains.push(ChainScratch::new(c.id));
-            self.chain_slots.insert(c.id, ChainSlot { chain_slot, parallel_slot, band });
-            self.program.ops.push(ChainOp::ChainBegin { parallel_slot, chain_slot, band });
+            self.chain_slots.insert(c.id, ChainSlot { chain_slot, parallel_slot, output });
+            self.program.ops.push(ChainOp::ChainBegin { parallel_slot, chain_slot, output });
             let lat = self.emit_list(&c.devices, prefix);
             let delay = (max > lat).then(|| {
                 let comp = max - lat;
@@ -317,31 +317,31 @@ mod tests {
         assert_eq!(b.program.pass1_end, 6);
     }
 
-    /// r.md #112: `Frequency3` の Parallel は chain 1/2/3 に Low/Mid/High、 4 本目は全帯域。
-    /// scratch に分割器が置かれ、 `Split::None` の Parallel には置かれない。
+    /// r.md #112: `Frequency3` の Parallel は chain 1/2/3 に出力 0/1/2 (Low/Mid/High)、 4 本目は
+    /// 素通し。 `MidSide` は 2 出力。 scratch に分割器が置かれ、 `Split::None` には置かれない。
     #[test]
-    fn frequency_split_assigns_bands_by_chain_order_and_allocates_the_splitter() {
+    fn split_assigns_outputs_by_chain_order_and_allocates_the_splitter() {
         let mut split = parallel(10, vec![(11, vec![]), (12, vec![]), (13, vec![]), (14, vec![])]);
         split.as_parallel_mut().unwrap().split = common::model::Split::DEFAULT_FREQUENCY3;
+        let mut ms = parallel(30, vec![(31, vec![]), (32, vec![]), (33, vec![])]);
+        ms.as_parallel_mut().unwrap().split = common::model::Split::MidSide;
         let plain = parallel(20, vec![(21, vec![])]);
-        let b = build_program(&[split, plain], 7, None, &DeviceLatencies::new(), &HashSet::new());
-        let bands: Vec<Option<SplitBand>> = b
+        let b = build_program(&[split, ms, plain], 7, None, &DeviceLatencies::new(), &HashSet::new());
+        let outputs: Vec<Option<u8>> = b
             .program
             .ops
             .iter()
             .filter_map(|op| match op {
-                ChainOp::ChainBegin { band, .. } => Some(*band),
+                ChainOp::ChainBegin { output, .. } => Some(*output),
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            bands,
-            vec![Some(SplitBand::Low), Some(SplitBand::Mid), Some(SplitBand::High), None, None]
-        );
+        assert_eq!(outputs, vec![Some(0), Some(1), Some(2), None, Some(0), Some(1), None, None]);
         assert!(b.program.parallels[0].split.is_some());
-        assert!(b.program.parallels[1].split.is_none());
-        assert_eq!(b.chain_slots[&12].band, Some(SplitBand::Mid));
-        assert_eq!(b.chain_slots[&14].band, None);
+        assert!(b.program.parallels[1].split.is_some());
+        assert!(b.program.parallels[2].split.is_none());
+        assert_eq!(b.chain_slots[&12].output, Some(1));
+        assert_eq!(b.chain_slots[&14].output, None);
     }
 
     #[test]

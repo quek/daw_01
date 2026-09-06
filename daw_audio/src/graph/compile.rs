@@ -33,8 +33,8 @@ struct ChainLoc {
     owner: u32,
     chain_slot: u32,
     parallel_slot: u32,
-    /// r.md #112: 帯域分割で受ける帯域 (`PreFx` tap はその帯域)。
-    band: Option<common::model::SplitBand>,
+    /// r.md #112: `Split` で受ける出力番号 (`PreFx` tap はその出力)。
+    output: Option<u8>,
     lat: ChainLatency,
 }
 
@@ -45,11 +45,11 @@ fn tap_bufref_for(tap: &AudioTap, id_to_idx: &HashMap<u32, u32>, chains: &ChainM
     match tap.source {
         TapSource::Track(t) => id_to_idx.get(&t).map(|&i| tap_bufref(tap.tap_point, i)),
         TapSource::Chain(c) => chains.get(&c).map(|loc| match tap.tap_point {
-            TapPoint::PreFx => match loc.band {
-                Some(band) => BufRef::ParallelBand {
+            TapPoint::PreFx => match loc.output {
+                Some(output) => BufRef::ParallelOutput {
                     owner: loc.owner,
                     slot: loc.parallel_slot,
-                    band,
+                    output,
                 },
                 None => BufRef::ParallelInput {
                     owner: loc.owner,
@@ -703,14 +703,14 @@ fn build_all_programs(
         .collect();
     let mut chain_map: ChainMap = HashMap::new();
     let mut register = |b: &super::program_build::BuiltProgram, owner: u32| {
-        for (&cid, &super::program_build::ChainSlot { chain_slot, parallel_slot, band }) in &b.chain_slots {
+        for (&cid, &super::program_build::ChainSlot { chain_slot, parallel_slot, output }) in &b.chain_slots {
             chain_map.insert(
                 cid,
                 ChainLoc {
                     owner,
                     chain_slot,
                     parallel_slot,
-                    band,
+                    output,
                     lat: b.chain_latency.get(&cid).copied().unwrap_or_default(),
                 },
             );

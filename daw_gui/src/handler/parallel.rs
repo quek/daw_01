@@ -292,9 +292,10 @@ impl AppData {
     }
 
     /// r.md #112: 入力の配り方 (`Split`) を切り替える。 構造変更なので `LoadSong` で運ぶ
-    /// (値のみ IPC ではない)。 出力数より chain が少なければ空 chain を補って
-    /// (名前は帯域名、 色は自動)、 既存 chain は名前も中身もそのまま。 4 本目以降は残す
-    /// (全帯域入力)。 off に戻しても chain は消さない。
+    /// (値のみ IPC ではない)。 出力数より chain が少なければ空 chain を補い (色は自動)、 既定名
+    /// (`Chain N` / 別モードの出力名) の chain は新モードの既定名へ付け替える (Low/Mid/High、
+    /// Mid/Side、 off なら `Chain N`)。 ユーザーが付けた名前と中身は据え置き。 出力数を超える
+    /// chain は残す (素通し入力)。 off に戻しても chain は消さない。
     pub(crate) fn set_parallel_split(&mut self, parallel_id: u64, split: Split) {
         self.edit_song_checked(move |song| {
             let Some(r) = song.parallel_by_id(parallel_id) else {
@@ -312,10 +313,14 @@ impl AppData {
                 return false;
             };
             parallel.split = split;
+            for (k, c) in parallel.chains.iter_mut().enumerate() {
+                if Split::is_generated_chain_name(&c.name) {
+                    c.name = split.default_chain_name(k);
+                }
+            }
             for id in ids {
                 let k = parallel.chains.len();
-                let name = split.output_name(k).map_or_else(|| parallel.next_chain_name(), str::to_string);
-                let mut c = ParallelChain::new(name);
+                let mut c = ParallelChain::new(split.default_chain_name(k));
                 c.id = id;
                 c.color = Some(auto_color(&chain_colors(&parallel.chains), &ancestors));
                 parallel.chains.push(c);
@@ -417,7 +422,7 @@ impl AppData {
             return;
         }
         // r.md #112: Split の param 行はヘッダ直下 (chain 行の帯域名と並び順で対応する)。
-        if !r.split.is_none() {
+        if r.split.has_params() {
             rows.push(row(ChainRowKind::SplitParams { parallel_id: r.id, split: r.split }));
         }
         for c in &r.chains {

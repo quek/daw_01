@@ -192,15 +192,18 @@ Mid-Side Split / Stereo Split を **別 container** にしているが、 ここ
 ```rust
 pub enum Split {
     None,                                       // 全 chain に同じ入力 (従来)
-    Frequency3 { low_hz: f32, high_hz: f32 },   // 3 バンド (#112)。 将来: Loudness / MidSide / Stereo …
+    Frequency3 { low_hz: f32, high_hz: f32 },   // 3 バンド (#112)
+    MidSide,                                    // Mid / Side (#112 追補)。 将来: Loudness / Stereo (L/R) …
 }
 ```
 
 - **出力は chain の並び順に対応**: `Frequency3` なら chain 1 = Low、 2 = Mid、 3 = High。 出力数を
   超える chain (4 本目以降) は全帯域 (素通し) の入力を受ける (Dry chain を足す使い方)。 band chain
   を削除した帯域は無音 (ユーザーの明示操作)。
-- **on にしたとき** chain が出力数に足りなければ空 chain を補う (名前は帯域名、 色は自動)。 既存
-  chain は名前も中身も据え置き。 off に戻しても chain は消さない。 モード切替は構造変更なので
+- **モード切替時の chain**: 出力数に足りなければ空 chain を補う (色は自動)。 **既定名** (`Chain N` /
+  別モードの出力名 = `Split::is_generated_chain_name`) の chain は新モードの既定名
+  (`Split::default_chain_name`: Low/Mid/High、 Mid/Side、 off なら `Chain N`) へ付け替え、 ユーザーが
+  付けた名前と中身は据え置く。 off に戻しても chain は消さない。 モード切替は構造変更なので
   `LoadSong` (再 compile)、 周波数は値のみ IPC `SetParallelSplitFreq`。
 - **順序**: `low_hz <= high_hz` を `Parallel::set_split_freq` (GUI と `song_values` の共通 setter)
   が保つ — 片方を相手より先へ動かすと相手が押される (Bitwig の分割点と同じく交差しない)。
@@ -213,7 +216,11 @@ pub enum Split {
   `ParallelBegin` で分割 (係数は buffer 終端の ramp 値、 変わったときだけ組み直す)、 `ChainBegin`
   が帯域をバスへ載せる。 状態は `Parallel::id` で再 compile を跨いで移送 (gain match の追従値も同じ
   経路に乗せた)。 band chain の `PreFx` tap = その帯域 (`BufRef::ParallelBand`)。 latency 0。
-- **UI**: ヘッダ行の Match の左に dropdown (`No split` / `3 bands`)。 `Frequency3` ならヘッダ直下に
+- **MidSide**: chain 1 = Mid `(M, M)`、 2 = Side `(S, -S)` (`M = (L+R)/2`、 `S = (L-R)/2`)。 空 chain 2 本
+  の和は `(M+S, M-S) = (L, R)` で厳密に元へ戻る。 状態なし、 param 行なし。 engine は
+  `band_split::Splitter` enum (`Frequency3(BandSplit)` / `MidSide(MidSideSplit)`) で variant ごとの
+  分割器を包み、 `ChainBegin` は `Split::output_of(k)` の出力番号で読む (`BufRef::ParallelOutput`)。
+- **UI**: ヘッダ行の Match の左に dropdown (`No split` / `3 bands` / `Mid/Side`)。 `Frequency3` ならヘッダ直下に
   param 行 `Low [200 Hz] Mid [2.0k] High` (`parallel_header.rs`、 inspector 共通の scrubable idiom:
   対数目盛 / undo bracket / automation gesture / 変調 overlay)。 chain 行は共通。
 
