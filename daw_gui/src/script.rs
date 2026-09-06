@@ -560,6 +560,16 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             0,
         )
         .function(
+            NativeFunction::from_fn_ptr(daw_toggle_virtual_keyboard),
+            js_string!("toggleVirtualKeyboard"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_virtual_keyboard_key),
+            js_string!("virtualKeyboardKey"),
+            3,
+        )
+        .function(
             NativeFunction::from_fn_ptr(daw_toggle_fold_to_scale),
             js_string!("toggleFoldToScale"),
             0,
@@ -1247,7 +1257,7 @@ fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     }
     let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
     let json = with_host(|host| {
-        let devices: &[common::model::PluginInstance] =
+        let devices: &[common::model::Device] =
             if track_id == common::model::MASTER_TRACK_ID {
                 &host.app.song_doc.song().master_fx_chain
             } else {
@@ -1532,6 +1542,60 @@ fn daw_toggle_snap_live_input(
 ) -> JsResult<JsValue> {
     with_host(|host| {
         host.app.handle_event(AppEvent::ToggleSnapLiveInput);
+    });
+    Ok(JsValue::undefined())
+}
+
+/// r.md #113: 仮想鍵盤 window の開閉 (= `K`)。
+fn daw_toggle_virtual_keyboard(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    with_host(|host| {
+        host.app.handle_event(AppEvent::VirtualKeyboard(
+            crate::event_virtual_keyboard::VirtualKeyboardEvent::Toggle,
+        ));
+    });
+    Ok(JsValue::undefined())
+}
+
+/// r.md #113: `virtualKeyboardKey(key, pressed, shift?)` — key grab が横取りした PC キーを
+/// 1 件模す (`key` は US 配列の刻印 1 文字: `"Z"` / `"2"` / `"["` 等)。 window が開いて
+/// いるかは問わない (headless では runner の宣言経路が無いので handler を直接叩く)。
+fn daw_virtual_keyboard_key(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let key = args
+        .get_or_undefined(0)
+        .to_string(ctx)?
+        .to_std_string()
+        .map_err(|e| JsNativeError::typ().with_message(format!("key not utf8: {e}")))?;
+    let pressed = args.get_or_undefined(1).to_boolean();
+    let shift = args.get_or_undefined(2).to_boolean();
+    let mut chars = key.chars();
+    let physical = match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_digit() => {
+            daw_ui_platform::PhysicalKey::Digit(u8::try_from(c as u32 - '0' as u32).unwrap_or(0))
+        }
+        (Some(c), None) => daw_ui_platform::PhysicalKey::Char(c.to_ascii_uppercase()),
+        _ => {
+            return Err(JsNativeError::typ()
+                .with_message(format!("virtualKeyboardKey: 1 文字のキー刻印を渡す (got {key:?})"))
+                .into());
+        }
+    };
+    with_host(|host| {
+        host.app.handle_event(AppEvent::VirtualKeyboard(
+            crate::event_virtual_keyboard::VirtualKeyboardEvent::Key(daw_ui_core::GrabbedKey {
+                key: physical,
+                pressed,
+                repeat: false,
+                shift,
+            }),
+        ));
     });
     Ok(JsValue::undefined())
 }

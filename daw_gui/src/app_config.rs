@@ -66,6 +66,24 @@ pub struct AppConfig {
     /// 曲の内容ではなく「この人の作業のしかた」なので app_config。`load` でクランプ。
     #[serde(default = "default_sampler_seconds")]
     pub sampler_seconds: u32,
+    /// r.md #113: 仮想鍵盤ウィンドウの位置 `[x, y]` (px)。 `None` = 未配置。
+    /// 開閉は保存しない (起動時は常に閉)。
+    #[serde(default)]
+    pub virtual_keyboard_pos: Option<[f32; 2]>,
+    /// r.md #113: 仮想鍵盤の下段 `Z` のピッチ (C 揃え)。 `load` で範囲に畳む。
+    #[serde(default = "default_virtual_keyboard_base_pitch")]
+    pub virtual_keyboard_base_pitch: u8,
+    /// r.md #113: 仮想鍵盤の打鍵ベロシティ `1..=127`。 `load` で範囲に畳む。
+    #[serde(default = "default_virtual_keyboard_velocity")]
+    pub virtual_keyboard_velocity: u8,
+}
+
+fn default_virtual_keyboard_base_pitch() -> u8 {
+    crate::virtual_keyboard::DEFAULT_BASE_PITCH
+}
+
+fn default_virtual_keyboard_velocity() -> u8 {
+    crate::virtual_keyboard::DEFAULT_VELOCITY
 }
 
 fn default_sampler_seconds() -> u32 {
@@ -108,6 +126,10 @@ impl AppConfig {
             // r.md #75: 合成の塊の長さ (秒) も「この人の作業のしかた」側。
             voicevox_chunk_secs: prefs.voicevox_chunk_secs,
             sampler_seconds: prefs.sampler_seconds,
+            // r.md #113: 仮想鍵盤の位置 / オクターブ / ベロシティも「作業のしかた」側。
+            virtual_keyboard_pos: prefs.virtual_keyboard_rect.map(|r| [r.x, r.y]),
+            virtual_keyboard_base_pitch: prefs.virtual_keyboard_base_pitch,
+            virtual_keyboard_velocity: prefs.virtual_keyboard_velocity,
         }
     }
 }
@@ -147,6 +169,9 @@ impl Default for AppConfig {
             loudness_report_rect: None,
             voicevox_chunk_secs: default_voicevox_chunk_secs(),
             sampler_seconds: default_sampler_seconds(),
+            virtual_keyboard_pos: None,
+            virtual_keyboard_base_pitch: default_virtual_keyboard_base_pitch(),
+            virtual_keyboard_velocity: default_virtual_keyboard_velocity(),
         }
     }
 }
@@ -169,6 +194,10 @@ pub fn load(path: impl AsRef<Path>) -> AppConfig {
         common::voicevox_phrase::MAX_CHUNK_SECS,
     );
     cfg.sampler_seconds = cfg.sampler_seconds.clamp(1, common::sampler_ring::MAX_SECONDS);
+    // r.md #113: 手書きの値でも鍵盤の範囲 (C 揃え / 1..=127) に畳む。
+    cfg.virtual_keyboard_base_pitch =
+        (cfg.virtual_keyboard_base_pitch.min(crate::virtual_keyboard::MAX_BASE_PITCH) / 12) * 12;
+    cfg.virtual_keyboard_velocity = cfg.virtual_keyboard_velocity.clamp(1, 127);
     cfg
 }
 
@@ -211,6 +240,9 @@ mod tests {
             loudness_report_rect: Some([5.0, 6.0, 720.0, 500.0]),
             voicevox_chunk_secs: 120.0,
             sampler_seconds: 60,
+            virtual_keyboard_pos: Some([30.0, 40.0]),
+            virtual_keyboard_base_pitch: 60,
+            virtual_keyboard_velocity: 80,
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -228,6 +260,27 @@ mod tests {
         assert!(loaded.loudness_report_open);
         assert_eq!(loaded.loudness_report_rect, Some([5.0, 6.0, 720.0, 500.0]));
         assert_eq!(loaded.voicevox_chunk_secs, 120.0);
+        assert_eq!(loaded.virtual_keyboard_pos, Some([30.0, 40.0]));
+        assert_eq!(loaded.virtual_keyboard_base_pitch, 60);
+        assert_eq!(loaded.virtual_keyboard_velocity, 80);
+    }
+
+    /// r.md #113: 手書きの `app_config.json` で C 揃えでない / 範囲外の鍵盤設定が来ても
+    /// 鍵盤の範囲に畳む (最高音が 127 を超えない、 ベロシティ 0 で無音にならない)。
+    #[test]
+    fn load_clamps_virtual_keyboard_settings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        std::fs::write(
+            &path,
+            r#"{"virtual_keyboard_base_pitch": 127, "virtual_keyboard_velocity": 0}"#,
+        )
+        .unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.virtual_keyboard_base_pitch, crate::virtual_keyboard::MAX_BASE_PITCH);
+        assert_eq!(loaded.virtual_keyboard_velocity, 1);
+        std::fs::write(&path, r#"{"virtual_keyboard_base_pitch": 50}"#).unwrap();
+        assert_eq!(load(&path).virtual_keyboard_base_pitch, 48, "C 揃えに切り下げる");
     }
 
     /// r.md #75: 壊れた / 手書きの `app_config.json` で 5 秒や 9999 秒が来ても、

@@ -77,21 +77,27 @@ impl AppData {
     /// frame 0 に注入するので、再生中でも停止中でも鳴る。
     fn monitor_note_on(&mut self, pitch: u8, velocity: u8) {
         for track_id in self.armed_track_ids() {
-            // 同じ鍵の重複 on (auto-repeat / 取りこぼした off) は 1 回に畳む。
-            if !self.recording.monitor_notes.insert((track_id, pitch)) {
-                continue;
-            }
-            self.send_audio(AudioCommand::PreviewNoteOn {
-                track_id,
-                pitch,
-                velocity,
-            });
+            self.monitor_note_on_track(track_id, pitch, velocity);
         }
+    }
+
+    /// 1 トラックへの発音 (台帳 `monitor_notes` に控える)。 MIDI 入力は録音待機
+    /// トラック全部、 仮想鍵盤 (r.md #113) はカーソルトラック 1 本にこれを呼ぶ。
+    pub(crate) fn monitor_note_on_track(&mut self, track_id: u32, pitch: u8, velocity: u8) {
+        // 同じ鍵の重複 on (auto-repeat / 取りこぼした off) は 1 回に畳む。
+        if !self.recording.monitor_notes.insert((track_id, pitch)) {
+            return;
+        }
+        self.send_audio(AudioCommand::PreviewNoteOn {
+            track_id,
+            pitch,
+            velocity,
+        });
     }
 
     /// モニター発音の消音。 arm を外した後に来た note-off でも確実に止められる
     /// よう、armed の集合ではなく **鳴らした台帳** を引いて off を送る。
-    fn monitor_note_off(&mut self, pitch: u8) {
+    pub(crate) fn monitor_note_off(&mut self, pitch: u8) {
         let sounding: Vec<u32> = self
             .recording
             .monitor_notes
@@ -357,6 +363,13 @@ impl AppData {
     /// 録音書き込みでも同じ動作、 不都合なら別 phase で「録音前に
     /// make_unique」 を検討)。
     pub(crate) fn record_midi_note_on(&mut self, pitch: u8, velocity: u8) {
+        let tracks = self.armed_track_ids();
+        self.record_midi_note_on_tracks(&tracks, pitch, velocity);
+    }
+
+    /// `tracks` (録音待機のもの) へ note_on を書き込む。 MIDI 入力は録音待機トラック
+    /// 全部、 仮想鍵盤 (r.md #113) は「カーソルトラックが録音待機なら 1 本」 で呼ぶ。
+    pub(crate) fn record_midi_note_on_tracks(&mut self, tracks: &[u32], pitch: u8, velocity: u8) {
         let playhead =
             self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
         if playhead < 0.0 {
@@ -374,7 +387,7 @@ impl AppData {
         } else {
             pitch
         };
-        for track_id in self.armed_track_ids() {
+        for &track_id in tracks {
             self.ensure_midi_clip_at_playhead(track_id, playhead);
             let Some(key) = self.find_midi_clip_at_playhead(track_id, playhead) else {
                 continue;
@@ -430,14 +443,21 @@ impl AppData {
         } else {
             pitch
         };
-        for track_id in self.armed_track_ids() {
-            let Some((start, note_id)) = self
-                .recording.midi_recording_active_notes
-                .remove(&(track_id, pitch))
+        // 押している台帳を引く (arm を外した / カーソルを移した後の note_off でも、
+        // 書き込んだトラックのノートを確定できる)。
+        let held: Vec<(u32, u8)> = self
+            .recording
+            .midi_recording_active_notes
+            .keys()
+            .filter(|(_, p)| *p == pitch)
+            .copied()
+            .collect();
+        for key in held {
+            let Some((start, note_id)) = self.recording.midi_recording_active_notes.remove(&key)
             else {
                 continue;
             };
-            self.finalize_recorded_note(track_id, start, note_id, playhead);
+            self.finalize_recorded_note(key.0, start, note_id, playhead);
         }
     }
 

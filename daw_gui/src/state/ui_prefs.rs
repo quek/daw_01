@@ -176,6 +176,14 @@ pub struct UiPrefs {
     /// Global Sampler / MIDI Capture が溜める長さ (秒)。SSoT は `app_config.json`。
     pub sampler_seconds: u32,
 
+    /// r.md #113: 仮想鍵盤ウィンドウの位置 (app_config で永続)。 `None` = 未配置
+    /// (初回は画面中央下)。 サイズは固定なので rect の w / h は描画側が決める。
+    pub virtual_keyboard_rect: Option<daw_ui_renderer::Rect>,
+    /// r.md #113: 仮想鍵盤の下段 `Z` のピッチ (C 揃え、 app_config で永続)。
+    pub virtual_keyboard_base_pitch: u8,
+    /// r.md #113: 仮想鍵盤の打鍵ベロシティ `1..=127` (app_config で永続)。
+    pub virtual_keyboard_velocity: u8,
+
     pub is_help_open: bool,
 
     /// r.md #60: ヘルプ > バージョン情報 (About) が開いているか。

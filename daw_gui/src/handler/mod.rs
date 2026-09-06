@@ -49,4 +49,6 @@ pub mod transport;
 pub mod view_model;
 /// `ViewState` の snapshot / restore (保存される表示状態の唯一の口)。
 pub mod view_state;
+/// r.md #113: PC キーボードによる仮想鍵盤 (PC キー → MIDI 入力と同じ入口)。
+pub mod virtual_keyboard;
 pub mod voicevox;

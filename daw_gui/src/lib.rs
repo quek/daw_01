@@ -26,6 +26,7 @@ pub mod event;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
 pub mod event_sampler;
+pub mod event_virtual_keyboard;
 pub mod handler;
 pub mod audio_source_cache;
 pub mod automation_label;
@@ -79,6 +80,8 @@ pub mod test_ffmpeg;
 pub mod theme;
 pub mod video_fx;
 pub mod view;
+/// r.md #113: 仮想鍵盤の配列 (どの PC キーが何半音か) の SSoT。
+pub mod virtual_keyboard;
 pub mod voicevox_client;
 pub mod voicevox_engine;
 pub mod widgets;

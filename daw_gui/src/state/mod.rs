@@ -19,6 +19,8 @@ pub mod activity;
 pub mod launcher_ui;
 pub mod sampler;
 pub mod midi_capture;
+/// r.md #113: 仮想鍵盤ウィンドウの session-only な状態。
+pub mod virtual_keyboard;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
@@ -34,6 +36,7 @@ pub use ui_ephemeral::{ScrubGesture, UiEphemeral};
 pub use launcher_ui::{LauncherFocus, LauncherUiState};
 pub use sampler::SamplerState;
 pub use midi_capture::MidiCaptureState;
+pub use virtual_keyboard::VirtualKeyboardState;
 
 /// GUI プロセスの全アプリ状態 (composition of state groups)。
 pub struct AppData {
@@ -81,6 +84,8 @@ pub struct AppData {
     pub sampler: SamplerState,
     /// MIDI Capture: MIDI 入力の常時捕捉。
     pub midi_capture: MidiCaptureState,
+    /// r.md #113: 仮想鍵盤ウィンドウ (開閉 / 押している鍵)。 session-only。
+    pub virtual_keyboard: VirtualKeyboardState,
 }
 
 impl AppData {

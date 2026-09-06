@@ -19,7 +19,7 @@ use crate::view::{
     recovery_modal,
     resource_monitor,
     settings, shortcuts_help, snap, status_bar, track_inspector, track_picker, transport,
-    undo_history, voicevox_overlay,
+    undo_history, virtual_keyboard, voicevox_overlay,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -60,6 +60,8 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
         // r.md #48: 設定 window も同じ true-floating 機構 (背景を暗転しないので、
         // テーマを選んだ瞬間に背後の全画面が切り替わるのを見ながら選べる)。
         settings::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+        // r.md #113: 仮想鍵盤ウィンドウも同じ true-floating 機構。
+        virtual_keyboard::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
     }
     // r.md #54: ラウドネスレポート window。走査中は **画面全体** を予約して
     // 背景を丸ごと inert にする (暗転と入力遮断が同じ 1 つの根拠から出る)。
@@ -196,6 +198,8 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
 
         // 設定 window (r.md #48): 同上、 背景描画の後 = z-order 最前面。
         settings::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+        // 仮想鍵盤 window (r.md #113): 同上。 key grab の横取り分もここで消費する。
+        virtual_keyboard::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
     }
 
     // ラウドネスレポート window (r.md #54): 同上。走査中はここで暗転も描く。
@@ -679,6 +683,15 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_undo_history") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleUndoHistory)
+        }));
+    }
+    // r.md #113: K で仮想鍵盤 window を開閉 (K は鍵盤の音のキーではないので、 開いている
+    // 間も横取りされず閉じられる)。
+    if ui.take_shortcut("daw.toggle_virtual_keyboard") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::VirtualKeyboard(
+                crate::event_virtual_keyboard::VirtualKeyboardEvent::Toggle,
+            ))
         }));
     }
     // r.md #50: Ctrl+Alt+M でマスターパネルを開閉 (REAPER の Master Track トグルと同キー)。
@@ -1211,6 +1224,15 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::SetArmedModSource(None));
             }));
+        } else if app.virtual_keyboard.open {
+            // r.md #113: 仮想鍵盤 window が開いていれば Esc で閉じる (押している音も
+            // 止まる)。 他の window より先 — 開いている間は素キー shortcut が横取り
+            // されるので、 いちばん早く抜けられる位置に置く。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::VirtualKeyboard(
+                    crate::event_virtual_keyboard::VirtualKeyboardEvent::Toggle,
+                ))
+            }));
         } else if app.ui_ephemeral.resource_panel_open {
             // resource monitor (r.md #3): 詳細パネルが開いていれば Esc で閉じる
             // (rename / audio editor の後、 選択解除より優先)。
@@ -1370,6 +1392,22 @@ mod tests {
         for e in edits {
             e.apply(app);
         }
+    }
+
+    /// r.md #113: `K` は仮想鍵盤 window の開閉。 開いている間に Esc を押すと閉じる
+    /// (他の window より先に)。
+    #[test]
+    fn k_toggles_virtual_keyboard_and_escape_closes_it() {
+        let mut app = build_app();
+        dispatch_char_key(&mut app, 'k');
+        assert!(app.virtual_keyboard.open, "K で開く");
+        dispatch_char_key(&mut app, 'k');
+        assert!(!app.virtual_keyboard.open, "もう一度 K で閉じる");
+        dispatch_char_key(&mut app, 'k');
+        app.ui_prefs.undo_history_open = true;
+        dispatch_escape(&mut app);
+        assert!(!app.virtual_keyboard.open, "Esc は仮想鍵盤を先に閉じる");
+        assert!(app.ui_prefs.undo_history_open, "編集履歴は次の Esc まで開いたまま");
     }
 
     /// r.md #96: `B` は Mixer のトグル。閉 → Mixer → 閉、Piano Roll タブ → Mixer。

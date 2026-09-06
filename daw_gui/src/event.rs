@@ -659,6 +659,9 @@ pub enum AppEvent {
     /// Global Sampler / MIDI Capture (`docs/plan_global_sampler.md`)。`Launcher` と同じ
     /// 「1 arm = 1 サブ enum」。
     Sampler(crate::event_sampler::SamplerEvent),
+    /// r.md #113: PC キーボードによる仮想鍵盤 (`docs/plan_virtual_keyboard.md`)。同じく
+    /// 「1 arm = 1 サブ enum」。
+    VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent),
 
     // -------- Arrangement / clip operations -------------------------------
     SelectClip { target: ClipKey, additive: bool },
@@ -1875,6 +1878,8 @@ impl AppEvent {
             // ここに並べると「巨大 match」 が 2 か所に増える)。
             E::Launcher(ev) => ev.undo_label(),
             E::Sampler(ev) => ev.undo_label(),
+            // r.md #113 `VirtualKeyboard(..)` は `MidiNoteOn` と同じ録音経路なので、
+            // ラベルも同じ既定 (`_ => "編集"`) に落とす。
 
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",

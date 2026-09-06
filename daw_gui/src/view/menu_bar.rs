@@ -245,6 +245,13 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.separator();
             // r.md #29: 編集履歴パネルの開閉。 行 click でその時点へ一発 Undo/Redo。
             event_item(m, "編集履歴", "daw.toggle_undo_history", AppEvent::ToggleUndoHistory);
+            // r.md #113: PC キーボードで演奏する仮想鍵盤ウィンドウ。
+            event_item(
+                m,
+                "仮想鍵盤",
+                "daw.toggle_virtual_keyboard",
+                AppEvent::VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent::Toggle),
+            );
             // r.md #50: 画面右端のマスターパネル (フェーダー + 各種メーター)。
             event_item(m, "マスターパネル", "daw.toggle_master_panel", AppEvent::ToggleMasterPanel);
             add_mixer_toggle_item(m);

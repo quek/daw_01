@@ -774,6 +774,12 @@ impl Runner {
             PlatformEvent::Focus(focused) => {
                 state.app.activity.main_focused = *focused;
                 state.app.sync_app_active_with_audio();
+                // r.md #113: 窓が非アクティブになったら仮想鍵盤の押しっぱなしを止める。
+                // winit は focus 喪失時に synthetic な key release しか送らず、 それは上で
+                // 捨てている (`is_synthetic: true`) ので、 ここで明示的に全部離す。
+                if !focused {
+                    state.app.virtual_keyboard_release_all();
+                }
             }
             _ => {}
         }
@@ -1477,6 +1483,18 @@ impl Runner {
         for name in std::mem::take(&mut state.app.ui_ephemeral.pending_shortcut_injections) {
             state.ui.inject_shortcut(name);
         }
+
+        // r.md #113: 仮想鍵盤が開いている間だけ、 鍵盤のキーを shortcut 層より前で横取り
+        // する。 テーマと同じく **毎フレーム無条件に** 宣言し直す (開閉と宣言がずれない)。
+        state.ui.set_key_grab(
+            state
+                .app
+                .virtual_keyboard
+                .open
+                .then(crate::virtual_keyboard::grab_keys)
+                .into_iter()
+                .flatten(),
+        );
 
         state.ui.frame_with_fonts(
             &mut state.app,

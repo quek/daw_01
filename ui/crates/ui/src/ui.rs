@@ -28,6 +28,7 @@ use crate::dialog::{DialogKind, DialogRequest, DialogResult, FileDialogFilter};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::input::{DroppedFiles, FrameInput, ImeEvent, PointerFrame};
+use crate::key_grab::{GrabbedKey, KeyGrab};
 use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::shortcut::ShortcutMap;
@@ -121,6 +122,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     redraw_suppressed: bool,
     /// M8 Phase 30: shortcut 登録テーブル。
     shortcut_map: ShortcutMap,
+    /// daw_01 r.md #113: 生キー横取りの宣言 (詳細は [`crate::key_grab`])。 shortcut 層より
+    /// 前に `keyboard_events` から取り除き、 `Ui::take_grabbed_keys` で渡す。
+    key_grab: KeyGrab,
     /// M8 Phase 31: OS clipboard provider (None なら set/get は no-op)。
     clipboard: Option<Box<dyn ClipboardProvider>>,
     /// M8 Phase 34: 前フレームに完了した dialog 結果 (次フレームで `Ui::take_dialog_result` で取り出される)。
@@ -247,6 +251,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             redraw_requested_in_last_frame: false,
             redraw_suppressed: false,
             shortcut_map: ShortcutMap::with_default_bindings(),
+            key_grab: KeyGrab::default(),
             clipboard: None,
             pending_dialog_results: HashMap::new(),
             last_focusable: Vec::new(),
@@ -336,6 +341,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// M8 Phase 30: shortcut map への mutable 参照 (実行時 rebind 用)。
     pub fn shortcut_map_mut(&mut self) -> &mut ShortcutMap {
         &mut self.shortcut_map
+    }
+
+    /// daw_01 r.md #113: 生キー横取りの宣言を `keys` に置き換える (空 = 解除)。
+    /// フレームを跨いで有効で、 宣言中は該当キーの press / release が shortcut 層にも
+    /// focused widget にも届かず `Ui::take_grabbed_keys` に出る ([`crate::key_grab`])。
+    pub fn set_key_grab(&mut self, keys: impl IntoIterator<Item = PhysicalKey>) {
+        self.key_grab.set(keys);
     }
 
     /// daw_01 r.md #36: 次フレームで `Ui::take_shortcut(name)` が拾えるように
@@ -653,6 +665,17 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // text_input が後で `take_keyboard_events_if_focused` で取るのは shortcut 後の残り。
         let modifiers = pointer.modifiers;
         let typing_lock = self.last_typing_focus;
+        // resource monitor (r.md #3): keyboard 遮断は capture_keyboard も要求する
+        // (= overlay panel は pointer だけ mask、 Space 等の shortcut は background に通す)。
+        let modal_capturing_keyboard = self
+            .open_popups
+            .values()
+            .any(|s| s.modal && s.capture_input && s.capture_keyboard);
+        // daw_01 r.md #113: 生キー横取り (key grab) は shortcut 層より **前**。 宣言された
+        // キーは shortcut にも focused widget にも渡らない ([`crate::key_grab`])。
+        let mut grabbed_keys =
+            self.key_grab
+                .take_from(&mut keyboard_events, modifiers, typing_lock || modal_capturing_keyboard);
         // daw_01 r.md #36: 外部窓 (プラグインエディタ) から転送された shortcut を先頭に積む。
         // 解決は済んでいるので typing 調停は通さない (OS フォーカスが daw_gui の外にある間に
         // 押されたキーなので、 こちらのテキスト欄は入力対象ではない)。
@@ -800,12 +823,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
             .open_popups
             .values()
             .any(|s| s.modal && s.capture_input);
-        // resource monitor (r.md #3): keyboard 遮断は capture_keyboard も要求する
-        // (= overlay panel は pointer だけ mask、 Space 等の shortcut は background に通す)。
-        let modal_capturing_keyboard = self
-            .open_popups
-            .values()
-            .any(|s| s.modal && s.capture_input && s.capture_keyboard);
         let effective_pointer = if modal_capturing { masked_pointer(pointer) } else { pointer };
 
         // r.md #48: ウィンドウの clear 色はパレットの床。renderer 側の `Scene::DEFAULT_CLEAR`
@@ -824,6 +841,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             modal_capturing,
             modal_capturing_keyboard,
             keyboard_events: &mut keyboard_events,
+            grabbed_keys: &mut grabbed_keys,
             ime_events: &mut ime_events,
             cursor,
             screen,
@@ -995,6 +1013,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) modal_capturing_keyboard: bool,
     /// このフレーム分のキー入力イベント (フォーカスを持つ widget が消費する)。
     keyboard_events: &'a mut Vec<KeyEvent>,
+    /// daw_01 r.md #113: このフレームに key grab が横取りした生キー (宣言側が
+    /// `take_grabbed_keys` で消費する。 取られなければフレーム末尾で捨てる)。
+    grabbed_keys: &'a mut Vec<GrabbedKey>,
     /// このフレーム分の IME イベント (フォーカスを持つ widget が消費する)。
     ime_events: &'a mut Vec<ImeEvent>,
     /// 現在の利用可能領域 (シンプルな vstack 用)。
@@ -1879,6 +1900,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     // ============================================================
     // M8 Phase 30: shortcut + focus traversal + focus ring
     // ============================================================
+
+    /// daw_01 r.md #113: `UiHost::set_key_grab` で宣言したキーの、 このフレームの
+    /// press / release を順序どおり取り出す (2 度目は空)。 宣言していなければ常に空。
+    pub fn take_grabbed_keys(&mut self) -> Vec<GrabbedKey> {
+        std::mem::take(self.grabbed_keys)
+    }
 
     /// このフレームに `name` で登録した shortcut が triggered されていれば true (consume)。
     /// 同 name で 2 度目に呼ぶと false (= 1 度限り消費)。

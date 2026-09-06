@@ -133,6 +133,9 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.goto_timeline_home", keys: &["Home"], category: ShortcutCategory::Transport, description: "プレイヘッドを最後のクリップ先頭へ (再押下で 1.1.1)", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "daw.goto_timeline_end", keys: &["End"], category: ShortcutCategory::Transport, description: "プレイヘッドを最後のクリップの後ろへ", hidden: false, forward_from_external_window: false, typing_only: true, repeatable: false },
     ShortcutDef { name: "daw.cycle_arrange_follow", keys: &["Alt+F"], category: ShortcutCategory::Transport, description: "再生追従スクロール: OFF → 連続 → ページ を循環", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // r.md #113: 窓が開いている間は鍵盤に使うキー (Z..P 等) が key grab に横取りされ、
+    // それらに bind された素キー shortcut (S / Q / D / E ...) は効かない (docs/plan_virtual_keyboard.md)。
+    ShortcutDef { name: "daw.toggle_virtual_keyboard", keys: &["K"], category: ShortcutCategory::Transport, description: "仮想鍵盤 (PC キーボードで演奏) を開く / 閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // ----- トラック -----
     ShortcutDef { name: "daw.add_track", keys: &["Ctrl+T"], category: ShortcutCategory::Track, description: "トラックを追加", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.group_tracks", keys: &["Ctrl+G"], category: ShortcutCategory::Track, description: "選択トラックをグループ化", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
