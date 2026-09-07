@@ -38,7 +38,7 @@ pub const MOD_PHASE_BREAKPOINT_TICKS: i64 = 512;
 pub const MOD_PHASE_TABLE_MAX_SECS: f64 = 24.0 * 3600.0;
 
 /// 変調できる param の数 ([`ModParam::ALL`] と同じ)。
-pub const MOD_PARAM_COUNT: usize = 10;
+pub const MOD_PARAM_COUNT: usize = 17;
 
 /// `build_plan` の作業用: 1 本の入力辺 (変調元の位置, param, 深さ, 極性, `ModRouting::id`)。
 type RawEdge = (usize, ModParam, f32, Polarity, u32);
@@ -121,6 +121,10 @@ pub struct ModNode {
     /// 各 param の **変調前の値** (plain)。`Rate` だけは tempo に依存するので
     /// `rate` から毎刻み求める (ここには入れない)。
     pub base: [f64; MOD_PARAM_COUNT],
+    /// r.md #117: このソースが属する track の `Song::tracks` 上の位置 (master / 不明は `None`)。
+    /// `Note` 起点の global fallback が「その track の最新ノート」 を引くための写像を plan の
+    /// 構築時 (off-RT) に解いておく (RT で id → 位置の線形探索をしない)。
+    pub owner_track_index: Option<u32>,
 }
 
 /// off-RT で `Song` から作る評価計画。RT は読むだけ。
@@ -181,12 +185,17 @@ pub fn build_plan(
     generation: u64,
     anchor_secs: impl Fn(f64) -> f64,
 ) -> ModPlan {
-    let n = song.mod_sources.len();
+    // r.md #115: バイパス中の source (`!enabled`) は計画に載せない (= 値面にも載らず、 それを
+    // 引く routing / 辺は合成側が飛ばす)。 以下の `pos` はこの列の位置。
+    let sources: Vec<&ModSource> = song.mod_sources.iter().filter(|m| m.enabled).collect();
+    let n = sources.len();
     // 1. 辺を集める。id → 元の位置。
-    let pos_of = |id: u32| song.mod_sources.iter().position(|m| m.id == id);
+    let pos_of = |id: u32| sources.iter().position(|m| m.id == id);
     // adj[dst] = 入ってくる (src_pos, param, depth, polarity)
     let mut adj: Vec<Vec<RawEdge>> = vec![Vec::new(); n];
-    for r in song.all_mod_routings() {
+    // r.md #115: バイパス中の routing も辺にしない。
+    let routings = || song.all_mod_routings().filter(|r| r.enabled);
+    for r in routings() {
         let AutomationTarget::ModSourceParam { source_id, param } = &r.target else {
             continue;
         };
@@ -194,7 +203,7 @@ pub fn build_plan(
             continue;
         };
         // 種別に存在しない param は評価から外す (種別を戻せば復活するので消しはしない)。
-        if !param.exists_on(&song.mod_sources[dst].kind) {
+        if !param.exists_on(&sources[dst].kind) {
             continue;
         }
         adj[dst].push((src, *param, r.depth, r.polarity, r.id));
@@ -218,7 +227,7 @@ pub fn build_plan(
             }
         }
     }
-    for r in song.all_mod_routings() {
+    for r in routings() {
         if let AutomationTarget::ModRoutingDepth { routing_id } = &r.target
             && let Some(src) = pos_of(r.source_id)
         {
@@ -227,7 +236,7 @@ pub fn build_plan(
         }
     }
     // lane 側 (置き場は対象 routing と同じ)。
-    for rid in song.all_mod_routings().map(|r| r.id).collect::<Vec<_>>() {
+    for rid in routings().map(|r| r.id).collect::<Vec<_>>() {
         let target = AutomationTarget::ModRoutingDepth { routing_id: rid };
         let owner = song.mod_routing_owner(rid).unwrap_or(MASTER_TRACK_ID);
         if song_has_lane(song, owner, &target) {
@@ -316,22 +325,23 @@ pub fn build_plan(
             adj[i].iter().any(|(_, p, ..)| *p == ModParam::Rate)
                 || song_has_lane(
                     song,
-                    song.mod_sources[i].owner_track_id,
+                    sources[i].owner_track_id,
                     &AutomationTarget::ModSourceParam {
-                        source_id: song.mod_sources[i].id,
+                        source_id: sources[i].id,
                         param: ModParam::Rate,
                     },
                 )
         })
         .collect();
     // `audio_dep[x]` = x の **出力**が音に依存するか (どの param 経由でも伝播する)。
-    let audio_dep = audio_dependency(song, &adj);
+    let audio_dep = audio_dependency(&sources, &adj);
     // テンポそのものが音で動くなら、刻みの `dt_beats` が音依存になる。
     // 位相表はフォロワーを 0 として焼くので、この曲では **どのソースも**表で
     // 再現できない (レビュー確定: サイドチェイン → SongTempo の構成で seek のたびに
     // 全 Integrated の位相が飛ぶのに「位置依存」バッジが出なかった)。
     let tempo_is_audio_driven = song.song_mod_routings.iter().any(|r| {
-        r.target == AutomationTarget::SongTempo
+        r.enabled
+            && r.target == AutomationTarget::SongTempo
             && pos_of(r.source_id).is_some_and(|p| audio_dep[p])
     });
     // **位相**が音に依存するのは「rate に入る辺の上流に follower が居る」ときだけ。
@@ -348,9 +358,12 @@ pub fn build_plan(
     let mut slot_ids = Vec::with_capacity(n);
     let mut lane_params = Vec::new();
     for (slot, &pos) in order.iter().enumerate() {
-        let src: &ModSource = &song.mod_sources[pos];
+        let src: &ModSource = sources[pos];
         let slot_u16 = u16::try_from(slot).unwrap_or(u16::MAX);
-        let tier = if !rate_modulated[pos] {
+        // r.md #117: ノート起点のソースは位相がノートごとに違うので積分しない (常に閉形式。
+        // rate の変調は実効 Hz として閉形式に入る = 位相だけノート起点)。
+        let per_note = src.kind.is_per_note();
+        let tier = if !rate_modulated[pos] || per_note {
             ModTier::Closed
         } else if rate_chain_is_audio(pos) {
             ModTier::Audio
@@ -360,7 +373,7 @@ pub fn build_plan(
         let retrigger = src.kind.retrigger().unwrap_or(RetriggerMode::FreeRun);
         let anchor = match retrigger {
             RetriggerMode::FromBeat { anchor_beat } => anchor_secs(anchor_beat),
-            RetriggerMode::FreeRun => 0.0,
+            RetriggerMode::FreeRun | RetriggerMode::Note => 0.0,
         };
         let in_edges = adj[pos]
             .iter()
@@ -396,6 +409,11 @@ pub fn build_plan(
             retrigger,
             anchor_secs: anchor,
             base: base_params(&src.kind),
+            owner_track_index: song
+                .tracks
+                .iter()
+                .position(|t| t.id == src.owner_track_id)
+                .and_then(|i| u32::try_from(i).ok()),
         });
         slot_ids.push(src.id);
     }
@@ -439,12 +457,11 @@ fn reaches(adj: &Adjacency, from: usize, to: usize) -> bool {
 
 /// 各ソースが「audio に依存する鎖」に載っているか (follower から到達可能か)。
 fn audio_dependency(
-    song: &Song,
+    sources: &[&ModSource],
     adj: &Adjacency,
 ) -> Vec<bool> {
-    let n = song.mod_sources.len();
-    let mut dep: Vec<bool> = song
-        .mod_sources
+    let n = sources.len();
+    let mut dep: Vec<bool> = sources
         .iter()
         .map(|m| matches!(m.kind, ModSourceKind::EnvelopeFollower { .. }))
         .collect();
@@ -493,6 +510,9 @@ pub fn param_plain(kind: &ModSourceKind, param: ModParam, bpm: f64) -> f64 {
             LfoShape::Pulse { width } => f64::from(width),
             _ => 0.5,
         },
+        (ModParam::LfoShapeAmt, ModSourceKind::Lfo(c)) => f64::from(c.shape_amt),
+        (ModParam::LfoJitter, ModSourceKind::Lfo(c)) => f64::from(c.jitter),
+        (ModParam::LfoSmooth, ModSourceKind::Lfo(c)) => f64::from(c.smooth),
         (ModParam::RandomSmooth, ModSourceKind::Random(c)) => f64::from(c.smooth),
         (ModParam::StepsSlew, ModSourceKind::Steps(c)) => f64::from(c.slew),
         (ModParam::FollowerAttack, ModSourceKind::EnvelopeFollower { follower, .. }) => {
@@ -514,6 +534,10 @@ pub fn param_plain(kind: &ModSourceKind, param: ModParam, bpm: f64) -> f64 {
                 .band_filter
                 .map_or(f64::from(crate::model::MOD_BAND_HZ_MAX), |b| f64::from(b.lp_hz))
         }
+        (ModParam::AdsrAttack, ModSourceKind::Adsr(c)) => f64::from(c.attack_ms),
+        (ModParam::AdsrDecay, ModSourceKind::Adsr(c)) => f64::from(c.decay_ms),
+        (ModParam::AdsrSustain, ModSourceKind::Adsr(c)) => f64::from(c.sustain),
+        (ModParam::AdsrRelease, ModSourceKind::Adsr(c)) => f64::from(c.release_ms),
         _ => 0.0,
     }
 }
@@ -554,6 +578,8 @@ pub struct ModRuntime {
     prev: Vec<f32>,
     /// envelope follower の出力 (engine ring が `set_follower` で書く)。
     follower: Vec<f32>,
+    /// r.md #117: `Note` 起点のソースの最新ノートの起点 (engine が `set_note_anchor` で書く)。
+    note_anchor: Vec<Option<NoteAnchor>>,
     base: Vec<[f64; MOD_PARAM_COUNT]>,
     /// その param の base を **automation lane が上書きしたか** ([`ModPlan::lane_params`])。
     /// `Rate` の base は tempo 依存で `ModRate::base_hz` から毎刻み求めるので、
@@ -584,6 +610,8 @@ impl ModRuntime {
         self.prev.resize(n, 0.0);
         self.follower.clear();
         self.follower.resize(n, 0.0);
+        self.note_anchor.clear();
+        self.note_anchor.resize(n, None);
         self.base.clear();
         self.base.extend(plan.nodes.iter().map(|node| node.base));
         self.base_from_lane.clear();
@@ -665,6 +693,38 @@ impl ModRuntime {
             *v = env.clamp(0.0, 1.0);
         }
     }
+
+    /// r.md #117: `Note` 起点のソースの **最新ノート** の起点を書く (global 落とし込み用。
+    /// engine が刻みごとに `PerTrackState::latest_note` から写す、 `set_follower` と同じ契約)。
+    /// `None` = 鳴ったノートが無い (開始値を出す)。
+    pub fn set_note_anchor(&mut self, slot: u16, anchor: Option<NoteAnchor>) {
+        if let Some(v) = self.note_anchor.get_mut(usize::from(slot)) {
+            *v = anchor;
+        }
+    }
+
+    /// この slot を評価する時刻。 `Note` は最新ノートの起点 (無ければ「今」 = 開始値)、
+    /// それ以外は plan の anchor。
+    #[must_use]
+    pub fn time_for(&self, node: &ModNode, slot: usize, beat: f64, secs: f64) -> ModTime {
+        if node.retrigger == RetriggerMode::Note {
+            match self.note_anchor.get(slot).copied().flatten() {
+                Some(a) => ModTime::at_note(beat, secs, a.beat, a.secs, a.release_secs),
+                None => ModTime::at_note(beat, secs, beat, secs, None),
+            }
+        } else {
+            ModTime { beat, secs, anchor_secs: node.anchor_secs, ..ModTime::default() }
+        }
+    }
+}
+
+/// r.md #117: ノートの起点 (note-on の拍 / 秒) と note-off の秒。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NoteAnchor {
+    pub beat: f64,
+    pub secs: f64,
+    /// note-off の絶対秒 (`None` = 押している)。
+    pub release_secs: Option<f64>,
 }
 
 /// 1 制御刻みを進める。**クロス変調の評価点はここ 1 つ**。
@@ -750,12 +810,9 @@ pub fn tick(
         };
         eff[ModParam::Rate.index()] = hz_eff;
 
+        let time = rt.time_for(node, slot, ctx.beat, ctx.secs);
         let cp = match (node.rate, node.tier) {
-            (Some(rate), ModTier::Closed) => cycle_pos(
-                &rate,
-                ModTime { beat: ctx.beat, secs: ctx.secs, anchor_secs: node.anchor_secs },
-                &node.retrigger,
-            ),
+            (Some(rate), ModTier::Closed) => cycle_pos(&rate, time, &node.retrigger),
             (Some(rate), _) => {
                 // 位相は瞬時周波数の積分。未変調なら閉形式と telescoping で一致する。
                 let mult = if base_hz > 0.0 { hz_eff / base_hz } else { 1.0 };
@@ -776,12 +833,22 @@ pub fn tick(
                 rt.follower[slot]
             }
             kind => {
+                // 時間由来の欄は config から、 変調される欄は実効値で上書き。
                 let g = GenParams {
-                    cycle_pos: cp,
                     lfo_phase: eff[ModParam::LfoPhase.index()] as f32,
                     pulse_width: eff[ModParam::LfoPulseWidth.index()] as f32,
+                    lfo_shape_amt: eff[ModParam::LfoShapeAmt.index()] as f32,
+                    lfo_jitter: eff[ModParam::LfoJitter.index()] as f32,
+                    lfo_smooth: eff[ModParam::LfoSmooth.index()] as f32,
                     random_smooth: eff[ModParam::RandomSmooth.index()] as f32,
                     steps_slew: eff[ModParam::StepsSlew.index()] as f32,
+                    adsr: [
+                        eff[ModParam::AdsrAttack.index()] as f32,
+                        eff[ModParam::AdsrDecay.index()] as f32,
+                        eff[ModParam::AdsrSustain.index()] as f32,
+                        eff[ModParam::AdsrRelease.index()] as f32,
+                    ],
+                    ..GenParams::from_config(kind, cp, time, &node.retrigger)
                 };
                 eval_generator(kind, g).unwrap_or(0.0)
             }
@@ -825,11 +892,7 @@ fn seed_phases(plan: &ModPlan, rt: &mut ModRuntime, table: Option<&ModPhaseTable
             None
         };
         rt.phase[slot] = from_table.unwrap_or_else(|| {
-            cycle_pos(
-                &rate,
-                ModTime { beat: ctx.beat, secs: ctx.secs, anchor_secs: node.anchor_secs },
-                &node.retrigger,
-            )
+            cycle_pos(&rate, rt.time_for(node, slot, ctx.beat, ctx.secs), &node.retrigger)
         });
     }
 }
@@ -859,7 +922,7 @@ pub fn next_mark(
         &AutomationTarget::SongTempo,
         base,
         &song.song_mod_routings,
-        |id| rt.value_by_id(plan, id),
+        |id| plan.slot_of(id).map(|s| rt.value(s)),
     )
     .max(1.0);
     PhaseMark { beat, secs: (tick_index + 1) as f64 * dt_secs, bpm }
@@ -957,11 +1020,7 @@ pub fn locate(
         if node.tier == ModTier::Audio
             && let Some(rate) = node.rate
         {
-            rt.phase[slot] = cycle_pos(
-                &rate,
-                ModTime { beat, secs, anchor_secs: node.anchor_secs },
-                &node.retrigger,
-            );
+            rt.phase[slot] = cycle_pos(&rate, rt.time_for(node, slot, beat, secs), &node.retrigger);
         }
     }
     rt.next_tick = target_tick;
@@ -1127,7 +1186,9 @@ mod tests {
                 rate,
                 phase: 0.0,
                 retrigger: RetriggerMode::FreeRun,
+                ..LfoConfig::default()
             }),
+            enabled: true,
         }
     }
 
@@ -1192,6 +1253,7 @@ mod tests {
             source_id: from,
             depth: 0.2,
             polarity: Polarity::Bipolar,
+            enabled: true,
         };
         let song = song_with(
             vec![
@@ -1215,6 +1277,41 @@ mod tests {
         );
     }
 
+    /// r.md #115: バイパス中の source は計画に載らず (slot 無し)、 バイパス中の routing は辺に
+    /// ならない。 輪もバイパスした側で切れる (= 残った側は in_cycle でない)。
+    #[test]
+    fn バイパスしたsourceとroutingは計画から外れる() {
+        let edge = |id: u32, from: u32, to: u32, enabled: bool| ModRouting {
+            id,
+            target: AutomationTarget::ModSourceParam { source_id: to, param: ModParam::Rate },
+            source_id: from,
+            depth: 0.2,
+            polarity: Polarity::Bipolar,
+            enabled,
+        };
+        // 1 ⇄ 2 の輪。 routing 2 (2 → 1) をバイパスすると輪でなくなり、 1 の rate 辺が消える。
+        let song = song_with(
+            vec![lfo_source(1, quarter()), lfo_source(2, quarter())],
+            vec![edge(1, 1, 2, true), edge(2, 2, 1, false)],
+        );
+        let plan = build_plan(&song, 1, |_| 0.0);
+        assert_eq!(plan.nodes.len(), 2);
+        assert!(plan.nodes.iter().all(|n| !n.in_cycle), "バイパスで輪が開く");
+        let n1 = &plan.nodes[usize::from(plan.slot_of(1).unwrap())];
+        let n2 = &plan.nodes[usize::from(plan.slot_of(2).unwrap())];
+        assert!(n1.in_edges.is_empty(), "2 → 1 はバイパス中");
+        assert_eq!(n2.in_edges.len(), 1, "1 → 2 は生きている");
+
+        // source 1 をバイパス: 計画から消え、 1 を source にする辺も消える。
+        let mut song = song;
+        song.mod_sources[0].enabled = false;
+        let plan = build_plan(&song, 2, |_| 0.0);
+        assert_eq!(plan.slot_of(1), None, "バイパス中の source は slot を持たない");
+        let n2 = &plan.nodes[usize::from(plan.slot_of(2).unwrap())];
+        assert!(n2.in_edges.is_empty(), "バイパス中の source からの辺は無い");
+        assert_eq!(n2.tier, ModTier::Closed, "rate 変調が消えたので閉形式");
+    }
+
     /// 設計正本 §8-3: 輪は back-edge が 1 刻み遅延で開き、両端に `in_cycle` が立つ。
     /// 同じ刻み列を 2 回回して bit 一致すること (決定論)。
     #[test]
@@ -1231,6 +1328,7 @@ mod tests {
                     source_id: 1,
                     depth: 0.2,
                     polarity: Polarity::Bipolar,
+                    enabled: true,
                 },
                 ModRouting {
                     id: 2,
@@ -1241,6 +1339,7 @@ mod tests {
                     source_id: 2,
                     depth: 0.2,
                     polarity: Polarity::Bipolar,
+                    enabled: true,
                 },
             ],
         );
@@ -1289,6 +1388,7 @@ mod tests {
                     source_id: 1,
                     depth: 0.5,
                     polarity: Polarity::Unipolar,
+                    enabled: true,
                 },
                 ModRouting {
                     id: 11,
@@ -1296,6 +1396,7 @@ mod tests {
                     source_id: 3,
                     depth: -0.5,
                     polarity: Polarity::Unipolar,
+                    enabled: true,
                 },
             ],
         );
@@ -1352,6 +1453,7 @@ mod tests {
                 tap: crate::model::AudioTap::post_fader(1),
                 follower: crate::model::FollowerConfig::default(),
             },
+            enabled: true,
         };
         let edge = |id: u32, from: u32, to: u32, param: ModParam| ModRouting {
             id,
@@ -1359,6 +1461,7 @@ mod tests {
             source_id: from,
             depth: 0.3,
             polarity: Polarity::Bipolar,
+            enabled: true,
         };
         let tier_of = |song: &Song, id: u32| {
             let plan = build_plan(song, 1, |_| 0.0);
@@ -1405,6 +1508,7 @@ mod tests {
             source_id: 3,
             depth: 0.2,
             polarity: Polarity::Unipolar,
+            enabled: true,
         });
         assert_eq!(tier_of(&song, 2), ModTier::Audio, "テンポが音で動く曲は表を使えない");
     }
@@ -1423,6 +1527,7 @@ mod tests {
             source_id: from,
             depth: 0.2,
             polarity: Polarity::Bipolar,
+            enabled: true,
         };
         let song = song_with(
             vec![lfo_source(1, quarter()), lfo_source(2, quarter())],
@@ -1473,6 +1578,7 @@ mod tests {
                 source_id: 1,
                 depth: 0.3,
                 polarity: Polarity::Bipolar,
+                enabled: true,
             }],
         );
         let plan = build_plan(&song, 1, |_| 0.0);
@@ -1522,6 +1628,7 @@ mod tests {
                     source_id: 1,
                     depth: 0.2,
                     polarity: Polarity::Bipolar,
+                    enabled: true,
                 },
                 // #2 → 「#1 の変調の深さ」(routing_id=1)
                 ModRouting {
@@ -1530,6 +1637,7 @@ mod tests {
                     source_id: 2,
                     depth: 0.5,
                     polarity: Polarity::Unipolar,
+                    enabled: true,
                 },
             ],
         );

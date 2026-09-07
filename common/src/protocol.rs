@@ -132,6 +132,9 @@ pub mod plugin_param_flags {
     pub const AUTOMATABLE: u32 = 1 << 4;
     pub const MODULATABLE: u32 = 1 << 5;
     pub const REQUIRES_PROCESS: u32 = 1 << 6;
+    /// r.md #117: CLAP `CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID` (ノート単位の `param_mod`)。
+    /// VST3 は立てない。
+    pub const MODULATABLE_PER_NOTE_ID: u32 = 1 << 7;
 }
 
 /// Single entry in the `AllPluginStates` reply.
@@ -218,6 +221,9 @@ pub enum AudioCommand {
     /// Handshake reply to `AudioEvent::Hello`.
     Ack,
     Play,
+    /// r.md #118: 停止した位置から続ける再生 (Shift+Space)。 `Play` と違いランチャーのセルを
+    /// 撃ち直さず、 止まったときの位相のまま鳴らす。
+    PlayContinue,
     Stop,
     /// パニックボタン — master 出力を declick フェードで一瞬ミュート
     /// する。 panic は直後に（master がミュートされてから）plugin_host へ
@@ -359,6 +365,12 @@ pub enum AudioCommand {
     /// と値域は `Parallel::set_split_freq` が両プロセスで同じ規則を通す。 分割モードの切替
     /// (`Split` の variant) は構造変更なので `LoadSong` で運ぶ。
     SetParallelSplitFreq { track: u32, parallel_id: u64, edge: crate::model::SplitEdge, hz: f32 },
+    /// r.md #114 Parallel Selector: アクティブ chain (安定 `ParallelChain::id`) の値のみ更新。 RT は
+    /// Song snapshot から live-read し、 クロスフェードで切り替える。 規則は
+    /// `Parallel::set_active_chain` が両プロセスで同じ。
+    SetParallelActiveChain { track: u32, parallel_id: u64, chain_id: u64 },
+    /// r.md #114 Parallel Selector: クロスフェード時間 (ms、 値域 `SELECTOR_FADE_RANGE`) の値のみ更新。
+    SetParallelSelectorFade { track: u32, parallel_id: u64, fade_ms: f32 },
     /// Record-arm 状態。 audio thread は track.armed を Song に反映するのみ。
     SetTrackArmed { track: u32, armed: bool },
     /// BPM 軽量更新 (transport scrub 中に毎 frame 流れうる)。値のみ。

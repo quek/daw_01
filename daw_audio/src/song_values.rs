@@ -79,6 +79,17 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
                 r.set_split_freq(edge, hz);
             });
         }
+        // r.md #114 Selector: アクティブ chain / クロスフェード時間 (規則は model の setter が SSoT)。
+        AudioCommand::SetParallelActiveChain { parallel_id, chain_id, .. } => {
+            with_parallel(song, parallel_id, |r| {
+                r.set_active_chain(chain_id);
+            });
+        }
+        AudioCommand::SetParallelSelectorFade { parallel_id, fade_ms, .. } => {
+            with_parallel(song, parallel_id, |r| {
+                r.set_selector_fade(fade_ms);
+            });
+        }
         AudioCommand::SetSongBpm { bpm } => song.bpm = bpm.clamp(1.0, 400.0),
         AudioCommand::SetSongTimeSigNumerator { num } => song.time_sig.0 = num.clamp(1, 32),
         _ => return false,

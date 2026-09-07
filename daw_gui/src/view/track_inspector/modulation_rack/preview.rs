@@ -161,7 +161,7 @@ pub(super) fn cross_mod_window(
             out.push((x, rt.value(slot)));
             let plain = common::modulators::generator_scalar(
                 &node.kind,
-                ModTime { beat: b, secs: s, anchor_secs: node.anchor_secs },
+                ModTime { beat: b, secs: s, anchor_secs: node.anchor_secs, ..ModTime::default() },
             )
             .unwrap_or(0.0);
             ghost.push((x, plain));

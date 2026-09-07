@@ -130,10 +130,13 @@ impl Builder<'_> {
                 if p.bypassed {
                     return 0;
                 }
+                let voice_slot = self.program.voices.len() as u32;
+                self.program.voices.push(crate::graph::voices::VoiceTable::new(p.id));
                 self.program.ops.push(ChainOp::Plugin {
                     device_id: p.id,
                     ports: p.ports,
                     own_prefx_ports: own_prefx_ports(p, self.program.track_id),
+                    voice_slot,
                 });
                 self.latencies.get(&p.id).copied().unwrap_or(0)
             }
@@ -151,7 +154,7 @@ impl Builder<'_> {
     /// Parallel 1 つを emit し、その latency (= chain の最大) を返す。
     fn emit_parallel(&mut self, r: &common::model::Parallel, prefix: u32) -> u32 {
         let parallel_slot = self.program.parallels.len() as u32;
-        self.program.parallels.push(ParallelScratch::new(r.id, r.split));
+        self.program.parallels.push(ParallelScratch::new(r.id, r.split, r.chains.len()));
         self.program.ops.push(ChainOp::ParallelBegin { parallel_slot });
         let max = r
             .chains
@@ -326,7 +329,10 @@ mod tests {
         let mut ms = parallel(30, vec![(31, vec![]), (32, vec![]), (33, vec![])]);
         ms.as_parallel_mut().unwrap().split = common::model::Split::MidSide;
         let plain = parallel(20, vec![(21, vec![])]);
-        let b = build_program(&[split, ms, plain], 7, None, &DeviceLatencies::new(), &HashSet::new());
+        // r.md #114: Selector は全 chain が出力 (chain 数に追従)。
+        let mut sel = parallel(40, vec![(41, vec![]), (42, vec![]), (43, vec![])]);
+        sel.as_parallel_mut().unwrap().split = common::model::Split::DEFAULT_SELECTOR;
+        let b = build_program(&[split, ms, plain, sel], 7, None, &DeviceLatencies::new(), &HashSet::new());
         let outputs: Vec<Option<u8>> = b
             .program
             .ops
@@ -336,10 +342,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(outputs, vec![Some(0), Some(1), Some(2), None, Some(0), Some(1), None, None]);
+        assert_eq!(
+            outputs,
+            vec![Some(0), Some(1), Some(2), None, Some(0), Some(1), None, None, Some(0), Some(1), Some(2)]
+        );
         assert!(b.program.parallels[0].split.is_some());
         assert!(b.program.parallels[1].split.is_some());
         assert!(b.program.parallels[2].split.is_none());
+        assert!(b.program.parallels[3].split.is_some());
         assert_eq!(b.chain_slots[&12].output, Some(1));
         assert_eq!(b.chain_slots[&14].output, None);
     }

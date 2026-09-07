@@ -22,6 +22,7 @@ mod group_track_lifecycle;
 mod linked_clip_bounds;
 mod make_unique;
 mod modulation_arm;
+mod modulation_bypass;
 mod modulation_follower_edit;
 mod modulation_id_hygiene;
 mod open_stays_clean;

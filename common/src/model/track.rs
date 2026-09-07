@@ -400,7 +400,7 @@ impl Track {
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
     /// source=None + device の実例あり) ため、 装置の実在を真実として判定する。
     pub fn is_voicevox_vocal(&self) -> bool {
-        plugins(&self.devices).any(|d| {
+        any_plugin(&self.devices, &mut |d| {
             d.format == crate::plugin_format::PluginFormat::Builtin
                 && d.plugin_id == crate::plugin_db::BUILTIN_ID_VOICEVOX
         })
@@ -416,7 +416,7 @@ impl Track {
     /// `true` のときだけ、このトラック上の `ClipContent::Text` clip が画面に
     /// overlay 表示される (`docs/plan_voicevox_talk.md` §2、`text_compose` が gate)。
     pub fn has_subtitle_device(&self) -> bool {
-        plugins(&self.devices).any(|d| {
+        any_plugin(&self.devices, &mut |d| {
             d.format == crate::plugin_format::PluginFormat::Builtin
                 && d.plugin_id == crate::plugin_db::SUBTITLE_ID
         })
@@ -454,7 +454,7 @@ impl Track {
     /// signal and sums children on top (instrument-bus, `MixAdditive`). Decided
     /// purely from explicit routing data (`aux_outputs[0]`), no role heuristic.
     pub fn paraout_main_to_child(&self) -> bool {
-        plugins(&self.devices).any(|d| matches!(d.aux_outputs.first(), Some(Some(_))))
+        any_plugin(&self.devices, &mut |d| matches!(d.aux_outputs.first(), Some(Some(_))))
     }
 
     /// Allocate a new stable clip id, bumping the per-track counter.

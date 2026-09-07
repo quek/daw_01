@@ -29,6 +29,9 @@ pub const MAX_MOD_SOURCES: usize = 64;
 /// 書き手は 1 buffer に 1 回しか面を触らないので、30Hz の読み手が 8 回連続で
 /// 書き込み中に当たることは実質ない (当たったら「今回は更新なし」に倒す)。
 const MOD_PLANE_READ_RETRIES: usize = 8;
+/// r.md #117: track ごとに GUI へ見せるボイス数の上限 (表示用。 engine のボイス表
+/// `MAX_VOICES` より小さく、 溢れたぶんは見せない)。
+pub const MAX_PUBLISHED_VOICES: usize = 16;
 
 /// r.md #87 (クリップランチャー): 走行状態を publish できる行数の上限。
 /// 行 = トラック行 + オートメーションレーン行なので、`MAX_TRACKS` (= 32) では足りない。
@@ -180,10 +183,52 @@ pub struct AudioBridge {
     /// 書き手は audio thread (毎 buffer)、読み手は GUI の poller。
     /// 使っていないスロットは `row_key == 0`。
     pub launcher_rows: [LauncherRowState; MAX_LAUNCHER_ROWS],
+    /// r.md #117: track ごとの **鳴っているボイス** (note-on の拍 / 秒、 note-off の秒)。
+    /// 変調ラックが `Note` 起点ソースのカーソルを **ボイスごと**に描くために読む
+    /// (Bitwig の per-voice 表示)。 書き手は audio thread (毎 buffer、 track ごとの
+    /// seqlock)、 読み手は GUI の poller。 値は `f64::to_bits`、 `off_secs` は
+    /// `NaN` = まだ押している。 `voice_len` を超える slot は無効。
+    pub voice_generation: [AtomicU64; MAX_TRACKS],
+    pub voice_len: [AtomicU32; MAX_TRACKS],
+    pub voice_on_beat: [[AtomicU64; MAX_PUBLISHED_VOICES]; MAX_TRACKS],
+    pub voice_on_secs: [[AtomicU64; MAX_PUBLISHED_VOICES]; MAX_TRACKS],
+    pub voice_off_secs: [[AtomicU64; MAX_PUBLISHED_VOICES]; MAX_TRACKS],
 }
 
 impl AudioBridge {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// r.md #117: 1 track のボイス面を seqlock で **1 回** 読む試行。 書き込み中 / 世代が
+/// 変わっていたら `false` (`out` には途中まで積まれているので呼び側が truncate する)。
+fn read_track_voices_once(b: &AudioBridge, track: usize, out: &mut Vec<(usize, VoiceSnapshot)>) -> bool {
+    let g0 = b.voice_generation[track].load(Ordering::Acquire);
+    if g0 & 1 != 0 {
+        return false;
+    }
+    let n = (b.voice_len[track].load(Ordering::Relaxed) as usize).min(MAX_PUBLISHED_VOICES);
+    for i in 0..n {
+        let off = f64::from_bits(b.voice_off_secs[track][i].load(Ordering::Relaxed));
+        out.push((
+            track,
+            VoiceSnapshot {
+                on_beat: f64::from_bits(b.voice_on_beat[track][i].load(Ordering::Relaxed)),
+                on_secs: f64::from_bits(b.voice_on_secs[track][i].load(Ordering::Relaxed)),
+                off_secs: (!off.is_nan()).then_some(off),
+            },
+        ));
+    }
+    fence(Ordering::Acquire);
+    b.voice_generation[track].load(Ordering::Relaxed) == g0
+}
+
+/// r.md #117: GUI が読む 1 ボイスぶんの起点 (拍 / 秒) と note-off の秒。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceSnapshot {
+    pub on_beat: f64,
+    pub on_secs: f64,
+    /// `None` = まだ押している。
+    pub off_secs: Option<f64>,
 }
 
 /// r.md #87: [`AudioBridgeHandle::launcher_row`] が返す 1 行ぶんの値
@@ -412,6 +457,44 @@ impl AudioBridgeHandle {
         false
     }
 
+    /// r.md #117: 1 track の鳴っているボイスを publish する (audio thread、 毎 buffer)。
+    /// [`MAX_PUBLISHED_VOICES`] を超えるぶんは捨てる。 RT 安全: atomic store のみ。
+    pub fn publish_track_voices(&self, track: usize, voices: impl Iterator<Item = VoiceSnapshot>) {
+        let b = self.bridge();
+        let Some(generation) = b.voice_generation.get(track) else { return };
+        let g = generation.load(Ordering::Relaxed);
+        generation.store(g.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        let mut n = 0usize;
+        for v in voices.take(MAX_PUBLISHED_VOICES) {
+            b.voice_on_beat[track][n].store(v.on_beat.to_bits(), Ordering::Relaxed);
+            b.voice_on_secs[track][n].store(v.on_secs.to_bits(), Ordering::Relaxed);
+            b.voice_off_secs[track][n].store(v.off_secs.unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
+            n += 1;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        b.voice_len[track].store(n as u32, Ordering::Relaxed);
+        generation.store(g.wrapping_add(2), Ordering::Release);
+    }
+
+    /// r.md #117: 全 track のボイスを `(track index, voice)` で読む (GUI の 30Hz poller)。
+    /// track ごとの seqlock で、 書き込み中に当たった track はその tick では省く
+    /// (= 前回値が残る)。 `out` は使い回す。
+    pub fn track_voices(&self, out: &mut Vec<(usize, VoiceSnapshot)>) {
+        let b = self.bridge();
+        out.clear();
+        for track in 0..MAX_TRACKS {
+            let start = out.len();
+            let ok = (0..MOD_PLANE_READ_RETRIES).any(|_| {
+                out.truncate(start);
+                read_track_voices_once(b, track, out)
+            });
+            if !ok {
+                out.truncate(start);
+            }
+        }
+    }
+
     /// r.md #87: 1 行ぶんの走行状態を publish する。`slot` は engine が毎 buffer
     /// 詰め直す **その buffer 限りの並び**で、意味を持つのは `row_key` の方
     /// (GUI は key で引く)。範囲外は黙って捨てる (`set_mod_scalar` と同じ規約)。
@@ -592,5 +675,25 @@ mod tests {
         assert_eq!(got.scalar(11), 0.2);
         // 消えた id は 0 (= 変調なし) に倒れる。前の値 0.5 が残っていない。
         assert_eq!(got.scalar(4), 0.0);
+    }
+
+    /// r.md #117: ボイス面は track ごとに往復し、 押している / 離した (NaN 符号化) が
+    /// 区別され、 publish し直したら減ったぶんは残らない。
+    #[test]
+    fn ボイス面は_track_ごとに往復し離したボイスを区別する() {
+        let name = format!("daw01_test_voices_{}", std::process::id());
+        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        let held = VoiceSnapshot { on_beat: 4.0, on_secs: 2.0, off_secs: None };
+        let released = VoiceSnapshot { on_beat: 5.0, on_secs: 2.5, off_secs: Some(3.0) };
+        h.publish_track_voices(1, [held, released].into_iter());
+        h.publish_track_voices(3, [held].into_iter());
+
+        let mut out = Vec::new();
+        h.track_voices(&mut out);
+        assert_eq!(out, vec![(1, held), (1, released), (3, held)]);
+
+        h.publish_track_voices(1, std::iter::empty());
+        h.track_voices(&mut out);
+        assert_eq!(out, vec![(3, held)], "track 1 のボイスは消えている");
     }
 }

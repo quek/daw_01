@@ -978,11 +978,11 @@ async fn recv_loop(
                     shared.idle_silent_samples.store(0, Ordering::Release);
                 }
             }
-            Ok(AudioCommand::Play) => {
-                tracing::info!("received Play");
-                shared
-                    .playback
-                    .store(PlaybackCommand::Play as u8, Ordering::Release);
+            // r.md #118: `PlayContinue` は launcher を再シードしない (engine 側で分岐)。
+            Ok(cmd @ (AudioCommand::Play | AudioCommand::PlayContinue)) => {
+                tracing::info!("received {cmd:?}");
+                let pc = if cmd == AudioCommand::Play { PlaybackCommand::Play } else { PlaybackCommand::PlayContinue };
+                shared.playback.store(pc as u8, Ordering::Release);
             }
             Ok(AudioCommand::Stop) => {
                 tracing::info!("received Stop");
@@ -1342,6 +1342,8 @@ async fn recv_loop(
                 | AudioCommand::SetParallelOutGain { .. }
                 | AudioCommand::SetParallelGainMatch { .. }
                 | AudioCommand::SetParallelSplitFreq { .. }
+                | AudioCommand::SetParallelActiveChain { .. }
+                | AudioCommand::SetParallelSelectorFade { .. }
                 | AudioCommand::SetSongBpm { .. }
                 | AudioCommand::SetSongTimeSigNumerator { .. })) => {
                 update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, &phase_tables, |s| {

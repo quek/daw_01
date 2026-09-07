@@ -57,6 +57,7 @@ fn add_source(app: &mut AppData, owner_track_id: u32) -> u32 {
             owner_track_id,
             color: [0.3, 0.7, 1.0],
             kind: ModSourceKind::default(),
+            enabled: true,
         });
         id
     })
@@ -228,6 +229,7 @@ fn payload_with_routing(name: &str, source_id: u32) -> TracksCopy {
         source_id,
         depth: 0.5,
         polarity: Polarity::Unipolar,
+        enabled: true,
     });
     TracksCopy {
         tracks: vec![TrackCopy { order: 0, track, contents: Vec::new() }],

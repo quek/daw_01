@@ -953,6 +953,9 @@ impl AppData {
         self.transport.preroll_remaining = 0;
         self.transport.pending_play = false;
         self.transport.pending_play_record = None;
+        // r.md #118: queue 中だった「停止点から再開」 のホーム上書きも捨てる (残すと次の
+        // 普通の Space が古いホームで走り出す)。
+        self.transport.play_origin_override = None;
         self.close_recording_session();
         self.silence_monitor_notes();
         self.recording.active_param_gestures.clear();
@@ -1294,6 +1297,12 @@ impl AppData {
                 .and_then(|r| r.split.freq(*edge))
                 .or_else(|| common::model::Split::DEFAULT_FREQUENCY3.freq(*edge))
                 .map_or(0.0, f64::from),
+            // r.md #114: アクティブ chain の中央の位置 (Selector でなければ中央 0.5)。
+            P::ParallelSelect { parallel_id } => self
+                .song_doc
+                .song()
+                .parallel_by_id(*parallel_id)
+                .map_or(0.5, |r| f64::from(r.select_pos())),
             // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
             // `ChannelStrip::target_value` が SSoT (ここで写さない)。
             P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {

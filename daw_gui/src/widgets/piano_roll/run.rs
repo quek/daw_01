@@ -1791,6 +1791,15 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 app.ui_ephemeral.pianoroll_hover_note = hover_note;
             }));
         }
+        // r.md #119: Ctrl+A の 1 段目 (ポインタ行の全ノート) 用に、 grid 上のポインタの鍵盤行を mirror。
+        let hover_pitch: Option<u8> = ui.pointer().pos.and_then(|(px, py)| {
+            grid.contains(px, py).then(|| RowGeometry::compute(view, grid).y_to_pitch(py))
+        });
+        if app.ui_ephemeral.pianoroll_hover_pitch != hover_pitch {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.ui_ephemeral.pianoroll_hover_pitch = hover_pitch;
+            }));
+        }
 
         // wheel handler — note drag / 作成中は無効。Ctrl=横ズーム, Alt=縦ズーム, Shift=横スクロール,
         // plain=ピッチスクロール (Ableton Live / Reaper 流)。

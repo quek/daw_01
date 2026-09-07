@@ -144,6 +144,31 @@ impl ModTickRunner {
         }
     }
 
+    /// 絶対サンプル位置 `sample` の拍 (直前の [`Self::run_buffer`] が評価した刻みの範囲内)。
+    /// 刻み境界の mark から刻み内は bpm 一定で線形に進める (`next_mark` と同じ規則)。
+    /// 範囲外 (評価していない刻み) は `None`。
+    ///
+    /// engine は **buffer 末の拍** をこれで取り、 次 buffer の `locate` (plan 差し替え直後の
+    /// 張り直し) の起点に使う。 buffer 頭の拍をそのまま起点にすると、 再生中に LoadSong が
+    /// 来るたびに拍が 1 buffer ぶん遅れて累積した (再生中に変調器を編集すると音が遅れる)。
+    #[must_use]
+    pub fn beat_at_sample(&self, sample: u64, sample_rate: u32) -> Option<f64> {
+        if self.first_tick == i64::MIN {
+            return None;
+        }
+        let k = tick_of(sample);
+        let i = usize::try_from(k - self.first_tick).ok()?;
+        let mark = if i < self.marks.len() {
+            self.marks[i]
+        } else if i == self.marks.len() {
+            self.next_mark
+        } else {
+            return None;
+        };
+        let rem = (sample % u64::from(MOD_TICK_FRAMES)) as f64;
+        Some(mark.beat + rem / f64::from(sample_rate.max(1)) * mark.bpm / 60.0)
+    }
+
     /// 値面に載せる slot 数 (`MAX_SLOTS` で切った plan の node 数)。
     #[must_use]
     #[inline]
@@ -253,6 +278,8 @@ impl ModTickRunner {
         frames: u32,
         sample_rate: u32,
         mut follower_env: impl FnMut(u16, i64) -> f32,
+        // r.md #117: `Note` 起点の slot の最新ノートの起点 (無ければ None = 開始値)。
+        mut note_anchor: impl FnMut(u16) -> Option<common::mod_graph::NoteAnchor>,
     ) -> PhaseMark {
         let k0 = tick_of(start_sample);
         if self.first_tick == i64::MIN || k0 < self.first_tick {
@@ -288,12 +315,13 @@ impl ModTickRunner {
             && self.marks.len() < MAX_TICKS_PER_BUFFER
         {
             let k = self.first_tick + self.marks.len() as i64;
-            self.eval_tick(song, k, dt, &mut follower_env);
+            self.eval_tick(song, k, dt, &mut follower_env, &mut note_anchor);
         }
 
         #[allow(clippy::cast_possible_truncation)]
         let rem = (start_sample % u64::from(MOD_TICK_FRAMES)) as u32;
         self.plane.set_lead(MOD_TICK_FRAMES - rem);
+        self.plane.set_first_sample(start_sample);
         self.build_spans(frames, MOD_TICK_FRAMES - rem);
 
         let head = self.marks.first().copied().unwrap_or(self.next_mark);
@@ -311,6 +339,7 @@ impl ModTickRunner {
         k: i64,
         dt: f64,
         follower_env: &mut impl FnMut(u16, i64) -> f32,
+        note_anchor: &mut impl FnMut(u16) -> Option<common::mod_graph::NoteAnchor>,
     ) {
         // envelope follower の出力を先に書く (`tick` は引数で取らない —
         // plan の slot 順と `Song::mod_sources` の位置順の取り違えを防ぐため)。
@@ -323,6 +352,10 @@ impl ModTickRunner {
         for slot in 0..self.plan.nodes.len() {
             let Ok(s) = u16::try_from(slot) else { continue };
             self.rt.set_follower(s, follower_env(s, env_tick));
+            // r.md #117: ノート起点の slot だけ最新ノートを写す (他は None のまま = 使われない)。
+            if self.plan.nodes[slot].retrigger == common::model::RetriggerMode::Note {
+                self.rt.set_note_anchor(s, note_anchor(s));
+            }
         }
         // automation lane が base を上書きする param を解決する (r.md #89 Q4)。
         for i in 0..self.plan.lane_params.len() {
@@ -638,7 +671,9 @@ mod tests {
                 },
                 phase: 0.0,
                 retrigger: RetriggerMode::FreeRun,
+                ..LfoConfig::default()
             }),
+            enabled: true,
         };
         // 2 が 1 の「速さ」を変調する = 1 は積分 tier (閉形式では解けない)。
         let song = Song {
@@ -653,6 +688,7 @@ mod tests {
                     },
                     depth: 0.3,
                     polarity: Polarity::Bipolar,
+                    enabled: true,
                 }],
                 ..Default::default()
             }],
@@ -673,7 +709,7 @@ mod tests {
             let mut out = Vec::new();
             let mut at = 0u64;
             for &n in chunks {
-                r.run_buffer(&song, at, n, sr, |_, _| 0.0);
+                r.run_buffer(&song, at, n, sr, |_, _| 0.0, |_| None);
                 // buffer 内の各 frame の値を絶対サンプル位置つきで記録する。
                 let plane = r.plane();
                 for f in 0..n {
@@ -687,6 +723,28 @@ mod tests {
         // 書き出し (1024 固定) と live (可変長) が同じ区間を描く。
         let export = run(&[1024, 1024, 1024]);
         let live = run(&[480, 544, 512, 1024, 512]);
+        // buffer 末の拍 (`beat_at_sample`) は次 buffer の頭の拍と一致する = plan を差し替えて
+        // `locate` し直しても拍軸が 1 buffer 遅れない (再生中の編集で音が遅れる退行の回帰)。
+        {
+            let plan = Arc::new(common::mod_graph::build_plan(&song, 1, |_| 0.0));
+            let mut rt = ModRuntime::default();
+            rt.install(&plan);
+            let mut r = ModTickRunner::new();
+            r.install(plan.clone(), rt);
+            r.locate(&song, 0, 0.0, sr);
+            let _ = r.run_buffer(&song, 0, 480, sr, |_, _| 0.0, |_| None);
+            let end_beat = r.beat_at_sample(480, sr).expect("buffer 末は評価済み");
+            let head2 = r.run_buffer(&song, 480, 544, sr, |_, _| 0.0, |_| None);
+            assert!((end_beat - head2.beat).abs() < 1e-9, "{end_beat} vs {}", head2.beat);
+            // plan 差し替え → buffer 末の拍で locate → 次の頭も同じ拍。
+            let mut rt2 = ModRuntime::default();
+            rt2.install(&plan);
+            r.install(plan, rt2);
+            let end2 = end_beat + 544.0 / f64::from(sr) * 120.0 / 60.0;
+            r.locate(&song, 1024, end2, sr);
+            let head3 = r.run_buffer(&song, 1024, 512, sr, |_, _| 0.0, |_| None);
+            assert!((head3.beat - end2).abs() < 1e-9, "{} vs {end2}", head3.beat);
+        }
         assert_eq!(export.len(), live.len());
         for (a, b) in export.iter().zip(live.iter()) {
             assert_eq!(a.0, b.0, "同じサンプル位置を比べている");

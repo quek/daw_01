@@ -198,8 +198,39 @@ impl AppData {
         self.selection.range_anchor = Some(s);
     }
 
-    /// 表示中クリップの**全ノート**を選択する (`Ctrl+A`)。
+    /// 表示中クリップの**全ノート**を選択する (`Ctrl+A` の最上段)。
     pub(crate) fn select_all_shown_notes(&mut self) {
+        let next = self.shown_notes_selection(|_| true);
+        self.set_time_selection(next);
+        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+    }
+
+    /// r.md #119: ピアノロールの `Ctrl+A` — **段階拡大**。
+    ///
+    /// 1. ポインタの鍵盤行 (`hover_pitch`) にあるノートを全部 (その行のノートの外接区間 ×
+    ///    その行のレーン)。
+    /// 2. 今の範囲が既に 1 の結果と一致している (または行にノートが無い / ポインタが grid の
+    ///    外) なら、表示中クリップの全ノート。
+    ///
+    /// 段の判定は「今の範囲が前段の結果と一致するか」だけで、押した回数は数えない
+    /// (アレンジの `select_all_arrangement` と同じ規則)。
+    pub(crate) fn select_all_pianoroll(&mut self, hover_pitch: Option<u8>) {
+        let row = hover_pitch.and_then(|p| self.shown_notes_selection(|n| n.pitch == p));
+        match row {
+            Some(row) if self.selection.time.as_ref() != Some(&row) => {
+                self.set_time_selection(Some(row));
+                self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+            }
+            _ => self.select_all_shown_notes(),
+        }
+    }
+
+    /// 表示中クリップのうち `keep` に通るノートを全部覆う範囲 (ノートの外接区間 × そのノートの
+    /// 鍵盤行レーン)。 該当ノートが無ければ `None`。
+    fn shown_notes_selection(
+        &self,
+        keep: impl Fn(&common::model::Note) -> bool,
+    ) -> Option<common::model::TimeSelection> {
         let shown = self.shown_pianoroll_clips();
         let song = self.song_doc.song();
         let mut start = f64::INFINITY;
@@ -209,7 +240,7 @@ impl AppData {
             let Some(clip) = song.clip_by_key(*key) else {
                 continue;
             };
-            for note in song.clip_notes(clip) {
+            for note in song.clip_notes(clip).iter().filter(|n| keep(n)) {
                 let s = clip.content_to_song_beat(note.start_beat);
                 start = start.min(s);
                 end = end.max(s + note.duration_beats);
@@ -222,9 +253,7 @@ impl AppData {
                 }
             }
         }
-        let next = common::model::TimeSelection::new(start, end, lanes);
-        self.set_time_selection(next);
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        common::model::TimeSelection::new(start, end, lanes)
     }
 
 
@@ -547,5 +576,42 @@ mod launcher_cell_editing_tests {
         assert_eq!(app.shown_pianoroll_clips(), vec![cell], "ノートを囲んでもセルは開いたまま");
         assert_eq!(app.inspector_target_refs(), vec![cell]);
         assert_eq!(app.selected_clip_ref(), Some(cell));
+    }
+
+    /// r.md #119: Ctrl+A は 1 回目でポインタ行の全ノート、 2 回目で全ノート。 行にノートが
+    /// 無い / grid 外なら即全ノート。 全ノート選択済みなら冪等。
+    #[test]
+    fn ピアノロールのctrl_aは行の全ノートから全ノートへ段階拡大する() {
+        use common::model::LaneRef;
+        let mut app = build_app();
+        let cell = seed_with_cell(&mut app);
+        app.open_cell_editor(LauncherCellKey::Track(cell));
+        for (start, pitch) in [(0.0, 60), (2.0, 60), (1.0, 64)] {
+            app.handle_event(AppEvent::AddNote { key: cell, start_beat: start, duration: 1.0, pitch });
+        }
+        let row60 = LaneRef::KeyTrack { clip: cell, pitch: 60 };
+        let row64 = LaneRef::KeyTrack { clip: cell, pitch: 64 };
+        let sel = |app: &AppData| app.selection.time.clone().expect("範囲がある");
+
+        // 1 回目: 行 60 の 2 つ (0..3 拍、 行 60 だけ)。
+        app.select_all_pianoroll(Some(60));
+        let s = sel(&app);
+        assert_eq!((s.start_beat, s.end_beat), (0.0, 3.0));
+        assert_eq!(s.lanes, vec![row60]);
+        // 2 回目: 全ノート (0..3 拍、 行 60 + 64)。
+        app.select_all_pianoroll(Some(60));
+        let s = sel(&app);
+        assert_eq!((s.start_beat, s.end_beat), (0.0, 3.0));
+        assert!(s.lanes.contains(&row60) && s.lanes.contains(&row64) && s.lanes.len() == 2);
+        // 全ノート選択済みで別の行を指しても、 その行だけに縮む (段の判定は「前段と一致するか」)。
+        app.select_all_pianoroll(Some(64));
+        let s = sel(&app);
+        assert_eq!((s.start_beat, s.end_beat, s.lanes), (1.0, 2.0, vec![row64]));
+        // 行にノートが無い → 即全ノート。 grid 外 (None) も同じ。
+        app.select_all_pianoroll(Some(72));
+        assert_eq!(sel(&app).lanes.len(), 2);
+        app.set_pianoroll_rect_selection(5.0, 5.0, 60, 60);
+        app.select_all_pianoroll(None);
+        assert_eq!(sel(&app).lanes.len(), 2);
     }
 }

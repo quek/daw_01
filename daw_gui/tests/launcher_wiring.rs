@@ -785,6 +785,25 @@ fn セルを開くとピアノロールの編集対象になる() {
     );
 }
 
+/// r.md #113: 空セルのダブルクリックで **作った MIDI セルがそのままピアノロールで開く**
+/// (アレンジの空き地ダブルクリックと同じ)。 選ぶだけだと打ち込みを始めるのにもう 1 回
+/// 開く操作が要る。
+#[test]
+fn セルを作るとそのままピアノロールで開く() {
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 1, 1);
+    app.ui_prefs.bottom_panel = None;
+
+    let cell = put_cell(&mut app, 1, 0);
+
+    assert_eq!(app.ui_prefs.bottom_panel, Some(1), "ピアノロールのタブが開く");
+    assert_eq!(
+        app.pianoroll_target_clip(),
+        Some(common::model::ClipKey { track_id: 1, clip_id: cell.clip_id() }),
+        "編集対象が作ったセルのクリップ"
+    );
+}
+
 /// 停止中にセルを撃つと、その操作自体が再生の開始になる (Live / Bitwig と同じ)。
 /// ランチャーは transport の拍で走るので、Play を送らないと**音が出ない**。
 #[test]
@@ -1486,4 +1505,32 @@ fn アレンジの範囲はセル選択を降ろしエディタ内の範囲は�
         app.selection.selected_launcher_cells.is_empty(),
         "アレンジの範囲を引いたらセルの選択は降りる"
     );
+}
+
+/// r.md #118: Shift+Space (停止点からの再開) は `PlayContinue` を送る。 engine はこれで
+/// ランチャーの再シードを飛ばし、 鳴っていたセルを頭出しせず続きから鳴らす。 普通の
+/// Space は `Play` のまま (= セルは頭から)。
+#[test]
+fn 停止点からの再開はセルを頭出ししない() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    // engine が走り出して 9 拍目で止まったのを観測する。
+    app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: true, recording_live: false });
+    app.transport.playhead_beat = Some(9.0);
+    app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: false, recording_live: false });
+    while audio_rx.try_recv().is_ok() {}
+
+    app.handle_event(AppEvent::PlayContinue);
+
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(
+        sent.iter().any(|c| matches!(c, AudioCommand::PlayContinue)),
+        "停止点からの再開は PlayContinue: {sent:?}"
+    );
+    assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play)), "Play は出ない: {sent:?}");
 }

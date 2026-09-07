@@ -1187,6 +1187,7 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
                 tap: AudioTap::post_fader(0), // points at Kick's sentinel id
                 follower: FollowerConfig::default(),
             },
+            enabled: true,
         }],
         ..Song::default()
     };
@@ -1474,7 +1475,9 @@ fn current_version_is_pinned() {
     // v36 (r.md #110 Parallel / `docs/plan_parallel.md`): `Track.devices` / `master_fx_chain` の
     // 要素が `Device` (plugin | Parallel) になり、`AudioTap` の source が track | chain の enum に
     // なった。どちらも旧 JSON と byte 互換 (untagged / flatten) で migration 関数は不要。
-    assert_eq!(CURRENT_VERSION, 36);
+    // v37: `AutomationLane.visible` を撤去し、レーンの非表示を `ViewState::hidden_automation_lanes`
+    // へ移した (見方の都合は Song に持たない)。旧 JSON の `visible` は unknown-field で読み捨て。
+    assert_eq!(CURRENT_VERSION, 38);
 }
 
 #[test]

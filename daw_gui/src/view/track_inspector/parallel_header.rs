@@ -11,17 +11,17 @@
 use daw_ui_core::{Edit, KnobStyle, ScrubCurve, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 use daw_ui_renderer::Rect;
 
-use crate::app::{AppData, AppEvent, InspectorScrubField};
+use crate::app::{AppData, AppEvent, InspectorScrubField, ModControlDomain};
 use crate::handler::parallel::ParallelMixerEdit;
 use crate::view::modulation::{PLAIN_IDENT, build_mod, push_mod_depth_bracket};
 use crate::view::param_gesture::push_param_gesture_edges;
-use common::model::{AutomationTarget, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
+use common::model::{AutomationTarget, SELECTOR_FADE_RANGE, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
 
 use super::chain_list::{CHAIN_BTN_W, CHAIN_KNOB, ROW_H, draw_disclosure, draw_rename_input};
 use super::{push_scrub_bracket, scrub_style, toggle_audio_style};
 
 /// dropdown の項目 (順序 = [`split_index`] / [`split_from_index`])。
-const SPLIT_LABELS: &[&str] = &["No split", "3 bands", "Mid/Side"];
+const SPLIT_LABELS: &[&str] = &["No split", "3 bands", "Mid/Side", "Selector"];
 /// ヘッダ行の dropdown 幅。
 pub(super) const SPLIT_DROPDOWN_W: f32 = 74.0;
 
@@ -30,10 +30,12 @@ fn split_index(split: Split) -> usize {
         Split::None => 0,
         Split::Frequency3 { .. } => 1,
         Split::MidSide => 2,
+        Split::Selector { .. } => 3,
     }
 }
 
-/// dropdown の選択 → 新しい `Split`。 同じモードなら現在値をそのまま返す (周波数を失わない)。
+/// dropdown の選択 → 新しい `Split`。 同じモードなら現在値をそのまま返す (周波数 / アクティブ chain
+/// を失わない)。
 fn split_from_index(idx: usize, current: Split) -> Split {
     match idx {
         1 => {
@@ -44,6 +46,13 @@ fn split_from_index(idx: usize, current: Split) -> Split {
             }
         }
         2 => Split::MidSide,
+        3 => {
+            if matches!(current, Split::Selector { .. }) {
+                current
+            } else {
+                Split::DEFAULT_SELECTOR
+            }
+        }
         _ => Split::None,
     }
 }
@@ -69,7 +78,7 @@ pub(super) fn draw_split_dropdown(
 }
 
 /// Split の param 行 (ヘッダ行の直下、 `Split::has_params` のときだけ行がある)。
-/// `Frequency3`: `Low [hz] Mid [hz] High`。
+/// `Frequency3`: `Low [hz] Mid [hz] High`。 `Selector` (r.md #114): `Active [n] Fade [ms]`。
 pub(super) fn draw_split_row(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -79,9 +88,6 @@ pub(super) fn draw_split_row(
     content: Rect,
     popup_open: bool,
 ) {
-    let Split::Frequency3 { low_hz, high_hz } = split else {
-        return;
-    };
     let p = &app.theme.core;
     let field_w = 58.0;
     let field_h = ROW_H - 8.0;
@@ -91,15 +97,140 @@ pub(super) fn draw_split_row(
     let label = |ui: &mut Ui<'_, AppData>, key: &'static str, text: &'static str, x: f32| {
         ui.label_at((key, i), text, x, label_y, 10.0, p.text_dim);
     };
-    label(ui, "inspector_split_low_label", "Low", x);
-    x += 26.0;
-    draw_freq_field(app, ui, i, parallel_id, SplitEdge::LowMid, low_hz, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
-    x += field_w + 6.0;
-    label(ui, "inspector_split_mid_label", "Mid", x);
-    x += 26.0;
-    draw_freq_field(app, ui, i, parallel_id, SplitEdge::MidHigh, high_hz, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
-    x += field_w + 6.0;
-    label(ui, "inspector_split_high_label", "High", x);
+    match split {
+        Split::Frequency3 { low_hz, high_hz } => {
+            label(ui, "inspector_split_low_label", "Low", x);
+            x += 26.0;
+            draw_freq_field(app, ui, i, parallel_id, SplitEdge::LowMid, low_hz, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
+            x += field_w + 6.0;
+            label(ui, "inspector_split_mid_label", "Mid", x);
+            x += 26.0;
+            draw_freq_field(app, ui, i, parallel_id, SplitEdge::MidHigh, high_hz, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
+            x += field_w + 6.0;
+            label(ui, "inspector_split_high_label", "High", x);
+        }
+        Split::Selector { fade_ms, .. } => {
+            label(ui, "inspector_select_active_label", "Active", x);
+            x += 38.0;
+            draw_active_field(app, ui, i, parallel_id, Rect { x, y: fy, w: 44.0, h: field_h }, popup_open);
+            x += 44.0 + 10.0;
+            label(ui, "inspector_select_fade_label", "Fade", x);
+            x += 30.0;
+            draw_fade_field(app, ui, i, parallel_id, fade_ms, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
+            ui.label_at(("inspector_select_fade_unit", i), "ms", x + field_w + 4.0, label_y, 10.0, p.text_dim);
+        }
+        Split::None | Split::MidSide => {}
+    }
+}
+
+/// r.md #114: Selector のアクティブ chain 欄 (`1..=n` の整数)。 値の住所は
+/// `TrackBuiltinParam::ParallelSelect` (位置 `0..=1`) そのもの = automation / 変調の的。 表示
+/// (chain 番号) ↔ model (位置) は `ModControlDomain::Ranged { min: 0.5, max: n + 0.5 }` の affine で、
+/// `Split::select_pos` (bin の中央) と一致する。 chain 行のアクティブ表示 (名前の明暗) は
+/// この値の読み出しだけで、 切替の編集面はこの欄 1 つ。
+fn draw_active_field(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    i: usize,
+    parallel_id: u64,
+    rect: Rect,
+    popup_open: bool,
+) {
+    let Some(track_id) = app.cursor_track_id() else { return };
+    let song = app.song_doc.song();
+    let Some(parallel) = song.parallel_by_id(parallel_id) else { return };
+    let n = parallel.chains.len();
+    if n == 0 {
+        return;
+    }
+    let chain_ids: Vec<u64> = parallel.chains.iter().map(|c| c.id).collect();
+    let track = song.track_by_id(track_id);
+    let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { parallel_id });
+    let base_pos = parallel.select_pos();
+    let live_pos = track.map_or(base_pos, |t| app.live_param_value(t, &target, base_pos));
+    let display = (Split::select_index(live_pos, n) + 1) as f64;
+    let domain = ModControlDomain::Ranged { min: 0.5, max: n as f64 + 0.5, log: false };
+    let style = ScrubableNumberStyle {
+        range: Some((1.0, n as f64)),
+        curve: ScrubCurve::Linear,
+        sensitivity: 0.02,
+        font_size: 10.0,
+        ..scrub_style(&app.theme)
+    };
+    let m = build_mod(app, target.clone(), display, domain, track_id);
+    let was = app.recording.active_param_gestures.contains(&(track_id, target.clone()));
+    let resp = ui.scrubable_number_at(
+        ("inspector_select_active", i),
+        rect,
+        display,
+        1.0,
+        ScrubableNumberFormat::Integer,
+        &style,
+        move |v| {
+            let k = (v.round().max(1.0) as usize - 1).min(chain_ids.len() - 1);
+            let chain_id = chain_ids[k];
+            Edit::mutate(move |app: &mut AppData| {
+                if !popup_open {
+                    app.handle_event(AppEvent::SetParallelMixer {
+                        parallel_id,
+                        edit: ParallelMixerEdit::ActiveChain(chain_id),
+                    });
+                }
+            })
+        },
+        None,
+        Some(m.modulation()),
+    );
+    push_param_gesture_edges(ui, track_id, target.clone(), "Selector Active", was, resp.dragging);
+    push_scrub_bracket(ui, app, InspectorScrubField::ParallelSelect { parallel_id }, resp.dragging || resp.editing_text);
+    push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
+}
+
+/// r.md #114: Selector のクロスフェード時間 (ms)。 値のみ IPC (`SetParallelSelectorFade`)、
+/// automation / 変調の的ではない。
+fn draw_fade_field(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    i: usize,
+    parallel_id: u64,
+    fade_ms: f32,
+    rect: Rect,
+    popup_open: bool,
+) {
+    let style = ScrubableNumberStyle {
+        range: Some(SELECTOR_FADE_RANGE.display_range()),
+        curve: ScrubCurve::Linear,
+        // Linear は値の単位 / px: 4 ms / px で 0..2000 ms が 500 px。
+        sensitivity: 4.0,
+        font_size: 10.0,
+        ..scrub_style(&app.theme)
+    };
+    let resp = ui.scrubable_number_at(
+        ("inspector_select_fade", i),
+        rect,
+        f64::from(fade_ms),
+        f64::from(Split::DEFAULT_SELECTOR_FADE_MS),
+        ScrubableNumberFormat::Integer,
+        &style,
+        move |v| {
+            Edit::mutate(move |app: &mut AppData| {
+                if !popup_open {
+                    app.handle_event(AppEvent::SetParallelMixer {
+                        parallel_id,
+                        edit: ParallelMixerEdit::SelectorFade(v as f32),
+                    });
+                }
+            })
+        },
+        None,
+        None,
+    );
+    push_scrub_bracket(
+        ui,
+        app,
+        InspectorScrubField::ParallelSelectorFade { parallel_id },
+        resp.dragging || resp.editing_text,
+    );
 }
 
 /// クロスオーバー 1 つの数値欄。 値の住所は `TrackBuiltinParam::ParallelSplitFreq` そのもの

@@ -22,6 +22,8 @@ mod port_buffer;
 pub mod program;
 mod program_build;
 mod schedule;
+pub mod selector_split;
+pub mod voices;
 
 pub use compile::{DeviceLatencies, GraphError, compile_schedule};
 #[cfg(test)]

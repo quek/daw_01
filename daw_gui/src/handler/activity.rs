@@ -130,6 +130,13 @@ impl AppData {
                 METER_STEPS,
             ));
         }
+        // r.md #117: 鳴っているボイス (変調ラックの per-voice カーソル)。 停止中でも
+        // プレビュー note で増減するので、 起点をそのまま混ぜる (収束する値)。
+        for (track, v) in &self.transport.track_voices {
+            mix(*track as u64);
+            mix(v.on_beat.to_bits());
+            mix(v.off_secs.map_or(0, f64::to_bits));
+        }
         // マスターストリップの GR (コンプ / リミッター)。同じ理由で digest に混ぜる。
         for gr in [self.transport.master_strip_gr.0, self.transport.master_strip_gr.1] {
             mix(quantize(

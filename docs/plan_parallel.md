@@ -194,6 +194,7 @@ pub enum Split {
     None,                                       // 全 chain に同じ入力 (従来)
     Frequency3 { low_hz: f32, high_hz: f32 },   // 3 バンド (#112)
     MidSide,                                    // Mid / Side (#112 追補)。 将来: Loudness / Stereo (L/R) …
+    Selector { active_chain: u64, fade_ms: f32 }, // アクティブな 1 chain だけ (#114、Bitwig Instrument/FX Selector)
 }
 ```
 
@@ -220,9 +221,20 @@ pub enum Split {
   の和は `(M+S, M-S) = (L, R)` で厳密に元へ戻る。 状態なし、 param 行なし。 engine は
   `band_split::Splitter` enum (`Frequency3(BandSplit)` / `MidSide(MidSideSplit)`) で variant ごとの
   分割器を包み、 `ChainBegin` は `Split::output_of(k)` の出力番号で読む (`BufRef::ParallelOutput`)。
-- **UI**: ヘッダ行の Match の左に dropdown (`No split` / `3 bands` / `Mid/Side`)。 `Frequency3` ならヘッダ直下に
-  param 行 `Low [200 Hz] Mid [2.0k] High` (`parallel_header.rs`、 inspector 共通の scrubable idiom:
-  対数目盛 / undo bracket / automation gesture / 変調 overlay)。 chain 行は共通。
+- **Selector** (r.md #114、 Bitwig Instrument Selector / FX Selector): 入力 (audio + MIDI) を **アクティブな
+  1 chain だけ** が受け、 他は無音 + 新規 note 無し。 全 chain が出力 (`output_of(k) = k`、 chain 数に
+  追従) で、 切替は `fade_ms` の線形クロスフェード (全 chain 同じ傾き → 途中も `Σw = 1`)。 非アクティブ
+  chain も処理は続くので余韻は残り、 鳴っている note は note-on を受けた chain で note-off まで鳴り切る
+  (`selector_split.rs` が `(note_id, key) → chain` の固定長表を持つ。 stop 時の flush は key で引く)。
+  `active_chain` は安定 `ParallelChain::id` (並べ替えに追従、 消したら先頭)。 automation / 変調の的は
+  `TrackBuiltinParam::ParallelSelect { parallel_id }` = 位置 `0..=1` を chain 数で等分
+  (`Split::select_index` が GUI / engine 共通の写像、 基準値は bin の中央 `select_pos`)。 値のみ IPC は
+  `SetParallelActiveChain` / `SetParallelSelectorFade`。 モード切替は chain を 2 本 (A/B) に補う。
+- **UI**: ヘッダ行の Match の左に dropdown (`No split` / `3 bands` / `Mid/Side` / `Selector`)。 `Frequency3` なら
+  ヘッダ直下に param 行 `Low [200 Hz] Mid [2.0k] High`、 `Selector` なら `Active [n] Fade [ms]`
+  (`parallel_header.rs`、 inspector 共通の scrubable idiom: 対数目盛 / undo bracket / automation gesture /
+  変調 overlay)。 chain 行は共通 (Selector では非アクティブ chain の名前だけ減光。 切替の編集面は
+  `Active` 欄 1 つ)。
 
 ### 4.4 値のみ更新 (`song_values.rs`)
 

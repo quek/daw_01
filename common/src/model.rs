@@ -255,7 +255,13 @@ pub use view_state::ViewState;
 /// (「見方の都合」 = 変えても `*` が立たない) へ移した。旧ファイルの `visible: false` は
 /// `crate::project::load_project` が deserialize 前に拾って
 /// [`crate::project::LoadedProject::hidden_automation_lanes`] へ移す。
-pub const CURRENT_VERSION: u32 = 37;
+///
+/// v38 (r.md #114-#117): `Split::Selector` / `ModSourceKind::Adsr` / `RetriggerMode::Note` /
+/// `TrackBuiltinParam::ParallelSelect` の variant と、 `LfoConfig` の Shape / Steps / Jitter /
+/// Smooth / Delay / Fade In、 `ModSource.enabled` / `ModRouting.enabled` を追加。 旧ファイルは
+/// `#[serde(default)]` で読める (migration 不要)。 新ファイルを旧ビルドで開くと unknown
+/// variant で落ちるので version を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 38;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -884,6 +890,20 @@ impl Song {
             .chain(self.song_mod_routings.iter())
     }
 
+    /// 安定 `ModRouting::id` で 1 本の変調を引く (track / song のどの store に居ても)。
+    pub fn mod_routing_by_id(&self, routing_id: u32) -> Option<&ModRouting> {
+        self.all_mod_routings().find(|r| r.id == routing_id)
+    }
+
+    /// [`Self::mod_routing_by_id`] の可変版。
+    pub fn mod_routing_by_id_mut(&mut self, routing_id: u32) -> Option<&mut ModRouting> {
+        self.tracks
+            .iter_mut()
+            .flat_map(|t| t.mod_routings.iter_mut())
+            .chain(self.song_mod_routings.iter_mut())
+            .find(|r| r.id == routing_id)
+    }
+
     /// `routing_id` の変調が置かれている track id (`MASTER_TRACK_ID` = song 側)。
     ///
     /// **置き場を `target` だけから決める全域関数は作らない** (master fx chain の
@@ -1389,11 +1409,22 @@ impl Song {
             r.out_gain = if r.out_gain.is_finite() { r.out_gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
             // r.md #112: クロスオーバーも RT がそのまま係数に使う。
             r.split.sanitize();
+            // r.md #114: Selector のアクティブ chain を実在する id に揃える。
+            r.normalize_selector();
         };
         for t in &mut self.tracks {
             for_each_parallel_mut(&mut t.devices, &mut fix_parallel);
         }
         for_each_parallel_mut(&mut self.master_fx_chain, &mut fix_parallel);
+        // r.md #116 / #117: LFO の Shape / Jitter / Smooth / Delay / Fade In と ADSR の時定数も RT が
+        // そのまま使う (GUI の編集は clamp 済だが LoadSong は素通し)。
+        for m in &mut self.mod_sources {
+            match &mut m.kind {
+                ModSourceKind::Lfo(c) => c.sanitize(),
+                ModSourceKind::Adsr(c) => c.sanitize(),
+                _ => {}
+            }
+        }
     }
 
     /// Single entry point for all pre-save normalization. GC orphan
@@ -1714,7 +1745,7 @@ impl Song {
         // migration は不要）。idempotent（device 既存 / group_transform 無しは no-op）。
         for track in &mut self.tracks {
             let has_transform =
-                plugins(&track.devices).any(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
+                any_plugin(&track.devices, &mut |d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
             if track.group_transform.is_some() && !has_transform {
                 track.devices.push(Device::Plugin(PluginInstance::with_ports(
                     crate::video_fx::TRANSFORM_ID.to_string(),

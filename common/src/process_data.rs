@@ -14,6 +14,12 @@
 pub const MAX_FRAMES: usize = 1024;
 pub const MAX_CHANNELS: usize = 2;
 pub const MAX_EVENTS: usize = 256;
+
+/// r.md #117: 「id 未指定」 の note id。 wire (CLAP `clap_event_note.note_id` / `param_mod`) では
+/// `-1` に写す (`i32` に収まらない唯一の値なので変換は往復で一致する)。 sequencer が振る
+/// `sing_note_id` / `talk_event_id` のどちらとも衝突しない。 鍵盤プレビューの note もこれ
+/// (`daw_audio` の `PREVIEW_NOTE_ID`)。 **`0` は有効な id** (`sing_note_id(0, 0)`)。
+pub const NOTE_ID_NONE: u32 = u32::MAX;
 /// r.md #89 (`docs/plan_rmd_88_89_cross_modulation.md` §2.2): capacity of the
 /// **dedicated** parameter-modulation array.
 ///
@@ -252,6 +258,9 @@ pub enum EventKind {
     /// daw's parameter domain (plugin host converts per-format to CLAP plain /
     /// VST3 normalized).
     ParamValue = 3,
+    /// r.md #117: plugin がボイスを閉じた通知 (CLAP `CLAP_EVENT_NOTE_END`、 `events_out` のみ)。
+    /// engine はこれで per-note 変調のボイス表からノートを外す。 VST3 には無い。
+    NoteEnd = 4,
 }
 
 /// **lane 非依存モジュレーション** 1 件
@@ -272,12 +281,30 @@ pub struct ParamMod {
     pub param_id: u32,
     /// Normalized (`-1..=1`) offset.
     pub value: f64,
+    /// r.md #117 (`docs/plan_per_note_modulation.md`): 宛先のノート。 `-1` = global (従来)。
+    /// `>= 0` なら CLAP の per-note 変調 (`clap_event_param_mod.note_id`) — host は param が
+    /// `MODULATABLE_PER_NOTE_ID` を立てているときだけ使い、 その param 宛の global を捨てる。
+    pub note_id: i32,
+    /// per-note の key / channel (`-1` = 指定なし)。
+    pub key: i16,
+    pub channel: i16,
+}
+
+impl ParamMod {
+    /// global (ノート指定なし) か。
+    #[must_use]
+    pub fn is_global(&self) -> bool {
+        self.note_id < 0
+    }
 }
 
 const EMPTY_PARAM_MOD: ParamMod = ParamMod {
     time: 0,
     param_id: 0,
     value: 0.0,
+    note_id: -1,
+    key: -1,
+    channel: -1,
 };
 
 impl ProcessData {
@@ -422,6 +449,17 @@ impl ProcessData {
     ///
     /// RT 安全: 固定長配列への書き込みのみ (確保・ロック無し)。
     pub fn push_param_mod(&mut self, time: u32, param_id: u32, offset_norm: f64) {
+        self.push_param_mod_for(time, param_id, offset_norm, -1, -1, -1);
+    }
+
+    /// r.md #117: ノート宛の modulation offset。 `note_id` は host が note event に載せたのと
+    /// 同じ `i32` (収まらない id は呼び側が弾く = note event 側も `-1` で届くので当てられない)。
+    /// 溢れの規則は [`Self::push_param_mod`]。
+    pub fn push_param_mod_note(&mut self, time: u32, param_id: u32, offset_norm: f64, note_id: i32, key: u8, channel: u8) {
+        self.push_param_mod_for(time, param_id, offset_norm, note_id, i16::from(key), i16::from(channel));
+    }
+
+    fn push_param_mod_for(&mut self, time: u32, param_id: u32, offset_norm: f64, note_id: i32, key: i16, channel: i16) {
         let n = self.n_param_mods as usize;
         let head = self.param_mods_head as usize % MAX_PARAM_MODS;
         let slot = if n < MAX_PARAM_MODS {
@@ -440,6 +478,9 @@ impl ProcessData {
             time,
             param_id,
             value: offset_norm,
+            note_id,
+            key,
+            channel,
         };
     }
 

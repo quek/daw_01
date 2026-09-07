@@ -182,14 +182,22 @@ impl<'a> ModPlaneRef<'a> {
     #[must_use]
     #[inline]
     pub fn scalar(&self, source_id: u32) -> f32 {
+        self.scalar_opt(source_id).unwrap_or(0.0)
+    }
+
+    /// `source_id` のスカラー。 面に載っていない id は `None` (r.md #115: バイパス中の
+    /// source は評価計画から外れて面に載らないので、 合成側はその routing を飛ばす)。
+    #[must_use]
+    #[inline]
+    pub fn scalar_opt(&self, source_id: u32) -> Option<f32> {
         let mut i = 0;
         while i < self.ids.len() {
             if self.ids[i] == source_id {
-                return self.values.get(i).copied().unwrap_or(0.0);
+                return self.values.get(i).copied();
             }
             i += 1;
         }
-        0.0
+        None
     }
 }
 
@@ -237,6 +245,8 @@ pub struct ModTickPlane {
     /// buffer 頭がちょうど境界なら [`crate::mod_graph::MOD_TICK_FRAMES`]
     /// (= 行 0 が buffer 頭の値、行 1 が 64 frame 目の値)。
     lead: u32,
+    /// r.md #117: buffer 先頭の絶対 song サンプル位置。
+    first_sample: u64,
 }
 
 impl ModTickPlane {
@@ -248,6 +258,7 @@ impl ModTickPlane {
             depth_ids: Vec::with_capacity(sources),
             depths: Vec::with_capacity(sources * ticks),
             lead: crate::mod_graph::MOD_TICK_FRAMES,
+            first_sample: 0,
         }
     }
 
@@ -318,7 +329,13 @@ impl ModTickPlane {
             depth_ids: &self.depth_ids,
             depths: &self.depths,
             lead: self.lead,
+            first_sample: self.first_sample,
         }
+    }
+
+    /// r.md #117: buffer 先頭の絶対 song サンプル位置 (runner が `set_lead` と一緒に書く)。
+    pub fn set_first_sample(&mut self, first_sample: u64) {
+        self.first_sample = first_sample;
     }
 }
 
@@ -332,12 +349,21 @@ pub struct ModTickPlaneRef<'a> {
     pub depths: &'a [f32],
     /// buffer 頭から最初の刻み境界までの frame 数 (境界に乗っているなら 64)。
     pub lead: u32,
+    /// r.md #117: この buffer の先頭の **絶対 song サンプル位置** (ボイスの起点秒と ADSR の
+    /// 時間軸)。 面と一緒に運ぶので runner の引数を増やさない。
+    pub first_sample: u64,
 }
 
 impl<'a> ModTickPlaneRef<'a> {
     #[must_use]
     pub const fn new(ids: &'a [u32], values: &'a [f32], lead: u32) -> Self {
-        Self { ids, values, depth_ids: &[], depths: &[], lead }
+        Self { ids, values, depth_ids: &[], depths: &[], lead, first_sample: 0 }
+    }
+
+    /// r.md #117: buffer 先頭の絶対 song サンプル位置。
+    #[must_use]
+    pub fn first_sample(&self) -> u64 {
+        self.first_sample
     }
 
     /// 深さの面も持つビュー (r.md #89 Q9)。
@@ -349,7 +375,7 @@ impl<'a> ModTickPlaneRef<'a> {
         depths: &'a [f32],
         lead: u32,
     ) -> Self {
-        Self { ids, values, depth_ids, depths, lead }
+        Self { ids, values, depth_ids, depths, lead, first_sample: 0 }
     }
 
     #[must_use]
@@ -423,17 +449,25 @@ impl<'a> ModTickPlaneRef<'a> {
     #[must_use]
     #[inline]
     pub fn scalar_at_frame(&self, source_id: u32, frame: u32) -> f32 {
+        self.scalar_at_frame_opt(source_id, frame).unwrap_or(0.0)
+    }
+
+    /// [`Self::scalar_at_frame`] の、 面に無い id (r.md #115: バイパス中の source / 行の無い面)
+    /// を `None` で返す版。 合成 (`modulation_offset_norm_with`) はこれで routing を飛ばす。
+    #[must_use]
+    #[inline]
+    pub fn scalar_at_frame_opt(&self, source_id: u32, frame: u32) -> Option<f32> {
         let rows = self.rows();
         if rows == 0 {
-            return 0.0;
+            return None;
         }
         let (a, b, t) = self.segment(frame);
-        let va = self.row(a.min(rows - 1)).scalar(source_id);
+        let va = self.row(a.min(rows - 1)).scalar_opt(source_id)?;
         if b >= rows {
-            return va;
+            return Some(va);
         }
-        let vb = self.row(b).scalar(source_id);
-        va + (vb - va) * t
+        let vb = self.row(b).scalar_opt(source_id).unwrap_or(va);
+        Some(va + (vb - va) * t)
     }
 
     /// `frame` における `routing_id` の実効深さ (r.md #89 Q9)。深さが動かない

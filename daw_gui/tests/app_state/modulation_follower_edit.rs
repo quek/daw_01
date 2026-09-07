@@ -36,6 +36,7 @@ fn build_app_with_follower() -> (AppData, u32) {
                 tap: AudioTap::post_fader(TRACK_A),
                 follower: FollowerConfig::default(),
             },
+            enabled: true,
         });
     });
     let source_id = app.song_doc.song().mod_sources[0].id;

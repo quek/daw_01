@@ -180,7 +180,7 @@ pub fn fill_target_ramp(
             &target,
             base,
             mod_routings,
-            |id| mod_plane.scalar_at_frame(id, f),
+            |id| mod_plane.scalar_at_frame_opt(id, f),
             |r| mod_plane.depth_at_frame(r.id, f).unwrap_or(r.depth),
         ) as f32;
     }
@@ -247,7 +247,7 @@ pub fn resolve_track_strip(
             &routing.target,
             f64::from(base),
             &track.mod_routings,
-            |id| mod_plane.scalar_at_frame(id, 0),
+            |id| mod_plane.scalar_at_frame_opt(id, 0),
             |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
         );
         #[allow(clippy::cast_possible_truncation)]
@@ -306,7 +306,7 @@ pub fn resolve_master_strip(
             &routing.target,
             f64::from(base),
             &song.song_mod_routings,
-            |id| mod_plane.scalar_at_frame(id, 0),
+            |id| mod_plane.scalar_at_frame_opt(id, 0),
             |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
         );
         #[allow(clippy::cast_possible_truncation)]
@@ -351,6 +351,8 @@ pub fn fill_pd_param_events(
     // docs/plan_modulation.md §5 / r.md #89: **刻みごとの**変調値面 (id キー)。
     // PluginParam lane の `mod_routings` がこれを引く。空 = 変調なし。
     mod_plane: ModTickPlaneRef<'_>,
+    // r.md #117: この plugin の鳴っているノート (per-note 変調の評価点)。 `None` = ノート無し。
+    voices: Option<&crate::graph::voices::VoiceTable>,
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -451,7 +453,14 @@ pub fn fill_pd_param_events(
         })
         .count()
         .max(1);
-    let budget = (common::process_data::MAX_PARAM_MODS / n_params).max(1);
+    // r.md #117: per-note のストリーム (per-note 対象 param × ボイス) も **同じ枠**を食うので、
+    // 予算はストリーム数の合計で割る。 別枠で数えると per-note が global を押し出し、 先頭
+    // param の global offset が解除されずに居座る (上の r.md #89 と同じ事故)。
+    let n_pn_params = voices.map_or(0, |vt| {
+        usize::from(!vt.is_empty()) * per_note_target_count(song, mod_routings, device_id)
+    });
+    let n_streams = n_params + n_pn_params * voices.map_or(0, |vt| vt.len());
+    let budget = (common::process_data::MAX_PARAM_MODS / n_streams.max(1)).max(1);
     let stride = n_ticks.div_ceil(budget).max(1);
     for (i, r) in mod_routings.iter().enumerate() {
         let AutomationTarget::PluginParam { device_id: d, param_id, .. } = &r.target else {
@@ -480,12 +489,137 @@ pub fn fill_pd_param_events(
             let offset = f64::from(common::automation::modulation_offset_norm_with(
                 &r.target,
                 mod_routings,
-                |id| mod_plane.scalar_at_frame(id, f),
+                |id| mod_plane.scalar_at_frame_opt(id, f),
                 |rr| mod_plane.depth_at_frame(rr.id, f).unwrap_or(rr.depth),
             ));
             if last.is_nan() || (offset - last).abs() > 1e-6 {
                 pd.push_param_mod(f, *param_id, offset);
                 last = offset;
+            }
+        }
+    }
+    if let Some(voices) = voices {
+        push_per_note_param_mods(
+            pd, song, mod_routings, device_id, sample_rate, current_bpm, playhead_beats, frames, mod_plane, voices, stride,
+            n_ticks,
+        );
+    }
+}
+
+/// r.md #117: この routing が **per-note 経路で評価される** か (source が有効な `Note` 起点)。
+fn is_per_note_routing(song: &Song, r: &common::model::ModRouting) -> bool {
+    r.enabled
+        && song
+            .mod_sources
+            .iter()
+            .any(|m| m.id == r.source_id && m.enabled && m.kind.is_per_note())
+}
+
+/// r.md #117: この device の param のうち、 per-note routing が 1 本でも刺さっているものの数
+/// (target ごとに 1 = per-note ストリームの本数 / ボイス)。 予算の分母。
+fn per_note_target_count(song: &Song, mod_routings: &[common::model::ModRouting], device_id: u64) -> usize {
+    mod_routings
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| {
+            matches!(&r.target, AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id)
+                && is_per_note_routing(song, r)
+                && !mod_routings[..*i].iter().any(|p| p.target == r.target && is_per_note_routing(song, p))
+        })
+        .count()
+}
+
+/// r.md #117: 1 ボイス・1 刻みの正規化オフセット = **その param 宛の全 routing の和**。 `Note`
+/// 起点の source はそのボイスの時刻 `time` で閉形式評価、 それ以外は面の値 (深さが動く変調は
+/// 面の実効値 — global と同じ)。
+fn per_note_offset_at(
+    song: &Song,
+    mod_routings: &[common::model::ModRouting],
+    target: &AutomationTarget,
+    mod_plane: ModTickPlaneRef<'_>,
+    f: u32,
+    time: common::modulators::ModTime,
+) -> f64 {
+    use common::modulators::generator_scalar;
+    f64::from(common::automation::modulation_offset_norm_with(
+        target,
+        mod_routings,
+        |sid| match song.mod_sources.iter().find(|m| m.id == sid) {
+            Some(m) if m.enabled && m.kind.is_per_note() => {
+                Some(generator_scalar(&m.kind, time).unwrap_or(0.0).clamp(0.0, 1.0))
+            }
+            _ => mod_plane.scalar_at_frame_opt(sid, f),
+        },
+        |rr| mod_plane.depth_at_frame(rr.id, f).unwrap_or(rr.depth),
+    ))
+}
+
+/// r.md #117 (`docs/plan_per_note_modulation.md` §3): per-note routing が刺さっている param に
+/// ついて、 **ボイス × 刻み** で `ParamMod { note_id, key }` を積む。
+///
+/// 値は **その param 宛の全 routing の和** (global と同じ `modulation_offset_norm_with`): `Note`
+/// 起点の source はそのボイスの時刻で閉形式評価 (`generator_scalar` に note-on の拍 / 秒と
+/// note-off の秒。 config の値で評価 = 位相だけノート起点)、 それ以外の source は面の値。
+/// host は「per-note が 1 件でもある param の global を捨てる」 ので、 ここに global 側の寄与
+/// (別 routing の LFO 等) も畳んでおかないと、 ボイスが鳴っている間だけその変調が消える。
+/// 同じ param の per-note routing が複数あっても 1 event (和) になる (CLAP `param_mod` は
+/// 絶対値で後勝ちなので、 別々に送ると加算されない)。
+///
+/// `stride` / `n_ticks` は global と共通の予算 (ストリーム数で割った刻み)。
+#[allow(clippy::too_many_arguments)]
+fn push_per_note_param_mods(
+    pd: &mut ProcessData,
+    song: &Song,
+    mod_routings: &[common::model::ModRouting],
+    device_id: u64,
+    sample_rate: u32,
+    current_bpm: f64,
+    playhead_beats: f64,
+    frames: u32,
+    mod_plane: ModTickPlaneRef<'_>,
+    voices: &crate::graph::voices::VoiceTable,
+    stride: usize,
+    n_ticks: usize,
+) {
+    use common::modulators::ModTime;
+    let sr = f64::from(sample_rate.max(1));
+    let secs0 = mod_plane.first_sample() as f64 / sr;
+    let beats_per_frame = current_bpm / (60.0 * sr);
+    for (i, r) in mod_routings.iter().enumerate() {
+        let AutomationTarget::PluginParam { device_id: d, param_id, .. } = &r.target else {
+            continue;
+        };
+        if *d != device_id || !is_per_note_routing(song, r) {
+            continue;
+        }
+        // 同一 target は 1 度だけ (先行する同 target の per-note routing があれば skip)。
+        if mod_routings[..i].iter().any(|p| p.target == r.target && is_per_note_routing(song, p)) {
+            continue;
+        }
+        for v in voices.iter() {
+            // host は note id を `i32` で運ぶ (`-1` = 未指定)。 収まらない id (鍵盤プレビューの
+            // `PREVIEW_NOTE_ID`) は note event 側も `-1` で届くので、 per-note では当てられない。
+            let Ok(note_id) = i32::try_from(v.note_id) else {
+                continue;
+            };
+            let mut last = f64::NAN;
+            for (t, f) in mod_plane.starts(frames).enumerate() {
+                if t % stride != 0 && t + 1 != n_ticks {
+                    continue;
+                }
+                let ft = f64::from(f);
+                let time = ModTime::at_note(
+                    playhead_beats + ft * beats_per_frame,
+                    secs0 + ft / sr,
+                    v.on_beat,
+                    v.on_secs,
+                    v.off_secs,
+                );
+                let offset = per_note_offset_at(song, mod_routings, &r.target, mod_plane, f, time);
+                if last.is_nan() || (offset - last).abs() > 1e-6 {
+                    pd.push_param_mod_note(f, *param_id, offset, note_id, v.key, v.channel);
+                    last = offset;
+                }
             }
         }
     }
@@ -556,6 +690,7 @@ mod tests {
             frames,
             recording_lanes,
             mod_plane,
+            None,
         );
     }
     use common::model::{
@@ -1016,6 +1151,65 @@ mod tests {
         assert!(pd.events_in[0].value >= 0.25 - 1e-6);
         let last = pd.events_in[(pd.n_events_in - 1) as usize].value;
         assert!(last > pd.events_in[0].value, "ramp で値が増加");
+    }
+
+    /// r.md #117: `Note` 起点のソースを source にする plugin param の routing は、 鳴っている
+    /// ボイスごとに `ParamMod { note_id, key }` を積む (値はそのノートの note-on からの位相)。
+    /// ノートが無ければ per-note は 1 件も出ない。 routing / source のバイパスは飛ばす。
+    #[test]
+    fn per_note_sources_emit_one_param_mod_stream_per_voice() {
+        use common::model::{LfoConfig, LfoShape, ModRouting, ModSource, ModSourceKind, Polarity, RetriggerMode};
+        use crate::graph::voices::VoiceTable;
+        let mut song = Song::default();
+        song.mod_sources.push(ModSource {
+            id: 9,
+            owner_track_id: 7,
+            color: [0.0; 3],
+            kind: ModSourceKind::Lfo(LfoConfig {
+                shape: LfoShape::SawUp,
+                rate: common::model::ModRate::default(), // 1/4 = 1 拍で 1 周
+                retrigger: RetriggerMode::Note,
+                ..LfoConfig::default()
+            }),
+            enabled: true,
+        });
+        let target = AutomationTarget::PluginParam { device_id: DEVICE_ID, param_id: 5, legacy_device_index: None };
+        song.tracks.push(track(|t| {
+            t.id = 7;
+            t.mod_routings = vec![ModRouting {
+                id: 1,
+                target: target.clone(),
+                source_id: 9,
+                depth: 1.0,
+                polarity: Polarity::Unipolar,
+                enabled: true,
+            }];
+        }));
+        let empty = empty_recording_lanes();
+        let plane = ModTickPlaneRef::new(&[], &[], 64);
+        // 2 ボイス: note 100 は beat 0 から、 note 101 は beat 0.25 から。 buffer 頭 = 0.5 拍。
+        let mut voices = VoiceTable::new(DEVICE_ID);
+        voices.note_on(100, 60, 0, 0.0, 0.0, 1.0);
+        voices.note_on(101, 64, 0, 0.25, 0.125, 1.0);
+        let mut pd = ProcessData::empty();
+        fill_pd_param_events(&mut pd, &song, 7, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, Some(&voices));
+        // global (最新ノート = 面の値、 ここでは面が空なので 0) は従来どおり別に積まれる。
+        let mods: Vec<_> = pd.param_mods_iter().copied().filter(|m| !m.is_global()).collect();
+        let at0 = |nid: i32| mods.iter().find(|m| m.note_id == nid && m.time == 0).map(|m| m.value).expect("frame 0 の mod");
+        assert!((at0(100) - 0.5).abs() < 1e-6, "note 100: 0.5 拍経過 = 位相 0.5");
+        assert!((at0(101) - 0.25).abs() < 1e-6, "note 101: 0.25 拍経過");
+        assert_eq!(mods.iter().find(|m| m.note_id == 100).unwrap().key, 60);
+        assert!(mods.iter().any(|m| m.note_id == 100 && m.time == 64), "刻みごとに出る");
+
+        // ボイス無し → per-note なし。 source バイパス → なし。
+        let per_note = |pd: &ProcessData| pd.param_mods_iter().filter(|m| !m.is_global()).count();
+        let mut pd = ProcessData::empty();
+        fill_pd_param_events(&mut pd, &song, 7, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, None);
+        assert_eq!(per_note(&pd), 0);
+        song.mod_sources[0].enabled = false;
+        let mut pd = ProcessData::empty();
+        fill_pd_param_events(&mut pd, &song, 7, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, Some(&voices));
+        assert_eq!(per_note(&pd), 0, "バイパス中の source は per-note も出さない");
     }
 
     /// Phase 4 Step C-2 (plugin param 版) 回帰: recording 中 (Touch/Latch/Write)

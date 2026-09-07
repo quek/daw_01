@@ -490,9 +490,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// 読み取り専用の波形プレビュー (LFO / Random)。`samples` をポリラインで描き、
-    /// `phase` があれば縦カーソルを重ねる。
+    /// `cursors` (`(x, y)` とも 0..=1、 複数可 = ノートごとの現在値など) を **縦線 + 値の点**
+    /// で重ねる。 点が値そのもの (包絡で縮んでいれば前景の線より内側に来る)。
     ///
-    /// `reference` は `samples` の **背後に薄く重ねる比較用の系列** (空で描かない)。
+    /// `references` は `samples` の **背後に薄く重ねる比較用の系列** (空なら描かない)。
     /// 「いま出ている形」 と「基準の形」 を同じ面で見比べさせるためのもので、 前景と
     /// 同じ `line_color` の低アルファ版を使う (別の色を足すと、 どちらが基準か色の
     /// 語彙を新しく覚えることになる)。 前景と同じ x 領域 `0..=1` で渡すこと。
@@ -501,14 +502,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         rect: Rect,
         samples: &[(f32, f32)],
-        reference: &[(f32, f32)],
-        phase: Option<f32>,
+        references: &[&[(f32, f32)]],
+        cursors: &[(f32, f32)],
         style: MsegEditorStyle,
     ) {
         let wid = WidgetId::ROOT.child((b"signal_preview", &id));
         let sample_bits: Vec<u32> = samples
             .iter()
-            .chain(reference.iter())
+            .chain(references.iter().flat_map(|r| r.iter()))
+            .chain(cursors.iter())
             .flat_map(|&(x, y)| [x.to_bits(), y.to_bits()])
             .collect();
         let input_hash = hash_inputs((
@@ -517,10 +519,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             sample_bits,
             // 系列の境目を fold する (前景と背景の点数が入れ替わっただけの差を拾う)。
             samples.len(),
-            phase.map_or(u32::MAX, f32::to_bits),
+            references.len(),
+            cursors.len(),
         ));
         let samples_owned: Vec<(f32, f32)> = samples.to_vec();
-        let reference_owned: Vec<(f32, f32)> = reference.to_vec();
+        let references_owned: Vec<Vec<(f32, f32)>> = references.iter().map(|r| r.to_vec()).collect();
+        let cursors_owned: Vec<(f32, f32)> = cursors.to_vec();
         self.with_widget_node(wid, input_hash, move |ui| {
             ui.push_rect(RectCommand {
                 rect,
@@ -539,9 +543,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 clip_rect: Some(rect),
             });
             // 比較用の系列は前景の **下** に、 同じインクの薄い版で先に描く。
-            if reference_owned.len() >= 2 {
-                let faint = Color { a: style.line_color.a * 0.3, ..style.line_color };
-                let segs: Vec<LineSegment> = reference_owned
+            let faint = Color { a: style.line_color.a * 0.3, ..style.line_color };
+            for reference in references_owned.iter().filter(|r| r.len() >= 2) {
+                let segs: Vec<LineSegment> = reference
                     .windows(2)
                     .map(|w| {
                         let (ax, ay) = (rect.x + w[0].0 * rect.w, rect.y + (1.0 - w[0].1) * rect.h);
@@ -570,18 +574,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     clip_rect: Some(rect),
                 });
             }
-            if let Some(ph) = phase {
-                let cx = rect.x + ph.clamp(0.0, 1.0) * rect.w;
-                ui.push_lines(LineBatch {
-                    segments: vec![LineSegment {
-                        a: [cx, rect.y],
-                        b: [cx, rect.y + rect.h],
-                        color: style.cursor_color,
-                    }]
-                    .into(),
-                    line_width_px: 1.5,
-                    clip_rect: Some(rect),
-                });
+            // カーソルは複数 (ノートごとの現在値など)。 縦線 + 値の点を 1 つずつ描く。
+            if !cursors_owned.is_empty() {
+                let segs: Vec<LineSegment> = cursors_owned
+                    .iter()
+                    .map(|(x, _)| {
+                        let cx = rect.x + x.clamp(0.0, 1.0) * rect.w;
+                        LineSegment { a: [cx, rect.y], b: [cx, rect.y + rect.h], color: style.cursor_color }
+                    })
+                    .collect();
+                ui.push_lines(LineBatch { segments: segs.into(), line_width_px: 1.5, clip_rect: Some(rect) });
+                let r = style.node_radius_px.max(2.0);
+                for (x, y) in &cursors_owned {
+                    let cx = rect.x + x.clamp(0.0, 1.0) * rect.w;
+                    let cy = rect.y + (1.0 - y.clamp(0.0, 1.0)) * rect.h;
+                    ui.push_rect(RectCommand {
+                        rect: Rect { x: cx - r, y: cy - r, w: 2.0 * r, h: 2.0 * r },
+                        fill: style.cursor_color,
+                        border: Color::TRANSPARENT,
+                        border_width: 0.0,
+                        radius: [r; 4],
+                        clip_rect: Some(rect),
+                    });
+                }
             }
         });
     }

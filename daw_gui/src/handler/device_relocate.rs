@@ -646,8 +646,11 @@ fn extract_parallel_bindings(
     extract_bindings(song, track_id, |target| {
         matches!(
             target,
-            T::TrackBuiltin(P::ParallelOutGain { parallel_id: p } | P::ParallelSplitFreq { parallel_id: p, .. })
-                if *p == parallel_id
+            T::TrackBuiltin(
+                P::ParallelOutGain { parallel_id: p }
+                    | P::ParallelSplitFreq { parallel_id: p, .. }
+                    | P::ParallelSelect { parallel_id: p }
+            ) if *p == parallel_id
         )
     })
 }

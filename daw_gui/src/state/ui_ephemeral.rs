@@ -38,6 +38,15 @@ pub enum ScrubGesture {
     GroupTransform(common::model::GroupTransformParam),
 }
 
+/// r.md #115: 変調ラックでポインタが乗っているもの (`Q` のバイパス対象)。 住所は安定 id。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModRackHover {
+    /// モジュレーターのヘッダ行 / 展開した本体。
+    Source(u32),
+    /// routing 1 行 (`ModRouting::id`)。
+    Routing(u32),
+}
+
 pub struct UiEphemeral {
     /// D3/D4: track/clip 名の `Arc<str>` キャッシュ ([`ArrLabelCache`])。 view から
     /// (`&self`) 更新するので `RefCell`。 AppData は GUI メインスレッド専有なので可。
@@ -121,6 +130,10 @@ pub struct UiEphemeral {
     /// これを見て「選択 device があればそれら、無ければこの行」を bypass 切替する。
     /// チェーン外 / インスペクタ非表示は `None`。
     pub inspector_hovered_device: Option<u64>,
+    /// r.md #115: インスペクタの変調ラックで、 いまカーソルが乗っているモジュレーター
+    /// (ヘッダ行 / 展開した本体) または routing 行。 `modulation_rack` が毎フレーム更新
+    /// (`inspector_hovered_device` と同 idiom)。 `Q` がこれを見てバイパスを切り替える。
+    pub inspector_hovered_mod: Option<ModRackHover>,
     /// マスターストリップで、いまカーソルが乗っているブロック
     /// (`docs/plan_master_strip.md` §3)。`Q` がこれを見てそのセクションの
     /// バイパスを切り替える。算出は `view::master_strip_ui` の 1 か所。
@@ -154,6 +167,9 @@ pub struct UiEphemeral {
     /// mute」する対象解決に使う。`piano_roll` widget が `note_hit` で毎フレーム更新、
     /// grid 外 / note 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_note: Option<u32>,
+    /// r.md #119: ピアノロール grid 上のポインタの鍵盤行 (MIDI pitch)。 Ctrl+A の 1 段目
+    /// (その行の全ノート) が見る。 `piano_roll` widget が毎フレーム更新、 grid 外は `None`。
+    pub pianoroll_hover_pitch: Option<u8>,
     /// view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
     /// plugin state 収集が非同期 (`on_all_states_from_child`、Ui 非保持) なので、
     /// そこで serialize した envelope JSON をここに積み、`dispatch_shortcuts` が

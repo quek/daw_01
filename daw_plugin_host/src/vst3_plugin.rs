@@ -152,6 +152,10 @@ impl AudioProcessorHalf for Vst3AudioHalf {
         // --- Build Event buffer and hand it to the reusable input list.
         self.in_event_buffer.clear();
         for te in events {
+            // r.md #117: `End` は出力側専用 (VST3 には無い)。
+            if matches!(te.event, NoteTransition::End { .. }) {
+                continue;
+            }
             self.in_event_buffer.push(encode_event(te));
         }
         self.in_event_list.set_events(&self.in_event_buffer);
@@ -180,14 +184,18 @@ impl AudioProcessorHalf for Vst3AudioHalf {
         // reaches the DSP; automation events follow in ascending time order
         // (VST3 `IParamValueQueue` requires non-decreasing offsets).
         for &(id, val) in &self.gui_edit_scratch {
-            self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
-                time: 0,
-                param_id: id,
-                value: val,
-                kind: ParamEventKind::Value,
-            });
+            self.folded_param_events.push(crate::plugin_instance::TimedParamEvent::global(
+                0,
+                id,
+                val,
+                ParamEventKind::Value,
+            ));
         }
         for ev in param_events {
+            // r.md #117: VST3 にはノート単位の param 変調が無い (global だけ効く)。
+            if ev.kind == ParamEventKind::Mod && ev.note_id >= 0 {
+                continue;
+            }
             // base は **時刻順に 1 件ずつ**進める (buffer 末の値を全刻みに使わない)。
             process_scaffold::advance_param_base(&mut self.param_mod_base, ev);
             match ev.kind {
@@ -196,12 +204,12 @@ impl AudioProcessorHalf for Vst3AudioHalf {
                     let base = self.param_mod_base.get(&ev.param_id).copied().unwrap_or(0.0);
                     // VST3 params are normalized 0..=1 ⇒ offset_scaled == offset.
                     let value = fold_mod_offset(base, ev.value, 0.0, 1.0);
-                    self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
-                        time: ev.time,
-                        param_id: ev.param_id,
+                    self.folded_param_events.push(crate::plugin_instance::TimedParamEvent::global(
+                        ev.time,
+                        ev.param_id,
                         value,
-                        kind: ParamEventKind::Value,
-                    });
+                        ParamEventKind::Value,
+                    ));
                 }
             }
         }
@@ -1805,7 +1813,8 @@ fn encode_event(te: &TimedNoteEvent) -> Event {
             }
             ev
         }
-        NoteTransition::Off { note_id, key } => {
+        // `End` は入力に来ない (呼び側で落とす)。 来ても note-off 相当で害はない。
+        NoteTransition::Off { note_id, key } | NoteTransition::End { note_id, key } => {
             let vst_note_id =
                 if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
             let note_off = NoteOffEvent {

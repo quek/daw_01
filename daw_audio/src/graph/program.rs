@@ -33,6 +33,7 @@ use common::process_data::EventKind;
 use crate::engine::{PluginRefs, SyncSlot};
 use crate::graph::DelayLine;
 use crate::graph::band_split::Splitter;
+use crate::graph::voices::VoiceTable;
 use crate::launcher::TrackRows;
 use crate::mixer::{MAX_EVENTS, MAX_FRAMES};
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
@@ -50,6 +51,8 @@ pub enum ChainOp {
         device_id: u64,
         ports: PortConfig,
         own_prefx_ports: u8,
+        /// r.md #117: この plugin のボイス表 (`ChainProgram::voices` の index)。
+        voice_slot: u32,
     },
     ParallelBegin { parallel_slot: u32 },
     /// `output`: この chain が受ける `Split` の出力番号 (`Split::output_of`)。 `None` = Parallel
@@ -107,10 +110,11 @@ const MATCH_GAIN_MIN: f32 = 0.25;
 const MATCH_GAIN_MAX: f32 = 4.0;
 
 impl ParallelScratch {
-    pub fn new(parallel_id: u64, split: common::model::Split) -> Self {
+    /// `n_chains` = chain 数 (`Split::Selector` が chain ごとの出力を持つ)。
+    pub fn new(parallel_id: u64, split: common::model::Split, n_chains: usize) -> Self {
         Self {
             parallel_id,
-            split: Splitter::new(split),
+            split: Splitter::new(split, n_chains),
             in_l: vec![0.0; MAX_FRAMES],
             in_r: vec![0.0; MAX_FRAMES],
             in_midi: Vec::with_capacity(MAX_EVENTS),
@@ -194,6 +198,8 @@ pub struct ChainProgram {
     pub delay_lines: Vec<DelayLine>,
     /// `delay_lines` と平行な stable key (= `ParallelChain::id`、再 compile 跨ぎの状態移送)。
     pub delay_keys: Vec<u64>,
+    /// r.md #117: plugin ごとのボイス表 (`ChainOp::Plugin::voice_slot`)。 device id で移送。
+    pub voices: Vec<VoiceTable>,
 }
 
 impl ChainProgram {
@@ -206,6 +212,7 @@ impl ChainProgram {
             chains: Vec::new(),
             delay_lines: Vec::new(),
             delay_keys: Vec::new(),
+            voices: Vec::new(),
         }
     }
 
@@ -236,6 +243,13 @@ impl ChainProgram {
                 if let (Some(s), Some(os)) = (rs.split.as_mut(), o.split.as_ref()) {
                     s.adopt_state_from(os);
                 }
+            }
+        }
+        // r.md #117: 鳴っているノートは plugin id で引き継ぐ (捨てると編集のたびに
+        // per-note 変調が起点を失う)。
+        for vt in &mut self.voices {
+            if let Some(o) = old.voices.iter().find(|o| o.device_id == vt.device_id) {
+                vt.adopt_state_from(o);
             }
         }
     }
@@ -282,6 +296,7 @@ pub fn run_chain_program(
         parallels,
         chains,
         delay_lines,
+        voices,
         ..
     } = program;
     let track_id = *track_id;
@@ -290,9 +305,10 @@ pub fn run_chain_program(
     let mut midi_replaced = false;
     for op in &ops[start..end] {
         match op {
-            ChainOp::Plugin { device_id, ports, own_prefx_ports } => {
+            ChainOp::Plugin { device_id, ports, own_prefx_ports, voice_slot } => {
+                let vt = voices.get_mut(*voice_slot as usize);
                 if run_plugin(
-                    *device_id, *ports, *own_prefx_ports, track_id, bus_l, bus_r, midi_a, midi_b, n, ctx,
+                    *device_id, *ports, *own_prefx_ports, track_id, bus_l, bus_r, midi_a, midi_b, n, ctx, vt,
                 ) {
                     midi_replaced = true;
                 }
@@ -312,11 +328,20 @@ pub fn run_chain_program(
                 match rs.split.as_mut() {
                     Some(Splitter::Frequency3(bs)) => {
                         let (low, high) = resolve_split_freqs(ctx, parallel_id);
-                        fill_split_ramp(ctx, track_id, parallel_id, SplitEdge::LowMid, low, &mut bs.low_ramp);
-                        fill_split_ramp(ctx, track_id, parallel_id, SplitEdge::MidHigh, high, &mut bs.high_ramp);
+                        let edge = |e| TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge: e };
+                        fill_parallel_ramp(ctx, track_id, edge(SplitEdge::LowMid), low, &mut bs.low_ramp);
+                        fill_parallel_ramp(ctx, track_id, edge(SplitEdge::MidHigh), high, &mut bs.high_ramp);
                         bs.process(ctx.sample_rate, &rs.in_l, &rs.in_r, n);
                     }
                     Some(Splitter::MidSide(ms)) => ms.process(&rs.in_l, &rs.in_r, n),
+                    // r.md #114: アクティブ chain の位置 (automation + 変調の per-sample ramp) と
+                    // クロスフェード時間は Song snapshot から live-read。
+                    Some(Splitter::Selector(sel)) => {
+                        let (pos, fade_ms) = resolve_selector(ctx, parallel_id);
+                        let target = TrackBuiltinParam::ParallelSelect { parallel_id };
+                        fill_parallel_ramp(ctx, track_id, target, pos, &mut sel.pos_ramp);
+                        sel.process(ctx.sample_rate, fade_ms, &rs.in_l, &rs.in_r, &rs.in_midi, n);
+                    }
                     None => {}
                 }
             }
@@ -332,7 +357,12 @@ pub fn run_chain_program(
                         bus_r[..n].copy_from_slice(&rs.in_r[..n]);
                     }
                 }
-                copy_midi(midi_a, &rs.in_midi);
+                // r.md #114: Selector は MIDI もアクティブ chain だけ (note-off は note-on を受けた
+                // chain へ)。 他の配り方は全 chain が同じ MIDI を受ける。
+                match (output, rs.split.as_ref()) {
+                    (Some(k), Some(Splitter::Selector(sel))) => sel.copy_midi_for(*k, &rs.in_midi, midi_a),
+                    _ => copy_midi(midi_a, &rs.in_midi),
+                }
                 // ここから chain の区間。置換フラグは chain ごとに立て直す。
                 midi_replaced = false;
             }
@@ -477,18 +507,29 @@ fn resolve_split_freqs(ctx: &ProgramCtx<'_>, parallel_id: u64) -> (f32, f32) {
         .map_or(common::model::Split::DEFAULT_FREQS, |r| r.split.freqs_or_default())
 }
 
-/// クロスオーバー周波数の ramp を埋める (`fill_parallel_out_ramp` と同じ経路)。
-fn fill_split_ramp(
+/// r.md #114: Selector の (アクティブ chain の位置, クロスフェード ms) を Song snapshot から
+/// live-read する。 snapshot に無い / `Selector` でなければ (中央, 既定)。
+fn resolve_selector(ctx: &ProgramCtx<'_>, parallel_id: u64) -> (f32, f32) {
+    use common::model::Split;
+    ctx.song
+        .and_then(|s| s.parallel_by_id(parallel_id))
+        .map_or((0.5, Split::DEFAULT_SELECTOR_FADE_MS), |r| {
+            (r.select_pos(), r.split.selector_fade_ms().unwrap_or(Split::DEFAULT_SELECTOR_FADE_MS))
+        })
+}
+
+/// Parallel の builtin param (クロスオーバー周波数 / Selector の位置) の ramp を埋める
+/// (`fill_parallel_out_ramp` と同じ経路)。 `constant` = snapshot の基準値。
+fn fill_parallel_ramp(
     ctx: &ProgramCtx<'_>,
     track_id: u32,
-    parallel_id: u64,
-    edge: SplitEdge,
-    hz: f32,
+    param: TrackBuiltinParam,
+    constant: f32,
     buf: &mut [f32],
 ) {
     let n = (ctx.frames as usize).min(buf.len());
     let Some(song) = ctx.song else {
-        buf[..n].fill(hz);
+        buf[..n].fill(constant);
         return;
     };
     let (lanes, routings) = track_stores(song, track_id);
@@ -502,8 +543,8 @@ fn fill_split_ramp(
         f64::from(ctx.current_bpm),
         ctx.playhead_beats,
         ctx.frames,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge }),
-        hz,
+        AutomationTarget::TrackBuiltin(param),
+        constant,
         buf,
         ctx.recording_lanes,
         ctx.mod_plane,
@@ -622,6 +663,7 @@ fn run_plugin(
     midi_b: &mut Vec<TimedNoteEvent>,
     n: usize,
     ctx: &ProgramCtx<'_>,
+    voices: Option<&mut VoiceTable>,
 ) -> bool {
     let Some(entry) = ctx.plugin_refs.get(&device_id) else {
         return false;
@@ -650,13 +692,31 @@ fn run_plugin(
     // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
     // M1 (r.md #8): note を param automation より **先に** push する (events_in の
     // 溢れで NoteOff を落とさない)。
+    // r.md #117: この plugin が受けるノートをボイス表に記録する (per-note 変調の起点)。
+    let sr = f64::from(ctx.sample_rate.max(1));
+    let first_sample = ctx.mod_plane.first_sample();
+    let secs0 = first_sample as f64 / sr;
+    let beats_per_frame = f64::from(ctx.current_bpm) / (60.0 * sr);
+    let mut voices = voices;
+    if let Some(vt) = voices.as_deref_mut() {
+        vt.expire(secs0);
+    }
     if ports.has_note_input {
         for ev in midi_a.iter() {
+            let t = f64::from(ev.time);
             match ev.event {
                 NoteTransition::On { note_id, key, velocity } => {
+                    if let Some(vt) = voices.as_deref_mut() {
+                        vt.note_on(note_id, key, 0, ctx.playhead_beats + t * beats_per_frame, secs0 + t / sr, velocity as f32);
+                    }
                     pd.push_note_on(ev.time, key, velocity, 0, note_id)
                 }
-                NoteTransition::Off { note_id, key } => pd.push_note_off(ev.time, key, 0, note_id),
+                NoteTransition::Off { note_id, key } => {
+                    if let Some(vt) = voices.as_deref_mut() {
+                        vt.note_off(note_id, key, secs0 + t / sr);
+                    }
+                    pd.push_note_off(ev.time, key, 0, note_id)
+                }
             }
         }
     }
@@ -673,6 +733,7 @@ fn run_plugin(
             ctx.frames,
             ctx.recording_lanes,
             ctx.mod_plane,
+            voices.as_deref().filter(|v| !v.is_empty()),
         );
     }
     if ports.has_audio_input {
@@ -695,6 +756,15 @@ fn run_plugin(
         return false;
     }
     // ---- outputs ----
+    // r.md #117: plugin がボイスを閉じた通知 (`NoteEnd`) でボイス表から外す。
+    if let Some(vt) = voices {
+        let n_out = pd.n_events_out as usize;
+        for ev in &pd.events_out[..n_out.min(pd.events_out.len())] {
+            if ev.kind == EventKind::NoteEnd {
+                vt.note_end(ev.note_id, ev.key);
+            }
+        }
+    }
     let mut replaced = false;
     if ports.has_note_output {
         midi_b.clear();
@@ -716,7 +786,7 @@ fn run_plugin(
                         key: ev.key,
                     },
                 },
-                EventKind::ParamValue => continue,
+                EventKind::ParamValue | EventKind::NoteEnd => continue,
             };
             if midi_b.len() < midi_b.capacity() {
                 midi_b.push(timed);
@@ -890,6 +960,67 @@ mod tests {
             assert!((bus.0[i] - expect.0[i]).abs() < 1e-5, "L[{i}]: {} vs {}", bus.0[i], expect.0[i]);
             assert!((bus.1[i] - expect.1[i]).abs() < 1e-5, "R[{i}]: {} vs {}", bus.1[i], expect.1[i]);
         }
+    }
+
+    /// r.md #114: `Selector` の空 chain 2 本は **アクティブな 1 本だけ** が入力を受けるので和は
+    /// 入力そのまま (`None` なら 2x)。 アクティブ chain を切り替えると `fade_ms` で線形に
+    /// クロスフェードし (途中も和は入力)、 切替先の chain の PostFx tap がそれを示す。
+    #[test]
+    fn selector_feeds_only_the_active_chain_and_crossfades_on_switch() {
+        let mut song = song_with(vec![parallel(10, vec![chain(11, vec![]), chain(12, vec![])])]);
+        // 8 sample のフェード (48 kHz で 1/6 ms)。
+        song.tracks[0].devices[0].as_parallel_mut().unwrap().split =
+            common::model::Split::Selector { active_chain: 11, fade_ms: 8.0 / 48.0 };
+        let taps: HashSet<(u64, common::model::TapPoint)> = [(12, common::model::TapPoint::PostFx)].into();
+        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &taps);
+        let mut program = built.program;
+        let refs: PluginRefs = std::collections::HashMap::new();
+        let lanes = HashSet::new();
+        fn ctx<'a>(
+            song: &'a Song,
+            refs: &'a PluginRefs,
+            lanes: &'a HashSet<(u32, AutomationTarget)>,
+        ) -> ProgramCtx<'a> {
+            ProgramCtx {
+                song: Some(song),
+                plugin_refs: refs,
+                worker_sync: None,
+                sample_rate: 48_000,
+                frames: 16,
+                playing: true,
+                current_bpm: 120.0,
+                playhead_beats: 0.0,
+                loop_region: LoopRegion::default(),
+                recording_lanes: lanes,
+                mod_plane: ModTickPlaneRef::default(),
+                own_pre_fx: None,
+                rows: TrackRows::default(),
+            }
+        }
+        let mut midi = Vec::with_capacity(MAX_EVENTS);
+        let mut midi_b = Vec::with_capacity(MAX_EVENTS);
+        let len = program.ops.len();
+        // 1 buffer 目: chain 11 がフェードイン (重みは 0 から)、 chain 12 は無音。
+        let (mut l, mut r) = (vec![1.0f32; 16], vec![1.0f32; 16]);
+        {
+            let c = ctx(&song, &refs, &lanes);
+            run_chain_program(&mut program, 0..len, &mut l, &mut r, &mut midi, &mut midi_b, &c);
+        }
+        assert!((l[7] - 1.0).abs() < 1e-5 && (l[15] - 1.0).abs() < 1e-5, "8 sample で入力そのまま: {l:?}");
+        assert!(program.chains[1].post_fx_l[..16].iter().all(|x| *x == 0.0), "chain 12 は無音");
+        // 2 buffer 目: chain 12 へ切替 → 途中も和 = 入力、 chain 12 の入力が 0 → 1 に上がる。
+        assert!(song.tracks[0].devices[0].as_parallel_mut().unwrap().set_active_chain(12));
+        let (mut l, mut r) = (vec![1.0f32; 16], vec![1.0f32; 16]);
+        {
+            let c = ctx(&song, &refs, &lanes);
+            run_chain_program(&mut program, 0..len, &mut l, &mut r, &mut midi, &mut midi_b, &c);
+        }
+        for (i, x) in l.iter().enumerate() {
+            assert!((x - 1.0).abs() < 1e-5, "切替中も和は入力 (i={i}): {x}");
+        }
+        let tap = &program.chains[1].post_fx_l;
+        assert!((tap[3] - 0.5).abs() < 1e-5, "4 sample 目で半分: {}", tap[3]);
+        assert!((tap[7] - 1.0).abs() < 1e-5 && (tap[15] - 1.0).abs() < 1e-5, "8 sample で全部: {tap:?}");
     }
 
     /// gain match: 空 chain 2 本 (和 = 2x) でも、 一定振幅を数秒流せば出力は入力と同じ

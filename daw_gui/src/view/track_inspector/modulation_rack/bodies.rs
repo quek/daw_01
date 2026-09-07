@@ -36,16 +36,16 @@ use super::{
 // 両方を見ること (ラックだけ変えると、 レーン名と呼び名が食い違う)。
 
 /// モジュレーターのツマミ 1 本の記述 ([`mod_param_field`] の引数)。
-struct ModParamField<'a> {
-    sid: u32,
-    param: ModParam,
-    rect: Rect,
+pub(super) struct ModParamField<'a> {
+    pub(super) sid: u32,
+    pub(super) param: ModParam,
+    pub(super) rect: Rect,
     /// dblclick リセット先 (plain 単位)。
-    default_plain: f64,
+    pub(super) default_plain: f64,
     /// 値の後ろに出す単位 (`"Hz"` / `"ms"` / `"\u{00d7}"`)。恒等 0..=1 の欄は空。
-    unit: &'static str,
+    pub(super) unit: &'static str,
     /// 値を書き戻す `Edit` を作る (種別ごとに撃つ event が違うので caller が渡す)。
-    on_change: &'a dyn Fn(f64) -> Edit<AppData>,
+    pub(super) on_change: &'a dyn Fn(f64) -> Edit<AppData>,
 }
 
 /// この欄が **値そのものを編集できるか**。
@@ -78,7 +78,7 @@ fn param_is_read_only(cx: &ModBodyCtx<'_>, sid: u32, param: ModParam) -> bool {
 ///   ◉ で待受中は press+drag が depth 編集に切り替わる (bespoke な widget は作らない)。
 ///
 /// 戻り値 = ドラッグ / 数値入力中か。
-fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: ModParamField<'_>) -> bool {
+pub(super) fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: ModParamField<'_>) -> bool {
     // `mod_param_range` の `None` は「レンジ無し」 ではなく **0..=1 の恒等** (同関数の契約)。
     // widget へ `None` をそのまま渡すと `clamp_opt` が素通しになり、 (a) 0..=1 の外の値が
     // モデルへ入り、 (b) 値→x 写像が立たないので変調の色帯と live tick が描かれない。
@@ -237,7 +237,8 @@ fn cp_to_pos(
             let period = rate.period_beats();
             let anchor = match retrig {
                 RetriggerMode::FromBeat { anchor_beat } => *anchor_beat,
-                RetriggerMode::FreeRun => 0.0,
+                // r.md #117: プレビューは「beat 0 で 1 ノートが鳴った」 として描く。
+                RetriggerMode::FreeRun | RetriggerMode::Note => 0.0,
             };
             (cp * period + anchor, 0.0)
         }
@@ -263,6 +264,7 @@ fn generator_cycle_samples(
         K::Random(c) => (c.rate, c.retrigger),
         K::Steps(c) => (c.rate, c.retrigger),
         K::Mseg(c) => (c.rate, c.retrigger),
+        K::Adsr(c) => return super::bodies_lfo::adsr_preview_samples(c, n),
         K::EnvelopeFollower { .. } => return Vec::new(),
     };
     let span = preview_cycles(kind);
@@ -273,12 +275,29 @@ fn generator_cycle_samples(
     } else {
         0.0
     };
+    // r.md #116: Delay / Fade In は起点からの経過拍で効く **時間包絡**であって波形の形では
+    // ない。 1 周期目をそのまま描くと包絡の途中 (Free なら拍が進まないので包絡 0 = 開始値の
+    // 直線) になるので、 包絡が終わった後の定常 1 周期を描く (Live / Bitwig の表示と同じ)。
+    // Sync は周期の整数倍だけ先へ送って位相を保つ。
+    let settle_beats = match kind {
+        K::Lfo(c) => f64::from(c.delay_beats.max(0.0) + c.fade_in_beats.max(0.0)),
+        _ => 0.0,
+    };
+    let settle_shift = match rate.mode {
+        _ if settle_beats <= 0.0 => 0.0,
+        common::model::ModRateMode::Sync => {
+            let period = rate.period_beats();
+            (settle_beats / period).ceil() * period
+        }
+        common::model::ModRateMode::Free => settle_beats,
+    };
     (0..=n)
         .map(|i| {
             let f = i as f32 / n as f32;
             let cp_s = win_start + f64::from(f) * span;
             let (b, s) = cp_to_pos(&rate, &retrig, cp_s);
-            let v = common::modulators::generator_scalar(kind, ModTime::new(b, s)).unwrap_or(0.0);
+            let v = common::modulators::generator_scalar(kind, ModTime::new(b + settle_shift, s))
+                .unwrap_or(0.0);
             (f, v)
         })
         .collect()
@@ -300,29 +319,99 @@ fn mseg_cursor_phase(c: &common::model::MsegConfig, cp: f64) -> Option<f32> {
     Some(q as f32)
 }
 
-/// generator の現在位相 (0..=1、 ライブカーソル用)。 MSEG は play_mode の fold も反映。
-fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) -> Option<f32> {
+/// r.md #117: このソースが属する track で **いま鳴っているボイス** (engine が publish した
+/// `TrackVoicesTick` の値)。 `Note` 起点のカーソルをボイスごとに描くための起点。
+pub(super) fn owner_track_voices<'a>(
+    cx: &'a ModBodyCtx<'_>,
+    sid: u32,
+) -> impl Iterator<Item = common::audio_bridge::VoiceSnapshot> + 'a {
+    let song = cx.app.song_doc.song();
+    let track_idx = song
+        .mod_source_owner(sid)
+        .and_then(|owner| song.tracks.iter().position(|t| t.id == owner));
+    cx.app
+        .transport
+        .track_voices
+        .iter()
+        .filter(move |(t, _)| Some(*t) == track_idx)
+        .map(|(_, v)| *v)
+}
+
+/// generator のライブカーソル `(位相, 今の値)` と、 包絡で縮んでいる間の **「今の振幅」 の
+/// 波形** (前景の下に薄く重ねる系列)。 MSEG は play_mode の fold も反映。
+///
+/// `Note` 起点は **鳴っているボイスごとに 1 組** (Bitwig の per-voice 表示)。 起点は engine が
+/// publish したボイス表 ([`owner_track_voices`]) で、 鳴っていなければカーソル無し。 同時に
+/// 押したノートは起点が同じなので重なって見える (それが実際の値)。
+///
+/// 点の y は **実際の出力値** (`generator_scalar` = Delay / Fade In 込み) なので、 Fade In の
+/// 途中は前景の線より内側に来る。 LFO はさらにそのボイスの包絡 (`lfo_fade_env`) で縮めた
+/// 1 周期を薄く重ね、 「徐々に大きくなる」 のが形として見える。
+fn generator_cursors(
+    cx: &ModBodyCtx<'_>,
+    src: &ModSourceRow,
+    fg: &Series,
+) -> (Vec<(f32, f32)>, Vec<Series>) {
     use common::model::ModSourceKind as K;
+    let kind = &src.kind;
     let (rate, retrig) = match kind {
         K::Lfo(c) => (c.rate, c.retrigger),
         K::Random(c) => (c.rate, c.retrigger),
         K::Steps(c) => (c.rate, c.retrigger),
         K::Mseg(c) => (c.rate, c.retrigger),
-        K::EnvelopeFollower { .. } => return None,
+        // ADSR は本体側 ([`super::bodies_lfo::adsr_voice_cursors`])、 フォロワーは周期を持たない。
+        K::EnvelopeFollower { .. } | K::Adsr(_) => return (Vec::new(), Vec::new()),
     };
-    let cp = common::modulators::cycle_pos(&rate, ModTime::new(beat, secs), &retrig);
-    let q = match kind {
-        K::Mseg(c) => f64::from(mseg_cursor_phase(c, cp).unwrap_or(0.0)),
-        // Random は preview が再生位置中心のスクロール窓なので、 カーソルも同じ窓内の相対位置
-        // (= 常に実値の上)。 generator_cycle_samples の win_start と一致させる。
-        K::Random(_) => {
-            let span = preview_cycles(kind);
-            let win_start = (cp - span * 0.5).max(0.0);
-            (cp - win_start) / span
+    let times: Vec<ModTime> = if retrig == common::model::RetriggerMode::Note {
+        owner_track_voices(cx, src.id)
+            .map(|v| ModTime::at_note(cx.beat, cx.secs, v.on_beat, v.on_secs, v.off_secs))
+            .collect()
+    } else {
+        vec![ModTime::new(cx.beat, cx.secs)]
+    };
+    let mut cursors = Vec::with_capacity(times.len());
+    let mut envelopes = Vec::new();
+    for t in times {
+        let cp = common::modulators::cycle_pos(&rate, t, &retrig);
+        let q = match kind {
+            K::Mseg(c) => f64::from(mseg_cursor_phase(c, cp).unwrap_or(0.0)),
+            // Random は preview が再生位置中心のスクロール窓なので、 カーソルも同じ窓内の
+            // 相対位置 (= 常に実値の上)。 generator_cycle_samples の win_start と一致させる
+            // (窓は transport 位置で決まる。 `Note` のボイスはその窓内の相対位置)。
+            K::Random(_) => {
+                let span = preview_cycles(kind);
+                let cp_now = common::modulators::cycle_pos(&rate, ModTime::new(cx.beat, cx.secs), &retrig);
+                let win_start = (cp_now - span * 0.5).max(0.0);
+                ((cp - win_start) / span).clamp(0.0, 1.0)
+            }
+            _ => cp.rem_euclid(1.0),
+        };
+        let value = common::modulators::generator_scalar(kind, t).unwrap_or(0.0);
+        #[allow(clippy::cast_possible_truncation)]
+        cursors.push((q as f32, value));
+        if let K::Lfo(c) = kind {
+            let env = common::modulators::lfo_fade_env(c, common::modulators::elapsed_beats(t, &retrig));
+            if env < 1.0
+                && let Some(&(_, start)) = fg.first()
+            {
+                envelopes.push(fg.iter().map(|&(x, v)| (x, start + (v - start) * env)).collect());
+            }
         }
-        _ => cp.rem_euclid(1.0),
+    }
+    (cursors, envelopes)
+}
+
+/// 系列 `s` (x 昇順) の `x` における値 (線形補間)。 クロス変調窓のカーソルの点を線に乗せる。
+fn series_value_at(s: &Series, x: f32) -> f32 {
+    let Some(i) = s.iter().position(|&(sx, _)| sx >= x) else {
+        return s.last().map_or(0.0, |&(_, y)| y);
     };
-    Some(q as f32)
+    if i == 0 {
+        return s[0].1;
+    }
+    let ((x0, y0), (x1, y1)) = (s[i - 1], s[i]);
+    let f = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+    y0 + (y1 - y0) * f
 }
 
 /// rate dropdown + (Hz のとき) 対数 Hz スクラバを描く。 Hz drag 中は true を返す。
@@ -331,7 +420,7 @@ fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) ->
 /// 旧実装は線形 `sensitivity 0.05` の `0.01..=50` で、 (a) 全域に約 1000px のドラッグが
 /// 要り、 (b) `Decimal(2)` なので下端 2 桁が `"0.00"` に潰れ、 (c) 単位表示が無く
 /// 兄弟欄 (`φ` / `w` / `Smooth`) と非対称だった (r.md #88-1/2)。
-fn mod_rate_full(
+pub(super) fn mod_rate_full(
     ui: &mut Ui<'_, AppData>,
     cx: &ModBodyCtx<'_>,
     x: f32,
@@ -373,7 +462,7 @@ fn mod_rate_full(
 const MOD_RATE_FULL_W: f32 = MOD_RATE_DROPDOWN_W + 4.0 + MOD_HZ_W;
 
 /// retrigger トグル: Free ⇄ 「再生位置を起点に restart」 (FromBeat{playhead})。
-fn mod_retrigger_toggle(
+pub(super) fn mod_retrigger_toggle(
     ui: &mut Ui<'_, AppData>,
     rect: Rect,
     retrig: &common::model::RetriggerMode,
@@ -381,25 +470,20 @@ fn mod_retrigger_toggle(
     playhead_beat: f64,
 ) {
     use common::model::RetriggerMode;
-    let from = matches!(retrig, RetriggerMode::FromBeat { .. });
-    ui.button_at(
-        ("inspector_mod_retrig", sid),
-        if from { "\u{27f2}here" } else { "Free" },
-        rect,
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                let next = if from {
-                    RetriggerMode::FreeRun
-                } else {
-                    RetriggerMode::FromBeat { anchor_beat: playhead_beat }
-                };
-                app.handle_event(AppEvent::EditModSource {
-                    id: sid,
-                    edit: crate::app::ModSourceEdit::Retrigger(next),
-                });
-            })
-        },
-    );
+    // r.md #117: `Free` → `⟲here` → `Note` の循環 (Q2 = 1)。
+    let (label, next) = match retrig {
+        RetriggerMode::FreeRun => ("Free", RetriggerMode::FromBeat { anchor_beat: playhead_beat }),
+        RetriggerMode::FromBeat { .. } => ("\u{27f2}here", RetriggerMode::Note),
+        RetriggerMode::Note => ("Note", RetriggerMode::FreeRun),
+    };
+    ui.button_at(("inspector_mod_retrig", sid), label, rect, move || {
+        Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::EditModSource {
+                id: sid,
+                edit: crate::app::ModSourceEdit::Retrigger(next),
+            });
+        })
+    });
 }
 
 /// ソースの **周期位置** (未ラップ、 cycles)。 MSEG のカーソルと Steps の点灯段が
@@ -438,140 +522,26 @@ fn is_cross_modulated(cx: &ModBodyCtx<'_>, sid: u32) -> bool {
 /// なくなるので固定窓では今鳴っている形を描けない。 再生位置中心の時間窓へ倒し、
 /// 変調前の形を薄く重ねる (r.md #89 Q8)。 掛かっていなければ従来どおり 1 周期を固定表示
 /// (基準系列は空 = 描かない)。
-fn preview_series(
+pub(super) fn preview_series(
     cx: &ModBodyCtx<'_>,
     src: &ModSourceRow,
-) -> (Series, Series, Option<f32>) {
+) -> (Series, Vec<Series>, Vec<(f32, f32)>) {
     if is_cross_modulated(cx, src.id) {
         let (fg, ghost) =
             super::preview::cross_mod_window(cx.app, cx.plan, src.id, cx.beat, cx.secs);
-        let cursor = super::preview::cross_mod_cursor(cx.app, cx.plan, src.id, cx.secs);
-        (fg, ghost, cursor)
+        let cursor = super::preview::cross_mod_cursor(cx.app, cx.plan, src.id, cx.secs)
+            .map(|x| (x, series_value_at(&fg, x)));
+        (fg, vec![ghost], cursor.into_iter().collect())
     } else {
-        (
-            generator_cycle_samples(&src.kind, 160, cx.beat, cx.secs),
-            Series::new(),
-            generator_phase(&src.kind, cx.beat, cx.secs),
-        )
+        let fg = generator_cycle_samples(&src.kind, 160, cx.beat, cx.secs);
+        let (cursors, envelopes) = generator_cursors(cx, src, &fg);
+        (fg, envelopes, cursors)
     }
 }
 
-/// LFO 本体 (プレビュー / shape / rate / φ / Pulse width / retrigger)。
-pub(super) fn draw_lfo_body(
-    ui: &mut Ui<'_, AppData>,
-    cx: &ModBodyCtx<'_>,
-    src: &ModSourceRow,
-    c: &common::model::LfoConfig,
-    mut y: f32,
-) -> (f32, bool) {
-    use crate::app::ModSourceEdit as E;
-    let (sid, lx, p) = (src.id, cx.lx, &cx.app.theme.core);
-    let mut drag = false;
-
-    let (fg, ghost, cursor) = preview_series(cx, src);
-    ui.signal_preview(
-        ("inspector_lfo_prev", sid),
-        Rect { x: lx, y, w: cx.row_w, h: MOD_CANVAS_H },
-        &fg,
-        &ghost,
-        cursor,
-        cx.editor,
-    );
-    y += MOD_CANVAS_H + 4.0;
-
-    // row A: shape + rate(+Hz)
-    let shapes = ["Sin", "Tri", "SawU", "SawD", "Sqr", "Pulse"];
-    let ssel = match c.shape {
-        common::model::LfoShape::Sine => 0,
-        common::model::LfoShape::Triangle => 1,
-        common::model::LfoShape::SawUp => 2,
-        common::model::LfoShape::SawDown => 3,
-        common::model::LfoShape::Square => 4,
-        common::model::LfoShape::Pulse { .. } => 5,
-    };
-    // Pulse の現 width を保持して shape 切替時に維持。
-    let cur_width = if let common::model::LfoShape::Pulse { width } = c.shape { width } else { 0.5 };
-    if let Some(pick) = ui.dropdown(
-        ("inspector_lfo_shape", sid),
-        Rect { x: lx, y, w: 56.0, h: ROW_H },
-        &shapes,
-        ssel,
-    ) {
-        let shape = match pick {
-            0 => common::model::LfoShape::Sine,
-            1 => common::model::LfoShape::Triangle,
-            2 => common::model::LfoShape::SawUp,
-            3 => common::model::LfoShape::SawDown,
-            4 => common::model::LfoShape::Square,
-            _ => common::model::LfoShape::Pulse { width: cur_width },
-        };
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoShape(shape) });
-        }));
-    }
-    drag |= mod_rate_full(ui, cx, lx + 62.0, y, &c.rate, sid);
-    y += ROW_PITCH;
-
-    // row B: φ phase + (Pulse width) + retrig
-    ui.label_at(("inspector_lfo_ph_lbl", sid), "\u{03c6}", lx, y + 4.0, 10.0, p.text);
-    drag |= mod_param_field(
-        ui,
-        cx,
-        ModParamField {
-            sid,
-            param: ModParam::LfoPhase,
-            rect: Rect { x: lx + 12.0, y, w: 50.0, h: ROW_H },
-            default_plain: 0.0,
-            unit: "",
-            on_change: &move |v| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::EditModSource {
-                        id: sid,
-                        edit: E::LfoPhase(v as f32),
-                    });
-                })
-            },
-        },
-    );
-    let mut next_x = lx + 68.0;
-    if matches!(c.shape, common::model::LfoShape::Pulse { .. }) {
-        ui.label_at(("inspector_lfo_w_lbl", sid), "w", next_x, y + 4.0, 10.0, p.text);
-        drag |= draw_lfo_width_field(ui, cx, sid, next_x + 12.0, y);
-        next_x += 64.0;
-    }
-    mod_retrigger_toggle(ui, Rect { x: next_x, y, w: 56.0, h: ROW_H }, &c.retrigger, sid, cx.beat);
-    (y + ROW_PITCH, drag)
-}
-
-/// Pulse の duty (`w`) 欄。 **`draw_lfo_body` の `if` の中に置かない** — 閉包 + 構造体
-/// リテラルが重なってインデントが 7 段に届き、 1 関数 6 段の budget を割る (不変条件 9)。
-fn draw_lfo_width_field(
-    ui: &mut Ui<'_, AppData>,
-    cx: &ModBodyCtx<'_>,
-    sid: u32,
-    x: f32,
-    y: f32,
-) -> bool {
-    use crate::app::ModSourceEdit as E;
-    mod_param_field(
-        ui,
-        cx,
-        ModParamField {
-            sid,
-            param: ModParam::LfoPulseWidth,
-            rect: Rect { x, y, w: 46.0, h: ROW_H },
-            default_plain: 0.5,
-            unit: "",
-            on_change: &move |v| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::EditModSource {
-                        id: sid,
-                        edit: E::LfoShape(common::model::LfoShape::Pulse { width: v as f32 }),
-                    });
-                })
-            },
-        },
-    )
+/// [`Ui::signal_preview`] へ渡す比較系列の借用列。
+pub(super) fn series_refs(s: &[Series]) -> Vec<&[(f32, f32)]> {
+    s.iter().map(Vec::as_slice).collect()
 }
 
 /// Random 本体 (プレビュー / Smooth / rate / 引き直し / retrigger)。
@@ -586,13 +556,13 @@ pub(super) fn draw_random_body(
     let (sid, lx, p) = (src.id, cx.lx, &cx.app.theme.core);
     let mut drag = false;
 
-    let (fg, ghost, cursor) = preview_series(cx, src);
+    let (fg, ghosts, cursors) = preview_series(cx, src);
     ui.signal_preview(
         ("inspector_rand_prev", sid),
         Rect { x: lx, y, w: cx.row_w, h: MOD_CANVAS_H },
         &fg,
-        &ghost,
-        cursor,
+        &series_refs(&ghosts),
+        &cursors,
         cx.editor,
     );
     y += MOD_CANVAS_H + 4.0;
@@ -1018,4 +988,37 @@ pub(super) fn draw_follower_body(
         },
     );
     (y + ROW_PITCH, drag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generator_cycle_samples;
+    use common::model::{LfoConfig, LfoShape, ModRate, ModRateMode, ModSourceKind, RetriggerMode};
+
+    /// r.md #116: Fade In / Delay を付けても、 プレビューは包絡が終わった後の定常 1 周期を
+    /// 描く (Free では拍が進まないので 1 周期目を描くと包絡 0 = 開始値の直線になっていた)。
+    #[test]
+    fn preview_draws_the_settled_cycle_past_delay_and_fade() {
+        let lfo = |mode: ModRateMode, retrigger: RetriggerMode| {
+            ModSourceKind::Lfo(LfoConfig {
+                shape: LfoShape::Sine,
+                rate: ModRate { mode, hz: 6.88, ..ModRate::default() },
+                retrigger,
+                delay_beats: 1.0,
+                fade_in_beats: 6.54,
+                ..LfoConfig::default()
+            })
+        };
+        for (mode, retrig) in [
+            (ModRateMode::Free, RetriggerMode::FreeRun),
+            (ModRateMode::Free, RetriggerMode::Note),
+            (ModRateMode::Sync, RetriggerMode::FreeRun),
+            (ModRateMode::Sync, RetriggerMode::Note),
+        ] {
+            let pts = generator_cycle_samples(&lfo(mode, retrig), 64, 0.0, 0.0);
+            let (lo, hi) = pts.iter().fold((1.0f32, 0.0f32), |(lo, hi), &(_, v)| (lo.min(v), hi.max(v)));
+            assert!(hi - lo > 0.9, "{mode:?}/{retrig:?}: 直線になっている lo={lo} hi={hi}");
+            assert!((pts[0].1 - 0.5).abs() < 0.05, "{mode:?}/{retrig:?}: 位相が保たれていない {}", pts[0].1);
+        }
+    }
 }

@@ -172,30 +172,7 @@ impl AppData {
             // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
             loudness: crate::state::LoudnessState::default(),
             song_doc: SongDoc::new(song),
-            transport: TransportState {
-                metronome_enabled: false,
-                is_playing: false,
-                preroll_remaining: 0,
-                loop_region: common::model::LoopRegion::default(),
-                playhead_beat: None,
-                playback_origin_beat: None,
-                panic_reinit_due: None,
-                panic_release_pending: false,
-                master_meter: crate::master_meter::MasterMeterSnapshot::default(),
-                track_peak_display: initial_peak_display,
-                master_strip_gr: (0.0, 0.0),
-                mod_plane: common::mod_plane::ModPlane::default(),
-                pending_play: false,
-                pending_play_record: None,
-                export_stage: None,
-                export_progress_at: None,
-                export_cancel: None,
-                pending_video_export: None,
-                export_temp_wav: None,
-                pending_video_export_range: None,
-                pending_video_export_dims: None,
-                pending_export: None,
-            },
+            transport: TransportState::new(initial_peak_display),
             selection: SelectionState {
                 selected_track_ids: Vec::new(),
                 selected_section_ids: Vec::new(),
@@ -380,6 +357,7 @@ impl AppData {
                 mixer_hovered_track: None,
                 mixer_hovered_strip_section: None,
                 inspector_hovered_device: None,
+                inspector_hovered_mod: None,
                 master_hovered_section: None,
                 master_gain_dragging: false,
                 voicevox_chunk_editing: false,
@@ -387,6 +365,7 @@ impl AppData {
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
+                pianoroll_hover_pitch: None,
                 pending_clipboard_write: None,
                 editing_automation_point: None,
                 last_touched_param: None,
@@ -677,6 +656,7 @@ impl AppData {
             AppEvent::PlayFromCursor { beat } => {
                 self.action_play_from_cursor(beat);
             }
+            AppEvent::PlayContinue => self.play_continue(),
             AppEvent::GotoTimelineHome => {
                 self.goto_timeline_home();
             }
@@ -1483,6 +1463,10 @@ impl AppData {
                 source_id,
                 bipolar,
             } => self.set_mod_routing_polarity(track_id, target, source_id, bipolar),
+            AppEvent::SetModRoutingEnabled { routing_id, enabled } => {
+                self.set_mod_routing_enabled(routing_id, enabled)
+            }
+            AppEvent::SetModSourceEnabled { id, enabled } => self.set_mod_source_enabled(id, enabled),
             AppEvent::SetModSourceTap { id, source } => {
                 self.set_mod_source_tap_source(id, source)
             }
@@ -1624,6 +1608,7 @@ impl AppData {
                 // extra GUI smoothing). Zero-copy: move the polled plane in。
                 self.transport.mod_plane = plane;
             }
+            AppEvent::TrackVoicesTick(voices) => self.transport.track_voices = voices,
             AppEvent::AddReturnTrack => {
                 self.action_add_return_track();
             }

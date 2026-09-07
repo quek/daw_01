@@ -69,7 +69,16 @@ pub enum RetriggerMode {
 }
 
 pub enum LfoShape { Sine, Triangle, SawUp, SawDown, Square, Pulse { width: f32 } }
-pub struct LfoConfig { pub shape: LfoShape, pub rate: ModRate, pub phase: f32, pub retrigger: RetriggerMode }
+pub struct LfoConfig { pub shape: LfoShape, pub rate: ModRate, pub phase: f32, pub retrigger: RetriggerMode,
+    // r.md #116 (Live LFO / Bitwig LFO): どれも曲位置の純関数のまま。既定は全部「効かない」側。
+    pub shape_amt: f32,     // Shape: 位相の曲げ 0..=1 (0.5 = そのまま)。ModParam::LfoShapeAmt
+    pub steps: u8,          // Steps: 出力を n 段に量子化 (0/1 = off、最大 24)
+    pub jitter: f32,        // Jitter: seed × 周期位置の決定論的乱れ (1 周 8 段、線形補間)。ModParam::LfoJitter
+    pub smooth: f32,        // Smooth: 前後 smooth×1/4 周の箱平均 (9 点)。ModParam::LfoSmooth
+    pub seed: u64,
+    pub delay_beats: f32,   // Delay: retrigger 起点 (FromBeat の anchor / FreeRun は曲頭) からこの拍数は開始値
+    pub fade_in_beats: f32, // Fade In: その後この拍数で開始値 → 波形へ線形。両方 0 なら従来どおり
+}
 
 pub enum RandomMode { Smooth, SampleHold }  // Smooth=step 間補間, SampleHold=階段
 pub struct RandomConfig { pub rate: ModRate, pub mode: RandomMode, pub seed: u64, pub retrigger: RetriggerMode }

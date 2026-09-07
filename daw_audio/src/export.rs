@@ -725,7 +725,14 @@ fn render_loop(
                     _ => 0.0,
                 }
             };
-            mod_tick.run_buffer(song, playhead, frames as u32, sample_rate, follower_env)
+            // r.md #117: live と同じ規則で `Note` 起点の最新ノートを渡す (書き出しの再現)。
+            let plan = std::sync::Arc::clone(&mod_tick.plan);
+            let scratch_ref = &*scratch;
+            let note_anchor = |plan_slot: u16| -> Option<common::mod_graph::NoteAnchor> {
+                let idx = plan.nodes.get(usize::from(plan_slot))?.owner_track_index?;
+                scratch_ref.get(idx as usize)?.state.latest_note
+            };
+            mod_tick.run_buffer(song, playhead, frames as u32, sample_rate, follower_env, note_anchor)
         };
         playhead_beats = head_mark.beat;
         let smoothed_current_bpm_freewheel = head_mark.bpm;

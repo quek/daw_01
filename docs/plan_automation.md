@@ -429,7 +429,11 @@ TRK2   │[━━━━━━━ Bass Loop ━━━━━━━━━━━━�
   (名前は target に応じて display 文字列、色は lane 識別色)
 - enabled (bypass) の切替はヘッダにボタンを置かず **Q キー (ポインタ下のレーン)**。
   バイパス中は名前を減光し clip を灰色化する。レーンの非表示はボタンを持たない
-  (param を触った自動生成だけが隠す、戻すのは Alt+A)
+  (param を触った自動生成だけが隠す、戻すのは Alt+A)。 r.md #115: 変調も同じ Q —
+  インスペクタの変調ラックでポインタ下のモジュレーター (ヘッダ / 本体、 `ModSource::enabled`)
+  または routing 行 (`ModRouting::enabled`) をバイパス切替。 バイパス中の source は評価計画
+  (`mod_graph::build_plan`) から外れ、 routing は合成 (`modulation_offset_norm_with`) が飛ばす
+  (0 を足すのではなく除外 — Bipolar は scalar 0 でも `-depth` を出すため)。
 - curve 内で point drag、Shift+click で curve type 切替メニュー、Alt+click で 1 point
   insert、Ctrl+click で point 削除
 

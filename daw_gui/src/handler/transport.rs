@@ -42,6 +42,7 @@ impl AppData {
         // (解析中はオーディオ出力が無音化され、プラグインは走査スレッドが占有する
         // ので、そもそも音は出せない)。
         if self.offline_render_busy() {
+            self.transport.play_origin_override = None;
             self.ui_ephemeral.status_message = if self.loudness.phase.is_busy() {
                 "ラウドネス解析中は再生できません".into()
             } else if !self.export_or_analysis_busy() {
@@ -86,7 +87,10 @@ impl AppData {
         // Pro Tools 流の「Stop で開始位置に戻る」 用に、 実際の再生
         // 開始時の playhead を保存。 ruler クリック等で playhead を
         // 移動してから play した場合は、 その位置が origin になる。
-        self.transport.playback_origin_beat = Some(self.transport.playhead_beat.unwrap_or(0.0));
+        // r.md #118: 停止点からの再開 (`play_continue`) はホームを据え置くので上書きを消費する。
+        let resume = self.transport.play_origin_override.take();
+        let origin = resume.unwrap_or_else(|| self.transport.playhead_beat.unwrap_or(0.0));
+        self.transport.playback_origin_beat = Some(origin);
         if let Some(preroll_samples) = record {
             // 録音の開始は Play より先に届ける必要がある (engine は届いた順に
             // 消費するので、逆順だと 1 バッファぶん曲が進んでから count-in / 録音に
@@ -95,7 +99,13 @@ impl AppData {
             // publish を始める。
             self.send_audio(AudioCommand::StartRecording { preroll_samples });
         }
-        self.send_audio(AudioCommand::Play);
+        // r.md #118: 停止点からの再開はセッションのセルも頭出しせず続きから鳴らす
+        // (engine は `PlayContinue` で launcher の再シードを飛ばす)。
+        self.send_audio(if resume.is_some() {
+            AudioCommand::PlayContinue
+        } else {
+            AudioCommand::Play
+        });
         // r.md #50: 走り出すたびに積算ラウドネス一式をリセットする
         // (Cubase の "Reset on Start" 相当)。曲を頭から通せば「この曲の
         // ラウドネス」がそのまま出る、という grill-me の決定。
@@ -132,6 +142,9 @@ impl AppData {
         self.ui_ephemeral.home_toggle_at_first = false;
         self.transport.playhead_beat = Some(beat as f32);
         self.transport.playback_origin_beat = Some(beat as f32);
+        // r.md #118: 明示 seek は「ここに戻る」 の意思なので、 queue 中の「停止点から再開」 の
+        // ホーム上書きは打ち消す (発火時に旧ホームが勝たないように)。
+        self.transport.play_origin_override = None;
         // ensure-synced: 換算は song のテンポカーブを使う。 直前の BPM 編集が
         // 未 flush だと engine の再生グリッドが旧 tempo のままで seek 位置がずれる。
         // epoch 未変化なら no-op。
@@ -154,6 +167,31 @@ impl AppData {
         self.seek_playhead_to(beat);
         if !self.transport.is_playing {
             self.play();
+        }
+    }
+
+    /// r.md #118 (Live の Shift+Space「停止した位置から再生を続ける」): 直前に止まった位置
+    /// ([`TransportState::stop_point`]) にプレイヘッドを置いて再生する。 **ホームは
+    /// 動かさない** — 次の Stop は元のホーム (= Live の insert marker) へ戻る。 再生中は
+    /// 何もしない。 まだ一度も止まっていなければ普通の再生 (Space と同じ)。
+    pub(crate) fn play_continue(&mut self) {
+        if self.transport.is_playing {
+            return;
+        }
+        let Some(sp) = self.transport.stop_point else {
+            self.play();
+            return;
+        };
+        self.transport.playhead_beat = Some(sp.beat);
+        // seek と同じ経路 (テンポカーブの積分)。 `seek_playhead_to` を呼ばないのは、 あれが
+        // ホームも停止点の位置へ更新してしまうため。
+        self.flush_song_sync();
+        let samples =
+            common::automation::beats_to_samples(self.song_doc.song(), self.ipc.sample_rate, f64::from(sp.beat));
+        self.send_audio(AudioCommand::SeekTo { samples });
+        self.transport.play_origin_override = sp.home;
+        if self.play() == PlayOutcome::Refused {
+            self.transport.play_origin_override = None;
         }
     }
 
@@ -274,6 +312,11 @@ impl AppData {
     /// **すべてここへ収束する**。「どんな止まり方でも再生を押した位置へ戻る」
     /// (r.md #50 の停止ホーム契約) を 1 箇所で保証するための合流点。
     pub(crate) fn on_transport_stopped(&mut self) {
+        // r.md #118: ホームへ戻す前に「どこで止まったか」 を覚える (Shift+Space の再開点)。
+        if let Some(beat) = self.transport.playhead_beat {
+            self.transport.stop_point =
+                Some(crate::state::StopPoint { beat, home: self.transport.playback_origin_beat });
+        }
         // Pro Tools 流: 停止時に playhead を「再生開始位置」 (= 直前の
         // play() 呼び出し時点の playhead) に戻す。 GUI 側 playhead_beat
         // の即時上書きと、 audio engine への SeekTo IPC を 1 セットで
@@ -431,5 +474,51 @@ impl AppData {
         if !self.transport.is_playing {
             self.play();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::state::StopPoint;
+    use crate::test_support::headless_app;
+
+    /// r.md #118: Shift+Space は「止まった位置」 から再生し、 ホームは元のまま (次の Stop は
+    /// 元のホームへ戻る = Live の insert marker)。 停止点は明示 seek でも消えず、 止まる
+    /// たびに更新される。 一度も止まっていなければ普通の再生。
+    #[test]
+    fn play_continue_resumes_at_the_stop_point_without_moving_home() {
+        let mut app = headless_app();
+        // まだ止まっていない: 普通の再生 (ホーム = 現在位置)。
+        app.transport.playhead_beat = Some(4.0);
+        app.play_continue();
+        assert_eq!(app.transport.playback_origin_beat, Some(4.0));
+
+        // 9 拍目で止まる → ホーム (4) へ戻り、 停止点 (9, home 4) を覚える。
+        app.transport.is_playing = true;
+        app.transport.playhead_beat = Some(9.0);
+        app.transport.is_playing = false;
+        app.on_transport_stopped();
+        assert_eq!(app.transport.playhead_beat, Some(4.0), "Stop はホームへ戻る");
+        assert_eq!(app.transport.stop_point, Some(StopPoint { beat: 9.0, home: Some(4.0) }));
+
+        // 明示 seek (ruler click / F) はホームを動かすが停止点は消さない。
+        app.seek_playhead_to(2.0);
+        assert_eq!(app.transport.stop_point.map(|s| s.beat), Some(9.0));
+
+        // Shift+Space: 9 から再生、 ホームは 4 のまま (seek した 2 でもない)。
+        app.play_continue();
+        assert_eq!(app.transport.playhead_beat, Some(9.0));
+        assert_eq!(app.transport.playback_origin_beat, Some(4.0), "ホームは据え置き");
+        assert_eq!(app.transport.play_origin_override, None, "上書きは消費済み");
+
+        // 12 で止まる → 4 へ戻り、 停止点は 12 に更新。 再生中の Shift+Space は無視。
+        app.transport.is_playing = true;
+        app.transport.playhead_beat = Some(12.0);
+        app.play_continue();
+        assert_eq!(app.transport.playhead_beat, Some(12.0), "再生中は何もしない");
+        app.transport.is_playing = false;
+        app.on_transport_stopped();
+        assert_eq!(app.transport.playhead_beat, Some(4.0));
+        assert_eq!(app.transport.stop_point, Some(StopPoint { beat: 12.0, home: Some(4.0) }));
     }
 }

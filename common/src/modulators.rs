@@ -25,10 +25,25 @@ use std::f64::consts::TAU;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GenParams {
     pub cycle_pos: f64,
+    /// r.md #116: retrigger の起点からの経過拍 (`FromBeat` は anchor から、 `FreeRun` は曲頭から、
+    /// `Note` は note-on から)。 LFO の Delay / Fade In が読む。 rate の変調とは無関係 (時間そのもの)。
+    pub elapsed_beats: f64,
+    /// r.md #117: 起点からの経過秒 (ADSR の時間軸)。
+    pub elapsed_secs: f64,
+    /// r.md #117: note-off からの経過秒 (`None` = 押している / ノート起点でない)。
+    pub released_secs: Option<f64>,
+    /// r.md #117: ADSR の `[attack_ms, decay_ms, sustain, release_ms]` (変調後の実効値)。
+    pub adsr: [f32; 4],
     /// LFO の開始位相 (0..=1)。
     pub lfo_phase: f32,
     /// LFO Pulse の duty (0..=1)。
     pub pulse_width: f32,
+    /// r.md #116: LFO の Shape (位相の曲げ、 0.5 = そのまま)。
+    pub lfo_shape_amt: f32,
+    /// r.md #116: LFO の Jitter (0..=1)。
+    pub lfo_jitter: f32,
+    /// r.md #116: LFO の Smooth (0..=1)。
+    pub lfo_smooth: f32,
     /// Random の Stepped↔Smoothed モーフ (0..=1)。
     pub random_smooth: f32,
     /// Steps の slew (0..=1)。
@@ -38,21 +53,32 @@ pub struct GenParams {
 impl GenParams {
     /// 変調が無いときの値 (config そのまま)。
     #[must_use]
-    pub fn from_config(kind: &ModSourceKind, cycle_pos: f64) -> Self {
-        let (lfo_phase, pulse_width) = match kind {
-            ModSourceKind::Lfo(c) => (
-                c.phase,
-                match c.shape {
-                    LfoShape::Pulse { width } => width,
-                    _ => 0.5,
-                },
-            ),
-            _ => (0.0, 0.5),
+    pub fn from_config(kind: &ModSourceKind, cycle_pos: f64, t: ModTime, retrigger: &RetriggerMode) -> Self {
+        let lfo = match kind {
+            ModSourceKind::Lfo(c) => Some(c),
+            _ => None,
+        };
+        let released_secs = match retrigger {
+            RetriggerMode::Note => t.release_secs.map(|r| t.secs - r).filter(|d| *d >= 0.0),
+            _ => None,
         };
         Self {
             cycle_pos,
-            lfo_phase,
-            pulse_width,
+            elapsed_beats: elapsed_beats(t, retrigger),
+            elapsed_secs: elapsed_secs(t, retrigger),
+            released_secs,
+            adsr: match kind {
+                ModSourceKind::Adsr(c) => [c.attack_ms, c.decay_ms, c.sustain, c.release_ms],
+                _ => [0.0; 4],
+            },
+            lfo_phase: lfo.map_or(0.0, |c| c.phase),
+            pulse_width: match lfo.map(|c| c.shape) {
+                Some(LfoShape::Pulse { width }) => width,
+                _ => 0.5,
+            },
+            lfo_shape_amt: lfo.map_or(0.5, |c| c.shape_amt),
+            lfo_jitter: lfo.map_or(0.0, |c| c.jitter),
+            lfo_smooth: lfo.map_or(0.0, |c| c.smooth),
             random_smooth: match kind {
                 ModSourceKind::Random(c) => c.smooth,
                 _ => 0.0,
@@ -62,6 +88,28 @@ impl GenParams {
                 _ => 0.0,
             },
         }
+    }
+}
+
+/// r.md #116: retrigger の起点からの経過拍 (LFO の Delay / Fade In の時間軸)。 `Note` は
+/// note-on (`t.anchor_beat`) から。
+#[inline]
+#[must_use]
+pub fn elapsed_beats(t: ModTime, retrigger: &RetriggerMode) -> f64 {
+    match retrigger {
+        RetriggerMode::FreeRun => t.beat,
+        RetriggerMode::FromBeat { anchor_beat } => t.beat - anchor_beat,
+        RetriggerMode::Note => t.beat - t.anchor_beat,
+    }
+}
+
+/// 起点からの経過秒 (ADSR の時間軸)。 `FreeRun` は曲頭から。
+#[inline]
+#[must_use]
+pub fn elapsed_secs(t: ModTime, retrigger: &RetriggerMode) -> f64 {
+    match retrigger {
+        RetriggerMode::FreeRun => t.secs,
+        RetriggerMode::FromBeat { .. } | RetriggerMode::Note => t.secs - t.anchor_secs,
     }
 }
 
@@ -76,19 +124,57 @@ pub fn eval_generator(kind: &ModSourceKind, p: GenParams) -> Option<f32> {
         ModSourceKind::Random(c) => Some(eval_random(c, p)),
         ModSourceKind::Mseg(c) => Some(eval_mseg(c, p)),
         ModSourceKind::Steps(c) => Some(eval_steps(c, p)),
+        ModSourceKind::Adsr(_) => Some(eval_adsr(p)),
     }
 }
 
 /// 変調が無い generator の出力スカラー (unipolar 0..=1)。閉形式なので O(1)。
-/// envelope follower は `None`。
+/// envelope follower は `None`。 `Note` 起点のソースは `t.anchor_*` (note-on) と
+/// `t.release_secs` (note-off) を呼び側が埋める (per-note の評価点 = engine の voice 表 /
+/// global の最新ノート / GUI プレビュー)。
 #[inline]
 pub fn generator_scalar(kind: &ModSourceKind, t: ModTime) -> Option<f32> {
-    let (rate, retrig) = match (kind.rate(), kind.retrigger()) {
-        (Some(r), Some(rt)) => (r, rt),
-        _ => return None,
+    let retrig = kind.retrigger()?;
+    let cp = kind.rate().map_or(0.0, |rate| cycle_pos(&rate, t, &retrig));
+    eval_generator(kind, GenParams::from_config(kind, cp, t, &retrig))
+}
+
+/// r.md #117: ADSR (時間は秒)。 `t_on` = note-on からの秒、 `released` = note-off からの秒
+/// (`None` = 押している)。 attack 線形、 decay / release は `exp(-3 t / T)`。
+#[inline]
+#[must_use]
+pub fn adsr_env(attack_ms: f32, decay_ms: f32, sustain: f32, release_ms: f32, t_on: f64, released: Option<f64>) -> f32 {
+    if t_on < 0.0 {
+        return 0.0;
+    }
+    let s = f64::from(sustain.clamp(0.0, 1.0));
+    let a = f64::from(attack_ms.max(0.0)) * 1e-3;
+    let d = f64::from(decay_ms.max(0.0)) * 1e-3;
+    let held = |t: f64| -> f64 {
+        if t < a {
+            if a > 0.0 { t / a } else { 1.0 }
+        } else if d > 0.0 {
+            s + (1.0 - s) * (-3.0 * (t - a) / d).exp()
+        } else {
+            s
+        }
     };
-    let cp = cycle_pos(&rate, t, &retrig);
-    eval_generator(kind, GenParams::from_config(kind, cp))
+    let v = match released {
+        None => held(t_on),
+        Some(tr) if tr <= 0.0 => held(t_on),
+        Some(tr) => {
+            let r = f64::from(release_ms.max(0.0)) * 1e-3;
+            let at_off = held(t_on - tr);
+            if r > 0.0 { at_off * (-3.0 * tr / r).exp() } else { 0.0 }
+        }
+    };
+    v.clamp(0.0, 1.0) as f32
+}
+
+#[inline]
+fn eval_adsr(g: GenParams) -> f32 {
+    let [a, d, s, r] = g.adsr;
+    adsr_env(a, d, s, r, g.elapsed_secs, g.released_secs)
 }
 
 /// 生成器を評価する時刻。`anchor_secs` は [`RetriggerMode::FromBeat`] の
@@ -102,7 +188,11 @@ pub fn generator_scalar(kind: &ModSourceKind, t: ModTime) -> Option<f32> {
 pub struct ModTime {
     pub beat: f64,
     pub secs: f64,
-    /// `FromBeat { anchor_beat }` を秒へ換算したもの。`FreeRun` では使わない。
+    /// r.md #117: `Note` の起点 (note-on の拍)。 `FromBeat` / `FreeRun` では使わない。
+    pub anchor_beat: f64,
+    /// r.md #117: `Note` の note-off の絶対秒 (`None` = 押している)。 ADSR の release が読む。
+    pub release_secs: Option<f64>,
+    /// `FromBeat { anchor_beat }` を秒へ換算したもの (`Note` では note-on の秒)。`FreeRun` では使わない。
     pub anchor_secs: f64,
 }
 
@@ -110,7 +200,13 @@ impl ModTime {
     /// テンポ一定 (または Sync のみ使う) 文脈の簡易構築。
     #[must_use]
     pub fn new(beat: f64, secs: f64) -> Self {
-        Self { beat, secs, anchor_secs: 0.0 }
+        Self { beat, secs, anchor_beat: 0.0, release_secs: None, anchor_secs: 0.0 }
+    }
+
+    /// r.md #117: note-on `(anchor_beat, anchor_secs)` を起点にした時刻 (`Note` 用)。
+    #[must_use]
+    pub fn at_note(beat: f64, secs: f64, anchor_beat: f64, anchor_secs: f64, release_secs: Option<f64>) -> Self {
+        Self { beat, secs, anchor_beat, release_secs, anchor_secs }
     }
 }
 
@@ -126,17 +222,11 @@ impl ModTime {
 pub fn cycle_pos(rate: &ModRate, t: ModTime, retrigger: &RetriggerMode) -> f64 {
     match rate.mode {
         crate::model::ModRateMode::Sync => {
-            let beat = match retrigger {
-                RetriggerMode::FreeRun => t.beat,
-                RetriggerMode::FromBeat { anchor_beat } => t.beat - anchor_beat,
-            };
+            let beat = elapsed_beats(t, retrigger);
             beat / rate.period_beats()
         }
         crate::model::ModRateMode::Free => {
-            let secs = match retrigger {
-                RetriggerMode::FreeRun => t.secs,
-                RetriggerMode::FromBeat { .. } => t.secs - t.anchor_secs,
-            };
+            let secs = elapsed_secs(t, retrigger);
             secs * f64::from(rate.hz.clamp(
                 crate::model::MOD_RATE_HZ_MIN,
                 crate::model::MOD_RATE_HZ_MAX,
@@ -172,15 +262,117 @@ pub fn lfo_shape_value(shape: LfoShape, p: f64) -> f32 {
     v as f32
 }
 
+/// r.md #116 Shape: 位相 `p` (0..=1) を `amt` で曲げる区分線形写像。 `amt = 0.5` は恒等
+/// (Live "bends or skews")。 継ぎ目 (位相の進む速さが変わる点) は **波形の傾きが 0 の点**に
+/// 置き、 出力の傾きが不連続にならないようにする:
+/// - Sine (山 p = 0.25 / 谷 p = 0.75): 山を `amt` の位置 `c` (0.01..0.49) へ、 谷を `1 - c` へ寄せる
+///   3 区間。 折り返し (p = 0) の前後は同じ速さなので全域で傾きが連続。 `amt → 0` で山が
+///   先頭に寄ってなだらかな SawDown、 `→ 1` で SawUp に近づく。
+/// - それ以外 (Triangle の山 p = 0.5 / 谷 p = 0、 Saw / Square / Pulse): 中点 (p = 0.5) を `amt`
+///   の位置へ寄せる 2 区間。 Triangle は `amt → 0` で SawDown、 `→ 1` で SawUp、 Square は
+///   duty が変わる。
 #[inline]
-fn eval_lfo(c: &LfoConfig, g: GenParams) -> f32 {
-    let p = g.cycle_pos + f64::from(g.lfo_phase);
+fn warp_phase(shape: LfoShape, p: f64, amt: f32) -> f64 {
+    let amt = f64::from(amt.clamp(0.0, 1.0));
+    match shape {
+        LfoShape::Sine => {
+            let c = amt * 0.48 + 0.01;
+            if p < c {
+                0.25 * p / c
+            } else if p < 1.0 - c {
+                0.25 + 0.5 * (p - c) / (1.0 - 2.0 * c)
+            } else {
+                0.75 + 0.25 * (p - (1.0 - c)) / c
+            }
+        }
+        _ => {
+            let c = amt * 0.96 + 0.02;
+            if p < c { 0.5 * p / c } else { 0.5 + 0.5 * (p - c) / (1.0 - c) }
+        }
+    }
+}
+
+/// r.md #116 Jitter の乱数 (unipolar 0..=1): 1 周を [`LFO_JITTER_STEPS_PER_CYCLE`] 段に切り、
+/// 段の間は線形補間 (段差クリックを出さない)。 `seed` と周期位置の純関数。
+#[inline]
+fn jitter_noise(seed: u64, cycle_pos: f64) -> f32 {
+    let x = cycle_pos * crate::model::LFO_JITTER_STEPS_PER_CYCLE;
+    let step = x.floor();
+    let frac = (x - step) as f32;
+    lerp(random_unit(seed, step as i64), random_unit(seed, step as i64 + 1), frac)
+}
+
+/// Smooth 以外を掛けた 1 点の LFO 値 (波形 → Shape → Steps → Jitter)。
+#[inline]
+fn lfo_point(c: &LfoConfig, g: GenParams, cycle_pos: f64) -> f32 {
+    let p = (cycle_pos + f64::from(g.lfo_phase)).rem_euclid(1.0);
+    let p = warp_phase(c.shape, p, g.lfo_shape_amt);
     // Pulse の duty は変調されうるので `GenParams` 側を使う (config の値は base)。
     let shape = match c.shape {
         LfoShape::Pulse { .. } => LfoShape::Pulse { width: g.pulse_width },
         other => other,
     };
-    lfo_shape_value(shape, p)
+    let mut v = lfo_shape_value(shape, p);
+    if c.steps >= 2 {
+        let n = f32::from(c.steps.min(crate::model::LFO_STEPS_MAX));
+        v = (v * n).floor().min(n - 1.0) / (n - 1.0);
+    }
+    let jitter = g.lfo_jitter.clamp(0.0, 1.0);
+    if jitter > 0.0 {
+        v += jitter * (jitter_noise(c.seed, cycle_pos) - 0.5);
+    }
+    v.clamp(0.0, 1.0)
+}
+
+/// Smooth の平均に使う点数 (前後対称、 中心を含む奇数)。
+const LFO_SMOOTH_TAPS: i32 = 9;
+
+#[inline]
+fn eval_lfo(c: &LfoConfig, g: GenParams) -> f32 {
+    let smooth = g.lfo_smooth.clamp(0.0, 1.0);
+    let v = if smooth <= 0.0 {
+        lfo_point(c, g, g.cycle_pos)
+    } else {
+        // 周期位置の前後 `smooth × 1/4 周` の箱平均 (時間の純関数のまま鈍らせる)。
+        let half = f64::from(smooth) * 0.125;
+        let mut sum = 0.0f32;
+        for i in -(LFO_SMOOTH_TAPS / 2)..=(LFO_SMOOTH_TAPS / 2) {
+            let off = half * f64::from(i) / f64::from(LFO_SMOOTH_TAPS / 2);
+            sum += lfo_point(c, g, g.cycle_pos + off);
+        }
+        sum / LFO_SMOOTH_TAPS as f32
+    };
+    // Delay / Fade In: 起点からの経過拍で「開始値 → 波形」 を混ぜる。 どちらも 0 なら
+    // 従来どおり (起点より前でも波形をそのまま出す)。
+    let env = lfo_fade_env(c, g.elapsed_beats);
+    if env >= 1.0 {
+        return v;
+    }
+    let start = lfo_point(c, g, 0.0);
+    lerp(start, v, env)
+}
+
+/// r.md #116: Delay / Fade In の包絡 (0..=1)。 起点からの経過拍 `elapsed_beats` で、 Delay の
+/// 間は 0、 その後 Fade In をかけて線形に 1 へ。 どちらも 0 なら常に 1 (起点より前でも
+/// 波形をそのまま出す)。 出力は `lerp(開始値, 波形, env)`。 プレビューの「今の振幅」 も
+/// この 1 本で出す。
+#[inline]
+#[must_use]
+pub fn lfo_fade_env(c: &LfoConfig, elapsed_beats: f64) -> f32 {
+    if c.delay_beats <= 0.0 && c.fade_in_beats <= 0.0 {
+        return 1.0;
+    }
+    let t = elapsed_beats - f64::from(c.delay_beats.max(0.0));
+    if t <= 0.0 {
+        0.0
+    } else if c.fade_in_beats <= 0.0 {
+        1.0
+    } else {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (t / f64::from(c.fade_in_beats)).min(1.0) as f32
+        }
+    }
 }
 
 /// SplitMix64: seed から step ごとに決定論的な乱数を引く (依存追加なし)。
@@ -394,6 +586,7 @@ mod tests {
             rate: sync_quarter(),
             phase: 0.0,
             retrigger: RetriggerMode::FreeRun,
+            ..LfoConfig::default()
         };
         // SawUp なので scalar == phase。 1/4 note 周期 = 1 beat。
         let cases = [(0.0, 0.0), (0.25, 0.25), (0.5, 0.5), (1.0, 0.0), (2.5, 0.5)];
@@ -413,6 +606,7 @@ mod tests {
             rate: sync_quarter(),
             phase: 0.25,
             retrigger: RetriggerMode::FreeRun,
+            ..LfoConfig::default()
         };
         // beat=0 で phase=0.25。
         let got = generator_scalar(&ModSourceKind::Lfo(c), ModTime::new(0.0, 0.0)).unwrap();
@@ -426,10 +620,156 @@ mod tests {
             rate: ModRate { mode: crate::model::ModRateMode::Free, hz: 2.0, ..ModRate::default() },
             phase: 0.0,
             retrigger: RetriggerMode::FreeRun,
+            ..LfoConfig::default()
         };
         // 2 Hz: 0.25 秒で半周 → SawUp=0.5。
         let got = generator_scalar(&ModSourceKind::Lfo(c), ModTime::new(0.0, 0.25)).unwrap();
         assert!((got - 0.5).abs() < 1e-6, "got={got}");
+    }
+
+    fn lfo_at(c: LfoConfig, beat: f64) -> f32 {
+        generator_scalar(&ModSourceKind::Lfo(c), ModTime::new(beat, 0.0)).unwrap()
+    }
+
+    /// r.md #116 Shape: 0.5 は恒等、 Triangle は 0 側で SawDown に、 1 側で SawUp に寄る
+    /// (山の位置が `amt` へ動く)。
+    #[test]
+    fn lfo_shapeは山の位置を動かし中央では恒等() {
+        let tri = |amt| LfoConfig { shape: LfoShape::Triangle, rate: sync_quarter(), shape_amt: amt, ..LfoConfig::default() };
+        for beat in [0.0, 0.1, 0.37, 0.5, 0.8] {
+            let plain = lfo_shape_value(LfoShape::Triangle, beat);
+            assert!((lfo_at(tri(0.5), beat) - plain).abs() < 1e-6, "0.5 は恒等 (beat={beat})");
+        }
+        // 山 (値 1) は amt の位置に来る (amt = 0.25 → 0.25 拍、 0.75 → 0.75 拍)。
+        assert!((lfo_at(tri(0.25), 0.26) - 1.0).abs() < 1e-2);
+        assert!((lfo_at(tri(0.75), 0.74) - 1.0).abs() < 1e-2);
+        // amt 0.5 の Triangle は 0.5 拍で 1。
+        assert!((lfo_at(tri(0.5), 0.5) - 1.0).abs() < 1e-6);
+
+        // Sine: 山は amt の位置 (0.17 → 山が 0.0916 拍 = 0.17·0.48+0.01)、 0.5 は恒等、 そして
+        // **全域で傾きが連続** (継ぎ目が山谷にあるので、 中線を横切る所に角が出ない)。
+        let sine = |amt| LfoConfig { shape: LfoShape::Sine, rate: sync_quarter(), shape_amt: amt, ..LfoConfig::default() };
+        for beat in [0.0, 0.1, 0.37, 0.5, 0.8] {
+            let plain = lfo_shape_value(LfoShape::Sine, beat);
+            assert!((lfo_at(sine(0.5), beat) - plain).abs() < 1e-6, "0.5 は恒等 (beat={beat})");
+        }
+        assert!((lfo_at(sine(0.17), 0.0916) - 1.0).abs() < 1e-3);
+        let h = 1e-3;
+        let mut max_jump = 0.0f32;
+        let mut prev_slope: Option<f32> = None;
+        for i in 0..2000 {
+            let b = f64::from(i) * h;
+            let slope = (lfo_at(sine(0.17), b + h) - lfo_at(sine(0.17), b)) / h as f32;
+            if let Some(p) = prev_slope {
+                max_jump = max_jump.max((slope - p).abs());
+            }
+            prev_slope = Some(slope);
+        }
+        // 傾きの変化は曲率由来の小さな値だけ (継ぎ目の速さ比 4.4 倍が中線で出ると ~10 になる)。
+        assert!(max_jump < 0.2, "Sine の傾きが不連続: max_jump={max_jump}");
+    }
+
+    /// r.md #116 Steps: n 段に量子化 (端は 0 と 1)。 0 / 1 は off。
+    #[test]
+    fn lfo_stepsは出力をn段に量子化する() {
+        let saw = |steps| LfoConfig { shape: LfoShape::SawUp, rate: sync_quarter(), steps, ..LfoConfig::default() };
+        assert!((lfo_at(saw(0), 0.3) - 0.3).abs() < 1e-6, "off");
+        assert!((lfo_at(saw(1), 0.3) - 0.3).abs() < 1e-6, "1 段も off");
+        // 4 段: 0.3 → floor(1.2) = 1 → 1/3。 0.99 → 3/3。
+        assert!((lfo_at(saw(4), 0.3) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((lfo_at(saw(4), 0.99) - 1.0).abs() < 1e-6);
+        assert_eq!(lfo_at(saw(2), 0.49), 0.0);
+        assert_eq!(lfo_at(saw(2), 0.51), 1.0);
+    }
+
+    /// r.md #116 Jitter / Smooth: 決定論 (同じ beat で同じ値)、 jitter は seed で変わり、
+    /// smooth は矩形の段差を鈍らせる。 どちらも 0 なら従来と bit 一致。
+    #[test]
+    fn lfo_jitterは決定論的でsmoothは段差を鈍らせる() {
+        let base = LfoConfig { shape: LfoShape::Square, rate: sync_quarter(), ..LfoConfig::default() };
+        let jit = |seed| LfoConfig { jitter: 0.5, seed, ..base };
+        let a1 = lfo_at(jit(1), 0.3);
+        assert_eq!(a1, lfo_at(jit(1), 0.3), "同 beat で同値");
+        assert_ne!(a1, lfo_at(jit(2), 0.3), "seed で変わる");
+        assert_ne!(a1, lfo_at(base, 0.3), "jitter が乗っている");
+        // smooth: 矩形の立ち下がり (0.5 拍) の直前直後が 1 / 0 でなく中間になる。
+        let sm = LfoConfig { smooth: 1.0, ..base };
+        let v = lfo_at(sm, 0.5);
+        assert!(v > 0.2 && v < 0.8, "段差が鈍る: {v}");
+        assert_eq!(lfo_at(base, 0.5), 0.0, "smooth 0 は従来どおり");
+    }
+
+    /// r.md #117: `Note` は note-on (`anchor_beat` / `anchor_secs`) を起点に走る。 起点が無い
+    /// (`ModTime::new`) と cycle 0 = 開始値。 Delay / Fade In もノートから数える。
+    #[test]
+    fn note_retriggerはnote_onを起点に走る() {
+        let saw = LfoConfig {
+            shape: LfoShape::SawUp,
+            rate: sync_quarter(),
+            retrigger: RetriggerMode::Note,
+            ..LfoConfig::default()
+        };
+        let k = ModSourceKind::Lfo(saw);
+        // 起点 8 拍で鳴ったノート: 8.25 拍で 0.25 周。
+        let v = generator_scalar(&k, ModTime::at_note(8.25, 0.0, 8.0, 0.0, None)).unwrap();
+        assert!((v - 0.25).abs() < 1e-6, "{v}");
+        // 起点無し = 開始値 (0)。
+        assert_eq!(generator_scalar(&k, ModTime::new(8.25, 0.0)).unwrap(), 0.25, "FreeRun 扱いではなく beat そのもの");
+        // Fade In もノートから: 1 拍で 0 → 1。 8.5 拍 (0.5 拍後) は 0.5 × 0.5。
+        let fade = ModSourceKind::Lfo(LfoConfig { fade_in_beats: 1.0, ..saw });
+        let v = generator_scalar(&fade, ModTime::at_note(8.5, 0.0, 8.0, 0.0, None)).unwrap();
+        assert!((v - 0.25).abs() < 1e-6, "{v}");
+    }
+
+    /// r.md #117: ADSR は秒基準。 attack 線形 → decay 指数 → sustain、 note-off 後は release 指数。
+    #[test]
+    fn adsrは押している間attack_decay_sustainで離すとreleaseする() {
+        let (a, d, s, r) = (100.0, 200.0, 0.5, 100.0);
+        let env = |t, rel| adsr_env(a, d, s, r, t, rel);
+        assert_eq!(env(-0.1, None), 0.0, "起点前は 0");
+        assert!((env(0.05, None) - 0.5).abs() < 1e-6, "attack 半分");
+        assert!((env(0.1, None) - 1.0).abs() < 1e-6, "attack 終端で 1");
+        let mid = env(0.2, None);
+        assert!(mid > 0.5 && mid < 1.0, "decay 途中: {mid}");
+        assert!((env(2.0, None) - 0.5).abs() < 1e-3, "sustain に収束");
+        // 2.0 秒で離した: release 0.1 s 後は 5% 以下。
+        assert!(env(2.05, Some(0.05)) < env(2.0, None));
+        assert!(env(2.1, Some(0.1)) < 0.5 * 0.05 + 1e-6);
+        // attack の途中で離すと、 その時点の値から release。
+        let at_off = env(0.05, None);
+        assert!((env(0.05, Some(0.0)) - at_off).abs() < 1e-6);
+        // 種別として評価: config 経由でも同じ。
+        let k = ModSourceKind::Adsr(crate::model::AdsrConfig { attack_ms: a, decay_ms: d, sustain: s, release_ms: r });
+        let v = generator_scalar(&k, ModTime::at_note(0.0, 8.05, 0.0, 8.0, None)).unwrap();
+        assert!((v - 0.5).abs() < 1e-6, "{v}");
+        let v = generator_scalar(&k, ModTime::at_note(0.0, 10.1, 0.0, 8.0, Some(10.0))).unwrap();
+        assert!(v < 0.03, "release 後: {v}");
+    }
+
+    /// r.md #116 Delay / Fade In: 起点 (FromBeat の anchor) から delay の間は開始値、 その後
+    /// fade_in かけて線形に波形へ。 どちらも 0 なら起点より前でも波形そのまま。
+    #[test]
+    fn lfo_delayとfade_inは起点からの経過拍で波形を混ぜる() {
+        let saw = LfoConfig {
+            shape: LfoShape::SawUp,
+            rate: sync_quarter(),
+            retrigger: RetriggerMode::FromBeat { anchor_beat: 4.0 },
+            ..LfoConfig::default()
+        };
+        // 起点より前でも波形 (従来): 3.5 拍 = anchor から -0.5 → SawUp = 0.5。
+        assert!((lfo_at(saw, 3.5) - 0.5).abs() < 1e-6);
+        let env = LfoConfig { delay_beats: 1.0, fade_in_beats: 2.0, ..saw };
+        // 開始値 = 位相 0 の値 = 0。 delay 中 (4.0..5.0) は 0。
+        assert_eq!(lfo_at(env, 4.5), 0.0);
+        // 6.0 拍 = delay 後 1 拍 = fade 半分: 波形 (SawUp、 2 周目の 0 → 0.0) … 6.25 で波形 0.25 × 0.625。
+        let v = lfo_at(env, 6.25);
+        assert!((v - 0.25 * 0.625).abs() < 1e-6, "fade 途中: {v}");
+        // fade 完了後は波形そのまま。
+        assert!((lfo_at(env, 7.5) - 0.5).abs() < 1e-6);
+        // delay だけ (fade 0) は段で切り替わる。
+        let d = LfoConfig { delay_beats: 1.0, ..saw };
+        assert_eq!(lfo_at(d, 4.9), 0.0);
+        assert!((lfo_at(d, 5.5) - 0.5).abs() < 1e-6);
     }
 
     #[test]

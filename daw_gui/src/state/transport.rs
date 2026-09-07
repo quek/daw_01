@@ -3,6 +3,15 @@
 
 use crate::app::{ExportStage, PendingExport};
 
+/// r.md #118: 直前に止まった位置 (Shift+Space の再開点)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StopPoint {
+    /// 止まったときのプレイヘッド。
+    pub beat: f32,
+    /// 止まる直前のホーム (`playback_origin_beat`)。 `None` = 一度も play していなかった。
+    pub home: Option<f32>,
+}
+
 pub struct TransportState {
     /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の
     /// toggle button で切り替え、 `AppEvent::SetMetronomeEnabled(bool)` で
@@ -43,6 +52,15 @@ pub struct TransportState {
     ///   間 (= まだ一度も play していない or stop 済みで restore 完了) は
     ///   stop() は何もしない。
     pub playback_origin_beat: Option<f32>,
+    /// r.md #118 (Live の Shift+Space): 直前に **止まった位置** と、 そのときのホーム。
+    /// `on_transport_stopped` がホームへ戻す前に捕捉し、 [`AppData::play_continue`] が
+    /// ここから再生を続ける。 ホームは動かさない (次の Stop は元のホームへ戻る =
+    /// Live の insert marker と同じ)。 明示 seek でも消えない (停止点はホームとは独立)。
+    pub stop_point: Option<StopPoint>,
+    /// r.md #118: 次の `start_transport` が捕捉するホームの上書き。 `play_continue` が
+    /// 「停止点から走り出すが、 ホームは元のまま」 を実現するために置く。 再生が
+    /// 読み込み待ちで queue されても、 実際に走り出すときに消費されるので失われない。
+    pub play_origin_override: Option<f32>,
     /// パニックボタンが立てる「遅延 reinit」 の起点時刻。 `Some` の間、
     /// `on_tick` が [`PANIC_REINIT_DELAY`] 経過で `ReinitAllPlugins` を plugin host
     /// に送って `None` に戻す。 master の declick フェードアウト完了後に plugin の
@@ -75,6 +93,10 @@ pub struct TransportState {
     /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が
     /// `ModPlane::scalar(id)` で引く。
     pub mod_plane: common::mod_plane::ModPlane,
+    /// r.md #117: engine が publish した track ごとの鳴っているボイス `(track index, voice)`。
+    /// ~30Hz の `TrackVoicesTick` ごとに差し替わり、 変調ラックが `Note` 起点ソースの
+    /// カーソルをボイスごとに描くのに使う。
+    pub track_voices: Vec<(usize, common::audio_bridge::VoiceSnapshot)>,
     /// `play()` was called while `pending_plugin_loads` was non-empty;
     /// re-fire it once the last `SlotPluginLoaded` arrives.
     pub pending_play: bool,
@@ -121,4 +143,38 @@ pub struct TransportState {
     /// as `AudioCommand::ExportWav` on `AppEvent::PluginsReinitDone`. Tuple is
     /// `(path, range_frames, write_mod_sidecar)`.
     pub pending_export: Option<PendingExport>,
+}
+
+impl TransportState {
+    /// 起動時の状態 (停止中、 ループ無し、 メーターは track 数ぶんの無音)。
+    /// `track_peak_display` は曲の track 数に揃えた `(peak_l, peak_r, hold)` の列。
+    pub fn new(track_peak_display: Vec<(f32, f32, f32)>) -> Self {
+        Self {
+            metronome_enabled: false,
+            is_playing: false,
+            preroll_remaining: 0,
+            loop_region: common::model::LoopRegion::default(),
+            playhead_beat: None,
+            playback_origin_beat: None,
+            stop_point: None,
+            play_origin_override: None,
+            panic_reinit_due: None,
+            panic_release_pending: false,
+            master_meter: crate::master_meter::MasterMeterSnapshot::default(),
+            track_peak_display,
+            master_strip_gr: (0.0, 0.0),
+            mod_plane: common::mod_plane::ModPlane::default(),
+            track_voices: Vec::new(),
+            pending_play: false,
+            pending_play_record: None,
+            export_stage: None,
+            export_progress_at: None,
+            export_cancel: None,
+            pending_video_export: None,
+            export_temp_wav: None,
+            pending_video_export_range: None,
+            pending_video_export_dims: None,
+            pending_export: None,
+        }
+    }
 }

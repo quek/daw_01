@@ -831,6 +831,11 @@ fn lane_target_display(
             label: intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge))),
             color: Color::rgb(0.40, 0.80, 0.75),
         },
+        // r.md #114: Selector のアクティブ chain (切替 = 段階なので橙で他と分ける)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => LaneDisplay {
+            label: intern_label("Active"),
+            color: Color::rgb(0.95, 0.65, 0.35),
+        },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
             label: intern_label("Mute"),
             color: Color::rgb(0.92, 0.45, 0.40),

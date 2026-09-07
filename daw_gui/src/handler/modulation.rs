@@ -48,12 +48,14 @@ impl AppData {
                     }),
                     ModSourceKindTag::Mseg => ModSourceKind::Mseg(Default::default()),
                     ModSourceKindTag::Steps => ModSourceKind::Steps(Default::default()),
+                    ModSourceKindTag::Adsr => ModSourceKind::Adsr(Default::default()),
                 };
                 song.mod_sources.push(common::model::ModSource {
                     id,
                     owner_track_id,
                     color,
                     kind,
+                    enabled: true,
                 });
             })
             .is_some();
@@ -116,6 +118,63 @@ impl AppData {
             ModSourceEdit::LfoPhase(p) => {
                 if let ModSourceKind::Lfo(c) = &mut m.kind {
                     c.phase = p.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            // r.md #116: Shape / Jitter / Smooth は 0..=1、 Steps は上限 24、 時間は拍で上限 64。
+            ModSourceEdit::LfoShapeAmt(v) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.shape_amt = v.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::LfoJitter(v) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.jitter = v.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::LfoSmooth(v) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.smooth = v.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::LfoSteps(n) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.steps = n.min(common::model::LFO_STEPS_MAX);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::LfoDelay(b) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.delay_beats = if b.is_finite() { b.clamp(0.0, common::model::LFO_TIME_BEATS_MAX) } else { 0.0 };
+                }
+                scrub = true;
+            }
+            ModSourceEdit::LfoFadeIn(b) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.fade_in_beats = if b.is_finite() { b.clamp(0.0, common::model::LFO_TIME_BEATS_MAX) } else { 0.0 };
+                }
+                scrub = true;
+            }
+            // r.md #117: ADSR。 時定数は `ADSR_TIME_MS_MIN..=MAX`、 sustain は 0..=1。
+            ModSourceEdit::AdsrAttack(v) | ModSourceEdit::AdsrDecay(v) | ModSourceEdit::AdsrRelease(v) => {
+                if let ModSourceKind::Adsr(c) = &mut m.kind
+                    && v.is_finite()
+                {
+                    let v = v.clamp(common::model::ADSR_TIME_MS_MIN, common::model::ADSR_TIME_MS_MAX);
+                    match edit {
+                        ModSourceEdit::AdsrAttack(_) => c.attack_ms = v,
+                        ModSourceEdit::AdsrDecay(_) => c.decay_ms = v,
+                        _ => c.release_ms = v,
+                    }
+                }
+                scrub = true;
+            }
+            ModSourceEdit::AdsrSustain(v) => {
+                if let ModSourceKind::Adsr(c) = &mut m.kind {
+                    c.sustain = v.clamp(0.0, 1.0);
                 }
                 scrub = true;
             }
@@ -247,6 +306,13 @@ impl AppData {
         match edit {
             ModSourceEdit::Rate(_) => Some(ModParam::Rate),
             ModSourceEdit::LfoPhase(_) => Some(ModParam::LfoPhase),
+            ModSourceEdit::LfoShapeAmt(_) => Some(ModParam::LfoShapeAmt),
+            ModSourceEdit::LfoJitter(_) => Some(ModParam::LfoJitter),
+            ModSourceEdit::LfoSmooth(_) => Some(ModParam::LfoSmooth),
+            ModSourceEdit::AdsrAttack(_) => Some(ModParam::AdsrAttack),
+            ModSourceEdit::AdsrDecay(_) => Some(ModParam::AdsrDecay),
+            ModSourceEdit::AdsrSustain(_) => Some(ModParam::AdsrSustain),
+            ModSourceEdit::AdsrRelease(_) => Some(ModParam::AdsrRelease),
             // Pulse の duty は shape に載っているので、Pulse を選び直したときだけ拾う。
             ModSourceEdit::LfoShape(common::model::LfoShape::Pulse { .. }) => {
                 Some(ModParam::LfoPulseWidth)
@@ -452,6 +518,7 @@ impl AppData {
                 source_id,
                 depth: 1.0,
                 polarity: common::model::Polarity::Unipolar,
+                enabled: true,
             });
             true
         })
@@ -494,6 +561,36 @@ impl AppData {
                 routing_id,
             });
         }
+    }
+
+    /// r.md #115: 1 本の変調のバイパス。 住所は安定 `ModRouting::id` (どの store に居ても引く)。
+    /// 合成側 (`modulation_offset_norm_with`) と計画 (`build_plan`) が `enabled` を見る。
+    pub(crate) fn set_mod_routing_enabled(&mut self, routing_id: u32, enabled: bool) {
+        self.edit_song_checked(move |song| {
+            let Some(r) = song.mod_routing_by_id_mut(routing_id) else {
+                return false;
+            };
+            if r.enabled == enabled {
+                return false;
+            }
+            r.enabled = enabled;
+            true
+        });
+    }
+
+    /// r.md #115: モジュレーター全体のバイパス。 `build_plan` がこの source を計画から外す
+    /// (= 値面に載らず、 これを引く routing / 辺は全部無効)。 routing 側の `enabled` は据え置き。
+    pub(crate) fn set_mod_source_enabled(&mut self, id: u32, enabled: bool) {
+        self.edit_song_checked(move |song| {
+            let Some(m) = song.mod_sources.iter_mut().find(|m| m.id == id) else {
+                return false;
+            };
+            if m.enabled == enabled {
+                return false;
+            }
+            m.enabled = enabled;
+            true
+        });
     }
 
     pub(crate) fn set_mod_routing_polarity(

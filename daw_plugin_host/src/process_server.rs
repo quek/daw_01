@@ -638,24 +638,28 @@ fn run_worker(
                     },
                 }),
                 EventKind::ParamValue => {
-                    param_events_in.push(crate::plugin_instance::TimedParamEvent {
-                        time: ev.time,
-                        param_id: ev.param_id,
-                        value: ev.value,
-                        kind: crate::plugin_instance::ParamEventKind::Value,
-                    });
+                    param_events_in.push(crate::plugin_instance::TimedParamEvent::global(
+                        ev.time,
+                        ev.param_id,
+                        ev.value,
+                        crate::plugin_instance::ParamEventKind::Value,
+                    ));
                 }
+                // 出力側専用 (plugin → engine)。 入力に混ざっていても無視。
+                EventKind::NoteEnd => {}
             }
         }
         // r.md #89: lane 非依存モジュレーションは `events_in` ではなく専用配列で
         // 届く (`docs/plan_rmd_88_89_cross_modulation.md` §2.2)。制御グリッドが
         // 64 サンプル刻みになるとノート枠を押し出すので枠を分けてある。
+        // r.md #117: ノート宛 (`note_id >= 0`) はそのまま運ぶ (per-format の扱いは backend)。
         for m in pd.param_mods_iter() {
             param_events_in.push(crate::plugin_instance::TimedParamEvent {
                 time: m.time,
                 param_id: m.param_id,
                 value: m.value,
                 kind: crate::plugin_instance::ParamEventKind::Mod,
+                note_id: m.note_id,
             });
         }
         events_in.sort_unstable_by_key(|e| e.time);
@@ -823,6 +827,19 @@ fn run_worker(
                     },
                     NoteTransition::Off { note_id, key } => Event {
                         kind: EventKind::NoteOff,
+                        _pad: [0; 3],
+                        time: tev.time,
+                        key,
+                        channel: 0,
+                        _pad1: [0; 2],
+                        velocity: 0.0,
+                        param_id: 0,
+                        note_id,
+                        value: 0.0,
+                    },
+                    // r.md #117: ボイス終了の通知 (engine の per-note ボイス表が読む)。
+                    NoteTransition::End { note_id, key } => Event {
+                        kind: EventKind::NoteEnd,
                         _pad: [0; 3],
                         time: tev.time,
                         key,

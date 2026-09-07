@@ -65,6 +65,7 @@ fn build_app_with_two_fx_tracks() -> (AppData, u32) {
                 tap: AudioTap::post_fader(TRACK_A),
                 follower: FollowerConfig::default(),
             },
+            enabled: true,
         });
     });
     for device_id in [DEVICE_A, DEVICE_B] {
@@ -236,6 +237,7 @@ fn deleting_owner_track_removes_its_mod_source_and_routings() {
                 owner_track_id: TRACK_A,
                 color: [0.3, 0.7, 1.0],
                 kind: ModSourceKind::default(),
+                enabled: true,
             });
             id
         })

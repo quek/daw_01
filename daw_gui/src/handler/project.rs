@@ -45,6 +45,9 @@ impl AppData {
         // 同じ id が新 Song の別ノートに当たりうる。
         self.recording.midi_recording_active_notes.clear();
         self.stop();
+        // r.md #118: 停止点 (Shift+Space の再開点) は旧 Song の拍なので捨てる。
+        self.transport.stop_point = None;
+        self.transport.play_origin_override = None;
         self.silence_monitor_notes();
         // r.md #67: カーソルキーの試聴音も止める (旧 Song の track id 宛の note-off が
         // 新 Song で宙に浮かないよう、モニター音と同じ扱いにする)。

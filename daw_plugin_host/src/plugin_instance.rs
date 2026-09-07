@@ -61,6 +61,9 @@ use crate::vst3_plugin::Vst3Plugin;
 pub enum NoteTransition {
     On { note_id: u32, key: u8, velocity: f64 },
     Off { note_id: u32, key: u8 },
+    /// r.md #117: plugin がボイスを閉じた通知 (CLAP `CLAP_EVENT_NOTE_END`、 出力側のみ)。
+    /// engine の per-note ボイス表がこれでノートを外す。 入力側には出さない。
+    End { note_id: u32, key: u8 },
 }
 
 /// A note transition scheduled at a specific frame offset inside the next
@@ -92,6 +95,18 @@ pub struct TimedParamEvent {
     pub param_id: u32,
     pub value: f64,
     pub kind: ParamEventKind,
+    /// r.md #117: `Mod` の宛先ノート (`-1` = global)。 CLAP の per-note 変調対応 param だけが
+    /// 使う (`clap_event_param_mod.note_id`、 key / channel / port は wildcard)。 VST3 は無視する
+    /// (global のみ)。
+    pub note_id: i32,
+}
+
+impl TimedParamEvent {
+    /// global (ノート指定なし) の event。
+    #[must_use]
+    pub fn global(time: u32, param_id: u32, value: f64, kind: ParamEventKind) -> Self {
+        Self { time, param_id, value, kind, note_id: -1 }
+    }
 }
 
 /// PR4 sidechain: one aux input port worth of buffers handed to

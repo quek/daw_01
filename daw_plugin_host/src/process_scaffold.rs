@@ -308,11 +308,11 @@ mod tests {
     fn base_cache_updates_existing_keys_only() {
         let mut cache = HashMap::from([(1u32, 0.5f64)]);
         let evs = [
-            TimedParamEvent { time: 0, param_id: 1, value: 0.9, kind: ParamEventKind::Value },
+            TimedParamEvent::global(0, 1, 0.9, ParamEventKind::Value),
             // 未知 param は insert しない (RT alloc 回避)。
-            TimedParamEvent { time: 0, param_id: 2, value: 0.1, kind: ParamEventKind::Value },
+            TimedParamEvent::global(0, 2, 0.1, ParamEventKind::Value),
             // Mod は base を動かさない。
-            TimedParamEvent { time: 0, param_id: 1, value: -0.2, kind: ParamEventKind::Mod },
+            TimedParamEvent::global(0, 1, -0.2, ParamEventKind::Mod),
         ];
         for ev in &evs {
             advance_param_base(&mut cache, ev);
@@ -331,10 +331,10 @@ mod tests {
         let mut cache = HashMap::from([(1u32, 0.0f64)]);
         // 刻み 0 で automation 0.2、刻み 512 で 0.9。各刻みに Mod +0.05。
         let evs = [
-            TimedParamEvent { time: 0, param_id: 1, value: 0.2, kind: ParamEventKind::Value },
-            TimedParamEvent { time: 0, param_id: 1, value: 0.05, kind: ParamEventKind::Mod },
-            TimedParamEvent { time: 512, param_id: 1, value: 0.9, kind: ParamEventKind::Value },
-            TimedParamEvent { time: 512, param_id: 1, value: 0.05, kind: ParamEventKind::Mod },
+            TimedParamEvent::global(0, 1, 0.2, ParamEventKind::Value),
+            TimedParamEvent::global(0, 1, 0.05, ParamEventKind::Mod),
+            TimedParamEvent::global(512, 1, 0.9, ParamEventKind::Value),
+            TimedParamEvent::global(512, 1, 0.05, ParamEventKind::Mod),
         ];
         let mut folded = Vec::new();
         for ev in &evs {

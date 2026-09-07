@@ -73,6 +73,17 @@ pub enum Split {
     /// Mid / Side 分割 (Bitwig Mid-Side Split)。 Mid chain は `(M, M)`、 Side chain は `(S, -S)`
     /// (`M = (L+R)/2`、 `S = (L-R)/2`) を受け、 和は `(M+S, M-S) = (L, R)` で元に戻る。
     MidSide,
+    /// r.md #114: Selector (Bitwig Instrument Selector / FX Selector)。 入力 (audio + MIDI) を
+    /// **アクティブな 1 chain だけ** が受け、 他の chain は無音 (+ 新しい note 無し) を受ける。
+    /// 切替は `fade_ms` のクロスフェード (両 chain の重みの和は常に 1)。 非アクティブ chain も
+    /// 処理は続くのでリバーブ等の余韻は残り、 鳴っている音は note-on を受けた chain で note-off
+    /// まで鳴り切る (Bitwig: "each sounding note continues until its output is silent")。
+    ///
+    /// `active_chain` は安定 `ParallelChain::id` (不変条件 1。 chain を並べ替えても追従する)。
+    /// chain 一覧に無い id は先頭 chain と読む ([`Parallel::active_chain_index`])。
+    /// automation / 変調の的は `TrackBuiltinParam::ParallelSelect` (位置 `0..=1`、 chain
+    /// `k = floor(v · n)`: "full range morphs evenly thru all layers")。
+    Selector { active_chain: u64, fade_ms: f32 },
 }
 
 impl Split {
@@ -85,14 +96,20 @@ impl Split {
     /// 既定の 3 バンド分割。
     pub const DEFAULT_FREQUENCY3: Self =
         Self::Frequency3 { low_hz: Self::DEFAULT_FREQS.0, high_hz: Self::DEFAULT_FREQS.1 };
+    /// r.md #114: Selector の既定クロスフェード (ms)。 クリックが乗らない最短程度。
+    pub const DEFAULT_SELECTOR_FADE_MS: f32 = 20.0;
+    /// 既定の Selector (`active_chain` は未解決 = 先頭 chain。 `Parallel::normalize_selector` が
+    /// 実 id へ置き換える)。
+    pub const DEFAULT_SELECTOR: Self = Self::Selector { active_chain: 0, fade_ms: Self::DEFAULT_SELECTOR_FADE_MS };
 
-    /// この配り方の出力数 (= 分割された入力を受ける chain の本数)。 `None` は 0 (= 全 chain が
-    /// 素通し入力)。
-    pub fn output_count(&self) -> usize {
+    /// この配り方が成り立つ最低 chain 数 (モード切替時に足りなければ空 chain を補う)。 `None` は 0。
+    /// 分割の出力数 (`Frequency3` = 3 / `MidSide` = 2) と一致するが、 `Selector` は全 chain が出力
+    /// (chain 数に追従) なので A/B の 2 本。
+    pub fn min_chains(&self) -> usize {
         match self {
             Self::None => 0,
             Self::Frequency3 { .. } => 3,
-            Self::MidSide => 2,
+            Self::MidSide | Self::Selector { .. } => 2,
         }
     }
 
@@ -104,7 +121,7 @@ impl Split {
     /// `index` 番目 (0 始まり) の出力の既定名 (chain を補完 / 付け替えるときの名前)。
     pub fn output_name(&self, index: usize) -> Option<&'static str> {
         match self {
-            Self::None => None,
+            Self::None | Self::Selector { .. } => None,
             Self::Frequency3 { .. } => Self::FREQUENCY3_NAMES.get(index).copied(),
             Self::MidSide => Self::MID_SIDE_NAMES.get(index).copied(),
         }
@@ -126,14 +143,22 @@ impl Split {
     }
 
     /// `index` 番目の chain が受ける出力の番号 (= その chain の index)。 出力数を超える chain は
-    /// `None` (素通し入力)。 engine の `ChainBegin` / `PreFx` tap の住所。
+    /// `None` (素通し入力)。 engine の `ChainBegin` / `PreFx` tap の住所。 `Selector` は全 chain が
+    /// 出力 (k 番目 = 「k 番目の chain がアクティブなら入力、 でなければ無音」)。
     pub fn output_of(&self, index: usize) -> Option<u8> {
-        (index < self.output_count()).then_some(index as u8)
+        let count = match self {
+            Self::None => 0,
+            Self::Frequency3 { .. } => 3,
+            Self::MidSide => 2,
+            Self::Selector { .. } => usize::from(u8::MAX),
+        };
+        (index < count).then_some(index as u8)
     }
 
-    /// UI に param 行 (ヘッダ直下) が要るか (`Frequency3` のクロスオーバー)。
+    /// UI に param 行 (ヘッダ直下) が要るか (`Frequency3` のクロスオーバー / `Selector` の
+    /// Active + Fade)。
     pub fn has_params(&self) -> bool {
-        matches!(self, Self::Frequency3 { .. })
+        matches!(self, Self::Frequency3 { .. } | Self::Selector { .. })
     }
 
     /// クロスオーバー周波数を読む (`Frequency3` 以外は `None`)。
@@ -143,7 +168,7 @@ impl Split {
                 SplitEdge::LowMid => *low_hz,
                 SplitEdge::MidHigh => *high_hz,
             }),
-            Self::None | Self::MidSide => None,
+            Self::None | Self::MidSide | Self::Selector { .. } => None,
         }
     }
 
@@ -152,19 +177,56 @@ impl Split {
     pub fn freqs_or_default(&self) -> (f32, f32) {
         match self {
             Self::Frequency3 { low_hz, high_hz } => (*low_hz, *high_hz),
-            Self::None | Self::MidSide => Self::DEFAULT_FREQS,
+            Self::None | Self::MidSide | Self::Selector { .. } => Self::DEFAULT_FREQS,
         }
+    }
+
+    /// r.md #114: Selector のクロスフェード時間 (ms)。 `Selector` 以外は `None`。
+    pub fn selector_fade_ms(&self) -> Option<f32> {
+        match self {
+            Self::Selector { fade_ms, .. } => Some(*fade_ms),
+            Self::None | Self::Frequency3 { .. } | Self::MidSide => None,
+        }
+    }
+
+    /// r.md #114: Selector の位置 `pos` (`0..=1`) が指す chain の index (`n` = chain 数)。
+    /// `k = floor(pos · n)` を `0..n` に収める。 GUI (表示) と engine (per-sample) の唯一の写像。
+    pub fn select_index(pos: f32, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let k = (pos.clamp(0.0, 1.0) * n as f32).floor();
+        (k as usize).min(n - 1)
+    }
+
+    /// [`Self::select_index`] の逆: chain `k` の中央の位置 (`(k + 0.5) / n`)。 端でなく中央に置く
+    /// のは、 小さな変調で隣へ飛ばないため。
+    pub fn select_pos(k: usize, n: usize) -> f32 {
+        if n == 0 {
+            return 0.5;
+        }
+        (k.min(n - 1) as f32 + 0.5) / n as f32
     }
 
     /// 値域へ丸め、 `low_hz <= high_hz` を保つ (load / IPC 境界の正規化)。
     pub fn sanitize(&mut self) {
-        if let Self::Frequency3 { low_hz, high_hz } = self {
-            let fix = |v: f32, d: f32| if v.is_finite() { SPLIT_FREQ_RANGE.clamp(v) } else { d };
-            *low_hz = fix(*low_hz, Self::DEFAULT_FREQS.0);
-            *high_hz = fix(*high_hz, Self::DEFAULT_FREQS.1);
-            if *low_hz > *high_hz {
-                *high_hz = *low_hz;
+        match self {
+            Self::Frequency3 { low_hz, high_hz } => {
+                let fix = |v: f32, d: f32| if v.is_finite() { SPLIT_FREQ_RANGE.clamp(v) } else { d };
+                *low_hz = fix(*low_hz, Self::DEFAULT_FREQS.0);
+                *high_hz = fix(*high_hz, Self::DEFAULT_FREQS.1);
+                if *low_hz > *high_hz {
+                    *high_hz = *low_hz;
+                }
             }
+            Self::Selector { fade_ms, .. } => {
+                *fade_ms = if fade_ms.is_finite() {
+                    SELECTOR_FADE_RANGE.clamp(*fade_ms)
+                } else {
+                    Self::DEFAULT_SELECTOR_FADE_MS
+                };
+            }
+            Self::None | Self::MidSide => {}
         }
     }
 }
@@ -198,6 +260,9 @@ pub enum SplitEdge {
 
 /// クロスオーバー周波数の可動範囲 (対数)。 ノブ / automation 正規化 / IPC クランプの SSoT。
 pub const SPLIT_FREQ_RANGE: super::ParamRange = super::ParamRange::Log { lo: 20.0, hi: 20_000.0 };
+
+/// r.md #114: Selector のクロスフェード時間 (ms) の可動範囲。 0 = 即切替 (1 sample)。
+pub const SELECTOR_FADE_RANGE: super::ParamRange = super::ParamRange::Linear { lo: 0.0, hi: 2_000.0 };
 
 /// Parallel の中の 1 本の並列 chain。Live の Chain List の 1 行 = Bitwig の layer 1 段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -275,6 +340,67 @@ impl Parallel {
             }
         }
         (*low_hz, *high_hz) != before
+    }
+
+    /// r.md #114: Selector のアクティブ chain の index (chain の並び順)。 `Selector` でなければ
+    /// `None`。 `active_chain` が chain 一覧に無い (消した / 未解決の 0) なら先頭 chain。
+    pub fn active_chain_index(&self) -> Option<usize> {
+        let Split::Selector { active_chain, .. } = self.split else {
+            return None;
+        };
+        if self.chains.is_empty() {
+            return None;
+        }
+        Some(self.chains.iter().position(|c| c.id == active_chain).unwrap_or(0))
+    }
+
+    /// r.md #114: automation / 変調の的 `ParallelSelect` の基準値 (アクティブ chain の中央の位置)。
+    /// `Selector` でなければ中央 (`0.5`)。
+    pub fn select_pos(&self) -> f32 {
+        self.active_chain_index()
+            .map_or(0.5, |k| Split::select_pos(k, self.chains.len()))
+    }
+
+    /// r.md #114: アクティブ chain を書く (GUI と engine が同じ規則を通る唯一の口)。 `Selector` で
+    /// なければ / その id の chain が無ければ何もしない。 戻り値 = 実際に変わったか。
+    pub fn set_active_chain(&mut self, chain_id: u64) -> bool {
+        if !self.chains.iter().any(|c| c.id == chain_id) {
+            return false;
+        }
+        let Split::Selector { active_chain, .. } = &mut self.split else {
+            return false;
+        };
+        if *active_chain == chain_id {
+            return false;
+        }
+        *active_chain = chain_id;
+        true
+    }
+
+    /// r.md #114: Selector のクロスフェード時間 (ms) を書く (値域へ丸める)。 戻り値 = 変わったか。
+    pub fn set_selector_fade(&mut self, ms: f32) -> bool {
+        let Split::Selector { fade_ms, .. } = &mut self.split else {
+            return false;
+        };
+        if !ms.is_finite() {
+            return false;
+        }
+        let ms = SELECTOR_FADE_RANGE.clamp(ms);
+        if *fade_ms == ms {
+            return false;
+        }
+        *fade_ms = ms;
+        true
+    }
+
+    /// r.md #114: `active_chain` を実在する chain id に揃える (モード切替 / load 時)。 chain 一覧に
+    /// 無ければ先頭 chain の id。 `Selector` 以外・chain 無しは何もしない。
+    pub fn normalize_selector(&mut self) {
+        let Some(k) = self.active_chain_index() else { return };
+        let id = self.chains[k].id;
+        if let Split::Selector { active_chain, .. } = &mut self.split {
+            *active_chain = id;
+        }
     }
 
     /// chain 追加時の既定名 ("Chain N"、N = 既存最大番号 + 1)。
@@ -364,7 +490,7 @@ impl Device {
     /// この device (Parallel なら中身全部) に routed aux 出力を持つ plugin が居るか
     /// (パラアウト `docs/plan_paraout.md` の split 判定)。
     pub fn routes_any_aux_output(&self) -> bool {
-        plugins(std::slice::from_ref(self)).any(|p| p.aux_outputs.iter().any(Option::is_some))
+        any_plugin(std::slice::from_ref(self), &mut |p| p.aux_outputs.iter().any(Option::is_some))
     }
 }
 
@@ -388,8 +514,19 @@ pub enum ChainRef {
     Chain(u64),
 }
 
+/// `devices` 以下に `pred` を満たす plugin が居るか (pre-order、 Parallel の中も辿る)。
+/// **確保なし** (再帰で辿る) なので RT からも呼べる — `Track::is_voicevox_vocal` は sequencer が
+/// 毎 buffer 呼ぶ。 iterator が要らない「居るか」判定はこちらを使う ([`plugins`] は確保する)。
+pub fn any_plugin(devices: &[Device], pred: &mut impl FnMut(&PluginInstance) -> bool) -> bool {
+    devices.iter().any(|d| match d {
+        Device::Plugin(p) => pred(p),
+        Device::Parallel(r) => r.chains.iter().any(|c| any_plugin(&c.devices, pred)),
+    })
+}
+
 /// `devices` 以下の全 plugin を **pre-order (= 信号順)** で辿る iterator。Parallel の中は
-/// chain 順・chain 内は device 順。RT では使わない (stack が `Vec`)。
+/// chain 順・chain 内は device 順。**RT では使わない** (stack が `Vec` = 確保する。
+/// `make test-rt` が捕まえる)。 存在判定だけなら [`any_plugin`]。
 pub fn plugins(devices: &[Device]) -> PluginIter<'_> {
     PluginIter {
         stack: vec![devices.iter()],
@@ -923,7 +1060,7 @@ mod tests {
         assert!(!plain.set_split_freq(SplitEdge::LowMid, 500.0), "None には効かない");
 
         let ms = Split::MidSide;
-        assert_eq!((ms.output_count(), ms.output_name(0), ms.output_name(1), ms.output_name(2)), (2, Some("Mid"), Some("Side"), None));
+        assert_eq!((ms.min_chains(), ms.output_name(0), ms.output_name(1), ms.output_name(2)), (2, Some("Mid"), Some("Side"), None));
         assert_eq!((ms.default_chain_name(1), ms.default_chain_name(2)), ("Side".to_string(), "Chain 3".to_string()));
         assert!(Split::is_generated_chain_name("Chain 12") && Split::is_generated_chain_name("High"));
         assert!(!Split::is_generated_chain_name("Comp") && !Split::is_generated_chain_name("Chain x"));
@@ -931,6 +1068,57 @@ mod tests {
         assert!(!ms.has_params());
         let json = serde_json::to_string(&ms).unwrap();
         assert_eq!(serde_json::from_str::<Split>(&json).unwrap(), ms);
+    }
+
+    /// r.md #114: Selector のアクティブ chain は安定 id で持ち、 無効な id は先頭 chain と読む。
+    /// 位置 `0..=1` ↔ chain index の写像は端を含めて `0..n` に収まり、 setter は値域を守る。
+    #[test]
+    fn selector_tracks_the_active_chain_by_id_and_maps_position_to_chain_index() {
+        let mut r = Parallel::new();
+        r.chains[0].id = 11;
+        r.chains.push(ParallelChain { id: 12, ..ParallelChain::new("Chain 2") });
+        r.chains.push(ParallelChain { id: 13, ..ParallelChain::new("Chain 3") });
+        assert_eq!(r.active_chain_index(), None, "Selector 以外は None");
+        assert!(!r.set_active_chain(12), "Selector 以外には効かない");
+
+        r.split = Split::DEFAULT_SELECTOR;
+        assert_eq!(r.active_chain_index(), Some(0), "未解決 (0) は先頭 chain");
+        r.normalize_selector();
+        assert_eq!(r.split, Split::Selector { active_chain: 11, fade_ms: Split::DEFAULT_SELECTOR_FADE_MS });
+        assert!(r.set_active_chain(13));
+        assert!(!r.set_active_chain(13), "同値は変更なし");
+        assert!(!r.set_active_chain(99), "無い chain は拒否");
+        assert_eq!(r.active_chain_index(), Some(2));
+        assert!((r.select_pos() - 2.5 / 3.0).abs() < 1e-6, "chain 3 の中央");
+        // 並べ替えても id で追従する (不変条件 1)。
+        r.chains.swap(0, 2);
+        assert_eq!(r.active_chain_index(), Some(0));
+        // 消したら先頭へ落ちる (補償コード無し)。
+        r.chains.remove(0);
+        assert_eq!(r.active_chain_index(), Some(0));
+        assert_eq!(r.chains[0].id, 12);
+
+        assert!(r.set_selector_fade(-5.0));
+        assert_eq!(r.split.selector_fade_ms(), Some(0.0), "値域の下端へ");
+        assert!(r.set_selector_fade(99_999.0));
+        assert_eq!(r.split.selector_fade_ms(), Some(2_000.0));
+        assert!(!r.set_selector_fade(f32::NAN));
+
+        // 位置 ↔ index: 端を含めて 0..n、 中央の位置は同じ index に戻る。
+        for n in 1..=5usize {
+            for k in 0..n {
+                assert_eq!(Split::select_index(Split::select_pos(k, n), n), k, "n={n} k={k}");
+            }
+            assert_eq!(Split::select_index(1.0, n), n - 1);
+            assert_eq!(Split::select_index(0.0, n), 0);
+            assert_eq!(Split::select_index(-1.0, n), 0);
+        }
+        assert_eq!(Split::select_index(0.5, 0), 0);
+        let sel = Split::DEFAULT_SELECTOR;
+        assert_eq!((sel.min_chains(), sel.output_name(0), sel.output_of(7), sel.default_chain_name(1)), (2, None, Some(7), "Chain 2".to_string()));
+        assert!(sel.has_params());
+        let json = serde_json::to_string(&sel).unwrap();
+        assert_eq!(serde_json::from_str::<Split>(&json).unwrap(), sel);
     }
 
     #[test]

@@ -357,6 +357,7 @@ impl AppData {
             .map(|m| ModSourceRow {
                 id: m.id,
                 color: m.color,
+                enabled: m.enabled,
                 scalar: self.transport.mod_plane.scalar(m.id),
                 kind: m.kind.clone(),
             })
@@ -400,11 +401,9 @@ impl AppData {
     /// 対象が `owner_track_id` 以外にある行は `"<トラック名> ▸ "` を前置きする。
     pub fn mod_source_routings(&self, source_id: u32) -> Vec<ModRoutingRow> {
         let song = self.song_doc.song();
-        let owner = song
-            .mod_sources
-            .iter()
-            .find(|m| m.id == source_id)
-            .map_or(0, |m| m.owner_track_id);
+        let source = song.mod_sources.iter().find(|m| m.id == source_id);
+        let owner = source.map_or(0, |m| m.owner_track_id);
+        let source_enabled = source.is_some_and(|m| m.enabled);
         // 自分の所有トラックを先頭に、 次に他トラック、 最後に song-level (master)。
         let scan = song
             .tracks
@@ -432,6 +431,8 @@ impl AppData {
                     label,
                     depth: r.depth,
                     bipolar: matches!(r.polarity, common::model::Polarity::Bipolar),
+                    enabled: r.enabled,
+                    effective: r.enabled && source_enabled,
                 });
             }
         }

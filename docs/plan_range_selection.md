@@ -148,7 +148,7 @@ pub enum LaneRef {
 | `Shift`+↑↓ | 範囲をレーン方向に伸縮 |
 | ←→ | **範囲内の素材**をグリッド 1 つ分ナッジ (§6.9 "You can nudge a selection of material using the left and right arrow keys") |
 | `Alt`+←→ | 同上、スナップ無効 |
-| `Ctrl+A` | その面の全体を**段階拡大**で。アレンジャーはマウス下のトラック 1 本 (行 + 全 automation lane、閉じた lane も) → 全トラック × 全 lane。lane 上なら 点 → lane のクリップ → そのトラック → 全トラック。横幅はどの段も対象クリップ (automation クリップ含む) の外接。段は「今の範囲が前段と一致するか」で決め、クリップの無い段は飛ばす (`AppData::select_all_arrangement`) |
+| `Ctrl+A` | その面の全体を**段階拡大**で。アレンジャーはマウス下のトラック 1 本 (行 + 全 automation lane、閉じた lane も) → 全トラック × 全 lane。lane 上なら 点 → lane のクリップ → そのトラック → 全トラック。横幅はどの段も対象クリップ (automation クリップ含む) の外接。段は「今の範囲が前段と一致するか」で決め、クリップの無い段は飛ばす (`AppData::select_all_arrangement`)。 ピアノロールも同じ規則で 2 段 (r.md #119): ポインタの鍵盤行の全ノート → 表示中クリップの全ノート。 行にノートが無い / grid 外なら即全ノート (`AppData::select_all_pianoroll`) |
 | `Esc` | 範囲をクリア |
 
 ピアノロールでは ←→ が「範囲内のノートをナッジ」、↑↓ が「移調」になる (現行の 12 本の割り当てを

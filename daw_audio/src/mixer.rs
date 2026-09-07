@@ -293,8 +293,8 @@ pub fn apply_channel_strip(
 /// 確保量でクランプ済みなので push で再確保しない。
 pub fn queue_all_notes_off(scratch: &mut [TrackScratch]) {
     for s in scratch.iter_mut() {
-        for &k in &s.state.active_notes {
-            s.state.pending_offs.push(k);
+        for &note in &s.state.active_notes {
+            s.state.pending_offs.push(note);
         }
         s.state.active_notes.clear();
     }

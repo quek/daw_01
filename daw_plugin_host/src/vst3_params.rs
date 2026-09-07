@@ -320,12 +320,7 @@ mod tests {
     use super::*;
 
     fn ev(time: u32, param_id: u32, value: f64) -> TimedParamEvent {
-        TimedParamEvent {
-            time,
-            param_id,
-            value,
-            kind: crate::plugin_instance::ParamEventKind::Value,
-        }
+        TimedParamEvent::global(time, param_id, value, crate::plugin_instance::ParamEventKind::Value)
     }
 
     #[test]

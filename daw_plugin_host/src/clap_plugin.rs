@@ -16,7 +16,8 @@ use anyhow::{Context, Result};
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{
-    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, clap_event_header,
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_END, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON,
+    clap_event_header,
     clap_event_note, clap_input_events, clap_output_events,
 };
 use clap_sys::events::{
@@ -37,8 +38,8 @@ use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE,
-    CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED,
-    CLAP_PARAM_REQUIRES_PROCESS, clap_param_info, clap_plugin_params,
+    CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY,
+    CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS, clap_param_info, clap_plugin_params,
 };
 use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
@@ -73,6 +74,12 @@ struct ClapParamMeta {
     max: f64,
     /// `CLAP_PARAM_IS_MODULATABLE` — eligible for non-destructive `param_mod`.
     modulatable: bool,
+    /// r.md #117: `CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID` — ノート単位の `param_mod` を受ける。
+    per_note: bool,
+    /// r.md #117: この param 宛の per-note mod が **今の buffer** にあるか (`process_epoch` の値。
+    /// 一致 = ある)。 buffer 頭の 1 pass で立て、 global mod を捨てる判定に使う (event ごとに
+    /// 全 event を走査する O(n²) を避ける)。
+    per_note_epoch: u64,
 }
 
 // ====================================================================
@@ -113,6 +120,9 @@ pub struct ClapAudioHalf {
     /// Per-param `(min, max, modulatable)` cached at load so process() can
     /// convert a normalized modulation offset without main-thread calls.
     param_meta: std::collections::HashMap<u32, ClapParamMeta>,
+    /// r.md #117: `process()` の通し番号 (`ClapParamMeta::per_note_epoch` の比較相手)。 0 始まりで
+    /// 最初の buffer は 1 なので、 初期値 0 の印はどの buffer にも一致しない。
+    process_epoch: u64,
     /// Last absolute value the host sent per param (base for the
     /// non-modulatable fold path). Seeded with defaults at load — process()
     /// only updates existing keys (no RT heap alloc).
@@ -133,6 +143,78 @@ pub struct ClapAudioHalf {
 // plain owned data.
 unsafe impl Send for ClapAudioHalf {}
 
+/// `clap_event_param_value` の header (time だけ違う)。
+fn param_value_header(time: u32) -> clap_event_header {
+    clap_event_header {
+        size: std::mem::size_of::<clap_event_param_value>() as u32,
+        time,
+        space_id: CLAP_CORE_EVENT_SPACE_ID,
+        type_: CLAP_EVENT_PARAM_VALUE,
+        flags: 0,
+    }
+}
+
+impl ClapAudioHalf {
+    /// `ParamEventKind::Mod` 1 件を CLAP の event に変換して積む。 modulatable param には
+    /// 非破壊の `param_mod` (amount = offset·(max−min))、 それ以外は base に畳んだ絶対値。
+    ///
+    /// r.md #117: ノート宛 (`note_id >= 0`) は per-note 対応 param にだけ送る。 対応 param には
+    /// 同 buffer に per-note が 1 件でもあれば global を捨てる (二重掛けしない)。
+    fn push_mod_event(&mut self, ev: &crate::plugin_instance::TimedParamEvent) {
+        let Some(meta) = self.param_meta.get(&ev.param_id).copied() else {
+            return; // unknown param id — nothing to modulate
+        };
+        let per_note = ev.note_id >= 0;
+        // per-note を受けられる param = modulatable かつ per-note 対応。 片方だけ立った矛盾した
+        // flag では global を捨てず、 per-note も送らない (変調が全消えしない)。
+        let per_note_ok = meta.modulatable && meta.per_note;
+        if per_note && !per_note_ok {
+            return;
+        }
+        if !per_note && per_note_ok && meta.per_note_epoch == self.process_epoch {
+            return;
+        }
+        let amount = ev.value * (meta.max - meta.min);
+        if meta.modulatable {
+            self.pending_param_mods.push(clap_event_param_mod {
+                header: clap_event_header {
+                    size: std::mem::size_of::<clap_event_param_mod>() as u32,
+                    time: ev.time,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_PARAM_MOD,
+                    flags: 0,
+                },
+                param_id: ev.param_id,
+                cookie: std::ptr::null_mut(),
+                // 宛先は note_id だけで特定する。 key / channel / port は wildcard (`-1`) —
+                // `PER_KEY` / `PER_CHANNEL` 非対応の param に具体値を送る根拠が spec に無い
+                // (events.h: "-1 meaning wildcard")。 note_id は host が振った一意 id なので
+                // これで十分。
+                note_id: ev.note_id,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                amount,
+            });
+        } else {
+            // No CLAP modulation channel: fold into an absolute value over the
+            // cached base (plain units).
+            let base = self.last_param_value.get(&ev.param_id).copied().unwrap_or(meta.min);
+            let value = fold_mod_offset(base, amount, meta.min, meta.max);
+            self.pending_param_events.push(clap_event_param_value {
+                header: param_value_header(ev.time),
+                param_id: ev.param_id,
+                cookie: std::ptr::null_mut(),
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value,
+            });
+        }
+    }
+}
+
 impl AudioProcessorHalf for ClapAudioHalf {
     fn process(
         &mut self,
@@ -147,6 +229,10 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
         self.pending_events.clear();
         for ev in events {
+            // r.md #117: `End` は出力側 (plugin → host) 専用。 入力に混ざっても送らない。
+            if matches!(ev.event, NoteTransition::End { .. }) {
+                continue;
+            }
             let mut e = encode_note(ev.event);
             e.header.time = ev.time;
             self.pending_events.push(e);
@@ -159,13 +245,14 @@ impl AudioProcessorHalf for ClapAudioHalf {
         use crate::plugin_instance::ParamEventKind;
         self.pending_param_events.clear();
         self.pending_param_mods.clear();
-        let param_value_header = |time: u32| clap_event_header {
-            size: std::mem::size_of::<clap_event_param_value>() as u32,
-            time,
-            space_id: CLAP_CORE_EVENT_SPACE_ID,
-            type_: CLAP_EVENT_PARAM_VALUE,
-            flags: 0,
-        };
+        // r.md #117: per-note mod が届いた param に今の buffer の印を付ける (1 pass、 確保なし)。
+        // `push_mod_event` はこの印で「global を捨てるか」 を O(1) で判定する。
+        self.process_epoch = self.process_epoch.wrapping_add(1);
+        for ev in param_events.iter().filter(|e| e.kind == ParamEventKind::Mod && e.note_id >= 0) {
+            if let Some(meta) = self.param_meta.get_mut(&ev.param_id) {
+                meta.per_note_epoch = self.process_epoch;
+            }
+        }
         for ev in param_events {
             // base は **時刻順に 1 件ずつ**進める (buffer 末の automation 値を
             // 全刻みの Mod の base に使わない — r.md #89)。
@@ -183,49 +270,7 @@ impl AudioProcessorHalf for ClapAudioHalf {
                         value: ev.value,
                     });
                 }
-                ParamEventKind::Mod => {
-                    let Some(meta) = self.param_meta.get(&ev.param_id).copied() else {
-                        continue; // unknown param id — nothing to modulate
-                    };
-                    let amount = ev.value * (meta.max - meta.min);
-                    if meta.modulatable {
-                        self.pending_param_mods.push(clap_event_param_mod {
-                            header: clap_event_header {
-                                size: std::mem::size_of::<clap_event_param_mod>() as u32,
-                                time: ev.time,
-                                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                                type_: CLAP_EVENT_PARAM_MOD,
-                                flags: 0,
-                            },
-                            param_id: ev.param_id,
-                            cookie: std::ptr::null_mut(),
-                            note_id: -1,
-                            port_index: -1,
-                            channel: -1,
-                            key: -1,
-                            amount,
-                        });
-                    } else {
-                        // No CLAP modulation channel: fold into an absolute
-                        // value over the cached base (plain units).
-                        let base = self
-                            .last_param_value
-                            .get(&ev.param_id)
-                            .copied()
-                            .unwrap_or(meta.min);
-                        let value = fold_mod_offset(base, amount, meta.min, meta.max);
-                        self.pending_param_events.push(clap_event_param_value {
-                            header: param_value_header(ev.time),
-                            param_id: ev.param_id,
-                            cookie: std::ptr::null_mut(),
-                            note_id: -1,
-                            port_index: -1,
-                            channel: -1,
-                            key: -1,
-                            value,
-                        });
-                    }
-                }
+                ParamEventKind::Mod => self.push_mod_event(ev),
             }
         }
         self.collected_out_notes.clear();
@@ -659,12 +704,16 @@ impl ClapPlugin {
         for info in &infos {
             let modulatable =
                 info.flags & common::protocol::plugin_param_flags::MODULATABLE != 0;
+            let per_note =
+                info.flags & common::protocol::plugin_param_flags::MODULATABLE_PER_NOTE_ID != 0;
             param_meta.insert(
                 info.id,
                 ClapParamMeta {
                     min: info.min_value,
                     max: info.max_value,
                     modulatable,
+                    per_note,
+                    per_note_epoch: 0,
                 },
             );
             last_param_value.insert(info.id, info.default_value);
@@ -702,6 +751,7 @@ impl ClapPlugin {
             // r.md #89: 制御グリッド化で 1 buffer 最大 `MAX_PARAM_MODS` 件届く。
             pending_param_mods: Vec::with_capacity(common::process_data::MAX_PARAM_MODS),
             param_meta,
+            process_epoch: 0,
             last_param_value,
             event_order: Vec::with_capacity(common::process_data::MAX_RT_EVENT_BUFFER),
             collected_out_notes: Vec::with_capacity(256),
@@ -1337,6 +1387,9 @@ fn enumerate_clap_params(
         if info.flags & CLAP_PARAM_IS_MODULATABLE != 0 {
             flags |= common::protocol::plugin_param_flags::MODULATABLE;
         }
+        if info.flags & CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID != 0 {
+            flags |= common::protocol::plugin_param_flags::MODULATABLE_PER_NOTE_ID;
+        }
         if info.flags & CLAP_PARAM_REQUIRES_PROCESS != 0 {
             flags |= common::protocol::plugin_param_flags::REQUIRES_PROCESS;
         }
@@ -1459,7 +1512,8 @@ unsafe extern "C" fn collect_out_note_try_push(
                 return true;
             }
             let note = unsafe { &*(event as *const clap_event_note) };
-            let note_id = note.note_id.max(0) as u32;
+            // `-1` (未指定 / plugin 自発のノート) は `NOTE_ID_NONE` へ (`0` は有効な id)。
+            let note_id = u32::try_from(note.note_id).unwrap_or(common::process_data::NOTE_ID_NONE);
             let transition = NoteTransition::On {
                 note_id,
                 key: note.key.clamp(0, 127) as u8,
@@ -1478,11 +1532,28 @@ unsafe extern "C" fn collect_out_note_try_push(
                 return true;
             }
             let note = unsafe { &*(event as *const clap_event_note) };
-            let note_id = note.note_id.max(0) as u32;
+            // `-1` (未指定 / plugin 自発のノート) は `NOTE_ID_NONE` へ (`0` は有効な id)。
+            let note_id = u32::try_from(note.note_id).unwrap_or(common::process_data::NOTE_ID_NONE);
             let transition = NoteTransition::Off {
                 note_id,
                 key: note.key.clamp(0, 127) as u8,
             };
+            if !collector.notes.is_null() {
+                let out = unsafe { &mut *collector.notes };
+                if out.len() < out.capacity() {
+                    out.push(TimedNoteEvent { time: header.time, event: transition });
+                }
+            }
+        }
+        t if t == CLAP_EVENT_NOTE_END => {
+            // r.md #117: plugin がボイスを閉じた。 engine の per-note ボイス表がこれで外す。
+            if header.size < std::mem::size_of::<clap_event_note>() as u32 {
+                return true;
+            }
+            let note = unsafe { &*(event as *const clap_event_note) };
+            // `-1` (未指定 / plugin 自発のノート) は `NOTE_ID_NONE` へ (`0` は有効な id)。
+            let note_id = u32::try_from(note.note_id).unwrap_or(common::process_data::NOTE_ID_NONE);
+            let transition = NoteTransition::End { note_id, key: note.key.clamp(0, 127) as u8 };
             if !collector.notes.is_null() {
                 let out = unsafe { &mut *collector.notes };
                 if out.len() < out.capacity() {
@@ -1667,7 +1738,7 @@ fn encode_note(transition: NoteTransition) -> clap_event_note {
             let nid = if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
             (CLAP_EVENT_NOTE_ON, key, velocity, nid)
         }
-        NoteTransition::Off { note_id, key } => {
+        NoteTransition::Off { note_id, key } | NoteTransition::End { note_id, key } => {
             let nid = if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
             (CLAP_EVENT_NOTE_OFF, key, 0.0, nid)
         }

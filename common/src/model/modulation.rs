@@ -235,6 +235,12 @@ pub struct ModSource {
     /// 変調器種別 (envelope follower / LFO / Random / MSEG / Steps)。
     #[serde(default)]
     pub kind: ModSourceKind,
+    /// r.md #115: モジュレーター全体のバイパス (Q キー、 ラックのヘッダ行 / 本体)。 `false` の
+    /// 間は **評価計画から外れる** (`mod_graph::build_plan` が node を作らない = 値面に載らず、
+    /// この source を引く routing / 交差変調の辺 / 深さの辺はすべて無効)。 plugin の bypass と
+    /// 同じ「居るが動いていない」。 routing 側の [`ModRouting::enabled`] は据え置き。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 impl ModSource {
@@ -296,6 +302,16 @@ pub struct ModRouting {
     pub depth: f32,
     #[serde(default)]
     pub polarity: Polarity,
+    /// r.md #115: この 1 本のバイパス (Q キー、 ラックの routing 行)。 `false` の間はこの routing
+    /// は合成に加わらない (`modulation_offset_norm_with` が飛ばす = 極性に関わらず 0)。 depth /
+    /// 極性 / 深さの変調は保持する。 ソース側の [`ModSource::enabled`] とは独立 (両方立って
+    /// いるときだけ効く)。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // =====================================================================
@@ -461,6 +477,44 @@ pub enum RetriggerMode {
     FreeRun,
     /// phase = f(song_beat - anchor_beat)。 clip / loop 開始等の beat 基準。 MSEG OneShot 用。
     FromBeat { anchor_beat: f64 },
+    /// r.md #117 (`docs/plan_per_note_modulation.md`): **ノート単位**。 鳴っている各ノートの
+    /// note-on を起点に 1 本ずつ走る (Bitwig のポリフォニック変調)。 routing 先が CLAP の
+    /// per-note 変調対応 param ならノートごとに別の値、 それ以外は最新ノートの値で global。
+    Note,
+}
+
+/// r.md #117: ADSR エンベロープ (常にノート起点、 rate / retrigger 欄なし)。 秒基準 (ms)。
+/// attack は線形、 decay / release は指数 (`exp(-3 t / T)`: T の後に 5% 以下)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AdsrConfig {
+    pub attack_ms: f32,
+    pub decay_ms: f32,
+    /// 0..=1。
+    pub sustain: f32,
+    pub release_ms: f32,
+}
+
+impl Default for AdsrConfig {
+    fn default() -> Self {
+        Self { attack_ms: 10.0, decay_ms: 200.0, sustain: 0.7, release_ms: 300.0 }
+    }
+}
+
+/// ADSR の時定数の可動範囲 (ms、 対数)。 `mod_param_range` が引く SSoT。
+pub const ADSR_TIME_MS_MIN: f32 = 0.1;
+pub const ADSR_TIME_MS_MAX: f32 = 20_000.0;
+
+impl AdsrConfig {
+    /// load 境界の値域補正 (`Song::sanitize_ranges`)。 RT (`adsr_env`) は値をそのまま使うので、
+    /// 非有限は既定値へ、 時定数は [`ADSR_TIME_MS_MIN`]`..=`[`ADSR_TIME_MS_MAX`]、 sustain は 0..=1。
+    pub fn sanitize(&mut self) {
+        let d = Self::default();
+        let time = |v: f32, def: f32| if v.is_finite() { v.clamp(ADSR_TIME_MS_MIN, ADSR_TIME_MS_MAX) } else { def };
+        self.attack_ms = time(self.attack_ms, d.attack_ms);
+        self.decay_ms = time(self.decay_ms, d.decay_ms);
+        self.release_ms = time(self.release_ms, d.release_ms);
+        self.sustain = if self.sustain.is_finite() { self.sustain.clamp(0.0, 1.0) } else { d.sustain };
+    }
 }
 
 /// LFO 波形。 phase 0..=1 → unipolar 0..=1。
@@ -481,7 +535,9 @@ pub enum LfoShape {
     },
 }
 
-/// 周期波 LFO。
+/// 周期波 LFO。 r.md #116 で Live の LFO device (Shape / Steps / Jitter / Smooth) と Bitwig の
+/// LFO (Delay / Fade In) の機能を足した。 どれも **曲位置の純関数** のまま (決定論、 書き出し
+/// 再現)。 既定値はすべて「効かない」 側なので既存曲の音は変わらない。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct LfoConfig {
     pub shape: LfoShape,
@@ -489,7 +545,48 @@ pub struct LfoConfig {
     /// cycle 内の開始オフセット 0..=1。
     pub phase: f32,
     pub retrigger: RetriggerMode,
+    /// Shape (Live: "bends or skews the shape"): 位相を曲げる量 0..=1、 `0.5` = そのまま。
+    /// 0 側は前半を縮め (山が前へ)、 1 側は後半を縮める (山が後ろへ)。 Triangle なら 0 で
+    /// SawDown、 1 で SawUp に近づく (Bitwig の Shape と同じ向き)。 `ModParam::LfoShapeAmt`。
+    #[serde(default = "default_lfo_shape_amt")]
+    pub shape_amt: f32,
+    /// Steps (Live: "adds up to 24 steps"): 出力を `steps` 段に量子化。 0 / 1 = off。
+    #[serde(default)]
+    pub steps: u8,
+    /// Jitter (Live: "adds randomness to the LFO output"): 決定論的な乱れの量 0..=1
+    /// (`seed` と周期位置の純関数、 1 周に [`LFO_JITTER_STEPS_PER_CYCLE`] 段)。 `ModParam::LfoJitter`。
+    #[serde(default)]
+    pub jitter: f32,
+    /// Smooth (Live: "softens any sharp changes in the output, including those from applied
+    /// jitter"): 周期位置の前後 `smooth × 1/4 周` の平均。 0 = off。 `ModParam::LfoSmooth`。
+    #[serde(default)]
+    pub smooth: f32,
+    /// Jitter の乱数列の seed (作成時に採番、 保存)。
+    #[serde(default = "default_lfo_seed")]
+    pub seed: u64,
+    /// Delay (Bitwig): retrigger の起点 (`FromBeat` の anchor、 `FreeRun` は曲頭) からこの拍数は
+    /// 出力を開始値に留める。 0 = off。
+    #[serde(default)]
+    pub delay_beats: f32,
+    /// Fade In (Bitwig): Delay の後、 この拍数かけて開始値から波形へ線形に混ぜる。 0 = 即。
+    #[serde(default)]
+    pub fade_in_beats: f32,
 }
+
+fn default_lfo_shape_amt() -> f32 {
+    0.5
+}
+
+fn default_lfo_seed() -> u64 {
+    0x5EED_1F00_0000_0001
+}
+
+/// Delay / Fade In の上限 (拍)。
+pub const LFO_TIME_BEATS_MAX: f32 = 64.0;
+/// Steps の上限 (Live と同じ 24)。
+pub const LFO_STEPS_MAX: u8 = 24;
+/// Jitter の乱数が 1 周あたり何段で切り替わるか。
+pub const LFO_JITTER_STEPS_PER_CYCLE: f64 = 8.0;
 
 impl Default for LfoConfig {
     fn default() -> Self {
@@ -498,6 +595,34 @@ impl Default for LfoConfig {
             rate: ModRate::default(),
             phase: 0.0,
             retrigger: RetriggerMode::FreeRun,
+            shape_amt: default_lfo_shape_amt(),
+            steps: 0,
+            jitter: 0.0,
+            smooth: 0.0,
+            seed: default_lfo_seed(),
+            delay_beats: 0.0,
+            fade_in_beats: 0.0,
+        }
+    }
+}
+
+impl LfoConfig {
+    /// load 境界の値域補正 (`Song::sanitize_ranges`)。 r.md #116 の欄は RT がそのまま使う
+    /// (`lfo_fade_env` は `NaN` を素通しする) ので、 非有限は既定値へ、 0..=1 の欄は clamp、
+    /// 拍は `0..=`[`LFO_TIME_BEATS_MAX`]、 段数は [`LFO_STEPS_MAX`] まで。
+    pub fn sanitize(&mut self) {
+        let d = Self::default();
+        let unit = |v: f32, def: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { def };
+        let beats = |v: f32| if v.is_finite() { v.clamp(0.0, LFO_TIME_BEATS_MAX) } else { 0.0 };
+        self.phase = unit(self.phase, d.phase);
+        self.shape_amt = unit(self.shape_amt, d.shape_amt);
+        self.jitter = unit(self.jitter, d.jitter);
+        self.smooth = unit(self.smooth, d.smooth);
+        self.steps = self.steps.min(LFO_STEPS_MAX);
+        self.delay_beats = beats(self.delay_beats);
+        self.fade_in_beats = beats(self.fade_in_beats);
+        if let LfoShape::Pulse { width } = &mut self.shape {
+            *width = unit(*width, 0.5);
         }
     }
 }
@@ -645,6 +770,12 @@ pub enum ModParam {
     LfoPhase,
     /// LFO Pulse の duty (0..=1)。shape が `Pulse` でないときは無視される。
     LfoPulseWidth,
+    /// r.md #116: LFO の Shape (位相の曲げ、 0..=1、 0.5 = そのまま)。
+    LfoShapeAmt,
+    /// r.md #116: LFO の Jitter (0..=1)。
+    LfoJitter,
+    /// r.md #116: LFO の Smooth (0..=1)。
+    LfoSmooth,
     /// Random の Stepped↔Smoothed モーフ (0..=1)。
     RandomSmooth,
     /// Steps の slew (0..=1)。
@@ -659,11 +790,19 @@ pub enum ModParam {
     FollowerHpHz,
     /// 帯域フィルタ LP cutoff (Hz)。同上。
     FollowerLpHz,
+    /// r.md #117: ADSR の attack (ms)。
+    AdsrAttack,
+    /// r.md #117: ADSR の decay (ms)。
+    AdsrDecay,
+    /// r.md #117: ADSR の sustain (0..=1)。
+    AdsrSustain,
+    /// r.md #117: ADSR の release (ms)。
+    AdsrRelease,
 }
 
 impl ModParam {
     /// 全 variant (RT の固定長配列を張るための SSoT。順序 = 配列の添字)。
-    pub const ALL: [ModParam; 10] = [
+    pub const ALL: [ModParam; 17] = [
         Self::Rate,
         Self::LfoPhase,
         Self::LfoPulseWidth,
@@ -674,6 +813,13 @@ impl ModParam {
         Self::FollowerGain,
         Self::FollowerHpHz,
         Self::FollowerLpHz,
+        Self::LfoShapeAmt,
+        Self::LfoJitter,
+        Self::LfoSmooth,
+        Self::AdsrAttack,
+        Self::AdsrDecay,
+        Self::AdsrSustain,
+        Self::AdsrRelease,
     ];
 
     /// [`Self::ALL`] 内の添字。固定長配列のキーに使う。
@@ -690,6 +836,13 @@ impl ModParam {
             Self::FollowerGain => 7,
             Self::FollowerHpHz => 8,
             Self::FollowerLpHz => 9,
+            Self::LfoShapeAmt => 10,
+            Self::LfoJitter => 11,
+            Self::LfoSmooth => 12,
+            Self::AdsrAttack => 13,
+            Self::AdsrDecay => 14,
+            Self::AdsrSustain => 15,
+            Self::AdsrRelease => 16,
         }
     }
 
@@ -700,6 +853,9 @@ impl ModParam {
             Self::Rate => "速さ",
             Self::LfoPhase => "位相",
             Self::LfoPulseWidth => "幅",
+            Self::LfoShapeAmt => "形",
+            Self::LfoJitter => "揺らぎ",
+            Self::LfoSmooth => "なめらかさ",
             Self::RandomSmooth => "なめらかさ",
             Self::StepsSlew => "スルー",
             Self::FollowerAttack => "Attack",
@@ -707,6 +863,10 @@ impl ModParam {
             Self::FollowerGain => "Gain",
             Self::FollowerHpHz => "HP",
             Self::FollowerLpHz => "LP",
+            Self::AdsrAttack => "Attack",
+            Self::AdsrDecay => "Decay",
+            Self::AdsrSustain => "Sustain",
+            Self::AdsrRelease => "Release",
         }
     }
 
@@ -716,7 +876,11 @@ impl ModParam {
     pub fn exists_on(self, kind: &ModSourceKind) -> bool {
         match self {
             Self::Rate => kind.rate().is_some(),
-            Self::LfoPhase | Self::LfoPulseWidth => matches!(kind, ModSourceKind::Lfo(_)),
+            Self::LfoPhase
+            | Self::LfoPulseWidth
+            | Self::LfoShapeAmt
+            | Self::LfoJitter
+            | Self::LfoSmooth => matches!(kind, ModSourceKind::Lfo(_)),
             Self::RandomSmooth => matches!(kind, ModSourceKind::Random(_)),
             Self::StepsSlew => matches!(kind, ModSourceKind::Steps(_)),
             Self::FollowerAttack
@@ -724,6 +888,9 @@ impl ModParam {
             | Self::FollowerGain
             | Self::FollowerHpHz
             | Self::FollowerLpHz => matches!(kind, ModSourceKind::EnvelopeFollower { .. }),
+            Self::AdsrAttack | Self::AdsrDecay | Self::AdsrSustain | Self::AdsrRelease => {
+                matches!(kind, ModSourceKind::Adsr(_))
+            }
         }
     }
 }
@@ -741,6 +908,8 @@ pub enum ModSourceKind {
     Random(RandomConfig),
     Mseg(MsegConfig),
     Steps(StepsConfig),
+    /// r.md #117: ノート起点のエンベロープ (rate / retrigger を持たない = 常に `Note`)。
+    Adsr(AdsrConfig),
 }
 
 impl Default for ModSourceKind {
@@ -761,11 +930,11 @@ impl ModSourceKind {
             ModSourceKind::Random(c) => Some(c.rate),
             ModSourceKind::Mseg(c) => Some(c.rate),
             ModSourceKind::Steps(c) => Some(c.rate),
-            ModSourceKind::EnvelopeFollower { .. } => None,
+            ModSourceKind::EnvelopeFollower { .. } | ModSourceKind::Adsr(_) => None,
         }
     }
 
-    /// generator 共通の retrigger (follower は `None`)。
+    /// generator 共通の retrigger (follower は `None`)。 ADSR は常に [`RetriggerMode::Note`]。
     #[must_use]
     pub fn retrigger(&self) -> Option<RetriggerMode> {
         match self {
@@ -773,8 +942,15 @@ impl ModSourceKind {
             ModSourceKind::Random(c) => Some(c.retrigger),
             ModSourceKind::Mseg(c) => Some(c.retrigger),
             ModSourceKind::Steps(c) => Some(c.retrigger),
+            ModSourceKind::Adsr(_) => Some(RetriggerMode::Note),
             ModSourceKind::EnvelopeFollower { .. } => None,
         }
+    }
+
+    /// r.md #117: ノート起点で走る (per-note 変調の対象になる) か。
+    #[must_use]
+    pub fn is_per_note(&self) -> bool {
+        self.retrigger() == Some(RetriggerMode::Note)
     }
 
     /// generator 共通の rate (follower は `None`)。
@@ -784,18 +960,18 @@ impl ModSourceKind {
             ModSourceKind::Random(c) => Some(&mut c.rate),
             ModSourceKind::Mseg(c) => Some(&mut c.rate),
             ModSourceKind::Steps(c) => Some(&mut c.rate),
-            ModSourceKind::EnvelopeFollower { .. } => None,
+            ModSourceKind::EnvelopeFollower { .. } | ModSourceKind::Adsr(_) => None,
         }
     }
 
-    /// generator 共通の retrigger (follower は `None`)。
+    /// generator 共通の retrigger (follower / ADSR は `None` = 変えられない)。
     pub fn retrigger_mut(&mut self) -> Option<&mut RetriggerMode> {
         match self {
             ModSourceKind::Lfo(c) => Some(&mut c.retrigger),
             ModSourceKind::Random(c) => Some(&mut c.retrigger),
             ModSourceKind::Mseg(c) => Some(&mut c.retrigger),
             ModSourceKind::Steps(c) => Some(&mut c.retrigger),
-            ModSourceKind::EnvelopeFollower { .. } => None,
+            ModSourceKind::EnvelopeFollower { .. } | ModSourceKind::Adsr(_) => None,
         }
     }
 
@@ -807,6 +983,7 @@ impl ModSourceKind {
             ModSourceKind::Random(_) => "Rand",
             ModSourceKind::Mseg(_) => "MSEG",
             ModSourceKind::Steps(_) => "Steps",
+            ModSourceKind::Adsr(_) => "ADSR",
         }
     }
 }

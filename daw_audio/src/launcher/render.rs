@@ -32,7 +32,7 @@ pub fn collect_row_midi(
     current_bpm: f32,
     frames: u32,
     out: &mut Vec<TimedNoteEvent>,
-    active_notes: &mut Vec<u8>,
+    active_notes: &mut Vec<(u32, u8)>,
 ) {
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
@@ -138,13 +138,17 @@ pub fn render_row_audio(
 
 /// 鳴っている note を `at` frame で全部止める (区間の切れ目の始末)。
 ///
-/// `note_id` は 0 (= 未指定) — builtin / プラグインとも key 一致で voice を止める
-/// (`process_track_owned` の `pending_offs` と同じ約束)。
-fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut Vec<u8>, at: u32) {
-    for &key in active_notes.iter() {
+/// Off は note-on と同じ `note_id` を運ぶ (CLAP / VST3 は id 一致で voice を探す。
+/// `process_track_owned` の `pending_offs` と同じ約束)。 RT 安全: `out` の容量を超える分は
+/// 捨てる (再確保しない。 `copy_midi` と同じ規約)。
+fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut Vec<(u32, u8)>, at: u32) {
+    for &(note_id, key) in active_notes.iter() {
+        if out.len() >= out.capacity() {
+            break;
+        }
         out.push(TimedNoteEvent {
             time: at,
-            event: crate::sequencer::NoteTransition::Off { note_id: 0, key },
+            event: crate::sequencer::NoteTransition::Off { note_id, key },
         });
     }
     active_notes.clear();
@@ -517,7 +521,8 @@ mod tests {
         // 1 buffer 目: セルが鳴り出す。
         let playing = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         collect_row_midi(Some(&song), 0, playing, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
-        assert_eq!(active.as_slice(), &[60], "セルの note が鳴っていない: {out:?}");
+        assert_eq!(active.len(), 1, "セルの note が鳴っていない: {out:?}");
+        assert_eq!(active[0].1, 60, "セルの note が鳴っていない: {out:?}");
 
         // 2 buffer 目: 先頭ちょうどでアレンジへ返す (`switch_frame == 0`)。
         out.clear();

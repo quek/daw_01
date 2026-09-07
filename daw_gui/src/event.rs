@@ -64,6 +64,8 @@ pub enum AppEvent {
     /// その位置から再生開始。view 層 (`dispatch_shortcuts`) が snap / ルーティング /
     /// song-absolute 解決済みの beat を渡すので、handler は set-playhead + seek/play のみ。
     PlayFromCursor { beat: f64 },
+    /// r.md #118: Shift+Space — 直前に停止した位置から再生を続ける (ホームは動かさない)。
+    PlayContinue,
     /// `Home` キー: プレイヘッドを先頭 (時間的に最初) のクリップの開始位置へ移動。
     /// 既にそこへ飛んだ直後なら 1.1.1 (song 先頭 = beat 0) へ (2 度押しで先頭)。
     /// clip が無ければ先頭へ。 r.md #10。
@@ -922,6 +924,11 @@ pub enum AppEvent {
         source_id: u32,
         depth: f32,
     },
+    /// r.md #115: 1 本の変調のバイパス (Q キー、 ポインタ下の routing 行)。 住所は安定
+    /// `ModRouting::id`。
+    SetModRoutingEnabled { routing_id: u32, enabled: bool },
+    /// r.md #115: モジュレーター全体のバイパス (Q キー、 ポインタ下のヘッダ行 / 本体)。
+    SetModSourceEnabled { id: u32, enabled: bool },
     /// toggle a routing's polarity (`true` = Bipolar, `false` = Unipolar).
     SetModRoutingPolarity {
         track_id: u32,
@@ -1140,6 +1147,9 @@ pub enum AppEvent {
     /// (**`ModSource::id` キー**)、polled ~30Hz from the `AudioBridge` modulation
     /// plane. Drives visual modulation each frame.
     ModScalarsTick(common::mod_plane::ModPlane),
+    /// r.md #117: track ごとの鳴っているボイス `(track index, voice)`、 同じ poller が
+    /// 30Hz で読む。 変調ラックが `Note` 起点ソースのカーソルをボイスごとに描く。
+    TrackVoicesTick(Vec<(usize, common::audio_bridge::VoiceSnapshot)>),
     /// resource monitor (r.md #3): poller が ~30Hz で読む全体メトリクス
     /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate)。
     MetricsTick {
@@ -1940,6 +1950,8 @@ impl AppEvent {
             E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::OutGain(_), .. } => "Parallel 出力",
             E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::GainMatch(_), .. } => "Parallel gain match",
             E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SplitFreq { .. }, .. } => "クロスオーバー周波数",
+            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::ActiveChain(_), .. } => "Selector のアクティブ chain",
+            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SelectorFade(_), .. } => "Selector のフェード時間",
             E::SetParallelSplit { .. } => "Parallel の分割",
             E::SetVideoFxParam { .. } => "映像FX変更",
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
@@ -1965,6 +1977,8 @@ impl AppEvent {
             E::AddModRouting { .. } | E::RemoveModRouting { .. } => "モジュレーション接続",
             E::SetModRoutingDepth { .. } => "モジュレーション深度変更",
             E::SetModRoutingPolarity { .. } => "モジュレーション極性変更",
+            E::SetModRoutingEnabled { .. } => "モジュレーション接続のバイパス切替",
+            E::SetModSourceEnabled { .. } => "モジュレーターのバイパス切替",
 
             // ---- オートメーション ----
             E::AddAutomationPoint { .. } => "ポイント追加",

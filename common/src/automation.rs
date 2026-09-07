@@ -77,6 +77,8 @@ pub fn plain_to_norm_ranged(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => {
             crate::model::SPLIT_FREQ_RANGE.to_norm(plain)
         }
+        // r.md #114: Selector の位置は plain == norm (`0..=1`、 chain 数に依らず全域を等分)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => plain.clamp(0.0, 1.0),
         // 内蔵チャンネルストリップ: レンジの SSoT は `EqParam::range` /
         // `CompParam::range` (`common::model::channel_strip`)。ここで式を持たない。
         AutomationTarget::TrackBuiltin(
@@ -159,6 +161,9 @@ pub fn mod_param_range(param: ModParam) -> Option<(f64, f64)> {
         )),
         ModParam::LfoPhase
         | ModParam::LfoPulseWidth
+        | ModParam::LfoShapeAmt
+        | ModParam::LfoJitter
+        | ModParam::LfoSmooth
         | ModParam::RandomSmooth
         | ModParam::StepsSlew => None,
         // フォロワーの時定数 / ゲイン / 帯域。端点は `common::model` の定数が SSoT で、
@@ -176,6 +181,12 @@ pub fn mod_param_range(param: ModParam) -> Option<(f64, f64)> {
             f64::from(crate::model::MOD_BAND_HZ_MIN),
             f64::from(crate::model::MOD_BAND_HZ_MAX),
         )),
+        // r.md #117: ADSR の時定数 (ms、 対数)。 sustain は 0..=1 の恒等。
+        ModParam::AdsrAttack | ModParam::AdsrDecay | ModParam::AdsrRelease => Some((
+            f64::from(crate::model::ADSR_TIME_MS_MIN),
+            f64::from(crate::model::ADSR_TIME_MS_MAX),
+        )),
+        ModParam::AdsrSustain => None,
     }
 }
 
@@ -299,6 +310,7 @@ pub fn norm_to_plain_ranged(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => {
             crate::model::SPLIT_FREQ_RANGE.from_norm(n)
         }
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => n.clamp(0.0, 1.0),
         // `plain_to_norm_ranged` の厳密逆 (レンジは channel_strip 側が SSoT)。
         AutomationTarget::TrackBuiltin(
             TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
@@ -553,7 +565,7 @@ pub fn song_lane_value_at(song: &Song, lane: &AutomationLane, song_beat: f64) ->
 pub fn modulation_offset_norm(
     target: &AutomationTarget,
     routings: &[ModRouting],
-    scalar: impl Fn(u32) -> f32,
+    scalar: impl Fn(u32) -> Option<f32>,
 ) -> f32 {
     modulation_offset_norm_with(target, routings, scalar, |r| r.depth)
 }
@@ -564,18 +576,26 @@ pub fn modulation_offset_norm(
 /// オートメーションレーンで動く。`depth` はその実効値を返す resolver で、
 /// 動かない変調では `r.depth` をそのまま返す。合成そのものは 1 本のままにして、
 /// 「深さがどこから来るか」だけを差し替える (SSoT)。
+///
+/// r.md #115: **バイパスはここ 1 箇所で除外する**。 `!r.enabled` の routing と、 `scalar` が
+/// `None` を返す source (= 評価計画に無い: `ModSource::enabled == false`、 または面に
+/// 未掲載) の routing は和に加わらない。 0 を足すのではなく **飛ばす** — Bipolar は
+/// scalar 0 でも `-depth` を出すので、 0 扱いではバイパスにならない。
 pub fn modulation_offset_norm_with(
     target: &AutomationTarget,
     routings: &[ModRouting],
-    scalar: impl Fn(u32) -> f32,
+    scalar: impl Fn(u32) -> Option<f32>,
     depth: impl Fn(&ModRouting) -> f32,
 ) -> f32 {
     let mut sum = 0.0f32;
     for r in routings {
-        if &r.target != target {
+        if &r.target != target || !r.enabled {
             continue;
         }
-        let s = scalar(r.source_id).clamp(0.0, 1.0);
+        let Some(s) = scalar(r.source_id) else {
+            continue;
+        };
+        let s = s.clamp(0.0, 1.0);
         let d = depth(r);
         sum += match r.polarity {
             Polarity::Unipolar => d * s,
@@ -603,7 +623,7 @@ pub fn apply_modulation(
     target: &AutomationTarget,
     base: f64,
     routings: &[ModRouting],
-    scalar: impl Fn(u32) -> f32,
+    scalar: impl Fn(u32) -> Option<f32>,
 ) -> f64 {
     apply_modulation_with(target, base, routings, scalar, |r| r.depth)
 }
@@ -613,7 +633,7 @@ pub fn apply_modulation_with(
     target: &AutomationTarget,
     base: f64,
     routings: &[ModRouting],
-    scalar: impl Fn(u32) -> f32,
+    scalar: impl Fn(u32) -> Option<f32>,
     depth: impl Fn(&ModRouting) -> f32,
 ) -> f64 {
     let offset = modulation_offset_norm_with(target, routings, scalar, depth);
@@ -656,7 +676,7 @@ pub fn modulation_offset_norm_with_plane(
     modulation_offset_norm_with(
         target,
         routings,
-        |source_id| plane.scalar(source_id),
+        |source_id| plane.scalar_opt(source_id),
         |r| plane.depth(r.id).unwrap_or(r.depth),
     )
 }
@@ -1750,21 +1770,21 @@ mod tests {
         let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
         let base = 1.0_f64;
         // No routings → base regardless of scalars.
-        assert_eq!(apply_modulation(&target, base, &[], |_| 0.5), base);
+        assert_eq!(apply_modulation(&target, base, &[], |_| Some(0.5)), base);
         let routings = vec![ModRouting {
             id: 1,
             target: target.clone(),
             source_id: 5,
             depth: 0.5,
             polarity: Polarity::Unipolar,
+            enabled: true,
         }];
         assert_eq!(
-            apply_modulation(&target, base, &routings, |_| 0.0),
+            apply_modulation(&target, base, &routings, |_| Some(0.0)),
             base,
             "scalar 0 → base (no modulation)"
         );
-        let v_full =
-            apply_modulation(&target, base, &routings, |sid| if sid == 5 { 1.0 } else { 0.0 });
+        let v_full = apply_modulation(&target, base, &routings, |sid| Some(if sid == 5 { 1.0 } else { 0.0 }));
         assert!(
             v_full > base,
             "unipolar depth 0.5 at scalar 1.0 must raise above base ({base} vs {v_full})"
@@ -1772,12 +1792,39 @@ mod tests {
         // A routing whose target doesn't match is ignored.
         let other = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
         assert_eq!(
-            apply_modulation(&other, 0.0, &routings, |_| 1.0),
+            apply_modulation(&other, 0.0, &routings, |_| Some(1.0)),
             0.0,
             "non-matching target → base unchanged"
         );
         // offset_norm exposes the raw normalized offset.
-        let off = modulation_offset_norm(&target, &routings, |_| 1.0);
+        let off = modulation_offset_norm(&target, &routings, |_| Some(1.0));
         assert!((off - 0.5).abs() < 1e-6, "unipolar depth 0.5 at s=1 → 0.5, got {off}");
+    }
+
+    /// r.md #115: バイパスは **飛ばす** (0 を足すのではない)。 `enabled == false` の routing と、
+    /// 面に無い source (`scalar` が `None`) の routing は、 Bipolar でも offset に寄与しない。
+    #[test]
+    fn bypassed_routing_and_absent_source_are_skipped_even_when_bipolar() {
+        use crate::model::{AutomationTarget, ModRouting, Polarity, TrackBuiltinParam};
+        let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
+        let mk = |id: u32, source_id: u32, enabled: bool| ModRouting {
+            id,
+            target: target.clone(),
+            source_id,
+            depth: 0.5,
+            polarity: Polarity::Bipolar,
+            enabled,
+        };
+        // 有効な Bipolar は scalar 0 で -depth。
+        let live = vec![mk(1, 5, true)];
+        assert!((modulation_offset_norm(&target, &live, |_| Some(0.0)) + 0.5).abs() < 1e-6);
+        // routing バイパス → 0。
+        let bypassed = vec![mk(1, 5, false)];
+        assert_eq!(modulation_offset_norm(&target, &bypassed, |_| Some(0.0)), 0.0);
+        assert_eq!(apply_modulation(&target, 0.25, &bypassed, |_| Some(0.0)), 0.25, "base のまま");
+        // source が面に無い (= バイパス中) → 0。 他の有効な routing は生きる。
+        let mixed = vec![mk(1, 5, true), mk(2, 6, true)];
+        let off = modulation_offset_norm(&target, &mixed, |sid| (sid == 6).then_some(1.0));
+        assert!((off - 0.5).abs() < 1e-6, "source 6 だけ (+0.5)、 source 5 は飛ばす: {off}");
     }
 }

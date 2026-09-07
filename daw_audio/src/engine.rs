@@ -47,7 +47,7 @@ pub const MAX_TRACKS: usize = 32;
 /// `talk_event_id` (= `[0, 1 << 28)` ∪ high band) のどちらとも衝突しない sentinel。
 /// CLAP/VST3 は `note_id` を無視し、 builtin は key 一致で発音/停止するので、
 /// on/off で同値であれば voice 対応が取れる。
-const PREVIEW_NOTE_ID: u32 = u32::MAX;
+const PREVIEW_NOTE_ID: u32 = common::process_data::NOTE_ID_NONE;
 
 /// IPC 受信ループから audio thread へ渡す軽量コマンド。毎 buffer 頭の
 /// `pump_commands` で drain される。v29: shmem / worker pool の重い扱いは
@@ -84,12 +84,16 @@ pub enum EngineCommand {
 pub enum PlaybackCommand {
     Stop = 0,
     Play = 1,
+    /// r.md #118: 停止した位置から続ける再生 (Shift+Space)。 ランチャーのセルを撃ち直さず
+    /// (`arm_reseed` しない)、 止まったときの位相のまま鳴らす。 それ以外は `Play` と同じ。
+    PlayContinue = 2,
 }
 
 impl PlaybackCommand {
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Play,
+            2 => Self::PlayContinue,
             _ => Self::Stop,
         }
     }
@@ -1078,6 +1082,33 @@ impl LocalState {
         }
     }
 
+    /// track ごとの表示用テレメトリ (peak / GR / 鳴っているボイス) を `AudioBridge` へ publish
+    /// する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store のみ (RT 安全)。
+    ///
+    /// ボイス (r.md #117、 変調ラックの per-voice カーソル用) は chain の **最初の** plugin の
+    /// ボイス表 = この track の MIDI 入力 (Selector で別 chain に居ても同じ MIDI を受ける)。
+    /// plugin が無ければ空。
+    fn publish_track_telemetry(&self, bridge: &AudioBridgeHandle, n_tracks: usize) {
+        for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
+            bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
+            // 内蔵チャンネルストリップの GR (docs/plan_channel_strip.md §9)。
+            bridge.set_track_gr_db(i, tr.strip_gr_db);
+            let voices = self
+                .cached_schedule
+                .track_programs
+                .get(i)
+                .and_then(|p| p.voices.first())
+                .into_iter()
+                .flat_map(|vt| vt.iter())
+                .map(|v| common::audio_bridge::VoiceSnapshot {
+                    on_beat: v.on_beat,
+                    on_secs: v.on_secs,
+                    off_secs: v.off_secs,
+                });
+            bridge.publish_track_voices(i, voices);
+        }
+    }
+
     /// r.md #89: この buffer が踏む制御刻みを回して、値面と transport を解く。
     ///
     /// envelope follower の値は `ModRuntime::set_follower` 経由でしか `tick` に
@@ -1109,8 +1140,17 @@ impl LocalState {
                 _ => 0.0,
             }
         };
+        // r.md #117: `Note` 起点のソースの最新ノート = 帰属トラックの device chain 入力で最後に
+        // 鳴った note-on (`PerTrackState::latest_note`)。 slot → source → owner track → scratch。
+        // Arc の clone は参照カウントの増減だけ (確保・解放なし)。
+        let plan = std::sync::Arc::clone(&self.mod_tick.plan);
+        let scratch = &self.scratch;
+        let note_anchor = |plan_slot: u16| -> Option<common::mod_graph::NoteAnchor> {
+            let idx = plan.nodes.get(usize::from(plan_slot))?.owner_track_index?;
+            scratch.get(idx as usize)?.state.latest_note
+        };
         self.mod_tick
-            .run_buffer(song, playhead, frames, sample_rate, follower_env)
+            .run_buffer(song, playhead, frames, sample_rate, follower_env, note_anchor)
     }
 
     /// r.md #40: off-thread が確保した stretch engine を `TrackScratch` へ取り込む。
@@ -1163,12 +1203,17 @@ impl LocalState {
         // so plugins drain cleanly.
         let desired = PlaybackCommand::from_u8(shared.playback.load(Ordering::Acquire));
         match (self.playing, desired) {
-            (false, PlaybackCommand::Play) => {
+            (false, cmd @ (PlaybackCommand::Play | PlaybackCommand::PlayContinue)) => {
                 self.playing = true;
                 // r.md #87 §1.4: 再生の起点は **ユーザーが最後に撃った状態**
                 // (`Track.launcher` / `AutomationLane.launcher`)。フォローアクションで
                 // 移った先は走行状態にしか無いので、停止 → 再生で同じセルが鳴り直す。
-                self.launcher.arm_reseed();
+                // r.md #118: 「停止位置から続ける」 は撃ち直さない — 走行状態 (`launch_beat`)
+                // は停止中も残っていて、seek ぶんは `on_transport_jump` が平行移動済みなので、
+                // 止まったときの位相のまま続く。
+                if cmd == PlaybackCommand::Play {
+                    self.launcher.arm_reseed();
+                }
                 // Play は **現在の playhead からそのまま再生する** (頭出しは
                 // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
                 // が所有する (モデル A = Pro Tools / Ableton 流)。
@@ -1598,12 +1643,7 @@ impl LocalState {
             // Publish per-track peak meters into the shared AudioBridge
             // so the GUI mixer strips animate. Atomic stores, RT-safe.
             // Tracks with effective_mute already have peak_l/r == 0.
-            for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
-                bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
-                // 内蔵チャンネルストリップの GR (docs/plan_channel_strip.md §9)。
-                // peak と同じ走査で出す = 同じ buffer の値だと保証される。
-                bridge.set_track_gr_db(i, tr.strip_gr_db);
-            }
+            self.publish_track_telemetry(bridge, n_tracks);
             // マスターストリップの GR (docs/plan_master_strip.md §6)。波形からは
             // 導けない値なので、per-track の GR と同じスカラー面で publish する。
             let (comp_gr, limiter_gr) = self.master_strip.gain_reduction_db();
@@ -1691,6 +1731,14 @@ impl LocalState {
             let sr = sample_rate as f64;
             if sr > 0.0 && song_ref.is_none() {
                 self.playhead_beats += n as f64 * f64::from(current_bpm) / (60.0 * sr);
+            } else if song_ref.is_some()
+                && let Some(end_beat) = self.mod_tick.beat_at_sample(new_ph, sample_rate)
+            {
+                // buffer **末** の拍 (刻みが解いた値)。次 buffer の頭で `run_buffer` が上書き
+                // するので通常は使われないが、その間に LoadSong で plan が差し替わると
+                // `locate` がこれを起点に張り直す。buffer 頭の拍のままだと張り直しのたびに
+                // 1 buffer ぶん拍が遅れ、再生中に変調器を編集するたびに音が遅れて累積した。
+                self.playhead_beats = end_beat;
             }
             if reached_end {
                 self.queue_all_notes_off();

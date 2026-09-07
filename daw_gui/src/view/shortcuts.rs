@@ -127,6 +127,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "escape", keys: &["Esc"], category: ShortcutCategory::Edit, description: "閉じる / 選択解除 / 編集をキャンセル", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     // ----- 再生 -----
     ShortcutDef { name: "daw.play_toggle", keys: &["Space"], category: ShortcutCategory::Transport, description: "再生 / 停止", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.play_continue", keys: &["Shift+Space"], category: ShortcutCategory::Transport, description: "停止した位置から再生を続ける (ホームは動かない)", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.toggle_loop", keys: &["P"], category: ShortcutCategory::Transport, description: "ループ ON / OFF", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.loop_selected_clip", keys: &["R"], category: ShortcutCategory::Transport, description: "選択クリップの範囲をループして再生 (再押下で解除、未選択ならループ ON/OFF)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.play_from_cursor", keys: &["F"], category: ShortcutCategory::Transport, description: "カーソル位置から再生 (Alt で吸着なし)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
@@ -433,8 +434,8 @@ mod tests {
 
     // -------- r.md #36: プラグインエディタ窓からの転送 -----------------------
 
-    /// 転送対象は Space (再生 / 停止)、Ctrl+S (保存)、Ctrl+Shift+W
-    /// (エディタ窓を全部閉じる) の 3 つだけ。
+    /// 転送対象は Space (再生 / 停止)、Shift+Space (停止点から再開、r.md #118)、Ctrl+S (保存)、
+    /// Ctrl+Shift+W (エディタ窓を全部閉じる) の 4 つだけ。
     ///
     /// 素の英数字キー (P / R / F / S / D / …) を足すとプラグイン自身のショートカットと
     /// 衝突する。 Home / End / Delete / Ctrl+X / Ctrl+C / Ctrl+V / Ctrl+A / 矢印は
@@ -448,7 +449,7 @@ mod tests {
     #[test]
     fn forwarded_set_is_transport_save_and_close_editors() {
         let names: Vec<&str> = forwarded_editor_chords().into_iter().map(|(_, n)| n).collect();
-        assert_eq!(names, vec!["save", "daw.play_toggle", "daw.close_all_plugin_editors"]);
+        assert_eq!(names, vec!["save", "daw.play_toggle", "daw.play_continue", "daw.close_all_plugin_editors"]);
     }
 
     /// 転送 chord は Win32 仮想キーに正しく変換されている

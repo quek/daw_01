@@ -10,6 +10,7 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::event::NudgeStep;
+use crate::state::ModRackHover;
 use crate::event_launcher::{LauncherCellKey, LauncherEvent};
 use crate::view::{
     about, arrangement_view, bottom_panel, clipboard_ops, dirty_guard_modal, export_overlay,
@@ -431,6 +432,95 @@ fn q_device_targets(app: &AppData) -> Vec<u64> {
     app.ui_ephemeral.inspector_hovered_device.into_iter().collect()
 }
 
+/// Q の対象を文脈で決めて mute / bypass を切り替える (`dispatch_shortcuts` の Q 節、 内蔵
+/// ストリップのセクションを先取りした後)。 優先順: 変調ラック (r.md #115) → インスペクタの
+/// device → オートメーションレーン → ノート → クリップ / 時間範囲。
+fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_active: bool) {
+    let device_targets = q_device_targets(app);
+    if let Some(hover) = app.ui_ephemeral.inspector_hovered_mod {
+        // r.md #115: ポインタ下のモジュレーター (ヘッダ / 本体) または routing 行を
+        // バイパス切替。 ラックにボタンは無く、 これが唯一の到達手段 (レーンと同じ)。
+        let song = app.song_doc.song();
+        let event = match hover {
+            ModRackHover::Source(id) => {
+                let enabled = song.mod_sources.iter().find(|m| m.id == id).is_some_and(|m| m.enabled);
+                AppEvent::SetModSourceEnabled { id, enabled: !enabled }
+            }
+            ModRackHover::Routing(routing_id) => {
+                let enabled = song.mod_routing_by_id(routing_id).is_some_and(|r| r.enabled);
+                AppEvent::SetModRoutingEnabled { routing_id, enabled: !enabled }
+            }
+        };
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(event);
+        }));
+    } else if !device_targets.is_empty() {
+        let bypassed = !app.all_devices_bypassed(&device_targets);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetDevicesBypassed {
+                device_ids: device_targets,
+                bypassed,
+            });
+        }));
+    } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
+        // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
+        // ヘッダにボタンは無く、これが唯一の到達手段。
+        let enabled = app
+            .song_doc
+            .song()
+            .automation_lane_by_key(lane.track, lane.lane)
+            .is_some_and(|l| l.enabled);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetLaneEnabled {
+                track_id: lane.track,
+                lane_id: lane.lane,
+                enabled: !enabled,
+            });
+        }));
+    } else if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
+        // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
+        // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
+        // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
+        let notes: Vec<u32> = if !app.selected_note_ids().is_empty() {
+            app.selected_note_ids()
+        } else {
+            app.ui_ephemeral.pianoroll_hover_note.into_iter().collect()
+        };
+        if !notes.is_empty() {
+            let new_muted = !app.all_notes_muted(&notes);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetNotesMuted {
+                    notes,
+                    muted: new_muted,
+                });
+            }));
+        }
+    } else if !is_pianoroll_active && app.selection.time.is_some() {
+        // 範囲が立っていれば **範囲操作** — 境界で分割して範囲部分だけをミュートする
+        // (Live §6.9 "deactivates a selection of material"、
+        // `docs/plan_range_selection.md` §8)。
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.apply_mute_time_selection();
+        }));
+    } else {
+        let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {
+            // audio waveform editor を開いている: その clip を mute。
+            app.ui_ephemeral.audio_editor_clip.into_iter().collect()
+        } else {
+            app.ui_ephemeral.arrangement_hover_clip.into_iter().collect()
+        };
+        if !targets.is_empty() {
+            let new_muted = !app.all_clips_muted(&targets);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetClipsMuted {
+                    targets,
+                    muted: new_muted,
+                });
+            }));
+        }
+    }
+}
+
 fn toggle_hovered_strip_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -565,6 +655,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.play_toggle") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::PlayToggle)
+        }));
+    }
+    // r.md #118: Shift+Space = 停止した位置から再生を続ける (Live)。
+    if ui.take_shortcut("daw.play_continue") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::PlayContinue)
         }));
     }
     if ui.take_shortcut("daw.toggle_loop") {
@@ -912,74 +1008,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // タイブレーカ) なら選択 device。 どちらでもなければ clip / note へ落とす。
     let mixer_active = app.ui_prefs.bottom_panel == Some(0) && pointer_in_bottom;
     if ui.take_shortcut("daw.toggle_mute") && !toggle_hovered_strip_section(app, ui, mixer_active) {
-        let device_targets = q_device_targets(app);
-        if !device_targets.is_empty() {
-            let bypassed = !app.all_devices_bypassed(&device_targets);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetDevicesBypassed {
-                    device_ids: device_targets,
-                    bypassed,
-                });
-            }));
-        } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
-            // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
-            // ヘッダにボタンは無く、これが唯一の到達手段。
-            let enabled = app
-                .song_doc
-                .song()
-                .automation_lane_by_key(lane.track, lane.lane)
-                .is_some_and(|l| l.enabled);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetLaneEnabled {
-                    track_id: lane.track,
-                    lane_id: lane.lane,
-                    enabled: !enabled,
-                });
-            }));
-        } else if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
-            // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
-            // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
-            // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
-            let notes: Vec<u32> = if !app.selected_note_ids().is_empty() {
-                app.selected_note_ids()
-            } else {
-                app.ui_ephemeral.pianoroll_hover_note.into_iter().collect()
-            };
-            if !notes.is_empty() {
-                let new_muted = !app.all_notes_muted(&notes);
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetNotesMuted {
-                        notes,
-                        muted: new_muted,
-                    });
-                }));
-            }
-        } else {
-            // 範囲が立っていれば **範囲操作** — 境界で分割して範囲部分だけをミュートする
-            // (Live §6.9 "deactivates a selection of material"、
-            // `docs/plan_range_selection.md` §8)。
-            if !is_pianoroll_active && app.selection.time.is_some() {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.apply_mute_time_selection();
-                }));
-            } else {
-                let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {
-                    // audio waveform editor を開いている: その clip を mute。
-                    app.ui_ephemeral.audio_editor_clip.into_iter().collect()
-                } else {
-                    app.ui_ephemeral.arrangement_hover_clip.into_iter().collect()
-                };
-                if !targets.is_empty() {
-                    let new_muted = !app.all_clips_muted(&targets);
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetClipsMuted {
-                            targets,
-                            muted: new_muted,
-                        });
-                    }));
-                }
-            }
-        }
+        dispatch_toggle_mute(app, ui, is_pianoroll_active);
     }
 
     // ----- r.md #87: ランチャーのキー操作 (Tab / 矢印 / Enter) -----
@@ -1011,9 +1040,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
             }));
         } else if is_pianoroll_active {
-            // 表示中クリップの全ノートを覆う範囲にする (`docs/plan_range_selection.md` §3.2)。
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.select_all_shown_notes();
+            // r.md #119: 段階拡大 — 1 回目はポインタの鍵盤行の全ノート、 2 回目 (または行に
+            // ノートが無い) で表示中クリップの全ノート (`docs/plan_range_selection.md` §3.2)。
+            let hover_pitch = app.ui_ephemeral.pianoroll_hover_pitch;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.select_all_pianoroll(hover_pitch);
             }));
         } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
             // automation lane 上: 段階拡大。

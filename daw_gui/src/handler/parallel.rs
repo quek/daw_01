@@ -289,6 +289,9 @@ impl AppData {
                 }
                 // 順序 (`low <= high`) と値域は model の setter が SSoT (engine 側も同じ関数)。
                 ParallelMixerEdit::SplitFreq { edge, hz } => return r.set_split_freq(edge, hz),
+                // r.md #114: Selector のアクティブ chain / クロスフェード (同じく model の setter)。
+                ParallelMixerEdit::ActiveChain(chain_id) => return r.set_active_chain(chain_id),
+                ParallelMixerEdit::SelectorFade(ms) => return r.set_selector_fade(ms),
             }
             true
         });
@@ -299,6 +302,12 @@ impl AppData {
                 ParallelMixerEdit::SplitFreq { edge, hz } => {
                     AudioCommand::SetParallelSplitFreq { track, parallel_id, edge, hz }
                 }
+                ParallelMixerEdit::ActiveChain(chain_id) => {
+                    AudioCommand::SetParallelActiveChain { track, parallel_id, chain_id }
+                }
+                ParallelMixerEdit::SelectorFade(fade_ms) => {
+                    AudioCommand::SetParallelSelectorFade { track, parallel_id, fade_ms }
+                }
             };
             self.send_audio(cmd);
         }
@@ -308,7 +317,8 @@ impl AppData {
     /// (値のみ IPC ではない)。 出力数より chain が少なければ空 chain を補い (色は自動)、 既定名
     /// (`Chain N` / 別モードの出力名) の chain は新モードの既定名へ付け替える (Low/Mid/High、
     /// Mid/Side、 off なら `Chain N`)。 ユーザーが付けた名前と中身は据え置き。 出力数を超える
-    /// chain は残す (素通し入力)。 off に戻しても chain は消さない。
+    /// chain は残す (素通し入力)。 off に戻しても chain は消さない。 r.md #114: Selector は 2 本
+    /// (A/B) に補い、 アクティブ chain を実在する id (未解決なら先頭) に揃える。
     pub(crate) fn set_parallel_split(&mut self, parallel_id: u64, split: Split) {
         self.edit_song_checked(move |song| {
             let Some(r) = song.parallel_by_id(parallel_id) else {
@@ -319,7 +329,7 @@ impl AppData {
             if r.split == split {
                 return false;
             }
-            let missing = split.output_count().saturating_sub(r.chains.len());
+            let missing = split.min_chains().saturating_sub(r.chains.len());
             let ids: Vec<u64> = (0..missing).map(|_| song.alloc_device_id()).collect();
             let ancestors = ancestor_colors(song, ChainRef::Chain(0), Some(parallel_id));
             let Some(parallel) = song.parallel_by_id_mut(parallel_id) else {
@@ -338,6 +348,7 @@ impl AppData {
                 c.color = Some(auto_color(&chain_colors(&parallel.chains), &ancestors));
                 parallel.chains.push(c);
             }
+            parallel.normalize_selector();
             true
         });
     }
@@ -441,7 +452,9 @@ impl AppData {
         if r.split.has_params() {
             rows.push(row(ChainRowKind::SplitParams { parallel_id: r.id, split: r.split }));
         }
-        for c in &r.chains {
+        // r.md #114: Selector ならアクティブ chain 以外を薄く出す。
+        let active = r.active_chain_index();
+        for (k, c) in r.chains.iter().enumerate() {
             let open = self.parallel_node_open(c.id);
             rows.push(row(ChainRowKind::Chain {
                 parallel_id: r.id,
@@ -454,6 +467,7 @@ impl AppData {
                 solo: c.solo,
                 open,
                 n_devices: c.devices.len(),
+                inactive: active.is_some_and(|a| a != k),
             }));
             // 展開中 chain の中身は **その chain 行の直下** (他の chain 行はその後ろに続く)。
             if !open {
@@ -595,6 +609,10 @@ pub enum ParallelMixerEdit {
     GainMatch(bool),
     /// r.md #112: 帯域分割のクロスオーバー周波数 (Hz)。
     SplitFreq { edge: common::model::SplitEdge, hz: f32 },
+    /// r.md #114: Selector のアクティブ chain (安定 `ParallelChain::id`)。
+    ActiveChain(u64),
+    /// r.md #114: Selector のクロスフェード時間 (ms)。
+    SelectorFade(f32),
 }
 
 /// 自動色 (Bitwig と同じく作った時点で周囲と別の色)。 パレット (色相順) から、 **兄弟にも祖先

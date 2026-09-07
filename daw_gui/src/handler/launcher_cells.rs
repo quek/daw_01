@@ -378,6 +378,10 @@ impl AppData {
     ///
     /// `scene_index` が実シーン数以上 (= 空きプレースホルダ列) なら
     /// `Song::ensure_scene_at` で列を実体化してから置く。既にセルがあれば no-op。
+    ///
+    /// r.md #113: トラック行に作ったセルはそのまま編集面 (ピアノロール) で開く
+    /// (アレンジの空き地ダブルクリック → `CreateClip` + ピアノロールと同じ)。 作った直後に
+    /// 打ち込みを始められる。 オートメーションレーン行のセルは編集面を持たないので選択だけ。
     pub fn create_launcher_cell(&mut self, row: LauncherRow, scene_index: usize) {
         // `edit_song_checked` を使うのは、行が存在しない / 既にセルがあるときに
         // **空の undo step を積まない**ため (ダブルクリックのたびに履歴が伸びる)。
@@ -397,7 +401,7 @@ impl AppData {
         let Some(cell) = created else {
             return;
         };
-        self.select_launcher_cell(cell, SelectModifier::Single);
+        self.open_cell_editor(cell);
     }
 
     /// セルを削除する。**アレンジのクリップは触らない** (key が指す入れ物だけ)。

@@ -377,3 +377,67 @@ fn enabling_mid_side_split_pads_chains_to_two_without_a_params_row() {
     assert_eq!(r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["Mid", "Side"]);
     assert!(!app.chain_rows().iter().any(|r| matches!(r.kind, ChainRowKind::SplitParams { .. })));
 }
+
+/// r.md #114: Selector は chain を 2 本 (A/B) に補い、 アクティブ chain は先頭の実 id に解決される。
+/// `Active` の切替は値のみ IPC (再 compile なし) で、 chain 行はアクティブ以外が `inactive`。
+/// アクティブ chain を消すと先頭へ落ちる (補償コード無し)。
+#[test]
+fn selector_pads_to_two_chains_and_switches_the_active_chain_value_only() {
+    use common::model::Split;
+    use common::protocol::AudioCommand;
+    use daw_gui::handler::parallel::ParallelMixerEdit;
+    let (mut app, mut audio_rx, _plugin_rx, _proxy) = build_app();
+    let (track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
+    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    let parallel_id = app.song_doc.song().tracks[0].devices[1].id();
+
+    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_SELECTOR });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    let [a, b] = [r.chains[0].id, r.chains[1].id];
+    assert_eq!(r.split, Split::Selector { active_chain: a, fade_ms: Split::DEFAULT_SELECTOR_FADE_MS }, "先頭 chain の実 id");
+    assert_eq!(r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["Chain 1", "Chain 2"]);
+    let inactive = |app: &daw_gui::app::AppData| -> Vec<bool> {
+        app.chain_rows()
+            .iter()
+            .filter_map(|r| match &r.kind {
+                ChainRowKind::Chain { inactive, .. } => Some(*inactive),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(app.chain_rows().iter().any(|r| matches!(r.kind, ChainRowKind::SplitParams { .. })), "Active / Fade の param 行");
+    assert_eq!(inactive(&app), vec![false, true]);
+    let _ = super::support::drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(b) });
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.active_chain_index(), Some(1));
+    assert_eq!(inactive(&app), vec![true, false]);
+    let cmds = super::support::drain(&mut audio_rx);
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            AudioCommand::SetParallelActiveChain { track, parallel_id: p, chain_id }
+                if *track == track_id && *p == parallel_id && *chain_id == b
+        )),
+        "{cmds:?}"
+    );
+    assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
+
+    // fade も値のみ。 無い chain / 同じ chain は何も送らない。
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::SelectorFade(120.0) });
+    assert_eq!(app.song_doc.song().parallel_by_id(parallel_id).unwrap().split.selector_fade_ms(), Some(120.0));
+    let cmds = super::support::drain(&mut audio_rx);
+    assert!(cmds.iter().any(|c| matches!(c, AudioCommand::SetParallelSelectorFade { fade_ms, .. } if *fade_ms == 120.0)));
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(b) });
+    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(9_999) });
+    assert!(super::support::drain(&mut audio_rx).is_empty());
+
+    // アクティブ chain (b) を消す → 先頭 (a) がアクティブ。
+    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![b] });
+    flush_states(&mut app);
+    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    assert_eq!(r.chains.len(), 1);
+    assert_eq!(r.active_chain_index(), Some(0));
+    assert_eq!(inactive(&app), vec![false]);
+}

@@ -221,13 +221,15 @@ pub fn process_track_owned(
 
     // ---- Sequencer: assemble this buffer's MIDI bus ----
     scratch.midi_bus_a.clear();
-    for &k in &scratch.state.pending_offs {
-        // pending_offs は stuck note flush 用なので note_id 不明 → 0
-        // (= "未指定" 相当)。 builtin plugin は voice cleanup で key 一致
-        // で停止するので、 note_id 0 でも実害なし。
+    // RT 安全: `midi_bus_a` の容量 (`MAX_EVENTS`) を超える分は捨てる (再確保しない)。 供給元
+    // (pending_offs / pending_preview / sequencer) は各々 `MAX_EVENTS` 以下だが、 合算は超えうる。
+    let bus_cap = scratch.midi_bus_a.capacity();
+    for &(note_id, key) in scratch.state.pending_offs.iter().take(bus_cap) {
+        // stuck note flush。 note-on と同じ note_id を載せる (CLAP / VST3 は id 一致で
+        // voice を探す。 `0` にすると Surge XT 等で止まらない)。
         scratch.midi_bus_a.push(TimedNoteEvent {
             time: 0,
-            event: NoteTransition::Off { note_id: 0, key: k },
+            event: NoteTransition::Off { note_id, key },
         });
     }
     scratch.state.pending_offs.clear();
@@ -236,7 +238,8 @@ pub fn process_track_owned(
     // (instrument dispatch は playing で gate されないので停止中でも発音する)。
     // collect_events_for_buffer より前に push し、 playing 時は同 buffer の
     // sort (CLAP の time 昇順 / 同 time は Off→On) に乗せる。
-    for &ev in &scratch.state.pending_preview {
+    let room = bus_cap.saturating_sub(scratch.midi_bus_a.len());
+    for &ev in scratch.state.pending_preview.iter().take(room) {
         scratch.midi_bus_a.push(TimedNoteEvent { time: 0, event: ev });
     }
     scratch.state.pending_preview.clear();
@@ -251,6 +254,17 @@ pub fn process_track_owned(
             frames,
             &mut scratch.midi_bus_a,
             &mut scratch.state.active_notes,
+        );
+    }
+    // r.md #117: この track の最新ノート (`Note` 起点のソースを global に落とす起点)。
+    {
+        let sr = f64::from(sample_rate.max(1));
+        scratch.state.observe_latest_note(
+            &scratch.midi_bus_a,
+            playhead_beats,
+            mod_plane.first_sample() as f64 / sr,
+            f64::from(current_bpm) / (60.0 * sr),
+            sample_rate,
         );
     }
 

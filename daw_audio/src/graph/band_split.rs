@@ -1,6 +1,7 @@
 //! r.md #112: Parallel の入力の分割 (`Split`) の RT 部 — [`Splitter`] が variant ごとの分割器を
 //! 包み、 `ChainBegin` は「k 番目の出力」 を読むだけ。 [`MidSideSplit`] は `M = (L+R)/2`、
 //! `S = (L-R)/2` を Mid chain `(M, M)` / Side chain `(S, -S)` に配る (和は `(L, R)` に戻る)。
+//! r.md #114 の `Split::Selector` は [`crate::graph::selector_split::SelectorSplit`] (別ファイル)。
 //! 以下は [`BandSplit`] (3 バンド、 `Split::Frequency3`) の説明。
 //!
 //! 4 次 Linkwitz-Riley (Butterworth 2 次 × 2、24 dB/oct) を 2 段で使う。 LR4 の LP と HP の
@@ -22,6 +23,7 @@
 use common::channel_strip_dsp::{Biquad, BiquadState};
 use common::model::{SPLIT_FREQ_RANGE, Split, SplitBand};
 
+use crate::graph::selector_split::SelectorSplit;
 use crate::mixer::MAX_FRAMES;
 
 /// `Split` の variant ごとの分割器。 compile 時に `Split` から作り (`None` は分割器なし)、 RT は
@@ -30,14 +32,18 @@ pub enum Splitter {
     /// 状態 (biquad 9 段 × 2ch + 出力 6 本) が大きいので Box (variant 間のサイズ差)。
     Frequency3(Box<BandSplit>),
     MidSide(MidSideSplit),
+    /// r.md #114: chain 数ぶんの出力 + 鳴っている note の表を持つので Box。
+    Selector(Box<SelectorSplit>),
 }
 
 impl Splitter {
-    pub fn new(split: Split) -> Option<Self> {
+    /// `n_chains` = この Parallel の chain 数 (`Selector` は chain ごとに出力を持つ)。
+    pub fn new(split: Split, n_chains: usize) -> Option<Self> {
         match split {
             Split::None => None,
             Split::Frequency3 { .. } => Some(Self::Frequency3(Box::default())),
             Split::MidSide => Some(Self::MidSide(MidSideSplit::new())),
+            Split::Selector { .. } => Some(Self::Selector(Box::new(SelectorSplit::new(n_chains)))),
         }
     }
 
@@ -54,6 +60,7 @@ impl Splitter {
                 Some(bs.band(band))
             }
             Self::MidSide(ms) => ms.output(k),
+            Self::Selector(sel) => sel.output(k),
         }
     }
 
@@ -62,6 +69,7 @@ impl Splitter {
         match (self, old) {
             (Self::Frequency3(a), Self::Frequency3(b)) => a.adopt_state_from(b),
             (Self::MidSide(a), Self::MidSide(b)) => a.adopt_state_from(b),
+            (Self::Selector(a), Self::Selector(b)) => a.adopt_state_from(b),
             _ => {}
         }
     }

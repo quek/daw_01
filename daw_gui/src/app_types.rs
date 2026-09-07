@@ -284,6 +284,9 @@ pub enum ChainRowKind {
         open: bool,
         /// preview 四角の数 (= chain 直下の device 数)。
         n_devices: usize,
+        /// r.md #114: Selector で **非アクティブ** な chain (名前を薄く出す。 Selector 以外は常に
+        /// `false`)。 表示だけで、 切替はヘッダ直下の `Active` 欄 (編集面は 1 つ)。
+        inactive: bool,
     },
     /// `+ chain`。
     AddChain { parallel_id: u64 },
@@ -537,6 +540,10 @@ pub enum InspectorScrubField {
     Talk(TalkParamKind),
     /// r.md #112: Parallel の帯域分割クロスオーバー周波数の欄 (Parallel id + 境界)。
     ParallelSplit { parallel_id: u64, edge: common::model::SplitEdge },
+    /// r.md #114: Selector のアクティブ chain 欄 (`Active`)。
+    ParallelSelect { parallel_id: u64 },
+    /// r.md #114: Selector のクロスフェード時間欄 (`Fade`)。
+    ParallelSelectorFade { parallel_id: u64 },
     /// r.md #87: インスペクタ「ローンチ」セクションの数値欄 (セル長 /
     /// フォローアクションの倍率・時間・確率)。
     ///
@@ -556,6 +563,8 @@ pub enum InspectorScrubField {
 pub struct ModSourceRow {
     pub id: u32,
     pub color: [f32; 3],
+    /// r.md #115: バイパス中は `false` (ヘッダの名前 / メーターを減光)。
+    pub enabled: bool,
     /// Live scalar (`0..=1`)。engine が publish した変調値面から **`id` で**
     /// 引いた実測値 — follower env または generator 値 (engine が全種別を publish)。
     pub scalar: f32,
@@ -583,6 +592,10 @@ pub struct ModRoutingRow {
     pub label: String,
     pub depth: f32,
     pub bipolar: bool,
+    /// r.md #115: この 1 本のバイパス (`ModRouting::enabled`)。
+    pub enabled: bool,
+    /// r.md #115: 実際に効いているか (= 自分もソースも有効)。 表示の減光はこちらで決める。
+    pub effective: bool,
 }
 
 /// `AddModSource` で作る変調器の種別タグ。
@@ -593,6 +606,8 @@ pub enum ModSourceKindTag {
     Random,
     Mseg,
     Steps,
+    /// r.md #117: ノート起点のエンベロープ。
+    Adsr,
 }
 
 /// generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated event)。
@@ -605,6 +620,26 @@ pub enum ModSourceEdit {
     Retrigger(common::model::RetriggerMode),
     LfoShape(common::model::LfoShape),
     LfoPhase(f32),
+    /// r.md #116: Shape (位相の曲げ 0..=1、 0.5 = そのまま)。
+    LfoShapeAmt(f32),
+    /// r.md #116: Steps (0 / 1 = off、 最大 `LFO_STEPS_MAX`)。
+    LfoSteps(u8),
+    /// r.md #116: Jitter (0..=1)。
+    LfoJitter(f32),
+    /// r.md #116: Smooth (0..=1)。
+    LfoSmooth(f32),
+    /// r.md #116: Delay (拍、 0..=`LFO_TIME_BEATS_MAX`)。
+    LfoDelay(f32),
+    /// r.md #116: Fade In (拍、 0..=`LFO_TIME_BEATS_MAX`)。
+    LfoFadeIn(f32),
+    /// r.md #117: ADSR の attack (ms)。
+    AdsrAttack(f32),
+    /// r.md #117: ADSR の decay (ms)。
+    AdsrDecay(f32),
+    /// r.md #117: ADSR の sustain (0..=1)。
+    AdsrSustain(f32),
+    /// r.md #117: ADSR の release (ms)。
+    AdsrRelease(f32),
     /// Bitwig 流 Stepped↔Smoothed 連続モーフ (0..=1)。
     RandomSmooth(f32),
     /// 乱数列を引き直す (seed を派生更新)。

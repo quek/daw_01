@@ -11,17 +11,18 @@
 //! (不変条件 9)。
 
 mod bodies;
+mod bodies_lfo;
 mod preview;
 
 use daw_ui_core::{Edit, MsegEditorStyle, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+use crate::state::ModRackHover;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 
-use bodies::{
-    draw_follower_body, draw_lfo_body, draw_mseg_body, draw_random_body, draw_steps_body,
-};
+use bodies::{draw_follower_body, draw_mseg_body, draw_random_body, draw_steps_body};
+use bodies_lfo::{draw_adsr_body, draw_lfo_body};
 
 // 数値 field の base style は inspector 全体で共有するので親モジュールから借りる
 // (ラベル色は `app.theme.core.text` を直接読む)。
@@ -201,7 +202,7 @@ pub(super) fn draw_modulation_rack(
         let add_rect = Rect { x: area.x + area.w - pad - add_w, y: y - 2.0, w: add_w, h: 20.0 };
         // 先頭は現在の選択として表示されるラベル。 dropdown widget が右端に
         // シェブロンを描くので、 ここに `\u{25be}` を入れると下矢印が二重になる → "+" のみ。
-        let add_labels = ["+", "Follow", "LFO", "Random", "MSEG", "Steps"];
+        let add_labels = ["+", "Follow", "LFO", "Random", "MSEG", "Steps", "ADSR"];
         if let Some(picked) = ui.dropdown("inspector_mod_add_src", add_rect, &add_labels, 0)
             && picked > 0
         {
@@ -210,7 +211,8 @@ pub(super) fn draw_modulation_rack(
                 2 => crate::app::ModSourceKindTag::Lfo,
                 3 => crate::app::ModSourceKindTag::Random,
                 4 => crate::app::ModSourceKindTag::Mseg,
-                _ => crate::app::ModSourceKindTag::Steps,
+                5 => crate::app::ModSourceKindTag::Steps,
+                _ => crate::app::ModSourceKindTag::Adsr,
             };
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::AddModSource { kind: tag });
@@ -222,10 +224,18 @@ pub(super) fn draw_modulation_rack(
     let mod_track_choices = app.mod_source_track_choices();
     let mod_track_labels: Vec<&str> = mod_track_choices.iter().map(|(_, l)| l.as_str()).collect();
     let mut any_mod_drag = false;
+    // r.md #115: ポインタ下のモジュレーター / routing 行 (Q のバイパス対象)。 行の矩形は
+    // 描いた順に確定するので、 ここで一緒に判定して最後に 1 回 mirror する。
+    let pointer_pos = ui.pointer().pos;
+    let mut hover: Option<ModRackHover> = None;
+    let hit = |r: Rect| pointer_pos.is_some_and(|(px, py)| r.contains(px, py));
 
     for src in &mod_sources {
         let sid = src.id;
         let expanded = app.ui_ephemeral.expanded_mod_sources.contains(&sid);
+        let block_top = y;
+        // バイパス中は名前 / メーターを減光 (プラグイン行の bypass と同じ見せ方)。
+        let ink = if src.enabled { p.text } else { p.text_faint };
 
         // --- header row: [▶/▼][name/track] [meter] [arm] [×] ---
         //
@@ -237,7 +247,7 @@ pub(super) fn draw_modulation_rack(
         let meter_x = rm_rect.x - 4.0 - meter_w;
         let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
         let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
-        ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, p.text);
+        ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, ink);
         let arm_w = 24.0;
         let arm_x = meter_x - 4.0 - arm_w;
         let node = plan.nodes.iter().find(|n| n.source_id == sid);
@@ -296,7 +306,7 @@ pub(super) fn draw_modulation_rack(
                 name_rect.x,
                 y + 4.0,
                 12.0,
-                p.text,
+                ink,
             );
         }
         ui.button_at(("inspector_mod_src_rm", sid), "\u{00d7}", rm_rect, move || {
@@ -320,9 +330,14 @@ pub(super) fn draw_modulation_rack(
                 K::Random(c) => draw_random_body(ui, &cx, src, c, y),
                 K::Mseg(c) => draw_mseg_body(ui, &cx, src, c, y),
                 K::Steps(c) => draw_steps_body(ui, &cx, src, c, y),
+                K::Adsr(c) => draw_adsr_body(ui, &cx, src, c, y),
             };
             y = next_y;
             any_mod_drag |= drag;
+        }
+        // ヘッダ行 + 展開した本体 = このモジュレーターの矩形。
+        if hit(Rect { x: lx, y: block_top, w: row_w, h: y - block_top }) {
+            hover = Some(ModRackHover::Source(sid));
         }
 
         // --- このソースが駆動している routing をソース直下に表示 (畳んでも見える) ---
@@ -332,11 +347,19 @@ pub(super) fn draw_modulation_rack(
         // 実際に作れる。 旧実装はカーソルトラックの routing しか描かなかったため、
         // それらはどこにも出ず削除できない孤児になっていた。
         for row in app.mod_source_routings(sid) {
+            if hit(Rect { x: lx, y, w: row_w, h: ROW_PITCH }) {
+                hover = Some(ModRackHover::Routing(row.id));
+            }
             let g = RoutingRowGeom { area, pad, lx, row_w, y };
             any_mod_drag |= draw_routing_row(ui, app, g, &row, sid);
             y += ROW_PITCH;
         }
         y += 4.0;
+    }
+    if hover != app.ui_ephemeral.inspector_hovered_mod {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.ui_ephemeral.inspector_hovered_mod = hover;
+        }));
     }
 
     // drag-end edge で sync (scrub 中は dirty のみ)。
@@ -445,7 +468,8 @@ fn draw_routing_row(
             h: 11.0 * 1.2,
         },
         11.0,
-        p.text,
+        // r.md #115: 効いていない (自分かソースがバイパス中) 行は減光。
+        if row.effective { p.text } else { p.text_faint },
     );
     let rm_x = area.x + area.w - pad - 20.0;
     let pol_x = rm_x - 4.0 - 22.0;

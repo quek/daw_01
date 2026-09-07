@@ -53,12 +53,14 @@ pub struct TimedParamEvent {
 /// loop-wrap.
 #[derive(Default)]
 pub struct PerTrackState {
-    /// Pitches currently sounding on this track. Used to flush stuck notes
-    /// on Stop / loop wrap.
-    pub active_notes: Vec<u8>,
-    /// NoteOffs that must fire at frame 0 of the *next* buffer (after
+    /// Notes currently sounding on this track as `(note_id, key)`. Used to flush stuck
+    /// notes on Stop / loop wrap. **note_id を持ち回るのが要点** — CLAP / VST3 のプラグインは
+    /// note-off をノート id で voice に当てる (`-1` だけが「未指定」) ので、 `0` や別 id の
+    /// Off は無視されて鳴りっぱなしになる (Surge XT で停止しても止まらなかった)。
+    pub active_notes: Vec<(u32, u8)>,
+    /// NoteOffs `(note_id, key)` that must fire at frame 0 of the *next* buffer (after
     /// Stop / clip-end) so notes don't hang.
-    pub pending_offs: Vec<u8>,
+    pub pending_offs: Vec<(u32, u8)>,
     /// 鍵盤レーン click のプレビュー note (on/off)。 engine の `pump_commands`
     /// が `EngineCommand::PreviewNote*` を受けてここに積み、
     /// `process_track_owned` が frame 0 で `midi_bus_a` に注入して clear する。
@@ -66,6 +68,14 @@ pub struct PerTrackState {
     /// とは独立 (= sequencer の note 追跡を汚さない)。 lifecycle は GUI 所有
     /// (= mouse release で note-off を送る、 held-value + caller diff)。
     pub pending_preview: Vec<NoteTransition>,
+    /// r.md #117: この track の device chain 入力で **最後に鳴った** note-on の起点 (と、 その
+    /// note-off の秒)。 `Note` 起点のソースを **global** に落とすときの「最新ノート」。
+    /// `process_track_owned` が毎 buffer `midi_bus_a` から更新し、 engine が刻みごとに
+    /// `ModRuntime::set_note_anchor` へ写す。
+    pub latest_note: Option<common::mod_graph::NoteAnchor>,
+    /// `latest_note` の `(note_id, key)` (note-off の対応付け。 同じ key の重なりでも別ノートの
+    /// Off で release を書かない)。
+    pub latest_id: (u32, u8),
 }
 
 impl PerTrackState {
@@ -74,6 +84,42 @@ impl PerTrackState {
             active_notes: Vec::with_capacity(cap),
             pending_offs: Vec::with_capacity(cap),
             pending_preview: Vec::with_capacity(cap),
+            latest_note: None,
+            latest_id: (0, 0),
+        }
+    }
+
+    /// r.md #117: この buffer の MIDI バスから最新ノートを更新する。 `beat0` / `secs0` は
+    /// buffer 先頭の曲位置、 `beats_per_frame` / `sample_rate` で frame を換算する。
+    pub fn observe_latest_note(
+        &mut self,
+        midi: &[TimedNoteEvent],
+        beat0: f64,
+        secs0: f64,
+        beats_per_frame: f64,
+        sample_rate: u32,
+    ) {
+        let sr = f64::from(sample_rate.max(1));
+        for ev in midi {
+            let t = f64::from(ev.time);
+            match ev.event {
+                NoteTransition::On { note_id, key, .. } => {
+                    self.latest_note = Some(common::mod_graph::NoteAnchor {
+                        beat: beat0 + t * beats_per_frame,
+                        secs: secs0 + t / sr,
+                        release_secs: None,
+                    });
+                    self.latest_id = (note_id, key);
+                }
+                NoteTransition::Off { note_id, key } => {
+                    if (note_id, key) == self.latest_id
+                        && let Some(a) = self.latest_note.as_mut()
+                        && a.release_secs.is_none()
+                    {
+                        a.release_secs = Some(secs0 + t / sr);
+                    }
+                }
+            }
         }
     }
 }
@@ -110,7 +156,7 @@ pub fn collect_events_for_buffer(
     frames: u32,
     time_offset: u32,
     out: &mut Vec<TimedNoteEvent>,
-    active_notes: &mut Vec<u8>,
+    active_notes: &mut Vec<(u32, u8)>,
 ) {
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else {
@@ -213,7 +259,7 @@ pub fn collect_events_for_buffer(
                         velocity: f64::from(note.velocity) / 127.0,
                     },
                 });
-                active_notes.push(note.pitch);
+                active_notes.push((note_id, note.pitch));
             }
             if off_abs_beat > on_abs_beat
                 && off_abs_beat >= playhead_beats
@@ -240,7 +286,7 @@ pub fn collect_events_for_buffer(
                         key: note.pitch,
                     },
                 });
-                if let Some(pos) = active_notes.iter().position(|&k| k == note.pitch) {
+                if let Some(pos) = active_notes.iter().position(|&(id, k)| id == note_id && k == note.pitch) {
                     active_notes.swap_remove(pos);
                 }
             }
@@ -333,7 +379,7 @@ mod tests {
         current_bpm: f32,
         frames: u32,
         out: &mut Vec<TimedNoteEvent>,
-        active_notes: &mut Vec<u8>,
+        active_notes: &mut Vec<(u32, u8)>,
     ) {
         let empty: &[Clip] = &[];
         let clips = song
@@ -426,7 +472,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].time, 0);
         assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
-        assert_eq!(active, vec![60]);
+        assert_eq!(active, vec![(common::plugin_metadata::sing_note_id(1, 1), 60)]);
     }
 
     /// muted clip は note イベントを 1 つも emit しない。
@@ -499,7 +545,7 @@ mod tests {
             }
             NoteTransition::Off { .. } => unreachable!(),
         }
-        assert_eq!(active, vec![64]);
+        assert_eq!(active, vec![(common::plugin_metadata::sing_note_id(clip_id, 2), 64)]);
     }
 
     /// r.md #75 が直した欠陥の直接の回帰テスト: clip の**先頭に 1 音足しても**、
@@ -547,7 +593,7 @@ mod tests {
     fn note_off_emitted_in_buffer_containing_end() {
         let song = one_note_song(0.0, 1.0, 60);
         let mut out = Vec::new();
-        let mut active = vec![60u8];
+        let mut active = vec![(common::plugin_metadata::sing_note_id(1, 1), 60u8)];
         // SPB-100 samples ≈ beat 0.9958 (= 1 beat 直前)、 buffer 200 frames で
         // beat 1.0 の note off を捕まえる。 sample→beat 換算は `samples / SPB`。
         let playhead_beats = (SPB - 100) as f64 / SPB as f64;
@@ -623,8 +669,9 @@ mod tests {
             assert_eq!(e.time, 0);
             assert!(matches!(e.event, NoteTransition::On { .. }));
         }
-        active.sort_unstable();
-        assert_eq!(active, vec![60, 64]);
+        let mut keys: Vec<u8> = active.iter().map(|&(_, k)| k).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![60, 64]);
     }
 
     #[test]
@@ -671,7 +718,7 @@ mod tests {
         let playhead = 8 * SPB - 100;
         let frames = 200u32;
         let mut out = Vec::new();
-        let mut active = vec![60u8];
+        let mut active = vec![(common::plugin_metadata::sing_note_id(1, 1), 60u8)];
         // playhead (samples) を beat に変換: samples / SPB。
         let playhead_beats = playhead as f64 / SPB as f64;
         collect(

@@ -217,6 +217,15 @@ pub fn automation_value_display(
             to_display: id,
             from_display: id,
         },
+        // r.md #114: Selector の位置 (0..=1 を全 chain で等分。 chain 数は lane から見えないので
+        // 位置そのまま。 どの chain かはインスペクタの `Active` 欄が示す)。
+        T::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => AutomationValueDisplay {
+            unit: "",
+            format: ScrubableNumberFormat::Decimal(2),
+            range: (0.0, 1.0),
+            to_display: id,
+            from_display: id,
+        },
         T::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
             use common::model::EqParam;
             let (unit, format) = match param {

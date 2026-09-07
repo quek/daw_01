@@ -137,6 +137,11 @@ pub enum TrackBuiltinParam {
     /// 対数)。住所は安定 `Parallel::id` + どちらの境界か。`Split::Frequency3` でない
     /// Parallel に残った lane は何にも効かない (dangling、削除で消える)。
     ParallelSplitFreq { parallel_id: u64, edge: super::SplitEdge },
+    /// r.md #114: Selector のアクティブ chain の位置 (`0..=1`、 chain `k = floor(v · n)`、
+    /// `Split::select_index` が SSoT)。 住所は安定 `Parallel::id`。 基準値は
+    /// `Parallel::select_pos` (アクティブ chain の中央)。 `Split::Selector` でない Parallel に
+    /// 残った lane は何にも効かない (dangling、削除で消える)。
+    ParallelSelect { parallel_id: u64 },
     /// 内蔵チャンネルストリップの EQ セクション ON/OFF (`Mute` と同じ 0.5 閾値の階段)。
     StripEqOn,
     /// 内蔵チャンネルストリップの Comp セクション ON/OFF。

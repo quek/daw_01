@@ -577,6 +577,7 @@ fn draw_chain_row(
     solo: bool,
     open: bool,
     n_devices: usize,
+    inactive: bool,
     row: Rect,
     popup_open: bool,
 ) {
@@ -712,12 +713,19 @@ fn draw_chain_row(
             app.handle_event(AppEvent::RenameParallelChain { chain_id, name: text });
         });
     } else {
+        // r.md #114: Selector の非アクティブ chain は薄く (アクティブなら展開に依らず明色 =
+        // 「今鳴っている chain」 が一目で分かる)。
+        let color = match (inactive, open) {
+            (true, _) => p.text_faint,
+            (false, true) => p.text,
+            (false, false) => p.text_dim,
+        };
         ui.label_at_clipped(
             ("inspector_chain_name", i),
             name,
             Rect { x: name_rect.x, y: row.y + 8.0, w: name_rect.w, h: 11.0 * 1.2 },
             11.0,
-            if open { p.text } else { p.text_dim },
+            color,
         );
     }
     let _ = parallel_id;
@@ -1010,9 +1018,10 @@ fn draw_row(
         ChainRowKind::SplitParams { parallel_id, split } => {
             super::parallel_header::draw_split_row(app, ui, i, *parallel_id, *split, content, popup_open);
         }
-        ChainRowKind::Chain { parallel_id, chain_id, name, color, gain, pan, muted, solo, open, n_devices } => {
+        ChainRowKind::Chain { parallel_id, chain_id, name, color, gain, pan, muted, solo, open, n_devices, inactive } => {
             draw_chain_row(
-                app, ui, i, *parallel_id, *chain_id, name, *color, *gain, *pan, *muted, *solo, *open, *n_devices, content, popup_open,
+                app, ui, i, *parallel_id, *chain_id, name, *color, *gain, *pan, *muted, *solo, *open, *n_devices, *inactive, content,
+                popup_open,
             );
         }
         ChainRowKind::AddChain { parallel_id } => draw_add_chain_row(ui, i, *parallel_id, content, popup_open),
