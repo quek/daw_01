@@ -1,8 +1,6 @@
 //! `button` ウィジェット — クリックされると `Edit<M>` を発行する。
 //!
-//! クリック判定: **press 開始位置を記憶**するモデル。
-//! - press inside → `press_started_inside = true` を記憶
-//! - release inside かつ `press_started_inside` → click 発火
+//! クリック判定は [`Ui::primary_click`] ([`crate::click`]): press も release もこのボタンの上。
 //! - press outside で始まったクリックは release が内側でも発火しない
 //! - press 中に外れて戻ってきても、release が内側なら click 発火 (Windows 標準挙動)
 //!
@@ -23,14 +21,6 @@ pub enum ButtonTextAlign {
     /// 左寄せ (`tx = rect.x`)。 track 名など先頭が識別に最重要なラベル用
     /// (Reaper / Cubase / Live のトラック名と同じ)。 省略時の左寄せとも一致する。
     Left,
-}
-
-/// button の永続状態。
-#[derive(Debug, Default)]
-pub(crate) struct ButtonState {
-    /// 直近の primary press がこのボタン内から始まったか。
-    /// release 時の click 判定に使う。release で false にリセット。
-    press_started_inside: bool,
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -131,22 +121,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let blocked = self.pointer_blocked_by_modal_popup();
         let inside = !blocked && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
-        // press 開始位置の記録と click 判定。
-        let (visual_pressed, click) = {
-            let state: &mut ButtonState = self.widget_state(wid);
-            if pointer.primary_just_pressed {
-                state.press_started_inside = inside;
-            }
-            let started = state.press_started_inside;
-            // 視覚: 「このボタンで押下が始まり、今もボタン内にホールド中」のときだけ pressed 表示。
-            let visual_pressed = started && inside && pointer.primary_pressed;
-            // click: release inside かつこのボタンで press が始まっていた。
-            let click = pointer.primary_just_released && started && inside;
-            if pointer.primary_just_released {
-                state.press_started_inside = false;
-            }
-            (visual_pressed, click)
-        };
+        // click 判定 (press もこのボタンで始まっていたときだけ)。 視覚は「このボタンで
+        // 押下が始まり、今もボタン内にホールド中」のときだけ pressed 表示。
+        let crate::click::ClickState { clicked: click, held: visual_pressed } =
+            self.primary_click(wid, inside);
 
         // M4 Phase 11: 描画を with_widget_node で input_hash キャッシュ。
         // input_hash の入力は visual に影響する: rect / text / inside / visual_pressed / font_size。
@@ -592,7 +570,7 @@ mod tests {
             },
         );
 
-        // release inside → press_started_inside == false なので click 発火しない
+        // release inside → press の所有者でないので click 発火しない
         let observed = Cell::new(true);
         host.frame_to_edits(
             &(),

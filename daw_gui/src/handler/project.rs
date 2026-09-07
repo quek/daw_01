@@ -45,9 +45,8 @@ impl AppData {
         // 同じ id が新 Song の別ノートに当たりうる。
         self.recording.midi_recording_active_notes.clear();
         self.stop();
-        // r.md #118: 停止点 (Shift+Space の再開点) は旧 Song の拍なので捨てる。
-        self.transport.stop_point = None;
-        self.transport.play_origin_override = None;
+        // r.md #121: ホーム (Space が再生を始める位置) は旧 Song の拍なので捨てる。
+        self.transport.home_beat = None;
         self.silence_monitor_notes();
         // r.md #67: カーソルキーの試聴音も止める (旧 Song の track id 宛の note-off が
         // 新 Song で宙に浮かないよう、モニター音と同じ扱いにする)。
@@ -607,7 +606,7 @@ impl AppData {
             self.media.pending_thumbnail_uploads.push(id);
         }
         // 音が揃った時点で再生 gate を外す (画像 / サムネイルは待たない)。
-        if audio_remaining == 0 && self.transport.pending_play {
+        if audio_remaining == 0 && self.transport.pending_play.is_some() {
             self.fire_pending_play();
         }
         if done >= total {

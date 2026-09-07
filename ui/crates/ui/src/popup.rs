@@ -269,6 +269,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             && thumb.contains(px, py)
         {
             drag = Some((py, offset));
+            // thumb を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+            let scrollbar = self.current_popup_id().child(b"popup_scrollbar");
+            self.claim_press(scrollbar);
         }
         if let Some((anchor_py, anchor_offset)) = drag
             && let Some((_, py)) = pointer.pos

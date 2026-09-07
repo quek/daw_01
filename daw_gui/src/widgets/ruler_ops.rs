@@ -11,7 +11,7 @@
 
 use common::snap::SnapConfig;
 use daw_ui_core::widgets::heavy::HeavyCtx;
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
 /// loop band の hit 種別 (start handle / end handle / 中央 / 範囲外)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +156,52 @@ pub fn draw_loop_band<M: ?Sized + 'static>(
         );
     }
 }
+
+/// ホーム印 (r.md #121): Space が再生を始める位置を ruler の下辺に ▽ (下向き三角) で描く。
+/// Live の insert marker と同じ役割。 プレイヘッド線と同じ色だが形が違うので見分けがつく。
+/// arrangement / piano_roll 両 widget が ruler 上に同 idiom で描くための共有 helper。
+///
+/// 三角は線の primitive だけで描く (glyph は font 不在で不可視になる — `ui/CLAUDE.md`
+/// の disclosure 罠)。 幅 [`HOME_MARKER_W`] / 高さ [`HOME_MARKER_H`] を 1px の水平線で
+/// 下辺から積み上げる。 ruler の外 (view の左右) なら描かない。
+pub fn draw_home_marker<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    beat: f64,
+    start_beat: f64,
+    len_beats: f64,
+    ruler: Rect,
+    color: Color,
+) {
+    if ruler.h <= 0.0 || beat < start_beat || beat > start_beat + len_beats {
+        return;
+    }
+    let beat_to_px = f64::from(ruler.w) / len_beats.max(1e-6);
+    #[allow(clippy::cast_possible_truncation)]
+    let x = (ruler.x + ((beat - start_beat) * beat_to_px) as f32).round();
+    let h = HOME_MARKER_H.min(ruler.h);
+    let bottom = ruler.y + ruler.h;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rows = h.max(1.0) as usize;
+    let segments: Vec<LineSegment> = (0..rows)
+        .map(|i| {
+            // 下辺 (i = 0) が頂点、 上へ行くほど広がる。
+            let t = (i as f32 + 0.5) / h;
+            let half = HOME_MARKER_W * 0.5 * t;
+            let y = bottom - i as f32 - 0.5;
+            LineSegment { a: [x - half, y], b: [x + half, y], color }
+        })
+        .collect();
+    hctx.push_lines(LineBatch {
+        segments: segments.into(),
+        line_width_px: 1.0,
+        clip_rect: Some(ruler),
+    });
+}
+
+/// [`draw_home_marker`] の三角の幅 (px、 底辺)。
+pub const HOME_MARKER_W: f32 = 10.0;
+/// [`draw_home_marker`] の三角の高さ (px)。
+pub const HOME_MARKER_H: f32 = 6.0;
 
 fn push_filled_rect<M: ?Sized + 'static>(hctx: &mut HeavyCtx<'_, '_, M>, r: Rect, fill: Color) {
     hctx.push_rect(RectCommand {

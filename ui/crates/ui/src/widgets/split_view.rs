@@ -65,6 +65,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // state 取得 + drag 処理。比率の真値は caller の `ratio`。
         let base = ratio.clamp(0.05, 0.95);
         let mut next_ratio = None;
+        let mut grabbed = false;
         let ratio = {
             let state: &mut SplitState = self.widget_state(wid);
             // handle 矩形を計算
@@ -81,6 +82,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     Orientation::Vertical => py,
                 };
                 state.drag_anchor = Some(DragAnchor { pointer_axis: p_axis, start_ratio: base });
+                grabbed = true;
             }
             // drag 中
             let mut live = base;
@@ -102,6 +104,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             live
         };
+        // 掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if grabbed {
+            self.claim_press(wid);
+        }
         if let Some(next) = next_ratio {
             self.push_edit(on_change(next));
             // drag で境界が動いたフレーム → 次フレーム再描画 (利用者が on_event で

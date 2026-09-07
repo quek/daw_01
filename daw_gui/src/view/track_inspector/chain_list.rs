@@ -14,7 +14,7 @@
 //! `SC` で行直下に展開する (source は他 track + 同 track の Parallel 内 chain)。
 
 use daw_ui_core::{
-    DragListRow, DragListSlot, DragListStyle, Edit, KnobStyle, ToggleButtonStyle, Ui,
+    DragListRow, DragListSlot, DragListStyle, Edit, KnobStyle, ToggleButtonStyle, Ui, WidgetId,
 };
 use daw_ui_renderer::{Color, Rect};
 
@@ -371,10 +371,8 @@ fn draw_parallel_band(
         // 帯 (と括弧の横棒) の click で picker。 hit は chain の色見本と同じく帯より少し広く。
         let hit = Rect { x: content.x, y: content.y, w: BRACKET_STUB_W, h: content.h };
         let pointer = ui.pointer();
-        if pointer.primary_just_released
-            && pointer.pos.is_some_and(|(px, py)| hit.contains(px, py))
-            && !popup_open
-        {
+        let inside = !popup_open && pointer.pos.is_some_and(|(px, py)| hit.contains(px, py));
+        if ui.primary_click(WidgetId::ROOT.child((b"inspector_parallel_band", *parallel_id)), inside).clicked {
             let parallel_id = *parallel_id;
             let anchor = Rect { x: content.x, y: content.y, w, h: content.h };
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -692,8 +690,10 @@ fn draw_chain_row(
     };
     let swatch_hit = Rect { x: row.x, y: row.y, w: 10.0, h: row.h };
     let pointer = ui.pointer();
-    let swatch_clicked = pointer.primary_just_released
-        && pointer.pos.is_some_and(|(px, py)| swatch_hit.contains(px, py));
+    let swatch_inside = pointer.pos.is_some_and(|(px, py)| swatch_hit.contains(px, py));
+    let swatch_clicked = ui
+        .primary_click(WidgetId::ROOT.child((b"inspector_chain_swatch", chain_id)), swatch_inside)
+        .clicked;
     let fill = color
         .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
         .unwrap_or(p.text_dim);
@@ -747,11 +747,8 @@ pub(super) fn draw_disclosure(
     // 枠も背景も無い glyph だけ (arrangement の group disclosure と同じ): release の hit test。
     let hit = Rect { x: x - 2.0, y: row.y + 4.0, w: 13.0, h: ROW_H - 8.0 };
     let pointer = ui.pointer();
-    if !popup_open
-        && pointer.primary_just_released
-        && let Some((px, py)) = pointer.pos
-        && hit.contains(px, py)
-    {
+    let inside = !popup_open && pointer.pos.is_some_and(|(px, py)| hit.contains(px, py));
+    if ui.primary_click(WidgetId::ROOT.child((b"inspector_disclosure", id)), inside).clicked {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id });
         }));

@@ -565,10 +565,11 @@ impl AppData {
     /// (量子化待ちに落ちないこと) は engine 側が担保する — `process_buffer` が
     /// **transport 要求を消費する前**の `playing` を発火拍の解決に渡す。
     ///
-    /// 再生位置は動かさない (Play と同じ「今の playhead からそのまま」)。
+    /// 再生位置は動かさない (いま見えているプレイヘッドからそのまま。 ホームへは
+    /// 頭出ししない — 撃ったのはセルであってアレンジではない)。
     fn ensure_transport_rolling(&mut self) {
         if !self.transport.is_playing {
-            self.start_transport(None);
+            self.start_transport(None, crate::state::PlayFrom::Playhead);
         }
     }
 
@@ -703,6 +704,21 @@ impl AppData {
             cell.launch.looping,
         )?;
         Some(cell.clip.start_beat + phase)
+    }
+
+    /// r.md #121: クリップ編集面の ruler に描くホーム (Space が再生を始める位置)。
+    /// アレンジのクリップは song の拍そのもの。 ランチャーのセルは自分の時間軸で回る
+    /// (= song の拍を写すと無意味な位置を指す) ので `None`。
+    #[must_use]
+    pub fn editor_home_beat(&self, target: ClipKey) -> Option<f64> {
+        let song = self.song_doc.song();
+        let is_cell = song
+            .track_by_id(target.track_id)
+            .is_some_and(|t| t.session_clip_by_id(target.clip_id).is_some());
+        if is_cell {
+            return None;
+        }
+        self.transport.home_beat.map(f64::from)
     }
 
     /// 行の走行状態 (engine 観測値)。`None` = engine がその行を publish していない

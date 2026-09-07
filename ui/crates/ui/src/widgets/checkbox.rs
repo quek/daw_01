@@ -1,6 +1,6 @@
 //! `checkbox` ウィジェット — bool toggle。click でチェック状態を反転する `Edit<M>` を発行。
 //!
-//! クリック判定は `button` と同じ armed-state モデル (`press_started_inside`) を使う。
+//! クリック判定は `button` と同じ [`Ui::primary_click`] (press も release もこの widget の上)。
 //! 視覚: 16px の正方形チェック枠 + チェック時の塗りつぶし + ラベル。
 
 use std::hash::Hash;
@@ -11,12 +11,6 @@ use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::ui::Ui;
-
-/// checkbox の永続状態 (button と同形式)。
-#[derive(Debug, Default)]
-pub(crate) struct CheckboxState {
-    press_started_inside: bool,
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckboxResponse {
@@ -48,20 +42,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
-        // armed-state click 判定 (button と同じモデル)。
-        let (visual_pressed, click) = {
-            let state: &mut CheckboxState = self.widget_state(wid);
-            if pointer.primary_just_pressed {
-                state.press_started_inside = inside;
-            }
-            let started = state.press_started_inside;
-            let visual_pressed = started && inside && pointer.primary_pressed;
-            let click = pointer.primary_just_released && started && inside;
-            if pointer.primary_just_released {
-                state.press_started_inside = false;
-            }
-            (visual_pressed, click)
-        };
+        // click 判定 (button と同じ `primary_click`)。
+        let crate::click::ClickState { clicked: click, held: visual_pressed } =
+            self.primary_click(wid, inside);
 
         // 描画。M4 Phase 11: with_widget_node で input_hash キャッシュ。
         let input_hash = hash_inputs((

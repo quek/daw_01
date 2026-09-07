@@ -258,6 +258,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         header_w: app.ui_prefs.arrange_header_w,
         ruler_h: RULER_H,
         playhead_beat: app.transport.playhead_beat.map(|b| b as f64),
+        home_beat: app.transport.home_beat.map(f64::from),
         loop_range,
         data_generation,
         bpm: app.song_doc.song().bpm,

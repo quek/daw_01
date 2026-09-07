@@ -201,6 +201,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// r.md #71 (プラグインのコピー / 移動): widget / view をまたぐ drag の payload
     /// (同時に 1 本)。 詳細と寿命は [`crate::drag_drop`]。
     drag_payload: Option<crate::drag_drop::DragPayload>,
+    /// daw_01 r.md #122: 直近の primary press の所有者 (press〜release の間だけ `Some`)。
+    /// 詳細は [`crate::click`]。
+    press_owner: Option<WidgetId>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -276,6 +279,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             text_metrics: TextMetrics::new(),
             owned_font_system: None,
             drag_payload: None,
+            press_owner: None,
             _m: PhantomData,
         }
     }
@@ -641,6 +645,11 @@ impl<M: ?Sized + 'static> UiHost<M> {
         {
             p.modifiers = pointer.modifiers;
         }
+        // daw_01 r.md #122: 新しい press は所有者を取り直す (前の gesture の所有者が
+        // release を取りこぼして残っていても引き継がない)。
+        if pointer.primary_just_pressed {
+            self.press_owner = None;
+        }
 
         // M15: OS text store (TSF) がこのフレームに加えた編集 (まぜ書き変換 / 再変換 /
         // composition 確定) を drain し、`ImeEvent` に変換して ime_events 先頭へ置く
@@ -882,6 +891,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_double_click_press: &mut pending_double_click_press,
             pending_secondary_click: &mut pending_secondary_click,
             drag_payload: &mut self.drag_payload,
+            press_owner: &mut self.press_owner,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -965,6 +975,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // 中で `take_drag_payload` するので取りこぼさない。
         if pointer.primary_just_released {
             self.drag_payload = None;
+            // daw_01 r.md #122: press の所有者は release で終わる ([`crate::click`])。
+            self.press_owner = None;
         }
         edits
     }
@@ -1133,6 +1145,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `Ui` は `&mut UiHost` を持たずフィールドごとに借用する構造なので、 この 1 本を
     /// 通さないと [`crate::drag_drop`] の `impl Ui` から payload に触れない。
     pub(crate) drag_payload: &'a mut Option<crate::drag_drop::DragPayload>,
+    /// daw_01 r.md #122: primary press の所有者 ([`crate::click`])。
+    pub(crate) press_owner: &'a mut Option<WidgetId>,
     _m: PhantomData<&'a M>,
 }
 
@@ -1372,6 +1386,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.open_popups
             .get(&wid)
             .map(|s| (s.scroll_offset, s.scroll_drag))
+    }
+
+    /// `popup_layer` の body で描画中の popup の id (body の外では `ROOT`)。 popup の中身
+    /// (項目行) が click 所有者 id の親に使う ([`crate::click`])。
+    pub(crate) fn current_popup_id(&self) -> WidgetId {
+        self.current_popup.unwrap_or(WidgetId::ROOT)
     }
 
     /// [`Ui::current_popup_scroll`] の書き込み側。body の外では no-op。

@@ -339,6 +339,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             current_depth
         };
 
+        // 掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if pointer.primary_just_pressed
+            && pointer.pos.is_some_and(|(px, py)| thumb_rect.contains(px, py))
+        {
+            self.claim_press(wid);
+        }
         // depth gesture が press を掴んだフレームは meter reset 抑止のため click を消費する。
         if grabbed_depth_press {
             self.consume_pointer_click();

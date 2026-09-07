@@ -586,6 +586,9 @@ pub struct ArrangementView {
     pub ruler_h: f32,
     /// playhead 線を描く拍位置 (`None` で disabled)。
     pub playhead_beat: Option<f64>,
+    /// r.md #121: ホーム (Space が再生を始める位置) の拍。 ruler の下辺に ▽ で描く
+    /// (`ruler_ops::draw_home_marker`)。 `None` で描かない。
+    pub home_beat: Option<f64>,
     /// ループ範囲 (`Some((start, end))`)。`start <= end` 前提。
     pub loop_range: Option<(f64, f64)>,
     /// track 構成 / clip 編集で bump する hook (cache busting)。
@@ -627,6 +630,7 @@ impl Default for ArrangementView {
             header_w: 160.0,
             ruler_h: 24.0,
             playhead_beat: None,
+            home_beat: None,
             loop_range: None,
             data_generation: 0,
             bpm: 120.0,

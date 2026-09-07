@@ -1318,7 +1318,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 local_x_px: local_x,
                 local_y_px: local_y,
             };
-            if pointer.primary_just_released {
+            // click は press もこの波形の上で始まっていたときだけ (r.md #122)。
+            if self.primary_click(wid, true).clicked {
                 response.clicked_at = Some(hit);
             }
             if pressed_inside(rect, pointer) {

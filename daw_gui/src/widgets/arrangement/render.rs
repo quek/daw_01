@@ -834,6 +834,17 @@ fn render_arrangement_heavy(
             f.style,
         );
     }
+    // r.md #121: ホーム印は playhead 線より奥 (同じ位置なら線が上に乗る)。
+    if let Some(home) = f.view.home_beat {
+        crate::widgets::ruler_ops::draw_home_marker(
+            hctx,
+            home,
+            f.view.start_beat,
+            f.view.len_beats,
+            ruler,
+            f.style.playhead_color,
+        );
+    }
     if let Some(b) = f.view.playhead_beat
         && b >= f.view.start_beat
         && b <= f.view.start_beat + f.view.len_beats

@@ -207,6 +207,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // press 時に points.len() を確認し、 drag 開始可否を確定。 release 後または points が
         // 外部削除されて stale idx を持つ場合は drag = None にリセット (idx が範囲外なら
         // on_change を呼ばない)。
+        let mut grabbed = false;
         let drag = {
             let state: &mut AutomationCurveState = self.widget_state(wid);
             if pointer.primary_just_pressed
@@ -214,6 +215,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && idx < points.len()
             {
                 state.drag = Some((idx, points[idx]));
+                grabbed = true;
             }
             if pointer.primary_just_released {
                 state.drag = None;
@@ -226,6 +228,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             state.drag
         };
+        // 点を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if grabbed {
+            self.claim_press(wid);
+        }
 
         // drag 中なら Edit 発行 (1 フレームに 1 回呼ばれる on_change はその場で消費)
         if let Some((idx, _initial)) = drag

@@ -186,6 +186,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // --- drag state 更新 + action 抽出 (scope を分けて借用を early release) ---
         let mut action: Option<MsegAction> = None;
+        // ノード / tension を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if pointer.primary_just_pressed && (hovered_node.is_some() || hovered_tension.is_some()) {
+            self.claim_press(wid);
+        }
         {
             let st: &mut MsegEditorState = self.widget_state(wid);
             // press: Alt+ノード = 削除、ノード = drag開始、tension = curve drag開始。
@@ -420,11 +424,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let cell = rect.w / n as f32;
 
         let mut set: Option<(usize, f32)> = None;
+        let pressed_inside = pointer.primary_just_pressed
+            && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+        // 塗り始めた press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if pressed_inside {
+            self.claim_press(wid);
+        }
         {
             let st: &mut StepGridState = self.widget_state(wid);
-            if pointer.primary_just_pressed
-                && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py))
-            {
+            if pressed_inside {
                 st.painting = true;
             }
             if pointer.primary_just_released {

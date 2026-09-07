@@ -142,6 +142,20 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 - audio thread 連携等の advanced 用途では `frame_to_edits(&model, ...) -> Vec<Edit<M>>` を使う (利用者が apply タイミングと request_redraw 制御)。
 - offscreen / headless test では `UiHost::no_redraw()` を使う。
 
+### click は「press も release も同じ widget」 (`Ui::primary_click` が唯一の口)
+
+- **`rect 内 && pointer.primary_just_released` を click として直接読まない。** 別 widget で
+  始めたドラッグの終わり (数値欄を縦にドラッグして dropdown の上で離す) まで click に化ける
+  (daw_01 r.md #122)。 widget ごとに `press_started_inside` を持つ方式も、 press を受けた
+  widget が release 側より後に描かれる配置で釣り合わず同じバグが再発する。
+- press の所有者は `UiHost` が 1 つだけ持つ ([`crates/ui/src/click.rs`](crates/ui/src/click.rs))。
+  click widget は `ui.primary_click(wid, inside)` を毎フレーム呼ぶ (press フレームで所有者
+  になり、 release フレームで所有者なら `clicked`)。 ドラッグ系 widget は press を掴んだ
+  フレームに `ui.claim_press(wid)` で所有者を名乗る (行の中の fader を掴んで行の上で離しても
+  行の click にならない)。 所有者は release フレームの末尾に消える。
+- テストで click を模すときは **同じフレームに `primary_just_pressed` と `primary_just_released`
+  の両方** を立てる (release だけの frame は誰の click にもならない)。
+
 ### widget state の downcast
 - `state: HashMap<WidgetId, Box<dyn WidgetState>>` から型復元するとき、`Box<dyn WidgetState>` 自身に WidgetState の blanket impl が当たって外側 Box の TypeId を返すバグに注意。`&mut **entry` で明示的に deref してから `as_any_mut().downcast_mut::<S>()` する (M2 で修正、回帰テスト済)。
 

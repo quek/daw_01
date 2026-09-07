@@ -180,6 +180,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         velocity_lane_h: VEL_LANE_H,
         // r.md #87: セルを開いているときはセル内の位相 (song の playhead ではない)。
         playhead_beat: app.editor_playhead_beat(target),
+        home_beat: app.editor_home_beat(target),
         ruler_h: RULER_H,
         bpm: app.song_doc.song().bpm,
         time_sig: app.song_doc.song().time_sig,

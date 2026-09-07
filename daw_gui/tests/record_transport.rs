@@ -184,7 +184,7 @@ fn 再生中の_rec_はパンチインで_count_in_を使わない() {
     // ruler をクリックして beat 8 から再生した状態 (= 停止ホームは 8)。
     app.handle_event(AppEvent::PlayFromCursor { beat: 8.0 });
     tick(&mut app, true, false, samples_at_beat(12.0));
-    let origin_before = app.transport.playback_origin_beat;
+    let home_before = app.transport.home_beat;
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::ToggleMidiRecording);
@@ -203,10 +203,7 @@ fn 再生中の_rec_はパンチインで_count_in_を使わない() {
         }),
         "パンチインは count-in 無しで録音を開始する: {sent:?}"
     );
-    assert_eq!(
-        app.transport.playback_origin_beat, origin_before,
-        "パンチインは停止ホームを動かさない"
-    );
+    assert_eq!(app.transport.home_beat, home_before, "パンチインはホームを動かさない");
 }
 
 /// Rec 再押下はパンチアウト — 録音だけ終わり、transport は止めない。
@@ -237,11 +234,11 @@ fn rec_再押下は録音だけ終えて再生を続ける() {
     );
 }
 
-/// engine が止まったのを観測したら、どんな止まり方でも録音セッションが閉じ、
-/// プレイヘッドは録音を始めた位置へ戻る。曲末 auto-stop / crash / 書き出しが
-/// すべてこの合流点を通る。
+/// engine が止まったのを観測したら、どんな止まり方でも録音セッションが閉じる。
+/// プレイヘッドは止まった位置に留まり (r.md #121)、ホーム (録音を始めた位置) は
+/// 次の Space が使う。曲末 auto-stop / crash / 書き出しがすべてこの合流点を通る。
 #[test]
-fn 停止の観測で録音が閉じ再生開始位置へ戻る() {
+fn 停止の観測で録音が閉じプレイヘッドは停止位置に留まる() {
     let (mut app, mut audio_rx, _p) = build_app();
     arm_first_track(&mut app);
     // beat 4 から再生 → そこでパンチイン (= 停止ホームは 4)。
@@ -257,12 +254,13 @@ fn 停止の観測で録音が閉じ再生開始位置へ戻る() {
 
     assert!(!app.recording.requested, "停止したら録音は閉じる");
     assert!(!app.recording.live);
-    assert_eq!(
-        app.transport.playhead_beat,
-        Some(4.0),
-        "停止ホーム (録音を始めた位置) へ戻る"
-    );
+    assert_eq!(app.transport.playhead_beat, Some(9.0), "止まった位置に留まる");
+    assert_eq!(app.transport.home_beat, Some(4.0), "ホーム (録音を始めた位置) は残る");
     let sent = drain(&mut audio_rx);
+    assert!(
+        !sent.iter().any(|c| matches!(c, AudioCommand::SeekTo { .. })),
+        "停止で engine のカーソルを動かさない: {sent:?}"
+    );
     assert!(
         sent.contains(&AudioCommand::StopRecording),
         "engine 側の録音セッションも閉じる: {sent:?}"

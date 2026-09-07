@@ -255,6 +255,10 @@ pub struct PianoRollView {
     /// `Some(b)` で `b` が `[start_beat, start_beat + len_beats]` 範囲内なら、
     /// note grid と velocity lane を縦断する 1 本の線が描かれる。
     pub playhead_beat: Option<f64>,
+    /// r.md #121: ホーム (Space が再生を始める位置) の song-global 拍。 ruler の下辺に ▽ で
+    /// 描く (`ruler_ops::draw_home_marker`、 `ruler_h > 0` のときのみ)。 `None` で描かない
+    /// (ランチャーのセルを開いているときは song の時間軸ではないので `None`)。
+    pub home_beat: Option<f64>,
     /// (M13 Phase 55) ruler 領域の高さ (px、`0.0` で ruler 無し → 旧 piano_roll 互換)。
     /// `> 0` のとき rect の top から `ruler_h` px を ruler として確保し、その下に keyboard /
     /// grid を配置 (keyboard と grid の `y` がともに `rect.y + ruler_h` から開始)。
@@ -1132,6 +1136,7 @@ mod tests {
             keyboard_w: 0.0,
             velocity_lane_h: 0.0,
             playhead_beat: None,
+            home_beat: None,
             ruler_h: 0.0,
             bpm: 120.0,
             time_sig: (4, 4),

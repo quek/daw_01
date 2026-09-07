@@ -18,7 +18,7 @@
 
 use std::cell::Cell;
 
-use daw_ui_core::{DragKind, Edit, Ui};
+use daw_ui_core::{DragKind, Edit, Ui, WidgetId};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
@@ -290,7 +290,7 @@ fn draw_list(
                 11.0,
                 text_color,
             );
-            if inside && pointer.primary_just_released {
+            if ui.primary_click(WidgetId::ROOT.child((b"undohist_row", idx)), inside).clicked {
                 clicked.set(Some(idx));
             }
         }

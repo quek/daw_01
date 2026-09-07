@@ -1251,6 +1251,19 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     loop_handle_w,
                 );
             }
+            // r.md #121: ホーム印 (ruler 下辺の ▽)。 loop band の上、 playhead 線の奥。
+            if ruler_h > 0.0
+                && let Some(home) = view_copy.home_beat
+            {
+                crate::widgets::ruler_ops::draw_home_marker(
+                    hctx,
+                    home,
+                    view_copy.start_beat,
+                    view_copy.len_beats,
+                    ruler,
+                    style_copy.playhead_color,
+                );
+            }
             // 時間範囲の帯は **ノートより手前・playhead より奥**。 範囲がノートを部分的に
             // 覆っているとき、どこからどこまでが範囲かが見える。
             if let Some((range, ref pitches)) = time_range {

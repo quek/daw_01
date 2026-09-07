@@ -225,12 +225,12 @@ fn draw_rows_inner(
             // (Single なら next=[MASTER_TRACK_ID])。 lane disclosure (`+`/`-`) rect 内 release は
             // automation collapse トグルが priority なので除外する (disclosure > row-select)。
             // master には mute/solo/volume band が無いので row 全体 (disclosure 除く) が対象。
-            if pointer.primary_just_released
-                && let Some((rx, ry)) = pointer.pos
-                && row.contains(rx, ry)
-                && (t.automation_lanes.is_empty() || !layout.lane_disc_rect.contains(rx, ry))
-                && !ui.has_open_popups()
-            {
+            let inside = !ui.has_open_popups()
+                && pointer.pos.is_some_and(|(rx, ry)| {
+                    row.contains(rx, ry)
+                        && (t.automation_lanes.is_empty() || !layout.lane_disc_rect.contains(rx, ry))
+                });
+            if ui.primary_click(WidgetId::ROOT.child((b"arr_track_row", t.id)), inside).clicked {
                 clicks.clicked_track = Some(t.id);
             }
             continue;
@@ -275,11 +275,9 @@ fn draw_rows_inner(
             // ストライプの click → color picker。 hit はストライプより少し広く (inspector の
             // chain 帯と同じ)。 group の disclosure と重なる分は `commit_clicks` で disclosure 優先。
             let hit = Rect { x: strip.x, y: strip.y, w: strip.w + 4.0, h: strip.h };
-            if pointer.primary_just_released
-                && let Some((rx, ry)) = pointer.pos
-                && hit.contains(rx, ry)
-                && !ui.has_open_popups()
-            {
+            let inside = !ui.has_open_popups()
+                && pointer.pos.is_some_and(|(rx, ry)| hit.contains(rx, ry));
+            if ui.primary_click(WidgetId::ROOT.child((b"arr_color_strip", t.id)), inside).clicked {
                 clicks.color_strip = Some((t.id, strip));
             }
         }
@@ -342,10 +340,8 @@ fn draw_rows_inner(
                 clip_rect: Some(disclosure_rect),
                 ..GlyphArea::default()
             });
-            if pointer.primary_just_released
-                && let Some((rx, ry)) = pointer.pos
-                && disclosure_rect.contains(rx, ry)
-            {
+            let inside = pointer.pos.is_some_and(|(rx, ry)| disclosure_rect.contains(rx, ry));
+            if ui.primary_click(WidgetId::ROOT.child((b"arr_group_disclosure", t.id)), inside).clicked {
                 clicks.disclosure = Some(t.id);
             }
         }
@@ -496,15 +492,17 @@ fn draw_rows_inner(
         // click がこの row にも届き multi-select が単一に潰れる → 「選択トラックを
         // まとめて Delete / 複製」 が右クリック 1 本にしか効かなくなる
         // (clip 短 click の r.md #14 ガードと同 class、 r.md #43 で同件対処)。
-        if pointer.primary_just_released
-            && let Some((rx, ry)) = pointer.pos
-            && row.contains(rx, ry)
-            && !button_zones.iter().any(|b| b.contains(rx, ry))
-            && !(is_group && disclosure_rect.contains(rx, ry))
-            && (t.automation_lanes.is_empty() || !layout.lane_disc_rect.contains(rx, ry))
-            && !layout.volume_band.is_some_and(|b| b.contains(rx, ry))
-            && !ui.has_open_popups()
-        {
+        // 加えて click 自体が「press もこの行で始まった」 ときだけ成立する (`primary_click`、
+        // r.md #122) ので、 volume band 等のドラッグを行の上で離しても選択は変わらない。
+        let inside = !ui.has_open_popups()
+            && pointer.pos.is_some_and(|(rx, ry)| {
+                row.contains(rx, ry)
+                    && !button_zones.iter().any(|b| b.contains(rx, ry))
+                    && !(is_group && disclosure_rect.contains(rx, ry))
+                    && (t.automation_lanes.is_empty() || !layout.lane_disc_rect.contains(rx, ry))
+                    && !layout.volume_band.is_some_and(|b| b.contains(rx, ry))
+            });
+        if ui.primary_click(WidgetId::ROOT.child((b"arr_track_row", t.id)), inside).clicked {
             clicks.clicked_track = Some(t.id);
         }
     }
@@ -517,7 +515,7 @@ fn draw_rows_inner(
 /// release が選択更新を併発して multi-select が単一に潰れる (track 行の M·S·R / volume band
 /// 除外と同じ理由)。 lane 行の縦範囲は press 側 (`press_header::lane_header`) と同じ積み方。
 fn lane_header_click(
-    ui: &Ui<'_, AppData>,
+    ui: &mut Ui<'_, AppData>,
     f: &ArrangementFrame<'_>,
     t: &ArrangementTrack,
     track_row_bottom: f32,
@@ -527,10 +525,7 @@ fn lane_header_click(
         return;
     }
     let pointer = f.pointer;
-    if !pointer.primary_just_released || ui.has_open_popups() {
-        return;
-    }
-    let Some((rx, ry)) = pointer.pos else { return };
+    let pos = if ui.has_open_popups() { None } else { pointer.pos };
     let style = f.style;
     let header_indent = f32::from(t.depth) * style.indent_px;
     let mut lane_y = track_row_bottom;
@@ -546,17 +541,17 @@ fn lane_header_click(
             h: lh,
         };
         lane_y += lh;
-        if !header_rect.contains(rx, ry) {
-            continue;
-        }
-        let on_control = automation_lane_header_layout(header_rect, style).is_some_and(|l| {
-            l.delete_icon_rect.contains(rx, ry)
-                || l.default_field_rect.is_some_and(|r| r.contains(rx, ry))
+        let inside = pos.is_some_and(|(rx, ry)| {
+            header_rect.contains(rx, ry)
+                && !automation_lane_header_layout(header_rect, style).is_some_and(|l| {
+                    l.delete_icon_rect.contains(rx, ry)
+                        || l.default_field_rect.is_some_and(|r| r.contains(rx, ry))
+                })
         });
-        if !on_control {
+        // click は press もこの lane header で始まっていたときだけ (r.md #122)。
+        if ui.primary_click(WidgetId::ROOT.child((b"arr_lane_header", t.id, lane.id)), inside).clicked {
             clicks.clicked_track = Some(t.id);
         }
-        return;
     }
 }
 

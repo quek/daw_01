@@ -1533,10 +1533,10 @@ impl AppData {
                 self.recording.live = recording_live;
                 let stopped = self.transport.is_playing && !playing;
                 self.transport.is_playing = playing;
-                self.on_tick(samples);
+                self.on_tick(samples, stopped);
                 if stopped {
                     // 手動停止・曲末 auto-stop・書き出し・パニックのどれで止まっても
-                    // ここへ収束する (停止ホームへの復帰と録音セッションのクローズ)。
+                    // ここへ収束する (録音セッションのクローズ)。
                     self.on_transport_stopped();
                 }
             }

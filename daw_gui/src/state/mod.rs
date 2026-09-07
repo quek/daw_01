@@ -27,7 +27,7 @@ pub mod virtual_keyboard;
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
 pub use activity::ActivityState;
-pub use transport::{StopPoint, TransportState};
+pub use transport::{PlayFrom, TransportState};
 pub use selection::SelectionState;
 pub use ipc::{DeviceParamKey, IpcState};
 pub use voicevox::VoicevoxState;

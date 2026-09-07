@@ -583,12 +583,12 @@ impl AppData {
 
     /// 録音を開始する (r.md #51)。
     ///
-    /// - **停止中**: `start_transport` でトランスポートごと走らせる。count-in の
-    ///   設定があればここで消費する。書き出し中は `play()` と同じ理由で断られ、
-    ///   録音も始まらない。
+    /// - **停止中**: `start_transport` で Space と同じくホームからトランスポートごと
+    ///   走らせる。count-in の設定があればここで消費する。書き出し中は `play()` と同じ
+    ///   理由で断られ、録音も始まらない。
     /// - **再生中 (パンチイン)**: トランスポートには触らない。count-in も使わない
     ///   (Cubase の count-in は「停止状態から録音を始めたとき」の機能) ので、
-    ///   曲が途切れず、停止で戻る位置 (`playback_origin_beat`) も動かない。
+    ///   曲が途切れず、ホーム (`home_beat`) も動かない。
     pub(crate) fn start_recording(&mut self) {
         if self.recording.requested {
             return;
@@ -620,7 +620,9 @@ impl AppData {
                 self.handle_event(AppEvent::SetMetronomeEnabled(true));
             }
             // `StartRecording` + `Play` の送信は start_transport が順序込みで行う。
-            if self.start_transport(Some(preroll_samples)) == PlayOutcome::Refused {
+            if self.start_transport(Some(preroll_samples), crate::state::PlayFrom::Home)
+                == PlayOutcome::Refused
+            {
                 // 書き出し中。 status_message は start_transport が出している。
                 self.recording.metronome_enabled_pre_recording = None;
                 return;

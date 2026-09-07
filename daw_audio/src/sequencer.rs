@@ -124,6 +124,108 @@ impl PerTrackState {
     }
 }
 
+/// 1 buffer (またはランチャー区間) の時間窓。 `collect_events_for_buffer` が note ごとの
+/// 発音判定 ([`emit_note_events`]) に渡す。
+#[derive(Clone, Copy)]
+struct BufferWindow {
+    /// 窓の先頭拍 (= 区間の実効拍)。
+    playhead_beats: f64,
+    /// 窓の終端拍 (排他)。
+    buf_end_beats: f64,
+    samples_per_beat: f64,
+    /// 窓の先頭 frame の buffer 内 offset (アレンジ行は 0、 ランチャー区間はその開始 frame)。
+    time_offset: u32,
+}
+
+impl BufferWindow {
+    /// 窓内の拍 → buffer 内 frame。
+    fn frame_at(&self, beat: f64) -> u32 {
+        let time_samples = ((beat - self.playhead_beats) * self.samples_per_beat).max(0.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let time = time_samples as u32;
+        time + self.time_offset
+    }
+}
+
+/// 1 つの note の On / chase / Off をこの窓で emit する ([`collect_events_for_buffer`] の本体)。
+/// `note` は呼び出し側で muted / 長さ 0 / clip 窓外を除外済み。
+fn emit_note_events(
+    win: BufferWindow,
+    clip: &Clip,
+    clip_end_beats: f64,
+    note: &Note,
+    note_id: u32,
+    out: &mut Vec<TimedNoteEvent>,
+    active_notes: &mut Vec<(u32, u8)>,
+) {
+    // beat-domain で note の絶対 beat 位置を求める。 Off は clip 末端
+    // で clamp (= 旧 sample-domain ロジックと同 idiom)。
+    let on_abs_beat = clip.content_to_song_beat(note.start_beat);
+    let raw_off_abs_beat = clip.content_to_song_beat(note.start_beat + note.duration_beats);
+    let off_abs_beat = raw_off_abs_beat.min(clip_end_beats);
+    let is_active = |active_notes: &[(u32, u8)]| {
+        active_notes.iter().any(|&(id, k)| id == note_id && k == note.pitch)
+    };
+    let on_event = NoteTransition::On {
+        note_id,
+        key: note.pitch,
+        velocity: f64::from(note.velocity) / 127.0,
+    };
+
+    if on_abs_beat >= win.playhead_beats && on_abs_beat < win.buf_end_beats {
+        // RT-safe: 容量超過分は drop し `Vec` 再確保を避ける。 On を
+        // drop したら対応する `active_notes` も積まず整合を保つ
+        // (= 後で flush しても残らない)。 `out` は `MAX_EVENTS`、
+        // `active_notes` は `ACTIVE_NOTES_CAP` でクランプ。
+        if out.len() >= MAX_EVENTS || active_notes.len() >= ACTIVE_NOTES_CAP {
+            return;
+        }
+        out.push(TimedNoteEvent { time: win.frame_at(on_abs_beat), event: on_event });
+        active_notes.push((note_id, note.pitch));
+    } else if on_abs_beat < win.playhead_beats
+        && off_abs_beat > win.playhead_beats
+        && !is_active(active_notes)
+    {
+        // r.md #120 (note chase): 窓の先頭を **跨いで鳴っているはずなのに追跡集合に
+        // 無い** note は、 その場で On を出す。 「鳴っているはず」 は note の区間、
+        // 「追跡集合に無い」 は Play の起点 / seek / loop wrap / ランチャー区間の
+        // 切れ目 (どれも `active_notes` を空にする) と、 範囲書き出しの走査開始を
+        // 全部同じ条件で拾う (= 経路ごとの「chase して」 flag を配らない)。 定常再生
+        // 中は On を出した時点で追跡集合に入るので二度は鳴らない。
+        //
+        // Off が同じ窓の frame 0 に落ちる (= 残り < 1 sample) note は追わない。
+        // 同時刻は Off → On の順に並ぶ (`collect_events_for_buffer` 末尾の sort 契約) ので、
+        // On が Off の後に残って stuck note になる。
+        if (off_abs_beat - win.playhead_beats) * win.samples_per_beat < 1.0 {
+            return;
+        }
+        if out.len() >= MAX_EVENTS || active_notes.len() >= ACTIVE_NOTES_CAP {
+            return;
+        }
+        out.push(TimedNoteEvent { time: win.time_offset, event: on_event });
+        active_notes.push((note_id, note.pitch));
+    }
+    if off_abs_beat > on_abs_beat
+        && off_abs_beat >= win.playhead_beats
+        && off_abs_beat < win.buf_end_beats
+    {
+        // RT-safe: `out` 容量超過時は Off を emit せず、 `active_notes`
+        // からも除かない (= 後続の Stop / loop-wrap flush で NoteOff が
+        // 送られ note が残らない)。 push できない Off を握りつぶして
+        // 追跡解除すると stuck note になるため、 両方とも skip する。
+        if out.len() >= MAX_EVENTS {
+            return;
+        }
+        out.push(TimedNoteEvent {
+            time: win.frame_at(off_abs_beat),
+            event: NoteTransition::Off { note_id, key: note.pitch },
+        });
+        if let Some(pos) = active_notes.iter().position(|&(id, k)| id == note_id && k == note.pitch) {
+            active_notes.swap_remove(pos);
+        }
+    }
+}
+
 /// Walk every clip on `track_idx` and emit `On` / `Off` events that fall
 /// inside the half-open buffer `[playhead_beats, playhead_beats + buf_len_beats)`.
 ///
@@ -229,67 +331,15 @@ pub fn collect_events_for_buffer(
             if note.start_beat < win_start || note.start_beat >= win_end {
                 continue;
             }
-            // beat-domain で note の絶対 beat 位置を求める。 Off は clip 末端
-            // で clamp (= 旧 sample-domain ロジックと同 idiom)。
-            let on_abs_beat = clip.content_to_song_beat(note.start_beat);
-            let raw_off_abs_beat =
-                clip.content_to_song_beat(note.start_beat + note.duration_beats);
-            let off_abs_beat = raw_off_abs_beat.min(clip_end_beats);
-
-            if on_abs_beat >= playhead_beats && on_abs_beat < buf_end_beats {
-                // RT-safe: 容量超過分は drop し `Vec` 再確保を避ける。 On を
-                // drop したら対応する `active_notes` も積まず整合を保つ
-                // (= 後で flush しても残らない)。 `out` は `MAX_EVENTS`、
-                // `active_notes` は `ACTIVE_NOTES_CAP` でクランプ。
-                if out.len() >= MAX_EVENTS || active_notes.len() >= ACTIVE_NOTES_CAP {
-                    continue;
-                }
-                let time_samples =
-                    ((on_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss
-                )]
-                let time = time_samples as u32 + time_offset;
-                out.push(TimedNoteEvent {
-                    time,
-                    event: NoteTransition::On {
-                        note_id,
-                        key: note.pitch,
-                        velocity: f64::from(note.velocity) / 127.0,
-                    },
-                });
-                active_notes.push((note_id, note.pitch));
-            }
-            if off_abs_beat > on_abs_beat
-                && off_abs_beat >= playhead_beats
-                && off_abs_beat < buf_end_beats
-            {
-                // RT-safe: `out` 容量超過時は Off を emit せず、 `active_notes`
-                // からも除かない (= 後続の Stop / loop-wrap flush で NoteOff が
-                // 送られ note が残らない)。 push できない Off を握りつぶして
-                // 追跡解除すると stuck note になるため、 両方とも skip する。
-                if out.len() >= MAX_EVENTS {
-                    continue;
-                }
-                let time_samples =
-                    ((off_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss
-                )]
-                let time = time_samples as u32 + time_offset;
-                out.push(TimedNoteEvent {
-                    time,
-                    event: NoteTransition::Off {
-                        note_id,
-                        key: note.pitch,
-                    },
-                });
-                if let Some(pos) = active_notes.iter().position(|&(id, k)| id == note_id && k == note.pitch) {
-                    active_notes.swap_remove(pos);
-                }
-            }
+            emit_note_events(
+                BufferWindow { playhead_beats, buf_end_beats, samples_per_beat, time_offset },
+                clip,
+                clip_end_beats,
+                note,
+                note_id,
+                out,
+                active_notes,
+            );
         }
     }
 
@@ -689,6 +739,54 @@ mod tests {
             &mut active,
         );
         assert!(out.is_empty());
+        assert!(active.is_empty());
+    }
+
+    /// r.md #120: note の途中から再生を始めても (= buffer 先頭が note を跨ぐ) その note は
+    /// 鳴る。 On は区間先頭の frame に出て追跡集合へ入り、 次の buffer では二度と出ない。
+    /// Off は本来の位置に出る。
+    #[test]
+    fn note_straddling_buffer_start_is_chased_once() {
+        let song = one_note_song(1.0, 2.0, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        // 1.5 拍目 (= note の真ん中) から 1 buffer。
+        collect(Some(&song), 0, SR, 1.5, 120.0, 1024, &mut out, &mut active);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].time, 0);
+        assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
+        assert_eq!(active.len(), 1);
+
+        // 追跡集合に居る間は再度 chase しない。
+        out.clear();
+        collect(Some(&song), 0, SR, 1.5 + 1024.0 / SPB as f64, 120.0, 1024, &mut out, &mut active);
+        assert!(out.is_empty(), "定常再生中に On を出し直さない: {out:?}");
+
+        // Off は本来の位置 (3.0 拍) に出て追跡集合から外れる。
+        out.clear();
+        collect(Some(&song), 0, SR, 3.0 - 100.0 / SPB as f64, 120.0, 200, &mut out, &mut active);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].time, 100);
+        assert!(matches!(out[0].event, NoteTransition::Off { key: 60, .. }));
+        assert!(active.is_empty());
+
+        // ランチャー区間 (`time_offset > 0`) では区間の開始 frame に出る。
+        out.clear();
+        collect_events_for_buffer(
+            Some(&song), 0, &song.tracks[0].clips, SR, 1.5, 120.0, 512, 512, &mut out, &mut active,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].time, 512);
+    }
+
+    /// r.md #120: 残りが 1 sample 未満の note は追わない (同 frame の Off → On で stuck になる)。
+    #[test]
+    fn note_ending_at_buffer_start_is_not_chased() {
+        let song = one_note_song(1.0, 1.0, 60);
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect(Some(&song), 0, SR, 2.0 - 0.5 / SPB as f64, 120.0, 1024, &mut out, &mut active);
+        assert!(out.iter().all(|e| matches!(e.event, NoteTransition::Off { .. })), "{out:?}");
         assert!(active.is_empty());
     }
 

@@ -71,6 +71,7 @@ fn hit_view() -> ArrangementView {
         header_w: 0.0,
         ruler_h: 0.0,
         playhead_beat: None,
+        home_beat: None,
         loop_range: None,
         data_generation: 0,
         bpm: 120.0,

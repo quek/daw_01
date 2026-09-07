@@ -172,6 +172,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 press_modifiers: pointer.modifiers,
                 draggable: rows[i].draggable,
             });
+            // 掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+            self.claim_press(wid);
         }
 
         // ---- drag continue / carry out ----

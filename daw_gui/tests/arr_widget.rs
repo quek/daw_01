@@ -1146,13 +1146,15 @@ fn header_release_during_external_drag_does_not_select_track() {
         "last-wins タグも Tracks に倒さない (次の Delete がトラックを消さない)"
     );
 
-    // 対照: drag していなければ同じ release で普通に選択される (ガードが
-    // 「常に選択を殺す」 方向へ壊れていないこと)。
+    // 対照: drag していなければ同じ場所の press + release で普通に選択される (ガードが
+    // 「常に選択を殺す」 方向へ壊れていないこと)。 r.md #122: click は press も同じ行で
+    // 始まっていることが条件なので、 release だけの frame では選択されない。
+    drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert_eq!(
         app.selection.selected_track_ids,
         vec![1],
-        "drag していない release は従来どおりトラックを選択する"
+        "drag していない press + release は従来どおりトラックを選択する"
     );
 }
 

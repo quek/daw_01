@@ -27,8 +27,6 @@ use crate::ui::Ui;
 /// text_input の永続状態。
 #[derive(Debug, Default)]
 pub(crate) struct TextInputState {
-    /// 直近の press がこの widget 内から始まったか (button と同じモデル)。
-    press_started_inside: bool,
     /// cursor の byte 位置 (selection の primary 端、Shift+Arrow で動く方)。
     /// char 境界に揃っていることを保証する。
     cursor_byte: usize,
@@ -206,18 +204,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
-        // armed-state click 判定。
-        let click = {
-            let state: &mut TextInputState = self.widget_state(wid);
-            if pointer.primary_just_pressed {
-                state.press_started_inside = inside;
-            }
-            let click = pointer.primary_just_released && state.press_started_inside && inside;
-            if pointer.primary_just_released {
-                state.press_started_inside = false;
-            }
-            click
-        };
+        // click 判定 (button と同じ `primary_click`)。
+        let click = self.primary_click(wid, inside).clicked;
 
         // Click inside → focus 取得 (cursor / anchor は下の gained_focus 検知で全選択する)。
         if click {

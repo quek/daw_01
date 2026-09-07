@@ -19,11 +19,11 @@ pub(crate) enum PlayOutcome {
 impl AppData {
     // -------- Playback -----------------------------------------------------
 
-    /// 再生を開始する **唯一の口**。 録音開始 (`start_recording`) もここを通る
-    /// ので、書き出し中の拒否・読み込み待ちの queue・停止ホーム
-    /// (`playback_origin_beat`) の捕捉が録音でも同じように効く。
+    /// Space: **ホーム** ([`TransportState::home_beat`]) から再生する。 録音開始
+    /// (`start_recording`) も同じ [`Self::start_transport`] を通るので、書き出し中の拒否・
+    /// 読み込み待ちの queue・ホームの確定が録音でも同じように効く。
     pub(crate) fn play(&mut self) -> PlayOutcome {
-        self.start_transport(None)
+        self.start_transport(None, PlayFrom::Home)
     }
 
     /// [`Self::play`] の本体。 `record` が `Some(preroll_samples)` なら
@@ -32,7 +32,13 @@ impl AppData {
     /// 録音の開始を `play()` の外から送らないのが要点 — 別々に送ると、
     /// `StartRecording` が届く前の 1 バッファだけ曲が進んでから count-in / 録音に
     /// 入る、という取りこぼしが生まれる。ここなら送信順が保証される。
-    pub(crate) fn start_transport(&mut self, record: Option<u64>) -> PlayOutcome {
+    ///
+    /// `from` は走り出す位置 (r.md #121): `Home` = ホームへ頭出ししてから (Space / Rec)、
+    /// `Playhead` / `Continue` = いま見えているプレイヘッドから。 頭出しで位置が変わる
+    /// ときだけ engine へ `SeekTo` を送ってから `Play` を送る (停止中の engine のカーソルは
+    /// 見えているプレイヘッドと同じ位置で凍っている — 止まった瞬間の Tick と明示 seek が
+    /// 両者を揃える)。
+    pub(crate) fn start_transport(&mut self, record: Option<u64>, from: PlayFrom) -> PlayOutcome {
         // export 中は再生を禁止する。音声 freewheel フェーズの realtime play は
         // offline render と競合し、書き出される音声を壊しうる（映像フェーズは
         // 独立だが、 混乱を避けて export 全体で一律に止める）。標準 WAV export も
@@ -42,7 +48,6 @@ impl AppData {
         // (解析中はオーディオ出力が無音化され、プラグインは走査スレッドが占有する
         // ので、そもそも音は出せない)。
         if self.offline_render_busy() {
-            self.transport.play_origin_override = None;
             self.ui_ephemeral.status_message = if self.loudness.phase.is_busy() {
                 "ラウドネス解析中は再生できません".into()
             } else if !self.export_or_analysis_busy() {
@@ -59,7 +64,7 @@ impl AppData {
         // 画像 / 動画サムネイルの decode 中 (= GPU 再初期化後の再読込を含む) は
         // 待たせない。
         if self.audio_decode_pending() {
-            self.transport.pending_play = true;
+            self.transport.pending_play = Some(from);
             self.transport.pending_play_record = record;
             self.ui_ephemeral.status_message = "プロジェクト読込中...".into();
             return PlayOutcome::Queued;
@@ -71,7 +76,7 @@ impl AppData {
         // Without this the just-loaded tracks render silent for the
         // first few buffers / first loop.
         if !self.ipc.pending_plugin_loads.is_empty() {
-            self.transport.pending_play = true;
+            self.transport.pending_play = Some(from);
             self.transport.pending_play_record = record;
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
@@ -84,13 +89,24 @@ impl AppData {
         // 未変化なら no-op なので、 定常状態 (= 既に frame flush 済) では LoadSong を
         // 再送せず、 大量 WAV の compile_audio_schedule 同期遅延を踏まない。
         self.flush_song_sync();
-        // Pro Tools 流の「Stop で開始位置に戻る」 用に、 実際の再生
-        // 開始時の playhead を保存。 ruler クリック等で playhead を
-        // 移動してから play した場合は、 その位置が origin になる。
-        // r.md #118: 停止点からの再開 (`play_continue`) はホームを据え置くので上書きを消費する。
-        let resume = self.transport.play_origin_override.take();
-        let origin = resume.unwrap_or_else(|| self.transport.playhead_beat.unwrap_or(0.0));
-        self.transport.playback_origin_beat = Some(origin);
+        // r.md #121: ホームは「明示 seek」 と「まだ無いときの最初の再生開始」 で決まる。
+        // 走り出す位置は Space ならホーム、 それ以外はいまのプレイヘッド。 頭出しで位置が
+        // 変わるときだけ `SeekTo` を先に送る (engine は buffer 頭で seek → play の順に消費)。
+        let playhead = self.transport.playhead_beat.unwrap_or(0.0);
+        let home = *self.transport.home_beat.get_or_insert(playhead);
+        let start = match from {
+            PlayFrom::Home => home,
+            PlayFrom::Playhead | PlayFrom::Continue => playhead,
+        };
+        if start != playhead {
+            self.transport.playhead_beat = Some(start);
+            let samples = common::automation::beats_to_samples(
+                self.song_doc.song(),
+                self.ipc.sample_rate,
+                f64::from(start),
+            );
+            self.send_audio(AudioCommand::SeekTo { samples });
+        }
         if let Some(preroll_samples) = record {
             // 録音の開始は Play より先に届ける必要がある (engine は届いた順に
             // 消費するので、逆順だと 1 バッファぶん曲が進んでから count-in / 録音に
@@ -99,12 +115,11 @@ impl AppData {
             // publish を始める。
             self.send_audio(AudioCommand::StartRecording { preroll_samples });
         }
-        // r.md #118: 停止点からの再開はセッションのセルも頭出しせず続きから鳴らす
+        // r.md #118: 停止位置からの再開はセッションのセルも頭出しせず続きから鳴らす
         // (engine は `PlayContinue` で launcher の再シードを飛ばす)。
-        self.send_audio(if resume.is_some() {
-            AudioCommand::PlayContinue
-        } else {
-            AudioCommand::Play
+        self.send_audio(match from {
+            PlayFrom::Continue => AudioCommand::PlayContinue,
+            PlayFrom::Home | PlayFrom::Playhead => AudioCommand::Play,
         });
         // r.md #50: 走り出すたびに積算ラウドネス一式をリセットする
         // (Cubase の "Reset on Start" 相当)。曲を頭から通せば「この曲の
@@ -122,16 +137,16 @@ impl AppData {
     /// asset decode 完了の 3 経路から呼ぶ唯一の口)。 queue 時に「録音だったか /
     /// count-in が何拍か」を復元するので、録音開始が queue されても録音のまま再開する。
     pub(crate) fn fire_pending_play(&mut self) {
-        self.transport.pending_play = false;
+        let Some(from) = self.transport.pending_play.take() else { return };
         let record = self.transport.pending_play_record.take();
-        self.start_transport(record);
+        self.start_transport(record, from);
     }
 
-    /// プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)
-    /// も同位置へ更新し、audio engine へ SeekTo を送る。 ruler click (arrangement /
-    /// piano_roll / audio_editor) と `f` キーから共通で呼ぶ唯一の seek 経路 (= 「停止 =
-    /// 最後に意図的に置いた位置に戻る」 の SSoT)。 再生中でも home を更新するので、
-    /// 再生中に置き直して停止すると新しい位置へ戻る。 `beat` は呼び出し側で snap 済を渡す。
+    /// プレイヘッドを `beat` に置き、 ホーム ([`TransportState::home_beat`] = Space が
+    /// 再生を始める位置) も同位置へ更新し、audio engine へ SeekTo を送る。 ruler click
+    /// (arrangement / piano_roll / audio_editor) と `f` / Home / End から共通で呼ぶ唯一の
+    /// seek 経路 (= 「ホーム = 最後に意図的に置いた位置」 の SSoT)。 再生中でも home を
+    /// 更新する。 `beat` は呼び出し側で snap 済を渡す。
     pub(crate) fn seek_playhead_to(&mut self, beat: f64) {
         let beat = beat.max(0.0);
         // r.md #10: 明示 seek は Home の 2 段トグルをリセットする (= 次の Home は
@@ -141,10 +156,7 @@ impl AppData {
         // flag に触れない = 再生中もトグルが壊れない。)
         self.ui_ephemeral.home_toggle_at_first = false;
         self.transport.playhead_beat = Some(beat as f32);
-        self.transport.playback_origin_beat = Some(beat as f32);
-        // r.md #118: 明示 seek は「ここに戻る」 の意思なので、 queue 中の「停止点から再開」 の
-        // ホーム上書きは打ち消す (発火時に旧ホームが勝たないように)。
-        self.transport.play_origin_override = None;
+        self.transport.home_beat = Some(beat as f32);
         // ensure-synced: 換算は song のテンポカーブを使う。 直前の BPM 編集が
         // 未 flush だと engine の再生グリッドが旧 tempo のままで seek 位置がずれる。
         // epoch 未変化なら no-op。
@@ -160,9 +172,8 @@ impl AppData {
 
     /// `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き
     /// (`seek_playhead_to`: home も更新 + SeekTo)、停止中は `play()` を呼んでその位置から
-    /// 再生開始する (play() の export / asset / plugin ゲートと playback_origin_beat capture を
-    /// 継承するため body を再実装しない)。 再生中は `play()`/`stop()` を呼ばずシームレスに
-    /// 継続する (home は `seek_playhead_to` が更新済なので Stop はこの位置へ戻る)。
+    /// 再生開始する (play() の export / asset / plugin ゲートを継承するため body を
+    /// 再実装しない)。 再生中は `play()`/`stop()` を呼ばずシームレスに継続する。
     pub(crate) fn action_play_from_cursor(&mut self, beat: f64) {
         self.seek_playhead_to(beat);
         if !self.transport.is_playing {
@@ -170,29 +181,14 @@ impl AppData {
         }
     }
 
-    /// r.md #118 (Live の Shift+Space「停止した位置から再生を続ける」): 直前に止まった位置
-    /// ([`TransportState::stop_point`]) にプレイヘッドを置いて再生する。 **ホームは
-    /// 動かさない** — 次の Stop は元のホーム (= Live の insert marker) へ戻る。 再生中は
-    /// 何もしない。 まだ一度も止まっていなければ普通の再生 (Space と同じ)。
+    /// r.md #118 (Live の Shift+Space「停止した位置から再生を続ける」): いま見えている
+    /// プレイヘッド (= 停止した位置、 r.md #121) から再生する。 **ホームは動かさない**
+    /// (次の Space は元のホームから)。 再生中は何もしない。
     pub(crate) fn play_continue(&mut self) {
         if self.transport.is_playing {
             return;
         }
-        let Some(sp) = self.transport.stop_point else {
-            self.play();
-            return;
-        };
-        self.transport.playhead_beat = Some(sp.beat);
-        // seek と同じ経路 (テンポカーブの積分)。 `seek_playhead_to` を呼ばないのは、 あれが
-        // ホームも停止点の位置へ更新してしまうため。
-        self.flush_song_sync();
-        let samples =
-            common::automation::beats_to_samples(self.song_doc.song(), self.ipc.sample_rate, f64::from(sp.beat));
-        self.send_audio(AudioCommand::SeekTo { samples });
-        self.transport.play_origin_override = sp.home;
-        if self.play() == PlayOutcome::Refused {
-            self.transport.play_origin_override = None;
-        }
+        self.start_transport(None, PlayFrom::Continue);
     }
 
     /// `Home` キー (r.md #10): 位置導出のトグル。 プレイヘッドが最後 (時間的に
@@ -200,7 +196,7 @@ impl AppData {
     /// 1.1.1 (song 先頭 = beat 0) へ移動する (= 2 度押しで先頭)。 clip が無ければ
     /// 先頭。 transient な押下回数 state を持たず、 現在位置だけで分岐するので
     /// 無効化するものが無い (SSoT)。 `seek_playhead_to` 経由なので停止中/再生中の
-    /// どちらでも効き、 停止ホーム (`playback_origin_beat`) も追従する。
+    /// どちらでも効き、 ホーム (`home_beat`) も追従する。
     pub(crate) fn goto_timeline_home(&mut self) {
         // 先頭 (時間的に最初) のクリップの頭。 clip が無ければ None。
         let first = common::timing::content_bounds_beats(self.song_doc.song()).map(|(lo, _)| lo);
@@ -274,7 +270,9 @@ impl AppData {
         let recording = self.recording.requested;
         if self.ipc.pending_plugin_loads.is_empty() && self.transport.is_playing && !recording {
             self.send_audio(AudioCommand::Stop);
-            self.transport.pending_play = true;
+            // 読み込みが済んだら **止まった位置から** 続ける (ホームへは戻さない —
+            // ユーザーが止めたのではなく、 こちらの都合で一瞬止めただけ)。
+            self.transport.pending_play = Some(PlayFrom::Playhead);
         }
         self.ipc.next_plugin_load_generation =
             self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
@@ -285,7 +283,7 @@ impl AppData {
         // 消える)。 SetSlotPlugin を送る全経路がこの関数を通るので、 ここが
         // 失敗 entry を落とす唯一の口。
         self.ipc.failed_plugin_loads.remove(&device_id);
-        if self.transport.pending_play {
+        if self.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
                 self.ipc.pending_plugin_loads.len()
@@ -294,9 +292,9 @@ impl AppData {
         generation
     }
 
-    /// 停止を **要求する** 唯一の口。 実際に止まったことの反映
-    /// (プレイヘッドを開始位置へ戻す / 録音セッションを閉じる) は、engine が
-    /// 止まったのを観測した [`Self::on_transport_stopped`] が行う。
+    /// 停止を **要求する** 唯一の口。 実際に止まったことの反映 (録音セッションを閉じる /
+    /// 停止位置の確定) は、engine が止まったのを観測した [`Self::on_transport_stopped`]
+    /// が行う。
     ///
     /// 録音セッションだけはここでも即座に閉じる。ユーザーが明示的に止めた以上、
     /// 観測が届くまでの数十 ms に鍵盤を叩いたぶんが録音に混ざってはいけない。
@@ -309,35 +307,10 @@ impl AppData {
     /// engine が止まったことを観測したときの後始末 (r.md #51)。
     ///
     /// 手動停止・曲末の auto-stop・書き出し・パニック・子プロセスの crash が
-    /// **すべてここへ収束する**。「どんな止まり方でも再生を押した位置へ戻る」
-    /// (r.md #50 の停止ホーム契約) を 1 箇所で保証するための合流点。
+    /// **すべてここへ収束する**。 r.md #121: プレイヘッドは **止まった位置に留める**
+    /// (ホームへは戻さない、 engine のカーソルも動かさない)。 次の Space は
+    /// `start_transport` がホームへ頭出しする。
     pub(crate) fn on_transport_stopped(&mut self) {
-        // r.md #118: ホームへ戻す前に「どこで止まったか」 を覚える (Shift+Space の再開点)。
-        if let Some(beat) = self.transport.playhead_beat {
-            self.transport.stop_point =
-                Some(crate::state::StopPoint { beat, home: self.transport.playback_origin_beat });
-        }
-        // Pro Tools 流: 停止時に playhead を「再生開始位置」 (= 直前の
-        // play() 呼び出し時点の playhead) に戻す。 GUI 側 playhead_beat
-        // の即時上書きと、 audio engine への SeekTo IPC を 1 セットで
-        // 実行する。 後者を送らないと on_tick が直近サンプル位置を返し
-        // て GUI 側の戻し操作を打ち消す。 origin が None (= まだ一度も
-        // play していない) なら playhead は触らない。
-        if let Some(origin) = self.transport.playback_origin_beat.take() {
-            self.transport.playhead_beat = Some(origin);
-            // ensure-synced: 換算は song のテンポカーブ依存 (seek_playhead_to と同旨)。
-            // epoch 未変化なら no-op。
-            self.flush_song_sync();
-            // r.md #54: `seek_playhead_to` と同じ `beats_to_samples` (SongTempo
-            // カーブの積分) を通す。ここだけ定数 BPM のままだと、テンポカーブの
-            // ある曲で「停止で戻る位置」と「クリックで飛ぶ位置」が食い違う。
-            let samples = common::automation::beats_to_samples(
-                self.song_doc.song(),
-                self.ipc.sample_rate,
-                f64::from(origin),
-            );
-            self.send_audio(AudioCommand::SeekTo { samples });
-        }
         // 録音は transport に乗るモードなので、止まったら必ず閉じる
         // (旧実装は stop() が録音フラグに触れず、停止後も Rec が点灯したまま
         // 凍ったプレイヘッドへノートが積み上がっていた)。
@@ -358,7 +331,7 @@ impl AppData {
     /// パニック — 鳴っている全ての音を即座に止める。
     ///
     /// 1. 再生中なら [`Self::stop`] で transport を止める（sequencer note-off を
-    ///    flush、audio clip / metronome を停止、playhead を開始位置へ戻す）。
+    ///    flush、audio clip / metronome を停止。playhead は止まった位置に留まる）。
     /// 2. 全 plugin を `ReinitAllPlugins`（deactivate→activate）で再初期化し、
     ///    note-off を無視する音源（VCV Rack 2 の hold voice）/ reverb tail /
     ///    鍵盤プレビューの stuck note / 自己発振まで確実に黙らせる。WAV 書き出し
@@ -479,46 +452,66 @@ impl AppData {
 
 #[cfg(test)]
 mod tests {
-    use crate::state::StopPoint;
+    use crate::state::PlayFrom;
     use crate::test_support::headless_app;
 
-    /// r.md #118: Shift+Space は「止まった位置」 から再生し、 ホームは元のまま (次の Stop は
-    /// 元のホームへ戻る = Live の insert marker)。 停止点は明示 seek でも消えず、 止まる
-    /// たびに更新される。 一度も止まっていなければ普通の再生。
+    /// r.md #121 / #118: Stop はプレイヘッドを **止まった位置に留める**。 Space はホーム
+    /// (最初の再生開始位置 / 明示 seek) から、 Shift+Space は止まった位置から再生し、
+    /// どちらもホームを動かさない。 明示 seek だけがホームを動かす。
     #[test]
-    fn play_continue_resumes_at_the_stop_point_without_moving_home() {
+    fn stop_keeps_the_playhead_and_space_returns_to_home() {
         let mut app = headless_app();
-        // まだ止まっていない: 普通の再生 (ホーム = 現在位置)。
+        // まだホームが無い: 最初の再生開始位置がホームになる。
         app.transport.playhead_beat = Some(4.0);
-        app.play_continue();
-        assert_eq!(app.transport.playback_origin_beat, Some(4.0));
+        app.play();
+        assert_eq!(app.transport.home_beat, Some(4.0));
+        assert_eq!(app.transport.playhead_beat, Some(4.0));
 
-        // 9 拍目で止まる → ホーム (4) へ戻り、 停止点 (9, home 4) を覚える。
+        // 9 拍目で止まる → プレイヘッドは 9 のまま、 ホームは 4 のまま。
         app.transport.is_playing = true;
         app.transport.playhead_beat = Some(9.0);
         app.transport.is_playing = false;
         app.on_transport_stopped();
-        assert_eq!(app.transport.playhead_beat, Some(4.0), "Stop はホームへ戻る");
-        assert_eq!(app.transport.stop_point, Some(StopPoint { beat: 9.0, home: Some(4.0) }));
+        assert_eq!(app.transport.playhead_beat, Some(9.0), "Stop は止まった位置に留める");
+        assert_eq!(app.transport.home_beat, Some(4.0), "Stop はホームを動かさない");
 
-        // 明示 seek (ruler click / F) はホームを動かすが停止点は消さない。
-        app.seek_playhead_to(2.0);
-        assert_eq!(app.transport.stop_point.map(|s| s.beat), Some(9.0));
-
-        // Shift+Space: 9 から再生、 ホームは 4 のまま (seek した 2 でもない)。
+        // Shift+Space: 9 から再生、 ホームは 4 のまま。
         app.play_continue();
         assert_eq!(app.transport.playhead_beat, Some(9.0));
-        assert_eq!(app.transport.playback_origin_beat, Some(4.0), "ホームは据え置き");
-        assert_eq!(app.transport.play_origin_override, None, "上書きは消費済み");
+        assert_eq!(app.transport.home_beat, Some(4.0));
 
-        // 12 で止まる → 4 へ戻り、 停止点は 12 に更新。 再生中の Shift+Space は無視。
+        // 12 で止まる → Space はホーム (4) へ頭出しして再生。
         app.transport.is_playing = true;
         app.transport.playhead_beat = Some(12.0);
         app.play_continue();
-        assert_eq!(app.transport.playhead_beat, Some(12.0), "再生中は何もしない");
+        assert_eq!(app.transport.playhead_beat, Some(12.0), "再生中の Shift+Space は何もしない");
         app.transport.is_playing = false;
         app.on_transport_stopped();
-        assert_eq!(app.transport.playhead_beat, Some(4.0));
-        assert_eq!(app.transport.stop_point, Some(StopPoint { beat: 12.0, home: Some(4.0) }));
+        assert_eq!(app.transport.playhead_beat, Some(12.0));
+        app.play();
+        assert_eq!(app.transport.playhead_beat, Some(4.0), "Space はホームから");
+
+        // 明示 seek (ruler click / F / Home / End) はホームも動かす。
+        app.transport.is_playing = false;
+        app.seek_playhead_to(2.0);
+        assert_eq!(app.transport.home_beat, Some(2.0));
+        assert_eq!(app.transport.playhead_beat, Some(2.0));
+    }
+
+    /// 読み込み待ちで queue した再生は「どこから」 も一緒に覚える (プラグイン読み込みで
+    /// 一瞬止めた再生は止まった位置から続く)。
+    #[test]
+    fn queued_play_remembers_where_to_start_from() {
+        let mut app = headless_app();
+        app.transport.home_beat = Some(0.0);
+        app.transport.playhead_beat = Some(7.0);
+        app.ipc.pending_plugin_loads.insert(1, 1);
+        app.play_continue();
+        assert_eq!(app.transport.pending_play, Some(PlayFrom::Continue));
+        app.ipc.pending_plugin_loads.clear();
+        app.fire_pending_play();
+        assert_eq!(app.transport.pending_play, None);
+        assert_eq!(app.transport.playhead_beat, Some(7.0), "止まった位置から続く");
+        assert_eq!(app.transport.home_beat, Some(0.0), "ホームは据え置き");
     }
 }

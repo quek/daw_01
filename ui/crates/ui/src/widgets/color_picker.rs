@@ -355,6 +355,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             }
 
+            // panel 内の press の所有者を名乗る (SV / Hue のドラッグを panel の外で離しても
+            // そこの click にならない、 r.md #122 / [`crate::click`])。
+            if pointer.primary_just_pressed
+                && ppos.is_some_and(|(px, py)| lay.panel.contains(px, py))
+            {
+                ui.claim_press(state_wid);
+            }
+
             // ---- 描画 (state を read-only コピー) ----
             let (hue, sat, val) = {
                 let st: &mut ColorPickerState = ui.widget_state(state_wid);

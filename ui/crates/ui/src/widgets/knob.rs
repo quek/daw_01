@@ -403,6 +403,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
             (state.drag_anchor, release_initial_value, state.drag_distance)
         };
+        // 掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if pointer.primary_just_pressed && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py)) {
+            self.claim_press(wid);
+        }
 
         // 2. base 表示値: リセット > base drag (depth gesture 中は抑止 = 非破壊) > 入力値。
         let displayed_value: f32 = if reset_fired {

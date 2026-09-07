@@ -951,11 +951,8 @@ impl AppData {
         // 閉じないと Rec が点灯したまま、凍ったプレイヘッドへノートが積み上がる。
         self.transport.is_playing = false;
         self.transport.preroll_remaining = 0;
-        self.transport.pending_play = false;
+        self.transport.pending_play = None;
         self.transport.pending_play_record = None;
-        // r.md #118: queue 中だった「停止点から再開」 のホーム上書きも捨てる (残すと次の
-        // 普通の Space が古いホームで走り出す)。
-        self.transport.play_origin_override = None;
         self.close_recording_session();
         self.silence_monitor_notes();
         self.recording.active_param_gestures.clear();

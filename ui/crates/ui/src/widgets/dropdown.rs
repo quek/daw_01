@@ -46,9 +46,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
         // popup state は caller-id ベース (rect 座標を入れると 1px 動いて state 蒸発 / 同位置別
         // dropdown で衝突する)。
-        let popup_id = ("dropdown_popup", WidgetId::ROOT.child((b"dropdown", &id)));
+        let wid = WidgetId::ROOT.child((b"dropdown", &id));
+        let popup_id = ("dropdown_popup", wid);
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
         let already_open = self.is_popup_open(popup_id);
+        // 本体の click (press も release も本体の上)。 他所で始めたドラッグをここで
+        // 離しても開かない (daw_01 r.md #122、 [`crate::click`])。
+        let clicked = self.primary_click(wid, inside).clicked;
 
         // 1. 本体描画 (現在値の表示 + 三角アロー)
         // palette の寿命は host の `'a` なので、 以後の `push_rect` / `push_text` (= `&mut self`)
@@ -132,7 +136,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (開いている / この frame で開く) だけ計算する。 閉じている dropdown で
         // 毎フレーム全項目を測ると、 transport / inspector に並ぶ dropdown の数だけ
         // UI ループが重くなる。
-        let opening = inside && pointer.primary_just_released && !already_open;
+        let opening = clicked && !already_open;
         let content_w = if already_open || opening {
             crate::widgets::menu::items_popup_width(self, items, rect.w)
         } else {
@@ -154,7 +158,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         // 2. クリックで popup toggle (click は consume して下層に流さない)
-        if inside && pointer.primary_just_released {
+        if clicked {
             if already_open {
                 self.close_popup(popup_id);
             } else {
@@ -202,6 +206,41 @@ mod tests {
         }
     }
 
+    /// daw_01 r.md #122: **他所で始めたドラッグを本体の上で離しても開かない**。 press も
+    /// 本体の上なら開く。
+    #[test]
+    fn release_of_a_drag_started_elsewhere_does_not_open() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let items = ["a", "b"];
+        let opened = std::cell::Cell::new(false);
+        let mut run = |host: &mut UiHost<()>, pos: (f32, f32), pressed: bool, jp: bool, jr: bool| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_pressed: pressed,
+                    primary_just_pressed: jp,
+                    primary_just_released: jr,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            };
+            host.frame_to_edits(&(), &mut scene, SCREEN, input, |(), ui| {
+                ui.dropdown("dd", BODY, &items, 0);
+                opened.set(ui.is_popup_open(("dropdown_popup", WidgetId::ROOT.child((b"dropdown", &"dd")))));
+            });
+        };
+        // 本体の外 (下の数値欄を想定) で press → 本体の上へ動かして release。
+        run(&mut host, (110.0, 200.0), true, true, false);
+        run(&mut host, (110.0, 110.0), true, false, false);
+        run(&mut host, (110.0, 110.0), false, false, true);
+        assert!(!opened.get(), "他所で始めたドラッグの release で開かない");
+        // 本体の上で press → release → 開く。
+        run(&mut host, (110.0, 110.0), true, true, false);
+        run(&mut host, (110.0, 110.0), false, false, true);
+        assert!(opened.get(), "本体で press + release なら開く");
+    }
+
     /// 画面に入りきらない項目数の dropdown を開き、 **ホイールで下へスクロールしてから
     /// 最終項目を click すると、 その index が返る**。
     ///
@@ -219,7 +258,7 @@ mod tests {
         let open = FrameInput {
             pointer: PointerFrame {
                 pos: Some((110.0, 110.0)),
-                primary_just_released: true,
+                primary_just_pressed: true, primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..FrameInput::default()
@@ -255,7 +294,7 @@ mod tests {
         let click = FrameInput {
             pointer: PointerFrame {
                 pos: Some((110.0, 590.0)),
-                primary_just_released: true,
+                primary_just_pressed: true, primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..FrameInput::default()
@@ -278,7 +317,7 @@ mod tests {
         let open = FrameInput {
             pointer: PointerFrame {
                 pos: Some((110.0, 110.0)),
-                primary_just_released: true,
+                primary_just_pressed: true, primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..FrameInput::default()
@@ -322,7 +361,7 @@ mod tests {
         let open = FrameInput {
             pointer: PointerFrame {
                 pos: Some((110.0, 110.0)),
-                primary_just_released: true,
+                primary_just_pressed: true, primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..FrameInput::default()
@@ -375,7 +414,7 @@ mod tests {
         let open = FrameInput {
             pointer: PointerFrame {
                 pos: Some((110.0, 110.0)),
-                primary_just_released: true,
+                primary_just_pressed: true, primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..FrameInput::default()
@@ -441,7 +480,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((110.0, 110.0)),
-                    primary_just_released: true,
+                    primary_just_pressed: true, primary_just_released: true,
                     ..PointerFrame::default()
                 },
                 ..FrameInput::default()

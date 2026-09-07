@@ -14,6 +14,7 @@ use std::hash::Hash;
 
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
+use crate::id::WidgetId;
 use crate::theme::Palette;
 use crate::ui::Ui;
 
@@ -80,6 +81,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     where
         F: FnMut(&mut Self, &T, usize, Rect, /* is_selected */ bool),
     {
+        let wid = WidgetId::ROOT.child((b"list_view", &id));
         let row_total_h = style.row_height + style.row_gap;
         let item_count = items.len();
         let content_h = (item_count as f32) * row_total_h;
@@ -147,9 +149,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
                     if inside {
                         hovered.set(Some(i));
-                        if pointer.primary_just_released {
-                            clicked.set(Some(i));
-                        }
+                    }
+                    // 行の click は press もその行で始まっていたときだけ (scrollbar の
+                    // thumb や他 widget のドラッグの終わりを行選択にしない、 r.md #122)。
+                    if ui.primary_click(wid.child((b"row", i)), inside).clicked {
+                        clicked.set(Some(i));
                     }
                 }
             },
@@ -238,6 +242,7 @@ mod tests {
         // pointer を row 1 中央に置いて release
         let click = PointerFrame {
             pos: Some((100.0, 40.0)),
+            primary_just_pressed: true,
             primary_just_released: true,
             ..PointerFrame::default()
         };

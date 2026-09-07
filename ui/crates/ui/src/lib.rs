@@ -10,6 +10,7 @@
 //! - メッセージ型は導入しない (Edit は enum + `Box<dyn FnOnce>`)
 //! - derive マクロは禁止 (Lens 不要、ユーザは手書きクロージャでアクセサを書く)
 
+pub mod click;
 pub mod clipboard;
 pub mod color;
 pub mod dialog;
@@ -29,6 +30,7 @@ pub mod viewport;
 pub mod widgets;
 
 #[cfg(feature = "clipboard")]
+pub use click::ClickState;
 pub use clipboard::ArboardClipboard;
 pub use clipboard::{ClipboardProvider, NoopClipboard};
 pub use dialog::{DialogResult, FileDialogFilter};

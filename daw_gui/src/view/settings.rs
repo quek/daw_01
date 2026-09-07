@@ -14,7 +14,7 @@
 
 use std::cell::Cell;
 
-use daw_ui_core::{DragKind, Edit, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
+use daw_ui_core::{DragKind, Edit, ScrubableNumberFormat, ScrubableNumberStyle, Ui, WidgetId};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
@@ -411,7 +411,7 @@ fn draw_theme_list(app: &AppData, ui: &mut Ui<'_, AppData>, list_rect: Rect) {
                     dim,
                 );
             }
-            if inside && pointer.primary_just_released {
+            if ui.primary_click(WidgetId::ROOT.child((b"settings_theme_row", i)), inside).clicked {
                 clicked.set(Some(i));
             }
         }

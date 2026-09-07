@@ -451,6 +451,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 last_mouse_y: py,
                 press_modifiers,
             });
+            // 掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+            self.claim_press(wid);
         }
 
         // ---- drag continue: 毎フレーム last_mouse_y を更新 ----

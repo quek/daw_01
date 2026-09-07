@@ -3,13 +3,18 @@
 
 use crate::app::{ExportStage, PendingExport};
 
-/// r.md #118: 直前に止まった位置 (Shift+Space の再開点)。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StopPoint {
-    /// 止まったときのプレイヘッド。
-    pub beat: f32,
-    /// 止まる直前のホーム (`playback_origin_beat`)。 `None` = 一度も play していなかった。
-    pub home: Option<f32>,
+/// 再生をどこから・どう始めるか ([`crate::app::AppData::start_transport`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayFrom {
+    /// ホーム ([`TransportState::home_beat`]) へ頭出しして `Play`。 Space / Rec。
+    Home,
+    /// いま見えているプレイヘッド ([`TransportState::playhead_beat`]) から `Play`
+    /// (= ランチャーのセルは撃ち直し)。 停止中にセルを撃ったとき / プラグイン読み込みで
+    /// 一瞬止めた再生の再開。
+    Playhead,
+    /// いま見えているプレイヘッドから `PlayContinue` (= 鳴っていたセルも頭出しせず続き)。
+    /// Shift+Space (r.md #118)。
+    Continue,
 }
 
 pub struct TransportState {
@@ -45,22 +50,17 @@ pub struct TransportState {
     /// (`*`) にならないが保存される**。 更新は必ず [`AppData::set_loop_region`]
     /// 経由 (state と audio engine への `SetLoop` を 1 か所で揃える)。
     pub loop_region: common::model::LoopRegion,
+    /// いま見えているプレイヘッド。 再生中は engine の観測値 (`on_tick`)、 停止中は
+    /// **止まった位置** (r.md #121: 停止でホームへ巻き戻さない。 アレンジもピアノロールも
+    /// 同じ値を描くので食い違わない) か、 明示 seek で置いた位置。
     pub playhead_beat: Option<f32>,
-    /// Pro Tools 流の「Stop で再生開始位置に戻す」 用、 直前の play()
-    /// 開始時点の playhead を保持。 stop() で playhead_beat に書き戻し
-    /// + SeekTo IPC で audio engine も同位置にリセットする。 None の
-    ///   間 (= まだ一度も play していない or stop 済みで restore 完了) は
-    ///   stop() は何もしない。
-    pub playback_origin_beat: Option<f32>,
-    /// r.md #118 (Live の Shift+Space): 直前に **止まった位置** と、 そのときのホーム。
-    /// `on_transport_stopped` がホームへ戻す前に捕捉し、 [`AppData::play_continue`] が
-    /// ここから再生を続ける。 ホームは動かさない (次の Stop は元のホームへ戻る =
-    /// Live の insert marker と同じ)。 明示 seek でも消えない (停止点はホームとは独立)。
-    pub stop_point: Option<StopPoint>,
-    /// r.md #118: 次の `start_transport` が捕捉するホームの上書き。 `play_continue` が
-    /// 「停止点から走り出すが、 ホームは元のまま」 を実現するために置く。 再生が
-    /// 読み込み待ちで queue されても、 実際に走り出すときに消費されるので失われない。
-    pub play_origin_override: Option<f32>,
+    /// ホーム = Space (と Rec) が再生を始める位置 (Live の insert marker、 r.md #121)。
+    /// 決まるのは **明示 seek** (ruler click / `f` / Home / End) と、 まだ無いときの最初の
+    /// 再生開始だけ。 停止では動かない (停止位置は `playhead_beat` に残る)。 `None` = この曲で
+    /// まだ一度も置いていない。 アレンジ / ピアノロールのルーラーに ▽ で描く
+    /// (`draw_home_marker`)。 Shift+Space ([`crate::app::AppData::play_continue`]) はホームを
+    /// 使わず `playhead_beat` から続ける。
+    pub home_beat: Option<f32>,
     /// パニックボタンが立てる「遅延 reinit」 の起点時刻。 `Some` の間、
     /// `on_tick` が [`PANIC_REINIT_DELAY`] 経過で `ReinitAllPlugins` を plugin host
     /// に送って `None` に戻す。 master の declick フェードアウト完了後に plugin の
@@ -97,9 +97,9 @@ pub struct TransportState {
     /// ~30Hz の `TrackVoicesTick` ごとに差し替わり、 変調ラックが `Note` 起点ソースの
     /// カーソルをボイスごとに描くのに使う。
     pub track_voices: Vec<(usize, common::audio_bridge::VoiceSnapshot)>,
-    /// `play()` was called while `pending_plugin_loads` was non-empty;
-    /// re-fire it once the last `SlotPluginLoaded` arrives.
-    pub pending_play: bool,
+    /// `start_transport` が読み込み待ち (`pending_plugin_loads` / asset decode) で queue した
+    /// 再生要求。 `Some(どこから)` の間は最後の load 完了で `fire_pending_play` が再発火する。
+    pub pending_play: Option<PlayFrom>,
     /// queue された要求が「録音の開始」だったか、だとすれば count-in の長さ
     /// (samples、`0` = count-in 無し)。 録音開始が読み込み待ちで queue された
     /// とき、再発火でも録音と count-in を落とさないために覚えておく (r.md #51)。
@@ -155,9 +155,7 @@ impl TransportState {
             preroll_remaining: 0,
             loop_region: common::model::LoopRegion::default(),
             playhead_beat: None,
-            playback_origin_beat: None,
-            stop_point: None,
-            play_origin_override: None,
+            home_beat: None,
             panic_reinit_due: None,
             panic_release_pending: false,
             master_meter: crate::master_meter::MasterMeterSnapshot::default(),
@@ -165,7 +163,7 @@ impl TransportState {
             master_strip_gr: (0.0, 0.0),
             mod_plane: common::mod_plane::ModPlane::default(),
             track_voices: Vec::new(),
-            pending_play: false,
+            pending_play: None,
             pending_play_record: None,
             export_stage: None,
             export_progress_at: None,

@@ -34,6 +34,8 @@ pub(crate) struct TabState {
 /// `Ui::tab_view` のビルダー。`tab(label, |ui, pane_rect| ...)` で各タブを宣言する。
 pub struct TabBuilder<'b, 'a, M: ?Sized + 'static> {
     ui: &'b mut Ui<'a, M>,
+    /// tab_view 自身の id (各タブの click 所有者 id の親)。
+    wid: WidgetId,
     bar_rect: Rect,
     pane_rect: Rect,
     next_x: f32,
@@ -65,7 +67,8 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
 
         let pointer = self.ui.pointer();
         let inside = pointer.pos.is_some_and(|(px, py)| tab_rect.contains(px, py));
-        if inside && pointer.primary_just_released {
+        let tab_wid = self.wid.child((b"tab", i));
+        if self.ui.primary_click(tab_wid, inside).clicked {
             self.clicked = Some(i);
         }
 
@@ -123,7 +126,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut TabState = self.widget_state(wid);
             state.selected
         };
-        let final_idx = self.tab_view_inner(rect, initial, f);
+        let final_idx = self.tab_view_inner(wid, rect,initial, f);
         if final_idx != initial {
             let state: &mut TabState = self.widget_state(wid);
             state.selected = final_idx;
@@ -154,7 +157,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut TabState = self.widget_state(wid);
             state.selected = *selected;
         }
-        let final_idx = self.tab_view_inner(rect, *selected, f);
+        let final_idx = self.tab_view_inner(wid, rect,*selected, f);
         if final_idx != *selected {
             *selected = final_idx;
             self.request_redraw();
@@ -165,7 +168,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
     /// タブバー描画 + builder 駆動 + click 集約 + 範囲外 clamp までを行う共通実装。
     /// `initial_selected` を受け取り、フレーム末に確定した selected (clamp 後) を返す。
-    fn tab_view_inner<F>(&mut self, rect: Rect, initial_selected: usize, f: F) -> usize
+    fn tab_view_inner<F>(&mut self, wid: WidgetId, rect: Rect, initial_selected: usize, f: F) -> usize
     where
         F: FnOnce(&mut TabBuilder<'_, 'a, M>),
     {
@@ -191,6 +194,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let (clicked, n) = {
             let mut builder = TabBuilder {
                 ui: self,
+                wid,
                 bar_rect,
                 pane_rect,
                 next_x: 0.0,
@@ -287,6 +291,7 @@ mod tests {
 
         let pointer = PointerFrame {
             pos: Some((60.0, 16.0)), // tab[1] = "B" の中央
+            primary_just_pressed: true,
             primary_just_released: true,
             ..PointerFrame::default()
         };
@@ -360,6 +365,7 @@ mod tests {
         // Frame 1: 内部 state 版で tab[1] を click → 内部 selected = 1 になる
         let pointer = PointerFrame {
             pos: Some((60.0, 16.0)),
+            primary_just_pressed: true,
             primary_just_released: true,
             ..PointerFrame::default()
         };

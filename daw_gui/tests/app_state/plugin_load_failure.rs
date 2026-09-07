@@ -73,7 +73,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
             .any(|m| matches!(m, AudioCommand::Play)),
         "Play should be queued, not sent yet: {audio_msgs_before_failure:?}"
     );
-    assert!(app.transport.pending_play, "pending_play should be true while waiting");
+    assert!(app.transport.pending_play.is_some(), "pending_play should be set while waiting");
     assert!(!app.transport.is_playing, "is_playing should be false while queued");
 
     // 3. plugin_host から load failure 通知が届いた fake dispatch。
@@ -95,7 +95,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
         "pending should be empty: {:?}",
         app.ipc.pending_plugin_loads
     );
-    assert!(!app.transport.pending_play, "pending_play should be cleared");
+    assert!(app.transport.pending_play.is_none(), "pending_play should be cleared");
     // r.md #51: `is_playing` は engine の観測値なので Play 送信直後には立たない。
     // 「queue した Play が発火したか」は直下の `AudioCommand::Play` で見る。
     let audio_msgs_after_failure = drain(&mut audio_rx);
@@ -151,7 +151,7 @@ fn load_failure_keeps_other_pending_unaffected() {
     // Play を queue。
     let _ = drain(&mut audio_rx);
     app.handle_event(AppEvent::Play);
-    assert!(app.transport.pending_play);
+    assert!(app.transport.pending_play.is_some());
     assert!(!app.transport.is_playing);
 
     // device 0 (test.synth) だけ失敗。 device 1 (test.fx) の pending は残る。
@@ -172,7 +172,7 @@ fn load_failure_keeps_other_pending_unaffected() {
         "device 1 (fx) pending should remain"
     );
     assert!(
-        app.transport.pending_play,
+        app.transport.pending_play.is_some(),
         "pending_play should still be true while Fx is loading"
     );
     assert!(!app.transport.is_playing, "is_playing should still be false");

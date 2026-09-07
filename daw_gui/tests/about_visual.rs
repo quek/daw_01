@@ -125,10 +125,12 @@ fn crop(rgba: &[u8], r: Rect) -> Region {
     Region { unique_colors: uniq.len(), pixels }
 }
 
+/// 1 frame に press と release を両方立てる (r.md #122: click は press も同じ widget の上)。
 fn click_at(x: f32, y: f32) -> FrameInput {
     FrameInput {
         pointer: PointerFrame {
             pos: Some((x, y)),
+            primary_just_pressed: true,
             primary_just_released: true,
             ..PointerFrame::default()
         },

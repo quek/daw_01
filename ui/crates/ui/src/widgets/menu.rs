@@ -14,6 +14,7 @@
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
+use crate::id::WidgetId;
 use crate::input::PointerFrame;
 use crate::ui::Ui;
 
@@ -181,6 +182,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
     let scroll = ui.popup_scroll(popup_rect, items_popup_height(items.len()));
     let pointer = ui.pointer();
     let hover_pos = hover_pos_in_popup(pointer.pos, popup_rect, scroll.dragging);
+    let popup_wid = ui.current_popup_id();
 
     let mut clicked: Option<usize> = None;
     ui.with_clip_rect(popup_rect, |ui| {
@@ -225,7 +227,8 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
                 }),
                 ..GlyphArea::default()
             });
-            if hovered && pointer.primary_just_released {
+            // 項目の click は press もその項目で始まっていたときだけ (r.md #122)。
+            if ui.primary_click(popup_wid.child((b"item", i)), hovered).clicked {
                 clicked = Some(i);
             }
         }
@@ -475,6 +478,9 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             continue;
         }
         let hovered = hover_pos.is_some_and(|(px, py)| item_rect.contains(px, py));
+        // 項目の click は press もその項目で始まっていたときだけ (r.md #122)。 SubMenu は
+        // hover で開くので click を使わないが、 所有者の取り合いには参加させる。
+        let clicked = ui.primary_click(WidgetId::ROOT.child((b"menu_entry", id_path, i)), hovered).clicked;
         let label = entry.label();
         let is_sub = matches!(entry, MenuEntry::SubMenu { .. });
         // M9 P1-5: enabled / shortcut_hint を取り出す (SubMenu は常に enabled、hint なし)。
@@ -559,8 +565,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             MenuEntry::Item { action, enabled, .. } => {
                 // disabled item は click を ignore
                 if *enabled
-                    && hovered
-                    && pointer.primary_just_released
+                    && clicked
                     && let Some(a) = action.take()
                 {
                     return_action = Some(a);
@@ -664,7 +669,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let this_open = open_idx == Some(i);
         let id_i = ("menu_bar_top", menus[i].0);
-        if pointer.primary_just_released {
+        // ラベルの click は press もそのラベルで始まっていたときだけ (r.md #122)。
+        let clicked = self.primary_click(WidgetId::ROOT.child((b"menu_bar_top", menus[i].0)), true).clicked;
+        if clicked {
             // click: open 中の同ラベル → toggle close、別ラベル → 旧を閉じて切替/open。
             if this_open {
                 self.close_popup(id_i);
@@ -958,7 +965,8 @@ mod tests {
         let click_at_edit = FrameInput {
             pointer: PointerFrame {
                 pos: Some((20.0, 16.0)),
-                primary_just_released: true,
+                primary_just_pressed: true,
+                    primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -979,7 +987,8 @@ mod tests {
         let click_at_undo = FrameInput {
             pointer: PointerFrame {
                 pos: Some((20.0, 32.0 + MENU_ITEM_H * 0.5)),
-                primary_just_released: true,
+                primary_just_pressed: true,
+                    primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -1010,7 +1019,8 @@ mod tests {
         let click_at_edit = FrameInput {
             pointer: PointerFrame {
                 pos: Some((20.0, 16.0)),
-                primary_just_released: true,
+                primary_just_pressed: true,
+                    primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -1063,7 +1073,8 @@ mod tests {
         let open = FrameInput {
             pointer: PointerFrame {
                 pos: Some((20.0, 16.0)),
-                primary_just_released: true,
+                primary_just_pressed: true,
+                    primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -1079,7 +1090,8 @@ mod tests {
         let click_item = FrameInput {
             pointer: PointerFrame {
                 pos: Some((20.0, 32.0 + MENU_ITEM_H * 0.5)),
-                primary_just_released: true,
+                primary_just_pressed: true,
+                    primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -1111,6 +1123,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1223,6 +1236,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1280,6 +1294,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((cascade_x, 44.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1336,6 +1351,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1363,6 +1379,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((cascade_x, 44.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1412,6 +1429,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1500,6 +1518,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1517,6 +1536,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((130.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1550,6 +1570,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1599,6 +1620,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1616,6 +1638,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1711,7 +1734,8 @@ mod tests {
         let click = FrameInput {
             pointer: PointerFrame {
                 pos: Some((140.0, 72.0)),
-                primary_just_released: true,
+                primary_just_pressed: true,
+                    primary_just_released: true,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -1789,6 +1813,7 @@ mod tests {
                 FrameInput {
                     pointer: PointerFrame {
                         pos: Some(pos),
+                        primary_just_pressed: click,
                         primary_just_released: click,
                         ..PointerFrame::default()
                     },
@@ -1848,6 +1873,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1874,6 +1900,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 590.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1908,6 +1935,7 @@ mod tests {
             FrameInput {
                 pointer: PointerFrame {
                     pos: Some((20.0, 16.0)),
+                    primary_just_pressed: true,
                     primary_just_released: true,
                     ..PointerFrame::default()
                 },
@@ -1948,6 +1976,7 @@ mod tests {
                 FrameInput {
                     pointer: PointerFrame {
                         pos: Some(pos),
+                        primary_just_pressed: click,
                         primary_just_released: click,
                         ..PointerFrame::default()
                     },
@@ -2001,7 +2030,8 @@ mod tests {
         let hover = |pos: (f32, f32), click: bool| FrameInput {
             pointer: PointerFrame {
                 pos: Some(pos),
-                primary_just_released: click,
+                primary_just_pressed: click,
+                        primary_just_released: click,
                 ..PointerFrame::default()
             },
             ..Default::default()
@@ -2051,6 +2081,7 @@ mod tests {
                 FrameInput {
                     pointer: PointerFrame {
                         pos: Some(pos),
+                        primary_just_pressed: click,
                         primary_just_released: click,
                         ..PointerFrame::default()
                     },

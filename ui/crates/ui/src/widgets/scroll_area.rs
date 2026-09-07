@@ -210,6 +210,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
             (state.offset, v_thumb_rect, h_thumb_rect)
         };
+        // thumb を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if pointer.primary_just_pressed
+            && let Some((px, py)) = pointer.pos
+            && (v_thumb_rect.is_some_and(|t| t.contains(px, py))
+                || h_thumb_rect.is_some_and(|t| t.contains(px, py)))
+        {
+            self.claim_press(wid);
+        }
 
         // wheel scroll / drag 中は次フレーム再描画を要求 (state 変化を視覚反映するため)
         if scrolled {

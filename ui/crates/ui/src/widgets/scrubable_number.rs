@@ -729,6 +729,11 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
 
             (state.drag_anchor, state.drag_distance, state.editing)
         };
+        // 掴んだ press の所有者を名乗る (この欄で始めたドラッグを他所で離しても、 そこの
+        // click にならない、 r.md #122 / [`crate::click`])。
+        if pointer.primary_just_pressed && inside {
+            self.claim_press(wid);
+        }
 
         // ---- 表示値の決定 ----
         // base 数値テキスト: reset > base scrub (depth-edit gesture 中は抑止) > value。

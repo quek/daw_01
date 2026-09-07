@@ -8,7 +8,8 @@ use common::protocol::{AudioCommand, PluginCommand};
 impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
-    pub(crate) fn on_tick(&mut self, playhead_samples: u64) {
+    /// `stopped` = この Tick で engine が止まったのを観測した (`playing` の落ち際)。
+    pub(crate) fn on_tick(&mut self, playhead_samples: u64, stopped: bool) {
         // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
         // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
         self.expire_nudge_audition(false);
@@ -101,15 +102,13 @@ impl AppData {
         // 運ばれてくる `playing` の落ち際を観測して `on_transport_stopped` を
         // 走らせるだけにする (= 手動停止と同じ合流点)。
         //
-        // 再生中のみ Tick の playhead を反映する。 停止中は GUI 側 playhead が
-        // 権威 (stop() の「開始位置へ戻す」 / ruler seek / engine respawn 後の
-        // 据え置き)。 これを入れないと、 stop() が playhead を origin に戻した
-        // 後に IPC キューへ残った in-flight Tick (engine が Stop/SeekTo を反映
-        // する前に読まれた直近サンプル位置) が後着で playhead を打ち消し、
-        // 「Space で停止してもプレイヘッドが元位置に戻らないことがある」 race を
-        // 生む。 stop() の SeekTo は engine 側カーソルを次の Play 用に揃えるため
-        // 引き続き送る (= GUI 表示の権威と engine state を分離)。
-        if self.transport.is_playing && next_beat != self.transport.playhead_beat {
+        // 再生中と **止まった瞬間の Tick** だけ playhead を反映する。 止まった瞬間の
+        // Tick が運ぶ位置は engine が凍らせたカーソルそのもの (r.md #121: 停止位置に
+        // 留める) で、 直前の再生中 Tick より最大 1 tick ぶん正確。 それ以降の停止中は
+        // GUI 側 playhead が権威 (ruler seek / engine respawn 後の据え置き)。 停止中の
+        // Tick を無視しないと、 seek の後に IPC キューへ残っていた in-flight Tick が
+        // 後着で playhead を打ち消す。
+        if (self.transport.is_playing || stopped) && next_beat != self.transport.playhead_beat {
             self.transport.playhead_beat = next_beat;
         }
 

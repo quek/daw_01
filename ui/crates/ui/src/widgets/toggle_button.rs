@@ -4,7 +4,7 @@
 //! - `checkbox`: 16px の □/☑ 枠 + ラベル (boolean property toggle の意味的アフォーダンス)
 //! - `toggle_button`: 矩形全面に任意ラベル + ON/OFF 背景色変化
 //!
-//! click 判定は `button` と同じ armed-state モデル (`press_started_inside`)。
+//! click 判定は `button` と同じ [`Ui::primary_click`] (press も release もこの widget の上)。
 //!
 //! 同じ「OFF/ON の塗り + hover/押下フィードバック」 を持つが **click の意味が違う**
 //! 兄弟として `indicator_button_at` がある (daw_01 r.md #50 の CLIP 表示):
@@ -24,12 +24,6 @@ use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::theme::Palette;
 use crate::ui::Ui;
-
-/// `toggle_button_at` の永続状態 (button / checkbox と同形)。
-#[derive(Debug, Default)]
-pub(crate) struct ToggleButtonState {
-    press_started_inside: bool,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ToggleButtonResponse {
@@ -166,20 +160,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let blocked = self.pointer_blocked_by_modal_popup();
         let inside = !blocked && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
-        // armed-state click 判定 (button / checkbox と同じモデル)。
-        let (visual_pressed, click) = {
-            let state: &mut ToggleButtonState = self.widget_state(wid);
-            if pointer.primary_just_pressed {
-                state.press_started_inside = inside;
-            }
-            let started = state.press_started_inside;
-            let visual_pressed = started && inside && pointer.primary_pressed;
-            let click = pointer.primary_just_released && started && inside;
-            if pointer.primary_just_released {
-                state.press_started_inside = false;
-            }
-            (visual_pressed, click)
-        };
+        // click 判定 (button / checkbox と同じ `primary_click`)。
+        let crate::click::ClickState { clicked: click, held: visual_pressed } =
+            self.primary_click(wid, inside);
 
         // style 全体を u64 に sub-hash してから master hash に組み込む
         // (タプル要素数が 12 を超えるため)。

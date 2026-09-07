@@ -637,8 +637,10 @@ fn render_loop(
 
     // Frame counter for the WAV output. The walk starts at `walk_start`
     // (= 0 for full / warm bounce so plugin state at `write_start` is built
-    // up; = `write_start` for a cold range so nothing before it is
-    // retriggered). Samples before `write_start` are rendered but not written.
+    // up; = `write_start` for a cold range). Samples before `write_start` are
+    // rendered but not written. A cold range that starts inside a note still
+    // sounds it: the sequencer chases straddling notes (r.md #120), the same
+    // as live playback from that position.
     let mut frames_written: u64 = 0;
     let mut playhead: u64 = walk_start;
     // A2 (r.md #8): beat 累算器。 live engine と同じく buffer 毎に current_bpm で
