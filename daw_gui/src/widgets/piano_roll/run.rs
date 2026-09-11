@@ -1821,6 +1821,14 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                             app.handle_event(AppEvent::SetPianoRollScrollX(new_scroll));
                         }));
                     } else {
+                        // 横ホイール軸 (チルト / トラックパッド水平) は修飾なしで横スクロール。
+                        // 縦軸 (top_pitch) とは独立に同フレームで両方効く。
+                        if sx.abs() > 0.001 {
+                            let new_scroll = (scroll_beat - sx / zoom_x).max(0.0);
+                            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::SetPianoRollScrollX(new_scroll));
+                            }));
+                        }
                         #[allow(clippy::cast_possible_truncation)]
                         let delta = (sy / 12.0).round() as i32;
                         if delta != 0 {

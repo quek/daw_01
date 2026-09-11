@@ -2531,29 +2531,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         Some(result)
     }
 
-    /// pointer が `rect` 内にあるなら、このフレームに蓄積された scroll delta (px) を取り出して
-    /// 内部 buffer を 0 に戻す。focus 不要 (scroll は pointer 位置で配信)。
-    ///
-    /// 戻り値は `(dx, dy)` (winit 慣行: `dy > 0` = wheel を上方向に回した = コンテンツが上に流れる)。
-    /// 同フレームに複数 widget が呼んでも、最初に呼んだ widget が消費する。
-    pub fn take_scroll_in_rect(&mut self, rect: Rect) -> (f32, f32) {
-        // modal popup の下に隠れている widget は pointer 入力を消費しない (#015)。
-        if self.pointer_blocked_by_modal_popup() {
-            return (0.0, 0.0);
-        }
-        let Some((px, py)) = self.pointer.pos else { return (0.0, 0.0) };
-        if !rect.contains(px, py) {
-            return (0.0, 0.0);
-        }
-        let d = self.pointer.scroll_delta;
-        self.pointer.scroll_delta = (0.0, 0.0);
-        // M14 Phase 94 (daw_01 #065): consume を両 pointer に反映 (`consume_pointer_click` と対称)。
-        // popup body は `pointer_raw` の copy を読むので、mirror しないと同 frame の別 body へ
-        // 同じ scroll が二重配信されうる (multi-popup edge)。
-        self.pointer_raw.scroll_delta = (0.0, 0.0);
-        d
-    }
-
     /// `wid` がフォーカスを持っているならフレームに溜まったキー入力を取り出す。
     ///
     /// チェック対象は **フレーム開始時の focus** (`self.focused`)。これによって、

@@ -108,24 +108,29 @@ fn emit_col_width(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     }));
 }
 
-/// `Shift` + ホイールで列を横スクロールする。
+/// `Shift` + ホイール、または横ホイール軸 (チルト / トラックパッド水平) で列を横スクロールする。
 ///
-/// **`Shift` を押していないホイールは消費しない** — 素のホイールは行の縦スクロール
+/// **`Shift` を押していない縦ホイールは消費しない** — 素の縦ホイールは行の縦スクロール
 /// (`release::commit_releases` の wheel ブロックが `header_pane ∪ 帯 ∪ lanes` で拾う) で、
 /// 帯の上でも行が動くのが正しい。アレンジ側の `Shift` = 横スクロールと同じ語彙。
+/// 修飾なしのときは横成分だけ消費し (`take_scroll_x_in_rect`)、縦成分は行スクロールへ残す。
 fn scroll_scenes(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
-    if !f.pointer.modifiers.shift || f.launcher.collapsed || f.launcher.col_w <= 0.0 {
+    if f.launcher.collapsed || f.launcher.col_w <= 0.0 {
         return;
     }
     let Some((px, py)) = f.pointer.pos else { return };
     if !f.launcher.pane.contains(px, py) {
         return;
     }
-    let (dx, dy) = ui.take_scroll_in_rect(f.launcher.pane);
-    // 横成分があればそれを、無ければ縦成分を横へ倒す (ホイールしか無いマウス用)。
-    // 向きはアレンジの Shift+ホイール (`scroll_beat_raw - dy * ...`: ホイール上 = 手前 /
-    // 左へ) と同じ。旧実装は `-dy` で逆向きだった。
-    let delta = if dx.abs() > 0.0 { dx } else { dy };
+    let delta = if f.pointer.modifiers.shift {
+        let (dx, dy) = ui.take_scroll_in_rect(f.launcher.pane);
+        // 横成分があればそれを、無ければ縦成分を横へ倒す (ホイールしか無いマウス用)。
+        // 向きはアレンジの Shift+ホイール (`scroll_beat_raw - dy * ...`: ホイール上 = 手前 /
+        // 左へ) と同じ。旧実装は `-dy` で逆向きだった。
+        if dx.abs() > 0.0 { dx } else { dy }
+    } else {
+        ui.take_scroll_x_in_rect(f.launcher.pane)
+    };
     if delta.abs() <= 0.0 {
         return;
     }

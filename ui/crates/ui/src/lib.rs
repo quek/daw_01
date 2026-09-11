@@ -27,6 +27,7 @@ pub mod text_metrics;
 pub mod theme;
 pub mod ui;
 pub mod viewport;
+pub mod wheel;
 pub mod widgets;
 
 #[cfg(feature = "clipboard")]

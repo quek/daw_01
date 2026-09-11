@@ -804,10 +804,16 @@ pub(super) fn commit_releases(
         let content_below_ruler = f.content_below_ruler;
         let scroll = ui.take_scroll_in_rect(content_below_ruler);
         if scroll.1.abs() > 0.0 || scroll.0.abs() > 0.0 {
-            let dy = scroll.1;
-            // header pane 上 (`mx < lanes.x`) では横軸操作 (Ctrl / Shift) を無視。 pointer.pos は
-            // take_scroll_in_rect が `content_below_ruler.contains` を満たして Some を保証済。
+            // dx = 横ホイール軸 (チルトホイール / トラックパッド水平 / WM_MOUSEHWHEEL)。 入力層で
+            // px 化済なので Shift+縦ホイールの ×4 は掛けず、 縦の plain scroll と同じ 1:1 で横へ流す。
+            let (dx, dy) = scroll;
+            // header pane 上 (`mx < lanes.x`) では横軸操作 (Ctrl / Shift / 横ホイール) を無視。
+            // pointer.pos は take_scroll_in_rect が `content_below_ruler.contains` を満たして Some を保証済。
             let over_lanes = pointer.pos.is_some_and(|(mx, _)| mx >= lanes.x);
+            let scroll_x_by = |ui: &mut Ui<'_, AppData>, delta_px: f32| {
+                let delta = -f64::from(delta_px) * beat_per_px;
+                ui.push_edit({ let v_b = view.scroll_beat_raw + delta; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetArrangeScroll(v_b as f32)); }) });
+            };
             if pointer.modifiers.ctrl && over_lanes {
                 // M14 Phase 61a (#011): wheel up = zoom in (符号反転)、 1 ノッチで ~20% 変化
                 // (係数 0.005 → 0.0015、 Cubase/Live 同等)、 SetZoomX を絶対値送信に統一
@@ -883,18 +889,24 @@ pub(super) fn commit_releases(
                 }
             } else if pointer.modifiers.shift && over_lanes {
                 // r.md #53: 差分加算の基準は **スナップ前** の連続値。 表示原点
-                // (view.start_beat) に足すと 1px 未満の端数が毎フレーム捨てられる。
-                let delta = -f64::from(dy) * beat_per_px * 4.0;
-                ui.push_edit({ let v_b = view.scroll_beat_raw + delta; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetArrangeScroll(v_b as f32)); }) });
+                // (view.start_beat) に足すと 1px 未満の端数が毎フレーム捨てられる
+                // (`scroll_x_by` が `scroll_beat_raw` 基準で加算する)。
+                scroll_x_by(ui, dy * 4.0 + dx);
             } else if !pointer.modifiers.ctrl && !pointer.modifiers.shift {
+                // 横ホイール軸は修飾なしで横スクロール (縦軸と独立に同フレームで両方効く)。
+                if over_lanes && dx.abs() > 0.0 {
+                    scroll_x_by(ui, dx);
+                }
                 // plain wheel (= 縦 scroll)。 header / lanes どちらの上でも同一挙動。 `!ctrl && !shift`
                 // guard は header 上で横操作キーが押されているときに plain scroll へ落ちないため
                 // (lanes 上では ctrl は上の分岐、 shift は直上の分岐で既に消費されここへ来ない)。
                 // M14 Phase 115 (daw_01 #088): dy は入力層で px 化済 (LINE_HEIGHT_PX=40/line)。
                 // 旧実装の追加 ×8 は二重スケール (1 ノッチ 320px ≈ 8 行) だったので撤去し、 scroll_area
                 // と同じ「入力層の px delta をそのまま使う」 に揃える (1 ノッチ ≈ 40px ≈ 1 行)。
-                let new_top = (view.track_top - dy).max(0.0);
-                ui.push_edit({ let v_t = new_top; Edit::mutate(move |app: &mut AppData| { app.ui_prefs.arrange_track_top = v_t.max(0.0); }) });
+                if dy.abs() > 0.0 {
+                    let new_top = (view.track_top - dy).max(0.0);
+                    ui.push_edit({ let v_t = new_top; Edit::mutate(move |app: &mut AppData| { app.ui_prefs.arrange_track_top = v_t.max(0.0); }) });
+                }
             }
         }
 
