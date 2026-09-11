@@ -1355,7 +1355,7 @@ async fn recv_loop(
             Ok(cmd @ (AudioCommand::LaunchCell { .. } | AudioCommand::LaunchCellFrom { .. }
                 | AudioCommand::LaunchScene { .. } | AudioCommand::RephaseLauncherRows { .. }
                 | AudioCommand::StopRow { .. }
-                | AudioCommand::StopAllRows
+                | AudioCommand::StopAllRows { .. }
                 | AudioCommand::SwitchRowToArranger { .. }
                 | AudioCommand::SwitchAllToArranger
                 )) => {

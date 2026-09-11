@@ -166,6 +166,15 @@ pub(super) fn dispatch(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     // 誰も session を張らなかった press は時間範囲のドラッグになる (最後に置く)。
     press_lanes::range_zone(ui, f, &hit, &mut claim);
     actions.emit(ui);
+    // r.md #124: 何かの drag session を張ったら press の所有者を名乗る (r.md #122 の契約)。
+    // これで他 widget の hover が消え (`Ui::hover_pos`)、 離した先の click にもならない。
+    let live = {
+        let s: &ArrangementState = ui.widget_state(f.wid);
+        s.any_drag_live()
+    };
+    if live {
+        ui.claim_press(f.wid);
+    }
 }
 
 /// release frame で確定する click 系 (track header のトラック選択) 用に、
@@ -416,8 +425,11 @@ fn ruler(
         // 一時 OFF、 zoom_x_px_per_beat に対する Adaptive grid。
         let snapped = f.view.snap.snap_beat(press_beat, press_alt, f.zoom_x_px_per_beat).max(0.0);
         let state: &mut ArrangementState = ui.widget_state(f.wid);
-        state.playhead_drag =
-            Some(PlayheadDragSession { last_mouse_x: px, last_emitted_beat: snapped });
+        state.playhead_drag = Some(PlayheadDragSession {
+            last_mouse_x: px,
+            last_emitted_beat: snapped,
+            anchor_beat: f.view.playhead_beat,
+        });
         claim.session = true;
         actions.seek_beat = Some(snapped);
     }

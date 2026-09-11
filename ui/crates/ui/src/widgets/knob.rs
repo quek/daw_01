@@ -20,7 +20,7 @@ use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::ui::{Ui, hovered};
+use crate::ui::Ui;
 use crate::widgets::scrubable_number::{ModEntry, Modulation};
 
 /// ダブルクリック判定の時間しきい値 (ms)。
@@ -315,8 +315,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut reset_fired = false;
         // depth gesture の release frame で確定する最終 depth (pointer 最終位置から再計算)。
         let mut release_depth: Option<f64> = None;
+        // daw_01 r.md #127: Esc でキャンセル → base drag は press 時の値へ戻す (depth gesture は
+        // anchor を捨てるだけ = 最終確定発火をしない)。
+        let drag_cancel = self.drag_cancel_requested();
+        let mut cancel_restore: Option<f32> = None;
         let (drag_anchor, release_initial_value, drag_distance) = {
             let state: &mut KnobState = self.widget_state(wid);
+            if drag_cancel && let Some(anchor) = state.drag_anchor {
+                let init = state.drag_initial_value.take();
+                state.drag_anchor = None;
+                state.drag_distance = 0.0;
+                if !anchor.depth_drag {
+                    cancel_restore = init;
+                }
+            }
 
             if pointer.primary_just_pressed
                 && let Some((px, py)) = pointer.pos
@@ -463,7 +475,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         ));
         let surface = style.surface;
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_knob(ui, rect, displayed_value, arc_origin, surface, dragging, pointer);
+            draw_knob(ui, rect, displayed_value, arc_origin, surface, dragging);
         });
 
         // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
@@ -504,7 +516,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // base scrub の per-frame mutate (depth gesture 中は displayed_value == value で自然に抑止、
         // release frame は下の undoable wrap で 1 度のみ)。
         let suppress_mutate_on_release = release_initial_value.is_some();
-        if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
+        if let Some(init) = cancel_restore {
+            if (init - value).abs() > f32::EPSILON {
+                self.push_edit(on_change(init));
+            }
+        } else if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
             let edit = on_change(displayed_value);
             self.push_edit(edit);
         }
@@ -518,7 +534,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         KnobResponse {
             displayed_value,
-            hovered: hovered(rect, pointer),
+            hovered: self.hovers(rect),
             dragging,
             mod_dragging,
         }
@@ -569,7 +585,6 @@ fn draw_knob<M: ?Sized + 'static>(
     // この knob が載っている面の色 (`KnobStyle::surface`)。 None で palette の `panel`。
     surface: Option<Color>,
     dragging: bool,
-    pointer: crate::input::PointerFrame,
 ) {
     let p = ui.palette();
 
@@ -592,7 +607,7 @@ fn draw_knob<M: ?Sized + 'static>(
     let press_c = p.accent;
     let bg_fill = if dragging {
         press_c
-    } else if hovered(rect, pointer) {
+    } else if ui.hovers(rect) {
         base.lerp(hover_c, 0.85)
     } else {
         base

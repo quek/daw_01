@@ -21,6 +21,8 @@
 //! 「rect 内で `primary_just_released`」 を click として直接読む widget を新しく書かないこと。
 //! release だけ見る判定は全部この口を通す。
 
+use daw_ui_renderer::Rect;
+
 use crate::id::WidgetId;
 use crate::ui::Ui;
 
@@ -61,6 +63,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 現在の press 所有者 (press〜release の間だけ `Some`)。
     pub fn press_owner(&self) -> Option<WidgetId> {
         *self.press_owner
+    }
+
+    /// `wid` が press を掴んでいたが、 **同じ press を後から別の widget が名乗った**
+    /// (= 自分の中に描かれる子 widget がドラッグを始めた)。 コンテナ系のドラッグ
+    /// (行の並べ替え等) は continuation フレームでこれを見て自分の session を捨てる —
+    /// でないと「行の中の数値欄をドラッグしたら行まで動く」 (daw_01 r.md #124)。
+    /// 所有者不在 (背景で始まった press) は「奪われた」 とはみなさない。
+    pub fn press_taken_from(&self, wid: WidgetId) -> bool {
+        self.press_owner.is_some_and(|o| o != wid)
+    }
+
+    /// daw_01 r.md #127: このフレームに「ボタンを押したまま Esc」 が来た。 drag session を
+    /// 持つ widget は session を捨てる (値を per-frame で流していた widget は press 時の値へ
+    /// 戻す)。 Esc 自体は `UiHost` が shortcut 層の手前で抜くので、 選択解除や窓の close
+    /// には化けない。
+    pub fn drag_cancel_requested(&self) -> bool {
+        self.drag_cancel
+    }
+
+    /// **hover 用**のポインタ位置。 別の widget が press を掴んだままドラッグしている間は
+    /// `None` (daw_01 r.md #124: ドラッグの通り道の部品が光らない)。 当たり判定 (press /
+    /// release / drop 先) には使わない — それらは `pointer().pos` のまま。
+    pub fn hover_pos(&self) -> Option<(f32, f32)> {
+        if self.hover_blocked { None } else { self.pointer.pos }
+    }
+
+    /// `rect` に hover しているか ([`Self::hover_pos`] 基準)。
+    pub fn hovers(&self, rect: Rect) -> bool {
+        self.hover_pos().is_some_and(|(px, py)| rect.contains(px, py))
     }
 }
 

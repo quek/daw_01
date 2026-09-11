@@ -459,6 +459,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // r.md #71 (プラグインのコピー / 移動): 掴んだまま **横へ** 出たら内部 reorder を
         // 打ち切り、 caller に運搬 (`begin_drag`) を引き継がせる。 判定は x だけ
         // (`CARRY_OUT_MARGIN_PX` の doc 参照)。
+        // 行の中の子 widget が同じ press を掴んだ (r.md #124) / Esc (r.md #127) は session を捨てる。
+        if self.press_taken_from(wid) || self.drag_cancel_requested() {
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            state.session = None;
+        }
         let mut dragged_out: Option<usize> = None;
         if let Some((px, py)) = pointer.pos {
             let out_of_x = px < rect.x - CARRY_OUT_MARGIN_PX

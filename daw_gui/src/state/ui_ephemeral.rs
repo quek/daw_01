@@ -114,6 +114,10 @@ pub struct UiEphemeral {
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
     /// 上でも同じトラック行を返す。
     pub arrange_hovered_track: Option<u32>,
+    /// Arranger (section 帯) の画面 rect (`ArrangementResponse.arranger_rect` の mirror)。
+    /// r.md #128: `R` がポインタ位置で「選択パートの範囲」 か「選択クリップの範囲」 かを
+    /// 決めるのに読む。 `arrangement_view::draw` が毎フレーム更新。
+    pub arrange_arranger_rect: daw_ui_renderer::Rect,
     /// ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
     /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master

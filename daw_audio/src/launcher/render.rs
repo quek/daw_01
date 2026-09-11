@@ -799,10 +799,11 @@ mod rt_assert_tests {
                         key: RowKey::track(1),
                         clip_id: 10,
                         pressed: true,
+                        immediate: false,
                     }),
-                    24 => rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true }),
-                    64 => rt.push_request(LaunchRequest::StopAll),
-                    96 => rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true }),
+                    24 => rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true, immediate: false }),
+                    64 => rt.push_request(LaunchRequest::StopAll { immediate: false }),
+                    96 => rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false }),
                     200 => rt.on_transport_jump(-8.0),
                     _ => {}
                 }

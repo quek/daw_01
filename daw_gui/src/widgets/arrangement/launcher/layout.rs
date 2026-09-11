@@ -284,9 +284,22 @@ pub(crate) fn cell_rect(rects: &LauncherRects, row_top: f32, row_h: f32, col: us
     }
 }
 
-/// セル左端の ▶ (発火ボタン) の矩形。行が低いときはセル高で頭打ち。
+/// セル左端の ▶ (発火ボタン) の矩形。
+///
+/// r.md #125: **名前帯 (ラベルと同じ行) に置く** — 上下中央だと波形 / ノートの真ん中に
+/// 記号が乗って中身が読めない。帯の高さは [`clip_content_inset_top`] (アレンジのクリップの
+/// ラベル帯と同じ SSoT) で、その中に収めて縦中央。行が低いときはセル高で頭打ち。
 #[must_use]
-pub(crate) fn launch_button_rect(cell: Rect) -> Rect {
+pub(crate) fn launch_button_rect(cell: Rect, style: &ArrangementStyle) -> Rect {
+    let band = clip_content_inset_top(style).min(cell.h);
+    let s = LAUNCH_BTN_W.min(band).min(cell.h - 2.0).min(cell.w - 2.0).max(4.0);
+    Rect { x: cell.x + 1.0, y: cell.y + (band - s) * 0.5, w: s, h: s }
+}
+
+/// シーン見出しの ▶。見出しは 1 行なので **上下中央** (セルの ▶ が名前帯へ寄ったのとは別 —
+/// 見出しには下に隠れる中身が無い)。
+#[must_use]
+pub(crate) fn head_launch_button_rect(cell: Rect) -> Rect {
     let s = LAUNCH_BTN_W.min(cell.h - 2.0).min(cell.w - 2.0).max(4.0);
     Rect { x: cell.x + 1.0, y: cell.y + (cell.h - s) * 0.5, w: s, h: s }
 }

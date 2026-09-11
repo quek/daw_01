@@ -120,6 +120,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // `pointer_blocked_by_modal_popup` が false を返すので menu 自身の item は無傷。
         let blocked = self.pointer_blocked_by_modal_popup();
         let inside = !blocked && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+        // 見た目の hover は「ドラッグ中は出さない」 (r.md #124)。 click 判定の `inside` とは別。
+        let hover_inside = inside && !self.hover_blocked;
 
         // click 判定 (press もこのボタンで始まっていたときだけ)。 視覚は「このボタンで
         // 押下が始まり、今もボタン内にホールド中」のときだけ pressed 表示。
@@ -137,7 +139,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect.w.to_bits(),
             rect.h.to_bits(),
             text,
-            inside,
+            hover_inside,
             visual_pressed,
             font_size.to_bits(),
             align as u8,
@@ -150,7 +152,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
             let fill = if visual_pressed {
                 press
-            } else if inside {
+            } else if hover_inside {
                 base.lerp(hover, 0.85)
             } else {
                 base

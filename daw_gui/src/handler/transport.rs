@@ -419,8 +419,11 @@ impl AppData {
     /// ON / OFF トグルにフォールバックする** (`P` と同じ `toggle_loop`)。
     /// 「範囲を作り直す材料が無いなら、今の範囲を出し入れする」 が自然で、
     /// 無反応 (旧 no-op) だとキーが死んでいるようにしか見えないため。
-    pub(crate) fn loop_selected_clip_toggle(&mut self, automation: bool) {
-        let Some((start, end)) = self.arrange_selection_beat_span(automation) else {
+    pub(crate) fn loop_selected_clip_toggle(&mut self, automation: bool, sections: bool) {
+        // r.md #128: Arranger の上では選択アレンジパートの範囲 (無ければ選択クリップへ倒す)。
+        let span = if sections { self.selected_sections_beat_span() } else { None }
+            .or_else(|| self.arrange_selection_beat_span(automation));
+        let Some((start, end)) = span else {
             self.toggle_loop();
             return;
         };

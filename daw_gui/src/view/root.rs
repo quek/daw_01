@@ -669,9 +669,19 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     if ui.take_shortcut("daw.loop_selected_clip") {
+        // r.md #128: ポインタが Arranger (section 帯) の上にあるときだけ、選択クリップでは
+        // なく **選択アレンジパート** の範囲をループする。 クリップレーンの上では section が
+        // 選択中でもクリップ側 (無ければクリップへ倒す)。
+        let arranger = app.ui_ephemeral.arrange_arranger_rect;
+        let sections = ui
+            .pointer()
+            .pos
+            .is_some_and(|(px, py)| arranger.contains(px, py))
+            && !app.selection.selected_section_ids.is_empty();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::LoopSelectedClipToggle {
                 automation: zoom_automation,
+                sections,
             })
         }));
     }

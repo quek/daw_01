@@ -265,13 +265,15 @@ pub enum LauncherIntent {
     /// `pressed` は
     /// [`LaunchMode`](common::model::LaunchMode) の 4 種 (Trigger / Gate / Toggle /
     /// Repeat) を engine が解釈するために要る。
-    Launch { cell: LauncherCellKey, pressed: bool },
+    /// `immediate` = Alt+click (r.md #126): 量子化を待たず今すぐ撃つ。
+    Launch { cell: LauncherCellKey, pressed: bool, immediate: bool },
     /// シーン見出しの ▶ を押した / 離した (その列を一斉発火)。
-    LaunchScene { scene_id: u32, pressed: bool },
-    /// 行の Stop Clips (停止列)。
-    StopRow(ArrangementRowKey),
-    /// 全行の Stop Clips (停止列の上端)。
-    StopAllRows,
+    LaunchScene { scene_id: u32, pressed: bool, immediate: bool },
+    /// 行の Stop Clips (停止列)。 `immediate` = Alt+click (r.md #126): 量子化を待たず
+    /// **今すぐ**止める。
+    StopRow { row: ArrangementRowKey, immediate: bool },
+    /// 全行の Stop Clips (停止列の上端)。 `immediate` は [`Self::StopRow`] と同じ。
+    StopAllRows { immediate: bool },
     /// 行をアレンジへ返す (返す列)。
     SwitchRowToArranger(ArrangementRowKey),
     /// 全行をアレンジへ返す (返す列の上端)。
@@ -557,6 +559,9 @@ impl QueuedView {
 pub(super) struct PaneWidthDragSession {
     /// drag 開始時の帯幅 (px)。
     pub anchor_pane_w: f32,
+    /// drag 開始時のレイアウト (r.md #127: Esc でここへ戻す。端まで引いて切り替わった後でも
+    /// 押した時点の見せ方に戻る)。
+    pub anchor_layout: LauncherLayout,
     pub anchor_mouse_x: f32,
     /// 最後に書き込んだ幅 (同値書き込みの抑制、0.5px 閾値)。
     pub last_emitted_w: f32,

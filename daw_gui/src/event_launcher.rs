@@ -217,16 +217,18 @@ pub enum LauncherDropMode {
 pub enum LauncherAudioCommand {
     /// セルを撃つ / 離す。`pressed` の解釈 (Trigger / Gate / Toggle / Repeat) は
     /// engine 側がセルの [`LaunchMode`] を見て行う。
-    LaunchCell { row: LauncherRow, clip_id: u32, pressed: bool },
+    /// `immediate` = 量子化を待たず今すぐ (r.md #126 の Alt+click)。
+    LaunchCell { row: LauncherRow, clip_id: u32, pressed: bool, immediate: bool },
     /// セルを `phase_beats` (セルの `start_beat` からの拍) の位置から鳴らす。
     /// [`LaunchMode`] は見ない (押下 / 離しの対を持たない操作)。
     LaunchCellFrom { row: LauncherRow, clip_id: u32, phase_beats: f64 },
     /// セルを鳴らしている全行を、それぞれのセル内の拍 `phase_beats` へ揃える。
     RephaseRows { phase_beats: f64 },
     /// 列を丸ごと撃つ。空セルの行は停止 (計画書 Q11)。
-    LaunchScene { scene_id: u32, pressed: bool },
-    StopRow { row: LauncherRow },
-    StopAllRows,
+    LaunchScene { scene_id: u32, pressed: bool, immediate: bool },
+    /// `immediate` = 量子化を待たず今すぐ (r.md #126 の Alt+click)。
+    StopRow { row: LauncherRow, immediate: bool },
+    StopAllRows { immediate: bool },
     SwitchRowToArranger { row: LauncherRow },
     SwitchAllToArranger,
 }
@@ -240,7 +242,8 @@ pub enum LauncherEvent {
     // ---- 発火 (計画書 §3.1 / §5) --------------------------------------
     /// セルを撃つ / 離す。`Song` 側は「ユーザーが最後に撃った状態」だけを
     /// 書き換える (走行位置は engine が持つ、計画書 §1.4)。
-    LaunchCell { cell: LauncherCellKey, pressed: bool },
+    /// `immediate` = 量子化を待たず今すぐ (r.md #126: ▶ の Alt+click)。
+    LaunchCell { cell: LauncherCellKey, pressed: bool, immediate: bool },
     /// ピアノロールの `f` = **全体をセル内の拍 `phase_beats` から再生**。
     /// 3 つを同時に行う:
     /// - `cell` をその拍から撃つ ([`LauncherAudioCommand::LaunchCellFrom`]。`Song` 側は
@@ -254,11 +257,12 @@ pub enum LauncherEvent {
     /// 量子化はセルの設定に従う。
     PlayFromCellBeat { cell: LauncherCellKey, phase_beats: f64 },
     /// 列 (シーン) を撃つ / 離す。
-    LaunchScene { scene_id: u32, pressed: bool },
-    /// 行の Stop Clips (ランチャーが握ったまま無音)。
-    StopRow { row: LauncherRow },
+    LaunchScene { scene_id: u32, pressed: bool, immediate: bool },
+    /// 行の Stop Clips (ランチャーが握ったまま無音)。 `immediate` = 量子化を待たず今すぐ
+    /// (r.md #126: 停止ボタンの Alt+click)。
+    StopRow { row: LauncherRow, immediate: bool },
     /// 全行の Stop Clips。
-    StopAllRows,
+    StopAllRows { immediate: bool },
     /// 行をアレンジ主導へ戻す (Switch Playback to Arranger)。
     RowToArranger { row: LauncherRow },
     /// 全行をアレンジ主導へ戻す (トランスポートのボタン)。
@@ -362,7 +366,7 @@ impl LauncherEvent {
             | E::PlayFromCellBeat { .. }
             | E::LaunchScene { .. }
             | E::LaunchFocused => "セルを撃つ",
-            E::StopRow { .. } | E::StopAllRows => "ランチャーを止める",
+            E::StopRow { .. } | E::StopAllRows { .. } => "ランチャーを止める",
             E::RowToArranger { .. } | E::AllToArranger => "アレンジに戻す",
             E::AddScene | E::AddSceneAt(..) | E::CaptureScene => "シーン追加",
             E::DeleteScenes(..) => "シーン削除",

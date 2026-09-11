@@ -22,7 +22,7 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::ui::{Ui, hovered};
+use crate::ui::Ui;
 use crate::widgets::level_meter::MeterScale;
 use crate::widgets::scrubable_number::{ModEntry, Modulation};
 
@@ -222,8 +222,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut grabbed_depth_press = false;
         // depth gesture の release frame で確定する最終 depth (pointer 最終位置から再計算)。
         let mut release_depth: Option<f64> = None;
+        // daw_01 r.md #127: Esc でキャンセル → base drag は press 時の値へ戻す (depth gesture は
+        // anchor を捨てるだけ)。 knob と同 idiom。
+        let drag_cancel = self.drag_cancel_requested();
+        let mut cancel_restore: Option<f32> = None;
         let (drag_anchor, release_initial_value, drag_distance) = {
             let state: &mut FaderState = self.widget_state(wid);
+            if drag_cancel && let Some(anchor) = state.drag_anchor {
+                let init = state.drag_initial_value.take();
+                state.drag_anchor = None;
+                state.drag_distance = 0.0;
+                if !anchor.depth_drag {
+                    cancel_restore = init;
+                }
+            }
 
             // 押下: ダブルクリック判定 → リセット 又は drag 開始 (thumb 内のみ)
             if pointer.primary_just_pressed
@@ -371,7 +383,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             hovered_thumb,
         ));
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_fader(ui, col, track_top, track_h, displayed_value, dragging, pointer);
+            draw_fader(ui, col, track_top, track_h, displayed_value, dragging);
         });
 
         // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
@@ -411,7 +423,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // model 値が二重更新されないようにする)。release_initial_value が Some なら drag 終端。
         // depth gesture 中は displayed_value == value で自然に base 発火が抑止される。
         let suppress_mutate_on_release = release_initial_value.is_some();
-        if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
+        if let Some(init) = cancel_restore {
+            if (init - value).abs() > f32::EPSILON {
+                self.push_edit(on_change(to_val(init)));
+            }
+        } else if !suppress_mutate_on_release && (displayed_value - value).abs() > f32::EPSILON {
             let edit = on_change(to_val(displayed_value));
             self.push_edit(edit);
         }
@@ -428,7 +444,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         FaderResponse {
             displayed_value: to_val(displayed_value),
-            hovered: hovered(col, pointer),
+            hovered: self.hovers(col),
             dragging,
             mod_dragging,
         }
@@ -468,7 +484,6 @@ fn draw_fader<M: ?Sized + 'static>(
     track_h: f32,
     value: f32,
     dragging: bool,
-    pointer: crate::input::PointerFrame,
 ) {
     let p = ui.palette();
 
@@ -515,7 +530,7 @@ fn draw_fader<M: ?Sized + 'static>(
     // thumb: flat な水平バー (border / shadow なし、Ableton 系ミニマル)。
     // 可動ハンドルの面は `handle` / `handle_active` トークン (周囲の面より必ず目立つ中立色。
     // ライトテーマでは暗い側に反転するので、 明度固定の literal では成立しない)。
-    let thumb_fill = if dragging || hovered(thumb, pointer) {
+    let thumb_fill = if dragging || ui.hovers(thumb) {
         p.handle_active
     } else {
         p.handle

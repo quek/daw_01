@@ -184,7 +184,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // `arrange_hovered_track` と同 idiom)。 layout を持つこの draw が唯一の算出点
     // (SSoT)。 master strip は solo を持たないので対象外 (= None のまま)。
     let pointer = ui.pointer();
-    let ptr = pointer.pos;
+    // hover 用 (r.md #124: 別 widget のドラッグ中は出さない)。
+    let ptr = ui.hover_pos();
     let mut hovered_strip: Option<u32> = None;
 
     let inner_pad = INNER_PAD;

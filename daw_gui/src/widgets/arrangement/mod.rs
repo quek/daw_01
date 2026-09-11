@@ -81,6 +81,7 @@ use geometry::*;
 // glob を足すのは「型を兄弟へ出すモジュール」だけ — `drag::RewindAxes` /
 // `header::HeaderClicks` / `render::HeavyInput` はモジュール内で閉じるので足さない
 // (足すと `unused_imports` が `-D warnings` で落ちる)。
+mod cancel;
 mod cursor;
 mod drag;
 mod frame;
@@ -2027,6 +2028,33 @@ pub(crate) struct ArrangementState {
     /// 生読みは「ModifiersChanged が MouseInput(Released) より先に届く」 race で
     /// Ctrl/Shift+click が Single に化ける (drag session の `last_*` と同 class)。
     press_modifiers: Modifiers,
+}
+
+impl ArrangementState {
+    /// 何かの drag session (帯のものも含む) が生きているか。 press 所有の宣言
+    /// (`press::dispatch`) が見る。 Esc キャンセル (`cancel.rs`) が捨てる集合と同じ。
+    #[must_use]
+    fn any_drag_live(&self) -> bool {
+        self.clip_drag.is_some()
+            || self.range_drag.is_some()
+            || self.loop_drag.is_some()
+            || self.track_reorder.is_some()
+            || self.track_volume_drag.is_some()
+            || self.playhead_drag.is_some()
+            || self.audio_drag.is_some()
+            || self.automation_point_drag.is_some()
+            || self.automation_lane_resize_drag.is_some()
+            || self.track_row_resize_drag.is_some()
+            || self.header_resize_drag.is_some()
+            || self.automation_clip_drag.is_some()
+            || self.automation_lasso_drag.is_some()
+            || self.automation_segment_bend.is_some()
+            || self.section_drag.is_some()
+            || self.launcher.pane_width_drag.is_some()
+            || self.launcher.col_width_drag.is_some()
+            || self.launcher.scene_reorder.is_some()
+            || self.launcher.cell_drag.is_some()
+    }
 }
 
 /// M14 Phase 63k (#025): audio_drag の commit / overlay で共有する計算結果。

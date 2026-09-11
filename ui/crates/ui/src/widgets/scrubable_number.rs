@@ -27,7 +27,7 @@ use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::theme::Palette;
-use crate::ui::{Ui, hovered};
+use crate::ui::Ui;
 use crate::widgets::text_input::TextInputStyle;
 
 /// ダブルクリック判定の時間しきい値 (ms)。 knob/fader と統一。
@@ -626,8 +626,20 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let mut short_click_release = false;
         // depth gesture の release frame の pointer 位置 (= 最終 depth をブロックの外で再計算する)。
         let mut release_anchor: Option<(DragAnchor, f32, f32)> = None;
+        // daw_01 r.md #127: Esc でキャンセル → base drag は press 時の値へ戻す (depth gesture は
+        // anchor を捨てるだけ)。 knob / fader と同 idiom。
+        let drag_cancel = self.drag_cancel_requested();
+        let mut cancel_restore: Option<f64> = None;
         let (drag_anchor, drag_distance, was_editing) = {
             let state: &mut ScrubableNumberState = self.widget_state(wid);
+            if drag_cancel && let Some(anchor) = state.drag_anchor {
+                let init = state.drag_initial_value.take();
+                state.drag_anchor = None;
+                state.drag_distance = 0.0;
+                if !anchor.depth_drag {
+                    cancel_restore = init;
+                }
+            }
 
             if pointer.primary_just_pressed
                 && let Some((px, py)) = pointer.pos
@@ -802,7 +814,11 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
 
         // drag 中の per-frame 発火 (= short-click release は除外、 reset は別経路で済、
         // release frame も skip — release frame は下で最終値を 1 度 commit する)。
-        if !short_click_release
+        if let Some(init) = cancel_restore {
+            if (init - value).abs() > f64::EPSILON {
+                self.push_edit(on_change(init));
+            }
+        } else if !short_click_release
             && !reset_fired
             && release_initial_value.is_none()
             && (displayed_value - value).abs() > f64::EPSILON
@@ -873,7 +889,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             // ---- 通常描画 (= 非 editing): 背景 + 数値テキスト ----
             let bg_fill = if dragging_now {
                 style.bg_color_dragging
-            } else if hovered(rect, pointer) {
+            } else if self.hovers(rect) {
                 style.bg_color_hovered
             } else {
                 style.bg_color
@@ -898,7 +914,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 rect.h.to_bits(),
                 displayed_value.to_bits(),
                 dragging_now,
-                hovered(rect, pointer),
+                self.hovers(rect),
                 style.font_size.to_bits(),
                 style.pad_x.to_bits(),
                 // **描画する文字列そのもの** を fold する。 値だけを hash すると (a) 同 id で
@@ -935,7 +951,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
 
         ScrubableNumberResponse {
             displayed_value,
-            hovered: hovered(rect, pointer),
+            hovered: self.hovers(rect),
             dragging: dragging_now,
             mod_dragging,
             editing_text: was_editing,

@@ -103,6 +103,9 @@ pub struct PlayheadDragSession {
     /// drag 中に最後に発火した snap 適用済 beat 値 (毎 frame 同値発火を抑制)。
     /// press frame で初期化済み (= press 即発行値)、 continuation で differ 時のみ更新 + emit。
     pub last_emitted_beat: f64,
+    /// r.md #127: press 直前のプレイヘッド位置。 Esc でキャンセルしたらここへ戻す
+    /// (`None` = 位置未設定だったので戻し先が無い)。
+    pub anchor_beat: Option<f64>,
 }
 
 /// loop band overlay の描画 (背景帯 + 左右 handle bar)。 arrangement / piano_roll 両 widget が

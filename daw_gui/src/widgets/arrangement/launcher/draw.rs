@@ -144,7 +144,7 @@ pub(crate) fn dispatch(
     // 押下 / hover / 点滅位相は 1 度だけ解いて、全部の描画関数へ同じ値を配る。
     // hover の判定は press と **同じ `zone_at`** を通す (光る場所 = 効く場所)。
     let fb = LauncherFeedback {
-        hover: f.pointer.pos.and_then(|(x, y)| press::zone_at(f, x, y)),
+        hover: f.hover_pos.and_then(|(x, y)| press::zone_at(f, x, y)),
         held: sessions.live_held_button,
         blink: app
             .transport
@@ -307,7 +307,7 @@ fn draw_scene_head(
     // 色ストライプ (左端 3px) — 列の identity。塗り全面ではなく帯にするのは、
     // 見出しの文字がクローム面の上に乗ったままになるようにするため。
     push_filled_rect(hctx, Rect { w: 3.0, ..r }, p.adapt_on(style.header_bg, scene.color));
-    let btn = layout::launch_button_rect(Rect { x: r.x + 3.0, w: (r.w - 3.0).max(2.0), ..r });
+    let btn = layout::head_launch_button_rect(Rect { x: r.x + 3.0, w: (r.w - 3.0).max(2.0), ..r });
     let ind = interactive_indicator(
         p,
         style.header_bg,
@@ -630,7 +630,7 @@ fn draw_empty_cell(
     let body_hover = fb.hovers_cell_body(key);
     let base = if body_hover { 0.40 } else { 0.25 };
     push_rounded(hctx, r, p.control.with_alpha(base), Color::TRANSPARENT, 0.0);
-    let btn = layout::launch_button_rect(r);
+    let btn = layout::launch_button_rect(r, f.style);
     let btn_ind = bare_indicator(
         p,
         composite_over(p.control.with_alpha(base), bg),
@@ -679,7 +679,7 @@ fn draw_filled_cell(
     let (r, key) = (d.rect, d.key);
     let fill = if cell.muted { muted_dim_fill(cell.color) } else { cell.color };
     push_rounded(hctx, r, fill, f.style.clip_border, CELL_RADIUS);
-    let btn = layout::launch_button_rect(r);
+    let btn = layout::launch_button_rect(r, f.style);
     let label = Rect {
         x: btn.x + btn.w + 2.0,
         y: r.y,
@@ -943,7 +943,7 @@ fn draw_group_cell(
         push_filled_rect(hctx, Rect { x: r.x, y, w: r.w, h: sh }, *c);
     }
     let base = stripes[0];
-    let btn = layout::launch_button_rect(r);
+    let btn = layout::launch_button_rect(r, f.style);
     // **まとめセルも押せる場所なので、押せるように見せる。** 以前はここだけ
     // `indicator_on` (= フィードバック無し) で描いていたので、押下中も hover 中も
     // 画面が 1px も変わらなかった (量子化 1 小節なら最大 1 小節「押せていない」
@@ -1193,17 +1193,62 @@ fn drag_overlays(
             .into_iter()
             .map(|m| (m.to_row, m.to_scene_index))
             .collect();
-        if slots.is_empty() {
-            // 格子の外 (= アレンジのレーンへ持ち出している最中 / 停止列の上)。
-            // 落ちるスロットが無いので、従来どおりカーソルに付くゴーストを出す。
-            let w = (f.launcher.col_w - 2.0).max(8.0);
-            let h = f.view.track_row_h.max(8.0) - 4.0;
-            let ghost = Rect { x: cd.last_mouse.0 - w * 0.5, y: cd.last_mouse.1 - h * 0.5, w, h };
-            push_rounded(hctx, ghost, style.0, style.1, CELL_RADIUS);
+        if !slots.is_empty() {
+            push_slot_ghosts(hctx, f, &slots, style);
             return;
         }
-        push_slot_ghosts(hctx, f, &slots, style);
+        // r.md #123: アレンジのレーンの上なら、**落ちる拍・行・長さ**でゴーストを描く。
+        // 着地先は commit と同じ `plan_arranger_drops` (スナップ込み) なので、ゴーストの
+        // 左端がそのままクリップの開始位置になる。
+        let drops = release::plan_arranger_drops(f, cd);
+        if !drops.is_empty() {
+            push_arranger_ghosts(hctx, f, &drops, style);
+            return;
+        }
+        // 格子の外かつレーンの外 (= 停止列の上など)。落ちる先が無いので、カーソルに
+        // 付くゴーストを出す。
+        let w = (f.launcher.col_w - 2.0).max(8.0);
+        let h = f.view.track_row_h.max(8.0) - 4.0;
+        let ghost = Rect { x: cd.last_mouse.0 - w * 0.5, y: cd.last_mouse.1 - h * 0.5, w, h };
+        push_rounded(hctx, ghost, style.0, style.1, CELL_RADIUS);
     }
+}
+
+/// アレンジのレーン上の着地先にゴーストを敷く (r.md #123)。
+///
+/// x / 幅は **クリップと同じ写像** (`f.view.start_beat` 原点 × `zoom_x_px_per_beat`)、
+/// 縦はクリップと同じインセット (`cell_rect` の `+2 / -4`)。長さは運ぶセルの
+/// `len_beats` (= 落としたクリップの長さ)。
+fn push_arranger_ghosts(
+    hctx: &mut HeavyCtx<'_, '_, AppData>,
+    f: &ArrangementFrame<'_>,
+    drops: &[CellToClipDrop],
+    (fill, border): (Color, Color),
+) {
+    let lanes = f.lanes;
+    let ppb = f64::from(f.zoom_x_px_per_beat);
+    hctx.with_clip_rect(lanes, |hctx| {
+        for d in drops {
+            let Some(row) = f.rows.iter().find(|r| r.key == d.to_row) else {
+                continue;
+            };
+            let len_beats = f
+                .launcher_view
+                .rows
+                .get(&d.from.row)
+                .and_then(|r| r.cells.get(&d.from.scene_id))
+                .map_or(0.0, |c| c.len_beats);
+            let x0 = f64::from(lanes.x) + (d.to_start_beat - f.view.start_beat) * ppb;
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, w) = (x0 as f32, (len_beats * ppb).max(2.0) as f32);
+            let top = layout::row_screen_top(f, row);
+            let r = Rect { x, y: top + 2.0, w, h: (row.height - 4.0).max(2.0) };
+            if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                continue;
+            }
+            push_rounded(hctx, r, fill, border, CELL_RADIUS);
+        }
+    });
 }
 
 /// ドラッグ中のゴーストの `(塗り, 縁)`。運び方 (移動 / リンク複製 / 独立複製) で

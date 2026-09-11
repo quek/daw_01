@@ -108,17 +108,27 @@ pub(super) fn dispatch(app: &AppData, ui: &mut Ui<'_, AppData>, resp: &Arrangeme
 /// intent 1 件を `LauncherEvent` へ。`None` = このフレームでは何もしない。
 fn convert(intent: &LauncherIntent) -> Option<LauncherEvent> {
     Some(match intent {
-        LauncherIntent::Launch { cell, pressed } => match cell_of(*cell) {
-            Some(c) => LauncherEvent::LaunchCell { cell: c, pressed: *pressed },
+        LauncherIntent::Launch { cell, pressed, immediate } => match cell_of(*cell) {
+            Some(c) => {
+                LauncherEvent::LaunchCell { cell: c, pressed: *pressed, immediate: *immediate }
+            }
             // 空セルの ▶ は「その行を止める」 (計画書 Q11)。離しでは何もしない。
-            None if *pressed => LauncherEvent::StopRow { row: row_of(cell.row) },
+            None if *pressed => {
+                LauncherEvent::StopRow { row: row_of(cell.row), immediate: false }
+            }
             None => return None,
         },
-        LauncherIntent::LaunchScene { scene_id, pressed } => {
-            LauncherEvent::LaunchScene { scene_id: *scene_id, pressed: *pressed }
+        LauncherIntent::LaunchScene { scene_id, pressed, immediate } => LauncherEvent::LaunchScene {
+            scene_id: *scene_id,
+            pressed: *pressed,
+            immediate: *immediate,
+        },
+        LauncherIntent::StopRow { row, immediate } => {
+            LauncherEvent::StopRow { row: row_of(*row), immediate: *immediate }
         }
-        LauncherIntent::StopRow(row) => LauncherEvent::StopRow { row: row_of(*row) },
-        LauncherIntent::StopAllRows => LauncherEvent::StopAllRows,
+        LauncherIntent::StopAllRows { immediate } => {
+            LauncherEvent::StopAllRows { immediate: *immediate }
+        }
         LauncherIntent::SwitchRowToArranger(row) => {
             LauncherEvent::RowToArranger { row: row_of(*row) }
         }

@@ -24,8 +24,8 @@ pub fn dispatch(
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
 ) -> bool {
     let req = match cmd {
-        AudioCommand::LaunchCell { track_id, lane_id, clip_id, pressed } => {
-            LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed }
+        AudioCommand::LaunchCell { track_id, lane_id, clip_id, pressed, immediate } => {
+            LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed, immediate }
         }
         AudioCommand::LaunchCellFrom { track_id, lane_id, clip_id, phase_beats } => {
             LaunchRequest::CellFrom { key: RowKey::lane(track_id, lane_id), clip_id, phase_beats }
@@ -33,13 +33,13 @@ pub fn dispatch(
         AudioCommand::RephaseLauncherRows { phase_beats } => {
             LaunchRequest::RephaseRunning { phase_beats }
         }
-        AudioCommand::LaunchScene { scene_id, pressed } => {
-            LaunchRequest::Scene { scene_id, pressed }
+        AudioCommand::LaunchScene { scene_id, pressed, immediate } => {
+            LaunchRequest::Scene { scene_id, pressed, immediate }
         }
-        AudioCommand::StopRow { track_id, lane_id } => {
-            LaunchRequest::StopRow { key: RowKey::lane(track_id, lane_id) }
+        AudioCommand::StopRow { track_id, lane_id, immediate } => {
+            LaunchRequest::StopRow { key: RowKey::lane(track_id, lane_id), immediate }
         }
-        AudioCommand::StopAllRows => LaunchRequest::StopAll,
+        AudioCommand::StopAllRows { immediate } => LaunchRequest::StopAll { immediate },
         AudioCommand::SwitchRowToArranger { track_id, lane_id } => {
             LaunchRequest::RowToArranger { key: RowKey::lane(track_id, lane_id) }
         }
@@ -61,10 +61,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // 行の宛先は安定 id で運ばれる (lane_id = 0 がトラック行)。
-        assert!(dispatch(AudioCommand::LaunchCell { track_id: 3, lane_id: 0, clip_id: 9, pressed: true }, &tx));
+        assert!(dispatch(AudioCommand::LaunchCell { track_id: 3, lane_id: 0, clip_id: 9, pressed: true, immediate: false }, &tx));
         let got = rx.try_recv().expect("audio thread へ渡る");
         match got {
-            EngineCommand::Launch(LaunchRequest::Cell { key, clip_id, pressed }) => {
+            EngineCommand::Launch(LaunchRequest::Cell { key, clip_id, pressed, .. }) => {
                 assert_eq!(key, RowKey::track(3));
                 assert_eq!(clip_id, 9);
                 assert!(pressed);

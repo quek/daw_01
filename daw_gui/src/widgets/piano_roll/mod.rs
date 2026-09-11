@@ -44,7 +44,9 @@ use crate::widgets::ruler_ops::{
 use crate::widgets::time_grid::{BarBeatGridStyle, GridLines, TimeGridExt, TimeRulerStyle};
 
 pub(crate) mod view_build;
+mod cancel;
 mod draw;
+mod press_ruler;
 use draw::*;
 mod geometry;
 use geometry::*;

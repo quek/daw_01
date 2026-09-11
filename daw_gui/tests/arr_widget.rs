@@ -2236,13 +2236,13 @@ fn launcher_cell_play_button_reports_a_launch_intent() {
         .copied()
         .find(|(k, _)| k.clip_id == 9)
         .expect("置いたセルの rect が返る");
-    // ▶ はセルの左端 (`launch_button_rect`)。
-    let (x, y) = (rect.x + 4.0, rect.y + rect.h * 0.5);
+    // ▶ はセルの左端・名前帯 (`launch_button_rect`、 r.md #125 で上下中央 → 上段)。
+    let (x, y) = (rect.x + 4.0, rect.y + 6.0);
     let r1 = drive_response(&mut host, &mut app, press(x, y, no_mods()));
     assert!(
         r1.launcher.intents.iter().any(|i| matches!(
             i,
-            LauncherIntent::Launch { cell, pressed: true } if cell.clip_id == 9
+            LauncherIntent::Launch { cell, pressed: true, .. } if cell.clip_id == 9
         )),
         "▶ の押下で Launch: {:?}",
         r1.launcher.intents
@@ -2251,7 +2251,7 @@ fn launcher_cell_play_button_reports_a_launch_intent() {
     assert!(
         r2.launcher.intents.iter().any(|i| matches!(
             i,
-            LauncherIntent::Launch { cell, pressed: false } if cell.clip_id == 9
+            LauncherIntent::Launch { cell, pressed: false, .. } if cell.clip_id == 9
         )),
         "離しでも 1 件 (`LaunchMode::Gate` の停止契機): {:?}",
         r2.launcher.intents

@@ -354,6 +354,7 @@ impl AppData {
                 arrangement_hover_clip: None,
                 arrange_drag_active: false,
                 arrange_hovered_track: None,
+                arrange_arranger_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 mixer_hovered_track: None,
                 mixer_hovered_strip_section: None,
                 inspector_hovered_device: None,
@@ -689,8 +690,8 @@ impl AppData {
                 }
                 self.recording.preview_note = next;
             }
-            AppEvent::LoopSelectedClipToggle { automation } => {
-                self.loop_selected_clip_toggle(automation);
+            AppEvent::LoopSelectedClipToggle { automation, sections } => {
+                self.loop_selected_clip_toggle(automation, sections);
             }
             AppEvent::BpmEditChanged(s) => {
                 self.ui_ephemeral.bpm_edit_text = s;

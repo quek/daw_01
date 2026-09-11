@@ -363,68 +363,19 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             && let Some((px, py)) = pointer.pos
             && ruler.contains(px, py)
         {
-            let press_beat =
-                view.start_beat + f64::from(px - ruler.x) * beat_per_px;
-            let press_alt = pointer.modifiers.alt;
-            if pointer.modifiers.shift {
-                // Shift + ruler drag → loop range edit (NewRange / Start/End/Middle handle)。
-                let kind = if let Some(range) = view.loop_range {
-                    match loop_band_hit_kind(
-                        range,
-                        view.start_beat,
-                        view.len_beats,
-                        ruler,
-                        px,
-                        4.0,
-                    ) {
-                        Some(LoopBandHit::Start) => LoopDragKind::Start,
-                        Some(LoopBandHit::End) => LoopDragKind::End,
-                        Some(LoopBandHit::Middle) => LoopDragKind::Middle,
-                        None => LoopDragKind::NewRange,
-                    }
-                } else {
-                    LoopDragKind::NewRange
-                };
-                // NewRange の anchor 端点は press 時 snap で grid に着地 (release 端点も
-                // `compute_loop_drag_endpoints` で snap される、 arrangement #024 と同 idiom)。
-                let anchor_press_beat_for_session = match kind {
-                    LoopDragKind::NewRange => view
-                        .snap
-                        .snap_beat(press_beat, press_alt, zoom_x_px_per_beat),
-                    _ => press_beat,
-                };
-                let anchor_loop = view.loop_range.unwrap_or((
-                    anchor_press_beat_for_session,
-                    anchor_press_beat_for_session,
-                ));
-                let state: &mut PianoRollState = ui.widget_state(wid);
-                state.loop_drag = Some(LoopDragSession {
-                    kind,
-                    anchor_loop,
-                    anchor_press_beat: anchor_press_beat_for_session,
-                    anchor_mouse_x: px,
-                    last_mouse_x: px,
-                    last_alt: press_alt,
-                });
-            } else {
-                // plain (Shift 非保持) ruler click/drag → playhead seek session。
-                let snapped = view
-                    .snap
-                    .snap_beat(press_beat, press_alt, zoom_x_px_per_beat)
-                    .max(0.0);
-                let state: &mut PianoRollState = ui.widget_state(wid);
-                state.playhead_drag = Some(PlayheadDragSession {
-                    last_mouse_x: px,
-                    last_emitted_beat: snapped,
-                });
-                press_seek_beat = Some(snapped);
-            }
+            press_seek_beat = press_ruler::press(
+                ui, wid, app, &view, ruler, beat_per_px, zoom_x_px_per_beat, px,
+                pointer.modifiers.alt, pointer.modifiers.shift,
+            );
         }
         if let Some(beat) = press_seek_beat {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.seek_playhead_to(beat);
             }));
         }
+
+        // r.md #127: ボタンを押したまま Esc = ドラッグのキャンセル (`cancel::on_escape`)。
+        cancel::on_escape(ui, wid);
 
         // drag 継続中は毎 continuation frame で `last_mouse` / `last_alt` を update。
         // **release frame の `last_alt` は update しない** — 同 frame に ModifiersChanged(alt=false)

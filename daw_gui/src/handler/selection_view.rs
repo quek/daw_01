@@ -1682,6 +1682,18 @@ impl AppData {
     /// root の `edit_surface` arbiter が選んだ **片面のみ** を対象にする (last-selection
     /// -wins、 = 「MIDI clip を選んだのに残存 automation 選択へズームしてしまう」 を防ぐ)。
     /// 解決不能 / 退化 (長さ 0) なら `None`。 `Z` 横ズームと `R` loop が共有する。
+    /// 選択アレンジパート (section) の bounding beat 範囲 (r.md #128: Arranger 上の `R`)。
+    /// 選択が無い / 退化なら `None`。
+    pub(crate) fn selected_sections_beat_span(&self) -> Option<(f64, f64)> {
+        let ids = &self.selection.selected_section_ids;
+        let (mut min_start, mut max_end) = (f64::INFINITY, f64::NEG_INFINITY);
+        for s in self.song_doc.song().sections.iter().filter(|s| ids.contains(&s.id)) {
+            min_start = min_start.min(s.start_beat);
+            max_end = max_end.max(s.start_beat + s.len_beats);
+        }
+        (min_start.is_finite() && max_end > min_start).then_some((min_start, max_end))
+    }
+
     pub(crate) fn arrange_selection_beat_span(&self, automation: bool) -> Option<(f64, f64)> {
         let (mut min_start, mut max_end) = (f64::INFINITY, f64::NEG_INFINITY);
         if automation {

@@ -25,7 +25,7 @@ use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::theme::{Palette, WaveformInk};
-use crate::ui::{Ui, hovered};
+use crate::ui::Ui;
 
 /// MSEG の 1 ブレークポイント (描画 / hit-test 用の plain コピー)。`curve` は
 /// 「この点から次の点へ向かうセグメント」の tension (-1..=1)。
@@ -149,7 +149,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
         let n = nodes.len();
         let mut response = MsegEditorResponse {
-            hovered: hovered(rect, pointer),
+            hovered: self.hovers(rect),
             dragging: false,
         };
 
@@ -417,7 +417,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let wid = WidgetId::ROOT.child((b"step_grid", &id));
         let pointer = self.pointer;
         let n = values.len();
-        let mut response = MsegEditorResponse { hovered: hovered(rect, pointer), dragging: false };
+        let mut response = MsegEditorResponse { hovered: self.hovers(rect), dragging: false };
         if n == 0 {
             return response;
         }

@@ -966,7 +966,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // トラック paste の挿入先 (= マウス下トラックの直上)。ヘッダ列でも
     // クリップレーン上でも効くよう、X はアレンジ全幅 (`area`)、Y は実 header rect で
     // 判定する (hover_clip と同じ Y-only 手法、master 行 / ruler 上は None)。
-    let hovered_track_id: Option<u32> = ui.pointer().pos.and_then(|(px, py)| {
+    let hovered_track_id: Option<u32> = ui.hover_pos().and_then(|(px, py)| {
         if !area.contains(px, py) {
             return None;
         }
@@ -979,13 +979,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         || app.ui_ephemeral.arrangement_hover_clip != hover_clip
         || app.ui_ephemeral.arrange_hovered_track != hovered_track_id
         || app.ui_ephemeral.arrange_drag_active != drag_active
+        || app.ui_ephemeral.arrange_arranger_rect != resp.arranger_rect
     {
+        let arranger_rect = resp.arranger_rect;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.ui_ephemeral.arrangement_hover_beat = snapped_beat;
             app.ui_ephemeral.arrangement_hover_beat_raw = raw_beat;
             app.ui_ephemeral.arrangement_hover_clip = hover_clip;
             app.ui_ephemeral.arrange_hovered_track = hovered_track_id;
             app.ui_ephemeral.arrange_drag_active = drag_active;
+            app.ui_ephemeral.arrange_arranger_rect = arranger_rect;
         }));
     }
 }

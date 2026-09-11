@@ -29,14 +29,14 @@ pub(crate) fn commit(
                     response
                         .launcher
                         .intents
-                        .push(LauncherIntent::Launch { cell: c, pressed: false });
+                        .push(LauncherIntent::Launch { cell: c, pressed: false, immediate: false });
                 }
             }
             LauncherButton::Scene(scene_id) => {
                 response
                     .launcher
                     .intents
-                    .push(LauncherIntent::LaunchScene { scene_id, pressed: false });
+                    .push(LauncherIntent::LaunchScene { scene_id, pressed: false, immediate: false });
             }
         }
     }
@@ -52,7 +52,8 @@ pub(crate) fn commit(
 
 /// ポインタ下のセル (`hovered_clip` と同じ毎フレーム算出の hover state)。
 fn hovered_cell(f: &ArrangementFrame<'_>, response: &mut ArrangementResponse) {
-    if let Some((x, y)) = f.pointer.pos {
+    // hover 用 (r.md #124: 別 widget のドラッグ中は出さない。 共有クリップの連動強調もここ経由)。
+    if let Some((x, y)) = f.hover_pos {
         response.launcher.hovered_cell = layout::cell_at(f, x, y).map(|(k, _)| k);
     }
 }
@@ -79,7 +80,7 @@ fn double_click(
     // (`launch_button_rect`) を通す — 通さないと、クリップを撃ち直す 2 連打が
     // そのまま `OpenCellEditor` になり、空セルの ■ を 2 度叩いて行を止める操作が
     // `CreateCell` になる (止める / 撃ち直すつもりの操作が曲の中身を変える)。
-    if layout::launch_button_rect(rect).contains(cx, cy) {
+    if layout::launch_button_rect(rect, f.style).contains(cx, cy) {
         return;
     }
     // セルを所有できない行 (マスター行 / グループ行) には作らない・開かない。
@@ -171,30 +172,45 @@ fn drop_to_arranger(
     mode: ClipCopyMode,
     response: &mut ArrangementResponse,
 ) {
+    let drops = plan_arranger_drops(f, cd);
+    if !drops.is_empty() {
+        response.launcher.intents.push(LauncherIntent::DropCellsToArranger { drops, mode });
+    }
+}
+
+/// アレンジのレーンへ運んでいるセルの **着地先** (行 + スナップ済の開始拍)。
+///
+/// r.md #123: [`plan_cell_moves`] と同じ理由で **`draw::drag_overlays` のプレビューと
+/// `drop_to_arranger` の確定がこの 1 本を通る** — ゴーストが乗っている拍にそのまま落ちる。
+/// ポインタがレーンの外なら空。
+#[must_use]
+pub(super) fn plan_arranger_drops(
+    f: &ArrangementFrame<'_>,
+    cd: &CellDragSession,
+) -> Vec<CellToClipDrop> {
     let (mx, my) = cd.last_mouse;
+    if !f.lanes.contains(mx, my) {
+        return Vec::new();
+    }
     let Some(base_row) = arrangement_row_at_y(f, my) else {
-        return;
+        return Vec::new();
     };
     let Some(base_idx) = row_index(f, base_row) else {
-        return;
+        return Vec::new();
     };
     let Some(anchor_idx) = row_index(f, cd.primary.row) else {
-        return;
+        return Vec::new();
     };
     let raw = px_to_beat(mx, f.lanes.x, f.lanes.w, f.view);
     let start = f.view.snap.snap_beat(raw, cd.last_alt, f.zoom_x_px_per_beat).max(0.0);
-    let drops: Vec<CellToClipDrop> = cd
-        .cells
+    cd.cells
         .iter()
         .filter_map(|cell| {
             let idx = row_index(f, cell.row)?;
             let to = shift_row(f, idx, base_idx, anchor_idx)?;
             Some(CellToClipDrop { from: *cell, to_row: to, to_start_beat: start })
         })
-        .collect();
-    if !drops.is_empty() {
-        response.launcher.intents.push(LauncherIntent::DropCellsToArranger { drops, mode });
-    }
+        .collect()
 }
 
 /// セルを別のセルへ運んだ (帯の中の移動 / 複製)。

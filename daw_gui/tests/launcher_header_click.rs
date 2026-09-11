@@ -202,7 +202,7 @@ fn プレースホルダ列の記号は全行停止を出す() {
     assert!(
         intents
             .iter()
-            .any(|i| matches!(i, LauncherIntent::LaunchScene { scene_id: 0, pressed: true })),
+            .any(|i| matches!(i, LauncherIntent::LaunchScene { scene_id: 0, pressed: true, .. })),
         "空き列の ▶ は全行停止 (scene_id 0) を出す: {intents:?}"
     );
 }
@@ -239,7 +239,7 @@ fn 実シーンの記号はそのシーンを撃つ() {
 
     assert!(
         intents.iter().any(
-            |i| matches!(i, LauncherIntent::LaunchScene { scene_id: s, pressed: true } if *s == scene_id)
+            |i| matches!(i, LauncherIntent::LaunchScene { scene_id: s, pressed: true, .. } if *s == scene_id)
         ),
         "▶ はそのシーンを撃つ: {intents:?}"
     );

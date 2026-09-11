@@ -13,12 +13,18 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     // 入力ビューは `arrangement()` のスタックに置いたまま、 `frame` がそこから借りる。
     let built = view_build::build(app, area);
     let f = frame::build(&built, area, ui);
-    let mut response = ArrangementResponse { ruler_rect: f.ruler, ..Default::default() };
+    let mut response = ArrangementResponse {
+        ruler_rect: f.ruler,
+        arranger_rect: f.arranger_rect,
+        ..Default::default()
+    };
 
     // 1. レイアウトを app にミラー (auto-fit / 縦ズーム用)。
     frame::mirror_layout(app, ui, &f, &mut response);
     // 2. press 振り分け (splitter → clip → arranger → ruler → header → automation)。
     press::dispatch(ui, &f);
+    // 2b. ボタンを押したまま Esc → 生きている drag session を全部捨てる (r.md #127)。
+    cancel::on_escape(ui, &f);
     // 3. drag 継続 + 端オートスクロール + per-frame live 発火。
     drag::advance(ui, &f);
     launcher::drag::advance(ui, &f);

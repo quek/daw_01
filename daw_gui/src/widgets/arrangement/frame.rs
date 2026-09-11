@@ -78,6 +78,9 @@ pub(super) struct ArrangementFrame<'a> {
     pub id: &'static str,
     /// このフレームの pointer スナップショット (`PointerFrame` は Copy、 `ui` を借りない)。
     pub pointer: daw_ui_core::PointerFrame,
+    /// **hover 用**のポインタ位置 (`Ui::hover_pos`)。 別 widget がドラッグ中は `None`
+    /// (r.md #124)。 当たり判定 (press / release / drop) は `pointer.pos` を使う。
+    pub hover_pos: Option<(f32, f32)>,
 }
 
 /// `BuiltArrangement` + caller の `area` + `ui` の pointer スナップショットから 1 フレームの
@@ -213,6 +216,7 @@ pub(super) fn build<'a>(
         wid,
         id,
         pointer,
+        hover_pos: ui.hover_pos(),
     }
 }
 

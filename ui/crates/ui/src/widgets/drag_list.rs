@@ -177,6 +177,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- drag continue / carry out ----
+        // 行の中の子 widget (数値欄 / knob …) が同じ press を掴んだら、 行のドラッグは
+        // 成立しない (r.md #124: Hue をドラッグしたらプラグインの順番が変わっていた)。
+        // Esc (r.md #127) も同じく session を捨てる。
+        if self.press_taken_from(wid) || self.drag_cancel_requested() {
+            let state: &mut DragListState = self.widget_state(wid);
+            state.session = None;
+        }
         let mut dragged_out: Option<usize> = None;
         if let Some((px, py)) = pointer.pos {
             let out_of_x = px < rect.x - CARRY_OUT_MARGIN_PX || px > rect.x + rect.w + CARRY_OUT_MARGIN_PX;
@@ -240,7 +247,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 w: rect.w,
                 h: rows[i].height,
             };
-            let inside = pointer.pos.is_some_and(|(px, py)| r.contains(px, py));
+            let inside = self.hovers(r);
             let in_block = dragging_anchor
                 .is_some_and(|s| i >= s.anchor && i < s.anchor + rows[s.anchor].block_len.max(1));
             row_rects.push((i, r));

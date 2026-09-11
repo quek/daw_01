@@ -636,6 +636,29 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let mut keyboard_events = keyboard;
         let mut ime_events = ime;
 
+        // daw_01 r.md #127: **ボタンを押したまま Esc = ドラッグのキャンセル。** この
+        // フレームだけ `Ui::drag_cancel_requested()` が立ち、drag session を持つ widget は
+        // session を捨てる (per-frame で値を流していたものは anchor へ戻す)。Esc は
+        // ここで keyboard_events から抜くので shortcut 層の "escape" (選択解除 / 窓を閉じる)
+        // には届かない — キャンセルしたいのはドラッグであって、選択や窓ではない。
+        // 運搬中の札 (widget を跨ぐ drag) も同時に捨てる。
+        let drag_cancel = pointer.primary_pressed
+            && keyboard_events.iter().any(|ev| {
+                ev.physical_key == PhysicalKey::Escape
+                    && matches!(ev.state, daw_ui_platform::ElementState::Pressed)
+            });
+        if drag_cancel {
+            keyboard_events.retain(|ev| ev.physical_key != PhysicalKey::Escape);
+            self.drag_payload = None;
+        }
+        // daw_01 r.md #124: **ドラッグ中は他の widget の hover を消す。** 前フレームまでに
+        // どこかの widget が press を掴んでいて (`press_owner`)、ボタンがまだ押されていれば
+        // ポインタはそのドラッグのもの — 通り道の部品が光るのは「そこも押せる」と読める誤情報。
+        // press フレーム自身は所有者が空 (上で取り直す) なので block しない。
+        // 札を運ぶ drag (`drag_payload`) は例外 — 落とし先が光るのはその drag の一部。
+        let hover_blocked =
+            pointer.primary_pressed && self.press_owner.is_some() && self.drag_payload.is_none();
+
         // r.md #71 (プラグインのコピー / 移動): 運搬中の payload の修飾キーを
         // 「**ボタンが押されていた最後のフレーム**」に保つ。 release フレームは
         // primary_pressed == false なので更新されず、直前の値が残る = drop 側は
@@ -892,6 +915,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_secondary_click: &mut pending_secondary_click,
             drag_payload: &mut self.drag_payload,
             press_owner: &mut self.press_owner,
+            drag_cancel,
+            hover_blocked,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -1147,6 +1172,12 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) drag_payload: &'a mut Option<crate::drag_drop::DragPayload>,
     /// daw_01 r.md #122: primary press の所有者 ([`crate::click`])。
     pub(crate) press_owner: &'a mut Option<WidgetId>,
+    /// daw_01 r.md #127: このフレームに「ボタンを押したまま Esc」 が来た
+    /// ([`Ui::drag_cancel_requested`])。
+    pub(crate) drag_cancel: bool,
+    /// daw_01 r.md #124: ドラッグ中 (別 widget が press を掴んだまま) は hover を出さない
+    /// ([`Ui::hover_pos`] / [`Ui::hovers`])。
+    pub(crate) hover_blocked: bool,
     _m: PhantomData<&'a M>,
 }
 
@@ -2803,12 +2834,6 @@ fn run_dialog_sync(_req: &DialogRequest) -> DialogResult {
 pub(crate) fn pressed_inside(rect: Rect, pointer: PointerFrame) -> bool {
     let Some((px, py)) = pointer.pos else { return false };
     pointer.primary_pressed && rect.contains(px, py)
-}
-
-/// hover 中なら true。
-pub(crate) fn hovered(rect: Rect, pointer: PointerFrame) -> bool {
-    let Some((px, py)) = pointer.pos else { return false };
-    rect.contains(px, py)
 }
 
 #[cfg(test)]

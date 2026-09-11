@@ -16,7 +16,7 @@ pub(super) fn hover(
     live: &LiveSessions,
     response: &mut ArrangementResponse,
 ) {
-    if let Some((cx, cy)) = f.pointer.pos
+    if let Some((cx, cy)) = f.hover_pos
         && f.lanes.contains(cx, cy)
     {
         response.hovered_track = track_index_from_y(cy, f.lanes.y, &f.tops)
@@ -88,7 +88,7 @@ pub(super) fn hover(
     // header pane 側でも同じ行なら lane を公開する (Q キーの「ポインタ下のレーン」 が
     // 名前の上でも効く)。 body 側で確定済みなら触らない。
     if response.hovered_automation_lane.is_none()
-        && let Some((cx, cy)) = f.pointer.pos
+        && let Some((cx, cy)) = f.hover_pos
         && f.header_pane.contains(cx, cy)
     {
         response.hovered_automation_lane = automation_lane_key_at_y(
@@ -111,7 +111,7 @@ pub(super) fn hover(
     // **`viewport_key` にも `fold_arrangement_clip_hash` にも入れないこと** —
     // `hovered_clip` と同じ罠 (マウスを動かすたびにアレンジ全体が再構築される)。
     response.hovered_automation_segment = if f.pointer.modifiers.alt {
-        f.pointer.pos.and_then(|(cx, cy)| {
+        f.hover_pos.and_then(|(cx, cy)| {
             if automation_point_at(
                 &f.visible_tracks,
                 &f.tops,
@@ -146,7 +146,7 @@ pub(super) fn hover(
         None
     };
     // M14 Phase 127 (daw_01 #105): Arranger section hover (arranger_rect 内、 clip / lane と y 排他)。
-    if let Some((cx, cy)) = f.pointer.pos
+    if let Some((cx, cy)) = f.hover_pos
         && f.arranger_lane_h > 0.0
         && f.arranger_rect.contains(cx, cy)
     {
@@ -248,7 +248,7 @@ pub(super) fn apply(
         // 新しい `CursorIcon` variant は足さない (daw-ui core に DAW 都合を持ち込まない
         // = アーキテクチャ不変条件 8)。
         ui.set_cursor(CursorIcon::NsResize);
-    } else if let Some((cx, cy)) = f.pointer.pos
+    } else if let Some((cx, cy)) = f.hover_pos
         && (automation_lane_resize_splitter_at(
             &f.visible_tracks,
             &f.tops,
@@ -275,13 +275,13 @@ pub(super) fn apply(
             .is_some())
     {
         ui.set_cursor(CursorIcon::NsResize);
-    } else if let Some((cx, cy)) = f.pointer.pos
+    } else if let Some((cx, cy)) = f.hover_pos
         && header_resize_splitter_at(f.rect, f.header_w, f.style, cx, cy)
     {
         // M14 Phase 117 (daw_01 #091): header / lanes 境界 hover で EwResize (discoverability)。
         // lane/row splitter (NsResize) を上で先に判定済なので角の競合は NsResize 優先。
         ui.set_cursor(CursorIcon::EwResize);
-    } else if let Some((cx, cy)) = f.pointer.pos
+    } else if let Some((cx, cy)) = f.hover_pos
         && let Some((_key, kind, clip_rect, _body_rect)) = automation_clip_zone_at(
             &f.visible_tracks,
             &f.tops,

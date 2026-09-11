@@ -524,8 +524,7 @@ fn lane_header_click(
     if t.automation_lanes_collapsed || t.automation_lanes.is_empty() {
         return;
     }
-    let pointer = f.pointer;
-    let pos = if ui.has_open_popups() { None } else { pointer.pos };
+    let pos = if ui.has_open_popups() { None } else { f.hover_pos };
     let style = f.style;
     let header_indent = f32::from(t.depth) * style.indent_px;
     let mut lane_y = track_row_bottom;

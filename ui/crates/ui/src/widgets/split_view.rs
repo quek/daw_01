@@ -8,7 +8,7 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
-use crate::ui::{Ui, hovered, pressed_inside};
+use crate::ui::{Ui, pressed_inside};
 
 const HANDLE_THICK: f32 = 6.0;
 const HANDLE_HIT_PAD: f32 = 4.0;
@@ -124,7 +124,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // handle 描画 (hover / drag で色変化)
         let handle_hit = expand_rect(handle, HANDLE_HIT_PAD);
         let pressed = pressed_inside(handle_hit, pointer);
-        let hover = hovered(handle_hit, pointer);
+        let hover = self.hovers(handle_hit);
         let p = self.palette();
         let fill = if pressed {
             p.border_focus

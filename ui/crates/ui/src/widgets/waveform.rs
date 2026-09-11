@@ -20,7 +20,7 @@ use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::theme::Palette;
-use crate::ui::{Ui, hovered, pressed_inside};
+use crate::ui::{Ui, pressed_inside};
 
 // ============================================================
 // Public types
@@ -1285,7 +1285,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 3. ヒットテスト。
         let pointer = self.pointer;
         let mut response = WaveformResponse {
-            hovered: segments.iter().any(|s| hovered(s.rect, pointer)),
+            hovered: segments.iter().any(|s| self.hovers(s.rect)),
             clicked_at: None,
             dragging_at: None,
         };

@@ -21,7 +21,7 @@ use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
 use crate::theme::{Palette, WaveformInk};
-use crate::ui::{Ui, hovered};
+use crate::ui::Ui;
 
 /// flatten の最大再帰深度 (NaN / 異常値で無限再帰しないようガード)。
 const MAX_FLATTEN_DEPTH: u32 = 16;
@@ -184,7 +184,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let wid = WidgetId::ROOT.child((b"automation_curve", &id));
         let pointer = self.pointer;
         let mut response = AutomationCurveResponse {
-            hovered: hovered(rect, pointer),
+            hovered: self.hovers(rect),
             dragging: false,
             hovered_point_index: None,
         };

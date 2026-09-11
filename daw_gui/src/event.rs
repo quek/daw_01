@@ -78,7 +78,9 @@ pub enum AppEvent {
     /// 既に loop ON かつ範囲が一致するなら loop を OFF にする (再生は維持)。 選択が
     /// 無ければ no-op。 `automation` は対象面 (通常 clip / automation clip) を root の
     /// `edit_surface` arbiter が解決した結果 (= Del/Cut と同じ last-selection-wins)。
-    LoopSelectedClipToggle { automation: bool },
+    /// `sections` = **選択アレンジパート (section)** の範囲を対象にする (r.md #128:
+    /// ポインタが Arranger の上にあるとき)。 `automation` より優先。
+    LoopSelectedClipToggle { automation: bool, sections: bool },
     /// Transport BPM 入力欄の文字列が変わった (commit ではなく途中入力)。
     /// Undo 対象外。
     BpmEditChanged(String),

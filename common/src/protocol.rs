@@ -457,6 +457,8 @@ pub enum AudioCommand {
         lane_id: u32,
         clip_id: u32,
         pressed: bool,
+        /// 量子化を待たず今すぐ撃つ (r.md #126: ▶ の Alt+click)。
+        immediate: bool,
     },
     /// セルを **セル内の拍 `phase_beats` から** 鳴らす (ピアノロールの `f` =
     /// Live のクリップビューでの頭出し)。
@@ -482,13 +484,15 @@ pub enum AudioCommand {
     RephaseLauncherRows { phase_beats: f64 },
     /// r.md #87: 列 ([`Scene::id`](crate::model::Scene)) をまとめて撃つ / 離す。
     /// その列にセルを持たない行は **停止**する (Q11、空セル = 停止)。
-    LaunchScene { scene_id: u32, pressed: bool },
+    /// `immediate` = 量子化を待たず今すぐ (r.md #126)。
+    LaunchScene { scene_id: u32, pressed: bool, immediate: bool },
     /// r.md #87: 1 行を止める (Stop Clips)。アレンジへは戻さない —
     /// ランチャーが主導権を握ったまま無音になる
     /// ([`RowPlayback::LauncherStopped`](crate::model::RowPlayback))。
-    StopRow { track_id: u32, lane_id: u32 },
-    /// r.md #87: 全行を止める (グローバル Stop Clips)。
-    StopAllRows,
+    /// `immediate` = 量子化を待たず今すぐ止める (r.md #126: 停止ボタンの Alt+click)。
+    StopRow { track_id: u32, lane_id: u32, immediate: bool },
+    /// r.md #87: 全行を止める (グローバル Stop Clips)。 `immediate` は [`Self::StopRow`] と同じ。
+    StopAllRows { immediate: bool },
     /// r.md #87: 1 行の主導権をアレンジへ返す
     /// ([`RowPlayback::Arranger`](crate::model::RowPlayback))。
     SwitchRowToArranger { track_id: u32, lane_id: u32 },

@@ -176,20 +176,20 @@ impl AppData {
                 if let Some(cell) =
                     self.cell_in_row_at_scene(LauncherRow::Track(track_id), scene_id)
                 {
-                    self.launch_cell(cell, pressed);
+                    self.launch_cell(cell, pressed, false);
                 } else if pressed && self.song_doc.song().scene_index(scene_id).is_some() {
                     // **列が実在して、そこが空セル**のときだけ停止 (Q11)。
                     // 列ごと消えている割り当ては何もしない — 「消した列のパッドを
                     // 押したら関係ない行が止まる」のは事故でしかない。
-                    self.stop_launcher_row(LauncherRow::Track(track_id));
+                    self.stop_launcher_row(LauncherRow::Track(track_id), false);
                 }
             }
-            T::LaunchScene { scene_id } => self.launch_scene(scene_id, pressed),
+            T::LaunchScene { scene_id } => self.launch_scene(scene_id, pressed, false),
             // 停止 / アレンジへ戻す は押下だけで完結する (離しても何もしない)。
             T::StopLauncherRow { track_id } if pressed => {
-                self.stop_launcher_row(LauncherRow::Track(track_id));
+                self.stop_launcher_row(LauncherRow::Track(track_id), false);
             }
-            T::StopAllLauncherRows if pressed => self.stop_all_launcher_rows(),
+            T::StopAllLauncherRows if pressed => self.stop_all_launcher_rows(false),
             T::SwitchRowToArranger { track_id } if pressed => {
                 self.row_to_arranger(LauncherRow::Track(track_id));
             }
@@ -212,9 +212,9 @@ impl AppData {
     pub(crate) fn send_launcher_audio(&self, cmd: LauncherAudioCommand) {
         use common::protocol::AudioCommand as A;
         let a = match cmd {
-            LauncherAudioCommand::LaunchCell { row, clip_id, pressed } => {
+            LauncherAudioCommand::LaunchCell { row, clip_id, pressed, immediate } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
-                A::LaunchCell { track_id, lane_id, clip_id, pressed }
+                A::LaunchCell { track_id, lane_id, clip_id, pressed, immediate }
             }
             LauncherAudioCommand::LaunchCellFrom { row, clip_id, phase_beats } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
@@ -223,14 +223,14 @@ impl AppData {
             LauncherAudioCommand::RephaseRows { phase_beats } => {
                 A::RephaseLauncherRows { phase_beats }
             }
-            LauncherAudioCommand::LaunchScene { scene_id, pressed } => {
-                A::LaunchScene { scene_id, pressed }
+            LauncherAudioCommand::LaunchScene { scene_id, pressed, immediate } => {
+                A::LaunchScene { scene_id, pressed, immediate }
             }
-            LauncherAudioCommand::StopRow { row } => {
+            LauncherAudioCommand::StopRow { row, immediate } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
-                A::StopRow { track_id, lane_id }
+                A::StopRow { track_id, lane_id, immediate }
             }
-            LauncherAudioCommand::StopAllRows => A::StopAllRows,
+            LauncherAudioCommand::StopAllRows { immediate } => A::StopAllRows { immediate },
             LauncherAudioCommand::SwitchRowToArranger { row } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
                 A::SwitchRowToArranger { track_id, lane_id }
@@ -249,11 +249,13 @@ impl AppData {
         use LauncherEvent as E;
         match ev {
             // ---- 発火 ----
-            E::LaunchCell { cell, pressed } => self.launch_cell(cell, pressed),
+            E::LaunchCell { cell, pressed, immediate } => self.launch_cell(cell, pressed, immediate),
             E::PlayFromCellBeat { cell, phase_beats } => self.play_from_cell_beat(cell, phase_beats),
-            E::LaunchScene { scene_id, pressed } => self.launch_scene(scene_id, pressed),
-            E::StopRow { row } => self.stop_launcher_row(row),
-            E::StopAllRows => self.stop_all_launcher_rows(),
+            E::LaunchScene { scene_id, pressed, immediate } => {
+                self.launch_scene(scene_id, pressed, immediate)
+            }
+            E::StopRow { row, immediate } => self.stop_launcher_row(row, immediate),
+            E::StopAllRows { immediate } => self.stop_all_launcher_rows(immediate),
             E::RowToArranger { row } => self.row_to_arranger(row),
             E::AllToArranger => self.all_rows_to_arranger(),
             E::SetGlobalQuantize(q) => self.set_global_launch_quantize(q),
@@ -376,7 +378,9 @@ impl AppData {
     ///   (`Repeat` の「押している間の撃ち直し」 は engine の仕事)
     /// - `Gate` — 離すと停止
     /// - `Toggle` — 鳴っているセルをもう一度押すと停止
-    pub fn launch_cell(&mut self, cell: LauncherCellKey, pressed: bool) {
+    ///
+    /// `immediate` = 量子化を待たず今すぐ (r.md #126)。
+    pub fn launch_cell(&mut self, cell: LauncherCellKey, pressed: bool, immediate: bool) {
         use common::model::LaunchMode;
         let row = cell.row();
         let clip_id = cell.clip_id();
@@ -411,7 +415,12 @@ impl AppData {
         if pressed {
             self.ensure_transport_rolling();
         }
-        self.send_launcher_audio(LauncherAudioCommand::LaunchCell { row, clip_id, pressed });
+        self.send_launcher_audio(LauncherAudioCommand::LaunchCell {
+            row,
+            clip_id,
+            pressed,
+            immediate,
+        });
     }
 
     /// ピアノロールの `f`: **全体を `phase_beats` (セルの `start_beat` からの拍) から再生**
@@ -495,7 +504,7 @@ impl AppData {
     /// **全行がランチャーへ移る** (Bitwig: シーンを撃つと全トラックが Launcher
     /// 制御になる)。列にセルが無い行が「アレンジのまま鳴り続ける」ことは無い —
     /// 撃った直後にアレンジの音とセルの音が混ざるのを避けるため。
-    pub fn launch_scene(&mut self, scene_id: u32, pressed: bool) {
+    pub fn launch_scene(&mut self, scene_id: u32, pressed: bool, immediate: bool) {
         if pressed {
             let mut plan: Vec<(LauncherRow, RowPlayback)> = Vec::new();
             // シーンを撃つと **全行がランチャーへ移る** (Bitwig: triggering a scene
@@ -524,7 +533,7 @@ impl AppData {
         if pressed && scene_id != 0 {
             self.ensure_transport_rolling();
         }
-        self.send_launcher_audio(LauncherAudioCommand::LaunchScene { scene_id, pressed });
+        self.send_launcher_audio(LauncherAudioCommand::LaunchScene { scene_id, pressed, immediate });
     }
 
     /// 列の **離し**。engine の `release_scene` → `release_cell` と同じ解釈を
@@ -574,9 +583,10 @@ impl AppData {
     }
 
     /// 行の Stop Clips: ランチャーが握ったまま無音にする (アレンジへは戻さない)。
-    pub fn stop_launcher_row(&mut self, row: LauncherRow) {
+    /// `immediate` = 量子化を待たず今すぐ (r.md #126)。
+    pub fn stop_launcher_row(&mut self, row: LauncherRow, immediate: bool) {
         self.set_row_playback(row, RowPlayback::LauncherStopped);
-        self.send_launcher_audio(LauncherAudioCommand::StopRow { row });
+        self.send_launcher_audio(LauncherAudioCommand::StopRow { row, immediate });
     }
 
     /// 全行の Stop Clips。
@@ -584,12 +594,12 @@ impl AppData {
     /// 列の連鎖の起点も降ろす — 残すと、engine の `seed_from_song` が停止 → 再生 /
     /// 書き出しのたびにその列のフォローアクションを arm し直し、**全部止めたはずの
     /// 行が勝手に鳴り出す** (§1.4 / Q9 の「聴こえている通りに書き出す」が破れる)。
-    pub fn stop_all_launcher_rows(&mut self) {
+    pub fn stop_all_launcher_rows(&mut self, immediate: bool) {
         for row in self.all_launcher_rows() {
             self.set_row_playback(row, RowPlayback::LauncherStopped);
         }
         self.set_last_launched_scene(0);
-        self.send_launcher_audio(LauncherAudioCommand::StopAllRows);
+        self.send_launcher_audio(LauncherAudioCommand::StopAllRows { immediate });
     }
 
     /// 行をアレンジ主導へ戻す (Switch Playback to Arranger)。
@@ -928,8 +938,8 @@ impl AppData {
             return;
         };
         match self.cell_in_row_at_scene(focus.row, scene_id) {
-            Some(cell) => self.launch_cell(cell, true),
-            None => self.stop_launcher_row(focus.row),
+            Some(cell) => self.launch_cell(cell, true, false),
+            None => self.stop_launcher_row(focus.row, false),
         }
     }
 

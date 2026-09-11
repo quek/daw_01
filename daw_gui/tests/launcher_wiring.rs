@@ -101,7 +101,7 @@ fn セルを撃つと行の主導権がランチャーへ移り全行戻すで�
     seed(&mut app, 2, 2);
     let cell = put_cell(&mut app, 1, 0);
 
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
 
     assert_eq!(
         launcher_of(&app, 1),
@@ -137,6 +137,7 @@ fn シーン発火は全行をランチャーへ移し空セルの行は停止�
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene0,
         pressed: true,
+        immediate: false,
     }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: t1_s0.clip_id() });
     assert_eq!(launcher_of(&app, 2), RowPlayback::Launcher { clip_id: t2_s0.clip_id() });
@@ -151,6 +152,7 @@ fn シーン発火は全行をランチャーへ移し空セルの行は停止�
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene1,
         pressed: true,
+        immediate: false,
     }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: t1_s1.clip_id() });
     assert_eq!(
@@ -340,9 +342,9 @@ fn gate_は離すと止まり_toggle_は再押下で止まる() {
         edit: LaunchEdit::Mode(LaunchMode::Gate),
     }));
 
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: gate, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: gate, pressed: true, immediate: false }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: gate.clip_id() });
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: gate, pressed: false }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: gate, pressed: false, immediate: false }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::LauncherStopped, "Gate は離すと止まる");
 
     let toggle = put_cell(&mut app, 1, 1);
@@ -350,15 +352,15 @@ fn gate_は離すと止まり_toggle_は再押下で止まる() {
         cells: vec![toggle],
         edit: LaunchEdit::Mode(LaunchMode::Toggle),
     }));
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true, immediate: false }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: toggle.clip_id() });
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: false }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: false, immediate: false }));
     assert_eq!(
         launcher_of(&app, 1),
         RowPlayback::Launcher { clip_id: toggle.clip_id() },
         "Toggle は離しても鳴り続ける"
     );
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true, immediate: false }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::LauncherStopped, "Toggle は再押下で止まる");
 }
 
@@ -379,12 +381,12 @@ fn 停止中の_toggle_は止めずに撃ち直す() {
         cells: vec![toggle],
         edit: LaunchEdit::Mode(LaunchMode::Toggle),
     }));
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true, immediate: false }));
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: toggle.clip_id() });
 
     // Space で停止 (engine の観測値を `Tick` 経由で受けたのと同じ状態)。
     app.transport.is_playing = false;
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true, immediate: false }));
     assert_eq!(
         launcher_of(&app, 1),
         RowPlayback::Launcher { clip_id: toggle.clip_id() },
@@ -400,7 +402,7 @@ fn capture_は鳴っているセルを新しい列に取り込む() {
     seed(&mut app, 2, 1);
     let t1 = put_cell(&mut app, 1, 0);
     let t2 = put_cell(&mut app, 2, 0);
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: t1, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: t1, pressed: true, immediate: false }));
     // トラック 2 は撃たない (= 取り込まれない)。
     let _ = t2;
 
@@ -471,7 +473,7 @@ fn 列を消すと鳴っていた行は停止に落ちる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
 
     let scene_id = app.song_doc.song().scenes[0].id;
     app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteScenes(vec![scene_id])));
@@ -636,7 +638,7 @@ fn セル発火は未保存マークも_undo_も付けない() {
     let depth = app.song_doc.undo_depth();
     let sync = app.song_doc.sync_epoch();
 
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
     assert!(!app.song_doc.is_dirty(), "再生状態は `*` を立てない");
     assert_eq!(app.song_doc.undo_depth(), depth, "再生状態は undo に積まない");
     assert_ne!(app.song_doc.sync_epoch(), sync, "子プロセスには届ける");
@@ -647,11 +649,11 @@ fn セル発火は未保存マークも_undo_も付けない() {
 
     // 同じセルをもう一度撃っても状態は変わらないので sync も進めない。
     let sync = app.song_doc.sync_epoch();
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
     assert_eq!(app.song_doc.sync_epoch(), sync, "同じ状態への再発火で sync を進めない");
 
     // 行の停止も同じ扱い。
-    app.handle_event(AppEvent::Launcher(LauncherEvent::StopRow { row: LauncherRow::Track(1) }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::StopRow { row: LauncherRow::Track(1), immediate: false }));
     assert!(!app.song_doc.is_dirty(), "停止ボタンでも `*` を立てない");
     assert_eq!(app.song_doc.undo_depth(), depth);
 }
@@ -665,7 +667,7 @@ fn undo_は再生状態を巻き戻さない() {
     let cell = put_cell(&mut app, 1, 0);
     // 撃つ前に 1 つ文書編集 (undo 対象) を積む。
     app.handle_event(AppEvent::Launcher(LauncherEvent::AddScene));
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
     let before = app.song_doc.song().tracks[0].launcher;
     assert!(matches!(before, common::model::RowPlayback::Launcher { .. }));
 
@@ -681,7 +683,7 @@ fn 空セルの上で_enter_を押すと行が止まる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 2);
     let cell = put_cell(&mut app, 1, 0);
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::FocusCell {
         row: LauncherRow::Track(1),
@@ -813,7 +815,7 @@ fn 停止中にセルを撃つと再生が始まる() {
     let cell = put_cell(&mut app, 1, 0);
     while audio_rx.try_recv().is_ok() {}
 
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
 
     let mut sent = Vec::new();
     while let Ok(c) = audio_rx.try_recv() {
@@ -886,7 +888,7 @@ fn 再生中に撃っても_play_を重ねない() {
     app.transport.is_playing = true;
     while audio_rx.try_recv().is_ok() {}
 
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
 
     let mut sent = Vec::new();
     while let Ok(c) = audio_rx.try_recv() {
@@ -1018,6 +1020,7 @@ fn 実体の無い列を撃っても再生は始まらない() {
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: 0,
         pressed: true,
+        immediate: false,
     }));
 
     let mut sent = Vec::new();
@@ -1384,15 +1387,17 @@ fn 撃った列だけが連鎖の起点として残る() {
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene,
         pressed: true,
+        immediate: false,
     }));
     assert_eq!(app.song_doc.song().last_launched_scene_id, scene, "撃った列が起点になる");
 
-    app.handle_event(AppEvent::Launcher(LauncherEvent::StopAllRows));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::StopAllRows { immediate: false }));
     assert_eq!(app.song_doc.song().last_launched_scene_id, 0, "全停止で起点は降りる");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene,
         pressed: true,
+        immediate: false,
     }));
     app.handle_event(AppEvent::Launcher(LauncherEvent::AllToArranger));
     assert_eq!(
@@ -1515,7 +1520,7 @@ fn 停止点からの再開はセルを頭出ししない() {
     let (mut app, mut audio_rx, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
-    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true }));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
     // engine が走り出して 9 拍目で止まったのを観測する。
     app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: true, recording_live: false });
     app.transport.playhead_beat = Some(9.0);

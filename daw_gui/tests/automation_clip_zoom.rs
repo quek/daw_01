@@ -554,7 +554,7 @@ fn r_loop_は選択された_automation_clip_を対象にする() {
         clip: 1,
     }];
 
-    app.handle_event(AppEvent::LoopSelectedClipToggle { automation: true });
+    app.handle_event(AppEvent::LoopSelectedClipToggle { automation: true, sections: false });
 
     assert_eq!(app.transport.loop_region.start_beat, 8.0);
     assert_eq!(app.transport.loop_region.end_beat, 12.0);

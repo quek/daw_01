@@ -43,7 +43,7 @@ const SCENE_SEED_SALT: u64 = 0x5CE7_E5EE_D0F0_1234;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LaunchRequest {
     /// セルの押下 / 離し。モードの解釈は engine 側 ([`LaunchMode`])。
-    Cell { key: RowKey, clip_id: u32, pressed: bool },
+    Cell { key: RowKey, clip_id: u32, pressed: bool, immediate: bool },
     /// セルを **セル内の拍 `phase_beats` から** 鳴らす (ピアノロールの `f`)。
     /// [`LaunchMode`] を見ない — Toggle の停止 / Gate の握りは起きない。
     CellFrom { key: RowKey, clip_id: u32, phase_beats: f64 },
@@ -51,10 +51,11 @@ pub enum LaunchRequest {
     /// 停止中 / アレンジ主導の行は触らない。
     RephaseRunning { phase_beats: f64 },
     /// 列をまとめて撃つ。その列にセルを持たない行は停止する (Q11)。
-    Scene { scene_id: u32, pressed: bool },
-    /// 1 行を止める (アレンジへは戻さない)。
-    StopRow { key: RowKey },
-    StopAll,
+    Scene { scene_id: u32, pressed: bool, immediate: bool },
+    /// 1 行を止める (アレンジへは戻さない)。 `immediate` = グローバル量子化を待たず
+    /// **この buffer で**止める (r.md #126: 停止ボタンの Alt+click)。
+    StopRow { key: RowKey, immediate: bool },
+    StopAll { immediate: bool },
     /// 1 行の主導権をアレンジへ返す。
     RowToArranger { key: RowKey },
     AllToArranger,
@@ -145,6 +146,9 @@ enum FireAt {
     /// フォローアクションの連鎖 — グローバル量子化を**迂回**し、`fire` 以降で
     /// セル自身の量子化にだけ従う。
     Chain { fire: f64 },
+    /// r.md #126: ユーザーが Alt+click で押した — **グローバルもセルの量子化も待たず**
+    /// この buffer の先頭で起きる (停止中は `User` と同じく即時)。
+    Immediate { start_beat: f64, playing: bool },
 }
 
 impl FireAt {
@@ -152,7 +156,10 @@ impl FireAt {
     fn beat(self, cell_q: LaunchQuantize, time_sig: (u8, u8)) -> f64 {
         match self {
             // 停止中は量子化しない (拍が進まないので待っても永久に来ない)。
-            Self::User { playing: false, .. } => f64::NEG_INFINITY,
+            Self::User { playing: false, .. } | Self::Immediate { playing: false, .. } => {
+                f64::NEG_INFINITY
+            }
+            Self::Immediate { start_beat, playing: true } => start_beat,
             Self::User { start_beat, global_q, playing: true } => {
                 match quantize::resolve(cell_q, global_q, time_sig) {
                     Some(q) => quantize::next_boundary(start_beat, q),
@@ -174,7 +181,7 @@ impl FireAt {
     fn chain_beat(self) -> Option<f64> {
         match self {
             Self::Chain { fire } => Some(fire),
-            Self::User { .. } => None,
+            Self::User { .. } | Self::Immediate { .. } => None,
         }
     }
 
@@ -186,7 +193,7 @@ impl FireAt {
     /// 拍が進んでいる間しか起きないので常に `true`。
     fn is_playing(self) -> bool {
         match self {
-            Self::User { playing, .. } => playing,
+            Self::User { playing, .. } | Self::Immediate { playing, .. } => playing,
             Self::Chain { .. } => true,
         }
     }
@@ -653,9 +660,16 @@ impl LauncherRuntime {
     ) {
         let at = FireAt::User { start_beat: span.start_beat, global_q, playing };
         let global_at = at.beat(LaunchQuantize::Global, song.time_sig);
+        // 量子化抜き (= この buffer の先頭、停止中なら即時)。
+        let now_at = at.beat(LaunchQuantize::Off, song.time_sig);
         match req {
-            LaunchRequest::Cell { key, clip_id, pressed } => {
-                self.press_cell(song, at, key, clip_id, pressed);
+            LaunchRequest::Cell { key, clip_id, pressed, immediate } => {
+                let fire = if immediate {
+                    FireAt::Immediate { start_beat: span.start_beat, playing }
+                } else {
+                    at
+                };
+                self.press_cell(song, fire, key, clip_id, pressed);
             }
             LaunchRequest::CellFrom { key, clip_id, phase_beats } => {
                 self.launch_cell_from(song, at, key, clip_id, phase_beats);
@@ -663,18 +677,27 @@ impl LauncherRuntime {
             LaunchRequest::RephaseRunning { phase_beats } => {
                 self.rephase_running(song, at, phase_beats);
             }
-            LaunchRequest::Scene { scene_id, pressed } => {
+            LaunchRequest::Scene { scene_id, pressed, immediate } => {
+                let fire = if immediate {
+                    FireAt::Immediate { start_beat: span.start_beat, playing }
+                } else {
+                    at
+                };
                 if pressed {
-                    self.launch_scene(song, at, scene_id, span.start_beat);
+                    self.launch_scene(song, fire, scene_id, span.start_beat);
                 } else {
                     self.release_scene(song, at, scene_id);
                 }
             }
             // **1 行だけの操作は列の連鎖を解除しない** ([`Self::disarm_scene`])。
-            LaunchRequest::StopRow { key } => {
-                self.queue(key, QueueTarget::Stop, global_at, false, false);
+            LaunchRequest::StopRow { key, immediate } => {
+                let at = if immediate { now_at } else { global_at };
+                self.queue(key, QueueTarget::Stop, at, false, false);
             }
-            LaunchRequest::StopAll => self.queue_all(QueueTarget::Stop, global_at),
+            LaunchRequest::StopAll { immediate } => {
+                let at = if immediate { now_at } else { global_at };
+                self.queue_all(QueueTarget::Stop, at);
+            }
             LaunchRequest::RowToArranger { key } => {
                 self.queue(key, QueueTarget::Arranger, global_at, false, false);
             }
@@ -1407,7 +1430,7 @@ mod tests {
     }
 
     fn press(rt: &mut LauncherRuntime, track_id: u32, clip_id: u32, pressed: bool) {
-        rt.push_request(LaunchRequest::Cell { key: RowKey::track(track_id), clip_id, pressed });
+        rt.push_request(LaunchRequest::Cell { key: RowKey::track(track_id), clip_id, pressed, immediate: false });
     }
 
     fn press_from(rt: &mut LauncherRuntime, track_id: u32, clip_id: u32, phase: f64) {
@@ -1474,7 +1497,7 @@ mod tests {
         press(&mut rt, 2, 20, true);
         step(&mut rt, &song, 0.0);
         // track 2 は止めておく (Silent)。
-        rt.push_request(LaunchRequest::StopRow { key: RowKey::track(2) });
+        rt.push_request(LaunchRequest::StopRow { key: RowKey::track(2), immediate: false });
         step(&mut rt, &song, 1.0);
         assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent);
 
@@ -1485,7 +1508,7 @@ mod tests {
         assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent, "止めた行を鳴らした");
 
         // 予約が生きている行: 行き先 (11) はそのまま、位相だけ載る。
-        rt.push_request(LaunchRequest::Cell { key: RowKey::track(1), clip_id: 11, pressed: true });
+        rt.push_request(LaunchRequest::Cell { key: RowKey::track(1), clip_id: 11, pressed: true, immediate: false });
         rt.push_request(LaunchRequest::RephaseRunning { phase_beats: 1.0 });
         step(&mut rt, &song, 4.0);
         let t1 = rt.rows().track_row(0).tail;
@@ -1648,7 +1671,7 @@ mod tests {
         rt.update(&song, span_at(0.0), LaunchQuantize::Bars(1), true);
 
         // 拍 1.0: 押下と、その反響 (`Song` 側が既に列 2 を撃った状態) が同時に届く。
-        rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true, immediate: false });
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 11 };
         song.tracks[1].launcher = RowPlayback::LauncherStopped;
         song.last_launched_scene_id = 2;
@@ -1739,7 +1762,7 @@ mod tests {
         let mut song = two_rows();
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
         assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(20));
@@ -1766,7 +1789,7 @@ mod tests {
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
 
-        rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true, immediate: false });
         step(&mut rt, &song, 0.1);
 
         // 列 2 にセルを持つ track 1 は鳴る。
@@ -2091,7 +2114,7 @@ mod tests {
         };
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
 
@@ -2133,7 +2156,7 @@ mod tests {
 
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
 
@@ -2159,10 +2182,10 @@ mod tests {
             chance_a: 100,
             ..FollowAction::default()
         };
-        for req in [LaunchRequest::StopAll, LaunchRequest::AllToArranger] {
+        for req in [LaunchRequest::StopAll { immediate: false }, LaunchRequest::AllToArranger] {
             let mut rt = LauncherRuntime::new();
             step(&mut rt, &song, 0.0);
-            rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+            rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
             step(&mut rt, &song, 0.0);
             assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
 
@@ -2193,10 +2216,10 @@ mod tests {
         };
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
 
-        rt.push_request(LaunchRequest::StopRow { key: RowKey::track(2) });
+        rt.push_request(LaunchRequest::StopRow { key: RowKey::track(2), immediate: false });
         step(&mut rt, &song, 1.0);
         step(&mut rt, &song, 3.99);
         assert_eq!(
@@ -2226,7 +2249,7 @@ mod tests {
         // (a) 未発火 (`0`) なら、前の再生で armed だった連鎖は持ち越さない。
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0); // scene.at = 4.0
         rt.arm_reseed();
         step(&mut rt, &song, 0.0);
@@ -2350,7 +2373,7 @@ mod tests {
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
         // 列を撃っても、保存された主導権があってもアレンジのまま。
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.5);
         for i in 0..2 {
             assert_eq!(
@@ -2370,13 +2393,13 @@ mod tests {
         let mut rt = LauncherRuntime::new();
         step(&mut rt, &song, 0.0);
 
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
         // Gate でない track 2 は離しても鳴り続ける。
         assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(20));
 
-        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: false });
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: false, immediate: false });
         step(&mut rt, &song, 1.0);
         assert_eq!(rt.rows().track_row(0).tail, RowPhase::Silent, "Gate が離しで止まらない");
         assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(20));

@@ -89,7 +89,7 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
             w: (l.col_w - 2.0).max(2.0),
             h: (l.scene_head.h - 2.0).max(2.0),
         };
-        let btn = layout::launch_button_rect(Rect {
+        let btn = layout::head_launch_button_rect(Rect {
             x: head_cell.x + 3.0,
             w: (head_cell.w - 3.0).max(2.0),
             ..head_cell
@@ -141,13 +141,13 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
     // で pass 1 を抜ける) ので運ぶ中身は無いが、**本体ぜんぶをボタンにすると子が鳴る列を
     // 掴もうとしただけで再生が始まる** (空セル / シーン見出しで潰したのと同じ症状)。
     if key.is_empty() {
-        return Some(if layout::launch_button_rect(rect).contains(x, y) {
+        return Some(if layout::launch_button_rect(rect, f.style).contains(x, y) {
             Zone::CellLaunch(key)
         } else {
             Zone::CellBody(key)
         });
     }
-    if layout::launch_button_rect(rect).contains(x, y) {
+    if layout::launch_button_rect(rect, f.style).contains(x, y) {
         Some(Zone::CellLaunch(key))
     } else {
         Some(Zone::CellBody(key))
@@ -236,6 +236,7 @@ pub(crate) fn dispatch(
         Zone::PaneSplitter => {
             s.pane_width_drag = Some(PaneWidthDragSession {
                 anchor_pane_w: pane_w,
+                anchor_layout: f.launcher_view.layout,
                 anchor_mouse_x: px,
                 last_emitted_w: pane_w,
             });
@@ -250,7 +251,8 @@ pub(crate) fn dispatch(
             claim.splitter = true;
         }
         Zone::GlobalStop => {
-            s.pending_intents.push(LauncherIntent::StopAllRows);
+            // r.md #126: Alt+click = 量子化を待たず即時停止 (行の停止 / 空セルの ■ も同じ)。
+            s.pending_intents.push(LauncherIntent::StopAllRows { immediate: alt });
             claim.session = true;
         }
         Zone::GlobalReturn => {
@@ -258,7 +260,7 @@ pub(crate) fn dispatch(
             claim.session = true;
         }
         Zone::RowStop(row) => {
-            s.pending_intents.push(LauncherIntent::StopRow(row));
+            s.pending_intents.push(LauncherIntent::StopRow { row, immediate: alt });
             claim.session = true;
         }
         Zone::RowReturn(row) => {
@@ -266,7 +268,7 @@ pub(crate) fn dispatch(
             claim.session = true;
         }
         Zone::SceneLaunch(scene_id) => {
-            s.pending_intents.push(LauncherIntent::LaunchScene { scene_id, pressed: true });
+            s.pending_intents.push(LauncherIntent::LaunchScene { scene_id, pressed: true, immediate: alt });
             s.held_button = Some(LauncherButton::Scene(scene_id));
             claim.session = true;
         }
@@ -293,8 +295,17 @@ pub(crate) fn dispatch(
                     range: false,
                 });
             }
-            for c in launch_cells {
-                s.pending_intents.push(LauncherIntent::Launch { cell: c, pressed: true });
+            // r.md #126: 空セルの ■ は「その行を止める」ボタン (`launcher_bridge` が
+            // `Launch` を `StopRow` に倒す)。 Alt+click はそれを量子化抜きで今すぐ止める —
+            // 即時性は `Launch` では運べないので、ここで直接 `StopRow` にする。 まとめセル
+            // (グループ行) は子を撃つ操作なので対象外。
+            let group = f.launcher_view.rows.get(&cell.row).is_some_and(|r| r.group);
+            if alt && cell.is_empty() && !group {
+                s.pending_intents.push(LauncherIntent::StopRow { row: cell.row, immediate: true });
+            } else {
+                for c in launch_cells {
+                    s.pending_intents.push(LauncherIntent::Launch { cell: c, pressed: true, immediate: alt });
+                }
             }
             s.held_button = Some(LauncherButton::Cell(cell));
             claim.session = true;
