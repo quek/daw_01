@@ -9,8 +9,9 @@ pub enum PlayFrom {
     /// ホーム ([`TransportState::home_beat`]) へ頭出しして `Play`。 Space / Rec。
     Home,
     /// いま見えているプレイヘッド ([`TransportState::playhead_beat`]) から `Play`
-    /// (= ランチャーのセルは撃ち直し)。 停止中にセルを撃ったとき / プラグイン読み込みで
-    /// 一瞬止めた再生の再開。
+    /// (= ランチャーのセルは撃ち直し)。 プラグイン読み込みで一瞬止めた再生の再開。
+    /// 停止中にセルを撃ったときは `Home` (Space と同じ頭出し — セルの周回の原点を
+    /// 小節線に乗せる)。
     Playhead,
     /// いま見えているプレイヘッドから `PlayContinue` (= 鳴っていたセルも頭出しせず続き)。
     /// Shift+Space (r.md #118)。
