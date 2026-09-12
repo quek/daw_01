@@ -1366,23 +1366,6 @@ impl AppData {
         if lanes_w < 16.0 || lanes_h < 16.0 {
             return;
         }
-        // 収める行は widget が前フレームに実際に積んだ行そのもの (master 行 + 可視 track 行 +
-        // 展開中の可視 automation lane 行)。 可視集合をモデルから再導出すると、 widget 側の
-        // lane 除外条件が 1 つ増えただけで silent に fit がズレる。
-        let fit_lane_keys: Vec<common::model::AutomationLaneKey> = self
-            .ui_ephemeral
-            .last_arrange_rows
-            .iter()
-            .filter_map(|r| match r.key {
-                crate::widgets::arrangement::ArrangementRowKey::Lane(k) => Some(k),
-                crate::widgets::arrangement::ArrangementRowKey::Track(_) => None,
-            })
-            .collect();
-        let row_count = self.ui_ephemeral.last_arrange_rows.len();
-        if row_count == 0 {
-            return;
-        }
-
         let (min_beat, max_beat) = self
             .song_doc.song()
             .tracks
@@ -1400,6 +1383,52 @@ impl AppData {
         let span_beats = (max_beat - min_beat + 4.0).max(4.0);
         self.ui_prefs.arrange_scroll_beat = (min_beat - 2.0).max(0.0) as f32;
         self.ui_prefs.arrange_zoom_x = (f64::from(lanes_w) / span_beats).clamp(2.0, 400.0) as f32;
+        self.fit_arrange_rows();
+    }
+
+    /// `X` キー (ランチャー帯 = セッションビューの上): 全シーンが格子幅に収まる列幅にして
+    /// 横スクロールを 0 へ戻す。 行はアレンジと共有なので [`Self::fit_arrange_rows`] で
+    /// lanes 高に収める (アレンジの横軸 zoom_x / scroll_beat は触らない)。
+    /// シーンが 0 本なら 1 列ぶんの幅にする (プレースホルダ列が 1 つ見える)。
+    pub(crate) fn fit_launcher_to_scenes(&mut self) {
+        use crate::widgets::arrangement::{LAUNCHER_MAX_COL_W, LAUNCHER_MIN_COL_W};
+        let grid_w = self.ui_ephemeral.launcher_grid_rect.w;
+        if grid_w < LAUNCHER_MIN_COL_W {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let n = self.song_doc.song().scenes.len().max(1) as f32;
+        self.ui_prefs.launcher_scene_col_w =
+            (grid_w / n).clamp(LAUNCHER_MIN_COL_W, LAUNCHER_MAX_COL_W);
+        self.ui_prefs.launcher_scroll_scene = 0.0;
+        self.fit_arrange_rows();
+    }
+
+    /// 縦の全体表示: widget が前フレームに積んだ全行 (master 行 + 可視 track 行 + 展開中の
+    /// 可視 automation lane 行) を等高で lanes 高に敷き詰め、 縦スクロールを 0 へ戻す。
+    /// アレンジの `X` (`fit_arrange_to_content`) とランチャー帯の `X`
+    /// (`fit_launcher_to_scenes`) が共有する (行は両者で共有なので縦の定義も 1 つ)。
+    fn fit_arrange_rows(&mut self) {
+        let lanes_h = self.ui_ephemeral.last_arrange_lanes_size.1;
+        if lanes_h < 16.0 {
+            return;
+        }
+        // 収める行は widget が前フレームに実際に積んだ行そのもの (master 行 + 可視 track 行 +
+        // 展開中の可視 automation lane 行)。 可視集合をモデルから再導出すると、 widget 側の
+        // lane 除外条件が 1 つ増えただけで silent に fit がズレる。
+        let fit_lane_keys: Vec<common::model::AutomationLaneKey> = self
+            .ui_ephemeral
+            .last_arrange_rows
+            .iter()
+            .filter_map(|r| match r.key {
+                crate::widgets::arrangement::ArrangementRowKey::Lane(k) => Some(k),
+                crate::widgets::arrangement::ArrangementRowKey::Track(_) => None,
+            })
+            .collect();
+        let row_count = self.ui_ephemeral.last_arrange_rows.len();
+        if row_count == 0 {
+            return;
+        }
         // 全行を等高で lanes_h に敷き詰める。 automation lane の行高は u16 (整数 px) しか
         // 持てないので、 まず理想高を整数へ丸めて lane に配り、 **端数を f32 の track 行高が
         // 吸収する**。 これで `n_track * row_h + n_lane * lane_px == lanes_h` が厳密に成立し、

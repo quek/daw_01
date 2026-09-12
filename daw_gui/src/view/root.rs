@@ -913,9 +913,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     if ui.take_shortcut("daw.fit_view") {
+        // ポインタがランチャー帯 (セッションビュー) の上なら帯の全体表示 (全シーンを列幅に
+        // 収め、 行も lanes 高に収める)。 `R` の Arranger 判定と同じ「ポインタ位置の rect」 流儀。
+        // 帯が畳まれている (格子が零 rect) ときは帯の上でもアレンジ側へ倒す。
+        let launcher_pane = app.ui_ephemeral.launcher_pane_rect;
+        let is_launcher_active = !is_pianoroll_active
+            && app.ui_ephemeral.launcher_grid_rect.w > 0.0
+            && ui.pointer().pos.is_some_and(|(px, py)| launcher_pane.contains(px, py));
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if is_pianoroll_active {
                 app.handle_event(AppEvent::FitPianoRollToClip);
+            } else if is_launcher_active {
+                // `delete_current_surface` と同じく handler を直接呼ぶ (handle_event の
+                // match は FN-BUDGET 上限に張り付いており、 1 行 arm でも超過する)。
+                app.fit_launcher_to_scenes();
             } else {
                 // arrangement: 直前のズームに戻る (履歴が空なら全体フィット)。
                 app.handle_event(AppEvent::ArrangeZoomBack);

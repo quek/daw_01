@@ -118,6 +118,15 @@ pub struct UiEphemeral {
     /// r.md #128: `R` がポインタ位置で「選択パートの範囲」 か「選択クリップの範囲」 かを
     /// 決めるのに読む。 `arrangement_view::draw` が毎フレーム更新。
     pub arrange_arranger_rect: daw_ui_renderer::Rect,
+    /// ランチャー帯全体の画面 rect (`ArrangementResponse.launcher_pane_rect` の mirror)。
+    /// `X` がポインタ位置で「帯の全体表示」 か「アレンジの全体表示」 かを決めるのに読む。
+    /// `arrangement_view::draw` が毎フレーム更新。 帯が無ければ零 rect。
+    pub launcher_pane_rect: daw_ui_renderer::Rect,
+    /// ランチャー帯のセル格子の画面 rect (`ArrangementResponse.launcher_grid_rect` の mirror)。
+    /// 帯の全体表示 (`fit_launcher_to_scenes`) が「全シーンを何 px に収めるか」 の唯一の根拠。
+    /// `last_arrange_lanes_size` と同じ「レイアウト SSoT の実 rect を記録する」 idiom で、
+    /// 零 rect は「未測定 / 畳まれている」 (fit を skip)。
+    pub launcher_grid_rect: daw_ui_renderer::Rect,
     /// ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
     /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master

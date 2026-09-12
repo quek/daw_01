@@ -249,5 +249,12 @@ pub(super) fn mirror_layout(
     }
     response.arranger_rect = f.arranger_rect;
     response.lanes_rect = f.lanes;
+    response.launcher_pane_rect = f.launcher.pane;
+    // 畳まれた帯は格子が実用にならないので零 rect (= 帯の全体表示を skip させる)。
+    response.launcher_grid_rect = if f.launcher.collapsed {
+        Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }
+    } else {
+        f.launcher.grid
+    };
     response.rows = rows;
 }

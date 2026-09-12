@@ -980,8 +980,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         || app.ui_ephemeral.arrange_hovered_track != hovered_track_id
         || app.ui_ephemeral.arrange_drag_active != drag_active
         || app.ui_ephemeral.arrange_arranger_rect != resp.arranger_rect
+        || app.ui_ephemeral.launcher_pane_rect != resp.launcher_pane_rect
+        || app.ui_ephemeral.launcher_grid_rect != resp.launcher_grid_rect
     {
         let arranger_rect = resp.arranger_rect;
+        let launcher_pane_rect = resp.launcher_pane_rect;
+        let launcher_grid_rect = resp.launcher_grid_rect;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.ui_ephemeral.arrangement_hover_beat = snapped_beat;
             app.ui_ephemeral.arrangement_hover_beat_raw = raw_beat;
@@ -989,6 +993,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.ui_ephemeral.arrange_hovered_track = hovered_track_id;
             app.ui_ephemeral.arrange_drag_active = drag_active;
             app.ui_ephemeral.arrange_arranger_rect = arranger_rect;
+            app.ui_ephemeral.launcher_pane_rect = launcher_pane_rect;
+            app.ui_ephemeral.launcher_grid_rect = launcher_grid_rect;
         }));
     }
 }

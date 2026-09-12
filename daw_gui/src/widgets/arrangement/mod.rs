@@ -95,6 +95,7 @@ pub use launcher::{
     ArrangementClipRef, ClipCopyMode, ClipToCellDrop, CellToClipDrop, LauncherCellKey,
     LauncherCellMove, LauncherIntent, LauncherResponse,
 };
+pub(crate) use launcher::{MAX_COL_W as LAUNCHER_MAX_COL_W, MIN_COL_W as LAUNCHER_MIN_COL_W};
 mod press;
 use press::*;
 mod press_header;
@@ -834,6 +835,13 @@ pub struct ArrangementResponse {
     /// scissor もこの rect なので、 **「lanes の高さ」 を式で再導出してはいけない** (`area.h - RULER_H`
     /// のような再導出が Arranger 帯 18px を引き忘れ、 全体表示で最下段 track が画面下へはみ出していた)。
     pub lanes_rect: Rect,
+    /// ランチャー帯全体 (停止列 + 格子 + 返す列) の実 rect。 `X` がポインタ位置で
+    /// 「帯の全体表示 (全シーンを列幅に収める)」 か「アレンジの全体表示」 かを決めるのに読む。
+    /// 帯が無いレイアウトでは零 rect。
+    pub launcher_pane_rect: Rect,
+    /// ランチャー帯のセル格子の実 rect (= 列を敷き詰める幅の唯一の根拠)。 帯が畳まれている
+    /// (`collapsed`) ときは零 rect で、 帯の全体表示は skip される。
+    pub launcher_grid_rect: Rect,
     /// r.md #63: このフレームに縦へ積んだ行の一覧 (描画順、 **culling 前** = 画面外の行も含む)。
     /// `X` の全体表示 / `Z` の縦ズームが「行がいくつあり、 どこから始まるか」 の唯一の根拠にする
     /// (= モデルから可視 track / lane 集合を再導出しない)。
@@ -950,6 +958,8 @@ impl Default for ArrangementResponse {
             ruler_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             arranger_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             lanes_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            launcher_pane_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            launcher_grid_rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             rows: Vec::new(),
             reordering: None,
             dragging_track_volume: None,

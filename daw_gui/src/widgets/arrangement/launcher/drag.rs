@@ -13,7 +13,38 @@ pub(crate) fn advance(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     update_sessions(ui, f);
     emit_pane_width(ui, f);
     emit_col_width(ui, f);
+    zoom_cols(ui, f);
     scroll_scenes(ui, f);
+}
+
+/// `Ctrl` + ホイールで列幅を横ズームする (アレンジの `Ctrl` + ホイール = 横ズームと同じ語彙、
+/// 同じ係数)。マウス直下の列を anchor に `scroll_scene` を同フレームで補正し、指している
+/// 列が画面上で動かない。`scroll_scenes` より先に呼び、`Ctrl` 中のホイールはここが消費する。
+fn zoom_cols(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
+    if !f.pointer.modifiers.ctrl || f.launcher.collapsed || f.launcher.col_w <= 0.0 {
+        return;
+    }
+    let Some((px, py)) = f.pointer.pos else { return };
+    if !f.launcher.pane.contains(px, py) {
+        return;
+    }
+    let (_, dy) = ui.take_scroll_in_rect(f.launcher.pane);
+    if dy.abs() <= 0.0 {
+        return;
+    }
+    let col_w = f.launcher.col_w;
+    let next_w = (col_w * (dy * 0.0015).exp()).clamp(MIN_COL_W, MAX_COL_W);
+    if (next_w - col_w).abs() < 1e-3 {
+        return;
+    }
+    // 格子の左端からの距離を列数に直し、新しい列幅でも同じ列が同じ x に来る scroll を求める。
+    let mouse_cols = (px - f.launcher.grid.x).max(0.0);
+    let scene_at_mouse = f.launcher.scroll_scene + mouse_cols / col_w;
+    let next_scroll = (scene_at_mouse - mouse_cols / next_w).clamp(0.0, MAX_SCROLL_SCENES);
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.ui_prefs.launcher_scene_col_w = next_w;
+        app.ui_prefs.launcher_scroll_scene = next_scroll;
+    }));
 }
 
 fn update_sessions(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {

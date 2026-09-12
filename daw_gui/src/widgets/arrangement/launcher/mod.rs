@@ -82,8 +82,8 @@ pub(super) const DEFAULT_PANE_W: f32 = 300.0;
 pub(super) const DEFAULT_COL_W: f32 = 96.0;
 
 /// 列幅の下限 / 上限 (px)。
-pub(super) const MIN_COL_W: f32 = 36.0;
-pub(super) const MAX_COL_W: f32 = 400.0;
+pub(crate) const MIN_COL_W: f32 = 36.0;
+pub(crate) const MAX_COL_W: f32 = 400.0;
 
 /// 横スクロールで到達できる列の上限 (表示 index)。プレースホルダ列は無限に続くが、
 /// engine 側のフォローアクションが見る列数の上限 (`daw_audio` の `MAX_SCENES` = 512) と
