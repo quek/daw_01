@@ -574,11 +574,10 @@ impl AppData {
     /// (量子化待ちに落ちないこと) は engine 側が担保する — `process_buffer` が
     /// **transport 要求を消費する前**の `playing` を発火拍の解決に渡す。
     ///
-    /// 再生位置は Space と同じく**ホーム**へ頭出しする。停止中の発火は engine が
-    /// 量子化せず即時に鳴らす (`FireAt::beat` — 拍が進まないので待てない) ので、
-    /// 走り出す位置がそのままセルの周回の原点になる。止まっていた位置 (小節の途中)
-    /// から走らせると、そのセルの小節頭だけ曲の小節線から外れ、後から再生中に撃った
-    /// セル (= 小節線に量子化される) と揃わない。
+    /// 再生位置は Space と同じく**ホーム**へ頭出しし、セルはそこから Launch の量子化に
+    /// 従って鳴る (engine の `FireAt::beat` — ホームが小節頭ならその場、途中なら次の
+    /// 小節頭まで待つ。アレンジの再生と同じ格子)。止まっていた位置から走らせると
+    /// 「どこで止めたか」で鳴り出す拍が変わり、Space の頭出しと食い違う。
     fn ensure_transport_rolling(&mut self) {
         if !self.transport.is_playing {
             self.start_transport(None, crate::state::PlayFrom::Home);

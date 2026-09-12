@@ -147,20 +147,24 @@ enum FireAt {
     /// セル自身の量子化にだけ従う。
     Chain { fire: f64 },
     /// r.md #126: ユーザーが Alt+click で押した — **グローバルもセルの量子化も待たず**
-    /// この buffer の先頭で起きる (停止中は `User` と同じく即時)。
+    /// この buffer の先頭で起きる。
     Immediate { start_beat: f64, playing: bool },
 }
 
 impl FireAt {
     /// 量子化 `cell_q` のセルが実際に鳴り出す song 拍。
+    ///
+    /// **停止中に撃っても規則は同じ** — GUI は発火と同時に Play (ホームへ頭出し) を送り、
+    /// engine は buffer 頭で transport 要求を消費してから発火拍を解くので、拍は必ず
+    /// 進み出す。ホームが小節頭ならその場で鳴り、途中なら次の小節頭まで待つ
+    /// (アレンジの再生と同じ格子に乗る。Live / Bitwig も同じ)。以前は停止中だけ
+    /// 量子化を素通しして止まっていた位置から鳴らしていたため、そのセルの小節頭だけ
+    /// 曲の小節線から外れ、後から撃ったセルと揃わなかった。`playing` は Toggle の
+    /// 「鳴っているセルをもう一度押した」判定 ([`Self::is_playing`]) だけが読む。
     fn beat(self, cell_q: LaunchQuantize, time_sig: (u8, u8)) -> f64 {
         match self {
-            // 停止中は量子化しない (拍が進まないので待っても永久に来ない)。
-            Self::User { playing: false, .. } | Self::Immediate { playing: false, .. } => {
-                f64::NEG_INFINITY
-            }
-            Self::Immediate { start_beat, playing: true } => start_beat,
-            Self::User { start_beat, global_q, playing: true } => {
+            Self::Immediate { start_beat, .. } => start_beat,
+            Self::User { start_beat, global_q, .. } => {
                 match quantize::resolve(cell_q, global_q, time_sig) {
                     Some(q) => quantize::next_boundary(start_beat, q),
                     None => start_beat,
@@ -397,7 +401,7 @@ impl LauncherRuntime {
         self.sync_rows(song);
         self.resync_cells(song, span.start_beat);
         if self.reseed {
-            self.seed_from_song(song, span.start_beat);
+            self.seed_from_song(song, span.start_beat, global_q);
             self.reseed = false;
         }
         // ユーザー操作 (`inbox`) を先に予約へ畳み、**その後で** `Song` 側の主導権が変わった行を
@@ -411,7 +415,7 @@ impl LauncherRuntime {
         //   (= 撃つたびに先頭 ~半小節が 2 回鳴る)。先に予約を作ってから反響を比べれば、
         //   同じ buffer に届いたユーザー操作は差分より新しいので必ず勝つ。
         self.drain_inbox(song, span, global_q, playing);
-        self.sync_saved_rows(song, span.start_beat);
+        self.sync_saved_rows(song, span.start_beat, global_q);
         self.resync_scene_follow(song, span.start_beat);
         self.tick_scene_follow(song, span);
         self.build_table(song, span, global_q);
@@ -554,16 +558,33 @@ impl LauncherRuntime {
     /// `Song` の [`RowPlayback`] から撃ち直す。**セルが引けない行は無音**に落とす —
     /// `Arranger` へ戻すと「ランチャーに渡した行」のアレンジのクリップが黙って
     /// 鳴り出す (`Song::normalize_session` と同じ規則)。
-    fn seed_from_song(&mut self, song: &Song, now: f64) {
+    fn seed_from_song(&mut self, song: &Song, now: f64, global_q: LaunchQuantize) {
         // **行と列を同じ 1 か所で起点へ戻す。** 列の走行位置は `Song` に無い
         // (§1.4) ので、前の再生で armed だった `scene.at` を残すと「どこで
         // 停止したか」で次のシーンへ移る拍が変わる = 同じ起点から始まらない。
         self.disarm_scene();
+        let scene_id = song.last_launched_scene_id;
+        // 列の連鎖の起点 = その列のセルが**最初に鳴り出す拍** (`launch_scene` の
+        // `first` と同じ規則。`now` にすると、小節の途中から再生したとき連鎖だけ
+        // 量子化待ちのぶん早く回る)。
+        let mut first = f64::INFINITY;
         for row in &mut self.rows {
-            match row_of(song, row.key) {
-                Some((cells, saved)) => seed_row(row, &cells, saved, now),
+            let fired = match row_of(song, row.key) {
+                Some((cells, saved)) => seed_row(row, &cells, saved, now, global_q, song.time_sig),
                 // ランチャーが握れない行 (テンポ / 拍子レーン) と、消えた行。
-                None => seed_row(row, &RowCells::Track(&[]), RowPlayback::Arranger, now),
+                None => seed_row(
+                    row,
+                    &RowCells::Track(&[]),
+                    RowPlayback::Arranger,
+                    now,
+                    global_q,
+                    song.time_sig,
+                ),
+            };
+            if let Some((at, scene)) = fired
+                && scene == scene_id
+            {
+                first = first.min(at);
             }
         }
         // 列の連鎖の起点は `Song.last_launched_scene_id` (= ユーザーが最後に撃った列)。
@@ -571,10 +592,10 @@ impl LauncherRuntime {
         // 書き出しでシーンのフォローアクションが一度も動かない (§1.4 / Q9)。
         // 遷移先は決して読まない — 書く側 (GUI) が書かないので、ここも「撃った列」
         // としてしか解釈しない。
-        self.seeded_scene = song.last_launched_scene_id;
-        if song.last_launched_scene_id != 0 {
-            let longest = scene_longest(song, song.last_launched_scene_id);
-            self.arm_scene_follow(song, song.last_launched_scene_id, now, longest, now);
+        self.seeded_scene = scene_id;
+        if scene_id != 0 {
+            let longest = scene_longest(song, scene_id);
+            self.arm_scene_follow(song, scene_id, first, longest, now);
         }
     }
 
@@ -600,7 +621,7 @@ impl LauncherRuntime {
     ///    ここを見ないと、撃った直後に毎回 1 回位相が飛ぶ。
     ///
     /// RT 安全: 線形走査のみ (確保・ロック・I/O なし)。
-    fn sync_saved_rows(&mut self, song: &Song, now: f64) {
+    fn sync_saved_rows(&mut self, song: &Song, now: f64, global_q: LaunchQuantize) {
         for idx in 0..self.rows.len() {
             let key = self.rows[idx].key;
             let Some((cells, saved)) = row_of(song, key) else {
@@ -614,7 +635,7 @@ impl LauncherRuntime {
             if self.rows[idx].queued.is_some() || realizes(self.rows[idx].phase, saved) {
                 continue;
             }
-            seed_row(&mut self.rows[idx], &cells, saved, now);
+            seed_row(&mut self.rows[idx], &cells, saved, now, global_q, song.time_sig);
         }
         // 列の連鎖の起点も同じ規則で追う (行と対の SSoT)。既にその列を走らせて
         // いるなら「反響」なので張り直さない。
@@ -660,7 +681,7 @@ impl LauncherRuntime {
     ) {
         let at = FireAt::User { start_beat: span.start_beat, global_q, playing };
         let global_at = at.beat(LaunchQuantize::Global, song.time_sig);
-        // 量子化抜き (= この buffer の先頭、停止中なら即時)。
+        // 量子化抜き (= この buffer の先頭)。
         let now_at = at.beat(LaunchQuantize::Off, song.time_sig);
         match req {
             LaunchRequest::Cell { key, clip_id, pressed, immediate } => {
@@ -1274,19 +1295,47 @@ fn fill_row_occupancy(occupied: &mut [bool], song: &Song, cells: &RowCells<'_>) 
 ///
 /// **セルが引けない行は無音**に落とす — `Arranger` へ戻すと「ランチャーに渡した行」の
 /// アレンジのクリップが黙って鳴り出す (`Song::normalize_session` と同じ規則)。
-fn seed_row(row: &mut RowRuntime, cells: &RowCells<'_>, saved: RowPlayback, now: f64) {
+///
+/// **セルは即時には置かず、Launch の量子化で解いた拍への予約にする** (ユーザーが
+/// 撃ったときと同じ [`FireAt::User`])。再生開始位置が小節頭ならその buffer で
+/// 鳴り、途中なら次の小節頭まで無音 — セッションの再生もアレンジと同じ格子に乗る。
+/// `now` に置くと、小節の途中から再生したときそのセルの小節頭だけ曲の小節線から
+/// 外れ、後から撃ったセルと揃わない。戻り値 = 予約した発火拍とそのセルの列
+/// (列のフォローアクションの起点に使う)。
+fn seed_row(
+    row: &mut RowRuntime,
+    cells: &RowCells<'_>,
+    saved: RowPlayback,
+    now: f64,
+    global_q: LaunchQuantize,
+    time_sig: (u8, u8),
+) -> Option<(f64, u32)> {
     row.queued = None;
     row.held_clip_id = 0;
     row.repeating = false;
     row.seeded = saved;
+    let mut fired = None;
     row.phase = match saved {
         RowPlayback::Arranger => RowPhase::Arranger,
         RowPlayback::LauncherStopped => RowPhase::Silent,
-        RowPlayback::Launcher { clip_id } => cells
-            .find_by_clip(clip_id)
-            .map_or(RowPhase::Silent, |c| c.phase_at(now, None)),
+        RowPlayback::Launcher { clip_id } => {
+            if let Some(c) = cells.find_by_clip(clip_id) {
+                let at = FireAt::User { start_beat: now, global_q, playing: true }
+                    .beat(c.quantize, time_sig);
+                row.queued = Some(Queued {
+                    target: QueueTarget::Cell(clip_id),
+                    at_beat: at,
+                    legato: false,
+                    from_repeat: false,
+                    start_phase: 0.0,
+                });
+                fired = Some((at, c.scene_id));
+            }
+            RowPhase::Silent
+        }
     };
     arm_timers(row, cells);
+    fired
 }
 
 /// 走行中の供給元が、保存された主導権を**既に実現しているか**。
@@ -2000,6 +2049,51 @@ mod tests {
         press(&mut rt, 2, 20, true);
         rt.update(&song, span_at(1.0), LaunchQuantize::Off, false);
         assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(20));
+    }
+
+    /// **停止中に撃っても Launch の量子化に従う** (アレンジの再生と同じ格子)。
+    /// 以前は停止中だけ量子化を素通しして止まっていた位置から鳴らしていたため、
+    /// 小節の途中で止めて撃ったセルの小節頭だけ曲の小節線から外れ、後から再生中に
+    /// 撃ったセル (= 小節線に量子化される) と揃わなかった。
+    #[test]
+    fn 停止中に撃っても量子化境界まで待つ() {
+        let song = two_rows();
+        let q = LaunchQuantize::Bars(1);
+        let mut rt = LauncherRuntime::new();
+        rt.update(&song, span_at(1.0), q, false);
+        // 小節の途中 (1.0 拍) で止まった状態で撃つ = 同じ buffer で Play が始まる。
+        press(&mut rt, 1, 10, true);
+        rt.update(&song, span_at(1.0), q, false);
+        // 境界までは元の供給元 (アレンジ) のまま = 再生中に撃ったときと同じ。
+        assert_eq!(rt.rows().track_row(0).tail, RowPhase::Arranger, "小節の途中で鳴った");
+        rt.update(&song, span_at(4.0), q, true);
+        let tail = rt.rows().track_row(0).tail;
+        assert_eq!(tail.cell_clip_id(), Some(10));
+        let RowPhase::Cell { launch_beat, .. } = tail else { panic!("{tail:?}") };
+        assert!((launch_beat - 4.0).abs() < 1e-9, "原点が小節頭でない: {launch_beat}");
+    }
+
+    /// **再生開始時の撃ち直し (`Song` の主導権から seed) も同じ量子化に乗る。**
+    /// 小節の途中から Space で再生すると、そのセルは次の小節頭まで無音で、
+    /// 原点は小節頭に置かれる。
+    #[test]
+    fn 再生開始の撃ち直しも量子化境界まで待つ() {
+        let mut song = two_rows();
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
+        let q = LaunchQuantize::Bars(1);
+        let mut rt = LauncherRuntime::new();
+        rt.update(&song, span_at(1.0), q, true);
+        assert_eq!(rt.rows().track_row(0).tail, RowPhase::Silent, "小節の途中で鳴った");
+        rt.update(&song, span_at(4.0), q, true);
+        let tail = rt.rows().track_row(0).tail;
+        let RowPhase::Cell { clip_id, launch_beat, .. } = tail else { panic!("{tail:?}") };
+        assert_eq!(clip_id, 10);
+        assert!((launch_beat - 4.0).abs() < 1e-9, "原点が小節頭でない: {launch_beat}");
+
+        // 小節頭から再生すればその buffer で鳴る (待たない)。
+        let mut rt = LauncherRuntime::new();
+        rt.update(&song, span_at(8.0), q, true);
+        assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
     }
 
     /// Q9 の前提: **同じプロジェクトから 2 回走らせたら遷移が完全に一致する**。

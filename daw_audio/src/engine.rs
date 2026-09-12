@@ -1367,8 +1367,9 @@ impl LocalState {
         // r.md #87: 「停止中に撃ったか」は **transport 要求を消費する前**の状態でしか
         // 分からない。GUI はセル / シーンの発火と同時に Play を送る (停止したまま
         // ▶ を押しても鳴らないのは操作として壊れている) ので、消費後に見ると
-        // 「再生中に撃った」と区別がつかず、量子化待ちに入って最大 1 小節鳴らない。
-        // 発火拍の解決 (`launcher.update`) だけがこの値を使う。
+        // 「再生中に撃った」と区別がつかない。Toggle の「鳴っているセルをもう一度
+        // 押した」判定 (`FireAt::is_playing`) だけがこの値を使う — 発火拍そのものは
+        // 停止中でも量子化に従う (`FireAt::beat`、Play は同時に始まるので拍は進む)。
         let was_playing = self.playing;
         self.consume_transport_requests(shared);
         let recording_requested = self.shared.recording_requested.load(Ordering::Acquire);
