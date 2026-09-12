@@ -1050,12 +1050,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     //   automation lane 上: 点 → lane のクリップ → そのトラック → 全トラック
     // 「そのトラック」 はマウス下の行、行の外ならカーソルトラック (選択末尾)。
     if ui.take_shortcut("select_all") {
-        // 帯が今の操作対象なら **ランチャーのセルを全選択**する。落とすと
-        // `SelectAllArrangement` に流れてアレンジの範囲が張られ、面が黙って範囲へ移る
-        // (画面は変わらないのに、次の Delete がアレンジの全クリップを消す)。
-        if crate::view::launcher_keys::select_all_cells_if_launcher(app, ui, surface) {
-            // 帯が取った (選択は helper が積む)。
-        } else if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_some() {
+        // **下部パネル (audio editor / piano roll) の上が最優先。** `Ctrl+A` は選択を*作る*
+        // 操作なのでポインタ位置が文脈で、 帯の helper はポインタが帯に無いときの fallback に
+        // 直近確定面 (= セル面) を見る。 これを先に通すと、 セルを開いて piano roll に
+        // ポインタを置いた `Ctrl+A` が帯に奪われ、 全セルが選択されて piano roll に
+        // 全クリップのノートが並ぶ (実機で報告)。
+        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_some() {
             let indices = app.all_audio_event_indices();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
@@ -1067,6 +1067,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.select_all_pianoroll(hover_pitch);
             }));
+        } else if crate::view::launcher_keys::select_all_cells_if_launcher(app, ui, surface) {
+            // 帯が今の操作対象なら **ランチャーのセルを全選択**する (選択は helper が積む)。
+            // 落とすと `SelectAllArrangement` に流れてアレンジの範囲が張られ、面が黙って
+            // 範囲へ移る (画面は変わらないのに、次の Delete がアレンジの全クリップを消す)。
         } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
             // automation lane 上: 段階拡大。
             //   1 回目 = lane の全ポイント
