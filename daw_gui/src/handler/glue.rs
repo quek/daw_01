@@ -248,11 +248,11 @@ impl AppData {
     /// [`Self::apply_glue`] が 1 回の編集で適用する (= 1 undo step、失敗時は無変更)。
     /// audio が 1 つも無い選択は render を挟まず同期で終わる。
     pub(crate) fn action_glue_selected_clips(&mut self) {
-        let Some(sel) = self.selection.time.clone() else {
+        let Some(sel) = self.cur.selection.time.clone() else {
             self.ui_ephemeral.status_message = "Glue: 範囲を選択してください".to_string();
             return;
         };
-        if self.ipc.pending_glue_bake.is_some() || self.ipc.pending_clip_fx_bounce.is_some() {
+        if self.cur.pipc.pending_glue_bake.is_some() || self.cur.pipc.pending_clip_fx_bounce.is_some() {
             self.ui_ephemeral.status_message =
                 "Glue: 焼き込み中です。 完了をお待ちください".into();
             return;
@@ -265,7 +265,7 @@ impl AppData {
         }
         let audio_tracks: Vec<u32> = refs_by_track
             .iter()
-            .filter(|(_, refs)| glue_kind_of(self.song_doc.song(), refs) == Some(GlueKind::Audio))
+            .filter(|(_, refs)| glue_kind_of(self.cur.song_doc.song(), refs) == Some(GlueKind::Audio))
             .map(|(id, _)| *id)
             .collect();
         if audio_tracks.is_empty() {
@@ -282,7 +282,7 @@ impl AppData {
         sel: &TimeSelection,
         fully_inside: bool,
     ) -> BTreeMap<u32, Vec<ClipKey>> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut out: BTreeMap<u32, Vec<(f64, ClipKey)>> = BTreeMap::new();
         for lane in &sel.lanes {
             let LaneRef::Track(track_id) = lane else {
@@ -322,8 +322,8 @@ impl AppData {
             let name = refs_by_track
                 .get(&track_id)
                 .and_then(|refs| refs.first().copied())
-                .and_then(|r| self.song_doc.song().clip_by_key(r))
-                .map(|c| self.song_doc.song().content_name(c.content_id).to_string())
+                .and_then(|r| self.cur.song_doc.song().clip_by_key(r))
+                .map(|c| self.cur.song_doc.song().content_name(c.content_id).to_string())
                 .unwrap_or_default();
             let Some((out_path, source_path)) = self.bounce_output_path(&name, "_glue") else {
                 return;
@@ -341,7 +341,7 @@ impl AppData {
         }
         self.ui_ephemeral.status_message =
             format!("Glue: {} トラックを焼き込み中...", jobs.len());
-        self.ipc.pending_glue_bake = Some(PendingGlueBake { sel, jobs, current: 0 });
+        self.cur.pipc.pending_glue_bake = Some(PendingGlueBake { sel, jobs, current: 0 });
         if !self.send_glue_bake(0) {
             self.abort_glue_bake("Glue: 焼き込みを開始できませんでした".into());
         }
@@ -350,7 +350,7 @@ impl AppData {
     /// `index` 番目の job を engine へ投げる (対象トラックだけを残した song を積んでから
     /// 範囲を offline render)。
     fn send_glue_bake(&mut self, index: usize) -> bool {
-        let Some(pending) = self.ipc.pending_glue_bake.as_ref() else {
+        let Some(pending) = self.cur.pipc.pending_glue_bake.as_ref() else {
             return false;
         };
         let (start_beat, end_beat) = (pending.sel.start_beat.max(0.0), pending.sel.end_beat);
@@ -366,15 +366,16 @@ impl AppData {
         let Some(isolated) = self.isolated_track_song(track_id, true) else {
             return false;
         };
-        if let Some(p) = self.ipc.pending_glue_bake.as_mut() {
+        if let Some(p) = self.cur.pipc.pending_glue_bake.as_mut() {
             p.current = index;
         }
-        self.send_audio(common::protocol::AudioCommand::SetMasterGain(isolated.master_gain));
-        self.send_audio(common::protocol::AudioCommand::LoadSong(isolated));
+        self.send_audio(common::protocol::AudioCommand::SetMasterGain { project: self.pk(), gain: isolated.master_gain });
+        self.send_audio(common::protocol::AudioCommand::LoadSong { project: self.pk(), song: isolated });
         self.send_plugin(common::protocol::PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Offline,
         ));
         self.send_audio(common::protocol::AudioCommand::BounceClipFxOnline {
+            project: self.pk(),
             path,
             source_track: track_id,
             // Glue の単位は範囲 × トラックなので「元 clip」は 1 つに定まらない。
@@ -397,7 +398,7 @@ impl AppData {
         error: Option<&str>,
         frames: u64,
     ) -> bool {
-        let Some(pending) = self.ipc.pending_glue_bake.as_mut() else {
+        let Some(pending) = self.cur.pipc.pending_glue_bake.as_mut() else {
             return false;
         };
         let index = pending.current;
@@ -428,7 +429,7 @@ impl AppData {
         self.send_plugin(common::protocol::PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Realtime,
         ));
-        let Some(done) = self.ipc.pending_glue_bake.take() else {
+        let Some(done) = self.cur.pipc.pending_glue_bake.take() else {
             return true;
         };
         let baked: BTreeMap<u32, GlueBakeJob> =
@@ -444,7 +445,7 @@ impl AppData {
     /// 焼き込みを中断する。**何も変更せず**、出力ファイルを消して engine を戻す
     /// (全か無かの原則、`docs/plan_glue_bake.md` §4)。
     pub(crate) fn abort_glue_bake(&mut self, message: String) {
-        if let Some(pending) = self.ipc.pending_glue_bake.take() {
+        if let Some(pending) = self.cur.pipc.pending_glue_bake.take() {
             for job in &pending.jobs {
                 let _ = std::fs::remove_file(&job.out_path);
             }
@@ -470,7 +471,7 @@ impl AppData {
         let (a, b) = (sel.start_beat, sel.end_beat);
         let mut tracks: Vec<u32> = Vec::new();
         for (track_id, refs) in self.glue_refs_by_track(sel, false) {
-            match glue_kind_of(self.song_doc.song(), &refs) {
+            match glue_kind_of(self.cur.song_doc.song(), &refs) {
                 // audio は焼けたトラックだけ (render 失敗は無変更)。
                 Some(GlueKind::Audio) if baked.contains_key(&track_id) => tracks.push(track_id),
                 Some(GlueKind::Audio) | None => {}
@@ -481,7 +482,7 @@ impl AppData {
         // トラックごとの結合 (N 回) が別々の step になると、1 回の `J` を戻すのに
         // N+1 回 Undo が要る。**非同期の完了から呼ばれる**ので、進行中のドラッグの
         // bracket は横取りせず退避して戻す。
-        let gesture = self.song_doc.enter_own_gesture();
+        let gesture = self.cur.song_doc.enter_own_gesture();
         // **範囲の境界でクリップを割ってから集める。** はみ出した部分は元のクリップと
         // して残り、範囲の中身だけが 1 クリップへ焼き込まれる (Live の `Ctrl+E`
         // "Split Clip at Selection" と同じ切り出し、`docs/plan_range_selection.md` §7.1)。
@@ -505,7 +506,7 @@ impl AppData {
             // トラックを skip しつつ、先に結合済みのトラックの編集は残していた)。
             // ここに来る前に「切ったトラック」だけへ絞ってあるので、混在トラックは
             // 切られてもいない。
-            let Some(kind) = glue_kind_of(self.song_doc.song(), &refs) else {
+            let Some(kind) = glue_kind_of(self.cur.song_doc.song(), &refs) else {
                 had_mixed_kind = true;
                 continue;
             };
@@ -526,13 +527,13 @@ impl AppData {
                 glued_count += 1;
             }
         }
-        self.song_doc.leave_own_gesture(gesture);
+        self.cur.song_doc.leave_own_gesture(gesture);
 
         // 焼いた WAV を即再生できるよう decode cache へ (失敗しても保存/再読込で回復)。
         for (source_id, path) in decoded {
             match crate::import_audio::decode_audio(&path) {
                 Ok(buffer) => {
-                    self.media.audio_source_cache.insert(source_id, std::sync::Arc::new(buffer));
+                    self.cur.media.audio_source_cache.insert(source_id, std::sync::Arc::new(buffer));
                 }
                 Err(e) => tracing::warn!(
                     error = %e, path = %path.display(),
@@ -572,7 +573,7 @@ impl AppData {
             sample_rate: self.ipc.sample_rate,
             channels: 2,
             frames: job.frames,
-            original_bpm: Some(self.song_doc.song().bpm),
+            original_bpm: Some(self.cur.song_doc.song().bpm),
             root_key: None,
         };
         let (start, len) = (sel.start_beat, sel.len_beats());
@@ -620,7 +621,7 @@ impl AppData {
         // 範囲が中身より広ければ、前後の空白は content 内の「何も無い区間」として
         // 自然に表現される (`content_offset_beats` を負にする必要は無い)。
         let (start, len) = (sel.start_beat, sel.len_beats());
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let name = refs
             .first()
             .and_then(|r| song.clip_by_key(*r))

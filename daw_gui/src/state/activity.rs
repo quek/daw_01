@@ -25,6 +25,10 @@ pub struct ActivityState {
     /// (sysinfo poller の `refresh_processes(All)` は全プロセス列挙で、
     /// 送る前の poll 自体が重い)。
     pub awake: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `docs/plan_project_tabs.md` §5.4: いま見えているタブの `ProjectKey.0`。telemetry
+    /// poller はメーター / 変調値面 / ランチャー走行状態 (重い面) をこのタブの slot だけ
+    /// 読む (playhead / playing は全タブぶん読む)。タブ切替で `AppData` が書く。
+    pub active_project: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// メインウィンドウが focus を持っているか。
     pub main_focused: bool,
     /// 動画プレビュー窓が focus を持っているか。
@@ -57,6 +61,7 @@ impl Default for ActivityState {
             // 起動直後は起きている状態から始める (最初の判定が届くまで
             // 背景スレッドを止めない = 「起動したのに何も動かない」を避ける)。
             awake: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            active_project: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }

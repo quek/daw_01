@@ -44,6 +44,7 @@ use std::thread::JoinHandle;
 
 use anyhow::Result;
 use common::metrics_bridge::MetricsBridgeHandle;
+use common::protocol::{DeviceAddr, InstanceToken};
 use common::plugin_ref::open_named_event;
 use common::process_data::{Event, EventKind};
 use common::protocol::PluginEvent;
@@ -56,10 +57,12 @@ use windows::Win32::System::Threading::{
 
 use crate::plugin_instance::{AudioHalf, NoteTransition, TimedNoteEvent};
 
-/// Per-plugin process-server entry (v29: device_id keyed, flat)。
+/// Per-plugin process-server entry (`InstanceToken` keyed, flat)。
 /// `audio` は split-half の audio 側 ([`AudioHalf`])、 `process_data` は
 /// audio engine が入力を書く shmem slot。
 pub struct PluginEntry {
+    /// この instance の住所 (param event を daw_gui へ返すときの宛先)。
+    pub device: DeviceAddr,
     pub audio: Arc<AudioHalf>,
     pub process_data: *mut common::process_data::ProcessData,
     /// per-publish one-shot: `process()` Err / panic を最初の 1 回だけ
@@ -85,6 +88,7 @@ pub const METRIC_SLOT_UNCLAIMED: u32 = u32::MAX;
 impl Clone for PluginEntry {
     fn clone(&self) -> Self {
         Self {
+            device: self.device,
             audio: Arc::clone(&self.audio),
             process_data: self.process_data,
             err_logged: Arc::clone(&self.err_logged),
@@ -97,41 +101,41 @@ impl Clone for PluginEntry {
 unsafe impl Send for PluginEntry {}
 unsafe impl Sync for PluginEntry {}
 
-/// Lock-free `device_id` → [`PluginEntry`] lookup the worker pool reads
+/// Lock-free [`InstanceToken`] → [`PluginEntry`] lookup the worker pool reads
 /// during dispatch. plugin-main thread が add / remove ごとに新しい
 /// `HashMap` を publish する; 古い snapshot は最後の worker guard が落ちる
 /// まで生きる (Arc entry なので dangle しない)。
-pub type PluginRegistry = Arc<arc_swap::ArcSwap<HashMap<u64, PluginEntry>>>;
+pub type PluginRegistry = Arc<arc_swap::ArcSwap<HashMap<InstanceToken, PluginEntry>>>;
 
 /// Publish (insert or replace) one registry entry.
-pub fn registry_insert(registry: &PluginRegistry, device_id: u64, entry: PluginEntry) {
-    let mut next: HashMap<u64, PluginEntry> = (**registry.load()).clone();
-    next.insert(device_id, entry);
+pub fn registry_insert(registry: &PluginRegistry, token: InstanceToken, entry: PluginEntry) {
+    let mut next: HashMap<InstanceToken, PluginEntry> = (**registry.load()).clone();
+    next.insert(token, entry);
     registry.store(Arc::new(next));
 }
 
 /// Remove one registry entry, returning it if present.
-pub fn registry_remove(registry: &PluginRegistry, device_id: u64) -> Option<PluginEntry> {
+pub fn registry_remove(registry: &PluginRegistry, token: InstanceToken) -> Option<PluginEntry> {
     let current = registry.load();
-    if !current.contains_key(&device_id) {
+    if !current.contains_key(&token) {
         return None;
     }
-    let mut next: HashMap<u64, PluginEntry> = (**current).clone();
-    let removed = next.remove(&device_id);
+    let mut next: HashMap<InstanceToken, PluginEntry> = (**current).clone();
+    let removed = next.remove(&token);
     drop(current);
     registry.store(Arc::new(next));
     removed
 }
 
 /// Snapshot every entry and clear the registry (ReinitAllPlugins 用)。
-pub fn registry_take_all(registry: &PluginRegistry) -> HashMap<u64, PluginEntry> {
-    let all: HashMap<u64, PluginEntry> = (**registry.load()).clone();
+pub fn registry_take_all(registry: &PluginRegistry) -> HashMap<InstanceToken, PluginEntry> {
+    let all: HashMap<InstanceToken, PluginEntry> = (**registry.load()).clone();
     registry.store(Arc::new(HashMap::new()));
     all
 }
 
 /// Re-publish a set of entries at once (ReinitAllPlugins の republish)。
-pub fn registry_restore_all(registry: &PluginRegistry, entries: HashMap<u64, PluginEntry>) {
+pub fn registry_restore_all(registry: &PluginRegistry, entries: HashMap<InstanceToken, PluginEntry>) {
     registry.store(Arc::new(entries));
 }
 
@@ -185,7 +189,7 @@ enum RtParamKind {
 #[derive(Clone, Copy)]
 struct RtParamEvent {
     kind: RtParamKind,
-    device_id: u64,
+    device: DeviceAddr,
     param_id: u32,
     value: f64,
 }
@@ -194,7 +198,7 @@ impl Default for RtParamEvent {
     fn default() -> Self {
         Self {
             kind: RtParamKind::Touch,
-            device_id: 0,
+            device: DeviceAddr::new(common::protocol::ProjectKey::NONE, 0),
             param_id: 0,
             value: 0.0,
         }
@@ -263,19 +267,19 @@ impl ParamEventRing {
 fn rt_param_to_event(ev: RtParamEvent) -> PluginEvent {
     match ev.kind {
         RtParamKind::Touch => PluginEvent::PluginParamTouched {
-            device_id: ev.device_id,
+            device: ev.device,
             param_id: ev.param_id,
             // display_name は daw_gui 側で plugin_params cache から解決する
             // (= host での文字列構築は placeholder のみ)。
             display_name: format!("Param {}", ev.param_id),
         },
         RtParamKind::Value => PluginEvent::PluginParamValueChanged {
-            device_id: ev.device_id,
+            device: ev.device,
             param_id: ev.param_id,
             value: ev.value,
         },
         RtParamKind::Release => PluginEvent::PluginParamGestureEnd {
-            device_id: ev.device_id,
+            device: ev.device,
             param_id: ev.param_id,
         },
     }
@@ -554,7 +558,7 @@ fn run_worker(
     // per-worker one-shot: 「registry に居ない device」への dispatch 警告は
     // 同じ id が続く限り 1 回だけ (TIME_CRITICAL thread での毎 buffer log を
     // 排除 — respawn 待ちの間 audio 側は毎 buffer dispatch し続ける)。
-    let mut warned_missing: Option<u64> = None;
+    let mut warned_missing: Option<InstanceToken> = None;
 
     loop {
         // 仕事が来るまでの park。不変条件 4 が禁じているのは「**他プロセスの完了待ち**を
@@ -572,8 +576,8 @@ fn run_worker(
         // (happens-before の論証は module docs)。
         dispatch.enter(idx as usize);
 
-        let device_id = bridge.bridge().worker_task[idx as usize].load(Ordering::Acquire);
-        if device_id == WorkerBridge::IDLE {
+        let raw = bridge.bridge().worker_task[idx as usize].load(Ordering::Acquire);
+        if raw == WorkerBridge::IDLE {
             dispatch.exit(idx as usize);
             unsafe {
                 let _ = SetEvent(done.0);
@@ -581,13 +585,14 @@ fn run_worker(
             continue;
         }
 
+        let token = InstanceToken(raw);
         let snapshot = registry.load();
-        let entry_opt = snapshot.get(&device_id);
+        let entry_opt = snapshot.get(&token);
         let Some(entry) = entry_opt else {
             // one-shot per distinct id (旧実装は毎 buffer warn = RT 違反)。
-            if warned_missing != Some(device_id) {
-                warned_missing = Some(device_id);
-                tracing::warn!(device_id, "no plugin registered for device (suppressing repeats)");
+            if warned_missing != Some(token) {
+                warned_missing = Some(token);
+                tracing::warn!(?token, "no plugin registered for token (suppressing repeats)");
             }
             bridge.bridge().worker_task[idx as usize]
                 .store(WorkerBridge::IDLE, Ordering::Release);
@@ -598,6 +603,7 @@ fn run_worker(
             continue;
         };
         warned_missing = None;
+        let device = entry.device;
 
         // teardown (exit / slot IDLE 化 / SetEvent(done)) を `Drop` に集約。
         let _guard = DispatchGuard {
@@ -711,14 +717,14 @@ fn run_worker(
                 // per-entry one-shot (v29): 落ち続ける plugin が毎 buffer
                 // format+log で RT thread を汚さない。
                 if !entry.err_logged.swap(true, Ordering::Relaxed) {
-                    tracing::error!(error = ?e, device_id, "plugin.process() failed (suppressing repeats)");
+                    tracing::error!(error = ?e, ?device, "plugin.process() failed (suppressing repeats)");
                 }
                 false
             }
             Err(_panic) => {
                 if !entry.err_logged.swap(true, Ordering::Relaxed) {
                     tracing::error!(
-                        device_id,
+                        ?device,
                         "plugin.process() panicked; worker survived, buffer skipped (suppressing repeats)"
                     );
                 }
@@ -726,13 +732,13 @@ fn run_worker(
             }
         };
         // resource monitor: per-plugin の process() 時間 (μs) を publish。
-        // L1: device_id (u64、 非有界) を配列 index にせず、 device_id を値で保持する
+        // L1: token (u64、 非有界) を配列 index にせず、 token を値で保持する
         // slot を claim する。 slot index は entry にキャッシュされるので線形 scan は
         // plugin ごと初回だけ。 満杯 / 競合で未 claim なら次 buffer で再試行。
         let proc_us = u32::try_from(proc_start.elapsed().as_micros()).unwrap_or(u32::MAX);
         let mut slot = entry.metric_slot.load(Ordering::Relaxed);
         if slot == METRIC_SLOT_UNCLAIMED
-            && let Some(i) = metrics.claim_plugin_metric_slot(device_id)
+            && let Some(i) = metrics.claim_plugin_metric_slot(token)
         {
             entry.metric_slot.store(i as u32, Ordering::Relaxed);
             slot = i as u32;
@@ -784,7 +790,7 @@ fn run_worker(
                 for param_id in out_param_touches.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Touch,
-                        device_id,
+                        device,
                         param_id,
                         value: 0.0,
                     });
@@ -792,7 +798,7 @@ fn run_worker(
                 for (param_id, value) in out_param_values.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Value,
-                        device_id,
+                        device,
                         param_id,
                         value,
                     });
@@ -800,7 +806,7 @@ fn run_worker(
                 for param_id in out_param_releases.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Release,
-                        device_id,
+                        device,
                         param_id,
                         value: 0.0,
                     });
@@ -918,15 +924,16 @@ mod tests {
     /// param event の wire 変換が device_id を保持する (v29)。
     #[test]
     fn rt_param_event_carries_device_id() {
+        let addr = DeviceAddr::new(common::protocol::ProjectKey(3), 0xDEAD_BEEF_0001);
         let ev = RtParamEvent {
             kind: RtParamKind::Value,
-            device_id: 0xDEAD_BEEF_0001,
+            device: addr,
             param_id: 7,
             value: 0.25,
         };
         match rt_param_to_event(ev) {
-            PluginEvent::PluginParamValueChanged { device_id, param_id, value } => {
-                assert_eq!(device_id, 0xDEAD_BEEF_0001);
+            PluginEvent::PluginParamValueChanged { device, param_id, value } => {
+                assert_eq!(device, addr);
                 assert_eq!(param_id, 7);
                 assert_eq!(value, 0.25);
             }
@@ -1037,7 +1044,7 @@ mod tests {
         );
     }
 
-    /// registry の insert / remove / take_all round-trip (device_id keyed)。
+    /// registry の insert / remove / take_all round-trip (token keyed)。
     #[test]
     fn registry_insert_remove_roundtrip() {
         struct NullHalf;
@@ -1062,32 +1069,35 @@ mod tests {
         let registry: PluginRegistry =
             Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new()));
         let entry = PluginEntry {
+            device: DeviceAddr::new(common::protocol::ProjectKey(1), 42),
             audio: AudioHalf::new(Box::new(NullHalf)),
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
             metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
             transport_pinned_to_song: false,
         };
-        registry_insert(&registry, 42, entry);
-        assert!(registry.load().contains_key(&42));
-        let removed = registry_remove(&registry, 42);
+        let t42 = InstanceToken(42);
+        registry_insert(&registry, t42, entry);
+        assert!(registry.load().contains_key(&t42));
+        let removed = registry_remove(&registry, t42);
         assert!(removed.is_some());
         assert!(registry.load().is_empty());
-        assert!(registry_remove(&registry, 42).is_none());
+        assert!(registry_remove(&registry, t42).is_none());
 
         // take_all + restore_all round-trip。
         let entry2 = PluginEntry {
+            device: DeviceAddr::new(common::protocol::ProjectKey(1), 7),
             audio: AudioHalf::new(Box::new(NullHalf)),
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
             metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
             transport_pinned_to_song: false,
         };
-        registry_insert(&registry, 7, entry2);
+        registry_insert(&registry, InstanceToken(7), entry2);
         let all = registry_take_all(&registry);
         assert!(registry.load().is_empty());
         assert_eq!(all.len(), 1);
         registry_restore_all(&registry, all);
-        assert!(registry.load().contains_key(&7));
+        assert!(registry.load().contains_key(&InstanceToken(7)));
     }
 }

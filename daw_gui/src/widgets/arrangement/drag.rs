@@ -288,7 +288,17 @@ fn edge_autoscroll(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     }
     // 移動量ゲート: press からの移動が ACTIVATE_PX 以上のときのみ端スクロールを許可
     // (click-and-hold で view が飛ぶのを防ぐ)。press frame で press 位置を記録。
-    let moved_enough = {
+    // `docs/plan_project_tabs.md` §5.6: **別のタブから運んできている** ドラッグ。
+    // press は元のタブで起きていて、このタブには session も press 位置も無いので、
+    // 下の移動量ゲート / session 判定では永久に動かない。payload が生きている間は
+    // クリップの Move と同じ両軸で端スクロールさせる (anchor 補正は不要 — ゴーストも
+    // 着地位置も毎フレーム pointer から解き直すので、スクロールに自動追従する)。
+    let xfer_drag = ui
+        .drag_payload::<crate::app_types::ProjectTransferPayload>(
+            crate::app_types::PROJECT_XFER_DRAG_KIND,
+        )
+        .is_some();
+    let moved_enough = xfer_drag || {
         let state: &mut ArrangementState = ui.widget_state(f.wid);
         if pointer.primary_just_pressed {
             state.edge_scroll_press = pointer.pos;
@@ -297,7 +307,9 @@ fn edge_autoscroll(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
         matches!((state.edge_scroll_press, pointer.pos),
             (Some(p), Some(c)) if (c.0 - p.0).powi(2) + (c.1 - p.1).powi(2) >= gate * gate)
     };
-    let axes = if moved_enough {
+    let axes = if xfer_drag {
+        Some((true, true))
+    } else if moved_enough {
         let state: &mut ArrangementState = ui.widget_state(f.wid);
         arrangement_edge_scroll_axes(state)
     } else {
@@ -355,13 +367,15 @@ fn edge_autoscroll(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
             ui.push_edit({
                 let v_t = new_top;
                 Edit::mutate(move |app: &mut AppData| {
-                    app.ui_prefs.arrange_track_top = v_t.max(0.0);
+                    app.cur.view.arrange_track_top = v_t.max(0.0);
                 })
             });
         }
     }
     if applied_beat_px != 0.0 || applied_track_px != 0.0 {
-        if marquee_active {
+        if xfer_drag {
+            // 別タブからの運搬は session を持たない (補正する anchor が無い)。
+        } else if marquee_active {
             let st: &mut daw_ui_core::widgets::drag_rect::DragRectState =
                 ui.widget_state(drag_rect_wid);
             if let Some(s) = st.drag_start.as_mut() {

@@ -40,6 +40,7 @@ pub(super) mod drag;
 pub(super) mod layout;
 pub(super) mod press;
 pub(super) mod release;
+pub(super) mod xfer;
 
 // 帯の幾何 / 標識のコントラスト / グループ展開の検査。**帯を畳んだら戻せない**
 // のような「一度踏むと直すまで使えない」欠陥を機械で止めるのが主目的。
@@ -644,4 +645,31 @@ pub(super) struct LauncherSessions {
     /// 「押している間の見た目」を作れない — 量子化待ちのあいだ画面が 1px も
     /// 変わらず、押せたかどうかが分からない。
     pub live_held_button: Option<LauncherButton>,
+}
+
+/// `docs/plan_project_tabs.md` §5.6: 別タブから運んできた payload の帯側の着地先
+/// (格子の上なら行 × 列)。
+///
+/// **列 / 行の解き方は落とす側 (`view::launcher_bridge::cell_drop_target`) と同じ式**。
+/// 列は `floor((x - grid.x) / col_w + scroll)` の「セルの中」規則 — 並べ替え用の
+/// `drag::drop_scene_index` (`(rel + 0.5).floor()` = 列と列の**境界**規則 + 既存列への clamp) を
+/// 使うと、セルの右半分で 1 列右にゴーストが出て、まだ実体の無い右の列には一生出ない
+/// (落とすと `ensure_scene_at` が実体化するので、**見えている位置と落ちる位置が食い違う**)。
+/// 行はセルを持てる行だけ (マスター行 / グループ行 / レーン行は落とす側が拒否する)。
+pub(super) fn xfer_slot_at(f: &ArrangementFrame<'_>, pos: (f32, f32)) -> Option<(ArrangementRowKey, u32)> {
+    if f.launcher.grid.w <= 0.0 || !f.launcher.grid.contains(pos.0, pos.1) {
+        return None;
+    }
+    let col_w = f.launcher.col_w;
+    if col_w <= 0.0 {
+        return None;
+    }
+    let rel = (pos.0 - f.launcher.grid.x) / col_w + f.launcher.scroll_scene;
+    if rel < 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let col = rel.floor() as u32;
+    let row = layout::row_at_y(f, pos.1)?.key;
+    Some((row, col))
 }

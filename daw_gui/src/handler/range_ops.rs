@@ -92,7 +92,7 @@ impl AppData {
     /// (詰めるのは Live の "Delete Time" 相当で、今回は入れていない)。
     /// 選択範囲そのものは残す (Live と同じ — 続けて別の操作ができる)。
     pub(crate) fn apply_delete_time_selection(&mut self) {
-        let Some(sel) = self.selection.time.clone() else {
+        let Some(sel) = self.cur.selection.time.clone() else {
             return;
         };
         let follow = self.ui_prefs.automation_follows_clips;
@@ -149,12 +149,12 @@ impl AppData {
     /// even if it contains multiple clips")。 範囲内のクリップが全部ミュート済みなら
     /// 解除、1 つでも鳴っていればミュート。
     pub fn apply_mute_time_selection(&mut self) {
-        let Some(sel) = self.selection.time.clone() else {
+        let Some(sel) = self.cur.selection.time.clone() else {
             return;
         };
         // 反転方向は「1 つでも鳴っていればミュート」 (トグルの一般規約)。
         let all_muted = {
-            let song = self.song_doc.song();
+            let song = self.cur.song_doc.song();
             let refs = self.selected_clip_refs();
             !refs.is_empty()
                 && refs
@@ -232,8 +232,19 @@ impl AppData {
     /// - 範囲からはみ出したクリップは**窓を詰めて**取り込む (content は触らない)。
     /// - トラックは範囲が掛かっている行のうち最上段を 0 とした相対 index。
     pub fn copy_time_selection_clip(&self) -> Option<(String, usize)> {
-        let sel = self.selection.time.as_ref()?;
-        let song = self.song_doc.song();
+        let (clips, _, _) = self.time_selection_clips_copy()?;
+        let count = clips.len();
+        let json = self.envelope_with_media(crate::clipboard::ClipboardPayload::Clips(clips)).to_json()?;
+        Some((json, count))
+    }
+
+    /// 範囲で切ったクリップの写し (copy と、§5.6 の範囲ドラッグの昇格が共用)。
+    /// 戻りは `(写し, 範囲の先頭 = 相対拍の原点, 最上段の track index)`。
+    pub(crate) fn time_selection_clips_copy(
+        &self,
+    ) -> Option<(Vec<crate::clipboard::ClipCopy>, f64, usize)> {
+        let sel = self.cur.selection.time.as_ref()?;
+        let song = self.cur.song_doc.song();
         let mut resolved: Vec<(usize, common::model::Clip)> = Vec::new();
         for key in self.selected_clip_refs() {
             let (Some(t_idx), Some(clip)) =
@@ -278,13 +289,7 @@ impl AppData {
                 talk: c.talk,
             });
         }
-        let count = clips.len();
-        let json = crate::clipboard::ClipboardEnvelope::new(
-            song.project_id,
-            crate::clipboard::ClipboardPayload::Clips(clips),
-        )
-        .to_json()?;
-        Some((json, count))
+        Some((clips, sel.start_beat, min_track))
     }
 }
 
@@ -300,21 +305,21 @@ impl AppData {
         if delta_beats.abs() <= EPS {
             return;
         }
-        let Some(sel) = self.selection.time.clone() else {
+        let Some(sel) = self.cur.selection.time.clone() else {
             return;
         };
         // ナッジは縦に動かさないので写像は恒等。 **トラック行**だけが対象 —
         // オートメーションレーン行しか掛かっていないトラックのクリップは動かさない。
         let map: Vec<(u32, u32)> = sel.track_row_ids().map(|id| (id, id)).collect();
         // 押しっぱなしのキーリピートを 1 undo step に畳む (ノートの nudge と同じ)。
-        self.song_doc.use_stream_scope(StreamGesture::RangeNudge);
+        self.cur.song_doc.use_stream_scope(StreamGesture::RangeNudge);
         self.move_time_range(sel.start_beat, sel.end_beat, delta_beats, &map);
     }
 
     /// いま選んでいる範囲が**まさに** `[a, b)` なら、そこに入っているオートメーション
     /// レーン行を返す。 行として明示的に選ばれているので、追従設定に依らず動く / 複製される。
     fn range_automation_lanes(&self, a: f64, b: f64) -> Vec<common::model::AutomationLaneKey> {
-        self.selection
+        self.cur.selection
             .time
             .as_ref()
             .filter(|t| (t.start_beat - a).abs() < EPS && (t.end_beat - b).abs() < EPS)
@@ -358,7 +363,7 @@ impl AppData {
             return;
         }
         let follow = self.ui_prefs.automation_follows_clips;
-        let same_range = self.selection.time.as_ref().is_some_and(|t| {
+        let same_range = self.cur.selection.time.as_ref().is_some_and(|t| {
             (t.start_beat - a).abs() < EPS && (t.end_beat - b).abs() < EPS
         });
         let auto_lanes = self.range_automation_lanes(a, b);
@@ -401,7 +406,7 @@ impl AppData {
         //    選んでいなかった (= ヘッダを掴んだのが選択外のクリップ) なら、動かした
         //    先を新しい選択にする。
         if same_range {
-            if let Some(sel) = self.selection.time.as_mut() {
+            if let Some(sel) = self.cur.selection.time.as_mut() {
                 sel.start_beat += delta;
                 sel.end_beat += delta;
                 for lane in &mut sel.lanes {
@@ -421,7 +426,7 @@ impl AppData {
             }
             self.set_time_selection(TimeSelection::new(a + delta, b + delta, lanes));
         }
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 
     /// 範囲の中身を**複製**して行き先へ置く (クリップヘッダの Ctrl+ドラッグ)。
@@ -493,14 +498,14 @@ impl AppData {
             }
         }
         self.set_time_selection(TimeSelection::new(a + delta, b + delta, lanes));
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 
     /// 範囲がアクティブなときの Shift+←→ = **範囲の右端を伸縮**する
     /// (Live §6.9 "hold Shift and use the arrow keys to extend or shorten the selection")。
     /// 左端 (アンカー) は動かない。 幅がゼロ以下になる縮小は無視する。
     pub(crate) fn resize_time_selection(&mut self, delta_beats: f64) {
-        let Some(sel) = self.selection.time.as_mut() else {
+        let Some(sel) = self.cur.selection.time.as_mut() else {
             return;
         };
         let next_end = sel.end_beat + delta_beats;
@@ -633,8 +638,8 @@ impl AppData {
     /// (`ui_ephemeral.last_arrange_rows`) を使うので、折り畳み / オートメーションレーンの
     /// 展開状態がそのまま反映される。
     pub(crate) fn extend_time_selection_lanes(&mut self, dir: i32) {
-        let rows = self.ui_ephemeral.last_arrange_rows.clone();
-        let Some(sel) = self.selection.time.as_mut() else {
+        let rows = self.cur.peph.last_arrange_rows.clone();
+        let Some(sel) = self.cur.selection.time.as_mut() else {
             return;
         };
         let index_of = |row: &crate::widgets::arrangement::ArrangementRow| -> Option<usize> {
@@ -723,7 +728,7 @@ impl AppData {
     /// "…Time" コマンド群は**レーンの選択を見ない** (Live §6.11 と同じく全トラックに効く)
     /// — 見るのは時間区間だけ。
     fn time_ops_range(&mut self) -> Option<(f64, f64)> {
-        match self.selection.time.as_ref() {
+        match self.cur.selection.time.as_ref() {
             Some(sel) if sel.len_beats() > EPS => Some((sel.start_beat, sel.end_beat)),
             _ => {
                 self.ui_ephemeral.status_message =
@@ -736,9 +741,11 @@ impl AppData {
     /// Cut Time / Paste Time が運ぶ **全トラック** の時間ごとの写しを clipboard JSON に。
     /// 範囲が無ければ `None`。
     pub fn copy_time_clip(&self) -> Option<(String, common::model::TimeRangeCopy)> {
-        let sel = self.selection.time.as_ref()?;
-        let song = self.song_doc.song();
-        let copy = song.copy_time_range(sel.start_beat, sel.end_beat)?;
+        let sel = self.cur.selection.time.as_ref()?;
+        let song = self.cur.song_doc.song();
+        let mut copy = song.copy_time_range(sel.start_beat, sel.end_beat)?;
+        // 媒体の写しは別プロジェクトのフォルダで解けるよう絶対パスに。
+        copy.media.absolutize(self.project_dir().as_deref());
         let json = crate::clipboard::ClipboardEnvelope::new(
             song.project_id,
             crate::clipboard::ClipboardPayload::Time(copy.clone()),
@@ -799,12 +806,12 @@ impl AppData {
     /// 貼った時間が新しい範囲選択になる。
     pub(crate) fn paste_time(&mut self, copy: &common::model::TimeRangeCopy, source_project_id: u64) {
         let Some((a, _)) = self.time_ops_range() else { return };
-        let same_project = source_project_id == self.song_doc.song().project_id;
+        let same_project = source_project_id == self.cur.song_doc.song().project_id;
         let changed = self.edit_song_rippling(|song| {
             song.paste_time_range(a, copy, same_project).map(|p| p.ripple).into_iter().collect()
         });
         if changed {
-            let lanes = self.selection.time.as_ref().map(|t| t.lanes.clone()).unwrap_or_default();
+            let lanes = self.cur.selection.time.as_ref().map(|t| t.lanes.clone()).unwrap_or_default();
             self.set_time_selection(TimeSelection::new(a, a + copy.span_beats, lanes));
             self.ui_ephemeral.status_message = format!("時間を貼り付け: {:.2} 拍", copy.span_beats);
         }
@@ -813,7 +820,7 @@ impl AppData {
     /// 範囲選択を `delta` 拍ずらす (レーン集合はそのまま)。
     fn shift_time_selection(&mut self, delta: f64) {
         let next = self
-            .selection
+            .cur.selection
             .time
             .as_ref()
             .and_then(|t| TimeSelection::new(t.start_beat + delta, t.end_beat + delta, t.lanes.clone()));

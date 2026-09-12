@@ -4,7 +4,8 @@
 //! The two processes each spawn N worker threads in 1:1 pairs. When audio
 //! engine `worker[i]` wants `plugin_host worker[i]` to call
 //! `plugin.process()` for a particular plugin instance, it writes the
-//! stable **device id** (v29, `PluginInstance::id`) into `worker_task[i]`
+//! instance's **token** (`protocol::InstanceToken`, plugin_host 採番・非再利用。
+//! `device_id` は project をまたいで衝突するので使わない) into `worker_task[i]`
 //! (Release), then signals `worker_wake[i]` (a Win32 named event). The
 //! plugin-host worker reads the slot (Acquire) after waking, runs
 //! `process()`, and signals `worker_done[i]`.
@@ -20,7 +21,7 @@ pub const MAX_WORKERS: usize = 32;
 
 #[repr(C)]
 pub struct WorkerBridge {
-    /// `worker_task[i]` is the stable device id audio-engine `worker[i]`
+    /// `worker_task[i]` is the `InstanceToken` audio-engine `worker[i]`
     /// is asking plugin-host `worker[i]` to process this dispatch.
     /// `u64::MAX` means "idle, ignore" (used during shutdown wake).
     pub worker_task: [AtomicU64; MAX_WORKERS],

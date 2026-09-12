@@ -9,12 +9,12 @@ impl AppData {
     /// `target` clip の first event の `reversed` 値を読む。 audio で
     /// ない / event が空 / 範囲外なら `false`。 メニューの toggle 用。
     pub(crate) fn is_clip_audio_event_reversed(&self, target: ClipKey) -> bool {
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .and_then(|c| {
                 if let Some(common::model::ClipContent::Audio(audio)) =
-                    self.song_doc.song().clip_contents.get(&c.content_id)
+                    self.cur.song_doc.song().clip_contents.get(&c.content_id)
                 {
                     audio.events.first().map(|e| e.reversed)
                 } else {
@@ -37,7 +37,7 @@ impl AppData {
     pub fn all_clips_muted(&self, targets: &[ClipKey]) -> bool {
         !targets.is_empty()
             && targets.iter().all(|t| {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .track_by_id(t.track_id)
                     .and_then(|tr| tr.clip_by_id(t.clip_id))
                     .is_some_and(|c| c.muted)
@@ -57,10 +57,10 @@ impl AppData {
             let Some((r, local)) = Self::decode_note_id_in(&shown, id) else {
                 return false;
             };
-            self.song_doc.song()
+            self.cur.song_doc.song()
                 .track_by_id(r.track_id)
                 .and_then(|t| t.clip_by_id(r.clip_id))
-                .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.muted))
+                .and_then(|c| self.cur.song_doc.song().clip_notes(c).get(local).map(|n| n.muted))
                 .unwrap_or(false)
         })
     }
@@ -140,14 +140,14 @@ impl AppData {
     /// (= uniform stretch のまま)。 OFF-RT。 buffer 未 decode の event は skip。
     pub(crate) fn auto_warp_clip(&mut self, target: ClipKey) {
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
         };
-        let n_events = match self.song_doc.song().clip_contents.get(&content_id) {
+        let n_events = match self.cur.song_doc.song().clip_contents.get(&content_id) {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return,
         };
@@ -156,7 +156,7 @@ impl AppData {
         // Phase A: 対象 event の source range + 配置 beat 長 (immutable borrow)。
         let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64, f64)> = Vec::new();
         if let Some(common::model::ClipContent::Audio(a)) =
-            self.song_doc.song().clip_contents.get(&content_id)
+            self.cur.song_doc.song().clip_contents.get(&content_id)
         {
             for &i in &indices {
                 if let Some(e) = a.events.get(i) {
@@ -177,7 +177,7 @@ impl AppData {
         // Phase B: onset 検出 → grid snap warp markers (OFF-RT)。
         let mut results: Vec<(usize, Vec<common::model::BeatMarker>)> = Vec::new();
         for (i, source_id, start, end, length_beats) in jobs {
-            let Some(buf) = self.media.audio_source_cache.get(source_id) else {
+            let Some(buf) = self.cur.media.audio_source_cache.get(source_id) else {
                 continue;
             };
             let s = start.min(buf.frames) as usize;
@@ -233,14 +233,14 @@ impl AppData {
     /// scan)。 buffer 未 decode の event は skip (= 空 onsets で Raw 等価のまま)。
     pub(crate) fn detect_onsets_for_clip(&mut self, target: ClipKey) {
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return;
         };
-        let n_events = match self.song_doc.song().clip_contents.get(&content_id) {
+        let n_events = match self.cur.song_doc.song().clip_contents.get(&content_id) {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return,
         };
@@ -250,7 +250,7 @@ impl AppData {
         // (immutable borrow)。
         let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64)> = Vec::new();
         if let Some(common::model::ClipContent::Audio(a)) =
-            self.song_doc.song().clip_contents.get(&content_id)
+            self.cur.song_doc.song().clip_contents.get(&content_id)
         {
             for &i in &indices {
                 if let Some(e) = a.events.get(i)
@@ -267,7 +267,7 @@ impl AppData {
         // Phase B: decoded buffer を mono downmix して OFF-RT 検出。
         let mut results: Vec<(usize, Vec<u64>)> = Vec::new();
         for (i, source_id, start, end) in jobs {
-            let Some(buf) = self.media.audio_source_cache.get(source_id) else {
+            let Some(buf) = self.cur.media.audio_source_cache.get(source_id) else {
                 continue;
             };
             let start = start.min(buf.frames) as usize;
@@ -340,12 +340,12 @@ impl AppData {
     /// 呼ばれる)。 target が audio clip を解決できなければ `None` 化する。
     pub(crate) fn resync_clip_audio_event_edit_buffers(&mut self, target: ClipKey) {
         let resolved = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
+            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
             .is_some_and(|content| matches!(content, common::model::ClipContent::Audio(_)));
-        self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
+        self.cur.peph.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
 
@@ -363,7 +363,7 @@ impl AppData {
         f: impl FnOnce(common::model::EventFade) -> common::model::EventFade,
     ) {
         let Some(content_id) = self
-            .song_doc
+            .cur.song_doc
             .song()
             .track_by_id(target.clip.track_id)
             .and_then(|t| t.clip_by_id(target.clip.clip_id))
@@ -477,7 +477,7 @@ impl AppData {
         F: FnMut(&mut common::model::TextEvent),
     {
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -675,7 +675,7 @@ impl AppData {
         let Some(target) = self.selected_clip_ref() else {
             return;
         };
-        let value = self.ui_ephemeral.clip_text_content_edit_text.clone();
+        let value = self.cur.peph.clip_text_content_edit_text.clone();
         self.set_clip_text_event_content(target, value);
     }
 
@@ -683,7 +683,7 @@ impl AppData {
         let Some(target) = self.selected_clip_ref() else {
             return;
         };
-        let value = self.ui_ephemeral.clip_text_font_family_edit_text.clone();
+        let value = self.cur.peph.clip_text_font_family_edit_text.clone();
         self.set_clip_text_event_font_family(target, value);
     }
 
@@ -692,10 +692,10 @@ impl AppData {
     /// 編集対象 text クリップの現在のフォント名 (先頭 event)。text クリップで
     /// なければ `None`。
     pub(crate) fn clip_text_font_family(&self, target: ClipKey) -> Option<String> {
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
+            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
             .map(|e| e.font_family.clone())
@@ -720,7 +720,7 @@ impl AppData {
         // プレビュー/commit は squash されて **1 undo で元に戻る**。 bracket が無いと
         // hover ごとに fresh gesture id → プレビュー 1 回ごとに undo step が積まれ、
         // commit も元を復元しない (M3)。 commit / cancel で end_gesture する。
-        self.song_doc.begin_gesture();
+        self.cur.song_doc.begin_gesture();
         self.refresh_font_picker_visible();
         // システムフォント列挙は重い (~20-860ms) ので background で 1 度だけ。
         if self.ui_ephemeral.font_picker_families.is_empty() && !self.ui_ephemeral.font_picker_loading {
@@ -810,7 +810,7 @@ impl AppData {
         self.ui_ephemeral.font_picker_target = None;
         self.ui_ephemeral.is_font_picker_open = false;
         // session gesture を閉じる (open_font_picker の begin_gesture と対)。
-        self.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture();
     }
 
     pub(crate) fn close_font_picker(&mut self) {
@@ -823,7 +823,7 @@ impl AppData {
         self.ui_ephemeral.font_picker_target = None;
         // session gesture を閉じる (open_font_picker の begin_gesture と対)。
         // commit 済み (target 既に None) でも呼ぶ: begin/end を必ず対にする。
-        self.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture();
     }
 
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane
@@ -834,22 +834,22 @@ impl AppData {
     /// `clip_edit_buffer_target` を `None`。
     pub(crate) fn resync_clip_text_event_edit_buffers(&mut self, target: ClipKey) {
         let event_snapshot = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
+            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
             .cloned();
         let Some(ev) = event_snapshot else {
-            self.ui_ephemeral.clip_text_content_edit_text.clear();
-            self.ui_ephemeral.clip_text_font_family_edit_text.clear();
-            self.ui_ephemeral.clip_edit_buffer_target = None;
+            self.cur.peph.clip_text_content_edit_text.clear();
+            self.cur.peph.clip_text_font_family_edit_text.clear();
+            self.cur.peph.clip_edit_buffer_target = None;
             return;
         };
-        self.ui_ephemeral.clip_text_content_edit_text = ev.text.clone();
-        self.ui_ephemeral.clip_text_font_family_edit_text = ev.font_family.clone();
-        self.ui_ephemeral.clip_edit_buffer_target = Some(target);
+        self.cur.peph.clip_text_content_edit_text = ev.text.clone();
+        self.cur.peph.clip_text_font_family_edit_text = ev.font_family.clone();
+        self.cur.peph.clip_edit_buffer_target = Some(target);
     }
 
     /// docs/plan_text_overlay.md §4 P5: text inspector が表示する
@@ -859,10 +859,10 @@ impl AppData {
     /// 存在するか。
     pub fn inspector_text_event_summary(&self) -> Option<InspectorTextEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song_doc.song().track_by_id(cref.track_id)?;
+        let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
         let clip = track.clip_by_id(cref.clip_id)?;
         let common::model::ClipContent::Text(t) =
-            self.song_doc.song().clip_contents.get(&clip.content_id)?
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -924,25 +924,25 @@ impl AppData {
     /// が image clip を解決できなければ `None` 化する。
     pub(crate) fn resync_clip_image_event_edit_buffers(&mut self, target: ClipKey) {
         let resolved = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
+            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
             .is_some_and(|content| matches!(content, common::model::ClipContent::Image(_)));
-        self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
+        self.cur.peph.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
     /// `target` が指す clip が `ClipContent::Image` か。 commit / fade /
     /// mute handler の kind dispatch で使う。 範囲外 / 別 variant は false。
     pub fn is_image_clip(&self, target: ClipKey) -> bool {
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
         let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         matches!(
-            self.song_doc.song().clip_contents.get(&clip.content_id),
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Image(_))
         )
     }
@@ -950,14 +950,14 @@ impl AppData {
     /// audio clip 判定。 `target` が指す clip が `ClipContent::Audio` か。
     /// MIDI / Vocal / 範囲外は false。 Audio Editor の open 判定で使う。
     pub fn is_audio_clip(&self, target: ClipKey) -> bool {
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
         let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         matches!(
-            self.song_doc.song().clip_contents.get(&clip.content_id),
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Audio(_))
         )
     }
@@ -965,14 +965,14 @@ impl AppData {
     /// ピアノロール対象 (= MIDI content) クリップか。歌唱 (VOICEVOX) クリップも
     /// MIDI content なので true (歌詞付き note としてピアノロールに出る)。範囲外 / 非 MIDI は false。
     pub fn is_midi_clip(&self, target: ClipKey) -> bool {
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return false;
         };
         let Some(clip) = track.clip_by_id(target.clip_id) else {
             return false;
         };
         matches!(
-            self.song_doc.song().clip_contents.get(&clip.content_id),
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Midi(_))
         )
     }

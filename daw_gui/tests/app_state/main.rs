@@ -28,6 +28,7 @@ mod modulation_id_hygiene;
 mod open_stays_clean;
 mod pending_state_queue;
 mod plugin_load_failure;
+mod project_tabs;
 mod parallel;
 mod range_edit;
 mod shutdown_sequence;

@@ -785,6 +785,11 @@ mod rt_assert_tests {
         let mut render_seq = 0u64;
         let name = format!("daw01-rt-launcher-{}", std::process::id());
         let bridge = common::audio_bridge::AudioBridgeHandle::create(&name).expect("bridge");
+        // `docs/plan_project_tabs.md` §3: telemetry は project ごとの slot に書く。
+        let slot = bridge
+            .claim_project_slot(common::protocol::ProjectKey(1))
+            .expect("project slot");
+        let telemetry = bridge.project(slot);
 
         // 1 buffer 目は行の生成 (`Vec::push`) を含むので検査の外で回す。
         rt.update(&song, BufferSpan::new(0.0, 120.0, 48_000, 512), LaunchQuantize::Off, true);
@@ -812,7 +817,7 @@ mod rt_assert_tests {
                 }
                 let span = BufferSpan::new(beat, 120.0, 48_000, 512);
                 rt.update(&song, span, LaunchQuantize::Off, true);
-                rt.publish(&bridge, span.start_beat);
+                rt.publish(telemetry, span.start_beat);
                 let src = rt.rows().track_row(0);
                 out.clear();
                 collect_row_midi(

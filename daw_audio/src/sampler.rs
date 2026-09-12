@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use common::model::{Song, TapPoint};
-use common::protocol::{PreviewNote, SamplerSource};
+use common::protocol::{PreviewNote, ProjectKey, SamplerSource};
 use common::sampler_ring::{SEGMENT_RESYNC_FRAMES, SamplerRingHandle, SegmentInfo};
 
 use crate::mixer::TrackScratch;
@@ -31,7 +31,7 @@ const PREVIEW_FADE_FRAMES: u64 = 240;
 /// MIDI 試聴で同時に鳴らせるノート数の上限 (事前確保)。
 const PREVIEW_SEQ_ACTIVE_CAP: usize = 256;
 
-/// MIDI 試聴シーケンス。recv loop が `engine_shared.preview_sequence` のミラーへ載せ、
+/// MIDI 試聴シーケンス。recv loop が `ProjectShared::preview_sequence` のミラーへ載せ、
 /// `RtBundle` の snapshot field で RT へ届く (旧 Arc は recycle で off-thread drop —
 /// RT が `ArcSwap` を load すると最終 drop が RT で起きうるので使わない)。
 pub struct PreviewSequence {
@@ -65,13 +65,21 @@ pub struct SamplerRt {
     last_segment_frame: u64,
     /// リングの試聴 `(start, end, cursor)`。
     preview: Option<(u64, u64, u64)>,
-    /// 直前 buffer で snapshot を強制した track index (次 buffer で下ろす)。
-    forced_track: Option<usize>,
-    /// MIDI 試聴の進行 `(generation, 開始時の frames_rendered, 次に撃つ index)`。
-    seq_cursor: Option<(u64, u64, usize)>,
-    /// 最後まで鳴らし終えた generation。同じ generation が bundle に残っていても
-    /// 先頭からやり直さない (GUI が Stop を送るまでの間の無限ループ防止)。
-    seq_done: Option<u64>,
+    /// MIDI 試聴の進行 `(持ち主の project, generation, 開始時の frames_rendered,
+    /// 次に撃つ index)`。
+    ///
+    /// **持ち主を覚えるのはタブが複数あるから** (`docs/plan_project_tabs.md` §5.5)。
+    /// この走行状態は装置に 1 つで、`step_preview_sequence` は開いている project の
+    /// 数だけ毎 buffer 呼ばれる。持ち主を見ずに畳むと、試聴していない別タブの buffer が
+    /// 毎回 cursor を捨て、試聴が頭から鳴り直し続ける。
+    seq_cursor: Option<(ProjectKey, u64, u64, usize)>,
+    /// 最後まで鳴らし終えた `(project, generation)` を **project ごとに** 持つ。
+    /// 同じ generation が bundle に残っていても先頭からやり直さない (GUI が Stop を
+    /// 送るまでの間の無限ループ防止)。
+    ///
+    /// 装置に 1 つだと、2 つのタブが試聴を終えた状態で **互いの「鳴らし終えた」印を
+    /// 上書きし合い、両方が延々と鳴り直す**。固定長なので RT で確保しない。
+    seq_done: [Option<(ProjectKey, u64)>; common::audio_bridge::MAX_PROJECTS],
     /// MIDI 試聴で鳴っているノート `(off の絶対 frame, track id, pitch)`。
     seq_active: Vec<(u64, u32, u8)>,
 }
@@ -89,10 +97,27 @@ impl SamplerRt {
             expected_playhead: u64::MAX,
             last_segment_frame: 0,
             preview: None,
-            forced_track: None,
             seq_cursor: None,
-            seq_done: None,
+            seq_done: [None; common::audio_bridge::MAX_PROJECTS],
             seq_active: Vec::with_capacity(PREVIEW_SEQ_ACTIVE_CAP),
+        }
+    }
+
+    /// project が閉じた: その project が握っていた試聴の走行状態を降ろす。
+    ///
+    /// 降ろさないと `seq_cursor` の持ち主が居ないまま残り、**以後どのタブも
+    /// 試聴できない** (割り込まない規則なので誰も持ち主になれない)。撤去済み
+    /// project の scratch はもう無いので note-off は撃てない (撃つ先が無い)。
+    /// RT から呼ぶ: 確保・解放・ロック無し。
+    pub fn forget_project(&mut self, key: ProjectKey) {
+        if self.seq_cursor.is_some_and(|c| c.0 == key) {
+            self.seq_cursor = None;
+            self.seq_active.clear();
+        }
+        for slot in &mut self.seq_done {
+            if slot.is_some_and(|(p, _)| p == key) {
+                *slot = None;
+            }
         }
     }
 
@@ -120,14 +145,16 @@ impl SamplerRt {
         song: Option<&Song>,
         scratch: &mut [TrackScratch],
     ) {
-        if let Some(i) = self.forced_track.take()
-            && let Some(s) = scratch.get_mut(i)
-        {
+        // **毎 buffer 全部下ろしてから立て直す** (`docs/plan_project_tabs.md` §5.5)。
+        // 「直前に立てた行」を 1 つだけ覚えて次の buffer で下ろす形だと、タブが複数
+        // あるときに *別 project の* scratch を下ろしてしまい、録音源の行は立ったまま
+        // 残る (毎 buffer 要らない snapshot を取り続ける)。bool を 32 個書くだけ。
+        for s in scratch.iter_mut() {
             s.force_prefx_snapshot = false;
             s.force_prefader_snapshot = false;
         }
         let Some(rig) = rig else { return };
-        let SamplerSource::Track(tap) = rig.source else { return };
+        let SamplerSource::Track { tap, .. } = rig.source else { return };
         // r.md #110: chain source は Global Sampler の対象外 (picker が track だけを出す)。
         let Some(idx) = song.and_then(|s| tap.source_track().and_then(|t| track_index(s, t))) else { return };
         let Some(s) = scratch.get_mut(idx) else { return };
@@ -136,7 +163,6 @@ impl SamplerRt {
             TapPoint::PostFx => s.force_prefader_snapshot = true,
             TapPoint::PostFader => {}
         }
-        self.forced_track = Some(idx);
     }
 
     /// 録音源の 1 buffer をリングへ書き、必要ならセグメントを押す。
@@ -176,7 +202,7 @@ impl SamplerRt {
 
         match rig.source {
             SamplerSource::Master => rig.ring.write_block(&master_l[..n], &master_r[..n]),
-            SamplerSource::Track(tap) => {
+            SamplerSource::Track { tap, .. } => {
                 let bufs = song
                     .and_then(|s| tap.source_track().and_then(|t| track_index(s, t)))
                     .and_then(|i| scratch.get(i))
@@ -221,25 +247,35 @@ impl SamplerRt {
     /// (`None` = 停止要求)。`frames_rendered` は buffer 頭の累積フレーム。
     pub fn step_preview_sequence(
         &mut self,
+        project: ProjectKey,
         seq: Option<&PreviewSequence>,
         song: Option<&Song>,
         scratch: &mut [TrackScratch],
         frames_rendered: u64,
         n: usize,
     ) {
+        let owner = self.seq_cursor.map(|c| c.0);
         let Some(seq) = seq else {
-            if self.seq_cursor.is_some() || !self.seq_active.is_empty() {
+            // **持ち主のタブの buffer でだけ畳む。** 試聴していない別タブの buffer で
+            // 消すと、毎 buffer 走行状態が捨てられて頭から鳴り直す。
+            if owner == Some(project) && (self.seq_cursor.is_some() || !self.seq_active.is_empty()) {
                 self.release_all(song, scratch);
                 self.seq_cursor = None;
             }
-            self.seq_done = None;
+            if let Some(slot) = self.seq_done.iter_mut().find(|s| s.is_some_and(|(p, _)| p == project)) {
+                *slot = None;
+            }
             return;
         };
-        if self.seq_done == Some(seq.generation) {
+        // 試聴は装置に 1 つ。別のタブが鳴らしている間は割り込まない。
+        if owner.is_some_and(|p| p != project) {
+            return;
+        }
+        if self.seq_done.contains(&Some((project, seq.generation))) {
             return;
         }
         let (generation, started, mut next) = match self.seq_cursor {
-            Some(c) if c.0 == seq.generation => c,
+            Some((p, g, started, next)) if p == project && g == seq.generation => (g, started, next),
             _ => {
                 // 新しいシーケンス: 鳴っている前のノートは消してから始める。
                 self.release_all(song, scratch);
@@ -253,7 +289,7 @@ impl SamplerRt {
         let Some(track_idx) = song.and_then(|s| track_index(s, seq.track_id)) else {
             self.release_all(song, scratch);
             self.seq_cursor = None;
-            self.seq_done = Some(seq.generation);
+            self.mark_seq_done(project, seq.generation);
             return;
         };
         while let Some(note) = seq.notes.get(next) {
@@ -280,9 +316,23 @@ impl SamplerRt {
         let finished = next >= seq.notes.len() && self.seq_active.is_empty();
         if finished {
             self.seq_cursor = None;
-            self.seq_done = Some(generation);
+            self.mark_seq_done(project, generation);
         } else {
-            self.seq_cursor = Some((generation, started, next));
+            self.seq_cursor = Some((project, generation, started, next));
+        }
+    }
+
+    /// 「この project のこの generation は鳴らし終えた」を記録する。
+    /// その project の枠があれば上書き、無ければ空き枠へ。空きが無ければ諦める
+    /// (= 次の buffer で鳴り直すだけ。RT で確保しないことを優先する)。
+    fn mark_seq_done(&mut self, project: ProjectKey, generation: u64) {
+        let at = self
+            .seq_done
+            .iter()
+            .position(|s| s.is_some_and(|(p, _)| p == project))
+            .or_else(|| self.seq_done.iter().position(Option::is_none));
+        if let Some(i) = at {
+            self.seq_done[i] = Some((project, generation));
         }
     }
 
@@ -307,20 +357,17 @@ impl SamplerRt {
     }
 }
 
-/// recv loop (IPC スレッド) の sampler 系コマンド処理。RT には触らない。
+/// recv loop (IPC スレッド) の Global Sampler コマンド処理 (デバイス全体)。RT には触らない。
 ///
 /// - `OpenSamplerRing`: daw_gui が create したリングを open し、`engine_shared.sampler`
-///   のミラーへ載せて `republish` (= bundle の snapshot field で RT へ届く、worker rig
-///   と同じ経路)。open 失敗は warn して従来のリングを据え置く。
-/// - `PreviewSequence` / `PreviewSequenceStop`: 同じくミラー + `republish`。track は
-///   安定 id のまま運び、RT が buffer ごとに解く。
-pub fn handle_command(
+///   のミラーへ載せる。戻り値 `true` = ミラーが変わったので呼び側が
+///   [`crate::engine::DeviceBundle`] を再 publish する (worker rig と同じ経路)。
+///   open 失敗は warn して従来のリングを据え置く。
+pub fn handle_device_command(
     cmd: common::protocol::AudioCommand,
     engine_shared: &crate::engine::EngineShared,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::engine::EngineCommand>,
-    seq_generation: &mut u64,
-    republish: &mut dyn FnMut(),
-) {
+) -> bool {
     use common::protocol::AudioCommand as C;
     use crate::engine::EngineCommand as E;
     match cmd {
@@ -330,30 +377,51 @@ pub fn handle_command(
                 engine_shared
                     .sampler
                     .store(Some(Arc::new(SamplerRig { ring: Arc::new(ring), source })));
-                republish();
+                true
             }
-            Err(e) => tracing::warn!(error = ?e, %shmem_id, "failed to open sampler ring"),
+            Err(e) => {
+                tracing::warn!(error = ?e, %shmem_id, "failed to open sampler ring");
+                false
+            }
         },
         C::SamplerPreview { start_frame, end_frame } => {
             let _ = cmd_tx.send(E::SamplerPreview { start: start_frame, end: end_frame });
+            false
         }
         C::SamplerPreviewStop => {
             let _ = cmd_tx.send(E::SamplerPreviewStop);
+            false
         }
-        C::PreviewSequence { track_id, notes } => {
+        _ => false,
+    }
+}
+
+/// recv loop の MIDI Capture 試聴コマンド処理 (project ごと)。
+///
+/// `PreviewSequence` / `PreviewSequenceStop`: `ProjectShared::preview_sequence` のミラーを
+/// 差し替える。戻り値 `true` = 呼び側が bundle を再 publish する (snapshot field で
+/// RT へ届く)。track は安定 id のまま運び、RT が buffer ごとに解く。
+pub fn handle_project_command(
+    cmd: common::protocol::AudioCommand,
+    project: &crate::engine::ProjectShared,
+    seq_generation: &mut u64,
+) -> bool {
+    use common::protocol::AudioCommand as C;
+    match cmd {
+        C::PreviewSequence { track_id, notes, .. } => {
             *seq_generation += 1;
-            engine_shared.preview_sequence.store(Some(Arc::new(PreviewSequence {
+            project.preview_sequence.store(Some(Arc::new(PreviewSequence {
                 track_id,
                 notes,
                 generation: *seq_generation,
             })));
-            republish();
+            true
         }
-        C::PreviewSequenceStop => {
-            engine_shared.preview_sequence.store(None);
-            republish();
+        C::PreviewSequenceStop { .. } => {
+            project.preview_sequence.store(None);
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -488,6 +556,11 @@ mod tests {
         assert!(rt.preview.is_none());
     }
 
+    /// 試聴の持ち主のタブ。
+    const PK: ProjectKey = ProjectKey(1);
+    /// 試聴していない別のタブ。
+    const OTHER: ProjectKey = ProjectKey(2);
+
     /// track id 1 だけを持つ song (試聴の id → index 解決用)。
     /// `Track` は private field を持つので default + mutate で組む (engine.rs と同じ)。
     #[allow(clippy::field_reassign_with_default)]
@@ -513,27 +586,58 @@ mod tests {
             generation: 1,
         };
         // buffer 0: [0, 32) → note 60 on
-        rt.step_preview_sequence(Some(&seq), Some(&song), &mut scratch, 0, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 0, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(ev.as_slice(), [NoteTransition::On { key: 60, .. }]));
         // buffer 1: [32, 64) → 60 off (期限 25) と 62 on
-        rt.step_preview_sequence(Some(&seq), Some(&song), &mut scratch, 32, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 32, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(
             ev.as_slice(),
             [NoteTransition::Off { key: 60, .. }, NoteTransition::On { key: 62, .. }]
         ));
         // buffer 2: 62 off (期限 45) → 完了
-        rt.step_preview_sequence(Some(&seq), Some(&song), &mut scratch, 64, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 64, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(ev.as_slice(), [NoteTransition::Off { key: 62, .. }]));
         assert!(rt.seq_cursor.is_none());
         // 同じ generation が bundle に残っていても先頭からやり直さない (無限ループ防止)
-        rt.step_preview_sequence(Some(&seq), Some(&song), &mut scratch, 96, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 96, 32);
         assert!(scratch[0].state.pending_preview.is_empty());
         // 停止要求で鳴っているものが無ければ何も出ない
-        rt.step_preview_sequence(None, Some(&song), &mut scratch, 128, 32);
+        rt.step_preview_sequence(PK, None, Some(&song), &mut scratch, 128, 32);
         assert!(scratch[0].state.pending_preview.is_empty());
+    }
+
+    /// `docs/plan_project_tabs.md` §5.5: 走行状態は装置に 1 つで、この関数は
+    /// **開いているタブの数だけ**毎 buffer 呼ばれる。試聴していないタブの buffer
+    /// (= `seq` が `None`) が持ち主の cursor を捨てると、毎 buffer 頭から鳴り直す。
+    #[test]
+    fn preview_sequence_survives_other_tabs_buffers() {
+        let song = song();
+        let mut rt = SamplerRt::new();
+        let mut scratch = vec![TrackScratch::new()];
+        let seq = PreviewSequence {
+            track_id: 1,
+            notes: vec![
+                PreviewNote { offset_frames: 5, duration_frames: 20, pitch: 60, velocity: 100 },
+                PreviewNote { offset_frames: 40, duration_frames: 5, pitch: 62, velocity: 64 },
+            ],
+            generation: 1,
+        };
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 0, 32);
+        take_events(&mut scratch[0]);
+        // 別タブの buffer (試聴していない) が挟まる。
+        rt.step_preview_sequence(OTHER, None, Some(&song), &mut scratch, 0, 32);
+        assert!(scratch[0].state.pending_preview.is_empty(), "別タブの buffer は何も出さない");
+        assert!(rt.seq_cursor.is_some(), "持ち主の走行状態が残る");
+        // 持ち主の次の buffer は続きから (60 の off と 62 の on)。頭から鳴り直さない。
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 32, 32);
+        let ev = take_events(&mut scratch[0]);
+        assert!(matches!(
+            ev.as_slice(),
+            [NoteTransition::Off { key: 60, .. }, NoteTransition::On { key: 62, .. }]
+        ));
     }
 
     #[test]
@@ -546,9 +650,9 @@ mod tests {
             notes: vec![PreviewNote { offset_frames: 0, duration_frames: 1000, pitch: 60, velocity: 100 }],
             generation: 7,
         };
-        rt.step_preview_sequence(Some(&seq), Some(&song), &mut scratch, 0, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 0, 32);
         scratch[0].state.pending_preview.clear();
-        rt.step_preview_sequence(None, Some(&song), &mut scratch, 32, 32);
+        rt.step_preview_sequence(PK, None, Some(&song), &mut scratch, 32, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(ev.as_slice(), [NoteTransition::Off { key: 60, .. }]));
     }

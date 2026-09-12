@@ -60,7 +60,7 @@ pub(super) fn press(
         state.playhead_drag = Some(PlayheadDragSession {
             last_mouse_x: px,
             last_emitted_beat: snapped,
-            anchor_beat: app.transport.playhead_beat.map(f64::from),
+            anchor_beat: app.cur.transport.playhead_beat.map(f64::from),
         });
         Some(snapped)
     }

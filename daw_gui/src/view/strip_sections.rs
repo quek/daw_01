@@ -102,8 +102,8 @@ struct StripCtx<'a> {
 #[must_use]
 pub fn head_height(app: &AppData) -> f32 {
     THUMB_H
-        + if app.ui_prefs.strip_comp_open { COMP_H } else { 0.0 }
-        + if app.ui_prefs.strip_eq_open { EQ_H } else { 0.0 }
+        + if app.cur.view.strip_comp_open { COMP_H } else { 0.0 }
+        + if app.cur.view.strip_eq_open { EQ_H } else { 0.0 }
 }
 
 /// 帯を描く。`rect` は strip 全体の矩形で、上端から [`head_height`] 分を使う。
@@ -116,7 +116,7 @@ pub fn draw_head(
     bg: Color,
     gain_reduction_db: f32,
 ) {
-    let Some(track) = app.song_doc.song().track_by_id(track_id) else {
+    let Some(track) = app.cur.song_doc.song().track_by_id(track_id) else {
         return;
     };
     let ctx = StripCtx {
@@ -144,14 +144,14 @@ pub fn draw_head(
         }
     };
 
-    if app.ui_prefs.strip_comp_open {
+    if app.cur.view.strip_comp_open {
         let sect = Rect { y, h: COMP_H, ..inner };
         draw_comp_section(&ctx, ui, sect);
         hit(sect, StripSection::Comp, &mut hovered);
         y += COMP_H;
         separator(ui, app, rect, y);
     }
-    if app.ui_prefs.strip_eq_open {
+    if app.cur.view.strip_eq_open {
         let sect = Rect { y, h: EQ_H, ..inner };
         draw_eq_section(&ctx, ui, sect);
         hit(sect, StripSection::Eq, &mut hovered);
@@ -176,14 +176,14 @@ fn publish_hover(
     track_id: u32,
     hovered: Option<StripSection>,
 ) {
-    let current = app.ui_ephemeral.mixer_hovered_strip_section;
+    let current = app.cur.peph.mixer_hovered_strip_section;
     let next = hovered.map(|s| (track_id, s));
     let mine = current.is_some_and(|(t, _)| t == track_id);
     if next == current || (next.is_none() && !mine) {
         return;
     }
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.ui_ephemeral.mixer_hovered_strip_section = next;
+        app.cur.peph.mixer_hovered_strip_section = next;
     }));
 }
 
@@ -669,7 +669,7 @@ fn strip_knob(
 
     let m = build_mod(app, target.clone(), f64::from(norm), ModControlDomain::Norm, track_id);
     let was_dragging = app
-        .recording
+        .cur.recording
         .active_param_gestures
         .contains(&(track_id, target.clone()));
     let resp = ui.knob_at(

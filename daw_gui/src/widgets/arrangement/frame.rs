@@ -83,6 +83,13 @@ pub(super) struct ArrangementFrame<'a> {
     pub hover_pos: Option<(f32, f32)>,
 }
 
+/// retained state (`ArrangementState`) の id。`docs/plan_project_tabs.md` §5.6: タブごとに
+/// 独立 (root がタブを閉じたときに `Ui::remove_widget_state` で捨てる)。
+#[must_use]
+pub fn arrangement_state_id(project: common::protocol::ProjectKey) -> WidgetId {
+    WidgetId::ROOT.child((b"arrangement_widget", &"arrangement", project.0))
+}
+
 /// `BuiltArrangement` + caller の `area` + `ui` の pointer スナップショットから 1 フレームの
 /// 地形を組む。
 pub(super) fn build<'a>(
@@ -103,7 +110,7 @@ pub(super) fn build<'a>(
     let master_row: Option<&ArrangementMasterRow> = Some(&built.master_row);
     let rect = area;
     let id = "arrangement";
-    let wid = WidgetId::ROOT.child((b"arrangement_widget", &id));
+    let wid = arrangement_state_id(built.project);
     let pointer = ui.pointer();
 
     // ---- rect 分割 ----
@@ -235,16 +242,16 @@ pub(super) fn mirror_layout(
     response: &mut ArrangementResponse,
 ) {
     let lanes_size = (f.lanes.w, f.lanes.h);
-    if app.ui_ephemeral.last_arrange_lanes_size != lanes_size {
+    if app.cur.peph.last_arrange_lanes_size != lanes_size {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.last_arrange_lanes_size = lanes_size;
+            app.cur.peph.last_arrange_lanes_size = lanes_size;
         }));
     }
     let rows = f.rows.clone();
-    if app.ui_ephemeral.last_arrange_rows != rows {
+    if app.cur.peph.last_arrange_rows != rows {
         let next = rows.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.last_arrange_rows = next;
+            app.cur.peph.last_arrange_rows = next;
         }));
     }
     response.arranger_rect = f.arranger_rect;

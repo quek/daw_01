@@ -60,8 +60,8 @@ impl AppData {
     }
 
     fn toggle_bottom_tab(&mut self, tab: u8) {
-        self.ui_prefs.bottom_panel =
-            if self.ui_prefs.bottom_panel == Some(tab) { None } else { Some(tab) };
+        self.cur.view.bottom_panel =
+            if self.cur.view.bottom_panel == Some(tab) { None } else { Some(tab) };
     }
 
     /// 溜める長さ (秒)。SSoT は `app_config.json` (`UiPrefs::sampler_seconds`)。
@@ -227,7 +227,7 @@ impl AppData {
         }
         let name = format!(
             "Sampler_{}_{}",
-            source_label_short(self.song_doc.song(), self.sampler.source),
+            source_label_short(self.cur.song_doc.song(), self.sampler.source),
             chrono_stamp()
         );
         let imported = match materialize_capture(&name, &frames, ring.sample_rate(), self.project_dir().as_deref()) {
@@ -264,7 +264,7 @@ impl AppData {
     fn beat_at_wall_ns(&self, at_ns: u64) -> Option<f64> {
         // 「再生中か」の所有者は engine で GUI はその観測 (`is_playing`)。停止していれば
         // セグメントが古い「再生中」を指していても外挿しない。
-        if !self.transport.is_playing {
+        if !self.cur.transport.is_playing {
             return None;
         }
         crate::state::sampler::beat_at_wall_ns(
@@ -272,7 +272,7 @@ impl AppData {
             at_ns,
             self.sampler.sample_rate(),
         )
-        .or_else(|| self.transport.playhead_beat.map(f64::from))
+        .or_else(|| self.cur.transport.playhead_beat.map(f64::from))
     }
 
     /// CC 120 (All Sound Off) / 123 (All Notes Off): そのチャンネルの押しっぱなしを閉じる。
@@ -327,12 +327,12 @@ impl AppData {
         let secs = (end_ns - start_ns) as f64 / 1e9;
         self.midi_capture.preview_until =
             Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(secs));
-        self.send_audio(AudioCommand::PreviewSequence { track_id, notes });
+        self.send_audio(AudioCommand::PreviewSequence { project: self.pk(), track_id, notes });
     }
 
     fn stop_midi_capture_preview(&mut self) {
         if self.midi_capture.preview_until.take().is_some() {
-            self.send_audio(AudioCommand::PreviewSequenceStop);
+            self.send_audio(AudioCommand::PreviewSequenceStop { project: self.pk() });
         }
     }
 
@@ -344,7 +344,7 @@ impl AppData {
         target: ImportTrackTarget,
         target_beat: Option<f64>,
     ) {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let win = CaptureWindow {
             start_ns,
             end_ns,
@@ -363,7 +363,7 @@ impl AppData {
         };
         let dest = cell_track_idx.or_else(|| resolve_media_drop_target(target, n_tracks));
         let start_beat = target_beat
-            .unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64)
+            .unwrap_or(self.cur.transport.playhead_beat.unwrap_or(0.0) as f64)
             .max(0.0);
         let cell_index = crate::handler::media::import_cell_index(target, 0);
         let name = format!("Capture_{}", chrono_stamp());
@@ -408,7 +408,7 @@ impl AppData {
 fn source_label_short(song: &common::model::Song, source: SamplerSource) -> String {
     match source {
         SamplerSource::Master => "Master".to_string(),
-        SamplerSource::Track(tap) => {
+        SamplerSource::Track { tap, .. } => {
             let name = tap
                 .source_track()
                 .and_then(|id| song.track_by_id(id))

@@ -5,6 +5,9 @@
 //! 純データ (メソッドは AppData 側 / SongDoc のみ振る舞いを持つ)。
 
 pub mod loudness;
+/// `docs/plan_project_tabs.md`: タブ (= プロジェクト) ごとの状態と、タブの集合。
+pub mod project;
+pub mod tabs;
 pub mod song_doc;
 pub mod transport;
 pub mod selection;
@@ -25,6 +28,8 @@ pub mod ring_axis;
 pub mod virtual_keyboard;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
+pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};
+pub use tabs::Tabs;
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
 pub use activity::ActivityState;
 pub use transport::{PlayFrom, TransportState};
@@ -42,36 +47,26 @@ pub use virtual_keyboard::VirtualKeyboardState;
 
 /// GUI プロセスの全アプリ状態 (composition of state groups)。
 pub struct AppData {
-    /// Song 文書 + undo/redo + dirty/epoch (編集は `SongDoc::edit` 経由のみ)。
-    pub song_doc: SongDoc,
-    /// 再生 / metering / export 進行。
-    pub transport: TransportState,
-    /// 選択集合 (clip / note / automation / track / section) + last-wins tier。
-    pub selection: SelectionState,
-    /// 子プロセス IPC (tx / supervisor / plugin bookkeeping / sync cache)。
+    /// **いま見えているタブ** (`docs/plan_project_tabs.md` §5.1)。Song 文書 / transport /
+    /// 選択 / view / 子プロセス帳簿など、タブごとに独立なものは全部ここ。他のタブは
+    /// `tabs` に parked していて、`with_project` が一時的に `cur` へ swap する。
+    pub cur: ProjectState,
+    /// タブの集合 (parked な `ProjectState` + 表示順 + 採番)。
+    pub tabs: Tabs,
+    /// 子プロセス IPC (tx / supervisor / plugin DB / metrics)。タブごとの帳簿は `cur.pipc`。
     pub ipc: IpcState,
-    /// VOICEVOX (歌唱/トーク/口パク) 状態。
+    /// VOICEVOX engine (singers / spawn)。タブごとの合成状態は `cur.pvv`。
     pub voicevox: VoicevoxState,
-    /// メディア import staging / decode cache。
-    pub media: MediaState,
-    /// MIDI 録音 / step 入力 / param gesture 録音。
-    pub recording: RecordingState,
-    /// View 構成 (zoom / scroll / snap / panel / recent)。
+    /// アプリ設定 (app_config.json) / recent / app_dirs。タブごとの view は `cur.view`。
     pub ui_prefs: UiPrefs,
-    /// 一時 UI 状態 (hover / picker / rename / menu / modal / scrub)。
+    /// アプリ全体の一時 UI 状態 (picker / modal / status)。タブごとの hover 等は `cur.peph`。
     pub ui_ephemeral: UiEphemeral,
-    /// r.md #87: クリップランチャーの一時状態 (フォーカス / hover / 列名の
-    /// 編集中テキスト / MIDI bind 表)。曲の中身は `Song`、見方の都合は
-    /// `UiPrefs` なので、ここは **保存しないもの**だけ。
-    pub launcher: LauncherUiState,
     /// r.md #49: アプリの窓がアクティブか (省電力判定の材料)。
     pub activity: ActivityState,
     /// r.md #61: 終了シーケンス。全終了経路 (✕ / Alt+F4 / File > 終了 /
     /// Ctrl+Q / smoke test / OS のセッション終了) がここに合流し、子プロセスの
     /// graceful teardown を有界に待ってから `event_loop.exit()` する。
     pub shutdown: crate::shutdown::ShutdownState,
-    /// r.md #54: 範囲ラウドネス解析の進行とレポート (session-only)。
-    pub loudness: LoudnessState,
     /// r.md #50: テレメトリスレッドの `MasterAnalyzer` へ渡す設定とリセット要求。
     /// UI スレッドが書き、解析スレッドが 1 ティック 1 回読む唯一の口
     /// (逆向きは `AppEvent::MasterMeterTick`)。
@@ -91,14 +86,110 @@ pub struct AppData {
 }
 
 impl AppData {
+    /// いま handler が向いているタブ (= `cur`) の住所。project 宛 IPC command は
+    /// 必ずこれを載せる (`docs/plan_project_tabs.md` §1.1)。
+    #[must_use]
+    pub fn pk(&self) -> common::protocol::ProjectKey {
+        self.cur.key
+    }
+
+    /// `cur` の device の wire 上の住所 (`docs/plan_project_tabs.md` §1.2)。
+    #[must_use]
+    pub fn dev(&self, device_id: u64) -> common::protocol::DeviceAddr {
+        common::protocol::DeviceAddr::new(self.cur.key, device_id)
+    }
+
+    /// 全タブの load 済み instance の token (resource monitor の metrics slot 回収用)。
+    pub fn all_loaded_tokens(&self) -> impl Iterator<Item = common::protocol::InstanceToken> + '_ {
+        self.cur
+            .pipc
+            .loaded_devices
+            .values()
+            .map(|d| d.token)
+            .chain(
+                self.tabs
+                    .parked
+                    .iter()
+                    .flat_map(|p| p.pipc.loaded_devices.values().map(|d| d.token)),
+            )
+    }
+
+    /// `key` のタブを一時的に `cur` へ swap して `f` を回し、戻す
+    /// (`docs/plan_project_tabs.md` §5.1 — 背景タブ宛の IPC event / autosave / 終了時の
+    /// 保存確認など、「アクティブでないタブ」に既存 handler をそのまま効かせる唯一の口)。
+    /// `key == cur.key` なら swap せずに回す。閉じたタブ (parked にも居ない) なら `None`。
+    ///
+    /// **view は呼ばない** — swap 中は `cur` が別タブなので、描画中に呼ぶと 1 フレームだけ
+    /// 別のタブが見える。handler (`handle_event` の内側) と frame 末の sync だけが使う。
+    pub fn with_project<R>(
+        &mut self,
+        key: common::protocol::ProjectKey,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        if key == self.cur.key {
+            return Some(f(self));
+        }
+        let active = self.cur.key;
+        if !self.tabs.swap_in(&mut self.cur, key) {
+            return None;
+        }
+        let outer = self.tabs.visiting_from.replace(active);
+        let r = f(self);
+        self.tabs.visiting_from = outer;
+        // `f` の中でタブが切り替わっていなければ元 (active) を `cur` へ戻す。
+        // 切り替わっていたら `cur` は既に新しいアクティブタブなので触らない。
+        if self.cur.key == key {
+            let _ = self.tabs.swap_in(&mut self.cur, active);
+        }
+        Some(r)
+    }
+
+    /// **全タブ**に同じ処理を回す ([`Self::with_project`] を表示順に回すだけ)。
+    ///
+    /// 子プロセスが落ちた / アプリを終了する、のように **影響がアプリ全体に及ぶ**
+    /// 後始末の唯一の口 (`docs/plan_project_tabs.md` §5.1)。呼ぶ側でループを書くと
+    /// ネストが 2 段深くなり、「ここだけアクティブなタブしか畳んでいない」漏れも起きる。
+    pub fn for_each_tab(&mut self, mut f: impl FnMut(&mut Self)) {
+        for key in self.tabs.order.clone() {
+            self.with_project(key, &mut f);
+        }
+    }
+
+    /// [`Self::for_each_tab`] の「どれかが `true` を返したか」版。**短絡しない**
+    /// (中止 / 後始末が目的なので、全タブで必ず回す)。
+    pub fn any_tab_mut(&mut self, mut f: impl FnMut(&mut Self) -> bool) -> bool {
+        let mut any = false;
+        for key in self.tabs.order.clone() {
+            any |= self.with_project(key, &mut f).unwrap_or(false);
+        }
+        any
+    }
+
+    /// `handle_event` の入口: event が **アクティブでないタブ** 宛 (`AppEvent::target_project`)
+    /// なら、そのタブを `cur` へ swap して `handle_event` を回し `None` を返す (呼び出し側は
+    /// 何もしない)。閉じたタブ宛 (遅延 event) は捨てる。アクティブなタブ宛 / デバイス全体の
+    /// event は `Some(event)` でそのまま返す。
+    pub(crate) fn deliver_to_target_tab(&mut self, event: crate::event::AppEvent) -> Option<crate::event::AppEvent> {
+        let Some(key) = event.target_project() else {
+            return Some(event);
+        };
+        if key == self.cur.key {
+            return Some(event);
+        }
+        if self.with_project(key, move |app| app.handle_event(event)).is_none() {
+            tracing::debug!(project = key.0, "event for a closed tab dropped");
+        }
+        None
+    }
+
     /// Song 編集の標準口: 現在 dispatch 中 event の ambient scope で
     /// [`SongDoc::edit`] を呼ぶ。 1 event 内の複数呼び出しは 1 undo step に
     /// squash され、 Begin*/End* gesture 中は drag 全体が 1 step になる。
     /// export 中は `None` (編集拒否 + status message 予約)。
     pub fn edit_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
         self.sync_export_lock();
-        let scope = self.song_doc.event_scope();
-        self.song_doc.edit(scope, f)
+        let scope = self.cur.song_doc.event_scope();
+        self.cur.song_doc.edit(scope, f)
     }
 
     /// no-op 検出付き [`AppData::edit_song`] ([`SongDoc::edit_checked`] 参照)。
@@ -108,15 +199,15 @@ impl AppData {
         f: impl FnOnce(&mut common::model::Song) -> bool,
     ) -> bool {
         self.sync_export_lock();
-        let scope = self.song_doc.event_scope();
-        self.song_doc.edit_checked(scope, f) == Some(true)
+        let scope = self.cur.song_doc.event_scope();
+        self.cur.song_doc.edit_checked(scope, f) == Some(true)
     }
 
     /// ランチャーの再生状態だけを書く ([`SongDoc::edit_playback`] 参照): undo に積まず
     /// `*` も立てず、子プロセス sync だけ走る。戻り値 = 実際に書き換わったか。
     pub fn edit_playback(&mut self, f: impl FnOnce(&mut common::model::Song) -> bool) -> bool {
         self.sync_export_lock();
-        self.song_doc.edit_playback(f) == Some(true)
+        self.cur.song_doc.edit_playback(f) == Some(true)
     }
 
     /// タイムラインを ripple する Song 編集 (セクションの移動 / 複製 / 範囲削除) の
@@ -140,11 +231,11 @@ impl AppData {
         if !changed {
             return false;
         }
-        let mut region = self.transport.loop_region;
+        let mut region = self.cur.transport.loop_region;
         for r in &ripples {
             region.apply_ripple(*r);
         }
-        if region != self.transport.loop_region {
+        if region != self.cur.transport.loop_region {
             self.set_loop_region(region);
         }
         true
@@ -158,7 +249,7 @@ impl AppData {
     /// 壊す (song mutation の遮断は edit / normalize 双方でこの同期に依存する)。
     pub fn normalize_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
         self.sync_export_lock();
-        self.song_doc.normalize(f)
+        self.cur.song_doc.normalize(f)
     }
 
     /// no-op 検出付き [`AppData::normalize_song`] ([`SongDoc::normalize_checked`]
@@ -172,7 +263,7 @@ impl AppData {
         f: impl FnOnce(&mut common::model::Song) -> bool,
     ) -> Option<bool> {
         self.sync_export_lock();
-        self.song_doc.normalize_checked(f)
+        self.cur.song_doc.normalize_checked(f)
     }
 
     /// song 凍結の単一保証点 (§7.5): export (audio freewheel / video render) 中は
@@ -188,7 +279,7 @@ impl AppData {
     /// `song_doc.edit` を直接呼ぶ経路 (BPM スクラブ等) があるので、入口同期だけだと
     /// 「走査が始まった直後の編集が素通りする」窓が残るため。
     pub(crate) fn sync_export_lock(&mut self) {
-        self.song_doc.set_export_lock(self.offline_render_busy());
+        self.cur.song_doc.set_export_lock(self.offline_render_busy());
     }
 
     /// **書き出し / 解析**が進行中か (WAV / video 書き出し・範囲ラウドネス解析)。
@@ -200,9 +291,9 @@ impl AppData {
     /// 自分の完了を握り潰して永久に終わらなくなる。
     #[must_use]
     pub fn export_or_analysis_busy(&self) -> bool {
-        self.transport.pending_video_export.is_some()
-            || self.transport.export_stage.is_some()
-            || self.loudness.phase.is_busy()
+        self.cur.transport.pending_video_export.is_some()
+            || self.cur.transport.export_stage.is_some()
+            || self.cur.loudness.phase.is_busy()
     }
 
     /// engine の offline render (`export_running`) を占有する処理が進行中か。
@@ -216,7 +307,7 @@ impl AppData {
     #[must_use]
     pub fn offline_render_busy(&self) -> bool {
         self.export_or_analysis_busy()
-            || self.ipc.pending_clip_fx_bounce.is_some()
-            || self.ipc.pending_glue_bake.is_some()
+            || self.cur.pipc.pending_clip_fx_bounce.is_some()
+            || self.cur.pipc.pending_glue_bake.is_some()
     }
 }

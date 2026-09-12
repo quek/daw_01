@@ -48,7 +48,7 @@ fn build_two_clip_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
     app.edit_song(|song| song.tracks.truncate(1));
     app.edit_song(|song| song.tracks[0].id = 1);
     app.edit_song(|song| song.tracks[0].clips.clear());
-    let mut t2 = app.song_doc.song().tracks[0].clone();
+    let mut t2 = app.cur.song_doc.song().tracks[0].clone();
     t2.id = 2;
     app.edit_song(|song| song.tracks.push(t2));
     app.handle_event(AppEvent::CreateClip { track: 0, start_beat: 0.0 });
@@ -87,13 +87,13 @@ fn view_state_snapshot_restore_roundtrips() {
     let key_a = app.live_clip_key(CLIP_A).expect("clip A は解決できる");
 
     // 代表的な表示状態を仕込む。
-    app.ui_prefs.arrange_zoom_x = 50.0;
-    app.ui_prefs.arrange_scroll_beat = 7.0;
-    app.ui_prefs.bottom_panel = Some(1);
-    app.ui_prefs.master_row_automation_expanded = true;
-    app.ui_prefs.expanded_automation_tracks.insert(2);
+    app.cur.view.arrange_zoom_x = 50.0;
+    app.cur.view.arrange_scroll_beat = 7.0;
+    app.cur.view.bottom_panel = Some(1);
+    app.cur.view.master_row_automation_expanded = true;
+    app.cur.view.expanded_automation_tracks.insert(2);
     let pv = PianoRollViewState { zoom_x: 111.0, zoom_y: 20.0, top_pitch: 70, scroll_beat: 2.0 };
-    app.ui_prefs.piano_roll_views.insert(key_a, pv);
+    app.cur.view.piano_roll_views.insert(key_a, pv);
     // ループ (ON/OFF + 範囲) も表示状態と同じ扱いで往復する。
     app.handle_event(AppEvent::SetLoopRange { start: 3.0, end: 11.0 });
     app.handle_event(AppEvent::ToggleLoop);
@@ -101,30 +101,30 @@ fn view_state_snapshot_restore_roundtrips() {
     let snap = app.snapshot_view_state();
 
     // すべて別の値へ壊してから restore。
-    app.ui_prefs.arrange_zoom_x = 999.0;
-    app.ui_prefs.arrange_scroll_beat = 0.0;
-    app.ui_prefs.bottom_panel = None;
-    app.ui_prefs.master_row_automation_expanded = false;
-    app.ui_prefs.expanded_automation_tracks.clear();
-    app.ui_prefs.piano_roll_views.clear();
+    app.cur.view.arrange_zoom_x = 999.0;
+    app.cur.view.arrange_scroll_beat = 0.0;
+    app.cur.view.bottom_panel = None;
+    app.cur.view.master_row_automation_expanded = false;
+    app.cur.view.expanded_automation_tracks.clear();
+    app.cur.view.piano_roll_views.clear();
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 0.0 });
     app.handle_event(AppEvent::ToggleLoop);
 
     let loop_region = snap.loop_region;
     app.restore_view_state(Some(snap), loop_region, Vec::new());
 
-    assert_eq!(app.ui_prefs.arrange_zoom_x, 50.0);
-    assert_eq!(app.ui_prefs.arrange_scroll_beat, 7.0);
-    assert_eq!(app.ui_prefs.bottom_panel, Some(1));
-    assert!(app.ui_prefs.master_row_automation_expanded);
-    assert!(app.ui_prefs.expanded_automation_tracks.contains(&2));
+    assert_eq!(app.cur.view.arrange_zoom_x, 50.0);
+    assert_eq!(app.cur.view.arrange_scroll_beat, 7.0);
+    assert_eq!(app.cur.view.bottom_panel, Some(1));
+    assert!(app.cur.view.master_row_automation_expanded);
+    assert!(app.cur.view.expanded_automation_tracks.contains(&2));
     assert_eq!(
-        app.ui_prefs.piano_roll_views.get(&key_a).copied(),
+        app.cur.view.piano_roll_views.get(&key_a).copied(),
         Some(pv),
         "per-clip piano roll view が復元される"
     );
     assert_eq!(
-        app.transport.loop_region,
+        app.cur.transport.loop_region,
         common::model::LoopRegion { enabled: true, start_beat: 3.0, end_beat: 11.0 },
         "ループ (ON/OFF + 範囲) も往復する"
     );
@@ -148,9 +148,9 @@ fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
 
     let live = EditorWindowGeometry { x: 300, y: 180, width: 880, height: 162 };
     let orphan = EditorWindowGeometry { x: 0, y: 0, width: 640, height: 480 };
-    app.ui_prefs.plugin_editor_windows.insert(42, live);
+    app.cur.view.plugin_editor_windows.insert(42, live);
     // 削除済み device の残骸 (song に居ない id)。
-    app.ui_prefs.plugin_editor_windows.insert(9999, orphan);
+    app.cur.view.plugin_editor_windows.insert(9999, orphan);
 
     let snap = app.snapshot_view_state();
     assert_eq!(
@@ -160,18 +160,18 @@ fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
     );
 
     // 別プロジェクトを開いた想定で壊してから復元。
-    app.ui_prefs.plugin_editor_windows.clear();
-    app.ui_prefs.plugin_editor_windows.insert(7, orphan);
+    app.cur.view.plugin_editor_windows.clear();
+    app.cur.view.plugin_editor_windows.insert(7, orphan);
     let loop_region = snap.loop_region;
     app.restore_view_state(Some(snap), loop_region, Vec::new());
 
     assert_eq!(
-        app.ui_prefs.plugin_editor_windows.get(&42).copied(),
+        app.cur.view.plugin_editor_windows.get(&42).copied(),
         Some(live),
         "窓の位置とサイズが復元される"
     );
     assert!(
-        !app.ui_prefs.plugin_editor_windows.contains_key(&7),
+        !app.cur.view.plugin_editor_windows.contains_key(&7),
         "前プロジェクトの窓位置は漏れない"
     );
 }
@@ -182,16 +182,16 @@ fn plugin_editor_geometry_roundtrips_and_drops_orphans() {
 fn restore_none_clears_per_clip_but_keeps_globals() {
     let (mut app, _rx) = build_two_clip_app();
     let key_a = app.live_clip_key(CLIP_A).expect("clip A は解決できる");
-    app.ui_prefs.arrange_zoom_x = 42.0;
-    app.ui_prefs.piano_roll_views.insert(key_a, PianoRollViewState::default());
+    app.cur.view.arrange_zoom_x = 42.0;
+    app.cur.view.piano_roll_views.insert(key_a, PianoRollViewState::default());
 
     app.restore_view_state(None, common::model::LoopRegion::default(), Vec::new());
 
     assert!(
-        app.ui_prefs.piano_roll_views.is_empty(),
+        app.cur.view.piano_roll_views.is_empty(),
         "旧ファイルでも前プロジェクトの per-clip view は漏らさずクリア"
     );
-    assert_eq!(app.ui_prefs.arrange_zoom_x, 42.0, "globals は現状維持 (従来挙動)");
+    assert_eq!(app.cur.view.arrange_zoom_x, 42.0, "globals は現状維持 (従来挙動)");
 }
 
 /// アレンジと下部パネルの境界比率がプロジェクトに保存され、開き直しても戻らない。
@@ -202,17 +202,17 @@ fn restore_none_clears_per_clip_but_keeps_globals() {
 #[test]
 fn arrangement_split_ratio_survives_save_and_reopen() {
     let (mut app, _rx) = build_app();
-    app.ui_prefs.arrangement_split_ratio = 0.88;
+    app.cur.view.arrangement_split_ratio = 0.88;
 
     let snap = app.snapshot_view_state();
     assert!((snap.arrangement_split_ratio - 0.88).abs() < 1e-6, "保存に載る");
 
     // 別セッションで開き直した状況 (widget state も ui_prefs も初期値)。
     let (mut fresh, _rx2) = build_app();
-    assert_eq!(fresh.ui_prefs.arrangement_split_ratio, 0.0, "既定は未設定");
+    assert_eq!(fresh.cur.view.arrangement_split_ratio, 0.0, "既定は未設定");
     fresh.restore_view_state(Some(snap), common::model::LoopRegion::default(), Vec::new());
     assert!(
-        (fresh.ui_prefs.arrangement_split_ratio - 0.88).abs() < 1e-6,
+        (fresh.cur.view.arrangement_split_ratio - 0.88).abs() < 1e-6,
         "開き直しても境界が既定へ戻らない"
     );
 }
@@ -224,5 +224,5 @@ fn legacy_file_leaves_split_ratio_unset() {
     let (mut app, _rx) = build_app();
     let v = common::model::ViewState { arrangement_split_ratio: 0.0, ..Default::default() };
     app.restore_view_state(Some(v), common::model::LoopRegion::default(), Vec::new());
-    assert_eq!(app.ui_prefs.arrangement_split_ratio, 0.0, "未設定のまま (既定は view が決める)");
+    assert_eq!(app.cur.view.arrangement_split_ratio, 0.0, "未設定のまま (既定は view が決める)");
 }

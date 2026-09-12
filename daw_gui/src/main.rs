@@ -272,13 +272,16 @@ fn run_gui(
             // (`AppData` 側が毎イベントで最新値を書き込む共有フラグ)。
             let awake = Arc::clone(&app.activity.awake);
             spawn_playhead_poller(
-                bridge,
-                Arc::clone(&metrics),
-                scope,
-                Arc::clone(&app.meter_control),
-                Arc::clone(&app.sampler.shared),
+                PollerHandles {
+                    bridge,
+                    metrics: Arc::clone(&metrics),
+                    scope,
+                    meter_control: Arc::clone(&app.meter_control),
+                    sampler_shared: Arc::clone(&app.sampler.shared),
+                    awake: Arc::clone(&awake),
+                    active_project: Arc::clone(&app.activity.active_project),
+                },
                 proxy.clone(),
-                Arc::clone(&awake),
             );
             spawn_resource_sysinfo_poller(proxy.clone(), awake);
             spawn_autosave_timer(proxy.clone());
@@ -418,17 +421,29 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// (REAPER が `Meter update frequency` を別設定に持っているのと同じ理由)。
 const METRICS_TICK_DIVISOR: u32 = 8;
 
-fn spawn_playhead_poller(
+/// テレメトリスレッドが読む共有面 (全部 `Arc`、GUI スレッドと共有)。
+struct PollerHandles {
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
-    meter_control: Arc<
-        std::sync::Mutex<daw_gui::master_meter::settings::MeterControl>,
-    >,
+    meter_control: Arc<std::sync::Mutex<daw_gui::master_meter::settings::MeterControl>>,
     sampler_shared: Arc<daw_gui::state::sampler::SamplerShared>,
-    proxy: EventLoopProxy<AppEvent>,
     awake: Arc<std::sync::atomic::AtomicBool>,
-) {
+    /// `docs/plan_project_tabs.md` §5.4: 重い面 (メーター / 変調値 / ボイス / ランチャー)
+    /// を読むタブ (= アクティブなタブ、`AppData` が切替で書く)。
+    active_project: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>) {
+    let PollerHandles {
+        bridge,
+        metrics,
+        scope,
+        meter_control,
+        sampler_shared,
+        awake,
+        active_project,
+    } = handles;
     std::thread::spawn(move || {
         // Global Sampler (`docs/plan_global_sampler.md` §3.3): 現世代のリングを
         // 読み進めて波形バケツを作る。世代が変わったら reader を作り直す。
@@ -461,22 +476,39 @@ fn spawn_playhead_poller(
                 IDLE_POLL_INTERVAL
             });
             tick_count = tick_count.wrapping_add(1);
-            let samples = bridge.playhead_samples();
-            let preroll = bridge.preroll_remaining();
-            // r.md #51: 「走っているか」「録音してよいか」は engine が所有する
-            // 事実。GUI は他の telemetry と同じ面で観測する。
-            let playing = bridge.playing();
-            if proxy
-                .send_event(AppEvent::Tick {
-                    samples,
-                    preroll,
-                    playing,
-                    recording_live: bridge.recording_live(),
-                })
-                .is_err()
-            {
+            // `docs/plan_project_tabs.md` §5.4: transport の軽い面は **開いている全タブ**
+            // ぶん送る (タブの ▶ 表示 / 背景タブの再生位置)。r.md #51: 「走っているか」
+            // 「録音してよいか」は engine が所有する事実。GUI は他の telemetry と同じ面で
+            // 観測する。
+            let mut send_failed = false;
+            for (key, slot) in bridge.live_projects() {
+                if proxy
+                    .send_event(AppEvent::Tick {
+                        project: key,
+                        samples: slot.playhead_samples(),
+                        preroll: slot.preroll_remaining(),
+                        playing: slot.playing(),
+                        recording_live: slot.recording_live(),
+                    })
+                    .is_err()
+                {
+                    send_failed = true;
+                    break;
+                }
+            }
+            if send_failed {
                 break;
             }
+            // 重い面 (メーター / 変調値面 / ボイス / ランチャー走行状態) はアクティブな
+            // タブの slot だけ。まだ claim されていない (OpenProject 前) なら送らない。
+            let active_key = common::protocol::ProjectKey(
+                active_project.load(std::sync::atomic::Ordering::Acquire),
+            );
+            let Some(active) = bridge.find_project(active_key) else {
+                continue;
+            };
+            let preroll = active.preroll_remaining();
+            let playing = active.playing();
             // r.md #50: マスターメーター。パネルが閉じているときは解析ごと止める
             // (リングは読み捨ててカーソルだけ進め、再表示で古い音が流れ込まない
             // ようにする)。
@@ -521,23 +553,29 @@ fn spawn_playhead_poller(
             // r.md #89: 値面は id 表と値の組なので seqlock で読む。書き込み中に
             // 当たって読めなかった tick は **送らない** (GUI 側の前回値が残る) —
             // 破れた組を送ると 1 フレームだけ別のソースの値で絵が動く。
-            if bridge.read_mod_plane(&mut mod_buf)
+            if active.read_mod_plane(&mut mod_buf)
                 && proxy
-                    .send_event(AppEvent::ModScalarsTick(std::mem::take(&mut mod_buf)))
+                    .send_event(AppEvent::ModScalarsTick {
+                        project: active_key,
+                        plane: std::mem::take(&mut mod_buf),
+                    })
                     .is_err()
             {
                 break;
             }
             // r.md #117: 鳴っているボイス (変調ラックの per-voice カーソル)。 peaks と同じ
             // 観測面で 30Hz。
-            bridge.track_voices(&mut voices_buf);
+            active.track_voices(&mut voices_buf);
             if proxy
-                .send_event(AppEvent::TrackVoicesTick(std::mem::take(&mut voices_buf)))
+                .send_event(AppEvent::TrackVoicesTick {
+                    project: active_key,
+                    voices: std::mem::take(&mut voices_buf),
+                })
                 .is_err()
             {
                 break;
             }
-            bridge.track_meters(&mut peaks_buf);
+            active.track_meters(&mut peaks_buf);
             // `peaks_buf` を毎 tick clone せず move でイベントに渡す。 次 tick の
             // `track_peaks` が `out.clear()` + push で再充填するので、 take 後に
             // 空になっても問題ない。 clone の memcpy を省く効果のみ (take は
@@ -545,10 +583,11 @@ fn spawn_playhead_poller(
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             if proxy
                 .send_event(AppEvent::TrackPeaksTick {
+                    project: active_key,
                     tracks: std::mem::take(&mut peaks_buf),
                     // マスターストリップの GR も同じ tick で読む (per-track の
                     // メーターと同じ buffer の値であることを保つ)。
-                    master_gr: bridge.master_gr_db(),
+                    master_gr: active.master_gr_db(),
                 })
                 .is_err()
             {
@@ -558,9 +597,12 @@ fn spawn_playhead_poller(
             // **`Song` には入らない表示専用データ** (計画書 §1.4) なので、peaks と
             // 同じ観測面で 30Hz で流す。フォローアクションで移った先はここにしか
             // 出ないため、これが無いとグリッドと映像だけ前のセルに取り残される。
-            bridge.launcher_row_snapshots(&mut launcher_buf);
+            active.launcher_row_snapshots(&mut launcher_buf);
             if proxy
-                .send_event(AppEvent::LauncherRowsTick(std::mem::take(&mut launcher_buf)))
+                .send_event(AppEvent::LauncherRowsTick {
+                    project: active_key,
+                    rows: std::mem::take(&mut launcher_buf),
+                })
                 .is_err()
             {
                 break;

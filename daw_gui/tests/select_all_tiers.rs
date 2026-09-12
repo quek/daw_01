@@ -106,13 +106,13 @@ fn first_press_covers_the_track_and_its_closed_lanes_second_press_everything() {
     setup(&mut app);
 
     press(&mut app, Some(1));
-    assert_eq!(app.selection.time, Some(track1_only()), "1 回目: トラック行 + 閉じた lane、外接 4..20");
+    assert_eq!(app.cur.selection.time, Some(track1_only()), "1 回目: トラック行 + 閉じた lane、外接 4..20");
 
     press(&mut app, Some(1));
-    assert_eq!(app.selection.time, Some(everything()), "2 回目: 全トラック + 全 lane + master lane、外接 0..28");
+    assert_eq!(app.cur.selection.time, Some(everything()), "2 回目: 全トラック + 全 lane + master lane、外接 0..28");
 
     press(&mut app, Some(1));
-    assert_eq!(app.selection.time, Some(everything()), "3 回目: 冪等");
+    assert_eq!(app.cur.selection.time, Some(everything()), "3 回目: 冪等");
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn changing_the_target_track_restarts_from_tier_one() {
     press(&mut app, Some(1));
     press(&mut app, Some(2));
     assert_eq!(
-        app.selection.time,
+        app.cur.selection.time,
         Some(TimeSelection::new(0.0, 8.0, vec![LaneRef::Track(2)]).unwrap()),
         "別トラックで押し直すと、そのトラックの 1 段目"
     );
@@ -133,11 +133,11 @@ fn empty_track_or_no_target_goes_straight_to_everything() {
     let mut app = build_app();
     setup(&mut app);
     press(&mut app, Some(3));
-    assert_eq!(app.selection.time, Some(everything()), "クリップの無いトラックは 1 段目を飛ばす");
+    assert_eq!(app.cur.selection.time, Some(everything()), "クリップの無いトラックは 1 段目を飛ばす");
 
     app.handle_event(AppEvent::ClearSelection);
     press(&mut app, None);
-    assert_eq!(app.selection.time, Some(everything()), "対象トラック無し = 直接 全トラック");
+    assert_eq!(app.cur.selection.time, Some(everything()), "対象トラック無し = 直接 全トラック");
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn master_row_tier_one_is_its_song_lanes() {
     setup(&mut app);
     press(&mut app, Some(MASTER_TRACK_ID));
     assert_eq!(
-        app.selection.time,
+        app.cur.selection.time,
         Some(TimeSelection::new(24.0, 28.0, vec![lane(MASTER_TRACK_ID, 1)]).unwrap()),
         "master は song lane 行だけで 1 段目"
     );

@@ -124,7 +124,7 @@ impl AppData {
     /// 手がかり ([`crate::clipboard::TracksCopy`])。
     pub(crate) fn collect_track_copies(&self, track_ids: &[u32]) -> crate::clipboard::TracksCopy {
         let mut out: Vec<crate::clipboard::TrackCopy> = Vec::new();
-        for t in self.song_doc.song().tracks.iter() {
+        for t in self.cur.song_doc.song().tracks.iter() {
             if !track_ids.contains(&t.id) {
                 continue;
             }
@@ -141,12 +141,12 @@ impl AppData {
             for cid in cids {
                 if seen.insert(cid) {
                     let content = self
-                        .song_doc.song()
+                        .cur.song_doc.song()
                         .clip_contents
                         .get(&cid)
                         .cloned()
                         .unwrap_or_default();
-                    let name = self.song_doc.song().clip_content_names.get(&cid).cloned();
+                    let name = self.cur.song_doc.song().clip_content_names.get(&cid).cloned();
                     contents.push(crate::clipboard::ContentEntry {
                         content_id: cid,
                         content,
@@ -162,7 +162,7 @@ impl AppData {
         }
         crate::clipboard::TracksCopy {
             tracks: out,
-            scenes: self.song_doc.song().scenes.iter().map(|s| s.id).collect(),
+            scenes: self.cur.song_doc.song().scenes.iter().map(|s| s.id).collect(),
         }
     }
 
@@ -174,11 +174,7 @@ impl AppData {
             return None;
         }
         let count = out.tracks.len();
-        let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
-            crate::clipboard::ClipboardPayload::Tracks(out),
-        )
-        .to_json()?;
+        let json = self.envelope_with_media(crate::clipboard::ClipboardPayload::Tracks(out)).to_json()?;
         Some((json, count))
     }
 
@@ -197,11 +193,15 @@ impl AppData {
         payload: crate::clipboard::TracksCopy,
         src_pid: u64,
         above_track: u32,
+        media: &common::model::MediaManifest,
     ) -> usize {
         let crate::clipboard::TracksCopy {
             mut tracks,
             scenes: src_scenes,
         } = payload;
+        // 取り込みは **貼り先のフォルダ基準** で (`media_for_import` の doc)。
+        let imported = self.media_for_import(media);
+        let media = &imported;
         if tracks.is_empty() {
             return 0;
         }
@@ -210,6 +210,12 @@ impl AppData {
         let audio_editor_key = self.audio_editor_target_key();
         let Some(new_ids) = self.edit_song(|song| {
             let same_project = src_pid == song.project_id;
+            // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
+            let media_remap = if same_project {
+                common::model::MediaRemap::default()
+            } else {
+                song.import_media(media)
+            };
             // drop 先の親 group context と挿入 index (above_track の直上)。
             let drop_parent = song.track_by_id(above_track).and_then(|t| t.parent_group_id);
             let insert_idx = song
@@ -217,7 +223,7 @@ impl AppData {
                 .unwrap_or(song.tracks.len());
             // paste は content 流用ポリシー (same_project で現存 content はリンク共有)。
             let mut built =
-                Self::build_pasted_tracks(song, &tracks, same_project, false, drop_parent);
+                Self::build_pasted_tracks(song, &tracks, same_project, false, drop_parent, &media_remap);
             Self::remap_pasted_scenes(song, &mut built, &src_scenes, same_project);
             let new_ids: Vec<u32> = built.iter().map(|(_, t)| t.id).collect();
             // above_track の直上に order 昇順を維持して連続挿入。
@@ -243,6 +249,9 @@ impl AppData {
         self.restore_plugins_for_tracks(&new_ids);
         self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();
+        if src_pid != self.cur.song_doc.song().project_id {
+            self.decode_imported_media(media);
+        }
         n
     }
 
@@ -261,6 +270,7 @@ impl AppData {
         same_project: bool,
         force_independent_content: bool,
         drop_parent: Option<u32>,
+        media_remap: &common::model::MediaRemap,
     ) -> Vec<(u32, common::model::Track)> {
         // 1) 新 track id を全件先に採番し old→new remap を作る (集合内参照解決用)。
         let mut track_remap: std::collections::HashMap<u32, u32> =
@@ -291,7 +301,9 @@ impl AppData {
                 {
                     ce.content_id
                 } else {
-                    song.alloc_content(ce.content.clone(), ce.name.clone().unwrap_or_default())
+                    let mut content = ce.content.clone();
+                    content.remap_media(media_remap);
+                    song.alloc_content(content, ce.name.clone().unwrap_or_default())
                 };
                 content_remap.insert(ce.content_id, new_cid);
             }
@@ -739,7 +751,7 @@ impl AppData {
         let roots: Vec<u32> = track_ids
             .iter()
             .copied()
-            .filter(|&id| self.song_doc.song().track_by_id(id).is_some())
+            .filter(|&id| self.cur.song_doc.song().track_by_id(id).is_some())
             .filter(|&id| !self.track_ancestor_in_set(id, &sel))
             .collect();
         if roots.is_empty() {
@@ -756,7 +768,7 @@ impl AppData {
             .flat_map(|(_, s)| s.iter().copied())
             .collect();
         let full_ordered: Vec<u32> = self
-            .song_doc
+            .cur.song_doc
             .song()
             .tracks
             .iter()
@@ -773,7 +785,7 @@ impl AppData {
             // same_project=true (元と同一 project)、 独立/リンクは force_independent で
             // 切替、 drop_parent=None で top-level は top-level のまま (group child は
             // 元 parent を継承)。
-            let mut built = Self::build_pasted_tracks(song, &copies.tracks, true, !linked, None);
+            let mut built = Self::build_pasted_tracks(song, &copies.tracks, true, !linked, None, &common::model::MediaRemap::default());
             // 同一プロジェクトなので列はそのまま解ける (= 実質 no-op) が、複製も
             // 貼り付けと同じ 1 本を通す — 列を消した直後に複製した場合も、規則が
             // 2 本に割れずに済む。
@@ -830,8 +842,8 @@ impl AppData {
     /// `id` の祖先チェーン (`parent_group_id`) に `set` の要素が居るか (cycle-safe)。
     /// duplicate の root 判定に使う (選択集合内の group child を root から除外)。
     fn track_ancestor_in_set(&self, id: u32, set: &std::collections::HashSet<u32>) -> bool {
-        let mut cursor = self.song_doc.song().track_by_id(id).and_then(|t| t.parent_group_id);
-        let limit = self.song_doc.song().tracks.len() + 1;
+        let mut cursor = self.cur.song_doc.song().track_by_id(id).and_then(|t| t.parent_group_id);
+        let limit = self.cur.song_doc.song().tracks.len() + 1;
         let mut hops = 0;
         while let Some(pid) = cursor {
             if set.contains(&pid) {
@@ -841,7 +853,7 @@ impl AppData {
             if hops > limit {
                 break;
             }
-            cursor = self.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
+            cursor = self.cur.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
         }
         false
     }
@@ -851,7 +863,7 @@ impl AppData {
     /// どちらの経路でも呼び出し側の `edit_song` が積むので、 ここは
     /// `song` を書き換えるだけ。
     pub(crate) fn delete_track_inner(&mut self, track_id: u32) {
-        let Some(idx) = self.song_doc.song().track_index_by_id(track_id) else {
+        let Some(idx) = self.cur.song_doc.song().track_index_by_id(track_id) else {
             return;
         };
         // Audio Editor が開いていたら、対象が消える / audio でなくなる場合に閉じる
@@ -859,7 +871,7 @@ impl AppData {
         // 「詰まって別トラックのクリップを指す」 ことは無い。
         let audio_editor_key = self.audio_editor_target_key();
         let idx = idx as u32;
-        if idx as usize >= self.song_doc.song().tracks.len() {
+        if idx as usize >= self.cur.song_doc.song().tracks.len() {
             return;
         }
 
@@ -869,11 +881,11 @@ impl AppData {
         // subtree of stable ids, then resolve them to current indices
         // and remove from highest to lowest so earlier indices stay
         // valid during the loop.
-        let target_id = self.song_doc.song().tracks[idx as usize].id;
+        let target_id = self.cur.song_doc.song().tracks[idx as usize].id;
         let subtree_ids = self.collect_track_subtree_ids(target_id);
         let mut subtree_idxs: Vec<u32> = subtree_ids
             .iter()
-            .filter_map(|id| self.song_doc.song().track_index_by_id(*id))
+            .filter_map(|id| self.cur.song_doc.song().track_index_by_id(*id))
             .map(|i| i as u32)
             .collect();
         subtree_idxs.sort_unstable();
@@ -891,10 +903,10 @@ impl AppData {
         let removal_targets: Vec<u32> = subtree_idxs
             .iter()
             .rev()
-            .map(|&i| self.song_doc.song().tracks[i as usize].id)
+            .map(|&i| self.cur.song_doc.song().tracks[i as usize].id)
             .collect();
         let removal_plan =
-            Self::plan_track_removal_ipc(self.song_doc.song(), &removal_targets);
+            Self::plan_track_removal_ipc(self.cur.song_doc.song(), &removal_targets);
         for &i in subtree_idxs.iter().rev() {
             self.edit_song(|song| song.tracks.remove(i as usize));
         }
@@ -933,15 +945,15 @@ impl AppData {
         // は binding を持つ track が居なければ何もしないので、二度と片付かない。
         // 消えたのが口 track 側だったときの dangling binding も同じ 1 本が落とす。
         self.reap_orphan_lipsync();
-        self.selection.selected_track_ids
+        self.cur.selection.selected_track_ids
             .retain(|id| !subtree_ids_set.contains(id));
-        if self.selection.selected_track_ids.is_empty()
+        if self.cur.selection.selected_track_ids.is_empty()
             && let Some(id) = self.neighbor_track_id_after_removal(removed_min_idx)
         {
-            self.selection.selected_track_ids.push(id);
+            self.cur.selection.selected_track_ids.push(id);
         }
         // collapsed_groups からも消えた id を除外。
-        self.ui_prefs.collapsed_groups
+        self.cur.view.collapsed_groups
             .retain(|id| !subtree_ids_set.contains(id));
         // r.md #71 (プラグインのコピー / 移動): 消えた track の device を指す選択も
         // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
@@ -962,7 +974,7 @@ impl AppData {
     /// [`Self::set_track_selection`] を通さず `selected_track_ids` に直接入れる
     /// (= last-wins タグを立て直さない)。
     fn neighbor_track_id_after_removal(&self, removed_min_idx: usize) -> Option<u32> {
-        let tracks = &self.song_doc.song().tracks;
+        let tracks = &self.cur.song_doc.song().tracks;
         tracks
             .get(removed_min_idx)
             .or_else(|| tracks.last())
@@ -980,7 +992,7 @@ impl AppData {
         let mut hops = 0;
         while !frontier.is_empty() {
             hops += 1;
-            if hops > self.song_doc.song().tracks.len() + 1 {
+            if hops > self.cur.song_doc.song().tracks.len() + 1 {
                 tracing::error!(
                     root_id,
                     "collect_track_subtree_ids: cycle detected, aborting BFS"
@@ -989,7 +1001,7 @@ impl AppData {
             }
             let mut next = Vec::new();
             for &pid in &frontier {
-                for t in &self.song_doc.song().tracks {
+                for t in &self.cur.song_doc.song().tracks {
                     if t.parent_group_id == Some(pid) && !result.contains(&t.id) {
                         result.push(t.id);
                         next.push(t.id);
@@ -1005,7 +1017,7 @@ impl AppData {
         if a == b {
             return;
         }
-        let n = self.song_doc.song().tracks.len() as u32;
+        let n = self.cur.song_doc.song().tracks.len() as u32;
         if a >= n || b >= n {
             return;
         }
@@ -1031,13 +1043,13 @@ impl AppData {
         }
         // 並びが変化しない場合は no-op
         let same = order.iter().enumerate().all(|(i, id)| {
-            self.song_doc.song().tracks.get(i).map(|t| t.id) == Some(*id)
+            self.cur.song_doc.song().tracks.get(i).map(|t| t.id) == Some(*id)
         });
-        if same && order.len() == self.song_doc.song().tracks.len() {
+        if same && order.len() == self.cur.song_doc.song().tracks.len() {
             return;
         }
         let selected_track_id = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
@@ -1054,7 +1066,7 @@ impl AppData {
         let index_order: Vec<u32> = order
             .iter()
             .filter_map(|id| {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .tracks
                     .iter()
                     .position(|t| t.id == *id)
@@ -1113,11 +1125,11 @@ impl AppData {
     /// 「マスターのインスペクタを見るためにヘッダを click しただけで Delete が
     /// 効かなくなる」 という不可視の故障になるため、 選択表示はしてもタグは立てない。
     pub(crate) fn set_track_selection(&mut self, ids: Vec<u32>) {
-        self.selection.selected_track_ids = ids;
+        self.cur.selection.selected_track_ids = ids;
         if self.has_deletable_track_selection() {
-            self.selection.last_edit_select = Some(EditSurface::Tracks);
-        } else if self.selection.last_edit_select == Some(EditSurface::Tracks) {
-            self.selection.last_edit_select = None;
+            self.cur.selection.last_edit_select = Some(EditSurface::Tracks);
+        } else if self.cur.selection.last_edit_select == Some(EditSurface::Tracks) {
+            self.cur.selection.last_edit_select = None;
         }
     }
 
@@ -1132,17 +1144,17 @@ impl AppData {
         if self.cursor_track_id() == Some(track_id) {
             return;
         }
-        self.selection.selected_track_ids = vec![track_id];
-        self.selection.track_anchor = Some(track_id);
+        self.cur.selection.selected_track_ids = vec![track_id];
+        self.cur.selection.track_anchor = Some(track_id);
     }
 
     /// 選択中トラックに `song.tracks` の実在トラックが 1 本でもあるか。
     /// master 行 (合成 id) だけの選択は「トラック面の編集対象なし」 とみなす。
     pub(crate) fn has_deletable_track_selection(&self) -> bool {
-        self.selection
+        self.cur.selection
             .selected_track_ids
             .iter()
-            .any(|id| self.song_doc.song().track_index_by_id(*id).is_some())
+            .any(|id| self.cur.song_doc.song().track_index_by_id(*id).is_some())
     }
 
     /// トラック面の一括操作 (削除 / cut / copy / 複製) が受け取る id 集合を正規化する。
@@ -1155,7 +1167,7 @@ impl AppData {
     pub(crate) fn live_track_ids(&self, track_ids: &[u32]) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::with_capacity(track_ids.len());
         for &id in track_ids {
-            if self.song_doc.song().track_index_by_id(id).is_some() && !out.contains(&id) {
+            if self.cur.song_doc.song().track_index_by_id(id).is_some() && !out.contains(&id) {
                 out.push(id);
             }
         }
@@ -1180,8 +1192,8 @@ impl AppData {
         modifier: crate::widgets::select_modifier::SelectModifier,
         visible_ids: &[u32],
     ) {
-        let prev = self.selection.selected_track_ids.clone();
-        let anchor = self.selection.track_anchor;
+        let prev = self.cur.selection.selected_track_ids.clone();
+        let anchor = self.cur.selection.track_anchor;
         let mut next = modifier.resolve(&prev, id, || {
             crate::widgets::select_modifier::range_ordered(visible_ids, anchor?, id)
         });
@@ -1201,7 +1213,7 @@ impl AppData {
         // 省けるコストは Vec 1 本の代入だけで、 `push_edit` は既に積まれている。
         self.set_track_selection(next);
         if modifier.updates_anchor() {
-            self.selection.track_anchor = Some(id);
+            self.cur.selection.track_anchor = Some(id);
         }
     }
 
@@ -1221,20 +1233,20 @@ impl AppData {
     /// (`select_clip` / `set_clip_selection` / `select_launcher_cell` は `Clips`
     /// タグを立てた **直後**にここを呼ぶので、 そちらのタグは上書きされない。)
     pub(crate) fn select_track(&mut self, track_id: u32) {
-        if self.song_doc.song().track_by_id(track_id).is_none() {
+        if self.cur.song_doc.song().track_by_id(track_id).is_none() {
             return;
         }
-        if self.selection.selected_track_ids.as_slice() != [track_id] {
-            self.selection.selected_track_ids = vec![track_id];
+        if self.cur.selection.selected_track_ids.as_slice() != [track_id] {
+            self.cur.selection.selected_track_ids = vec![track_id];
         }
-        if self.selection.last_edit_select == Some(EditSurface::Tracks) {
-            self.selection.last_edit_select = None;
+        if self.cur.selection.last_edit_select == Some(EditSurface::Tracks) {
+            self.cur.selection.last_edit_select = None;
         }
     }
 
     pub(crate) fn begin_rename_track(&mut self, track_id: u32) {
         let Some(name) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == track_id)
@@ -1242,23 +1254,23 @@ impl AppData {
         else {
             return;
         };
-        self.ui_ephemeral.track_rename_text = name;
-        self.ui_ephemeral.track_rename_id = Some(track_id);
+        self.cur.peph.track_rename_text = name;
+        self.cur.peph.track_rename_id = Some(track_id);
     }
 
     pub(crate) fn commit_rename_track(&mut self) {
-        let Some(track_id) = self.ui_ephemeral.track_rename_id else {
+        let Some(track_id) = self.cur.peph.track_rename_id else {
             return;
         };
-        self.ui_ephemeral.track_rename_id = None;
-        let new_name = self.ui_ephemeral.track_rename_text.trim().to_string();
-        self.ui_ephemeral.track_rename_text.clear();
+        self.cur.peph.track_rename_id = None;
+        let new_name = self.cur.peph.track_rename_text.trim().to_string();
+        self.cur.peph.track_rename_text.clear();
         if new_name.is_empty() {
             return;
         }
         // 同名なら no-op (r.md #12 の sibling: dirty 化させない)。
         if self
-            .song_doc
+            .cur.song_doc
             .song()
             .tracks
             .iter()
@@ -1276,28 +1288,28 @@ impl AppData {
 
     /// セクション帯の inline 改名を開始する (現在名を編集バッファに seed)。
     pub(crate) fn begin_rename_section(&mut self, id: u32) {
-        let Some(name) = self.song_doc.song().sections.iter().find(|s| s.id == id).map(|s| s.name.clone())
+        let Some(name) = self.cur.song_doc.song().sections.iter().find(|s| s.id == id).map(|s| s.name.clone())
         else {
             return;
         };
-        self.ui_ephemeral.section_rename_text = name;
-        self.ui_ephemeral.section_rename_id = Some(id);
+        self.cur.peph.section_rename_text = name;
+        self.cur.peph.section_rename_id = Some(id);
     }
 
     /// セクション帯の改名を確定する (空名は無視)。
     pub(crate) fn commit_rename_section(&mut self) {
-        let Some(id) = self.ui_ephemeral.section_rename_id else {
+        let Some(id) = self.cur.peph.section_rename_id else {
             return;
         };
-        self.ui_ephemeral.section_rename_id = None;
-        let new_name = self.ui_ephemeral.section_rename_text.trim().to_string();
-        self.ui_ephemeral.section_rename_text.clear();
+        self.cur.peph.section_rename_id = None;
+        let new_name = self.cur.peph.section_rename_text.trim().to_string();
+        self.cur.peph.section_rename_text.clear();
         if new_name.is_empty() {
             return;
         }
         // 同名なら no-op (r.md #12 の sibling: dirty 化させない)。
         if self
-            .song_doc
+            .cur.song_doc
             .song()
             .sections
             .iter()
@@ -1318,7 +1330,7 @@ impl AppData {
     /// `begin_rename_clip` の pre-fill と `commit_rename_clip` の同名判定で共有する
     /// (DRY: 両者が同じ「現在名」を見ることで、 未編集 commit が確実に no-op になる)。
     fn clip_rename_current(&self, content_id: common::model::ContentId) -> String {
-        self.song_doc
+        self.cur.song_doc
             .song()
             .clip_contents
             .get(&content_id)
@@ -1326,12 +1338,12 @@ impl AppData {
             .and_then(|events| events.first())
             .map(|ev| ev.text.clone())
             .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| self.song_doc.song().content_name(content_id).to_string())
+            .unwrap_or_else(|| self.cur.song_doc.song().content_name(content_id).to_string())
     }
 
     pub(crate) fn begin_rename_clip(&mut self, target: ClipKey) {
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -1340,8 +1352,8 @@ impl AppData {
         };
         // 表示されている名前 (= clip_display_label と同じ) を編集開始値にする。
         // Text clip は本文 (= first TextEvent.text) を、 それ以外は content_name を pre-fill。
-        self.ui_ephemeral.clip_rename_text = self.clip_rename_current(content_id);
-        self.ui_ephemeral.clip_rename = Some(target);
+        self.cur.peph.clip_rename_text = self.clip_rename_current(content_id);
+        self.cur.peph.clip_rename = Some(target);
     }
 
     /// clip rename を確定。 clip 名は表示専用 (audio / plugin processing に無関係)
@@ -1355,14 +1367,14 @@ impl AppData {
     /// derived / 空表示へ戻し、 Text は本文をクリアする (旧実装は空文字を無条件
     /// 無視して元の名前に張り付いていた)。
     pub(crate) fn commit_rename_clip(&mut self) {
-        let Some(target) = self.ui_ephemeral.clip_rename else {
+        let Some(target) = self.cur.peph.clip_rename else {
             return;
         };
-        self.ui_ephemeral.clip_rename = None;
-        let new_name = self.ui_ephemeral.clip_rename_text.trim().to_string();
-        self.ui_ephemeral.clip_rename_text.clear();
+        self.cur.peph.clip_rename = None;
+        let new_name = self.cur.peph.clip_rename_text.trim().to_string();
+        self.cur.peph.clip_rename_text.clear();
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -1375,7 +1387,7 @@ impl AppData {
             return;
         }
         let is_text = matches!(
-            self.song_doc.song().clip_contents.get(&content_id),
+            self.cur.song_doc.song().clip_contents.get(&content_id),
             Some(common::model::ClipContent::Text(_))
         );
         if is_text {
@@ -1399,7 +1411,7 @@ impl AppData {
     }
 
     pub(crate) fn ensure_first_track(&mut self) {
-        if self.song_doc.song().tracks.is_empty() {
+        if self.cur.song_doc.song().tracks.is_empty() {
             self.edit_song(|song| {
                 let id = song.alloc_track_id();
                 song.tracks.push(track_with(|t| {
@@ -1472,7 +1484,7 @@ mod launcher_track_paste_tests {
         let mut dst = Song::default();
         dst.push_scene();
 
-        let mut built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, false, false, None);
+        let mut built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, false, false, None, &common::model::MediaRemap::default());
         AppData::remap_pasted_scenes(&mut dst, &mut built, &copies.scenes, false);
 
         // 元で 3 列目 (index 2) だったので、貼り先も 3 列目まで実体化して着地する。
@@ -1492,7 +1504,7 @@ mod launcher_track_paste_tests {
         copies.scenes = vec![scenes[0]];
         let mut dst = Song::default();
 
-        let mut built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, false, false, None);
+        let mut built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, false, false, None, &common::model::MediaRemap::default());
         AppData::remap_pasted_scenes(&mut dst, &mut built, &copies.scenes, false);
 
         assert!(built[0].1.session_clips.is_empty(), "解けない列のセルは残さない");
@@ -1504,7 +1516,7 @@ mod launcher_track_paste_tests {
         let (mut song, tid, cid, scenes) = song_with_cell();
         let copies = copies_of(&song, tid, cid, &scenes);
         // 同一プロジェクトの独立複製 (Alt+D) = force_independent_content。
-        let mut built = AppData::build_pasted_tracks(&mut song, &copies.tracks, true, true, None);
+        let mut built = AppData::build_pasted_tracks(&mut song, &copies.tracks, true, true, None, &common::model::MediaRemap::default());
         AppData::remap_pasted_scenes(&mut song, &mut built, &copies.scenes, true);
 
         let cell = &built[0].1.session_clips[0];

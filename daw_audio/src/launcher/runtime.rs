@@ -424,13 +424,13 @@ impl LauncherRuntime {
 
     /// 走行状態を publish する (表示専用、`Song` には入れない)。
     ///
-    /// `beat` は **`SharedState::playhead` と同じ瞬間の song 拍**を渡すこと。
+    /// `beat` は **`ProjectShared::playhead` と同じ瞬間の song 拍**を渡すこと。
     /// GUI は publish 値 (`launch_beat`) と `playhead` を組にして位相を解くので、
     /// 2 つが別の時間軸を指した 1 フレームは `cell_phase` が `None` を返し、
     /// **ランチャー行の映像 / 画像 / 字幕とピアノロールの再生線がまるごと消える**
     /// (ループ巻き戻し直後の buffer で実際に起きていた)。呼び側は transport の
     /// advance / 巻き戻しを済ませてからここへ来る。
-    pub fn publish(&self, bridge: &common::audio_bridge::AudioBridgeHandle, beat: f64) {
+    pub fn publish(&self, bridge: &common::audio_bridge::ProjectTelemetry, beat: f64) {
         use common::audio_bridge as ab;
         for (slot, row) in self.rows.iter().enumerate() {
             let (state, clip_id, progress, launch_beat) = row_display(row.phase, beat);

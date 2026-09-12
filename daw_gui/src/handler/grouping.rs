@@ -20,7 +20,7 @@ impl AppData {
             }
         }
         // Validate all ids exist before mutating anything.
-        if child_ids.iter().any(|id| self.song_doc.song().track_by_id(*id).is_none()) {
+        if child_ids.iter().any(|id| self.cur.song_doc.song().track_by_id(*id).is_none()) {
             tracing::warn!(?child_ids, "group request: stale track id, abort");
             return;
         }
@@ -34,7 +34,7 @@ impl AppData {
             .iter()
             .copied()
             .filter(|id| {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .track_by_id(*id)
                     .and_then(|t| t.parent_group_id)
                     .is_none_or(|pid| !selected.contains(&pid))
@@ -48,19 +48,19 @@ impl AppData {
         // Live 互換、 視覚的には「子の上にヘッダー行」。
         let top_child_idx = child_ids
             .iter()
-            .filter_map(|id| self.song_doc.song().track_index_by_id(*id))
+            .filter_map(|id| self.cur.song_doc.song().track_index_by_id(*id))
             .min()
-            .unwrap_or(self.song_doc.song().tracks.len());
+            .unwrap_or(self.cur.song_doc.song().tracks.len());
         // Inherit the common parent of the selection if every selected
         // track shared the same `parent_group_id` — preserves Live's
         // behaviour of grouping inside a group keeps you in the parent.
         let common_parent = {
             let first_parent = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .track_by_id(roots[0])
                 .and_then(|t| t.parent_group_id);
             if roots.iter().all(|id| {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .track_by_id(*id)
                     .and_then(|t| t.parent_group_id)
                     == first_parent
@@ -73,7 +73,7 @@ impl AppData {
         let Some(group_id) = self.edit_song(|song| song.alloc_track_id()) else {
             return;
         };
-        let group_index = self.song_doc.song().tracks.len() + 1;
+        let group_index = self.cur.song_doc.song().tracks.len() + 1;
         let group_track = track_with(|t| {
             t.id = group_id;
             t.name = format!("Group {group_index}");
@@ -99,7 +99,7 @@ impl AppData {
         // ヘッダー)。 device のアドレスは安定 `device_id` 一本なので、
         // Vec::insert で既存 track の Vec position が shift しても
         // plugin の lookup は壊れない。
-        let insert_at = top_child_idx.min(self.song_doc.song().tracks.len());
+        let insert_at = top_child_idx.min(self.cur.song_doc.song().tracks.len());
         self.edit_song(|song| song.tracks.insert(insert_at, group_track));
         // 新規 group track を選択状態に (Live 互換: グループ化直後は
         // 親 group が selection cursor になる)。 明示的なトラック面操作なので
@@ -160,10 +160,10 @@ impl AppData {
         for step in plan {
             match *step {
                 TrackRemovalIpc::CloseAudioShmem { device_id } => {
-                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+                    self.send_audio(AudioCommand::ClosePluginShmem { project: self.pk(), device_id });
                 }
                 TrackRemovalIpc::RemoveHostDevice { device_id } => {
-                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
+                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
                 }
             }
         }
@@ -177,8 +177,8 @@ impl AppData {
             if let TrackRemovalIpc::RemoveHostDevice { device_id } = *step {
                 self.cleanup_slot_gui(device_id);
                 self.forget_device_caches(device_id);
-                self.ipc.pending_plugin_loads.remove(&device_id);
-                self.ipc.failed_plugin_loads.remove(&device_id);
+                self.cur.pipc.pending_plugin_loads.remove(&device_id);
+                self.cur.pipc.failed_plugin_loads.remove(&device_id);
             }
         }
     }
@@ -228,22 +228,22 @@ impl AppData {
         // 深さ降順 (子から先に処理)。 同階層なら index 大きい方から。
         groups_to_ungroup.sort_by_key(|id| {
             let depth = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .track_by_id(*id)
                 .map(|t| self.compute_track_depth(t))
                 .unwrap_or(0);
-            (-(depth as i32), -(self.song_doc.song().track_index_by_id(*id).unwrap_or(0) as i32))
+            (-(depth as i32), -(self.cur.song_doc.song().track_index_by_id(*id).unwrap_or(0) as i32))
         });
 
         // 削除する group の device teardown IPC を **Song から外す前に** 組む
         // (`fx_chain_by_track_id` は削除前の Song からしか引けない。 後から呼ぶと
         // plan が空になり IPC が 1 通も出ない = 無言で壊れる)。
         let removal_plan =
-            Self::plan_track_removal_ipc(self.song_doc.song(), &groups_to_ungroup);
+            Self::plan_track_removal_ipc(self.cur.song_doc.song(), &groups_to_ungroup);
 
         let mut new_selection: Vec<u32> = Vec::new();
         for group_id in &groups_to_ungroup {
-            let Some(group_track) = self.song_doc.song().track_by_id(*group_id) else {
+            let Some(group_track) = self.cur.song_doc.song().track_by_id(*group_id) else {
                 continue;
             };
             let new_parent = group_track.parent_group_id;
@@ -255,13 +255,13 @@ impl AppData {
                     }
                 }
             });
-            if let Some(pos) = self.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
+            if let Some(pos) = self.cur.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
                 self.edit_song(|song| song.tracks.remove(pos));
                 // 消えた group track が所有していたモジュレーターと、その変調の深さを
                 // 指していたレーン / 変調の後始末 (track 削除経路と同じ 1 本)。
                 self.cleanup_modulation_after_track_removal();
             }
-            self.ui_prefs.collapsed_groups.remove(group_id);
+            self.cur.view.collapsed_groups.remove(group_id);
         }
 
         // **song update + LoadSong を先に送る** → daw_audio engine が
@@ -303,7 +303,7 @@ impl AppData {
             return;
         }
         if let Some(pid) = parent_id {
-            if self.song_doc.song().track_by_id(pid).is_none() {
+            if self.cur.song_doc.song().track_by_id(pid).is_none() {
                 tracing::warn!(track_id, parent_id = pid, "ignored: parent track not found");
                 return;
             }
@@ -317,13 +317,13 @@ impl AppData {
                     return;
                 }
                 hops += 1;
-                if hops > self.song_doc.song().tracks.len() as u32 + 1 {
+                if hops > self.cur.song_doc.song().tracks.len() as u32 + 1 {
                     // Existing graph already has a cycle; abort to avoid an infinite loop.
                     tracing::error!("existing parent chain is cyclic; aborting reparent");
                     return;
                 }
                 cursor = self
-                    .song_doc.song()
+                    .cur.song_doc.song()
                     .track_by_id(c)
                     .and_then(|t| t.parent_group_id);
             }
@@ -343,16 +343,16 @@ impl AppData {
     }
 
     pub(crate) fn action_remove_last_track(&mut self) {
-        let len = self.song_doc.song().tracks.len();
+        let len = self.cur.song_doc.song().tracks.len();
         if len == 0 {
             return;
         }
         // device teardown の IPC は **pop する前に** 組む (Song から外した後では
         // chain を列挙できず、 plan が空 = IPC が 1 通も出ない)。
-        let Some(last_id) = self.song_doc.song().tracks.last().map(|t| t.id) else {
+        let Some(last_id) = self.cur.song_doc.song().tracks.last().map(|t| t.id) else {
             return;
         };
-        let removal_plan = Self::plan_track_removal_ipc(self.song_doc.song(), &[last_id]);
+        let removal_plan = Self::plan_track_removal_ipc(self.cur.song_doc.song(), &[last_id]);
         // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
         let Some(Some(removed)) = self.edit_song(|song| song.tracks.pop()) else {
             return;
@@ -376,14 +376,14 @@ impl AppData {
         // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
         // 空なら最後尾にフォールバック。
         let live_ids: std::collections::HashSet<u32> =
-            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
-        self.selection.selected_track_ids.retain(|id| live_ids.contains(id));
-        if self.selection.selected_track_ids.is_empty()
-            && let Some(t) = self.song_doc.song().tracks.last()
+            self.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
+        self.cur.selection.selected_track_ids.retain(|id| live_ids.contains(id));
+        if self.cur.selection.selected_track_ids.is_empty()
+            && let Some(t) = self.cur.song_doc.song().tracks.last()
         {
-            self.selection.selected_track_ids.push(t.id);
+            self.cur.selection.selected_track_ids.push(t.id);
         }
-        self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));
+        self.cur.view.collapsed_groups.retain(|id| live_ids.contains(id));
         // 範囲は「区間 × 行」しか持たないので、消えたトラックの行を落とすだけ。
         self.prune_selection_lanes();
         self.resize_track_peak_display();

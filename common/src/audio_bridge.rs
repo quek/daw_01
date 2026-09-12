@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use anyhow::Result;
 
 use crate::mod_plane::ModPlane;
+use crate::protocol::ProjectKey;
 use crate::shmem::NamedShmem;
 
 /// (A1 r.md #8) フォールバック既定サンプルレート。 通常はランタイムで
@@ -21,11 +22,15 @@ pub const MAX_TRACKS: usize = 32;
 /// docs/plan_modulation.md §4.2: hard cap for the modulation-scalar ring in
 /// shmem. `Song::mod_sources` beyond this index don't publish a scalar (their
 /// `EnvelopeFollow` node isn't emitted). スロットの**並び**は engine の compile 順
-/// だが、読み手は並びではなく [`AudioBridge::mod_slot_ids`] の id で引く
+/// だが、読み手は並びではなく [`ProjectTelemetry::mod_slot_ids`] の id で引く
 /// (`docs/plan_rmd_88_89_cross_modulation.md` §4-2、アーキ不変条件 1)。
 pub const MAX_MOD_SOURCES: usize = 64;
+/// `docs/plan_project_tabs.md` §0: 同時に開けるプロジェクト (= タブ) の上限。
+/// engine の per-project RT 状態は開いている数だけ確保するが、telemetry 面
+/// ([`AudioBridge::projects`]) は shmem なのでここで固定する。
+pub const MAX_PROJECTS: usize = 32;
 
-/// [`AudioBridgeHandle::read_mod_plane`] が seqlock の読み直しを諦めるまでの回数。
+/// [`ProjectTelemetry::read_mod_plane`] が seqlock の読み直しを諦めるまでの回数。
 /// 書き手は 1 buffer に 1 回しか面を触らないので、30Hz の読み手が 8 回連続で
 /// 書き込み中に当たることは実質ない (当たったら「今回は更新なし」に倒す)。
 const MOD_PLANE_READ_RETRIES: usize = 8;
@@ -54,6 +59,10 @@ pub const LAUNCHER_STATE_STOPPED: u32 = 2;
 pub const LAUNCHER_QUEUED_STOP: u32 = u32::MAX;
 /// [`LauncherRowState::queued_clip_id`] が「アレンジへ返す予約」を表す値。
 pub const LAUNCHER_QUEUED_ARRANGER: u32 = u32::MAX - 1;
+
+/// [`ProjectTelemetry::playhead_samples`] の「まだ再生位置が無い」sentinel
+/// (slot を claim した直後 / まだ 1 buffer も回っていない)。
+pub const PLAYHEAD_UNSET: u64 = u64::MAX;
 
 /// r.md #87: 1 行ぶんの走行状態 (表示専用)。
 ///
@@ -96,8 +105,8 @@ pub struct LauncherRowState {
     pub launch_beat_bits: AtomicU64,
 }
 
-/// Shared memory telemetry plane: daw_audio (writer) → daw_gui (30Hz
-/// polling reader)。
+/// 1 プロジェクト (= タブ) ぶんの telemetry 面: daw_audio (writer) → daw_gui (30Hz
+/// polling reader)。`docs/plan_project_tabs.md` §2.5。
 ///
 /// `playhead_samples` is published by **daw_audio** at the end of every
 /// buffer so daw_gui can poll it (once per UI tick) for playhead-row
@@ -111,19 +120,16 @@ pub struct LauncherRowState {
 ///
 /// All fields are lock-free Acquire/Release atomics — readers tolerate any
 /// value they happen to observe.
-///
-/// v29 (`docs/plan_arch_refactor.md` §2): 旧 `frames_requested` / `samples`
-/// 面 (M0 時代の request/ready セマフォ往復データプレーン) は writer /
-/// reader とも存在しない死んだ protocol だったため削除。音声データは
-/// per-plugin の `ProcessData` shmem + `WorkerBridge` dispatch が運ぶ。
 #[repr(C)]
-pub struct AudioBridge {
+pub struct ProjectTelemetry {
+    /// この slot がどのプロジェクトの面か (`ProjectKey.0`)。**`0` = 空きスロット。**
+    /// writer (daw_audio) が `OpenProject` で CAS claim し、`CloseProject` で 0 に戻す。
+    /// 読み手は index ではなくこの値で自分の slot を引く (アーキ不変条件 1)。
+    pub project_key: AtomicU64,
     pub playhead_samples: AtomicU64,
     /// Per-track post-fader peaks, `[track][0=L, 1=R]`, as `f32::to_bits`.
-    /// Written by **daw_audio** after summing each track into the master
-    /// bus (`engine.rs` / `main.rs` の `set_track_peak`); read by daw_gui on
-    /// its UI tick。(v29: 旧 daw_plugin_host request/ready data plane 撤去に伴い
-    /// writer は daw_audio に一本化 — module doc 参照。)
+    /// Written by **daw_audio** after summing each track into the project bus
+    /// (`engine.rs` の `set_track_peak`); read by daw_gui on its UI tick。
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
     /// Per-track のゲインリダクション (dB、0 以下、`f32::to_bits`)。
     /// 内蔵チャンネルストリップのコンプが buffer ごとに書き、mixer strip の
@@ -142,7 +148,7 @@ pub struct AudioBridge {
     /// polled by the GUI at ~30Hz alongside `track_peaks` and applied to
     /// modulated params.
     ///
-    /// **slot の意味は [`AudioBridge::mod_slot_ids`] が持つ。** 位置で引かないこと
+    /// **slot の意味は [`Self::mod_slot_ids`] が持つ。** 位置で引かないこと
     /// (`docs/plan_rmd_88_89_cross_modulation.md` §4-2)。
     pub mod_scalars: [AtomicU32; MAX_MOD_SOURCES],
     /// r.md #89: `mod_scalars[i]` が**どのソースの値か** (`ModSource::id`)。
@@ -165,7 +171,7 @@ pub struct AudioBridge {
     /// 0 = count-in 中ではない / 完了済。 `StartRecording` 受信時に audio
     /// thread が値を立てる。 **これ単体で「count-in が終わったか」を判定しては
     /// いけない** — 0 は「まだ始まっていない」も意味するので、録音実体の開始判定は
-    /// [`AudioBridge::recording_live`] を見る (r.md #51)。
+    /// [`Self::recording_live`] を見る (r.md #51)。
     pub preroll_remaining_samples: AtomicU64,
     /// r.md #51: engine が今 transport を回しているか (0/1)。
     ///
@@ -195,13 +201,30 @@ pub struct AudioBridge {
     pub voice_off_secs: [[AtomicU64; MAX_PUBLISHED_VOICES]; MAX_TRACKS],
 }
 
+/// Shared memory telemetry plane: `MAX_PROJECTS` 個の [`ProjectTelemetry`]。
+/// daw_gui (親) が bootstrap で **プロセス生存中 1 度だけ** create する
+/// (`plugin_ref` の命名契約)。
+///
+/// v29 (`docs/plan_arch_refactor.md` §2): 旧 `frames_requested` / `samples`
+/// 面 (M0 時代の request/ready セマフォ往復データプレーン) は writer /
+/// reader とも存在しない死んだ protocol だったため削除。音声データは
+/// per-plugin の `ProcessData` shmem + `WorkerBridge` dispatch が運ぶ。
+#[repr(C)]
+pub struct AudioBridge {
+    pub projects: [ProjectTelemetry; MAX_PROJECTS],
+}
+
 impl AudioBridge {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
 /// r.md #117: 1 track のボイス面を seqlock で **1 回** 読む試行。 書き込み中 / 世代が
 /// 変わっていたら `false` (`out` には途中まで積まれているので呼び側が truncate する)。
-fn read_track_voices_once(b: &AudioBridge, track: usize, out: &mut Vec<(usize, VoiceSnapshot)>) -> bool {
+fn read_track_voices_once(
+    b: &ProjectTelemetry,
+    track: usize,
+    out: &mut Vec<(usize, VoiceSnapshot)>,
+) -> bool {
     let g0 = b.voice_generation[track].load(Ordering::Acquire);
     if g0 & 1 != 0 {
         return false;
@@ -231,7 +254,7 @@ pub struct VoiceSnapshot {
     pub off_secs: Option<f64>,
 }
 
-/// r.md #87: [`AudioBridgeHandle::launcher_row`] が返す 1 行ぶんの値
+/// r.md #87: [`ProjectTelemetry::launcher_row`] が返す 1 行ぶんの値
 /// ([`LauncherRowState`] の atomic を全部読んだ結果の組)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LauncherRowSnapshot {
@@ -247,49 +270,44 @@ pub struct LauncherRowSnapshot {
     pub launch_beat: f64,
 }
 
-/// Owning handle to the audio shared memory region.
-pub struct AudioBridgeHandle {
-    shmem: NamedShmem,
-}
-
-impl AudioBridgeHandle {
-    pub fn create(os_id: &str) -> Result<Self> {
-        let shmem = NamedShmem::create(os_id, AudioBridge::SIZE)?;
-        // Zero-initialize so the AtomicU32 starts at 0 and samples are silent.
-        unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, AudioBridge::SIZE) };
-        let handle = Self { shmem };
-        // Publish the "not playing" sentinel before any reader polls, so the
-        // GUI highlight is off until plugin_host announces a real playhead.
-        handle.set_playhead_samples(u64::MAX);
-        Ok(handle)
+impl ProjectTelemetry {
+    /// この slot のプロジェクト (`ProjectKey::NONE` = 空き)。
+    #[must_use]
+    pub fn key(&self) -> ProjectKey {
+        ProjectKey(self.project_key.load(Ordering::Acquire))
     }
 
-    pub fn open(os_id: &str) -> Result<Self> {
-        let shmem = NamedShmem::open(os_id, AudioBridge::SIZE)?;
-        Ok(Self { shmem })
-    }
-
-    fn ptr(&self) -> *mut AudioBridge {
-        self.shmem.as_ptr() as *mut AudioBridge
-    }
-
-    pub fn bridge(&self) -> &AudioBridge {
-        unsafe { &*self.ptr() }
+    /// 面を「何も鳴っていない」状態に戻す (claim の直前 / 解放の直後)。前の
+    /// プロジェクトの値が新しいプロジェクトの初回 tick に見えないようにする。
+    /// off-RT (recv loop) で呼ぶ。`project_key` は触らない。
+    fn reset(&self) {
+        self.playhead_samples.store(PLAYHEAD_UNSET, Ordering::Release);
+        self.clear_track_meters();
+        self.publish_mod_plane(&ModPlane::default());
+        self.preroll_remaining_samples.store(0, Ordering::Release);
+        self.playing.store(0, Ordering::Release);
+        self.recording_live.store(0, Ordering::Release);
+        for cell in &self.launcher_rows {
+            cell.row_key.store(0, Ordering::Release);
+        }
+        for t in 0..MAX_TRACKS {
+            self.publish_track_voices(t, std::iter::empty());
+        }
     }
 
     pub fn set_playhead_samples(&self, n: u64) {
-        self.bridge().playhead_samples.store(n, Ordering::Release);
+        self.playhead_samples.store(n, Ordering::Release);
     }
 
     pub fn playhead_samples(&self) -> u64 {
-        self.bridge().playhead_samples.load(Ordering::Acquire)
+        self.playhead_samples.load(Ordering::Acquire)
     }
 
     /// Publishes one track's post-fader peak pair. Out-of-range track
     /// indices (beyond `MAX_TRACKS`) are silently dropped — the track is
     /// still mixed, it just doesn't get a meter.
     pub fn set_track_peak(&self, track: usize, l: f32, r: f32) {
-        let Some(slot) = self.bridge().track_peaks.get(track) else {
+        let Some(slot) = self.track_peaks.get(track) else {
             return;
         };
         slot[0].store(l.to_bits(), Ordering::Release);
@@ -299,7 +317,7 @@ impl AudioBridgeHandle {
     /// マスターストリップの GR を publish する (`[0] = コンプ / [1] = リミッター`、
     /// dB、0 以下)。audio thread が毎 buffer 呼ぶ。
     pub fn set_master_gr_db(&self, comp_db: f32, limiter_db: f32) {
-        let slot = &self.bridge().master_gr_db;
+        let slot = &self.master_gr_db;
         slot[0].store(comp_db.to_bits(), Ordering::Release);
         slot[1].store(limiter_db.to_bits(), Ordering::Release);
     }
@@ -307,7 +325,7 @@ impl AudioBridgeHandle {
     /// マスターストリップの GR `(コンプ, リミッター)` を読む (GUI の UI tick)。
     #[must_use]
     pub fn master_gr_db(&self) -> (f32, f32) {
-        let slot = &self.bridge().master_gr_db;
+        let slot = &self.master_gr_db;
         (
             f32::from_bits(slot[0].load(Ordering::Acquire)),
             f32::from_bits(slot[1].load(Ordering::Acquire)),
@@ -329,14 +347,14 @@ impl AudioBridgeHandle {
 
     /// Publishes one track's gain reduction (dB, 0 以下)。範囲外の index は捨てる。
     pub fn set_track_gr_db(&self, track: usize, gr_db: f32) {
-        let Some(slot) = self.bridge().track_gr_db.get(track) else {
+        let Some(slot) = self.track_gr_db.get(track) else {
             return;
         };
         slot.store(gr_db.to_bits(), Ordering::Release);
     }
 
     pub fn track_peak(&self, track: usize) -> (f32, f32) {
-        let Some(slot) = self.bridge().track_peaks.get(track) else {
+        let Some(slot) = self.track_peaks.get(track) else {
             return (0.0, 0.0);
         };
         let l = f32::from_bits(slot[0].load(Ordering::Acquire));
@@ -344,46 +362,36 @@ impl AudioBridgeHandle {
         (l, r)
     }
 
-    /// Fills `out` with `(L, R)` peaks for tracks 0..`out.len()`.
-    /// Out-of-range tracks are reported as `(0.0, 0.0)`.
     /// Phase 7 B4 Step C: count-in 残り samples を audio thread が更新。
     /// `StartRecording` 受信時に audio thread が preroll を立て、
     /// `process_buffer` が preroll > 0 ループ内で毎 buffer 更新する。
     /// 0 到達で通常再生に戻る。
     pub fn set_preroll_remaining(&self, n: u64) {
-        self.bridge()
-            .preroll_remaining_samples
-            .store(n, Ordering::Release);
+        self.preroll_remaining_samples.store(n, Ordering::Release);
     }
 
     pub fn preroll_remaining(&self) -> u64 {
-        self.bridge()
-            .preroll_remaining_samples
-            .load(Ordering::Acquire)
+        self.preroll_remaining_samples.load(Ordering::Acquire)
     }
 
     /// r.md #51: engine の transport 走行状態を publish する (audio thread が
     /// 毎 buffer 呼ぶ)。読み手は GUI の playhead poller。
     pub fn set_playing(&self, playing: bool) {
-        self.bridge()
-            .playing
-            .store(u32::from(playing), Ordering::Release);
+        self.playing.store(u32::from(playing), Ordering::Release);
     }
 
     pub fn playing(&self) -> bool {
-        self.bridge().playing.load(Ordering::Acquire) != 0
+        self.playing.load(Ordering::Acquire) != 0
     }
 
     /// r.md #51: 「今ノートを記録してよいか」を publish する (audio thread が
     /// 毎 buffer 呼ぶ)。count-in 明けの立ち上がりもここが唯一の合図。
     pub fn set_recording_live(&self, live: bool) {
-        self.bridge()
-            .recording_live
-            .store(u32::from(live), Ordering::Release);
+        self.recording_live.store(u32::from(live), Ordering::Release);
     }
 
     pub fn recording_live(&self) -> bool {
-        self.bridge().recording_live.load(Ordering::Acquire) != 0
+        self.recording_live.load(Ordering::Acquire) != 0
     }
 
     /// Fills `out` with `(peak L, peak R, gain reduction dB)` for every track slot.
@@ -393,10 +401,10 @@ impl AudioBridgeHandle {
     pub fn track_meters(&self, out: &mut Vec<(f32, f32, f32)>) {
         out.clear();
         for i in 0..MAX_TRACKS {
-            let slot = &self.bridge().track_peaks[i];
+            let slot = &self.track_peaks[i];
             let l = f32::from_bits(slot[0].load(Ordering::Acquire));
             let r = f32::from_bits(slot[1].load(Ordering::Acquire));
-            let gr = f32::from_bits(self.bridge().track_gr_db[i].load(Ordering::Acquire));
+            let gr = f32::from_bits(self.track_gr_db[i].load(Ordering::Acquire));
             out.push((l, r, gr));
         }
     }
@@ -410,23 +418,20 @@ impl AudioBridgeHandle {
     ///
     /// RT 安全: atomic store のみ (確保・ロック・I/O なし)。
     pub fn publish_mod_plane(&self, plane: &ModPlane) {
-        let b = self.bridge();
-        let g = b.mod_plane_generation.load(Ordering::Relaxed);
+        let g = self.mod_plane_generation.load(Ordering::Relaxed);
         // 奇数 = 書き込み中。以降のデータ書き込みがこの store より前へ回らない
         // ように Release fence で仕切る (store 自体は Relaxed で十分)。
-        b.mod_plane_generation
-            .store(g.wrapping_add(1), Ordering::Relaxed);
+        self.mod_plane_generation.store(g.wrapping_add(1), Ordering::Relaxed);
         fence(Ordering::Release);
         let ids = plane.ids();
         let values = plane.values();
         for i in 0..MAX_MOD_SOURCES {
             let id = ids.get(i).copied().unwrap_or(0);
             let v = values.get(i).copied().unwrap_or(0.0);
-            b.mod_slot_ids[i].store(id, Ordering::Relaxed);
-            b.mod_scalars[i].store(v.to_bits(), Ordering::Relaxed);
+            self.mod_slot_ids[i].store(id, Ordering::Relaxed);
+            self.mod_scalars[i].store(v.to_bits(), Ordering::Relaxed);
         }
-        b.mod_plane_generation
-            .store(g.wrapping_add(2), Ordering::Release);
+        self.mod_plane_generation.store(g.wrapping_add(2), Ordering::Release);
     }
 
     /// r.md #89: 値面を seqlock で読む (GUI の 30Hz poller)。
@@ -435,22 +440,21 @@ impl AudioBridgeHandle {
     /// 破れたら `false` を返して `out` は触らない (= 前回値を保つ)。
     /// `out` は使い回すので確保は起きない。
     pub fn read_mod_plane(&self, out: &mut ModPlane) -> bool {
-        let b = self.bridge();
         for _ in 0..MOD_PLANE_READ_RETRIES {
-            let g0 = b.mod_plane_generation.load(Ordering::Acquire);
+            let g0 = self.mod_plane_generation.load(Ordering::Acquire);
             if g0 & 1 != 0 {
                 continue; // 書き込み中
             }
             out.clear();
             for i in 0..MAX_MOD_SOURCES {
-                let id = b.mod_slot_ids[i].load(Ordering::Relaxed);
-                let v = f32::from_bits(b.mod_scalars[i].load(Ordering::Relaxed));
+                let id = self.mod_slot_ids[i].load(Ordering::Relaxed);
+                let v = f32::from_bits(self.mod_scalars[i].load(Ordering::Relaxed));
                 if id != 0 {
                     out.push(id, v);
                 }
             }
             fence(Ordering::Acquire);
-            if b.mod_plane_generation.load(Ordering::Relaxed) == g0 {
+            if self.mod_plane_generation.load(Ordering::Relaxed) == g0 {
                 return true;
             }
         }
@@ -460,20 +464,20 @@ impl AudioBridgeHandle {
     /// r.md #117: 1 track の鳴っているボイスを publish する (audio thread、 毎 buffer)。
     /// [`MAX_PUBLISHED_VOICES`] を超えるぶんは捨てる。 RT 安全: atomic store のみ。
     pub fn publish_track_voices(&self, track: usize, voices: impl Iterator<Item = VoiceSnapshot>) {
-        let b = self.bridge();
-        let Some(generation) = b.voice_generation.get(track) else { return };
+        let Some(generation) = self.voice_generation.get(track) else { return };
         let g = generation.load(Ordering::Relaxed);
         generation.store(g.wrapping_add(1), Ordering::Relaxed);
         fence(Ordering::Release);
         let mut n = 0usize;
         for v in voices.take(MAX_PUBLISHED_VOICES) {
-            b.voice_on_beat[track][n].store(v.on_beat.to_bits(), Ordering::Relaxed);
-            b.voice_on_secs[track][n].store(v.on_secs.to_bits(), Ordering::Relaxed);
-            b.voice_off_secs[track][n].store(v.off_secs.unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
+            self.voice_on_beat[track][n].store(v.on_beat.to_bits(), Ordering::Relaxed);
+            self.voice_on_secs[track][n].store(v.on_secs.to_bits(), Ordering::Relaxed);
+            self.voice_off_secs[track][n]
+                .store(v.off_secs.unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
             n += 1;
         }
         #[allow(clippy::cast_possible_truncation)]
-        b.voice_len[track].store(n as u32, Ordering::Relaxed);
+        self.voice_len[track].store(n as u32, Ordering::Relaxed);
         generation.store(g.wrapping_add(2), Ordering::Release);
     }
 
@@ -481,13 +485,12 @@ impl AudioBridgeHandle {
     /// track ごとの seqlock で、 書き込み中に当たった track はその tick では省く
     /// (= 前回値が残る)。 `out` は使い回す。
     pub fn track_voices(&self, out: &mut Vec<(usize, VoiceSnapshot)>) {
-        let b = self.bridge();
         out.clear();
         for track in 0..MAX_TRACKS {
             let start = out.len();
             let ok = (0..MOD_PLANE_READ_RETRIES).any(|_| {
                 out.truncate(start);
-                read_track_voices_once(b, track, out)
+                read_track_voices_once(self, track, out)
             });
             if !ok {
                 out.truncate(start);
@@ -512,7 +515,7 @@ impl AudioBridgeHandle {
         progress: f32,
         launch_beat: f64,
     ) {
-        let Some(cell) = self.bridge().launcher_rows.get(slot) else {
+        let Some(cell) = self.launcher_rows.get(slot) else {
             return;
         };
         cell.state.store(state, Ordering::Release);
@@ -533,7 +536,7 @@ impl AudioBridgeHandle {
 
     /// r.md #87: `slot` 以降を「空き」にする (engine が publish した行数より後ろ)。
     pub fn clear_launcher_rows_from(&self, slot: usize) {
-        for cell in self.bridge().launcher_rows.iter().skip(slot) {
+        for cell in self.launcher_rows.iter().skip(slot) {
             if cell.row_key.load(Ordering::Acquire) == 0 {
                 break;
             }
@@ -548,27 +551,27 @@ impl AudioBridgeHandle {
         // 格納値は `row_key + 1` (0 = 空きスロット)。`row_key` が 0 の行
         // (track_id / lane_id とも 0) も**正しく引ける**ようにここで +1 する。
         let want = ((u64::from(track_id) << 32) | u64::from(lane_id)).saturating_add(1);
-        for cell in &self.bridge().launcher_rows {
+        for cell in &self.launcher_rows {
             let key = cell.row_key.load(Ordering::Acquire);
             if key == 0 {
                 break;
             }
             if key == want {
-                return Some(LauncherRowSnapshot {
-                    state: cell.state.load(Ordering::Acquire),
-                    playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
-                    queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
-                    queued_at_beat: f64::from_bits(
-                        cell.queued_at_beat_bits.load(Ordering::Acquire),
-                    ),
-                    progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
-                    launch_beat: f64::from_bits(
-                        cell.launch_beat_bits.load(Ordering::Acquire),
-                    ),
-                });
+                return Some(Self::launcher_snapshot(cell));
             }
         }
         None
+    }
+
+    fn launcher_snapshot(cell: &LauncherRowState) -> LauncherRowSnapshot {
+        LauncherRowSnapshot {
+            state: cell.state.load(Ordering::Acquire),
+            playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
+            queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
+            queued_at_beat: f64::from_bits(cell.queued_at_beat_bits.load(Ordering::Acquire)),
+            progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
+            launch_beat: f64::from_bits(cell.launch_beat_bits.load(Ordering::Acquire)),
+        }
     }
 
     /// r.md #87: publish 済みの行を **まとめて** 読み出す (GUI の 30Hz poller 用)。
@@ -579,7 +582,7 @@ impl AudioBridgeHandle {
     /// 行数ぶん呼ぶと O(n²) になる。表示側は全行ぶん要るのでこちらを使う。
     pub fn launcher_row_snapshots(&self, out: &mut Vec<(u64, LauncherRowSnapshot)>) {
         out.clear();
-        for cell in &self.bridge().launcher_rows {
+        for cell in &self.launcher_rows {
             // publisher は `row_key` を最後に書くので、ここで先に読めば
             // 「新しい key と古い値」の組は見えない (set_launcher_row の doc)。
             // 格納値は `row_key + 1` (0 = 空きスロット)。
@@ -587,23 +590,97 @@ impl AudioBridgeHandle {
             if stored == 0 {
                 break;
             }
-            let key = stored - 1;
-            out.push((
-                key,
-                LauncherRowSnapshot {
-                    state: cell.state.load(Ordering::Acquire),
-                    playing_clip_id: cell.playing_clip_id.load(Ordering::Acquire),
-                    queued_clip_id: cell.queued_clip_id.load(Ordering::Acquire),
-                    queued_at_beat: f64::from_bits(
-                        cell.queued_at_beat_bits.load(Ordering::Acquire),
-                    ),
-                    progress: f32::from_bits(cell.progress_bits.load(Ordering::Acquire)),
-                    launch_beat: f64::from_bits(
-                        cell.launch_beat_bits.load(Ordering::Acquire),
-                    ),
-                },
-            ));
+            out.push((stored - 1, Self::launcher_snapshot(cell)));
         }
+    }
+}
+
+/// Owning handle to the audio shared memory region.
+pub struct AudioBridgeHandle {
+    shmem: NamedShmem,
+}
+
+impl AudioBridgeHandle {
+    pub fn create(os_id: &str) -> Result<Self> {
+        let shmem = NamedShmem::create(os_id, AudioBridge::SIZE)?;
+        // Zero-initialize so every slot starts free (`project_key == 0`) and silent.
+        unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, AudioBridge::SIZE) };
+        let handle = Self { shmem };
+        for slot in &handle.bridge().projects {
+            slot.reset();
+        }
+        Ok(handle)
+    }
+
+    pub fn open(os_id: &str) -> Result<Self> {
+        let shmem = NamedShmem::open(os_id, AudioBridge::SIZE)?;
+        Ok(Self { shmem })
+    }
+
+    fn ptr(&self) -> *mut AudioBridge {
+        self.shmem.as_ptr() as *mut AudioBridge
+    }
+
+    pub fn bridge(&self) -> &AudioBridge {
+        unsafe { &*self.ptr() }
+    }
+
+    /// writer (daw_audio, off-RT): `key` 用の空き slot を claim する。面を reset して
+    /// から `project_key` を **最後に** publish するので、読み手が key で見つけた時点で
+    /// 中身は「何も鳴っていない」状態。満杯なら `None`。同じ key を 2 度 claim すると
+    /// 既存 slot を返す (respawn 後の再構築で冪等)。
+    pub fn claim_project_slot(&self, key: ProjectKey) -> Option<usize> {
+        debug_assert!(key.is_some(), "ProjectKey::NONE は空きスロットの印なので claim 不可");
+        let slots = &self.bridge().projects;
+        if let Some(i) = slots.iter().position(|s| s.key() == key) {
+            return Some(i);
+        }
+        for (i, s) in slots.iter().enumerate() {
+            if s.project_key.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            s.reset();
+            if s.project_key
+                .compare_exchange(0, key.0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// writer: slot を空きに戻す (`CloseProject`)。面も reset するので、読み手が
+    /// 1 tick 遅れて覗いても前のプロジェクトの値は見えない。
+    pub fn release_project_slot(&self, slot: usize) {
+        if let Some(s) = self.bridge().projects.get(slot) {
+            s.project_key.store(0, Ordering::Release);
+            s.reset();
+        }
+    }
+
+    /// slot index で引く (writer 側 — `ProjectRt` が claim 時の index を持つ)。
+    #[must_use]
+    pub fn project(&self, slot: usize) -> &ProjectTelemetry {
+        &self.bridge().projects[slot]
+    }
+
+    /// reader (daw_gui): `key` の面を線形走査で引く (≤ `MAX_PROJECTS`、tick ごと)。
+    /// まだ claim されていない (OpenProject が届く前) / 解放済みなら `None`。
+    #[must_use]
+    pub fn find_project(&self, key: ProjectKey) -> Option<&ProjectTelemetry> {
+        self.bridge().projects.iter().find(|s| s.key() == key)
+    }
+
+    /// reader: 使用中の slot を `(key, 面)` で列挙する (タブの ▶ 表示用)。
+    pub fn live_projects(&self) -> impl Iterator<Item = (ProjectKey, &ProjectTelemetry)> {
+        self.bridge()
+            .projects
+            .iter()
+            .filter_map(|s| {
+                let k = s.key();
+                k.is_some().then_some((k, s))
+            })
     }
 }
 
@@ -620,19 +697,62 @@ pub fn shmem_id(parent_pid: u32) -> String {
 mod tests {
     use super::*;
 
+    fn bridge(tag: &str) -> (AudioBridgeHandle, usize) {
+        let name = format!("daw01_test_{tag}_{}", std::process::id());
+        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        let slot = h.claim_project_slot(ProjectKey(1)).expect("slot");
+        (h, slot)
+    }
+
+    /// `docs/plan_project_tabs.md` §2.5: slot は key で claim / release し、読み手は
+    /// index ではなく key で引く。解放した slot は再利用でき、前の値は残らない。
+    #[test]
+    fn project_slot_は_key_で往復し解放後は前の値が残らない() {
+        let name = format!("daw01_test_slots_{}", std::process::id());
+        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        assert!(h.find_project(ProjectKey(7)).is_none());
+        let a = h.claim_project_slot(ProjectKey(7)).unwrap();
+        let b = h.claim_project_slot(ProjectKey(9)).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(h.claim_project_slot(ProjectKey(7)), Some(a), "同じ key は冪等");
+        h.project(a).set_playhead_samples(4800);
+        h.project(a).set_playing(true);
+        assert_eq!(h.find_project(ProjectKey(7)).unwrap().playhead_samples(), 4800);
+        assert_eq!(h.live_projects().count(), 2);
+
+        h.release_project_slot(a);
+        assert!(h.find_project(ProjectKey(7)).is_none());
+        assert_eq!(h.live_projects().count(), 1);
+        let c = h.claim_project_slot(ProjectKey(11)).unwrap();
+        assert_eq!(c, a, "空いた slot が再利用される");
+        let t = h.find_project(ProjectKey(11)).unwrap();
+        assert_eq!(t.playhead_samples(), PLAYHEAD_UNSET, "前の playhead が残らない");
+        assert!(!t.playing());
+    }
+
+    #[test]
+    fn slot_が満杯なら_claim_は_none() {
+        let name = format!("daw01_test_full_{}", std::process::id());
+        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        for i in 0..MAX_PROJECTS {
+            assert!(h.claim_project_slot(ProjectKey(i as u64 + 1)).is_some());
+        }
+        assert_eq!(h.claim_project_slot(ProjectKey(999)), None);
+    }
+
     /// r.md #87: **`row_key == 0` の行 (track_id 0 / lane_id 0) も GUI へ届く。**
     /// 空きスロットの印と実 key が衝突していたときは、その行で読み取りが打ち切られ、
     /// 以降の行が丸ごと届かなかった (= セルの進捗が一切出ない)。
     #[test]
     fn 行キー_0_の行も読み出せる() {
-        let name = format!("daw01_test_bridge_{}", std::process::id());
-        let h = AudioBridgeHandle::create(&name).expect("bridge");
-        h.set_launcher_row(0, 0, LAUNCHER_STATE_PLAYING, 7, 0, 0.0, 0.25, 4.0);
-        h.set_launcher_row(1, (1_u64 << 32) | 2, LAUNCHER_STATE_STOPPED, 0, 9, 12.0, 0.0, 0.0);
-        h.clear_launcher_rows_from(2);
+        let (h, slot) = bridge("bridge");
+        let t = h.project(slot);
+        t.set_launcher_row(0, 0, LAUNCHER_STATE_PLAYING, 7, 0, 0.0, 0.25, 4.0);
+        t.set_launcher_row(1, (1_u64 << 32) | 2, LAUNCHER_STATE_STOPPED, 0, 9, 12.0, 0.0, 0.0);
+        t.clear_launcher_rows_from(2);
 
         let mut out = Vec::new();
-        h.launcher_row_snapshots(&mut out);
+        t.launcher_row_snapshots(&mut out);
         assert_eq!(out.len(), 2, "2 行とも届く: {out:?}");
         assert_eq!(out[0].0, 0, "1 行目の key は 0 (track_id 0 / lane_id 0)");
         assert_eq!(out[0].1.playing_clip_id, 7);
@@ -641,7 +761,7 @@ mod tests {
         assert_eq!(out[1].1.queued_clip_id, 9);
         assert!((out[1].1.queued_at_beat - 12.0).abs() < 1e-9);
         // 単発引きも同じ行を引ける。
-        let one = h.launcher_row(0, 0).expect("row_key 0 も引ける");
+        let one = t.launcher_row(0, 0).expect("row_key 0 も引ける");
         assert_eq!(one.playing_clip_id, 7);
     }
 
@@ -649,17 +769,17 @@ mod tests {
     /// 値が残っても、id が一致するものだけが返る。
     #[test]
     fn 変調値面は_id_で往復し消えたソースは残らない() {
-        let name = format!("daw01_test_modplane_{}", std::process::id());
-        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        let (h, slot) = bridge("modplane");
+        let t = h.project(slot);
 
         let mut published = crate::mod_plane::ModPlane::default();
         published.push(11, 0.25);
         published.push(4, 0.5);
         published.push(9, 0.75);
-        h.publish_mod_plane(&published);
+        t.publish_mod_plane(&published);
 
         let mut got = crate::mod_plane::ModPlane::default();
-        assert!(h.read_mod_plane(&mut got), "seqlock が破れていない");
+        assert!(t.read_mod_plane(&mut got), "seqlock が破れていない");
         assert_eq!(got.len(), 3);
         assert_eq!(got.scalar(4), 0.5);
         assert_eq!(got.scalar(9), 0.75);
@@ -668,8 +788,8 @@ mod tests {
         let mut next = crate::mod_plane::ModPlane::default();
         next.push(9, 0.1);
         next.push(11, 0.2);
-        h.publish_mod_plane(&next);
-        assert!(h.read_mod_plane(&mut got));
+        t.publish_mod_plane(&next);
+        assert!(t.read_mod_plane(&mut got));
         assert_eq!(got.len(), 2, "空いた slot は id 0 で潰れている");
         assert_eq!(got.scalar(9), 0.1);
         assert_eq!(got.scalar(11), 0.2);
@@ -681,19 +801,19 @@ mod tests {
     /// 区別され、 publish し直したら減ったぶんは残らない。
     #[test]
     fn ボイス面は_track_ごとに往復し離したボイスを区別する() {
-        let name = format!("daw01_test_voices_{}", std::process::id());
-        let h = AudioBridgeHandle::create(&name).expect("bridge");
+        let (h, slot) = bridge("voices");
+        let t = h.project(slot);
         let held = VoiceSnapshot { on_beat: 4.0, on_secs: 2.0, off_secs: None };
         let released = VoiceSnapshot { on_beat: 5.0, on_secs: 2.5, off_secs: Some(3.0) };
-        h.publish_track_voices(1, [held, released].into_iter());
-        h.publish_track_voices(3, [held].into_iter());
+        t.publish_track_voices(1, [held, released].into_iter());
+        t.publish_track_voices(3, [held].into_iter());
 
         let mut out = Vec::new();
-        h.track_voices(&mut out);
+        t.track_voices(&mut out);
         assert_eq!(out, vec![(1, held), (1, released), (3, held)]);
 
-        h.publish_track_voices(1, std::iter::empty());
-        h.track_voices(&mut out);
+        t.publish_track_voices(1, std::iter::empty());
+        t.track_voices(&mut out);
         assert_eq!(out, vec![(3, held)], "track 1 のボイスは消えている");
     }
 }

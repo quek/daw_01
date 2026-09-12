@@ -119,14 +119,14 @@ impl AppData {
         // 出し入れする。 `resize_clip` が先に offset を更新済みなので、ここで読む
         // `new_off` が新しい窓の起点、`prev_off` が伸縮前の起点。
         let new_off = self
-            .song_doc
+            .cur.song_doc
             .song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map_or(0.0, |c| c.content_offset_beats);
         let prev_off = new_off - (new_start - prev_start);
         // 共有 content は fork してから伸縮 (siblings の length と無関係)。
-        let content_id = if self.song_doc.song().clip_content_refcount(content_id) > 1 {
+        let content_id = if self.cur.song_doc.song().clip_content_refcount(content_id) > 1 {
             self.edit_song(|song| {
                 let new_id = song.fork_content(content_id);
                 if let Some(clip) = song
@@ -335,11 +335,11 @@ impl AppData {
         let made_unique = targets
             .iter()
             .filter(|t| {
-                self.song_doc
+                self.cur.song_doc
                     .song()
                     .track_by_id(t.track_id)
                     .and_then(|tr| tr.clip_by_id(t.clip_id))
-                    .is_some_and(|c| self.song_doc.song().clip_content_refcount(c.content_id) >= 2)
+                    .is_some_and(|c| self.cur.song_doc.song().clip_content_refcount(c.content_id) >= 2)
             })
             .count();
         self.edit_song_checked(|song| {
@@ -459,22 +459,22 @@ impl AppData {
         // event 分割に振り分ける。 Audio Editor が開いていてもマウスが
         // arrangement 上にある場合は通常の clip 分割パスを使う (= ユーザー
         // は arrangement の clip を分割したいのでそのまま流す)。
-        if self.ui_ephemeral.audio_editor_clip.is_some()
-            && self.ui_ephemeral.audio_editor_hover_beat_in_clip.is_some()
+        if self.cur.peph.audio_editor_clip.is_some()
+            && self.cur.peph.audio_editor_hover_beat_in_clip.is_some()
         {
             self.action_split_audio_editor_event_at_cursor();
             return;
         }
 
         let cursor: f64 = if snap {
-            self.ui_ephemeral.arrangement_hover_beat
-                .or(self.ui_ephemeral.arrangement_hover_beat_raw)
-                .or_else(|| self.transport.playhead_beat.map(|b| b as f64))
+            self.cur.peph.arrangement_hover_beat
+                .or(self.cur.peph.arrangement_hover_beat_raw)
+                .or_else(|| self.cur.transport.playhead_beat.map(|b| b as f64))
                 .unwrap_or(-1.0)
         } else {
-            self.ui_ephemeral.arrangement_hover_beat_raw
-                .or(self.ui_ephemeral.arrangement_hover_beat)
-                .or_else(|| self.transport.playhead_beat.map(|b| b as f64))
+            self.cur.peph.arrangement_hover_beat_raw
+                .or(self.cur.peph.arrangement_hover_beat)
+                .or_else(|| self.cur.transport.playhead_beat.map(|b| b as f64))
                 .unwrap_or(-1.0)
         };
         if cursor < 0.0 {
@@ -483,9 +483,9 @@ impl AppData {
             return;
         }
         // Build targets list. Prefer hover clip, fall back to selection.
-        let targets: Vec<ClipKey> = if let Some(hover) = self.ui_ephemeral.arrangement_hover_clip {
+        let targets: Vec<ClipKey> = if let Some(hover) = self.cur.peph.arrangement_hover_clip {
             vec![hover]
-        } else if self.selection.time.is_some() {
+        } else if self.cur.selection.time.is_some() {
             self.selected_clip_refs()
         } else {
             self.ui_ephemeral.status_message =
@@ -520,18 +520,18 @@ impl AppData {
     /// 戻り値は分割成功時 `true`。 cursor が解決できない / event 上に
     /// 乗っていない場合は status_message を出して `false` を返す。
     pub(crate) fn action_split_audio_editor_event_at_cursor(&mut self) -> bool {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(target) = self.cur.peph.audio_editor_clip else {
             return false;
         };
 
         // cursor 位置 (clip 内 beat)。 hover (= マウスが waveform 上)
         // を最優先、 無ければ playhead が clip 内なら playhead を使う。
         let in_clip_beat: Option<f64> = self
-            .ui_ephemeral.audio_editor_hover_beat_in_clip
+            .cur.peph.audio_editor_hover_beat_in_clip
             .or_else(|| {
-                let ph = self.transport.playhead_beat? as f64;
+                let ph = self.cur.transport.playhead_beat? as f64;
                 let clip = self
-                    .song_doc.song()
+                    .cur.song_doc.song()
                     .track_by_id(target.track_id)?
                     .clip_by_id(target.clip_id)?;
                 // r.md #44: Audio Editor の軸は content-local。
@@ -548,13 +548,13 @@ impl AppData {
 
         // event_idx を解決 (= cursor が strict interior に乗っている event)。
         let track = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id);
         let clip = track.and_then(|t| t.clip_by_id(target.clip_id));
         let Some(clip) = clip else { return false };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio_ro)) =
-            self.song_doc.song().clip_contents.get(&content_id)
+            self.cur.song_doc.song().clip_contents.get(&content_id)
         else {
             return false;
         };
@@ -632,7 +632,7 @@ impl AppData {
         // したい」 ことが多い、 Reaper / Bitwig 流)。
         self.set_audio_event_selection(&[event_idx + 1]);
         self.ui_ephemeral.status_message = "Split: event を分割しました".into();
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
         true

@@ -50,7 +50,7 @@ pub(super) fn pair_usable(slot: &SyncSlot, entry: &PluginEntry) -> bool {
 /// `AudioEvent::PluginUnresponsive` を 1 回だけ送る。 RT-safe: atomic store のみ。
 #[inline]
 pub(super) fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry) -> bool {
-    match slot.sync.dispatch(entry.plugin_ref.device_id, DISPATCH_TIMEOUT_MS) {
+    match slot.sync.dispatch(entry.plugin_ref.token, DISPATCH_TIMEOUT_MS) {
         Ok(DispatchOutcome::Done) => true,
         Ok(DispatchOutcome::TimedOut) => {
             slot.poisoned.store(true, Ordering::Release);

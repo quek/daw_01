@@ -31,6 +31,9 @@ const SECTION_LANE_H: f32 = 18.0;
 /// 旧 `Ui::arrangement(tracks, sections, view, selected_*, style, master_row, make_edit)`
 /// の全入力を 1 struct に束ねたもの。
 pub(super) struct BuiltArrangement {
+    /// `docs/plan_project_tabs.md` §5.6: retained state (drag session / hover) の id に
+    /// 混ぜるタブの住所。タブごとに独立させ、切替で他タブのドラッグ状態が混ざらない。
+    pub project: common::protocol::ProjectKey,
     pub tracks: Vec<ArrangementTrack>,
     pub sections: Vec<SectionView>,
     pub view: ArrangementView,
@@ -50,9 +53,9 @@ pub(super) struct BuiltArrangement {
 #[allow(clippy::too_many_lines)]
 pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     // Phase 6 review perf (E11): depth / refcount を 1 度だけ batch 計算。
-    let n_tracks = app.song_doc.song().tracks.len();
+    let n_tracks = app.cur.song_doc.song().tracks.len();
     let mut id_to_parent: HashMap<u32, Option<u32>> = HashMap::with_capacity(n_tracks);
-    for t in &app.song_doc.song().tracks {
+    for t in &app.cur.song_doc.song().tracks {
         id_to_parent.insert(t.id, t.parent_group_id);
     }
     let compute_depth = |track_id: u32| -> u8 {
@@ -74,7 +77,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     // 数え落としが GC 側では「セルの中身が黙って消える」に化ける
     // (`common/src/model/track.rs::all_clips` の doc)。
     let mut refcount_by_content: HashMap<common::model::ContentId, usize> = HashMap::new();
-    for t in &app.song_doc.song().tracks {
+    for t in &app.cur.song_doc.song().tracks {
         for c in t.all_clips() {
             *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
         }
@@ -84,7 +87,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             }
         }
     }
-    for lane in &app.song_doc.song().song_lanes {
+    for lane in &app.cur.song_doc.song().song_lanes {
         for c in lane.all_clips() {
             *refcount_by_content.entry(c.content_id).or_insert(0) += 1;
         }
@@ -99,16 +102,16 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     // D3/D4: track/clip 名の `Arc<str>` キャッシュ (song_epoch 世代キー)。
     let labels = app.arrangement_labels();
     let lane_build_data = LaneBuildData {
-        song: app.song_doc.song(),
+        song: app.cur.song_doc.song(),
         refcount_by_content: &refcount_by_content,
-        lane_height_overrides: &app.ui_prefs.automation_lane_row_overrides,
-        hidden_lanes: &app.ui_prefs.hidden_automation_lanes,
+        lane_height_overrides: &app.cur.view.automation_lane_row_overrides,
+        hidden_lanes: &app.cur.view.hidden_automation_lanes,
         content_names: &labels.content_names,
         active_groups: &active_groups,
         lane_h_bounds: lane_h_bounds(area),
     };
     let tracks: Vec<ArrangementTrack> = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -117,7 +120,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             id: t.id,
             kind: if t.clips.iter().any(|c| {
                 matches!(
-                    app.song_doc.song().clip_contents.get(&c.content_id),
+                    app.cur.song_doc.song().clip_contents.get(&c.content_id),
                     Some(common::model::ClipContent::Video(_))
                         | Some(common::model::ClipContent::Image(_))
                         | Some(common::model::ClipContent::Text(_))
@@ -143,7 +146,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             volume: t.volume,
             // mixer strip (`TrackMixEntry.peak_l_raw`) と同じ表示値 (弾道済み) を同じ index で引く。
             peak: app
-                .transport
+                .cur.transport
                 .track_peak_display
                 .get(track_idx)
                 .map_or((0.0, 0.0), |&(l, r, _gr)| (l, r)),
@@ -151,7 +154,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 .clips
                 .iter()
                 .map(|c| {
-                    let content = app.song_doc.song().clip_contents.get(&c.content_id);
+                    let content = app.cur.song_doc.song().clip_contents.get(&c.content_id);
                     ClipView {
                         id: c.id,
                         start_beat: c.start_beat,
@@ -164,7 +167,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                             .content_labels
                             .get(&c.content_id)
                             .cloned()
-                            .unwrap_or_else(|| clip_display_label(c, app.song_doc.song())),
+                            .unwrap_or_else(|| clip_display_label(c, app.cur.song_doc.song())),
                         color: Some(track_color::to_renderer(track_color::effective_clip_color(t, c))),
                         share_group_color: if refcount_by_content
                             .get(&c.content_id)
@@ -201,15 +204,15 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 .collect(),
             parent_id: t.parent_group_id,
             depth: compute_depth(t.id),
-            collapsed: app.ui_prefs.collapsed_groups.contains(&t.id),
-            automation_lanes_collapsed: !app.ui_prefs.expanded_automation_tracks.contains(&t.id),
+            collapsed: app.cur.view.collapsed_groups.contains(&t.id),
+            automation_lanes_collapsed: !app.cur.view.expanded_automation_tracks.contains(&t.id),
             automation_lanes: build_arrangement_automation_lanes(
                 t,
                 lane_build_data,
                 &|tgt| app.plugin_param_range(tgt),
                 &|tgt| app.plugin_param_name(tgt),
             ),
-            row_h: app.ui_prefs.track_row_overrides.get(&t.id).copied(),
+            row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
         })
         .collect();
@@ -224,45 +227,45 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         .map(|k| ClipKey { track_id: k.track_id, clip_id: k.clip_id })
         .collect();
 
-    let selected_tracks: Vec<u32> = app.selection.selected_track_ids.clone();
+    let selected_tracks: Vec<u32> = app.cur.selection.selected_track_ids.clone();
 
-    let zoom = app.ui_prefs.arrange_zoom_x.max(1.0);
-    let row_h = app.ui_prefs.arrange_track_row_h.max(1.0);
+    let zoom = app.cur.view.arrange_zoom_x.max(1.0);
+    let row_h = app.cur.view.arrange_track_row_h.max(1.0);
     // r.md #87: アレンジのレーンの幅は **ランチャー帯を引いた残り**。 ここが帯を
     // 引き忘れると、 描画と hit-test は自分同士では揃うのに `view.len_beats` の分母
     // だけ広く、 `arrange_zoom_x` の 1 拍あたり px と実際の描画が食い違う (auto-fit が
     // 毎回わずかに外す形で出る)。 帯幅の式は `resolve_pane_w_raw` の 1 本だけ。
     let launcher_pane_w = super::launcher::layout::resolve_pane_w_raw(
-        app.ui_prefs.launcher_layout,
-        app.ui_prefs.launcher_width,
-        (area.w - app.ui_prefs.arrange_header_w).max(1.0),
-        app.song_doc.song().any_launcher_owned_row(),
+        app.cur.view.launcher_layout,
+        app.cur.view.launcher_width,
+        (area.w - app.cur.view.arrange_header_w).max(1.0),
+        app.cur.song_doc.song().any_launcher_owned_row(),
     );
-    let lanes_w = (area.w - app.ui_prefs.arrange_header_w - launcher_pane_w).max(1.0);
-    let loop_range = app.transport.loop_region.range();
+    let lanes_w = (area.w - app.cur.view.arrange_header_w - launcher_pane_w).max(1.0);
+    let loop_range = app.cur.transport.loop_region.range();
     let data_generation = data_generation(&tracks);
 
     // r.md #53: 表示原点はデバイスピクセル境界に載せる (`clip_to_rect` が使うのと同じ
     // `beat_to_px` で丸めるので、スクロール中は全アイテムが整数 px の剛体平行移動になる)。
-    let scroll_beat_raw = f64::from(app.ui_prefs.arrange_scroll_beat);
+    let scroll_beat_raw = f64::from(app.cur.view.arrange_scroll_beat);
     let view = ArrangementView {
         start_beat: pixel_snapped_scroll_beat(scroll_beat_raw, lanes_w, zoom),
         scroll_beat_raw,
         len_beats: view_len_beats(lanes_w, zoom),
-        track_top: app.ui_prefs.arrange_track_top,
+        track_top: app.cur.view.arrange_track_top,
         // r.md #63: 分母は「行が実際に描かれる高さ」 = ruler と Arranger 帯を除いた lanes 高さ。
         // ここは heavy cache キーにしか使わないが、 `area.h - RULER_H` のままだと同じ誤式の
         // 3 つ目のコピーとして残り、 次に誰かが「lanes の高さ」 としてコピーする種になる。
         tracks_visible: ((area.h - RULER_H - SECTION_LANE_H) / row_h).max(1.0),
         track_row_h: row_h,
-        header_w: app.ui_prefs.arrange_header_w,
+        header_w: app.cur.view.arrange_header_w,
         ruler_h: RULER_H,
-        playhead_beat: app.transport.playhead_beat.map(|b| b as f64),
-        home_beat: app.transport.home_beat.map(f64::from),
+        playhead_beat: app.cur.transport.playhead_beat.map(|b| b as f64),
+        home_beat: app.cur.transport.home_beat.map(f64::from),
         loop_range,
         data_generation,
-        bpm: app.song_doc.song().bpm,
-        time_sig: app.song_doc.song().time_sig,
+        bpm: app.cur.song_doc.song().bpm,
+        time_sig: app.cur.song_doc.song().time_sig,
         snap: snap::arrange_snap_config(app),
         arranger_lane_h: SECTION_LANE_H,
         automation_follows_clips: app.ui_prefs.automation_follows_clips,
@@ -288,7 +291,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         .collect();
 
     let selected_automation_points: Vec<AutomationPointKey> = app
-        .selection
+        .cur.selection
         .selected_automation_points
         .iter()
         .map(|k| AutomationPointKey {
@@ -299,24 +302,24 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
 
     // master row: Song.song_lanes → automation lane 群。
     let master_row_lanes = build_arrangement_lanes_from_slice(
-        &app.song_doc.song().song_lanes,
+        &app.cur.song_doc.song().song_lanes,
         common::model::MASTER_TRACK_ID,
         lane_build_data,
         &|tgt| app.plugin_param_range(tgt),
         &|tgt| app.plugin_param_name(tgt),
     );
     let master_row = ArrangementMasterRow {
-        automation_lanes_collapsed: !app.ui_prefs.master_row_automation_expanded,
+        automation_lanes_collapsed: !app.cur.view.master_row_automation_expanded,
         automation_lanes: master_row_lanes,
         peak: {
-            let [l, r] = app.transport.master_meter.peak;
+            let [l, r] = app.cur.transport.master_meter.peak;
             (l, r)
         },
         height_px_override: None,
     };
 
     let sections: Vec<SectionView> = app
-        .song_doc
+        .cur.song_doc
         .song()
         .sections
         .iter()
@@ -330,7 +333,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             color: s.color,
             start_beat: s.start_beat,
             len_beats: s.len_beats,
-            selected: app.selection.selected_section_ids.contains(&s.id),
+            selected: app.cur.selection.selected_section_ids.contains(&s.id),
         })
         .collect();
 
@@ -343,12 +346,13 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     );
 
     BuiltArrangement {
+        project: app.pk(),
         tracks,
         sections,
         view,
         style,
         selected_clips,
-        time_selection: app.selection.time.clone(),
+        time_selection: app.cur.selection.time.clone(),
         selected_tracks,
         selected_automation_clips,
         selected_automation_points,
@@ -376,12 +380,12 @@ pub(super) fn clip_thumbnail(
     app: &AppData,
     content: Option<&common::model::ClipContent>,
 ) -> Option<ClipThumbnail> {
-    let media = &app.song_doc.song().media;
+    let media = &app.cur.song_doc.song().media;
     content
         .and_then(|ct| ct.video_events())
         .and_then(|events| events.first())
         .and_then(|ev| {
-            let texture = *app.ui_ephemeral.video_texture_cache.get(&ev.source_id)?;
+            let texture = *app.cur.peph.video_texture_cache.get(&ev.source_id)?;
             let src = media.video_sources.get(&ev.source_id)?;
             Some(ClipThumbnail {
                 texture,
@@ -393,7 +397,7 @@ pub(super) fn clip_thumbnail(
         .or_else(|| {
             let events = content?.image_events()?;
             let ev = events.first()?;
-            let texture = *app.ui_ephemeral.image_texture_cache.get(&ev.source_id)?;
+            let texture = *app.cur.peph.image_texture_cache.get(&ev.source_id)?;
             let src = media.image_sources.get(&ev.source_id)?;
             Some(ClipThumbnail {
                 texture,
@@ -421,15 +425,15 @@ fn active_share_groups(
     app: &AppData,
     refcount_by_content: &HashMap<common::model::ContentId, usize>,
 ) -> HashSet<common::model::ContentId> {
-    let sel = &app.selection;
+    let sel = &app.cur.selection;
     if sel.time.is_none()
         && sel.selected_automation_clips.is_empty()
         && sel.selected_launcher_cells.is_empty()
-        && app.ui_ephemeral.arrange_hover_content.is_none()
+        && app.cur.peph.arrange_hover_content.is_none()
     {
         return HashSet::new();
     }
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let is_shared =
         |cid: common::model::ContentId| refcount_by_content.get(&cid).copied().unwrap_or(0) >= 2;
     let mut set = HashSet::new();
@@ -468,7 +472,7 @@ fn active_share_groups(
             add(cid);
         }
     }
-    if let Some(cid) = app.ui_ephemeral.arrange_hover_content {
+    if let Some(cid) = app.cur.peph.arrange_hover_content {
         add(cid);
     }
     set

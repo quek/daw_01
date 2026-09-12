@@ -24,22 +24,22 @@ impl AppData {
     ) {
         // fader/knob drag 全体を 1 undo step に bracket する (最初の song 編集が snapshot を
         // 積む。 PluginParam のように song を変えない gesture では undo step は増えない)。
-        self.song_doc.begin_gesture();
-        self.recording.active_param_gestures.insert((track_id, target.clone()));
+        self.cur.song_doc.begin_gesture();
+        self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
         // Phase 4 Step C: Latch / Write mode で 再生中の gesture begin は
         // latched_param_gestures にも入れる。 stop まで「触れた事実」 を保持し、 release 後も
         // curve 上書きを継続する。 Touch mode では latched は使わない (= release で recording
         // 完全停止)。
         if matches!(
-            self.recording.recording_mode,
+            self.cur.recording.recording_mode,
             common::model::RecordingMode::Latch | common::model::RecordingMode::Write
-        ) && self.transport.is_playing
+        ) && self.cur.transport.is_playing
         {
-            self.recording.latched_param_gestures.insert((track_id, target.clone()));
+            self.cur.recording.latched_param_gestures.insert((track_id, target.clone()));
         }
         // `TouchParam` を発火し続けるより、 gesture begin で `last_touched_param` を更新する
         // idiom に統一する (= drag 開始の瞬間が touch、 drag 中の値変化は touch を再発火しない)。
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -57,12 +57,12 @@ impl AppData {
     /// recording_last_beat からも該当 entry を消す (= 次の gesture begin で改めて throttle 開始)。
     /// Latch / Write は stop まで latched 継続なので last_beat も保持する (= 連続 record)。
     pub(crate) fn end_param_gesture(&mut self, track_id: u32, target: common::model::AutomationTarget) {
-        self.recording.active_param_gestures.remove(&(track_id, target.clone()));
-        if self.recording.active_param_gestures.is_empty() {
-            self.song_doc.end_gesture();
+        self.cur.recording.active_param_gestures.remove(&(track_id, target.clone()));
+        if self.cur.recording.active_param_gestures.is_empty() {
+            self.cur.song_doc.end_gesture();
         }
-        if self.recording.recording_mode == common::model::RecordingMode::Touch {
-            self.recording.recording_last_beat.remove(&(track_id, target));
+        if self.cur.recording.recording_mode == common::model::RecordingMode::Touch {
+            self.cur.recording.recording_last_beat.remove(&(track_id, target));
         }
         self.sync_recording_lanes_with_audio();
     }

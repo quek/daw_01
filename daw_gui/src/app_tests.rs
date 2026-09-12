@@ -215,15 +215,15 @@ mod follow_scroll_tests {
     fn edge_autoscroll_keeps_follow_but_manual_scroll_cancels_it() {
         use crate::app::AppEvent;
         let mut app = crate::test_support::headless_app();
-        app.ui_prefs.arrange_follow = FollowMode::Scroll;
-        app.transport.is_playing = true;
+        app.cur.view.arrange_follow = FollowMode::Scroll;
+        app.cur.transport.is_playing = true;
 
         app.handle_event(AppEvent::AutoScrollArrange(5.0));
-        assert_eq!(app.ui_prefs.arrange_follow, FollowMode::Scroll, "端スクロールで追従が消えた");
-        assert!((app.ui_prefs.arrange_scroll_beat - 5.0).abs() < 1e-6, "view は動く");
+        assert_eq!(app.cur.view.arrange_follow, FollowMode::Scroll, "端スクロールで追従が消えた");
+        assert!((app.cur.view.arrange_scroll_beat - 5.0).abs() < 1e-6, "view は動く");
 
         app.handle_event(AppEvent::SetArrangeScroll(6.0));
-        assert_eq!(app.ui_prefs.arrange_follow, FollowMode::Off, "手動スクロールは追従を解除する");
+        assert_eq!(app.cur.view.arrange_follow, FollowMode::Off, "手動スクロールは追従を解除する");
     }
 
     /// 再生追従スクロールの scroll_beat 計算 (純関数)。Page のページめくり境界、
@@ -1062,7 +1062,7 @@ mod track_duplicate_tests {
         let before = song.clip_contents.len();
         let tc = copy_of(&song, tid, cid);
         // linked = force_independent_content=false。
-        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, false, None);
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, false, None, &common::model::MediaRemap::default());
         assert_eq!(built.len(), 1);
         let (src, t) = &built[0];
         assert_eq!(*src, tid);
@@ -1080,7 +1080,7 @@ mod track_duplicate_tests {
         let before = song.clip_contents.len();
         let tc = copy_of(&song, tid, cid);
         // independent = force_independent_content=true。
-        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None);
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None, &common::model::MediaRemap::default());
         let (_, t) = &built[0];
         assert_ne!(t.clips[0].content_id, cid, "独立コピーは新 content_id");
         assert_eq!(song.clip_contents.len(), before + 1, "content が 1 件増える");
@@ -1105,7 +1105,7 @@ mod track_duplicate_tests {
             TrackCopy { order: 0, track: song.track_by_id(gid).unwrap().clone(), contents: vec![] },
             TrackCopy { order: 1, track: song.track_by_id(child).unwrap().clone(), contents: vec![] },
         ];
-        let built = AppData::build_pasted_tracks(&mut song, &tcs, true, true, None);
+        let built = AppData::build_pasted_tracks(&mut song, &tcs, true, true, None, &common::model::MediaRemap::default());
         let new_group = built[0].1.id;
         assert_ne!(new_group, gid);
         assert_eq!(built[1].1.parent_group_id, Some(new_group), "child は複製後の group を指す");
@@ -1131,7 +1131,7 @@ mod track_duplicate_tests {
             track: song.track_by_id(child).unwrap().clone(),
             contents: vec![],
         };
-        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None);
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None, &common::model::MediaRemap::default());
         assert_eq!(built[0].1.parent_group_id, Some(gid), "同じ group 内に残る");
     }
 
@@ -1179,7 +1179,7 @@ mod track_duplicate_tests {
         };
 
         // 同一プロジェクト: 集合内は新 id へ、集合外は実在するので据え置き。
-        let built = AppData::build_pasted_tracks(&mut song, std::slice::from_ref(&tc), true, true, None);
+        let built = AppData::build_pasted_tracks(&mut song, std::slice::from_ref(&tc), true, true, None, &common::model::MediaRemap::default());
         let new_id = built[0].1.id;
         assert_eq!(
             built[0].1.devices[0].as_plugin().unwrap().aux_outputs,
@@ -1192,7 +1192,7 @@ mod track_duplicate_tests {
 
         // 別プロジェクト: 集合外の id は解決できない。**据え置くと無関係なトラックへ
         // 音が流れる**ので落とす。
-        let built = AppData::build_pasted_tracks(&mut song, &[tc], false, true, None);
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], false, true, None, &common::model::MediaRemap::default());
         let new_id = built[0].1.id;
         assert_eq!(
             built[0].1.devices[0].as_plugin().unwrap().aux_outputs,
@@ -1229,16 +1229,16 @@ mod gpu_derived_cache_tests {
     #[test]
     fn after_song_replaced_queues_texture_destroys() {
         let mut app = build_app();
-        app.ui_ephemeral.video_texture_cache.insert(7, handle(1));
-        app.ui_ephemeral.image_texture_cache.insert(9, handle(2));
+        app.cur.peph.video_texture_cache.insert(7, handle(1));
+        app.cur.peph.image_texture_cache.insert(9, handle(2));
 
         app.after_song_replaced();
 
         assert!(
-            app.ui_ephemeral.video_texture_cache.is_empty(),
+            app.cur.peph.video_texture_cache.is_empty(),
             "別 project の id が誤 hit しないよう参照は捨てる"
         );
-        assert!(app.ui_ephemeral.image_texture_cache.is_empty());
+        assert!(app.cur.peph.image_texture_cache.is_empty());
         let mut queued: Vec<u32> = app
             .ui_ephemeral
             .pending_texture_destroys
@@ -1253,13 +1253,13 @@ mod gpu_derived_cache_tests {
     #[test]
     fn rebuild_gpu_derived_caches_queues_texture_destroys() {
         let mut app = build_app();
-        app.ui_ephemeral.video_texture_cache.insert(1, handle(11));
-        app.ui_ephemeral.image_texture_cache.insert(2, handle(12));
+        app.cur.peph.video_texture_cache.insert(1, handle(11));
+        app.cur.peph.image_texture_cache.insert(2, handle(12));
 
         app.rebuild_gpu_derived_caches();
 
-        assert!(app.ui_ephemeral.video_texture_cache.is_empty());
-        assert!(app.ui_ephemeral.image_texture_cache.is_empty());
+        assert!(app.cur.peph.video_texture_cache.is_empty());
+        assert!(app.cur.peph.image_texture_cache.is_empty());
         assert_eq!(app.ui_ephemeral.pending_texture_destroys.len(), 2);
     }
 }
@@ -1323,28 +1323,28 @@ mod image_flip_tests {
             ..Clip::default()
         });
         song.tracks.push(track);
-        app.song_doc.replace_song(song);
-        app.song_doc.mark_saved();
+        app.cur.song_doc.replace_song(song);
+        app.cur.song_doc.mark_saved();
         (app, ClipKey { track_id, clip_id })
     }
 
     fn flips(app: &AppData, key: ClipKey) -> Vec<(bool, bool)> {
-        let clip = app.song_doc.song().track_by_id(key.track_id).unwrap().clip_by_id(key.clip_id).unwrap();
-        let events = app.song_doc.song().clip_contents[&clip.content_id].image_events().unwrap();
+        let clip = app.cur.song_doc.song().track_by_id(key.track_id).unwrap().clip_by_id(key.clip_id).unwrap();
+        let events = app.cur.song_doc.song().clip_contents[&clip.content_id].image_events().unwrap();
         events.iter().map(|e| (e.flip_h, e.flip_v)).collect()
     }
 
     #[test]
     fn flip_toggles_broadcast_to_all_events_and_undo_in_one_step() {
         let (mut app, key) = build_app_with_image_clip();
-        assert!(!app.song_doc.is_dirty());
+        assert!(!app.cur.song_doc.is_dirty());
 
         app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
             targets: vec![key],
             edit: DiscreteClipEdit::ImageFlipH(true),
         });
         assert_eq!(flips(&app, key), vec![(true, false), (true, false)]);
-        assert!(app.song_doc.is_dirty(), "反転は中身が変わる編集なので dirty");
+        assert!(app.cur.song_doc.is_dirty(), "反転は中身が変わる編集なので dirty");
 
         app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
             targets: vec![key],

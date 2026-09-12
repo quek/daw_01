@@ -137,7 +137,7 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
     let mut x = header.x + PAD;
 
     // 録音源 (Master / 各 track × 3 tap)。
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mut items: Vec<String> = vec!["Master".to_string()];
     let mut sources: Vec<common::protocol::SamplerSource> = vec![common::protocol::SamplerSource::Master];
     for t in &song.tracks {
@@ -147,11 +147,29 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
             common::model::TapPoint::PostFader,
         ] {
             items.push(format!("{} · {}", t.name, crate::handler::sampler::tap_point_label(tp)));
-            sources.push(common::protocol::SamplerSource::Track(common::model::AudioTap::new(
-                common::model::TapSource::Track(t.id),
-                tp,
-            )));
+            sources.push(common::protocol::SamplerSource::Track {
+                project: app.pk(),
+                tap: common::model::AudioTap::new(common::model::TapSource::Track(t.id), tp),
+            });
         }
+    }
+    // 録音源が **別のタブ** の track のときも選択肢に出す (`docs/plan_project_tabs.md`
+    // §5.5)。出さないと dropdown が「Master」を指したまま別タブの音を録り続け、
+    // 画面のどこにも本当の録音源が出ない。
+    if !sources.contains(&app.sampler.source)
+        && let common::protocol::SamplerSource::Track { project, tap } = app.sampler.source
+        && let Some(ps) = app.tab(project)
+    {
+        let name = tap
+            .source_track()
+            .and_then(|id| ps.song_doc.song().track_by_id(id))
+            .map_or_else(|| "Track".to_string(), |t| t.name.clone());
+        items.push(format!(
+            "[{}] {name} · {}",
+            AppData::tab_label(ps),
+            crate::handler::sampler::tap_point_label(tap.tap_point)
+        ));
+        sources.push(app.sampler.source);
     }
     let selected = sources.iter().position(|s| *s == app.sampler.source).unwrap_or(0);
     let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
@@ -353,7 +371,7 @@ pub(crate) fn draw_bar_lines(
 ) {
     let p = &app.theme.core;
     let sr = app.sampler.sample_rate().max(1);
-    let bar = common::model::beats_per_bar(app.song_doc.song().time_sig).max(1e-6);
+    let bar = common::model::beats_per_bar(app.cur.song_doc.song().time_sig).max(1e-6);
     let mut lines: Vec<LineSegment> = Vec::new();
     let mut labels: Vec<(f32, String)> = Vec::new();
     for &(start, end, seg) in &src.spans {

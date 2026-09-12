@@ -125,7 +125,7 @@ fn draw_scene_follow_rows(
     let scene_follow = fold_scene_follow(app, scene_ids).unwrap_or_default();
     // 見出しに **列の名前** を出す (無名なら "Scene N")。列を直接選んだときはペインの
     // タイトルがトラック名のままなので、ここが「どの列をいじっているか」の唯一の手掛かり。
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let names: Vec<String> = song
         .scenes
         .iter()
@@ -395,7 +395,7 @@ fn draw_follow_action_row(
         FollowTarget::Scenes => ("scene_a", "scene_b"),
     };
     // 「ジャンプ」を選んだ直後の飛び先は先頭の列 (行 3 の dropdown で変える)。
-    let first_scene = app.song_doc.song().scenes.first().map_or(0, |s| s.id);
+    let first_scene = app.cur.song_doc.song().scenes.first().map_or(0, |s| s.id);
     for (is_a, x, tag) in [(true, x0, tag_a), (false, x2, tag_b)] {
         let kind = if is_a { follow.a } else { follow.b };
         if let Some(i) = ui.dropdown_with_font(
@@ -440,7 +440,7 @@ fn draw_follow_jump_row(
     target: FollowTarget,
     cells: &[LauncherCellKey],
 ) -> f32 {
-    let scenes = &app.song_doc.song().scenes;
+    let scenes = &app.cur.song_doc.song().scenes;
     let jump_of = |k: FollowActionKind| match k {
         FollowActionKind::Jump { scene_id } => Some(scene_id),
         _ => None,
@@ -511,7 +511,7 @@ fn draw_midi_rows(
         .map(LauncherCellKey::Track)
         .and_then(|c| app.scene_of_cell(c))
         .or_else(|| scene_ids.last().copied());
-    let learning = app.launcher.learn_target;
+    let learning = app.cur.launcher.learn_target;
     let n = app.launcher_bindings().len();
 
     ui.label_at(
@@ -735,9 +735,9 @@ fn num_field(
 /// 表示 (`draw_launch_section`) と書き込み (`push_follow_edit`) が **同じこの 1 本**を
 /// 通るので、「見えている値」と「書き込み先」が食い違わない。
 fn scenes_of(app: &AppData, cells: &[LauncherCellKey]) -> Vec<u32> {
-    if !app.selection.selected_scene_ids.is_empty() {
-        let mut ids = app.selection.selected_scene_ids.clone();
-        ids.sort_by_key(|id| app.song_doc.song().scene_index(*id).unwrap_or(usize::MAX));
+    if !app.cur.selection.selected_scene_ids.is_empty() {
+        let mut ids = app.cur.selection.selected_scene_ids.clone();
+        ids.sort_by_key(|id| app.cur.song_doc.song().scene_index(*id).unwrap_or(usize::MAX));
         return ids;
     }
     let mut ids: Vec<u32> = Vec::new();
@@ -748,13 +748,13 @@ fn scenes_of(app: &AppData, cells: &[LauncherCellKey]) -> Vec<u32> {
             ids.push(s);
         }
     }
-    ids.sort_by_key(|id| app.song_doc.song().scene_index(*id).unwrap_or(usize::MAX));
+    ids.sort_by_key(|id| app.cur.song_doc.song().scene_index(*id).unwrap_or(usize::MAX));
     ids
 }
 
 /// 列のフォローアクションを畳む (全部同じなら `Some`、割れていれば `None`)。
 fn fold_scene_follow(app: &AppData, scene_ids: &[u32]) -> Option<FollowAction> {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mut it = scene_ids
         .iter()
         .filter_map(|id| song.scenes.iter().find(|s| s.id == *id))

@@ -12,16 +12,16 @@
 //! - 派生は method (`pub fn track_headers(&self) -> Vec<TrackHeader>` 等)
 //! - background thread → UI event は `EventLoopProxy<AppEvent>` 経由
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use common::model::Song;
 use common::plugin_db::PluginDatabase;
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::audio_source_cache::AudioSourceCache;
+use common::protocol::ProjectKey;
+
+use crate::state::{ProjectState, Tabs};
 use crate::dispatcher::{BackgroundDispatcher, JobDispatcher};
 
 
@@ -117,23 +117,6 @@ impl AppData {
         // (A1 r.md #8) 解決済みデバイス実サンプルレート (= bootstrap.sample_rate)。
         sample_rate: u32,
     ) -> Self {
-        let mut song = Song::default();
-        // **id は必ず allocator から採る。** `Track::default()` の `id` は
-        // 「未採番」の sentinel (0) で、0 を実トラックの住所として使うと
-        // `RowKey::packed()` が 0 になり、`audio_bridge` の「空きスロット =
-        // row_key 0」規約と衝突する (= ランチャーの走行状態が 1 行も GUI へ
-        // 届かず、セルの進捗が永久に出ない)。起動直後の 1 本目でそれを踏んでいた。
-        let first_track_id = song.alloc_track_id();
-        song.tracks.push(track_with(|t| {
-            t.id = first_track_id;
-            t.name = "Track 1".into();
-        }));
-        // 起動時の初期プロジェクトにも安定 project_id を採番する
-        // (clipboard の同一プロジェクト判定用)。
-        song.ensure_project_id();
-        let initial_peak_display = vec![(0.0, 0.0, 0.0); song.tracks.len()];
-        let initial_bpm = song.bpm;
-        let initial_time_sig_num = song.time_sig.0;
         let recovery_candidates = app_dirs
             .as_ref()
             .map(|d| common::recovery::scan_recovery_files(&d.recovery_dir()))
@@ -167,134 +150,31 @@ impl AppData {
             &app_config.theme,
         );
 
+        let first_key = ProjectKey(1);
         let app = Self {
             theme,
-            // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
-            loudness: crate::state::LoudnessState::default(),
-            song_doc: SongDoc::new(song),
-            transport: TransportState::new(initial_peak_display),
-            selection: SelectionState {
-                selected_track_ids: Vec::new(),
-                selected_section_ids: Vec::new(),
-                selected_scene_ids: Vec::new(),
-                selected_automation_clips: Vec::new(),
-                last_edit_select: None,
-                selected_automation_points: Vec::new(),
-                time: None,
-                range_anchor: None,
-                selected_launcher_cells: Vec::new(),
-                launcher_cell_anchor: None,
-                selected_device_ids: Vec::new(),
-                track_anchor: None,
-                section_anchor: None,
-                automation_point_anchor: None,
-                automation_clip_anchor: None,
-                device_anchor: None,
-                scene_anchor: None,
-            },
+            cur: ProjectState::new_untitled(first_key),
+            tabs: Tabs::new(first_key),
             ipc: IpcState {
                 sample_rate,
-                ara_doc_cache: std::collections::HashMap::new(),
-                ara_pcm_materialized: std::collections::HashMap::new(),
-                plugin_param_values: std::collections::HashMap::new(),
-                plugin_params: std::collections::HashMap::new(),
-                slot_has_gui: std::collections::HashMap::new(),
-                loaded_devices: std::collections::HashMap::new(),
                 metrics: common::metrics_bridge::ResourceMetrics::default(),
                 metrics_bridge: None,
                 plugin_db,
-                pending_state_queue: VecDeque::new(),
-                state_request_sent_at: None,
                 audio_tx: Some(audio_tx),
                 plugin_tx: Some(plugin_tx),
-                pending_clip_fx_bounce: None,
-                pending_glue_bake: None,
-                pending_vocal_synth_bounce: None,
-                pending_vocal_synth_export: std::collections::HashSet::new(),
-                open_plugin_guis: std::collections::HashSet::new(),
-                pending_plugin_loads: std::collections::HashMap::new(),
                 next_plugin_load_generation: 0,
-                failed_plugin_loads: std::collections::HashMap::new(),
-                pending_added_plugin_finalize: std::collections::HashMap::new(),
-                gui_open_requests: Vec::new(),
                 rescan_result: Arc::new(Mutex::new(None)),
                 supervisor,
                 child_disconnect_log: Vec::new(),
                 is_rescanning: false,
-                last_synced_epoch: 0,
                 event_proxy,
             },
             voicevox: VoicevoxState::new(voicevox_job),
-            media: MediaState {
-                audio_source_cache: AudioSourceCache::new(),
-                video_thumbnail_rgba: std::collections::HashMap::new(),
-                pending_thumbnail_uploads: Vec::new(),
-                image_source_bgra: std::collections::HashMap::new(),
-                pending_image_uploads: Vec::new(),
-                asset_decode: None,
-                load_progress: None,
-                load_progress_label: "",
-            },
-            recording: RecordingState {
-                recording_mode: common::model::RecordingMode::default(),
-                requested: false,
-                live: false,
-                count_in_bars: 0,
-                midi_recording_active_notes: std::collections::HashMap::new(),
-                monitor_notes: std::collections::HashSet::new(),
-                metronome_enabled_pre_recording: None,
-                midi_learn_target: None,
-                active_param_gestures: std::collections::HashSet::new(),
-                latched_param_gestures: std::collections::HashSet::new(),
-                recording_last_beat: std::collections::HashMap::new(),
-                last_sent_recording_lanes: std::collections::HashSet::new(),
-                preview_note: None,
-                nudge_audition: None,
-                midi_input_label: String::new(),
-                step_cursor_beat: 0.0,
-                step_size_beats: DEFAULT_NOTE_DURATION,
-                snap_live_input: false,
-            },
             ui_prefs: UiPrefs {
-                strip_comp_open: false,
-                strip_eq_open: false,
                 preview_window_visible: false,
                 // 既定 ON: クリップを動かしたら automation も付いてくる方が期待に近い。
                 // アプリ設定 (`AppConfig`) から復元する。
                 automation_follows_clips: app_config.automation_follows_clips,
-                collapsed_groups: std::collections::HashSet::new(),
-                expanded_automation_tracks: std::collections::HashSet::new(),
-                hidden_automation_lanes: std::collections::HashSet::new(),
-                collapsed_parallel_nodes: std::collections::HashSet::new(),
-                master_row_automation_expanded: false,
-                track_row_overrides: std::collections::HashMap::new(),
-                automation_lane_row_overrides: std::collections::HashMap::new(),
-                bottom_panel: Some(0),
-                audio_editor_views: std::collections::HashMap::new(),
-                audio_editor_vertical_gain: 1.0,
-                arrange_zoom_x: ARRANGE_PX_PER_BEAT,
-                // 0.0 = 未設定 (view が既定比率へ倒す)。
-                arrangement_split_ratio: 0.0,
-                arrange_scroll_beat: 0.0,
-                arrange_follow: common::model::FollowMode::default(),
-                arrange_track_top: 0.0,
-                arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
-                arrange_header_w: 160.0,
-                // r.md #87: 0 = 未設定 → widget が既定幅を使う。
-                launcher_layout: common::model::LauncherLayout::default(),
-                launcher_width: 0.0,
-                launcher_scene_col_w: 0.0,
-                launcher_scroll_scene: 0.0,
-                piano_roll_views: std::collections::HashMap::new(),
-                plugin_editor_windows: std::collections::HashMap::new(),
-                multi_clip_view: common::model::PianoRollViewState::default(),
-                multi_clip_view_key: Vec::new(),
-                locked_pr_tracks: std::collections::HashSet::new(),
-                last_note_duration_beats: DEFAULT_NOTE_DURATION,
-                pianoroll_snap_enabled: true,
-                pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
-                arrange_snap_enabled: true,
-                arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
                 resource_monitor_enabled: app_config.resource_monitor_enabled,
                 // r.md #29: 編集履歴 window の開閉/位置/サイズを app_config から復元。
                 undo_history_open: app_config.undo_history_open,
@@ -335,62 +215,18 @@ impl AppData {
                 // 「app.init_recent_labels()」 を見よ)。
                 recent_files_labels: Vec::new(),
                 recent_saved_labels: Vec::new(),
-                snap_on_draw: false,
-                piano_roll_fold: false,
             },
             ui_ephemeral: UiEphemeral {
-                arr_label_cache: std::cell::RefCell::default(),
-                tempo_map_cache: std::cell::RefCell::default(),
                 // r.md #48: 設定 window を開いたときに `refresh_available_themes` が埋める。
                 // 起動時に settings_open が復元されるケースは `new()` 末尾で埋める。
                 available_themes: Vec::new(),
-                loaded_project_id: 0,
                 project_generation: 0,
-                video_texture_cache: std::collections::HashMap::new(),
-                image_texture_cache: std::collections::HashMap::new(),
+                pending_tab_switch: None,
+                retained_state_to_drop: Vec::new(),
                 pending_texture_destroys: Vec::new(),
-                arrangement_hover_beat: None,
-                arrangement_hover_beat_raw: None,
-                arrangement_hover_clip: None,
-                arrange_drag_active: false,
-                arrange_hovered_track: None,
-                arrange_arranger_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
-                launcher_pane_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
-                launcher_grid_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
-                mixer_hovered_track: None,
-                mixer_hovered_strip_section: None,
-                inspector_hovered_device: None,
-                inspector_hovered_mod: None,
-                master_hovered_section: None,
-                master_gain_dragging: false,
                 voicevox_chunk_editing: false,
                 sampler_secs_editing: false,
-                pianoroll_hover_beat: None,
-                pianoroll_hover_beat_song_raw: None,
-                pianoroll_hover_note: None,
-                pianoroll_hover_pitch: None,
                 pending_clipboard_write: None,
-                editing_automation_point: None,
-                last_touched_param: None,
-                preview_secs_memo: std::cell::Cell::new(None),
-                home_toggle_at_first: false,
-                arrange_zoom_history: Vec::new(),
-                arrange_zoom_anchor: None,
-                zoom_lane_fill: None,
-                arrange_hover_content: None,
-                arrange_dragging_track_volume: None,
-                arrange_hovered_automation_lane: None,
-                piano_roll_lyric_editing: false,
-                pianoroll_viewport: None,
-                audio_editor_clip: None,
-                pianoroll_focus_clip: None,
-                audio_editor_hover_beat_in_clip: None,
-                inspector_body_h: 800.0,
-                inspector_device_panel_h: 0.0,
-                last_pianoroll_grid_size: (0.0, 0.0),
-                pending_pianoroll_fit: false,
-                last_arrange_lanes_size: (0.0, 0.0),
-                last_arrange_rows: Vec::new(),
                 resource_panel_open: false,
                 undo_history_follow_pos: 0,
                 plugin_picker_entries,
@@ -398,8 +234,6 @@ impl AppData {
                 plugin_picker_query: String::new(),
                 is_plugin_picker_open: false,
                 plugin_picker_target: None,
-                open_sidechain_panel: None,
-                renaming_chain: None,
                 plugin_picker_cursor: 0,
                 font_picker_families: Vec::new(),
                 font_picker_visible: Vec::new(),
@@ -409,41 +243,15 @@ impl AppData {
                 font_picker_loading: false,
                 font_picker_target: None,
                 font_picker_restore: String::new(),
-                send_picker: None,
-                open_video_fx_params: None,
-                open_plugin_params: None,
                 anim_epoch: std::time::Instant::now(),
                 frame_now: std::time::Instant::now(),
                 status_message: String::new(),
                 pending_shortcut_injections: Vec::new(),
-                track_rename_id: None,
-                color_picker_target: None,
-                color_picker_anchor: None,
-                clip_create_menu: None,
-                clip_create_menu_open: false,
-                section_menu: None,
-                section_menu_open: false,
-                section_rename_id: None,
-                section_rename_text: String::new(),
-                track_rename_text: String::new(),
-                clip_rename: None,
-                clip_rename_text: String::new(),
-                bpm_edit_text: format!("{initial_bpm:.1}"),
-                time_sig_num_edit_text: initial_time_sig_num.to_string(),
-                clip_edit_buffer_target: None,
-                clip_text_content_edit_text: String::new(),
-                clip_text_font_family_edit_text: String::new(),
-                scrub_gesture: None,
-                scrub_gesture_seen: false,
-                mod_follower_scrub_active: false,
-                armed_mod_source: None,
-                expanded_mod_sources: std::collections::HashSet::new(),
                 export_range_picker: None,
                 recovery_candidates,
                 show_recovery_modal,
                 dirty_guard: None,
                 guard_after_save: None,
-                guard_pending_action: None,
                 export_dialog_open: false,
                 save_as_dialog_open: false,
                 #[cfg(windows)]
@@ -456,8 +264,6 @@ impl AppData {
                 main_focused: true,
                 ..Default::default()
             },
-            // r.md #87: ランチャーの一時状態 (フォーカス / hover / MIDI bind)。
-            launcher: crate::state::LauncherUiState::default(),
             // r.md #61: 起動直後は `Running`。終了要求で `Draining` に入る。
             shutdown: crate::shutdown::ShutdownState::default(),
             // r.md #50: メーター設定の初期値は app_config から。`active` は
@@ -499,6 +305,14 @@ impl AppData {
             tracing::info!("plugin cache predates port-probe; auto-rescanning to fill port info");
             app.begin_rescan();
         }
+        // `docs/plan_project_tabs.md` §5.2: 最初のタブの engine slot を作り、scope
+        // (マスターメーター / Global Sampler) と poller の重い面をそこへ向ける。
+        // `LoadSong` は最初の frame flush が送る。
+        app.send_audio(AudioCommand::OpenProject { project: first_key });
+        app.send_audio(AudioCommand::SetScopeProject { project: first_key });
+        app.activity
+            .active_project
+            .store(first_key.0, std::sync::atomic::Ordering::Release);
         // 起動直後は clean (SongDoc::new が saved_state_id = state_id で構築)。
         app
     }
@@ -547,11 +361,17 @@ impl AppData {
             tracing::debug!(?event, "event dropped during shutdown");
             return;
         }
+        // `docs/plan_project_tabs.md` §5.1: 子プロセスからの event が **アクティブでない
+        // タブ** 宛なら、そのタブを一時的に `cur` へ swap して同じ handler を回す
+        // (undo scope / export gate もそのタブのものが効く)。閉じたタブ宛 (遅延 event) は捨てる。
+        let Some(event) = self.deliver_to_target_tab(event) else {
+            return;
+        };
         // この event の ambient undo scope を確定する (1 event 内の複数 edit_song は
         // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
         // 同時に、 この event が snapshot を積んだときの履歴リスト用ラベル
         // (r.md #29) を event 種から確定して渡す。
-        self.song_doc.begin_event(event.undo_label());
+        self.cur.song_doc.begin_event(event.undo_label());
         // Export gate (positive-default + block-list)。
         //
         // 旧構造は negative-default の allow-list だった (export 中は列挙した少数
@@ -598,12 +418,14 @@ impl AppData {
             AppEvent::Plugin(ev) => self.dispatch_plugin_event(ev),
             // r.md #87: ランチャー操作は 1 arm で受けて専用 dispatcher へ。
             AppEvent::Launcher(ev) => self.handle_launcher_event(ev),
-            // New / Open は現在のプロジェクトを破棄するので、 dirty なら
-            // 先に保存確認ダイアログを挟む (clean なら即実行)。
+            AppEvent::Tab(ev) => self.handle_tab_event(ev),
             // r.md #61: 全終了経路の合流点。
             AppEvent::Quit(req) => self.request_quit(req),
-            AppEvent::New => self.request_guarded_action(DirtyGuardAction::New),
-            AppEvent::Open => self.request_guarded_action(DirtyGuardAction::Open),
+            // `docs/plan_project_tabs.md` §5.2: New / Open は現在のタブを破棄しない
+            // (新しいタブに開く。pristine な Untitled だけは Open が置き換える) ので
+            // 保存確認は要らない。
+            AppEvent::New => self.handle_tab_event(crate::event_tabs::TabEvent::New),
+            AppEvent::Open => self.action_open(),
             AppEvent::Save => {
                 // ガード確認中 / 保存後アクション待ち中 / queue drain 待ち中は
                 // 手動保存を無視する。 この間に別経路の保存を走らせると pending_state_queue
@@ -612,7 +434,7 @@ impl AppData {
                 // なのでこの gate を通らない。
                 if self.ui_ephemeral.dirty_guard.is_none()
                     && self.ui_ephemeral.guard_after_save.is_none()
-                    && self.ui_ephemeral.guard_pending_action.is_none()
+                    && self.cur.pipc.guard_pending_action.is_none()
                 {
                     self.action_save();
                 }
@@ -620,23 +442,13 @@ impl AppData {
             AppEvent::SaveAs => {
                 if self.ui_ephemeral.dirty_guard.is_none()
                     && self.ui_ephemeral.guard_after_save.is_none()
-                    && self.ui_ephemeral.guard_pending_action.is_none()
+                    && self.cur.pipc.guard_pending_action.is_none()
                 {
                     self.action_save_as();
                 }
             }
             AppEvent::DirtyGuardSave => self.guard_save(),
-            AppEvent::DirtyGuardDiscard => {
-                if let Some(action) = self.ui_ephemeral.dirty_guard.take() {
-                    // 「保存せず続行/終了」 = 現プロジェクトの未保存変更を破棄する。
-                    // その変更を写した autosave (sidecar / session recovery file) を
-                    // 消してから操作を実行する。 残すと、 同じ file を開き直したとき /
-                    // 次回起動時に recovery 機構が「破棄したはずの変更を復元しますか？」
-                    // と聞いてしまう (実機検証で発覚)。
-                    self.discard_current_autosave();
-                    self.perform_guard_action(action);
-                }
-            }
+            AppEvent::DirtyGuardDiscard => self.guard_discard(),
             AppEvent::DirtyGuardCancel => {
                 self.ui_ephemeral.dirty_guard = None;
             }
@@ -647,7 +459,7 @@ impl AppData {
                 self.stop();
             }
             AppEvent::PlayToggle => {
-                if self.transport.is_playing {
+                if self.cur.transport.is_playing {
                     self.stop();
                 } else {
                     self.play();
@@ -675,14 +487,15 @@ impl AppData {
                 // reorder race-free な addressing (audio 側で index に再解決)。
                 // 対象 track が存在しない / pitch=None なら next=None (= 発音停止)。
                 let next = pitch
-                    .and_then(|p| self.song_doc.song().track_by_id(track_id).map(|t| (t.id, p)));
-                for action in diff_preview(self.recording.preview_note, next) {
+                    .and_then(|p| self.cur.song_doc.song().track_by_id(track_id).map(|t| (t.id, p)));
+                for action in diff_preview(self.cur.recording.preview_note, next) {
                     match action {
                         PreviewAction::NoteOff { track_id, pitch } => {
-                            self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+                            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
                         }
                         PreviewAction::NoteOn { track_id, pitch } => {
                             self.send_audio(AudioCommand::PreviewNoteOn {
+                                project: self.pk(),
                                 track_id,
                                 pitch,
                                 velocity: PREVIEW_VELOCITY,
@@ -690,45 +503,45 @@ impl AppData {
                         }
                     }
                 }
-                self.recording.preview_note = next;
+                self.cur.recording.preview_note = next;
             }
             AppEvent::LoopSelectedClipToggle { automation, sections } => {
                 self.loop_selected_clip_toggle(automation, sections);
             }
             AppEvent::BpmEditChanged(s) => {
-                self.ui_ephemeral.bpm_edit_text = s;
+                self.cur.peph.bpm_edit_text = s;
             }
             AppEvent::CommitBpmEdit => {
                 self.commit_bpm_edit();
             }
             AppEvent::SetSongBpmFromScrub(next) => {
                 let clamped = next.clamp(1.0, 400.0);
-                if (self.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
-                    let old_bpm = self.song_doc.song().bpm;
+                if (self.cur.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
+                    let old_bpm = self.cur.song_doc.song().bpm;
                     // scrub の連続 commit は stream gesture で 1 undo step に
                     // squash する (dirty / autosave は epoch bump が担う)。
-                    let scope = self.song_doc.stream_scope(StreamGesture::BpmScrub);
-                    self.song_doc.edit(scope, |song| song.bpm = clamped);
-                    self.ui_ephemeral.bpm_edit_text = format!("{:.1}", clamped);
+                    let scope = self.cur.song_doc.stream_scope(StreamGesture::BpmScrub);
+                    self.cur.song_doc.edit(scope, |song| song.bpm = clamped);
+                    self.cur.peph.bpm_edit_text = format!("{:.1}", clamped);
                     // Raw audio clip を秒固定スケール (r.md #7)。Raw clip があれば
                     // LoadSong (decode 再利用で軽量) で再生 window を追従させ、
                     // 無ければ従来の軽量 SetSongBpm で済ます。
                     if !self.rescale_raw_clips_for_bpm_change(old_bpm, clamped) {
-                        self.send_audio(AudioCommand::SetSongBpm { bpm: clamped });
+                        self.send_audio(AudioCommand::SetSongBpm { project: self.pk(), bpm: clamped });
                     }
                 }
             }
             AppEvent::SetSongTimeSigNumFromScrub(next) => {
                 let clamped = next.clamp(1, 32);
-                if self.song_doc.song().time_sig.0 != clamped {
-                    let scope = self.song_doc.stream_scope(StreamGesture::TimeSigScrub);
-                    self.song_doc.edit(scope, |song| song.time_sig.0 = clamped);
-                    self.ui_ephemeral.time_sig_num_edit_text = clamped.to_string();
-                    self.send_audio(AudioCommand::SetSongTimeSigNumerator { num: clamped });
+                if self.cur.song_doc.song().time_sig.0 != clamped {
+                    let scope = self.cur.song_doc.stream_scope(StreamGesture::TimeSigScrub);
+                    self.cur.song_doc.edit(scope, |song| song.time_sig.0 = clamped);
+                    self.cur.peph.time_sig_num_edit_text = clamped.to_string();
+                    self.send_audio(AudioCommand::SetSongTimeSigNumerator { project: self.pk(), num: clamped });
                 }
             }
             AppEvent::TimeSigNumEditChanged(s) => {
-                self.ui_ephemeral.time_sig_num_edit_text = s;
+                self.cur.peph.time_sig_num_edit_text = s;
             }
             AppEvent::CommitTimeSigNumEdit => {
                 self.commit_time_sig_num_edit();
@@ -836,18 +649,18 @@ impl AppData {
             AppEvent::ToggleGroupCollapsed { track_id } => {
                 // r.md #74: arrangement / mixer 両方の group disclosure が
                 // ここに合流する (`collapsed_groups` が 2 ビュー共通の SSoT)。
-                if !self.ui_prefs.collapsed_groups.insert(track_id) {
-                    self.ui_prefs.collapsed_groups.remove(&track_id);
+                if !self.cur.view.collapsed_groups.insert(track_id) {
+                    self.cur.view.collapsed_groups.remove(&track_id);
                 }
             }
             AppEvent::ToggleTrackAutomationCollapsed { track_id } => {
                 // gui_01 #034 (Phase 63n-10): master row の expansion は
                 // 通常 track の set とは別 SSoT。
                 if track_id == common::model::MASTER_TRACK_ID {
-                    self.ui_prefs.master_row_automation_expanded =
-                        !self.ui_prefs.master_row_automation_expanded;
-                } else if !self.ui_prefs.expanded_automation_tracks.insert(track_id) {
-                    self.ui_prefs.expanded_automation_tracks.remove(&track_id);
+                    self.cur.view.master_row_automation_expanded =
+                        !self.cur.view.master_row_automation_expanded;
+                } else if !self.cur.view.expanded_automation_tracks.insert(track_id) {
+                    self.cur.view.expanded_automation_tracks.remove(&track_id);
                 }
             }
             AppEvent::SetLaneEnabled {
@@ -877,7 +690,7 @@ impl AppData {
                 prev_px: _,
                 next_px,
             } => {
-                self.ui_prefs.track_row_overrides.insert(track_id, next_px);
+                self.cur.view.track_row_overrides.insert(track_id, next_px);
             }
             AppEvent::AddAutomationPoint {
                 track_id,
@@ -896,12 +709,12 @@ impl AppData {
                 // session-only: 該当 point が存在するときだけ編集開始 (race で
                 // 既に消えていれば no-op)。
                 if self.automation_point_value(&key).is_some() {
-                    self.ui_ephemeral.editing_automation_point = Some(key);
+                    self.cur.peph.editing_automation_point = Some(key);
                 }
             }
             AppEvent::SetAutomationPointValue { key, value } => {
                 self.set_automation_point_value(&key, value);
-                self.ui_ephemeral.editing_automation_point = None;
+                self.cur.peph.editing_automation_point = None;
             }
             AppEvent::SetAutomationCurve { track_id, lane_id, clip_id, point_id, next } => {
                 self.set_automation_curve(track_id, lane_id, clip_id, point_id, next);
@@ -935,15 +748,15 @@ impl AppData {
                 // 直近に選択した編集面を記録 (= 共存選択されたときの
                 // copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
                 if !next.is_empty() {
-                    self.selection.last_edit_select = Some(EditSurface::AutomationClips);
+                    self.cur.selection.last_edit_select = Some(EditSurface::AutomationClips);
                 }
-                self.selection.selected_automation_clips = next;
+                self.cur.selection.selected_automation_clips = next;
             }
             AppEvent::SelectAutomationPoints { prev: _, next } => {
                 if !next.is_empty() {
-                    self.selection.last_edit_select = Some(EditSurface::AutomationPoints);
+                    self.cur.selection.last_edit_select = Some(EditSurface::AutomationPoints);
                 }
-                self.selection.selected_automation_points = next;
+                self.cur.selection.selected_automation_points = next;
             }
             AppEvent::QuantizeSelectedAutomationPoints(div) => {
                 self.quantize_selected_automation_points(div);
@@ -956,7 +769,7 @@ impl AppData {
                 target,
                 display_name,
             } => {
-                self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+                self.cur.peph.last_touched_param = Some(TouchedParam {
                     track_id,
                     target,
                     display_name,
@@ -989,7 +802,7 @@ impl AppData {
                 // bracket する (= ParamGestureBegin と同 idiom)。これが無いと per-frame の
                 // `SetGroupTransformField` が各々 fresh な event_scope で snapshot を積み、
                 // 1 回の drag が undo 履歴を大量の step で埋める。group lane recording は未対応。
-                self.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture();
             }
             AppEvent::SetGroupTransformField { track_id, param, value } => {
                 // scrubable_number / preview drag からの live 設定。inspector は
@@ -997,23 +810,23 @@ impl AppData {
                 self.set_group_transform_field(track_id, param, value);
             }
             AppEvent::EndGroupTransformDrag => {
-                self.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture();
             }
             // r.md #28: inspector scrubable_number の drag / text 編集 stroke を 1 undo step に
             // bracket する。arch refactor で `is_undoable` whitelist を撤去した際、この Begin/End
             // が no-op のまま残り、per-frame の Set* 編集が各々 undo step を積んでいた (= 1 drag で
             // 履歴が溢れる)。ParamGestureBegin/End と同じ begin_gesture/end_gesture で塞ぐ。
             AppEvent::BeginInspectorScrub => {
-                self.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture();
             }
             AppEvent::EndInspectorScrub => {
-                self.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture();
             }
             AppEvent::BeginImagePiPDrag => {
                 // r.md #28: preview canvas 上の image PiP drag 全体を 1 undo step に bracket
                 // する (per-frame の `SetClipImageX/Y/W/H/Rotation` が各々 snapshot を積んで
                 // undo 履歴を溢れさせない = group transform / inspector scrub と同 idiom)。
-                self.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture();
                 // lane recording seed: selected_clip が指す image track に対し、lane を持つ
                 // field を `active_param_gestures` に登録する。record_automation_points_for
                 // _tick が再生中に 1/64 beat 刻みで point を打ち続ける。drag end (= MouseInput
@@ -1022,10 +835,10 @@ impl AppData {
             }
             AppEvent::EndImagePiPDrag => {
                 self.end_image_pip_drag_recording();
-                self.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture();
             }
             AppEvent::SetRecordingMode(mode) => {
-                self.recording.recording_mode = mode;
+                self.cur.recording.recording_mode = mode;
                 self.sync_recording_lanes_with_audio();
             }
             AppEvent::SetMetronomeEnabled(enabled) => {
@@ -1033,14 +846,14 @@ impl AppData {
                 // 次 buffer から `render_metronome` の有無を切り替える (= 無効
                 // 時は mix step 自体 skip = CPU 0)。 GUI 側は transport bar の
                 // toggle UI 更新のみ。
-                self.transport.metronome_enabled = enabled;
-                self.send_audio(AudioCommand::SetMetronomeEnabled(enabled));
+                self.cur.transport.metronome_enabled = enabled;
+                self.send_audio(AudioCommand::SetMetronomeEnabled { project: self.pk(), enabled });
             }
             AppEvent::ToggleMidiRecording => {
                 self.toggle_midi_recording();
             }
             AppEvent::SetCountInBars(bars) => {
-                self.recording.count_in_bars = bars.min(2);
+                self.cur.recording.count_in_bars = bars.min(2);
             }
             AppEvent::ParamGestureBegin {
                 track_id,
@@ -1075,19 +888,19 @@ impl AppData {
                 self.begin_rename_track(track_id);
             }
             AppEvent::RenameTrackChanged(text) => {
-                self.ui_ephemeral.track_rename_text = text;
+                self.cur.peph.track_rename_text = text;
             }
             AppEvent::CommitRenameTrack => self.commit_rename_track(),
             AppEvent::CancelRenameTrack => {
-                self.ui_ephemeral.track_rename_id = None;
-                self.ui_ephemeral.track_rename_text.clear();
+                self.cur.peph.track_rename_id = None;
+                self.cur.peph.track_rename_text.clear();
             }
             AppEvent::BeginRenameSection(id) => self.begin_rename_section(id),
-            AppEvent::RenameSectionChanged(text) => self.ui_ephemeral.section_rename_text = text,
+            AppEvent::RenameSectionChanged(text) => self.cur.peph.section_rename_text = text,
             AppEvent::CommitRenameSection => self.commit_rename_section(),
             AppEvent::CancelRenameSection => {
-                self.ui_ephemeral.section_rename_id = None;
-                self.ui_ephemeral.section_rename_text.clear();
+                self.cur.peph.section_rename_id = None;
+                self.cur.peph.section_rename_text.clear();
             }
             AppEvent::SetSectionColor { id, color } => {
                 self.edit_song(|song| {
@@ -1098,12 +911,12 @@ impl AppData {
             }
             AppEvent::BeginRenameClip(target) => self.begin_rename_clip(target),
             AppEvent::RenameClipChanged(text) => {
-                self.ui_ephemeral.clip_rename_text = text;
+                self.cur.peph.clip_rename_text = text;
             }
             AppEvent::CommitRenameClip => self.commit_rename_clip(),
             AppEvent::CancelRenameClip => {
-                self.ui_ephemeral.clip_rename = None;
-                self.ui_ephemeral.clip_rename_text.clear();
+                self.cur.peph.clip_rename = None;
+                self.cur.peph.clip_rename_text.clear();
             }
             AppEvent::ToggleHelp => {
                 self.ui_prefs.is_help_open = !self.ui_prefs.is_help_open;
@@ -1118,12 +931,11 @@ impl AppData {
                 self.ui_prefs.is_about_open = false;
             }
             AppEvent::OpenRecent(path) => {
-                // Open Recent も「プロジェクトを開く」 = 現プロジェクト破棄
-                // なので dirty なら保存確認を挟む。
-                self.request_guarded_action(DirtyGuardAction::OpenPath(path));
+                // Open Recent も「プロジェクトを開く」= 新しいタブ (pristine なら置き換え)。
+                self.open_path_in_tab(path);
             }
             AppEvent::AutosaveTick => {
-                self.maybe_autosave();
+                self.autosave_all_tabs();
             }
             AppEvent::RecoveryRestore(path) => {
                 self.restore_recovery(path);
@@ -1149,34 +961,34 @@ impl AppData {
                 self.handle_midi_control_change(channel, controller, value);
             }
             AppEvent::StartMidiLearn(target) => {
-                self.recording.midi_learn_target = Some(target);
+                self.cur.recording.midi_learn_target = Some(target);
                 self.ui_ephemeral.status_message =
                     "MIDI Learn: 次の CC を bind します...".to_string();
             }
             AppEvent::CancelMidiLearn => {
-                self.recording.midi_learn_target = None;
+                self.cur.recording.midi_learn_target = None;
                 self.ui_ephemeral.status_message = "MIDI Learn cancel".to_string();
             }
             AppEvent::RemoveMidiBinding(idx) => {
-                if idx < self.song_doc.song().midi_bindings.len() {
+                if idx < self.cur.song_doc.song().midi_bindings.len() {
                     self.edit_song(|song| song.midi_bindings.remove(idx));
                 }
             }
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
-                self.recording.midi_input_label = label.clone();
+                self.cur.recording.midi_input_label = label.clone();
                 if name.is_some() {
                     self.ui_ephemeral.status_message = format!("MIDI 入力: {label}");
                 }
             }
             AppEvent::SelectBottomPanel(p) => {
-                self.ui_prefs.bottom_panel = Some(p);
+                self.cur.view.bottom_panel = Some(p);
             }
             // r.md #96: Mixer が見えていれば閉じ、それ以外 (閉じている / Piano Roll タブ)
             // なら Mixer タブで開く。開く前の状態は覚えない (Bitwig の `B` 流)。
             AppEvent::ToggleMixerPanel => {
-                self.ui_prefs.bottom_panel =
-                    if self.ui_prefs.bottom_panel == Some(0) { None } else { Some(0) };
+                self.cur.view.bottom_panel =
+                    if self.cur.view.bottom_panel == Some(0) { None } else { Some(0) };
             }
             AppEvent::Sampler(ev) => self.handle_sampler_event(ev),
             AppEvent::VirtualKeyboard(ev) => self.handle_virtual_keyboard_event(ev),
@@ -1194,8 +1006,8 @@ impl AppData {
             AppEvent::SetTimeSelection { start_beat, end_beat, lanes } => {
                 let next = common::model::TimeSelection::new(start_beat, end_beat, lanes);
                 self.set_time_selection(next);
-                self.selection.range_anchor =
-                    self.selection.time.as_ref().map(|t| t.start_beat);
+                self.cur.selection.range_anchor =
+                    self.cur.selection.time.as_ref().map(|t| t.start_beat);
                 // 範囲を引いたら、ピアノロールは**その範囲**を映す (掛かったクリップ全体
                 // ではない)。 ビューが曲頭のままだとノートが画面外で空に見えるので、
                 // 範囲を張り直すたびに合わせ直す。
@@ -1205,11 +1017,11 @@ impl AppData {
                 self.select_all_arrangement(track);
             }
             AppEvent::ClearSelection => {
-                self.selection.time = None;
-                self.selection.selected_launcher_cells.clear();
+                self.cur.selection.time = None;
+                self.cur.selection.selected_launcher_cells.clear();
                 // 選択を捨てたら Shift+click 範囲選択の基点も捨てる。
-                self.selection.range_anchor = None;
-                self.selection.launcher_cell_anchor = None;
+                self.cur.selection.range_anchor = None;
+                self.cur.selection.launcher_cell_anchor = None;
             }
             AppEvent::ResizeClip {
                 target,
@@ -1246,7 +1058,7 @@ impl AppData {
             AppEvent::SetNoteSelection(targets) => {
                 self.set_note_selection(&(targets));
                 if !self.selected_note_ids().is_empty() {
-                    self.selection.last_edit_select = Some(EditSurface::Notes);
+                    self.cur.selection.last_edit_select = Some(EditSurface::Notes);
                 }
                 // last (anchor) は packed note id。所属クリップを decode し、
                 // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
@@ -1259,12 +1071,12 @@ impl AppData {
                         self.set_pianoroll_target_clip(key);
                     }
                     if let Some(dur) = self
-                        .song_doc.song()
+                        .cur.song_doc.song()
                         .track_by_id(r.track_id)
                         .and_then(|t| t.clip_by_id(r.clip_id))
-                        .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.duration_beats))
+                        .and_then(|c| self.cur.song_doc.song().clip_notes(c).get(local).map(|n| n.duration_beats))
                     {
-                        self.ui_prefs.last_note_duration_beats =
+                        self.cur.view.last_note_duration_beats =
                             dur.max(common::model::MIN_NOTE_LEN_BEATS);
                     }
                 }
@@ -1322,10 +1134,10 @@ impl AppData {
             AppEvent::HoverFontInPicker(idx) => self.hover_font_in_picker(idx),
             AppEvent::CommitFontFromPicker(family) => self.commit_font_from_picker(family),
             AppEvent::FontFamiliesLoaded(families) => self.on_font_families_loaded(families),
-            AppEvent::AssetDecodeTick => self.on_asset_decode_tick(),
+            AppEvent::AssetDecodeTick { .. } => self.on_asset_decode_tick(),
             AppEvent::RescanProgress { done, total } => {
-                self.media.load_progress = Some((done, total));
-                self.media.load_progress_label = "プラグインを走査中";
+                self.cur.media.load_progress = Some((done, total));
+                self.cur.media.load_progress_label = "プラグインを走査中";
             }
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
@@ -1334,13 +1146,13 @@ impl AppData {
                 self.finish_rescan();
             }
             AppEvent::SetArrangeScroll(scroll) => {
-                self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
+                self.cur.view.arrange_scroll_beat = scroll.max(0.0);
                 // 再生中の手動横スクロールは追従を解除する (ユーザー選択の挙動)。
                 self.cancel_follow_on_manual_view_change();
             }
             // ドラッグの端オートスクロールは view を動かすだけ (追従は解除しない)。
             AppEvent::AutoScrollArrange(scroll) => {
-                self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
+                self.cur.view.arrange_scroll_beat = scroll.max(0.0);
             }
             AppEvent::CycleArrangeFollow => self.cycle_arrange_follow(),
             AppEvent::SetArrangeTrackRowH(h) => {
@@ -1348,16 +1160,16 @@ impl AppData {
                 // 表示できるようにする)。 viewport 高はここでは未知なので大きめに取り、
                 // 実描画時は lanes 高さと min を取って絶対に visible 数 0 にならない構造で
                 // 描画側 (`view_build` の `tracks_visible`) が吸収する。
-                self.ui_prefs.arrange_track_row_h =
+                self.cur.view.arrange_track_row_h =
                     h.clamp(MIN_ARRANGE_ROW_H, MAX_ARRANGE_ROW_H);
             }
             AppEvent::SetArrangeHeaderW(w) => {
                 // track 名が読める下限と lanes を潰さない上限で clamp。 widget は
                 // 毎フレーム `view.header_w` としてこの値を読むので即反映される。
-                self.ui_prefs.arrange_header_w = w.clamp(80.0, 480.0);
+                self.cur.view.arrange_header_w = w.clamp(80.0, 480.0);
             }
             AppEvent::SetArrangeZoom(zoom) => {
-                self.ui_prefs.arrange_zoom_x = zoom.clamp(2.0, 400.0);
+                self.cur.view.arrange_zoom_x = zoom.clamp(2.0, 400.0);
                 // 再生中の手動ズームは追従を解除する (ユーザー選択の挙動)。
                 self.cancel_follow_on_manual_view_change();
             }
@@ -1485,7 +1297,7 @@ impl AppData {
             AppEvent::SetModSourceTapPoint { id, tap_point } => {
                 self.set_mod_source_tap_point(id, tap_point)
             }
-            AppEvent::SetArmedModSource(id) => self.ui_ephemeral.armed_mod_source = id,
+            AppEvent::SetArmedModSource(id) => self.cur.peph.armed_mod_source = id,
             AppEvent::SetAuxInputTapPoint {
                 device_id,
                 port,
@@ -1514,39 +1326,20 @@ impl AppData {
             // per-frame の `SetMasterGain` が各々 snapshot を積み、1 回の drag で
             // undo 履歴が埋まる (group transform / inspector scrub と同じ罠)。
             AppEvent::BeginMasterGainDrag => {
-                self.ui_ephemeral.master_gain_dragging = true;
-                self.song_doc.begin_gesture();
+                self.cur.peph.master_gain_dragging = true;
+                self.cur.song_doc.begin_gesture();
             }
             AppEvent::EndMasterGainDrag => {
-                self.ui_ephemeral.master_gain_dragging = false;
-                self.song_doc.end_gesture();
+                self.cur.peph.master_gain_dragging = false;
+                self.cur.song_doc.end_gesture();
             }
-            AppEvent::Tick {
-                samples,
-                preroll,
-                playing,
-                recording_live,
-            } => {
-                // r.md #51: engine が所有する状態をここで観測する。
-                // **`transport.is_playing` / `recording.live` を書くのはここだけ**
-                // (他所で立てると engine の実状態と食い違い、Rec 単独録音で
-                // プレイヘッド凍結・オートメーション未記録・曲末で止まらない、が
-                // 一度に起きていた)。
-                self.transport.preroll_remaining = preroll;
-                self.recording.live = recording_live;
-                let stopped = self.transport.is_playing && !playing;
-                self.transport.is_playing = playing;
-                self.on_tick(samples, stopped);
-                if stopped {
-                    // 手動停止・曲末 auto-stop・書き出し・パニックのどれで止まっても
-                    // ここへ収束する (録音セッションのクローズ)。
-                    self.on_transport_stopped();
-                }
+            AppEvent::Tick { project, samples, preroll, playing, recording_live } => {
+                self.on_transport_tick(project, samples, preroll, playing, recording_live);
             }
             // r.md #50: マスターメーターの表示状態は解析器が丸ごと作るので、
             // ここは差し替えるだけ (GUI 側で弾道を二重に掛けない)。
             AppEvent::MasterMeterTick(snapshot) => {
-                self.transport.master_meter = *snapshot;
+                self.cur.transport.master_meter = *snapshot;
             }
             AppEvent::SetTrackVolume { track, amp } => {
                 self.set_track_volume(track, amp);
@@ -1574,11 +1367,17 @@ impl AppData {
             AppEvent::ToggleStripSection(section) => {
                 self.toggle_strip_section(section);
             }
-            AppEvent::TrackPeaksTick { tracks, master_gr } => {
-                self.on_track_peaks_tick(&tracks, master_gr);
+            // メーター / 走行状態 / 変調値面はアクティブなタブの slot だけ読む。届いた
+            // 時点で切り替わっていたら (1 tick の窓) 捨てる — 別タブの値を混ぜない。
+            AppEvent::TrackPeaksTick { project, tracks, master_gr } => {
+                if project == self.cur.key {
+                    self.on_track_peaks_tick(&tracks, master_gr);
+                }
             }
-            AppEvent::LauncherRowsTick(rows) => {
-                self.on_launcher_rows_tick(rows);
+            AppEvent::LauncherRowsTick { project, rows } => {
+                if project == self.cur.key {
+                    self.on_launcher_rows_tick(rows);
+                }
             }
             AppEvent::MetricsTick {
                 dsp_load_peak,
@@ -1605,13 +1404,19 @@ impl AppData {
             AppEvent::ToggleResourcePanel => {
                 self.ui_ephemeral.resource_panel_open = !self.ui_ephemeral.resource_panel_open;
             }
-            AppEvent::ModScalarsTick(plane) => {
+            AppEvent::ModScalarsTick { project, plane } => {
                 // docs/plan_modulation.md §4.2: snapshot the latest modulator
                 // values (already attack/release-smoothed by the engine — no
                 // extra GUI smoothing). Zero-copy: move the polled plane in。
-                self.transport.mod_plane = plane;
+                if project == self.cur.key {
+                    self.cur.transport.mod_plane = plane;
+                }
             }
-            AppEvent::TrackVoicesTick(voices) => self.transport.track_voices = voices,
+            AppEvent::TrackVoicesTick { project, voices } => {
+                if project == self.cur.key {
+                    self.cur.transport.track_voices = voices;
+                }
+            }
             AppEvent::AddReturnTrack => {
                 self.action_add_return_track();
             }
@@ -1631,10 +1436,10 @@ impl AppData {
                 self.set_send_enabled(track_id, send_idx, enabled);
             }
             AppEvent::OpenSendPicker { src_track_id } => {
-                self.ui_ephemeral.send_picker = Some(SendPickerState { src_track_id });
+                self.cur.peph.send_picker = Some(SendPickerState { src_track_id });
             }
             AppEvent::CloseSendPicker => {
-                self.ui_ephemeral.send_picker = None;
+                self.cur.peph.send_picker = None;
             }
             AppEvent::ExportWav => {
                 self.open_export_range_picker(ExportRangeKind::Wav);
@@ -1648,14 +1453,14 @@ impl AppData {
             }
             AppEvent::SetExportRangeEnd(beat) => {
                 if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
-                    let max = self.song_doc.song().length_beats.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
+                    let max = self.cur.song_doc.song().length_beats.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
                     p.end_beat = beat.clamp(p.start_beat + MIN_EXPORT_RANGE_BEATS, max);
                 }
             }
             AppEvent::ResetExportRange => {
                 if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
                     p.start_beat = 0.0;
-                    p.end_beat = self.song_doc.song().length_beats.max(MIN_EXPORT_RANGE_BEATS);
+                    p.end_beat = self.cur.song_doc.song().length_beats.max(MIN_EXPORT_RANGE_BEATS);
                 }
             }
             // r.md #54: 範囲プリセット。対象が無いときは何も変えず理由を出す
@@ -1663,7 +1468,7 @@ impl AppData {
             AppEvent::SetExportRangeSource(source) => {
                 match self.export_range_from_source(source) {
                     Some((start, end)) => {
-                        let len = self.song_doc.song().length_beats;
+                        let len = self.cur.song_doc.song().length_beats;
                         if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
                             p.start_beat = start.max(0.0);
                             p.end_beat = end.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
@@ -1718,7 +1523,7 @@ impl AppData {
                 self.toggle_loudness_report();
             }
             AppEvent::RerunLoudnessAnalysis => {
-                if let Some(r) = self.loudness.report.as_ref() {
+                if let Some(r) = self.cur.loudness.report.as_ref() {
                     let range = Some((r.range_start_beat, r.range_end_beat));
                     self.begin_loudness_analysis(range);
                 }
@@ -1820,7 +1625,7 @@ impl AppData {
                 // has_pending_save が立ち、 on_all_states 完了ハンドラ (既存) が実行
                 // する。
                 if self.ui_ephemeral.guard_after_save.is_some()
-                    && !self.song_doc.is_dirty()
+                    && !self.cur.song_doc.is_dirty()
                     && !self.has_pending_save()
                     && let Some(action) = self.ui_ephemeral.guard_after_save.take()
                 {
@@ -1837,12 +1642,12 @@ impl AppData {
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
-            AppEvent::ExportProgress { done, total } => {
-                self.transport.export_stage = Some(ExportStage::VideoRender { done, total });
+            AppEvent::ExportProgress { done, total, .. } => {
+                self.cur.transport.export_stage = Some(ExportStage::VideoRender { done, total });
             }
-            AppEvent::ExportFinished { result } => {
-                self.transport.export_stage = None;
-                self.transport.export_cancel = None;
+            AppEvent::ExportFinished { result, .. } => {
+                self.cur.transport.export_stage = None;
+                self.cur.transport.export_cancel = None;
                 // 自動レンダリングした音声 temp 一式 (WAV + sidecar) を削除。
                 self.remove_export_temp_wav();
                 match result {
@@ -1860,11 +1665,11 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::CancelExport => match self.transport.export_stage {
+            AppEvent::CancelExport => match self.cur.transport.export_stage {
                 // 映像フェーズは daw_gui プロセス内の render thread。in-process の
                 // atomic flag で次フレーム中断させる。
                 Some(ExportStage::VideoRender { .. }) => {
-                    if let Some(flag) = &self.transport.export_cancel {
+                    if let Some(flag) = &self.cur.transport.export_cancel {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         self.ui_ephemeral.status_message = "Video export をキャンセル中...".into();
                     }
@@ -1919,7 +1724,7 @@ impl AppData {
             AppEvent::ResyncClipEditBuffers(target) => {
                 // 数値 buffer は撤去済み。 text section と共有する
                 // `clip_edit_buffer_target` を target に向ける純 sync。
-                self.ui_ephemeral.clip_edit_buffer_target = Some(target);
+                self.cur.peph.clip_edit_buffer_target = Some(target);
             }
             AppEvent::SetClipGainDb { target, gain_db } => {
                 self.set_clip_audio_event_gain_db(target, gain_db);
@@ -1997,12 +1802,12 @@ impl AppData {
             AppEvent::BeginTextPiPDrag => {
                 // r.md #28: preview canvas 上の text PiP drag 全体を 1 undo step に bracket
                 // する (image PiP と同 idiom)。
-                self.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture();
                 self.begin_text_pip_drag_recording();
             }
             AppEvent::EndTextPiPDrag => {
                 self.end_text_pip_drag_recording();
-                self.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture();
             }
             AppEvent::SetClipTextMuted { target, muted } => {
                 // 字幕 clip mute も clip-level `Clip.muted` に一本化。
@@ -2027,10 +1832,10 @@ impl AppData {
                 self.set_clip_text_num_field(target, field, value);
             }
             AppEvent::ClipTextContentEditChanged(s) => {
-                self.ui_ephemeral.clip_text_content_edit_text = s;
+                self.cur.peph.clip_text_content_edit_text = s;
             }
             AppEvent::ClipTextFontFamilyEditChanged(s) => {
-                self.ui_ephemeral.clip_text_font_family_edit_text = s;
+                self.cur.peph.clip_text_font_family_edit_text = s;
             }
             AppEvent::CommitClipTextContentEdit => {
                 self.commit_clip_text_content_edit();
@@ -2062,7 +1867,7 @@ impl AppData {
             AppEvent::SelectAudioEditorEvent(idx) => {
                 self.set_audio_event_selection(&idx.into_iter().collect::<Vec<usize>>());
                 if !self.selected_audio_event_indices().is_empty() {
-                    self.selection.last_edit_select = Some(EditSurface::AudioEvents);
+                    self.cur.selection.last_edit_select = Some(EditSurface::AudioEvents);
                 }
             }
             AppEvent::SetAudioEditorEventSelection(indices) => {
@@ -2202,21 +2007,21 @@ impl AppData {
                 // Clip Inspector の 2 段 dropdown は `singers` を
                 // 直接読む (キャラ→style の階層が要るので flat cache は持たない)。
             }
-            AppEvent::LipsyncGenerated { vocal_track_id, target_track_id, bpm, clips, generation } => {
+            AppEvent::LipsyncGenerated { vocal_track_id, target_track_id, bpm, clips, generation, .. } => {
                 // 成功/失敗/空に関わらず in-flight 解除 (= スピナーを止める)。
                 // generation が古くても (project 切替後でも) 必ず外す。
-                self.voicevox.lipsync_inflight.remove(&target_track_id);
+                self.cur.pvv.lipsync_inflight.remove(&target_track_id);
                 // spawn 後に project が切り替わった (reset_saved_baseline
                 // が gen を bump した) 古い結果は捨てる。 適用すると別 project の口
                 // track を作り直して spurious dirty になる。 debounce leg と同 idiom。
-                if generation == self.voicevox.lipsync_gen && !clips.is_empty() {
+                if generation == self.cur.pvv.lipsync_gen && !clips.is_empty() {
                     self.apply_lipsync_generated(vocal_track_id, bpm, clips);
-                } else if generation == self.voicevox.lipsync_gen {
+                } else if generation == self.cur.pvv.lipsync_gen {
                     // 空 = 全 query 失敗 (engine 起動中等。 ソース無しは spawn 前に
                     // return 済み)。 発注時に記録した fingerprint を rollback して、
                     // 次の debounce で自動リトライさせる (残すと「最新」扱いになり
                     // 入力を変えるまで口パクが欠けたまま再生成されない)。
-                    self.voicevox.lipsync_fingerprints.remove(&target_track_id);
+                    self.cur.pvv.lipsync_fingerprints.remove(&target_track_id);
                 }
             }
             AppEvent::SetLipsyncTarget { track, target } => {
@@ -2225,14 +2030,14 @@ impl AppData {
             AppEvent::SetMouthMapSlot { track, shape, source_id } => {
                 self.set_mouth_map_slot(track, shape, source_id);
             }
-            AppEvent::LipsyncDebounceFired(generation) => {
-                if generation == self.voicevox.lipsync_gen {
+            AppEvent::LipsyncDebounceFired { generation, .. } => {
+                if generation == self.cur.pvv.lipsync_gen {
                     // (talk) regen は target 中心 (= その口 track を出力先にする全ソースを
                     // まとめて再生成) なので、口 track ごとに 1 回だけ呼べば足りる。同じ
                     // target を複数ソースぶん呼ぶと全ソース regen が重複するため、出力先
                     // track 単位で dedup し代表ソースを 1 つ渡す。
                     let mut targets: Vec<u32> = self
-                        .song_doc.song()
+                        .cur.song_doc.song()
                         .tracks
                         .iter()
                         .filter_map(|t| t.lipsync_target_track)
@@ -2243,12 +2048,12 @@ impl AppData {
                         // 入力 (notes / 歌詞 / bpm / mouth_map / binding / clip 位置) が
                         // 前回の再生成時から変わっていなければスキップ。track rename / 色 /
                         // mute / volume 等の非入力編集による無駄な再生成を防ぐ。
-                        let fp = Self::lipsync_input_fingerprint(self.song_doc.song(), target);
-                        if self.voicevox.lipsync_fingerprints.get(&target) == Some(&fp) {
+                        let fp = Self::lipsync_input_fingerprint(self.cur.song_doc.song(), target);
+                        if self.cur.pvv.lipsync_fingerprints.get(&target) == Some(&fp) {
                             continue;
                         }
                         if let Some(src_id) = self
-                            .song_doc.song()
+                            .cur.song_doc.song()
                             .tracks
                             .iter()
                             .find(|t| t.lipsync_target_track == Some(target))
@@ -2276,46 +2081,46 @@ impl AppData {
                 self.set_clip_talk_param(clip, param, value);
             }
             AppEvent::SetPianoRollSnapEnabled(b) => {
-                self.ui_prefs.pianoroll_snap_enabled = b;
+                self.cur.view.pianoroll_snap_enabled = b;
             }
             AppEvent::SetPianoRollSnapChoice(c) => {
-                self.ui_prefs.pianoroll_snap_choice = clamp_snap_choice(c);
+                self.cur.view.pianoroll_snap_choice = clamp_snap_choice(c);
             }
             AppEvent::SetArrangeSnapEnabled(b) => {
-                self.ui_prefs.arrange_snap_enabled = b;
+                self.cur.view.arrange_snap_enabled = b;
             }
             AppEvent::SetArrangeSnapChoice(c) => {
-                self.ui_prefs.arrange_snap_choice = clamp_snap_choice(c);
+                self.cur.view.arrange_snap_choice = clamp_snap_choice(c);
             }
             AppEvent::TogglePianoRollSnap => {
-                self.ui_prefs.pianoroll_snap_enabled = !self.ui_prefs.pianoroll_snap_enabled;
+                self.cur.view.pianoroll_snap_enabled = !self.cur.view.pianoroll_snap_enabled;
             }
             AppEvent::ToggleArrangeSnap => {
-                self.ui_prefs.arrange_snap_enabled = !self.ui_prefs.arrange_snap_enabled;
+                self.cur.view.arrange_snap_enabled = !self.cur.view.arrange_snap_enabled;
             }
             AppEvent::NarrowPianoRollGrid => {
-                self.ui_prefs.pianoroll_snap_choice =
-                    crate::view::snap::narrow_choice(self.ui_prefs.pianoroll_snap_choice);
+                self.cur.view.pianoroll_snap_choice =
+                    crate::view::snap::narrow_choice(self.cur.view.pianoroll_snap_choice);
             }
             AppEvent::NarrowArrangeGrid => {
-                self.ui_prefs.arrange_snap_choice =
-                    crate::view::snap::narrow_choice(self.ui_prefs.arrange_snap_choice);
+                self.cur.view.arrange_snap_choice =
+                    crate::view::snap::narrow_choice(self.cur.view.arrange_snap_choice);
             }
             AppEvent::WidenPianoRollGrid => {
-                self.ui_prefs.pianoroll_snap_choice =
-                    crate::view::snap::widen_choice(self.ui_prefs.pianoroll_snap_choice);
+                self.cur.view.pianoroll_snap_choice =
+                    crate::view::snap::widen_choice(self.cur.view.pianoroll_snap_choice);
             }
             AppEvent::WidenArrangeGrid => {
-                self.ui_prefs.arrange_snap_choice =
-                    crate::view::snap::widen_choice(self.ui_prefs.arrange_snap_choice);
+                self.cur.view.arrange_snap_choice =
+                    crate::view::snap::widen_choice(self.cur.view.arrange_snap_choice);
             }
             AppEvent::TogglePianoRollTriplet => {
-                self.ui_prefs.pianoroll_snap_choice =
-                    crate::view::snap::toggle_triplet_choice(self.ui_prefs.pianoroll_snap_choice);
+                self.cur.view.pianoroll_snap_choice =
+                    crate::view::snap::toggle_triplet_choice(self.cur.view.pianoroll_snap_choice);
             }
             AppEvent::ToggleArrangeTriplet => {
-                self.ui_prefs.arrange_snap_choice =
-                    crate::view::snap::toggle_triplet_choice(self.ui_prefs.arrange_snap_choice);
+                self.cur.view.arrange_snap_choice =
+                    crate::view::snap::toggle_triplet_choice(self.cur.view.arrange_snap_choice);
             }
             AppEvent::FitPianoRollToClip => {
                 self.fit_piano_roll_to_clip();
@@ -2348,18 +2153,18 @@ impl AppData {
                 self.quantize_pitches_to_scale(target);
             }
             AppEvent::ToggleSnapOnDraw => {
-                self.ui_prefs.snap_on_draw = !self.ui_prefs.snap_on_draw;
+                self.cur.view.snap_on_draw = !self.cur.view.snap_on_draw;
             }
             AppEvent::ToggleSnapLiveInput => {
-                self.recording.snap_live_input = !self.recording.snap_live_input;
+                self.cur.recording.snap_live_input = !self.cur.recording.snap_live_input;
             }
             AppEvent::ToggleFoldToScale => {
-                self.ui_prefs.piano_roll_fold = !self.ui_prefs.piano_roll_fold;
+                self.cur.view.piano_roll_fold = !self.cur.view.piano_roll_fold;
             }
         }
         // edit_song が export 中拒否を予約していたら status に表示する
         // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
-        if let Some(msg) = self.song_doc.take_rejection() {
+        if let Some(msg) = self.cur.song_doc.take_rejection() {
             self.ui_ephemeral.status_message = msg.into();
         }
     }

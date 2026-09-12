@@ -25,6 +25,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     press::dispatch(ui, &f);
     // 2b. ボタンを押したまま Esc → 生きている drag session を全部捨てる (r.md #127)。
     cancel::on_escape(ui, &f);
+    // 2c. `docs/plan_project_tabs.md` §5.6: タブ帯の上に留まる / Ctrl+Tab → 運んでいる
+    //     クリップ / トラックを別タブへの持ち込み (drag payload) に昇格して切り替える。
+    xfer::promote(app, ui, &f);
     // 3. drag 継続 + 端オートスクロール + per-frame live 発火。
     drag::advance(ui, &f);
     launcher::drag::advance(ui, &f);
@@ -39,6 +42,12 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     response.edge_scroll_drag = {
         let state: &mut ArrangementState = ui.widget_state(f.wid);
         arrangement_edge_scroll_axes(state).is_some()
+    };
+    response.xfer_drag_active = {
+        let state: &mut ArrangementState = ui.widget_state(f.wid);
+        state.clip_drag.as_ref().is_some_and(|d| d.kind == ClipDragKind::Move)
+            || state.track_reorder.is_some()
+            || state.launcher.cell_drag.is_some()
     };
     cursor::apply(ui, &f, &live, &response);
     launcher::press::cursor(ui, &f);

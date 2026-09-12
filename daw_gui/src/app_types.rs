@@ -22,10 +22,10 @@ pub use crate::color_target::ColorPickerTarget;
 /// テスト可能な enum で表現する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackRemovalIpc {
-    /// daw_audio engine に `AudioCommand::ClosePluginShmem { device_id }`
+    /// daw_audio engine に `AudioCommand::ClosePluginShmem { project: self.pk(), device_id }`
     /// を送る (use-after-free deadlock 防止のため teardown より先)。
     CloseAudioShmem { device_id: u64 },
-    /// daw_plugin_host に `PluginCommand::RemoveSlotPlugin { device_id }` を送る
+    /// daw_plugin_host に `PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) }` を送る
     /// (plugin instance の proper teardown)。 r.md #71 (プラグインのコピー / 移動):
     /// **track という単位は host 側に無い** — 帰属を二重所有すると device 移動で
     /// stale になるので、列挙は Song を持つ daw_gui 側の責務。
@@ -1732,21 +1732,39 @@ pub(crate) fn merge_lipsync_events_by_priority(mut events: Vec<(f64, f64, u32, u
     merged
 }
 
-/// 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 を
-/// 行おうとしたとき、 ガードモーダル (`dirty_guard_modal`) で保存確認を挟んでから
-/// 実行する操作の種類。 終了 (`Quit`、 旧 close 確認) と、 New / Open /
-/// Open Recent を一本化する (= 同じ「破棄する前に確認」 セマンティクス)。
+/// 未保存変更がある状態で「プロジェクト (タブ) を破棄する操作」 を行おうとしたとき、
+/// ガードモーダル (`dirty_guard_modal`) で保存確認を挟んでから実行する操作の種類
+/// (= 同じ「破棄する前に確認」 セマンティクス)。
+///
+/// `docs/plan_project_tabs.md` §5.2: New / Open はタブを置き換えないのでガード不要になり、
+/// 残るのは **終了** と **タブを閉じる** だけ。どちらも対象タブを順に (Q9) 確認する —
+/// 確認モーダルは常に **アクティブなタブ** (`AppData::cur`) について出るので、
+/// 呼び出し側は対象タブへ切り替えてから `request_guarded_action` を呼ぶ。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DirtyGuardAction {
     /// アプリを終了する (✕ / Alt+F4 / File > 終了 / Ctrl+Q / OS のセッション終了)。
     /// 終了コードは `QuitRequest` から運ばれる (smoke test が判定結果を載せる)。
+    /// 未保存タブを 1 つずつ確認し (`AppData::continue_quit`)、全部通ったら終了する。
     Quit(crate::shutdown::QuitRequest),
-    /// 新規プロジェクト (`action_new`)。
-    New,
-    /// プロジェクトを開く (ファイル選択 dialog、 `action_open`)。
-    Open,
-    /// 指定パスのプロジェクトを開く (Open Recent、 `action_open_path`)。
-    OpenPath(PathBuf),
+    /// タブを順に閉じる (先頭 = いま確認しているタブ = アクティブ)。1 つ閉じるごとに
+    /// 残りで `AppData::continue_close_tabs` を続け、キャンセルで残りも中断する。
+    CloseTabs(Vec<common::protocol::ProjectKey>),
+}
+
+/// `docs/plan_project_tabs.md` §5.6: タブをまたいでクリップ / トラックを運ぶ drag の札。
+/// アレンジ内部のドラッグがタブ帯の上で (0.5 秒 hover / Ctrl+Tab) この payload に昇格し、
+/// 落とし先のタブのアレンジが cross-project paste と同じ経路で独立コピーを作る。
+pub const PROJECT_XFER_DRAG_KIND: &str = "daw_01.project_xfer";
+
+/// [`PROJECT_XFER_DRAG_KIND`] の中身。`envelope` は copy と同じ [`crate::clipboard::ClipboardEnvelope`]
+/// (`Clips` / `Tracks`) を **メモリ上でそのまま** 持つ (serialize しないので clipboard の
+/// サイズ上限は掛からない)。`grab_*_offset` は掴んだ位置関係を落とし先で保つための差分
+/// (ポインタの拍 − 先頭クリップの拍 / ポインタのトラック − 先頭クリップのトラック)。
+#[derive(Debug, Clone)]
+pub struct ProjectTransferPayload {
+    pub envelope: crate::clipboard::ClipboardEnvelope,
+    pub grab_beat_offset: f64,
+    pub grab_track_offset: usize,
 }
 
 /// (talk) Text clip の読み上げスケール 1 項目 (`AppEvent::SetClipTalkParam`)。

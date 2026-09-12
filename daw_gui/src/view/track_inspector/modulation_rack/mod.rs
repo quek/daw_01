@@ -121,7 +121,7 @@ struct ModBodyCtx<'a> {
 /// たまたま合っていた再生中の一致まで壊れる。 テンポカーブが無い曲では
 /// `beats_to_samples` が閉形式に落ちるので、 既存曲のプレビューは 1 サンプルも動かない。
 fn mod_preview_pos(app: &AppData) -> (f64, f64) {
-    let beat = f64::from(app.transport.playhead_beat.unwrap_or(0.0));
+    let beat = f64::from(app.cur.transport.playhead_beat.unwrap_or(0.0));
     (beat, song_secs_at_beat(app, beat))
 }
 
@@ -136,23 +136,23 @@ fn song_secs_at_beat(app: &AppData, beat: f64) -> f64 {
     if sr == 0 || !beat.is_finite() {
         return 0.0;
     }
-    let epoch = app.song_doc.edit_epoch();
-    if let Some((e, b, secs)) = app.ui_ephemeral.preview_secs_memo.get()
+    let epoch = app.cur.song_doc.edit_epoch();
+    if let Some((e, b, secs)) = app.cur.peph.preview_secs_memo.get()
         && e == epoch
         && b.to_bits() == beat.to_bits()
     {
         return secs;
     }
-    let samples = common::automation::beats_to_samples(app.song_doc.song(), sr, beat);
+    let samples = common::automation::beats_to_samples(app.cur.song_doc.song(), sr, beat);
     #[allow(clippy::cast_precision_loss)]
     let secs = samples as f64 / f64::from(sr);
-    app.ui_ephemeral.preview_secs_memo.set(Some((epoch, beat, secs)));
+    app.cur.peph.preview_secs_memo.set(Some((epoch, beat, secs)));
     secs
 }
 
 /// モジュレーションラックを **スクロール viewport の top-down
 /// フロー** で描く (旧: 下端 pinned・2 個 cap)。各ソースは折りたたみ行で、クリックで
-/// クリックで大きなグラフィカルエディタに展開する (`app.ui_ephemeral.expanded_mod_sources`、 複数同時可)。
+/// クリックで大きなグラフィカルエディタに展開する (`app.cur.peph.expanded_mod_sources`、 複数同時可)。
 /// 戻り値は描画後の `y`。
 #[allow(clippy::too_many_lines)]
 pub(super) fn draw_modulation_rack(
@@ -180,7 +180,7 @@ pub(super) fn draw_modulation_rack(
     // 読まないが、 **この plan はプレビューの評価入力でもある** (`preview::cross_mod_window`
     // → `mod_graph::tick`)。 0 で埋めると Hz モードの ⟲here がプレビュー上だけ
     // FreeRun として描かれるので、 transport 位置と同じ写像で解決する。
-    let plan = common::mod_graph::build_plan(app.song_doc.song(), 0, |anchor_beat| {
+    let plan = common::mod_graph::build_plan(app.cur.song_doc.song(), 0, |anchor_beat| {
         song_secs_at_beat(app, anchor_beat)
     });
     let cx = ModBodyCtx {
@@ -232,7 +232,7 @@ pub(super) fn draw_modulation_rack(
 
     for src in &mod_sources {
         let sid = src.id;
-        let expanded = app.ui_ephemeral.expanded_mod_sources.contains(&sid);
+        let expanded = app.cur.peph.expanded_mod_sources.contains(&sid);
         let block_top = y;
         // バイパス中は名前 / メーターを減光 (プラグイン行の bypass と同じ見せ方)。
         let ink = if src.enabled { p.text } else { p.text_faint };
@@ -252,14 +252,14 @@ pub(super) fn draw_modulation_rack(
         let arm_x = meter_x - 4.0 - arm_w;
         let node = plan.nodes.iter().find(|n| n.source_id == sid);
         let badge_w = draw_mod_badges(ui, &app.theme, sid, node, arm_x - 4.0, y);
-        let armed = app.ui_ephemeral.armed_mod_source == Some(sid);
+        let armed = app.cur.peph.armed_mod_source == Some(sid);
         ui.button_at(
             ("inspector_mod_src_arm", sid),
             if armed { "\u{25c9}" } else { "\u{25cb}" },
             Rect { x: arm_x, y, w: arm_w, h: 20.0 },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    let next = if app.ui_ephemeral.armed_mod_source == Some(sid) { None } else { Some(sid) };
+                    let next = if app.cur.peph.armed_mod_source == Some(sid) { None } else { Some(sid) };
                     app.handle_event(AppEvent::SetArmedModSource(next));
                 })
             },
@@ -276,8 +276,8 @@ pub(super) fn draw_modulation_rack(
             move || {
                 Edit::mutate(move |app: &mut AppData| {
                     // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
-                    if !app.ui_ephemeral.expanded_mod_sources.insert(sid) {
-                        app.ui_ephemeral.expanded_mod_sources.remove(&sid);
+                    if !app.cur.peph.expanded_mod_sources.insert(sid) {
+                        app.cur.peph.expanded_mod_sources.remove(&sid);
                     }
                 })
             },
@@ -356,9 +356,9 @@ pub(super) fn draw_modulation_rack(
         }
         y += 4.0;
     }
-    if hover != app.ui_ephemeral.inspector_hovered_mod {
+    if hover != app.cur.peph.inspector_hovered_mod {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.inspector_hovered_mod = hover;
+            app.cur.peph.inspector_hovered_mod = hover;
         }));
     }
 
@@ -486,7 +486,7 @@ fn draw_routing_row(
         ..scrub_style(&app.theme)
     };
     let depth_owner = app
-        .song_doc
+        .cur.song_doc
         .song()
         .mod_routing_owner(row.id)
         .unwrap_or(common::model::MASTER_TRACK_ID);

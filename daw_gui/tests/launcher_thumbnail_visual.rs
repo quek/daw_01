@@ -110,7 +110,7 @@ fn populate(app: &mut AppData, texture: TextureHandle, with_arrangement_clip: bo
         })
         .expect("編集できる");
     // decode 完了後に runner が入れるのと同じ場所 (main renderer の handle)。
-    app.ui_ephemeral.image_texture_cache.insert(source_id, texture);
+    app.cur.peph.image_texture_cache.insert(source_id, texture);
 }
 
 /// ルート view を 1 フレーム組んでオフスクリーン描画し、KEY_RGB の pixel 数を返す。
@@ -163,11 +163,11 @@ fn session_only_image_clip_cell_shows_its_thumbnail() {
     // 1. セッションだけに居るクリップのセルにサムネイルが出る。
     let mut app = build_app();
     populate(&mut app, texture, false);
-    assert_eq!(app.ui_prefs.launcher_layout, LauncherLayout::Both, "既定は帯とレーンの両方");
+    assert_eq!(app.cur.view.launcher_layout, LauncherLayout::Both, "既定は帯とレーンの両方");
     let with_pane = render_and_count(&mut renderer, &app, "session_only_both");
 
     // 2. 対照: 同じ song で帯を畳むと消える (= 1 の色は帯のセルから出ていた)。
-    app.ui_prefs.launcher_layout = LauncherLayout::ArrangerOnly;
+    app.cur.view.launcher_layout = LauncherLayout::ArrangerOnly;
     let without_pane = render_and_count(&mut renderer, &app, "session_only_arranger_only");
 
     assert_eq!(without_pane, 0, "帯を畳めば texture 色は 1px も出ない (アレンジに同 content は無い)");

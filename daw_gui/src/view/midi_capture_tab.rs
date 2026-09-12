@@ -132,7 +132,7 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
     let p = &app.theme.core;
     let y = header.y + (HEADER_H - 22.0) / 2.0;
     let mut x = header.x + PAD;
-    let port = app.recording.midi_input_label.as_str();
+    let port = app.cur.recording.midi_input_label.as_str();
     let port_label = if port.is_empty() { "MIDI 入力なし".to_string() } else { format!("入力: {port}") };
     ui.label_at("midi_capture_port", &port_label, x, y + 5.0, FONT, p.text_dim);
     x += ui.measure_text(&port_label, FONT) + PAD * 3.0;

@@ -39,7 +39,7 @@ fn app_with_source() -> (AppData, u32) {
 
 fn connect(app: &mut AppData, target: &AutomationTarget, source_id: u32) -> u32 {
     app.handle_event(AppEvent::AddModRouting { track_id: TRACK_A, target: target.clone(), source_id });
-    app.song_doc
+    app.cur.song_doc
         .song()
         .all_mod_routings()
         .find(|r| r.source_id == source_id && &r.target == target)
@@ -54,23 +54,23 @@ fn routing_and_source_bypass_are_independent_and_undoable() {
     let pan = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
     let r_vol = connect(&mut app, &vol, sid);
     let r_pan = connect(&mut app, &pan, sid);
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
 
     // 1 本だけバイパス: その行だけ effective が落ちる。
     app.handle_event(AppEvent::SetModRoutingEnabled { routing_id: r_vol, enabled: false });
-    assert!(app.song_doc.is_dirty(), "バイパスは曲の編集");
+    assert!(app.cur.song_doc.is_dirty(), "バイパスは曲の編集");
     let rows = app.mod_source_routings(sid);
     let flags: Vec<(u32, bool, bool)> = rows.iter().map(|r| (r.id, r.enabled, r.effective)).collect();
     assert_eq!(flags, vec![(r_vol, false, false), (r_pan, true, true)]);
 
     // 同値は no-op (undo step を積まない)。
-    let before = app.song_doc.undo_depth();
+    let before = app.cur.song_doc.undo_depth();
     app.handle_event(AppEvent::SetModRoutingEnabled { routing_id: r_vol, enabled: false });
-    assert_eq!(app.song_doc.undo_depth(), before);
+    assert_eq!(app.cur.song_doc.undo_depth(), before);
 
     // ソースをバイパス: 全行 effective が落ちるが、 routing 側のフラグは据え置き。
     app.handle_event(AppEvent::SetModSourceEnabled { id: sid, enabled: false });
-    assert!(!app.song_doc.song().mod_sources[0].enabled);
+    assert!(!app.cur.song_doc.song().mod_sources[0].enabled);
     assert!(app.mod_source_display().iter().all(|s| !s.enabled));
     let rows = app.mod_source_routings(sid);
     let flags: Vec<(u32, bool, bool)> = rows.iter().map(|r| (r.id, r.enabled, r.effective)).collect();
@@ -88,9 +88,9 @@ fn routing_and_source_bypass_are_independent_and_undoable() {
 
     // undo で 1 段ずつ戻る (最後の有効化 → ソースのバイパス → routing のバイパス)。
     app.handle_event(AppEvent::Undo);
-    assert!(!app.song_doc.song().mod_sources[0].enabled);
+    assert!(!app.cur.song_doc.song().mod_sources[0].enabled);
     app.handle_event(AppEvent::Undo);
-    assert!(app.song_doc.song().mod_sources[0].enabled);
+    assert!(app.cur.song_doc.song().mod_sources[0].enabled);
     app.handle_event(AppEvent::Undo);
-    assert!(app.song_doc.song().mod_routing_by_id(r_vol).unwrap().enabled);
+    assert!(app.cur.song_doc.song().mod_routing_by_id(r_vol).unwrap().enabled);
 }

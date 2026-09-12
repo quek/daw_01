@@ -21,12 +21,12 @@ fn app_with_two_linked_clips() -> daw_gui::app::AppData {
             Clip { id: 2, start_beat: 4.0, length_beats: 4.0, content_id: cid, ..Default::default() },
         ];
     });
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
     app
 }
 
 fn content_ids(app: &daw_gui::app::AppData) -> (u32, u32) {
-    let clips = &app.song_doc.song().tracks[0].clips;
+    let clips = &app.cur.song_doc.song().tracks[0].clips;
     (clips[0].content_id, clips[1].content_id)
 }
 
@@ -49,7 +49,7 @@ fn make_unique_forks_all_selected_clips() {
 
     let (a, b) = content_ids(&app);
     assert_ne!(a, b, "選択した 2 clip は互いに独立した content になる (r.md #14)");
-    assert!(app.song_doc.is_dirty(), "実際に独立化したので dirty");
+    assert!(app.cur.song_doc.is_dirty(), "実際に独立化したので dirty");
 }
 
 /// 選択外の clip を右クリック Make Unique → その 1 つだけ独立化 (相方は共有のまま)。
@@ -82,13 +82,13 @@ fn make_unique_on_independent_clip_is_noop() {
             ..Default::default()
         }];
     });
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
 
     app.handle_event(AppEvent::SetClipSelection(vec![A]));
     app.handle_event(AppEvent::MakeClipUnique(A));
 
     assert!(
-        !app.song_doc.is_dirty(),
+        !app.cur.song_doc.is_dirty(),
         "既に独立した clip の Make Unique は何も変えない (r.md #14 / #12 と同じ no-op 規律)"
     );
 }

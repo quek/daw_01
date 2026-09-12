@@ -59,7 +59,7 @@ fn param_is_read_only(cx: &ModBodyCtx<'_>, sid: u32, param: ModParam) -> bool {
     param == ModParam::Rate
         && cx
             .app
-            .song_doc
+            .cur.song_doc
             .song()
             .mod_sources
             .iter()
@@ -103,7 +103,7 @@ pub(super) fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: 
     // 置き場は「そのソースが属するトラック」。 target だけから決める全域関数は作らない。
     let track_id = cx
         .app
-        .song_doc
+        .cur.song_doc
         .song()
         .mod_source_owner(f.sid)
         .unwrap_or(common::model::MASTER_TRACK_ID);
@@ -325,12 +325,12 @@ pub(super) fn owner_track_voices<'a>(
     cx: &'a ModBodyCtx<'_>,
     sid: u32,
 ) -> impl Iterator<Item = common::audio_bridge::VoiceSnapshot> + 'a {
-    let song = cx.app.song_doc.song();
+    let song = cx.app.cur.song_doc.song();
     let track_idx = song
         .mod_source_owner(sid)
         .and_then(|owner| song.tracks.iter().position(|t| t.id == owner));
     cx.app
-        .transport
+        .cur.transport
         .track_voices
         .iter()
         .filter(move |(t, _)| Some(*t) == track_idx)

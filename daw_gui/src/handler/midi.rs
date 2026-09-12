@@ -34,9 +34,9 @@ impl AppData {
             return;
         }
         self.monitor_note_on(pitch, velocity);
-        if self.recording.live {
+        if self.cur.recording.live {
             self.record_midi_note_on(pitch, velocity);
-        } else if !self.recording.requested {
+        } else if !self.cur.recording.requested {
             // 録音を待っている最中 (count-in / 読み込み待ち) の入力を step input で
             // 拾うと、意図しない位置にノートが置かれる。モニターだけして捨てる。
             self.step_input_note_on(pitch, velocity);
@@ -53,7 +53,7 @@ impl AppData {
         // **モニター中の音は必ず止める。** note-on の後に割り当てが増えると
         // note-off だけが飲まれ、鳴らしっぱなしになる (押している最中に Learn を
         // 済ませると起こる)。飲むかどうかに関係なく先に消音する。
-        let monitoring = self.recording.monitor_notes.iter().any(|(_, p)| *p == pitch);
+        let monitoring = self.cur.recording.monitor_notes.iter().any(|(_, p)| *p == pitch);
         if self.fire_launcher_bindings(
             channel,
             common::model::MidiBindInput::Note(pitch),
@@ -65,7 +65,7 @@ impl AppData {
             return;
         }
         self.monitor_note_off(pitch);
-        if self.recording.live {
+        if self.cur.recording.live {
             self.record_midi_note_off(pitch);
         }
     }
@@ -85,10 +85,11 @@ impl AppData {
     /// トラック全部、 仮想鍵盤 (r.md #113) はカーソルトラック 1 本にこれを呼ぶ。
     pub(crate) fn monitor_note_on_track(&mut self, track_id: u32, pitch: u8, velocity: u8) {
         // 同じ鍵の重複 on (auto-repeat / 取りこぼした off) は 1 回に畳む。
-        if !self.recording.monitor_notes.insert((track_id, pitch)) {
+        if !self.cur.recording.monitor_notes.insert((track_id, pitch)) {
             return;
         }
         self.send_audio(AudioCommand::PreviewNoteOn {
+            project: self.pk(),
             track_id,
             pitch,
             velocity,
@@ -99,28 +100,28 @@ impl AppData {
     /// よう、armed の集合ではなく **鳴らした台帳** を引いて off を送る。
     pub(crate) fn monitor_note_off(&mut self, pitch: u8) {
         let sounding: Vec<u32> = self
-            .recording
+            .cur.recording
             .monitor_notes
             .iter()
             .filter(|(_, p)| *p == pitch)
             .map(|(t, _)| *t)
             .collect();
         for track_id in sounding {
-            self.recording.monitor_notes.remove(&(track_id, pitch));
-            self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+            self.cur.recording.monitor_notes.remove(&(track_id, pitch));
+            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
         }
     }
 
     /// 鳴らしているモニター音を全て止める (arm 変更 / 停止 / 曲の入れ替え)。
     pub(crate) fn silence_monitor_notes(&mut self) {
-        for (track_id, pitch) in std::mem::take(&mut self.recording.monitor_notes) {
-            self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+        for (track_id, pitch) in std::mem::take(&mut self.cur.recording.monitor_notes) {
+            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
         }
     }
 
     /// 録音待機 (`Track::armed`) のトラック id。 録音・モニターの宛先。
     pub(crate) fn armed_track_ids(&self) -> Vec<u32> {
-        self.song_doc
+        self.cur.song_doc
             .song()
             .tracks
             .iter()
@@ -138,7 +139,7 @@ impl AppData {
         armed_track: Option<u32>,
     ) -> Option<common::model::BindingTarget> {
         use common::model::{AutomationTarget, BindingTarget, TrackBuiltinParam};
-        if let Some(tp) = &self.ui_ephemeral.last_touched_param {
+        if let Some(tp) = &self.cur.peph.last_touched_param {
             match tp.target {
                 AutomationTarget::PluginParam { device_id, param_id, .. } => {
                     return Some(BindingTarget::PluginParam {
@@ -182,13 +183,13 @@ impl AppData {
         // 値が動くたびに届く CC を毎回「押下」にすると `Toggle` が往復するので、
         // **押下状態が変わったフレームだけ**ランチャーへ回す。
         let edge = self.launcher_cc_edge(channel, input, pressed);
-        if self.recording.midi_learn_target.is_none()
-            && (self.launcher.learn_target.is_some() || edge)
+        if self.cur.recording.midi_learn_target.is_none()
+            && (self.cur.launcher.learn_target.is_some() || edge)
             && self.consume_launcher_midi(channel, input, pressed)
         {
             return;
         }
-        if let Some(target) = self.recording.midi_learn_target.take() {
+        if let Some(target) = self.cur.recording.midi_learn_target.take() {
             // Learn mode: 既存 同 (channel, controller) を retain で除外 +
             // 新 binding push。 status_message は次 frame の通常 status に上書き
             // されるが「bind 完了」 を一瞬表示。
@@ -211,7 +212,7 @@ impl AppData {
         // 通常 lookup: 該当 binding 全てに値送信 (= 同 CC を複数 target に
         // bind する usage を許容)。 channel = 16 は any-channel match。
         let targets: Vec<common::model::BindingTarget> = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .midi_bindings
             .iter()
             .filter(|b| {
@@ -254,10 +255,10 @@ impl AppData {
                 // (r.md #7)。Raw clip があれば LoadSong (decode 再利用で軽量) で
                 // 再生 window を追従、無ければ軽量 SetSongBpm で即時更新。
                 let bpm = (60.0 + v_norm * 120.0).clamp(1.0, 400.0);
-                let old_bpm = self.song_doc.song().bpm;
+                let old_bpm = self.cur.song_doc.song().bpm;
                 self.edit_song(|song| song.bpm = bpm);
                 if !self.rescale_raw_clips_for_bpm_change(old_bpm, bpm) {
-                    self.send_audio(AudioCommand::SetSongBpm { bpm });
+                    self.send_audio(AudioCommand::SetSongBpm { project: self.pk(), bpm });
                 }
                 // plugin host 側の BPM 消費者 (VOICEVOX metadata / ARA / lipsync)
                 // は edit_song の epoch bump を runner の frame flush が拾って追従する
@@ -313,9 +314,9 @@ impl AppData {
         if self.reject_write_if_pianoroll_locked(target) {
             return;
         }
-        let cursor = self.recording.step_cursor_beat;
-        let step = self.recording.step_size_beats;
-        let Some(clip) = self.song_doc.song().clip_by_key(target) else {
+        let cursor = self.cur.recording.step_cursor_beat;
+        let step = self.cur.recording.step_size_beats;
+        let Some(clip) = self.cur.song_doc.song().clip_by_key(target) else {
             return;
         };
         // r.md #44: step カーソルは content-local。 clip が見せている窓
@@ -352,7 +353,7 @@ impl AppData {
         let next_cursor = cursor + step;
         // selected_notes は packed note id。入力先 (target) clip の slot で pack。
         self.set_note_selection(&(self.pack_clip_selection(target, &selected)));
-        self.recording.step_cursor_beat = next_cursor;
+        self.cur.recording.step_cursor_beat = next_cursor;
     }
 
     /// Phase 7 B4 Step D: 録音中の note_on 処理。 armed track 全てに対して
@@ -371,7 +372,7 @@ impl AppData {
     /// 全部、 仮想鍵盤 (r.md #113) は「カーソルトラックが録音待機なら 1 本」 で呼ぶ。
     pub(crate) fn record_midi_note_on_tracks(&mut self, tracks: &[u32], pitch: u8, velocity: u8) {
         let playhead =
-            self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
+            self.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
         if playhead < 0.0 {
             return;
         }
@@ -379,8 +380,8 @@ impl AppData {
         // note_off も同じ snap を適用するので、 deterministic snap で
         // (track_id, pitch) lookup が整合する。 step input は別 path
         // (`step_input_note_on`) を経由するのでここの snap は録音時のみ。
-        let pitch = if self.recording.snap_live_input {
-            self.song_doc.song()
+        let pitch = if self.cur.recording.snap_live_input {
+            self.cur.song_doc.song()
                 .scale_at(playhead)
                 .map(|sc| sc.snap(pitch))
                 .unwrap_or(pitch)
@@ -395,7 +396,7 @@ impl AppData {
             // r.md #44: note は content-local なので、原点 (= clip 開始 - 窓 offset)
             // を引いて local 化する。
             let Some(clip_origin) =
-                self.song_doc.song().clip_by_key(key).map(common::model::Clip::content_origin_beat)
+                self.cur.song_doc.song().clip_by_key(key).map(common::model::Clip::content_origin_beat)
             else {
                 continue;
             };
@@ -420,7 +421,7 @@ impl AppData {
             // (不変条件 1 — 位置照合で参照を貼り直さない)。 書き込みが拒否された
             // (書き出し中) 場合は id が無いので、note_off も何もしない。
             if let Some(Some(note_id)) = note_id {
-                self.recording
+                self.cur.recording
                     .midi_recording_active_notes
                     .insert((track_id, pitch), (playhead, note_id));
             }
@@ -431,12 +432,12 @@ impl AppData {
     /// `(start_beat, note_id)` を取り出し、 `length = playhead - start` で確定する。
     pub(crate) fn record_midi_note_off(&mut self, pitch: u8) {
         let playhead =
-            self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
+            self.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
         // Phase 7 B5: note_on 側で snap した pitch で active_notes に登録して
         // いるので、 note_off の lookup key も同じ snap を適用。 snap は
         // deterministic なので転調を跨がない note なら lookup は必ず hit する。
-        let pitch = if self.recording.snap_live_input {
-            self.song_doc.song()
+        let pitch = if self.cur.recording.snap_live_input {
+            self.cur.song_doc.song()
                 .scale_at(playhead)
                 .map(|sc| sc.snap(pitch))
                 .unwrap_or(pitch)
@@ -446,14 +447,14 @@ impl AppData {
         // 押している台帳を引く (arm を外した / カーソルを移した後の note_off でも、
         // 書き込んだトラックのノートを確定できる)。
         let held: Vec<(u32, u8)> = self
-            .recording
+            .cur.recording
             .midi_recording_active_notes
             .keys()
             .filter(|(_, p)| *p == pitch)
             .copied()
             .collect();
         for key in held {
-            let Some((start, note_id)) = self.recording.midi_recording_active_notes.remove(&key)
+            let Some((start, note_id)) = self.cur.recording.midi_recording_active_notes.remove(&key)
             else {
                 continue;
             };
@@ -548,7 +549,7 @@ impl AppData {
         track_id: u32,
         playhead: f64,
     ) -> Option<ClipKey> {
-        let track = self.song_doc.song().track_by_id(track_id)?;
+        let track = self.cur.song_doc.song().track_by_id(track_id)?;
         let clip = track.clips.iter().find(|c| {
             playhead >= c.start_beat
                 && playhead < c.start_beat + c.length_beats
@@ -574,7 +575,7 @@ impl AppData {
     /// (Cubase:「To stop recording and continue playback, click Record」)。
     /// 止めたいときは停止 (スペース / ■)。
     pub(crate) fn toggle_midi_recording(&mut self) {
-        if self.recording.requested {
+        if self.cur.recording.requested {
             self.close_recording_session();
         } else {
             self.start_recording();
@@ -590,7 +591,7 @@ impl AppData {
     ///   (Cubase の count-in は「停止状態から録音を始めたとき」の機能) ので、
     ///   曲が途切れず、ホーム (`home_beat`) も動かない。
     pub(crate) fn start_recording(&mut self) {
-        if self.recording.requested {
+        if self.cur.recording.requested {
             return;
         }
         // 録音先が無いまま走り出すと、何も記録されないのに再生だけ始まって
@@ -601,22 +602,22 @@ impl AppData {
                 "録音待機 (R) のトラックがありません".into();
             return;
         }
-        self.recording.midi_recording_active_notes.clear();
+        self.cur.recording.midi_recording_active_notes.clear();
         // ensure-synced: count-in の preroll (bpm→sample) と Play は engine の
         // 現 song を前提にする。 録音開始直前の編集が未 flush なら先に届ける
         // (epoch 未変化なら no-op)。
         self.flush_song_sync();
 
-        if self.transport.is_playing {
+        if self.cur.transport.is_playing {
             // パンチイン: 走っているものに乗るだけ。
-            self.send_audio(AudioCommand::StartRecording { preroll_samples: 0 });
+            self.send_audio(AudioCommand::StartRecording { project: self.pk(), preroll_samples: 0 });
         } else {
             let preroll_samples = self.count_in_samples();
-            if preroll_samples > 0 && !self.transport.metronome_enabled {
+            if preroll_samples > 0 && !self.cur.transport.metronome_enabled {
                 // count-in 強制 ON。 既存 SetMetronomeEnabled handler を
                 // 呼び出して audio engine への IPC 送信もまとめて。
                 // 元の状態は録音セッションのクローズで戻す (強制 ON したときだけ)。
-                self.recording.metronome_enabled_pre_recording = Some(false);
+                self.cur.recording.metronome_enabled_pre_recording = Some(false);
                 self.handle_event(AppEvent::SetMetronomeEnabled(true));
             }
             // `StartRecording` + `Play` の送信は start_transport が順序込みで行う。
@@ -624,30 +625,30 @@ impl AppData {
                 == PlayOutcome::Refused
             {
                 // 書き出し中。 status_message は start_transport が出している。
-                self.recording.metronome_enabled_pre_recording = None;
+                self.cur.recording.metronome_enabled_pre_recording = None;
                 return;
             }
         }
         // r.md #50 の積算ラウドネスのリセットはここに要らない — 録音の開始も
         // `start_transport` を通るので、あちらの 1 箇所で畳まれる。パンチイン
         // (既に走っている transport に乗る) では畳まないのが正しい。
-        self.recording.requested = true;
+        self.cur.recording.requested = true;
         // 録音 take 全体を 1 undo step に bracket する (r.md #51)。 これが無いと
         // note-on / note-off の song 編集が別々の step になり、8 音録ると
         // Ctrl+Z を 16 回押すことになる。
-        self.song_doc.begin_gesture();
+        self.cur.song_doc.begin_gesture();
     }
 
     /// count-in の長さ (samples)。 0 = count-in 無し。
     fn count_in_samples(&self) -> u64 {
-        let bars = self.recording.count_in_bars;
+        let bars = self.cur.recording.count_in_bars;
         if bars == 0 {
             return 0;
         }
-        let beats_per_bar = f64::from(self.song_doc.song().time_sig.0.max(1));
+        let beats_per_bar = f64::from(self.cur.song_doc.song().time_sig.0.max(1));
         let preroll_beats = f64::from(bars) * beats_per_bar;
         let sr = f64::from(self.ipc.sample_rate);
-        let bpm = f64::from(self.song_doc.song().bpm.max(1.0));
+        let bpm = f64::from(self.cur.song_doc.song().bpm.max(1.0));
         (preroll_beats * 60.0 / bpm * sr).round().max(0.0) as u64
     }
 
@@ -662,8 +663,8 @@ impl AppData {
     /// なるため。count-in 中に BPM を変えると 1 小節ぶん数字がずれ得るが、
     /// `clamp(1, bars)` で範囲は保たれ、次の count-in で解消する。
     pub(crate) fn count_in_remaining_bars(&self) -> Option<u64> {
-        let bars = u64::from(self.recording.count_in_bars);
-        let remaining = self.transport.preroll_remaining;
+        let bars = u64::from(self.cur.recording.count_in_bars);
+        let remaining = self.cur.transport.preroll_remaining;
         if bars == 0 || remaining == 0 {
             return None;
         }
@@ -680,16 +681,16 @@ impl AppData {
     /// トランスポートは止めない — パンチアウトは再生を続けるのが参照 DAW 共通の
     /// 挙動で、停止は `stop()` の仕事。
     pub(crate) fn close_recording_session(&mut self) {
-        if !self.recording.requested {
+        if !self.cur.recording.requested {
             return;
         }
-        self.recording.requested = false;
-        self.recording.live = false;
+        self.cur.recording.requested = false;
+        self.cur.recording.live = false;
         // 押しっぱなしのノートは、ここで長さを確定する。放置すると仮の長さ
         // (0.05 拍) のまま残り、録り終わりの音だけ極端に短くなる。
-        let playhead = self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
+        let playhead = self.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
         let held: Vec<(u32, f64, u32)> = self
-            .recording
+            .cur.recording
             .midi_recording_active_notes
             .drain()
             .map(|((track_id, _pitch), (start, note_id))| (track_id, start, note_id))
@@ -698,14 +699,14 @@ impl AppData {
             self.finalize_recorded_note(track_id, start, note_id, playhead);
         }
         // count-in で強制 ON にしていたら元へ戻す (触っていなければ None)。
-        if let Some(prev) = self.recording.metronome_enabled_pre_recording.take()
-            && prev != self.transport.metronome_enabled
+        if let Some(prev) = self.cur.recording.metronome_enabled_pre_recording.take()
+            && prev != self.cur.transport.metronome_enabled
         {
             self.handle_event(AppEvent::SetMetronomeEnabled(prev));
         }
         // engine 側の count-in と曲末 auto-stop の抑止を解除する。
-        self.send_audio(AudioCommand::StopRecording);
+        self.send_audio(AudioCommand::StopRecording { project: self.pk() });
         // 録音 take の undo bracket を閉じる。
-        self.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture();
     }
 }

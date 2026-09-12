@@ -39,12 +39,12 @@ fn build_app_with_follower() -> (AppData, u32) {
             enabled: true,
         });
     });
-    let source_id = app.song_doc.song().mod_sources[0].id;
+    let source_id = app.cur.song_doc.song().mod_sources[0].id;
     (app, source_id)
 }
 
 fn follower(app: &AppData, source_id: u32) -> FollowerConfig {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .mod_sources
         .iter()
@@ -54,7 +54,7 @@ fn follower(app: &AppData, source_id: u32) -> FollowerConfig {
 }
 
 fn touched(app: &AppData) -> Option<AutomationTarget> {
-    app.ui_ephemeral.last_touched_param.as_ref().map(|t| t.target.clone())
+    app.cur.peph.last_touched_param.as_ref().map(|t| t.target.clone())
 }
 
 /// 新しい 4 つの口が実際にモデルへ効き、 帯域が逆転しない。

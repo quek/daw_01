@@ -23,6 +23,13 @@ fn snap_toggle_style(p: &Palette) -> ToggleButtonStyle {
     ToggleButtonStyle { radius: 3.0, font_size: 12.0, ..ToggleButtonStyle::from_palette(p) }
 }
 
+/// retained state (`PianoRollState`) の id。`docs/plan_project_tabs.md` §5.6: タブごとに
+/// 独立 (root がタブを閉じたときに `Ui::remove_widget_state` で捨てる)。
+#[must_use]
+pub fn piano_roll_state_id(project: common::protocol::ProjectKey) -> WidgetId {
+    WidgetId::ROOT.child((b"piano_roll_widget", &"piano_roll", project.0))
+}
+
 pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoRollResponse {
         let p = &*app.theme.core;
         // ---- view 構築 (レイアウト SSoT) + toolbar (常時描画) ----
@@ -32,9 +39,9 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // 表示する MIDI クリップが無い (未選択 or 非 MIDI のみ) → placeholder。
             // widget が走らないので、歌詞編集 mirror が残っていたら false に戻す
             // (stale-true で Esc が widget へ委ねられ続けて消える事故を防ぐ)。
-            if app.ui_ephemeral.piano_roll_lyric_editing {
+            if app.cur.peph.piano_roll_lyric_editing {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.ui_ephemeral.piano_roll_lyric_editing = false;
+                    app.cur.peph.piano_roll_lyric_editing = false;
                 }));
             }
             ui.panel("pr_bg_empty", built.body_full, p.panel, 0.0);
@@ -78,13 +85,13 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // 現フレームの grid 領域サイズを記録 (X キー / Fit ボタン / SelectClip 経由の fit 用、1 frame 遅延 OK)。
         // pending_pianoroll_fit が立っていたら消費して fit を再実行。
         let grid_size = (grid.w, grid.h);
-        if app.ui_ephemeral.last_pianoroll_grid_size != grid_size
-            || app.ui_ephemeral.pending_pianoroll_fit
+        if app.cur.peph.last_pianoroll_grid_size != grid_size
+            || app.cur.peph.pending_pianoroll_fit
         {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.last_pianoroll_grid_size = grid_size;
-                if app.ui_ephemeral.pending_pianoroll_fit {
-                    app.ui_ephemeral.pending_pianoroll_fit = false;
+                app.cur.peph.last_pianoroll_grid_size = grid_size;
+                if app.cur.peph.pending_pianoroll_fit {
+                    app.cur.peph.pending_pianoroll_fit = false;
                     app.handle_event(AppEvent::FitPianoRollToClip);
                 }
             }));
@@ -93,15 +100,15 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         if multi {
             let keys: Vec<common::model::ClipKey> =
                 shown.iter().filter_map(|r| app.live_clip_key(*r)).collect();
-            if app.ui_prefs.multi_clip_view_key != keys {
+            if app.cur.view.multi_clip_view_key != keys {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.ui_prefs.multi_clip_view_key = keys.clone();
+                    app.cur.view.multi_clip_view_key = keys.clone();
                     app.handle_event(AppEvent::FitPianoRollToClip);
                 }));
             }
         }
 
-        let wid = WidgetId::ROOT.child((b"piano_roll_widget", &id));
+        let wid = piano_roll_state_id(app.pk());
         let pointer = ui.pointer();
 
         // ===== M14 Phase 59 / daw_01 #017: 歌詞 inline 編集 mode =====
@@ -1063,7 +1070,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let (lo, hi) = (geom.y_to_pitch(y1), geom.y_to_pitch(y0));
             ((a.min(b), a.max(b)), (lo..=hi).collect::<Vec<u8>>())
         });
-        let time_range: Option<((f64, f64), Vec<u8>)> = app.selection.time.as_ref().and_then(|sel| {
+        let time_range: Option<((f64, f64), Vec<u8>)> = app.cur.selection.time.as_ref().and_then(|sel| {
             let mut pitches: Vec<u8> = sel
                 .lanes
                 .iter()
@@ -1691,9 +1698,9 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // 動かしたノートを画面内に追う処理 (handler 側) が「今どれだけ見えているか」 を知る
         // ための唯一の口。 変化したフレームだけ Edit を発行 (毎フレーム push を避ける)。
         let viewport_now = Some((view.len_beats, view.pitch_visible));
-        if viewport_now != app.ui_ephemeral.pianoroll_viewport {
+        if viewport_now != app.cur.peph.pianoroll_viewport {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.pianoroll_viewport = viewport_now;
+                app.cur.peph.pianoroll_viewport = viewport_now;
             }));
         }
 
@@ -1701,15 +1708,15 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // take_shortcut("escape") を消費してしまうため、編集中は app 側フラグを見て Esc を widget に委ねる。
         // 変化したフレームだけ Edit を発行 (毎フレーム push を避ける)。
         let lyric_editing_now = response.lyric_editing.is_some();
-        if lyric_editing_now != app.ui_ephemeral.piano_roll_lyric_editing {
+        if lyric_editing_now != app.cur.peph.piano_roll_lyric_editing {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.piano_roll_lyric_editing = lyric_editing_now;
+                app.cur.peph.piano_roll_lyric_editing = lyric_editing_now;
             }));
         }
 
         // gui_01 #055: 鍵盤レーン click のピッチプレビュー。前フレーム値 (recording.preview_note の
         // pitch) と差分し、変化した frame だけ PreviewPitchChanged を発火。鳴らす track は描画中 clip の track。
-        if response.keyboard_active_pitch != app.recording.preview_note.map(|(_, p)| p) {
+        if response.keyboard_active_pitch != app.cur.recording.preview_note.map(|(_, p)| p) {
             let track_id = target.track_id;
             let pitch = response.keyboard_active_pitch;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1738,30 +1745,30 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let beat_to_px = f64::from(grid.w) / view.len_beats.max(1e-6);
             Some(view.start_beat + f64::from(px - grid.x) / beat_to_px)
         });
-        if app.ui_ephemeral.pianoroll_hover_beat != hover_beat
-            || app.ui_ephemeral.pianoroll_hover_beat_song_raw != hover_beat_song_raw
+        if app.cur.peph.pianoroll_hover_beat != hover_beat
+            || app.cur.peph.pianoroll_hover_beat_song_raw != hover_beat_song_raw
         {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.pianoroll_hover_beat = hover_beat;
-                app.ui_ephemeral.pianoroll_hover_beat_song_raw = hover_beat_song_raw;
+                app.cur.peph.pianoroll_hover_beat = hover_beat;
+                app.cur.peph.pianoroll_hover_beat_song_raw = hover_beat_song_raw;
             }));
         }
         // q キー用に、ポインタ直下の note id (packed、selected_notes と同空間) を毎フレーム mirror。
         let hover_note: Option<u32> = ui.pointer().pos.and_then(|(px, py)| {
             note_hit(notes, view, grid, px, py, style.resize_handle_px).map(|(id, _)| id)
         });
-        if app.ui_ephemeral.pianoroll_hover_note != hover_note {
+        if app.cur.peph.pianoroll_hover_note != hover_note {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.pianoroll_hover_note = hover_note;
+                app.cur.peph.pianoroll_hover_note = hover_note;
             }));
         }
         // r.md #119: Ctrl+A の 1 段目 (ポインタ行の全ノート) 用に、 grid 上のポインタの鍵盤行を mirror。
         let hover_pitch: Option<u8> = ui.pointer().pos.and_then(|(px, py)| {
             grid.contains(px, py).then(|| RowGeometry::compute(view, grid).y_to_pitch(py))
         });
-        if app.ui_ephemeral.pianoroll_hover_pitch != hover_pitch {
+        if app.cur.peph.pianoroll_hover_pitch != hover_pitch {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.pianoroll_hover_pitch = hover_pitch;
+                app.cur.peph.pianoroll_hover_pitch = hover_pitch;
             }));
         }
 
@@ -1914,7 +1921,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "pr_snap_toggle",
         "Snap",
         Rect { x, y, w: toggle_w, h },
-        app.ui_prefs.pianoroll_snap_enabled,
+        app.cur.view.pianoroll_snap_enabled,
         &toggle_style,
         |new| {
             Edit::mutate(move |app: &mut AppData| {
@@ -1928,7 +1935,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "pr_snap_unit",
         Rect { x, y, w: dropdown_w, h },
         SNAP_LABELS,
-        app.ui_prefs.pianoroll_snap_choice as usize,
+        app.cur.view.pianoroll_snap_choice as usize,
     ) {
         let new = idx as u8;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1952,7 +1959,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "pr_fold_to_scale",
         "Fold",
         Rect { x, y, w: fold_w, h },
-        app.ui_prefs.piano_roll_fold,
+        app.cur.view.piano_roll_fold,
         &toggle_style,
         |_| {
             Edit::mutate(|app: &mut AppData| {
@@ -1970,7 +1977,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "pr_snap_on_draw",
         "Snap Draw",
         Rect { x, y, w: snap_draw_w, h },
-        app.ui_prefs.snap_on_draw,
+        app.cur.view.snap_on_draw,
         &toggle_style,
         |_| {
             Edit::mutate(|app: &mut AppData| {
@@ -2026,7 +2033,7 @@ fn draw_legend(
         let mut y = list_rect.y - scroll_off.1;
         for (row_i, &ti) in track_indices.iter().enumerate() {
             // `ti` は track の安定 id (`ClipKey::track_id`)。 Vec index ではない。
-            let Some(track) = app.song_doc.song().track_by_id(ti) else {
+            let Some(track) = app.cur.song_doc.song().track_by_id(ti) else {
                 continue;
             };
             let track_id = track.id;

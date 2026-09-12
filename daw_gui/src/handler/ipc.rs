@@ -10,7 +10,7 @@
 use crate::app_types::*;
 use crate::event::AppEvent;
 use crate::state::*;
-use common::protocol::{AudioCommand, AudioEvent, ChildKind, PluginCommand, PluginEvent};
+use common::protocol::{AudioCommand, AudioEvent, ChildKind, DeviceAddr, PluginCommand, PluginEvent};
 
 impl AppData {
     /// daw_audio の `AudioEvent` を既存ハンドラへ接続する (旧 `audio_event_to_app`
@@ -21,15 +21,15 @@ impl AppData {
             AudioEvent::ChildDisconnected => {
                 self.handle_child_disconnected(ChildKind::Audio);
             }
-            AudioEvent::ExportWavComplete { error, cancelled } => {
+            AudioEvent::ExportWavComplete { error, cancelled, .. } => {
                 // この完了が今 track している音声 render のものでなければ無視する
                 // (BounceClipFxComplete の stale ガードと対称)。crash / watchdog で
                 // 既に abort 済みの後着完了 (= 中止 status を「完了」で上書きしてしまう)
                 // や、daw_audio の二重起動ガードが弾いた reject 完了が、走行中 export の
                 // overlay / plugin render mode / status を壊すのを防ぐ。正規完了は
                 // 標準 WAV / video 前段とも export_stage=AudioRender なので素通りする。
-                if !matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. }))
-                    && self.transport.pending_video_export.is_none()
+                if !matches!(self.cur.transport.export_stage, Some(ExportStage::AudioRender { .. }))
+                    && self.cur.transport.pending_video_export.is_none()
                 {
                     tracing::warn!(
                         ?error,
@@ -47,16 +47,16 @@ impl AppData {
                 // 必ずクリアする（標準 WAV はこれで overlay が閉じ、video 後段は
                 // この後 `action_export_mp4` が VideoRender を再設定する）。
                 // watchdog 用の進捗タイムスタンプも落とす。
-                self.transport.export_progress_at = None;
-                self.transport.export_stage = None;
-                if let Some(mp4_path) = self.transport.pending_video_export.take() {
+                self.cur.transport.export_progress_at = None;
+                self.cur.transport.export_stage = None;
+                if let Some(mp4_path) = self.cur.transport.pending_video_export.take() {
                     // 音声と同じ拍範囲で video を render する (= 全曲
                     // なら None)。 取り出して消費。
-                    let range_beats = self.transport.pending_video_export_range.take();
+                    let range_beats = self.cur.transport.pending_video_export_range.take();
                     // picker で選んだ出力解像度 / fps の per-export
                     // override。 None (= 旧経路) なら action_export_mp4 が
                     // プロジェクト値にフォールバックする。
-                    let dims = self.transport.pending_video_export_dims.take();
+                    let dims = self.cur.transport.pending_video_export_dims.take();
                     if cancelled {
                         // 前段（音声）でキャンセル → video export 全体を中止し、
                         // 映像 render には進まない。
@@ -78,7 +78,7 @@ impl AppData {
                                 self.remove_export_temp_wav();
                                 None
                             }
-                            None => self.transport.export_temp_wav.clone(),
+                            None => self.cur.transport.export_temp_wav.clone(),
                         };
                         #[cfg(windows)]
                         self.action_export_mp4(mp4_path, wav, range_beats, dims);
@@ -93,23 +93,23 @@ impl AppData {
                     self.ui_ephemeral.status_message = "WAV 書き出し完了".to_string();
                 }
             }
-            AudioEvent::ExportWavProgress { done, total } => {
+            AudioEvent::ExportWavProgress { done, total, .. } => {
                 // daw_audio の音声 freewheel 進捗。標準 WAV export / video 前段の
                 // どちらでも来る。stage が AudioRender でない (= export 非実行 or
                 // 既に映像フェーズ) なら stale とみなして無視する (overlay の
                 // 亡霊化を防ぐ)。
-                if matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. })) {
-                    self.transport.export_stage = Some(ExportStage::AudioRender { done, total });
+                if matches!(self.cur.transport.export_stage, Some(ExportStage::AudioRender { .. })) {
+                    self.cur.transport.export_stage = Some(ExportStage::AudioRender { done, total });
                     // watchdog: 進捗が来ている間は生存とみなしてタイマーをリセット。
-                    self.transport.export_progress_at = Some(std::time::Instant::now());
+                    self.cur.transport.export_progress_at = Some(std::time::Instant::now());
                 }
             }
             // r.md #54: 範囲ラウドネス解析。途中経過は数値も曲線も入っているので、
             // レポート窓は走査に合わせて伸びるグラフをそのまま描ける。
-            AudioEvent::LoudnessAnalysisProgress(report) => {
+            AudioEvent::LoudnessAnalysisProgress { report, .. } => {
                 self.on_loudness_progress(report);
             }
-            AudioEvent::LoudnessAnalysisComplete { report, error, cancelled } => {
+            AudioEvent::LoudnessAnalysisComplete { report, error, cancelled, .. } => {
                 self.on_loudness_complete(report, error, cancelled);
             }
             AudioEvent::BounceClipFxComplete {
@@ -118,6 +118,7 @@ impl AppData {
                 source_clip,
                 error,
                 frames,
+                ..
             } => {
                 // Glue の焼き込みも同じ offline render / 完了通知を使うので、
                 // 先に Glue 側へ照合させる (`docs/plan_glue_bake.md` §4)。
@@ -126,11 +127,11 @@ impl AppData {
                 }
                 self.handle_bounce_clip_fx_complete(path, source_track, source_clip, error, frames);
             }
-            AudioEvent::PluginUnresponsive { device_id } => {
+            AudioEvent::PluginUnresponsive { device: DeviceAddr { device_id, .. } } => {
                 // (v29 §4) dispatch timeout → 該当 device は quarantine 済み。
                 // どの plugin かを可視化する (解除は respawn / 再ロード)。
                 let name = self
-                    .song_doc
+                    .cur.song_doc
                     .song()
                     .plugin_by_id(device_id)
                     .map(|d| d.plugin_id.clone())
@@ -177,18 +178,33 @@ impl AppData {
                 self.sync_app_active_with_audio();
                 self.handle_child_disconnected(ChildKind::PluginHost);
             }
-            PluginEvent::PluginsReinitDone => {
+            // `docs/plan_project_tabs.md` §5.1: Panic (`ReinitAllPlugins { project: None }`) の
+            // 完了は **デバイス全体** の事実なので `project` が無く、`target_project` の配送に
+            // 乗らない = 「いま見えているタブ」に着弾する。Panic を撃ったタブの declick 解除と
+            // VOICEVOX 再 flush が別のタブに適用されると、撃ったタブは master が下がったまま
+            // 戻らない。全タブへ配ってから本体を回す (project 付きの完了は配送済みなのでそのまま)。
+            PluginEvent::PluginsReinitDone { project: None } => {
+                for key in self.tabs.order.clone() {
+                    self.with_project(key, |app| {
+                        app.dispatch_plugin_event(PluginEvent::PluginsReinitDone {
+                            project: Some(app.pk()),
+                        });
+                    });
+                }
+            }
+            PluginEvent::PluginsReinitDone { .. } => {
                 // r.md #75: 下の VOICEVOX 再 flush の可否は **`pending_export` を take する
                 // 前**に見る (take した後だと必ず「render 中でない」に見えてしまう)。
-                let render_pending = self.transport.pending_export.is_some()
-                    || self.ipc.pending_clip_fx_bounce.is_some()
-                    || self.ipc.pending_vocal_synth_bounce.is_some()
-                    || !self.ipc.pending_vocal_synth_export.is_empty();
+                let render_pending = self.cur.transport.pending_export.is_some()
+                    || self.cur.pipc.pending_clip_fx_bounce.is_some()
+                    || self.cur.pipc.pending_vocal_synth_bounce.is_some()
+                    || !self.cur.pipc.pending_vocal_synth_export.is_empty();
                 // plugins are now reinitialised to a clean state —
                 // fire the stashed offline export. (If nothing is pending, a
                 // stray reply; ignore.)
-                if let Some((path, range, write_mod_sidecar)) = self.transport.pending_export.take() {
+                if let Some((path, range, write_mod_sidecar)) = self.cur.transport.pending_export.take() {
                     self.send_audio(AudioCommand::ExportWav {
+                        project: self.pk(),
                         path,
                         range,
                         write_mod_sidecar,
@@ -203,8 +219,8 @@ impl AppData {
                 // clean (silent) mix. Guard on `panic_reinit_due.is_none()` so a
                 // rapid second panic (whose reinit is still queued for `on_tick`)
                 // doesn't release early on the previous reinit's reply.
-                if self.transport.panic_release_pending && self.transport.panic_reinit_due.is_none() {
-                    self.transport.panic_release_pending = false;
+                if self.cur.transport.panic_release_pending && self.cur.transport.panic_reinit_due.is_none() {
+                    self.cur.transport.panic_release_pending = false;
                     self.send_audio(AudioCommand::PanicRelease);
                 }
                 // r.md #75: reinit は builtin VOICEVOX を deactivate する = 走っていた
@@ -219,21 +235,21 @@ impl AppData {
                 // reinit の前に合成完了を待ち終えており、ここで新しい job を走らせると
                 // 逐次 publish が render 中の buffer を差し替えてしまう。
                 if !render_pending {
-                    self.voicevox.voicevox_metadata_sent.clear();
+                    self.cur.pvv.voicevox_metadata_sent.clear();
                     self.sync_vocal_metadata();
                 }
             }
-            PluginEvent::VocalSynthReady { device_id } => {
+            PluginEvent::VocalSynthReady { device: DeviceAddr { device_id, .. } } => {
                 // r.md #75: 曲全体の WAV 書き出しの合成完了ゲート。全 VOICEVOX device の
                 // ready が揃ってから reinit → render へ進む (揃う前に render すると
                 // 部分ミックスが焼かれる)。
-                if self.ipc.pending_vocal_synth_export.remove(&device_id)
-                    && self.ipc.pending_vocal_synth_export.is_empty()
+                if self.cur.pipc.pending_vocal_synth_export.remove(&device_id)
+                    && self.cur.pipc.pending_vocal_synth_export.is_empty()
                 {
                     // 合成に掛かった時間を書き出し watchdog の 60 秒に食わせないため、
                     // ここで進捗時刻を打ち直す。
-                    self.transport.export_progress_at = Some(std::time::Instant::now());
-                    self.send_plugin(PluginCommand::ReinitAllPlugins);
+                    self.cur.transport.export_progress_at = Some(std::time::Instant::now());
+                    self.send_plugin(PluginCommand::ReinitAllPlugins { project: Some(self.pk()) });
                 }
                 // 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
                 // device_id は echo back 用。 pending があれば offline render を開始する。
@@ -241,7 +257,7 @@ impl AppData {
                 // 「まだ在るか」 の確認だけで足りる。 **index へ落とし直さない** —
                 // 落とすと `ClipKey` が index の住所を持つことになり、 合成中に
                 // クリップが 1 つ増減しただけで bounce が別のクリップに当たる。
-                if let Some(p) = self.ipc.pending_vocal_synth_bounce.take() {
+                if let Some(p) = self.cur.pipc.pending_vocal_synth_bounce.take() {
                     let key = ClipKey { track_id: p.track_id, clip_id: p.clip_id };
                     match self.live_clip_key(key) {
                         Some(target) => self.start_clip_bounce(target, p.mode),
@@ -253,10 +269,11 @@ impl AppData {
                 }
             }
             PluginEvent::SlotPluginLoaded {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 id,
                 name,
                 shmem_id,
+                token,
                 state_load_error,
                 aux_output_count,
                 aux_input_count,
@@ -267,6 +284,7 @@ impl AppData {
                     id,
                     name,
                     shmem_id,
+                    token,
                     state_load_error,
                     aux_output_count,
                     aux_input_count,
@@ -274,7 +292,7 @@ impl AppData {
                 );
             }
             PluginEvent::SlotPluginLoadFailed {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 plugin_id,
                 reason,
                 generation,
@@ -282,41 +300,41 @@ impl AppData {
                 self.on_plugin_load_failed_from_child(device_id, plugin_id, reason, generation);
             }
             PluginEvent::SlotPluginState { .. } => {}
-            PluginEvent::AllPluginStates { entries } => {
+            PluginEvent::AllPluginStates { entries, .. } => {
                 self.on_all_states_from_child(entries);
             }
             PluginEvent::SlotGuiGeometry {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 geometry,
             } => {
                 self.on_gui_geometry(device_id, geometry);
             }
-            PluginEvent::SlotGuiClosed { device_id } => {
+            PluginEvent::SlotGuiClosed { device: DeviceAddr { device_id, .. } } => {
                 self.on_gui_closed(device_id);
             }
-            PluginEvent::SlotPluginShmemReleased { device_id } => {
+            PluginEvent::SlotPluginShmemReleased { device: DeviceAddr { device_id, .. } } => {
                 self.on_plugin_shmem_released_from_child(device_id);
             }
-            PluginEvent::SlotPluginUnloaded { device_id } => {
+            PluginEvent::SlotPluginUnloaded { device: DeviceAddr { device_id, .. } } => {
                 self.on_plugin_unloaded_from_child(device_id);
             }
-            PluginEvent::PluginLatencyChanged { device_id, samples } => {
+            PluginEvent::PluginLatencyChanged { device: DeviceAddr { device_id, .. }, samples } => {
                 self.on_plugin_latency_changed(device_id, samples);
             }
             PluginEvent::PluginParamList {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 params,
                 has_embedded_gui,
             } => {
-                self.ipc.plugin_params.insert(device_id, params);
-                self.ipc.slot_has_gui.insert(device_id, has_embedded_gui);
+                self.cur.pipc.plugin_params.insert(device_id, params);
+                self.cur.pipc.slot_has_gui.insert(device_id, has_embedded_gui);
             }
             PluginEvent::PluginParamTouched {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 param_id,
                 display_name,
             } => {
-                let Some((track, _index)) = find_device_by_id(self.song_doc.song(), device_id)
+                let Some((track, _index)) = find_device_by_id(self.cur.song_doc.song(), device_id)
                 else {
                     return; // 削除済み device の stale event
                 };
@@ -345,18 +363,18 @@ impl AppData {
                 self.connect_armed_mod_source_to(track, target);
             }
             PluginEvent::PluginParamValueChanged {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 param_id,
                 value,
             } => {
                 // Phase 4 Step C-3: plugin GUI knob の最新値を
                 // `(device_id, param_id)` cache に保存。
-                self.ipc
+                self.cur.pipc
                     .plugin_param_values
                     .insert(DeviceParamKey { device_id, param_id }, value);
             }
-            PluginEvent::PluginParamGestureEnd { device_id, param_id } => {
-                let Some((track, _index)) = find_device_by_id(self.song_doc.song(), device_id)
+            PluginEvent::PluginParamGestureEnd { device: DeviceAddr { device_id, .. }, param_id } => {
+                let Some((track, _index)) = find_device_by_id(self.cur.song_doc.song(), device_id)
                 else {
                     return;
                 };
@@ -373,7 +391,7 @@ impl AppData {
                 });
             }
             PluginEvent::VoicevoxSynthStatus {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 progress,
             } => {
                 self.apply_voicevox_synth_status(device_id, progress);

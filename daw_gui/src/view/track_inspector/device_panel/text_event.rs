@@ -27,7 +27,7 @@ pub(super) fn draw_text_event(
     // テキスト編集は失われない。
     let text_track_has_subtitle = app
         .selected_clip_ref()
-        .and_then(|r| app.song_doc.song().track_by_id(r.track_id))
+        .and_then(|r| app.cur.song_doc.song().track_by_id(r.track_id))
         .is_some_and(common::model::Track::has_subtitle_device);
     // 字幕 device の「Par」を押したときだけ Text Event 欄を出す
     // (= 専用欄を常時表示せず Par パネルに集約)。
@@ -35,7 +35,7 @@ pub(super) fn draw_text_event(
         && app.subtitle_param_panel_open()
         && let Some(summary) = app.inspector_text_event_summary()
     {
-        if app.ui_ephemeral.clip_edit_buffer_target != Some(summary.target) {
+        if app.cur.peph.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipTextEditBuffers(target));
@@ -94,7 +94,7 @@ pub(super) fn draw_text_event(
         let text_resp = ui.text_input_at(
             "inspector_text_content_input",
             Rect { x: input_x, y, w: string_input_w, h: input_h },
-            &app.ui_ephemeral.clip_text_content_edit_text,
+            &app.cur.peph.clip_text_content_edit_text,
             &ui.text_input_style(),
             |s| {
                 Edit::mutate(move |app: &mut AppData| {
@@ -121,10 +121,10 @@ pub(super) fn draw_text_event(
             11.0,
             p.text,
         );
-        let font_btn_label = if app.ui_ephemeral.clip_text_font_family_edit_text.is_empty() {
+        let font_btn_label = if app.cur.peph.clip_text_font_family_edit_text.is_empty() {
             "(default)".to_string()
         } else {
-            app.ui_ephemeral.clip_text_font_family_edit_text.clone()
+            app.cur.peph.clip_text_font_family_edit_text.clone()
         };
         if ui.button_at_clicked(
             "inspector_text_font_button",

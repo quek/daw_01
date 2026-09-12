@@ -46,7 +46,7 @@ fn build_app() -> (
         48_000,
     );
     let proj = TempDir::new().unwrap();
-    app.song_doc.file_path = Some(proj.path().join("proj.daw"));
+    app.cur.song_doc.file_path = Some(proj.path().join("proj.daw"));
     (app, proj, audio_rx, plugin_rx)
 }
 
@@ -114,7 +114,7 @@ fn 空きスペース_drop_で一番下に必要な本数のトラックがで�
         "two_tracks.mid",
         vec![one_note_track(0.0, 1.0, 60), one_note_track(0.0, 1.0, 67)],
     );
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportMidi {
         paths: vec![mid],
@@ -122,7 +122,7 @@ fn 空きスペース_drop_で一番下に必要な本数のトラックがで�
         target_beat: Some(8.0),
     });
 
-    let tracks = &app.song_doc.song().tracks;
+    let tracks = &app.cur.song_doc.song().tracks;
     assert_eq!(tracks.len(), before + 2, "SMF track の数だけ新規 track が増える");
     assert!(tracks[0].clips.is_empty(), "既存の先頭 track は無変化");
     for t in &tracks[before..] {
@@ -133,7 +133,7 @@ fn 空きスペース_drop_で一番下に必要な本数のトラックがで�
             t.clips[0].start_beat
         );
         let content = app
-            .song_doc
+            .cur.song_doc
             .song()
             .clip_contents
             .get(&t.clips[0].content_id)
@@ -149,7 +149,7 @@ fn 既存トラックへの_drop_は1本目をそこに載せ残りを直下に�
     // 2 本の track を用意して 2 本目 (index 1) に落とす。
     app.handle_event(AppEvent::AddInstrumentTrack);
     let tracks_before: Vec<u32> = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -172,7 +172,7 @@ fn 既存トラックへの_drop_は1本目をそこに載せ残りを直下に�
         target_beat: Some(0.0),
     });
 
-    let tracks = &app.song_doc.song().tracks;
+    let tracks = &app.cur.song_doc.song().tracks;
     assert_eq!(tracks.len(), 4, "既存 2 本 + 新規 2 本");
     assert_eq!(tracks[1].id, tracks_before[1], "1 本目は既存 track に載る");
     assert_eq!(tracks[1].clips.len(), 1);
@@ -207,7 +207,7 @@ fn 空の曲では_smf_のテンポと拍子を取り込む() {
         vec![meta_track, one_note_track(0.0, 1.0, 60)],
     );
     assert!(
-        (app.song_doc.song().bpm - 120.0).abs() < 1e-6,
+        (app.cur.song_doc.song().bpm - 120.0).abs() < 1e-6,
         "前提: 既定 BPM は 120"
     );
 
@@ -217,7 +217,7 @@ fn 空の曲では_smf_のテンポと拍子を取り込む() {
         target_beat: Some(0.0),
     });
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert!((song.bpm - 150.0).abs() < 1e-3, "曲頭 BPM を採用: {}", song.bpm);
     assert_eq!(song.time_sig, (3, 4), "拍子も採用");
     let tempo_lane = song
@@ -279,7 +279,7 @@ fn smpte_の_midi_はテンポ採用後の実時間で配置される() {
         target_beat: Some(0.0),
     });
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert!((song.bpm - 150.0).abs() < 1e-3, "SMF のテンポを採用: {}", song.bpm);
     let clip = &song.tracks.last().unwrap().clips[0];
     let notes = song.clip_contents.get(&clip.content_id).unwrap().notes().unwrap();
@@ -321,7 +321,7 @@ fn クリップのある曲では_bpm_を変えない() {
         target: ImportTrackTarget::NewTrackBottom,
         target_beat: Some(0.0),
     });
-    let bpm_after_first = app.song_doc.song().bpm;
+    let bpm_after_first = app.cur.song_doc.song().bpm;
 
     // 2 回目: もうクリップがあるので BPM は変わらない。
     app.handle_event(AppEvent::ImportMidi {
@@ -331,13 +331,13 @@ fn クリップのある曲では_bpm_を変えない() {
     });
 
     assert!(
-        (app.song_doc.song().bpm - bpm_after_first).abs() < 1e-6,
+        (app.cur.song_doc.song().bpm - bpm_after_first).abs() < 1e-6,
         "既存クリップがある曲の BPM は据え置き: {} → {}",
         bpm_after_first,
-        app.song_doc.song().bpm
+        app.cur.song_doc.song().bpm
     );
     assert!(
-        app.song_doc
+        app.cur.song_doc
             .song()
             .song_lanes
             .iter()
@@ -365,7 +365,7 @@ fn クリップは音の始まる小節から始まる() {
         target_beat: Some(4.0),
     });
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let clip = &song.tracks.last().unwrap().clips[0];
     assert!(
         (clip.content_offset_beats - 8.0).abs() < 1e-9,
@@ -401,7 +401,7 @@ fn クリップは音の始まる小節から始まる() {
 #[test]
 fn 曲の長さが取り込みに合わせて伸びる() {
     let (mut app, src, _a, _p) = build_app();
-    let before = app.song_doc.song().length_beats;
+    let before = app.cur.song_doc.song().length_beats;
     let mid = write_midi(
         src.path(),
         "long.mid",
@@ -414,7 +414,7 @@ fn 曲の長さが取り込みに合わせて伸びる() {
         target_beat: Some(0.0),
     });
 
-    let after = app.song_doc.song().length_beats;
+    let after = app.cur.song_doc.song().length_beats;
     assert!(after > before, "曲の長さが伸びる: {before} → {after}");
     assert!((after - 104.0).abs() < 1e-9, "最終ノート終端の小節まで: {after}");
 }
@@ -428,18 +428,18 @@ fn 取り込みは1回の_undo_で戻る() {
         "undo.mid",
         vec![one_note_track(0.0, 1.0, 60), one_note_track(0.0, 1.0, 67)],
     );
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportMidi {
         paths: vec![mid],
         target: ImportTrackTarget::NewTrackBottom,
         target_beat: Some(0.0),
     });
-    assert_eq!(app.song_doc.song().tracks.len(), before + 2);
+    assert_eq!(app.cur.song_doc.song().tracks.len(), before + 2);
 
     app.handle_event(AppEvent::Undo);
     assert_eq!(
-        app.song_doc.song().tracks.len(),
+        app.cur.song_doc.song().tracks.len(),
         before,
         "1 回の Undo で取り込み前に戻る"
     );
@@ -451,7 +451,7 @@ fn 壊れたファイルは曲を変えない() {
     let (mut app, src, _a, _p) = build_app();
     let path = src.path().join("broken.mid");
     std::fs::write(&path, b"this is not a midi file").unwrap();
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportMidi {
         paths: vec![path],
@@ -459,7 +459,7 @@ fn 壊れたファイルは曲を変えない() {
         target_beat: Some(0.0),
     });
 
-    assert_eq!(app.song_doc.song().tracks.len(), before, "track は増えない");
+    assert_eq!(app.cur.song_doc.song().tracks.len(), before, "track は増えない");
     assert!(
         app.ui_ephemeral.status_message.contains("MIDI import 失敗"),
         "status: {}",

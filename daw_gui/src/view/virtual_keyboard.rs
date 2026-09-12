@@ -217,7 +217,7 @@ fn draw_controls(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     // ---- 宛先 (カーソルトラック = 選択中のトラック) ----
     let target = app
         .virtual_keyboard_target_track()
-        .and_then(|id| app.song_doc.song().track_by_id(id));
+        .and_then(|id| app.cur.song_doc.song().track_by_id(id));
     let (text, color) = match target {
         Some(t) => (format!("\u{2192} {}", t.name), p.text_dim),
         None => ("トラックを選択してください".to_string(), p.text_error),

@@ -17,9 +17,9 @@ impl AppData {
     /// 現存しないクリップの orphan entry を GC して書き出す。
     /// r.md #110: 保存する折り畳み Parallel / chain — 現存するものだけ、id 順。
     fn persisted_collapsed_parallel_nodes(&self) -> Vec<u64> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut v: Vec<u64> = self
-            .ui_prefs
+            .cur.view
             .collapsed_parallel_nodes
             .iter()
             .copied()
@@ -30,10 +30,10 @@ impl AppData {
     }
 
     pub fn snapshot_view_state(&self) -> common::model::ViewState {
-        let mut expanded: Vec<u32> = self.ui_prefs.expanded_automation_tracks.iter().copied().collect();
+        let mut expanded: Vec<u32> = self.cur.view.expanded_automation_tracks.iter().copied().collect();
         expanded.sort_unstable();
         let mut piano_roll_views: Vec<(common::model::ClipKey, common::model::PianoRollViewState)> =
-            self.ui_prefs.piano_roll_views
+            self.cur.view.piano_roll_views
                 .iter()
                 .filter(|(k, _)| self.live_clip_key(**k).is_some())
                 .map(|(k, v)| (*k, *v))
@@ -43,7 +43,7 @@ impl AppData {
             common::model::ClipKey,
             common::model::AudioEditorViewState,
         )> = self
-            .ui_prefs.audio_editor_views
+            .cur.view.audio_editor_views
             .iter()
             .filter(|(k, _)| self.live_clip_key(**k).is_some())
             .map(|(k, v)| (*k, *v))
@@ -52,21 +52,21 @@ impl AppData {
         // Fit / `Z` 縦ズームが張った lane 行高。**現存するレーンの分だけ**書き出し
         // (消えたレーンの orphan を溜めない)、キー順で並べて save 差分を安定させる。
         let mut lane_row_overrides: Vec<(common::model::AutomationLaneKey, u16)> = self
-            .ui_prefs
+            .cur.view
             .automation_lane_row_overrides
             .iter()
             .filter(|(k, _)| {
-                self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some()
+                self.cur.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some()
             })
             .map(|(k, v)| (*k, *v))
             .collect();
         lane_row_overrides.sort_unstable_by_key(|(k, _)| (k.track, k.lane));
         // 隠しレーンも同じ規則 (現存するレーンだけ、キー順)。
         let mut hidden_automation_lanes: Vec<common::model::AutomationLaneKey> = self
-            .ui_prefs
+            .cur.view
             .hidden_automation_lanes
             .iter()
-            .filter(|k| self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
+            .filter(|k| self.cur.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
             .copied()
             .collect();
         hidden_automation_lanes.sort_unstable_by_key(|k| (k.track, k.lane));
@@ -74,47 +74,47 @@ impl AppData {
         // device の分だけ**を書き出し (削除済み device の orphan を溜めない)、
         // device_id 昇順で並べて save 差分を安定させる。
         let mut plugin_editor_windows: Vec<(u64, common::model::EditorWindowGeometry)> = self
-            .ui_prefs
+            .cur.view
             .plugin_editor_windows
             .iter()
-            .filter(|(id, _)| find_device_by_id(self.song_doc.song(), **id).is_some())
+            .filter(|(id, _)| find_device_by_id(self.cur.song_doc.song(), **id).is_some())
             .map(|(id, g)| (*id, *g))
             .collect();
         plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
         common::model::ViewState {
-            arrange_zoom_x: self.ui_prefs.arrange_zoom_x,
-            arrangement_split_ratio: self.ui_prefs.arrangement_split_ratio,
-            arrange_scroll_beat: self.ui_prefs.arrange_scroll_beat,
-            arrange_follow: self.ui_prefs.arrange_follow,
+            arrange_zoom_x: self.cur.view.arrange_zoom_x,
+            arrangement_split_ratio: self.cur.view.arrangement_split_ratio,
+            arrange_scroll_beat: self.cur.view.arrange_scroll_beat,
+            arrange_follow: self.cur.view.arrange_follow,
             // 再生ループ (ON/OFF + 範囲) は transport が live SSoT。 ここへ書くことで
             // 「dirty は立てないが保存される」 (= ズーム / スクロールと同じ扱い)。
-            loop_region: self.transport.loop_region,
-            arrange_track_top: self.ui_prefs.arrange_track_top,
-            arrange_track_row_h: self.ui_prefs.arrange_track_row_h,
-            arrange_header_w: self.ui_prefs.arrange_header_w,
-            track_row_overrides: self.ui_prefs.track_row_overrides.clone(),
+            loop_region: self.cur.transport.loop_region,
+            arrange_track_top: self.cur.view.arrange_track_top,
+            arrange_track_row_h: self.cur.view.arrange_track_row_h,
+            arrange_header_w: self.cur.view.arrange_header_w,
+            track_row_overrides: self.cur.view.track_row_overrides.clone(),
             expanded_automation_tracks: expanded,
             automation_lane_row_overrides: lane_row_overrides,
-            master_row_automation_expanded: self.ui_prefs.master_row_automation_expanded,
+            master_row_automation_expanded: self.cur.view.master_row_automation_expanded,
             hidden_automation_lanes,
             collapsed_parallel_nodes: self.persisted_collapsed_parallel_nodes(),
-            arrange_snap_enabled: self.ui_prefs.arrange_snap_enabled,
-            arrange_snap_choice: self.ui_prefs.arrange_snap_choice,
-            pianoroll_snap_enabled: self.ui_prefs.pianoroll_snap_enabled,
-            pianoroll_snap_choice: self.ui_prefs.pianoroll_snap_choice,
-            piano_roll_fold: self.ui_prefs.piano_roll_fold,
-            snap_on_draw: self.ui_prefs.snap_on_draw,
-            snap_live_input: self.recording.snap_live_input,
-            bottom_panel: self.ui_prefs.bottom_panel,
+            arrange_snap_enabled: self.cur.view.arrange_snap_enabled,
+            arrange_snap_choice: self.cur.view.arrange_snap_choice,
+            pianoroll_snap_enabled: self.cur.view.pianoroll_snap_enabled,
+            pianoroll_snap_choice: self.cur.view.pianoroll_snap_choice,
+            piano_roll_fold: self.cur.view.piano_roll_fold,
+            snap_on_draw: self.cur.view.snap_on_draw,
+            snap_live_input: self.cur.recording.snap_live_input,
+            bottom_panel: self.cur.view.bottom_panel,
             piano_roll_views,
             audio_editor_views,
             plugin_editor_windows,
             // r.md #87: ランチャー帯の見せ方 / 幅 / 列幅 / 横スクロール。
             // 「見方の都合」なので保存はするが dirty は立てない。
-            launcher_layout: self.ui_prefs.launcher_layout,
-            launcher_width: self.ui_prefs.launcher_width,
-            launcher_scene_col_w: self.ui_prefs.launcher_scene_col_w,
-            launcher_scroll_scene: self.ui_prefs.launcher_scroll_scene,
+            launcher_layout: self.cur.view.launcher_layout,
+            launcher_width: self.cur.view.launcher_width,
+            launcher_scene_col_w: self.cur.view.launcher_scene_col_w,
+            launcher_scroll_scene: self.cur.view.launcher_scroll_scene,
         }
     }
 
@@ -139,64 +139,64 @@ impl AppData {
         loop_region: common::model::LoopRegion,
         hidden_automation_lanes: Vec<common::model::AutomationLaneKey>,
     ) {
-        self.ui_prefs.piano_roll_views.clear();
-        self.ui_prefs.audio_editor_views.clear();
+        self.cur.view.piano_roll_views.clear();
+        self.cur.view.audio_editor_views.clear();
         // r.md #65: 別プロジェクトの窓位置が漏れないよう per-clip view と同様に先にクリア。
-        self.ui_prefs.plugin_editor_windows.clear();
+        self.cur.view.plugin_editor_windows.clear();
         self.set_loop_region(loop_region);
         // 消えたレーンのキーは捨てる (`automation_lane_row_overrides` と同じ)。
-        self.ui_prefs.hidden_automation_lanes = hidden_automation_lanes
+        self.cur.view.hidden_automation_lanes = hidden_automation_lanes
             .into_iter()
-            .filter(|k| self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
+            .filter(|k| self.cur.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
             .collect();
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
-        self.ui_prefs.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
+        self.cur.view.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
         // `0.0` / NaN は「未設定」 (旧ファイル)。view 側が既定比率へ倒すので
         // ここで 0.05 に clamp しない (するとアレンジが潰れて開く)。
-        self.ui_prefs.arrangement_split_ratio = if v.arrangement_split_ratio.is_finite() {
+        self.cur.view.arrangement_split_ratio = if v.arrangement_split_ratio.is_finite() {
             v.arrangement_split_ratio.clamp(0.0, 0.95)
         } else {
             0.0
         };
-        self.ui_prefs.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
-        self.ui_prefs.arrange_follow = v.arrange_follow;
-        self.ui_prefs.arrange_track_top = v.arrange_track_top.max(0.0);
-        self.ui_prefs.arrange_track_row_h =
+        self.cur.view.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
+        self.cur.view.arrange_follow = v.arrange_follow;
+        self.cur.view.arrange_track_top = v.arrange_track_top.max(0.0);
+        self.cur.view.arrange_track_row_h =
             v.arrange_track_row_h.clamp(MIN_ARRANGE_ROW_H, MAX_ARRANGE_ROW_H);
-        self.ui_prefs.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
-        self.ui_prefs.track_row_overrides = v
+        self.cur.view.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
+        self.cur.view.track_row_overrides = v
             .track_row_overrides
             .into_iter()
             .map(|(k, h)| (k, h.max(16)))
             .collect();
-        self.ui_prefs.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
-        self.ui_prefs.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
+        self.cur.view.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
+        self.cur.view.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
         // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
         // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
-        self.ui_prefs.automation_lane_row_overrides = v
+        self.cur.view.automation_lane_row_overrides = v
             .automation_lane_row_overrides
             .into_iter()
             .filter(|(k, _)| {
-                self.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some()
+                self.cur.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some()
             })
             .map(|(k, h)| (k, h.max(16)))
             .collect();
-        self.ui_prefs.master_row_automation_expanded = v.master_row_automation_expanded;
-        self.ui_prefs.arrange_snap_enabled = v.arrange_snap_enabled;
-        self.ui_prefs.arrange_snap_choice = v.arrange_snap_choice.min(max_choice);
-        self.ui_prefs.pianoroll_snap_enabled = v.pianoroll_snap_enabled;
-        self.ui_prefs.pianoroll_snap_choice = v.pianoroll_snap_choice.min(max_choice);
-        self.ui_prefs.piano_roll_fold = v.piano_roll_fold;
-        self.ui_prefs.snap_on_draw = v.snap_on_draw;
-        self.recording.snap_live_input = v.snap_live_input;
-        self.ui_prefs.bottom_panel = v.bottom_panel;
+        self.cur.view.master_row_automation_expanded = v.master_row_automation_expanded;
+        self.cur.view.arrange_snap_enabled = v.arrange_snap_enabled;
+        self.cur.view.arrange_snap_choice = v.arrange_snap_choice.min(max_choice);
+        self.cur.view.pianoroll_snap_enabled = v.pianoroll_snap_enabled;
+        self.cur.view.pianoroll_snap_choice = v.pianoroll_snap_choice.min(max_choice);
+        self.cur.view.piano_roll_fold = v.piano_roll_fold;
+        self.cur.view.snap_on_draw = v.snap_on_draw;
+        self.cur.recording.snap_live_input = v.snap_live_input;
+        self.cur.view.bottom_panel = v.bottom_panel;
         // r.md #87: ランチャー帯。負の値 / NaN は「未設定」へ潰し、widget の既定幅に任せる
         // (壊れた保存値で帯が消える / 画面外へ飛ぶのを防ぐ)。
-        self.ui_prefs.launcher_layout = v.launcher_layout;
-        self.ui_prefs.launcher_width = sanitize_launcher_px(v.launcher_width);
-        self.ui_prefs.launcher_scene_col_w = sanitize_launcher_px(v.launcher_scene_col_w);
-        self.ui_prefs.launcher_scroll_scene =
+        self.cur.view.launcher_layout = v.launcher_layout;
+        self.cur.view.launcher_width = sanitize_launcher_px(v.launcher_width);
+        self.cur.view.launcher_scene_col_w = sanitize_launcher_px(v.launcher_scene_col_w);
+        self.cur.view.launcher_scroll_scene =
             if v.launcher_scroll_scene.is_finite() { v.launcher_scroll_scene.max(0.0) } else { 0.0 };
         // 選択 (時間範囲) は session-only なので復元しない
         // (`docs/plan_range_selection.md` §2.3)。
@@ -205,7 +205,7 @@ impl AppData {
             pv.zoom_y = pv.zoom_y.clamp(6.0, 40.0);
             pv.top_pitch = pv.top_pitch.clamp(11, 127);
             pv.scroll_beat = pv.scroll_beat.max(0.0);
-            self.ui_prefs.piano_roll_views.insert(k, pv);
+            self.cur.view.piano_roll_views.insert(k, pv);
         }
         for (k, mut av) in v.audio_editor_views {
             // r.md #44: start_beat は content-local 軸で、左端を外へ伸ばした clip では
@@ -214,7 +214,7 @@ impl AppData {
                 av.start_beat = 0.0;
             }
             av.len_beats = av.len_beats.max(0.0);
-            self.ui_prefs.audio_editor_views.insert(k, av);
+            self.cur.view.audio_editor_views.insert(k, av);
         }
         // r.md #65: エディタ窓のジオメトリ。現存しない device の stale entry は捨てる。
         // 位置 (`x`/`y`) は **clamp しない** — マルチモニタでは負値が正当で、
@@ -225,13 +225,13 @@ impl AppData {
         for (device_id, mut g) in v.plugin_editor_windows {
             if g.width == 0
                 || g.height == 0
-                || find_device_by_id(self.song_doc.song(), device_id).is_none()
+                || find_device_by_id(self.cur.song_doc.song(), device_id).is_none()
             {
                 continue;
             }
             g.width = g.width.min(16_384);
             g.height = g.height.min(16_384);
-            self.ui_prefs.plugin_editor_windows.insert(device_id, g);
+            self.cur.view.plugin_editor_windows.insert(device_id, g);
         }
     }
 }

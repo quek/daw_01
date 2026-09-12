@@ -70,7 +70,7 @@ fn build_app_with_two_fx_tracks() -> (AppData, u32) {
     });
     for device_id in [DEVICE_A, DEVICE_B] {
         app.handle_event(AppEvent::Plugin(PluginEvent::PluginParamList {
-            device_id,
+            device: app.dev(device_id),
             params: vec![PluginParamInfo {
                 id: PARAM_ID,
                 name: "Dry/Wet".into(),
@@ -83,14 +83,14 @@ fn build_app_with_two_fx_tracks() -> (AppData, u32) {
             has_embedded_gui: true,
         }));
     }
-    let source_id = app.song_doc.song().mod_sources[0].id;
+    let source_id = app.cur.song_doc.song().mod_sources[0].id;
     assert_ne!(source_id, 0, "mod_source に安定 id が採番されている");
     (app, source_id)
 }
 
 fn touch_plugin_knob(app: &mut AppData, device_id: u64) {
     app.handle_event(AppEvent::Plugin(PluginEvent::PluginParamTouched {
-        device_id,
+        device: app.dev(device_id),
         param_id: PARAM_ID,
         // host が送るのは placeholder。 daw_gui 側が実名で上書きする。
         display_name: format!("Param {PARAM_ID}"),
@@ -98,7 +98,7 @@ fn touch_plugin_knob(app: &mut AppData, device_id: u64) {
 }
 
 fn routings_of(app: &AppData, track_id: u32) -> Vec<(u32, AutomationTarget)> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .tracks
         .iter()
@@ -132,7 +132,7 @@ fn arm_then_plugin_knob_touch_creates_routing_and_disarms() {
         }
     );
     assert_eq!(
-        app.ui_ephemeral.armed_mod_source, None,
+        app.cur.peph.armed_mod_source, None,
         "1 本繋いだら待受は自動解除される (待受けたまま忘れて誤爆しない)"
     );
 }
@@ -253,7 +253,7 @@ fn deleting_owner_track_removes_its_mod_source_and_routings() {
     app.handle_event(AppEvent::DeleteTracks(vec![TRACK_A]));
 
     assert!(
-        app.song_doc.song().mod_sources.is_empty(),
+        app.cur.song_doc.song().mod_sources.is_empty(),
         "所有トラックと一緒にソースも消える"
     );
     assert!(
@@ -271,7 +271,7 @@ fn removing_armed_source_disarms() {
 
     app.handle_event(AppEvent::RemoveModSource { id: source_id });
 
-    assert_eq!(app.ui_ephemeral.armed_mod_source, None);
+    assert_eq!(app.cur.peph.armed_mod_source, None);
     touch_plugin_knob(&mut app, DEVICE_A);
     assert!(routings_of(&app, TRACK_A).is_empty());
 }

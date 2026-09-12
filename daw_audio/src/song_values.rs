@@ -20,38 +20,38 @@ use common::protocol::AudioCommand;
 /// IPC は信頼境界なので、範囲外の値はここで必ず潰す。
 pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
     match *cmd {
-        AudioCommand::SetTrackVolume { track, volume } => {
+        AudioCommand::SetTrackVolume { track, volume, .. } => {
             with_track(song, track, |t| t.volume = volume.clamp(0.0, MAX_TRACK_GAIN));
         }
-        AudioCommand::SetTrackPan { track, pan } => {
+        AudioCommand::SetTrackPan { track, pan, .. } => {
             with_track(song, track, |t| t.pan = pan.clamp(-1.0, 1.0));
         }
-        AudioCommand::SetTrackMuted { track, muted } => {
+        AudioCommand::SetTrackMuted { track, muted, .. } => {
             with_track(song, track, |t| t.muted = muted);
         }
-        AudioCommand::SetTrackSolo { track, solo } => {
+        AudioCommand::SetTrackSolo { track, solo, .. } => {
             with_track(song, track, |t| t.solo = solo);
         }
         // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。IPC は信頼境界
         // なので、各パラメータを可動範囲へ丸めてから載せる。丸め方の SSoT は
         // `common::model::channel_strip` の `ParamRange`。
-        AudioCommand::SetTrackStrip { track, strip } => {
+        AudioCommand::SetTrackStrip { track, strip, .. } => {
             with_track(song, track, |t| t.strip = sanitize_strip(strip));
         }
         // マスターストリップ (docs/plan_master_strip.md)。同じく IPC 境界で丸める。
-        AudioCommand::SetMasterStrip { strip } => {
+        AudioCommand::SetMasterStrip { strip, .. } => {
             song.master_strip = sanitize_master_strip(strip);
         }
-        AudioCommand::SetTrackArmed { track, armed } => {
+        AudioCommand::SetTrackArmed { track, armed, .. } => {
             with_track(song, track, |t| t.armed = armed);
         }
-        AudioCommand::SetSendGain { track, send_id, gain } => {
+        AudioCommand::SetSendGain { track, send_id, gain, .. } => {
             with_send(song, track, send_id, |s| {
                 // track / master と同じ +6 dB 上限を共有 (r.md #11 sibling)。
                 s.gain = gain.clamp(0.0, MAX_TRACK_GAIN);
             });
         }
-        AudioCommand::SetSendEnabled { track, send_id, enabled } => {
+        AudioCommand::SetSendEnabled { track, send_id, enabled, .. } => {
             with_send(song, track, send_id, |s| s.enabled = enabled);
         }
         // r.md #110 Parallel chain の mixer (gain / pan / mute / solo)。宛先は安定
@@ -90,8 +90,8 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
                 r.set_selector_fade(fade_ms);
             });
         }
-        AudioCommand::SetSongBpm { bpm } => song.bpm = bpm.clamp(1.0, 400.0),
-        AudioCommand::SetSongTimeSigNumerator { num } => song.time_sig.0 = num.clamp(1, 32),
+        AudioCommand::SetSongBpm { bpm, .. } => song.bpm = bpm.clamp(1.0, 400.0),
+        AudioCommand::SetSongTimeSigNumerator { num, .. } => song.time_sig.0 = num.clamp(1, 32),
         _ => return false,
     }
     true
@@ -198,25 +198,25 @@ mod tests {
             ..Track::default()
         });
 
-        assert!(apply(&AudioCommand::SetTrackVolume { track: 3, volume: 99.0 }, &mut song));
+        assert!(apply(&AudioCommand::SetTrackVolume { project: common::protocol::ProjectKey(1), track: 3, volume: 99.0 }, &mut song));
         assert_eq!(song.tracks[0].volume, MAX_TRACK_GAIN);
-        assert!(apply(&AudioCommand::SetTrackPan { track: 3, pan: -9.0 }, &mut song));
+        assert!(apply(&AudioCommand::SetTrackPan { project: common::protocol::ProjectKey(1), track: 3, pan: -9.0 }, &mut song));
         assert_eq!(song.tracks[0].pan, -1.0);
         assert!(apply(
-            &AudioCommand::SetSendGain { track: 3, send_id: 1, gain: -5.0 },
+            &AudioCommand::SetSendGain { project: common::protocol::ProjectKey(1), track: 3, send_id: 1, gain: -5.0 },
             &mut song
         ));
         assert_eq!(song.tracks[0].sends[0].gain, 0.0);
-        assert!(apply(&AudioCommand::SetSongBpm { bpm: 0.0 }, &mut song));
+        assert!(apply(&AudioCommand::SetSongBpm { project: common::protocol::ProjectKey(1), bpm: 0.0 }, &mut song));
         assert_eq!(song.bpm, 1.0);
-        assert!(apply(&AudioCommand::SetSongTimeSigNumerator { num: 0 }, &mut song));
+        assert!(apply(&AudioCommand::SetSongTimeSigNumerator { project: common::protocol::ProjectKey(1), num: 0 }, &mut song));
         assert_eq!(song.time_sig.0, 1);
 
         // 存在しない id は何も壊さない。
-        assert!(apply(&AudioCommand::SetTrackMuted { track: 99, muted: true }, &mut song));
+        assert!(apply(&AudioCommand::SetTrackMuted { project: common::protocol::ProjectKey(1), track: 99, muted: true }, &mut song));
         assert!(!song.tracks[0].muted);
         // 値のみ更新でないコマンドは扱わない。
-        assert!(!apply(&AudioCommand::Play, &mut song));
+        assert!(!apply(&AudioCommand::Play { project: common::protocol::ProjectKey(1) }, &mut song));
     }
 
 
@@ -235,7 +235,7 @@ mod tests {
         strip.comp.attack_ms = -5.0;
         strip.comp.sc_freq_hz = 1.0; // 20Hz 未満は OFF へ
 
-        assert!(apply(&AudioCommand::SetTrackStrip { track: 7, strip }, &mut song));
+        assert!(apply(&AudioCommand::SetTrackStrip { project: common::protocol::ProjectKey(1), track: 7, strip }, &mut song));
         let got = song.tracks[0].strip;
         assert!(got.eq.param(EqBand::Hmf, EqParam::Freq).is_finite());
         assert!((got.eq.param(EqBand::Hmf, EqParam::Gain) - 15.0).abs() < 1e-6);

@@ -61,7 +61,7 @@ fn setup_tracks(app: &mut AppData, specs: &[Vec<Note>]) -> Vec<ClipKey> {
             }));
         }
     });
-    (0..app.song_doc.song().tracks.len())
+    (0..app.cur.song_doc.song().tracks.len())
         .map(|i| ClipKey { track_id: 1 + i as u32, clip_id: 10 + i as u32 })
         .collect()
 }
@@ -71,15 +71,15 @@ fn show_clips(app: &mut AppData, keys: &[ClipKey]) {
 }
 
 fn notes_of(app: &AppData, track: usize) -> Vec<Note> {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let clip = &song.tracks[track].clips[0];
     song.clip_notes(clip).to_vec()
 }
 
 /// 既定グリッド (1/16 = 0.25 拍) を使うため snap を明示的に有効化する。
 fn enable_grid(app: &mut AppData) {
-    app.ui_prefs.pianoroll_snap_enabled = true;
-    app.ui_prefs.pianoroll_snap_choice = daw_gui::view::snap::CHOICE_PIANOROLL_DEFAULT; // 1/16
+    app.cur.view.pianoroll_snap_enabled = true;
+    app.cur.view.pianoroll_snap_choice = daw_gui::view::snap::CHOICE_PIANOROLL_DEFAULT; // 1/16
 }
 
 // ============================================================
@@ -254,7 +254,7 @@ fn arrow_walks_the_scale_when_folded() {
     app.edit_song(|song| {
         song.scale_changes.push(ScaleChange { beat: 0.0, root: 0, scale: Scale::Major });
     });
-    app.ui_prefs.piano_roll_fold = true;
+    app.cur.view.piano_roll_fold = true;
     app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
     app.handle_event(AppEvent::NudgeSelectedNotePitch { octave: false, steps: 1 });
@@ -311,7 +311,7 @@ fn nudge_may_push_notes_outside_the_clip_window() {
     );
     // クリップ自体は伸びない (窓は不変)。
     assert!(
-        (app.song_doc.song().tracks[0].clips[0].length_beats - 32.0).abs() < 1e-9,
+        (app.cur.song_doc.song().tracks[0].clips[0].length_beats - 32.0).abs() < 1e-9,
         "クリップは伸びない"
     );
     // 戻せば窓の中へ戻る (データは無傷)。
@@ -353,18 +353,18 @@ fn consecutive_nudges_collapse_into_one_undo_step() {
     enable_grid(&mut app);
     app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
-    let before = app.song_doc.history_current();
+    let before = app.cur.song_doc.history_current();
     for _ in 0..8 {
         app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Grid, steps: 1 });
     }
     assert!((notes_of(&app, 0)[0].start_beat - 6.0).abs() < 1e-9, "8 回で +2 拍");
     assert_eq!(
-        app.song_doc.history_current() - before,
+        app.cur.song_doc.history_current() - before,
         1,
         "連続 nudge は 1 undo step: labels={:?}",
-        app.song_doc.history_labels()
+        app.cur.song_doc.history_labels()
     );
-    app.song_doc.undo();
+    app.cur.song_doc.undo();
     assert!((notes_of(&app, 0)[0].start_beat - 4.0).abs() < 1e-9, "1 回の undo で元位置へ戻る");
 }
 
@@ -378,11 +378,11 @@ fn nudge_at_the_edge_does_not_push_undo_steps() {
     enable_grid(&mut app);
     app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
 
-    let before = app.song_doc.history_current();
+    let before = app.cur.song_doc.history_current();
     for _ in 0..5 {
         app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Grid, steps: -1 });
     }
-    assert_eq!(app.song_doc.history_current(), before, "拍 0 で止まったまま undo は積まれない");
+    assert_eq!(app.cur.song_doc.history_current(), before, "拍 0 で止まったまま undo は積まれない");
 }
 
 /// 選択が空なら何も起きない (ユーザー決定: 再生位置移動やスクロールには割り当てない)。
@@ -391,12 +391,12 @@ fn nudge_without_selection_is_a_no_op() {
     let mut app = build_app();
     let keys = setup_tracks(&mut app, &[vec![mk_note(60, 4.0, 1.0)]]);
     show_clips(&mut app, &keys);
-    let before = app.song_doc.history_current();
+    let before = app.cur.song_doc.history_current();
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Grid, steps: 1 });
     app.handle_event(AppEvent::NudgeSelectedNotePitch { octave: false, steps: 1 });
     app.handle_event(AppEvent::NudgeSelectedNoteLength { step: NudgeStep::Grid, steps: 1 });
     assert!((notes_of(&app, 0)[0].start_beat - 4.0).abs() < 1e-9);
-    assert_eq!(app.song_doc.history_current(), before);
+    assert_eq!(app.cur.song_doc.history_current(), before);
 }
 
 /// Alt (Fine) はスナップ無効の微移動。スナップ OFF の無修飾 ←/→ も同じ量になる。
@@ -416,7 +416,7 @@ fn fine_step_is_one_sixteenth_of_the_grid() {
     );
 
     // スナップを切ると無修飾 ←/→ も同じ微移動になる (「グリッド」 が定義できないため)。
-    app.ui_prefs.pianoroll_snap_enabled = false;
+    app.cur.view.pianoroll_snap_enabled = false;
     app.handle_event(AppEvent::NudgeSelectedNoteTime { step: NudgeStep::Grid, steps: 1 });
     assert!(
         (notes_of(&app, 0)[0].start_beat - 4.031_25).abs() < 1e-9,

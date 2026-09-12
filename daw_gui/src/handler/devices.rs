@@ -86,19 +86,19 @@ impl AppData {
         if geometry.width == 0 || geometry.height == 0 {
             return;
         }
-        self.ui_prefs.plugin_editor_windows.insert(device_id, geometry);
+        self.cur.view.plugin_editor_windows.insert(device_id, geometry);
     }
 
     pub(crate) fn on_gui_closed(&mut self, device_id: u64) {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
-        self.ipc.open_plugin_guis.remove(&device_id);
+        self.cur.pipc.open_plugin_guis.remove(&device_id);
         // r.md #65: エディタの open / close は **2 プロセスに跨って往復する**ので、
         // 片側のログだけでは「誰が閉じて誰が開き直したか」が決まらない。
         // 頻度は人の操作と同じなので info で常設する。
         tracing::info!(
             device_id,
-            still_open = self.ipc.open_plugin_guis.len(),
+            still_open = self.cur.pipc.open_plugin_guis.len(),
             "plugin editor closed (SlotGuiClosed from plugin-host)"
         );
     }
@@ -113,6 +113,7 @@ impl AppData {
         id: String,
         _name: String,
         shmem_id: String,
+        token: common::protocol::InstanceToken,
         // Phase 6 review (silent corruption fix): plugin_host が saved state
         // を `state_load(&bytes)` で適用しようとして失敗したときの理由。
         // `Some(reason)` のとき plugin は default 状態で chain に居る ⇒
@@ -132,7 +133,7 @@ impl AppData {
         // 応答のみ受理する。 A→B と連続差し替えしたとき、 A の stale 応答が
         // B を載せた song device を巻き戻すのを防ぐ。 entry が無い (= 既に
         // 最新世代を処理済み / disconnect で clear 済み) 場合も stale 扱い。
-        match self.ipc.pending_plugin_loads.get(&device_id) {
+        match self.cur.pipc.pending_plugin_loads.get(&device_id) {
             Some(&g) if g == generation => {}
             latest => {
                 tracing::warn!(
@@ -146,20 +147,20 @@ impl AppData {
         }
         // chain の該当位置に `PluginInstance` を書き戻すために、 いまの
         // 所属 track と位置を **その場で引き直す** (保持はしない)。
-        let coords = find_device_by_id(self.song_doc.song(), device_id);
+        let coords = find_device_by_id(self.cur.song_doc.song(), device_id);
 
         // SSoT (code review 2026-06-06): audio engine に `ProcessData` shmem を
         // 開かせる。 incoming bridge の stale clone ではなく、 respawn で
         // 差し替わる live な `self.ipc.audio_tx` から送ることで、 audio respawn
         // 後にロードした plugin の音が出なくなる bug を防ぐ。 v29: 配置は
         // daw_audio が Song から解決するので device_id + shmem_id のみ。
-        self.send_audio(AudioCommand::OpenPluginShmem { device_id, shmem_id });
+        self.send_audio(AudioCommand::OpenPluginShmem { project: self.pk(), device_id, shmem_id, token });
 
         let Some((track_id, index)) = coords else {
             // device が song から消えている (load 中に削除された等)。 shmem は
             // 開いたままでも engine 側は Song に居ない device を schedule しない。
             // pending だけ解放して終了。
-            self.ipc.pending_plugin_loads.remove(&device_id);
+            self.cur.pipc.pending_plugin_loads.remove(&device_id);
             tracing::warn!(device_id, %id, "SlotPluginLoaded for a device no longer in the song");
             return;
         };
@@ -173,10 +174,11 @@ impl AppData {
         // device 単位での load 状態 cache。 reconcile の device-level diff
         // (Undo で plugin 構成が変化した場合の同期) と、 track 削除前の
         // `ClosePluginShmem` の対象確認 (use-after-free deadlock 防止) に使う。
-        self.ipc.loaded_devices.insert(
+        self.cur.pipc.loaded_devices.insert(
             device_id,
             LoadedDeviceInfo {
                 plugin_id_str: id.clone(),
+                token,
             },
         );
         // 注意: ここで `ensure_first_track()` を呼んではいけない。 子プロセスの
@@ -250,29 +252,29 @@ impl AppData {
         // the cached entry here the next sync sees "no change" and never sends
         // `SetupAraDocument` to the new instance — leaving it with no regions, so
         // it renders silence and its empty playback renderer stalls the engine.
-        self.ipc.ara_doc_cache.remove(&device_id);
+        self.cur.pipc.ara_doc_cache.remove(&device_id);
 
         // 新 plugin の audio 再 sync は edit_song の epoch bump 経由: 下の play() が
         // ensure-synced flush で Play 前に新 schedule を届け (Play 待ち再生)、 Play が
         // 無い Shift 追加 (open_gui=false) でも runner の frame flush が同 frame 末に
         // LoadSong する (旧: ここで明示 sync_song_to_plugin_host していた review 修正を
         // sync 一本化で epoch flush に移譲)。 pending_added_plugin_finalize は消費する。
-        if let Some(open_gui) = self.ipc.pending_added_plugin_finalize.remove(&device_id)
+        if let Some(open_gui) = self.cur.pipc.pending_added_plugin_finalize.remove(&device_id)
             && open_gui
         {
-            self.ipc.gui_open_requests.push(device_id);
+            self.cur.pipc.gui_open_requests.push(device_id);
         }
 
         // A7: this load is done. If Play was queued waiting for the
         // last plugin to register on the audio side, fire it now.
-        self.ipc.pending_plugin_loads.remove(&device_id);
-        if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play.is_some() {
+        self.cur.pipc.pending_plugin_loads.remove(&device_id);
+        if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message.clear();
             self.fire_pending_play();
-        } else if !self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play.is_some() {
+        } else if !self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
-                self.ipc.pending_plugin_loads.len()
+                self.cur.pipc.pending_plugin_loads.len()
             );
         }
 
@@ -286,7 +288,7 @@ impl AppData {
         // metadata 差分キャッシュから該当 device を落として初回 flush を必ず送る
         // (= seed 合成。project 切替 / plugin 差替で device_id が再利用されても確実に
         // 再送。cache が残ったままだと「同じ metadata」判定で送信 skip → 無音になる)。
-        self.voicevox.voicevox_metadata_sent.remove(&device_id);
+        self.cur.pvv.voicevox_metadata_sent.remove(&device_id);
         self.sync_vocal_metadata();
     }
 
@@ -310,7 +312,7 @@ impl AppData {
         generation: u64,
     ) {
         // v29 世代 guard: loaded と対称 (最新世代の失敗のみ pending を解放)。
-        match self.ipc.pending_plugin_loads.get(&device_id) {
+        match self.cur.pipc.pending_plugin_loads.get(&device_id) {
             Some(&g) if g == generation => {}
             latest => {
                 tracing::warn!(
@@ -328,27 +330,27 @@ impl AppData {
             %reason,
             "plugin load failed (notified by plugin host)"
         );
-        self.ipc.pending_plugin_loads.remove(&device_id);
+        self.cur.pipc.pending_plugin_loads.remove(&device_id);
         // 失敗を「そのセッション中ずっと無音」で終わらせない: device を
         // 「未ロード」としてインスペクタに出し、 明示的な再 load
         // (`AppEvent::ReloadDevice`) の対象にする。 自動リトライはしない
         // (plugin 側の恒常的な失敗で無限ループになる)。
-        self.ipc.failed_plugin_loads.insert(device_id, reason.clone());
+        self.cur.pipc.failed_plugin_loads.insert(device_id, reason.clone());
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
-        self.ipc.pending_added_plugin_finalize.remove(&device_id);
+        self.cur.pipc.pending_added_plugin_finalize.remove(&device_id);
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
         // と対称)。 失敗で空になったタイミングで queue Play を flush する。
-        if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play.is_some() {
+        if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message =
                 format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
             self.fire_pending_play();
-        } else if !self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play.is_some() {
+        } else if !self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             // まだ他の load が走っているなら、 残数表示を更新しつつエラーは
             // 上書き (最新の状況をユーザーに見せる)。
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み失敗: {plugin_id} ({reason}) — 残 {}",
-                self.ipc.pending_plugin_loads.len()
+                self.cur.pipc.pending_plugin_loads.len()
             );
         } else {
             // pending_play は立っていない (= 再生中じゃなかった or stop 済) ので
@@ -370,7 +372,7 @@ impl AppData {
     /// 保存済み state (`PluginInstance.state`) 込みで送るので、 一時的な
     /// 失敗 (shmem 名衝突など) から復帰したときは音色も復元される。
     pub(crate) fn reload_device(&mut self, device_id: u64) {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(inst) = song.plugin_by_id(device_id).cloned() else {
             return;
         };
@@ -405,7 +407,7 @@ impl AppData {
     /// なく live `self.ipc.audio_tx` から送る (audio respawn 後に dangling
     /// shmem 参照が残るのを防ぐ)。
     pub(crate) fn on_plugin_shmem_released_from_child(&mut self, device_id: u64) {
-        self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+        self.send_audio(AudioCommand::ClosePluginShmem { project: self.pk(), device_id });
     }
 
     /// plugin_host が plugin destroy を完了した通知を受けて、
@@ -415,17 +417,17 @@ impl AppData {
     pub(crate) fn on_plugin_unloaded_from_child(&mut self, device_id: u64) {
         // device が空になったので「未ロード」表示も畳む (再 load の対象は
         // song に残っている device だけ)。
-        self.ipc.failed_plugin_loads.remove(&device_id);
+        self.cur.pipc.failed_plugin_loads.remove(&device_id);
         self.forget_device_caches(device_id);
         // builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
         // overlay / スピナーが消えない)。plugin host の deactivate も idle を報告するが二重防御。
-        self.voicevox.voicevox_synth_status.remove(&device_id);
+        self.cur.pvv.voicevox_synth_status.remove(&device_id);
         // r.md #27: metadata 差分キャッシュも live device に揃える (unload された
         // device の stale entry を残さない。voicevox_synth_status と対称)。
-        self.voicevox.voicevox_metadata_sent.remove(&device_id);
+        self.cur.pvv.voicevox_metadata_sent.remove(&device_id);
         // r.md #75: 再生ヘッド優先ヒントの送信記憶も同様 (device_id 再利用時に
         // 「もう送った」と誤判定して最初のヒントを落とさない)。
-        self.voicevox.priority_sent.remove(&device_id);
+        self.cur.pvv.priority_sent.remove(&device_id);
         // 消えた device の PDC 寄与も畳む (0 = entry を落とす)。
         self.set_device_latency(device_id, 0);
     }
@@ -437,10 +439,10 @@ impl AppData {
     /// id keyed では詰める操作が無いので放置 = 永久に残る)。 落とす経路は
     /// unload 通知 / device 削除 / reconcile の RemoveDevice の 3 つ。
     pub(crate) fn forget_device_caches(&mut self, device_id: u64) {
-        self.ipc.loaded_devices.remove(&device_id);
-        self.ipc.plugin_params.remove(&device_id);
-        self.ipc.slot_has_gui.remove(&device_id);
-        self.ipc
+        self.cur.pipc.loaded_devices.remove(&device_id);
+        self.cur.pipc.plugin_params.remove(&device_id);
+        self.cur.pipc.slot_has_gui.remove(&device_id);
+        self.cur.pipc
             .plugin_param_values
             .retain(|k, _| k.device_id != device_id);
     }
@@ -465,14 +467,14 @@ impl AppData {
 
     /// `AudioCommand::SetDeviceLatency` を送る唯一の口。
     fn set_device_latency(&mut self, device_id: u64, samples: u32) {
-        self.send_audio(AudioCommand::SetDeviceLatency { device_id, samples });
+        self.send_audio(AudioCommand::SetDeviceLatency { project: self.pk(), device_id, samples });
     }
 
     pub(crate) fn toggle_slot_gui(&mut self, device_id: u64) {
         // r.md #71 (プラグインのコピー / 移動): アドレスは安定 device_id 一本。
         // cursor track に依存しないので、 表示チェーンが切り替わっても
         // 「どの device のボタンを押したか」 が変わらない。
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let device = song.plugin_by_id(device_id);
         // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
         // (`builtin.video.subtitle`) は video device だが video_fx def を持たず、
@@ -482,9 +484,9 @@ impl AppData {
             && d.ports.is_video()
             && d.plugin_id != common::plugin_db::SUBTITLE_ID
         {
-            self.ui_ephemeral.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
-            self.ui_ephemeral.open_video_fx_params =
-                if self.ui_ephemeral.open_video_fx_params == Some(device_id) {
+            self.cur.peph.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
+            self.cur.peph.open_video_fx_params =
+                if self.cur.peph.open_video_fx_params == Some(device_id) {
                     None
                 } else {
                     Some(device_id)
@@ -499,14 +501,14 @@ impl AppData {
         let is_builtin = device.is_some_and(|d| d.format == PluginFormat::Builtin);
         let has_embedded_gui = !is_builtin
             && self
-                .ipc.slot_has_gui
+                .cur.pipc.slot_has_gui
                 .get(&device_id)
                 .copied()
                 .unwrap_or(true);
         if !has_embedded_gui {
-            self.ui_ephemeral.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
-            self.ui_ephemeral.open_plugin_params =
-                if self.ui_ephemeral.open_plugin_params == Some(device_id) {
+            self.cur.peph.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
+            self.cur.peph.open_plugin_params =
+                if self.cur.peph.open_plugin_params == Some(device_id) {
                     None
                 } else {
                     Some(device_id)
@@ -517,13 +519,13 @@ impl AppData {
         // open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
-        let is_open = self.ipc.open_plugin_guis.contains(&device_id);
+        let is_open = self.cur.pipc.open_plugin_guis.contains(&device_id);
         // r.md #65: 「GUI ボタンが押された」を 1 行で残す。押すたびに open / close が
         // 交互になるので、**このログが 2 行連続で出れば人が 2 回押した**と確定する
         // (= 自動で開き直っているのではない)。
         tracing::info!(device_id, is_open, "toggle_slot_gui (GUI button)");
         if is_open {
-            self.send_plugin(PluginCommand::CloseSlotGui { device_id });
+            self.send_plugin(PluginCommand::CloseSlotGui { device: self.dev(device_id) });
             return;
         }
         self.open_slot_gui(device_id);
@@ -541,13 +543,13 @@ impl AppData {
         // 原因がまったく別になるのに、ログからは区別できなかった。
         tracing::info!(
             device_id,
-            already_open = self.ipc.open_plugin_guis.contains(&device_id),
+            already_open = self.cur.pipc.open_plugin_guis.contains(&device_id),
             caller = %std::panic::Location::caller(),
             "open_slot_gui"
         );
         #[cfg(windows)]
         {
-            if self.ipc.open_plugin_guis.contains(&device_id) {
+            if self.cur.pipc.open_plugin_guis.contains(&device_id) {
                 return;
             }
             let label = self.device_display_name(device_id);
@@ -585,23 +587,26 @@ impl AppData {
                     "opening plugin editor without an owner window (main window not ready)"
                 );
             }
-            self.ipc.open_plugin_guis.insert(device_id);
+            self.cur.pipc.open_plugin_guis.insert(device_id);
+            // `docs/plan_project_tabs.md` Q6: 背景タブの窓も開いたままなので、どのタブの
+            // プラグインかをタイトルで見分ける。
+            let project = Self::tab_label(&self.cur);
             self.send_plugin(PluginCommand::OpenSlotGuiEmbedded {
-                device_id,
-                title: format!("Plugin — {label}"),
+                device: self.dev(device_id),
+                title: format!("Plugin — {label} [{project}]"),
                 // r.md #65: 前回このプロジェクトで閉じたときの窓の位置 / サイズ。
                 // 位置は常に、サイズは plugin が resizable のときだけ plugin-host が使う。
-                geometry: self.ui_prefs.plugin_editor_windows.get(&device_id).copied(),
+                geometry: self.cur.view.plugin_editor_windows.get(&device_id).copied(),
                 owner_main_window,
             });
             // r.md #36: 「キーを全部プラグインに送る」 の現在値を open のたびに同期する
             // (plugin-host は再起動で状態を失う / device_id は open まで意味を持たない)。
-            let song = self.song_doc.song();
+            let song = self.cur.song_doc.song();
             let send_all = song
                 .plugin_by_id(device_id)
                 .is_some_and(|p| p.send_all_keys_to_plugin);
             self.send_plugin(PluginCommand::SetEditorSendAllKeys {
-                device_id,
+                device: self.dev(device_id),
                 enabled: send_all,
             });
         }
@@ -616,7 +621,7 @@ impl AppData {
     /// コピー / 移動: device は別トラックへ移動しうるので保持しない)。
     #[cfg(windows)]
     fn device_display_name(&self, device_id: u64) -> String {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some((track_id, _)) = find_device_by_id(song, device_id) else {
             return "(unknown)".into();
         };
@@ -639,10 +644,10 @@ impl AppData {
     /// window 生成を handle_event ではなく frame loop に置くことで、frame loop を
     /// 回さない headless test では window を作らない。
     pub(crate) fn drain_pending_gui_opens(&mut self) {
-        if self.ipc.gui_open_requests.is_empty() {
+        if self.cur.pipc.gui_open_requests.is_empty() {
             return;
         }
-        for device_id in std::mem::take(&mut self.ipc.gui_open_requests) {
+        for device_id in std::mem::take(&mut self.cur.pipc.gui_open_requests) {
             self.open_slot_gui(device_id);
         }
     }
@@ -666,7 +671,7 @@ impl AppData {
             inst.send_all_keys_to_plugin = enabled;
             true
         });
-        self.send_plugin(PluginCommand::SetEditorSendAllKeys { device_id, enabled });
+        self.send_plugin(PluginCommand::SetEditorSendAllKeys { device: self.dev(device_id), enabled });
     }
 
     /// r.md #105: `device_ids` を bypass する / 戻す。 変化しない id はそのまま
@@ -694,7 +699,7 @@ impl AppData {
     /// `all_clips_muted` と同じ「全部 off なら on、 1 つでも on なら全 off」)。
     /// 見つからない id は数えない。 空なら `false`。
     pub(crate) fn all_devices_bypassed(&self, device_ids: &[u64]) -> bool {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut seen = false;
         for &id in device_ids {
             let Some(inst) = song.device_by_id(id) else {
@@ -774,7 +779,7 @@ impl AppData {
     /// are taken at the dispatch choke point (`is_undoable`), so this only
     /// mutates the model and syncs.
     pub(crate) fn explode_parallel_out(&mut self, device_id: u64) {
-        let Some((track_id, _)) = find_device_by_id(self.song_doc.song(), device_id) else {
+        let Some((track_id, _)) = find_device_by_id(self.cur.song_doc.song(), device_id) else {
             return;
         };
         // The grouped explode model needs the source to be a real track
@@ -782,10 +787,10 @@ impl AppData {
         if track_id == common::model::MASTER_TRACK_ID {
             return;
         }
-        let Some(src) = self.song_doc.song().track_by_id(track_id) else {
+        let Some(src) = self.cur.song_doc.song().track_by_id(track_id) else {
             return;
         };
-        let Some(inst) = self.song_doc.song().plugin_by_id(device_id) else {
+        let Some(inst) = self.cur.song_doc.song().plugin_by_id(device_id) else {
             return;
         };
         let count = inst.aux_output_count as usize;
@@ -794,7 +799,7 @@ impl AppData {
         }
         let src_name = src.name.clone();
         // Snapshot the current routes + the set of live track ids so the loop
-        // below can keep valid existing routes without re-borrowing `self.song_doc.song()`
+        // below can keep valid existing routes without re-borrowing `self.cur.song_doc.song()`
         // while it allocates ids / inserts tracks.
         let existing: Vec<Option<u32>> = (0..count)
             .map(|port| {
@@ -805,7 +810,7 @@ impl AppData {
             })
             .collect();
         let live_ids: std::collections::HashSet<u32> =
-            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
+            self.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
 
         let mut routes: Vec<Option<common::model::AuxOutputRoute>> = vec![None; count];
         let mut new_children: Vec<common::model::Track> = Vec::new();
@@ -832,10 +837,10 @@ impl AppData {
         // Insert the new children right after the source track so they appear
         // grouped under it in the arrangement.
         let insert_at = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_index_by_id(track_id)
             .map(|i| i + 1)
-            .unwrap_or(self.song_doc.song().tracks.len());
+            .unwrap_or(self.cur.song_doc.song().tracks.len());
         for (k, child) in new_children.into_iter().enumerate() {
             self.edit_song(|song| song.tracks.insert(insert_at + k, child));
         }
@@ -879,7 +884,7 @@ impl AppData {
         // 外した後では引けない。
         // r.md #110: 対象は plugin / Parallel (中身ごと) / chain (Parallel の 1 本)。 host に
         // 居る plugin は「中に含まれる plugin 全部」なので、 先に展開しておく。
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let targets: Vec<(u64, u32)> = device_ids
             .iter()
             .filter_map(|&id| {
@@ -908,19 +913,19 @@ impl AppData {
             // 開いているインライン param パネルが **消す device を指していたら**
             // 閉じる (別 device を指しているなら触らない — id keyed なので
             // 「同トラックだから」で巻き込む必要が無い)。
-            if self.ui_ephemeral.open_video_fx_params == Some(device_id) {
-                self.ui_ephemeral.open_video_fx_params = None;
+            if self.cur.peph.open_video_fx_params == Some(device_id) {
+                self.cur.peph.open_video_fx_params = None;
             }
-            if self.ui_ephemeral.open_plugin_params == Some(device_id) {
-                self.ui_ephemeral.open_plugin_params = None;
+            if self.cur.peph.open_plugin_params == Some(device_id) {
+                self.cur.peph.open_plugin_params = None;
             }
             // video device 等 host に居ないものは host 側が no-op で無視する。
-            self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
+            self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
             // load に失敗した device は plugin_host に instance が無く
             // `SlotPluginUnloaded` が返って来ない。 「未ロード」 entry を
             // ここで落とさないと、 消したはずの device がインスペクタの
             // 失敗リストに残り続ける。
-            self.ipc.failed_plugin_loads.remove(&device_id);
+            self.cur.pipc.failed_plugin_loads.remove(&device_id);
             // cache から該当 entry を即時削除。 SlotPluginUnloaded event 到着前に
             // reconcile が走っても stale entry を見ないようにする防御策。
             self.forget_device_caches(device_id);
@@ -1037,8 +1042,8 @@ impl AppData {
     /// `shift_slot_gui_keys` は不変条件 1 が禁じる貼り替え補償コードだった)。
     #[cfg(windows)]
     pub(crate) fn cleanup_slot_gui(&mut self, device_id: u64) {
-        if self.ipc.open_plugin_guis.remove(&device_id) {
-            self.send_plugin(PluginCommand::CloseSlotGui { device_id });
+        if self.cur.pipc.open_plugin_guis.remove(&device_id) {
+            self.send_plugin(PluginCommand::CloseSlotGui { device: self.dev(device_id) });
         }
     }
 
@@ -1053,13 +1058,13 @@ impl AppData {
     pub(crate) fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
         // in-flight だった round-trip の応答が来た。 watchdog の deadline を
         // 解除する。 この後 queue に後続があれば dispatch_front_state_request が再武装する。
-        self.ipc.state_request_sent_at = None;
+        self.cur.pipc.state_request_sent_at = None;
         // live song の plugin state を最新化する (= dirty 判定の整合と、
         // Deferred の Undo snapshot が最新 knob を捕まえるため)。 queue が空
         // だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
         // 対象は live ではなく凍結 snapshot なので、 下の match 内で snapshot 側に
         // も別途適用する。
-        self.song_doc
+        self.cur.song_doc
             .write_back_plugin_state(|song| Self::apply_plugin_states_to(song, &states));
         // Phase 6 review (silent corruption fix): plugin_host 側で
         // `state_save()` が `Err` を返したエントリは `SlotState.error`
@@ -1082,7 +1087,7 @@ impl AppData {
                 }
                 // v29: device_id keyed。 ユーザー向けには (track, device) の
                 // 見える座標に逆引きして表示する (解決不能なら id を出す)。
-                match find_device_by_id(self.song_doc.song(), s.device_id) {
+                match find_device_by_id(self.cur.song_doc.song(), s.device_id) {
                     Some((track, index)) => {
                         msg.push_str(&format!("track {track} device {index}"));
                     }
@@ -1097,7 +1102,7 @@ impl AppData {
             tracing::error!(failed_count = failed.len(), %msg, "plugin state save failures");
             self.ui_ephemeral.status_message = msg;
         }
-        let Some(req) = self.ipc.pending_state_queue.pop_front() else {
+        let Some(req) = self.cur.pipc.pending_state_queue.pop_front() else {
             return;
         };
         match req {
@@ -1114,10 +1119,10 @@ impl AppData {
                 let snap_epoch = if snapshot.is_some() {
                     snap_epoch
                 } else {
-                    self.song_doc.edit_epoch()
+                    self.cur.song_doc.edit_epoch()
                 };
                 let mut snapshot =
-                    snapshot.unwrap_or_else(|| Box::new(self.song_doc.song().clone()));
+                    snapshot.unwrap_or_else(|| Box::new(self.cur.song_doc.song().clone()));
                 Self::apply_plugin_states_to(&mut snapshot, &states);
                 self.finish_save(snapshot, path, snap_epoch);
             }
@@ -1146,9 +1151,9 @@ impl AppData {
         // 新たな front が Save なら、 dispatch_front_state_request が **この瞬間**
         // (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、
         // その Save の snapshot は返ってくる state と同じ layout になる。
-        if !self.ipc.pending_state_queue.is_empty() {
+        if !self.cur.pipc.pending_state_queue.is_empty() {
             self.dispatch_front_state_request();
-        } else if let Some(action) = self.ui_ephemeral.guard_pending_action.take() {
+        } else if let Some(action) = self.cur.pipc.guard_pending_action.take() {
             // round-trip が全て drain した。 in-flight 中に保留していた
             // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
             // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。

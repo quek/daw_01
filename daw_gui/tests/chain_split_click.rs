@@ -28,7 +28,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
     let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
     let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
     let mut app = AppData::new(audio_tx, plugin_tx, None, None, event_dispatcher, job_dispatcher, None, None, 48_000);
-    let visible: Vec<u32> = app.song_doc.song().tracks.iter().map(|t| t.id).collect();
+    let visible: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
     let tid = visible[0];
     app.apply_select_tracks(tid, SelectModifier::Single, &visible);
     app.handle_event(AppEvent::AddParallel { chain: ChainRef::Track(tid), index: 0 });
@@ -89,16 +89,16 @@ fn inspector_glyphs(scene: &Scene, text: &str) -> Vec<(f32, f32)> {
 fn chain_mute_button_still_works_after_picking_three_bands_from_the_dropdown() {
     let (mut app, _audio_rx, _plugin_rx) = build_app();
     let mut host: UiHost<AppData> = UiHost::no_redraw();
-    let parallel_id = app.song_doc.song().tracks[0].devices[0].id();
+    let parallel_id = app.cur.song_doc.song().tracks[0].devices[0].id();
 
     // 分割前: chain 行の M が効く (基準)。
     let scene = frame(&mut host, &mut app, PointerFrame::default());
     let m = inspector_glyphs(&scene, "M");
     assert_eq!(m.len(), 1, "chain 1 本 = M ボタン 1 つ: {m:?}");
     click(&mut host, &mut app, m[0]);
-    assert!(app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted, "分割前の M");
+    assert!(app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted, "分割前の M");
     click(&mut host, &mut app, m[0]);
-    assert!(!app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted);
+    assert!(!app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted);
 
     // dropdown を開いて「3 bands」を選ぶ。
     let body = inspector_glyphs(&scene, "No split");
@@ -107,7 +107,7 @@ fn chain_mute_button_still_works_after_picking_three_bands_from_the_dropdown() {
     let item = glyph_centers(&scene, "3 bands");
     assert!(!item.is_empty(), "dropdown の一覧に 3 bands が出る");
     let scene = click(&mut host, &mut app, item[0]);
-    let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+    let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split, Split::DEFAULT_FREQUENCY3);
     assert_eq!(r.chains.len(), 3);
 
@@ -116,14 +116,14 @@ fn chain_mute_button_still_works_after_picking_three_bands_from_the_dropdown() {
     assert_eq!(m.len(), 3, "chain 3 本 = M ボタン 3 つ: {m:?}");
     for (k, pos) in m.iter().enumerate() {
         click(&mut host, &mut app, *pos);
-        let r = app.song_doc.song().parallel_by_id(parallel_id).unwrap();
+        let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
         assert!(r.chains[k].muted, "3 bands 後の chain {k} の M が効かない (pos {pos:?})");
     }
     // S も。
     let s = inspector_glyphs(&scene, "S");
     assert_eq!(s.len(), 3, "{s:?}");
     click(&mut host, &mut app, s[1]);
-    assert!(app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[1].solo, "3 bands 後の S");
+    assert!(app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[1].solo, "3 bands 後の S");
 }
 
 /// dropdown で split を選んだあとの流れをいくつか辿り、 どこで M が死ぬかを見る。
@@ -141,9 +141,9 @@ fn assert_first_mute_toggles(host: &mut UiHost<AppData>, app: &mut AppData, para
     let scene = frame(host, app, PointerFrame::default());
     let m = inspector_glyphs(&scene, "M");
     assert!(!m.is_empty(), "{ctx}: M が無い");
-    let before = app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted;
+    let before = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted;
     click(host, app, m[0]);
-    let after = app.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted;
+    let after = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].muted;
     assert_ne!(before, after, "{ctx}: chain 1 の M が効かない (pos {:?})", m[0]);
 }
 
@@ -151,11 +151,11 @@ fn assert_first_mute_toggles(host: &mut UiHost<AppData>, app: &mut AppData, para
 fn mute_works_after_switching_between_split_modes() {
     let (mut app, _a, _p) = build_app();
     let mut host: UiHost<AppData> = UiHost::no_redraw();
-    let parallel_id = app.song_doc.song().tracks[0].devices[0].id();
+    let parallel_id = app.cur.song_doc.song().tracks[0].devices[0].id();
     pick(&mut host, &mut app, "No split", "3 bands");
     assert_first_mute_toggles(&mut host, &mut app, parallel_id, "3 bands");
     pick(&mut host, &mut app, "3 bands", "Mid/Side");
-    assert_eq!(app.song_doc.song().parallel_by_id(parallel_id).unwrap().split, Split::MidSide);
+    assert_eq!(app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().split, Split::MidSide);
     assert_first_mute_toggles(&mut host, &mut app, parallel_id, "Mid/Side");
     pick(&mut host, &mut app, "Mid/Side", "No split");
     assert_first_mute_toggles(&mut host, &mut app, parallel_id, "No split");
@@ -167,7 +167,7 @@ fn mute_works_after_switching_between_split_modes() {
 fn mute_works_after_clicking_a_crossover_field() {
     let (mut app, _a, _p) = build_app();
     let mut host: UiHost<AppData> = UiHost::no_redraw();
-    let parallel_id = app.song_doc.song().tracks[0].devices[0].id();
+    let parallel_id = app.cur.song_doc.song().tracks[0].devices[0].id();
     let scene = pick(&mut host, &mut app, "No split", "3 bands");
     // 周波数欄 (200 Hz) を click → text 入力モード。 その後 M。
     let f = inspector_glyphs(&scene, "200");
@@ -180,7 +180,7 @@ fn mute_works_after_clicking_a_crossover_field() {
 fn mute_works_after_a_dropdown_is_dismissed_by_clicking_elsewhere() {
     let (mut app, _a, _p) = build_app();
     let mut host: UiHost<AppData> = UiHost::no_redraw();
-    let parallel_id = app.song_doc.song().tracks[0].devices[0].id();
+    let parallel_id = app.cur.song_doc.song().tracks[0].devices[0].id();
     pick(&mut host, &mut app, "No split", "3 bands");
     // dropdown を開いて、 一覧の外 (chain 行の M) を click → 閉じるだけ。 次の click で M が効く。
     let scene = frame(&mut host, &mut app, PointerFrame::default());

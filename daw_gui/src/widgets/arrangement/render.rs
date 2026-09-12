@@ -28,6 +28,10 @@ pub(super) fn dispatch(
     overlays: &Overlays,
     response: &ArrangementResponse,
 ) {
+    // §5.6: 別タブから運んできている payload (着地プレビューを描く)。
+    let xfer_payload = ui.drag_payload::<crate::app_types::ProjectTransferPayload>(
+        crate::app_types::PROJECT_XFER_DRAG_KIND,
+    );
     // ---- 描画 (heavy + cached + 動的 overlay) ----
     // M10 Phase 50: pending_reorder_hash を viewport_key に入れて、release frame の optimistic
     // preview で cache miss を強制 (新順序での再描画を 1 frame 遅延なく行う)。
@@ -145,7 +149,7 @@ pub(super) fn dispatch(
     // 換算は widget 側の `content_map` (content 原点 + ビューのズーム) が 1 本で行う。
     // SongTempo automation を持つ曲だけ曲線評価になる (無ければ定数 = 従来と同コスト)。
     // base とゴーストで **同じ写像** を使う (engine と同じ `event_wave_spans` の入力)。
-    let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
+    let tempo_map = common::audio_render::TempoMap::from_song(app.cur.song_doc.song());
     let clip_content = content_build::build_clip_content(app, &tempo_map, &f.visible_tracks);
     // r.md #68: Shift + 端 drag (= time-stretch) のときだけ、 ゴーストの中身を
     // commit と同じ `stretch_remap` + `event_wave_spans` で組み直す (Slice 配置 /
@@ -161,13 +165,14 @@ pub(super) fn dispatch(
 
     let heavy = HeavyInput {
         viewport_key_hash: hash_inputs(viewport_key),
+        xfer: xfer_payload,
         // 旧 `id_for_inner`。 heavy closure が `'static` を要求すると誤読して id を hash 化
         // していた名残だが、 hash 値そのものは `bar_beat_grid` / `time_ruler` の widget id に
         // 使われているので値は 1 bit も変えない。
         id_hash: hash_inputs(f.id),
         // r.md #58: フェードの掴む正方形を出す clip。 `response.hovered_clip` は
         // `cursor::hover` で **このフレーム中に** 確定済みなので、 caller 側ミラー
-        // (`app.ui_ephemeral.arrangement_hover_clip`、 1 フレーム遅れ) ではなくこちらを使う。
+        // (`app.cur.peph.arrangement_hover_clip`、 1 フレーム遅れ) ではなくこちらを使う。
         // **`viewport_key` にも `fold_arrangement_clip_hash` にも入れないこと。**
         hovered_clip: response.hovered_clip,
         // r.md #73: Alt hover 中の「曲げられる区間」。 `hovered_clip` と同じく
@@ -199,6 +204,9 @@ pub(super) fn dispatch(
 /// (`visible_tracks` / `tops` / `sections` / `selected_*` のスライス) は**入れない**。
 pub(super) struct HeavyInput {
     pub viewport_key_hash: u64,
+    /// `docs/plan_project_tabs.md` §5.6: 別タブから運んできている payload (着地プレビュー)。
+    /// **`viewport_key_hash` の材料にしない** (毎フレーム動くので cache が無意味になる)。
+    pub xfer: Option<std::sync::Arc<crate::app_types::ProjectTransferPayload>>,
     pub id_hash: u64,
     /// r.md #58: フェードの掴む正方形を出す clip。 `response.hovered_clip` の写し。
     /// **`viewport_key_hash` の材料にしてはいけない** (hover でアレンジ全体が再構築される)。
@@ -622,7 +630,6 @@ fn render_arrangement_heavy(
                 f.view,
                 lanes,
                 f.style,
-                f.visible_tracks.len(),
                 *bd,
                 *td,
                 overlays.clip_min_len,
@@ -631,6 +638,10 @@ fn render_arrangement_heavy(
             );
             // 範囲と一緒に動く automation クリップの断片 (Move のみ、関数内で判定)。
             draw_automation_drag_preview(hctx, nd, &f.rows, f.view, lanes, f.style, *bd, *td);
+        }
+        // §5.6: 別タブから運んできているクリップ / セル / トラックの着地プレビュー。
+        if let Some(p) = heavy.xfer.as_ref() {
+            xfer_ghost::draw(hctx, f, p);
         }
         // M14 Phase 63k (#025): audio_drag ghost overlay (drag 中の dB / fade preview + label)。
         // commit-by-release のため clip_rect_anchor + 計算済 outcome から preview rect / line を

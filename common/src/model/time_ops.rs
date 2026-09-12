@@ -11,6 +11,7 @@
 //! - 挿入点をまたぐ帯は挿入ぶん伸びる (帯の中に時間を差し込んだ = その帯が長くなる)。
 //! - 複製 / 貼り付けで運ぶ帯は、範囲に完全に入っていたものだけ (新 id で置く)。
 
+use super::{MediaManifest, MediaRemap};
 use super::*;
 
 /// 時間範囲 `[a, b)` の中身の写し。Cut Time / Paste Time が clipboard で運ぶ単位で、
@@ -29,6 +30,10 @@ pub struct TimeRangeCopy {
     pub automation: Vec<(u32, u32, AutomationClip)>,
     /// 参照している content の写し (`content_id` → (content, 共有名))。
     pub contents: HashMap<ContentId, (ClipContent, String)>,
+    /// content が参照する媒体 (音源 / 映像 / 画像) の写し。別プロジェクトへ貼るとき
+    /// `Song::import_media` で取り込む (無いと `source_id` が宙に浮いて殻だけ貼られる)。
+    #[serde(default, skip_serializing_if = "MediaManifest::is_empty")]
+    pub media: MediaManifest,
     pub scale_changes: Vec<ScaleChange>,
     /// 範囲に完全に入っていたセクション帯 (`id` は貼り先で採番し直す)。
     pub sections: Vec<Section>,
@@ -108,6 +113,7 @@ impl Song {
                 out.contents.insert(cid, (content.clone(), name));
             }
         }
+        out.media = self.media_manifest_for(out.contents.values().map(|(c, _)| c));
         out.scale_changes = self
             .scale_changes
             .iter()
@@ -194,6 +200,9 @@ impl Song {
         same_project: bool,
     ) -> Option<PastedTime> {
         let ripple = self.insert_time(at, copy.span_beats)?;
+        // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
+        let media_remap =
+            if same_project { MediaRemap::default() } else { self.import_media(&copy.media) };
         let mut remap: HashMap<ContentId, ContentId> = HashMap::new();
         let mut resolve = |song: &mut Song, cid: ContentId| -> Option<ContentId> {
             if let Some(&new) = remap.get(&cid) {
@@ -202,7 +211,9 @@ impl Song {
             let new = if same_project && song.clip_contents.contains_key(&cid) {
                 cid
             } else if let Some((content, name)) = copy.contents.get(&cid) {
-                song.alloc_content(content.clone(), name.clone())
+                let mut content = content.clone();
+                content.remap_media(&media_remap);
+                song.alloc_content(content, name.clone())
             } else if same_project {
                 // 写しにも現物にも無い (未採番 content の手組み Song 等)。 同じプロジェクト
                 // なら id をそのまま共有する (旧 `duplicate_section` と同じ)。

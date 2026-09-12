@@ -418,7 +418,7 @@ pub(super) fn overlays(
         let beat_delta =
             compute_clip_drag_beat_delta(nd, raw, &f.view.snap, f.zoom_x_px_per_beat);
         // track 方向は y→visible 行 index 解決の差 (per-track 行高 / lane 展開対応)。
-        let track_delta = compute_clip_drag_track_delta(nd, &f.tops);
+        let track_delta = compute_clip_drag_track_delta(nd, &f.tops, f.view.track_row_h);
         (nd.clone(), beat_delta, track_delta)
     });
 

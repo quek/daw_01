@@ -65,10 +65,11 @@ fn add_loaded_vocal_track(app: &mut daw_gui::app::AppData) {
         track.clips.push(clip);
         song.tracks.push(track);
     });
-    app.ipc.loaded_devices.insert(
+    app.cur.pipc.loaded_devices.insert(
         VOCAL_DEVICE_ID,
         LoadedDeviceInfo {
             plugin_id_str: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+            token: common::protocol::InstanceToken(1),
         },
     );
 }
@@ -128,8 +129,8 @@ fn transform_edit_does_not_resend_vocal_metadata() {
 #[test]
 fn group_transform_drag_is_one_undo_step() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let track_id = app.song_doc.song().tracks[0].id;
-    let before = app.song_doc.undo_depth();
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    let before = app.cur.song_doc.undo_depth();
 
     app.handle_event(AppEvent::BeginGroupTransformDrag);
     for i in 1..=8 {
@@ -142,15 +143,15 @@ fn group_transform_drag_is_one_undo_step() {
     app.handle_event(AppEvent::EndGroupTransformDrag);
 
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         before + 1,
         "8 フレームぶんの Transform scrub は 1 undo step に bracket される"
     );
     // 1 回の undo で drag 全体が巻き戻る (= 途中値が履歴に残らない)。
-    assert!(app.song_doc.can_undo());
+    assert!(app.cur.song_doc.can_undo());
     app.handle_event(AppEvent::Undo);
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         before,
         "1 回の undo で drag 前まで戻る"
     );

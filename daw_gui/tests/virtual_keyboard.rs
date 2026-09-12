@@ -39,10 +39,10 @@ fn drain_notes(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<(bool, u32, u8, 
     let mut v = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         match msg {
-            AudioCommand::PreviewNoteOn { track_id, pitch, velocity } => {
+            AudioCommand::PreviewNoteOn { project: _, track_id, pitch, velocity } => {
                 v.push((true, track_id, pitch, velocity));
             }
-            AudioCommand::PreviewNoteOff { track_id, pitch } => v.push((false, track_id, pitch, 0)),
+            AudioCommand::PreviewNoteOff { project: _, track_id, pitch } => v.push((false, track_id, pitch, 0)),
             _ => {}
         }
     }
@@ -51,8 +51,8 @@ fn drain_notes(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<(bool, u32, u8, 
 
 /// 先頭トラックをカーソル (選択) にする。 R は付けない。
 fn select_first_track(app: &mut AppData) -> u32 {
-    let track_id = app.song_doc.song().tracks[0].id;
-    app.selection.selected_track_ids = vec![track_id];
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    app.cur.selection.selected_track_ids = vec![track_id];
     assert_eq!(app.virtual_keyboard_target_track(), Some(track_id));
     track_id
 }
@@ -122,7 +122,7 @@ fn 押すと選択トラックで鳴り_離すと止まる() {
 #[test]
 fn 選択トラックが無ければ鳴らない() {
     let (mut app, mut audio_rx, _p) = build_app();
-    app.selection.selected_track_ids.clear();
+    app.cur.selection.selected_track_ids.clear();
     open(&mut app);
     let _ = drain_notes(&mut audio_rx);
     app.handle_event(key('Z', true));
@@ -140,13 +140,13 @@ fn 押下中にカーソルを移しても鳴らしたトラックで止まる()
     let (mut app, mut audio_rx, _p) = build_app();
     let first = select_first_track(&mut app);
     app.handle_event(AppEvent::AddInstrumentTrack);
-    let second = app.song_doc.song().tracks.iter().map(|t| t.id).find(|id| *id != first).expect("2 本目");
-    app.selection.selected_track_ids = vec![first];
+    let second = app.cur.song_doc.song().tracks.iter().map(|t| t.id).find(|id| *id != first).expect("2 本目");
+    app.cur.selection.selected_track_ids = vec![first];
     open(&mut app);
     let _ = drain_notes(&mut audio_rx);
 
     app.handle_event(key('Z', true));
-    app.selection.selected_track_ids = vec![second];
+    app.cur.selection.selected_track_ids = vec![second];
     app.handle_event(key('X', true));
     app.handle_event(key('Z', false));
     app.handle_event(key('X', false));
@@ -278,12 +278,12 @@ fn 録音中はカーソルトラックが_r_ならクリップに書き込ま�
     app.handle_event(AppEvent::ToggleTrackArmed(track_id));
     open(&mut app);
     app.handle_event(AppEvent::ToggleMidiRecording);
-    app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: true, recording_live: true });
     app.handle_event(key('Q', true));
     // 120 BPM / 48kHz で 1 拍 = 24000 サンプル。
-    app.handle_event(AppEvent::Tick { samples: 24_000, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 24_000, preroll: 0, playing: true, recording_live: true });
     app.handle_event(key('Q', false));
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let clip = &song.tracks[0].clips[0];
     let notes = match song.clip_contents.get(&clip.content_id).expect("content") {
         common::model::ClipContent::Midi(m) => &m.notes,
@@ -301,18 +301,18 @@ fn 録音中でもカーソルトラックが_r_でなければ書き込まな�
     let (mut app, mut audio_rx, _p) = build_app();
     let first = select_first_track(&mut app);
     app.handle_event(AppEvent::AddInstrumentTrack);
-    let second = app.song_doc.song().tracks.iter().map(|t| t.id).find(|id| *id != first).expect("2 本目");
+    let second = app.cur.song_doc.song().tracks.iter().map(|t| t.id).find(|id| *id != first).expect("2 本目");
     // R は 2 本目、 カーソルは 1 本目。
     app.handle_event(AppEvent::ToggleTrackArmed(second));
-    app.selection.selected_track_ids = vec![first];
+    app.cur.selection.selected_track_ids = vec![first];
     open(&mut app);
     app.handle_event(AppEvent::ToggleMidiRecording);
-    app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: true, recording_live: true });
     let _ = drain_notes(&mut audio_rx);
     app.handle_event(key('Q', true));
-    app.handle_event(AppEvent::Tick { samples: 24_000, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 24_000, preroll: 0, playing: true, recording_live: true });
     app.handle_event(key('Q', false));
     assert_eq!(drain_notes(&mut audio_rx), vec![(true, first, 60, 100), (false, first, 60, 0)]);
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert!(song.tracks.iter().all(|t| t.clips.is_empty()), "どのトラックにも書き込まない");
 }

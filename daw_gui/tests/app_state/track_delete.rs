@@ -23,12 +23,12 @@ use super::support::{build_app, load_instrument, select_track_single};
 
 /// 可視順 = 現在の `song.tracks` 順 (テスト song は group 折り畳み無し)。
 fn visible_ids(app: &AppData) -> Vec<u32> {
-    app.song_doc.song().tracks.iter().map(|t| t.id).collect()
+    app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect()
 }
 
 /// `n` 本になるまでトラックを足して id 列を返す (初期 song は 1 本)。
 fn ensure_tracks(app: &mut AppData, n: usize) -> Vec<u32> {
-    while app.song_doc.song().tracks.len() < n {
+    while app.cur.song_doc.song().tracks.len() < n {
         app.handle_event(AppEvent::AddInstrumentTrack);
     }
     visible_ids(app)
@@ -98,7 +98,7 @@ fn header_click_makes_tracks_the_delete_surface() {
         "ヘッダ click 直後はトラック面が Delete の対象"
     );
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![ids[1]],
         "click したトラックだけが選択される"
     );
@@ -116,14 +116,14 @@ fn delete_tracks_removes_all_selected_in_one_undo_step() {
     app.apply_select_tracks(ids[1], SelectModifier::Single, &visible);
     app.apply_select_tracks(ids[2], SelectModifier::RangeFromAnchor, &visible);
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![ids[1], ids[2]],
         "Shift+click でアンカーからの範囲が選択される"
     );
 
-    let depth_before = app.song_doc.undo_depth();
+    let depth_before = app.cur.song_doc.undo_depth();
     app.handle_event(AppEvent::DeleteTracks(
-        app.selection.selected_track_ids.clone(),
+        app.cur.selection.selected_track_ids.clone(),
     ));
 
     assert_eq!(
@@ -132,12 +132,12 @@ fn delete_tracks_removes_all_selected_in_one_undo_step() {
         "選択した 2 本がまとめて消える"
     );
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         depth_before + 1,
         "N 本消しても undo は 1 ステップ (1 event = 1 gesture の squash)"
     );
 
-    assert!(app.song_doc.undo(), "undo できる");
+    assert!(app.cur.song_doc.undo(), "undo できる");
     assert_eq!(visible_ids(&app), ids, "Undo 1 回で 2 本とも戻る");
 }
 
@@ -170,8 +170,8 @@ fn delete_tracks_handles_group_and_its_child_selected_together() {
 fn delete_tracks_ignores_ids_not_in_the_song() {
     let (mut app, _a, _p, _d) = build_app();
     ensure_tracks(&mut app, 2);
-    app.song_doc.mark_saved();
-    let depth_before = app.song_doc.undo_depth();
+    app.cur.song_doc.mark_saved();
+    let depth_before = app.cur.song_doc.undo_depth();
     let before = visible_ids(&app);
 
     app.handle_event(AppEvent::DeleteTracks(vec![
@@ -181,11 +181,11 @@ fn delete_tracks_ignores_ids_not_in_the_song() {
 
     assert_eq!(visible_ids(&app), before, "トラックは 1 本も消えない");
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         depth_before,
         "死んだ undo step を積まない"
     );
-    assert!(!app.song_doc.is_dirty(), "dirty 化もしない");
+    assert!(!app.cur.song_doc.is_dirty(), "dirty 化もしない");
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ fn clip_selection_never_targets_the_track_surface() {
         additive: false,
     });
     assert!(
-        !app.selection.selected_track_ids.is_empty(),
+        !app.cur.selection.selected_track_ids.is_empty(),
         "クリップ選択は暗黙にトラックも選ぶ (前提の確認)"
     );
     assert_eq!(
@@ -224,7 +224,7 @@ fn clip_selection_never_targets_the_track_surface() {
         "範囲の中のクリップは消える"
     );
     assert!(
-        !app.selection.selected_track_ids.is_empty(),
+        !app.cur.selection.selected_track_ids.is_empty(),
         "クリップを消してもトラック選択は残る (= 危険な前提が生きている)"
     );
 
@@ -291,7 +291,7 @@ fn header_click_after_a_clip_selection_moves_the_surface_to_tracks() {
         "ヘッダ click は last-wins でトラック面を取り返す"
     );
     app.handle_event(AppEvent::DeleteTracks(
-        app.selection.selected_track_ids.clone(),
+        app.cur.selection.selected_track_ids.clone(),
     ));
     assert_eq!(visible_ids(&app), vec![ids[0]], "選んだトラックが消える");
 }
@@ -311,7 +311,7 @@ fn delete_reselects_the_adjacent_track_not_the_last_one() {
 
     assert_eq!(visible_ids(&app), vec![ids[0], ids[2], ids[3]]);
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![ids[2]],
         "削除位置に繰り上がった隣接トラックが選ばれる (末尾 ids[3] ではない)"
     );
@@ -327,7 +327,7 @@ fn deleting_the_last_track_reselects_the_one_above() {
     app.delete_current_surface(false);
 
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![ids[1]],
         "末尾を消したら直前のトラック"
     );
@@ -416,19 +416,20 @@ fn deferred_delete_removes_all_selected_in_one_roundtrip_and_one_undo_step() {
     assert_eq!(app.edit_surface(false), Some(EditSurface::Tracks));
 
     let before = visible_ids(&app);
-    let depth_before = app.song_doc.undo_depth();
+    let depth_before = app.cur.song_doc.undo_depth();
     app.delete_current_surface(false);
 
     // まだ消えない (state round-trip 待ち)。 enqueue は 1 件だけ。
     assert_eq!(visible_ids(&app), before, "応答前は song 未変更");
     assert_eq!(
-        app.ipc.pending_state_queue.len(),
+        app.cur.pipc.pending_state_queue.len(),
         1,
         "複数トラックでも deferred は 1 件にまとまる (undo 分裂を防ぐ)"
     );
 
     // plugin host からの応答で実行。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates {
+        project: app.pk(),
         entries: Vec::new(),
     }));
 
@@ -438,11 +439,11 @@ fn deferred_delete_removes_all_selected_in_one_roundtrip_and_one_undo_step() {
         "応答後に選択した 2 本がまとめて消える"
     );
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         depth_before + 1,
         "deferred でも undo は 1 ステップ"
     );
-    assert!(app.song_doc.undo(), "undo できる");
+    assert!(app.cur.song_doc.undo(), "undo できる");
     assert_eq!(visible_ids(&app), before, "Undo 1 回で 2 本とも戻る");
 }
 
@@ -452,8 +453,8 @@ fn deferred_delete_removes_all_selected_in_one_roundtrip_and_one_undo_step() {
 fn deferred_delete_captures_plugin_state_before_removing() {
     let (mut app, _a, _p, _d) = build_app();
     load_instrument(&mut app);
-    let target_id = app.song_doc.song().tracks[0].id;
-    let device_id = daw_gui::app::device_id_at(app.song_doc.song(), target_id, 0)
+    let target_id = app.cur.song_doc.song().tracks[0].id;
+    let device_id = daw_gui::app::device_id_at(app.cur.song_doc.song(), target_id, 0)
         .expect("instrument device");
     ensure_tracks(&mut app, 2);
 
@@ -464,6 +465,7 @@ fn deferred_delete_captures_plugin_state_before_removing() {
     // round-trip の応答に「今の state」 を載せる。 削除前に Song へ書き戻されるので
     // Undo で復元した track の device state に現れる。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates {
+        project: app.pk(),
         entries: vec![common::protocol::SlotState {
             device_id,
             data: Some(b"knob-turned".to_vec()),
@@ -476,9 +478,9 @@ fn deferred_delete_captures_plugin_state_before_removing() {
         "応答後に対象トラックが消える"
     );
 
-    assert!(app.song_doc.undo(), "undo できる");
+    assert!(app.cur.song_doc.undo(), "undo できる");
     let restored = app
-        .song_doc
+        .cur.song_doc
         .song()
         .track_by_id(target_id)
         .expect("undo でトラックが戻る");
@@ -515,7 +517,7 @@ fn master_row_selection_does_not_capture_the_delete_surface() {
     );
 
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![common::model::MASTER_TRACK_ID],
         "選択表示のために集合には入る (マスターのインスペクタ対象)"
     );
@@ -591,7 +593,7 @@ fn hovering_an_empty_automation_lane_does_not_block_track_delete() {
 
     select_track_single(&mut app, 1);
     // lane 本体に hover しているだけ (点も automation clip も未選択)。
-    app.ui_ephemeral.arrange_hovered_automation_lane =
+    app.cur.peph.arrange_hovered_automation_lane =
         Some(common::model::AutomationLaneKey { track: ids[1], lane: 1 });
 
     assert_eq!(
@@ -624,7 +626,7 @@ fn shift_click_upwards_puts_the_cursor_on_the_clicked_track() {
         Some(ids[1]),
         "cursor は click したトラック (範囲下端 ids[3] ではない)"
     );
-    let mut selected = app.selection.selected_track_ids.clone();
+    let mut selected = app.cur.selection.selected_track_ids.clone();
     selected.sort_unstable();
     let mut expected = vec![ids[1], ids[2], ids[3]];
     expected.sort_unstable();

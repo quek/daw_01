@@ -68,7 +68,7 @@ fn fixture(layout: LauncherLayout) -> Fixture {
         48_000,
     );
     let proj = TempDir::new().unwrap();
-    app.song_doc.file_path = Some(proj.path().join("proj.daw"));
+    app.cur.song_doc.file_path = Some(proj.path().join("proj.daw"));
     app.edit_song(|song| {
         song.tracks.clear();
         for id in 1..=2u32 {
@@ -80,11 +80,11 @@ fn fixture(layout: LauncherLayout) -> Fixture {
         }
         song.ids.next_track_id = 3;
     });
-    app.ui_prefs.arrange_header_w = HEADER_W;
-    app.ui_prefs.arrange_scroll_beat = 0.0;
-    app.ui_prefs.arrange_track_top = 0.0;
-    app.ui_prefs.launcher_layout = layout;
-    app.ui_prefs.launcher_width = PANE_W;
+    app.cur.view.arrange_header_w = HEADER_W;
+    app.cur.view.arrange_scroll_beat = 0.0;
+    app.cur.view.arrange_track_top = 0.0;
+    app.cur.view.launcher_layout = layout;
+    app.cur.view.launcher_width = PANE_W;
     let wav = write_wav(proj.path(), "loop.wav", 48_000);
     Fixture {
         app,
@@ -143,7 +143,7 @@ impl Fixture {
 
     /// (トラック数, アレンジのクリップ総数, セルの総数)。
     fn placement(&self) -> (usize, usize, usize) {
-        let song = self.app.song_doc.song();
+        let song = self.app.cur.song_doc.song();
         (
             song.tracks.len(),
             song.tracks.iter().map(|t| t.clips.len()).sum(),
@@ -184,7 +184,7 @@ fn 帯の行より下の余白へのdropは新トラックのセルになる() {
     let x = grid.x + resp.launcher.col_w * 0.5;
     fx.drop_wav_at((x, y));
     assert_eq!(fx.placement(), (3, 0, 1), "(トラック数, アレンジのクリップ数, セル数)");
-    let new_track = fx.app.song_doc.song().tracks.last().unwrap();
+    let new_track = fx.app.cur.song_doc.song().tracks.last().unwrap();
     assert_eq!(new_track.session_clips.len(), 1);
     assert_eq!(new_track.clips.len(), 0);
 }
@@ -200,7 +200,7 @@ fn ランチャーのみレイアウトでも余白へのdropは新トラック�
     let x = grid.x + resp.launcher.col_w * 1.5;
     fx.drop_wav_at((x, y));
     assert_eq!(fx.placement(), (3, 0, 1), "(トラック数, アレンジのクリップ数, セル数)");
-    let song = fx.app.song_doc.song();
+    let song = fx.app.cur.song_doc.song();
     let cell = &song.tracks.last().unwrap().session_clips[0];
     let scene_index = song.scenes.iter().position(|s| s.id == cell.scene_id);
     assert_eq!(scene_index, Some(1), "落とした列 (2 列目) のセルに入る");

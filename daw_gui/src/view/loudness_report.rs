@@ -103,7 +103,7 @@ fn clamp_fully_visible(r: Rect, screen: Rect) -> Rect {
 pub fn window_rect(app: &AppData, screen: Rect) -> Rect {
     let r = app.ui_prefs.loudness_report_rect.unwrap_or_else(|| default_rect(screen));
     let r = clamp_to_screen(r, screen);
-    if app.loudness.phase.is_busy() {
+    if app.cur.loudness.phase.is_busy() {
         clamp_fully_visible(r, screen)
     } else {
         r
@@ -118,7 +118,7 @@ pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.loudness_report_open {
         return;
     }
-    if app.loudness.phase.is_busy() {
+    if app.cur.loudness.phase.is_busy() {
         ui.reserve_floating_region(screen);
     } else {
         ui.reserve_floating_region(window_rect(app, screen));
@@ -131,7 +131,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
         return;
     }
     ui.with_floating_region(|ui| {
-        if app.loudness.phase.is_busy() {
+        if app.cur.loudness.phase.is_busy() {
             // 背景の暗転。入力は reserve が既に落としているので、これは
             // 「触れない」ことを見せるためだけの層。
             ui.push_rect(RectCommand {
@@ -155,7 +155,7 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     let mut commit = false;
     // 走査中は動かせない (暗転で全遮断しているので、窓だけ動かせると
     // 「遮断しているのに動く」という矛盾した見え方になる)。
-    let busy = app.loudness.phase.is_busy();
+    let busy = app.cur.loudness.phase.is_busy();
 
     if !busy {
         let title_drag = Rect {
@@ -215,7 +215,7 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
 
 fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     let p = &app.theme.core;
-    let busy = app.loudness.phase.is_busy();
+    let busy = app.cur.loudness.phase.is_busy();
 
     ui.push_rect(RectCommand {
         rect,
@@ -275,10 +275,10 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 /// 1 行目: 測った範囲 + 状態 + ボタン。
 fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) -> f32 {
     let p = &app.theme.core;
-    let busy = app.loudness.phase.is_busy();
-    let time_sig = app.song_doc.song().time_sig;
+    let busy = app.cur.loudness.phase.is_busy();
+    let time_sig = app.cur.song_doc.song().time_sig;
 
-    let text = match app.loudness.report.as_ref() {
+    let text = match app.cur.loudness.report.as_ref() {
         Some(r) => format!(
             "範囲 {} – {} ({:.1} 秒)",
             bar_beat(r.range_start_beat, time_sig),
@@ -294,7 +294,7 @@ fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) 
     let bw = 92.0;
     let bx = rect.x + rect.w - PAD - bw;
     if busy {
-        let label = if matches!(app.loudness.phase, LoudnessPhase::Cancelling) {
+        let label = if matches!(app.cur.loudness.phase, LoudnessPhase::Cancelling) {
             "中止中..."
         } else {
             "中止"
@@ -310,7 +310,7 @@ fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) 
                 app.handle_event(AppEvent::AnalyzeLoudness)
             }));
         }
-        if app.loudness.report.is_some() {
+        if app.cur.loudness.report.is_some() {
             let rx = bx - bw - 6.0;
             if ui.button_at_clicked(
                 "loudness_rerun",
@@ -326,7 +326,7 @@ fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) 
 
     // 古い / 失敗の表示 (2 行目相当、範囲テキストの下)。
     let note_y = y + BTN_H + 2.0;
-    if let Some(err) = app.loudness.error.as_ref() {
+    if let Some(err) = app.cur.loudness.error.as_ref() {
         ui.label_at("loudness_err", err, rect.x + PAD, note_y, 11.0, p.text_error);
     } else if app.loudness_report_stale() {
         ui.label_at(
@@ -344,10 +344,10 @@ fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) 
 /// 進捗バー。
 fn draw_progress(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) -> f32 {
     let p = &app.theme.core;
-    let (frac, label) = match app.loudness.phase {
+    let (frac, label) = match app.cur.loudness.phase {
         LoudnessPhase::AwaitingReinit { .. } => (0.0, "プラグインを初期化中...".to_string()),
         _ => {
-            let f = app.loudness.report.as_ref().map_or(0.0, |r| r.progress());
+            let f = app.cur.loudness.report.as_ref().map_or(0.0, |r| r.progress());
             (f, format!("解析中 {:.0}%", f * 100.0))
         }
     };
@@ -368,7 +368,7 @@ fn draw_progress(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) ->
 /// 数値表。位置を持つ行は「@ 12.3s」ボタンでその位置へ飛べる。
 fn draw_values(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) -> f32 {
     let p = &app.theme.core;
-    let Some(r) = app.loudness.report.as_ref() else {
+    let Some(r) = app.cur.loudness.report.as_ref() else {
         ui.label_at(
             "loudness_empty",
             "「解析...」で範囲を選ぶと、その区間のラウドネスを全速で測ります。",
@@ -524,7 +524,7 @@ fn draw_presets(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) -> 
     ui.label_at("lr_preset_label", "目標", rect.x + PAD, y + 4.0, 12.0, p.text_dim);
     let target = app.ui_prefs.meter_settings.loudness_target_lufs;
     let ceiling = app.ui_prefs.meter_settings.loudness_true_peak_ceiling_dbtp;
-    let report = app.loudness.report.as_ref();
+    let report = app.cur.loudness.report.as_ref();
 
     let mut x = rect.x + PAD + 40.0;
     let avail = rect.x + rect.w - PAD - x;
@@ -580,7 +580,7 @@ fn draw_graphs(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) {
     if h < GRAPH_MIN_H {
         return;
     }
-    let Some(r) = app.loudness.report.as_ref() else {
+    let Some(r) = app.cur.loudness.report.as_ref() else {
         return;
     };
     let target = app.ui_prefs.meter_settings.loudness_target_lufs;

@@ -127,7 +127,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     let notes = build_widget_notes(app, &shown, Some(target.track_id));
     let zoom_x = app.pianoroll_zoom_x().max(4.0);
     let zoom_y = app.pianoroll_zoom_y().max(6.0);
-    let loop_range = app.transport.loop_region.range();
+    let loop_range = app.cur.transport.loop_region.range();
     // piano roll を song-absolute 座標系に統一。clip.start_beat を唯一の絶対オフセット SSoT とし、
     // view 入口で加算 (ruler/grid/playhead/loop が曲の絶対小節位置)、note の model 書き戻し出口で
     // 減算する (note は共有 content のため clip-local 保持)。
@@ -135,7 +135,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     // scroll 基準 / scale 判定) は clip の窓の開始 = `start_beat`。両者は左端 trim した
     // clip で食い違うので別々に持つ。
     let target_clip = app
-        .song_doc
+        .cur.song_doc
         .song()
         .track_by_id(target.track_id)
         .and_then(|t| t.clip_by_id(target.clip_id));
@@ -152,7 +152,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         let earliest = shown
             .iter()
             .filter_map(|r| {
-                app.song_doc
+                app.cur.song_doc
                     .song()
                     .track_by_id(r.track_id)
                     .and_then(|t| t.clip_by_id(r.clip_id))
@@ -182,14 +182,14 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         playhead_beat: app.editor_playhead_beat(target),
         home_beat: app.editor_home_beat(target),
         ruler_h: RULER_H,
-        bpm: app.song_doc.song().bpm,
-        time_sig: app.song_doc.song().time_sig,
+        bpm: app.cur.song_doc.song().bpm,
+        time_sig: app.cur.song_doc.song().time_sig,
         snap: snap_cfg,
         sub_grid_interval_beats: snap::subgrid_interval_beats(snap_cfg, zoom_x),
         loop_range,
         scale,
-        snap_pitch_during_drag: app.ui_prefs.snap_on_draw,
-        default_note_len_beats: app.ui_prefs.last_note_duration_beats,
+        snap_pitch_during_drag: app.cur.view.snap_on_draw,
+        default_note_len_beats: app.cur.view.last_note_duration_beats,
     };
 
     // 各表示クリップ (clip_slot 順) の song-absolute 開始拍。emit が widget の song-absolute
@@ -197,7 +197,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     let clip_starts: Vec<f64> = shown
         .iter()
         .map(|r| {
-            app.song_doc
+            app.cur.song_doc
                 .song()
                 .track_by_id(r.track_id)
                 .and_then(|t| t.clip_by_id(r.clip_id))
@@ -244,7 +244,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
 pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipKey], target_track: Option<u32>) -> Vec<Note> {
     let mut out: Vec<Note> = Vec::new();
     for (clip_slot, &r) in shown.iter().enumerate() {
-        let Some(track) = app.song_doc.song().track_by_id(r.track_id) else {
+        let Some(track) = app.cur.song_doc.song().track_by_id(r.track_id) else {
             continue;
         };
         let Some(clip) = track.clip_by_id(r.clip_id) else {
@@ -258,7 +258,7 @@ pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipKey], target_track:
         // r.md #44: note は content-local なので song-absolute 化は content 原点基準
         // (左端 trim した clip でも note は song 上の同じ位置に描かれる)。
         let clip_start = clip.content_origin_beat();
-        for (i, n) in app.song_doc.song().clip_notes(clip).iter().enumerate() {
+        for (i, n) in app.cur.song_doc.song().clip_notes(clip).iter().enumerate() {
             out.push(Note {
                 id: AppData::pack_note_id(clip_slot, i),
                 // song-absolute 化: clip-local note + clip 開始位置。

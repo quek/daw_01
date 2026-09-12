@@ -98,8 +98,13 @@ pub struct ShortcutDef {
 /// ここに 1 行足すだけで「キー登録」と「F1 一覧」の両方に反映される。
 pub static SHORTCUTS: &[ShortcutDef] = &[
     // ----- ファイル -----
-    ShortcutDef { name: "new", keys: &["Ctrl+N"], category: ShortcutCategory::File, description: "新規プロジェクト", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
-    ShortcutDef { name: "open", keys: &["Ctrl+O"], category: ShortcutCategory::File, description: "プロジェクトを開く", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "new", keys: &["Ctrl+N"], category: ShortcutCategory::File, description: "新しいタブに新規プロジェクト", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "open", keys: &["Ctrl+O"], category: ShortcutCategory::File, description: "プロジェクトを開く (新しいタブ)", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    // `docs/plan_project_tabs.md` §5.3: プロジェクトタブ。Ctrl+Tab はドラッグ中も効く
+    // (運んでいるクリップを別タブへ持ち込む、Q10)。
+    ShortcutDef { name: "daw.tab_next", keys: &["Ctrl+Tab"], category: ShortcutCategory::File, description: "次のプロジェクトタブへ", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.tab_prev", keys: &["Ctrl+Shift+Tab"], category: ShortcutCategory::File, description: "前のプロジェクトタブへ", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
+    ShortcutDef { name: "daw.tab_close", keys: &["Ctrl+W"], category: ShortcutCategory::File, description: "プロジェクトタブを閉じる", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "save", keys: &["Ctrl+S"], category: ShortcutCategory::File, description: "保存", hidden: false, forward_from_external_window: true, typing_only: false, repeatable: false },
     ShortcutDef { name: "save_as", keys: &["Ctrl+Shift+S"], category: ShortcutCategory::File, description: "名前を付けて保存", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },
     ShortcutDef { name: "daw.export_wav", keys: &["Ctrl+E"], category: ShortcutCategory::File, description: "WAV 書き出し", hidden: false, forward_from_external_window: false, typing_only: false, repeatable: false },

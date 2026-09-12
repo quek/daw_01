@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::shutdown::QuitRequest;
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, ExportStage};
+use daw_gui::event_tabs::TabEvent;
 
 use super::support::{self, drain, load_instrument};
 
@@ -56,13 +57,13 @@ fn hang_during_save_and_quit_reasks_the_guard() {
 
     let (mut app, _rx) = build_app();
     load_instrument(&mut app);
-    app.song_doc.file_path = Some(path.clone());
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.file_path = Some(path.clone());
+    app.cur.song_doc.normalize(|_| {});
     app.request_close();
 
     // 「保存して終了」: plugin 有りなので state 取得待ちの非同期保存 (round-trip in flight)。
     app.handle_event(AppEvent::DirtyGuardSave);
-    assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
+    assert!(!app.cur.pipc.pending_state_queue.is_empty(), "save round-trip in flight");
     assert_eq!(
         app.ui_ephemeral.guard_after_save,
         Some(DirtyGuardAction::Quit(QuitRequest::USER)),
@@ -72,7 +73,7 @@ fn hang_during_save_and_quit_reasks_the_guard() {
     // 閾値前は何もしない (slow render / busy host を誤って中止しない)。
     app.poll_state_roundtrip_watchdog(Instant::now() + Duration::from_secs(5));
     assert!(
-        !app.ipc.pending_state_queue.is_empty(),
+        !app.cur.pipc.pending_state_queue.is_empty(),
         "watchdog must not fire before the timeout"
     );
     assert_eq!(
@@ -84,7 +85,7 @@ fn hang_during_save_and_quit_reasks_the_guard() {
     // 応答が来ないまま閾値超過 → watchdog 発火で脱出。
     app.poll_state_roundtrip_watchdog(far_future());
     assert!(
-        app.ipc.pending_state_queue.is_empty(),
+        app.cur.pipc.pending_state_queue.is_empty(),
         "stale state-request queue cleared by watchdog"
     );
     assert!(
@@ -115,7 +116,7 @@ fn hang_during_deferred_edit_aborts_without_applying_edit() {
     load_instrument(&mut app); // plugin あり → DeleteTracks は deferred round-trip。
     // id は必ず採番し直す (clone のまま push すると同 id が 2 本並び、 安定 id での
     // 削除が意図しない方を指す)。
-    let extra = app.song_doc.song().tracks[0].clone();
+    let extra = app.cur.song_doc.song().tracks[0].clone();
     let target_id = app
         .edit_song(|song| {
             let id = song.alloc_track_id();
@@ -125,34 +126,34 @@ fn hang_during_deferred_edit_aborts_without_applying_edit() {
             id
         })
         .expect("edit_song");
-    let track_count = app.song_doc.song().tracks.len();
+    let track_count = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::DeleteTracks(vec![target_id]));
     assert!(
-        !app.ipc.pending_state_queue.is_empty(),
+        !app.cur.pipc.pending_state_queue.is_empty(),
         "deferred delete round-trip in flight"
     );
 
-    // round-trip 中に Open Recent → 完了まで保留。
-    let target = std::path::PathBuf::from("C:/some/other.daw");
-    app.handle_event(AppEvent::OpenRecent(target.clone()));
+    // round-trip 中にタブを閉じる → 完了まで保留。
+    let key = app.pk();
+    app.handle_event(AppEvent::Tab(TabEvent::Close(key)));
     assert_eq!(
-        app.ui_ephemeral.guard_pending_action,
-        Some(DirtyGuardAction::OpenPath(target)),
-        "Open deferred until the queue drains"
+        app.cur.pipc.guard_pending_action,
+        Some(DirtyGuardAction::CloseTabs(vec![key])),
+        "close deferred until the queue drains"
     );
 
     // host hang → watchdog 発火。
     app.poll_state_roundtrip_watchdog(far_future());
-    assert!(app.ipc.pending_state_queue.is_empty(), "queue cleared");
+    assert!(app.cur.pipc.pending_state_queue.is_empty(), "queue cleared");
     assert!(
-        app.ui_ephemeral.guard_pending_action.is_none(),
+        app.cur.pipc.guard_pending_action.is_none(),
         "stuck queue-drain action dropped"
     );
     // 削除は完了ハンドラ (on_all_states_from_child) でしか実行されない。 watchdog は
     // それを呼ばないので track は残る (= データ破壊しない)。
     assert_eq!(
-        app.song_doc.song().tracks.len(),
+        app.cur.song_doc.song().tracks.len(),
         track_count,
         "deferred delete was NOT applied (project intact)"
     );
@@ -162,13 +163,13 @@ fn hang_during_deferred_edit_aborts_without_applying_edit() {
 #[test]
 fn watchdog_is_noop_when_no_roundtrip_in_flight() {
     let (mut app, _rx) = build_app();
-    assert!(app.ipc.pending_state_queue.is_empty());
+    assert!(app.cur.pipc.pending_state_queue.is_empty());
 
     app.poll_state_roundtrip_watchdog(far_future());
 
-    assert!(app.ipc.pending_state_queue.is_empty());
+    assert!(app.cur.pipc.pending_state_queue.is_empty());
     assert!(app.ui_ephemeral.guard_after_save.is_none());
-    assert!(app.ui_ephemeral.guard_pending_action.is_none());
+    assert!(app.cur.pipc.guard_pending_action.is_none());
     assert!(app.ui_ephemeral.status_message.is_empty(), "no spurious notification");
 }
 
@@ -182,33 +183,33 @@ fn watchdog_suppressed_during_export_then_fires_after() {
 
     let (mut app, _rx) = build_app();
     load_instrument(&mut app);
-    app.song_doc.file_path = Some(path.clone());
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.file_path = Some(path.clone());
+    app.cur.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::Save);
-    assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
+    assert!(!app.cur.pipc.pending_state_queue.is_empty(), "save round-trip in flight");
 
     // export 進行中を模す。 閾値を遥かに超えても抑制される。
-    app.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+    app.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
     app.poll_state_roundtrip_watchdog(far_future());
     assert!(
-        !app.ipc.pending_state_queue.is_empty(),
+        !app.cur.pipc.pending_state_queue.is_empty(),
         "watchdog must not fire while an export gates the response"
     );
 
     // video export の音声前段 (export_stage 未設定でも pending_video_export で gate) も抑制。
-    app.transport.export_stage = None;
-    app.transport.pending_video_export = Some(std::path::PathBuf::from("C:/out.mp4"));
+    app.cur.transport.export_stage = None;
+    app.cur.transport.pending_video_export = Some(std::path::PathBuf::from("C:/out.mp4"));
     app.poll_state_roundtrip_watchdog(far_future());
     assert!(
-        !app.ipc.pending_state_queue.is_empty(),
+        !app.cur.pipc.pending_state_queue.is_empty(),
         "watchdog also suppressed while a video export is pending"
     );
 
     // gate 解除後は、 真に応答が来ない round-trip を改めて閾値超過で reap する。
-    app.transport.pending_video_export = None;
+    app.cur.transport.pending_video_export = None;
     app.poll_state_roundtrip_watchdog(far_future());
     assert!(
-        app.ipc.pending_state_queue.is_empty(),
+        app.cur.pipc.pending_state_queue.is_empty(),
         "watchdog fires once the export gate is lifted"
     );
 }
@@ -226,25 +227,26 @@ fn roundtrip_with_no_plugin_host_aborts_immediately() {
     load_instrument(&mut app); // song_has_plugin() == true。
     // crash 後 respawn 断念で host が居ない状況を模す (plugin_tx=None、 song は plugin 保持)。
     app.ipc.plugin_tx = None;
-    app.song_doc.file_path = Some(path.clone());
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.file_path = Some(path.clone());
+    app.cur.song_doc.normalize(|_| {});
 
     app.handle_event(AppEvent::Save);
 
     // dispatch が host 不在を検知して即 abort。 watchdog (30s) を一切回さずに queue は空。
     assert!(
-        app.ipc.pending_state_queue.is_empty(),
+        app.cur.pipc.pending_state_queue.is_empty(),
         "no doomed round-trip is armed when there is no host to answer"
     );
     assert!(!app.ui_ephemeral.status_message.is_empty(), "user is notified immediately");
     assert!(!path.exists(), "save did not complete (no plugin states available)");
 
     // 以後もガードは生きている (恒久ロックしない)。
-    app.song_doc.normalize(|_| {});
-    app.handle_event(AppEvent::New);
+    app.cur.song_doc.normalize(|_| {});
+    let key = app.pk();
+    app.handle_event(AppEvent::Tab(TabEvent::Close(key)));
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
-        Some(DirtyGuardAction::New),
+        Some(DirtyGuardAction::CloseTabs(vec![key])),
         "dirty guard still works in the degraded no-host state"
     );
 }
@@ -258,14 +260,14 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
 
     let (mut app, _rx) = build_app();
     load_instrument(&mut app);
-    app.song_doc.file_path = Some(path.clone());
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.file_path = Some(path.clone());
+    app.cur.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::Save);
-    assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
+    assert!(!app.cur.pipc.pending_state_queue.is_empty(), "save round-trip in flight");
 
     // 正常応答で完了。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
-    assert!(app.ipc.pending_state_queue.is_empty(), "queue drained on response");
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    assert!(app.cur.pipc.pending_state_queue.is_empty(), "queue drained on response");
     assert!(path.exists(), "project saved");
 
     // 完了後は watchdog が発火しない (deadline 解除済み)。
@@ -288,12 +290,12 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
 fn plugins_reinit_done_passes_export_gate_and_fires_export_wav() {
     let (mut app, _plugin_rx, mut audio_rx) = build_app_with_audio();
     // 音声 freewheel 前段を模す: export_stage 立て + reinit 完了待ちの stashed export。
-    app.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
-    app.transport.pending_export = Some((std::path::PathBuf::from("C:/out.wav"), None, false));
+    app.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+    app.cur.transport.pending_export = Some((std::path::PathBuf::from("C:/out.wav"), None, false));
     let _ = drain(&mut audio_rx);
 
     // host の reinit 完了通知。 gate を通過 → handler が pending_export を撃つ。
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
 
     let msgs = drain(&mut audio_rx);
     assert!(
@@ -301,7 +303,7 @@ fn plugins_reinit_done_passes_export_gate_and_fires_export_wav() {
             .any(|m| matches!(m, AudioCommand::ExportWav { .. })),
         "PluginsReinitDone must pass the export gate and fire ExportWav: {msgs:?}"
     );
-    assert!(app.transport.pending_export.is_none(), "stashed export consumed");
+    assert!(app.cur.transport.pending_export.is_none(), "stashed export consumed");
 }
 
 /// gate を開け過ぎていないことの確認: export 中、 song を変える user 操作
@@ -309,8 +311,8 @@ fn plugins_reinit_done_passes_export_gate_and_fires_export_wav() {
 #[test]
 fn export_gate_still_blocks_song_mutations() {
     let (mut app, _plugin_rx, _audio_rx) = build_app_with_audio();
-    let track_id = app.song_doc.song().tracks[0].id;
-    app.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    app.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
 
     app.handle_event(AppEvent::SetTrackVolume {
         track: track_id,
@@ -318,7 +320,7 @@ fn export_gate_still_blocks_song_mutations() {
     });
 
     let vol = app
-        .song_doc.song()
+        .cur.song_doc.song()
         .tracks
         .iter()
         .find(|t| t.id == track_id)
@@ -337,17 +339,17 @@ fn export_gate_still_blocks_song_mutations() {
 #[test]
 fn export_gate_flows_default_events_but_blocks_host_reconfig() {
     let (mut app, mut plugin_rx, _audio_rx) = build_app_with_audio();
-    app.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+    app.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
 
     // (1) 正例: 旧 allow-list に無かった VoicevoxSynthStatus は今 export 中も流れ、
     //     handler が status entry を作る。 追加した variant を何もせず default で
     //     通す = 「allow 忘れ → deadlock」 が不能。
     app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus {
-        device_id: 7,
+        device: app.dev(7),
         progress: VocalSynthProgress { busy: true, ..Default::default() },
     }));
     assert!(
-        app.voicevox.voicevox_synth_status.contains_key(&7),
+        app.cur.pvv.voicevox_synth_status.contains_key(&7),
         "block-list 外の event は export 中も流れて処理される (positive-default)"
     );
 
@@ -357,6 +359,7 @@ fn export_gate_flows_default_events_but_blocks_host_reconfig() {
     //     到達せず、 その送信も起きない。
     let _ = drain(&mut plugin_rx); // setup 由来の command を掃除
     app.handle_event(AppEvent::Audio(AudioEvent::BounceClipFxComplete {
+        project: app.pk(),
         path: std::path::PathBuf::from("x.wav"),
         source_track: 0,
         source_clip: 0,

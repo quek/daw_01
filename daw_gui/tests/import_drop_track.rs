@@ -50,7 +50,7 @@ fn build_app() -> (
     );
     let proj = TempDir::new().unwrap();
     // project_dir = file_path.parent() を temp にして import 物を temp/samples へ。
-    app.song_doc.file_path = Some(proj.path().join("proj.daw"));
+    app.cur.song_doc.file_path = Some(proj.path().join("proj.daw"));
     (app, proj, audio_rx, plugin_rx)
 }
 
@@ -83,7 +83,7 @@ fn write_png(dir: &Path, name: &str) -> PathBuf {
 fn audio_drop_in_empty_space_creates_track_at_bottom() {
     let (mut app, src, _a, _p) = build_app();
     let wav = write_wav(src.path(), "kick.wav", 4800);
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportAudio {
         paths: vec![wav],
@@ -91,7 +91,7 @@ fn audio_drop_in_empty_space_creates_track_at_bottom() {
         target_beat: Some(4.0),
     });
 
-    let tracks = &app.song_doc.song().tracks;
+    let tracks = &app.cur.song_doc.song().tracks;
     assert_eq!(tracks.len(), before + 1, "一番下に新規 track が 1 本増える");
     let bottom = tracks.last().unwrap();
     assert_eq!(bottom.clips.len(), 1, "末尾 track に audio clip が 1 個");
@@ -112,7 +112,7 @@ fn audio_multi_drop_stacks_on_single_bottom_track() {
     let (mut app, src, _a, _p) = build_app();
     let w1 = write_wav(src.path(), "a.wav", 4800);
     let w2 = write_wav(src.path(), "b.wav", 2400);
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportAudio {
         paths: vec![w1, w2],
@@ -120,7 +120,7 @@ fn audio_multi_drop_stacks_on_single_bottom_track() {
         target_beat: Some(0.0),
     });
 
-    let tracks = &app.song_doc.song().tracks;
+    let tracks = &app.cur.song_doc.song().tracks;
     assert_eq!(tracks.len(), before + 1, "複数ファイルでも新規 track は 1 本だけ");
     assert_eq!(
         tracks.last().unwrap().clips.len(),
@@ -134,7 +134,7 @@ fn audio_multi_drop_stacks_on_single_bottom_track() {
 fn audio_drop_on_existing_track_adds_there() {
     let (mut app, src, _a, _p) = build_app();
     let wav = write_wav(src.path(), "kick.wav", 4800);
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportAudio {
         paths: vec![wav],
@@ -142,7 +142,7 @@ fn audio_drop_on_existing_track_adds_there() {
         target_beat: Some(2.0),
     });
 
-    let tracks = &app.song_doc.song().tracks;
+    let tracks = &app.cur.song_doc.song().tracks;
     assert_eq!(tracks.len(), before, "既存 track drop は track を増やさない");
     assert_eq!(tracks[0].clips.len(), 1, "指定した既存 track に clip が付く");
 }
@@ -153,7 +153,7 @@ fn audio_drop_on_existing_track_adds_there() {
 fn image_drop_in_empty_space_creates_track_at_bottom_not_top() {
     let (mut app, src, _a, _p) = build_app();
     let png = write_png(src.path(), "pic.png");
-    let before = app.song_doc.song().tracks.len();
+    let before = app.cur.song_doc.song().tracks.len();
 
     app.handle_event(AppEvent::ImportImage {
         paths: vec![png],
@@ -161,7 +161,7 @@ fn image_drop_in_empty_space_creates_track_at_bottom_not_top() {
         target_beat: Some(1.0),
     });
 
-    let tracks = &app.song_doc.song().tracks;
+    let tracks = &app.cur.song_doc.song().tracks;
     assert_eq!(tracks.len(), before + 1, "新規 image track が 1 本増える");
     assert_eq!(
         tracks.last().unwrap().clips.len(),

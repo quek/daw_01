@@ -191,8 +191,8 @@ fn draw_chrome_and_list(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         w: (rect.w - 1.0 - RESIZE_MARGIN).max(0.0),
         h: (rect.h - TITLE_H - 1.0 - RESIZE_MARGIN).max(0.0),
     };
-    let labels = app.song_doc.history_labels();
-    let current = app.song_doc.history_current();
+    let labels = app.cur.song_doc.history_labels();
+    let current = app.cur.song_doc.history_current();
     draw_list(app, ui, list_rect, &labels, current);
 
     // 右下隅のリサイズ grip (斜めドット、 視認用)。

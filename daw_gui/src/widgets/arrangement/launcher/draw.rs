@@ -134,6 +134,12 @@ pub(crate) fn dispatch(
     automation_clip_drag: Option<&AutomationClipDragSession>,
     response: &mut ArrangementResponse,
 ) {
+    // `docs/plan_project_tabs.md` §5.6: **別のタブから** 運んできている payload。
+    // アレンジ側 (`xfer_ghost`) は帯に描けない (帯はこの後に描かれて上書きする) ので、
+    // 帯の着地プレビューは帯自身の描画パス = ここで出す。
+    let xfer = ui.drag_payload::<crate::app_types::ProjectTransferPayload>(
+        crate::app_types::PROJECT_XFER_DRAG_KIND,
+    );
     response.launcher.pane_rect = f.launcher.pane;
     response.launcher.grid_rect = f.launcher.grid;
     response.launcher.col_w = f.launcher.col_w;
@@ -147,7 +153,7 @@ pub(crate) fn dispatch(
         hover: f.hover_pos.and_then(|(x, y)| press::zone_at(f, x, y)),
         held: sessions.live_held_button,
         blink: app
-            .transport
+            .cur.transport
             .playhead_beat
             .is_none_or(|b| f64::from(b).rem_euclid(1.0) < 0.5),
     };
@@ -166,7 +172,7 @@ pub(crate) fn dispatch(
         });
         return;
     }
-    let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
+    let tempo_map = common::audio_render::TempoMap::from_song(app.cur.song_doc.song());
     let out = &mut response.launcher;
     ui.heavy(("arrangement_launcher", &f.id), |hctx| {
         chrome(hctx, f);
@@ -174,6 +180,9 @@ pub(crate) fn dispatch(
         head_row(hctx, f, fb, out);
         grid_rows(hctx, app, &tempo_map, f, fb, out);
         drag_overlays(hctx, f, sessions, clip_drag, automation_clip_drag);
+        if let Some(p) = xfer.as_ref() {
+            super::xfer::overlays(hctx, f, p);
+        }
     });
 }
 
@@ -828,7 +837,7 @@ fn cell_content(
         return;
     };
     let Some(mc) = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -978,7 +987,7 @@ fn square_in(r: Rect, size: f32) -> Rect {
     Rect { x: r.x + (r.w - s) * 0.5, y: r.y + (r.h - s) * 0.5, w: s, h: s }
 }
 
-fn push_rounded(
+pub(super) fn push_rounded(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     r: Rect,
     fill: Color,
@@ -1254,7 +1263,7 @@ fn push_arranger_ghosts(
 /// ドラッグ中のゴーストの `(塗り, 縁)`。運び方 (移動 / リンク複製 / 独立複製) で
 /// 色が変わるのはアレンジのクリップドラッグと同じ語彙。
 #[must_use]
-fn ghost_style(f: &ArrangementFrame<'_>, mode: ClipCopyMode) -> (Color, Color) {
+pub(super) fn ghost_style(f: &ArrangementFrame<'_>, mode: ClipCopyMode) -> (Color, Color) {
     let (fill, border) = match mode {
         ClipCopyMode::Move => (f.style.clip_selected_fill, f.style.clip_selected_border),
         ClipCopyMode::CloneLinked => {
@@ -1271,7 +1280,7 @@ fn ghost_style(f: &ArrangementFrame<'_>, mode: ClipCopyMode) -> (Color, Color) {
 ///
 /// rect は **描画と当たり判定が共有する `layout::cell_rect`** から取るので、
 /// ゴーストは実際のセルとぴったり重なる。見えていない行 / 列は描かない。
-fn push_slot_ghosts(
+pub(super) fn push_slot_ghosts(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,
     slots: &[(ArrangementRowKey, u32)],

@@ -45,7 +45,7 @@ use anyhow::Result;
 
 use common::plugin_format::PluginFormat;
 use common::plugin_metadata::{NoteMetadata, TalkMetadata};
-use common::protocol::{PluginParamInfo, RenderMode};
+use common::protocol::{DeviceAddr, PluginParamInfo, RenderMode};
 
 use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
@@ -124,7 +124,7 @@ pub struct AuxInputBuf<'a> {
 /// not block the caller — plugins often hold an internal lock across these.
 ///
 /// v29: すべての callback は load 時に **安定 device id** を capture した
-/// closure として `main.rs::make_callbacks(device_id)` が生成する。旧
+/// closure として `main.rs::make_callbacks(device)` が生成する。旧
 /// `(track, index)` capture は削除 / 並べ替えで stale になり「別デバイスの
 /// GUI を destroy する」class のバグ源だった。
 #[derive(Clone)]
@@ -574,7 +574,7 @@ const SYNTH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 戻り値は **スレッドを起こせたか**。`false` なら呼び出し側が即 ready を返すこと
 /// (待ち手が居ないまま bounce / 書き出しを止めない)。
 pub fn spawn_vocal_synth_wait(
-    device_id: u64,
+    device: DeviceAddr,
     progress: (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>),
     emit: impl FnOnce(common::protocol::PluginEvent) + Send + 'static,
 ) -> bool {
@@ -597,7 +597,7 @@ pub fn spawn_vocal_synth_wait(
                 }
                 if last_change.elapsed() > SYNTH_STALL_TIMEOUT {
                     tracing::warn!(
-                        device_id,
+                        ?device,
                         target_gen,
                         done = now.0,
                         "vocal synth が 60 秒進捗しないため待機を打ち切る"
@@ -605,7 +605,7 @@ pub fn spawn_vocal_synth_wait(
                     break;
                 }
             }
-            emit(common::protocol::PluginEvent::VocalSynthReady { device_id });
+            emit(common::protocol::PluginEvent::VocalSynthReady { device });
         });
     spawn.is_ok()
 }

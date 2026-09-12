@@ -82,7 +82,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use common::protocol::{KeyChord, PluginEvent};
+use common::protocol::{DeviceAddr, KeyChord, PluginEvent};
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -208,11 +208,11 @@ pub struct KeyRouter {
     /// 覚えておく (down だけ奪うとプラグインが押しっぱなしと誤認する)。
     swallowed_keys: Vec<KeyChord>,
     /// 「キーを全部プラグインに送る」 が ON の device (逃げ道)。
-    send_all_keys: HashSet<u64>,
-    /// 開いているエディタのコンテナ窓 (`device_id`, hwnd)。 `PluginHost` が窓を作った /
+    send_all_keys: HashSet<DeviceAddr>,
+    /// 開いているエディタのコンテナ窓 (`device`, hwnd)。 `PluginHost` が窓を作った /
     /// 壊した瞬間に [`KeyRouter::register_editor`] / [`KeyRouter::unregister_editor`] で
     /// 更新する (フックは `PluginHost` を引けないので、 ここが hwnd → device の唯一の索引)。
-    editors: Vec<(u64, u64)>,
+    editors: Vec<(DeviceAddr, u64)>,
     /// daw_gui へ `EditorKey` を送る口。 フック設置中だけ `Some`。
     evt_tx: Option<UnboundedSender<PluginEvent>>,
     /// 張ってあるフック。 [`reinstall_hook`] で張り直す (連鎖の先頭に置き直す) ために持つ。
@@ -236,39 +236,39 @@ impl KeyRouter {
         self.swallowed_keys.clear();
     }
 
-    pub fn set_send_all_keys(&mut self, device_id: u64, enabled: bool) {
+    pub fn set_send_all_keys(&mut self, device: DeviceAddr, enabled: bool) {
         if enabled {
-            self.send_all_keys.insert(device_id);
+            self.send_all_keys.insert(device);
         } else {
-            self.send_all_keys.remove(&device_id);
+            self.send_all_keys.remove(&device);
         }
     }
 
     /// コンテナ窓を作った直後に呼ぶ。
-    pub fn register_editor(&mut self, device_id: u64, hwnd: u64) {
-        self.unregister_editor(device_id);
-        self.editors.push((device_id, hwnd));
+    pub fn register_editor(&mut self, device: DeviceAddr, hwnd: u64) {
+        self.unregister_editor(device);
+        self.editors.push((device, hwnd));
     }
 
     /// 窓を壊す (直前 / 直後どちらでも可) ときに呼ぶ。 対応する key-up はもう届かない
     /// ので横取り中の記録も捨てる。 残すと次に別のキーの key-up を誤って飲み込む。
-    pub fn unregister_editor(&mut self, device_id: u64) {
-        self.editors.retain(|(id, _)| *id != device_id);
+    pub fn unregister_editor(&mut self, device: DeviceAddr) {
+        self.editors.retain(|(id, _)| *id != device);
         self.swallowed_keys.clear();
     }
 
     /// `hwnd` がどの device のエディタ窓 (コンテナ本体 or その子孫) かを返す。
-    fn editor_device_of(&self, hwnd: HWND) -> Option<(u64, bool)> {
+    fn editor_device_of(&self, hwnd: HWND) -> Option<(DeviceAddr, bool)> {
         if hwnd.is_invalid() {
             return None;
         }
-        for &(device_id, container) in &self.editors {
+        for &(device, container) in &self.editors {
             let container = HWND(container as *mut core::ffi::c_void);
             if container == hwnd {
-                return Some((device_id, true));
+                return Some((device, true));
             }
             if unsafe { IsChild(container, hwnd) }.as_bool() {
-                return Some((device_id, false));
+                return Some((device, false));
             }
         }
         None
@@ -304,13 +304,13 @@ impl KeyRouter {
                 "editor key-down reached hook"
             );
         }
-        let Some((device_id, is_container)) = device else {
+        let Some((device, is_container)) = device else {
             return false;
         };
         // 逃げ道 (REAPER の「Send all keyboard input to plug-in」相当): この device では
         // 一切横取りしない。 relay は既にプラグインが 「要らない」 と言ったものなので
         // 飲み込む (再 dispatch しても行き場が無い) が、 転送はしない。
-        if self.send_all_keys.contains(&device_id) {
+        if self.send_all_keys.contains(&device) {
             return is_relay;
         }
         let chord = chord_of(msg);
@@ -349,7 +349,7 @@ impl KeyRouter {
             }
         }
         if diag {
-            tracing::info!(vk, device_id, "editor key: swallowed and forwarded to daw_gui");
+            tracing::info!(vk, ?device, "editor key: swallowed and forwarded to daw_gui");
         }
         if is_auto_repeat(msg.lParam) {
             // オートリピートは 1 押下 1 発火にするため **飲み込むが emit しない**。
@@ -360,7 +360,7 @@ impl KeyRouter {
         self.swallowed_keys.retain(|c| unsafe { GetAsyncKeyState(i32::from(c.vk)) } < 0);
         self.swallowed_keys.push(chord);
         if let Some(tx) = self.evt_tx.as_ref() {
-            let _ = tx.send(PluginEvent::EditorKey { device_id, chord });
+            let _ = tx.send(PluginEvent::EditorKey { device, chord });
         }
         true
     }

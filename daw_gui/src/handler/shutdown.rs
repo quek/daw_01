@@ -28,6 +28,7 @@ impl AppData {
     /// 『未保存だから待って』と答えたのに、こちらは終了を始めていない」という
     /// 噛み合わない状態になる (New の確認モーダルを開いたまま席を立った場合)。
     pub fn request_quit(&mut self, req: QuitRequest) {
+        tracing::info!(?req, tabs = self.tabs.len(), "request_quit");
         if self.shutdown.is_shutting_down() {
             return; // ✕ 連打 / メニューとショートカットの二重発火。
         }
@@ -45,18 +46,20 @@ impl AppData {
         ) {
             return;
         }
-        // 保留中の New / Open は終了で置き換える。round-trip 待ちの保存
+        // 保留中のタブ閉じは終了で置き換える。round-trip 待ちの保存
         // (`pending_state_queue`) はそのまま残るので、drain 後に
         // `request_guarded_action` が終了で再評価する。
         self.clear_pending_guards();
-        self.request_guarded_action(DirtyGuardAction::Quit(req));
+        // `docs/plan_project_tabs.md` Q9: 未保存タブを 1 つずつ確認してから終了する。
+        self.continue_quit(req);
     }
 
     /// 保留中のガード意図を全部捨てる (置き換えの前段)。
     fn clear_pending_guards(&mut self) {
         self.ui_ephemeral.dirty_guard = None;
         self.ui_ephemeral.guard_after_save = None;
-        self.ui_ephemeral.guard_pending_action = None;
+        // 保留は **タブごと** なので全部落とす (`docs/plan_project_tabs.md` §5.1)。
+        self.for_each_tab(|app| app.cur.pipc.guard_pending_action = None);
     }
 
     /// 終了シーケンスを開始する。ここから先はユーザー入力を受け付けず、
@@ -101,13 +104,20 @@ impl AppData {
 
         // (1) オフライン処理を中止。engine 側の render thread に「もう要らない」
         //     を伝えてから終了要求を出す。
-        if self.transport.export_stage.is_some() || self.loudness.phase.is_busy() {
+        // `docs/plan_project_tabs.md` §5.4: 走っているかは **全タブ** を見る (engine の
+        // オフライン描画は全体で 1 本なので、送るのは 1 回でよい)。背景タブの書き出しを
+        // 止めずに daw_audio を落とすと、freewheel render を抱えたまま recv loop を抜ける。
+        if self.any_tab_export_or_analysis_busy() {
             self.send_audio(AudioCommand::CancelExport);
         }
+        // in-process の映像 render はタブごとの cancel フラグで畳む。
+        self.for_each_tab(AppData::cancel_inflight_video_export);
 
         // (2) transport 停止。
-        self.send_audio(AudioCommand::Stop);
-        self.transport.is_playing = false;
+        for key in self.tabs.order.clone() {
+            self.send_audio(AudioCommand::Stop { project: key });
+        }
+        self.for_each_tab(|app| app.cur.transport.is_playing = false);
 
         // (3)(4) 子プロセスへ終了要求。
         self.send_plugin(PluginCommand::Shutdown);
@@ -119,17 +129,17 @@ impl AppData {
         // (6) 開いている picker / help を畳む。以後 `handle_event` は全 event を
         //     捨てるので操作は届かないが、描かれたままだと「終了処理中…」の下に
         //     残って見た目が壊れる (暗幕も二重になる)。
-        self.close_transient_ui_for_shutdown();
+        self.close_transient_ui();
     }
 
     /// 終了に入るときに畳む一時 UI。ここに挙げ忘れても **数秒だけ古いパネルが
     /// 見えるだけ** (操作は `handle_event` の gate が全部落とす) なので、
     /// 「列挙漏れ = 永久ロック」の失敗モードにはならない。
-    fn close_transient_ui_for_shutdown(&mut self) {
+    pub(crate) fn close_transient_ui(&mut self) {
         self.ui_ephemeral.is_plugin_picker_open = false;
         self.ui_ephemeral.is_font_picker_open = false;
         self.ui_ephemeral.font_picker_target = None;
-        self.ui_ephemeral.send_picker = None;
+        self.cur.peph.send_picker = None;
         self.ui_ephemeral.export_range_picker = None;
         self.ui_ephemeral.show_recovery_modal = false;
         self.ui_prefs.is_help_open = false;

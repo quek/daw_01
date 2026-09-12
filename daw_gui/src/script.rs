@@ -24,7 +24,7 @@ use boa_engine::{
 };
 use common::model::Song;
 use common::plugin_format::PluginFormat;
-use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent};
+use common::protocol::{AudioCommand, AudioEvent, DeviceAddr, PluginCommand, PluginEvent};
 
 use crate::app::{AppData, AppEvent, ClipKey};
 use crate::bootstrap::{Bootstrap, ChildEvent};
@@ -91,7 +91,7 @@ struct ScriptHost {
     app: AppData,
     /// v29: 生 `daw.setSlotPlugin` 用の要求 generation counter (AppData の
     /// counter と衝突しないよう ScriptHost 側でも単調増加を維持し、 送信前に
-    /// `app.ipc.pending_plugin_loads` へ登録して echo を通す)。
+    /// `app.cur.pipc.pending_plugin_loads` へ登録して echo を通す)。
     next_raw_load_generation: u64,
     /// `daw.takePluginLoadEventsJson()` が返して clear する観測バッファ。
     /// plugin load の成否をログ grep ではなく **script 内の assertion** で
@@ -194,7 +194,7 @@ impl ScriptHost {
     /// (loadSongFile 経路) → `last_loaded_song` (loadSongFromObject 経路) の
     /// 順で解決する。
     fn resolve_device_id(&self, track_id: u32, index: u32) -> Option<u64> {
-        crate::app::device_id_at(self.app.song_doc.song(), track_id, index).or_else(|| {
+        crate::app::device_id_at(self.app.cur.song_doc.song(), track_id, index).or_else(|| {
             self.last_loaded_song
                 .as_ref()
                 .and_then(|s| crate::app::device_id_at(s, track_id, index))
@@ -260,16 +260,7 @@ impl ScriptHost {
             ChildEvent::Plugin(msg) => msg,
         };
         match msg {
-            PluginEvent::SlotPluginLoaded {
-                device_id,
-                id,
-                name,
-                shmem_id,
-                state_load_error,
-                aux_output_count,
-                aux_input_count,
-                generation,
-            } => {
+            PluginEvent::SlotPluginLoaded { device: DeviceAddr { device_id, .. }, .. } => {
                 self.plugin_load_events.loaded.push(*device_id);
                 // GUI runner と同じく app へ dispatch する。これで `loaded_devices` が
                 // 埋まり、OpenPluginShmem 送信 + `sync_vocal_metadata` 再 flush
@@ -277,46 +268,35 @@ impl ScriptHost {
                 // 無いと、 slot ロード前の初回 flush が skip されたまま再 flush されず、
                 // VOICEVOX を含む project の headless export が無音になる
                 // (`docs/plan_voicevox_talk.md` §7 で talk export 検証時に発覚)。
-                self.app
-                    .handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoaded {
-                        device_id: *device_id,
-                        id: id.clone(),
-                        name: name.clone(),
-                        shmem_id: shmem_id.clone(),
-                        state_load_error: state_load_error.clone(),
-                        aux_output_count: *aux_output_count,
-                        aux_input_count: *aux_input_count,
-                        generation: *generation,
-                    }));
+                self.app.handle_event(AppEvent::Plugin(msg.clone()));
             }
-            PluginEvent::SlotPluginShmemReleased { device_id } => {
+            PluginEvent::SlotPluginShmemReleased { .. } => {
                 // GUI runner と同じく app へ流し、`ClosePluginShmem` を
                 // daw_audio へ転送させる (これが無いと project 切替 /
                 // plugin 差し替えで daw_audio に stale mapping が残る)。
-                self.app
-                    .handle_event(AppEvent::Plugin(PluginEvent::SlotPluginShmemReleased {
-                        device_id: *device_id,
-                    }));
+                self.app.handle_event(AppEvent::Plugin(msg.clone()));
             }
-            PluginEvent::SlotPluginUnloaded { device_id } => {
+            PluginEvent::SlotPluginUnloaded { device: DeviceAddr { device_id, .. } } => {
                 let _ = self.bootstrap.audio_tx.send(AudioCommand::SetDeviceLatency {
+                    project: self.app.pk(),
                     device_id: *device_id,
                     samples: 0,
                 });
             }
-            PluginEvent::PluginLatencyChanged { device_id, samples } => {
+            PluginEvent::PluginLatencyChanged { device: DeviceAddr { device_id, .. }, samples } => {
                 // GUI mode と同じく **device 単位のまま** engine へ中継する
                 // (track 合計は `compile_schedule` が導出する = 集計を二重に持たない)。
                 let _ = self.bootstrap.audio_tx.send(AudioCommand::SetDeviceLatency {
+                    project: self.app.pk(),
                     device_id: *device_id,
                     samples: *samples,
                 });
             }
             PluginEvent::SlotPluginLoadFailed {
-                device_id,
+                device: DeviceAddr { device_id, .. },
                 plugin_id,
                 reason,
-                generation,
+                ..
             } => {
                 tracing::error!(
                     device_id,
@@ -331,13 +311,7 @@ impl ScriptHost {
                 });
                 // production と同じく app へ dispatch する (= `pending_plugin_loads`
                 // が解放され、 script の「全 load 完了」 判定が失敗でも進む)。
-                self.app
-                    .handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
-                        device_id: *device_id,
-                        plugin_id: plugin_id.clone(),
-                        reason: reason.clone(),
-                        generation: *generation,
-                    }));
+                self.app.handle_event(AppEvent::Plugin(msg.clone()));
             }
             _ => {}
         }
@@ -463,6 +437,12 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             js_string!("takePluginLoadEventsJson"),
             0,
         )
+        // ----- `docs/plan_project_tabs.md` §5.4: プロジェクトタブ -----
+        .function(NativeFunction::from_fn_ptr(daw_new_tab), js_string!("newTab"), 0)
+        .function(NativeFunction::from_fn_ptr(daw_close_tab), js_string!("closeTab"), 0)
+        .function(NativeFunction::from_fn_ptr(daw_switch_tab), js_string!("switchTab"), 1)
+        .function(NativeFunction::from_fn_ptr(daw_tabs_json), js_string!("tabsJson"), 0)
+        .function(NativeFunction::from_fn_ptr(daw_metrics_json), js_string!("metricsJson"), 0)
         .function(
             NativeFunction::from_fn_ptr(daw_pending_plugin_loads),
             js_string!("pendingPluginLoadsJson"),
@@ -664,7 +644,8 @@ fn daw_load_song_from_object(
     // device_id addressing (`daw.setSlotPlugin` 等) がこの id を引く。
     song.ensure_ids();
     with_host(|h| {
-        let _ = h.bootstrap.audio_tx.send(AudioCommand::LoadSong(song.clone()));
+        let project = h.app.pk();
+        let _ = h.bootstrap.audio_tx.send(AudioCommand::LoadSong { project, song: song.clone() });
         h.last_loaded_song = Some(song);
     });
     Ok(JsValue::undefined())
@@ -705,9 +686,9 @@ fn daw_set_slot_plugin(
         // AppData の世代 guard を通り、 OpenPluginShmem forward まで走る)。
         h.next_raw_load_generation = h.next_raw_load_generation.wrapping_add(1).max(1);
         let generation = h.next_raw_load_generation;
-        h.app.ipc.pending_plugin_loads.insert(device_id, generation);
+        h.app.cur.pipc.pending_plugin_loads.insert(device_id, generation);
         let _ = h.bootstrap.plugin_tx.send(PluginCommand::SetSlotPlugin {
-            device_id,
+            device: h.app.dev(device_id),
             format,
             path: PathBuf::from(path_str),
             plugin_id,
@@ -740,7 +721,7 @@ fn daw_wait_for_plugin_loaded(
             |msg| {
                 matches!(
                     msg,
-                    ChildEvent::Plugin(PluginEvent::SlotPluginLoaded { device_id, .. })
+                    ChildEvent::Plugin(PluginEvent::SlotPluginLoaded { device: DeviceAddr { device_id, .. }, .. })
                         if *device_id == want_device
                 )
             },
@@ -787,6 +768,7 @@ fn daw_export_wav(
         // 適用されない song で render が始まる。
         h.drain_pending_for(Duration::from_millis(50));
         let _ = h.bootstrap.audio_tx.send(AudioCommand::ExportWav {
+            project: h.app.pk(),
             path: PathBuf::from(path_str),
             // scripting API は全曲 export (レンジ指定は GUI 専用)。
             range: None,
@@ -828,7 +810,7 @@ fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
     with_host(|h| {
         // Resolve plugin ids → DLL paths from the cached DB the bootstrap built.
         h.app.ipc.plugin_db = h.bootstrap.plugin_db.clone();
-        h.app.song_doc.file_path = Some(path.clone());
+        h.app.cur.song_doc.file_path = Some(path.clone());
         // GUI の File→Open と同じ順序を厳守する。 teardown を飛ばすと前 song の
         // plugin instance が plugin_host に残り、 device_id が project ごとに
         // 再採番されるせいで新 song の SetSlotPlugin が **旧 instance に dedup
@@ -839,7 +821,7 @@ fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         // Instantiate every plugin in the chain (sends SetSlotPlugin), then push
         // the song + project_dir + LoadSong to the audio engine.
         h.app.restore_plugin_from_song(&song);
-        h.app.song_doc.replace_song(song.clone());
+        h.app.cur.song_doc.replace_song(song.clone());
         // Song スコープの派生状態を破棄する唯一の口 (GUI 経路と同じ)。
         h.app.after_song_replaced();
         // headless (frame loop 無し) なので明示的に flush する。 replace_song が epoch を
@@ -855,7 +837,7 @@ fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
 /// "played first" state where a synth holds a live voice.
 fn daw_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_host(|h| {
-        let _ = h.bootstrap.audio_tx.send(AudioCommand::Play);
+        let _ = h.bootstrap.audio_tx.send(AudioCommand::Play { project: h.app.pk() });
     });
     Ok(JsValue::undefined())
 }
@@ -863,7 +845,7 @@ fn daw_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<
 /// `daw.stop()` — stop realtime transport.
 fn daw_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_host(|h| {
-        let _ = h.bootstrap.audio_tx.send(AudioCommand::Stop);
+        let _ = h.bootstrap.audio_tx.send(AudioCommand::Stop { project: h.app.pk() });
     });
     Ok(JsValue::undefined())
 }
@@ -878,7 +860,7 @@ fn daw_start_recording(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         let _ = h
             .bootstrap
             .audio_tx
-            .send(AudioCommand::StartRecording { preroll_samples });
+            .send(AudioCommand::StartRecording { project: h.app.pk(), preroll_samples });
     });
     Ok(JsValue::undefined())
 }
@@ -887,7 +869,7 @@ fn daw_start_recording(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
 /// Does not stop the transport (punch-out keeps playing).
 fn daw_stop_recording(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_host(|h| {
-        let _ = h.bootstrap.audio_tx.send(AudioCommand::StopRecording);
+        let _ = h.bootstrap.audio_tx.send(AudioCommand::StopRecording { project: h.app.pk() });
     });
     Ok(JsValue::undefined())
 }
@@ -900,13 +882,12 @@ fn daw_stop_recording(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) ->
 /// window (`feedback_prefer_headless_verification`).
 fn daw_transport_state(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let (playing, recording_live, preroll, playhead) = with_host(|h| {
-        let b = &h.bootstrap.bridge;
-        (
-            b.playing(),
-            b.recording_live(),
-            b.preroll_remaining(),
-            b.playhead_samples(),
-        )
+        // `docs/plan_project_tabs.md`: アクティブなタブの telemetry slot を読む
+        // (まだ claim されていなければ停止状態として返す)。
+        match h.bootstrap.bridge.find_project(h.app.pk()) {
+            Some(b) => (b.playing(), b.recording_live(), b.preroll_remaining(), b.playhead_samples()),
+            None => (false, false, 0, 0),
+        }
     });
     let obj = JsObject::default(ctx.intrinsics());
     obj.set(js_string!("playing"), playing, false, ctx)?;
@@ -931,12 +912,13 @@ fn daw_sleep_ms(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
 fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let timeout_ms = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(30_000);
     let res = with_host(|h| {
+        let project = h.app.pk();
         let _ = h
             .bootstrap
             .plugin_tx
-            .send(PluginCommand::ReinitAllPlugins);
+            .send(PluginCommand::ReinitAllPlugins { project: Some(project) });
         h.pump_until(
-            |msg| matches!(msg, ChildEvent::Plugin(PluginEvent::PluginsReinitDone)),
+            |msg| matches!(msg, ChildEvent::Plugin(PluginEvent::PluginsReinitDone { .. })),
             Duration::from_millis(timeout_ms),
         )
     });
@@ -946,7 +928,7 @@ fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -
 
 /// `daw.exportWavRange(path, startBeat, endBeat, timeoutMs)` — offline export
 /// of a beat range (the cold range, GUI's
-/// `AudioCommand::ExportWav { range: Some(..) }`), driven headlessly.
+/// `AudioCommand::ExportWav { project: h.app.pk(), range: Some(..) }`), driven headlessly.
 ///
 /// r.md #54: 引数は **拍** (旧: サンプルフレーム)。拍→サンプル換算は daw_audio 側
 /// (`beats_to_samples` = tempo automation を積分する SSoT) 一本になった。
@@ -958,6 +940,7 @@ fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     let pump_result = with_host(|h| {
         h.drain_pending_for(Duration::from_millis(50));
         let _ = h.bootstrap.audio_tx.send(AudioCommand::ExportWav {
+            project: h.app.pk(),
             path: PathBuf::from(path_str),
             range: Some((start, end)),
             write_mod_sidecar: false,
@@ -995,7 +978,7 @@ fn daw_analyze_loudness(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
         let _ = h
             .bootstrap
             .audio_tx
-            .send(AudioCommand::AnalyzeLoudness { range });
+            .send(AudioCommand::AnalyzeLoudness { project: h.app.pk(), range });
         h.pump_until(
             |msg| {
                 matches!(
@@ -1011,6 +994,7 @@ fn daw_analyze_loudness(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
             report: Some(r),
             error: None,
             cancelled: false,
+            ..
         })) => {
             // 曲線とヒストグラムは巨大なので、スカラーだけを JSON にする
             // (headless の検証で欲しいのは数値)。
@@ -1069,7 +1053,7 @@ fn daw_set_device_latency(
         let _ = h
             .bootstrap
             .audio_tx
-            .send(AudioCommand::SetDeviceLatency { device_id, samples });
+            .send(AudioCommand::SetDeviceLatency { project: h.app.pk(), device_id, samples });
     });
     Ok(JsValue::undefined())
 }
@@ -1104,7 +1088,7 @@ fn daw_pending_plugin_loads(
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
     let json = with_host(|h| {
-        let mut ids: Vec<u64> = h.app.ipc.pending_plugin_loads.keys().copied().collect();
+        let mut ids: Vec<u64> = h.app.cur.pipc.pending_plugin_loads.keys().copied().collect();
         ids.sort_unstable();
         serde_json::to_string(&ids)
     })
@@ -1153,7 +1137,7 @@ fn daw_app_load_song_json(
     song.ensure_clip_contents();
     song.ensure_audio_source_ids();
     with_host(|host| {
-        host.app.song_doc.replace_song(song);
+        host.app.cur.song_doc.replace_song(song);
         // headless: frame flush が無いので明示 flush (replace_song の epoch bump を拾う)。
         host.app.flush_song_sync();
     });
@@ -1171,7 +1155,7 @@ fn daw_inspect_song_json(
     // reflects what the user actually sees (and matches the rename smoke
     // test's contract). Without this, every clip name reads back `undefined`.
     let json = with_host(|host| {
-        let song = host.app.song_doc.song();
+        let song = host.app.cur.song_doc.song();
         let names = &song.clip_content_names;
         // §10 で `Clip.name` field を撤去。per-clip 名の SSoT は `clip_content_names` (map)。
         // inspection JSON では serialize 後の各 clip オブジェクトへ `name` を注入し
@@ -1235,7 +1219,7 @@ fn daw_clip_display_label(
     let target: ClipKey = serde_json::from_str(&ref_json)
         .map_err(|e| js_native(format!("clipDisplayLabel: parse: {e}")))?;
     let label = with_host(|host| {
-        let song = &host.app.song_doc.song();
+        let song = &host.app.cur.song_doc.song();
         let Some(clip) = song.clip_by_key(target) else {
             return String::new();
         };
@@ -1244,7 +1228,7 @@ fn daw_clip_display_label(
     Ok(JsString::from(label.as_str()).into())
 }
 
-/// `daw.deviceChain(track_id)` → `host.app.song_doc.song()` の指定トラックの単一デバイス
+/// `daw.deviceChain(track_id)` → `host.app.cur.song_doc.song()` の指定トラックの単一デバイス
 /// チェーンを、各 device の `{plugin_id, ports}` の JSON 配列文字列で返す。
 /// 役割判定はしない (engine は port を順に直結するだけ)。load → migration →
 /// port 解決 → 並び順 が production と同じ経路で正しく通ることを JS から
@@ -1259,10 +1243,10 @@ fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     let json = with_host(|host| {
         let devices: &[common::model::Device] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &host.app.song_doc.song().master_fx_chain
+                &host.app.cur.song_doc.song().master_fx_chain
             } else {
                 host.app
-                    .song_doc.song()
+                    .cur.song_doc.song()
                     .tracks
                     .iter()
                     .find(|t| t.id == track_id)
@@ -1394,7 +1378,7 @@ fn daw_set_hover_clip(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
                 .map_err(|e| js_native(format!("setHoverClip: parse: {e}")))?,
         )
     };
-    with_host(|host| host.app.ui_ephemeral.arrangement_hover_clip = cref);
+    with_host(|host| host.app.cur.peph.arrangement_hover_clip = cref);
     Ok(JsValue::undefined())
 }
 
@@ -1409,8 +1393,8 @@ fn daw_set_hover_beat(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         if n.is_nan() { None } else { Some(n) }
     };
     with_host(|host| {
-        host.app.ui_ephemeral.arrangement_hover_beat = beat;
-        host.app.ui_ephemeral.arrangement_hover_beat_raw = beat;
+        host.app.cur.peph.arrangement_hover_beat = beat;
+        host.app.cur.peph.arrangement_hover_beat_raw = beat;
     });
     Ok(JsValue::undefined())
 }
@@ -1673,4 +1657,99 @@ fn daw_set_note_positions_json(
         host.app.handle_event(AppEvent::SetNotePositions(entries));
     });
     Ok(JsValue::undefined())
+}
+
+// ---------------------------------------------------------------------------
+// `docs/plan_project_tabs.md` §5.4: プロジェクトタブ (`daw.newTab` / `closeTab` /
+// `switchTab(index)` / `tabsJson`)。既存の API はすべてアクティブなタブに効く。
+// ---------------------------------------------------------------------------
+
+/// `daw.newTab()` — 空の Untitled を新しいタブに開いてアクティブにする。
+fn daw_new_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let ok = with_host(|h| {
+        let ok = h.app.new_tab().is_some();
+        h.app.flush_all_song_sync();
+        ok
+    });
+    if !ok {
+        return Err(js_native("newTab: tab limit reached"));
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `daw.closeTab()` — アクティブなタブを閉じる (未保存でも確認せず捨てる = headless)。
+fn daw_close_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    with_host(|h| {
+        let key = h.app.pk();
+        h.app.close_tab_now(key);
+        h.app.flush_all_song_sync();
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.switchTab(index)` — 表示順 `index` のタブをアクティブにする。
+fn daw_switch_tab(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let index = usize::try_from_js(args.get_or_undefined(0), ctx)?;
+    let ok = with_host(|h| {
+        let Some(key) = h.app.tabs.order.get(index).copied() else {
+            return false;
+        };
+        h.app.switch_tab(key);
+        true
+    });
+    if !ok {
+        return Err(js_native(format!("switchTab: no tab at index {index}")));
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `daw.tabsJson()` — `[{index, key, path, dirty, playing, active}]`。
+fn daw_tabs_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let json = with_host(|h| {
+        let rows: Vec<serde_json::Value> = h
+            .app
+            .tabs
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| {
+                let ps = h.app.tab(*key)?;
+                // 走行状態は engine の telemetry (GUI の Tick と同じ面) から読む。
+                let playing = h
+                    .bootstrap
+                    .bridge
+                    .find_project(*key)
+                    .is_some_and(|b| b.playing());
+                Some(serde_json::json!({
+                    "index": index,
+                    "key": key.0,
+                    "path": ps.song_doc.file_path.as_ref().map(|p| p.display().to_string()),
+                    "dirty": ps.song_doc.is_dirty(),
+                    "playing": playing,
+                    "active": *key == h.app.pk(),
+                }))
+            })
+            .collect();
+        serde_json::to_string(&rows)
+    })
+    .map_err(|e| js_native(format!("tabsJson: serialize: {e}")))?;
+    Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.metricsJson()` — engine の負荷 (`MetricsBridge`、resource monitor と同じ面):
+/// `{dspLoadAvg, xrunCount, bufferFrames, sampleRate}`。`docs/plan_project_tabs.md` §7 の
+/// 「1 タブのコストは変更前と同等」を headless で実測するための口。
+fn daw_metrics_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let json = with_host(|h| {
+        let m = &h.bootstrap.metrics;
+        let (buffer_frames, sample_rate) = m.buffer_info();
+        serde_json::to_string(&serde_json::json!({
+            "dspLoadAvg": m.dsp_load_avg(),
+            "xrunCount": m.xrun_count(),
+            "bufferFrames": buffer_frames,
+            "sampleRate": sample_rate,
+        }))
+    })
+    .map_err(|e| js_native(format!("metricsJson: serialize: {e}")))?;
+    Ok(JsString::from(json.as_str()).into())
 }

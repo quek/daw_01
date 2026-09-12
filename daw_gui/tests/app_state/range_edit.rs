@@ -59,7 +59,7 @@ fn app_with_clips(specs: &[(u32, f64, f64)]) -> AppData {
 
 /// `(start, len)` を開始拍順で。
 fn spans(app: &AppData) -> Vec<(f64, f64)> {
-    let mut v: Vec<(f64, f64)> = app.song_doc.song().tracks[0]
+    let mut v: Vec<(f64, f64)> = app.cur.song_doc.song().tracks[0]
         .clips
         .iter()
         .map(|c| (c.start_beat, c.length_beats))
@@ -101,7 +101,7 @@ fn 範囲の_j_は結果クリップが範囲そのものになる() {
     app.handle_event(AppEvent::GlueSelectedClips);
     assert_eq!(spans(&app), vec![(4.0, 8.0)], "結果クリップ = 範囲そのもの");
     // 素材は content の 2〜6 拍目 (= song 6〜10) に居る。
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let clip = &song.tracks[0].clips[0];
     let notes = song.clip_notes(clip);
     let first = notes.iter().map(|n| n.start_beat).fold(f64::INFINITY, f64::min);
@@ -122,7 +122,7 @@ fn 範囲のミュートは範囲部分だけを消音する() {
     let mut app = app_with_clips(&[(1, 0.0, 16.0)]);
     set_range(&mut app, 4.0, 12.0);
     app.apply_mute_time_selection();
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mut got: Vec<(f64, bool)> =
         song.tracks[0].clips.iter().map(|c| (c.start_beat, c.muted)).collect();
     got.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -133,7 +133,7 @@ fn 範囲のミュートは範囲部分だけを消音する() {
 fn クリップを選ぶと範囲がその占有区間になる() {
     let mut app = app_with_clips(&[(1, 4.0, 8.0)]);
     app.handle_event(AppEvent::SelectClip { target: key(1), additive: false });
-    let sel = app.selection.time.as_ref().expect("範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("範囲が立つ");
     assert_eq!((sel.start_beat, sel.end_beat), (4.0, 12.0));
     assert_eq!(app.selected_clip_refs(), vec![key(1)]);
 }
@@ -144,7 +144,7 @@ fn ctrl_クリックで離れた_2_クリップを拾うと間のクリップも
     let mut app = app_with_clips(&[(1, 0.0, 4.0), (2, 4.0, 4.0), (3, 8.0, 4.0)]);
     app.handle_event(AppEvent::SelectClip { target: key(1), additive: false });
     app.handle_event(AppEvent::SelectClip { target: key(3), additive: true });
-    let sel = app.selection.time.as_ref().expect("範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("範囲が立つ");
     assert_eq!((sel.start_beat, sel.end_beat), (0.0, 12.0));
     assert_eq!(app.selected_clip_refs(), vec![key(1), key(2), key(3)]);
 }
@@ -184,7 +184,7 @@ fn 矢印キーの範囲ナッジは中身も範囲も一緒に動く() {
     app.nudge_time_selection(4.0);
     // 4〜8 の中身が 8〜12 へ移り、元の場所は空く。
     assert_eq!(spans(&app), vec![(0.0, 4.0), (8.0, 4.0), (12.0, 4.0)]);
-    let sel = app.selection.time.as_ref().expect("範囲は残る");
+    let sel = app.cur.selection.time.as_ref().expect("範囲は残る");
     assert_eq!((sel.start_beat, sel.end_beat), (8.0, 12.0), "範囲も一緒に動く");
 }
 
@@ -193,7 +193,7 @@ fn 範囲ナッジは曲頭より前へ行かない() {
     let mut app = app_with_clips(&[(1, 0.0, 8.0)]);
     set_range(&mut app, 0.0, 4.0);
     app.nudge_time_selection(-4.0);
-    let sel = app.selection.time.as_ref().expect("範囲は残る");
+    let sel = app.cur.selection.time.as_ref().expect("範囲は残る");
     assert_eq!((sel.start_beat, sel.end_beat), (0.0, 4.0), "曲頭で止まる");
 }
 
@@ -205,7 +205,7 @@ fn 選択外のクリップのヘッダを掴んだら_その区間だけが動�
     set_range(&mut app, 0.0, 4.0);
     app.move_time_range(8.0, 12.0, 4.0, &[(TRACK, TRACK)]);
     assert_eq!(spans(&app), vec![(0.0, 4.0), (12.0, 4.0)]);
-    let sel = app.selection.time.as_ref().expect("範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("範囲が立つ");
     assert_eq!((sel.start_beat, sel.end_beat), (12.0, 16.0), "動かした先が新しい選択");
 }
 
@@ -217,7 +217,7 @@ fn 範囲の複製は元を残して窓を詰めて置く() {
     app.copy_time_range(4.0, 8.0, 8.0, &[(TRACK, TRACK)], false);
     // 行き先 [12,16) は上書き規則で元クリップから削り取られる。
     assert_eq!(spans(&app), vec![(0.0, 12.0), (12.0, 4.0)]);
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let copy = song.tracks[0].clips.iter().find(|c| c.start_beat == 12.0).expect("複製がある");
     assert!(
         (copy.content_offset_beats - 4.0).abs() < 1e-9,
@@ -253,12 +253,12 @@ fn ピアノロールの_d_は範囲の長さぶん送る() {
         lanes: vec![LaneRef::KeyTrack { clip, pitch: 60 }],
     });
     app.handle_event(AppEvent::DuplicateSelectedNotes);
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mut starts: Vec<f64> =
         song.clip_notes(&song.tracks[0].clips[0]).iter().map(|n| n.start_beat).collect();
     starts.sort_by(f64::total_cmp);
     assert_eq!(starts, vec![1.5, 5.5], "裏拍の位置が保たれる");
-    let sel = app.selection.time.as_ref().expect("範囲は残る");
+    let sel = app.cur.selection.time.as_ref().expect("範囲は残る");
     assert_eq!((sel.start_beat, sel.end_beat), (4.0, 8.0), "範囲も 1 つ後ろへ送る");
 }
 
@@ -270,7 +270,7 @@ fn 範囲の複製を連打しても行き先に居たクリップを巻き込�
     let mut app = app_with_clips(&[(1, 0.0, 4.0), (2, 4.0, 4.0)]);
     app.handle_event(AppEvent::SelectClip { target: key(1), additive: false });
     for _ in 0..2 {
-        let sel = app.selection.time.as_ref().expect("範囲が立つ").clone();
+        let sel = app.cur.selection.time.as_ref().expect("範囲が立つ").clone();
         app.copy_time_range(
             sel.start_beat,
             sel.end_beat,
@@ -280,7 +280,7 @@ fn 範囲の複製を連打しても行き先に居たクリップを巻き込�
         );
     }
     assert_eq!(spans(&app), vec![(0.0, 4.0), (4.0, 4.0), (8.0, 4.0)]);
-    let sel = app.selection.time.as_ref().expect("範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("範囲が立つ");
     assert_eq!((sel.start_beat, sel.end_beat), (8.0, 12.0));
     assert_eq!(app.selected_clip_refs().len(), 1, "選択は複製 1 本だけ");
 }
@@ -307,7 +307,7 @@ fn ピアノロールの複製は行き先のノートを上書きする() {
         lanes: vec![LaneRef::KeyTrack { clip, pitch: 60 }],
     });
     app.handle_event(AppEvent::DuplicateSelectedNotes);
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mut starts: Vec<f64> =
         song.clip_notes(&song.tracks[0].clips[0]).iter().map(|n| n.start_beat).collect();
     starts.sort_by(f64::total_cmp);
@@ -351,7 +351,7 @@ fn オートメーションクリップを選ぶと範囲もそこへ移る() {
         prev: Vec::new(),
         next: vec![common::model::AutomationClipKey { track: TRACK, lane: 1, clip: 1 }],
     });
-    let sel = app.selection.time.as_ref().expect("範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("範囲が立つ");
     assert_eq!((sel.start_beat, sel.end_beat), (12.0, 16.0), "範囲が automation クリップへ移る");
     assert!(app.selected_clip_refs().is_empty(), "MIDI クリップの選択表示は外れる");
 }

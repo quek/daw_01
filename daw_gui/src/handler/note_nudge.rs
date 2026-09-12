@@ -33,7 +33,7 @@ impl AppData {
             .unwrap_or(0.25);
         match step {
             NudgeStep::Bar => {
-                let (num, den) = self.song_doc.song().time_sig;
+                let (num, den) = self.cur.song_doc.song().time_sig;
                 f64::from(num.max(1)) * 4.0 / f64::from(den.max(1))
             }
             NudgeStep::Grid if cfg.is_active(false) => selected_unit,
@@ -58,14 +58,14 @@ impl AppData {
                 continue;
             }
             let Some(clip) = self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .track_by_id(r.track_id)
                 .and_then(|t| t.clip_by_id(r.clip_id))
             else {
                 continue;
             };
-            let Some(n) = self.song_doc.song().clip_notes(clip).get(local) else {
+            let Some(n) = self.cur.song_doc.song().clip_notes(clip).get(local) else {
                 continue;
             };
             out.push((id, n.start_beat, n.duration_beats, n.pitch));
@@ -103,7 +103,7 @@ impl AppData {
             .map(|&(id, start, _, pitch)| (id, start + delta, pitch))
             .collect();
         // 連続したカーソル操作は 1 undo step に畳む (押しっぱなしで 100 step は誤り)。
-        self.song_doc.use_stream_scope(StreamGesture::NoteNudgeMove);
+        self.cur.song_doc.use_stream_scope(StreamGesture::NoteNudgeMove);
         self.set_note_positions(&entries);
         self.follow_nudged_notes();
     }
@@ -134,7 +134,7 @@ impl AppData {
             .iter()
             .map(|&(id, start, dur, _)| (id, start, dur + delta))
             .collect();
-        self.song_doc.use_stream_scope(StreamGesture::NoteNudgeLength);
+        self.cur.song_doc.use_stream_scope(StreamGesture::NoteNudgeLength);
         self.resize_notes(&entries);
         self.follow_nudged_notes();
     }
@@ -161,7 +161,7 @@ impl AppData {
         // Snap on Draw は書き戻しで吸着されるから (どちらも半音移動が破綻する)。
         let degree_scale = scale.filter(|sc| {
             matches!(sc.mode, crate::widgets::piano_roll::PianoRollScaleMode::Fold)
-                || self.ui_prefs.snap_on_draw
+                || self.cur.view.snap_on_draw
         });
         let per_step = match (octave, degree_scale) {
             // スケールの 1 オクターブ = そのスケールの音数ぶんの degree。
@@ -188,7 +188,7 @@ impl AppData {
                 (id, start, next)
             })
             .collect();
-        self.song_doc.use_stream_scope(StreamGesture::NoteNudgeMove);
+        self.cur.song_doc.use_stream_scope(StreamGesture::NoteNudgeMove);
         self.set_note_positions(&entries);
         self.follow_nudged_notes();
         self.audition_anchor_note();
@@ -203,7 +203,7 @@ impl AppData {
     /// 追従の基準は **アンカー** (最後に選んだ 1 音)。 選択集合全体を入れようとすると
     /// 広い選択ではズームを変えるしかなくなり、 意図しない表示倍率変更になる。
     fn follow_nudged_notes(&mut self) {
-        let Some((visible_beats, visible_pitches)) = self.ui_ephemeral.pianoroll_viewport else {
+        let Some((visible_beats, visible_pitches)) = self.cur.peph.pianoroll_viewport else {
             return;
         };
         let Some((_, r, start, dur, pitch)) = self.anchor_selected_note() else {
@@ -220,7 +220,7 @@ impl AppData {
         } else {
             self.pianoroll_target_clip()
                 .and_then(|t| {
-                    self.song_doc
+                    self.cur.song_doc
                         .song()
                         .track_by_id(t.track_id)
                         .and_then(|tr| tr.clip_by_id(t.clip_id))
@@ -261,11 +261,11 @@ impl AppData {
         let shown = self.shown_pianoroll_clips();
         let (r, local) = Self::decode_note_id_in(&shown, id)?;
         let clip = self
-            .song_doc
+            .cur.song_doc
             .song()
             .track_by_id(r.track_id)
             .and_then(|t| t.clip_by_id(r.clip_id))?;
-        let n = self.song_doc.song().clip_notes(clip).get(local)?;
+        let n = self.cur.song_doc.song().clip_notes(clip).get(local)?;
         Some((id, r, n.start_beat, n.duration_beats, n.pitch))
     }
 
@@ -284,38 +284,39 @@ impl AppData {
         // 鳴らすのは **そのノート自身のトラック** の音源 (複数クリップ表示では対象クリップと
         // 別トラックのノートを掴んでいることがある)。
         let Some(track_id) = self
-            .song_doc
+            .cur.song_doc
             .song()
             .track_by_id(r.track_id)
             .map(|t| t.id)
         else {
             return;
         };
-        if let Some((prev_track, prev_pitch, _)) = self.recording.nudge_audition {
+        if let Some((prev_track, prev_pitch, _)) = self.cur.recording.nudge_audition {
             if prev_track == track_id && prev_pitch == pitch {
                 return; // 同じ音のまま = 鳴らし直さない
             }
-            self.send_audio(AudioCommand::PreviewNoteOff { track_id: prev_track, pitch: prev_pitch });
+            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id: prev_track, pitch: prev_pitch });
         }
         self.send_audio(AudioCommand::PreviewNoteOn {
+            project: self.pk(),
             track_id,
             pitch,
             velocity: PREVIEW_VELOCITY,
         });
-        self.recording.nudge_audition =
+        self.cur.recording.nudge_audition =
             Some((track_id, pitch, std::time::Instant::now() + NUDGE_AUDITION_LEN));
     }
 
     /// [`Self::audition_anchor_note`] が鳴らした試聴音を、期限が来ていれば消音する
     /// (`on_tick` から毎ティック呼ばれる)。`force` は停止 / 曲差し替え / 終了時の即時消音。
     pub(crate) fn expire_nudge_audition(&mut self, force: bool) {
-        let Some((track_id, pitch, due)) = self.recording.nudge_audition else {
+        let Some((track_id, pitch, due)) = self.cur.recording.nudge_audition else {
             return;
         };
         if !force && std::time::Instant::now() < due {
             return;
         }
-        self.recording.nudge_audition = None;
-        self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+        self.cur.recording.nudge_audition = None;
+        self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
     }
 }

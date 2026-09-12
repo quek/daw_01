@@ -29,7 +29,7 @@ pub(super) fn draw_lipsync_target(
     // VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
     // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
     if app.voicevox_param_panel_open()
-        && let Some(track) = cursor_idx.and_then(|i| app.song_doc.song().tracks.get(i))
+        && let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i))
         && track.is_voicevox_vocal()
     {
         let self_id = track.id;
@@ -39,7 +39,7 @@ pub(super) fn draw_lipsync_target(
         let mut candidate_ids: Vec<u32> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         labels.push("(なし)".into());
-        for t in app.song_doc.song().tracks.iter().filter(|t| t.id != self_id) {
+        for t in app.cur.song_doc.song().tracks.iter().filter(|t| t.id != self_id) {
             candidate_ids.push(t.id);
             labels.push(if t.name.is_empty() {
                 format!("Track {}", t.id)

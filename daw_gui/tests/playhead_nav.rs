@@ -47,7 +47,7 @@ fn build_app() -> (
 }
 
 fn playhead(app: &AppData) -> f64 {
-    f64::from(app.transport.playhead_beat.expect("playhead set after seek"))
+    f64::from(app.cur.transport.playhead_beat.expect("playhead set after seek"))
 }
 
 /// 先頭 track にクリップ (beat 4 / 12) を 2 つ置いた app。 earliest = 4。
@@ -70,7 +70,7 @@ fn app_with_clips() -> (
 
 /// content 両端 (earliest_start, content_end)。
 fn bounds(app: &AppData) -> (f64, f64) {
-    common::timing::content_bounds_beats(app.song_doc.song()).expect("clips exist")
+    common::timing::content_bounds_beats(app.cur.song_doc.song()).expect("clips exist")
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn home_toggle_survives_playhead_movement_during_playback() {
 
     // 再生 poll が playhead を先へ進めたのを模す (engine tick と同じく
     // playhead_beat を直接書き、 seek_playhead_to は通らない → flag に触れない)。
-    app.transport.playhead_beat = Some((first + 4.0) as f32);
+    app.cur.transport.playhead_beat = Some((first + 4.0) as f32);
 
     // 2 回目 Home は playhead が動いていても先頭 (beat 0) へ戻る。
     app.handle_event(AppEvent::GotoTimelineHome);
@@ -167,26 +167,26 @@ fn end_moves_to_content_end() {
 fn home_end_scroll_arrange_to_reveal_target() {
     let (mut app, _a, _p) = app_with_clips(); // clips at 4, 12
     // 可視 4 拍 (200px / 50px-per-beat) にして端寄せを観測可能にする。
-    app.ui_ephemeral.last_arrange_lanes_size = (200.0, 400.0);
-    app.ui_prefs.arrange_zoom_x = 50.0;
+    app.cur.peph.last_arrange_lanes_size = (200.0, 400.0);
+    app.cur.view.arrange_zoom_x = 50.0;
     let (first, end) = bounds(&app);
     assert!(end - first > 4.0, "content が可視幅(4拍)より広い前提");
 
     // Home → 先頭 (first) が左端付近 (1 拍余白)。
     app.handle_event(AppEvent::GotoTimelineHome);
     assert!(
-        (f64::from(app.ui_prefs.arrange_scroll_beat) - (first - 1.0)).abs() < 1e-3,
+        (f64::from(app.cur.view.arrange_scroll_beat) - (first - 1.0)).abs() < 1e-3,
         "Home は先頭を左端付近へ (scroll={})",
-        app.ui_prefs.arrange_scroll_beat
+        app.cur.view.arrange_scroll_beat
     );
 
     // End → 終端 (end) が右端付近 (scroll = end - visible(4) + 1)。
     app.handle_event(AppEvent::GotoTimelineEnd);
     let expected = (end - 4.0 + 1.0).max(0.0);
     assert!(
-        (f64::from(app.ui_prefs.arrange_scroll_beat) - expected).abs() < 1e-3,
+        (f64::from(app.cur.view.arrange_scroll_beat) - expected).abs() < 1e-3,
         "End は終端を右端付近へ (scroll={}, expected={expected})",
-        app.ui_prefs.arrange_scroll_beat
+        app.cur.view.arrange_scroll_beat
     );
 }
 

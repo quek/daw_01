@@ -37,7 +37,7 @@ impl AppData {
     /// これで決まり、書き出す音が変わるので曲の一部 (計画書 Q9 / Q10)。
     #[must_use]
     pub fn global_launch_quantize(&self) -> LaunchQuantize {
-        self.song_doc.song().global_launch_quantize
+        self.cur.song_doc.song().global_launch_quantize
     }
 
     /// [`Self::global_launch_quantize`] の setter。`Song` を書き換えて (= `*` が立つ)
@@ -56,7 +56,7 @@ impl AppData {
     /// 連続値のパラメータ (CC) と同じ場所に載る。
     #[must_use]
     pub fn launcher_bindings(&self) -> Vec<common::model::MidiBinding> {
-        self.song_doc
+        self.cur.song_doc
             .song()
             .midi_bindings
             .iter()
@@ -94,11 +94,11 @@ impl AppData {
         input: common::model::MidiBindInput,
         pressed: bool,
     ) -> bool {
-        if let Some(target) = self.launcher.learn_target.take() {
+        if let Some(target) = self.cur.launcher.learn_target.take() {
             // 離した側で bind すると、押した瞬間に何が起きたか分からない。
             // 押下だけを bind の合図にする。
             if !pressed {
-                self.launcher.learn_target = Some(target);
+                self.cur.launcher.learn_target = Some(target);
                 return true;
             }
             self.add_launcher_binding(common::model::MidiBinding {
@@ -125,14 +125,14 @@ impl AppData {
         pressed: bool,
     ) -> bool {
         let key = (channel, input);
-        match self.launcher.cc_pressed.iter_mut().find(|(k, _)| *k == key) {
+        match self.cur.launcher.cc_pressed.iter_mut().find(|(k, _)| *k == key) {
             Some((_, prev)) => {
                 let edge = *prev != pressed;
                 *prev = pressed;
                 edge
             }
             None => {
-                self.launcher.cc_pressed.push((key, pressed));
+                self.cur.launcher.cc_pressed.push((key, pressed));
                 // 初回は「押した」だけを発火にする (立ち上がりでの取りこぼしを防ぐ)。
                 pressed
             }
@@ -147,7 +147,7 @@ impl AppData {
         pressed: bool,
     ) -> bool {
         let targets: Vec<common::model::BindingTarget> = self
-            .song_doc
+            .cur.song_doc
             .song()
             .midi_bindings
             .iter()
@@ -177,7 +177,7 @@ impl AppData {
                     self.cell_in_row_at_scene(LauncherRow::Track(track_id), scene_id)
                 {
                     self.launch_cell(cell, pressed, false);
-                } else if pressed && self.song_doc.song().scene_index(scene_id).is_some() {
+                } else if pressed && self.cur.song_doc.song().scene_index(scene_id).is_some() {
                     // **列が実在して、そこが空セル**のときだけ停止 (Q11)。
                     // 列ごと消えている割り当ては何もしない — 「消した列のパッドを
                     // 押したら関係ない行が止まる」のは事故でしかない。
@@ -214,28 +214,28 @@ impl AppData {
         let a = match cmd {
             LauncherAudioCommand::LaunchCell { row, clip_id, pressed, immediate } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
-                A::LaunchCell { track_id, lane_id, clip_id, pressed, immediate }
+                A::LaunchCell { project: self.pk(), track_id, lane_id, clip_id, pressed, immediate }
             }
             LauncherAudioCommand::LaunchCellFrom { row, clip_id, phase_beats } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
-                A::LaunchCellFrom { track_id, lane_id, clip_id, phase_beats }
+                A::LaunchCellFrom { project: self.pk(), track_id, lane_id, clip_id, phase_beats }
             }
             LauncherAudioCommand::RephaseRows { phase_beats } => {
-                A::RephaseLauncherRows { phase_beats }
+                A::RephaseLauncherRows { project: self.pk(), phase_beats }
             }
             LauncherAudioCommand::LaunchScene { scene_id, pressed, immediate } => {
-                A::LaunchScene { scene_id, pressed, immediate }
+                A::LaunchScene { project: self.pk(), scene_id, pressed, immediate }
             }
             LauncherAudioCommand::StopRow { row, immediate } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
-                A::StopRow { track_id, lane_id, immediate }
+                A::StopRow { project: self.pk(), track_id, lane_id, immediate }
             }
-            LauncherAudioCommand::StopAllRows { immediate } => A::StopAllRows { immediate },
+            LauncherAudioCommand::StopAllRows { immediate } => A::StopAllRows { project: self.pk(), immediate },
             LauncherAudioCommand::SwitchRowToArranger { row } => {
                 let (track_id, lane_id) = Self::launcher_row_ids(row);
-                A::SwitchRowToArranger { track_id, lane_id }
+                A::SwitchRowToArranger { project: self.pk(), track_id, lane_id }
             }
-            LauncherAudioCommand::SwitchAllToArranger => A::SwitchAllToArranger,
+            LauncherAudioCommand::SwitchAllToArranger => A::SwitchAllToArranger { project: self.pk() },
         };
         self.send_audio(a);
     }
@@ -261,9 +261,9 @@ impl AppData {
             E::SetGlobalQuantize(q) => self.set_global_launch_quantize(q),
 
             // ---- 表示 ----
-            E::SetLayout(l) => self.ui_prefs.launcher_layout = l,
+            E::SetLayout(l) => self.cur.view.launcher_layout = l,
             E::CycleLayout => {
-                self.ui_prefs.launcher_layout = self.ui_prefs.launcher_layout.cycle();
+                self.cur.view.launcher_layout = self.cur.view.launcher_layout.cycle();
             }
 
             // ---- 選択とフォーカス ----
@@ -271,10 +271,10 @@ impl AppData {
             E::SelectScene { scene_id, modifier } => self.select_scene(scene_id, modifier),
             E::OpenCellEditor(cell) => self.open_cell_editor(cell),
             E::FocusCell { row, scene_index } => {
-                self.launcher.focus = Some(LauncherFocus { row, scene_index });
+                self.cur.launcher.focus = Some(LauncherFocus { row, scene_index });
             }
             E::SetHover(at) => {
-                self.launcher.hover =
+                self.cur.launcher.hover =
                     at.map(|(row, scene_index)| LauncherFocus { row, scene_index });
             }
             E::MoveFocus { dx, dy } => self.move_launcher_focus(dx, dy),
@@ -288,7 +288,7 @@ impl AppData {
             E::MoveScene { scene_id, to_index } => self.move_scene(scene_id, to_index),
             E::SetSceneColor { scene_id, color } => self.set_scene_color(scene_id, color),
             E::BeginRenameScene(id) => self.begin_rename_scene(id),
-            E::RenameSceneChanged(t) => self.launcher.scene_rename_text = t,
+            E::RenameSceneChanged(t) => self.cur.launcher.scene_rename_text = t,
             E::CommitRenameScene => self.commit_rename_scene(),
             E::CancelRenameScene => self.cancel_rename_scene(),
             E::CaptureScene => self.capture_scene(),
@@ -306,11 +306,11 @@ impl AppData {
 
             // ---- MIDI ----
             E::StartLearn(target) => {
-                self.launcher.learn_target = Some(target);
+                self.cur.launcher.learn_target = Some(target);
                 self.ui_ephemeral.status_message =
                     format!("MIDI Learn: 次のノート / CC を「{}」に割り当てます", target.launcher_label().unwrap_or(""));
             }
-            E::CancelLearn => self.launcher.learn_target = None,
+            E::CancelLearn => self.cur.launcher.learn_target = None,
             E::ClearBindings => {
                 self.clear_launcher_bindings();
                 self.ui_ephemeral.status_message = "ランチャーの MIDI 割り当てを消しました".into();
@@ -325,7 +325,7 @@ impl AppData {
     /// 行の現在の主導権。行が実在しなければ [`RowPlayback::Arranger`]。
     #[must_use]
     pub fn row_playback(&self, row: LauncherRow) -> RowPlayback {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match row {
             LauncherRow::Track(id) => song.track_by_id(id).map_or(RowPlayback::Arranger, |t| t.launcher),
             LauncherRow::Lane(k) => song
@@ -396,7 +396,7 @@ impl AppData {
         // (`FireAt::is_playing` = transport 要求を消費する前の `playing`) で判断する
         // ので、**両側を同時に直さないと** GUI が書いた `LauncherStopped` を
         // `sync_saved_rows` が後から適用してセルが消える。
-        let playing_this = self.transport.is_playing
+        let playing_this = self.cur.transport.is_playing
             && self.running_playback(row) == RowPlayback::Launcher { clip_id };
         // Gate の離しは **その行がまだこのセルを起点にしているとき**だけ止める。
         // 間に別のセルを撃った行を止めてしまうと、engine (`release_cell` の
@@ -467,7 +467,7 @@ impl AppData {
             return None;
         }
         let (len, looping) = self.cell_loop_of(cell)?;
-        let playhead = f64::from(self.transport.playhead_beat?);
+        let playhead = f64::from(self.cur.transport.playhead_beat?);
         let now = crate::launcher_time::cell_phase(snap.launch_beat, playhead, len, looping)?;
         let want = if !len.is_finite() || len <= 0.0 || !phase_beats.is_finite() {
             0.0
@@ -482,7 +482,7 @@ impl AppData {
     /// セルのループ長と looping 設定。セルが無ければ `None`。
     #[must_use]
     fn cell_loop_of(&self, cell: LauncherCellKey) -> Option<(f64, bool)> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match cell {
             LauncherCellKey::Track(k) => song
                 .track_by_id(k.track_id)
@@ -579,7 +579,7 @@ impl AppData {
     /// 小節頭まで待つ。アレンジの再生と同じ格子)。止まっていた位置から走らせると
     /// 「どこで止めたか」で鳴り出す拍が変わり、Space の頭出しと食い違う。
     fn ensure_transport_rolling(&mut self) {
-        if !self.transport.is_playing {
+        if !self.cur.transport.is_playing {
             self.start_transport(None, crate::state::PlayFrom::Home);
         }
     }
@@ -655,7 +655,7 @@ impl AppData {
     /// で戻らなくなったりする (ボタンは点灯し続けるのに押しても直らない)。
     #[must_use]
     pub fn all_launcher_rows(&self) -> Vec<LauncherRow> {
-        all_rows_of(self.song_doc.song())
+        all_rows_of(self.cur.song_doc.song())
     }
 
     /// ランチャーの行を **アレンジと同じ表示順** で返す。
@@ -681,7 +681,7 @@ impl AppData {
         &mut self,
         rows: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>,
     ) {
-        self.launcher.running = rows;
+        self.cur.launcher.running = rows;
     }
 
     /// クリップ編集面 (ピアノロール / オーディオエディタ) が出すプレイヘッド拍。
@@ -694,13 +694,13 @@ impl AppData {
     /// アレンジのクリップは従来どおり song の playhead。鳴っていないセルは `None`。
     #[must_use]
     pub fn editor_playhead_beat(&self, target: ClipKey) -> Option<f64> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(track) = song.track_by_id(target.track_id) else {
-            return self.transport.playhead_beat.map(f64::from);
+            return self.cur.transport.playhead_beat.map(f64::from);
         };
         let Some(cell) = track.session_clip_by_id(target.clip_id) else {
             // アレンジのクリップ。
-            return self.transport.playhead_beat.map(f64::from);
+            return self.cur.transport.playhead_beat.map(f64::from);
         };
         let snap = self.launcher_running_row(target.track_id, 0)?;
         if snap.state != common::audio_bridge::LAUNCHER_STATE_PLAYING
@@ -708,7 +708,7 @@ impl AppData {
         {
             return None;
         }
-        let playhead = f64::from(self.transport.playhead_beat?);
+        let playhead = f64::from(self.cur.transport.playhead_beat?);
         let phase = crate::launcher_time::cell_phase(
             snap.launch_beat,
             playhead,
@@ -723,14 +723,14 @@ impl AppData {
     /// (= song の拍を写すと無意味な位置を指す) ので `None`。
     #[must_use]
     pub fn editor_home_beat(&self, target: ClipKey) -> Option<f64> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let is_cell = song
             .track_by_id(target.track_id)
             .is_some_and(|t| t.session_clip_by_id(target.clip_id).is_some());
         if is_cell {
             return None;
         }
-        self.transport.home_beat.map(f64::from)
+        self.cur.transport.home_beat.map(f64::from)
     }
 
     /// 行の走行状態 (engine 観測値)。`None` = engine がその行を publish していない
@@ -745,7 +745,7 @@ impl AppData {
     pub fn launcher_running_rows(&self) -> Vec<crate::launcher_time::RunningRow> {
         use common::audio_bridge::{LAUNCHER_STATE_PLAYING, LAUNCHER_STATE_STOPPED};
         use crate::launcher_time::{RowId, RunningRow};
-        self.launcher
+        self.cur.launcher
             .running
             .iter()
             .map(|(key, snap)| {
@@ -776,17 +776,17 @@ impl AppData {
         lane_id: u32,
     ) -> Option<common::audio_bridge::LauncherRowSnapshot> {
         let want = (u64::from(track_id) << 32) | u64::from(lane_id);
-        self.launcher.running.iter().find(|(k, _)| *k == want).map(|(_, s)| *s)
+        self.cur.launcher.running.iter().find(|(k, _)| *k == want).map(|(_, s)| *s)
     }
 
     #[must_use]
     pub fn launcher_rows(&self) -> Vec<LauncherRow> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut rows = Vec::new();
-        if self.ui_prefs.master_row_automation_expanded {
+        if self.cur.view.master_row_automation_expanded {
             for lane in song.song_lanes.iter().filter(|l| {
                 l.target.accepts_launcher_cells()
-                    && !self.ui_prefs.hidden_automation_lanes.contains(&common::model::AutomationLaneKey {
+                    && !self.cur.view.hidden_automation_lanes.contains(&common::model::AutomationLaneKey {
                         track: MASTER_TRACK_ID,
                         lane: l.id,
                     })
@@ -802,12 +802,12 @@ impl AppData {
                 continue;
             }
             rows.push(LauncherRow::Track(track.id));
-            if !self.ui_prefs.expanded_automation_tracks.contains(&track.id) {
+            if !self.cur.view.expanded_automation_tracks.contains(&track.id) {
                 continue;
             }
             for lane in track.automation_lanes.iter().filter(|l| {
                 l.target.accepts_launcher_cells()
-                    && !self.ui_prefs.hidden_automation_lanes.contains(&common::model::AutomationLaneKey {
+                    && !self.cur.view.hidden_automation_lanes.contains(&common::model::AutomationLaneKey {
                         track: track.id,
                         lane: l.id,
                     })
@@ -823,12 +823,12 @@ impl AppData {
 
     /// 祖先のどれかが畳まれたグループなら `true` (= 行として描かれない)。
     fn track_hidden_by_collapsed_group(&self, track_id: u32) -> bool {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut cursor = song.track_by_id(track_id).and_then(|t| t.parent_group_id);
         // 壊れた parent 連鎖 (循環) でも止まるよう hop を切る (widget と同じ 32)。
         for _ in 0..32 {
             let Some(pid) = cursor else { return false };
-            if self.ui_prefs.collapsed_groups.contains(&pid) {
+            if self.cur.view.collapsed_groups.contains(&pid) {
                 return true;
             }
             cursor = song.track_by_id(pid).and_then(|t| t.parent_group_id);
@@ -839,7 +839,7 @@ impl AppData {
     /// 列 id の表示順リスト。
     #[must_use]
     pub fn scene_ids(&self) -> Vec<u32> {
-        self.song_doc.song().scenes.iter().map(|s| s.id).collect()
+        self.cur.song_doc.song().scenes.iter().map(|s| s.id).collect()
     }
 
     /// シーン見出しの click による列選択 (無修飾 = 置換 / Ctrl = トグル / Shift = 範囲)。
@@ -854,38 +854,38 @@ impl AppData {
         if !order.contains(&scene_id) {
             return;
         }
-        let anchor = self.selection.scene_anchor;
-        let next = modifier.resolve(&self.selection.selected_scene_ids, scene_id, || {
+        let anchor = self.cur.selection.scene_anchor;
+        let next = modifier.resolve(&self.cur.selection.selected_scene_ids, scene_id, || {
             let a = anchor?;
             crate::widgets::select_modifier::range_ordered(&order, a, scene_id)
         });
-        self.selection.selected_scene_ids = next;
+        self.cur.selection.selected_scene_ids = next;
         if modifier.updates_anchor() {
-            self.selection.scene_anchor = Some(scene_id);
+            self.cur.selection.scene_anchor = Some(scene_id);
         }
-        if self.selection.selected_scene_ids.is_empty() {
+        if self.cur.selection.selected_scene_ids.is_empty() {
             // 空になったら、自分が立てたタグだけ降ろす (`select_track` と同じ作法)。
             // 残すと `edit_surface` が「タグはあるが面は空」で `None` を返し続け、
             // Delete が無反応になる。
-            if self.selection.last_edit_select == Some(crate::app::EditSurface::Scenes) {
-                self.selection.last_edit_select = None;
+            if self.cur.selection.last_edit_select == Some(crate::app::EditSurface::Scenes) {
+                self.cur.selection.last_edit_select = None;
             }
             return;
         }
         // **直近確定面を列へ移す** ([[feedback_selection_action_last_wins]])。
         // これを書かないと、列を選んでも `last_edit_select` が前の面 (アレンジの
         // 範囲など) を指したままになり、続く Delete がそちらを消す。
-        self.selection.last_edit_select = Some(crate::app::EditSurface::Scenes);
+        self.cur.selection.last_edit_select = Some(crate::app::EditSurface::Scenes);
         // 列を選んだらセル側は空にする (上記の排他)。セルは行の種類に関わらず
         // この 1 本に居るので、ここで落とすのも 1 本で足りる。
-        self.selection.selected_launcher_cells.clear();
-        self.selection.launcher_cell_anchor = None;
+        self.cur.selection.selected_launcher_cells.clear();
+        self.cur.selection.launcher_cell_anchor = None;
     }
 
     /// 行 `row` の列 `scene_id` にあるセル。
     #[must_use]
     pub fn cell_in_row_at_scene(&self, row: LauncherRow, scene_id: u32) -> Option<LauncherCellKey> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let clip_id = match row {
             LauncherRow::Track(id) => song.track_by_id(id)?.session_clip(scene_id)?.clip.id,
             LauncherRow::Lane(k) => {
@@ -910,17 +910,17 @@ impl AppData {
         if rows.is_empty() {
             return;
         }
-        let max_scene = self.song_doc.song().scenes.len(); // = 末尾プレースホルダの index
-        let cur = self.launcher.focus.and_then(|f| {
+        let max_scene = self.cur.song_doc.song().scenes.len(); // = 末尾プレースホルダの index
+        let cur = self.cur.launcher.focus.and_then(|f| {
             rows.iter().position(|r| *r == f.row).map(|i| (i, f.scene_index))
         });
         // 行が畳まれていて表示リストに無いときは、**列は保ったまま**先頭行へ寄せる
         // (列まで 0 に戻すと、グループを畳んだ瞬間にフォーカスが左上へ飛ぶ)。
         let (row_i, scene_i) =
-            cur.unwrap_or((0, self.launcher.focus.map_or(0, |f| f.scene_index)));
+            cur.unwrap_or((0, self.cur.launcher.focus.map_or(0, |f| f.scene_index)));
         let next_row = (row_i as i64 + i64::from(dy)).clamp(0, rows.len() as i64 - 1) as usize;
         let next_scene = (scene_i as i64 + i64::from(dx)).clamp(0, max_scene as i64) as usize;
-        self.launcher.focus = Some(LauncherFocus {
+        self.cur.launcher.focus = Some(LauncherFocus {
             row: rows[next_row],
             scene_index: next_scene,
         });
@@ -931,10 +931,10 @@ impl AppData {
     /// キーボードには「離す」が無いので **押下だけ**を送る。`Gate` のセルは
     /// 離すまで鳴り続けるが、これは Live のキーボード発火と同じ扱い。
     pub fn launch_focused_cell(&mut self) {
-        let Some(focus) = self.launcher.focus else {
+        let Some(focus) = self.cur.launcher.focus else {
             return;
         };
-        let Some(&scene_id) = self.song_doc.song().scenes.get(focus.scene_index).map(|s| &s.id)
+        let Some(&scene_id) = self.cur.song_doc.song().scenes.get(focus.scene_index).map(|s| &s.id)
         else {
             // プレースホルダ列 (まだ実体が無い) は撃つものが無い。
             return;
@@ -1042,21 +1042,21 @@ impl AppData {
 
     /// 列名の inline rename を開始する (見出しのダブルクリック / メニュー)。
     pub fn begin_rename_scene(&mut self, scene_id: u32) {
-        let Some(i) = self.song_doc.song().scene_index(scene_id) else {
+        let Some(i) = self.cur.song_doc.song().scene_index(scene_id) else {
             return;
         };
         // 未命名なら表示中の自動名 ("Scene N") を初期値に入れる — 空欄から
         // 打ち直させると「いま何という名前なのか」が消える。
-        self.launcher.scene_rename_text = self.song_doc.song().scenes[i].display_name(i);
-        self.launcher.scene_rename_id = Some(scene_id);
+        self.cur.launcher.scene_rename_text = self.cur.song_doc.song().scenes[i].display_name(i);
+        self.cur.launcher.scene_rename_id = Some(scene_id);
     }
 
     /// 列名の確定。空文字は「未命名へ戻す」 (= 自動名 "Scene N" に戻る)。
     pub fn commit_rename_scene(&mut self) {
-        let Some(scene_id) = self.launcher.scene_rename_id.take() else {
+        let Some(scene_id) = self.cur.launcher.scene_rename_id.take() else {
             return;
         };
-        let text = std::mem::take(&mut self.launcher.scene_rename_text);
+        let text = std::mem::take(&mut self.cur.launcher.scene_rename_text);
         let name = text.trim().to_string();
         self.edit_song_checked(|song| {
             let Some(i) = song.scene_index(scene_id) else {
@@ -1075,8 +1075,8 @@ impl AppData {
 
     /// 列名の編集をやめる (Esc / 外クリック)。
     pub fn cancel_rename_scene(&mut self) {
-        self.launcher.scene_rename_id = None;
-        self.launcher.scene_rename_text.clear();
+        self.cur.launcher.scene_rename_id = None;
+        self.cur.launcher.scene_rename_text.clear();
     }
 
     /// Capture: **いま鳴っているセル**を新しい列として取り込む。
@@ -1209,11 +1209,11 @@ impl AppData {
             return;
         }
         // 列選択へ倒す手順は `select_scene` と同じ (セル面とは排他、anchor も貼り替え)。
-        self.selection.selected_launcher_cells.clear();
-        self.selection.launcher_cell_anchor = None;
-        self.selection.scene_anchor = made.first().copied();
-        self.selection.selected_scene_ids = made;
-        self.selection.last_edit_select = Some(crate::app::EditSurface::Scenes);
+        self.cur.selection.selected_launcher_cells.clear();
+        self.cur.selection.launcher_cell_anchor = None;
+        self.cur.selection.scene_anchor = made.first().copied();
+        self.cur.selection.selected_scene_ids = made;
+        self.cur.selection.last_edit_select = Some(crate::app::EditSurface::Scenes);
     }
 }
 

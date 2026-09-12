@@ -340,9 +340,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // 算出した hover track を AppData に反映 (変化時のみ Edit、
     // arrange_hovered_track と同じ diff-guard)。 dispatch_shortcuts が S キーで読む。
-    if app.ui_ephemeral.mixer_hovered_track != hovered_strip {
+    if app.cur.peph.mixer_hovered_track != hovered_strip {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.mixer_hovered_track = hovered_strip;
+            app.cur.peph.mixer_hovered_track = hovered_strip;
         }));
     }
 }
@@ -369,12 +369,12 @@ fn draw_track_strip(
     // group strip は折り畳み disclosure を出す。collapsed 状態は
     // arrangement と共通の collapsed_groups を引く。
     let group_collapsed = if entry.is_group {
-        Some(app.ui_prefs.collapsed_groups.contains(&track_id))
+        Some(app.cur.view.collapsed_groups.contains(&track_id))
     } else {
         None
     };
     let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
-    let n_sends = app.song_doc.song().track_by_id(track_id).map_or(0, |t| t.sends.len());
+    let n_sends = app.cur.song_doc.song().track_by_id(track_id).map_or(0, |t| t.sends.len());
     // strip 高さが足りないときは band 側を縮めてフェーダーの最低高を守る
     // (縮めた分の send 行は band 内の縦スクロールで到達できる)。 旧実装は
     // band を要求どおり確保して fader_h を `.max(20.0)` で誤魔化していたため、
@@ -450,10 +450,10 @@ fn draw_return_strip(
 /// `AppData.active_param_gestures` から引く (= gesture edge 検知用)。
 fn drag_flags(app: &AppData, track_id: u32) -> (bool, bool) {
     let vol = app
-        .recording.active_param_gestures
+        .cur.recording.active_param_gestures
         .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
     let pan = app
-        .recording.active_param_gestures
+        .cur.recording.active_param_gestures
         .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
     (vol, pan)
 }
@@ -518,7 +518,7 @@ fn draw_strip(
     // arrangement と同じ `selection.selected_track_ids` (SSoT) を参照するので
     // 両ビューが連動して光る。 master は実トラックではないので対象外。 色ストライプ
     // の**後**に描いて枠が左辺で途切れないようにする (最前面に完全な枠)。
-    if !is_master && app.selection.selected_track_ids.contains(&track_idx) {
+    if !is_master && app.cur.selection.selected_track_ids.contains(&track_idx) {
         ui.push_rect(RectCommand {
             rect,
             fill: Color::TRANSPARENT,
@@ -887,9 +887,9 @@ fn draw_sends_section(
     );
 
     // 各 send の宛先名は派生 (= track_by_id で都度解決)。 send 本体は
-    // `app.song_doc.song().track_by_id(track_id).sends` を読む。 track が無ければ
+    // `app.cur.song_doc.song().track_by_id(track_id).sends` を読む。 track が無ければ
     // (race) 何も描かない。
-    let Some(src_track) = app.song_doc.song().track_by_id(track_id) else {
+    let Some(src_track) = app.cur.song_doc.song().track_by_id(track_id) else {
         return;
     };
     // band が必要高より低い (= strip が短い) ときは band 内を縦スクロールさせる。
@@ -938,7 +938,7 @@ fn draw_sends_rows(
 
     for (send_idx, send) in src_track.sends.iter().enumerate() {
         let dest_name = app
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(send.dest_track_id)
             .map(|t| {
                 if t.name.is_empty() {
@@ -993,7 +993,7 @@ fn draw_sends_rows(
             legacy_send_idx: None,
         });
         let was_dragging_send = app
-            .recording.active_param_gestures
+            .cur.recording.active_param_gestures
             .contains(&(track_id, send_gain_target.clone()));
         // 再生中は SendGain オートメーションの playhead 値に追従させる
         // (volume / pan と同 idiom)。 停止中・非 automation・書き込み中は send.gain。

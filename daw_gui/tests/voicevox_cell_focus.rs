@@ -146,13 +146,14 @@ fn app_with_vocal_cell() -> (AppData, UnboundedReceiver<PluginCommand>) {
         });
         song.ids.next_track_id = 2;
     });
-    app.ipc.loaded_devices.insert(
+    app.cur.pipc.loaded_devices.insert(
         5,
         LoadedDeviceInfo {
             plugin_id_str: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+            token: common::protocol::InstanceToken(1),
         },
     );
-    app.transport.playhead_beat = Some(0.0);
+    app.cur.transport.playhead_beat = Some(0.0);
     (app, rx)
 }
 
@@ -162,10 +163,10 @@ fn app_with_vocal_cell() -> (AppData, UnboundedReceiver<PluginCommand>) {
 fn 選んだセルが合成順序ヒントの座標を決める() {
     let (mut app, mut rx) = app_with_vocal_cell();
     let cell = app
-        .cell_in_row_at_scene(LauncherRow::Track(1), app.song_doc.song().scenes[0].id)
+        .cell_in_row_at_scene(LauncherRow::Track(1), app.cur.song_doc.song().scenes[0].id)
         .expect("列 0 にセルが居る");
-    app.selection.selected_launcher_cells = vec![cell];
-    app.selection.last_edit_select = Some(EditSurface::LauncherCells);
+    app.cur.selection.selected_launcher_cells = vec![cell];
+    app.cur.selection.last_edit_select = Some(EditSurface::LauncherCells);
 
     app.sync_vocal_metadata();
     let msgs = drain(&mut rx);
@@ -185,7 +186,7 @@ fn 選んだセルが合成順序ヒントの座標を決める() {
     // アレンジ側へ戻る (= セル選択が降りる) → ヒントは song の playhead。
     // セル選択とアレンジの選択は排他なので、「アレンジを触った」は選択を捨てる
     // ことで表す (r.md #90 / `drop_cell_selection_if_arrangement`)。
-    app.voicevox.voicevox_metadata_sent.clear();
+    app.cur.pvv.voicevox_metadata_sent.clear();
     app.handle_event(AppEvent::ClearSelection);
     app.sync_vocal_metadata();
     let msgs = drain(&mut rx);
@@ -206,8 +207,8 @@ fn 鳴っている行はそのセルの座標で送る() {
         song.track_by_id_mut(1).unwrap().launcher =
             common::model::RowPlayback::Launcher { clip_id: 2 };
     });
-    app.selection.selected_launcher_cells.clear();
-    app.selection.last_edit_select = None;
+    app.cur.selection.selected_launcher_cells.clear();
+    app.cur.selection.last_edit_select = None;
 
     app.sync_vocal_metadata();
     let msgs = drain(&mut rx);
@@ -288,7 +289,7 @@ fn 最後のソースを消すと口パクの生成物が残らない() {
     let mut app = app_with_generated_lipsync(1);
     app.handle_event(AppEvent::DeleteTracks(vec![1]));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mouth = song.track_by_id(100).expect("口 track は残る");
     assert!(
         mouth.clips.iter().all(|c| !c.auto_lipsync),
@@ -311,7 +312,7 @@ fn ソースが残っていれば口パクの生成物は消えない() {
     let mut app = app_with_generated_lipsync(2);
     app.handle_event(AppEvent::DeleteTracks(vec![1]));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mouth = song.track_by_id(100).expect("口 track");
     assert!(mouth.clips.iter().any(|c| c.auto_lipsync));
     assert!(mouth.session_clips.iter().any(|c| c.clip.auto_lipsync));
@@ -324,6 +325,6 @@ fn 口トラックを消すと出力先の参照が残らない() {
     let mut app = app_with_generated_lipsync(1);
     app.handle_event(AppEvent::DeleteTracks(vec![100]));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert_eq!(song.track_by_id(1).expect("vocal").lipsync_target_track, None);
 }

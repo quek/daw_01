@@ -13,7 +13,7 @@ use daw_gui::app::AppEvent;
 use super::support::{build_app, drain};
 
 fn count_loadsong(msgs: &[AudioCommand]) -> usize {
-    msgs.iter().filter(|m| matches!(m, AudioCommand::LoadSong(_))).count()
+    msgs.iter().filter(|m| matches!(m, AudioCommand::LoadSong { project: _, song: _ })).count()
 }
 
 /// (a) 1 frame に複数編集を積んでも、 flush は LoadSong を **1 回だけ** 送る
@@ -72,11 +72,11 @@ fn play_after_edit_syncs_latest_song_before_play() {
     let msgs = drain(&mut audio_rx);
     let load_idx = msgs
         .iter()
-        .position(|m| matches!(m, AudioCommand::LoadSong(_)))
+        .position(|m| matches!(m, AudioCommand::LoadSong { project: _, song: _ }))
         .unwrap_or_else(|| panic!("編集後の Play は最新 song を LoadSong で先に送る: {msgs:?}"));
     let play_idx = msgs
         .iter()
-        .position(|m| matches!(m, AudioCommand::Play))
+        .position(|m| matches!(m, AudioCommand::Play { project: _ }))
         .unwrap_or_else(|| panic!("Play コマンドが送られる: {msgs:?}"));
     assert!(
         load_idx < play_idx,
@@ -98,7 +98,7 @@ fn play_after_edit_syncs_latest_song_before_play() {
         "編集の無い Play は LoadSong を再送しない: {replay:?}"
     );
     assert!(
-        replay.iter().any(|m| matches!(m, AudioCommand::Play)),
+        replay.iter().any(|m| matches!(m, AudioCommand::Play { project: _ })),
         "2 回目 Play も Play コマンドは送る: {replay:?}"
     );
 }

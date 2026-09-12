@@ -35,7 +35,7 @@ use common::loudness_report::{LoudnessCollector, LoudnessReport};
 use common::model::Song;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
-use crate::engine::{EngineShared, MAX_TRACKS};
+use crate::engine::{EngineShared, MAX_TRACKS, ProjectShared};
 use crate::graph::{compile_schedule, render_master_buffer};
 use crate::mixer::TrackScratch;
 
@@ -170,6 +170,7 @@ pub struct LoudnessOutcome {
 pub fn run_export(
     path: PathBuf,
     engine_shared: Arc<EngineShared>,
+    project: Arc<ProjectShared>,
     song: Song,
     sample_rate: u32,
     max_frames: usize,
@@ -218,6 +219,7 @@ pub fn run_export(
         let mut sink = WavSink { writer: &mut writer };
         render_loop(
             &engine_shared,
+            &project,
             &song,
             sample_rate,
             max_frames,
@@ -370,6 +372,7 @@ fn wait_for_live_park(engine_shared: &EngineShared) {
 /// (= `AudioCommand::CancelExport`) で、書き出しと共通。
 pub fn run_loudness_analysis(
     engine_shared: Arc<EngineShared>,
+    project: Arc<ProjectShared>,
     song: Song,
     sample_rate: u32,
     max_frames: usize,
@@ -407,6 +410,7 @@ pub fn run_loudness_analysis(
     };
     let RenderOutcome { cancelled, .. } = render_loop(
         &engine_shared,
+        &project,
         &song,
         sample_rate,
         max_frames,
@@ -471,6 +475,7 @@ struct RenderOutcome {
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
     engine_shared: &EngineShared,
+    project: &ProjectShared,
     song: &Song,
     sample_rate: u32,
     max_frames: usize,
@@ -505,9 +510,9 @@ fn render_loop(
     // synchronous full compile here is appropriate; it reuses already-decoded
     // buffers and publishes the full renderer for the live load to pick up.
     {
-        let prev = engine_shared.audio_clip_renderer.load();
+        let prev = project.audio_clip_renderer.load();
         let prev_ref: &crate::audio_clip_renderer::AudioClipRenderer = &prev;
-        let project_dir = engine_shared
+        let project_dir = project
             .project_dir
             .load()
             .as_ref()
@@ -521,7 +526,7 @@ fn render_loop(
             // だと generation guard を迂回し、export 中に届いた新 song 用の
             // renderer を古いもので上書きしてしまう (かつ
             // `last_published_generation` も進まないので stale が live に残る)。
-            let generation = engine_shared
+            let generation = project
                 .schedule_generation
                 .load(std::sync::atomic::Ordering::Acquire);
             let full = crate::audio_clip_renderer::compile_audio_schedule(
@@ -531,7 +536,7 @@ fn render_loop(
                 sample_rate,
                 true,
             );
-            crate::publish_audio_clip_schedule(engine_shared, generation, full, sample_rate);
+            crate::project_ctl::publish_audio_clip_schedule(project, generation, full, sample_rate);
         }
     }
 
@@ -540,7 +545,7 @@ fn render_loop(
     // `render_audio_events` を通す = 不変条件 #6)。 足りないと Stretch clip が
     // degrade 経路に落ちて書き出しだけ音が変わるので、ここで必ず揃える。
     {
-        let renderer_g = engine_shared.audio_clip_renderer.load();
+        let renderer_g = project.audio_clip_renderer.load();
         for (track_idx, &needed) in renderer_g.engines_per_track.iter().enumerate() {
             let Some(ts) = scratch.get_mut(track_idx) else {
                 break;
@@ -566,7 +571,7 @@ fn render_loop(
     // (`compile_schedule` は live / export 共通なので入力も共通)。
     let mut schedule = compile_schedule(
         song,
-        &engine_shared.device_latencies.load(),
+        &project.device_latencies.load(),
         sample_rate,
         max_frames as u32,
     )
@@ -706,9 +711,9 @@ fn render_loop(
 
         // Snapshot the same wait-free state the notify thread sees (mirrors —
         // this thread is off-RT, so ArcSwap loads are fine here).
-        let plugin_refs_g = engine_shared.plugin_refs.load();
+        let plugin_refs_g = project.plugin_refs.load();
         let worker_g = engine_shared.worker.load_full();
-        let audio_renderer_g = engine_shared.audio_clip_renderer.load();
+        let audio_renderer_g = project.audio_clip_renderer.load();
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
@@ -741,7 +746,7 @@ fn render_loop(
 
         // live と同一の単一 render 経路 (§5): dispatch → schedule → master fx
         // → master gain。 export (freewheel render) は loop しない。
-        let master_gain = f32::from_bits(engine_shared.master_gain.load(Ordering::Relaxed));
+        let master_gain = f32::from_bits(project.master_gain.load(Ordering::Relaxed));
         // 行ごとの時間軸を live と同じ解き方で更新する (不変条件 6 — 片方だけ
         // 別経路にすると「聴こえた通りに書き出す」が成立しない)。
         let span = crate::launcher::runtime::BufferSpan::new(

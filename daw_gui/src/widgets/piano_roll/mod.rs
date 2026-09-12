@@ -54,7 +54,7 @@ use geometry::*;
 /// カーソルキー nudge (handler) の共有 SSoT。
 pub(crate) use geometry::{clamp_shared_delta, clamp_shared_pitch_delta};
 mod run;
-pub use run::piano_roll;
+pub use run::{piano_roll, piano_roll_state_id};
 
 // ============================================================
 // Public types

@@ -18,7 +18,7 @@ use super::support::{self, fake_plugin_loaded, select_track_single};
 
 /// track を 1 本足して plugin を 1 個載せ、その device_id を返す。
 fn add_track_with_plugin(app: &mut AppData, plugin_id: &str) -> (u32, u64) {
-    let base = app.song_doc.song().tracks[0].clone();
+    let base = app.cur.song_doc.song().tracks[0].clone();
     let track_id = app
         .edit_song(|song| {
             let id = song.alloc_track_id();
@@ -29,7 +29,7 @@ fn add_track_with_plugin(app: &mut AppData, plugin_id: &str) -> (u32, u64) {
             id
         })
         .expect("edit_song");
-    let idx = app.song_doc.song().tracks.len() - 1;
+    let idx = app.cur.song_doc.song().tracks.len() - 1;
     select_track_single(app, idx);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -44,7 +44,7 @@ fn add_track_with_plugin(app: &mut AppData, plugin_id: &str) -> (u32, u64) {
 /// plugin host が load 直後に必ず送る latency 報告。
 fn report_latency(app: &mut AppData, device_id: u64, samples: u32) {
     app.handle_event(AppEvent::Plugin(PluginEvent::PluginLatencyChanged {
-        device_id,
+        device: app.dev(device_id),
         samples,
     }));
 }
@@ -63,39 +63,39 @@ fn reopening_project_with_plugin_latency_stays_clean() {
     report_latency(&mut app, d1, 512);
     report_latency(&mut app, d2, 256);
 
-    common::project::save(&proj, app.song_doc.song()).expect("write project file");
-    app.song_doc.mark_saved();
-    assert!(!app.song_doc.is_dirty(), "保存直後は clean");
+    common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
+    app.cur.song_doc.mark_saved();
+    assert!(!app.cur.song_doc.is_dirty(), "保存直後は clean");
 
     // ---- 開き直す ----------------------------------------------------------
     app.handle_event(AppEvent::OpenRecent(proj.clone()));
     assert_eq!(
-        app.song_doc.file_path.as_ref(),
+        app.cur.song_doc.file_path.as_ref(),
         Some(&proj),
         "clean なので確認モーダル無しで開く"
     );
-    assert!(!app.song_doc.is_dirty(), "開いた直後は clean");
+    assert!(!app.cur.song_doc.is_dirty(), "開いた直後は clean");
 
     // ---- plugin host からの応答が 1 台ずつ届く ------------------------------
     // device 1 だけが load 完了 + latency 報告した時点。device 2 はまだ応答が
     // 無いが、それは「device 2 の latency が 0 になった」という意味ではない。
-    let t1_id = app.song_doc.song().tracks[1].id;
-    let t2_id = app.song_doc.song().tracks[2].id;
+    let t1_id = app.cur.song_doc.song().tracks[1].id;
+    let t2_id = app.cur.song_doc.song().tracks[2].id;
     let d1 = fake_plugin_loaded(&mut app, t1_id, 0, "test.synth");
     report_latency(&mut app, d1, 512);
     assert!(
-        !app.song_doc.is_dirty(),
+        !app.cur.song_doc.is_dirty(),
         "1 台目の latency 報告で '*' が付いてはいけない"
     );
 
     let d2 = fake_plugin_loaded(&mut app, t2_id, 0, "test.fx");
     report_latency(&mut app, d2, 256);
     assert!(
-        !app.song_doc.is_dirty(),
+        !app.cur.song_doc.is_dirty(),
         "全 device の応答が揃っても '*' が付いてはいけない"
     );
     assert!(
-        !app.song_doc.can_undo(),
+        !app.cur.song_doc.can_undo(),
         "子プロセスの報告は undo 履歴を作らない"
     );
 
@@ -104,7 +104,7 @@ fn reopening_project_with_plugin_latency_stays_clean() {
     let reported: Vec<(u64, u32)> = support::drain(&mut audio_rx)
         .into_iter()
         .filter_map(|cmd| match cmd {
-            common::protocol::AudioCommand::SetDeviceLatency { device_id, samples } => {
+            common::protocol::AudioCommand::SetDeviceLatency { project: _, device_id, samples } => {
                 Some((device_id, samples))
             }
             _ => None,
@@ -140,19 +140,19 @@ fn reopening_master_only_project_does_not_grow_a_ghost_track() {
         }));
     })
     .expect("edit_song");
-    common::project::save(&proj, app.song_doc.song()).expect("write project file");
-    app.song_doc.mark_saved();
+    common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
+    app.cur.song_doc.mark_saved();
 
     app.handle_event(AppEvent::OpenRecent(proj.clone()));
-    assert!(app.song_doc.song().tracks.is_empty(), "トラック 0 本のまま開く");
-    assert!(!app.song_doc.is_dirty(), "開いた直後は clean");
+    assert!(app.cur.song_doc.song().tracks.is_empty(), "トラック 0 本のまま開く");
+    assert!(!app.cur.song_doc.is_dirty(), "開いた直後は clean");
 
     fake_plugin_loaded(&mut app, MASTER_TRACK_ID, 0, "test.fx");
     assert!(
-        app.song_doc.song().tracks.is_empty(),
+        app.cur.song_doc.song().tracks.is_empty(),
         "子プロセスの load 応答がトラックを生やしてはいけない"
     );
-    assert!(!app.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");
+    assert!(!app.cur.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");
 }
 
 /// 保存済み device の `ports` が plugin DB の probe 結果と食い違っていても、
@@ -181,18 +181,18 @@ fn reopening_project_whose_saved_ports_differ_from_the_db_stays_clean() {
             (devices.len() - 1) as u32
         })
         .expect("edit_song");
-    common::project::save(&proj, app.song_doc.song()).expect("write project file");
-    app.song_doc.mark_saved();
+    common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
+    app.cur.song_doc.mark_saved();
 
     app.handle_event(AppEvent::OpenRecent(proj.clone()));
-    assert!(!app.song_doc.is_dirty(), "開いた直後は clean");
+    assert!(!app.cur.song_doc.is_dirty(), "開いた直後は clean");
 
     // track id は load の `ensure_ids()` で採番されるので、開いた後に読む。
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     fake_plugin_loaded(&mut app, track_id, device_index, "test.fx");
     assert_eq!(
-        app.song_doc.song().tracks[0].devices[device_index as usize].as_plugin().unwrap().ports, saved_ports,
+        app.cur.song_doc.song().tracks[0].devices[device_index as usize].as_plugin().unwrap().ports, saved_ports,
         "保存済みの port 構成は DB に上書きされない"
     );
-    assert!(!app.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");
+    assert!(!app.cur.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");
 }

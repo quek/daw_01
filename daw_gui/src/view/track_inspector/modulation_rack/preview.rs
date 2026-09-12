@@ -41,7 +41,7 @@ struct Window {
 /// 膨らまないように、 速すぎるソースで 160 点が 1 刻みを割らないように)。
 /// 曲頭近くでは左端が 0 に張り付くので、 再生位置は窓の中央とは限らない。
 fn window_of(app: &AppData, node: &common::mod_graph::ModNode, secs: f64) -> Option<Window> {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let sr = app.ipc.sample_rate.max(1);
     let dt_secs = f64::from(MOD_TICK_FRAMES) / f64::from(sr);
     if dt_secs <= 0.0 {
@@ -95,14 +95,14 @@ fn walk_window(
     playhead_beat: f64,
     mut visit: impl FnMut(i64, &ModRuntime, f64, f64),
 ) {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let mut rt = ModRuntime::default();
     rt.install(plan);
     // フォロワーは窓の間ずっと最後の値で止める (音は先読みできない)。
     // 値面は **id キー** なので slot は `slot_ids` から引く (位置で読まない)。
     for (slot, id) in plan.slot_ids.iter().enumerate() {
         let Ok(slot) = u16::try_from(slot) else { break };
-        rt.set_follower(slot, app.transport.mod_plane.scalar(*id));
+        rt.set_follower(slot, app.cur.transport.mod_plane.scalar(*id));
     }
     #[allow(clippy::cast_precision_loss)]
     let start_secs = w.start_tick as f64 * w.dt_secs;

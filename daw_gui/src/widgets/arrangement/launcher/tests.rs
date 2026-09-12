@@ -520,7 +520,7 @@ fn セッションだけの画像クリップのセルにアレンジと同じ�
     // decode 待ちの間は無地 (fill だけ)。
     assert_eq!(cell_thumbnail(&app), None, "texture が無いうちはサムネイル無し");
 
-    app.ui_ephemeral.image_texture_cache.insert(source_id, handle);
+    app.cur.peph.image_texture_cache.insert(source_id, handle);
     assert_eq!(
         cell_thumbnail(&app),
         Some(ClipThumbnail { texture: handle, width: 1920, height: 1080, start_in_content_beats: 1.0 }),

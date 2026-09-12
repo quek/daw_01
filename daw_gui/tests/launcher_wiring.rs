@@ -61,18 +61,18 @@ fn put_cell(app: &mut AppData, track_id: u32, scene_index: usize) -> LauncherCel
         row: LauncherRow::Track(track_id),
         scene_index,
     }));
-    let scene_id = app.song_doc.song().scenes[scene_index].id;
+    let scene_id = app.cur.song_doc.song().scenes[scene_index].id;
     app.cell_in_row_at_scene(LauncherRow::Track(track_id), scene_id)
         .expect("セルが作られている")
 }
 
 fn launcher_of(app: &AppData, track_id: u32) -> RowPlayback {
-    app.song_doc.song().track_by_id(track_id).expect("track").launcher
+    app.cur.song_doc.song().track_by_id(track_id).expect("track").launcher
 }
 
 /// 行 `track_id` の表示順 `scene_index` に居るセル (無ければ `None`)。
 fn cell_at(app: &AppData, track_id: u32, scene_index: usize) -> Option<LauncherCellKey> {
-    let scene_id = app.song_doc.song().scenes.get(scene_index)?.id;
+    let scene_id = app.cur.song_doc.song().scenes.get(scene_index)?.id;
     app.cell_in_row_at_scene(LauncherRow::Track(track_id), scene_id)
 }
 
@@ -133,7 +133,7 @@ fn シーン発火は全行をランチャーへ移し空セルの行は停止�
     // トラック 3 にはセルを置かない (= アレンジ主導のまま)。
 
     // 列 0 を撃つ → t1 / t2 が鳴る。
-    let scene0 = app.song_doc.song().scenes[0].id;
+    let scene0 = app.cur.song_doc.song().scenes[0].id;
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene0,
         pressed: true,
@@ -148,7 +148,7 @@ fn シーン発火は全行をランチャーへ移し空セルの行は停止�
     );
 
     // 列 1 を撃つ → t1 は次のセルへ、t2 は空セルなので停止、t3 は据え置き。
-    let scene1 = app.song_doc.song().scenes[1].id;
+    let scene1 = app.cur.song_doc.song().scenes[1].id;
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene1,
         pressed: true,
@@ -174,13 +174,13 @@ fn シーン発火は全行をランチャーへ移し空セルの行は停止�
 fn プレースホルダ列にセルを置くと列が実体化する() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 0);
-    assert!(app.song_doc.song().scenes.is_empty(), "最初は列ゼロ");
+    assert!(app.cur.song_doc.song().scenes.is_empty(), "最初は列ゼロ");
 
     // 表示上の 3 列目 (index 2) に置く。
     let cell = put_cell(&mut app, 1, 2);
 
-    assert_eq!(app.song_doc.song().scenes.len(), 3, "途中の列もまとめて実体化する");
-    let scene2 = app.song_doc.song().scenes[2].id;
+    assert_eq!(app.cur.song_doc.song().scenes.len(), 3, "途中の列もまとめて実体化する");
+    let scene2 = app.cur.song_doc.song().scenes[2].id;
     assert_eq!(app.scene_of_cell(cell), Some(scene2), "置いたセルは 3 列目に乗る");
 }
 
@@ -199,7 +199,7 @@ fn セルの削除はアレンジのクリップを巻き込まない() {
         track.clips.push(Clip { id, start_beat: 0.0, length_beats: 4.0, content_id: content, ..Clip::default() });
     });
     let cell = put_cell(&mut app, 1, 0);
-    let arrangement_clip_id = app.song_doc.song().tracks[0].clips[0].id;
+    let arrangement_clip_id = app.cur.song_doc.song().tracks[0].clips[0].id;
 
     // セルを選んで削除 (`create_launcher_cell` が選択済みだが明示する)。
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
@@ -208,7 +208,7 @@ fn セルの削除はアレンジのクリップを巻き込まない() {
     }));
     app.handle_event(AppEvent::DeleteSelectedClip);
 
-    let track = &app.song_doc.song().tracks[0];
+    let track = &app.cur.song_doc.song().tracks[0];
     assert!(track.session_clips.is_empty(), "セルは消える");
     assert_eq!(track.clips.len(), 1, "アレンジのクリップは残る");
     assert_eq!(track.clips[0].id, arrangement_clip_id);
@@ -221,7 +221,7 @@ fn セルをコピーして別の行に貼るとリンクになる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 2, 1);
     let src = put_cell(&mut app, 1, 0);
-    let src_content = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+    let src_content = app.cur.song_doc.song().tracks[0].session_clips[0].clip.content_id;
 
     let (json, count) = app.copy_launcher_cells_clip().expect("セルを選択済み");
     assert_eq!(count, 1);
@@ -234,14 +234,15 @@ fn セルをコピーして別の行に貼るとリンクになる() {
         cells,
         env.source_project_id,
         LauncherFocus { row: LauncherRow::Track(2), scene_index: 0 },
+        &env.media,
     );
 
     assert_eq!(pasted, 1);
-    let dst = &app.song_doc.song().tracks[1].session_clips;
+    let dst = &app.cur.song_doc.song().tracks[1].session_clips;
     assert_eq!(dst.len(), 1, "トラック 2 にセルが 1 つ増える");
     assert_eq!(dst[0].clip.content_id, src_content, "同一プロジェクトの貼り付けは content 共有");
     assert_eq!(
-        app.song_doc.song().tracks[0].session_clips.len(),
+        app.cur.song_doc.song().tracks[0].session_clips.len(),
         1,
         "コピー元のセルはそのまま残る"
     );
@@ -257,7 +258,7 @@ fn midi_learn_したノートでセルを撃てる() {
     let (mut app, mut audio_rx, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
-    let scene_id = app.song_doc.song().scenes[0].id;
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
     // 録音待機にして「bind に当たらないノートは音源へ流れる」ことも見る。
     app.edit_song(|song| song.tracks[0].armed = true);
     while audio_rx.try_recv().is_ok() {}
@@ -335,7 +336,7 @@ fn ローンチ設定は複数選択へ一括で効く() {
 fn gate_は離すと止まり_toggle_は再押下で止まる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 2);
-    app.transport.is_playing = true;
+    app.cur.transport.is_playing = true;
     let gate = put_cell(&mut app, 1, 0);
     app.handle_event(AppEvent::Launcher(LauncherEvent::SetLaunchSettings {
         cells: vec![gate],
@@ -375,7 +376,7 @@ fn gate_は離すと止まり_toggle_は再押下で止まる() {
 fn 停止中の_toggle_は止めずに撃ち直す() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
-    app.transport.is_playing = true;
+    app.cur.transport.is_playing = true;
     let toggle = put_cell(&mut app, 1, 0);
     app.handle_event(AppEvent::Launcher(LauncherEvent::SetLaunchSettings {
         cells: vec![toggle],
@@ -385,7 +386,7 @@ fn 停止中の_toggle_は止めずに撃ち直す() {
     assert_eq!(launcher_of(&app, 1), RowPlayback::Launcher { clip_id: toggle.clip_id() });
 
     // Space で停止 (engine の観測値を `Tick` 経由で受けたのと同じ状態)。
-    app.transport.is_playing = false;
+    app.cur.transport.is_playing = false;
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell: toggle, pressed: true, immediate: false }));
     assert_eq!(
         launcher_of(&app, 1),
@@ -408,8 +409,8 @@ fn capture_は鳴っているセルを新しい列に取り込む() {
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::CaptureScene));
 
-    assert_eq!(app.song_doc.song().scenes.len(), 2, "列が 1 本増える");
-    let new_scene = app.song_doc.song().scenes[1].id;
+    assert_eq!(app.cur.song_doc.song().scenes.len(), 2, "列が 1 本増える");
+    let new_scene = app.cur.song_doc.song().scenes[1].id;
     let captured = app
         .cell_in_row_at_scene(LauncherRow::Track(1), new_scene)
         .expect("鳴っていた行のセルが取り込まれる");
@@ -418,8 +419,8 @@ fn capture_は鳴っているセルを新しい列に取り込む() {
         "鳴っていない行は取り込まない"
     );
     // 中身はリンク (同じ content を共有)。
-    let src_content = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
-    let new_content = app.song_doc.song().tracks[0]
+    let src_content = app.cur.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+    let new_content = app.cur.song_doc.song().tracks[0]
         .session_clips
         .iter()
         .find(|c| c.clip.id == captured.clip_id())
@@ -447,21 +448,21 @@ fn フォーカス移動は末尾のプレースホルダ列まで届く() {
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::MoveFocus { dx: 5, dy: 0 }));
     assert_eq!(
-        app.launcher.focus,
+        app.cur.launcher.focus,
         Some(LauncherFocus { row: LauncherRow::Track(1), scene_index: 2 }),
         "実シーン 2 本 + 末尾のプレースホルダ 1 本まで"
     );
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::MoveFocus { dx: 0, dy: 5 }));
     assert_eq!(
-        app.launcher.focus,
+        app.cur.launcher.focus,
         Some(LauncherFocus { row: LauncherRow::Track(2), scene_index: 2 }),
         "行は最下段で止まる"
     );
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::MoveFocus { dx: -9, dy: -9 }));
     assert_eq!(
-        app.launcher.focus,
+        app.cur.launcher.focus,
         Some(LauncherFocus { row: LauncherRow::Track(1), scene_index: 0 }),
         "左上で止まる"
     );
@@ -475,11 +476,11 @@ fn 列を消すと鳴っていた行は停止に落ちる() {
     let cell = put_cell(&mut app, 1, 0);
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
 
-    let scene_id = app.song_doc.song().scenes[0].id;
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
     app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteScenes(vec![scene_id])));
 
-    assert!(app.song_doc.song().scenes.is_empty());
-    assert!(app.song_doc.song().tracks[0].session_clips.is_empty(), "列と一緒にセルも消える");
+    assert!(app.cur.song_doc.song().scenes.is_empty());
+    assert!(app.cur.song_doc.song().tracks[0].session_clips.is_empty(), "列と一緒にセルも消える");
     assert_eq!(
         launcher_of(&app, 1),
         RowPlayback::LauncherStopped,
@@ -498,18 +499,18 @@ fn セルの複製は右隣の空き列へ置く() {
         cells: vec![a],
         unique: false,
     }));
-    let scene1 = app.song_doc.song().scenes[1].id;
+    let scene1 = app.cur.song_doc.song().scenes[1].id;
     let dup = app
         .cell_in_row_at_scene(LauncherRow::Track(1), scene1)
         .expect("右隣の空き列へ置かれる");
-    assert_eq!(app.song_doc.song().scenes.len(), 2, "空きがあるので列は増えない");
+    assert_eq!(app.cur.song_doc.song().scenes.len(), 2, "空きがあるので列は増えない");
 
     // もう一度複製すると空きが無いので列が 1 本増える。
     app.handle_event(AppEvent::Launcher(LauncherEvent::DuplicateCells {
         cells: vec![dup],
         unique: false,
     }));
-    assert_eq!(app.song_doc.song().scenes.len(), 3, "空きが無ければ列を足す");
+    assert_eq!(app.cur.song_doc.song().scenes.len(), 3, "空きが無ければ列を足す");
 }
 
 /// 独立複製 (`unique = true`) は content を採り直すので、元と連動しない。
@@ -518,16 +519,16 @@ fn 独立複製したセルは元と_content_を共有しない() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 2);
     let a = put_cell(&mut app, 1, 0);
-    let src_content = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+    let src_content = app.cur.song_doc.song().tracks[0].session_clips[0].clip.content_id;
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::DuplicateCells {
         cells: vec![a],
         unique: true,
     }));
 
-    let scene1 = app.song_doc.song().scenes[1].id;
+    let scene1 = app.cur.song_doc.song().scenes[1].id;
     let dup = app.cell_in_row_at_scene(LauncherRow::Track(1), scene1).expect("複製されている");
-    let dup_content = app.song_doc.song().tracks[0]
+    let dup_content = app.cur.song_doc.song().tracks[0]
         .session_clips
         .iter()
         .find(|c| c.clip.id == dup.clip_id())
@@ -545,13 +546,13 @@ fn 列の複製は直後に入りセルと名前色を写す() {
     seed(&mut app, 2, 3);
     let a = put_cell(&mut app, 1, 0);
     put_cell(&mut app, 2, 0);
-    let src_id = app.song_doc.song().scenes[0].id;
-    let tail_id = app.song_doc.song().scenes[2].id;
+    let src_id = app.cur.song_doc.song().scenes[0].id;
+    let tail_id = app.cur.song_doc.song().scenes[2].id;
     app.edit_song(|song| {
         song.scenes[0].name = "Verse".into();
         song.scenes[0].color = Some([0.5, 0.25, 0.75]);
     });
-    let content_a = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+    let content_a = app.cur.song_doc.song().tracks[0].session_clips[0].clip.content_id;
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
         scene_id: src_id,
@@ -562,7 +563,7 @@ fn 列の複製は直後に入りセルと名前色を写す() {
         unique: false,
     }));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert_eq!(song.scenes.len(), 4, "列が 1 本増える");
     let dup = &song.scenes[1];
     assert_ne!(dup.id, src_id);
@@ -576,7 +577,7 @@ fn 列の複製は直後に入りセルと名前色を写す() {
         .expect("行 1 のセルが写る");
     assert!(app.cell_in_row_at_scene(LauncherRow::Track(2), dup_id).is_some(), "行 2 のセルも写る");
     assert_ne!(dup_a, a);
-    let dup_content = app.song_doc.song().tracks[0]
+    let dup_content = app.cur.song_doc.song().tracks[0]
         .session_clips
         .iter()
         .find(|c| c.clip.id == dup_a.clip_id())
@@ -584,7 +585,7 @@ fn 列の複製は直後に入りセルと名前色を写す() {
         .clip
         .content_id;
     assert_eq!(dup_content, content_a, "リンク複製は content を共有する");
-    assert_eq!(app.selection.selected_scene_ids, vec![dup_id], "複製後は新しい列が選択");
+    assert_eq!(app.cur.selection.selected_scene_ids, vec![dup_id], "複製後は新しい列が選択");
 }
 
 /// r.md #108: 複数列をまとめて複製すると、表示順のまま**最後に選んだ列の直後**に並ぶ。
@@ -595,8 +596,8 @@ fn 複数列の独立複製は表示順で末尾の後に並ぶ() {
     seed(&mut app, 1, 3);
     put_cell(&mut app, 1, 0);
     put_cell(&mut app, 1, 1);
-    let ids: Vec<u32> = app.song_doc.song().scenes.iter().map(|s| s.id).collect();
-    let content0 = app.song_doc.song().tracks[0].session_clips[0].clip.content_id;
+    let ids: Vec<u32> = app.cur.song_doc.song().scenes.iter().map(|s| s.id).collect();
+    let content0 = app.cur.song_doc.song().tracks[0].session_clips[0].clip.content_id;
 
     // 選択順は逆 (列 1 → 列 0) でも複製は表示順。
     app.handle_event(AppEvent::Launcher(LauncherEvent::DuplicateScenes {
@@ -604,7 +605,7 @@ fn 複数列の独立複製は表示順で末尾の後に並ぶ() {
         unique: true,
     }));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let order: Vec<u32> = song.scenes.iter().map(|s| s.id).collect();
     assert_eq!(order.len(), 5);
     assert_eq!(&order[..2], &ids[..2], "元の 2 列は先頭のまま");
@@ -613,7 +614,7 @@ fn 複数列の独立複製は表示順で末尾の後に並ぶ() {
     let c0 = app.cell_in_row_at_scene(LauncherRow::Track(1), d0).expect("列 0 の複製");
     let c1 = app.cell_in_row_at_scene(LauncherRow::Track(1), d1).expect("列 1 の複製");
     assert_ne!(c0, c1);
-    let dup_content = app.song_doc.song().tracks[0]
+    let dup_content = app.cur.song_doc.song().tracks[0]
         .session_clips
         .iter()
         .find(|c| c.clip.id == c0.clip_id())
@@ -621,7 +622,7 @@ fn 複数列の独立複製は表示順で末尾の後に並ぶ() {
         .clip
         .content_id;
     assert_ne!(dup_content, content0, "独立複製は content を採り直す");
-    assert_eq!(app.selection.selected_scene_ids, vec![d0, d1]);
+    assert_eq!(app.cur.selection.selected_scene_ids, vec![d0, d1]);
 }
 
 /// 撃った状態は「ユーザーが最後に撃ったもの」なので `Song` に入り保存されるが、
@@ -633,29 +634,29 @@ fn セル発火は未保存マークも_undo_も付けない() {
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
     // seed / put_cell で立った dirty をここで一度落とす。
-    app.song_doc.mark_saved();
-    assert!(!app.song_doc.is_dirty());
-    let depth = app.song_doc.undo_depth();
-    let sync = app.song_doc.sync_epoch();
+    app.cur.song_doc.mark_saved();
+    assert!(!app.cur.song_doc.is_dirty());
+    let depth = app.cur.song_doc.undo_depth();
+    let sync = app.cur.song_doc.sync_epoch();
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
-    assert!(!app.song_doc.is_dirty(), "再生状態は `*` を立てない");
-    assert_eq!(app.song_doc.undo_depth(), depth, "再生状態は undo に積まない");
-    assert_ne!(app.song_doc.sync_epoch(), sync, "子プロセスには届ける");
+    assert!(!app.cur.song_doc.is_dirty(), "再生状態は `*` を立てない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth, "再生状態は undo に積まない");
+    assert_ne!(app.cur.song_doc.sync_epoch(), sync, "子プロセスには届ける");
     assert!(matches!(
-        app.song_doc.song().tracks[0].launcher,
+        app.cur.song_doc.song().tracks[0].launcher,
         common::model::RowPlayback::Launcher { .. }
     ));
 
     // 同じセルをもう一度撃っても状態は変わらないので sync も進めない。
-    let sync = app.song_doc.sync_epoch();
+    let sync = app.cur.song_doc.sync_epoch();
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
-    assert_eq!(app.song_doc.sync_epoch(), sync, "同じ状態への再発火で sync を進めない");
+    assert_eq!(app.cur.song_doc.sync_epoch(), sync, "同じ状態への再発火で sync を進めない");
 
     // 行の停止も同じ扱い。
     app.handle_event(AppEvent::Launcher(LauncherEvent::StopRow { row: LauncherRow::Track(1), immediate: false }));
-    assert!(!app.song_doc.is_dirty(), "停止ボタンでも `*` を立てない");
-    assert_eq!(app.song_doc.undo_depth(), depth);
+    assert!(!app.cur.song_doc.is_dirty(), "停止ボタンでも `*` を立てない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
 }
 
 /// undo / redo は文書を履歴の snapshot に差し替えるが、再生状態は履歴に属さない
@@ -668,13 +669,13 @@ fn undo_は再生状態を巻き戻さない() {
     // 撃つ前に 1 つ文書編集 (undo 対象) を積む。
     app.handle_event(AppEvent::Launcher(LauncherEvent::AddScene));
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
-    let before = app.song_doc.song().tracks[0].launcher;
+    let before = app.cur.song_doc.song().tracks[0].launcher;
     assert!(matches!(before, common::model::RowPlayback::Launcher { .. }));
 
-    assert!(app.song_doc.undo());
-    assert_eq!(app.song_doc.song().tracks[0].launcher, before, "undo で再生状態は変わらない");
-    assert!(app.song_doc.redo());
-    assert_eq!(app.song_doc.song().tracks[0].launcher, before, "redo でも変わらない");
+    assert!(app.cur.song_doc.undo());
+    assert_eq!(app.cur.song_doc.song().tracks[0].launcher, before, "undo で再生状態は変わらない");
+    assert!(app.cur.song_doc.redo());
+    assert_eq!(app.cur.song_doc.song().tracks[0].launcher, before, "redo でも変わらない");
 }
 
 /// 空セルの上で `Enter` を押すとその行が止まる (= 空セルは停止)。
@@ -710,8 +711,8 @@ fn セルを別の行へ移すと元の行から消える() {
         mode: daw_gui::event_launcher::LauncherDropMode::Move,
     }));
 
-    assert!(app.song_doc.song().tracks[0].session_clips.is_empty(), "元の行からは消える");
-    assert_eq!(app.song_doc.song().tracks[1].session_clips.len(), 1, "先の行に現れる");
+    assert!(app.cur.song_doc.song().tracks[0].session_clips.is_empty(), "元の行からは消える");
+    assert_eq!(app.cur.song_doc.song().tracks[1].session_clips.len(), 1, "先の行に現れる");
 }
 
 /// 既にセルがある場所をもう一度叩いても何も起きない。
@@ -722,23 +723,23 @@ fn 置けないセル作成は列も未保存マークも増やさない() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
     put_cell(&mut app, 1, 0);
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
 
     // 同じ場所へもう一度 (= 既にセルがある)。
     app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
         row: LauncherRow::Track(1),
         scene_index: 0,
     }));
-    assert_eq!(app.song_doc.song().scenes.len(), 1, "列は増えない");
-    assert!(!app.song_doc.is_dirty(), "何も起きていないので `*` は付かない");
+    assert_eq!(app.cur.song_doc.song().scenes.len(), 1, "列は増えない");
+    assert!(!app.cur.song_doc.is_dirty(), "何も起きていないので `*` は付かない");
 
     // 存在しない行へ (= 置けない)。プレースホルダ列を指しても列は作らない。
     app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
         row: LauncherRow::Track(99),
         scene_index: 5,
     }));
-    assert_eq!(app.song_doc.song().scenes.len(), 1, "置けないなら列も作らない");
-    assert!(!app.song_doc.is_dirty());
+    assert_eq!(app.cur.song_doc.song().scenes.len(), 1, "置けないなら列も作らない");
+    assert!(!app.cur.song_doc.is_dirty());
 }
 
 /// 掴んだセルをそのままの位置へ落としても、曲は変わらない。
@@ -747,7 +748,7 @@ fn 同じ場所へのドロップは未保存マークを立てない() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::MoveCells {
         moves: vec![daw_gui::event_launcher::LauncherCellMove {
@@ -758,9 +759,9 @@ fn 同じ場所へのドロップは未保存マークを立てない() {
         mode: daw_gui::event_launcher::LauncherDropMode::Move,
     }));
 
-    assert!(!app.song_doc.is_dirty());
+    assert!(!app.cur.song_doc.is_dirty());
     assert_eq!(
-        app.song_doc.song().tracks[0].session_clips[0].clip.id,
+        app.cur.song_doc.song().tracks[0].session_clips[0].clip.id,
         cell.clip_id(),
         "id も採り直さない"
     );
@@ -775,11 +776,11 @@ fn セルを開くとピアノロールの編集対象になる() {
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
     // 閉じていても (r.md #96) セルを開けばピアノロールのタブで開く。
-    app.ui_prefs.bottom_panel = None;
+    app.cur.view.bottom_panel = None;
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
 
-    assert_eq!(app.ui_prefs.bottom_panel, Some(1), "ピアノロールのタブが開く");
+    assert_eq!(app.cur.view.bottom_panel, Some(1), "ピアノロールのタブが開く");
     assert_eq!(
         app.pianoroll_target_clip(),
         Some(common::model::ClipKey { track_id: 1, clip_id: cell.clip_id() }),
@@ -794,11 +795,11 @@ fn セルを開くとピアノロールの編集対象になる() {
 fn セルを作るとそのままピアノロールで開く() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 1);
-    app.ui_prefs.bottom_panel = None;
+    app.cur.view.bottom_panel = None;
 
     let cell = put_cell(&mut app, 1, 0);
 
-    assert_eq!(app.ui_prefs.bottom_panel, Some(1), "ピアノロールのタブが開く");
+    assert_eq!(app.cur.view.bottom_panel, Some(1), "ピアノロールのタブが開く");
     assert_eq!(
         app.pianoroll_target_clip(),
         Some(common::model::ClipKey { track_id: 1, clip_id: cell.clip_id() }),
@@ -822,11 +823,11 @@ fn 停止中にセルを撃つと再生が始まる() {
         sent.push(c);
     }
     assert!(
-        sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })),
         "撃った瞬間に Play が出る: {sent:?}"
     );
     assert!(
-        sent.iter().any(|c| matches!(c, AudioCommand::LaunchCell { pressed: true, .. })),
+        sent.iter().any(|c| matches!(c, AudioCommand::LaunchCell { project: _, pressed: true, .. })),
         "発火自体も送る: {sent:?}"
     );
 }
@@ -853,14 +854,14 @@ fn セルを途中から撃つと再生開始と位相付き発火が出る() {
         "鳴っていないセルには seek の基準が無い (song を 1 小節目へ戻さない): {sent:?}"
     );
     assert!(
-        sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })),
         "撃った瞬間に Play が出る: {sent:?}"
     );
     let clip_id = cell.clip_id();
     assert!(
         sent.iter().any(|c| matches!(
             c,
-            AudioCommand::LaunchCellFrom { track_id: 1, lane_id: 0, clip_id: id, phase_beats }
+            AudioCommand::LaunchCellFrom { project: _, track_id: 1, lane_id: 0, clip_id: id, phase_beats }
                 if *id == clip_id && (*phase_beats - 1.5).abs() < 1e-9
         )),
         "位相付きの発火を送る: {sent:?}"
@@ -868,12 +869,12 @@ fn セルを途中から撃つと再生開始と位相付き発火が出る() {
     assert!(
         sent.iter().any(|c| matches!(
             c,
-            AudioCommand::RephaseLauncherRows { phase_beats } if (*phase_beats - 1.5).abs() < 1e-9
+            AudioCommand::RephaseLauncherRows { project: _, phase_beats } if (*phase_beats - 1.5).abs() < 1e-9
         )),
         "他行も同じ拍へ揃える: {sent:?}"
     );
     assert_eq!(
-        app.song_doc.song().tracks[0].launcher,
+        app.cur.song_doc.song().tracks[0].launcher,
         RowPlayback::Launcher { clip_id },
         "Song 側は「このセルを撃った」"
     );
@@ -885,7 +886,7 @@ fn 再生中に撃っても_play_を重ねない() {
     let (mut app, mut audio_rx, _p) = build_app();
     seed(&mut app, 1, 1);
     let cell = put_cell(&mut app, 1, 0);
-    app.transport.is_playing = true;
+    app.cur.transport.is_playing = true;
     while audio_rx.try_recv().is_ok() {}
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
@@ -894,7 +895,7 @@ fn 再生中に撃っても_play_を重ねない() {
     while let Ok(c) = audio_rx.try_recv() {
         sent.push(c);
     }
-    assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play)), "Play は出ない: {sent:?}");
+    assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })), "Play は出ない: {sent:?}");
 }
 
 /// 別トラックのセルを選ぶと、インスペクタが見ているトラック (= カーソル) も
@@ -937,20 +938,20 @@ fn 別トラックのセルを選ぶとカーソルトラックも追従する()
 fn シーンを選ぶと列のフォローアクションが編集対象になる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 2, 3);
-    let empty_scene = app.song_doc.song().scenes[2].id;
+    let empty_scene = app.cur.song_doc.song().scenes[2].id;
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
         scene_id: empty_scene,
         modifier: SelectModifier::Single,
     }));
 
-    assert_eq!(app.selection.selected_scene_ids, vec![empty_scene]);
+    assert_eq!(app.cur.selection.selected_scene_ids, vec![empty_scene]);
     app.handle_event(AppEvent::Launcher(LauncherEvent::SetSceneFollow {
-        scene_ids: app.selection.selected_scene_ids.clone(),
+        scene_ids: app.cur.selection.selected_scene_ids.clone(),
         edit: LaunchEdit::FollowEnabled(true),
     }));
     let scene = app
-        .song_doc
+        .cur.song_doc
         .song()
         .scenes
         .iter()
@@ -967,26 +968,26 @@ fn 列を選ぶとセルの選択は落ちその逆も同じ() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 2, 2);
     let cell = put_cell(&mut app, 1, 0);
-    let scene = app.song_doc.song().scenes[1].id;
+    let scene = app.cur.song_doc.song().scenes[1].id;
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
         cell,
         modifier: SelectModifier::Single,
     }));
-    assert!(!app.selection.selected_launcher_cells.is_empty(), "セルが選ばれている");
+    assert!(!app.cur.selection.selected_launcher_cells.is_empty(), "セルが選ばれている");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
         scene_id: scene,
         modifier: SelectModifier::Single,
     }));
-    assert_eq!(app.selection.selected_scene_ids, vec![scene]);
-    assert!(app.selection.selected_launcher_cells.is_empty(), "列を選んだらセルの選択は落ちる");
+    assert_eq!(app.cur.selection.selected_scene_ids, vec![scene]);
+    assert!(app.cur.selection.selected_launcher_cells.is_empty(), "列を選んだらセルの選択は落ちる");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
         cell,
         modifier: SelectModifier::Single,
     }));
-    assert!(app.selection.selected_scene_ids.is_empty(), "セルを選んだら列の選択は落ちる");
+    assert!(app.cur.selection.selected_scene_ids.is_empty(), "セルを選んだら列の選択は落ちる");
 }
 
 /// 列を消したら、その列を指していた選択も一緒に落ちる
@@ -995,7 +996,7 @@ fn 列を選ぶとセルの選択は落ちその逆も同じ() {
 fn 消えた列は選択からも落ちる() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 1, 2);
-    let scene = app.song_doc.song().scenes[1].id;
+    let scene = app.cur.song_doc.song().scenes[1].id;
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene {
         scene_id: scene,
         modifier: SelectModifier::Single,
@@ -1003,7 +1004,7 @@ fn 消えた列は選択からも落ちる() {
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::DeleteScenes(vec![scene])));
 
-    assert!(app.selection.selected_scene_ids.is_empty(), "消えた列は選択に残らない");
+    assert!(app.cur.selection.selected_scene_ids.is_empty(), "消えた列は選択に残らない");
 }
 
 /// 実体の無い列 (右側のプレースホルダ) を撃つのは「全行停止」なので、
@@ -1014,7 +1015,7 @@ fn 実体の無い列を撃っても再生は始まらない() {
     seed(&mut app, 2, 1);
     put_cell(&mut app, 1, 0);
     while audio_rx.try_recv().is_ok() {}
-    assert!(!app.transport.is_playing, "前提: 停止している");
+    assert!(!app.cur.transport.is_playing, "前提: 停止している");
 
     // `scene_id = 0` = まだ `Song.scenes` に無い列 (widget の placeholder)。
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
@@ -1028,10 +1029,10 @@ fn 実体の無い列を撃っても再生は始まらない() {
         sent.push(c);
     }
     assert!(
-        !sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        !sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })),
         "全停止で Play を送らない: {sent:?}"
     );
-    assert!(!app.transport.is_playing, "全停止で再生が始まらない");
+    assert!(!app.cur.transport.is_playing, "全停止で再生が始まらない");
     assert_eq!(launcher_of(&app, 1), RowPlayback::LauncherStopped, "行は停止に落ちる");
 }
 
@@ -1057,7 +1058,7 @@ fn 隣り合うセルをまとめてずらしても消えない() {
         daw_gui::event_launcher::LauncherDropMode::Move,
     );
 
-    assert_eq!(app.song_doc.song().tracks[0].session_clips.len(), 2, "2 つとも残る");
+    assert_eq!(app.cur.song_doc.song().tracks[0].session_clips.len(), 2, "2 つとも残る");
     assert!(cell_at(&app, 1, 0).is_none(), "元の列 0 は空く");
     assert_eq!(cell_at(&app, 1, 1), Some(a), "A は列 1 へ (id も保つ)");
     assert_eq!(cell_at(&app, 1, 2), Some(b), "B は列 2 へ (id も保つ)");
@@ -1075,7 +1076,7 @@ fn 隣り合うセルをまとめてずらしても消えない() {
         daw_gui::event_launcher::LauncherDropMode::Move,
     );
 
-    assert_eq!(app.song_doc.song().tracks[0].session_clips.len(), 2, "2 つとも残る");
+    assert_eq!(app.cur.song_doc.song().tracks[0].session_clips.len(), 2, "2 つとも残る");
     assert_eq!(cell_at(&app, 1, 0), Some(a), "A は列 0 へ");
     assert_eq!(cell_at(&app, 1, 1), Some(b), "B は列 1 へ");
     assert!(cell_at(&app, 1, 2).is_none(), "元の列 2 は空く");
@@ -1098,7 +1099,7 @@ fn 隣り合うセルのリンクコピーは_2_つとも作られる() {
         daw_gui::event_launcher::LauncherDropMode::CopyLinked,
     );
 
-    assert_eq!(app.song_doc.song().tracks[0].session_clips.len(), 3, "元 1 つ + 複製 2 つ");
+    assert_eq!(app.cur.song_doc.song().tracks[0].session_clips.len(), 3, "元 1 つ + 複製 2 つ");
     assert_eq!(cell_at(&app, 1, 0), Some(a), "元の A はその場に残る");
     assert!(cell_at(&app, 1, 2).is_some(), "B の複製が列 2 に出来る");
 }
@@ -1121,14 +1122,14 @@ fn セルを置けない行には作れない() {
         song.song_lanes
             .push(AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::SongTempo, 120.0) });
     });
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
         row: LauncherRow::Track(1),
         scene_index: 0,
     }));
     assert!(
-        app.song_doc.song().tracks[0].session_clips.is_empty(),
+        app.cur.song_doc.song().tracks[0].session_clips.is_empty(),
         "グループトラックの行にセルは置けない"
     );
 
@@ -1140,10 +1141,10 @@ fn セルを置けない行には作れない() {
         scene_index: 0,
     }));
     assert!(
-        app.song_doc.song().song_lanes[0].session_clips.is_empty(),
+        app.cur.song_doc.song().song_lanes[0].session_clips.is_empty(),
         "テンポレーンの行にセルは置けない"
     );
-    assert!(!app.song_doc.is_dirty(), "置けないので `*` も立たない");
+    assert!(!app.cur.song_doc.is_dirty(), "置けないので `*` も立たない");
 }
 
 /// **オートメーション追従**: MIDI クリップをセルへ運ぶと、その窓に完全に入るオートメーション
@@ -1216,7 +1217,7 @@ fn クリップをセルへ運ぶとオートメーションが追従する() {
         mode: LauncherDropMode::Move,
     }));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let scene = song.scenes[0].id;
     let track = &song.tracks[0];
     assert_eq!(track.session_clips.len(), 1, "MIDI のセルが出来る");
@@ -1266,17 +1267,17 @@ fn セルを初めて開くとピアノロールがノートにフィットす�
     let cell = put_cell(&mut app, 1, 0);
     let LauncherCellKey::Track(key) = cell else { panic!("トラック行のセル") };
     // fit はグリッド寸法が要る (無いと保留フラグだけ立つ)。前フレームの描画値を模す。
-    app.ui_ephemeral.last_pianoroll_grid_size = (800.0, 400.0);
-    app.selection.selected_launcher_cells.clear();
-    assert!(!app.ui_prefs.piano_roll_views.contains_key(&key), "前提: まだ view の記憶が無い");
+    app.cur.peph.last_pianoroll_grid_size = (800.0, 400.0);
+    app.cur.selection.selected_launcher_cells.clear();
+    assert!(!app.cur.view.piano_roll_views.contains_key(&key), "前提: まだ view の記憶が無い");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
-    let first = app.ui_prefs.piano_roll_views.get(&key).copied().expect("初回は fit して view を記憶する");
+    let first = app.cur.view.piano_roll_views.get(&key).copied().expect("初回は fit して view を記憶する");
 
     // view を動かしてから選び直しても飛ばない (記憶を復元)。
-    app.ui_prefs.piano_roll_views.get_mut(&key).expect("view").scroll_beat += 7.0;
+    app.cur.view.piano_roll_views.get_mut(&key).expect("view").scroll_beat += 7.0;
     app.handle_event(AppEvent::Launcher(LauncherEvent::OpenCellEditor(cell)));
-    let second = app.ui_prefs.piano_roll_views.get(&key).copied().expect("view");
+    let second = app.cur.view.piano_roll_views.get(&key).copied().expect("view");
     assert!((second.scroll_beat - (first.scroll_beat + 7.0)).abs() < 1e-9, "2 度目は fit し直さない");
 }
 
@@ -1309,7 +1310,7 @@ fn 追従_off_ならオートメーションはセルへ運ばない() {
         }],
         mode: LauncherDropMode::Move,
     }));
-    let lane = &app.song_doc.song().tracks[0].automation_lanes[0];
+    let lane = &app.cur.song_doc.song().tracks[0].automation_lanes[0];
     assert!(lane.session_clips.is_empty(), "追従 OFF ではレーンのセルは作らない");
     assert_eq!(lane.clips.len(), 1, "レーンのクリップもそのまま");
 }
@@ -1354,7 +1355,7 @@ fn オートメーションクリップをレーン行のセルへ落とせる()
         mode: LauncherDropMode::Move,
     }));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let lane = &song.tracks[0].automation_lanes[0];
     assert_eq!(lane.session_clips.len(), 1, "レーン行の列 0 にセルが出来る");
     assert!(lane.clips.is_empty(), "移動なので元のクリップはレーンから消える");
@@ -1381,18 +1382,18 @@ fn 撃った列だけが連鎖の起点として残る() {
     let (mut app, _a, _p) = build_app();
     seed(&mut app, 2, 2);
     put_cell(&mut app, 1, 0);
-    let scene = app.song_doc.song().scenes[0].id;
-    assert_eq!(app.song_doc.song().last_launched_scene_id, 0, "前提: まだ撃っていない");
+    let scene = app.cur.song_doc.song().scenes[0].id;
+    assert_eq!(app.cur.song_doc.song().last_launched_scene_id, 0, "前提: まだ撃っていない");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene,
         pressed: true,
         immediate: false,
     }));
-    assert_eq!(app.song_doc.song().last_launched_scene_id, scene, "撃った列が起点になる");
+    assert_eq!(app.cur.song_doc.song().last_launched_scene_id, scene, "撃った列が起点になる");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::StopAllRows { immediate: false }));
-    assert_eq!(app.song_doc.song().last_launched_scene_id, 0, "全停止で起点は降りる");
+    assert_eq!(app.cur.song_doc.song().last_launched_scene_id, 0, "全停止で起点は降りる");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene {
         scene_id: scene,
@@ -1401,7 +1402,7 @@ fn 撃った列だけが連鎖の起点として残る() {
     }));
     app.handle_event(AppEvent::Launcher(LauncherEvent::AllToArranger));
     assert_eq!(
-        app.song_doc.song().last_launched_scene_id,
+        app.cur.song_doc.song().last_launched_scene_id,
         0,
         "全行アレンジ復帰でも起点は降りる"
     );
@@ -1432,7 +1433,7 @@ fn 両方の行のセルを選んだ_delete_は両方消す() {
         scene_index: 1,
     }));
     let lane_cell = app
-        .cell_in_row_at_scene(LauncherRow::Lane(lane), app.song_doc.song().scenes[1].id)
+        .cell_in_row_at_scene(LauncherRow::Lane(lane), app.cur.song_doc.song().scenes[1].id)
         .expect("レーン行にセルが出来ている");
 
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
@@ -1447,11 +1448,11 @@ fn 両方の行のセルを選んだ_delete_は両方消す() {
 
     app.delete_current_surface(false);
     assert!(
-        app.song_doc.song().tracks[0].session_clips.is_empty(),
+        app.cur.song_doc.song().tracks[0].session_clips.is_empty(),
         "トラック行のセルが消えている"
     );
     assert!(
-        app.song_doc.song().tracks[0].automation_lanes[0].session_clips.is_empty(),
+        app.cur.song_doc.song().tracks[0].automation_lanes[0].session_clips.is_empty(),
         "オートメーションレーン行のセルも同じ Delete で消えている"
     );
 }
@@ -1478,7 +1479,7 @@ fn アレンジの範囲はセル選択を降ろしエディタ内の範囲は�
         scene_index: 0,
     }));
     let lane_cell = app
-        .cell_in_row_at_scene(LauncherRow::Lane(lane), app.song_doc.song().scenes[0].id)
+        .cell_in_row_at_scene(LauncherRow::Lane(lane), app.cur.song_doc.song().scenes[0].id)
         .expect("レーン行にセルが出来ている");
     app.handle_event(AppEvent::Launcher(LauncherEvent::SelectCell {
         cell: lane_cell,
@@ -1495,7 +1496,7 @@ fn アレンジの範囲はセル選択を降ろしエディタ内の範囲は�
         }],
     });
     assert_eq!(
-        app.selection.selected_launcher_cells,
+        app.cur.selection.selected_launcher_cells,
         vec![lane_cell],
         "エディタ内の行だけの範囲ではセルの選択は残る"
     );
@@ -1507,7 +1508,7 @@ fn アレンジの範囲はセル選択を降ろしエディタ内の範囲は�
         lanes: vec![common::model::LaneRef::Automation(lane)],
     });
     assert!(
-        app.selection.selected_launcher_cells.is_empty(),
+        app.cur.selection.selected_launcher_cells.is_empty(),
         "アレンジの範囲を引いたらセルの選択は降りる"
     );
 }
@@ -1522,9 +1523,9 @@ fn 停止点からの再開はセルを頭出ししない() {
     let cell = put_cell(&mut app, 1, 0);
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
     // engine が走り出して 9 拍目で止まったのを観測する。
-    app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: true, recording_live: false });
-    app.transport.playhead_beat = Some(9.0);
-    app.handle_event(AppEvent::Tick { samples: 0, preroll: 0, playing: false, recording_live: false });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: true, recording_live: false });
+    app.cur.transport.playhead_beat = Some(9.0);
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: false, recording_live: false });
     while audio_rx.try_recv().is_ok() {}
 
     app.handle_event(AppEvent::PlayContinue);
@@ -1534,8 +1535,8 @@ fn 停止点からの再開はセルを頭出ししない() {
         sent.push(c);
     }
     assert!(
-        sent.iter().any(|c| matches!(c, AudioCommand::PlayContinue)),
+        sent.iter().any(|c| matches!(c, AudioCommand::PlayContinue { project: _ })),
         "停止点からの再開は PlayContinue: {sent:?}"
     );
-    assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play)), "Play は出ない: {sent:?}");
+    assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })), "Play は出ない: {sent:?}");
 }

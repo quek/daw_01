@@ -62,7 +62,7 @@ pub(crate) fn file_drop_target(
         return crate::view::launcher_bridge::cell_drop_target(app, resp, pos);
     }
     Some(
-        match track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, pos.1) {
+        match track_index_at_y(&resp.track_header_rects, &app.cur.song_doc.song().tracks, pos.1) {
             Some(idx) => ImportTrackTarget::Track(idx as u32),
             None => ImportTrackTarget::NewTrackBottom,
         },
@@ -132,7 +132,7 @@ fn device_drag_over_headers(
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         let dest_index = app
-            .song_doc
+            .cur.song_doc
             .song()
             .fx_chain_by_track_id(hover_track)
             .map_or(0, <[_]>::len) as u32;
@@ -207,10 +207,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 #068 連動ハイライト: 今フレームの hovered clip の content_id を
     // 次フレームの active group 計算用に保持 (変化時のみ Edit を発火、 毎フレーム
     // の無駄な mutate を避ける)。
-    let hover_content = hovered_share_content(app.song_doc.song(), &resp);
-    if hover_content != app.ui_ephemeral.arrange_hover_content {
+    let hover_content = hovered_share_content(app.cur.song_doc.song(), &resp);
+    if hover_content != app.cur.peph.arrange_hover_content {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.arrange_hover_content = hover_content;
+            app.cur.peph.arrange_hover_content = hover_content;
         }));
     }
 
@@ -220,9 +220,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let hover_lane = resp
         .hovered_automation_lane
         .map(|k| common::model::AutomationLaneKey { track: k.track, lane: k.lane });
-    if hover_lane != app.ui_ephemeral.arrange_hovered_automation_lane {
+    if hover_lane != app.cur.peph.arrange_hovered_automation_lane {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.arrange_hovered_automation_lane = hover_lane;
+            app.cur.peph.arrange_hovered_automation_lane = hover_lane;
         }));
     }
 
@@ -234,8 +234,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // response field 経由で行う)。 これが無いとスライダ操作が undo に積まれず、
     // mixer フェーダーと同じ「Undo がクリップ移動まで巻き戻る」 症状になる。
     let drag_vol = resp.dragging_track_volume;
-    if drag_vol != app.ui_ephemeral.arrange_dragging_track_volume {
-        let prev = app.ui_ephemeral.arrange_dragging_track_volume;
+    if drag_vol != app.cur.peph.arrange_dragging_track_volume {
+        let prev = app.cur.peph.arrange_dragging_track_volume;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             use common::model::{AutomationTarget, TrackBuiltinParam};
             if let Some(t) = prev {
@@ -251,7 +251,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     display_name: "Volume".to_string(),
                 });
             }
-            app.ui_ephemeral.arrange_dragging_track_volume = drag_vol;
+            app.cur.peph.arrange_dragging_track_volume = drag_vol;
         }));
     }
 
@@ -274,8 +274,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // rename overlay 判定用に clip_rename の生存確認を 1 回だけ済ませる
     // (selected_clips と同 idiom)。 track rename の renaming_track_id と同
     // パターンで、 ループ内で live_clip_key を毎 clip 呼ぶ線形探索を避ける。
-    let renaming_clip_key = app.ui_ephemeral.clip_rename.and_then(|r| {
-        let t = app.song_doc.song().track_by_id(r.track_id)?;
+    let renaming_clip_key = app.cur.peph.clip_rename.and_then(|r| {
+        let t = app.cur.song_doc.song().track_by_id(r.track_id)?;
         let c = t.clip_by_id(r.clip_id)?;
         Some(ClipKey { track_id: t.id, clip_id: c.id })
     });
@@ -340,7 +340,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // lanes 左端 (= track header の右) より左には描かせない。 左スクロールで
         // clip の左端がヘッダの下に潜っている状態でも、 値ラベルが M/S/R ボタンの
         // 上に載らないようにするための下限。
-        let lanes_left = area.x + app.ui_prefs.arrange_header_w.max(0.0);
+        let lanes_left = area.x + app.cur.view.arrange_header_w.max(0.0);
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect, lanes_left);
 
         // VOICEVOX 生成中マーカー。歌唱/読み上げトラックが合成中なら
@@ -362,7 +362,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let edit_resp = ui.text_input_at_focused(
                 ("clip_rename", key.track_id, key.clip_id),
                 input_rect,
-                &app.ui_ephemeral.clip_rename_text,
+                &app.cur.peph.clip_rename_text,
                 &ui.text_input_style(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
@@ -424,7 +424,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 値の表示/解釈は `automation_value` (人間可読単位 SSoT) を 1 経路で使う。
 
     // (a) 編集中 point の inline 数値入力欄 (点をダブルクリックで開始)。
-    if let Some(edit_key) = app.ui_ephemeral.editing_automation_point {
+    if let Some(edit_key) = app.cur.peph.editing_automation_point {
         let point_rect = resp
             .automation_point_rects
             .iter()
@@ -436,7 +436,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
             .map(|(_, r)| *r);
         let lane_target = app
-            .song_doc.song()
+            .cur.song_doc.song()
             .automation_lane_by_key(edit_key.track_id, edit_key.lane_id)
             .map(|l| l.target.clone());
         if let (Some(rect), Some(target)) = (point_rect, lane_target) {
@@ -476,19 +476,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             value: plain,
                         });
                     } else {
-                        app.ui_ephemeral.editing_automation_point = None;
+                        app.cur.peph.editing_automation_point = None;
                     }
                 }));
             } else if !edit_resp.focused {
                 // Esc / focus 喪失 (commit でない) → キャンセル。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.ui_ephemeral.editing_automation_point = None;
+                    app.cur.peph.editing_automation_point = None;
                 }));
             }
         } else {
             // 点が画面外 / 削除済 → 編集状態を破棄。
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.ui_ephemeral.editing_automation_point = None;
+                app.cur.peph.editing_automation_point = None;
             }));
         }
     }
@@ -502,14 +502,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             lane: lk.lane,
         };
         let Some(target) = app
-            .song_doc.song()
+            .cur.song_doc.song()
             .automation_lane_by_key(lk.track, lk.lane)
             .map(|l| l.target.clone())
         else {
             continue;
         };
         let default_value = app
-            .song_doc.song()
+            .cur.song_doc.song()
             .automation_lane_by_key(lk.track, lk.lane)
             .map_or(0.0, |l| l.default_value);
         let plugin_range = app.plugin_param_range(&target);
@@ -569,7 +569,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (c) point drag 中の現値表示 (人間可読単位、 カーソル近傍)。
     if let Some(drag) = resp.automation_point_drag
         && let Some(target) = app
-            .song_doc.song()
+            .cur.song_doc.song()
             .automation_lane_by_key(drag.key.clip.track, drag.key.clip.lane)
             .map(|l| l.target.clone())
     {
@@ -681,7 +681,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // rename mode 中の track には text_input を rect に重ね描きする。
     // rename 対象は安定 ID で直接持つ (index 経由の解決はしない = reorder/delete で
     // 別 track にすり替わらない、 SSoT)。
-    let renaming_track_id = app.ui_ephemeral.track_rename_id;
+    let renaming_track_id = app.cur.peph.track_rename_id;
     for (track_id, rect) in &resp.track_header_rects {
         let track_id = *track_id;
         let rect = *rect;
@@ -701,8 +701,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // 選択集合に含まれるなら選択全体、 含まれないなら右クリック track
                     // 単独 (REAPER / Ableton 流)。 メニュー内で規則を割らない。
                     let target_ids = || {
-                        if app.selection.selected_track_ids.contains(&track_id) {
-                            app.selection.selected_track_ids.clone()
+                        if app.cur.selection.selected_track_ids.contains(&track_id) {
+                            app.cur.selection.selected_track_ids.clone()
                         } else {
                             vec![track_id]
                         }
@@ -740,7 +740,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let resp = ui.text_input_at_focused(
                 ("track_rename", track_id),
                 input_rect,
-                &app.ui_ephemeral.track_rename_text,
+                &app.cur.peph.track_rename_text,
                 &ui.text_input_style(),
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
@@ -766,7 +766,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // しない)、`dismissed` で target を None に戻す。
     // セクション帯の inline 改名。section_rename_id の帯 rect に text_input を重ねる
     // (track rename と同 idiom)。Enter で commit、 Esc は root の escape handler が CancelRenameSection。
-    if let Some(rename_id) = app.ui_ephemeral.section_rename_id {
+    if let Some(rename_id) = app.cur.peph.section_rename_id {
         for (sid, rect) in &resp.section_rects {
             if *sid == rename_id {
                 let input_rect = Rect {
@@ -778,7 +778,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let r = ui.text_input_at_focused(
                     ("section_rename", *sid),
                     input_rect,
-                    &app.ui_ephemeral.section_rename_text,
+                    &app.cur.peph.section_rename_text,
                     &ui.text_input_style(),
                     |new| {
                         Edit::mutate(move |app: &mut AppData| {
@@ -819,9 +819,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // `arrange_snap_config`) を読むので座標変換は完全一致する。
     // r.md #53: widget 側は表示原点をピクセル境界にスナップして描くので、pixel→beat の
     // 逆変換もスナップ後の原点を使う (= 見えている位置とドロップ / Split 位置が一致する)。
-    let zoom = app.ui_prefs.arrange_zoom_x.max(1.0);
+    let zoom = app.cur.view.arrange_zoom_x.max(1.0);
     let scroll_beat = crate::widgets::arrangement::pixel_snapped_scroll_beat(
-        f64::from(app.ui_prefs.arrange_scroll_beat),
+        f64::from(app.cur.view.arrange_scroll_beat),
         canvas_area.w.max(1.0),
         zoom,
     );
@@ -951,8 +951,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // が 1 つ下の track の clip を対象にしてしまうため使わない。 lanes 側でも
         // 各行の Y レンジは header と共通なので Y のみで判定する。
         let (_, py) = ui.pointer().pos?;
-        let track_idx = track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, py)?;
-        let track = app.song_doc.song().tracks.get(track_idx)?;
+        let track_idx = track_index_at_y(&resp.track_header_rects, &app.cur.song_doc.song().tracks, py)?;
+        let track = app.cur.song_doc.song().tracks.get(track_idx)?;
         // hit-test の入口は表示順の index だが、 **返す住所は安定 id**
         // (`arrangement_hover_clip` は Split (E) 等の対象解決に使われるので、
         // index で返すと「カーソルの下ではないクリップが切られる」)。
@@ -970,31 +970,34 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if !area.contains(px, py) {
             return None;
         }
-        let idx = track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, py)?;
-        app.song_doc.song().tracks.get(idx).map(|t| t.id)
+        let idx = track_index_at_y(&resp.track_header_rects, &app.cur.song_doc.song().tracks, py)?;
+        app.cur.song_doc.song().tracks.get(idx).map(|t| t.id)
     });
     let drag_active = resp.edge_scroll_drag;
-    if app.ui_ephemeral.arrangement_hover_beat != snapped_beat
-        || app.ui_ephemeral.arrangement_hover_beat_raw != raw_beat
-        || app.ui_ephemeral.arrangement_hover_clip != hover_clip
-        || app.ui_ephemeral.arrange_hovered_track != hovered_track_id
-        || app.ui_ephemeral.arrange_drag_active != drag_active
-        || app.ui_ephemeral.arrange_arranger_rect != resp.arranger_rect
-        || app.ui_ephemeral.launcher_pane_rect != resp.launcher_pane_rect
-        || app.ui_ephemeral.launcher_grid_rect != resp.launcher_grid_rect
+    if app.cur.peph.arrangement_hover_beat != snapped_beat
+        || app.cur.peph.arrangement_hover_beat_raw != raw_beat
+        || app.cur.peph.arrangement_hover_clip != hover_clip
+        || app.cur.peph.arrange_hovered_track != hovered_track_id
+        || app.cur.peph.arrange_drag_active != drag_active
+        || app.cur.peph.arrange_xfer_drag_active != resp.xfer_drag_active
+        || app.cur.peph.arrange_arranger_rect != resp.arranger_rect
+        || app.cur.peph.launcher_pane_rect != resp.launcher_pane_rect
+        || app.cur.peph.launcher_grid_rect != resp.launcher_grid_rect
     {
         let arranger_rect = resp.arranger_rect;
         let launcher_pane_rect = resp.launcher_pane_rect;
         let launcher_grid_rect = resp.launcher_grid_rect;
+        let xfer_drag_active = resp.xfer_drag_active;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.arrangement_hover_beat = snapped_beat;
-            app.ui_ephemeral.arrangement_hover_beat_raw = raw_beat;
-            app.ui_ephemeral.arrangement_hover_clip = hover_clip;
-            app.ui_ephemeral.arrange_hovered_track = hovered_track_id;
-            app.ui_ephemeral.arrange_drag_active = drag_active;
-            app.ui_ephemeral.arrange_arranger_rect = arranger_rect;
-            app.ui_ephemeral.launcher_pane_rect = launcher_pane_rect;
-            app.ui_ephemeral.launcher_grid_rect = launcher_grid_rect;
+            app.cur.peph.arrange_xfer_drag_active = xfer_drag_active;
+            app.cur.peph.arrangement_hover_beat = snapped_beat;
+            app.cur.peph.arrangement_hover_beat_raw = raw_beat;
+            app.cur.peph.arrangement_hover_clip = hover_clip;
+            app.cur.peph.arrange_hovered_track = hovered_track_id;
+            app.cur.peph.arrange_drag_active = drag_active;
+            app.cur.peph.arrange_arranger_rect = arranger_rect;
+            app.cur.peph.launcher_pane_rect = launcher_pane_rect;
+            app.cur.peph.launcher_grid_rect = launcher_grid_rect;
         }));
     }
 }
@@ -1027,12 +1030,12 @@ fn apply_curve_menu_choice(
         return;
     }
     let resolved = app
-        .song_doc
+        .cur.song_doc
         .song()
         .track_by_id(key.clip.track)
         .and_then(|t| t.lane_by_id(key.clip.lane))
         .and_then(|l| l.clip_by_id(key.clip.clip))
-        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id))
+        .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id))
         .and_then(|cc| cc.automation_points())
         .and_then(|pts| Some((pts.get(point_idx)?, pts.get(point_idx - 1)?)))
         .map(|(cur, prev)| (cur.id, prev.value, cur.value));
@@ -1059,17 +1062,17 @@ fn apply_curve_menu_choice(
 }
 
 fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
-    let Some((track, beat, pos)) = app.ui_ephemeral.clip_create_menu else {
+    let Some((track, beat, pos)) = app.cur.peph.clip_create_menu else {
         return;
     };
-    let open_at = if app.ui_ephemeral.clip_create_menu_open {
+    let open_at = if app.cur.peph.clip_create_menu_open {
         Some(pos)
     } else {
         None
     };
-    if app.ui_ephemeral.clip_create_menu_open {
+    if app.cur.peph.clip_create_menu_open {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.ui_ephemeral.clip_create_menu_open = false;
+            app.cur.peph.clip_create_menu_open = false;
         }));
     }
     ui.context_menu_at(
@@ -1083,7 +1086,7 @@ fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
                         track,
                         start_beat: beat,
                     });
-                    app.ui_ephemeral.clip_create_menu = None;
+                    app.cur.peph.clip_create_menu = None;
                 }));
             }
         },
@@ -1119,13 +1122,13 @@ fn render_ruler_menu_overlay(ui: &mut Ui<'_, AppData>, ruler_rect: Rect) {
 /// (`render_clip_create_menu_overlay` と同 idiom)。 項目: このセクションをループ / 帯のみ削除 /
 /// 範囲ごと削除。 選択で stash を `None` に戻す。
 fn render_section_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
-    let Some((section_id, pos)) = app.ui_ephemeral.section_menu else {
+    let Some((section_id, pos)) = app.cur.peph.section_menu else {
         return;
     };
-    let open_at = if app.ui_ephemeral.section_menu_open { Some(pos) } else { None };
-    if app.ui_ephemeral.section_menu_open {
+    let open_at = if app.cur.peph.section_menu_open { Some(pos) } else { None };
+    if app.cur.peph.section_menu_open {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.ui_ephemeral.section_menu_open = false;
+            app.cur.peph.section_menu_open = false;
         }));
     }
     ui.context_menu_at(
@@ -1145,7 +1148,7 @@ fn render_section_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
                     4 => app.apply_delete_section_range(section_id),
                     _ => {}
                 }
-                app.ui_ephemeral.section_menu = None;
+                app.cur.peph.section_menu = None;
             }));
         },
     );
@@ -1199,7 +1202,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "arr_snap_toggle",
         "Snap",
         toggle_rect,
-        app.ui_prefs.arrange_snap_enabled,
+        app.cur.view.arrange_snap_enabled,
         &snap_toggle_style(&app.theme),
         |new| {
             Edit::mutate(move |app: &mut AppData| {
@@ -1212,7 +1215,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "arr_snap_unit",
         dropdown_rect,
         SNAP_LABELS,
-        app.ui_prefs.arrange_snap_choice as usize,
+        app.cur.view.arrange_snap_choice as usize,
     ) {
         let new = idx as u8;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1287,7 +1290,7 @@ fn draw_clip_synth_spinner(
     clip_rect: Rect,
 ) {
     // idle フレーム (生成なし) は per-clip の track 探索を一切しない。
-    if app.voicevox.voicevox_synth_status.is_empty() && app.voicevox.lipsync_inflight.is_empty() {
+    if app.cur.pvv.voicevox_synth_status.is_empty() && app.cur.pvv.lipsync_inflight.is_empty() {
         return;
     }
     // バッジ (チップ+スピナー) が名前/枠に被らない最小サイズ。狭い/低い clip は省略。
@@ -1297,7 +1300,7 @@ fn draw_clip_synth_spinner(
     let wav = app.clip_wav_synthesizing(clip_key.track_id, clip_key.clip_id);
     let lip = app.lipsync_target_generating(clip_key.track_id)
         && app
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == clip_key.track_id)
@@ -1350,19 +1353,19 @@ fn draw_audio_clip_value_overlay(
     if clip_rect.w < 60.0 || clip_rect.h < 24.0 {
         return;
     }
-    let Some(t_idx) = app.song_doc.song().tracks.iter().position(|t| t.id == clip_key.track_id) else {
+    let Some(t_idx) = app.cur.song_doc.song().tracks.iter().position(|t| t.id == clip_key.track_id) else {
         return;
     };
-    let Some(c_idx) = app.song_doc.song().tracks[t_idx]
+    let Some(c_idx) = app.cur.song_doc.song().tracks[t_idx]
         .clips
         .iter()
         .position(|c| c.id == clip_key.clip_id)
     else {
         return;
     };
-    let track = &app.song_doc.song().tracks[t_idx];
+    let track = &app.cur.song_doc.song().tracks[t_idx];
     let clip = &track.clips[c_idx];
-    let Some(content) = app.song_doc.song().clip_contents.get(&clip.content_id) else {
+    let Some(content) = app.cur.song_doc.song().clip_contents.get(&clip.content_id) else {
         return;
     };
     let Some(events) = content.audio_events() else {

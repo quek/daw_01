@@ -7,6 +7,7 @@ pub mod automation;
 pub mod automation_lanes;
 pub mod bounce;
 pub mod clip_events;
+pub mod clipboard_media;
 pub mod clips;
 pub mod colors;
 pub mod device_relocate;
@@ -43,6 +44,7 @@ pub mod selection_view;
 /// r.md #61: 終了シーケンスの実行 (子プロセス teardown の待ち合わせ)。
 pub mod shutdown;
 pub mod sync;
+pub mod tabs;
 pub mod tick;
 pub mod tracks;
 pub mod transport;

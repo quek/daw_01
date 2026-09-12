@@ -104,7 +104,7 @@ pub(super) fn commit_releases(
                 );
                 // track 方向は y→visible 行 index 解決の差 (per-track 行高 / lane 展開対応、
                 // overlay と同 helper)。
-                let td = compute_clip_drag_track_delta(&nd, press_tops);
+                let td = compute_clip_drag_track_delta(&nd, press_tops, view.track_row_h);
                 (snapped, td)
             };
             let min_clip_len = common::model::MIN_CLIP_LEN_BEATS;
@@ -119,54 +119,14 @@ pub(super) fn commit_releases(
                 // 動かすのは**常に範囲** (`docs/plan_range_selection.md` §6)。
                 // press 時に確定した `move_range` を、拍 delta とトラック写像で運ぶ。
                 // Ctrl / Ctrl+Shift は「動かす」代わりに「複製して置く」。
-                ClipDragKind::Move => {
-                    // M14 Phase 63c (#016): visible_tracks (collapsed 親の subtree skip 後) で
-                    // index → track_id を解決。 anchor.track_index が visible-idx なので、
-                    // press_i32 + track_delta も visible domain で clamp する。
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    let max_idx_i32 = (visible_tracks.len().saturating_sub(1)) as i32;
-                    // master_row 有りなら visible_tracks[0] は synthetic master (id=MASTER_TRACK_ID)。
-                    // clip drop 先から master を除外 (track_header drag / DoubleClickEmpty と
-                    // 同じ guard、 ここだけ漏れていた)。 visible_tracks に通常 track が無い退化
-                    // ケース (master のみ) は max < min となり clamp が panic するので max を
-                    // min まで底上げして fallback (visible_tracks.get(1) = None → 元 track id)。
-                    let min_idx_i32 = i32::from(master_row.is_some());
-                    let clamp_max = max_idx_i32.max(min_idx_i32);
-                    // 範囲が掛かっているトラック行の写像 `(移動元, 行き先)`。
-                    // `track_rows` は press 時に確定した範囲の全トラック行 (クリップの
-                    // 有無を問わない) で、visible-idx に track_delta を足して visible
-                    // domain のまま clamp してから track id へ戻す。
-                    let mut track_map: Vec<(u32, u32)> = Vec::new();
-                    for &(from, t_idx) in &nd.track_rows {
-                        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                        let press_i32 = t_idx as i32;
-                        let new_idx = (press_i32 + track_delta).clamp(min_idx_i32, clamp_max);
-                        #[allow(clippy::cast_sign_loss)]
-                        let new_idx_u = new_idx.max(0) as usize;
-                        let to = visible_tracks.get(new_idx_u).map_or(from, |t| t.id);
-                        track_map.push((from, to));
-                    }
-                    let (ra, rb) = nd.move_range;
-                    // automation lane 行だけの範囲 (`track_map` 空) でも横移動は成立する
-                    // (`move_time_range` が範囲の明示 lane を自分で運ぶ)。
-                    let moved = beat_delta.abs() > 1e-6
-                        || track_map.iter().any(|(from, to)| from != to);
-                    if moved {
-                        // M14 Phase 63e (#019): Move + Ctrl + Shift → 独立コピー、
-                        // Move + Ctrl → リンクコピー、 それ以外 → 移動。
-                        // `last_ctrl` / `last_shift` は overlay と同じ真値を読むので、 release
-                        // frame の OS event 順序問題に依存せず確定する。 Alt は直交 (snap 一時
-                        // 無効のみ) で、 既に上の `compute_clip_drag_beat_delta` で適用済。
-                        let (ctrl, shift) = (nd.last_ctrl, nd.last_shift);
-                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                            if ctrl {
-                                app.copy_time_range(ra, rb, beat_delta, &track_map, shift);
-                            } else {
-                                app.move_time_range(ra, rb, beat_delta, &track_map);
-                            }
-                        }));
-                    }
-                }
+                ClipDragKind::Move => commit_clip_move(
+                    ui,
+                    &nd,
+                    visible_tracks,
+                    master_row.is_some(),
+                    beat_delta,
+                    track_delta,
+                ),
                 // r.md #68: 端 drag の (start, len) は **preview と同じ関数** で出す
                 // (`resize_preview_start_len` = ゴーストの矩形 / ゴーストの中身 /
                 // ここ の 3 箇所の SSoT)。 以前は左右で別々に同じ式を写経していて、
@@ -330,7 +290,7 @@ pub(super) fn commit_releases(
                 };
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let anchor = app
-                        .selection
+                        .cur.selection
                         .automation_point_anchor
                         .map(point_key_from_model)
                         .filter(|a| a.clip == pressed.clip);
@@ -347,7 +307,7 @@ pub(super) fn commit_releases(
                         });
                     }
                     if modifier.updates_anchor() {
-                        app.selection.automation_point_anchor =
+                        app.cur.selection.automation_point_anchor =
                             Some(point_key_to_model(pressed));
                     }
                 }));
@@ -777,7 +737,7 @@ pub(super) fn commit_releases(
         // dist >= 16px → 上で計算した `pending_drop` を SetTrackParent として 1 度発行。
         // 旧 ReorderTracks 経由の sibling reorder も同 variant に統合済 (parent 不変 + anchor_after 指定)。
         if let Some((src_tracks, parent, anchor_after)) = pending_drop {
-            ui.push_edit({ let v_tracks = src_tracks; let v_parent = parent; let v_anchor = anchor_after; Edit::mutate(move |app: &mut AppData| { if !v_tracks.iter().any(|id| app.song_doc.song().tracks.iter().any(|t| t.id == *id)) { return; } app.edit_song(|song| { let mut moved: Vec<common::model::Track> = v_tracks.iter().filter_map(|id| { let pos = song.tracks.iter().position(|t| t.id == *id)?; Some(song.tracks.remove(pos)) }).collect(); if moved.is_empty() { return; } for t in &mut moved { t.parent_group_id = v_parent; } let insert_at = match v_anchor { None => 0, Some(after_id) => song.tracks.iter().position(|t| t.id == after_id).map(|i| i + 1).unwrap_or(song.tracks.len()) }; for (offset, t) in moved.into_iter().enumerate() { song.tracks.insert(insert_at + offset, t); } }); }) });
+            ui.push_edit({ let v_tracks = src_tracks; let v_parent = parent; let v_anchor = anchor_after; Edit::mutate(move |app: &mut AppData| { if !v_tracks.iter().any(|id| app.cur.song_doc.song().tracks.iter().any(|t| t.id == *id)) { return; } app.edit_song(|song| { let mut moved: Vec<common::model::Track> = v_tracks.iter().filter_map(|id| { let pos = song.tracks.iter().position(|t| t.id == *id)?; Some(song.tracks.remove(pos)) }).collect(); if moved.is_empty() { return; } for t in &mut moved { t.parent_group_id = v_parent; } let insert_at = match v_anchor { None => 0, Some(after_id) => song.tracks.iter().position(|t| t.id == after_id).map(|i| i + 1).unwrap_or(song.tracks.len()) }; for (offset, t) in moved.into_iter().enumerate() { song.tracks.insert(insert_at + offset, t); } }); }) });
         }
 
         // ---- M10 Phase 47b+49: track volume drag release → 最終値を 1 度 commit ----
@@ -848,7 +808,7 @@ pub(super) fn commit_releases(
                     #[allow(clippy::cast_possible_truncation)]
                     let new_top =
                         (abs_pos * f64::from(new_h) - f64::from(my - lanes.y)).max(0.0) as f32;
-                    ui.push_edit({ let v_t = new_top; Edit::mutate(move |app: &mut AppData| { app.ui_prefs.arrange_track_top = v_t.max(0.0); }) });
+                    ui.push_edit({ let v_t = new_top; Edit::mutate(move |app: &mut AppData| { app.cur.view.arrange_track_top = v_t.max(0.0); }) });
                 }
                 ui.push_edit({ let v_h = new_h; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetArrangeTrackRowH(v_h)); }) });
 
@@ -905,7 +865,7 @@ pub(super) fn commit_releases(
                 // と同じ「入力層の px delta をそのまま使う」 に揃える (1 ノッチ ≈ 40px ≈ 1 行)。
                 if dy.abs() > 0.0 {
                     let new_top = (view.track_top - dy).max(0.0);
-                    ui.push_edit({ let v_t = new_top; Edit::mutate(move |app: &mut AppData| { app.ui_prefs.arrange_track_top = v_t.max(0.0); }) });
+                    ui.push_edit({ let v_t = new_top; Edit::mutate(move |app: &mut AppData| { app.cur.view.arrange_track_top = v_t.max(0.0); }) });
                 }
             }
         }
@@ -1003,7 +963,7 @@ pub(super) fn commit_releases(
             && let Some((cx, cy)) = ui.take_secondary_click_in_rect(arranger_rect)
             && let Some(sid) = section_at_inrect(sections, arranger_rect, view, cx, cy)
         {
-            ui.push_edit({ let v_id = sid; let v_pos = (cx, cy); Edit::mutate(move |app: &mut AppData| { app.ui_ephemeral.section_menu = Some((v_id, v_pos)); app.ui_ephemeral.section_menu_open = true; }) });
+            ui.push_edit({ let v_id = sid; let v_pos = (cx, cy); Edit::mutate(move |app: &mut AppData| { app.cur.peph.section_menu = Some((v_id, v_pos)); app.cur.peph.section_menu_open = true; }) });
         }
 
         // ---- double-click (lanes 内で clip / lane body / 空白 track row) ----
@@ -1116,7 +1076,7 @@ pub(super) fn commit_releases(
                         pointer.modifiers.alt,
                         zoom_x_px_per_beat,
                     );
-                    ui.push_edit({ let v_track = t.id; let v_start = (beat).max(0.0); Edit::mutate(move |app: &mut AppData| { if let Some(t_idx) = app.song_doc.song().tracks.iter().position(|t| t.id == v_track) { app.handle_event(AppEvent::CreateClip { track: t_idx as u32, start_beat: v_start }); app.handle_event(AppEvent::SelectBottomPanel(1)); } }) });
+                    ui.push_edit({ let v_track = t.id; let v_start = (beat).max(0.0); Edit::mutate(move |app: &mut AppData| { if let Some(t_idx) = app.cur.song_doc.song().tracks.iter().position(|t| t.id == v_track) { app.handle_event(AppEvent::CreateClip { track: t_idx as u32, start_beat: v_start }); app.handle_event(AppEvent::SelectBottomPanel(1)); } }) });
                 }
             }
         }
@@ -1158,7 +1118,7 @@ pub(super) fn commit_releases(
                     // 関与せず直接 `pointer.modifiers.alt` を読んでよい。
                     let beat =
                         view.snap.snap_beat(raw_beat, pointer.modifiers.alt, zoom_x_px_per_beat);
-                    ui.push_edit({ let v_track = t.id; let v_beat = (beat).max(0.0); let v_pos = (cx, cy); Edit::mutate(move |app: &mut AppData| { app.ui_ephemeral.clip_create_menu = Some((v_track, v_beat, v_pos)); app.ui_ephemeral.clip_create_menu_open = true; }) });
+                    ui.push_edit({ let v_track = t.id; let v_beat = (beat).max(0.0); let v_pos = (cx, cy); Edit::mutate(move |app: &mut AppData| { app.cur.peph.clip_create_menu = Some((v_track, v_beat, v_pos)); app.cur.peph.clip_create_menu_open = true; }) });
                 }
             }
         }
@@ -1197,7 +1157,7 @@ fn automation_clip_short_click(
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         let anchor = app
-            .selection
+            .cur.selection
             .automation_clip_anchor
             .map(|k| AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip });
         let next = modifier.resolve(&prev, key, || range_block(&items, anchor?, key));
@@ -1209,8 +1169,107 @@ fn automation_clip_short_click(
             app.handle_event(AppEvent::SelectAutomationClips { prev: prev_model, next: next_model });
         }
         if modifier.updates_anchor() {
-            app.selection.automation_clip_anchor = Some(widget_to_model_clip_key(key));
+            app.cur.selection.automation_clip_anchor = Some(widget_to_model_clip_key(key));
         }
     }));
     response.selection_changed = true;
+}
+
+/// クリップ / 範囲の Move を確定する (`commit_releases` から切り出し — 関数の
+/// ネスト budget のため。中身は移動前と同じ)。
+///
+/// 行き先は **可視行の index** で解く。`docs/plan_project_tabs.md` §5.6:
+/// 最終行より下 (= 行の無い余白) に落ちた行は「新しいトラック」で、id は編集の中で
+/// 採ってから解決する (Ableton Live と同じ。ゴースト `drag_preview_geometry` も
+/// 同じ行に描く)。上端だけは master 行 (クリップを持てない) を避けて clamp する。
+fn commit_clip_move(
+    ui: &mut Ui<'_, AppData>,
+    nd: &ClipDragSession,
+    visible_tracks: &[ArrangementTrack],
+    has_master_row: bool,
+    beat_delta: f64,
+    track_delta: i32,
+) {
+    // master_row 有りなら visible_tracks[0] は synthetic master (id=MASTER_TRACK_ID)。
+    // clip drop 先から master を除外 (track_header drag / DoubleClickEmpty と同じ guard)。
+    let min_idx_i32 = i32::from(has_master_row);
+    // 範囲が掛かっているトラック行の写像 `(移動元, 行き先の可視行 index)`。
+    // `track_rows` は press 時に確定した範囲の全トラック行 (クリップの有無を問わない)。
+    let visible_ids: Vec<u32> = visible_tracks.iter().map(|t| t.id).collect();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let n_visible = visible_ids.len() as i32;
+    // **中身を運ぶ行だけ**が新しいトラックを要る。範囲に入っているだけの空の行まで
+    // 数えると、ゴーストには何も出ていないのに誰も使わないトラックが増える
+    // (行き先の無い空の行は `resolve_track_map` が元の行に留める)。
+    let carries = |track: u32| -> bool {
+        nd.anchors.iter().any(|a| a.key.track_id == track)
+            || nd.automation_anchors.iter().any(|a| a.key.track == track)
+    };
+    let mut dest_rows: Vec<(u32, i32)> = Vec::new();
+    let mut new_tracks = 0i32;
+    for &(from, t_idx) in &nd.track_rows {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let press_i32 = t_idx as i32;
+        let new_idx = (press_i32 + track_delta).max(min_idx_i32);
+        if carries(from) {
+            new_tracks = new_tracks.max(new_idx - n_visible + 1);
+        }
+        dest_rows.push((from, new_idx));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let new_tracks = new_tracks.max(0) as usize;
+    let (ra, rb) = nd.move_range;
+    // automation lane 行だけの範囲 (`dest_rows` 空) でも横移動は成立する
+    // (`move_time_range` が範囲の明示 lane を自分で運ぶ)。
+    let moved = beat_delta.abs() > 1e-6
+        || new_tracks > 0
+        || dest_rows.iter().any(|&(from, idx)| {
+            #[allow(clippy::cast_sign_loss)]
+            let i = idx.max(0) as usize;
+            visible_ids.get(i).copied() != Some(from)
+        });
+    if !moved {
+        return;
+    }
+    // M14 Phase 63e (#019): Move + Ctrl + Shift → 独立コピー、Move + Ctrl → リンクコピー、
+    // それ以外 → 移動。`last_ctrl` / `last_shift` は overlay と同じ真値を読むので、release
+    // frame の OS event 順序問題に依存せず確定する。Alt は直交 (snap 一時無効のみ) で、
+    // 既に `compute_clip_drag_beat_delta` で適用済。
+    let (ctrl, shift) = (nd.last_ctrl, nd.last_shift);
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        // 行の無い余白へ落ちた行のぶんだけトラックを作ってから動かす。足す編集と
+        // 動かす編集は **1 undo 手** に束ねる (ユーザーの操作は 1 回の drop)。
+        let save = app.cur.song_doc.enter_own_gesture();
+        let created = app.append_empty_tracks_ids(new_tracks);
+        if created.len() == new_tracks {
+            let track_map = resolve_track_map(&dest_rows, &visible_ids, &created);
+            if ctrl {
+                app.copy_time_range(ra, rb, beat_delta, &track_map, shift);
+            } else {
+                app.move_time_range(ra, rb, beat_delta, &track_map);
+            }
+        }
+        app.cur.song_doc.leave_own_gesture(save);
+    }));
+}
+
+/// 行き先の可視行 index を track id へ解く。可視行を超えた index は、この drop で
+/// 作った新しいトラック (`created`) の何本目かを指す。
+fn resolve_track_map(
+    dest_rows: &[(u32, i32)],
+    visible_ids: &[u32],
+    created: &[u32],
+) -> Vec<(u32, u32)> {
+    dest_rows
+        .iter()
+        .map(|&(from, idx)| {
+            #[allow(clippy::cast_sign_loss)]
+            let i = idx.max(0) as usize;
+            let to = match visible_ids.get(i) {
+                Some(id) => *id,
+                None => created.get(i - visible_ids.len()).copied().unwrap_or(from),
+            };
+            (from, to)
+        })
+        .collect()
 }

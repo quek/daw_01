@@ -89,26 +89,26 @@ impl AppData {
         // Save As (保存先フォルダが変わった): 旧 bundle の参照ファイルを新 bundle へ
         // 複製する。 live と履歴の `ProjectRelative` はこの時点ではまだ旧 bundle 相対
         // なので、 file_path を差し替える **前** に旧 dir を読む。
-        let old_dir = self.song_doc.file_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+        let old_dir = self.cur.song_doc.file_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
         if let Some(old_dir) = old_dir.filter(|old| *old != dir) {
             self.relocate_bundle(&old_dir, &dir);
         }
         // round-trip 中に live へ編集が入ったかを epoch 差で先に記録する
         // (下の live migration は「保存完了処理の正規化」 で epoch を進める
         // ため、 記録後に行う)。
-        let edited_since_snapshot = self.song_doc.edit_epoch() != snap_epoch;
+        let edited_since_snapshot = self.cur.song_doc.edit_epoch() != snap_epoch;
         let mut status = std::mem::take(&mut self.ui_ephemeral.status_message);
         self.normalize_song(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
-        self.song_doc.rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
+        self.cur.song_doc.rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
         self.ui_ephemeral.status_message = status;
         // serialize 成功時のみ file_path を確定する (旧契約)。
-        self.song_doc.file_path = Some(path.clone());
+        self.cur.song_doc.file_path = Some(path.clone());
         // 保存が現在の live 内容を含む (= round-trip 中の編集なし) なら
         // clean。 編集が入っていれば dirty のまま (下の guard_after_save
         // 再保存 loop が残りを確定する)。 save 後も Undo できるよう履歴は
         // 残す (replace_song は使わない)。
         if !edited_since_snapshot {
-            self.song_doc.mark_saved();
+            self.cur.song_doc.mark_saved();
         }
         // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
         // 用の session recovery file) を削除する。 save 後の .daw が
@@ -163,7 +163,7 @@ impl AppData {
         // を実行する。 save 成功が分かるこの場所で判定するので、 失敗時の無限
         // 再保存ループに陥らない。
         if self.ui_ephemeral.guard_after_save.is_some() {
-            if self.song_doc.is_dirty() {
+            if self.cur.song_doc.is_dirty() {
                 self.begin_save(path);
             } else if let Some(action) = self.ui_ephemeral.guard_after_save.take() {
                 self.perform_guard_action(action);
@@ -174,8 +174,8 @@ impl AppData {
     /// live + undo / redo 全段が bundle 内に持つ参照 (project-relative)。
     fn bundle_refs(&self, project_dir: &Path) -> HashSet<PathBuf> {
         let mut refs = HashSet::new();
-        media_bundle::collect_bundle_refs(self.song_doc.song(), project_dir, &mut refs);
-        for song in self.song_doc.history_songs() {
+        media_bundle::collect_bundle_refs(self.cur.song_doc.song(), project_dir, &mut refs);
+        for song in self.cur.song_doc.history_songs() {
             media_bundle::collect_bundle_refs(song, project_dir, &mut refs);
         }
         refs
@@ -211,9 +211,9 @@ impl AppData {
     /// 進行中の bounce / glue が名前を予約したファイル (project-relative)。 render が
     /// 書き終わるまで song に載らないので、 参照集合に足さないと掃除が消してしまう。
     fn in_flight_render_outputs(&self, project_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-        let bounce = self.ipc.pending_clip_fx_bounce.as_ref().map(|p| p.out_path.clone());
+        let bounce = self.cur.pipc.pending_clip_fx_bounce.as_ref().map(|p| p.out_path.clone());
         let glue = self
-            .ipc
+            .cur.pipc
             .pending_glue_bake
             .iter()
             .flat_map(|p| p.jobs.iter().map(|j| j.out_path.clone()));
@@ -326,32 +326,32 @@ mod tests {
         touch(&old.path().join("samples").join("orphan.wav"));
 
         let mut app = headless_app();
-        app.song_doc.file_path = Some(old_daw.clone());
-        app.song_doc.replace_song(two_clip_song());
+        app.cur.song_doc.file_path = Some(old_daw.clone());
+        app.cur.song_doc.replace_song(two_clip_song());
         // clip 2 を消す → b.wav は undo 履歴だけが参照する。
         app.edit_song(|song| song.tracks[0].clips.retain(|c| c.id != 2));
-        assert!(app.song_doc.can_undo());
+        assert!(app.cur.song_doc.can_undo());
 
         let new_dir = new.path().join("p2");
         let new_daw = new_dir.join("p2.daw");
         std::fs::create_dir_all(&new_dir).unwrap();
-        let epoch = app.song_doc.edit_epoch();
-        let snapshot = Box::new(app.song_doc.song().clone());
+        let epoch = app.cur.song_doc.edit_epoch();
+        let snapshot = Box::new(app.cur.song_doc.song().clone());
         app.finish_save(snapshot, new_daw.clone(), epoch);
 
         assert!(new_daw.exists(), "project file written");
-        assert_eq!(app.song_doc.file_path.as_deref(), Some(new_daw.as_path()));
+        assert_eq!(app.cur.song_doc.file_path.as_deref(), Some(new_daw.as_path()));
         assert!(new_dir.join("samples").join("a.wav").exists(), "live 参照は複製");
         assert!(new_dir.join("samples").join("b.wav").exists(), "undo 参照も複製");
         assert!(!new_dir.join("samples").join("orphan.wav").exists(), "未参照は複製しない");
         assert!(old.path().join("samples").join("orphan.wav").exists(), "旧 bundle は触らない");
-        assert!(!app.song_doc.is_dirty());
+        assert!(!app.cur.song_doc.is_dirty());
 
         // 上書き保存: 新 bundle に紛れ込んだ未参照ファイルだけゴミ箱へ、 b.wav は残る。
         let junk = new_dir.join("bounce").join("junk.wav");
         touch(&junk);
-        let epoch = app.song_doc.edit_epoch();
-        let snapshot = Box::new(app.song_doc.song().clone());
+        let epoch = app.cur.song_doc.edit_epoch();
+        let snapshot = Box::new(app.cur.song_doc.song().clone());
         app.finish_save(snapshot, new_daw.clone(), epoch);
         assert!(!junk.exists(), "未参照はゴミ箱へ (status: {})", app.ui_ephemeral.status_message);
         assert!(new_dir.join("samples").join("b.wav").exists(), "undo 参照は残る");
@@ -370,12 +370,12 @@ mod tests {
         touch(&junk);
 
         let mut app = headless_app();
-        app.song_doc.file_path = Some(daw.clone());
+        app.cur.song_doc.file_path = Some(daw.clone());
         let mut song = two_clip_song();
         song.tracks[0].clips.truncate(1);
-        app.song_doc.replace_song(song);
-        let epoch = app.song_doc.edit_epoch();
-        let snapshot = Box::new(app.song_doc.song().clone());
+        app.cur.song_doc.replace_song(song);
+        let epoch = app.cur.song_doc.edit_epoch();
+        let snapshot = Box::new(app.cur.song_doc.song().clone());
         app.finish_save(snapshot, daw, epoch);
         assert!(junk.exists(), "相乗りフォルダでは掃除しない");
     }

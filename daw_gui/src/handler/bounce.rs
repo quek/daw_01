@@ -87,7 +87,7 @@ impl AppData {
         let keys: Vec<common::model::ClipKey> = new_refs
             .iter()
             .filter_map(|(t_idx, c_id)| {
-                let track = self.song_doc.song().tracks.get(*t_idx as usize)?;
+                let track = self.cur.song_doc.song().tracks.get(*t_idx as usize)?;
                 track
                     .clips
                     .iter()
@@ -131,8 +131,8 @@ impl AppData {
     /// `pre_fx == false` (Bounce with FX) は結果を**別トラック**に置いて元をミュートする
     /// ので、フェーダーまで焼かないと音が変わる。ここでは外さない。
     pub(crate) fn isolated_track_song(&self, track_id: u32, pre_fx: bool) -> Option<Song> {
-        let track = self.song_doc.song().track_by_id(track_id)?;
-        let mut isolated = self.song_doc.song().clone();
+        let track = self.cur.song_doc.song().track_by_id(track_id)?;
+        let mut isolated = self.cur.song_doc.song().clone();
         isolated.master_fx_chain.clear();
         isolated.master_gain = 1.0;
         // r.md #92: ストリップ本体 (全 OFF = `is_bypassed`) に加え、ON に戻し得る
@@ -209,7 +209,7 @@ impl AppData {
             .collect();
         let safe_name = if safe_name.is_empty() { "bounce".into() } else { safe_name };
         let project_dir = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         // **空ファイルを作って名前を予約する。** `exists()` を見るだけでは足りない —
@@ -291,7 +291,7 @@ impl AppData {
         file_frames: u64,
     ) -> AudioEvent {
         let sr = self.ipc.sample_rate;
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let window_frames = common::automation::beats_to_samples(song, sr, window.1)
             .saturating_sub(common::automation::beats_to_samples(song, sr, window.0));
         AudioEvent {
@@ -316,21 +316,21 @@ impl AppData {
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
     pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
         // Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
-        if self.ipc.pending_clip_fx_bounce.is_some() || self.ipc.pending_glue_bake.is_some() {
+        if self.cur.pipc.pending_clip_fx_bounce.is_some() || self.cur.pipc.pending_glue_bake.is_some() {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return;
         };
         let source_track_id = track.id;
         let Some(clip) = track.clip_by_id(target.clip_id).cloned() else {
             return;
         };
-        let clip_name = self.song_doc.song().content_name(clip.content_id).to_string();
+        let clip_name = self.cur.song_doc.song().content_name(clip.content_id).to_string();
         // bounce 可能なのは Audio / Midi (= 歌唱含む) のみ。Automation/Video/Image/Text は対象外。
         if !matches!(
-            self.song_doc.song().clip_contents.get(&clip.content_id),
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Midi(_) | common::model::ClipContent::Audio(_))
         ) {
             self.ui_ephemeral.status_message = "Bounce: audio / MIDI / 歌唱クリップのみ対象です".into();
@@ -357,7 +357,7 @@ impl AppData {
         else {
             return;
         };
-        self.ipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
+        self.cur.pipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
             mode,
             source_track: target.track_id,
             source_clip: target.clip_id,
@@ -378,12 +378,13 @@ impl AppData {
         // engine のマスター音量は atomic なので、送る Song に合わせて明示的に
         // 揃える (bounce 中は unity)。「engine が持つ song と master_gain は常に
         // 一致する」を LoadSong の全送出点で保つ。
-        self.send_audio(AudioCommand::SetMasterGain(isolated.master_gain));
-        self.send_audio(AudioCommand::LoadSong(isolated));
+        self.send_audio(AudioCommand::SetMasterGain { project: self.pk(), gain: isolated.master_gain });
+        self.send_audio(AudioCommand::LoadSong { project: self.pk(), song: isolated });
         self.send_plugin(PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Offline,
         ));
         self.send_audio(AudioCommand::BounceClipFxOnline {
+            project: self.pk(),
             path: out_path,
             source_track: target.track_id,
             source_clip: target.clip_id,
@@ -417,7 +418,7 @@ impl AppData {
                     && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
             })
             .map(|d| d.id)
-            .filter(|id| self.ipc.loaded_devices.contains_key(id))
+            .filter(|id| self.cur.pipc.loaded_devices.contains_key(id))
     }
 
     /// bounce の入口。歌唱トラックは合成が非同期 HTTP で走り、 offline render が
@@ -426,9 +427,9 @@ impl AppData {
     /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
     /// または plugin_id 未確定なら即 `start_clip_bounce`。
     pub(crate) fn request_bounce(&mut self, target: ClipKey, mode: BounceMode) {
-        if self.ipc.pending_clip_fx_bounce.is_some()
-            || self.ipc.pending_vocal_synth_bounce.is_some()
-            || self.ipc.pending_glue_bake.is_some()
+        if self.cur.pipc.pending_clip_fx_bounce.is_some()
+            || self.cur.pipc.pending_vocal_synth_bounce.is_some()
+            || self.cur.pipc.pending_glue_bake.is_some()
         {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
@@ -436,7 +437,7 @@ impl AppData {
         // 歌唱トラック + builtin plugin_id 解決済み → 合成完了を待ってから render。
         // 待ち中の編集で index が動いても追跡できるよう stable id で退避する。
         let vocal = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .filter(|t| t.is_voicevox_vocal())
             .and_then(|t| {
@@ -445,15 +446,15 @@ impl AppData {
                 Some((plugin_id, t.id, clip_id))
             });
         if let Some((device_id, track_id, clip_id)) = vocal {
-            self.ipc.pending_vocal_synth_bounce =
+            self.cur.pipc.pending_vocal_synth_bounce =
                 Some(PendingVocalSynthBounce { track_id, clip_id, mode });
             // r.md #27: bounce は合成完了 (`VocalSynthReady`) を待つので、metadata が
             // 前回送信と不変でも必ず再送して synth 世代を進める。差分キャッシュを迂回
             // するため該当 device の entry を落としてから flush する (= 直前の合成が
             // engine 未起動等で失敗していても bounce で確実に再試行される)。
-            self.voicevox.voicevox_metadata_sent.remove(&device_id);
+            self.cur.pvv.voicevox_metadata_sent.remove(&device_id);
             self.sync_vocal_metadata();
-            self.send_plugin(PluginCommand::PrepareVocalSynth { device_id });
+            self.send_plugin(PluginCommand::PrepareVocalSynth { device: self.dev(device_id) });
             self.ui_ephemeral.status_message = "Bounce: 歌唱を合成中...".into();
             return;
         }
@@ -481,10 +482,10 @@ impl AppData {
     /// ないと engine が isolate された 1 トラックのままになる。 vocal / ARA 等の派生
     /// 同期は不要 (song 内容は bounce 前と同一)。
     pub(crate) fn restore_engine_song_after_bounce(&mut self) {
-        let song = self.song_doc.song().clone();
+        let song = self.cur.song_doc.song().clone();
         // bounce 中に unity へ落としたマスター音量も一緒に戻す。
-        self.send_audio(AudioCommand::SetMasterGain(song.master_gain));
-        self.send_audio(AudioCommand::LoadSong(song));
+        self.send_audio(AudioCommand::SetMasterGain { project: self.pk(), gain: song.master_gain });
+        self.send_audio(AudioCommand::LoadSong { project: self.pk(), song });
     }
 
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
@@ -499,7 +500,7 @@ impl AppData {
         error: Option<String>,
         frames: u64,
     ) {
-        let Some(pending) = self.ipc.pending_clip_fx_bounce.take() else {
+        let Some(pending) = self.cur.pipc.pending_clip_fx_bounce.take() else {
             // 対応する pending が無い completion (respawn 後の残骸等)。 render mode
             // だけ防御的に Realtime へ戻す。
             self.send_plugin(PluginCommand::SetRenderMode(
@@ -519,7 +520,7 @@ impl AppData {
                 "BounceClipFxComplete identifier mismatch with pending; ignoring"
             );
             // 進行中の本命 bounce の追跡 (と Offline render mode) は壊さない。
-            self.ipc.pending_clip_fx_bounce = Some(pending);
+            self.cur.pipc.pending_clip_fx_bounce = Some(pending);
             return;
         }
         // bookend を Realtime に戻す (= 失敗時も忘れず)。
@@ -546,7 +547,7 @@ impl AppData {
         // InPlace の置換対象 content が bounce 中の編集で消えていたら結果を破棄
         // (index でなく stable id で判定。 別クリップを誤置換しない)。
         if pending.mode == BounceMode::InPlace
-            && !self.song_doc.song().clip_contents.contains_key(&pending.source_content_id)
+            && !self.cur.song_doc.song().clip_contents.contains_key(&pending.source_content_id)
         {
             self.ui_ephemeral.status_message =
                 "Bounce In Place: 対象クリップが消えたため結果を破棄しました".into();
@@ -565,7 +566,7 @@ impl AppData {
             sample_rate: engine_sr,
             channels: 2,
             frames,
-            original_bpm: Some(self.song_doc.song().bpm),
+            original_bpm: Some(self.cur.song_doc.song().bpm),
             root_key: None,
         };
         let Some(new_source_id) = self.edit_song(move |song| {
@@ -580,7 +581,7 @@ impl AppData {
         // できるよう)。 失敗しても tracker 表示等は問題ないので warn だけ。
         match crate::import_audio::decode_audio(&path) {
             Ok(buffer) => {
-                self.media.audio_source_cache.insert(new_source_id, Arc::new(buffer));
+                self.cur.media.audio_source_cache.insert(new_source_id, Arc::new(buffer));
             }
             Err(e) => {
                 tracing::warn!(
@@ -614,7 +615,7 @@ impl AppData {
                     t.clips = Vec::new();
                 });
                 self.edit_song(|song| song.tracks.push(new_track));
-                let new_track_idx = self.song_doc.song().tracks.len() - 1;
+                let new_track_idx = self.cur.song_doc.song().tracks.len() - 1;
 
                 let bounced_content_name = format!("{} (bounced FX)", pending.clip_name);
                 let Some(new_content_id) = self.edit_song(move |song| {

@@ -28,7 +28,7 @@ use crate::widgets::arrangement::{
 use crate::widgets::select_modifier::SelectModifier;
 
 /// widget の行キー → handler の行キー。
-fn row_of(row: ArrangementRowKey) -> LauncherRow {
+pub(crate) fn row_of(row: ArrangementRowKey) -> LauncherRow {
     match row {
         ArrangementRowKey::Track(id) => LauncherRow::Track(id),
         ArrangementRowKey::Lane(l) => LauncherRow::Lane(common::model::AutomationLaneKey {
@@ -89,7 +89,7 @@ pub(super) fn dispatch(app: &AppData, ui: &mut Ui<'_, AppData>, resp: &Arrangeme
         .launcher
         .hovered_cell
         .map(|k| LauncherFocus { row: row_of(k.row), scene_index: k.scene_index as usize });
-    if hover != app.launcher.hover {
+    if hover != app.cur.launcher.hover {
         let at = hover.map(|f| (f.row, f.scene_index));
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::Launcher(LauncherEvent::SetHover(at)));
@@ -239,6 +239,36 @@ pub(crate) fn cell_drop_target(
         // 拍 0 へ飛ぶ方が事故が大きい)。
         return None;
     }
+    let (row, scene_index) = cell_slot_at(resp, pos)?;
+    match row {
+        Some(ArrangementRowKey::Track(track_id)) => {
+            // グループ行 / マスター行はセルを持てない (置いても鳴らない)。
+            let row = LauncherRow::Track(track_id);
+            crate::handler::launcher_cells::row_accepts_cells(app.cur.song_doc.song(), row)
+                .then_some(ImportTrackTarget::LauncherCell { track_id, scene_index })
+        }
+        // オートメーションレーン行にはオーディオ / 画像 / MIDI を置けない。
+        Some(ArrangementRowKey::Lane(_)) => None,
+        None => Some(ImportTrackTarget::LauncherNewTrack { scene_index }),
+    }
+}
+
+/// 帯の格子の上の点 → `(行, 列)`。行が `None` なら **行が 1 つも無い下の余白**
+/// (呼ぶ側が「一番下に新しいトラックを作る」を選ぶ)。格子の外 (停止列 / 返す列 /
+/// 見出し / つかみ代) は `None`。
+///
+/// 落とし先の解決 ([`cell_drop_target`]) と、別タブからの持ち込み
+/// (`view::capture_drop`) が **この 1 本**を共有する — 列の解き方 (セルの rect に
+/// 当たらない隙間でも列は決まる) と行の解き方 (`row_bands` = セルを置けない行も
+/// 含む y 帯) を 2 箇所に書くと、ゴーストと着地が静かに食い違う。
+pub(crate) fn cell_slot_at(
+    resp: &ArrangementResponse,
+    pos: (f32, f32),
+) -> Option<(Option<ArrangementRowKey>, u32)> {
+    let grid = resp.launcher.grid_rect;
+    if grid.w <= 0.0 || !grid.contains(pos.0, pos.1) {
+        return None;
+    }
     // 列は**セルの rect に当たらなくても**解く (列と列の 2px の隙間、行が 1 つも
     // 無い下の余白、行と行の隙間 — どこに落ちても列は決まる)。
     let col_w = resp.launcher.col_w;
@@ -252,25 +282,14 @@ pub(crate) fn cell_drop_target(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scene_index = rel.floor() as u32;
     // 行は「その y を含む行の帯」から引く。**行が 1 つも無い下の余白**のときだけ
-    // 一番下に新しいトラックを作って、その行のセルにする (アレンジ側の
-    // `NewTrackBottom` と同じ約束を、ランチャーの語彙で持つ)。
+    // `None` (アレンジ側の `NewTrackBottom` と同じ約束を、ランチャーの語彙で持つ)。
     let row = resp
         .launcher
         .row_bands
         .iter()
         .find(|(_, r)| pos.1 >= r.y && pos.1 < r.y + r.h)
         .map(|(k, _)| *k);
-    match row {
-        Some(ArrangementRowKey::Track(track_id)) => {
-            // グループ行 / マスター行はセルを持てない (置いても鳴らない)。
-            let row = LauncherRow::Track(track_id);
-            crate::handler::launcher_cells::row_accepts_cells(app.song_doc.song(), row)
-                .then_some(ImportTrackTarget::LauncherCell { track_id, scene_index })
-        }
-        // オートメーションレーン行にはオーディオ / 画像 / MIDI を置けない。
-        Some(ArrangementRowKey::Lane(_)) => None,
-        None => Some(ImportTrackTarget::LauncherNewTrack { scene_index }),
-    }
+    Some((row, scene_index))
 }
 
 /// セル (クリップ有り) の右クリックメニュー。
@@ -359,7 +378,7 @@ fn scene_menu_edit(idx: usize, scene_id: u32, rect: Rect) -> Edit<AppData> {
 /// (track / clip の rename と同 idiom)。これが無いと「列を右クリックしても何も出ない /
 /// 名前を変えられない」になる。
 pub(crate) fn scene_overlays(app: &AppData, ui: &mut Ui<'_, AppData>, resp: &ArrangementResponse) {
-    let renaming = app.launcher.scene_rename_id;
+    let renaming = app.cur.launcher.scene_rename_id;
     for (scene_id, index, rect) in &resp.launcher.scene_rects {
         let scene_id = *scene_id;
         let index = *index as usize;
@@ -402,7 +421,7 @@ fn scene_rename_input(
     let r = ui.text_input_at_focused(
         ("launcher_scene_rename", scene_id),
         input_rect,
-        &app.launcher.scene_rename_text,
+        &app.cur.launcher.scene_rename_text,
         &ui.text_input_style(),
         |new| {
             Edit::mutate(move |app: &mut AppData| {

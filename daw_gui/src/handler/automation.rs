@@ -8,15 +8,15 @@ use common::model::{AudioEvent, InstrumentSource};
 
 impl AppData {
     pub(crate) fn action_add_instrument_track(&mut self) {
-        let index = self.song_doc.song().tracks.len() + 1;
+        let index = self.cur.song_doc.song().tracks.len() + 1;
         // 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
-        let insert_at = add_track_insert_index(&self.song_doc.song().tracks, &self.selection.selected_track_ids);
+        let insert_at = add_track_insert_index(&self.cur.song_doc.song().tracks, &self.cur.selection.selected_track_ids);
         // 新 track は挿入位置の基準 track (= 最上段の選択) と同じグループ
         // 階層に入れる (parent_group_id を継承)。基準が無い (= 選択無しで末尾挿入、
         // insert_at == tracks.len()) ときだけ master 直下 (None)。基準がグループ (子持ち)
         // でも「同じ階層 = 兄弟」になる (parent_group_id 継承がそのまま兄弟化する)。
-        let parent_group_id = self.song_doc.song().tracks.get(insert_at).and_then(|t| t.parent_group_id);
+        let parent_group_id = self.cur.song_doc.song().tracks.get(insert_at).and_then(|t| t.parent_group_id);
         let Some(id) = self.edit_song(|song| {
             let id = song.alloc_track_id();
             let track = track_with(|t| {
@@ -105,7 +105,7 @@ impl AppData {
     /// 「このセクションをループ」: 帯の範囲を既存ループ領域に設定する (ループの SSoT を駆動、
     /// 二重化しない)。
     pub(crate) fn apply_loop_section(&mut self, id: u32) {
-        if let Some(s) = self.song_doc.song().sections.iter().find(|s| s.id == id) {
+        if let Some(s) = self.cur.song_doc.song().sections.iter().find(|s| s.id == id) {
             let (start, end) = (s.start_beat, s.end_beat());
             self.handle_event(AppEvent::SetLoopRange { start, end });
         }
@@ -140,11 +140,11 @@ impl AppData {
         // `SelectionState.section_anchor` が所有する — 旧実装は「選択集合の末尾」 を
         // 基点にしていたが、 RangeFromAnchor が集合ごと書き換えるので Shift+click を
         // 繰り返すと基点が歩いて範囲を伸縮できなかった。
-        let prev = self.selection.selected_section_ids.clone();
-        let anchor = self.selection.section_anchor;
+        let prev = self.cur.selection.selected_section_ids.clone();
+        let anchor = self.cur.selection.section_anchor;
         // 帯は開始拍順に並べて 1 次元の範囲を取る。
         let ordered: Vec<u32> = {
-            let mut v: Vec<&common::model::Section> = self.song_doc.song().sections.iter().collect();
+            let mut v: Vec<&common::model::Section> = self.cur.song_doc.song().sections.iter().collect();
             v.sort_by(|a, b| {
                 a.start_beat
                     .partial_cmp(&b.start_beat)
@@ -152,29 +152,29 @@ impl AppData {
             });
             v.into_iter().map(|s| s.id).collect()
         };
-        self.selection.selected_section_ids = modifier.resolve(&prev, id, || {
+        self.cur.selection.selected_section_ids = modifier.resolve(&prev, id, || {
             crate::widgets::select_modifier::range_ordered(&ordered, anchor?, id)
         });
         if modifier.updates_anchor() {
-            self.selection.section_anchor = Some(id);
+            self.cur.selection.section_anchor = Some(id);
         }
         // 「最後に選んだ面」 = セクション。 空になった (Ctrl+click で最後の 1 本を外した)
         // ときはタグを降ろす (トラック面の `set_track_selection` と同じ規則)。
-        if self.selection.selected_section_ids.is_empty() {
-            if self.selection.last_edit_select == Some(EditSurface::Sections) {
-                self.selection.last_edit_select = None;
+        if self.cur.selection.selected_section_ids.is_empty() {
+            if self.cur.selection.last_edit_select == Some(EditSurface::Sections) {
+                self.cur.selection.last_edit_select = None;
             }
         } else {
-            self.selection.last_edit_select = Some(EditSurface::Sections);
+            self.cur.selection.last_edit_select = Some(EditSurface::Sections);
         }
     }
 
     /// 選択中のセクション帯を削除する (帯のみ・内容温存、 キーボード Delete から)。
     pub(crate) fn apply_delete_selected_sections(&mut self) {
-        if self.selection.selected_section_ids.is_empty() {
+        if self.cur.selection.selected_section_ids.is_empty() {
             return;
         }
-        let ids = std::mem::take(&mut self.selection.selected_section_ids);
+        let ids = std::mem::take(&mut self.cur.selection.selected_section_ids);
         self.edit_song_checked(move |song| {
             let mut removed = false;
             for id in ids {
@@ -204,15 +204,15 @@ impl AppData {
     /// `None` (トランスポートの `A` ボタンは消灯、押しても何も起きない)。
     #[must_use]
     pub(crate) fn all_automation_lanes_visible(&self) -> Option<bool> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         song.all_automation_lanes().next()?;
-        let all_visible = self.ui_prefs.hidden_automation_lanes.is_empty();
+        let all_visible = self.cur.view.hidden_automation_lanes.is_empty();
         let all_expanded = song
             .tracks
             .iter()
             .filter(|t| !t.automation_lanes.is_empty())
-            .all(|t| self.ui_prefs.expanded_automation_tracks.contains(&t.id))
-            && (song.song_lanes.is_empty() || self.ui_prefs.master_row_automation_expanded);
+            .all(|t| self.cur.view.expanded_automation_tracks.contains(&t.id))
+            && (song.song_lanes.is_empty() || self.cur.view.master_row_automation_expanded);
         Some(all_visible && all_expanded)
     }
 
@@ -228,14 +228,14 @@ impl AppData {
         };
         let show = !all_visible;
         if show {
-            self.ui_prefs.hidden_automation_lanes.clear();
+            self.cur.view.hidden_automation_lanes.clear();
         } else {
             let keys: Vec<common::model::AutomationLaneKey> =
-                self.song_doc.song().all_automation_lane_keys().collect();
-            self.ui_prefs.hidden_automation_lanes.extend(keys);
+                self.cur.song_doc.song().all_automation_lane_keys().collect();
+            self.cur.view.hidden_automation_lanes.extend(keys);
         }
         if show {
-            let song = self.song_doc.song();
+            let song = self.cur.song_doc.song();
             let with_lanes: Vec<u32> = song
                 .tracks
                 .iter()
@@ -243,9 +243,9 @@ impl AppData {
                 .map(|t| t.id)
                 .collect();
             let has_song_lanes = !song.song_lanes.is_empty();
-            self.ui_prefs.expanded_automation_tracks.extend(with_lanes);
+            self.cur.view.expanded_automation_tracks.extend(with_lanes);
             if has_song_lanes {
-                self.ui_prefs.master_row_automation_expanded = true;
+                self.cur.view.master_row_automation_expanded = true;
             }
         }
     }
@@ -265,7 +265,7 @@ impl AppData {
             return;
         };
         let display_name = self.automation_target_label(&target);
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -278,7 +278,7 @@ impl AppData {
     pub(crate) fn set_lane_height(&mut self, track_id: u32, lane_id: u32, next_px: u16) {
         // ユーザーが明示的に lane を resize した = `Z` 縦ズームの一時拡大 (session
         // override) を破棄して model 高さに制御を戻す。
-        self.ui_prefs.automation_lane_row_overrides
+        self.cur.view.automation_lane_row_overrides
             .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
         self.edit_song_checked(|song| {
             if let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) {
@@ -421,10 +421,10 @@ impl AppData {
     /// `automation_lane_by_key` が解決する。
     pub(crate) fn automation_point_value(&self, key: &AutomationPointKeyRef) -> Option<f64> {
         let lane = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .automation_lane_by_key(key.track_id, key.lane_id)?;
         let clip = lane.clip_by_id(key.clip_id)?;
-        let content = self.song_doc.song().clip_contents.get(&clip.content_id)?;
+        let content = self.cur.song_doc.song().clip_contents.get(&clip.content_id)?;
         let pts = content.automation_points()?;
         pts.get(key.point_idx as usize).map(|p| p.value)
     }
@@ -464,7 +464,7 @@ impl AppData {
             Vec<u32>,
         > = std::collections::HashMap::new();
         for k in points {
-            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
+            let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -490,8 +490,8 @@ impl AppData {
         // (review) point_idx は positional なので削除で全 index がずれる。 残すと
         // 次の Del / Cut が詰め後の別の点を破壊する (`delete_selected_notes` の
         // `mem::take` と同じ後始末)。 inline 編集中の点も同様に無効化する。
-        self.selection.selected_automation_points.clear();
-        self.ui_ephemeral.editing_automation_point = None;
+        self.cur.selection.selected_automation_points.clear();
+        self.cur.peph.editing_automation_point = None;
     }
 
     /// r.md #73: 1 区間の補間形状を設定する唯一の handler。
@@ -558,12 +558,12 @@ impl AppData {
     /// が無いので、 同 frame 内の値ペアで identify)。 同 clip 内に snap
     /// 結果が同位置になる point が複数いれば最初の一致を採用。
     pub(crate) fn quantize_selected_automation_points(&mut self, div: u8) {
-        if self.selection.selected_automation_points.is_empty() {
+        if self.cur.selection.selected_automation_points.is_empty() {
             return;
         }
         let div = div.max(1) as f64;
         let snap = |b: f64| ((b * div).round() / div).max(0.0);
-        let selected = self.selection.selected_automation_points.clone();
+        let selected = self.cur.selection.selected_automation_points.clone();
 
         // `content_id` ごとに、 quantize 対象 idx 群と、 selection lookup 用の
         // `(snapped_time, value)` ペア群を集める。 ペアは selection の現順序
@@ -584,7 +584,7 @@ impl AppData {
             ContentBuckets,
         > = std::collections::HashMap::new();
         for k in &selected {
-            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
+            let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -592,7 +592,7 @@ impl AppData {
             };
             let content_id = clip.content_id;
             let Some(common::model::ClipContent::Automation(a)) =
-                self.song_doc.song().clip_contents.get(&content_id)
+                self.cur.song_doc.song().clip_contents.get(&content_id)
             else {
                 continue;
             };
@@ -657,7 +657,7 @@ impl AppData {
             return;
         };
 
-        self.selection.selected_automation_points = new_selection;
+        self.cur.selection.selected_automation_points = new_selection;
     }
 
     /// Phase 3: 選択中 automation point を JSON 化して OS clipboard に
@@ -671,20 +671,20 @@ impl AppData {
     /// 戻り値は `(json, count)`。 何も copy できない (選択無し / lookup
     /// 失敗) 場合は `None`。
     pub fn copy_points_clip(&self) -> Option<(String, usize)> {
-        if self.selection.selected_automation_points.is_empty() {
+        if self.cur.selection.selected_automation_points.is_empty() {
             return None;
         }
         let mut copied: Vec<crate::clipboard::CopiedPoint> =
-            Vec::with_capacity(self.selection.selected_automation_points.len());
-        for k in &self.selection.selected_automation_points {
-            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
+            Vec::with_capacity(self.cur.selection.selected_automation_points.len());
+        for k in &self.cur.selection.selected_automation_points {
+            let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
                 continue;
             };
             let Some(common::model::ClipContent::Automation(a)) =
-                self.song_doc.song().clip_contents.get(&clip.content_id)
+                self.cur.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 continue;
             };
@@ -713,7 +713,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
+            self.cur.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::AutomationPoints(copied),
         )
         .to_json()?;
@@ -734,7 +734,7 @@ impl AppData {
         if points_in.is_empty() {
             return 0;
         }
-        let Some(lane) = self.song_doc.song().automation_lane_by_key(lane_key.track, lane_key.lane) else {
+        let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(lane_key.track, lane_key.lane) else {
             return 0;
         };
         let target = lane.target.clone();
@@ -757,7 +757,7 @@ impl AppData {
         let anchor = clip.song_to_content_beat(song_beat).max(0.0);
 
         // dest content が automation でない壊れたモデルなら undo を触る前に bail。
-        if let Some(c) = self.song_doc.song().clip_contents.get(&content_id)
+        if let Some(c) = self.cur.song_doc.song().clip_contents.get(&content_id)
             && !matches!(c, common::model::ClipContent::Automation(_))
         {
             self.ui_ephemeral.status_message =
@@ -816,7 +816,7 @@ impl AppData {
             return 0;
         };
 
-        self.selection.selected_automation_points = new_indices
+        self.cur.selection.selected_automation_points = new_indices
             .into_iter()
             .map(|i| AutomationPointKeyRef {
                 track_id: dest_key.track,
@@ -825,7 +825,7 @@ impl AppData {
                 point_idx: i,
             })
             .collect();
-        self.selection.last_edit_select = Some(EditSurface::AutomationPoints);
+        self.cur.selection.last_edit_select = Some(EditSurface::AutomationPoints);
         count
     }
 
@@ -834,13 +834,13 @@ impl AppData {
     /// オーディオエディタで選択中のイベントを clipboard envelope
     /// (`ClipboardPayload::AudioEvents`) JSON に。最早 start を 0 とした相対に正規化。
     pub fn copy_events_clip(&self) -> Option<(String, usize)> {
-        let r = self.ui_ephemeral.audio_editor_clip?;
+        let r = self.cur.peph.audio_editor_clip?;
         if self.selected_audio_event_indices().is_empty() {
             return None;
         }
-        let track = self.song_doc.song().track_by_id(r.track_id)?;
+        let track = self.cur.song_doc.song().track_by_id(r.track_id)?;
         let clip = track.clip_by_id(r.clip_id)?;
-        let content = self.song_doc.song().clip_contents.get(&clip.content_id)?;
+        let content = self.cur.song_doc.song().clip_contents.get(&clip.content_id)?;
         let events = content.audio_events()?;
         let mut copied: Vec<AudioEvent> = self
             .selected_audio_event_indices()
@@ -861,7 +861,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
+            self.cur.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::AudioEvents(copied),
         )
         .to_json()?;
@@ -875,12 +875,12 @@ impl AppData {
         if events.is_empty() {
             return 0;
         }
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(target) = self.cur.peph.audio_editor_clip else {
             self.ui_ephemeral.status_message = "貼り付け先のオーディオクリップがありません".to_string();
             return 0;
         };
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -888,7 +888,7 @@ impl AppData {
             return 0;
         };
         if !matches!(
-            self.song_doc.song().clip_contents.get(&content_id),
+            self.cur.song_doc.song().clip_contents.get(&content_id),
             Some(common::model::ClipContent::Audio(_))
         ) {
             self.ui_ephemeral.status_message = "貼り付け先 clip が audio でない".to_string();
@@ -927,7 +927,7 @@ impl AppData {
             return 0;
         };
         self.set_audio_event_selection(&(new_indices));
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
         count
@@ -941,15 +941,30 @@ impl AppData {
     /// `content_id` も保持 (同一プロジェクトのリンク共有用)。
     pub fn copy_clips_clip(&self) -> Option<(String, usize)> {
         let refs = self.selected_clip_refs();
+        let (envelope, _, _) = self.clips_copy_envelope(&refs)?;
+        let count = match &envelope.payload {
+            crate::clipboard::ClipboardPayload::Clips(c) => c.len(),
+            _ => 0,
+        };
+        Some((envelope.to_json()?, count))
+    }
+
+    /// `refs` のクリップを clipboard の `Clips` envelope に写す (copy と、§5.6 のタブを
+    /// またぐドラッグが共用)。戻りは `(envelope, 先頭クリップの拍, 最上段の track index)`
+    /// (= envelope 内の相対座標の原点。ドラッグ側が掴んだ位置関係を保つのに使う)。
+    pub fn clips_copy_envelope(
+        &self,
+        refs: &[ClipKey],
+    ) -> Option<(crate::clipboard::ClipboardEnvelope, f64, usize)> {
         if refs.is_empty() {
             return None;
         }
         let mut resolved: Vec<(usize, common::model::Clip)> = Vec::new();
-        for r in &refs {
+        for r in refs {
             // クリップボードは「最上段トラックからの相対」で正規化するので、
             // ここだけは **表示 index** が要る (住所は id、並びは index)。
-            if let Some(t_idx) = self.song_doc.song().track_index_of(r.track_id)
-                && let Some(c) = self.song_doc.song().clip_by_key(*r)
+            if let Some(t_idx) = self.cur.song_doc.song().track_index_of(r.track_id)
+                && let Some(c) = self.cur.song_doc.song().clip_by_key(*r)
             {
                 resolved.push((t_idx, c.clone()));
             }
@@ -966,12 +981,12 @@ impl AppData {
         let mut clips = Vec::with_capacity(resolved.len());
         for (ti, c) in &resolved {
             let content = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .clip_contents
                 .get(&c.content_id)
                 .cloned()
                 .unwrap_or_default();
-            let name = self.song_doc.song().clip_content_names.get(&c.content_id).cloned();
+            let name = self.cur.song_doc.song().clip_content_names.get(&c.content_id).cloned();
             clips.push(crate::clipboard::ClipCopy {
                 track_offset: (*ti as i64) - (min_track as i64),
                 start_beat: c.start_beat - base,
@@ -992,13 +1007,8 @@ impl AppData {
                 talk: c.talk,
             });
         }
-        let count = clips.len();
-        let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
-            crate::clipboard::ClipboardPayload::Clips(clips),
-        )
-        .to_json()?;
-        Some((json, count))
+        let envelope = self.envelope_with_media(crate::clipboard::ClipboardPayload::Clips(clips));
+        Some((envelope, base, min_track))
     }
 
     /// クリップ群を「マウス下トラック (`anchor_track`)」を基準に `at_beat` (song-absolute,
@@ -1012,20 +1022,24 @@ impl AppData {
         src_pid: u64,
         anchor_track: u32,
         at_beat: f64,
+        media: &common::model::MediaManifest,
     ) -> usize {
         if clips.is_empty() {
             return 0;
         }
-        let Some(anchor_idx) = self.song_doc.song().track_index_by_id(anchor_track) else {
+        let Some(anchor_idx) = self.cur.song_doc.song().track_index_by_id(anchor_track) else {
             self.ui_ephemeral.status_message = "貼り付け先のトラックがありません".to_string();
             return 0;
         };
-        let same_project = src_pid == self.song_doc.song().project_id;
+        let same_project = src_pid == self.cur.song_doc.song().project_id;
+        // 取り込みは **貼り先のフォルダ基準** で (`media_for_import` の doc)。
+        let imported = self.media_for_import(media);
+        let media = &imported;
         // 貼り付け対象 (target_idx が範囲内) が 1 件も無ければ undo を積まず return
         // (= spurious な no-op undo step を作らない、paste_notes_at と同方針)。
         let any_valid = clips.iter().any(|cc| {
             let ti = anchor_idx as i64 + cc.track_offset;
-            ti >= 0 && (ti as usize) < self.song_doc.song().tracks.len()
+            ti >= 0 && (ti as usize) < self.cur.song_doc.song().tracks.len()
         });
         if !any_valid {
             self.ui_ephemeral.status_message = "貼り付け先のトラックがありません".to_string();
@@ -1035,6 +1049,12 @@ impl AppData {
         // (linked クリップ群を複数貼っても貼り付け後もリンクを保つ)。同一プロジェクト
         // かつ content 現存なら流用 (リンク共有)、それ以外は inline payload から独立採番。
         let Some(new_refs) = self.edit_song(move |song| {
+            // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
+            let media_remap = if same_project {
+                common::model::MediaRemap::default()
+            } else {
+                song.import_media(media)
+            };
             let mut content_remap: std::collections::HashMap<
                 common::model::ContentId,
                 common::model::ContentId,
@@ -1053,10 +1073,9 @@ impl AppData {
                         if same_project && song.clip_contents.contains_key(&cc.content_id) {
                             cc.content_id
                         } else {
-                            song.alloc_content(
-                                cc.content.clone(),
-                                cc.name.clone().unwrap_or_default(),
-                            )
+                            let mut content = cc.content.clone();
+                            content.remap_media(&media_remap);
+                            song.alloc_content(content, cc.name.clone().unwrap_or_default())
                         };
                     content_remap.insert(cc.content_id, resolved);
                     resolved
@@ -1098,6 +1117,9 @@ impl AppData {
         }) else {
             return 0;
         };
+        if !same_project {
+            self.decode_imported_media(media);
+        }
         let pasted = new_refs.len();
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
@@ -1114,12 +1136,12 @@ impl AppData {
     /// `source_content_id` を保持して linked group を paste 後も保つ。 戻り値は `(json, count)`、
     /// 選択無し / 解決失敗なら `None`。
     pub fn copy_automation_clips_clip(&self) -> Option<(String, usize)> {
-        if self.selection.selected_automation_clips.is_empty() {
+        if self.cur.selection.selected_automation_clips.is_empty() {
             return None;
         }
         let mut resolved = Vec::new();
-        for k in &self.selection.selected_automation_clips {
-            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track, k.lane) else {
+        for k in &self.cur.selection.selected_automation_clips {
+            let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(k.track, k.lane) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip) else {
@@ -1138,7 +1160,7 @@ impl AppData {
         let mut out = Vec::with_capacity(resolved.len());
         for (target, clip) in &resolved {
             let points: Vec<crate::clipboard::CopiedPoint> =
-                match self.song_doc.song().clip_contents.get(&clip.content_id) {
+                match self.cur.song_doc.song().clip_contents.get(&clip.content_id) {
                     Some(common::model::ClipContent::Automation(a)) => a
                         .points
                         .iter()
@@ -1152,7 +1174,7 @@ impl AppData {
                         .collect(),
                     _ => Vec::new(),
                 };
-            let name = self.song_doc.song().clip_content_names.get(&clip.content_id).cloned();
+            let name = self.cur.song_doc.song().clip_content_names.get(&clip.content_id).cloned();
             out.push(crate::clipboard::AutomationClipCopy {
                 start_beat: clip.start_beat - base,
                 length_beats: clip.length_beats,
@@ -1164,7 +1186,7 @@ impl AppData {
         }
         let count = out.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
+            self.cur.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::AutomationClips(out),
         )
         .to_json()?;
@@ -1185,7 +1207,7 @@ impl AppData {
         if clips.is_empty() {
             return 0;
         }
-        let Some(lane) = self.song_doc.song().automation_lane_by_key(lane_key.track, lane_key.lane) else {
+        let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(lane_key.track, lane_key.lane) else {
             self.ui_ephemeral.status_message = "貼り付け先の automation lane がありません".to_string();
             return 0;
         };
@@ -1255,12 +1277,12 @@ impl AppData {
         };
         let pasted = new_keys.len();
         if pasted > 0 {
-            self.selection.selected_automation_clips = new_keys;
+            self.cur.selection.selected_automation_clips = new_keys;
             // 貼ったばかりの clip を直後の copy/cut/delete 対象にする: 競合する点選択を
             // 解除し (paste_clips_at が selected_notes を clear するのと同じ)、 last-wins も
             // clip 側に倒す。
-            self.selection.selected_automation_points.clear();
-            self.selection.last_edit_select = Some(EditSurface::AutomationClips);
+            self.cur.selection.selected_automation_points.clear();
+            self.cur.selection.last_edit_select = Some(EditSurface::AutomationClips);
         }
         pasted
     }
@@ -1389,7 +1411,7 @@ impl AppData {
         let mut max_end = f64::MIN;
         for &src in sources {
             let Some(clip) = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .automation_lane_by_key(src.track, src.lane)
                 .and_then(|lane| lane.clip_by_id(src.clip))
             else {
@@ -1409,7 +1431,7 @@ impl AppData {
         new_start_beat: f64,
     ) -> Option<common::model::AutomationClipKey> {
         let (content_id, name, length, color) = {
-            let lane = self.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
+            let lane = self.cur.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
             let src_clip = lane.clip_by_id(source.clip)?;
             (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats, src_clip.color)
         };
@@ -1443,12 +1465,12 @@ impl AppData {
         new_start_beat: f64,
     ) -> Option<common::model::AutomationClipKey> {
         let (src_content_id, name, length, color) = {
-            let lane = self.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
+            let lane = self.cur.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
             let src_clip = lane.clip_by_id(source.clip)?;
             (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats, src_clip.color)
         };
         let cloned_content = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .clip_contents
             .get(&src_content_id)
             .cloned()
@@ -1486,7 +1508,7 @@ impl AppData {
         let mut new_keys = Vec::with_capacity(sources.len());
         for &src in sources {
             let Some(new_start) = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .automation_lane_by_key(src.track, src.lane)
                 .and_then(|lane| lane.clip_by_id(src.clip))
                 .map(|c| c.start_beat + offset)
@@ -1498,8 +1520,8 @@ impl AppData {
             }
         }
         if !new_keys.is_empty() {
-            self.selection.selected_automation_clips = new_keys;
-            self.selection.last_edit_select = Some(EditSurface::AutomationClips);
+            self.cur.selection.selected_automation_clips = new_keys;
+            self.cur.selection.last_edit_select = Some(EditSurface::AutomationClips);
         }
     }
 
@@ -1511,7 +1533,7 @@ impl AppData {
         let mut new_keys = Vec::with_capacity(sources.len());
         for &src in sources {
             let Some(new_start) = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .automation_lane_by_key(src.track, src.lane)
                 .and_then(|lane| lane.clip_by_id(src.clip))
                 .map(|c| c.start_beat + offset)
@@ -1523,8 +1545,8 @@ impl AppData {
             }
         }
         if !new_keys.is_empty() {
-            self.selection.selected_automation_clips = new_keys;
-            self.selection.last_edit_select = Some(EditSurface::AutomationClips);
+            self.cur.selection.selected_automation_clips = new_keys;
+            self.cur.selection.last_edit_select = Some(EditSurface::AutomationClips);
         }
     }
 
@@ -1555,7 +1577,7 @@ impl AppData {
     /// 独立になる。 1 回の `edit_song` で 1 undo step、 既に全て独立なら
     /// `edit_song_checked` の no-op 検出で dirty 化しない。
     pub(crate) fn make_automation_clip_unique(&mut self, key: common::model::AutomationClipKey) {
-        let selected = self.selection.selected_automation_clips.clone();
+        let selected = self.cur.selection.selected_automation_clips.clone();
         let targets = if selected.contains(&key) {
             selected
         } else {
@@ -1566,11 +1588,11 @@ impl AppData {
         let made_unique = targets
             .iter()
             .filter(|k| {
-                self.song_doc
+                self.cur.song_doc
                     .song()
                     .automation_lane_by_key(k.track, k.lane)
                     .and_then(|lane| lane.clip_by_id(k.clip))
-                    .is_some_and(|c| self.song_doc.song().clip_content_refcount(c.content_id) >= 2)
+                    .is_some_and(|c| self.cur.song_doc.song().clip_content_refcount(c.content_id) >= 2)
             })
             .count();
         self.edit_song_checked(|song| {
@@ -1632,7 +1654,7 @@ impl AppData {
         // B6 (r.md #8): clip 名に実 param 名を使うため、 mut borrow を取る前に
         // immutable borrow で target を取り出し完全修飾 label を解決する。
         let Some(target) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .automation_lane_by_key(lane_key.track, lane_key.lane)
             .map(|l| l.target.clone())
         else {

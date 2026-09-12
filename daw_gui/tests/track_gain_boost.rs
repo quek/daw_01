@@ -37,7 +37,7 @@ fn build_app() -> (
 }
 
 fn track_volume(app: &AppData, track_id: u32) -> f32 {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .tracks
         .iter()
@@ -49,7 +49,7 @@ fn track_volume(app: &AppData, track_id: u32) -> f32 {
 #[test]
 fn track_volume_keeps_boost_above_unity() {
     let (mut app, _a, _p) = build_app();
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
 
     // +3dB 相当 (amp ≈ 1.41): 旧 unity clamp では 1.0 に潰れて 0dB に戻った。
     app.handle_event(AppEvent::SetTrackVolume { track: track_id, amp: 1.41 });
@@ -86,15 +86,15 @@ fn master_gain_keeps_boost_above_unity() {
 
     app.handle_event(AppEvent::SetMasterGain(1.5));
     assert!(
-        (app.song_doc.song().master_gain - 1.5).abs() < 1e-6,
+        (app.cur.song_doc.song().master_gain - 1.5).abs() < 1e-6,
         "master のブーストが保持される (got {})",
-        app.song_doc.song().master_gain
+        app.cur.song_doc.song().master_gain
     );
 
     app.handle_event(AppEvent::SetMasterGain(5.0));
     assert!(
-        (app.song_doc.song().master_gain - common::model::MAX_TRACK_GAIN).abs() < 1e-6,
+        (app.cur.song_doc.song().master_gain - common::model::MAX_TRACK_GAIN).abs() < 1e-6,
         "master 上限は MAX_TRACK_GAIN (got {})",
-        app.song_doc.song().master_gain
+        app.cur.song_doc.song().master_gain
     );
 }

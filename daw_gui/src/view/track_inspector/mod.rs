@@ -236,9 +236,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // v18 (`docs/plan_track_clip_color.md`): タイトル行右端に track 色スウォッチ。
     // 単一トラック選択時のみ表示し、クリックで color_picker を開く (anchor =
     // スウォッチ rect)。effective 色 (上書き or id 由来の導出色) を塗る。
-    if app.selection.selected_track_ids.len() <= 1
+    if app.cur.selection.selected_track_ids.len() <= 1
         && let Some(idx) = app.cursor_track_index()
-        && let Some(track) = app.song_doc.song().tracks.get(idx)
+        && let Some(track) = app.cur.song_doc.song().tracks.get(idx)
     {
         let track_id = track.id;
         let swatch = Rect { x: area.x + area.w - pad - 20.0, y: y - 2.0, w: 20.0, h: 20.0 };
@@ -287,7 +287,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (再インデントしない)。
     let body_top = y;
     let param_h = (area.y + area.h - body_top).max(0.0);
-    let content_h = app.ui_ephemeral.inspector_body_h.max(1.0);
+    let content_h = app.cur.peph.inspector_body_h.max(1.0);
     let param_vp = Rect { x: area.x, y: body_top, w: area.w, h: param_h };
     let measured_body_h = std::cell::Cell::new(0.0_f32);
     ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
@@ -312,7 +312,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 次 frame で正しい formatted 値に書き戻る (= 体感的にちらつかない)。
         // 同じ Clip を選択し直しただけでは target は変わらない (=
         // ResyncClipEditBuffers が無駄に走らない)。
-        if app.ui_ephemeral.clip_edit_buffer_target != Some(summary.target) {
+        if app.cur.peph.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipEditBuffers(target));
@@ -657,7 +657,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // section と同 idiom)。 image clip 切替後に 1 frame だけ古い
         // buffer が表示されるが、 直後の frame で formatted な現値に
         // 書き戻る。
-        if app.ui_ephemeral.clip_edit_buffer_target != Some(summary.target) {
+        if app.cur.peph.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipEditBuffers(target));
@@ -1128,10 +1128,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- 口パク mapping (口形状 → 画像) -------------------------------
     // この track を口パク出力先に指定している vocal track があるとき、7 形状
     // (a/i/u/e/o/N/閉口) の画像割当を表示する。各 slot は import 済み image を選ぶ。
-    if let Some(track) = cursor_idx.and_then(|i| app.song_doc.song().tracks.get(i)) {
+    if let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i)) {
         let this_id = track.id;
         let is_target = app
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .any(|t| t.lipsync_target_track == Some(this_id));
@@ -1149,7 +1149,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // image_ids[k] と labels[k+1] が対応 (labels[0] = "(なし)" sentinel)。
             // ラベル文字列を別 Vec へ再 clone せず、 ソート後そのまま labels へ move する。
             let mut images: Vec<(common::model::ImageSourceId, String)> = app
-                .song_doc.song()
+                .cur.song_doc.song()
                 .media.image_sources
                 .iter()
                 .map(|(id, src)| (*id, image_source_label(src)))
@@ -1234,9 +1234,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     });
     // 測定した param 実高さを次フレーム用に保存 (変化時のみ edit を積む)。
     let measured = measured_body_h.get();
-    if (app.ui_ephemeral.inspector_body_h - measured).abs() > 0.5 {
+    if (app.cur.peph.inspector_body_h - measured).abs() > 0.5 {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.inspector_body_h = measured;
+            app.cur.peph.inspector_body_h = measured;
         }));
     }
 }

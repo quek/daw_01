@@ -76,7 +76,7 @@ fn populate(app: &mut AppData) {
     for _ in 0..3 {
         app.handle_event(AppEvent::AddInstrumentTrack);
     }
-    let ids: Vec<u32> = app.song_doc.song().tracks.iter().map(|t| t.id).collect();
+    let ids: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
     for (i, id) in ids.iter().enumerate() {
         app.handle_event(AppEvent::CreateClip { track: *id, start_beat: (i as f64) * 4.0 });
     }
@@ -97,7 +97,7 @@ fn populate(app: &mut AppData) {
         }
     });
     // 1 本目のクリップを選択して選択リングを描かせる。
-    if let Some(t) = app.song_doc.song().tracks.first()
+    if let Some(t) = app.cur.song_doc.song().tracks.first()
         && let Some(c) = t.clips.first()
     {
         let key = common::model::ClipKey { track_id: t.id, clip_id: c.id };

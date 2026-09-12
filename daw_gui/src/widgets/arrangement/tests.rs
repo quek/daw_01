@@ -719,19 +719,24 @@
         assert_eq!(t.height, 1080);
     }
 
+    /// 行の無い余白へ動かしたら、ゴーストは **最終行より下の行** に出る
+    /// (落とすとその本数だけトラックが増える、Ableton Live と同じ)。上端だけは
+    /// master 行を避けて clamp する。
     #[test]
-    fn drag_preview_geometry_move_clamps_track() {
+    fn drag_preview_geometry_move_keeps_rows_past_the_end() {
         let anchor = ClipDragAnchor {
             key: ClipKey { track_id: 0, clip_id: 0 },
             start_beat: 4.0,
             len_beats: 2.0,
             track_index: 0,
         };
-        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 0, 3, 0.05);
+        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 0, 0.05);
         assert!((s - 5.5).abs() < 1e-9);
         assert!((l - 2.0).abs() < 1e-9);
-        // 0 + 5 = 5 → clamped to 2 (tracks=3 → max idx = 2)
-        assert_eq!(idx, 2);
+        assert_eq!(idx, 5, "0 + 5 = 5 (下側は clamp しない)");
+        // master 行 (min_idx = 1) より上へは行かない。
+        let (_, _, up) = drag_preview_geometry(anchor, ClipDragKind::Move, 0.0, -3, 1, 0.05);
+        assert_eq!(up, 1);
     }
 
     // M10 Phase 46: track reorder

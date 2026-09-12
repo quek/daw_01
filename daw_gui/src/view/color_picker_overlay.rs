@@ -16,7 +16,7 @@ use crate::view::track_color;
 /// するので flicker しない)、`dismissed` で target を `None` に戻す。対象 track /
 /// clip が削除された (= 現在色を引けない) ときは picker を閉じる。
 pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
-    let (Some(target), Some(anchor)) = (app.ui_ephemeral.color_picker_target, app.ui_ephemeral.color_picker_anchor)
+    let (Some(target), Some(anchor)) = (app.cur.peph.color_picker_target, app.cur.peph.color_picker_anchor)
     else {
         return;
     };
@@ -26,11 +26,11 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
     // 対象の現在色を引く。対象が消えていれば picker を閉じる。
     let current: Option<Color> = match target {
         ColorPickerTarget::Track(track_id) => app
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(track_id)
             .map(|t| track_color::to_renderer(track_color::effective_track_color(t))),
         ColorPickerTarget::Clip(clip_ref) => app
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(clip_ref.track_id)
             .and_then(|t| {
                 t.clip_by_id(clip_ref.clip_id).map(|c| {
@@ -38,7 +38,7 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
                 })
             }),
         ColorPickerTarget::AutomationClip(k) => app
-            .song_doc
+            .cur.song_doc
             .song()
             .automation_lane_by_key(k.track, k.lane)
             .and_then(|lane| {
@@ -47,31 +47,31 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
                 })
             }),
         ColorPickerTarget::AutomationLane(k) => app
-            .song_doc
+            .cur.song_doc
             .song()
             .automation_lane_by_key(k.track, k.lane)
             .map(|lane| track_color::to_renderer(track_color::effective_lane_color(lane))),
         ColorPickerTarget::Section(id) => app
-            .song_doc.song()
+            .cur.song_doc.song()
             .sections
             .iter()
             .find(|s| s.id == id)
             .map(|s| Color { r: s.color[0], g: s.color[1], b: s.color[2], a: 1.0 }),
         // r.md #87: ランチャーの列。`Scene::color` は `None` = パレット既定なので、
         // 未設定のときは並び順から導いた既定色を初期値に見せる (トラック色と同流儀)。
-        ColorPickerTarget::Scene(id) => app.song_doc.song().scenes.iter().position(|s| s.id == id).map(|i| {
-            let s = &app.song_doc.song().scenes[i];
+        ColorPickerTarget::Scene(id) => app.cur.song_doc.song().scenes.iter().position(|s| s.id == id).map(|i| {
+            let s = &app.cur.song_doc.song().scenes[i];
             let rgb = s.color.unwrap_or(track_color::PALETTE[i % track_color::PALETTE.len()]);
             Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
         }),
         // r.md #110: Parallel chain。 未設定は中立色 (text_dim) を初期値に見せる。
-        ColorPickerTarget::ParallelChain(id) => app.song_doc.song().chain_by_id(id).map(|(_, c)| {
+        ColorPickerTarget::ParallelChain(id) => app.cur.song_doc.song().chain_by_id(id).map(|(_, c)| {
             c.color
                 .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
                 .unwrap_or(app.theme.core.text_dim)
         }),
         // Parallel 自体 (括弧の帯)。 未設定は chain と同じ中立色。
-        ColorPickerTarget::Parallel(id) => app.song_doc.song().parallel_by_id(id).map(|r| {
+        ColorPickerTarget::Parallel(id) => app.cur.song_doc.song().parallel_by_id(id).map(|r| {
             r.color
                 .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
                 .unwrap_or(app.theme.core.text_dim)

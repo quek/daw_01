@@ -116,7 +116,7 @@ impl AppData {
 
     /// 保存済みプロジェクトのディレクトリ (`samples/` の親)。未保存なら `None`。
     pub(crate) fn project_dir(&self) -> Option<PathBuf> {
-        self.song_doc
+        self.cur.song_doc
             .file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -140,7 +140,7 @@ impl AppData {
         target_beat: Option<f64>,
         new_track_name: String,
     ) -> Option<AudioPlacement> {
-        let n_tracks = self.song_doc.song().tracks.len();
+        let n_tracks = self.cur.song_doc.song().tracks.len();
         let fixed_dest: Option<usize> = match target {
             // どちらも「一番下に新しいトラックを作る」。違うのは置き場所だけ
             // (アレンジのレーン / ランチャーのセル) で、それは `cell_index` が決める。
@@ -154,7 +154,7 @@ impl AppData {
                 Some((i as usize).min(n_tracks - 1))
             }
             ImportTrackTarget::LauncherCell { track_id, .. } => {
-                cell_dest_index(self.song_doc.song(), track_id)
+                cell_dest_index(self.cur.song_doc.song(), track_id)
             }
             ImportTrackTarget::NoHint => {
                 if n_tracks == 0 {
@@ -167,7 +167,7 @@ impl AppData {
         };
         // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
         let start_beat_seed: f64 =
-            target_beat.unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64);
+            target_beat.unwrap_or(self.cur.transport.playhead_beat.unwrap_or(0.0) as f64);
         Some(AudioPlacement {
             target,
             fixed_dest,
@@ -186,7 +186,7 @@ impl AppData {
         p: &mut AudioPlacement,
         imported: import_audio::ImportedAudio,
     ) -> bool {
-        let bpm = self.song_doc.song().bpm;
+        let bpm = self.cur.song_doc.song().bpm;
         let length_beats =
             frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
         let prev_bottom = p.bottom_idx;
@@ -253,7 +253,7 @@ impl AppData {
         if fixed_dest.is_none() {
             p.bottom_idx = Some(dest_idx);
         }
-        self.media.audio_source_cache.insert(source_id, imported.buffer.clone());
+        self.cur.media.audio_source_cache.insert(source_id, imported.buffer.clone());
         p.next_start_beat += length_beats;
         p.cell_offset += 1;
         true
@@ -296,7 +296,7 @@ impl AppData {
             return;
         }
         let project_dir: Option<PathBuf> = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
@@ -304,17 +304,17 @@ impl AppData {
         // 既存トラックへの drop は index、 それ以外は一番下に新規トラック。
         let cell_track_idx = match target {
             ImportTrackTarget::LauncherCell { track_id, .. } => {
-                cell_dest_index(self.song_doc.song(), track_id)
+                cell_dest_index(self.cur.song_doc.song(), track_id)
             }
             _ => None,
         };
         let dest_track_idx: Option<usize> = cell_track_idx
-            .or_else(|| resolve_media_drop_target(target, self.song_doc.song().tracks.len()));
+            .or_else(|| resolve_media_drop_target(target, self.cur.song_doc.song().tracks.len()));
 
         // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
         let start_beat_seed: f64 =
-            target_beat.unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64);
-        let bpm = self.song_doc.song().bpm;
+            target_beat.unwrap_or(self.cur.transport.playhead_beat.unwrap_or(0.0) as f64);
+        let bpm = self.cur.song_doc.song().bpm;
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut next_start_beat = start_beat_seed.max(0.0);
@@ -351,7 +351,7 @@ impl AppData {
                     }) else {
                         return;
                     };
-                    self.media.audio_source_cache.insert(id, audio.buffer.clone());
+                    self.cur.media.audio_source_cache.insert(id, audio.buffer.clone());
                     Some(id)
                 }
                 None => None,
@@ -374,11 +374,11 @@ impl AppData {
             //     `video_texture_cache` for the arrangement view to
             //     read.
             if let Some(thumb) = imported.thumbnail {
-                self.media.video_thumbnail_rgba.insert(
+                self.cur.media.video_thumbnail_rgba.insert(
                     video_source_id,
                     (thumb.width, thumb.height, std::sync::Arc::new(thumb.rgba)),
                 );
-                self.media.pending_thumbnail_uploads.push(video_source_id);
+                self.cur.media.pending_thumbnail_uploads.push(video_source_id);
             }
 
             // 3) Video clip + (音声があれば) 対の音声 clip を 1 undo step で置く。
@@ -466,7 +466,7 @@ impl AppData {
             return;
         }
         let project_dir = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
@@ -477,12 +477,12 @@ impl AppData {
         // r.md #87: セルへの drop は安定 id なので、まず id → index を解く。
         let cell_track_idx = match target {
             ImportTrackTarget::LauncherCell { track_id, .. } => {
-                cell_dest_index(self.song_doc.song(), track_id)
+                cell_dest_index(self.cur.song_doc.song(), track_id)
             }
             _ => None,
         };
         let dest_track_idx: Option<usize> = cell_track_idx
-            .or_else(|| resolve_media_drop_target(target, self.song_doc.song().tracks.len()));
+            .or_else(|| resolve_media_drop_target(target, self.cur.song_doc.song().tracks.len()));
 
         // drag&drop の drop 位置 (`target_beat`) を最優先。 無いとき (dialog 経由)
         // は従来挙動: 既存 track に貼るときは playhead を seed に順送り配置
@@ -491,11 +491,11 @@ impl AppData {
         let mut next_start_beat = match target_beat {
             Some(b) => b.max(0.0),
             None if dest_track_idx.is_some() => {
-                (self.transport.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
+                (self.cur.transport.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
             }
             None => 0.0_f64,
         };
-        let image_clip_length_beats = (self.song_doc.song().length_beats * 0.5).max(8.0);
+        let image_clip_length_beats = (self.cur.song_doc.song().length_beats * 0.5).max(8.0);
 
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
@@ -526,11 +526,11 @@ impl AppData {
             }) else {
                 return;
             };
-            self.media.image_source_bgra.insert(
+            self.cur.media.image_source_bgra.insert(
                 image_source_id,
                 (src_w, src_h, std::sync::Arc::new(imported.bgra)),
             );
-            self.media.pending_image_uploads.push(image_source_id);
+            self.cur.media.pending_image_uploads.push(image_source_id);
 
             // 2) Build the Image clip content. Single ImageEvent
             // covering the whole clip。 デフォルト PiP rect は
@@ -544,7 +544,7 @@ impl AppData {
                 .unwrap_or("image")
                 .to_string();
             let (def_x, def_y, def_w, def_h) = aspect_fit_pip_rect(
-                self.song_doc.song().video_resolution,
+                self.cur.song_doc.song().video_resolution,
                 (src_w, src_h),
             );
             self.edit_song(|song| {
@@ -625,7 +625,7 @@ impl AppData {
     /// 任意の track 上にタイムラインで生成する。 content / styles は inspector、 PiP rect は
     /// preview drag で編集。 clip 長は他 clip 生成 (`create_clip`) と同じ `DEFAULT_CLIP_LENGTH`。
     pub(crate) fn add_text_clip_to_track(&mut self, track_id: u32, start_beat: f64) {
-        let Some(track_idx) = self.song_doc.song().tracks.iter().position(|t| t.id == track_id) else {
+        let Some(track_idx) = self.cur.song_doc.song().tracks.iter().position(|t| t.id == track_id) else {
             return;
         };
         let start_beat = start_beat.max(0.0);
@@ -725,7 +725,7 @@ impl AppData {
         }
         // SMPTE timing (division 負値) の SMF は tick が「秒の細分」なので、
         // 取り込み先プロジェクトのテンポで拍に直す。metrical のファイルでは使われない。
-        let tempo_map = common::tempo_map::TempoMap::from_song(self.song_doc.song());
+        let tempo_map = common::tempo_map::TempoMap::from_song(self.cur.song_doc.song());
         let seconds_to_beat = |s: f64| tempo_map.seconds_to_beat(s);
 
         let mut parsed_files: Vec<(PathBuf, String, crate::midi_import::ParsedMidi)> = Vec::new();
@@ -749,10 +749,10 @@ impl AppData {
 
         // drop 位置 (無ければ playhead) が SMF tick 0 の置き場所。
         let drop_beat = target_beat
-            .unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64)
+            .unwrap_or(self.cur.transport.playhead_beat.unwrap_or(0.0) as f64)
             .max(0.0);
-        let song_is_empty = song_has_no_clips(self.song_doc.song());
-        let anchor = resolve_media_drop_target(target, self.song_doc.song().tracks.len());
+        let song_is_empty = song_has_no_clips(self.cur.song_doc.song());
+        let anchor = resolve_media_drop_target(target, self.cur.song_doc.song().tracks.len());
 
         // ---- 採用するテンポ / 拍子を先に確定する (空の曲のときだけ) ----
         let adopted_time_sig = if song_is_empty {
@@ -1374,7 +1374,7 @@ mod video_import_target_tests {
     }
 
     fn kind_of(app: &crate::state::AppData, content_id: common::model::ContentId) -> &'static str {
-        match app.song_doc.song().clip_contents.get(&content_id) {
+        match app.cur.song_doc.song().clip_contents.get(&content_id) {
             Some(ClipContent::Video(_)) => "video",
             Some(ClipContent::Audio(_)) => "audio",
             _ => "other",
@@ -1391,7 +1391,7 @@ mod video_import_target_tests {
             return;
         };
         let mut app = headless_app();
-        app.song_doc.replace_song(common::model::Song {
+        app.cur.song_doc.replace_song(common::model::Song {
             tracks: vec![
                 track_with(|t| { t.id = 10; t.name = "A".into(); }),
                 track_with(|t| { t.id = 20; t.name = "B".into(); }),
@@ -1403,7 +1403,7 @@ mod video_import_target_tests {
             ImportTrackTarget::LauncherCell { track_id: 10, scene_index: 2 },
             Some(4.0),
         );
-        let song = app.song_doc.song();
+        let song = app.cur.song_doc.song();
         assert_eq!(song.tracks.len(), 3, "対の音声行が 1 本増える: {}", app.ui_ephemeral.status_message);
         assert_eq!(song.tracks[0].id, 10);
         assert_eq!(song.tracks[1].name, "clip (Audio)", "音声行は video 行の直下");
@@ -1431,7 +1431,7 @@ mod video_import_target_tests {
             return;
         };
         let mut app = headless_app();
-        app.song_doc.replace_song(common::model::Song {
+        app.cur.song_doc.replace_song(common::model::Song {
             tracks: vec![
                 track_with(|t| { t.id = 10; t.parent_group_id = Some(99); }),
                 track_with(|t| { t.id = 20; }),
@@ -1439,7 +1439,7 @@ mod video_import_target_tests {
             ..Default::default()
         });
         app.action_import_video(vec![src], ImportTrackTarget::Track(0), Some(4.0));
-        let song = app.song_doc.song();
+        let song = app.cur.song_doc.song();
         assert_eq!(song.tracks.len(), 3);
         assert_eq!(song.tracks[0].clips.len(), 1, "video clip は落とした行");
         assert_eq!(song.tracks[0].clips[0].start_beat, 4.0);

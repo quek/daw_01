@@ -235,7 +235,7 @@ fn ts_index_to_den(idx: usize) -> u8 {
 
 /// r.md #56: 再生位置を (ビート表記, タイム表記) の 2 本に分けて組み立てる。
 ///
-/// SSoT は `app.transport.playhead_beat` 一本。 小節.拍 は time_sig から
+/// SSoT は `app.cur.transport.playhead_beat` 一本。 小節.拍 は time_sig から
 /// (アレンジ / ピアノロールのルーラと同じ [`common::timing::beat_to_bar_beat`])、
 /// 秒は [`AppData::song_beat_to_seconds`] から導出する。 これは SongTempo automation
 /// lane があれば `TempoMap` を `song_epoch` 世代キャッシュに載せて引くだけの経路で、
@@ -245,11 +245,11 @@ fn ts_index_to_den(idx: usize) -> u8 {
 /// テンポカーブのある曲で毎フレーム O(曲長) の table 構築が走る (常時描画のバーなので
 /// 曲長に比例して悪化する) ため、 必ずキャッシュ側を通す。
 fn playhead_readout(app: &AppData) -> (String, String) {
-    let Some(b) = app.transport.playhead_beat else {
+    let Some(b) = app.cur.transport.playhead_beat else {
         return ("--.-.--".to_string(), "--:--.---".to_string());
     };
     let beat = f64::from(b);
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let (bar, beat_in_bar) = common::timing::beat_to_bar_beat(beat, song.time_sig);
     let beat_int = beat_in_bar.floor().max(1.0) as u32;
     let sub = ((beat_in_bar - f64::from(beat_int)) * 100.0).floor().clamp(0.0, 99.0) as u32;
@@ -364,14 +364,14 @@ fn draw_tempo_and_key(
     let bpm_mod = crate::view::modulation::build_mod(
         app,
         bpm_target.clone(),
-        f64::from(app.song_doc.song().bpm),
+        f64::from(app.cur.song_doc.song().bpm),
         crate::view::modulation::PLAIN_IDENT,
         MASTER_TRACK_ID,
     );
     let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",
         Rect { x, y: cy, w: bpm_w, h: bh },
-        f64::from(app.song_doc.song().bpm),
+        f64::from(app.cur.song_doc.song().bpm),
         120.0,
         ScrubableNumberFormat::Decimal(1),
         &scrub_style_bpm(&app.theme),
@@ -397,7 +397,7 @@ fn draw_tempo_and_key(
     // target = SongTempo、 track_id = MASTER_TRACK_ID (= master row 配下の
     // song-level lane を指す sentinel)。 mixer_strips と同 helper 使用。
     let songtempo_was_dragging = app
-        .recording.active_param_gestures
+        .cur.recording.active_param_gestures
         .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo));
     push_param_gesture_edges(
         ui,
@@ -417,7 +417,7 @@ fn draw_tempo_and_key(
     let ts_resp = ui.scrubable_number_at(
         "transport_time_sig_num",
         Rect { x, y: cy, w: ts_num_w, h: bh },
-        f64::from(app.song_doc.song().time_sig.0),
+        f64::from(app.cur.song_doc.song().time_sig.0),
         4.0,
         ScrubableNumberFormat::Integer,
         &scrub_style_tsig_num(&app.theme),
@@ -432,7 +432,7 @@ fn draw_tempo_and_key(
         None,
     );
     let tsig_was_dragging = app
-        .recording.active_param_gestures
+        .cur.recording.active_param_gestures
         .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTimeSigNumerator));
     push_param_gesture_edges(
         ui,
@@ -457,7 +457,7 @@ fn draw_tempo_and_key(
 
     // time_sig (denominator) dropdown
     let ts_den_w = 52.0;
-    let cur_den_idx = ts_den_to_index(app.song_doc.song().time_sig.1);
+    let cur_den_idx = ts_den_to_index(app.cur.song_doc.song().time_sig.1);
     if let Some(idx) = ui.dropdown(
         "transport_time_sig_den",
         Rect { x, y: cy, w: ts_den_w, h: bh },
@@ -485,8 +485,8 @@ fn draw_tempo_and_key(
     );
     x += 28.0;
 
-    let playhead_for_scale = app.transport.playhead_beat.map(f64::from).unwrap_or(0.0).max(0.0);
-    let cur_scale_change = app.song_doc.song().scale_at(playhead_for_scale).copied();
+    let playhead_for_scale = app.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0).max(0.0);
+    let cur_scale_change = app.cur.song_doc.song().scale_at(playhead_for_scale).copied();
     let cur_root_idx = cur_scale_change
         .map(|sc| sc.root.min(11) as usize + 1)
         .unwrap_or(0); // 0 = "—" (OFF)
@@ -581,7 +581,7 @@ fn draw_playback_buttons(
 
     // Play/Stop: icon (▶ / ■) + 緑色 toggle。 再生中は緑 LED で active 強調。
     let play_w = 36.0;
-    let play_active = app.transport.is_playing;
+    let play_active = app.cur.transport.is_playing;
     ui.toggle_button_at(
         "transport_play",
         if play_active { "\u{25A0}" } else { "\u{25B6}" },
@@ -605,8 +605,8 @@ fn draw_playback_buttons(
     // (残り小節数を数字で) と、プロジェクト / プラグインの読込待ち (`…`)。
     // 同じ表示にすると嘘になる。
     let rec_w = 36.0;
-    let rec_active = app.recording.requested;
-    let pending = rec_active && !app.recording.live;
+    let rec_active = app.cur.recording.requested;
+    let pending = rec_active && !app.cur.recording.live;
     let count_in_left = pending
         .then(|| app.count_in_remaining_bars())
         .flatten()
@@ -637,7 +637,7 @@ fn draw_playback_buttons(
 
     // Loop toggle: icon (⟳) + 色のコンパクトボタン。 active 時 blue に染まる。
     let loop_w = 36.0;
-    let loop_active = app.transport.loop_region.enabled;
+    let loop_active = app.cur.transport.loop_region.enabled;
     ui.toggle_button_at(
         "transport_loop",
         "\u{27F3}",
@@ -655,7 +655,7 @@ fn draw_playback_buttons(
     let follow_w = 36.0;
     ui.toggle_button_at(
         "transport_follow",
-        follow_glyph(app.ui_prefs.arrange_follow),
+        follow_glyph(app.cur.view.arrange_follow),
         Rect { x, y: cy, w: follow_w, h: bh },
         false, // 色を付けない (ユーザー指定) ので active 強調はしない
         &style_follow(&app.theme),
@@ -672,7 +672,7 @@ fn draw_playback_buttons(
 /// popup id は座標に依らない安定 id (`master_panel::MENU_IDS` と同じ理由)。
 fn count_in_context_menu(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     const COUNT_IN_LABELS: [&str; 3] = ["カウントイン なし", "カウントイン 1 小節", "カウントイン 2 小節"];
-    let cur = usize::from(app.recording.count_in_bars.min(2));
+    let cur = usize::from(app.cur.recording.count_in_bars.min(2));
     let labels: Vec<String> = COUNT_IN_LABELS
         .iter()
         .enumerate()
@@ -708,7 +708,7 @@ fn draw_recording_controls(
     let rec_mode_w = 66.0;
     let cur_rec_idx = RECORDING_MODES
         .iter()
-        .position(|(m, _)| *m == app.recording.recording_mode)
+        .position(|(m, _)| *m == app.cur.recording.recording_mode)
         .unwrap_or(0);
     if let Some(idx) = ui.dropdown(
         "transport_rec_mode",
@@ -730,7 +730,7 @@ fn draw_recording_controls(
     // off、 session-only state (project save には含めない)。 icon = ♬ (16 分
     // 音符 ×2、 細かい beat 感)、 active 時は黄 LED 風で 「click 鳴動中」 を強調。
     let metro_w = 36.0;
-    let metro_active = app.transport.metronome_enabled;
+    let metro_active = app.cur.transport.metronome_enabled;
     let metro_rect = Rect { x, y: cy, w: metro_w, h: bh };
     ui.toggle_button_at(
         "transport_metronome",
@@ -753,7 +753,7 @@ fn draw_recording_controls(
     // で in-scale に寄せる。 session-only state、 step input は適用外。
     // "Snap Live" = 9 字 * 12 * 0.527 = 57.0px。
     let snap_live_w = 64.0;
-    let snap_live_active = app.recording.snap_live_input;
+    let snap_live_active = app.cur.recording.snap_live_input;
     ui.toggle_button_at(
         "transport_snap_live",
         "Snap Live",
@@ -776,8 +776,8 @@ fn draw_recording_controls(
     // 「現在 user 操作待ちの mode」 強調)。
     // 最長ラベル "Learn Param" / "Learning..." = 11 字 * 12 * 0.527 = 69.6px。
     let learn_w = 76.0;
-    let learn_active = app.recording.midi_learn_target.is_some();
-    let armed_track_for_learn = app.selection.selected_track_ids.first().copied();
+    let learn_active = app.cur.recording.midi_learn_target.is_some();
+    let armed_track_for_learn = app.cur.selection.selected_track_ids.first().copied();
     // B2 (r.md #8): touch + learn。 直近に触った param が bind 可能なら
     // (PluginParam / Volume / Pan) それを、 無ければ選択 track の Volume を learn。
     let learn_target = app.midi_learn_binding_target(armed_track_for_learn);
@@ -798,7 +798,7 @@ fn draw_recording_controls(
         &style_rec_mode(&app.theme),
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
-                if app.recording.midi_learn_target.is_some() {
+                if app.cur.recording.midi_learn_target.is_some() {
                     app.handle_event(AppEvent::CancelMidiLearn);
                 } else if let Some(target) = learn_target {
                     app.handle_event(AppEvent::StartMidiLearn(target));

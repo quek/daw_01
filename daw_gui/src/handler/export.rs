@@ -15,7 +15,7 @@ impl AppData {
     /// 再利用されるので、消し残しがそのまま溜まっていた。「何を消すか」を 1 か所に
     /// 集めて、sidecar が増えたときに 3 箇所へ足し忘れないようにする。
     pub(crate) fn remove_export_temp_wav(&mut self) {
-        let Some(wav) = self.transport.export_temp_wav.take() else {
+        let Some(wav) = self.cur.transport.export_temp_wav.take() else {
             return;
         };
         let _ = std::fs::remove_file(
@@ -35,10 +35,10 @@ impl AppData {
     /// その範囲が「今の関心領域」)。 末尾は最低 `MIN_EXPORT_RANGE_BEATS` を保証する。
     pub(crate) fn default_export_range(&self) -> (f64, f64) {
         let (start, end) = self
-            .transport
+            .cur.transport
             .loop_region
             .range()
-            .unwrap_or((0.0, self.song_doc.song().length_beats));
+            .unwrap_or((0.0, self.cur.song_doc.song().length_beats));
         let start = start.max(0.0);
         (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
     }
@@ -52,8 +52,8 @@ impl AppData {
         // video export は実行中だと二重起動できない (旧 action_open_export_mp4_dialog
         // のガードをここへ移設)。
         if matches!(kind, ExportRangeKind::Mp4)
-            && (self.transport.export_stage.is_some()
-                || self.transport.pending_video_export.is_some()
+            && (self.cur.transport.export_stage.is_some()
+                || self.cur.transport.pending_video_export.is_some()
                 || self.ui_ephemeral.export_dialog_open)
         {
             self.ui_ephemeral.status_message = "Video export を実行中です".into();
@@ -66,8 +66,8 @@ impl AppData {
             kind,
             // 既定はプロジェクト現在値 (= 1920x1080 / 30)。 dropdown で
             // 変更した値は per-export override として確定時に運ばれる。
-            resolution: self.song_doc.song().video_resolution,
-            framerate: self.song_doc.song().video_framerate,
+            resolution: self.cur.song_doc.song().video_resolution,
+            framerate: self.cur.song_doc.song().video_framerate,
         });
     }
 
@@ -80,7 +80,7 @@ impl AppData {
         };
         // start=0 かつ end>=length は全曲とみなす (= None)。 浮動小数の比較は緩く。
         let is_full = picker.start_beat <= f64::EPSILON
-            && picker.end_beat >= self.song_doc.song().length_beats - f64::EPSILON;
+            && picker.end_beat >= self.cur.song_doc.song().length_beats - f64::EPSILON;
         let range_beats: Option<(f64, f64)> =
             if is_full { None } else { Some((picker.start_beat, picker.end_beat)) };
         match picker.kind {
@@ -119,9 +119,9 @@ impl AppData {
         &self,
         source: ExportRangeSource,
     ) -> Option<(f64, f64)> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match source {
-            ExportRangeSource::Loop => self.transport.loop_region.range(),
+            ExportRangeSource::Loop => self.cur.transport.loop_region.range(),
             // 通常クリップ面と automation 面のどちらで選んでいても拾う
             // (last-selection-wins の面判定はここでは不要 — 両方の bounding を取る)。
             ExportRangeSource::Selection => {
@@ -136,7 +136,7 @@ impl AppData {
             }
             // プレイヘッドが乗っているセクション (無ければ最初のセクション)。
             ExportRangeSource::Section => {
-                let at = f64::from(self.transport.playhead_beat.unwrap_or(0.0));
+                let at = f64::from(self.cur.transport.playhead_beat.unwrap_or(0.0));
                 song.sections
                     .iter()
                     .find(|s| at >= s.start_beat && at < s.end_beat())
@@ -178,7 +178,7 @@ impl AppData {
         ));
         // 全 plugin を deactivate→activate でクリーンにしてから export する。
         // 完了 (`PluginsReinitDone`) で stashed export を発火。
-        self.transport.pending_export = Some((path, range, write_mod_sidecar));
+        self.cur.transport.pending_export = Some((path, range, write_mod_sidecar));
 
         // r.md #75: 合成が終わる前に render すると部分ミックスが焼かれる (フレーズ単位で
         // 逐次 publish するようになったため)。全 VOICEVOX device に最新メタデータを
@@ -187,18 +187,18 @@ impl AppData {
         // job があるとそこで捨てられ、`done_gen` が永久に追いつかない。
         let devices = self.all_vocal_synth_device_ids();
         if devices.is_empty() {
-            self.send_plugin(PluginCommand::ReinitAllPlugins);
+            self.send_plugin(PluginCommand::ReinitAllPlugins { project: Some(self.pk()) });
             return;
         }
         for &device_id in &devices {
             // bounce と同じ理由で差分キャッシュを迂回する (前回失敗していても再試行し、
             // 合成世代を必ず 1 つ進めて `VocalSynthReady` を確実に返させる)。
-            self.voicevox.voicevox_metadata_sent.remove(&device_id);
+            self.cur.pvv.voicevox_metadata_sent.remove(&device_id);
         }
         self.sync_vocal_metadata();
-        self.ipc.pending_vocal_synth_export = devices.iter().copied().collect();
+        self.cur.pipc.pending_vocal_synth_export = devices.iter().copied().collect();
         for device_id in devices {
-            self.send_plugin(PluginCommand::PrepareVocalSynth { device_id });
+            self.send_plugin(PluginCommand::PrepareVocalSynth { device: self.dev(device_id) });
         }
     }
 
@@ -210,19 +210,28 @@ impl AppData {
     /// (どちらの子の crash でも安全に解除できる)。
     ///
     /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
+    /// 走っている **映像** 書き出し (in-process の render スレッド) に中断を伝える。
+    /// engine 側の freewheel は `AudioCommand::CancelExport` の担当なので触らない。
+    /// 終了シーケンスが全タブぶん呼ぶ (`docs/plan_project_tabs.md` §5.4)。
+    pub(crate) fn cancel_inflight_video_export(&mut self) {
+        if let Some(flag) = &self.cur.transport.export_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn abort_inflight_renders_on_disconnect(&mut self) -> bool {
         let mut aborted = false;
         // `J` (Glue) の焼き込みも同じ offline render を使う。 自前の後始末
         // (出力ファイルの削除 + bookend + engine song 復元) を持っているので、
         // pending を落とすだけでなくそちらへ委ねる。
-        if self.ipc.pending_glue_bake.is_some() {
+        if self.cur.pipc.pending_glue_bake.is_some() {
             self.abort_glue_bake(
                 "音声エンジンが切断されたため Glue の焼き込みを中止しました".into(),
             );
             aborted = true;
         }
-        if self.ipc.pending_clip_fx_bounce.take().is_some()
-            || self.ipc.pending_vocal_synth_bounce.take().is_some()
+        if self.cur.pipc.pending_clip_fx_bounce.take().is_some()
+            || self.cur.pipc.pending_vocal_synth_bounce.take().is_some()
         {
             self.send_plugin(PluginCommand::SetRenderMode(
                 common::protocol::RenderMode::Realtime,
@@ -260,11 +269,11 @@ impl AppData {
     /// 子プロセス切断 (`handle_child_disconnected`) とユーザーの Cancel/ESC の両方が
     /// ここを通る (待ちを畳む手順は 1 か所)。
     pub(crate) fn abort_vocal_synth_export_gate(&mut self, reason: &str) -> bool {
-        if self.ipc.pending_vocal_synth_export.is_empty() {
+        if self.cur.pipc.pending_vocal_synth_export.is_empty() {
             return false;
         }
-        self.ipc.pending_vocal_synth_export.clear();
-        self.transport.pending_export = None;
+        self.cur.pipc.pending_vocal_synth_export.clear();
+        self.cur.transport.pending_export = None;
         // `export_stage` は既に `AudioRender` なので、既存の脱出口がそのまま効く
         // (overlay / 入力 gate / temp WAV / SetRenderMode(Realtime) を畳む)。
         self.abort_audio_export(reason.into());
@@ -295,15 +304,15 @@ impl AppData {
         resolution: (u32, u32),
         framerate: f32,
     ) {
-        if self.transport.export_stage.is_some()
-            || self.transport.pending_video_export.is_some()
+        if self.cur.transport.export_stage.is_some()
+            || self.cur.transport.pending_video_export.is_some()
             || self.ui_ephemeral.export_dialog_open
         {
             self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
         let default_name = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
@@ -345,16 +354,16 @@ impl AppData {
         }
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
-        self.transport.pending_video_export = Some(output_path);
-        self.transport.pending_video_export_range = range_beats;
+        self.cur.transport.pending_video_export = Some(output_path);
+        self.cur.transport.pending_video_export_range = range_beats;
         // 音声 render 完了後に始める video render へ、 picker で選んだ
         // 出力解像度 / fps を per-export override として持ち越す。
-        self.transport.pending_video_export_dims = Some((resolution, framerate));
-        self.transport.export_temp_wav = Some(temp_wav.clone());
+        self.cur.transport.pending_video_export_dims = Some((resolution, framerate));
+        self.cur.transport.export_temp_wav = Some(temp_wav.clone());
         // 前段 = 音声 freewheel。daw_audio の `ExportWavProgress` で determinate
         // 進捗が来る（旧構造では indeterminate「音声レンダリング中」だった）。
-        self.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
-        self.transport.export_progress_at = Some(std::time::Instant::now());
+        self.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+        self.cur.transport.export_progress_at = Some(std::time::Instant::now());
         self.ui_ephemeral.status_message = "音声をレンダリング中...".into();
         // 音声も video と同じ窓 (拍) で freewheel render する。 `None` で全曲。
         // stop → reinit plugins → ExportWav (begin_wav_export 経由)。 video render が
@@ -373,13 +382,13 @@ impl AppData {
     /// 実際に中止したら `true`、`AudioRender` 中でなく no-op なら `false` を返す。
     /// 呼び出し側 (`handle_child_disconnected`) が status 文言の組み立てに使う。
     pub(crate) fn abort_audio_export(&mut self, reason: String) -> bool {
-        if !matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. })) {
+        if !matches!(self.cur.transport.export_stage, Some(ExportStage::AudioRender { .. })) {
             return false;
         }
-        self.transport.export_stage = None;
-        self.transport.export_progress_at = None;
-        self.transport.pending_video_export = None;
-        if let Some(t) = self.transport.export_temp_wav.take() {
+        self.cur.transport.export_stage = None;
+        self.cur.transport.export_progress_at = None;
+        self.cur.transport.pending_video_export = None;
+        if let Some(t) = self.cur.transport.export_temp_wav.take() {
             let _ = std::fs::remove_file(&t);
         }
         // daw_audio がまだ生きている (= watchdog が slow render を hang と誤検出した
@@ -432,7 +441,8 @@ impl AppData {
         match kind {
             FileDialogKind::OpenProject => {
                 if let Some(path) = paths.into_iter().next() {
-                    self.action_open_path(path);
+                    // `docs/plan_project_tabs.md` Q4: 新しいタブ (pristine なら置き換え)。
+                    self.open_path_in_tab(path);
                 }
             }
             FileDialogKind::ExportMp4 { range_beats, resolution, framerate } => {
@@ -475,8 +485,8 @@ impl AppData {
                 // 来るまでは 0% 表示、以降 daw_audio の freewheel 進捗で更新、
                 // `ExportWavComplete` で None に戻して閉じる。これで WAV export 中
                 // の入力 gate / 再生抑止も video と同様に効く。
-                self.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
-                self.transport.export_progress_at = Some(std::time::Instant::now());
+                self.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+                self.cur.transport.export_progress_at = Some(std::time::Instant::now());
                 // standalone WAV export — stop → reinit plugins →
                 // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
                 // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
@@ -487,7 +497,7 @@ impl AppData {
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
-                match crate::midi_export::export_midi(self.song_doc.song(), &path) {
+                match crate::midi_export::export_midi(self.cur.song_doc.song(), &path) {
                     Ok(()) => {
                         self.ui_ephemeral.status_message =
                             format!("MIDI 書き出し完了: {}", path.display());
@@ -562,19 +572,22 @@ impl AppData {
         // 何らかの export が走っている間は再入を弾く。video 後段への chain は
         // `ExportWavComplete` ハンドラが先に `export_stage` を None に戻してから
         // 呼ぶので通る。
-        if self.transport.export_stage.is_some() {
+        if self.cur.transport.export_stage.is_some() {
             self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
         let project_dir = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        let song = self.song_doc.song().clone();
+        let song = self.cur.song_doc.song().clone();
         let proxy = self.ipc.event_proxy.clone();
+        // 進捗 / 完了は **書き出しを始めたタブ** へ返す (途中でタブを切り替えても
+        // 別のタブに着弾しない)。
+        let project = self.pk();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.transport.export_cancel = Some(cancel.clone());
-        self.transport.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
+        self.cur.transport.export_cancel = Some(cancel.clone());
+        self.cur.transport.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
         self.ui_ephemeral.status_message = format!("Video export 開始: {}", output_path.display());
         std::thread::spawn(move || {
             // video の render 窓も拍範囲に合わせる (audio temp WAV は
@@ -597,7 +610,7 @@ impl AppData {
             let mut on_progress = |done: u64, total: u64| {
                 if done == 0 || done >= total || done.saturating_sub(last_sent) >= 5 {
                     last_sent = done;
-                    proxy.send(AppEvent::ExportProgress { done, total });
+                    proxy.send(AppEvent::ExportProgress { project, done, total });
                 }
             };
             let result = crate::render_video::render_mp4_cancellable(
@@ -606,7 +619,7 @@ impl AppData {
                 &mut on_progress,
             )
             .map(|stats| stats.output_path);
-            proxy.send(AppEvent::ExportFinished { result });
+            proxy.send(AppEvent::ExportFinished { project, result });
         });
     }
 

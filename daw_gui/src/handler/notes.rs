@@ -23,7 +23,7 @@ fn dup_dest_in_clip(
     r: ClipKey,
     offset: f64,
 ) -> Option<((f64, f64), Vec<u8>)> {
-    let clip = app.song_doc.song().clip_by_key(r)?;
+    let clip = app.cur.song_doc.song().clip_by_key(r)?;
     let dest = (
         clip.song_to_content_beat(sel.start_beat) + offset,
         clip.song_to_content_beat(sel.end_beat) + offset,
@@ -87,9 +87,9 @@ impl AppData {
         if self.selected_note_ids().is_empty() {
             return None;
         }
-        let track = self.song_doc.song().track_by_id(r.track_id)?;
+        let track = self.cur.song_doc.song().track_by_id(r.track_id)?;
         let clip = track.clip_by_id(r.clip_id)?;
-        let notes = self.song_doc.song().clip_notes(clip);
+        let notes = self.cur.song_doc.song().clip_notes(clip);
         let mut copied: Vec<Note> = self
             .selected_note_ids()
             .iter()
@@ -109,7 +109,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
+            self.cur.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::Notes(copied),
         )
         .to_json()?;
@@ -235,8 +235,8 @@ impl AppData {
     }
 
     pub(crate) fn resize_track_peak_display(&mut self) {
-        let n = self.song_doc.song().tracks.len();
-        self.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));
+        let n = self.cur.song_doc.song().tracks.len();
+        self.cur.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));
     }
 
     // -------- Note operations ----------------------------------------------
@@ -255,12 +255,12 @@ impl AppData {
     /// `scale_at(playhead)` で見つかる event を update。 plan §4.1 と一致。
     pub(crate) fn set_scale_at_playhead(&mut self, root: u8, scale: common::scale::Scale) {
         let playhead = self
-            .transport.playhead_beat
+            .cur.transport.playhead_beat
             .map(f64::from)
             .unwrap_or(0.0)
             .max(0.0);
         let root = root.min(11);
-        if self.song_doc.song().scale_changes.is_empty() {
+        if self.cur.song_doc.song().scale_changes.is_empty() {
             self.edit_song(move |song| {
                 song.scale_changes.push(common::scale::ScaleChange {
                     beat: 0.0,
@@ -274,7 +274,7 @@ impl AppData {
         // を update。 playhead 未満の event が無ければ最初の event を update
         // (Cubase Transport の Chord Track edit と同じ idiom)。
         let target_idx = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .scale_changes
             .iter()
             .rposition(|c| c.beat <= playhead)
@@ -294,12 +294,12 @@ impl AppData {
         let Some(r) = self.selected_clip_ref() else {
             return;
         };
-        if self.song_doc.song().scale_changes.is_empty() {
+        if self.cur.song_doc.song().scale_changes.is_empty() {
             self.ui_ephemeral.status_message =
                 "Scale が設定されていません (Transport bar の Key dropdown で設定)".to_string();
             return;
         }
-        let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(r.track_id) else {
             return;
         };
         let Some(clip) = track.clip_by_id(r.clip_id) else {
@@ -311,7 +311,7 @@ impl AppData {
         // (= borrow checker 衝突回避)。 `Song::clip_notes` は `Clip` を経由する
         // shared note 取得 helper、 mutable 版は `notes_in_clip_mut`。
         let snaps: Vec<(u32, u8)> = {
-            let notes = self.song_doc.song().clip_notes(clip);
+            let notes = self.cur.song_doc.song().clip_notes(clip);
             let target_indices: Vec<u32> = match target {
                 QuantizePitchTarget::SelectedNotes => self.selected_note_ids(),
                 QuantizePitchTarget::SelectedClipAllNotes => {
@@ -324,7 +324,7 @@ impl AppData {
                     let n = notes.get(i as usize)?;
                     let global_beat = clip_start_beat + n.start_beat;
                     let new_pitch = self
-                        .song_doc.song()
+                        .cur.song_doc.song()
                         .scale_at(global_beat)
                         .map(|sc| sc.snap(n.pitch))
                         .unwrap_or(n.pitch);
@@ -382,14 +382,14 @@ impl AppData {
         // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw。
         // scale_changes が空なら scale_at が None → unwrap_or で raw pitch
         // 維持 = 機能 OFF と同じ挙動。
-        let pitch = if self.ui_prefs.snap_on_draw {
+        let pitch = if self.cur.view.snap_on_draw {
             let clip_start_beat = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .clip_by_key(key)
                 .map(common::model::Clip::content_origin_beat)
                 .unwrap_or(0.0);
             let global_beat = clip_start_beat + start_beat;
-            self.song_doc.song()
+            self.cur.song_doc.song()
                 .scale_at(global_beat)
                 .map(|sc| sc.snap(pitch))
                 .unwrap_or(pitch)
@@ -420,17 +420,17 @@ impl AppData {
         };
         // 新規ノートは「対象クリップ」へ入る。 focus をこのクリップに揃えるだけで
         // 選択 (範囲) は縮小しない (複数同時表示を保持)。
-        self.ui_ephemeral.pianoroll_focus_clip = Some(key);
+        self.cur.peph.pianoroll_focus_clip = Some(key);
         // 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
         self.set_note_selection(&(self.pack_clip_selection(key, &selected)));
-        self.ui_prefs.last_note_duration_beats = duration;
+        self.cur.view.last_note_duration_beats = duration;
     }
 
     pub(crate) fn set_note_positions(&mut self, entries: &[(u32, f64, u8)]) {
         // entries の `u32` は packed note id (clip_slot|local index)。所属クリップ
         // ごとに分配し、各クリップ内 local index で位置を書き換える。`beat` は view が既に
         // 各 note の所属クリップ clip-local に戻している (per-note offset)。
-        let snap_on_draw = self.ui_prefs.snap_on_draw;
+        let snap_on_draw = self.cur.view.snap_on_draw;
         self.for_each_note_clip_group(
             entries.iter().map(|&(id, beat, pitch)| (id, (beat, pitch))),
             |app, slot, r, items| {
@@ -443,7 +443,7 @@ impl AppData {
                     .iter()
                     .map(|&(local, (beat, pitch))| {
                         let new_pitch = if snap_on_draw {
-                            app.song_doc.song()
+                            app.cur.song_doc.song()
                                 .scale_at(clip_start + beat.max(0.0))
                                 .map(|sc| sc.snap(pitch))
                                 .unwrap_or(pitch)
@@ -495,7 +495,7 @@ impl AppData {
             },
         );
         if let Some(&(_, _, duration)) = entries.last() {
-            self.ui_prefs.last_note_duration_beats =
+            self.cur.view.last_note_duration_beats =
                 duration.max(common::model::MIN_NOTE_LEN_BEATS);
         }
     }
@@ -511,7 +511,7 @@ impl AppData {
     /// 行き先が窓 (クリップ) の外へ出るなら**窓を伸ばして**鳴るようにする。
     /// 伸ばせるのは隣のクリップの手前まで (`Track::clips` の非重なり不変条件)。
     pub(crate) fn duplicate_selected_notes(&mut self) {
-        let Some(sel) = self.selection.time.clone() else {
+        let Some(sel) = self.cur.selection.time.clone() else {
             return;
         };
         let offset = sel.len_beats();
@@ -521,7 +521,7 @@ impl AppData {
         }
         // クリップごとの `edit_song` + 窓伸ばしで snapshot が何段も積まれるので、
         // 1 回の D を **1 undo step** に畳む (`J` と同じ扱い)。
-        self.song_doc.begin_gesture();
+        self.cur.song_doc.begin_gesture();
         self.for_each_note_clip_group(
             selected.into_iter().map(|id| (id, ())),
             |app, _slot, r, items| {
@@ -537,14 +537,14 @@ impl AppData {
             },
         );
         self.extend_clips_to_cover(&sel, offset);
-        self.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture();
         // 範囲を 1 つ後ろへ送る。 選択されたノートは範囲から導出されるので、
         // これだけで「複製が新しい選択」になる。
-        if let Some(t) = self.selection.time.as_mut() {
+        if let Some(t) = self.cur.selection.time.as_mut() {
             t.start_beat += offset;
             t.end_beat += offset;
         }
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 
     /// 範囲を `offset` 拍後ろへ複製したときに、行き先が窓の外へ出るクリップの
@@ -860,9 +860,9 @@ impl AppData {
     /// 選択は範囲 (時間 × 鍵盤行) なので、 割っても両半分が選択されたまま。
     pub(crate) fn action_split_notes_at_cursor(&mut self, snap: bool) {
         let Some(raw) = self
-            .ui_ephemeral
+            .cur.peph
             .pianoroll_hover_beat_song_raw
-            .or_else(|| self.transport.playhead_beat.map(|b| b as f64))
+            .or_else(|| self.cur.transport.playhead_beat.map(|b| b as f64))
         else {
             self.ui_ephemeral.status_message =
                 "Split: マウスをピアノロールに置くか再生中に E を押してください".into();
@@ -878,11 +878,11 @@ impl AppData {
         // どちらも無ければ、 表示中クリップの **全ノート** を対象にする (切り口を跨ぐものだけが
         // 実際に割れる = 「カーソルの時間にある全ノートを分割」)。
         let selected = self.selected_note_ids();
-        let targets: Vec<u32> = match self.ui_ephemeral.pianoroll_hover_note {
+        let targets: Vec<u32> = match self.cur.peph.pianoroll_hover_note {
             Some(id) if !selected.contains(&id) => vec![id],
             _ if !selected.is_empty() => selected,
             _ => {
-                let song = self.song_doc.song();
+                let song = self.cur.song_doc.song();
                 self.shown_pianoroll_clips()
                     .iter()
                     .enumerate()

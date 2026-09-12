@@ -36,6 +36,7 @@ fn make_song_with_one_track(track_id: u32, devices: Vec<PluginInstance>) -> Song
 fn loaded(plugin_id_str: &str) -> LoadedDeviceInfo {
     LoadedDeviceInfo {
         plugin_id_str: plugin_id_str.into(),
+        token: common::protocol::InstanceToken(1),
     }
 }
 

@@ -27,7 +27,7 @@ impl AppData {
             return;
         };
         let track_id_opt = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target_clip.track_id)
             .map(|t| t.id);
         let Some(track_id) = track_id_opt else {
@@ -53,10 +53,10 @@ impl AppData {
             }
         });
         if let Some(lane_id) = found_id {
-            self.ui_prefs
+            self.cur.view
                 .hidden_automation_lanes
                 .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
-            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.cur.view.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Image Automation lane '{}' は既に存在します",
                 automation_target_display_name(&target)
@@ -70,11 +70,11 @@ impl AppData {
         // image event が無ければ field ごとの常識値。 clamp 範囲は field
         // 種別で異なる (x/y/w/h/opacity = [0,1]、 rotation = [-π, π])。
         let default_value: f64 = {
-            let Some(track) = self.song_doc.song().track_by_id(track_id) else {
+            let Some(track) = self.cur.song_doc.song().track_by_id(track_id) else {
                 return;
             };
             let event = track.all_clips().find_map(|c| {
-                self.song_doc.song().clip_contents.get(&c.content_id).and_then(|content| {
+                self.cur.song_doc.song().clip_contents.get(&c.content_id).and_then(|content| {
                     match content {
                         ClipContent::Image(img) => img.events.first(),
                         _ => None,
@@ -120,7 +120,7 @@ impl AppData {
         if !__applied {
             return;
         }
-        self.ui_prefs.expanded_automation_tracks.insert(track_id);
+        self.cur.view.expanded_automation_tracks.insert(track_id);
         self.ui_ephemeral.status_message = format!(
             "Added image automation lane: {}",
             automation_target_display_name(&target)
@@ -131,7 +131,7 @@ impl AppData {
     /// 残っているか。 record_automation_points_for_tick の起動条件で
     /// 「停止中でも image drag 中なら record を回す」 ために使う。
     pub(crate) fn image_pip_drag_active(&self) -> bool {
-        self.recording.active_param_gestures
+        self.cur.recording.active_param_gestures
             .iter()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::ImageBuiltin(_)))
     }
@@ -152,7 +152,7 @@ impl AppData {
         let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
-        let Some(track) = self.song_doc.song().track_by_id(target_clip.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target_clip.track_id) else {
             return;
         };
         let track_id = track.id;
@@ -173,14 +173,14 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.recording.active_param_gestures.insert((track_id, target.clone()));
+                self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
                 if matches!(
-                    self.recording.recording_mode,
+                    self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch
                         | common::model::RecordingMode::Write
-                ) && self.transport.is_playing
+                ) && self.cur.transport.is_playing
                 {
-                    self.recording.latched_param_gestures.insert((track_id, target.clone()));
+                    self.cur.recording.latched_param_gestures.insert((track_id, target.clone()));
                 }
                 seeded.push(target);
             }
@@ -198,16 +198,16 @@ impl AppData {
         use common::model::AutomationTarget;
         // image lane gesture だけを掃除 (audio / plugin gesture は残す)。
         let to_remove: Vec<(u32, AutomationTarget)> = self
-            .recording.active_param_gestures
+            .cur.recording.active_param_gestures
             .iter()
             .filter(|(_, t)| matches!(t, AutomationTarget::ImageBuiltin(_)))
             .cloned()
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
-            self.recording.active_param_gestures.remove(&key);
-            if self.recording.recording_mode == common::model::RecordingMode::Touch {
-                self.recording.recording_last_beat.remove(&key);
+            self.cur.recording.active_param_gestures.remove(&key);
+            if self.cur.recording.recording_mode == common::model::RecordingMode::Touch {
+                self.cur.recording.recording_last_beat.remove(&key);
             }
         }
         if any {
@@ -224,7 +224,7 @@ impl AppData {
         let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
-        let Some(track) = self.song_doc.song().track_by_id(target_clip.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target_clip.track_id) else {
             return;
         };
         let track_id = track.id;
@@ -243,14 +243,14 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.recording.active_param_gestures.insert((track_id, target.clone()));
+                self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
                 if matches!(
-                    self.recording.recording_mode,
+                    self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch
                         | common::model::RecordingMode::Write
-                ) && self.transport.is_playing
+                ) && self.cur.transport.is_playing
                 {
-                    self.recording.latched_param_gestures.insert((track_id, target));
+                    self.cur.recording.latched_param_gestures.insert((track_id, target));
                 }
                 seeded = true;
             }
@@ -266,16 +266,16 @@ impl AppData {
     pub(crate) fn end_text_pip_drag_recording(&mut self) {
         use common::model::AutomationTarget;
         let to_remove: Vec<(u32, AutomationTarget)> = self
-            .recording.active_param_gestures
+            .cur.recording.active_param_gestures
             .iter()
             .filter(|(_, t)| matches!(t, AutomationTarget::TextBuiltin(_)))
             .cloned()
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
-            self.recording.active_param_gestures.remove(&key);
-            if self.recording.recording_mode == common::model::RecordingMode::Touch {
-                self.recording.recording_last_beat.remove(&key);
+            self.cur.recording.active_param_gestures.remove(&key);
+            if self.cur.recording.recording_mode == common::model::RecordingMode::Touch {
+                self.cur.recording.recording_last_beat.remove(&key);
             }
         }
         if any {
@@ -289,7 +289,7 @@ impl AppData {
     /// で `image_pip_drag_active() || text_pip_drag_active()` の OR で
     /// 使う。
     pub(crate) fn text_pip_drag_active(&self) -> bool {
-        self.recording.active_param_gestures
+        self.cur.recording.active_param_gestures
             .iter()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::TextBuiltin(_)))
     }
@@ -355,10 +355,10 @@ impl AppData {
             }
         });
         if let Some(lane_id) = found_id {
-            self.ui_prefs
+            self.cur.view
                 .hidden_automation_lanes
                 .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
-            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.cur.view.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Group Automation lane '{}' は既に存在します",
                 automation_target_display_name(&target)
@@ -366,7 +366,7 @@ impl AppData {
             return;
         }
         let gt = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(track_id)
             .and_then(|t| t.group_transform)
             .unwrap_or_default();
@@ -385,7 +385,7 @@ impl AppData {
         if !__applied {
             return;
         }
-        self.ui_prefs.expanded_automation_tracks.insert(track_id);
+        self.cur.view.expanded_automation_tracks.insert(track_id);
         self.ui_ephemeral.status_message = format!(
             "Added group automation lane: {}",
             automation_target_display_name(&target)
@@ -453,7 +453,7 @@ impl AppData {
         if !__applied {
             return;
         }
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::GroupTransform(param),
             display_name: format!("Group {}", group_param_label(param)),
@@ -465,7 +465,7 @@ impl AppData {
     /// video / text 表示 clip を持つ track が 1 つでもある、または既に
     /// `group_transform` データを持つなら true。inspector / 合成の gate。
     pub fn group_has_visual_content(&self, group_track_id: u32) -> bool {
-        crate::group_compose::group_has_visual_content(self.song_doc.song(), group_track_id)
+        crate::group_compose::group_has_visual_content(self.cur.song_doc.song(), group_track_id)
     }
 
     /// group inspector 用 summary。cursor track が visual group なら、各 param に
@@ -476,16 +476,16 @@ impl AppData {
         // Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
         // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
         // ときだけ Group Transform セクションを出す。
-        let open_device = self.ui_ephemeral.open_video_fx_params?;
+        let open_device = self.cur.peph.open_video_fx_params?;
         // r.md #71 (プラグインのコピー / 移動): パネルは device_id で開いたまま
         // にして、 **描画側で** 「いま表示しているチェーンの device か」 を gate する
         // (device を別トラックへ移してもパネルが自然に追従する)。
-        let (open_track, _) = find_device_by_id(self.song_doc.song(), open_device)?;
+        let (open_track, _) = find_device_by_id(self.cur.song_doc.song(), open_device)?;
         if self.cursor_track_id() != Some(open_track) {
             return None;
         }
-        let track = self.song_doc.song().track_by_id(open_track)?;
-        if self.song_doc.song().plugin_by_id(open_device).map(|d| d.plugin_id.as_str())
+        let track = self.cur.song_doc.song().track_by_id(open_track)?;
+        if self.cur.song_doc.song().plugin_by_id(open_device).map(|d| d.plugin_id.as_str())
             != Some(common::video_fx::TRANSFORM_ID)
         {
             return None;
@@ -507,13 +507,13 @@ impl AppData {
     /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
     /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
     pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
-        let device_id = self.ui_ephemeral.open_video_fx_params?;
-        let (track_id, _) = find_device_by_id(self.song_doc.song(), device_id)?;
+        let device_id = self.cur.peph.open_video_fx_params?;
+        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
         let def = self
-            .song_doc
+            .cur.song_doc
             .song()
             .plugin_by_id(device_id)
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))?;
@@ -523,9 +523,9 @@ impl AppData {
         let empty: &[common::model::AutomationLane] = &[];
         let lanes: &[common::model::AutomationLane] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song_doc.song().song_lanes
+                &self.cur.song_doc.song().song_lanes
             } else {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .track_by_id(track_id)
                     .map_or(empty, |t| t.automation_lanes.as_slice())
             };
@@ -556,11 +556,11 @@ impl AppData {
         use common::model::{AutomationLane, AutomationTarget};
         // lane の所有者 (track / master) は device_id から毎回引き直す
         // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some((track_id, _)) = find_device_by_id(song, device_id) else {
             return;
         };
-        // def_by_id は &'static を返すので self.song_doc.song() の借用はここで終わる。
+        // def_by_id は &'static を返すので self.cur.song_doc.song() の借用はここで終わる。
         let Some(def) = song
             .plugin_by_id(device_id)
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
@@ -607,10 +607,10 @@ impl AppData {
             }
         });
         if let Some(Some(key)) = created_hidden {
-            self.ui_prefs.hidden_automation_lanes.insert(key);
+            self.cur.view.hidden_automation_lanes.insert(key);
         }
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -625,12 +625,12 @@ impl AppData {
     /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
     pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
-        let device_id = self.ui_ephemeral.open_plugin_params?;
-        let (track_id, _) = find_device_by_id(self.song_doc.song(), device_id)?;
+        let device_id = self.cur.peph.open_plugin_params?;
+        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        let device = self.song_doc.song().plugin_by_id(device_id)?;
+        let device = self.cur.song_doc.song().plugin_by_id(device_id)?;
         let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
@@ -638,14 +638,14 @@ impl AppData {
         let empty: &[common::model::AutomationLane] = &[];
         let lanes: &[common::model::AutomationLane] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song_doc.song().song_lanes
+                &self.cur.song_doc.song().song_lanes
             } else {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .track_by_id(track_id)
                     .map_or(empty, |t| t.automation_lanes.as_slice())
             };
         let params: Vec<PluginParamRow> = self
-            .ipc.plugin_params
+            .cur.pipc.plugin_params
             .get(&device_id)
             .map(|infos| {
                 infos
@@ -704,12 +704,12 @@ impl AppData {
     /// 「Par」パネルが開いている device の plugin_id (cursor track 上)。
     /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
     pub(crate) fn open_param_panel_plugin_id(&self) -> Option<&str> {
-        let device_id = self.ui_ephemeral.open_plugin_params?;
-        let (track_id, _) = find_device_by_id(self.song_doc.song(), device_id)?;
+        let device_id = self.cur.peph.open_plugin_params?;
+        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        self.song_doc.song().plugin_by_id(device_id).map(|d| d.plugin_id.as_str())
+        self.cur.song_doc.song().plugin_by_id(device_id).map(|d| d.plugin_id.as_str())
     }
 
     /// VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
@@ -737,11 +737,11 @@ impl AppData {
         use common::model::{AutomationLane, AutomationTarget};
         // device が消えていれば何もしない (削除済み device への stale binding /
         // stale event は正常系なので tracing は出さない)。
-        let Some((track_id, _)) = find_device_by_id(self.song_doc.song(), device_id) else {
+        let Some((track_id, _)) = find_device_by_id(self.cur.song_doc.song(), device_id) else {
             return;
         };
         let Some(info) = self
-            .ipc.plugin_params
+            .cur.pipc.plugin_params
             .get(&device_id)
             .and_then(|v| v.iter().find(|p| p.id == param_id))
             .cloned()
@@ -789,13 +789,13 @@ impl AppData {
             }
         });
         if let Some(Some(key)) = created_hidden {
-            self.ui_prefs.hidden_automation_lanes.insert(key);
+            self.cur.view.hidden_automation_lanes.insert(key);
         }
         // 表示名は `automation_target_label` 1 本に寄せる (r.md #72 / #78)。
         // かつてここだけ `format!("{module} {name}")` を手組みしていたため、
         // 同じ param が経路によって別名で出ていた。
         let display_name = self.automation_target_label(&target);
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -819,7 +819,7 @@ impl AppData {
             return;
         };
         let track_id_opt = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target_clip.track_id)
             .map(|t| t.id);
         let Some(track_id) = track_id_opt else {
@@ -845,10 +845,10 @@ impl AppData {
             }
         });
         if let Some(lane_id) = found_id {
-            self.ui_prefs
+            self.cur.view
                 .hidden_automation_lanes
                 .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
-            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.cur.view.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Text Automation lane '{}' は既に存在します",
                 automation_target_display_name(&target)
@@ -881,7 +881,7 @@ impl AppData {
         if !__applied {
             return;
         }
-        self.ui_prefs.expanded_automation_tracks.insert(track_id);
+        self.cur.view.expanded_automation_tracks.insert(track_id);
         self.ui_ephemeral.status_message = format!(
             "Added text automation lane: {}",
             automation_target_display_name(&target)
@@ -944,26 +944,31 @@ impl AppData {
         if self.suppress_child_respawn(kind) {
             return;
         }
-        let was_playing = self.transport.is_playing;
+        let was_playing = self.any_tab_mut(|app| app.cur.transport.is_playing);
         // r.md #51: 通常 `is_playing` の writer は `on_tick` の観測だけだが、
         // 子プロセスが落ちた以上 Tick はもう来ない (= 観測が永久に止まる) ので、
         // ここだけは「走っていない」ことを直接書き込む。 録音セッションも同時に
         // 閉じないと Rec が点灯したまま、凍ったプレイヘッドへノートが積み上がる。
-        self.transport.is_playing = false;
-        self.transport.preroll_remaining = 0;
-        self.transport.pending_play = None;
-        self.transport.pending_play_record = None;
-        self.close_recording_session();
-        self.silence_monitor_notes();
-        self.recording.active_param_gestures.clear();
-        self.recording.latched_param_gestures.clear();
+        // `docs/plan_project_tabs.md` §5.1: 子が落ちた影響は **全タブ** に及ぶ。
+        // アクティブなタブだけ畳むと、背景タブは Rec が点いたまま / bounce が永久に
+        // 残ったまま (= そのタブの編集が export_lock で無言に全拒否される) になる。
+        self.for_each_tab(|app| {
+            app.cur.transport.is_playing = false;
+            app.cur.transport.preroll_remaining = 0;
+            app.cur.transport.pending_play = None;
+            app.cur.transport.pending_play_record = None;
+            app.close_recording_session();
+            app.silence_monitor_notes();
+            app.cur.recording.active_param_gestures.clear();
+            app.cur.recording.latched_param_gestures.clear();
+        });
         // r.md #54: 走査中の解析も畳む。子が落ちた以上 `LoudnessAnalysisComplete` は
         // 永遠に来ないので、放置すると背景を暗転したまま watchdog の 60 秒まで
         // 操作不能になる (書き出しの `abort_audio_export` と同じ理由・同じ位置)。
         // plugin_host の切断でも畳む — `PluginsReinitDone` 待ちで固まるため。
-        self.abort_loudness_analysis(
-            "子プロセスが切断されたためラウドネス解析を中止しました".into(),
-        );
+        self.for_each_tab(|app| {
+            app.abort_loudness_analysis("子プロセスが切断されたためラウドネス解析を中止しました".into());
+        });
         // 音声 render 中の crash で export を中止したか。respawn 成功時の status に
         // 「書き出しを中止しました」を併記して、中止の事実が上書きで消えないようにする。
         let mut export_aborted = false;
@@ -975,30 +980,33 @@ impl AppData {
                 // GUI が永久ロックする）。AudioRender 中でなければ no-op。中止した
                 // ことは下の respawn status に併記する（respawn 成功 status に
                 // 上書きされて「書き出しが中止された」事実が消えないように）。
-                export_aborted = self.abort_audio_export(
-                    "音声エンジンがクラッシュしたため書き出しを中止しました".into(),
-                );
+                export_aborted |= self.any_tab_mut(|app| {
+                    app.abort_audio_export("音声エンジンがクラッシュしたため書き出しを中止しました".into())
+                });
                 tracing::warn!("daw_audio child disconnected");
             }
             ChildKind::PluginHost => {
                 self.ipc.plugin_tx = None;
-                self.ipc.pending_plugin_loads.clear();
-                self.ipc.loaded_devices.clear();
+                // 帳簿は全タブぶん落とす (host が消えた = どのタブの instance も無い)。
+                self.for_each_tab(|app| {
+                    app.cur.pipc.pending_plugin_loads.clear();
+                    app.cur.pipc.loaded_devices.clear();
+                });
                 // host が消えた時点で **全** device が未ロードなので、「一部だけ
                 // 未ロード」を示す失敗 entry は誤情報になる (respawn すれば
                 // restore_plugin_from_song が全 device を load し直し、crash-loop で
                 // 諦めた場合は status_message がその旨を伝える)。
-                self.ipc.failed_plugin_loads.clear();
+                self.for_each_tab(|app| app.cur.pipc.failed_plugin_loads.clear());
                 // plugin state 取得待ちの round-trip はもう完了しない
                 // (host 消滅で AllStatesReceived が来ない)。 stale な queue / 保留ガードを
                 // 破棄して GUI の恒久ロックを防ぐ。 hang watchdog (`abort_state_roundtrip`)
                 // と同じ脱出処理に一本化する。
-                self.abort_state_roundtrip();
+                self.for_each_tab(AppData::abort_state_roundtrip);
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
         // 進行中の bounce / 書き出しを畳む (脱出口は handler::export が持つ)。
-        export_aborted |= self.abort_inflight_renders_on_disconnect();
+        export_aborted |= self.any_tab_mut(AppData::abort_inflight_renders_on_disconnect);
 
         // 中止した書き出しがあれば status に併記する suffix。
         let export_suffix = if export_aborted {
@@ -1091,22 +1099,9 @@ impl AppData {
         };
         match respawn_result {
             Ok(()) => {
-                // state restore: project_dir + LoadSong (= sync_song_to
-                // _plugin_host 経路)、 plugin slots は restore_plugin_from
-                // _song で SetSlotPlugin 再送。
-                let song_snapshot = self.song_doc.song().clone();
-                self.restore_plugin_from_song(&song_snapshot);
-                // ループ (ON/OFF + 範囲) は `Song` に載らない session state なので
-                // LoadSong では戻らない。 新しい audio プロセスは既定 (OFF / 範囲
-                // 未設定) で立ち上がるため、 明示的に送り直して GUI 表示と engine の
-                // 実挙動を揃える。
-                if matches!(kind, ChildKind::Audio) {
-                    self.set_loop_region(self.transport.loop_region);
-                    // Global Sampler のリングも session state。GUI 側の shmem は
-                    // 生きているので、新しい audio プロセスに同じ世代を open させる
-                    // (デバイスのレートが変わっていたら作り直す)。
-                    self.resume_sampler_ring_after_respawn();
-                }
+                // `docs/plan_project_tabs.md` §5.1: 新しい子プロセスは **どのタブも**
+                // 知らないので、全タブを回して復元する (handler::tabs)。
+                self.restore_tabs_after_respawn(kind);
                 self.ui_ephemeral.status_message = format!(
                     "{}を再起動しました{}{}",
                     kind.as_str(),
@@ -1141,7 +1136,7 @@ impl AppData {
     }
 
     pub(crate) fn add_automation_from_last_touched(&mut self) {
-        let Some(touched) = self.ui_ephemeral.last_touched_param.clone() else {
+        let Some(touched) = self.cur.peph.last_touched_param.clone() else {
             self.ui_ephemeral.status_message =
                 "No parameter touched yet — drag any knob first".into();
             return;
@@ -1157,21 +1152,21 @@ impl AppData {
                 | common::model::AutomationTarget::SongTimeSigNumerator
         ) || touched.track_id == common::model::MASTER_TRACK_ID;
         // song-level でない場合のみ touched track が削除済か検査。
-        if !is_song_level && self.song_doc.song().track_by_id(touched.track_id).is_none() {
-            self.ui_ephemeral.last_touched_param = None;
+        if !is_song_level && self.cur.song_doc.song().track_by_id(touched.track_id).is_none() {
+            self.cur.peph.last_touched_param = None;
             self.ui_ephemeral.status_message =
                 "Last-touched parameter's track was removed".into();
             return;
         }
         // 既存 lane を find (target 一致)。 master か track かで lookup 経路が分岐。
         let existing_lane_id: Option<u32> = if is_song_level {
-            self.song_doc.song()
+            self.cur.song_doc.song()
                 .song_lanes
                 .iter()
                 .find(|l| l.target == touched.target)
                 .map(|l| l.id)
         } else {
-            self.song_doc.song()
+            self.cur.song_doc.song()
                 .track_by_id(touched.track_id)
                 .and_then(|t| {
                     t.automation_lanes
@@ -1187,7 +1182,7 @@ impl AppData {
             } else {
                 touched.track_id
             };
-            self.ui_prefs
+            self.cur.view
                 .hidden_automation_lanes
                 .remove(&common::model::AutomationLaneKey { track: lookup_track_id, lane: lane_id });
             self.edit_song_checked(|song| {
@@ -1201,9 +1196,9 @@ impl AppData {
                 }
             });
             if is_song_level {
-                self.ui_prefs.master_row_automation_expanded = true;
+                self.cur.view.master_row_automation_expanded = true;
             } else {
-                self.ui_prefs.expanded_automation_tracks.insert(touched.track_id);
+                self.cur.view.expanded_automation_tracks.insert(touched.track_id);
             }
             self.ui_ephemeral.status_message = format!(
                 "Automation lane '{}' は既に存在します",
@@ -1222,7 +1217,7 @@ impl AppData {
                 };
                 song.song_lanes.push(new_lane);
             });
-            self.ui_prefs.master_row_automation_expanded = true;
+            self.cur.view.master_row_automation_expanded = true;
         } else {
             let __applied = self.edit_song_checked(|song| {
                 let Some(track) = song.track_by_id_mut(touched.track_id) else {
@@ -1239,7 +1234,7 @@ impl AppData {
             if !__applied {
                 return;
             }
-            self.ui_prefs.expanded_automation_tracks.insert(touched.track_id);
+            self.cur.view.expanded_automation_tracks.insert(touched.track_id);
         }
         self.ui_ephemeral.status_message = format!(
             "Added automation lane: {}",
@@ -1256,7 +1251,7 @@ impl AppData {
         param: &common::model::TrackBuiltinParam,
     ) -> f64 {
         use common::model::TrackBuiltinParam as P;
-        let Some(track) = self.song_doc.song().track_by_id(track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(track_id) else {
             return 0.0;
         };
         match param {
@@ -1272,23 +1267,23 @@ impl AppData {
                 .map_or(0.0, |s| f64::from(s.gain)),
             // r.md #110: Parallel chain の gain / pan (安定 chain id で引く)。
             P::ChainGain { chain_id } => self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .chain_by_id(*chain_id)
                 .map_or(1.0, |(_, c)| f64::from(c.gain)),
             P::ChainPan { chain_id } => self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .chain_by_id(*chain_id)
                 .map_or(0.0, |(_, c)| f64::from(c.pan)),
             P::ParallelOutGain { parallel_id } => self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .parallel_by_id(*parallel_id)
                 .map_or(1.0, |r| f64::from(r.out_gain)),
             // r.md #112: 分割が off の Parallel (dangling lane) は既定値を出す。
             P::ParallelSplitFreq { parallel_id, edge } => self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .parallel_by_id(*parallel_id)
                 .and_then(|r| r.split.freq(*edge))
@@ -1296,7 +1291,7 @@ impl AppData {
                 .map_or(0.0, f64::from),
             // r.md #114: アクティブ chain の中央の位置 (Selector でなければ中央 0.5)。
             P::ParallelSelect { parallel_id } => self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .parallel_by_id(*parallel_id)
                 .map_or(0.5, |r| f64::from(r.select_pos())),
@@ -1329,7 +1324,7 @@ impl AppData {
                 self.mod_param_plain_value(*source_id, *param)
             }
             AutomationTarget::ModRoutingDepth { routing_id } => self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .all_mod_routings()
                 .find(|r| r.id == *routing_id)
@@ -1337,20 +1332,20 @@ impl AppData {
             // マスターストリップ: target ↔ フィールドの対応は
             // `MasterStrip::param` が SSoT (ここで写さない)。
             AutomationTarget::MasterStrip(param) => {
-                f64::from(self.song_doc.song().master_strip.param(*param))
+                f64::from(self.cur.song_doc.song().master_strip.param(*param))
             }
-            AutomationTarget::SongTempo => f64::from(self.song_doc.song().bpm),
-            AutomationTarget::SongTimeSigNumerator => f64::from(self.song_doc.song().time_sig.0),
+            AutomationTarget::SongTempo => f64::from(self.cur.song_doc.song().bpm),
+            AutomationTarget::SongTimeSigNumerator => f64::from(self.cur.song_doc.song().time_sig.0),
             // Image PiP default: 同 track の最初の image clip の first
             // event 値を初期値に使う。 1 つも image clip が無い (= lane
             // を空 image track で先行追加するケース) は 0.0 fallback。
             AutomationTarget::ImageBuiltin(field) => {
                 use common::model::{ClipContent, ImageBuiltinParam};
-                let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
+                let Some(track) = self.cur.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
                 let event = track.all_clips().find_map(|c| {
-                    self.song_doc.song()
+                    self.cur.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -1373,11 +1368,11 @@ impl AppData {
             // ごとの常識値 (色 RGBA は (1,1,1,1) や (0,0,0,1) 等)。
             AutomationTarget::TextBuiltin(field) => {
                 use common::model::{ClipContent, TextBuiltinParam as T};
-                let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
+                let Some(track) = self.cur.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
                 let event = track.all_clips().find_map(|c| {
-                    self.song_doc.song()
+                    self.cur.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -1438,7 +1433,7 @@ impl AppData {
             AutomationTarget::GroupTransform(param) => {
                 use common::model::GroupTransformParam as G;
                 let gt = self
-                    .song_doc.song()
+                    .cur.song_doc.song()
                     .track_by_id(touched.track_id)
                     .and_then(|t| t.group_transform)
                     .unwrap_or_default();
@@ -1477,7 +1472,7 @@ impl AppData {
             }
         });
         // 選択中だった clip があれば selection からも除く。
-        self.selection.selected_automation_clips
+        self.cur.selection.selected_automation_clips
             .retain(|sel| !keys.iter().any(|k| k == sel));
     }
 

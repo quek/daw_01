@@ -41,14 +41,14 @@ fn build_app() -> (
 }
 
 fn strip(app: &AppData, track_id: u32) -> ChannelStrip {
-    app.song_doc.song().track_by_id(track_id).expect("track exists").strip
+    app.cur.song_doc.song().track_by_id(track_id).expect("track exists").strip
 }
 
 /// audio へ飛んだ `SetTrackStrip` を全部拾う。
 fn drain_strip_cmds(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<(u32, ChannelStrip)> {
     let mut out = Vec::new();
     while let Ok(cmd) = rx.try_recv() {
-        if let AudioCommand::SetTrackStrip { track, strip } = cmd {
+        if let AudioCommand::SetTrackStrip { project: _, track, strip } = cmd {
             out.push((track, strip));
         }
     }
@@ -58,7 +58,7 @@ fn drain_strip_cmds(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<(u32, Chann
 #[test]
 fn ノブの値は可動範囲へ丸められて_audio_まで届く() {
     let (mut app, mut audio_rx, _p) = build_app();
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
 
     // HMF の Freq は 400Hz〜8kHz。範囲外を投げても端で止まる。
     app.handle_event(AppEvent::StripEdit {
@@ -94,7 +94,7 @@ fn ノブの値は可動範囲へ丸められて_audio_まで届く() {
 #[test]
 fn 中身を触ったセクションは自動で_on_になる() {
     let (mut app, _a, _p) = build_app();
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     assert!(!strip(&app, track_id).eq.on, "既定はバイパス");
     assert!(!strip(&app, track_id).comp.on);
 
@@ -146,7 +146,7 @@ fn 中身を触ったセクションは自動で_on_になる() {
 fn sc_listen_は同時に一トラックだけ() {
     let (mut app, mut audio_rx, _p) = build_app();
     app.handle_event(AppEvent::AddInstrumentTrack);
-    let ids: Vec<u32> = app.song_doc.song().tracks.iter().map(|t| t.id).collect();
+    let ids: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
     assert!(ids.len() >= 2, "2 トラック以上で試す");
     let (a, b) = (ids[0], ids[1]);
 
@@ -173,15 +173,15 @@ fn sc_listen_は同時に一トラックだけ() {
 #[test]
 fn セクションの開閉は曲を汚さない() {
     let (mut app, _a, _p) = build_app();
-    assert!(!app.song_doc.is_dirty(), "初期状態は clean");
-    assert!(!app.ui_prefs.strip_eq_open);
+    assert!(!app.cur.song_doc.is_dirty(), "初期状態は clean");
+    assert!(!app.cur.view.strip_eq_open);
 
     app.handle_event(AppEvent::ToggleStripSection(StripSection::Eq));
-    assert!(app.ui_prefs.strip_eq_open);
+    assert!(app.cur.view.strip_eq_open);
     app.handle_event(AppEvent::ToggleStripSection(StripSection::Comp));
-    assert!(app.ui_prefs.strip_comp_open);
-    assert!(!app.song_doc.is_dirty(), "見方の都合で `*` が立ってはいけない");
+    assert!(app.cur.view.strip_comp_open);
+    assert!(!app.cur.song_doc.is_dirty(), "見方の都合で `*` が立ってはいけない");
 
     app.handle_event(AppEvent::ToggleStripSection(StripSection::Eq));
-    assert!(!app.ui_prefs.strip_eq_open);
+    assert!(!app.cur.view.strip_eq_open);
 }

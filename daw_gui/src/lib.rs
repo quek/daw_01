@@ -26,6 +26,7 @@ pub mod event;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
 pub mod event_sampler;
+pub mod event_tabs;
 pub mod event_virtual_keyboard;
 pub mod handler;
 pub mod audio_source_cache;

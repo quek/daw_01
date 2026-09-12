@@ -83,7 +83,7 @@ fn 解析はループ範囲を既定にして再初期化のあとに拍で飛�
 
     app.handle_event(AppEvent::ConfirmExportRange);
     assert_eq!(
-        app.loudness.phase,
+        app.cur.loudness.phase,
         LoudnessPhase::AwaitingReinit { range: Some((8.0, 24.0)) }
     );
     assert!(app.ui_prefs.loudness_report_open, "レポート窓が先に開いていない");
@@ -91,7 +91,7 @@ fn 解析はループ範囲を既定にして再初期化のあとに拍で飛�
     // 再初期化ハンドシェイク: Offline へ切り替えて全プラグインを作り直す。
     let plugin_cmds = drain(&mut plugin_rx);
     assert!(plugin_cmds.contains(&PluginCommand::SetRenderMode(RenderMode::Offline)));
-    assert!(plugin_cmds.contains(&PluginCommand::ReinitAllPlugins));
+    assert!(plugin_cmds.iter().any(|c| matches!(c, PluginCommand::ReinitAllPlugins { project: Some(_) })));
     // まだ解析コマンドは出ていない (状態が汚れたまま測らない)。
     assert!(
         !drain(&mut audio_rx)
@@ -100,10 +100,11 @@ fn 解析はループ範囲を既定にして再初期化のあとに拍で飛�
         "reinit 完了前に解析が始まっている"
     );
 
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Running);
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Running);
     assert!(
         drain(&mut audio_rx).contains(&AudioCommand::AnalyzeLoudness {
+            project: app.pk(),
             range: Some((8.0, 24.0))
         }),
         "解析コマンドが拍で飛んでいない"
@@ -117,20 +118,20 @@ fn 走査中は再生と編集を受け付けない() {
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 16.0 });
     app.handle_event(AppEvent::AnalyzeLoudness);
     app.handle_event(AppEvent::ConfirmExportRange);
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
     drain(&mut audio_rx);
 
     app.handle_event(AppEvent::Play);
-    assert!(!app.transport.is_playing, "解析中に再生が始まっている");
+    assert!(!app.cur.transport.is_playing, "解析中に再生が始まっている");
     assert!(
-        !drain(&mut audio_rx).contains(&AudioCommand::Play),
+        !drain(&mut audio_rx).contains(&AudioCommand::Play { project: app.pk() }),
         "解析中に Play が engine へ飛んでいる"
     );
 
-    let before = app.song_doc.song().bpm;
+    let before = app.cur.song_doc.song().bpm;
     app.handle_event(AppEvent::SetSongBpmFromScrub(180.0));
     assert_eq!(
-        app.song_doc.song().bpm,
+        app.cur.song_doc.song().bpm,
         before,
         "解析中に曲が編集されている (測っている前提が変わる)"
     );
@@ -143,30 +144,32 @@ fn 完了でレポートが確定し編集すると古くなる() {
     app.handle_event(AppEvent::SetLoopRange { start: 4.0, end: 20.0 });
     app.handle_event(AppEvent::AnalyzeLoudness);
     app.handle_event(AppEvent::ConfirmExportRange);
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
     drain(&mut audio_rx);
     drain(&mut plugin_rx);
 
     // 途中経過 → 確定。
-    app.handle_event(AppEvent::Audio(AudioEvent::LoudnessAnalysisProgress(
-        Box::new(LoudnessReport {
+    app.handle_event(AppEvent::Audio(AudioEvent::LoudnessAnalysisProgress {
+        project: app.pk(),
+        report: Box::new(LoudnessReport {
             done_frames: 240_000,
             total_frames: 480_000,
             integrated_lufs: -15.0,
             ..LoudnessReport::default()
         }),
-    )));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Running);
-    assert_eq!(app.loudness.report.as_ref().unwrap().integrated_lufs, -15.0);
+    }));
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Running);
+    assert_eq!(app.cur.loudness.report.as_ref().unwrap().integrated_lufs, -15.0);
 
     app.handle_event(AppEvent::Audio(AudioEvent::LoudnessAnalysisComplete {
+        project: app.pk(),
         report: Some(report((4.0, 20.0), -13.2)),
         error: None,
         cancelled: false,
     }));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Idle);
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Idle);
     assert!(!app.loudness_report_stale());
-    let r = app.loudness.report.as_ref().expect("レポートが無い");
+    let r = app.cur.loudness.report.as_ref().expect("レポートが無い");
     assert_eq!(r.integrated_lufs, -13.2);
     // 目標との差 = 「あと何 dB」。
     let gain = r.normalization_gain_db(-14.0).expect("目標との差");
@@ -192,21 +195,22 @@ fn 中止すると途中の値を確定値として残さない() {
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 8.0 });
     app.handle_event(AppEvent::AnalyzeLoudness);
     app.handle_event(AppEvent::ConfirmExportRange);
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
     drain(&mut audio_rx);
 
     app.handle_event(AppEvent::CancelLoudnessAnalysis);
-    assert_eq!(app.loudness.phase, LoudnessPhase::Cancelling);
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Cancelling);
     assert!(drain(&mut audio_rx).contains(&AudioCommand::CancelExport));
 
     app.handle_event(AppEvent::Audio(AudioEvent::LoudnessAnalysisComplete {
+        project: app.pk(),
         report: Some(report((0.0, 8.0), -20.0)),
         error: None,
         cancelled: true,
     }));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Idle);
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Idle);
     assert!(
-        app.loudness.report.is_none(),
+        app.cur.loudness.report.is_none(),
         "中止した途中値を確定レポートとして残している"
     );
 }
@@ -222,12 +226,12 @@ fn 子プロセス切断で解析を畳み_engine_へ中止を送る() {
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 8.0 });
     app.handle_event(AppEvent::AnalyzeLoudness);
     app.handle_event(AppEvent::ConfirmExportRange);
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Running);
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Running);
     drain(&mut audio_rx);
 
     app.handle_event(AppEvent::Plugin(PluginEvent::ChildDisconnected));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Idle, "暗転したまま残っている");
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Idle, "暗転したまま残っている");
     assert!(
         drain(&mut audio_rx).contains(&AudioCommand::CancelExport),
         "engine に中止を送っていない (export_running が立ちっぱなしになる)"
@@ -244,31 +248,32 @@ fn 前セッションの後着完了を新しい解析の結果にしない() {
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 8.0 });
     app.handle_event(AppEvent::AnalyzeLoudness);
     app.handle_event(AppEvent::ConfirmExportRange);
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
     // watchdog 相当の強制終了 → 世代が進む。
     app.handle_event(AppEvent::Plugin(PluginEvent::ChildDisconnected));
 
     // 2 回目を開始 (まだ reinit 待ち)。
     app.handle_event(AppEvent::AnalyzeLoudness);
     app.handle_event(AppEvent::ConfirmExportRange);
-    assert!(matches!(app.loudness.phase, LoudnessPhase::AwaitingReinit { .. }));
+    assert!(matches!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { .. }));
     drain(&mut audio_rx);
 
     // ここで 1 回目の完了が後着する。
     app.handle_event(AppEvent::Audio(AudioEvent::LoudnessAnalysisComplete {
+        project: app.pk(),
         report: Some(report((0.0, 8.0), -18.0)),
         error: None,
         cancelled: false,
     }));
     assert!(
-        matches!(app.loudness.phase, LoudnessPhase::AwaitingReinit { .. }),
+        matches!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { .. }),
         "後着完了で 2 回目のセッションが畳まれている"
     );
-    assert!(app.loudness.report.is_none(), "前セッションの値を確定値にしている");
+    assert!(app.cur.loudness.report.is_none(), "前セッションの値を確定値にしている");
 
     // 2 回目は正常に発火できる。
-    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
-    assert_eq!(app.loudness.phase, LoudnessPhase::Running);
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone { project: Some(app.pk()) }));
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Running);
     assert!(
         drain(&mut audio_rx)
             .iter()
@@ -288,7 +293,7 @@ fn 範囲プリセットが拍範囲を差し替える() {
     app.handle_event(AppEvent::AnalyzeLoudness);
 
     app.handle_event(AppEvent::SetExportRangeSource(ExportRangeSource::Whole));
-    let len = app.song_doc.song().length_beats;
+    let len = app.cur.song_doc.song().length_beats;
     let p = app.ui_ephemeral.export_range_picker.unwrap();
     assert_eq!((p.start_beat, p.end_beat), (0.0, len));
 

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use common::mod_graph::{ModPhaseTable, ModPlan, ModRuntime, build_plan};
 use common::model::Song;
+use common::protocol::ProjectKey;
 
 /// RT へ配送する 1 組 (評価計画と、それに合わせて確保済みの RT 状態)。
 ///
@@ -58,13 +59,18 @@ impl ModPlanPublisher {
 /// 位相表を張る専用スレッドと、その郵便受け。
 pub struct ModPhaseTableBuilder {
     request: Arc<Mailbox>,
-    done_rx: std::sync::mpsc::Receiver<Arc<ModPhaseTable>>,
+    done_rx: std::sync::mpsc::Receiver<(ProjectKey, Arc<ModPhaseTable>)>,
 }
 
-/// 最新の要求だけ残す郵便受け (古い要求は捨てる — 途中の形は誰も要らない)。
-type Mailbox = (std::sync::Mutex<Option<Request>>, std::sync::Condvar);
+/// project ごとに最新の要求だけ残す郵便受け (古い要求は捨てる — 途中の形は誰も要らない)。
+/// 複数 project (`docs/plan_project_tabs.md`) でも 1 スレッドで順に張る。
+type Mailbox = (
+    std::sync::Mutex<std::collections::VecDeque<Request>>,
+    std::sync::Condvar,
+);
 
 struct Request {
+    project: ProjectKey,
     plan: Arc<ModPlan>,
     song: Arc<Song>,
     sample_rate: u32,
@@ -74,8 +80,10 @@ struct Request {
 impl ModPhaseTableBuilder {
     #[must_use]
     pub fn spawn() -> Self {
-        let request: Arc<Mailbox> =
-            Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let request: Arc<Mailbox> = Arc::new((
+            std::sync::Mutex::new(std::collections::VecDeque::new()),
+            std::sync::Condvar::new(),
+        ));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let mailbox = Arc::clone(&request);
         // spawn 失敗 (スレッド枯渇) は「表が張られない」= 閉形式シードに倒れる
@@ -94,7 +102,7 @@ impl ModPhaseTableBuilder {
     ///
     /// 積分が要らない plan (= rate を変調していない曲) では何もしない —
     /// **既存曲のコストはゼロ**。
-    pub fn request(&self, plan: Arc<ModPlan>, song: &Arc<Song>, sample_rate: u32) {
+    pub fn request(&self, project: ProjectKey, plan: Arc<ModPlan>, song: &Arc<Song>, sample_rate: u32) {
         if !plan.needs_integration() {
             return;
         }
@@ -103,8 +111,11 @@ impl ModPhaseTableBuilder {
         let length_secs =
             common::automation::beats_to_samples(song, sample_rate, song.length_beats) as f64 / sr;
         let (lock, cv) = &*self.request;
-        if let Ok(mut slot) = lock.lock() {
-            *slot = Some(Request {
+        if let Ok(mut queue) = lock.lock() {
+            // 同じ project の古い要求は捨てる (最新だけ残す)。
+            queue.retain(|r| r.project != project);
+            queue.push_back(Request {
+                project,
                 plan,
                 // `publish_bundle` が持っている `Arc<Song>` をそのまま共有する。
                 // deep clone すると、ツマミを動かすたびに曲まるごとの複製が
@@ -117,12 +128,13 @@ impl ModPhaseTableBuilder {
         }
     }
 
-    /// 完成した表を受け取る (無ければ `None`)。溜まっていたら最新の 1 枚だけ返す。
+    /// 完成した表を受け取る (無ければ空)。同じ project で溜まっていたら最新の 1 枚だけ。
     #[must_use]
-    pub fn take_finished(&self) -> Option<Arc<ModPhaseTable>> {
-        let mut latest = None;
-        while let Ok(t) = self.done_rx.try_recv() {
-            latest = Some(t);
+    pub fn take_finished(&self) -> Vec<(ProjectKey, Arc<ModPhaseTable>)> {
+        let mut latest: Vec<(ProjectKey, Arc<ModPhaseTable>)> = Vec::new();
+        while let Ok((key, t)) = self.done_rx.try_recv() {
+            latest.retain(|(k, _)| *k != key);
+            latest.push((key, t));
         }
         latest
     }
@@ -130,10 +142,13 @@ impl ModPhaseTableBuilder {
 
 /// 郵便受けを待って表を張り続ける。`done_tx` が閉じたら (= recv loop が畳まれたら)
 /// 終わる。
-fn worker_loop(mailbox: &Mailbox, done_tx: &std::sync::mpsc::Sender<Arc<ModPhaseTable>>) {
+fn worker_loop(
+    mailbox: &Mailbox,
+    done_tx: &std::sync::mpsc::Sender<(ProjectKey, Arc<ModPhaseTable>)>,
+) {
     while let Some(job) = wait_for_request(mailbox) {
         let table = ModPhaseTable::build(&job.plan, &job.song, job.sample_rate, job.length_secs);
-        if done_tx.send(Arc::new(table)).is_err() {
+        if done_tx.send((job.project, Arc::new(table))).is_err() {
             return;
         }
     }
@@ -142,9 +157,9 @@ fn worker_loop(mailbox: &Mailbox, done_tx: &std::sync::mpsc::Sender<Arc<ModPhase
 /// 要求が入るまで待つ。lock が毒されたら `None` (= スレッドを畳む)。
 fn wait_for_request(mailbox: &Mailbox) -> Option<Request> {
     let (lock, cv) = mailbox;
-    let mut slot = lock.lock().ok()?;
-    while slot.is_none() {
-        slot = cv.wait(slot).ok()?;
+    let mut queue = lock.lock().ok()?;
+    while queue.is_empty() {
+        queue = cv.wait(queue).ok()?;
     }
-    slot.take()
+    queue.pop_front()
 }

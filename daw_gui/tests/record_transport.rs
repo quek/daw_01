@@ -52,10 +52,10 @@ fn drain(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<AudioCommand> {
 
 /// 先頭トラックを録音待機にする。
 fn arm_first_track(app: &mut AppData) -> u32 {
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     app.handle_event(AppEvent::ToggleTrackArmed(track_id));
     assert!(
-        app.song_doc.song().tracks[0].armed,
+        app.cur.song_doc.song().tracks[0].armed,
         "arm_first_track: armed にならなかった"
     );
     track_id
@@ -64,6 +64,7 @@ fn arm_first_track(app: &mut AppData) -> u32 {
 /// engine からの Tick を 1 回模す (playhead は拍でなくサンプル)。
 fn tick(app: &mut AppData, playing: bool, recording_live: bool, samples: u64) {
     app.handle_event(AppEvent::Tick {
+        project: app.pk(),
         samples,
         preroll: 0,
         playing,
@@ -78,7 +79,7 @@ fn samples_at_beat(beat: f64) -> u64 {
 
 /// 先頭トラックの先頭クリップに録音されたノート。
 fn recorded_notes(app: &AppData) -> Vec<common::model::Note> {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let Some(clip) = song.tracks[0].clips.first() else {
         return Vec::new();
     };
@@ -104,7 +105,7 @@ fn rec_単独開始は_count_in_の後に_play_を送る() {
         .expect("StartRecording が送られていない");
     let play_at = sent
         .iter()
-        .position(|c| matches!(c, AudioCommand::Play))
+        .position(|c| matches!(c, AudioCommand::Play { project: _ }))
         .expect("Play が送られていない");
     assert!(
         start_at < play_at,
@@ -114,12 +115,13 @@ fn rec_単独開始は_count_in_の後に_play_を送る() {
     assert_eq!(
         sent[start_at],
         AudioCommand::StartRecording {
+            project: app.pk(),
             preroll_samples: 96_000
         }
     );
-    assert!(app.recording.requested, "Rec ボタンは点灯する");
+    assert!(app.cur.recording.requested, "Rec ボタンは点灯する");
     assert!(
-        !app.recording.live,
+        !app.cur.recording.live,
         "engine の観測前に録音実体が立ってはいけない (count-in を飛ばす)"
     );
 }
@@ -131,7 +133,7 @@ fn rec_単独開始は_count_in_の後に_play_を送る() {
 fn count_in_無しでも_start_recording_を送る() {
     let (mut app, mut audio_rx, _p) = build_app();
     arm_first_track(&mut app);
-    assert_eq!(app.recording.count_in_bars, 0, "前提: 既定は count-in 無し");
+    assert_eq!(app.cur.recording.count_in_bars, 0, "前提: 既定は count-in 無し");
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::ToggleMidiRecording);
@@ -143,6 +145,7 @@ fn count_in_無しでも_start_recording_を送る() {
             matches!(
                 c,
                 AudioCommand::StartRecording {
+                    project: _,
                     preroll_samples: 0
                 }
             )
@@ -150,7 +153,7 @@ fn count_in_無しでも_start_recording_を送る() {
         .unwrap_or_else(|| panic!("count-in 0 でも StartRecording を送る: {sent:?}"));
     let play_at = sent
         .iter()
-        .position(|c| matches!(c, AudioCommand::Play))
+        .position(|c| matches!(c, AudioCommand::Play { project: _ }))
         .expect("Play が送られていない");
     assert!(start_at < play_at, "録音の開始は Play より先: {sent:?}");
 }
@@ -159,17 +162,17 @@ fn count_in_無しでも_start_recording_を送る() {
 #[test]
 fn 録音待機が無ければ何も始まらない() {
     let (mut app, mut audio_rx, _p) = build_app();
-    for t in app.song_doc.song().tracks.iter() {
+    for t in app.cur.song_doc.song().tracks.iter() {
         assert!(!t.armed, "前提: 初期状態は arm されていない");
     }
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::ToggleMidiRecording);
 
-    assert!(!app.recording.requested);
+    assert!(!app.cur.recording.requested);
     let sent = drain(&mut audio_rx);
     assert!(
-        !sent.iter().any(|c| matches!(c, AudioCommand::Play)),
+        !sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })),
         "録音先が無いのに再生だけ始めない: {sent:?}"
     );
     assert!(app.ui_ephemeral.status_message.contains("録音待機"));
@@ -184,7 +187,7 @@ fn 再生中の_rec_はパンチインで_count_in_を使わない() {
     // ruler をクリックして beat 8 から再生した状態 (= 停止ホームは 8)。
     app.handle_event(AppEvent::PlayFromCursor { beat: 8.0 });
     tick(&mut app, true, false, samples_at_beat(12.0));
-    let home_before = app.transport.home_beat;
+    let home_before = app.cur.transport.home_beat;
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::ToggleMidiRecording);
@@ -192,18 +195,19 @@ fn 再生中の_rec_はパンチインで_count_in_を使わない() {
     let sent = drain(&mut audio_rx);
     assert_eq!(
         sent.iter()
-            .filter(|c| matches!(c, AudioCommand::Play))
+            .filter(|c| matches!(c, AudioCommand::Play { project: _ }))
             .count(),
         0,
         "既に走っている transport へ Play を再送しない: {sent:?}"
     );
     assert!(
         sent.contains(&AudioCommand::StartRecording {
+            project: app.pk(),
             preroll_samples: 0
         }),
         "パンチインは count-in 無しで録音を開始する: {sent:?}"
     );
-    assert_eq!(app.transport.home_beat, home_before, "パンチインはホームを動かさない");
+    assert_eq!(app.cur.transport.home_beat, home_before, "パンチインはホームを動かさない");
 }
 
 /// Rec 再押下はパンチアウト — 録音だけ終わり、transport は止めない。
@@ -213,23 +217,23 @@ fn rec_再押下は録音だけ終えて再生を続ける() {
     arm_first_track(&mut app);
     app.handle_event(AppEvent::ToggleMidiRecording);
     tick(&mut app, true, true, samples_at_beat(4.0));
-    assert!(app.recording.live, "前提: 録音実体が走っている");
+    assert!(app.cur.recording.live, "前提: 録音実体が走っている");
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::ToggleMidiRecording);
 
-    assert!(!app.recording.requested, "Rec は消灯する");
+    assert!(!app.cur.recording.requested, "Rec は消灯する");
     let sent = drain(&mut audio_rx);
     assert!(
-        sent.contains(&AudioCommand::StopRecording),
+        sent.contains(&AudioCommand::StopRecording { project: app.pk() }),
         "engine の録音セッションを閉じる: {sent:?}"
     );
     assert!(
-        !sent.contains(&AudioCommand::Stop),
+        !sent.contains(&AudioCommand::Stop { project: app.pk() }),
         "パンチアウトで transport を止めない: {sent:?}"
     );
     assert!(
-        app.transport.is_playing,
+        app.cur.transport.is_playing,
         "観測値は再生中のまま (engine は走り続けている)"
     );
 }
@@ -246,23 +250,23 @@ fn 停止の観測で録音が閉じプレイヘッドは停止位置に留ま�
     tick(&mut app, true, false, samples_at_beat(4.0));
     app.handle_event(AppEvent::ToggleMidiRecording);
     tick(&mut app, true, true, samples_at_beat(9.0));
-    assert_eq!(app.transport.playhead_beat, Some(9.0));
+    assert_eq!(app.cur.transport.playhead_beat, Some(9.0));
     let _ = drain(&mut audio_rx);
 
     // engine が (曲末なり Stop なりで) 止まったことを観測する。
     tick(&mut app, false, false, samples_at_beat(9.0));
 
-    assert!(!app.recording.requested, "停止したら録音は閉じる");
-    assert!(!app.recording.live);
-    assert_eq!(app.transport.playhead_beat, Some(9.0), "止まった位置に留まる");
-    assert_eq!(app.transport.home_beat, Some(4.0), "ホーム (録音を始めた位置) は残る");
+    assert!(!app.cur.recording.requested, "停止したら録音は閉じる");
+    assert!(!app.cur.recording.live);
+    assert_eq!(app.cur.transport.playhead_beat, Some(9.0), "止まった位置に留まる");
+    assert_eq!(app.cur.transport.home_beat, Some(4.0), "ホーム (録音を始めた位置) は残る");
     let sent = drain(&mut audio_rx);
     assert!(
         !sent.iter().any(|c| matches!(c, AudioCommand::SeekTo { .. })),
         "停止で engine のカーソルを動かさない: {sent:?}"
     );
     assert!(
-        sent.contains(&AudioCommand::StopRecording),
+        sent.iter().any(|c| matches!(c, AudioCommand::StopRecording { project: _ })),
         "engine 側の録音セッションも閉じる: {sent:?}"
     );
 }
@@ -284,7 +288,7 @@ fn count_in_中の入力は記録されない() {
         velocity: 100,
     });
     assert_eq!(
-        app.song_doc.song().tracks[0].clips.len(),
+        app.cur.song_doc.song().tracks[0].clips.len(),
         0,
         "count-in 中はクリップも作らない"
     );
@@ -297,7 +301,7 @@ fn count_in_中の入力は記録されない() {
         velocity: 100,
     });
     assert_eq!(
-        app.song_doc.song().tracks[0].clips.len(),
+        app.cur.song_doc.song().tracks[0].clips.len(),
         1,
         "count-in 明けの入力は記録される"
     );
@@ -383,6 +387,7 @@ fn 録音待機トラックは停止中でも弾いた音を鳴らす() {
     let sent = drain(&mut audio_rx);
     assert!(
         sent.contains(&AudioCommand::PreviewNoteOn {
+            project: app.pk(),
             track_id,
             pitch: 60,
             velocity: 90,
@@ -394,6 +399,7 @@ fn 録音待機トラックは停止中でも弾いた音を鳴らす() {
     let sent = drain(&mut audio_rx);
     assert!(
         sent.contains(&AudioCommand::PreviewNoteOff {
+            project: app.pk(),
             track_id,
             pitch: 60
         }),
@@ -411,6 +417,7 @@ fn 録音待機トラックは停止中でも弾いた音を鳴らす() {
     let sent = drain(&mut audio_rx);
     assert!(
         sent.contains(&AudioCommand::PreviewNoteOff {
+            project: app.pk(),
             track_id,
             pitch: 62
         }),

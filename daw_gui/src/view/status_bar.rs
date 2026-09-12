@@ -64,12 +64,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let left = format!(
         "MIDI: {} \u{2502} file: {}",
-        if app.recording.midi_input_label.is_empty() {
+        if app.cur.recording.midi_input_label.is_empty() {
             "(none)"
         } else {
-            app.recording.midi_input_label.as_str()
+            app.cur.recording.midi_input_label.as_str()
         },
-        app.song_doc.file_path
+        app.cur.song_doc.file_path
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "(unsaved)".to_string()),

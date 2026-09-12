@@ -35,11 +35,11 @@ use crate::app::{AppData, AppEvent, ScrubGesture};
 /// 判断して gesture を閉じる。呼び忘れは「ドラッグ中に undo bracket が
 /// 1 フレームで切れる」形で出る。
 pub(crate) fn push(ui: &mut Ui<'_, AppData>, app: &AppData, owner: ScrubGesture, active: bool) {
-    let holds = app.ui_ephemeral.scrub_gesture.as_ref() == Some(&owner);
+    let holds = app.cur.peph.scrub_gesture.as_ref() == Some(&owner);
     if holds {
         // 在席印。閉じる側 (`sweep`) はこれが立っていないことだけを根拠にする。
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.ui_ephemeral.scrub_gesture_seen = true;
+            app.cur.peph.scrub_gesture_seen = true;
         }));
     }
     if active == holds {
@@ -53,7 +53,7 @@ pub(crate) fn push(ui: &mut Ui<'_, AppData>, app: &AppData, owner: ScrubGesture,
         // 「B を開く」→「A を閉じる」の順になり得る。所有者を照合しないと
         // 掴んだばかりの B の bracket をその場で畳んでしまう。
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if app.ui_ephemeral.scrub_gesture.as_ref() == Some(&owner) {
+            if app.cur.peph.scrub_gesture.as_ref() == Some(&owner) {
                 close(app);
             }
         }));
@@ -73,18 +73,18 @@ fn open(app: &mut AppData, owner: ScrubGesture) {
         }
         _ => app.handle_event(AppEvent::BeginInspectorScrub),
     }
-    app.ui_ephemeral.scrub_gesture = Some(owner);
-    app.ui_ephemeral.scrub_gesture_seen = true;
+    app.cur.peph.scrub_gesture = Some(owner);
+    app.cur.peph.scrub_gesture_seen = true;
 }
 
 /// gesture を閉じる。**立ち下がりでも消滅 ([`sweep`]) でもここ 1 本を通る** —
 /// 閉じ方が 2 通りあると、片方だけが副作用 (host 再同期 / 変調の割り当て確定) を
 /// 持つ形に育つ。
 pub(crate) fn close(app: &mut AppData) {
-    let Some(owner) = app.ui_ephemeral.scrub_gesture.take() else {
+    let Some(owner) = app.cur.peph.scrub_gesture.take() else {
         return;
     };
-    app.ui_ephemeral.scrub_gesture_seen = false;
+    app.cur.peph.scrub_gesture_seen = false;
     match owner {
         ScrubGesture::GroupTransform(_) => app.handle_event(AppEvent::EndGroupTransformDrag),
         ScrubGesture::ModRack => {
@@ -105,10 +105,10 @@ pub(crate) fn close(app: &mut AppData) {
 
 /// フレーム末に 1 回だけ呼ぶ。所有者が今フレーム描かれていなければ閉じる。
 pub(crate) fn sweep(app: &mut AppData) {
-    if app.ui_ephemeral.scrub_gesture.is_some() && !app.ui_ephemeral.scrub_gesture_seen {
+    if app.cur.peph.scrub_gesture.is_some() && !app.cur.peph.scrub_gesture_seen {
         close(app);
     }
-    app.ui_ephemeral.scrub_gesture_seen = false;
+    app.cur.peph.scrub_gesture_seen = false;
 }
 
 #[cfg(test)]
@@ -152,18 +152,18 @@ mod tests {
     fn 欄が描かれなくなったフレームで_bracket_が閉じる() {
         let mut app = build_app();
         open(&mut app, ScrubGesture::Inspector(InspectorScrubField::Gain));
-        assert!(app.song_doc.gesture_active(), "前提: bracket が開いている");
+        assert!(app.cur.song_doc.gesture_active(), "前提: bracket が開いている");
 
         // 描かれ続けているフレーム: `push` が在席印を立てた状態で sweep。
-        app.ui_ephemeral.scrub_gesture_seen = true;
+        app.cur.peph.scrub_gesture_seen = true;
         sweep(&mut app);
-        assert!(app.song_doc.gesture_active(), "描かれている間は開いたまま");
-        assert!(app.ui_ephemeral.scrub_gesture.is_some());
+        assert!(app.cur.song_doc.gesture_active(), "描かれている間は開いたまま");
+        assert!(app.cur.peph.scrub_gesture.is_some());
 
         // 欄が消えたフレーム: 在席印が立たない。
         sweep(&mut app);
-        assert!(!app.song_doc.gesture_active(), "欄が消えたら閉じる");
-        assert!(app.ui_ephemeral.scrub_gesture.is_none());
+        assert!(!app.cur.song_doc.gesture_active(), "欄が消えたら閉じる");
+        assert!(app.cur.peph.scrub_gesture.is_none());
     }
 
     /// 所有者は 1 度に 1 つ。別の欄が掴んだら前の bracket は畳まれる
@@ -174,13 +174,13 @@ mod tests {
         open(&mut app, ScrubGesture::Inspector(InspectorScrubField::Gain));
         open(&mut app, ScrubGesture::GroupTransform(common::model::GroupTransformParam::X));
         assert_eq!(
-            app.ui_ephemeral.scrub_gesture,
+            app.cur.peph.scrub_gesture,
             Some(ScrubGesture::GroupTransform(common::model::GroupTransformParam::X))
         );
-        assert!(app.song_doc.gesture_active());
+        assert!(app.cur.song_doc.gesture_active());
 
         close(&mut app);
-        assert!(app.ui_ephemeral.scrub_gesture.is_none());
-        assert!(!app.song_doc.gesture_active());
+        assert!(app.cur.peph.scrub_gesture.is_none());
+        assert!(!app.cur.song_doc.gesture_active());
     }
 }

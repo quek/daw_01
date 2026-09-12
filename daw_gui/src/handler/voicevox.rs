@@ -298,7 +298,7 @@ impl AppData {
         let now = std::time::Instant::now();
         let failure = progress.failure.clone();
         let entry = self
-            .voicevox
+            .cur.pvv
             .voicevox_synth_status
             .entry(device_id)
             .or_default();
@@ -318,14 +318,14 @@ impl AppData {
             }
         }
         if !entry.progress.busy && entry.failing_since.is_none() && entry.rejected.is_none() {
-            self.voicevox.voicevox_synth_status.remove(&device_id);
+            self.cur.pvv.voicevox_synth_status.remove(&device_id);
         }
     }
 
     /// engine には到達できているが歌詞等を拒否した「内容エラー」の理由 (あれば最初の 1 件)。
     /// overlay が「合成できない歌詞があります」表示に使う。
     pub fn voicevox_rejected_detail(&self) -> Option<&str> {
-        self.voicevox
+        self.cur.pvv
             .voicevox_synth_status
             .values()
             .find_map(|s| s.rejected.as_deref())
@@ -342,31 +342,31 @@ impl AppData {
                     && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
             })
             .map(|d| d.id)
-            .filter(|id| self.ipc.loaded_devices.contains_key(id))
+            .filter(|id| self.cur.pipc.loaded_devices.contains_key(id))
     }
 
     /// track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
     pub fn track_wav_synthesizing(&self, track_id: u32) -> bool {
-        let Some(track) = self.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {
+        let Some(track) = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {
             return false;
         };
         let Some(pid) = self.voicevox_plugin_id_for_track(track) else {
             return false;
         };
-        self.voicevox.voicevox_synth_status.get(&pid).is_some_and(|s| s.progress.busy)
+        self.cur.pvv.voicevox_synth_status.get(&pid).is_some_and(|s| s.progress.busy)
     }
 
     /// このクリップに **未完了フレーズが掛かっているか** (= クリップ上スピナーの点灯条件)。
     /// 「トラックが busy」ではないので、1 ノート直しただけで同トラックの全クリップが
     /// 回ることがなくなる (r.md #75)。
     pub fn clip_wav_synthesizing(&self, track_id: u32, clip_id: u32) -> bool {
-        let Some(track) = self.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {
+        let Some(track) = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {
             return false;
         };
         let Some(pid) = self.voicevox_plugin_id_for_track(track) else {
             return false;
         };
-        self.voicevox
+        self.cur.pvv
             .voicevox_synth_status
             .get(&pid)
             .is_some_and(|s| s.progress.pending_clips.binary_search(&clip_id).is_ok())
@@ -375,7 +375,7 @@ impl AppData {
     /// 曲中の builtin VOICEVOX device の安定 id (load 済のものだけ、track 順)。
     /// 書き出し前の合成完了ゲートが「誰を待つか」を決めるのに使う。
     pub(crate) fn all_vocal_synth_device_ids(&self) -> Vec<u64> {
-        self.song_doc
+        self.cur.song_doc
             .song()
             .tracks
             .iter()
@@ -386,20 +386,20 @@ impl AppData {
 
     /// 出力先 (口 track) が口パク再生成中か。
     pub fn lipsync_target_generating(&self, track_id: u32) -> bool {
-        self.voicevox.lipsync_inflight.contains(&track_id)
+        self.cur.pvv.lipsync_inflight.contains(&track_id)
     }
 
     /// いずれかの VOICEVOX 生成 (WAV 合成 / 口パク) が進行中か。
     pub fn voicevox_any_generating(&self) -> bool {
-        !self.voicevox.lipsync_inflight.is_empty()
-            || self.voicevox.voicevox_synth_status.values().any(|s| s.progress.busy)
+        !self.cur.pvv.lipsync_inflight.is_empty()
+            || self.cur.pvv.voicevox_synth_status.values().any(|s| s.progress.busy)
     }
 
     /// 合成待ちのフレーズ総数 (= 全体オーバーレイの「残り N フレーズ」)。
     /// r.md #75 で合成の最小単位がフレーズになったので、旧
     /// `voicevox_synth_busy_count` (= busy な track 数) は意味を失った。
     pub fn voicevox_pending_phrase_count(&self) -> u32 {
-        self.voicevox
+        self.cur.pvv
             .voicevox_synth_status
             .values()
             .map(|s| s.progress.pending)
@@ -425,7 +425,7 @@ impl AppData {
             return;
         }
         self.persist_app_config();
-        self.voicevox.voicevox_metadata_sent.clear();
+        self.cur.pvv.voicevox_metadata_sent.clear();
         self.sync_vocal_metadata();
     }
 
@@ -435,9 +435,9 @@ impl AppData {
     /// 新 project の vocal device に seed 合成が飛ばず無音になる。書き出しの
     /// 合成完了ゲートも同様に畳む (前の曲の device を待ち続けない)。
     pub(crate) fn reset_voicevox_sync_state(&mut self) {
-        self.voicevox.voicevox_metadata_sent.clear();
-        self.voicevox.priority_sent.clear();
-        self.ipc.pending_vocal_synth_export.clear();
+        self.cur.pvv.voicevox_metadata_sent.clear();
+        self.cur.pvv.priority_sent.clear();
+        self.cur.pipc.pending_vocal_synth_export.clear();
     }
 
     /// アプリ設定の「合成の塊の長さ」(秒) を有効範囲へクランプして返す。
@@ -452,7 +452,7 @@ impl AppData {
     /// engine 未接続警告を出すべきか (= busy のまま failing が閾値以上継続)。
     /// engine boot (数秒) の間は failing でも警告せず「合成中」に見せ、閾値超過で切り替える。
     pub fn voicevox_engine_unreachable(&self, now: std::time::Instant) -> bool {
-        self.voicevox.voicevox_synth_status.values().any(|s| {
+        self.cur.pvv.voicevox_synth_status.values().any(|s| {
             s.progress.busy
                 && s.failing_since
                     .is_some_and(|t| now.duration_since(t) >= VOICEVOX_ENGINE_WARNING)
@@ -476,14 +476,14 @@ impl AppData {
     /// 起動 logic を移植 (= localhost:50021 が起動済でなければ自動で
     /// spawn、 builtin plugin の HTTP synth を成功させる前提)。
     pub fn sync_vocal_metadata(&mut self) {
-        let bpm = self.song_doc.song().bpm;
+        let bpm = self.cur.song_doc.song().bpm;
         // r.md #75: 塊 (= `/sing_frame_audio_query` 1 回) の長さ。アプリ設定が SSoT。
         let chunk_secs = self.voicevox_chunk_secs();
-        let has_vocal_track = self.song_doc.song().tracks.iter().any(|t| t.is_voicevox_vocal());
+        let has_vocal_track = self.cur.song_doc.song().tracks.iter().any(|t| t.is_voicevox_vocal());
         if has_vocal_track {
             self.ensure_voicevox_engine();
         }
-        for track in &self.song_doc.song().tracks {
+        for track in &self.cur.song_doc.song().tracks {
             if !track.is_voicevox_vocal() {
                 continue;
             }
@@ -493,7 +493,7 @@ impl AppData {
                 continue;
             };
 
-            let song = self.song_doc.song();
+            let song = self.cur.song_doc.song();
             // 全 clip (アレンジ + ランチャーのセル) の notes / TextEvent を metadata
             // 配列へ flatten する (組み立ての規則は下の 3 つの純粋関数が持つ)。
             // **セルを落とすと撃っても無音**、**原点を 0 のまま足すと撃たなくても
@@ -518,7 +518,7 @@ impl AppData {
             // 入れない** — 入れるとトランスポートのたびに再合成になる (順序ヒントは
             // 専用の `SetVocalSynthPriority`)。
             if self
-                .voicevox
+                .cur.pvv
                 .voicevox_metadata_sent
                 .get(&host_plugin_id)
                 .is_some_and(|(b, c, e, t)| {
@@ -527,7 +527,7 @@ impl AppData {
             {
                 continue;
             }
-            self.voicevox.voicevox_metadata_sent.insert(
+            self.cur.pvv.voicevox_metadata_sent.insert(
                 host_plugin_id,
                 (bpm, chunk_secs, entries.clone(), talk.clone()),
             );
@@ -538,14 +538,14 @@ impl AppData {
             // 一番待たされるのに、そこだけ効かないことになる。同じ channel の FIFO
             // なので、先に送れば host は必ず先に atomic へ書く。
             if let Some(beat) = self.vocal_synth_priority_beat(track, bpm) {
-                self.voicevox.priority_sent.insert(host_plugin_id, beat);
+                self.cur.pvv.priority_sent.insert(host_plugin_id, beat);
                 self.send_plugin(PluginCommand::SetVocalSynthPriority {
-                    device_id: host_plugin_id,
+                    device: self.dev(host_plugin_id),
                     playhead_beats: beat,
                 });
             }
             self.send_plugin(PluginCommand::SetBuiltinPluginNoteMetadata {
-                device_id: host_plugin_id,
+                device: self.dev(host_plugin_id),
                 bpm,
                 chunk_secs,
                 entries,
@@ -562,21 +562,21 @@ impl AppData {
     /// **再合成はトリガしない** (`SetVocalSynthPriority` は順序ヒント専用)。停止 / seek でも
     /// 位置が動くので、同じ経路で届く。
     pub(crate) fn send_vocal_synth_priority_if_moved(&mut self) {
-        if self.voicevox.voicevox_synth_status.is_empty() {
+        if self.cur.pvv.voicevox_synth_status.is_empty() {
             return;
         }
-        let bpm = self.song_doc.song().bpm;
+        let bpm = self.cur.song_doc.song().bpm;
         // 位置は **device (= track) ごと**に違う (行ごとに時間軸の供給元が違うため)。
         // 借用を跨がないよう先に解いてから送る。
         let targets: Vec<(u64, f64)> = self
-            .song_doc
+            .cur.song_doc
             .song()
             .tracks
             .iter()
             .filter_map(|track| {
                 let device_id = self.voicevox_plugin_id_for_track(track)?;
                 if !self
-                    .voicevox
+                    .cur.pvv
                     .voicevox_synth_status
                     .get(&device_id)
                     .is_some_and(|s| s.progress.busy)
@@ -588,16 +588,16 @@ impl AppData {
             .collect();
         for (device_id, beat) in targets {
             let moved = self
-                .voicevox
+                .cur.pvv
                 .priority_sent
                 .get(&device_id)
                 .is_none_or(|prev| (beat - prev).abs() >= 1.0);
             if !moved {
                 continue;
             }
-            self.voicevox.priority_sent.insert(device_id, beat);
+            self.cur.pvv.priority_sent.insert(device_id, beat);
             self.send_plugin(PluginCommand::SetVocalSynthPriority {
-                device_id,
+                device: self.dev(device_id),
                 playhead_beats: beat,
             });
         }
@@ -624,11 +624,11 @@ impl AppData {
     /// 3. どちらでもない → song の playhead (= 従来どおり。アレンジを普通に作って
     ///    いる間はセルが遠いので自然に後回しになる)
     fn vocal_synth_priority_beat(&self, track: &common::model::Track, bpm: f32) -> Option<f64> {
-        let playhead = self.transport.playhead_beat.map(f64::from);
+        let playhead = self.cur.transport.playhead_beat.map(f64::from);
         let Some((clip_id, phase)) = self.focused_synth_cell(track) else {
             return playhead;
         };
-        let base = synth_clips_with_base(self.song_doc.song(), track, bpm)
+        let base = synth_clips_with_base(self.cur.song_doc.song(), track, bpm)
             .into_iter()
             .find_map(|(c, base)| (c.id == clip_id).then_some(base));
         match base {
@@ -757,9 +757,9 @@ impl AppData {
     /// 保存済み口パク clip を生成した入力をベースライン化することで、開いた直後の
     /// 非入力編集 (track rename 等) で口パクが再生成されないようにする。
     pub(crate) fn seed_lipsync_fingerprints(&mut self) {
-        self.voicevox.lipsync_fingerprints.clear();
+        self.cur.pvv.lipsync_fingerprints.clear();
         let mut targets: Vec<u32> = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .filter_map(|t| t.lipsync_target_track)
@@ -767,8 +767,8 @@ impl AppData {
         targets.sort_unstable();
         targets.dedup();
         for target in targets {
-            let fp = Self::lipsync_input_fingerprint(self.song_doc.song(), target);
-            self.voicevox.lipsync_fingerprints.insert(target, fp);
+            let fp = Self::lipsync_input_fingerprint(self.cur.song_doc.song(), target);
+            self.cur.pvv.lipsync_fingerprints.insert(target, fp);
         }
     }
 
@@ -783,7 +783,7 @@ impl AppData {
     /// legacy プロジェクトだけが dirty = 要再保存になる)。
     pub(crate) fn normalize_lipsync_clips_on_load(&mut self) {
         let mut mouth_ids: Vec<u32> = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .filter_map(|t| t.lipsync_target_track)
@@ -865,7 +865,7 @@ impl AppData {
     /// 再試行される。
     pub(crate) fn regenerate_outdated_lipsync_on_load(&mut self) {
         let vocal_ids =
-            common::lipsync::vocal_tracks_with_outdated_lipsync(self.song_doc.song());
+            common::lipsync::vocal_tracks_with_outdated_lipsync(self.cur.song_doc.song());
         for vid in vocal_ids {
             tracing::info!(
                 vocal_track_id = vid,
@@ -883,7 +883,7 @@ impl AppData {
     /// `mouth_map` 未設定 / notes を持つ clip 無し のときは no-op。歌唱のみ (Q6)。
     pub fn regenerate_lipsync_for_track(&mut self, vocal_track_id: u32) {
         let Some(target_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == vocal_track_id)
@@ -896,17 +896,17 @@ impl AppData {
         // 再生成する (= rename 等の非入力編集では再生成しない)。直接呼び出し
         // (binding / mouth_map 変更) はここで必ず最新値へ更新されるので、直後の
         // debounce 発火は fingerprint 一致で二重再生成にならない。
-        let fp = Self::lipsync_input_fingerprint(self.song_doc.song(), target_id);
-        self.voicevox.lipsync_fingerprints.insert(target_id, fp);
+        let fp = Self::lipsync_input_fingerprint(self.cur.song_doc.song(), target_id);
+        self.cur.pvv.lipsync_fingerprints.insert(target_id, fp);
         // 口 track が存在し mouth_map が設定済みか (= 生成する意味があるか)。
-        let configured = self.song_doc.song().tracks.iter().any(|t| {
+        let configured = self.cur.song_doc.song().tracks.iter().any(|t| {
             t.id == target_id && t.mouth_map.as_ref().is_some_and(|m| m.is_configured())
         });
         if !configured {
             return;
         }
-        let bpm = self.song_doc.song().bpm;
-        let (snaps, talk_snaps) = collect_lipsync_snaps(self.song_doc.song(), target_id, bpm);
+        let bpm = self.cur.song_doc.song().bpm;
+        let (snaps, talk_snaps) = collect_lipsync_snaps(self.cur.song_doc.song(), target_id, bpm);
         if snaps.is_empty() && talk_snaps.is_empty() {
             // r.md #18: 開き口ソースが 1 つも無くても、 立ち絵が映っている間は口を
             // 消さない。 HTTP は不要 (phoneme が無い) ので、 立ち絵範囲を閉じ口だけで
@@ -921,13 +921,16 @@ impl AppData {
         self.ensure_voicevox_engine();
         // 出力先 (口 track) を in-flight に登録 = クリップ上スピナー +
         // 全体オーバーレイ「口パク生成中」を点灯。完了イベントで必ず外す。
-        self.voicevox.lipsync_inflight.insert(target_id);
+        self.cur.pvv.lipsync_inflight.insert(target_id);
         // spawn 時点の世代を snapshot し、 結果と一緒に返す。 HTTP が遅延して
         // いる間に project が切り替わる (reset_saved_baseline が gen を bump) と
         // handler 側で破棄される。
-        let generation = self.voicevox.lipsync_gen;
+        let generation = self.cur.pvv.lipsync_gen;
         let target_track_id = target_id;
         let proxy = self.ipc.event_proxy.clone();
+        // 結果は **発注したタブ** へ返す (track id は Song スコープの名前なので、
+        // 住所が無いと別タブの同 id の口 track を作り直してしまう)。
+        let project = self.pk();
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
             for (clip_start_beat, clip_len_beats, first_phoneme_local_beat, priority, notes) in snaps {
@@ -966,6 +969,7 @@ impl AppData {
             // `lipsync_inflight` から target を外してスピナーを止める。clips が空なら
             // (= 全 HTTP 失敗) handler 側で「既存 clip を温存」して反映だけスキップする。
             proxy.send(AppEvent::LipsyncGenerated {
+                project,
                 vocal_track_id,
                 target_track_id,
                 bpm,
@@ -1162,7 +1166,7 @@ impl AppData {
         }
         // この口 track を出力先にしている vocal track を再生成する。
         let vocal_ids: Vec<u32> = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .filter(|v| v.lipsync_target_track == Some(track_id))
@@ -1183,24 +1187,26 @@ impl AppData {
     /// `reset_saved_baseline` (= load / new / recovery) から呼び、 開いた直後の
     /// spurious dirty を防ぐ。
     pub(crate) fn cancel_pending_lipsync_regen(&mut self) {
-        self.voicevox.lipsync_gen = self.voicevox.lipsync_gen.wrapping_add(1);
+        self.cur.pvv.lipsync_gen = self.cur.pvv.lipsync_gen.wrapping_add(1);
     }
 
     pub(crate) fn mark_lipsync_dirty(&mut self) {
         if !self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .any(|t| t.lipsync_target_track.is_some())
         {
             return;
         }
-        self.voicevox.lipsync_gen = self.voicevox.lipsync_gen.wrapping_add(1);
-        let generation = self.voicevox.lipsync_gen;
+        self.cur.pvv.lipsync_gen = self.cur.pvv.lipsync_gen.wrapping_add(1);
+        let generation = self.cur.pvv.lipsync_gen;
         let proxy = self.ipc.event_proxy.clone();
+        // debounce の発火は **仕掛けたタブ** へ返す (track id は Song スコープの名前)。
+        let project = self.pk();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
-            proxy.send(AppEvent::LipsyncDebounceFired(generation));
+            proxy.send(AppEvent::LipsyncDebounceFired { project, generation });
         });
     }
 

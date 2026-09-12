@@ -53,7 +53,7 @@ fn set_theme_swaps_the_palette_and_persists_only_the_id() {
     assert_eq!(app.theme.id, "light");
     assert!(!app.theme.core.is_dark(), "ライトに切り替わっている");
     assert_ne!(app.theme.core.panel, dark_panel, "パネル色が実際に変わる");
-    assert!(!app.song_doc.is_dirty(), "テーマ切替は Song を dirty にしない");
+    assert!(!app.cur.song_doc.is_dirty(), "テーマ切替は Song を dirty にしない");
 
     // 永続化されるのは id だけ (色は焼き込まない = テーマファイルを編集したら次回反映される)。
     let cfg_text = std::fs::read_to_string(dirs.app_config()).expect("app_config が書かれる");
@@ -122,7 +122,7 @@ fn toggling_the_settings_window_persists_without_dirtying_the_song() {
     assert!(!app.ui_prefs.settings_open, "既定は閉じている");
     app.handle_event(AppEvent::ToggleSettings);
     assert!(app.ui_prefs.settings_open);
-    assert!(!app.song_doc.is_dirty(), "window の開閉は Song を dirty にしない");
+    assert!(!app.cur.song_doc.is_dirty(), "window の開閉は Song を dirty にしない");
 
     let (restarted, _rx2) = build_app(Some(dirs));
     assert!(restarted.ui_prefs.settings_open, "開閉状態が再起動を跨いで復元される");

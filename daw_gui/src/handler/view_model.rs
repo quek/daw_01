@@ -11,28 +11,28 @@ impl AppData {
     /// 「カーソル相当」 = `selected_track_ids` の末尾要素。 `None` の
     /// ときは選択ゼロ (まだ何もクリックしていない / 全 track 削除直後)。
     pub fn cursor_track_id(&self) -> Option<u32> {
-        self.selection.selected_track_ids.last().copied()
+        self.cur.selection.selected_track_ids.last().copied()
     }
 
     /// カーソル track の `song.tracks` 内 index。 selection は id ベース
     /// なので、 track 並び替え後でも index は再評価される。
     pub fn cursor_track_index(&self) -> Option<usize> {
         let id = self.cursor_track_id()?;
-        self.song_doc.song().tracks.iter().position(|t| t.id == id)
+        self.cur.song_doc.song().tracks.iter().position(|t| t.id == id)
     }
 
     /// A track acts as a "group" iff at least one other track points
     /// at it via `parent_group_id`. The role is purely derived — there
     /// is no `Track::kind` field. SSOT (CLAUDE.md).
     pub fn is_group_track(&self, track_id: u32) -> bool {
-        crate::group_compose::is_group_track(self.song_doc.song(), track_id)
+        crate::group_compose::is_group_track(self.cur.song_doc.song(), track_id)
     }
 
     /// A track acts as a "return" iff at least one other track has a
     /// `Send` whose `dest_track_id` points at it. Purely derived (no
     /// `Track::kind`), mirroring `is_group_track`. SSOT (CLAUDE.md).
     pub fn is_return_track(&self, track_id: u32) -> bool {
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .tracks
             .iter()
             .flat_map(|t| t.sends.iter())
@@ -62,7 +62,7 @@ impl AppData {
                 if !seen.insert(cur) {
                     continue;
                 }
-                if let Some(t) = self.song_doc.song().track_by_id(cur) {
+                if let Some(t) = self.cur.song_doc.song().track_by_id(cur) {
                     for s in &t.sends {
                         stack.push(s.dest_track_id);
                     }
@@ -70,7 +70,7 @@ impl AppData {
             }
             false
         };
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .tracks
             .iter()
             .enumerate()
@@ -100,7 +100,7 @@ impl AppData {
             if hops > 32 {
                 break;
             }
-            cursor = self.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
+            cursor = self.cur.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
         }
         depth
     }
@@ -146,19 +146,19 @@ impl AppData {
         target: &common::model::AutomationTarget,
         fallback: f32,
     ) -> f32 {
-        if !self.transport.is_playing {
+        if !self.cur.transport.is_playing {
             return fallback;
         }
         // `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を
         // 書き込み中なら lane を読まず手動値を返す (audio thread に送る
         // `recording_lanes` と同集合 = UI と audio が drift しない)。
         let key = (track.id, target.clone());
-        let recording = self.recording.recording_mode != common::model::RecordingMode::Read
-            && (self.recording.active_param_gestures.contains(&key)
+        let recording = self.cur.recording.recording_mode != common::model::RecordingMode::Read
+            && (self.cur.recording.active_param_gestures.contains(&key)
                 || (matches!(
-                    self.recording.recording_mode,
+                    self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch | common::model::RecordingMode::Write
-                ) && self.recording.latched_param_gestures.contains(&key)));
+                ) && self.cur.recording.latched_param_gestures.contains(&key)));
         if recording {
             return fallback;
         }
@@ -169,7 +169,7 @@ impl AppData {
         else {
             return fallback;
         };
-        rows.lane_value(track.id, lane, self.song_doc.song()) as f32
+        rows.lane_value(track.id, lane, self.cur.song_doc.song()) as f32
     }
 
     /// いまの playhead と engine の走行状態から組んだ行解決器。
@@ -180,7 +180,7 @@ impl AppData {
     ) -> crate::launcher_time::RowTimeline<'a> {
         crate::launcher_time::RowTimeline::with_running(
             0.0,
-            f64::from(self.transport.playhead_beat.unwrap_or(0.0)),
+            f64::from(self.cur.transport.playhead_beat.unwrap_or(0.0)),
             running,
         )
     }
@@ -191,7 +191,7 @@ impl AppData {
         // `compute_track_depth(t)` (= O(depth) parent chain walk) を呼び、
         // 合計 O(N²) per frame だった。 大型 song で 60fps drop。
         // 単一 pass で is_group_set / depths を batch 計算して O(N) に。
-        let n_tracks = self.song_doc.song().tracks.len();
+        let n_tracks = self.cur.song_doc.song().tracks.len();
         let mut is_group_set: std::collections::HashSet<u32> =
             std::collections::HashSet::with_capacity(n_tracks);
         // リターン判定も同 pass で batch 集計 (= is_group と同 idiom)。
@@ -200,7 +200,7 @@ impl AppData {
             std::collections::HashSet::with_capacity(n_tracks);
         let mut id_to_parent: std::collections::HashMap<u32, Option<u32>> =
             std::collections::HashMap::with_capacity(n_tracks);
-        for t in &self.song_doc.song().tracks {
+        for t in &self.cur.song_doc.song().tracks {
             id_to_parent.insert(t.id, t.parent_group_id);
             if let Some(pid) = t.parent_group_id {
                 is_group_set.insert(pid);
@@ -234,13 +234,13 @@ impl AppData {
             let target = common::model::AutomationTarget::TrackBuiltin(p);
             self.live_param_value_on(&rows, t, &target, fallback)
         };
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .tracks
             .iter()
             .enumerate()
             .map(|(i, t)| {
                 let (l, r, gr) =
-                    self.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                    self.cur.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
                 TrackMixEntry {
                     index: i as u32,
                     track_id: t.id,
@@ -269,7 +269,7 @@ impl AppData {
     }
 
     pub fn selected_track_label(&self) -> String {
-        let n_selected = self.selection.selected_track_ids.len();
+        let n_selected = self.cur.selection.selected_track_ids.len();
         if n_selected > 1 {
             return format!("{n_selected} tracks selected");
         }
@@ -278,7 +278,7 @@ impl AppData {
         }
         match self.cursor_track_index() {
             Some(idx) => self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .tracks
                 .get(idx)
                 .map(|t| {
@@ -306,7 +306,7 @@ impl AppData {
         }
         let Some(track) = self
             .cursor_track_index()
-            .and_then(|i| self.song_doc.song().tracks.get(i))
+            .and_then(|i| self.cur.song_doc.song().tracks.get(i))
         else {
             return Vec::new();
         };
@@ -350,7 +350,7 @@ impl AppData {
         // 詰まっても正しいソースの値が出る (旧実装は `enumerate()` の位置で
         // 引いていて、engine 側の slot 数と食い違うと別のソースの値を表示した)。
         let owner = self.cursor_track_id();
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .mod_sources
             .iter()
             .filter(|m| Some(m.owner_track_id) == owner)
@@ -358,7 +358,7 @@ impl AppData {
                 id: m.id,
                 color: m.color,
                 enabled: m.enabled,
-                scalar: self.transport.mod_plane.scalar(m.id),
+                scalar: self.cur.transport.mod_plane.scalar(m.id),
                 kind: m.kind.clone(),
             })
             .collect()
@@ -371,7 +371,7 @@ impl AppData {
     /// r.md #110: 他 track に加えて **同 track の Parallel 内 chain** も選べる (Bitwig と同じ)。
     /// 自 track 自身も可 (follower は control-rate なので feedback にならない)。
     pub fn mod_source_track_choices(&self) -> Vec<(common::model::TapSource, String)> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut out: Vec<(common::model::TapSource, String)> = song
             .tracks
             .iter()
@@ -400,7 +400,7 @@ impl AppData {
     ///
     /// 対象が `owner_track_id` 以外にある行は `"<トラック名> ▸ "` を前置きする。
     pub fn mod_source_routings(&self, source_id: u32) -> Vec<ModRoutingRow> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let source = song.mod_sources.iter().find(|m| m.id == source_id);
         let owner = source.map_or(0, |m| m.owner_track_id);
         let source_enabled = source.is_some_and(|m| m.enabled);
@@ -445,7 +445,7 @@ impl AppData {
         if track_id == common::model::MASTER_TRACK_ID {
             return "Master".to_string();
         }
-        self.song_doc
+        self.cur.song_doc
             .song()
             .tracks
             .iter()
@@ -458,7 +458,7 @@ impl AppData {
     /// 固定パレットを引く (id でなく位置 = 追加順に色が回る)。
     pub fn mod_source_color(&self, source_id: u32) -> [f32; 3] {
         // 色は `ModSource.color` が SSoT (作成時に palette から割当)。
-        self.song_doc.song()
+        self.cur.song_doc.song()
             .mod_sources
             .iter()
             .find(|m| m.id == source_id)
@@ -492,7 +492,7 @@ impl AppData {
         else {
             return None;
         };
-        let params = self.ipc.plugin_params.get(device_id)?;
+        let params = self.cur.pipc.plugin_params.get(device_id)?;
         let info = params.iter().find(|p| p.id == *param_id)?;
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
     }
@@ -523,14 +523,14 @@ impl AppData {
         else {
             return None;
         };
-        let inst = self.song_doc.song().plugin_by_id(*device_id)?;
+        let inst = self.cur.song_doc.song().plugin_by_id(*device_id)?;
         let device = self.device_label(inst);
         if let Some(def) = common::video_fx::def_by_id(&inst.plugin_id) {
             let param = def.param(*param_id)?;
             return Some(format!("{device}: {}", param.name));
         }
         let info = self
-            .ipc.plugin_params
+            .cur.pipc.plugin_params
             .get(device_id)?
             .iter()
             .find(|p| p.id == *param_id)?;
@@ -562,7 +562,7 @@ impl AppData {
     /// 種別 + 作成順の通し番号で `"LFO 2 ▸ 速さ"` / `"LFO 2 → Volume の深さ"` を作る。
     fn mod_target_label(&self, target: &common::model::AutomationTarget) -> Option<String> {
         use common::model::AutomationTarget as T;
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match target {
             T::ModSourceParam { source_id, param } => {
                 Some(format!("{} \u{25b8} {}", self.mod_source_name(*source_id)?, param.label()))
@@ -583,7 +583,7 @@ impl AppData {
 
     /// 種別ラベル + 同種内の作成順 (1 始まり)。ラック / レーン / ステータスで共有する。
     pub fn mod_source_name(&self, source_id: u32) -> Option<String> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let src = song.mod_sources.iter().find(|m| m.id == source_id)?;
         let kind_label = src.kind.short_label();
         let ordinal = song
@@ -604,9 +604,9 @@ impl AppData {
     ) -> InspectorModData {
         let routings: &[common::model::ModRouting] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song_doc.song().song_mod_routings
+                &self.cur.song_doc.song().song_mod_routings
             } else {
-                match self.song_doc.song().tracks.iter().find(|t| t.id == track_id) {
+                match self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id) {
                     Some(t) => &t.mod_routings,
                     None => return InspectorModData::default(),
                 }
@@ -637,14 +637,14 @@ impl AppData {
             let color = self.mod_source_color(r.source_id);
             let depth_display = reach_depth(r.depth);
             entries.push((color, depth_display));
-            if Some(r.source_id) == self.ui_ephemeral.armed_mod_source {
+            if Some(r.source_id) == self.cur.peph.armed_mod_source {
                 armed = Some((color, depth_display, r.source_id));
             }
         }
         // Armed source with no routing yet on this target → editable from depth 0
         // (first drag creates the routing).
         if armed.is_none()
-            && let Some(sid) = self.ui_ephemeral.armed_mod_source
+            && let Some(sid) = self.cur.peph.armed_mod_source
         {
             armed = Some((self.mod_source_color(sid), 0.0, sid));
         }
@@ -655,7 +655,7 @@ impl AppData {
                 target,
                 model_base,
                 routings,
-                self.transport.mod_plane.as_ref(),
+                self.cur.transport.mod_plane.as_ref(),
             );
             domain.to_display(target, live_model)
         });
@@ -704,10 +704,10 @@ impl AppData {
     /// view は first event を「代表値」 として見せれば編集後に整合が取れる。
     pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song_doc.song().track_by_id(cref.track_id)?;
+        let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
         let clip = track.clip_by_id(cref.clip_id)?;
         let common::model::ClipContent::Audio(audio) =
-            self.song_doc.song().clip_contents.get(&clip.content_id)?
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -716,7 +716,7 @@ impl AppData {
         // multi-event clip でも個別 event を編集可能。 audio_editor が
         // 閉じている / 別 clip を開いている / 選択中 event idx が範囲外
         // なら first event (= Phase 2 PR1-3 と同じ既存挙動)。
-        let event_idx = if self.ui_ephemeral.audio_editor_clip == Some(cref) {
+        let event_idx = if self.cur.peph.audio_editor_clip == Some(cref) {
             self.audio_editor_anchor_event().unwrap_or(0)
         } else {
             0
@@ -746,11 +746,11 @@ impl AppData {
     /// shortcut handler 経由で呼ばれて `SelectAudioEditorEvent` の
     /// 引数を組み立てる用。
     pub fn next_audio_editor_event_idx(&self, delta: i32) -> Option<usize> {
-        let target = self.ui_ephemeral.audio_editor_clip?;
-        let track = self.song_doc.song().track_by_id(target.track_id)?;
+        let target = self.cur.peph.audio_editor_clip?;
+        let track = self.cur.song_doc.song().track_by_id(target.track_id)?;
         let clip = track.clip_by_id(target.clip_id)?;
         let common::model::ClipContent::Audio(audio) =
-            self.song_doc.song().clip_contents.get(&clip.content_id)?
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -781,10 +781,10 @@ impl AppData {
     /// のみ snapshot に乗せる)。
     pub fn inspector_image_event_summary(&self) -> Option<InspectorImageEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song_doc.song().track_by_id(cref.track_id)?;
+        let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
         let clip = track.clip_by_id(cref.clip_id)?;
         let common::model::ClipContent::Image(image) =
-            self.song_doc.song().clip_contents.get(&clip.content_id)?
+            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -828,7 +828,7 @@ impl AppData {
     /// 引数 `n_events` は当該 ClipContent::Audio の events 長 (= 呼び出し
     /// 前に immutable get で取得)。
     pub(crate) fn audio_event_target_indices(&self, target: ClipKey, n_events: usize) -> Vec<usize> {
-        if self.ui_ephemeral.audio_editor_clip == Some(target)
+        if self.cur.peph.audio_editor_clip == Some(target)
             && !self.selected_audio_event_indices().is_empty()
         {
             let mut v: Vec<usize> = self
@@ -858,14 +858,14 @@ impl AppData {
         F: FnMut(&mut common::model::AudioEvent),
     {
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
         else {
             return false;
         };
-        let n_events = match self.song_doc.song().clip_contents.get(&content_id) {
+        let n_events = match self.cur.song_doc.song().clip_contents.get(&content_id) {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return false,
         };
@@ -897,11 +897,11 @@ impl AppData {
     where
         F: FnOnce(&mut Vec<common::model::BeatMarker>),
     {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(target) = self.cur.peph.audio_editor_clip else {
             return false;
         };
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -931,7 +931,7 @@ impl AppData {
         F: FnMut(&mut common::model::ImageEvent),
     {
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -965,7 +965,7 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
         };
-        let Some(devices) = self.song_doc.song().fx_chain_by_track_id(track_id) else {
+        let Some(devices) = self.cur.song_doc.song().fx_chain_by_track_id(track_id) else {
             return Vec::new();
         };
         common::model::plugins(devices)
@@ -982,19 +982,19 @@ impl AppData {
         target: ColorPickerTarget,
         anchor: daw_ui_renderer::Rect,
     ) {
-        self.ui_ephemeral.color_picker_target = Some(target);
-        self.ui_ephemeral.color_picker_anchor = Some(anchor);
+        self.cur.peph.color_picker_target = Some(target);
+        self.cur.peph.color_picker_anchor = Some(anchor);
         // picker session 全体を 1 undo step に bracket する (`close_color_picker` で end)。
-        self.song_doc.begin_gesture();
+        self.cur.song_doc.begin_gesture();
     }
 
     /// color_picker を閉じる唯一の口 (dismiss / 対象消失の両方)。`open_color_picker` の
     /// gesture をここで閉じる — 閉じ忘れると以後の離散編集が同じ gesture id に squash され
     /// 1 undo step に潰れる (旧実装は view が target を None にするだけで End が無かった)。
     pub fn close_color_picker(&mut self) {
-        self.ui_ephemeral.color_picker_target = None;
-        self.ui_ephemeral.color_picker_anchor = None;
-        self.song_doc.end_gesture();
+        self.cur.peph.color_picker_target = None;
+        self.cur.peph.color_picker_anchor = None;
+        self.cur.song_doc.end_gesture();
     }
 
     // -------- Undo/Redo ----------------------------------------------------
@@ -1009,7 +1009,7 @@ impl AppData {
     /// 引きは O(log n)」 という設計 (tempo_map.rs 冒頭 doc) なので、 世代キャッシュが
     /// 本来の使い方。 lane が無い曲は table を張らず定数 BPM の高速経路に落ちる。
     pub(crate) fn song_beat_to_seconds(&self, beat: f64) -> f64 {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match self.tempo_map_cached().as_ref() {
             Some(m) => m.beat_to_seconds(beat),
             // lane 無し = `song_beat_to_seconds` の定数 BPM 高速経路 (table を張らない)。
@@ -1020,10 +1020,10 @@ impl AppData {
     /// `song_epoch` 世代キャッシュの [`common::tempo_map::TempoMap`]。テンポカーブが
     /// 無い曲は `None` (= 呼び側は `song.bpm` の定数換算を使う)。
     fn tempo_map_cached(&self) -> std::cell::Ref<'_, Option<common::tempo_map::TempoMap>> {
-        let song = self.song_doc.song();
-        let epoch = self.song_doc.edit_epoch();
+        let song = self.cur.song_doc.song();
+        let epoch = self.cur.song_doc.edit_epoch();
         {
-            let mut cache = self.ui_ephemeral.tempo_map_cache.borrow_mut();
+            let mut cache = self.cur.peph.tempo_map_cache.borrow_mut();
             if !cache.built || cache.epoch != epoch {
                 cache.map = common::tempo_map::has_tempo_automation(song)
                     .then(|| common::tempo_map::TempoMap::from_song(song));
@@ -1031,7 +1031,7 @@ impl AppData {
                 cache.built = true;
             }
         }
-        std::cell::Ref::map(self.ui_ephemeral.tempo_map_cache.borrow(), |c| &c.map)
+        std::cell::Ref::map(self.cur.peph.tempo_map_cache.borrow(), |c| &c.map)
     }
 
 
@@ -1042,13 +1042,13 @@ impl AppData {
     /// (linked clip は同一ラベルを共有)。
     pub(crate) fn arrangement_labels(&self) -> std::cell::Ref<'_, ArrLabelCache> {
         {
-            let mut cache = self.ui_ephemeral.arr_label_cache.borrow_mut();
-            if cache.epoch != self.song_doc.edit_epoch() {
+            let mut cache = self.cur.peph.arr_label_cache.borrow_mut();
+            if cache.epoch != self.cur.song_doc.edit_epoch() {
                 cache.track_names.clear();
                 cache.content_labels.clear();
                 cache.section_names.clear();
                 cache.content_names.clear();
-                for t in &self.song_doc.song().tracks {
+                for t in &self.cur.song_doc.song().tracks {
                     cache
                         .track_names
                         .insert(t.id, std::sync::Arc::from(t.name.as_str()));
@@ -1056,26 +1056,26 @@ impl AppData {
                         cache.content_labels.entry(c.content_id).or_insert_with(|| {
                             crate::widgets::arrangement::view_build::clip_display_label(
                                 c,
-                                self.song_doc.song(),
+                                self.cur.song_doc.song(),
                             )
                         });
                     }
                 }
                 // D4 同件: section ruler / automation clip ラベルも世代キャッシュ。
-                for s in &self.song_doc.song().sections {
+                for s in &self.cur.song_doc.song().sections {
                     cache
                         .section_names
                         .insert(s.id, std::sync::Arc::from(s.name.as_str()));
                 }
-                for (cid, name) in &self.song_doc.song().clip_content_names {
+                for (cid, name) in &self.cur.song_doc.song().clip_content_names {
                     cache
                         .content_names
                         .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
-                cache.epoch = self.song_doc.edit_epoch();
+                cache.epoch = self.cur.song_doc.edit_epoch();
             }
         }
-        self.ui_ephemeral.arr_label_cache.borrow()
+        self.cur.peph.arr_label_cache.borrow()
     }
 
 }

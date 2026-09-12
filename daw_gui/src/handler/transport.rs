@@ -48,7 +48,7 @@ impl AppData {
         // (解析中はオーディオ出力が無音化され、プラグインは走査スレッドが占有する
         // ので、そもそも音は出せない)。
         if self.offline_render_busy() {
-            self.ui_ephemeral.status_message = if self.loudness.phase.is_busy() {
+            self.ui_ephemeral.status_message = if self.cur.loudness.phase.is_busy() {
                 "ラウドネス解析中は再生できません".into()
             } else if !self.export_or_analysis_busy() {
                 // bounce / Glue の焼き込みも同じ freewheel を占有する。
@@ -64,8 +64,8 @@ impl AppData {
         // 画像 / 動画サムネイルの decode 中 (= GPU 再初期化後の再読込を含む) は
         // 待たせない。
         if self.audio_decode_pending() {
-            self.transport.pending_play = Some(from);
-            self.transport.pending_play_record = record;
+            self.cur.transport.pending_play = Some(from);
+            self.cur.transport.pending_play_record = record;
             self.ui_ephemeral.status_message = "プロジェクト読込中...".into();
             return PlayOutcome::Queued;
         }
@@ -75,12 +75,12 @@ impl AppData {
         // track starts on the same buffer once registration completes.
         // Without this the just-loaded tracks render silent for the
         // first few buffers / first loop.
-        if !self.ipc.pending_plugin_loads.is_empty() {
-            self.transport.pending_play = Some(from);
-            self.transport.pending_play_record = record;
+        if !self.cur.pipc.pending_plugin_loads.is_empty() {
+            self.cur.transport.pending_play = Some(from);
+            self.cur.transport.pending_play_record = record;
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
-                self.ipc.pending_plugin_loads.len()
+                self.cur.pipc.pending_plugin_loads.len()
             );
             return PlayOutcome::Queued;
         }
@@ -92,20 +92,20 @@ impl AppData {
         // r.md #121: ホームは「明示 seek」 と「まだ無いときの最初の再生開始」 で決まる。
         // 走り出す位置は Space ならホーム、 それ以外はいまのプレイヘッド。 頭出しで位置が
         // 変わるときだけ `SeekTo` を先に送る (engine は buffer 頭で seek → play の順に消費)。
-        let playhead = self.transport.playhead_beat.unwrap_or(0.0);
-        let home = *self.transport.home_beat.get_or_insert(playhead);
+        let playhead = self.cur.transport.playhead_beat.unwrap_or(0.0);
+        let home = *self.cur.transport.home_beat.get_or_insert(playhead);
         let start = match from {
             PlayFrom::Home => home,
             PlayFrom::Playhead | PlayFrom::Continue => playhead,
         };
         if start != playhead {
-            self.transport.playhead_beat = Some(start);
+            self.cur.transport.playhead_beat = Some(start);
             let samples = common::automation::beats_to_samples(
-                self.song_doc.song(),
+                self.cur.song_doc.song(),
                 self.ipc.sample_rate,
                 f64::from(start),
             );
-            self.send_audio(AudioCommand::SeekTo { samples });
+            self.send_audio(AudioCommand::SeekTo { project: self.pk(), samples });
         }
         if let Some(preroll_samples) = record {
             // 録音の開始は Play より先に届ける必要がある (engine は届いた順に
@@ -113,13 +113,13 @@ impl AppData {
             // 入る)。 count-in 無し (`0`) でも必ず送る — engine はこれで
             // 「録音中」を知り、曲末 auto-stop の抑止と `recording_live` の
             // publish を始める。
-            self.send_audio(AudioCommand::StartRecording { preroll_samples });
+            self.send_audio(AudioCommand::StartRecording { project: self.pk(), preroll_samples });
         }
         // r.md #118: 停止位置からの再開はセッションのセルも頭出しせず続きから鳴らす
         // (engine は `PlayContinue` で launcher の再シードを飛ばす)。
         self.send_audio(match from {
-            PlayFrom::Continue => AudioCommand::PlayContinue,
-            PlayFrom::Home | PlayFrom::Playhead => AudioCommand::Play,
+            PlayFrom::Continue => AudioCommand::PlayContinue { project: self.pk() },
+            PlayFrom::Home | PlayFrom::Playhead => AudioCommand::Play { project: self.pk() },
         });
         // r.md #50: 走り出すたびに積算ラウドネス一式をリセットする
         // (Cubase の "Reset on Start" 相当)。曲を頭から通せば「この曲の
@@ -137,8 +137,8 @@ impl AppData {
     /// asset decode 完了の 3 経路から呼ぶ唯一の口)。 queue 時に「録音だったか /
     /// count-in が何拍か」を復元するので、録音開始が queue されても録音のまま再開する。
     pub(crate) fn fire_pending_play(&mut self) {
-        let Some(from) = self.transport.pending_play.take() else { return };
-        let record = self.transport.pending_play_record.take();
+        let Some(from) = self.cur.transport.pending_play.take() else { return };
+        let record = self.cur.transport.pending_play_record.take();
         self.start_transport(record, from);
     }
 
@@ -154,9 +154,9 @@ impl AppData {
         // 通る唯一の seek 経路。 goto_timeline_home はこの後で flag を再設定する。
         // (再生中の playhead poll は playhead_beat を直接書くのでここを通らず、
         // flag に触れない = 再生中もトグルが壊れない。)
-        self.ui_ephemeral.home_toggle_at_first = false;
-        self.transport.playhead_beat = Some(beat as f32);
-        self.transport.home_beat = Some(beat as f32);
+        self.cur.peph.home_toggle_at_first = false;
+        self.cur.transport.playhead_beat = Some(beat as f32);
+        self.cur.transport.home_beat = Some(beat as f32);
         // ensure-synced: 換算は song のテンポカーブを使う。 直前の BPM 編集が
         // 未 flush だと engine の再生グリッドが旧 tempo のままで seek 位置がずれる。
         // epoch 未変化なら no-op。
@@ -166,8 +166,8 @@ impl AppData {
         // テンポオートメーションのある曲で「クリックした小節と実際に鳴り始める
         // 位置」がずれ、ラウドネス解析の「最大値の位置へ飛ぶ」も外れる。
         let samples =
-            common::automation::beats_to_samples(self.song_doc.song(), self.ipc.sample_rate, beat);
-        self.send_audio(AudioCommand::SeekTo { samples });
+            common::automation::beats_to_samples(self.cur.song_doc.song(), self.ipc.sample_rate, beat);
+        self.send_audio(AudioCommand::SeekTo { project: self.pk(), samples });
     }
 
     /// `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き
@@ -176,7 +176,7 @@ impl AppData {
     /// 再実装しない)。 再生中は `play()`/`stop()` を呼ばずシームレスに継続する。
     pub(crate) fn action_play_from_cursor(&mut self, beat: f64) {
         self.seek_playhead_to(beat);
-        if !self.transport.is_playing {
+        if !self.cur.transport.is_playing {
             self.play();
         }
     }
@@ -185,7 +185,7 @@ impl AppData {
     /// プレイヘッド (= 停止した位置、 r.md #121) から再生する。 **ホームは動かさない**
     /// (次の Space は元のホームから)。 再生中は何もしない。
     pub(crate) fn play_continue(&mut self) {
-        if self.transport.is_playing {
+        if self.cur.transport.is_playing {
             return;
         }
         self.start_transport(None, PlayFrom::Continue);
@@ -199,14 +199,14 @@ impl AppData {
     /// どちらでも効き、 ホーム (`home_beat`) も追従する。
     pub(crate) fn goto_timeline_home(&mut self) {
         // 先頭 (時間的に最初) のクリップの頭。 clip が無ければ None。
-        let first = common::timing::content_bounds_beats(self.song_doc.song()).map(|(lo, _)| lo);
+        let first = common::timing::content_bounds_beats(self.cur.song_doc.song()).map(|(lo, _)| lo);
         // トグルは **live playhead 位置でなく直前の Home 結果**
         // (`home_toggle_at_first`) で判定する。 位置導出だと再生中に playhead が
         // 毎フレーム進んで 2 度押しが成立せず、 長尺では f32/f64 の丸め差が EPS を
         // 超えて先頭へ戻れない (レビュー指摘)。 flag は明示 seek / 停止でのみ
         // リセットされ、 再生中の playhead poll では触らないので、 再生中でも
         // 確実にトグルする。 clip が無ければ常に 1.1.1。
-        let go_to_start = self.ui_ephemeral.home_toggle_at_first || first.is_none();
+        let go_to_start = self.cur.peph.home_toggle_at_first || first.is_none();
         let target = if go_to_start {
             0.0
         } else {
@@ -214,7 +214,7 @@ impl AppData {
         };
         // `seek_playhead_to` が flag を false に戻すので、 設定はその後に行う。
         self.seek_playhead_to(target);
-        self.ui_ephemeral.home_toggle_at_first = !go_to_start;
+        self.cur.peph.home_toggle_at_first = !go_to_start;
         // アレンジを横スクロールして移動先を可視化 (Home は左端寄せ)。
         self.reveal_beat_in_arrange(target, true);
     }
@@ -223,7 +223,7 @@ impl AppData {
     /// 全クリップの `max(start + length)`) へ移動する。 clip が無ければ先頭
     /// (beat 0)。 `seek_playhead_to` 経由なので停止中/再生中どちらでも効く。
     pub(crate) fn goto_timeline_end(&mut self) {
-        let target = common::timing::content_bounds_beats(self.song_doc.song())
+        let target = common::timing::content_bounds_beats(self.cur.song_doc.song())
             .map(|(_, hi)| hi)
             .unwrap_or(0.0);
         self.seek_playhead_to(target);
@@ -241,15 +241,15 @@ impl AppData {
         // 端に貼り付けず少し余白を残す。
         const MARGIN_BEATS: f32 = 1.0;
         let beat = beat.max(0.0) as f32;
-        let lanes_w = self.ui_ephemeral.last_arrange_lanes_size.0;
-        let visible = lanes_w / self.ui_prefs.arrange_zoom_x.max(1.0); // lanes_w 0 → 0
+        let lanes_w = self.cur.peph.last_arrange_lanes_size.0;
+        let visible = lanes_w / self.cur.view.arrange_zoom_x.max(1.0); // lanes_w 0 → 0
         let scroll = if at_start || visible <= 0.0 {
             beat - MARGIN_BEATS
         } else {
             // End: 目標を右端の少し内側に置き、 手前の content を見せる。
             beat - visible + MARGIN_BEATS
         };
-        self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
+        self.cur.view.arrange_scroll_beat = scroll.max(0.0);
     }
 
     /// A7: register a `device_id` we are about to send `SetSlotPlugin`
@@ -267,26 +267,26 @@ impl AppData {
         // 足したプラグインが数バッファ遅れて鳴り出すことより重い
         // (REAPER も走行中のトラック arm 追加を明示的に許可している)。
         // 止めてしまうと録音セッションが閉じ、録り直しになる。
-        let recording = self.recording.requested;
-        if self.ipc.pending_plugin_loads.is_empty() && self.transport.is_playing && !recording {
-            self.send_audio(AudioCommand::Stop);
+        let recording = self.cur.recording.requested;
+        if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.is_playing && !recording {
+            self.send_audio(AudioCommand::Stop { project: self.pk() });
             // 読み込みが済んだら **止まった位置から** 続ける (ホームへは戻さない —
             // ユーザーが止めたのではなく、 こちらの都合で一瞬止めただけ)。
-            self.transport.pending_play = Some(PlayFrom::Playhead);
+            self.cur.transport.pending_play = Some(PlayFrom::Playhead);
         }
         self.ipc.next_plugin_load_generation =
             self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
         let generation = self.ipc.next_plugin_load_generation;
-        self.ipc.pending_plugin_loads.insert(device_id, generation);
+        self.cur.pipc.pending_plugin_loads.insert(device_id, generation);
         // 新しい load 要求が in-flight になった時点で、 直近の失敗理由は
         // 「現在の状態」 ではなくなる (インスペクタの「未ロード」表示もここで
         // 消える)。 SetSlotPlugin を送る全経路がこの関数を通るので、 ここが
         // 失敗 entry を落とす唯一の口。
-        self.ipc.failed_plugin_loads.remove(&device_id);
-        if self.transport.pending_play.is_some() {
+        self.cur.pipc.failed_plugin_loads.remove(&device_id);
+        if self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
-                self.ipc.pending_plugin_loads.len()
+                self.cur.pipc.pending_plugin_loads.len()
             );
         }
         generation
@@ -300,7 +300,7 @@ impl AppData {
     /// 観測が届くまでの数十 ms に鍵盤を叩いたぶんが録音に混ざってはいけない。
     /// クローズは冪等なので二重に呼ばれても害はない。
     pub(crate) fn stop(&mut self) {
-        self.send_audio(AudioCommand::Stop);
+        self.send_audio(AudioCommand::Stop { project: self.pk() });
         self.close_recording_session();
     }
 
@@ -319,8 +319,8 @@ impl AppData {
         // Latch / Write の latched set + per-param 直近 record 位置を全て
         // clear。 これで次の Play 時には latched / last_beat が空からスタート、
         // touching しない limit 何も record されない (Touch / Latch / Write 共通)。
-        self.recording.latched_param_gestures.clear();
-        self.recording.recording_last_beat.clear();
+        self.cur.recording.latched_param_gestures.clear();
+        self.cur.recording.recording_last_beat.clear();
         // Phase 4 Step C-2: audio thread の recording bypass を解除 +
         // 最新 song を送る (= curve eval に戻る瞬間に正しい point sequence
         // が反映される)。 currently_recording_lanes は !is_playing なので
@@ -356,7 +356,7 @@ impl AppData {
     /// master が戻る（クリック / reverb tail 復活）ことを防ぐ。engine 側にも
     /// plugin-host hang 用の安全 auto-release がある。
     pub(crate) fn panic(&mut self) {
-        if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
+        if self.cur.transport.pending_video_export.is_some() || self.cur.transport.export_stage.is_some() {
             return;
         }
         // r.md #51: `is_playing` で条件を付けない。 これは観測値なので、押した
@@ -366,10 +366,10 @@ impl AppData {
         self.stop();
         // モニターで鳴らしている held は reinit が黙らせるので、こちらは
         // 台帳だけ畳む (残すと次の note-off で存在しない音を止めにいく)。
-        self.recording.monitor_notes.clear();
+        self.cur.recording.monitor_notes.clear();
         self.send_audio(AudioCommand::Panic);
-        self.transport.panic_reinit_due = Some(std::time::Instant::now());
-        self.transport.panic_release_pending = true;
+        self.cur.transport.panic_reinit_due = Some(std::time::Instant::now());
+        self.cur.transport.panic_release_pending = true;
         self.ui_ephemeral.status_message = "パニック: 全ての音を停止しました".into();
     }
 
@@ -387,14 +387,14 @@ impl AppData {
             region.start_beat = 0.0;
             region.end_beat = 0.0;
         }
-        self.transport.loop_region = region;
-        self.send_audio(AudioCommand::SetLoop(region));
+        self.cur.transport.loop_region = region;
+        self.send_audio(AudioCommand::SetLoop { project: self.pk(), region });
     }
 
     pub(crate) fn toggle_loop(&mut self) {
         let region = common::model::LoopRegion {
-            enabled: !self.transport.loop_region.enabled,
-            ..self.transport.loop_region
+            enabled: !self.cur.transport.loop_region.enabled,
+            ..self.cur.transport.loop_region
         };
         self.set_loop_region(region);
     }
@@ -403,7 +403,7 @@ impl AppData {
         let region = common::model::LoopRegion {
             start_beat: start,
             end_beat: end,
-            ..self.transport.loop_region
+            ..self.cur.transport.loop_region
         };
         self.set_loop_region(region);
     }
@@ -429,7 +429,7 @@ impl AppData {
         };
 
         const EPS: f64 = 1e-9;
-        let current = self.transport.loop_region;
+        let current = self.cur.transport.loop_region;
         let same_range =
             (current.start_beat - start).abs() < EPS && (current.end_beat - end).abs() < EPS;
 
@@ -447,7 +447,7 @@ impl AppData {
             end_beat: end,
         });
         self.seek_playhead_to(start);
-        if !self.transport.is_playing {
+        if !self.cur.transport.is_playing {
             self.play();
         }
     }
@@ -465,40 +465,40 @@ mod tests {
     fn stop_keeps_the_playhead_and_space_returns_to_home() {
         let mut app = headless_app();
         // まだホームが無い: 最初の再生開始位置がホームになる。
-        app.transport.playhead_beat = Some(4.0);
+        app.cur.transport.playhead_beat = Some(4.0);
         app.play();
-        assert_eq!(app.transport.home_beat, Some(4.0));
-        assert_eq!(app.transport.playhead_beat, Some(4.0));
+        assert_eq!(app.cur.transport.home_beat, Some(4.0));
+        assert_eq!(app.cur.transport.playhead_beat, Some(4.0));
 
         // 9 拍目で止まる → プレイヘッドは 9 のまま、 ホームは 4 のまま。
-        app.transport.is_playing = true;
-        app.transport.playhead_beat = Some(9.0);
-        app.transport.is_playing = false;
+        app.cur.transport.is_playing = true;
+        app.cur.transport.playhead_beat = Some(9.0);
+        app.cur.transport.is_playing = false;
         app.on_transport_stopped();
-        assert_eq!(app.transport.playhead_beat, Some(9.0), "Stop は止まった位置に留める");
-        assert_eq!(app.transport.home_beat, Some(4.0), "Stop はホームを動かさない");
+        assert_eq!(app.cur.transport.playhead_beat, Some(9.0), "Stop は止まった位置に留める");
+        assert_eq!(app.cur.transport.home_beat, Some(4.0), "Stop はホームを動かさない");
 
         // Shift+Space: 9 から再生、 ホームは 4 のまま。
         app.play_continue();
-        assert_eq!(app.transport.playhead_beat, Some(9.0));
-        assert_eq!(app.transport.home_beat, Some(4.0));
+        assert_eq!(app.cur.transport.playhead_beat, Some(9.0));
+        assert_eq!(app.cur.transport.home_beat, Some(4.0));
 
         // 12 で止まる → Space はホーム (4) へ頭出しして再生。
-        app.transport.is_playing = true;
-        app.transport.playhead_beat = Some(12.0);
+        app.cur.transport.is_playing = true;
+        app.cur.transport.playhead_beat = Some(12.0);
         app.play_continue();
-        assert_eq!(app.transport.playhead_beat, Some(12.0), "再生中の Shift+Space は何もしない");
-        app.transport.is_playing = false;
+        assert_eq!(app.cur.transport.playhead_beat, Some(12.0), "再生中の Shift+Space は何もしない");
+        app.cur.transport.is_playing = false;
         app.on_transport_stopped();
-        assert_eq!(app.transport.playhead_beat, Some(12.0));
+        assert_eq!(app.cur.transport.playhead_beat, Some(12.0));
         app.play();
-        assert_eq!(app.transport.playhead_beat, Some(4.0), "Space はホームから");
+        assert_eq!(app.cur.transport.playhead_beat, Some(4.0), "Space はホームから");
 
         // 明示 seek (ruler click / F / Home / End) はホームも動かす。
-        app.transport.is_playing = false;
+        app.cur.transport.is_playing = false;
         app.seek_playhead_to(2.0);
-        assert_eq!(app.transport.home_beat, Some(2.0));
-        assert_eq!(app.transport.playhead_beat, Some(2.0));
+        assert_eq!(app.cur.transport.home_beat, Some(2.0));
+        assert_eq!(app.cur.transport.playhead_beat, Some(2.0));
     }
 
     /// 読み込み待ちで queue した再生は「どこから」 も一緒に覚える (プラグイン読み込みで
@@ -506,15 +506,15 @@ mod tests {
     #[test]
     fn queued_play_remembers_where_to_start_from() {
         let mut app = headless_app();
-        app.transport.home_beat = Some(0.0);
-        app.transport.playhead_beat = Some(7.0);
-        app.ipc.pending_plugin_loads.insert(1, 1);
+        app.cur.transport.home_beat = Some(0.0);
+        app.cur.transport.playhead_beat = Some(7.0);
+        app.cur.pipc.pending_plugin_loads.insert(1, 1);
         app.play_continue();
-        assert_eq!(app.transport.pending_play, Some(PlayFrom::Continue));
-        app.ipc.pending_plugin_loads.clear();
+        assert_eq!(app.cur.transport.pending_play, Some(PlayFrom::Continue));
+        app.cur.pipc.pending_plugin_loads.clear();
         app.fire_pending_play();
-        assert_eq!(app.transport.pending_play, None);
-        assert_eq!(app.transport.playhead_beat, Some(7.0), "止まった位置から続く");
-        assert_eq!(app.transport.home_beat, Some(0.0), "ホームは据え置き");
+        assert_eq!(app.cur.transport.pending_play, None);
+        assert_eq!(app.cur.transport.playhead_beat, Some(7.0), "止まった位置から続く");
+        assert_eq!(app.cur.transport.home_beat, Some(0.0), "ホームは据え置き");
     }
 }

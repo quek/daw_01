@@ -52,7 +52,7 @@ fn build_app(theme: &str) -> AppData {
 /// 1 トラック目の EQ を「はっきり曲がる」設定にする (HMF を +15dB / 狭い Q)。
 fn app_with_curved_eq(theme: &str) -> AppData {
     let mut app = build_app(theme);
-    let track = app.song_doc.song().tracks[0].id;
+    let track = app.cur.song_doc.song().tracks[0].id;
     app.handle_event(AppEvent::StripEdit {
         track,
         edit: StripEdit::Param { param: TrackBuiltinParam::StripEqOn, value: 1.0 },

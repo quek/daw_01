@@ -23,7 +23,7 @@ pub(crate) fn build(
     // r.md #91: 連動ハイライトの対象 content (`view_build::active_share_groups`、アレンジと同じ集合)。
     active_groups: &HashSet<common::model::ContentId>,
 ) -> LauncherView {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let scenes: Vec<LauncherSceneView> = song
         .scenes
         .iter()
@@ -35,7 +35,7 @@ pub(crate) fn build(
                 .color
                 .map_or_else(|| app.theme.core.accent, track_color::to_renderer),
             follow: s.follow.enabled,
-            selected: app.selection.selected_scene_ids.contains(&s.id),
+            selected: app.cur.selection.selected_scene_ids.contains(&s.id),
         })
         .collect();
 
@@ -124,13 +124,13 @@ pub(crate) fn build(
     LauncherView {
         scenes,
         rows,
-        layout: app.ui_prefs.launcher_layout,
-        width: app.ui_prefs.launcher_width,
-        col_w: app.ui_prefs.launcher_scene_col_w,
-        scroll_scene: app.ui_prefs.launcher_scroll_scene,
+        layout: app.cur.view.launcher_layout,
+        width: app.cur.view.launcher_width,
+        col_w: app.cur.view.launcher_scene_col_w,
+        scroll_scene: app.cur.view.launcher_scroll_scene,
         progress,
         queued,
-        selected: app.selection.selected_launcher_cells.clone(),
+        selected: app.cur.selection.selected_launcher_cells.clone(),
     }
 }
 
@@ -238,7 +238,7 @@ fn apply_running(
         // GUI 側で境界を解き直すと、グローバル量子化を迂回するシーンの
         // フォローアクション由来の予約で必ず食い違う。
         if snap.queued_clip_id != 0
-            && let Some(ph) = app.transport.playhead_beat
+            && let Some(ph) = app.cur.transport.playhead_beat
         {
             let remaining = snap.queued_at_beat - f64::from(ph);
             if remaining.is_finite() {
@@ -265,7 +265,7 @@ fn apply_running(
         // 映像 / クリップ編集面と同じ 1 本 (`launcher_time::cell_phase`) を通す
         // ので、音・絵・帯がズレない。解けないとき (長さ 0 / まだ届いていない)
         // だけ publish 値へ倒す。
-        let smooth = app.transport.playhead_beat.and_then(|ph| {
+        let smooth = app.cur.transport.playhead_beat.and_then(|ph| {
             let cell = row.cells.values().find(|c| c.clip_id == snap.playing_clip_id)?;
             let phase = crate::launcher_time::cell_phase(
                 snap.launch_beat,

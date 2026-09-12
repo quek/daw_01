@@ -54,14 +54,14 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         None,
         48_000,
     );
-    app.ui_prefs.arrange_header_w = 0.0;
-    app.ui_prefs.arrange_track_row_h = 50.0;
-    app.ui_prefs.arrange_track_top = 0.0;
+    app.cur.view.arrange_header_w = 0.0;
+    app.cur.view.arrange_track_row_h = 50.0;
+    app.cur.view.arrange_track_top = 0.0;
     // 帯を出す (このファイルは帯側の当たり判定の回帰網)。
-    app.ui_prefs.launcher_layout = LauncherLayout::Both;
-    app.ui_prefs.launcher_width = 320.0;
-    app.ui_prefs.launcher_scene_col_w = 96.0;
-    app.ui_prefs.launcher_scroll_scene = 0.0;
+    app.cur.view.launcher_layout = LauncherLayout::Both;
+    app.cur.view.launcher_width = 320.0;
+    app.cur.view.launcher_scene_col_w = 96.0;
+    app.cur.view.launcher_scroll_scene = 0.0;
     // 2 トラック / 実シーン 1 本 (右側はプレースホルダ列になる) / セル 1 個。
     app.edit_song(|song| {
         song.tracks.clear();
@@ -213,7 +213,7 @@ fn 実シーンの本体を押すと発火ではなく列の選択になる() {
     let (mut app, _a, _p) = build_app();
     let mut host: UiHost<AppData> = UiHost::no_redraw();
     let (real, _) = scene_head_rects(&mut host, &mut app);
-    let scene_id = app.song_doc.song().scenes[0].id;
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
 
     let intents = click_intents(&mut host, &mut app, body_x(real), real.y + real.h * 0.5);
 
@@ -233,7 +233,7 @@ fn 実シーンの記号はそのシーンを撃つ() {
     let (mut app, _a, _p) = build_app();
     let mut host: UiHost<AppData> = UiHost::no_redraw();
     let (real, _) = scene_head_rects(&mut host, &mut app);
-    let scene_id = app.song_doc.song().scenes[0].id;
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
 
     let intents = click_intents(&mut host, &mut app, glyph_x(real), real.y + real.h * 0.5);
 

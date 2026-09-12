@@ -94,7 +94,7 @@ impl AppData {
     /// セルのローンチ設定 (存在しなければ `None`)。
     #[must_use]
     pub fn launch_settings_of(&self, cell: LauncherCellKey) -> Option<LaunchSettings> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match cell {
             LauncherCellKey::Track(k) => song
                 .track_by_id(k.track_id)
@@ -110,7 +110,7 @@ impl AppData {
     /// セルが乗っている列 (`Scene::id`)。
     #[must_use]
     pub fn scene_of_cell(&self, cell: LauncherCellKey) -> Option<u32> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match cell {
             LauncherCellKey::Track(k) => song
                 .track_by_id(k.track_id)
@@ -130,8 +130,8 @@ impl AppData {
     /// それ以外は [`Self::selected_launcher_cells`] を使う。
     #[must_use]
     pub fn live_launcher_cells(&self) -> Vec<LauncherCellKey> {
-        let song = self.song_doc.song();
-        self.selection
+        let song = self.cur.song_doc.song();
+        self.cur.selection
             .selected_launcher_cells
             .iter()
             .copied()
@@ -143,8 +143,8 @@ impl AppData {
     /// 非空判定を確保なしで)。`edit_surface` が毎フレーム引くのでここは短絡させる。
     #[must_use]
     pub fn has_live_launcher_cells(&self) -> bool {
-        let song = self.song_doc.song();
-        self.selection.selected_launcher_cells.iter().any(|c| cell_exists(song, *c))
+        let song = self.cur.song_doc.song();
+        self.cur.selection.selected_launcher_cells.iter().any(|c| cell_exists(song, *c))
     }
 
     /// いま選択されている **セル** (アレンジのクリップは除く)。
@@ -157,7 +157,7 @@ impl AppData {
     /// (`feedback_selection_action_last_wins` の "直近確定面で決める")。
     #[must_use]
     pub fn selected_launcher_cells(&self) -> Vec<LauncherCellKey> {
-        if self.selection.last_edit_select != Some(crate::app::EditSurface::LauncherCells) {
+        if self.cur.selection.last_edit_select != Some(crate::app::EditSurface::LauncherCells) {
             return Vec::new();
         }
         self.live_launcher_cells()
@@ -180,13 +180,13 @@ impl AppData {
     /// 冪等で、どこから呼んでも安全。
     pub(crate) fn drop_cell_selection_if_arrangement(&mut self) {
         let arrangement = self
-            .selection
+            .cur.selection
             .time
             .as_ref()
             .is_some_and(|t| t.lanes.iter().copied().any(common::model::LaneRef::is_arrangement_row));
         if arrangement {
-            self.selection.selected_launcher_cells.clear();
-            self.selection.launcher_cell_anchor = None;
+            self.cur.selection.selected_launcher_cells.clear();
+            self.cur.selection.launcher_cell_anchor = None;
         }
     }
 
@@ -252,7 +252,7 @@ impl AppData {
     /// [`SelectModifier`] を使うので、修飾キーの意味が面ごとに割れない。
     pub fn select_launcher_cell(&mut self, cell: LauncherCellKey, modifier: SelectModifier) {
         // 列 (シーン) 選択とは排他 (`SelectionState::selected_scene_ids` の doc)。
-        self.selection.selected_scene_ids.clear();
+        self.cur.selection.selected_scene_ids.clear();
         // アレンジの範囲選択とも排他 (`drop_cell_selection_if_arrangement` の逆向き)。
         // 選択されているクリップは常に 1 つの面だけなので、セルを選んだらアレンジの
         // 範囲は降りる。 残すとインスペクタ / ピアノロールが 2 つの面を同時に指す。
@@ -262,18 +262,18 @@ impl AppData {
         // 「トラック行のセルからその下のオートメーションレーン行のセルまで」が
         // 範囲選択できなかった)。
         let items = self.launcher_range_items();
-        let anchor = self.selection.launcher_cell_anchor;
-        let next = modifier.resolve(&self.selection.selected_launcher_cells, cell, || {
+        let anchor = self.cur.selection.launcher_cell_anchor;
+        let next = modifier.resolve(&self.cur.selection.selected_launcher_cells, cell, || {
             let a = anchor?;
             crate::widgets::select_modifier::range_block(&items, a, cell)
         });
         let anchor_track = next.last().map(|k| k.row().track_id());
-        self.selection.selected_launcher_cells = next;
+        self.cur.selection.selected_launcher_cells = next;
         if modifier.updates_anchor() {
-            self.selection.launcher_cell_anchor = Some(cell);
+            self.cur.selection.launcher_cell_anchor = Some(cell);
         }
-        if !self.selection.selected_launcher_cells.is_empty() {
-            self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
+        if !self.cur.selection.selected_launcher_cells.is_empty() {
+            self.cur.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
         }
         // アレンジのクリップ選択 (`select_clip` / `set_clip_selection`) と
         // 同じく、 anchor のトラックへカーソルを追従させる。 これが無いと
@@ -286,17 +286,17 @@ impl AppData {
         }
         // 撃つ / 設定を出す起点をクリックしたセルへ移す。
         if let (Some(scene_id), row) = (self.scene_of_cell(cell), cell.row())
-            && let Some(scene_index) = self.song_doc.song().scene_index(scene_id)
+            && let Some(scene_index) = self.cur.song_doc.song().scene_index(scene_id)
         {
-            self.launcher.focus = Some(crate::state::LauncherFocus { row, scene_index });
+            self.cur.launcher.focus = Some(crate::state::LauncherFocus { row, scene_index });
         }
         // アレンジのクリップ選択 (`apply_clip_range`) と同じく、**初めて開く**セルはピアノロールを
         // auto-fit する (per-clip view の記憶が無いときだけ。記憶があれば復元に任せ、明示的な
         // 再 fit は `X`)。単一のトラック行 MIDI セルだけ — 複数表示は共有 viewport なので
         // 選ぶたびに飛ばさない。
-        if let [LauncherCellKey::Track(k)] = self.selection.selected_launcher_cells.as_slice()
+        if let [LauncherCellKey::Track(k)] = self.cur.selection.selected_launcher_cells.as_slice()
             && self.is_midi_clip(*k)
-            && !self.ui_prefs.piano_roll_views.contains_key(k)
+            && !self.cur.view.piano_roll_views.contains_key(k)
         {
             self.fit_piano_roll_to_clip();
         }
@@ -316,7 +316,7 @@ impl AppData {
     fn launcher_range_items(
         &self,
     ) -> Vec<crate::widgets::select_modifier::RangeItem<LauncherCellKey>> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut items = Vec::new();
         for (row_i, row) in self.launcher_rows().into_iter().enumerate() {
             // 行の種別ごとの「セルの列 id と clip id」だけが違う。
@@ -352,22 +352,22 @@ impl AppData {
     /// 無い (掃除していた頃は「セル面が automation 面へ相乗りしている」ことの
     /// 帳尻合わせだった)。
     pub(crate) fn prune_launcher_selection(&mut self) {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         // 消えた列を指したままだと、インスペクタが存在しない列の設定を出す。
         let live_scenes: Vec<u32> = song.scenes.iter().map(|s| s.id).collect();
-        self.selection.selected_scene_ids.retain(|id| live_scenes.contains(id));
-        self.selection.scene_anchor =
-            self.selection.scene_anchor.filter(|id| live_scenes.contains(id));
-        let song = self.song_doc.song();
+        self.cur.selection.selected_scene_ids.retain(|id| live_scenes.contains(id));
+        self.cur.selection.scene_anchor =
+            self.cur.selection.scene_anchor.filter(|id| live_scenes.contains(id));
+        let song = self.cur.song_doc.song();
         let alive = |k: &LauncherCellKey| cell_exists(song, *k);
         let cells: Vec<LauncherCellKey> =
-            self.selection.selected_launcher_cells.iter().copied().filter(alive).collect();
+            self.cur.selection.selected_launcher_cells.iter().copied().filter(alive).collect();
         // **範囲選択の起点 (anchor) も掃除する。** 消えたセルを指したままだと
         // 次の `Shift+click` が範囲を解けず、単一選択に落ちる (「範囲選択が
         // 時々効かない」の正体)。
-        self.selection.launcher_cell_anchor =
-            self.selection.launcher_cell_anchor.filter(alive);
-        self.selection.selected_launcher_cells = cells;
+        self.cur.selection.launcher_cell_anchor =
+            self.cur.selection.launcher_cell_anchor.filter(alive);
+        self.cur.selection.selected_launcher_cells = cells;
     }
 
     // ------------------------------------------------------------------
@@ -629,10 +629,10 @@ impl AppData {
             return;
         }
         // click 経路と同じく列選択・アレンジの範囲選択とは排他。
-        self.selection.selected_scene_ids.clear();
+        self.cur.selection.selected_scene_ids.clear();
         self.set_time_selection(None);
-        self.selection.selected_launcher_cells = cells.to_vec();
-        self.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
+        self.cur.selection.selected_launcher_cells = cells.to_vec();
+        self.cur.selection.last_edit_select = Some(crate::app::EditSurface::LauncherCells);
         // click 経路 (`select_launcher_cell`) と同じくカーソルトラックを追従させる。
         // 別トラックへセルを複製 / 移動したら、 インスペクタもその行に付いていく。
         // anchor は「最後に置いたセル」 = 集合の末尾。
@@ -687,7 +687,7 @@ impl AppData {
     /// — 長さは `LaunchSettings` ではなく `Clip` 側にあるので別関数)。
     #[must_use]
     pub fn launch_cell_length_fold(&self, cells: &[LauncherCellKey]) -> Option<f64> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let len_of = |c: &LauncherCellKey| -> Option<f64> {
             match c {
                 LauncherCellKey::Track(k) => song

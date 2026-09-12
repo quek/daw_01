@@ -32,8 +32,8 @@ use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
 
-    assert_eq!(app.song_doc.song().tracks.len(), 1);
-    let inst_track_id = app.song_doc.song().tracks[0].id;
+    assert_eq!(app.cur.song_doc.song().tracks.len(), 1);
+    let inst_track_id = app.cur.song_doc.song().tracks[0].id;
 
     // Step 1: track 0 を選択し、 picker から synth を入れる (= device 0 に append)。
     select_track_single(&mut app, 0);
@@ -45,13 +45,13 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     });
 
     // SetSlotPlugin が plugin_host 行きに sent されているはず (安定 device id)。
-    let synth_dev = device_id_at(app.song_doc.song(), inst_track_id, 0)
+    let synth_dev = device_id_at(app.cur.song_doc.song(), inst_track_id, 0)
         .expect("picker append should allocate a device id");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs
             .iter()
-            .any(|m| matches!(m, PluginCommand::SetSlotPlugin { device_id, .. }
+            .any(|m| matches!(m, PluginCommand::SetSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. }, .. }
                 if *device_id == synth_dev)),
         "SetSlotPlugin(device_id) should be sent to plugin_host: {:?}",
         plugin_msgs
@@ -59,7 +59,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
 
     fake_plugin_loaded(&mut app, inst_track_id, 0, "test.synth");
     assert!(
-        app.ipc.loaded_devices.contains_key(&synth_dev),
+        app.cur.pipc.loaded_devices.contains_key(&synth_dev),
         "instrument device_id should register in loaded_devices"
     );
 
@@ -72,7 +72,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         audio_after_add
             .iter()
-            .any(|m| matches!(m, AudioCommand::LoadSong(_))),
+            .any(|m| matches!(m, AudioCommand::LoadSong { project: _, song: _ })),
         "adding a plugin should re-sync daw_audio with a fresh LoadSong: {:?}",
         audio_after_add
     );
@@ -81,12 +81,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     app.handle_event(AppEvent::Play);
     let audio_msgs = drain(&mut audio_rx);
     assert!(
-        audio_msgs.iter().any(|m| matches!(m, AudioCommand::Play)),
+        audio_msgs.iter().any(|m| matches!(m, AudioCommand::Play { project: _ })),
         "Play should send Play to audio: {:?}",
         audio_msgs
     );
     assert!(
-        !audio_msgs.iter().any(|m| matches!(m, AudioCommand::LoadSong(_))),
+        !audio_msgs.iter().any(|m| matches!(m, AudioCommand::LoadSong { project: _, song: _ })),
         "Play does NOT re-send LoadSong (dbca77f): {:?}",
         audio_msgs
     );
@@ -98,23 +98,23 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         track_ids: vec![inst_track_id],
     });
     assert_eq!(
-        app.song_doc.song().tracks.len(),
+        app.cur.song_doc.song().tracks.len(),
         2,
         "after group: 2 tracks (group + instrument)"
     );
-    let group_id = app.song_doc.song().tracks[0].id;
+    let group_id = app.cur.song_doc.song().tracks[0].id;
     assert_ne!(group_id, inst_track_id, "group has fresh id");
     assert_eq!(
-        app.song_doc.song().tracks[1].id, inst_track_id,
+        app.cur.song_doc.song().tracks[1].id, inst_track_id,
         "instrument is now after the group"
     );
     assert_eq!(
-        app.song_doc.song().tracks[1].parent_group_id,
+        app.cur.song_doc.song().tracks[1].parent_group_id,
         Some(group_id),
         "instrument's parent should point at the new group"
     );
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![group_id],
         "selection moves to the group track"
     );
@@ -138,13 +138,13 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         keep_open: false,
         open_gui: true,
     });
-    let bitcrush_dev = device_id_at(app.song_doc.song(), group_id, 0)
+    let bitcrush_dev = device_id_at(app.cur.song_doc.song(), group_id, 0)
         .expect("bitcrush append should allocate a device id");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::SetSlotPlugin { device_id, .. }
+            PluginCommand::SetSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. }, .. }
                 if *device_id == bitcrush_dev
         )),
         "Bitcrush should land at device 0 on the group track: {:?}",
@@ -159,13 +159,13 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         keep_open: false,
         open_gui: true,
     });
-    let delay_dev = device_id_at(app.song_doc.song(), group_id, 1)
+    let delay_dev = device_id_at(app.cur.song_doc.song(), group_id, 1)
         .expect("delay append should allocate a device id");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::SetSlotPlugin { device_id, .. }
+            PluginCommand::SetSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. }, .. }
                 if *device_id == delay_dev
         )),
         "Delay should land at device 1 on the group track: {:?}",
@@ -175,12 +175,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
 
     // `loaded_devices` に Bitcrush, Delay の device_id が register されている。
     assert!(
-        app.ipc.loaded_devices.contains_key(&bitcrush_dev)
-            && app.ipc.loaded_devices.contains_key(&delay_dev),
+        app.cur.pipc.loaded_devices.contains_key(&bitcrush_dev)
+            && app.cur.pipc.loaded_devices.contains_key(&delay_dev),
         "group has Bitcrush + Delay device_ids in loaded_devices"
     );
     assert_eq!(
-        app.song_doc.song().tracks
+        app.cur.song_doc.song().tracks
             .iter()
             .find(|t| t.id == group_id)
             .map(|t| t.devices.len()),
@@ -197,27 +197,27 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // RemoveDevices は plugin の最新 state を取ってから Undo snapshot → 削除 という
     // deferred path を通る。 test では plugin_host を mock していないので、 fake で
     // AllStatesReceived を流して deferred edit を実行させる。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::RemoveSlotPlugin { device_id } if *device_id == bitcrush_dev
+            PluginCommand::RemoveSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. } } if *device_id == bitcrush_dev
         )),
         "RemoveSlotPlugin(bitcrush) should be sent to plugin_host: {:?}",
         plugin_msgs
     );
     // plugin_host が destroy 完了して SlotPluginUnloaded を返したのを fake。
-    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginUnloaded { device_id: bitcrush_dev }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginUnloaded { device: app.dev(bitcrush_dev )}));
 
     // Bitcrush が `loaded_devices` から消えて、 Delay のみ残る。
     assert!(
-        !app.ipc.loaded_devices.contains_key(&bitcrush_dev)
-            && app.ipc.loaded_devices.contains_key(&delay_dev),
+        !app.cur.pipc.loaded_devices.contains_key(&bitcrush_dev)
+            && app.cur.pipc.loaded_devices.contains_key(&delay_dev),
         "after Bitcrush remove: only Delay's device_id remains loaded"
     );
     assert_eq!(
-        app.song_doc.song().tracks
+        app.cur.song_doc.song().tracks
             .iter()
             .find(|t| t.id == group_id)
             .map(|t| t.devices.len()),
@@ -234,7 +234,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     app.handle_event(AppEvent::UngroupTracks {
         track_ids: vec![group_id],
     });
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
     // frame flush: ClosePluginShmem は ungroup handler が UAF 防止で直送済。 schedule
     // 再構築の LoadSong はここで送られ、 close をブラケットする (load_before/after)。
     app.flush_song_sync();
@@ -245,17 +245,17 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // ----- ungroup IPC: audio 側 -----
     let close_idx = audio_msgs
         .iter()
-        .position(|m| matches!(m, AudioCommand::ClosePluginShmem { device_id } if *device_id == delay_dev))
+        .position(|m| matches!(m, AudioCommand::ClosePluginShmem { project: _, device_id } if *device_id == delay_dev))
         .unwrap_or_else(|| {
             panic!(
                 "ClosePluginShmem(delay) must be sent on audio_tx during ungroup: {audio_msgs:?}"
             )
         });
     let load_after = audio_msgs.iter().enumerate().any(|(i, m)| {
-        i > close_idx && matches!(m, AudioCommand::LoadSong(_))
+        i > close_idx && matches!(m, AudioCommand::LoadSong { project: _, song: _ })
     });
     let load_before = audio_msgs.iter().enumerate().any(|(i, m)| {
-        i < close_idx && matches!(m, AudioCommand::LoadSong(_))
+        i < close_idx && matches!(m, AudioCommand::LoadSong { project: _, song: _ })
     });
     assert!(
         load_before || load_after,
@@ -269,7 +269,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::RemoveSlotPlugin { device_id } if *device_id == delay_dev
+            PluginCommand::RemoveSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. } } if *device_id == delay_dev
         )),
         "RemoveSlotPlugin(delay) must be sent on plugin_tx: {:?}",
         plugin_msgs
@@ -277,7 +277,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         !plugin_msgs.iter().any(|m| matches!(
             m,
-            PluginCommand::RemoveSlotPlugin { device_id } if *device_id == synth_dev
+            PluginCommand::RemoveSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. } } if *device_id == synth_dev
         )),
         "instrument device must survive ungroup: {:?}",
         plugin_msgs
@@ -285,16 +285,16 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
 
     // ----- ungroup 後の AppData 状態 -----
     assert_eq!(
-        app.song_doc.song().tracks.len(),
+        app.cur.song_doc.song().tracks.len(),
         1,
         "after ungroup: only the instrument track remains"
     );
     assert_eq!(
-        app.song_doc.song().tracks[0].id, inst_track_id,
+        app.cur.song_doc.song().tracks[0].id, inst_track_id,
         "instrument track still in place"
     );
     assert_eq!(
-        app.song_doc.song().tracks[0].parent_group_id, None,
+        app.cur.song_doc.song().tracks[0].parent_group_id, None,
         "instrument's parent reverts to master (None)"
     );
     assert!(
@@ -302,15 +302,15 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "instrument track has no children → not a group"
     );
     assert!(
-        !app.ipc.loaded_devices.contains_key(&delay_dev),
+        !app.cur.pipc.loaded_devices.contains_key(&delay_dev),
         "group の device は帳簿から落ちる"
     );
     assert!(
-        app.ipc.loaded_devices.contains_key(&synth_dev),
+        app.cur.pipc.loaded_devices.contains_key(&synth_dev),
         "instrument track keeps its device (audio continues)"
     );
     // 念のため song モデル側も instrument device が残っているか。
-    let inst_track = &app.song_doc.song().tracks[0];
+    let inst_track = &app.cur.song_doc.song().tracks[0];
     assert_eq!(
         inst_track.plugins().next().map(|p| p.plugin_id.as_str()),
         Some("test.synth"),
@@ -330,7 +330,7 @@ fn setup_loaded_chain(
     audio_rx: &mut UnboundedReceiver<AudioCommand>,
     plugin_rx: &mut UnboundedReceiver<PluginCommand>,
 ) -> (u32, [u64; 3]) {
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     select_track_single(app, 0);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -355,7 +355,7 @@ fn setup_loaded_chain(
     let delay_dev = fake_plugin_loaded(app, track_id, 2, "test.delay");
     // Sanity: starting layout is [synth, bitcrush, delay].
     {
-        let t = &app.song_doc.song().tracks[0];
+        let t = &app.cur.song_doc.song().tracks[0];
         assert_eq!(
             t.plugins().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
             vec!["test.synth", "test.bitcrush", "test.delay"]
@@ -388,11 +388,11 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     }));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
 
     // (a) song permutation: device 順が [synth, delay, bitcrush] に。
     {
-        let t = &app.song_doc.song().tracks[0];
+        let t = &app.cur.song_doc.song().tracks[0];
         assert_eq!(
             t.plugins().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
             vec!["test.synth", "test.delay", "test.bitcrush"],
@@ -411,7 +411,7 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     //     不変条件 1 が禁じる貼り替え補償コード)。 3 台とも load 済のまま。
     for dev in [synth_dev, bitcrush_dev, delay_dev] {
         assert!(
-            app.ipc.loaded_devices.contains_key(&dev),
+            app.cur.pipc.loaded_devices.contains_key(&dev),
             "並べ替えで帳簿の entry は動かない (device_id keyed): {dev}"
         );
     }
@@ -424,7 +424,7 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     let plugin_msgs = drain(&mut plugin_rx);
     let audio_msgs = drain(&mut audio_rx);
     assert!(
-        audio_msgs.iter().any(|m| matches!(m, AudioCommand::LoadSong(_))),
+        audio_msgs.iter().any(|m| matches!(m, AudioCommand::LoadSong { project: _, song: _ })),
         "a LoadSong must follow to rebuild the schedule order: {audio_msgs:?}"
     );
     // plugin_host には並び替え由来の per-device 命令が飛ばないこと
@@ -471,11 +471,11 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     }));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
 
     // bitcrush moved index 1 -> index 2; the lane still points at bitcrush by id.
     assert_eq!(
-        app.song_doc.song().tracks[0].automation_lanes[0].target,
+        app.cur.song_doc.song().tracks[0].automation_lanes[0].target,
         AutomationTarget::PluginParam {
             device_id: bitcrush_dev,
             param_id: 42,
@@ -485,7 +485,7 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     );
     // …and that id resolves to the plugin's new position.
     assert_eq!(
-        app.song_doc.song().tracks[0]
+        app.cur.song_doc.song().tracks[0]
             .devices
             .iter()
             .position(|d| d.id() == bitcrush_dev),
@@ -524,7 +524,7 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
     let _ = drain(&mut plugin_rx);
 
     // [synth, bitcrush, delay, phantom] の index 1 と 2 を入れ替える。
-    let delay_dev = app.song_doc.song().tracks[0].devices[2].id();
+    let delay_dev = app.cur.song_doc.song().tracks[0].devices[2].id();
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![delay_dev],
         dest: common::model::ChainRef::Track(track_id),
@@ -533,9 +533,9 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
     }));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
 
-    let after: Vec<String> = app.song_doc.song().tracks[0]
+    let after: Vec<String> = app.cur.song_doc.song().tracks[0]
         .plugins()
         .map(|p| p.plugin_id.clone())
         .collect();
@@ -551,7 +551,7 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
     assert!(
         plugin_msgs
             .iter()
-            .all(|m| matches!(m, PluginCommand::RequestAllStates)),
+            .all(|m| matches!(m, PluginCommand::RequestAllStates { project: _ })),
         "並べ替えは plugin instance を作り直さない: {plugin_msgs:?}"
     );
 }

@@ -23,13 +23,13 @@ pub(super) fn draw_talk(
         return y;
     }
     let Some(r) = app.selected_clip_ref() else { return y };
-    let Some(track) = app.song_doc.song().track_by_id(r.track_id) else { return y };
+    let Some(track) = app.cur.song_doc.song().track_by_id(r.track_id) else { return y };
     if !track.is_voicevox_vocal() {
         return y;
     }
     let Some(clip) = track.clip_by_id(r.clip_id) else { return y };
     if !app
-        .song_doc
+        .cur.song_doc
         .song()
         .clip_contents
         .get(&clip.content_id)
@@ -98,7 +98,7 @@ pub(super) fn draw_talk(
     // 持つので、ここは字幕 device 無し (= 喋るが映さない talk-only) のときだけ出し、
     // 二重入力を避ける。編集 buffer / events は overlay と共用 (同時表示しないので競合せず)。
     if !has_subtitle {
-        if app.ui_ephemeral.clip_edit_buffer_target != Some(r) {
+        if app.cur.peph.clip_edit_buffer_target != Some(r) {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipTextEditBuffers(r));
             }));
@@ -119,7 +119,7 @@ pub(super) fn draw_talk(
                 w: area.w - pad * 2.0 - 48.0,
                 h: 22.0,
             },
-            &app.ui_ephemeral.clip_text_content_edit_text,
+            &app.cur.peph.clip_text_content_edit_text,
             &ui.text_input_style(),
             |s| {
                 Edit::mutate(move |app: &mut AppData| {

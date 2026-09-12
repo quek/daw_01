@@ -42,16 +42,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         ui.open_modal("dirty_guard");
     }
 
-    // 保留中の操作に応じた動詞。 終了は「終了」、 New / Open は「続行」。
+    // 保留中の操作に応じた動詞。 終了は「終了」、 タブを閉じるは「閉じる」。
     let verb = match action {
         DirtyGuardAction::Quit(_) => "終了",
-        DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_) => "続行",
+        DirtyGuardAction::CloseTabs(_) => "閉じる",
     };
     let question = match action {
-        DirtyGuardAction::Quit(_) => "閉じる前に保存しますか？",
-        DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_) => {
-            "続ける前に保存しますか？"
-        }
+        DirtyGuardAction::Quit(_) => "終了する前に保存しますか？",
+        DirtyGuardAction::CloseTabs(_) => "タブを閉じる前に保存しますか？",
     };
     let save_label = format!("保存して{verb}");
     let discard_label = format!("保存せず{verb}");
@@ -59,7 +57,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // 表示用プロジェクト名 (未保存新規は "Untitled")。 = いま破棄しようとしている
     // (未保存変更を持つ) プロジェクト。
     let project_name = app
-        .song_doc.file_path
+        .cur.song_doc.file_path
         .as_ref()
         .and_then(|p| p.file_stem())
         .and_then(|s| s.to_str())
@@ -120,7 +118,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 &save_label,
                 Rect { x: save_x, y: btn_y, w: BTN_SAVE_W, h: BTN_H },
             ) {
-                ui.close_modal("dirty_guard");
+                // **ここで `close_modal` を呼ばない。** 呼ぶと `Ui::modal` の close 検出が
+                // 同じフレームに `on_close` (= `DirtyGuardCancel`) を積み、それが
+                // **この edit の後** に走る。終了シーケンスの「保存せず終了」は次の未保存タブの
+                // 確認を `dirty_guard` に再武装するので、その Cancel に消されて
+                // **2 つ目以降のタブを一切聞かないまま止まる** (実機で発覚)。
+                // 閉じるのは状態が SSoT — `dirty_guard` が `None` になったフレームに
+                // この関数の冒頭が閉じる。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::DirtyGuardSave)
                 }));
@@ -131,7 +135,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 &discard_label,
                 Rect { x: discard_x, y: btn_y, w: BTN_W, h: BTN_H },
             ) {
-                ui.close_modal("dirty_guard");
+                // `close_modal` は呼ばない (上の理由。閉じるのは状態が SSoT)。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::DirtyGuardDiscard)
                 }));
@@ -142,7 +146,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 "キャンセル",
                 Rect { x: cancel_x, y: btn_y, w: BTN_W, h: BTN_H },
             ) {
-                ui.close_modal("dirty_guard");
+                // `close_modal` は呼ばない (上の理由。閉じるのは状態が SSoT)。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::DirtyGuardCancel)
                 }));

@@ -47,7 +47,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
 fn last_set_loop(rx: &mut UnboundedReceiver<AudioCommand>) -> Option<LoopRegion> {
     let mut last = None;
     while let Ok(cmd) = rx.try_recv() {
-        if let AudioCommand::SetLoop(r) = cmd {
+        if let AudioCommand::SetLoop { project: _, region: r } = cmd {
             last = Some(r);
         }
     }
@@ -71,12 +71,12 @@ fn add_section(app: &mut AppData, id: u32, start: f64, len: f64) {
 #[test]
 fn loop_changes_do_not_dirty_the_project() {
     let (mut app, mut audio_rx, _p) = build_app();
-    app.song_doc.mark_saved();
-    assert!(!app.song_doc.is_dirty(), "前提: 保存直後は clean");
-    let undo_depth = app.song_doc.undo_depth();
+    app.cur.song_doc.mark_saved();
+    assert!(!app.cur.song_doc.is_dirty(), "前提: 保存直後は clean");
+    let undo_depth = app.cur.song_doc.undo_depth();
 
     app.handle_event(AppEvent::SetLoopRange { start: 4.0, end: 12.0 });
-    assert!(!app.song_doc.is_dirty(), "ループ範囲の変更で '*' が付いてはいけない");
+    assert!(!app.cur.song_doc.is_dirty(), "ループ範囲の変更で '*' が付いてはいけない");
     assert_eq!(
         last_set_loop(&mut audio_rx),
         Some(LoopRegion { enabled: false, start_beat: 4.0, end_beat: 12.0 }),
@@ -84,14 +84,14 @@ fn loop_changes_do_not_dirty_the_project() {
     );
 
     app.handle_event(AppEvent::ToggleLoop);
-    assert!(!app.song_doc.is_dirty(), "ループ ON/OFF でも '*' が付いてはいけない");
+    assert!(!app.cur.song_doc.is_dirty(), "ループ ON/OFF でも '*' が付いてはいけない");
     assert_eq!(
         last_set_loop(&mut audio_rx),
         Some(LoopRegion { enabled: true, start_beat: 4.0, end_beat: 12.0 })
     );
 
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         undo_depth,
         "undo 履歴も汚さない (ループは Song の編集ではない)"
     );
@@ -104,9 +104,9 @@ fn degenerate_loop_range_collapses_to_undefined() {
     let (mut app, _a, _p) = build_app();
     app.handle_event(AppEvent::SetLoopRange { start: 4.0, end: 12.0 });
     app.handle_event(AppEvent::SetLoopRange { start: 8.0, end: 8.0 });
-    assert_eq!(app.transport.loop_region.range(), None);
-    assert_eq!(app.transport.loop_region.start_beat, 0.0);
-    assert_eq!(app.transport.loop_region.end_beat, 0.0);
+    assert_eq!(app.cur.transport.loop_region.range(), None);
+    assert_eq!(app.cur.transport.loop_region.start_beat, 0.0);
+    assert_eq!(app.cur.transport.loop_region.end_beat, 0.0);
 }
 
 /// (d) 時間の挿入 / 削除 (破壊的セクション編集の ripple) でループ範囲もシフトする。
@@ -129,12 +129,12 @@ fn ripple_from_section_edit_shifts_the_loop_range() {
     let changed = app.edit_song_rippling(|song| song.move_section(1, 20.0));
     assert!(changed, "セクションは実際に移動する");
     assert_eq!(
-        app.song_doc.song().sections.iter().find(|s| s.id == 1).map(|s| s.start_beat),
+        app.cur.song_doc.song().sections.iter().find(|s| s.id == 1).map(|s| s.start_beat),
         Some(20.0),
         "帯は指した拍に着地する (r.md #71)"
     );
     assert_eq!(
-        (app.transport.loop_region.start_beat, app.transport.loop_region.end_beat),
+        (app.cur.transport.loop_region.start_beat, app.cur.transport.loop_region.end_beat),
         (12.0, 24.0),
         "ripple close + open がループ範囲にも同じ規則で効く"
     );
@@ -145,13 +145,13 @@ fn ripple_from_section_edit_shifts_the_loop_range() {
         app.edit_song_rippling(|song| song.delete_section_range(1).into_iter().collect());
     assert!(changed, "範囲削除は実際に起きる");
     assert_eq!(
-        (app.transport.loop_region.start_beat, app.transport.loop_region.end_beat),
+        (app.cur.transport.loop_region.start_beat, app.cur.transport.loop_region.end_beat),
         (12.0, 20.0),
         "削除した 4 拍ぶんループ末尾も前へ詰まる"
     );
     assert_eq!(
         last_set_loop(&mut audio_rx),
-        Some(app.transport.loop_region),
+        Some(app.cur.transport.loop_region),
         "シフト後の範囲が engine にも届く"
     );
 }

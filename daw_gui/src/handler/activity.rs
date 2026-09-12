@@ -36,10 +36,10 @@ impl AppData {
     /// 足すと、見えない何かのために永久に省電力へ入らなくなる。
     #[must_use]
     pub fn app_busy(&self, now: std::time::Instant) -> bool {
-        self.transport.export_stage.is_some()
-            || self.transport.pending_video_export.is_some()
+        self.cur.transport.export_stage.is_some()
+            || self.cur.transport.pending_video_export.is_some()
             // r.md #54: 解析中はレポート窓に進捗バーと伸びるグラフが出ている。
-            || self.loudness.phase.is_busy()
+            || self.cur.loudness.phase.is_busy()
             || self.ipc.is_rescanning
             || self.voicevox_animating(now)
             // r.md #61: 終了処理中は「プラグインを解放しています… (N 秒)」の
@@ -56,7 +56,10 @@ impl AppData {
     /// engine は playing なのでここに含まれる。
     #[must_use]
     pub fn transport_rolling(&self) -> bool {
-        self.transport.is_playing
+        // `docs/plan_project_tabs.md` Q1: 背景タブも鳴り続けるので、**どれか 1 つでも**
+        // 走っていれば転がっている。アクティブなタブだけ見ると、裏で鳴らしながら
+        // 窓を非アクティブにした瞬間に描画が止まって画面が凍る。
+        self.cur.transport.is_playing || self.tabs.parked.iter().any(|p| p.transport.is_playing)
     }
 
     /// 画面を描き続けるべきか。
@@ -108,18 +111,18 @@ impl AppData {
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         };
         // Song が変わったら (= automation 録音が点を打った等) 無条件に再描画。
-        mix(self.song_doc.edit_epoch());
+        mix(self.cur.song_doc.edit_epoch());
         // playhead は拍の 1/1000 まで見る (ズーム最大でも 1px 未満)。
-        mix(quantize(self.transport.playhead_beat.unwrap_or(f32::NAN), 1000.0));
-        mix(quantize(self.ui_prefs.arrange_scroll_beat, 1000.0));
+        mix(quantize(self.cur.transport.playhead_beat.unwrap_or(f32::NAN), 1000.0));
+        mix(quantize(self.cur.view.arrange_scroll_beat, 1000.0));
         // r.md #50: マスターパネルの全メーター (ピーク / VU / ラウドネス /
         // スペクトラム / オシロ / ゴニオ) は解析器が 1 つのダイジェストに畳んで
         // よこす。解析器側で表示解像度に量子化してあるので、無音になれば必ず
         // 収束する = ここで再描画が止まる。
-        mix(self.transport.master_meter.visual_digest);
+        mix(self.cur.transport.master_meter.visual_digest);
         // トラックメーターは linear なので dB 経由で正規化してから量子化する
         // (そのまま量子化すると指数減衰が 0 に収束せず永久に描き続ける)。
-        for (l, r, gr) in &self.transport.track_peak_display {
+        for (l, r, gr) in &self.cur.transport.track_peak_display {
             mix(quantize(meter_norm(*l), METER_STEPS));
             mix(quantize(meter_norm(*r), METER_STEPS));
             // GR も動く表示なので digest に混ぜる (混ぜないとコンプだけが
@@ -132,20 +135,20 @@ impl AppData {
         }
         // r.md #117: 鳴っているボイス (変調ラックの per-voice カーソル)。 停止中でも
         // プレビュー note で増減するので、 起点をそのまま混ぜる (収束する値)。
-        for (track, v) in &self.transport.track_voices {
+        for (track, v) in &self.cur.transport.track_voices {
             mix(*track as u64);
             mix(v.on_beat.to_bits());
             mix(v.off_secs.map_or(0, f64::to_bits));
         }
         // マスターストリップの GR (コンプ / リミッター)。同じ理由で digest に混ぜる。
-        for gr in [self.transport.master_strip_gr.0, self.transport.master_strip_gr.1] {
+        for gr in [self.cur.transport.master_strip_gr.0, self.cur.transport.master_strip_gr.1] {
             mix(quantize(
                 (gr / common::model::MASTER_GR_METER_RANGE_DB).clamp(0.0, 1.0),
                 METER_STEPS,
             ));
         }
         // 変調スカラーは画像 / グループ / 映像効果の見た目を直接動かすので細かく見る。
-        for v in self.transport.mod_plane.values() {
+        for v in self.cur.transport.mod_plane.values() {
             mix(quantize(*v, 4096.0));
         }
         // リソースモニターの表示粒度 = 整数パーセント。
@@ -158,12 +161,12 @@ impl AppData {
         mix(u64::from(m.sample_rate));
         // watchdog が発火すると status_message / export 表示 / 録音状態が変わる。
         mix(self.ui_ephemeral.status_message.len() as u64);
-        mix(u64::from(self.transport.export_stage.is_some()));
+        mix(u64::from(self.cur.transport.export_stage.is_some()));
         // r.md #54: 解析の進捗バーと曲線は 250ms ごとに更新される。走査済み
         // フレーム数を混ぜて、進んだフレームだけ描き直す。
-        mix(u64::from(self.loudness.phase.is_busy()));
+        mix(u64::from(self.cur.loudness.phase.is_busy()));
         mix(
-            self.loudness
+            self.cur.loudness
                 .report
                 .as_ref()
                 .map_or(0, |r| r.done_frames ^ u64::from(r.complete)),
@@ -172,13 +175,13 @@ impl AppData {
         // count-in の残量は **有無だけ**混ぜる — 生の残量を混ぜると、画面に出ない
         // 数値が毎 tick 変わるだけで count-in 中ずっと 30fps 描き直すことになる
         // (表示解像度で量子化する、というこの関数の原則どおり)。
-        mix(u64::from(self.recording.requested));
-        mix(u64::from(self.recording.live));
-        mix(u64::from(self.transport.preroll_remaining > 0));
-        mix(u64::from(self.transport.is_playing));
+        mix(u64::from(self.cur.recording.requested));
+        mix(u64::from(self.cur.recording.live));
+        mix(u64::from(self.cur.transport.preroll_remaining > 0));
+        mix(u64::from(self.cur.transport.is_playing));
         // r.md #87: ランチャーの走行状態 (`LauncherRowsTick`)。停止中は行が動かない
         // ので収束する。進捗はセルの幅 (数百 px) より細かく見ても意味が無い。
-        for (key, row) in &self.launcher.running {
+        for (key, row) in &self.cur.launcher.running {
             mix(*key);
             mix(u64::from(row.state));
             mix(u64::from(row.playing_clip_id));
@@ -190,7 +193,7 @@ impl AppData {
         // 閉じていれば `Sampler(Tick)` は画面を変えないので描き直さない。
         // タブ番号は `handler::sampler::toggle_bottom_tab` の引数と同じ (2 = Sampler、
         // 3 = MIDI Capture)。
-        match self.ui_prefs.bottom_panel {
+        match self.cur.view.bottom_panel {
             Some(2) => {
                 // 波形は 1 バケツ (`BUCKET_FRAMES`) 単位でしか変わらない。
                 mix(self.sampler.write_frames / crate::state::sampler::BUCKET_FRAMES);

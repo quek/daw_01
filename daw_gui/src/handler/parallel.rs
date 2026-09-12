@@ -137,14 +137,14 @@ impl AppData {
         });
         // 複製した plugin を host に実体化する (`paste_devices` と同じ経路)。
         let created: Vec<common::model::PluginInstance> = self
-            .song_doc
+            .cur.song_doc
             .song()
             .all_plugins()
-            .filter(|p| !self.ipc.loaded_devices.contains_key(&p.id) && !p.ports.is_video())
+            .filter(|p| !self.cur.pipc.loaded_devices.contains_key(&p.id) && !p.ports.is_video())
             .cloned()
             .collect();
         for inst in &created {
-            self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
+            self.cur.pipc.pending_added_plugin_finalize.insert(inst.id, false);
         }
         for inst in &created {
             self.restore_device(inst);
@@ -210,7 +210,7 @@ impl AppData {
     /// engine へ即時反映する (再 compile なし)。
     pub(crate) fn set_chain_mixer(&mut self, chain_id: u64, edit: ChainMixerEdit) {
         let Some(track) = self
-            .song_doc
+            .cur.song_doc
             .song()
             .chain_owner_track(ChainRef::Chain(chain_id))
         else {
@@ -252,10 +252,10 @@ impl AppData {
         });
         if changed {
             let cmd = match edit {
-                ChainMixerEdit::Gain(gain) => AudioCommand::SetChainGain { track, chain_id, gain },
-                ChainMixerEdit::Pan(pan) => AudioCommand::SetChainPan { track, chain_id, pan },
-                ChainMixerEdit::Muted(muted) => AudioCommand::SetChainMuted { track, chain_id, muted },
-                ChainMixerEdit::Solo(solo) => AudioCommand::SetChainSolo { track, chain_id, solo },
+                ChainMixerEdit::Gain(gain) => AudioCommand::SetChainGain { project: self.pk(), track, chain_id, gain },
+                ChainMixerEdit::Pan(pan) => AudioCommand::SetChainPan { project: self.pk(), track, chain_id, pan },
+                ChainMixerEdit::Muted(muted) => AudioCommand::SetChainMuted { project: self.pk(), track, chain_id, muted },
+                ChainMixerEdit::Solo(solo) => AudioCommand::SetChainSolo { project: self.pk(), track, chain_id, solo },
             };
             self.send_audio(cmd);
         }
@@ -263,10 +263,10 @@ impl AppData {
 
     /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC、chain mixer と同じ)。
     pub(crate) fn set_parallel_mixer(&mut self, parallel_id: u64, edit: ParallelMixerEdit) {
-        let Some((at, _)) = self.song_doc.song().find_device(parallel_id) else {
+        let Some((at, _)) = self.cur.song_doc.song().find_device(parallel_id) else {
             return;
         };
-        let Some(track) = self.song_doc.song().chain_owner_track(at) else {
+        let Some(track) = self.cur.song_doc.song().chain_owner_track(at) else {
             return;
         };
         let changed = self.edit_song_checked(move |song| {
@@ -297,16 +297,16 @@ impl AppData {
         });
         if changed {
             let cmd = match edit {
-                ParallelMixerEdit::OutGain(gain) => AudioCommand::SetParallelOutGain { track, parallel_id, gain },
-                ParallelMixerEdit::GainMatch(on) => AudioCommand::SetParallelGainMatch { track, parallel_id, on },
+                ParallelMixerEdit::OutGain(gain) => AudioCommand::SetParallelOutGain { project: self.pk(), track, parallel_id, gain },
+                ParallelMixerEdit::GainMatch(on) => AudioCommand::SetParallelGainMatch { project: self.pk(), track, parallel_id, on },
                 ParallelMixerEdit::SplitFreq { edge, hz } => {
-                    AudioCommand::SetParallelSplitFreq { track, parallel_id, edge, hz }
+                    AudioCommand::SetParallelSplitFreq { project: self.pk(), track, parallel_id, edge, hz }
                 }
                 ParallelMixerEdit::ActiveChain(chain_id) => {
-                    AudioCommand::SetParallelActiveChain { track, parallel_id, chain_id }
+                    AudioCommand::SetParallelActiveChain { project: self.pk(), track, parallel_id, chain_id }
                 }
                 ParallelMixerEdit::SelectorFade(fade_ms) => {
-                    AudioCommand::SetParallelSelectorFade { track, parallel_id, fade_ms }
+                    AudioCommand::SetParallelSelectorFade { project: self.pk(), track, parallel_id, fade_ms }
                 }
             };
             self.send_audio(cmd);
@@ -355,14 +355,14 @@ impl AppData {
 
     /// 見方の都合: Parallel / chain の中身の開閉 (Bitwig の layer の開閉)。 dirty 無し。
     pub(crate) fn toggle_parallel_node_collapsed(&mut self, id: u64) {
-        if !self.ui_prefs.collapsed_parallel_nodes.remove(&id) {
-            self.ui_prefs.collapsed_parallel_nodes.insert(id);
+        if !self.cur.view.collapsed_parallel_nodes.remove(&id) {
+            self.cur.view.collapsed_parallel_nodes.insert(id);
         }
     }
 
     /// Parallel / chain の中身を展開しているか (既定 = 展開)。
     pub fn parallel_node_open(&self, id: u64) -> bool {
-        !self.ui_prefs.collapsed_parallel_nodes.contains(&id)
+        !self.cur.view.collapsed_parallel_nodes.contains(&id)
     }
 
     // -------- view-model ----------------------------------------------------
@@ -374,7 +374,7 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
         };
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(devices) = song.fx_chain_by_track_id(track_id) else {
             return Vec::new();
         };
@@ -504,9 +504,9 @@ impl AppData {
         // CLAP・VST3 は host の通知 (`slot_has_gui`)、 未受信 (load 直後) は楽観的に
         // true で「GUI」のまま。
         let has_embedded_gui = p.format != PluginFormat::Builtin
-            && self.ipc.slot_has_gui.get(&p.id).copied().unwrap_or(true);
+            && self.cur.pipc.slot_has_gui.get(&p.id).copied().unwrap_or(true);
         let has_params = self
-            .ipc
+            .cur.pipc
             .plugin_params
             .get(&p.id)
             .is_some_and(|v| !v.is_empty());
@@ -520,7 +520,7 @@ impl AppData {
             is_voicevox,
             has_params,
             send_all_keys: p.send_all_keys_to_plugin,
-            load_error: self.ipc.failed_plugin_loads.get(&p.id).cloned(),
+            load_error: self.cur.pipc.failed_plugin_loads.get(&p.id).cloned(),
             bypassed: p.bypassed,
             aux_input_count: p.aux_input_count,
             sc_wired: p.aux_inputs.iter().any(Option::is_some),
@@ -531,7 +531,7 @@ impl AppData {
     /// 行数 = host が報告した port 数 (`aux_input_count`、engine が staging できる
     /// `MAX_AUX_IN` で cap)。
     pub fn sidechain_ports(&self, device_id: u64) -> Vec<SidechainPort> {
-        let Some(p) = self.song_doc.song().plugin_by_id(device_id) else {
+        let Some(p) = self.cur.song_doc.song().plugin_by_id(device_id) else {
             return Vec::new();
         };
         let n = (p.aux_input_count as usize).min(common::process_data::MAX_AUX_IN);
@@ -550,7 +550,7 @@ impl AppData {
     /// sidechain / follower の source 候補: 「—」 + 他 track + 同 track の Parallel 内 chain
     /// (`Parallel名 / Chain名`)。 自 track の出力は除外 (feedback → `GraphError::Cycle`)。
     pub fn tap_source_choices(&self, include_none: bool) -> Vec<SidechainSourceChoice> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let cursor_id = self.cursor_track_id();
         let mut choices: Vec<SidechainSourceChoice> = Vec::new();
         if include_none {
@@ -583,7 +583,7 @@ impl AppData {
     pub fn paraout_dest_choices(&self) -> Vec<(String, Option<u32>)> {
         let cursor_id = self.cursor_track_id();
         let mut out = vec![("—".to_string(), None)];
-        for t in &self.song_doc.song().tracks {
+        for t in &self.cur.song_doc.song().tracks {
             if Some(t.id) == cursor_id || t.id == MASTER_TRACK_ID {
                 continue;
             }

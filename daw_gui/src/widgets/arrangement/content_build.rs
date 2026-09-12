@@ -65,7 +65,7 @@ pub(super) fn build_clip_content(
         if t.id == MASTER_TRACK_ID {
             continue;
         }
-        let Some(mt) = app.song_doc.song().tracks.iter().find(|mt| mt.id == t.id) else {
+        let Some(mt) = app.cur.song_doc.song().tracks.iter().find(|mt| mt.id == t.id) else {
             continue;
         };
         for c in &t.clips {
@@ -119,7 +119,7 @@ pub(super) fn build_stretch_ghost_content(
             continue;
         }
         let Some(mt) = app
-            .song_doc
+            .cur.song_doc
             .song()
             .tracks
             .iter()
@@ -162,7 +162,7 @@ pub(super) fn build_one(
     stretch: Option<StretchPreview>,
     spans: &mut Vec<WaveSpan>,
 ) -> Option<ClipContentDraw> {
-    let content = app.song_doc.song().clip_contents.get(&mc.content_id)?;
+    let content = app.cur.song_doc.song().clip_contents.get(&mc.content_id)?;
     // content 原点は trim でも stretch でも不変 (`resize_clip` / `stretch_clip_content` が
     // start と offset を同量動かす)。 span の tempo 評価位置はここを基準に出す。
     let content_origin = mc.content_origin_beat();
@@ -175,7 +175,7 @@ pub(super) fn build_one(
             let audio_events = content.audio_events()?;
             let mut events: Vec<AudioEventDraw> = Vec::new();
             for (ev_i, ev) in audio_events.iter().enumerate() {
-                let Some(buffer) = app.media.audio_source_cache.get(ev.source_id) else {
+                let Some(buffer) = app.cur.media.audio_source_cache.get(ev.source_id) else {
                     // decode 待ち / missing source は skip (他 event は描く)。
                     continue;
                 };

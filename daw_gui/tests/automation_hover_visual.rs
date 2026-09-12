@@ -117,7 +117,7 @@ fn add_automation_lane(app: &mut AppData) {
             }];
         }));
     });
-    app.ui_prefs.expanded_automation_tracks.insert(1);
+    app.cur.view.expanded_automation_tracks.insert(1);
 }
 
 fn frame(p: PointerFrame) -> FrameInput {
@@ -284,7 +284,7 @@ fn check_alt_hover_keeps_the_curve(theme_id: &str, select_clip: bool) {
     assert_eq!(app.theme.id, theme_id, "テーマが適用されている");
     add_automation_lane(&mut app);
     if select_clip {
-        app.selection.selected_automation_clips =
+        app.cur.selection.selected_automation_clips =
             vec![common::model::AutomationClipKey { track: 1, lane: 1, clip: 1 }];
     }
     let mut host: UiHost<AppData> = UiHost::no_redraw();
@@ -468,7 +468,7 @@ fn add_bend_lane(app: &mut AppData) {
             }];
         }));
     });
-    app.ui_prefs.expanded_automation_tracks.insert(1);
+    app.cur.view.expanded_automation_tracks.insert(1);
 }
 
 fn pointer_at(x: f32, y: f32, m: Modifiers) -> PointerFrame {
@@ -657,7 +657,7 @@ fn check_single_stroke(theme_id: &str, select_clip: bool, do_drag: bool) {
     assert_eq!(app.theme.id, theme_id, "テーマが適用されている");
     add_bend_lane(&mut app);
     if select_clip {
-        app.selection.selected_automation_clips =
+        app.cur.selection.selected_automation_clips =
             vec![common::model::AutomationClipKey { track: 1, lane: 1, clip: 1 }];
     }
     let mut host: UiHost<AppData> = UiHost::no_redraw();

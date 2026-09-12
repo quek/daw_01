@@ -42,8 +42,8 @@ fn zoom_cols(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     let scene_at_mouse = f.launcher.scroll_scene + mouse_cols / col_w;
     let next_scroll = (scene_at_mouse - mouse_cols / next_w).clamp(0.0, MAX_SCROLL_SCENES);
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.ui_prefs.launcher_scene_col_w = next_w;
-        app.ui_prefs.launcher_scroll_scene = next_scroll;
+        app.cur.view.launcher_scene_col_w = next_w;
+        app.cur.view.launcher_scroll_scene = next_scroll;
     }));
 }
 
@@ -108,9 +108,9 @@ fn emit_pane_width(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
         LauncherLayout::Both
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.ui_prefs.launcher_layout = layout;
+        app.cur.view.launcher_layout = layout;
         if layout == LauncherLayout::Both {
-            app.ui_prefs.launcher_width = next;
+            app.cur.view.launcher_width = next;
         }
     }));
 }
@@ -135,7 +135,7 @@ fn emit_col_width(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     }
     let Some(next) = emit else { return };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.ui_prefs.launcher_scene_col_w = next;
+        app.cur.view.launcher_scene_col_w = next;
     }));
 }
 
@@ -175,7 +175,7 @@ fn scroll_scenes(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
         return;
     }
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.ui_prefs.launcher_scroll_scene = next;
+        app.cur.view.launcher_scroll_scene = next;
     }));
 }
 

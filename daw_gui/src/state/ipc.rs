@@ -1,18 +1,12 @@
 //! S3b-1: AppData state group (IpcState)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common::plugin_db::PluginDatabase;
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{
-    LoadedDeviceInfo, PendingClipFxBounce, PendingStateRequest, PendingVocalSynthBounce,
-};
-use crate::handler::glue::PendingGlueBake;
 use crate::dispatcher::BackgroundDispatcher;
 
 /// `(device_id, param_id)` の複合キー。 生タプルにしないのは、 positional
@@ -24,49 +18,6 @@ pub struct DeviceParamKey {
 }
 
 pub struct IpcState {
-    /// (r.md #5 ARA2) Last ARA clip-spec set sent to the plugin host per
-    /// device (v29: 安定 `device_id` keyed)。 `SetupAraDocument` is sent only
-    /// when an ARA device's track audio clips actually change — rebuilding the
-    /// ARA document deactivates/reactivates the plug-in, so it must not happen
-    /// on every song sync. Devices that disappear (removed / no longer ARA)
-    /// get `ClearAraDocument`.
-    pub(crate) ara_doc_cache: std::collections::HashMap<u64, Vec<common::protocol::AraClipSpec>>,
-    /// (v29 §2) 旧 `AraSourceSpec::Pcm` の置換: in-memory (`Generated`) audio
-    /// source を ARA に見せるために app cache へ書き出した WAV の path。
-    /// key = `AudioSourceId`。 Generated source は immutable (bounce は毎回
-    /// 新 source id) なので session 内 1 回の materialize で足りる。
-    pub(crate) ara_pcm_materialized:
-        std::collections::HashMap<common::model::AudioSourceId, PathBuf>,
-    /// Phase 4 Step C-3 (`docs/plan_automation.md` §6): plugin GUI で knob 値が
-    /// 変更されるたびに `PluginParamValueChangedFromChild` で受け取る最新値の
-    /// cache。 `(device_id, param_id) -> plain value`。 audio bridge tick
-    /// で `current_plain_value(PluginParam)` がここから plain 値を引いて
-    /// `AutomationPoint` を生成する。 session-only / Undo 対象外。 device が
-    /// 消える経路 (unload / 削除 / project 切替) で当該 entry を落とす。
-    pub plugin_param_values: std::collections::HashMap<DeviceParamKey, f64>,
-    /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
-    /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
-    /// くるたびに上書き。 安定 `device_id` で identify、 Parameter
-    /// Picker (Phase 3+) / lane の label 解決 / norm↔plain 変換に
-    /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
-    pub plugin_params: std::collections::HashMap<u64, Vec<common::protocol::PluginParamInfo>>,
-    /// device ごとに plugin が埋め込み GUI (editor window)
-    /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
-    /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
-    /// 「⚙」 でインライン param パネルをトグル。 plugin_params と同じ寿命・同じ箇所
-    /// (insert / remove / clear) で維持する。
-    pub slot_has_gui: std::collections::HashMap<u64, bool>,
-    /// `device_id` → 現在 plugin_host に load されている plugin の情報。
-    /// Undo/Redo の reconcile (`reconcile_plugins_with_song`) で「Song の各
-    /// device の plugin が host 側と一致しているか」 を device 粒度で diff する
-    /// ために使う。 track を消す前に **Song から** device を列挙して
-    /// `ClosePluginShmem` を撃つので (`plan_track_removal_ipc`)、 track → device
-    /// の帳簿は持たない (r.md #71 プラグインのコピー / 移動: device の帰属は
-    /// Song が SSoT、 複製すると移動で stale になる)。
-    ///
-    /// 更新タイミング: `SlotPluginLoaded` 受信時に insert、
-    /// `SlotPluginUnloaded` 受信時と削除系編集の `_inner` 関数内で remove。
-    pub loaded_devices: std::collections::HashMap<u64, LoadedDeviceInfo>,
     // PDC の入力となる「plugin が報告した latency」 は daw_gui では **持たない**。
     // plugin_host からの `PluginEvent::PluginLatencyChanged` を
     // `AudioCommand::SetDeviceLatency` としてそのまま engine へ中継し、
@@ -86,23 +37,7 @@ pub struct IpcState {
     // -------- Plugin database / picker --------
     pub plugin_db: Option<Arc<PluginDatabase>>,
 
-    // -------- Save flow / IPC --------
-    /// `RequestAllStates` を発行した順に保持するキュー。 front が現在 in-flight
-    /// の request、 後続は先行 request の応答後に順次 dispatch される。 空の
-    /// 間は新規 request を発行するときに即時 `RequestAllStates` を送る。
-    /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`]。
-    pub pending_state_queue: VecDeque<PendingStateRequest>,
-    /// いま in-flight な `RequestAllStates` (plugin-state round-trip) を
-    /// 送った時刻。 `dispatch_front_state_request` が送信の瞬間に `Some(now)` を立て、
-    /// `on_all_states_from_child` で応答が来たら `None` に戻す (後続 request が
-    /// あれば dispatch が再武装する)。 plugin host が crash でなく **hang** した
-    /// (プロセス・パイプは生存のまま `state_save` 等で停止) 場合は
-    /// `ChildDisconnected` も発火せず `AllStatesReceived` が永久に来ないので、
-    /// `pending_state_queue` が drain せず保存 / New / Open / Open Recent / 終了(✕)
-    /// が恒久ロックする (#63 のダーティーガードが round-trip 完了を待つため)。
-    /// `on_tick` の watchdog がこの時刻からの無応答経過を見て round-trip を破棄し、
-    /// 脱出口を作る (export watchdog と同型)。 `None` = round-trip 非進行。
-    pub(crate) state_request_sent_at: Option<std::time::Instant>,
+    // -------- IPC senders --------
     pub audio_tx: Option<UnboundedSender<AudioCommand>>,
     pub plugin_tx: Option<UnboundedSender<PluginCommand>>,
     /// 子プロセス自動再起動 supervisor (`bootstrap::ChildSupervisor`)。
@@ -120,86 +55,16 @@ pub struct IpcState {
     /// respawn→reload→再 crash の無限ループに陥り GUI が固まるのを防ぐ)。session-only。
     pub child_disconnect_log: Vec<(common::protocol::ChildKind, std::time::Instant)>,
 
-    /// Phase 2 PR-C: plugin-FX bounce が進行中なら `Some`。 `None` で
-    /// 新規 bounce を受け付ける。 同時 1 件のみ。 `AudioCommand::
-    /// BounceClipFxOnline` 発火時に `Some` 化、 `AudioEvent::
-    /// BounceClipFxComplete` 受信で `None` に戻す + 新 track / 新 clip
-    /// 配置。 path / source_track / source_clip は IPC echo back と
-    /// pending entry を identifier 照合するために保持。
-    pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
-    /// `J` (Glue) の焼き込みが進行中なら `Some` (`docs/plan_glue_bake.md`)。
-    /// clip bounce と同じ offline render を共有するので**同時には走らせない**
-    /// (どちらかが `Some` の間は新規を受け付けない)。トラックを 1 本ずつ焼き、
-    /// 最後の `BounceClipFxComplete` で song へ適用してから `None` に戻す。
-    pub pending_glue_bake: Option<PendingGlueBake>,
-    /// 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
-    /// `VocalSynthReady` を待つ間 stable id を退避し、 ready 受信で現在位置へ
-    /// 解決して `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
-    pub pending_vocal_synth_bounce: Option<PendingVocalSynthBounce>,
-    /// r.md #75: WAV 書き出し前の合成完了待ち。`PrepareVocalSynth` を送った device の
-    /// 集合で、`VocalSynthReady` で 1 つずつ減らす。空になったら `ReinitAllPlugins` へ
-    /// 進む。bounce (1 件) と違い **曲中の全 VOICEVOX device** が対象。
-    ///
-    /// 逐次 publish (フレーズ単位) にした以上、待たずに render すると **部分ミックス**を
-    /// 掴む。plugin host 側で `done_gen` を守っても、待つ人がいなければ意味がない。
-    pub pending_vocal_synth_export: std::collections::HashSet<u64>,
-    /// which device (`PluginInstance::id`) plugin editors are currently open.
-    /// The editor *windows* are now created and owned by the plugin-host process
-    /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
-    /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
-    /// it's a plain id set — the window FFI lives in the plugin-host process.
-    pub open_plugin_guis: std::collections::HashSet<u64>,
 
     // -------- Plugin load tracking (A7 race-condition fix) -----------
-    /// v29: `device_id → 要求 generation`。 `SetSlotPlugin` を送ったが
-    /// `SlotPluginLoaded` / `SlotPluginLoadFailed` がまだの device 集合。
-    /// While non-empty, Play is queued so the audio engine doesn't
-    /// dispatch silent buffers for tracks whose plugins are still being
-    /// loaded. 応答は entry の generation と一致するものだけ受理する
-    /// (A→B 連続差し替えの stale 応答 race 対策、
-    /// `docs/plan_arch_refactor.md` §7 世代 guard)。
-    pub pending_plugin_loads: std::collections::HashMap<u64, u64>,
     /// v29: `SetSlotPlugin` の要求世代 counter (AppData-wide 単調増加 =
     /// per-device 単調増加を含意)。 送信ごとに bump して
     /// `pending_plugin_loads` へ記録する。
     pub(crate) next_plugin_load_generation: u64,
-    /// `device_id → 直近の load 失敗理由`。 `SlotPluginLoadFailed` を受けた
-    /// device は plugin_host に instance が無い (= そのセッション中ずっと
-    /// 無音) 状態で song には残る。 ここに残すことでインスペクタが
-    /// 「未ロード」として可視化し、 ユーザーが明示的に再 load できる
-    /// (`AppEvent::ReloadDevice`)。 自動リトライはしない — plugin 側の
-    /// 恒常的な失敗で無限ループになるため。
-    ///
-    /// entry の寿命: `track_pending_load` (= 新しい load 要求を送る唯一の
-    /// 口) で消え、 `on_plugin_load_failed_from_child` で入る。 device が
-    /// 消える経路 (`SlotPluginUnloaded` / device 削除 / project 切替) でも
-    /// 落とす。 session-only (保存対象外)。
-    pub failed_plugin_loads: std::collections::HashMap<u64, String>,
-    /// ユーザーが plugin picker で手動追加した plugin の集合 (値 = GUI 自動 open
-    /// するか)。load 完了 (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio
-    /// へ `LoadSong` を再送して新 plugin を signal path に入れ (Shift 追加でも必須)、
-    /// (2) 値が true なら GUI 自動 open を `gui_open_requests` に queue する。
-    /// `select_plugin_from_db` と device コピー (r.md #71) が `device_id` を積む。
-    /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
-    /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
-    pub pending_added_plugin_finalize: std::collections::HashMap<u64, bool>,
-    /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
-    /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
-    /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム
-    /// 遅延させる seam (headless test は frame loop を回さない → window を作らない)。
-    pub(crate) gui_open_requests: Vec<u64>,
 
     // -------- Background workers --------
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
     pub is_rescanning: bool,
-    /// 子プロセス sync (pull 型、 docs/plan_arch_refactor.md §7.5) の世代キー。
-    /// [`AppData::flush_song_sync`] が最後に 6 段 choreography を実行したときの
-    /// `SongDoc::sync_epoch()` (= 中身が変わった世代、再生状態の変更を含む)。
-    /// runner の frame flush が `sync_epoch != last_synced_epoch` を見て 1 frame 1 回だけ LoadSong を送り、 scrub / MIDI-CC
-    /// 等の連続編集を構造的に coalesce する (旧 `pending_host_sync` flag +
-    /// `flush_pending_host_sync` 経路の置換)。 初期値 0 (SongDoc の epoch は 1 始まり
-    /// なので初回 flush が必ず走る)。 session-only。
-    pub last_synced_epoch: u64,
 
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
     /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための

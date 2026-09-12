@@ -12,6 +12,7 @@
 //! 外部 (他アプリ / 改竄) clipboard text を信用しないため、deserialize 後に
 //! 値域を sanitize する (NaN/Inf/範囲外を model に入れない)。
 
+use common::model::MediaManifest;
 use common::model::{
     AudioEvent, AutomationCurve, ClipContent, ContentId, Note, Track,
 };
@@ -47,6 +48,11 @@ pub struct ClipboardEnvelope {
     /// copy 元の `Song.project_id`。同一なら clip/track paste はリンク共有。
     pub source_project_id: u64,
     pub payload: ClipboardPayload,
+    /// `payload` の content が参照する媒体 (音源 / 映像 / 画像) の写し (パスは絶対)。
+    /// 別プロジェクトへ貼るとき `Song::import_media` で取り込む。`Time` は
+    /// `TimeRangeCopy` が自分で運ぶのでここは空。旧 JSON との互換のため serde default。
+    #[serde(default, skip_serializing_if = "MediaManifest::is_empty")]
+    pub media: MediaManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +74,106 @@ pub enum ClipboardPayload {
     /// `Clips` (選んだ行だけ、貼り先はポインタ下) と違い、貼り先は範囲選択の先頭で、
     /// 貼るときに `span_beats` の時間を差し込んでから元のトラック / レーンへ戻す。
     Time(common::model::TimeRangeCopy),
+}
+
+impl ClipboardPayload {
+    /// payload が運ぶ content (媒体の写しを組むため)。`Time` は `TimeRangeCopy` が
+    /// 自分の `media` を持つので空。
+    #[must_use]
+    pub fn clip_contents(&self) -> Vec<&ClipContent> {
+        match self {
+            ClipboardPayload::Clips(c) => c.iter().map(|cc| &cc.content).collect(),
+            ClipboardPayload::Tracks(t) => {
+                t.tracks.iter().flat_map(|tc| tc.contents.iter().map(|ce| &ce.content)).collect()
+            }
+            ClipboardPayload::LauncherCells(cells) => cells
+                .iter()
+                .filter_map(|c| match &c.cell {
+                    LauncherCellPayload::Track(cc) => Some(&cc.content),
+                    LauncherCellPayload::Lane(_) => None,
+                })
+                .collect(),
+            ClipboardPayload::Notes(_)
+            | ClipboardPayload::AutomationPoints(_)
+            | ClipboardPayload::AudioEvents(_)
+            | ClipboardPayload::AutomationClips(_)
+            | ClipboardPayload::Devices(_)
+            | ClipboardPayload::Time(_) => Vec::new(),
+        }
+    }
+}
+
+/// セル群をアレンジのクリップに写す: 行 = 相対行、同じ行のセルは左の列から順に
+/// 長さぶん右へ並べる (重ねない)。オートメーションレーンのセルは落とす。
+pub fn clips_from_cells(cells: &[LauncherCellCopy]) -> Vec<ClipCopy> {
+    let mut order: Vec<usize> = (0..cells.len()).collect();
+    order.sort_by_key(|&i| (cells[i].row_offset, cells[i].scene_offset));
+    let mut out = Vec::new();
+    let mut prev_row: Option<i64> = None;
+    let mut next_beat = 0.0_f64;
+    for i in order {
+        let LauncherCellPayload::Track(cc) = &cells[i].cell else { continue };
+        if prev_row != Some(cells[i].row_offset) {
+            prev_row = Some(cells[i].row_offset);
+            next_beat = 0.0;
+        }
+        let mut c = cc.clone();
+        c.track_offset = cells[i].row_offset;
+        c.start_beat = next_beat;
+        next_beat += c.length_beats.max(0.0);
+        out.push(c);
+    }
+    out
+}
+
+/// アレンジのクリップ群をセルの並びに写す: 行 = 元のトラック相対、列 = 同じトラック内の
+/// 開始拍順 (左から 0, 1, 2, ...)。ローンチ設定は既定。
+/// 行の無い余白へ落としたときの、各クリップの **新しいトラックの並び順**
+/// (`docs/plan_project_tabs.md` §5.6)。
+///
+/// `track_offset` の相異なる値を昇順に並べた順位。**間の空き行は詰める** —
+/// 運んできた 2 本が元のタブで離れていても、作るのは 2 本だけで、間に空の
+/// トラックは作らない (ユーザーが頼んでいないものを残さない)。
+///
+/// ゴースト (`widgets::arrangement::xfer_ghost`) と着地 (`view::capture_drop`) が
+/// この 1 本を共有する — 別々に数えると見えている行と落ちる行がずれる。
+#[must_use]
+pub fn dense_row_ranks(clips: &[ClipCopy]) -> Vec<usize> {
+    let mut rows: Vec<i64> = clips.iter().map(|c| c.track_offset).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    clips
+        .iter()
+        .map(|c| rows.iter().position(|r| *r == c.track_offset).unwrap_or(0))
+        .collect()
+}
+
+pub fn cells_from_clips(clips: &[ClipCopy]) -> Vec<LauncherCellCopy> {
+    let mut order: Vec<usize> = (0..clips.len()).collect();
+    order.sort_by(|&a, &b| {
+        (clips[a].track_offset, clips[a].start_beat)
+            .partial_cmp(&(clips[b].track_offset, clips[b].start_beat))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut out = Vec::with_capacity(clips.len());
+    let mut prev_row: Option<i64> = None;
+    let mut col: i64 = 0;
+    for i in order {
+        let c = &clips[i];
+        if prev_row == Some(c.track_offset) {
+            col += 1;
+        } else {
+            col = 0;
+            prev_row = Some(c.track_offset);
+        }
+        out.push(LauncherCellCopy {
+            row_offset: c.track_offset,
+            scene_offset: col,
+            cell: LauncherCellPayload::Track(c.clone()),
+            launch: common::model::LaunchSettings::default(),
+        });
+    }
+    out
 }
 
 /// 正規化済み device。`order` は選択群内の相対順 (上から 0,1,2...) で、貼り付けで
@@ -231,7 +337,15 @@ impl ClipboardEnvelope {
             magic: CLIPBOARD_MAGIC.to_string(),
             source_project_id,
             payload,
+            media: MediaManifest::default(),
         }
+    }
+
+    /// 媒体の写しを載せる (`AppData::envelope_with_media` が呼ぶ)。
+    #[must_use]
+    pub fn with_media(mut self, media: MediaManifest) -> Self {
+        self.media = media;
+        self
     }
 
     /// envelope を JSON 文字列へ。OS clipboard に書く。

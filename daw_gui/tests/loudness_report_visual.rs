@@ -137,12 +137,12 @@ fn render(
     }
     assert_eq!(app.ui_prefs.loudness_report_open, open);
     if open {
-        app.loudness.report = Some(finished_report());
+        app.cur.loudness.report = Some(finished_report());
         // 「測ったときの Song」= 今の Song にしておく (揃えないと窓が
         // 「もう古い」警告状態で描かれ、通常表示の regression を見られない)。
-        app.loudness.report_epoch = app.song_doc.edit_epoch();
+        app.cur.loudness.report_epoch = app.cur.song_doc.edit_epoch();
         if busy {
-            app.loudness.phase = LoudnessPhase::Running;
+            app.cur.loudness.phase = LoudnessPhase::Running;
         }
     }
 

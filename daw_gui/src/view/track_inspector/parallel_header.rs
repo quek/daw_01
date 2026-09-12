@@ -137,7 +137,7 @@ fn draw_active_field(
     popup_open: bool,
 ) {
     let Some(track_id) = app.cursor_track_id() else { return };
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let Some(parallel) = song.parallel_by_id(parallel_id) else { return };
     let n = parallel.chains.len();
     if n == 0 {
@@ -158,7 +158,7 @@ fn draw_active_field(
         ..scrub_style(&app.theme)
     };
     let m = build_mod(app, target.clone(), display, domain, track_id);
-    let was = app.recording.active_param_gestures.contains(&(track_id, target.clone()));
+    let was = app.cur.recording.active_param_gestures.contains(&(track_id, target.clone()));
     let resp = ui.scrubable_number_at(
         ("inspector_select_active", i),
         rect,
@@ -247,7 +247,7 @@ fn draw_freq_field(
     popup_open: bool,
 ) {
     let Some(track_id) = app.cursor_track_id() else { return };
-    let track = app.song_doc.song().track_by_id(track_id);
+    let track = app.cur.song_doc.song().track_by_id(track_id);
     let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge });
     let live = track.map_or(hz, |t| app.live_param_value(t, &target, hz));
     let default = match edge {
@@ -262,7 +262,7 @@ fn draw_freq_field(
         ..scrub_style(&app.theme)
     };
     let m = build_mod(app, target.clone(), f64::from(live), PLAIN_IDENT, track_id);
-    let was = app.recording.active_param_gestures.contains(&(track_id, target.clone()));
+    let was = app.cur.recording.active_param_gestures.contains(&(track_id, target.clone()));
     let key = match edge {
         SplitEdge::LowMid => "inspector_split_low",
         SplitEdge::MidHigh => "inspector_split_high",
@@ -357,11 +357,11 @@ pub(super) fn draw_parallel_begin_row(
         },
     );
     if let Some(track_id) = app.cursor_track_id() {
-        let track = app.song_doc.song().track_by_id(track_id);
+        let track = app.cur.song_doc.song().track_by_id(track_id);
         let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id });
         let live = track.map_or(out_gain, |t| app.live_param_value(t, &target, out_gain));
         right -= CHAIN_KNOB + 4.0;
-        let was = app.recording.active_param_gestures.contains(&(track_id, target.clone()));
+        let was = app.cur.recording.active_param_gestures.contains(&(track_id, target.clone()));
         let resp = ui.knob_at(
             ("inspector_parallel_out", i),
             Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
@@ -391,7 +391,7 @@ pub(super) fn draw_parallel_begin_row(
     // ここは 開閉 disclosure + 名前。
     draw_disclosure(ui, ("inspector_parallel_disclosure", i), parallel_id, open, row.x + 14.0, row, popup_open, p);
     let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
-    if let Some((id, buf)) = &app.ui_ephemeral.renaming_chain
+    if let Some((id, buf)) = &app.cur.peph.renaming_chain
         && *id == parallel_id
     {
         draw_rename_input(app, ui, ("inspector_parallel_rename", i), name_rect, buf, move |app, text| {

@@ -99,6 +99,9 @@ pub struct LoadedDeviceInfo {
     /// reconcile の device-level diff で「Song と host で同じ plugin が
     /// 居るか」 を判定するキー。
     pub plugin_id_str: String,
+    /// plugin_host が採番した instance token (`docs/plan_project_tabs.md` §1.3)。
+    /// `OpenPluginShmem` で daw_audio へ渡し、resource monitor の per-plugin μs もこれで引く。
+    pub token: common::protocol::InstanceToken,
 }
 
 /// `reconcile_plugins_with_song` の Phase B が計算する action。

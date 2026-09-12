@@ -37,12 +37,12 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
     let mut app = AppData::new(
         audio_tx, plugin_tx, None, None, ev, job, None, None, 48_000,
     );
-    app.ui_prefs.arrange_header_w = 160.0;
-    app.ui_prefs.arrange_track_row_h = 32.0;
-    app.ui_prefs.arrange_track_top = 0.0;
-    app.ui_prefs.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
+    app.cur.view.arrange_header_w = 160.0;
+    app.cur.view.arrange_track_row_h = 32.0;
+    app.cur.view.arrange_track_top = 0.0;
+    app.cur.view.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
     // 1 トラック目に「保存済みで巨大な」オートメーションレーンを 1 本生やし、展開する。
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     app.edit_song(|song| {
         let lane = AutomationLane {
             id: 1,
@@ -54,7 +54,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         };
         song.tracks[0].automation_lanes.push(lane);
     });
-    app.ui_prefs.expanded_automation_tracks.insert(track_id);
+    app.cur.view.expanded_automation_tracks.insert(track_id);
     (app, audio_rx, plugin_rx)
 }
 

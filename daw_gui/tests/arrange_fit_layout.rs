@@ -75,7 +75,7 @@ fn fill_tracks(app: &mut AppData, n: usize) -> Vec<u32> {
             });
         }
     });
-    app.song_doc.song().tracks.iter().map(|t| t.id).collect()
+    app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect()
 }
 
 /// フィット後の最下段の行の下端と、lanes 領域の下端。
@@ -130,14 +130,14 @@ fn fit_は最下段の行の下端を_lanes_の下端に合わせる() {
         app.handle_event(AppEvent::FitArrangeToContent);
         let resp = drive(&mut host, &mut app); // フィット後のレイアウト
 
-        assert_eq!(app.ui_prefs.arrange_track_top, 0.0, "fit は先頭行を上端に置く");
+        assert_eq!(app.cur.view.arrange_track_top, 0.0, "fit は先頭行を上端に置く");
         assert_eq!(
             resp.rows.len(),
             track_count + 1,
             "行は master 1 + track {track_count}",
         );
         let (content_bottom, lanes_bottom) =
-            content_bottom_and_lanes_bottom(&resp, app.ui_prefs.arrange_track_top);
+            content_bottom_and_lanes_bottom(&resp, app.cur.view.arrange_track_top);
         assert!(
             (content_bottom - lanes_bottom).abs() < 1e-3,
             "track {track_count} 本: 最下段の下端 {content_bottom} が lanes 下端 {lanes_bottom} と一致しない",
@@ -166,7 +166,7 @@ fn fit_は展開_automation_lane_があっても下端を揃える() {
         }
     });
     for id in track_ids.iter().take(2) {
-        app.ui_prefs.expanded_automation_tracks.insert(*id);
+        app.cur.view.expanded_automation_tracks.insert(*id);
     }
 
     let mut host = UiHost::no_redraw();
@@ -176,7 +176,7 @@ fn fit_は展開_automation_lane_があっても下端を揃える() {
 
     assert_eq!(resp.rows.len(), 6 + 1 + 2, "master 1 + track 6 + 展開 lane 2");
     let (content_bottom, lanes_bottom) =
-        content_bottom_and_lanes_bottom(&resp, app.ui_prefs.arrange_track_top);
+        content_bottom_and_lanes_bottom(&resp, app.cur.view.arrange_track_top);
     assert!(
         (content_bottom - lanes_bottom).abs() < 1e-3,
         "最下段の下端 {content_bottom} が lanes 下端 {lanes_bottom} と一致しない",

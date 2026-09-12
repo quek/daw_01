@@ -53,7 +53,7 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
         48_000,
     );
     // 決定的な pixel→beat 変換のため snap を無効化 (zoom 等は per-clip default = 64/14/84/0)。
-    app.ui_prefs.pianoroll_snap_enabled = false;
+    app.cur.view.pianoroll_snap_enabled = false;
     (app, audio_rx, plugin_rx)
 }
 
@@ -155,7 +155,7 @@ fn setup_clip(app: &mut AppData, track_id: u32, clip_id: u32, notes: Vec<Note>) 
     // per-clip view を **先に** 既定値で登録してから選択する。 未登録のクリップを
     // 初めて開くと `set_clip_selection` が auto-fit してズームが変わり、
     // px → 拍の換算が既定 (ZOOM) からずれる。
-    app.ui_prefs
+    app.cur.view
         .piano_roll_views
         .insert(key, common::model::PianoRollViewState::default());
     // 選択の SSoT は時間範囲 1 本 — クリップ選択はその特殊形として張り直す。
@@ -167,7 +167,7 @@ fn mk_note(pitch: u8, start: f64, len: f64, vel: u8) -> Note {
 }
 
 fn clip_notes(app: &AppData, track_id: u32, clip_id: u32) -> Vec<Note> {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let t = song.tracks.iter().find(|t| t.id == track_id).expect("track");
     let c = t.clips.iter().find(|c| c.id == clip_id).expect("clip");
     song.clip_notes(c).to_vec()
@@ -451,9 +451,9 @@ fn ruler_plain_click_seeks_playhead() {
     drive_pointer(&mut host, &mut app, press(184.0, RULER_Y, no_mods()));
     drive_pointer(&mut host, &mut app, release(184.0, RULER_Y, no_mods()));
     assert!(
-        app.transport.playhead_beat.is_some_and(|b| (b - 2.0).abs() < 1e-3),
+        app.cur.transport.playhead_beat.is_some_and(|b| (b - 2.0).abs() < 1e-3),
         "playhead が beat 2.0 へ: got {:?}",
-        app.transport.playhead_beat
+        app.cur.transport.playhead_beat
     );
 }
 
@@ -467,7 +467,7 @@ fn ruler_shift_drag_sets_loop_range() {
     drive_pointer(&mut host, &mut app, press(120.0, RULER_Y, m));
     drive_pointer(&mut host, &mut app, hold(312.0, RULER_Y, m));
     drive_pointer(&mut host, &mut app, release(312.0, RULER_Y, m));
-    let region = app.transport.loop_region;
+    let region = app.cur.transport.loop_region;
     assert!(
         (region.start_beat - 1.0).abs() < 1e-3 && (region.end_beat - 4.0).abs() < 1e-3,
         "loop 範囲 [1,4]: got [{}, {}]",

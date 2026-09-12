@@ -39,7 +39,7 @@ const PANEL_W: f32 = 320.0;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     // 何も生成していない idle フレーム (= 大多数) は track 走査せず即 return。
-    if app.voicevox.voicevox_synth_status.is_empty() && app.voicevox.lipsync_inflight.is_empty() {
+    if app.cur.pvv.voicevox_synth_status.is_empty() && app.cur.pvv.lipsync_inflight.is_empty() {
         return;
     }
     // render_frame が frame 冒頭で確定した時刻を使う (= 再描画継続判定
@@ -49,8 +49,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     let rejected = app.voicevox_rejected_detail();
     let phrases_left = app.voicevox_pending_phrase_count();
     // busy だが pending がまだ 0 件の一瞬でパネルが消えないよう、busy 判定も併用する。
-    let wav_busy = app.voicevox.voicevox_synth_status.values().any(|s| s.progress.busy);
-    let lipsync = !app.voicevox.lipsync_inflight.is_empty();
+    let wav_busy = app.cur.pvv.voicevox_synth_status.values().any(|s| s.progress.busy);
+    let lipsync = !app.cur.pvv.lipsync_inflight.is_empty();
 
     // engine 未接続 / 内容エラー (拒否された歌詞) が確定したら、進行中スピナーより
     // 警告を優先表示する。
@@ -60,7 +60,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
 
     // load_overlay (上端中央) と重ならないよう、それが出ているときは下にずらす。
     let load_active =
-        matches!(app.media.load_progress, Some((_, total)) if total > 0) || app.is_async_save_pending();
+        matches!(app.cur.media.load_progress, Some((_, total)) if total > 0) || app.is_async_save_pending();
     let base_y = if load_active { 12.0 + 54.0 } else { 12.0 };
 
     let phase = spinner_phase(now.duration_since(app.ui_ephemeral.anim_epoch), SPINNER_PERIOD);

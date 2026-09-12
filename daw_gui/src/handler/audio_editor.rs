@@ -19,23 +19,23 @@ impl AppData {
         }
         // 別 clip を開くときは前 clip の event 選択 (クリップ内 index) が stale に
         // なるので clear する (同 clip の再 open は選択を保持)。 = close / undo と同方針。
-        if self.ui_ephemeral.audio_editor_clip != Some(target) {
+        if self.cur.peph.audio_editor_clip != Some(target) {
             self.set_audio_event_selection(&[]);
         }
-        self.ui_ephemeral.audio_editor_clip = Some(target);
-        self.ui_prefs.bottom_panel = Some(1);
+        self.cur.peph.audio_editor_clip = Some(target);
+        self.cur.view.bottom_panel = Some(1);
         // per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
         // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
         let Some(key) = self.live_clip_key(target) else { return };
-        if !self.ui_prefs.audio_editor_views.contains_key(&key) {
+        if !self.cur.view.audio_editor_views.contains_key(&key) {
             // r.md #44: view は content-local 軸なので、初期 view は clip の窓
             // (`[content_offset_beats, +length_beats)`) をそのまま全体表示する。
             let (start_beat, len_beats) = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .track_by_id(target.track_id)
                 .and_then(|t| t.clip_by_id(target.clip_id))
                 .map_or((0.0, 0.0), |c| (c.content_offset_beats, c.length_beats));
-            self.ui_prefs.audio_editor_views.insert(
+            self.cur.view.audio_editor_views.insert(
                 key,
                 common::model::AudioEditorViewState {
                     start_beat,
@@ -47,14 +47,14 @@ impl AppData {
 
     pub(crate) fn close_audio_editor(&mut self) {
         // view 状態は `audio_editor_views` に残す (= 次回 open で復元)。
-        self.ui_ephemeral.audio_editor_clip = None;
+        self.cur.peph.audio_editor_clip = None;
         self.set_audio_event_selection(&[]);
-        self.ui_ephemeral.audio_editor_hover_beat_in_clip = None;
+        self.cur.peph.audio_editor_hover_beat_in_clip = None;
         // 面そのものが消えたので last-wins タグも降ろす。 残すと
         // 「閉じた audio editor の面」 を指したまま `edit_surface` が空判定で
         // 落ちるだけの死んだタグになり、 Delete が None に倒れて効かなくなる。
-        if self.selection.last_edit_select == Some(EditSurface::AudioEvents) {
-            self.selection.last_edit_select = None;
+        if self.cur.selection.last_edit_select == Some(EditSurface::AudioEvents) {
+            self.cur.selection.last_edit_select = None;
         }
     }
 
@@ -62,7 +62,7 @@ impl AppData {
     /// 詰まる編集の **直前** に退避しておき、 編集後に
     /// [`Self::reanchor_audio_editor`] へ渡す。
     pub(crate) fn audio_editor_target_key(&self) -> Option<common::model::ClipKey> {
-        self.ui_ephemeral
+        self.cur.peph
             .audio_editor_clip
             .and_then(|r| self.live_clip_key(r))
     }
@@ -77,7 +77,7 @@ impl AppData {
     /// 生きていて **まだ audio なら開いたまま**、消えた / audio でなくなった /
     /// そもそも key が取れなかったなら閉じる。
     pub(crate) fn reanchor_audio_editor(&mut self, key: Option<common::model::ClipKey>) {
-        if self.ui_ephemeral.audio_editor_clip.is_none() {
+        if self.cur.peph.audio_editor_clip.is_none() {
             return;
         }
         let Some(key) = key else {
@@ -87,10 +87,10 @@ impl AppData {
         let still_audio = self
             .clip_at(key)
             .map(|c| c.content_id)
-            .and_then(|cid| self.song_doc.song().clip_contents.get(&cid))
+            .and_then(|cid| self.cur.song_doc.song().clip_contents.get(&cid))
             .is_some_and(|c| matches!(c, common::model::ClipContent::Audio(_)));
         match self.live_clip_key(key) {
-            Some(r) if still_audio => self.ui_ephemeral.audio_editor_clip = Some(r),
+            Some(r) if still_audio => self.cur.peph.audio_editor_clip = Some(r),
             _ => self.close_audio_editor(),
         }
     }
@@ -98,12 +98,12 @@ impl AppData {
     /// Audio Editor 水平 scroll: `view_start_beat` を `[0, total - view_len]`
     /// で clamp。 `audio_editor_clip` が None / clip が解決できない場合は no-op。
     pub(crate) fn set_audio_editor_scroll(&mut self, new_start: f64) {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
+        let Some(target) = self.cur.peph.audio_editor_clip else { return };
         let Some(key) = self.live_clip_key(target) else { return };
         // r.md #44: view は content-local 軸で、clip が見せる窓
         // `[content_offset_beats, +length_beats)` に clamp する。
         let Some((min_start, total)) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| (c.content_offset_beats, c.length_beats.max(0.0)))
@@ -112,13 +112,13 @@ impl AppData {
         };
         // entry 無し = まだ全体表示 → view_len は total 扱い。
         let view_len = self
-            .ui_prefs.audio_editor_views
+            .cur.view.audio_editor_views
             .get(&key)
             .map_or(total, |v| v.len_beats)
             .max(0.0)
             .min(total);
         let max_start = min_start + (total - view_len).max(0.0);
-        self.ui_prefs.audio_editor_views.entry(key).or_default().start_beat =
+        self.cur.view.audio_editor_views.entry(key).or_default().start_beat =
             new_start.clamp(min_start, max_start);
     }
 
@@ -126,10 +126,10 @@ impl AppData {
     /// `view_len` は `[MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, clip.length]`、
     /// `view_start` は `[0, clip.length - view_len]` で clamp。
     pub(crate) fn set_audio_editor_zoom(&mut self, new_start: f64, new_len: f64) {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
+        let Some(target) = self.cur.peph.audio_editor_clip else { return };
         let Some(key) = self.live_clip_key(target) else { return };
         let Some((min_start, total)) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| (c.content_offset_beats, c.length_beats.max(0.0)))
@@ -138,7 +138,7 @@ impl AppData {
         };
         let len = new_len.clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS));
         let max_start = min_start + (total - len).max(0.0);
-        let entry = self.ui_prefs.audio_editor_views.entry(key).or_default();
+        let entry = self.cur.view.audio_editor_views.entry(key).or_default();
         entry.start_beat = new_start.clamp(min_start, max_start);
         entry.len_beats = len;
     }
@@ -151,7 +151,7 @@ impl AppData {
     /// clip.length_beats は新 event の終端を超えないように自動拡張。
     /// selection は新 event index に進む。
     pub(crate) fn duplicate_audio_editor_event(&mut self) {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(target) = self.cur.peph.audio_editor_clip else {
             return;
         };
         let Some(idx) = self.audio_editor_anchor_event() else {
@@ -194,7 +194,7 @@ impl AppData {
             return;
         };
         self.set_audio_event_selection(&[insert_at]);
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -237,7 +237,7 @@ impl AppData {
             }
             true
         });
-        if changed && self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if changed && self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -247,7 +247,7 @@ impl AppData {
     /// event_length_beats + source_start_frames を delta で連動)、
     /// `side == Right` で右端 trim (= event_length_beats +
     /// source_end_frames を連動)。 source の sample_rate で
-    /// delta_beats → frames 変換 (bpm = self.song_doc.song().bpm)。 source 境界
+    /// delta_beats → frames 変換 (bpm = self.cur.song_doc.song().bpm)。 source 境界
     /// (0..total_frames) と event_length_beats > 0 を保つ clamp 込み。
     pub(crate) fn set_audio_event_trim(
         &mut self,
@@ -256,24 +256,24 @@ impl AppData {
         side: AudioEventTrimSide,
         delta_beats: f64,
     ) {
-        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
+        let bpm = self.cur.song_doc.song().bpm.max(1.0) as f64;
         // source 情報を先に snapshot (= 後の mut borrow と分離)。
         let (sr_hz, total_frames) = {
-            let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
+            let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
                 return;
             };
             let Some(clip) = track.clip_by_id(target.clip_id) else {
                 return;
             };
             let Some(common::model::ClipContent::Audio(audio)) =
-                self.song_doc.song().clip_contents.get(&clip.content_id)
+                self.cur.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 return;
             };
             let Some(event) = audio.events.get(event_idx) else {
                 return;
             };
-            let Some(audio_source) = self.song_doc.song().media.audio_sources.get(&event.source_id) else {
+            let Some(audio_source) = self.cur.song_doc.song().media.audio_sources.get(&event.source_id) else {
                 return;
             };
             (audio_source.sample_rate as f64, audio_source.frames)
@@ -349,7 +349,7 @@ impl AppData {
             }
             true
         });
-        if changed && self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if changed && self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -370,7 +370,7 @@ impl AppData {
             return;
         }
         let project_dir: Option<PathBuf> = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
         let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
@@ -380,7 +380,7 @@ impl AppData {
                 return;
             }
         };
-        let bpm = self.song_doc.song().bpm;
+        let bpm = self.cur.song_doc.song().bpm;
         let length_beats =
             frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
         let display_name = imported.display_name.clone();
@@ -392,7 +392,7 @@ impl AppData {
         }) else {
             return;
         };
-        self.media.audio_source_cache
+        self.cur.media.audio_source_cache
             .insert(source_id, imported.buffer.clone());
 
         let position = position_in_clip_beats.max(0.0);
@@ -430,7 +430,7 @@ impl AppData {
             return;
         };
         self.set_audio_event_selection(&[new_idx]);
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
         self.ui_ephemeral.status_message = format!("Audio event 追加: {display_name}");
@@ -445,7 +445,7 @@ impl AppData {
         let deduped: Vec<usize> = indices.into_iter().filter(|i| seen.insert(*i)).collect();
         self.set_audio_event_selection(&(deduped));
         if !self.selected_audio_event_indices().is_empty() {
-            self.selection.last_edit_select = Some(EditSurface::AudioEvents);
+            self.cur.selection.last_edit_select = Some(EditSurface::AudioEvents);
         }
     }
 
@@ -453,11 +453,11 @@ impl AppData {
     /// 対応)。 高い index から `remove` して shift を回避。 削除後は
     /// selection を clear。 events が空になっても content は保持。
     pub(crate) fn delete_audio_editor_selection(&mut self) {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(target) = self.cur.peph.audio_editor_clip else {
             return;
         };
         let Some(content_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .track_by_id(target.track_id)
             .and_then(|t| t.clip_by_id(target.clip_id))
             .map(|c| c.content_id)
@@ -487,7 +487,7 @@ impl AppData {
             return;
         }
         self.set_audio_event_selection(&[]);
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+        if self.cur.peph.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -497,14 +497,14 @@ impl AppData {
     /// beats)、 既存値は上書き。 audio 以外の clip (MIDI / Vocal) と
     /// `selected_clip` がない場合は no-op。
     pub(crate) fn auto_fade_selected_clips(&mut self) {
-        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
+        let bpm = self.cur.song_doc.song().bpm.max(1.0) as f64;
         let auto_fade_beats = 0.004 * bpm / 60.0; // 4 ms 相当
         let mut applied = 0usize;
         // borrow checker: target list を先に固める。
         let targets: Vec<ClipKey> = self.selected_clip_refs();
         for target in targets {
             let Some(content_id) = self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .track_by_id(target.track_id)
                 .and_then(|t| t.clip_by_id(target.clip_id))
                 .map(|c| c.content_id)
@@ -535,7 +535,7 @@ impl AppData {
         }
         if applied > 0 {
             // edit buffer (Inspector) も追従させる。
-            if let Some(target) = self.ui_ephemeral.clip_edit_buffer_target {
+            if let Some(target) = self.cur.peph.clip_edit_buffer_target {
                 self.resync_clip_audio_event_edit_buffers(target);
             }
             self.ui_ephemeral.status_message = format!("Auto-Fade: {applied} 個のクリップに 4 ms fade を適用");
@@ -562,16 +562,16 @@ impl AppData {
     /// ユーザーが明示的に掛けたときだけ付く。
     pub(crate) fn auto_crossfade_selected_clips(&mut self) {
         // クロスフェード長 (拍)。 4 ms 相当を拍へ換算 (Auto-Fade と同じ尺度)。
-        let bpm = f64::from(self.song_doc.song().bpm.max(1.0));
+        let bpm = f64::from(self.cur.song_doc.song().bpm.max(1.0));
         let xfade_beats = (0.004 * bpm / 60.0).max(1e-4);
         // (track_id, clip_id, start, end, content_id) を集める。
         let mut entries: Vec<(u32, u32, f64, f64, common::model::ContentId)> = Vec::new();
         for target in self.selected_clip_refs() {
-            let Some(clip) = self.song_doc.song().clip_by_key(target) else {
+            let Some(clip) = self.cur.song_doc.song().clip_by_key(target) else {
                 continue;
             };
             let Some(common::model::ClipContent::Audio(_)) =
-                self.song_doc.song().clip_contents.get(&clip.content_id)
+                self.cur.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 continue;
             };
@@ -642,7 +642,7 @@ impl AppData {
                 }
             }
         });
-        if let Some(target) = self.ui_ephemeral.clip_edit_buffer_target {
+        if let Some(target) = self.cur.peph.clip_edit_buffer_target {
             self.resync_clip_audio_event_edit_buffers(target);
         }
         self.ui_ephemeral.status_message =

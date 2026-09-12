@@ -621,10 +621,10 @@ fn handle_preview_drag(
             let kind = preview_drag_target_kind(app, drag.target);
             let cur_rot = {
                 let content = app
-                    .song_doc.song()
+                    .cur.song_doc.song()
                     .track_by_id(drag.target.track_id)
                     .and_then(|t| t.clip_by_id(drag.target.clip_id))
-                    .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
+                    .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id));
                 match content {
                     Some(c) if matches!(kind, PreviewDragTargetKind::Text) => c
                         .text_events()
@@ -659,10 +659,10 @@ fn handle_preview_drag(
     // を持つ clip を見つけ、 同 idiom の現値 (x, y, w, h) を返す。
     let target = drag.target;
     let content = app
-        .song_doc.song()
+        .cur.song_doc.song()
         .track_by_id(target.track_id)
         .and_then(|t| t.clip_by_id(target.clip_id))
-        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
+        .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id));
     let kind = preview_drag_target_kind(app, target);
     let current = match content {
         Some(c) if matches!(kind, PreviewDragTargetKind::Text) => {
@@ -716,10 +716,10 @@ enum PreviewDragTargetKind {
 
 fn preview_drag_target_kind(app: &AppData, target: ClipKey) -> PreviewDragTargetKind {
     let content = app
-        .song_doc.song()
+        .cur.song_doc.song()
         .track_by_id(target.track_id)
         .and_then(|t| t.clip_by_id(target.clip_id))
-        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
+        .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id));
     match content {
         Some(common::model::ClipContent::Text(_)) => PreviewDragTargetKind::Text,
         _ => PreviewDragTargetKind::Image,
@@ -809,7 +809,7 @@ impl Runner {
         // r.md #61: WNDPROC (= `WM_QUERYENDSESSION`) は `AppData` を借用できないので、
         // 「未保存か」をここでミラーしておく (`activity.awake` と同じ idiom)。
         #[cfg(windows)]
-        crate::session_end::set_dirty(state.app.song_doc.is_dirty());
+        crate::session_end::set_dirty(state.app.any_tab_dirty());
         let keep = state.app.should_keep_rendering(now);
         state
             .app
@@ -1118,13 +1118,13 @@ impl ApplicationHandler<AppEvent> for Runner {
         let is_tick = matches!(
             event,
             AppEvent::Tick { .. }
-                | AppEvent::ModScalarsTick(_)
-                | AppEvent::TrackVoicesTick(_)
+                | AppEvent::ModScalarsTick { .. }
+                | AppEvent::TrackVoicesTick { .. }
                 | AppEvent::TrackPeaksTick { .. }
                 | AppEvent::MasterMeterTick(_)
                 | AppEvent::MetricsTick { .. }
                 | AppEvent::SystemMetricsTick { .. }
-                | AppEvent::LauncherRowsTick(_)
+                | AppEvent::LauncherRowsTick { .. }
                 | AppEvent::Sampler(crate::event_sampler::SamplerEvent::Tick(_))
         );
         let before = is_tick.then(|| state.app.tick_visual_fingerprint());
@@ -1151,7 +1151,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             // 動かす tick から来るので `changed` が立ち、再描画 = frame flush が
             // 必ず後に続く。両方で呼ぶと、ドラッグ中に frame flush と tick flush が
             // 交互に走って `LoadSong` の送信回数が増える (coalesce の意味が薄れる)。
-            state.app.flush_song_sync();
+            state.app.flush_all_song_sync();
         }
         // 背景スレッド (IPC bridge) 経由の event で、 plugin state 取得待ちの
         // 非同期保存が完了して終了シーケンスが始まることがある (= 「保存して
@@ -1520,7 +1520,8 @@ impl Runner {
         // 直前に 1 回だけ flush する。 flush_song_sync は epoch 差 (edit_epoch !=
         // last_synced_epoch) を見て変化時のみ LoadSong を送るので、 1 frame 内の複数編集
         // (scrub / MIDI-CC flood 等) は 1 回の LoadSong に構造的に coalesce される。
-        state.app.flush_song_sync();
+        // `docs/plan_project_tabs.md` §5.4: 背景タブも回す (各タブが自分の epoch を持つ)。
+        state.app.flush_all_song_sync();
 
         // (r.md #61) 「保存して終了」(同期保存) /「保存せず終了」 はこの frame の
         // `ui.frame` 内で Edit が適用されて終了シーケンスを始める。完了判定
@@ -1539,21 +1540,9 @@ impl Runner {
             Self::log_gpu_memory_periodically(state, now);
         }
 
-        // タイトル差分反映: "<*>プロジェクト名"。未保存変更があれば先頭に * を付ける。
-        // file_path 未設定 (新規未保存) は "Untitled"。 dirty は epoch 比較 O(1)
-        // (SongDoc::is_dirty) なので毎フレーム読んでよい。
-        let project_name = state
-            .app
-            .song_doc.file_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .unwrap_or("Untitled");
-        let new_title = if state.app.song_doc.is_dirty() {
-            format!("*{project_name}")
-        } else {
-            project_name.to_string()
-        };
+        // タイトル差分反映: "<*>プロジェクト名" (= アクティブなタブ)。未保存変更があれば
+        // 先頭に * を付ける。 dirty は epoch 比較 O(1) なので毎フレーム読んでよい。
+        let new_title = state.app.window_title();
         if new_title != state.last_title {
             state.window.set_title(&new_title);
             state.last_title = new_title;
@@ -1632,7 +1621,7 @@ impl Runner {
         let visible = state.app.ui_prefs.preview_window_visible;
         match (visible, state.preview.is_some()) {
             (true, false) => {
-                let initial_size = state.app.song_doc.song().video_resolution;
+                let initial_size = state.app.cur.song_doc.song().video_resolution;
                 // main window の HWND を owner として渡して preview を
                 // main の owned-window に。 Win32 仕様で owned は owner
                 // の常に前面、 owner 最小化で owned も最小化、 タスクバー
@@ -1727,13 +1716,13 @@ impl Runner {
     /// CPU staging (`image_source_bgra`) はアップロード後に捨てる (メモリ SSoT はディスク)。
     /// preview を後から開いた場合は `sync_preview_window` が再 decode を起動する。
     fn drain_image_uploads(state: &mut RunnerState) {
-        if state.app.media.pending_image_uploads.is_empty() {
+        if state.app.cur.media.pending_image_uploads.is_empty() {
             return;
         }
-        let pending: Vec<_> = std::mem::take(&mut state.app.media.pending_image_uploads);
+        let pending: Vec<_> = std::mem::take(&mut state.app.cur.media.pending_image_uploads);
         for image_source_id in pending {
             let Some((w, h, bgra)) =
-                state.app.media.image_source_bgra.remove(&image_source_id)
+                state.app.cur.media.image_source_bgra.remove(&image_source_id)
             else {
                 continue; // already uploaded (= rapid undo path)
             };
@@ -1743,7 +1732,7 @@ impl Runner {
             // (上書きするだけだと GPU 側 store に orphan が積み上がる)。
             let existing = state
                 .app
-                .ui_ephemeral
+                .cur.peph
                 .image_texture_cache
                 .get(&image_source_id)
                 .copied()
@@ -1752,14 +1741,14 @@ impl Runner {
                 Some(handle) => handle,
                 None => {
                     if let Some(old) =
-                        state.app.ui_ephemeral.image_texture_cache.remove(&image_source_id)
+                        state.app.cur.peph.image_texture_cache.remove(&image_source_id)
                     {
                         state.renderer.destroy_texture(old);
                     }
                     let handle = state.renderer.create_texture_bgra(w, h);
                     state
                         .app
-                        .ui_ephemeral
+                        .cur.peph
                         .image_texture_cache
                         .insert(image_source_id, handle);
                     handle
@@ -1787,7 +1776,7 @@ impl Runner {
         // ~41ms) so a malformed project framerate (0 / NaN) still
         // permits some decoding.
         let frame_interval_ms = {
-            let fps = state.app.song_doc.song().video_framerate.max(1.0);
+            let fps = state.app.cur.song_doc.song().video_framerate.max(1.0);
             (1000.0 / fps).round().max(33.0) as u64
         };
         let now = Instant::now();
@@ -1798,12 +1787,12 @@ impl Runner {
         }
         state.last_preview_drive_at = Some(now);
 
-        let Some(playhead_beat) = state.app.transport.playhead_beat.map(f64::from) else {
+        let Some(playhead_beat) = state.app.cur.transport.playhead_beat.map(f64::from) else {
             preview.set_track_composites(Vec::new());
             return;
         };
-        let song = state.app.song_doc.song();
-        let mods = state.app.transport.mod_plane.as_ref();
+        let song = state.app.cur.song_doc.song();
+        let mods = state.app.cur.transport.mod_plane.as_ref();
         // r.md #87: 「どの行が今なにを、どの拍で映すか」の解決器。映像 / 画像 / 字幕 /
         // グループ変換 / 映像効果が全部これを通る (書き出しは `render_video` が
         // `LauncherSidecar` から差した `RowTimeline::with_running`)。
@@ -1814,7 +1803,7 @@ impl Runner {
         let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(song, &rows);
         let project_dir = state
             .app
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
@@ -2093,16 +2082,16 @@ impl Runner {
         app: &mut AppData,
         renderer: &mut Renderer<WinitWindow>,
     ) {
-        if app.media.pending_thumbnail_uploads.is_empty() {
+        if app.cur.media.pending_thumbnail_uploads.is_empty() {
             return;
         }
-        let pending: Vec<_> = std::mem::take(&mut app.media.pending_thumbnail_uploads);
+        let pending: Vec<_> = std::mem::take(&mut app.cur.media.pending_thumbnail_uploads);
         for video_source_id in pending {
             // It's possible the source was unloaded between the
             // import and the next frame (= rapid undo path). Just
             // skip — the GPU is the source of truth and a missing
             // RGBA staging means there's nothing to upload.
-            let Some((w, h, rgba)) = app.media.video_thumbnail_rgba.remove(&video_source_id)
+            let Some((w, h, rgba)) = app.cur.media.video_thumbnail_rgba.remove(&video_source_id)
             else {
                 continue;
             };
@@ -2110,7 +2099,7 @@ impl Runner {
             // **ネイティブ解像度** (`extract_thumbnail` は downscale しない) なので
             // 4K なら 1 枚 33MB。 上書きするだけだと再 import / project 開き直しの
             // たびに GPU 側 store に orphan が積み上がる。
-            if let Some(old) = app.ui_ephemeral.video_texture_cache.remove(&video_source_id) {
+            if let Some(old) = app.cur.peph.video_texture_cache.remove(&video_source_id) {
                 renderer.destroy_texture(old);
             }
             let handle = renderer.create_texture(w, h);
@@ -2118,7 +2107,7 @@ impl Runner {
             // 同 id への再 upload では旧 handle を必ず解放する (insert で
             // 上書きすると GPU テクスチャがそのまま漏れる)。
             if let Some(old) = app
-                .ui_ephemeral
+                .cur.peph
                 .video_texture_cache
                 .insert(video_source_id, handle)
             {

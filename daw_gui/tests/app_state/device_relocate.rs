@@ -44,14 +44,14 @@ fn add_empty_track(app: &mut AppData) -> u32 {
 /// fake する。 戻り値は device_id。
 fn add_plugin(app: &mut AppData, track_id: u32, plugin_id: &str) -> u64 {
     let idx = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
         .position(|t| t.id == track_id)
         .expect("track exists");
     select_track_single(app, idx);
-    let at = app.song_doc.song().tracks[idx].devices.len() as u32;
+    let at = app.cur.song_doc.song().tracks[idx].devices.len() as u32;
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: plugin_id.into(),
@@ -87,7 +87,7 @@ fn add_plugin_param_lane(app: &mut AppData, track_id: u32, device_id: u64) -> u3
 }
 
 fn track_devices(app: &AppData, track_id: u32) -> Vec<u64> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .tracks
         .iter()
@@ -101,7 +101,7 @@ fn track_devices(app: &AppData, track_id: u32) -> Vec<u64> {
 #[test]
 fn move_between_tracks_keeps_device_id_and_carries_lane() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
     let old_lane = add_plugin_param_lane(&mut app, t0, dev);
@@ -129,14 +129,14 @@ fn move_between_tracks_keeps_device_id_and_carries_lane() {
     }));
     // plugin state の round-trip 待ちに積まれるので、応答を fake して実行させる。
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
 
     assert!(track_devices(&app, t0).is_empty(), "元トラックから消える");
     assert_eq!(track_devices(&app, t1), vec![dev], "device_id は不変のまま移る");
 
     let t0_lanes = &app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -148,7 +148,7 @@ fn move_between_tracks_keeps_device_id_and_carries_lane() {
         "PluginParam lane は元トラックに残らない (残すと永久に効かない)"
     );
     let t1_lanes = &app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -183,12 +183,12 @@ fn move_between_tracks_keeps_device_id_and_carries_lane() {
 #[test]
 fn move_across_tracks_rekeys_lane_row_override() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
     let lane = add_plugin_param_lane(&mut app, t0, dev);
     let from = AutomationLaneKey { track: t0, lane };
-    app.ui_prefs.automation_lane_row_overrides.insert(from, 123);
+    app.cur.view.automation_lane_row_overrides.insert(from, 123);
 
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
@@ -197,11 +197,11 @@ fn move_across_tracks_rekeys_lane_row_override() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
 
     let new_lane = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -216,11 +216,11 @@ fn move_across_tracks_rekeys_lane_row_override() {
         .id;
     let to = AutomationLaneKey { track: t1, lane: new_lane };
     assert!(
-        !app.ui_prefs.automation_lane_row_overrides.contains_key(&from),
+        !app.cur.view.automation_lane_row_overrides.contains_key(&from),
         "旧キーは消える"
     );
     assert_eq!(
-        app.ui_prefs.automation_lane_row_overrides.get(&to).copied(),
+        app.cur.view.automation_lane_row_overrides.get(&to).copied(),
         Some(123),
         "新キーへ写る"
     );
@@ -230,7 +230,7 @@ fn move_across_tracks_rekeys_lane_row_override() {
 #[test]
 fn move_across_tracks_drops_ara_archive() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
     let other = add_plugin(&mut app, t0, "test.delay");
@@ -247,10 +247,10 @@ fn move_across_tracks_drops_ara_archive() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     assert_eq!(track_devices(&app, t0), vec![other, dev], "同一チェーン内で並べ替わる");
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert!(
         song.plugin_by_id(dev)
             .unwrap()
@@ -267,9 +267,9 @@ fn move_across_tracks_drops_ara_archive() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let (tr, _) = daw_gui::app::find_device_by_id(song, dev).unwrap();
     assert_eq!(tr, t1);
     assert!(
@@ -286,7 +286,7 @@ fn move_across_tracks_drops_ara_archive() {
 #[test]
 fn copy_allocates_new_id_and_keeps_state() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
     add_plugin_param_lane(&mut app, t0, dev);
@@ -303,7 +303,7 @@ fn copy_allocates_new_id_and_keeps_state() {
         copy: true,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
 
     assert_eq!(track_devices(&app, t0), vec![dev], "コピー元は残る");
@@ -312,7 +312,7 @@ fn copy_allocates_new_id_and_keeps_state() {
     let new_id = copies[0];
     assert_ne!(new_id, dev, "コピーは新 id を採番する");
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert_eq!(
         song.plugin_by_id(new_id)
             .unwrap()
@@ -331,13 +331,13 @@ fn copy_allocates_new_id_and_keeps_state() {
         "automation lane は複製しない (確定方針)"
     );
     assert!(
-        app.ipc.pending_added_plugin_finalize.contains_key(&new_id),
+        app.cur.pipc.pending_added_plugin_finalize.contains_key(&new_id),
         "コピーした device は load 完了 finalize に積まれる"
     );
     let msgs = drain(&mut plugin_rx);
     assert!(
         msgs.iter().any(
-            |m| matches!(m, PluginCommand::SetSlotPlugin { device_id, .. } if *device_id == new_id)
+            |m| matches!(m, PluginCommand::SetSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. }, .. } if *device_id == new_id)
         ),
         "コピーは新 instance を host に作らせる: {msgs:?}"
     );
@@ -347,7 +347,7 @@ fn copy_allocates_new_id_and_keeps_state() {
 #[test]
 fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
     app.edit_song(|song| {
@@ -363,14 +363,14 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
         copy: true,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     let same_copy = track_devices(&app, t0)
         .into_iter()
         .find(|id| *id != dev)
         .expect("same-track copy");
     {
-        let song = app.song_doc.song();
+        let song = app.cur.song_doc.song();
         assert!(
             song.plugin_by_id(same_copy)
                 .unwrap()
@@ -388,10 +388,10 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
         copy: true,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     let cross_copy = track_devices(&app, t1)[0];
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert!(
         song.plugin_by_id(cross_copy)
             .unwrap()
@@ -405,7 +405,7 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
 #[test]
 fn move_voicevox_moves_vocal_marker() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     // builtin は plugin_db に無いので直接 Song へ入れる (picker 経由と同じ形)。
     let dev = app
@@ -431,11 +431,11 @@ fn move_voicevox_moves_vocal_marker() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
 
-    let src = app.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
-    let dst = app.song_doc.song().tracks.iter().find(|t| t.id == t1).unwrap();
+    let src = app.cur.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
+    let dst = app.cur.song_doc.song().tracks.iter().find(|t| t.id == t1).unwrap();
     assert_eq!(src.source, InstrumentSource::None, "元トラックの印は降りる");
     assert_eq!(dst.source, InstrumentSource::Vocal, "移送先に印が立つ");
 }
@@ -445,7 +445,7 @@ fn move_voicevox_moves_vocal_marker() {
 #[test]
 fn removing_one_of_two_voicevox_keeps_vocal_marker() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let (a, _b) = app
         .edit_song(|song| {
             let a = song.alloc_device_id();
@@ -468,9 +468,9 @@ fn removing_one_of_two_voicevox_keeps_vocal_marker() {
     app.handle_event(AppEvent::RemoveDevices { device_ids: vec![a] });
     // 削除は plugin state の round-trip 待ちに積まれるので、応答を fake して実行させる。
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
-    let src = app.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
+    let src = app.cur.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
     assert_eq!(src.devices.len(), 1, "1 本だけ消える");
     assert_eq!(
         src.source,
@@ -484,7 +484,7 @@ fn removing_one_of_two_voicevox_keeps_vocal_marker() {
 #[test]
 fn deleting_source_track_after_move_keeps_moved_device_loaded() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
 
@@ -495,11 +495,11 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
 
     // plan は「Song から列挙する」ので、移動した device は元トラックの plan に出ない。
-    let plan = AppData::plan_track_removal_ipc(app.song_doc.song(), &[t0]);
+    let plan = AppData::plan_track_removal_ipc(app.cur.song_doc.song(), &[t0]);
     assert!(
         plan.is_empty(),
         "移動で空になった元トラックの teardown plan は空: {plan:?}"
@@ -508,12 +508,12 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
     let _ = drain(&mut plugin_rx);
     app.handle_event(AppEvent::DeleteTracks(vec![t0]));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     let msgs = drain(&mut plugin_rx);
     assert!(
         !msgs.iter().any(
-            |m| matches!(m, PluginCommand::RemoveSlotPlugin { device_id } if *device_id == dev)
+            |m| matches!(m, PluginCommand::RemoveSlotPlugin { device: common::protocol::DeviceAddr { device_id, .. } } if *device_id == dev)
         ),
         "移動先の device は元トラック削除で teardown されない: {msgs:?}"
     );
@@ -524,7 +524,7 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
 #[test]
 fn master_chain_round_trip() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let dev = add_plugin(&mut app, t0, "test.fx");
     add_plugin_param_lane(&mut app, t0, dev);
     let master = common::model::MASTER_TRACK_ID;
@@ -536,15 +536,15 @@ fn master_chain_round_trip() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     assert_eq!(
-        app.song_doc.song().master_fx_chain.iter().map(|d| d.id()).collect::<Vec<_>>(),
+        app.cur.song_doc.song().master_fx_chain.iter().map(|d| d.id()).collect::<Vec<_>>(),
         vec![dev],
         "master へ移る"
     );
     assert_eq!(
-        app.song_doc.song().song_lanes.len(),
+        app.cur.song_doc.song().song_lanes.len(),
         1,
         "lane は song_lanes へ移る (master は song 所有)"
     );
@@ -556,13 +556,13 @@ fn master_chain_round_trip() {
         copy: false,
     }));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
-    assert!(app.song_doc.song().master_fx_chain.is_empty(), "master から戻る");
-    assert!(app.song_doc.song().song_lanes.is_empty(), "lane も戻る");
+    assert!(app.cur.song_doc.song().master_fx_chain.is_empty(), "master から戻る");
+    assert!(app.cur.song_doc.song().song_lanes.is_empty(), "lane も戻る");
     assert_eq!(track_devices(&app, t0), vec![dev], "device_id は往復しても不変");
     assert_eq!(
-        app.song_doc
+        app.cur.song_doc
             .song()
             .tracks
             .iter()
@@ -579,7 +579,7 @@ fn master_chain_round_trip() {
 #[test]
 fn paste_devices_inserts_before_selection() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let a = add_plugin(&mut app, t0, "test.fx");
     let b = add_plugin(&mut app, t0, "test.delay");
     let c = add_plugin(&mut app, t0, "test.bitcrush");
@@ -616,7 +616,7 @@ fn paste_devices_inserts_before_selection() {
 #[test]
 fn device_selection_is_scoped_to_displayed_chain() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
-    let t0 = app.song_doc.song().tracks[0].id;
+    let t0 = app.cur.song_doc.song().tracks[0].id;
     let t1 = add_empty_track(&mut app);
     let dev0 = add_plugin(&mut app, t0, "test.fx");
     let dev1 = add_plugin(&mut app, t1, "test.delay");
@@ -632,7 +632,7 @@ fn device_selection_is_scoped_to_displayed_chain() {
 
     // カーソルトラックだけ動かす (選択集合は触らない = ドラッグ途中の状態)。
     let idx1 = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -656,7 +656,7 @@ fn device_selection_is_scoped_to_displayed_chain() {
     });
     assert_eq!(app.live_device_ids(), vec![dev1]);
     assert!(
-        !app.selection.selected_device_ids.contains(&dev0),
+        !app.cur.selection.selected_device_ids.contains(&dev0),
         "異トラックの id は選択集合に残らない"
     );
 }

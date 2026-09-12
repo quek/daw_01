@@ -25,7 +25,7 @@ impl AppData {
     /// 冪等。 selection のみ更新で非 undoable。
     pub(crate) fn select_all_arrangement(&mut self, track: Option<u32>) {
         let all = self.all_tracks_selection();
-        let cur = self.selection.time.as_ref();
+        let cur = self.cur.selection.time.as_ref();
         let next = if all.is_some() && cur == all.as_ref() {
             // 既に全トラック = 最上段。 1 段目へ戻さない (冪等)。
             all
@@ -40,10 +40,10 @@ impl AppData {
         };
         // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
         // 「Ctrl+A = 範囲面を選んだ」 という意図は確定している)。
-        self.selection.last_edit_select = Some(EditSurface::TimeRange);
-        if self.selection.time.as_ref() != Some(&next) {
-            self.selection.range_anchor = Some(next.start_beat);
-            self.selection.time = Some(next);
+        self.cur.selection.last_edit_select = Some(EditSurface::TimeRange);
+        if self.cur.selection.time.as_ref() != Some(&next) {
+            self.cur.selection.range_anchor = Some(next.start_beat);
+            self.cur.selection.time = Some(next);
         }
         // 冪等 early-return より後 (既に全選択でも「アレンジの面を選んだ」は確定)。
         self.drop_cell_selection_if_arrangement();
@@ -52,7 +52,7 @@ impl AppData {
     /// 1 トラックの全行 (トラック行 + 全 automation lane) を、そのクリップの外接で
     /// 覆う範囲。 `MASTER_TRACK_ID` は song lane 行だけ。 クリップが 1 つも無ければ `None`。
     fn all_in_track_selection(&self, track_id: u32) -> Option<common::model::TimeSelection> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut lanes = Vec::new();
         if track_id == common::model::MASTER_TRACK_ID {
             lanes.extend(song.song_lanes.iter().map(|l| {
@@ -77,7 +77,7 @@ impl AppData {
     /// 全トラック行 + 全 automation lane (master の song lane も) を、全クリップの
     /// 外接で覆う範囲。 クリップが 1 つも無ければ `None`。
     fn all_tracks_selection(&self) -> Option<common::model::TimeSelection> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut lanes = Vec::new();
         for t in &song.tracks {
             lanes.push(common::model::LaneRef::Track(t.id));
@@ -103,7 +103,7 @@ impl AppData {
         &self,
         lanes: Vec<common::model::LaneRef>,
     ) -> Option<common::model::TimeSelection> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let (mut start, mut end) = (f64::INFINITY, f64::NEG_INFINITY);
         let mut cover = |s: f64, len: f64| {
             start = start.min(s);
@@ -143,13 +143,13 @@ impl AppData {
             if self.is_pianoroll_clip_locked_in(&shown, r) {
                 continue;
             }
-            let Some(track) = self.song_doc.song().track_by_id(r.track_id) else {
+            let Some(track) = self.cur.song_doc.song().track_by_id(r.track_id) else {
                 continue;
             };
             let Some(clip) = track.clip_by_id(r.clip_id) else {
                 continue;
             };
-            let n = self.song_doc.song().clip_notes(clip).len();
+            let n = self.cur.song_doc.song().clip_notes(clip).len();
             out.extend((0..n).map(|local| Self::pack_note_id(slot, local)));
         }
         out
@@ -158,16 +158,16 @@ impl AppData {
     /// Ctrl+A (オーディオエディタ): 開いている clip の全 audio event index
     /// を返す。 audio_editor_clip が無い / 非 audio なら空。
     pub fn all_audio_event_indices(&self) -> Vec<usize> {
-        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(target) = self.cur.peph.audio_editor_clip else {
             return Vec::new();
         };
-        let Some(track) = self.song_doc.song().track_by_id(target.track_id) else {
+        let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return Vec::new();
         };
         let Some(clip) = track.clip_by_id(target.clip_id) else {
             return Vec::new();
         };
-        match self.song_doc.song().clip_contents.get(&clip.content_id) {
+        match self.cur.song_doc.song().clip_contents.get(&clip.content_id) {
             Some(common::model::ClipContent::Audio(audio)) => (0..audio.events.len()).collect(),
             _ => Vec::new(),
         }
@@ -182,12 +182,12 @@ impl AppData {
         &self,
         lane: common::model::AutomationLaneKey,
     ) -> Vec<AutomationPointKeyRef> {
-        let Some(lane_ref) = self.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
+        let Some(lane_ref) = self.cur.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
             return Vec::new();
         };
         let mut out = Vec::new();
         for clip in &lane_ref.clips {
-            let n = match self.song_doc.song().clip_contents.get(&clip.content_id) {
+            let n = match self.cur.song_doc.song().clip_contents.get(&clip.content_id) {
                 Some(common::model::ClipContent::Automation(a)) => a.points.len(),
                 _ => 0,
             };
@@ -210,7 +210,7 @@ impl AppData {
         &self,
         lane: common::model::AutomationLaneKey,
     ) -> Vec<common::model::AutomationClipKey> {
-        let Some(lane_ref) = self.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
+        let Some(lane_ref) = self.cur.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
             return Vec::new();
         };
         lane_ref

@@ -173,6 +173,13 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.separator();
             event_item(m, "New", "new", AppEvent::New);
             event_item(m, "Open...", "open", AppEvent::Open);
+            // `docs/plan_project_tabs.md` §5.3: タブを閉じる (Ctrl+W)。New が「新しいタブ」。
+            event_item(
+                m,
+                "タブを閉じる",
+                "daw.tab_close",
+                AppEvent::Tab(crate::event_tabs::TabEvent::Close(app.pk())),
+            );
             m.separator();
             event_item(m, "Save", "save", AppEvent::Save);
             event_item(m, "Save As...", "save_as", AppEvent::SaveAs);

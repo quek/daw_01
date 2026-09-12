@@ -71,7 +71,7 @@ fn connect(app: &mut AppData, target: &AutomationTarget, source_id: u32) -> u32 
         target: target.clone(),
         source_id,
     });
-    app.song_doc
+    app.cur.song_doc
         .song()
         .all_mod_routings()
         .find(|r| r.source_id == source_id && &r.target == target)
@@ -126,14 +126,14 @@ fn duplicating_a_track_renumbers_routings_and_repoints_depth_refs() {
     };
     connect(&mut app, &rate, lfo_b);
     assert_eq!(
-        depth_refs(&app.song_doc.song().tracks[0]).len(),
+        depth_refs(&app.cur.song_doc.song().tracks[0]).len(),
         2,
         "前提: 深さレーン 1 本 + 深さへの変調 1 本"
     );
 
     app.handle_event(AppEvent::DuplicateTracksShared(vec![TRACK_A]));
 
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     assert_eq!(song.tracks.len(), 2, "複製されている");
     let ids: Vec<u32> = song.all_mod_routings().map(|r| r.id).collect();
     let uniq: std::collections::HashSet<u32> = ids.iter().copied().collect();
@@ -195,7 +195,7 @@ fn removing_a_device_chains_cleanup_to_depth_refs() {
     connect(&mut app, &depth, lfo_b);
     add_depth_lane(&mut app, &cutoff, lfo_a);
     assert_eq!(
-        depth_refs(&app.song_doc.song().tracks[0]).len(),
+        depth_refs(&app.cur.song_doc.song().tracks[0]).len(),
         2,
         "前提: 深さレーン 1 本 + 深さへの変調 1 本"
     );
@@ -204,10 +204,10 @@ fn removing_a_device_chains_cleanup_to_depth_refs() {
     // device があるので plugin state の round-trip 待ちに積まれる。応答を fake して
     // 実行させる (production の deferred と同じ経路)。
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
 
-    let t = &app.song_doc.song().tracks[0];
+    let t = &app.cur.song_doc.song().tracks[0];
     assert!(t.devices.is_empty(), "前提: device が消えている");
     assert!(
         t.mod_routings.is_empty(),
@@ -238,7 +238,7 @@ fn payload_with_routing(name: &str, source_id: u32) -> TracksCopy {
 }
 
 fn pasted_routings(app: &AppData, name: &str) -> Vec<ModRouting> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .tracks
         .iter()
@@ -254,11 +254,11 @@ fn pasting_across_projects_drops_modulation_it_cannot_resolve() {
     let mut app = single_track_app();
     // 貼り先が持っている、貼り元とは **無関係な** モジュレーター。
     let local = add_source(&mut app, TRACK_A);
-    let pid = app.song_doc.song().project_id;
+    let pid = app.cur.song_doc.song().project_id;
 
     // 別プロジェクト由来。payload の source_id が偶然 `local` と一致していても、
     // 貼り先のモジュレーターに勝手に結線してはいけない。
-    app.paste_tracks_at(payload_with_routing("FromOther", local), pid ^ 0xdead_beef, TRACK_A);
+    app.paste_tracks_at(payload_with_routing("FromOther", local), pid ^ 0xdead_beef, TRACK_A, &Default::default());
     assert!(
         pasted_routings(&app, "FromOther").is_empty(),
         "別プロジェクトのモジュレーターは持ち込めない (同じ id の別物に繋がない)"
@@ -266,11 +266,11 @@ fn pasting_across_projects_drops_modulation_it_cannot_resolve() {
 
     // 対照: 同一プロジェクトなら実在するので残る。ただし id は payload の値
     // (= 1) ではなく新規採番。
-    app.paste_tracks_at(payload_with_routing("FromSelf", local), pid, TRACK_A);
+    app.paste_tracks_at(payload_with_routing("FromSelf", local), pid, TRACK_A, &Default::default());
     let kept = pasted_routings(&app, "FromSelf");
     assert_eq!(kept.len(), 1, "同一プロジェクトの変調は残る: {kept:?}");
     assert_eq!(kept[0].source_id, local);
-    let ids: Vec<u32> = app.song_doc.song().all_mod_routings().map(|r| r.id).collect();
+    let ids: Vec<u32> = app.cur.song_doc.song().all_mod_routings().map(|r| r.id).collect();
     let uniq: std::collections::HashSet<u32> = ids.iter().copied().collect();
     assert_eq!(ids.len(), uniq.len(), "貼り付けた変調にも一意な id が配られる: {ids:?}");
 }
@@ -301,7 +301,7 @@ fn group_owning_a_modulator() -> (AppData, u32) {
         source_id,
     });
     assert_eq!(
-        app.song_doc.song().all_mod_routings().count(),
+        app.cur.song_doc.song().all_mod_routings().count(),
         1,
         "前提: グループ所有の LFO が子の Volume を変調している"
     );
@@ -309,7 +309,7 @@ fn group_owning_a_modulator() -> (AppData, u32) {
 }
 
 fn assert_no_orphan_modulator(app: &AppData, what: &str) {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let orphans: Vec<u32> = song
         .mod_sources
         .iter()
@@ -336,7 +336,7 @@ fn ungrouping_reaps_the_group_tracks_modulators() {
     app.handle_event(AppEvent::UngroupTracks { track_ids: vec![GROUP] });
 
     assert!(
-        app.song_doc.song().track_by_id(GROUP).is_none(),
+        app.cur.song_doc.song().track_by_id(GROUP).is_none(),
         "前提: グループトラックが消えている"
     );
     assert_no_orphan_modulator(&app, "グループ解除");
@@ -349,10 +349,10 @@ fn removing_the_last_track_reaps_its_modulators() {
     let (mut app, _source_id) = group_owning_a_modulator();
     // 末尾 = CHILD なので、先に CHILD を消してから GROUP を末尾にする。
     app.handle_event(AppEvent::RemoveLastTrack);
-    assert_eq!(app.song_doc.song().tracks.len(), 1, "前提: 子が消えて GROUP が末尾");
+    assert_eq!(app.cur.song_doc.song().tracks.len(), 1, "前提: 子が消えて GROUP が末尾");
 
     app.handle_event(AppEvent::RemoveLastTrack);
 
-    assert!(app.song_doc.song().tracks.is_empty(), "前提: 全トラックが消えている");
+    assert!(app.cur.song_doc.song().tracks.is_empty(), "前提: 全トラックが消えている");
     assert_no_orphan_modulator(&app, "末尾トラック削除");
 }

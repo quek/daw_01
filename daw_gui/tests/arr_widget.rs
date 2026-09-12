@@ -82,14 +82,14 @@ fn build_app_with_header(
         48_000,
     );
     // 決定的な pixel→beat 変換のため view 由来の ui_prefs を固定。
-    app.ui_prefs.arrange_header_w = header_w;
-    app.ui_prefs.arrange_zoom_x = ZOOM;
-    app.ui_prefs.arrange_scroll_beat = 0.0;
-    app.ui_prefs.arrange_track_row_h = ROW_H;
-    app.ui_prefs.arrange_track_top = 0.0;
-    app.ui_prefs.arrange_snap_enabled = false;
+    app.cur.view.arrange_header_w = header_w;
+    app.cur.view.arrange_zoom_x = ZOOM;
+    app.cur.view.arrange_scroll_beat = 0.0;
+    app.cur.view.arrange_track_row_h = ROW_H;
+    app.cur.view.arrange_track_top = 0.0;
+    app.cur.view.arrange_snap_enabled = false;
     // r.md #87: 帯は畳んだ状態で回す (このファイルはアレンジ側の回帰網)。
-    app.ui_prefs.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
+    app.cur.view.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
     (app, audio_rx, plugin_rx)
 }
 
@@ -189,7 +189,7 @@ fn add_section(app: &mut AppData, id: u32, start: f64, len: f64) {
 }
 
 fn section_start(app: &AppData, id: u32) -> Option<f64> {
-    app.song_doc.song().sections.iter().find(|s| s.id == id).map(|s| s.start_beat)
+    app.cur.song_doc.song().sections.iter().find(|s| s.id == id).map(|s| s.start_beat)
 }
 
 /// 帯中央 drag → 破壊的 move。dest が帯の外 (左方向) なら observable に移動する
@@ -219,7 +219,7 @@ fn section_right_edge_drag_resizes() {
     drive(&mut host, &mut app, press(256.0, SEC_Y, no_mods()));
     drive(&mut host, &mut app, hold(288.0, SEC_Y, no_mods()));
     drive(&mut host, &mut app, release(320.0, SEC_Y, no_mods())); // +64px = +1 拍
-    let s = app.song_doc.song().sections.iter().find(|s| s.id == 7).cloned();
+    let s = app.cur.song_doc.song().sections.iter().find(|s| s.id == 7).cloned();
     assert!(
         s.as_ref().is_some_and(|s| (s.start_beat - 2.0).abs() < 1e-3 && (s.len_beats - 3.0).abs() < 1e-3),
         "start 2.0 固定・len 2.0→3.0: got {s:?}"
@@ -230,12 +230,12 @@ fn section_right_edge_drag_resizes() {
 #[test]
 fn section_empty_range_drag_creates_section() {
     let (mut app, _a, _p) = build_app();
-    let before = app.song_doc.song().sections.len();
+    let before = app.cur.song_doc.song().sections.len();
     let mut host = UiHost::no_redraw();
     drive(&mut host, &mut app, press(64.0, SEC_Y, no_mods())); // beat 1.0
     drive(&mut host, &mut app, hold(200.0, SEC_Y, no_mods()));
     drive(&mut host, &mut app, release(320.0, SEC_Y, no_mods())); // beat 5.0 → len 4.0
-    let secs = &app.song_doc.song().sections;
+    let secs = &app.cur.song_doc.song().sections;
     assert_eq!(secs.len(), before + 1, "1 件作成される");
     let s = secs.last().unwrap();
     assert!((s.start_beat - 1.0).abs() < 1e-3, "start 1.0: got {}", s.start_beat);
@@ -251,14 +251,14 @@ fn section_short_click_jumps_and_selects() {
     drive(&mut host, &mut app, press(256.0, SEC_Y, no_mods()));
     drive(&mut host, &mut app, release(258.0, SEC_Y, no_mods())); // 2px < 4px = click
     assert!(
-        app.transport.playhead_beat.is_some_and(|b| (b - 2.0).abs() < 1e-3),
+        app.cur.transport.playhead_beat.is_some_and(|b| (b - 2.0).abs() < 1e-3),
         "playhead が section.start=2.0 へ: got {:?}",
-        app.transport.playhead_beat
+        app.cur.transport.playhead_beat
     );
     assert!(
-        app.selection.selected_section_ids.contains(&7),
+        app.cur.selection.selected_section_ids.contains(&7),
         "section 7 が選択される: got {:?}",
-        app.selection.selected_section_ids
+        app.cur.selection.selected_section_ids
     );
 }
 
@@ -308,7 +308,7 @@ fn add_midi_track_with_clip(app: &mut AppData, track_id: u32, clip_id: u32, star
 }
 
 fn clip_start(app: &AppData, track_id: u32, clip_id: u32) -> Option<f64> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .tracks
         .iter()
@@ -337,6 +337,38 @@ fn clip_header_drag_moves_clip() {
     );
 }
 
+/// 行の無い余白 (最終行より下) へ運んだら、**新しいトラックを作って**そこへ落ちる
+/// (Ableton Live と同じ。以前は一番下のトラックへ寄っていた)。
+/// どれだけ下まで引いても増えるのは掴んだ行のぶんだけで、undo は 1 手。
+#[test]
+fn clip_dragged_below_the_last_row_lands_on_a_new_track() {
+    let (mut app, _a, _p) = build_app();
+    add_midi_track_with_clip(&mut app, 1, 10, 2.0, 4.0);
+    let grab_y = track0_y_top() + 2.0;
+    // 最終行の下端よりさらに 3 行ぶん下 (= 完全な余白)。
+    let below = track0_y_top() + ROW_H * 4.0;
+    let mut host = UiHost::no_redraw();
+    drive(&mut host, &mut app, press(256.0, grab_y, no_mods()));
+    drive(&mut host, &mut app, hold(256.0, below, no_mods()));
+    drive(&mut host, &mut app, release(256.0, below, no_mods()));
+    {
+        let song = app.cur.song_doc.song();
+        assert_eq!(song.tracks.len(), 2, "増えるのは 1 本だけ: {:?}", song.tracks.len());
+        assert!(song.tracks[0].clips.is_empty(), "元のトラックからは離れる");
+        assert_eq!(song.tracks[1].clips.len(), 1, "新しいトラックへ落ちる");
+        assert!(
+            (song.tracks[1].clips[0].start_beat - 2.0).abs() < 1e-3,
+            "拍は動かない: {:?}",
+            song.tracks[1].clips[0].start_beat
+        );
+    }
+    // トラックを足した編集と動かした編集で 1 undo 手 (操作は 1 回の drop)。
+    app.handle_event(daw_gui::app::AppEvent::Undo);
+    let song = app.cur.song_doc.song();
+    assert_eq!(song.tracks.len(), 1, "undo 1 回で元通り");
+    assert_eq!(song.tracks[0].clips.len(), 1);
+}
+
 /// clip の **本体** を drag → 時間範囲になる (クリップは動かない)。
 #[test]
 fn clip_body_drag_makes_a_time_range() {
@@ -348,7 +380,7 @@ fn clip_body_drag_makes_a_time_range() {
     drive(&mut host, &mut app, hold(320.0, y, no_mods()));
     drive(&mut host, &mut app, release(384.0, y, no_mods()));
     assert_eq!(clip_start(&app, 1, 10), Some(2.0), "クリップは動かない");
-    let sel = app.selection.time.as_ref().expect("時間範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("時間範囲が立つ");
     assert!(
         (sel.start_beat - 4.0).abs() < 1e-3 && (sel.end_beat - 6.0).abs() < 1e-3,
         "掴んだ拍 4 〜 離した拍 6 が範囲: got {:?}",
@@ -367,7 +399,7 @@ fn clip_right_edge_drag_resizes() {
     drive(&mut host, &mut app, hold(416.0, y, no_mods()));
     drive(&mut host, &mut app, release(448.0, y, no_mods())); // +64px = +1 拍
     let len = app
-        .song_doc
+        .cur.song_doc
         .song()
         .tracks
         .iter()
@@ -699,7 +731,7 @@ fn video_clip_thumbnails_tile_across_the_visible_range() {
             }];
         }));
     });
-    app.ui_ephemeral
+    app.cur.peph
         .video_texture_cache
         .insert(1, TextureHandle::from_raw(NonZeroU32::new(9).unwrap()));
 
@@ -718,7 +750,7 @@ fn video_clip_thumbnails_tile_across_the_visible_range() {
     // 2 回目はカリング範囲が変わるので、cached 層が scroll で再構築されないと
     // タイルが古い可視域のまま残る (= viewport_key に start_beat が入っている前提の回帰)。
     for (scroll, what) in [(0.0_f32, "先頭が画面内"), (20.0, "先頭が画面外")] {
-        app.ui_prefs.arrange_scroll_beat = scroll;
+        app.cur.view.arrange_scroll_beat = scroll;
         let tiles = tiles_now(&mut host, &mut app);
         assert!(tiles.len() >= 2, "{what}: 可視域がタイルで埋まる: got {} 枚", tiles.len());
         // 全タイル同寸 (= クリップ長でも位置でも大きさが変わらない)。
@@ -772,7 +804,7 @@ fn section_drag_onto_next_band_swaps_and_lands_where_previewed() {
         })
     };
     let starts = |app: &AppData| -> Vec<(u32, f64)> {
-        app.song_doc.song().sections.iter().map(|s| (s.id, s.start_beat)).collect()
+        app.cur.song_doc.song().sections.iter().map(|s| (s.id, s.start_beat)).collect()
     };
 
     let mut host = UiHost::no_redraw();
@@ -849,7 +881,7 @@ fn section_drag_preview_shows_the_resolved_landing_position() {
     );
 
     drive(&mut host, &mut app, release(448.0, SEC_Y, no_mods()));
-    let landed = app.song_doc.song().sections.iter().find(|s| s.id == 1).map(|s| s.start_beat);
+    let landed = app.cur.song_doc.song().sections.iter().find(|s| s.id == 1).map(|s| s.start_beat);
     assert_eq!(landed, Some(4.0), "見えていた拍 4 に落ちる");
     let scene = drive_scene(&mut host, &mut app, PointerFrame::default());
     let committed = red_x(&scene).expect("確定後の帯 (赤)");
@@ -942,7 +974,7 @@ fn add_expanded_automation_lane(app: &mut AppData, track_id: u32, lane_id: u32) 
             });
         }
     });
-    app.ui_prefs.expanded_automation_tracks.insert(track_id);
+    app.cur.view.expanded_automation_tracks.insert(track_id);
 }
 
 const AUTOMATION_CONTENT_ID: ContentId = 901;
@@ -1023,7 +1055,7 @@ fn volume_band_center(scene: &Scene, row_top: f32) -> Option<(f32, f32)> {
 }
 
 fn track_volume_of(app: &AppData, id: u32) -> f32 {
-    app.song_doc.song().tracks.iter().find(|t| t.id == id).expect("track が居る").volume
+    app.cur.song_doc.song().tracks.iter().find(|t| t.id == id).expect("track が居る").volume
 }
 
 fn lane_height(app: &AppData, track_id: u32, lane_id: u32) -> Option<u16> {
@@ -1044,7 +1076,7 @@ fn lane_field<T>(
     lane_id: u32,
     f: impl Fn(&AutomationLane) -> T,
 ) -> Option<T> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .tracks
         .iter()
@@ -1055,7 +1087,7 @@ fn lane_field<T>(
 
 /// automation curve に残っている point の id 列。
 fn point_ids(app: &AppData) -> Vec<u32> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .clip_contents
         .get(&AUTOMATION_CONTENT_ID)
@@ -1066,7 +1098,7 @@ fn point_ids(app: &AppData) -> Vec<u32> {
 
 /// `id` の point の clip-local 拍。
 fn point_time(app: &AppData, id: u32) -> Option<f64> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .clip_contents
         .get(&AUTOMATION_CONTENT_ID)
@@ -1103,14 +1135,14 @@ fn header_volume_band_drag_changes_track_volume() {
 fn header_row_click_selects_track() {
     let (mut app, _a, _p) = build_app_with_header(HEADER_W);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    app.selection.selected_track_ids.clear();
+    app.cur.selection.selected_track_ids.clear();
     let mut host = UiHost::no_redraw();
     // 名前帯 / M·S·R / volume band / lane disclosure を避けた行上部の空き。
     let y = track0_y() - ROW_H * 0.4;
     let x = header_right(HEADER_W) - 8.0;
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
-    assert_eq!(app.selection.selected_track_ids, vec![1], "行 click でそのトラックが選択される");
+    assert_eq!(app.cur.selection.selected_track_ids, vec![1], "行 click でそのトラックが選択される");
 }
 
 /// r.md #71 (プラグインのコピー / 移動): **外部 drag を落とした frame の release は
@@ -1127,8 +1159,8 @@ fn header_row_click_selects_track() {
 fn header_release_during_external_drag_does_not_select_track() {
     let (mut app, _a, _p) = build_app_with_header(HEADER_W);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    app.selection.selected_track_ids.clear();
-    app.selection.last_edit_select = None;
+    app.cur.selection.selected_track_ids.clear();
+    app.cur.selection.last_edit_select = None;
     let mut host = UiHost::no_redraw();
     // 押した場所はインスペクタ側 (= この widget の外) なので press は起こさない。
     // 掴んだままヘッダの上へ来て、そこで離す。
@@ -1137,12 +1169,12 @@ fn header_release_during_external_drag_does_not_select_track() {
     drive_dragging(&mut host, &mut app, hold(x, y, no_mods()));
     drive_dragging(&mut host, &mut app, release(x, y, no_mods()));
     assert!(
-        app.selection.selected_track_ids.is_empty(),
+        app.cur.selection.selected_track_ids.is_empty(),
         "運搬の drop frame ではトラック選択を走らせない: {:?}",
-        app.selection.selected_track_ids
+        app.cur.selection.selected_track_ids
     );
     assert_eq!(
-        app.selection.last_edit_select, None,
+        app.cur.selection.last_edit_select, None,
         "last-wins タグも Tracks に倒さない (次の Delete がトラックを消さない)"
     );
 
@@ -1152,7 +1184,7 @@ fn header_release_during_external_drag_does_not_select_track() {
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![1],
         "drag していない press + release は従来どおりトラックを選択する"
     );
@@ -1163,14 +1195,14 @@ fn header_release_during_external_drag_does_not_select_track() {
 fn header_master_row_click_selects_master() {
     let (mut app, _a, _p) = build_app_with_header(HEADER_W);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    app.selection.selected_track_ids.clear();
+    app.cur.selection.selected_track_ids.clear();
     let mut host = UiHost::no_redraw();
     let y = master_row_y();
     let x = header_right(HEADER_W) - 8.0;
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert_eq!(
-        app.selection.selected_track_ids,
+        app.cur.selection.selected_track_ids,
         vec![common::model::MASTER_TRACK_ID],
         "master 行も選択対象"
     );
@@ -1180,7 +1212,7 @@ fn header_master_row_click_selects_master() {
 #[test]
 fn header_lane_disclosure_click_collapses_lanes() {
     let (mut app, _a, _p) = app_with_lane(HEADER_W);
-    assert!(app.ui_prefs.expanded_automation_tracks.contains(&1), "前提: 展開されている");
+    assert!(app.cur.view.expanded_automation_tracks.contains(&1), "前提: 展開されている");
     let mut host = UiHost::no_redraw();
     // `layout.lane_disc_rect` の位置は production が描いた `-` (展開中の disclosure) から引く
     // (右端は今はレベルメーターが占めるので座標の当て推量では届かない)。
@@ -1189,7 +1221,7 @@ fn header_lane_disclosure_click_collapses_lanes() {
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x, y, no_mods()));
     assert!(
-        !app.ui_prefs.expanded_automation_tracks.contains(&1),
+        !app.cur.view.expanded_automation_tracks.contains(&1),
         "lane disclosure の click で畳まれる"
     );
 }
@@ -1219,7 +1251,7 @@ fn lane_header_delete_icon_removes_the_lane() {
 fn popup_open_header_press_does_not_select_track() {
     let (mut app, _a, _p) = build_app_with_header(HEADER_W);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    app.selection.selected_track_ids.clear();
+    app.cur.selection.selected_track_ids.clear();
     let mut host = UiHost::no_redraw();
     let y = track0_y() - ROW_H * 0.4;
     let x = header_right(HEADER_W) - 8.0;
@@ -1236,9 +1268,9 @@ fn popup_open_header_press_does_not_select_track() {
         });
     }
     assert!(
-        app.selection.selected_track_ids.is_empty(),
+        app.cur.selection.selected_track_ids.is_empty(),
         "popup が開いているフレームの header press は選択を動かさない: {:?}",
-        app.selection.selected_track_ids
+        app.cur.selection.selected_track_ids
     );
 }
 
@@ -1278,11 +1310,11 @@ fn row_splitter_inside_clip_does_not_start_clip_drag() {
     drive(&mut host, &mut app, hold(x + 3.0 * ZOOM, y + 25.0, no_mods()));
     drive(&mut host, &mut app, release(x + 3.0 * ZOOM, y + 25.0, no_mods()));
     assert_eq!(clip_start(&app, 1, 1), start_before, "clip は動かない");
-    let row_h = app.ui_prefs.track_row_overrides.get(&1).copied().unwrap_or(0);
+    let row_h = app.cur.view.track_row_overrides.get(&1).copied().unwrap_or(0);
     assert!(
         f32::from(row_h) > ROW_H,
         "行の高さだけが伸びる: {:?}",
-        app.ui_prefs.track_row_overrides
+        app.cur.view.track_row_overrides
     );
 }
 
@@ -1302,9 +1334,9 @@ fn header_splitter_in_arranger_band_does_not_start_section_drag() {
     drive(&mut host, &mut app, release(bx + 59.0, SEC_Y, no_mods()));
     assert_eq!(section_start(&app, 1), start_before, "section は動かない");
     assert!(
-        app.ui_prefs.arrange_header_w > HEADER_W + 1.0,
+        app.cur.view.arrange_header_w > HEADER_W + 1.0,
         "header 幅だけが広がる: {}",
-        app.ui_prefs.arrange_header_w
+        app.cur.view.arrange_header_w
     );
 }
 
@@ -1314,7 +1346,7 @@ fn header_splitter_in_arranger_band_does_not_start_section_drag() {
 fn header_splitter_in_ruler_does_not_seek_playhead() {
     let (mut app, _a, _p) = build_app_with_header(HEADER_W);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    let before = app.transport.playhead_beat;
+    let before = app.cur.transport.playhead_beat;
     let mut host = UiHost::no_redraw();
     let ruler_y = 10.0;
     // hot zone は境界の左 (r.md #87)。
@@ -1322,11 +1354,11 @@ fn header_splitter_in_ruler_does_not_seek_playhead() {
     drive(&mut host, &mut app, press(bx, ruler_y, no_mods()));
     drive(&mut host, &mut app, hold(bx + 59.0, ruler_y, no_mods()));
     drive(&mut host, &mut app, release(bx + 59.0, ruler_y, no_mods()));
-    assert_eq!(app.transport.playhead_beat, before, "playhead は動かない");
+    assert_eq!(app.cur.transport.playhead_beat, before, "playhead は動かない");
     assert!(
-        app.ui_prefs.arrange_header_w > HEADER_W + 1.0,
+        app.cur.view.arrange_header_w > HEADER_W + 1.0,
         "header 幅だけが広がる: {}",
-        app.ui_prefs.arrange_header_w
+        app.cur.view.arrange_header_w
     );
 }
 
@@ -1376,7 +1408,7 @@ fn alt_click_on_point_deletes_without_resizing_the_lane() {
 #[test]
 fn drag_on_automation_clip_moves_it_instead_of_lassoing() {
     let (mut app, _a, _p) = app_with_lane(0.0);
-    app.selection.selected_automation_points.clear();
+    app.cur.selection.selected_automation_points.clear();
     let clip_rect = lane_clip_rect(&mut app);
     let mut host = UiHost::no_redraw();
     // clip [0,8) の名前帯 (上端から数 px)、point (拍 0 / 2 / 6) から離れた拍 4 付近。
@@ -1387,9 +1419,9 @@ fn drag_on_automation_clip_moves_it_instead_of_lassoing() {
     drive(&mut host, &mut app, release(x + ZOOM, y, no_mods()));
     assert_eq!(lane_clip_start(&app, 1, 1), Some(1.0), "automation clip が 1 拍ぶん動く");
     assert!(
-        app.selection.selected_automation_points.is_empty(),
+        app.cur.selection.selected_automation_points.is_empty(),
         "lasso は起動しない: {:?}",
-        app.selection.selected_automation_points
+        app.cur.selection.selected_automation_points
     );
 }
 
@@ -1406,7 +1438,7 @@ fn drag_on_automation_clip_body_makes_a_range() {
     drive(&mut host, &mut app, hold(x + ZOOM, y, no_mods()));
     drive(&mut host, &mut app, release(x + ZOOM, y, no_mods()));
     assert_eq!(lane_clip_start(&app, 1, 1), clip_before, "本体の drag では clip は動かない");
-    let sel = app.selection.time.as_ref().expect("時間範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("時間範囲が立つ");
     assert!(sel.end_beat > sel.start_beat, "幅のある範囲になる");
     assert!(
         sel.lanes.iter().any(|l| matches!(l, common::model::LaneRef::Automation(_))),
@@ -1427,7 +1459,7 @@ fn drag_on_empty_lane_zone_makes_a_time_range() {
     drive(&mut host, &mut app, press(9.0 * ZOOM, y_top, no_mods()));
     drive(&mut host, &mut app, hold(0.5 * ZOOM, y_bottom, no_mods()));
     drive(&mut host, &mut app, release(0.5 * ZOOM, y_bottom, no_mods()));
-    let sel = app.selection.time.as_ref().expect("時間範囲が立つ");
+    let sel = app.cur.selection.time.as_ref().expect("時間範囲が立つ");
     assert!(sel.end_beat > sel.start_beat, "幅のある範囲になる");
     assert!(
         sel.lanes
@@ -1538,7 +1570,7 @@ fn add_bend_lane(app: &mut AppData, values: (f64, f64), curve: AutomationCurve) 
             }];
         }
     });
-    app.ui_prefs.expanded_automation_tracks.insert(1);
+    app.cur.view.expanded_automation_tracks.insert(1);
 }
 
 fn app_with_bend_lane(
@@ -1581,7 +1613,7 @@ fn linear_segment_point(app: &mut AppData, u: f32) -> (f32, f32) {
 }
 
 fn point_curve(app: &AppData, id: u32) -> Option<AutomationCurve> {
-    app.song_doc
+    app.cur.song_doc
         .song()
         .clip_contents
         .get(&AUTOMATION_CONTENT_ID)
@@ -1594,7 +1626,7 @@ fn point_curve(app: &AppData, id: u32) -> Option<AutomationCurve> {
 /// 数式は production の `apply_curve` をそのまま呼ぶ (テストに式を写さない)。
 fn curve_value_at(app: &AppData, u: f64) -> f64 {
     let pts = app
-        .song_doc
+        .cur.song_doc
         .song()
         .clip_contents
         .get(&AUTOMATION_CONTENT_ID)
@@ -1669,7 +1701,7 @@ fn alt_drag_converts_hold_segment_to_a_curve() {
 fn alt_drag_commits_once_on_release() {
     let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
     let (gx, gy) = linear_segment_point(&mut app, 0.25);
-    let before = app.song_doc.undo_depth();
+    let before = app.cur.song_doc.undo_depth();
     let alt = modifiers(false, false, true);
     let mut host = UiHost::no_redraw();
     drive(&mut host, &mut app, press(gx, gy, alt));
@@ -1677,7 +1709,7 @@ fn alt_drag_commits_once_on_release() {
     drive(&mut host, &mut app, hold(gx, gy - 12.0, alt));
     drive(&mut host, &mut app, release(gx, gy - 12.0, alt));
     assert_eq!(
-        app.song_doc.undo_depth(),
+        app.cur.song_doc.undo_depth(),
         before + 1,
         "drag 中は commit せず、release で 1 段だけ積む"
     );
@@ -1707,13 +1739,13 @@ fn alt_click_on_the_line_without_moving_changes_nothing() {
         } else {
             p0.1 + (p1.1 - p0.1) * 0.25
         };
-        let before = app.song_doc.undo_depth();
+        let before = app.cur.song_doc.undo_depth();
         let alt = modifiers(false, false, true);
         let mut host = UiHost::no_redraw();
         drive(&mut host, &mut app, press(gx, gy, alt));
         drive(&mut host, &mut app, release(gx, gy, alt));
         assert_eq!(point_curve(&app, 2), Some(curve), "{curve:?}: curve は変わらない");
-        assert_eq!(app.song_doc.undo_depth(), before, "{curve:?}: undo も積まれない");
+        assert_eq!(app.cur.song_doc.undo_depth(), before, "{curve:?}: undo も積まれない");
     }
 }
 
@@ -1744,7 +1776,7 @@ fn alt_double_click_on_the_line_resets_to_linear() {
 #[test]
 fn alt_double_click_off_the_line_still_adds_an_unsnapped_point() {
     let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
-    app.ui_prefs.arrange_snap_enabled = true;
+    app.cur.view.arrange_snap_enabled = true;
     let clip_rect = lane_clip_rect(&mut app);
     // 線は norm 0.1 → 0.9 の直線。 clip 上端近く (norm 0.9 付近) は前半では線から遠い。
     // x はグリッドに乗らない拍を選ぶ。
@@ -1756,7 +1788,7 @@ fn alt_double_click_off_the_line_still_adds_an_unsnapped_point() {
         drive(&mut host, &mut app, p);
     }
     let times: Vec<f64> = app
-        .song_doc
+        .cur.song_doc
         .song()
         .clip_contents
         .get(&AUTOMATION_CONTENT_ID)
@@ -1776,21 +1808,21 @@ fn alt_double_click_off_the_line_still_adds_an_unsnapped_point() {
 #[test]
 fn clicking_a_point_keeps_the_automation_clip_selection() {
     let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
-    app.selection.selected_automation_clips =
+    app.cur.selection.selected_automation_clips =
         vec![common::model::AutomationClipKey { track: 1, lane: 1, clip: 1 }];
     let (p0, _p1) = point_dots(&mut app);
     let mut host = UiHost::no_redraw();
     drive(&mut host, &mut app, press(p0.0, p0.1, no_mods()));
     drive(&mut host, &mut app, release(p0.0, p0.1, no_mods()));
     assert!(
-        !app.selection.selected_automation_clips.is_empty(),
+        !app.cur.selection.selected_automation_clips.is_empty(),
         "点の click でクリップ選択は消えない: {:?}",
-        app.selection.selected_automation_clips
+        app.cur.selection.selected_automation_clips
     );
     assert!(
-        !app.selection.selected_automation_points.is_empty(),
+        !app.cur.selection.selected_automation_points.is_empty(),
         "点は選択される: {:?}",
-        app.selection.selected_automation_points
+        app.cur.selection.selected_automation_points
     );
 }
 
@@ -1798,7 +1830,7 @@ fn clicking_a_point_keeps_the_automation_clip_selection() {
 #[test]
 fn clicking_an_automation_clip_keeps_the_point_selection() {
     let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
-    app.selection.selected_automation_points = vec![daw_gui::app_types::AutomationPointKeyRef {
+    app.cur.selection.selected_automation_points = vec![daw_gui::app_types::AutomationPointKeyRef {
         track_id: 1,
         lane_id: 1,
         clip_id: 1,
@@ -1812,14 +1844,14 @@ fn clicking_an_automation_clip_keeps_the_point_selection() {
     drive(&mut host, &mut app, press(x, y, no_mods()));
     drive(&mut host, &mut app, release(x + 1.0, y, no_mods()));
     assert!(
-        !app.selection.selected_automation_clips.is_empty(),
+        !app.cur.selection.selected_automation_clips.is_empty(),
         "クリップが選択される: {:?}",
-        app.selection.selected_automation_clips
+        app.cur.selection.selected_automation_clips
     );
     assert!(
-        !app.selection.selected_automation_points.is_empty(),
+        !app.cur.selection.selected_automation_points.is_empty(),
         "クリップの click で点選択は消えない: {:?}",
-        app.selection.selected_automation_points
+        app.cur.selection.selected_automation_points
     );
 }
 
@@ -1850,7 +1882,7 @@ fn alt_drag_off_the_line_moves_the_clip_without_snapping() {
     /// 名前帯を 0.3 拍ぶん引いて、着地した clip start を返す。
     fn drag_clip(alt_on: bool) -> f64 {
         let (mut app, _a, _p) = app_with_bend_lane(0.0, (0.2, 1.8), AutomationCurve::Linear);
-        app.ui_prefs.arrange_snap_enabled = true;
+        app.cur.view.arrange_snap_enabled = true;
         let clip_rect = lane_clip_rect(&mut app);
         // 名前帯 (上端から数 px)。線は左下から右上へ上がるので左半分は線から遠い。
         let x = 2.0_f32 * ZOOM;
@@ -2078,8 +2110,8 @@ fn app_with_launcher(
     pane_w: f32,
 ) -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<PluginCommand>) {
     let (mut app, a, p) = build_app_with_header(header_w);
-    app.ui_prefs.launcher_layout = common::model::LauncherLayout::Both;
-    app.ui_prefs.launcher_width = pane_w;
+    app.cur.view.launcher_layout = common::model::LauncherLayout::Both;
+    app.cur.view.launcher_width = pane_w;
     (app, a, p)
 }
 
@@ -2183,7 +2215,7 @@ fn launcher_shift_wheel_reaches_placeholder_scenes_beyond_the_real_ones() {
 fn dragging_a_clip_into_the_launcher_pane_does_not_autoscroll_the_lanes() {
     let (mut app, _a, _p) = app_with_launcher(HEADER_W, 200.0);
     // scroll_beat > 0 で始める: 0 だと下限クランプが症状を隠す。
-    app.ui_prefs.arrange_scroll_beat = 8.0;
+    app.cur.view.arrange_scroll_beat = 8.0;
     add_midi_track_with_clip(&mut app, 1, 1, 8.0, 4.0);
     let mut host = UiHost::no_redraw();
     let r = drive_response(&mut host, &mut app, PointerFrame::default());
@@ -2198,12 +2230,12 @@ fn dragging_a_clip_into_the_launcher_pane_does_not_autoscroll_the_lanes() {
     // lanes の中で 20px 動かして drag を成立させる (端 zone には入らない)。
     let r = drive_response(&mut host, &mut app, hold(grab_x - 20.0, y, no_mods()));
     assert!(r.dragging.is_some(), "クリップの drag が始まっていない");
-    assert!((app.ui_prefs.arrange_scroll_beat - 8.0).abs() < 1e-9, "中央では動かない");
+    assert!((app.cur.view.arrange_scroll_beat - 8.0).abs() < 1e-9, "中央では動かない");
     // 正の対照: lanes の**内側**の左端 hot-zone では動く (= drag が生きていて端スクロールが効く)。
     for _ in 0..3 {
         drive(&mut host, &mut app, hold(lanes.x + 2.0, y, no_mods()));
     }
-    let after_inside = app.ui_prefs.arrange_scroll_beat;
+    let after_inside = app.cur.view.arrange_scroll_beat;
     assert!(after_inside < 8.0, "レーン内側の端で端スクロールしていない: {after_inside}");
     // 帯の上で静止 (数フレーム) → もう動かない。
     let px = pane.x + pane.w * 0.5;
@@ -2211,10 +2243,10 @@ fn dragging_a_clip_into_the_launcher_pane_does_not_autoscroll_the_lanes() {
         drive(&mut host, &mut app, hold(px, y, no_mods()));
     }
     assert!(
-        (app.ui_prefs.arrange_scroll_beat - after_inside).abs() < 1e-9,
+        (app.cur.view.arrange_scroll_beat - after_inside).abs() < 1e-9,
         "帯の上で横スクロールし続けた: {} → {}",
         after_inside,
-        app.ui_prefs.arrange_scroll_beat
+        app.cur.view.arrange_scroll_beat
     );
     drive(&mut host, &mut app, release(px, y, no_mods()));
 }
@@ -2257,7 +2289,7 @@ fn launcher_cell_play_button_reports_a_launch_intent() {
         r2.launcher.intents
     );
     assert_eq!(
-        app.song_doc.song().tracks[0].launcher,
+        app.cur.song_doc.song().tracks[0].launcher,
         common::model::RowPlayback::Arranger,
         "widget は主導権を書き換えない"
     );
@@ -2300,7 +2332,7 @@ fn launcher_empty_cell_double_click_reports_create_cell() {
         r.launcher.intents
     );
     assert!(
-        app.song_doc.song().scenes.is_empty(),
+        app.cur.song_doc.song().scenes.is_empty(),
         "widget は列を実体化しない (開いただけで `*` が立たない)"
     );
 }
@@ -2311,7 +2343,7 @@ fn launcher_empty_cell_double_click_reports_create_cell() {
 fn アレンジのクリップのダブルクリックは帯を出していてもピアノロールを開く() {
     let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
-    app.ui_prefs.bottom_panel = Some(0);
+    app.cur.view.bottom_panel = Some(0);
     let mut host = UiHost::no_redraw();
     let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
     let (_, rect) = r0.clip_rects.first().copied().expect("アレンジのクリップ rect が返る");
@@ -2324,7 +2356,7 @@ fn アレンジのクリップのダブルクリックは帯を出していて�
     ] {
         drive_response(&mut host, &mut app, p);
     }
-    assert_eq!(app.ui_prefs.bottom_panel, Some(1), "ピアノロールのタブが開く");
+    assert_eq!(app.cur.view.bottom_panel, Some(1), "ピアノロールのタブが開く");
 }
 
 /// セル (クリップ有り) のダブルクリック → `OpenCellEditor` の意図。
@@ -2335,7 +2367,7 @@ fn セルのダブルクリックは編集面を開く意図を出す() {
     let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
     add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
     add_session_cell(&mut app, 1, 9, 4.0);
-    app.ui_prefs.bottom_panel = Some(0);
+    app.cur.view.bottom_panel = Some(0);
     let mut host = UiHost::no_redraw();
     let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
     let (_, rect) = r0

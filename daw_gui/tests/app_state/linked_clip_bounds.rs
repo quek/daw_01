@@ -56,13 +56,13 @@ fn app_with_two_linked_audio_clips() -> daw_gui::app::AppData {
             Clip { id: 2, start_beat: 16.0, length_beats: 8.0, content_id: cid, ..Default::default() },
         ];
     });
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
     app
 }
 
 /// 共有 content の唯一の audio event を返す。
 fn shared_event(app: &daw_gui::app::AppData) -> AudioEvent {
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let cid = song.tracks[0].clips[0].content_id;
     match song.clip_contents.get(&cid) {
         Some(ClipContent::Audio(a)) => a.events[0].clone(),
@@ -72,7 +72,7 @@ fn shared_event(app: &daw_gui::app::AppData) -> AudioEvent {
 
 fn clip(app: &daw_gui::app::AppData, r: ClipKey) -> Clip {
     // 住所は安定 id (index ではない)。
-    app.song_doc.song().clip_by_key(r).expect("clip exists").clone()
+    app.cur.song_doc.song().clip_by_key(r).expect("clip exists").clone()
 }
 
 /// A の右端を 8 → 4 拍に縮めても、共有 content と相方 B の窓は一切変わらない。
@@ -170,14 +170,14 @@ fn left_trim_of_a_midi_clip_hides_notes_without_moving_them() {
             ..Default::default()
         }];
     });
-    app.song_doc.mark_saved();
-    let cid = app.song_doc.song().tracks[0].clips[0].content_id;
-    let before = app.song_doc.song().clip_contents.get(&cid).cloned();
+    app.cur.song_doc.mark_saved();
+    let cid = app.cur.song_doc.song().tracks[0].clips[0].content_id;
+    let before = app.cur.song_doc.song().clip_contents.get(&cid).cloned();
 
     app.handle_event(AppEvent::ResizeClip { target: A, start_beat: 2.0, length: 6.0, stretch: false });
 
     assert_eq!(
-        app.song_doc.song().clip_contents.get(&cid).cloned(),
+        app.cur.song_doc.song().clip_contents.get(&cid).cloned(),
         before,
         "MIDI の左端 trim も notes を動かさない"
     );
@@ -198,7 +198,7 @@ fn shared_duplicate_carries_the_window() {
     // そのまま [6,10) へ写る。
     app.copy_time_range(2.0, 6.0, 4.0, &[(A.track_id, A.track_id)], false);
 
-    let clips = &app.song_doc.song().tracks[0].clips;
+    let clips = &app.cur.song_doc.song().tracks[0].clips;
     assert_eq!(clips.len(), 3, "複製 clip が末尾に 1 本増える");
     let dup = &clips[2];
     assert_eq!(

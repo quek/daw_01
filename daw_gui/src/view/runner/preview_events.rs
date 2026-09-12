@@ -98,7 +98,7 @@ impl Runner {
                 state.preview_cursor = Some(cursor);
                 if let Some(drag) = state.preview_drag {
                     let size = preview.renderer.size();
-                    let project_resolution = state.app.song_doc.song().video_resolution;
+                    let project_resolution = state.app.cur.song_doc.song().video_resolution;
                     let project_box = preview_project_box(
                         (size.width as f32, size.height as f32),
                         project_resolution,
@@ -117,7 +117,7 @@ impl Runner {
                 }
                 if let Some(gdrag) = state.preview_group_drag {
                     let size = preview.renderer.size();
-                    let project_resolution = state.app.song_doc.song().video_resolution;
+                    let project_resolution = state.app.cur.song_doc.song().video_resolution;
                     handle_group_drag(
                         &self.proxy,
                         &gdrag,
@@ -144,7 +144,7 @@ impl Runner {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
                         let rotation = preview.selection_rotation_radians;
-                        let project_resolution = state.app.song_doc.song().video_resolution;
+                        let project_resolution = state.app.cur.song_doc.song().video_resolution;
                         let project_box = preview_project_box(screen, project_resolution);
                         // 選択中 clip が active visual group の子なら親 group の
                         // affine を合成（= ハンドルが立ち絵に重なる）。drag 中は
@@ -192,22 +192,22 @@ impl Runner {
                     // 深くなるので手前で組む (engine が publish していない行は
                     // `RowTimeline` が `Song.launcher` へ倒す)。
                     let running = state.app.launcher_running_rows();
-                    let beat = state.app.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
+                    let beat = state.app.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
                     let rows = RowTimeline::with_running(0.0, beat, &running);
                     if state.preview_drag.is_none()
                         && let Some(cursor) = state.preview_cursor
                         && let Some(track_id) = state.app.cursor_track_id()
-                        && let Some(track) = state.app.song_doc.song().track_by_id(track_id)
+                        && let Some(track) = state.app.cur.song_doc.song().track_by_id(track_id)
                         && let Some(transform) = crate::video_fx::resolve_track_transform(
-                            state.app.song_doc.song(),
+                            state.app.cur.song_doc.song(),
                             track,
                             &rows,
-                            state.app.transport.mod_plane.as_ref(),
+                            state.app.cur.transport.mod_plane.as_ref(),
                         )
                     {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
-                        let project_resolution = state.app.song_doc.song().video_resolution;
+                        let project_resolution = state.app.cur.song_doc.song().video_resolution;
                         let project_box = preview_project_box(screen, project_resolution);
                         if let Some(mode) = group_hit_test(&transform, project_box, cursor) {
                             let (rx, ry, _rw, _rh, _rot, px, py, _) =

@@ -96,7 +96,7 @@ pub fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
 /// click 相当)。 production は可視順を `apply_select_tracks` に渡すので、 ここでも
 /// 全トラックの id 列をそのまま可視順として渡す (折り畳み無しの test song では同じ)。
 pub fn select_track_single(app: &mut AppData, idx: usize) {
-    let visible: Vec<u32> = app.song_doc.song().tracks.iter().map(|t| t.id).collect();
+    let visible: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
     let id = visible[idx];
     app.apply_select_tracks(id, SelectModifier::Single, &visible);
 }
@@ -104,7 +104,7 @@ pub fn select_track_single(app: &mut AppData, idx: usize) {
 /// 楽器 (test.synth) を track 0 に picker 経由でロードし、plugin_host からの
 /// `SlotPluginLoaded` 応答まで fake dispatch する。
 pub fn load_instrument(app: &mut AppData) {
-    let track_id = app.song_doc.song().tracks[0].id;
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     select_track_single(app, 0);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -125,15 +125,16 @@ pub fn load_instrument(app: &mut AppData) {
 /// pending generation をそのまま返す (= production の echo と同じ)。
 /// 戻り値は device_id (以後の `ClosePluginShmem` 等の assert 用)。
 pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str) -> u64 {
-    let device_id = daw_gui::app::device_id_at(app.song_doc.song(), track_id, index)
+    let device_id = daw_gui::app::device_id_at(app.cur.song_doc.song(), track_id, index)
         .expect("fake_plugin_loaded: no device at (track_id, index)");
     let generation = app
-        .ipc.pending_plugin_loads
+        .cur.pipc.pending_plugin_loads
         .get(&device_id)
         .copied()
         .expect("fake_plugin_loaded: SetSlotPlugin was not pending for this device");
     app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoaded {
-        device_id,
+        device: app.dev(device_id),
+        token: common::protocol::InstanceToken(device_id),
         id: id.into(),
         name: id.into(),
         shmem_id: String::new(),

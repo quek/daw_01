@@ -9,8 +9,9 @@
 //!
 //! daw_audio also owns N `WorkerSyncRef`, one per audio-engine worker
 //! thread. `worker[i]` uses `worker_sync[i]` to wake `plugin_host worker[i]`
-//! (a 1:1 pair) and tell it which device to process via the shared
-//! `WorkerBridge::worker_task[i]` atomic (v29: 安定 device id, u64)。
+//! (a 1:1 pair) and tell it which instance to process via the shared
+//! `WorkerBridge::worker_task[i]` atomic ([`InstanceToken`] — device_id は
+//! project をまたいで衝突するので使わない、`docs/plan_project_tabs.md` §1.3)。
 //! Because the audio engine dispatches per **track** (and a track's chain
 //! runs serially in one audio worker), the same plugin instance is never
 //! asked to process concurrently — CLAP spec is upheld without per-plugin
@@ -76,6 +77,7 @@ use windows::Win32::{
 };
 
 use crate::process_data::ProcessData;
+use crate::protocol::InstanceToken;
 
 /// worker dispatch の done 待ちの既定 timeout (ms)。数 buffer 分 (~10-21ms/
 /// buffer) より十分大きく、GUI が「音が止まった」と感じる前に quarantine が
@@ -85,8 +87,11 @@ pub const DISPATCH_TIMEOUT_MS: u32 = 500;
 /// Owned by daw_audio. One per loaded plugin instance.
 #[derive(Clone, Copy)]
 pub struct PluginRef {
-    /// 安定 device id (`PluginInstance::id`)。
+    /// 安定 device id (`PluginInstance::id`、その project 内の名前)。
     pub device_id: u64,
+    /// plugin_host が採番した instance token (`docs/plan_project_tabs.md` §1.3)。
+    /// **worker dispatch はこれで名指しする** — device_id は project をまたいで衝突する。
+    pub token: InstanceToken,
     pub process_data: *mut ProcessData,
 }
 
@@ -143,20 +148,20 @@ unsafe impl Sync for WorkerSyncRef {}
 
 #[cfg(windows)]
 impl WorkerSyncRef {
-    /// Hand a device to the matching plugin-host worker and wait (bounded)
+    /// Hand an instance to the matching plugin-host worker and wait (bounded)
     /// until `process()` finishes. The caller must have already populated
-    /// the `ProcessData` for `device_id` (frames / events_in / buffer_in).
+    /// the `ProcessData` for that instance (frames / events_in / buffer_in).
     ///
     /// Order of operations is load-bearing:
-    ///   1. Publish `device_id` so the host worker can read it after the
+    ///   1. Publish `token` so the host worker can read it after the
     ///      wake fires (`Release`).
     ///   2. Signal the wake event.
     ///   3. Wait on the done event (auto-reset; one return = one signal),
     ///      **bounded by `timeout_ms`** — see the module-level poisoning
     ///      contract for what `TimedOut` obliges the caller to do.
-    pub fn dispatch(&self, device_id: u64, timeout_ms: u32) -> anyhow::Result<DispatchOutcome> {
+    pub fn dispatch(&self, token: InstanceToken, timeout_ms: u32) -> anyhow::Result<DispatchOutcome> {
         unsafe {
-            (*self.worker_task).store(device_id, Ordering::Release);
+            (*self.worker_task).store(token.0, Ordering::Release);
             SetEvent(self.event_wake)?;
             match WaitForSingleObject(self.event_done, timeout_ms) {
                 WAIT_OBJECT_0 => Ok(DispatchOutcome::Done),

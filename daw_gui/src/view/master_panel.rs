@@ -12,7 +12,7 @@
 //! ステレオ     ゴニオ + 位相相関 + 幅 / 左右バランス
 //! ```
 //!
-//! 表示値はすべて `app.transport.master_meter` (テレメトリスレッドの
+//! 表示値はすべて `app.cur.transport.master_meter` (テレメトリスレッドの
 //! `MasterAnalyzer` が作ったスナップショット) から読むだけで、ここでは弾道も
 //! 平滑も一切かけない (規格準拠の測定は解析器が SSoT)。
 //!
@@ -220,7 +220,7 @@ fn draw_section_header<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, sect: Rec
     // (メーターのクリック) を持つ独立した測定で、 停止中にプラグインが 0 dBFS を
     // 叩いたら点灯するのが正しい (クリップ検出は保護表示なので止めない)。 ただ
     // 「保持中」 とだけ書くとそれらまで凍っていると読めるので、 対象を明示する。
-    if i == 0 && !app.transport.master_meter.loudness_running {
+    if i == 0 && !app.cur.transport.master_meter.loudness_running {
         const HOLD: &str = "ラウドネス保持中";
         let w = ui.measure_text(HOLD, HEADER_FONT);
         let title_end = sect.x + PAD + ui.measure_text(SECTION_TITLES[i], HEADER_FONT);
@@ -294,7 +294,7 @@ fn draw_section_handle<'a>(
 // =====================================================================
 
 fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rect) {
-    let m = &app.transport.master_meter;
+    let m = &app.cur.transport.master_meter;
     let p = &app.theme.core;
     let settings = app.ui_prefs.meter_settings;
 
@@ -310,7 +310,7 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
         reference_db: Some(settings.vu_reference_dbfs),
         ..LevelMeterStyle::from_palette(p)
     };
-    let master_gain = app.song_doc.song().master_gain;
+    let master_gain = app.cur.song_doc.song().master_gain;
     let fader_db = if master_gain <= 0.0 {
         f32::NEG_INFINITY
     } else {
@@ -347,7 +347,7 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
     // `Song` に入って undo 対象になったので、これが無いと 1 回のドラッグで
     // per-frame の編集が undo 履歴を埋める。was_dragging は 1 frame 遅れで
     // 追従する (param_gesture と同じ edge 検出の連鎖)。
-    if resp.fader.dragging != app.ui_ephemeral.master_gain_dragging {
+    if resp.fader.dragging != app.cur.peph.master_gain_dragging {
         let started = resp.fader.dragging;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(if started {
@@ -422,7 +422,7 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
 
 /// M / S / I / LRA / TP の数値 + クリップ表示 + Reset。
 fn draw_loudness_readout<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
-    let m = &app.transport.master_meter;
+    let m = &app.cur.transport.master_meter;
     let p = &app.theme.core;
     let s = app.ui_prefs.meter_settings;
     let l = &m.loudness;
@@ -553,7 +553,7 @@ fn fmt_loudness(v: f32, s: MeterSettings) -> String {
 // =====================================================================
 
 fn draw_spectrum_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rect) {
-    let m = &app.transport.master_meter;
+    let m = &app.cur.transport.master_meter;
     let s = app.ui_prefs.meter_settings;
     let style = SpectrumStyle {
         floor_db: -s.spectrum_range_db,
@@ -568,14 +568,14 @@ fn draw_spectrum_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: R
 }
 
 fn draw_scope_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rect) {
-    let m = &app.transport.master_meter;
+    let m = &app.cur.transport.master_meter;
     let style = OscilloscopeStyle::from_palette(&app.theme.core);
     ui.oscilloscope("master_panel_scope", body, &m.scope, &style);
     scope_context_menu(ui, body, app.ui_prefs.meter_settings);
 }
 
 fn draw_stereo_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rect) {
-    let m = &app.transport.master_meter;
+    let m = &app.cur.transport.master_meter;
     let p = &app.theme.core;
     let s = app.ui_prefs.meter_settings;
     // 下に相関バー + 幅/バランスの数値、残りをゴニオ (正方形)。

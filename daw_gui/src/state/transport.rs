@@ -21,7 +21,7 @@ pub enum PlayFrom {
 pub struct TransportState {
     /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の
     /// toggle button で切り替え、 `AppEvent::SetMetronomeEnabled(bool)` で
-    /// 更新 → `AudioCommand::SetMetronomeEnabled(bool)` を audio に送信。
+    /// 更新 → `AudioCommand::SetMetronomeEnabled { project: self.pk(), enabled: bool }` を audio に送信。
     /// audio thread は内蔵 click 音 (sine + linear envelope decay、 accent:
     /// downbeat 880Hz / 他 440Hz) を master mix に重ねる。 起動時 default
     /// false。 session-only (project save には含めない)。

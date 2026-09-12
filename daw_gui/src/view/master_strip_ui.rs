@@ -83,7 +83,7 @@ pub fn desired_height() -> f32 {
 /// 高さが足りないときは **下のブロックから諦める** (Comp → EQ → LIM の優先順)。
 /// コンプの GR が最後まで残るのは、マスターで最初に見たいのがそれだから。
 pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
-    let strip = app.song_doc.song().master_strip;
+    let strip = app.cur.song_doc.song().master_strip;
     let mut y = rect.y;
     let mut hovered: Option<MasterSection> = None;
     let ptr = ui.pointer().pos;
@@ -113,9 +113,9 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
 
     // Q キー (= 「カーソル直下のものを無効化」) の対象面。master パネルは毎フレーム
     // 描かれるので、ここの値が古くなることはない。
-    if app.ui_ephemeral.master_hovered_section != hovered {
+    if app.cur.peph.master_hovered_section != hovered {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.master_hovered_section = hovered;
+            app.cur.peph.master_hovered_section = hovered;
         }));
     }
 }
@@ -153,7 +153,7 @@ fn draw_comp<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, strip: 
     let p = &app.theme.core;
     // ---- 針式 GR メーター ----
     let meter = Rect { h: METER_H - 2.0, ..rect };
-    let gr = app.transport.master_strip_gr.0;
+    let gr = app.cur.transport.master_strip_gr.0;
     let style = NeedleMeterStyle {
         bg: block_bg(app, strip.comp.on),
         needle: if strip.comp.on { app.theme.daw.strip_gr } else { p.text_dim },
@@ -259,7 +259,7 @@ fn draw_limiter<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, stri
     // ---- GR セグメント (1 個 = 1dB) ----
     let bar = Rect { h: LIM_BAR_H - 2.0, ..rect };
     ui.panel("master_lim_bar_bg", bar, block_bg(app, strip.limiter.on), 2.0);
-    let gr = if strip.limiter.on { app.transport.master_strip_gr.1 } else { 0.0 };
+    let gr = if strip.limiter.on { app.cur.transport.master_strip_gr.1 } else { 0.0 };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let lit = (gr.max(0.0) as usize).min(LIM_SEGMENTS);
     #[allow(clippy::cast_precision_loss)]
@@ -373,7 +373,7 @@ fn master_knob<'a>(
     rect: Rect,
     param: MasterStripParam,
 ) -> KnobReadout {
-    let strip = app.song_doc.song().master_strip;
+    let strip = app.cur.song_doc.song().master_strip;
     let plain = strip.param(param);
     let target = AutomationTarget::MasterStrip(param);
     let norm = plain_to_norm(&target, f64::from(plain));

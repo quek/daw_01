@@ -1192,13 +1192,15 @@ pub(super) fn draw_automation_selection_overlay<M: ?Sized + 'static>(
     }
 }
 
+/// 「落とすと増える行」の下敷きの濃さ (クリップより薄く、行が増えることを示すだけ)。
+pub(super) const NEW_TRACK_ROW_ALPHA: f32 = 0.12;
+
 pub(super) fn drag_preview_geometry(
     anchor: ClipDragAnchor,
     kind: ClipDragKind,
     beat_delta: f64,
     track_delta: i32,
     min_idx: usize,
-    n_tracks: usize,
     min_len: f64,
 ) -> (f64, f64, usize) {
     match kind {
@@ -1207,11 +1209,11 @@ pub(super) fn drag_preview_geometry(
             // `min_idx` = master row があれば 1 (release commit の `min_idx_i32` と
             // 同じ下限)。 揃えないと最上端で preview が master 行に ghost を描き
             // preview ≠ commit になる (review — overlay/commit 完全一致の原則)。
+            //
+            // **下側は clamp しない** — 最終行より下は「落とすと増える新しいトラックの
+            // 行」で、commit (`release.rs`) もその行へ着地させる (Ableton Live と同じ)。
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            let new_idx = (anchor.track_index as i32 + track_delta).clamp(
-                min_idx as i32,
-                ((n_tracks.saturating_sub(1)) as i32).max(min_idx as i32),
-            );
+            let new_idx = (anchor.track_index as i32 + track_delta).max(min_idx as i32);
             #[allow(clippy::cast_sign_loss)]
             let new_idx_u = new_idx.max(0) as usize;
             (new_start, anchor.len_beats, new_idx_u)
@@ -1240,7 +1242,6 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
     view: ArrangementView,
     lanes: Rect,
     style: &ArrangementStyle,
-    n_tracks: usize,
     beat_delta: f64,
     track_delta: i32,
     min_len: f64,
@@ -1279,18 +1280,30 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         visible_tracks.first().is_some_and(|t| t.id == MASTER_TRACK_ID),
     );
     for a in &nd.anchors {
-        let (start, len, new_idx) = drag_preview_geometry(
-            *a, nd.kind, beat_delta, track_delta, min_idx, n_tracks, min_len,
-        );
-        // drag_preview_geometry が n_tracks 範囲内に clamp 済なので tops から必ず取れる前提。
-        // 万一範囲外なら preview を skip (clip 描画消失だけで panic はしない、 defensive)。
-        let Some(row_top) = tops.get(new_idx).copied() else {
-            continue;
+        let (start, len, new_idx) =
+            drag_preview_geometry(*a, nd.kind, beat_delta, track_delta, min_idx, min_len);
+        // 最終行より下 (= 落とすと増える新しいトラックの行) は `tops` に無いので、
+        // 最終行の下端から行高きざみで外挿する (commit 側の着地規則と同じ数え方)。
+        let row_top = match tops.get(new_idx).copied() {
+            Some(t) => t,
+            None => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let extra = (new_idx + 1 - tops.len()) as f32;
+                tops.last().copied().unwrap_or(lanes.y) + extra * view.track_row_h
+            }
         };
         // ghost も drop 先 track の per-track 実効行高で描く (commit 後の実描画と一致)。
         let ghost_row_h = visible_tracks
             .get(new_idx)
             .map_or(view.track_row_h, |t| effective_track_row_h(t, view.track_row_h));
+        // 新しいトラックになる行は、行そのものも薄く示す (行が増えることが分かる)。
+        if new_idx >= visible_tracks.len() {
+            push_filled_rect(
+                hctx,
+                Rect { x: lanes.x, y: row_top, w: lanes.w, h: ghost_row_h - 1.0 },
+                style.clip_clone_indep_fill.with_alpha(NEW_TRACK_ROW_ALPHA),
+            );
+        }
         // 元 clip の実データ (kind / 色 / 名前 / thumbnail) を lookup (中身入りコピーの source)。
         // drag 中に clip が消える等の異常時は選択色でフォールバック (content なしの薄い枠)。
         let src = visible_tracks

@@ -15,7 +15,7 @@ impl AppData {
         // 全 song を 1 行に serialize し、 ドラッグ中は毎 frame 送られる)。 debug へ
         // 降格し、 LoadSong は track/clip 数の要約だけにする (payload は落とす)。
         match &msg {
-            AudioCommand::LoadSong(song) => {
+            AudioCommand::LoadSong { song, .. } => {
                 let clips: usize = song.tracks.iter().map(|t| t.clips.len()).sum();
                 tracing::debug!(tracks = song.tracks.len(), clips, "sending LoadSong to audio");
             }
@@ -55,7 +55,7 @@ impl AppData {
     /// `pub`: runner (frame flush) と各 handler (ensure-synced) のほか、 headless
     /// 統合テストが frame 境界を模して呼ぶ (`tests/app_state/*`)。
     pub fn flush_song_sync(&mut self) {
-        if self.song_doc.sync_epoch() == self.ipc.last_synced_epoch {
+        if self.cur.song_doc.sync_epoch() == self.cur.pipc.last_synced_epoch {
             return;
         }
         // v23 (review fix #4/#5/#6): daw_audio は各 device の役割を `ports` から
@@ -71,17 +71,17 @@ impl AppData {
         // 送れば audio side の LoadSong handler 内で project_dir が
         // 既に最新になっている。
         let project_dir: Option<PathBuf> = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        self.send_audio(AudioCommand::SetProjectDir(project_dir));
-        let song = self.song_doc.song().clone();
+        self.send_audio(AudioCommand::SetProjectDir { project: self.pk(), dir: project_dir });
+        let song = self.cur.song_doc.song().clone();
         // マスター音量は engine 側では atomic (`EngineShared.master_gain`) が live
         // 値を持つので、**送る Song から導いて**必ず一緒に届ける。ここは
         // 「Song が差し替わる」全経路 (Open / New / Undo / Redo / 復旧) が通る
         // 唯一の口なので、開いた直後に保存値が効かない取りこぼしが構造的に無い。
-        self.send_audio(AudioCommand::SetMasterGain(song.master_gain));
-        self.send_audio(AudioCommand::LoadSong(song));
+        self.send_audio(AudioCommand::SetMasterGain { project: self.pk(), gain: song.master_gain });
+        self.send_audio(AudioCommand::LoadSong { project: self.pk(), song });
         // PR-V3: vocal track が builtin VOICEVOX を instrument に持つ場合、
         // notes / bpm 変更を plugin に flush して背景 synth を trigger。
         // 既存 vocal block (= track.instrument is None の旧 project) には
@@ -95,7 +95,7 @@ impl AppData {
         // choreography 完了。 現 epoch を synced ベースラインにする
         // (resolve_default_device_ports の normalize bump も含めて吸収する
         // ため末尾で読む = 次 frame で epoch 一致 → no-op に収束)。
-        self.ipc.last_synced_epoch = self.song_doc.sync_epoch();
+        self.cur.pipc.last_synced_epoch = self.cur.song_doc.sync_epoch();
     }
 
     /// (r.md #5 ARA2) Expose each ARA-capable device's track audio clips to the
@@ -108,10 +108,10 @@ impl AppData {
             return;
         };
         let project_dir: Option<PathBuf> = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        let bpm = f64::from(self.song_doc.song().bpm).max(1.0);
+        let bpm = f64::from(self.cur.song_doc.song().bpm).max(1.0);
 
         // (v29 §2) ARA track が参照する in-memory (`Generated`) source を
         // 先に WAV へ materialize する (旧 `AraSourceSpec::Pcm` の置換)。
@@ -123,7 +123,7 @@ impl AppData {
         // 安定 device_id keyed)。
         let mut live: std::collections::HashMap<u64, Vec<common::protocol::AraClipSpec>> =
             std::collections::HashMap::new();
-        for track in &self.song_doc.song().tracks {
+        for track in &self.cur.song_doc.song().tracks {
             for device in track.plugins() {
                 if device.id == 0
                     || !db.find_by_id(&device.plugin_id).is_some_and(|entry| entry.is_ara())
@@ -165,7 +165,7 @@ impl AppData {
         let mut rebuilds: Vec<(u64, Vec<common::protocol::AraClipSpec>)> = Vec::new();
         let mut updates: Vec<(u64, Vec<common::protocol::AraRegionUpdate>)> = Vec::new();
         for (key, clips) in &live {
-            match self.ipc.ara_doc_cache.get(key) {
+            match self.cur.pipc.ara_doc_cache.get(key) {
                 Some(prev) if prev == clips => {}
                 Some(prev) if ara_same_clip_set(prev, clips) => {
                     updates.push((*key, clips.iter().map(ara_region_update_of).collect()));
@@ -174,42 +174,42 @@ impl AppData {
             }
         }
         let stale: Vec<u64> = self
-            .ipc.ara_doc_cache
+            .cur.pipc.ara_doc_cache
             .keys()
             .filter(|key| !live.contains_key(*key))
             .copied()
             .collect();
 
-        self.ipc.ara_doc_cache = live;
+        self.cur.pipc.ara_doc_cache = live;
         for (device_id, clips) in rebuilds {
             // Restore any saved ARA edits for this device alongside the rebuild.
             let archive = self
-                .song_doc
+                .cur.song_doc
                 .song()
                 .plugin_by_id(device_id)
                 .and_then(|d| d.ara_archive.as_deref().map(<[u8]>::to_vec));
             self.send_plugin(PluginCommand::SetupAraDocument {
-                device_id,
+                device: self.dev(device_id),
                 clips,
                 bpm,
-                time_sig: (self.song_doc.song().time_sig.0 as u16, self.song_doc.song().time_sig.1 as u16),
+                time_sig: (self.cur.song_doc.song().time_sig.0 as u16, self.cur.song_doc.song().time_sig.1 as u16),
                 archive,
             });
         }
         for (device_id, regions) in updates {
-            self.send_plugin(PluginCommand::UpdateAraRegions { device_id, regions });
+            self.send_plugin(PluginCommand::UpdateAraRegions { device: self.dev(device_id), regions });
         }
         for device_id in stale {
-            self.send_plugin(PluginCommand::ClearAraDocument { device_id });
+            self.send_plugin(PluginCommand::ClearAraDocument { device: self.dev(device_id) });
         }
     }
 
     /// Send `ClearAraDocument` for every cached ARA device and empty the cache.
     pub(crate) fn clear_all_ara_documents(&mut self) {
-        let stale: Vec<u64> = self.ipc.ara_doc_cache.keys().copied().collect();
-        self.ipc.ara_doc_cache.clear();
+        let stale: Vec<u64> = self.cur.pipc.ara_doc_cache.keys().copied().collect();
+        self.cur.pipc.ara_doc_cache.clear();
         for device_id in stale {
-            self.send_plugin(PluginCommand::ClearAraDocument { device_id });
+            self.send_plugin(PluginCommand::ClearAraDocument { device: self.dev(device_id) });
         }
     }
 
@@ -228,7 +228,7 @@ impl AppData {
         use common::model::{AudioSourcePath, ClipContent};
         // 対象: ARA device を持つ track の audio event が参照する Generated source。
         let mut todo: Vec<common::model::AudioSourceId> = Vec::new();
-        for track in &self.song_doc.song().tracks {
+        for track in &self.cur.song_doc.song().tracks {
             let has_ara = track
                 .plugins()
                 .any(|d| db.find_by_id(&d.plugin_id).is_some_and(|e| e.is_ara()));
@@ -237,16 +237,16 @@ impl AppData {
             }
             for clip in &track.clips {
                 let Some(ClipContent::Audio(audio)) =
-                    self.song_doc.song().clip_contents.get(&clip.content_id)
+                    self.cur.song_doc.song().clip_contents.get(&clip.content_id)
                 else {
                     continue;
                 };
                 for event in &audio.events {
-                    let Some(source) = self.song_doc.song().media.audio_sources.get(&event.source_id) else {
+                    let Some(source) = self.cur.song_doc.song().media.audio_sources.get(&event.source_id) else {
                         continue;
                     };
                     if matches!(source.path, AudioSourcePath::Generated { .. })
-                        && !self.ipc.ara_pcm_materialized.contains_key(&event.source_id)
+                        && !self.cur.pipc.ara_pcm_materialized.contains_key(&event.source_id)
                     {
                         todo.push(event.source_id);
                     }
@@ -269,7 +269,7 @@ impl AppData {
         source_id: common::model::AudioSourceId,
     ) -> anyhow::Result<()> {
         use std::hash::Hasher as _;
-        let Some(buffer) = self.media.audio_source_cache.get(source_id) else {
+        let Some(buffer) = self.cur.media.audio_source_cache.get(source_id) else {
             anyhow::bail!("generated source {source_id} has no decoded buffer in the GUI cache");
         };
         let Some(dirs) = self.ui_prefs.app_dirs.as_ref() else {
@@ -314,7 +314,7 @@ impl AppData {
             writer.finalize()?;
             tracing::info!(source_id, path = %path.display(), "ARA: materialized generated source to WAV");
         }
-        self.ipc.ara_pcm_materialized.insert(source_id, path);
+        self.cur.pipc.ara_pcm_materialized.insert(source_id, path);
         Ok(())
     }
 
@@ -331,12 +331,12 @@ impl AppData {
         use common::model::{AudioSourcePath, ClipContent};
         let mut out = Vec::new();
         for clip in &track.clips {
-            let Some(ClipContent::Audio(audio)) = self.song_doc.song().clip_contents.get(&clip.content_id)
+            let Some(ClipContent::Audio(audio)) = self.cur.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 continue;
             };
             for (event_index, event) in audio.events.iter().enumerate() {
-                let Some(source) = self.song_doc.song().media.audio_sources.get(&event.source_id) else {
+                let Some(source) = self.cur.song_doc.song().media.audio_sources.get(&event.source_id) else {
                     continue;
                 };
                 let abs = match &source.path {
@@ -350,7 +350,7 @@ impl AppData {
                     // WAV path を渡す (未 materialize = decoded buffer 無し
                     // は従来どおり skip)。
                     AudioSourcePath::Generated { .. } => {
-                        match self.ipc.ara_pcm_materialized.get(&event.source_id) {
+                        match self.cur.pipc.ara_pcm_materialized.get(&event.source_id) {
                             Some(p) => p.clone(),
                             None => continue,
                         }
@@ -409,7 +409,7 @@ impl AppData {
         // 入れない。 epoch は進む = 子プロセス sync は走り、 2 周目は
         // 解決済みで no-op に収束する)。
         let needs = {
-            let song = self.song_doc.song();
+            let song = self.cur.song_doc.song();
             song.all_plugins()
                 .any(|d| d.ports.is_unresolved() && db.find_by_id(&d.plugin_id).is_some())
         };

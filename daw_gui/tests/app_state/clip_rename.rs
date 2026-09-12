@@ -31,9 +31,9 @@ fn app_with_named_clip(name: &str) -> (daw_gui::app::AppData, ClipKey) {
         }];
     });
     // 保存済みベースライン = clean。 以後の rename が dirty 化するかを観測する。
-    app.song_doc.mark_saved();
-    assert!(!app.song_doc.is_dirty(), "fixture starts clean");
-    let track_id = app.song_doc.song().tracks[0].id;
+    app.cur.song_doc.mark_saved();
+    assert!(!app.cur.song_doc.is_dirty(), "fixture starts clean");
+    let track_id = app.cur.song_doc.song().tracks[0].id;
     (app, ClipKey { track_id, clip_id: 1 })
 }
 
@@ -44,8 +44,8 @@ fn rename(app: &mut daw_gui::app::AppData, target: ClipKey, new_name: &str) {
 }
 
 fn clip0_name(app: &daw_gui::app::AppData) -> String {
-    let cid = app.song_doc.song().tracks[0].clips[0].content_id;
-    app.song_doc.song().content_name(cid).to_string()
+    let cid = app.cur.song_doc.song().tracks[0].clips[0].content_id;
+    app.cur.song_doc.song().content_name(cid).to_string()
 }
 
 /// #12: 同じ名前に付け直しても dirty にならない。
@@ -56,7 +56,7 @@ fn rename_to_same_name_is_not_dirty() {
     rename(&mut app, target, "Verse A");
 
     assert!(
-        !app.song_doc.is_dirty(),
+        !app.cur.song_doc.is_dirty(),
         "renaming to the identical name must not mark the project dirty (r.md #12)"
     );
     assert_eq!(clip0_name(&app), "Verse A", "name unchanged");
@@ -72,7 +72,7 @@ fn commit_without_editing_is_not_dirty() {
     app.handle_event(AppEvent::BeginRenameClip(target));
     app.handle_event(AppEvent::CommitRenameClip);
 
-    assert!(!app.song_doc.is_dirty(), "no-op commit is not dirty (r.md #12)");
+    assert!(!app.cur.song_doc.is_dirty(), "no-op commit is not dirty (r.md #12)");
     assert_eq!(clip0_name(&app), "Chorus");
 }
 
@@ -83,7 +83,7 @@ fn rename_to_different_name_is_dirty() {
 
     rename(&mut app, target, "Bridge");
 
-    assert!(app.song_doc.is_dirty(), "a real rename dirties");
+    assert!(app.cur.song_doc.is_dirty(), "a real rename dirties");
     assert_eq!(clip0_name(&app), "Bridge");
 }
 
@@ -94,12 +94,12 @@ fn rename_to_empty_clears_name_and_dirties() {
 
     rename(&mut app, target, "");
 
-    assert!(app.song_doc.is_dirty(), "clearing a name is a real change (r.md #15)");
+    assert!(app.cur.song_doc.is_dirty(), "clearing a name is a real change (r.md #15)");
     assert_eq!(clip0_name(&app), "", "empty commit clears the shared name (r.md #15)");
     // 共有名 map からキー自体が消えている (空文字 sentinel を残さない)。
-    let cid = app.song_doc.song().tracks[0].clips[0].content_id;
+    let cid = app.cur.song_doc.song().tracks[0].clips[0].content_id;
     assert!(
-        !app.song_doc.song().clip_content_names.contains_key(&cid),
+        !app.cur.song_doc.song().clip_content_names.contains_key(&cid),
         "cleared name removes the map entry entirely"
     );
 }
@@ -109,13 +109,13 @@ fn rename_to_empty_clears_name_and_dirties() {
 fn empty_rename_on_already_empty_is_not_dirty() {
     let (mut app, target) = app_with_named_clip("Bridge");
     rename(&mut app, target, ""); // クリア (dirty)
-    app.song_doc.mark_saved(); // 新ベースライン = clean
+    app.cur.song_doc.mark_saved(); // 新ベースライン = clean
     assert_eq!(clip0_name(&app), "");
 
     rename(&mut app, target, ""); // 既に空 → no-op
 
     assert!(
-        !app.song_doc.is_dirty(),
+        !app.cur.song_doc.is_dirty(),
         "empty rename on an already-cleared name is a no-op (r.md #12)"
     );
 }

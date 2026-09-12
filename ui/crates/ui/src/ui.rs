@@ -2604,6 +2604,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
     }
 
+    /// `id` の retained state を捨てる (無ければ no-op)。id を **もう使わない** と分かった
+    /// 側 (daw_gui のプロジェクトタブを閉じたとき等) が呼ぶ。次に同じ id で
+    /// `widget_state` を取れば `Default` から作り直される。
+    pub fn remove_widget_state(&mut self, id: WidgetId) {
+        self.state.remove(&id);
+    }
+
     /// `WidgetId` に紐付く永続状態 (retained state) を取得 or 初期化する。
     ///
     /// immediate-mode の widget が、フレーム間で保持したい状態 (drag anchor / LOD キャッシュ /

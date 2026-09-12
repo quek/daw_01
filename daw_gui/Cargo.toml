@@ -86,6 +86,10 @@ name = "loudness_analysis_smoke"
 required-features = ["script"]
 
 [[test]]
+name = "project_tabs_smoke"
+required-features = ["script"]
+
+[[test]]
 name = "note_overlap_smoke"
 required-features = ["script"]
 

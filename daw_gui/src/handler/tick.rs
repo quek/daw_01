@@ -9,6 +9,35 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     /// `stopped` = この Tick で engine が止まったのを観測した (`playing` の落ち際)。
+    /// `AppEvent::Tick` (テレメトリスレッドが 33ms ごと、開いている全タブぶん送る)。
+    /// r.md #51: engine が所有する状態をここで観測する。
+    /// **`transport.is_playing` / `recording.live` を書くのはここだけ**
+    /// (他所で立てると engine の実状態と食い違い、Rec 単独録音で
+    /// プレイヘッド凍結・オートメーション未記録・曲末で止まらない、が一度に起きていた)。
+    /// `docs/plan_project_tabs.md`: 背景タブの slot も届くので該当タブへ配る
+    /// (タブの ▶ 表示 / 戻ったときの再生位置)。閉じたタブの分は捨てる。
+    pub(crate) fn on_transport_tick(
+        &mut self,
+        project: common::protocol::ProjectKey,
+        samples: u64,
+        preroll: u64,
+        playing: bool,
+        recording_live: bool,
+    ) {
+        self.with_project(project, |app| {
+            app.cur.transport.preroll_remaining = preroll;
+            app.cur.recording.live = recording_live;
+            let stopped = app.cur.transport.is_playing && !playing;
+            app.cur.transport.is_playing = playing;
+            app.on_tick(samples, stopped);
+            if stopped {
+                // 手動停止・曲末 auto-stop・書き出し・パニックのどれで止まっても
+                // ここへ収束する (録音セッションのクローズ)。
+                app.on_transport_stopped();
+            }
+        });
+    }
+
     pub(crate) fn on_tick(&mut self, playhead_samples: u64, stopped: bool) {
         // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
         // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
@@ -21,11 +50,11 @@ impl AppData {
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
         // 段差クリック (「ビープ」) を出さずに reverb tail / 全 plugin 状態をクリア
         // する (`Self::panic` 参照)。
-        if let Some(due) = self.transport.panic_reinit_due
+        if let Some(due) = self.cur.transport.panic_reinit_due
             && due.elapsed() >= PANIC_REINIT_DELAY
         {
-            self.transport.panic_reinit_due = None;
-            self.send_plugin(PluginCommand::ReinitAllPlugins);
+            self.cur.transport.panic_reinit_due = None;
+            self.send_plugin(PluginCommand::ReinitAllPlugins { project: None });
         }
 
         // Export watchdog: daw_audio が crash でなく hang した場合 (進捗 heartbeat も
@@ -35,14 +64,14 @@ impl AppData {
         // この閾値を超えるのは実質 hang のみ (長尺 render での誤発火は無い)。
         // VideoRender は daw_gui 内で必ず ExportFinished を返すので対象外。
         const EXPORT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
-        if matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. }))
+        if matches!(self.cur.transport.export_stage, Some(ExportStage::AudioRender { .. }))
             // r.md #75: 合成完了ゲートで待っている間は daw_audio がまだ render を
             // 始めていないので、この watchdog の対象外。待ち自体は plugin host 側の
             // 停滞判定 (SYNTH_STALL_TIMEOUT) で必ず終わる。これを入れないと、
             // キャッシュが冷たい長い曲で合成が 60 秒を超えた瞬間に
             // 「音声エンジンが応答しないため書き出しを中止しました」になる。
-            && self.ipc.pending_vocal_synth_export.is_empty()
-            && let Some(since) = self.transport.export_progress_at
+            && self.cur.pipc.pending_vocal_synth_export.is_empty()
+            && let Some(since) = self.cur.transport.export_progress_at
             && since.elapsed() > EXPORT_WATCHDOG
         {
             tracing::error!(
@@ -58,14 +87,14 @@ impl AppData {
         // ChildDisconnected は来ない) で、進捗が止まったら窓と入力 gate を解放する。
         // プラグイン再初期化待ち (`AwaitingReinit`) も対象 — plugin_host が hang して
         // `PluginsReinitDone` が来ないと、走査を始める前の段階で固まるため。
-        if self.loudness.phase.is_busy()
-            && let Some(since) = self.loudness.progress_at
+        if self.cur.loudness.phase.is_busy()
+            && let Some(since) = self.cur.loudness.progress_at
             && since.elapsed()
                 > std::time::Duration::from_secs(crate::handler::loudness::LOUDNESS_WATCHDOG_SECS)
         {
             tracing::error!(
                 elapsed_s = since.elapsed().as_secs(),
-                phase = ?self.loudness.phase,
+                phase = ?self.cur.loudness.phase,
                 "loudness analysis stalled past watchdog timeout; aborting"
             );
             // `abort_loudness_analysis` は engine へ `CancelExport` を送る。
@@ -74,7 +103,7 @@ impl AppData {
             self.abort_loudness_analysis(
                 "音声エンジンが応答しないため解析を中止しました".into(),
             );
-            self.loudness.error =
+            self.cur.loudness.error =
                 Some("音声エンジンが応答しないため解析を中止しました".into());
         }
         // plugin host が crash でなく hang した場合 (プロセス・パイプは
@@ -88,7 +117,7 @@ impl AppData {
             None
         } else {
             common::timing::playhead_to_beat(
-                Some(self.song_doc.song()),
+                Some(self.cur.song_doc.song()),
                 self.ipc.sample_rate,
                 playhead_samples,
             )
@@ -108,8 +137,8 @@ impl AppData {
         // GUI 側 playhead が権威 (ruler seek / engine respawn 後の据え置き)。 停止中の
         // Tick を無視しないと、 seek の後に IPC キューへ残っていた in-flight Tick が
         // 後着で playhead を打ち消す。
-        if (self.transport.is_playing || stopped) && next_beat != self.transport.playhead_beat {
-            self.transport.playhead_beat = next_beat;
+        if (self.cur.transport.is_playing || stopped) && next_beat != self.cur.transport.playhead_beat {
+            self.cur.transport.playhead_beat = next_beat;
         }
 
         // r.md #75: 合成中の VOICEVOX device に「いまここを再生している」を伝える。
@@ -125,18 +154,18 @@ impl AppData {
         // 直接 arrange_scroll_beat を書く (= SetArrangeScroll event を経由しない) ので
         // 自分自身で Off に落ちることはない。ドラッグ中 (`arrange_drag_active`) は一時停止
         // — 端オートスクロールと綱引きにならないため。離せばそのまま追従が続く。
-        if self.transport.is_playing
-            && !self.ui_ephemeral.arrange_drag_active
-            && let Some(ph) = self.transport.playhead_beat
+        if self.cur.transport.is_playing
+            && !self.cur.peph.arrange_drag_active
+            && let Some(ph) = self.cur.transport.playhead_beat
         {
-            let visible_beats = self.ui_ephemeral.last_arrange_lanes_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);
+            let visible_beats = self.cur.peph.last_arrange_lanes_size.0 / self.cur.view.arrange_zoom_x.max(1.0);
             if let Some(new_scroll) = Self::follow_scroll_beat(
-                self.ui_prefs.arrange_follow,
+                self.cur.view.arrange_follow,
                 ph,
-                self.ui_prefs.arrange_scroll_beat,
+                self.cur.view.arrange_scroll_beat,
                 visible_beats,
             ) {
-                self.ui_prefs.arrange_scroll_beat = new_scroll.max(0.0);
+                self.cur.view.arrange_scroll_beat = new_scroll.max(0.0);
             }
         }
 
@@ -158,9 +187,9 @@ impl AppData {
         // (= 「停止中の drag で現 playhead に keyframe」 を許可。 audio
         // 経路は recording_mode を尊重)。
         let audio_recording =
-            self.transport.is_playing && self.recording.recording_mode != common::model::RecordingMode::Read;
+            self.cur.transport.is_playing && self.cur.recording.recording_mode != common::model::RecordingMode::Read;
         if (audio_recording || image_dragging)
-            && let Some(ph) = self.transport.playhead_beat
+            && let Some(ph) = self.cur.transport.playhead_beat
         {
             let _inserted = self.record_automation_points_for_tick(f64::from(ph));
         }
@@ -193,20 +222,20 @@ impl AppData {
         // 仕様。 audio gesture には影響しない、 drag が active な image /
         // text lane だけが record される)。
         let visual_dragging = self.image_pip_drag_active() || self.text_pip_drag_active();
-        if self.recording.recording_mode == common::model::RecordingMode::Read && !visual_dragging {
+        if self.cur.recording.recording_mode == common::model::RecordingMode::Read && !visual_dragging {
             return 0;
         }
         // active ∪ latched (Touch mode は latched が常に空なので active のみ)。
         let mut recording: Vec<(u32, common::model::AutomationTarget)> = Vec::new();
-        for key in self.recording.active_param_gestures.iter() {
+        for key in self.cur.recording.active_param_gestures.iter() {
             recording.push(key.clone());
         }
         if matches!(
-            self.recording.recording_mode,
+            self.cur.recording.recording_mode,
             common::model::RecordingMode::Latch | common::model::RecordingMode::Write
         ) {
-            for key in self.recording.latched_param_gestures.iter() {
-                if !self.recording.active_param_gestures.contains(key) {
+            for key in self.cur.recording.latched_param_gestures.iter() {
+                if !self.cur.recording.active_param_gestures.contains(key) {
                     recording.push(key.clone());
                 }
             }
@@ -219,7 +248,7 @@ impl AppData {
         let mut inserted = 0usize;
         for (track_id, target) in recording {
             let last = self
-                .recording.recording_last_beat
+                .cur.recording.recording_last_beat
                 .get(&(track_id, target.clone()))
                 .copied();
             if let Some(prev) = last
@@ -249,7 +278,7 @@ impl AppData {
             // content 原点を引いて local 化する (r.md #44)。
             let clip_local_beat = playhead_beat - clip_origin;
             if self.insert_recording_point(content_id, clip_local_beat, plain_value) {
-                self.recording.recording_last_beat
+                self.cur.recording.recording_last_beat
                     .insert((track_id, target.clone()), playhead_beat);
                 inserted += 1;
             }
@@ -278,7 +307,7 @@ impl AppData {
         ) || track_id == common::model::MASTER_TRACK_ID;
         // L8 (r.md #8): track 不在なら content_id を alloc する前に return する
         // (orphan AutomationContent leak を防ぐ)。 song-level は track 不要。
-        if !is_song_level && self.song_doc.song().track_by_id(track_id).is_none() {
+        if !is_song_level && self.cur.song_doc.song().track_by_id(track_id).is_none() {
             return None;
         }
         let default_value = self.lane_default_for_target(&TouchedParam {
@@ -294,9 +323,9 @@ impl AppData {
         //     length を制限する (前方の既存 clip と重なる clip を作らない)。
         let (reuse, next_clip_start) = {
             let lanes: &[AutomationLane] = if is_song_level {
-                &self.song_doc.song().song_lanes
+                &self.cur.song_doc.song().song_lanes
             } else {
-                self.song_doc.song()
+                self.cur.song_doc.song()
                     .track_by_id(track_id)
                     .map(|t| t.automation_lanes.as_slice())
                     .unwrap_or(&[])
@@ -328,7 +357,7 @@ impl AppData {
         let clip_len = if next_clip_start.is_finite() {
             (next_clip_start - clip_start).max(0.0)
         } else {
-            (self.song_doc.song().length_beats - clip_start).max(4.0)
+            (self.cur.song_doc.song().length_beats - clip_start).max(4.0)
         };
         // L11 (r.md #8): alloc_content で content + 表示名 "Rec" を同時登録する。
         // 旧実装は AutomationClip.name="Rec" を設定していたが、 arrangement view は
@@ -340,7 +369,7 @@ impl AppData {
             )
         })?;
         if is_song_level {
-            self.ui_prefs.master_row_automation_expanded = true;
+            self.cur.view.master_row_automation_expanded = true;
             self.edit_song(|song| {
                 if let Some(lane) = song.song_lanes.iter_mut().find(|l| &l.target == target) {
                     lane.enabled = true;
@@ -374,7 +403,7 @@ impl AppData {
                 }
             });
         } else {
-            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.cur.view.expanded_automation_tracks.insert(track_id);
             let found = self
                 .edit_song(|song| {
                     let Some(track) = song.track_by_id_mut(track_id) else {
@@ -431,17 +460,17 @@ impl AppData {
     ) -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
         let mut set: std::collections::HashSet<(u32, common::model::AutomationTarget)> =
             std::collections::HashSet::new();
-        if !self.transport.is_playing || self.recording.recording_mode == common::model::RecordingMode::Read {
+        if !self.cur.transport.is_playing || self.cur.recording.recording_mode == common::model::RecordingMode::Read {
             return set;
         }
-        for k in &self.recording.active_param_gestures {
+        for k in &self.cur.recording.active_param_gestures {
             set.insert(k.clone());
         }
         if matches!(
-            self.recording.recording_mode,
+            self.cur.recording.recording_mode,
             common::model::RecordingMode::Latch | common::model::RecordingMode::Write
         ) {
-            for k in &self.recording.latched_param_gestures {
+            for k in &self.cur.recording.latched_param_gestures {
                 set.insert(k.clone());
             }
         }
@@ -461,7 +490,7 @@ impl AppData {
     /// - `SetRecordingMode(_)` handler (mode 変化で latched 寄与が変わる)
     pub(crate) fn sync_recording_lanes_with_audio(&mut self) {
         let next = self.currently_recording_lanes();
-        if next == self.recording.last_sent_recording_lanes {
+        if next == self.cur.recording.last_sent_recording_lanes {
             return;
         }
         let lanes_vec: Vec<(u32, common::model::AutomationTarget)> =
@@ -471,8 +500,8 @@ impl AppData {
         // 届ける (ensure-synced): bypass 解除の瞬間に record session 中の点列で正しい
         // curve が引かれる。 epoch 未変化なら flush は no-op。
         self.flush_song_sync();
-        self.send_audio(AudioCommand::SetRecordingLanes { lanes: lanes_vec });
-        self.recording.last_sent_recording_lanes = next;
+        self.send_audio(AudioCommand::SetRecordingLanes { project: self.pk(), lanes: lanes_vec });
+        self.cur.recording.last_sent_recording_lanes = next;
     }
 
     /// Phase 4 Step C: target に対応する現在 plain 値を返す。
@@ -490,14 +519,14 @@ impl AppData {
         use common::model::{ClipContent, ImageBuiltinParam};
         match target {
             // Phase 5: song-level target は track_id 無関係、 Song の現在値を返す
-            common::model::AutomationTarget::SongTempo => Some(f64::from(self.song_doc.song().bpm)),
+            common::model::AutomationTarget::SongTempo => Some(f64::from(self.cur.song_doc.song().bpm)),
             common::model::AutomationTarget::SongTimeSigNumerator => {
-                Some(f64::from(self.song_doc.song().time_sig.0))
+                Some(f64::from(self.cur.song_doc.song().time_sig.0))
             }
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Volume,
             ) => self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .tracks
                 .iter()
                 .find(|t| t.id == track_id)
@@ -505,13 +534,13 @@ impl AppData {
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Pan,
             ) => self
-                .song_doc.song()
+                .cur.song_doc.song()
                 .tracks
                 .iter()
                 .find(|t| t.id == track_id)
                 .map(|t| f64::from(t.pan)),
             common::model::AutomationTarget::PluginParam { device_id, param_id, .. } => self
-                .ipc
+                .cur.pipc
                 .plugin_param_values
                 .get(&DeviceParamKey {
                     device_id: *device_id,
@@ -523,9 +552,9 @@ impl AppData {
             // 更新 → ここで再読み込み → record_automation_points_for_tick が
             // point を打つ、 という pipeline。
             common::model::AutomationTarget::ImageBuiltin(field) => {
-                let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
+                let track = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
                 let event = track.all_clips().find_map(|c| {
-                    self.song_doc.song()
+                    self.cur.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -547,9 +576,9 @@ impl AppData {
             // ため)。
             common::model::AutomationTarget::TextBuiltin(field) => {
                 use common::model::TextBuiltinParam as T;
-                let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
+                let track = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
                 let event = track.all_clips().find_map(|c| {
-                    self.song_doc.song()
+                    self.cur.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -607,12 +636,12 @@ impl AppData {
                 | common::model::AutomationTarget::SongTimeSigNumerator
         ) || track_id == common::model::MASTER_TRACK_ID;
         let lane = if is_song_level {
-            self.song_doc.song()
+            self.cur.song_doc.song()
                 .song_lanes
                 .iter()
                 .find(|l| l.enabled && l.target == *target)?
         } else {
-            let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
+            let track = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
             track
                 .automation_lanes
                 .iter()
@@ -650,9 +679,9 @@ impl AppData {
         // callback でない) なので RT 制約に抵触しない。 連続する record tick は
         // AutomationRecord stream gesture で 1 undo step に squash する。
         let scope = self
-            .song_doc
+            .cur.song_doc
             .stream_scope(crate::state::StreamGesture::AutomationRecord);
-        self.song_doc.edit_checked(scope, move |song| {
+        self.cur.song_doc.edit_checked(scope, move |song| {
             let entry = song.clip_contents.entry(content_id).or_insert_with(|| {
                 common::model::ClipContent::Automation(common::model::AutomationContent::default())
             });
@@ -690,29 +719,29 @@ impl AppData {
     /// `song.bpm` に反映、 parse 失敗なら現値を維持。 どちらも edit_text を
     /// formatted な現値 (`"{:.1}"`) に書き戻して表示を整える。
     pub(crate) fn commit_bpm_edit(&mut self) {
-        if let Ok(v) = self.ui_ephemeral.bpm_edit_text.trim().parse::<f32>() {
+        if let Ok(v) = self.cur.peph.bpm_edit_text.trim().parse::<f32>() {
             let clamped = v.clamp(1.0, 400.0);
-            if (self.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
-                let old_bpm = self.song_doc.song().bpm;
+            if (self.cur.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
+                let old_bpm = self.cur.song_doc.song().bpm;
                 self.edit_song(|song| song.bpm = clamped);
                 // Raw audio clip を秒固定スケール (r.md #7)。LoadSong は edit_song の
                 // epoch bump を runner の frame flush が拾って送るので、ここは model 更新のみ。
                 self.edit_song(|song| song.rescale_raw_clips_for_bpm(old_bpm, clamped));
             }
         }
-        self.ui_ephemeral.bpm_edit_text = format!("{:.1}", self.song_doc.song().bpm);
+        self.cur.peph.bpm_edit_text = format!("{:.1}", self.cur.song_doc.song().bpm);
     }
 
     /// time_sig numerator 入力欄を Enter で commit。 parse 成功なら 1..=32 に
     /// clamp、 失敗なら現値維持。 edit_text は現値の string 表現に書き戻す。
     pub(crate) fn commit_time_sig_num_edit(&mut self) {
-        if let Ok(v) = self.ui_ephemeral.time_sig_num_edit_text.trim().parse::<u8>() {
+        if let Ok(v) = self.cur.peph.time_sig_num_edit_text.trim().parse::<u8>() {
             let clamped = v.clamp(1, 32);
-            if self.song_doc.song().time_sig.0 != clamped {
+            if self.cur.song_doc.song().time_sig.0 != clamped {
                 self.edit_song(|song| song.time_sig.0 = clamped);
             }
         }
-        self.ui_ephemeral.time_sig_num_edit_text = self.song_doc.song().time_sig.0.to_string();
+        self.cur.peph.time_sig_num_edit_text = self.cur.song_doc.song().time_sig.0.to_string();
     }
 
     /// time_sig denominator dropdown で選択された値を反映。 2/4/8/16 以外は無視。
@@ -721,16 +750,16 @@ impl AppData {
             tracing::warn!(den, "ignoring invalid time_sig denominator");
             return;
         }
-        if self.song_doc.song().time_sig.1 != den {
+        if self.cur.song_doc.song().time_sig.1 != den {
             self.edit_song(|song| song.time_sig.1 = den);
         }
     }
 
-    /// `self.song_doc.song()` が外部要因 (open / new / undo / redo / autosave 復元 etc.) で
+    /// `self.cur.song_doc.song()` が外部要因 (open / new / undo / redo / autosave 復元 etc.) で
     /// 差し替わった後に、 transport 入力欄の表示文字列を現値に書き戻す。
     pub(crate) fn resync_song_edit_texts(&mut self) {
-        self.ui_ephemeral.bpm_edit_text = format!("{:.1}", self.song_doc.song().bpm);
-        self.ui_ephemeral.time_sig_num_edit_text = self.song_doc.song().time_sig.0.to_string();
+        self.cur.peph.bpm_edit_text = format!("{:.1}", self.cur.song_doc.song().bpm);
+        self.cur.peph.time_sig_num_edit_text = self.cur.song_doc.song().time_sig.0.to_string();
         // clip 数値 field は scrubable_number 化され専用 buffer は
         // 撤去。 共有 `clip_edit_buffer_target` だけ song 差し替え (open / new
         // / undo / redo) に追従させる。 selected_clip が image / text の場合は
@@ -739,7 +768,7 @@ impl AppData {
         match self.selected_clip_ref() {
             Some(target) => self.resync_clip_audio_event_edit_buffers(target),
             None => {
-                self.ui_ephemeral.clip_edit_buffer_target = None;
+                self.cur.peph.clip_edit_buffer_target = None;
             }
         }
     }

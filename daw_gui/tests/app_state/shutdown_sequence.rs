@@ -33,7 +33,7 @@ fn build_app() -> (
 #[test]
 fn 終了要求は子プロセスへ停止と終了を正しい順序で送る() {
     let (mut app, mut audio_rx, mut plugin_rx) = build_app();
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
 
@@ -45,7 +45,7 @@ fn 終了要求は子プロセスへ停止と終了を正しい順序で送る()
     // transport を止めてから engine を終了させる (逆順だと停止が届かない)。
     let stop = audio
         .iter()
-        .position(|c| matches!(c, AudioCommand::Stop))
+        .position(|c| matches!(c, AudioCommand::Stop { project: _ }))
         .expect("Stop を送る");
     let shutdown = audio
         .iter()
@@ -63,8 +63,8 @@ fn 終了要求は子プロセスへ停止と終了を正しい順序で送る()
 #[test]
 fn 書き出し中の終了は先に中止を送る() {
     let (mut app, mut audio_rx, _plugin_rx) = build_app();
-    app.song_doc.mark_saved();
-    app.transport.export_stage = Some(daw_gui::app::ExportStage::AudioRender { done: 1, total: 10 });
+    app.cur.song_doc.mark_saved();
+    app.cur.transport.export_stage = Some(daw_gui::app::ExportStage::AudioRender { done: 1, total: 10 });
     let _ = drain(&mut audio_rx);
 
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
@@ -87,7 +87,7 @@ fn 書き出し中の終了は先に中止を送る() {
 #[test]
 fn 未保存なら確認モーダルを出して子には何も送らない() {
     let (mut app, mut audio_rx, mut plugin_rx) = build_app();
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.normalize(|_| {});
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
 
@@ -111,7 +111,7 @@ fn 未保存なら確認モーダルを出して子には何も送らない() {
 fn 自動実行の終了要求は未保存確認を飛ばして終了コードを運ぶ() {
     let (mut app, _audio_rx, _plugin_rx) = build_app();
     // smoke test は fixture を import して必ず dirty になる。
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.normalize(|_| {});
 
     app.handle_event(AppEvent::Quit(QuitRequest::automated(1)));
 
@@ -129,7 +129,7 @@ fn 自動実行の終了要求は未保存確認を飛ばして終了コード�
 #[test]
 fn 終了中の切断では子を再起動しない() {
     let (mut app, _audio_rx, mut plugin_rx) = build_app();
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
     let _ = drain(&mut plugin_rx);
 
@@ -156,18 +156,18 @@ fn 終了中の切断では子を再起動しない() {
 #[test]
 fn 終了中は以後のイベントを一切受け付けない() {
     let (mut app, mut audio_rx, mut plugin_rx) = build_app();
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
-    let epoch = app.song_doc.edit_epoch();
+    let epoch = app.cur.song_doc.edit_epoch();
 
     // 編集 / 再生 / autosave — どれも終了を決めた後に効いてはいけない。
     app.handle_event(AppEvent::AddInstrumentTrack);
     app.handle_event(AppEvent::Play);
     app.handle_event(AppEvent::AutosaveTick);
 
-    assert_eq!(app.song_doc.edit_epoch(), epoch, "Song は変わらない");
+    assert_eq!(app.cur.song_doc.edit_epoch(), epoch, "Song は変わらない");
     assert!(
         drain(&mut audio_rx).is_empty(),
         "子プロセスへ新しいコマンドを送らない"
@@ -182,7 +182,7 @@ fn 終了中は以後のイベントを一切受け付けない() {
 #[test]
 fn recovery_ファイルは終了完了時に消す() {
     let (mut app, _audio_rx, _plugin_rx) = build_app();
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
 
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
     assert!(app.shutdown.is_draining(), "まだ待っている段階");
@@ -195,7 +195,7 @@ fn recovery_ファイルは終了完了時に消す() {
 fn 終了待ちは監視対象が無ければ即完了する() {
     // script / test 経路 (supervisor: None) は待つ相手が居ない。
     let (mut app, _audio_rx, _plugin_rx) = build_app();
-    app.song_doc.mark_saved();
+    app.cur.song_doc.mark_saved();
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     app.poll_shutdown();

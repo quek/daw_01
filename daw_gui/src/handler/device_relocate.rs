@@ -43,7 +43,7 @@ impl AppData {
     /// (不変条件 5、undo 1 step、epoch bump 1 回)。
     pub(crate) fn relocate_devices_inner(&mut self, req: &RelocateDevices) {
         let RelocateDevices { device_ids, dest, dest_index, copy } = req.clone();
-        let Some(dest_track) = self.song_doc.song().chain_owner_track(dest) else {
+        let Some(dest_track) = self.cur.song_doc.song().chain_owner_track(dest) else {
             return;
         };
         let Some(outcome) = self
@@ -59,35 +59,35 @@ impl AppData {
             let to = common::model::AutomationLaneKey { track: dst_track, lane: new_lane };
             // 行高 override は session-only だが、 鍵 (track, lane) が両方変わるので
             // 写し替えないと「行高だけ元の位置に取り残されて別 lane に化ける」。
-            if let Some(v) = self.ui_prefs.automation_lane_row_overrides.remove(&from) {
-                self.ui_prefs.automation_lane_row_overrides.insert(to, v);
+            if let Some(v) = self.cur.view.automation_lane_row_overrides.remove(&from) {
+                self.cur.view.automation_lane_row_overrides.insert(to, v);
             }
             // Z 段階ズームの復元スナップショットにも同じ写像を掛ける
             // (掛けないと X で 1 段戻した瞬間に行高が飛ぶ)。
-            for snap in &mut self.ui_ephemeral.arrange_zoom_history {
+            for snap in &mut self.cur.peph.arrange_zoom_history {
                 if let Some(v) = snap.lane_row_overrides.remove(&from) {
                     snap.lane_row_overrides.insert(to, v);
                 }
             }
-            for k in &mut self.selection.selected_automation_clips {
+            for k in &mut self.cur.selection.selected_automation_clips {
                 if k.lane_key() == from {
                     k.track = to.track;
                     k.lane = to.lane;
                 }
             }
-            if let Some(k) = self.selection.automation_clip_anchor.as_mut()
+            if let Some(k) = self.cur.selection.automation_clip_anchor.as_mut()
                 && k.lane_key() == from
             {
                 k.track = to.track;
                 k.lane = to.lane;
             }
-            for p in &mut self.selection.selected_automation_points {
+            for p in &mut self.cur.selection.selected_automation_points {
                 if (p.track_id, p.lane_id) == (from.track, from.lane) {
                     p.track_id = to.track;
                     p.lane_id = to.lane;
                 }
             }
-            if let Some(p) = self.selection.automation_point_anchor.as_mut()
+            if let Some(p) = self.cur.selection.automation_point_anchor.as_mut()
                 && (p.track_id, p.lane_id) == (from.track, from.lane)
             {
                 p.track_id = to.track;
@@ -102,11 +102,11 @@ impl AppData {
             // 既定値欄は次のフレームで元の key のまま描かれなくなるので、
             // `view::scrub_gesture::sweep` が必ず閉じる (寿命は「所有者が今フレーム
             // も描かれている間」)。
-            self.ui_ephemeral.arrange_hovered_automation_lane = None;
+            self.cur.peph.arrange_hovered_automation_lane = None;
         }
 
         for &(src_track, dst_track, device_id) in &outcome.moved_devices {
-            rekey_param_gestures(&mut self.recording, src_track, dst_track, device_id);
+            rekey_param_gestures(&mut self.cur.recording, src_track, dst_track, device_id);
         }
         if !outcome.moved_devices.is_empty() {
             self.sync_recording_lanes_with_audio();
@@ -119,7 +119,7 @@ impl AppData {
         let created_plugins: Vec<common::model::PluginInstance> =
             plugins(&outcome.created).cloned().collect();
         for inst in &created_plugins {
-            self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
+            self.cur.pipc.pending_added_plugin_finalize.insert(inst.id, false);
         }
         for inst in &created_plugins {
             self.restore_device(inst);
@@ -134,7 +134,7 @@ impl AppData {
 
         // 落とした device を選択し、 落とし先のチェーンを表示し続ける
         // (選択とタグの更新は `set_device_selection` 1 本に通す = SSoT)。
-        self.selection.device_anchor = outcome.result_ids.last().copied();
+        self.cur.selection.device_anchor = outcome.result_ids.last().copied();
         self.set_device_selection(outcome.result_ids);
         self.focus_inspector_track(dest_track);
     }
@@ -210,7 +210,7 @@ impl AppData {
     /// `ara_archive`、(2) 全 plugin の `state`** で、(1) で収まればそこで止める。
     /// r.md #110: Parallel は中身ごと 1 件。
     fn serialize_devices_to_envelope(&self, device_ids: &[u64]) -> Option<(String, usize, usize)> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         // 表示順 (= チェーン順) を保つため、 呼び出し側の並びをそのまま使う。
         let mut out: Vec<crate::clipboard::DeviceCopy> = Vec::new();
         for &id in device_ids {
@@ -277,7 +277,7 @@ impl AppData {
         if devices.is_empty() {
             return 0;
         }
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         if song.fx_chain_by_track_id(dest_track).is_none() {
             return 0;
         }
@@ -324,14 +324,14 @@ impl AppData {
         let created_plugins: Vec<common::model::PluginInstance> =
             plugins(&created).cloned().collect();
         for inst in &created_plugins {
-            self.ipc.pending_added_plugin_finalize.insert(inst.id, false);
+            self.cur.pipc.pending_added_plugin_finalize.insert(inst.id, false);
         }
         for inst in &created_plugins {
             self.restore_device(inst);
         }
         self.flush_song_sync();
         // 貼った device を選択に倒す (更新は `set_device_selection` 1 本に通す)。
-        self.selection.device_anchor = created.last().map(Device::id);
+        self.cur.selection.device_anchor = created.last().map(Device::id);
         let n = created.len();
         self.set_device_selection(created.iter().map(Device::id).collect());
         n
@@ -351,13 +351,13 @@ impl AppData {
         // `prev` は **正規化済み** を渡す (異トラックの stale id は最初の click で落ちる)。
         let prev = self.live_device_ids();
         let next = modifier.resolve(&prev, device_id, || {
-            self.selection
+            self.cur.selection
                 .device_anchor
                 .and_then(|a| crate::widgets::select_modifier::range_ordered(&order, a, device_id))
         });
         self.set_device_selection(next);
         if modifier.updates_anchor() {
-            self.selection.device_anchor = Some(device_id);
+            self.cur.selection.device_anchor = Some(device_id);
         }
     }
 
@@ -366,13 +366,13 @@ impl AppData {
     /// — 残すと `edit_surface` が Devices を返し続け、 次の Delete が
     /// 「実在 0 件」 で空振りして他の面の削除まで殺す。
     pub fn set_device_selection(&mut self, ids: Vec<u64>) {
-        self.selection.selected_device_ids = ids;
-        if self.selection.selected_device_ids.is_empty() {
-            if self.selection.last_edit_select == Some(EditSurface::Devices) {
-                self.selection.last_edit_select = None;
+        self.cur.selection.selected_device_ids = ids;
+        if self.cur.selection.selected_device_ids.is_empty() {
+            if self.cur.selection.last_edit_select == Some(EditSurface::Devices) {
+                self.cur.selection.last_edit_select = None;
             }
         } else {
-            self.selection.last_edit_select = Some(EditSurface::Devices);
+            self.cur.selection.last_edit_select = Some(EditSurface::Devices);
         }
     }
 
@@ -382,26 +382,26 @@ impl AppData {
     /// **正しさの担保ではない** — それは読む側の [`Self::live_device_ids`] が持つ。
     /// ここは保持した集合が無限に育たないようにするだけ。
     pub(crate) fn prune_device_selection(&mut self) {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let alive: Vec<u64> = self
-            .selection
+            .cur.selection
             .selected_device_ids
             .iter()
             .copied()
             .filter(|&id| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some())
             .collect();
-        if alive.len() != self.selection.selected_device_ids.len() {
+        if alive.len() != self.cur.selection.selected_device_ids.len() {
             self.set_device_selection(alive);
         }
         if self
-            .selection
+            .cur.selection
             .device_anchor
             .is_some_and(|id| {
-                let song = self.song_doc.song();
+                let song = self.cur.song_doc.song();
                 song.device_by_id(id).is_none() && song.chain_by_id(id).is_none()
             })
         {
-            self.selection.device_anchor = None;
+            self.cur.selection.device_anchor = None;
         }
     }
 }

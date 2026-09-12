@@ -58,7 +58,7 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
         return;
     }
     if matches!(surface, EditSurface::Tracks) {
-        let ids = app.selection.selected_track_ids.clone();
+        let ids = app.cur.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.copy_tracks(ids);
         }));
@@ -132,11 +132,11 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
             EditSurface::AudioEvents => AppEvent::DeleteAudioEditorSelection,
             EditSurface::Notes => AppEvent::DeleteSelectedNotes,
             EditSurface::AutomationPoints => AppEvent::DeleteAutomationPoints {
-                points: app.selection.selected_automation_points.clone(),
+                points: app.cur.selection.selected_automation_points.clone(),
             },
             EditSurface::TimeRange => AppEvent::DeleteTimeSelection,
             EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
-                keys: app.selection.selected_automation_clips.clone(),
+                keys: app.cur.selection.selected_automation_clips.clone(),
             },
             _ => return,
         };
@@ -148,7 +148,7 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
         return;
     }
     if matches!(surface, EditSurface::Tracks) {
-        let ids = app.selection.selected_track_ids.clone();
+        let ids = app.cur.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.cut_tracks(ids);
         }));
@@ -175,12 +175,14 @@ pub(crate) fn paste_from_clipboard(
         return; // 他アプリ text / 旧 format → 黙って無視
     };
     let src_pid = env.source_project_id;
+    // 別プロジェクトからの貼り付けで取り込む媒体の写し (音源 / 映像 / 画像)。
+    let media = env.media;
     use crate::clipboard::ClipboardPayload as P;
     match env.payload {
         P::Notes(notes) => {
             if is_pianoroll_active
-                && app.ui_ephemeral.audio_editor_clip.is_none()
-                && let Some(at) = app.ui_ephemeral.pianoroll_hover_beat
+                && app.cur.peph.audio_editor_clip.is_none()
+                && let Some(at) = app.cur.peph.pianoroll_hover_beat
             {
                 let notes = crate::clipboard::sanitize_notes(notes);
                 ui.push_edit(paste_edit("ノート", move |app| app.paste_notes_at(notes, at)));
@@ -190,8 +192,8 @@ pub(crate) fn paste_from_clipboard(
         }
         P::AudioEvents(events) => {
             if is_pianoroll_active
-                && app.ui_ephemeral.audio_editor_clip.is_some()
-                && let Some(at) = app.ui_ephemeral.audio_editor_hover_beat_in_clip
+                && app.cur.peph.audio_editor_clip.is_some()
+                && let Some(at) = app.cur.peph.audio_editor_hover_beat_in_clip
             {
                 let events = crate::clipboard::sanitize_audio_events(events);
                 ui.push_edit(paste_edit("イベント", move |app| app.paste_events_at(events, at)));
@@ -201,8 +203,8 @@ pub(crate) fn paste_from_clipboard(
         }
         P::AutomationPoints(points) => {
             if let (Some(lane), Some(at)) = (
-                app.ui_ephemeral.arrange_hovered_automation_lane,
-                app.ui_ephemeral.arrangement_hover_beat,
+                app.cur.peph.arrange_hovered_automation_lane,
+                app.cur.peph.arrangement_hover_beat,
             ) {
                 let points = crate::clipboard::sanitize_points(points);
                 ui.push_edit(paste_edit("オートメーションポイント", move |app| {
@@ -214,13 +216,13 @@ pub(crate) fn paste_from_clipboard(
         }
         P::Clips(clips) => {
             if !is_pianoroll_active
-                && app.ui_ephemeral.arrange_hovered_automation_lane.is_none()
+                && app.cur.peph.arrange_hovered_automation_lane.is_none()
                 && let (Some(track), Some(at)) =
-                    (app.ui_ephemeral.arrange_hovered_track, app.ui_ephemeral.arrangement_hover_beat)
+                    (app.cur.peph.arrange_hovered_track, app.cur.peph.arrangement_hover_beat)
             {
                 let clips = crate::clipboard::sanitize_clips(clips);
                 ui.push_edit(paste_edit("クリップ", move |app| {
-                    app.paste_clips_at(clips, src_pid, track, at)
+                    app.paste_clips_at(clips, src_pid, track, at, &media)
                 }));
                 return;
             }
@@ -230,8 +232,8 @@ pub(crate) fn paste_from_clipboard(
             // automation clip は「マウス下の automation lane」へ、 hover 拍を基準に貼る
             // (= automation point paste と同じく lane + beat が揃ったときのみ)。
             if let (Some(lane), Some(at)) = (
-                app.ui_ephemeral.arrange_hovered_automation_lane,
-                app.ui_ephemeral.arrangement_hover_beat,
+                app.cur.peph.arrange_hovered_automation_lane,
+                app.cur.peph.arrangement_hover_beat,
             ) {
                 let clips = crate::clipboard::sanitize_automation_clips(clips);
                 ui.push_edit(paste_edit("オートメーションクリップ", move |app| {
@@ -245,10 +247,10 @@ pub(crate) fn paste_from_clipboard(
             // r.md #87: 貼り先は **ポインタが乗っているセル** (行 × 列)。
             // ランチャーの上にポインタが無ければ貼らない (アレンジの paste と
             // 同じ規約 — 再生ヘッドや先頭列への fallback はしない)。
-            if let Some(dest) = app.launcher.hover {
+            if let Some(dest) = app.cur.launcher.hover {
                 let cells = crate::clipboard::sanitize_launcher_cells(cells);
                 ui.push_edit(paste_edit("セル", move |app| {
-                    app.paste_launcher_cells(cells, src_pid, dest)
+                    app.paste_launcher_cells(cells, src_pid, dest, &media)
                 }));
                 return;
             }
@@ -256,11 +258,11 @@ pub(crate) fn paste_from_clipboard(
         }
         P::Tracks(payload) => {
             if !is_pianoroll_active
-                && let Some(above) = app.ui_ephemeral.arrange_hovered_track
+                && let Some(above) = app.cur.peph.arrange_hovered_track
             {
                 let payload = crate::clipboard::sanitize_tracks(payload);
                 ui.push_edit(paste_edit("トラック", move |app| {
-                    app.paste_tracks_at(payload, src_pid, above)
+                    app.paste_tracks_at(payload, src_pid, above, &media)
                 }));
                 return;
             }
@@ -368,7 +370,7 @@ pub(crate) fn duplicate_devices(app: &AppData, ui: &mut Ui<'_, AppData>) {
     // 挿入位置 = 選択の末尾 device の直後 (その device が居る chain の中)。
     let Some((dest, dest_index)) = ids
         .last()
-        .and_then(|&id| app.song_doc.song().find_device(id))
+        .and_then(|&id| app.cur.song_doc.song().find_device(id))
         .map(|(chain, i)| (chain, i as u32 + 1))
     else {
         return;
@@ -439,7 +441,7 @@ if (dup_shared || dup_unique) && !launcher_cells.is_empty() {
 if (dup_shared || dup_unique)
     && matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Scenes))
 {
-    let scene_ids = app.selection.selected_scene_ids.clone();
+    let scene_ids = app.cur.selection.selected_scene_ids.clone();
     let unique = dup_unique;
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         app.handle_event(AppEvent::Launcher(
@@ -452,7 +454,7 @@ if dup_shared && !dup_devices {
     // 対象面は copy/cut/delete と同じ last-wins (`edit_surface`)。トラック面なら
     // トラックをリンク複製 (D = 共有、 クリップ複製と同規約)。 それ以外は従来通り。
     if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Tracks)) {
-        let ids = app.selection.selected_track_ids.clone();
+        let ids = app.cur.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateTracksShared(ids));
         }));
@@ -476,7 +478,7 @@ if dup_shared && !dup_devices {
 if dup_unique && !dup_devices {
     // トラック面なら Alt+D = トラックを独立複製 (クリップ複製と同規約)。
     if matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Tracks)) {
-        let ids = app.selection.selected_track_ids.clone();
+        let ids = app.cur.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateTracksUnique(ids));
         }));
@@ -501,7 +503,7 @@ if dup_unique && !dup_devices {
 /// 選択中の automation クリップ (範囲に畳まれていない唯一の面) は従来どおり別に複製する。
 fn duplicate_time_range(app: &AppData, ui: &mut Ui<'_, AppData>, unique: bool) {
     let automation_sources: Vec<common::model::AutomationClipKey> =
-        app.selection.selected_automation_clips.clone();
+        app.cur.selection.selected_automation_clips.clone();
     let Some(sel) = app.time_selection() else {
         return;
     };
@@ -510,7 +512,7 @@ fn duplicate_time_range(app: &AppData, ui: &mut Ui<'_, AppData>, unique: bool) {
     let offset = b - a;
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         // クリップと automation で `edit_song` が 2 回走るので 1 undo step に畳む。
-        app.song_doc.begin_gesture();
+        app.cur.song_doc.begin_gesture();
         app.copy_time_range(a, b, offset, &map, unique);
         if !automation_sources.is_empty() {
             let ev = if unique {
@@ -520,6 +522,6 @@ fn duplicate_time_range(app: &AppData, ui: &mut Ui<'_, AppData>, unique: bool) {
             };
             app.handle_event(ev);
         }
-        app.song_doc.end_gesture();
+        app.cur.song_doc.end_gesture();
     }));
 }

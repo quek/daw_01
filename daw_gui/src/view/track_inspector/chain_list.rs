@@ -83,16 +83,16 @@ pub(super) fn draw_chain_list(
         })
         .collect();
     let open_dev: Option<u64> = app
-        .ui_ephemeral
+        .cur.peph
         .open_plugin_params
-        .or(app.ui_ephemeral.open_video_fx_params)
+        .or(app.cur.peph.open_video_fx_params)
         .filter(|id| plugin_ids.contains(id));
     let sc_open: Option<u64> = app
-        .ui_ephemeral
+        .cur.peph
         .open_sidechain_panel
         .filter(|id| plugin_ids.contains(id));
-    let panel_h = if app.ui_ephemeral.inspector_device_panel_h > 1.0 {
-        app.ui_ephemeral.inspector_device_panel_h
+    let panel_h = if app.cur.peph.inspector_device_panel_h > 1.0 {
+        app.cur.peph.inspector_device_panel_h
     } else {
         280.0 // 初回 bootstrap: expansion を 1 度描かせて実測させる
     };
@@ -117,7 +117,7 @@ pub(super) fn draw_chain_list(
     };
 
     // 落とせるか: 掴んだ device (Parallel) の中の chain へは落とせない (循環)。
-    let song = app.song_doc.song();
+    let song = app.cur.song_doc.song();
     let valid_drop = |from: Option<usize>, slot: usize| -> bool {
         let Some(from) = from else { return true };
         let Some(dev_id) = rows.get(from).and_then(ChainRow::drag_id) else {
@@ -160,9 +160,9 @@ pub(super) fn draw_chain_list(
         .hovered
         .and_then(|i| rows.get(i))
         .and_then(ChainRow::drag_id);
-    if app.ui_ephemeral.inspector_hovered_device != hovered_device {
+    if app.cur.peph.inspector_hovered_device != hovered_device {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.inspector_hovered_device = hovered_device;
+            app.cur.peph.inspector_hovered_device = hovered_device;
         }));
     }
     // click = 選択 (無修飾 / Ctrl / Shift)。 Parallel / chain の開閉は行左端の disclosure。
@@ -438,9 +438,9 @@ fn draw_plugin_expansions(
         let measured =
             (device_panel::draw_device_panel(app, ui, ctx.area, ctx.pad, exp_rect) - exp_rect.y).max(0.0);
         // 展開部の実消費高を測って次フレームの行高に使う (lag-by-one)。
-        if (app.ui_ephemeral.inspector_device_panel_h - measured).abs() > 0.5 {
+        if (app.cur.peph.inspector_device_panel_h - measured).abs() > 0.5 {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.ui_ephemeral.inspector_device_panel_h = measured;
+                app.cur.peph.inspector_device_panel_h = measured;
             }));
         }
     }
@@ -518,7 +518,7 @@ fn draw_plugin_row(
     // [SC] (aux 入力 port を持つ plugin だけ)。 配線済みは ON 色。
     if entry.aux_input_count > 0 {
         right -= btn_sc_w + 2.0;
-        let open = app.ui_ephemeral.open_sidechain_panel == Some(device_id);
+        let open = app.cur.peph.open_sidechain_panel == Some(device_id);
         ui.toggle_button_at(
             ("inspector_row_sc", i),
             if open { "SC\u{25B4}" } else { "SC\u{25BE}" },
@@ -530,8 +530,8 @@ fn draw_plugin_row(
                     if popup_open {
                         return;
                     }
-                    app.ui_ephemeral.open_sidechain_panel =
-                        if app.ui_ephemeral.open_sidechain_panel == Some(device_id) { None } else { Some(device_id) };
+                    app.cur.peph.open_sidechain_panel =
+                        if app.cur.peph.open_sidechain_panel == Some(device_id) { None } else { Some(device_id) };
                 })
             },
         );
@@ -629,13 +629,13 @@ fn draw_chain_row(
     );
     // knob は automation gesture idiom (mixer の send knob と同じ)。
     let Some(track_id) = app.cursor_track_id() else { return };
-    let track = app.song_doc.song().track_by_id(track_id);
+    let track = app.cur.song_doc.song().track_by_id(track_id);
     let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { chain_id });
     let gain_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id });
     let live_pan = track.map_or(pan, |t| app.live_param_value(t, &pan_target, pan));
     let live_gain = track.map_or(gain, |t| app.live_param_value(t, &gain_target, gain));
     right -= CHAIN_KNOB + 4.0;
-    let was_pan = app.recording.active_param_gestures.contains(&(track_id, pan_target.clone()));
+    let was_pan = app.cur.recording.active_param_gestures.contains(&(track_id, pan_target.clone()));
     let pan_resp = ui.knob_at(
         ("inspector_chain_pan", i),
         Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
@@ -652,7 +652,7 @@ fn draw_chain_row(
     );
     push_param_gesture_edges(ui, track_id, pan_target, "Chain Pan", was_pan, pan_resp.dragging);
     right -= CHAIN_KNOB + 2.0;
-    let was_gain = app.recording.active_param_gestures.contains(&(track_id, gain_target.clone()));
+    let was_gain = app.cur.recording.active_param_gestures.contains(&(track_id, gain_target.clone()));
     let gain_resp = ui.knob_at(
         ("inspector_chain_gain", i),
         Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
@@ -706,7 +706,7 @@ fn draw_chain_row(
     let name_x = row.x + 14.0;
     draw_disclosure(ui, ("inspector_chain_disclosure", i), chain_id, open, name_x, row, popup_open, p);
     let name_rect = Rect { x: name_x + 11.0, y: row.y + 3.0, w: (right - 6.0 - name_x - 11.0).max(1.0), h: ROW_H - 6.0 };
-    if let Some((id, buf)) = &app.ui_ephemeral.renaming_chain
+    if let Some((id, buf)) = &app.cur.peph.renaming_chain
         && *id == chain_id
     {
         draw_rename_input(app, ui, ("inspector_chain_rename", i), name_rect, buf, move |app, text| {
@@ -779,7 +779,7 @@ pub(super) fn draw_rename_input(
     let style = ui.text_input_style();
     let resp = ui.text_input_at_focused(id, rect, buf, &style, |text| {
         Edit::mutate(move |app: &mut AppData| {
-            if let Some((_, b)) = app.ui_ephemeral.renaming_chain.as_mut() {
+            if let Some((_, b)) = app.cur.peph.renaming_chain.as_mut() {
                 *b = text;
             }
         })
@@ -788,7 +788,7 @@ pub(super) fn draw_rename_input(
     if resp.committed || resp.blurred {
         let text = resp.committed_text.clone().unwrap_or_else(|| buf.to_string());
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.ui_ephemeral.renaming_chain = None;
+            app.cur.peph.renaming_chain = None;
             if !text.trim().is_empty() {
                 commit(app, text);
             }
@@ -796,7 +796,7 @@ pub(super) fn draw_rename_input(
     } else if !resp.focused {
         // Esc 等で focus が外れた = 取消。
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.ui_ephemeral.renaming_chain = None;
+            app.cur.peph.renaming_chain = None;
         }));
     }
 }
@@ -865,10 +865,10 @@ fn draw_sidechain_panel(
 /// (トラックヘッダの右クリックメニューと同じ規則)。 順序は表示順。 chain id は運べないので
 /// 除く。
 fn carried_device_ids(app: &AppData, rows: &[ChainRow], device_id: u64) -> Vec<u64> {
-    if app.selection.selected_device_ids.contains(&device_id) {
+    if app.cur.selection.selected_device_ids.contains(&device_id) {
         rows.iter()
             .filter_map(ChainRow::drag_id)
-            .filter(|id| app.selection.selected_device_ids.contains(id))
+            .filter(|id| app.cur.selection.selected_device_ids.contains(id))
             .collect()
     } else {
         vec![device_id]
@@ -907,8 +907,8 @@ fn apply_parallel_menu(app: &mut AppData, idx: usize, parallel_id: u64, anchor: 
         }
         1 => app.handle_event(AppEvent::UngroupParallel { parallel_id }),
         2 => {
-            let name = app.song_doc.song().parallel_by_id(parallel_id).map(|r| r.name.clone()).unwrap_or_default();
-            app.ui_ephemeral.renaming_chain = Some((parallel_id, name));
+            let name = app.cur.song_doc.song().parallel_by_id(parallel_id).map(|r| r.name.clone()).unwrap_or_default();
+            app.cur.peph.renaming_chain = Some((parallel_id, name));
         }
         3 => app.open_color_picker(ColorPickerTarget::Parallel(parallel_id), anchor),
         4 => app.copy_devices(ids),
@@ -922,12 +922,12 @@ fn apply_chain_menu(app: &mut AppData, idx: usize, parallel_id: u64, chain_id: u
     match idx {
         0 => {
             let name = app
-                .song_doc
+                .cur.song_doc
                 .song()
                 .chain_by_id(chain_id)
                 .map(|(_, c)| c.name.clone())
                 .unwrap_or_default();
-            app.ui_ephemeral.renaming_chain = Some((chain_id, name));
+            app.cur.peph.renaming_chain = Some((chain_id, name));
         }
         1 => app.open_color_picker(ColorPickerTarget::ParallelChain(chain_id), anchor),
         2 => app.handle_event(AppEvent::DuplicateParallelChain { chain_id }),
@@ -938,7 +938,7 @@ fn apply_chain_menu(app: &mut AppData, idx: usize, parallel_id: u64, chain_id: u
 
 /// `device_id` の直後に `ids` のコピーを挿す (メニューの「複製」)。
 fn duplicate_after(app: &mut AppData, ids: Vec<u64>, device_id: u64) {
-    let Some((dest, index)) = app.song_doc.song().find_device(device_id) else {
+    let Some((dest, index)) = app.cur.song_doc.song().find_device(device_id) else {
         return;
     };
     app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
@@ -986,7 +986,7 @@ fn draw_row(
         h: row_rect.h,
     };
     // 背景 → Parallel の帯 → 中身、 の順 (chain 行の色見本は中身側で帯の上に描く)。
-    let selected = r.select_id().is_some_and(|id| app.selection.selected_device_ids.contains(&id));
+    let selected = r.select_id().is_some_and(|id| app.cur.selection.selected_device_ids.contains(&id));
     match &r.kind {
         ChainRowKind::Plugin(_) | ChainRowKind::ParallelBegin { .. } => {
             draw_row_bg(ui, i, content, selected, hovered, dragging, p);

@@ -23,7 +23,7 @@ impl AppData {
     /// 仮想鍵盤の宛先 = カーソルトラック (選択中のトラック)。 `None` = 選択なし。
     pub fn virtual_keyboard_target_track(&self) -> Option<u32> {
         let id = self.cursor_track_id()?;
-        self.song_doc.song().track_by_id(id).map(|t| t.id)
+        self.cur.song_doc.song().track_by_id(id).map(|t| t.id)
     }
 
     /// カーソルトラックで発音し、 録音実体が走っていてそのトラックが録音待機なら
@@ -41,12 +41,12 @@ impl AppData {
             return;
         };
         self.monitor_note_on_track(track_id, pitch, velocity);
-        if self.recording.live {
-            let armed = self.song_doc.song().track_by_id(track_id).is_some_and(|t| t.armed);
+        if self.cur.recording.live {
+            let armed = self.cur.song_doc.song().track_by_id(track_id).is_some_and(|t| t.armed);
             if armed {
                 self.record_midi_note_on_tracks(&[track_id], pitch, velocity);
             }
-        } else if !self.recording.requested {
+        } else if !self.cur.recording.requested {
             self.step_input_note_on(pitch, velocity);
         }
     }
@@ -61,7 +61,7 @@ impl AppData {
             velocity: None,
         });
         self.monitor_note_off(pitch);
-        if self.recording.live {
+        if self.cur.recording.live {
             self.record_midi_note_off(pitch);
         }
     }

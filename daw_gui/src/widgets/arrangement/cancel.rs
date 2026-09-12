@@ -64,15 +64,15 @@ pub(super) fn on_escape(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
         }
         if let Some(d) = state.launcher.pane_width_drag.take() {
             edits.push(Edit::mutate(move |app: &mut AppData| {
-                app.ui_prefs.launcher_layout = d.anchor_layout;
+                app.cur.view.launcher_layout = d.anchor_layout;
                 if d.anchor_layout == LauncherLayout::Both {
-                    app.ui_prefs.launcher_width = d.anchor_pane_w;
+                    app.cur.view.launcher_width = d.anchor_pane_w;
                 }
             }));
         }
         if let Some(d) = state.launcher.col_width_drag.take() {
             edits.push(Edit::mutate(move |app: &mut AppData| {
-                app.ui_prefs.launcher_scene_col_w = d.anchor_col_w;
+                app.cur.view.launcher_scene_col_w = d.anchor_col_w;
             }));
         }
 

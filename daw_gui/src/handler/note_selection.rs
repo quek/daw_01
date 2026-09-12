@@ -20,7 +20,7 @@ impl AppData {
     /// widget へ渡す id 空間と常に一致する。
     #[must_use]
     pub fn selected_note_ids(&self) -> Vec<u32> {
-        let Some(sel) = self.selection.time.as_ref() else {
+        let Some(sel) = self.cur.selection.time.as_ref() else {
             return Vec::new();
         };
         // **鍵盤行が 1 つも無ければノートは選ばれていない。** この早期 return が無いと、
@@ -29,7 +29,7 @@ impl AppData {
         if !sel.lanes.iter().any(|l| matches!(l, LaneRef::KeyTrack { .. })) {
             return Vec::new();
         }
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let shown = self.shown_pianoroll_clips();
         let mut out = Vec::new();
         for (slot, key) in shown.iter().enumerate() {
@@ -56,7 +56,7 @@ impl AppData {
     /// 空を渡すと選択解除。
     pub(crate) fn set_note_selection(&mut self, ids: &[u32]) {
         let shown = self.shown_pianoroll_clips();
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut start = f64::INFINITY;
         let mut end = f64::NEG_INFINITY;
         let mut lanes: Vec<LaneRef> = Vec::new();
@@ -87,12 +87,12 @@ impl AppData {
             return;
         }
         self.set_time_selection(common::model::TimeSelection::new(start, end, lanes));
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 
     /// ノート選択だけを解除し、表示していたクリップの範囲へ落とす。
     fn collapse_note_selection_to_clips(&mut self, shown: &[ClipKey]) {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut start = f64::INFINITY;
         let mut end = f64::NEG_INFINITY;
         let mut lanes: Vec<LaneRef> = Vec::new();
@@ -123,7 +123,7 @@ impl AppData {
             common::model::TimeSelection::new(start, end, lanes)
         };
         self.set_time_selection(next);
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 
     /// ピアノロールの 2 次元ドラッグ (時間 × 鍵盤行) を範囲にする。
@@ -139,7 +139,7 @@ impl AppData {
     ) {
         let (lo, hi) = if pitch_lo <= pitch_hi { (pitch_lo, pitch_hi) } else { (pitch_hi, pitch_lo) };
         let shown = self.shown_pianoroll_clips();
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut lanes: Vec<LaneRef> = Vec::new();
         for key in &shown {
             // 鍵盤行に加えてクリップのトラック行も入れる — アレンジ側でそのクリップが
@@ -158,8 +158,8 @@ impl AppData {
         match common::model::TimeSelection::new(start_beat, end_beat, lanes) {
             Some(next) => {
                 self.set_time_selection(Some(next));
-                self.selection.range_anchor =
-                    self.selection.time.as_ref().map(|t| t.start_beat);
+                self.cur.selection.range_anchor =
+                    self.cur.selection.time.as_ref().map(|t| t.start_beat);
             }
             // 幅ゼロのドラッグ (= ただのクリック) はノート選択の解除。
             None => self.collapse_note_selection_to_clips(&shown),
@@ -175,7 +175,7 @@ impl AppData {
         let Some((key, idx)) = Self::decode_note_id_in(&shown, id) else {
             return;
         };
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(clip) = song.clip_by_key(key) else {
             return;
         };
@@ -187,22 +187,22 @@ impl AppData {
         let lanes: Vec<LaneRef> = song
             .content_lanes_for(key, LaneRef::KeyTrack { clip: key, pitch: note.pitch })
             .collect();
-        if additive && let Some(sel) = self.selection.time.as_mut() {
+        if additive && let Some(sel) = self.cur.selection.time.as_mut() {
             sel.extend(s, e, lanes);
-            self.selection.last_edit_select = Some(crate::app::EditSurface::TimeRange);
+            self.cur.selection.last_edit_select = Some(crate::app::EditSurface::TimeRange);
             self.drop_cell_selection_if_arrangement();
             return;
         }
         let next = common::model::TimeSelection::new(s, e, lanes);
         self.set_time_selection(next);
-        self.selection.range_anchor = Some(s);
+        self.cur.selection.range_anchor = Some(s);
     }
 
     /// 表示中クリップの**全ノート**を選択する (`Ctrl+A` の最上段)。
     pub(crate) fn select_all_shown_notes(&mut self) {
         let next = self.shown_notes_selection(|_| true);
         self.set_time_selection(next);
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 
     /// r.md #119: ピアノロールの `Ctrl+A` — **段階拡大**。
@@ -217,9 +217,9 @@ impl AppData {
     pub(crate) fn select_all_pianoroll(&mut self, hover_pitch: Option<u8>) {
         let row = hover_pitch.and_then(|p| self.shown_notes_selection(|n| n.pitch == p));
         match row {
-            Some(row) if self.selection.time.as_ref() != Some(&row) => {
+            Some(row) if self.cur.selection.time.as_ref() != Some(&row) => {
                 self.set_time_selection(Some(row));
-                self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+                self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
             }
             _ => self.select_all_shown_notes(),
         }
@@ -232,7 +232,7 @@ impl AppData {
         keep: impl Fn(&common::model::Note) -> bool,
     ) -> Option<common::model::TimeSelection> {
         let shown = self.shown_pianoroll_clips();
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let mut start = f64::INFINITY;
         let mut end = f64::NEG_INFINITY;
         let mut lanes: Vec<LaneRef> = Vec::new();
@@ -276,13 +276,13 @@ impl AppData {
     /// 走っても、アレンジの選択を巻き込まない。
     pub(crate) fn clear_note_selection(&mut self) {
         let is_note_range = self
-            .selection
+            .cur.selection
             .time
             .as_ref()
             .is_some_and(|t| t.lanes.iter().any(|l| matches!(l, LaneRef::KeyTrack { .. })));
         if is_note_range {
-            self.selection.time = None;
-            self.selection.range_anchor = None;
+            self.cur.selection.time = None;
+            self.cur.selection.range_anchor = None;
         }
     }
 }
@@ -294,16 +294,16 @@ impl AppData {
     /// `ui_ephemeral.audio_editor_clip` が指すクリップの `AudioContent.events` への添字。
     #[must_use]
     pub fn selected_audio_event_indices(&self) -> Vec<usize> {
-        let Some(key) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(key) = self.cur.peph.audio_editor_clip else {
             return Vec::new();
         };
-        let Some(sel) = self.selection.time.as_ref() else {
+        let Some(sel) = self.cur.selection.time.as_ref() else {
             return Vec::new();
         };
         if !sel.has_lane(LaneRef::AudioLane(key)) {
             return Vec::new();
         }
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(clip) = song.clip_by_key(key) else {
             return Vec::new();
         };
@@ -330,10 +330,10 @@ impl AppData {
     /// 空を渡すとそのクリップの区間へ落とす (エディタが空表示にならないよう、
     /// ノート選択の解除と同じ扱い)。
     pub(crate) fn set_audio_event_selection(&mut self, indices: &[usize]) {
-        let Some(key) = self.ui_ephemeral.audio_editor_clip else {
+        let Some(key) = self.cur.peph.audio_editor_clip else {
             return;
         };
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(clip) = song.clip_by_key(key).cloned() else {
             return;
         };
@@ -369,7 +369,7 @@ impl AppData {
             common::model::TimeSelection::new(s, e, vec![LaneRef::Track(key.track_id)])
         };
         self.set_time_selection(next);
-        self.selection.range_anchor = self.selection.time.as_ref().map(|t| t.start_beat);
+        self.cur.selection.range_anchor = self.cur.selection.time.as_ref().map(|t| t.start_beat);
     }
 }
 
@@ -404,7 +404,7 @@ mod launcher_cell_editing_tests {
             row: LauncherRow::Track(1),
             scene_index: 0,
         }));
-        let scene_id = app.song_doc.song().scenes[0].id;
+        let scene_id = app.cur.song_doc.song().scenes[0].id;
         let cell = app
             .cell_in_row_at_scene(LauncherRow::Track(1), scene_id)
             .expect("セルが作られている");
@@ -502,7 +502,7 @@ mod launcher_cell_editing_tests {
         app.handle_event(AppEvent::SelectClip { target: arranged, additive: false });
 
         assert!(
-            app.selection.selected_launcher_cells.is_empty(),
+            app.cur.selection.selected_launcher_cells.is_empty(),
             "セル選択は降りる (選択枠も消える)"
         );
         assert_eq!(app.shown_pianoroll_clips(), vec![arranged], "ピアノロールはアレンジへ移る");
@@ -591,7 +591,7 @@ mod launcher_cell_editing_tests {
         }
         let row60 = LaneRef::KeyTrack { clip: cell, pitch: 60 };
         let row64 = LaneRef::KeyTrack { clip: cell, pitch: 64 };
-        let sel = |app: &AppData| app.selection.time.clone().expect("範囲がある");
+        let sel = |app: &AppData| app.cur.selection.time.clone().expect("範囲がある");
 
         // 1 回目: 行 60 の 2 つ (0..3 拍、 行 60 だけ)。
         app.select_all_pianoroll(Some(60));

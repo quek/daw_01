@@ -43,10 +43,10 @@ impl AppData {
         // ここは **Song 差し替えの後**に呼ばれる (`after_song_replaced`) ので、
         // 押しっぱなしノートの長さ確定は先に捨てる — 対象の Song はもう無く、
         // 同じ id が新 Song の別ノートに当たりうる。
-        self.recording.midi_recording_active_notes.clear();
+        self.cur.recording.midi_recording_active_notes.clear();
         self.stop();
         // r.md #121: ホーム (Space が再生を始める位置) は旧 Song の拍なので捨てる。
-        self.transport.home_beat = None;
+        self.cur.transport.home_beat = None;
         self.silence_monitor_notes();
         // r.md #67: カーソルキーの試聴音も止める (旧 Song の track id 宛の note-off が
         // 新 Song で宙に浮かないよう、モニター音と同じ扱いにする)。
@@ -58,62 +58,62 @@ impl AppData {
         //
         // -- 選択 / アンカー (ClipKey・track_id・lane_id・point index) -------
         // 解決できてしまうので、残すと Delete / Cut が非選択対象に当たる。
-        self.selection.selected_track_ids.clear();
-        self.selection.selected_section_ids.clear();
-        self.selection.selected_scene_ids.clear();
-        self.selection.selected_automation_clips.clear();
-        self.selection.selected_automation_points.clear();
-        self.selection.time = None;
-        self.selection.range_anchor = None;
-        self.selection.selected_launcher_cells.clear();
-        self.selection.launcher_cell_anchor = None;
+        self.cur.selection.selected_track_ids.clear();
+        self.cur.selection.selected_section_ids.clear();
+        self.cur.selection.selected_scene_ids.clear();
+        self.cur.selection.selected_automation_clips.clear();
+        self.cur.selection.selected_automation_points.clear();
+        self.cur.selection.time = None;
+        self.cur.selection.range_anchor = None;
+        self.cur.selection.selected_launcher_cells.clear();
+        self.cur.selection.launcher_cell_anchor = None;
         // r.md #87: ランチャーの一時状態も Song スコープの id を持つ
         // (フォーカス行 / Learn 待ちの宛先 / rename 中の列 / engine の走行状態)。
         // 捨てる規則は `LauncherUiState::reset_song_scoped` が持つ。
-        self.launcher.reset_song_scoped();
+        self.cur.launcher.reset_song_scoped();
         // (`time = None` が範囲の SSoT を既に捨てている。 ノート / audio event の
         // 選択はそこから導出されるので、追加で clear する口は要らない。)
         // r.md #71 (プラグインのコピー / 移動): device 選択も project スコープ。
-        self.selection.selected_device_ids.clear();
-        self.selection.device_anchor = None;
-        self.selection.track_anchor = None;
-        self.selection.section_anchor = None;
-        self.selection.scene_anchor = None;
-        self.selection.automation_point_anchor = None;
-        self.selection.automation_clip_anchor = None;
-        self.selection.last_edit_select = None;
+        self.cur.selection.selected_device_ids.clear();
+        self.cur.selection.device_anchor = None;
+        self.cur.selection.track_anchor = None;
+        self.cur.selection.section_anchor = None;
+        self.cur.selection.scene_anchor = None;
+        self.cur.selection.automation_point_anchor = None;
+        self.cur.selection.automation_clip_anchor = None;
+        self.cur.selection.last_edit_select = None;
 
         // -- 開いているエディタ / インスペクタの対象 ------------------------
         // `audio_editor_clip` は positional `ClipKey` なので、開いたままだと
         // 新 project の track[i].clip[j] を編集対象にしてしまう。
-        self.ui_ephemeral.audio_editor_clip = None;
-        self.ui_ephemeral.armed_mod_source = None;
-        self.ui_ephemeral.expanded_mod_sources.clear();
-        self.ui_ephemeral.open_plugin_params = None;
-        self.ui_ephemeral.open_video_fx_params = None;
+        self.cur.peph.audio_editor_clip = None;
+        self.cur.peph.armed_mod_source = None;
+        self.cur.peph.expanded_mod_sources.clear();
+        self.cur.peph.open_plugin_params = None;
+        self.cur.peph.open_video_fx_params = None;
 
         // -- track_id / ClipKey keyed の表示設定 ----------------------------
         // ViewState を持たない旧 .daw では `restore_view_state` が早期 return
         // するので、ここで消さないと前 project の値が適用され続ける。
-        self.ui_prefs.locked_pr_tracks.clear();
-        self.ui_prefs.expanded_automation_tracks.clear();
-        self.ui_prefs.hidden_automation_lanes.clear();
-        self.ui_prefs.track_row_overrides.clear();
-        self.ui_prefs.multi_clip_view_key.clear();
-        self.ui_prefs.collapsed_groups.clear();
+        self.cur.view.locked_pr_tracks.clear();
+        self.cur.view.expanded_automation_tracks.clear();
+        self.cur.view.hidden_automation_lanes.clear();
+        self.cur.view.track_row_overrides.clear();
+        self.cur.view.multi_clip_view_key.clear();
+        self.cur.view.collapsed_groups.clear();
 
         // -- 子プロセスに関する帳簿 (すべて device_id keyed) ----------------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
-        self.ipc.plugin_param_values.clear();
-        self.ipc.ara_doc_cache.clear();
-        self.ipc.ara_pcm_materialized.clear();
-        self.ipc.gui_open_requests.clear();
+        self.cur.pipc.plugin_param_values.clear();
+        self.cur.pipc.ara_doc_cache.clear();
+        self.cur.pipc.ara_pcm_materialized.clear();
+        self.cur.pipc.gui_open_requests.clear();
         // 進行中 bounce / Glue の焼き込みの完了通知を新 project に適用しない
         // (放置すると、前の曲の選択拍で新しい曲のクリップが削除され、前の曲の音を
         // 指すクリップが置かれる = 開いた直後の曲が黙って壊れる)。
-        self.ipc.pending_clip_fx_bounce = None;
-        self.ipc.pending_vocal_synth_bounce = None;
-        if self.ipc.pending_glue_bake.is_some() {
+        self.cur.pipc.pending_clip_fx_bounce = None;
+        self.cur.pipc.pending_vocal_synth_bounce = None;
+        if self.cur.pipc.pending_glue_bake.is_some() {
             self.abort_glue_bake(
                 "プロジェクトを切り替えたので Glue の焼き込みを中止しました".into(),
             );
@@ -121,18 +121,18 @@ impl AppData {
         // r.md #54: 前の曲のラウドネスレポート (数値も「範囲 x – y」の拍も) を
         // 新しい曲のものとして見せない。走査中なら engine ごと畳む。
         self.abort_loudness_analysis("プロジェクトを切り替えたのでラウドネス解析を中止しました".into());
-        self.loudness.report = None;
-        self.loudness.error = None;
+        self.cur.loudness.report = None;
+        self.cur.loudness.error = None;
 
         // ---- (B) **別プロジェクト**のときだけ無効になるもの ----------------
         // decode 済みメディアは「id + 実体」で同一性が決まるので、同じ project
         // を読み直すだけなら有効なまま (再 decode は無駄)。project が変われば
         // id 空間ごと別物になるので全部捨てる。
-        let project_id = self.song_doc.song().project_id;
-        if project_id != 0 && project_id == self.ui_ephemeral.loaded_project_id {
+        let project_id = self.cur.song_doc.song().project_id;
+        if project_id != 0 && project_id == self.cur.peph.loaded_project_id {
             return;
         }
-        self.ui_ephemeral.loaded_project_id = project_id;
+        self.cur.peph.loaded_project_id = project_id;
         // renderer を持つ runner に「preview 側の GPU 状態も捨てろ」と伝える世代印
         // (`PreviewWindowState::clear_all` / `cached_rings`)。 handle として表現できる
         // main renderer のテクスチャは下の破棄予約で渡すので、 世代印は
@@ -143,11 +143,11 @@ impl AppData {
         // 参照を捨てるだけだと GPU 側 store に entry が残り、 プロジェクトを開き直す
         // たびに VRAM が単調増加する (サムネイルはネイティブ解像度で 4K なら 1 枚 33MB)。
         self.discard_gpu_derived_caches();
-        self.media.audio_source_cache.retain(|_| false);
-        self.media.image_source_bgra.clear();
-        self.media.pending_image_uploads.clear();
-        self.media.video_thumbnail_rgba.clear();
-        self.media.pending_thumbnail_uploads.clear();
+        self.cur.media.audio_source_cache.retain(|_| false);
+        self.cur.media.image_source_bgra.clear();
+        self.cur.media.pending_image_uploads.clear();
+        self.cur.media.video_thumbnail_rgba.clear();
+        self.cur.media.pending_thumbnail_uploads.clear();
     }
 
     /// New / Open / Restore 時、 `SongDoc::replace_song` の直後に呼ぶ
@@ -193,12 +193,12 @@ impl AppData {
         // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
         // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。
-        self.ui_ephemeral.arrange_zoom_history.clear();
-        self.ui_ephemeral.arrange_zoom_anchor = None;
-        self.ui_prefs.automation_lane_row_overrides.clear();
+        self.cur.peph.arrange_zoom_history.clear();
+        self.cur.peph.arrange_zoom_anchor = None;
+        self.cur.view.automation_lane_row_overrides.clear();
         // r.md #10: 別 project の `Home` 2 段トグル state を持ち越さない
         // (= 新 project 最初の Home は先頭クリップ位置から始める)。
-        self.ui_ephemeral.home_toggle_at_first = false;
+        self.cur.peph.home_toggle_at_first = false;
         // 編集面の last-wins タグ (r.md #43) を含む Song スコープの参照系は、
         // 冒頭の `reset_song_scoped_state` が一括で捨てている。 個別に消し直さない
         // (破棄の口を 2 つにすると、また片方だけ更新される)。
@@ -208,7 +208,7 @@ impl AppData {
         // audio editor の対象は song を差し替えると消えている可能性があるので、
         // **前** に key を退避して `after_undo_redo` で引き直す。
         let key = self.audio_editor_target_key();
-        if !self.song_doc.undo() {
+        if !self.cur.song_doc.undo() {
             return;
         }
         self.after_undo_redo(key);
@@ -216,7 +216,7 @@ impl AppData {
 
     pub(crate) fn redo(&mut self) {
         let key = self.audio_editor_target_key();
-        if !self.song_doc.redo() {
+        if !self.cur.song_doc.redo() {
             return;
         }
         self.after_undo_redo(key);
@@ -227,7 +227,7 @@ impl AppData {
     /// (`after_undo_redo`) は最終 state に対して 1 度だけ走らせる。
     pub(crate) fn jump_history_to(&mut self, index: usize) {
         let key = self.audio_editor_target_key();
-        if !self.song_doc.jump_to(index) {
+        if !self.cur.song_doc.jump_to(index) {
             return;
         }
         self.after_undo_redo(key);
@@ -274,48 +274,48 @@ impl AppData {
         // **ピアノロールが閉じていた** (実機で報告)。
         // (review) automation point 選択 (`point_idx` positional) と inline 編集中
         // point も undo でずれるため clear (notes / audio events と同じ扱い)。
-        self.selection.selected_automation_points.clear();
-        self.ui_ephemeral.editing_automation_point = None;
+        self.cur.selection.selected_automation_points.clear();
+        self.cur.peph.editing_automation_point = None;
         // audio_editor_clip は安定 id (`ClipKey`) なので、undo で track/clip の
         // 並びが詰まっても別 clip を指すことは無い。残る失敗は「対象そのものが
         // 消える / audio でなくなる」なので、退避した key で引き直して解決不能なら
         // 閉じる (track 削除経路と共通のガード = `reanchor_audio_editor`)。
         self.reanchor_audio_editor(audio_editor_key);
-        self.ui_ephemeral.track_rename_id = None;
-        self.ui_ephemeral.track_rename_text.clear();
-        self.ui_ephemeral.section_rename_id = None;
-        self.ui_ephemeral.section_rename_text.clear();
+        self.cur.peph.track_rename_id = None;
+        self.cur.peph.track_rename_text.clear();
+        self.cur.peph.section_rename_id = None;
+        self.cur.peph.section_rename_text.clear();
         // 削除/undo で消えた section id を選択から除外。
-        self.selection.selected_section_ids
-            .retain(|id| self.song_doc.song().sections.iter().any(|s| s.id == *id));
-        self.ui_ephemeral.clip_rename = None;
-        self.ui_ephemeral.clip_rename_text.clear();
+        self.cur.selection.selected_section_ids
+            .retain(|id| self.cur.song_doc.song().sections.iter().any(|s| s.id == *id));
+        self.cur.peph.clip_rename = None;
+        self.cur.peph.clip_rename_text.clear();
         // r.md #87: 列見出しの rename も同じ (undo で列が消えれば commit 先が
         // 無くなり、消えた id に別の列が採り直されれば別の列へ commit される)。
-        self.launcher.scene_rename_id = None;
-        self.launcher.scene_rename_text.clear();
+        self.cur.launcher.scene_rename_id = None;
+        self.cur.launcher.scene_rename_text.clear();
         // selected_track_ids: undo で track が消えていたら除外。 残りが
         // 空なら「最後の track をカーソル」 にフォールバック (UI が
         // 完全選択ゼロでフリーズしないため)。
         let live_ids: std::collections::HashSet<u32> =
-            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
-        self.selection.selected_track_ids.retain(|id| live_ids.contains(id));
-        if self.selection.selected_track_ids.is_empty()
-            && let Some(last) = self.song_doc.song().tracks.last()
+            self.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
+        self.cur.selection.selected_track_ids.retain(|id| live_ids.contains(id));
+        if self.cur.selection.selected_track_ids.is_empty()
+            && let Some(last) = self.cur.song_doc.song().tracks.last()
         {
             let id = last.id;
-            self.selection.selected_track_ids.push(id);
+            self.cur.selection.selected_track_ids.push(id);
             // r.md #43: このフォールバックは **ユーザーの選択ではない** (undo で選択が
             // 全部消えたときに任意の 1 本を当てているだけ)。 last-wins タグが Tracks の
             // まま残ると、 直後の Delete が「触ってもいないトラック」 を消すので降ろす。
             // 削除経路の自動再選択は「削除位置の隣」 = 操作の続きなのでタグを保つが、
             // こちらは位置の連続性が無いので保てない。
-            if self.selection.last_edit_select == Some(EditSurface::Tracks) {
-                self.selection.last_edit_select = None;
+            if self.cur.selection.last_edit_select == Some(EditSurface::Tracks) {
+                self.cur.selection.last_edit_select = None;
             }
         }
         // collapsed_groups も track が消えていたら除外。
-        self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));
+        self.cur.view.collapsed_groups.retain(|id| live_ids.contains(id));
         // r.md #71 (プラグインのコピー / 移動): undo/redo で消えた device の id も
         // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
         self.prune_device_selection();
@@ -344,39 +344,6 @@ impl AppData {
 
     // -------- File ----------------------------------------------------------
 
-    pub(crate) fn action_new(&mut self) {
-        // 別プロジェクト (空) に切り替えるので現プロジェクトの plugin / editor を破棄。
-        self.teardown_all_loaded_plugins();
-        let mut song = Song::default();
-        // New プロジェクトに新しい project_id を採番 (clipboard の
-        // 同一プロジェクト判定用、別 New 同士は別プロジェクト扱いになる)。
-        song.ensure_project_id();
-        Self::migrate_legacy_vocal_tracks(&mut song);
-        self.song_doc.replace_song(song);
-        self.song_doc.file_path = None;
-        self.selection.selected_track_ids.clear();
-        self.selection.selected_scene_ids.clear();
-        self.ui_prefs.collapsed_groups.clear();
-        self.selection.time = None;
-        self.selection.range_anchor = None;
-        // 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
-        // (globals は現状維持 = 従来挙動)。`None` 経路 = action_open_path の旧ファイルと同じ。
-        // ループは New で必ず初期化する (前プロジェクトの範囲を持ち越さない)。
-        self.restore_view_state(None, common::model::LoopRegion::default(), Vec::new());
-        self.resize_track_peak_display();
-        // sync 前に migrated vocal track の builtin VOICEVOX を SetSlotPlugin
-        // で plugin host に load 要求する (= restore_plugin_from_song と同
-        // 経路、 起動直後の Song::default のみ self を持つので clone 経由)。
-        let song_snapshot = self.song_doc.song().clone();
-        self.restore_plugin_from_song(&song_snapshot);
-        self.resync_song_edit_texts();
-        // 新規プロジェクトを clean (= '*' 無し) で開始し、 旧プロジェクトの
-        // Undo/Redo 履歴を破棄する (直前の song 差し替え等で state が進むので、
-        // ここで saved_state_id を現 state に合わせて dirty を打ち消す)。
-        self.after_song_replaced();
-        tracing::info!("new project");
-    }
-
     pub(crate) fn action_open(&mut self) {
         let dialog = rfd::FileDialog::new().add_filter("daw", &["daw"]);
         self.spawn_file_dialog(
@@ -386,8 +353,8 @@ impl AppData {
         );
     }
 
-    /// Phase 6 review fix: project load 直後に `self.song_doc.song().audio_sources` 全件
-    /// を WAV decode して `self.media.audio_source_cache` に詰める。 旧コードでは
+    /// Phase 6 review fix: project load 直後に `self.cur.song_doc.song().audio_sources` 全件
+    /// を WAV decode して `self.cur.media.audio_source_cache` に詰める。 旧コードでは
     /// この path が欠落していて、 saved project を開いた audio clip の波形が
     /// 表示されなかった (= arrangement widget の波形 overlay で
     /// `audio_source_cache.get(event.source_id) → None`)。 import 経由 (=
@@ -395,7 +362,7 @@ impl AppData {
     /// が即 decode + cache 投入していたので、 そちらだけ波形が出るという
     /// intermittent な見え方になっていた。
     ///
-    /// caller は `self.song_doc.file_path` と `self.song_doc.song()` をセット済の前提。
+    /// caller は `self.cur.song_doc.file_path` と `self.cur.song_doc.song()` をセット済の前提。
     /// ProjectRelative は file_path.parent() で resolve、 Generated は廃止
     /// 仕様で skip。 decode 失敗は warn ログのみ (= waveform が出ないだけで
     /// 他機能は動く defensive)。
@@ -426,7 +393,7 @@ impl AppData {
         // file_path = None (= 未保存 project の sidecar 復元) の場合、
         // ProjectRelative は resolve できないので skip。
         let project_dir: Option<PathBuf> = self
-            .song_doc.file_path
+            .cur.song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
@@ -439,7 +406,7 @@ impl AppData {
         // 食い違う entry はここで捨てて decode し直す。
         let mut audio_jobs: Vec<(common::model::AudioSourceId, PathBuf)> = Vec::new();
         let mut stale_audio: Vec<common::model::AudioSourceId> = Vec::new();
-        for (&source_id, source) in &self.song_doc.song().media.audio_sources {
+        for (&source_id, source) in &self.cur.song_doc.song().media.audio_sources {
             let abs = match &source.path {
                 AudioSourcePath::Absolute(abs) => abs.clone(),
                 AudioSourcePath::ProjectRelative(rel) => match project_dir.as_ref() {
@@ -449,7 +416,7 @@ impl AppData {
                 // PR-V4 で廃止 (builtin VOICEVOX plugin 経由)。
                 AudioSourcePath::Generated { .. } => continue,
             };
-            match self.media.audio_source_cache.get(source_id) {
+            match self.cur.media.audio_source_cache.get(source_id) {
                 Some(buf) if buf.origin == abs => continue,
                 Some(_) => stale_audio.push(source_id),
                 None => {}
@@ -459,12 +426,12 @@ impl AppData {
         // 別 project の同 id を掴んだ entry は、decode 完了を待たずに **即座に**
         // 落とす (待つ間に波形描画 / onset 検出が前 project の音を読むため)。
         for source_id in stale_audio {
-            self.media.audio_source_cache.remove(source_id);
+            self.cur.media.audio_source_cache.remove(source_id);
         }
         // 未 staging の image source。
         let mut image_jobs: Vec<(common::model::ImageSourceId, PathBuf)> = Vec::new();
-        for (&source_id, source) in &self.song_doc.song().media.image_sources {
-            if self.media.image_source_bgra.contains_key(&source_id) {
+        for (&source_id, source) in &self.cur.song_doc.song().media.image_sources {
+            if self.cur.media.image_source_bgra.contains_key(&source_id) {
                 continue;
             }
             let abs = match &source.path {
@@ -485,9 +452,9 @@ impl AppData {
         // 他プラットフォームでは job を積まない (= total にも数えない)。
         let mut video_jobs: Vec<(common::model::VideoSourceId, PathBuf)> = Vec::new();
         if cfg!(windows) {
-            for (&source_id, source) in &self.song_doc.song().media.video_sources {
-                if self.media.video_thumbnail_rgba.contains_key(&source_id)
-                    || self.ui_ephemeral.video_texture_cache.contains_key(&source_id)
+            for (&source_id, source) in &self.cur.song_doc.song().media.video_sources {
+                if self.cur.media.video_thumbnail_rgba.contains_key(&source_id)
+                    || self.cur.peph.video_texture_cache.contains_key(&source_id)
                 {
                     continue;
                 }
@@ -510,8 +477,8 @@ impl AppData {
             // 走行中だった decode の marker も畳む (= その成果は孤児 Arc へ捨てる)。
             // `load_progress` も一緒に消さないと、 進捗 overlay が出たまま残る
             // (例: 重い project を読込中に「新規」 を選んだとき)。
-            self.media.asset_decode = None;
-            self.media.load_progress = None;
+            self.cur.media.asset_decode = None;
+            self.cur.media.load_progress = None;
             return;
         }
         let staging = Arc::new(Mutex::new(AssetDecodeStaging {
@@ -519,10 +486,12 @@ impl AppData {
             audio_remaining,
             ..Default::default()
         }));
-        self.media.asset_decode = Some(Arc::clone(&staging));
-        self.media.load_progress = Some((0, total));
-        self.media.load_progress_label = label;
+        self.cur.media.asset_decode = Some(Arc::clone(&staging));
+        self.cur.media.load_progress = Some((0, total));
+        self.cur.media.load_progress_label = label;
         let proxy = self.ipc.event_proxy.clone();
+        // 結果は **このタブ** へ返す (背景タブの読み込みでも波形が出る)。
+        let project = self.pk();
         std::thread::spawn(move || {
             for (id, abs) in audio_jobs {
                 let decoded = crate::import_audio::decode_audio(&abs)
@@ -539,7 +508,7 @@ impl AppData {
                     // 成否に関わらず 1 件消化 (失敗した source を待ち続けない)。
                     g.audio_remaining = g.audio_remaining.saturating_sub(1);
                 }
-                proxy.send(AppEvent::AssetDecodeTick);
+                proxy.send(AppEvent::AssetDecodeTick { project });
             }
             for (id, abs) in image_jobs {
                 let decoded = decode_image_to_bgra(&abs);
@@ -549,7 +518,7 @@ impl AppData {
                     }
                     g.done += 1;
                 }
-                proxy.send(AppEvent::AssetDecodeTick);
+                proxy.send(AppEvent::AssetDecodeTick { project });
             }
             for (id, abs) in video_jobs {
                 let decoded = decode_video_thumbnail(&abs);
@@ -559,7 +528,7 @@ impl AppData {
                     }
                     g.done += 1;
                 }
-                proxy.send(AppEvent::AssetDecodeTick);
+                proxy.send(AppEvent::AssetDecodeTick { project });
             }
         });
     }
@@ -567,7 +536,7 @@ impl AppData {
     /// 未 decode の **audio** source が残っているか (= 再生を gate すべきか)。
     /// 画像 / 動画サムネイルの decode 中は `false` (音は揃っているので再生してよい)。
     pub(crate) fn audio_decode_pending(&self) -> bool {
-        self.media
+        self.cur.media
             .asset_decode
             .as_ref()
             .and_then(|s| s.lock().ok().map(|g| g.audio_remaining > 0))
@@ -578,7 +547,7 @@ impl AppData {
     /// 溜まった結果を self caches へ流し込み (= 該当 clip の波形 / 画像が描画
     /// 開始)、 全件完了で gate を外して queue 中の Play を流す。
     pub(crate) fn on_asset_decode_tick(&mut self) {
-        let Some(staging) = self.media.asset_decode.clone() else {
+        let Some(staging) = self.cur.media.asset_decode.clone() else {
             return;
         };
         let (audio, image, video_thumbnail, done, total, audio_remaining) = {
@@ -595,26 +564,26 @@ impl AppData {
             )
         };
         for (id, buf) in audio {
-            self.media.audio_source_cache.insert(id, buf);
+            self.cur.media.audio_source_cache.insert(id, buf);
         }
         for (id, (w, h, bytes)) in image {
-            self.media.image_source_bgra.insert(id, (w, h, bytes));
-            self.media.pending_image_uploads.push(id);
+            self.cur.media.image_source_bgra.insert(id, (w, h, bytes));
+            self.cur.media.pending_image_uploads.push(id);
         }
         for (id, (w, h, rgba)) in video_thumbnail {
-            self.media.video_thumbnail_rgba.insert(id, (w, h, rgba));
-            self.media.pending_thumbnail_uploads.push(id);
+            self.cur.media.video_thumbnail_rgba.insert(id, (w, h, rgba));
+            self.cur.media.pending_thumbnail_uploads.push(id);
         }
         // 音が揃った時点で再生 gate を外す (画像 / サムネイルは待たない)。
-        if audio_remaining == 0 && self.transport.pending_play.is_some() {
+        if audio_remaining == 0 && self.cur.transport.pending_play.is_some() {
             self.fire_pending_play();
         }
         if done >= total {
             tracing::info!(total, "asset decode complete");
-            self.media.asset_decode = None;
-            self.media.load_progress = None;
+            self.cur.media.asset_decode = None;
+            self.cur.media.load_progress = None;
         } else {
-            self.media.load_progress = Some((done, total));
+            self.cur.media.load_progress = Some((done, total));
         }
     }
 
@@ -637,99 +606,105 @@ impl AppData {
 
     /// main renderer 上の派生テクスチャ (動画サムネイル / 画像) の参照を捨て、
     /// 実体の解放を runner (`drain_texture_destroys`) に予約する。
-    fn discard_gpu_derived_caches(&mut self) {
+    pub(crate) fn discard_gpu_derived_caches(&mut self) {
         let destroys = &mut self.ui_ephemeral.pending_texture_destroys;
-        destroys.extend(self.ui_ephemeral.video_texture_cache.drain().map(|(_, h)| h));
-        destroys.extend(self.ui_ephemeral.image_texture_cache.drain().map(|(_, h)| h));
+        destroys.extend(self.cur.peph.video_texture_cache.drain().map(|(_, h)| h));
+        destroys.extend(self.cur.peph.image_texture_cache.drain().map(|(_, h)| h));
     }
 
-    pub(crate) fn action_open_path(&mut self, path: PathBuf) {
+    /// プロジェクトファイルを読む (失敗は status / recent 掃除だけして `None`)。
+    /// Song は触らないので、読めないファイルのために空タブを作らずに済む。
+    pub(crate) fn load_project_file(&mut self, path: &Path) -> Option<common::project::LoadedProject> {
         // Recursive open を防ぐ: autosave file を直接開いた場合は弾く
         // (RecoveryRestore で開くべきもの)。
-        if common::recovery::is_autosave_file(&path) {
+        if common::recovery::is_autosave_file(path) {
             self.ui_ephemeral.status_message = format!(
                 "autosave ファイルは Recovery modal から復元してください: {}",
                 path.display()
             );
-            return;
+            return None;
         }
-        match common::project::load_project(&path) {
-            Ok(loaded) => {
-                let (mut song, view, loop_region, hidden_lanes) =
-                    (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);
-                let overlaps_resolved = loaded.overlaps_resolved;
-                tracing::info!(path = %path.display(), "loaded project");
-                song.ensure_ids();
-                Self::migrate_legacy_vocal_tracks(&mut song);
-                // 別プロジェクトを開くので、現プロジェクトの plugin と
-                // **開いている editor window** を先に全て破棄する。単一チェーン移行で
-                // project 切替時の teardown が漏れ、前プロジェクトの editor 窓が残って
-                // いた回帰の修正 (load 成功後・新 plugin load 前に実行)。
-                self.teardown_all_loaded_plugins();
-                self.restore_plugin_from_song(&song);
-                self.song_doc.replace_song(song);
-                self.song_doc.file_path = Some(path.clone());
-                // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの
-                // Undo/Redo 履歴と **Song スコープ状態** を破棄する
-                // (reset_saved_baseline 内で is_dirty=false)。
-                // `begin_asset_decode` / `restore_view_state` より **先** に呼ぶ:
-                // 後だと、前 project のキャッシュを見て「decode 済み」と判断した
-                // 直後にそのキャッシュが捨てられ、decode job も無いまま波形が
-                // 永久に出ない状態になる。
-                self.after_song_replaced();
-                // 重なっていたクリップを上書き規則で解消していたら、中身が変わって
-                // いるので正直に `*` を立てる (`docs/plan_range_selection.md` §6.4)。
-                if overlaps_resolved {
-                    self.song_doc.mark_dirty_after_load_fixup();
-                    self.ui_ephemeral.status_message =
-                        "重なっていたクリップを解消しました (上のクリップが優先)".to_string();
-                }
-                // audio / image / video サムネイルの decode は重いので background
-                // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像 /
-                // サムネイルは streaming で順次出る (begin_asset_decode →
-                // AssetDecodeTick)。
-                self.begin_asset_decode("プロジェクトを読込中");
-                // 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
-                // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
-                // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
-                self.restore_view_state(view, loop_region, hidden_lanes);
-                // 復元した選択クリップのトラックを追従選択 (= select_clip と同じ文脈復元)。
-                if let Some(r) = self.selected_clip_ref() {
-                    self.select_track(r.track_id);
-                }
-                self.resize_track_peak_display();
-                self.resync_song_edit_texts();
-                // sidecar 検出: 前回のセッションが正常終了せず、 同 file の
-                // autosave が残っているなら recovery modal に追加。 ユーザーが
-                // 「復元」 で sidecar に切り替えられる。
-                let sidecar = common::recovery::sidecar_for(&path);
-                if sidecar.exists() && !self.ui_ephemeral.recovery_candidates.contains(&sidecar) {
-                    // sidecar が .daw より新しいときだけ復元候補に出す。 古い
-                    // (= 保存後の消し損ね / unclean exit 残骸) は stale なので
-                    // 提示せず掃除する (delete-on-save の取りこぼし救済)。
-                    if Self::recovery_sidecar_is_newer(&sidecar, &path) {
-                        tracing::info!(
-                            sidecar = %sidecar.display(),
-                            "sidecar autosave detected on open (newer than saved file)"
-                        );
-                        self.ui_ephemeral.recovery_candidates.push(sidecar);
-                        self.ui_ephemeral.show_recovery_modal = true;
-                    } else {
-                        tracing::info!(
-                            sidecar = %sidecar.display(),
-                            "stale sidecar autosave (not newer than saved file); removing"
-                        );
-                        let _ = std::fs::remove_file(&sidecar);
-                    }
-                }
-                self.push_recent(path);
-            }
+        match common::project::load_project(path) {
+            Ok(loaded) => Some(loaded),
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to load project");
                 self.ui_ephemeral.status_message = format!("Open 失敗: {e:#}");
-                self.forget_recent_if_missing(&path);
+                self.forget_recent_if_missing(path);
+                None
             }
         }
+    }
+
+    /// 読み込んだプロジェクトを **アクティブなタブ** に据える (現在の中身は破棄)。
+    pub(crate) fn install_loaded_project(&mut self, path: PathBuf, loaded: common::project::LoadedProject) {
+        let (mut song, view, loop_region, hidden_lanes) =
+            (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);
+        let overlaps_resolved = loaded.overlaps_resolved;
+        tracing::info!(path = %path.display(), "loaded project");
+        song.ensure_ids();
+        Self::migrate_legacy_vocal_tracks(&mut song);
+        // 別プロジェクトを開くので、現プロジェクトの plugin と
+        // **開いている editor window** を先に全て破棄する。単一チェーン移行で
+        // project 切替時の teardown が漏れ、前プロジェクトの editor 窓が残って
+        // いた回帰の修正 (load 成功後・新 plugin load 前に実行)。
+        self.teardown_all_loaded_plugins();
+        self.restore_plugin_from_song(&song);
+        self.cur.song_doc.replace_song(song);
+        self.cur.song_doc.file_path = Some(path.clone());
+        // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの
+        // Undo/Redo 履歴と **Song スコープ状態** を破棄する
+        // (reset_saved_baseline 内で is_dirty=false)。
+        // `begin_asset_decode` / `restore_view_state` より **先** に呼ぶ:
+        // 後だと、前 project のキャッシュを見て「decode 済み」と判断した
+        // 直後にそのキャッシュが捨てられ、decode job も無いまま波形が
+        // 永久に出ない状態になる。
+        self.after_song_replaced();
+        // 重なっていたクリップを上書き規則で解消していたら、中身が変わって
+        // いるので正直に `*` を立てる (`docs/plan_range_selection.md` §6.4)。
+        if overlaps_resolved {
+            self.cur.song_doc.mark_dirty_after_load_fixup();
+            self.ui_ephemeral.status_message =
+                "重なっていたクリップを解消しました (上のクリップが優先)".to_string();
+        }
+        // audio / image / video サムネイルの decode は重いので background
+        // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像 /
+        // サムネイルは streaming で順次出る (begin_asset_decode →
+        // AssetDecodeTick)。
+        self.begin_asset_decode("プロジェクトを読込中");
+        // 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
+        // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
+        // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
+        self.restore_view_state(view, loop_region, hidden_lanes);
+        // 復元した選択クリップのトラックを追従選択 (= select_clip と同じ文脈復元)。
+        if let Some(r) = self.selected_clip_ref() {
+            self.select_track(r.track_id);
+        }
+        self.resize_track_peak_display();
+        self.resync_song_edit_texts();
+        // sidecar 検出: 前回のセッションが正常終了せず、 同 file の
+        // autosave が残っているなら recovery modal に追加。 ユーザーが
+        // 「復元」 で sidecar に切り替えられる。
+        let sidecar = common::recovery::sidecar_for(&path);
+        if sidecar.exists() && !self.ui_ephemeral.recovery_candidates.contains(&sidecar) {
+            // sidecar が .daw より新しいときだけ復元候補に出す。 古い
+            // (= 保存後の消し損ね / unclean exit 残骸) は stale なので
+            // 提示せず掃除する (delete-on-save の取りこぼし救済)。
+            if Self::recovery_sidecar_is_newer(&sidecar, &path) {
+                tracing::info!(
+                    sidecar = %sidecar.display(),
+                    "sidecar autosave detected on open (newer than saved file)"
+                );
+                self.ui_ephemeral.recovery_candidates.push(sidecar);
+                self.ui_ephemeral.show_recovery_modal = true;
+            } else {
+                tracing::info!(
+                    sidecar = %sidecar.display(),
+                    "stale sidecar autosave (not newer than saved file); removing"
+                );
+                let _ = std::fs::remove_file(&sidecar);
+            }
+        }
+        self.push_recent(path);
     }
 
     /// 消えた / 移動したファイルを Open Recent / Recently Saved から外す (Reaper と同じ:
@@ -831,15 +806,15 @@ impl AppData {
     }
 
     pub(crate) fn maybe_autosave(&mut self) {
-        if !self.song_doc.is_dirty() {
+        if !self.cur.song_doc.is_dirty() {
             return;
         }
-        if self.song_doc.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
+        if self.cur.song_doc.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
             return;
         }
 
         // 保存先決定: file_path Some なら sidecar、 None なら recovery_dir。
-        let autosave_path = match self.song_doc.file_path.as_ref() {
+        let autosave_path = match self.cur.song_doc.file_path.as_ref() {
             Some(orig) => common::recovery::sidecar_for(orig),
             None => {
                 let Some(dir) =
@@ -854,7 +829,7 @@ impl AppData {
                 }
                 common::recovery::recovery_path_for_session(
                     &dir,
-                    &self.song_doc.recovery_session_id,
+                    &self.cur.song_doc.recovery_session_id,
                 )
             }
         };
@@ -862,10 +837,10 @@ impl AppData {
         // autosave も表示状態を同梱する (= ダーティでなくても view が
         // 永続化される → スクロール/ズーム変更が `*` を立てずに次回 open で復元される)。
         let view = self.snapshot_view_state();
-        match common::project::save_project(&autosave_path, self.song_doc.song(), Some(&view)) {
+        match common::project::save_project(&autosave_path, self.cur.song_doc.song(), Some(&view)) {
             Ok(()) => {
                 tracing::info!(path = %autosave_path.display(), "autosaved");
-                self.song_doc.last_autosave = std::time::Instant::now();
+                self.cur.song_doc.last_autosave = std::time::Instant::now();
             }
             Err(e) => {
                 tracing::warn!(
@@ -887,7 +862,7 @@ impl AppData {
         if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
             stale.push(common::recovery::recovery_path_for_session(
                 &dir,
-                &self.song_doc.recovery_session_id,
+                &self.cur.song_doc.recovery_session_id,
             ));
         }
         for p in stale {
@@ -906,7 +881,7 @@ impl AppData {
             self.ui_ephemeral.recovery_candidates.retain(|c| c != &p);
         }
         // 次の autosave までの 60s タイマーを reset (= save 直後に即書き戻さない)。
-        self.song_doc.last_autosave = std::time::Instant::now();
+        self.cur.song_doc.last_autosave = std::time::Instant::now();
     }
 
     /// ダーティーガードで「保存せず続行/終了」 (discard) を選んだとき、
@@ -919,13 +894,13 @@ impl AppData {
     /// untitled = file_path None も session file だけ掃除する)。
     pub(crate) fn discard_current_autosave(&mut self) {
         let mut stale: Vec<PathBuf> = Vec::new();
-        if let Some(orig) = self.song_doc.file_path.as_ref() {
+        if let Some(orig) = self.cur.song_doc.file_path.as_ref() {
             stale.push(common::recovery::sidecar_for(orig));
         }
         if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
             stale.push(common::recovery::recovery_path_for_session(
                 &dir,
-                &self.song_doc.recovery_session_id,
+                &self.cur.song_doc.recovery_session_id,
             ));
         }
         for p in stale {
@@ -973,14 +948,24 @@ impl AppData {
         let (mut song, view, loop_region, hidden_lanes) =
             (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);
         song.ensure_ids();
+        // `docs/plan_project_tabs.md` §5.4: Open と同じ規則 — **同じファイルを 2 つのタブで
+        // 開かない** (開くと互いに上書きし合う)。sidecar の復元先は元の .daw なので、
+        // それを開いているタブがあればそこへ復元する。
+        let restore_to = common::recovery::original_file_for_sidecar(&autosave_path);
+        if let Some(key) = restore_to.as_deref().and_then(|p| self.tab_with_path(p)) {
+            self.switch_tab(key);
+        } else if !self.cur_tab_is_pristine() && self.new_tab().is_none() {
+            // pristine な Untitled ならそこへ、そうでなければ新しいタブへ。
+            return;
+        }
         // 別プロジェクトへの丸ごと差し替えなので、現プロジェクトの plugin と
         // 開いている editor window を先に全て破棄する (action_open_path /
         // action_new と同じ teardown。 これが無いと「plugin 入り project を開いた
         // 直後の復元」 で旧 plugin 実体・editor 窓・GUI cache が残る)。
         self.teardown_all_loaded_plugins();
         self.restore_plugin_from_song(&song);
-        self.song_doc.replace_song(song);
-        self.song_doc.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
+        self.cur.song_doc.replace_song(song);
+        self.cur.song_doc.file_path = restore_to;
         // 復元した内容を新しい保存ベースラインに確定し、 履歴と Song スコープ
         // 状態を破棄する (action_open_path と同じく decode / view 復元より先)。
         // sidecar は元 project と同じ `project_id` を持つので、同一 project の
@@ -1002,7 +987,7 @@ impl AppData {
             self.ui_ephemeral.show_recovery_modal = false;
         }
         tracing::info!(
-            recovered_to = ?self.song_doc.file_path,
+            recovered_to = ?self.cur.song_doc.file_path,
             "recovery restored"
         );
     }
@@ -1023,14 +1008,26 @@ impl AppData {
     }
 
     /// アプリ正常終了時 (`WindowEvent::CloseRequested`) に呼ぶ cleanup。
-    /// 自セッションで作った recovery file (sidecar / recovery_dir 両方) を削除。
+    /// 自セッションで作った recovery file (sidecar / recovery_dir 両方) を **全タブ** で削除。
     /// recovery file が無ければ no-op。 削除失敗は warn でログのみ。
     pub fn on_shutdown(&self) {
+        self.remove_recovery_files_of(&self.cur);
+        for ps in &self.tabs.parked {
+            self.remove_recovery_files_of(ps);
+        }
+    }
+
+    /// アクティブなタブの recovery file を削除する (タブを閉じるとき)。
+    pub(crate) fn remove_recovery_files_of_cur(&self) {
+        self.remove_recovery_files_of(&self.cur);
+    }
+
+    fn remove_recovery_files_of(&self, ps: &ProjectState) {
         // 自セッションの recovery_dir file
         if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
             let p = common::recovery::recovery_path_for_session(
                 &dir,
-                &self.song_doc.recovery_session_id,
+                &ps.song_doc.recovery_session_id,
             );
             if p.exists()
                 && let Err(e) = std::fs::remove_file(&p)
@@ -1043,7 +1040,7 @@ impl AppData {
             }
         }
         // sidecar (file_path が Some なら)
-        if let Some(orig) = self.song_doc.file_path.as_ref() {
+        if let Some(orig) = ps.song_doc.file_path.as_ref() {
             let side = common::recovery::sidecar_for(orig);
             if side.exists()
                 && let Err(e) = std::fs::remove_file(&side)
@@ -1088,13 +1085,13 @@ impl AppData {
             // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
             // RemoveSlotPlugin 単体は db 不要だが、 まとめて skip する
             // (= db ロード待ち)。
-            if !self.song_doc.song().tracks.is_empty() {
+            if !self.cur.song_doc.song().tracks.is_empty() {
                 tracing::warn!("reconcile: plugin database not loaded; skipped");
             }
             return;
         }
         let actions =
-            compute_slot_reconcile_actions(self.song_doc.song(), &self.ipc.loaded_devices);
+            compute_slot_reconcile_actions(self.cur.song_doc.song(), &self.cur.pipc.loaded_devices);
         for action in actions {
             match action {
                 SlotReconcileAction::RemoveDevice { device_id } => {
@@ -1108,10 +1105,10 @@ impl AppData {
                     // `handler/grouping.rs` の `plan_track_removal_ipc` doc)。
                     // 旧 Phase A が track 単位でまとめて送っていた責務を、
                     // device 単位でここが引き取る。
-                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
-                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
-                    self.ipc.loaded_devices.remove(&device_id);
-                    self.ipc.pending_plugin_loads.remove(&device_id);
+                    self.send_audio(AudioCommand::ClosePluginShmem { project: self.pk(), device_id });
+                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
+                    self.cur.pipc.loaded_devices.remove(&device_id);
+                    self.cur.pipc.pending_plugin_loads.remove(&device_id);
                 }
                 SlotReconcileAction::LoadDevice {
                     device_id,
@@ -1194,35 +1191,42 @@ impl AppData {
         // 「load 応答待ちの device」 (帳簿に居ない) か 「Song から消えたが host に
         // 残っている device」 (Song に居ない) のどちらかを取りこぼす。
         let mut ids: std::collections::HashSet<u64> =
-            self.ipc.loaded_devices.keys().copied().collect();
-        ids.extend(self.song_doc.song().all_plugins().map(|d| d.id));
+            self.cur.pipc.loaded_devices.keys().copied().collect();
+        ids.extend(self.cur.song_doc.song().all_plugins().map(|d| d.id));
         for device_id in ids {
-            self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+            self.send_audio(AudioCommand::ClosePluginShmem { project: self.pk(), device_id });
         }
         // project 切替。`device_id` は Song スコープの名前なので、 前 project の
         // instance を「列挙して消す」ことが原理的にできない (新 Song は旧 id を
         // 知らず、旧 Song はもう無い)。 帳簿にも Song にも依存しない
         // 「全部捨てろ」でしか塞げない (protocol.rs の UnloadAllPlugins doc 参照)。
-        self.send_plugin(PluginCommand::UnloadAllPlugins);
-        // 計測 slot も device_id で引くので同じく project スコープ。解放は
+        self.send_plugin(PluginCommand::UnloadProject { project: self.pk() });
+        // 計測 slot (token keyed) も project スコープ。解放は
         // これまでリソースモニタを描画しているフレームでしか走らず、モニタを
         // 開かずに project を開き続けると 512 slot が stale で埋まって以後
         // どの plugin も 0 μs になっていた。instance を全部落とした直後の
-        // ここが、live 集合が空だと確実に言える唯一の地点。
+        // ここが、このタブの live 集合が空だと確実に言える唯一の地点。
+        // 他のタブ (`tabs.parked`) の instance は生きているので残す。
         if let Some(bridge) = self.ipc.metrics_bridge.as_ref() {
-            bridge.reclaim_plugin_metric_slots(&std::collections::HashSet::new());
+            let live: std::collections::HashSet<common::protocol::InstanceToken> = self
+                .tabs
+                .parked
+                .iter()
+                .flat_map(|p| p.pipc.loaded_devices.values().map(|d| d.token))
+                .collect();
+            bridge.reclaim_plugin_metric_slots(&live);
         }
-        self.ipc.loaded_devices.clear();
-        self.ipc.open_plugin_guis.clear();
-        self.ipc.plugin_params.clear();
-        self.ipc.slot_has_gui.clear();
-        self.ipc.plugin_param_values.clear();
-        self.ipc.pending_plugin_loads.clear();
-        self.ipc.pending_added_plugin_finalize.clear();
-        self.ipc.gui_open_requests.clear();
+        self.cur.pipc.loaded_devices.clear();
+        self.cur.pipc.open_plugin_guis.clear();
+        self.cur.pipc.plugin_params.clear();
+        self.cur.pipc.slot_has_gui.clear();
+        self.cur.pipc.plugin_param_values.clear();
+        self.cur.pipc.pending_plugin_loads.clear();
+        self.cur.pipc.pending_added_plugin_finalize.clear();
+        self.cur.pipc.gui_open_requests.clear();
         // 「未ロード」 表示も project スコープ (前 project の device_id を
         // 次 project が再利用するので、 残すと無関係な device が失敗表示になる)。
-        self.ipc.failed_plugin_loads.clear();
+        self.cur.pipc.failed_plugin_loads.clear();
     }
 
     /// plugin_host に `SetSlotPlugin` を送る唯一の口 (script mode の生 API を除く)。
@@ -1256,7 +1260,7 @@ impl AppData {
         let resolved_id = entry.id.clone();
         let generation = self.track_pending_load(device_id);
         self.send_plugin(PluginCommand::SetSlotPlugin {
-            device_id,
+            device: self.dev(device_id),
             format,
             path,
             plugin_id: resolved_id,
@@ -1296,11 +1300,11 @@ impl AppData {
 
     /// 指定 track id 群の devices だけを plugin host に `SetSlotPlugin` で
     /// 実体化する (paste したトラックの plugin を state 込みで新インスタンス化)。
-    /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song_doc.song()` を読むため
+    /// [`Self::restore_plugin_from_song`] の track 限定版。`self.cur.song_doc.song()` を読むため
     /// to_send を先に owned で確保してから送る (borrow 回避)。
     pub(crate) fn restore_plugins_for_tracks(&mut self, track_ids: &[u32]) {
         let to_send: Vec<common::model::PluginInstance> = self
-            .song_doc
+            .cur.song_doc
             .song()
             .tracks
             .iter()
@@ -1313,7 +1317,7 @@ impl AppData {
     }
 
     pub(crate) fn action_save(&mut self) {
-        if let Some(path) = self.song_doc.file_path.clone() {
+        if let Some(path) = self.cur.song_doc.file_path.clone() {
             self.begin_save(path);
         } else {
             self.action_save_as();
@@ -1327,32 +1331,33 @@ impl AppData {
         self.request_quit(crate::shutdown::QuitRequest::USER);
     }
 
-    /// 現在のプロジェクトを破棄する操作 (終了 / New / Open /
-    /// Open Recent) のエントリ。 未保存変更があれば確認モーダルを開き、
-    /// 無ければ即 `action` を実行する。 ふつうの DAW と同じく「破棄する前に
-    /// 保存するか確認」 する。
+    /// **アクティブなタブ** を破棄する操作 (終了 / タブを閉じる) のエントリ。
+    /// 未保存変更があれば確認モーダルを開き、 無ければ即 `action` を実行する。
+    /// ふつうの DAW と同じく「破棄する前に保存するか確認」 する。
+    /// 対象タブは呼び出し側が先に `switch_tab` でアクティブにしておく
+    /// (`continue_quit` / `continue_close_tabs`)。
     pub fn request_guarded_action(&mut self, action: DirtyGuardAction) {
         // 既に終了確定 / 保存後アクション待ち / queue drain 待ち / モーダル表示中
         // なら、 連打で多重に処理しない (= 二重操作の無視 / ユーザーの判断待ち)。
         if self.shutdown.is_shutting_down()
             || self.ui_ephemeral.guard_after_save.is_some()
-            || self.ui_ephemeral.guard_pending_action.is_some()
+            || self.cur.pipc.guard_pending_action.is_some()
             || self.ui_ephemeral.dirty_guard.is_some()
         {
             return;
         }
         // plugin-state round-trip (Save / Deferred edit / Copy) が in-flight の間は、
-        // self.song_doc.song() も dirty 判定も確定していない (Deferred edit は完了時に track を
+        // self.cur.song_doc.song() も dirty 判定も確定していない (Deferred edit は完了時に track を
         // 削除する等)。 確認モーダルを出さず、 破壊操作も走らせず、 queue が drain
         // したら最新状態で **再評価** する (= `on_all_states_from_child` 末尾)。
         // 出してしまうと: ① 保存完了で clean 化した後も「未保存です」 と聞く stale
-        // 表示、 ② Deferred edit (track 削除等) 完了前に self.song_doc.song() を差し替えると、
+        // 表示、 ② Deferred edit (track 削除等) 完了前に self.cur.song_doc.song() を差し替えると、
         // pending な編集が別 project に誤適用されデータ破壊、 になる。
-        if !self.ipc.pending_state_queue.is_empty() {
-            self.ui_ephemeral.guard_pending_action = Some(action);
+        if !self.cur.pipc.pending_state_queue.is_empty() {
+            self.cur.pipc.guard_pending_action = Some(action);
             return;
         }
-        if self.song_doc.is_dirty() {
+        if self.cur.song_doc.is_dirty() {
             self.ui_ephemeral.dirty_guard = Some(action);
         } else {
             self.perform_guard_action(action);
@@ -1362,29 +1367,30 @@ impl AppData {
     /// ガード確認を抜けた (= 保存済 / 破棄選択 / clean) あとに、 保留していた
     /// 操作を実際に実行する。
     pub(crate) fn perform_guard_action(&mut self, action: DirtyGuardAction) {
-        // データ破壊ガード: New / Open / OpenPath は self.song_doc.song() / file_path を
-        // 破壊的に差し替える。 pending_state_queue に未完了 round-trip
-        // (Save / Deferred edit / Copy) が残っている間に実行すると、 その完了処理が
-        // 「差し替え後の song」 を「差し替え前に捕まえた path / track_id」 で扱い、
-        // 別 project を上書き / 別 project の track を削除して破壊する。 queue が
-        // drain するまで保留し、 完了ハンドラ (`on_all_states_from_child` 末尾) が
-        // queue 空の状態で再評価する。 (Quit は song を触らないので保留不要。)
-        if !self.ipc.pending_state_queue.is_empty()
-            && matches!(
-                action,
-                DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_)
-            )
+        // データ破壊ガード: タブを閉じるのは Song / 帳簿を破壊的に捨てる。
+        // pending_state_queue に未完了 round-trip (Save / Deferred edit / Copy) が
+        // 残っている間に実行すると、 その完了処理が別のタブ (`with_project` は閉じた
+        // タブへ配らないので実際は捨てられる) の save を失う。 queue が drain するまで
+        // 保留し、 完了ハンドラ (`on_all_states_from_child` 末尾) が queue 空の状態で
+        // 再評価する。 (Quit は `continue_quit` が round-trip 中のタブを自分で待つ。)
+        if !self.cur.pipc.pending_state_queue.is_empty()
+            && matches!(action, DirtyGuardAction::CloseTabs(_))
         {
-            self.ui_ephemeral.guard_pending_action = Some(action);
+            self.cur.pipc.guard_pending_action = Some(action);
             return;
         }
         match action {
-            // r.md #61: 「終了する」で即 exit するのではなく、子プロセスの
+            // r.md #61 / Q9: 次の未保存タブを確認し、全部通ったら子プロセスの
             // graceful teardown を待つシーケンスへ入る。
-            DirtyGuardAction::Quit(req) => self.begin_shutdown(req),
-            DirtyGuardAction::New => self.action_new(),
-            DirtyGuardAction::Open => self.action_open(),
-            DirtyGuardAction::OpenPath(path) => self.action_open_path(path),
+            DirtyGuardAction::Quit(req) => self.continue_quit(req),
+            // 先頭 = 確認を通った (= アクティブな) タブ。閉じて残りを続ける。
+            DirtyGuardAction::CloseTabs(mut keys) => {
+                if let Some(first) = keys.first().copied() {
+                    keys.remove(0);
+                    self.close_tab_now(first);
+                }
+                self.continue_close_tabs(keys);
+            }
         }
     }
 
@@ -1401,7 +1407,7 @@ impl AppData {
             return;
         };
         self.action_save();
-        if !self.song_doc.is_dirty() {
+        if !self.cur.song_doc.is_dirty() {
             self.perform_guard_action(action);
         } else if self.has_pending_save() {
             self.ui_ephemeral.guard_after_save = Some(action);
@@ -1411,10 +1417,33 @@ impl AppData {
         }
     }
 
+    /// ガードモーダルで「保存せず閉じる / 終了」 を選んだ処理。このタブの未保存変更を
+    /// 破棄する = その変更を写した autosave (sidecar / session recovery file) を消してから
+    /// 操作を実行する。 残すと、 同じ file を開き直したとき / 次回起動時に recovery 機構が
+    /// 「破棄したはずの変更を復元しますか？」 と聞いてしまう (実機検証で発覚)。
+    pub(crate) fn guard_discard(&mut self) {
+        let Some(action) = self.ui_ephemeral.dirty_guard.take() else {
+            return;
+        };
+        self.discard_current_autosave();
+        if matches!(action, DirtyGuardAction::Quit(_)) {
+            // 終了の途中 (Q9): 「保存せず終了」 と答えたタブは **もう聞かない**。
+            // ここで dirty を落とすのが唯一の記録で、`continue_quit` は次の未保存タブへ進む。
+            //
+            // **タブを閉じてはいけない。** 閉じる経路は書き出し / 解析中のタブを拒否するので、
+            // 拒否されると dirty が残ったまま `continue_quit` が同じタブをまた聞き、
+            // 確認モーダルが永久に出続ける (答えても終われない)。アプリごと終わるのだから
+            // タブを畳む必要も無い (`begin_shutdown` が全タブ分の Stop と子プロセスの
+            // teardown を担う)。autosave は上の `discard_current_autosave` で消してある。
+            self.cur.song_doc.mark_saved();
+        }
+        self.perform_guard_action(action);
+    }
+
     /// `pending_state_queue` に未処理の `Save` request が残っているか。
     /// 非同期保存 (plugin state 取得待ち) の in-flight 判定に使う。
     pub(crate) fn has_pending_save(&self) -> bool {
-        self.ipc.pending_state_queue
+        self.cur.pipc.pending_state_queue
             .iter()
             .any(|r| matches!(r, PendingStateRequest::Save { .. }))
     }
@@ -1491,7 +1520,7 @@ impl AppData {
     /// `RequestAllStates` を発行する意味が無いので、 deferred / save の
     /// dispatcher は plugin なしを早期判定して即時実行に切り替える。
     pub(crate) fn song_has_plugin(&self) -> bool {
-        self.song_doc.song().all_plugins().next().is_some()
+        self.cur.song_doc.song().all_plugins().next().is_some()
     }
 
     /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
@@ -1538,8 +1567,8 @@ impl AppData {
     /// IPC は発行しない (= 先行 request の応答処理時に次の `RequestAllStates`
     /// が改めて送られる、 [`AppData::on_all_states_from_child`] 参照)。
     pub(crate) fn enqueue_state_request(&mut self, req: PendingStateRequest) {
-        let was_idle = self.ipc.pending_state_queue.is_empty();
-        self.ipc.pending_state_queue.push_back(req);
+        let was_idle = self.cur.pipc.pending_state_queue.is_empty();
+        self.cur.pipc.pending_state_queue.push_back(req);
         if was_idle {
             self.dispatch_front_state_request();
         }
@@ -1571,26 +1600,26 @@ impl AppData {
             return;
         }
         let needs_snapshot = matches!(
-            self.ipc.pending_state_queue.front(),
+            self.cur.pipc.pending_state_queue.front(),
             Some(PendingStateRequest::Save { snapshot: None, .. })
         );
         if needs_snapshot {
-            let snap = Box::new(self.song_doc.song().clone());
-            let epoch = self.song_doc.edit_epoch();
+            let snap = Box::new(self.cur.song_doc.song().clone());
+            let epoch = self.cur.song_doc.edit_epoch();
             if let Some(PendingStateRequest::Save {
                 snapshot,
                 snap_epoch,
                 ..
-            }) = self.ipc.pending_state_queue.front_mut()
+            }) = self.cur.pipc.pending_state_queue.front_mut()
             {
                 *snapshot = Some(snap);
                 *snap_epoch = epoch;
             }
         }
-        self.send_plugin(PluginCommand::RequestAllStates);
+        self.send_plugin(PluginCommand::RequestAllStates { project: self.pk() });
         // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
-        self.ipc.state_request_sent_at = Some(std::time::Instant::now());
+        self.cur.pipc.state_request_sent_at = Some(std::time::Instant::now());
     }
 
     /// in-flight な plugin-state round-trip を強制的に破棄する。 plugin host が
@@ -1617,11 +1646,11 @@ impl AppData {
     /// 正しいのは「queue が空になった最新状態でガードをやり直す」ことで、これは
     /// `on_all_states_from_child` 末尾の正常系とまったく同じ扱い。
     pub(crate) fn abort_state_roundtrip(&mut self) {
-        self.ipc.pending_state_queue.clear();
-        self.ipc.state_request_sent_at = None;
+        self.cur.pipc.pending_state_queue.clear();
+        self.cur.pipc.state_request_sent_at = None;
         // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
         let after_save = self.ui_ephemeral.guard_after_save.take();
-        let pending = self.ui_ephemeral.guard_pending_action.take();
+        let pending = self.cur.pipc.guard_pending_action.take();
         if after_save.is_none() && pending.is_none() {
             return;
         }
@@ -1632,13 +1661,14 @@ impl AppData {
             .flatten()
             .find(|a| matches!(a, DirtyGuardAction::Quit(_)));
         match quit {
-            Some(action) => {
+            Some(DirtyGuardAction::Quit(req)) => {
                 tracing::warn!(
                     "aborted an in-flight plugin-state round-trip while quitting; \
                      re-asking with the current (unsaved) state"
                 );
-                self.request_guarded_action(action);
+                self.continue_quit(req);
             }
+            Some(DirtyGuardAction::CloseTabs(_)) => unreachable!("filtered to Quit above"),
             None => tracing::warn!(
                 "aborted an in-flight plugin-state round-trip; \
                  dropping the deferred dirty-guard action"
@@ -1667,11 +1697,11 @@ impl AppData {
         // gate に食われただけの save を中止してしまう。 gate と同条件の間は watchdog を
         // 止め、 export 後 (gate 解除後) に再評価する (応答が来ない真の hang なら、
         // gate 解除後に改めて閾値超過で発火する)。
-        if self.transport.export_stage.is_some() || self.transport.pending_video_export.is_some() {
+        if self.cur.transport.export_stage.is_some() || self.cur.transport.pending_video_export.is_some() {
             return;
         }
         const STATE_ROUNDTRIP_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
-        let Some(since) = self.ipc.state_request_sent_at else {
+        let Some(since) = self.cur.pipc.state_request_sent_at else {
             return;
         };
         if now.saturating_duration_since(since) <= STATE_ROUNDTRIP_WATCHDOG {
@@ -1696,8 +1726,8 @@ impl AppData {
             // plugin が無ければ state 収集 (RequestAllStates) は不要。 今の live を
             // そのまま凍結して即 serialize する。 cache migration は finish_save 内で
             // 行う (= live と snapshot の両方に適用、 file_path は成功時のみ確定)。
-            let snap_epoch = self.song_doc.edit_epoch();
-            let snapshot = Box::new(self.song_doc.song().clone());
+            let snap_epoch = self.cur.song_doc.edit_epoch();
+            let snapshot = Box::new(self.cur.song_doc.song().clone());
             self.finish_save(snapshot, path, snap_epoch);
             return;
         }
@@ -1716,7 +1746,7 @@ impl AppData {
     /// この間 load_overlay が「保存中…」インジケータを出す
     /// (= 非ブロック、 編集は続行可)。
     pub(crate) fn is_async_save_pending(&self) -> bool {
-        self.ipc.pending_state_queue
+        self.cur.pipc.pending_state_queue
             .iter()
             .any(|r| matches!(r, PendingStateRequest::Save { .. }))
     }

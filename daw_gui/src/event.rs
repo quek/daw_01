@@ -660,6 +660,9 @@ pub enum AppEvent {
     /// r.md #113: PC キーボードによる仮想鍵盤 (`docs/plan_virtual_keyboard.md`)。同じく
     /// 「1 arm = 1 サブ enum」。
     VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent),
+    /// `docs/plan_project_tabs.md` §5.2: プロジェクトタブの操作 (新規 / 開く / 切替 /
+    /// 閉じる / 並べ替え)。同じく「1 arm = 1 サブ enum」。
+    Tab(crate::event_tabs::TabEvent),
 
     // -------- Arrangement / clip operations -------------------------------
     SelectClip { target: ClipKey, additive: bool },
@@ -813,7 +816,11 @@ pub enum AppEvent {
 
     /// プロジェクトロードの background asset decode が 1 件完了する
     /// たびに発火。 staging を caches へ流し込み、 全件完了で gate を外す。
-    AssetDecodeTick,
+    /// `project` = decode を始めたタブ (`docs/plan_project_tabs.md` §5.1)。
+    /// **背景タブの読み込みでも波形 / サムネイルが出る**ために要る — 住所が無いと
+    /// アクティブなタブが自分の staging を持たずに tick を捨て、読み込んだタブは
+    /// 永久に decode 結果を受け取れない (進捗オーバーレイも消えない)。
+    AssetDecodeTick { project: common::protocol::ProjectKey },
 
     /// 再スキャンの VST3 note-effect probe 進捗 (done, total)。
     /// load_overlay に「プラグイン走査中 done/total」を出す。
@@ -1009,6 +1016,9 @@ pub enum AppEvent {
     /// r.md #50: マスターのピークはここに載らない。計測は `MasterMeterTick` の
     /// 解析器 1 か所が持つ (同じ音の値を 2 経路に複製しない)。
     Tick {
+        /// どのタブの engine slot か (`docs/plan_project_tabs.md` §2.5)。poller は開いている
+        /// 全 slot ぶん送り、`handle_event` が `with_project` で該当タブへ配る。
+        project: common::protocol::ProjectKey,
         samples: u64,
         preroll: u64,
         playing: bool,
@@ -1133,6 +1143,8 @@ pub enum AppEvent {
     /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ
     /// 組だから — 別イベントに割ると「同じ buffer の値かどうか」の保証が消える。
     TrackPeaksTick {
+        /// アクティブなタブの slot から読んだもの。届いた時点で `cur` が別タブなら捨てる。
+        project: common::protocol::ProjectKey,
         tracks: Vec<(f32, f32, f32)>,
         master_gr: (f32, f32),
     },
@@ -1144,14 +1156,23 @@ pub enum AppEvent {
     /// 「ユーザーが最後に撃った状態」= 再生の起点で、フォローアクションで移った先は
     /// engine の走行状態にしか無い。これを取り込まないと、音だけ次のセルへ進んで
     /// グリッドと映像が前のセルに取り残される。
-    LauncherRowsTick(Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>),
+    LauncherRowsTick {
+        project: common::protocol::ProjectKey,
+        rows: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>,
+    },
     /// docs/plan_modulation.md §4.2 / r.md #89: latest per-`ModSource` scalars
     /// (**`ModSource::id` キー**)、polled ~30Hz from the `AudioBridge` modulation
     /// plane. Drives visual modulation each frame.
-    ModScalarsTick(common::mod_plane::ModPlane),
+    ModScalarsTick {
+        project: common::protocol::ProjectKey,
+        plane: common::mod_plane::ModPlane,
+    },
     /// r.md #117: track ごとの鳴っているボイス `(track index, voice)`、 同じ poller が
     /// 30Hz で読む。 変調ラックが `Note` 起点ソースのカーソルをボイスごとに描く。
-    TrackVoicesTick(Vec<(usize, common::audio_bridge::VoiceSnapshot)>),
+    TrackVoicesTick {
+        project: common::protocol::ProjectKey,
+        voices: Vec<(usize, common::audio_bridge::VoiceSnapshot)>,
+    },
     /// resource monitor (r.md #3): poller が ~30Hz で読む全体メトリクス
     /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate)。
     MetricsTick {
@@ -1220,6 +1241,9 @@ pub enum AppEvent {
     /// 全体オーバーレイの「口パク生成中」を解除)、その後 generation 一致 & `clips` 非空の
     /// ときだけ口 track へ反映する。`target_track_id` は spawn 時に解決済の出力先 track id。
     LipsyncGenerated {
+        /// 発注したタブ (`docs/plan_project_tabs.md` §5.1)。track id は Song スコープの
+        /// 名前なので、住所が無いと別タブの同 id の track を作り直してしまう。
+        project: common::protocol::ProjectKey,
         vocal_track_id: u32,
         target_track_id: u32,
         bpm: f32,
@@ -1240,7 +1264,7 @@ pub enum AppEvent {
     /// 口パク自動再生成 debounce timer の発火。`mark_lipsync_dirty` が
     /// 立てた timer thread が送る。`lipsync_gen` と一致するときだけ
     /// (= それ以降変更なし) 全 bound vocal track を再生成する。Undo 対象外。
-    LipsyncDebounceFired(u64),
+    LipsyncDebounceFired { project: common::protocol::ProjectKey, generation: u64 },
     /// Clip Inspector の 2 段 dropdown で選択された声を、 対象
     /// clip (stable `ClipKey`) に焼き込む。 builtin へ再 flush して新しい声で
     /// 再合成する。
@@ -1463,11 +1487,16 @@ pub enum AppEvent {
     },
     /// 映像 render thread が発火（`done` / `total` フレーム）。`export_stage` を
     /// `VideoRender` に更新して進捗オーバーレイに反映。非 undoable。
-    ExportProgress { done: u64, total: u64 },
+    /// `project` = 書き出しているタブ。daw_audio 発の `AudioEvent::ExportWavComplete` は
+    /// 住所を持つのに、映像 render は daw_gui 内のスレッドなので自分で載せる
+    /// (載せないとタブを切り替えた瞬間から進捗が別のタブに着弾し、書き出し中のタブが
+    /// `export_stage` を抱えたまま操作不能・閉じられなくなる)。
+    ExportProgress { project: common::protocol::ProjectKey, done: u64, total: u64 },
     /// 映像 render thread の完了通知（成功時は出力 path、失敗 /
     /// キャンセル時は理由）。`export_stage` / `export_cancel` をクリアして
     /// status_message に結果を出す。非 undoable。
     ExportFinished {
+        project: common::protocol::ProjectKey,
         result: Result<PathBuf, String>,
     },
     /// 進捗オーバーレイの Cancel ボタン → 実行中 export の `export_cancel`
@@ -1799,6 +1828,26 @@ impl AppEvent {
     ///
     /// `begin_event` が **全 event** で呼ぶので安価であること (heap を持たない
     /// `&'static str` の純 match)。
+    /// この event が向く project (`docs/plan_project_tabs.md` §5.1)。子プロセスからの
+    /// protocol event は `project` / `device.project` を載せているので、`handle_event` は
+    /// それが **アクティブでないタブ** 宛なら `with_project` でそのタブへ配る。
+    /// `None` = アクティブなタブ (UI 操作) かデバイス全体 (`ChildDisconnected` 等)。
+    #[must_use]
+    pub fn target_project(&self) -> Option<common::protocol::ProjectKey> {
+        match self {
+            AppEvent::Audio(ev) => ev.project(),
+            AppEvent::Plugin(ev) => ev.project(),
+            // daw_gui 内の background スレッド (asset decode / 映像 render / 口パク合成) が
+            // 返す結果も、発注したタブへ配る (子プロセスの event と同じ扱い)。
+            AppEvent::AssetDecodeTick { project }
+            | AppEvent::ExportProgress { project, .. }
+            | AppEvent::ExportFinished { project, .. }
+            | AppEvent::LipsyncGenerated { project, .. }
+            | AppEvent::LipsyncDebounceFired { project, .. } => Some(*project),
+            _ => None,
+        }
+    }
+
     pub fn undo_label(&self) -> &'static str {
         use AppEvent as E;
         match self {

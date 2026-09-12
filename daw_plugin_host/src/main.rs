@@ -5,7 +5,7 @@
 //! daw_plugin_host — CLAP / VST3 / builtin plugin をホストする子プロセス。
 //!
 //! v29 (`docs/plan_arch_refactor.md` §6): bookkeeping は
-//! **安定 `device_id: u64` keyed の単一 `HashMap<u64, InstanceRecord>`** に
+//! **安定 `device: DeviceAddr` keyed の単一 `HashMap<DeviceAddr, InstanceRecord>`** に
 //! 一本化。旧 `(track, index)` positional キーの並行 4 map
 //! (plugin_lookup / loaded_id_for_slot / loaded_meta_for_slot /
 //! editor_windows) と、削除 / 並べ替え時の再キー儀式 (shift / permute) は
@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::plugin_ref::process_data_shmem_id;
-use common::protocol::{AudioSession, PluginCommand, PluginEvent, SlotState};
+use common::protocol::{AudioSession, DeviceAddr, InstanceToken, PluginCommand, PluginEvent, ProjectKey, SlotState};
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::mpsc as tmpsc;
@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
 use crate::process_server::{
     METRIC_SLOT_UNCLAIMED, PluginEntry, PluginRegistry, registry_insert, registry_remove,
-    registry_restore_all, registry_take_all,
+    registry_take_all,
 };
 
 /// Custom Win32 message id used to wake the plugin-main thread's `GetMessage`
@@ -123,28 +123,40 @@ struct InstanceRecord {
     /// プロセス)。record が生きている間 mapping を保持する。
     _shmem: common::process_data::ProcessDataHandle,
     shmem_id: String,
+    /// この instantiation の token (`docs/plan_project_tabs.md` §1.3) — worker registry /
+    /// metrics slot / shmem 名の incarnation を兼ねる。プロセス生存中に再利用しない。
+    token: InstanceToken,
     /// plugin 発 restart 要求の cooldown。
     restarts: RestartWindowTracker,
 }
 
+/// 開いているプロジェクト (= タブ) ごとの状態。`SetProjectDir` で upsert、
+/// `UnloadProject` で消える。
+#[derive(Default)]
+struct ProjectCtx {
+    /// ARA WAV 解決等 (v29 時点では `AraClipSpec.source_wav` が常に絶対
+    /// パスなので参照されないが、契約として保持)。
+    project_dir: Option<PathBuf>,
+}
+
 /// plugin 発の非同期 host 要求 (callback → channel → plugin-main loop)。
-/// v29: 全て load 時に capture した安定 device_id を運ぶ (旧 (track,index)
+/// v29: 全て load 時に capture した安定 device を運ぶ (旧 (track,index)
 /// 値 capture は削除 / 並べ替え後に stale になり「別デバイスの GUI を
 /// destroy / 別 plugin を reinit」する実バグだった)。
 #[derive(Debug, Clone, Copy)]
 enum HostNotify {
-    Resize(u64, u32, u32),
-    Closed(u64),
-    Show(u64, bool),
+    Resize(DeviceAddr, u32, u32),
+    Closed(DeviceAddr),
+    Show(DeviceAddr, bool),
     /// plugin 発 restart。`Vst3(flags)` は RestartFlags、`Full` は CLAP
     /// `request_restart` (= 全 reinit)。
-    Restart(u64, RestartKind),
+    Restart(DeviceAddr, RestartKind),
     /// CLAP `request_callback` → `on_main_thread()` を 1 回呼ぶ。
-    MainThreadCallback(u64),
+    MainThreadCallback(DeviceAddr),
     /// CLAP `clap_host_latency.changed`。
-    LatencyChanged(u64),
+    LatencyChanged(DeviceAddr),
     /// CLAP `clap_host_params.rescan`。
-    ParamsRescan(u64),
+    ParamsRescan(DeviceAddr),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -668,14 +680,14 @@ struct PluginHost {
     /// して daw_gui → daw_audio へ素通しされる。
     /// 契約は `common::plugin_ref` の module doc を参照。
     next_shmem_incarnation: u64,
-    /// **唯一の bookkeeping** (v29): 安定 device_id → record。
-    instances: HashMap<u64, InstanceRecord>,
+    /// **唯一の bookkeeping** (v29): 安定 device → record。
+    instances: HashMap<DeviceAddr, InstanceRecord>,
     /// worker pool が dispatch 中に読む lock-free registry。
     registry: PluginRegistry,
     worker_pool: Option<process_server::WorkerPool>,
-    /// ARA WAV 解決等 (v29 時点では `AraClipSpec.source_wav` が常に絶対
-    /// パスなので参照されないが、契約として保持)。
-    project_dir: Option<PathBuf>,
+    /// 開いているプロジェクト (= タブ) の帳簿。instance は `DeviceAddr.project` で
+    /// 帰属するので、ここには project 単位の情報だけ。
+    projects: HashMap<ProjectKey, ProjectCtx>,
 }
 
 impl PluginHost {
@@ -693,68 +705,68 @@ impl PluginHost {
             instances: HashMap::new(),
             registry: Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new())),
             worker_pool: None,
-            project_dir: None,
+            projects: HashMap::new(),
         }
     }
 
     /// Per-device host callbacks: 各ロード plugin は自分の **安定
-    /// device_id** を capture する (焼き込み座標の stale 問題が構造的に
+    /// device** を capture する (焼き込み座標の stale 問題が構造的に
     /// 消滅 — `docs/plan_arch_refactor.md` §1)。
-    fn make_callbacks(&self, device_id: u64) -> HostCallbacks {
+    fn make_callbacks(&self, device: DeviceAddr) -> HostCallbacks {
         let notify = |tx: &tmpsc::UnboundedSender<HostNotify>| tx.clone();
         HostCallbacks {
             on_request_resize: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move |w, h| {
-                    let _ = tx.send(HostNotify::Resize(device_id, w, h));
+                    let _ = tx.send(HostNotify::Resize(device, w, h));
                 })
             },
             on_closed: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::Closed(device_id));
+                    let _ = tx.send(HostNotify::Closed(device));
                 })
             },
             on_request_show: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::Show(device_id, true));
+                    let _ = tx.send(HostNotify::Show(device, true));
                 })
             },
             on_request_hide: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::Show(device_id, false));
+                    let _ = tx.send(HostNotify::Show(device, false));
                 })
             },
             on_restart_component: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move |flags: i32| {
-                    let _ = tx.send(HostNotify::Restart(device_id, RestartKind::Vst3(flags)));
+                    let _ = tx.send(HostNotify::Restart(device, RestartKind::Vst3(flags)));
                 })
             },
             on_request_restart: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::Restart(device_id, RestartKind::Full));
+                    let _ = tx.send(HostNotify::Restart(device, RestartKind::Full));
                 })
             },
             on_request_callback: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::MainThreadCallback(device_id));
+                    let _ = tx.send(HostNotify::MainThreadCallback(device));
                 })
             },
             on_latency_changed: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::LatencyChanged(device_id));
+                    let _ = tx.send(HostNotify::LatencyChanged(device));
                 })
             },
             on_params_rescan: {
                 let tx = notify(&self.notify_tx);
                 Arc::new(move || {
-                    let _ = tx.send(HostNotify::ParamsRescan(device_id));
+                    let _ = tx.send(HostNotify::ParamsRescan(device));
                 })
             },
             // VST3 param gesture (IComponentHandler)。CLAP plugin はこの
@@ -763,7 +775,7 @@ impl PluginHost {
                 let tx = self.evt_tx.clone();
                 Arc::new(move |param_id| {
                     let _ = tx.send(PluginEvent::PluginParamTouched {
-                        device_id,
+                        device,
                         param_id,
                         // display_name は daw_gui 側で plugin_params cache
                         // から解決する。
@@ -775,7 +787,7 @@ impl PluginHost {
                 let tx = self.evt_tx.clone();
                 Arc::new(move |param_id, value| {
                     let _ = tx.send(PluginEvent::PluginParamValueChanged {
-                        device_id,
+                        device,
                         param_id,
                         value,
                     });
@@ -784,7 +796,7 @@ impl PluginHost {
             on_param_gesture_end: {
                 let tx = self.evt_tx.clone();
                 Arc::new(move |param_id| {
-                    let _ = tx.send(PluginEvent::PluginParamGestureEnd { device_id, param_id });
+                    let _ = tx.send(PluginEvent::PluginParamGestureEnd { device, param_id });
                 })
             },
             // builtin VOICEVOX の合成状態報告 (旧 set_voicevox_status_reporter
@@ -793,7 +805,7 @@ impl PluginHost {
                 let tx = self.evt_tx.clone();
                 Arc::new(move |progress| {
                     let _ = tx.send(PluginEvent::VoicevoxSynthStatus {
-                        device_id,
+                        device,
                         progress,
                     });
                 })
@@ -809,11 +821,12 @@ impl PluginHost {
         let _ = self.evt_tx.send(evt);
     }
 
-    /// registry から `device_id` の entry を外し、worker の in-flight
+    /// registry から `device` の entry を外し、worker の in-flight
     /// dispatch を排出する。戻り値 = 外した entry (republish 用)。
     /// entry が未 publish なら quiesce も不要 (worker は触れない)。
-    fn detach_and_quiesce(&self, device_id: u64) -> Option<PluginEntry> {
-        let saved = registry_remove(&self.registry, device_id);
+    fn detach_and_quiesce(&self, device: DeviceAddr) -> Option<PluginEntry> {
+        let token = self.instances.get(&device)?.token;
+        let saved = registry_remove(&self.registry, token);
         if saved.is_some()
             && let Some(pool) = self.worker_pool.as_ref()
         {
@@ -822,30 +835,38 @@ impl PluginHost {
         saved
     }
 
-    /// `device_id` の plugin latency を再 query して `PluginLatencyChanged`
+    /// [`Self::detach_and_quiesce`] で外した entry を同じ instance の token で戻す。
+    /// (device が消えていれば捨てる = 戻し先が無い)
+    fn republish(&self, device: DeviceAddr, entry: PluginEntry) {
+        if let Some(rec) = self.instances.get(&device) {
+            registry_insert(&self.registry, rec.token, entry);
+        }
+    }
+
+    /// `device` の plugin latency を再 query して `PluginLatencyChanged`
     /// を emit する (activate 直後 / restart / reinit / CLAP latency.changed
     /// の共通関数 — `docs/plan_arch_refactor.md` §6 の非対称是正)。
-    fn requery_latency_and_emit(&mut self, device_id: u64) {
-        let Some(rec) = self.instances.get_mut(&device_id) else {
+    fn requery_latency_and_emit(&mut self, device: DeviceAddr) {
+        let Some(rec) = self.instances.get_mut(&device) else {
             return;
         };
         let samples = rec.plugin.query_latency();
-        tracing::info!(device_id, samples, "plugin reported latency");
-        self.emit(PluginEvent::PluginLatencyChanged { device_id, samples });
+        tracing::info!(?device, samples, "plugin reported latency");
+        self.emit(PluginEvent::PluginLatencyChanged { device, samples });
     }
 
     /// param 一覧を (再) 送信する (activate 直後 / CLAP params.rescan)。
-    fn emit_param_list(&mut self, device_id: u64) {
-        let Some(rec) = self.instances.get_mut(&device_id) else {
+    fn emit_param_list(&mut self, device: DeviceAddr) {
+        let Some(rec) = self.instances.get_mut(&device) else {
             return;
         };
         let params = rec.plugin.enumerate_params();
         if !params.is_empty() {
-            tracing::info!(device_id, count = params.len(), "plugin enumerated params");
+            tracing::info!(?device, count = params.len(), "plugin enumerated params");
         }
         let has_embedded_gui = rec.plugin.gui_is_embed_supported();
         self.emit(PluginEvent::PluginParamList {
-            device_id,
+            device,
             params,
             has_embedded_gui,
         });
@@ -861,9 +882,9 @@ impl PluginHost {
             PluginCommand::Ack | PluginCommand::Session(_) => {
                 tracing::warn!("unexpected handshake message after handshake; ignored");
             }
-            PluginCommand::SetProjectDir(dir) => {
-                tracing::info!(?dir, "project dir updated");
-                self.project_dir = dir;
+            PluginCommand::SetProjectDir { project, dir } => {
+                tracing::info!(?project, ?dir, "project dir updated");
+                self.projects.entry(project).or_default().project_dir = dir;
             }
             PluginCommand::OpenWorkerPool {
                 n_workers,
@@ -902,9 +923,9 @@ impl PluginHost {
                 }
                 tracing::info!(?mode, "render mode broadcast to all plugins");
             }
-            PluginCommand::ReinitAllPlugins => self.reinit_all_plugins(),
+            PluginCommand::ReinitAllPlugins { project } => self.reinit_all_plugins(project),
             PluginCommand::SetSlotPlugin {
-                device_id,
+                device,
                 format,
                 path,
                 plugin_id,
@@ -912,7 +933,7 @@ impl PluginHost {
                 generation,
             } => {
                 self.set_slot_plugin(
-                    device_id,
+                    device,
                     format,
                     &path,
                     &plugin_id,
@@ -920,8 +941,8 @@ impl PluginHost {
                     generation,
                 );
             }
-            PluginCommand::RemoveSlotPlugin { device_id } => {
-                self.teardown_device(device_id, true);
+            PluginCommand::RemoveSlotPlugin { device } => {
+                self.teardown_device(device, true);
             }
             // (r.md #61) 終了要求は `pipe_loop` が read ループを抜けるために
             // 消費するので、ここへは届かない。届いたら配線が壊れているので
@@ -929,35 +950,40 @@ impl PluginHost {
             PluginCommand::Shutdown => {
                 tracing::warn!("Shutdown reached handle_command; pipe_loop should have consumed it");
             }
-            PluginCommand::UnloadAllPlugins => {
-                // project 切替。`device_id` は Song スコープの名前なので、
-                // 残すと新 project の同 id device が旧 instance に dedup
-                // 吸収される (保存 state が復元されず前 project の音で鳴る)。
-                let ids: Vec<u64> = self.instances.keys().copied().collect();
-                tracing::info!(count = ids.len(), "UnloadAllPlugins: project switched");
+            PluginCommand::UnloadProject { project } => {
+                // タブを閉じた。列挙元は自分の帳簿 (open 応答が返る前の device も漏らさない)。
+                let mut ids: Vec<DeviceAddr> = self
+                    .instances
+                    .keys()
+                    .copied()
+                    .filter(|d| d.project == project)
+                    .collect();
+                ids.sort_unstable();
+                tracing::info!(?project, count = ids.len(), "UnloadProject");
                 for id in ids {
                     self.teardown_device(id, true);
                 }
+                self.projects.remove(&project);
             }
-            PluginCommand::RequestSlotState { device_id } => {
-                let data = match self.instances.get_mut(&device_id) {
+            PluginCommand::RequestSlotState { device } => {
+                let data = match self.instances.get_mut(&device) {
                     Some(rec) => match rec.plugin.state_save() {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::error!(error = ?e, device_id, "state_save failed");
+                            tracing::error!(error = ?e, ?device, "state_save failed");
                             None
                         }
                     },
                     None => None,
                 };
-                self.emit(PluginEvent::SlotPluginState { device_id, data });
+                self.emit(PluginEvent::SlotPluginState { device, data });
             }
-            PluginCommand::RequestAllStates => {
-                let entries = self.collect_all_states();
-                self.emit(PluginEvent::AllPluginStates { entries });
+            PluginCommand::RequestAllStates { project } => {
+                let entries = self.collect_all_states(project);
+                self.emit(PluginEvent::AllPluginStates { project, entries });
             }
             PluginCommand::OpenSlotGuiEmbedded {
-                device_id,
+                device,
                 title,
                 geometry,
                 owner_main_window,
@@ -965,30 +991,30 @@ impl PluginHost {
                 // r.md #65: owner が取れたかで、owner と `WS_EX_TOOLWINDOW` の
                 // **両方**が決まる (片方だけ成立する経路を作らない)。
                 let owner = editor_window::OwnerBinding::resolve(owner_main_window);
-                match self.open_gui(device_id, &title, geometry, owner) {
+                match self.open_gui(device, &title, geometry, owner) {
                     Ok(Some(geometry)) => {
-                        self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
+                        self.emit(PluginEvent::SlotGuiGeometry { device, geometry });
                     }
                     Ok(None) => {
-                        self.emit(PluginEvent::SlotGuiClosed { device_id });
+                        self.emit(PluginEvent::SlotGuiClosed { device });
                     }
                     Err(e) => {
-                        tracing::error!(error = ?e, device_id, "failed to open GUI");
+                        tracing::error!(error = ?e, ?device, "failed to open GUI");
                         // open_gui cleaned up its own (plugin + window) on
                         // failure; close_slot_gui is idempotent and also
                         // emits SlotGuiClosed.
-                        self.close_slot_gui(device_id);
+                        self.close_slot_gui(device);
                     }
                 }
             }
-            PluginCommand::CloseSlotGui { device_id } => {
-                self.close_slot_gui(device_id);
+            PluginCommand::CloseSlotGui { device } => {
+                self.close_slot_gui(device);
             }
             // r.md #55: 開いている窓は host 自身が知っている。daw_gui から
-            // device_id を並べてもらう形にすると、open 応答が返る前の窓が
+            // device を並べてもらう形にすると、open 応答が返る前の窓が
             // 列挙から漏れて閉じ残る (UnloadAllPlugins と同じ理由)。
             PluginCommand::CloseAllSlotGuis => {
-                let ids: Vec<u64> = self
+                let ids: Vec<DeviceAddr> = self
                     .instances
                     .iter()
                     .filter_map(|(&id, rec)| rec.editor.is_some().then_some(id))
@@ -1004,18 +1030,18 @@ impl PluginHost {
                 tracing::info!(count = chords.len(), "editor forwarded keys updated");
                 editor_keys::with_router(|r| r.set_forwarded_keys(chords));
             }
-            PluginCommand::SetEditorSendAllKeys { device_id, enabled } => {
-                editor_keys::with_router(|r| r.set_send_all_keys(device_id, enabled));
+            PluginCommand::SetEditorSendAllKeys { device, enabled } => {
+                editor_keys::with_router(|r| r.set_send_all_keys(device, enabled));
             }
             PluginCommand::SetBuiltinPluginNoteMetadata {
-                device_id,
+                device,
                 bpm,
                 chunk_secs,
                 entries,
                 talk,
             } => {
-                let Some(rec) = self.instances.get_mut(&device_id) else {
-                    tracing::warn!(device_id, "SetBuiltinPluginNoteMetadata: device not found");
+                let Some(rec) = self.instances.get_mut(&device) else {
+                    tracing::warn!(?device, "SetBuiltinPluginNoteMetadata: ?device not found");
                     return;
                 };
                 // VocalSynth capability (builtin VOICEVOX のみ Some)。CLAP /
@@ -1024,60 +1050,60 @@ impl PluginHost {
                     vs.set_note_metadata(bpm, chunk_secs, &entries, &talk);
                 }
             }
-            PluginCommand::PrepareVocalSynth { device_id } => {
-                self.prepare_vocal_synth(device_id);
+            PluginCommand::PrepareVocalSynth { device } => {
+                self.prepare_vocal_synth(device);
             }
-            PluginCommand::SetVocalSynthPriority { device_id, playhead_beats } => {
+            PluginCommand::SetVocalSynthPriority { device, playhead_beats } => {
                 // device 未発見でも **warn を出さない** — トランスポート中に毎秒来る
                 // 順序ヒントなので、ログを汚さない。
-                if let Some(rec) = self.instances.get_mut(&device_id)
+                if let Some(rec) = self.instances.get_mut(&device)
                     && let Some(vs) = rec.plugin.as_vocal_synth()
                 {
                     vs.set_priority_beats(playhead_beats);
                 }
             }
-            PluginCommand::SetupAraDocument { device_id, clips, bpm, time_sig, archive } => {
+            PluginCommand::SetupAraDocument { device, clips, bpm, time_sig, archive } => {
                 // setup_ara は内部で deactivate→activate するので quiesce 契約。
-                let saved = self.detach_and_quiesce(device_id);
+                let saved = self.detach_and_quiesce(device);
                 let published = saved.is_some();
-                match self.instances.get_mut(&device_id) {
+                match self.instances.get_mut(&device) {
                     Some(rec) => {
                         if published {
                             rec.plugin.stop_processing();
                         }
                         match rec.plugin.setup_ara(&clips, bpm, time_sig, archive.as_deref()) {
                             Ok(true) => {
-                                tracing::info!(device_id, n = clips.len(), "ARA document set up");
+                                tracing::info!(?device, n = clips.len(), "ARA document set up");
                             }
                             Ok(false) => {
                                 tracing::warn!(
-                                    device_id,
+                                    ?device,
                                     "SetupAraDocument: plugin is not ARA-capable, ignoring"
                                 );
                             }
                             Err(e) => {
-                                tracing::error!(error = ?e, device_id, "ARA setup failed");
+                                tracing::error!(error = ?e, ?device, "ARA setup failed");
                             }
                         }
                         if published
                             && let Err(e) = rec.plugin.start_processing()
                         {
-                            tracing::error!(error = ?e, device_id, "SetupAraDocument: start_processing failed");
+                            tracing::error!(error = ?e, ?device, "SetupAraDocument: start_processing failed");
                         }
                     }
                     None => {
-                        tracing::warn!(device_id, "SetupAraDocument: no plugin for device");
+                        tracing::warn!(?device, "SetupAraDocument: no plugin for ?device");
                     }
                 }
                 if let Some(entry) = saved {
-                    registry_insert(&self.registry, device_id, entry);
+                    self.republish(device, entry);
                 }
             }
-            PluginCommand::ClearAraDocument { device_id } => {
+            PluginCommand::ClearAraDocument { device } => {
                 // clear_ara も deactivate→activate を伴うので同じ quiesce 契約。
-                let saved = self.detach_and_quiesce(device_id);
+                let saved = self.detach_and_quiesce(device);
                 let published = saved.is_some();
-                if let Some(rec) = self.instances.get_mut(&device_id) {
+                if let Some(rec) = self.instances.get_mut(&device) {
                     if published {
                         rec.plugin.stop_processing();
                     }
@@ -1085,22 +1111,22 @@ impl PluginHost {
                     if published
                         && let Err(e) = rec.plugin.start_processing()
                     {
-                        tracing::error!(error = ?e, device_id, "ClearAraDocument: start_processing failed");
+                        tracing::error!(error = ?e, ?device, "ClearAraDocument: start_processing failed");
                     }
-                    tracing::info!(device_id, "ARA document cleared");
+                    tracing::info!(?device, "ARA document cleared");
                 }
                 if let Some(entry) = saved {
-                    registry_insert(&self.registry, device_id, entry);
+                    self.republish(device, entry);
                 }
             }
-            PluginCommand::UpdateAraRegions { device_id, regions } => {
-                match self.instances.get(&device_id) {
+            PluginCommand::UpdateAraRegions { device, regions } => {
+                match self.instances.get(&device) {
                     Some(rec) => {
                         rec.plugin.update_ara_regions(&regions);
-                        tracing::info!(device_id, n = regions.len(), "ARA regions updated");
+                        tracing::info!(?device, n = regions.len(), "ARA regions updated");
                     }
                     None => {
-                        tracing::warn!(device_id, "UpdateAraRegions: no plugin for device");
+                        tracing::warn!(?device, "UpdateAraRegions: no plugin for ?device");
                     }
                 }
             }
@@ -1111,7 +1137,7 @@ impl PluginHost {
     #[allow(clippy::too_many_arguments)]
     fn set_slot_plugin(
         &mut self,
-        device_id: u64,
+        device: DeviceAddr,
         format: PluginFormat,
         path: &std::path::Path,
         plugin_id: &str,
@@ -1122,19 +1148,20 @@ impl PluginHost {
         // LoadSong: 同じ plugin id が既にこの device に居るなら reload せず、
         // ただし daw_gui の `pending_plugin_loads` を解放するため
         // `SlotPluginLoaded` は必ず再 emit する (generation echo 付き)。
-        if let Some(rec) = self.instances.get_mut(&device_id)
+        if let Some(rec) = self.instances.get_mut(&device)
             && rec.requested_id == plugin_id
         {
             tracing::info!(
-                device_id,
+                ?device,
                 id = %plugin_id,
                 "SetSlotPlugin: same plugin already loaded, re-emitting SlotPluginLoaded"
             );
             let evt = PluginEvent::SlotPluginLoaded {
-                device_id,
+                device,
                 id: rec.loaded_id.clone(),
                 name: rec.name.clone(),
                 shmem_id: rec.shmem_id.clone(),
+                token: rec.token,
                 // 同 plugin の re-emit path。state_load を呼んでいないので
                 // error は常に None。
                 state_load_error: None,
@@ -1148,13 +1175,13 @@ impl PluginHost {
 
         // (1) 新 plugin の instantiate。失敗 ⇒ 旧 plugin は touch せず早期
         //     return (旧 plugin が居れば継続再生)。
-        let callbacks = self.make_callbacks(device_id);
+        let callbacks = self.make_callbacks(device);
         let mut plugin = match load_plugin(format, path, plugin_id, callbacks) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
                 self.emit(PluginEvent::SlotPluginLoadFailed {
-                    device_id,
+                    device,
                     plugin_id: plugin_id.to_string(),
                     reason: format!("{e}"),
                     generation,
@@ -1165,7 +1192,7 @@ impl PluginHost {
         // (r.md #5 ARA2) Bind ARA before the first state load / activate /
         // GUI creation, as the ARA spec requires.
         if let Err(e) = plugin.bind_ara_if_capable() {
-            tracing::error!(error = ?e, device_id, "ARA bind at load failed");
+            tracing::error!(error = ?e, ?device, "ARA bind at load failed");
         }
         // state_load 失敗は握りつぶさず `state_load_error` で daw_gui へ
         // (silent corruption fix)。plugin 自体は default 状態で進む。
@@ -1175,7 +1202,7 @@ impl PluginHost {
                 Err(e) => {
                     let reason = format!("{e:#}");
                     tracing::error!(
-                        device_id,
+                        ?device,
                         plugin = %plugin_id,
                         error = %reason,
                         "state_load failed (= plugin は default 状態で進む)",
@@ -1189,11 +1216,11 @@ impl PluginHost {
 
         // (2) 旧 instance の teardown (registry detach → quiesce → drop)。
         //     旧 plugin の unload は GUI へは通知しない (直後の
-        //     SlotPluginLoaded が同 device_id を上書きする)。ただし
+        //     SlotPluginLoaded が同 device を上書きする)。ただし
         //     `SlotPluginShmemReleased` は teardown_device が必ず送るので、
         //     daw_audio は下の (4) で作る新 mapping を開く前に旧 mapping を
         //     落とす (= 旧へ書いて新を読む窓が閉じる)。
-        self.teardown_device(device_id, false);
+        self.teardown_device(device, false);
 
         // (3) activate + start_processing。v29: 失敗した plugin は registry
         //     に **publish しない** (旧実装は無条件 publish でゾンビ化 →
@@ -1205,10 +1232,10 @@ impl PluginHost {
             .activate(sr, 64, mf)
             .and_then(|()| plugin.start_processing())
         {
-            tracing::error!(error = ?e, device_id, "activate/start_processing failed; not publishing");
+            tracing::error!(error = ?e, ?device, "activate/start_processing failed; not publishing");
             teardown_plugin(plugin);
             self.emit(PluginEvent::SlotPluginLoadFailed {
-                device_id,
+                device,
                 plugin_id: plugin_id.to_string(),
                 reason: format!("activate failed: {e:#}"),
                 generation,
@@ -1217,14 +1244,15 @@ impl PluginHost {
         }
 
         // (4) ProcessData shmem を作成。名前は **この instantiation 専用**
-        //     (incarnation を焼き込む)。device_id を再利用すると、前世代の
+        //     (incarnation を焼き込む)。device を再利用すると、前世代の
         //     mapping を daw_audio がまだ握っている間に同名 create が走って
         //     `already exists` で失敗する (解放は非同期で上限が無い) —
         //     `common::plugin_ref` の命名契約を参照。世代を含めれば前世代が
         //     生き残っていても create は必ず成功し、旧 mapping は保持者が
         //     居なくなった時点で静かに消える。
         self.next_shmem_incarnation += 1;
-        let shmem_id = process_data_shmem_id(self.pid, device_id, self.next_shmem_incarnation);
+        let token = InstanceToken(self.next_shmem_incarnation);
+        let shmem_id = process_data_shmem_id(self.pid, device.device_id, token.0);
         // 一意名にした後で `already exists` が出たら本物の設計バグ (同
         // incarnation の二重 create) なので、`NamedShmem::create` の排他
         // チェックは検出器として残してある。
@@ -1232,14 +1260,14 @@ impl PluginHost {
             Ok(handle) => {
                 // 名前をログに残す: この class の障害 (名前の再利用 / 世代ずれ) は
                 // 「どの名前を誰が握っているか」が分からないと追えない。
-                tracing::info!(device_id, %shmem_id, "created ProcessData shmem");
+                tracing::info!(?device, %shmem_id, "created ProcessData shmem");
                 handle
             }
             Err(e) => {
-                tracing::error!(error = ?e, device_id, %shmem_id, "failed to create ProcessData shmem");
+                tracing::error!(error = ?e, ?device, %shmem_id, "failed to create ProcessData shmem");
                 teardown_plugin(plugin);
                 self.emit(PluginEvent::SlotPluginLoadFailed {
-                    device_id,
+                    device,
                     plugin_id: plugin_id.to_string(),
                     reason: format!("shmem create failed: {e}"),
                     generation,
@@ -1265,7 +1293,7 @@ impl PluginHost {
         let transport_pinned_to_song = plugin.has_ara_session();
 
         self.instances.insert(
-            device_id,
+            device,
             InstanceRecord {
                 plugin,
                 editor: None,
@@ -1276,13 +1304,15 @@ impl PluginHost {
                 aux_input_count,
                 _shmem: shmem,
                 shmem_id: shmem_id.clone(),
+                token,
                 restarts: RestartWindowTracker::default(),
             },
         );
         registry_insert(
             &self.registry,
-            device_id,
+            token,
             PluginEntry {
+                device,
                 audio,
                 process_data: pd_ptr,
                 err_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1292,25 +1322,26 @@ impl PluginHost {
         );
 
         self.emit(PluginEvent::SlotPluginLoaded {
-            device_id,
+            device,
             id: loaded_id,
             name: loaded_name,
             shmem_id,
+            token,
             state_load_error,
             aux_output_count,
             aux_input_count,
             generation,
         });
-        tracing::info!(device_id, samples = latency_samples, "plugin reported latency");
+        tracing::info!(?device, samples = latency_samples, "plugin reported latency");
         self.emit(PluginEvent::PluginLatencyChanged {
-            device_id,
+            device,
             samples: latency_samples,
         });
         if !params.is_empty() {
-            tracing::info!(device_id, count = params.len(), "plugin enumerated params");
+            tracing::info!(?device, count = params.len(), "plugin enumerated params");
         }
         self.emit(PluginEvent::PluginParamList {
-            device_id,
+            device,
             params,
             has_embedded_gui,
         });
@@ -1318,27 +1349,32 @@ impl PluginHost {
 
     /// device の instance を完全 teardown する。`emit_unloaded` は
     /// `SlotPluginUnloaded` を送るか (replace 経路では送らない — 直後の
-    /// `SlotPluginLoaded` が同 device_id を上書きするので、daw_gui の
+    /// `SlotPluginLoaded` が同 device を上書きするので、daw_gui の
     /// bookkeeping を一度空にする必要はない)。
     ///
     /// `SlotPluginShmemReleased` は **`emit_unloaded` に関わらず必ず**送る。
     /// 「この device の shmem はもう無い」は「device が空になった」とは別の
     /// 事実で、daw_audio が旧 mapping を掴んだまま新 instance と食い違うのを
     /// 防ぐのはこちらの責務 (protocol の doc 参照)。
-    fn teardown_device(&mut self, device_id: u64, emit_unloaded: bool) {
-        let Some(mut rec) = self.instances.remove(&device_id) else {
+    fn teardown_device(&mut self, device: DeviceAddr, emit_unloaded: bool) {
+        let Some(mut rec) = self.instances.remove(&device) else {
             return;
         };
         // (0) daw_audio に mapping を落とさせる。plugin の destroy より先に
         //     送ることで、daw_gui → daw_audio の順序保証 (Released → 後続の
         //     Loaded) がそのまま「close が open に先行する」になる。
-        self.emit(PluginEvent::SlotPluginShmemReleased { device_id });
-        // (1) registry から外す → (2) in-flight dispatch 排出。
-        self.detach_and_quiesce(device_id);
+        self.emit(PluginEvent::SlotPluginShmemReleased { device });
+        // (1) registry から外す → (2) in-flight dispatch 排出。record は既に帳簿から
+        //     外してあるので `detach_and_quiesce` (帳簿で token を引く) ではなく token 直。
+        if registry_remove(&self.registry, rec.token).is_some()
+            && let Some(pool) = self.worker_pool.as_ref()
+        {
+            pool.quiesce();
+        }
         // (3) editor を先に取り出しておく (drop は plugin teardown の後)。
         let editor = rec.editor.take();
         // r.md #36: キー横取りフックの索引から外す (窓は (5) で壊す)。
-        editor_keys::with_router(|r| r.unregister_editor(device_id));
+        editor_keys::with_router(|r| r.unregister_editor(device));
         // r.md #65 同件: `close_slot_gui` と同じく、**アクティブな窓を破棄すると
         // アクティブは owner ではなく Alt+Esc 順の次の窓へ移る**。判定は drop の
         // 前に取る。この経路 (device 削除 / 差し替え / track 削除 / shutdown) は
@@ -1361,7 +1397,7 @@ impl PluginHost {
             if self.instances.values().all(|r| r.editor.is_none()) {
                 editor_window::clear_windows_active();
             }
-            self.emit(PluginEvent::SlotGuiClosed { device_id });
+            self.emit(PluginEvent::SlotGuiClosed { device });
         }
         // (6) shmem handle は rec ごと drop 済 (rec._shmem)。名前は
         //     incarnation 入りで二度と再利用されないので、daw_audio 側の
@@ -1369,31 +1405,48 @@ impl PluginHost {
         if emit_unloaded {
             // daw_gui はこれを受けて自分側の bookkeeping を片付ける
             // (shmem の close は上の `SlotPluginShmemReleased` が担当)。
-            self.emit(PluginEvent::SlotPluginUnloaded { device_id });
+            self.emit(PluginEvent::SlotPluginUnloaded { device });
         }
     }
 
-    /// ReinitAllPlugins: 全 plugin を clean state へ (export 前 / パニック)。
-    fn reinit_all_plugins(&mut self) {
+    /// ReinitAllPlugins: plugin を clean state へ (export 前 / パニック)。
+    /// `project = None` は全 instance、`Some` はその project だけ (背景タブの再生を乱さない)。
+    fn reinit_all_plugins(&mut self, project: Option<ProjectKey>) {
         // Force every plugin back to a clean, silent state with a
         // two-pronged reset (deactivate→activate + reset())。
         //   - deactivate→activate clears stubborn held voices (VCV Rack 2);
         //   - `reset()` clears CLAP DSP tails (reverb feedback network)。
         // Safety contract: registry detach → quiesce → mutate (this thread)
         // → republish。
-        let saved = registry_take_all(&self.registry);
+        let mut device_ids: Vec<DeviceAddr> = self
+            .instances
+            .keys()
+            .copied()
+            .filter(|d| project.is_none_or(|p| d.project == p))
+            .collect();
+        device_ids.sort_unstable();
+        let saved: HashMap<InstanceToken, PluginEntry> = match project {
+            None => registry_take_all(&self.registry),
+            Some(_) => device_ids
+                .iter()
+                .filter_map(|d| {
+                    let token = self.instances.get(d)?.token;
+                    registry_remove(&self.registry, token).map(|e| (token, e))
+                })
+                .collect(),
+        };
         if let Some(pool) = self.worker_pool.as_ref() {
             pool.quiesce();
         }
         let sr = f64::from(self.session.sample_rate);
         let mf = self.session.max_frames;
-        let mut restored = HashMap::new();
-        let mut reinitialised: Vec<u64> = Vec::new();
-        let device_ids: Vec<u64> = self.instances.keys().copied().collect();
-        for device_id in &device_ids {
-            let Some(rec) = self.instances.get_mut(device_id) else {
+        let mut restored: HashMap<InstanceToken, PluginEntry> = HashMap::new();
+        let mut reinitialised: Vec<DeviceAddr> = Vec::new();
+        for device in &device_ids {
+            let Some(rec) = self.instances.get_mut(device) else {
                 continue;
             };
+            let token = rec.token;
             rec.plugin.stop_processing();
             rec.plugin.deactivate();
             let ok = match rec
@@ -1403,37 +1456,41 @@ impl PluginHost {
             {
                 Ok(()) => true,
                 Err(e) => {
-                    tracing::error!(error = ?e, device_id, "reinit: activate/start failed; leaving detached");
+                    tracing::error!(error = ?e, ?device, "reinit: activate/start failed; leaving detached");
                     false
                 }
             };
             if ok {
                 rec.plugin.reset();
-                reinitialised.push(*device_id);
+                reinitialised.push(*device);
                 // 成功したものだけ republish (v29: 失敗 plugin をゾンビ
                 // publish しない — worker は無音バイパス)。
-                if let Some(entry) = saved.get(device_id) {
-                    restored.insert(*device_id, entry.clone());
+                if let Some(entry) = saved.get(&token) {
+                    restored.insert(token, entry.clone());
                 }
             }
         }
-        registry_restore_all(&self.registry, restored);
+        // 外した分だけ戻す (`registry_restore_all` で丸ごと置き換えると、project 限定の
+        // reinit で他タブの entry が消える)。
+        for (token, entry) in restored {
+            registry_insert(&self.registry, token, entry);
+        }
         // v29: reinit 完了時にも per-plugin latency を再 query + re-emit
         // (restartComponent 経路と共通関数 — 旧実装は非対称で export 前
         // reinit 後に PDC が stale になった)。query は active な plugin
         // にしか許されない (CLAP latency ext は `[main-thread & active]`)
         // ので、reinit に成功したものだけ。
         let n = reinitialised.len();
-        for device_id in reinitialised {
-            self.requery_latency_and_emit(device_id);
+        for device in reinitialised {
+            self.requery_latency_and_emit(device);
         }
-        tracing::info!(plugins = n, "reinitialised all plugins to clean state (export prep / panic)");
-        self.emit(PluginEvent::PluginsReinitDone);
+        tracing::info!(?project, plugins = n, "reinitialised plugins to clean state (export prep / panic)");
+        self.emit(PluginEvent::PluginsReinitDone { project });
     }
 
     /// plugin 発 restart (CLAP `request_restart` / VST3 `restartComponent`)
     /// の実行部。cooldown 超過は無視 + warn。
-    fn handle_restart(&mut self, device_id: u64, kind: RestartKind) {
+    fn handle_restart(&mut self, device: DeviceAddr, kind: RestartKind) {
         // VST3 RestartFlags の反応:
         //   kReloadComponent=1 / kIoChanged=2 → full reinit。
         //   kLatencyChanged=8 → latency 再 query のみ (deactivate→activate
@@ -1454,32 +1511,32 @@ impl PluginHost {
                 !reinit && latency
             }
         };
-        if !self.instances.contains_key(&device_id) {
+        if !self.instances.contains_key(&device) {
             return;
         }
         if latency_only {
             // plugin は active のままなので query 可能。
-            self.requery_latency_and_emit(device_id);
+            self.requery_latency_and_emit(device);
             return;
         }
         // full reinit — per-plugin cooldown (3 回 / 10s)。activate 中に
         // kIoChanged / kReloadComponent を再送する plugin への構造的防御。
-        if let Some(rec) = self.instances.get_mut(&device_id)
+        if let Some(rec) = self.instances.get_mut(&device)
             && !rec.restarts.allow(Instant::now())
         {
             tracing::warn!(
-                device_id,
+                ?device,
                 "plugin restart request ignored: exceeded {RESTART_MAX_IN_WINDOW} restarts in {RESTART_WINDOW:?} (reinit loop guard)"
             );
             return;
         }
-        let saved = self.detach_and_quiesce(device_id);
+        let saved = self.detach_and_quiesce(device);
         let published = saved.is_some();
         let sr = f64::from(self.session.sample_rate);
         let mf = self.session.max_frames;
         let mut ok = false;
         if published {
-            if let Some(rec) = self.instances.get_mut(&device_id) {
+            if let Some(rec) = self.instances.get_mut(&device) {
                 rec.plugin.stop_processing();
                 rec.plugin.deactivate();
                 ok = match rec
@@ -1489,7 +1546,7 @@ impl PluginHost {
                 {
                     Ok(()) => true,
                     Err(e) => {
-                        tracing::error!(error = ?e, device_id, "restart reinit: activate/start failed");
+                        tracing::error!(error = ?e, ?device, "restart reinit: activate/start failed");
                         false
                     }
                 };
@@ -1497,20 +1554,20 @@ impl PluginHost {
                     rec.plugin.reset();
                 }
             }
-            tracing::info!(device_id, ?kind, "plugin restart: reinitialised");
+            tracing::info!(?device, ?kind, "plugin restart: reinitialised");
         }
         // registry 未掲載 (published=false) なら reinit 対象外 — 何もしない
         // (旧実装と同義)。失敗した plugin は republish しない (ゾンビ防止)。
         if ok && let Some(entry) = saved {
-            registry_insert(&self.registry, device_id, entry);
+            self.republish(device, entry);
         }
         // latency query は active な plugin にしか許されないので成功時のみ。
         if ok {
-            self.requery_latency_and_emit(device_id);
+            self.requery_latency_and_emit(device);
         }
     }
 
-    fn prepare_vocal_synth(&mut self, device_id: u64) {
+    fn prepare_vocal_synth(&mut self, device: DeviceAddr) {
         // bounce / 曲全体の WAV 書き出しの前に合成完了を保証する。builtin VOICEVOX の
         // (queued, done, heartbeat) を取り出し、直前 flush 世代まで done になるのを
         // 別 thread で poll して VocalSynthReady を emit する
@@ -1518,26 +1575,31 @@ impl PluginHost {
         // 該当 builtin が無ければ / spawn に失敗したら即 ready (bounce を hang させない)。
         let progress = self
             .instances
-            .get_mut(&device_id)
+            .get_mut(&device)
             .and_then(|rec| rec.plugin.as_vocal_synth().map(|vs| vs.synth_progress()));
         let spawned = progress.is_some_and(|p| {
             let tx = self.evt_tx.clone();
-            crate::plugin_instance::spawn_vocal_synth_wait(device_id, p, move |ev| {
+            crate::plugin_instance::spawn_vocal_synth_wait(device, p, move |ev| {
                 let _ = tx.send(ev);
             })
         });
         if !spawned {
-            self.emit(PluginEvent::VocalSynthReady { device_id });
+            self.emit(PluginEvent::VocalSynthReady { device });
         }
     }
 
-    fn collect_all_states(&mut self) -> Vec<SlotState> {
+    fn collect_all_states(&mut self, project: ProjectKey) -> Vec<SlotState> {
         let mut out = Vec::new();
-        // Iterate in deterministic device_id order so save files diff cleanly.
-        let mut ids: Vec<u64> = self.instances.keys().copied().collect();
+        // Iterate in deterministic device order so save files diff cleanly.
+        let mut ids: Vec<DeviceAddr> = self
+            .instances
+            .keys()
+            .copied()
+            .filter(|d| d.project == project)
+            .collect();
         ids.sort_unstable();
-        for device_id in ids {
-            let Some(rec) = self.instances.get_mut(&device_id) else {
+        for device in ids {
+            let Some(rec) = self.instances.get_mut(&device) else {
                 continue;
             };
             let (data, error) = match rec.plugin.state_save() {
@@ -1545,7 +1607,7 @@ impl PluginHost {
                 Err(e) => {
                     let reason = format!("{e:#}");
                     tracing::error!(
-                        device_id,
+                        ?device,
                         plugin = rec.plugin.name(),
                         error = %reason,
                         "state_save failed (= SlotState.error 経由で daw_gui に通知)",
@@ -1554,7 +1616,7 @@ impl PluginHost {
                 }
             };
             out.push(SlotState {
-                device_id,
+                device_id: device.device_id,
                 data,
                 ara_archive: rec.plugin.store_ara_archive(),
                 error,
@@ -1585,12 +1647,12 @@ impl PluginHost {
     /// まとめる**のが構造的な解。
     fn open_gui(
         &mut self,
-        device_id: u64,
+        device: DeviceAddr,
         title: &str,
         saved: Option<common::model::EditorWindowGeometry>,
         owner: editor_window::OwnerBinding,
     ) -> Result<Option<common::model::EditorWindowGeometry>> {
-        let Some(rec) = self.instances.get_mut(&device_id) else {
+        let Some(rec) = self.instances.get_mut(&device) else {
             return Ok(None);
         };
         let plugin = &mut rec.plugin;
@@ -1758,7 +1820,7 @@ impl PluginHost {
         // `poll_editor_geometry` が同じ値をもう 1 通送る。
         let _ = editor.take_geometry_change();
         // r.md #36: キー横取りフックの hwnd → device 索引に載せる (窓を壊す側で外す)。
-        editor_keys::with_router(|r| r.register_editor(device_id, editor.hwnd_u64()));
+        editor_keys::with_router(|r| r.register_editor(device, editor.hwnd_u64()));
         rec.editor = Some(editor);
         // r.md #36: プラグインが GUI 生成時に自前のフックを張っていても、 我々が連鎖の
         // 先頭に居るように張り直す。
@@ -1776,21 +1838,21 @@ impl PluginHost {
         Ok(Some(geometry))
     }
 
-    /// close the editor for `device_id`: tear the plugin GUI down
+    /// close the editor for `device`: tear the plugin GUI down
     /// (`gui_hide` → `gui_destroy`) BEFORE destroying the container window,
     /// then notify daw_gui. Idempotent.
-    fn close_slot_gui(&mut self, device_id: u64) {
+    fn close_slot_gui(&mut self, device: DeviceAddr) {
         // r.md #65: 窓を壊す前に最後のジオメトリを送る (次回 open で復元する)。
         // ドラッグ確定時にも送っているが、閉じる直前の 1 発が「最後に見た形」を確定させる。
         // **最小化したまま閉じた場合は送らない** (`persistable_geometry` が None) —
         // `(-32000,-32000)` / `0×0` を保存すると次回 1×1 の窓で開いてしまう。
         let last_geometry = self
             .instances
-            .get(&device_id)
+            .get(&device)
             .and_then(|rec| rec.editor.as_ref())
             .and_then(editor_window::EditorWindow::persistable_geometry);
         if let Some(geometry) = last_geometry {
-            self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
+            self.emit(PluginEvent::SlotGuiGeometry { device, geometry });
         }
         // r.md #65: 破棄すると **アクティブは owner ではなく Alt+Esc 順の次の窓**へ
         // 移る (window-features "Destroying a Window")。前面が自分のグループだった
@@ -1798,10 +1860,10 @@ impl PluginHost {
         // **前**に取る (破棄後では自分の窓がもう無く、判定材料が消えている)。
         let restore_foreground = self
             .instances
-            .get(&device_id)
+            .get(&device)
             .and_then(|rec| rec.editor.as_ref())
             .and_then(editor_window::EditorWindow::owner_to_restore_if_foreground);
-        if let Some(rec) = self.instances.get_mut(&device_id) {
+        if let Some(rec) = self.instances.get_mut(&device) {
             let _ = rec.plugin.gui_hide();
             rec.plugin.gui_destroy();
             // Drop = DestroyWindow, run after gui_destroy detached the child.
@@ -1812,7 +1874,7 @@ impl PluginHost {
         }
         // r.md #36: 窓を壊すと対応する key-up はもう届かないので索引から外す
         // (横取り中の記録も一緒に捨てる)。
-        editor_keys::with_router(|r| r.unregister_editor(device_id));
+        editor_keys::with_router(|r| r.unregister_editor(device));
         // r.md #49: 窓が 1 枚も無いプロセスは定義上アクティブでない。アクティブな窓を
         // 閉じた場合 activation は他プロセスへ移るが、破棄済みの窓に `WM_ACTIVATEAPP`
         // は届かないので、ここで明示的に落とす (これが無いと daw_gui が
@@ -1820,7 +1882,7 @@ impl PluginHost {
         if self.instances.values().all(|r| r.editor.is_none()) {
             editor_window::clear_windows_active();
         }
-        self.emit(PluginEvent::SlotGuiClosed { device_id });
+        self.emit(PluginEvent::SlotGuiClosed { device });
     }
 
     fn handle_notify(&mut self, n: HostNotify) {
@@ -1831,8 +1893,8 @@ impl PluginHost {
             // ここには来ない。来るのは (a) GUI をまだ開いていない、(b) plugin-main
             // 以外のスレッドから CLAP `request_resize` (= `[thread-safe]`) が来た、の 2 つ。
             // **同じ関数へ合流させる**ので、経路が 2 本でも実装は 1 本 (SSoT)。
-            HostNotify::Resize(device_id, w, h) => {
-                let Some(rec) = self.instances.get(&device_id) else {
+            HostNotify::Resize(device, w, h) => {
+                let Some(rec) = self.instances.get(&device) else {
                     return;
                 };
                 let Some(win) = rec.editor.as_ref() else {
@@ -1842,17 +1904,17 @@ impl PluginHost {
                 };
                 let outcome = editor_window::plugin_requested_resize(win.hwnd_u64(), w, h);
                 if outcome != editor_window::PluginResizeOutcome::Applied {
-                    tracing::debug!(device_id, w, h, ?outcome, "deferred plugin resize not applied");
+                    tracing::debug!(?device, w, h, ?outcome, "deferred plugin resize not applied");
                 }
             }
-            HostNotify::Closed(device_id) => {
-                self.close_slot_gui(device_id);
+            HostNotify::Closed(device) => {
+                self.close_slot_gui(device);
             }
             // CLAP `clap_host_gui.request_show` / `request_hide`。
             // r.md #65: show は `hide()` で隠した窓を **見せ直せる**ようにする
             // (`SetForegroundWindow` だけでは非表示の窓は出てこない)。
-            HostNotify::Show(device_id, show) => {
-                if let Some(rec) = self.instances.get(&device_id)
+            HostNotify::Show(device, show) => {
+                if let Some(rec) = self.instances.get(&device)
                     && let Some(win) = rec.editor.as_ref()
                 {
                     if show {
@@ -1862,21 +1924,21 @@ impl PluginHost {
                     }
                 }
             }
-            HostNotify::Restart(device_id, kind) => {
-                self.handle_restart(device_id, kind);
+            HostNotify::Restart(device, kind) => {
+                self.handle_restart(device, kind);
             }
-            HostNotify::MainThreadCallback(device_id) => {
+            HostNotify::MainThreadCallback(device) => {
                 // CLAP `request_callback` → `on_main_thread()` (この thread =
                 // CLAP main-thread)。
-                if let Some(rec) = self.instances.get_mut(&device_id) {
+                if let Some(rec) = self.instances.get_mut(&device) {
                     rec.plugin.on_main_thread();
                 }
             }
-            HostNotify::LatencyChanged(device_id) => {
-                self.requery_latency_and_emit(device_id);
+            HostNotify::LatencyChanged(device) => {
+                self.requery_latency_and_emit(device);
             }
-            HostNotify::ParamsRescan(device_id) => {
-                self.emit_param_list(device_id);
+            HostNotify::ParamsRescan(device) => {
+                self.emit_param_list(device);
             }
         }
     }
@@ -1885,7 +1947,7 @@ impl PluginHost {
     /// ドラッグ中は送らない (`WM_EXITSIZEMOVE` / プラグイン起点 resize 完了で
     /// 1 回 dirty が立つ)。
     fn poll_editor_geometry(&mut self) {
-        let changes: Vec<(u64, common::model::EditorWindowGeometry)> = self
+        let changes: Vec<(DeviceAddr, common::model::EditorWindowGeometry)> = self
             .instances
             .iter()
             .filter_map(|(&id, rec)| {
@@ -1895,8 +1957,8 @@ impl PluginHost {
                     .map(|g| (id, g))
             })
             .collect();
-        for (device_id, geometry) in changes {
-            self.emit(PluginEvent::SlotGuiGeometry { device_id, geometry });
+        for (device, geometry) in changes {
+            self.emit(PluginEvent::SlotGuiGeometry { device, geometry });
         }
     }
 
@@ -1930,7 +1992,7 @@ impl PluginHost {
     /// **plugin に `removed()` を通す経路を飛ばさない**のが要点で、飛ばすと
     /// `IPlugView` が attach 済みのまま残る。
     fn poll_editor_close_requests(&mut self) {
-        let to_close: Vec<u64> = self
+        let to_close: Vec<DeviceAddr> = self
             .instances
             .iter()
             .filter(|(_, rec)| {
@@ -1962,8 +2024,8 @@ impl PluginHost {
             })
             .map(|(&id, _)| id)
             .collect();
-        for device_id in to_close {
-            self.close_slot_gui(device_id);
+        for device in to_close {
+            self.close_slot_gui(device);
         }
     }
 
@@ -2000,7 +2062,7 @@ impl PluginHost {
         // (2) 全 device を正規経路で畳む。`emit_unloaded` は false — device が
         //     「Song から外れた」のではなくプロセスが終わるだけで、受け手の
         //     daw_gui も同時に畳まれている。
-        let ids: Vec<u64> = self.instances.keys().copied().collect();
+        let ids: Vec<DeviceAddr> = self.instances.keys().copied().collect();
         tracing::info!(count = ids.len(), "shutdown: tearing down all devices");
         for id in ids {
             self.teardown_device(id, false);
@@ -2245,7 +2307,7 @@ async fn pipe_loop(
 fn log_command(cmd: &PluginCommand) {
     match cmd {
         PluginCommand::SetSlotPlugin {
-            device_id,
+            device,
             format,
             path,
             plugin_id,
@@ -2253,7 +2315,7 @@ fn log_command(cmd: &PluginCommand) {
             generation,
         } => {
             tracing::info!(
-                device_id,
+                ?device,
                 ?format,
                 path = %path.display(),
                 id = %plugin_id,
@@ -2262,9 +2324,9 @@ fn log_command(cmd: &PluginCommand) {
                 "received SetSlotPlugin"
             );
         }
-        PluginCommand::SetBuiltinPluginNoteMetadata { device_id, bpm, chunk_secs, entries, talk } => {
+        PluginCommand::SetBuiltinPluginNoteMetadata { device, bpm, chunk_secs, entries, talk } => {
             tracing::debug!(
-                device_id,
+                ?device,
                 bpm,
                 chunk_secs,
                 count = entries.len(),
@@ -2274,20 +2336,20 @@ fn log_command(cmd: &PluginCommand) {
         }
         // r.md #75: トランスポート中に毎 tick 来る順序ヒント。**必ず arm を持つこと** —
         // 下の catch-all は `info!` なので、arm が無いとログが優先度ヒントで溢れる。
-        PluginCommand::SetVocalSynthPriority { device_id, playhead_beats } => {
-            tracing::trace!(device_id, playhead_beats, "received SetVocalSynthPriority");
+        PluginCommand::SetVocalSynthPriority { device, playhead_beats } => {
+            tracing::trace!(?device, playhead_beats, "received SetVocalSynthPriority");
         }
-        PluginCommand::SetupAraDocument { device_id, clips, bpm, archive, .. } => {
+        PluginCommand::SetupAraDocument { device, clips, bpm, archive, .. } => {
             tracing::info!(
-                device_id,
+                ?device,
                 n = clips.len(),
                 bpm,
                 has_archive = archive.is_some(),
                 "received SetupAraDocument"
             );
         }
-        PluginCommand::UpdateAraRegions { device_id, regions } => {
-            tracing::info!(device_id, n = regions.len(), "received UpdateAraRegions");
+        PluginCommand::UpdateAraRegions { device, regions } => {
+            tracing::info!(?device, n = regions.len(), "received UpdateAraRegions");
         }
         other => {
             tracing::info!(?other, "received command");
@@ -2298,6 +2360,102 @@ fn log_command(cmd: &PluginCommand) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn test_host() -> (PluginHost, tmpsc::UnboundedReceiver<PluginEvent>) {
+        let (evt_tx, evt_rx) = tmpsc::unbounded_channel();
+        let (notify_tx, _notify_rx) = tmpsc::unbounded_channel();
+        let session = AudioSession {
+            shmem_id: String::new(),
+            metrics_shmem_id: String::new(),
+            scope_shmem_id: String::new(),
+            sample_rate: 48_000,
+            max_frames: 256,
+            channels: 2,
+        };
+        (PluginHost::new(session, evt_tx, notify_tx), evt_rx)
+    }
+
+    fn set_silence(host: &mut PluginHost, device: DeviceAddr) {
+        host.handle_command(PluginCommand::SetSlotPlugin {
+            device,
+            format: PluginFormat::Builtin,
+            path: PathBuf::from(common::plugin_db::BUILTIN_ID_SILENCE),
+            plugin_id: common::plugin_db::BUILTIN_ID_SILENCE.to_string(),
+            initial_state: None,
+            generation: 1,
+        });
+    }
+
+    /// `docs/plan_project_tabs.md` §4: 同じ `device_id` でも project が違えば別 instance。
+    /// registry (worker が引く側) は token で引くので 2 つとも載り、`UnloadProject` は
+    /// その project の分だけ消す。
+    #[test]
+    fn 同じ_device_id_は_project_ごとに別_instance_で_unload_project_は片方だけ消す() {
+        let (mut host, mut evt_rx) = test_host();
+        let a = DeviceAddr::new(ProjectKey(1), 1);
+        let b = DeviceAddr::new(ProjectKey(2), 1);
+        set_silence(&mut host, a);
+        set_silence(&mut host, b);
+        assert_eq!(host.instances.len(), 2);
+        let ta = host.instances[&a].token;
+        let tb = host.instances[&b].token;
+        assert_ne!(ta, tb, "token はプロセス内で一意");
+        assert_eq!(host.registry.load().len(), 2);
+        assert_eq!(host.registry.load()[&ta].device, a);
+        assert_eq!(host.registry.load()[&tb].device, b);
+
+        let mut loaded = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let PluginEvent::SlotPluginLoaded { device, token, .. } = ev {
+                loaded.push((device, token));
+            }
+        }
+        assert_eq!(loaded, vec![(a, ta), (b, tb)], "応答は住所 + token を返す");
+
+        host.handle_command(PluginCommand::UnloadProject { project: ProjectKey(1) });
+        assert_eq!(host.instances.len(), 1);
+        assert!(host.instances.contains_key(&b));
+        assert_eq!(host.registry.load().len(), 1);
+        assert!(host.registry.load().contains_key(&tb));
+        let mut unloaded = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let PluginEvent::SlotPluginUnloaded { device } = ev {
+                unloaded.push(device);
+            }
+        }
+        assert_eq!(unloaded, vec![a], "閉じた project の分だけ通知が返る");
+        host.shutdown();
+    }
+
+    /// `RequestAllStates` / `ReinitAllPlugins { Some }` は project で絞られる。
+    #[test]
+    fn 状態収集と_reinit_は_project_で絞られる() {
+        let (mut host, mut evt_rx) = test_host();
+        let a = DeviceAddr::new(ProjectKey(1), 5);
+        let b = DeviceAddr::new(ProjectKey(2), 5);
+        set_silence(&mut host, a);
+        set_silence(&mut host, b);
+        while evt_rx.try_recv().is_ok() {}
+
+        host.handle_command(PluginCommand::RequestAllStates { project: ProjectKey(2) });
+        let Ok(PluginEvent::AllPluginStates { project, entries }) = evt_rx.try_recv() else {
+            panic!("AllPluginStates expected");
+        };
+        assert_eq!(project, ProjectKey(2));
+        assert_eq!(entries.iter().map(|e| e.device_id).collect::<Vec<_>>(), vec![5]);
+
+        host.handle_command(PluginCommand::ReinitAllPlugins { project: Some(ProjectKey(1)) });
+        let mut done = None;
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let PluginEvent::PluginsReinitDone { project } = ev {
+                done = Some(project);
+            }
+        }
+        assert_eq!(done, Some(Some(ProjectKey(1))));
+        assert_eq!(host.registry.load().len(), 2, "他 project の entry が registry から消えない");
+        host.shutdown();
+    }
 
     /// restart cooldown: 10 秒窓で 3 回まで許可、4 回目は拒否、窓が過ぎれば
     /// 再び許可 (Melda 型 reinit 無限ループの構造的防御)。

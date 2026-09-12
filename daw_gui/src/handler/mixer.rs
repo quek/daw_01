@@ -22,7 +22,7 @@ impl AppData {
             song.master_gain = clamped;
             changed
         });
-        self.send_audio(AudioCommand::SetMasterGain(clamped));
+        self.send_audio(AudioCommand::SetMasterGain { project: self.pk(), gain: clamped });
     }
 
     // -------- Plugin picker -----------------------------------------------
@@ -46,9 +46,9 @@ impl AppData {
             let dest = self
                 .ui_ephemeral
                 .plugin_picker_target
-                .filter(|c| self.song_doc.song().chain_devices(*c).is_some())
+                .filter(|c| self.cur.song_doc.song().chain_devices(*c).is_some())
                 .unwrap_or(common::model::ChainRef::Track(track_id));
-            let at = self.song_doc.song().chain_devices(dest).map_or(0, Vec::len) as u32;
+            let at = self.cur.song_doc.song().chain_devices(dest).map_or(0, Vec::len) as u32;
             self.handle_event(AppEvent::AddParallel { chain: dest, index: at });
             return;
         }
@@ -93,7 +93,7 @@ impl AppData {
             // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
             // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
             // 常に積み、 auto-open だけ値で分岐する。
-            self.ipc
+            self.cur.pipc
                 .pending_added_plugin_finalize
                 .insert(device_id, open_gui);
             self.send_set_slot_plugin(device_id, &entry_id, None);
@@ -108,7 +108,7 @@ impl AppData {
         let dest = self
             .ui_ephemeral
             .plugin_picker_target
-            .filter(|c| self.song_doc.song().chain_devices(*c).is_some())
+            .filter(|c| self.cur.song_doc.song().chain_devices(*c).is_some())
             .unwrap_or(common::model::ChainRef::Track(track_id));
         if is_master {
             self.edit_song(move |song| {
@@ -293,7 +293,7 @@ impl AppData {
     pub(crate) fn finish_rescan(&mut self) {
         self.ipc.is_rescanning = false;
         // 走査進捗 overlay を消す (Phase B)。
-        self.media.load_progress = None;
+        self.cur.media.load_progress = None;
         let Some(new_db) = self.ipc.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };
@@ -311,7 +311,7 @@ impl AppData {
     // -------- Mixer --------------------------------------------------------
 
     // Phase 6 review (SSOT fix): `track_id` は stable な Track::id。 旧 GUI
-    // 側は Vec index を受け取って `self.song_doc.song().tracks.get_mut(idx)` していたが、
+    // 側は Vec index を受け取って `self.cur.song_doc.song().tracks.get_mut(idx)` していたが、
     // IPC を通すと audio engine 側の Vec 順序とずれて race を起こすため、
     // ここから IPC まで一貫して id で識別する。
     pub(crate) fn set_track_volume(&mut self, track_id: u32, volume: f32) {
@@ -319,7 +319,7 @@ impl AppData {
         // (r.md #11。 unity 上限だとフェーダーを 0dB より上げると 0dB へ戻った)。
         let v = volume.clamp(0.0, MAX_TRACK_GAIN);
         // 存在しない track は no-op (audio send / last-touched も出さない = 旧 early return)。
-        if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
+        if !self.cur.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
             return;
         }
         // SetSongBpmFromScrub と同 idiom: 値が実際に変わったときだけ dirty を立てて
@@ -333,11 +333,11 @@ impl AppData {
             t.volume = v;
             changed
         });
-        let msg = AudioCommand::SetTrackVolume { track: track_id, volume: v };
+        let msg = AudioCommand::SetTrackVolume { project: self.pk(), track: track_id, volume: v };
         self.send_audio(msg);
         // gui_01 #028 §7.3: knob 操作で last-touched param を更新。
         // `A` キー shortcut の source になる。
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Volume,
@@ -350,7 +350,7 @@ impl AppData {
     pub(crate) fn set_track_pan(&mut self, track_id: u32, pan: f32) {
         let p = pan.clamp(-1.0, 1.0);
         // 存在しない track は no-op (audio send / last-touched も出さない = 旧 early return)。
-        if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
+        if !self.cur.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
             return;
         }
         self.edit_song_checked(|song| {
@@ -361,9 +361,9 @@ impl AppData {
             t.pan = p;
             changed
         });
-        let msg = AudioCommand::SetTrackPan { track: track_id, pan: p };
+        let msg = AudioCommand::SetTrackPan { project: self.pk(), track: track_id, pan: p };
         self.send_audio(msg);
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Pan,
@@ -384,7 +384,7 @@ impl AppData {
     /// 「どのフィールドを触るか」は `ChannelStrip::set_target_value` が SSoT なので、
     /// ここは **どのトラックへ / どの副作用を出すか**だけを持つ。
     pub(crate) fn apply_strip_edit(&mut self, track_id: u32, edit: &StripEdit) {
-        if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
+        if !self.cur.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
             return;
         }
         // SC Listen は solo と同じ排他: 別トラックで点いていたら必ず消す
@@ -394,7 +394,7 @@ impl AppData {
         // 消灯させる相手は編集**前**に読む (編集後は全部 false になっていて
         // 「誰を送り直すべきか」が分からなくなる)。
         let listen_cleared: Vec<u32> = if exclusive_listen {
-            self.song_doc
+            self.cur.song_doc
                 .song()
                 .tracks
                 .iter()
@@ -456,9 +456,9 @@ impl AppData {
         // 全トラックを送ると 1 クリックで 32 通の IPC が飛ぶので、消灯対象は
         // 編集前に読んだ id (`listen_cleared`) に限る。
         for id in listen_cleared.into_iter().chain(std::iter::once(track_id)) {
-            if let Some(t) = self.song_doc.song().track_by_id(id) {
+            if let Some(t) = self.cur.song_doc.song().track_by_id(id) {
                 let strip = t.strip;
-                self.send_audio(AudioCommand::SetTrackStrip { track: id, strip });
+                self.send_audio(AudioCommand::SetTrackStrip { project: self.pk(), track: id, strip });
             }
         }
 
@@ -466,7 +466,7 @@ impl AppData {
         // スイッチ / モードはオートメーション対象ではないので載せない。
         if let StripEdit::Param { param, .. } = edit {
             let target = common::model::AutomationTarget::TrackBuiltin(*param);
-            self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+            self.cur.peph.last_touched_param = Some(TouchedParam {
                 track_id,
                 display_name: crate::automation_label::automation_target_display_name(&target),
                 target,
@@ -503,14 +503,14 @@ impl AppData {
             }
             song.master_strip != before
         });
-        let strip = self.song_doc.song().master_strip;
-        self.send_audio(AudioCommand::SetMasterStrip { strip });
+        let strip = self.cur.song_doc.song().master_strip;
+        self.send_audio(AudioCommand::SetMasterStrip { project: self.pk(), strip });
 
         // ON/OFF 以外は `A` キーでレーンを作る対象に載せる。master は Track では
         // ないので track_id は `MASTER_TRACK_ID` (song-level レーンの住所)。
         if !matches!(param, M::CompOn | M::EqOn | M::LimiterOn) {
             let target = common::model::AutomationTarget::MasterStrip(param);
-            self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+            self.cur.peph.last_touched_param = Some(TouchedParam {
                 track_id: common::model::MASTER_TRACK_ID,
                 display_name: crate::automation_label::automation_target_display_name(&target),
                 target,
@@ -524,9 +524,9 @@ impl AppData {
     pub(crate) fn toggle_strip_section(&mut self, section: StripSection) {
         match section {
             StripSection::Comp => {
-                self.ui_prefs.strip_comp_open = !self.ui_prefs.strip_comp_open;
+                self.cur.view.strip_comp_open = !self.cur.view.strip_comp_open;
             }
-            StripSection::Eq => self.ui_prefs.strip_eq_open = !self.ui_prefs.strip_eq_open,
+            StripSection::Eq => self.cur.view.strip_eq_open = !self.cur.view.strip_eq_open,
         }
     }
 
@@ -540,7 +540,7 @@ impl AppData {
     pub(crate) fn action_add_return_track(&mut self) {
         // 既存リターン数 + 1 で命名 (= 派生集合の cardinality)。
         let existing_returns = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .filter(|t| self.is_return_track(t.id))
@@ -616,7 +616,7 @@ impl AppData {
     /// 旧 `reindex_send_gain_lanes` の「後続 index 詰め」 は id 化で消滅)。
     pub(crate) fn remove_send(&mut self, track_id: u32, send_idx: usize) {
         let Some(send_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == track_id)
@@ -669,7 +669,7 @@ impl AppData {
         // v29: realtime IPC / automation target は positional index でなく
         // 安定 send id でアドレスする。 track/send が無ければ no-op (旧 early return)。
         let Some(send_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == track_id)
@@ -693,11 +693,12 @@ impl AppData {
             changed
         });
         self.send_audio(AudioCommand::SetSendGain {
+            project: self.pk(),
             track: track_id,
             send_id,
             gain: g,
         });
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::SendGain {
@@ -714,7 +715,7 @@ impl AppData {
     /// 同 idiom、 full-song resend しない (= 配線は維持したまま mute)。
     pub(crate) fn set_send_enabled(&mut self, track_id: u32, send_idx: usize, enabled: bool) {
         let Some(send_id) = self
-            .song_doc.song()
+            .cur.song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == track_id)
@@ -737,6 +738,7 @@ impl AppData {
             changed
         });
         self.send_audio(AudioCommand::SetSendEnabled {
+            project: self.pk(),
             track: track_id,
             send_id,
             enabled,
@@ -752,7 +754,7 @@ impl AppData {
         }) else {
             return;
         };
-        let msg = AudioCommand::SetTrackMuted { track: track_id, muted };
+        let msg = AudioCommand::SetTrackMuted { project: self.pk(), track: track_id, muted };
         self.send_audio(msg);
     }
 
@@ -765,7 +767,7 @@ impl AppData {
         }) else {
             return;
         };
-        let msg = AudioCommand::SetTrackSolo { track: track_id, solo };
+        let msg = AudioCommand::SetTrackSolo { project: self.pk(), track: track_id, solo };
         self.send_audio(msg);
     }
 
@@ -778,22 +780,22 @@ impl AppData {
         }) else {
             return;
         };
-        let msg = AudioCommand::SetTrackArmed { track: track_id, armed };
+        let msg = AudioCommand::SetTrackArmed { project: self.pk(), track: track_id, armed };
         self.send_audio(msg);
         if !armed {
             // r.md #51: arm を外した瞬間に、そのトラックで鳴らしていたモニター音を
             // 止める。 note-off はもう届かない (armed でないので送り先から外れる) ので、
             // ここで消さないと鍵盤を離しても鳴り続ける。
             let held: Vec<u8> = self
-                .recording
+                .cur.recording
                 .monitor_notes
                 .iter()
                 .filter(|(t, _)| *t == track_id)
                 .map(|(_, p)| *p)
                 .collect();
             for pitch in held {
-                self.recording.monitor_notes.remove(&(track_id, pitch));
-                self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+                self.cur.recording.monitor_notes.remove(&(track_id, pitch));
+                self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
             }
         }
     }
@@ -811,14 +813,14 @@ impl AppData {
     ) {
         const RELEASE: f32 = 0.85;
         // マスターストリップの GR も同じ弾道で 0 へ戻す (per-track と同じ規則)。
-        let m = &mut self.transport.master_strip_gr;
+        let m = &mut self.cur.transport.master_strip_gr;
         m.0 = common::meter::update_peak(m.0, (-master_gr.0).max(0.0), RELEASE);
         m.1 = common::meter::update_peak(m.1, (-master_gr.1).max(0.0), RELEASE);
-        let n = self.song_doc.song().tracks.len();
-        if self.transport.track_peak_display.len() != n {
-            self.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));
+        let n = self.cur.song_doc.song().tracks.len();
+        if self.cur.transport.track_peak_display.len() != n {
+            self.cur.transport.track_peak_display.resize(n, (0.0, 0.0, 0.0));
         }
-        for (i, d) in self.transport.track_peak_display.iter_mut().enumerate() {
+        for (i, d) in self.cur.transport.track_peak_display.iter_mut().enumerate() {
             let (l, r, gr_db) = peaks.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
             d.0 = common::meter::update_peak(d.0, l, RELEASE);
             d.1 = common::meter::update_peak(d.1, r, RELEASE);

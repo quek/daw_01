@@ -58,8 +58,8 @@ fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<PluginCom
 /// 保存された project ファイルのパスを返す。
 fn save_fresh_project(app: &mut AppData, proj_dir: &std::path::Path) -> std::path::PathBuf {
     let proj_path = proj_dir.join("proj.daw");
-    app.song_doc.file_path = Some(proj_path.clone());
-    app.song_doc.normalize(|_| {});
+    app.cur.song_doc.file_path = Some(proj_path.clone());
+    app.cur.song_doc.normalize(|_| {});
     app.request_close();
     app.handle_event(AppEvent::DirtyGuardSave);
     proj_path
@@ -76,7 +76,7 @@ fn save_persists_recent_into_injected_dir() {
 
     // 前提: 同期保存が成功している。
     assert!(proj_path.exists(), "project file written: {}", proj_path.display());
-    assert!(!app.song_doc.is_dirty(), "is_dirty cleared after save");
+    assert!(!app.cur.song_doc.is_dirty(), "is_dirty cleared after save");
 
     // 本題: recent / recent_saved は **注入した data_dir** に書かれ、
     // 中身は今保存した proj.daw 1 件 (実 %LOCALAPPDATA% ではない)。
@@ -108,7 +108,7 @@ fn none_app_dirs_saves_project_without_persisting_recent() {
         proj_path.exists(),
         "project file written even with no app_dirs"
     );
-    assert!(!app.song_doc.is_dirty(), "is_dirty cleared after save");
+    assert!(!app.cur.song_doc.is_dirty(), "is_dirty cleared after save");
 
     // in-memory list は更新される (= menu は session 内で機能する) が、
     // app_dirs=None なので disk へは一切書かない。 disk 検証は

@@ -87,7 +87,7 @@ impl AppData {
     pub(crate) fn edit_mod_source(&mut self, id: u32, edit: ModSourceEdit) {
         use common::model::ModSourceKind;
         // 存在しない id は no-op (dirty も付けない = 旧 early return と同じ)。
-        if !self.song_doc.song().mod_sources.iter().any(|m| m.id == id) {
+        if !self.cur.song_doc.song().mod_sources.iter().any(|m| m.id == id) {
             return;
         }
         // r.md #89: 「最後に触った parameter」の記録はここ 1 箇所に集める
@@ -290,7 +290,7 @@ impl AppData {
         source_id: u32,
         param: common::model::ModParam,
     ) -> f64 {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let Some(m) = song.mod_sources.iter().find(|m| m.id == source_id) else {
             return 0.0;
         };
@@ -336,7 +336,7 @@ impl AppData {
         target: common::model::AutomationTarget,
     ) {
         use common::model::AutomationTarget as T;
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         let track_id = match &target {
             T::ModSourceParam { source_id, .. } => song.mod_source_owner(*source_id),
             T::ModRoutingDepth { routing_id } => song.mod_routing_owner(*routing_id),
@@ -344,7 +344,7 @@ impl AppData {
         };
         let Some(track_id) = track_id else { return };
         let display_name = self.automation_target_label(&target);
-        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
+        self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -368,12 +368,12 @@ impl AppData {
         track_id: u32,
         target: common::model::AutomationTarget,
     ) {
-        let Some(source_id) = self.ui_ephemeral.armed_mod_source else {
+        let Some(source_id) = self.cur.peph.armed_mod_source else {
             return;
         };
         let label = self.automation_target_label(&target);
         let added = self.add_mod_routing(track_id, target, source_id);
-        self.ui_ephemeral.armed_mod_source = None;
+        self.cur.peph.armed_mod_source = None;
         // 既に繋がっていた param を再ドラッグしただけのときに「割り当てました」と
         // 出すと、 何が起きたかを取り違える。 起きた事実をそのまま出す。
         self.ui_ephemeral.status_message = if added {
@@ -388,8 +388,8 @@ impl AppData {
     /// 所有のソースしか列挙しないので、 トラックを移ると ◉ ボタン自体が画面から
     /// 消える。 待受の可視化を ◉ ボタンだけに任せられない理由がこれ。
     pub fn armed_mod_source_label(&self) -> Option<([f32; 3], String)> {
-        let sid = self.ui_ephemeral.armed_mod_source?;
-        let src = self.song_doc.song().mod_sources.iter().find(|m| m.id == sid)?;
+        let sid = self.cur.peph.armed_mod_source?;
+        let src = self.cur.song_doc.song().mod_sources.iter().find(|m| m.id == sid)?;
         let track = self.track_display_name(src.owner_track_id);
         Some((src.color, format!("{track} / {}", src.kind.short_label())))
     }
@@ -397,8 +397,8 @@ impl AppData {
     pub(crate) fn remove_mod_source(&mut self, id: u32) {
         // 待受中のソースを消したら待受も解除する (削除済み id を掴んだままだと
         // 次に触ったツマミが幽霊 routing になる)。
-        if self.ui_ephemeral.armed_mod_source == Some(id) {
-            self.ui_ephemeral.armed_mod_source = None;
+        if self.cur.peph.armed_mod_source == Some(id) {
+            self.cur.peph.armed_mod_source = None;
         }
         self.edit_song(move |song| {
             song.mod_sources.retain(|m| m.id != id);
@@ -437,14 +437,14 @@ impl AppData {
     /// 冪等 — 健全な曲では no-op。
     pub(crate) fn cleanup_modulation_after_track_removal(&mut self) {
         let orphans: Vec<u32> = self
-            .song_doc
+            .cur.song_doc
             .song()
             .mod_sources
             .iter()
             .filter(|m| {
                 m.owner_track_id != 0
                     && m.owner_track_id != common::model::MASTER_TRACK_ID
-                    && self.song_doc.song().track_by_id(m.owner_track_id).is_none()
+                    && self.cur.song_doc.song().track_by_id(m.owner_track_id).is_none()
             })
             .map(|m| m.id)
             .collect();
@@ -668,7 +668,7 @@ impl AppData {
             lp_hz: b.lp_hz.clamp(b.hp_hz.clamp(MOD_BAND_HZ_MIN, MOD_BAND_HZ_MAX), MOD_BAND_HZ_MAX),
         });
         let prev = self
-            .song_doc
+            .cur.song_doc
             .song()
             .mod_sources
             .iter()
@@ -697,7 +697,7 @@ impl AppData {
     pub(crate) fn set_mod_follower_scrubbing(&mut self, active: bool) {
         // Drag-end edge (was scrubbing, now not) → recompile the baked follower
         // coefficients once with the final attack/release values.
-        self.ui_ephemeral.mod_follower_scrub_active = active;
+        self.cur.peph.mod_follower_scrub_active = active;
     }
 
     pub(crate) fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {

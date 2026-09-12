@@ -42,14 +42,14 @@ pub fn load_color(theme: &Theme, load: f32) -> Color {
 
 /// 内容 (全体指標 + track/plugin 行数) からパネル rect を決める。 右側固定。
 fn panel_rect(app: &AppData, screen: Rect) -> Rect {
-    let n_tracks = app.song_doc.song().tracks.len();
+    let n_tracks = app.cur.song_doc.song().tracks.len();
     let n_plugins: usize = app
-        .song_doc.song()
+        .cur.song_doc.song()
         .tracks
         .iter()
         .map(|t| {
             t.plugins()
-                .filter(|d| app.ipc.loaded_devices.contains_key(&d.id))
+                .filter(|d| app.cur.pipc.loaded_devices.contains_key(&d.id))
                 .count()
         })
         .sum();
@@ -158,18 +158,18 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
     // 現在 live な device 集合で stale slot (unload 済み device) を解放し、 slot
     // 枯渇を防ぐ (unload 済み device の worker は既に store しないので安全)。
     if let Some(mb) = app.ipc.metrics_bridge.as_ref() {
-        let song = app.song_doc.song();
-        let live: std::collections::HashSet<u64> = song
-            .all_plugins()
-            .map(|d| d.id)
-            .filter(|&id| id != 0)
+        // 全タブの live instance (token)。閉じたタブの分は既に帳簿から消えている。
+        let live: std::collections::HashSet<common::protocol::InstanceToken> = app
+            .all_loaded_tokens()
             .collect();
         mb.reclaim_plugin_metric_slots(&live);
     }
     let plugin_us = |pid: u64| {
-        app.ipc.metrics_bridge
-            .as_ref()
-            .map_or(0, |mb| mb.plugin_dsp_us(pid))
+        let token = app.cur.pipc.loaded_devices.get(&pid).map(|d| d.token);
+        match (app.ipc.metrics_bridge.as_ref(), token) {
+            (Some(mb), Some(token)) => mb.plugin_dsp_us(token),
+            _ => 0,
+        }
     };
 
     // パネル背景 + タイトルバー。
@@ -260,12 +260,12 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
 
     // ---- トラック別 / プラグイン別 CPU 内訳 ----
     let bottom = py + ph - ROW_H;
-    'tracks: for track in &app.song_doc.song().tracks {
+    'tracks: for track in &app.cur.song_doc.song().tracks {
         // host に実体がある device (= `loaded_devices` に居る) だけを出す。
         // device_id そのものが計測キーなので、 chain 順との対応づけは要らない。
         let loaded: Vec<&common::model::PluginInstance> = track
             .plugins()
-            .filter(|d| app.ipc.loaded_devices.contains_key(&d.id))
+            .filter(|d| app.cur.pipc.loaded_devices.contains_key(&d.id))
             .collect();
         let track_us: u32 = loaded.iter().map(|d| plugin_us(d.id)).sum();
         load_row(

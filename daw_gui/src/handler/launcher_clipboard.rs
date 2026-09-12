@@ -13,7 +13,7 @@
 use common::model::{AutomationClip, Clip, ClipContent};
 
 use crate::clipboard::{
-    AutomationClipCopy, ClipCopy, ClipboardEnvelope, ClipboardPayload, LauncherCellCopy,
+    AutomationClipCopy, ClipCopy, ClipboardPayload, LauncherCellCopy,
     LauncherCellPayload,
 };
 use common::model::{AutomationClipKey, ClipKey};
@@ -27,6 +27,15 @@ impl AppData {
     #[must_use]
     pub fn copy_launcher_cells_clip(&self) -> Option<(String, usize)> {
         let cells = self.selected_launcher_cells();
+        let out = self.launcher_cells_copy(&cells)?;
+        let count = out.len();
+        let json = self.envelope_with_media(ClipboardPayload::LauncherCells(out)).to_json()?;
+        Some((json, count))
+    }
+
+    /// セル群を clipboard の写しにする (copy と、§5.6 のタブをまたぐドラッグが共用)。
+    /// 相対座標の原点 = 群の左上。空なら `None`。
+    pub(crate) fn launcher_cells_copy(&self, cells: &[LauncherCellKey]) -> Option<Vec<LauncherCellCopy>> {
         if cells.is_empty() {
             return None;
         }
@@ -36,13 +45,13 @@ impl AppData {
         let rows = self.all_launcher_rows();
         // 相対座標の原点 = 選択群の左上。
         let mut placed: Vec<(usize, usize, LauncherCellKey)> = Vec::new();
-        for cell in &cells {
+        for cell in cells {
             let Some(row_i) = rows.iter().position(|r| *r == cell.row()) else {
                 continue;
             };
             let Some(col) = self
                 .scene_of_cell(*cell)
-                .and_then(|s| self.song_doc.song().scene_index(s))
+                .and_then(|s| self.cur.song_doc.song().scene_index(s))
             else {
                 continue;
             };
@@ -66,19 +75,13 @@ impl AppData {
         if out.is_empty() {
             return None;
         }
-        let count = out.len();
-        let json = ClipboardEnvelope::new(
-            self.song_doc.song().project_id,
-            ClipboardPayload::LauncherCells(out),
-        )
-        .to_json()?;
-        Some((json, count))
+        Some(out)
     }
 
     /// セル 1 つの中身を clipboard 表現にする。
     /// 行の種別ごとの組み立ては自由関数へ出してある (不変条件 9 のインデント 6 段)。
     fn cell_clipboard_payload(&self, cell: LauncherCellKey) -> Option<LauncherCellPayload> {
-        let song = self.song_doc.song();
+        let song = self.cur.song_doc.song();
         match cell {
             LauncherCellKey::Track(k) => track_cell_payload(song, k),
             LauncherCellKey::Lane(k) => lane_cell_payload(song, k),
@@ -95,6 +98,7 @@ impl AppData {
         cells: Vec<LauncherCellCopy>,
         src_pid: u64,
         dest: LauncherFocus,
+        media: &common::model::MediaManifest,
     ) -> usize {
         if cells.is_empty() {
             return 0;
@@ -104,9 +108,18 @@ impl AppData {
         let Some(base_row) = rows.iter().position(|r| *r == dest.row) else {
             return 0;
         };
-        let same_project = src_pid == self.song_doc.song().project_id;
+        let same_project = src_pid == self.cur.song_doc.song().project_id;
+        // 取り込みは **貼り先のフォルダ基準** で (`media_for_import` の doc)。
+        let imported = self.media_for_import(media);
+        let media = &imported;
         let mut made: Vec<LauncherCellKey> = Vec::new();
         self.edit_song_checked(|song| {
+            // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
+            let media_remap = if same_project {
+                common::model::MediaRemap::default()
+            } else {
+                song.import_media(media)
+            };
             let mut remap: std::collections::HashMap<
                 common::model::ContentId,
                 common::model::ContentId,
@@ -134,7 +147,7 @@ impl AppData {
                     continue;
                 }
                 let scene_id = song.ensure_scene_at(dest.scene_index + cc.scene_offset as usize);
-                if let Some(key) = paste_one(song, row, scene_id, cc, same_project, &mut remap) {
+                if let Some(key) = paste_one(song, row, scene_id, cc, same_project, &mut remap, &media_remap) {
                     made.push(key);
                 }
             }
@@ -142,6 +155,9 @@ impl AppData {
         });
         let n = made.len();
         self.set_launcher_cell_selection(&made);
+        if !same_project {
+            self.decode_imported_media(media);
+        }
         n
     }
 }
@@ -155,6 +171,7 @@ fn paste_one(
     cc: &LauncherCellCopy,
     same_project: bool,
     remap: &mut std::collections::HashMap<common::model::ContentId, common::model::ContentId>,
+    media_remap: &common::model::MediaRemap,
 ) -> Option<LauncherCellKey> {
     match (&cc.cell, row) {
         (LauncherCellPayload::Track(c), LauncherRow::Track(track_id)) => {
@@ -166,7 +183,9 @@ fn paste_one(
                     let id = if same_project && song.clip_contents.contains_key(&c.content_id) {
                         c.content_id
                     } else {
-                        song.alloc_content(c.content.clone(), c.name.clone().unwrap_or_default())
+                        let mut content = c.content.clone();
+                        content.remap_media(media_remap);
+                        song.alloc_content(content, c.name.clone().unwrap_or_default())
                     };
                     remap.insert(c.content_id, id);
                     id

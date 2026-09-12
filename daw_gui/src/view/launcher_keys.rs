@@ -57,7 +57,7 @@ fn launcher_owns_surface(surface: Option<EditSurface>) -> bool {
 #[must_use]
 pub(crate) fn launcher_is_target(app: &AppData, surface: Option<EditSurface>) -> bool {
     launcher_owns_surface(surface)
-        || (surface.is_none() && app.launcher.hover.is_some())
+        || (surface.is_none() && app.cur.launcher.hover.is_some())
 }
 
 /// ランチャーのキーボード操作を消費する。`dispatch_shortcuts` の途中から
@@ -133,7 +133,7 @@ pub(crate) fn select_all_cells_if_launcher(
     // すると、帯にポインタを置いたままの `Ctrl+A` が `SelectAllArrangement` に落ちて
     // アレンジの範囲が張られ、面が黙って範囲へ移る (画面は変わらない
     // のに、続く `Delete` がアレンジの全クリップを消す)。
-    if app.launcher.hover.is_none() && !launcher_owns_surface(surface) {
+    if app.cur.launcher.hover.is_none() && !launcher_owns_surface(surface) {
         return false;
     }
     let scene_ids = app.scene_ids();

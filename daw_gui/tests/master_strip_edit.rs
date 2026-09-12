@@ -39,13 +39,13 @@ fn build_app() -> (
 }
 
 fn strip(app: &AppData) -> MasterStrip {
-    app.song_doc.song().master_strip
+    app.cur.song_doc.song().master_strip
 }
 
 fn drain(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<MasterStrip> {
     let mut out = Vec::new();
     while let Ok(cmd) = rx.try_recv() {
-        if let AudioCommand::SetMasterStrip { strip } = cmd {
+        if let AudioCommand::SetMasterStrip { project: _, strip } = cmd {
             out.push(strip);
         }
     }
