@@ -169,10 +169,40 @@ impl AppData {
         }
     }
 
-    /// track を消す 3 経路 (選択トラック削除 / ungroup / 最終 track 削除) が共通で
-    /// 使う daw_gui ローカル帳簿の掃除。 対象 device は **削除前の Song から**
-    /// 列挙した id 集合で渡す (帳簿から引くと load 応答待ちを取りこぼす)。
-    pub(crate) fn forget_removed_track_devices(&mut self, plan: &[TrackRemovalIpc]) {
+    /// トラックを Song から外す 3 経路 (選択トラック削除 / グループ解除 / 末尾トラック削除) が、外した**後**に
+    /// 共通で通す後始末。経路ごとに手で並べると漏れる (グループ解除と末尾削除で、口パクの生成物 / 選択範囲の
+    /// 行 / audio editor の対象が漏れていた) ので 1 本にする。
+    ///
+    /// - `plan`: 外す**前**の Song から組んだ device teardown の IPC 列 ([`Self::plan_track_removal_ipc`])。
+    /// - `audio_editor_key`: 外す前に退避した audio editor の対象 (`audio_editor_target_key`)。
+    ///
+    /// 消えた id を指す session 状態 (device 選択 / SC Listen / MIDI Learn 待ち / last touched) は、外した編集の
+    /// 口 (`edit_song`) の後の `reconcile_song_refs` が済ませている。トラック選択の倒し先は経路ごとに違うので
+    /// 呼び出し側が持つ。
+    pub(crate) fn after_tracks_removed(
+        &mut self,
+        plan: &[TrackRemovalIpc],
+        audio_editor_key: Option<common::model::ClipKey>,
+    ) {
+        // Song 側の派生の後始末: 消えたトラックが所有していたモジュレーター (と、その変調の深さを指すレーン /
+        // 変調)、ソースを失った口 track の生成物。
+        self.cleanup_modulation_after_track_removal();
+        self.reap_orphan_lipsync();
+        // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ (audio worker が destroyed plugin を
+        // dispatch しないよう、audio 側の mapping を先に落とす)。
+        self.send_track_removal_ipc(plan);
+        self.forget_removed_track_devices(plan);
+        let song = self.cur.song_doc.song();
+        self.cur.view.collapsed_groups.retain(|id| song.track_by_id(*id).is_some());
+        // 範囲は「区間 × 行」しか持たないので、消えた行 (トラック / 生成物のクリップ) を落とすだけ。
+        self.prune_selection_lanes();
+        self.reanchor_audio_editor(audio_editor_key);
+        self.resize_track_peak_display();
+    }
+
+    /// track を消す 3 経路が [`Self::after_tracks_removed`] で使う daw_gui ローカル帳簿の掃除。
+    /// 対象 device は **削除前の Song から** 列挙した id 集合で渡す (帳簿から引くと load 応答待ちを取りこぼす)。
+    fn forget_removed_track_devices(&mut self, plan: &[TrackRemovalIpc]) {
         for step in plan {
             if let TrackRemovalIpc::RemoveHostDevice { device_id } = *step {
                 self.cleanup_slot_gui(device_id);
@@ -240,6 +270,8 @@ impl AppData {
         // plan が空になり IPC が 1 通も出ない = 無言で壊れる)。
         let removal_plan =
             Self::plan_track_removal_ipc(self.cur.song_doc.song(), &groups_to_ungroup);
+        // group がクリップを持つこともある (group は「子を持つトラック」の暗黙の役割)。
+        let audio_editor_key = self.audio_editor_target_key();
 
         let mut new_selection: Vec<u32> = Vec::new();
         for group_id in &groups_to_ungroup {
@@ -257,18 +289,14 @@ impl AppData {
             });
             if let Some(pos) = self.cur.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
                 self.edit_song(|song| song.tracks.remove(pos));
-                // 消えた group track が所有していたモジュレーターと、その変調の深さを
-                // 指していたレーン / 変調の後始末 (track 削除経路と同じ 1 本)。
-                self.cleanup_modulation_after_track_removal();
             }
-            self.cur.view.collapsed_groups.remove(group_id);
         }
 
         // **song update + LoadSong を先に送る** → daw_audio engine が
         // 新 schedule (group が消えた状態) を即適用。 audio thread が
         // 古い schedule の ProcessGroupFx で destroyed plugin にアクセス
         // する race を回避する。
-
+        //
         // **重要 (deadlock 防止)**: plugin_host が `tracks.mutate` で
         // chain の Box<Plugin> を drop すると `plugin_shmems.remove(&pid)`
         // で `ProcessDataHandle` も drop され、 OS が shmem mapping を
@@ -281,14 +309,12 @@ impl AppData {
         // 直接 ClosePluginShmem を送って `plugin_refs` から stale entry を
         // 削除させ、 audio worker が destroyed plugin を dispatch しないように
         // する。 順序は `plan_track_removal_ipc` が持っている。
-        self.send_track_removal_ipc(&removal_plan);
-        self.forget_removed_track_devices(&removal_plan);
+        self.after_tracks_removed(&removal_plan, audio_editor_key);
         // selection: ungroup 後は元 group の子を選択 (Live 互換)。 明示的な
         // トラック面操作なので last-wins タグも Tracks に倒す。
         if !new_selection.is_empty() {
             self.set_track_selection(new_selection);
         }
-        self.resize_track_peak_display();
         tracing::info!(?groups_to_ungroup, "ungrouped tracks");
     }
 
@@ -332,6 +358,7 @@ impl AppData {
             return;
         };
         let removal_plan = Self::plan_track_removal_ipc(self.cur.song_doc.song(), &[last_id]);
+        let audio_editor_key = self.audio_editor_target_key();
         // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
         let Some(Some(removed)) = self.edit_song(|song| song.tracks.pop()) else {
             return;
@@ -343,29 +370,19 @@ impl AppData {
             name = %removed.name,
             "removed last track"
         );
-        // 消えたトラックが所有していたモジュレーターと、その変調の深さを指していた
-        // レーン / 変調の後始末 (track 削除 / グループ解除と同じ 1 本)。
-        self.cleanup_modulation_after_track_removal();
-        // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ。 この経路は
-        // 以前 `ClosePluginShmem` を送っておらず (= 順序仕様が守られていなかった)、
+        // この経路は以前 `ClosePluginShmem` を送っておらず (= 順序仕様が守られていなかった)、
         // plan 経由に統一したことで穴も塞がる。
-        self.send_track_removal_ipc(&removal_plan);
-        self.forget_removed_track_devices(&removal_plan);
+        self.after_tracks_removed(&removal_plan, audio_editor_key);
         // selected_track_ids は id ベース。 削除対象 track id を除外
         // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
         // 空なら最後尾にフォールバック。
-        let live_ids: std::collections::HashSet<u32> =
-            self.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
-        self.cur.selection.selected_track_ids.retain(|id| live_ids.contains(id));
+        let song = self.cur.song_doc.song();
+        self.cur.selection.selected_track_ids.retain(|&id| song.track_by_id(id).is_some());
         if self.cur.selection.selected_track_ids.is_empty()
             && let Some(t) = self.cur.song_doc.song().tracks.last()
         {
             self.cur.selection.selected_track_ids.push(t.id);
         }
-        self.cur.view.collapsed_groups.retain(|id| live_ids.contains(id));
-        // 範囲は「区間 × 行」しか持たないので、消えたトラックの行を落とすだけ。
-        self.prune_selection_lanes();
-        self.resize_track_peak_display();
     }
 
 }

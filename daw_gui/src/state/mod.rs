@@ -186,10 +186,13 @@ impl AppData {
     /// [`SongDoc::edit`] を呼ぶ。 1 event 内の複数呼び出しは 1 undo step に
     /// squash され、 Begin*/End* gesture 中は drag 全体が 1 step になる。
     /// export 中は `None` (編集拒否 + status message 予約)。
+    /// 編集の後に、消えた id を指す session 状態を掃除する (`reconcile_song_refs`)。
     pub fn edit_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
         self.sync_export_lock();
         let scope = self.cur.song_doc.event_scope();
-        self.cur.song_doc.edit(scope, f)
+        let r = self.cur.song_doc.edit(scope, f);
+        self.reconcile_song_refs();
+        r
     }
 
     /// no-op 検出付き [`AppData::edit_song`] ([`SongDoc::edit_checked`] 参照)。
@@ -200,7 +203,11 @@ impl AppData {
     ) -> bool {
         self.sync_export_lock();
         let scope = self.cur.song_doc.event_scope();
-        self.cur.song_doc.edit_checked(scope, f) == Some(true)
+        let changed = self.cur.song_doc.edit_checked(scope, f) == Some(true);
+        if changed {
+            self.reconcile_song_refs();
+        }
+        changed
     }
 
     /// ランチャーの再生状態だけを書く ([`SongDoc::edit_playback`] 参照): undo に積まず
@@ -249,7 +256,9 @@ impl AppData {
     /// 壊す (song mutation の遮断は edit / normalize 双方でこの同期に依存する)。
     pub fn normalize_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
         self.sync_export_lock();
-        self.cur.song_doc.normalize(f)
+        let r = self.cur.song_doc.normalize(f);
+        self.reconcile_song_refs();
+        r
     }
 
     /// no-op 検出付き [`AppData::normalize_song`] ([`SongDoc::normalize_checked`]
@@ -263,7 +272,11 @@ impl AppData {
         f: impl FnOnce(&mut common::model::Song) -> bool,
     ) -> Option<bool> {
         self.sync_export_lock();
-        self.cur.song_doc.normalize_checked(f)
+        let changed = self.cur.song_doc.normalize_checked(f);
+        if changed == Some(true) {
+            self.reconcile_song_refs();
+        }
+        changed
     }
 
     /// song 凍結の単一保証点 (§7.5): export (audio freewheel / video render) 中は

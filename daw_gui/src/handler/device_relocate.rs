@@ -407,37 +407,6 @@ impl AppData {
             self.cur.selection.last_edit_select = Some(EditSurface::Devices);
         }
     }
-
-    /// device が消える経路 (削除 / 切り取り / Parallel 解除 / track 削除 / project 切替 /
-    /// undo-redo) の後始末。 選択から実在しない id を落とし (空になったらタグを降ろす)、
-    /// 居なくなった device の SC Listen を解除する。
-    ///
-    /// 選択については **正しさの担保ではない** — それは読む側の [`Self::live_device_ids`] が持つ。
-    /// ここは保持した集合が無限に育たないようにするだけ。
-    pub(crate) fn prune_device_session_refs(&mut self) {
-        let song = self.cur.song_doc.song();
-        let alive: Vec<u64> = self
-            .cur.selection
-            .selected_device_ids
-            .iter()
-            .copied()
-            .filter(|&id| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some())
-            .collect();
-        if alive.len() != self.cur.selection.selected_device_ids.len() {
-            self.set_device_selection(alive);
-        }
-        if self
-            .cur.selection
-            .device_anchor
-            .is_some_and(|id| {
-                let song = self.cur.song_doc.song();
-                song.device_by_id(id).is_none() && song.chain_by_id(id).is_none()
-            })
-        {
-            self.cur.selection.device_anchor = None;
-        }
-        self.prune_sc_listen();
-    }
 }
 
 /// [`AppData::relocate_devices_inner`] が `edit_song` の中で組み立てる結果。

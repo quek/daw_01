@@ -34,6 +34,7 @@ mod project_tabs;
 mod parallel;
 mod range_edit;
 mod shutdown_sequence;
+mod song_refs;
 mod state_roundtrip_watchdog;
 mod sync_flush;
 mod track_delete;

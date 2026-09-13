@@ -30,6 +30,16 @@ pub(crate) fn param_owner(song: &Song, target: &AutomationTarget, fallback_owner
     }
 }
 
+/// 最後に触ったパラメーターの lane / routing を置く store の持ち主。束縛先が居ない / 住所がその種類に無い /
+/// 持ち主の store (トラック) が消えたなら `None` (= 「対象が削除された」)。
+///
+/// 解決の規則は enforce と同じ `Song::param_target_resolves` なので、`Some` の持ち主へ積んだレーンは同じ編集の
+/// 中で消されない。`A` キーと、消えた対象を指す session 状態の掃除 (`reconcile_song_refs`) が共有する。
+pub(crate) fn touched_param_owner(song: &Song, touched: &TouchedParam) -> Option<u32> {
+    let owner = param_owner(song, &touched.target, touched.track_id)?;
+    (song.param_stores(owner).is_some() && song.param_target_resolves(&touched.target, owner)).then_some(owner)
+}
+
 impl AppData {
     /// `A` キー shortcut の handler。`last_touched_param` の lane を
     /// その持ち主の store に追加 (or 既存があれば visible = true で復活)。
@@ -42,19 +52,18 @@ impl AppData {
         };
         // r.md #129 (§7.7): 持ち主は target の束縛先が決める (device を他トラックへ運んだ後でも、
         // master fx chain の device でも正しい store に積む)。置き場の分岐は `param_stores` 1 か所。
+        // 束縛先が解決しない (消えた / 種類が違う) なら積まない — 積むと enforce が同じ編集の中で消し、
+        // 中身の無い undo step と `*` だけが残る。
         let song = self.cur.song_doc.song();
-        let Some(owner) = param_owner(song, &touched.target, touched.track_id) else {
+        let Some(owner) = touched_param_owner(song, &touched) else {
             self.cur.peph.last_touched_param = None;
             self.ui_ephemeral.status_message = "Last-touched parameter was removed".into();
             return;
         };
-        let Some((lanes, _)) = song.param_stores(owner) else {
-            self.cur.peph.last_touched_param = None;
-            self.ui_ephemeral.status_message =
-                "Last-touched parameter's track was removed".into();
-            return;
-        };
-        if let Some(lane_id) = lanes.iter().find(|l| l.target == touched.target).map(|l| l.id) {
+        let existing = song
+            .param_stores(owner)
+            .and_then(|(lanes, _)| lanes.iter().find(|l| l.target == touched.target).map(|l| l.id));
+        if let Some(lane_id) = existing {
             // 既存 lane を visible / enabled = true に戻して expand。
             self.cur.view
                 .hidden_automation_lanes
