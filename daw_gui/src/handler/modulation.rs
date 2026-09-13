@@ -282,16 +282,21 @@ impl AppData {
     /// r.md #89: モジュレーターのツマミの **今の値** (plain)。ラックのツマミ・
     /// オートメーションレーンの既定値・変調の base が全部ここを通る
     /// (値の SSoT は `common::mod_graph::param_plain`)。
+    /// ソースが居なければ 0 (ラックのツマミは居るソースしか描かない)。
     pub(crate) fn mod_param_plain_value(
         &self,
         source_id: u32,
         param: common::model::ModParam,
     ) -> f64 {
+        self.mod_param_plain(source_id, param).unwrap_or(0.0)
+    }
+
+    /// [`Self::mod_param_plain_value`] の本体。`None` = ソースが居ない
+    /// (`target_plain_value` はこれを「値の出所が無い」 として扱う)。
+    pub(crate) fn mod_param_plain(&self, source_id: u32, param: common::model::ModParam) -> Option<f64> {
         let song = self.cur.song_doc.song();
-        let Some(m) = song.mod_sources.iter().find(|m| m.id == source_id) else {
-            return 0.0;
-        };
-        common::mod_graph::param_plain(&m.kind, param, f64::from(song.bpm))
+        let m = song.mod_sources.iter().find(|m| m.id == source_id)?;
+        Some(common::mod_graph::param_plain(&m.kind, param, f64::from(song.bpm)))
     }
 
     /// r.md #89: `ModSourceEdit` が動かす [`common::model::ModParam`]。
@@ -421,21 +426,28 @@ impl AppData {
         }
     }
 
-    /// Resolve `track_id` to its mutable `mod_routings` Vec
-    /// (`MASTER_TRACK_ID` → `Song.song_mod_routings`,
-    /// `docs/plan_modulation_routing_redesign.md` §2).
+    /// `target` への変調 routing が載る store を `f` に渡す (Song 編集は `edit_song` 経由)。
+    ///
+    /// r.md #129 (§7.7): store の持ち主は **実行時の Song** から
+    /// [`param_owner`](crate::handler::param_value::param_owner) で引き直す — view が渡す
+    /// `track_id` は target だけでは持ち主が決まらない住所 (Volume / Pan …) のためだけに使う
+    /// (同じフレームで device を他トラックへ運んだ後だと、view の track id は古い)。
+    /// 束縛先が居なければ何もせず `None`。
     pub(crate) fn edit_mod_routings<R>(
         &mut self,
         track_id: u32,
+        target: &common::model::AutomationTarget,
         f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> R,
     ) -> Option<R> {
-        self.edit_song(move |song| Some(f(song.param_stores_mut(track_id)?.1)))
+        let owner = crate::handler::param_value::param_owner(self.cur.song_doc.song(), target, track_id)?;
+        self.edit_song(move |song| Some(f(song.param_stores_mut(owner)?.1)))
             .flatten()
     }
 
     /// 戻り値は **実際に足したか** (既に同じ (target, source) があれば `false`)。
     /// per-control の depth ドラッグは毎フレームここを通るので、 呼び出し側が
     /// 「今つないだ」 と「もう繋がっていた」 を区別できるようにしている。
+    /// 載せる store は [`Self::edit_mod_routings`] と同じく target の持ち主。
     pub(crate) fn add_mod_routing(
         &mut self,
         track_id: u32,
@@ -448,15 +460,19 @@ impl AppData {
         // r.md #89: id は **足すこの 1 箇所**で採番する (`AutomationTarget::ModRoutingDepth`
         // が 1 本の変調を指すので、後から `ensure_ids` 任せにすると採番前の一瞬だけ
         // 深さを変調先にできない窓ができる)。
+        let Some(owner) = crate::handler::param_value::param_owner(self.cur.song_doc.song(), &target, track_id)
+        else {
+            return false;
+        };
         self.edit_song(move |song| {
-            let Some((_, routings)) = song.param_stores(track_id) else {
+            let Some((_, routings)) = song.param_stores(owner) else {
                 return false;
             };
             if routings.iter().any(|r| r.source_id == source_id && r.target == target) {
                 return false;
             }
             let id = song.alloc_mod_routing_id();
-            let Some((_, routings)) = song.param_stores_mut(track_id) else {
+            let Some((_, routings)) = song.param_stores_mut(owner) else {
                 return false;
             };
             routings.push(common::model::ModRouting {
@@ -480,7 +496,7 @@ impl AppData {
     ) {
         // r.md #89: 消した変調の **深さ** を指していた変調の連鎖掃除は、SongDoc の
         // `enforce_edit_invariants` が同じ undo step で担う (r.md #129)。
-        self.edit_mod_routings(track_id, |routings| {
+        self.edit_mod_routings(track_id, &target, |routings| {
             routings.retain(|r| !(r.source_id == source_id && r.target == target));
         });
     }
@@ -495,7 +511,7 @@ impl AppData {
         // depth は GUI compose が毎フレーム読む visual-only 値 (Phase 4)。 scrub
         // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる
         // (= edit_song が epoch を bump)。
-        let touched = self.edit_mod_routings(track_id, |routings| {
+        let touched = self.edit_mod_routings(track_id, &target, |routings| {
             let r = routings
                 .iter_mut()
                 .find(|r| r.source_id == source_id && r.target == target)?;
@@ -545,7 +561,7 @@ impl AppData {
         source_id: u32,
         bipolar: bool,
     ) {
-        self.edit_mod_routings(track_id, |routings| {
+        self.edit_mod_routings(track_id, &target, |routings| {
             if let Some(r) = routings
                 .iter_mut()
                 .find(|r| r.source_id == source_id && r.target == target)

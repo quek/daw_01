@@ -7,6 +7,43 @@ use crate::app_types::*;
 use crate::event::*;
 use common::protocol::{AudioCommand};
 
+/// 触った param を MIDI で動かす的 (`BindingTarget`)。bind 先の型が無い住所は `None`。
+///
+/// **`_` で受けない** — 住所が増えたとき、Learn できるかをここで決め忘れない (r.md #129 §7.9:
+/// 旧実装は `_ => {}` に内蔵 device と Tempo が落ち、黙って armed track の Volume に bind していた)。
+fn learnable_binding(
+    track_id: u32,
+    target: &common::model::AutomationTarget,
+) -> Option<common::model::BindingTarget> {
+    use common::model::{AutomationTarget as T, BindingTarget as B, TrackBuiltinParam as P};
+    match *target {
+        T::PluginParam { device_id, param_id, .. } => {
+            Some(B::PluginParam { device_id, param_id, legacy_device_index: None, legacy_track: None })
+        }
+        T::TrackBuiltin(P::Volume) => Some(B::TrackVolume(track_id)),
+        T::TrackBuiltin(P::Pan) => Some(B::TrackPan(track_id)),
+        // 内蔵 device と master Limiter も plugin と同じ正式な的。
+        T::NativeParam { device_id, param } => Some(B::NativeParam { device_id, param }),
+        T::MasterLimiter(p) => Some(B::MasterLimiter(p)),
+        T::SongTempo => Some(B::SongTempo),
+        T::TrackBuiltin(
+            P::Mute
+            | P::SendGain { .. }
+            | P::ChainGain { .. }
+            | P::ChainPan { .. }
+            | P::ParallelOutGain { .. }
+            | P::ParallelSplitFreq { .. }
+            | P::ParallelSelect { .. },
+        )
+        | T::SongTimeSigNumerator
+        | T::ImageBuiltin(_)
+        | T::TextBuiltin(_)
+        | T::GroupTransform(_)
+        | T::ModSourceParam { .. }
+        | T::ModRoutingDepth { .. } => None,
+    }
+}
+
 impl AppData {
     // -------- Clip / note / midi -------------------------------------------
 
@@ -132,38 +169,19 @@ impl AppData {
 
     /// MIDI Learn button (transport) が bind する target を決める (B2 / r.md #8、
     /// touch + learn)。 直近に触った param (`last_touched_param`) が bind 可能
-    /// (PluginParam / track Volume / Pan) ならそれを優先、 無ければ選択 track の
-    /// Volume に fallback。
+    /// (PluginParam / 内蔵 device の param / master Limiter / Tempo / track Volume / Pan) なら
+    /// それを優先、 無ければ選択 track の Volume に fallback (transport の Learn ボタンの
+    /// ラベルがどちらを learn するかを出す)。
     pub fn midi_learn_binding_target(
         &self,
         armed_track: Option<u32>,
     ) -> Option<common::model::BindingTarget> {
-        use common::model::{AutomationTarget, BindingTarget, TrackBuiltinParam};
-        if let Some(tp) = &self.cur.peph.last_touched_param {
-            match tp.target {
-                AutomationTarget::PluginParam { device_id, param_id, .. } => {
-                    return Some(BindingTarget::PluginParam {
-                        device_id,
-                        param_id,
-                        legacy_device_index: None,
-                        legacy_track: None,
-                    });
-                }
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => {
-                    return Some(BindingTarget::TrackVolume(tp.track_id));
-                }
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => {
-                    return Some(BindingTarget::TrackPan(tp.track_id));
-                }
-                // r.md #129 (§7.9): 内蔵 device と master Limiter も plugin と同じ正式な的。
-                AutomationTarget::NativeParam { device_id, param } => {
-                    return Some(BindingTarget::NativeParam { device_id, param });
-                }
-                AutomationTarget::MasterLimiter(p) => return Some(BindingTarget::MasterLimiter(p)),
-                _ => {}
-            }
-        }
-        armed_track.map(BindingTarget::TrackVolume)
+        self.cur
+            .peph
+            .last_touched_param
+            .as_ref()
+            .and_then(|tp| learnable_binding(tp.track_id, &tp.target))
+            .or_else(|| armed_track.map(common::model::BindingTarget::TrackVolume))
     }
 
     /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn 経路 + 通常 lookup 経路。
@@ -233,9 +251,9 @@ impl AppData {
 
     /// Phase 7 B1-M Step 2: CC 値 (0..127) を target に適用。 normalization は
     /// target ごとに違う (= TrackVolume は 0..1、 TrackPan は -1..1、
-    /// SongTempo は 60..180 BPM linear)。 既存 setter (set_track_volume /
-    /// set_track_pan / song.bpm + IPC) を経由するので audio engine 反映も
-    /// automatic。
+    /// SongTempo は 60..180 BPM linear、 内蔵 device / Limiter は `target_range` の値域)。
+    /// 既存 setter (set_track_volume / set_track_pan / song.bpm + IPC / ノブと同じ
+    /// `apply_native_edit`) を経由するので audio engine 反映も automatic。
     pub(crate) fn apply_midi_value_to_target(
         &mut self,
         target: common::model::BindingTarget,

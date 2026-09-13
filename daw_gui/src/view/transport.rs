@@ -773,7 +773,8 @@ fn draw_recording_controls(
     let learn_active = app.cur.recording.midi_learn_target.is_some();
     let armed_track_for_learn = app.cur.selection.selected_track_ids.first().copied();
     // B2 (r.md #8): touch + learn。 直近に触った param が bind 可能なら
-    // (PluginParam / Volume / Pan) それを、 無ければ選択 track の Volume を learn。
+    // (PluginParam / 内蔵 device / master Limiter / Tempo / Volume / Pan) それを、 無ければ選択
+    // track の Volume を learn (判定は `midi_learn_binding_target` 1 本)。
     let learn_target = app.midi_learn_binding_target(armed_track_for_learn);
     let learn_label = if learn_active {
         "Learning..."
@@ -786,6 +787,7 @@ fn draw_recording_controls(
                 | common::model::BindingTarget::MasterLimiter(_),
             ) => "Learn Param",
             Some(common::model::BindingTarget::TrackPan(_)) => "Learn Pan",
+            Some(common::model::BindingTarget::SongTempo) => "Learn Tempo",
             _ => "Learn Vol",
         }
     };

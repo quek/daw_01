@@ -62,7 +62,8 @@ impl AutomationValueDisplay {
     #[must_use]
     pub fn format_with_unit(&self, plain: f64) -> String {
         let num = self.format_number(plain);
-        if self.unit.is_empty() {
+        // ラベルを出す値 ("OFF") には単位を付けない (widget の描画と同じ判定)。
+        if self.unit.is_empty() || !self.format.unit_applies((self.to_display)(plain)) {
             num
         } else {
             format!("{num} {}", self.unit)
@@ -345,15 +346,19 @@ fn native_unit_format(param: common::model::NativeParamId) -> (&'static str, Scr
         // Hz は下端 20 と上端 20k が 3 桁離れるので有効数字表記
         // (固定小数だと下端が潰れるか上端が欄に入らない)。
         P::Comp(CompParam::Attack | CompParam::Release) => ("ms", ScrubableNumberFormat::Significant { digits: 3 }),
-        P::Comp(CompParam::ScFreq) => ("Hz", ScrubableNumberFormat::Significant { digits: 3 }),
+        // 検出フィルタは左端 (plain 0) が OFF (`ParamRange::LogWithOff`)。"0 Hz" と出すと
+        // 「0 Hz で効いている」と読めてしまうので、0 だけ "OFF" と書く。
+        P::Comp(CompParam::ScFreq) => ("Hz", ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" }),
         P::Eq { param: EqParam::Freq, .. } => ("Hz", ScrubableNumberFormat::Significant { digits: 3 }),
         P::Eq { param: EqParam::Gain, .. } => ("dB", ScrubableNumberFormat::Decimal(1)),
         P::Eq { param: EqParam::Q, .. } => ("", ScrubableNumberFormat::Decimal(2)),
         P::BusComp(BusCompParam::Threshold | BusCompParam::Makeup) => ("dB", ScrubableNumberFormat::Decimal(1)),
-        // 段階式は段の index が plain。
-        P::BusComp(BusCompParam::Ratio | BusCompParam::Attack | BusCompParam::Release) => {
-            ("", ScrubableNumberFormat::Integer)
-        }
+        // 段階式は段の index が plain。表記は段のラベル (`NativeParamId::step_labels` が SSoT) で、
+        // レーン見出し・点の数値・マスターパネルが同じ "4:1" を出す。
+        P::BusComp(BusCompParam::Ratio | BusCompParam::Attack | BusCompParam::Release) => (
+            "",
+            param.step_labels().map_or(ScrubableNumberFormat::Integer, |labels| ScrubableNumberFormat::Choices { labels }),
+        ),
         P::ToneEq(_) => ("dB", ScrubableNumberFormat::Decimal(1)),
     }
 }
@@ -461,6 +466,27 @@ mod tests {
         // range 無しは 0..1 既定。
         let d2 = automation_value_display(&target, None);
         assert_eq!(d2.range, (0.0, 1.0));
+    }
+
+    /// A-6 (§7.4 / §18-W): 段階式は段の index ではなくラベルで出し、ラベルで入力を受ける。
+    #[test]
+    fn bus_comp_steps_display_and_parse_as_labels() {
+        use common::model::{BusCompParam, CompParam, NativeParamId};
+        let ratio = automation_value_display(
+            &T::NativeParam { device_id: 1, param: NativeParamId::BusComp(BusCompParam::Ratio) },
+            None,
+        );
+        assert_eq!(ratio.format_with_unit(1.0), "4:1");
+        assert_eq!(ratio.parse_to_plain("10:1"), Some(2.0));
+        assert_eq!(ratio.parse_to_plain("abc"), None);
+
+        let sc = automation_value_display(
+            &T::NativeParam { device_id: 1, param: NativeParamId::Comp(CompParam::ScFreq) },
+            None,
+        );
+        assert_eq!(sc.format_with_unit(0.0), "OFF", "検出フィルタの左端は OFF (単位を付けない)");
+        assert_eq!(sc.format_with_unit(150.0), "150 Hz");
+        assert_eq!(sc.parse_to_plain("off"), Some(0.0));
     }
 
     #[test]
