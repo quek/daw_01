@@ -40,6 +40,10 @@ pub struct NativeBlock<'a> {
 }
 
 /// 内蔵 device 1 台ぶんの DSP 状態 (種類ごと)。
+///
+/// variant の大きさは揃っていない (EQ はバイクワッド 6 段ぶん) が、Box にしない: 状態は compile 時に
+/// `ChainProgram::natives` へ並べて確保し、再 compile を跨ぐ引き継ぎは RT 上の固定長コピー (`Copy`) で行う。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 pub enum NativeDsp {
     Comp(comp::CompState),
