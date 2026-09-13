@@ -1045,11 +1045,13 @@ pub enum AppEvent {
         master_limiter_gr_db: f32,
     },
     /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
-    /// テレメトリポーラが `DeviceScopeReader` + `SpectrumAnalyzer` で作る。tick の project が
-    /// 現タブのときだけ取り込む。
+    /// テレメトリポーラが `DeviceScopeReader` + `SpectrumAnalyzer` で作り、**表示が変わった tick だけ**
+    /// 送る (`master_meter::device_spectrum`)。tick の project が現タブのときだけ取り込む。
     DeviceSpectrumTick {
         project: common::protocol::ProjectKey,
         spectra: Vec<(u64, std::sync::Arc<[f32]>)>,
+        /// 表示解像度で量子化した中身のダイジェスト (tick の再描画判定の指紋に混ぜる、r.md #49)。
+        visual_digest: u64,
     },
     /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
     /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`

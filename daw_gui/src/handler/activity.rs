@@ -120,6 +120,8 @@ impl AppData {
         // よこす。解析器側で表示解像度に量子化してあるので、無音になれば必ず
         // 収束する = ここで再描画が止まる。
         mix(self.cur.transport.master_meter.visual_digest);
+        // r.md #129: EQ Par のスペクトラムも同じ作法 (ポーラが表示解像度で量子化したダイジェスト)。
+        mix(self.cur.transport.device_spectra_digest);
         // トラックメーターは linear なので dB 経由で正規化してから量子化する
         // (そのまま量子化すると指数減衰が 0 に収束せず永久に描き続ける)。
         for (l, r) in &self.cur.transport.track_peak_display {

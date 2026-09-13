@@ -1297,9 +1297,10 @@ impl AppData {
                     self.on_track_peaks_tick(&tracks, native_gr.as_deref(), master_limiter_gr_db);
                 }
             }
-            AppEvent::DeviceSpectrumTick { project, spectra } => {
+            AppEvent::DeviceSpectrumTick { project, spectra, visual_digest } => {
                 if project == self.cur.key {
                     self.cur.transport.device_spectra = spectra.into_iter().collect();
+                    self.cur.transport.device_spectra_digest = visual_digest;
                 }
             }
             AppEvent::LauncherRowsTick { project, rows } => {

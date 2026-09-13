@@ -150,6 +150,9 @@ pub struct TransportState {
     /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
     /// アクティブなタブの `DeviceSpectrumTick` だけが書く。session-only。
     pub device_spectra: std::collections::HashMap<u64, std::sync::Arc<[f32]>>,
+    /// `device_spectra` の中身を表示解像度で量子化したダイジェスト (ポーラが作る)。`device_spectra` と
+    /// 同じ tick で書き、tick の再描画判定の指紋 (`tick_visual_fingerprint`) に混ぜる。
+    pub device_spectra_digest: u64,
     /// docs/plan_modulation.md §4.2 / r.md #89: audio engine が publish した
     /// 変調値面 (**`ModSource::id` キー** — SSoT は `common/src/mod_plane.rs`)。
     /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が
@@ -225,6 +228,7 @@ impl TransportState {
             native_gr: NativeGrDisplay::default(),
             master_limiter_gr: 0.0,
             device_spectra: std::collections::HashMap::new(),
+            device_spectra_digest: 0,
             mod_plane: common::mod_plane::ModPlane::default(),
             track_voices: Vec::new(),
             pending_play: None,
@@ -244,6 +248,27 @@ impl TransportState {
 #[cfg(test)]
 mod tests {
     use super::NativeGrDisplay;
+
+    /// r.md #49: `DeviceSpectrumTick` は tick 扱い (中身が変わらなければ再描画しない) なので、スペクトラムの
+    /// 表示の変化は指紋に入っていなければならない (入っていないと動いているスペクトラムが凍る)。別タブの tick は
+    /// 取り込まないので指紋も動かない。
+    #[test]
+    fn device_spectrum_ticks_move_the_redraw_fingerprint_only_when_the_display_changes() {
+        use crate::app::AppEvent;
+        let mut app = crate::test_support::headless_app();
+        let project = app.cur.key;
+        let tick = |app: &mut crate::app::AppData, project, visual_digest| {
+            let spectra = vec![(7, std::sync::Arc::from(vec![-20.0_f32; 4]))];
+            app.handle_event(AppEvent::DeviceSpectrumTick { project, spectra, visual_digest });
+            app.tick_visual_fingerprint()
+        };
+        let first = tick(&mut app, project, 1);
+        assert_eq!(tick(&mut app, project, 1), first, "同じ表示の tick は指紋を動かさない");
+        assert_ne!(tick(&mut app, project, 2), first, "表示が変われば再描画する");
+        let now = app.tick_visual_fingerprint();
+        let other = common::protocol::ProjectKey(project.0.wrapping_add(1));
+        assert_eq!(tick(&mut app, other, 3), now, "別タブの tick は取り込まない");
+    }
 
     /// 1 tick で「面にある id の更新 / 間に挟まる新しい id の追加 / 面から消えた id の減衰と破棄」が混ざっても、
     /// id 昇順のまま正しい id に効く (マージ走査の取り違えが無い)。
