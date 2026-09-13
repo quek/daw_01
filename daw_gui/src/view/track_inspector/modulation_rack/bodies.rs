@@ -803,7 +803,7 @@ pub(super) fn draw_follower_body(
     ui: &mut Ui<'_, AppData>,
     cx: &ModBodyCtx<'_>,
     sid: u32,
-    tap: &common::model::AudioTap,
+    tap: Option<&common::model::AudioTap>,
     f: &common::model::FollowerConfig,
     mut y: f32,
 ) -> (f32, bool) {
@@ -826,7 +826,9 @@ pub(super) fn draw_follower_body(
         common::model::TapPoint::PostFader,
     ];
     let tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];
-    let tap_sel = TAP_POINTS.iter().position(|t| *t == tap.tap_point).unwrap_or(2);
+    // 入力なし (tap が `None`) は、source を選んだときに付く既定の点を出す。
+    let tap_point = tap.map(|t| t.tap_point).unwrap_or_default();
+    let tap_sel = TAP_POINTS.iter().position(|t| *t == tap_point).unwrap_or(2);
     if let Some(pick) = ui.dropdown(
         ("inspector_mod_src_tap", sid),
         Rect { x: lx, y, w: tap_w, h: ROW_H },

@@ -8,6 +8,7 @@
 //! portable across machines as long as the same plugin (any path) is
 //! installed.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -104,24 +105,102 @@ impl PluginEntry {
 /// ままで `sync_ara_documents` が `SetupAraDocument` を送らず ARA が無音になる)。
 pub const PORT_PROBE_VERSION: u32 = 4;
 
+/// plugin の一覧 (cache / scan の結果) と、id で引く索引。
+///
+/// `find_by_id` は毎フレームの名前解決や同期のたびに呼ばれるので、id → 位置の索引を持つ。`entries` を書き換える
+/// 口はこの型のメソッド ([`Self::new`] / [`Self::update_entry`] / [`Self::ensure_builtins`] / 読み込み) だけで、
+/// どれも索引を保つ (field は private なので、書き換えたのに索引が古いという状態は作れない)。
+/// JSON の形は [`PluginDatabaseRepr`] (field 名と既定値は従来どおり)。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "PluginDatabaseRepr", into = "PluginDatabaseRepr")]
 pub struct PluginDatabase {
-    pub entries: Vec<PluginEntry>,
+    entries: Vec<PluginEntry>,
     /// UNIX timestamp (seconds) of the last successful scan. Used for
     /// "rescan if older than X" heuristics in the future.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scanned_at: Option<u64>,
+    scanned_at: Option<u64>,
     /// `PluginEntry` の port 構成 (3 bool) を probe で埋めた版
-    /// ([`PORT_PROBE_VERSION`])。 古い cache (フィールド無し) は `#[serde(default)]`
-    /// で 0 に load され、 [`PluginDatabase::needs_port_probe`] が再 probe を促す。
+    /// ([`PORT_PROBE_VERSION`])。 古い cache (フィールド無し) は 0 に load され、
+    /// [`PluginDatabase::needs_port_probe`] が再 probe を促す。
+    port_probe_version: u32,
+    /// id → `entries` の位置。同じ id が複数あれば先頭 (前から探したときと同じ答え)。
+    by_id: HashMap<String, usize>,
+}
+
+/// [`PluginDatabase`] の JSON (cache file / scan subprocess の stdout) の形。
+#[derive(Serialize, Deserialize)]
+struct PluginDatabaseRepr {
+    entries: Vec<PluginEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scanned_at: Option<u64>,
     #[serde(default)]
-    pub port_probe_version: u32,
+    port_probe_version: u32,
+}
+
+impl From<PluginDatabaseRepr> for PluginDatabase {
+    fn from(repr: PluginDatabaseRepr) -> Self {
+        Self::new(repr.entries, repr.scanned_at, repr.port_probe_version)
+    }
+}
+
+impl From<PluginDatabase> for PluginDatabaseRepr {
+    fn from(db: PluginDatabase) -> Self {
+        Self { entries: db.entries, scanned_at: db.scanned_at, port_probe_version: db.port_probe_version }
+    }
 }
 
 impl PluginDatabase {
-    /// Returns the entry with matching `id`, or `None` if absent.
+    /// `entries` から作る (`scanned_at` = 最後に scan した UNIX 秒、`port_probe_version` = port を probe した版)。
+    #[must_use]
+    pub fn new(entries: Vec<PluginEntry>, scanned_at: Option<u64>, port_probe_version: u32) -> Self {
+        let mut db = Self { entries, scanned_at, port_probe_version, by_id: HashMap::new() };
+        db.rebuild_index();
+        db
+    }
+
+    /// 全 entry (builtin を注入済みなら builtin が先頭)。
+    #[must_use]
+    pub fn entries(&self) -> &[PluginEntry] {
+        &self.entries
+    }
+
+    /// 最後に scan した UNIX 秒。
+    #[must_use]
+    pub fn scanned_at(&self) -> Option<u64> {
+        self.scanned_at
+    }
+
+    /// port 構成を probe で埋めた版 ([`PORT_PROBE_VERSION`])。
+    #[must_use]
+    pub fn port_probe_version(&self) -> u32 {
+        self.port_probe_version
+    }
+
+    /// port 構成を probe で埋めた版を記録する。
+    pub fn set_port_probe_version(&mut self, version: u32) {
+        self.port_probe_version = version;
+    }
+
+    /// `index` 番目の entry を書き換える (probe した port 構成の反映など)。id を変えたら索引を作り直す。
+    /// 範囲外なら何もしない。
+    pub fn update_entry(&mut self, index: usize, f: impl FnOnce(&mut PluginEntry)) {
+        let Some(entry) = self.entries.get_mut(index) else { return };
+        let id_before = entry.id.clone();
+        f(entry);
+        if entry.id != id_before {
+            self.rebuild_index();
+        }
+    }
+
+    /// Returns the entry with matching `id`, or `None` if absent (O(1)、同じ id が複数あれば先頭)。
     pub fn find_by_id(&self, id: &str) -> Option<&PluginEntry> {
-        self.entries.iter().find(|e| e.id == id)
+        self.entries.get(*self.by_id.get(id)?)
+    }
+
+    fn rebuild_index(&mut self) {
+        self.by_id.clear();
+        for (i, e) in self.entries.iter().enumerate() {
+            self.by_id.entry(e.id.clone()).or_insert(i);
+        }
     }
 
     /// 起動時に port 構成の再 probe (= rescan) が要るか。 cache が旧版
@@ -150,6 +229,7 @@ impl PluginDatabase {
         let mut merged = builtin_descriptors();
         merged.append(&mut self.entries);
         self.entries = merged;
+        self.rebuild_index();
     }
 
     /// Load the cached database from disk. Missing file / invalid JSON
@@ -185,6 +265,7 @@ impl PluginDatabase {
                 true
             }
         });
+        // 索引は ensure_builtins が作り直す。
         db.ensure_builtins();
         Ok(Some(db))
     }
@@ -203,7 +284,7 @@ impl PluginDatabase {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let persisted = PluginDatabase {
+        let persisted = PluginDatabaseRepr {
             entries: self
                 .entries
                 .iter()
@@ -367,8 +448,8 @@ mod tests {
 
     #[test]
     fn find_by_id_hit() {
-        let db = PluginDatabase {
-            entries: vec![PluginEntry {
+        let db = PluginDatabase::new(
+            vec![PluginEntry {
                 id: "com.example.foo".into(),
                 format: PluginFormat::Clap,
                 name: "Foo".into(),
@@ -385,9 +466,9 @@ mod tests {
                 has_video_input: false,
                 has_video_output: false,
             }],
-            scanned_at: Some(42),
-            port_probe_version: 0,
-        };
+            Some(42),
+            0,
+        );
         assert_eq!(
             db.find_by_id("com.example.foo").map(|e| e.name.as_str()),
             Some("Foo")
@@ -400,12 +481,45 @@ mod tests {
         assert!(db.find_by_id("missing").is_none());
     }
 
+    /// id の索引は entries を書き換える口 (JSON からの読み込み / `update_entry` / `ensure_builtins`) の後も
+    /// 前から探したときと同じ答えを返す (同じ id が 2 つあれば先頭)。
+    #[test]
+    fn find_by_id_follows_every_way_entries_change() {
+        let entry = |id: &str, name: &str| PluginEntry {
+            id: id.into(),
+            format: PluginFormat::Clap,
+            name: name.into(),
+            vendor: String::new(),
+            version: String::new(),
+            features: vec![],
+            path: PathBuf::from("x.clap"),
+            descriptor_index: 0,
+            has_note_input: false,
+            has_note_output: false,
+            has_audio_output: true,
+            has_audio_input: false,
+            has_video_input: false,
+            has_video_output: false,
+        };
+        let json = serde_json::to_string(&PluginDatabase::new(vec![entry("a", "A1"), entry("b", "B"), entry("a", "A2")], None, 3))
+            .expect("serialize");
+        let mut db: PluginDatabase = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(db.port_probe_version(), 3);
+        assert_eq!(db.find_by_id("a").map(|e| e.name.as_str()), Some("A1"), "同じ id は先頭");
+        db.update_entry(1, |e| e.id = "c".into());
+        assert!(db.find_by_id("b").is_none(), "変えた前の id では引けない");
+        assert_eq!(db.find_by_id("c").map(|e| e.name.as_str()), Some("B"));
+        db.ensure_builtins();
+        assert_eq!(db.find_by_id("c").map(|e| e.name.as_str()), Some("B"), "builtin を先頭に注入しても位置が追従");
+        assert!(db.find_by_id(BUILTIN_ID_VOICEVOX).is_some());
+    }
+
     #[test]
     fn save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.json");
-        let db = PluginDatabase {
-            entries: vec![PluginEntry {
+        let db = PluginDatabase::new(
+            vec![PluginEntry {
                 id: "com.test.x".into(),
                 format: PluginFormat::Clap,
                 name: "X".into(),
@@ -422,17 +536,17 @@ mod tests {
                 has_video_input: false,
                 has_video_output: false,
             }],
-            scanned_at: Some(100),
-            port_probe_version: 0,
-        };
+            Some(100),
+            0,
+        );
         db.save_to_file(&path).unwrap();
         let loaded = PluginDatabase::load_from_file(&path).unwrap().unwrap();
         // load_from_file re-injects builtins, so compare against the
         // expected sanitised shape rather than the raw saved entries.
         let mut expected = db.clone();
         expected.ensure_builtins();
-        assert_eq!(loaded.entries, expected.entries);
-        assert_eq!(loaded.scanned_at, db.scanned_at);
+        assert_eq!(loaded.entries(), expected.entries());
+        assert_eq!(loaded.scanned_at(), db.scanned_at());
         // The original external entry survives the round-trip.
         assert!(loaded.find_by_id("com.test.x").is_some());
     }
@@ -463,9 +577,9 @@ mod tests {
         // 二度呼んでも builtin が重複しない (format で除外してから再注入)。
         let mut db = PluginDatabase::default();
         db.ensure_builtins();
-        let n = db.entries.len();
+        let n = db.entries().len();
         db.ensure_builtins();
-        assert_eq!(db.entries.len(), n);
+        assert_eq!(db.entries().len(), n);
     }
 
     #[test]
@@ -474,8 +588,8 @@ mod tests {
         // 残る (builtin はコードが SSoT)。load は ensure_builtins で復元する。
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.json");
-        let mut db = PluginDatabase {
-            entries: vec![PluginEntry {
+        let mut db = PluginDatabase::new(
+            vec![PluginEntry {
                 id: "com.test.x".into(),
                 format: PluginFormat::Clap,
                 name: "X".into(),
@@ -492,9 +606,9 @@ mod tests {
                 has_video_input: false,
                 has_video_output: false,
             }],
-            scanned_at: Some(1),
-            port_probe_version: 0,
-        };
+            Some(1),
+            0,
+        );
         db.ensure_builtins();
         db.save_to_file(&path).unwrap();
         // Inspect the raw on-disk JSON: builtins must be excluded from
@@ -504,8 +618,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(on_disk.find_by_id(BUILTIN_ID_VOICEVOX).is_none());
         assert!(on_disk.find_by_id(BUILTIN_ID_SILENCE).is_none());
-        assert_eq!(on_disk.entries.len(), 1);
-        assert_eq!(on_disk.entries[0].id, "com.test.x");
+        assert_eq!(on_disk.entries().len(), 1);
+        assert_eq!(on_disk.entries()[0].id, "com.test.x");
         // After load the external entry is still present alongside builtins.
         let loaded = PluginDatabase::load_from_file(&path).unwrap().unwrap();
         assert!(loaded.find_by_id("com.test.x").is_some());

@@ -65,7 +65,7 @@ fn bypassed_device_is_excluded_from_pdc_and_sidechain_taps() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
     assert_eq!(sched.master_latency_samples, 0, "bypass 中の 2048 sample は数えない");
     assert!(
         !sched
@@ -80,7 +80,7 @@ fn bypassed_device_is_excluded_from_pdc_and_sidechain_taps() {
     let mut live = song;
     live.tracks[1].devices[0].set_bypassed(false);
     live.tracks[2].devices[0].set_bypassed(false);
-    let sched = compile_schedule(&live, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&live, &lat, 48_000, 0, RenderScope::Mix).unwrap();
     assert_eq!(sched.master_latency_samples, 2048);
     assert!(sched
         .nodes
@@ -516,7 +516,7 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&latent, &lat, 48_000, 0).unwrap().master_latency_samples,
+        compile_schedule(&latent, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         2048
     );
 
@@ -535,7 +535,7 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&grouped, &lat, 48_000, 0).unwrap().master_latency_samples,
+        compile_schedule(&grouped, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         512
     );
 
@@ -591,6 +591,31 @@ fn master_limiter_latency_is_baked_from_the_static_on_or_an_on_lane() {
     }
 }
 
+/// `RenderScope` の段の有無は schedule の形に焼く: `Mix` だけが master の段 (fx chain / Limiter の遅延) を持ち、
+/// トラックのフェーダーを持ち、`Sources` だけがトラックの fx を外す。master の段を通さない scope は master fx と
+/// Limiter の遅延を出力遅延に数えない (bounce の書き出し窓がずれない)。
+#[test]
+fn render_scope_shapes_the_master_stage_and_track_faders() {
+    let mut lat = DeviceLatencies::new();
+    let mut song = Song {
+        tracks: vec![track(|t| {
+            t.id = 1;
+            t.devices = latency_chain(&mut lat, 20, 512);
+        })],
+        master_fx_chain: latency_chain(&mut lat, 90, 2048),
+        ..Song::default()
+    };
+    song.master_limiter.on = true;
+    let look = common::model::limiter_lookahead_samples(48_000);
+    let shape = |scope| {
+        let s = compile_schedule(&song, &lat, 48_000, 0, scope).unwrap();
+        (s.master_stage, s.master_program.ops.len(), s.master_limiter_latency, s.master_latency_samples, s.track_programs[0].fader)
+    };
+    assert_eq!(shape(RenderScope::Mix), (true, 1, true, 512 + 2048 + look, true));
+    assert_eq!(shape(RenderScope::PostFx), (false, 0, false, 512, false), "PostFx 点まで (fx は数え、フェーダーは掛けない)");
+    assert_eq!(shape(RenderScope::Sources), (false, 0, false, 0, false), "音声入力を持つ fx も数えない");
+}
+
 /// r.md #39: `master_latency_samples` は master **出力** の遅延量なので、
 /// send/return・パラアウト・master fx のどの経路で latency が入っても拾う。
 /// (レビュー指摘: 並列 2 track と group しか見ていなかった。)
@@ -622,7 +647,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&sends, &lat, 48_000, 0).unwrap().master_latency_samples,
+        compile_schedule(&sends, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         100,
         "send 先 (return) の latency も master 合流に効く"
     );
@@ -654,7 +679,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&paraout, &lat, 48_000, 0).unwrap().master_latency_samples,
+        compile_schedule(&paraout, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         64 + 256,
         "paraout dest は source の path latency を取り込む"
     );
@@ -668,7 +693,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&master_fx, &lat, 48_000, 0).unwrap().master_latency_samples,
+        compile_schedule(&master_fx, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         2048,
         "master fx chain の latency も master 出力の遅延"
     );
@@ -687,7 +712,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&both, &lat, 48_000, 0).unwrap().master_latency_samples,
+        compile_schedule(&both, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         512 + 2048
     );
 }
@@ -718,7 +743,7 @@ fn pdc_parallel_tracks_emit_compensating_delay_for_lower_latency_path() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
 
     // (a) DelayLine が 1 本以上、 capacity ≥ 100 で確保されている。
     assert!(
@@ -823,7 +848,7 @@ fn pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin() {
         ],
         ..Song::default()
     };
-    let mut sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let mut sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
 
     // Track ごとに「ロードされた plugin」 を持たせる。 production の
     // CLAP/VST3 と違って format-agnostic な test stub だが、
@@ -1193,7 +1218,7 @@ fn pdc_sidechain_source_path_latency_propagates_to_dest_for(kind: ScConsumer) {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
 
     // Master Mix の input は (TrackScratch(0), TrackScratch(1)) の 2 本。
     // path_latency(A=0) = 100, path_latency(B=1) = 100 + 50 = 150 になっている
@@ -1296,7 +1321,7 @@ fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track_for(kind: ScConsum
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
 
     assert_eq!(
         sched.input_delay_per_track.len(),
@@ -1365,7 +1390,7 @@ fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag_for(kind: ScConsumer) {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, BUF).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, BUF, RenderScope::Mix).unwrap();
 
     // leaf 宛: source path latency (100) + 1 buffer (512)。
     assert_eq!(
@@ -1418,7 +1443,7 @@ fn pdc_sidechain_instrument_input_delay_skipped_in_mvp() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
 
     // path_latency は instrument の sidechain も拾う (= 100 + 0 = 100)
     // ので master mix の sibling alignment は機能する。
@@ -1781,7 +1806,7 @@ fn send_source_latency_aligns_return_with_dry_at_master() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
 
     let master_mix = sched
         .nodes
@@ -2073,7 +2098,7 @@ fn paraout_instrument_bus_pdc_aligns_main_and_children() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).expect("must compile");
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).expect("must compile");
 
     let add_mix = sched
         .nodes
@@ -2148,7 +2173,7 @@ fn paraout_independent_dest_pdc_fans_in_source_latency() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0).expect("must compile");
+    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).expect("must compile");
 
     let master_mix = sched
         .nodes
@@ -2219,7 +2244,7 @@ fn sidechain_from_own_track_prefx_is_staged_in_program_not_schedule() {
         tap: AudioTap::new(TapSource::Track(1), TapPoint::PreFx),
     })];
     song.tracks.push(Track { id: 1, devices: vec![Device::Plugin(comp)], ..Track::default() });
-    let schedule = compile_schedule(&song, &DeviceLatencies::new(), 48_000, 256).expect("no cycle");
+    let schedule = compile_schedule(&song, &DeviceLatencies::new(), 48_000, 256, RenderScope::Mix).expect("no cycle");
     assert!(!schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
     assert!(schedule.track_programs[0].ops.iter().any(|op| matches!(
         op,
@@ -2419,7 +2444,7 @@ fn a_return_native_comp_aligns_its_bus_input_to_the_sidechain_with_bus_sc_align(
     };
     let n = 256usize;
     let render = |listen: bool| {
-        let mut sched = compile_schedule(&song, &lat, 48_000, n as u32).unwrap();
+        let mut sched = compile_schedule(&song, &lat, 48_000, n as u32, RenderScope::Mix).unwrap();
         let fx = sched.nodes.iter().position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 2, .. })).unwrap();
         assert!(
             matches!(sched.nodes[fx - 1], NodeOp::ApplyDelay { buf: BufRef::TrackScratch(2), frames: L, .. }),
@@ -2478,7 +2503,7 @@ fn a_group_with_instrument_prefix_consumer_takes_the_pass_one_lag() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, BUF).unwrap();
+    let sched = compile_schedule(&song, &lat, 48_000, BUF, RenderScope::Mix).unwrap();
     assert_eq!(sched.track_programs[1].pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument);
     assert_eq!(sched.input_delay_per_track[1], L + BUF);
     assert!(!sched.delay_keys.iter().any(|k| matches!(k, DelayKey::BusScAlign { .. })), "{:?}", sched.delay_keys);
@@ -2530,7 +2555,9 @@ fn a_post_fx_tap_on_a_group_reads_this_buffers_chain_output() {
 /// `song.tracks[0]` の device 列を単独の program で通した L チャンネル。
 fn sched_free_eq_output(song: &Song, x: &[f32]) -> Vec<f32> {
     let devices = &song.tracks[0].devices;
-    let mut alone = crate::graph::build_program(devices, 2, None, &DeviceLatencies::new(), &Default::default()).program;
+    let mut alone =
+        crate::graph::build_program(devices, 2, None, &DeviceLatencies::new(), &Default::default(), RenderScope::Mix)
+            .program;
     let (mut l, mut r) = (x.to_vec(), x.to_vec());
     let refs: crate::engine::PluginRefs = std::collections::HashMap::new();
     let rec = std::collections::HashSet::new();

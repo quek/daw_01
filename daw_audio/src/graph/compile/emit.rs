@@ -198,8 +198,8 @@ pub(super) fn emit_followers(
             common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
                 follower_slots.push(crate::graph::follower::FollowerSlot::from_config(follower, sample_rate));
                 // docs/plan_modulation.md §6: tap_point で source buffer を解決。
-                // dangling source は follower node を emit しない (scalar は 0 のまま)。
-                if let Some(src) = tap_bufref_for(tap, id_to_idx, chain_map) {
+                // 入力なし (`None`) は follower node を emit しない (scalar は 0 のまま)。
+                if let Some(src) = tap.as_ref().and_then(|tap| tap_bufref_for(tap, id_to_idx, chain_map)) {
                     nodes.push(NodeOp::EnvelopeFollow { src, slot: slot as u32 });
                 }
             }

@@ -27,11 +27,12 @@ pub mod text_metrics;
 pub mod theme;
 pub mod ui;
 pub mod viewport;
+pub mod visible_rows;
 pub mod wheel;
 pub mod widgets;
 
+pub use click::{ClickState, NearestHit};
 #[cfg(feature = "clipboard")]
-pub use click::ClickState;
 pub use clipboard::ArboardClipboard;
 pub use clipboard::{ClipboardProvider, NoopClipboard};
 pub use dialog::{DialogResult, FileDialogFilter};

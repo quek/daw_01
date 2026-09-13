@@ -389,7 +389,7 @@ impl AppData {
                     .peph
                     .last_touched_param
                     .as_ref()
-                    .is_some_and(|t| crate::handler::param_value::touched_param_owner(song, t).is_none()),
+                    .is_some_and(|t| crate::handler::param_value::touched_param_owner(&self.cur.song_doc, t).is_none()),
                 self.cur.peph.armed_mod_source.is_some_and(|id| !song.mod_sources.iter().any(|m| m.id == id)),
             )
         };

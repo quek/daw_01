@@ -21,6 +21,7 @@ use std::hash::Hash;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
+use crate::click::NearestHit;
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -94,6 +95,15 @@ pub struct MsegEditorResponse {
     pub dragging: bool,
 }
 
+/// `mseg_editor` の当たり判定の候補。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MsegHit {
+    /// セグメント `segment` の tension handle。
+    Tension(usize),
+    /// ノード `index`。
+    Node(usize),
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct MsegEditorState {
     /// ドラッグ中のノード index。
@@ -154,55 +164,64 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         let to_px = |t: f32, v: f32| (rect.x + t * rect.w, rect.y + (1.0 - v) * rect.h);
-
-        // --- hit-test: node (radius*2 で甘め) ---
-        let hovered_node: Option<usize> = pointer.pos.and_then(|(px, py)| {
-            let r2 = (style.node_radius_px * 2.0).powi(2);
-            nodes.iter().position(|nd| {
-                let (nx, ny) = to_px(nd.time, nd.value);
-                (px - nx).powi(2) + (py - ny).powi(2) <= r2
-            })
-        });
-        // --- hit-test: tension handle (各セグメント中点、ノードに当たってない時のみ) ---
         let tension_handle_px = |seg: usize| -> (f32, f32) {
             let mt = f32::midpoint(nodes[seg].time, nodes[seg + 1].time);
             to_px(mt, sample_y_at(samples, mt))
         };
-        let hovered_tension: Option<usize> = if hovered_node.is_some() {
-            None
-        } else {
-            pointer.pos.and_then(|(px, py)| {
-                let r2 = (style.node_radius_px * 2.2).powi(2);
-                (0..n.saturating_sub(1)).find(|&seg| {
-                    // 水平に潰れたセグメントは tension が見えないので除外。
-                    if (nodes[seg + 1].time - nodes[seg].time).abs() < 1e-3 {
-                        return false;
-                    }
-                    let (hx, hy) = tension_handle_px(seg);
-                    (px - hx).powi(2) + (py - hy).powi(2) <= r2
-                })
-            })
+
+        // --- hit-test: tension handle (各セグメント中点、radius*2.2) とノード (radius*2) ---
+        // 当たり円は甘めに取るので短いセグメントではノードと tension handle / 隣のノードどうしが重なる。
+        // 当たったもののうち **近い 1 つ** を選ぶ ([`crate::click`]、描画順 = tension handle の上にノードなので、
+        // 同じ距離ならノード)。水平に潰れたセグメントは tension が見えないので候補にしない。
+        let hit: Option<(MsegHit, f32)> = pointer.pos.and_then(|(px, py)| {
+            let tensions = (0..n.saturating_sub(1))
+                .filter(|&seg| (nodes[seg + 1].time - nodes[seg].time).abs() >= 1e-3)
+                .map(|seg| (MsegHit::Tension(seg), tension_handle_px(seg), style.node_radius_px * 2.2));
+            let node_hits = nodes
+                .iter()
+                .enumerate()
+                .map(|(i, nd)| (MsegHit::Node(i), to_px(nd.time, nd.value), style.node_radius_px * 2.0));
+            tensions
+                .chain(node_hits)
+                .map(|(h, (hx, hy), r)| (h, (px - hx).hypot(py - hy), r))
+                .filter(|&(_, d, r)| d <= r)
+                .map(|(h, d, _)| (h, d))
+                .collect::<NearestHit<_>>()
+                .best()
+        });
+        // hover (強調 / 右クリック・Delete の削除先 / ダブルクリックの除外) は、当たり判定の重なる別の widget とも
+        // 近さで取り合う。
+        let hovered = hit.filter(|&(_, d)| self.nearest_under_pointer(wid, d)).map(|(h, _)| h);
+        let hovered_node = match hovered {
+            Some(MsegHit::Node(i)) => Some(i),
+            _ => None,
         };
+        let hovered_tension = match hovered {
+            Some(MsegHit::Tension(seg)) => Some(seg),
+            _ => None,
+        };
+        // press も近さを添えて名乗り (r.md #122 / [`crate::click`])、より近い widget に奪われたら session を捨てる。
+        let pressed = pointer.primary_just_pressed && hit.is_some_and(|(_, d)| self.claim_press_at(wid, d));
+        let taken = !pressed && self.press_taken_from(wid);
 
         // --- drag state 更新 + action 抽出 (scope を分けて借用を early release) ---
         let mut action: Option<MsegAction> = None;
-        // ノード / tension を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
-        if pointer.primary_just_pressed && (hovered_node.is_some() || hovered_tension.is_some()) {
-            self.claim_press(wid);
-        }
         {
             let st: &mut MsegEditorState = self.widget_state(wid);
+            if taken {
+                st.node_drag = None;
+                st.curve_drag = None;
+            }
             // press: Alt+ノード = 削除、ノード = drag開始、tension = curve drag開始。
-            if pointer.primary_just_pressed {
-                if let Some(idx) = hovered_node {
-                    if pointer.modifiers.alt && idx > 0 && idx + 1 < n {
-                        action = Some(MsegAction::Delete { index: idx });
-                    } else {
-                        st.node_drag = Some(idx);
-                    }
-                } else if let Some(seg) = hovered_tension {
+            match hit.filter(|_| pressed).map(|(h, _)| h) {
+                Some(MsegHit::Node(idx)) if pointer.modifiers.alt && idx > 0 && idx + 1 < n => {
+                    action = Some(MsegAction::Delete { index: idx });
+                }
+                Some(MsegHit::Node(idx)) => st.node_drag = Some(idx),
+                Some(MsegHit::Tension(seg)) => {
                     st.curve_drag = Some((seg, nodes[seg].curve, pointer.pos.map_or(0.0, |p| p.1)));
                 }
+                None => {}
             }
             if pointer.primary_just_released {
                 st.node_drag = None;

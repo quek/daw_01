@@ -103,14 +103,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect,
             (rect.w, content_h),
             |ui, offset| {
-                if item_count == 0 || row_total_h <= 0.0 {
-                    return;
-                }
-                let visible_top = offset.1;
-                let visible_bottom = offset.1 + rect.h;
-                let i_start = (visible_top / row_total_h).floor().max(0.0) as usize;
-                let i_end = ((visible_bottom / row_total_h).ceil() as usize).min(item_count);
-                for (i, item) in items.iter().enumerate().take(i_end).skip(i_start) {
+                // 見えている行だけ回す (今の clip = scroll_area の viewport と祖先の clip の交差)。
+                let visible = ui.visible_rows(rect.y - offset.1, row_total_h, item_count);
+                for (i, item) in items.iter().enumerate().take(visible.end).skip(visible.start) {
                     let row_y = rect.y - offset.1 + (i as f32) * row_total_h;
                     let row_rect = Rect {
                         x: rect.x,

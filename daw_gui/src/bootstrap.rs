@@ -1070,7 +1070,7 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
                 // builtin が反映され、vocal track の instrument ロードが通る)。
                 db.ensure_builtins();
                 tracing::info!(
-                    count = db.entries.len(),
+                    count = db.entries().len(),
                     path = %cache.display(),
                     "loaded cached plugin database"
                 );
@@ -1091,7 +1091,7 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
                     tracing::warn!(error = ?e, "failed to write plugin cache");
                 } else {
                     tracing::info!(
-                        count = db.entries.len(),
+                        count = db.entries().len(),
                         path = %cache.display(),
                         "wrote plugin database cache"
                     );

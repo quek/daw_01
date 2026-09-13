@@ -93,7 +93,8 @@ fn ctx<'a>(env: &'a Env, song: &'a Song, devices: &'a [Device], n: usize) -> Pro
 }
 
 fn build(devices: &[Device], track_id: u32) -> ChainProgram {
-    build_program(devices, track_id, None, &DeviceLatencies::new(), &HashSet::new()).program
+    build_program(devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix)
+        .program
 }
 
 fn run(program: &mut ChainProgram, l: &mut [f32], r: &mut [f32], ctx: &ProgramCtx<'_>) {

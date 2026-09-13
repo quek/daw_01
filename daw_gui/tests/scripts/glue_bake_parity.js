@@ -7,6 +7,7 @@
 //   2. 0..4 拍のラウドネスを測る (結合前)。
 //   3. 範囲を選んで J → 焼き込み完了 (1 clip / 1 event) を待つ。
 //   4. 同じ範囲をもう一度測り、一致することを確かめる。
+//   (以降の節で master / トラックの内蔵 device・Parallel 付きの Glue と、Bounce (with FX) も同じく測る)
 
 function fail(msg) {
   throw new Error("glue_bake_parity: " + msg);
@@ -279,8 +280,8 @@ function expectSameLoudness(before, after, label, hint) {
 }
 
 // ---- 7. master の組み込み Bus Comp と Limiter が ON でも音が変わらないこと (r.md #92) ----
-// 焼き込みはトラック単独の isolate render だが、master の Bus Comp / フェーダー後 Limiter を
-// 外し忘れると GR が WAV に焼き込まれ、再生時にもう一度マスターを通って二重に掛かる
+// 焼き込みはトラック単独の render で、master の段は render の scope (`RenderScope::Sources`) が通さない。
+// 通してしまうと GR が WAV に焼き込まれ、再生時にもう一度マスターを通って二重に掛かる
 // (実機: comp + limiter ON の曲で Glue した Kick が -4.5 dB)。強めの設定で差を露出させる。
 // r.md #129: master の Bus Comp は `master_fx_chain` の組み込み device、Limiter は `master_limiter`。
 const withMaster = JSON.parse(JSON.stringify(song));
@@ -301,7 +302,7 @@ const masterBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
 if (masterBefore.integrated_lufs === null) fail("master の Bus Comp / Limiter ON の song が無音");
 
 s = glueTrack1AndWait("master の Bus Comp / Limiter ON");
-// device は song 側に残っている (焼き込みが外すのは render 用の使い捨て Song だけ)。
+// device は song 側に残っている (焼き込みは Song から処理を消さず、描く段を scope で選ぶ)。
 expectEq(builtinNative(s.master_fx_chain, "BusComp").bypassed === true, false, "master Bus Comp kept ON");
 expectEq(s.master_limiter.on, true, "master limiter kept");
 expectSameLoudness(
@@ -312,7 +313,7 @@ expectSameLoudness(
 );
 
 // ---- 8. トラックの組み込み Comp が ON でも音が変わらないこと (r.md #129 §10.15) ----
-// Glue は pre-FX の焼き込み (素材の素の音)。トラックの組み込み Comp を render 用の Song から外し忘れると、
+// Glue は pre-FX の焼き込み (素材の素の音)。render の scope がトラックの内蔵 device を通してしまうと、
 // 圧縮済みの音が焼かれ、再生時にもう一度 Comp を通って二重に掛かる。
 const withComp = JSON.parse(JSON.stringify(song));
 withComp.tracks[0].devices = [
@@ -331,3 +332,69 @@ expectSameLoudness(
   "トラックの組み込み Comp ON",
   "焼き込みがトラックの組み込み Comp を通している (二重適用) を疑う",
 );
+
+// ---- 9. トラックに Parallel があっても音が変わらないこと (設計書 §18.2-2) ----
+// Parallel は再生時にも入ってくる音を chain に配って足す。空 chain 2 本の Parallel は入力を 2 回足す (+6 dB) ので、
+// 焼き込みがこれを通すと +6 dB 焼かれ、再生時にもう一度 +6 dB 掛かる。chain の pan / 出力 trim も同じ。
+const withParallel = JSON.parse(JSON.stringify(song));
+withParallel.tracks[0].devices = [
+  { Parallel: { out_gain: 0.8, chains: [{ name: "A" }, { name: "B", pan: -0.5 }] } },
+];
+daw.appLoadSongJson(JSON.stringify(withParallel));
+daw.sleepMs(300);
+const parallelBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
+if (parallelBefore.integrated_lufs === null) fail("Parallel 付きトラックの song が無音");
+
+s = glueTrack1AndWait("Parallel 付きトラック");
+expectEq((s.tracks[0].devices || []).filter((d) => d.Parallel).length, 1, "Parallel kept");
+expectSameLoudness(
+  parallelBefore,
+  JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000)),
+  "Parallel 付きトラック",
+  "焼き込みが Parallel の分配 / 混ぜ (chain の和・pan・出力 trim) を通している (二重適用) を疑う",
+);
+
+// ---- 10. Bounce (with FX) が元と同じ音で鳴ること (r.md #129) ----
+// With FX は device チェーン (内蔵 Comp を含む) までを焼いて新しいトラックに置き、元トラックを mute する。フェーダー
+// (volume / pan) は焼かずに新しいトラックへ写す (`Song::place_bounce_with_fx`)。焼く段がフェーダーを含むと、写した
+// フェーダーでもう一度掛かる (pan 中央で -3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
+function bounceWithFxAndWait(label) {
+  daw.dispatchBounceWithFx(JSON.stringify({ track_id: 1, clip_id: 1 }));
+  let snapshot = null;
+  let elapsed = 0;
+  while (elapsed < 30000) {
+    snapshot = JSON.parse(daw.inspectSongJson());
+    if (snapshot.tracks.length === 2) break;
+    daw.sleepMs(200);
+    elapsed += 200;
+  }
+  expectEq(snapshot.tracks.length, 2, label + " で Bounce 後のトラック数");
+  return snapshot;
+}
+
+for (const [volume, pan] of [[1.0, 0.0], [1.0, -0.6], [0.5, 0.0]]) {
+  const label = "Bounce (with FX) volume " + volume + " / pan " + pan;
+  const withFx = JSON.parse(JSON.stringify(withComp));
+  withFx.tracks[0].volume = volume;
+  withFx.tracks[0].pan = pan;
+  daw.appLoadSongJson(JSON.stringify(withFx));
+  daw.sleepMs(300);
+  // 焼くのはクリップ 1 (0..2 拍) だけ。元トラックはトラックごと mute されるので、同じ区間で比べる。
+  const fxBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 2.0, 60000));
+  if (fxBefore.integrated_lufs === null) fail(label + ": 元の song が無音");
+
+  s = bounceWithFxAndWait(label);
+  expectEq(s.tracks[0].muted, true, label + ": 元トラックは mute");
+  const bounced = s.tracks[1];
+  expectEq(bounced.clips.length, 1, label + ": 焼いたクリップ");
+  if (Math.abs(bounced.volume - volume) > 1e-6 || Math.abs(bounced.pan - pan) > 1e-6) {
+    fail(label + ": フェーダーを写していない: volume=" + bounced.volume + " pan=" + bounced.pan);
+  }
+  const fxAfter = JSON.parse(daw.analyzeLoudnessJson(0.0, 2.0, 60000));
+  const hint = "焼く段がフェーダーを含む (二重適用) / device チェーンを焼いていない を疑う";
+  expectSameLoudness(fxBefore, fxAfter, label, hint);
+  const fxPeakDelta = Math.abs(fxAfter.sample_peak_dbfs - fxBefore.sample_peak_dbfs);
+  if (fxPeakDelta > 0.5) {
+    fail(label + ": ピークが変わった: before=" + fxBefore.sample_peak_dbfs + " after=" + fxAfter.sample_peak_dbfs + "。" + hint);
+  }
+}

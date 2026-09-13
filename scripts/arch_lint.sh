@@ -80,6 +80,9 @@ rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 # 検査パターンは **1 箇所で定義**して canary と本体で同じものを使う。別々に書くと
 # 「canary は通るが本体は壊れている」が成立してしまい、canary が証明にならない。
 INFINITE_RE='WaitForSingleObject[(][^,]*,[[:space:]]*INFINITE'
+# check 15 (RT-ARCSWAP-LOAD): 引数なしの `.load()` / `.load_full()` = ArcSwap の読み出し。Atomic の
+# `.load(Ordering::…)` は引数を持つので当たらない。
+ARCSWAP_LOAD_RE='[.]load(_full)?[(][)]'
 UNTAGGED_RE='^[[:space:]]*#[[]serde[(]untagged[)][]]'
 PROTOCOL_RE='(MainToChild|ChildToMain)'
 # check 14 (WIRE-SOURCES): wire 型の印 (bincode の derive / impl。grep -w で単語一致) と、
@@ -152,6 +155,14 @@ printf 'x: HashMap<(u64, u32), f64>,\n'           | awk "$POSKEY_AWK" | grep -q 
 # 旧 canary が anchor 無しの別パターンを試していたことが露見した** — 検査対象と
 # 別物を試す canary は証明にならない、という実例。
 printf '    #[serde(untagged)]\n' | grep -qE "$UNTAGGED_RE" || canary_ok=0
+# RT-ARCSWAP-LOAD: `.load()` / `.load_full()` (改行して `.load()` だけの行も) を拾い、Atomic の
+# `.load(Ordering::Acquire)` と別名の `.load_state()` は拾わない。除外マーカーが効くこと。
+printf 'let song = self.shared.song.load();\n' | grep -qE "$ARCSWAP_LOAD_RE" || canary_ok=0
+printf '        .load_full()\n'                 | grep -qE "$ARCSWAP_LOAD_RE" || canary_ok=0
+printf 'if flag.load(Ordering::Acquire) {\n'    | grep -qE "$ARCSWAP_LOAD_RE" && canary_ok=0
+printf 'let s = plugin.load_state();\n'         | grep -qE "$ARCSWAP_LOAD_RE" && canary_ok=0
+printf 'let g = x.load(); // arch-lint: allow-arcswap-load (off-RT)\n' \
+    | grep -E "$ARCSWAP_LOAD_RE" | strip_allowed arcswap-load | grep -q . && canary_ok=0
 printf 'use MainToChild;\n' | grep -qwE "$PROTOCOL_RE" || canary_ok=0
 # doc comment 中の言及は数えないこと (撤去の経緯説明が common/src に 40 行残っている)
 printf '/// 旧 #[serde(untagged)] は撤去済み\n' | grep -qE "$UNTAGGED_RE" && canary_ok=0
@@ -706,6 +717,21 @@ if [ -z "$_wire_enc" ] || [ -z "$_wire_reg" ]; then
 fi
 hits=$(wire_unregistered "$_wire_enc" "$_wire_reg")
 record WIRE-SOURCES firstfield "bincode の Encode を持つのに common/build.rs の WIRE_SOURCES に未登録 (fingerprint が protocol の変更を検出できない):" "$hits"
+
+# 15. RT 経路の ArcSwap load (不変条件 4、r.md #129)。`load()` の Guard も `load_full()` の Arc も、書き手が
+#     同時に store すると **RT が旧値の最終参照になって RT で解放が起きる** (arc-swap の hybrid 戦略:
+#     writer が debt を払うと `HybridProtection::drop` が自分で drop する)。RT が読む snapshot は
+#     daw_audio では `ProjectCtl::snapshot_bundle` が集めて rtrb の便 (`RtBundle` / `DeviceBundle`) で渡し、
+#     daw_plugin_host の worker pool では registry の snapshot を worker ごとの受け口に置く
+#     (`process_server.rs` の `PluginRegistry` / `RegistryInbox`)。どちらも旧値は recycle ring で off-thread に返す。
+#     走査の範囲は check 1 と同じ作法: daw_audio/src と daw_plugin_host/src 全体を RT 側とみなし、off-RT の
+#     読み出し (recv loop / notify thread / 書き出しの走査 / RT へ送る前の組み立て / テスト) と、書き手が
+#     quiesce 付きで回収する契約を持つ RT の読み出しは、同一行に「arch-lint: allow-arcswap-load (理由)」を
+#     付けて明示する。ファイル単位では除外しない — main.rs は notify thread と CPAL callback が、engine.rs は
+#     off-thread の構築と RT 本体が同居している。
+hits=$(grep -rnE "$ARCSWAP_LOAD_RE" --include='*.rs' daw_audio/src daw_plugin_host/src 2>/dev/null \
+    | strip_allowed arcswap-load | strip_comments || true)
+record RT-ARCSWAP-LOAD grep "RT 側 (daw_audio / daw_plugin_host) で ArcSwap を load。RT は rtrb の便 / registry の受け口の snapshot を読む (off-RT なら同一行に allow マーカーと理由):" "$hits"
 
 # ---------------------------------------------------------------- 判定
 # 「検査器が実際に何を見たか」を毎回可視化する (出力が空 = 違反ゼロ、を信じないための土台)。

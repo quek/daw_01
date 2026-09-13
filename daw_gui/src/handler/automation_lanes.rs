@@ -477,6 +477,18 @@ impl AppData {
         crate::group_compose::group_has_visual_content(self.cur.song_doc.song(), group_track_id)
     }
 
+    /// Par の描画 / 値の書き込み (scrub の毎フレーム) が引く device と置き場のトラック (`MASTER_TRACK_ID` = master)。
+    /// `find_device_by_id` と同じ答え (未採番の `0` は無し) を `SongDoc` の node 索引で返す (木を走査しない)。
+    fn par_device_node(&self, device_id: u64) -> Option<(&common::model::Device, u32)> {
+        (device_id != 0).then(|| self.cur.song_doc.device_node(device_id))?
+    }
+
+    /// [`Self::par_device_node`] の plugin 版。
+    fn plugin_node(&self, device_id: u64) -> Option<(&common::model::PluginInstance, u32)> {
+        let (device, owner) = self.par_device_node(device_id)?;
+        Some((device.as_plugin()?, owner))
+    }
+
     /// group inspector 用 summary。Par を開いた `open_device` が cursor track の Transform 配置
     /// device なら、各 param に `GroupTransform(param)` lane があるか（=「A」 トグル点灯）を返す。
     pub fn inspector_group_transform_summary(
@@ -489,16 +501,11 @@ impl AppData {
         // r.md #71 (プラグインのコピー / 移動): パネルは device_id で開いたまま
         // にして、 **描画側で** 「いま表示しているチェーンの device か」 を gate する
         // (device を別トラックへ移してもパネルが自然に追従する)。
-        let (open_track, _) = find_device_by_id(self.cur.song_doc.song(), open_device)?;
-        if self.cursor_track_id() != Some(open_track) {
+        let (device, open_track) = self.plugin_node(open_device)?;
+        if self.cursor_track_id() != Some(open_track) || device.plugin_id != common::video_fx::TRANSFORM_ID {
             return None;
         }
         let track = self.cur.song_doc.song().track_by_id(open_track)?;
-        if self.cur.song_doc.song().plugin_by_id(open_device).map(|d| d.plugin_id.as_str())
-            != Some(common::video_fx::TRANSFORM_ID)
-        {
-            return None;
-        }
         let mut automated = [false; 8];
         for param in GROUP_PARAMS {
             automated[group_param_index(param)] = track.automation_lanes.iter().any(
@@ -515,15 +522,11 @@ impl AppData {
     /// Par を開いた映像 FX `device_id` が cursor track に居るとき、その device の def + 各 param の
     /// 現在実値を返す。inspector が scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
     pub fn inspector_video_fx_params(&self, device_id: u64) -> Option<VideoFxParamsInspector> {
-        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
+        let (device, track_id) = self.plugin_node(device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        let def = self
-            .cur.song_doc
-            .song()
-            .plugin_by_id(device_id)
-            .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))?;
+        let def = common::video_fx::def_by_id(&device.plugin_id)?;
         if def.params.is_empty() {
             return None; // Transform 等は専用セクションで編集。
         }
@@ -589,15 +592,10 @@ impl AppData {
     pub(crate) fn set_video_fx_param(&mut self, device_id: u64, param_id: u32, value_real: f32) {
         use common::model::AutomationTarget;
         // lane の所有者 (track / master) は device_id から毎回引き直す
-        // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。
-        let song = self.cur.song_doc.song();
-        let Some((track_id, _)) = find_device_by_id(song, device_id) else {
-            return;
-        };
-        // def_by_id は &'static を返すので self.cur.song_doc.song() の借用はここで終わる。
-        let Some(def) = song
-            .plugin_by_id(device_id)
-            .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
+        // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。scrub 中は毎フレーム来るので node 索引で。
+        // def_by_id は &'static を返すので Song の借用はここで終わる。
+        let Some((def, track_id)) =
+            self.plugin_node(device_id).and_then(|(d, track_id)| Some((common::video_fx::def_by_id(&d.plugin_id)?, track_id)))
         else {
             return;
         };
@@ -627,64 +625,52 @@ impl AppData {
     /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
     /// Talk / Text Event) が自分の gate (Par を開いた device の種類) で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
-    pub fn inspector_plugin_params(&self, device_id: u64) -> Option<PluginParamsInspector> {
-        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
-        if self.cursor_track_id() != Some(track_id) {
-            return None;
-        }
-        let device = self.cur.song_doc.song().plugin_by_id(device_id)?;
+    ///
+    /// 行は param 表の全 param ぶんあるので、device ごとに [`PluginParamsPanelCache`] (Song + param 表 +
+    /// plugin DB の世代) に載せ、毎フレーム組み直さない。カーソルトラックの gate だけは毎回見る。
+    pub fn inspector_plugin_params(&self, device_id: u64) -> Option<std::rc::Rc<PluginParamsInspector>> {
+        let panel = {
+            let mut cache = self.cur.peph.plugin_params_panels.borrow_mut();
+            if !self.host_derived_key_is_current(cache.key.as_ref()) {
+                cache.panels.clear();
+                cache.key = Some(self.host_derived_key());
+            }
+            cache
+                .panels
+                .entry(device_id)
+                .or_insert_with(|| self.build_plugin_params_inspector(device_id).map(std::rc::Rc::new))
+                .clone()
+        }?;
+        (self.cursor_track_id() == Some(panel.track_id)).then_some(panel)
+    }
+
+    /// [`Self::inspector_plugin_params`] の中身 (カーソルトラックの gate を除く)。
+    fn build_plugin_params_inspector(&self, device_id: u64) -> Option<PluginParamsInspector> {
+        use common::model::AutomationTarget;
+        let (device, track_id) = self.plugin_node(device_id)?;
         if device.ports.is_video() && device.plugin_id != common::plugin_db::SUBTITLE_ID {
             return None; // 映像 FX は専用セクション。
         }
         let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
-        // 実レンジへ。 HIDDEN は出さない。
+        // 実レンジへ。 HIDDEN は出さない。レーンは param id で 1 回だけ引ける形にする
+        // (param ごとにレーン列を探さない。同じ target のレーンが複数あれば先頭)。
         let lanes = self.cur.song_doc.song().param_stores(track_id).map_or(&[][..], |(l, _)| l);
-        let params: Vec<PluginParamRow> = self
-            .cur.pipc.plugin_params
-            .get(&device_id)
-            .map(|infos| {
-                infos
-                    .iter()
-                    .filter(|p| {
-                        p.flags & common::protocol::plugin_param_flags::HIDDEN == 0
-                    })
-                    .map(|p| {
-                        let span = p.max_value - p.min_value;
-                        let target = common::model::AutomationTarget::PluginParam {
-                            device_id,
-                            param_id: p.id,
-                            legacy_device_index: None,
-                        };
-                        let norm = lanes.iter().find(|l| l.target == target).map_or_else(
-                            || {
-                                if span.abs() < f64::EPSILON {
-                                    0.0
-                                } else {
-                                    ((p.default_value - p.min_value) / span).clamp(0.0, 1.0)
-                                }
-                            },
-                            |l| l.default_value,
-                        );
-                        PluginParamRow {
-                            id: p.id,
-                            name: p.name.clone(),
-                            value_real: p.min_value + norm * span,
-                            default_real: p.default_value,
-                            min: p.min_value,
-                            max: p.max_value,
-                            stepped: p.flags
-                                & common::protocol::plugin_param_flags::STEPPED
-                                != 0,
-                            readonly: p.flags
-                                & common::protocol::plugin_param_flags::READONLY
-                                != 0,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut lane_defaults: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+        for lane in lanes {
+            if let AutomationTarget::PluginParam { device_id: d, param_id, legacy_device_index: None } = lane.target
+                && d == device_id
+            {
+                lane_defaults.entry(param_id).or_insert(lane.default_value);
+            }
+        }
+        let infos = self.cur.pipc.plugin_params.get(&device_id).unwrap_or_default();
+        let params: Vec<PluginParamRow> = infos
+            .iter()
+            .filter(|p| p.flags & common::protocol::plugin_param_flags::HIDDEN == 0)
+            .map(|p| plugin_param_row(p, lane_defaults.get(&p.id).copied()))
+            .collect();
         // param が 1 つも無い device (VOICEVOX / 字幕 / Silence) は汎用パネルを出さない
         // (= 専用セクションが Par パネルを担う)。
         if params.is_empty() {
@@ -710,16 +696,12 @@ impl AppData {
     pub(crate) fn set_plugin_param(&mut self, device_id: u64, param_id: u32, value_real: f64) {
         use common::model::AutomationTarget;
         // device が消えていれば何もしない (削除済み device への stale binding /
-        // stale event は正常系なので tracing は出さない)。
-        let Some((track_id, _)) = find_device_by_id(self.cur.song_doc.song(), device_id) else {
+        // stale event は正常系なので tracing は出さない)。scrub 中は毎フレーム来るので、持ち主は node 索引・
+        // param は id の索引で引く。
+        let Some((_, track_id)) = self.par_device_node(device_id) else {
             return;
         };
-        let Some(info) = self
-            .cur.pipc.plugin_params
-            .get(&device_id)
-            .and_then(|v| v.iter().find(|p| p.id == param_id))
-            .cloned()
-        else {
+        let Some(info) = self.cur.pipc.plugin_params.info(device_id, param_id) else {
             return;
         };
         let span = info.max_value - info.min_value;
@@ -1103,4 +1085,75 @@ impl AppData {
             .retain(|sel| !keys.iter().any(|k| k == sel));
     }
 
+}
+
+/// plugin の Par の 1 param 行。値は値保持レーンの `default_value` (`lane_default`、0..=1 norm)、無ければ plugin の
+/// 既定値を実レンジで出す。
+fn plugin_param_row(p: &common::protocol::PluginParamInfo, lane_default: Option<f64>) -> PluginParamRow {
+    use common::protocol::plugin_param_flags as F;
+    let span = p.max_value - p.min_value;
+    let norm = lane_default.unwrap_or_else(|| {
+        if span.abs() < f64::EPSILON { 0.0 } else { ((p.default_value - p.min_value) / span).clamp(0.0, 1.0) }
+    });
+    PluginParamRow {
+        id: p.id,
+        name: p.name.clone(),
+        value_real: p.min_value + norm * span,
+        default_real: p.default_value,
+        min: p.min_value,
+        max: p.max_value,
+        stepped: p.flags & F::STEPPED != 0,
+        readonly: p.flags & F::READONLY != 0,
+    }
+}
+
+#[cfg(test)]
+mod plugin_params_panel_tests {
+    use common::model::{Device, PluginInstance, Track};
+    use common::plugin_format::PluginFormat;
+    use common::protocol::PluginParamInfo;
+
+    /// plugin の Par の param 行は世代キャッシュから引くが、host の param 表の到着・値の編集 (レーン既定値)・
+    /// plugin DB の差し替え・カーソルトラックの切り替えの後は必ず今の内容になる。
+    #[test]
+    fn plugin_params_panel_follows_param_lists_edits_the_plugin_db_and_the_cursor() {
+        let mut app = crate::test_support::headless_app();
+        let (mut track_id, mut device_id) = (0, 0);
+        app.edit_song(|song| {
+            track_id = song.alloc_track_id();
+            let mut inst = PluginInstance::new("com.example.synth".into(), PluginFormat::Clap);
+            inst.id = song.alloc_device_id();
+            device_id = inst.id;
+            song.tracks.push(Track { id: track_id, devices: vec![Device::Plugin(inst)], ..Track::default() });
+        });
+        app.cur.selection.selected_track_ids = vec![track_id];
+        assert!(app.inspector_plugin_params(device_id).is_none(), "host が param 表を送る前は出さない");
+
+        let cutoff = PluginParamInfo {
+            id: 7,
+            name: "Cutoff".into(),
+            module: String::new(),
+            min_value: 0.0,
+            max_value: 100.0,
+            default_value: 50.0,
+            flags: 0,
+        };
+        app.cur.pipc.plugin_params.insert(device_id, vec![cutoff]);
+        let panel = app.inspector_plugin_params(device_id).expect("param 表が届いたら出る");
+        assert_eq!((panel.plugin_name.as_str(), panel.params[0].value_real), ("com.example.synth", 50.0));
+
+        app.set_plugin_param(device_id, 7, 25.0);
+        let panel = app.inspector_plugin_params(device_id).expect("panel");
+        assert!((panel.params[0].value_real - 25.0).abs() < 1e-9, "値の編集が反映される: {}", panel.params[0].value_real);
+
+        let db: common::plugin_db::PluginDatabase = serde_json::from_str(
+            r#"{"entries":[{"id":"com.example.synth","name":"Synth","path":"synth.clap","descriptor_index":0}]}"#,
+        )
+        .expect("plugin DB");
+        app.ipc.plugin_db = Some(std::sync::Arc::new(db));
+        assert_eq!(app.inspector_plugin_params(device_id).expect("panel").plugin_name, "Synth", "plugin DB の名前");
+
+        app.cur.selection.selected_track_ids.clear();
+        assert!(app.inspector_plugin_params(device_id).is_none(), "カーソルトラックに居ない device は出さない");
+    }
 }

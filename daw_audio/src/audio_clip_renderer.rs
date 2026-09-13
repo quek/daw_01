@@ -868,11 +868,8 @@ pub fn render_audio_events(
             l_plane
         };
 
-        // Equal-power pan for mono → stereo / balance pan for stereo.
-        // pan = 0 → no change; pan > 0 → right; pan < 0 → left.
-        let pan_rad = (event.pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let pan_l = pan_rad.cos();
-        let pan_r = pan_rad.sin();
+        // トラックと同じ pan 則 (中央 0 dB の等パワー則、SSoT は `common::audio_render::pan_gains`)。
+        let (pan_l, pan_r) = common::audio_render::pan_gains(event.pan);
 
         // --- 出力範囲を event-local に揃える ------------------------------
         // event_local = i - event_start_offset_in_buf。 負の区間 (= event 開始前)
@@ -1033,8 +1030,8 @@ pub fn render_audio_events(
                     continue;
                 }
                 let i = first_i + k;
-                track_l[i] += out_l[k] * env * pan_l * std::f32::consts::SQRT_2;
-                track_r[i] += out_r[k] * env * pan_r * std::f32::consts::SQRT_2;
+                track_l[i] += out_l[k] * env * pan_l;
+                track_r[i] += out_r[k] * env * pan_r;
             }
             continue;
         }
@@ -1111,8 +1108,8 @@ pub fn render_audio_events(
                 )
             };
 
-            track_l[i] += s_l * env * pan_l * std::f32::consts::SQRT_2;
-            track_r[i] += s_r * env * pan_r * std::f32::consts::SQRT_2;
+            track_l[i] += s_l * env * pan_l;
+            track_r[i] += s_r * env * pan_r;
         }
     }
 }

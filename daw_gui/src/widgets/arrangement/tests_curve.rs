@@ -496,6 +496,48 @@ fn automation_segment_at_hits_the_drawn_curve() {
     );
 }
 
+/// 点の当たり円 (半径 = 点の半径 × 2) が重なると、**近い点**に当たる (走査の最後に当たった点ではない)。
+/// 同じ距離なら後に描いた点 — 選択中の点は非選択の上に描き直すので選択中、同じ選択状態なら後ろの点。
+#[test]
+fn automation_point_at_picks_the_nearest_of_overlapping_points() {
+    let style = test_style();
+    let lanes = Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 };
+    let view = hit_view();
+    let point = |id: u32, time_beat: f64| ArrangementAutomationPoint {
+        id,
+        time_beat,
+        value_norm: 0.5,
+        value_plain: vol_plain(0.5),
+        curve: AutomationCurve::Linear,
+    };
+    let mut lane = volume_lane();
+    // 1 beat = 50px: 点 0 は x=100、点 1 は x=112.5。
+    lane.clips = vec![ArrangementAutomationClip {
+        id: 1,
+        start_beat: 0.0,
+        len_beats: 4.0,
+        name: Arc::from("c"),
+        color: None,
+        points: vec![point(1, 2.0), point(2, 2.25)],
+        share_group_color: None,
+        in_active_group: false,
+    }];
+    let tracks = vec![track_with_lane(lane)];
+    let tops = vec![0.0_f32, 120.0];
+    let pad = style.automation_clip_v_pad_px;
+    let y = 20.0 + pad + 0.5 * (100.0 - pad * 2.0).max(2.0);
+    assert!(style.automation_point_radius_px.max(2.0) * 2.0 >= 6.25, "当たり円が 2 点の中間まで届く前提");
+    let key = |point_idx: u32| AutomationPointKey { clip: AutomationClipKey { track: 10, lane: 1, clip: 1 }, point_idx };
+    let hit = |x: f32, selected: &[AutomationPointKey]| {
+        geometry::automation_point_at(&tracks, &tops, view.track_row_h, view, 0.0, 0.0, lanes, x, y, &style, selected)
+            .map(|(k, _)| k.point_idx)
+    };
+    assert_eq!(hit(105.0, &[]), Some(0), "点 0 に 5px / 点 1 に 7.5px");
+    assert_eq!(hit(107.0, &[]), Some(1), "点 0 に 7px / 点 1 に 5.5px");
+    assert_eq!(hit(106.25, &[]), Some(1), "同じ距離は後ろの点");
+    assert_eq!(hit(106.25, &[key(0)]), Some(0), "同じ距離は上に描き直す選択中の点");
+}
+
 /// 描画は「鳴る形」と一致する。
 /// - (a) affine + 窓の内側では norm 空間の直線と同値 (= 旧実装と 1px も変わらない)
 /// - (b) log な target (`GroupTransform::ScaleX`) では `plain_to_norm(apply_curve(...))` と一致

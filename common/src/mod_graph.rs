@@ -1446,7 +1446,7 @@ mod tests {
             owner_track_id: 1,
             color: [0.0; 3],
             kind: ModSourceKind::EnvelopeFollower {
-                tap: crate::model::AudioTap::post_fader(1),
+                tap: Some(crate::model::AudioTap::post_fader(1)),
                 follower: crate::model::FollowerConfig::default(),
             },
             enabled: true,

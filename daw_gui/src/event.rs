@@ -192,8 +192,8 @@ pub enum AppEvent {
     /// gui_01 #028 (M14 Phase 63n-1): track 行の automation lane disclosure
     /// (`+` / `-`) click。
     /// `expanded_automation_tracks` の `track_id` を反転し、 widget が
-    /// 次フレームで lane 群を展開 / 折り畳む。 session-only な UI 状態
-    /// なので Undo / save 対象外。
+    /// 次フレームで lane 群を展開 / 折り畳む。 「見方の都合」 なので Undo 対象外で
+    /// dirty も立てないが、 `ViewState` で保存する。
     ToggleTrackAutomationCollapsed {
         track_id: u32,
     },
@@ -877,8 +877,8 @@ pub enum AppEvent {
         source_id: u32,
         bipolar: bool,
     },
-    /// docs/plan_modulation.md §9: change what a `ModSource` follows (track / Parallel chain)。
-    SetModSourceTap { id: u32, source: common::model::TapSource },
+    /// docs/plan_modulation.md §9: change what a `ModSource` follows (track / Parallel chain)。`None` = 入力なし。
+    SetModSourceTap { id: u32, source: Option<common::model::TapSource> },
     /// docs/plan_modulation.md §3: envelope follower attack / release (ms).
     /// During a scrub drag these only mark dirty (no per-frame recompile); the
     /// engine recompiles the baked coefficients once on drag-end (see
@@ -966,7 +966,7 @@ pub enum AppEvent {
     PasteTime { copy: Box<common::model::TimeRangeCopy>, source_project_id: u64 },
     SetArrangeTrackRowH(f32),
     /// arrangement の track header 幅を更新 (gui_01 widget の右端
-    /// splitter drag が発火)。 handler 側で 80..480 px に clamp。 session-only。
+    /// splitter drag が発火)。 handler 側で 80..480 px に clamp。 Undo 対象外、 `ViewState` で保存。
     SetArrangeHeaderW(f32),
     SetPianoRollScrollX(f32),
     SetPianoRollTopPitch(u8),
@@ -1707,14 +1707,14 @@ pub enum AppEvent {
     /// scale を尊重 = 転調をまたぐ note も自然に補正される)。 1 操作 1 Undo
     /// step。 piano_roll の右クリック menu / inspector ボタン経由で発火。
     QuantizePitchesToScale(QuantizePitchTarget),
-    /// Snap on Draw toggle (session-only)。 piano_roll header の toggle で
-    /// 切替。 Undo 非対象 (= session 設定)。
+    /// Snap on Draw toggle。 piano_roll header の toggle で切替。 Undo 非対象、
+    /// `ViewState` で保存。
     ToggleSnapOnDraw,
-    /// Snap Live Input toggle (session-only)。 transport bar の toggle で
-    /// 切替。 Undo 非対象。
+    /// Snap Live Input toggle。 transport bar の toggle で切替。 Undo 非対象、
+    /// `ViewState` で保存。
     ToggleSnapLiveInput,
-    /// piano_roll の Fold to Scale toggle (session-only)。 piano_roll snap
-    /// toolbar の「Fold」 button で切替。 Undo 非対象。
+    /// piano_roll の Fold to Scale toggle。 piano_roll snap toolbar の「Fold」 button で
+    /// 切替。 Undo 非対象、 `ViewState` で保存。
     ToggleFoldToScale,
 }
 

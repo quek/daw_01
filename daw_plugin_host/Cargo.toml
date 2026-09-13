@@ -23,6 +23,9 @@ com-scrape-types.workspace = true
 dirs.workspace = true
 hound.workspace = true
 libloading.workspace = true
+# worker pool への registry snapshot の受け渡し: 旧 snapshot を worker (RT) から plugin-main へ返す
+# recycle ring (process_server.rs の `PluginRegistry`、daw_audio の `RtBundle` と同じ作法)。
+rtrb.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 vst3.workspace = true

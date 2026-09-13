@@ -163,7 +163,7 @@ FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                        
 #    いつ消えるか: **未起票**。
 FN-BUDGET | ui/crates/ui/src/widgets/text_input.rs::Ui::text_input_at | 375 | daw-ui core。未起票
 
-# --- FN-NESTING (インデント 6 段) 96 件--------------------------------------
+# --- FN-NESTING (インデント 6 段) 93 件--------------------------------------
 # 計測値は `最大段数/6 段以上の行数` の 2 成分。**深さが据え置きでも、6 段以上の行が
 # 増えたら新規違反**になる (深さだけを天井にすると、baseline 済みの関数が「深いまま
 # 無制限に太る」経路が残る)。
@@ -184,7 +184,6 @@ FN-NESTING | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy
 FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build                     | 10/67  | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                        | 9/296  | #77 と同型の分割が未着手
 FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build_arrangement_lanes_from_slice | 8/33 | #77 の対象外。未起票
-FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::automation_point_at         | 8/16   | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect      | 8/8    | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | #77 と同型の分割が未着手
 FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | #77 の対象外。未起票
@@ -196,11 +195,6 @@ FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash 
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
 FN-NESTING | daw_gui/src/view/audio_editor.rs::draw                                    | 8/95  | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/arrangement_view.rs::draw                                | 8/73  | 巨大 draw。未起票
-# draw_strip は r.md #74 で 6 段以上の行が **8 -> 6 に減った** (最大段数 7 は不変)。
-# disclosure クロージャの `if contains { remove } else { insert }` が
-# `app.handle_event(...)` 1 行になったため。締まる方向なので実測値へ下げる
-# (据え置くと消したぶんの入れ子が戻っても検出できない silent headroom になる)。
-FN-NESTING | daw_gui/src/view/mixer_strips.rs::draw_strip                              | 7/6   | 巨大 draw。未起票
 FN-NESTING | daw_gui/src/view/recovery_modal.rs::draw                                  | 7/8   | 巨大 draw。未起票
 
 # 3. IPC / イベント / ショートカットの巨大 match。
@@ -226,7 +220,6 @@ FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result |
 #    ほどく = 「選択された要素の列」を先に平坦化してから 1 段で回す形へ寄せる。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi                     | 9/42 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/automation_lanes.rs::AppData::inspector_plugin_params     | 9/31 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::auto_warp_clip                   | 8/13 | edit_song 多重ループ。未起票
@@ -237,13 +230,11 @@ FN-NESTING | daw_gui/src/handler/notes.rs::AppData::delete_selected_notes       
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::resize_notes                           | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_velocities                    | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clips.rs::AppData::stretch_clip_content                   | 7/24 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/bounce.rs::AppData::handle_bounce_clip_fx_complete        | 7/20 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::normalize_lipsync_clips_on_load     | 7/17 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_image                    | 7/16 | edit_song 多重ループ。未起票
 # `project.rs::reconcile_plugins_with_song` (7/15) は #71 で **解消**。 §A で slot
 # 再構築が positional index から安定 device_id 一本になり、 「track ごとに index を
 # 数え直して貼り替える」 二重ループそのものが消えた (不変条件 1)。
-FN-NESTING | daw_gui/src/handler/tracks.rs::AppData::build_pasted_tracks                   | 7/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_automation_clips_at         | 7/14 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/sync.rs::AppData::collect_ara_clips_for_track             | 7/11 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::quantize_selected_automation_points | 7/10 | edit_song 多重ループ。未起票

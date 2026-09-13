@@ -6,7 +6,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use common::model::{
-    AudioContent, Clip, ClipContent, ClipKey, LaneRef, MidiContent, Note, Song, TimeSelection,
+    Clip, ClipContent, ClipKey, LaneRef, MidiContent, Note, Song, TimeSelection,
 };
 use std::collections::BTreeMap;
 
@@ -361,9 +361,9 @@ impl AppData {
         if end_beat <= start_beat {
             return false;
         }
-        // pre_fx = true: insert FX / フェーダー / pan を外した「素材の素の音」だけを焼く
-        // (`docs/plan_glue_bake.md` §3)。
-        let Some(isolated) = self.isolated_track_song(track_id, true) else {
+        // 素材の音だけを焼く (`RenderScope::Sources`、`docs/plan_glue_bake.md` §3): 焼いた音は元のトラックへ
+        // 戻り、再生時にトラックの fx / フェーダーと master をもう一度通る。
+        let Some(isolated) = self.cur.song_doc.song().isolated_track(track_id) else {
             return false;
         };
         if let Some(p) = self.cur.pipc.pending_glue_bake.as_mut() {
@@ -385,6 +385,7 @@ impl AppData {
             end_beat,
             // 素材だけの render なので曲頭から積み上げる意味が無い (= 範囲頭から cold)。
             warm: false,
+            scope: common::protocol::RenderScope::Sources,
         });
         true
     }
@@ -568,28 +569,21 @@ impl AppData {
         job: &GlueBakeJob,
         decoded: &mut Vec<(common::model::AudioSourceId, std::path::PathBuf)>,
     ) -> Option<ClipKey> {
-        let source = common::model::AudioSource {
+        let wav = common::model::BakedWav {
             path: job.source_path.clone(),
             sample_rate: self.ipc.sample_rate,
-            channels: 2,
             frames: job.frames,
-            original_bpm: Some(self.cur.song_doc.song().bpm),
-            root_key: None,
         };
         let (start, len) = (sel.start_beat, sel.len_beats());
+        let window = (sel.start_beat, sel.end_beat);
         let name = job.name.clone();
-        // 焼き込み結果は範囲ちょうどを覆う 1 event (窓は先頭から)。tail の切り落としと
-        // Raw 固定の理由は `baked_audio_event` (bounce と共通の SSoT) が持つ。
-        let mut event = self.baked_audio_event(0, (sel.start_beat, sel.end_beat), 0.0, job.frames);
         let clip_ids: Vec<u32> = refs.iter().map(|r| r.clip_id).collect();
         let placed = self.edit_song(move |song| {
-            let source_id = song.alloc_audio_source_id();
-            song.media.audio_sources.insert(source_id, source);
-            event.source_id = source_id;
-            let content_id = song.alloc_content(
-                ClipContent::Audio(AudioContent { next_event_id: 2, events: vec![event] }),
-                name,
-            );
+            song.track_by_id(track_id)?;
+            // 焼き込み結果は範囲ちょうどを覆う 1 event (窓は先頭から)。tail の切り落としと
+            // Raw 固定の理由は `Song::add_baked_audio` (bounce と共通の SSoT) が持つ。
+            let (source_id, content) = song.add_baked_audio(wav, window, 0.0);
+            let content_id = song.alloc_content(ClipContent::Audio(content), name);
             let track = song.track_by_id_mut(track_id)?;
             // 住所が id なので「後ろから消して index の詰まりを避ける」儀式は要らない。
             for id in &clip_ids {

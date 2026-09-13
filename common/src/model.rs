@@ -14,6 +14,7 @@ use crate::scale::ScaleChange;
 // ロジックを切り出したファイル (section_ops / load_normalize / source_pools 等) は登録しない
 // (ロジックの変更で fingerprint を動かさない、build.rs 冒頭)。
 mod automation;
+mod bounce_ops;
 mod clip_window;
 mod master_limiter;
 mod media_manifest;
@@ -38,6 +39,7 @@ mod time_selection;
 mod view_state;
 mod track;
 pub use automation::*;
+pub use bounce_ops::*;
 pub use clip_window::*;
 pub use master_limiter::*;
 pub use media_manifest::*;
@@ -1377,18 +1379,15 @@ impl Song {
             .and_then(|c| c.notes_mut())
     }
 
-    /// `track_id` の send (安定 id = `send_id`) を削除し、 その send を狙う
-    /// SendGain automation lane / mod routing を除去する。 v29 で id
+    /// `track_id` の send (安定 id = `send_id`) を削除する。 v29 で id
     /// addressing になったため、 残る send への参照は**無変更のまま正しい**
     /// (positional 時代の「後続 index を詰める」 reindex 儀式は不要になった —
     /// r.md #8 A5 で実際に壊れた class の構造的解消)。
     /// 削除成功で `true`、 track 不在 / id 不在なら `false`。
     ///
-    /// **ここが落とすのはこの send を狙う 1 段だけ。** r.md #89 で変調が安定 id を
-    /// 持ったので、落とした変調の **深さ**を指していた別の変調 / レーンが dangling に
-    /// なる。その連鎖掃除 ([`Self::prune_dangling_param_targets`]) は song 全体を固定点
-    /// まで回す別種の操作なので、daw_gui の SongDoc の口 (`enforce_edit_invariants`) が
-    /// 編集のたびに無条件で担う。
+    /// **その send を狙う SendGain のレーン / 変調はここでは落とさない。** 「send の無い SendGain は
+    /// dangling」は [`Self::prune_dangling_param_targets`] の表が SSoT で、その深さを指す変調までの連鎖と
+    /// 一緒に、daw_gui の SongDoc の口 (`enforce_edit_invariants`) が同じ undo step で掃除する。
     pub fn remove_track_send(&mut self, track_id: u32, send_id: u32) -> bool {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
             return false;
@@ -1397,20 +1396,6 @@ impl Song {
             return false;
         };
         t.sends.remove(pos);
-        let targets_send = |target: &AutomationTarget| {
-            matches!(
-                target,
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id: sid, .. })
-                    if *sid == send_id
-            )
-        };
-        let before = t.automation_lanes.len();
-        t.automation_lanes.retain(|lane| !targets_send(&lane.target));
-        let dropped = t.automation_lanes.len() != before;
-        t.mod_routings.retain(|r| !targets_send(&r.target));
-        if dropped {
-            self.gc_clip_contents();
-        }
         true
     }
 

@@ -351,24 +351,19 @@ fn group_hit_test(
         let ly = sy - pivy;
         (pivx + lx * cos_r - ly * sin_r, pivy + lx * sin_r + ly * cos_r)
     };
-    let (curx, cury) = cursor;
-    const HIT_R: f32 = 14.0;
-    // rotate handle（上辺中点から 24 px 外側、回転前 y を引いてから回転）。
-    let (rotx, roty) = rotate(rx + rw * 0.5, ry - 24.0);
-    if (curx - rotx).hypot(cury - roty) <= HIT_R {
-        return Some(PreviewDragMode::Rotate);
-    }
-    let corners = [
-        (rotate(rx, ry), 0u8),
-        (rotate(rx + rw, ry), 1),
-        (rotate(rx, ry + rh), 2),
-        (rotate(rx + rw, ry + rh), 3),
+    // rotate handle（上辺中点から 24 px 外側、回転前 y を引いてから回転）と 4 隅を、描画順
+    // (`PreviewWindowState::draw_group_overlay` = 回転 → NW → NE → SE → SW) に並べる。
+    let handles = [
+        (PreviewDragMode::Rotate, rotate(rx + rw * 0.5, ry - 24.0), HandleHit::Circle),
+        (PreviewDragMode::Resize { corner: 0 }, rotate(rx, ry), HandleHit::Square),
+        (PreviewDragMode::Resize { corner: 1 }, rotate(rx + rw, ry), HandleHit::Square),
+        (PreviewDragMode::Resize { corner: 3 }, rotate(rx + rw, ry + rh), HandleHit::Square),
+        (PreviewDragMode::Resize { corner: 2 }, rotate(rx, ry + rh), HandleHit::Square),
     ];
-    for ((hx, hy), idx) in corners {
-        if (curx - hx).abs() <= HIT_R && (cury - hy).abs() <= HIT_R {
-            return Some(PreviewDragMode::Resize { corner: idx });
-        }
+    if let Some(mode) = nearest_handle(cursor, &handles) {
+        return Some(mode);
     }
+    let (curx, cury) = cursor;
     // body: cursor を pivot 基準で逆回転して unrotated rect に内外判定。
     let lx = (curx - pivx) * cos_r + (cury - pivy) * sin_r;
     let ly = -(curx - pivx) * sin_r + (cury - pivy) * cos_r;
@@ -376,6 +371,38 @@ fn group_hit_test(
         return Some(PreviewDragMode::Move);
     }
     None
+}
+
+/// preview の選択枠のハンドルの当たり判定の形 (半径 / 半辺はどちらも [`HANDLE_HIT_R`])。
+#[derive(Debug, Clone, Copy)]
+enum HandleHit {
+    /// 中心からの距離で当てる (回転ハンドル)。
+    Circle,
+    /// 回転後の中心を囲む軸平行の正方形で当てる (4 隅)。
+    Square,
+}
+
+/// ハンドルの当たり判定の半径 / 半辺 (px)。描画 (10 px 角) より少し広めで端を掴みやすく。
+const HANDLE_HIT_R: f32 = 14.0;
+
+/// **描画順** に並んだ `handles` のうち、当たり判定の中にある近い 1 つ (同じ距離なら後に描いたハンドル、
+/// `daw_ui_core::NearestHit`)。枠を小さく縮めると隅どうし / 隅と回転ハンドルの当たりが重なるので、
+/// 先に並べたハンドルを常に優先しない。
+fn nearest_handle(
+    cursor: (f32, f32),
+    handles: &[(PreviewDragMode, (f32, f32), HandleHit)],
+) -> Option<PreviewDragMode> {
+    let (curx, cury) = cursor;
+    handles
+        .iter()
+        .filter(|&&(_, (hx, hy), shape)| match shape {
+            HandleHit::Circle => (curx - hx).hypot(cury - hy) <= HANDLE_HIT_R,
+            HandleHit::Square => (curx - hx).abs() <= HANDLE_HIT_R && (cury - hy).abs() <= HANDLE_HIT_R,
+        })
+        .map(|&(mode, (hx, hy), _)| (mode, (curx - hx).hypot(cury - hy)))
+        .collect::<daw_ui_core::NearestHit<_>>()
+        .best()
+        .map(|(mode, _)| mode)
 }
 
 /// group drag delta を base transform に積んで `SetGroupTransformField` を発火。
@@ -509,23 +536,17 @@ fn hit_test_handles(
     let half_w = rw * 0.5;
     let half_h = rh * 0.5;
     let (curx, cury) = cursor;
-    const HIT_R: f32 = 14.0;
-    // Rotate handle (上辺中点から 24 px 外側)。 corner より優先。
-    let (rot_x, rot_y) = rotate_point(0.0, -half_h - 24.0);
-    if (curx - rot_x).hypot(cury - rot_y) <= HIT_R {
-        return Some(PreviewDragMode::Rotate);
-    }
-    // 4 corner handles (回転後座標で square hit box)。
-    let corners = [
-        (rotate_point(-half_w, -half_h), 0u8), // NW
-        (rotate_point(half_w, -half_h), 1),    // NE
-        (rotate_point(-half_w, half_h), 2),    // SW
-        (rotate_point(half_w, half_h), 3),     // SE
+    // 4 corner handles (回転後座標) と Rotate handle (上辺中点から 24 px 外側) を、描画順
+    // (`PreviewWindowState::draw_selection_overlay` = NW → NE → SW → SE → 中央 → 回転) に並べる。
+    let handles = [
+        (PreviewDragMode::Resize { corner: 0 }, rotate_point(-half_w, -half_h), HandleHit::Square), // NW
+        (PreviewDragMode::Resize { corner: 1 }, rotate_point(half_w, -half_h), HandleHit::Square), // NE
+        (PreviewDragMode::Resize { corner: 2 }, rotate_point(-half_w, half_h), HandleHit::Square), // SW
+        (PreviewDragMode::Resize { corner: 3 }, rotate_point(half_w, half_h), HandleHit::Square), // SE
+        (PreviewDragMode::Rotate, rotate_point(0.0, -half_h - 24.0), HandleHit::Circle),
     ];
-    for ((hx, hy), idx) in corners {
-        if (curx - hx).abs() <= HIT_R && (cury - hy).abs() <= HIT_R {
-            return Some(PreviewDragMode::Resize { corner: idx });
-        }
+    if let Some(mode) = nearest_handle(cursor, &handles) {
+        return Some(mode);
     }
     // 内部 rect (= move handle)。 rotation を逆変換して cursor を rect
     // local 系に持ち込み、 axis-aligned 内外判定する。
@@ -2342,5 +2363,43 @@ mod tests {
             prev = d;
         }
         assert_eq!(gpu_retry_backoff(3), gpu_retry_backoff(100), "上限で頭打ち");
+    }
+
+    /// 20px 角まで縮めた PiP では 4 隅のハンドルの当たり箱 (±14px) が重なる。重なりを押すと **近い隅** を掴む
+    /// (先に判定した NW ではない)。rect は screen (500, 500)〜(520, 520)。
+    #[test]
+    fn overlapping_image_handles_grab_the_nearest_corner() {
+        let map = crate::group_compose::CanvasMap::project((0.0, 0.0, 1000.0, 1000.0));
+        let overlay = (0.5, 0.5, 0.02, 0.02);
+        for (cursor, corner) in [((512.0, 512.0), 3), ((508.0, 512.0), 2), ((512.0, 508.0), 1), ((508.0, 508.0), 0)] {
+            let mode = hit_test_handles(overlay, 0.0, &map, cursor);
+            assert!(
+                matches!(mode, Some(PreviewDragMode::Resize { corner: c }) if c == corner),
+                "{cursor:?}: 近い隅 {corner} を掴む (got {mode:?})"
+            );
+        }
+    }
+
+    /// group の枠でも同じ: 回転ハンドル (上辺中点の 24px 上) と NW 隅の当たりが重なる所では近い方を掴む。
+    /// group rect は (500, 500)〜(520, 520)、回転ハンドルは (510, 476)。
+    #[test]
+    fn overlapping_group_handles_grab_the_nearest_one() {
+        let transform = common::model::GroupTransform {
+            x: 0.0,
+            y: 0.0,
+            scale_x: 0.02,
+            scale_y: 0.02,
+            anchor_x: 0.0,
+            anchor_y: 0.0,
+            rotation_radians: 0.0,
+            ..common::model::GroupTransform::default()
+        };
+        let project_box = (500.0, 500.0, 1000.0, 1000.0);
+        // NW 隅に 12.1px / 回転ハンドルに 13.9px。
+        let mode = group_hit_test(&transform, project_box, (505.0, 489.0));
+        assert!(matches!(mode, Some(PreviewDragMode::Resize { .. })), "近い NW 隅を掴む (got {mode:?})");
+        // 回転ハンドルに 11.7px / NW 隅に 14.3px。
+        let mode = group_hit_test(&transform, project_box, (506.0, 487.0));
+        assert!(matches!(mode, Some(PreviewDragMode::Rotate)), "近い回転ハンドルを掴む (got {mode:?})");
     }
 }

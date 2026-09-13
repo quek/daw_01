@@ -352,15 +352,18 @@ fn push_delay(
 /// `limiter_latency` = `Schedule::master_limiter_latency` (= `Song::master_limiter_latency_active`:
 /// 静的 ON または On レーン / 変調)。DSP (`MasterLimiterState::process`) も同じ値で遅延を通すかを
 /// 決めるので、On をオートメーションしても会計と実際の遅延が食い違わない (r.md #129 §18-G)。
+///
+/// `master_chain` = compile した master の fx chain (scope が master を通さないなら空)。
 pub(super) fn master_output_latency(
-    song: &Song,
+    master_chain: &[common::model::Device],
     device_latencies: &DeviceLatencies,
     master_mix_latency: u32,
     sample_rate: u32,
     limiter_latency: bool,
+    scope: common::protocol::RenderScope,
 ) -> u32 {
     let limiter = if limiter_latency { common::model::limiter_lookahead_samples(sample_rate) } else { 0 };
     master_mix_latency
-        .saturating_add(program_latency(&song.master_fx_chain, device_latencies))
+        .saturating_add(program_latency(master_chain, device_latencies, scope))
         .saturating_add(limiter)
 }

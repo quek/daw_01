@@ -44,10 +44,15 @@ pub fn loop_band_hit_kind(
     let start_x = ruler.x + ((range.0 - start_beat) * beat_to_px) as f32;
     let end_x = ruler.x + ((range.1 - start_beat) * beat_to_px) as f32;
     let edge = handle_radius_px.max(1.0);
-    if (px - start_x).abs() <= edge {
-        Some(LoopBandHit::Start)
-    } else if (px - end_x).abs() <= edge {
-        Some(LoopBandHit::End)
+    // 短い loop (ズームアウト) では両端の当たりが重なる。近い端を掴み、同じ距離なら後に描いた End
+    // ([`draw_loop_band`] の描画順、`daw_ui_core::NearestHit`)。
+    let handle = [(LoopBandHit::Start, (px - start_x).abs()), (LoopBandHit::End, (px - end_x).abs())]
+        .into_iter()
+        .filter(|&(_, d)| d <= edge)
+        .collect::<daw_ui_core::NearestHit<_>>()
+        .best();
+    if let Some((hit, _)) = handle {
+        Some(hit)
     } else if px > start_x && px < end_x {
         Some(LoopBandHit::Middle)
     } else {
@@ -297,6 +302,18 @@ mod tests {
         let ruler = Rect { x: 0.0, y: 0.0, w: 400.0, h: 16.0 };
         let hit = loop_band_hit_kind((2.0, 6.0), 0.0, 8.0, ruler, 200.0, 4.0);
         assert_eq!(hit, Some(LoopBandHit::Middle));
+    }
+
+    /// ズームアウトで loop が数 px になり両端の当たり (±4px) が重なると、**近い端**を掴む
+    /// (先に判定する Start ではない)。同じ距離なら後に描いた End。
+    #[test]
+    fn loop_band_hit_kind_overlapping_handles_pick_the_nearer_edge() {
+        let ruler = Rect { x: 0.0, y: 0.0, w: 400.0, h: 16.0 };
+        // 1 beat = 50 px。range 2.0..2.1 → start_x = 100 / end_x = 105。
+        let hit = |px: f32| loop_band_hit_kind((2.0, 2.1), 0.0, 8.0, ruler, px, 4.0);
+        assert_eq!(hit(101.0), Some(LoopBandHit::Start), "Start に 1px / End に 4px");
+        assert_eq!(hit(104.0), Some(LoopBandHit::End), "Start に 4px / End に 1px");
+        assert_eq!(hit(102.5), Some(LoopBandHit::End), "同じ距離は後に描いた End");
     }
 
     /// `loop_band_hit_kind`: 範囲外 (end_x より右) は `None`。

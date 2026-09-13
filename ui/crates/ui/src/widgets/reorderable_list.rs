@@ -632,14 +632,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
 
                 // ---- uniform (drag / settle) 描画: 既存ロジック (pending_order の表示順) ----
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let i_start = (visible_top / row_total_h).floor().max(0.0) as usize;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let i_end = ((visible_bottom / row_total_h).ceil() as usize).min(item_count_copy);
-
                 // 描画順は **表示順** (= pending_order があれば preview 順、無ければ元順)。
                 // i は表示位置 (0..item_count)、src は実 items index (= pending_order[i] or i)。
-                for i in i_start..i_end {
+                // 見えている行だけ回す ([`Ui::visible_rows`])。
+                for i in ui.visible_rows(rect.y - offset.1, row_total_h, item_count_copy) {
                     let src = pending_order_for_draw
                         .as_ref()
                         .and_then(|o| o.get(i).copied())

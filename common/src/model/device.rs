@@ -708,18 +708,6 @@ pub fn for_each_aux_slot_mut(devices: &mut [Device], f: &mut impl FnMut(u64, u8,
     }
 }
 
-/// `devices` 以下 (Parallel の中を含む) から native を取り除く (Bounce In Place の pre-FX 焼き込み専用)。
-pub fn remove_natives_in(devices: &mut Vec<Device>) {
-    devices.retain(|d| !matches!(d, Device::Native(_)));
-    for d in devices {
-        if let Device::Parallel(r) = d {
-            for c in &mut r.chains {
-                remove_natives_in(&mut c.devices);
-            }
-        }
-    }
-}
-
 /// `devices` 以下の全 plugin を **pre-order (= 信号順)** で辿る iterator。Parallel の中は
 /// chain 順・chain 内は device 順。**RT では使わない** (stack が `Vec` = 確保する。
 /// `make test-rt` が捕まえる)。 存在判定だけなら [`any_plugin`]。

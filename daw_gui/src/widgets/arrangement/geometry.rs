@@ -2,6 +2,7 @@
 //! automation lane hit-test)。 型・session は `use super::*` で親から継承する。
 
 use super::*;
+use daw_ui_core::NearestHit;
 
 /// M14 Phase 63n-1 (#028): visible track 群の prefix sum row top (`tops.len() == visible_tracks.len() + 1`)。
 /// `tops[i]` = i 番目 track 上端 = (i-1) 番目 track 下端、 `tops[i+1] - tops[i]` で i 番目の expanded
@@ -1285,9 +1286,12 @@ pub fn header_resize_splitter_at(
         && cy < arrangement_rect.y + arrangement_rect.h
 }
 
-/// M14 Phase 63n-2 (#028): lane body 内 cursor 位置から hit する point を返す (後勝ち、 描画順と整合)。
+/// M14 Phase 63n-2 (#028): lane body 内 cursor 位置から hit する point を返す。
 /// 戻り値の `Rect` は popup anchor 用 point dot rect (= `lane_disclosure_rect_for` 同様)。
 /// hit zone は **point dot 半径の 2 倍** (= 8px @ default radius=4) で生成、 fingertip 操作の余裕を持たせる。
+/// 隣の点と hit zone が重なるので、当たった点のうち **近い 1 点** を返す (`daw_ui_core::NearestHit`)。
+/// 同じ距離なら上に描いた点 — 選択中の点 (`selected`) は非選択の上に描き直す (`render.rs`) ので選択中、
+/// 同じ選択状態なら後ろの点。
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn automation_point_at(
@@ -1301,13 +1305,12 @@ pub fn automation_point_at(
     cx: f32,
     cy: f32,
     style: &ArrangementStyle,
+    selected: &[AutomationPointKey],
 ) -> Option<(AutomationPointKey, Rect)> {
     if !lanes.contains(cx, cy) {
         return None;
     }
-    let radius = style.automation_point_radius_px.max(2.0);
-    let hit_r2 = (radius * 2.0).powi(2);
-    let mut hit: Option<(AutomationPointKey, Rect)> = None;
+    let mut nearest = NearestHit::default();
     for_each_visible_lane(
         visible_tracks,
         tops,
@@ -1321,42 +1324,59 @@ pub fn automation_point_at(
             if cy < body_rect.y || cy >= body_rect.y + body_rect.h {
                 return;
             }
-            let track_id = visible_tracks[t_idx].id;
-            let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
-            let pad = style.automation_clip_v_pad_px;
-            let clip_y = body_rect.y + pad;
-            let clip_h = (body_rect.h - pad * 2.0).max(2.0);
-            for clip_in in &lane.clips {
-                for (p_idx, p) in clip_in.points.iter().enumerate() {
-                    let abs_beat = clip_in.start_beat + p.time_beat;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let px = body_rect.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
-                    let py = clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
-                    let dx = cx - px;
-                    let dy = cy - py;
-                    if dx * dx + dy * dy <= hit_r2 {
-                        let key = AutomationPointKey {
-                            clip: AutomationClipKey {
-                                track: track_id,
-                                lane: lane.id,
-                                clip: clip_in.id,
-                            },
-                            #[allow(clippy::cast_possible_truncation)]
-                            point_idx: p_idx as u32,
-                        };
-                        let r = Rect {
-                            x: px - radius,
-                            y: py - radius,
-                            w: radius * 2.0,
-                            h: radius * 2.0,
-                        };
-                        hit = Some((key, r));
-                    }
-                }
+            let at = LanePointHitArea { track_id: visible_tracks[t_idx].id, body_rect, view, style };
+            // 描画順どおり、非選択 → 選択中の順に申告する。
+            for selected_pass in [false, true] {
+                offer_lane_points(&mut nearest, lane, at, (cx, cy), |key| selected.contains(&key) == selected_pass);
             }
         },
     );
-    hit
+    nearest.best().map(|(hit, _)| hit)
+}
+
+/// [`offer_lane_points`] が点の画面位置を出すのに使う、1 lane 分の配置。
+#[derive(Clone, Copy)]
+struct LanePointHitArea<'a> {
+    track_id: u32,
+    body_rect: Rect,
+    view: ArrangementView,
+    style: &'a ArrangementStyle,
+}
+
+/// 1 lane の点のうち `include` が選び、当たり円 (点の半径の 2 倍) の中にあるものを `nearest` に申告する。
+/// 点の画面位置は描画 (`draw_automation_lane` の point dot) と同じ式。
+fn offer_lane_points(
+    nearest: &mut NearestHit<(AutomationPointKey, Rect)>,
+    lane: &ArrangementAutomationLane,
+    at: LanePointHitArea<'_>,
+    (cx, cy): (f32, f32),
+    include: impl Fn(AutomationPointKey) -> bool,
+) {
+    let LanePointHitArea { track_id, body_rect, view, style } = at;
+    let radius = style.automation_point_radius_px.max(2.0);
+    let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
+    let pad = style.automation_clip_v_pad_px;
+    let clip_y = body_rect.y + pad;
+    let clip_h = (body_rect.h - pad * 2.0).max(2.0);
+    for clip_in in &lane.clips {
+        let clip = AutomationClipKey { track: track_id, lane: lane.id, clip: clip_in.id };
+        for (p_idx, p) in clip_in.points.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let key = AutomationPointKey { clip, point_idx: p_idx as u32 };
+            if !include(key) {
+                continue;
+            }
+            let abs_beat = clip_in.start_beat + p.time_beat;
+            #[allow(clippy::cast_possible_truncation)]
+            let px = body_rect.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+            let py = clip_y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_h;
+            let d = (cx - px).hypot(cy - py);
+            if d <= radius * 2.0 {
+                let r = Rect { x: px - radius, y: py - radius, w: radius * 2.0, h: radius * 2.0 };
+                nearest.offer((key, r), d);
+            }
+        }
+    }
 }
 
 /// M14 Phase 63n-2 (#028): lane body 内 cursor から該当する `(track_idx, lane_idx, header_rect,

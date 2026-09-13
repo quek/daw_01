@@ -21,7 +21,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::model::{Song, StructureWatch};
+use common::model::{Device, NativeDevice, Parallel, ParallelChain, PluginInstance, Song, StructureWatch};
+
+use super::node_index::NodeIndex;
 
 /// Undo 履歴の上限 (snapshot 方式)。
 const UNDO_LIMIT: usize = 200;
@@ -117,6 +119,9 @@ pub struct SongDoc {
     structure: StructureWatch,
     /// id 構造が変わった世代 ([`SongDoc::structure_epoch`])。
     structure_epoch: u64,
+    /// device node の id → 位置 ([`SongDoc::device_node`] / [`SongDoc::chain_node`])。`structure_epoch` が
+    /// 進むたびに作り直す (構造が同じ間は位置が変わらない)。
+    nodes: NodeIndex,
     /// 保存先 (.daw)。 未保存プロジェクトは `None`。
     pub file_path: Option<PathBuf>,
 
@@ -171,6 +176,8 @@ impl SongDoc {
         // `*` は立たない。
         let mut structure = StructureWatch::default();
         song.enforce_edit_invariants_watched(&mut structure);
+        let mut nodes = NodeIndex::default();
+        nodes.rebuild(&song);
         Self {
             song,
             edit_epoch: 1,
@@ -180,6 +187,7 @@ impl SongDoc {
             sync_epoch: 1,
             structure,
             structure_epoch: 1,
+            nodes,
             file_path: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -324,9 +332,15 @@ impl SongDoc {
     fn enforce_invariants(&mut self) -> bool {
         let outcome = self.song.enforce_edit_invariants_watched(&mut self.structure);
         if outcome.structure_changed {
-            self.structure_epoch += 1;
+            self.advance_structure();
         }
         outcome.changed
+    }
+
+    /// id 構造が変わった: 世代を進め、node の索引を今の Song から作り直す (この 2 つは必ず一緒に動く)。
+    fn advance_structure(&mut self) {
+        self.structure_epoch += 1;
+        self.nodes.rebuild(&self.song);
     }
 
     /// live の id 構造 (トラック / device node / lane / 変調 / MIDI binding の id と束縛、範囲は
@@ -336,6 +350,76 @@ impl SongDoc {
     /// clip / content / media source / section / scene の id と値の変化では進まない。
     pub fn structure_epoch(&self) -> u64 {
         self.structure_epoch
+    }
+
+    // -------- device node の引き (id 構造の世代つき索引) --------------------
+
+    /// `id` の device と置き場のトラック id (`MASTER_TRACK_ID` = master)。`Song::device_by_id` と
+    /// `Song::device_owner_track` と同じ答えを、id 構造の世代つき索引 ([`NodeIndex`]) で位置をたどって返す
+    /// (曲全体の木を走査しない)。**描画のように毎フレーム id で node を引く読みはこちらを使う**。
+    /// `edit` の closure の中 (構造を変えている最中の `&mut Song`) では索引が使えないので `Song` の方を使う。
+    pub fn device_node(&self, id: u64) -> Option<(&Device, u32)> {
+        let found = self.nodes.device(&self.song, id);
+        debug_assert!(found.is_ok(), "node 索引が id 構造の変化を取りこぼした (device {id})");
+        found.unwrap_or_else(|_| self.song.device_by_id(id).zip(self.song.device_owner_track(id)))
+    }
+
+    /// `id` の chain と親 Parallel、置き場のトラック id ([`Self::device_node`] の chain 版、`Song::chain_by_id` と
+    /// `Song::chain_owner_track` と同じ答え)。
+    pub fn chain_node(&self, id: u64) -> Option<(&Parallel, &ParallelChain, u32)> {
+        let found = self.nodes.chain(&self.song, id);
+        debug_assert!(found.is_ok(), "node 索引が id 構造の変化を取りこぼした (chain {id})");
+        found.unwrap_or_else(|_| {
+            let (parallel, chain) = self.song.chain_by_id(id)?;
+            Some((parallel, chain, self.song.chain_owner_track(common::model::ChainRef::Chain(id))?))
+        })
+    }
+
+    /// `Song::device_by_id` を索引で ([`Self::device_node`])。
+    pub fn device_by_id(&self, id: u64) -> Option<&Device> {
+        self.device_node(id).map(|(device, _)| device)
+    }
+
+    /// `Song::plugin_by_id` を索引で ([`Self::device_node`])。
+    pub fn plugin_by_id(&self, id: u64) -> Option<&PluginInstance> {
+        self.device_by_id(id)?.as_plugin()
+    }
+
+    /// `Song::native_by_id` を索引で ([`Self::device_node`])。
+    pub fn native_by_id(&self, id: u64) -> Option<&NativeDevice> {
+        self.device_by_id(id)?.as_native()
+    }
+
+    /// `Song::parallel_by_id` を索引で ([`Self::device_node`])。
+    pub fn parallel_by_id(&self, id: u64) -> Option<&Parallel> {
+        self.device_by_id(id)?.as_parallel()
+    }
+
+    /// `Song::device_owner_track` を索引で ([`Self::device_node`])。
+    pub fn device_owner_track(&self, id: u64) -> Option<u32> {
+        self.device_node(id).map(|(_, owner)| owner)
+    }
+
+    /// `Song::chain_by_id` を索引で ([`Self::chain_node`])。
+    pub fn chain_by_id(&self, id: u64) -> Option<(&Parallel, &ParallelChain)> {
+        self.chain_node(id).map(|(parallel, chain, _)| (parallel, chain))
+    }
+
+    /// `Song::chain_owner_track(ChainRef::Chain(id))` を索引で ([`Self::chain_node`])。
+    pub fn chain_owner_track(&self, id: u64) -> Option<u32> {
+        self.chain_node(id).map(|(_, _, owner)| owner)
+    }
+
+    /// `Song::bound_owner_track` と同じ答え。node で束縛する住所 (plugin / native / chain / Parallel、
+    /// `AutomationTarget::bound_node_id`) の持ち主は索引で引き、それ以外 (変調 / song 全体 / 束縛しない住所) は
+    /// `Song` の同じ関数に任せる (木を走査しない住所だけが残る)。録音の tick のように繰り返し引く口で使う。
+    pub fn bound_owner_track(&self, target: &common::model::AutomationTarget) -> Option<u32> {
+        use common::model::{AutomationTarget as T, TrackBuiltinParam as B};
+        match (target, target.bound_node_id()) {
+            (T::TrackBuiltin(B::ChainGain { .. } | B::ChainPan { .. }), Some(chain_id)) => self.chain_owner_track(chain_id),
+            (_, Some(device_id)) => self.device_owner_track(device_id),
+            (_, None) => self.song.bound_owner_track(target),
+        }
     }
 
     /// ランチャーの**再生状態** (`Track.launcher` / `AutomationLane.launcher` /
@@ -532,7 +616,7 @@ impl SongDoc {
         // 差し替えた Song の構造を観測する。履歴の Song は回復済みのはずだが、それを前提にはしない
         // (観測しただけの構造は次の編集で必ず回復を回す、`StructureWatch::observe`)。
         if self.structure.observe(&self.song) {
-            self.structure_epoch += 1;
+            self.advance_structure();
         }
         // gesture squash chain は履歴 jump を跨がない (跨ぐと drag 再開時の
         // snapshot が skip され、 undo 1 回分の状態が履歴から欠落する)。
@@ -545,9 +629,9 @@ impl SongDoc {
         self.song = song;
         // r.md #129: baseline 確定前に不変条件を回復する (load 経路は正規化済みなので no-op、
         // script 経路はここで dangling の連鎖掃除まで揃う)。`*` は立たない。
-        self.enforce_invariants();
-        // 構造が同じでも、同じ id は別の曲の物を指す。
-        self.structure_epoch += 1;
+        self.song.enforce_edit_invariants_watched(&mut self.structure);
+        // 構造が同じでも、同じ id は別の曲の物を指す (世代は必ず進め、索引も必ず作り直す)。
+        self.advance_structure();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.current_label = BASELINE_LABEL;
@@ -909,6 +993,115 @@ mod tests {
         let e4 = doc.structure_epoch();
         doc.replace_song(doc.song().clone());
         assert!(doc.structure_epoch() > e4, "replace_song は同じ構造でも進む");
+    }
+
+    /// device node の引き (索引) は、id 構造を変える編集 / undo / redo / replace_song の後も、木を走査する
+    /// `Song` の引きと同じ答えを返す (索引が構造の世代に遅れない)。値だけの編集 (改名) では索引を作り直さず、
+    /// たどった先の新しい名前が見える。
+    #[test]
+    fn node_lookups_agree_with_the_tree_walk_across_structure_changes() {
+        use common::model::{AutomationTarget, ChainRef, MASTER_TRACK_ID, Track, TrackBuiltinParam};
+
+        fn collect_ids(devices: &[Device], device_ids: &mut Vec<u64>, chain_ids: &mut Vec<u64>) {
+            for d in devices {
+                device_ids.push(d.id());
+                if let Device::Parallel(p) = d {
+                    for c in &p.chains {
+                        chain_ids.push(c.id);
+                        collect_ids(&c.devices, device_ids, chain_ids);
+                    }
+                }
+            }
+        }
+        fn assert_agrees(doc: &SongDoc, step: &str) {
+            let song = doc.song();
+            let (mut device_ids, mut chain_ids) = (Vec::new(), Vec::new());
+            for devices in song.tracks.iter().map(|t| &t.devices).chain([&song.master_fx_chain]) {
+                collect_ids(devices, &mut device_ids, &mut chain_ids);
+            }
+            assert!(chain_ids.len() >= 3, "{step}: 入れ子の chain を含む曲で確かめる");
+            // 束縛先の持ち主 (`bound_owner_track`) も同じ答え。種類違いの住所 (chain の住所に device id) を含む。
+            let targets = |id: u64| {
+                [
+                    AutomationTarget::PluginParam { device_id: id, param_id: 0, legacy_device_index: None },
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id: id }),
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: id }),
+                ]
+            };
+            let fixed = [AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), AutomationTarget::SongTempo];
+            for id in device_ids.into_iter().chain([u64::MAX]) {
+                let walk = song.device_by_id(id).map(Device::id).zip(song.device_owner_track(id));
+                assert_eq!(doc.device_node(id).map(|(d, owner)| (d.id(), owner)), walk, "{step}: device {id}");
+                for t in targets(id) {
+                    assert_eq!(doc.bound_owner_track(&t), song.bound_owner_track(&t), "{step}: {t:?}");
+                }
+            }
+            for id in chain_ids.into_iter().chain([u64::MAX]) {
+                let walk = song
+                    .chain_by_id(id)
+                    .map(|(p, c)| (p.id, c.id))
+                    .zip(song.chain_owner_track(ChainRef::Chain(id)));
+                assert_eq!(doc.chain_node(id).map(|(p, c, owner)| ((p.id, c.id), owner)), walk, "{step}: chain {id}");
+                for t in targets(id) {
+                    assert_eq!(doc.bound_owner_track(&t), song.bound_owner_track(&t), "{step}: {t:?}");
+                }
+            }
+            for t in &fixed {
+                assert_eq!(doc.bound_owner_track(t), song.bound_owner_track(t), "{step}: {t:?}");
+            }
+        }
+
+        let mut doc = SongDoc::new(Song::default());
+        let (mut t1, mut t2) = (0, 0);
+        doc.edit(EditScope::Discrete, |s| {
+            t1 = s.alloc_track_id();
+            s.tracks.push(Track { id: t1, ..Track::default() });
+            t2 = s.alloc_track_id();
+            s.tracks.push(Track { id: t2, ..Track::default() });
+        });
+        // track 1 に Parallel (chain 2 本、2 本目の中にもう 1 段の Parallel)、master にも Parallel。
+        let (mut outer, mut deep_chain) = (0, 0);
+        doc.edit(EditScope::Discrete, |s| {
+            let mut inner = Parallel::new();
+            inner.id = s.alloc_device_id();
+            inner.chains[0].id = s.alloc_device_id();
+            deep_chain = inner.chains[0].id;
+            let mut second = ParallelChain::new("Chain 2");
+            second.id = s.alloc_device_id();
+            second.devices.push(Device::Parallel(inner));
+            let mut p = Parallel::new();
+            p.id = s.alloc_device_id();
+            p.chains[0].id = s.alloc_device_id();
+            p.chains.push(second);
+            outer = p.id;
+            s.insert_device(ChainRef::Track(t1), 0, Device::Parallel(p));
+            let mut m = Parallel::new();
+            m.id = s.alloc_device_id();
+            m.chains[0].id = s.alloc_device_id();
+            s.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(m));
+        });
+        assert_agrees(&doc, "Parallel を挿した");
+        doc.edit(EditScope::Discrete, |s| {
+            let p = s.remove_device(outer).expect("outer");
+            s.insert_device(ChainRef::Track(t2), 1, p);
+        });
+        assert_agrees(&doc, "トラックを跨いで運んだ");
+        doc.edit(EditScope::Discrete, |s| s.tracks.reverse());
+        assert_agrees(&doc, "トラックを並べ替えた");
+
+        let epoch = doc.structure_epoch();
+        doc.edit(EditScope::Discrete, |s| s.chain_by_id_mut(deep_chain).expect("chain").name = "Deep".into());
+        assert_eq!(doc.structure_epoch(), epoch, "改名は id 構造を変えない");
+        assert_eq!(doc.chain_by_id(deep_chain).map(|(_, c)| c.name.as_str()), Some("Deep"), "たどった先の新しい名前");
+
+        assert!(doc.undo() && doc.undo(), "改名と並べ替えを戻す");
+        assert_agrees(&doc, "undo");
+        assert!(doc.redo(), "並べ替えをやり直す");
+        assert_agrees(&doc, "redo");
+        let mut other = doc.song().clone();
+        other.tracks.reverse();
+        doc.replace_song(other);
+        assert_agrees(&doc, "replace_song");
     }
 
     /// 不変条件 1: undo で採番の状態が巻き戻っても、undo した物の id を別の新しい物に振らない。

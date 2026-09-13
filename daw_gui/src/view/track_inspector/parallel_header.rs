@@ -17,7 +17,7 @@ use crate::handler::parallel::ParallelMixerEdit;
 use crate::view::modulation::{ModBuild, PLAIN_IDENT, build_mod, push_mod_depth_bracket};
 use crate::view::native_device::ParamOwner;
 use crate::view::param_gesture::push_param_gesture;
-use common::model::{AutomationTarget, SELECTOR_FADE_RANGE, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
+use common::model::{AutomationTarget, Device, SELECTOR_FADE_RANGE, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
 
 use super::chain_list::ROW_H;
 use super::chain_row::{CHAIN_BTN_W, CHAIN_KNOB, draw_disclosure, draw_rename_input};
@@ -141,8 +141,7 @@ fn draw_active_field(
 ) {
     let song = app.cur.song_doc.song();
     // レーン / 変調の置き場は Parallel の持ち主 (master の Parallel なら song 側)。
-    let Some(track_id) = song.device_owner_track(parallel_id) else { return };
-    let Some(parallel) = song.parallel_by_id(parallel_id) else { return };
+    let Some((Device::Parallel(parallel), track_id)) = app.cur.song_doc.device_node(parallel_id) else { return };
     let n = parallel.chains.len();
     if n == 0 {
         return;
@@ -249,7 +248,7 @@ fn draw_freq_field(
     popup_open: bool,
 ) {
     // レーン / 変調の置き場は Parallel の持ち主 (master の Parallel なら song 側)。
-    let Some(track_id) = app.cur.song_doc.song().device_owner_track(parallel_id) else { return };
+    let Some(track_id) = app.cur.song_doc.device_owner_track(parallel_id) else { return };
     let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge });
     let live = app.live_param_value(track_id, &target, hz);
     let default = match edge {
@@ -355,7 +354,7 @@ pub(super) fn draw_parallel_begin_row(
         },
     );
     // レーンの置き場は Parallel の持ち主 (master の Parallel なら song 側)。
-    if let Some(track_id) = app.cur.song_doc.song().device_owner_track(parallel_id) {
+    if let Some(track_id) = app.cur.song_doc.device_owner_track(parallel_id) {
         let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id });
         let live = app.live_param_value(track_id, &target, out_gain);
         right -= CHAIN_KNOB + 4.0;

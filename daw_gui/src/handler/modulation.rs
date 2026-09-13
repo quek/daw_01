@@ -29,15 +29,19 @@ impl AppData {
         use common::model::{ModSourceKind, RandomConfig};
         // 帰属トラック = カーソルトラック (= このラックを開いているトラック)。以後
         // inspector ではこのトラックの下にだけ列挙される。
-        let owner_track_id = self.cursor_track_id().unwrap_or(0);
+        let cursor_track = self.cursor_track_id();
+        let owner_track_id = cursor_track.unwrap_or(0);
+        // follower の follow 先は初期 = カーソルトラック (master は音を tap できないので入力なし)。
+        let follower_tap = cursor_track
+            .filter(|&t| self.cur.song_doc.song().track_by_id(t).is_some())
+            .map(common::model::AudioTap::post_fader);
         let _ = self
             .edit_song(move |song| {
                 let id = song.alloc_mod_source_id();
                 let color = common::model::ModSource::palette_color(song.mod_sources.len());
                 let kind = match tag {
-                    // follower の follow 先は初期 = カーソルトラック。
                     ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
-                        tap: common::model::AudioTap::post_fader(owner_track_id),
+                        tap: follower_tap,
                         follower: common::model::FollowerConfig::default(),
                     },
                     ModSourceKindTag::Lfo => ModSourceKind::Lfo(Default::default()),
@@ -67,7 +71,7 @@ impl AppData {
     pub(crate) fn edit_mod_source_follower(
         &mut self,
         id: u32,
-        f: impl FnOnce(&mut common::model::AudioTap, &mut common::model::FollowerConfig),
+        f: impl FnOnce(&mut Option<common::model::AudioTap>, &mut common::model::FollowerConfig),
     ) -> bool {
         self.edit_song_checked(move |song| {
             let Some(m) = song.mod_sources.iter_mut().find(|m| m.id == id) else {
@@ -367,63 +371,12 @@ impl AppData {
         Some((src.color, format!("{track} / {}", src.kind.short_label())))
     }
 
+    /// モジュレーターを外す。このソースを使う変調、このソースのツマミを指すレーン / 変調、消えた変調の深さを
+    /// 指す変調までの連鎖掃除は、SongDoc の編集後の不変条件 (`Song::prune_dangling_param_targets`) が同じ undo
+    /// step で担い、待ち受け (◉) の解除は `reconcile_song_refs` が担う (r.md #129)。帰属トラックが消えた
+    /// モジュレーターの削除も不変条件 (`Song::prune_orphan_mod_sources`) がトラックを外した編集の中で行う。
     pub(crate) fn remove_mod_source(&mut self, id: u32) {
-        // 待受中のソースを消したら待受も解除する (削除済み id を掴んだままだと
-        // 次に触ったツマミが幽霊 routing になる)。
-        if self.cur.peph.armed_mod_source == Some(id) {
-            self.cur.peph.armed_mod_source = None;
-        }
-        self.edit_song(move |song| {
-            song.mod_sources.retain(|m| m.id != id);
-            // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
-            // 残すと UI に幽霊 routing が出るので明示削除)。lane 非依存なので
-            // Track.mod_routings / Song.song_mod_routings を走査する。
-            for t in &mut song.tracks {
-                t.mod_routings.retain(|r| r.source_id != id);
-            }
-            song.song_mod_routings.retain(|r| r.source_id != id);
-            // r.md #89: このソースの **ツマミ** を指していた変調 / レーンと、消えた変調の
-            // **深さ** を指していた変調までの連鎖掃除は、SongDoc の `enforce_edit_invariants`
-            // が同じ undo step で担う (r.md #129)。
-        });
-    }
-
-    /// **トラックが `song.tracks` から消えた後の変調の後始末**。トラックを外す
-    /// 全経路がこの 1 本を通る (削除 / グループ解除 / 末尾削除)。2 段ある:
-    ///
-    /// 1. **所有トラックが居なくなったモジュレーターを道連れにする** (r.md #78)。
-    ///    ソースはラックで **所有トラックの下にしか列挙されない**ので、残すとどの
-    ///    画面にも出ず削除できないまま、生き残ったトラックの param を変調し続ける
-    ///    (LFO / Random / MSEG / Steps は song 位置の純関数なので、所有トラックが
-    ///    消えても値を出し続ける)。
-    /// 2. **深さ参照の連鎖掃除** (r.md #89)。消えたトラックの変調を
-    ///    [`common::model::AutomationTarget::ModRoutingDepth`] で指していたレーン /
-    ///    変調を落とす。これはトラックを外した編集そのものの後に SongDoc の
-    ///    `enforce_edit_invariants` が済ませている (r.md #129)。
-    ///
-    /// **判定は「消した id の集合」ではなく `owner_track_id` が実在するか**。集合を
-    /// 各経路から配る形だと経路ごとに集合の作り方が要り、1 つ忘れると孤児が残る
-    /// (実際 グループ解除 と 末尾削除 が漏れていた)。`owner_track_id` の `0`
-    /// (legacy) と `MASTER_TRACK_ID` は master 所有なのでトラック不在ではない。
-    ///
-    /// 冪等 — 健全な曲では no-op。
-    pub(crate) fn cleanup_modulation_after_track_removal(&mut self) {
-        let orphans: Vec<u32> = self
-            .cur.song_doc
-            .song()
-            .mod_sources
-            .iter()
-            .filter(|m| {
-                m.owner_track_id != 0
-                    && m.owner_track_id != common::model::MASTER_TRACK_ID
-                    && self.cur.song_doc.song().track_by_id(m.owner_track_id).is_none()
-            })
-            .map(|m| m.id)
-            .collect();
-        for id in orphans {
-            // 参照 routing の除去と 2 の連鎖掃除まで `remove_mod_source` が担う。
-            self.remove_mod_source(id);
-        }
+        self.edit_song(move |song| song.mod_sources.retain(|m| m.id != id));
     }
 
     /// `target` への**既存の**変調 routing が載る store を `f` に渡す (解除 / 深さ / 極性。足すのは
@@ -442,7 +395,7 @@ impl AppData {
         target: &common::model::AutomationTarget,
         f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> (R, bool),
     ) -> Option<R> {
-        let owner = crate::handler::param_value::param_owner(self.cur.song_doc.song(), target, track_id)?;
+        let owner = crate::handler::param_value::param_owner(&self.cur.song_doc, target, track_id)?;
         let mut out = None;
         self.edit_song_checked(|song| {
             let Some((_, routings)) = song.param_stores_mut(owner) else {
@@ -473,7 +426,7 @@ impl AppData {
         // が 1 本の変調を指すので、後から `ensure_ids` 任せにすると採番前の一瞬だけ
         // 深さを変調先にできない窓ができる)。
         let song = self.cur.song_doc.song();
-        let owner = crate::handler::param_value::param_owner(song, &target, track_id)?;
+        let owner = crate::handler::param_value::param_owner(&self.cur.song_doc, &target, track_id)?;
         let (_, routings) = song.param_stores(owner)?;
         if routings.iter().any(|r| r.source_id == source_id && r.target == target) {
             return Some(false);
@@ -587,9 +540,13 @@ impl AppData {
         });
     }
 
-    /// r.md #110: follower の source は track か同 track の Parallel 内 chain。
-    pub(crate) fn set_mod_source_tap_source(&mut self, id: u32, source: common::model::TapSource) {
-        self.edit_mod_source_follower(id, |tap, _| tap.source = source);
+    /// r.md #110: follower の source は track か同 track の Parallel 内 chain。`None` = 入力なし。
+    /// tap 点は今の配線から引き継ぐ (入力なしから配線したときは既定の Post-Fader)。
+    pub(crate) fn set_mod_source_tap_source(&mut self, id: u32, source: Option<common::model::TapSource>) {
+        self.edit_mod_source_follower(id, |tap, _| {
+            let tap_point = tap.map(|t| t.tap_point).unwrap_or_default();
+            *tap = source.map(|s| common::model::AudioTap::new(s, tap_point));
+        });
     }
 
     pub(crate) fn set_mod_source_attack(&mut self, id: u32, ms: f32) {
@@ -676,8 +633,12 @@ impl AppData {
 
     pub(crate) fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
         // tap は EnvelopeFollower{tap} 内に内包 (generator には無い)。
-        // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。
-        self.edit_mod_source_follower(id, |tap, _| tap.tap_point = tap_point);
+        // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。入力なしには点が無い。
+        self.edit_mod_source_follower(id, |tap, _| {
+            if let Some(tap) = tap {
+                tap.tap_point = tap_point;
+            }
+        });
         // tap_point は schedule の BufRef を変えるので recompile が要る。
     }
 

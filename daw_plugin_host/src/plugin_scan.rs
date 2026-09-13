@@ -81,12 +81,12 @@ pub fn scan_system() -> Result<PluginDatabase> {
         }
     }
 
-    Ok(PluginDatabase {
+    Ok(PluginDatabase::new(
         entries,
-        scanned_at: Some(now_secs()),
+        Some(now_secs()),
         // scan_system は port を probe しない (GUI の rescan が probe 後に版を立てる)。0 = 未 probe。
-        port_probe_version: 0,
-    })
+        0,
+    ))
 }
 
 fn now_secs() -> u64 {

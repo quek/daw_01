@@ -33,19 +33,69 @@
 //! [`Ui::nearest_under_pointer`] で近さを申告し、**前フレームに最も近かった点** だけが勝者になる
 //! (描画順の後ろにいる点の近さは同じフレームでは分からないので 1 フレーム遅れ、
 //! [`Ui::claim_wheel_in_rect`] と同じ)。
+//!
+//! 1 つの widget が自分の中に当たり判定の重なりうる点を複数持つとき (オートメーションの点 / MSEG のノードと
+//! tension handle / 映像のハンドル) も規則は同じ。[`NearestHit`] で widget の中の近い 1 つを選び、その距離で
+//! 上の 2 本を呼んで widget をまたいで取り合う。
 
 use daw_ui_renderer::Rect;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
 
+/// 当たり判定が重なりうる候補から **近い 1 つ** を選ぶ規則 (module doc) の唯一の実装。
+///
+/// 当たり判定の中にいる候補を **描画順** (後ろほど手前) に [`Self::offer`] で申告し、[`Self::best`] で勝者を取る。
+/// 最も近い候補が勝ち、同じ距離なら後に申告した方 (手前)。当たり判定の外の候補は申告しない。
+/// widget をまたぐ取り合い ([`Ui::claim_press_at`] / [`Ui::nearest_under_pointer`]) も同じ規則で比べる。
+#[derive(Debug, Clone, Copy)]
+pub struct NearestHit<T> {
+    best: Option<(T, f32)>,
+}
+
+impl<T> Default for NearestHit<T> {
+    fn default() -> Self {
+        Self { best: None }
+    }
+}
+
+impl<T> NearestHit<T> {
+    /// `candidate` を判定の中心からの距離 `distance` (px) と一緒に申告する。
+    pub fn offer(&mut self, candidate: T, distance: f32) {
+        if self.best.as_ref().is_none_or(|&(_, best)| wins(distance, best)) {
+            self.best = Some((candidate, distance));
+        }
+    }
+
+    /// 勝者とその距離 (申告が無ければ `None`)。
+    pub fn best(self) -> Option<(T, f32)> {
+        self.best
+    }
+}
+
+impl<T> FromIterator<(T, f32)> for NearestHit<T> {
+    /// 描画順に並んだ `(候補, 距離)` を順に申告する。
+    fn from_iter<I: IntoIterator<Item = (T, f32)>>(iter: I) -> Self {
+        let mut hit = Self::default();
+        for (candidate, distance) in iter {
+            hit.offer(candidate, distance);
+        }
+        hit
+    }
+}
+
+/// 後から申告した距離 `distance` が今の勝者 `best` に勝つか (近い、または同じ距離 = 後に描いた方)。
+fn wins(distance: f32, best: f32) -> bool {
+    distance <= best
+}
+
 /// press の所有者と、近さで取り合う当たり判定の勝者。`UiHost` がフレームを跨いで 1 つだけ持つ。
 #[derive(Debug, Default)]
 pub(crate) struct PointerClaims {
     /// 直近の primary press の所有者 (press〜release の間だけ `Some`)。
     press: Option<PressClaim>,
-    /// [`Ui::nearest_under_pointer`] の `[前フレームの勝者, 今フレームの暫定勝者]` (id と距離)。
-    nearest: [Option<(WidgetId, f32)>; 2],
+    /// [`Ui::nearest_under_pointer`] の `[前フレームの勝者, 今フレームの暫定勝者]`。
+    nearest: [NearestHit<WidgetId>; 2],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +112,7 @@ impl PointerClaims {
         if primary_just_pressed {
             self.press = None;
         }
-        self.nearest = [self.nearest[1], None];
+        self.nearest = [self.nearest[1], NearestHit::default()];
     }
 
     /// release フレームの末尾。press の所有者は release で終わる。
@@ -116,7 +166,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `true` を返す。`false` の widget は session を始めない。近さを持たない所有者 ([`Self::claim_press`] /
     /// [`Self::primary_click`] = 行の背景など) からは従来どおり後勝ちで奪う。
     pub fn claim_press_at(&mut self, wid: WidgetId, distance: f32) -> bool {
-        let beaten = self.pointer_claims.press.is_some_and(|c| c.distance.is_some_and(|d| d < distance));
+        let beaten = self.pointer_claims.press.is_some_and(|c| c.distance.is_some_and(|d| !wins(distance, d)));
         if !beaten {
             self.pointer_claims.press = Some(PressClaim { wid, distance: Some(distance) });
         }
@@ -128,10 +178,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// (同じ距離なら後に描いた方)。前フレームに誰も申告していなければ、申告した全員を勝者とする。
     pub fn nearest_under_pointer(&mut self, wid: WidgetId, distance: f32) -> bool {
         let claims = &mut *self.pointer_claims;
-        if claims.nearest[1].is_none_or(|(_, d)| distance <= d) {
-            claims.nearest[1] = Some((wid, distance));
-        }
-        claims.nearest[0].is_none_or(|(w, _)| w == wid)
+        claims.nearest[1].offer(wid, distance);
+        claims.nearest[0].best().is_none_or(|(w, _)| w == wid)
     }
 
     /// 現在の press 所有者 (press〜release の間だけ `Some`)。

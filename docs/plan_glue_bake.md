@@ -28,25 +28,30 @@ Bounce In Place との役割の重なりは許容する — Bounce は 1 クリ�
 
 ## 3. 何を焼くか (= pre-FX)
 
-`isolated_track_song(track_id, pre_fx = true)` が組む song を engine に `LoadSong`
-してから範囲を render する。焼くのは**素材の音だけ**:
+`Song::isolated_track(track_id)` が組む「そのトラックだけ」の song を engine に `LoadSong`
+してから、`BounceClipFxOnline { scope: RenderScope::Sources }` で範囲を render する。
+**Song は書き換えず、どの段を通すかは scope が compile で program の形に焼く**
+(Song を書き換えて処理を消すと、音源を含む Parallel などが正確に焼けない)。焼くのは**素材の音だけ**:
 
-- insert FX (audio 入力を持つ device) は port 中和でバイパス
-- **トラックのフェーダー / pan を外す** — オートメーションレーンと `mod_routings`
-  (LFO 等の変調) の**両方**が対象。焼き込むと再生時に同じものがもう一度掛かって
-  二重に効く (master 音量を外すのと同じ理由)。lane だけ外して変調を残すと、
-  フェーダーに刺した LFO の深さが二乗になる
-- pan 則は中央でも -3dB 掛かるので、音量側で**打ち消してから**焼く
-  (`common::audio_render::pan_gains` が pan 則の SSoT)。放置すると焼くたびに 3dB 下がる
-- master fx / master 音量 / send / group / sidechain は落とす
+- 音声入力を持つ device と内蔵 device は op を出さない (latency も数えない)。Parallel は
+  素材の音だけを描く形 (分割と chain の gain / pan / mute / solo・出力 trim を通さない) にする
+- **トラックのフェーダーの段 (volume / pan / mute / solo) を通さない** (`mixer::pass_strip`) —
+  オートメーションレーンと `mod_routings` (LFO 等の変調) も段ごと通らない。焼き込むと再生時に
+  同じものがもう一度掛かって二重に効く (pan を振ったトラック・volume ≠ 1 のトラックで音量が変わる)
+- master の段 (fx chain / 音量 / Limiter) を通さない
+- 他のトラックを落とし、それを指す参照 (send / SC / パラアウト / follower / レーン / 変調) は
+  編集後の不変条件と同じ掃除 (`Song::prune_dangling_refs`) が外す。自トラックを読む配線は残る
 - **ランチャーの主導権をアレンジへ戻す** (`RowPlayback::Arranger`) — 行がランチャー側の
   ままだと offline 走査はセルの音を再現し、アレンジのクリップが鳴らない
 - clip / event の mute は**そのまま効く** (= 聞こえている音を焼く)
 
+Bounce (with FX) は同じ isolate で `RenderScope::PostFx` (device チェーンまで) を焼き、
+フェーダーから先は新しいトラックへ写す。規則の正本は `common/src/model/bounce_ops.rs`。
+
 走査は cold (`RenderSpan::RangeCold`) = 「範囲の頭で再生を押した音」。plugin を通さない
 ので tail を積み上げる意味がなく、トラック数ぶん曲頭から空走査するのを避ける。
 
-焼いた WAV を指す event の組み立ては `AppData::baked_audio_event` が SSoT
+焼いた WAV の登録と、それを指す event の組み立ては `Song::add_baked_audio` が SSoT
 (bounce と共通)。**source 範囲は書き出し窓ちょうどに切り、`StretchMode` は `Raw`** —
 理由は同関数の doc。
 

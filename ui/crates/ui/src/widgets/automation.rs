@@ -17,6 +17,7 @@ use std::hash::Hash;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
+use crate::click::NearestHit;
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -189,33 +190,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             hovered_point_index: None,
         };
 
-        // hover 判定: 各点との距離 (radius * 2 内なら hit、選びやすさのため少し甘く)
-        let hovered_idx: Option<usize> = pointer.pos.and_then(|(px, py)| {
-            let r2 = (style.node_radius_px * 2.0).powi(2);
-            for (i, &(x, y)) in points.iter().enumerate() {
-                let nx = rect.x + x * rect.w;
-                let ny = rect.y + (1.0 - y) * rect.h;
-                if (px - nx).powi(2) + (py - ny).powi(2) <= r2 {
-                    return Some(i);
-                }
-            }
-            None
+        // 当たり判定: 各点との距離が radius * 2 以内なら当たり (選びやすさのため少し甘く)。当たり円は隣の点と
+        // 重なるので、当たった点のうち **近い 1 点** (同じ距離なら後に描いた点) を選ぶ ([`crate::click`])。
+        let hit: Option<(usize, f32)> = pointer.pos.and_then(|(px, py)| {
+            let r = style.node_radius_px * 2.0;
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| (i, (px - (rect.x + x * rect.w)).hypot(py - (rect.y + (1.0 - y) * rect.h))))
+                .filter(|&(_, d)| d <= r)
+                .collect::<NearestHit<_>>()
+                .best()
         });
+        // hover の強調は、当たり判定の重なる別の widget とも近さで取り合う。
+        let hovered_idx = hit.filter(|&(_, d)| self.nearest_under_pointer(wid, d)).map(|(i, _)| i);
         response.hovered_point_index = hovered_idx;
+        // press も近さを添えて名乗り、より近い点 (または手前の widget) に奪われたら session を捨てる。
+        let pressed = pointer.primary_just_pressed && hit.is_some_and(|(_, d)| self.claim_press_at(wid, d));
+        let taken = !pressed && self.press_taken_from(wid);
 
         // drag state 更新 (scope を分けて borrow を early release)
-        // press 時に points.len() を確認し、 drag 開始可否を確定。 release 後または points が
-        // 外部削除されて stale idx を持つ場合は drag = None にリセット (idx が範囲外なら
-        // on_change を呼ばない)。
-        let mut grabbed = false;
+        // release 後または points が外部削除されて stale idx を持つ場合は drag = None にリセット
+        // (idx が範囲外なら on_change を呼ばない)。
         let drag = {
             let state: &mut AutomationCurveState = self.widget_state(wid);
-            if pointer.primary_just_pressed
-                && let Some(idx) = hovered_idx
-                && idx < points.len()
-            {
+            if taken {
+                state.drag = None;
+            }
+            if pressed && let Some((idx, _)) = hit {
                 state.drag = Some((idx, points[idx]));
-                grabbed = true;
             }
             if pointer.primary_just_released {
                 state.drag = None;
@@ -228,10 +231,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             state.drag
         };
-        // 点を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
-        if grabbed {
-            self.claim_press(wid);
-        }
 
         // drag 中なら Edit 発行 (1 フレームに 1 回呼ばれる on_change はその場で消費)
         if let Some((idx, _initial)) = drag
@@ -357,5 +356,50 @@ mod tests {
         let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
         assert!(flatten_curve(&[], rect, 2.0).is_empty());
         assert!(flatten_curve(&[(0.5, 0.5)], rect, 2.0).is_empty());
+    }
+
+    /// 当たり円 (半径 = `node_radius_px` × 2 = 10px) が重なる 2 点。rect 幅 256 で x = 128 / 144 px、y = 50 px。
+    const OVERLAP_RECT: Rect = Rect { x: 0.0, y: 0.0, w: 256.0, h: 100.0 };
+    const OVERLAP_POINTS: [(f32, f32); 2] = [(0.5, 0.5), (0.5625, 0.5)];
+
+    /// model = 最後に `on_change` で動かされた点の index。
+    type Moved = std::cell::Cell<Option<usize>>;
+
+    fn press_at(x: f32) -> crate::input::FrameInput {
+        crate::input::FrameInput {
+            pointer: crate::input::PointerFrame {
+                pos: Some((x, 50.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..crate::input::PointerFrame::default()
+            },
+            ..crate::input::FrameInput::default()
+        }
+    }
+
+    fn run_overlap(host: &mut crate::ui::UiHost<Moved>, model: &mut Moved, input: crate::input::FrameInput) -> AutomationCurveResponse {
+        let mut scene = daw_ui_renderer::Scene::new();
+        let out = std::cell::Cell::new(AutomationCurveResponse::default());
+        let screen = daw_ui_platform::PhysicalSize { width: 256, height: 100 };
+        host.frame(model, &mut scene, screen, input, |_, ui| {
+            let style = AutomationCurveStyle::from_palette(&Palette::dark());
+            out.set(ui.automation_curve("c", OVERLAP_RECT, &OVERLAP_POINTS, style, |idx, _| {
+                Edit::mutate(move |m: &mut Moved| m.set(Some(idx)))
+            }));
+        });
+        out.get()
+    }
+
+    /// 当たり円が重なった 2 点の重なりを押すと、掴むのは **近い方** — 同じ距離なら後に描いた点 (手前)。
+    /// hover の強調も同じ点を指す。
+    #[test]
+    fn a_press_in_overlapping_hit_circles_grabs_the_nearest_point() {
+        for (x, want, why) in [(135.0, 0, "128 に 7px / 144 に 9px"), (137.0, 1, "128 に 9px / 144 に 7px"), (136.0, 1, "同じ 8px は後に描いた点")] {
+            let mut host = crate::ui::UiHost::no_redraw();
+            let mut model: Moved = std::cell::Cell::new(None);
+            let r = run_overlap(&mut host, &mut model, press_at(x));
+            assert_eq!(model.get(), Some(want), "x={x}: {why}");
+            assert_eq!(r.hovered_point_index, Some(want), "x={x}: hover の強調も同じ点");
+        }
     }
 }

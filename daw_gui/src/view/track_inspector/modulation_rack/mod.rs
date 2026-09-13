@@ -287,9 +287,10 @@ pub(super) fn draw_modulation_rack(
         let name_rect =
             Rect { x: name_x, y, w: (arm_x - 4.0 - badge_w - name_x).max(40.0), h: 20.0 };
         if let K::EnvelopeFollower { tap, .. } = &src.kind {
+            let current = tap.map(|t| t.source);
             let sel = mod_track_choices
                 .iter()
-                .position(|(src, _)| *src == tap.source)
+                .position(|(src, _)| *src == current)
                 .unwrap_or(0);
             if let Some(picked) =
                 ui.dropdown(("inspector_mod_src_track", sid), name_rect, &mod_track_labels, sel)
@@ -324,7 +325,7 @@ pub(super) fn draw_modulation_rack(
             // (1 関数 300 実コード行 / インデント 6 段) を押し上げる (不変条件 9)。
             let (next_y, drag) = match &src.kind {
                 K::EnvelopeFollower { tap, follower } => {
-                    draw_follower_body(ui, &cx, sid, tap, follower, y)
+                    draw_follower_body(ui, &cx, sid, tap.as_ref(), follower, y)
                 }
                 K::Lfo(c) => draw_lfo_body(ui, &cx, src, c, y),
                 K::Random(c) => draw_random_body(ui, &cx, src, c, y),

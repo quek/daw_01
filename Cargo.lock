@@ -1461,6 +1461,7 @@ dependencies = [
  "hound",
  "libloading",
  "reqwest",
+ "rtrb",
  "serde_json",
  "tempfile",
  "tokio",

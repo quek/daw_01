@@ -400,17 +400,16 @@ impl AppData {
     /// loop).
     /// r.md #110: 他 track に加えて **同 track の Parallel 内 chain** も選べる (Bitwig と同じ)。
     /// 自 track 自身も可 (follower は control-rate なので feedback にならない)。
-    pub fn mod_source_track_choices(&self) -> Vec<(common::model::TapSource, String)> {
+    /// 先頭は SC の候補と同じ「—」(入力なし。聴いていたトラック / chain が消えた follower もここを指す)。
+    pub fn mod_source_track_choices(&self) -> Vec<(Option<common::model::TapSource>, String)> {
         let song = self.cur.song_doc.song();
-        let mut out: Vec<(common::model::TapSource, String)> = song
-            .tracks
-            .iter()
-            .map(|t| (common::model::TapSource::Track(t.id), t.name.clone()))
+        let mut out: Vec<(Option<common::model::TapSource>, String)> = std::iter::once((None, "—".to_string()))
+            .chain(song.tracks.iter().map(|t| (Some(common::model::TapSource::Track(t.id)), t.name.clone())))
             .collect();
         if let Some(devices) = self.cursor_track_id().and_then(|id| song.fx_chain_by_track_id(id)) {
             common::model::for_each_chain(devices, &mut |parallel, c| {
                 out.push((
-                    common::model::TapSource::Chain(c.id),
+                    Some(common::model::TapSource::Chain(c.id)),
                     format!("{} / {}", parallel.name, c.name),
                 ));
             });
@@ -522,8 +521,7 @@ impl AppData {
         else {
             return None;
         };
-        let params = self.cur.pipc.plugin_params.get(device_id)?;
-        let info = params.iter().find(|p| p.id == *param_id)?;
+        let info = self.cur.pipc.plugin_params.info(*device_id, *param_id)?;
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
     }
 
@@ -554,25 +552,28 @@ impl AppData {
     /// 内蔵映像 FX は host が `PluginParamList` を送らない (param 表は静的
     /// マニフェスト) ので、 そちらから引く。 ノードで束縛しない target / ノードが消えて
     /// いる / host 未送 / 空名 は `None` (caller が song 非依存の名前へ fallback)。
+    ///
+    /// ノードは `SongDoc` の id 構造の世代つき索引で引き、param は id の索引で引く (曲全体の木も param 表も
+    /// 走査しない)。modulation ラックの接続行のように毎フレーム行ごとに呼ばれるため。
     pub fn device_param_name(&self, target: &common::model::AutomationTarget) -> Option<String> {
         use common::model::{AutomationTarget as T, TrackBuiltinParam as B};
-        let song = self.cur.song_doc.song();
+        let doc = &self.cur.song_doc;
         let (device_id, param_id) = match target {
             T::PluginParam { device_id, param_id, .. } => (*device_id, *param_id),
             T::NativeParam { device_id, param } => {
-                return Some(common::model::native_param_label(&song.native_by_id(*device_id)?.display_name(), *param));
+                return Some(common::model::native_param_label(&doc.native_by_id(*device_id)?.display_name(), *param));
             }
-            T::TrackBuiltin(B::ChainGain { chain_id }) => return Some(format!("{}: Gain", song.chain_by_id(*chain_id)?.1.name)),
-            T::TrackBuiltin(B::ChainPan { chain_id }) => return Some(format!("{}: Pan", song.chain_by_id(*chain_id)?.1.name)),
+            T::TrackBuiltin(B::ChainGain { chain_id }) => return Some(format!("{}: Gain", doc.chain_by_id(*chain_id)?.1.name)),
+            T::TrackBuiltin(B::ChainPan { chain_id }) => return Some(format!("{}: Pan", doc.chain_by_id(*chain_id)?.1.name)),
             T::TrackBuiltin(B::ParallelOutGain { parallel_id }) => {
-                return Some(format!("{}: Out", song.parallel_by_id(*parallel_id)?.name));
+                return Some(format!("{}: Out", doc.parallel_by_id(*parallel_id)?.name));
             }
             T::TrackBuiltin(B::ParallelSplitFreq { parallel_id, edge }) => {
                 let edge = crate::automation_label::split_edge_label(*edge);
-                return Some(format!("{}: Split {edge}", song.parallel_by_id(*parallel_id)?.name));
+                return Some(format!("{}: Split {edge}", doc.parallel_by_id(*parallel_id)?.name));
             }
             T::TrackBuiltin(B::ParallelSelect { parallel_id }) => {
-                return Some(format!("{}: Active", song.parallel_by_id(*parallel_id)?.name));
+                return Some(format!("{}: Active", doc.parallel_by_id(*parallel_id)?.name));
             }
             T::TrackBuiltin(B::Volume | B::Pan | B::Mute | B::SendGain { .. })
             | T::MasterLimiter(_)
@@ -584,17 +585,13 @@ impl AppData {
             | T::ModSourceParam { .. }
             | T::ModRoutingDepth { .. } => return None,
         };
-        let inst = song.plugin_by_id(device_id)?;
+        let inst = doc.plugin_by_id(device_id)?;
         let device = self.device_label(inst);
         if let Some(def) = common::video_fx::def_by_id(&inst.plugin_id) {
             let param = def.param(param_id)?;
             return Some(format!("{device}: {}", param.name));
         }
-        let info = self
-            .cur.pipc.plugin_params
-            .get(&device_id)?
-            .iter()
-            .find(|p| p.id == param_id)?;
+        let info = self.cur.pipc.plugin_params.info(device_id, param_id)?;
         if info.name.is_empty() {
             return None;
         }
@@ -1079,10 +1076,17 @@ impl AppData {
     /// 同一 `Arc<str>` の clone (refcount bump) を返す。 `clip_display_label` は
     /// `clip.content_id` のみに依存するので content_id 単位で 1 回だけ算出する
     /// (linked clip は同一ラベルを共有)。
+    /// レーンのノード名は Song に加えて host の param 表と plugin DB からも決まるので、別の鍵
+    /// ([`LaneLabelsKey`]) で作り直す。
     pub(crate) fn arrangement_labels(&self) -> std::cell::Ref<'_, ArrLabelCache> {
         {
             let mut cache = self.cur.peph.arr_label_cache.borrow_mut();
-            if cache.epoch != self.cur.song_doc.edit_epoch() {
+            let edit_epoch = self.cur.song_doc.edit_epoch();
+            if !self.host_derived_key_is_current(cache.lane_labels_key.as_ref()) {
+                self.fill_lane_node_labels(&mut cache.lane_node_labels);
+                cache.lane_labels_key = Some(self.host_derived_key());
+            }
+            if cache.epoch != edit_epoch {
                 cache.track_names.clear();
                 cache.content_labels.clear();
                 cache.section_names.clear();
@@ -1111,15 +1115,30 @@ impl AppData {
                         .content_names
                         .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
-                self.fill_lane_node_labels(&mut cache.lane_node_labels);
-                cache.epoch = self.cur.song_doc.edit_epoch();
+                cache.epoch = edit_epoch;
             }
         }
         self.cur.peph.arr_label_cache.borrow()
     }
 
-    /// [`ArrLabelCache::lane_node_labels`] を今の Song で作り直す (全トラック + master のレーンのうち、名前が
-    /// Song だけから決まる target)。
+    /// Song と host の param 表と plugin DB から作る派生の、今の入力の世代 ([`HostDerivedKey`])。
+    pub(crate) fn host_derived_key(&self) -> HostDerivedKey {
+        HostDerivedKey {
+            edit_epoch: self.cur.song_doc.edit_epoch(),
+            plugin_params: self.cur.pipc.plugin_params.generation(),
+            plugin_db: self.ipc.plugin_db.clone(),
+        }
+    }
+
+    /// `key` (派生を作ったときの世代、`None` = まだ作っていない) が今の入力のものか。
+    pub(crate) fn host_derived_key_is_current(&self, key: Option<&HostDerivedKey>) -> bool {
+        key.is_some_and(|k| {
+            k.is_current(self.cur.song_doc.edit_epoch(), self.cur.pipc.plugin_params.generation(), &self.ipc.plugin_db)
+        })
+    }
+
+    /// [`ArrLabelCache::lane_node_labels`] を作り直す (全トラック + master のレーンのうち、ノードで束縛する target)。
+    /// 名前の組み立ては [`Self::device_param_name`] 1 本。
     fn fill_lane_node_labels(
         &self,
         labels: &mut std::collections::HashMap<common::model::AutomationTarget, std::sync::Arc<str>>,
@@ -1127,7 +1146,7 @@ impl AppData {
         labels.clear();
         let song = self.cur.song_doc.song();
         let lanes = song.tracks.iter().flat_map(|t| &t.automation_lanes).chain(&song.song_lanes);
-        for lane in lanes.filter(|l| name_is_song_derived(&l.target)) {
+        for lane in lanes {
             if !labels.contains_key(&lane.target)
                 && let Some(name) = self.device_param_name(&lane.target)
             {
@@ -1135,28 +1154,6 @@ impl AppData {
             }
         }
     }
-
-    /// アレンジのレーン見出しに出す、ノードで束縛する target の完全修飾名 ([`Self::device_param_name`] と
-    /// 同じ名前)。Song だけから決まる名前は `labels` (= [`Self::arrangement_labels`] の世代キャッシュ) から引き、
-    /// 毎フレームの木の走査と `format!` をしない。host の param 表に依存する `PluginParam` だけはその場で引く
-    /// (Song の世代では変化を検知できない)。
-    pub(crate) fn lane_node_label(
-        &self,
-        labels: &ArrLabelCache,
-        target: &common::model::AutomationTarget,
-    ) -> Option<std::sync::Arc<str>> {
-        if name_is_song_derived(target) {
-            labels.lane_node_labels.get(target).cloned()
-        } else {
-            self.device_param_name(target).map(std::sync::Arc::from)
-        }
-    }
-}
-
-/// [`AppData::device_param_name`] の名前が Song だけから決まるか (`PluginParam` は host が送る param 表と
-/// plugin DB にも依存する)。レーン名の世代キャッシュに載せてよいかの判定。
-fn name_is_song_derived(target: &common::model::AutomationTarget) -> bool {
-    !matches!(target, common::model::AutomationTarget::PluginParam { .. })
 }
 
 #[cfg(test)]
@@ -1219,7 +1216,7 @@ mod live_value_tests {
             song.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(parallel));
             song.push_lane(MASTER_TRACK_ID, AutomationLane::new(chain_gain.clone(), 0.3));
         });
-        let label = |app: &crate::state::AppData| app.lane_node_label(&app.arrangement_labels(), &chain_gain);
+        let label = |app: &crate::state::AppData| app.arrangement_labels().lane_node_label(&chain_gain);
         let before = label(&app).expect("chain のレーンに名前が付く");
         assert_eq!(Some(before.clone()), app.device_param_name(&chain_gain).map(std::sync::Arc::from), "device_param_name と同じ名前");
 
@@ -1227,5 +1224,51 @@ mod live_value_tests {
             song.chain_by_id_mut(9_002).expect("chain").name = "Bass".into();
         });
         assert_eq!(label(&app).as_deref(), Some("Bass: Gain"), "改名は次の世代で反映される (旧 {before})");
+    }
+
+    /// plugin の param のレーン名も世代キャッシュから引くが、host が param 表を送った / 捨てた、plugin DB を
+    /// 差し替えた後は必ず新しい名前になる (Song の世代だけでは検知できない入力も鍵に入っている)。
+    #[test]
+    fn plugin_param_lane_labels_follow_param_lists_and_the_plugin_db() {
+        use common::model::PluginInstance;
+        use common::plugin_format::PluginFormat;
+        use common::protocol::PluginParamInfo;
+
+        let mut app = crate::test_support::headless_app();
+        let mut device_id = 0;
+        app.edit_song(|song| {
+            let mut inst = PluginInstance::new("com.example.synth".into(), PluginFormat::Clap);
+            inst.id = song.alloc_device_id();
+            device_id = inst.id;
+            song.master_fx_chain.push(Device::Plugin(inst));
+            let target = AutomationTarget::PluginParam { device_id, param_id: 7, legacy_device_index: None };
+            song.push_lane(MASTER_TRACK_ID, AutomationLane::new(target, 0.5));
+        });
+        let target = AutomationTarget::PluginParam { device_id, param_id: 7, legacy_device_index: None };
+        let label = |app: &crate::state::AppData| app.arrangement_labels().lane_node_label(&target);
+        assert_eq!(label(&app), None, "host が param 表を送る前は名前が無い (見出しは song 非依存の名前)");
+
+        let cutoff = PluginParamInfo {
+            id: 7,
+            name: "Cutoff".into(),
+            module: String::new(),
+            min_value: 0.0,
+            max_value: 1.0,
+            default_value: 0.5,
+            flags: 0,
+        };
+        app.cur.pipc.plugin_params.insert(device_id, vec![cutoff]);
+        assert_eq!(label(&app).as_deref(), Some("com.example.synth: Cutoff"), "param 表が届いたら名前が付く (DB に無い plugin は id)");
+
+        let db: common::plugin_db::PluginDatabase = serde_json::from_str(
+            r#"{"entries":[{"id":"com.example.synth","name":"Synth","path":"synth.clap","descriptor_index":0}]}"#,
+        )
+        .expect("plugin DB");
+        app.ipc.plugin_db = Some(std::sync::Arc::new(db));
+        assert_eq!(label(&app).as_deref(), Some("Synth: Cutoff"), "plugin DB を差し替えたら DB の名前");
+        assert_eq!(label(&app), app.device_param_name(&target).map(std::sync::Arc::from), "device_param_name と同じ名前");
+
+        app.cur.pipc.plugin_params.remove(&device_id);
+        assert_eq!(label(&app), None, "param 表が捨てられたら名前も消える");
     }
 }

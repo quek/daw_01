@@ -47,7 +47,7 @@ fn make_plugin_db_with_n_instruments(n: usize) -> Arc<PluginDatabase> {
             has_video_output: false,
         });
     }
-    Arc::new(PluginDatabase { entries, scanned_at: None, port_probe_version: 0 })
+    Arc::new(PluginDatabase::new(entries, None, 0))
 }
 
 fn build_app(

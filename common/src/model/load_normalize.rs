@@ -106,9 +106,9 @@ impl Song {
         self.ensure_image_source_ids();
         self.ensure_ids();
         self.ensure_midi_binding_inputs();
-        // r.md #89 / #129: dangling な lane / routing / MIDI binding を掃除する。id 採番と組み込みの
-        // 正規化の後 (routing id / device id が確定してから解決する) でなければならない。
-        self.prune_dangling_param_targets();
+        // r.md #89 / #129: dangling な信号経路 / lane / routing / MIDI binding を掃除する。id 採番と組み込みの
+        // 正規化の後 (track id の remap / routing id / device id が確定してから解決する) でなければならない。
+        self.prune_dangling_refs();
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
@@ -489,7 +489,7 @@ impl Song {
         // (mod_source.id は track id ではないので不変、 tap の source track のみ)。
         for ms in self.mod_sources.iter_mut() {
             // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ remap。
-            if let Some(tap) = ms.follower_tap_mut()
+            if let Some(Some(tap)) = ms.follower_tap_mut()
                 && let TapSource::Track(src) = &mut tap.source
                 && let Some(&new_id) = id_remap.get(src)
             {
