@@ -20,6 +20,12 @@
 //! 最後に、f32 の丸め (dB ↔ 振幅の往復) で ceiling を 1 ULP でも超えないよう、出ていくサンプル自身の
 //! ピークで上限を掛ける。上の 3 段が正しく働いている限りこの上限は丸め誤差ぶんしか効かない。
 //!
+//! # 非有限のサンプル (§12.2)
+//!
+//! 上流が ±inf / NaN を 1 サンプル出しても状態を固着させない。検出では 0 とみなし (必要ゲインが
+//! 有限に保たれるので、窓・平均・平滑はどれも有限のまま)、出ていくときは 0 に落とす (`inf` に
+//! `ceiling / inf = 0` を掛けると NaN になる)。平滑状態が非有限なら block 末に無音の解析へ戻す。
+//!
 //! 旧実装 (r.md #129 以前の master strip) は入ってきたサンプルだけで利得を決め、先読みしている間に
 //! リリースで利得が戻ったため、孤立したインパルスで ceiling を超えていた (golden で peak 1.003 > −1 dBFS)。
 //!
@@ -186,6 +192,7 @@ impl MasterLimiterState {
             }
             self.gain_db = if avg < self.gain_db { avg } else { avg + (self.gain_db - avg) * release_c };
             let mut g = db_to_amp(self.gain_db);
+            let (out_l, out_r) = (finite_or_zero(out_l), finite_or_zero(out_r));
             // 丸め (dB ↔ 振幅) で ceiling を超えないための上限。出ていくサンプル自身のピークで掛ける。
             let out_peak = out_l.abs().max(out_r.abs());
             if out_peak * g > ceiling_amp {
@@ -197,16 +204,20 @@ impl MasterLimiterState {
             l[i] = out_l * g;
             r[i] = out_r * g;
         }
+        if !self.gain_db.is_finite() || !self.avg_sum.is_finite() {
+            self.clear_analysis();
+            self.gain_db = 0.0;
+        }
         // GR は実際に掛けた最小ゲイン (log はブロックに 1 回)。
         self.gr_db = if worst_amp < 1.0 { amp_to_db(worst_amp).min(0.0) } else { 0.0 };
     }
 
     /// 入ってきたサンプルのピークを解析に入れ、出ていくサンプル (L サンプル前) に使える
-    /// 「窓内最小値の移動平均」(dB、0 以下) を返す。
+    /// 「窓内最小値の移動平均」(dB、0 以下) を返す。非有限のピークは 0 (無音) とみなす。
     #[inline]
     fn analyze(&mut self, peak: f32, ceiling_db: f32) -> f32 {
         let len = self.look_len.max(1);
-        let required = limiter_gain_db(amp_to_db(peak), ceiling_db);
+        let required = limiter_gain_db(amp_to_db(finite_or_zero(peak)), ceiling_db);
         let held = self.held.push(self.clock, required, len as u64);
         let slot = (self.clock % len as u64) as usize;
         self.avg_sum += f64::from(held) - f64::from(self.avg_ring[slot]);
@@ -250,4 +261,9 @@ impl MasterLimiterState {
         self.look_pos = (pos + 1) % len;
         out
     }
+}
+
+#[inline]
+fn finite_or_zero(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }

@@ -49,8 +49,8 @@ mod song_values;
 mod stretch_engine;
 
 use engine::{
-    DeviceBundle, DeviceRt, EngineCommand, EngineShared, PluginEntry, ProjectDelivery, ProjectRt,
-    SharedState, SyncSlot, WorkerRig,
+    DeviceBundle, DeviceRt, EngineCommand, EngineCommandSender, EngineShared, PluginEntry,
+    ProjectDelivery, ProjectRt, SharedState, SyncSlot, WorkerRig,
 };
 use mod_plan_publish::ModPhaseTableBuilder;
 use project_ctl::{DecodeJob, ProjectCtl};
@@ -123,9 +123,9 @@ async fn main() -> Result<()> {
     let engine_shared = Arc::new(EngineShared::new());
 
     // Preview / launcher channel: the receive loop pushes light commands here;
-    // the audio thread drains it at the top of every buffer. shmem / worker
-    // pool の重い扱いは bundle ring 経由 (plan §4)。
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<EngineCommand>();
+    // the audio thread drains it at the top of every buffer (rtrb、RT で確保も解放もしない)。
+    // shmem / worker pool の重い扱いは bundle ring 経由 (plan §4)。
+    let (cmd_tx, cmd_rx) = EngineCommandSender::channel();
 
     // plan §4 / `docs/plan_project_tabs.md` §3.2: wait-free SPSC pairs for RT
     // delivery. project slot は `ProjectDelivery` で開閉し、撤去した `ProjectRt` は
@@ -537,7 +537,7 @@ struct RecvLoop {
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     session_sample_rate: u32,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    cmd_tx: EngineCommandSender,
     out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     decode_tx: std::sync::mpsc::Sender<DecodeJob>,
     project_tx: rtrb::Producer<ProjectDelivery>,
@@ -569,6 +569,8 @@ fn recv_loop_housekeeping(
         drop(old);
     }
     rl.device_publisher.flush();
+    // ring が満杯の間に溜めた EngineCommand を流す (次のコマンドが来なくても届く)。
+    rl.cmd_tx.flush();
     let mut finished = phase_tables.take_finished();
     for ctl in projects.values_mut() {
         let key = ctl.key();
@@ -710,7 +712,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
             cmd @ (AudioCommand::OpenSamplerRing { .. }
             | AudioCommand::SamplerPreview { .. }
             | AudioCommand::SamplerPreviewStop) => {
-                if sampler::handle_device_command(cmd, &rl.engine_shared, &rl.cmd_tx) {
+                if sampler::handle_device_command(cmd, &rl.engine_shared, &mut rl.cmd_tx) {
                     rl.device_publisher.publish(&rl.engine_shared);
                 }
             }
@@ -798,7 +800,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     cmd,
                     &rl.engine_shared,
                     rl.session_sample_rate,
-                    &rl.cmd_tx,
+                    &mut rl.cmd_tx,
                     &rl.decode_tx,
                     &phase_tables,
                 );
@@ -886,7 +888,7 @@ fn start_output_stream(
     scope: Arc<ScopeBridgeHandle>,
     device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
-    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    cmd_rx: rtrb::Consumer<EngineCommand>,
     project_rx: rtrb::Consumer<ProjectDelivery>,
     project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
     device_rx: rtrb::Consumer<DeviceBundle>,
