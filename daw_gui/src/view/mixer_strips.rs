@@ -185,7 +185,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // S キーで「マウス直下のストリップ」を solo するため、 各 strip の
     // rect にポインタ当たり判定をして hover track を求める (arrangement の
     // `arrange_hovered_track` と同 idiom)。 layout を持つこの draw が唯一の算出点
-    // (SSoT)。 master strip は solo を持たないので対象外 (= None のまま)。
+    // (SSoT)。
     let pointer = ui.pointer();
     // hover 用 (r.md #124: 別 widget のドラッグ中は出さない)。
     let ptr = ui.hover_pos();
@@ -404,9 +404,8 @@ fn draw_track_strip(
         entry.peak_r_raw,
         rect,
         bg,
-        Some(track_color::to_renderer(entry.color)),
+        track_color::to_renderer(entry.color),
         track_id,
-        false,
         group_collapsed,
         sends_band_h,
         scope,
@@ -439,9 +438,8 @@ fn draw_return_strip(
         entry.peak_r_raw,
         rect,
         app.theme.daw.strip_return_bg,
-        Some(track_color::to_renderer(entry.color)),
+        track_color::to_renderer(entry.color),
         track_id,
-        false,
         None, // group_collapsed: return strip は disclosure 無し
         0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
         scope,
@@ -462,18 +460,16 @@ fn draw_strip(
     peak_r_raw: f32,
     rect: Rect,
     bg: Color,
-    // track の effective 色。 `Some(c)` で strip 左端に縦カラーストライプを
-    // 描く (arrangement header と同 idiom)。 master strip は neutral なので None。
-    color: Option<Color>,
+    // track の effective 色。 strip 左端に縦カラーストライプを描く (arrangement header と同 idiom)。
+    color: Color,
     track_idx: u32,
-    is_master: bool,
     // group strip のとき `Some(collapsed)` を渡すと、 名前左に折り畳み
     // disclosure (r.md #74: 展開中 ▶ / 折り畳み中 ▼、 開示軸 Inline) を描き、
     // click で `collapsed_groups` を toggle する
-    // (arrangement と同じ SSoT)。 非 group (通常 track / return / master) は `None`。
+    // (arrangement と同じ SSoT)。 非 group (通常 track / return) は `None`。
     group_collapsed: Option<bool>,
     // この strip 下部に確保する Sends セクション band の高さ (px)。 通常
-    // track は caller が `sends_band_height` で算出した値、 リターン / master
+    // track は caller が `sends_band_height` で算出した値、 リターン
     // は 0。 fader 下端をこの分だけ持ち上げて領域を空ける。 Sends セクション
     // 本体の描画は caller (`draw_track_strip`) が `draw_sends_section` で行う。
     sends_band_h: f32,
@@ -486,22 +482,20 @@ fn draw_strip(
     // track 色ストライプ: strip 左端に縦 COLOR_STRIP_W px。 panel と同じ角丸
     // (radius 4) に揃えるため左 2 隅 (tl, bl) のみ丸める。 bg の上に重ねるので
     // group (青) / return (緑) tint と色衝突せず常にトラック色が視認できる。
-    if let Some(c) = color {
-        ui.push_rect(RectCommand {
-            rect: Rect { x: rect.x, y: rect.y, w: COLOR_STRIP_W, h: rect.h },
-            fill: c,
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [4.0, 0.0, 0.0, 4.0],
-            clip_rect: None,
-        });
-    }
+    ui.push_rect(RectCommand {
+        rect: Rect { x: rect.x, y: rect.y, w: COLOR_STRIP_W, h: rect.h },
+        fill: color,
+        border: Color::TRANSPARENT,
+        border_width: 0.0,
+        radius: [4.0, 0.0, 0.0, 4.0],
+        clip_rect: None,
+    });
 
     // r.md #13: 選択中トラックの strip をアクセント枠でハイライトする。
     // arrangement と同じ `selection.selected_track_ids` (SSoT) を参照するので
-    // 両ビューが連動して光る。 master は実トラックではないので対象外。 色ストライプ
-    // の**後**に描いて枠が左辺で途切れないようにする (最前面に完全な枠)。
-    if !is_master && app.cur.selection.selected_track_ids.contains(&track_idx) {
+    // 両ビューが連動して光る。 色ストライプの**後**に描いて枠が左辺で途切れないようにする
+    // (最前面に完全な枠)。
+    if app.cur.selection.selected_track_ids.contains(&track_idx) {
         ui.push_rect(RectCommand {
             rect,
             fill: Color::TRANSPARENT,
@@ -560,169 +554,167 @@ fn draw_strip(
         11.0,
         // 全トラック名を本文色で描画。 旧 dim はクローム面 (strip 本体) に対し
         // コントラスト不足で読みにくかった。 乗る背景は strip の面 (panel /
-        // return tint / master) というパレット自身のクロームなので、 極性固定
+        // return tint) というパレット自身のクロームなので、 極性固定
         // インクではなくテーマ従属の `text` でよい。
         p.text,
     );
     y += TOP_LABEL_H;
 
-    if !is_master {
-        let btn_w = (rect.w - pad * 2.0 - 4.0) * 0.5;
-        ui.toggle_button_at(
-            ("mixer_strip_mute", layout_idx),
-            "M",
-            Rect { x: rect.x + pad, y, w: btn_w, h: TOGGLE_H },
-            muted,
-            &style_mute(&app.theme),
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleTrackMute(track_idx))
-                })
-            },
-        );
-        ui.toggle_button_at(
-            ("mixer_strip_solo", layout_idx),
-            "S",
-            Rect { x: rect.x + pad + btn_w + 4.0, y, w: btn_w, h: TOGGLE_H },
-            solo,
-            &style_solo(&app.theme),
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ToggleTrackSolo(track_idx))
-                })
-            },
-        );
-        y += TOGGLE_H + 6.0;
+    let btn_w = (rect.w - pad * 2.0 - 4.0) * 0.5;
+    ui.toggle_button_at(
+        ("mixer_strip_mute", layout_idx),
+        "M",
+        Rect { x: rect.x + pad, y, w: btn_w, h: TOGGLE_H },
+        muted,
+        &style_mute(&app.theme),
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleTrackMute(track_idx))
+            })
+        },
+    );
+    ui.toggle_button_at(
+        ("mixer_strip_solo", layout_idx),
+        "S",
+        Rect { x: rect.x + pad + btn_w + 4.0, y, w: btn_w, h: TOGGLE_H },
+        solo,
+        &style_solo(&app.theme),
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleTrackSolo(track_idx))
+            })
+        },
+    );
+    y += TOGGLE_H + 6.0;
 
-        // Pan 行 = `[ノブ 32][gap 4][数値欄 30]` を **1 行のまとまり** として strip
-        // 中央に寄せる (r.md #62)。 旧レイアウトはノブの真下に数値行 (12 + 間隔 2px) を
-        // 積んでいて、 strip 1 本あたり縦 14px を数値だけに費やしていた。 横に並べれば
-        // 行高 = ノブ径のままなので、 その 14px はそのまま fader / メーター高に回る。
-        // 参照 DAW (Ardour / Bitwig Mix view / REAPER MCP) はいずれも pan に数値専用の
-        // 行を割かない。 左が「つまみ」・右が「その値」 の並びは、 本プロジェクトの
-        // インスペクタ (ラベル左・値右) とも一致する。
+    // Pan 行 = `[ノブ 32][gap 4][数値欄 30]` を **1 行のまとまり** として strip
+    // 中央に寄せる (r.md #62)。 旧レイアウトはノブの真下に数値行 (12 + 間隔 2px) を
+    // 積んでいて、 strip 1 本あたり縦 14px を数値だけに費やしていた。 横に並べれば
+    // 行高 = ノブ径のままなので、 その 14px はそのまま fader / メーター高に回る。
+    // 参照 DAW (Ardour / Bitwig Mix view / REAPER MCP) はいずれも pan に数値専用の
+    // 行を割かない。 左が「つまみ」・右が「その値」 の並びは、 本プロジェクトの
+    // インスペクタ (ラベル左・値右) とも一致する。
+    //
+    // ノブ本体は plain -1..1 ⇔ 正規化 0..1 の写像を手書きせず、
+    // `common::automation` の plain⇔norm SSoT を使う (同じ式を 3 本書かない)。
+    let pan_row_x = rect.x + (rect.w - PAN_ROW_W) * 0.5;
+    let knob_x = pan_row_x;
+    let track_idx_for_pan = track_idx;
+    // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
+    // #109): Pan を音でドラッグ変調する Bitwig 流。knob は値が 0..=1 正規化なので
+    // `ModControlDomain::Norm`、routing 帰属はこの strip のトラック (track_idx)。
+    let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
+    let knob_value = plain_to_norm(&pan_target, f64::from(pan));
+    let pan_mod =
+        owner.map(|o| build_mod(app, pan_target.clone(), f64::from(knob_value), ModControlDomain::Norm, o));
+    let pan_resp = ui.knob_at(
+        ("mixer_strip_pan", layout_idx),
+        Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
+        knob_value,
+        0.5,
+        // Pan は bipolar param: 見かけの零点はセンタ (12 時)。 弧はセンタから
+        // L/R 方向へ伸び、 センタでは塗りが消えてセンタ notch だけが残る (r.md #47)。
         //
-        // ノブ本体は plain -1..1 ⇔ 正規化 0..1 の写像を手書きせず、
-        // `common::automation` の plain⇔norm SSoT を使う (同じ式を 3 本書かない)。
-        let pan_row_x = rect.x + (rect.w - PAN_ROW_W) * 0.5;
-        let knob_x = pan_row_x;
-        let track_idx_for_pan = track_idx;
-        // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
-        // #109): Pan を音でドラッグ変調する Bitwig 流。knob は値が 0..=1 正規化なので
-        // `ModControlDomain::Norm`、routing 帰属はこの strip のトラック (track_idx)。
-        let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
-        let knob_value = plain_to_norm(&pan_target, f64::from(pan));
-        let pan_mod =
-            owner.map(|o| build_mod(app, pan_target.clone(), f64::from(knob_value), ModControlDomain::Norm, o));
-        let pan_resp = ui.knob_at(
-            ("mixer_strip_pan", layout_idx),
-            Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
-            knob_value,
-            0.5,
-            // Pan は bipolar param: 見かけの零点はセンタ (12 時)。 弧はセンタから
-            // L/R 方向へ伸び、 センタでは塗りが消えてセンタ notch だけが残る (r.md #47)。
-            //
-            // `surface` には **この strip の実際の背景** を渡す。 通常 / group strip は
-            // `panel` だが return strip は緑 tint (`daw.strip_return_bg`) なので、 palette の
-            // 既定 (`panel`) 任せにすると return strip だけ可動範囲外の切り欠きが
-            // 「暗い帯」 として浮く。 caller は bg を持っているので迷わず渡せる。
-            &KnobStyle { surface: Some(bg), ..KnobStyle::BIPOLAR },
-            {
-                let target_for_change = pan_target.clone();
-                move |v| {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let pan = norm_to_plain(&target_for_change, v) as f32;
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetTrackPan {
-                            track: track_idx_for_pan,
-                            pan,
-                        })
-                    })
-                }
-            },
-            pan_mod.as_ref().map(|m| m.modulation()),
-        );
-        push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &pan_target, pan_resp.mod_dragging);
-
-        // Pan の数値欄 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
-        // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
-        // `automation_value` の PAN_FORMAT が SSoT で、 inspector / automation lane と同一。
-        //
-        // **読むだけでなく編集できる**: 従来 daw_01 には pan を数値で正確に指定する手段が
-        // どこにも無く、 ノブのドラッグだけだった。 Ardour はミキサーの数値欄について
-        // 「its precise value is shown in a text field ... that doubles as a way to type in a
-        // numeric value」 と明記している。 ここは `scrubable_number_at` (drag で微調整 /
-        // click で打ち込み / dblclick でセンタへリセット) をそのまま使う = inspector /
-        // automation lane header / export range と同じ idiom (bespoke な編集バッファを作らない)。
-        //
-        // 値は **knob の `displayed_value`** から取る: knob を drag / dblclick reset している
-        // 間は model より widget の preview が先行するので、 app 側の pan を読むと数値だけ
-        // 1 frame 遅れる (逆に数値欄を drag している間は widget 自身の preview が優先される)。
-        let pan_desc = automation_value_display(&pan_target, None);
-        let pan_plain = norm_to_plain(&pan_target, pan_resp.displayed_value);
-        let readout_style = ScrubableNumberStyle {
-            // hover は窪みの既定ではなく 1 段持ち上げた `control`。 80px strip では
-            // 「いまどの欄を掴んでいるか」 が面から離れて見えないと読めない (inspector と同じ判断)。
-            bg_color_hovered: p.control,
-            // scrub 中の帯は accent の electric azure ではなく控えめな `scrub_drag_bg`
-            // (transport のテンポだけが暖色版を使う)。
-            bg_color_dragging: p.scrub_drag_bg,
-            font_size: PAN_READOUT_FONT,
-            pad_x: PAN_READOUT_PAD_X,
-            sensitivity: PAN_READOUT_SENSITIVITY,
-            range: Some(pan_desc.range),
-            ..ScrubableNumberStyle::from_palette(p)
-        };
-        let readout_resp = ui.scrubable_number_at(
-            ("mixer_strip_pan_value", layout_idx),
-            Rect {
-                x: pan_row_x + KNOB_SIZE + PAN_READOUT_GAP,
-                y: y + (KNOB_SIZE - PAN_READOUT_H) * 0.5,
-                w: PAN_READOUT_W,
-                h: PAN_READOUT_H,
-            },
-            pan_plain,
-            // dblclick reset = センタ (`"C"`)。 ノブの dblclick (正規化 0.5) と同じ着地点。
-            0.0,
-            pan_desc.format,
-            &readout_style,
+        // `surface` には **この strip の実際の背景** を渡す。 通常 / group strip は
+        // `panel` だが return strip は緑 tint (`daw.strip_return_bg`) なので、 palette の
+        // 既定 (`panel`) 任せにすると return strip だけ可動範囲外の切り欠きが
+        // 「暗い帯」 として浮く。 caller は bg を持っているので迷わず渡せる。
+        &KnobStyle { surface: Some(bg), ..KnobStyle::BIPOLAR },
+        {
+            let target_for_change = pan_target.clone();
             move |v| {
-                // 範囲は widget が `style.range` で clamp 済だが、 表示レンジの SSoT
-                // (`AutomationValueDisplay`) を通してから model 単位へ落とす。
                 #[allow(clippy::cast_possible_truncation)]
-                let pan = pan_desc.clamp_plain(v) as f32;
+                let pan = norm_to_plain(&target_for_change, v) as f32;
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetTrackPan { track: track_idx_for_pan, pan })
+                    app.handle_event(AppEvent::SetTrackPan {
+                        track: track_idx_for_pan,
+                        pan,
+                    })
                 })
-            },
-            None,
-            // modulation の表示・depth ドラッグ面は **ノブ 1 つに集約** する
-            // (同じ param の変調を 2 箇所で編集できる状態を作らない)。
-            None,
-        );
-        // gesture (= undo 1 step + オートメーション記録) は **ノブと数値欄で 1 本**。
-        // 同じ `(track, Pan)` を key にするので、 どちらの drag でも Begin / End は
-        // 1 回ずつになるよう OR を取ってから edge 検知に渡す。 text 打ち込みは 1 回の
-        // `SetTrackPan` で完結する (= それ自体が 1 undo step) ので gesture にしない。
-        push_param_gesture(
-            ui,
-            app,
-            ParamSurface::MixerStrip,
-            track_idx,
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-            pan_resp.dragging || readout_resp.dragging,
-        );
-        y += KNOB_SIZE + 2.0;
-    }
+            }
+        },
+        pan_mod.as_ref().map(|m| m.modulation()),
+    );
+    push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &pan_target, pan_resp.mod_dragging);
+
+    // Pan の数値欄 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
+    // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
+    // `automation_value` の PAN_FORMAT が SSoT で、 inspector / automation lane と同一。
+    //
+    // **読むだけでなく編集できる**: 従来 daw_01 には pan を数値で正確に指定する手段が
+    // どこにも無く、 ノブのドラッグだけだった。 Ardour はミキサーの数値欄について
+    // 「its precise value is shown in a text field ... that doubles as a way to type in a
+    // numeric value」 と明記している。 ここは `scrubable_number_at` (drag で微調整 /
+    // click で打ち込み / dblclick でセンタへリセット) をそのまま使う = inspector /
+    // automation lane header / export range と同じ idiom (bespoke な編集バッファを作らない)。
+    //
+    // 値は **knob の `displayed_value`** から取る: knob を drag / dblclick reset している
+    // 間は model より widget の preview が先行するので、 app 側の pan を読むと数値だけ
+    // 1 frame 遅れる (逆に数値欄を drag している間は widget 自身の preview が優先される)。
+    let pan_desc = automation_value_display(&pan_target, None);
+    let pan_plain = norm_to_plain(&pan_target, pan_resp.displayed_value);
+    let readout_style = ScrubableNumberStyle {
+        // hover は窪みの既定ではなく 1 段持ち上げた `control`。 80px strip では
+        // 「いまどの欄を掴んでいるか」 が面から離れて見えないと読めない (inspector と同じ判断)。
+        bg_color_hovered: p.control,
+        // scrub 中の帯は accent の electric azure ではなく控えめな `scrub_drag_bg`
+        // (transport のテンポだけが暖色版を使う)。
+        bg_color_dragging: p.scrub_drag_bg,
+        font_size: PAN_READOUT_FONT,
+        pad_x: PAN_READOUT_PAD_X,
+        sensitivity: PAN_READOUT_SENSITIVITY,
+        range: Some(pan_desc.range),
+        ..ScrubableNumberStyle::from_palette(p)
+    };
+    let readout_resp = ui.scrubable_number_at(
+        ("mixer_strip_pan_value", layout_idx),
+        Rect {
+            x: pan_row_x + KNOB_SIZE + PAN_READOUT_GAP,
+            y: y + (KNOB_SIZE - PAN_READOUT_H) * 0.5,
+            w: PAN_READOUT_W,
+            h: PAN_READOUT_H,
+        },
+        pan_plain,
+        // dblclick reset = センタ (`"C"`)。 ノブの dblclick (正規化 0.5) と同じ着地点。
+        0.0,
+        pan_desc.format,
+        &readout_style,
+        move |v| {
+            // 範囲は widget が `style.range` で clamp 済だが、 表示レンジの SSoT
+            // (`AutomationValueDisplay`) を通してから model 単位へ落とす。
+            #[allow(clippy::cast_possible_truncation)]
+            let pan = pan_desc.clamp_plain(v) as f32;
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetTrackPan { track: track_idx_for_pan, pan })
+            })
+        },
+        None,
+        // modulation の表示・depth ドラッグ面は **ノブ 1 つに集約** する
+        // (同じ param の変調を 2 箇所で編集できる状態を作らない)。
+        None,
+    );
+    // gesture (= undo 1 step + オートメーション記録) は **ノブと数値欄で 1 本**。
+    // 同じ `(track, Pan)` を key にするので、 どちらの drag でも Begin / End は
+    // 1 回ずつになるよう OR を取ってから edge 検知に渡す。 text 打ち込みは 1 回の
+    // `SetTrackPan` で完結する (= それ自体が 1 undo step) ので gesture にしない。
+    push_param_gesture(
+        ui,
+        app,
+        ParamSurface::MixerStrip,
+        track_idx,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+        pan_resp.dragging || readout_resp.dragging,
+    );
+    y += KNOB_SIZE + 2.0;
 
     // 縦 fader + L/R peak meter。 Sends セクションを持つ strip では、 その
     // band の高さ分だけ fader 下端を持ち上げて領域を空ける (= caller が
     // `draw_sends_section` で同じ band geometry を使って描く)。
     let fader_top = y + 4.0;
     // `sends_band_height_fitted` はこの積み上げを定数化した値で band 高を決める。
-    // 片方だけ変えると band とフェーダーが重なるので、 非 master 経路で一致を固定する。
+    // 片方だけ変えると band とフェーダーが重なるので、 一致を固定する。
     debug_assert!(
-        is_master || (fader_top - (rect.y + head_h + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
+        (fader_top - (rect.y + head_h + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
         "STRIP_FADER_TOP_OFFSET が draw_strip の y 積み上げとずれている"
     );
     let fader_bottom = rect.y + rect.h - pad - 12.0 - sends_band_h;
@@ -733,7 +725,6 @@ fn draw_strip(
 
     let fader_db = if volume <= 0.0 { f32::NEG_INFINITY } else { 20.0 * volume.log10() };
     let track_idx_for_vol = track_idx;
-    let is_master_for_vol = is_master;
     // fader ハンドル・L/R メーター・dB 目盛り・0dB 線・
     // peak を「ただ一つの dB→ピクセル y 写像」から配置する単一 widget に統一。
     // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 68) を渡すと
@@ -748,10 +739,9 @@ fn draw_strip(
     // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
     // #110): 音量フェーダーを音でドラッグ変調。表示ドメインは「フェーダーの正規化
     // トラック位置」(dB taper) なので base も `MeterScale::db_to_frac(dB)` の frac で
-    // 渡し、`ModControlDomain::FaderDb` が volume(amp) ↔ frac を解決する。master の
-    // 出力ゲインは `TrackBuiltin(Volume)` ではないので変調対象外。
+    // 渡し、`ModControlDomain::FaderDb` が volume(amp) ↔ frac を解決する。
     let vol_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
-    let vol_mod = owner.filter(|_| !is_master).map(|o| {
+    let vol_mod = owner.map(|o| {
         let base_frac = f64::from(vol_scale.db_to_frac(fader_db));
         build_mod(app, vol_target.clone(), base_frac, ModControlDomain::FaderDb(vol_scale), o)
     });
@@ -768,30 +758,20 @@ fn draw_strip(
         move |new_db| {
             let amp = if new_db.is_finite() { 10f32.powf(new_db / 20.0) } else { 0.0 };
             Edit::mutate(move |app: &mut AppData| {
-                if is_master_for_vol {
-                    app.handle_event(AppEvent::SetMasterGain(amp));
-                } else {
-                    app.handle_event(AppEvent::SetTrackVolume {
-                        track: track_idx_for_vol,
-                        amp,
-                    });
-                }
+                app.handle_event(AppEvent::SetTrackVolume { track: track_idx_for_vol, amp });
             })
         },
         vol_mod.as_ref().map(|m| m.modulation()),
     );
-    // Phase 4 Step B: master strip は automation target を持たないので skip。
-    if !is_master {
-        push_param_gesture(
-            ui,
-            app,
-            ParamSurface::MixerStrip,
-            track_idx,
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            resp.fader.dragging,
-        );
-        push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &vol_target, resp.mod_dragging);
-    }
+    push_param_gesture(
+        ui,
+        app,
+        ParamSurface::MixerStrip,
+        track_idx,
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+        resp.fader.dragging,
+    );
+    push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &vol_target, resp.mod_dragging);
 }
 
 /// strip 下部に確保する Sends セクション band の高さ (px)。 send 行数 +

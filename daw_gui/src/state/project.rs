@@ -234,8 +234,7 @@ pub struct ProjectView {
     /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
     /// `automation_lanes_collapsed = true` を widget へ渡す。 `+` / `-` click
     /// で `ToggleTrackAutomationCollapsed` イベント経由に insert/remove。
-    /// プロジェクト保存対象ではない (= session-only): UI 状態は再起動で
-    /// 既定 (全 collapsed) に戻る。
+    /// 「見方の都合」 なので dirty は立てないが `ViewState` で保存する。
     pub expanded_automation_tracks: std::collections::HashSet<u32>,
     /// r.md #110: 折り畳んでいる Parallel / chain の id (既定は展開、閉じた id だけ持つ)。
     /// 「見方の都合」 なので dirty は立てないが `ViewState` で保存する。
@@ -245,7 +244,7 @@ pub struct ProjectView {
     /// 集合に MASTER_TRACK_ID を入れる方式は sentinel が混ざって SSoT が
     /// 曖昧、 master 専用 field の方が intent が明瞭)。 起動時 false、
     /// `ToggleTrackAutomationCollapsed { track_id: MASTER_TRACK_ID }` で flip。
-    /// session-only / Undo / save 対象外。
+    /// Undo 対象外、 dirty は立てないが `ViewState` で保存する。
     pub master_row_automation_expanded: bool,
     /// v37: アレンジで隠しているオートメーションレーン (既定は表示、隠したものだけ持つ)。
     /// パラメータを触ったときに自動生成されるレーンが入り、Alt+A (A ボタン) で全部出す /
@@ -256,8 +255,7 @@ pub struct ProjectView {
     /// global default `arrange_track_row_h` を使う。 widget の Alt+drag
     /// or 下端 splitter drag で `SetSingleTrackRowH` 発火 → ここに反映。
     /// Alt+wheel は引き続き global を変える (`SetTrackRowH`)。
-    /// session-only (= save / Undo 対象外、 必要になったら `Track.row_h`
-    /// として model 化する)。
+    /// Undo 対象外、 dirty は立てないが `ViewState` で保存する。
     pub track_row_overrides: std::collections::HashMap<u32, u16>,
     /// 下部パネル。`None` = 閉じている (アレンジが右カラムの全高を使う)、
     /// `Some(0)` = Mixer タブ、`Some(1)` = Piano Roll (Audio Editor) タブ。
@@ -289,18 +287,18 @@ pub struct ProjectView {
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
     /// default は `ARRANGE_TRACK_HEIGHT`。
     pub arrange_track_row_h: f32,
-    /// automation lane の行高 session override (= `Z` 縦ズームで選択
-    /// automation clip のレーンを画面いっぱいに拡大した一時値。 model の
-    /// `AutomationLane.height_px` は保存対象なので汚さず、 これで上書き表示する)。
+    /// automation lane の行高 override (= `Z` 縦ズームで選択 automation clip のレーンを
+    /// 画面いっぱいに拡大した値 / fit (`X`) が縮めた値。 model の `AutomationLane.height_px` は
+    /// 曲の中身なので汚さず、 これで上書き表示する)。
     /// 該当 lane の splitter resize (`set_lane_height`) と `X` (zoom back) で解除。
-    /// `track_row_overrides` の lane 版。 session-only (save / Undo 対象外)。
+    /// `track_row_overrides` の lane 版。 Undo 対象外、 dirty は立てないが `ViewState` で保存する。
     pub automation_lane_row_overrides:
         std::collections::HashMap<common::model::AutomationLaneKey, u16>,
     /// arrangement の track header 幅 (px、 default 160.0)。 header と
     /// lanes の境界 (右端 splitter) drag で gui_01 arrangement widget が
     /// `SetHeaderW` を発火 → `SetArrangeHeaderW` 経由でここを更新する。 widget は
-    /// 毎フレーム `view.header_w` としてこの値を読む。 session-only (= save /
-    /// Undo 対象外、 `arrange_track_row_h` と同じ扱い)。
+    /// 毎フレーム `view.header_w` としてこの値を読む。 Undo 対象外、 dirty は立てないが
+    /// `ViewState` で保存する (`arrange_track_row_h` と同じ扱い)。
     pub arrange_header_w: f32,
     /// ピアノロールの表示状態を **クリップごと** (`ClipKey`) に記憶する
     /// (Ableton Live / Bitwig 流)。 旧来のフラットな `pianoroll_zoom_x` 等は撤去し、
@@ -345,8 +343,8 @@ pub struct ProjectView {
     pub arrange_snap_choice: u8,
     /// Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw toggle。 ON のとき
     /// piano_roll で note 追加時の pitch を `Song.scale_at(beat).snap(pitch)` で
-    /// in-scale に寄せる。 piano_roll header の toggle で切替、 session-only
-    /// state (project save しない)。 Highlight mode が前提 (Fold mode は
+    /// in-scale に寄せる。 piano_roll header の toggle で切替、 dirty は立てないが
+    /// `ViewState` で保存する。 Highlight mode が前提 (Fold mode は
     /// widget 側で既に in-scale pitch を push する)。
     pub snap_on_draw: bool,
     /// r.md #65: プラグインエディタ窓の位置 / client サイズ (device_id → geometry)。
@@ -360,16 +358,16 @@ pub struct ProjectView {
     /// Phase 7 B5 (`docs/plan_scale.html` §4.4): piano_roll が Fold mode か。
     /// `true` で out-of-scale 行を非表示 (Ableton K キー Fold to Scale 相当)、
     /// `false` で Highlight mode (root 行強調 + in-scale 通常 + out 行 dim)。
-    /// piano_roll snap toolbar の「Fold」 toggle で切替、 session-only state。
+    /// piano_roll snap toolbar の「Fold」 toggle で切替、 dirty は立てないが `ViewState` で保存する。
     /// `Song.scale_changes` が空のときは `view.scale = None` で機能 OFF。
     pub piano_roll_fold: bool,
     /// ランチャー帯とアレンジのレーンをどう見せるか (`Tab` で巡回)。
     pub launcher_layout: common::model::LauncherLayout,
+    /// アレンジと下部パネルの境界比率 (上の取り分)。`ViewState` に保存され、
+    /// プロジェクトを開き直しても境界位置が保たれる。`0.0` = 未設定。
+    pub arrangement_split_ratio: f32,
     /// [`LauncherLayout::Both`](common::model::LauncherLayout::Both) のときの
     /// ランチャー帯の幅 (px)。`0` 以下 = 未設定 (widget の既定幅)。
-    /// アレンジと下部パネルの境界比率 (上の取り分)。`ViewState` に保存され、
-    /// プロジェクトを開き直しても境界位置が戻らない。`0.0` = 未設定。
-    pub arrangement_split_ratio: f32,
     pub launcher_width: f32,
     /// シーン 1 列の幅 (px、全列共通)。`0` 以下 = 未設定 (widget の既定幅)。
     pub launcher_scene_col_w: f32,
@@ -450,8 +448,7 @@ pub struct ProjectEphemeral {
     pub launcher_grid_rect: daw_ui_renderer::Rect,
     /// ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
     /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
-    /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
-    /// strip は solo を持たないので None 扱い。
+    /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。
     pub mixer_hovered_track: Option<u32>,
     /// r.md #129: Mixer 帯の組み込み Comp / EQ のセクションで、いまカーソルが乗っている device id
     /// (常設帯 (GR / カーブ) と開いているセクションの両方)。`Q` がこれを見て、トラックの mute

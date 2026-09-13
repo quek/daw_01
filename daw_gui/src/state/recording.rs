@@ -148,8 +148,8 @@ pub struct RecordingState {
     pub step_size_beats: f64,
     /// Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。 ON
     /// のとき MIDI 録音中の note_on pitch を `Song.scale_at(playhead).snap(pitch)`
-    /// で in-scale に寄せる。 transport bar の toggle で切替、 session-only
-    /// state。 step input (recording 停止中の MIDI input) には適用しない
+    /// で in-scale に寄せる。 transport bar の toggle で切替、 dirty は立てないが
+    /// `ViewState` で保存する。 step input (recording 停止中の MIDI input) には適用しない
     /// (= pitch を「聞いて」 決める用途、 Cubase / Bitwig も同方針)。
     pub snap_live_input: bool,
 }
