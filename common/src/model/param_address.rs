@@ -152,8 +152,70 @@ impl Song {
         self.param_stores_mut(track_id)?.0.iter_mut().find(|l| l.id == lane_id)
     }
 
+    /// dangling な参照を全部掃除する: 信号経路 ([`Self::prune_dangling_routes`]) → パラメーターの束縛
+    /// ([`Self::prune_dangling_param_targets`]) の順 (send を消すと、その SendGain のレーン / 変調が
+    /// dangling になる。逆向きの依存は無い)。**冪等**。`enforce_edit_invariants` と `normalize_after_load` の一部。
+    pub fn prune_dangling_refs(&mut self) -> bool {
+        self.prune_dangling_routes() | self.prune_dangling_param_targets()
+    }
+
+    /// 消えたトラック / chain を id で指す**信号経路**を掃除する。**冪等**。
+    ///
+    /// - aux 入力 (plugin / 内蔵 Comp・Bus Comp の SC) と envelope follower の tap: source が無ければ
+    ///   `None` (入力なし。device / モジュレーター本体と設定は残す)
+    /// - plugin の aux 出力 (パラアウト): 宛先トラックが無ければ `None`
+    /// - send: 宛先トラックが無ければ削除 (その SendGain のレーン / 変調は `prune_dangling_param_targets` が落とす)
+    ///
+    /// 削除の口 (トラック削除 / chain 削除 / Parallel 解除) ごとに掃除を書かない — どの口で消えても
+    /// SongDoc の `enforce_edit_invariants` が同じ undo step でここを通す。
+    pub fn prune_dangling_routes(&mut self) -> bool {
+        let tracks: HashSet<u32> = self.tracks.iter().map(|t| t.id).collect();
+        let mut chains: HashSet<u64> = HashSet::new();
+        for devices in self.tracks.iter().map(|t| t.devices.as_slice()).chain(std::iter::once(self.master_fx_chain.as_slice())) {
+            for_each_chain(devices, &mut |_, c| {
+                chains.insert(c.id);
+            });
+        }
+        let resolves = |source: TapSource| match source {
+            TapSource::Track(t) => tracks.contains(&t),
+            TapSource::Chain(c) => chains.contains(&c),
+        };
+        let mut changed = false;
+        let Song { tracks: owned, master_fx_chain, mod_sources, .. } = self;
+        for devices in owned.iter_mut().map(|t| &mut t.devices).chain(std::iter::once(master_fx_chain)) {
+            for_each_aux_slot_mut(devices, &mut |_, _, slot| {
+                if slot.is_some_and(|r| !resolves(r.tap.source)) {
+                    *slot = None;
+                    changed = true;
+                }
+            });
+            for_each_plugin_mut(devices, &mut |p| {
+                for slot in &mut p.aux_outputs {
+                    if slot.is_some_and(|r| !tracks.contains(&r.dest_track)) {
+                        *slot = None;
+                        changed = true;
+                    }
+                }
+            });
+        }
+        for t in owned.iter_mut() {
+            let n = t.sends.len();
+            t.sends.retain(|s| tracks.contains(&s.dest_track_id));
+            changed |= t.sends.len() != n;
+        }
+        for m in mod_sources.iter_mut() {
+            if let Some(tap) = m.follower_tap_mut()
+                && tap.is_some_and(|t| !resolves(t.source))
+            {
+                *tap = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// dangling な lane / routing / MIDI binding を**固定点まで**掃除する。**冪等** (2 回目は
-    /// `false`)。`enforce_edit_invariants` と `normalize_after_load` の一部。
+    /// `false`)。[`Self::prune_dangling_refs`] の後段。
     ///
     /// 残す条件は `keep_target` の表 (id で束縛する target は「その id の node が実在し、
     /// その store の持ち主に居る」)。変調を 1 本消すとその深さを指す変調 / レーンが dangling に
@@ -161,10 +223,7 @@ impl Song {
     pub fn prune_dangling_param_targets(&mut self) -> bool {
         let mut changed_any = false;
         loop {
-            let nodes = self.node_table();
-            let live_sources: HashSet<u32> = self.mod_sources.iter().map(|m| m.id).collect();
-            let live_routings: HashSet<u32> = self.all_mod_routings().map(|r| r.id).collect();
-            let ctx = PruneCtx { nodes: &nodes, live_sources: &live_sources, live_routings: &live_routings };
+            let ctx = self.prune_ctx();
             let mut changed = false;
             let mut sweep = |owner: u32, lanes: &mut Vec<AutomationLane>, routings: &mut Vec<ModRouting>| {
                 let (nl, nr) = (lanes.len(), routings.len());
@@ -186,8 +245,8 @@ impl Song {
         }
     }
 
-    /// 全チェーンの node (plugin / native / Parallel / chain) → (持ち主, 種類)。
-    fn node_table(&self) -> HashMap<u64, (u32, NodeKind)> {
+    /// 残す判定の表 (node / 生きている変調ソース・変調 / トラック / 各トラックの send)。
+    fn prune_ctx(&self) -> PruneCtx {
         let mut nodes = HashMap::new();
         let owners = self
             .tracks
@@ -197,7 +256,13 @@ impl Song {
         for (owner, devices) in owners {
             collect_nodes(devices, owner, &mut nodes);
         }
-        nodes
+        PruneCtx {
+            nodes,
+            live_sources: self.mod_sources.iter().map(|m| m.id).collect(),
+            live_routings: self.all_mod_routings().map(|r| r.id).collect(),
+            tracks: self.tracks.iter().map(|t| t.id).collect(),
+            sends: self.tracks.iter().map(|t| (t.id, t.sends.iter().map(|s| s.id).collect())).collect(),
+        }
     }
 }
 
@@ -221,13 +286,17 @@ fn collect_nodes(devices: &[Device], owner: u32, out: &mut HashMap<u64, (u32, No
     }
 }
 
-struct PruneCtx<'a> {
-    nodes: &'a HashMap<u64, (u32, NodeKind)>,
-    live_sources: &'a HashSet<u32>,
-    live_routings: &'a HashSet<u32>,
+struct PruneCtx {
+    /// 全チェーンの node (plugin / native / Parallel / chain) → (持ち主, 種類)。
+    nodes: HashMap<u64, (u32, NodeKind)>,
+    live_sources: HashSet<u32>,
+    live_routings: HashSet<u32>,
+    tracks: HashSet<u32>,
+    /// トラック id → そのトラックの send id。
+    sends: HashMap<u32, Vec<u32>>,
 }
 
-impl PruneCtx<'_> {
+impl PruneCtx {
     fn node_is(&self, id: u64, owner: u32, kind: NodeKind) -> bool {
         self.nodes.get(&id) == Some(&(owner, kind))
     }
@@ -247,7 +316,9 @@ impl PruneCtx<'_> {
                 B::ParallelOutGain { parallel_id }
                 | B::ParallelSplitFreq { parallel_id, .. }
                 | B::ParallelSelect { parallel_id } => self.node_is(*parallel_id, owner, NodeKind::Parallel),
-                B::Volume | B::Pan | B::Mute | B::SendGain { .. } => true,
+                // その store の持ち主のトラックに、その id の send がある (master の store に send は無い)。
+                B::SendGain { send_id, .. } => self.sends.get(&owner).is_some_and(|ids| ids.contains(send_id)),
+                B::Volume | B::Pan | B::Mute => true,
             },
             AutomationTarget::MasterLimiter(_)
             | AutomationTarget::SongTempo
@@ -260,7 +331,8 @@ impl PruneCtx<'_> {
         }
     }
 
-    /// MIDI binding を残すか (device は持ち主を問わず実在と種類で判定する)。
+    /// MIDI binding を残すか (device は持ち主を問わず実在と種類で判定する)。トラックを指すものはトラックの実在。
+    /// 列 (scene) を指すものは列の削除の口 (`delete_scenes`) が落とす。
     fn keep_binding(&self, target: &BindingTarget) -> bool {
         match target {
             BindingTarget::PluginParam { device_id, .. } => {
@@ -269,15 +341,15 @@ impl PruneCtx<'_> {
             BindingTarget::NativeParam { device_id, param } => {
                 param.exists() && matches!(self.nodes.get(device_id), Some((_, NodeKind::Native(k))) if *k == param.kind())
             }
+            BindingTarget::TrackVolume(track_id)
+            | BindingTarget::TrackPan(track_id)
+            | BindingTarget::LaunchCell { track_id, .. }
+            | BindingTarget::StopLauncherRow { track_id }
+            | BindingTarget::SwitchRowToArranger { track_id } => self.tracks.contains(track_id),
             BindingTarget::MasterLimiter(_)
-            | BindingTarget::TrackVolume(_)
-            | BindingTarget::TrackPan(_)
             | BindingTarget::SongTempo
-            | BindingTarget::LaunchCell { .. }
             | BindingTarget::LaunchScene { .. }
-            | BindingTarget::StopLauncherRow { .. }
             | BindingTarget::StopAllLauncherRows
-            | BindingTarget::SwitchRowToArranger { .. }
             | BindingTarget::SwitchAllToArranger => true,
         }
     }
@@ -292,27 +364,21 @@ impl Song {
     /// `owner` の store 自体が在るかは見ない (呼び出し側が `param_stores` で確かめる)。
     #[must_use]
     pub fn param_target_resolves(&self, target: &AutomationTarget, owner: u32) -> bool {
-        self.with_prune_ctx(|ctx| ctx.keep_target(target, owner))
+        self.prune_ctx().keep_target(target, owner)
     }
 
     /// MIDI binding の `target` が、実在する node / 住所を指すか (device は持ち主を問わず実在と種類)。
     #[must_use]
     pub fn binding_target_resolves(&self, target: &BindingTarget) -> bool {
-        self.with_prune_ctx(|ctx| ctx.keep_binding(target))
+        self.prune_ctx().keep_binding(target)
     }
 
     /// `owner` の store に置く「`source_id` のモジュレーターで `target` を変調する」routing が残るか
     /// (prune の routing の retain と同じ式: ソースが実在し、`target` がその store で解決する)。
     #[must_use]
     pub fn mod_routing_resolves(&self, target: &AutomationTarget, source_id: u32, owner: u32) -> bool {
-        self.with_prune_ctx(|ctx| ctx.live_sources.contains(&source_id) && ctx.keep_target(target, owner))
-    }
-
-    fn with_prune_ctx<R>(&self, f: impl FnOnce(&PruneCtx<'_>) -> R) -> R {
-        let nodes = self.node_table();
-        let live_sources: HashSet<u32> = self.mod_sources.iter().map(|m| m.id).collect();
-        let live_routings: HashSet<u32> = self.all_mod_routings().map(|r| r.id).collect();
-        f(&PruneCtx { nodes: &nodes, live_sources: &live_sources, live_routings: &live_routings })
+        let ctx = self.prune_ctx();
+        ctx.live_sources.contains(&source_id) && ctx.keep_target(target, owner)
     }
 }
 
@@ -417,5 +483,88 @@ mod tests {
         assert_eq!(bound.len(), 3, "{bound:?}");
         assert!(bound.iter().all(|b| !matches!(b, BindingTarget::PluginParam { device_id: 77, .. } | BindingTarget::NativeParam { device_id: 99, .. })));
         assert!(!song.prune_dangling_param_targets(), "2 回目は変化しない");
+    }
+
+    /// トラック 1 (chain 11 を持つ Parallel) / 2 / 3 と、それらを読む配線を全部持つ Song。
+    /// トラック 3 の plugin 30 の aux 入力 = [トラック 2, chain 11]、aux 出力 = [トラック 2]、send = トラック 2 宛て、
+    /// トラック 3 の組み込み Comp 32 の SC = トラック 2、MIDI binding はトラック 2 の音量 / パン / ランチャー。
+    fn routed_song() -> Song {
+        use T::TrackBuiltin as TB;
+        use AutomationTarget as T;
+        let mut p = Parallel::new();
+        p.id = 10;
+        p.chains[0].id = 11;
+        let mut plugin = PluginInstance { id: 30, ..PluginInstance::new("p30".into(), PluginFormat::Clap) };
+        plugin.aux_inputs = vec![
+            Some(AuxInputRoute { tap: AudioTap::new(TapSource::Track(2), TapPoint::PostFader) }),
+            Some(AuxInputRoute { tap: AudioTap::new(TapSource::Chain(11), TapPoint::PostFx) }),
+        ];
+        plugin.aux_outputs = vec![Some(AuxOutputRoute::to_track(2))];
+        let mut comp = NativeDevice::new_builtin(NativeKind::Comp, 32);
+        comp.aux_input = Some(AuxInputRoute { tap: AudioTap::new(TapSource::Track(2), TapPoint::PostFader) });
+        let send = Send { id: 7, dest_track_id: 2, gain: 1.0, mode: SendMode::PostFader, enabled: true };
+        let t3 = Track {
+            id: 3,
+            devices: vec![Device::Plugin(plugin), Device::Native(comp), builtin(NativeKind::Eq, 33)],
+            sends: vec![send],
+            automation_lanes: vec![lane(TB(TrackBuiltinParam::SendGain { send_id: 7, legacy_send_idx: None }))],
+            mod_routings: vec![routing(1, TB(TrackBuiltinParam::SendGain { send_id: 7, legacy_send_idx: None }))],
+            ..Track::default()
+        };
+        let t1 = Track {
+            id: 1,
+            devices: vec![Device::Parallel(p), builtin(NativeKind::Comp, 12), builtin(NativeKind::Eq, 13)],
+            ..Track::default()
+        };
+        let t2 = Track { id: 2, devices: vec![builtin(NativeKind::Comp, 20), builtin(NativeKind::Eq, 21)], ..Track::default() };
+        Song {
+            tracks: vec![t1, t2, t3],
+            master_fx_chain: vec![builtin(NativeKind::BusComp, 40), builtin(NativeKind::ToneEq, 41)],
+            mod_sources: vec![ModSource { id: 1, owner_track_id: 3, color: [1.0; 3], kind: ModSourceKind::default(), enabled: true }],
+            midi_bindings: vec![
+                binding(BindingTarget::TrackVolume(2)),
+                binding(BindingTarget::TrackPan(2)),
+                binding(BindingTarget::LaunchCell { track_id: 2, scene_id: 1 }),
+                binding(BindingTarget::StopLauncherRow { track_id: 2 }),
+                binding(BindingTarget::SwitchRowToArranger { track_id: 2 }),
+                binding(BindingTarget::TrackVolume(3)),
+            ],
+            ..Song::default()
+        }
+    }
+
+    /// 消えたトラック / chain を指す信号経路 (aux 入力 / aux 出力 / send) と MIDI binding は、編集後の
+    /// 不変条件の口が掃除する。aux 入力は「入力なし」、aux 出力は「宛先なし」、send は削除 (その SendGain の
+    /// レーン / 変調も落ちる)、binding は削除。実在する参照は触らない。2 回目は変化しない。
+    #[test]
+    fn enforce_prunes_routes_and_bindings_to_removed_tracks_and_chains() {
+        let mut song = routed_song();
+        assert!(!song.enforce_edit_invariants(), "前提: 全部実在するので不動点");
+        song.tracks.retain(|t| t.id != 2);
+        if let Some(Device::Parallel(p)) = song.tracks[0].devices.first_mut() {
+            p.chains.clear();
+        }
+        assert!(song.enforce_edit_invariants());
+        let t3 = song.track_by_id(3).expect("t3");
+        let Some(Device::Plugin(plugin)) = t3.devices.first() else { panic!("plugin") };
+        assert_eq!(plugin.aux_inputs, vec![None, None], "消えたトラック / chain を読む aux 入力は入力なし");
+        assert_eq!(plugin.aux_outputs, vec![None], "消えたトラック宛ての aux 出力は宛先なし");
+        assert_eq!(song.native_by_id(32).and_then(|n| n.aux_input), None, "内蔵 Comp の SC も同じ");
+        assert!(t3.sends.is_empty(), "消えたトラック宛ての send は消える");
+        assert!(t3.automation_lanes.is_empty() && t3.mod_routings.is_empty(), "消えた send の SendGain も落ちる");
+        let bound: Vec<BindingTarget> = song.midi_bindings.iter().map(|b| b.target).collect();
+        assert_eq!(bound, vec![BindingTarget::TrackVolume(3)], "消えたトラックを指す binding だけ落ちる");
+        assert!(!song.enforce_edit_invariants(), "2 回目は変化しない");
+    }
+
+    /// 送り先の send が無い SendGain は、その store に send が無ければ残らない (master の store にも send は無い)。
+    #[test]
+    fn send_gain_without_its_send_is_dangling() {
+        let gain = |send_id| AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id, legacy_send_idx: None });
+        let song = routed_song();
+        assert!(song.param_target_resolves(&gain(7), 3));
+        assert!(!song.param_target_resolves(&gain(8), 3), "無い send id");
+        assert!(!song.param_target_resolves(&gain(7), 1), "別トラックの send");
+        assert!(!song.param_target_resolves(&gain(7), MASTER_TRACK_ID), "master に send は無い");
     }
 }

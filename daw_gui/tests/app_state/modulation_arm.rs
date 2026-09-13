@@ -62,7 +62,7 @@ fn build_app_with_two_fx_tracks() -> (AppData, u32) {
             owner_track_id: TRACK_A,
             color: [0.3, 0.7, 1.0],
             kind: ModSourceKind::EnvelopeFollower {
-                tap: AudioTap::post_fader(TRACK_A),
+                tap: Some(AudioTap::post_fader(TRACK_A)),
                 follower: FollowerConfig::default(),
             },
             enabled: true,

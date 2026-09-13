@@ -29,15 +29,18 @@ impl AppData {
         use common::model::{ModSourceKind, RandomConfig};
         // 帰属トラック = カーソルトラック (= このラックを開いているトラック)。以後
         // inspector ではこのトラックの下にだけ列挙される。
-        let owner_track_id = self.cursor_track_id().unwrap_or(0);
+        let cursor_track = self.cursor_track_id();
+        let owner_track_id = cursor_track.unwrap_or(0);
         let _ = self
             .edit_song(move |song| {
                 let id = song.alloc_mod_source_id();
                 let color = common::model::ModSource::palette_color(song.mod_sources.len());
                 let kind = match tag {
-                    // follower の follow 先は初期 = カーソルトラック。
+                    // follower の follow 先は初期 = カーソルトラック (master は音を tap できないので入力なし)。
                     ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
-                        tap: common::model::AudioTap::post_fader(owner_track_id),
+                        tap: cursor_track
+                            .filter(|&t| song.track_by_id(t).is_some())
+                            .map(common::model::AudioTap::post_fader),
                         follower: common::model::FollowerConfig::default(),
                     },
                     ModSourceKindTag::Lfo => ModSourceKind::Lfo(Default::default()),
@@ -67,7 +70,7 @@ impl AppData {
     pub(crate) fn edit_mod_source_follower(
         &mut self,
         id: u32,
-        f: impl FnOnce(&mut common::model::AudioTap, &mut common::model::FollowerConfig),
+        f: impl FnOnce(&mut Option<common::model::AudioTap>, &mut common::model::FollowerConfig),
     ) -> bool {
         self.edit_song_checked(move |song| {
             let Some(m) = song.mod_sources.iter_mut().find(|m| m.id == id) else {
@@ -587,9 +590,13 @@ impl AppData {
         });
     }
 
-    /// r.md #110: follower の source は track か同 track の Parallel 内 chain。
-    pub(crate) fn set_mod_source_tap_source(&mut self, id: u32, source: common::model::TapSource) {
-        self.edit_mod_source_follower(id, |tap, _| tap.source = source);
+    /// r.md #110: follower の source は track か同 track の Parallel 内 chain。`None` = 入力なし。
+    /// tap 点は今の配線から引き継ぐ (入力なしから配線したときは既定の Post-Fader)。
+    pub(crate) fn set_mod_source_tap_source(&mut self, id: u32, source: Option<common::model::TapSource>) {
+        self.edit_mod_source_follower(id, |tap, _| {
+            let tap_point = tap.map(|t| t.tap_point).unwrap_or_default();
+            *tap = source.map(|s| common::model::AudioTap::new(s, tap_point));
+        });
     }
 
     pub(crate) fn set_mod_source_attack(&mut self, id: u32, ms: f32) {
@@ -676,8 +683,12 @@ impl AppData {
 
     pub(crate) fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
         // tap は EnvelopeFollower{tap} 内に内包 (generator には無い)。
-        // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。
-        self.edit_mod_source_follower(id, |tap, _| tap.tap_point = tap_point);
+        // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。入力なしには点が無い。
+        self.edit_mod_source_follower(id, |tap, _| {
+            if let Some(tap) = tap {
+                tap.tap_point = tap_point;
+            }
+        });
         // tap_point は schedule の BufRef を変えるので recompile が要る。
     }
 
