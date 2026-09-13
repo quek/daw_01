@@ -921,7 +921,7 @@ impl AppData {
 
         // song を書き換え。 全 device を 1 回の edit_song で消す (undo 1 step)。
         let ids: Vec<u64> = targets.iter().map(|&(id, _)| id).collect();
-        let removed = self.edit_song(move |song| {
+        self.edit_song(move |song| {
             let removed = remove_devices_and_chains(song, &ids);
             // 副作用は **全部消してから** 評価する。 「2 本ある VOICEVOX の
             // 1 本だけ消す」 が成立するので、 途中の中間状態で判定すると
@@ -956,11 +956,7 @@ impl AppData {
                     track.group_transform = None;
                 }
             }
-            removed
         });
-        if removed.is_none() {
-            return;
-        }
         // 削除 node を指す参照 (automation lane / mod routing / MIDI binding) と、 それを深さに
         // 持つ変調の連鎖は、 上の edit の中で SongDoc の `enforce_edit_invariants` が同じ undo
         // step で掃除済み (r.md #129)。 消えた id を指す session 状態 (選択 / Listen / Learn 待ち /
