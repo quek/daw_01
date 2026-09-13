@@ -635,6 +635,8 @@ pub fn sanitize_tracks(mut payload: TracksCopy) -> TracksCopy {
         } else {
             0.0
         };
+        // r.md #129: 内蔵 device の値はフィールド単位で有限・値域内へ (NaN / inf を model に入れない)。
+        common::model::for_each_native_mut(&mut tc.track.devices, &mut common::model::NativeDevice::sanitize);
     }
     payload
 }
@@ -659,6 +661,8 @@ pub fn sanitize_devices(devices: Vec<DeviceCopy>) -> Vec<DeviceCopy> {
                 p.aux_inputs.truncate(MAX_AUX_PORTS);
                 p.aux_outputs.truncate(MAX_AUX_PORTS);
             });
+            // r.md #129: 内蔵 device の値はフィールド単位で有限・値域内へ (NaN / inf を model に入れない)。
+            common::model::for_each_native_mut(std::slice::from_mut(&mut d.device), &mut common::model::NativeDevice::sanitize);
             d
         })
         .collect()

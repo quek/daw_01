@@ -82,6 +82,31 @@ rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 INFINITE_RE='WaitForSingleObject[(][^,]*,[[:space:]]*INFINITE'
 UNTAGGED_RE='^[[:space:]]*#[[]serde[(]untagged[)][]]'
 PROTOCOL_RE='(MainToChild|ChildToMain)'
+# check 14 (WIRE-SOURCES): wire 型の印 (bincode の derive / impl。grep -w で単語一致) と、
+# common/build.rs の WIRE_SOURCES に並ぶ `"src/…rs"` 文字列。
+WIRE_TOKEN='Encode'
+WIRE_ENTRY_RE='"src/[^"]+[.]rs"'
+
+# wire_registered <build.rs の中身> — WIRE_SOURCES の登録を `common/src/…rs` で 1 行ずつ出す。
+wire_registered() {
+    printf '%s\n' "$1" | grep -oE "$WIRE_ENTRY_RE" | while IFS= read -r _q; do
+        _q="${_q#\"}"
+        printf 'common/%s\n' "${_q%\"}"
+    done
+}
+
+# wire_unregistered <Encode を持つ path 列> <登録 path 列> — 登録に無い path を 1 行ずつ出す。
+wire_unregistered() {
+    while IFS= read -r _p; do
+        [ -n "$_p" ] || continue
+        case "$NL$2$NL" in
+            *"$NL$_p$NL"*) : ;;
+            *) printf '%s\n' "$_p" ;;
+        esac
+    done <<EOF
+$1
+EOF
+}
 
 # positional キーの検出 (不変条件 1)。 **連想コンテナのキーがタプル** という形だけを
 # 見る。 「(u32, u32) の並び」そのものを見るパターンは repo に 40 件当たり、その 8 割が
@@ -135,6 +160,18 @@ printf 'WaitForSingleObject(h, INFINITE); // arch-lint: allow-infinite\n' \
     | grep -E "$INFINITE_RE" | strip_allowed infinite | grep -q . && canary_ok=0
 printf 'p: HashMap<(u32, u32), SizePool>, // arch-lint: allow-positional-key\n' \
     | awk "$POSKEY_AWK" | strip_allowed positional-key | grep -q . && canary_ok=0
+# WIRE-SOURCES: 登録の抽出 / Encode の単語一致 / 未登録の差分 が実際に効くこと。
+_wire_c_reg="$(wire_registered 'const WIRE_SOURCES: &[&str] = &[
+    "src/wire.rs",
+    "src/model/native/comp.rs",
+];')"
+[ "$_wire_c_reg" = "common/src/wire.rs${NL}common/src/model/native/comp.rs" ] || canary_ok=0
+printf '#[derive(Debug, Encode, Decode)]\n' | grep -qw "$WIRE_TOKEN" || canary_ok=0
+printf 'impl<C> bincode::Encode for PluginInstance {\n' | grep -qw "$WIRE_TOKEN" || canary_ok=0
+printf 'let v = encode_to_vec(x); struct Encoder;\n' | grep -qw "$WIRE_TOKEN" && canary_ok=0
+[ "$(wire_unregistered "common/src/wire.rs${NL}common/src/model/new.rs" "$_wire_c_reg")" = "common/src/model/new.rs" ] \
+    || canary_ok=0
+[ -z "$(wire_unregistered "common/src/model/native/comp.rs" "$_wire_c_reg")" ] || canary_ok=0
 if [ "$canary_ok" -ne 1 ]; then
     printf 'arch-lint: [SELF-BROKEN] 検査器の正規表現が効いていません。\n' >&2
     printf '  この環境の grep に既知のパターンが通りませんでした。違反ゼロの報告は信用できません。\n' >&2
@@ -643,6 +680,32 @@ record UI-DOMAIN grep "daw-ui core に DAW ドメイン/mirror 機構が残存 (
 #     (パターンを shell に書かない = 上の backslash 節の方針)。
 hits=$(list_empty_dirs || true)
 record EMPTY-DIR firstfield "追跡外の空ディレクトリ (git では見えない。原因を直して削除する。.gitignore に足さない):" "$hits"
+
+# 14. WIRE_SOURCES の登録漏れ (不変条件 7、r.md #129)。common/src 下で bincode の `Encode` を
+#     derive / impl しているファイルは common/build.rs の WIRE_SOURCES に載っていなければならない。
+#     載せ忘れると protocol を変えても fingerprint が変わらず、ビルド世代の混在が接続時に検出されずに
+#     decode 失敗 (= 無音) として出る。
+#     repr(C) の shmem 型 (audio_bridge / device_scope_bridge など) は `Encode` を持たないので
+#     **この検査では拾えない** — build.rs への手動列挙のまま。
+#     コメント中の `Encode` は strip_comments が落とす。mode は firstfield (hits が path だけ)。
+_wire_enc_lines=$(grep -rnw --include='*.rs' "$WIRE_TOKEN" common/src 2>/dev/null | strip_comments || true)
+_wire_enc=""
+while IFS= read -r _l; do
+    [ -n "$_l" ] || continue
+    _p="${_l%%:*}"
+    contains "$_wire_enc" "$_p" || _wire_enc="$_wire_enc$_p$NL"
+done <<EOF
+$_wire_enc_lines
+EOF
+_wire_reg="$(wire_registered "$(cat common/build.rs 2>/dev/null)")"
+# 「1 件も出なかった」を「違反ゼロ」と読まない: common には wire 型が必ずあり、build.rs にも登録がある。
+if [ -z "$_wire_enc" ] || [ -z "$_wire_reg" ]; then
+    printf 'arch-lint: [SELF-BROKEN] WIRE-SOURCES 検査が走査できませんでした (Encode %s 件 / 登録 %s 件)。\n' \
+        "$(printf '%s' "$_wire_enc" | grep -c .)" "$(printf '%s\n' "$_wire_reg" | grep -c .)" >&2
+    exit 1
+fi
+hits=$(wire_unregistered "$_wire_enc" "$_wire_reg")
+record WIRE-SOURCES firstfield "bincode の Encode を持つのに common/build.rs の WIRE_SOURCES に未登録 (fingerprint が protocol の変更を検出できない):" "$hits"
 
 # ---------------------------------------------------------------- 判定
 # 「検査器が実際に何を見たか」を毎回可視化する (出力が空 = 違反ゼロ、を信じないための土台)。
