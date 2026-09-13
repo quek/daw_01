@@ -353,10 +353,7 @@ pub(super) fn draw_parallel_begin_row(
         move |v| {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
-                        parallel_id,
-                        edit: ParallelMixerEdit::GainMatch(v),
-                    }));
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(v) }));
                 }
             })
         },
@@ -376,10 +373,7 @@ pub(super) fn draw_parallel_begin_row(
             move |v| {
                 let gain = v * 2.0;
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
-                        parallel_id,
-                        edit: ParallelMixerEdit::OutGain(gain),
-                    }));
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(gain) }));
                 })
             },
             None,

@@ -68,10 +68,7 @@ pub(super) fn draw_chain_row(
         move |v| {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::Device(DeviceEvent::SetChainMixer {
-                        chain_id,
-                        edit: ChainMixerEdit::Solo(v),
-                    }));
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetChainMixer { chain_id, edit: ChainMixerEdit::Solo(v) }));
                 }
             })
         },
@@ -86,10 +83,7 @@ pub(super) fn draw_chain_row(
         move |v| {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::Device(DeviceEvent::SetChainMixer {
-                        chain_id,
-                        edit: ChainMixerEdit::Muted(v),
-                    }));
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetChainMixer { chain_id, edit: ChainMixerEdit::Muted(v) }));
                 }
             })
         },
