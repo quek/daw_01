@@ -175,7 +175,7 @@ transport (44)
 ┌────────────┬──────────────────────────┬─────────────┐
 │            │ arrangement              │  MASTER     │  ← 新パネル
 │ inspector  ├──────────────────────────┤  spectrum   │     (幅可変、
-│ (280 固定) │ bottom (mixer/pianoroll) │  scope      │      境界ドラッグ)
+│ (360 固定) │ bottom (mixer/pianoroll) │  scope      │      境界ドラッグ)
 │            │                          │  gonio      │
 └────────────┴──────────────────────────┴─────────────┘
 status (24)
