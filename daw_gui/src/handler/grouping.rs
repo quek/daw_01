@@ -184,9 +184,6 @@ impl AppData {
         plan: &[TrackRemovalIpc],
         audio_editor_key: Option<common::model::ClipKey>,
     ) {
-        // Song 側の派生の後始末: 消えたトラックが所有していたモジュレーター (と、その変調の深さを指すレーン /
-        // 変調)、ソースを失った口 track の生成物。
-        self.cleanup_modulation_after_track_removal();
         self.reap_orphan_lipsync();
         // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ (audio worker が destroyed plugin を
         // dispatch しないよう、audio 側の mapping を先に落とす)。

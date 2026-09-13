@@ -30,7 +30,7 @@ type Taken = HashMap<NativeKind, BTreeSet<u16>>;
 /// - device node (plugin / native / Parallel / chain) の id と木の形、native の種類・builtin・番号
 /// - 信号経路が指す id: aux 入力の source (plugin / native)、plugin の aux 出力の宛先、send の id と宛先
 /// - lane の id と target、変調 routing の id・ソース・target
-/// - 変調ソースの id と follower の source、MIDI binding の target
+/// - 変調ソースの id・帰属トラック・follower の source、MIDI binding の target
 ///
 /// 値 (params / volume / 点列 / bypass / tap 点) と、clip / content / media source / section / scene の id は含まない。
 /// 比べるのは前回の観測の写し全体 (ハッシュではない) なので、取り違えは起きない。
@@ -81,7 +81,7 @@ enum ShapeItem {
     ChainEnd,
     Lane { id: u32, target: AutomationTarget },
     Routing { id: u32, source_id: u32, target: AutomationTarget },
-    Source { id: u32, follows: Option<TapSource> },
+    Source { id: u32, owner: u32, follows: Option<TapSource> },
     Binding(BindingTarget),
 }
 
@@ -113,6 +113,7 @@ fn capture_structure(song: &Song, out: &mut Vec<ShapeItem>) {
     }
     out.extend(song.mod_sources.iter().map(|m| ShapeItem::Source {
         id: m.id,
+        owner: m.owner_track_id,
         follows: m.follower().and_then(|(tap, _)| tap).map(|t| t.source),
     }));
     out.extend(song.midi_bindings.iter().map(|b| ShapeItem::Binding(b.target)));
@@ -551,6 +552,7 @@ mod tests {
         ("send の宛先を消えたトラックに", |s| s.tracks[0].sends[0].dest_track_id = 9),
         ("send を消す", |s| s.tracks[0].sends.clear()),
         ("follower の source を消えたトラックに", |s| s.mod_sources[0].kind = follower_of(9)),
+        ("モジュレーターの帰属を消えたトラックに", |s| s.mod_sources[0].owner_track_id = 9),
         ("SC を外す", |s| native(s, 14).aux_input = None),
     ];
 

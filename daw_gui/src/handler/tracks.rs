@@ -327,37 +327,18 @@ impl AppData {
                 Some(old) if same_project && song.track_by_id(old).is_some() => Some(old),
                 _ => drop_parent,
             };
-            // A5 sibling (r.md #8) / v29: send を間引いたら、 消えた send の
-            // SendGain automation lane / mod routing を除去する。 生き残った
-            // send は安定 id ごと clone されるので lane は自動で追従する
-            // (旧 positional 版の「後続 index 詰め」= reindex_send_gain_lanes
-            // は id 化で不要になり model から削除済み)。
-            let mut removed_send_ids: Vec<u32> = Vec::new();
+            // 宛先を集合内の新 id へ貼り替え、解決できない send (別プロジェクト / 居ない宛先) は落とす。
+            // 生き残った send は安定 id ごと clone されるので lane は自動で追従する。落とした send の
+            // SendGain のレーン / 変調は、この編集の後の不変条件 (`Song::prune_dangling_param_targets`) が
+            // 同じ undo step で落とす (ここで個別に掃除しない)。
             t.sends.retain_mut(|s| {
-                let survives = if let Some(&new) = track_remap.get(&s.dest_track_id) {
+                if let Some(&new) = track_remap.get(&s.dest_track_id) {
                     s.dest_track_id = new;
                     true
                 } else {
                     same_project && song.track_by_id(s.dest_track_id).is_some()
-                };
-                if !survives {
-                    removed_send_ids.push(s.id);
                 }
-                survives
             });
-            if !removed_send_ids.is_empty() {
-                let is_removed_send_gain = |target: &common::model::AutomationTarget| {
-                    matches!(
-                        target,
-                        common::model::AutomationTarget::TrackBuiltin(
-                            common::model::TrackBuiltinParam::SendGain { send_id, .. }
-                        ) if removed_send_ids.contains(send_id)
-                    )
-                };
-                t.automation_lanes
-                    .retain(|l| !is_removed_send_gain(&l.target));
-                t.mod_routings.retain(|r| !is_removed_send_gain(&r.target));
-            }
             // v29: device の安定 id は Song-global unique が不変条件。 clone
             // した devices の id を再採番し、 track 内 automation lane /
             // mod routing の PluginParam 参照を新 id へ貼り替える (元 track と

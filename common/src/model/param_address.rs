@@ -152,11 +152,28 @@ impl Song {
         self.param_stores_mut(track_id)?.0.iter_mut().find(|l| l.id == lane_id)
     }
 
-    /// dangling な参照を全部掃除する: 信号経路 ([`Self::prune_dangling_routes`]) → パラメーターの束縛
-    /// ([`Self::prune_dangling_param_targets`]) の順 (send を消すと、その SendGain のレーン / 変調が
-    /// dangling になる。逆向きの依存は無い)。**冪等**。`enforce_edit_invariants` と `normalize_after_load` の一部。
+    /// dangling な参照を全部掃除する: 信号経路 ([`Self::prune_dangling_routes`]) → 帰属トラックの消えた
+    /// モジュレーター ([`Self::prune_orphan_mod_sources`]) → パラメーターの束縛 ([`Self::prune_dangling_param_targets`])
+    /// の順 (send / モジュレーターを消すと、その SendGain のレーン / 変調・そのソースの変調が dangling になる。
+    /// 逆向きの依存は無い)。**冪等**。`enforce_edit_invariants` と `normalize_after_load` の一部。
     pub fn prune_dangling_refs(&mut self) -> bool {
-        self.prune_dangling_routes() | self.prune_dangling_param_targets()
+        self.prune_dangling_routes() | self.prune_orphan_mod_sources() | self.prune_dangling_param_targets()
+    }
+
+    /// 帰属トラック (`ModSource::owner_track_id`) が消えたモジュレーターを外す。**冪等**。
+    ///
+    /// ラックはモジュレーターを帰属トラックの下にしか列挙しないので、残すとどの画面にも出ず削除できないまま、
+    /// 生き残ったトラックの param を変調し続ける (LFO / Random / MSEG / Steps は曲位置の純関数、r.md #78)。
+    /// `0` (legacy) と `MASTER_TRACK_ID` は master 帰属でトラック不在ではない。そのソースを使う変調と、その
+    /// ツマミを指すレーン / 変調は後段の `prune_dangling_param_targets` が落とす。トラックを外す経路
+    /// (削除 / グループ解除 / 末尾削除 / undo の差し替え) ごとに掃除を書かない。
+    pub fn prune_orphan_mod_sources(&mut self) -> bool {
+        let Song { tracks, mod_sources, .. } = self;
+        let n = mod_sources.len();
+        mod_sources.retain(|m| {
+            m.owner_track_id == 0 || m.owner_track_id == MASTER_TRACK_ID || tracks.iter().any(|t| t.id == m.owner_track_id)
+        });
+        mod_sources.len() != n
     }
 
     /// 消えたトラック / chain を id で指す**信号経路**を掃除する。**冪等**。
@@ -554,6 +571,23 @@ mod tests {
         assert!(t3.automation_lanes.is_empty() && t3.mod_routings.is_empty(), "消えた send の SendGain も落ちる");
         let bound: Vec<BindingTarget> = song.midi_bindings.iter().map(|b| b.target).collect();
         assert_eq!(bound, vec![BindingTarget::TrackVolume(3)], "消えたトラックを指す binding だけ落ちる");
+        assert!(!song.enforce_edit_invariants(), "2 回目は変化しない");
+    }
+
+    /// 帰属トラックが消えたモジュレーターは外れ、それを使う変調も落ちる。帰属が master (`MASTER_TRACK_ID`) /
+    /// legacy (`0`) / 実在するトラックのモジュレーターは残る。
+    #[test]
+    fn enforce_prunes_modulators_whose_owner_track_is_gone() {
+        let source = |id, owner_track_id| ModSource { id, owner_track_id, color: [1.0; 3], kind: ModSourceKind::default(), enabled: true };
+        let mut song = routed_song();
+        song.mod_sources = vec![source(1, 3), source(2, 2), source(3, 0), source(4, MASTER_TRACK_ID)];
+        let volume = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
+        song.tracks[2].mod_routings = vec![ModRouting { source_id: 2, ..routing(5, volume.clone()) }, routing(6, volume)];
+        assert!(!song.enforce_edit_invariants(), "前提: 全部の帰属トラックが居るので不動点");
+        song.tracks.retain(|t| t.id != 2);
+        assert!(song.enforce_edit_invariants());
+        assert_eq!(song.mod_sources.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3, 4]);
+        assert!(song.all_mod_routings().all(|r| r.source_id != 2), "外したモジュレーターの変調も落ちる");
         assert!(!song.enforce_edit_invariants(), "2 回目は変化しない");
     }
 
