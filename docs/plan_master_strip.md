@@ -1,11 +1,16 @@
 # マスターストリップ (バスコンプ + トーン EQ + リミッター) 設計
 
+> **r.md #129 で一部を置き換えた。** Bus Comp / Tone EQ は `master_fx_chain` 上の組み込み device
+> (`Device::Native`)、Limiter は `Song::master_limiter` になった。並べ替え・遅延の会計・オートメーション住所・
+> テレメトリは [docs/plan_rack_native_devices.md](plan_rack_native_devices.md) が正本。本書に残るのは
+> マスターパネルの見せ方とパラメータの範囲だけ。置き換えた決定は各節の冒頭に 1 行で示す。
+
 マスターバスは他チャンネルと**別物**の処理を持つ。Reason も Mixbus もそうしていて、
 理由も同じ — マスターに要るのは「潰して整える」ではなく **仕上げ** (グルー / トーンの
 微調整 / 出力を絶対に超えさせない) だから。
 
 通常チャンネルの内蔵ストリップは [docs/plan_channel_strip.md](plan_channel_strip.md)。
-そちらとは**別実装・別 UI** で、共有するのは DSP の部品 (バイクワッド / 圧縮カーブ) だけ。
+描画部品 (つまみ / カーブ / GR) は通常 ch の帯・Rack と共有する (`daw_gui/src/view/native_device/`)。
 
 参考にした一次情報:
 
@@ -30,34 +35,28 @@
 ## 1. 信号経路
 
 ```
-全 track の合算 → Comp → EQ → insert プラグイン → マスターフェーダー → リミッター → 出力
+全 track の合算 → master_fx_chain (組み込み Bus Comp / Tone EQ を含む) → マスターフェーダー → リミッター → 出力
 ```
 
-**固定順で、並べ替えもトグルも持たない。** 内蔵が先・insert が後なのは Reason の既定と
-同じ理由 — マキシマイザー / マスタリング用プラグインを挿したとき、それが (リミッターを
-除いて) 最後に来る。
+**廃止 (r.md #129)**: 「固定順で、並べ替えもトグルも持たない」。Bus Comp / Tone EQ は `master_fx_chain` 上の device で
+Rack から並べ替えられる。既存曲を開いたときの並びは今と同じ音になる `Bus Comp → Tone EQ → insert`
+— [plan_rack_native_devices.md](plan_rack_native_devices.md) §2 (Q3 / Q4 / Q6)。
 
-**リミッターだけはフェーダーの後**。ここが「最終出力を絶対に超えさせない」唯一の場所で、
-フェーダーの前に置くとフェーダーを上げた瞬間に破れる。
-
-通常トラックは `devices → Comp → EQ → Pan → Fader` のまま (§7 参照)。
+**リミッターだけはフェーダーの後で固定 (維持)**。ここが「最終出力を絶対に超えさせない」唯一の場所で、
+フェーダーの前に置くとフェーダーを上げた瞬間に破れる。Rack では末尾の動かせない行として出る (Q3)。
 
 実行場所は `render_master_buffer` (live と書き出しが共有する唯一の描画関数、不変条件 6)。
 
 ## 2. レイテンシー
 
-リミッターが **ON のときだけ**、ルックアヘッドでマスター出力に 5ms の遅延が乗る
-(Mixbus と同じ割り切り)。ミックス全体に一様に掛かるのでトラック間のズレは生まれないが、
-**出力全体が曲位置より 5ms 遅れる**ので、この量は `Schedule::master_latency_samples`
-(既存の PDC 会計) に足す — 書き出しはその分だけ窓をずらして時間軸を揃え、
-メトロノームのクリックはその分だけ前へ出す。サンプル数への換算は
-`common::model::limiter_lookahead_samples` の 1 式だけ (DSP の遅延線長と会計が
-1 サンプルも食い違わないように)。コンプと EQ は先読み無しの 0 サンプル。
+ルックアヘッドでマスター出力に 5ms の遅延が乗る (Mixbus と同じ割り切り)。ミックス全体に一様に掛かるのでトラック間の
+ズレは生まれないが、**出力全体が曲位置より 5ms 遅れる**ので、この量は `Schedule::master_latency_samples`
+(既存の PDC 会計) に足す。サンプル数への換算は `common::model::limiter_lookahead_samples` の 1 式だけ。
+コンプと EQ は先読み無しの 0 サンプル。
 
-リミッターを **OFF にすると遅延も無くなる** (素通し)。切り替えの瞬間に出力が 5ms
-飛ぶ / 詰まるので再生中に切り替えるとプツッと鳴るが、「使っていないのに常に 5ms
-遅れる」より切り替え時の一瞬を取る (grill で確定)。ON/OFF は `edit_song` を通るので
-LoadSong → schedule 再 compile が同じフレームで走り、会計も即追従する。
+**変更 (r.md #129)**: 「ON のときだけ遅延」ではなく、遅延の有無は `Song::master_limiter_latency_active()`
+(静的 on、または On のレーン / 変調がある) で compile 時に決まる。OFF に解決されている区間は遅延だけを通す
+— [plan_rack_native_devices.md](plan_rack_native_devices.md) §8.3.4 / §20-3。
 
 ## 3. UI
 
@@ -68,10 +67,10 @@ LoadSong → schedule 再 compile が同じフレームで走り、会計も即�
 ```
 +-----+----+------------------------+
 |     |    | COMP    ( 針メーター )  |   ← 上から信号順
-| fdr | LU | Thr Rat Atk Rel Gain   |
+| fdr | LU | Thr Ratio Atk / Rel Makeup |
 |  +  | bar|------------------------|
 | mtr |    | EQ    ~~ curve ~~      |
-|     |    | Lo   LoMid   Hi        |
+|     |    | Low  LoMid  High       |
 |     |    |------------------------|
 |     |    | LIM  ########   -1.0   |
 |     |    |------------------------|
@@ -81,11 +80,14 @@ LoadSong → schedule 再 compile が同じフレームで走り、会計も即�
 ```
 
 - **常時表示**。折り畳みは持たない (マスターは 1 本しかないので、全 ch 一括で畳む
-  通常 ch の事情が無い)。パネルが狭い / 低いときは、既存のラウドネス表示と同じ作法で
-  **内側から要素を落とす** (数値 → カーブ → ノブの順に諦める)。
+  通常 ch の事情が無い)。パネルが低いときは優先度の低いブロックから描かない
+  (Bus Comp > Tone EQ > Limiter)。
+- **変更 (r.md #129)**: Bus Comp と Tone EQ の上下は Rack (master チェーン) の前後に合わせて入れ替わり、Limiter は常に
+  一番下 (Q17)。上の図は既定の並び — [plan_rack_native_devices.md](plan_rack_native_devices.md) §10.9。
 - **ON/OFF は `Q` キー**。カーソルが Comp / EQ / LIM のどのブロックに乗っているかで
   対象が決まる (通常 ch の内蔵ストリップと同じ作法)。専用の ON ボタンは置かない。
-- **セクションの中身を触ったら自動で ON** — 通常 ch と同じ。
+- **セクションの中身を触ったら自動で ON** — 通常 ch と同じ (4 種共通の `NativeEdit::apply`)。
+  つまみは再生中はオートメーション値に追従し、ジェスチャー (undo 1 step / 録音) と変調 (◉) を持つ。
 
 ### 3.1 針式 GR メーター
 
@@ -112,7 +114,8 @@ Reason と同じ**アナログ針式** (`0 2 4 8 12 20 dB COMPRESSION` の円弧
 段階式なのはバスコンプの定石 (SSL バスコンプも同じ) で、選択肢が少ないぶん速く決まる。
 `Auto` は program-adaptive — 長いピークの後は遅く、短いピークの後は速く戻る。
 
-**外部サイドチェーンと検出フィルタは持たない** (Reason のミキサー側コンプも持たない)。
+**廃止 (r.md #129)**: 「外部サイドチェーンを持たない」。Bus Comp も SC▾ を持ち、plugin と同じ手順で他トラックの音で
+検出できる (Q19) — [plan_rack_native_devices.md](plan_rack_native_devices.md) §10.13。**検出フィルタは持たないまま**。
 ニーは通常 ch と同じソフトニー (`COMP_KNEE_DB`)。
 
 ### 4.2 EQ (Mixbus のトーンコントロール準拠)
@@ -125,7 +128,7 @@ Reason と同じ**アナログ針式** (`0 2 4 8 12 20 dB COMPRESSION` の円弧
 
 **周波数は動かせない。** 「最終段で大きく動かすのは事故」という Mixbus の思想どおり、
 よくある問題だけに絞る。狙った帯域を追い込むのは insert の EQ プラグインの仕事。
-カーブ表示は通常 ch と同じ `eq_magnitude_db` を流用する。
+カーブ表示は daw_audio と同じ `common::dsp::tone_eq_magnitude_db` から描く。
 
 ### 4.3 リミッター
 
@@ -144,54 +147,35 @@ Reason と同じ**アナログ針式** (`0 2 4 8 12 20 dB COMPRESSION` の円弧
 **全パラメータが対象**。master には `Track` が無いので、insert プラグインの param が既に
 使っている **song-level レーン** (`MASTER_TRACK_ID`) に載せる。
 
-```rust
-// common/src/model/automation.rs
-pub enum AutomationTarget {
-    …,
-    /// マスターストリップ (コンプ / トーン EQ / リミッター) のパラメータ。
-    MasterStrip(MasterStripParam),
-}
-```
-
-段階式のパラメータ (Ratio / Attack / Release) は **段の index** を正規化して載せる
-(`TrackBuiltin::Mute` と同じ「階段」扱い = 曲線は段になる)。
+**変更 (r.md #129)**: 住所は `MasterStrip(..)` ではなく、Bus Comp / Tone EQ は device id で束縛する
+`AutomationTarget::NativeParam { device_id, param }`、Limiter は `AutomationTarget::MasterLimiter(On | Ceiling)`
+— [plan_rack_native_devices.md](plan_rack_native_devices.md) §5.3。段階式 (Ratio / Attack / Release) は段の index を
+正規化して載せ、値の表示は `4:1` / `Auto` のような段のラベル。
 
 **マスターゲイン (フェーダー) は対象外のまま**。今回の範囲を広げない。
 
 ## 6. データモデル / 永続 / テレメトリ
 
-- `Song` に `master_strip: MasterStrip` を追加 (`#[serde(default)]`、bincode
-  `Encode/Decode`)。型は `common/src/model/track/channel_strip.rs` に同居させる
-  (レンジの SSoT である `ParamRange` と DSP の語彙を共有するため)。
-- 値は `Song` に保存し `*` (dirty) を立てる。変更は `edit_song()` チョークポイント経由、
-  audio へは値のみ更新の `AudioCommand::SetMasterStrip` で送る (graph は再 compile しない)。
-- **GR テレメトリ**: コンプとリミッターの 2 本を `AudioBridge` に足す
-  (`master_comp_gr_db` / `master_limiter_gr_db`)。マスターのメーター類は本来
-  `MasterAnalyzer` が波形から導く方針だが、**GR は波形からは導けない** (どれだけ
-  下げたかは処理側しか知らない) ので、per-track の GR と同じスカラー面に載せる。
-- RT 状態 (バイクワッド遅延 / 平滑ゲイン / ルックアヘッドリング) は `MasterStripState` に
-  持ち、engine と書き出しがそれぞれ 1 個ずつ所有する (書き出しは毎回新品 = 決定論的)。
+- **廃止 (r.md #129)**: `Song.master_strip` / `AudioCommand::SetMasterStrip` / GR 2 本 (`master_comp_gr_db` /
+  `master_limiter_gr_db` のスカラー面) / `MasterStripState`。Bus Comp / Tone EQ は native device (値 IPC は
+  `SetNativeDevice`、GR は device id キーの面)、Limiter は `Song::master_limiter` (`SetMasterLimiter`、GR は
+  `master_limiter_gr_db`)、RT 状態は `MasterLimiterState` — [plan_rack_native_devices.md](plan_rack_native_devices.md) §5 / §8 / §11。
+- 値は `Song` に保存し `*` (dirty) を立てる。変更は `edit_song()` チョークポイント経由。
+- **GR は波形からは導けない** (どれだけ下げたかは処理側しか知らない) ので、`MasterAnalyzer` ではなく処理側が面に書く
+  (この方針は維持)。
 
 ## 7. 通常トラックとの違い (なぜ揃えないか)
 
-Reason は通常 ch も `Dynamics → EQ → Inserts → Fader` (内蔵が先) だが、**daw_01 の
-通常トラックでは実現できない**。`Track.devices` は Reaper 流の単一チェーンで、MIDI FX /
-楽器 / エフェクトを役割で区別しない (不変条件 1 / 「役割判定しない」設計)。ストリップを
-チェーンの前に置くと、楽器トラックでは楽器が音を出す前に処理することになり、楽器の出力が
-ストリップを素通りする。「楽器の後・エフェクトの前」に差し込むには devices を分類する
-しかなく、それは意図的に禁じている。
-
-master の `master_fx_chain` は**純粋に insert だけ**なので、この問題が無い。
-だから master だけ Reason と同じ並びにできる — マスターだけ並びが違うことには
-この根拠がある。
+**根拠が消滅 (r.md #129)**: 「devices を分類できないので通常トラックは内蔵が後」は、組み込みをチェーン上の device にして
+ユーザーが位置を決める形で解消した。新しい device の既定の挿入位置は Q6 — [plan_rack_native_devices.md](plan_rack_native_devices.md) §5.7。
 
 ## 8. 非対象 (意図的に持たないもの)
 
 - モニターセクション / Control Room 出力 (マスターの後段でモニター音量・DIM・MONO を
-  持ち、書き出しには乗らない段)。**現状 daw_01 には無い。** 作るなら通常 ch の
-  `SC Listen` もそこへ移すのが筋。
+  持ち、書き出しには乗らない段)。**現状 daw_01 には無い。** (通常 ch の `SC Listen` は r.md #129 で
+  聴き方の状態として Song の外 (`NativeIo`) に出したので、書き出しに乗らないことは既に保証されている。)
 - テープサチュレーション (Mixbus のマスターにはある)
-- 外部サイドチェーン / 検出フィルタ (§4.1)
-- 順序の入れ替え・`Inserts Pre Comp` トグル (§1)
+- 検出フィルタ (§4.1)
+- `Inserts Pre Comp` トグル (並べ替えは Rack の D&D で行う)
 - トゥルーピーク制限 (§4.3)
 - マスターゲインのオートメーション (§5)
