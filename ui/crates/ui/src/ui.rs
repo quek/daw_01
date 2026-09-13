@@ -477,7 +477,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// `f` は `(&model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
     /// 内部動作:
     /// 1. scene を積みつつ edits を収集 (build クロージャは古い model 値で 1 度だけ実行)
-    /// 2. 収集した edits を `&mut model` に apply (forward mutation のみ)
+    /// 2. 収集した edits を `&mut model` に apply (forward mutation のみ)。順は prelude
+    ///    ([`Ui::push_prelude_edit`](crate::edit)) → 通常 ([`Ui::push_edit`])、それぞれ push 順
     /// 3. **M8**: clipboard write / file dialog 同期実行 / dialog 結果クリーンアップ
     /// 4. edits / focus 変化があった場合は `redraw_request` を呼ぶ
     ///    → 次フレームで apply 後の値で再描画される (immediate-mode + Edit queue の必然対処)
@@ -595,6 +596,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
     ///
     /// 挙動の特徴:
     /// - 戻り値の `Vec<Edit<M>>` は **apply されていない**。 caller が `apply` を呼ぶ責任を負う。
+    ///   並びがそのまま適用順: prelude ([`Ui::push_prelude_edit`](crate::edit)、push 順) → 通常
+    ///   ([`Ui::push_edit`]、push 順)。 caller は並べ替えずに先頭から apply すること。
     /// - **自動 `request_redraw` は呼ばれない**。 caller が edits 検出時に手動で
     ///   `WindowBackend::request_redraw` を呼ぶ責任を負う。
     /// - undo/redo / clipboard write / dialog 同期実行 など `Edit` 以外の副作用は
@@ -874,6 +877,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             state: &mut self.state,
             scene,
             edits: &mut edits,
+            prelude_len: 0,
             pointer: effective_pointer,
             pointer_raw: pointer,
             modal_capturing,
@@ -1037,7 +1041,11 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     control_font_size: f32,
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
-    edits: &'a mut Vec<Edit<M>>,
+    /// このフレームに積まれた Edit。先頭 [`Self::prelude_len`] 個が prelude
+    /// ([`Ui::push_prelude_edit`](crate::edit))、残りが通常 ([`Ui::push_edit`]) で、この並びが適用順。
+    pub(crate) edits: &'a mut Vec<Edit<M>>,
+    /// `edits` の先頭にある prelude の個数 (prelude は通常の Edit より先に適用される)。
+    pub(crate) prelude_len: usize,
     /// widget が読む pointer。`modal_capturing` 中の background 描画 (`drawing_in_popup ==
     /// false`) では `masked_pointer` に差し替わり (pos = None / 全 button false / scroll 0)、
     /// `popup_layer` の body 内 (`drawing_in_popup == true`) では `pointer_raw` に戻る。
@@ -1673,6 +1681,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// エディットを Scene に積む (外部 widget extension で利用可能)。
+    /// 同じフレームの [`Ui::push_prelude_edit`](crate::edit) の Edit より後に適用される。
     pub fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
     }

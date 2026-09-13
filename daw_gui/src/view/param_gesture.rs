@@ -16,6 +16,17 @@
 //!    Ctrl+Tab / Ctrl+Z でつまみが消えた) を閉じる。PluginWindow / VideoPreview は描画と無関係に
 //!    閉じるので対象外 ([`ParamSurface::swept`])。
 //!
+//! ## Begin は同じフレームの値より先に効く (prelude キュー)
+//!
+//! 申告は widget の応答 (`dragging`) を見てから積むので、widget が同じフレームに既に積んだ値の
+//! Edit より **後ろ** に並ぶ — press でクリック位置へ飛ぶ (アレンジのヘッダ音量)、ドラッグが閾値を
+//! 越えたフレームで最初の値を出す (数値欄)、ホイールの最初の notch (EQ 点の Q)。そのまま適用すると
+//! 最初の値だけが gesture の外で 1 undo step 積まれ、1 操作が 2 step に割れる。
+//!
+//! そこで **Begin だけ** を daw-ui core の prelude キュー (`Ui::push_prelude_edit`) に積み、呼び出し側の
+//! 描画順に依らず値より先に適用する。在席印と End は通常キューのまま (離したフレームに widget が
+//! 出す最後の値を、閉じる前に適用するため)。呼び出し側は「widget を描いてから申告」のままでよい。
+//!
 //! [`ProjectEphemeral::param_gesture_seen`]: crate::state::ProjectEphemeral::param_gesture_seen
 
 use common::model::AutomationTarget;
@@ -29,7 +40,7 @@ use crate::app::{AppData, AppEvent, ParamSurface};
 /// |---|---|---|
 /// | 自分の面 | true | 在席印 |
 /// | 自分の面 | false | `ParamGestureEnd` |
-/// | 誰もいない | true | `ParamGestureBegin` |
+/// | 誰もいない | true | `ParamGestureBegin` (prelude = 同じフレームの値より先) |
 /// | それ以外 (別の面が所有 / 誰も所有せず非ドラッグ) | — | 何もしない |
 pub(crate) fn push_param_gesture(
     ui: &mut Ui<'_, AppData>,
@@ -52,7 +63,7 @@ pub(crate) fn push_param_gesture(
             }));
         }
         (None, true) => {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            ui.push_prelude_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ParamGestureBegin { surface, track_id, target });
             }));
         }

@@ -156,6 +156,13 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 - テストで click を模すときは **同じフレームに `primary_just_pressed` と `primary_just_released`
   の両方** を立てる (release だけの frame は誰の click にもならない)。
 
+### 後から出る Edit を束ねる宣言は `push_prelude_edit` で積む
+
+- widget の応答 (ドラッグが始まった) を見てから積む「束ねる宣言」は、widget が同じフレームに既に積んだ
+  最初の値より後ろに並ぶ (press で飛ぶ値 / 閾値を越えたフレームの値 / ホイールの最初の notch)。
+  宣言を開く側は `Ui::push_prelude_edit` (通常の Edit より先に適用)、閉じる側は `push_edit` で積む。
+  適用順と「同じフレームに A を離して B を掴む」ときの挙動は [`crates/ui/src/edit.rs`](crates/ui/src/edit.rs) のモジュール doc。
+
 ### 子 widget がホイールを使う: `claim_wheel_in_rect` は 1 フレーム遅れで効く
 
 - `scroll_area` は **中身の closure より前に** ホイールを消費する。中に置いた widget (EQ カーブの点で
