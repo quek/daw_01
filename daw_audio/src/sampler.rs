@@ -366,7 +366,7 @@ impl SamplerRt {
 pub fn handle_device_command(
     cmd: common::protocol::AudioCommand,
     engine_shared: &crate::engine::EngineShared,
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::engine::EngineCommand>,
+    cmd_tx: &mut crate::engine::EngineCommandSender,
 ) -> bool {
     use common::protocol::AudioCommand as C;
     use crate::engine::EngineCommand as E;
@@ -385,11 +385,11 @@ pub fn handle_device_command(
             }
         },
         C::SamplerPreview { start_frame, end_frame } => {
-            let _ = cmd_tx.send(E::SamplerPreview { start: start_frame, end: end_frame });
+            cmd_tx.send(E::SamplerPreview { start: start_frame, end: end_frame });
             false
         }
         C::SamplerPreviewStop => {
-            let _ = cmd_tx.send(E::SamplerPreviewStop);
+            cmd_tx.send(E::SamplerPreviewStop);
             false
         }
         _ => false,

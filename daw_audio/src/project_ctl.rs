@@ -9,15 +9,16 @@
 //! - `LoadSong` に伴う audio clip renderer の publish と、background decode worker。
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 
 use common::audio_bridge::AudioBridgeHandle;
+use common::device_scope_bridge::MAX_DEVICE_SCOPES;
 use common::protocol::{AudioCommand, ProjectKey};
 
 use crate::engine::{
-    self, EngineCommand, EngineShared, PluginEntry, ProjectDelivery, ProjectRt, ProjectShared,
-    RtBundle,
+    self, EngineCommand, EngineCommandSender, EngineShared, PluginEntry, ProjectDelivery, ProjectRt,
+    ProjectShared, RecordingLanes, RtBundle,
 };
 use crate::graph::{DelayLine, Schedule, compile_schedule};
 use crate::mod_plan_publish::{ModPhaseTableBuilder, ModPlanPublisher};
@@ -80,8 +81,8 @@ pub fn decode_worker_loop(rx: std::sync::mpsc::Receiver<DecodeJob>, session_samp
 /// partial and the decode worker's full renderer through a mutex so a slow
 /// decode for generation N can't clobber a newer N+1 that landed during the
 /// decode (the bare `schedule_generation` re-check has a TOCTOU window between
-/// its load and the `store`). Off the audio thread — the CPAL callback only ever
-/// `load()`s the `ArcSwap`, never this mutex (r.md #7 B)。
+/// its load and the `store`). Off the audio thread. RT へは次の [`RtBundle`] が同じ `Arc` を
+/// 運ぶ (`load_song` は直後の publish、decode worker の差し替えは recv loop の housekeeping)。
 pub(crate) fn publish_audio_clip_schedule(
     project: &ProjectShared,
     generation: u64,
@@ -184,6 +185,9 @@ pub struct BundlePublisher {
     /// これまでに配送した per-track scratch の本数 (`RtBundle::scratch_growth`)。
     /// 増える方向にだけ動かす — 減らしても走行状態の移送が要るだけで得が無い。
     delivered_scratch: usize,
+    /// 直近の便に載せた audio clip renderer (ミラーの差し替えを検出する印。`Weak` なので中身は
+    /// 延命しないが、確保は残るのでアドレスが別の renderer に再利用されることもない)。
+    published_renderer: Weak<crate::audio_clip_renderer::AudioClipRenderer>,
     pub(crate) parked: Option<RtBundle>,
     /// r.md #89: クロス変調の評価計画の publish 状態 (内容が変わったときだけ載せる)。
     mod_plans: ModPlanPublisher,
@@ -197,6 +201,7 @@ impl BundlePublisher {
         Self {
             tx,
             delivered_scratch: 0,
+            published_renderer: Weak::new(),
             parked: None,
             mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
@@ -288,6 +293,29 @@ pub struct ProjectCtl {
     pub bundle_recycle_rx: rtrb::Consumer<RtBundle>,
     /// MIDI Capture の試聴シーケンスの差し替え世代 (`sampler::PreviewSequence`)。
     pub preview_seq_generation: u64,
+    /// 再生ループの状態 (`SetLoop`)。この 3 つは RT だけが読む「聴き方・見方」で、所有者は recv loop
+    /// (IPC で書き、[`Self::snapshot_bundle`] が便に載せる)。off-RT の読者は居ないので共有面に置かない。
+    pub loop_region: common::model::LoopRegion,
+    /// 録音中の lane (`SetRecordingLanes`、別ファイルを開いたら空にする)。
+    pub recording_lanes: Arc<RecordingLanes>,
+    /// device scope の対象 (`SetDeviceScopes`、[`device_scope_watch`] で切り詰め済み)。
+    pub device_scope_watch: [u64; MAX_DEVICE_SCOPES],
+}
+
+/// `SetDeviceScopes` の device id 列を slot 表にする: 0 と重複を除き、先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰める。
+fn device_scope_watch(device_ids: &[u64]) -> [u64; MAX_DEVICE_SCOPES] {
+    let mut watch = [0u64; MAX_DEVICE_SCOPES];
+    let mut n = 0;
+    for &id in device_ids {
+        if n == MAX_DEVICE_SCOPES {
+            break;
+        }
+        if id != 0 && !watch[..n].contains(&id) {
+            watch[n] = id;
+            n += 1;
+        }
+    }
+    watch
 }
 
 impl ProjectCtl {
@@ -295,7 +323,34 @@ impl ProjectCtl {
         self.shared.key
     }
 
-    /// 現在の mirrors (plugin_refs / preview_sequence) + `song` で `RtBundle` を組んで
+    /// 今の snapshot 一式を載せた便 (delta は全部「据え置き」)。**RT が読む snapshot を集める唯一の口** —
+    /// RT は共有面の `ArcSwap` を load しないので、RT に届けるものはここに足す。
+    fn snapshot_bundle(&mut self, song: Option<Arc<common::model::Song>>) -> RtBundle {
+        let tempo_map = match song.as_deref() {
+            Some(s) => common::tempo_map::TempoMap::from_song(s),
+            None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
+        };
+        let audio_clip_renderer = self.shared.audio_clip_renderer.load_full();
+        self.publisher.published_renderer = Arc::downgrade(&audio_clip_renderer);
+        RtBundle {
+            song,
+            tempo_map,
+            schedule: None,
+            reset_song_scoped_state: false,
+            input_delay_replacements: Vec::new(),
+            scratch_growth: None,
+            plugin_refs: self.shared.plugin_refs.load_full(),
+            preview_sequence: self.shared.preview_sequence.load_full(),
+            loop_region: self.loop_region,
+            recording_lanes: Arc::clone(&self.recording_lanes),
+            audio_clip_renderer,
+            device_scope_watch: self.device_scope_watch,
+            mod_plan: None,
+            mod_phase_table: None,
+        }
+    }
+
+    /// 現在の snapshot 一式 ([`Self::snapshot_bundle`]) + `song` で `RtBundle` を組んで
     /// RT へ配送する。 `shared.song` mirror もここで更新する (off-thread 読者用)。
     pub fn publish_bundle(
         &mut self,
@@ -306,10 +361,6 @@ impl ProjectCtl {
         phase_tables: &ModPhaseTableBuilder,
     ) {
         self.shared.song.store(song.clone());
-        let tempo_map = match song.as_deref() {
-            Some(s) => common::tempo_map::TempoMap::from_song(s),
-            None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
-        };
         let (schedule, input_delay_replacements) = if topology != Topology::Unchanged {
             let buffer_frames = resolve_buffer_frames(engine_shared, sample_rate);
             self.publisher.last_compiled_frames = Some(buffer_frames);
@@ -359,13 +410,10 @@ impl ProjectCtl {
         } else {
             None
         };
-        self.publisher.send(RtBundle {
-            song,
-            tempo_map,
+        let bundle = RtBundle {
             scratch_growth,
             schedule,
             mod_plan,
-            mod_phase_table: None,
             reset_song_scoped_state: matches!(
                 topology,
                 Topology::Recompile {
@@ -373,9 +421,9 @@ impl ProjectCtl {
                 }
             ),
             input_delay_replacements,
-            plugin_refs: self.shared.plugin_refs.load_full(),
-            preview_sequence: self.shared.preview_sequence.load_full(),
-        });
+            ..self.snapshot_bundle(song)
+        };
+        self.publisher.send(bundle);
     }
 
     /// 現在の song をそのまま値のみ bundle で送り直す (mirror が変わったとき)。
@@ -435,22 +483,18 @@ impl ProjectCtl {
         // 刻みループで、plan の配送を待たせたくないから (設計正本 §2.4)。
         if let Some(table) = finished_table {
             let song = self.shared.song.load_full();
-            self.publisher.send(RtBundle {
-                tempo_map: match song.as_deref() {
-                    Some(s) => common::tempo_map::TempoMap::from_song(s),
-                    None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
-                },
-                song,
-                schedule: None,
-                reset_song_scoped_state: false,
-                input_delay_replacements: Vec::new(),
-                // 位相表だけの便。scratch は `publish_bundle` が song と同じ便で運ぶ。
-                scratch_growth: None,
-                plugin_refs: self.shared.plugin_refs.load_full(),
-                preview_sequence: self.shared.preview_sequence.load_full(),
-                mod_plan: None,
-                mod_phase_table: Some(table),
-            });
+            // 位相表だけの便。scratch は `publish_bundle` が song と同じ便で運ぶ。
+            let bundle = RtBundle { mod_phase_table: Some(table), ..self.snapshot_bundle(song) };
+            self.publisher.send(bundle);
+        }
+        // decode worker が renderer のミラーを差し替えていたら、同じ `Arc` を RT へ送り直す
+        // (RT はミラーを load しない)。
+        let renderer_moved = !std::ptr::eq(
+            self.publisher.published_renderer.as_ptr(),
+            Arc::as_ptr(&self.shared.audio_clip_renderer.load()),
+        );
+        if renderer_moved {
+            self.republish(engine_shared, sample_rate, phase_tables);
         }
         // leaf 宛 sidechain tap の 1-buffer 補償量 (= 実測 buffer frames) が
         // compile 時の仮定から変わっていたら topology を再 publish する
@@ -505,6 +549,7 @@ pub fn open_project(
         pool_rx,
         pool_recycle_tx,
     );
+    let rt_renderer = Arc::clone(&rt.audio_clip_renderer);
     if project_tx.push(ProjectDelivery::Open(Box::new(rt))).is_err() {
         // ring 満杯 = RT が居ない / 詰まっている。slot を返して失敗にする。
         bridge.release_project_slot(slot);
@@ -514,13 +559,19 @@ pub fn open_project(
     let mut map = (**engine_shared.projects.load()).clone();
     map.insert(key, Arc::clone(&shared));
     engine_shared.projects.store(Arc::new(map));
+    let mut publisher = BundlePublisher::new(bundle_tx);
+    // RT は最初からミラーと同じ renderer を持っている (`ProjectRt::new`)。
+    publisher.published_renderer = Arc::downgrade(&rt_renderer);
     projects.insert(
         key,
         ProjectCtl {
             shared,
-            publisher: BundlePublisher::new(bundle_tx),
+            publisher,
             bundle_recycle_rx,
             preview_seq_generation: 0,
+            loop_region: common::model::LoopRegion::default(),
+            recording_lanes: Arc::new(RecordingLanes::new()),
+            device_scope_watch: [0; MAX_DEVICE_SCOPES],
         },
     );
     tracing::info!(project = key.0, slot, "project slot opened");
@@ -585,7 +636,7 @@ pub fn handle_project_command(
     cmd: AudioCommand,
     engine_shared: &EngineShared,
     session_sample_rate: u32,
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    cmd_tx: &mut EngineCommandSender,
     decode_tx: &std::sync::mpsc::Sender<DecodeJob>,
     phase_tables: &ModPhaseTableBuilder,
 ) {
@@ -609,9 +660,10 @@ pub fn handle_project_command(
         }
         AudioCommand::SetLoop { mut region, .. } => {
             // IPC は信頼境界。 NaN / 負値の拍位置は samples_per_beat 換算を
-            // 壊すので store 前に正規化する (LoadSong の sanitize_ranges と同旨)。
+            // 壊すので載せる前に正規化する (LoadSong の sanitize_ranges と同旨)。
             region.sanitize();
-            shared.loop_region.store(Arc::new(region));
+            ctl.loop_region = region;
+            ctl.republish(engine_shared, session_sample_rate, phase_tables);
         }
         AudioCommand::SeekTo { samples, .. } => {
             // playhead を IPC 受信スレッドから直接書かない。
@@ -738,7 +790,7 @@ pub fn handle_project_command(
             // 引いて EngineCommand に載せ替える。 解決は IPC スレッド上 =
             // RT 外。 song 未ロード / id 不在なら drop (= 無音)。
             if let Some(track) = preview_track_index(&shared, track_id) {
-                let _ = cmd_tx.send(EngineCommand::PreviewNoteOn {
+                cmd_tx.send(EngineCommand::PreviewNoteOn {
                     project: key,
                     track,
                     pitch,
@@ -748,17 +800,16 @@ pub fn handle_project_command(
         }
         AudioCommand::PreviewNoteOff { track_id, pitch, .. } => {
             if let Some(track) = preview_track_index(&shared, track_id) {
-                let _ = cmd_tx.send(EngineCommand::PreviewNoteOff { project: key, track, pitch });
+                cmd_tx.send(EngineCommand::PreviewNoteOff { project: key, track, pitch });
             }
         }
         AudioCommand::SetRecordingLanes { lanes, .. } => {
             // Phase 4 Step C-2: GUI が「現在 recording 中の lane」 セットを
-            // 送ってきた。 ArcSwap で snapshot を replace し、 audio thread
+            // 送ってきた。 集合は off-thread で作って便で送り、 audio thread
             // は次 buffer から `fill_track_param_ramps` で該当 lane の
-            // curve eval を skip する。 lock-free / 0 allocation on audio thread。
-            let set: std::collections::HashSet<(u32, common::model::AutomationTarget)> =
-                lanes.into_iter().collect();
-            shared.recording_lanes.store(Arc::new(set));
+            // curve eval を skip する (旧集合の解放も off-thread)。
+            ctl.recording_lanes = Arc::new(lanes.into_iter().collect());
+            ctl.republish(engine_shared, session_sample_rate, phase_tables);
         }
         AudioCommand::SetProjectDir { dir, .. } => {
             // `compile_audio_schedule` が `AudioSourcePath::ProjectRelative`
@@ -768,13 +819,14 @@ pub fn handle_project_command(
             tracing::info!(project = key.0, ?dir, "project_dir updated");
         }
         // r.md #129: SC Listen / device scope は「聴き方・見方の都合」で Song に載らない。
-        // 共有面に置くだけで、RT が buffer 頭で読んで `NativeIo` に組む (§8.7 / §11.2)。
-        // Comp 以外の id は RT の op が一致しないので効かない。
+        // RT が buffer 頭で読んで `NativeIo` に組む (§8.7 / §11.2)。Comp 以外の id は RT の op が
+        // 一致しないので効かない。
         AudioCommand::SetScListen { device_id, .. } => {
             shared.sc_listen_device.store(device_id.unwrap_or(0), Ordering::Release);
         }
         AudioCommand::SetDeviceScopes { device_ids, .. } => {
-            shared.set_device_scopes(&device_ids);
+            ctl.device_scope_watch = device_scope_watch(&device_ids);
+            ctl.republish(engine_shared, session_sample_rate, phase_tables);
         }
         // MIDI Capture の試聴 (`docs/plan_global_sampler.md`)。
         cmd @ (AudioCommand::PreviewSequence { .. } | AudioCommand::PreviewSequenceStop { .. }) => {
@@ -830,8 +882,8 @@ fn load_song(
         // で必ず後から届く)。
         shared.plugin_refs.store(Arc::new(HashMap::new()));
         // track_id keyed。 非空のまま持ち越すと新 song の同番号
-        // track の automation が bypass されたままになる。
-        shared.recording_lanes.store(Arc::new(std::collections::HashSet::new()));
+        // track の automation が bypass されたままになる (下の publish が新 song と同じ便で運ぶ)。
+        ctl.recording_lanes = Arc::new(RecordingLanes::new());
         // device_id keyed の PDC 入力も同じく song スコープ。
         // 持ち越すと新 song の同番号 device が、 まだ何も報告して
         // いないのに前 song の latency で補償される。
@@ -973,9 +1025,64 @@ mod tests {
             scratch_growth: None,
             plugin_refs: Arc::new(std::collections::HashMap::new()),
             preview_sequence: None,
+            loop_region: common::model::LoopRegion::default(),
+            recording_lanes: Arc::new(RecordingLanes::new()),
+            audio_clip_renderer: Arc::new(audio_clip_renderer::AudioClipRenderer::empty()),
+            device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
         }
+    }
+
+    /// 不変条件 4: RT は共有面の `ArcSwap` を load しない。ループ / 録音中の lane / device scope の対象と、
+    /// decode worker が差し替えた audio clip renderer は便で届き、RT が置き換えた旧値は RT で解放されず
+    /// recycle ring で off-thread に戻る。
+    #[test]
+    fn rt_が読む聴き方と_renderer_は便で届き旧値は_off_thread_で捨てる() {
+        use common::model::{AutomationTarget, LoopRegion};
+        let engine = EngineShared::new();
+        let bridge = AudioBridgeHandle::create(&format!("daw01_test_ctl_view_{}", std::process::id())).unwrap();
+        let (mut project_tx, mut project_rx) = rtrb::RingBuffer::new(4);
+        let mut projects = HashMap::new();
+        assert!(open_project(ProjectKey(1), &mut projects, &engine, &bridge, &mut project_tx));
+        let Ok(ProjectDelivery::Open(mut rt)) = project_rx.pop() else { panic!("Open 便") };
+        let ctl = projects.get_mut(&ProjectKey(1)).expect("ctl");
+        let phase_tables = ModPhaseTableBuilder::spawn();
+        let (mut cmd_tx, _cmd_rx) = EngineCommandSender::channel();
+        let (decode_tx, _decode_rx) = std::sync::mpsc::channel();
+        let sr = 48_000;
+
+        // 開いた直後は何も送り直さない (RT は最初からミラーと同じ renderer を持つ)。
+        ctl.housekeeping(&engine, sr, &phase_tables, None);
+        assert_eq!(rt.bundle_rx.slots(), 0, "送り直していない");
+        assert!(Arc::ptr_eq(&rt.audio_clip_renderer, &ctl.shared.audio_clip_renderer.load_full()));
+
+        let project = ProjectKey(1);
+        let region = LoopRegion { enabled: true, start_beat: 4.0, end_beat: 8.0 };
+        for cmd in [
+            AudioCommand::SetLoop { project, region },
+            AudioCommand::SetRecordingLanes { project, lanes: vec![(3, AutomationTarget::SongTempo)] },
+            AudioCommand::SetDeviceScopes { project, device_ids: vec![0, 7, 7, 9] },
+        ] {
+            handle_project_command(ctl, cmd, &engine, sr, &mut cmd_tx, &decode_tx, &phase_tables);
+        }
+        let old_lanes = Arc::clone(&rt.recording_lanes);
+        rt.refresh_bundle();
+        assert_eq!(rt.loop_region, region);
+        assert!(rt.recording_lanes.contains(&(3, AutomationTarget::SongTempo)));
+        assert_eq!(&rt.device_scope_watch[..3], &[7, 9, 0], "0 と重複を除いて詰める");
+        assert_eq!(Arc::strong_count(&old_lanes), 2, "旧集合は RT ではなく recycle ring が持っている");
+
+        // decode worker の publish (ミラーの差し替え) は housekeeping が RT へ送り直す。
+        let old_renderer = Arc::clone(&rt.audio_clip_renderer);
+        publish_audio_clip_schedule(&ctl.shared, 1, audio_clip_renderer::AudioClipRenderer::empty(), sr);
+        ctl.housekeeping(&engine, sr, &phase_tables, None);
+        rt.refresh_bundle();
+        assert!(Arc::ptr_eq(&rt.audio_clip_renderer, &ctl.shared.audio_clip_renderer.load_full()));
+        assert!(!Arc::ptr_eq(&rt.audio_clip_renderer, &old_renderer));
+        assert_eq!(Arc::strong_count(&old_renderer), 2, "旧 renderer は RT ではなく recycle ring が持っている");
+        ctl.housekeeping(&engine, sr, &phase_tables, None);
+        assert_eq!(Arc::strong_count(&old_renderer), 1, "housekeeping (off-thread) が捨てる");
     }
 
     /// BundlePublisher の drop-oldest: ring が full のとき新しい bundle が
