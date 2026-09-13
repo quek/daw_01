@@ -30,6 +30,7 @@ use crate::graph::mix::{
     resolve_tap_buffers,
 };
 use crate::graph::native::{NativeIo, apply_listen_override, stage_native_sidechain};
+use crate::graph::program::Pass1Role;
 use crate::graph::{BufRef, ChainProgram, NodeOp, ProgramCtx, Schedule, run_chain_program};
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
@@ -203,28 +204,19 @@ pub fn process_track_owned(
     // snapshots to pass 2.
     // r.md #110: pass 1 で走らせる op 区間。group-with-instrument は instrument prefix
     // (`program.pass1_end`) まで、leaf は全部。
-    let skip_strip = match song {
-        Some(s) => {
-            let id = song_track.id;
-            let has_children = s.track_has_children(id);
-            let split = song_track.paraout_split_device();
-            if has_children && split.is_some() {
-                true
-            } else if has_children
-                || s.track_receives_send(id)
-                || s.track_receives_paraout(id)
-            {
-                scratch.track_l[..n].fill(0.0);
-                scratch.track_r[..n].fill(0.0);
-                scratch.peak_l = 0.0;
-                scratch.peak_r = 0.0;
-                scratch.effective_mute = false;
-                return;
-            } else {
-                false
-            }
+    // r.md #129: 役割は compile 時に焼いた値 (旧実装は毎 buffer Song を歩き、パラアウト先の判定が
+    // plugin を列挙する iterator の確保を RT で起こしていた)。
+    let skip_strip = match program.pass1_role {
+        Pass1Role::Leaf => false,
+        Pass1Role::GroupWithInstrument => true,
+        Pass1Role::Bus => {
+            scratch.track_l[..n].fill(0.0);
+            scratch.track_r[..n].fill(0.0);
+            scratch.peak_l = 0.0;
+            scratch.peak_r = 0.0;
+            scratch.effective_mute = false;
+            return;
         }
-        None => false,
     };
     let op_end = if skip_strip { program.pass1_end } else { program.ops.len() };
 

@@ -159,6 +159,36 @@ fn render(s: &Scenario) -> Vec<WindowStats> {
     })
 }
 
+/// T8 (DSP 側): 遅延を焼いてある間、解決値が OFF なら先読みぶんの遅延だけを通してゲインは掛けない
+/// (PDC の会計どおり)。遅延を焼いていなければ遅延もゲインも無い素通し。`reset()` 後のリングは無音。
+#[test]
+fn master_limiter_passes_only_the_delay_while_resolved_off_and_resets_to_silence() {
+    let look = common::model::limiter_lookahead_samples(SR) as usize;
+    let n = 512;
+    let loud = vec![2.0f32; n];
+    let off = MasterLimiterSettings { on: false, ceiling_db: -1.0 };
+    let mut st = MasterLimiterState::new();
+    let (mut l, mut r) = (loud.clone(), loud.clone());
+    st.process(&off, true, &mut l, &mut r, n, SR as f32);
+    assert!(l[..look].iter().all(|v| *v == 0.0), "先読みぶんの無音が先行する");
+    assert!(l[look..].iter().chain(&r[look..]).all(|v| *v == 2.0), "ゲインは掛けない (+6 dB のまま)");
+    assert_eq!(st.gain_reduction_db(), 0.0);
+
+    let mut bare = MasterLimiterState::new();
+    let (mut l, mut r) = (loud.clone(), loud.clone());
+    bare.process(&off, false, &mut l, &mut r, n, SR as f32);
+    assert_eq!((l, r), (loud.clone(), loud), "遅延を焼いていなければ素通し");
+
+    let on = MasterLimiterSettings { on: true, ceiling_db: -1.0 };
+    let (mut l, mut r) = (vec![0.9f32; n], vec![0.9f32; n]);
+    st.process(&on, true, &mut l, &mut r, n, SR as f32);
+    st.reset();
+    let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
+    st.process(&on, true, &mut l, &mut r, n, SR as f32);
+    assert!(l.iter().chain(&r).all(|v| *v == 0.0), "reset 後のリングに前の音が残らない");
+    assert_eq!(st.gain_reduction_db(), 0.0);
+}
+
 fn within(got: f64, want: f64) -> bool {
     (got - want).abs() <= 1e-6 + 1e-5 * want.abs()
 }

@@ -901,6 +901,64 @@ mod tests {
         Song { bpm: 120.0, length_beats, ..Song::default() }
     }
 
+    /// r.md #129 §15.3 T16: 組み込み Comp / EQ / Bus Comp / Tone EQ と Limiter が ON の v38 fixture を
+    /// offline render すると 2 回でビット一致する (内蔵 device と Limiter の状態は毎回新品)。SC Listen を
+    /// 立てても書き出しは変わらない (書き出しは「聴き方」を持たない `NativeIo::default()` しか渡さない)。
+    #[test]
+    fn v38_fixture_renders_bit_identically_and_ignores_sc_listen() {
+        struct Capture(Vec<f32>);
+        impl RenderSink for Capture {
+            fn accept(&mut self, l: &[f32], r: &[f32]) -> Result<()> {
+                for (a, b) in l.iter().zip(r) {
+                    self.0.push(*a);
+                    self.0.push(*b);
+                }
+                Ok(())
+            }
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../common/tests/fixtures");
+        let song = common::project::load_project(dir.join("v38_strips.daw")).expect("v38 fixture").song;
+        let lead_comp = song.tracks[0]
+            .devices
+            .iter()
+            .find_map(|d| d.as_native().filter(|n| n.builtin && n.kind() == common::model::NativeKind::Comp))
+            .expect("Lead の組み込み Comp")
+            .id;
+        let engine = EngineShared::new();
+        let render = |listen: u64| {
+            let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
+            project.project_dir.store(Some(Arc::new(dir.clone())));
+            project.sc_listen_device.store(listen, Ordering::Release);
+            let span = RenderSpan::RangeCold { start_beat: 0.0, end_beat: 4.0 };
+            let win = RenderWindow::resolve(&song, 48_000, span, false).expect("window");
+            let mut sink = Capture(Vec::new());
+            let outcome = render_loop(
+                &engine,
+                &project,
+                &song,
+                48_000,
+                common::process_data::MAX_FRAMES,
+                win.total_samples,
+                win.write_start,
+                win.write_end,
+                win.walk_start,
+                false,
+                &mut sink,
+                |_, _| {},
+            )
+            .expect("render");
+            assert!(!outcome.cancelled);
+            sink.0
+        };
+        let first = render(0);
+        let peak = first.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.01, "fixture の音声クリップが鳴っている (無音だとビット一致が自明に通る): {peak}");
+        assert!(first.iter().zip(render(0)).all(|(a, b)| a.to_bits() == b.to_bits()), "2 回の書き出しがビット一致");
+        let listened = render(lead_comp);
+        assert_eq!(first.len(), listened.len());
+        assert!(first.iter().zip(listened).all(|(a, b)| a.to_bits() == b.to_bits()), "Listen は書き出しに乗らない");
+    }
+
     #[test]
     fn 全曲は曲末まで書いて減衰ぶん走査を延ばす() {
         let w = RenderWindow::resolve(&song(16.0), 48_000, RenderSpan::Full, true).unwrap();

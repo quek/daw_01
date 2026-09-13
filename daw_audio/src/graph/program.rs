@@ -189,11 +189,26 @@ impl ChainScratch {
     }
 }
 
+/// pass 1 (`process_track_owned`) でこの track が何をするか。compile 時に配線トポロジから焼く
+/// (RT で Song を歩いて判定しない — plugin を列挙する判定は確保を伴う、r.md #129 §18-B と同じ理由)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pass1Role {
+    /// leaf: device チェーン全部 → PostFx 点 → フェーダー。
+    #[default]
+    Leaf,
+    /// group / return / パラアウト先: pass 1 では何もしない (合流と device は pass 2 の `ProcessGroupFx`)。
+    Bus,
+    /// パラアウトの楽器兼 group: 楽器の prefix `[..pass1_end]` だけ。残りとフェーダーは pass 2。
+    GroupWithInstrument,
+}
+
 /// 1 track (または master) の device ツリーを展開した命令列 + その scratch。
 /// `Schedule` が track index 順に 1 つずつ持つ (`track_programs`) + master 用 1 つ。
 pub struct ChainProgram {
     /// 所有 track (`MASTER_TRACK_ID` = master)。automation / 変調の store を引くキー。
     pub track_id: u32,
+    /// pass 1 の役割 (`compile_schedule` が Topology から設定する。master は使わない)。
+    pub pass1_role: Pass1Role,
     pub ops: Vec<ChainOp>,
     /// パラアウト (`docs/plan_paraout.md`): pass 1 で走らせる op の終端 (exclusive)。
     /// 通常は `ops.len()`。group-with-instrument では instrument prefix の終端で、
@@ -225,6 +240,7 @@ impl ChainProgram {
     pub fn empty(track_id: u32) -> Self {
         Self {
             track_id,
+            pass1_role: Pass1Role::Leaf,
             ops: Vec::new(),
             pass1_end: 0,
             parallels: Vec::new(),

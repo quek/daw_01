@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use common::audio_bridge::{MAX_NATIVE_METERS, MAX_TRACKS};
 use common::model::{AudioTap, Song, TapPoint, TapSource};
 
+use super::program::Pass1Role;
 use super::program_build::{BuiltProgram, ChainLatency, build_program};
 use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule};
 use deps::Topology;
@@ -168,6 +169,14 @@ pub fn compile_schedule(
 
     // ---- 配線トポロジ: 親参照の検査 → group / send / パラアウトの入力表 → bus 判定 ----
     let topo = Topology::build(song)?;
+    // pass 1 の役割を program に焼く (RT の `process_track_owned` が Song を歩かない)。
+    for (b, (&bus, gwi)) in built.iter_mut().zip(topo.bus_flags.iter().zip(&topo.gwi_split)) {
+        b.program.pass1_role = match (gwi, bus) {
+            (Some(_), _) => Pass1Role::GroupWithInstrument,
+            (None, true) => Pass1Role::Bus,
+            (None, false) => Pass1Role::Leaf,
+        };
+    }
     let taps = TapCtx {
         id_to_idx: &topo.id_to_idx,
         chains: &chain_map,

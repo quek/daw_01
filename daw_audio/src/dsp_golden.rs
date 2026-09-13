@@ -220,8 +220,9 @@ fn splitmix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// 1 シナリオ。`meta` は駆動条件 (`stimulus` / `block` / `input_gain_db` / `driver`) と DSP の設定値で、
-/// 並びは記録順 (比較側はキーで引く)。
+/// 1 シナリオ。`meta` は駆動条件 (`kind` / `driver` / `stimulus` / `block` / `input_gain_db`) と DSP の
+/// 設定値で、並びは記録順 (比較側はキーで引く)。旧 DSP の記録器は旧型と一緒に消えたので、meta は
+/// ファイルにある値が正本。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scenario {
     pub name: String,
@@ -233,27 +234,6 @@ impl Scenario {
     pub fn meta(&self, key: &str) -> Option<&str> {
         self.meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
-}
-
-/// シナリオの先頭に置く駆動条件の meta (`kind` / `driver` / `stimulus` / `block` / `input_gain_db`)。
-/// 設定値の meta はこの後ろに記録側が足す。
-pub fn drive_meta(
-    kind: &str,
-    driver: &str,
-    stimulus: Stimulus,
-    block: usize,
-    input_gain_db: f64,
-) -> Vec<(String, String)> {
-    [
-        ("kind", kind.to_string()),
-        ("driver", driver.to_string()),
-        ("stimulus", stimulus.name().to_string()),
-        ("block", block.to_string()),
-        ("input_gain_db", format!("{input_gain_db:?}")),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
-    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]

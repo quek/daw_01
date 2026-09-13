@@ -360,3 +360,6 @@ fn stage_into(ns: Option<&mut NativeScratch>, l: &[f32], r: &[f32], n: usize) {
         stage.stage(l, r, n);
     }
 }
+
+#[cfg(test)]
+mod tests;

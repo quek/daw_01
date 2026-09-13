@@ -473,8 +473,8 @@ impl ProjectRt {
             .and_then(|t| self.mod_tick.set_table(Some(t)));
 
         // per-track scratch の成長便。**song と同じ便で届く**ので、この install の
-        // 直後に走る render は必ず足りた状態で始まる。走行状態 (PDC リング / strip の
-        // フィルタ / 鳴っているノート) を保つため、既存の行は要素ごと swap で移す
+        // 直後に走る render は必ず足りた状態で始まる。走行状態 (入力遅延のリング / stretch
+        // engine / 鳴っているノート) を保つため、既存の行は要素ごと swap で移す
         // (move だけ = RT で確保も解放もしない)。押し出した古い Vec は bundle に
         // 載せ替えて recycle ring へ (drop は off-thread)。
         if let Some(mut fresh) = new.scratch_growth.take() {
@@ -2028,6 +2028,138 @@ mod bundle_install_tests {
         // no free.
         assert_no_alloc::assert_no_alloc(|| {
             local.refresh_bundle();
+        });
+    }
+
+    /// 組み込み Comp / EQ を持つ 2 track + 組み込み Bus Comp / Tone EQ の master。track 1 には追加の Comp も。
+    fn native_song(added_comps: u64) -> Arc<Song> {
+        use common::model::{Device, NativeDevice, NativeKind};
+        let mut s = Song::default();
+        let mut t1 = track(1);
+        t1.devices = (0..added_comps)
+            .map(|k| Device::Native(NativeDevice::new_added(NativeKind::Comp, 1000 + k, 2)))
+            .chain([
+                Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 11)),
+                Device::Native(NativeDevice::new_builtin(NativeKind::Eq, 12)),
+            ])
+            .collect();
+        let mut t2 = track(2);
+        t2.devices = vec![Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 21))];
+        s.tracks = vec![t1, t2];
+        s.master_fx_chain = vec![
+            Device::Native(NativeDevice::new_builtin(NativeKind::BusComp, 31)),
+            Device::Native(NativeDevice::new_builtin(NativeKind::ToneEq, 32)),
+        ];
+        Arc::new(s)
+    }
+
+    fn telemetry(tag: &str) -> (AudioBridgeHandle, usize) {
+        let bridge = AudioBridgeHandle::create(&format!("daw01_test_native_gr_{tag}_{}", std::process::id())).unwrap();
+        let slot = bridge.claim_project_slot(ProjectKey(1)).unwrap();
+        (bridge, slot)
+    }
+
+    /// r.md #129 §11.1: GR 面は「この buffer で処理した program」の `meter` 付き device だけから出る
+    /// (EQ 系は出ない / 処理していない track の GR は残らない)。枠は組み込みを優先して割り当てる。
+    #[test]
+    fn native_gr_is_published_by_id_from_processed_programs_only() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        bundle_tx.push(make_bundle(&native_song(1))).unwrap();
+        local.refresh_bundle();
+        let sched = &mut local.cached_schedule;
+        for p in sched.track_programs.iter_mut().chain(std::iter::once(&mut sched.master_program)) {
+            for ns in &mut p.natives {
+                ns.gr_db = -(ns.device_id as f32);
+            }
+        }
+        let (bridge, slot) = telemetry("processed");
+        let t = bridge.project(slot);
+        let mut out = Vec::new();
+        local.publish_meters(t, 2);
+        assert!(t.read_native_meters(&mut out));
+        out.sort_by_key(|(id, _)| *id);
+        assert_eq!(out, vec![(11, -11.0), (21, -21.0), (31, -31.0), (1000, -1000.0)]);
+        local.publish_meters(t, 1);
+        assert!(t.read_native_meters(&mut out));
+        assert!(!out.iter().any(|(id, _)| *id == 21), "処理していない track 2 の GR は残らない: {out:?}");
+
+        // 枠 (MAX_NATIVE_METERS) を超える追加分があっても、組み込みは必ず出る。
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        let many = common::audio_bridge::MAX_NATIVE_METERS as u64 + 8;
+        bundle_tx.push(make_bundle(&native_song(many))).unwrap();
+        local.refresh_bundle();
+        local.publish_meters(t, 2);
+        assert!(t.read_native_meters(&mut out));
+        assert_eq!(out.len(), common::audio_bridge::MAX_NATIVE_METERS);
+        for id in [11, 21, 31] {
+            assert!(out.iter().any(|(i, _)| *i == id), "組み込み {id} が枠から漏れた");
+        }
+    }
+
+    /// r.md #129 §11.2: scope project の buffer は見出し表と違う slot だけ見出しを書き換え、読み手は
+    /// `(project, device id)` を見る。見出しが同じなら書き換えない (世代が進まない)。
+    #[test]
+    fn device_scope_headers_follow_the_watch_table() {
+        let scope =
+            DeviceScopeBridgeHandle::create(&format!("daw01_test_native_scope_{}", std::process::id())).unwrap();
+        let mut headers = [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES];
+        let mut watch = [0u64; MAX_DEVICE_SCOPES];
+        watch[2] = 77;
+        let io = native_io_for_buffer(
+            ProjectKey(5),
+            9,
+            Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
+            Some(&watch),
+        );
+        assert_eq!(io.sc_listen, 9);
+        assert!(io.scopes.is_some());
+        assert_eq!(headers[2], (ProjectKey(5), 77));
+        assert_eq!(headers[0], (ProjectKey(5), 0));
+        let mut reader = common::device_scope_bridge::DeviceScopeReader::default();
+        let mut frames = Vec::new();
+        assert_eq!(reader.read(&scope, 2, &mut frames).map(|(p, d, _)| (p, d)), Some((ProjectKey(5), 77)));
+        scope.write_block(2, &[0.25; 4], &[0.25; 4]);
+        assert_eq!(reader.read(&scope, 2, &mut frames).map(|(_, _, o)| o.frames), Some(4));
+        // 同じ watch でもう一度 → 見出しは変わらないので読み手のカーソルも続く。
+        native_io_for_buffer(
+            ProjectKey(5),
+            0,
+            Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
+            Some(&watch),
+        );
+        scope.write_block(2, &[0.5; 3], &[0.5; 3]);
+        assert_eq!(reader.read(&scope, 2, &mut frames).map(|(_, _, o)| o.frames), Some(3));
+        // scope project でなければ scope を持たない。
+        assert!(native_io_for_buffer(ProjectKey(5), 0, None, None).scopes.is_none());
+    }
+
+    /// T12: GR 面の publish と device scope の見出し同期は RT で確保しない。
+    #[cfg(feature = "rt-assert")]
+    #[test]
+    fn native_meter_publish_and_scope_header_sync_do_not_allocate() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        bundle_tx.push(make_bundle(&native_song(3))).unwrap();
+        local.refresh_bundle();
+        let (bridge, slot) = telemetry("rt");
+        let t = bridge.project(slot);
+        let scope = DeviceScopeBridgeHandle::create(&format!("daw01_test_native_rt_scope_{}", std::process::id())).unwrap();
+        let mut headers = [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES];
+        let (mut a, mut b) = ([0u64; MAX_DEVICE_SCOPES], [0u64; MAX_DEVICE_SCOPES]);
+        a[0] = 12;
+        b[0] = 32;
+        b[5] = 12;
+        assert_no_alloc::assert_no_alloc(|| {
+            for i in 0..8 {
+                local.publish_meters(t, 2);
+                let watch = if i % 2 == 0 { &a } else { &b };
+                let io = native_io_for_buffer(
+                    ProjectKey(1),
+                    11,
+                    Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
+                    Some(watch),
+                );
+                assert!(io.scopes.is_some());
+            }
         });
     }
 }

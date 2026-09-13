@@ -207,11 +207,13 @@ pub struct Schedule {
     /// time.
     ///
     /// Indexed by song track index (parallel to `song.tracks`). Entry `i`
-    /// is `max(path_latency(src) [+ buffer_frames for a leaf dst] for src
-    /// in devices[*].aux_inputs[*].tap)`, or 0 if the track has no
-    /// sidechain wiring. leaf dst の `+ buffer_frames` は「tap の staging が
-    /// post-dispatch = 消費が次 buffer」という 1-buffer 遅延の補償
-    /// (`docs/plan_arch_refactor.md` §5)。
+    /// is `max(source latency + buffer_frames)` over the track's **pass-1**
+    /// sidechain consumers (leaf の全 device / group-with-instrument の prefix、
+    /// plugin の aux 入力と内蔵 device の SC)、or 0 if there are none.
+    /// `+ buffer_frames` は「tap の staging が post-dispatch = 消費が次 buffer」という
+    /// 1-buffer 遅延の補償 (`docs/plan_arch_refactor.md` §5)。pass 2 (bus の
+    /// `ProcessGroupFx`) の consumer はここではなく `ApplyDelay(BusScAlign)` で揃える
+    /// (`docs/plan_rack_native_devices.md` §8.3.3)。
     ///
     /// MVP scope: only audio-in+out devices' sidechain is reflected here.
     /// Instrument sidechain alignment requires delaying MIDI events too

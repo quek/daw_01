@@ -28,9 +28,8 @@ mod audio_clip_renderer;
 mod audio_worker;
 mod automation;
 #[cfg(test)]
-// r.md #129: 記録器 (旧 strip DSP の tests) は strip 型と一緒に消えた。刺激と統計の API は
-// 内蔵 device DSP の golden 比較が使う (それまでは読み戻しの自己検査だけが使う)。
-#[allow(dead_code)]
+// r.md #129: 内蔵 device DSP の golden (`native_dsp/golden_v38.txt`) の刺激・統計・形式。
+// 比較は `native_dsp::tests`。
 mod dsp_golden;
 mod engine;
 mod engine_shared;
