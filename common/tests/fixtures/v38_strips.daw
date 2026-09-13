@@ -1,0 +1,944 @@
+{
+  "version": 38,
+  "song": {
+    "bpm": 120.0,
+    "time_sig": [
+      4,
+      4
+    ],
+    "length_beats": 8.0,
+    "tracks": [
+      {
+        "id": 1,
+        "name": "Lead",
+        "devices": [
+          {
+            "id": 1,
+            "plugin_id": "test.synth",
+            "format": "Clap",
+            "aux_output_count": 0,
+            "aux_input_count": 0,
+            "ports": {
+              "has_note_input": true,
+              "has_note_output": false,
+              "has_audio_output": true,
+              "has_audio_input": false,
+              "has_video_input": false,
+              "has_video_output": false
+            }
+          },
+          {
+            "Parallel": {
+              "id": 2,
+              "name": "Parallel",
+              "chains": [
+                {
+                  "id": 3,
+                  "name": "Chain 1",
+                  "gain": 1.0,
+                  "pan": 0.0,
+                  "devices": [
+                    {
+                      "id": 4,
+                      "plugin_id": "test.fx.chorus",
+                      "format": "Clap",
+                      "aux_output_count": 0,
+                      "aux_input_count": 0,
+                      "ports": {
+                        "has_note_input": false,
+                        "has_note_output": false,
+                        "has_audio_output": true,
+                        "has_audio_input": true,
+                        "has_video_input": false,
+                        "has_video_output": false
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": 5,
+                  "name": "Chain 2",
+                  "gain": 1.0,
+                  "pan": 0.0,
+                  "devices": []
+                }
+              ],
+              "out_gain": 1.0
+            }
+          },
+          {
+            "id": 6,
+            "plugin_id": "test.fx.delay",
+            "format": "Clap",
+            "aux_output_count": 0,
+            "aux_input_count": 0,
+            "ports": {
+              "has_note_input": false,
+              "has_note_output": false,
+              "has_audio_output": true,
+              "has_audio_input": true,
+              "has_video_input": false,
+              "has_video_output": false
+            }
+          }
+        ],
+        "volume": 1.0,
+        "pan": 0.0,
+        "strip": {
+          "comp": {
+            "on": true,
+            "mode": "Compressor",
+            "threshold_db": -18.0,
+            "ratio": 4.0,
+            "attack_ms": 5.0,
+            "release_ms": 120.0,
+            "makeup_db": 3.0,
+            "sc_freq_hz": 150.0
+          },
+          "eq": {
+            "on": true,
+            "hp": {
+              "on": true,
+              "freq_hz": 60.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lp": {
+              "on": false,
+              "freq_hz": 15000.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lf": {
+              "on": true,
+              "freq_hz": 100.0,
+              "gain_db": 2.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lmf": {
+              "on": true,
+              "freq_hz": 350.0,
+              "gain_db": -3.0,
+              "q": 1.2,
+              "bell": false
+            },
+            "hmf": {
+              "on": true,
+              "freq_hz": 3000.0,
+              "gain_db": 2.5,
+              "q": 0.9,
+              "bell": false
+            },
+            "hf": {
+              "on": true,
+              "freq_hz": 9000.0,
+              "gain_db": 1.5,
+              "q": 0.8,
+              "bell": true
+            }
+          }
+        },
+        "muted": false,
+        "solo": false,
+        "armed": false,
+        "source": "None",
+        "clips": [
+          {
+            "id": 1,
+            "start_beat": 0.0,
+            "length_beats": 1.0,
+            "content_id": 1
+          },
+          {
+            "id": 2,
+            "start_beat": 1.0,
+            "length_beats": 1.0,
+            "content_id": 1
+          },
+          {
+            "id": 3,
+            "start_beat": 2.0,
+            "length_beats": 1.0,
+            "content_id": 1
+          },
+          {
+            "id": 4,
+            "start_beat": 3.0,
+            "length_beats": 1.0,
+            "content_id": 1
+          }
+        ],
+        "next_clip_id": 5,
+        "sends": [
+          {
+            "id": 1,
+            "dest_track_id": 4,
+            "gain": 0.5,
+            "mode": "PostFader",
+            "enabled": true
+          }
+        ],
+        "next_send_id": 2,
+        "automation_lanes": [
+          {
+            "id": 1,
+            "target": {
+              "TrackBuiltin": {
+                "StripEq": {
+                  "band": "Hmf",
+                  "param": "Gain"
+                }
+              }
+            },
+            "default_value": 2.5,
+            "enabled": true,
+            "height_px": 60,
+            "clips": [
+              {
+                "id": 1,
+                "start_beat": 0.0,
+                "length_beats": 4.0,
+                "content_id": 2
+              }
+            ],
+            "next_clip_id": 2
+          },
+          {
+            "id": 2,
+            "target": {
+              "TrackBuiltin": {
+                "StripEq": {
+                  "band": "Hp",
+                  "param": "Gain"
+                }
+              }
+            },
+            "default_value": 3.0,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          },
+          {
+            "id": 3,
+            "target": {
+              "ModRoutingDepth": {
+                "routing_id": 1
+              }
+            },
+            "default_value": 0.35,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          },
+          {
+            "id": 4,
+            "target": {
+              "PluginParam": {
+                "device_id": 4,
+                "param_id": 7
+              }
+            },
+            "default_value": 0.5,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          },
+          {
+            "id": 5,
+            "target": {
+              "TrackBuiltin": {
+                "ChainGain": {
+                  "chain_id": 5
+                }
+              }
+            },
+            "default_value": 0.8,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          },
+          {
+            "id": 6,
+            "target": {
+              "ModRoutingDepth": {
+                "routing_id": 2
+              }
+            },
+            "default_value": 0.1,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          }
+        ],
+        "next_lane_id": 7,
+        "mod_routings": [
+          {
+            "id": 1,
+            "target": {
+              "TrackBuiltin": {
+                "StripComp": {
+                  "param": "Ratio"
+                }
+              }
+            },
+            "source_id": 1,
+            "depth": 0.3,
+            "polarity": "Bipolar",
+            "enabled": true
+          },
+          {
+            "id": 2,
+            "target": {
+              "TrackBuiltin": {
+                "StripEq": {
+                  "band": "Lf",
+                  "param": "Q"
+                }
+              }
+            },
+            "source_id": 1,
+            "depth": 0.2,
+            "polarity": "Unipolar",
+            "enabled": true
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "name": "GWI",
+        "devices": [
+          {
+            "id": 7,
+            "plugin_id": "test.drum_sampler",
+            "format": "Clap",
+            "aux_outputs": [
+              null,
+              {
+                "dest_track": 3
+              }
+            ],
+            "aux_output_count": 2,
+            "aux_input_count": 0,
+            "ports": {
+              "has_note_input": true,
+              "has_note_output": false,
+              "has_audio_output": true,
+              "has_audio_input": false,
+              "has_video_input": false,
+              "has_video_output": false
+            }
+          },
+          {
+            "id": 8,
+            "plugin_id": "test.fx.bus_glue",
+            "format": "Clap",
+            "aux_output_count": 0,
+            "aux_input_count": 0,
+            "ports": {
+              "has_note_input": false,
+              "has_note_output": false,
+              "has_audio_output": true,
+              "has_audio_input": true,
+              "has_video_input": false,
+              "has_video_output": false
+            }
+          }
+        ],
+        "volume": 1.0,
+        "pan": 0.0,
+        "strip": {
+          "comp": {
+            "on": true,
+            "mode": "Leveler",
+            "threshold_db": -20.0,
+            "ratio": 3.0,
+            "attack_ms": 12.0,
+            "release_ms": 300.0,
+            "makeup_db": 1.5,
+            "sc_freq_hz": 0.0
+          },
+          "eq": {
+            "on": true,
+            "hp": {
+              "on": false,
+              "freq_hz": 80.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lp": {
+              "on": false,
+              "freq_hz": 12000.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lf": {
+              "on": true,
+              "freq_hz": 100.0,
+              "gain_db": -2.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lmf": {
+              "on": true,
+              "freq_hz": 400.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "hmf": {
+              "on": true,
+              "freq_hz": 2500.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "hf": {
+              "on": true,
+              "freq_hz": 8000.0,
+              "gain_db": 3.0,
+              "q": 0.7,
+              "bell": false
+            }
+          }
+        },
+        "muted": false,
+        "solo": false,
+        "armed": false,
+        "source": "None",
+        "clips": [
+          {
+            "id": 1,
+            "start_beat": 0.0,
+            "length_beats": 1.0,
+            "content_id": 1
+          },
+          {
+            "id": 2,
+            "start_beat": 2.0,
+            "length_beats": 1.0,
+            "content_id": 1
+          }
+        ],
+        "next_clip_id": 3,
+        "next_send_id": 1,
+        "automation_lanes": [
+          {
+            "id": 1,
+            "target": {
+              "TrackBuiltin": "StripCompOn"
+            },
+            "default_value": 1.0,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          },
+          {
+            "id": 2,
+            "target": {
+              "TrackBuiltin": {
+                "StripComp": {
+                  "param": "Threshold"
+                }
+              }
+            },
+            "default_value": -20.0,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          },
+          {
+            "id": 3,
+            "target": {
+              "TrackBuiltin": "StripEqOn"
+            },
+            "default_value": 1.0,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          }
+        ],
+        "next_lane_id": 4
+      },
+      {
+        "id": 3,
+        "name": "GWI Child",
+        "volume": 1.0,
+        "pan": 0.0,
+        "strip": {
+          "comp": {
+            "on": false,
+            "mode": "Limiter",
+            "threshold_db": -30.0,
+            "ratio": 6.0,
+            "attack_ms": 1.0,
+            "release_ms": 80.0,
+            "makeup_db": 0.0,
+            "sc_freq_hz": 6000.0
+          },
+          "eq": {
+            "on": false,
+            "hp": {
+              "on": false,
+              "freq_hz": 80.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lp": {
+              "on": false,
+              "freq_hz": 12000.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lf": {
+              "on": true,
+              "freq_hz": 100.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lmf": {
+              "on": true,
+              "freq_hz": 400.0,
+              "gain_db": 4.0,
+              "q": 2.0,
+              "bell": false
+            },
+            "hmf": {
+              "on": true,
+              "freq_hz": 2500.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "hf": {
+              "on": true,
+              "freq_hz": 8000.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            }
+          }
+        },
+        "muted": false,
+        "solo": false,
+        "armed": false,
+        "source": "None",
+        "next_clip_id": 1,
+        "parent_group_id": 2,
+        "next_send_id": 1,
+        "next_lane_id": 1
+      },
+      {
+        "id": 4,
+        "name": "Return",
+        "volume": 1.0,
+        "pan": 0.0,
+        "strip": {
+          "comp": {
+            "on": false,
+            "mode": "Compressor",
+            "threshold_db": 0.0,
+            "ratio": 2.0,
+            "attack_ms": 10.0,
+            "release_ms": 200.0,
+            "makeup_db": 0.0,
+            "sc_freq_hz": 0.0
+          },
+          "eq": {
+            "on": true,
+            "hp": {
+              "on": true,
+              "freq_hz": 200.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lp": {
+              "on": true,
+              "freq_hz": 8000.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lf": {
+              "on": true,
+              "freq_hz": 100.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "lmf": {
+              "on": true,
+              "freq_hz": 400.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "hmf": {
+              "on": true,
+              "freq_hz": 2500.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            },
+            "hf": {
+              "on": true,
+              "freq_hz": 8000.0,
+              "gain_db": 0.0,
+              "q": 0.7,
+              "bell": false
+            }
+          }
+        },
+        "muted": false,
+        "solo": false,
+        "armed": false,
+        "source": "None",
+        "next_clip_id": 1,
+        "next_send_id": 1,
+        "automation_lanes": [
+          {
+            "id": 1,
+            "target": {
+              "MasterStrip": "EqOn"
+            },
+            "default_value": 1.0,
+            "enabled": true,
+            "height_px": 60,
+            "next_clip_id": 1
+          }
+        ],
+        "next_lane_id": 2
+      }
+    ],
+    "ids": {
+      "next_track_id": 5,
+      "next_device_id": 2,
+      "next_content_id": 4,
+      "next_audio_source_id": 2,
+      "next_video_source_id": 1,
+      "next_image_source_id": 1,
+      "next_song_lane_id": 7,
+      "next_section_id": 1,
+      "next_mod_source_id": 3,
+      "next_mod_routing_id": 4,
+      "next_scene_id": 1
+    },
+    "clip_contents": {
+      "2": {
+        "type": "Automation",
+        "points": [
+          {
+            "id": 1,
+            "time_beat": 0.0,
+            "value": -4.0,
+            "curve": "Linear"
+          },
+          {
+            "id": 2,
+            "time_beat": 4.0,
+            "value": 6.0,
+            "curve": "Linear"
+          }
+        ],
+        "next_point_id": 3
+      },
+      "3": {
+        "type": "Automation",
+        "points": [
+          {
+            "id": 1,
+            "time_beat": 0.0,
+            "value": -1.0,
+            "curve": "Linear"
+          },
+          {
+            "id": 2,
+            "time_beat": 8.0,
+            "value": -3.0,
+            "curve": "Linear"
+          }
+        ],
+        "next_point_id": 3
+      },
+      "1": {
+        "type": "Audio",
+        "events": [
+          {
+            "id": 1,
+            "source_id": 1,
+            "event_start_in_clip_beats": 0.0,
+            "event_length_beats": 1.0,
+            "source_start_frames": 0,
+            "source_end_frames": 24000,
+            "gain_db": 0.0,
+            "pan": 0.0,
+            "pitch_semitones": 0.0,
+            "formant_semitones": 0.0,
+            "stretch_mode": "Raw",
+            "fade_in_beats": 0.0,
+            "fade_out_beats": 0.0,
+            "fade_in_curve": "Linear",
+            "fade_out_curve": "Linear",
+            "reversed": false,
+            "muted": false
+          }
+        ],
+        "next_event_id": 2
+      }
+    },
+    "clip_content_names": {},
+    "media": {
+      "audio_sources": {
+        "1": {
+          "path": {
+            "ProjectRelative": "samples/v38_strips_loop.wav"
+          },
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 24000
+        }
+      },
+      "video_sources": {},
+      "image_sources": {}
+    },
+    "song_lanes": [
+      {
+        "id": 1,
+        "target": {
+          "MasterStrip": "CompRatio"
+        },
+        "default_value": 2.0,
+        "enabled": true,
+        "height_px": 60,
+        "next_clip_id": 1
+      },
+      {
+        "id": 2,
+        "target": {
+          "MasterStrip": "LimiterOn"
+        },
+        "default_value": 1.0,
+        "enabled": true,
+        "height_px": 60,
+        "next_clip_id": 1
+      },
+      {
+        "id": 3,
+        "target": {
+          "MasterStrip": "LimiterCeiling"
+        },
+        "default_value": -1.0,
+        "enabled": true,
+        "height_px": 60,
+        "clips": [
+          {
+            "id": 1,
+            "start_beat": 0.0,
+            "length_beats": 8.0,
+            "content_id": 3
+          }
+        ],
+        "next_clip_id": 2
+      },
+      {
+        "id": 4,
+        "target": {
+          "PluginParam": {
+            "device_id": 12,
+            "param_id": 3
+          }
+        },
+        "default_value": 0.25,
+        "enabled": true,
+        "height_px": 60,
+        "next_clip_id": 1
+      },
+      {
+        "id": 5,
+        "target": {
+          "TrackBuiltin": "StripEqOn"
+        },
+        "default_value": 1.0,
+        "enabled": true,
+        "height_px": 60,
+        "next_clip_id": 1
+      },
+      {
+        "id": 6,
+        "target": {
+          "ModRoutingDepth": {
+            "routing_id": 3
+          }
+        },
+        "default_value": 0.15,
+        "enabled": true,
+        "height_px": 60,
+        "next_clip_id": 1
+      }
+    ],
+    "midi_bindings": [],
+    "scale_changes": [],
+    "video_resolution": [
+      1920,
+      1080
+    ],
+    "video_framerate": 30.0,
+    "master_fx_chain": [
+      {
+        "id": 9,
+        "plugin_id": "test.fx.maximizer",
+        "format": "Clap",
+        "aux_output_count": 0,
+        "aux_input_count": 0,
+        "ports": {
+          "has_note_input": false,
+          "has_note_output": false,
+          "has_audio_output": true,
+          "has_audio_input": true,
+          "has_video_input": false,
+          "has_video_output": false
+        }
+      },
+      {
+        "Parallel": {
+          "id": 10,
+          "name": "Parallel",
+          "chains": [
+            {
+              "id": 11,
+              "name": "Chain 1",
+              "gain": 1.0,
+              "pan": 0.0,
+              "devices": [
+                {
+                  "id": 12,
+                  "plugin_id": "test.fx.exciter",
+                  "format": "Clap",
+                  "aux_output_count": 0,
+                  "aux_input_count": 0,
+                  "ports": {
+                    "has_note_input": false,
+                    "has_note_output": false,
+                    "has_audio_output": true,
+                    "has_audio_input": true,
+                    "has_video_input": false,
+                    "has_video_output": false
+                  }
+                }
+              ]
+            }
+          ],
+          "out_gain": 1.0
+        }
+      }
+    ],
+    "master_gain": 1.0,
+    "master_strip": {
+      "comp": {
+        "on": true,
+        "threshold_db": -12.0,
+        "ratio": "R4",
+        "attack": "A10",
+        "release": "Auto",
+        "makeup_db": 2.0
+      },
+      "eq": {
+        "on": true,
+        "low_db": 1.5,
+        "lomid_db": -1.0,
+        "high_db": 2.0
+      },
+      "limiter": {
+        "on": true,
+        "ceiling_db": -0.5
+      }
+    },
+    "project_id": 6211370241622165840,
+    "mod_sources": [
+      {
+        "id": 1,
+        "owner_track_id": 1,
+        "color": [
+          0.3,
+          0.69,
+          1.0
+        ],
+        "kind": {
+          "Lfo": {
+            "shape": "Sine",
+            "rate": {
+              "mode": "Sync",
+              "numerator": 1,
+              "denominator": 4,
+              "hz": 1.0
+            },
+            "phase": 0.0,
+            "retrigger": "FreeRun",
+            "shape_amt": 0.5,
+            "steps": 0,
+            "jitter": 0.0,
+            "smooth": 0.0,
+            "seed": 6840157493906112513,
+            "delay_beats": 0.0,
+            "fade_in_beats": 0.0
+          }
+        },
+        "enabled": true
+      },
+      {
+        "id": 2,
+        "owner_track_id": 4294967295,
+        "color": [
+          1.0,
+          0.55,
+          0.26
+        ],
+        "kind": {
+          "Lfo": {
+            "shape": "Sine",
+            "rate": {
+              "mode": "Sync",
+              "numerator": 1,
+              "denominator": 4,
+              "hz": 1.0
+            },
+            "phase": 0.0,
+            "retrigger": "FreeRun",
+            "shape_amt": 0.5,
+            "steps": 0,
+            "jitter": 0.0,
+            "smooth": 0.0,
+            "seed": 6840157493906112513,
+            "delay_beats": 0.0,
+            "fade_in_beats": 0.0
+          }
+        },
+        "enabled": true
+      }
+    ],
+    "song_mod_routings": [
+      {
+        "id": 3,
+        "target": {
+          "MasterStrip": "CompThreshold"
+        },
+        "source_id": 2,
+        "depth": -0.2,
+        "polarity": "Unipolar",
+        "enabled": true
+      }
+    ],
+    "global_launch_quantize": {
+      "Bars": 1
+    }
+  },
+  "view": null
+}

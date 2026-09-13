@@ -248,11 +248,12 @@ impl MasterStripState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::dsp_golden::{self, BlockGr, Scenario, Stimulus};
     use common::model::{
-        MASTER_AUTO_RELEASE_MAX_MS, MASTER_AUTO_RELEASE_MIN_MS, MasterEqBand, MasterRatio,
-        MasterStripParam,
+        MASTER_AUTO_RELEASE_MAX_MS, MASTER_AUTO_RELEASE_MIN_MS, MasterAttack, MasterCompSettings,
+        MasterEqBand, MasterLimiterSettings, MasterRatio, MasterStripParam,
     };
 
     const SR: f32 = 48_000.0;
@@ -384,5 +385,104 @@ mod tests {
         assert_eq!(delay, 240);
         assert!(l[..delay].iter().all(|v| *v == 0.0), "遅延ぶんの無音が出ていない");
         assert!((l[delay] - 0.5).abs() < 1e-6, "遅延の直後に信号が出る: {}", l[delay]);
+    }
+
+    // ---- r.md #129 S0: 組み込み DSP の golden (master 側のシナリオ) ----
+    //
+    // 書き出しは `mixer::channel_strip::tests::record_golden` が strip 側と一緒に行う。
+
+    /// T1 の master 由来シナリオ: Bus Comp の ratio × attack × release {300ms, Auto} (Auto は
+    /// buffer 256 / 512 / 1024) / Tone EQ ±6 と帯域ごとに違うゲイン / master 完全形 (+6dB 入力、
+    /// ceiling −1、リミッターの先読み遅延あり)。
+    pub(crate) fn golden_scenarios() -> Vec<Scenario> {
+        let mut out = Vec::new();
+        for ratio in MasterRatio::ALL {
+            for attack in MasterAttack::ALL {
+                for (release, blocks) in
+                    [(MasterRelease::R300, &[512][..]), (MasterRelease::Auto, &[256, 512, 1_024][..])]
+                {
+                    let strip = MasterStrip { comp: golden_bus_comp(ratio, attack, release), ..MasterStrip::default() };
+                    let label = format!("{ratio:?}/{attack:?}/{release:?}");
+                    push_master(&mut out, "bus_comp", &label, &strip, blocks, 0.0);
+                }
+            }
+        }
+        for (label, [low_db, lomid_db, high_db]) in
+            [("all+6", [6.0, 6.0, 6.0]), ("all-6", [-6.0, -6.0, -6.0]), ("mixed", [6.0, -6.0, 3.0])]
+        {
+            let eq = MasterEqSettings { on: true, low_db, lomid_db, high_db };
+            push_master(&mut out, "tone_eq", label, &MasterStrip { eq, ..MasterStrip::default() }, &[512], 0.0);
+        }
+        let full = MasterStrip {
+            comp: golden_bus_comp(MasterRatio::R4, MasterAttack::A3, MasterRelease::Auto),
+            eq: MasterEqSettings { on: true, low_db: 2.0, lomid_db: -1.5, high_db: 3.0 },
+            limiter: MasterLimiterSettings { on: true, ceiling_db: -1.0 },
+        };
+        push_master(&mut out, "master_full", "input+6_ceiling-1", &full, &[512, 1_024], 6.0);
+        out
+    }
+
+    fn golden_bus_comp(ratio: MasterRatio, attack: MasterAttack, release: MasterRelease) -> MasterCompSettings {
+        MasterCompSettings { on: true, threshold_db: -18.0, ratio, attack, release, makeup_db: 2.0 }
+    }
+
+    fn push_master(
+        out: &mut Vec<Scenario>,
+        kind: &str,
+        label: &str,
+        strip: &MasterStrip,
+        blocks: &[usize],
+        input_gain_db: f64,
+    ) {
+        let with_limiter = strip.limiter.on;
+        let driver = if with_limiter {
+            "MasterStripState::process_pre+process_limiter"
+        } else {
+            "MasterStripState::process_pre"
+        };
+        for &block in blocks {
+            for stim in Stimulus::ALL {
+                let mut st = MasterStripState::new();
+                let windows = dsp_golden::run_blocks(&stim.generate(input_gain_db), block, |l, r| {
+                    let n = l.len();
+                    st.process_pre(strip, l, r, n, SR);
+                    if with_limiter {
+                        st.process_limiter(strip, l, r, n, SR);
+                    }
+                    let (gr, lim_gr) = st.gain_reduction_db();
+                    BlockGr { gr, lim_gr }
+                });
+                let mut meta = dsp_golden::drive_meta(kind, driver, stim, block, input_gain_db);
+                push_master_meta(&mut meta, strip);
+                let name = format!("{kind}/{label}/block={block}/{}", stim.name());
+                out.push(Scenario { name, meta, windows });
+            }
+        }
+    }
+
+    fn push_master_meta(meta: &mut Vec<(String, String)>, strip: &MasterStrip) {
+        let (c, e, lim) = (&strip.comp, &strip.eq, &strip.limiter);
+        let mut kv = |k: &str, v: String| meta.push((k.to_string(), v));
+        kv("comp.on", c.on.to_string());
+        if c.on {
+            kv("comp.threshold_db", format!("{:?}", c.threshold_db));
+            kv("comp.ratio", format!("{:?}", c.ratio));
+            kv("comp.ratio_index", format!("{:?}", strip.param(MasterStripParam::CompRatio)));
+            kv("comp.attack", format!("{:?}", c.attack));
+            kv("comp.attack_index", format!("{:?}", strip.param(MasterStripParam::CompAttack)));
+            kv("comp.release", format!("{:?}", c.release));
+            kv("comp.release_index", format!("{:?}", strip.param(MasterStripParam::CompRelease)));
+            kv("comp.makeup_db", format!("{:?}", c.makeup_db));
+        }
+        kv("eq.on", e.on.to_string());
+        if e.on {
+            kv("eq.low_db", format!("{:?}", e.low_db));
+            kv("eq.lomid_db", format!("{:?}", e.lomid_db));
+            kv("eq.high_db", format!("{:?}", e.high_db));
+        }
+        kv("limiter.on", lim.on.to_string());
+        if lim.on {
+            kv("limiter.ceiling_db", format!("{:?}", lim.ceiling_db));
+        }
     }
 }
