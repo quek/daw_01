@@ -1086,9 +1086,9 @@ mod tests {
         sink
     }
 
-    /// 内蔵 Comp を強く掛けたトラック 1 本の曲。素材は L と R で振幅も周波数も違うサイン波
-    /// (pan の左右差と Comp の効き方が測れる)。クリップは 1..3 拍。
-    fn bounce_source_song(dir: &std::path::Path, volume: f32, pan: f32) -> (Song, u32) {
+    /// トラック 1 本の曲 (`comp` なら内蔵 Comp を強く掛ける)。素材は L と R で振幅も周波数も違うサイン波
+    /// (pan の左右差と Comp の効き方が測れる)。焼くクリップは 1..3 拍で、その住所を返す。
+    fn bounce_source_song(dir: &std::path::Path, volume: f32, pan: f32, comp: bool) -> (Song, common::model::ClipKey) {
         use common::model::*;
         let wav = dir.join("source.wav");
         let spec = WavSpec { channels: 2, sample_rate: BOUNCE_SR, bits_per_sample: 32, sample_format: SampleFormat::Float };
@@ -1124,73 +1124,122 @@ mod tests {
             song.alloc_content(ClipContent::Audio(AudioContent { events: vec![event], next_event_id: 2 }), "src".into());
         let mut track = Track { id: song.alloc_track_id(), ..Track::default() };
         (track.volume, track.pan) = (volume, pan);
-        track.place_clip(Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Clip::default() });
-        let comp_id = song.alloc_device_id();
-        let mut comp = NativeDevice::new_added(NativeKind::Comp, comp_id, 2);
-        if let NativeParams::Comp(c) = &mut comp.params {
-            (c.threshold_db, c.ratio, c.makeup_db) = (-24.0, 8.0, 6.0);
+        let clip_id = track.place_clip(Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Clip::default() });
+        if comp {
+            let comp_id = song.alloc_device_id();
+            let mut comp = NativeDevice::new_added(NativeKind::Comp, comp_id, 2);
+            if let NativeParams::Comp(c) = &mut comp.params {
+                (c.threshold_db, c.ratio, c.makeup_db) = (-24.0, 8.0, 6.0);
+            }
+            track.devices.push(Device::Native(comp));
         }
-        track.devices.push(Device::Native(comp));
-        let tid = track.id;
+        let track_id = track.id;
         song.tracks.push(track);
         song.enforce_edit_invariants();
-        (song, tid)
+        (song, ClipKey { track_id, clip_id })
     }
 
-    /// Bounce with FX は元と同じ音で鳴る (r.md #129): 元トラックを鳴らした mix と、そのクリップを焼いて
-    /// (`Song::isolated_track` → engine の書き出し) 新しいトラックに置いた (`Song::place_bounce_with_fx`) 後の mix を
-    /// 同じ区間で描き、L / R それぞれのピークと RMS が一致する。焼く段がフェーダーを含むと、写したフェーダーで
-    /// もう一度掛かる (pan を振ると振った側が最大 +3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
-    #[test]
-    fn bounce_with_fx_sounds_like_the_original_track() {
+    /// 製品の Bounce (with FX) と同じ操作列: `Song::isolated_track` → engine の書き出し (`PostFx`) →
+    /// `Song::add_baked_audio` → `Song::place_bounce_with_fx` → 編集後の不変条件。
+    fn bounce_with_fx(song: &Song, source: common::model::ClipKey, dir: &std::path::Path) -> Song {
+        let clip = song.clip_by_key(source).expect("source clip").clone();
+        let window = (clip.start_beat, clip.start_beat + clip.length_beats);
+        let baked_path = dir.join("baked.wav");
+        let engine = Arc::new(EngineShared::new());
+        engine.live_parked.store(true, Ordering::Release);
+        let project = Arc::new(ProjectShared::new(common::protocol::ProjectKey(1), 0));
+        let isolated = song.isolated_track(source.track_id).expect("isolated");
+        let span = RenderSpan::RangeWarm { start_beat: window.0, end_beat: window.1 };
+        let scope = RenderScope::PostFx;
+        let max = common::process_data::MAX_FRAMES;
+        let outcome =
+            run_export(baked_path.clone(), engine, project, isolated, BOUNCE_SR, max, span, scope, false, |_, _| {})
+                .expect("bake");
+        let mut bounced = song.clone();
+        let wav = common::model::BakedWav {
+            path: common::model::AudioSourcePath::Absolute(baked_path),
+            sample_rate: BOUNCE_SR,
+            frames: outcome.frames,
+        };
+        let (_, content) = bounced.add_baked_audio(wav, window, clip.content_offset_beats);
+        let content_id = bounced.alloc_content(common::model::ClipContent::Audio(content), "baked".into());
+        let baked = common::model::Clip { content_id, ..clip };
+        bounced.place_bounce_with_fx(source, "FX".into(), baked).expect("placed");
+        bounced.enforce_edit_invariants();
+        bounced
+    }
+
+    /// 2 つの mix の L / R それぞれのピークと RMS が 0.05 dB 以内で一致する。
+    fn assert_same_sound(case: &str, original: &StereoCapture, after: &StereoCapture) {
         let db = |x: f32| 20.0 * x.max(1e-9).log10();
         let peak = |s: &[f32]| s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let rms = |s: &[f32]| (s.iter().map(|v| v * v).sum::<f32>() / s.len().max(1) as f32).sqrt();
+        assert!(peak(&original.l) > 0.05, "{case}: 元の mix が鳴っている");
+        for (ch, a, b) in [("L", &original.l, &after.l), ("R", &original.r, &after.r)] {
+            assert_eq!(a.len(), b.len(), "{case} {ch}: 同じ区間");
+            let (dp, dr) = (db(peak(b)) - db(peak(a)), db(rms(b)) - db(rms(a)));
+            assert!(dp.abs() < 0.05 && dr.abs() < 0.05, "{case} {ch}: ピーク差 {dp:.3} dB / RMS 差 {dr:.3} dB");
+        }
+    }
+
+    fn bounce_temp_dir(case: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("daw01_bounce_fx_parity_{}_{case}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Bounce with FX は元と同じ音で鳴る (r.md #129): 元トラックを鳴らした mix と、そのクリップを焼いて新しいトラックに
+    /// 置いた後の mix を同じ区間で描き、L / R それぞれのピークと RMS が一致する。焼く段がフェーダーを含むと、写した
+    /// フェーダーでもう一度掛かる (pan を振ると振った側が最大 +3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと
+    /// Comp が消える。
+    #[test]
+    fn bounce_with_fx_sounds_like_the_original_track() {
         for (volume, pan) in [(1.0, 0.0), (1.0, -0.6), (0.5, 0.0)] {
-            let dir = std::env::temp_dir().join(format!("daw01_bounce_fx_parity_{}_{volume}_{pan}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let (song, tid) = bounce_source_song(&dir, volume, pan);
-            let original = render_mix(&song, 1.0, 3.0);
-
-            let baked_path = dir.join("baked.wav");
-            let engine = Arc::new(EngineShared::new());
-            engine.live_parked.store(true, Ordering::Release);
-            let project = Arc::new(ProjectShared::new(common::protocol::ProjectKey(1), 0));
-            let isolated = song.isolated_track(tid).expect("isolated");
-            let span = RenderSpan::RangeWarm { start_beat: 1.0, end_beat: 3.0 };
-            let outcome = run_export(
-                baked_path.clone(),
-                engine,
-                project,
-                isolated,
-                BOUNCE_SR,
-                common::process_data::MAX_FRAMES,
-                span,
-                RenderScope::PostFx,
-                false,
-                |_, _| {},
-            )
-            .expect("bake");
-            let mut bounced = song.clone();
-            let wav = common::model::BakedWav {
-                path: common::model::AudioSourcePath::Absolute(baked_path),
-                sample_rate: BOUNCE_SR,
-                frames: outcome.frames,
-            };
-            let (_, content) = bounced.add_baked_audio(wav, (1.0, 3.0), 0.0);
-            let content_id = bounced.alloc_content(common::model::ClipContent::Audio(content), "baked".into());
-            let clip = common::model::Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Default::default() };
-            bounced.place_bounce_with_fx(tid, "FX".into(), clip).expect("placed");
-            bounced.enforce_edit_invariants();
-            let after = render_mix(&bounced, 1.0, 3.0);
-
             let case = format!("volume {volume} / pan {pan}");
-            assert!(peak(&original.l) > 0.05, "{case}: 元の mix が鳴っている");
-            for (ch, a, b) in [("L", &original.l, &after.l), ("R", &original.r, &after.r)] {
-                assert_eq!(a.len(), b.len(), "{case} {ch}: 同じ区間");
-                let (dp, dr) = (db(peak(b)) - db(peak(a)), db(rms(b)) - db(rms(a)));
-                assert!(dp.abs() < 0.05 && dr.abs() < 0.05, "{case} {ch}: ピーク差 {dp:.3} dB / RMS 差 {dr:.3} dB");
-            }
+            let dir = bounce_temp_dir(&format!("{volume}_{pan}"));
+            let (song, source) = bounce_source_song(&dir, volume, pan, true);
+            let bounced = bounce_with_fx(&song, source, &dir);
+            assert_same_sound(&case, &render_mix(&song, 1.0, 3.0), &render_mix(&bounced, 1.0, 3.0));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 元トラックは mute せず焼いたクリップだけを mute するので、そのトラックを通るほかの音 (group の子 / 受けた send /
+    /// 同じトラックの別のクリップ) は Bounce の後も鳴り続け、mix は元と同じ (元トラックを mute するとこれらが消える)。
+    #[test]
+    fn bounce_with_fx_keeps_what_else_flows_through_the_track() {
+        use common::model::{Clip, SendMode, Track};
+        type Arrange = fn(&mut Song, u32, common::model::ContentId);
+        fn add_track(song: &mut Song, content_id: common::model::ContentId, parent: Option<u32>) -> u32 {
+            let mut t = Track { id: song.alloc_track_id(), parent_group_id: parent, ..Track::default() };
+            t.place_clip(Clip { start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() });
+            let id = t.id;
+            song.tracks.push(t);
+            id
+        }
+        let cases: [(&str, Arrange); 3] = [
+            ("group の子を持つ group トラック", |song, tid, content| {
+                add_track(song, content, Some(tid));
+            }),
+            ("send を受けるトラック", |song, tid, content| {
+                let from = add_track(song, content, None);
+                let t = song.track_by_id_mut(from).expect("send source");
+                t.sends.push(common::model::Send { id: 1, dest_track_id: tid, gain: 0.5, mode: SendMode::PostFader, enabled: true });
+                t.next_send_id = 2;
+            }),
+            ("同じトラックに別のクリップ", |song, tid, content| {
+                let t = song.track_by_id_mut(tid).expect("track");
+                t.place_clip(Clip { start_beat: 3.0, length_beats: 2.0, content_id: content, ..Clip::default() });
+            }),
+        ];
+        for (i, (case, arrange)) in cases.into_iter().enumerate() {
+            let dir = bounce_temp_dir(&format!("flow_{i}"));
+            let (mut song, source) = bounce_source_song(&dir, 0.7, -0.4, false);
+            let content = song.clip_by_key(source).expect("source clip").content_id;
+            arrange(&mut song, source.track_id, content);
+            song.enforce_edit_invariants();
+            let bounced = bounce_with_fx(&song, source, &dir);
+            assert_same_sound(case, &render_mix(&song, 0.0, 6.0), &render_mix(&bounced, 0.0, 6.0));
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

@@ -236,7 +236,7 @@ Formant は全 mode で有効 (Stretch は「0 = 原音の声質を保持」、 
 | **Reverse** (右クリック) | `event.reversed` 反転 (再生時に source を逆方向走査、 destructive ではない) |
 | **Normalize** (右クリック) | event の peak を解析し、 0 dB に達する係数を `event.gain_db` に設定 (non-destructive、 Bitwig 流) |
 | **Bounce In Place** (右クリック) | clip 内 events を offline render → 1 つの新 AudioSource (.wav) に書き込み → ClipContent を 1 event 構成に置換。 Bitwig "Pre-FX" は plugin chain 通さず |
-| **Bounce** (右クリック) | bounce 結果を **新 Clip** / **新 track** に書き出し (元 clip は残る)。焼くのは device チェーンまでで、フェーダー / send / 行き先は新 track へ写し、元 track は mute (元と同じ音で鳴る。規則は `Song::place_bounce_with_fx`) |
+| **Bounce** (右クリック) | bounce 結果を **新 Clip** / **新 track** に書き出し (元 clip は残る)。焼くのは device チェーンまでで、フェーダー / send / 行き先は新 track へ写し、焼いた元 clip だけを mute (元 track の他の音はそのまま鳴り、元と同じ音になる。規則は `Song::place_bounce_with_fx`) |
 
 ### 3.9 Inspector
 

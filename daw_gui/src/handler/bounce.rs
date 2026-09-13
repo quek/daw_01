@@ -175,7 +175,7 @@ impl AppData {
     /// song ([`common::model::Song::isolated_track`]) を engine に LoadSong し、offline render を要求する。
     /// In Place は素材の音 (`RenderScope::Sources`)、With FX は device チェーンまで (`RenderScope::PostFx`) を焼く。
     /// 結果は完了通知 handler (`handle_bounce_clip_fx_complete`) が mode に応じて「同位置置換」/
-    /// 「新トラック + 元ミュート」([`common::model::Song::place_bounce_with_fx`]) する。
+    /// 「新トラック + 元クリップのミュート」([`common::model::Song::place_bounce_with_fx`]) する。
     /// Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
     pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
@@ -340,7 +340,7 @@ impl AppData {
     /// (`handle_bounce_clip_fx_complete`) 内で Undo snapshot を 1 回だけ
     /// 取る。 既に bounce 進行中なら重複 request を拒否。
     /// With FX = 音源/synth + そのトラックの device チェーン (内蔵 device 含む) を engine offline
-    /// render で焼き、**新トラックに置いてフェーダー / send / 行き先を写す** + 元トラック自動ミュート
+    /// render で焼き、**新トラックに置いてフェーダー / send / 行き先を写す** + 元クリップ自動ミュート
     /// (非破壊・二重再生回避、async、規則は [`common::model::Song::place_bounce_with_fx`])。対象クリップ 1 トラックだけを
     /// isolate するので他トラックは混ざらない
     /// (旧実装は時間範囲の全ミックスを焼くバグがあった)。歌唱の合成待ちは `request_bounce` 経由。
@@ -418,12 +418,13 @@ impl AppData {
             return;
         }
         // 置き先が bounce 中の編集で消えていたら結果を破棄する (index でなく stable id で判定):
-        // In Place は置換対象の content (別クリップを誤置換しない)、With FX は元トラック
-        // (写すフェーダーと配線の持ち主、mute する相手が居ない)。
+        // In Place は置換対象の content (別クリップを誤置換しない)、With FX は元クリップ
+        // (mute する相手と、写すフェーダーの持ち主が居ない)。
         let song = self.cur.song_doc.song();
+        let source = ClipKey { track_id: pending.source_track_id, clip_id: pending.source_clip };
         let gone = match pending.mode {
             BounceMode::InPlace => (!song.clip_contents.contains_key(&pending.source_content_id)).then_some("対象クリップ"),
-            BounceMode::WithFx => song.track_by_id(pending.source_track_id).is_none().then_some("元トラック"),
+            BounceMode::WithFx => song.clip_by_key(source).is_none().then_some("元クリップ"),
         };
         if let Some(what) = gone {
             self.ui_ephemeral.status_message = format!("{label}: {what}が消えたため結果を破棄しました");
@@ -438,7 +439,7 @@ impl AppData {
         let wav = common::model::BakedWav { path: pending.source_path.clone(), sample_rate: self.ipc.sample_rate, frames };
         let window = (pending.start_beat, pending.start_beat + pending.clip_length_beats);
         let (mode, offset, length) = (pending.mode, pending.content_offset_beats, pending.clip_length_beats);
-        let (source_track_id, source_content_id) = (pending.source_track_id, pending.source_content_id);
+        let source_content_id = pending.source_content_id;
         let track_name = format!("{} (FX)", pending.clip_name);
         let (content_name, new_track_name) = (format!("{} (bounced FX)", pending.clip_name), track_name.clone());
         let placed = self.edit_song(move |song| {
@@ -454,7 +455,7 @@ impl AppData {
                         content_offset_beats: offset,
                         ..Default::default()
                     };
-                    song.place_bounce_with_fx(source_track_id, new_track_name, clip)?;
+                    song.place_bounce_with_fx(source, new_track_name, clip)?;
                 }
                 // 元クリップの content を置換 (= flat 化)。同 content_id を共有する linked clip も追従する。
                 BounceMode::InPlace => *song.clip_contents.get_mut(&source_content_id)? = content,
@@ -483,7 +484,7 @@ impl AppData {
         self.ui_ephemeral.status_message = match mode {
             BounceMode::WithFx => {
                 self.resize_track_peak_display();
-                format!("Bounce (with FX) 完了: 新トラック '{track_name}' を追加 (元トラックはミュート)")
+                format!("Bounce (with FX) 完了: 新トラック '{track_name}' を追加 (元クリップはミュート)")
             }
             BounceMode::InPlace => format!("Bounce In Place 完了: '{}'", pending.clip_name),
         };
