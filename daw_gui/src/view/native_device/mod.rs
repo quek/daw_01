@@ -26,6 +26,10 @@ pub use curve::{CurveAxes, CurveBand, CurveHandle, CurveLook, EqCurveSource, Han
 pub use gr::{LIMITER_GR_SEGMENTS, draw_gr_horizontal, draw_gr_segments, draw_gr_vertical, gr_text};
 pub use knob::{NativeKnobResponse, NativeKnobSpec, limiter_knob, native_knob, native_knob_with_value};
 
+/// OFF (bypass) の device の表示 (EQ カーブの線とスペクトラム / GR メーターの溝と塗り) の不透明度の倍率。
+/// 形は変えずに薄くする (Q9)。部品ごとに持つと OFF の見え方が面ごとに割れるので 1 か所に置く。
+const INACTIVE_ALPHA: f32 = 0.45;
+
 /// 共有部品の widget id: `(描画面, 持ち主の device, 部品名, 部品内の鍵)`。
 ///
 /// 位置 (行 index / トラック index) を鍵にしない (不変条件 1) — 並べ替えても入力状態が付いて回らない。

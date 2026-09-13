@@ -292,8 +292,8 @@ fn draw_limiter(ctx: &MasterCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     // ---- GR セグメント (1 個 = 1dB) ----
     let bar = Rect { h: LIM_BAR_H - 2.0, ..rect };
     let gr_id = wid(SURFACE, RackPanelKey::MasterLimiter, "gr", ());
+    // OFF の見せ方 (溝と塗りを薄く) は共有部品が持つ (Rack の行・Par と同じ見え方)。
     draw_gr_segments(app, ui, gr_id, bar, app.cur.transport.master_limiter_gr, on, LIMITER_GR_SEGMENTS);
-    dim_if_off(app, ui, bar, on);
 
     // ---- ノブ 1 個 + 常時表示の数値欄 ----
     // この行はノブが 1 個で右側が空くので、hover を待たずに値をノブの横へ常に出す
