@@ -438,8 +438,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         // depth 表示値 (= modulation 弧 + on_mod_change): depth gesture drag 中のみ更新、 他は現 depth。
+        // `mod_dragging` と同じ閾値で gate する (scrubable_number と同じ): caller は `mod_dragging` の立ち上がりで
+        // undo を束ねるので、 立つ前に depth を出すとその値が束ねる外で別の step になる。
         let displayed_depth: f64 = if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos)
             && anchor.depth_drag
+            && drag_distance >= DRAG_THRESHOLD_PX
         {
             let d = knob_drag_delta(anchor.pointer_y, py, depth_units_per_px, anchor.ctrl);
             clamp_opt(anchor.value + d, depth_range)
@@ -1787,6 +1790,31 @@ mod tests {
         assert_eq!(n, 0, "閾値未満 click は depth Edit を発火しない (got {n} edits)");
         assert!((model.depth - 0.0).abs() < 1e-9, "depth は変わらない (got {})", model.depth);
         assert!(!resp.mod_dragging, "閾値未満では mod_dragging は立たない");
+    }
+
+    /// 押したまま閾値未満を動かしている間も depth Edit を出さない。depth の最初の値は `mod_dragging` が
+    /// 立つフレームと同じフレームに出る (caller は `mod_dragging` を見て undo を束ねるので、立つ前に
+    /// 値が出ると束ねる前の値が別の step になる。scrubable_number と同じ gate)。
+    #[test]
+    fn mod_edit_subthreshold_hold_fires_no_depth_until_mod_dragging() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { value: 0.5, depth: 0.0 };
+        let rect = knob_rect();
+        let c = knob_center();
+
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, press_at(c, false), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        let (edits, resp) =
+            run_mod_frame(&mut host, &model, rect, hold_at((c.0, c.1 - 2.0), false), true, &[], None, &mut Scene::new());
+        assert_eq!(edits.len(), 0, "閾値未満の hold は depth Edit を出さない");
+        assert!(!resp.mod_dragging);
+        let (edits, resp) =
+            run_mod_frame(&mut host, &model, rect, hold_at((c.0, c.1 - 10.0), false), true, &[], None, &mut Scene::new());
+        assert!(resp.mod_dragging, "閾値を越えたら mod_dragging");
+        assert!(!edits.is_empty(), "同じフレームに depth の最初の値が出る");
+        for e in edits { e.apply(&mut model); }
+        assert!(model.depth > 0.0, "上へ動かしたので depth が増える (got {})", model.depth);
     }
 
     /// entries がリングの radial 余地を超えても panic せず graceful に skip する (内側から詰める)。

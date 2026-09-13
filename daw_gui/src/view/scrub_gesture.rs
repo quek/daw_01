@@ -24,6 +24,14 @@
 //! **所有者は 1 度に 1 つ**。`SongDoc` の bracket
 //! ([`SongDoc::begin_gesture`](crate::state::SongDoc::begin_gesture)) が 1 本しか
 //! 無いので、追跡側を面ごとに分けると「A が開けたまま B が閉じる」が黙って作れる。
+//!
+//! ## 開くのは同じフレームの値より先 (prelude キュー)
+//!
+//! 欄は `active` (drag が閾値を越えた / 変調深さのドラッグが始まった) を見てから申告するので、欄が
+//! 同じフレームに既に積んだ最初の値の Edit より **後ろ** に並ぶ。そのまま適用すると最初の値だけが
+//! bracket の外で 1 undo step 積まれる。そこで **開く Edit だけ** を daw-ui core の prelude キュー
+//! (`Ui::push_prelude_edit`) に積んで値より先に効かせる。在席印と閉じる Edit は通常キューのまま
+//! (離したフレームの最後の値を、閉じる前に適用するため)。
 
 use daw_ui_core::{Edit, Ui};
 
@@ -46,11 +54,12 @@ pub(crate) fn push(ui: &mut Ui<'_, AppData>, app: &AppData, owner: ScrubGesture,
         return;
     };
     if open_it {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| open(app, owner.clone())));
+        // 同じフレームの値より先に開く (モジュール doc)。
+        ui.push_prelude_edit(Edit::mutate(move |app: &mut AppData| open(app, owner.clone())));
     } else {
-        // **閉じるのは自分が所有者のままのときだけ。** `Edit` は積んだ順に
-        // フレーム末へ適用されるので、同じフレームで A が離され B が掴まれると
-        // 「B を開く」→「A を閉じる」の順になり得る。所有者を照合しないと
+        // **閉じるのは自分が所有者のままのときだけ。** 開く Edit は prelude で先に
+        // 適用されるので、同じフレームで A が離され B が掴まれると必ず
+        // 「B を開く」→「A を閉じる」の順になる。所有者を照合しないと
         // 掴んだばかりの B の bracket をその場で畳んでしまう。
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if app.cur.peph.scrub_gesture.as_ref() == Some(&owner) {

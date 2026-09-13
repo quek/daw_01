@@ -4,39 +4,14 @@
 
 use super::*;
 
-pub(super) fn advance(app: &AppData, ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
+pub(super) fn advance(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     update_sessions(ui, f);
     edge_autoscroll(ui, f);
     emit_lane_height(ui, f);
     emit_row_height(ui, f);
     emit_header_w(ui, f);
     emit_playhead(ui, f);
-    declare_track_volume_gesture(app, ui, f);
     emit_track_volume(ui, f);
-}
-
-/// ヘッダ音量のドラッグをジェスチャーとして申告する (r.md #129 §7.6、面 = `ArrangementHeader`)。
-///
-/// **値の Edit ([`emit_track_volume`]) より先に積む。** press のフレームでクリック位置へ飛ぶ値が
-/// 出るので、申告が後だと最初の値だけが gesture の外で 1 undo step 積まれ、1 ドラッグが 2 step に
-/// 割れる。session が生きている間 (press / 移動 / release) だけ申告し、離した次のフレームは
-/// 申告しないので、そのフレーム末の sweep が閉じる (全トラックの非ドラッグを毎フレーム申告すると、
-/// Mixer フェーダーが握っている同じ Volume を閉じてしまう)。
-fn declare_track_volume_gesture(app: &AppData, ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
-    let track = {
-        let state: &mut ArrangementState = ui.widget_state(f.wid);
-        state.track_volume_drag.as_ref().map(|tv| tv.track_id)
-    };
-    if let Some(track) = track {
-        crate::view::param_gesture::push_param_gesture(
-            ui,
-            app,
-            crate::app::ParamSurface::ArrangementHeader,
-            track,
-            common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume),
-            true,
-        );
-    }
 }
 
 /// release フレームで winit が pointer を press 位置へ巻き戻す現象への対処。
