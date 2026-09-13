@@ -8,10 +8,19 @@
 //!   2. audio 側が `WorkerBridge::worker_task` の対応 slot に書いた
 //!      **安定 device id (u64)** を読む (v29 — session-unique plugin_id は
 //!      廃止)。
-//!   3. その id を [`PluginRegistry`] (`HashMap<u64, PluginEntry>` の
-//!      ArcSwap snapshot) で resolve し、 live な entry に対応していれば
-//!      audio half の `process()` を呼ぶ。
+//!   3. 自分の受け口 ([`RegistryInbox`]) に届いている最新の registry snapshot を採用し、
+//!      その id を resolve して live な entry に対応していれば audio half の `process()` を呼ぶ。
 //!   4. `done` event を signal して audio worker を再開させる。
+//!
+//! # registry snapshot の受け渡し (worker が旧 snapshot の最終参照にならない)
+//!
+//! 正本は plugin-main thread の [`PluginRegistry`]。変更のたびに新しい snapshot
+//! (`Arc<RegistryMap>`) を worker ごとの単一 slot の受け口 ([`SnapshotMailbox`]) に置き、worker は
+//! dispatch-critical section の頭でそれを取って差し替える。**差し替えた旧 snapshot は worker 上で
+//! drop せず、recycle ring で plugin-main へ返す** (plugin-main が次の変更の前に回収して drop する)。
+//! 旧実装は `ArcSwap::load` で読んでおり、store と重なると Guard が旧値の最終参照になって
+//! worker (TIME_CRITICAL) 上で旧 map と、外した plugin の audio half が解放されえた
+//! (arc-swap 1.9.1 hybrid 戦略、daw_audio の `RtBundle` と同じ根)。
 //!
 //! # plugin Drop の同期: `DispatchCounter` + `quiesce`
 //!
@@ -28,9 +37,10 @@
 //!
 //! plugin-main thread の [`WorkerPool::quiesce`] は `enter` を snapshot し、
 //! 全 worker で `exit` が追いつくのを待つ。 registry から entry を外して
-//! (`registry_remove`) から `quiesce` を呼べば、 以後 worker はその audio
-//! half に触れない — そこで初めて main half (と FFI plugin) を安全に
-//! deactivate / drop できる。
+//! (`registry_remove` = 外した snapshot を全 worker の受け口に置く) から `quiesce` を呼べば、
+//! 以後に critical section に入る worker は必ずその snapshot 以降を採用する (置く `swap` と
+//! `enter` / 採用の `swap` がすべて `SeqCst`) ので、その audio half に触れない — そこで初めて
+//! main half (と FFI plugin) を安全に deactivate / drop できる。
 //!
 //! IDLE wake / missing-entry でも counter は bump する (SeqCst 全順序の
 //! 論証を分岐 free に保つため)。
@@ -101,42 +111,178 @@ impl Clone for PluginEntry {
 unsafe impl Send for PluginEntry {}
 unsafe impl Sync for PluginEntry {}
 
-/// Lock-free [`InstanceToken`] → [`PluginEntry`] lookup the worker pool reads
-/// during dispatch. plugin-main thread が add / remove ごとに新しい
-/// `HashMap` を publish する; 古い snapshot は最後の worker guard が落ちる
-/// まで生きる (Arc entry なので dangle しない)。
-pub type PluginRegistry = Arc<arc_swap::ArcSwap<HashMap<InstanceToken, PluginEntry>>>;
+/// registry 1 世代の中身 ([`InstanceToken`] → [`PluginEntry`])。
+pub type RegistryMap = HashMap<InstanceToken, PluginEntry>;
+
+/// worker が差し替えた旧 snapshot を plugin-main へ返す ring の容量。plugin-main は snapshot を置く
+/// **前に** 必ず回収するので、1 回の回収から次の回収までに 1 本の worker が返すのは「回収と同時に
+/// 採用していた 1 本」+「その回収の後に置かれた 1 本」の高々 2 本。余裕を持たせた値で、満杯には
+/// 到達しない ([`RegistryInbox::adopt_latest`] は満杯でも worker 上で解放しない)。
+const RETIRED_RING_CAP: usize = 8;
+
+/// 単一 slot の最新 snapshot の受け渡し口 (worker 1 本ぶん)。所有権を `AtomicPtr` で移すので、
+/// 置く側 (plugin-main) と取る側 (worker) のどちらも相手の保持中の値を解放しない。
+/// 置く / 取るは `SeqCst` (`DispatchCounter` との全順序、module doc の quiesce の論証)。
+struct SnapshotMailbox {
+    slot: std::sync::atomic::AtomicPtr<RegistryMap>,
+}
+
+impl SnapshotMailbox {
+    fn new() -> Self {
+        Self { slot: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }
+    }
+
+    /// plugin-main (非 RT): `snap` を置き、worker がまだ取っていなかった前の値を返す (解放は呼び出し側)。
+    fn post(&self, snap: Arc<RegistryMap>) -> Option<Arc<RegistryMap>> {
+        let prev = self.slot.swap(Arc::into_raw(snap).cast_mut(), Ordering::SeqCst);
+        // SAFETY: slot に入るのは `post` の `Arc::into_raw` だけで、取り出した側が所有権を 1 回だけ戻す。
+        (!prev.is_null()).then(|| unsafe { Arc::from_raw(prev) })
+    }
+
+    /// worker (RT): 置かれていれば取る。swap 1 回だけ (確保・解放なし)。
+    fn take(&self) -> Option<Arc<RegistryMap>> {
+        let p = self.slot.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        // SAFETY: `post` と同じ。
+        (!p.is_null()).then(|| unsafe { Arc::from_raw(p) })
+    }
+}
+
+impl Drop for SnapshotMailbox {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+/// plugin-main 側の送り口 (worker 1 本ぶん)。
+struct RegistryFeed {
+    mailbox: Arc<SnapshotMailbox>,
+    retired: rtrb::Consumer<Arc<RegistryMap>>,
+}
+
+/// worker thread 側の受け口。worker が所有し、dispatch-critical section の頭で
+/// [`Self::adopt_latest`] を呼ぶ。
+pub struct RegistryInbox {
+    mailbox: Arc<SnapshotMailbox>,
+    retired: rtrb::Producer<Arc<RegistryMap>>,
+    current: Arc<RegistryMap>,
+    /// recycle ring が満杯だったときに返しそびれた旧 snapshot (次の採用で先に返す)。
+    stash: Option<Arc<RegistryMap>>,
+}
+
+impl RegistryInbox {
+    /// 置かれている最新の snapshot を採用して、今の snapshot を返す。**worker (RT) 上で確保も解放もしない** —
+    /// 差し替えた旧 snapshot は recycle ring で plugin-main へ返す。ring は `RETIRED_RING_CAP` の doc の上限に
+    /// より満杯にならない。満杯なら手元に 1 本保って次の採用で先に返す (2 本目も溢れるのは上限の数倍の
+    /// 未回収で、そこだけは worker 上で解放される)。
+    fn adopt_latest(&mut self) -> &RegistryMap {
+        if let Some(stashed) = self.stash.take()
+            && let Err(rtrb::PushError::Full(back)) = self.retired.push(stashed)
+        {
+            self.stash = Some(back);
+        }
+        if let Some(latest) = self.mailbox.take() {
+            let old = std::mem::replace(&mut self.current, latest);
+            if let Err(rtrb::PushError::Full(back)) = self.retired.push(old) {
+                self.stash.get_or_insert(back);
+            }
+        }
+        &self.current
+    }
+}
+
+struct RegistryState {
+    current: Arc<RegistryMap>,
+    feeds: Vec<RegistryFeed>,
+}
+
+impl RegistryState {
+    /// 新しい中身を正本にして全 worker の受け口に置く。置く前に、worker が返した旧 snapshot と
+    /// まだ取られていなかった前の snapshot を回収して **ここ (plugin-main) で** drop する。
+    fn publish(&mut self, next: RegistryMap) {
+        let next = Arc::new(next);
+        for feed in &mut self.feeds {
+            while let Ok(old) = feed.retired.pop() {
+                drop(old);
+            }
+            drop(feed.mailbox.post(Arc::clone(&next)));
+        }
+        self.current = next;
+    }
+}
+
+/// [`InstanceToken`] → [`PluginEntry`] の registry。正本と worker への送り口を持ち、**plugin-main
+/// thread だけが触る** (worker は [`RegistryInbox`] で読む。module doc の「registry snapshot の受け渡し」)。
+pub struct PluginRegistry {
+    state: std::sync::Mutex<RegistryState>,
+}
+
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self { state: std::sync::Mutex::new(RegistryState { current: Arc::new(HashMap::new()), feeds: Vec::new() }) }
+    }
+}
+
+impl PluginRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        // plugin-main だけが取る lock なので poison は panic 中の再入だけ。中身は整合しているので使い続ける。
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 今の中身 (plugin-main / テスト用の読み取り)。
+    pub fn snapshot(&self) -> Arc<RegistryMap> {
+        Arc::clone(&self.lock().current)
+    }
+
+    /// `n` 本の worker の受け口を作り、以前の送り口と置き換える (`WorkerPool::open`)。受け口は今の中身から始まる。
+    fn attach_workers(&self, n: usize) -> Vec<RegistryInbox> {
+        let mut state = self.lock();
+        let current = Arc::clone(&state.current);
+        let (feeds, inboxes) = (0..n)
+            .map(|_| {
+                let mailbox = Arc::new(SnapshotMailbox::new());
+                let (tx, rx) = rtrb::RingBuffer::new(RETIRED_RING_CAP);
+                (
+                    RegistryFeed { mailbox: Arc::clone(&mailbox), retired: rx },
+                    RegistryInbox { mailbox, retired: tx, current: Arc::clone(&current), stash: None },
+                )
+            })
+            .unzip();
+        state.feeds = feeds;
+        inboxes
+    }
+}
 
 /// Publish (insert or replace) one registry entry.
 pub fn registry_insert(registry: &PluginRegistry, token: InstanceToken, entry: PluginEntry) {
-    let mut next: HashMap<InstanceToken, PluginEntry> = (**registry.load()).clone();
+    let mut state = registry.lock();
+    let mut next = (*state.current).clone();
     next.insert(token, entry);
-    registry.store(Arc::new(next));
+    state.publish(next);
 }
 
 /// Remove one registry entry, returning it if present.
 pub fn registry_remove(registry: &PluginRegistry, token: InstanceToken) -> Option<PluginEntry> {
-    let current = registry.load();
-    if !current.contains_key(&token) {
+    let mut state = registry.lock();
+    if !state.current.contains_key(&token) {
         return None;
     }
-    let mut next: HashMap<InstanceToken, PluginEntry> = (**current).clone();
+    let mut next = (*state.current).clone();
     let removed = next.remove(&token);
-    drop(current);
-    registry.store(Arc::new(next));
+    state.publish(next);
     removed
 }
 
 /// Snapshot every entry and clear the registry (ReinitAllPlugins 用)。
-pub fn registry_take_all(registry: &PluginRegistry) -> HashMap<InstanceToken, PluginEntry> {
-    let all: HashMap<InstanceToken, PluginEntry> = (**registry.load()).clone();
-    registry.store(Arc::new(HashMap::new()));
+pub fn registry_take_all(registry: &PluginRegistry) -> RegistryMap {
+    let mut state = registry.lock();
+    let all = (*state.current).clone();
+    state.publish(HashMap::new());
     all
 }
 
 /// Re-publish a set of entries at once (ReinitAllPlugins の republish)。
-pub fn registry_restore_all(registry: &PluginRegistry, entries: HashMap<InstanceToken, PluginEntry>) {
-    registry.store(Arc::new(entries));
+pub fn registry_restore_all(registry: &PluginRegistry, entries: RegistryMap) {
+    registry.lock().publish(entries);
 }
 
 /// `HANDLE` is `*mut c_void` and therefore `!Send`. We only ever wait on
@@ -380,7 +526,7 @@ impl WorkerPool {
         metrics_shmem_id: &str,
         wake_event_names: &[String],
         done_event_names: &[String],
-        registry: PluginRegistry,
+        registry: &PluginRegistry,
         evt_tx: tokio::sync::mpsc::UnboundedSender<PluginEvent>,
     ) -> Result<Self> {
         anyhow::ensure!(
@@ -411,8 +557,10 @@ impl WorkerPool {
         let mut workers = Vec::with_capacity(n_workers as usize);
         let mut wake_events = Vec::with_capacity(n_workers as usize);
         let mut param_rings = Vec::with_capacity(n_workers as usize);
+        // worker ごとの registry の受け口 (以前の pool の送り口はここで置き換わる)。
+        let inboxes = registry.attach_workers(n_workers as usize);
 
-        for i in 0..n_workers as usize {
+        for (i, inbox) in inboxes.into_iter().enumerate() {
             let wake = open_named_event(&wake_event_names[i])?;
             let done = open_named_event(&done_event_names[i])?;
             wake_events.push(wake);
@@ -420,7 +568,6 @@ impl WorkerPool {
             let bridge_w = Arc::clone(&bridge);
             let metrics_w = Arc::clone(&metrics);
             let shutdown_w = Arc::clone(&shutdown);
-            let registry_w = Arc::clone(&registry);
             let dispatch_w = Arc::clone(&dispatch);
             let idx = i as u32;
             let wake_s = SendableHandle(wake);
@@ -430,10 +577,7 @@ impl WorkerPool {
             let handle = std::thread::Builder::new()
                 .name(format!("plugin-worker-{i}"))
                 .spawn(move || {
-                    run_worker(
-                        idx, bridge_w, metrics_w, shutdown_w, registry_w, dispatch_w, wake_s,
-                        done_s, ring,
-                    )
+                    run_worker(idx, bridge_w, metrics_w, shutdown_w, inbox, dispatch_w, wake_s, done_s, ring)
                 })?;
             workers.push(handle);
         }
@@ -523,7 +667,7 @@ fn run_worker(
     bridge: Arc<WorkerBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     shutdown: Arc<AtomicBool>,
-    registry: PluginRegistry,
+    mut registry: RegistryInbox,
     dispatch: Arc<DispatchCounter>,
     wake: SendableHandle,
     done: SendableHandle,
@@ -586,7 +730,8 @@ fn run_worker(
         }
 
         let token = InstanceToken(raw);
-        let snapshot = registry.load();
+        // `enter` の後に採用する (quiesce の論証、module doc)。旧 snapshot は plugin-main へ返る。
+        let snapshot = registry.adopt_latest();
         let entry_opt = snapshot.get(&token);
         let Some(entry) = entry_opt else {
             // one-shot per distinct id (旧実装は毎 buffer warn = RT 違反)。
@@ -1044,60 +1189,87 @@ mod tests {
         );
     }
 
+    struct NullHalf;
+    impl crate::plugin_instance::AudioProcessorHalf for NullHalf {
+        fn process(
+            &mut self,
+            _frames: u32,
+            _events: &[TimedNoteEvent],
+            _param_events: &[crate::plugin_instance::TimedParamEvent],
+            _input_audio: &[&[f32]],
+            _aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
+            _transport: &crate::plugin_instance::TransportContext,
+        ) -> Result<i32> {
+            Ok(0)
+        }
+        fn output_buffer(&self, _channel: usize) -> Option<&[f32]> {
+            None
+        }
+        fn drain_out_notes_into(&mut self, _out: &mut Vec<TimedNoteEvent>) {}
+    }
+
+    fn null_entry(device_id: u64) -> PluginEntry {
+        PluginEntry {
+            device: DeviceAddr::new(common::protocol::ProjectKey(1), device_id),
+            audio: AudioHalf::new(Box::new(NullHalf)),
+            process_data: std::ptr::null_mut(),
+            err_logged: Arc::new(AtomicBool::new(false)),
+            metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
+            transport_pinned_to_song: false,
+        }
+    }
+
     /// registry の insert / remove / take_all round-trip (token keyed)。
     #[test]
     fn registry_insert_remove_roundtrip() {
-        struct NullHalf;
-        impl crate::plugin_instance::AudioProcessorHalf for NullHalf {
-            fn process(
-                &mut self,
-                _frames: u32,
-                _events: &[TimedNoteEvent],
-                _param_events: &[crate::plugin_instance::TimedParamEvent],
-                _input_audio: &[&[f32]],
-                _aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
-                _transport: &crate::plugin_instance::TransportContext,
-            ) -> Result<i32> {
-                Ok(0)
-            }
-            fn output_buffer(&self, _channel: usize) -> Option<&[f32]> {
-                None
-            }
-            fn drain_out_notes_into(&mut self, _out: &mut Vec<TimedNoteEvent>) {}
-        }
-
-        let registry: PluginRegistry =
-            Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new()));
-        let entry = PluginEntry {
-            device: DeviceAddr::new(common::protocol::ProjectKey(1), 42),
-            audio: AudioHalf::new(Box::new(NullHalf)),
-            process_data: std::ptr::null_mut(),
-            err_logged: Arc::new(AtomicBool::new(false)),
-            metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
-            transport_pinned_to_song: false,
-        };
+        let registry = PluginRegistry::default();
         let t42 = InstanceToken(42);
-        registry_insert(&registry, t42, entry);
-        assert!(registry.load().contains_key(&t42));
+        registry_insert(&registry, t42, null_entry(42));
+        assert!(registry.snapshot().contains_key(&t42));
         let removed = registry_remove(&registry, t42);
         assert!(removed.is_some());
-        assert!(registry.load().is_empty());
+        assert!(registry.snapshot().is_empty());
         assert!(registry_remove(&registry, t42).is_none());
 
         // take_all + restore_all round-trip。
-        let entry2 = PluginEntry {
-            device: DeviceAddr::new(common::protocol::ProjectKey(1), 7),
-            audio: AudioHalf::new(Box::new(NullHalf)),
-            process_data: std::ptr::null_mut(),
-            err_logged: Arc::new(AtomicBool::new(false)),
-            metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
-            transport_pinned_to_song: false,
-        };
-        registry_insert(&registry, InstanceToken(7), entry2);
+        registry_insert(&registry, InstanceToken(7), null_entry(7));
         let all = registry_take_all(&registry);
-        assert!(registry.load().is_empty());
+        assert!(registry.snapshot().is_empty());
         assert_eq!(all.len(), 1);
         registry_restore_all(&registry, all);
-        assert!(registry.load().contains_key(&InstanceToken(7)));
+        assert!(registry.snapshot().contains_key(&InstanceToken(7)));
+    }
+
+    /// worker (RT) は registry の変更を dispatch の頭で採用し、**差し替えた旧 snapshot を自分で解放しない**
+    /// (plugin-main が次の変更の前に回収して drop する)。外した plugin の audio half の最終参照が worker に
+    /// 残らないことを strong count で確かめる。外した後に採用した snapshot にはその entry が居ない (quiesce の前提)。
+    #[test]
+    fn worker_adopts_the_latest_snapshot_and_hands_the_old_one_back_to_plugin_main() {
+        let registry = PluginRegistry::default();
+        let mut inbox = registry.attach_workers(1).pop().expect("inbox");
+        let t1 = InstanceToken(1);
+        let entry = null_entry(1);
+        let audio = Arc::clone(&entry.audio);
+        registry_insert(&registry, t1, entry);
+        assert!(inbox.adopt_latest().contains_key(&t1), "置いた snapshot を採用する");
+
+        let removed = registry_remove(&registry, t1).expect("外す");
+        drop(removed);
+        assert_eq!(Arc::strong_count(&audio), 2, "前提: テスト + worker が採用中の旧 snapshot");
+        assert!(!inbox.adopt_latest().contains_key(&t1), "外した後に採用した snapshot には居ない");
+        assert_eq!(
+            Arc::strong_count(&audio),
+            2,
+            "採用で差し替えた旧 snapshot は worker 上で drop されず、plugin-main への ring に居る"
+        );
+        registry_insert(&registry, InstanceToken(2), null_entry(2));
+        assert_eq!(Arc::strong_count(&audio), 1, "plugin-main が次の変更の前に回収して drop した");
+
+        // worker が採用しないうちに何度変更しても、受け口に残るのは最新だけ (前の値は plugin-main が drop)。
+        for id in 3..40 {
+            registry_insert(&registry, InstanceToken(id), null_entry(id));
+        }
+        assert_eq!(inbox.adopt_latest().len(), 38, "最新の中身を採用する");
+        assert!(inbox.stash.is_none(), "ring は溢れない");
     }
 }

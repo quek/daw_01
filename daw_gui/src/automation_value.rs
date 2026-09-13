@@ -146,193 +146,82 @@ fn deg_to_rad(v: f64) -> f64 {
 /// `target` の値を人間可読単位で表示/入力するための記述子を返す。
 /// `plugin_range` は `PluginParam` の実 min/max (daw_gui の `plugin_params`
 /// cache 由来、無ければ `None`)。
+///
+/// **表示レンジはここで数値を書かない。** 正規化の値域 ([`common::automation::target_range`]) を
+/// `to_display` で表示単位へ写したものが表示レンジ — 2 か所に数値を持つと、表示・入力できる値が
+/// 変調で潰れる / レーンの上端に張り付く形で食い違う (設計書 §18.2-3、旧 Text の px 系)。
+/// ここが決めるのは単位ラベル・書式・plain↔表示の変換だけ。
 #[must_use]
 pub fn automation_value_display(
     target: &AutomationTarget,
     plugin_range: Option<(f64, f64)>,
 ) -> AutomationValueDisplay {
+    let (unit, format, to_display, from_display) = display_units(target);
+    let (lo, hi) = common::automation::target_range(target, plugin_range).display_range();
+    AutomationValueDisplay { unit, format, range: (to_display(lo), to_display(hi)), to_display, from_display }
+}
+
+/// `target` の (単位ラベル, 書式, plain → 表示, 表示 → plain)。`_` を書かない網羅 match。
+#[allow(clippy::type_complexity)]
+fn display_units(target: &AutomationTarget) -> (&'static str, ScrubableNumberFormat, fn(f64) -> f64, fn(f64) -> f64) {
     use AutomationTarget as T;
-    // 既定 (0..=1 恒等、小数 3 桁、単位なし) — image/text/group の位置・色など。
-    let unit01 = AutomationValueDisplay {
-        unit: "",
-        format: ScrubableNumberFormat::Decimal(3),
-        range: (0.0, 1.0),
-        to_display: id,
-        from_display: id,
-    };
-    // 回転 (ラジアン↔度、-180..180)。
-    let rotation = AutomationValueDisplay {
-        unit: "\u{00b0}",
-        format: ScrubableNumberFormat::Decimal(1),
-        range: (-180.0, 180.0),
-        to_display: rad_to_deg,
-        from_display: deg_to_rad,
-    };
-    // dB ゲイン (線形 0..=2 ↔ -60..+6 dB)。
-    let gain_db = AutomationValueDisplay {
-        unit: "dB",
-        format: ScrubableNumberFormat::Decimal(1),
-        range: (-60.0, 6.0),
-        to_display: lin_to_db,
-        from_display: db_to_lin,
-    };
+    use ScrubableNumberFormat as F;
     match target {
+        // dB ゲイン (線形 0..=2 ↔ -60..+6 dB)。
         T::TrackBuiltin(
             TrackBuiltinParam::Volume
             | TrackBuiltinParam::SendGain { .. }
             | TrackBuiltinParam::ChainGain { .. }
             | TrackBuiltinParam::ParallelOutGain { .. },
-        ) => gain_db,
-        T::TrackBuiltin(TrackBuiltinParam::Pan | TrackBuiltinParam::ChainPan { .. }) => AutomationValueDisplay {
-            // 単位は表記自身が持つ (`"L50"`) ので unit ラベルは空。
-            unit: "",
-            format: PAN_FORMAT,
-            range: (-1.0, 1.0),
-            to_display: id,
-            from_display: id,
-        },
-        T::TrackBuiltin(TrackBuiltinParam::Mute) => AutomationValueDisplay {
-            unit: "",
-            format: ScrubableNumberFormat::Integer,
-            range: (0.0, 1.0),
-            to_display: id,
-            from_display: id,
-        },
-        // r.md #112: クロスオーバー周波数 (Hz、 対数、 レンジの SSoT は `SPLIT_FREQ_RANGE`)。
-        T::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => AutomationValueDisplay {
-            unit: "Hz",
-            format: ScrubableNumberFormat::Significant { digits: 3 },
-            range: common::model::SPLIT_FREQ_RANGE.display_range(),
-            to_display: id,
-            from_display: id,
-        },
+        ) => ("dB", F::Decimal(1), lin_to_db, db_to_lin),
+        // 単位は表記自身が持つ (`"L50"`) ので unit ラベルは空。
+        T::TrackBuiltin(TrackBuiltinParam::Pan | TrackBuiltinParam::ChainPan { .. }) => ("", PAN_FORMAT, id, id),
+        T::TrackBuiltin(TrackBuiltinParam::Mute) => ("", F::Integer, id, id),
+        // r.md #112: クロスオーバー周波数 (Hz、 対数)。
+        T::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => ("Hz", F::Significant { digits: 3 }, id, id),
         // r.md #114: Selector の位置 (0..=1 を全 chain で等分。 chain 数は lane から見えないので
         // 位置そのまま。 どの chain かはインスペクタの `Active` 欄が示す)。
-        T::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => AutomationValueDisplay {
-            unit: "",
-            format: ScrubableNumberFormat::Decimal(2),
-            range: (0.0, 1.0),
-            to_display: id,
-            from_display: id,
-        },
-        // r.md #129: 内蔵 device (§7.4)。plain = 表示単位そのもの (Hz / dB / ms / 比) なので
-        // 変換は恒等。**レンジは `NativeParamId::range` が SSoT** — ここで数値を書かない。
+        T::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => ("", F::Decimal(2), id, id),
+        // r.md #129: 内蔵 device (§7.4)。plain = 表示単位そのもの (Hz / dB / ms / 比) なので変換は恒等。
         T::NativeParam { param, .. } => {
             let (unit, format) = native_unit_format(*param);
-            AutomationValueDisplay {
-                unit,
-                format,
-                range: param.range().display_range(),
-                to_display: id,
-                from_display: id,
-            }
+            (unit, format, id, id)
         }
-        T::MasterLimiter(param) => {
-            use common::model::MasterLimiterParam as L;
-            let (unit, format) = match param {
-                L::On => ("", ScrubableNumberFormat::Integer),
-                L::Ceiling => ("dB", ScrubableNumberFormat::Decimal(1)),
-            };
-            AutomationValueDisplay {
-                unit,
-                format,
-                range: param.range().display_range(),
-                to_display: id,
-                from_display: id,
-            }
-        }
-        // PluginParam は plain = native。実 min/max があればそれを表示レンジに。
-        T::PluginParam { .. } => AutomationValueDisplay {
-            unit: "",
-            format: ScrubableNumberFormat::Decimal(3),
-            range: plugin_range.unwrap_or((0.0, 1.0)),
-            to_display: id,
-            from_display: id,
-        },
-        // r.md #89: モジュレーターのツマミ。値域と log/恒等の別は
-        // `common::automation::mod_param_range` が SSoT。
+        T::MasterLimiter(common::model::MasterLimiterParam::On) => ("", F::Integer, id, id),
+        T::MasterLimiter(common::model::MasterLimiterParam::Ceiling) => ("dB", F::Decimal(1), id, id),
+        // PluginParam は plain = native。
+        T::PluginParam { .. } => ("", F::Decimal(3), id, id),
+        // r.md #89: モジュレーターのツマミ。
         T::ModSourceParam { param, .. } => {
             use common::model::ModParam;
-            let (unit, format) = match param {
-                ModParam::Rate => ("Hz", ScrubableNumberFormat::Decimal(3)),
-                ModParam::FollowerAttack | ModParam::FollowerRelease => {
-                    ("ms", ScrubableNumberFormat::Decimal(1))
-                }
-                ModParam::FollowerHpHz | ModParam::FollowerLpHz => {
-                    ("Hz", ScrubableNumberFormat::Decimal(0))
-                }
-                _ => ("", ScrubableNumberFormat::Decimal(2)),
-            };
-            AutomationValueDisplay {
-                unit,
-                format,
-                range: common::automation::mod_param_range(*param).unwrap_or((0.0, 1.0)),
-                to_display: id,
-                from_display: id,
+            match param {
+                ModParam::Rate => ("Hz", F::Decimal(3), id, id),
+                ModParam::FollowerAttack | ModParam::FollowerRelease => ("ms", F::Decimal(1), id, id),
+                ModParam::FollowerHpHz | ModParam::FollowerLpHz => ("Hz", F::Decimal(0), id, id),
+                _ => ("", F::Decimal(2), id, id),
             }
         }
-        T::ModRoutingDepth { .. } => AutomationValueDisplay {
-            unit: "",
-            format: ScrubableNumberFormat::Decimal(2),
-            range: (-1.0, 1.0),
-            to_display: id,
-            from_display: id,
-        },
-        T::SongTempo => AutomationValueDisplay {
-            unit: "BPM",
-            format: ScrubableNumberFormat::Decimal(1),
-            range: (1.0, 400.0),
-            to_display: id,
-            from_display: id,
-        },
-        T::SongTimeSigNumerator => AutomationValueDisplay {
-            unit: "",
-            format: ScrubableNumberFormat::Integer,
-            range: (1.0, 32.0),
-            to_display: id,
-            from_display: id,
-        },
+        T::ModRoutingDepth { .. } => ("", F::Decimal(2), id, id),
+        T::SongTempo => ("BPM", F::Decimal(1), id, id),
+        T::SongTimeSigNumerator => ("", F::Integer, id, id),
+        // 回転 (ラジアン↔度)。
         T::ImageBuiltin(ImageBuiltinParam::Rotation)
         | T::TextBuiltin(TextBuiltinParam::Rotation)
-        | T::GroupTransform(GroupTransformParam::Rotation) => rotation,
-        // Group Scale は線形 0.1..10 表示 (log space は norm 変換側で吸収)。
+        | T::GroupTransform(GroupTransformParam::Rotation) => ("\u{00b0}", F::Decimal(1), rad_to_deg, deg_to_rad),
+        // Group Scale は線形表示 (log space は norm 変換側で吸収)。
         T::GroupTransform(GroupTransformParam::ScaleX | GroupTransformParam::ScaleY) => {
-            AutomationValueDisplay {
-                unit: "\u{00d7}",
-                format: ScrubableNumberFormat::Decimal(3),
-                range: (0.1, 10.0),
-                to_display: id,
-                from_display: id,
-            }
+            ("\u{00d7}", F::Decimal(3), id, id)
         }
-        // Text の px 系: FontSize / OutlineWidth / Shadow offset・blur。
-        T::TextBuiltin(TextBuiltinParam::FontSize) => AutomationValueDisplay {
-            unit: "px",
-            format: ScrubableNumberFormat::Decimal(1),
-            range: (1.0, 4096.0),
-            to_display: id,
-            from_display: id,
-        },
-        T::TextBuiltin(TextBuiltinParam::OutlineWidth | TextBuiltinParam::ShadowBlur) => {
-            AutomationValueDisplay {
-                unit: "px",
-                format: ScrubableNumberFormat::Decimal(1),
-                range: (0.0, 100.0),
-                to_display: id,
-                from_display: id,
-            }
-        }
-        T::TextBuiltin(TextBuiltinParam::ShadowOffsetX | TextBuiltinParam::ShadowOffsetY) => {
-            AutomationValueDisplay {
-                unit: "px",
-                format: ScrubableNumberFormat::Decimal(1),
-                range: (-200.0, 200.0),
-                to_display: id,
-                from_display: id,
-            }
-        }
+        // Text の px 系: FontSize / OutlineWidth / Shadow offset・blur (plain = px)。
+        T::TextBuiltin(
+            TextBuiltinParam::FontSize
+            | TextBuiltinParam::OutlineWidth
+            | TextBuiltinParam::ShadowBlur
+            | TextBuiltinParam::ShadowOffsetX
+            | TextBuiltinParam::ShadowOffsetY,
+        ) => ("px", F::Decimal(1), id, id),
         // 残り (image/text/group の位置・サイズ・不透明度・色 channel) は 0..=1 恒等。
-        T::ImageBuiltin(_) | T::TextBuiltin(_) | T::GroupTransform(_) => unit01,
+        T::ImageBuiltin(_) | T::TextBuiltin(_) | T::GroupTransform(_) => ("", F::Decimal(3), id, id),
     }
 }
 
@@ -405,9 +294,9 @@ mod tests {
     #[test]
     fn parse_clamps_to_display_range() {
         let d = vol();
-        // +24 dB は表示レンジ (−60..+6) で +6 にクランプ → 線形 \u{2248} 1.995。
+        // +24 dB は表示レンジ (−60 dB..正規化の上端 = 線形 `MAX_TRACK_GAIN` の +6.02 dB) でクランプ → 線形の上端。
         let plain = d.parse_to_plain("24").unwrap();
-        assert!((plain - (d.from_display)(6.0)).abs() < 1e-9);
+        assert!((plain - f64::from(common::model::MAX_TRACK_GAIN)).abs() < 1e-9);
         // 単位 suffix は剥がしてから書式 parser に渡す (大文字小文字は無視)。
         assert!(d.parse_to_plain("-6.0 dB").is_some());
         assert!(d.parse_to_plain("-6.0 db").is_some());

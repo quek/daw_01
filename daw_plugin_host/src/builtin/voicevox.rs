@@ -307,7 +307,7 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
         // ただし store と同時に走った `process()` は debt を払われて所有者になり得るので、
         // **writer 側の quiesce 付き retire (`voicevox_render`) と対で初めて解放が起きない**」。
         // 上の `rt_epoch` がその quiesce 判定の材料。
-        let snapshot = self.synth_result.load();
+        let snapshot = self.synth_result.load(); // arch-lint: allow-arcswap-load (RT だが書き手は swap + rt_epoch の quiesce 付き retire。voicevox_render::release_when_quiesced)
 
         if transport.is_playing {
             // === REAPER 式 連続再生 (r.md #23) =====================================
@@ -1216,7 +1216,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(ok, "synth thread completed within 10s");
-        let res = p.synth_result.load_full().expect("synth_result present after talk synth");
+        let res = p.synth_result.load_full().expect("synth_result present after talk synth"); // arch-lint: allow-arcswap-load (test)
         assert!(!res.samples.is_empty(), "talk synth produced samples");
         let rms =
             (res.samples.iter().map(|s| s * s).sum::<f32>() / res.samples.len() as f32).sqrt();

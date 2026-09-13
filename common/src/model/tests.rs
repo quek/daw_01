@@ -1184,7 +1184,7 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
             owner_track_id: 0,
             color: ModSource::palette_color(0),
             kind: ModSourceKind::EnvelopeFollower {
-                tap: AudioTap::post_fader(0), // points at Kick's sentinel id
+                tap: Some(AudioTap::post_fader(0)), // points at Kick's sentinel id
                 follower: FollowerConfig::default(),
             },
             enabled: true,
@@ -1198,7 +1198,7 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
     assert_ne!(new_kick_id, 0, "Kick sentinel rebased");
     assert_ne!(song.mod_sources[0].id, 0, "mod_source id assigned");
     assert_eq!(
-        song.mod_sources[0].follower().unwrap().0.source_track(),
+        song.mod_sources[0].follower().unwrap().0.and_then(AudioTap::source_track),
         Some(new_kick_id),
         "mod_source tap.source_track must follow the track id remap"
     );
@@ -1988,7 +1988,7 @@ fn gc_clip_contents_keeps_automation_clip_references() {
     assert!(song.clip_contents.contains_key(&cid));
 }
 
-/// v29: `Song::remove_track_send` は安定 send id で削除し、 その send を
+/// v29: `Song::remove_track_send` は安定 send id で削除し、 編集後の不変条件がその send を
 /// 狙う SendGain lane だけを除去する。 残る send への参照は id なので
 /// **無変更のまま正しい** (positional reindex 儀式は廃止)。
 #[test]
@@ -2010,6 +2010,7 @@ fn remove_track_send_drops_only_matching_send_gain_lanes() {
         enabled: true,
     };
     let mut song = Song::default();
+    song.tracks.extend((1..=3).map(|id| Track { id, ..Track::default() }));
     song.tracks.push(Track {
         id: 42,
         sends: vec![mk_send(10, 1), mk_send(11, 2), mk_send(12, 3)],
@@ -2017,8 +2018,10 @@ fn remove_track_send_drops_only_matching_send_gain_lanes() {
         automation_lanes: vec![send_lane(10), send_lane(11), send_lane(12)],
         ..Track::default()
     });
+    song.enforce_edit_invariants();
     // send id 11 (dest 2) を削除。
     assert!(song.remove_track_send(42, 11));
+    assert!(song.enforce_edit_invariants());
     let t = song.track_by_id(42).unwrap();
     assert_eq!(t.sends.len(), 2);
     assert_eq!(t.sends[0].dest_track_id, 1);

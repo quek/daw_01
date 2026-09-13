@@ -93,11 +93,15 @@ pub fn target_range(target: &AutomationTarget, plugin_range: Option<(f64, f64)>)
             I::Rotation => ROTATION,
             I::X | I::Y | I::W | I::H | I::Opacity => UNIT,
         },
-        // FontSize は px。control レンジ (1..=4096)。色 / 位置 / 形は 0..=1。
-        // outline width / shadow offset / blur は px だが lane の値域は plain 直接 (§18.2-3)。
+        // px 系 (FontSize / OutlineWidth / Shadow の Offset・Blur) はレーンの値もイベントの値も px の plain なので、
+        // 値域も px。インスペクタのスクラブ範囲と同じ (Offset は上下対称)。色 / 位置 / 形は 0..=1。
+        // **表示レンジ (`daw_gui::automation_value`) もここを引く** — 別の数字を持つと、表示できる値が変調で
+        // 潰れる / レーンの上端に張り付く形で食い違う (§18.2-3)。
         AutomationTarget::TextBuiltin(p) => match p {
             X::Rotation => ROTATION,
             X::FontSize => ParamRange::Linear { lo: 1.0, hi: 4096.0 },
+            X::OutlineWidth | X::ShadowBlur => ParamRange::Linear { lo: 0.0, hi: 1024.0 },
+            X::ShadowOffsetX | X::ShadowOffsetY => ParamRange::Linear { lo: -1024.0, hi: 1024.0 },
             X::X
             | X::Y
             | X::W
@@ -111,14 +115,10 @@ pub fn target_range(target: &AutomationTarget, plugin_range: Option<(f64, f64)>)
             | X::OutlineG
             | X::OutlineB
             | X::OutlineA
-            | X::OutlineWidth
             | X::ShadowR
             | X::ShadowG
             | X::ShadowB
-            | X::ShadowA
-            | X::ShadowOffsetX
-            | X::ShadowOffsetY
-            | X::ShadowBlur => UNIT,
+            | X::ShadowA => UNIT,
         },
         // Group transform (§4.4): ScaleX/ScaleY は 0.1..=10 の log space。X/Y は「アンカー基準
         // オフセット」で負 / >1 を取りうるが、正規化は画面内 0..1 の範囲でのみ正確。
@@ -890,6 +890,22 @@ mod tests {
         // 他の TextBuiltin (X 等) は従来どおり 0..=1 恒等。
         let tx = AutomationTarget::TextBuiltin(T::X);
         assert!((norm_to_plain(&tx, 0.3) - 0.3).abs() < 1e-6);
+    }
+
+    /// 設計書 §18.2-3: Text の px 系 (Outline Width / Shadow Offset / Shadow Blur) は、レーンの値もイベントの値も
+    /// px の plain。正規化が 0..=1 の恒等だと、変調を 1 本刺しただけで素の値が 1 px に潰れる
+    /// (`apply_modulation_with_plane` が plain → norm → plain を往復する)。
+    #[test]
+    fn text_px_params_normalize_over_their_px_range() {
+        use crate::model::{ModRouting, Polarity, TextBuiltinParam as T};
+        for (param, plain) in [(T::OutlineWidth, 8.0), (T::ShadowBlur, 24.0), (T::ShadowOffsetX, -12.0), (T::ShadowOffsetY, 30.0)] {
+            let target = AutomationTarget::TextBuiltin(param);
+            let back = norm_to_plain(&target, plain_to_norm(&target, plain));
+            assert!((back - plain).abs() < 1e-3, "{param:?}: {plain} px -> {back}");
+            let idle = ModRouting { id: 1, target: target.clone(), source_id: 9, depth: 0.5, polarity: Polarity::Unipolar, enabled: false };
+            let modulated = apply_modulation_with_plane(&target, plain, std::slice::from_ref(&idle), ModPlaneRef::default());
+            assert!((modulated - plain).abs() < 1e-3, "{param:?}: 効いていない変調で {plain} px -> {modulated}");
+        }
     }
 
     #[test]

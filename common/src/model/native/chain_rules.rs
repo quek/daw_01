@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::super::{
     AutomationLane, AutomationTarget, BindingTarget, ChainRef, Device, IdAllocators, MASTER_TRACK_ID, ModRouting,
-    NativeDevice, NativeKind, Song, device_in, for_each_node_id_mut,
+    NativeDevice, NativeKind, Song, TapSource, device_in, for_each_node_id_mut,
 };
 
 /// [`Song::assign_native_ordinals`] の番号の決め方。
@@ -27,11 +27,12 @@ type Taken = HashMap<NativeKind, BTreeSet<u16>>;
 /// Song の **id 構造**の観測器。[`Song::enforce_edit_invariants`] が読むものすべてと lane id:
 ///
 /// - トラック id (並び順込み) と、各置き場 (トラック / master) の
-/// - device node (plugin / native / Parallel / chain) の id と木の形、native の種類・builtin・番号・aux 配線の有無
+/// - device node (plugin / native / Parallel / chain) の id と木の形、native の種類・builtin・番号
+/// - 信号経路が指す id: aux 入力の source (plugin / native)、plugin の aux 出力の宛先、send の id と宛先
 /// - lane の id と target、変調 routing の id・ソース・target
-/// - 変調ソースの id、MIDI binding の target
+/// - 変調ソースの id・帰属トラック・follower の source、MIDI binding の target
 ///
-/// 値 (params / volume / 点列 / bypass) と、clip / content / media source / section / scene の id は含まない。
+/// 値 (params / volume / 点列 / bypass / tap 点) と、clip / content / media source / section / scene の id は含まない。
 /// 比べるのは前回の観測の写し全体 (ハッシュではない) なので、取り違えは起きない。
 #[derive(Debug, Default)]
 pub struct StructureWatch {
@@ -69,14 +70,18 @@ pub struct EnforceOutcome {
 enum ShapeItem {
     /// 以降の node / lane / routing の置き場 (track id か `MASTER_TRACK_ID`)。
     Owner(u32),
+    Send { id: u32, dest: u32 },
     Plugin(u64),
-    Native { id: u64, kind: NativeKind, builtin: bool, ordinal: u16, aux_input: bool },
+    /// 直前の plugin の aux 入力 / aux 出力 (配線のある port だけ)。
+    AuxIn { port: usize, source: TapSource },
+    AuxOut { port: usize, dest: u32 },
+    Native { id: u64, kind: NativeKind, builtin: bool, ordinal: u16, aux_source: Option<TapSource> },
     Parallel(u64),
     Chain(u64),
     ChainEnd,
     Lane { id: u32, target: AutomationTarget },
     Routing { id: u32, source_id: u32, target: AutomationTarget },
-    Source(u32),
+    Source { id: u32, owner: u32, follows: Option<TapSource> },
     Binding(BindingTarget),
 }
 
@@ -85,15 +90,19 @@ fn capture_structure(song: &Song, out: &mut Vec<ShapeItem>) {
     let stores = song
         .tracks
         .iter()
-        .map(|t| (t.id, t.devices.as_slice(), t.automation_lanes.as_slice(), t.mod_routings.as_slice()))
+        .map(|t| {
+            (t.id, t.sends.as_slice(), t.devices.as_slice(), t.automation_lanes.as_slice(), t.mod_routings.as_slice())
+        })
         .chain(std::iter::once((
             MASTER_TRACK_ID,
+            &[][..],
             song.master_fx_chain.as_slice(),
             song.song_lanes.as_slice(),
             song.song_mod_routings.as_slice(),
         )));
-    for (owner, devices, lanes, routings) in stores {
+    for (owner, sends, devices, lanes, routings) in stores {
         out.push(ShapeItem::Owner(owner));
+        out.extend(sends.iter().map(|s| ShapeItem::Send { id: s.id, dest: s.dest_track_id }));
         capture_nodes(devices, out);
         out.extend(lanes.iter().map(|l: &AutomationLane| ShapeItem::Lane { id: l.id, target: l.target.clone() }));
         out.extend(routings.iter().map(|r: &ModRouting| ShapeItem::Routing {
@@ -102,20 +111,36 @@ fn capture_structure(song: &Song, out: &mut Vec<ShapeItem>) {
             target: r.target.clone(),
         }));
     }
-    out.extend(song.mod_sources.iter().map(|m| ShapeItem::Source(m.id)));
+    out.extend(song.mod_sources.iter().map(|m| ShapeItem::Source {
+        id: m.id,
+        owner: m.owner_track_id,
+        follows: m.follower().and_then(|(tap, _)| tap).map(|t| t.source),
+    }));
     out.extend(song.midi_bindings.iter().map(|b| ShapeItem::Binding(b.target)));
 }
 
 fn capture_nodes(devices: &[Device], out: &mut Vec<ShapeItem>) {
     for d in devices {
         match d {
-            Device::Plugin(p) => out.push(ShapeItem::Plugin(p.id)),
+            Device::Plugin(p) => {
+                out.push(ShapeItem::Plugin(p.id));
+                for (port, route) in p.aux_inputs.iter().enumerate() {
+                    if let Some(r) = route {
+                        out.push(ShapeItem::AuxIn { port, source: r.tap.source });
+                    }
+                }
+                for (port, route) in p.aux_outputs.iter().enumerate() {
+                    if let Some(r) = route {
+                        out.push(ShapeItem::AuxOut { port, dest: r.dest_track });
+                    }
+                }
+            }
             Device::Native(n) => out.push(ShapeItem::Native {
                 id: n.id,
                 kind: n.kind(),
                 builtin: n.builtin,
                 ordinal: n.ordinal,
-                aux_input: n.aux_input.is_some(),
+                aux_source: n.aux_input.map(|r| r.tap.source),
             }),
             Device::Parallel(r) => {
                 out.push(ShapeItem::Parallel(r.id));
@@ -280,10 +305,10 @@ impl Song {
         changed | normalize_chain(master_fx_chain, true, ids)
     }
 
-    /// 編集後の不変条件: 組み込みの正規化と dangling 参照の掃除。handler に prune を書かない。
-    /// SongDoc の口は [`Self::enforce_edit_invariants_watched`] 経由で呼ぶ。
+    /// 編集後の不変条件: 組み込みの正規化と dangling 参照 (信号経路 → パラメーターの束縛) の掃除。
+    /// handler に prune を書かない。SongDoc の口は [`Self::enforce_edit_invariants_watched`] 経由で呼ぶ。
     pub fn enforce_edit_invariants(&mut self) -> bool {
-        self.normalize_native_devices() | self.prune_dangling_param_targets()
+        self.normalize_native_devices() | self.prune_dangling_refs()
     }
 
     /// [`Self::enforce_edit_invariants`] を、**id 構造が `watch` の前回の回復から変わったときだけ**回す。
@@ -400,8 +425,8 @@ impl Song {
 mod tests {
     use super::*;
     use crate::model::{
-        AuxInputRoute, CompParam, MidiBindInput, MidiBinding, ModSource, ModSourceKind, NativeParamId, Parallel,
-        PluginInstance, Polarity, Track, TrackBuiltinParam,
+        AudioTap, AuxInputRoute, AuxOutputRoute, CompParam, MidiBindInput, MidiBinding, ModSource, ModSourceKind,
+        NativeParamId, Parallel, PluginInstance, Polarity, Send, SendMode, TapPoint, Track, TrackBuiltinParam,
     };
     use crate::plugin_format::PluginFormat;
 
@@ -423,19 +448,29 @@ mod tests {
     }
 
     /// トラック 1: plugin 5 / Parallel 10 (chain 11 に plugin 13) / 追加の Comp 14、トラック 2 と master は空。
+    /// トラック 1 の配線: plugin 5 の aux 入力 = chain 11・aux 出力 = トラック 2、Comp 14 の SC = トラック 2、
+    /// send 1 = トラック 2 宛て (SendGain レーン付き)。follower 1 はトラック 2 を聴き、binding はトラック 2 の音量も持つ。
     /// 回復で組み込みが 100.. に入った不動点を返す。
     fn settled_song() -> Song {
         let mut p = Parallel::new();
         p.id = 10;
         p.chains[0].id = 11;
         p.chains[0].devices = vec![plugin(13)];
+        let mut plugin5 = PluginInstance { id: 5, ..PluginInstance::new("p5".into(), PluginFormat::Clap) };
+        plugin5.aux_inputs = vec![Some(AuxInputRoute { tap: AudioTap::new(TapSource::Chain(11), TapPoint::PostFx) })];
+        plugin5.aux_outputs = vec![Some(AuxOutputRoute::to_track(2))];
+        let mut comp14 = NativeDevice::new_added(NativeKind::Comp, 14, 2);
+        comp14.aux_input = Some(AuxInputRoute::post_fader(2));
+        let send_gain = AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id: 1, legacy_send_idx: None });
         let track1 = Track {
             id: 1,
-            devices: vec![plugin(5), Device::Parallel(p), Device::Native(NativeDevice::new_added(NativeKind::Comp, 14, 2))],
+            devices: vec![Device::Plugin(plugin5), Device::Parallel(p), Device::Native(comp14)],
+            sends: vec![Send { id: 1, dest_track_id: 2, gain: 1.0, mode: SendMode::PostFader, enabled: true }],
             automation_lanes: vec![
                 AutomationLane::new(comp_thr(100), 0.0),
                 AutomationLane::new(AutomationTarget::PluginParam { device_id: 5, param_id: 1, legacy_device_index: None }, 0.0),
                 AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 11 }), 0.0),
+                AutomationLane::new(send_gain, 1.0),
             ],
             mod_routings: vec![ModRouting {
                 id: 1,
@@ -451,14 +486,19 @@ mod tests {
             tracks: vec![track1, Track { id: 2, ..Track::default() }],
             master_fx_chain: Vec::new(),
             ids: IdAllocators { next_device_id: 100, ..Song::default().ids },
-            mod_sources: vec![ModSource { id: 1, owner_track_id: 1, color: [1.0; 3], kind: ModSourceKind::default(), enabled: true }],
-            midi_bindings: vec![binding(100)],
+            mod_sources: vec![ModSource { id: 1, owner_track_id: 1, color: [1.0; 3], kind: follower_of(2), enabled: true }],
+            midi_bindings: vec![binding(100), MidiBinding { target: BindingTarget::TrackVolume(2), ..binding(100) }],
             ..Song::default()
         };
         song.enforce_edit_invariants();
         assert!(!song.enforce_edit_invariants(), "前提: 不動点");
-        assert_eq!(song.tracks[0].automation_lanes.len(), 3, "前提: lane は全部生きている");
+        assert_eq!(song.tracks[0].automation_lanes.len(), 4, "前提: lane は全部生きている");
+        assert_eq!(song.midi_bindings.len(), 2, "前提: binding は全部生きている");
         song
+    }
+
+    fn follower_of(track: u32) -> ModSourceKind {
+        ModSourceKind::EnvelopeFollower { tap: Some(AudioTap::post_fader(track)), follower: Default::default() }
     }
 
     fn native(s: &mut Song, id: u64) -> &mut NativeDevice {
@@ -496,6 +536,24 @@ mod tests {
             let volume = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
             s.tracks[0].automation_lanes.push(AutomationLane::new(volume, 1.0));
         }),
+        ("配線の宛先のトラックを消す", |s| s.tracks.retain(|t| t.id != 2)),
+        ("SC の読む chain を消す", |s| drop(s.remove_device(10))),
+        ("SC の source を消えたトラックに", |s| native(s, 14).aux_input = Some(AuxInputRoute::post_fader(9))),
+        ("plugin の aux 入力を消えた chain に", |s| {
+            if let Some(Device::Plugin(p)) = s.device_by_id_mut(5) {
+                p.aux_inputs[0] = Some(AuxInputRoute { tap: AudioTap::new(TapSource::Chain(99), TapPoint::PreFx) });
+            }
+        }),
+        ("aux 出力の宛先を消えたトラックに", |s| {
+            if let Some(Device::Plugin(p)) = s.device_by_id_mut(5) {
+                p.aux_outputs[0] = Some(AuxOutputRoute::to_track(9));
+            }
+        }),
+        ("send の宛先を消えたトラックに", |s| s.tracks[0].sends[0].dest_track_id = 9),
+        ("send を消す", |s| s.tracks[0].sends.clear()),
+        ("follower の source を消えたトラックに", |s| s.mod_sources[0].kind = follower_of(9)),
+        ("モジュレーターの帰属を消えたトラックに", |s| s.mod_sources[0].owner_track_id = 9),
+        ("SC を外す", |s| native(s, 14).aux_input = None),
     ];
 
     /// 値だけの編集。
@@ -512,6 +570,12 @@ mod tests {
                 p.state = Some(std::sync::Arc::from(&[1u8, 2, 3][..]));
             }
         }),
+        ("SC の tap 点", |s| {
+            if let Some(r) = native(s, 14).aux_input.as_mut() {
+                r.tap.tap_point = TapPoint::PreFx;
+            }
+        }),
+        ("send の量", |s| s.tracks[0].sends[0].gain = 0.25),
     ];
 
     /// 構造を変える編集では、観測付きの回復は無条件の回復と**必ず同じ Song** になる (enforce が読む入力の

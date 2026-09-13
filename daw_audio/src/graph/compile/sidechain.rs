@@ -133,7 +133,7 @@ pub(super) fn collect_chain_taps(song: &Song) -> HashSet<(u64, TapPoint)> {
         }
     }
     for ms in &song.mod_sources {
-        if let Some((tap, _)) = ms.follower() {
+        if let Some((Some(tap), _)) = ms.follower() {
             add(tap);
         }
     }
@@ -158,7 +158,7 @@ pub(super) fn bake_snapshot_needs(song: &Song, built: &mut [BuiltProgram]) {
             }
         }
         for ms in &song.mod_sources {
-            if let Some((tap, _)) = ms.follower() {
+            if let Some((Some(tap), _)) = ms.follower() {
                 add(tap);
             }
         }

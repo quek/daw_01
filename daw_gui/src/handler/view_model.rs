@@ -400,17 +400,16 @@ impl AppData {
     /// loop).
     /// r.md #110: 他 track に加えて **同 track の Parallel 内 chain** も選べる (Bitwig と同じ)。
     /// 自 track 自身も可 (follower は control-rate なので feedback にならない)。
-    pub fn mod_source_track_choices(&self) -> Vec<(common::model::TapSource, String)> {
+    /// 先頭は SC の候補と同じ「—」(入力なし。聴いていたトラック / chain が消えた follower もここを指す)。
+    pub fn mod_source_track_choices(&self) -> Vec<(Option<common::model::TapSource>, String)> {
         let song = self.cur.song_doc.song();
-        let mut out: Vec<(common::model::TapSource, String)> = song
-            .tracks
-            .iter()
-            .map(|t| (common::model::TapSource::Track(t.id), t.name.clone()))
+        let mut out: Vec<(Option<common::model::TapSource>, String)> = std::iter::once((None, "—".to_string()))
+            .chain(song.tracks.iter().map(|t| (Some(common::model::TapSource::Track(t.id)), t.name.clone())))
             .collect();
         if let Some(devices) = self.cursor_track_id().and_then(|id| song.fx_chain_by_track_id(id)) {
             common::model::for_each_chain(devices, &mut |parallel, c| {
                 out.push((
-                    common::model::TapSource::Chain(c.id),
+                    Some(common::model::TapSource::Chain(c.id)),
                     format!("{} / {}", parallel.name, c.name),
                 ));
             });

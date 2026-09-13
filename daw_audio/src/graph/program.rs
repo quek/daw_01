@@ -20,6 +20,10 @@
 //!   バスを置換した」ときだけ merged に寄与する。
 //! - `ParallelEnd`: バス := sum。MIDI := 置換した chain があれば merged (time 順)、無ければ
 //!   parallel 入力の素通し。
+//! - **素材の音だけを描く Parallel** (`RenderScope::Sources`、compile が [`ParallelScratch::sources`] に焼く):
+//!   chain には無音を配り (MIDI の配り方は同じ = Selector はアクティブ chain だけ)、chain の gain /
+//!   pan / mute / solo・出力 trim・gain match・帯域分割 / Mid-Side を通さず、バス := 入力 (chain の
+//!   最大 latency ぶん遅らせる) + chain 出力の和。入力は 1 回だけ通り、chain の中の音源はそのまま足される。
 //! - `Native` (r.md #129): 内蔵 device をバスへその場で適用する (audio 置換・MIDI 素通し、
 //!   `graph::native::run_native`)。bypass 中でも op は出ていて、実効の ON/OFF は block 頭で解決する。
 //!
@@ -76,7 +80,9 @@ pub enum ChainOp {
         snapshot_post_fader: bool,
     },
     /// `parallel_id`: 出力 trim / gain match を Song snapshot から live-read するためのキー。
-    ParallelEnd { parallel_slot: u32, parallel_id: u64 },
+    /// `input_delay`: 素材の音だけを描く Parallel ([`ParallelScratch::sources`]) で、入力を chain の
+    /// 最大 latency に揃える `(delay_lines の index, frames)`。それ以外 / 遅延 0 は `None`。
+    ParallelEnd { parallel_slot: u32, parallel_id: u64, input_delay: Option<(u32, u32)> },
     /// r.md #129: 内蔵 DSP を現在のバスへその場で適用する (audio 置換・MIDI 素通し)。
     /// bypass 中でも op は出す (実効 ON/OFF は block 頭で解決し、切り替えは crossfade)。
     /// `native_slot` = `ChainProgram::natives` の index (状態は値型の op に持てないので scratch 側)。
@@ -106,6 +112,8 @@ pub struct ParallelScratch {
     /// r.md #112: 入力の分割器 (`Split::None` 以外のとき compile が置く)。 分割された chain の
     /// 入力と `PreFx` tap はここから読む。
     pub split: Option<Splitter>,
+    /// 素材の音だけを描く (`RenderScope::Sources`、module doc の信号規則)。compile 時に焼く。
+    pub sources: bool,
 }
 
 /// gain match の窓 (一次 IIR の時定数、秒)。 ポンピングが出ない程度に遅く。
@@ -117,11 +125,12 @@ const MATCH_GAIN_MIN: f32 = 0.25;
 const MATCH_GAIN_MAX: f32 = 4.0;
 
 impl ParallelScratch {
-    /// `n_chains` = chain 数 (`Split::Selector` が chain ごとの出力を持つ)。
-    pub fn new(parallel_id: u64, split: common::model::Split, n_chains: usize) -> Self {
+    /// `n_chains` = chain 数 (`Split::Selector` が chain ごとの出力を持つ)。`sources` = 素材の音だけを描く。
+    pub fn new(parallel_id: u64, split: common::model::Split, n_chains: usize, sources: bool) -> Self {
         Self {
             parallel_id,
             split: Splitter::new(split, n_chains),
+            sources,
             in_l: vec![0.0; MAX_FRAMES],
             in_r: vec![0.0; MAX_FRAMES],
             in_midi: Vec::with_capacity(MAX_EVENTS),
@@ -216,9 +225,10 @@ pub struct ChainProgram {
     pub pass1_end: usize,
     pub parallels: Vec<ParallelScratch>,
     pub chains: Vec<ChainScratch>,
-    /// 並列 PDC の delay line (`ChainOp::ChainEnd::delay` の index)。
+    /// 並列 PDC の delay line (`ChainOp::ChainEnd::delay` / `ChainOp::ParallelEnd::input_delay` の index)。
     pub delay_lines: Vec<DelayLine>,
-    /// `delay_lines` と平行な stable key (= `ParallelChain::id`、再 compile 跨ぎの状態移送)。
+    /// `delay_lines` と平行な stable key (= `ParallelChain::id`、素材の音だけを描く Parallel の入力は
+    /// `Parallel::id`。どちらも device id と同じ空間なので衝突しない。再 compile 跨ぎの状態移送)。
     pub delay_keys: Vec<u64>,
     /// r.md #117: plugin ごとのボイス表 (`ChainOp::Plugin::voice_slot`)。 device id で移送。
     pub voices: Vec<VoiceTable>,
@@ -231,6 +241,9 @@ pub struct ChainProgram {
     /// (RT で Song を歩いて判定しない、§18-B)。PostFx は pre-fader send も含む。
     pub snapshot_pre_fx: bool,
     pub snapshot_post_fx: bool,
+    /// device 列の後にトラックのフェーダー (volume / pan / mute / solo) を掛けるか (`RenderScope::fader`、compile 時に
+    /// 焼く)。`false` はフェーダーを素通しする (`process_track_owned` / `run_group_fx_chain`)。master は使わない。
+    pub fader: bool,
     /// SC Listen: この buffer で検出信号を書いた Comp の slot。トラック出力 (PostFx 点) で消費する
     /// (`graph::native::apply_listen_override`)。
     pub listen_pending: Option<u32>,
@@ -253,6 +266,7 @@ impl ChainProgram {
             native_dry_r: Vec::new(),
             snapshot_pre_fx: false,
             snapshot_post_fx: false,
+            fader: true,
             listen_pending: None,
         }
     }
@@ -406,6 +420,11 @@ pub fn run_chain_program(
             ChainOp::ChainBegin { parallel_slot, output, .. } => {
                 let Some(rs) = parallels.get(*parallel_slot as usize) else { continue };
                 match output.and_then(|k| rs.split.as_ref()?.output(k)) {
+                    // 素材の音だけ: 入力は `ParallelEnd` で 1 回だけ足すので、chain には配らない。
+                    _ if rs.sources => {
+                        bus_l[..n].fill(0.0);
+                        bus_r[..n].fill(0.0);
+                    }
                     Some((l, r)) => {
                         bus_l[..n].copy_from_slice(&l[..n]);
                         bus_r[..n].copy_from_slice(&r[..n]);
@@ -448,48 +467,47 @@ pub fn run_chain_program(
                     cs.post_fx_l[..n].copy_from_slice(&bus_l[..n]);
                     cs.post_fx_r[..n].copy_from_slice(&bus_r[..n]);
                 }
-                let (gain, pan, effective_mute) =
-                    resolve_chain_mixer(ctx, track_id, *parallel_id, *chain_id);
-                fill_chain_ramps(ctx, track_id, *chain_id, gain, pan, cs);
-                for i in 0..n {
-                    let (pl, pr) = chain_pan_gains(cs.pan_ramp[i]);
-                    let g = cs.gain_ramp[i];
-                    let (l, r) = if effective_mute {
-                        (0.0, 0.0)
-                    } else {
-                        (bus_l[i] * pl * g, bus_r[i] * pr * g)
-                    };
+                if rs.sources {
+                    // 素材の音だけ: chain の gain / pan / mute / solo を通さない。
                     if *snapshot_post_fader {
-                        cs.post_fader_l[i] = l;
-                        cs.post_fader_r[i] = r;
+                        cs.post_fader_l[..n].copy_from_slice(&bus_l[..n]);
+                        cs.post_fader_r[..n].copy_from_slice(&bus_r[..n]);
                     }
-                    rs.sum_l[i] += l;
-                    rs.sum_r[i] += r;
+                    for i in 0..n {
+                        rs.sum_l[i] += bus_l[i];
+                        rs.sum_r[i] += bus_r[i];
+                    }
+                } else {
+                    let (gain, pan, effective_mute) =
+                        resolve_chain_mixer(ctx, track_id, *parallel_id, *chain_id);
+                    fill_chain_ramps(ctx, track_id, *chain_id, gain, pan, cs);
+                    mix_chain_into_sum(bus_l, bus_r, n, effective_mute, *snapshot_post_fader, cs, rs);
                 }
                 if midi_replaced {
                     append_midi(&mut rs.merged_midi, midi_a);
                     rs.any_midi_replaced = true;
                 }
             }
-            ChainOp::ParallelEnd { parallel_slot, parallel_id } => {
+            ChainOp::ParallelEnd { parallel_slot, parallel_id, input_delay } => {
                 let Some(rs) = parallels.get_mut(*parallel_slot as usize) else { continue };
-                // 出力 trim (automation / 変調 ramp) × gain match (buffer 内で線形に追従)。
-                let (out_gain, gain_match) = resolve_parallel_out(ctx, *parallel_id);
-                fill_parallel_out_ramp(ctx, track_id, *parallel_id, out_gain, rs);
-                let mg_from = rs.match_gain;
-                let mg_to = if gain_match {
-                    rs.update_gain_match(n, ctx.sample_rate)
+                if rs.sources {
+                    // 素材の音だけ: 入力 (chain の最大 latency に揃える) + chain 出力の和。
+                    bus_l[..n].copy_from_slice(&rs.in_l[..n]);
+                    bus_r[..n].copy_from_slice(&rs.in_r[..n]);
+                    if let Some((line_idx, frames)) = input_delay
+                        && let Some(line) = delay_lines.get_mut(*line_idx as usize)
+                    {
+                        line.step_in_place(&mut bus_l[..n], &mut bus_r[..n], *frames as usize);
+                    }
+                    for i in 0..n {
+                        bus_l[i] += rs.sum_l[i];
+                        bus_r[i] += rs.sum_r[i];
+                    }
                 } else {
-                    rs.in_ms = 0.0;
-                    rs.out_ms = 0.0;
-                    1.0
-                };
-                rs.match_gain = mg_to;
-                let step = if n > 0 { (mg_to - mg_from) / n as f32 } else { 0.0 };
-                for i in 0..n {
-                    let g = rs.out_gain_ramp[i] * (mg_from + step * (i as f32 + 1.0));
-                    bus_l[i] = rs.sum_l[i] * g;
-                    bus_r[i] = rs.sum_r[i] * g;
+                    // 出力 trim (automation / 変調 ramp) × gain match (buffer 内で線形に追従)。
+                    let (out_gain, gain_match) = resolve_parallel_out(ctx, *parallel_id);
+                    fill_parallel_out_ramp(ctx, track_id, *parallel_id, out_gain, rs);
+                    apply_parallel_out(bus_l, bus_r, n, gain_match, ctx.sample_rate, rs);
                 }
                 if rs.any_midi_replaced {
                     rs.merged_midi.sort_unstable_by_key(|e| e.time);
@@ -517,6 +535,56 @@ pub fn run_chain_program(
         }
     }
     midi_replaced
+}
+
+/// `ChainEnd`: chain の出力 (`bus`) に gain / pan / mute の ramp を掛けて Parallel の和へ足す。
+/// `snapshot_post_fader` なら掛けた後の音を chain の PostFader tap に残す。
+fn mix_chain_into_sum(
+    bus_l: &[f32],
+    bus_r: &[f32],
+    n: usize,
+    effective_mute: bool,
+    snapshot_post_fader: bool,
+    cs: &mut ChainScratch,
+    rs: &mut ParallelScratch,
+) {
+    for i in 0..n {
+        let (pl, pr) = chain_pan_gains(cs.pan_ramp[i]);
+        let g = cs.gain_ramp[i];
+        let (l, r) = if effective_mute { (0.0, 0.0) } else { (bus_l[i] * pl * g, bus_r[i] * pr * g) };
+        if snapshot_post_fader {
+            cs.post_fader_l[i] = l;
+            cs.post_fader_r[i] = r;
+        }
+        rs.sum_l[i] += l;
+        rs.sum_r[i] += r;
+    }
+}
+
+/// `ParallelEnd`: バス := chain の和 × 出力 trim ramp × gain match (buffer 内で線形に追従)。
+fn apply_parallel_out(
+    bus_l: &mut [f32],
+    bus_r: &mut [f32],
+    n: usize,
+    gain_match: bool,
+    sample_rate: u32,
+    rs: &mut ParallelScratch,
+) {
+    let mg_from = rs.match_gain;
+    let mg_to = if gain_match {
+        rs.update_gain_match(n, sample_rate)
+    } else {
+        rs.in_ms = 0.0;
+        rs.out_ms = 0.0;
+        1.0
+    };
+    rs.match_gain = mg_to;
+    let step = if n > 0 { (mg_to - mg_from) / n as f32 } else { 0.0 };
+    for i in 0..n {
+        let g = rs.out_gain_ramp[i] * (mg_from + step * (i as f32 + 1.0));
+        bus_l[i] = rs.sum_l[i] * g;
+        bus_r[i] = rs.sum_r[i] * g;
+    }
 }
 
 /// chain の pan 則 (SSoT)。**中央 = unity** の balance 則: 空 chain 1 本の Parallel が
@@ -873,6 +941,7 @@ mod tests {
     use crate::graph::build_program;
     use crate::graph::compile::DeviceLatencies;
     use common::model::{Device, Parallel, ParallelChain, Track};
+    use common::protocol::RenderScope;
     use std::collections::HashSet;
 
     fn parallel(id: u64, chains: Vec<ParallelChain>) -> Device {
@@ -906,13 +975,18 @@ mod tests {
 
     /// plugin 無しで program を走らせる (dispatch 先が無いので `Plugin` op は素通し)。
     fn run(song: &Song, frames: u32, bus: &mut (Vec<f32>, Vec<f32>), midi: &mut Vec<TimedNoteEvent>) -> ChainProgram {
-        let built = build_program(
-            &song.tracks[0].devices,
-            1,
-            None,
-            &DeviceLatencies::new(),
-            &HashSet::new(),
-        );
+        run_scoped(song, RenderScope::Mix, &DeviceLatencies::new(), frames, bus, midi)
+    }
+
+    fn run_scoped(
+        song: &Song,
+        scope: RenderScope,
+        latencies: &DeviceLatencies,
+        frames: u32,
+        bus: &mut (Vec<f32>, Vec<f32>),
+        midi: &mut Vec<TimedNoteEvent>,
+    ) -> ChainProgram {
+        let built = build_program(&song.tracks[0].devices, 1, None, latencies, &HashSet::new(), scope);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
@@ -944,6 +1018,63 @@ mod tests {
         ((0..n).map(|i| i as f32).collect(), (0..n).map(|i| -(i as f32)).collect())
     }
 
+    /// 素材の音だけを描く Parallel (`RenderScope::Sources`): どの配り方でも入力は 1 回だけ通り、chain の
+    /// gain / pan / mute・出力 trim・gain match・帯域分割 / Mid-Side は掛からない (同じ Parallel を `Mix` で描くと
+    /// 入力とは違う音になることも確かめる)。
+    #[test]
+    fn sources_scope_passes_the_parallel_input_once_without_its_mixing_stages() {
+        use common::model::Split;
+        let mixing = |split: Split, n_chains: u64| {
+            let chains = (0..n_chains)
+                .map(|k| ParallelChain { gain: 0.5, pan: -0.7, muted: k == 1, ..chain(11 + k, vec![]) })
+                .collect();
+            let mut p = parallel(10, chains);
+            let r = p.as_parallel_mut().unwrap();
+            r.split = split;
+            r.out_gain = 0.25;
+            r.gain_match = true;
+            song_with(vec![p])
+        };
+        let cases = [
+            ("None", mixing(Split::None, 2)),
+            ("Frequency3 + 素通し chain", mixing(Split::DEFAULT_FREQUENCY3, 4)),
+            ("MidSide", mixing(Split::MidSide, 2)),
+            ("Selector", mixing(Split::Selector { active_chain: 12, fade_ms: 0.0 }, 3)),
+        ];
+        for (name, song) in &cases {
+            let input = ramp(64);
+            let mut midi = Vec::with_capacity(MAX_EVENTS);
+            let mut bus = input.clone();
+            run_scoped(song, RenderScope::Sources, &DeviceLatencies::new(), 64, &mut bus, &mut midi);
+            assert_eq!(bus, input, "{name}: 入力そのまま");
+            let mut mixed = input.clone();
+            run(song, 64, &mut mixed, &mut midi);
+            assert_ne!(mixed, input, "{name}: 前提 — Mix では混ぜの段が掛かる");
+        }
+    }
+
+    /// 素材の音だけを描く Parallel は、chain を通らない入力を chain の最大 latency (音源の報告値) に揃える。
+    #[test]
+    fn sources_scope_delays_the_parallel_input_to_the_longest_chain() {
+        let instrument = Device::Plugin(common::model::PluginInstance {
+            id: 5,
+            ..common::model::PluginInstance::with_ports(
+                "synth".into(),
+                common::plugin_format::PluginFormat::Clap,
+                PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() },
+            )
+        });
+        let song = song_with(vec![parallel(10, vec![chain(11, vec![instrument]), chain(12, vec![])])]);
+        let mut lat = DeviceLatencies::new();
+        lat.insert(5, 4);
+        let input = ramp(16);
+        let mut bus = input.clone();
+        let mut midi = Vec::with_capacity(MAX_EVENTS);
+        run_scoped(&song, RenderScope::Sources, &lat, 16, &mut bus, &mut midi);
+        let delayed: Vec<f32> = (0..16).map(|i| if i < 4 { 0.0 } else { input.0[i - 4] }).collect();
+        assert_eq!(bus.0, delayed, "音源の chain (latency 4) に揃えて 4 sample 遅れる");
+    }
+
     #[test]
     fn two_empty_chains_sum_to_twice_the_input() {
         let song = song_with(vec![parallel(10, vec![chain(11, vec![]), chain(12, vec![])])]);
@@ -961,7 +1092,8 @@ mod tests {
         fn steady_rms(song: &Song, f: f32) -> f32 {
             let sr = 48_000u32;
             let n = 960usize; // 20 ms: 50 / 700 / 8000 Hz の周期が整数個乗る
-            let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new());
+            let built =
+                build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
             let mut program = built.program;
             let refs: PluginRefs = std::collections::HashMap::new();
             let lanes = HashSet::new();
@@ -1035,7 +1167,7 @@ mod tests {
         song.tracks[0].devices[0].as_parallel_mut().unwrap().split =
             common::model::Split::Selector { active_chain: 11, fade_ms: 8.0 / 48.0 };
         let taps: HashSet<(u64, common::model::TapPoint)> = [(12, common::model::TapPoint::PostFx)].into();
-        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &taps);
+        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &taps, RenderScope::Mix);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
@@ -1105,7 +1237,8 @@ mod tests {
         let frames = 256usize;
         let mut midi = Vec::with_capacity(MAX_EVENTS);
         // 同じ program を buffer 跨ぎで回すため `run` ではなく手で組む (`run` は毎回 build する)。
-        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new());
+        let built =
+            build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
@@ -1232,7 +1365,7 @@ mod tests {
             ..common::model::PluginInstance::new("latent".into(), common::plugin_format::PluginFormat::Clap)
         });
         let song = song_with(vec![parallel(10, vec![chain(11, vec![latent]), chain(12, vec![])])]);
-        let built = build_program(&song.tracks[0].devices, 1, None, &lat, &HashSet::new());
+        let built = build_program(&song.tracks[0].devices, 1, None, &lat, &HashSet::new(), RenderScope::Mix);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();

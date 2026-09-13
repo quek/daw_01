@@ -33,6 +33,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use common::loudness_report::{LoudnessCollector, LoudnessReport};
 use common::model::Song;
+use common::protocol::RenderScope;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
 use crate::engine::{EngineShared, MAX_TRACKS, ProjectShared};
@@ -166,6 +167,9 @@ pub struct LoudnessOutcome {
 /// (via `AudioCommand::CancelExport`), the loop breaks, the partial WAV is
 /// deleted, and the function returns `Ok(ExportOutcome { cancelled: true, .. })`
 /// (a cancel is not an error).
+///
+/// `scope` = どの処理段を通すか (WAV 書き出しは `RenderScope::Mix`、クリップ bounce は
+/// `PostFx` / `Sources`)。走査 / 描く関数は scope に依らず同じで、compile する program の形だけが変わる。
 #[allow(clippy::too_many_arguments)]
 pub fn run_export(
     path: PathBuf,
@@ -175,6 +179,7 @@ pub fn run_export(
     sample_rate: u32,
     max_frames: usize,
     span: RenderSpan,
+    scope: RenderScope,
     write_video_sidecars: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
@@ -221,6 +226,7 @@ pub fn run_export(
             &engine_shared,
             &project,
             &song,
+            scope,
             sample_rate,
             max_frames,
             total_samples,
@@ -412,6 +418,8 @@ pub fn run_loudness_analysis(
         &engine_shared,
         &project,
         &song,
+        // 解析するのは書き出す音と同じ「曲そのまま」。
+        RenderScope::Mix,
         sample_rate,
         max_frames,
         win.total_samples,
@@ -477,6 +485,7 @@ fn render_loop(
     engine_shared: &EngineShared,
     project: &ProjectShared,
     song: &Song,
+    scope: RenderScope,
     sample_rate: u32,
     max_frames: usize,
     total_samples: u64,
@@ -510,11 +519,11 @@ fn render_loop(
     // synchronous full compile here is appropriate; it reuses already-decoded
     // buffers and publishes the full renderer for the live load to pick up.
     {
-        let prev = project.audio_clip_renderer.load();
+        let prev = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         let prev_ref: &crate::audio_clip_renderer::AudioClipRenderer = &prev;
         let project_dir = project
             .project_dir
-            .load()
+            .load() // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
             .as_ref()
             .map(|a| (**a).clone());
         if crate::audio_clip_renderer::has_undecoded_sources(
@@ -545,7 +554,7 @@ fn render_loop(
     // `render_audio_events` を通す = 不変条件 #6)。 足りないと Stretch clip が
     // degrade 経路に落ちて書き出しだけ音が変わるので、ここで必ず揃える。
     {
-        let renderer_g = project.audio_clip_renderer.load();
+        let renderer_g = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         for (track_idx, &needed) in renderer_g.engines_per_track.iter().enumerate() {
             let Some(ts) = scratch.get_mut(track_idx) else {
                 break;
@@ -571,9 +580,10 @@ fn render_loop(
     // (`compile_schedule` は live / export 共通なので入力も共通)。
     let mut schedule = compile_schedule(
         song,
-        &project.device_latencies.load(),
+        &project.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         sample_rate,
         max_frames as u32,
+        scope,
     )
     .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
@@ -711,9 +721,9 @@ fn render_loop(
 
         // Snapshot the same wait-free state the notify thread sees (mirrors —
         // this thread is off-RT, so ArcSwap loads are fine here).
-        let plugin_refs_g = project.plugin_refs.load();
-        let worker_g = engine_shared.worker.load_full();
-        let audio_renderer_g = project.audio_clip_renderer.load();
+        let plugin_refs_g = project.plugin_refs.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        let worker_g = engine_shared.worker.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        let audio_renderer_g = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
@@ -936,6 +946,7 @@ mod tests {
                 &engine,
                 &project,
                 &song,
+                RenderScope::Mix,
                 48_000,
                 common::process_data::MAX_FRAMES,
                 win.total_samples,
@@ -1029,6 +1040,160 @@ mod tests {
         .unwrap();
         assert_eq!(w.write_start, w.write_end);
         assert_eq!(w.total_samples, w.walk_start, "空範囲で走査ループが 1 度も回らない");
+    }
+
+    /// L / R を別々に受け取る sink。
+    #[derive(Default)]
+    struct StereoCapture {
+        l: Vec<f32>,
+        r: Vec<f32>,
+    }
+
+    impl RenderSink for StereoCapture {
+        fn accept(&mut self, l: &[f32], r: &[f32]) -> Result<()> {
+            self.l.extend_from_slice(l);
+            self.r.extend_from_slice(r);
+            Ok(())
+        }
+    }
+
+    const BOUNCE_SR: u32 = 48_000;
+
+    /// 曲の mix (`RenderScope::Mix`) を `[start, end)` 拍だけ描く (clip bounce と同じく曲頭から温める)。
+    fn render_mix(song: &Song, start_beat: f64, end_beat: f64) -> StereoCapture {
+        let engine = EngineShared::new();
+        let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
+        let span = RenderSpan::RangeWarm { start_beat, end_beat };
+        let win = RenderWindow::resolve(song, BOUNCE_SR, span, false).expect("window");
+        let mut sink = StereoCapture::default();
+        let outcome = render_loop(
+            &engine,
+            &project,
+            song,
+            RenderScope::Mix,
+            BOUNCE_SR,
+            common::process_data::MAX_FRAMES,
+            win.total_samples,
+            win.write_start,
+            win.write_end,
+            win.walk_start,
+            false,
+            &mut sink,
+            |_, _| {},
+        )
+        .expect("render");
+        assert!(!outcome.cancelled);
+        sink
+    }
+
+    /// 内蔵 Comp を強く掛けたトラック 1 本の曲。素材は L と R で振幅も周波数も違うサイン波
+    /// (pan の左右差と Comp の効き方が測れる)。クリップは 1..3 拍。
+    fn bounce_source_song(dir: &std::path::Path, volume: f32, pan: f32) -> (Song, u32) {
+        use common::model::*;
+        let wav = dir.join("source.wav");
+        let spec = WavSpec { channels: 2, sample_rate: BOUNCE_SR, bits_per_sample: 32, sample_format: SampleFormat::Float };
+        let mut writer = WavWriter::create(&wav, spec).expect("source wav");
+        for i in 0..BOUNCE_SR * 2 {
+            let t = i as f32 / BOUNCE_SR as f32;
+            writer.write_sample(0.6 * (std::f32::consts::TAU * 220.0 * t).sin()).expect("write");
+            writer.write_sample(0.3 * (std::f32::consts::TAU * 330.0 * t).sin()).expect("write");
+        }
+        writer.finalize().expect("finalize");
+        let mut song = song(8.0);
+        let source_id = song.alloc_audio_source_id();
+        song.media.audio_sources.insert(
+            source_id,
+            AudioSource {
+                path: AudioSourcePath::Absolute(wav),
+                sample_rate: BOUNCE_SR,
+                channels: 2,
+                frames: u64::from(BOUNCE_SR) * 2,
+                original_bpm: None,
+                root_key: None,
+            },
+        );
+        let event = AudioEvent {
+            id: 1,
+            source_id,
+            event_length_beats: 4.0,
+            source_end_frames: u64::from(BOUNCE_SR) * 2,
+            stretch_mode: StretchMode::Raw,
+            ..AudioEvent::default()
+        };
+        let content_id =
+            song.alloc_content(ClipContent::Audio(AudioContent { events: vec![event], next_event_id: 2 }), "src".into());
+        let mut track = Track::default();
+        track.id = song.alloc_track_id();
+        (track.volume, track.pan) = (volume, pan);
+        track.place_clip(Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Clip::default() });
+        let comp_id = song.alloc_device_id();
+        let mut comp = NativeDevice::new_added(NativeKind::Comp, comp_id, 2);
+        if let NativeParams::Comp(c) = &mut comp.params {
+            (c.threshold_db, c.ratio, c.makeup_db) = (-24.0, 8.0, 6.0);
+        }
+        track.devices.push(Device::Native(comp));
+        let tid = track.id;
+        song.tracks.push(track);
+        song.enforce_edit_invariants();
+        (song, tid)
+    }
+
+    /// Bounce with FX は元と同じ音で鳴る (r.md #129): 元トラックを鳴らした mix と、そのクリップを焼いて
+    /// (`Song::isolated_track` → engine の書き出し) 新しいトラックに置いた (`Song::place_bounce_with_fx`) 後の mix を
+    /// 同じ区間で描き、L / R それぞれのピークと RMS が一致する。焼く段がフェーダーを含むと、写したフェーダーで
+    /// もう一度掛かる (pan 中央で -3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
+    #[test]
+    fn bounce_with_fx_sounds_like_the_original_track() {
+        let db = |x: f32| 20.0 * x.max(1e-9).log10();
+        let peak = |s: &[f32]| s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let rms = |s: &[f32]| (s.iter().map(|v| v * v).sum::<f32>() / s.len().max(1) as f32).sqrt();
+        for (volume, pan) in [(1.0, 0.0), (1.0, -0.6), (0.5, 0.0)] {
+            let dir = std::env::temp_dir().join(format!("daw01_bounce_fx_parity_{}_{volume}_{pan}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let (song, tid) = bounce_source_song(&dir, volume, pan);
+            let original = render_mix(&song, 1.0, 3.0);
+
+            let baked_path = dir.join("baked.wav");
+            let engine = Arc::new(EngineShared::new());
+            engine.live_parked.store(true, Ordering::Release);
+            let project = Arc::new(ProjectShared::new(common::protocol::ProjectKey(1), 0));
+            let isolated = song.isolated_track(tid).expect("isolated");
+            let span = RenderSpan::RangeWarm { start_beat: 1.0, end_beat: 3.0 };
+            let outcome = run_export(
+                baked_path.clone(),
+                engine,
+                project,
+                isolated,
+                BOUNCE_SR,
+                common::process_data::MAX_FRAMES,
+                span,
+                RenderScope::PostFx,
+                false,
+                |_, _| {},
+            )
+            .expect("bake");
+            let mut bounced = song.clone();
+            let wav = common::model::BakedWav {
+                path: common::model::AudioSourcePath::Absolute(baked_path),
+                sample_rate: BOUNCE_SR,
+                frames: outcome.frames,
+            };
+            let (_, content) = bounced.add_baked_audio(wav, (1.0, 3.0), 0.0);
+            let content_id = bounced.alloc_content(common::model::ClipContent::Audio(content), "baked".into());
+            let clip = common::model::Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Default::default() };
+            bounced.place_bounce_with_fx(tid, "FX".into(), clip).expect("placed");
+            bounced.enforce_edit_invariants();
+            let after = render_mix(&bounced, 1.0, 3.0);
+
+            let case = format!("volume {volume} / pan {pan}");
+            assert!(peak(&original.l) > 0.05, "{case}: 元の mix が鳴っている");
+            for (ch, a, b) in [("L", &original.l, &after.l), ("R", &original.r, &after.r)] {
+                assert_eq!(a.len(), b.len(), "{case} {ch}: 同じ区間");
+                let (dp, dr) = (db(peak(b)) - db(peak(a)), db(rms(b)) - db(rms(a)));
+                assert!(dp.abs() < 0.05 && dr.abs() < 0.05, "{case} {ch}: ピーク差 {dp:.3} dB / RMS 差 {dr:.3} dB");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

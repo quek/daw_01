@@ -149,9 +149,9 @@ pub enum TrackBuiltinParam {
 /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field
 /// selector。 計 23 variants で TextEvent 全描画属性 + 位置 + 形を
 /// automation 可能。 lane の値は plain (= TextEvent field と同単位)、
-/// normalize 経路 (= UI 表示の 0..=1) は target ごとに plain_to_norm で
-/// 定義 (Color channel は 0..=1 そのまま、 size / offset / blur は
-/// project px なので plain そのまま使用)。
+/// normalize 経路 (= UI 表示の 0..=1) は `common::automation::target_range` が
+/// target ごとに定義 (Color channel は 0..=1 そのまま、 size / outline width /
+/// shadow offset / blur は px の値域)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum TextBuiltinParam {
     /// 位置 / サイズ (normalized 0..=1、 image と同 idiom)

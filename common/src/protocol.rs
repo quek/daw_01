@@ -136,6 +136,48 @@ pub enum RenderMode {
     Offline,
 }
 
+/// 1 回の描画でどの処理段を通すか。engine の compile が program の形に焼く (通さない device は op を
+/// 出さない / 通さない段は program に「掛けない」と書く) ので、描く関数 (`render_master_buffer`) は
+/// scope に依らず 1 本 (アーキ不変条件 6)。**Song を書き換えて処理を消さない** — どのトラックを描くかは
+/// 送り手が Song で決め、どの段を通すかはここで決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode)]
+pub enum RenderScope {
+    /// 曲そのまま (トラックの device → フェーダー → master の fx / 音量 / Limiter)。live / 書き出し /
+    /// ラウドネス解析。
+    #[default]
+    Mix,
+    /// トラックの PostFx 点まで: device チェーン (内蔵 device / Parallel の混ぜを含む) を通し、フェーダー
+    /// (volume / pan / mute / solo) と master を通さない。Bounce (with FX) — 焼いた音は新しいトラックに置き、
+    /// フェーダーとそこから先 (send / 親 group) は元トラックから写す (`Song::place_bounce_with_fx`) ので、
+    /// 焼く側で通すと写したフェーダーでもう一度掛かる。
+    PostFx,
+    /// 素材の音だけ (pre-FX): クリップの音と音源 (音声入力を持たない device) の出力。音声入力を持つ
+    /// device / 内蔵 device / Parallel の分割と混ぜ (chain の gain / pan / mute / solo・出力 trim・
+    /// gain match) / フェーダー / master を通さない。Bounce In Place / Glue — 焼いた音は元のトラックへ
+    /// 戻り、再生時にこれらの段をもう一度通るので、焼く側で通すと二重に掛かる。
+    Sources,
+}
+
+impl RenderScope {
+    /// 音声入力を持つ device と内蔵 device を通すか。
+    #[must_use]
+    pub fn track_fx(self) -> bool {
+        !matches!(self, Self::Sources)
+    }
+
+    /// トラックのフェーダー (volume / pan / mute / solo) を掛けるか。
+    #[must_use]
+    pub fn fader(self) -> bool {
+        matches!(self, Self::Mix)
+    }
+
+    /// master の fx chain / 音量 / Limiter を通すか。
+    #[must_use]
+    pub fn master(self) -> bool {
+        matches!(self, Self::Mix)
+    }
+}
+
 // =====================================================================
 // 共有 struct (両 channel から参照される payload)
 // =====================================================================
@@ -385,8 +427,8 @@ pub enum AudioCommand {
     /// Offline-render a range of the **currently loaded song** to a WAV file
     /// (`Bounce`, `docs/plan_audio_clip.md` §3.8 / `J` Glue の焼き込み、
     /// `docs/plan_glue_bake.md`)。 送り手が先に `LoadSong` で対象トラックだけを
-    /// 残した song を積むので、ここでは「今の song の `[start_beat, end_beat)` を
-    /// 焼く」以上の意味は持たない。 Replies with `AudioEvent::BounceClipFxComplete`。
+    /// 残した song を積み、どの処理段を通すかは `scope` が決める (Bounce with FX =
+    /// `PostFx`、Bounce In Place / Glue = `Sources`)。 Replies with `AudioEvent::BounceClipFxComplete`。
     /// 範囲は拍 (`ExportWav` と同じく換算は engine 側 SSoT)。
     ///
     /// `warm` = 曲頭から走査するか。 plugin chain を通す bounce は tail /
@@ -402,6 +444,7 @@ pub enum AudioCommand {
         start_beat: f64,
         end_beat: f64,
         warm: bool,
+        scope: RenderScope,
     },
     /// Reposition the audio engine's playhead. `samples` is the absolute
     /// frame offset at the engine sample rate. Takes effect on the next

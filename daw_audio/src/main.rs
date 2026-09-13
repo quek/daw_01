@@ -414,7 +414,7 @@ fn spawn_notify_thread(
                 notify_quarantined_devices(&engine_shared, &out_tx);
                 // worker pool 全体の完了待ち timeout → pool 停止を 1 回だけ通知
                 // (GUI は plugin_host respawn → OpenWorkerPool 再送で復旧する)。
-                if let Some(rig) = engine_shared.worker.load_full()
+                if let Some(rig) = engine_shared.worker.load_full() // arch-lint: allow-arcswap-load (off-RT: notify thread)
                     && rig.pool.as_ref().is_some_and(|p| p.is_stalled())
                     && !rig.stall_notified.swap(true, Ordering::AcqRel)
                 {
@@ -442,9 +442,9 @@ fn notify_quarantined_devices(
     engine_shared: &EngineShared,
     out_tx: &tokio::sync::mpsc::UnboundedSender<AudioEvent>,
 ) {
-    let projects = engine_shared.projects.load();
+    let projects = engine_shared.projects.load(); // arch-lint: allow-arcswap-load (off-RT: notify thread)
     for (key, project) in projects.iter() {
-        let refs = project.plugin_refs.load();
+        let refs = project.plugin_refs.load(); // arch-lint: allow-arcswap-load (off-RT: notify thread)
         for (id, entry) in refs.iter() {
             if !entry.quarantined.load(Ordering::Acquire)
                 || entry.unresponsive_notified.swap(true, Ordering::AcqRel)
@@ -483,8 +483,8 @@ impl DevicePublisher {
     fn publish(&mut self, engine_shared: &EngineShared) {
         self.flush();
         let bundle = DeviceBundle {
-            worker: engine_shared.worker.load_full(),
-            sampler: engine_shared.sampler.load_full(),
+            worker: engine_shared.worker.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
+            sampler: engine_shared.sampler.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
         };
         if let Err(rtrb::PushError::Full(newest)) = self.tx.push(bundle) {
             // 旧 parked は superseded (snapshot) なのでここ (off-thread) で drop。
@@ -766,6 +766,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                 start_beat,
                 end_beat,
                 warm,
+                scope,
             } => {
                 let Some(ctl) = projects.get(&project) else {
                     tracing::warn!(project = project.0, "BounceClipFxOnline for an unknown project; ignored");
@@ -782,6 +783,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     start_beat,
                     end_beat,
                     warm,
+                    scope,
                 );
             }
             // それ以外は全部 project 宛 (`AudioCommand::project` が SSoT)。閉じた

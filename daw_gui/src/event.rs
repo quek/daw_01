@@ -877,8 +877,8 @@ pub enum AppEvent {
         source_id: u32,
         bipolar: bool,
     },
-    /// docs/plan_modulation.md §9: change what a `ModSource` follows (track / Parallel chain)。
-    SetModSourceTap { id: u32, source: common::model::TapSource },
+    /// docs/plan_modulation.md §9: change what a `ModSource` follows (track / Parallel chain)。`None` = 入力なし。
+    SetModSourceTap { id: u32, source: Option<common::model::TapSource> },
     /// docs/plan_modulation.md §3: envelope follower attack / release (ms).
     /// During a scrub drag these only mark dirty (no per-frame recompile); the
     /// engine recompiles the baked coefficients once on drag-end (see

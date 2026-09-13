@@ -254,6 +254,9 @@ pub struct Schedule {
     /// `MasterLimiterState::process` はこの値で遅延を通すかを決めるので、PDC の会計
     /// (`master_latency_samples` の limiter 項) と実際の遅延が食い違わない (§18-G)。
     pub master_limiter_latency: bool,
+    /// master の段 (fx chain → SC Listen の置換 → master 音量 → Limiter) を通すか
+    /// (`RenderScope::master`、compile 時に焼く)。`false` は全 track の合流をそのまま出力にする (bounce)。
+    pub master_stage: bool,
     /// r.md #110 Parallel: track index 順の展開済み device 列 (`docs/plan_parallel.md` §4.1)。
     /// pass 1 (worker) / pass 2 (`ProcessGroupFx`) の両方がこれを走らせる。
     /// scratch (Parallel / chain slot、並列 PDC の delay line) も program が所有する。
@@ -279,6 +282,7 @@ impl Schedule {
             mod_kinds: Vec::new(),
             master_latency_samples: 0,
             master_limiter_latency: false,
+            master_stage: true,
             track_programs: Vec::new(),
             master_program: ChainProgram::empty(common::model::MASTER_TRACK_ID),
             master_midi_a: Vec::with_capacity(crate::mixer::MAX_EVENTS),

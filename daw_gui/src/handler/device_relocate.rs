@@ -677,7 +677,7 @@ fn extract_bindings(
 /// 自トラックを指していた aux 参照を移動先へ貼り替える。 他トラックを指すものは
 /// 触らない (= その配線はユーザーが意図して張ったもの)。 chain source (同 track の
 /// Parallel 内 chain) は運搬で chain が同 track に残るとは限らないが、 id は不変なので
-/// そのまま (dangling なら compile が黙って落とす)。
+/// そのまま (chain が消えていれば編集後の不変条件 `Song::prune_dangling_routes` が同じ undo step で外す)。
 ///
 /// 対象は `dev` 以下の全 device (Parallel なら中身全部)。aux 入力は plugin と内蔵 Comp / Bus Comp
 /// 共通の slot (`for_each_aux_slot_mut`)、aux 出力は plugin だけ。

@@ -249,17 +249,17 @@ impl ModSource {
         MOD_SOURCE_PALETTE[index % MOD_SOURCE_PALETTE.len()]
     }
 
-    /// envelope follower のときだけ `(tap, follower)` を返す (generator は `None`)。
-    pub fn follower(&self) -> Option<(&AudioTap, &FollowerConfig)> {
+    /// envelope follower のときだけ `(tap, follower)` を返す (generator は `None`)。tap の `None` は入力なし。
+    pub fn follower(&self) -> Option<(Option<&AudioTap>, &FollowerConfig)> {
         if let ModSourceKind::EnvelopeFollower { tap, follower } = &self.kind {
-            Some((tap, follower))
+            Some((tap.as_ref(), follower))
         } else {
             None
         }
     }
 
     /// envelope follower の tap を可変借用 (generator は `None`)。
-    pub fn follower_tap_mut(&mut self) -> Option<&mut AudioTap> {
+    pub fn follower_tap_mut(&mut self) -> Option<&mut Option<AudioTap>> {
         if let ModSourceKind::EnvelopeFollower { tap, .. } = &mut self.kind {
             Some(tap)
         } else {
@@ -901,7 +901,10 @@ impl ModParam {
 pub enum ModSourceKind {
     /// 他トラック音声のエンベロープフォロワー (既存基盤)。
     EnvelopeFollower {
-        tap: AudioTap,
+        /// 聴く音。`None` = 入力なし (値は 0)。aux 入力 (`Option<AuxInputRoute>`) と同じ規則で、source の
+        /// トラック / chain が消えると編集後の不変条件 (`Song::prune_dangling_routes`) が `None` にする。
+        /// 旧 file の tap object はそのまま `Some` として読める。
+        tap: Option<AudioTap>,
         follower: FollowerConfig,
     },
     Lfo(LfoConfig),
@@ -915,7 +918,7 @@ pub enum ModSourceKind {
 impl Default for ModSourceKind {
     fn default() -> Self {
         ModSourceKind::EnvelopeFollower {
-            tap: AudioTap::post_fader(0),
+            tap: None,
             follower: FollowerConfig::default(),
         }
     }
