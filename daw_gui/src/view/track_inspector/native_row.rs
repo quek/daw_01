@@ -33,9 +33,9 @@ const BTN_GAP: f32 = 2.0;
 const MINI_W: f32 = 80.0;
 const MINI_CURVE_H: f32 = 18.0;
 const MINI_GR_H: f32 = 8.0;
-/// 小表示と名前の間。
+/// 小表示とボタン列の間。
 const MINI_GAP: f32 = 4.0;
-/// OFF の行の小表示は `active = false` (共有部品が α 0.45 で描く)。
+/// 行の名前の文字サイズ (plugin 行と同じ)。
 const NAME_FONT: f32 = 11.0;
 /// master 末尾の「Post-Fader」の区切りの高さ。
 const DIVIDER_H: f32 = 16.0;
@@ -81,10 +81,11 @@ pub(super) fn draw_native_row(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Row
             })
         });
     }
-    // 小表示 (EQ 系はミニカーブ、Comp 系は横 GR バー)。ダブルクリックで ON/OFF (Q15)。
+    // 小表示 (EQ 系はミニカーブ、Comp 系は横 GR バー。OFF は共有部品が形を保って薄く描く)。
+    // ダブルクリックで ON/OFF (Q15)。単クリックは drag_list の click (選択) に流す。
     right -= MINI_W + MINI_GAP;
     let mini_hit = Rect { x: right, y: row.y + 2.0, w: MINI_W, h: ROW_H - 4.0 };
-    draw_mini(app, ui, ctx, entry, Rect { x: right, ..mini_hit });
+    draw_mini(app, ui, ctx, entry, mini_hit);
     if !popup_open && ui.take_double_click_in_rect(mini_hit).is_some() {
         let bypassed = !entry.bypassed;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
