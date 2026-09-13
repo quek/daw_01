@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use daw_ui_platform::{AppEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalPosition, ScrollDelta};
 
 /// マウスホイール 1 line を何 px に換算するか (Windows / Linux / macOS で慣用される値)。
-const LINE_HEIGHT_PX: f32 = 40.0;
+pub(crate) const LINE_HEIGHT_PX: f32 = 40.0;
 
 /// M8 Phase 32: OS から drop された file 群と drop 直前の cursor 座標。
 ///

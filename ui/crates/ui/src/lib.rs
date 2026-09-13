@@ -90,6 +90,7 @@ pub use widgets::text_input::{TextInputResponse, TextInputStyle};
 pub use widgets::toggle_button::{
     IndicatorButtonResponse, ToggleButtonResponse, ToggleButtonStyle,
 };
+pub use widgets::xy_point::{XyAxes, XyPointResponse, XyPointStyle};
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
     WaveformSegment, WaveformSource, WaveformStyle, WaveformView,
