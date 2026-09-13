@@ -278,7 +278,8 @@ fn value_style(app: &AppData, target: &AutomationTarget, unit: &'static str) -> 
     let p = &app.theme.core;
     let (range, curve, sensitivity) = match target_range(target, None) {
         // `LogWithOff` の OFF (0) は対数目盛に載らないので、欄のドラッグは lo..hi で動かす。
-        // OFF はつまみを左へ回し切るか、ダブルクリック (既定値) で戻す。
+        // OFF はつまみを左へ回し切る / ダブルクリック (既定値) / 欄に "OFF" か "0" を打つ
+        // (書式がラベルで名指しする値は確定時に range へ clamp されない、`labeled_value`)。
         ParamRange::Log { lo, hi } | ParamRange::LogWithOff { lo, hi } => ((lo, hi), ScrubCurve::Log, KNOB_UNITS_PER_PX),
         r @ (ParamRange::Linear { .. } | ParamRange::Toggle | ParamRange::Stepped { .. }) => {
             let (lo, hi) = r.display_range();
