@@ -57,5 +57,5 @@ pub(super) fn draw_device_panel(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: Pa
 
 /// Par を開いた device が `plugin_id` の plugin か (VOICEVOX / 字幕の専用セクションの gate)。
 fn opened_plugin_is(app: &AppData, device_id: u64, plugin_id: &str) -> bool {
-    app.cur.song_doc.song().plugin_by_id(device_id).is_some_and(|p| p.plugin_id == plugin_id)
+    app.cur.song_doc.plugin_by_id(device_id).is_some_and(|p| p.plugin_id == plugin_id)
 }

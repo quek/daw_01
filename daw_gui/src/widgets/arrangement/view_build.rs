@@ -211,7 +211,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 t,
                 lane_build_data,
                 &|tgt| app.plugin_param_range(tgt),
-                &|tgt| app.lane_node_label(&labels, tgt),
+                &|tgt| labels.lane_node_label(tgt),
             ),
             row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
@@ -307,7 +307,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         common::model::MASTER_TRACK_ID,
         lane_build_data,
         &|tgt| app.plugin_param_range(tgt),
-        &|tgt| app.lane_node_label(&labels, tgt),
+        &|tgt| labels.lane_node_label(tgt),
     );
     let master_row = ArrangementMasterRow {
         automation_lanes_collapsed: !app.cur.view.master_row_automation_expanded,
@@ -814,7 +814,7 @@ fn native_lane_color(kind: common::model::NativeKind) -> Color {
     }
 }
 
-/// `device_param_name` (song を引いたノード名つきの名前、`AppData::lane_node_label`) の lane ラベル。
+/// `device_param_name` (song を引いたノード名つきの名前、`ArrLabelCache::lane_node_label`) の lane ラベル。
 /// 解決できない (song 無しで呼ばれた / ノードが消えた) ときは `fallback`。ノード名はユーザーが変えられる
 /// ので intern しない (世代キャッシュが持つ `Arc` をそのまま使う)。
 fn node_label(device_param_name: Option<Arc<str>>, fallback: impl FnOnce() -> Arc<str>) -> Arc<str> {

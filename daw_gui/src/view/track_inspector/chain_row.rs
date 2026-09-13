@@ -90,7 +90,7 @@ pub(super) fn draw_chain_row(
     );
     // knob は automation gesture idiom (mixer の send knob と同じ)。 レーンの置き場は chain の持ち主
     // (master の Parallel なら song 側、 master 行も再生中に追従する)。
-    let Some(track_id) = app.cur.song_doc.song().chain_owner_track(ChainRef::Chain(chain_id)) else { return };
+    let Some(track_id) = app.cur.song_doc.chain_owner_track(chain_id) else { return };
     let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { chain_id });
     let gain_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id });
     let scope = app.live_param_scope();

@@ -24,7 +24,7 @@ use crate::app::{
 use crate::audio_source_cache::AudioSourceCache;
 use crate::handler::glue::PendingGlueBake;
 use crate::state::{
-    DeviceParamKey, LauncherUiState, LoudnessState, MediaState, ModRackHover, RecordingState,
+    DeviceParamKey, LauncherUiState, LoudnessState, MediaState, ModRackHover, PluginParamTable, RecordingState,
     ScrubGesture, SelectionState, SongDoc, TransportState,
 };
 
@@ -56,7 +56,8 @@ pub struct ProjectIpc {
     /// くるたびに上書き。 安定 `device_id` で identify、 Parameter
     /// Picker (Phase 3+) / lane の label 解決 / norm↔plain 変換に
     /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
-    pub plugin_params: std::collections::HashMap<u64, Vec<common::protocol::PluginParamInfo>>,
+    /// 変わるたびに世代が進む (レーン名の世代キャッシュが読む、[`PluginParamTable`])。
+    pub plugin_params: PluginParamTable,
     /// device ごとに plugin が埋め込み GUI (editor window)
     /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
     /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
@@ -863,7 +864,7 @@ impl ProjectState {
                 ara_doc_cache: std::collections::HashMap::new(),
                 ara_pcm_materialized: std::collections::HashMap::new(),
                 plugin_param_values: std::collections::HashMap::new(),
-                plugin_params: std::collections::HashMap::new(),
+                plugin_params: PluginParamTable::default(),
                 slot_has_gui: std::collections::HashMap::new(),
                 loaded_devices: std::collections::HashMap::new(),
                 pending_clip_fx_bounce: None,

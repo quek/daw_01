@@ -1293,11 +1293,45 @@ pub(crate) struct ArrLabelCache {
     pub(crate) section_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
     pub(crate) content_names:
         std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
-    /// r.md #129: ノード (内蔵 device / chain / Parallel) で束縛するレーンの完全修飾名 ("Comp 2: Thr")。
-    /// 名前は Song だけから決まるので同じ世代で持つ (毎フレーム木の走査 + `format!` をしない)。
-    /// Song 以外 (host の param 表) に依存する `PluginParam` は入れない (`AppData::lane_node_label`)。
+    /// r.md #129: ノード (plugin / 内蔵 device / chain / Parallel) で束縛するレーンの完全修飾名
+    /// ("Comp 2: Thr" / "Synth: Cutoff"、`AppData::device_param_name`)。毎フレームの node の引き・param 表と
+    /// plugin DB の探索・`format!` をしない。名前は Song に加えて host の param 表と plugin DB からも決まるので、
+    /// `epoch` とは別の鍵 `lane_labels_key` で作り直す。
     pub(crate) lane_node_labels:
         std::collections::HashMap<common::model::AutomationTarget, std::sync::Arc<str>>,
+    /// `lane_node_labels` を作ったときの入力の世代 (`None` = まだ作っていない)。
+    pub(crate) lane_labels_key: Option<LaneLabelsKey>,
+}
+
+impl ArrLabelCache {
+    /// レーン見出しに出す、ノードで束縛する target の完全修飾名 (`AppData::device_param_name` と同じ名前)。
+    /// ノードで束縛しない target / ノードが消えた / 名前が決まらない (host 未送) は `None`。
+    pub(crate) fn lane_node_label(&self, target: &common::model::AutomationTarget) -> Option<std::sync::Arc<str>> {
+        self.lane_node_labels.get(target).cloned()
+    }
+}
+
+/// [`ArrLabelCache::lane_node_labels`] を作ったときの入力の世代。どれか 1 つでも変われば作り直す。
+pub(crate) struct LaneLabelsKey {
+    /// Song (`SongDoc::edit_epoch`)。
+    pub(crate) edit_epoch: u64,
+    /// host の param 表 (`PluginParamTable::generation`)。
+    pub(crate) plugin_params: u64,
+    /// plugin DB。DB は丸ごと差し替える不変値 (`Arc`) なので、同じ `Arc` を指しているかが世代になる。
+    /// 作ったときの `Arc` をここで持つので、解放された番地が次の DB に再利用されて同じに見えることは無い。
+    pub(crate) plugin_db: Option<Arc<PluginDatabase>>,
+}
+
+impl LaneLabelsKey {
+    /// 今の入力 (`edit_epoch` / `plugin_params` / `plugin_db`) で作ったものか。
+    pub(crate) fn is_current(&self, edit_epoch: u64, plugin_params: u64, plugin_db: &Option<Arc<PluginDatabase>>) -> bool {
+        let same_db = match (&self.plugin_db, plugin_db) {
+            (Some(built), Some(now)) => Arc::ptr_eq(built, now),
+            (None, None) => true,
+            _ => false,
+        };
+        self.edit_epoch == edit_epoch && self.plugin_params == plugin_params && same_db
+    }
 }
 
 /// r.md #56: 再生位置の秒表示用 [`common::tempo_map::TempoMap`] の `edit_epoch`

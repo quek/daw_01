@@ -9,6 +9,10 @@ pub mod loudness;
 pub mod project;
 pub mod tabs;
 pub mod song_doc;
+/// r.md #129: Song の device node の id → 位置の索引 (所有者は `SongDoc`)。
+pub mod node_index;
+/// r.md #129: plugin host が送る param 表 (世代つき、所有者は `ProjectIpc`)。
+pub mod plugin_params;
 pub mod transport;
 pub mod selection;
 pub mod ipc;
@@ -31,6 +35,7 @@ pub use loudness::{LoudnessPhase, LoudnessState};
 pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};
 pub use tabs::Tabs;
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
+pub use plugin_params::PluginParamTable;
 pub use activity::ActivityState;
 pub use transport::{PlayFrom, TransportState};
 pub use selection::SelectionState;

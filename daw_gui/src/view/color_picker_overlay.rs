@@ -66,13 +66,13 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
             Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
         }),
         // r.md #110: Parallel chain。 未設定は中立色 (text_dim) を初期値に見せる。
-        ColorPickerTarget::ParallelChain(id) => app.cur.song_doc.song().chain_by_id(id).map(|(_, c)| {
+        ColorPickerTarget::ParallelChain(id) => app.cur.song_doc.chain_by_id(id).map(|(_, c)| {
             c.color
                 .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
                 .unwrap_or(app.theme.core.text_dim)
         }),
         // Parallel 自体 (括弧の帯)。 未設定は chain と同じ中立色。
-        ColorPickerTarget::Parallel(id) => app.cur.song_doc.song().parallel_by_id(id).map(|r| {
+        ColorPickerTarget::Parallel(id) => app.cur.song_doc.parallel_by_id(id).map(|r| {
             r.color
                 .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
                 .unwrap_or(app.theme.core.text_dim)
