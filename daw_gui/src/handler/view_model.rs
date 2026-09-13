@@ -558,34 +558,65 @@ impl AppData {
             .map_or_else(|| self.resolve_name(&inst.plugin_id), |def| def.name.to_string())
     }
 
-    /// `PluginParam` target の **完全修飾** param 名 (r.md #72 / #78)。
-    /// 形は `"<device 名>: <param 名>"`、 CLAP が `module` (= "/" 区切りの
-    /// グループパス) を報告していれば `"<device 名>: <module>/<param 名>"`。
+    /// **チェーン上のノード (device / chain / Parallel) で束縛する** target の、song を引いた
+    /// **完全修飾** 名 (r.md #72 / #78 / #129 §7.4)。形は `"<ノード名>: <param 名>"`:
     ///
-    /// device 名を必ず付けるのが要点で、 これが無いと MPhaser の "Dry/Wet" と
+    /// | target | 名前 |
+    /// |---|---|
+    /// | `PluginParam` | `"<device 名>: <param 名>"` (CLAP が `module` を報告していれば `"<device 名>: <module>/<param 名>"`) |
+    /// | `NativeParam` | `native_param_label(display_name, p)` = `"Comp 2: Thr"` |
+    /// | `ChainGain` / `ChainPan` | `"<chain 名>: Gain"` / `"<chain 名>: Pan"` |
+    /// | `ParallelOutGain` / `ParallelSplitFreq` / `ParallelSelect` | `"<Parallel 名>: Out"` / `"<Parallel 名>: Split Low\|Mid"` / `"<Parallel 名>: Active"` |
+    ///
+    /// ノード名を必ず付けるのが要点で、 これが無いと MPhaser の "Dry/Wet" と
     /// MSaturator の "Dry/Wet" が同一表示になる (r.md #72)。 modulation ラックの
     /// 接続行・ arrangement lane header・ status message が**同じこの 1 本**を
     /// 使うので、 名前の付け方はここだけを直せばよい。
     ///
     /// 内蔵映像 FX は host が `PluginParamList` を送らない (param 表は静的
-    /// マニフェスト) ので、 そちらから引く。 非 plugin target / device が消えて
-    /// いる / host 未送 / 空名 は `None` (caller が generic 名へ fallback)。
-    pub fn plugin_param_name(&self, target: &common::model::AutomationTarget) -> Option<String> {
-        let common::model::AutomationTarget::PluginParam { device_id, param_id, .. } = target
-        else {
-            return None;
+    /// マニフェスト) ので、 そちらから引く。 ノードで束縛しない target / ノードが消えて
+    /// いる / host 未送 / 空名 は `None` (caller が song 非依存の名前へ fallback)。
+    pub fn device_param_name(&self, target: &common::model::AutomationTarget) -> Option<String> {
+        use common::model::{AutomationTarget as T, TrackBuiltinParam as B};
+        let song = self.cur.song_doc.song();
+        let (device_id, param_id) = match target {
+            T::PluginParam { device_id, param_id, .. } => (*device_id, *param_id),
+            T::NativeParam { device_id, param } => {
+                return Some(common::model::native_param_label(&song.native_by_id(*device_id)?.display_name(), *param));
+            }
+            T::TrackBuiltin(B::ChainGain { chain_id }) => return Some(format!("{}: Gain", song.chain_by_id(*chain_id)?.1.name)),
+            T::TrackBuiltin(B::ChainPan { chain_id }) => return Some(format!("{}: Pan", song.chain_by_id(*chain_id)?.1.name)),
+            T::TrackBuiltin(B::ParallelOutGain { parallel_id }) => {
+                return Some(format!("{}: Out", song.parallel_by_id(*parallel_id)?.name));
+            }
+            T::TrackBuiltin(B::ParallelSplitFreq { parallel_id, edge }) => {
+                let edge = crate::automation_label::split_edge_label(*edge);
+                return Some(format!("{}: Split {edge}", song.parallel_by_id(*parallel_id)?.name));
+            }
+            T::TrackBuiltin(B::ParallelSelect { parallel_id }) => {
+                return Some(format!("{}: Active", song.parallel_by_id(*parallel_id)?.name));
+            }
+            T::TrackBuiltin(B::Volume | B::Pan | B::Mute | B::SendGain { .. })
+            | T::MasterLimiter(_)
+            | T::SongTempo
+            | T::SongTimeSigNumerator
+            | T::ImageBuiltin(_)
+            | T::TextBuiltin(_)
+            | T::GroupTransform(_)
+            | T::ModSourceParam { .. }
+            | T::ModRoutingDepth { .. } => return None,
         };
-        let inst = self.cur.song_doc.song().plugin_by_id(*device_id)?;
+        let inst = song.plugin_by_id(device_id)?;
         let device = self.device_label(inst);
         if let Some(def) = common::video_fx::def_by_id(&inst.plugin_id) {
-            let param = def.param(*param_id)?;
+            let param = def.param(param_id)?;
             return Some(format!("{device}: {}", param.name));
         }
         let info = self
             .cur.pipc.plugin_params
-            .get(device_id)?
+            .get(&device_id)?
             .iter()
-            .find(|p| p.id == *param_id)?;
+            .find(|p| p.id == param_id)?;
         if info.name.is_empty() {
             return None;
         }
@@ -597,8 +628,9 @@ impl AppData {
     }
 
     /// `automation_target_display_name` の song-aware 版 (B6 / r.md #8)。
-    /// `PluginParam` は完全修飾名 (`plugin_param_name`) を、 解決できなければ
-    /// generic「Param N」を返す。 status_message / clip 名 / mod routing 表示用。
+    /// ノードで束縛する target は完全修飾名 (`device_param_name`: "Comp 2: Thr" /
+    /// "Chain 1: Pan") を、 解決できなければ song 非依存の名前を返す。
+    /// status_message / last touched / clip 名 / mod routing 表示用。
     pub fn automation_target_label(&self, target: &common::model::AutomationTarget) -> String {
         // r.md #89: モジュレーターは song を引かないと種別も通し番号も出せない
         // (`automation_target_display_name` は song 非依存の pure label なので
@@ -606,7 +638,7 @@ impl AppData {
         if let Some(name) = self.mod_target_label(target) {
             return name;
         }
-        self.plugin_param_name(target)
+        self.device_param_name(target)
             .unwrap_or_else(|| automation_target_display_name(target))
     }
 
@@ -623,7 +655,7 @@ impl AppData {
                 let r = song.all_mod_routings().find(|r| r.id == *routing_id)?;
                 let src = self.mod_source_name(r.source_id)?;
                 // 深さの表示は「どのソースが何を変調しているか」が読めないと意味が無い。
-                let dest = self.plugin_param_name(&r.target).unwrap_or_else(|| {
+                let dest = self.device_param_name(&r.target).unwrap_or_else(|| {
                     self.mod_target_label(&r.target)
                         .unwrap_or_else(|| automation_target_display_name(&r.target))
                 });
@@ -654,7 +686,13 @@ impl AppData {
         domain: ModControlDomain,
         track_id: u32,
     ) -> InspectorModData {
-        let Some((_, routings)) = self.cur.song_doc.song().param_stores(track_id) else {
+        // r.md #129 (§7.7): routing の store は target の持ち主 (view が渡す track id は
+        // Volume / Pan のように target だけでは持ち主が決まらない住所のためだけに使う)。
+        let song = self.cur.song_doc.song();
+        let Some(track_id) = crate::handler::param_value::param_owner(song, target, track_id) else {
+            return InspectorModData::default();
+        };
+        let Some((_, routings)) = song.param_stores(track_id) else {
             return InspectorModData::default();
         };
         let model_base = domain.to_model(target, display_base);

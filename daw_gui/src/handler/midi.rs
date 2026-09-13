@@ -132,8 +132,8 @@ impl AppData {
 
     /// MIDI Learn button (transport) が bind する target を決める (B2 / r.md #8、
     /// touch + learn)。 直近に触った param (`last_touched_param`) が bind 可能
-    /// (PluginParam / track Volume / Pan) ならそれを優先、 無ければ選択 track の
-    /// Volume に fallback。
+    /// (PluginParam / 内蔵 device の param / master Limiter / track Volume / Pan) なら
+    /// それを優先、 無ければ選択 track の Volume に fallback。
     pub fn midi_learn_binding_target(
         &self,
         armed_track: Option<u32>,
@@ -233,9 +233,9 @@ impl AppData {
 
     /// Phase 7 B1-M Step 2: CC 値 (0..127) を target に適用。 normalization は
     /// target ごとに違う (= TrackVolume は 0..1、 TrackPan は -1..1、
-    /// SongTempo は 60..180 BPM linear)。 既存 setter (set_track_volume /
-    /// set_track_pan / song.bpm + IPC) を経由するので audio engine 反映も
-    /// automatic。
+    /// SongTempo は 60..180 BPM linear、 内蔵 device / Limiter は `target_range` の値域)。
+    /// 既存 setter (set_track_volume / set_track_pan / song.bpm + IPC / ノブと同じ
+    /// `apply_native_edit`) を経由するので audio engine 反映も automatic。
     pub(crate) fn apply_midi_value_to_target(
         &mut self,
         target: common::model::BindingTarget,

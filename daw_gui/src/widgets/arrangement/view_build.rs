@@ -211,7 +211,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 t,
                 lane_build_data,
                 &|tgt| app.plugin_param_range(tgt),
-                &|tgt| app.plugin_param_name(tgt),
+                &|tgt| app.device_param_name(tgt),
             ),
             row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
@@ -307,7 +307,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         common::model::MASTER_TRACK_ID,
         lane_build_data,
         &|tgt| app.plugin_param_range(tgt),
-        &|tgt| app.plugin_param_name(tgt),
+        &|tgt| app.device_param_name(tgt),
     );
     let master_row = ArrangementMasterRow {
         automation_lanes_collapsed: !app.cur.view.master_row_automation_expanded,
@@ -814,9 +814,15 @@ fn native_lane_color(kind: common::model::NativeKind) -> Color {
     }
 }
 
+/// `device_param_name` (song を引いたノード名つきの名前) の lane ラベル。
+/// 解決できない (song 無しで呼ばれた / ノードが消えた) ときは `fallback`。
+fn node_label(device_param_name: Option<&str>, fallback: impl FnOnce() -> Arc<str>) -> Arc<str> {
+    device_param_name.map_or_else(fallback, intern_label)
+}
+
 fn lane_target_display(
     target: &common::model::AutomationTarget,
-    plugin_param_name: Option<&str>,
+    device_param_name: Option<&str>,
 ) -> LaneDisplay {
     use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
@@ -828,27 +834,31 @@ fn lane_target_display(
             label: intern_label("Pan"),
             color: Color::rgb(0.55, 0.92, 0.55),
         },
-        // r.md #110: Parallel chain の gain / pan (Volume / Pan と同じ見た目)。
+        // r.md #110: Parallel chain の gain / pan (Volume / Pan と同じ見た目)。r.md #129 (§7.4):
+        // 同じトラックに Parallel が複数あっても見分けられるよう、ラベルは chain / Parallel の名前つき
+        // ("Chain 1: Gain")。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { .. }) => LaneDisplay {
-            label: intern_label("Chain Gain"),
+            label: node_label(device_param_name, || intern_label("Chain Gain")),
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => LaneDisplay {
-            label: intern_label("Chain Pan"),
+            label: node_label(device_param_name, || intern_label("Chain Pan")),
             color: Color::rgb(0.55, 0.92, 0.55),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { .. }) => LaneDisplay {
-            label: intern_label("Parallel Out"),
+            label: node_label(device_param_name, || intern_label("Parallel Out")),
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         // r.md #112: クロスオーバー周波数 (EQ と同じ青緑系 = 周波数の色)。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { edge, .. }) => LaneDisplay {
-            label: intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge))),
+            label: node_label(device_param_name, || {
+                intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge)))
+            }),
             color: Color::rgb(0.40, 0.80, 0.75),
         },
         // r.md #114: Selector のアクティブ chain (切替 = 段階なので橙で他と分ける)。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => LaneDisplay {
-            label: intern_label("Active"),
+            label: node_label(device_param_name, || intern_label("Active")),
             color: Color::rgb(0.95, 0.65, 0.35),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
@@ -864,10 +874,9 @@ fn lane_target_display(
         // ラベルは song を引ける側の device 名 ("Comp 2: Thr") があればそれ、無ければ
         // song 非依存の SSoT (`automation_target_display_name`)。
         AutomationTarget::NativeParam { param, .. } => LaneDisplay {
-            label: plugin_param_name.map_or_else(
-                || intern_label(&crate::automation_label::automation_target_display_name(target)),
-                intern_label,
-            ),
+            label: node_label(device_param_name, || {
+                intern_label(&crate::automation_label::automation_target_display_name(target))
+            }),
             color: native_lane_color(param.kind()),
         },
         AutomationTarget::MasterLimiter(_) => LaneDisplay {
@@ -875,10 +884,7 @@ fn lane_target_display(
             color: native_lane_color(common::model::NativeKind::Comp),
         },
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
-            label: match plugin_param_name {
-                Some(name) => intern_label(name),
-                None => intern_label(&format!("Param {param_id}")),
-            },
+            label: node_label(device_param_name, || intern_label(&format!("Param {param_id}"))),
             color: Color::rgb(0.78, 0.55, 0.92),
         },
         // r.md #89: モジュレーターのツマミ / 変調の深さ。ソース名まで入った表示は
