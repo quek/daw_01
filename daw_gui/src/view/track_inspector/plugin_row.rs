@@ -106,10 +106,7 @@ pub(super) fn draw_plugin_row(
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     if !popup_open {
-                        app.handle_event(AppEvent::Device(DeviceEvent::SetPluginSendAllKeys {
-                            device_id,
-                            enabled: next,
-                        }));
+                        app.handle_event(AppEvent::Device(DeviceEvent::SetPluginSendAllKeys { device_id, enabled: next }));
                     }
                 })
             },

@@ -5,6 +5,8 @@ pub mod arrangement_view;
 pub mod color_picker_overlay;
 pub mod audio_editor;
 pub mod bottom_panel;
+/// `Q` (カーソル直下のものを無効化 / 有効化) の宛先解決と発行 (root.rs から分離)。
+pub mod bypass_toggle;
 pub mod capture_drop;
 /// Ctrl+C / Ctrl+X / Ctrl+V / D — 編集面ごとのクリップボード操作 (root.rs から分離)。
 pub mod clipboard_ops;

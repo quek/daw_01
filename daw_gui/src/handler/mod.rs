@@ -39,7 +39,11 @@ pub mod notes;
 pub mod project;
 pub mod parallel;
 pub mod param_gesture;
+/// パラメーターの現在値と、 それを初期値にする `A` キーのレーン追加 (`automation_lanes.rs` から分離)。
+pub mod param_value;
 pub mod range_ops;
+/// autosave / クラッシュ復旧 modal / recovery file の掃除 (`project.rs` から分離)。
+pub mod recovery;
 pub mod save_bundle;
 pub mod select_all;
 pub mod selection_view;
