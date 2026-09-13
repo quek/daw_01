@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use common::device_scope_bridge::MAX_DEVICE_SCOPES;
 use common::model::Song;
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::protocol::{InstanceToken, ProjectKey};
@@ -271,22 +270,23 @@ pub struct StretchPoolDelivery {
 /// RT が 1 buffer 遅れても溢れないよう 2 倍取る。
 const STRETCH_POOL_RING_CAP: usize = MAX_TRACKS * 2;
 
+/// 録音中の lane の集合 (`(track_id, AutomationTarget)`、GUI の `SetRecordingLanes`)。
+pub type RecordingLanes = std::collections::HashSet<(u32, common::model::AutomationTarget)>;
+
 /// **プロジェクト (= タブ) ごと**の共有面 (`docs/plan_project_tabs.md` §3.1)。
 ///
-/// transport / seek / loop / preroll / recording は audio thread が毎 buffer 読む
-/// wait-free 面。`plugin_refs` / renderer / `device_latencies` / `project_dir` は
-/// off-RT 読者 (export / notify / decode) 向けのミラーで、**RT はこれらの `ArcSwap` を
-/// load しない** — RT へは [`RtBundle`] が配送される。
+/// transport / seek / preroll / recording は audio thread が毎 buffer 読む wait-free 面 (atomic)。
+/// `song` / `plugin_refs` / renderer / `device_latencies` / `project_dir` は off-RT 読者
+/// (export / notify / decode) 向けのミラー。
+///
+/// **RT はこの構造体の `ArcSwap` を load しない** (不変条件 4)。load の Guard を持っている間に
+/// 別スレッドが store すると、Guard が差し替え前の `Arc` の最終参照になり、Guard の drop =
+/// RT 上で解放が起きる (arc-swap の debt 返済)。RT が読む snapshot はすべて [`RtBundle`] で届き、
+/// 置き換えた旧値は recycle ring で off-thread に捨てる。
 pub struct ProjectShared {
     pub key: ProjectKey,
     pub song: ArcSwapOption<Song>,
     pub playback: AtomicU8,
-    /// 再生ループの状態 (ON/OFF + 範囲)。 ループは `Song` ではなく GUI の
-    /// session state が所有するので、`LoadSong` ではなく `AudioCommand::SetLoop`
-    /// だけがここを書き換える (`common::model::LoopRegion`)。 ON/OFF と範囲を
-    /// 別々の atomic に割らないのは、 audio thread が 1 buffer 内で整合した
-    /// スナップショットを読むため (`recording_lanes` と同じ `ArcSwap` idiom)。
-    pub loop_region: ArcSwap<common::model::LoopRegion>,
     /// Last published playhead in samples. Mirrored to shmem for the GUI
     /// playhead cursor. **書き込みは audio thread (`process_buffer`) 単独**。
     /// IPC スレッドは seek を `pending_seek` に積むだけで、ここを直接書かない
@@ -299,15 +299,6 @@ pub struct ProjectShared {
     /// `playhead` の writer を audio thread 単独に保ち、停止/seek の競合を排除する。
     /// `NO_PENDING_SEEK` = 要求なし。多重要求は last-wins。
     pub pending_seek: AtomicU64,
-    /// Phase 4 Step C-2 (`docs/plan_automation.md` §6): currently recording
-    /// lane set (= GUI が `SetRecordingLanes` で更新)。 audio thread は
-    /// 各 buffer の頭で `load()` し、 `fill_track_param_ramps` で該当 lane
-    /// の curve eval を bypass する。 `(track_id, AutomationTarget)` の
-    /// 2 つ組で identify (lane_id を使わないのは GUI 側で lane を削除して
-    /// から audio に通知が届くまでの race を避けるため = target 一致なら
-    /// bypass で済む)。 起動時は空。
-    pub recording_lanes:
-        ArcSwap<std::collections::HashSet<(u32, common::model::AutomationTarget)>>,
     /// メトロノーム on/off。 GUI が `AudioCommand::SetMetronomeEnabled` で更新、
     /// audio thread が `render_metronome` で読む。 false なら click 生成を
     /// skip (= 無音)。 起動時 default false。
@@ -320,10 +311,10 @@ pub struct ProjectShared {
     /// (`None` = 停止)。差し替えは `generation` で検出する。
     pub preview_sequence: ArcSwapOption<crate::sampler::PreviewSequence>,
     /// Audio clip render snapshot. Built off-thread in
-    /// `compile_audio_schedule` and published via `ArcSwap`. The
-    /// audio thread `load()`s once per buffer to find events that
-    /// overlap the current playhead range. Empty until imports start
-    /// landing.
+    /// `compile_audio_schedule` and published here for the off-RT readers
+    /// (export / the decode worker's reuse). RT へは同じ `Arc` が [`RtBundle`] で届く
+    /// (差し替えを recv loop の housekeeping が検出して送り直す)。 Empty until imports
+    /// start landing.
     pub audio_clip_renderer: ArcSwap<AudioClipRenderer>,
     /// Monotonic schedule version, bumped on every `LoadSong`. The background
     /// decode worker stamps each job with the generation at dispatch and only
@@ -348,7 +339,7 @@ pub struct ProjectShared {
     /// `StretchEngine` は 1 個 ~1 MB を確保するので **RT では作れない**。
     /// `publish_audio_clip_schedule` が新 schedule の
     /// `AudioClipRenderer::engines_per_track` を見て不足分を作り、ここへ push する
-    /// (schedule を `ArcSwap` に store する **前**に push するので、RT が新
+    /// (renderer をミラーへ store して [`RtBundle`] で送る **前**に push するので、RT が新
     /// schedule を見るときには pool が届いている)。 producer が 2 つある
     /// (recv loop / decode worker) ので `Mutex` で直列化する — off-thread なので
     /// ロックしてよい (RT 側は `ProjectRt::stretch_pool_rx` を lock-free に drain)。
@@ -409,10 +400,6 @@ pub struct ProjectShared {
     /// 切替でも解除しない: respawn 後の GUI の再送を無効にしないため)。Song に無い id もそのまま
     /// 保持し、compile 後に一致する op があれば効く。
     pub sc_listen_device: AtomicU64,
-    /// r.md #129 §11.2: device scope (EQ Par のスペクトラム) の対象 device id を slot 順に
-    /// (`0` = 空き)。IPC スレッドが `SetDeviceScopes` で切り詰め・重複除去して差し替え、scope
-    /// project の RT が buffer 頭で `load` する。
-    pub device_scope_watch: ArcSwap<[u64; MAX_DEVICE_SCOPES]>,
 }
 
 impl ProjectShared {
@@ -442,10 +429,8 @@ impl ProjectShared {
             key,
             song: ArcSwapOption::empty(),
             playback: AtomicU8::new(PlaybackCommand::Stop as u8),
-            loop_region: ArcSwap::from_pointee(common::model::LoopRegion::default()),
             playhead: AtomicU64::new(0),
             pending_seek: AtomicU64::new(NO_PENDING_SEEK),
-            recording_lanes: ArcSwap::from_pointee(std::collections::HashSet::new()),
             metronome_enabled: AtomicBool::new(false),
             plugin_refs: ArcSwap::from_pointee(HashMap::new()),
             preview_sequence: ArcSwapOption::empty(),
@@ -464,25 +449,7 @@ impl ProjectShared {
             device_latencies: ArcSwap::from_pointee(HashMap::new()),
             telemetry_slot,
             sc_listen_device: AtomicU64::new(0),
-            device_scope_watch: ArcSwap::from_pointee([0; MAX_DEVICE_SCOPES]),
         }
-    }
-
-    /// `SetDeviceScopes` の受け口: 0 と重複を除いて先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰め、
-    /// slot 表として差し替える (off-RT)。
-    pub fn set_device_scopes(&self, device_ids: &[u64]) {
-        let mut watch = [0u64; MAX_DEVICE_SCOPES];
-        let mut n = 0;
-        for &id in device_ids {
-            if n == MAX_DEVICE_SCOPES {
-                break;
-            }
-            if id != 0 && !watch[..n].contains(&id) {
-                watch[n] = id;
-                n += 1;
-            }
-        }
-        self.device_scope_watch.store(Arc::new(watch));
     }
 }
 

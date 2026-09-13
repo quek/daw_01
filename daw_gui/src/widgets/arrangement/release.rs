@@ -736,8 +736,11 @@ pub(super) fn commit_releases(
         // dist < 16px → click 格下げ (modifier-aware なトラック選択に任せる、 後続 loop の clicked_track 経路)
         // dist >= 16px → 上で計算した `pending_drop` を SetTrackParent として 1 度発行。
         // 旧 ReorderTracks 経由の sibling reorder も同 variant に統合済 (parent 不変 + anchor_after 指定)。
-        if let Some((src_tracks, parent, anchor_after)) = pending_drop {
-            ui.push_edit({ let v_tracks = src_tracks; let v_parent = parent; let v_anchor = anchor_after; Edit::mutate(move |app: &mut AppData| { if !v_tracks.iter().any(|id| app.cur.song_doc.song().tracks.iter().any(|t| t.id == *id)) { return; } app.edit_song(|song| { let mut moved: Vec<common::model::Track> = v_tracks.iter().filter_map(|id| { let pos = song.tracks.iter().position(|t| t.id == *id)?; Some(song.tracks.remove(pos)) }).collect(); if moved.is_empty() { return; } for t in &mut moved { t.parent_group_id = v_parent; } let insert_at = match v_anchor { None => 0, Some(after_id) => song.tracks.iter().position(|t| t.id == after_id).map(|i| i + 1).unwrap_or(song.tracks.len()) }; for (offset, t) in moved.into_iter().enumerate() { song.tracks.insert(insert_at + offset, t); } }); }) });
+        // 適用 (実在 / 依存の循環の拒否 / undo) は handler → `Song::move_tracks` 1 本が持つ。
+        if let Some((track_ids, parent_id, anchor_after)) = pending_drop {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetTrackParent { track_ids, parent_id, anchor_after });
+            }));
         }
 
         // ---- M10 Phase 47b+49: track volume drag release → 最終値を 1 度 commit ----

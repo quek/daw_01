@@ -555,13 +555,13 @@ pub enum AppEvent {
     UngroupTracks {
         track_ids: Vec<u32>,
     },
-    /// Reparent a track. `track_id` becomes a child of `parent_id` (or
-    /// a top-level track when `parent_id == None`). The graph compiler
-    /// rejects the edit (silently keeping the old parent) if it would
-    /// produce a cycle.
+    /// トラック群の親を `parent_id` (None = top-level) にし、`anchor_after` の直後 (None = 先頭) へ
+    /// 並べ替える (アレンジのヘッダ drop)。依存 (親子 / サイドチェイン / send) が循環する付け替えは
+    /// `Song::move_tracks` が拒否し、何も変えずに status で理由を出す。
     SetTrackParent {
-        track_id: u32,
+        track_ids: Vec<u32>,
         parent_id: Option<u32>,
+        anchor_after: Option<u32>,
     },
     RemoveLastTrack,
     /// 選択トラック群の削除 (r.md #43)。 引数は **安定 `Track::id`** の集合

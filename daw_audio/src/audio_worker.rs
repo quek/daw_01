@@ -77,7 +77,7 @@ pub struct DispatchShared {
     pub frames: AtomicU32,
     pub playing: AtomicU8,
     pub any_solo: AtomicU8,
-    /// 再生ループの状態 (= `SharedState::loop_region` の copy)。 master が dispatch
+    /// 再生ループの状態 (= `ProjectRt::loop_region` の copy)。 master が dispatch
     /// 直前に自分のスタック上の値を publish し、 workers が `process_track_owned` に
     /// 渡して plugin transport の `loop_*_beats` / `looping` / IS_LOOP_ACTIVE 判定に
     /// 使う。 ON/OFF と範囲を別々の atomic に割ると worker が食い違った組を読みうる
@@ -114,7 +114,7 @@ pub struct DispatchShared {
     /// r.md #89: buffer 頭から最初の刻み境界までの frame 数。
     pub mod_lead: AtomicU32,
     /// Phase 4 Step C-2: 「現在 recording 中の lane」 set への ptr
-    /// (= `SharedState.recording_lanes.load()` 結果)。 master が dispatch
+    /// (= `ProjectRt::recording_lanes`)。 master が dispatch
     /// 前に store、 workers + master が `fill_track_param_ramps` の引数に
     /// 渡して curve eval を bypass する判定に使う。 null → 空 set 相当。
     pub recording_lanes_ptr:
@@ -614,8 +614,8 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         if recording_lanes_ptr.is_null() {
             &empty_recording_lanes
         } else {
-            // SAFETY: master holds the ArcSwap Guard / Arc snapshot alive
-            // for the dispatch window via `dispatch_and_wait` 's local var.
+            // SAFETY: master holds the snapshot alive for the dispatch window
+            // (live: `ProjectRt::recording_lanes`、書き出し: export thread の local)。
             unsafe { &*recording_lanes_ptr }
         };
     // Phase 5 Step 5.2: master が当該 buffer の effective bpm を atomic で
@@ -676,8 +676,8 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         if audio_renderer_ptr.is_null() {
             None
         } else {
-            // SAFETY: master holds the AudioClipRenderer (Guard or
-            // ArcSwap snapshot) alive for the dispatch window.
+            // SAFETY: master holds the AudioClipRenderer alive for the dispatch
+            // window (live: `ProjectRt::audio_clip_renderer`、書き出し: export thread の Guard)。
             Some(unsafe { &*audio_renderer_ptr })
         };
     let slots = unsafe { std::slice::from_raw_parts(slots_base, n_slots as usize) };

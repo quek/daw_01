@@ -96,8 +96,8 @@ impl AppData {
         });
         if result {
             // 解除で消えた chain の gain / pan や Parallel の出力のレーン / 変調は、SongDoc の
-            // `enforce_edit_invariants` が同じ undo step で掃除済み (r.md #129)。
-            self.prune_device_session_refs();
+            // `enforce_edit_invariants` が同じ undo step で、消えた id を指す選択は `reconcile_song_refs` が
+            // 掃除済み (r.md #129)。
             self.flush_song_sync();
         }
     }

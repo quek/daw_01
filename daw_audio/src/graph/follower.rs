@@ -35,6 +35,11 @@ fn one_pole_coeff(fc_hz: f32, sample_rate: u32) -> f32 {
     a.clamp(0.0, 1.0)
 }
 
+#[inline]
+fn finite_or_zero(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
 /// Attack/release one-pole coefficient for a time constant in milliseconds.
 /// `ms <= 0` yields an instantaneous (coefficient `1.0`) response.
 fn time_coeff(ms: f32, sample_rate: u32) -> f32 {
@@ -162,6 +167,10 @@ impl FollowerSlot {
     /// `first_sample` は `l[0]` の **絶対 song サンプル位置** — 刻み境界を跨ぐたびに
     /// その時点の envelope を [`Self::hist`] へ記録するために要る (境界は絶対位置で
     /// 決まるので、buffer の切り方に依存しない)。
+    ///
+    /// 非有限の検出値は 0 とみなし、状態 (envelope / 帯域フィルタ) が非有限なら block 末に
+    /// 無音へ戻す (`docs/plan_rack_native_devices.md` §12.2 の検出器の規則) — 状態は再 compile を
+    /// 跨いで引き継がれるので、1 サンプルの inf が曲を開き直すまで変調を NaN に固着させる。
     #[inline]
     pub fn process_block(&mut self, l: &[f32], r: &[f32], n: usize, first_sample: u64) {
         let n = n.min(l.len()).min(r.len());
@@ -172,11 +181,12 @@ impl FollowerSlot {
                 FollowerMode::Peak => l[i].abs().max(r[i].abs()),
                 FollowerMode::Rms => (0.5 * (l[i] * l[i] + r[i] * r[i])).sqrt(),
             };
+            let det = finite_or_zero(det);
             let det = match &mut self.band {
                 Some(b) => b.process(det),
                 None => det,
             };
-            let det = det * self.gain;
+            let det = finite_or_zero(det * self.gain);
             let t = if self.rectify { det.abs() } else { det };
             let coeff = if t > env { self.atk } else { self.rel };
             env += coeff * (t - env);
@@ -190,6 +200,16 @@ impl FollowerSlot {
             }
         }
         self.env = env;
+        if !env.is_finite() {
+            self.env = 0.0;
+            self.hist.iter_mut().filter(|v| !v.is_finite()).for_each(|v| *v = 0.0);
+        }
+        if let Some(b) = self.band.as_mut()
+            && !(b.lp_hp.is_finite() && b.lp.is_finite())
+        {
+            b.lp_hp = 0.0;
+            b.lp = 0.0;
+        }
     }
 
     /// 絶対刻み `tick` 時点の envelope。
@@ -269,5 +289,41 @@ mod tests {
             }
         }
         assert!(a.iter().any(|(_, v)| *v > 0.01), "そもそも env が動いている");
+    }
+
+    /// 検出する音に非有限のサンプル (±inf / NaN) が 1 サンプル混ざっても、envelope と帯域フィルタの
+    /// 状態は固着しない (§12.2 の検出器の規則)。以後の envelope は有限で、無音なら 0 へ戻り、
+    /// 音が来ればまた追従する。状態は再 compile を跨いで引き継がれるので、固着すると曲を開き直すまで直らない。
+    #[test]
+    fn 非有限のサンプルでenvelopeが固着しない() {
+        let sr = 48_000;
+        let block = 4 * TICK;
+        let band = Some(BandFilter { hp_hz: 40.0, lp_hz: 200.0 });
+        for band_filter in [None, band] {
+            for poison in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+                let c = FollowerConfig { attack_ms: 1.0, release_ms: 10.0, band_filter, ..FollowerConfig::default() };
+                let mut fs = FollowerSlot::from_config(&c, sr);
+                let mut at = 0u64;
+                let run = |fs: &mut FollowerSlot, at: &mut u64, sig: &[f32]| {
+                    fs.process_block(sig, sig, sig.len(), *at);
+                    *at += sig.len() as u64;
+                };
+                let mut hit = vec![0.5f32; block];
+                hit[7] = poison;
+                run(&mut fs, &mut at, &hit);
+                for _ in 0..200 {
+                    run(&mut fs, &mut at, &vec![0.0; block]);
+                }
+                let label = format!("band={} poison={poison}", band_filter.is_some());
+                let tick = (at / TICK as u64) as i64 - 1;
+                assert!(fs.env.is_finite() && fs.env.abs() < 1e-3, "{label}: 無音で 0 へ戻る ({})", fs.env);
+                assert!(fs.env_at_tick(tick).is_finite(), "{label}");
+                let tone: Vec<f32> = (0..block).map(|i| 0.8 * (i as f32 * 0.0125).sin()).collect();
+                for _ in 0..20 {
+                    run(&mut fs, &mut at, &tone);
+                }
+                assert!(fs.env.is_finite() && fs.env > 0.01, "{label}: また追従する ({})", fs.env);
+            }
+        }
     }
 }
