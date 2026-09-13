@@ -149,7 +149,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 .cur.transport
                 .track_peak_display
                 .get(track_idx)
-                .map_or((0.0, 0.0), |&(l, r, _gr)| (l, r)),
+                .copied()
+                .unwrap_or((0.0, 0.0)),
             clips: t
                 .clips
                 .iter()
@@ -804,6 +805,15 @@ fn intern_send_label(send_id: u32) -> Arc<str> {
     })
 }
 
+/// 内蔵 device のレーン色 (Comp / Bus Comp / Limiter = 橙、EQ / Tone EQ = 青緑)。
+fn native_lane_color(kind: common::model::NativeKind) -> Color {
+    use common::model::NativeKind as K;
+    match kind {
+        K::Comp | K::BusComp => Color::rgb(0.95, 0.65, 0.35),
+        K::Eq | K::ToneEq => Color::rgb(0.40, 0.85, 0.80),
+    }
+}
+
 fn lane_target_display(
     target: &common::model::AutomationTarget,
     plugin_param_name: Option<&str>,
@@ -849,44 +859,20 @@ fn lane_target_display(
             label: intern_send_label(*send_id),
             color: Color::rgb(0.85, 0.75, 0.40),
         },
-        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。EQ は青緑 /
-        // コンプは橙で、fx (紫) や volume (水色) と一目で分かれる色に置く。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEqOn) => LaneDisplay {
-            label: intern_label("EQ On"),
-            color: Color::rgb(0.40, 0.85, 0.80),
+        // r.md #129 (§7.4): 内蔵 device。EQ 系は青緑 / コンプ系は橙で、fx (紫) や volume (水色)
+        // と一目で分かれる色に置く。色は song を引かずに種類で決める (song 無しで呼ばれる)。
+        // ラベルは song を引ける側の device 名 ("Comp 2: Thr") があればそれ、無ければ
+        // song 非依存の SSoT (`automation_target_display_name`)。
+        AutomationTarget::NativeParam { param, .. } => LaneDisplay {
+            label: plugin_param_name.map_or_else(
+                || intern_label(&crate::automation_label::automation_target_display_name(target)),
+                intern_label,
+            ),
+            color: native_lane_color(param.kind()),
         },
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripCompOn) => LaneDisplay {
-            label: intern_label("Comp On"),
-            color: Color::rgb(0.95, 0.65, 0.35),
-        },
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
-        | AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { .. }) => {
-            let is_eq = matches!(
-                target,
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
-            );
-            LaneDisplay {
-                // ラベルの組み立ては song 非依存の SSoT
-                // (`crate::automation_label::automation_target_display_name`) を引く。
-                label: intern_label(&crate::automation_label::automation_target_display_name(
-                    target,
-                )),
-                color: if is_eq {
-                    Color::rgb(0.40, 0.85, 0.80)
-                } else {
-                    Color::rgb(0.95, 0.65, 0.35)
-                },
-            }
-        }
-        // マスターストリップ (docs/plan_master_strip.md)。通常 ch のストリップと
-        // 同系色にしつつ、ラベルで master と分かる (SSoT は automation_label)。
-        AutomationTarget::MasterStrip(param) => LaneDisplay {
+        AutomationTarget::MasterLimiter(_) => LaneDisplay {
             label: intern_label(&crate::automation_label::automation_target_display_name(target)),
-            color: match param {
-                common::model::MasterStripParam::EqOn
-                | common::model::MasterStripParam::EqGain(_) => Color::rgb(0.40, 0.85, 0.80),
-                _ => Color::rgb(0.95, 0.65, 0.35),
-            },
+            color: native_lane_color(common::model::NativeKind::Comp),
         },
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
             label: match plugin_param_name {

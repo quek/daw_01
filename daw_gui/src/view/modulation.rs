@@ -142,18 +142,20 @@ pub(crate) fn build_mod(
 pub(crate) fn push_mod_depth_bracket(
     ui: &mut Ui<'_, AppData>,
     app: &AppData,
+    surface: crate::app::ParamSurface,
     track_id: u32,
     target: &AutomationTarget,
     mod_dragging: bool,
 ) {
-    // 所有者は **(track_id, target)**。ミキサーは同じ target (例
+    // 所有者は **(面, track_id, target)**。ミキサーは同じ target (例
     // `TrackBuiltin(Pan)`) を全ストリップに描くので、target だけを鍵にすると
     // 全部が 1 本の bracket を取り合い、どれか 1 つを drag しただけで他ストリップの
-    // 欄が「非 active」として閉じてしまう。
+    // 欄が「非 active」として閉じてしまう。r.md #129: 同じ param を別の面 (Mixer 帯と Rack Par)
+    // が描いても、ドラッグしていない面の申告が ◉ を解除しないよう面も含める。
     crate::view::scrub_gesture::push(
         ui,
         app,
-        crate::app::ScrubGesture::ModDepth { track_id, target: target.clone() },
+        crate::app::ScrubGesture::ModDepth { surface, track_id, target: target.clone() },
         mod_dragging,
     );
 }

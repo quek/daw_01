@@ -6,6 +6,8 @@ pub mod audio_editor;
 pub mod automation;
 pub mod automation_lanes;
 pub mod bounce;
+/// r.md #129: `Q` の宛先 (Mixer 帯 / マスターパネルの hover → device / Limiter)。
+pub mod bypass_target;
 pub mod clip_events;
 pub mod clipboard_media;
 pub mod clips;
@@ -33,6 +35,8 @@ pub mod midi;
 pub mod sampler;
 pub mod mixer;
 pub mod modulation;
+/// r.md #129: 内蔵 device / master Limiter の値編集と追加 (値 IPC の唯一の口)。
+pub mod native_edit;
 pub mod note_selection;
 pub mod note_nudge;
 pub mod notes;
@@ -44,7 +48,11 @@ pub mod param_value;
 pub mod range_ops;
 /// autosave / クラッシュ復旧 modal / recovery file の掃除 (`project.rs` から分離)。
 pub mod recovery;
+/// r.md #129: Rack の Par パネルの開閉 (見方の都合)。
+pub mod rack_view;
 pub mod save_bundle;
+/// r.md #129: SC Listen (聴き方の都合、Song に書かない) の唯一の口。
+pub mod sc_listen;
 pub mod select_all;
 pub mod selection_view;
 /// r.md #61: 終了シーケンスの実行 (子プロセス teardown の待ち合わせ)。

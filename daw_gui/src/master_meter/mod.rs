@@ -10,6 +10,8 @@
 //! (メトロノームやパニック declick は含まない)。設計は
 //! `docs/plan_master_meters.md`。
 
+/// r.md #129: EQ Par の device ごとのスペクトラム (同じ解析器を device ごとに回す)。
+pub mod device_spectrum;
 pub mod scope;
 pub mod settings;
 pub mod spectrum;

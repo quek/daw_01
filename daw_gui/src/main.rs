@@ -217,6 +217,8 @@ fn run_gui(
     let metrics = Arc::clone(&bootstrap.metrics);
     // r.md #50: マスター出力サンプルのリング (テレメトリポーラの解析器が読む)。
     let scope = Arc::clone(&bootstrap.scope);
+    // r.md #129: EQ Par の device ごとのサンプルリング (同じポーラが読む)。
+    let device_scope = Arc::clone(&bootstrap.device_scope);
     let job = Arc::clone(&bootstrap.job);
     let plugin_db = bootstrap.plugin_db.clone();
     let supervisor = Arc::clone(&bootstrap.supervisor);
@@ -276,6 +278,7 @@ fn run_gui(
                     bridge,
                     metrics: Arc::clone(&metrics),
                     scope,
+                    device_scope,
                     meter_control: Arc::clone(&app.meter_control),
                     sampler_shared: Arc::clone(&app.sampler.shared),
                     awake: Arc::clone(&awake),
@@ -426,6 +429,7 @@ struct PollerHandles {
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
+    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     meter_control: Arc<std::sync::Mutex<daw_gui::master_meter::settings::MeterControl>>,
     sampler_shared: Arc<daw_gui::state::sampler::SamplerShared>,
     awake: Arc<std::sync::atomic::AtomicBool>,
@@ -439,6 +443,7 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
         bridge,
         metrics,
         scope,
+        device_scope,
         meter_control,
         sampler_shared,
         awake,
@@ -448,8 +453,12 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
         // Global Sampler (`docs/plan_global_sampler.md` §3.3): 現世代のリングを
         // 読み進めて波形バケツを作る。世代が変わったら reader を作り直す。
         let mut sampler_builder: Option<daw_gui::state::sampler::OverviewBuilder> = None;
-        let mut peaks_buf: Vec<(f32, f32, f32)> =
+        let mut peaks_buf: Vec<(f32, f32)> =
             Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
+        // r.md #129: 内蔵 device の GR 面 (id と値の組、seqlock で読む)。
+        let mut native_buf: Vec<(u64, f32)> =
+            Vec::with_capacity(common::audio_bridge::MAX_NATIVE_METERS);
+        let mut device_spectra = daw_gui::master_meter::device_spectrum::DeviceSpectrumPoller::default();
         let mut mod_buf = common::mod_plane::ModPlane::with_capacity(
             common::audio_bridge::MAX_MOD_SOURCES,
         );
@@ -581,15 +590,27 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
             // 空になっても問題ない。 clone の memcpy を省く効果のみ (take は
             // capacity ごと move out するので次 tick で確保し直す = per-tick の
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
+            // r.md #129: 内蔵 device の GR 面は seqlock が破れた tick は None (GUI は前回値を保つ)。
+            let native_gr = active.read_native_meters(&mut native_buf).then(|| native_buf.clone());
             if proxy
                 .send_event(AppEvent::TrackPeaksTick {
                     project: active_key,
                     tracks: std::mem::take(&mut peaks_buf),
-                    // マスターストリップの GR も同じ tick で読む (per-track の
+                    native_gr,
+                    // master の Limiter の GR も同じ tick で読む (per-track の
                     // メーターと同じ buffer の値であることを保つ)。
-                    master_gr: active.master_gr_db(),
+                    master_limiter_gr_db: active.master_limiter_gr_db(),
                 })
                 .is_err()
+            {
+                break;
+            }
+            // r.md #129 (Q14): EQ Par のスペクトラム。解析はマスターのスペクトラムと同じ設定で回す。
+            let spectrum_settings = meter_control.lock().map(|c| c.settings).unwrap_or_default();
+            if let Some(spectra) = device_spectra.tick(&device_scope, active_key, &spectrum_settings)
+                && proxy
+                    .send_event(AppEvent::DeviceSpectrumTick { project: active_key, spectra })
+                    .is_err()
             {
                 break;
             }

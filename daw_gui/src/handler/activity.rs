@@ -10,11 +10,11 @@ use crate::state::*;
 
 /// メーターの量子化ステップ。バー高さは 100px 前後なので 1/1024 は確実に
 /// サブピクセル = 「見た目が変わらない差」。
-const METER_STEPS: f32 = 1024.0;
+pub(crate) const METER_STEPS: f32 = 1024.0;
 
 /// `f32` を `steps` 分解能の整数へ落として指紋に混ぜられる形にする。
 /// NaN / 非有限は 1 つの固定値に畳む (指紋の目的は等値比較だけ)。
-fn quantize(v: f32, steps: f32) -> u64 {
+pub(crate) fn quantize(v: f32, steps: f32) -> u64 {
     if !v.is_finite() {
         return u64::MAX;
     }
@@ -122,30 +122,25 @@ impl AppData {
         mix(self.cur.transport.master_meter.visual_digest);
         // トラックメーターは linear なので dB 経由で正規化してから量子化する
         // (そのまま量子化すると指数減衰が 0 に収束せず永久に描き続ける)。
-        for (l, r, gr) in &self.cur.transport.track_peak_display {
+        for (l, r) in &self.cur.transport.track_peak_display {
             mix(quantize(meter_norm(*l), METER_STEPS));
             mix(quantize(meter_norm(*r), METER_STEPS));
-            // GR も動く表示なので digest に混ぜる (混ぜないとコンプだけが
-            // 動いている間に再描画が止まり、メーターが凍る)。0 に収束するよう
-            // 表示レンジで正規化してから量子化する。
-            mix(quantize(
-                (*gr / common::model::GR_METER_RANGE_DB).clamp(0.0, 1.0),
-                METER_STEPS,
-            ));
         }
+        // 内蔵 device の GR と master Limiter の GR も動く表示なので digest に混ぜる (混ぜないと
+        // コンプだけが動いている間に再描画が止まり、メーターが凍る)。0 に収束するよう表示レンジで
+        // 正規化してから量子化する。
+        let gr_norm = |gr: f32| quantize((gr / common::model::GR_METER_RANGE_DB).clamp(0.0, 1.0), METER_STEPS);
+        for (id, gr) in self.cur.transport.native_gr.iter() {
+            mix(id);
+            mix(gr_norm(gr));
+        }
+        mix(gr_norm(self.cur.transport.master_limiter_gr));
         // r.md #117: 鳴っているボイス (変調ラックの per-voice カーソル)。 停止中でも
         // プレビュー note で増減するので、 起点をそのまま混ぜる (収束する値)。
         for (track, v) in &self.cur.transport.track_voices {
             mix(*track as u64);
             mix(v.on_beat.to_bits());
             mix(v.off_secs.map_or(0, f64::to_bits));
-        }
-        // マスターストリップの GR (コンプ / リミッター)。同じ理由で digest に混ぜる。
-        for gr in [self.cur.transport.master_strip_gr.0, self.cur.transport.master_strip_gr.1] {
-            mix(quantize(
-                (gr / common::model::MASTER_GR_METER_RANGE_DB).clamp(0.0, 1.0),
-                METER_STEPS,
-            ));
         }
         // 変調スカラーは画像 / グループ / 映像効果の見た目を直接動かすので細かく見る。
         for v in self.cur.transport.mod_plane.values() {

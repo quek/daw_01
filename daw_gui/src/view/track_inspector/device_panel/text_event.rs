@@ -11,6 +11,7 @@ pub(super) fn draw_text_event(
     area: Rect,
     pad: f32,
     mut y: f32,
+    device_id: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
@@ -32,7 +33,7 @@ pub(super) fn draw_text_event(
     // 字幕 device の「Par」を押したときだけ Text Event 欄を出す
     // (= 専用欄を常時表示せず Par パネルに集約)。
     if text_track_has_subtitle
-        && app.subtitle_param_panel_open()
+        && app.subtitle_param_panel_open(device_id)
         && let Some(summary) = app.inspector_text_event_summary()
     {
         if app.cur.peph.clip_edit_buffer_target != Some(summary.target) {

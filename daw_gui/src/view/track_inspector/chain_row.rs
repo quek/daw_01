@@ -6,11 +6,11 @@
 use daw_ui_core::{Edit, KnobStyle, Ui, WidgetId};
 use daw_ui_renderer::{Color, Rect};
 
-use crate::app::{AppData, AppEvent, ColorPickerTarget};
+use crate::app::{AppData, AppEvent, ColorPickerTarget, ParamSurface};
 use crate::event_device::DeviceEvent;
 use crate::handler::parallel::ChainMixerEdit;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
-use crate::view::param_gesture::push_param_gesture_edges;
+use crate::view::param_gesture::push_param_gesture;
 use common::model::{AutomationTarget, ChainRef, TrackBuiltinParam};
 
 use super::chain_list::{BAR_W, ROW_GAP, ROW_H};
@@ -88,15 +88,15 @@ pub(super) fn draw_chain_row(
             })
         },
     );
-    // knob は automation gesture idiom (mixer の send knob と同じ)。
-    let Some(track_id) = app.cursor_track_id() else { return };
-    let track = app.cur.song_doc.song().track_by_id(track_id);
+    // knob は automation gesture idiom (mixer の send knob と同じ)。 レーンの置き場は chain の持ち主
+    // (master の Parallel なら song 側、 master 行も再生中に追従する)。
+    let Some(track_id) = app.cur.song_doc.song().chain_owner_track(ChainRef::Chain(chain_id)) else { return };
     let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { chain_id });
     let gain_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id });
-    let live_pan = track.map_or(pan, |t| app.live_param_value(t, &pan_target, pan));
-    let live_gain = track.map_or(gain, |t| app.live_param_value(t, &gain_target, gain));
+    let scope = app.live_param_scope();
+    let live_pan = app.live_param_value_on(&scope, track_id, &pan_target, pan);
+    let live_gain = app.live_param_value_on(&scope, track_id, &gain_target, gain);
     right -= CHAIN_KNOB + 4.0;
-    let was_pan = app.cur.recording.active_param_gestures.contains(&(track_id, pan_target.clone()));
     let pan_resp = ui.knob_at(
         ("inspector_chain_pan", i),
         Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
@@ -111,9 +111,8 @@ pub(super) fn draw_chain_row(
         },
         None,
     );
-    push_param_gesture_edges(ui, track_id, pan_target, "Chain Pan", was_pan, pan_resp.dragging);
+    push_param_gesture(ui, app, ParamSurface::Rack, track_id, pan_target, pan_resp.dragging);
     right -= CHAIN_KNOB + 2.0;
-    let was_gain = app.cur.recording.active_param_gestures.contains(&(track_id, gain_target.clone()));
     let gain_resp = ui.knob_at(
         ("inspector_chain_gain", i),
         Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
@@ -128,7 +127,7 @@ pub(super) fn draw_chain_row(
         },
         None,
     );
-    push_param_gesture_edges(ui, track_id, gain_target, "Chain Gain", was_gain, gain_resp.dragging);
+    push_param_gesture(ui, app, ParamSurface::Rack, track_id, gain_target, gain_resp.dragging);
     // preview 四角 (Bitwig の chain preview: device 数ぶんの小さい四角)。
     let sq = 6.0;
     let n_sq = n_devices.min(6);

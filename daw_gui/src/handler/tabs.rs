@@ -296,6 +296,11 @@ impl AppData {
                 // ため、 明示的に送り直して GUI 表示と engine の実挙動を揃える。
                 if matches!(kind, ChildKind::Audio) {
                     app.set_loop_region(app.cur.transport.loop_region);
+                    // r.md #129 (§10.14 / §10.18): SC Listen と device scope の watch も session state。
+                    // Listen は OpenProject の後・LoadSong (次の frame flush) の前に再送し、watch は
+                    // 送信済みの記憶を捨てて次のフレームの差分送信に任せる。
+                    app.set_sc_listen(app.cur.peph.sc_listen_device);
+                    app.cur.peph.device_scopes_sent.clear();
                 }
             });
         }

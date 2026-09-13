@@ -11,6 +11,7 @@ pub(super) fn draw_group_transform(
     area: Rect,
     pad: f32,
     mut y: f32,
+    device_id: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // ---- Group Transform section (`docs/plan_tachie_group_transform.md` §5.5) --
@@ -18,7 +19,7 @@ pub(super) fn draw_group_transform(
     // 数値編集 + per-param「A」automate トグルで expose。image inspector と同
     // idiom。group は表示 clip を持たないので clip 選択ではなく track 選択が
     // トリガ（§5.5）。純 audio バスには出ない（§5.6 group_has_visual_content）。
-    if let Some(summary) = app.inspector_group_transform_summary() {
+    if let Some(summary) = app.inspector_group_transform_summary(device_id) {
         ui.label_at(
             "inspector_group_transform_label",
             "Group Transform",
@@ -134,13 +135,20 @@ pub(super) fn draw_group_transform(
             );
             // modulation depth ドラッグの falling edge で host 再同期 (audio target の
             // depth 反映用。visual group transform は compose が即読みするので視覚は即時)。
-            mod_widget::push_mod_depth_bracket(ui, app, track_id, &g_target, resp.mod_dragging);
+            mod_widget::push_mod_depth_bracket(
+                ui,
+                app,
+                crate::app::ParamSurface::Rack,
+                track_id,
+                &g_target,
+                resp.mod_dragging,
+            );
             // drag / text 編集を undo 1 step に bracket
-            // (`view::scrub_gesture` が寿命ごと持つ 1 本)。
+            // (`view::scrub_gesture` が寿命ごと持つ 1 本、所有者は Transform device の Par)。
             crate::view::scrub_gesture::push(
                 ui,
                 app,
-                crate::app::ScrubGesture::GroupTransform(param),
+                crate::app::ScrubGesture::GroupTransform { device_id, param },
                 resp.dragging || resp.editing_text,
             );
             let auto_on = summary.automated[idx];

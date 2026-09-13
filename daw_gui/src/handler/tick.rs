@@ -227,7 +227,7 @@ impl AppData {
         }
         // active ∪ latched (Touch mode は latched が常に空なので active のみ)。
         let mut recording: Vec<(u32, common::model::AutomationTarget)> = Vec::new();
-        for key in self.cur.recording.active_param_gestures.iter() {
+        for key in self.cur.recording.active_param_gestures.keys() {
             recording.push(key.clone());
         }
         if matches!(
@@ -235,7 +235,7 @@ impl AppData {
             common::model::RecordingMode::Latch | common::model::RecordingMode::Write
         ) {
             for key in self.cur.recording.latched_param_gestures.iter() {
-                if !self.cur.recording.active_param_gestures.contains(key) {
+                if !self.cur.recording.active_param_gestures.contains_key(key) {
                     recording.push(key.clone());
                 }
             }
@@ -298,18 +298,12 @@ impl AppData {
         playhead_beat: f64,
     ) -> Option<(f64, common::model::ContentId)> {
         use common::model::{AutomationClip, AutomationContent, AutomationLane, ClipContent};
-        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam も `song_lanes` に
-        // 記録する (master は Track ではない)。 add_automation_from_last_touched と同 class。
-        let is_song_level = matches!(
-            target,
-            common::model::AutomationTarget::SongTempo
-                | common::model::AutomationTarget::SongTimeSigNumerator
-        ) || track_id == common::model::MASTER_TRACK_ID;
-        // L8 (r.md #8): track 不在なら content_id を alloc する前に return する
-        // (orphan AutomationContent leak を防ぐ)。 song-level は track 不要。
-        if !is_song_level && self.cur.song_doc.song().track_by_id(track_id).is_none() {
-            return None;
-        }
+        // 置き場は target の束縛先 (tempo / master fx の device → `song_lanes`)、決まらない住所は
+        // gesture の track (r.md #129: 置き場の分岐は `Song::param_stores` 1 か所)。
+        let owner = self.cur.song_doc.song().bound_owner_track(target).unwrap_or(track_id);
+        // L8 (r.md #8): store が無ければ content_id を alloc する前に return する
+        // (orphan AutomationContent leak を防ぐ)。
+        let (lanes, _) = self.cur.song_doc.song().param_stores(owner)?;
         let default_value = self.lane_default_for_target(&TouchedParam {
             track_id,
             target: target.clone(),
@@ -322,14 +316,6 @@ impl AppData {
         // (b) 無ければ clip_start より後の最近接 clip 開始 (無ければ song 末尾) までに
         //     length を制限する (前方の既存 clip と重なる clip を作らない)。
         let (reuse, next_clip_start) = {
-            let lanes: &[AutomationLane] = if is_song_level {
-                &self.cur.song_doc.song().song_lanes
-            } else {
-                self.cur.song_doc.song()
-                    .track_by_id(track_id)
-                    .map(|t| t.automation_lanes.as_slice())
-                    .unwrap_or(&[])
-            };
             match lanes.iter().find(|l| &l.target == target) {
                 Some(l) => {
                     let reuse = l
@@ -368,85 +354,42 @@ impl AppData {
                 "Rec".into(),
             )
         })?;
-        if is_song_level {
+        if owner == common::model::MASTER_TRACK_ID {
             self.cur.view.master_row_automation_expanded = true;
-            self.edit_song(|song| {
-                if let Some(lane) = song.song_lanes.iter_mut().find(|l| &l.target == target) {
+        } else {
+            self.cur.view.expanded_automation_tracks.insert(owner);
+        }
+        let rec_clip = |id: u32| AutomationClip {
+            id,
+            name: "Rec".into(),
+            start_beat: clip_start,
+            length_beats: clip_len,
+            content_id,
+            content_offset_beats: 0.0,
+            color: None,
+        };
+        let found = self
+            .edit_song(|song| {
+                let Some((lanes, _)) = song.param_stores_mut(owner) else {
+                    return false;
+                };
+                if let Some(lane) = lanes.iter_mut().find(|l| &l.target == target) {
                     lane.enabled = true;
                     let cid = lane.next_clip_id;
                     lane.next_clip_id += 1;
-                    lane.clips.push(AutomationClip {
-                        id: cid,
-                        name: "Rec".into(),
-                        start_beat: clip_start,
-                        length_beats: clip_len,
-                        content_id,
-                        content_offset_beats: 0.0,
-                        color: None,
-                    });
-                } else {
-                    let lid = song.alloc_song_lane_id();
-                    song.song_lanes.push(AutomationLane {
-                        id: lid,
-                        clips: vec![AutomationClip {
-                            id: 1,
-                            name: "Rec".into(),
-                            start_beat: clip_start,
-                            length_beats: clip_len,
-                            content_id,
-                            content_offset_beats: 0.0,
-                            color: None,
-                        }],
-                        next_clip_id: 2,
-                        ..AutomationLane::new(target.clone(), default_value)
-                    });
+                    lane.clips.push(rec_clip(cid));
+                    return true;
                 }
-            });
-        } else {
-            self.cur.view.expanded_automation_tracks.insert(track_id);
-            let found = self
-                .edit_song(|song| {
-                    let Some(track) = song.track_by_id_mut(track_id) else {
-                        return false;
-                    };
-                    if let Some(lane) =
-                        track.automation_lanes.iter_mut().find(|l| &l.target == target)
-                    {
-                        lane.enabled = true;
-                        let cid = lane.next_clip_id;
-                        lane.next_clip_id += 1;
-                        lane.clips.push(AutomationClip {
-                            id: cid,
-                            name: "Rec".into(),
-                            start_beat: clip_start,
-                            length_beats: clip_len,
-                            content_id,
-                            content_offset_beats: 0.0,
-                            color: None,
-                        });
-                    } else {
-                        let lid = track.alloc_lane_id();
-                        track.automation_lanes.push(AutomationLane {
-                            id: lid,
-                            clips: vec![AutomationClip {
-                                id: 1,
-                                name: "Rec".into(),
-                                start_beat: clip_start,
-                                length_beats: clip_len,
-                                content_id,
-                                content_offset_beats: 0.0,
-                                color: None,
-                            }],
-                            next_clip_id: 2,
-                            ..AutomationLane::new(target.clone(), default_value)
-                        });
-                    }
-                    true
-                })
-                .unwrap_or(false);
-            if !found {
-                return None;
-            }
+                let lane = AutomationLane {
+                    clips: vec![rec_clip(1)],
+                    next_clip_id: 2,
+                    ..AutomationLane::new(target.clone(), default_value)
+                };
+                song.push_lane(owner, lane).is_some()
+            })
+            .unwrap_or(false);
+        if !found {
+            return None;
         }
         // 新規作成した clip は窓 offset 0 なので原点 = clip_start。
         Some((clip_start, content_id))
@@ -463,7 +406,7 @@ impl AppData {
         if !self.cur.transport.is_playing || self.cur.recording.recording_mode == common::model::RecordingMode::Read {
             return set;
         }
-        for k in &self.cur.recording.active_param_gestures {
+        for k in self.cur.recording.active_param_gestures.keys() {
             set.insert(k.clone());
         }
         if matches!(
@@ -626,27 +569,11 @@ impl AppData {
         target: &common::model::AutomationTarget,
         playhead_beat: f64,
     ) -> Option<(f64, common::model::ContentId)> {
-        // Phase 5: SongTempo / SongTimeSigNumerator は song_lanes を参照、
-        // track_id は ignore (= song-level lane は track に紐付かない)。
-        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam lane も
-        // song_lanes に居るので song-level 扱い (master は Track ではない)。
-        let is_song_level = matches!(
-            target,
-            common::model::AutomationTarget::SongTempo
-                | common::model::AutomationTarget::SongTimeSigNumerator
-        ) || track_id == common::model::MASTER_TRACK_ID;
-        let lane = if is_song_level {
-            self.cur.song_doc.song()
-                .song_lanes
-                .iter()
-                .find(|l| l.enabled && l.target == *target)?
-        } else {
-            let track = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
-            track
-                .automation_lanes
-                .iter()
-                .find(|l| l.enabled && l.target == *target)?
-        };
+        // 置き場は target の束縛先 (tempo / master fx の device → `song_lanes`)、決まらない住所は
+        // gesture の track (r.md #129: 置き場の分岐は `Song::param_stores` 1 か所)。
+        let song = self.cur.song_doc.song();
+        let owner = song.bound_owner_track(target).unwrap_or(track_id);
+        let lane = song.param_stores(owner)?.0.iter().find(|l| l.enabled && l.target == *target)?;
         let clip = lane.clips.iter().find(|c| {
             playhead_beat >= c.start_beat && playhead_beat < c.start_beat + c.length_beats
         })?;

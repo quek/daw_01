@@ -521,17 +521,19 @@ pub enum AppEvent {
     /// (= 既存 `TouchParam` の subsume)。 audio thread は Step C で
     /// `recording_mode != Read` 時に該当 lane の curve eval を bypass する。
     /// session-only / Undo 対象外 (= mutation は全て session field)。
+    /// r.md #129 (§7.6): 所有者は面つき。名前は handler が `automation_target_label` で作る。
     ParamGestureBegin {
+        surface: crate::state::ParamSurface,
         track_id: u32,
         target: common::model::AutomationTarget,
-        display_name: String,
     },
     /// Phase 4 Step B: parameter knob の drag が **終了** した瞬間に発火。
     /// `active_param_gestures` から remove。 Touch mode では これで該当
     /// lane の recording が止まる (Latch / Write mode は別の latched set
     /// が transport stop まで持続するので、 本イベントだけでは止まらない)。
-    /// session-only / Undo 対象外。
+    /// session-only / Undo 対象外。所有者が `surface` のときだけ閉じる。
     ParamGestureEnd {
+        surface: crate::state::ParamSurface,
         track_id: u32,
         target: common::model::AutomationTarget,
     },
@@ -1020,17 +1022,8 @@ pub enum AppEvent {
     ResetTrackClipColors { track: u32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
-    /// 内蔵チャンネルストリップ (コンプ + EQ) の編集
-    /// (`docs/plan_channel_strip.md`)。**中身はサブ enum 側**が持つ
-    /// ([`StripEdit`]) — ノブ 1 個ごとに variant を並べると、ここの巨大 match が
-    /// さらに 20 行伸びる。Undo 対象 (= 曲の中身が変わる)。
-    StripEdit { track: u32, edit: StripEdit },
-    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) の 1 パラメータ変更
-    /// (`docs/plan_master_strip.md`)。段階式は `MasterStrip::set_param` が段へ丸める。
-    /// Undo 対象 (= 曲の中身が変わる)。
-    MasterStripEdit { param: common::model::MasterStripParam, value: f32 },
-    /// EQ / Comp セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
-    /// 見方の都合なので `UiPrefs` (session-only) に持ち、dirty を立てず Undo にも
+    /// Mixer 帯の組み込み Comp / EQ セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
+    /// 見方の都合なので `ProjectView` (session-only) に持ち、dirty を立てず Undo にも
     /// 積まない (`collapsed_groups` と同じ扱い)。
     ToggleStripSection(StripSection),
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
@@ -1038,17 +1031,25 @@ pub enum AppEvent {
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
-    /// メーター面の 1 tick。`tracks` は per-track の
-    /// `(peak L, peak R, ゲインリダクション dB)`、`master_gr` は
-    /// マスターストリップの `(バスコンプ, リミッター)` の GR (dB、0 以下)。
+    /// メーター面の 1 tick。`tracks` は per-track の `(peak L, peak R)`、`native_gr` は GR を出す
+    /// 内蔵 device の `(device id, GR dB (0 以下))` (`None` = seqlock が読めなかった = 前回値を保つ)、
+    /// `master_limiter_gr_db` は master Limiter の GR (dB、0 以下)。
     ///
     /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ
     /// 組だから — 別イベントに割ると「同じ buffer の値かどうか」の保証が消える。
     TrackPeaksTick {
         /// アクティブなタブの slot から読んだもの。届いた時点で `cur` が別タブなら捨てる。
         project: common::protocol::ProjectKey,
-        tracks: Vec<(f32, f32, f32)>,
-        master_gr: (f32, f32),
+        tracks: Vec<(f32, f32)>,
+        native_gr: Option<Vec<(u64, f32)>>,
+        master_limiter_gr_db: f32,
+    },
+    /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
+    /// テレメトリポーラが `DeviceScopeReader` + `SpectrumAnalyzer` で作る。tick の project が
+    /// 現タブのときだけ取り込む。
+    DeviceSpectrumTick {
+        project: common::protocol::ProjectKey,
+        spectra: Vec<(u64, std::sync::Arc<[f32]>)>,
     },
     /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
     /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`
@@ -1860,15 +1861,6 @@ impl AppEvent {
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",
             E::SetTrackPan { .. } => "パン変更",
-            E::StripEdit { edit, .. } => edit.undo_label(),
-            E::MasterStripEdit { param, .. } => {
-                use common::model::MasterStripParam as M;
-                match param {
-                    M::EqOn | M::EqGain(_) => "マスター EQ 変更",
-                    M::LimiterOn | M::LimiterCeiling => "マスターリミッター変更",
-                    _ => "マスターコンプ変更",
-                }
-            }
             E::ToggleTrackMute(..) => "ミュート切替",
             E::ToggleTrackSolo(..) => "ソロ切替",
             E::SetMasterGain(..) => "マスターゲイン変更",
@@ -1974,83 +1966,7 @@ impl AppEvent {
     }
 }
 
-/// 内蔵チャンネルストリップの 1 操作 ([`AppEvent::StripEdit`] の中身)。
-///
-/// 連続パラメータは `TrackBuiltinParam` をそのまま住所に使う — オートメーション
-/// / 変調の target と同じ型なので、「ノブが動かす値」と「レーンが動かす値」が
-/// 構造的に一致する (対応表を 2 つ持たない)。
-#[derive(Debug, Clone, PartialEq)]
-pub enum StripEdit {
-    /// 連続パラメータ (EQ の Freq/Gain/Q、Comp の Thr/Ratio/Atk/Rel/Gain/SC) と
-    /// セクションのバイパス。値は plain 単位で、可動範囲へは model 側がクランプする。
-    Param { param: common::model::TrackBuiltinParam, value: f32 },
-    /// オートメーションに載せないスイッチ (バンドの ON、シェルフ/ベル、SC Listen)。
-    Switch { switch: StripSwitch, on: bool },
-    /// コンプの動作モード (Leveler / Compressor / Limiter)。
-    CompMode(common::model::CompMode),
-}
-
-impl StripEdit {
-    /// この操作が「どちらのセクションの中身を触ったか」。
-    ///
-    /// 触られたセクションは handler が自動で ON にする (バイパス中にノブを回して
-    /// 無音のままだと、操作が効かなかったようにしか見えない)。**バイパス
-    /// トグルそのもの** (`StripEqOn` / `StripCompOn`) は明示指定なので `None`。
-    #[must_use]
-    pub fn section_touched(&self) -> Option<StripSection> {
-        match self {
-            Self::Param { param, .. } => match param {
-                common::model::TrackBuiltinParam::StripEq { .. } => Some(StripSection::Eq),
-                common::model::TrackBuiltinParam::StripComp { .. } => Some(StripSection::Comp),
-                _ => None,
-            },
-            Self::Switch { switch, .. } => match switch {
-                StripSwitch::BandOn(_) | StripSwitch::Bell(_) => Some(StripSection::Eq),
-                // 検出信号の試聴はコンプが動いていないと意味がない。
-                StripSwitch::ScListen => Some(StripSection::Comp),
-            },
-            Self::CompMode(_) => Some(StripSection::Comp),
-        }
-    }
-
-    #[must_use]
-    pub fn undo_label(&self) -> &'static str {
-        match self {
-            Self::Param { param, .. } => match param {
-                common::model::TrackBuiltinParam::StripCompOn
-                | common::model::TrackBuiltinParam::StripComp { .. } => "コンプ変更",
-                _ => "EQ 変更",
-            },
-            Self::Switch { switch, .. } => match switch {
-                StripSwitch::ScListen => "検出信号の試聴",
-                StripSwitch::BandOn(_) | StripSwitch::Bell(_) => "EQ 変更",
-            },
-            Self::CompMode(_) => "コンプ変更",
-        }
-    }
-}
-
-/// オートメーション対象にしないストリップのスイッチ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StripSwitch {
-    /// EQ 1 バンドの ON/OFF (HP / LP は既定 OFF)。
-    BandOn(common::model::EqBand),
-    /// 両端バンドのシェルフ ⇄ ベル切替。
-    Bell(common::model::EqBand),
-    /// 検出信号そのものをモニタへ出す。**同時に 1 トラックだけ** (solo と同じ)。
-    ScListen,
-}
-
-/// マスターストリップのブロック (`docs/plan_master_strip.md`)。
-/// `Q` キーの対象を「カーソルが乗っているブロック」で決めるのに使う。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MasterSection {
-    Comp,
-    Eq,
-    Limiter,
-}
-
-/// mixer strip で開閉するセクション (全 ch 一括)。
+/// Mixer 帯で開閉するセクション (全 ch 一括)。r.md #129: 中身は組み込み Comp / EQ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripSection {
     Comp,

@@ -234,9 +234,8 @@ impl AppData {
             // model が持つ。貼り付けた行にも同じ規則を通す (冪等なので既存行は不変)。
             song.normalize_session();
             // r.md #89: `rehome_pasted_modulation` が落とした変調の **深さ**を指していた
-            // 変調 / レーンを連鎖して掃除する (固定点の SSoT はこの 1 本。冪等なので
-            // 既存の健全な曲では no-op)。
-            song.prune_dangling_mod_targets();
+            // 変調 / レーンの連鎖掃除は、SongDoc の `enforce_edit_invariants` が同じ undo step で
+            // 担う (r.md #129、固定点の SSoT は `Song::prune_dangling_param_targets`)。
             new_ids
         }) else {
             return 0;
@@ -416,30 +415,13 @@ impl AppData {
         t: &mut common::model::Track,
         device_remap: &std::collections::HashMap<u64, u64>,
     ) {
+        // id で束縛する住所 (plugin / 内蔵 / chain / Parallel) の種類はここで列挙しない
+        // (`bound_node_id_mut` が SSoT)。組み込みは組み込みのまま新しい id になる。
         let remap_target = |target: &mut common::model::AutomationTarget| {
-            use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
-            match target {
-                T::PluginParam { device_id, .. } => {
-                    if let Some(&nid) = device_remap.get(device_id) {
-                        *device_id = nid;
-                    }
-                }
-                // r.md #110: chain の gain / pan lane も複製後の chain id へ。
-                T::TrackBuiltin(P::ChainGain { chain_id } | P::ChainPan { chain_id }) => {
-                    if let Some(&nid) = device_remap.get(chain_id) {
-                        *chain_id = nid;
-                    }
-                }
-                T::TrackBuiltin(
-                    P::ParallelOutGain { parallel_id }
-                    | P::ParallelSplitFreq { parallel_id, .. }
-                    | P::ParallelSelect { parallel_id },
-                ) => {
-                    if let Some(&nid) = device_remap.get(parallel_id) {
-                        *parallel_id = nid;
-                    }
-                }
-                _ => {}
+            if let Some(id) = target.bound_node_id_mut()
+                && let Some(&nid) = device_remap.get(id)
+            {
+                *id = nid;
             }
         };
         for lane in &mut t.automation_lanes {
@@ -448,14 +430,13 @@ impl AppData {
         for r in &mut t.mod_routings {
             remap_target(&mut r.target);
         }
-        // r.md #110: 同 track の chain を source にする sidechain も複製後の chain id へ。
-        common::model::for_each_plugin_mut(&mut t.devices, &mut |dev| {
-            for route in dev.aux_inputs.iter_mut().flatten() {
-                if let common::model::TapSource::Chain(c) = &mut route.tap.source
-                    && let Some(&nid) = device_remap.get(c)
-                {
-                    *c = nid;
-                }
+        // r.md #110: 同 track の chain を source にする sidechain も複製後の chain id へ (内蔵も含む)。
+        common::model::for_each_aux_slot_mut(&mut t.devices, &mut |_, _, slot| {
+            if let Some(route) = slot
+                && let common::model::TapSource::Chain(c) = &mut route.tap.source
+                && let Some(&nid) = device_remap.get(c)
+            {
+                *c = nid;
             }
         });
     }
@@ -492,14 +473,15 @@ impl AppData {
                 }
             }
         };
-        common::model::for_each_plugin_mut(&mut t.devices, &mut |dev| {
-            for slot in &mut dev.aux_inputs {
-                let Some(route) = slot else { continue };
-                match resolve_tap(route.tap.source) {
-                    Some(src) => route.tap.source = src,
-                    None => *slot = None,
-                }
+        // aux 入力は plugin と内蔵 (Comp / Bus Comp の SC) 共通の slot。
+        common::model::for_each_aux_slot_mut(&mut t.devices, &mut |_, _, slot| {
+            let Some(route) = slot else { return };
+            match resolve_tap(route.tap.source) {
+                Some(src) => route.tap.source = src,
+                None => *slot = None,
             }
+        });
+        common::model::for_each_plugin_mut(&mut t.devices, &mut |dev| {
             for slot in &mut dev.aux_outputs {
                 let Some(route) = slot else { continue };
                 match resolve(route.dest_track) {
@@ -534,8 +516,8 @@ impl AppData {
     ///   ものは落とす。
     ///
     /// ここで変調を落とすと、その深さを指していた別の変調が dangling になる
-    /// (連鎖)。固定点まで回すのは [`common::model::Song::prune_dangling_mod_targets`]
-    /// が SSoT なので、**挿入後に呼び出し側が 1 回通す** (ここでは複製しない)。
+    /// (連鎖)。固定点まで回すのは [`common::model::Song::prune_dangling_param_targets`]
+    /// が SSoT で、**編集の後に SongDoc が 1 回通す** (ここでは複製しない)。
     fn rehome_pasted_modulation(
         song: &mut common::model::Song,
         built: &mut [(u32, common::model::Track)],
@@ -822,9 +804,8 @@ impl AppData {
                     }
                 }
             }
-            // r.md #89: paste と同じ連鎖掃除 (`rehome_pasted_modulation` の drop で
-            // 深さ参照が dangling になり得る)。
-            song.prune_dangling_mod_targets();
+            // r.md #89: paste と同じ連鎖掃除 (`rehome_pasted_modulation` の drop で深さ参照が
+            // dangling になり得る) は SongDoc の `enforce_edit_invariants` が担う (r.md #129)。
             new_ids
         });
         let Some(new_ids) = new_ids else {
@@ -956,8 +937,8 @@ impl AppData {
         self.cur.view.collapsed_groups
             .retain(|id| !subtree_ids_set.contains(id));
         // r.md #71 (プラグインのコピー / 移動): 消えた track の device を指す選択も
-        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
-        self.prune_device_selection();
+        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。Listen も解除する。
+        self.prune_device_session_refs();
         // Audio Editor を安定 key で貼り直す (消えていれば閉じる)。
         self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();

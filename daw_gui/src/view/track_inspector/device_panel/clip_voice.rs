@@ -11,12 +11,13 @@ pub(super) fn draw_clip_voice(
     area: Rect,
     pad: f32,
     mut y: f32,
+    device_id: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // Clip Voice 編集: 選択中の clip が vocal track 上の MIDI clip の
     // とき、 キャラ ▼ → スタイル ▼ の 2 段 dropdown で per-clip 声を選ぶ。
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
-    if app.voicevox_param_panel_open()
+    if app.voicevox_param_panel_open(device_id)
         && let Some(r) = app.selected_clip_ref()
         && let Some(track) = app.cur.song_doc.song().track_by_id(r.track_id)
         && track.is_voicevox_vocal()

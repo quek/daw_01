@@ -275,10 +275,7 @@ impl AppData {
         // を避け dirty のみ (= edit_song が epoch bump、 drag-end edge で sync、
         // follower の attack/release と同流儀)。
         if let Some(param) = touched {
-            self.note_touched_mod_target(common::model::AutomationTarget::ModSourceParam {
-                source_id: id,
-                param,
-            });
+            self.note_touched_mod_param(id, param);
         }
     }
 
@@ -321,35 +318,6 @@ impl AppData {
             ModSourceEdit::StepsSlew(_) => Some(ModParam::StepsSlew),
             _ => None,
         }
-    }
-
-    /// r.md #89: モジュレーターのツマミ / 変調の深さを触ったことを記録する。
-    /// `A` キーの「最後に触った parameter のオートメーションレーンを追加」が
-    /// これを見るので、**ラックのツマミを動かしたら必ず呼ぶこと**
-    /// (呼ばないと、そのツマミだけ `A` でレーンを作れない片手落ちになる)。
-    ///
-    /// `track_id` はレーン / routing の置き場 (= ソースの帰属トラック、master なら
-    /// `MASTER_TRACK_ID`)。`add_automation_from_last_touched` の song-level 判定が
-    /// これをそのまま使う。
-    pub(crate) fn note_touched_mod_target(
-        &mut self,
-        target: common::model::AutomationTarget,
-    ) {
-        use common::model::AutomationTarget as T;
-        let song = self.cur.song_doc.song();
-        let track_id = match &target {
-            T::ModSourceParam { source_id, .. } => song.mod_source_owner(*source_id),
-            T::ModRoutingDepth { routing_id } => song.mod_routing_owner(*routing_id),
-            _ => None,
-        };
-        let Some(track_id) = track_id else { return };
-        let display_name = self.automation_target_label(&target);
-        self.cur.peph.last_touched_param = Some(TouchedParam {
-            track_id,
-            target,
-            display_name,
-            touched_at: std::time::Instant::now(),
-        });
     }
 
     /// r.md #78: **待受中 (◉) のソースを `target` に繋ぐ唯一の口**。
@@ -409,10 +377,9 @@ impl AppData {
                 t.mod_routings.retain(|r| r.source_id != id);
             }
             song.song_mod_routings.retain(|r| r.source_id != id);
-            // r.md #89: このソースの **ツマミ** を指していた変調 / レーンと、
-            // 消えた変調の **深さ** を指していた変調まで連鎖して掃除する
-            // (source_id だけ見ると幽霊 routing が残る)。
-            song.prune_dangling_mod_targets();
+            // r.md #89: このソースの **ツマミ** を指していた変調 / レーンと、消えた変調の
+            // **深さ** を指していた変調までの連鎖掃除は、SongDoc の `enforce_edit_invariants`
+            // が同じ undo step で担う (r.md #129)。
         });
     }
 
@@ -426,8 +393,8 @@ impl AppData {
     ///    消えても値を出し続ける)。
     /// 2. **深さ参照の連鎖掃除** (r.md #89)。消えたトラックの変調を
     ///    [`common::model::AutomationTarget::ModRoutingDepth`] で指していたレーン /
-    ///    変調を落とす。1 で 1 件も消えなくても要る (ソースを持たないトラックを
-    ///    消した場合)。
+    ///    変調を落とす。これはトラックを外した編集そのものの後に SongDoc の
+    ///    `enforce_edit_invariants` が済ませている (r.md #129)。
     ///
     /// **判定は「消した id の集合」ではなく `owner_track_id` が実在するか**。集合を
     /// 各経路から配る形だと経路ごとに集合の作り方が要り、1 つ忘れると孤児が残る
@@ -452,7 +419,6 @@ impl AppData {
             // 参照 routing の除去と 2 の連鎖掃除まで `remove_mod_source` が担う。
             self.remove_mod_source(id);
         }
-        self.edit_song(|song| song.prune_dangling_mod_targets());
     }
 
     /// Resolve `track_id` to its mutable `mod_routings` Vec
@@ -463,15 +429,8 @@ impl AppData {
         track_id: u32,
         f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> R,
     ) -> Option<R> {
-        self.edit_song(move |song| {
-            let routings = if track_id == common::model::MASTER_TRACK_ID {
-                &mut song.song_mod_routings
-            } else {
-                &mut song.track_by_id_mut(track_id)?.mod_routings
-            };
-            Some(f(routings))
-        })
-        .flatten()
+        self.edit_song(move |song| Some(f(song.param_stores_mut(track_id)?.1)))
+            .flatten()
     }
 
     /// 戻り値は **実際に足したか** (既に同じ (target, source) があれば `false`)。
@@ -490,27 +449,15 @@ impl AppData {
         // が 1 本の変調を指すので、後から `ensure_ids` 任せにすると採番前の一瞬だけ
         // 深さを変調先にできない窓ができる)。
         self.edit_song(move |song| {
-            let exists = if track_id == common::model::MASTER_TRACK_ID {
-                &song.song_mod_routings
-            } else {
-                match song.track_by_id(track_id) {
-                    Some(t) => &t.mod_routings,
-                    None => return false,
-                }
-            }
-            .iter()
-            .any(|r| r.source_id == source_id && r.target == target);
-            if exists {
+            let Some((_, routings)) = song.param_stores(track_id) else {
+                return false;
+            };
+            if routings.iter().any(|r| r.source_id == source_id && r.target == target) {
                 return false;
             }
             let id = song.alloc_mod_routing_id();
-            let routings = if track_id == common::model::MASTER_TRACK_ID {
-                &mut song.song_mod_routings
-            } else {
-                match song.track_by_id_mut(track_id) {
-                    Some(t) => &mut t.mod_routings,
-                    None => return false,
-                }
+            let Some((_, routings)) = song.param_stores_mut(track_id) else {
+                return false;
             };
             routings.push(common::model::ModRouting {
                 id,
@@ -531,11 +478,11 @@ impl AppData {
         target: common::model::AutomationTarget,
         source_id: u32,
     ) {
+        // r.md #89: 消した変調の **深さ** を指していた変調の連鎖掃除は、SongDoc の
+        // `enforce_edit_invariants` が同じ undo step で担う (r.md #129)。
         self.edit_mod_routings(track_id, |routings| {
             routings.retain(|r| !(r.source_id == source_id && r.target == target));
         });
-        // r.md #89: 消した変調の **深さ** を指していた変調も連鎖して落とす。
-        self.edit_song(|song| song.prune_dangling_mod_targets());
     }
 
     pub(crate) fn set_mod_routing_depth(
@@ -557,9 +504,7 @@ impl AppData {
         });
         // r.md #89: 深さ自体も変調先 / オートメーション先なので、触ったことを記録する。
         if let Some(Some(routing_id)) = touched {
-            self.note_touched_mod_target(common::model::AutomationTarget::ModRoutingDepth {
-                routing_id,
-            });
+            self.note_touched_target(common::model::AutomationTarget::ModRoutingDepth { routing_id }, track_id);
         }
     }
 
@@ -685,13 +630,14 @@ impl AppData {
         }
     }
 
-    /// フォロワーのツマミを触ったことを記録する薄いラッパ。 `note_touched_mod_target`
-    /// が唯一の記録口なので、 ここは `AutomationTarget` を組み立てるだけ。
+    /// モジュレーターのツマミを触ったことを記録する薄いラッパ。 `note_touched_target`
+    /// が唯一の記録口なので、 ここは `AutomationTarget` を組み立てるだけ (ソースの id で
+    /// 束縛する住所なので、持ち主はソースの帰属から決まり fallback は使われない)。
     fn note_touched_mod_param(&mut self, source_id: u32, param: ModParam) {
-        self.note_touched_mod_target(common::model::AutomationTarget::ModSourceParam {
-            source_id,
-            param,
-        });
+        self.note_touched_target(
+            common::model::AutomationTarget::ModSourceParam { source_id, param },
+            common::model::MASTER_TRACK_ID,
+        );
     }
 
     pub(crate) fn set_mod_follower_scrubbing(&mut self, active: bool) {

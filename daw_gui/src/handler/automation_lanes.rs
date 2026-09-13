@@ -129,7 +129,7 @@ impl AppData {
     /// 「停止中でも image drag 中なら record を回す」 ために使う。
     pub(crate) fn image_pip_drag_active(&self) -> bool {
         self.cur.recording.active_param_gestures
-            .iter()
+            .keys()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::ImageBuiltin(_)))
     }
 
@@ -170,7 +170,12 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
+                // 所有者は preview 窓 (描画の存在ではなく drag end で閉じる、`ParamSurface::swept`)。
+                // 別の面が既に握っていれば奪わない。
+                self.cur.recording
+                    .active_param_gestures
+                    .entry((track_id, target.clone()))
+                    .or_insert(crate::state::ParamSurface::VideoPreview);
                 if matches!(
                     self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch
@@ -193,12 +198,14 @@ impl AppData {
     /// では latched は stop まで残す (= 既存 ParamGestureEnd と同 idiom)。
     pub(crate) fn end_image_pip_drag_recording(&mut self) {
         use common::model::AutomationTarget;
-        // image lane gesture だけを掃除 (audio / plugin gesture は残す)。
+        // preview 窓が握った image lane gesture だけを掃除 (audio / plugin / 他の面の gesture は残す)。
         let to_remove: Vec<(u32, AutomationTarget)> = self
             .cur.recording.active_param_gestures
             .iter()
-            .filter(|(_, t)| matches!(t, AutomationTarget::ImageBuiltin(_)))
-            .cloned()
+            .filter(|((_, t), s)| {
+                **s == crate::state::ParamSurface::VideoPreview && matches!(t, AutomationTarget::ImageBuiltin(_))
+            })
+            .map(|(k, _)| k.clone())
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
@@ -240,7 +247,10 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
+                self.cur.recording
+                    .active_param_gestures
+                    .entry((track_id, target.clone()))
+                    .or_insert(crate::state::ParamSurface::VideoPreview);
                 if matches!(
                     self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch
@@ -265,8 +275,10 @@ impl AppData {
         let to_remove: Vec<(u32, AutomationTarget)> = self
             .cur.recording.active_param_gestures
             .iter()
-            .filter(|(_, t)| matches!(t, AutomationTarget::TextBuiltin(_)))
-            .cloned()
+            .filter(|((_, t), s)| {
+                **s == crate::state::ParamSurface::VideoPreview && matches!(t, AutomationTarget::TextBuiltin(_))
+            })
+            .map(|(k, _)| k.clone())
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
@@ -287,7 +299,7 @@ impl AppData {
     /// 使う。
     pub(crate) fn text_pip_drag_active(&self) -> bool {
         self.cur.recording.active_param_gestures
-            .iter()
+            .keys()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::TextBuiltin(_)))
     }
 
@@ -465,15 +477,15 @@ impl AppData {
         crate::group_compose::group_has_visual_content(self.cur.song_doc.song(), group_track_id)
     }
 
-    /// group inspector 用 summary。cursor track が visual group なら、各 param に
-    /// `GroupTransform(param)` lane があるか（=「A」 トグル点灯）を返す。
+    /// group inspector 用 summary。Par を開いた `open_device` が cursor track の Transform 配置
+    /// device なら、各 param に `GroupTransform(param)` lane があるか（=「A」 トグル点灯）を返す。
     pub fn inspector_group_transform_summary(
         &self,
+        open_device: u64,
     ) -> Option<GroupTransformInspectorSummary> {
         // Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
         // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
         // ときだけ Group Transform セクションを出す。
-        let open_device = self.cur.peph.open_video_fx_params?;
         // r.md #71 (プラグインのコピー / 移動): パネルは device_id で開いたまま
         // にして、 **描画側で** 「いま表示しているチェーンの device か」 を gate する
         // (device を別トラックへ移してもパネルが自然に追従する)。
@@ -500,11 +512,9 @@ impl AppData {
         })
     }
 
-    /// 開いている映像 FX param パネル（`open_video_fx_params`）が cursor
-    /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
-    /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
-    pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
-        let device_id = self.cur.peph.open_video_fx_params?;
+    /// Par を開いた映像 FX `device_id` が cursor track に居るとき、その device の def + 各 param の
+    /// 現在実値を返す。inspector が scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
+    pub fn inspector_video_fx_params(&self, device_id: u64) -> Option<VideoFxParamsInspector> {
         let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
@@ -517,15 +527,7 @@ impl AppData {
         if def.params.is_empty() {
             return None; // Transform 等は専用セクションで編集。
         }
-        let empty: &[common::model::AutomationLane] = &[];
-        let lanes: &[common::model::AutomationLane] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.cur.song_doc.song().song_lanes
-            } else {
-                self.cur.song_doc.song()
-                    .track_by_id(track_id)
-                    .map_or(empty, |t| t.automation_lanes.as_slice())
-            };
+        let lanes = self.cur.song_doc.song().param_stores(track_id).map_or(&[][..], |(l, _)| l);
         let values: Vec<f32> = def
             .params
             .iter()
@@ -616,31 +618,25 @@ impl AppData {
     }
 
     /// 汎用 plugin の「Par」インライン param パネルの read snapshot。
-    /// `open_plugin_params` が cursor track の device を指し、 host から param 一覧が
+    /// Par を開いた `device_id` が cursor track に居て、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
     /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
     /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
-    pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
-        let device_id = self.cur.peph.open_plugin_params?;
+    pub fn inspector_plugin_params(&self, device_id: u64) -> Option<PluginParamsInspector> {
         let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
         let device = self.cur.song_doc.song().plugin_by_id(device_id)?;
+        if device.ports.is_video() && device.plugin_id != common::plugin_db::SUBTITLE_ID {
+            return None; // 映像 FX は専用セクション。
+        }
         let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
         // 実レンジへ。 HIDDEN は出さない。
-        let empty: &[common::model::AutomationLane] = &[];
-        let lanes: &[common::model::AutomationLane] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.cur.song_doc.song().song_lanes
-            } else {
-                self.cur.song_doc.song()
-                    .track_by_id(track_id)
-                    .map_or(empty, |t| t.automation_lanes.as_slice())
-            };
+        let lanes = self.cur.song_doc.song().param_stores(track_id).map_or(&[][..], |(l, _)| l);
         let params: Vec<PluginParamRow> = self
             .cur.pipc.plugin_params
             .get(&device_id)
@@ -698,10 +694,12 @@ impl AppData {
         })
     }
 
-    /// 「Par」パネルが開いている device の plugin_id (cursor track 上)。
+    /// 「Par」パネルが開いている `device_id` の plugin_id (cursor track 上)。
     /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
-    pub(crate) fn open_param_panel_plugin_id(&self) -> Option<&str> {
-        let device_id = self.cur.peph.open_plugin_params?;
+    pub(crate) fn open_param_panel_plugin_id(&self, device_id: u64) -> Option<&str> {
+        if !self.rack_panel_open(common::model::RackPanelKey::Device(device_id)) {
+            return None;
+        }
         let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
@@ -709,16 +707,16 @@ impl AppData {
         self.cur.song_doc.song().plugin_by_id(device_id).map(|d| d.plugin_id.as_str())
     }
 
-    /// VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
+    /// VOICEVOX builtin `device_id` の「Par」パネルが開いているか (= Clip Voice /
     /// Talk セクションを Par パネルとして描画する gate)。
-    pub fn voicevox_param_panel_open(&self) -> bool {
-        self.open_param_panel_plugin_id() == Some(common::plugin_db::BUILTIN_ID_VOICEVOX)
+    pub fn voicevox_param_panel_open(&self, device_id: u64) -> bool {
+        self.open_param_panel_plugin_id(device_id) == Some(common::plugin_db::BUILTIN_ID_VOICEVOX)
     }
 
-    /// 字幕 builtin の「Par」パネルが開いているか (= Text Event
+    /// 字幕 builtin `device_id` の「Par」パネルが開いているか (= Text Event
     /// セクションを Par パネルとして描画する gate)。
-    pub fn subtitle_param_panel_open(&self) -> bool {
-        self.open_param_panel_plugin_id() == Some(common::plugin_db::SUBTITLE_ID)
+    pub fn subtitle_param_panel_open(&self, device_id: u64) -> bool {
+        self.open_param_panel_plugin_id(device_id) == Some(common::plugin_db::SUBTITLE_ID)
     }
 
     /// 汎用 plugin param を 1 つ編集 (「⚙」パネルの scrubable から)。 値の

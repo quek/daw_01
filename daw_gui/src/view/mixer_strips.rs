@@ -18,7 +18,8 @@ use common::automation::{norm_to_plain, plain_to_norm};
 use crate::automation_value::automation_value_display;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 use crate::view::modulation::{build_mod, push_mod_depth_bracket};
-use crate::view::param_gesture::push_param_gesture_edges;
+use crate::app::ParamSurface;
+use crate::view::param_gesture::push_param_gesture;
 use crate::view::strip_sections;
 use crate::view::track_color;
 use daw_ui_renderer::{Color, Rect, RectCommand};
@@ -373,7 +374,6 @@ fn draw_track_strip(
     } else {
         None
     };
-    let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
     let n_sends = app.cur.song_doc.song().track_by_id(track_id).map_or(0, |t| t.sends.len());
     // strip 高さが足りないときは band 側を縮めてフェーダーの最低高を守る
     // (縮めた分の send 行は band 内の縦スクロールで到達できる)。 旧実装は
@@ -396,7 +396,6 @@ fn draw_track_strip(
         entry.solo,
         entry.peak_l_raw,
         entry.peak_r_raw,
-        entry.gain_reduction_db,
         rect,
         bg,
         Some(track_color::to_renderer(entry.color)),
@@ -404,8 +403,6 @@ fn draw_track_strip(
         false,
         group_collapsed,
         sends_band_h,
-        was_dragging_vol,
-        was_dragging_pan,
     );
     // Sends セクションは draw_strip の fader 下端より下の band に描画する。
     draw_sends_section(app, ui, track_id, rect, bg, sends_band_h);
@@ -421,7 +418,6 @@ fn draw_return_strip(
     rect: Rect,
 ) {
     let track_id = entry.track_id;
-    let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
     draw_strip(
         app,
         ui,
@@ -433,7 +429,6 @@ fn draw_return_strip(
         entry.solo,
         entry.peak_l_raw,
         entry.peak_r_raw,
-        entry.gain_reduction_db,
         rect,
         app.theme.daw.strip_return_bg,
         Some(track_color::to_renderer(entry.color)),
@@ -441,21 +436,7 @@ fn draw_return_strip(
         false,
         None, // group_collapsed: return strip は disclosure 無し
         0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
-        was_dragging_vol,
-        was_dragging_pan,
     );
-}
-
-/// この track の Volume / Pan が前フレーム時点で active gesture かを
-/// `AppData.active_param_gestures` から引く (= gesture edge 検知用)。
-fn drag_flags(app: &AppData, track_id: u32) -> (bool, bool) {
-    let vol = app
-        .cur.recording.active_param_gestures
-        .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
-    let pan = app
-        .cur.recording.active_param_gestures
-        .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
-    (vol, pan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,9 +451,6 @@ fn draw_strip(
     solo: bool,
     peak_l_raw: f32,
     peak_r_raw: f32,
-    // 内蔵コンプのゲインリダクション (正の減衰量 dB)。ストリップ帯の GR メーター
-    // が読む (docs/plan_channel_strip.md §3)。
-    gain_reduction_db: f32,
     rect: Rect,
     bg: Color,
     // track の effective 色。 `Some(c)` で strip 左端に縦カラーストライプを
@@ -490,12 +468,6 @@ fn draw_strip(
     // は 0。 fader 下端をこの分だけ持ち上げて領域を空ける。 Sends セクション
     // 本体の描画は caller (`draw_track_strip`) が `draw_sends_section` で行う。
     sends_band_h: f32,
-    // Phase 4 Step B: 前フレーム時点での「この track の Volume / Pan が
-    // active gesture か」 を caller (= draw) が AppData から読んだ値。 widget
-    // の dragging 結果と diff して ParamGestureBegin / End を発火する。
-    // master strip は automation target を持たないので常に false を渡す。
-    was_dragging_vol: bool,
-    was_dragging_pan: bool,
 ) {
     let p = &app.theme.core;
     ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
@@ -534,15 +506,7 @@ fn draw_strip(
     // 内蔵チャンネルストリップ帯 (Comp / EQ / 常設サムネイル) を strip 上端に積む。
     // **既存 strip の中身は変えず、その上に足すだけ** (docs/plan_channel_strip.md §2)。
     let head_h = strip_sections::head_height(app);
-    strip_sections::draw_head(
-        app,
-        ui,
-        track_idx,
-        Rect { h: head_h, ..rect },
-        pad,
-        bg,
-        gain_reduction_db,
-    );
+    strip_sections::draw_head(app, ui, track_idx, Rect { h: head_h, ..rect }, pad, bg);
     let mut y = rect.y + head_h + pad;
 
     // 名前 (group strip は左に折り畳み disclosure を置く)。 mixer は strip が
@@ -661,7 +625,7 @@ fn draw_strip(
             },
             Some(pan_mod.modulation()),
         );
-        push_mod_depth_bracket(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
+        push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &pan_target, pan_resp.mod_dragging);
 
         // Pan の数値欄 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
         // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
@@ -723,12 +687,12 @@ fn draw_strip(
         // 同じ `(track, Pan)` を key にするので、 どちらの drag でも Begin / End は
         // 1 回ずつになるよう OR を取ってから edge 検知に渡す。 text 打ち込みは 1 回の
         // `SetTrackPan` で完結する (= それ自体が 1 undo step) ので gesture にしない。
-        push_param_gesture_edges(
+        push_param_gesture(
             ui,
+            app,
+            ParamSurface::MixerStrip,
             track_idx,
             AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-            "Pan",
-            was_dragging_pan,
             pan_resp.dragging || readout_resp.dragging,
         );
         y += KNOB_SIZE + 2.0;
@@ -803,15 +767,15 @@ fn draw_strip(
     );
     // Phase 4 Step B: master strip は automation target を持たないので skip。
     if !is_master {
-        push_param_gesture_edges(
+        push_param_gesture(
             ui,
+            app,
+            ParamSurface::MixerStrip,
             track_idx,
             AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            "Volume",
-            was_dragging_vol,
             resp.fader.dragging,
         );
-        push_mod_depth_bracket(ui, app, track_idx, &vol_target, resp.mod_dragging);
+        push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &vol_target, resp.mod_dragging);
     }
 }
 
@@ -992,12 +956,9 @@ fn draw_sends_rows(
             send_id: send.id,
             legacy_send_idx: None,
         });
-        let was_dragging_send = app
-            .cur.recording.active_param_gestures
-            .contains(&(track_id, send_gain_target.clone()));
         // 再生中は SendGain オートメーションの playhead 値に追従させる
         // (volume / pan と同 idiom)。 停止中・非 automation・書き込み中は send.gain。
-        let live_gain = app.live_param_value(src_track, &send_gain_target, send.gain);
+        let live_gain = app.live_param_value(src_track.id, &send_gain_target, send.gain);
         let knob_resp = ui.knob_at(
             ("mixer_send_knob", track_id as usize, send_idx),
             knob_rect,
@@ -1024,15 +985,8 @@ fn draw_sends_rows(
             // 変調可能にするなら engine を先に直すこと (r.md #78 の保留事項)。
             None,
         );
-        // send-gain automation の gesture edge を volume / pan と同様に発火。
-        push_param_gesture_edges(
-            ui,
-            track_id,
-            send_gain_target,
-            "Send",
-            was_dragging_send,
-            knob_resp.dragging,
-        );
+        // send-gain automation の gesture を volume / pan と同様に申告。
+        push_param_gesture(ui, app, ParamSurface::MixerStrip, track_id, send_gain_target, knob_resp.dragging);
 
         // knob 右に Pre/Post (広め) と M (1 文字・狭め) を横並び。 × は header に
         // 逃がしたので、 残り幅を Pre/Post に寄せて "Post" の省略を無くす。

@@ -10,9 +10,10 @@
 //! でアドレスする。 positional index だと、 イベント発行と消費の間にチェーンが変わりうる
 //! (移動 / 削除) 場面で別 device に効く。
 
-use common::model::{ChainRef, Split, TapPoint, TapSource};
+use common::model::{ChainRef, NativeKind, RackPanelKey, Split, TapPoint, TapSource};
 
 use crate::device_addr::{InsertAt, RelocateDevices};
+use crate::event_native::{MasterLimiterEdit, NativeEdit};
 use crate::handler::parallel::{ChainMixerEdit, ParallelMixerEdit};
 use crate::widgets::select_modifier::SelectModifier;
 
@@ -116,6 +117,17 @@ pub enum DeviceEvent {
     SetParallelSplit { parallel_id: u64, split: Split },
     /// 見方の都合: Parallel / chain の中身の開閉 (undo 対象外)。 `id` は Parallel か chain。
     ToggleParallelNodeCollapsed { id: u64 },
+    // -------- r.md #129 内蔵 device (`docs/plan_rack_native_devices.md` §9.1) --------
+    /// picker の内蔵 4 種。chain の既定位置 (Q6) へ追加分として挿す。`open_panel` = Shift なしなら true。
+    AddNative { chain: ChainRef, kind: NativeKind, open_panel: bool },
+    /// 組み込み・追加分共通の値編集。Song 編集 + 値 IPC + 自動 ON (`NativeEdit::apply`)。
+    NativeEdit { device_id: u64, edit: NativeEdit },
+    /// master の固定 Limiter (チェーン外)。
+    MasterLimiterEdit(MasterLimiterEdit),
+    /// SC Listen (聴き方の都合、Song に書かない。bypass 中の Comp を有効化するのだけ Song 編集)。
+    SetScListen { device_id: Option<u64> },
+    /// Par の開閉 (見方の都合、Song に書かない)。
+    ToggleRackPanel(RackPanelKey),
 }
 
 impl DeviceEvent {
@@ -155,16 +167,27 @@ impl DeviceEvent {
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
             E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
             E::SetPluginSendAllKeys { .. } => "プラグインへのキー送出設定",
-            E::SetDevicesBypassed { bypassed: true, .. } => "プラグインを無効化",
-            E::SetDevicesBypassed { bypassed: false, .. } => "プラグインを有効化",
+            E::SetDevicesBypassed { bypassed: true, .. } => "デバイスを無効化",
+            E::SetDevicesBypassed { bypassed: false, .. } => "デバイスを有効化",
             E::ExplodeParallelOut { .. } => "パラアウト展開",
             E::SetParallelOutputRoute { .. } => "パラアウト経路変更",
+            E::AddNative { kind, .. } => match kind {
+                NativeKind::Comp => "Comp 追加",
+                NativeKind::Eq => "EQ 追加",
+                NativeKind::BusComp => "Bus Comp 追加",
+                NativeKind::ToneEq => "Tone EQ 追加",
+            },
+            E::NativeEdit { edit, .. } => edit.undo_label(),
+            E::MasterLimiterEdit(_) => "マスターリミッター変更",
+            // Listen 自体は Song に書かない。snapshot が積まれるのは bypass 中の Comp を有効化したときだけ。
+            E::SetScListen { .. } => "デバイスを有効化",
             // 非編集 (GUI 窓 / 選択 / 再読込 / 開閉) は snapshot を積まないので
             // ラベルは記録されない (`AppEvent::undo_label` の既定と同じ名前)。
             E::ToggleSlotGui { .. }
             | E::SelectDevice { .. }
             | E::ReloadDevice { .. }
-            | E::ToggleParallelNodeCollapsed { .. } => "編集",
+            | E::ToggleParallelNodeCollapsed { .. }
+            | E::ToggleRackPanel(_) => "編集",
         }
     }
 }

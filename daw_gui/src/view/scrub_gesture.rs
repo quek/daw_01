@@ -35,17 +35,17 @@ use crate::app::{AppData, AppEvent, ScrubGesture};
 /// 判断して gesture を閉じる。呼び忘れは「ドラッグ中に undo bracket が
 /// 1 フレームで切れる」形で出る。
 pub(crate) fn push(ui: &mut Ui<'_, AppData>, app: &AppData, owner: ScrubGesture, active: bool) {
-    let holds = app.cur.peph.scrub_gesture.as_ref() == Some(&owner);
+    let (holds, transition) = push_action(app, &owner, active);
     if holds {
         // 在席印。閉じる側 (`sweep`) はこれが立っていないことだけを根拠にする。
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.cur.peph.scrub_gesture_seen = true;
         }));
     }
-    if active == holds {
+    let Some(open_it) = transition else {
         return;
-    }
-    if active {
+    };
+    if open_it {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| open(app, owner.clone())));
     } else {
         // **閉じるのは自分が所有者のままのときだけ。** `Edit` は積んだ順に
@@ -60,12 +60,20 @@ pub(crate) fn push(ui: &mut Ui<'_, AppData>, app: &AppData, owner: ScrubGesture,
     }
 }
 
+/// [`push`] の判定 (Ui を持たない純関数): `(所有者が自分か, 遷移)`。遷移は `Some(true)` = 開く、
+/// `Some(false)` = 閉じる、`None` = 何もしない。所有者の照合は **面を含む** `ScrubGesture` の等値で
+/// 行うので、別の面の非アクティブな申告は別の面の bracket に触れない。
+fn push_action(app: &AppData, owner: &ScrubGesture, active: bool) -> (bool, Option<bool>) {
+    let holds = app.cur.peph.scrub_gesture.as_ref() == Some(owner);
+    (holds, (active != holds).then_some(active))
+}
+
 /// gesture を開く。既に別の所有者が握っていれば先に閉じる (1 度に 1 本)。
 fn open(app: &mut AppData, owner: ScrubGesture) {
     close(app);
     match &owner {
         // グループ変換だけ専用の Begin/End を持つ (`docs/plan_tachie_group_transform.md`)。
-        ScrubGesture::GroupTransform(_) => app.handle_event(AppEvent::BeginGroupTransformDrag),
+        ScrubGesture::GroupTransform { .. } => app.handle_event(AppEvent::BeginGroupTransformDrag),
         ScrubGesture::ModRack => {
             // 係数の再コンパイルを drag 中は伏せる (§3)。
             app.handle_event(AppEvent::SetModFollowerScrubbing(true));
@@ -86,12 +94,12 @@ pub(crate) fn close(app: &mut AppData) {
     };
     app.cur.peph.scrub_gesture_seen = false;
     match owner {
-        ScrubGesture::GroupTransform(_) => app.handle_event(AppEvent::EndGroupTransformDrag),
+        ScrubGesture::GroupTransform { .. } => app.handle_event(AppEvent::EndGroupTransformDrag),
         ScrubGesture::ModRack => {
             app.handle_event(AppEvent::SetModFollowerScrubbing(false));
             app.handle_event(AppEvent::EndInspectorScrub);
         }
-        ScrubGesture::ModDepth { track_id, target } => {
+        ScrubGesture::ModDepth { track_id, target, .. } => {
             app.handle_event(AppEvent::EndInspectorScrub);
             // 立ち下がり = このツマミへの割り当てが完了した瞬間。routing 自体は
             // drag 中に作られているので、ここは解除と通知だけ (`view::modulation`)。
@@ -104,11 +112,13 @@ pub(crate) fn close(app: &mut AppData) {
 }
 
 /// フレーム末に 1 回だけ呼ぶ。所有者が今フレーム描かれていなければ閉じる。
+/// パラメーターのジェスチャー (面つき所有者) の寿命回収も同じ点で行う (r.md #129 §7.6)。
 pub(crate) fn sweep(app: &mut AppData) {
     if app.cur.peph.scrub_gesture.is_some() && !app.cur.peph.scrub_gesture_seen {
         close(app);
     }
     app.cur.peph.scrub_gesture_seen = false;
+    crate::view::param_gesture::sweep_param_gestures(app);
 }
 
 #[cfg(test)]
@@ -172,15 +182,31 @@ mod tests {
     fn 別の欄が掴むと前の所有者は降りる() {
         let mut app = build_app();
         open(&mut app, ScrubGesture::Inspector(InspectorScrubField::Gain));
-        open(&mut app, ScrubGesture::GroupTransform(common::model::GroupTransformParam::X));
-        assert_eq!(
-            app.cur.peph.scrub_gesture,
-            Some(ScrubGesture::GroupTransform(common::model::GroupTransformParam::X))
-        );
+        let group = ScrubGesture::GroupTransform { device_id: 9, param: common::model::GroupTransformParam::X };
+        open(&mut app, group.clone());
+        assert_eq!(app.cur.peph.scrub_gesture, Some(group));
         assert!(app.cur.song_doc.gesture_active());
 
         close(&mut app);
         assert!(app.cur.peph.scrub_gesture.is_none());
         assert!(!app.cur.song_doc.gesture_active());
+    }
+
+    /// F-G4 (r.md #129): 変調深さの所有者は面つき。Rack で深さをドラッグしている間、同じ
+    /// `(track, target)` を描く MixerStrip の非アクティブな申告は bracket を閉じず、◉ も残る。
+    #[test]
+    fn 別の面の非アクティブな深さ申告は所有者を閉じない() {
+        use crate::state::ParamSurface;
+        let mut app = build_app();
+        let target = common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume);
+        let rack = ScrubGesture::ModDepth { surface: ParamSurface::Rack, track_id: 1, target: target.clone() };
+        let mixer = ScrubGesture::ModDepth { surface: ParamSurface::MixerStrip, track_id: 1, target };
+        app.cur.peph.armed_mod_source = Some(3);
+        open(&mut app, rack.clone());
+        assert_eq!(super::push_action(&app, &mixer, false), (false, None), "別の面は何もしない");
+        assert_eq!(super::push_action(&app, &rack, true), (true, None), "所有者は在席印だけ");
+        assert_eq!(app.cur.peph.scrub_gesture, Some(rack));
+        assert_eq!(app.cur.peph.armed_mod_source, Some(3), "◉ が残る");
+        assert!(app.cur.song_doc.gesture_active());
     }
 }

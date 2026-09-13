@@ -332,7 +332,7 @@ impl AppData {
             PluginEvent::PluginParamTouched {
                 device: DeviceAddr { device_id, .. },
                 param_id,
-                display_name,
+                ..
             } => {
                 let Some((track, _index)) = find_device_by_id(self.cur.song_doc.song(), device_id)
                 else {
@@ -343,18 +343,15 @@ impl AppData {
                     param_id,
                     legacy_device_index: None,
                 };
-                // Phase 2c: host から来る `display_name` は placeholder
-                // (= "Param N")。 完全修飾名 (`automation_target_label`) で
-                // 上書きする。 解決できなければ host の placeholder に落ちる。
-                let resolved_name = self
-                    .plugin_param_name(&target)
-                    .unwrap_or(display_name);
                 // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
-                // latched に反映する (= mixer knob と同 idiom)。
+                // latched に反映する (= mixer knob と同 idiom)。 host から来る `display_name` は
+                // placeholder (= "Param N") なので使わない — 名前は handler が
+                // `automation_target_label` で作る (r.md #129 §7.6)。 寿命は描画と無関係に
+                // plugin 窓の End が閉じる (`ParamSurface::PluginWindow` は sweep されない)。
                 self.handle_event(AppEvent::ParamGestureBegin {
+                    surface: crate::state::ParamSurface::PluginWindow,
                     track_id: track,
                     target: target.clone(),
-                    display_name: resolved_name,
                 });
                 // r.md #78: modulation source が待受中 (◉) なら、 **プラグイン
                 // 自身の窓の中で触った param** をそのソースの変調先にする。
@@ -386,6 +383,7 @@ impl AppData {
                     legacy_device_index: None,
                 };
                 self.handle_event(AppEvent::ParamGestureEnd {
+                    surface: crate::state::ParamSurface::PluginWindow,
                     track_id: track,
                     target,
                 });

@@ -90,8 +90,11 @@ impl AppData {
         self.cur.peph.audio_editor_clip = None;
         self.cur.peph.armed_mod_source = None;
         self.cur.peph.expanded_mod_sources.clear();
-        self.cur.peph.open_plugin_params = None;
-        self.cur.peph.open_video_fx_params = None;
+        // r.md #129: Par の実測高は device id keyed の session 値 (開閉は ViewState が運ぶ)。
+        self.cur.peph.rack_panel_heights.clear();
+        // SC Listen は聴き方の都合で Song に書かない。新しい曲の device を指さないよう、LoadSong
+        // より先に届く解除を送る (§10.14)。
+        self.set_sc_listen(None);
 
         // -- track_id / ClipKey keyed の表示設定 ----------------------------
         // ViewState を持たない旧 .daw では `restore_view_state` が早期 return
@@ -102,6 +105,7 @@ impl AppData {
         self.cur.view.track_row_overrides.clear();
         self.cur.view.multi_clip_view_key.clear();
         self.cur.view.collapsed_groups.clear();
+        self.cur.view.open_rack_panels.clear();
 
         // -- 子プロセスに関する帳簿 (すべて device_id keyed) ----------------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
@@ -318,8 +322,8 @@ impl AppData {
         // collapsed_groups も track が消えていたら除外。
         self.cur.view.collapsed_groups.retain(|id| live_ids.contains(id));
         // r.md #71 (プラグインのコピー / 移動): undo/redo で消えた device の id も
-        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。
-        self.prune_device_selection();
+        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。Listen も解除する。
+        self.prune_device_session_refs();
         self.resize_track_peak_display();
         // Undo / Redo は plugin_host / audio engine の plugin
         // load 状態に直接 IPC を発行しないので、 ここで Song と
@@ -908,9 +912,10 @@ impl AppData {
             }
             let device_id = song.alloc_device_id();
             let track = &mut song.tracks[ti];
-            // builtin VOICEVOX は純粋音源 (note_in + audio_out)。チェーン末尾に
-            // 追加する (位置で音源として導出される)。
-            track.devices.push(common::model::Device::Plugin(common::model::PluginInstance {
+            // builtin VOICEVOX は純粋音源 (note_in + audio_out)。チェーンの既定位置 (r.md #129 Q6:
+            // 組み込みの手前) に追加する (位置で音源として導出される)。
+            let at = common::model::default_insert_index_in(&track.devices, false);
+            track.devices.insert(at, common::model::Device::Plugin(common::model::PluginInstance {
                 id: device_id,
                 ..common::model::PluginInstance::with_ports(
                     common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),

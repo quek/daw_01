@@ -136,6 +136,7 @@ pub(super) fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: 
     crate::view::modulation::push_mod_depth_bracket(
         ui,
         cx.app,
+        crate::app::ParamSurface::Rack,
         track_id,
         &target,
         resp.mod_dragging,

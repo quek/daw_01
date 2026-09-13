@@ -39,33 +39,12 @@ pub fn automation_target_display_name(
             // の pure label なので id をそのまま出す)。
             format!("Send {send_id}")
         }
-        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。ラベルは strip の
-        // ノブ表記と同じ短縮形を組み合わせる ("EQ HMF Freq" / "Comp Thr")。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEqOn) => "EQ On".into(),
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripCompOn) => "Comp On".into(),
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
-            use common::model::EqParam;
-            let p = match param {
-                EqParam::Freq => "Freq",
-                EqParam::Gain => "Gain",
-                EqParam::Q => "Q",
-            };
-            format!("EQ {} {p}", band.label())
+        // r.md #129: 内蔵 device。song 非依存なので番号の無い種類名 ("Comp: Thr")。
+        // 番号付きの device 名 ("Comp 2: Thr") は `AppData::device_param_name` が補う。
+        AutomationTarget::NativeParam { param, .. } => {
+            common::model::native_param_label(param.kind().label(), *param)
         }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
-            format!("Comp {}", param.label())
-        }
-        // マスターストリップ (docs/plan_master_strip.md)。セクション名 + ノブ名。
-        AutomationTarget::MasterStrip(param) => {
-            use common::model::MasterStripParam as M;
-            let section = match param {
-                M::CompOn | M::CompThreshold | M::CompRatio | M::CompAttack | M::CompRelease
-                | M::CompMakeup => "Master Comp",
-                M::EqOn | M::EqGain(_) => "Master EQ",
-                M::LimiterOn | M::LimiterCeiling => "Master Lim",
-            };
-            format!("{section} {}", param.label())
-        }
+        AutomationTarget::MasterLimiter(p) => format!("Limiter: {}", p.label()),
         AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
         AutomationTarget::SongTempo => "Tempo".into(),
         AutomationTarget::SongTimeSigNumerator => "Time Sig".into(),

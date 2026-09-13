@@ -13,19 +13,18 @@ impl AppData {
     // -------- 作る / 壊す ---------------------------------------------------
 
     /// `chain` の `at` に空の Parallel (chain 1 本) を挿す (picker の 「Parallel」)。
+    /// `at` は closure の中 (実行時の Song) で解決する。
     pub(crate) fn add_parallel(&mut self, chain: ChainRef, at: InsertAt) {
         self.ensure_first_track();
         self.edit_song_checked(move |song| {
-            if song.chain_devices(chain).is_none() {
+            let Some(index) = at.resolve(song, chain) else {
                 return false;
-            }
-            let InsertAt::Index(index) = at;
+            };
             let mut parallel = Parallel::new();
             parallel.id = song.alloc_device_id();
             parallel.chains[0].id = song.alloc_device_id();
             color_new_parallel(song, chain, &mut parallel);
-            song.insert_device(chain, index as usize, Device::Parallel(parallel));
-            true
+            song.insert_device(chain, index, Device::Parallel(parallel))
         });
     }
 
@@ -93,7 +92,9 @@ impl AppData {
             true
         });
         if result {
-            self.prune_device_selection();
+            // 解除で消えた chain の gain / pan や Parallel の出力のレーン / 変調は、SongDoc の
+            // `enforce_edit_invariants` が同じ undo step で掃除済み (r.md #129)。
+            self.prune_device_session_refs();
             self.flush_song_sync();
         }
     }
@@ -411,6 +412,9 @@ impl AppData {
                     parallel_band: None,
                 }),
                 Device::Parallel(r) => self.push_parallel_rows(r, chain, i as u32, depth, bars, rows),
+                // r.md #129: 内蔵 device は Rack に行を持たない (編集面は Mixer 帯 / マスターパネル)。
+                // `index` はチェーン内の位置なので、行を出さなくても drop 位置は正しく解ける。
+                Device::Native(_) => {}
             }
         }
     }

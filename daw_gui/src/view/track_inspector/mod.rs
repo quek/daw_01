@@ -168,7 +168,14 @@ fn scrub_field(
     // modulation depth ドラッグの falling edge で host 再同期 (自コントロールの
     // target を key に、他コントロールと干渉せず drag-end で 1 回だけ recompile)。
     if let Some((target, _)) = &mod_spec {
-        mod_widget::push_mod_depth_bracket(ui, app, cursor_track, target, resp.mod_dragging);
+        mod_widget::push_mod_depth_bracket(
+            ui,
+            app,
+            crate::app::ParamSurface::Rack,
+            cursor_track,
+            target,
+            resp.mod_dragging,
+        );
     }
 }
 

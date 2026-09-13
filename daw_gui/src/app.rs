@@ -90,7 +90,7 @@ pub use crate::event::{
 };
 
 pub use crate::state::{
-    AppData, DeviceParamKey, EditScope, IpcState, MediaState, RecordingState, ScrubGesture,
+    AppData, DeviceParamKey, EditScope, IpcState, MediaState, ParamSurface, RecordingState, ScrubGesture,
     SelectionState, SongDoc, StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
 };
 
@@ -856,16 +856,12 @@ impl AppData {
             AppEvent::SetCountInBars(bars) => {
                 self.cur.recording.count_in_bars = bars.min(2);
             }
-            AppEvent::ParamGestureBegin {
-                track_id,
-                target,
-                display_name,
-            } => {
+            AppEvent::ParamGestureBegin { surface, track_id, target } => {
                 // 1 drag = 1 undo step の bracket と touch の記録 (`handler/param_gesture.rs`)。
-                self.begin_param_gesture(track_id, target, display_name);
+                self.begin_param_gesture(surface, track_id, target);
             }
-            AppEvent::ParamGestureEnd { track_id, target } => {
-                self.end_param_gesture(track_id, target);
+            AppEvent::ParamGestureEnd { surface, track_id, target } => {
+                self.end_param_gesture(surface, track_id, target);
             }
             AppEvent::CreateAutomationClip {
                 lane,
@@ -1294,20 +1290,19 @@ impl AppData {
             AppEvent::ToggleTrackArmed(track) => {
                 self.toggle_track_armed(track);
             }
-            AppEvent::StripEdit { track, edit } => {
-                self.apply_strip_edit(track, &edit);
-            }
-            AppEvent::MasterStripEdit { param, value } => {
-                self.apply_master_strip_edit(param, value);
-            }
             AppEvent::ToggleStripSection(section) => {
                 self.toggle_strip_section(section);
             }
             // メーター / 走行状態 / 変調値面はアクティブなタブの slot だけ読む。届いた
             // 時点で切り替わっていたら (1 tick の窓) 捨てる — 別タブの値を混ぜない。
-            AppEvent::TrackPeaksTick { project, tracks, master_gr } => {
+            AppEvent::TrackPeaksTick { project, tracks, native_gr, master_limiter_gr_db } => {
                 if project == self.cur.key {
-                    self.on_track_peaks_tick(&tracks, master_gr);
+                    self.on_track_peaks_tick(&tracks, native_gr.as_deref(), master_limiter_gr_db);
+                }
+            }
+            AppEvent::DeviceSpectrumTick { project, spectra } => {
+                if project == self.cur.key {
+                    self.cur.transport.device_spectra = spectra.into_iter().collect();
                 }
             }
             AppEvent::LauncherRowsTick { project, rows } => {

@@ -65,6 +65,12 @@ impl AppData {
             DeviceEvent::SetParallelMixer { parallel_id, edit } => self.set_parallel_mixer(parallel_id, edit),
             DeviceEvent::SetParallelSplit { parallel_id, split } => self.set_parallel_split(parallel_id, split),
             DeviceEvent::ToggleParallelNodeCollapsed { id } => self.toggle_parallel_node_collapsed(id),
+            // ---- r.md #129 内蔵 device ----
+            DeviceEvent::AddNative { chain, kind, open_panel } => self.add_native(chain, kind, open_panel),
+            DeviceEvent::NativeEdit { device_id, edit } => self.apply_native_edit(device_id, &edit),
+            DeviceEvent::MasterLimiterEdit(edit) => self.apply_master_limiter_edit(edit),
+            DeviceEvent::SetScListen { device_id } => self.request_sc_listen(device_id),
+            DeviceEvent::ToggleRackPanel(key) => self.toggle_rack_panel(key),
         }
     }
 }

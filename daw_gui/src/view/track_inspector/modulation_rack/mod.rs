@@ -557,6 +557,7 @@ fn draw_routing_row(
     crate::view::modulation::push_mod_depth_bracket(
         ui,
         app,
+        crate::app::ParamSurface::Rack,
         depth_owner,
         &common::model::AutomationTarget::ModRoutingDepth { routing_id: row.id },
         depth_resp.mod_dragging,
