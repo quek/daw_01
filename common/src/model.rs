@@ -1099,22 +1099,6 @@ impl Song {
             .any(|t| t.sends.iter().any(|s| s.dest_track_id == track_id))
     }
 
-    /// パラアウト (`docs/plan_paraout.md`): true if any plugin (on any track or
-    /// the master fx chain) routes one of its aux outputs to `track_id` (= it
-    /// acts as a parallel-out destination bus). RT-safe scan, no alloc. Such a
-    /// track is summed + FX'd in pass 2 (`run_group_fx_chain`), so the audio
-    /// engine skips its own device chain in pass 1 (like a group / return) to
-    /// avoid double-processing stateful FX.
-    pub fn track_receives_paraout(&self, track_id: u32) -> bool {
-        self.all_plugins()
-            .any(|p| {
-                p.aux_outputs
-                    .iter()
-                    .flatten()
-                    .any(|r| r.dest_track == track_id)
-            })
-    }
-
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
     /// 実体は [`IdAllocators::alloc_content_id`] (= 採番規則の SSoT)。
     pub fn alloc_content_id(&mut self) -> ContentId {
