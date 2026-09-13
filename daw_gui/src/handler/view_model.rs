@@ -657,22 +657,18 @@ impl AppData {
         Some(format!("{kind_label} {ordinal}"))
     }
 
+    /// `target` のコントロール 1 個ぶんの変調の表示データ。`owner` は target の lane / routing の持ち主
+    /// (r.md #129 §7.7) で、**面を描き始めるときに 1 回だけ解決した** ものを渡す (つまみごとに木を
+    /// 引き直さない、`ParamOwner` の doc)。描画中の Song は不変なので同じスナップショットから解決した
+    /// 持ち主で足り、Edit 側 (`AddModRouting` / `SetModRoutingDepth`) は実行時の Song で引き直す。
     pub fn inspector_mod_data(
         &self,
         target: &common::model::AutomationTarget,
         display_base: f64,
         domain: ModControlDomain,
-        track_id: u32,
+        owner: crate::view::native_device::ParamOwner<'_>,
     ) -> InspectorModData {
-        // r.md #129 (§7.7): routing の store は target の持ち主 (view が渡す track id は
-        // Volume / Pan のように target だけでは持ち主が決まらない住所のためだけに使う)。
-        let song = self.cur.song_doc.song();
-        let Some(track_id) = crate::handler::param_value::param_owner(song, target, track_id) else {
-            return InspectorModData::default();
-        };
-        let Some((_, routings)) = song.param_stores(track_id) else {
-            return InspectorModData::default();
-        };
+        let (track_id, routings) = (owner.id, owner.routings);
         let model_base = domain.to_model(target, display_base);
         // docs/plan_modulation_followups.md §2: plugin params normalize against
         // their real min/max (identity placeholder would saturate the overlay).

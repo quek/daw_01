@@ -110,7 +110,7 @@ fn draw_mini(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &
     let active = !entry.bypassed;
     match entry.kind {
         NativeKind::Eq | NativeKind::ToneEq => {
-            let Some(dev) = app.cur.song_doc.song().native_by_id(id) else { return };
+            let Some(dev) = row_native(app, ctx, id) else { return };
             let live = live_device(app, ctx, dev);
             let Some(src) = EqCurveSource::from_params(&live.params) else { return };
             let rect = Rect { y: area.y + (area.h - MINI_CURVE_H) * 0.5, h: MINI_CURVE_H, ..area };
@@ -123,6 +123,13 @@ fn draw_mini(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &
             draw_gr_horizontal(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), rect, gr, active, GR_METER_RANGE_DB, None);
         }
     }
+}
+
+/// 行の device。行は表示中のチェーン (カーソルトラック) から組まれているので、全トラックの木を先頭から
+/// 走査せず、そのチェーンの中だけを探す (行ごとに毎フレーム呼ばれる)。
+fn row_native<'a>(app: &'a AppData, ctx: &RowCtx<'_>, id: u64) -> Option<&'a NativeDevice> {
+    let chain = app.cur.song_doc.song().fx_chain_by_track_id(ctx.cursor_tid?)?;
+    common::model::native_in(chain, id)
 }
 
 /// レーンを重ねた表示値 (持ち主の store が引けなければ Song の値)。
@@ -147,7 +154,7 @@ pub(super) fn draw_native_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ct
     if !app.rack_panel_open(key) {
         return;
     }
-    let Some(dev) = app.cur.song_doc.song().native_by_id(id) else { return };
+    let Some(dev) = row_native(app, ctx, id) else { return };
     let Some(owner) = ctx.owner else { return };
     let rect = Rect { x: content.x, y: ey, w: content.w, h: layout::panel_height(entry.kind) };
     let bg = draw_panel_bg(app, ui, key, rect, ctx.popup_open);

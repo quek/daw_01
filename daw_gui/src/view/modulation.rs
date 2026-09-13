@@ -68,17 +68,18 @@ impl ModBuild {
     }
 }
 
-/// `track_id` 上の `target` のコントロール (表示 `display_base`、ドメイン `domain`)
-/// の per-control modulation データを組み立てる。`track_id` は routing の帰属
-/// トラック (inspector = cursor track、mixer strip = その strip のトラック)。
+/// `owner` が持つ `target` のコントロール (表示 `display_base`、ドメイン `domain`)
+/// の per-control modulation データを組み立てる。`owner` は target の lane / routing の持ち主
+/// (r.md #129 §7.7) を **面を描き始めるときに 1 回だけ** 解決したもの (Rack / Mixer 帯 / マスターパネルは
+/// つまみの `NativeKnobSpec::owner`、それ以外は描いている面が知っている持ち主の id から `ParamOwner::resolve`)。
 pub(crate) fn build_mod(
     app: &AppData,
     target: AutomationTarget,
     display_base: f64,
     domain: ModControlDomain,
-    track_id: u32,
+    owner: crate::view::native_device::ParamOwner<'_>,
 ) -> ModBuild {
-    let d = app.inspector_mod_data(&target, display_base, domain, track_id);
+    let d = app.inspector_mod_data(&target, display_base, domain, owner);
     let to_color = |c: [f32; 3]| Color { r: c[0], g: c[1], b: c[2], a: 1.0 };
     let entries = d
         .entries

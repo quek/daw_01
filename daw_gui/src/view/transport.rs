@@ -367,7 +367,7 @@ fn draw_tempo_and_key(
         bpm_target.clone(),
         f64::from(app.cur.song_doc.song().bpm),
         crate::view::modulation::PLAIN_IDENT,
-        MASTER_TRACK_ID,
+        crate::view::native_device::ParamOwner::master(app.cur.song_doc.song()),
     );
     let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",

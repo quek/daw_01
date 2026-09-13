@@ -490,13 +490,15 @@ fn draw_routing_row(
         .song()
         .mod_routing_owner(row.id)
         .unwrap_or(common::model::MASTER_TRACK_ID);
-    let depth_mod = crate::view::modulation::build_mod(
-        app,
-        common::model::AutomationTarget::ModRoutingDepth { routing_id: row.id },
-        f64::from(row.depth),
-        crate::view::modulation::PLAIN_IDENT,
-        depth_owner,
-    );
+    let depth_mod = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), depth_owner).map(|owner| {
+        crate::view::modulation::build_mod(
+            app,
+            common::model::AutomationTarget::ModRoutingDepth { routing_id: row.id },
+            f64::from(row.depth),
+            crate::view::modulation::PLAIN_IDENT,
+            owner,
+        )
+    });
     let depth_resp = ui.scrubable_number_at(
         ("inspector_mod_rt_depth", rid),
         Rect { x: depth_x, y: row_y, w: 46.0, h: 20.0 },
@@ -516,7 +518,7 @@ fn draw_routing_row(
             })
         },
         None,
-        Some(depth_mod.modulation()),
+        depth_mod.as_ref().map(crate::view::modulation::ModBuild::modulation),
     );
     let bip = row.bipolar;
     let tgt_pol = row.target.clone();

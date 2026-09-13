@@ -14,7 +14,8 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, InspectorScrubField, ModControlDomain, ParamSurface};
 use crate::event_device::DeviceEvent;
 use crate::handler::parallel::ParallelMixerEdit;
-use crate::view::modulation::{PLAIN_IDENT, build_mod, push_mod_depth_bracket};
+use crate::view::modulation::{ModBuild, PLAIN_IDENT, build_mod, push_mod_depth_bracket};
+use crate::view::native_device::ParamOwner;
 use crate::view::param_gesture::push_param_gesture;
 use common::model::{AutomationTarget, SELECTOR_FADE_RANGE, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
 
@@ -159,7 +160,7 @@ fn draw_active_field(
         font_size: 10.0,
         ..scrub_style(&app.theme)
     };
-    let m = build_mod(app, target.clone(), display, domain, track_id);
+    let m = ParamOwner::resolve(song, track_id).map(|owner| build_mod(app, target.clone(), display, domain, owner));
     let resp = ui.scrubable_number_at(
         ("inspector_select_active", i),
         rect,
@@ -180,7 +181,7 @@ fn draw_active_field(
             })
         },
         None,
-        Some(m.modulation()),
+        m.as_ref().map(ModBuild::modulation),
     );
     push_param_gesture(ui, app, ParamSurface::Rack, track_id, target.clone(), resp.dragging);
     push_scrub_bracket(ui, app, InspectorScrubField::ParallelSelect { parallel_id }, resp.dragging || resp.editing_text);
@@ -262,7 +263,8 @@ fn draw_freq_field(
         font_size: 10.0,
         ..scrub_style(&app.theme)
     };
-    let m = build_mod(app, target.clone(), f64::from(live), PLAIN_IDENT, track_id);
+    let m = ParamOwner::resolve(app.cur.song_doc.song(), track_id)
+        .map(|owner| build_mod(app, target.clone(), f64::from(live), PLAIN_IDENT, owner));
     let key = match edge {
         SplitEdge::LowMid => "inspector_split_low",
         SplitEdge::MidHigh => "inspector_split_high",
@@ -285,7 +287,7 @@ fn draw_freq_field(
             })
         },
         None,
-        Some(m.modulation()),
+        m.as_ref().map(ModBuild::modulation),
     );
     push_param_gesture(ui, app, ParamSurface::Rack, track_id, target.clone(), resp.dragging);
     push_scrub_bracket(

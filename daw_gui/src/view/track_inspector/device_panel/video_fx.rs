@@ -21,6 +21,8 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
         let input_x = ctx.x + label_w;
         let input_w = (row_w - label_w).max(40.0);
         let track_id = view.track_id;
+        // 変調の持ち主 (device を持つトラック) はパネルにつき 1 回だけ解決し、全行で使い回す。
+        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
         for (i, param) in view.def.params.iter().enumerate() {
             let value = f64::from(view.values[i]);
             let (min, max) = param.kind.range();
@@ -51,8 +53,8 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                 legacy_device_index: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: param.kind.is_log() };
-            let mod_build = build_mod(app, target.clone(), value, domain, track_id);
-            let modulation = Some(mod_build.modulation());
+            let mod_build = owner.map(|o| build_mod(app, target.clone(), value, domain, o));
+            let modulation = mod_build.as_ref().map(|m| m.modulation());
             let param_id = param.id;
             let resp = ui.scrubable_number_at(
                 (device_id, i, "vfx_scrub"),

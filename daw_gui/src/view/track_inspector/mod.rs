@@ -142,9 +142,10 @@ fn scrub_field(
     // inspector の image/text field は cursor track の clip に属する。
     let cursor_track = app.cursor_track_id().unwrap_or(common::model::MASTER_TRACK_ID);
     let mod_spec = scrub_field_mod(scrub_key);
-    let mod_build = mod_spec
-        .as_ref()
-        .map(|(target, domain)| build_mod(app, target.clone(), base, *domain, cursor_track));
+    let mod_build = mod_spec.as_ref().and_then(|(target, domain)| {
+        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), cursor_track)?;
+        Some(build_mod(app, target.clone(), base, *domain, owner))
+    });
     let modulation = mod_build.as_ref().map(ModBuild::modulation);
 
     let resp = ui.scrubable_number_at(
