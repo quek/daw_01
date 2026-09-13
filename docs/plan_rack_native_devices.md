@@ -2324,7 +2324,7 @@ state/project.rs:462, :595, :630, :634, :960, :984, :991, :992 / handler/devices
 | F-G7 | `tests/app_state/project_tabs.rs` | 2 タブで Listen → audio を respawn → 送信列が `OpenProject` → `SetScListen(Some)` の順で、LoadSong より前 |
 | F-G8 | `handler/view_model.rs` cfg(test) | 再生中で song_lanes に NativeParam レーン → `live_native_param` がレーン値、停止中は model 値 / master chain の ChainGain も追従 |
 
-回すもの: `cargo test -p common --lib`、`cargo test -p daw_audio --lib -- song_values`、`cargo test -p daw_gui --features daw_gui/script --lib -- event_native view::param_gesture view::scrub_gesture handler::bypass_target handler::bounce handler::view_model`、`--test app_state --test chain_split_click --test channel_strip_visual`。
+回すもの: `cargo test -p common --lib`、`cargo test -p daw_audio --bin daw_audio -- song_values`、`cargo test -p daw_gui --features daw_gui/script --lib -- event_native view::param_gesture view::scrub_gesture handler::bypass_target handler::bounce handler::view_model`、`--test app_state --test chain_split_click --test channel_strip_visual`。
 
 ### 15.3 E
 
@@ -2347,7 +2347,7 @@ state/project.rs:462, :595, :630, :634, :960, :984, :991, :992 / handler/devices
 | T15 | pre-fader send の無い group でも、PostFx を source にした follower / SC が今の buffer のチェーン後の信号を読む |
 | T16 | 同じ v38 fixture の offline render 2 回が bit 一致。`sc_listen_device` を立てても書き出しは変わらない |
 
-回すもの: `cargo check -p daw_audio --all-targets`、`cargo test -p daw_audio --lib -- native_dsp graph automation song_values`、`make test-rt`、`cargo test -p common --lib -- audio_bridge device_scope_bridge`。
+回すもの: `cargo check -p daw_audio --all-targets`、`cargo test -p daw_audio --bin daw_audio -- native_dsp graph automation song_values`、`make test-rt`、`cargo test -p common --lib -- audio_bridge device_scope_bridge`。
 
 ### 15.4 A
 
@@ -2540,9 +2540,9 @@ critic 2-d の 9 件（Bounce / group の変調 / Listen の dirty / LoadSong �
 
 | 単位 | 内容 | 前提 | 統合順 | 回すもの |
 |---|---|---|---|---|
-| **S0** 記録 | 本書、v38 fixture、DSP golden（§15.1） | HEAD 76837672 | 1 | `cargo test -p common --lib -- --ignored record_v38_fixture`、`cargo test -p daw_audio --lib -- --ignored record_golden`（生成物を commit） |
+| **S0** 記録 | 本書、v38 fixture、DSP golden（§15.1） | HEAD 76837672 | 1 | `cargo test -p common --lib -- --ignored record_v38_fixture`、`cargo test -p daw_audio --bin daw_audio -- --ignored record_golden`（生成物を commit） |
 | **S1a** model 分割 | 挙動を変えない（§17） | S0 | 2（S1b / S1c と順不同） | `cargo check -p common -p daw_audio -p daw_plugin_host --all-targets`、`cargo check -p daw_gui --all-targets --features daw_gui/script`、`cargo test -p common --lib` |
-| **S1b** compile 分割 | 挙動を変えない | S0 | 2 | `cargo check -p daw_audio --all-targets`、`cargo test -p daw_audio --lib -- graph::compile` |
+| **S1b** compile 分割 | 挙動を変えない | S0 | 2 | `cargo check -p daw_audio --all-targets`、`cargo test -p daw_audio --bin daw_audio -- graph::compile` |
 | **S1c** daw_gui 機械分割 | `DeviceEvent` への移設（新 variant なし）、`InsertAt`（Index のみ）、`chain_rows.rs`、chain_list / track_inspector/mod.rs / root.rs の Q 節 → `view/bypass_toggle.rs`、`handler/project.rs` → `recovery.rs`、automation_lanes.rs:1138-1452 → `param_value.rs`、`row_menu` の型化 | S0 | 2 | `cargo check -p daw_gui --all-targets --features daw_gui/script`、`cargo test -p daw_gui --features daw_gui/script --test app_state --test chain_split_click` |
 | **F** 基盤 | common 全部、daw_gui のハブ（event / state / 編集・Listen・Q・ガード述語の単一の口 / ジェスチャー所有者 / live 値 / telemetry の受け口 / tabs / bounce / 挿入位置 3 か所 / クリップボードの sanitize）、全 crate の型追従 | S1a, S1b, S1c | 3 | §15.2 |
 | **E** engine | ChainOp::Native、native_dsp、SC 会計、Listen の置換、Limiter の遅延焼き込み、GR / scope の publish、group の変調、routing_deps の利用 | F | 4（A / C と順不同） | §15.3 |
