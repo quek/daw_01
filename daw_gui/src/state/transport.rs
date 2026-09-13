@@ -21,8 +21,9 @@ pub enum PlayFrom {
 /// r.md #129 (§11.1): GR を出す内蔵 device の GR 表示値 (**正の減衰量 dB**)。
 ///
 /// 読み手 (Rack 行 / Par / Mixer 帯 / マスターパネル) は device id で引く。engine の GR 面は
-/// compile 順の slot だが、ここは id 昇順に並べ替えて二分探索する (位置で引かない、不変条件 1)。
-#[derive(Debug, Clone, Default, PartialEq)]
+/// compile 順の slot だが、ポーラが id 昇順に並べて送り、ここも id 昇順で持って二分探索する
+/// (位置で引かない、不変条件 1)。
+#[derive(Debug, Default)]
 pub struct NativeGrDisplay {
     /// `(device id, 減衰量 dB)`、id 昇順。
     entries: Vec<(u64, f32)>,
@@ -35,26 +36,40 @@ impl NativeGrDisplay {
         self.entries.binary_search_by_key(&id, |e| e.0).map_or(0.0, |i| self.entries[i].1)
     }
 
-    /// GR 面の 1 tick を取り込む。面にある id は peak と同じ release 弾道で更新し、面に無い id は
-    /// 0 へ減衰させて表示解像度で 0 になったら捨てる (処理されなくなった device の値が残らない)。
+    /// GR 面の 1 tick (`(device id, GR dB (0 以下))`、**id 昇順**) を取り込む。面にある id は peak と同じ
+    /// release 弾道で更新 (新しい id はその値で追加) し、面に無い id は 0 へ減衰させて表示解像度で 0 に
+    /// なったら捨てる (処理されなくなった device の値が残らない)。どちらも id 昇順なので 1 回のマージ走査。
     pub fn update(&mut self, plane: &[(u64, f32)], release: f32) {
-        for e in &mut self.entries {
-            if !plane.iter().any(|(id, _)| *id == e.0) {
-                e.1 = common::meter::update_peak(e.1, 0.0, release);
-            }
-        }
-        for &(id, gr_db) in plane {
-            let amount = (-gr_db).max(0.0);
-            match self.entries.binary_search_by_key(&id, |e| e.0) {
-                Ok(i) => self.entries[i].1 = common::meter::update_peak(self.entries[i].1, amount, release),
-                Err(i) => self.entries.insert(i, (id, amount)),
-            }
-        }
+        debug_assert!(plane.windows(2).all(|w| w[0].0 < w[1].0), "GR 面は id 昇順で渡す (ポーラが並べる)");
         let steps = crate::handler::activity::METER_STEPS;
-        self.entries.retain(|&(id, v)| {
-            plane.iter().any(|(p, _)| *p == id)
-                || crate::handler::activity::quantize(v / common::model::GR_METER_RANGE_DB, steps) != 0
-        });
+        let settled = |v: f32| crate::handler::activity::quantize(v / common::model::GR_METER_RANGE_DB, steps) == 0;
+        let reduction = |gr_db: f32| (-gr_db).max(0.0);
+        let old = std::mem::take(&mut self.entries);
+        let mut merged = Vec::with_capacity(old.len().max(plane.len()));
+        let (mut i, mut j) = (0, 0);
+        loop {
+            match (old.get(i).copied(), plane.get(j).copied()) {
+                (Some((id, v)), Some((pid, gr_db))) if id == pid => {
+                    merged.push((id, common::meter::update_peak(v, reduction(gr_db), release)));
+                    i += 1;
+                    j += 1;
+                }
+                (Some((id, v)), p) if p.is_none_or(|(pid, _)| id < pid) => {
+                    let v = common::meter::update_peak(v, 0.0, release);
+                    if !settled(v) {
+                        merged.push((id, v));
+                    }
+                    i += 1;
+                }
+                (_, Some((pid, gr_db))) => {
+                    merged.push((pid, reduction(gr_db)));
+                    j += 1;
+                }
+                // 両方を読み切った (`(Some, None)` は 2 本目の腕が取る)。
+                (_, None) => break,
+            }
+        }
+        self.entries = merged;
     }
 
     /// `(device id, 減衰量 dB)` を id 昇順に。
@@ -223,5 +238,29 @@ impl TransportState {
             pending_video_export_dims: None,
             pending_export: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeGrDisplay;
+
+    /// 1 tick で「面にある id の更新 / 間に挟まる新しい id の追加 / 面から消えた id の減衰と破棄」が混ざっても、
+    /// id 昇順のまま正しい id に効く (マージ走査の取り違えが無い)。
+    #[test]
+    fn gr_display_merges_a_sorted_plane_into_sorted_entries() {
+        let mut d = NativeGrDisplay::default();
+        d.update(&[(10, -6.0), (30, -3.0)], 0.5);
+        d.update(&[(20, -4.0), (30, -9.0), (40, -1.0)], 0.5);
+        let ids: Vec<u64> = d.iter().map(|e| e.0).collect();
+        assert_eq!(ids, [10, 20, 30, 40], "減衰中の 10 は残り、20 / 40 が順序どおりに入る");
+        assert!(d.get(10) > 0.0 && d.get(10) < 6.0, "面から消えた 10 は減衰する: {}", d.get(10));
+        assert_eq!(d.get(20), 4.0, "新しい id はその値");
+        assert!(d.get(30) >= 9.0, "深くなった 30 は即座に追従する: {}", d.get(30));
+        assert_eq!(d.get(40), 1.0);
+        for _ in 0..200 {
+            d.update(&[(30, 0.0)], 0.5);
+        }
+        assert_eq!(d.iter().map(|e| e.0).collect::<Vec<_>>(), [30], "0 に収束した id は捨て、面にある id は残す");
     }
 }

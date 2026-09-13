@@ -1032,7 +1032,7 @@ pub enum AppEvent {
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
     /// メーター面の 1 tick。`tracks` は per-track の `(peak L, peak R)`、`native_gr` は GR を出す
-    /// 内蔵 device の `(device id, GR dB (0 以下))` (`None` = seqlock が読めなかった = 前回値を保つ)、
+    /// 内蔵 device の `(device id, GR dB (0 以下))`、id 昇順 (`None` = seqlock が読めなかった = 前回値を保つ)、
     /// `master_limiter_gr_db` は master Limiter の GR (dB、0 以下)。
     ///
     /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ

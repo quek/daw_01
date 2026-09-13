@@ -591,7 +591,12 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
             // capacity ごと move out するので次 tick で確保し直す = per-tick の
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             // r.md #129: 内蔵 device の GR 面は seqlock が破れた tick は None (GUI は前回値を保つ)。
-            let native_gr = active.read_native_meters(&mut native_buf).then(|| native_buf.clone());
+            // 面は engine の compile 順なので id 昇順に並べて送る (GUI は表示値と 1 回のマージで突き合わせる、
+            // `NativeGrDisplay::update`)。
+            let native_gr = active.read_native_meters(&mut native_buf).then(|| {
+                native_buf.sort_unstable_by_key(|e| e.0);
+                native_buf.clone()
+            });
             if proxy
                 .send_event(AppEvent::TrackPeaksTick {
                     project: active_key,
