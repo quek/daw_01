@@ -1300,76 +1300,108 @@ mod tests {
         assert!(c.next_point_id > *ids.iter().max().unwrap(), "allocator が進んでいない");
     }
 
-    /// r.md #73: 2 述語は `AutomationTarget` の全 variant を明示的に覆う。
-    /// 新しい target を足したときにここが落ちるようにしておく (曲線の直接操作は
-    /// 「その lane で逆写像が取れるか」に依存するので、既定値で通してはいけない)。
+    /// 全 `AutomationTarget` (NativeParam は 4 種の全住所、MasterLimiter を含む)。variant を足したら
+    /// `cover` の網羅 match が落ちるので、ここへの追加を忘れない。
+    fn every_target() -> Vec<AutomationTarget> {
+        use crate::model::{
+            GroupTransformParam as G, ImageBuiltinParam as I, MasterLimiterParam, NativeKind, NativeParamId,
+            SplitEdge, TextBuiltinParam as X,
+        };
+        fn cover(t: &AutomationTarget) {
+            match t {
+                AutomationTarget::TrackBuiltin(_)
+                | AutomationTarget::PluginParam { .. }
+                | AutomationTarget::NativeParam { .. }
+                | AutomationTarget::MasterLimiter(_)
+                | AutomationTarget::SongTempo
+                | AutomationTarget::SongTimeSigNumerator
+                | AutomationTarget::ImageBuiltin(_)
+                | AutomationTarget::TextBuiltin(_)
+                | AutomationTarget::GroupTransform(_)
+                | AutomationTarget::ModSourceParam { .. }
+                | AutomationTarget::ModRoutingDepth { .. } => {}
+            }
+        }
+        use TrackBuiltinParam as B;
+        let mut v: Vec<AutomationTarget> = [
+            B::Volume,
+            B::Pan,
+            B::Mute,
+            B::SendGain { send_id: 1, legacy_send_idx: None },
+            B::ChainGain { chain_id: 1 },
+            B::ChainPan { chain_id: 1 },
+            B::ParallelOutGain { parallel_id: 1 },
+            B::ParallelSplitFreq { parallel_id: 1, edge: SplitEdge::LowMid },
+            B::ParallelSplitFreq { parallel_id: 1, edge: SplitEdge::MidHigh },
+            B::ParallelSelect { parallel_id: 1 },
+        ]
+        .into_iter()
+        .map(AutomationTarget::TrackBuiltin)
+        .collect();
+        v.push(AutomationTarget::PluginParam { device_id: 1, param_id: 2, legacy_device_index: None });
+        for kind in NativeKind::ALL {
+            v.extend(NativeParamId::all_of(kind).iter().map(|&param| AutomationTarget::NativeParam { device_id: 1, param }));
+        }
+        v.extend([MasterLimiterParam::On, MasterLimiterParam::Ceiling].map(AutomationTarget::MasterLimiter));
+        v.extend([AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator]);
+        v.extend([I::X, I::Y, I::W, I::H, I::Opacity, I::Rotation].map(AutomationTarget::ImageBuiltin));
+        v.extend(
+            [
+                X::X, X::Y, X::W, X::H, X::Opacity, X::Rotation, X::FontSize, X::FillR, X::FillG, X::FillB,
+                X::FillA, X::OutlineR, X::OutlineG, X::OutlineB, X::OutlineA, X::OutlineWidth, X::ShadowR,
+                X::ShadowG, X::ShadowB, X::ShadowA, X::ShadowOffsetX, X::ShadowOffsetY, X::ShadowBlur,
+            ]
+            .map(AutomationTarget::TextBuiltin),
+        );
+        v.extend(
+            [G::X, G::Y, G::Rotation, G::ScaleX, G::ScaleY, G::AnchorX, G::AnchorY, G::Opacity]
+                .map(AutomationTarget::GroupTransform),
+        );
+        v.extend(ModParam::ALL.map(|param| AutomationTarget::ModSourceParam { source_id: 1, param }));
+        v.push(AutomationTarget::ModRoutingDepth { routing_id: 1 });
+        v.iter().for_each(cover);
+        v
+    }
+
+    /// F-C7 (r.md #129): 正規化の単一の表 `target_range` と 2 述語の整合を全 target で確かめる。
+    /// invertible なら往復が 1e-9 で戻り、norm は plain に対して単調非減少。affine なら中点が一致し、
+    /// Log / LogWithOff / Toggle には中点が一致しない例がある。ParallelSplitFreq は affine でない。
     #[test]
-    fn norm_mapping_predicates_cover_every_target() {
-        use crate::model::{GroupTransformParam, ImageBuiltinParam, TextBuiltinParam};
-        // affine でない = ScaleX / ScaleY (log) と Mute (階段) の 3 つだけ。
-        let non_affine = [
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute),
-            AutomationTarget::GroupTransform(GroupTransformParam::ScaleX),
-            AutomationTarget::GroupTransform(GroupTransformParam::ScaleY),
-        ];
-        for t in &non_affine {
-            assert!(!norm_mapping_is_affine(t), "{t:?} は非 affine のはず");
+    fn target_range_is_consistent_for_every_target() {
+        let targets = every_target();
+        assert!(targets.len() > 90, "列挙が欠けている: {}", targets.len());
+        for t in &targets {
+            let r = target_range(t, None);
+            let (lo, hi) = r.display_range();
+            let plains: Vec<f64> = (0..=20).map(|i| lo + (hi - lo) * f64::from(i) / 20.0).collect();
+            let norms: Vec<f64> = plains.iter().map(|&p| r.to_norm(p)).collect();
+            assert!(norms.windows(2).all(|w| w[1] >= w[0] - 1e-12), "{t:?}: norm が単調でない {norms:?}");
+            assert_eq!(norm_mapping_is_invertible(t), r.is_invertible(), "{t:?}");
+            assert_eq!(norm_mapping_is_affine(t), r.is_affine(), "{t:?}");
+            if r.is_invertible() {
+                for n in [0.1, 0.5, 0.9] {
+                    assert!((r.to_norm(r.from_norm(n)) - n).abs() < 1e-9, "{t:?}: {n} が往復しない");
+                }
+            }
+            let mid_matches = plains.windows(3).all(|w| (r.to_norm(w[1]) - (r.to_norm(w[0]) + r.to_norm(w[2])) / 2.0).abs() < 1e-9);
+            if r.is_affine() {
+                assert!(mid_matches, "{t:?}: affine なのに中点が一致しない");
+            }
+            if matches!(r, ParamRange::Log { .. } | ParamRange::LogWithOff { .. } | ParamRange::Toggle) {
+                assert!(!mid_matches, "{t:?}: 非 affine なのに中点が全部一致した");
+            }
         }
-        // 逆写像を持たない = Mute だけ。
-        assert!(!norm_mapping_is_invertible(&AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::Mute
-        )));
-        // 残りは全部 affine かつ invertible。 **全 variant を列挙する** (`_ =>` を書かない)。
-        let affine: Vec<AutomationTarget> = vec![
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
-                send_id: 1,
-                legacy_send_idx: None,
-            }),
-            AutomationTarget::PluginParam { device_id: 1, param_id: 2, legacy_device_index: None },
-            AutomationTarget::SongTempo,
-            AutomationTarget::SongTimeSigNumerator,
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::X),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::W),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::H),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::X),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::Y),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::W),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::H),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::Opacity),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::Rotation),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FontSize),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillR),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillG),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillB),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillA),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineR),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineG),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineB),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineA),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineWidth),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowR),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowG),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowB),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowA),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowOffsetX),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowOffsetY),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowBlur),
-            AutomationTarget::GroupTransform(GroupTransformParam::X),
-            AutomationTarget::GroupTransform(GroupTransformParam::Y),
-            AutomationTarget::GroupTransform(GroupTransformParam::Rotation),
-            AutomationTarget::GroupTransform(GroupTransformParam::AnchorX),
-            AutomationTarget::GroupTransform(GroupTransformParam::AnchorY),
-            AutomationTarget::GroupTransform(GroupTransformParam::Opacity),
-        ];
-        for t in &affine {
-            assert!(norm_mapping_is_affine(t), "{t:?} は affine のはず");
-            assert!(norm_mapping_is_invertible(t), "{t:?} は逆写像を持つはず");
-        }
+        let split = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq {
+            parallel_id: 1,
+            edge: crate::model::SplitEdge::LowMid,
+        });
+        assert!(!norm_mapping_is_affine(&split), "旧 `_ => true` の誤判定");
+        // Stepped は旧 Linear{0,count-1} と to_norm が同じ。
+        let ratio = AutomationTarget::NativeParam {
+            device_id: 1,
+            param: crate::model::NativeParamId::BusComp(crate::model::BusCompParam::Ratio),
+        };
+        assert!((plain_to_norm(&ratio, 1.0) - 0.5).abs() < 1e-6);
     }
 
     /// r.md #73: `apply_curve` は a / b に対して **affine 同変**。

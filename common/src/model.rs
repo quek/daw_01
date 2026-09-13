@@ -1524,3 +1524,5 @@ impl Default for TalkParams {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod native_tests;

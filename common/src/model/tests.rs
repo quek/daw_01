@@ -1477,7 +1477,10 @@ fn current_version_is_pinned() {
     // なった。どちらも旧 JSON と byte 互換 (untagged / flatten) で migration 関数は不要。
     // v37: `AutomationLane.visible` を撤去し、レーンの非表示を `ViewState::hidden_automation_lanes`
     // へ移した (見方の都合は Song に持たない)。旧 JSON の `visible` は unknown-field で読み捨て。
-    assert_eq!(CURRENT_VERSION, 38);
+    // v38: Selector / ADSR / LFO 拡張 (serde default で読める)。
+    // v39 (r.md #129): strip / master_strip → 組み込み `Device::Native` と `master_limiter`
+    // (`project::native_migration` が版に依存せず移す)。
+    assert_eq!(CURRENT_VERSION, 39);
 }
 
 #[test]

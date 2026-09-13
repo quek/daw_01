@@ -761,6 +761,29 @@ mod tests {
         assert!(!t.playing());
     }
 
+    /// r.md #129: native GR 面は id で引く seqlock。消えた id は次の publish で残らず、書き込み中は
+    /// 読めない (前回値を保つ)。`clear_meters` で空になる。
+    #[test]
+    fn native_meters_are_read_by_id_and_cleared_as_a_whole() {
+        let (h, slot) = bridge("native_gr");
+        let t = h.project(slot);
+        let mut out = Vec::new();
+        t.publish_native_meters([(11, -3.0), (4, -1.0), (9, -6.0)].into_iter());
+        assert!(t.read_native_meters(&mut out));
+        assert_eq!(out, vec![(11, -3.0), (4, -1.0), (9, -6.0)]);
+        t.publish_native_meters([(9, -2.0), (11, -4.0)].into_iter());
+        assert!(t.read_native_meters(&mut out));
+        assert_eq!(out, vec![(9, -2.0), (11, -4.0)], "消えた id 4 が残らない");
+        let g = t.native_meter_generation.load(Ordering::Relaxed);
+        t.native_meter_generation.store(g | 1, Ordering::Relaxed);
+        assert!(!t.read_native_meters(&mut out), "書き込み中は読めない");
+        t.native_meter_generation.store((g | 1) + 1, Ordering::Relaxed);
+        t.set_master_limiter_gr_db(-2.5);
+        t.clear_meters();
+        assert!(t.read_native_meters(&mut out) && out.is_empty());
+        assert_eq!(t.master_limiter_gr_db(), 0.0);
+    }
+
     #[test]
     fn slot_が満杯なら_claim_は_none() {
         let name = format!("daw01_test_full_{}", std::process::id());

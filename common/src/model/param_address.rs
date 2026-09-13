@@ -282,3 +282,107 @@ impl PruneCtx<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_format::PluginFormat;
+
+    fn plug(id: u64) -> Device {
+        Device::Plugin(PluginInstance { id, ..PluginInstance::new(format!("p{id}"), PluginFormat::Clap) })
+    }
+
+    fn builtin(kind: NativeKind, id: u64) -> Device {
+        Device::Native(NativeDevice::new_builtin(kind, id))
+    }
+
+    fn lane(target: AutomationTarget) -> AutomationLane {
+        AutomationLane::new(target, 0.0)
+    }
+
+    fn routing(id: u32, target: AutomationTarget) -> ModRouting {
+        ModRouting { id, target, source_id: 1, depth: 0.5, polarity: Polarity::Unipolar, enabled: true }
+    }
+
+    fn binding(target: BindingTarget) -> MidiBinding {
+        MidiBinding { channel: 0, input: MidiBindInput::ControlChange(1), legacy_controller: None, target }
+    }
+
+    fn comp_thr(device_id: u64) -> AutomationTarget {
+        AutomationTarget::NativeParam { device_id, param: NativeParamId::Comp(CompParam::Threshold) }
+    }
+
+    /// F-C9: dangling な lane / routing / MIDI binding を固定点まで掃除し、実在するものは残す。2 回目は false。
+    #[test]
+    fn prune_dangling_param_targets_drops_dangling_and_keeps_live_targets() {
+        use AutomationTarget as T;
+        use TrackBuiltinParam as B;
+        let mut p = Parallel::new();
+        p.id = 10;
+        p.chains[0].id = 11;
+        p.chains[0].devices = vec![plug(12)];
+        let keep_t1 = vec![
+            lane(comp_thr(3)),
+            lane(T::TrackBuiltin(B::ChainGain { chain_id: 11 })),
+            lane(T::PluginParam { device_id: 12, param_id: 1, legacy_device_index: None }),
+            lane(T::TrackBuiltin(B::Volume)),
+        ];
+        let drop_t1 = vec![
+            lane(comp_thr(99)),                                                          // 消えた native
+            lane(comp_thr(5)),                                                           // 別トラックの device
+            lane(comp_thr(4)),                                                           // 種類違い (4 は EQ)
+            lane(T::NativeParam { device_id: 4, param: NativeParamId::Eq { band: EqBand::Hp, param: EqParam::Gain } }),
+            lane(T::TrackBuiltin(B::ChainGain { chain_id: 55 })),                        // 消えた chain
+            lane(T::PluginParam { device_id: 10, param_id: 1, legacy_device_index: None }), // Parallel を指す PluginParam
+            lane(T::MasterLimiter(MasterLimiterParam::Ceiling)),                         // 置き場違い
+            lane(T::ModRoutingDepth { routing_id: 2 }),                                  // 連鎖で消える深さの深さ
+        ];
+        let t1 = Track {
+            id: 1,
+            devices: vec![builtin(NativeKind::Comp, 3), builtin(NativeKind::Eq, 4), Device::Parallel(p)],
+            automation_lanes: keep_t1.iter().chain(&drop_t1).cloned().collect(),
+            mod_routings: vec![
+                routing(1, comp_thr(99)),                           // dangling
+                routing(2, T::ModRoutingDepth { routing_id: 1 }),   // routing 1 の深さ → 連鎖
+                routing(3, comp_thr(3)),
+            ],
+            ..Track::default()
+        };
+        let t2 = Track { id: 2, devices: vec![builtin(NativeKind::Comp, 5), builtin(NativeKind::Eq, 6)], ..Track::default() };
+        let song_keep = vec![
+            lane(T::NativeParam { device_id: 7, param: NativeParamId::BusComp(BusCompParam::Ratio) }),
+            lane(T::PluginParam { device_id: 9, param_id: 1, legacy_device_index: None }),
+            lane(T::MasterLimiter(MasterLimiterParam::Ceiling)),
+            lane(T::SongTempo),
+        ];
+        let mut song = Song {
+            tracks: vec![t1, t2],
+            master_fx_chain: vec![builtin(NativeKind::BusComp, 7), builtin(NativeKind::ToneEq, 8), plug(9)],
+            song_lanes: song_keep.clone(),
+            mod_sources: vec![ModSource {
+                id: 1,
+                owner_track_id: 1,
+                color: [1.0; 3],
+                kind: ModSourceKind::default(),
+                enabled: true,
+            }],
+            midi_bindings: vec![
+                binding(BindingTarget::PluginParam { device_id: 12, param_id: 1, legacy_device_index: None, legacy_track: None }),
+                binding(BindingTarget::PluginParam { device_id: 77, param_id: 1, legacy_device_index: None, legacy_track: None }),
+                binding(BindingTarget::NativeParam { device_id: 3, param: NativeParamId::On(NativeKind::Comp) }),
+                binding(BindingTarget::NativeParam { device_id: 99, param: NativeParamId::On(NativeKind::Comp) }),
+                binding(BindingTarget::MasterLimiter(MasterLimiterParam::On)),
+            ],
+            ..Song::default()
+        };
+        assert!(song.prune_dangling_param_targets());
+        let targets = |lanes: &[AutomationLane]| lanes.iter().map(|l| l.target.clone()).collect::<Vec<_>>();
+        assert_eq!(targets(&song.tracks[0].automation_lanes), targets(&keep_t1));
+        assert_eq!(song.tracks[0].mod_routings.iter().map(|r| r.id).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(targets(&song.song_lanes), targets(&song_keep));
+        let bound: Vec<BindingTarget> = song.midi_bindings.iter().map(|b| b.target).collect();
+        assert_eq!(bound.len(), 3, "{bound:?}");
+        assert!(bound.iter().all(|b| !matches!(b, BindingTarget::PluginParam { device_id: 77, .. } | BindingTarget::NativeParam { device_id: 99, .. })));
+        assert!(!song.prune_dangling_param_targets(), "2 回目は変化しない");
+    }
+}

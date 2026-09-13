@@ -236,3 +236,189 @@ fn legacy_master_target(target: &Value, bus: u64, tone: u64) -> Rewrite {
         _ => Rewrite::Drop,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::model::{
+        AutomationTarget as T, BusCompAttack, BusCompParam, BusCompRatio, BusCompRelease, CompMode, CompParam,
+        Device, EqBand, EqParam, MasterLimiterParam, NativeDevice, NativeKind, NativeParamId, NativeParams, Song,
+    };
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v38_strips.daw")
+    }
+
+    fn fixture_song_value() -> serde_json::Value {
+        let text = std::fs::read_to_string(fixture_path()).expect("read v38 fixture");
+        let mut v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        v["song"].take()
+    }
+
+    fn natives(devices: &[Device]) -> Vec<NativeDevice> {
+        let mut out = Vec::new();
+        crate::model::for_each_native(devices, &mut |n| out.push(*n));
+        out
+    }
+
+    fn top_ids(devices: &[Device]) -> Vec<u64> {
+        devices.iter().map(Device::id).collect()
+    }
+
+    fn targets(lanes: &[crate::model::AutomationLane]) -> Vec<(u32, T)> {
+        lanes.iter().map(|l| (l.id, l.target.clone())).collect()
+    }
+
+    fn np(device_id: u64, param: NativeParamId) -> T {
+        T::NativeParam { device_id, param }
+    }
+
+    /// F-C10: v38 fixture を開くと、strip は実 id の組み込み native になり、target も実 id に解決する。
+    #[test]
+    fn v38_fixture_loads_strips_as_builtin_native_devices() {
+        let loaded = crate::project::load_project(fixture_path()).expect("load v38");
+        let song = loaded.song;
+        // 組み込みの位置: 通常 (GWI も) は末尾に Comp → EQ、master は先頭。id は 13 から track 順 → master。
+        assert_eq!(top_ids(&song.tracks[0].devices), vec![1, 2, 6, 13, 14]);
+        assert_eq!(top_ids(&song.tracks[1].devices), vec![7, 8, 15, 16]);
+        assert_eq!(top_ids(&song.tracks[2].devices), vec![17, 18], "devices キーが無いトラック");
+        assert_eq!(top_ids(&song.tracks[3].devices), vec![19, 20]);
+        assert_eq!(top_ids(&song.master_fx_chain), vec![21, 22, 9, 10]);
+        for (t, want) in song.tracks.iter().zip([[false, false], [false, false], [true, true], [true, false]]) {
+            let n = natives(&t.devices);
+            assert!(n.iter().all(|d| d.builtin && d.ordinal == 1), "{}", t.name);
+            assert_eq!([n[0].kind(), n[1].kind()], [NativeKind::Comp, NativeKind::Eq]);
+            assert_eq!([n[0].bypassed, n[1].bypassed], want, "{}: bypassed = !on", t.name);
+        }
+        // params の一致 (Lead)。
+        let lead = natives(&song.tracks[0].devices);
+        let NativeParams::Comp(c) = lead[0].params else { panic!("comp") };
+        assert_eq!((c.mode, c.threshold_db, c.ratio, c.attack_ms, c.release_ms, c.makeup_db, c.sc_freq_hz), (CompMode::Compressor, -18.0, 4.0, 5.0, 120.0, 3.0, 150.0));
+        let NativeParams::Eq(e) = lead[1].params else { panic!("eq") };
+        assert!(e.hp.on && e.hp.freq_hz == 60.0 && !e.lp.on && e.lp.freq_hz == 15_000.0 && e.hf.bell && e.hmf.gain_db == 2.5);
+        // OFF の節 (Child) も値は保つ。
+        let child = natives(&song.tracks[2].devices);
+        let NativeParams::Comp(c) = child[0].params else { panic!("comp") };
+        assert_eq!((c.mode, c.sc_freq_hz), (CompMode::Limiter, 6_000.0));
+        // master。
+        let master = natives(&song.master_fx_chain);
+        assert_eq!([master[0].kind(), master[1].kind()], [NativeKind::BusComp, NativeKind::ToneEq]);
+        assert!(!master[0].bypassed && !master[1].bypassed);
+        let NativeParams::BusComp(b) = master[0].params else { panic!("bus") };
+        assert_eq!((b.threshold_db, b.ratio, b.attack, b.release, b.makeup_db), (-12.0, BusCompRatio::R4, BusCompAttack::A10, BusCompRelease::Auto, 2.0));
+        let NativeParams::ToneEq(tone) = master[1].params else { panic!("tone") };
+        assert_eq!((tone.low_db, tone.lomid_db, tone.high_db), (1.5, -1.0, 2.0));
+        assert!(song.master_limiter.on && song.master_limiter.ceiling_db == -0.5);
+
+        // target: 実 id の NativeParam。実在しない EQ 組の lane と、その routing の深さのレーンは消える。
+        assert_eq!(
+            targets(&song.tracks[0].automation_lanes),
+            vec![
+                (1, np(14, NativeParamId::Eq { band: EqBand::Hmf, param: EqParam::Gain })),
+                (3, T::ModRoutingDepth { routing_id: 1 }),
+                (4, T::PluginParam { device_id: 4, param_id: 7, legacy_device_index: None }),
+                (5, T::TrackBuiltin(crate::model::TrackBuiltinParam::ChainGain { chain_id: 5 })),
+            ]
+        );
+        let lead_routes: Vec<(u32, T)> = song.tracks[0].mod_routings.iter().map(|r| (r.id, r.target.clone())).collect();
+        assert_eq!(lead_routes, vec![(1, np(13, NativeParamId::Comp(CompParam::Ratio)))]);
+        assert_eq!(
+            targets(&song.tracks[1].automation_lanes),
+            vec![
+                (1, np(15, NativeParamId::On(NativeKind::Comp))),
+                (2, np(15, NativeParamId::Comp(CompParam::Threshold))),
+                (3, np(16, NativeParamId::On(NativeKind::Eq))),
+            ],
+            "GWI は Lead とは別の組み込みの id に解決する"
+        );
+        assert!(song.tracks[3].automation_lanes.is_empty(), "トラックに紛れた MasterStrip は消える");
+        assert_eq!(
+            targets(&song.song_lanes),
+            vec![
+                (1, np(21, NativeParamId::BusComp(BusCompParam::Ratio))),
+                (2, T::MasterLimiter(MasterLimiterParam::On)),
+                (3, T::MasterLimiter(MasterLimiterParam::Ceiling)),
+                (4, T::PluginParam { device_id: 12, param_id: 3, legacy_device_index: None }),
+                (6, T::ModRoutingDepth { routing_id: 3 }),
+            ]
+        );
+        assert_eq!(song.song_mod_routings[0].target, np(21, NativeParamId::BusComp(BusCompParam::Threshold)));
+
+        // next_device_id が遅れていても衝突しない。
+        let mut all = Vec::new();
+        for t in &song.tracks {
+            crate::model::for_each_node_id(&t.devices, &mut |id| all.push(id));
+        }
+        crate::model::for_each_node_id(&song.master_fx_chain, &mut |id| all.push(id));
+        let unique: std::collections::HashSet<u64> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+        assert!(song.ids.next_device_id > *all.iter().max().unwrap());
+
+        // 正規化の 2 回目で不変 / 保存 → 開き直しで等値。
+        let mut again = song.clone();
+        again.normalize_after_load();
+        assert_eq!(again, song);
+        assert!(!again.enforce_edit_invariants());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v39.daw");
+        crate::project::save(&path, &song).unwrap();
+        assert_eq!(crate::project::load_project(&path).unwrap().song, song);
+    }
+
+    /// F-C10: 混在形 (組み込みを既に持つ JSON に strip が載っている) は組み込みに合流し、キーが無い
+    /// `master_fx_chain` / `ids` は作る。migration は冪等。
+    #[test]
+    fn migration_merges_mixed_form_and_creates_missing_keys() {
+        let mut once = fixture_song_value();
+        super::migrate_strips_to_native(&mut once);
+        let snapshot = once.clone();
+        super::migrate_strips_to_native(&mut once);
+        assert_eq!(once, snapshot, "新形は触らない");
+
+        let mut mixed = snapshot.clone();
+        mixed["tracks"][0]["strip"] = serde_json::json!({"comp": {"on": false, "threshold_db": -30.0}, "eq": {"on": true}});
+        mixed["master_strip"] = serde_json::json!({"comp": {"on": false, "threshold_db": -6.0}});
+        super::migrate_strips_to_native(&mut mixed);
+        let song: Song = serde_json::from_value(mixed).expect("deserialize");
+        let lead = natives(&song.tracks[0].devices);
+        assert_eq!(lead.iter().map(|n| n.id).collect::<Vec<_>>(), vec![13, 14], "同じ組み込みに合流 (増えない)");
+        assert!(lead[0].bypassed && !lead[1].bypassed);
+        assert!(matches!(lead[0].params, NativeParams::Comp(c) if c.threshold_db == -30.0));
+        let master = natives(&song.master_fx_chain);
+        assert_eq!(master.iter().map(|n| n.id).collect::<Vec<_>>(), vec![21, 22]);
+        assert!(matches!(master[0].params, NativeParams::BusComp(b) if b.threshold_db == -6.0) && master[0].bypassed);
+
+        let mut bare = fixture_song_value();
+        let obj = bare.as_object_mut().unwrap();
+        obj.remove("master_fx_chain");
+        obj.remove("ids");
+        super::migrate_strips_to_native(&mut bare);
+        let chain = bare["master_fx_chain"].as_array().expect("master_fx_chain を作る");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(bare["ids"]["next_device_id"], 19, "master chain を消すと最大 node id は 8 → 9 から 10 個");
+    }
+
+    /// F-C11: script と同じ経路 (`migrate_legacy_song` + `from_value` + `ensure_ids`) でも同じ解決になる。
+    #[test]
+    fn script_load_path_resolves_the_same_as_file_load() {
+        let file = crate::project::load_project(fixture_path()).unwrap().song;
+        let mut value = fixture_song_value();
+        crate::project::migrate_legacy_song(&mut value);
+        crate::project::tag_clip_contents_in_song(&mut value);
+        let mut script: Song = serde_json::from_value(value).unwrap();
+        script.ensure_ids();
+        for (a, b) in script.tracks.iter().zip(&file.tracks) {
+            assert_eq!(a.devices, b.devices, "{}", a.name);
+            assert_eq!(a.mod_routings, b.mod_routings, "{}", a.name);
+        }
+        assert_eq!(script.master_fx_chain, file.master_fx_chain);
+        assert_eq!(script.master_limiter, file.master_limiter);
+        // 深さのレーンの連鎖掃除は SongDoc の口 (`enforce_edit_invariants`) が担う。
+        script.enforce_edit_invariants();
+        for (a, b) in script.tracks.iter().zip(&file.tracks) {
+            assert_eq!(targets(&a.automation_lanes), targets(&b.automation_lanes), "{}", a.name);
+        }
+        assert_eq!(targets(&script.song_lanes), targets(&file.song_lanes));
+    }
+}

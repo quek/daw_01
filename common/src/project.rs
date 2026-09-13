@@ -1532,7 +1532,10 @@ mod tests {
     fn save_and_load_default_song() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("project.daw");
-        let song = Song::default();
+        // r.md #129: 実際の曲は SongDoc の口で組み込み (master の Bus Comp / Tone EQ) が補われて
+        // いる。`Song::default()` はその前の生の値なので、正規化してから往復させる。
+        let mut song = Song::default();
+        song.normalize_native_devices();
         save(&path, &song).unwrap();
         let mut loaded = load(&path).unwrap();
         // v24: default の project_id は 0 (未採番)。save は 0 のまま書き、

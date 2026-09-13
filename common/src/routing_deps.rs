@@ -330,3 +330,81 @@ impl Song {
         changed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NativeDevice, NativeKind, Parallel, PluginInstance, Send, SendMode, Track};
+    use crate::plugin_format::PluginFormat;
+
+    fn sc_plugin(id: u64, source: TapSource, bypassed: bool) -> Device {
+        let mut p = PluginInstance::new(format!("p{id}"), PluginFormat::Clap);
+        p.id = id;
+        p.bypassed = bypassed;
+        p.aux_inputs = vec![Some(AuxInputRoute { tap: AudioTap::new(source, TapPoint::PostFader) })];
+        Device::Plugin(p)
+    }
+
+    fn comp(id: u64) -> Device {
+        Device::Native(NativeDevice::new_builtin(NativeKind::Comp, id))
+    }
+
+    /// G (group) ← A (child)、B は独立。
+    fn song(a_devices: Vec<Device>) -> Song {
+        let mut chain_holder = Parallel::new();
+        chain_holder.id = 50;
+        chain_holder.chains[0].id = 51;
+        let mut a_devices = a_devices;
+        a_devices.push(Device::Parallel(chain_holder));
+        Song {
+            tracks: vec![
+                Track { id: 1, name: "G".into(), devices: vec![comp(10)], ..Track::default() },
+                Track { id: 2, name: "A".into(), parent_group_id: Some(1), devices: a_devices, ..Track::default() },
+                Track { id: 3, name: "B".into(), devices: vec![comp(30)], ..Track::default() },
+            ],
+            ..Song::default()
+        }
+    }
+
+    /// F-C12: 循環の検出 / bypass 中の配線は Structural だけ / 自分の chain は辺にしない /
+    /// `set_aux_input` の拒否と自トラック PreFx 固定 / `can_add_send`。
+    #[test]
+    fn track_deps_detect_cycles_through_children_sidechain_and_sends() {
+        // 子 A の Comp の SC に親 G を選ぶと循環する (拒否、値は変わらない)。
+        let mut s = song(vec![comp(20)]);
+        let deps = TrackDeps::build(&s, EdgeScope::Structural);
+        assert!(deps.would_cycle(2, 1), "A が G を読むと G→A→G");
+        assert!(!deps.would_cycle(1, 3) && !deps.would_cycle(2, 3));
+        assert!(!s.set_aux_input(20, 0, Some(TapSource::Track(1))));
+        assert_eq!(s.native_by_id(20).unwrap().aux_input, None);
+        assert!(s.set_aux_input(20, 0, Some(TapSource::Track(3))), "独立トラックは配線できる");
+        assert!(s.set_aux_input(20, 0, Some(TapSource::Track(2))), "自トラック");
+        assert_eq!(s.native_by_id(20).unwrap().aux_input.unwrap().tap.tap_point, TapPoint::PreFx, "自トラックは PreFx 固定");
+        assert!(!s.set_aux_input(20, 0, Some(TapSource::Track(2))), "同じ配線は変化なし");
+        assert!(TrackDeps::build(&s, EdgeScope::Active).dependency_order().is_ok());
+
+        // bypass 中の plugin の配線 (A が G を読む) は Structural だけが数える。
+        let s = song(vec![sc_plugin(21, TapSource::Track(1), true)]);
+        assert!(TrackDeps::build(&s, EdgeScope::Active).dependency_order().is_ok());
+        assert_eq!(TrackDeps::build(&s, EdgeScope::Structural).dependency_order(), Err(DependencyCycle));
+        let mut s2 = s.clone();
+        assert!(s2.drop_cyclic_aux_routes(&[2]));
+        assert!(TrackDeps::build(&s2, EdgeScope::Structural).dependency_order().is_ok());
+
+        // 自分の chain を source にする tap は辺にしない (前 buffer の snapshot = 循環ではない)。
+        let s = song(vec![sc_plugin(22, TapSource::Chain(51), false)]);
+        let order = TrackDeps::build(&s, EdgeScope::Active).dependency_order().expect("自己 chain は循環しない");
+        assert_eq!(order.len(), 3);
+        let a = order.iter().position(|&i| i == 1).unwrap();
+        let g = order.iter().position(|&i| i == 0).unwrap();
+        assert!(a < g, "子が親より先: {order:?}");
+
+        // send: G → A は A が G に依存し、G は A (子) に依存するので循環。B → A は可。
+        let s = song(vec![]);
+        assert!(!s.can_add_send(1, 2));
+        assert!(s.can_add_send(3, 2));
+        let mut looped = s.clone();
+        looped.tracks[0].sends.push(Send { id: 1, dest_track_id: 2, gain: 1.0, mode: SendMode::PostFader, enabled: true });
+        assert_eq!(TrackDeps::build(&looped, EdgeScope::Active).dependency_order(), Err(DependencyCycle));
+    }
+}
