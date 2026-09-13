@@ -11,7 +11,7 @@ use common::protocol::{AudioCommand, ProjectKey};
 
 use super::runtime::LaunchRequest;
 use super::RowKey;
-use crate::engine::EngineCommand;
+use crate::engine::{EngineCommand, EngineCommandSender};
 
 /// この `AudioCommand` が launcher 系なら処理して `true`。
 ///
@@ -19,10 +19,7 @@ use crate::engine::EngineCommand;
 /// すべて audio thread のキューへ渡す。**グローバルローンチ量子化はここを通らない** —
 /// `Song.global_launch_quantize` が SSoT で、`LoadSong` に載って届く
 /// (値の経路を 2 本持つと、どちらが効いたか分からなくなる)。
-pub fn dispatch(
-    cmd: AudioCommand,
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
-) -> bool {
+pub fn dispatch(cmd: AudioCommand, cmd_tx: &mut EngineCommandSender) -> bool {
     let (project, req): (ProjectKey, LaunchRequest) = match cmd {
         AudioCommand::LaunchCell { project, track_id, lane_id, clip_id, pressed, immediate } => {
             (project, LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed, immediate })
@@ -46,9 +43,7 @@ pub fn dispatch(
         AudioCommand::SwitchAllToArranger { project } => (project, LaunchRequest::AllToArranger),
         _ => return false,
     };
-    // 送れなかった (= audio thread が居ない) ときは黙って捨てる — 起動直後 /
-    // 終了処理中で、そもそも鳴らす相手が居ない。
-    let _ = cmd_tx.send(EngineCommand::Launch { project, req });
+    cmd_tx.send(EngineCommand::Launch { project, req });
     true
 }
 
@@ -58,11 +53,11 @@ mod tests {
 
     #[test]
     fn 発火系の_command_は_audio_thread_へ渡る() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tx, mut rx) = EngineCommandSender::channel();
 
         // 行の宛先は安定 id で運ばれる (lane_id = 0 がトラック行)。
-        assert!(dispatch(AudioCommand::LaunchCell { project: ProjectKey(4), track_id: 3, lane_id: 0, clip_id: 9, pressed: true, immediate: false }, &tx));
-        let got = rx.try_recv().expect("audio thread へ渡る");
+        assert!(dispatch(AudioCommand::LaunchCell { project: ProjectKey(4), track_id: 3, lane_id: 0, clip_id: 9, pressed: true, immediate: false }, &mut tx));
+        let got = rx.pop().expect("audio thread へ渡る");
         match got {
             EngineCommand::Launch { project, req: LaunchRequest::Cell { key, clip_id, pressed, .. } } => {
                 assert_eq!(project, ProjectKey(4));
@@ -74,6 +69,6 @@ mod tests {
         }
 
         // launcher 以外は素通り (recv_loop の他の arm が処理する)。
-        assert!(!dispatch(AudioCommand::Play { project: ProjectKey(4) }, &tx));
+        assert!(!dispatch(AudioCommand::Play { project: ProjectKey(4) }, &mut tx));
     }
 }

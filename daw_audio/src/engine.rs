@@ -96,6 +96,52 @@ pub enum EngineCommand {
     SamplerPreviewStop,
 }
 
+/// [`EngineCommand`] の ring の深さ (人の操作速度なら RT が 1 buffer 遅れても溢れない)。
+pub const ENGINE_COMMAND_RING_CAP: usize = 512;
+
+/// recv loop → RT の [`EngineCommand`] の送り口。
+///
+/// RT 側は事前確保した rtrb の ring から値を move で取り出すだけ (確保も解放もしない)。以前の
+/// `tokio::sync::mpsc::unbounded_channel` は、受信側が読み終えたブロックを送信側の末尾へ戻せないと
+/// (予備が 3 つ連なっている等) **受信側 = RT 上で解放**していた。
+///
+/// ring が満杯の間 (RT が止まっている / park 中) は、順序を保って off-RT の backlog に溜め、次の送信か
+/// [`Self::flush`] (recv loop の housekeeping) で流す。コマンドは delta (撃つ / 離す) なので捨てない。
+pub struct EngineCommandSender {
+    tx: rtrb::Producer<EngineCommand>,
+    backlog: std::collections::VecDeque<EngineCommand>,
+}
+
+impl EngineCommandSender {
+    /// 送り口と、RT ([`DeviceRt::new`]) に渡す受け口。
+    #[must_use]
+    pub fn channel() -> (Self, rtrb::Consumer<EngineCommand>) {
+        let (tx, rx) = rtrb::RingBuffer::new(ENGINE_COMMAND_RING_CAP);
+        (Self { tx, backlog: std::collections::VecDeque::new() }, rx)
+    }
+
+    pub fn send(&mut self, cmd: EngineCommand) {
+        self.flush();
+        if !self.backlog.is_empty() {
+            self.backlog.push_back(cmd);
+            return;
+        }
+        if let Err(rtrb::PushError::Full(cmd)) = self.tx.push(cmd) {
+            self.backlog.push_back(cmd);
+        }
+    }
+
+    /// backlog を入るだけ ring へ流す (順序どおり)。
+    pub fn flush(&mut self) {
+        while let Some(cmd) = self.backlog.pop_front() {
+            if let Err(rtrb::PushError::Full(cmd)) = self.tx.push(cmd) {
+                self.backlog.push_front(cmd);
+                return;
+            }
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackCommand {
@@ -138,9 +184,13 @@ pub enum ProjectDelivery {
 /// RT は swap (move / Arc clone) だけを行う。superseded bundle は recycle ring で
 /// recv loop に返送され、`Drop` (free / shmem unmap) も off-thread で走る。
 ///
+/// **RT が読む snapshot はすべてここで届く** — RT は共有面 ([`ProjectShared`]) の `ArcSwap` を
+/// load しない (load の Guard が差し替え前の `Arc` の最終参照になり、RT で解放が起きる)。
+///
 /// **不変条件 (field を足すときは必ずどちらか決めること)**: forward ring は
 /// 両端が「最新だけ残す」 coalescing channel なので、
-/// - **snapshot** field (`song` / `tempo_map` / `plugin_refs` / `preview_sequence`) は
+/// - **snapshot** field (`song` / `tempo_map` / `plugin_refs` / `preview_sequence` / `loop_region` /
+///   `recording_lanes` / `audio_clip_renderer` / `device_scope_watch`) は
 ///   最新値が過去を包含する ⇒ そのまま最新で上書きしてよい。
 /// - **delta** field (`schedule` と、それと対の `input_delay_replacements`)
 ///   は「無い = 変更なし」を意味する ⇒ **中間 bundle を捨てるときに
@@ -184,6 +234,18 @@ pub struct RtBundle {
     pub plugin_refs: Arc<PluginRefs>,
     /// MIDI Capture の試聴シーケンス (Arc clone)。`None` = 停止。snapshot field。
     pub preview_sequence: Option<Arc<crate::sampler::PreviewSequence>>,
+    /// 再生ループの状態 (ON/OFF + 範囲、snapshot)。ループは `Song` ではなく GUI の session state が
+    /// 所有し、`AudioCommand::SetLoop` で届く。1 つの値で運ぶので buffer 内で ON/OFF と範囲が食い違わない。
+    pub loop_region: common::model::LoopRegion,
+    /// 録音中の lane (snapshot、`AudioCommand::SetRecordingLanes`)。`fill_track_param_ramps` がこの lane の
+    /// curve eval を bypass する。lane id でなく target で持つのは、GUI で lane を消してから届くまでの
+    /// race を避けるため。
+    pub recording_lanes: Arc<RecordingLanes>,
+    /// audio clip renderer (snapshot)。`ProjectShared::audio_clip_renderer` のミラーと同じ `Arc`。
+    pub audio_clip_renderer: Arc<AudioClipRenderer>,
+    /// r.md #129 §11.2: device scope (EQ Par のスペクトラム) の対象 device id を slot 順に (`0` = 空き、
+    /// snapshot、`AudioCommand::SetDeviceScopes`)。
+    pub device_scope_watch: [u64; MAX_DEVICE_SCOPES],
     /// **delta**: r.md #89 のクロス変調評価計画と、それに合わせて
     /// **off-thread で `install` 済み**の RT 状態。`None` = 据え置き。
     ///
@@ -318,6 +380,14 @@ pub struct ProjectRt {
     pub plugin_refs: Arc<PluginRefs>,
     /// MIDI Capture の試聴シーケンス (bundle 由来 Arc clone)。
     pub preview_sequence: Option<Arc<crate::sampler::PreviewSequence>>,
+    /// 再生ループの状態 (bundle 由来)。
+    pub loop_region: common::model::LoopRegion,
+    /// 録音中の lane (bundle 由来)。
+    pub recording_lanes: Arc<RecordingLanes>,
+    /// audio clip renderer (bundle 由来)。worker へは dispatch の間だけポインタで貸す。
+    pub audio_clip_renderer: Arc<AudioClipRenderer>,
+    /// device scope の対象 (bundle 由来)。
+    pub device_scope_watch: [u64; MAX_DEVICE_SCOPES],
     /// r.md #87: クリップランチャーの走行状態 (行ごとの予約 / フォローアクション /
     /// 供給元)。**`Song` には書き戻さない** — 詳細は
     /// [`crate::launcher::LauncherRuntime`] の doc。事前確保のみで RT で伸びない。
@@ -386,6 +456,8 @@ impl ProjectRt {
         // **空から始める** — 実際に要る本数は song と同じ便 (`RtBundle::scratch_growth`)
         // で届く。容量だけ予約しておき、成長便の install が再確保しないようにする。
         let scratch = Vec::with_capacity(MAX_TRACKS);
+        // off-thread で作るので共有面のミラーを読んでよい (RT に来てからは load しない)。
+        let audio_clip_renderer = shared.audio_clip_renderer.load_full();
         Self {
             key: shared.key,
             telemetry_slot: shared.telemetry_slot,
@@ -408,6 +480,10 @@ impl ProjectRt {
             tempo_map: common::tempo_map::TempoMap::from_song(&Song::default()),
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
+            loop_region: common::model::LoopRegion::default(),
+            recording_lanes: Arc::new(RecordingLanes::new()),
+            audio_clip_renderer,
+            device_scope_watch: [0; MAX_DEVICE_SCOPES],
             launcher: crate::launcher::LauncherRuntime::new(),
             mod_tick: crate::mod_tick::ModTickRunner::new(),
             follower_cols: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
@@ -455,6 +531,11 @@ impl ProjectRt {
         let old_refs = std::mem::replace(&mut self.plugin_refs, Arc::clone(&new.plugin_refs));
         let old_preview_sequence =
             std::mem::replace(&mut self.preview_sequence, new.preview_sequence.take());
+        // 旧値は `new` 側に残し、下の recycled bundle に載せる (解放は off-thread)。
+        std::mem::swap(&mut self.recording_lanes, &mut new.recording_lanes);
+        std::mem::swap(&mut self.audio_clip_renderer, &mut new.audio_clip_renderer);
+        self.loop_region = new.loop_region;
+        self.device_scope_watch = new.device_scope_watch;
 
         // r.md #89: plan / 位相表の差し替え。旧 RT 状態と旧表は recycle bundle に
         // 載せて off-thread で drop する (`ModRuntime` は `Vec` を 6 本持つ)。
@@ -572,6 +653,10 @@ impl ProjectRt {
             scratch_growth: new.scratch_growth.take(),
             plugin_refs: old_refs,
             preview_sequence: old_preview_sequence,
+            loop_region: new.loop_region,
+            recording_lanes: new.recording_lanes,
+            audio_clip_renderer: new.audio_clip_renderer,
+            device_scope_watch: new.device_scope_watch,
             mod_plan: retired_plan,
             mod_phase_table: retired_table,
         };
@@ -847,10 +932,9 @@ impl ProjectRt {
         // otherwise observe a mid-buffer flip and produce an internally
         // inconsistent buffer.
         //
-        // ループ状態は 3 値まとめて 1 回だけ copy-out する (buffer 途中で
-        // ON/OFF と範囲が食い違って見えない)。 `LoopRegion` は `Copy` なので
-        // guard は即座に落とせる = RT 上で Arc を持ち回らない。
-        let loop_region = **self.shared.loop_region.load();
+        // ループ状態は 3 値まとめた 1 つの値 (bundle 由来) を copy-out する (buffer 途中で
+        // ON/OFF と範囲が食い違って見えない)。
+        let loop_region = self.loop_region;
         let looping = loop_region.enabled;
         let metronome_enabled = self.shared.metronome_enabled.load(Ordering::Acquire);
         // r.md #87: グローバルローンチ量子化。**SSoT は `Song`** — セルの量子化が
@@ -920,12 +1004,6 @@ impl ProjectRt {
         let song_ref = song_snapshot.as_deref();
         let playhead = self.shared.playhead.load(Ordering::Acquire);
 
-        // Phase 4 Step C-2: 「現在 recording 中の lane」 を ProjectShared から
-        // 1 buffer 分の lifetime で借りる。
-        let recording_lanes_g = self.shared.recording_lanes.load();
-        let recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)> =
-            &recording_lanes_g;
-
         // Phase 5 Step 5.2: seek 検出 + playhead_beats 同期。 前 buffer 末で
         // 記録した `last_known_playhead` と current playhead を比較し、 一致
         // していなければ (= IPC SeekTo / Play edge / loop wrap / 起動直後)
@@ -946,16 +1024,6 @@ impl ProjectRt {
             // 一致する (= どこから再生しても同じ位相)。
             self.locate_mod(song_ref, playhead, sample_rate);
         }
-        // 今 buffer の effective bpm を SongTempo lane から評価する。
-        // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
-        // 当該 buffer 内では tempo 定数として扱う (= sub-buffer の tempo
-        // change は scope 外、 1 buffer = ~5..20ms なので user 体感には
-        // 影響なし)。SongTempo lane が recording 中なら curve eval を skip し
-        // `song.bpm` constant fallback を維持する (Volume / Pan と同 idiom)。
-        let tempo_recording = recording_lanes.contains(&(
-            common::model::MASTER_TRACK_ID,
-            common::model::AutomationTarget::SongTempo,
-        ));
         // r.md #89: この buffer の変調と transport は**制御グリッド**で解く。
         // `ModTickRunner` が刻み (64 サンプル、絶対位置に整列) ごとに
         // `mod_graph::tick` を回し、`next_mark` の規則で拍とテンポを進める。
@@ -974,6 +1042,18 @@ impl ProjectRt {
         if song_ref.is_some() {
             self.playhead_beats = head_mark.beat;
         }
+        // Phase 4 Step C-2: 「現在 recording 中の lane」 (bundle 由来、この buffer の間は差し替わらない)。
+        let recording_lanes: &RecordingLanes = &self.recording_lanes;
+        // 今 buffer の effective bpm を SongTempo lane から評価する。
+        // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
+        // 当該 buffer 内では tempo 定数として扱う (= sub-buffer の tempo
+        // change は scope 外、 1 buffer = ~5..20ms なので user 体感には
+        // 影響なし)。SongTempo lane が recording 中なら curve eval を skip し
+        // `song.bpm` constant fallback を維持する (Volume / Pan と同 idiom)。
+        let tempo_recording = recording_lanes.contains(&(
+            common::model::MASTER_TRACK_ID,
+            common::model::AutomationTarget::SongTempo,
+        ));
         #[allow(clippy::cast_possible_truncation)]
         let current_bpm: f32 = match song_ref {
             // Tempo lane を録音中は curve eval を skip して constant fallback。
@@ -985,10 +1065,9 @@ impl ProjectRt {
         if let Some(song) = song_ref {
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
 
-            // PR6: audio clip renderer snapshot for this buffer. Guard stays
-            // live until the end of the call so workers can safely deref it.
-            let audio_renderer_g = self.shared.audio_clip_renderer.load();
-            let audio_renderer: &AudioClipRenderer = &audio_renderer_g;
+            // PR6: audio clip renderer snapshot for this buffer (bundle 由来)。`self` が
+            // 持ち続けるので、worker が dispatch の間ポインタで読んでも生きている。
+            let audio_renderer: &AudioClipRenderer = &self.audio_clip_renderer;
 
             // r.md #87: 行ごとの時間軸を **dispatch より前に**確定させる
             // (worker はこのテーブルをポインタで読む)。予約の発火 / フォロー
@@ -1018,12 +1097,11 @@ impl ProjectRt {
 
             // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope)。scope の対象の
             // project だけが見出しを同期して scope へ書く。
-            let watch_g = ctx.device_scope.is_some().then(|| self.shared.device_scope_watch.load());
             let native_io = native_io_for_buffer(
                 self.key,
                 self.shared.sc_listen_device.load(Ordering::Acquire),
                 ctx.device_scope,
-                watch_g.as_deref().map(|w| &**w),
+                &self.device_scope_watch,
             );
 
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
@@ -1264,27 +1342,24 @@ impl ProjectRt {
     }
 }
 
-/// r.md #129: この buffer の [`NativeIo`] を組む。`device_scope` と `watch` が揃う (= scope project の
-/// live 描画) ときだけ scope を持ち、見出し表と違う slot の見出しを `(key, device id)` に書き換える
+/// r.md #129: この buffer の [`NativeIo`] を組む。`device_scope` がある (= scope project の live 描画)
+/// ときだけ scope を持ち、見出し表と違う slot の見出しを `(key, device id)` に書き換える
 /// (見出しの書き手は scope project の render だけ)。確保・ロックなし (atomic store のみ)。
 fn native_io_for_buffer<'a>(
     key: ProjectKey,
     sc_listen: u64,
     device_scope: Option<DeviceScopeCtx<'a>>,
-    watch: Option<&'a [u64; MAX_DEVICE_SCOPES]>,
+    watch: &'a [u64; MAX_DEVICE_SCOPES],
 ) -> NativeIo<'a> {
-    let scopes = match (device_scope, watch) {
-        (Some(ds), Some(watch)) => {
-            for (k, (header, &id)) in ds.headers.iter_mut().zip(watch.iter()).enumerate() {
-                if *header != (key, id) {
-                    ds.bridge.set_slot(k, key, id);
-                    *header = (key, id);
-                }
+    let scopes = device_scope.map(|ds| {
+        for (k, (header, &id)) in ds.headers.iter_mut().zip(watch.iter()).enumerate() {
+            if *header != (key, id) {
+                ds.bridge.set_slot(k, key, id);
+                *header = (key, id);
             }
-            Some(DeviceScopeTap { bridge: ds.bridge, watch })
         }
-        _ => None,
-    };
+        DeviceScopeTap { bridge: ds.bridge, watch }
+    });
     NativeIo { sc_listen, scopes }
 }
 
@@ -1307,9 +1382,9 @@ pub struct DeviceRt {
     pub project_rx: rtrb::Consumer<ProjectDelivery>,
     /// 撤去した `ProjectRt` を off-thread で drop させる口 (RT で free しない)。
     pub project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
-    /// Pending preview / launcher commands from the receive loop. Drained at the top
-    /// of every `process_buffer`.
-    pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    /// Pending preview / launcher commands from the receive loop ([`EngineCommandSender`]).
+    /// Drained at the top of every `process_buffer`.
+    pub cmd_rx: rtrb::Consumer<EngineCommand>,
     /// Resources shared with the export / notify threads.
     pub shared: Arc<EngineShared>,
     /// デバイス全体 snapshot (worker rig / sampler ring) の配送 ring 対。
@@ -1331,7 +1406,7 @@ pub struct DeviceRt {
 impl DeviceRt {
     pub fn new(
         max_frames: usize,
-        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+        cmd_rx: rtrb::Consumer<EngineCommand>,
         shared: Arc<EngineShared>,
         project_rx: rtrb::Consumer<ProjectDelivery>,
         project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
@@ -1430,7 +1505,7 @@ impl DeviceRt {
 
     /// Drain pending commands. Called at the top of `process_buffer`.
     fn pump_commands(&mut self) {
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
+        while let Ok(cmd) = self.cmd_rx.pop() {
             match cmd {
                 // r.md #87: ランチャーの操作。発火拍の解決は buffer 頭の
                 // `launcher.update` (= song snapshot が入ってから) が行う。
@@ -1580,6 +1655,40 @@ impl DeviceRt {
     }
 }
 
+#[cfg(test)]
+mod engine_command_tests {
+    use super::*;
+
+    fn preview(start: u64) -> EngineCommand {
+        EngineCommand::SamplerPreview { start, end: start + 1 }
+    }
+
+    fn start_of(cmd: EngineCommand) -> u64 {
+        match cmd {
+            EngineCommand::SamplerPreview { start, .. } => start,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// RT が止まっていて ring が溢れても、コマンドは捨てずに順序どおり届く (撃つ / 離すは delta)。
+    /// 溜めた分は次の送信を待たずに flush (housekeeping) で流れる。
+    #[test]
+    fn 溢れたコマンドは順序を保って後から届く() {
+        let (mut tx, mut rx) = EngineCommandSender::channel();
+        let total = ENGINE_COMMAND_RING_CAP as u64 + 100;
+        for i in 0..total {
+            tx.send(preview(i));
+        }
+        let mut got: Vec<u64> = std::iter::from_fn(|| rx.pop().ok()).map(start_of).collect();
+        assert_eq!(got.len(), ENGINE_COMMAND_RING_CAP, "ring に入るのは容量ぶん");
+        tx.send(preview(total));
+        tx.flush();
+        got.extend(std::iter::from_fn(|| rx.pop().ok()).map(start_of));
+        assert_eq!(got, (0..=total).collect::<Vec<_>>(), "欠けも入れ替わりも無い");
+        assert!(tx.backlog.is_empty());
+    }
+}
+
 /// D1 / plan §4: off-thread bundle publish → wait-free RT install →
 /// off-thread recycle. Verifies the audio thread picks up the newest bundle,
 /// hands the superseded one back for disposal, coalesces bursts, adopts
@@ -1655,6 +1764,10 @@ mod bundle_install_tests {
             ),
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
+            loop_region: common::model::LoopRegion::default(),
+            recording_lanes: Arc::new(RecordingLanes::new()),
+            audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
+            device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
         }
@@ -1671,6 +1784,10 @@ mod bundle_install_tests {
             scratch_growth: None,
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
+            loop_region: common::model::LoopRegion::default(),
+            recording_lanes: Arc::new(RecordingLanes::new()),
+            audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
+            device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
         }
@@ -2109,7 +2226,7 @@ mod bundle_install_tests {
             ProjectKey(5),
             9,
             Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
-            Some(&watch),
+            &watch,
         );
         assert_eq!(io.sc_listen, 9);
         assert!(io.scopes.is_some());
@@ -2125,12 +2242,12 @@ mod bundle_install_tests {
             ProjectKey(5),
             0,
             Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
-            Some(&watch),
+            &watch,
         );
         scope.write_block(2, &[0.5; 3], &[0.5; 3]);
         assert_eq!(reader.read(&scope, 2, &mut frames).map(|(_, _, o)| o.frames), Some(3));
         // scope project でなければ scope を持たない。
-        assert!(native_io_for_buffer(ProjectKey(5), 0, None, None).scopes.is_none());
+        assert!(native_io_for_buffer(ProjectKey(5), 0, None, &watch).scopes.is_none());
     }
 
     /// T12: GR 面の publish と device scope の見出し同期は RT で確保しない。
@@ -2156,7 +2273,7 @@ mod bundle_install_tests {
                     ProjectKey(1),
                     11,
                     Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
-                    Some(watch),
+                    watch,
                 );
                 assert!(io.scopes.is_some());
             }
@@ -2193,7 +2310,7 @@ mod multi_project_tests {
 
     fn rig(tag: &str) -> Rig {
         let engine = Arc::new(EngineShared::new());
-        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = EngineCommandSender::channel();
         let (project_tx, project_rx) = rtrb::RingBuffer::new(8);
         let (project_recycle_tx, project_recycle_rx) = rtrb::RingBuffer::new(8);
         let (device_tx, device_rx) = rtrb::RingBuffer::new(4);
@@ -2274,6 +2391,10 @@ mod multi_project_tests {
             ),
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
+            loop_region: common::model::LoopRegion::default(),
+            recording_lanes: Arc::new(RecordingLanes::new()),
+            audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
+            device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
         }

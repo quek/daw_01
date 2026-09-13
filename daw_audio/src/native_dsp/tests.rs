@@ -236,6 +236,53 @@ fn master_limiter_never_exceeds_the_ceiling() {
     assert_eq!(&r[look..], &quiet.r[..quiet.r.len() - look]);
 }
 
+/// §12.2: 上流が非有限のサンプル (±inf / NaN) を 1 サンプル出しても、Limiter の状態は固着しない。
+/// 以後の出力は全サンプル有限で ceiling を超えず、ceiling 以下の音に戻れば遅延だけの素通しに戻る
+/// (live と書き出しは同じ `process` を通るので、これ 1 本で両方を覆う)。
+#[test]
+fn master_limiter_contains_a_non_finite_sample() {
+    let look = common::model::limiter_lookahead_samples(SR) as usize;
+    let block = 256;
+    let s = MasterLimiterSettings { on: true, ceiling_db: -1.0 };
+    let ceiling_amp = common::dsp::db_to_amp(s.ceiling_db);
+    for poison in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        for (poison_l, poison_r) in [(true, false), (false, true), (true, true)] {
+            let label = format!("{poison} L={poison_l} R={poison_r}");
+            let mut st = MasterLimiterState::new();
+            // 潰している最中 (+6 dB) に 1 サンプルだけ非有限。
+            for b in 0..20 {
+                let (mut l, mut r) = (vec![2.0f32; block], vec![-2.0f32; block]);
+                if b == 3 {
+                    if poison_l {
+                        l[17] = poison;
+                    }
+                    if poison_r {
+                        r[17] = poison;
+                    }
+                }
+                st.process(&s, true, &mut l, &mut r, block, SR as f32);
+                assert!(
+                    l.iter().chain(&r).all(|v| v.is_finite() && v.abs() <= ceiling_amp),
+                    "{label} block {b}: 出力が非有限か ceiling 超え"
+                );
+                assert!(st.gain_reduction_db().is_finite() && st.gain_reduction_db() <= 0.0, "{label} block {b}");
+            }
+            // ceiling 以下に戻ってリリースし終えたら、遅延だけの素通し (無音にも NaN にも固着しない)。
+            let quiet: Vec<f32> = (0..block * 400).map(|i| 0.25 * ((i as f32) * 0.01).sin()).collect();
+            let (mut l, mut r) = (quiet.clone(), quiet.clone());
+            for (cl, cr) in l.chunks_mut(block).zip(r.chunks_mut(block)) {
+                st.process(&s, true, cl, cr, block, SR as f32);
+            }
+            assert_eq!(st.gain_reduction_db(), 0.0, "{label}: リリースし終えている");
+            let tail = quiet.len() - block * 8;
+            for i in tail..quiet.len() {
+                assert!((l[i] - quiet[i - look]).abs() <= 1e-6, "{label} sample {i}: {} != {}", l[i], quiet[i - look]);
+                assert!((r[i] - quiet[i - look]).abs() <= 1e-6, "{label} sample {i}");
+            }
+        }
+    }
+}
+
 /// T12: Limiter (先読みリング / 窓内最小値の deque / 移動平均) は RT で確保しない。SR の変更・OFF の区間・
 /// reset も含めて回す。
 #[cfg(feature = "rt-assert")]

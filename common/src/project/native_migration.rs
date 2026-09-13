@@ -33,7 +33,9 @@ pub(crate) fn migrate_strips_to_native(song: &mut Value) {
             migrate_strips_in_track_value(track, &mut next);
         }
     }
-    migrate_master_strip(obj, &mut next);
+    if master_has_legacy_strips(obj) {
+        migrate_master_strip(obj, &mut next);
+    }
     let ids = obj.entry("ids").or_insert_with(|| Value::Object(Map::new()));
     if let Some(ids) = ids.as_object_mut() {
         ids.insert("next_device_id".to_string(), Value::from(next));
@@ -45,37 +47,35 @@ pub(crate) fn migrate_strips_to_native(song: &mut Value) {
 ///
 /// 旧形の印が無いトラック (新形式 / strip 導入前) には何もしない — `strip` キーの不在を
 /// 「既定値の strip」と読むと、新形式の組み込みの値を既定値 + bypass で上書きしてしまう。
-/// 組み込みの補充はその場合 `normalize_native_devices` が担う。
+/// 組み込みの補充はその場合 `normalize_native_devices` が担う。同じ理由で、節 (`comp` / `eq`) が
+/// 無い組み込みの値は触らない (旧 target しか無いトラックは target の書き換えだけになる)。
 pub fn migrate_strips_in_track_value(track: &mut Value, next_id: &mut u64) {
     if !track_has_legacy_strips(track) {
         return;
     }
     let Some(t) = track.as_object_mut() else { return };
     let strip = t.remove("strip").unwrap_or(Value::Null);
-    let (comp, comp_bypassed) = take_section_on(strip.get("comp"));
-    let (eq, eq_bypassed) = take_section_on(strip.get("eq"));
     let devices = t.entry("devices").or_insert_with(|| Value::Array(Vec::new()));
     let Some(devices) = devices.as_array_mut() else { return };
-    let comp_id = install_builtin(devices, "Comp", comp, comp_bypassed, None, next_id);
-    let eq_id = install_builtin(devices, "Eq", eq, eq_bypassed, None, next_id);
+    let comp_id = install_builtin(devices, "Comp", take_section(strip.get("comp")), None, next_id);
+    let eq_id = install_builtin(devices, "Eq", take_section(strip.get("eq")), None, next_id);
     for key in ["automation_lanes", "mod_routings"] {
         rewrite_targets(t.get_mut(key), |target| legacy_track_target(target, comp_id, eq_id));
     }
 }
 
 /// master: `master_strip.limiter` → `master_limiter`、comp / eq → `master_fx_chain` 先頭の組み込み
-/// Bus Comp / Tone EQ、song store の target 書き換え。
+/// Bus Comp / Tone EQ、song store の target 書き換え。master に旧形の印があるときだけ呼ぶ
+/// (トラックと同じ規則。節の無い組み込みの値は触らない)。
 fn migrate_master_strip(song: &mut Map<String, Value>, next: &mut u64) {
     let strip = song.remove("master_strip").unwrap_or(Value::Null);
     if let Some(limiter) = strip.get("limiter") {
         song.insert("master_limiter".to_string(), limiter.clone());
     }
-    let (bus, bus_bypassed) = take_section_on(strip.get("comp"));
-    let (tone, tone_bypassed) = take_section_on(strip.get("eq"));
     let chain = song.entry("master_fx_chain").or_insert_with(|| Value::Array(Vec::new()));
     let Some(chain) = chain.as_array_mut() else { return };
-    let bus_id = install_builtin(chain, "BusComp", bus, bus_bypassed, Some(0), next);
-    let tone_id = install_builtin(chain, "ToneEq", tone, tone_bypassed, Some(1), next);
+    let bus_id = install_builtin(chain, "BusComp", take_section(strip.get("comp")), Some(0), next);
+    let tone_id = install_builtin(chain, "ToneEq", take_section(strip.get("eq")), Some(1), next);
     for key in ["song_lanes", "song_mod_routings"] {
         rewrite_targets(song.get_mut(key), |target| legacy_master_target(target, bus_id, tone_id));
     }
@@ -84,9 +84,12 @@ fn migrate_master_strip(song: &mut Map<String, Value>, next: &mut u64) {
 /// song に旧形の印が 1 つでもあるか。
 fn has_legacy_strips(song: &Value) -> bool {
     let tracks = song.get("tracks").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    song.get("master_strip").is_some()
-        || tracks.iter().any(track_has_legacy_strips)
-        || has_legacy_targets([song.get("song_lanes"), song.get("song_mod_routings")])
+    tracks.iter().any(track_has_legacy_strips) || song.as_object().is_some_and(master_has_legacy_strips)
+}
+
+/// master に旧形の印 (`master_strip` キー / song store の旧形の target) があるか。
+fn master_has_legacy_strips(song: &Map<String, Value>) -> bool {
+    song.get("master_strip").is_some() || has_legacy_targets([song.get("song_lanes"), song.get("song_mod_routings")])
 }
 
 /// トラック 1 本に旧形の印 (`strip` キー / 旧形の target) があるか。
@@ -139,18 +142,24 @@ fn max_node_id(song: &Map<String, Value>) -> u64 {
     max
 }
 
-/// 旧セクション (comp / eq) から `on` を抜き、`(params 本体, bypassed = !on)` を返す。
-/// セクションが無ければ既定値 (`{}` + bypass = 旧既定 `on: false` と同じ音)。
-fn take_section_on(section: Option<&Value>) -> (Value, bool) {
-    let mut body = section.and_then(Value::as_object).cloned().unwrap_or_default();
-    let on = body.remove("on").and_then(|v| v.as_bool()).unwrap_or(false);
-    body.remove("sc_listen");
-    (Value::Object(body), !on)
+/// 旧セクション (comp / eq) の値。`params` は `on` / `sc_listen` を抜いた本体、`bypassed = !on`。
+struct Section {
+    params: Value,
+    bypassed: bool,
 }
 
-/// 最上位の同じ種類の組み込みに値を上書き (混在形) するか、無ければ `at` (None = 末尾) に作る。
-/// 戻り値 = その組み込みの device id。
-fn install_builtin(devices: &mut Vec<Value>, kind: &str, params: Value, bypassed: bool, at: Option<usize>, next: &mut u64) -> u64 {
+/// 旧セクションを取り出す。セクションが無ければ `None` (値の情報が無い)。
+fn take_section(section: Option<&Value>) -> Option<Section> {
+    let mut body = section?.as_object()?.clone();
+    let on = body.remove("on").and_then(|v| v.as_bool()).unwrap_or(false);
+    body.remove("sc_listen");
+    Some(Section { params: Value::Object(body), bypassed: !on })
+}
+
+/// 最上位の同じ種類の組み込みを使う (混在形)。`section` があればその値と ON/OFF で上書きし、無ければ
+/// 値に触らず id だけを返す。組み込みが無ければ `at` (None = 末尾) に作る (節が無ければ既定値 + bypass
+/// = 旧既定 `on: false` と同じ音)。戻り値 = その組み込みの device id。
+fn install_builtin(devices: &mut Vec<Value>, kind: &str, section: Option<Section>, at: Option<usize>, next: &mut u64) -> u64 {
     let existing = devices.iter_mut().filter_map(|d| d.get_mut("Native")).find(|n| {
         n.get("builtin").and_then(Value::as_bool) == Some(true)
             && n.get("params").and_then(Value::as_object).is_some_and(|p| p.contains_key(kind))
@@ -161,11 +170,14 @@ fn install_builtin(devices: &mut Vec<Value>, kind: &str, params: Value, bypassed
             _ => alloc(next),
         };
         native.insert("id".to_string(), Value::from(id));
-        native.insert("params".to_string(), json!({ kind: params }));
-        native.insert("bypassed".to_string(), Value::Bool(bypassed));
+        if let Some(Section { params, bypassed }) = section {
+            native.insert("params".to_string(), json!({ kind: params }));
+            native.insert("bypassed".to_string(), Value::Bool(bypassed));
+        }
         return id;
     }
     let id = alloc(next);
+    let Section { params, bypassed } = section.unwrap_or(Section { params: json!({}), bypassed: true });
     let dev = json!({"Native": {"id": id, "builtin": true, "ordinal": 1, "bypassed": bypassed, "params": {kind: params}}});
     let at = at.map_or(devices.len(), |i| i.min(devices.len()));
     devices.insert(at, dev);
@@ -409,6 +421,56 @@ mod tests {
         let chain = bare["master_fx_chain"].as_array().expect("master_fx_chain を作る");
         assert_eq!(chain.len(), 2);
         assert_eq!(bare["ids"]["next_device_id"], 19, "master chain を消すと最大 node id は 8 → 9 から 10 個");
+    }
+
+    /// 旧形の印の一部だけが混ざった新形式 JSON: 印を持たない置き場 (master / トラック) と、節 (`comp` /
+    /// `eq`) が無い組み込みの値と ON/OFF は触らない。旧 target しか無ければ既存の組み込みの id へ
+    /// target だけを書き換える。
+    #[test]
+    fn partial_legacy_marks_keep_new_form_builtin_values() {
+        let mut new_form = fixture_song_value();
+        super::migrate_strips_to_native(&mut new_form);
+        let base: Song = serde_json::from_value(new_form.clone()).expect("deserialize");
+        let natives_of = |song: &Song| {
+            (song.tracks.iter().map(|t| natives(&t.devices)).collect::<Vec<_>>(), natives(&song.master_fx_chain))
+        };
+        let (base_tracks, base_master) = natives_of(&base);
+        assert!(base_master.iter().all(|n| !n.bypassed), "前提: master の組み込みは ON で値がある");
+        assert!(!base_tracks[0][0].bypassed, "前提: Lead の Comp は ON");
+
+        // (1) トラックに旧 lane だけ (strip キー無し)。master には印が無い。
+        let mut lanes_only = new_form.clone();
+        let mut lane = lanes_only["tracks"][0]["automation_lanes"][0].clone();
+        lane["id"] = serde_json::json!(90);
+        lane["target"] = serde_json::json!({"TrackBuiltin": "StripCompOn"});
+        lanes_only["tracks"][0]["automation_lanes"].as_array_mut().unwrap().push(lane);
+        super::migrate_strips_to_native(&mut lanes_only);
+        let song: Song = serde_json::from_value(lanes_only).expect("deserialize");
+        assert_eq!(natives_of(&song), (base_tracks.clone(), base_master.clone()), "値も ON/OFF も id も変わらない");
+        let comp_id = base_tracks[0][0].id;
+        assert_eq!(
+            song.tracks[0].automation_lanes.iter().find(|l| l.id == 90).map(|l| l.target.clone()),
+            Some(np(comp_id, NativeParamId::On(NativeKind::Comp))),
+            "既存の組み込み Comp の id に書き換わる"
+        );
+
+        // (2) master_strip は limiter の節だけ: Limiter は移し、Bus Comp / Tone EQ は触らない。
+        let mut limiter_only = new_form.clone();
+        limiter_only["master_strip"] = serde_json::json!({"limiter": {"on": true, "ceiling_db": -3.0}});
+        super::migrate_strips_to_native(&mut limiter_only);
+        let song: Song = serde_json::from_value(limiter_only).expect("deserialize");
+        assert_eq!(natives_of(&song), (base_tracks.clone(), base_master.clone()));
+        assert!(song.master_limiter.on && song.master_limiter.ceiling_db == -3.0);
+
+        // (3) strip の節が comp だけ: Comp は上書き、EQ は触らない。
+        let mut comp_only = new_form;
+        comp_only["tracks"][0]["strip"] = serde_json::json!({"comp": {"on": false, "threshold_db": -30.0}});
+        super::migrate_strips_to_native(&mut comp_only);
+        let song: Song = serde_json::from_value(comp_only).expect("deserialize");
+        let (tracks, master) = natives_of(&song);
+        assert!(tracks[0][0].bypassed && matches!(tracks[0][0].params, NativeParams::Comp(c) if c.threshold_db == -30.0));
+        assert_eq!(tracks[0][1], base_tracks[0][1], "節の無い EQ は値も ON/OFF もそのまま");
+        assert_eq!((&tracks[1..], master), (&base_tracks[1..], base_master));
     }
 
     /// F-C11: script と同じ経路 (`migrate_legacy_song` + `from_value` + `ensure_ids`) でも同じ解決になる。
