@@ -721,15 +721,17 @@ record WIRE-SOURCES firstfield "bincode の Encode を持つのに common/build.
 # 15. RT 経路の ArcSwap load (不変条件 4、r.md #129)。`load()` の Guard も `load_full()` の Arc も、書き手が
 #     同時に store すると **RT が旧値の最終参照になって RT で解放が起きる** (arc-swap の hybrid 戦略:
 #     writer が debt を払うと `HybridProtection::drop` が自分で drop する)。RT が読む snapshot は
-#     `ProjectCtl::snapshot_bundle` が集めて rtrb の便 (`RtBundle` / `DeviceBundle`) で渡し、旧値は
-#     recycle ring で off-thread に返す (`engine_shared.rs` の `ProjectShared` doc)。
-#     走査の範囲は check 1 と同じ作法: daw_audio/src 全体を RT 側とみなし、off-RT の読み出し (recv loop /
-#     notify thread / 書き出しの走査 / RT へ送る前の組み立て / テスト) は同一行に
-#     「arch-lint: allow-arcswap-load (理由)」を付けて明示する。ファイル単位では除外しない —
-#     main.rs は notify thread と CPAL callback が、engine.rs は off-thread の構築と RT 本体が同居している。
-hits=$(grep -rnE "$ARCSWAP_LOAD_RE" --include='*.rs' daw_audio/src 2>/dev/null \
+#     daw_audio では `ProjectCtl::snapshot_bundle` が集めて rtrb の便 (`RtBundle` / `DeviceBundle`) で渡し、
+#     daw_plugin_host の worker pool では registry の snapshot を worker ごとの受け口に置く
+#     (`process_server.rs` の `PluginRegistry` / `RegistryInbox`)。どちらも旧値は recycle ring で off-thread に返す。
+#     走査の範囲は check 1 と同じ作法: daw_audio/src と daw_plugin_host/src 全体を RT 側とみなし、off-RT の
+#     読み出し (recv loop / notify thread / 書き出しの走査 / RT へ送る前の組み立て / テスト) と、書き手が
+#     quiesce 付きで回収する契約を持つ RT の読み出しは、同一行に「arch-lint: allow-arcswap-load (理由)」を
+#     付けて明示する。ファイル単位では除外しない — main.rs は notify thread と CPAL callback が、engine.rs は
+#     off-thread の構築と RT 本体が同居している。
+hits=$(grep -rnE "$ARCSWAP_LOAD_RE" --include='*.rs' daw_audio/src daw_plugin_host/src 2>/dev/null \
     | strip_allowed arcswap-load | strip_comments || true)
-record RT-ARCSWAP-LOAD grep "daw_audio の RT 側で ArcSwap を load。RT は rtrb の便 (RtBundle / DeviceBundle) の snapshot を読む (off-RT なら同一行に allow マーカーと理由):" "$hits"
+record RT-ARCSWAP-LOAD grep "RT 側 (daw_audio / daw_plugin_host) で ArcSwap を load。RT は rtrb の便 / registry の受け口の snapshot を読む (off-RT なら同一行に allow マーカーと理由):" "$hits"
 
 # ---------------------------------------------------------------- 判定
 # 「検査器が実際に何を見たか」を毎回可視化する (出力が空 = 違反ゼロ、を信じないための土台)。

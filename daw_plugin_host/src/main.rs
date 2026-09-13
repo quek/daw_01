@@ -682,7 +682,7 @@ struct PluginHost {
     next_shmem_incarnation: u64,
     /// **唯一の bookkeeping** (v29): 安定 device → record。
     instances: HashMap<DeviceAddr, InstanceRecord>,
-    /// worker pool が dispatch 中に読む lock-free registry。
+    /// worker pool が dispatch 中に読む registry の正本 (worker へは snapshot の受け渡しで届く)。
     registry: PluginRegistry,
     worker_pool: Option<process_server::WorkerPool>,
     /// 開いているプロジェクト (= タブ) の帳簿。instance は `DeviceAddr.project` で
@@ -703,7 +703,7 @@ impl PluginHost {
             pid: std::process::id(),
             next_shmem_incarnation: 0,
             instances: HashMap::new(),
-            registry: Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new())),
+            registry: PluginRegistry::default(),
             worker_pool: None,
             projects: HashMap::new(),
         }
@@ -901,7 +901,7 @@ impl PluginHost {
                     &self.session.metrics_shmem_id,
                     &wake_event_names,
                     &done_event_names,
-                    Arc::clone(&self.registry),
+                    &self.registry,
                     self.evt_tx.clone(),
                 ) {
                     Ok(pool) => self.worker_pool = Some(pool),
@@ -2402,9 +2402,9 @@ mod tests {
         let ta = host.instances[&a].token;
         let tb = host.instances[&b].token;
         assert_ne!(ta, tb, "token はプロセス内で一意");
-        assert_eq!(host.registry.load().len(), 2);
-        assert_eq!(host.registry.load()[&ta].device, a);
-        assert_eq!(host.registry.load()[&tb].device, b);
+        assert_eq!(host.registry.snapshot().len(), 2);
+        assert_eq!(host.registry.snapshot()[&ta].device, a);
+        assert_eq!(host.registry.snapshot()[&tb].device, b);
 
         let mut loaded = Vec::new();
         while let Ok(ev) = evt_rx.try_recv() {
@@ -2417,8 +2417,8 @@ mod tests {
         host.handle_command(PluginCommand::UnloadProject { project: ProjectKey(1) });
         assert_eq!(host.instances.len(), 1);
         assert!(host.instances.contains_key(&b));
-        assert_eq!(host.registry.load().len(), 1);
-        assert!(host.registry.load().contains_key(&tb));
+        assert_eq!(host.registry.snapshot().len(), 1);
+        assert!(host.registry.snapshot().contains_key(&tb));
         let mut unloaded = Vec::new();
         while let Ok(ev) = evt_rx.try_recv() {
             if let PluginEvent::SlotPluginUnloaded { device } = ev {
@@ -2454,7 +2454,7 @@ mod tests {
             }
         }
         assert_eq!(done, Some(Some(ProjectKey(1))));
-        assert_eq!(host.registry.load().len(), 2, "他 project の entry が registry から消えない");
+        assert_eq!(host.registry.snapshot().len(), 2, "他 project の entry が registry から消えない");
         host.shutdown();
     }
 
