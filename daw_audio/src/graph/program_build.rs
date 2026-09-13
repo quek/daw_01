@@ -7,7 +7,9 @@ use common::model::{Device, TapPoint, TapSource};
 
 use super::compile::DeviceLatencies;
 use super::delay_line::DelayLine;
+use super::native::NativeScratch;
 use super::program::{ChainOp, ChainProgram, ChainScratch, ParallelScratch};
+use crate::mixer::MAX_FRAMES;
 
 /// chain の tap 点ごとの **track chain 起点からの相対 latency** (samples)。
 /// sidechain / follower の source latency 計算に使う。
@@ -30,6 +32,9 @@ pub struct BuiltProgram {
     pub chain_latency: HashMap<u64, ChainLatency>,
     /// chain id → slot 情報 (tap の `BufRef` 解決用)。
     pub chain_slots: HashMap<u64, ChainSlot>,
+    /// r.md #129: 内蔵 device id → `ChainProgram::natives` の slot。op が出た device だけが載る
+    /// (bypass 中の Parallel の中の native には op も slot も無い) ので、SC の tap を出せるかの判定にも使う。
+    pub native_slots: HashMap<u64, u32>,
 }
 
 /// chain の program 内の位置。 `output` = r.md #112 `Split` でこの chain が受ける出力番号
@@ -82,12 +87,14 @@ pub fn build_program(
     let mut program = ChainProgram::empty(track_id);
     let mut chain_latency: HashMap<u64, ChainLatency> = HashMap::new();
     let mut chain_slots: HashMap<u64, ChainSlot> = HashMap::new();
+    let mut native_slots: HashMap<u64, u32> = HashMap::new();
     let mut b = Builder {
         program: &mut program,
         latencies,
         taps,
         chain_latency: &mut chain_latency,
         chain_slots: &mut chain_slots,
+        native_slots: &mut native_slots,
     };
     let mut acc = 0u32;
     let mut pass1_end: Option<usize> = None;
@@ -99,11 +106,17 @@ pub fn build_program(
     }
     let len = program.ops.len();
     program.pass1_end = pass1_end.unwrap_or(len).min(len);
+    // crossfade の dry 退避は内蔵 device が 1 つでもあるときだけ (op は直列なので 1 組)。
+    if !program.natives.is_empty() {
+        program.native_dry_l = vec![0.0; MAX_FRAMES];
+        program.native_dry_r = vec![0.0; MAX_FRAMES];
+    }
     BuiltProgram {
         program,
         latency: acc,
         chain_latency,
         chain_slots,
+        native_slots,
     }
 }
 
@@ -113,6 +126,7 @@ struct Builder<'a> {
     taps: &'a HashSet<(u64, TapPoint)>,
     chain_latency: &'a mut HashMap<u64, ChainLatency>,
     chain_slots: &'a mut HashMap<u64, ChainSlot>,
+    native_slots: &'a mut HashMap<u64, u32>,
 }
 
 impl Builder<'_> {
@@ -142,9 +156,18 @@ impl Builder<'_> {
                 });
                 self.latencies.get(&p.id).copied().unwrap_or(0)
             }
-            // r.md #129: 内蔵 device の op (`ChainOp::Native`) は engine 側の実装 (§8.3.1) で出す。
-            // それまでは素通し (op を出さない) で、遅延は 0。
-            Device::Native(_) => 0,
+            // r.md #129: 内蔵 device。bypass 中でも op を出す (実効 ON/OFF は RT が block 頭で解決し、
+            // 切り替えは crossfade)。未採番 (id 0) は引き当てられないので出さない。遅延は 0。
+            Device::Native(nd) => {
+                if nd.id == 0 {
+                    return 0;
+                }
+                let native_slot = self.program.natives.len() as u32;
+                self.program.natives.push(NativeScratch::new(nd, self.program.track_id));
+                self.program.ops.push(ChainOp::Native { device_id: nd.id, native_slot });
+                self.native_slots.insert(nd.id, native_slot);
+                0
+            }
             Device::Parallel(r) => {
                 // chain を全部消した Parallel は Live / Bitwig と同じく素通し (op を出さない =
                 // 何も無いのと同じ)。 bypass も同じ。
@@ -262,6 +285,7 @@ mod tests {
                     None => format!("CE{chain_slot}"),
                 },
                 ChainOp::ParallelEnd { parallel_slot, .. } => format!("RE{parallel_slot}"),
+                ChainOp::Native { device_id, .. } => format!("N{device_id}"),
             })
             .collect()
     }

@@ -18,6 +18,7 @@ mod delay_line;
 pub mod execute;
 pub mod follower;
 mod mix;
+pub mod native;
 mod port_buffer;
 pub mod program;
 mod program_build;
@@ -34,6 +35,7 @@ pub use execute::{
     render_master_buffer, set_pd_transport,
 };
 pub use follower::FollowerSlot;
+pub use native::{DeviceScopeTap, NativeIo};
 pub use port_buffer::{PortBuffer, PortBufferPool};
 pub use program::{ChainOp, ChainProgram, ProgramCtx, run_chain_program};
 pub use program_build::{build_program, program_latency};

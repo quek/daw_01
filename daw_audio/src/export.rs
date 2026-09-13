@@ -491,6 +491,9 @@ fn render_loop(
     let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
     let mut master_l: Vec<f32> = vec![0.0; max_frames];
     let mut master_r: Vec<f32> = vec![0.0; max_frames];
+    // r.md #129: master Limiter の状態は **書き出しごとに新品** (= 決定論的)。内蔵 device の状態も
+    // この走査で compile する schedule の新品の scratch に居る (live の `adopt_state_from` を通らない)。
+    let mut master_limiter = crate::native_dsp::MasterLimiterState::new();
     let scratch = &mut scratch[..];
     let master_l = &mut master_l[..];
     let master_r = &mut master_r[..];
@@ -783,6 +786,10 @@ fn render_loop(
             mod_tick.follower_drive(&follower_cols, playhead),
             launcher.rows(),
             master_gain,
+            &mut master_limiter,
+            // r.md #129: 書き出しは「聴き方・見方」を持たない = SC Listen の音も device scope への
+            // 書き込みも WAV に乗らない (構造的な保証)。
+            crate::graph::NativeIo::default(),
         );
 
         // docs/plan_modulation.md §7: record this buffer's modulator values

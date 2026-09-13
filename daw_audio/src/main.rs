@@ -41,6 +41,7 @@ mod metronome;
 mod mixer;
 mod mod_plan_publish;
 mod mod_tick;
+mod native_dsp;
 mod offline_jobs;
 mod project_ctl;
 mod sampler;
@@ -109,6 +110,13 @@ async fn main() -> Result<()> {
             .context("failed to open scope shmem")?,
     );
     scope.set_sample_rate(session.sample_rate);
+    // r.md #129 §11.2: device 単位のサンプルリング (EQ Par のスペクトラム)。GUI が create したものを open し、
+    // scope project の対象 device の出力を毎バッファ書き込む。
+    let device_scope = Arc::new(
+        common::device_scope_bridge::DeviceScopeBridgeHandle::open(&session.device_scope_shmem_id)
+            .context("failed to open device scope shmem")?,
+    );
+    device_scope.set_sample_rate(session.sample_rate);
 
     let shared = Arc::new(SharedState::new());
     // Engine resources shared between the CPAL closure, the export thread and
@@ -138,6 +146,7 @@ async fn main() -> Result<()> {
         Arc::clone(&bridge),
         Arc::clone(&metrics),
         Arc::clone(&scope),
+        Arc::clone(&device_scope),
         session.sample_rate,
         cmd_rx,
         project_rx,
@@ -876,6 +885,7 @@ fn start_output_stream(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     scope: Arc<ScopeBridgeHandle>,
+    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     project_rx: rtrb::Consumer<ProjectDelivery>,
@@ -930,6 +940,7 @@ fn start_output_stream(
         bridge,
         metrics,
         scope,
+        device_scope,
         session_sample_rate,
         local,
     )?;
@@ -946,6 +957,7 @@ fn build_stream(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     scope: Arc<ScopeBridgeHandle>,
+    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
     // `DeviceRt` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-project scratch — pre-allocated, never
@@ -1011,7 +1023,7 @@ fn build_stream(
                 let cb_start = std::time::Instant::now();
                 let frames = (data.len() / channels_usize).min(max_frames);
 
-                local.process_buffer(&shared, &bridge, &scope, session_sample_rate, frames);
+                local.process_buffer(&shared, &bridge, &scope, &device_scope, session_sample_rate, frames);
 
                 // consume the panic edge to (re)start the master
                 // declick envelope at sample 0 of this buffer.

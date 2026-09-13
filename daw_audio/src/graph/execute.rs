@@ -3,10 +3,12 @@
 //!
 //! [`render_master_buffer`] が「1 buffer を master へ描く」単一経路:
 //! worker dispatch (per-track pass 1) → schedule 実行 (group mix / PDC /
-//! send / sidechain / follower) → master fx chain → master gain。
+//! send / sidechain / follower) → master fx chain (組み込み Bus Comp / Tone EQ を含む) →
+//! master gain → master limiter。
 //! **live (CPAL callback) と offline export (freewheel) の両方がこれを呼ぶ**
 //! ので、master に挿した limiter が WAV に乗らない類の live/export 乖離が
-//! 構造的に起きない。metronome / panic declick 等 monitoring 専用の処理は
+//! 構造的に起きない。違うのは「聴き方・見方」の [`NativeIo`] (SC Listen / device scope) だけで、
+//! export は既定値を渡す。metronome / panic declick 等 monitoring 専用の処理は
 //! live 側 (engine.rs / main.rs) にだけ残る。
 //!
 //! RT 規約: この module の関数はすべて audio callback / audio worker /
@@ -25,13 +27,15 @@ use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::engine::{MAX_TRACKS, PluginEntry, PluginRefs, SyncSlot, WorkerRig};
 use crate::graph::mix::{
     has_soloed_contributor, mix_into_master, mix_into_track_scratch, mix_send_into_track_scratch,
-    resolve_tap_buffers, track_needs_prefader_snapshot, track_needs_prefx_snapshot,
+    resolve_tap_buffers,
 };
+use crate::graph::native::{NativeIo, apply_listen_override, stage_native_sidechain};
 use crate::graph::{BufRef, ChainProgram, NodeOp, ProgramCtx, Schedule, run_chain_program};
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
 use crate::mod_tick::FollowerDrive;
 use crate::mixer::{TrackScratch, apply_strip};
+use crate::native_dsp::MasterLimiterState;
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
 
 /// この device / pair が dispatch 可能かどうか (quarantine / poison gate)。
@@ -166,8 +170,13 @@ pub fn process_track_owned(
     // ループ端での buffer 分割は `crate::launcher::render` が持つ。
     // 空 (`TrackRows::default()`) で全部アレンジ = 従来の挙動。
     rows: TrackRows<'_>,
+    // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+    native_io: NativeIo<'_>,
 ) {
     let n = frames as usize;
+    // r.md #129: SC Listen の置換要求は program の実行開始時に消す (GWI は pass 1 の開始 = ここ。
+    // pass 2 の `run_group_fx_chain` は prefix で立った要求を PostFx 点で消費する)。
+    program.listen_pending = None;
 
     // Tracks that have children (i.e. behave as a "group" / folder)
     // are handled by the post-dispatch schedule walk: the children's
@@ -268,8 +277,6 @@ pub fn process_track_owned(
         );
     }
 
-    let track_id = song_track.id;
-
     // ---- Track audio output (cleared every buffer) ----
     // 毎 buffer ゼロから組み立てる。直後に audio clip を加算し、その後 device chain が
     // port 構成に従って audio を上書き / 加算していく。
@@ -319,16 +326,16 @@ pub fn process_track_owned(
     // group-with-instrument prefix (`skip_strip`) the meaningful pre-FX tap is
     // the summed bus before the suffix FX, captured in pass 2
     // (`run_group_fx_chain`), so skip the pass-1 capture here.
-    let captured_prefx = !skip_strip
-        && (scratch.force_prefx_snapshot
-            || song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)));
+    // r.md #129 §18-B: 「誰かが読むか」は compile 時に焼いた値 (RT で Song を歩かない)。
+    let captured_prefx = !skip_strip && (scratch.force_prefx_snapshot || program.snapshot_pre_fx);
     if captured_prefx {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
+    let snapshot_post_fx = program.snapshot_post_fx;
 
     // ---- device chain (r.md #110: 展開済み program を 1 本の walker で走らせる) ----
-    // port 直結規則 / Parallel の fork-join は `run_chain_program` (`program.rs`)。
+    // port 直結規則 / Parallel の fork-join / 内蔵 device は `run_chain_program` (`program.rs`)。
     // group-with-instrument は instrument prefix `[0..pass1_end]` だけ (残りは pass 2)。
     let ctx = ProgramCtx {
         song,
@@ -344,6 +351,9 @@ pub fn process_track_owned(
         mod_plane,
         rows,
         own_pre_fx: captured_prefx.then_some((&scratch.pre_fx_l[..], &scratch.pre_fx_r[..])),
+        native: native_io,
+        owner_devices: &song_track.devices,
+        owner_stores: (&song_track.automation_lanes, &song_track.mod_routings),
     };
     run_chain_program(
         program,
@@ -374,20 +384,18 @@ pub fn process_track_owned(
         return;
     }
 
+    // ---- PostFx 点: SC Listen の置換 (r.md #129 K25d) ----
+    // トラックのチェーン出力を、Listen 中の Comp の検出信号で置き換える。後段の device 自体は
+    // 普通に走っていて状態も保たれる。pre-fader tap より前なので send / SC にも同じ音が流れる。
+    apply_listen_override(program, &mut scratch.track_l, &mut scratch.track_r, n);
+
     // ---- Pre-fader send tap ----
     // A pre-fader send reads the post-fx, pre-strip signal. Snapshot it
     // before the strip overwrites `track_l/r` in place. docs/plan_modulation.md
     // §6: a PostFx aux-input route or mod source also reads this snapshot, so
     // capture it for those too. Only copied when something actually needs it
-    // (cheap check; skips the memcpy otherwise).
-    let has_prefader_send = song_track
-        .sends
-        .iter()
-        .any(|s| s.mode == common::model::SendMode::PreFader);
-    if has_prefader_send
-        || scratch.force_prefader_snapshot
-        || song.is_some_and(|s| track_needs_prefader_snapshot(s, song_track.id))
-    {
+    // (`ChainProgram::snapshot_post_fx` は pre-fader send を含めて compile 時に焼いた値)。
+    if scratch.force_prefader_snapshot || snapshot_post_fx {
         scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
@@ -451,9 +459,17 @@ pub fn process_master_fx_chain(
     // r.md #87: マスター行 (`song_lanes`) の供給元。ランチャーで撃った行は
     // アレンジのカーブではなくセルのカーブを使う。
     master_rows: TrackRows<'_>,
+    // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+    native_io: NativeIo<'_>,
 ) {
     // master は note を持たない = 空の MIDI バスで走らせる。
     midi_a.clear();
+    program.listen_pending = None;
+    // r.md #129: master fx chain の device (組み込み Bus Comp / Tone EQ を含む) の store は song 側。
+    let (owner_devices, owner_stores) = match song {
+        Some(s) => (s.master_fx_chain.as_slice(), (s.song_lanes.as_slice(), s.song_mod_routings.as_slice())),
+        None => (&[][..], (&[][..], &[][..])),
+    };
     let ctx = ProgramCtx {
         song,
         plugin_refs,
@@ -468,6 +484,9 @@ pub fn process_master_fx_chain(
         mod_plane,
         rows: master_rows,
         own_pre_fx: None,
+        native: native_io,
+        owner_devices,
+        owner_stores,
     };
     let len = program.ops.len();
     run_chain_program(program, 0..len, master_l, master_r, midi_a, midi_b, &ctx);
@@ -505,6 +524,8 @@ pub fn execute_schedule_post_dispatch(
     follower_drive: FollowerDrive<'_>,
     // r.md #87: 行ごとの時間軸の供給元 (group の automation レーン行に効く)。
     rows: &RowSourceTable,
+    // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+    native_io: NativeIo<'_>,
 ) {
     // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
     // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
@@ -519,6 +540,7 @@ pub fn execute_schedule_post_dispatch(
         follower_keys: _,
         mod_kinds: _,
         master_latency_samples: _,
+        master_limiter_latency: _,
         track_programs,
         master_program,
         master_midi_a: _,
@@ -598,6 +620,7 @@ pub fn execute_schedule_post_dispatch(
                     mod_plane,
                     *start_op as usize,
                     rows.track_rows(*track_idx as usize),
+                    native_io,
                 );
             }
             NodeOp::ApplyDelay {
@@ -660,6 +683,12 @@ pub fn execute_schedule_post_dispatch(
                 pd.buffer_aux_in[port][0][..copy_n].copy_from_slice(&src_l[..copy_n]);
                 pd.buffer_aux_in[port][1][..copy_n].copy_from_slice(&src_r[..copy_n]);
                 pd.aux_in_active[port] = 1;
+            }
+
+            // r.md #129: 内蔵 device (Comp / Bus Comp) の外部サイドチェインの staging。
+            // 読み元 (scratch / 同じ program / 別 program) ごとの借用は `stage_native_sidechain` が持つ。
+            NodeOp::NativeSidechainTap { src, owner, native_slot } => {
+                stage_native_sidechain(scratch, track_programs, master_program, *src, *owner, *native_slot, n);
             }
 
             NodeOp::ParallelOutTap {
@@ -788,20 +817,29 @@ fn run_group_fx_chain(
     start_op: usize,
     // r.md #87: この group の行の供給元 (レーン行の automation に効く)。
     rows: TrackRows<'_>,
+    // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+    native_io: NativeIo<'_>,
 ) {
     let n = frames as usize;
-    let track_id = song_track.id;
+    // r.md #129: 純粋な bus はここが program の実行開始。GWI (`start_op > 0`) は pass 1 で
+    // 立った Listen の要求を PostFx 点で消費するので消さない。
+    if start_op == 0 {
+        program.listen_pending = None;
+    }
 
     // docs/plan_modulation_followups.md §1: a group's pre-FX signal = the summed
     // children before its own device chain. Capture for any PreFx tap / mod
     // source (guarded — untouched groups skip the memcpy). For a
     // group-with-instrument this is the summed bus *before the suffix FX* (the
     // instrument prefix already ran), which is the right pre-FX tap point.
-    let captured_prefx = scratch.force_prefx_snapshot || track_needs_prefx_snapshot(song, track_id);
+    // 「誰かが読むか」は compile 時に焼いた値 (r.md #129 §18-B)。`BusScAlign` の遅延はこの
+    // snapshot より前に掛かっているので、自トラック Pre-FX を読む SC も揃う。
+    let captured_prefx = scratch.force_prefx_snapshot || program.snapshot_pre_fx;
     if captured_prefx {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
+    let snapshot_post_fx = program.snapshot_post_fx;
 
     // r.md #110: bus の device 列も同じ walker。summed audio を入力に、MIDI バスは空
     // (bus は note を持たない) で `[start_op..]` を走らせる。
@@ -820,6 +858,9 @@ fn run_group_fx_chain(
         mod_plane,
         rows,
         own_pre_fx: captured_prefx.then_some((&scratch.pre_fx_l[..], &scratch.pre_fx_r[..])),
+        native: native_io,
+        owner_devices: &song_track.devices,
+        owner_stores: (&song_track.automation_lanes, &song_track.mod_routings),
     };
     let len = program.ops.len();
     run_chain_program(
@@ -832,14 +873,13 @@ fn run_group_fx_chain(
         &ctx,
     );
 
+    // ---- PostFx 点: SC Listen の置換 (r.md #129 K25d、leaf と同じ位置) ----
+    apply_listen_override(program, &mut scratch.track_l, &mut scratch.track_r, n);
+
     // ---- Pre-fader send tap (bus / return source) ----
-    // A pre-fader send from this bus reads its post-fx, pre-strip signal.
-    if scratch.force_prefader_snapshot
-        || song_track
-            .sends
-            .iter()
-            .any(|s| s.mode == common::model::SendMode::PreFader)
-    {
+    // A pre-fader send from this bus reads its post-fx, pre-strip signal. PostFx の tap /
+    // mod source も同じ snapshot を読む (r.md #129 §18-C: 以前は leaf だけがこの条件を持っていた)。
+    if scratch.force_prefader_snapshot || snapshot_post_fx {
         scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
@@ -868,8 +908,8 @@ fn run_group_fx_chain(
         &mut scratch.volume_per_sample,
         &mut scratch.pan_per_sample,
         recording_lanes,
-        // group/master bus の volume/pan follower 変調は follow-up。
-        ModTickPlaneRef::default(),
+        // r.md #129 §18-A: group / return の volume / pan にも変調を効かせる (leaf と同じ値面)。
+        mod_plane,
     );
     apply_strip(scratch, n, muted, effective_mute);
 }
@@ -914,18 +954,20 @@ fn advance_follower(
     }
 }
 
-/// live (CPAL callback 経由の `LocalState::process_buffer`) と offline export
+/// live (CPAL callback 経由の `ProjectRt::render_buffer`) と offline export
 /// (`export::render_loop`) が共有する「1 buffer を master へ描く」単一経路
 /// (`docs/plan_arch_refactor.md` §5):
 ///
 /// 1. master バスをゼロ初期化
 /// 2. per-track pass-1 dispatch (worker pool fan-out、無ければ serial)
 /// 3. schedule 実行 (group mix / PDC / send / sidechain / follower)
-/// 4. master fx chain
+/// 4. master fx chain (組み込み Bus Comp / Tone EQ を含む) → master の SC Listen
 /// 5. master gain
+/// 6. master limiter (フェーダーの後、先読み遅延は compile 時に焼いた値で決まる)
 ///
 /// metronome / panic declick 等 **monitoring 専用** の処理はここに入れない
-/// (live 側にだけ存在する)。RT-safe: 確保・ロック・I/O なし。
+/// (live 側にだけ存在する)。live と export の違いは `native_io` (聴き方・見方) だけで、
+/// export は `NativeIo::default()` を渡す。RT-safe: 確保・ロック・I/O なし。
 #[allow(clippy::too_many_arguments)]
 pub fn render_master_buffer(
     song: &Song,
@@ -950,6 +992,10 @@ pub fn render_master_buffer(
     // なので、両方がここへ同じ形で渡す。空なら全部アレンジ = 従来の挙動。
     rows: &RowSourceTable,
     master_gain: f32,
+    // r.md #129: master のフェーダー後 Limiter の状態。live は `ProjectRt`、書き出しは毎回新品。
+    master_limiter: &mut MasterLimiterState,
+    // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+    native_io: NativeIo<'_>,
 ) {
     let n = (frames as usize).min(master_l.len()).min(master_r.len());
     let frames = n as u32;
@@ -981,6 +1027,7 @@ pub fn render_master_buffer(
             &loop_region,
             mod_plane,
             rows,
+            native_io,
         );
         // stall した pool は scratch を更新しない (dispatch_and_wait が冒頭で
         // early-return する)。 その残余 (直前 buffer の per-track 出力) を後段の
@@ -1026,6 +1073,7 @@ pub fn render_master_buffer(
                 loop_region,
                 mod_plane,
                 rows.track_rows(track_idx),
+                native_io,
             );
         }
     }
@@ -1051,11 +1099,13 @@ pub fn render_master_buffer(
         mod_plane,
         follower_drive,
         rows,
+        native_io,
     );
 
     // ---- master fx chain ----
     // 全 track mix 後に直列 process。 live/export 両経路で通るので、 master に
-    // 挿した limiter / EQ が WAV にも乗る (旧 export は素通りだった)。
+    // 挿した limiter / EQ が WAV にも乗る (旧 export は素通りだった)。 r.md #129: 組み込みの
+    // Bus Comp / Tone EQ もこの chain の device として走る (既定の位置は先頭)。
     process_master_fx_chain(
         &mut schedule.master_program,
         &mut schedule.master_midi_a,
@@ -1074,7 +1124,10 @@ pub fn render_master_buffer(
         recording_lanes,
         mod_plane,
         rows.master_rows(),
+        native_io,
     );
+    // r.md #129: master の PostFx 点 = fx chain の後、master gain の前。
+    apply_listen_override(&mut schedule.master_program, &mut master_l[..n], &mut master_r[..n], n);
 
     // ---- master gain ----
     // session の master volume。 live は従来 CPAL interleave 段で掛けていたが、
@@ -1085,6 +1138,16 @@ pub fn render_master_buffer(
             master_r[i] *= master_gain;
         }
     }
+
+    // ---- master limiter (最終段) ----
+    // **フェーダーの後**が唯一正しい位置 — 前に置くとフェーダーを上げた瞬間に
+    // 「出力を超えさせない」保証が破れる。値 (On / Ceiling) はオートメーション / 変調を
+    // buffer 頭で解決する。先読み遅延を通すかは compile 時に焼いた値 (PDC の会計と同じ) で決まり、
+    // 遅延を焼いてある間は解決値が OFF でも遅延だけを通す。
+    let limiter = crate::automation::resolve_master_limiter(song, rows.master_rows(), playhead_beats, recording_lanes, mod_plane);
+    #[allow(clippy::cast_precision_loss)]
+    let sr_f32 = sample_rate as f32;
+    master_limiter.process(&limiter, schedule.master_limiter_latency, &mut master_l[..n], &mut master_r[..n], n, sr_f32);
 }
 
 /// テスト用 `PluginRefs` helper (shmem を立てずに heap の `ProcessData` を
@@ -1227,6 +1290,7 @@ mod sidechain_tests {
             ModTickPlaneRef::default(),
             FollowerDrive::default(),
             &RowSourceTable::default(),
+            NativeIo::default(),
         );
 
         for i in 0..FRAMES {
@@ -1303,6 +1367,7 @@ mod sidechain_tests {
             ModTickPlaneRef::default(),
             FollowerDrive::default(),
             &RowSourceTable::default(),
+            NativeIo::default(),
         );
 
         assert_eq!(pd.aux_in_active[0], 0, "quarantined device's pd must be untouched");
@@ -1623,6 +1688,8 @@ mod render_master_tests {
             FollowerDrive::default(),
             &RowSourceTable::default(),
             0.5,
+            &mut MasterLimiterState::new(),
+            NativeIo::default(),
         );
         assert!(master_l.iter().all(|&v| v == 0.0), "master must be cleared+silent");
         assert!(master_r.iter().all(|&v| v == 0.0));

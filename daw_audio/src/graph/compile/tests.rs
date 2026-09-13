@@ -1,4 +1,5 @@
 use super::*;
+use crate::graph::DelayKey;
 use common::model::{Device, PluginInstance, Song, Track};
 use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
@@ -776,6 +777,7 @@ fn pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin() {
             }
             NodeOp::ProcessGroupFx { .. }
             | NodeOp::SidechainTap { .. }
+            | NodeOp::NativeSidechainTap { .. }
             | NodeOp::MixSend { .. }
             | NodeOp::MixAdditive { .. }
             | NodeOp::ParallelOutTap { .. } => {
@@ -1284,7 +1286,9 @@ fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track() {
 /// §5 (arch refactor): **leaf** 宛の sidechain tap は staging (post-
 /// dispatch) と消費 (次 buffer の pass-1 process) が 1 buffer ずれるので、
 /// `buffer_frames` が入力遅延と path latency の両方に加算される。bus 宛
-/// (return の ProcessGroupFx) は同 buffer 消費なので加算されない。
+/// (return の ProcessGroupFx) は同 buffer 消費なので加算されず、track の入力遅延ではなく
+/// `ProcessGroupFx` の直前の `BusScAlign` で揃える (r.md #129 §8.3.3)。ここでは return の入力
+/// (send 元) が SC 元と同じ track なので、揃える量は 0 = 遅延を積まない。
 #[test]
 fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag() {
     use common::model::{PluginInstance, Send, SendMode};
@@ -1337,13 +1341,12 @@ fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag() {
         100 + BUF,
         "leaf-destined tap must include the 1-buffer staging lag"
     );
-    // bus 宛 (return): 同 buffer 消費なので lag 加算なし。入力遅延自体
-    // bus では未使用 (ProcessGroupFx は input_delay を適用しない) だが、
-    // 規則の対称性を検証する。
-    assert_eq!(
-        sched.input_delay_per_track[2],
-        100,
-        "bus-destined tap is consumed in the same buffer (no extra lag)"
+    // bus 宛 (return): pass 2 の consumer なので track の入力遅延は持たない。
+    assert_eq!(sched.input_delay_per_track[2], 0, "pass-2 consumer は input delay を使わない");
+    assert!(
+        !sched.delay_keys.iter().any(|k| matches!(k, DelayKey::BusScAlign { .. })),
+        "send 元 (= SC 元) で入力が既に 100 遅れているので BusScAlign は積まない: {:?}",
+        sched.delay_keys
     );
 }
 

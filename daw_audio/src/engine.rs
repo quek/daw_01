@@ -29,14 +29,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::audio_bridge::{AudioBridgeHandle, ProjectTelemetry};
+use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
 use common::model::Song;
 use common::protocol::{ProjectKey, SamplerSource};
 use common::timing::{effective_loop_bounds, song_ended};
 
 use crate::audio_clip_renderer::AudioClipRenderer;
-use crate::graph::{DelayLine, Schedule, render_master_buffer};
+use crate::graph::{DelayLine, DeviceScopeTap, NativeIo, Schedule, render_master_buffer};
 use crate::metronome::{ClickVoice, render_metronome};
 use crate::mixer::TrackScratch;
+use crate::native_dsp::MasterLimiterState;
 use crate::sampler::{SamplerRig, SamplerRt};
 use crate::sequencer::NoteTransition;
 
@@ -334,6 +336,10 @@ pub struct ProjectRt {
     /// (`ModTickRunner::build_follower_env_map`)。刻みごとの線形探索を避けるため
     /// plan / schedule の差し替え時に 1 度だけ作る。
     pub follower_env_of_slot: Vec<u16>,
+    /// r.md #129: master のフェーダー後 Limiter の状態 (先読みリングは `new` で 1 回だけ確保)。
+    /// live 用の 1 個 — 書き出しは `export` が毎回新品を作る。同じタブで別ファイルを開いたら
+    /// `refresh_bundle` が reset する (§18-M)。
+    pub master_limiter: MasterLimiterState,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -355,8 +361,17 @@ pub struct DeviceCtx<'a> {
     pub sampler_rt: &'a mut SamplerRt,
     /// この project が scope (マスターメーター) の対象のときだけ `Some`。
     pub scope: Option<&'a common::scope_bridge::ScopeBridgeHandle>,
+    /// r.md #129: device scope (EQ Par のスペクトラム) の書き先。scope の対象の project だけ `Some`。
+    pub device_scope: Option<DeviceScopeCtx<'a>>,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
+}
+
+/// r.md #129 §11.2: device scope の書き先と、slot の見出し表 (`DeviceRt` が持つ)。見出しの書き手は
+/// scope project の render だけなので、`(project, device id)` が表と違う slot だけを書き換える。
+pub struct DeviceScopeCtx<'a> {
+    pub bridge: &'a DeviceScopeBridgeHandle,
+    pub headers: &'a mut [(ProjectKey, u64); MAX_DEVICE_SCOPES],
 }
 
 impl ProjectRt {
@@ -397,6 +412,7 @@ impl ProjectRt {
             mod_tick: crate::mod_tick::ModTickRunner::new(),
             follower_cols: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             follower_env_of_slot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
+            master_limiter: MasterLimiterState::new(),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -504,6 +520,9 @@ impl ProjectRt {
                     // (添字は track 内 schedule 順 = 位置キー)。
                     s.repitch_accum.fill((u64::MAX, 0.0));
                 }
+                // r.md #129 §18-M: master Limiter の先読みリングも前 project の音を持っている
+                // (schedule の外で生き続ける)。192kHz 換算のリングを 0 で埋めるだけで確保しない。
+                self.master_limiter.reset();
             } else {
                 // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
                 sched.adopt_state_from(&mut self.cached_schedule);
@@ -571,13 +590,29 @@ impl ProjectRt {
         }
     }
 
-    /// track ごとの表示用テレメトリ (peak / GR / 鳴っているボイス) を `AudioBridge` へ publish
-    /// する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store のみ (RT 安全)。
+    /// 表示用のメーター面 (track peak / 鳴っているボイス / 内蔵 device の GR / master Limiter の GR) を
+    /// `AudioBridge` へ publish する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store
+    /// のみ (RT 安全)。
     ///
     /// ボイス (r.md #117、 変調ラックの per-voice カーソル用) は chain の **最初の** plugin の
     /// ボイス表 = この track の MIDI 入力 (Selector で別 chain に居ても同じ MIDI を受ける)。
     /// plugin が無ければ空。
-    fn publish_track_telemetry(&self, slot: &ProjectTelemetry, n_tracks: usize) {
+    ///
+    /// GR (r.md #129 §11.1) は **この buffer で処理した program** (`track_programs[..n_tracks]` と master)
+    /// の `meter` 付き内蔵 device だけから出す = 処理していない program の GR が前の値のまま残らない。
+    /// slot の並びは compile 順で、読み手は device id で引く (不変条件 1)。
+    fn publish_meters(&self, slot: &ProjectTelemetry, n_tracks: usize) {
+        let programs = &self.cached_schedule;
+        let gr = programs
+            .track_programs
+            .iter()
+            .take(n_tracks)
+            .chain(std::iter::once(&programs.master_program))
+            .flat_map(|p| p.natives.iter())
+            .filter(|ns| ns.meter)
+            .map(|ns| (ns.device_id, ns.gr_db));
+        slot.publish_native_meters(gr);
+        slot.set_master_limiter_gr_db(self.master_limiter.gain_reduction_db());
         for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
             slot.set_track_peak(i, tr.peak_l, tr.peak_r);
             let voices = self
@@ -981,8 +1016,18 @@ impl ProjectRt {
                 n,
             );
 
+            // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope)。scope の対象の
+            // project だけが見出しを同期して scope へ書く。
+            let watch_g = ctx.device_scope.is_some().then(|| self.shared.device_scope_watch.load());
+            let native_io = native_io_for_buffer(
+                self.key,
+                self.shared.sc_listen_device.load(Ordering::Acquire),
+                ctx.device_scope,
+                watch_g.as_deref().map(|w| &**w),
+            );
+
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
-            // master fx → master gain。
+            // master fx → master gain → master limiter。
             let master_gain = f32::from_bits(self.shared.master_gain.load(Ordering::Relaxed));
             render_master_buffer(
                 song,
@@ -1004,6 +1049,8 @@ impl ProjectRt {
                 self.mod_tick.follower_drive(&self.follower_cols, playhead),
                 self.launcher.rows(),
                 master_gain,
+                &mut self.master_limiter,
+                native_io,
             );
 
             // 走行状態の GUI への publish は **transport を進めた後** (この関数の末尾)。
@@ -1071,10 +1118,10 @@ impl ProjectRt {
                 );
             }
 
-            // Publish per-track peak meters into the shared AudioBridge
-            // so the GUI mixer strips animate. Atomic stores, RT-safe.
+            // Publish per-track peak meters / native GR / limiter GR into the shared
+            // AudioBridge so the GUI mixer strips animate. Atomic stores, RT-safe.
             // Tracks with effective_mute already have peak_l/r == 0.
-            self.publish_track_telemetry(slot, n_tracks);
+            self.publish_meters(slot, n_tracks);
 
             // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。
             // 刻みが解いた buffer 頭の値をそのまま出す (GUI は 30Hz なので
@@ -1217,6 +1264,30 @@ impl ProjectRt {
     }
 }
 
+/// r.md #129: この buffer の [`NativeIo`] を組む。`device_scope` と `watch` が揃う (= scope project の
+/// live 描画) ときだけ scope を持ち、見出し表と違う slot の見出しを `(key, device id)` に書き換える
+/// (見出しの書き手は scope project の render だけ)。確保・ロックなし (atomic store のみ)。
+fn native_io_for_buffer<'a>(
+    key: ProjectKey,
+    sc_listen: u64,
+    device_scope: Option<DeviceScopeCtx<'a>>,
+    watch: Option<&'a [u64; MAX_DEVICE_SCOPES]>,
+) -> NativeIo<'a> {
+    let scopes = match (device_scope, watch) {
+        (Some(ds), Some(watch)) => {
+            for (k, (header, &id)) in ds.headers.iter_mut().zip(watch.iter()).enumerate() {
+                if *header != (key, id) {
+                    ds.bridge.set_slot(k, key, id);
+                    *header = (key, id);
+                }
+            }
+            Some(DeviceScopeTap { bridge: ds.bridge, watch })
+        }
+        _ => None,
+    };
+    NativeIo { sc_listen, scopes }
+}
+
 /// CPAL クロージャ専有の状態 (`docs/plan_project_tabs.md` §3.1)。開いている
 /// [`ProjectRt`] の列とデバイス最終ミックス。project の追加 / 撤去は
 /// [`ProjectDelivery`] で off-thread から届く (RT で確保しない)。
@@ -1252,6 +1323,9 @@ pub struct DeviceRt {
     pub sampler_rt: SamplerRt,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
+    /// r.md #129 §11.2: device scope の slot ごとに、最後に書いた見出し `(project, device id)`。
+    /// 表と違う slot だけ見出しを書き換える (毎 buffer 16 slot の atomic を読み書きしない)。
+    pub scope_headers: [(ProjectKey, u64); MAX_DEVICE_SCOPES],
 }
 
 impl DeviceRt {
@@ -1278,6 +1352,7 @@ impl DeviceRt {
             sampler: None,
             sampler_rt: SamplerRt::new(),
             frames_rendered: 0,
+            scope_headers: [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES],
         }
     }
 
@@ -1409,6 +1484,7 @@ impl DeviceRt {
         shared: &SharedState,
         bridge: &AudioBridgeHandle,
         scope: &common::scope_bridge::ScopeBridgeHandle,
+        device_scope: &DeviceScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
     ) {
@@ -1482,6 +1558,8 @@ impl DeviceRt {
                 sampler: if is_sampler { self.sampler.as_deref() } else { None },
                 sampler_rt: &mut self.sampler_rt,
                 scope: is_scope.then_some(scope),
+                device_scope: is_scope
+                    .then_some(DeviceScopeCtx { bridge: device_scope, headers: &mut self.scope_headers }),
                 frames_rendered,
             };
             let slot = bridge.project(p.telemetry_slot);
@@ -1976,6 +2054,7 @@ mod multi_project_tests {
         _device_recycle_rx: rtrb::Consumer<DeviceBundle>,
         bridge: AudioBridgeHandle,
         scope: common::scope_bridge::ScopeBridgeHandle,
+        device_scope: DeviceScopeBridgeHandle,
         shared: Arc<SharedState>,
         engine: Arc<EngineShared>,
     }
@@ -2002,6 +2081,7 @@ mod multi_project_tests {
             "daw01_test_mp_scope_{tag}_{pid}"
         ))
         .unwrap();
+        let device_scope = DeviceScopeBridgeHandle::create(&format!("daw01_test_mp_dscope_{tag}_{pid}")).unwrap();
         Rig {
             dev,
             project_tx,
@@ -2010,6 +2090,7 @@ mod multi_project_tests {
             _device_recycle_rx: device_recycle_rx,
             bridge,
             scope,
+            device_scope,
             shared: Arc::new(SharedState::new()),
             engine,
         }
@@ -2068,7 +2149,7 @@ mod multi_project_tests {
 
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
-            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, 48_000, 256);
+            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, 256);
         }
     }
 
