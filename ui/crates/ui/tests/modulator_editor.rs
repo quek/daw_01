@@ -44,12 +44,15 @@ fn release(x: f32, y: f32) -> PointerFrame {
 }
 
 fn run_mseg(host: &mut UiHost<Obs>, obs: &mut Obs, p: PointerFrame) {
+    run_mseg_with(host, obs, &nodes(), &samples(), p);
+}
+
+/// `nodes` を渡す版。サンプル列は `samples` (ノードを線形に結んだ列を渡す)。
+fn run_mseg_with(host: &mut UiHost<Obs>, obs: &mut Obs, node_list: &[MsegNode], sample_list: &[(f32, f32)], p: PointerFrame) {
     let mut scene = Scene::new();
     let screen = PhysicalSize { width: 200, height: 100 };
-    let node_list = nodes();
-    let sample_list = samples();
     let edits = host.frame_to_edits(obs, &mut scene, screen, FrameInput { pointer: p, ..Default::default() }, |_obs, ui| {
-        ui.mseg_editor("t", RECT, &node_list, &sample_list, None, MsegEditorStyle::from_palette(ui.palette()), |act| {
+        ui.mseg_editor("t", RECT, node_list, sample_list, None, MsegEditorStyle::from_palette(ui.palette()), |act| {
             Edit::mutate(move |o: &mut Obs| match act {
                 MsegAction::Move { index, time, value } => o.moves.push((index, time, value)),
                 MsegAction::Add { time, value } => o.adds.push((time, value)),
@@ -154,6 +157,52 @@ fn mseg_alt_click_endpoint_does_not_delete() {
     // node 0 (端点) を Alt+click → 削除されず、drag が始まる (Move 発火)。
     run_mseg(&mut host, &mut obs, press(0.0, 80.0, alt));
     assert!(obs.deletes.is_empty(), "端点は削除しない");
+}
+
+/// ノードを線形に結んだサンプル列 (tension handle の縦位置 = 区間の中点)。
+fn linear_samples(node_list: &[MsegNode]) -> Vec<(f32, f32)> {
+    node_list.iter().map(|n| (n.time, n.value)).collect()
+}
+
+/// 当たり円が重なった隣り合うノードの重なりを押すと、掴むのは **近い方**。
+/// node 1 = (0.5, 0.8) → px (100, 20)、node 2 = (0.54, 0.8) → px (108, 20)、その間の tension handle は (104, 20)。
+#[test]
+fn mseg_press_between_close_nodes_grabs_the_nearer_node() {
+    let node_list = vec![
+        MsegNode { time: 0.0, value: 0.2, curve: 0.0 },
+        MsegNode { time: 0.5, value: 0.8, curve: 0.0 },
+        MsegNode { time: 0.54, value: 0.8, curve: 0.0 },
+        MsegNode { time: 1.0, value: 0.2, curve: 0.0 },
+    ];
+    let sample_list = linear_samples(&node_list);
+    let mut host: UiHost<Obs> = UiHost::no_redraw();
+    let mut obs = Obs::default();
+    // node 2 に 1px / tension handle に 3px / node 1 に 7px (どれも当たり円の中)。
+    run_mseg_with(&mut host, &mut obs, &node_list, &sample_list, press(107.0, 20.0, Modifiers::default()));
+    run_mseg_with(&mut host, &mut obs, &node_list, &sample_list, hold(107.0, 40.0));
+    let last = obs.moves.last().copied().expect("move emitted");
+    assert_eq!(last.0, 2, "いちばん近い node 2 を掴む (最初に当たった node 1 ではない)");
+    assert!(obs.curves.is_empty(), "tension は曲げない");
+}
+
+/// ノードの当たり円に食い込んだ tension handle も、その上を押せば曲げられる (ノードを常に優先しない)。
+/// 区間 node 1 (100, 20) → node 2 (112, 30) の tension handle は (106, 25) で、両ノードから 7.8px。
+#[test]
+fn mseg_press_on_a_tension_handle_inside_a_node_hit_circle_bends_the_segment() {
+    let node_list = vec![
+        MsegNode { time: 0.0, value: 0.2, curve: 0.0 },
+        MsegNode { time: 0.5, value: 0.8, curve: 0.0 },
+        MsegNode { time: 0.56, value: 0.7, curve: 0.0 },
+        MsegNode { time: 1.0, value: 0.2, curve: 0.0 },
+    ];
+    let sample_list = linear_samples(&node_list);
+    let mut host: UiHost<Obs> = UiHost::no_redraw();
+    let mut obs = Obs::default();
+    run_mseg_with(&mut host, &mut obs, &node_list, &sample_list, press(106.0, 25.0, Modifiers::default()));
+    run_mseg_with(&mut host, &mut obs, &node_list, &sample_list, hold(106.0, 15.0));
+    let last = obs.curves.last().copied().expect("set_curve emitted");
+    assert_eq!(last.0, 1, "segment 1 の tension");
+    assert!(obs.moves.is_empty(), "ノードは動かさない");
 }
 
 #[test]

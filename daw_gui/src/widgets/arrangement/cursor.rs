@@ -123,6 +123,7 @@ pub(super) fn hover(
                 cx,
                 cy,
                 f.style,
+                f.selected_automation_points,
             )
             .is_some()
             {

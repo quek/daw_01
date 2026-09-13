@@ -369,6 +369,7 @@ fn point(
         px,
         py,
         f.style,
+        f.selected_automation_points,
     ) else {
         return;
     };

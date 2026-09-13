@@ -31,7 +31,7 @@ pub mod wheel;
 pub mod widgets;
 
 #[cfg(feature = "clipboard")]
-pub use click::ClickState;
+pub use click::{ClickState, NearestHit};
 pub use clipboard::ArboardClipboard;
 pub use clipboard::{ClipboardProvider, NoopClipboard};
 pub use dialog::{DialogResult, FileDialogFilter};

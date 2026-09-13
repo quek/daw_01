@@ -994,6 +994,7 @@ pub(super) fn commit_releases(
                 cx,
                 cy,
                 style,
+                selected_automation_points,
             ) {
                 // 既存 point の上での dblclick → 値の数値入力を開始 (新規点追加より優先)。
                 // caller (daw_01) が automation_point_rects で rect を引いて inline 数値入力 overlay を出す。

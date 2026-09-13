@@ -135,6 +135,23 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
     a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
 }
 
+/// warp marker の当たり帯の半幅 (px、縦は event の全高)。
+const WARP_MARKER_HIT_HALF_W: f32 = 5.0;
+
+/// press フレームに warp marker を掴むなら、どの marker か。`marker_xs` は描画順の `(marker 位置, 画面 x)`。
+/// 当たり帯は隣の marker と重なるので、帯の中の近い 1 本 (同じ距離なら後に描いた marker、
+/// `daw_ui_core::NearestHit`)。press フレームでなければ `None`。
+fn pressed_warp_marker(pointer: daw_ui_core::PointerFrame, marker_xs: &[(usize, f32)]) -> Option<usize> {
+    let px = pointer.pos.filter(|_| pointer.primary_just_pressed)?.0;
+    marker_xs
+        .iter()
+        .map(|&(marker_idx, mx)| (marker_idx, (px - mx).abs()))
+        .filter(|&(_, d)| d <= WARP_MARKER_HIT_HALF_W)
+        .collect::<daw_ui_core::NearestHit<_>>()
+        .best()
+        .map(|(marker_idx, _)| marker_idx)
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Audio Editor の面はパレットのクローム面 (panel)。 この上に載る文字は
     // 可変背景ではないので極性固定インクではなく `p.text` で正しい。
@@ -824,13 +841,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 登録し、 narrow hit rect で press を先取りする (= marker 上の press は
         // marker が、 それ以外は center が取る)。 trim grip より後なので端
         // marker は trim に譲る。 release は 1 回だけなので各ジェスチャ = 1 undo。
+        // 当たり帯 (±5 px) は隣の marker と重なるので、 press フレームは近い 1 本だけが名乗る
+        // (`pressed_warp_marker`)。 session 中のフレームは帯を見ないので全 marker を回す。
+        let press_marker = pressed_warp_marker(ui.pointer(), &marker_xs);
         for &(marker_idx, mx) in &marker_xs {
-            let hit = Rect {
-                x: mx - 5.0,
-                y: event_rect.y,
-                w: 10.0,
-                h: event_rect.h,
-            };
+            if ui.pointer().primary_just_pressed && press_marker != Some(marker_idx) {
+                continue;
+            }
+            let hit = Rect { x: mx - WARP_MARKER_HIT_HALF_W, y: event_rect.y, w: WARP_MARKER_HIT_HALF_W * 2.0, h: event_rect.h };
             let Some(drag) = ui.take_drag_in_rect(
                 ("audio_editor_warp_marker", clip_id, idx, marker_idx),
                 hit,
