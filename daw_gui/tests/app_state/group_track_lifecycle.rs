@@ -24,7 +24,8 @@ use common::model::{AutomationLane, AutomationTarget, InstrumentSource};
 use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use daw_gui::app::{device_id_at, AppData, AppEvent, RelocateDevices};
+use daw_gui::app::{device_id_at, AppData, AppEvent, InsertAt, RelocateDevices};
+use daw_gui::event_device::DeviceEvent;
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 
@@ -191,9 +192,9 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // Step 6: Bitcrush (device 0) を削除。
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![bitcrush_dev],
-    });
+    }));
     // RemoveDevices は plugin の最新 state を取ってから Undo snapshot → 削除 という
     // deferred path を通る。 test では plugin_host を mock していないので、 fake で
     // AllStatesReceived を流して deferred edit を実行させる。
@@ -380,12 +381,12 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     // Reorder. devices = [synth(0), bitcrush(1), delay(2)]. gui_01 契約は
     // new[i] = items[order[i]]; order [0,2,1] は synth を残して 2 つの FX を入れ替え
     // (delay が bitcrush より前へ)。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![delay_dev],
         dest: common::model::ChainRef::Track(track_id),
-        dest_index: 1,
+        dest_index: InsertAt::Index(1),
         copy: false,
-    }));
+    })));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
@@ -463,12 +464,12 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     });
 
     // Swap the two FX (delay before bitcrush): order [0,2,1].
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![delay_dev],
         dest: common::model::ChainRef::Track(track_id),
-        dest_index: 1,
+        dest_index: InsertAt::Index(1),
         copy: false,
-    }));
+    })));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
@@ -525,12 +526,12 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
 
     // [synth, bitcrush, delay, phantom] の index 1 と 2 を入れ替える。
     let delay_dev = app.cur.song_doc.song().tracks[0].devices[2].id();
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![delay_dev],
         dest: common::model::ChainRef::Track(track_id),
-        dest_index: 1,
+        dest_index: InsertAt::Index(1),
         copy: false,
-    }));
+    })));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));

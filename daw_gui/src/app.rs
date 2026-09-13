@@ -419,6 +419,7 @@ impl AppData {
             // r.md #87: ランチャー操作は 1 arm で受けて専用 dispatcher へ。
             AppEvent::Launcher(ev) => self.handle_launcher_event(ev),
             AppEvent::Tab(ev) => self.handle_tab_event(ev),
+            AppEvent::Device(ev) => self.handle_device_event(ev),
             // r.md #61: 全終了経路の合流点。
             AppEvent::Quit(req) => self.request_quit(req),
             // `docs/plan_project_tabs.md` §5.2: New / Open は現在のタブを破棄しない
@@ -1199,55 +1200,11 @@ impl AppData {
             AppEvent::SelectPluginFromDb { id, keep_open, open_gui } => {
                 self.select_plugin_from_db(id, keep_open, open_gui);
             }
-            AppEvent::ToggleSlotGui { device_id } => {
-                self.toggle_slot_gui(device_id);
-            }
             // r.md #55: 閉じた 1 枚ごとに `SlotGuiClosed` が返ってくるので、
             // `ipc.open_plugin_guis` の掃除は ✕ を押したときと同じ経路 (on_gui_closed)
             // に任せる。ここで先回りして帳簿を clear しない (二重管理を作らない)。
             AppEvent::CloseAllPluginEditors => {
                 self.send_plugin(PluginCommand::CloseAllSlotGuis);
-            }
-            AppEvent::SetVideoFxParam { device_id, param_id, value_real } => {
-                self.set_video_fx_param(device_id, param_id, value_real);
-            }
-            AppEvent::SetPluginParam { device_id, param_id, value_real } => {
-                self.set_plugin_param(device_id, param_id, value_real);
-            }
-            AppEvent::RemoveDevices { device_ids } => {
-                self.remove_devices(device_ids);
-            }
-            AppEvent::RelocateDevices(req) => {
-                self.relocate_devices(req);
-            }
-            AppEvent::SelectDevice { device_id, modifier } => {
-                self.apply_select_device(device_id, modifier);
-            }
-            AppEvent::ReloadDevice { device_id } => {
-                self.reload_device(device_id);
-            }
-            AppEvent::ExplodeParallelOut { device_id } => {
-                self.explode_parallel_out(device_id);
-            }
-            AppEvent::SetParallelOutputRoute {
-                device_id,
-                port,
-                dest,
-            } => {
-                self.set_parallel_output_route(device_id, port, dest);
-            }
-            AppEvent::SetSidechainSource {
-                device_id,
-                port,
-                source,
-            } => {
-                self.set_sidechain_source(device_id, port, source);
-            }
-            AppEvent::SetPluginSendAllKeys { device_id, enabled } => {
-                self.set_plugin_send_all_keys(device_id, enabled);
-            }
-            AppEvent::SetDevicesBypassed { device_ids, bypassed } => {
-                self.set_devices_bypassed(&device_ids, bypassed);
             }
             AppEvent::AddModSource { kind } => self.add_mod_source(kind),
             AppEvent::EditModSource { id, edit } => self.edit_mod_source(id, edit),
@@ -1298,27 +1255,6 @@ impl AppData {
                 self.set_mod_source_tap_point(id, tap_point)
             }
             AppEvent::SetArmedModSource(id) => self.cur.peph.armed_mod_source = id,
-            AppEvent::SetAuxInputTapPoint {
-                device_id,
-                port,
-                tap_point,
-            } => self.set_aux_input_tap_point(device_id, port, tap_point),
-            // ---- r.md #110 Parallel ----
-            AppEvent::AddParallel { chain, index } => self.add_parallel(chain, index),
-            AppEvent::GroupDevices { device_ids } => self.group_devices(device_ids),
-            AppEvent::UngroupParallel { parallel_id } => self.ungroup_parallel(parallel_id),
-            AppEvent::AddParallelChain { parallel_id } => self.add_parallel_chain(parallel_id),
-            AppEvent::DuplicateParallelChain { chain_id } => self.duplicate_parallel_chain(chain_id),
-            AppEvent::RenameParallelChain { chain_id, name } => self.rename_parallel_chain(chain_id, name),
-            AppEvent::RenameParallel { parallel_id, name } => self.rename_parallel(parallel_id, name),
-            AppEvent::SetParallelChainColor { chain_id, color } => {
-                self.set_parallel_chain_color(chain_id, color)
-            }
-            AppEvent::SetParallelColor { parallel_id, color } => self.set_parallel_color(parallel_id, color),
-            AppEvent::SetChainMixer { chain_id, edit } => self.set_chain_mixer(chain_id, edit),
-            AppEvent::SetParallelMixer { parallel_id, edit } => self.set_parallel_mixer(parallel_id, edit),
-            AppEvent::SetParallelSplit { parallel_id, split } => self.set_parallel_split(parallel_id, split),
-            AppEvent::ToggleParallelNodeCollapsed { id } => self.toggle_parallel_node_collapsed(id),
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }

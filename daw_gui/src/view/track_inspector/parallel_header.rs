@@ -12,12 +12,14 @@ use daw_ui_core::{Edit, KnobStyle, ScrubCurve, ScrubableNumberFormat, ScrubableN
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, InspectorScrubField, ModControlDomain};
+use crate::event_device::DeviceEvent;
 use crate::handler::parallel::ParallelMixerEdit;
 use crate::view::modulation::{PLAIN_IDENT, build_mod, push_mod_depth_bracket};
 use crate::view::param_gesture::push_param_gesture_edges;
 use common::model::{AutomationTarget, SELECTOR_FADE_RANGE, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
 
-use super::chain_list::{CHAIN_BTN_W, CHAIN_KNOB, ROW_H, draw_disclosure, draw_rename_input};
+use super::chain_list::ROW_H;
+use super::chain_row::{CHAIN_BTN_W, CHAIN_KNOB, draw_disclosure, draw_rename_input};
 use super::{push_scrub_bracket, scrub_style, toggle_audio_style};
 
 /// dropdown の項目 (順序 = [`split_index`] / [`split_from_index`])。
@@ -71,7 +73,7 @@ pub(super) fn draw_split_dropdown(
         let next = split_from_index(idx, split);
         if next != split {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: next });
+                app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: next }));
             }));
         }
     }
@@ -171,10 +173,10 @@ fn draw_active_field(
             let chain_id = chain_ids[k];
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::SetParallelMixer {
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
                         parallel_id,
                         edit: ParallelMixerEdit::ActiveChain(chain_id),
-                    });
+                    }));
                 }
             })
         },
@@ -215,10 +217,10 @@ fn draw_fade_field(
         move |v| {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::SetParallelMixer {
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
                         parallel_id,
                         edit: ParallelMixerEdit::SelectorFade(v as f32),
-                    });
+                    }));
                 }
             })
         },
@@ -277,10 +279,10 @@ fn draw_freq_field(
         move |v| {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::SetParallelMixer {
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
                         parallel_id,
                         edit: ParallelMixerEdit::SplitFreq { edge, hz: v as f32 },
-                    });
+                    }));
                 }
             })
         },
@@ -334,7 +336,7 @@ pub(super) fn draw_parallel_begin_row(
         move || {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![parallel_id] });
+                    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![parallel_id] }));
                 }
             })
         },
@@ -351,7 +353,7 @@ pub(super) fn draw_parallel_begin_row(
         move |v| {
             Edit::mutate(move |app: &mut AppData| {
                 if !popup_open {
-                    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(v) });
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(v) }));
                 }
             })
         },
@@ -371,7 +373,7 @@ pub(super) fn draw_parallel_begin_row(
             move |v| {
                 let gain = v * 2.0;
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(gain) });
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(gain) }));
                 })
             },
             None,
@@ -395,7 +397,7 @@ pub(super) fn draw_parallel_begin_row(
         && *id == parallel_id
     {
         draw_rename_input(app, ui, ("inspector_parallel_rename", i), name_rect, buf, move |app, text| {
-            app.handle_event(AppEvent::RenameParallel { parallel_id, name: text });
+            app.handle_event(AppEvent::Device(DeviceEvent::RenameParallel { parallel_id, name: text }));
         });
     } else {
         ui.label_at_clipped(

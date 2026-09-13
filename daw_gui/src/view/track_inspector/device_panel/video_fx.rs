@@ -4,6 +4,7 @@
 //! `chain_sections.rs` / `modulation_rack.rs` と同じ
 //! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
 use super::super::*;
+use crate::event_device::DeviceEvent;
 
 pub(super) fn draw_video_fx_params(
     app: &AppData,
@@ -93,6 +94,6 @@ pub(super) fn draw_video_fx_params(
 #[allow(clippy::cast_possible_truncation)]
 fn set_video_fx_param_edit(device_id: u64, param_id: u32, v: f64) -> Edit<AppData> {
     Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::SetVideoFxParam { device_id, param_id, value_real: v as f32 });
+        app.handle_event(AppEvent::Device(DeviceEvent::SetVideoFxParam { device_id, param_id, value_real: v as f32 }));
     })
 }

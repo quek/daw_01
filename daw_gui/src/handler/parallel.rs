@@ -12,13 +12,14 @@ use common::protocol::AudioCommand;
 impl AppData {
     // -------- 作る / 壊す ---------------------------------------------------
 
-    /// `chain` の `index` に空の Parallel (chain 1 本) を挿す (picker の 「Parallel」)。
-    pub(crate) fn add_parallel(&mut self, chain: ChainRef, index: u32) {
+    /// `chain` の `at` に空の Parallel (chain 1 本) を挿す (picker の 「Parallel」)。
+    pub(crate) fn add_parallel(&mut self, chain: ChainRef, at: InsertAt) {
         self.ensure_first_track();
         self.edit_song_checked(move |song| {
             if song.chain_devices(chain).is_none() {
                 return false;
             }
+            let InsertAt::Index(index) = at;
             let mut parallel = Parallel::new();
             parallel.id = song.alloc_device_id();
             parallel.chains[0].id = song.alloc_device_id();

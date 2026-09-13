@@ -20,7 +20,8 @@ use common::model::{
 use common::plugin_format::PluginFormat;
 use common::protocol::PluginCommand;
 
-use daw_gui::app::{AppData, AppEvent, EditSurface, RelocateDevices};
+use daw_gui::app::{AppData, AppEvent, EditSurface, InsertAt, RelocateDevices};
+use daw_gui::event_device::DeviceEvent;
 use daw_gui::widgets::select_modifier::SelectModifier;
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
@@ -121,12 +122,12 @@ fn move_between_tracks_keeps_device_id_and_carries_lane() {
         .expect("edit_song");
     let _ = drain(&mut plugin_rx);
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     // plugin state の round-trip 待ちに積まれるので、応答を fake して実行させる。
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
@@ -190,12 +191,12 @@ fn move_across_tracks_rekeys_lane_row_override() {
     let from = AutomationLaneKey { track: t0, lane };
     app.cur.view.automation_lane_row_overrides.insert(from, 123);
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -240,12 +241,12 @@ fn move_across_tracks_drops_ara_archive() {
     });
 
     // (1) 同一チェーン内の移動 (= 並べ替え) では残る。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t0),
-        dest_index: 2,
+        dest_index: InsertAt::Index(2),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -260,12 +261,12 @@ fn move_across_tracks_drops_ara_archive() {
     );
 
     // (2) トラックを跨いだら捨てる。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -296,12 +297,12 @@ fn copy_allocates_new_id_and_keeps_state() {
     });
     let _ = drain(&mut plugin_rx);
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: true,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -356,12 +357,12 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
     });
 
     // 同一トラック内のコピー → 引き継ぐ。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t0),
-        dest_index: 1,
+        dest_index: InsertAt::Index(1),
         copy: true,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -381,12 +382,12 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
     }
 
     // 別トラックへのコピー → 捨てる。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: true,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -424,12 +425,12 @@ fn move_voicevox_moves_vocal_marker() {
         })
         .expect("edit_song");
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -465,7 +466,7 @@ fn removing_one_of_two_voicevox_keeps_vocal_marker() {
         })
         .expect("edit_song");
 
-    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![a] });
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![a] }));
     // 削除は plugin state の round-trip 待ちに積まれるので、応答を fake して実行させる。
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
@@ -488,12 +489,12 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
     let t1 = add_empty_track(&mut app);
     let dev = add_plugin(&mut app, t0, "test.fx");
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t1),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -529,12 +530,12 @@ fn master_chain_round_trip() {
     add_plugin_param_lane(&mut app, t0, dev);
     let master = common::model::MASTER_TRACK_ID;
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(master),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -549,12 +550,12 @@ fn master_chain_round_trip() {
         "lane は song_lanes へ移る (master は song 所有)"
     );
 
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![dev],
         dest: common::model::ChainRef::Track(t0),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
@@ -623,10 +624,10 @@ fn device_selection_is_scoped_to_displayed_chain() {
 
     // t0 の device を選ぶ → タグは Devices。
     select_track_single(&mut app, 0);
-    app.handle_event(AppEvent::SelectDevice {
+    app.handle_event(AppEvent::Device(DeviceEvent::SelectDevice {
         device_id: dev0,
         modifier: SelectModifier::Single,
-    });
+    }));
     assert_eq!(app.edit_surface(false), Some(EditSurface::Devices));
     assert_eq!(app.live_device_ids(), vec![dev0]);
 
@@ -650,10 +651,10 @@ fn device_selection_is_scoped_to_displayed_chain() {
     );
 
     // t1 の device を Ctrl+click → 異トラックの id は混ざらない。
-    app.handle_event(AppEvent::SelectDevice {
+    app.handle_event(AppEvent::Device(DeviceEvent::SelectDevice {
         device_id: dev1,
         modifier: SelectModifier::Toggle,
-    });
+    }));
     assert_eq!(app.live_device_ids(), vec![dev1]);
     assert!(
         !app.cur.selection.selected_device_ids.contains(&dev0),

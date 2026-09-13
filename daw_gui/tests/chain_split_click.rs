@@ -12,8 +12,9 @@ use common::model::{ChainRef, Split};
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent};
+use daw_gui::app::{AppData, AppEvent, InsertAt};
 use daw_gui::dispatcher::{BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher};
+use daw_gui::event_device::DeviceEvent;
 use daw_gui::widgets::select_modifier::SelectModifier;
 use daw_ui_core::{FrameInput, PointerFrame, UiHost};
 use daw_ui_platform::PhysicalSize;
@@ -31,7 +32,10 @@ fn build_app() -> (AppData, UnboundedReceiver<AudioCommand>, UnboundedReceiver<P
     let visible: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
     let tid = visible[0];
     app.apply_select_tracks(tid, SelectModifier::Single, &visible);
-    app.handle_event(AppEvent::AddParallel { chain: ChainRef::Track(tid), index: 0 });
+    app.handle_event(AppEvent::Device(DeviceEvent::AddParallel {
+        chain: ChainRef::Track(tid),
+        at: InsertAt::Index(0),
+    }));
     (app, audio_rx, plugin_rx)
 }
 

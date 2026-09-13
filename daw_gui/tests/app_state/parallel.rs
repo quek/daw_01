@@ -3,7 +3,8 @@
 
 use common::model::{ChainRef, Device, TapPoint, TapSource};
 use common::protocol::PluginEvent;
-use daw_gui::app::{AppData, AppEvent, ChainRowKind, RelocateDevices};
+use daw_gui::app::{AppData, AppEvent, ChainRowKind, InsertAt, RelocateDevices};
+use daw_gui::event_device::DeviceEvent;
 
 use super::support::{build_app, fake_plugin_loaded, select_track_single};
 
@@ -40,7 +41,7 @@ fn group_wraps_selected_devices_into_a_parallel_and_ungroup_restores_them() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
     let (_track_id, [synth, bitcrush, delay]) = setup_chain(&mut app);
 
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush, delay] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush, delay] }));
     let song = app.cur.song_doc.song();
     let devices = &song.tracks[0].devices;
     assert_eq!(devices.len(), 2, "synth + Parallel");
@@ -58,7 +59,7 @@ fn group_wraps_selected_devices_into_a_parallel_and_ungroup_restores_them() {
     assert_eq!(plugin_ids_in_order(&app), vec!["test.synth", "test.bitcrush", "test.delay"]);
 
     let parallel_id = parallel.id;
-    app.handle_event(AppEvent::UngroupParallel { parallel_id });
+    app.handle_event(AppEvent::Device(DeviceEvent::UngroupParallel { parallel_id }));
     let devices = &app.cur.song_doc.song().tracks[0].devices;
     assert_eq!(
         devices.iter().map(Device::id).collect::<Vec<_>>(),
@@ -71,9 +72,9 @@ fn group_wraps_selected_devices_into_a_parallel_and_ungroup_restores_them() {
 fn chain_rows_put_each_open_chains_devices_under_its_row() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
     let (track_id, [synth, bitcrush, delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
-    app.handle_event(AppEvent::AddParallelChain { parallel_id });
+    app.handle_event(AppEvent::Device(DeviceEvent::AddParallelChain { parallel_id }));
     let (chain_a, chain_b) = {
         let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
         (r.chains[0].id, r.chains[1].id)
@@ -114,25 +115,25 @@ fn chain_rows_put_each_open_chains_devices_under_its_row() {
         ],
     );
     // A を閉じると bitcrush の行が消え、B は開いたまま。 もう一度で戻る。
-    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: chain_a });
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleParallelNodeCollapsed { id: chain_a }));
     let rows = app.chain_rows();
     assert!(!rows.iter().any(|r| matches!(&r.kind, ChainRowKind::Plugin(e) if e.device_id == bitcrush)));
     assert!(rows.iter().any(|r| matches!(&r.kind, ChainRowKind::AddPlugin { chain: ChainRef::Chain(c) } if *c == chain_b)));
-    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: chain_a });
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleParallelNodeCollapsed { id: chain_a }));
     assert_eq!(app.chain_rows().iter().filter(|r| matches!(r.kind, ChainRowKind::Plugin(_))).count(), 3);
     // Parallel ごと畳むと開始行 1 本だけ (chain 行も終了行も無い)。
-    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: parallel_id });
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleParallelNodeCollapsed { id: parallel_id }));
     let rows = app.chain_rows();
     assert!(rows.iter().any(|r| matches!(&r.kind, ChainRowKind::ParallelBegin { open: false, .. })));
     assert!(!rows.iter().any(|r| matches!(r.kind, ChainRowKind::Chain { .. } | ChainRowKind::ParallelEnd { .. })));
-    app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id: parallel_id });
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleParallelNodeCollapsed { id: parallel_id }));
     // 自動色: Parallel と chain、兄弟 chain、入れ子の Parallel / chain がそれぞれ別の色。
     let (rc, ca, cb) = {
         let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
         (r.color.expect("parallel color"), r.chains[0].color.expect("chain color"), r.chains[1].color.expect("chain color"))
     };
     assert!(rc != ca && rc != cb && ca != cb, "{rc:?} {ca:?} {cb:?}");
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let inner = app.cur.song_doc.song().chain_by_id(chain_a).unwrap().1.devices[0].as_parallel().unwrap().clone();
     let (irc, ica) = (inner.color.unwrap(), inner.chains[0].color.unwrap());
     assert!(![rc, ca].contains(&irc) && ![rc, ca, irc].contains(&ica), "入れ子は外側と別の色: {irc:?} {ica:?}");
@@ -143,17 +144,17 @@ fn chain_rows_put_each_open_chains_devices_under_its_row() {
 fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
     let (track_id, [synth, bitcrush, delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
     let chain_id = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
 
     // delay を chain の中 (bitcrush の後ろ) へ。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![delay],
         dest: ChainRef::Chain(chain_id),
-        dest_index: 1,
+        dest_index: InsertAt::Index(1),
         copy: false,
-    }));
+    })));
     flush_states(&mut app);
     let song = app.cur.song_doc.song();
     assert_eq!(song.tracks[0].devices.len(), 2, "top-level は synth + Parallel");
@@ -162,24 +163,24 @@ fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
     assert_eq!(song.find_device(delay), Some((ChainRef::Chain(chain_id), 1)));
 
     // Parallel ごと top-level 先頭へ (synth の前)。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![parallel_id],
         dest: ChainRef::Track(track_id),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     flush_states(&mut app);
     let ids: Vec<u64> = app.cur.song_doc.song().tracks[0].devices.iter().map(Device::id).collect();
     assert_eq!(ids, vec![parallel_id, synth]);
     assert_eq!(plugin_ids_in_order(&app), vec!["test.bitcrush", "test.delay", "test.synth"]);
 
     // Parallel を自分の中の chain へは落とせない (循環)。
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
         device_ids: vec![parallel_id],
         dest: ChainRef::Chain(chain_id),
-        dest_index: 0,
+        dest_index: InsertAt::Index(0),
         copy: false,
-    }));
+    })));
     flush_states(&mut app);
     let ids: Vec<u64> = app.cur.song_doc.song().tracks[0].devices.iter().map(Device::id).collect();
     assert_eq!(ids, vec![parallel_id, synth], "自分の中への移動は無視される");
@@ -189,13 +190,13 @@ fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
 fn removing_a_chain_unloads_its_plugins_and_keeps_the_parallel() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let (_track_id, [_synth, bitcrush, delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush, delay] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush, delay] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
-    app.handle_event(AppEvent::AddParallelChain { parallel_id });
+    app.handle_event(AppEvent::Device(DeviceEvent::AddParallelChain { parallel_id }));
     let chain_a = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
     let _ = super::support::drain(&mut plugin_rx);
 
-    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![chain_a] });
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![chain_a] }));
     flush_states(&mut app);
     let song = app.cur.song_doc.song();
     let parallel = song.parallel_by_id(parallel_id).expect("Parallel 自体は残る");
@@ -216,7 +217,7 @@ fn removing_a_chain_unloads_its_plugins_and_keeps_the_parallel() {
 fn sidechain_source_can_be_a_chain_of_the_same_track() {
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
     let (_track_id, [_synth, bitcrush, delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
     let chain_a = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
     // 候補に 「Parallel / Chain 1」 が出る。
@@ -225,12 +226,16 @@ fn sidechain_source_can_be_a_chain_of_the_same_track() {
         choices.iter().any(|c| c.source == Some(TapSource::Chain(chain_a))),
         "chain が source 候補に並ぶ: {choices:?}"
     );
-    app.handle_event(AppEvent::SetSidechainSource {
+    app.handle_event(AppEvent::Device(DeviceEvent::SetSidechainSource {
         device_id: delay,
         port: 0,
         source: Some(TapSource::Chain(chain_a)),
-    });
-    app.handle_event(AppEvent::SetAuxInputTapPoint { device_id: delay, port: 0, tap_point: TapPoint::PostFx });
+    }));
+    app.handle_event(AppEvent::Device(DeviceEvent::SetAuxInputTapPoint {
+        device_id: delay,
+        port: 0,
+        tap_point: TapPoint::PostFx,
+    }));
     let p = app.cur.song_doc.song().plugin_by_id(delay).unwrap();
     let tap = p.aux_inputs[0].unwrap().tap;
     assert_eq!(tap.source, TapSource::Chain(chain_a));
@@ -248,12 +253,12 @@ fn parallel_out_gain_and_gain_match_update_song_and_send_value_only_commands() {
     use daw_gui::handler::parallel::ParallelMixerEdit;
     let (mut app, mut audio_rx, _plugin_rx, _proxy) = build_app();
     let (track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
     let _ = super::support::drain(&mut audio_rx);
 
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(0.5) });
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::OutGain(0.5) }));
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!((r.out_gain, r.gain_match), (0.5, true));
     let cmds = super::support::drain(&mut audio_rx);
@@ -265,7 +270,7 @@ fn parallel_out_gain_and_gain_match_update_song_and_send_value_only_commands() {
     assert!(cmds.iter().any(|c| matches!(c, AudioCommand::SetParallelGainMatch { project: _, parallel_id: p, on: true, .. } if *p == parallel_id)));
     assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
     // 同じ値をもう一度 → 何も送らない。
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::GainMatch(true) }));
     assert!(super::support::drain(&mut audio_rx).is_empty());
 }
 
@@ -277,10 +282,10 @@ fn enabling_frequency_split_pads_chains_to_three_and_shows_the_split_row() {
     use common::model::Split;
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
     let (_track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
 
-    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split, Split::Frequency3 { low_hz: 200.0, high_hz: 2_000.0 });
     assert_eq!(
@@ -305,8 +310,8 @@ fn enabling_frequency_split_pads_chains_to_three_and_shows_the_split_row() {
 
     // ユーザーが付けた名前は切替で触らない。
     let mid_id = r.chains[1].id;
-    app.handle_event(AppEvent::RenameParallelChain { chain_id: mid_id, name: "Comp".into() });
-    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::None });
+    app.handle_event(AppEvent::Device(DeviceEvent::RenameParallelChain { chain_id: mid_id, name: "Comp".into() }));
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: Split::None }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split, Split::None);
     assert_eq!(
@@ -325,15 +330,15 @@ fn split_frequency_edits_keep_order_and_send_value_only_commands() {
     use daw_gui::handler::parallel::ParallelMixerEdit;
     let (mut app, mut audio_rx, _plugin_rx, _proxy) = build_app();
     let (track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
-    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 }));
     let _ = super::support::drain(&mut audio_rx);
 
-    app.handle_event(AppEvent::SetParallelMixer {
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
         parallel_id,
         edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::LowMid, hz: 3_000.0 },
-    });
+    }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split, Split::Frequency3 { low_hz: 3_000.0, high_hz: 3_000.0 }, "Low|Mid が Mid|High を押し上げる");
     let cmds = super::support::drain(&mut audio_rx);
@@ -348,17 +353,17 @@ fn split_frequency_edits_keep_order_and_send_value_only_commands() {
     assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
 
     // 値域外は端へ。 同じ値をもう一度 → 何も送らない。
-    app.handle_event(AppEvent::SetParallelMixer {
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
         parallel_id,
         edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::MidHigh, hz: 99_999.0 },
-    });
+    }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split.freq(SplitEdge::MidHigh), Some(20_000.0));
     let _ = super::support::drain(&mut audio_rx);
-    app.handle_event(AppEvent::SetParallelMixer {
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer {
         parallel_id,
         edit: ParallelMixerEdit::SplitFreq { edge: SplitEdge::MidHigh, hz: 20_000.0 },
-    });
+    }));
     assert!(super::support::drain(&mut audio_rx).is_empty());
 }
 
@@ -368,10 +373,10 @@ fn enabling_mid_side_split_pads_chains_to_two_without_a_params_row() {
     use common::model::Split;
     let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
     let (_track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
 
-    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::MidSide });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: Split::MidSide }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.split, Split::MidSide);
     assert_eq!(r.chains.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["Mid", "Side"]);
@@ -388,10 +393,10 @@ fn selector_pads_to_two_chains_and_switches_the_active_chain_value_only() {
     use daw_gui::handler::parallel::ParallelMixerEdit;
     let (mut app, mut audio_rx, _plugin_rx, _proxy) = build_app();
     let (track_id, [_synth, bitcrush, _delay]) = setup_chain(&mut app);
-    app.handle_event(AppEvent::GroupDevices { device_ids: vec![bitcrush] });
+    app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush] }));
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
 
-    app.handle_event(AppEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_SELECTOR });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_SELECTOR }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     let [a, b] = [r.chains[0].id, r.chains[1].id];
     assert_eq!(r.split, Split::Selector { active_chain: a, fade_ms: Split::DEFAULT_SELECTOR_FADE_MS }, "先頭 chain の実 id");
@@ -409,7 +414,7 @@ fn selector_pads_to_two_chains_and_switches_the_active_chain_value_only() {
     assert_eq!(inactive(&app), vec![false, true]);
     let _ = super::support::drain(&mut audio_rx);
 
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(b) });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(b) }));
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.active_chain_index(), Some(1));
     assert_eq!(inactive(&app), vec![true, false]);
@@ -425,16 +430,16 @@ fn selector_pads_to_two_chains_and_switches_the_active_chain_value_only() {
     assert!(!cmds.iter().any(|c| matches!(c, AudioCommand::LoadSong { .. })), "値のみ更新は再 compile しない");
 
     // fade も値のみ。 無い chain / 同じ chain は何も送らない。
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::SelectorFade(120.0) });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::SelectorFade(120.0) }));
     assert_eq!(app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().split.selector_fade_ms(), Some(120.0));
     let cmds = super::support::drain(&mut audio_rx);
     assert!(cmds.iter().any(|c| matches!(c, AudioCommand::SetParallelSelectorFade { project: _, fade_ms, .. } if *fade_ms == 120.0)));
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(b) });
-    app.handle_event(AppEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(9_999) });
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(b) }));
+    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelMixer { parallel_id, edit: ParallelMixerEdit::ActiveChain(9_999) }));
     assert!(super::support::drain(&mut audio_rx).is_empty());
 
     // アクティブ chain (b) を消す → 先頭 (a) がアクティブ。
-    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![b] });
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![b] }));
     flush_states(&mut app);
     let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
     assert_eq!(r.chains.len(), 1);

@@ -4,6 +4,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
+use crate::event_device::DeviceEvent;
 use std::sync::{Arc};
 use common::model::{InstrumentSource, MAX_TRACK_GAIN, SendMode};
 use common::protocol::AudioCommand;
@@ -49,7 +50,10 @@ impl AppData {
                 .filter(|c| self.cur.song_doc.song().chain_devices(*c).is_some())
                 .unwrap_or(common::model::ChainRef::Track(track_id));
             let at = self.cur.song_doc.song().chain_devices(dest).map_or(0, Vec::len) as u32;
-            self.handle_event(AppEvent::AddParallel { chain: dest, index: at });
+            self.handle_event(AppEvent::Device(DeviceEvent::AddParallel {
+                chain: dest,
+                at: InsertAt::Index(at),
+            }));
             return;
         }
         let Some(db) = self.ipc.plugin_db.clone() else {

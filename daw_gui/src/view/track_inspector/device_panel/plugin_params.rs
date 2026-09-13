@@ -4,6 +4,7 @@
 //! `chain_sections.rs` / `modulation_rack.rs` と同じ
 //! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
 use super::super::*;
+use crate::event_device::DeviceEvent;
 
 pub(super) fn draw_plugin_params(
     app: &AppData,
@@ -121,6 +122,6 @@ pub(super) fn draw_plugin_params(
 /// `SetPluginParam` は per-frame 非 undoable で、 stroke の bracket は呼び出し側が持つ。
 fn set_plugin_param_edit(device_id: u64, param_id: u32, value_real: f64) -> Edit<AppData> {
     Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::SetPluginParam { device_id, param_id, value_real });
+        app.handle_event(AppEvent::Device(DeviceEvent::SetPluginParam { device_id, param_id, value_real }));
     })
 }

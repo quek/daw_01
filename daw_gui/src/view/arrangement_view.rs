@@ -9,7 +9,8 @@ use crate::widgets::arrangement::{live_clip_key, ArrangementResponse};
 use daw_ui_core::{Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget};
+use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget, InsertAt};
+use crate::event_device::DeviceEvent;
 use crate::theme::Theme;
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
@@ -136,12 +137,12 @@ fn device_drag_over_headers(
             .song()
             .fx_chain_by_track_id(hover_track)
             .map_or(0, <[_]>::len) as u32;
-        app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
+        app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(crate::app::RelocateDevices {
             device_ids: payload.device_ids.clone(),
             dest: common::model::ChainRef::Track(hover_track),
-            dest_index,
+            dest_index: InsertAt::Index(dest_index),
             copy,
-        }));
+        })));
     }));
 }
 
