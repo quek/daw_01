@@ -123,6 +123,7 @@ impl AppData {
         // r.md #129 (Q18): 移動した行は Par を閉じた状態から始める (同じトラック内の並べ替えも)。
         // コピーは新 id なので最初から閉じている。
         self.close_rack_panels_of(&outcome.moved_nodes);
+        self.note_dropped_cyclic_routes(outcome.dropped_routes);
 
         // コピーで作った device を host に実体化する。 **finalize を先に積む**
         // (load 応答が先に届いたときに取りこぼさないため)。 `OpenPluginShmem` は
@@ -335,13 +336,14 @@ impl AppData {
                 chain.splice(at..at, created.iter().cloned());
             }
             // 持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。
-            song.drop_cyclic_aux_routes(&[dest_track]);
+            let dropped = song.drop_cyclic_aux_routes(&node_ids_of(&created));
             apply_dest_side_effects(song, dest_track, &created);
-            created
+            (created, dropped)
         });
-        let Some(created) = created else {
+        let Some((created, dropped)) = created else {
             return 0;
         };
+        self.note_dropped_cyclic_routes(dropped);
         let created_plugins: Vec<common::model::PluginInstance> =
             plugins(&created).cloned().collect();
         for inst in &created_plugins {
@@ -356,6 +358,15 @@ impl AppData {
         let n = created.len();
         self.set_device_selection(created.iter().map(Device::id).collect());
         n
+    }
+
+    /// 貼り付け / コピー / 運搬で持ち込んだサイドチェインのうち、依存が循環するので落とした本数を status に出す
+    /// (黙って消すと、後で Comp を ON にしたときに初めて配線が無いことに気付く)。0 本なら何もしない。
+    pub(crate) fn note_dropped_cyclic_routes(&mut self, dropped: usize) {
+        if dropped > 0 {
+            self.ui_ephemeral.status_message =
+                format!("依存が循環するサイドチェイン配線を {dropped} 本外しました");
+        }
     }
 
     // -------- r.md #71: device 選択 ----------------------------------------
@@ -396,37 +407,6 @@ impl AppData {
             self.cur.selection.last_edit_select = Some(EditSurface::Devices);
         }
     }
-
-    /// device が消える経路 (削除 / 切り取り / Parallel 解除 / track 削除 / project 切替 /
-    /// undo-redo) の後始末。 選択から実在しない id を落とし (空になったらタグを降ろす)、
-    /// 居なくなった device の SC Listen を解除する。
-    ///
-    /// 選択については **正しさの担保ではない** — それは読む側の [`Self::live_device_ids`] が持つ。
-    /// ここは保持した集合が無限に育たないようにするだけ。
-    pub(crate) fn prune_device_session_refs(&mut self) {
-        let song = self.cur.song_doc.song();
-        let alive: Vec<u64> = self
-            .cur.selection
-            .selected_device_ids
-            .iter()
-            .copied()
-            .filter(|&id| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some())
-            .collect();
-        if alive.len() != self.cur.selection.selected_device_ids.len() {
-            self.set_device_selection(alive);
-        }
-        if self
-            .cur.selection
-            .device_anchor
-            .is_some_and(|id| {
-                let song = self.cur.song_doc.song();
-                song.device_by_id(id).is_none() && song.chain_by_id(id).is_none()
-            })
-        {
-            self.cur.selection.device_anchor = None;
-        }
-        self.prune_sc_listen();
-    }
 }
 
 /// [`AppData::relocate_devices_inner`] が `edit_song` の中で組み立てる結果。
@@ -444,6 +424,15 @@ struct RelocateOutcome {
     moved_nodes: Vec<u64>,
     /// コピーで新規に作った device (中の plugin を host へ実体化する対象)。
     created: Vec<Device>,
+    /// 依存が循環するので落としたサイドチェイン配線の本数 (status に出す)。
+    dropped_routes: usize,
+}
+
+/// `devices` 以下の node id 全部 (plugin / native / Parallel / chain)。
+fn node_ids_of(devices: &[Device]) -> Vec<u64> {
+    let mut ids = Vec::new();
+    common::model::for_each_node_id(devices, &mut |id| ids.push(id));
+    ids
 }
 
 /// 運搬の Song 側処理 (純関数)。 `None` = 落とし先チェーンが無い / 対象ゼロ。
@@ -481,6 +470,7 @@ fn relocate_in_song(
         moved_devices: Vec::new(),
         moved_nodes: Vec::new(),
         created: Vec::new(),
+        dropped_routes: 0,
     };
 
     if copy {
@@ -508,7 +498,7 @@ fn relocate_in_song(
             chain.splice(at..at, copies.iter().cloned());
         }
         // 持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。
-        song.drop_cyclic_aux_routes(&[dest_track]);
+        outcome.dropped_routes = song.drop_cyclic_aux_routes(&node_ids_of(&copies));
         // 副作用は **dest 側だけ** (src はそのまま残るので降ろさない)。
         apply_dest_side_effects(song, dest_track, &copies);
         outcome.result_ids = copies.iter().map(Device::id).collect();
@@ -567,12 +557,11 @@ fn relocate_in_song(
         chain.splice(at..at, moved.iter().cloned());
     }
     if !outcome.moved_devices.is_empty() {
-        // トラックを跨いで持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。 先に
-        // dest 上の配線 (持ち込んだもの) を判定し、 残った循環 (運んだ Parallel の chain を他トラックが
-        // 読んでいる) だけを他トラック側で落とす。
-        song.drop_cyclic_aux_routes(&[dest_track]);
-        let all: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
-        song.drop_cyclic_aux_routes(&all);
+        // トラックを跨いで持ち込んだサイドチェインと、運んだ Parallel の chain を他トラックから読む配線
+        // (chain の持ち主が変わって辺が変わる) のうち、依存が循環するものを落とす (§5.9)。同じトラック内の
+        // 並べ替えは辺を変えないので判定しない。
+        let crossed: Vec<u64> = outcome.moved_devices.iter().map(|&(_, _, id)| id).collect();
+        outcome.dropped_routes = song.drop_cyclic_aux_routes(&crossed);
     }
     // 副作用の対称化: src 側は「他に残っていなければ降ろす」、 dest 側は立てる。
     for (src_track, left) in left_by_track {

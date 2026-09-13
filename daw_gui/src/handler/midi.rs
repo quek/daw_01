@@ -213,10 +213,19 @@ impl AppData {
             return;
         }
         if let Some(target) = self.cur.recording.midi_learn_target.take() {
+            // r.md #129: 束縛先が解決しない (Learn を押した後に device が消えた等) なら bind しない。積むと
+            // enforce が同じ編集の中で消し、既存の同じ CC の binding だけが消えるか、中身の無い undo step と
+            // `*` が残る。規則は enforce と同じ `Song::binding_target_resolves`。
+            if !self.cur.song_doc.song().binding_target_resolves(&target) {
+                self.ui_ephemeral.status_message =
+                    "MIDI Learn: 対象が削除されたので bind しませんでした".into();
+                return;
+            }
             // Learn mode: 既存 同 (channel, controller) を retain で除外 +
-            // 新 binding push。 status_message は次 frame の通常 status に上書き
-            // されるが「bind 完了」 を一瞬表示。
-            self.edit_song(move |song| {
+            // 新 binding push (同じ binding を Learn し直しただけなら変化なし)。 status_message は
+            // 次 frame の通常 status に上書きされるが「bind 完了」 を一瞬表示。
+            self.edit_song_checked(move |song| {
+                let before = song.midi_bindings.clone();
                 song.midi_bindings.retain(|b| {
                     !(b.input == common::model::MidiBindInput::cc(controller)
                         && b.channel == channel)
@@ -227,6 +236,7 @@ impl AppData {
                     legacy_controller: None,
                     target,
                 });
+                song.midi_bindings != before
             });
             self.ui_ephemeral.status_message =
                 format!("MIDI bind: CC {controller} (ch {channel}) → {target:?}");

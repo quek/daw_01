@@ -90,6 +90,10 @@ impl AppData {
         self.cur.peph.audio_editor_clip = None;
         self.cur.peph.armed_mod_source = None;
         self.cur.peph.expanded_mod_sources.clear();
+        // `A` キー / MIDI Learn の的も前の曲の id (device / track / 変調) を指す。残すと新しい曲の
+        // 同じ id の別の対象にレーンや binding が付く。
+        self.cur.peph.last_touched_param = None;
+        self.cur.recording.midi_learn_target = None;
         // r.md #129: Par の実測高は device id keyed の session 値 (開閉は ViewState が運ぶ)。
         self.cur.peph.rack_panel_heights.clear();
         // SC Listen は聴き方の都合で Song に書かない。新しい曲の device を指さないよう、LoadSong
@@ -321,9 +325,9 @@ impl AppData {
         }
         // collapsed_groups も track が消えていたら除外。
         self.cur.view.collapsed_groups.retain(|id| live_ids.contains(id));
-        // r.md #71 (プラグインのコピー / 移動): undo/redo で消えた device の id も
-        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。Listen も解除する。
-        self.prune_device_session_refs();
+        // undo/redo は `edit_song` を通らないので、消えた id を指す session 状態 (device 選択 / Listen /
+        // Learn 待ち / last touched) の掃除をここで同じ口から呼ぶ。
+        self.reconcile_song_refs();
         self.resize_track_peak_display();
         // Undo / Redo は plugin_host / audio engine の plugin
         // load 状態に直接 IPC を発行しないので、 ここで Song と
@@ -346,6 +350,69 @@ impl AppData {
             "reconcile_plugins_with_song after Undo/Redo"
         );
         self.resync_song_edit_texts();    }
+
+    /// Song 編集の口 (`edit_song` / `edit_song_checked` / `normalize_song(_checked)`) の後始末: 編集の前に
+    /// 読んだ `structure_epoch` から id 構造が変わっていれば [`Self::reconcile_song_refs`] を回す。掃除対象は
+    /// すべて id 構造 (`StructureWatch`) に含まれる id を指すので、値だけの編集 (ドラッグ中の毎フレーム) では
+    /// 何もしない。
+    pub(crate) fn reconcile_song_refs_after(&mut self, structure_epoch: u64) {
+        if self.cur.song_doc.structure_epoch() != structure_epoch {
+            self.reconcile_song_refs();
+        }
+    }
+
+    /// Song の id を指す session 状態のうち、指す先が居なくなったものを外す。**Song を変える AppData の口
+    /// (`edit_song` 系は id 構造が変わったときに [`Self::reconcile_song_refs_after`] から、undo / redo /
+    /// 履歴ジャンプは `after_undo_redo` から) の直後に必ず呼ばれる** ので、トラックや device が消える経路
+    /// (削除 / 切り取り / Parallel 解除 / トラック削除 / グループ解除 / 末尾トラック削除 …) ごとに掃除を
+    /// 書かない。冪等。
+    ///
+    /// - device 選択 / anchor: 実在しない id を落とす (空になったらタグを降ろす)。正しさは読む側の
+    ///   [`Self::live_device_ids`] が持ち、ここは保持した集合が育たないようにするだけ。
+    /// - SC Listen: 居なくなった device なら解除する (§10.14)。undo で device が戻っても Listen は勝手に戻らない。
+    /// - MIDI Learn 待ちの的 / last touched: 束縛先が解決しなければ外す (§7.7 / §7.9)。規則は enforce と同じ。
+    ///
+    /// Par の開閉 (`open_rack_panels`) は触らない — undo で消えて redo で戻れば開いた状態で出る (§12.2)。
+    pub(crate) fn reconcile_song_refs(&mut self) {
+        let (alive_selection, anchor_gone, learn_gone, touched_gone) = {
+            let song = self.cur.song_doc.song();
+            let node_alive = |id: u64| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some();
+            let selected = &self.cur.selection.selected_device_ids;
+            let alive_selection = (!selected.iter().all(|&id| node_alive(id)))
+                .then(|| selected.iter().copied().filter(|&id| node_alive(id)).collect::<Vec<_>>());
+            (
+                alive_selection,
+                self.cur.selection.device_anchor.is_some_and(|id| !node_alive(id)),
+                self.cur.recording.midi_learn_target.as_ref().is_some_and(|t| !song.binding_target_resolves(t)),
+                self.cur
+                    .peph
+                    .last_touched_param
+                    .as_ref()
+                    .is_some_and(|t| crate::handler::param_value::touched_param_owner(song, t).is_none()),
+            )
+        };
+        if let Some(alive) = alive_selection {
+            // 選択の setter (`set_device_selection`) は通さない — 明示的なチェーン操作用で、非空なら
+            // last-wins タグを Devices に倒す。後始末で別の面を操作した後のタグを奪うと、次の Delete が
+            // その面に効かなくなる。空になったときだけタグを降ろす。
+            let emptied = alive.is_empty();
+            self.cur.selection.selected_device_ids = alive;
+            if emptied && self.cur.selection.last_edit_select == Some(EditSurface::Devices) {
+                self.cur.selection.last_edit_select = None;
+            }
+        }
+        if anchor_gone {
+            self.cur.selection.device_anchor = None;
+        }
+        if learn_gone {
+            self.cur.recording.midi_learn_target = None;
+            self.ui_ephemeral.status_message = "MIDI Learn: 対象が削除されたので取り消しました".into();
+        }
+        if touched_gone {
+            self.cur.peph.last_touched_param = None;
+        }
+        self.prune_sc_listen();
+    }
 
     // -------- File ----------------------------------------------------------
 

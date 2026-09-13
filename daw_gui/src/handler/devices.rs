@@ -963,10 +963,8 @@ impl AppData {
         }
         // 削除 node を指す参照 (automation lane / mod routing / MIDI binding) と、 それを深さに
         // 持つ変調の連鎖は、 上の edit の中で SongDoc の `enforce_edit_invariants` が同じ undo
-        // step で掃除済み (r.md #129)。
-        // 選択集合からも消えた id を落とし、 空になったら last-wins タグを降ろす
-        // (正しさは `live_device_ids()` の正規化が担保する。 これは後始末)。Listen も解除する。
-        self.prune_device_session_refs();
+        // step で掃除済み (r.md #129)。 消えた id を指す session 状態 (選択 / Listen / Learn 待ち /
+        // last touched) は `edit_song` の後の `reconcile_song_refs` が掃除済み。
     }
 
     /// この device のプラグイン GUI が開いていれば閉じる。 実 window は

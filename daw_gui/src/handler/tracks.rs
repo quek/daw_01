@@ -208,7 +208,7 @@ impl AppData {
         tracks.sort_by_key(|t| t.order);
         // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
         let audio_editor_key = self.audio_editor_target_key();
-        let Some(new_ids) = self.edit_song(|song| {
+        let Some((new_ids, dropped)) = self.edit_song(|song| {
             let same_project = src_pid == song.project_id;
             // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
             let media_remap = if same_project {
@@ -231,18 +231,24 @@ impl AppData {
                 song.tracks.insert((insert_idx + off).min(song.tracks.len()), t);
             }
             // r.md #129 (§5.9): 貼った先の group の下で依存が循環するサイドチェイン (子から親を読む等) は
-            // 落とす (循環すると engine が空の schedule にして master が無音になる)。
-            song.drop_cyclic_aux_routes(&new_ids);
+            // 落とす (循環すると engine が空の schedule にして master が無音になる)。判定するのは貼った
+            // トラックの device の配線だけ。
+            let mut brought: Vec<u64> = Vec::new();
+            for t in song.tracks.iter().filter(|t| new_ids.contains(&t.id)) {
+                common::model::for_each_node_id(&t.devices, &mut |id| brought.push(id));
+            }
+            let dropped = song.drop_cyclic_aux_routes(&brought);
             // 行の不変条件 (孤児セル / 消えたセルを指す主導権 / 死んだ列への Jump) は
             // model が持つ。貼り付けた行にも同じ規則を通す (冪等なので既存行は不変)。
             song.normalize_session();
             // r.md #89: `rehome_pasted_modulation` が落とした変調の **深さ**を指していた
             // 変調 / レーンの連鎖掃除は、SongDoc の `enforce_edit_invariants` が同じ undo step で
             // 担う (r.md #129、固定点の SSoT は `Song::prune_dangling_param_targets`)。
-            new_ids
+            (new_ids, dropped)
         }) else {
             return 0;
         };
+        self.note_dropped_cyclic_routes(dropped);
         // 選択を新 track 群に + plugin host へ各 device を SetSlotPlugin で実体化
         // (flush_song_sync = LoadSong は audio 専属で plugin host では no-op なので、
         //  plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。
@@ -894,9 +900,6 @@ impl AppData {
         for &i in subtree_idxs.iter().rev() {
             self.edit_song(|song| song.tracks.remove(i as usize));
         }
-        // 消えたトラックが所有していたモジュレーターと、その変調の深さを指していた
-        // レーン / 変調の後始末 (トラックを外す全経路共通の 1 本)。
-        self.cleanup_modulation_after_track_removal();
         // (b) LoadSong で audio engine を新 schedule に
         // (c) **重要 (deadlock 防止)**: RemoveSlotPlugin 送信前に daw_audio
         // に直接 ClosePluginShmem を送って plugin_refs から stale entry
@@ -904,11 +907,12 @@ impl AppData {
         // unmap した直後、 audio worker が `pd.prepare()` で unmapped
         // memory を読み AV → silent terminate → all_done 永久 wait
         // を防ぐため。 順序は `plan_track_removal_ipc` が持っている。
-        self.send_track_removal_ipc(&removal_plan);
-        self.forget_removed_track_devices(&removal_plan);
-
-        // 範囲は「区間 × 行」しか持たないので、消えたトラックの行を落とすだけ。
-        self.prune_selection_lanes();
+        //
+        // 孤児モジュレーター (r.md #78)・口パクの生成物 (r.md #87: ソースを失った口 track の `auto_lipsync`
+        // の clip / セル。残すと歌が無いのに口だけ動き、二度と片付かない)・選択範囲の行・折り畳み・
+        // Audio Editor の対象は、トラックを外す 3 経路共通の 1 本が担う (ここで「消した id の集合」から
+        // 作り直すと経路ごとに分岐が増え、実際にグループ解除 / 末尾削除で漏れていた)。
+        self.after_tracks_removed(&removal_plan, audio_editor_key);
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
         // 残りが空なら **削除位置に繰り上がった隣接トラック** を選ぶ
@@ -920,15 +924,6 @@ impl AppData {
         // 通さない = タグを触らない) ため、 **次の Delete が画面外の最下段トラックを
         // 消す**。 Ableton / REAPER と同じく削除位置の直後 (無ければ直前) へ倒す。
         let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
-        // r.md #78 の孤児モジュレーター掃除は上の
-        // `cleanup_modulation_after_track_removal` が担う (グループ解除 / 末尾削除と
-        // 同じ 1 本。ここで「消した id の集合」から作り直すと経路ごとに分岐が増える)。
-        // r.md #87: 消えたトラックが口パクのソースだったなら、出力先の口 track に
-        // 残った生成物 (`auto_lipsync` の clip / セル) も道連れにする。 残すと
-        // **歌が無いのに口だけ動く** — しかも再生成の経路 (`mark_lipsync_dirty`)
-        // は binding を持つ track が居なければ何もしないので、二度と片付かない。
-        // 消えたのが口 track 側だったときの dangling binding も同じ 1 本が落とす。
-        self.reap_orphan_lipsync();
         self.cur.selection.selected_track_ids
             .retain(|id| !subtree_ids_set.contains(id));
         if self.cur.selection.selected_track_ids.is_empty()
@@ -936,15 +931,6 @@ impl AppData {
         {
             self.cur.selection.selected_track_ids.push(id);
         }
-        // collapsed_groups からも消えた id を除外。
-        self.cur.view.collapsed_groups
-            .retain(|id| !subtree_ids_set.contains(id));
-        // r.md #71 (プラグインのコピー / 移動): 消えた track の device を指す選択も
-        // 落とす (正しさは読む側の `live_device_ids()` が担保する。 これは後始末)。Listen も解除する。
-        self.prune_device_session_refs();
-        // Audio Editor を安定 key で貼り直す (消えていれば閉じる)。
-        self.reanchor_audio_editor(audio_editor_key);
-        self.resize_track_peak_display();
     }
 
     /// トラックを消したあと「選択ゼロ」 を避けるためのフォールバック先。

@@ -35,8 +35,8 @@ impl AppData {
         self.send_audio(AudioCommand::SetScListen { project: self.pk(), device_id });
     }
 
-    /// Song に居なくなった device を Listen していたら解除する (削除 / 切り取り / Parallel 解除 /
-    /// トラック削除 / undo-redo の後始末 `prune_device_session_refs` から)。
+    /// Song に居なくなった device を Listen していたら解除する (Song を変える全ての口の後始末
+    /// `reconcile_song_refs` から)。
     pub(crate) fn prune_sc_listen(&mut self) {
         if let Some(id) = self.cur.peph.sc_listen_device
             && self.cur.song_doc.song().native_by_id(id).is_none()

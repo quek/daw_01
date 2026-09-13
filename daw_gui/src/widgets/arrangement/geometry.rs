@@ -875,11 +875,11 @@ pub(super) fn resolve_track_drop(
     } else {
         above.and_then(|a| ancestor_at_depth(a, depth - 1, tracks))
     };
-    // **parent が source 自身になる cycle を防ぐ** (= 自分を自分の子にする / multi-select で moving 中の
-    // 祖先を親にする)。 例: expanded group G を G ヘッダ直下の gap へ drag すると above=G・唯一の合法深さ
-    // depth(G)+1 で parent=G=source になる。 daw_01 の SetTrackParent 直接適用は cycle 検証を通らない
-    // (parent_group_id を直書きする) ので widget 側で source を親にしない不変を保証する。 source に当たったら
-    // 最近接の **非 source 祖先** へ繰り上げる (全祖先が source なら top-level)。
+    // **parent が source 自身になる drop を最近接の非 source 祖先へ繰り上げる** (= 自分を自分の子にする /
+    // multi-select で moving 中の祖先を親にする)。 例: expanded group G を G ヘッダ直下の gap へ drag すると
+    // above=G・唯一の合法深さ depth(G)+1 で parent=G=source になるが、 ユーザーの意図は「G の位置のまま」
+    // なので G の親へ繰り上げる (全祖先が source なら top-level)。 依存 (親子 / サイドチェイン / send) の
+    // 循環そのものの拒否は、 ここではなく適用の口 `Song::move_tracks` が持つ (拒否時は status)。
     let mut parent = parent;
     while let Some(pid) = parent {
         if source.contains(&pid) {

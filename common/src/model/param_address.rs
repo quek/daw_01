@@ -283,6 +283,32 @@ impl PruneCtx<'_> {
     }
 }
 
+/// 束縛先がいまの Song で解決するかを **編集の前に** 問う口 (A キーでレーンを積む前 / MIDI Learn の適用前 /
+/// 消えた対象を指す session 状態の掃除)。規則は `prune_dangling_param_targets` と同じ
+/// [`PruneCtx::keep_target`] / [`PruneCtx::keep_binding`] をそのまま使う (ここに複製しない) ので、true の target を
+/// 積んだ編集は `enforce_edit_invariants` に同じ編集の中で消されない。**keep_* の意味を変えるときはここも追従する。**
+impl Song {
+    /// `owner` (track id か `MASTER_TRACK_ID`) の store に置く `target` が、実在する node / 住所を指すか。
+    /// `owner` の store 自体が在るかは見ない (呼び出し側が `param_stores` で確かめる)。
+    #[must_use]
+    pub fn param_target_resolves(&self, target: &AutomationTarget, owner: u32) -> bool {
+        self.with_prune_ctx(|ctx| ctx.keep_target(target, owner))
+    }
+
+    /// MIDI binding の `target` が、実在する node / 住所を指すか (device は持ち主を問わず実在と種類)。
+    #[must_use]
+    pub fn binding_target_resolves(&self, target: &BindingTarget) -> bool {
+        self.with_prune_ctx(|ctx| ctx.keep_binding(target))
+    }
+
+    fn with_prune_ctx<R>(&self, f: impl FnOnce(&PruneCtx<'_>) -> R) -> R {
+        let nodes = self.node_table();
+        let live_sources: HashSet<u32> = self.mod_sources.iter().map(|m| m.id).collect();
+        let live_routings: HashSet<u32> = self.all_mod_routings().map(|r| r.id).collect();
+        f(&PruneCtx { nodes: &nodes, live_sources: &live_sources, live_routings: &live_routings })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

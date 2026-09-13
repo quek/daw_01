@@ -868,8 +868,8 @@ impl AppData {
             AppEvent::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks(&track_ids);
             }
-            AppEvent::SetTrackParent { track_id, parent_id } => {
-                self.action_set_track_parent(track_id, parent_id);
+            AppEvent::SetTrackParent { track_ids, parent_id, anchor_after } => {
+                self.action_move_tracks(&track_ids, parent_id, anchor_after);
             }
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
             AppEvent::DeleteTracks(track_ids) => self.delete_tracks(track_ids),
