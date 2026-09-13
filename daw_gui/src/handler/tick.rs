@@ -315,53 +315,55 @@ impl AppData {
         if let Some(reuse) = reuse {
             return Some(reuse);
         }
+        // r.md #129: 束縛先が解決しない (種類違いの住所等) レーンを積むと enforce が同じ編集の中で消し、中身の無い
+        // undo step と `*` と孤児の content だけが残る。規則は enforce と同じ (`param_target_resolves`)。既存レーンの
+        // 再利用は上で済んでいるので、判定は作るときだけ。
+        if !self.cur.song_doc.song().param_target_resolves(target, owner) {
+            return None;
+        }
         let clip_len = if next_clip_start.is_finite() {
             (next_clip_start - clip_start).max(0.0)
         } else {
             (self.cur.song_doc.song().length_beats - clip_start).max(4.0)
         };
-        // L11 (r.md #8): alloc_content で content + 表示名 "Rec" を同時登録する。
-        // 旧実装は AutomationClip.name="Rec" を設定していたが、 arrangement view は
-        // content_name(content_id) を描くので "Rec" が表示されなかった。
-        let content_id = self.edit_song(|song| {
-            song.alloc_content(
-                ClipContent::Automation(AutomationContent::default()),
-                "Rec".into(),
-            )
-        })?;
+        // content と clip / レーンは 1 回の編集で積む (store が無ければ content を採番しない)。
+        let mut content_id = None;
+        self.edit_song_checked(|song| {
+            if song.param_stores(owner).is_none() {
+                return false;
+            }
+            // L11 (r.md #8): alloc_content で content + 表示名 "Rec" を同時登録する。
+            // 旧実装は AutomationClip.name="Rec" を設定していたが、 arrangement view は
+            // content_name(content_id) を描くので "Rec" が表示されなかった。
+            let cid = song.alloc_content(ClipContent::Automation(AutomationContent::default()), "Rec".into());
+            content_id = Some(cid);
+            let rec_clip = |id: u32| AutomationClip {
+                id,
+                name: "Rec".into(),
+                start_beat: clip_start,
+                length_beats: clip_len,
+                content_id: cid,
+                content_offset_beats: 0.0,
+                color: None,
+            };
+            if let Some((lanes, _)) = song.param_stores_mut(owner)
+                && let Some(lane) = lanes.iter_mut().find(|l| &l.target == target)
+            {
+                lane.enabled = true;
+                let id = lane.next_clip_id;
+                lane.next_clip_id += 1;
+                lane.clips.push(rec_clip(id));
+                return true;
+            }
+            let lane = AutomationLane {
+                clips: vec![rec_clip(1)],
+                next_clip_id: 2,
+                ..AutomationLane::new(target.clone(), default_value)
+            };
+            song.push_lane(owner, lane).is_some()
+        });
+        let content_id = content_id?;
         self.expand_automation_of(owner);
-        let rec_clip = |id: u32| AutomationClip {
-            id,
-            name: "Rec".into(),
-            start_beat: clip_start,
-            length_beats: clip_len,
-            content_id,
-            content_offset_beats: 0.0,
-            color: None,
-        };
-        let found = self
-            .edit_song(|song| {
-                let Some((lanes, _)) = song.param_stores_mut(owner) else {
-                    return false;
-                };
-                if let Some(lane) = lanes.iter_mut().find(|l| &l.target == target) {
-                    lane.enabled = true;
-                    let cid = lane.next_clip_id;
-                    lane.next_clip_id += 1;
-                    lane.clips.push(rec_clip(cid));
-                    return true;
-                }
-                let lane = AutomationLane {
-                    clips: vec![rec_clip(1)],
-                    next_clip_id: 2,
-                    ..AutomationLane::new(target.clone(), default_value)
-                };
-                song.push_lane(owner, lane).is_some()
-            })
-            .unwrap_or(false);
-        if !found {
-            return None;
-        }
         // 新規作成した clip は窓 offset 0 なので原点 = clip_start。
         Some((clip_start, content_id))
     }

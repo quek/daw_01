@@ -358,32 +358,20 @@ impl Song {
     /// 依存を持たない新規トラックを子にする作成 (グループ化 / パラアウト / 取り込み) と、到達関係を縮めるだけの
     /// グループ解除は循環を作らないので、この口を通らずに書く。
     ///
-    /// 親が変わるトラック t ごとに、書き換える前の graph で `would_cycle(parent, t)` を判定し、1 本でも
-    /// 循環すれば何も書かずに `Err`。足す辺はすべて `parent` から出るので、新しい循環は `parent` を途中に
-    /// 含まない t → … → parent の道を持ち、その道は書き換える前の graph にもある (= この判定で過不足ない)。
-    /// 自分の子孫を親にするのも同じ判定に入る。読み込んだファイルに元からある循環は拒否の理由にしない
-    /// (親が変わらない並べ替えは判定しない)。
-    ///
-    /// 実在しない id は無視し、`parent` が実在しなければ何もしない。戻り値 = 並びか親が実際に変わったか。
+    /// 循環の判定は [`ReparentCheck::would_cycle`] (アレンジのドロップのプレビューと同じ 1 本)。循環すれば何も
+    /// 書かずに `Err`。実在しない id は無視し、`parent` が実在しなければ何もしない。
+    /// 戻り値 = 並びか親が実際に変わったか。
     pub fn move_tracks(
         &mut self,
         track_ids: &[u32],
         parent: Option<u32>,
         anchor_after: Option<u32>,
     ) -> Result<bool, DependencyCycle> {
-        if let Some(p) = parent {
-            if self.track_by_id(p).is_none() {
-                return Ok(false);
-            }
-            let deps = TrackDeps::build(self, EdgeScope::Structural);
-            let cyclic = track_ids
-                .iter()
-                .copied()
-                .filter(|&t| self.track_by_id(t).is_some_and(|track| track.parent_group_id != parent))
-                .any(|t| deps.would_cycle(p, t));
-            if cyclic {
-                return Err(DependencyCycle);
-            }
+        if parent.is_some_and(|p| self.track_by_id(p).is_none()) {
+            return Ok(false);
+        }
+        if self.reparent_check().would_cycle(track_ids, parent) {
+            return Err(DependencyCycle);
         }
         let before: Vec<(u32, Option<u32>)> = self.tracks.iter().map(|t| (t.id, t.parent_group_id)).collect();
         let mut moved: Vec<crate::model::Track> = Vec::with_capacity(track_ids.len());
@@ -403,6 +391,40 @@ impl Song {
         });
         self.tracks.splice(at..at, moved);
         Ok(!self.tracks.iter().map(|t| (t.id, t.parent_group_id)).eq(before))
+    }
+
+    /// 親の付け替えの循環判定 ([`ReparentCheck`]) を、いまの Song の依存 graph で組む (graph は 1 回だけ組むので、
+    /// ドラッグ中のプレビューが候補の親をいくつ試しても組み直さない)。
+    #[must_use]
+    pub fn reparent_check(&self) -> ReparentCheck<'_> {
+        ReparentCheck { song: self, deps: TrackDeps::build(self, EdgeScope::Structural) }
+    }
+}
+
+/// 親の付け替え ([`Song::move_tracks`]) が依存の循環で拒否されるかの判定。**確定 (`move_tracks`) とアレンジの
+/// ヘッダ drop のプレビューが共有する唯一の規則**。
+pub struct ReparentCheck<'a> {
+    song: &'a Song,
+    deps: TrackDeps,
+}
+
+impl ReparentCheck<'_> {
+    /// `track_ids` を `parent` の子にすると新しい循環ができるか。
+    ///
+    /// 親が変わるトラック t ごとに、書き換える前の graph で `would_cycle(parent, t)` を見る。足す辺はすべて
+    /// `parent` から出るので、新しい循環は `parent` を途中に含まない t → … → parent の道を持ち、その道は書き換える
+    /// 前の graph にもある (= この判定で過不足ない)。自分の子孫を親にするのも同じ判定に入る。読み込んだファイルに
+    /// 元からある循環は理由にしない (親が変わらないトラック、top-level への付け替えは判定しない)。
+    ///
+    /// 親が深いほど元の親の子孫なので、ある親で循環するなら、その子孫を親にしても必ず循環する。
+    #[must_use]
+    pub fn would_cycle(&self, track_ids: &[u32], parent: Option<u32>) -> bool {
+        let Some(p) = parent else { return false };
+        track_ids
+            .iter()
+            .copied()
+            .filter(|&t| self.song.track_by_id(t).is_some_and(|track| track.parent_group_id != parent))
+            .any(|t| self.deps.would_cycle(p, t))
     }
 }
 

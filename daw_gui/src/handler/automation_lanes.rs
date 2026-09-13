@@ -552,18 +552,32 @@ impl AppData {
     /// (plugin / 映像 FX の Par の値の SSoT)。無ければ作り、**隠した状態で始める** (触っただけで
     /// アレンジに行が増えない。非表示は見方の都合なので Song ではなく view に持つ)。
     /// 置き場の分岐は `Song::param_stores_mut` / `push_lane` 1 か所 (r.md #129)。
+    ///
+    /// r.md #129: 束縛先が解決しなければ Song を編集しない (積むと enforce が同じ編集の中で消し、中身の無い undo
+    /// step と `*` だけが残る)。値が変わらない書き込みも undo を積まない。
     fn write_param_lane_default(&mut self, owner: u32, target: common::model::AutomationTarget, norm: f64) {
-        let created = self
-            .edit_song(|song| {
-                let (lanes, _) = song.param_stores_mut(owner)?;
-                if let Some(lane) = lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    return None;
-                }
-                let lane = song.push_lane(owner, common::model::AutomationLane::new(target, norm))?;
-                Some(common::model::AutomationLaneKey { track: owner, lane })
-            })
-            .flatten();
+        // 既にあるレーンは enforce を通って残っている = 解決済みなので、判定は作るときだけ (scrub の毎フレームで
+        // node 表を作り直さない)。
+        let song = self.cur.song_doc.song();
+        let Some((lanes, _)) = song.param_stores(owner) else {
+            return;
+        };
+        if !lanes.iter().any(|l| l.target == target) && !song.param_target_resolves(&target, owner) {
+            return;
+        }
+        let mut created = None;
+        self.edit_song_checked(|song| {
+            let Some((lanes, _)) = song.param_stores_mut(owner) else {
+                return false;
+            };
+            if let Some(lane) = lanes.iter_mut().find(|l| l.target == target) {
+                return std::mem::replace(&mut lane.default_value, norm) != norm;
+            }
+            created = song
+                .push_lane(owner, common::model::AutomationLane::new(target, norm))
+                .map(|lane| common::model::AutomationLaneKey { track: owner, lane });
+            created.is_some()
+        });
         if let Some(key) = created {
             self.cur.view.hidden_automation_lanes.insert(key);
         }

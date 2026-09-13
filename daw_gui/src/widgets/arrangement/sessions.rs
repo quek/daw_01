@@ -75,6 +75,7 @@ pub(super) struct ReleasedSessions {
 /// `take()` して捨てるだけ** (per-frame emit で最終値が出ているので release commit は不要)。
 pub(super) fn take(
     ui: &mut Ui<'_, AppData>,
+    app: &AppData,
     f: &ArrangementFrame<'_>,
     response: &mut ArrangementResponse,
 ) -> (LiveSessions, ReleasedSessions) {
@@ -183,23 +184,17 @@ pub(super) fn take(
     // drop が最下段 group の内側に吸い込まれるバグを持っていた)。 **overlay (描画プレビュー) と
     // 完全に同じ pure 関数**を通すので preview = commit が構造的に保証される。 gate は drag 距離
     // (dx/dy 合成) で、 click (≒静止) を reorder に昇格させない。
+    //
+    // r.md #129: 落とせる深さは依存 (親子 / サイドチェイン / send) の循環で狭まる。 判定は確定の
+    // `Song::move_tracks` と同じ `Song::reparent_check` を渡す。 落とせる深さが無い gap (`droppable == false`) も
+    // そのまま発行し、 handler が同じ規則で拒否して status を出す (Song は変わらない)。
     released.pending_drop = track_reorder_release_raw.as_ref().and_then(|tr| {
         let dx = tr.last_mouse_x - tr.anchor_mouse_x;
         let dy = tr.last_mouse_y - tr.anchor_mouse_y;
         if (dx * dx + dy * dy).sqrt() < REORDER_DRAG_THRESHOLD_PX {
             return None;
         }
-        let drop = resolve_track_drop(
-            f.tracks,
-            &f.visible_tracks,
-            &f.tops,
-            &f.is_group_set,
-            &tr.source_track_ids,
-            f.style.indent_px,
-            tr.last_mouse_y,
-            tr.last_mouse_x,
-            tr.anchor_mouse_x,
-        );
+        let drop = resolve_reorder_drop(app, f, tr);
         Some((tr.source_track_ids.clone(), drop.parent, drop.anchor_after))
     });
     released.pending_reorder_hash = released.pending_drop.as_ref().map_or(0_u64, |(ts, p, a)| {
@@ -362,11 +357,13 @@ pub(super) struct Overlays {
 /// **呼び出し位置が `cursor` より前に動くことの正当性**: ここが含む
 /// `clip_min_len` / `section` / `reorder` の 3 つは旧実装では cursor ブロックの **後**に
 /// あったが、 いずれも**純粋**である。 入力は `f.*` (地形、 誰も書かない) / `live.*`
-/// (この時点で確定済の session clone) / `view.snap` / `style` だけで、 出力は `Overlays` の
+/// (この時点で確定済の session clone) / `view.snap` / `style` / `app` の Song (読むだけ、 reorder の
+/// 依存の循環の判定) だけで、 出力は `Overlays` の
 /// フィールドのみ (`ArrangementState` にも `ArrangementResponse` にも書かない)。
 /// したがって `cursor::hover` / `cursor::apply` より前に評価しても、 両者の入力・出力とも
 /// 変わらない。
 pub(super) fn overlays(
+    app: &AppData,
     f: &ArrangementFrame<'_>,
     live: &LiveSessions,
     released: &ReleasedSessions,
@@ -452,7 +449,8 @@ pub(super) fn overlays(
     // dist >= 閾値 のときのみ overlay 描画 (短 click 中は静止 = button click と区別がつかないため
     // UI ノイズ)。 **commit (`pending_drop`) と同じ `resolve_track_drop`** を通すので indicator が
     // 指す位置 = 実際に着地する位置 が必ず一致する (旧 `compute_reorder_target_index` は parent /
-    // 深さを描けず blank-drop で実結果とズレていた)。
+    // 深さを描けず blank-drop で実結果とズレていた)。 r.md #129: 落とせる深さが無い gap では指標線と
+    // group 行の強調を出さない (ghost row は出す)。
     let reorder: Option<ReorderOverlay> = live
         .track_reorder
         .as_ref()
@@ -462,24 +460,14 @@ pub(super) fn overlays(
             (dx * dx + dy * dy).sqrt() >= REORDER_DRAG_THRESHOLD_PX
         })
         .map(|tr| {
-            let drop = resolve_track_drop(
-                f.tracks,
-                &f.visible_tracks,
-                &f.tops,
-                &f.is_group_set,
-                &tr.source_track_ids,
-                f.style.indent_px,
-                tr.last_mouse_y,
-                tr.last_mouse_x,
-                tr.anchor_mouse_x,
-            );
-            let indicator_y = f
-                .tops
-                .get(drop.gap)
-                .copied()
-                .or_else(|| f.tops.last().copied())
-                .unwrap_or(f.header_pane.y);
-            let indent_x = f.header_pane.x + f32::from(drop.depth) * f.style.indent_px;
+            let drop = resolve_reorder_drop(app, f, tr);
+            if !drop.droppable {
+                return ReorderOverlay { drop: None, drag_center_y: tr.last_mouse_y, highlight_row: None };
+            }
+            let indicator = DropIndicator {
+                y: f.tops.get(drop.gap).copied().or_else(|| f.tops.last().copied()).unwrap_or(f.header_pane.y),
+                indent_x: f.header_pane.x + f32::from(drop.depth) * f.style.indent_px,
+            };
             // parent が group のとき header 行を hilight。 parent が collapsed で不可視なら
             // (visible に居ない → position None →) hilight しない (不可視 UI を光らせない意図の
             // None。 reparent 構造自体は commit と同一 resolver なので一致する)。
@@ -490,7 +478,7 @@ pub(super) fn overlays(
                     Rect { x: f.content_below_ruler.x, y, w: f.content_below_ruler.w, h }
                 })
             });
-            ReorderOverlay { indicator_y, indent_x, drag_center_y: tr.last_mouse_y, highlight_row }
+            ReorderOverlay { drop: Some(indicator), drag_center_y: tr.last_mouse_y, highlight_row }
         });
 
     Overlays {
@@ -518,4 +506,22 @@ pub(super) fn overlays(
         range_preview,
         reorder_hash: released.pending_reorder_hash,
     }
+}
+
+/// track header drag の drop 解決。 **確定 (`pending_drop`) とプレビュー (`overlays`) が共有する 1 本**で、
+/// 依存の循環の判定は確定の `Song::move_tracks` と同じ `Song::reparent_check` (graph は 1 回だけ組む)。
+fn resolve_reorder_drop(app: &AppData, f: &ArrangementFrame<'_>, tr: &TrackReorderSession) -> ReorderDrop {
+    let check = app.cur.song_doc.song().reparent_check();
+    resolve_track_drop(
+        f.tracks,
+        &f.visible_tracks,
+        &f.tops,
+        &f.is_group_set,
+        &tr.source_track_ids,
+        &|parent| check.would_cycle(&tr.source_track_ids, parent),
+        f.style.indent_px,
+        tr.last_mouse_y,
+        tr.last_mouse_x,
+        tr.anchor_mouse_x,
+    )
 }

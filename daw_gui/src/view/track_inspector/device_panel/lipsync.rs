@@ -15,7 +15,7 @@ pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: 
     // (drag reparent SetTrackParent) 一本に統一する。階層は
     // アレンジの入れ子インデントで可視化されるので、同じ概念をインスペクタの
     // ドロップダウンでも編集できると Single Source of Truth が崩れる。
-    // `AppEvent::SetTrackParent` / `action_set_track_parent` 自体はアレンジ
+    // `AppEvent::SetTrackParent` / `action_move_tracks` 自体はアレンジ
     // ドラッグが使うため残す。
 
     // ---- 口パク (lip-sync) 出力先 binding ----------------------------

@@ -828,6 +828,7 @@
             &tops,
             &is_group,
             source,
+            &|_| false,
             16.0,
             mouse_y,
             anchor_x + col * 16.0,

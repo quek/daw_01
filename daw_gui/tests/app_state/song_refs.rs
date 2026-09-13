@@ -277,3 +277,112 @@ fn a_key_on_an_unresolvable_target_adds_nothing() {
     dev(&mut app, DeviceEvent::RemoveDevices { device_ids: vec![c2] });
     assert!(app.cur.peph.last_touched_param.is_none(), "消えた device の last touched は外れる");
 }
+
+// ---- 束縛先を解決してから積む: 変調 routing / 値保持レーン -----------------------------------------
+
+const FX_PARAM: u32 = 7;
+
+/// 先頭トラックに plugin を 1 個置き、host の param 一覧を届けた app。戻り値 = (トラック, device)。
+fn app_with_plugin() -> (AppData, u32, u64) {
+    use common::model::{Device, PluginInstance};
+    use common::protocol::{PluginEvent, PluginParamInfo};
+    let (mut app, _a, _p, _d) = build_app();
+    let t0 = app.cur.song_doc.song().tracks[0].id;
+    let device_id = app
+        .edit_song(|song| {
+            let id = song.alloc_device_id();
+            let plugin = PluginInstance { id, ..PluginInstance::new("test.delay".into(), common::plugin_format::PluginFormat::Clap) };
+            song.track_by_id_mut(t0).expect("t0").devices.insert(0, Device::Plugin(plugin));
+            id
+        })
+        .expect("plugin");
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginParamList {
+        device: app.dev(device_id),
+        params: vec![PluginParamInfo {
+            id: FX_PARAM,
+            name: "Dry/Wet".into(),
+            module: String::new(),
+            min_value: 0.0,
+            max_value: 1.0,
+            default_value: 0.5,
+            flags: 0,
+        }],
+        has_embedded_gui: true,
+    }));
+    let visible: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
+    app.apply_select_tracks(t0, daw_gui::widgets::select_modifier::SelectModifier::Single, &visible);
+    (app, t0, device_id)
+}
+
+/// ◉ で待ち受け中のモジュレーターを undo で消すと待ち受けは外れ、プラグイン窓のツマミを触っても routing を
+/// 積まない (空の undo step / `*` / 「割り当てました」を出さない)。消えたモジュレーターの id を掴んだまま
+/// 触っても (適用の口の判定)、Song は変わらない。
+#[test]
+fn undoing_the_armed_mod_source_disarms_and_touch_adds_nothing() {
+    use common::protocol::PluginEvent;
+    let (mut app, t0, device_id) = app_with_plugin();
+    app.handle_event(AppEvent::AddModSource { kind: daw_gui::app::ModSourceKindTag::Lfo });
+    let source = app.cur.song_doc.song().mod_sources.last().expect("source").id;
+    app.handle_event(AppEvent::SetArmedModSource(Some(source)));
+
+    app.handle_event(AppEvent::Undo);
+    assert!(app.cur.song_doc.song().mod_sources.iter().all(|m| m.id != source), "undo でモジュレーターが消える");
+    assert_eq!(app.cur.peph.armed_mod_source, None, "待ち受けは外れる");
+
+    app.cur.song_doc.mark_saved();
+    let depth = app.cur.song_doc.undo_depth();
+    let touch = |app: &mut AppData| {
+        app.handle_event(AppEvent::Plugin(PluginEvent::PluginParamTouched {
+            device: app.dev(device_id),
+            param_id: FX_PARAM,
+            display_name: format!("Param {FX_PARAM}"),
+        }));
+    };
+    touch(&mut app);
+    // 消えた id を掴んだまま触る (掃除より前に届いた待ち受け)。
+    app.cur.peph.armed_mod_source = Some(source);
+    touch(&mut app);
+    assert!(app.cur.song_doc.song().track_by_id(t0).expect("t0").mod_routings.is_empty());
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    assert!(!app.cur.song_doc.is_dirty());
+    assert!(!app.ui_ephemeral.status_message.contains("割り当てました"), "{}", app.ui_ephemeral.status_message);
+}
+
+/// 変調 routing の編集は、解決しない target を積まず、変化の無い編集で undo も `*` も積まない
+/// (同じ routing の追加 / 無い routing の解除 / 同じ極性 / 同じ深さ)。
+#[test]
+fn mod_routing_edits_without_effect_add_no_undo_step() {
+    let (mut app, t0, device_id) = app_with_plugin();
+    app.handle_event(AppEvent::AddModSource { kind: daw_gui::app::ModSourceKindTag::Lfo });
+    let source_id = app.cur.song_doc.song().mod_sources.last().expect("source").id;
+    let target = AutomationTarget::PluginParam { device_id, param_id: FX_PARAM, legacy_device_index: None };
+    app.handle_event(AppEvent::AddModRouting { track_id: t0, target: target.clone(), source_id });
+    assert_eq!(app.cur.song_doc.song().track_by_id(t0).expect("t0").mod_routings.len(), 1);
+
+    app.cur.song_doc.mark_saved();
+    let depth = app.cur.song_doc.undo_depth();
+    let eq = app.cur.song_doc.song().builtin_native(t0, NativeKind::Eq).expect("eq").id;
+    let wrong_kind = AutomationTarget::NativeParam { device_id: eq, param: thr() };
+    app.handle_event(AppEvent::AddModRouting { track_id: t0, target: target.clone(), source_id });
+    app.handle_event(AppEvent::AddModRouting { track_id: t0, target: wrong_kind.clone(), source_id });
+    app.handle_event(AppEvent::RemoveModRouting { track_id: t0, target: wrong_kind, source_id });
+    app.handle_event(AppEvent::SetModRoutingPolarity { track_id: t0, target: target.clone(), source_id, bipolar: false });
+    app.handle_event(AppEvent::SetModRoutingDepth { track_id: t0, target, source_id, depth: 1.0 });
+    assert_eq!(app.cur.song_doc.song().track_by_id(t0).expect("t0").mod_routings.len(), 1, "種類違いは積まない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    assert!(!app.cur.song_doc.is_dirty());
+}
+
+/// plugin の Par の値 (値保持レーンの既定値) を同じ値で書き直しても undo も `*` も積まない。
+#[test]
+fn rewriting_a_plugin_param_with_the_same_value_adds_no_undo_step() {
+    let (mut app, _t0, device_id) = app_with_plugin();
+    dev(&mut app, DeviceEvent::SetPluginParam { device_id, param_id: FX_PARAM, value_real: 0.25 });
+    app.cur.song_doc.mark_saved();
+    let depth = app.cur.song_doc.undo_depth();
+    dev(&mut app, DeviceEvent::SetPluginParam { device_id, param_id: FX_PARAM, value_real: 0.25 });
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    assert!(!app.cur.song_doc.is_dirty());
+    dev(&mut app, DeviceEvent::SetPluginParam { device_id, param_id: FX_PARAM, value_real: 0.75 });
+    assert_eq!(app.cur.song_doc.undo_depth(), depth + 1, "値が変われば 1 step");
+}

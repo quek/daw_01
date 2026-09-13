@@ -34,7 +34,8 @@ pub(crate) fn param_owner(song: &Song, target: &AutomationTarget, fallback_owner
 /// 持ち主の store (トラック) が消えたなら `None` (= 「対象が削除された」)。
 ///
 /// 解決の規則は enforce と同じ `Song::param_target_resolves` なので、`Some` の持ち主へ積んだレーンは同じ編集の
-/// 中で消されない。`A` キーと、消えた対象を指す session 状態の掃除 (`reconcile_song_refs`) が共有する。
+/// 中で消されない。`A` キーと、消えた対象を指す session 状態の掃除 (`reconcile_song_refs`) が共有する
+/// (録音レーン / 値保持レーン / 変調を積む口も、作るときは同じ述語で判定する)。
 pub(crate) fn touched_param_owner(song: &Song, touched: &TouchedParam) -> Option<u32> {
     let owner = param_owner(song, &touched.target, touched.track_id)?;
     (song.param_stores(owner).is_some() && song.param_target_resolves(&touched.target, owner)).then_some(owner)
@@ -405,6 +406,27 @@ mod tests {
             let points = song.clip_contents.get(&lane.clips[0].content_id).and_then(|c| c.automation_points());
             assert_eq!(points.map(<[_]>::len), Some(1), "{target:?}");
         }
+    }
+
+    /// 録音で作るレーン (`ensure_recording_lane_clip`) も束縛先が解決するときだけ積む: 種類違いの住所ではレーン /
+    /// content / undo / `*` を増やさない (積むと enforce が同じ編集の中で消し、空の undo step と孤児の content が
+    /// 残る)。いまの呼び出し元 (録音の tick) は値が引けない住所を先に飛ばすが、口そのものが規則を持つ。
+    #[test]
+    fn recording_lane_is_not_created_for_unresolvable_targets() {
+        let mut app = crate::test_support::headless_app();
+        let t1 = app.cur.song_doc.song().tracks[0].id;
+        let eq = app.cur.song_doc.song().builtin_native(t1, NativeKind::Eq).expect("eq").id;
+        let target = AutomationTarget::NativeParam { device_id: eq, param: thr() };
+        app.cur.song_doc.mark_saved();
+        let depth = app.cur.song_doc.undo_depth();
+        let contents = app.cur.song_doc.song().clip_contents.len();
+
+        assert_eq!(app.ensure_recording_lane_clip(t1, &target, 1.0), None);
+        let song = app.cur.song_doc.song();
+        assert!(song.param_stores(t1).expect("t1").0.iter().all(|l| l.target != target));
+        assert_eq!(song.clip_contents.len(), contents, "content も採番しない");
+        assert_eq!(app.cur.song_doc.undo_depth(), depth);
+        assert!(!app.cur.song_doc.is_dirty());
     }
 
     /// A-3 (T26 / §18-T): master fx chain の Parallel の chain gain で A を押すと、既定値は chain の現在値

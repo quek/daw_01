@@ -371,10 +371,11 @@ impl AppData {
     ///   [`Self::live_device_ids`] が持ち、ここは保持した集合が育たないようにするだけ。
     /// - SC Listen: 居なくなった device なら解除する (§10.14)。undo で device が戻っても Listen は勝手に戻らない。
     /// - MIDI Learn 待ちの的 / last touched: 束縛先が解決しなければ外す (§7.7 / §7.9)。規則は enforce と同じ。
+    /// - 変調の待ち受け (◉): モジュレーターが居なくなったら外す。
     ///
     /// Par の開閉 (`open_rack_panels`) は触らない — undo で消えて redo で戻れば開いた状態で出る (§12.2)。
     pub(crate) fn reconcile_song_refs(&mut self) {
-        let (alive_selection, anchor_gone, learn_gone, touched_gone) = {
+        let (alive_selection, anchor_gone, learn_gone, touched_gone, armed_gone) = {
             let song = self.cur.song_doc.song();
             let node_alive = |id: u64| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some();
             let selected = &self.cur.selection.selected_device_ids;
@@ -389,6 +390,7 @@ impl AppData {
                     .last_touched_param
                     .as_ref()
                     .is_some_and(|t| crate::handler::param_value::touched_param_owner(song, t).is_none()),
+                self.cur.peph.armed_mod_source.is_some_and(|id| !song.mod_sources.iter().any(|m| m.id == id)),
             )
         };
         if let Some(alive) = alive_selection {
@@ -410,6 +412,11 @@ impl AppData {
         }
         if touched_gone {
             self.cur.peph.last_touched_param = None;
+        }
+        if armed_gone {
+            // 待ち受け (◉) 中のモジュレーターが消えた (undo 等): 待ち受けたままだと次に触ったツマミに幽霊の
+            // routing を積もうとする。
+            self.cur.peph.armed_mod_source = None;
         }
         self.prune_sc_listen();
     }
