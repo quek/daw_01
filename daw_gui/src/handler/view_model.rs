@@ -1083,11 +1083,9 @@ impl AppData {
         {
             let mut cache = self.cur.peph.arr_label_cache.borrow_mut();
             let edit_epoch = self.cur.song_doc.edit_epoch();
-            let plugin_params = self.cur.pipc.plugin_params.generation();
-            let plugin_db = &self.ipc.plugin_db;
-            if !cache.lane_labels_key.as_ref().is_some_and(|k| k.is_current(edit_epoch, plugin_params, plugin_db)) {
+            if !self.host_derived_key_is_current(cache.lane_labels_key.as_ref()) {
                 self.fill_lane_node_labels(&mut cache.lane_node_labels);
-                cache.lane_labels_key = Some(LaneLabelsKey { edit_epoch, plugin_params, plugin_db: plugin_db.clone() });
+                cache.lane_labels_key = Some(self.host_derived_key());
             }
             if cache.epoch != edit_epoch {
                 cache.track_names.clear();
@@ -1122,6 +1120,22 @@ impl AppData {
             }
         }
         self.cur.peph.arr_label_cache.borrow()
+    }
+
+    /// Song と host の param 表と plugin DB から作る派生の、今の入力の世代 ([`HostDerivedKey`])。
+    pub(crate) fn host_derived_key(&self) -> HostDerivedKey {
+        HostDerivedKey {
+            edit_epoch: self.cur.song_doc.edit_epoch(),
+            plugin_params: self.cur.pipc.plugin_params.generation(),
+            plugin_db: self.ipc.plugin_db.clone(),
+        }
+    }
+
+    /// `key` (派生を作ったときの世代、`None` = まだ作っていない) が今の入力のものか。
+    pub(crate) fn host_derived_key_is_current(&self, key: Option<&HostDerivedKey>) -> bool {
+        key.is_some_and(|k| {
+            k.is_current(self.cur.song_doc.edit_epoch(), self.cur.pipc.plugin_params.generation(), &self.ipc.plugin_db)
+        })
     }
 
     /// [`ArrLabelCache::lane_node_labels`] を作り直す (全トラック + master のレーンのうち、ノードで束縛する target)。

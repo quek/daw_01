@@ -40,16 +40,16 @@ fn entry(id: &str, name: &str, instrument: bool, path: &str) -> PluginEntry {
 /// assert するテストはこの統合バイナリには無い)。`path` は実在不要
 /// (production の plugin loader に通すわけではない)。
 pub fn make_plugin_db() -> Arc<PluginDatabase> {
-    Arc::new(PluginDatabase {
-        entries: vec![
+    Arc::new(PluginDatabase::new(
+        vec![
             entry("test.synth", "Test Synth", true, "C:/fake/synth.clap"),
             entry("test.bitcrush", "Test Bitcrush", false, "C:/fake/bitcrush.clap"),
             entry("test.delay", "Test Delay", false, "C:/fake/delay.clap"),
             entry("test.fx", "Test FX", false, "C:/fake/fx.clap"),
         ],
-        scanned_at: None,
-        port_probe_version: 0,
-    })
+        None,
+        0,
+    ))
 }
 
 /// AppData を test 用 dispatcher 込みで構築。dispatcher は trait 抽象に

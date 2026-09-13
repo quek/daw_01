@@ -18,10 +18,11 @@ use crate::state::*;
 /// `None` = id で束縛する住所なのに束縛先が居ない (削除された)。
 ///
 /// view から渡る track id は、同じフレームで device を他トラックへ運んだ後だと古いことがあるので、
-/// id で束縛する住所は **必ずここで** 実行時の Song から引き直す。
-pub(crate) fn param_owner(song: &Song, target: &AutomationTarget, fallback_owner: u32) -> Option<u32> {
+/// id で束縛する住所は **必ずここで** 実行時の Song から引き直す。束縛先は `SongDoc` の node 索引で引く
+/// (`SongDoc::bound_owner_track`、録音の tick ごとに呼ばれるので木を走査しない)。
+pub(crate) fn param_owner(doc: &SongDoc, target: &AutomationTarget, fallback_owner: u32) -> Option<u32> {
     use AutomationTarget as T;
-    match song.bound_owner_track(target) {
+    match doc.bound_owner_track(target) {
         Some(owner) => Some(owner),
         None if target.bound_node_id().is_some() || matches!(target, T::ModSourceParam { .. } | T::ModRoutingDepth { .. }) => {
             None
@@ -36,8 +37,9 @@ pub(crate) fn param_owner(song: &Song, target: &AutomationTarget, fallback_owner
 /// 解決の規則は enforce と同じ `Song::param_target_resolves` なので、`Some` の持ち主へ積んだレーンは同じ編集の
 /// 中で消されない。`A` キーと、消えた対象を指す session 状態の掃除 (`reconcile_song_refs`) が共有する
 /// (録音レーン / 値保持レーン / 変調を積む口も、作るときは同じ述語で判定する)。
-pub(crate) fn touched_param_owner(song: &Song, touched: &TouchedParam) -> Option<u32> {
-    let owner = param_owner(song, &touched.target, touched.track_id)?;
+pub(crate) fn touched_param_owner(doc: &SongDoc, touched: &TouchedParam) -> Option<u32> {
+    let owner = param_owner(doc, &touched.target, touched.track_id)?;
+    let song = doc.song();
     (song.param_stores(owner).is_some() && song.param_target_resolves(&touched.target, owner)).then_some(owner)
 }
 
@@ -56,7 +58,7 @@ impl AppData {
         // 束縛先が解決しない (消えた / 種類が違う) なら積まない — 積むと enforce が同じ編集の中で消し、
         // 中身の無い undo step と `*` だけが残る。
         let song = self.cur.song_doc.song();
-        let Some(owner) = touched_param_owner(song, &touched) else {
+        let Some(owner) = touched_param_owner(&self.cur.song_doc, &touched) else {
             self.cur.peph.last_touched_param = None;
             self.ui_ephemeral.status_message = "Last-touched parameter was removed".into();
             return;
@@ -116,7 +118,7 @@ impl AppData {
     /// 持ち主は [`param_owner`]、名前は `automation_target_label`。id で束縛する住所の束縛先が
     /// 居なければ記録しない。
     pub(crate) fn note_touched_target(&mut self, target: AutomationTarget, fallback_owner: u32) {
-        let Some(track_id) = param_owner(self.cur.song_doc.song(), &target, fallback_owner) else {
+        let Some(track_id) = param_owner(&self.cur.song_doc, &target, fallback_owner) else {
             return;
         };
         let display_name = self.automation_target_label(&target);
@@ -137,14 +139,16 @@ impl AppData {
     /// (束縛先が居ない / plugin がまだ値を報告していない / 表示 clip が無い)。
     pub(crate) fn target_plain_value(&self, owner: u32, target: &AutomationTarget) -> Option<f64> {
         use AutomationTarget as T;
-        let song = self.cur.song_doc.song();
+        // node は `SongDoc` の索引で引く (録音の tick ごとに呼ばれる)。
+        let doc = &self.cur.song_doc;
+        let song = doc.song();
         match target {
-            T::NativeParam { device_id, param } => song.native_by_id(*device_id)?.param(*param).map(f64::from),
+            T::NativeParam { device_id, param } => doc.native_by_id(*device_id)?.param(*param).map(f64::from),
             T::MasterLimiter(p) => Some(f64::from(song.master_limiter.param(*p))),
-            T::TrackBuiltin(param) => track_builtin_value(song, owner, param),
+            T::TrackBuiltin(param) => track_builtin_value(doc, owner, param),
             // plugin の値は Song に無い。GUI の cache (`PluginParamValueChanged` / ノブ操作で更新) を引く。
             T::PluginParam { device_id, param_id, .. } => {
-                song.plugin_by_id(*device_id)?;
+                doc.plugin_by_id(*device_id)?;
                 self.cur.pipc
                     .plugin_param_values
                     .get(&DeviceParamKey { device_id: *device_id, param_id: *param_id })
@@ -177,9 +181,10 @@ impl AppData {
 }
 
 /// `TrackBuiltin` の現在値。Volume / Pan / Mute / SendGain は `owner` の track、Chain / Parallel は
-/// id (master fx chain の中でも引ける)。
-fn track_builtin_value(song: &Song, owner: u32, param: &common::model::TrackBuiltinParam) -> Option<f64> {
+/// id (master fx chain の中でも引ける、`SongDoc` の node 索引)。
+fn track_builtin_value(doc: &SongDoc, owner: u32, param: &common::model::TrackBuiltinParam) -> Option<f64> {
     use common::model::TrackBuiltinParam as B;
+    let song = doc.song();
     match param {
         B::Volume => song.track_by_id(owner).map(|t| f64::from(t.volume)),
         B::Pan => song.track_by_id(owner).map(|t| f64::from(t.pan)),
@@ -189,18 +194,18 @@ fn track_builtin_value(song: &Song, owner: u32, param: &common::model::TrackBuil
             song.track_by_id(owner)?.sends.iter().find(|s| s.id == *send_id).map(|s| f64::from(s.gain))
         }
         // r.md #110: Parallel chain の gain / pan (安定 chain id で引く)。
-        B::ChainGain { chain_id } => song.chain_by_id(*chain_id).map(|(_, c)| f64::from(c.gain)),
-        B::ChainPan { chain_id } => song.chain_by_id(*chain_id).map(|(_, c)| f64::from(c.pan)),
-        B::ParallelOutGain { parallel_id } => song.parallel_by_id(*parallel_id).map(|r| f64::from(r.out_gain)),
+        B::ChainGain { chain_id } => doc.chain_by_id(*chain_id).map(|(_, c)| f64::from(c.gain)),
+        B::ChainPan { chain_id } => doc.chain_by_id(*chain_id).map(|(_, c)| f64::from(c.pan)),
+        B::ParallelOutGain { parallel_id } => doc.parallel_by_id(*parallel_id).map(|r| f64::from(r.out_gain)),
         // r.md #112: 分割が off の Parallel は既定の境界周波数を出す。
-        B::ParallelSplitFreq { parallel_id, edge } => song
+        B::ParallelSplitFreq { parallel_id, edge } => doc
             .parallel_by_id(*parallel_id)?
             .split
             .freq(*edge)
             .or_else(|| common::model::Split::DEFAULT_FREQUENCY3.freq(*edge))
             .map(f64::from),
         // r.md #114: アクティブ chain の中央の位置 (Selector でなければ中央 0.5)。
-        B::ParallelSelect { parallel_id } => song.parallel_by_id(*parallel_id).map(|r| f64::from(r.select_pos())),
+        B::ParallelSelect { parallel_id } => doc.parallel_by_id(*parallel_id).map(|r| f64::from(r.select_pos())),
     }
 }
 

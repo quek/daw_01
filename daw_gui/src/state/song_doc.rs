@@ -410,6 +410,18 @@ impl SongDoc {
         self.chain_node(id).map(|(_, _, owner)| owner)
     }
 
+    /// `Song::bound_owner_track` と同じ答え。node で束縛する住所 (plugin / native / chain / Parallel、
+    /// `AutomationTarget::bound_node_id`) の持ち主は索引で引き、それ以外 (変調 / song 全体 / 束縛しない住所) は
+    /// `Song` の同じ関数に任せる (木を走査しない住所だけが残る)。録音の tick のように繰り返し引く口で使う。
+    pub fn bound_owner_track(&self, target: &common::model::AutomationTarget) -> Option<u32> {
+        use common::model::{AutomationTarget as T, TrackBuiltinParam as B};
+        match (target, target.bound_node_id()) {
+            (T::TrackBuiltin(B::ChainGain { .. } | B::ChainPan { .. }), Some(chain_id)) => self.chain_owner_track(chain_id),
+            (_, Some(device_id)) => self.device_owner_track(device_id),
+            (_, None) => self.song.bound_owner_track(target),
+        }
+    }
+
     /// ランチャーの**再生状態** (`Track.launcher` / `AutomationLane.launcher` /
     /// `last_launched_scene_id`) の書き換え専用。Song に住み `.daw` にも保存されるが、
     /// 撃つ / 止める / アレンジへ返すは「聴き方」であって曲の中身ではない
@@ -988,7 +1000,7 @@ mod tests {
     /// たどった先の新しい名前が見える。
     #[test]
     fn node_lookups_agree_with_the_tree_walk_across_structure_changes() {
-        use common::model::{ChainRef, MASTER_TRACK_ID, Track};
+        use common::model::{AutomationTarget, ChainRef, MASTER_TRACK_ID, Track, TrackBuiltinParam};
 
         fn collect_ids(devices: &[Device], device_ids: &mut Vec<u64>, chain_ids: &mut Vec<u64>) {
             for d in devices {
@@ -1008,9 +1020,21 @@ mod tests {
                 collect_ids(devices, &mut device_ids, &mut chain_ids);
             }
             assert!(chain_ids.len() >= 3, "{step}: 入れ子の chain を含む曲で確かめる");
+            // 束縛先の持ち主 (`bound_owner_track`) も同じ答え。種類違いの住所 (chain の住所に device id) を含む。
+            let targets = |id: u64| {
+                [
+                    AutomationTarget::PluginParam { device_id: id, param_id: 0, legacy_device_index: None },
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id: id }),
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: id }),
+                ]
+            };
+            let fixed = [AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), AutomationTarget::SongTempo];
             for id in device_ids.into_iter().chain([u64::MAX]) {
                 let walk = song.device_by_id(id).map(Device::id).zip(song.device_owner_track(id));
                 assert_eq!(doc.device_node(id).map(|(d, owner)| (d.id(), owner)), walk, "{step}: device {id}");
+                for t in targets(id) {
+                    assert_eq!(doc.bound_owner_track(&t), song.bound_owner_track(&t), "{step}: {t:?}");
+                }
             }
             for id in chain_ids.into_iter().chain([u64::MAX]) {
                 let walk = song
@@ -1018,6 +1042,12 @@ mod tests {
                     .map(|(p, c)| (p.id, c.id))
                     .zip(song.chain_owner_track(ChainRef::Chain(id)));
                 assert_eq!(doc.chain_node(id).map(|(p, c, owner)| ((p.id, c.id), owner)), walk, "{step}: chain {id}");
+                for t in targets(id) {
+                    assert_eq!(doc.bound_owner_track(&t), song.bound_owner_track(&t), "{step}: {t:?}");
+                }
+            }
+            for t in &fixed {
+                assert_eq!(doc.bound_owner_track(t), song.bound_owner_track(t), "{step}: {t:?}");
             }
         }
 

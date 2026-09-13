@@ -18,7 +18,7 @@ use crate::app::{
     ARRANGE_PX_PER_BEAT, ARRANGE_TRACK_HEIGHT, ArrLabelCache, ArrangeViewSnapshot,
     ArrangeZoomAnchor, AutomationPointKeyRef, ClipKey, ColorPickerTarget, DEFAULT_NOTE_DURATION,
     LoadedDeviceInfo, PendingClipFxBounce, PendingStateRequest, PendingVocalSynthBounce,
-    SendPickerState, TempoMapCache,
+    PluginParamsPanelCache, SendPickerState, TempoMapCache,
     TouchedParam, VocalSynthStatus, track_with,
 };
 use crate::audio_source_cache::AudioSourceCache;
@@ -385,6 +385,9 @@ pub struct ProjectEphemeral {
     /// r.md #56: 秒表示用 `TempoMap` の世代キャッシュ ([`TempoMapCache`])。
     /// `arr_label_cache` と同じく view から (`&self`) 更新するので `RefCell`。
     pub(crate) tempo_map_cache: std::cell::RefCell<TempoMapCache>,
+    /// r.md #129: plugin の Par の param 行の世代キャッシュ ([`PluginParamsPanelCache`])。
+    /// `arr_label_cache` と同じく view から (`&self`) 更新するので `RefCell`。
+    pub(crate) plugin_params_panels: std::cell::RefCell<PluginParamsPanelCache>,
     /// GPU-side video thumbnail textures keyed by `VideoSourceId`.
     /// Written by the runner (P3.5) after a successful texture upload;
     /// read by `arrangement_view.rs` (P3.6) and passed to
@@ -932,6 +935,7 @@ impl ProjectState {
             peph: ProjectEphemeral {
                 arr_label_cache: std::cell::RefCell::default(),
                 tempo_map_cache: std::cell::RefCell::default(),
+                plugin_params_panels: std::cell::RefCell::default(),
                 loaded_project_id: 0,
                 video_texture_cache: std::collections::HashMap::new(),
                 image_texture_cache: std::collections::HashMap::new(),

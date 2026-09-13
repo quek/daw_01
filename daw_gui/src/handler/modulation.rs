@@ -442,7 +442,7 @@ impl AppData {
         target: &common::model::AutomationTarget,
         f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> (R, bool),
     ) -> Option<R> {
-        let owner = crate::handler::param_value::param_owner(self.cur.song_doc.song(), target, track_id)?;
+        let owner = crate::handler::param_value::param_owner(&self.cur.song_doc, target, track_id)?;
         let mut out = None;
         self.edit_song_checked(|song| {
             let Some((_, routings)) = song.param_stores_mut(owner) else {
@@ -473,7 +473,7 @@ impl AppData {
         // が 1 本の変調を指すので、後から `ensure_ids` 任せにすると採番前の一瞬だけ
         // 深さを変調先にできない窓ができる)。
         let song = self.cur.song_doc.song();
-        let owner = crate::handler::param_value::param_owner(song, &target, track_id)?;
+        let owner = crate::handler::param_value::param_owner(&self.cur.song_doc, &target, track_id)?;
         let (_, routings) = song.param_stores(owner)?;
         if routings.iter().any(|r| r.source_id == source_id && r.target == target) {
             return Some(false);

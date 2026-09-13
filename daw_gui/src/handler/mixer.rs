@@ -244,7 +244,7 @@ impl AppData {
                 // 失敗 / timeout は scan-time 暫定値を保持 (退行しない)。 builtin は code が
                 // SSoT なので probe しない。
                 let probe_idx: Vec<usize> = db
-                    .entries
+                    .entries()
                     .iter()
                     .enumerate()
                     .filter(|(_, e)| {
@@ -260,22 +260,18 @@ impl AppData {
                 for (n, &i) in probe_idx.iter().enumerate() {
                     proxy.send(AppEvent::RescanProgress { done: n, total });
                     let (format, path, id) = {
-                        let e = &db.entries[i];
+                        let e = &db.entries()[i];
                         (e.format, e.path.clone(), e.id.clone())
                     };
                     if let Some(cfg) = crate::subprocess::probe_plugin_ports(format, &path, &id) {
-                        let e = &mut db.entries[i];
-                        e.has_note_input = cfg.has_note_input;
-                        e.has_note_output = cfg.has_note_output;
-                        e.has_audio_output = cfg.has_audio_output;
-                        e.has_audio_input = cfg.has_audio_input;
+                        db.update_entry(i, |e| apply_probed_ports(e, &cfg));
                     }
                 }
                 if total > 0 {
                     proxy.send(AppEvent::RescanProgress { done: total, total });
                 }
                 // probe 済みを示す版を立てる (起動時の自動再 probe 判定用)。
-                db.port_probe_version = common::plugin_db::PORT_PROBE_VERSION;
+                db.set_port_probe_version(common::plugin_db::PORT_PROBE_VERSION);
                 if let Some(cache) = common::plugin_db::default_cache_path()
                     && let Err(e) = db.save_to_file(&cache)
                 {
@@ -750,6 +746,15 @@ impl AppData {
 /// 接頭辞の後ろは空でもよい = 種別だけで絞る)。 接頭辞が無ければ `(None, 全文)`。
 /// 「v」 だけ (空白なし) は接頭辞ではなく通常の検索語 (`vocoder` の途中入力)。
 /// 戻りの文字列は前後空白を除いてある (呼び側の `trim()` をここに吸収)。
+/// rescan の probe が読んだ port 構成 (note in/out・audio in/out) を DB の entry に書く。映像 port は内蔵映像効果
+/// だけが持つので probe の対象外 (書かない)。
+fn apply_probed_ports(entry: &mut common::plugin_db::PluginEntry, cfg: &common::port_config::PortConfig) {
+    entry.has_note_input = cfg.has_note_input;
+    entry.has_note_output = cfg.has_note_output;
+    entry.has_audio_output = cfg.has_audio_output;
+    entry.has_audio_input = cfg.has_audio_input;
+}
+
 pub(crate) fn split_picker_query(query: &str) -> (Option<PluginCategory>, &str) {
     let query = query.trim_start();
     let mut chars = query.chars();

@@ -191,7 +191,7 @@ impl PluginPickEntry {
     /// 「Parallel」と DB の plugin (名前順)。 起動時と DB 再走査の両方がこれを通る (SSoT)。
     /// DB が無い環境 (`None`) でも内蔵と Parallel は出る (追加は DB を引かない)。
     pub(crate) fn build_all(db: Option<&common::plugin_db::PluginDatabase>) -> Vec<Self> {
-        let mut rest: Vec<Self> = db.map(|db| db.entries.iter().map(Self::from_db_entry).collect()).unwrap_or_default();
+        let mut rest: Vec<Self> = db.map(|db| db.entries().iter().map(Self::from_db_entry).collect()).unwrap_or_default();
         rest.push(Self::parallel_entry());
         rest.sort_by_key(|e| e.name.to_lowercase());
         let mut v: Vec<Self> = common::model::NativeKind::ALL.into_iter().map(Self::native_entry).collect();
@@ -1300,7 +1300,7 @@ pub(crate) struct ArrLabelCache {
     pub(crate) lane_node_labels:
         std::collections::HashMap<common::model::AutomationTarget, std::sync::Arc<str>>,
     /// `lane_node_labels` を作ったときの入力の世代 (`None` = まだ作っていない)。
-    pub(crate) lane_labels_key: Option<LaneLabelsKey>,
+    pub(crate) lane_labels_key: Option<HostDerivedKey>,
 }
 
 impl ArrLabelCache {
@@ -1311,8 +1311,9 @@ impl ArrLabelCache {
     }
 }
 
-/// [`ArrLabelCache::lane_node_labels`] を作ったときの入力の世代。どれか 1 つでも変われば作り直す。
-pub(crate) struct LaneLabelsKey {
+/// Song と host の param 表と plugin DB から作る派生 (レーン名 / plugin の Par の param 行) を作ったときの、
+/// 入力の世代。どれか 1 つでも変われば作り直す (`AppData::host_derived_key` / `host_derived_key_is_current`)。
+pub(crate) struct HostDerivedKey {
     /// Song (`SongDoc::edit_epoch`)。
     pub(crate) edit_epoch: u64,
     /// host の param 表 (`PluginParamTable::generation`)。
@@ -1322,7 +1323,7 @@ pub(crate) struct LaneLabelsKey {
     pub(crate) plugin_db: Option<Arc<PluginDatabase>>,
 }
 
-impl LaneLabelsKey {
+impl HostDerivedKey {
     /// 今の入力 (`edit_epoch` / `plugin_params` / `plugin_db`) で作ったものか。
     pub(crate) fn is_current(&self, edit_epoch: u64, plugin_params: u64, plugin_db: &Option<Arc<PluginDatabase>>) -> bool {
         let same_db = match (&self.plugin_db, plugin_db) {
@@ -1332,6 +1333,16 @@ impl LaneLabelsKey {
         };
         self.edit_epoch == edit_epoch && self.plugin_params == plugin_params && same_db
     }
+}
+
+/// plugin の Par の param 行 ([`PluginParamsInspector`]) の世代キャッシュ (device ごと)。param 行は param 表の
+/// 全 param ぶんあり (数万の実例がある)、毎フレーム組み直さない。
+#[derive(Default)]
+pub(crate) struct PluginParamsPanelCache {
+    /// `panels` を作ったときの入力の世代 (変わったら全部捨てる)。
+    pub(crate) key: Option<HostDerivedKey>,
+    /// device id → 組んだ param 行 (`None` = その device は汎用の Par を出さない)。
+    pub(crate) panels: std::collections::HashMap<u64, Option<std::rc::Rc<PluginParamsInspector>>>,
 }
 
 /// r.md #56: 再生位置の秒表示用 [`common::tempo_map::TempoMap`] の `edit_epoch`

@@ -299,7 +299,7 @@ impl AppData {
         use common::model::{AutomationClip, AutomationContent, AutomationLane, ClipContent};
         // 置き場は target の持ち主 (tempo / master fx の device → `song_lanes`)、決まらない住所は
         // gesture の track (r.md #129: `param_owner` 1 か所)。束縛先が居なければ作らない。
-        let owner = crate::handler::param_value::param_owner(self.cur.song_doc.song(), target, track_id)?;
+        let owner = crate::handler::param_value::param_owner(&self.cur.song_doc, target, track_id)?;
         // L8 (r.md #8): store が無ければ content_id を alloc する前に return する
         // (orphan AutomationContent leak を防ぐ)。
         let (lanes, _) = self.cur.song_doc.song().param_stores(owner)?;
@@ -433,7 +433,7 @@ impl AppData {
         // 置き場は target の持ち主 (tempo / master fx の device → `song_lanes`)、決まらない住所は
         // gesture の track (r.md #129: `param_owner` 1 か所)。
         let song = self.cur.song_doc.song();
-        let owner = crate::handler::param_value::param_owner(song, target, track_id)?;
+        let owner = crate::handler::param_value::param_owner(&self.cur.song_doc, target, track_id)?;
         let lane = song.param_stores(owner)?.0.iter().find(|l| l.enabled && l.target == *target)?;
         let clip = lane.clips.iter().find(|c| {
             playhead_beat >= c.start_beat && playhead_beat < c.start_beat + c.length_beats
