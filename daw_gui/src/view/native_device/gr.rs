@@ -2,7 +2,9 @@
 //! master Limiter のセグメント表示が共有する。
 //!
 //! 値はすべて **正の減衰量 dB** (0 = 掛かっていない。`TransportState::native_gr.get(id)` /
-//! `master_limiter_gr` がこの向きで持つ)。`active == false` (bypass) は形を変えずに塗りを薄くする。
+//! `master_limiter_gr` がこの向きで持つ)。`active == false` (bypass) は形を変えずに薄くする (Q9) —
+//! 横 / セグメントは溝と塗りの両方 (GR 0 の停止中も ON の行と見分けられる)、縦は呼び出し側が面を渡す
+//! (EQ カーブの上に重ねるので面は不透明のまま) ので塗りだけ。
 
 use std::hash::Hash;
 
@@ -10,12 +12,11 @@ use common::model::GR_METER_RANGE_DB;
 use daw_ui_core::Ui;
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
+use super::INACTIVE_ALPHA;
 use crate::app::AppData;
 
 /// master Limiter の GR セグメント数 (1 セグメント = 1 dB、Mixbus と同じ粒度)。
 pub const LIMITER_GR_SEGMENTS: usize = 12;
-/// OFF (bypass) の塗りの不透明度の倍率。
-const INACTIVE_ALPHA: f32 = 0.45;
 
 /// 縦の GR メーター (上から下へ減衰量ぶん伸びる、レンジ `GR_METER_RANGE_DB`)。
 /// EQ カーブの上に重ねる用途があるので、面 (`bg`) は必ず自分で塗る。
@@ -54,7 +55,7 @@ pub fn draw_gr_horizontal(
     let p = &app.theme.core;
     let value_w = value_font.map_or(0.0, |font| font * 2.0 + 2.0);
     let bar = Rect { w: (rect.w - value_w).max(1.0), ..rect };
-    ui.panel((b"native_gr_h", &id), bar, p.window_bg, 2.0);
+    ui.panel((b"native_gr_h", &id), bar, slot_color(app, active), 2.0);
     let frac = gr_frac(gr_db, range_db);
     if frac > 0.0 {
         fill(ui, Rect { w: bar.w * frac, ..bar }, gr_color(app, active), [2.0; 4]);
@@ -82,7 +83,7 @@ pub fn draw_gr_segments(
     active: bool,
     segments: usize,
 ) {
-    ui.panel((b"native_gr_seg", &id), rect, app.theme.core.window_bg, 2.0);
+    ui.panel((b"native_gr_seg", &id), rect, slot_color(app, active), 2.0);
     let segments = segments.max(1);
     let lit = (gr_db.max(0.0) as usize).min(segments);
     let seg_w = (rect.w - 2.0) / segments as f32;
@@ -105,7 +106,15 @@ fn gr_frac(gr_db: f32, range_db: f32) -> f32 {
 }
 
 fn gr_color(app: &AppData, active: bool) -> Color {
-    let c = app.theme.daw.strip_gr;
+    inactive_dim(app.theme.daw.strip_gr, active)
+}
+
+/// 横 / セグメントの溝 (メーターの窪み)。OFF は下の面へ溶かして薄くする。
+fn slot_color(app: &AppData, active: bool) -> Color {
+    inactive_dim(app.theme.core.window_bg, active)
+}
+
+fn inactive_dim(c: Color, active: bool) -> Color {
     if active { c } else { c.with_alpha(c.a * INACTIVE_ALPHA) }
 }
 

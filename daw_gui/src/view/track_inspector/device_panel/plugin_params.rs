@@ -16,6 +16,8 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
     if let Some(view) = app.inspector_plugin_params(ctx.device_id) {
         let device_id = view.device_id;
         let track_id = view.track_id;
+        // 変調の持ち主 (device を持つトラック) はパネルにつき 1 回だけ解決し、全行で使い回す。
+        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
         ui.label_at_clipped(
             ("inspector_pp_label", device_id),
             &view.plugin_name,
@@ -73,8 +75,8 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
                 legacy_device_index: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: false };
-            let mod_build = build_mod(app, target.clone(), row.value_real, domain, track_id);
-            let modulation = Some(mod_build.modulation());
+            let mod_build = owner.map(|o| build_mod(app, target.clone(), row.value_real, domain, o));
+            let modulation = mod_build.as_ref().map(|m| m.modulation());
             let param_id = row.id;
             let fmt = if row.stepped {
                 ScrubableNumberFormat::Decimal(0)

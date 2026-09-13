@@ -17,7 +17,7 @@ use std::hash::Hash;
 
 use common::automation::{norm_to_plain, plain_to_norm, target_range};
 use common::model::{
-    AutomationTarget, BusCompParam, EqParam, MASTER_TRACK_ID, MasterLimiterParam, NativeDevice, NativeParamId,
+    AutomationTarget, BusCompParam, EqParam, MasterLimiterParam, NativeDevice, NativeParamId,
     ParamRange, RackPanelKey,
 };
 use daw_ui_core::widgets::knob::KNOB_UNITS_PER_PX;
@@ -113,7 +113,7 @@ pub fn limiter_knob(
     let plain = app.live_lane_value(scope, ParamOwner::master(song), &target, song.master_limiter.param(param));
     let core = KnobCore {
         surface,
-        owner_id: MASTER_TRACK_ID,
+        owner: ParamOwner::master(song),
         panel: RackPanelKey::MasterLimiter,
         key: param,
         target,
@@ -129,9 +129,10 @@ pub fn limiter_knob(
 }
 
 /// つまみ 1 個分の解決済みの記述 (native と Limiter で共有する)。
-struct KnobCore<K, E> {
+struct KnobCore<'a, K, E> {
     surface: ParamSurface,
-    owner_id: u32,
+    /// lane / routing の持ち主 (解決済み。変調の帯もこれから引き、つまみごとに木を引き直さない)。
+    owner: ParamOwner<'a>,
     panel: RackPanelKey,
     /// widget id の部品内の鍵 (`NativeParamId` / `MasterLimiterParam`)。
     key: K,
@@ -147,10 +148,10 @@ struct KnobCore<K, E> {
     event: E,
 }
 
-fn native_core(
+fn native_core<'a>(
     app: &AppData,
-    spec: &NativeKnobSpec<'_>,
-) -> Option<KnobCore<NativeParamId, impl Fn(f32) -> AppEvent + Copy + Send + 'static>> {
+    spec: &NativeKnobSpec<'a>,
+) -> Option<KnobCore<'a, NativeParamId, impl Fn(f32) -> AppEvent + Copy + Send + 'static>> {
     let dev = spec.device;
     let param = spec.param;
     // On (値域 Toggle) はつまみにしない。種類違い / 実在しない組 (`Eq{Hp,Gain}` 等) も描かない。
@@ -159,7 +160,7 @@ fn native_core(
     let device_id = dev.id;
     Some(KnobCore {
         surface: spec.surface,
-        owner_id: spec.owner.id,
+        owner: spec.owner,
         panel: RackPanelKey::Device(device_id),
         key: param,
         target: AutomationTarget::NativeParam { device_id, param },
@@ -176,7 +177,7 @@ fn native_core(
 fn draw_param_knob<K, E>(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
-    core: KnobCore<K, E>,
+    core: KnobCore<'_, K, E>,
     value_rect: Option<Rect>,
 ) -> NativeKnobResponse
 where
@@ -186,7 +187,7 @@ where
     let target = &core.target;
     let norm = plain_to_norm(target, f64::from(core.plain));
     let default_norm = plain_to_norm(target, f64::from(core.default_plain));
-    let m = build_mod(app, target.clone(), f64::from(norm), ModControlDomain::Norm, core.owner_id);
+    let m = build_mod(app, target.clone(), f64::from(norm), ModControlDomain::Norm, core.owner);
     let event = core.event;
     let knob = ui.knob_at(
         wid(core.surface, core.panel, "knob", core.key),
@@ -238,11 +239,11 @@ where
         ui,
         app,
         core.surface,
-        core.owner_id,
+        core.owner.id,
         target.clone(),
         knob.dragging || field_dragging || core.external_drag,
     );
-    push_mod_depth_bracket(ui, app, core.surface, core.owner_id, target, knob.mod_dragging);
+    push_mod_depth_bracket(ui, app, core.surface, core.owner.id, target, knob.mod_dragging);
 
     NativeKnobResponse {
         hovered: knob.hovered || field.as_ref().is_some_and(|f| f.hovered),
@@ -278,7 +279,8 @@ fn value_style(app: &AppData, target: &AutomationTarget, unit: &'static str) -> 
     let p = &app.theme.core;
     let (range, curve, sensitivity) = match target_range(target, None) {
         // `LogWithOff` の OFF (0) は対数目盛に載らないので、欄のドラッグは lo..hi で動かす。
-        // OFF はつまみを左へ回し切るか、ダブルクリック (既定値) で戻す。
+        // OFF はつまみを左へ回し切る / ダブルクリック (既定値) / 欄に "OFF" か "0" を打つ
+        // (書式がラベルで名指しする値は確定時に range へ clamp されない、`labeled_value`)。
         ParamRange::Log { lo, hi } | ParamRange::LogWithOff { lo, hi } => ((lo, hi), ScrubCurve::Log, KNOB_UNITS_PER_PX),
         r @ (ParamRange::Linear { .. } | ParamRange::Toggle | ParamRange::Stepped { .. }) => {
             let (lo, hi) = r.display_range();

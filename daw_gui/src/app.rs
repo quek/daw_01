@@ -1251,17 +1251,6 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            // マスターフェーダーの drag を 1 undo step に束ねる。これが無いと
-            // per-frame の `SetMasterGain` が各々 snapshot を積み、1 回の drag で
-            // undo 履歴が埋まる (group transform / inspector scrub と同じ罠)。
-            AppEvent::BeginMasterGainDrag => {
-                self.cur.peph.master_gain_dragging = true;
-                self.cur.song_doc.begin_gesture();
-            }
-            AppEvent::EndMasterGainDrag => {
-                self.cur.peph.master_gain_dragging = false;
-                self.cur.song_doc.end_gesture();
-            }
             AppEvent::Tick { project, samples, preroll, playing, recording_live } => {
                 self.on_transport_tick(project, samples, preroll, playing, recording_live);
             }
@@ -1297,9 +1286,10 @@ impl AppData {
                     self.on_track_peaks_tick(&tracks, native_gr.as_deref(), master_limiter_gr_db);
                 }
             }
-            AppEvent::DeviceSpectrumTick { project, spectra } => {
+            AppEvent::DeviceSpectrumTick { project, spectra, visual_digest } => {
                 if project == self.cur.key {
                     self.cur.transport.device_spectra = spectra.into_iter().collect();
+                    self.cur.transport.device_spectra_digest = visual_digest;
                 }
             }
             AppEvent::LauncherRowsTick { project, rows } => {

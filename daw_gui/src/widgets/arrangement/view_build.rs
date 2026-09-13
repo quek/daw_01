@@ -211,7 +211,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 t,
                 lane_build_data,
                 &|tgt| app.plugin_param_range(tgt),
-                &|tgt| app.device_param_name(tgt),
+                &|tgt| app.lane_node_label(&labels, tgt),
             ),
             row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
@@ -307,7 +307,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         common::model::MASTER_TRACK_ID,
         lane_build_data,
         &|tgt| app.plugin_param_range(tgt),
-        &|tgt| app.device_param_name(tgt),
+        &|tgt| app.lane_node_label(&labels, tgt),
     );
     let master_row = ArrangementMasterRow {
         automation_lanes_collapsed: !app.cur.view.master_row_automation_expanded,
@@ -639,7 +639,7 @@ fn build_arrangement_automation_lanes(
     track: &common::model::Track,
     data: LaneBuildData<'_>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
-    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
+    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<Arc<str>>,
 ) -> Vec<ArrangementAutomationLane> {
     build_arrangement_lanes_from_slice(&track.automation_lanes, track.id, data, range_of, param_name_of)
 }
@@ -673,7 +673,7 @@ fn build_arrangement_lanes_from_slice(
     track_id: u32,
     data: LaneBuildData<'_>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
-    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
+    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<Arc<str>>,
 ) -> Vec<ArrangementAutomationLane> {
     let LaneBuildData {
         song,
@@ -688,7 +688,7 @@ fn build_arrangement_lanes_from_slice(
         .iter()
         .map(|lane| {
             let param_name = param_name_of(&lane.target);
-            let display = lane_target_display(&lane.target, param_name.as_deref());
+            let display = lane_target_display(&lane.target, param_name);
             let range = range_of(&lane.target);
             let default_value_norm =
                 common::automation::plain_to_norm_ranged(&lane.target, lane.default_value, range);
@@ -814,15 +814,16 @@ fn native_lane_color(kind: common::model::NativeKind) -> Color {
     }
 }
 
-/// `device_param_name` (song を引いたノード名つきの名前) の lane ラベル。
-/// 解決できない (song 無しで呼ばれた / ノードが消えた) ときは `fallback`。
-fn node_label(device_param_name: Option<&str>, fallback: impl FnOnce() -> Arc<str>) -> Arc<str> {
-    device_param_name.map_or_else(fallback, intern_label)
+/// `device_param_name` (song を引いたノード名つきの名前、`AppData::lane_node_label`) の lane ラベル。
+/// 解決できない (song 無しで呼ばれた / ノードが消えた) ときは `fallback`。ノード名はユーザーが変えられる
+/// ので intern しない (世代キャッシュが持つ `Arc` をそのまま使う)。
+fn node_label(device_param_name: Option<Arc<str>>, fallback: impl FnOnce() -> Arc<str>) -> Arc<str> {
+    device_param_name.unwrap_or_else(fallback)
 }
 
 fn lane_target_display(
     target: &common::model::AutomationTarget,
-    device_param_name: Option<&str>,
+    device_param_name: Option<Arc<str>>,
 ) -> LaneDisplay {
     use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {

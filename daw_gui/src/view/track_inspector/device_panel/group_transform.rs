@@ -34,6 +34,8 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
         let auto_btn_x = input_x + input_w + auto_btn_gap;
         let track_id = summary.track_id;
         let gt = summary.transform;
+        // 変調の持ち主 (このグループのトラック) はパネルにつき 1 回だけ解決する。
+        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
 
         for param in crate::app::GROUP_PARAMS {
             use common::model::GroupTransformParam as G;
@@ -114,8 +116,8 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
             } else {
                 mod_widget::PLAIN_IDENT
             };
-            let g_mod_build = build_mod(app, g_target.clone(), value, g_domain, track_id);
-            let g_modulation = Some(g_mod_build.modulation());
+            let g_mod_build = owner.map(|o| build_mod(app, g_target.clone(), value, g_domain, o));
+            let g_modulation = g_mod_build.as_ref().map(|m| m.modulation());
             let resp = ui.scrubable_number_at(
                 (device_id, param, "group_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },

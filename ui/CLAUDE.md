@@ -174,8 +174,9 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 
 ### 矩形の中をドラッグする点 (`xy_point_at`) の作法
 
-- press は当たり円の中なら `claim_press` で名乗る (`take_drag_in_rect` は claim しないので、行の中に
-  置く点 / ハンドルには使わない — 親の `drag_list` が行ごと動く)。
+- press は当たり円の中なら `claim_press_at` (近さつき) で名乗る (`take_drag_in_rect` は claim しないので、行の中に
+  置く点 / ハンドルには使わない — 親の `drag_list` が行ごと動く)。当たり判定が重なりうる点 / ハンドルを新しく
+  書くときも同じ口 + `nearest_under_pointer` (hover / ホイール) で「近い 1 点だけ」にする ([`crates/ui/src/click.rs`](crates/ui/src/click.rs))。
 - 押したまま Esc で press 時の位置へ戻す (knob / fader と同じ `drag_cancel_requested` の契約)。
 - `XyPointResponse::wheel` は notch 単位 (入力層の `LINE_HEIGHT_PX` で px から戻す)。`wheel_active` は
   最後のホイールから 400ms 立っていて、caller がホイールの一連を undo 1 step に束ねる窓に使う

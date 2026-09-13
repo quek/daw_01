@@ -1115,6 +1115,7 @@ impl ApplicationHandler<AppEvent> for Runner {
         // `LauncherRowsTick` (r.md #87) と `Sampler(Tick)` (Global Sampler) も同じ
         // poll thread が毎 tick 送る。ここに入れ忘れると、停止中でも窓がアクティブな
         // 限り無条件再描画が 30fps で走り続け、#49 の省電力が事実上無効になる。
+        // `DeviceSpectrumTick` (r.md #129) も同じ poll thread の tick (中身はダイジェストで指紋に入る)。
         let is_tick = matches!(
             event,
             AppEvent::Tick { .. }
@@ -1122,6 +1123,7 @@ impl ApplicationHandler<AppEvent> for Runner {
                 | AppEvent::TrackVoicesTick { .. }
                 | AppEvent::TrackPeaksTick { .. }
                 | AppEvent::MasterMeterTick(_)
+                | AppEvent::DeviceSpectrumTick { .. }
                 | AppEvent::MetricsTick { .. }
                 | AppEvent::SystemMetricsTick { .. }
                 | AppEvent::LauncherRowsTick { .. }

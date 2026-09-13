@@ -6,6 +6,7 @@
 //! - Par の余白を掴んでも行が動かない
 //! - `Q` の宛先 (Rack の Limiter 行 / Mixer の hover が先)
 //! - ダーク / ライトで、スペクトラムの上の EQ 点と OFF 行の名前が背景に沈まない
+//! - ダーク / ライトで、OFF 行の GR の小表示が形を保ったまま薄くなる (Q9)
 
 use std::sync::Arc;
 
@@ -473,6 +474,76 @@ fn eq_points_over_the_spectrum_and_off_row_names_keep_contrast_in_both_themes() 
                 let ratio = contrast_ratio(eq_name.color, bg);
                 assert!(ratio >= MIN_CONTRAST, "{theme}: OFF 行の名前 {:?} / 背景 {bg:?} = {ratio:.2}", eq_name.color);
             }
+        }
+    }
+}
+
+/// 行の小表示 (幅 `MINI_W` × 高さ `MINI_GR_H` の GR の溝) の、行の背景に対するコントラスト。
+/// `row_name` の行の中にある溝を探し、溝の塗りを行の背景に重ねた色と背景を比べる。
+fn gr_mini_slot_contrast(scene: &Scene, row_name: &str) -> f32 {
+    const MINI_W: f32 = 80.0;
+    const MINI_GR_H: f32 = 8.0;
+    let row_y = one(scene, row_name).top - NAME_TOP;
+    let (idx, slot) = scene
+        .primitives
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| match p {
+            Primitive::Rect(r)
+                if (r.rect.w - MINI_W).abs() < 0.01
+                    && (r.rect.h - MINI_GR_H).abs() < 0.01
+                    && r.rect.x < INSPECTOR_W
+                    && r.rect.y >= row_y
+                    && r.rect.y + r.rect.h <= row_y + ROW_H =>
+            {
+                Some((i, *r))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("`{row_name}` の行に GR の溝が描かれる"));
+    let center = (slot.rect.x + slot.rect.w * 0.5, slot.rect.y + slot.rect.h * 0.5);
+    let bg = backdrop(scene, center, idx);
+    contrast_ratio(composite(bg, slot.fill), bg)
+}
+
+/// Q9: OFF の Comp / Limiter 行の小表示 (GR の溝) は、形を保ったまま薄くなる — ダーク / ライトの両方で、
+/// 行の背景が静止 / hover (溝が沈む側) のどちらでも、溝のコントラストが ON の行より下がり、しかも消えない
+/// (EQ 系の小表示のカーブと同じ見せ方)。停止中 (GR 0 = 塗りが出ない) で比べる。
+#[test]
+fn off_rows_dim_their_gr_mini_displays_but_keep_the_shape_in_both_themes() {
+    /// ON と OFF の見分けに要るコントラストの差。
+    const MIN_DIFF: f32 = 0.05;
+    /// 溝の輪郭が残る下限 (80×8 の無彩色の面なら数 % の輝度差で見える)。
+    const MIN_VISIBLE: f32 = 1.04;
+    // `row` の行の溝のコントラスト。`hovered` なら行の名前の上にポインタを置いたフレームで測る。
+    let measure = |h: &mut Harness, row: &str, hovered: bool| {
+        let scene = h.settle();
+        if !hovered {
+            return gr_mini_slot_contrast(&scene, row);
+        }
+        let (x, y) = one(&scene, row).center();
+        let _ = h.frame(hover(x, y));
+        gr_mini_slot_contrast(&h.frame(hover(x, y)), row)
+    };
+    let check = |what: String, on: f32, off: f32| {
+        assert!(off <= on - MIN_DIFF, "{what}: OFF の溝 {off:.3} が ON {on:.3} より薄くない");
+        assert!(off >= MIN_VISIBLE, "{what}: OFF の溝 {off:.3} が消えている (ON {on:.3})");
+    };
+    for theme in ["dark", "light"] {
+        for hovered in [false, true] {
+            let mut h = Harness::new(theme);
+            let t0 = h.track(0);
+            assert!(h.native(h.builtin(t0, NativeKind::Comp)).bypassed, "前提: 組み込み Comp は既定で OFF");
+            h.dev(DeviceEvent::AddNative { chain: common::model::ChainRef::Track(t0), kind: NativeKind::Comp, open_panel: false });
+            let (on, off) = (measure(&mut h, "Comp 2", hovered), measure(&mut h, "Comp", hovered));
+            check(format!("{theme} hovered={hovered} Comp"), on, off);
+
+            h.select(MASTER_TRACK_ID);
+            assert!(!h.app.cur.song_doc.song().master_limiter.on, "前提: Limiter は既定で OFF");
+            let off = measure(&mut h, "Limiter", hovered);
+            h.dev(DeviceEvent::MasterLimiterEdit(daw_gui::event_native::MasterLimiterEdit::On(true)));
+            let on = measure(&mut h, "Limiter", hovered);
+            check(format!("{theme} hovered={hovered} Limiter"), on, off);
         }
     }
 }
