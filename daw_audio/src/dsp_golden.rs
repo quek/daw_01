@@ -1,9 +1,11 @@
 //! r.md #129: 組み込み DSP の golden (`src/native_dsp/golden_v38.txt`) の刺激・統計・テキスト形式。
 //!
-//! **記録側と比較側が同じこのコードを使う。** 記録は旧 `mixer::channel_strip` の tests にある
-//! `record_golden` (commit 76837672 の strip DSP)、比較は新 `native_dsp` の tests
+//! **記録側と比較側が同じこのコードを使う。** 記録は旧 `mixer::channel_strip` の tests にあった
+//! `record_golden` (commit 76837672 の strip DSP、旧型と一緒に削除済み)、比較は新 `native_dsp` の tests
 //! (`docs/plan_rack_native_devices.md` §15.3 T1)。旧 DSP の型には依存しない — 記録の後で旧 DSP は
-//! 消えるので、ここが旧型を引くと比較側がビルドできなくなる。
+//! 消えるので、ここが旧型を引くと比較側がビルドできなくなる。例外は `limiter.on = true` の
+//! master_full で、ceiling を超えていた旧 Limiter を直した後に `native_dsp::tests::rerecord_limiter_scenarios`
+//! で窓だけを取り直した (r.md #129 E)。
 //!
 //! - 刺激: 48 kHz・2 s のステレオ 3 種 ([`Stimulus`])。
 //! - 駆動: 刺激を `block` サンプルずつ in-place で処理させる ([`run_blocks`])。

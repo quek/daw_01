@@ -189,6 +189,102 @@ fn master_limiter_passes_only_the_delay_while_resolved_off_and_resets_to_silence
     assert_eq!(st.gain_reduction_db(), 0.0);
 }
 
+/// Limiter はどんな刺激・入力レベル・ceiling・ブロック長でも出力が ceiling を超えない
+/// (旧実装は先読み窓の中でピークを保持せず、孤立インパルスで超えていた)。ceiling 以下の音は先読みぶん
+/// 遅れるだけでビット単位で変わらない。
+#[test]
+fn master_limiter_never_exceeds_the_ceiling() {
+    let look = common::model::limiter_lookahead_samples(SR) as usize;
+    let mut worst_ratio = 0.0f64;
+    for stimulus in Stimulus::ALL {
+        for input_gain_db in [0.0, 6.0, 12.0, 24.0] {
+            let x = stimulus.generate(input_gain_db);
+            for ceiling_db in [-6.0f32, -1.0, 0.0] {
+                let ceiling_amp = common::dsp::db_to_amp(ceiling_db);
+                let s = MasterLimiterSettings { on: true, ceiling_db };
+                for block in [64usize, 512, 1024] {
+                    let mut st = MasterLimiterState::new();
+                    let (mut l, mut r) = (x.l.clone(), x.r.clone());
+                    for (cl, cr) in l.chunks_mut(block).zip(r.chunks_mut(block)) {
+                        let n = cl.len();
+                        st.process(&s, true, cl, cr, n, SR as f32);
+                        assert!(st.gain_reduction_db() <= 0.0);
+                    }
+                    let peak = l.iter().chain(&r).fold(0.0f32, |m, v| m.max(v.abs()));
+                    worst_ratio = worst_ratio.max(f64::from(peak) / f64::from(ceiling_amp));
+                    assert!(
+                        peak <= ceiling_amp,
+                        "{} +{input_gain_db}dB ceiling {ceiling_db} block {block}: peak {peak} > {ceiling_amp}",
+                        stimulus.name()
+                    );
+                }
+            }
+        }
+    }
+    assert!(worst_ratio > 0.99, "どこかで ceiling まで潰している (検査が空振りしていない): {worst_ratio}");
+
+    // ceiling 以下の音は遅延だけ。
+    let quiet = Stimulus::Tones.generate(-12.0);
+    let mut st = MasterLimiterState::new();
+    let (mut l, mut r) = (quiet.l.clone(), quiet.r.clone());
+    for (cl, cr) in l.chunks_mut(512).zip(r.chunks_mut(512)) {
+        let n = cl.len();
+        st.process(&MasterLimiterSettings { on: true, ceiling_db: 0.0 }, true, cl, cr, n, SR as f32);
+        assert_eq!(st.gain_reduction_db(), 0.0);
+    }
+    assert_eq!(&l[look..], &quiet.l[..quiet.l.len() - look]);
+    assert_eq!(&r[look..], &quiet.r[..quiet.r.len() - look]);
+}
+
+/// T12: Limiter (先読みリング / 窓内最小値の deque / 移動平均) は RT で確保しない。SR の変更・OFF の区間・
+/// reset も含めて回す。
+#[cfg(feature = "rt-assert")]
+#[test]
+fn master_limiter_does_not_allocate() {
+    let x = Stimulus::Impulses.generate(12.0);
+    let mut st = MasterLimiterState::new();
+    let (mut l, mut r) = (x.l.clone(), x.r.clone());
+    assert_no_alloc::assert_no_alloc(|| {
+        for (i, (cl, cr)) in l.chunks_mut(256).zip(r.chunks_mut(256)).enumerate() {
+            let n = cl.len();
+            let s = MasterLimiterSettings { on: i % 7 != 3, ceiling_db: -3.0 };
+            let sr = if i < 200 { 48_000.0 } else { 96_000.0 };
+            st.process(&s, i % 11 != 5, cl, cr, n, sr);
+            if i == 300 {
+                st.reset();
+            }
+        }
+    });
+}
+
+/// golden の `limiter.on = true` のシナリオ (master_full) の窓を、直した Limiter で取り直す。
+/// それ以外のシナリオと meta は変えない。ヘッダの記録条件の行も合わせて書き換える (冪等)。
+#[test]
+#[ignore = "r.md #129 E: Limiter の修正後に golden の master_full を取り直す"]
+fn rerecord_limiter_scenarios() {
+    let path = dsp_golden::golden_path();
+    let text = std::fs::read_to_string(&path).expect("golden_v38.txt を読めない");
+    let mut golden = dsp_golden::parse(&text).expect("golden を解釈できない");
+    let mut rerecorded = 0usize;
+    for s in &mut golden.scenarios {
+        if s.meta("limiter.on") == Some("true") {
+            s.windows = render(s);
+            rerecorded += 1;
+        }
+    }
+    assert!(rerecorded > 0);
+    for h in &mut golden.header {
+        if h.starts_with("記録:") {
+            *h = "記録: 旧 DSP の記録器 (旧 mixer/channel_strip.rs の tests) は旧型と一緒に削除済み。limiter.on=true の窓の取り直しは cargo test -p daw_audio --bin daw_audio -- --ignored rerecord_limiter_scenarios (native_dsp/tests.rs)。".to_string();
+        } else if h.starts_with("kind=master_full:") {
+            *h = "kind=master_full: ブロックごとに process_pre → process_limiter (HEAD の render_master_buffer と同じ順。master_fx_chain は空・master_gain は 1.0 なので間に処理は無い)。limiter.on=true = HEAD でリミッターの先読み遅延が乗る状態。gr = gain_reduction_db().0、lim_gr = .1。**この kind の窓だけは r.md #129 E で直した Limiter (native_dsp/limiter.rs、先読み窓の中で必要ゲインの最小値を保持) から取り直した** — 旧 Limiter は先読みしている間にリリースで利得が戻り、孤立インパルスで ceiling を超えていた (peak 1.003 > −1 dBFS)。Bus Comp / Tone EQ の部分は旧 DSP と同じ。".to_string();
+        }
+    }
+    let out = dsp_golden::format(&golden);
+    assert_eq!(dsp_golden::parse(&out).as_ref(), Ok(&golden), "書いた値を読み戻せない");
+    std::fs::write(&path, out).expect("golden を書けない");
+}
+
 fn within(got: f64, want: f64) -> bool {
     (got - want).abs() <= 1e-6 + 1e-5 * want.abs()
 }
