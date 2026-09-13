@@ -444,7 +444,7 @@ pub fn default_insert_index_in(devices: &[Device], is_master: bool) -> usize;
 
 ### 5.8 不変条件を保つ単一の口
 
-**`Song::enforce_edit_invariants()` を SongDoc の 5 つの口で呼ぶ**（K5）
+**`Song::enforce_edit_invariants_watched()` を SongDoc の 5 つの口で呼ぶ**（K5）。回復するのは id 構造（`common::model::StructureWatch` が SSoT）が回復済みの構造と違うときだけで、結果は無条件に回した場合と同じ（値だけの編集ごとに曲全体を作り直さないため、X1）。構造が変わったかは `SongDoc::structure_epoch()` で GUI からも読め、session 状態の後始末もこの世代で間引く。undo / redo / 履歴ジャンプでは `Song::carry_id_high_water_from` で id の払い出し位置を持ち越し、id を再利用しない（不変条件 1）。
 
 | 口 | 位置 | 呼び方 |
 |---|---|---|
@@ -1963,7 +1963,7 @@ pub fn device_scope_shmem_id(parent_pid: u32) -> String;
 | 1 | 安定 id | op / tap / GR 面 / scope 見出し / 値 IPC / Listen / Par の鍵 / hover / widget id / ジェスチャー所有者は、すべて device id（と ProjectKey、target）で指す。`ChainRow.index` はフレーム内の drop 解決だけに使う。`InsertAt::Default` は実行時に解決する |
 | 2 | blob-less | 値 IPC は約 100 byte の Copy、`SetDeviceScopes` は 16 個以下の u64。サンプルは shmem |
 | 3 | 宛先の型 | 新しい command はすべて `AudioCommand`、project 宛て。GUI 内は `DeviceEvent` の sub-enum 1 本 |
-| 4 | RT で確保・ロックしない | 確保はすべて compile 時（`NativeScratch` / `ScStage` / `ListenBuf` / dry / `BusScAlign` の DelayLine）。RT は swap / コピー / atomic / `ArcSwap::load` のみ。既存の RT 確保（§18-B）も消える |
+| 4 | RT で確保・ロックしない | 確保はすべて compile 時（`NativeScratch` / `ScStage` / `ListenBuf` / dry / `BusScAlign` の DelayLine）。RT は swap / コピー / atomic のみで、`ArcSwap::load` もしない（load の Guard が差し替え前の Arc の最終参照になり RT で解放が起きるため。RT が読む snapshot はすべて `RtBundle` で届く、X1）。既存の RT 確保（§18-B）も消える |
 | 5 | edit_song が単一の口 | Song の変更は handler の `edit_song(_checked)` だけ。挿入位置・番号・ガード・正規化・prune も closure の中や SongDoc の口で Song から求める。Par / Listen / scope は Song の外 |
 | 6 | live と export が同じ render | 組み込みは `run_chain_program` の op、limiter は `render_master_buffer` の中。違うのは `NativeIo`（Listen / scope）だけで、export は既定値 |
 | 7 | WIRE_SOURCES | §5.12 + arch-lint の検査 |
