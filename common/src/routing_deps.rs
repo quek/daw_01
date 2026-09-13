@@ -322,7 +322,11 @@ impl Song {
                 }
             }
         }
-        own.into_iter().chain(reading).filter(|&(owner, id, port)| self.drop_aux_route_if_cyclic(owner, id, port)).count()
+        let mut dropped = 0;
+        for (owner, id, port) in own.into_iter().chain(reading) {
+            dropped += usize::from(self.drop_aux_route_if_cyclic(owner, id, port));
+        }
+        dropped
     }
 
     /// `owner` 上の device `id` の aux 入力 `port` を外した graph で、その配線が循環を作るなら外したままにする。
