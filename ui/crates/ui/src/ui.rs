@@ -204,6 +204,8 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// daw_01 r.md #122: 直近の primary press の所有者 (press〜release の間だけ `Some`)。
     /// 詳細は [`crate::click`]。
     press_owner: Option<WidgetId>,
+    /// daw_01 r.md #129: ホイールを自分で使う矩形 (`[前フレーム, 今フレーム]`)。詳細は [`crate::wheel`]。
+    wheel_claims: [Vec<Rect>; 2],
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -280,6 +282,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             owned_font_system: None,
             drag_payload: None,
             press_owner: None,
+            wheel_claims: [Vec::new(), Vec::new()],
             _m: PhantomData,
         }
     }
@@ -673,6 +676,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
         if pointer.primary_just_pressed {
             self.press_owner = None;
         }
+        // daw_01 r.md #129: 前フレームのホイール claim だけを残し、今フレームの分を空で始める。
+        self.wheel_claims.swap(0, 1);
+        self.wheel_claims[1].clear();
 
         // M15: OS text store (TSF) がこのフレームに加えた編集 (まぜ書き変換 / 再変換 /
         // composition 確定) を drain し、`ImeEvent` に変換して ime_events 先頭へ置く
@@ -915,6 +921,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_secondary_click: &mut pending_secondary_click,
             drag_payload: &mut self.drag_payload,
             press_owner: &mut self.press_owner,
+            wheel_claims: &mut self.wheel_claims,
             drag_cancel,
             hover_blocked,
             _m: PhantomData,
@@ -1172,6 +1179,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) drag_payload: &'a mut Option<crate::drag_drop::DragPayload>,
     /// daw_01 r.md #122: primary press の所有者 ([`crate::click`])。
     pub(crate) press_owner: &'a mut Option<WidgetId>,
+    /// daw_01 r.md #129: ホイール claim `[前フレーム, 今フレーム]` ([`crate::wheel`])。
+    pub(crate) wheel_claims: &'a mut [Vec<Rect>; 2],
     /// daw_01 r.md #127: このフレームに「ボタンを押したまま Esc」 が来た
     /// ([`Ui::drag_cancel_requested`])。
     pub(crate) drag_cancel: bool,

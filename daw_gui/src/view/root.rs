@@ -27,7 +27,8 @@ use crate::event_tabs::TabEvent;
 pub const MENU_H: f32 = 24.0;
 pub const TRANSPORT_H: f32 = 44.0;
 pub const STATUS_H: f32 = 24.0;
-pub const INSPECTOR_W: f32 = 280.0;
+/// インスペクタ (Rack) の固定幅 (r.md #129 Q1/Q2: ドラッグで変えない。 中身は `pad` 12 を除いた 336px)。
+pub const INSPECTOR_W: f32 = 360.0;
 
 /// arrangement (top) と bottom_panel (= piano_roll / mixer / audio_editor) の
 /// 初期分割比率。 上が `default_ratio`、 下が `1.0 - default_ratio`。 0.65 で
@@ -329,7 +330,7 @@ fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let Some((px, py)) = ui.pointer().pos else {
         return;
     };
-    let label = format!("プラグイン {}", p.device_ids.len());
+    let label = format!("デバイス {}", p.device_ids.len());
     let core = &app.theme.core;
     let chip = Rect { x: px + 12.0, y: py + 12.0, w: 120.0, h: 22.0 };
     ui.panel_with_border("device_drag_chip", chip, core.panel_raised, core.accent, 1.0, 3.0);

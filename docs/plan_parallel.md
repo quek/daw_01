@@ -26,7 +26,7 @@ chain UI は全面作り直し。本ファイルがこの機能の SSoT。
 
 | # | 問い | 決定 |
 |---|---|---|
-| 1 | 表示場所 | **インスペクタのまま、縦回転型**。幅 280px 不変。Live の Chain List を縦のまま置き、「隣」を「下」にする。括弧は開始行 / 終了行 (全幅)、選択 chain の device 区間は左端の細い色帯。インデント無し。 |
+| 1 | 表示場所 | **インスペクタのまま、縦回転型**。Live の Chain List を縦のまま置き、「隣」を「下」にする。括弧は開始行 / 終了行 (全幅)、選択 chain の device 区間は左端の細い色帯。インデント無し。**幅は 360px 固定に変更、組み込み Comp / EQ は Parallel に入れない** ([plan_rack_native_devices.md](plan_rack_native_devices.md) Q1/Q2 / Q5) |
 | 2 | サイドチェイン | **Sidechain セクション撤去**。aux 入力 port を持つ device の行にだけ `SC` を出し、展開で port ごと `[source ▾][tap ▾]` (multi-port)。source = 他 track + **同 track の Parallel 内 chain**。 |
 | 3 | 呼称 | track の device 列 = **Rack** (見出し、Reason)。入れ子の並列容器 = **Parallel** (Ctrl+G / picker / 型名)。「FX Layer」「Rack (容器の意味で)」は使わない。 |
 

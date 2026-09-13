@@ -156,6 +156,25 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 - テストで click を模すときは **同じフレームに `primary_just_pressed` と `primary_just_released`
   の両方** を立てる (release だけの frame は誰の click にもならない)。
 
+### 子 widget がホイールを使う: `claim_wheel_in_rect` は 1 フレーム遅れで効く
+
+- `scroll_area` は **中身の closure より前に** ホイールを消費する。中に置いた widget (EQ カーブの点で
+  ホイール = Q 等) が `take_scroll_in_rect` を呼んでも、あふれた祖先が先に取っていて永久に届かない。
+- ホイールを使う widget は **毎フレーム** `ui.claim_wheel_in_rect(rect)` を呼ぶ。`scroll_area` は
+  **前フレームに claim された矩形** の上ではホイールを消費しない ([`crates/ui/src/wheel.rs`](crates/ui/src/wheel.rs))。
+  前フレームの宣言を読むので、claim した最初のフレームは祖先が取り、claim をやめた次のフレームまでは
+  祖先が譲り続ける。headless テストでホイールを流すときは、先に hover だけのフレームを 1 つ挟む。
+
+### 矩形の中をドラッグする点 (`xy_point_at`) の作法
+
+- press は当たり円の中なら `claim_press` で名乗る (`take_drag_in_rect` は claim しないので、行の中に
+  置く点 / ハンドルには使わない — 親の `drag_list` が行ごと動く)。
+- 押したまま Esc で press 時の位置へ戻す (knob / fader と同じ `drag_cancel_requested` の契約)。
+- `XyPointResponse::wheel` は notch 単位 (入力層の `LINE_HEIGHT_PX` で px から戻す)。`wheel_active` は
+  最後のホイールから 400ms 立っていて、caller がホイールの一連を undo 1 step に束ねる窓に使う
+  (窓が閉じるフレームを起こすため、active の間は widget が `request_redraw` する)。
+- 値は矩形内の座標 (px) のまま返す。意味 (周波数 / ゲイン) への写像は caller が持つ (core にドメイン知識を入れない)。
+
 ### widget state の downcast
 - `state: HashMap<WidgetId, Box<dyn WidgetState>>` から型復元するとき、`Box<dyn WidgetState>` 自身に WidgetState の blanket impl が当たって外側 Box の TypeId を返すバグに注意。`&mut **entry` で明示的に deref してから `as_any_mut().downcast_mut::<S>()` する (M2 で修正、回帰テスト済)。
 

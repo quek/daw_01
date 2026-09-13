@@ -103,7 +103,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 縦横どちらもあふれていない (= スクロールしようがない) scroll_area は wheel を
         // **消費しない**。 消費すると、 内側にネストした「今はスクロール不要な」 領域が
         // 親のホイール操作 (例: mixer strip 列の横スクロール) を無言で殺してしまう。
-        let scroll = if need_v || need_h {
+        // 前フレームに子 widget が「このホイールは自分が使う」と claim した矩形の上でも消費しない
+        // (EQ カーブの点のホイール = Q。 [`crate::wheel`] の module doc)。
+        let scroll = if (need_v || need_h) && !self.wheel_claimed_at_pointer() {
             self.take_scroll_in_rect(rect)
         } else {
             (0.0, 0.0)

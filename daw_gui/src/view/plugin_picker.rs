@@ -14,6 +14,17 @@ const PANEL_H: f32 = 460.0;
 const TITLE_H: f32 = 36.0;
 const SEARCH_H: f32 = 26.0;
 
+/// 種別タグ (楽器 / FX / MIDI / 映像 / 内蔵) の色。分類色はテーマの `daw.tag_*` が SSoT
+/// (ライトでは同じ色相のまま暗く沈む)。内蔵 device は audio FX なので FX と同じ色。
+fn tag_color(category: PluginCategory, theme: &crate::theme::Theme) -> daw_ui_renderer::Color {
+    match category {
+        PluginCategory::Instrument => theme.daw.tag_instrument,
+        PluginCategory::Fx | PluginCategory::Native => theme.daw.tag_fx,
+        PluginCategory::MidiFx => theme.daw.tag_midi,
+        PluginCategory::Video => theme.daw.tag_video,
+    }
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // is_plugin_picker_open を modal 可視性の SSoT にする。 選択時 (Ctrl 以外) は
     // select_plugin_from_db が flag=false にするので、 ここで modal を閉じる
@@ -207,16 +218,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     );
                     // 種別タグ (楽器 / FX / MIDI / 映像): 混合リストで選ぶ前に行き先が分かる。
                     // 分類色はテーマの `daw.tag_*` が SSoT (ライトでは同じ色相のまま暗く沈む)。
-                    let tag_color = if is_selected {
-                        p.ink_on_accent()
-                    } else {
-                        match entry.category {
-                            PluginCategory::Instrument => app.theme.daw.tag_instrument,
-                            PluginCategory::Fx => app.theme.daw.tag_fx,
-                            PluginCategory::MidiFx => app.theme.daw.tag_midi,
-                            PluginCategory::Video => app.theme.daw.tag_video,
-                        }
-                    };
+                    let tag_color = if is_selected { p.ink_on_accent() } else { tag_color(entry.category, &app.theme) };
                     ui.label_at(
                         ("pp_row_tag", i),
                         entry.category.tag(),

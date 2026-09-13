@@ -3,6 +3,7 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
+use crate::handler::device_guard::{self, DeviceOp};
 use common::model::InstrumentSource;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotState};
@@ -847,6 +848,8 @@ impl AppData {
     /// r.md #71 (プラグインのコピー / 移動): 複数選択を **1 件にまとめて** 積む
     /// (id ごとに enqueue すると round-trip が分かれて undo が N ステップに割れる)。
     pub(crate) fn remove_devices(&mut self, device_ids: Vec<u64>) {
+        // r.md #129 (Q5): 組み込み内蔵 device は消せない。 組み込みしか残らなければ round-trip も積まない。
+        let device_ids = self.permit_or_explain(&device_ids, DeviceOp::Remove);
         if device_ids.is_empty() {
             return;
         }
@@ -870,10 +873,11 @@ impl AppData {
         // 外した後では引けない。
         // r.md #110: 対象は plugin / Parallel (中身ごと) / chain (Parallel の 1 本)。 host に
         // 居る plugin は「中に含まれる plugin 全部」なので、 先に展開しておく。
+        // r.md #129 (Q5): deferred 実行でも実行時の Song で組み込みを落とし直す。
         let song = self.cur.song_doc.song();
-        let targets: Vec<(u64, u32)> = device_ids
-            .iter()
-            .filter_map(|&id| {
+        let targets: Vec<(u64, u32)> = device_guard::permitted_ids(song, device_ids, DeviceOp::Remove)
+            .into_iter()
+            .filter_map(|id| {
                 song.device_owner_track(id)
                     .or_else(|| song.chain_owner_track(common::model::ChainRef::Chain(id)))
                     .map(|track_id| (id, track_id))
@@ -896,11 +900,7 @@ impl AppData {
         }
         // 消す node の Par は閉じる (別 device を指しているなら触らない — id keyed なので
         // 「同トラックだから」で巻き込む必要が無い)。
-        for id in node_ids {
-            let key = common::model::RackPanelKey::Device(id);
-            self.cur.view.open_rack_panels.remove(&key);
-            self.cur.peph.rack_panel_heights.remove(&key);
-        }
+        self.close_rack_panels_of(&node_ids);
         for device_id in plugin_ids {
             // **GUI lifecycle**: close the editor BEFORE removing the plugin.
             // cleanup_slot_gui sends CloseSlotGui so the plugin-host tears the

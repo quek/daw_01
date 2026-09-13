@@ -14,6 +14,8 @@ pub mod clips;
 pub mod colors;
 /// `AppEvent::Device(..)` の dispatcher (`DeviceEvent` の振り分け)。
 pub mod device_event;
+/// r.md #129 (Q5): 組み込み内蔵 device を消せない / 包めない / 普通のドラッグで運べない絞り込み。
+pub mod device_guard;
 pub mod device_relocate;
 pub mod devices;
 pub mod export;

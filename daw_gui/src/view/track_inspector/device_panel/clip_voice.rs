@@ -1,23 +1,17 @@
 //! VOICEVOX 歌唱クリップの per-clip 声 (キャラ ▼ → スタイル ▼)。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::{PanelCtx, opened_plugin_is};
 
-pub(super) fn draw_clip_voice(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-    device_id: u64,
-) -> f32 {
+pub(super) fn draw_clip_voice(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
+    let mut y = ctx.y;
+    let device_id = ctx.device_id;
     // Clip Voice 編集: 選択中の clip が vocal track 上の MIDI clip の
     // とき、 キャラ ▼ → スタイル ▼ の 2 段 dropdown で per-clip 声を選ぶ。
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
-    if app.voicevox_param_panel_open(device_id)
+    if opened_plugin_is(app, device_id, common::plugin_db::BUILTIN_ID_VOICEVOX)
         && let Some(r) = app.selected_clip_ref()
         && let Some(track) = app.cur.song_doc.song().track_by_id(r.track_id)
         && track.is_voicevox_vocal()
@@ -51,9 +45,9 @@ pub(super) fn draw_clip_voice(
         };
 
         ui.label_at(
-            "inspector_clip_voice_label",
+            ("inspector_clip_voice_label", device_id),
             "Clip Voice",
-            area.x + pad,
+            ctx.x,
             y,
             12.0,
             p.text,
@@ -64,9 +58,9 @@ pub(super) fn draw_clip_voice(
             // engine 未起動 / 一覧未取得: 焼き込み声名 + 取得中。 声名は常に出せる。
             let txt = format!("{cur_singer} - {cur_style}  (一覧取得中…)");
             ui.label_at(
-                "inspector_clip_voice_current",
+                ("inspector_clip_voice_current", device_id),
                 &txt,
-                area.x + pad + 4.0,
+                ctx.x + 4.0,
                 y + 6.0,
                 11.0,
                 p.text,
@@ -82,13 +76,13 @@ pub(super) fn draw_clip_voice(
                 .position(|s| s.name == cur_singer)
                 .unwrap_or(0);
             let char_rect = Rect {
-                x: area.x + pad,
+                x: ctx.x,
                 y,
-                w: area.w - pad * 2.0,
+                w: ctx.w,
                 h: 24.0,
             };
             let picked_char = ui.dropdown(
-                "inspector_clip_voice_char",
+                ("inspector_clip_voice_char", device_id),
                 char_rect,
                 &char_labels,
                 cur_char_idx,
@@ -106,13 +100,13 @@ pub(super) fn draw_clip_voice(
                 .position(|st| st.id == cur_speaker)
                 .unwrap_or(0);
             let style_rect = Rect {
-                x: area.x + pad,
+                x: ctx.x,
                 y,
-                w: area.w - pad * 2.0,
+                w: ctx.w,
                 h: 24.0,
             };
             let picked_style = ui.dropdown(
-                "inspector_clip_voice_style",
+                ("inspector_clip_voice_style", device_id),
                 style_rect,
                 &style_labels,
                 cur_style_idx,
@@ -148,13 +142,13 @@ pub(super) fn draw_clip_voice(
 
             // 再取得ボタン (新規キャラ導入時に押す)。
             let refetch_rect = Rect {
-                x: area.x + pad,
+                x: ctx.x,
                 y,
-                w: area.w - pad * 2.0,
+                w: ctx.w,
                 h: 22.0,
             };
             if ui.button_at_clicked(
-                "inspector_clip_voice_refetch",
+                ("inspector_clip_voice_refetch", device_id),
                 "声一覧を再取得",
                 refetch_rect,
             ) {

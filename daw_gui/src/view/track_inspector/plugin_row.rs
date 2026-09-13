@@ -11,6 +11,7 @@ use common::model::{RackPanelKey, TapPoint, TapSource};
 
 use super::chain_list::{ROW_H, RowCtx, panel_height};
 use super::device_panel;
+use super::native_row::claim_expansion_press;
 
 /// SC パネル 1 port 行の高さ。
 pub(super) const SC_PORT_H: f32 = 24.0;
@@ -27,14 +28,16 @@ pub(super) fn draw_plugin_expansions(
     let mut ey = content.y + ROW_H;
     if ctx.sc_open == Some(device_id) && ctx.sc_panel_h > 0.0 {
         let rect = Rect { x: content.x, y: ey, w: content.w, h: ctx.sc_panel_h };
+        claim_expansion_press(ui, rect, ("sc", device_id), ctx.popup_open);
         draw_sidechain_panel(app, ui, device_id, ctx.sc_ports, rect);
         ey += ctx.sc_panel_h;
     }
     let key = RackPanelKey::Device(device_id);
     if app.rack_panel_open(key) {
         let exp_rect = Rect { x: content.x, y: ey, w: content.w, h: panel_height(app, device_id) };
-        let measured =
-            (device_panel::draw_device_panel(app, ui, ctx.area, ctx.pad, exp_rect, device_id) - exp_rect.y).max(0.0);
+        claim_expansion_press(ui, exp_rect, ("par", key), ctx.popup_open);
+        let panel = device_panel::PanelCtx { device_id, x: exp_rect.x, w: exp_rect.w, y: exp_rect.y };
+        let measured = (device_panel::draw_device_panel(app, ui, panel) - exp_rect.y).max(0.0);
         // 展開部の実消費高を device ごとに測って次フレームの行高に使う (lag-by-one)。
         if app.cur.peph.rack_panel_heights.get(&key).is_none_or(|h| (h - measured).abs() > 0.5) {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -157,8 +160,8 @@ pub(super) fn draw_plugin_row(
     );
 }
 
-/// SC パネル: port ごとに `In N: [source ▾] [tap ▾]`。
-fn draw_sidechain_panel(
+/// SC パネル: port ごとに `In N: [source ▾] [tap ▾]` (plugin と内蔵 Comp / Bus Comp 共通)。
+pub(super) fn draw_sidechain_panel(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     device_id: u64,
@@ -166,7 +169,7 @@ fn draw_sidechain_panel(
     rect: Rect,
 ) {
     let p = &app.theme.core;
-    let choices = app.sidechain_source_choices();
+    let choices = app.sidechain_source_choices(device_id);
     let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
     const TAP_POINTS: [TapPoint; 3] = [TapPoint::PreFx, TapPoint::PostFx, TapPoint::PostFader];
     let tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];

@@ -132,10 +132,7 @@ impl AppData {
                 "recovery candidates found at startup"
             );
         }
-        let plugin_picker_entries = plugin_db
-            .as_ref()
-            .map(|db| PluginPickEntry::build_all(db))
-            .unwrap_or_default();
+        let plugin_picker_entries = PluginPickEntry::build_all(plugin_db.as_deref());
 
         // プロジェクト非依存のアプリ設定は **1 回だけ** 読む (旧実装はフィールドごとに
         // 同じ JSON を 3 回 load していた)。 `app_dirs == None` (テスト) では既定値。

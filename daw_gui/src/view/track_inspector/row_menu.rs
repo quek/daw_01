@@ -9,7 +9,7 @@ use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{
-    AppData, AppEvent, ChainRow, ChainRowKind, ColorPickerTarget, InsertAt, RelocateDevices,
+    AppData, AppEvent, ChainEntry, ChainRow, ChainRowKind, ColorPickerTarget, InsertAt, NativeRowEntry, RelocateDevices,
 };
 use crate::event_device::DeviceEvent;
 
@@ -32,9 +32,12 @@ enum DeviceMenuItem {
 }
 
 impl DeviceMenuItem {
-    /// plugin 行。
+    /// plugin 行 / 足した内蔵 device の行。
     const PLUGIN: &'static [Self] =
         &[Self::Bypass, Self::Group, Self::Copy, Self::Cut, Self::Paste, Self::Duplicate, Self::Delete];
+    /// 組み込み内蔵 device の行 (Q5: 削除 / 切り取り / Parallel にまとめるは出さない)。 選択に組み込みが
+    /// 混ざっていても、 Delete / Cut / Group は handler 側 (`device_guard`) で組み込みを落とす。
+    const BUILTIN_NATIVE: &'static [Self] = &[Self::Bypass, Self::Copy, Self::Paste, Self::Duplicate];
     /// Parallel の開始行。
     const PARALLEL: &'static [Self] = &[
         Self::Bypass,
@@ -85,6 +88,10 @@ enum MenuRow {
 fn menu_items(row: &ChainRow) -> Option<(MenuRow, &'static [DeviceMenuItem])> {
     match &row.kind {
         ChainRowKind::Plugin(e) => Some((MenuRow::Device(e.device_id), DeviceMenuItem::PLUGIN)),
+        ChainRowKind::Native(n) => Some((
+            MenuRow::Device(n.device_id),
+            if n.builtin { DeviceMenuItem::BUILTIN_NATIVE } else { DeviceMenuItem::PLUGIN },
+        )),
         ChainRowKind::ParallelBegin { parallel_id, .. } => {
             Some((MenuRow::Parallel(*parallel_id), DeviceMenuItem::PARALLEL))
         }
@@ -108,7 +115,9 @@ pub(super) fn draw_context_menus(
         let Some((target, items)) = menu_items(r) else { continue };
         let base = Rect { x: row_rect.x, y: row_rect.y, w: row_rect.w, h: base_row_h(&r.kind) };
         let bypassed = match &r.kind {
-            ChainRowKind::Plugin(e) => app.all_devices_bypassed(&carried_device_ids(app, rows, e.device_id)),
+            ChainRowKind::Plugin(ChainEntry { device_id, .. }) | ChainRowKind::Native(NativeRowEntry { device_id, .. }) => {
+                app.all_devices_bypassed(&carried_device_ids(app, rows, *device_id))
+            }
             ChainRowKind::ParallelBegin { bypassed, .. } => *bypassed,
             _ => false,
         };

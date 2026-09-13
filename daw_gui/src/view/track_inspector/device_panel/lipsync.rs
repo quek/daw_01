@@ -1,19 +1,13 @@
 //! 口パク (lip-sync) の出力先 track binding。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::{PanelCtx, opened_plugin_is};
 
-pub(super) fn draw_lipsync_target(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-    device_id: u64,
-) -> f32 {
+pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
+    let mut y = ctx.y;
+    let device_id = ctx.device_id;
     // カーソルトラックの index。 None なら描かない (track 0 を誤対象にしない)。
     let cursor_idx = app.cursor_track_index();
     // ---- 親グループ (Parent) の編集 UI はインスペクタから撤去した ----
@@ -29,7 +23,7 @@ pub(super) fn draw_lipsync_target(
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
     // VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
     // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
-    if app.voicevox_param_panel_open(device_id)
+    if opened_plugin_is(app, device_id, common::plugin_db::BUILTIN_ID_VOICEVOX)
         && let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i))
         && track.is_voicevox_vocal()
     {
@@ -49,18 +43,18 @@ pub(super) fn draw_lipsync_target(
             });
         }
         ui.label_at(
-            "inspector_lipsync_target_label",
+            ("inspector_lipsync_target_label", device_id),
             "口パク出力先",
-            area.x + pad,
+            ctx.x,
             y,
             12.0,
             p.text,
         );
         y += 18.0;
         let dropdown_rect = Rect {
-            x: area.x + pad,
+            x: ctx.x,
             y,
-            w: area.w - pad * 2.0,
+            w: ctx.w,
             h: 24.0,
         };
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
@@ -73,7 +67,7 @@ pub(super) fn draw_lipsync_target(
                 .unwrap_or(0),
         };
         if let Some(picked) = ui.dropdown(
-            "inspector_lipsync_target_dropdown",
+            ("inspector_lipsync_target_dropdown", device_id),
             dropdown_rect,
             &label_refs,
             selected_idx,

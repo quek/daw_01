@@ -1,51 +1,44 @@
 //! 埋め込み GUI を持たない plugin の「Par」インライン param パネル。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::PanelCtx;
 use crate::event_device::DeviceEvent;
 
-pub(super) fn draw_plugin_params(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-    open_device: u64,
-) -> f32 {
+pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
+    let mut y = ctx.y;
     // ---- Plugin param panel -----------------------------------
     // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し CLAP・VST3) の
     // チェーン行「Par」ボタンで開閉。 VOICEVOX は device 既定の声 (キャラ→スタイル)
     // を、 汎用 plugin は param を scrubable_number で実レンジ編集する。 値の SSoT は
     // PluginParam lane の default_value (= `set_plugin_param`、 映像 FX と同 idiom)。
-    if let Some(view) = app.inspector_plugin_params(open_device) {
+    if let Some(view) = app.inspector_plugin_params(ctx.device_id) {
         let device_id = view.device_id;
         let track_id = view.track_id;
         ui.label_at_clipped(
-            "inspector_pp_label",
+            ("inspector_pp_label", device_id),
             &view.plugin_name,
-            Rect { x: area.x + pad, y, w: (area.w - pad * 2.0).max(1.0), h: 12.0 * 1.2 },
+            Rect { x: ctx.x, y, w: ctx.w.max(1.0), h: 12.0 * 1.2 },
             12.0,
             p.text,
         );
         y += 18.0;
 
         // 汎用 param 行 (scrubable_number で実レンジ + per-control 変調)。
-        let row_w = area.w - pad * 2.0;
+        let row_w = ctx.w;
         let input_h = 22.0;
         let label_w = 96.0;
-        let input_x = area.x + pad + label_w;
+        let input_x = ctx.x + label_w;
         let input_w = (row_w - label_w).max(40.0);
         for (i, row) in view.params.iter().enumerate() {
             // param 名はプラグイン由来で長さ上限が無い。 label_w(96) を超えると
             // 後続の値ボックス (不透明 bg) に覆われて途中で消えるので rect で切る。
             ui.label_at_clipped(
-                (i, "pp_name"),
+                (device_id, i, "pp_name"),
                 &row.name,
                 Rect {
-                    x: area.x + pad,
+                    x: ctx.x,
                     y: y + 5.0,
                     w: (label_w - 4.0).max(1.0),
                     h: 11.0 * 1.2,
@@ -57,7 +50,7 @@ pub(super) fn draw_plugin_params(
                 // 編集不可 param は現値をラベル表示するだけ。
                 let txt = format!("{:.3}", row.value_real);
                 ui.label_at_clipped(
-                    (i, "pp_ro"),
+                    (device_id, i, "pp_ro"),
                     &txt,
                     Rect { x: input_x, y: y + 5.0, w: input_w, h: 11.0 * 1.2 },
                     11.0,
@@ -89,7 +82,7 @@ pub(super) fn draw_plugin_params(
                 ScrubableNumberFormat::Decimal(3)
             };
             let resp = ui.scrubable_number_at(
-                (i, "pp_scrub"),
+                (device_id, i, "pp_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
                 row.value_real,
                 row.default_real,

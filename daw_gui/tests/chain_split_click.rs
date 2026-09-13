@@ -84,9 +84,9 @@ fn glyph_centers(scene: &Scene, text: &str) -> Vec<(f32, f32)> {
     v
 }
 
-/// inspector (画面左カラム、 幅 280) の中の glyph だけ。
+/// inspector (画面左カラム、 幅 `INSPECTOR_W`) の中の glyph だけ。
 fn inspector_glyphs(scene: &Scene, text: &str) -> Vec<(f32, f32)> {
-    glyph_centers(scene, text).into_iter().filter(|(x, _)| *x < 300.0).collect()
+    glyph_centers(scene, text).into_iter().filter(|(x, _)| *x < daw_gui::view::root::INSPECTOR_W).collect()
 }
 
 #[test]

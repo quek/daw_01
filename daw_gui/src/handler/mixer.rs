@@ -39,9 +39,11 @@ impl AppData {
         if !keep_open {
             self.ui_ephemeral.is_plugin_picker_open = false;
         }
-        // r.md #110: 「Parallel」 は plugin ではなく container。 picker を開いた chain の末尾に
-        // 空 Parallel (chain 1 本) を挿す。
-        if id == common::plugin_db::PARALLEL_PICKER_ID {
+        // r.md #110: 「Parallel」 は plugin ではなく container、 r.md #129 (Q8): 内蔵 4 種は daw_audio が
+        // in-process で処理する device。 どちらも DB を引かず、 picker を開いた chain の既定位置 (Q6) に挿す。
+        // 内蔵は Shift なし (= GUI を開く) なら Par を開く。
+        let native = common::model::NativeKind::from_picker_id(&id);
+        if id == common::plugin_db::PARALLEL_PICKER_ID || native.is_some() {
             self.ensure_first_track();
             let Some(track_id) = self.cursor_track_id() else { return };
             let dest = self
@@ -49,7 +51,11 @@ impl AppData {
                 .plugin_picker_target
                 .filter(|c| self.cur.song_doc.song().chain_devices(*c).is_some())
                 .unwrap_or(common::model::ChainRef::Track(track_id));
-            self.handle_event(AppEvent::Device(DeviceEvent::AddParallel { chain: dest, at: InsertAt::Default }));
+            let ev = match native {
+                Some(kind) => DeviceEvent::AddNative { chain: dest, kind, open_panel: open_gui },
+                None => DeviceEvent::AddParallel { chain: dest, at: InsertAt::Default },
+            };
+            self.handle_event(AppEvent::Device(ev));
             return;
         }
         let Some(db) = self.ipc.plugin_db.clone() else {
@@ -691,11 +697,8 @@ impl AppData {
     }
 
     pub(crate) fn rebuild_picker_entries(&mut self) {
-        let Some(db) = self.ipc.plugin_db.as_ref() else {
-            self.ui_ephemeral.plugin_picker_entries.clear();
-            return;
-        };
-        self.ui_ephemeral.plugin_picker_entries = PluginPickEntry::build_all(db);
+        // DB が無くても内蔵 4 種と Parallel は出す (r.md #129)。
+        self.ui_ephemeral.plugin_picker_entries = PluginPickEntry::build_all(self.ipc.plugin_db.as_deref());
     }
 
     pub(crate) fn refresh_picker_visible(&mut self) {
@@ -716,11 +719,11 @@ impl AppData {
             .iter()
             .filter(|e| {
                 !master
-                    || (matches!(e.category, PluginCategory::Fx | PluginCategory::Video)
+                    || (matches!(e.category, PluginCategory::Fx | PluginCategory::Video | PluginCategory::Native)
                         // master には Transform 配置 device を出さない (全画面 master に配置は無意味)。
                         && e.id != common::video_fx::TRANSFORM_ID)
             })
-            .filter(|e| category.is_none_or(|c| e.category == c))
+            .filter(|e| category.is_none_or(|c| e.category.matches_filter(c)))
             .filter(|e| {
                 query.is_empty()
                     || crate::fuzzy::subsequence_match(&e.name, query)

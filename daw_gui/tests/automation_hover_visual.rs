@@ -38,7 +38,8 @@ use daw_ui_core::{FrameInput, PointerFrame, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{LineBatch, OffscreenRenderer, Rect, Scene};
 
-const W: u32 = 1200;
+/// 画面幅。インスペクタの右に 920px のアレンジが残るように、インスペクタ幅に追従させる。
+const W: u32 = 920 + daw_gui::view::root::INSPECTOR_W as u32;
 const H: u32 = 700;
 const CONTENT_ID: common::model::ContentId = 4242;
 

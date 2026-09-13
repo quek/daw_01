@@ -44,41 +44,19 @@ impl AppData {
     }
 
     /// 「＋ Send」 ピッカーに出す宛先候補 `(track_id, display_name)`。
-    /// `src_track_id` 自身は除外し、 加えて「その宛先が send 辺で
-    /// (直接 / 間接に) `src` に戻ってくる」 = ルーティング閉路を作る track
-    /// も除外する。 閉路判定は send グラフ上で `dest` から `src` への
-    /// 到達可能性を BFS で見る (= `dest` を起点に send を辿って `src` に
-    /// 着けば、 `src -> dest` を足すと閉路になる)。 schedule compiler 側も
-    /// 閉路を弾くが、 GUI で予め隠すことで誤操作を防ぐ。
+    /// `src_track_id` 自身と、 send を足すと依存が循環する track を除く (r.md #129 §10.13)。
+    /// 循環の判定は `Song::can_add_send` と同じ依存 graph (children / サイドチェイン / send、
+    /// Structural) — send 辺だけを見ると「子から親 group への send」 が候補に残り、 選ぶと
+    /// `add_send` に拒否される。 graph は候補ごとに組み直さず 1 回だけ組む。
     pub fn send_destination_candidates(&self, src_track_id: u32) -> Vec<(u32, String)> {
-        // dest を起点に send 辺を辿って src に到達するか。 到達するなら
-        // src -> dest は閉路を成すので候補から除く。
-        let creates_cycle = |dest: u32| -> bool {
-            if dest == src_track_id {
-                return true;
-            }
-            let mut stack = vec![dest];
-            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            while let Some(cur) = stack.pop() {
-                if cur == src_track_id {
-                    return true;
-                }
-                if !seen.insert(cur) {
-                    continue;
-                }
-                if let Some(t) = self.cur.song_doc.song().track_by_id(cur) {
-                    for s in &t.sends {
-                        stack.push(s.dest_track_id);
-                    }
-                }
-            }
-            false
-        };
-        self.cur.song_doc.song()
+        use common::routing_deps::{EdgeScope, TrackDeps};
+        let song = self.cur.song_doc.song();
+        let deps = TrackDeps::build(song, EdgeScope::Structural);
+        song
             .tracks
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.id != src_track_id && !creates_cycle(t.id))
+            .filter(|(_, t)| t.id != src_track_id && !deps.would_cycle(t.id, src_track_id))
             .map(|(i, t)| {
                 let name = if t.name.is_empty() {
                     format!("Track {}", i + 1)
@@ -758,25 +736,6 @@ impl AppData {
     // ワンショット 1 本に統一し、 daw_gui が描くツマミは per-control ドラッグ、
     // プラグイン自身の窓の中のツマミは `PluginParamTouched` が拾う
     // (`handler/ipc.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
-
-    /// r.md #110: sidechain の source 候補 (「—」 + 他 track + 同 track の Parallel 内 chain)。
-    /// sidechain の source 候補 = 「—」 + **このトラックの入力 (Pre-FX)** + 他 track +
-    /// 同 track の Parallel 内 chain。 自 track は Pre-FX だけ (出力側は feedback)。
-    pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
-        let mut v = self.tap_source_choices(true);
-        if let Some(tid) = self.cursor_track_id()
-            && tid != common::model::MASTER_TRACK_ID
-        {
-            v.insert(
-                1,
-                SidechainSourceChoice {
-                    label: "このトラックの入力 (Pre-FX)".into(),
-                    source: Some(common::model::TapSource::Track(tid)),
-                },
-            );
-        }
-        v
-    }
 
     /// Audio event field の inspector 表示用ライト read snapshot。
     /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 中に少なくとも
