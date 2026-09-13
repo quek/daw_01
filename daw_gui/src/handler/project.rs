@@ -392,7 +392,14 @@ impl AppData {
             )
         };
         if let Some(alive) = alive_selection {
-            self.set_device_selection(alive);
+            // 選択の setter (`set_device_selection`) は通さない — 明示的なチェーン操作用で、非空なら
+            // last-wins タグを Devices に倒す。後始末で別の面を操作した後のタグを奪うと、次の Delete が
+            // その面に効かなくなる。空になったときだけタグを降ろす。
+            let emptied = alive.is_empty();
+            self.cur.selection.selected_device_ids = alive;
+            if emptied && self.cur.selection.last_edit_select == Some(EditSurface::Devices) {
+                self.cur.selection.last_edit_select = None;
+            }
         }
         if anchor_gone {
             self.cur.selection.device_anchor = None;

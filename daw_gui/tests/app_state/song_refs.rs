@@ -80,6 +80,32 @@ fn ungrouping_clears_listen_and_selection_of_the_removed_group() {
     assert_eq!(app.cur.peph.sc_listen_device, None, "Listen は勝手に戻らない");
 }
 
+/// 選択から消えた id を落とすだけでは、直近の編集面 (last-wins タグ) を device 面へ戻さない。device を
+/// 2 つ選んだあと別の面を操作し、undo で片方が消えても、次の Delete は device 面を向かない。
+#[test]
+fn pruning_device_selection_keeps_the_last_edit_surface() {
+    use daw_gui::app::EditSurface;
+    let (mut app, _a, _p, _d) = build_app();
+    let t0 = app.cur.song_doc.song().tracks[0].id;
+    let eq = app.cur.song_doc.song().builtin_native(t0, NativeKind::Eq).expect("eq").id;
+    let c2 = add_native(&mut app, t0, NativeKind::Comp, false);
+    app.set_device_selection(vec![eq, c2]);
+    app.cur.selection.last_edit_select = Some(EditSurface::TimeRange);
+
+    app.handle_event(AppEvent::Undo);
+    assert!(app.cur.song_doc.song().native_by_id(c2).is_none());
+    assert_eq!(app.cur.selection.selected_device_ids, vec![eq], "消えた id だけ落ちる");
+    assert_eq!(app.cur.selection.last_edit_select, Some(EditSurface::TimeRange), "編集面は変えない");
+
+    // 全部消えたら device 面のタグは降ろす。
+    app.handle_event(AppEvent::Redo);
+    app.set_device_selection(vec![c2]);
+    assert_eq!(app.cur.selection.last_edit_select, Some(EditSurface::Devices));
+    app.handle_event(AppEvent::Undo);
+    assert!(app.cur.selection.selected_device_ids.is_empty());
+    assert_eq!(app.cur.selection.last_edit_select, None);
+}
+
 /// 末尾トラックの削除でも同じ。
 #[test]
 fn removing_the_last_track_clears_listen() {

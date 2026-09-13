@@ -353,8 +353,10 @@ impl Song {
     }
 
     /// トラック群の親を `parent` (None = top-level) にし、`anchor_after` の直後 (None = 先頭、見つからなければ
-    /// 末尾) へ並べ替える。**親の付け替え (children 辺) の唯一の口** — アレンジのヘッダ drop と
-    /// `SetTrackParent` が通る (SC の [`Self::set_aux_input`]、send の [`Self::can_add_send`] と対)。
+    /// 末尾) へ並べ替える。**既存トラックの親の付け替え (children 辺の張り替え) の唯一の口** — アレンジの
+    /// ヘッダ drop と `SetTrackParent` が通る (SC の [`Self::set_aux_input`]、send の [`Self::can_add_send`] と対)。
+    /// 依存を持たない新規トラックを子にする作成 (グループ化 / パラアウト / 取り込み) と、到達関係を縮めるだけの
+    /// グループ解除は循環を作らないので、この口を通らずに書く。
     ///
     /// 親が変わるトラック t ごとに、書き換える前の graph で `would_cycle(parent, t)` を判定し、1 本でも
     /// 循環すれば何も書かずに `Err`。足す辺はすべて `parent` から出るので、新しい循環は `parent` を途中に
