@@ -201,9 +201,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// r.md #71 (プラグインのコピー / 移動): widget / view をまたぐ drag の payload
     /// (同時に 1 本)。 詳細と寿命は [`crate::drag_drop`]。
     drag_payload: Option<crate::drag_drop::DragPayload>,
-    /// daw_01 r.md #122: 直近の primary press の所有者 (press〜release の間だけ `Some`)。
+    /// daw_01 r.md #122 / #129: 直近の primary press の所有者と、近さで取り合う当たり判定の勝者。
     /// 詳細は [`crate::click`]。
-    press_owner: Option<WidgetId>,
+    pointer_claims: crate::click::PointerClaims,
     /// daw_01 r.md #129: ホイールを自分で使う矩形 (`[前フレーム, 今フレーム]`)。詳細は [`crate::wheel`]。
     wheel_claims: [Vec<Rect>; 2],
     _m: PhantomData<fn(&mut M)>,
@@ -281,7 +281,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             text_metrics: TextMetrics::new(),
             owned_font_system: None,
             drag_payload: None,
-            press_owner: None,
+            pointer_claims: crate::click::PointerClaims::default(),
             wheel_claims: [Vec::new(), Vec::new()],
             _m: PhantomData,
         }
@@ -658,12 +658,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
             self.drag_payload = None;
         }
         // daw_01 r.md #124: **ドラッグ中は他の widget の hover を消す。** 前フレームまでに
-        // どこかの widget が press を掴んでいて (`press_owner`)、ボタンがまだ押されていれば
+        // どこかの widget が press を掴んでいて (`pointer_claims`)、ボタンがまだ押されていれば
         // ポインタはそのドラッグのもの — 通り道の部品が光るのは「そこも押せる」と読める誤情報。
         // press フレーム自身は所有者が空 (上で取り直す) なので block しない。
         // 札を運ぶ drag (`drag_payload`) は例外 — 落とし先が光るのはその drag の一部。
         let hover_blocked =
-            pointer.primary_pressed && self.press_owner.is_some() && self.drag_payload.is_none();
+            pointer.primary_pressed && self.pointer_claims.press_held() && self.drag_payload.is_none();
 
         // r.md #71 (プラグインのコピー / 移動): 運搬中の payload の修飾キーを
         // 「**ボタンが押されていた最後のフレーム**」に保つ。 release フレームは
@@ -674,11 +674,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
         {
             p.modifiers = pointer.modifiers;
         }
-        // daw_01 r.md #122: 新しい press は所有者を取り直す (前の gesture の所有者が
-        // release を取りこぼして残っていても引き継がない)。
-        if pointer.primary_just_pressed {
-            self.press_owner = None;
-        }
+        // daw_01 r.md #122 / #129: 新しい press は所有者を取り直し、近さの勝者は今フレーム分を空で
+        // 始める ([`crate::click::PointerClaims::begin_frame`])。
+        self.pointer_claims.begin_frame(pointer.primary_just_pressed);
         // daw_01 r.md #129: 前フレームのホイール claim だけを残し、今フレームの分を空で始める。
         self.wheel_claims.swap(0, 1);
         self.wheel_claims[1].clear();
@@ -924,7 +922,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_double_click_press: &mut pending_double_click_press,
             pending_secondary_click: &mut pending_secondary_click,
             drag_payload: &mut self.drag_payload,
-            press_owner: &mut self.press_owner,
+            pointer_claims: &mut self.pointer_claims,
             wheel_claims: &mut self.wheel_claims,
             drag_cancel,
             hover_blocked,
@@ -1012,7 +1010,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         if pointer.primary_just_released {
             self.drag_payload = None;
             // daw_01 r.md #122: press の所有者は release で終わる ([`crate::click`])。
-            self.press_owner = None;
+            self.pointer_claims.end_press();
         }
         edits
     }
@@ -1185,8 +1183,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `Ui` は `&mut UiHost` を持たずフィールドごとに借用する構造なので、 この 1 本を
     /// 通さないと [`crate::drag_drop`] の `impl Ui` から payload に触れない。
     pub(crate) drag_payload: &'a mut Option<crate::drag_drop::DragPayload>,
-    /// daw_01 r.md #122: primary press の所有者 ([`crate::click`])。
-    pub(crate) press_owner: &'a mut Option<WidgetId>,
+    /// daw_01 r.md #122 / #129: primary press の所有者と近さの勝者 ([`crate::click`])。
+    pub(crate) pointer_claims: &'a mut crate::click::PointerClaims,
     /// daw_01 r.md #129: ホイール claim `[前フレーム, 今フレーム]` ([`crate::wheel`])。
     pub(crate) wheel_claims: &'a mut [Vec<Rect>; 2],
     /// daw_01 r.md #127: このフレームに「ボタンを押したまま Esc」 が来た

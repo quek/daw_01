@@ -4,9 +4,11 @@
 //! 写像は caller が持つ (daw_01 の EQ カーブ点は `view::native_device::CurveAxes`)。
 //!
 //! 契約:
-//! - press が当たり円 (`style.hit_radius`) の中なら [`Ui::claim_press`] で所有者を名乗る
-//!   (`take_drag_in_rect` は claim しないので使わない)。親の行ドラッグ (`drag_list`) は次フレームで
-//!   session を捨てる ([`crate::click`])。
+//! - press が当たり円 (`style.hit_radius`) の中なら [`Ui::claim_press_at`] で **近さを添えて** 所有者を
+//!   名乗る (`take_drag_in_rect` は claim しないので使わない)。当たり円が重なった点どうしは近い 1 点
+//!   だけが掴み (同じ距離なら後に描いた点)、奪われた点と親の行ドラッグ (`drag_list`) は次フレームで
+//!   session を捨てる ([`crate::click`])。hover の強調とホイールも [`Ui::nearest_under_pointer`] で
+//!   同じ近い 1 点に向ける (前フレームの近さで決まる 1 フレーム遅れ)。
 //! - 掴んだ位置と点の中心のずれを保つ (中心へ飛ばない)。Ctrl で感度 1/10 ([`FINE_DRAG_SCALE`])、
 //!   ドラッグ中の Ctrl 切り替えは再 anchor して値を跳ねさせない (knob と同じ)。
 //! - 押したまま Esc ([`Ui::drag_cancel_requested`]) で press 時の位置へ戻す (knob と同じ契約)。
@@ -136,11 +138,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let on_point = |p: (f32, f32)| (p.0 - pos.0).hypot(p.1 - pos.1) <= r;
         let drag_cancel = self.drag_cancel_requested();
 
+        // ---- 重なった当たり円の取り合い (近い点が勝つ、`crate::click` の module doc) ----
+        let distance = pointer.pos.map(|p| (p.0 - pos.0).hypot(p.1 - pos.1)).filter(|d| !blocked && *d <= r);
+        let nearest = distance.is_some_and(|d| self.nearest_under_pointer(wid, d));
+        let pressed_here = pointer.primary_just_pressed && distance.is_some_and(|d| self.claim_press_at(wid, d));
+        // 先に名乗った後で、より近い点 (または手前の widget) に press を奪われた。
+        let taken = !pressed_here && self.press_taken_from(wid);
+
         // ---- press / continue / release / Esc ----
         let mut emit: Option<(f32, f32)> = None;
-        let pressed_here = !blocked && pointer.primary_just_pressed && pointer.pos.is_some_and(on_point);
         let (dragging, displayed) = {
             let state: &mut XyPointState = self.widget_state(wid);
+            if taken {
+                state.drag = None;
+            }
             if pressed_here && let Some(p) = pointer.pos {
                 state.drag =
                     Some(Drag { start: pos, anchor_pointer: p, anchor_value: pos, ctrl: pointer.modifiers.ctrl, last: pos });
@@ -176,9 +187,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             (dragging, displayed)
         };
-        if pressed_here {
-            self.claim_press(wid);
-        }
         if let Some(p) = emit {
             self.push_edit(on_change(p));
         }
@@ -188,7 +196,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut wheel_active = false;
         if wheel_enabled {
             self.claim_wheel_in_rect(hit);
-            if !blocked && pointer.pos.is_some_and(on_point) {
+            if nearest {
                 wheel = self.take_scroll_in_rect(hit).1 / LINE_HEIGHT_PX;
             }
             let now = Instant::now();
@@ -206,7 +214,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- draw ----
-        let hovered = !blocked && self.hover_pos().is_some_and(on_point);
+        let hovered = nearest && self.hover_pos().is_some_and(on_point);
         let fill = if dragging || hovered { style.fill_active } else { style.fill };
         let rr = style.radius;
         self.push_rect(RectCommand {
@@ -356,6 +364,77 @@ mod tests {
         let r = run(&mut host, &mut model, frame((101.0, 51.0), false, false, false), XyAxes::BOTH);
         assert_eq!(r.wheel, 0.0);
         assert!(r.wheel_active, "窓の間は active のまま");
+    }
+
+    /// 当たり円が重なる 2 点 (`a` を先に描き `b` を後に描く) を 1 フレーム回す。model = (a の位置, b の位置)。
+    fn run_pair(host: &mut UiHost<PairModel>, model: &mut PairModel, input: FrameInput) -> [XyPointResponse; 2] {
+        let mut scene = Scene::new();
+        let out = Cell::new([XyPointResponse::default(); 2]);
+        host.frame(model, &mut scene, SCREEN, input, |m, ui| {
+            let style = XyPointStyle::from_palette(&Palette::dark());
+            let a = ui.xy_point_at("a", BOUNDS, m.0.get(), XyAxes::BOTH, true, &style, |p| {
+                Edit::mutate(move |m: &mut PairModel| m.0.set(p))
+            });
+            let b = ui.xy_point_at("b", BOUNDS, m.1.get(), XyAxes::BOTH, true, &style, |p| {
+                Edit::mutate(move |m: &mut PairModel| m.1.set(p))
+            });
+            out.set([a, b]);
+        });
+        out.get()
+    }
+
+    type PairModel = (Cell<(f32, f32)>, Cell<(f32, f32)>);
+
+    /// 当たり円 (半径 8) が重なる 2 点の重なりを押すと、掴めるのは **近い 1 点だけ** — 先に描いた点が
+    /// 近ければ先の点、後に描いた点が近ければ後の点、同じ距離なら後に描いた点 (手前)。もう一方は動かない。
+    #[test]
+    fn a_press_in_overlapping_hit_circles_grabs_only_the_nearest_point() {
+        let a0 = (100.0, 50.0);
+        let b0 = (110.0, 50.0);
+        let drag = |press_x: f32| {
+            let mut host: UiHost<PairModel> = UiHost::no_redraw();
+            let mut model: PairModel = (Cell::new(a0), Cell::new(b0));
+            let r = run_pair(&mut host, &mut model, frame((press_x, 50.0), true, true, false));
+            let grabbed = [r[0].dragging, r[1].dragging];
+            let r = run_pair(&mut host, &mut model, frame((press_x + 30.0, 50.0), false, true, false));
+            run_pair(&mut host, &mut model, frame((press_x + 30.0, 50.0), false, false, true));
+            (grabbed, [r[0].dragging, r[1].dragging], model.0.get(), model.1.get())
+        };
+        let (pressed, held, a, b) = drag(104.0);
+        assert_eq!(pressed, [true, false], "a に近い (4px 対 6px): 後に描いた b は掴まない");
+        assert_eq!(held, [true, false]);
+        assert_eq!((a, b), ((130.0, 50.0), b0), "a だけが動く");
+
+        let (_, held, a, b) = drag(106.0);
+        assert_eq!(held, [false, true], "b に近い: 先に名乗った a は奪われて session を捨てる");
+        assert_eq!((a, b), (a0, (140.0, 50.0)), "b だけが動く (掴んだずれを保って +30)");
+
+        let (_, held, a, b) = drag(105.0);
+        assert_eq!(held, [false, true], "同じ距離は後に描いた点 (手前)");
+        assert_eq!((a, b), (a0, (140.0, 50.0)));
+    }
+
+    /// 重なりの上では hover の強調とホイールも近い 1 点だけ (press と同じ点)。勝者は前フレームの近さで
+    /// 決まるので、ポインタを置いたフレームの次から効く (`claim_wheel_in_rect` と同じ 1 フレーム遅れ)。
+    #[test]
+    fn hover_and_wheel_over_overlapping_hit_circles_go_to_the_nearest_point_only() {
+        let mut host: UiHost<PairModel> = UiHost::no_redraw();
+        let mut model: PairModel = (Cell::new((100.0, 50.0)), Cell::new((110.0, 50.0)));
+        run_pair(&mut host, &mut model, frame((106.0, 50.0), false, false, false));
+        let mut wheel = frame((106.0, 50.0), false, false, false);
+        wheel.pointer.scroll_delta = (0.0, 40.0);
+        let r = run_pair(&mut host, &mut model, wheel);
+        assert_eq!([r[0].hovered, r[1].hovered], [false, true], "近い b だけが光る");
+        assert_eq!([r[0].wheel, r[1].wheel], [0.0, 1.0], "ホイールも近い b だけが受け取る");
+
+        // ポインタが a 寄りへ動くと、次のフレームから a に移る。
+        run_pair(&mut host, &mut model, frame((103.0, 50.0), false, false, false));
+        let r = run_pair(&mut host, &mut model, frame((103.0, 50.0), false, false, false));
+        assert_eq!([r[0].hovered, r[1].hovered], [true, false]);
+
+        // 1 点だけの当たり円の上は、その点が光る。
+        let r = run_pair(&mut host, &mut model, frame((95.0, 50.0), false, false, false));
+        assert!(r[0].hovered && !r[1].hovered);
     }
 
     #[test]
