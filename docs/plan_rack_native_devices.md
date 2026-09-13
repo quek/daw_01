@@ -376,7 +376,7 @@ view_state.rs は WIRE_SOURCES の対象外（ファイル doc :1-3）。
 | `find_device_in` / `device_in(_mut)` / `remove_device_in` / `chain_*` / `for_each_chain*` / `for_each_parallel*` | 変更不要（`d.id()` と `if let Parallel` で書かれている） |
 | 新設 `for_each_native(_mut)` / `any_native` / `native_in(_mut)(devices, id)` | 確保なし、RT から呼べる。Parallel の中も辿る |
 | 新設 `for_each_aux_input(devices, f(device_id, port, &AuxInputRoute))` / `for_each_aux_slot_mut(devices, f(device_id, port, &mut Option<AuxInputRoute>))` | plugin と Native を 1 本で辿る |
-| 新設 `remove_natives_in(devices: &mut Vec<Device>)` | Parallel の中も含めて Native を除く（Bounce In Place / Glue の pre_fx 専用、§10.15） |
+| ~~新設 `remove_natives_in(devices: &mut Vec<Device>)`~~ | 実装後に撤去（焼き込みは Song から device を消さず `RenderScope` で段を選ぶ、§10.15） |
 | 新設 `Song::{native_by_id(_mut), builtin_native(owner, kind) -> Option<&NativeDevice>, builtin_natives(owner) -> impl Iterator<Item=&NativeDevice>}` | `builtin_natives` はチェーン順（最上位のみ）。owner は `Track::id` か `MASTER_TRACK_ID`（`fx_chain_by_track_id` model.rs:1672 と同じ sentinel 分岐） |
 | 新設 `Song::set_aux_input(device_id, port, source: Option<TapSource>) -> bool` | devices.rs:726-744 の規則を model に移す（自トラックが source なら PreFx 固定、tap_point は既存を引き継ぐ）。§5.9 の `would_cycle` なら false。plugin と Native で共有する |
 
@@ -455,7 +455,7 @@ pub fn default_insert_index_in(devices: &[Device], is_master: bool) -> usize;
 | `replace_song` | :502-511 | baseline 確定前 |
 
 - 次の口からは**呼ばない**: `edit_playback`（:315、ランチャーの再生状態だけ）、`write_back_plugin_state`（:345、blob だけ）、`rewrite_history`（:381、履歴の path 移行）、undo/redo（snapshot は正規化済み）。
-- SongDoc を通らない 2 か所だけ明示的に呼ぶ: `isolated_track_song`（bounce.rs:182）と `normalize_after_load`（model.rs:1475）。
+- SongDoc を通らない 2 か所だけ明示的に呼ぶ: `normalize_after_load`（model.rs:1475）と、参照の掃除だけを使う `Song::isolated_track`（`prune_dangling_refs`、§10.15）。
 - これで `Track::default()` を使う 25 か所（テストを除く）で新規トラックに組み込みが入る。
 - handler 側の明示的な prune 呼び出し 7 か所と `remap_device_refs_after_remove` は削除する（§14.2）。
 
@@ -690,6 +690,8 @@ pub fn norm_mapping_is_invertible(t) -> bool { target_range(t, None).is_invertib
 | SongTempo / SongTimeSigNumerator | Linear{1,400} / Linear{1,32} | 同じ |
 | Image / Text / Group の Rotation | Linear{-π,π} | 同じ |
 | Text FontSize | Linear{1,4096} | 同じ |
+| Text OutlineWidth / ShadowBlur | Linear{0,1024} | 実装後に訂正（旧 Linear{0,1} の恒等で、px の表示レンジと食い違っていた。§18.2-3） |
+| Text ShadowOffsetX / ShadowOffsetY | Linear{-1024,1024} | 同上 |
 | Group ScaleX / ScaleY | Log{0.1,10} | 同じ |
 | Image / Text / Group のその他 | Linear{0,1} | 同じ（:148 の末尾 clamp） |
 | ModSourceParam | `mod_param_range` が Some なら Log{min,max}、None なら Linear{0,1} | 同じ |
@@ -1809,16 +1811,20 @@ fn apply(app: &mut AppData, item: DeviceMenuItem, row_id: u64, anchor: Rect);
   - respawn: `restore_tabs_after_respawn` で OpenProject の後、LoadSong の前に再送する
 - 移動では id が変わらないので聴き続ける。コピー先には付いてこない。別トラックを表示しても Listen は続く（solo と同じ持続）。
 
-### 10.15 Bounce In Place / Glue（`isolated_track_song` handler/bounce.rs:133-184、F。呼び出し元 bounce.rs:356、glue.rs:366）
+### 10.15 Bounce In Place / Glue / Bounce with FX（`Song::isolated_track` / `Song::place_bounce_with_fx`、`common/src/model/bounce_ops.rs`）
 
-| 対象 | 処理 |
-|---|---|
-| master | `master_fx_chain.clear()`（:136。組み込みも消える。engine は組み込みの有無を前提にしない）。`master_limiter = MasterLimiterSettings { on: false, ..Default::default() }` を明示する（既定値が変わっても r.md #92 の修正が壊れないように）。`song_lanes` / `song_mod_routings` から `MasterLimiter(_)` を retain で外す（On レーンで再び ON にならないように）。旧 :141-147 を置換 |
-| トラック（両モード共通） | `for_each_aux_slot_mut(&mut kept.devices, \|_,_,s\| *s = None)`（plugin の `aux_inputs.clear()` :157-162 と同じ理由） |
-| `pre_fx == true` | `remove_natives_in(&mut kept.devices)`（K28）。レーン / routing / On の再有効化は、:182 の `prune_dangling_param_targets` が機械的に消す。これで「内蔵ストリップが中和されず二重に掛かる」穴（critic 2-d-1）が塞がる |
-| `pre_fx == false`（with FX） | native はそのまま焼き込む（plugin と同じ） |
+> 実装後に改訂。上の設計（isolate した Song から master の段・内蔵 device・aux 入力を消す）は、書き換えで表せない
+> 組み合わせ（音源を含む Parallel、自トラック Pre-FX の SC）を正確に焼けないので採らなかった。
 
-doc（:104-132）の r.md #92 の記述を `master_limiter` / native に更新する。
+- **Song は「どのトラックを描くか」だけを決める。** `Song::isolated_track` が他トラックを落とし、それを指す参照を
+  `Song::prune_dangling_refs` で外す（自トラックを読む配線・内蔵 device・master の段は Song に残す）。
+- **どの段を通すかは `RenderScope`**（`common/src/protocol.rs`）が compile で program の形に焼く: In Place / Glue は
+  `Sources`（音源の出力まで。内蔵 device・音声入力を持つ device・Parallel の混ぜ・フェーダー・master を通さない）、
+  With FX は `PostFx`（device チェーンまで。フェーダーと master を通さない）。
+- With FX は焼いた音を新しいトラックに置き、PostFx 点から後ろ（フェーダーとそのレーン / 変調・send・親 group・
+  PostFader を読む配線）を元トラックから写して元トラックを mute する（規則の正本は `Song::place_bounce_with_fx` の doc）。
+- 検証: `common` の `model::bounce_ops::tests`、`daw_audio` の `export::tests::bounce_with_fx_sounds_like_the_original_track`
+  （元と Bounce 後の mix のピーク / RMS が pan 中央・偏り・volume ≠ 1 で一致）、`daw_gui/tests/scripts/glue_bake_parity.js`。
 
 ### 10.16 daw-ui core（`ui/crates/ui/src/`、R。ドメイン知識を持たない）
 
@@ -2320,11 +2326,11 @@ state/project.rs:462, :595, :630, :634, :960, :984, :991, :992 / handler/devices
 | F-G3 | `tests/app_state/open_stays_clean.rs` | v38 fixture を開いた直後 `!is_dirty()`、新規タブも同じ |
 | F-G4 | `view/param_gesture.rs` / `scrub_gesture.rs` cfg(test)（scrub_gesture.rs:114-186 と同形） | Begin(Rack) → End(MixerStrip) は no-op / End(Rack) で外れる / Begin 直後の同じフレームの sweep では閉じない / 在席印の無い sweep で閉じる / PluginWindow・VideoPreview は sweep で消えない / `ModDepth{Rack}` は MixerStrip の非アクティブな push で閉じず、◉ も残る |
 | F-G5 | `handler/bypass_target.rs` cfg(test) | master hover `Device(id)` → `SetDevicesBypassed{[id], !cur}`、`MasterLimiter` → `On(!on)` / Mixer hover があっても `mixer_active=false` なら None |
-| F-G6 | `handler/bounce.rs` cfg(test) | `isolated_track_song(t, true)`: kept に Native 0 個、NativeParam のレーン・routing 0、`master_limiter.on == false`、song 側に MasterLimiter / NativeParam なし / `(t, false)`: native の params・bypassed は元と一致、aux None |
+| F-G6 | `common/src/model/bounce_ops.rs` cfg(test)（実装後に移設・改訂、§10.15） | `isolated_track`: 他トラックを読む SC / send / follower は外れ、自トラックを読む SC・内蔵 device・master の段は残る / `place_bounce_with_fx`: フェーダー・send・親 group・PostFader を読む配線が新しいトラックへ移り、元トラックは mute だけ |
 | F-G7 | `tests/app_state/project_tabs.rs` | 2 タブで Listen → audio を respawn → 送信列が `OpenProject` → `SetScListen(Some)` の順で、LoadSong より前 |
 | F-G8 | `handler/view_model.rs` cfg(test) | 再生中で song_lanes に NativeParam レーン → `live_native_param` がレーン値、停止中は model 値 / master chain の ChainGain も追従 |
 
-回すもの: `cargo test -p common --lib`、`cargo test -p daw_audio --bin daw_audio -- song_values`、`cargo test -p daw_gui --features daw_gui/script --lib -- event_native view::param_gesture view::scrub_gesture handler::bypass_target handler::bounce handler::view_model`、`--test app_state --test chain_split_click --test channel_strip_visual`。
+回すもの: `cargo test -p common --lib`、`cargo test -p daw_audio --bin daw_audio -- song_values`、`cargo test -p daw_gui --features daw_gui/script --lib -- event_native view::param_gesture view::scrub_gesture handler::bypass_target handler::view_model`、`--test app_state --test chain_split_click --test channel_strip_visual`。
 
 ### 15.3 E
 
@@ -2518,9 +2524,13 @@ critic 2-d の 9 件（Bounce / group の変調 / Listen の dirty / LoadSong �
 
 ### 18.2 本件外（列挙のみ、直さない）
 
-1. トラックや chain を消しても、aux route の `TapSource::{Track, Chain}` と follower の tap が dangling のまま残る（handler/tracks.rs:48-140 と devices.rs に掃除が無い）。
-2. `pre_fx` の Bounce In Place で Parallel の split / gain / pan が焼き込まれる（bounce.rs:163-177）。
-3. Text の px 系は正規化が 0..1 の恒等（common/src/automation.rs:126）なのに、表示レンジは px（automation_value.rs:356-373）で食い違っている。
+1. ~~トラックや chain を消しても、aux route / follower の tap が dangling のまま残る。~~ 実装後に修正: 編集後の不変条件
+   `Song::prune_dangling_routes`（`common/src/model/param_address.rs`）が消えた source を指す tap を外し、帰属トラックの
+   消えたモジュレーターは `Song::prune_orphan_mod_sources` が消す。
+2. ~~Bounce In Place で Parallel の split / gain / pan が焼き込まれる。~~ 実装後に修正: `RenderScope::Sources` が素材の音だけを
+   描く Parallel を compile で焼く（§10.15）。
+3. ~~Text の px 系の正規化と表示レンジが食い違っている。~~ 実装後に修正: 正規化を px の値域にし（§7.1）、表示レンジは
+   `target_range` から導く（`daw_gui/src/automation_value.rs`）。
 4. `state/project.rs:295-299` の `arrange_header_w` のコメント「session-only」が古い（実際は保存される: handler/view_state.rs:94, :167）。
 
 ---

@@ -477,8 +477,9 @@ impl AppData {
     /// `track_id` の `sends[send_idx]` を削除。 構造変化 → full-song resend。
     /// v29: UI からは positional index で来るので、 該当 send の安定 id に
     /// 解決してから `Song::remove_track_send(track_id, send_id)` を呼ぶ
-    /// (SendGain automation lane / mod routing の除去は model 側が id で行う —
-    /// 旧 `reindex_send_gain_lanes` の「後続 index 詰め」 は id 化で消滅)。
+    /// (その send を狙う SendGain の automation lane / mod routing は、編集後の不変条件
+    /// `Song::prune_dangling_param_targets` が同じ undo step で落とす — 旧 `reindex_send_gain_lanes` の
+    /// 「後続 index 詰め」 は id 化で消滅)。
     pub(crate) fn remove_send(&mut self, track_id: u32, send_idx: usize) {
         let Some(send_id) = self
             .cur.song_doc.song()
