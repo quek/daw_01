@@ -42,6 +42,15 @@ impl AppData {
     /// engine にスペクトラムを計算させたい device: Rack に行がある (= 折り畳まれた Parallel の中ではない)
     /// EQ / Tone EQ のうち Par が開いているもの。上から [`MAX_DEVICE_SCOPES`] 個まで。
     pub fn wanted_device_scopes(&self) -> Vec<u64> {
+        // 毎フレーム呼ばれるので、EQ 系の Par が 1 枚も開いていなければ行を組み立てない。
+        let song = self.cur.song_doc.song();
+        let is_eq_panel = |k: &RackPanelKey| match k {
+            RackPanelKey::Device(id) => song.native_by_id(*id).is_some_and(|n| matches!(n.kind(), NativeKind::Eq | NativeKind::ToneEq)),
+            RackPanelKey::MasterLimiter => false,
+        };
+        if !self.cur.view.open_rack_panels.iter().any(is_eq_panel) {
+            return Vec::new();
+        }
         self.chain_rows()
             .iter()
             .filter_map(|r| match &r.kind {
