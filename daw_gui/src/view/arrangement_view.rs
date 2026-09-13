@@ -223,22 +223,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // arrangement ヘッダのトラック音量スライダ drag を mixer フェーダーと
-    // 同じ gesture 経路に乗せ、 「1 drag = 1 undo step」 にする。 これが無いとスライダ操作が
-    // undo に積まれず、 mixer フェーダーと同じ「Undo がクリップ移動まで巻き戻る」 症状になる。
-    // r.md #129 (§7.6): 所有者は面つき。**ドラッグ中だけ**申告する — 離したフレームでは申告しない
-    // ので、そのフレーム末の sweep が End を出す (全トラックの非ドラッグを毎フレーム申告すると、
-    // Mixer フェーダーが握っている同じ Volume を閉じてしまう)。
-    if let Some(t) = resp.dragging_track_volume {
-        crate::view::param_gesture::push_param_gesture(
-            ui,
-            app,
-            crate::app::ParamSurface::ArrangementHeader,
-            t,
-            common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume),
-            true,
-        );
-    }
+    // arrangement ヘッダのトラック音量スライダ drag のジェスチャー (1 drag = 1 undo step) は
+    // widget 自身が値の Edit より先に申告する (`widgets/arrangement/drag.rs::declare_track_volume_gesture`)。
+    // ここ (widget の後) で申告すると、press のフレームにクリック位置へ飛ぶ値が gesture の外で積まれる。
 
     // gui_01 #020 (M14 Phase 63f): clip 上の右クリックメニュー (Make Unique)。
     // widget が `clip_rects: Vec<(ClipKey, Rect)>` を返してくれるので、

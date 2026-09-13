@@ -689,6 +689,16 @@ fn draw_strip(
                 #[allow(clippy::cast_possible_truncation)]
                 let pan = pan_desc.clamp_plain(v) as f32;
                 Edit::mutate(move |app: &mut AppData| {
+                    // 数値欄はドラッグが閾値を越えた **そのフレームに** 最初の値を出す (下の申告は
+                    // widget の後に積まれる)。値より先にジェスチャーを開いておかないと、最初の値だけが
+                    // gesture の外で 1 undo step 積まれて 1 ドラッグが 2 step に割れる。所有者が既に
+                    // いれば Begin は何もしない。text 確定 / ダブルクリックは次のフレームの申告
+                    // (非ドラッグ) が閉じるので 1 step のまま。
+                    app.handle_event(AppEvent::ParamGestureBegin {
+                        surface: ParamSurface::MixerStrip,
+                        track_id: track_idx_for_pan,
+                        target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+                    });
                     app.handle_event(AppEvent::SetTrackPan { track: track_idx_for_pan, pan })
                 })
             },
