@@ -31,16 +31,17 @@ impl AppData {
         // inspector ではこのトラックの下にだけ列挙される。
         let cursor_track = self.cursor_track_id();
         let owner_track_id = cursor_track.unwrap_or(0);
+        // follower の follow 先は初期 = カーソルトラック (master は音を tap できないので入力なし)。
+        let follower_tap = cursor_track
+            .filter(|&t| self.cur.song_doc.song().track_by_id(t).is_some())
+            .map(common::model::AudioTap::post_fader);
         let _ = self
             .edit_song(move |song| {
                 let id = song.alloc_mod_source_id();
                 let color = common::model::ModSource::palette_color(song.mod_sources.len());
                 let kind = match tag {
-                    // follower の follow 先は初期 = カーソルトラック (master は音を tap できないので入力なし)。
                     ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
-                        tap: cursor_track
-                            .filter(|&t| song.track_by_id(t).is_some())
-                            .map(common::model::AudioTap::post_fader),
+                        tap: follower_tap,
                         follower: common::model::FollowerConfig::default(),
                     },
                     ModSourceKindTag::Lfo => ModSourceKind::Lfo(Default::default()),
