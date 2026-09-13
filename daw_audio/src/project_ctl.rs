@@ -60,7 +60,7 @@ pub fn decode_worker_loop(rx: std::sync::mpsc::Receiver<DecodeJob>, session_samp
             if job.generation != job.project.schedule_generation.load(Ordering::Acquire) {
                 continue; // superseded before we started
             }
-            let prev = job.project.audio_clip_renderer.load();
+            let prev = job.project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: decode worker)
             let prev_ref: &audio_clip_renderer::AudioClipRenderer = &prev;
             let full = audio_clip_renderer::compile_audio_schedule(
                 &job.song,
@@ -330,7 +330,7 @@ impl ProjectCtl {
             Some(s) => common::tempo_map::TempoMap::from_song(s),
             None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
         };
-        let audio_clip_renderer = self.shared.audio_clip_renderer.load_full();
+        let audio_clip_renderer = self.shared.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
         self.publisher.published_renderer = Arc::downgrade(&audio_clip_renderer);
         RtBundle {
             song,
@@ -339,8 +339,8 @@ impl ProjectCtl {
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
             scratch_growth: None,
-            plugin_refs: self.shared.plugin_refs.load_full(),
-            preview_sequence: self.shared.preview_sequence.load_full(),
+            plugin_refs: self.shared.plugin_refs.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
+            preview_sequence: self.shared.preview_sequence.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
             loop_region: self.loop_region,
             recording_lanes: Arc::clone(&self.recording_lanes),
             audio_clip_renderer,
@@ -369,7 +369,7 @@ impl ProjectCtl {
                 // 壊れた graph は謎の音ではなく無音として聴こえる方が診断しやすい。
                 Some(s) => match compile_schedule(
                     s,
-                    &self.shared.device_latencies.load(),
+                    &self.shared.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: recv loop の compile)
                     sample_rate,
                     buffer_frames,
                     common::protocol::RenderScope::Mix,
@@ -434,7 +434,7 @@ impl ProjectCtl {
         sample_rate: u32,
         phase_tables: &ModPhaseTableBuilder,
     ) {
-        let song = self.shared.song.load_full();
+        let song = self.shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
         self.publish_bundle(engine_shared, song, sample_rate, Topology::Unchanged, phase_tables);
     }
 
@@ -450,7 +450,7 @@ impl ProjectCtl {
     ) where
         F: FnOnce(&mut common::model::Song),
     {
-        let snapshot = self.shared.song.load();
+        let snapshot = self.shared.song.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
         let Some(song) = snapshot.as_deref() else {
             return;
         };
@@ -483,7 +483,7 @@ impl ProjectCtl {
         // 閉形式シードで凌いでいる)。plan と別便なのは、表の構築が曲長ぶんの
         // 刻みループで、plan の配送を待たせたくないから (設計正本 §2.4)。
         if let Some(table) = finished_table {
-            let song = self.shared.song.load_full();
+            let song = self.shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
             // 位相表だけの便。scratch は `publish_bundle` が song と同じ便で運ぶ。
             let bundle = RtBundle { mod_phase_table: Some(table), ..self.snapshot_bundle(song) };
             self.publisher.send(bundle);
@@ -492,7 +492,7 @@ impl ProjectCtl {
         // (RT はミラーを load しない)。
         let renderer_moved = !std::ptr::eq(
             self.publisher.published_renderer.as_ptr(),
-            Arc::as_ptr(&self.shared.audio_clip_renderer.load()),
+            Arc::as_ptr(&self.shared.audio_clip_renderer.load()), // arch-lint: allow-arcswap-load (off-RT: recv loop)
         );
         if renderer_moved {
             self.republish(engine_shared, sample_rate, phase_tables);
@@ -503,7 +503,7 @@ impl ProjectCtl {
         if let Some(compiled) = self.publisher.last_compiled_frames
             && resolve_buffer_frames(engine_shared, sample_rate) != compiled
         {
-            let song = self.shared.song.load_full();
+            let song = self.shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
             if song.is_some() {
                 self.publish_bundle(
                     engine_shared,
@@ -557,7 +557,7 @@ pub fn open_project(
         tracing::error!(project = key.0, "OpenProject: delivery ring full");
         return false;
     }
-    let mut map = (**engine_shared.projects.load()).clone();
+    let mut map = (**engine_shared.projects.load()).clone(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     map.insert(key, Arc::clone(&shared));
     engine_shared.projects.store(Arc::new(map));
     let mut publisher = BundlePublisher::new(bundle_tx);
@@ -592,7 +592,7 @@ pub fn close_project(
         tracing::debug!(project = key.0, "CloseProject: not open");
         return;
     };
-    let mut map = (**engine_shared.projects.load()).clone();
+    let mut map = (**engine_shared.projects.load()).clone(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     map.remove(&key);
     engine_shared.projects.store(Arc::new(map));
     if project_tx.push(ProjectDelivery::Close(key)).is_err() {
@@ -621,7 +621,7 @@ pub fn reap_closed_projects(
 /// 超過は `None` (= プレビュー drop)。 id ベースなので GUI 側の track 並べ替えと
 /// race しない (= `SetTrackVolume` 等と同じ方針)。
 pub(crate) fn preview_track_index(project: &ProjectShared, track_id: u32) -> Option<usize> {
-    let snapshot = project.song.load();
+    let snapshot = project.song.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let song = snapshot.as_deref()?;
     song.tracks
         .iter()
@@ -699,7 +699,7 @@ pub fn handle_project_command(
             match common::process_data::ProcessDataHandle::open(&shmem_id) {
                 Ok(handle) => {
                     let entry = Arc::new(PluginEntry::new(device_id, token, handle));
-                    let mut map: engine::PluginRefs = (**shared.plugin_refs.load()).clone();
+                    let mut map: engine::PluginRefs = (**shared.plugin_refs.load()).clone(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
                     map.insert(device_id, entry);
                     shared.plugin_refs.store(Arc::new(map));
                     ctl.republish(engine_shared, session_sample_rate, phase_tables);
@@ -711,7 +711,7 @@ pub fn handle_project_command(
             }
         }
         AudioCommand::ClosePluginShmem { device_id, .. } => {
-            let mut map: engine::PluginRefs = (**shared.plugin_refs.load()).clone();
+            let mut map: engine::PluginRefs = (**shared.plugin_refs.load()).clone(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
             let removed = map.remove(&device_id);
             shared.plugin_refs.store(Arc::new(map));
             ctl.republish(engine_shared, session_sample_rate, phase_tables);
@@ -892,7 +892,7 @@ fn load_song(
             .device_latencies
             .store(Arc::new(crate::graph::DeviceLatencies::new()));
     }
-    let project_dir_g = shared.project_dir.load();
+    let project_dir_g = shared.project_dir.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let project_dir: Option<std::path::PathBuf> =
         project_dir_g.as_ref().map(|arc| (**arc).clone());
     // Bump the schedule version so any in-flight decode for an older
@@ -905,7 +905,7 @@ fn load_song(
     // decode and never block the receive loop. Sources not yet
     // decoded are left out — their events stay silent until the
     // worker fills them in.
-    let prev = shared.audio_clip_renderer.load();
+    let prev = shared.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let prev_ref: &audio_clip_renderer::AudioClipRenderer = &prev;
     let partial = audio_clip_renderer::compile_audio_schedule(
         &song,
@@ -976,7 +976,7 @@ fn set_device_latency(
     // 値が変わらないなら再 compile しない (plugin host は load ごとに
     // 0 でも必ず報告してくるので、 無条件 recompile は起動時に
     // device 数ぶんの無駄な再 compile を生む)。
-    let current = shared.device_latencies.load();
+    let current = shared.device_latencies.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let unchanged = match (current.get(&device_id), samples) {
         (None, 0) => true,
         (Some(&prev), s) => prev == s,
@@ -996,7 +996,7 @@ fn set_device_latency(
     shared.device_latencies.store(Arc::new(next));
     // song が届く前の報告もあり得る (plugin load の方が速い) —
     // その場合は表だけ更新し、 次の LoadSong の compile が拾う。
-    let song = shared.song.load_full();
+    let song = shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     if song.is_some() {
         ctl.publish_bundle(
             engine_shared,
@@ -1056,7 +1056,7 @@ mod tests {
         // 開いた直後は何も送り直さない (RT は最初からミラーと同じ renderer を持つ)。
         ctl.housekeeping(&engine, sr, &phase_tables, None);
         assert_eq!(rt.bundle_rx.slots(), 0, "送り直していない");
-        assert!(Arc::ptr_eq(&rt.audio_clip_renderer, &ctl.shared.audio_clip_renderer.load_full()));
+        assert!(Arc::ptr_eq(&rt.audio_clip_renderer, &ctl.shared.audio_clip_renderer.load_full())); // arch-lint: allow-arcswap-load (test)
 
         let project = ProjectKey(1);
         let region = LoopRegion { enabled: true, start_beat: 4.0, end_beat: 8.0 };
@@ -1079,7 +1079,7 @@ mod tests {
         publish_audio_clip_schedule(&ctl.shared, 1, audio_clip_renderer::AudioClipRenderer::empty(), sr);
         ctl.housekeeping(&engine, sr, &phase_tables, None);
         rt.refresh_bundle();
-        assert!(Arc::ptr_eq(&rt.audio_clip_renderer, &ctl.shared.audio_clip_renderer.load_full()));
+        assert!(Arc::ptr_eq(&rt.audio_clip_renderer, &ctl.shared.audio_clip_renderer.load_full())); // arch-lint: allow-arcswap-load (test)
         assert!(!Arc::ptr_eq(&rt.audio_clip_renderer, &old_renderer));
         assert_eq!(Arc::strong_count(&old_renderer), 2, "旧 renderer は RT ではなく recycle ring が持っている");
         ctl.housekeeping(&engine, sr, &phase_tables, None);

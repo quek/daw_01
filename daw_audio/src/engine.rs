@@ -457,7 +457,7 @@ impl ProjectRt {
         // で届く。容量だけ予約しておき、成長便の install が再確保しないようにする。
         let scratch = Vec::with_capacity(MAX_TRACKS);
         // off-thread で作るので共有面のミラーを読んでよい (RT に来てからは load しない)。
-        let audio_clip_renderer = shared.audio_clip_renderer.load_full();
+        let audio_clip_renderer = shared.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: RT へ渡す前に組む)
         Self {
             key: shared.key,
             telemetry_slot: shared.telemetry_slot,
@@ -2364,7 +2364,7 @@ mod multi_project_tests {
             pool_recycle_tx,
         );
         r.project_tx.push(ProjectDelivery::Open(Box::new(rt))).ok().unwrap();
-        let mut map = (**r.engine.projects.load()).clone();
+        let mut map = (**r.engine.projects.load()).clone(); // arch-lint: allow-arcswap-load (test)
         map.insert(key, Arc::clone(&shared));
         r.engine.projects.store(Arc::new(map));
         (shared, bundle_tx)

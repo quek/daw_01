@@ -34,7 +34,7 @@ fn reserve(engine_shared: &EngineShared) -> bool {
 /// 予約後の共通前処理: song snapshot を取り、stale cancel を畳む。song が無ければ
 /// 予約を返して `None`。
 fn take_song(engine_shared: &EngineShared, project: &ProjectShared) -> Option<common::model::Song> {
-    let song_snap = project.song.load();
+    let song_snap = project.song.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let Some(song_arc) = song_snap.as_ref() else {
         engine_shared.export_running.store(false, Ordering::Release);
         return None;

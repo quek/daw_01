@@ -524,7 +524,7 @@ impl EngineShared {
     /// `key` の project (recv loop のミラーから)。閉じたタブ / 未 open は `None`。
     #[must_use]
     pub fn project(&self, key: ProjectKey) -> Option<Arc<ProjectShared>> {
-        self.projects.load().get(&key).cloned()
+        self.projects.load().get(&key).cloned() // arch-lint: allow-arcswap-load (off-RT: recv loop のミラー)
     }
 
     #[must_use]

@@ -519,11 +519,11 @@ fn render_loop(
     // synchronous full compile here is appropriate; it reuses already-decoded
     // buffers and publishes the full renderer for the live load to pick up.
     {
-        let prev = project.audio_clip_renderer.load();
+        let prev = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         let prev_ref: &crate::audio_clip_renderer::AudioClipRenderer = &prev;
         let project_dir = project
             .project_dir
-            .load()
+            .load() // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
             .as_ref()
             .map(|a| (**a).clone());
         if crate::audio_clip_renderer::has_undecoded_sources(
@@ -554,7 +554,7 @@ fn render_loop(
     // `render_audio_events` を通す = 不変条件 #6)。 足りないと Stretch clip が
     // degrade 経路に落ちて書き出しだけ音が変わるので、ここで必ず揃える。
     {
-        let renderer_g = project.audio_clip_renderer.load();
+        let renderer_g = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         for (track_idx, &needed) in renderer_g.engines_per_track.iter().enumerate() {
             let Some(ts) = scratch.get_mut(track_idx) else {
                 break;
@@ -580,7 +580,7 @@ fn render_loop(
     // (`compile_schedule` は live / export 共通なので入力も共通)。
     let mut schedule = compile_schedule(
         song,
-        &project.device_latencies.load(),
+        &project.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         sample_rate,
         max_frames as u32,
         scope,
@@ -721,9 +721,9 @@ fn render_loop(
 
         // Snapshot the same wait-free state the notify thread sees (mirrors —
         // this thread is off-RT, so ArcSwap loads are fine here).
-        let plugin_refs_g = project.plugin_refs.load();
-        let worker_g = engine_shared.worker.load_full();
-        let audio_renderer_g = project.audio_clip_renderer.load();
+        let plugin_refs_g = project.plugin_refs.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        let worker_g = engine_shared.worker.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        let audio_renderer_g = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
