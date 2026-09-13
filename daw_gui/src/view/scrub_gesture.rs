@@ -113,7 +113,8 @@ pub(crate) fn close(app: &mut AppData) {
 
 /// フレーム末に 1 回だけ呼ぶ。所有者が今フレーム描かれていなければ閉じる。
 /// パラメーターのジェスチャー (面つき所有者) の寿命回収も同じ点で行う (r.md #129 §7.6)。
-pub(crate) fn sweep(app: &mut AppData) {
+/// runner が毎フレーム `build_root` の直後に呼ぶ。integration test も同じ順で呼ぶ。
+pub fn sweep(app: &mut AppData) {
     if app.cur.peph.scrub_gesture.is_some() && !app.cur.peph.scrub_gesture_seen {
         close(app);
     }
