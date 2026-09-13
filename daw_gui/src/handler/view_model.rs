@@ -1111,20 +1111,29 @@ impl AppData {
                         .content_names
                         .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
-                cache.lane_node_labels.clear();
-                let song = self.cur.song_doc.song();
-                for lane in song.tracks.iter().flat_map(|t| &t.automation_lanes).chain(&song.song_lanes) {
-                    if !name_is_song_derived(&lane.target) || cache.lane_node_labels.contains_key(&lane.target) {
-                        continue;
-                    }
-                    if let Some(name) = self.device_param_name(&lane.target) {
-                        cache.lane_node_labels.insert(lane.target.clone(), std::sync::Arc::from(name));
-                    }
-                }
+                self.fill_lane_node_labels(&mut cache.lane_node_labels);
                 cache.epoch = self.cur.song_doc.edit_epoch();
             }
         }
         self.cur.peph.arr_label_cache.borrow()
+    }
+
+    /// [`ArrLabelCache::lane_node_labels`] を今の Song で作り直す (全トラック + master のレーンのうち、名前が
+    /// Song だけから決まる target)。
+    fn fill_lane_node_labels(
+        &self,
+        labels: &mut std::collections::HashMap<common::model::AutomationTarget, std::sync::Arc<str>>,
+    ) {
+        labels.clear();
+        let song = self.cur.song_doc.song();
+        let lanes = song.tracks.iter().flat_map(|t| &t.automation_lanes).chain(&song.song_lanes);
+        for lane in lanes.filter(|l| name_is_song_derived(&l.target)) {
+            if !labels.contains_key(&lane.target)
+                && let Some(name) = self.device_param_name(&lane.target)
+            {
+                labels.insert(lane.target.clone(), std::sync::Arc::from(name));
+            }
+        }
     }
 
     /// アレンジのレーン見出しに出す、ノードで束縛する target の完全修飾名 ([`Self::device_param_name`] と

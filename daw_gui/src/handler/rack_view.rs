@@ -45,30 +45,9 @@ impl AppData {
     /// 組まずに **カーソルトラックの木だけ** を行と同じ順・同じ規則 (`push_chain_rows`: 折り畳んだ Parallel は
     /// 開始行だけ、折り畳んだ chain は chain 行だけ) でたどる。何も開いていなければ確保もしない。
     pub fn wanted_device_scopes(&self) -> Vec<u64> {
-        fn walk(app: &AppData, devices: &[Device], out: &mut Vec<u64>) {
-            for d in devices {
-                if out.len() == MAX_DEVICE_SCOPES {
-                    return;
-                }
-                match d {
-                    Device::Native(n)
-                        if matches!(n.kind(), NativeKind::Eq | NativeKind::ToneEq)
-                            && app.rack_panel_open(RackPanelKey::Device(n.id)) =>
-                    {
-                        out.push(n.id);
-                    }
-                    Device::Parallel(p) if app.parallel_node_open(p.id) => {
-                        for c in p.chains.iter().filter(|c| app.parallel_node_open(c.id)) {
-                            walk(app, &c.devices, out);
-                        }
-                    }
-                    Device::Native(_) | Device::Parallel(_) | Device::Plugin(_) => {}
-                }
-            }
-        }
         let mut out = Vec::new();
         if let Some(devices) = self.cursor_track_id().and_then(|t| self.cur.song_doc.song().fx_chain_by_track_id(t)) {
-            walk(self, devices, &mut out);
+            collect_open_eq_scopes(self, devices, &mut out);
         }
         out
     }
@@ -82,6 +61,28 @@ impl AppData {
         }
         self.send_audio(AudioCommand::SetDeviceScopes { project: self.pk(), device_ids: wanted.clone() });
         self.cur.peph.device_scopes_sent = wanted;
+    }
+}
+
+/// [`AppData::wanted_device_scopes`] の木のたどり: 行と同じ順で、折り畳んだ Parallel / chain の中には入らない。
+fn collect_open_eq_scopes(app: &AppData, devices: &[Device], out: &mut Vec<u64>) {
+    for d in devices {
+        if out.len() == MAX_DEVICE_SCOPES {
+            return;
+        }
+        match d {
+            Device::Native(n)
+                if matches!(n.kind(), NativeKind::Eq | NativeKind::ToneEq) && app.rack_panel_open(RackPanelKey::Device(n.id)) =>
+            {
+                out.push(n.id);
+            }
+            Device::Parallel(p) if app.parallel_node_open(p.id) => {
+                for c in p.chains.iter().filter(|c| app.parallel_node_open(c.id)) {
+                    collect_open_eq_scopes(app, &c.devices, out);
+                }
+            }
+            Device::Native(_) | Device::Parallel(_) | Device::Plugin(_) => {}
+        }
     }
 }
 

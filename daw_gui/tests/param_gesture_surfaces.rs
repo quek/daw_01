@@ -10,6 +10,7 @@
 //!    ヘッダ音量、ドラッグが閾値を越えたフレームに最初の値を出す数値欄 (Mixer の Pan / Rack Par /
 //!    Limiter Ceiling / インスペクタ)、変調深さのドラッグ、EQ 点のホイール Q — のどれも undo +1。
 //! 3. Latch で再生中にマスターパネルの Bus Comp Thr を動かす → master の `song_lanes` にレーンと点。
+//! 4. マスターパネルのフェーダー (`ScrubGesture::MasterGain`) も undo +1 で、掴んだままパネルが消えたら閉じる。
 
 use std::sync::Arc;
 use std::time::Duration;
