@@ -1,7 +1,9 @@
-//! チャンネルストリップの DSP 核 (バイクワッド係数・振幅応答・コンプの利得計算)。
+//! DSP の部品 (バイクワッド係数・振幅応答・コンプの利得計算)。内蔵 device (Comp / EQ /
+//! Bus Comp / Tone EQ / master Limiter) と Parallel の帯域分割が使う。
 //!
 //! **daw_audio (音を出す側) と daw_gui (カーブを描く側) が同じ実装を共有する。**
 //! 片方に式を写すと、画面のカーブと実際の音が静かに食い違う。
+//! ON/OFF は device の `bypassed` が持つので、係数を組む関数は ON/OFF を見ない。
 //!
 //! 係数は Robert Bristow-Johnson の Audio EQ Cookbook (W3C 版
 //! <https://www.w3.org/TR/audio-eq-cookbook/>) をそのまま使う。差分方程式の規約も
@@ -17,8 +19,8 @@
 //! **buffer 先頭で係数を組むときだけ**呼ぶ (サンプルループ内では呼ばない)。
 
 use crate::model::{
-    COMP_KNEE_DB, CompSettings, EQ_Q_MAX, EQ_Q_MIN, EQ_SHELF_Q, EqBand, EqSettings,
-    MASTER_AUTO_RELEASE_MAX_MS, MASTER_AUTO_RELEASE_MIN_MS, MasterEqBand, MasterEqSettings,
+    BUS_COMP_AUTO_RELEASE_MAX_MS, BUS_COMP_AUTO_RELEASE_MIN_MS, COMP_KNEE_DB, CompSettings,
+    EQ_Q_MAX, EQ_Q_MIN, EQ_SHELF_Q, EqBand, EqSettings, ToneEqBand, ToneEqSettings,
 };
 
 /// 正規化済み (a0 = 1) のバイクワッド係数。
@@ -209,16 +211,13 @@ impl BiquadState {
 /// EQ の段数 ([`EqBand::ALL`] と同順)。
 pub const EQ_STAGES: usize = 6;
 
-/// [`EqSettings`] から 6 段の係数を組む。`on = false` の段は素通し。
+/// [`EqSettings`] から 6 段の係数を組む。バンドの `on = false` の段は素通し。
 ///
 /// 三角関数を 6 回まわすので **buffer 先頭で 1 回だけ**呼ぶ (RT のサンプル
 /// ループ内では呼ばない)。
 #[must_use]
 pub fn eq_stages(eq: &EqSettings, sample_rate: f32) -> [Biquad; EQ_STAGES] {
     let mut out = [Biquad::IDENTITY; EQ_STAGES];
-    if !eq.on {
-        return out;
-    }
     for (slot, band) in out.iter_mut().zip(EqBand::ALL) {
         let b = eq.band(band);
         if !b.on {
@@ -320,22 +319,24 @@ pub fn amp_to_db(amp: f32) -> f32 {
     if amp <= 1e-6 { -120.0 } else { 20.0 * amp.log10() }
 }
 
-/// マスタートーン EQ の 3 段 ([`MasterEqBand::ALL`] と同順)。
-///
-/// 周波数は固定、ゲインだけが動く (`docs/plan_master_strip.md` §4.2)。
-/// 通常 ch と同じ [`Biquad`] を使うので、カーブ表示も同じ [`eq_magnitude_db`] で描ける。
+/// dB → 線形振幅。
 #[must_use]
-pub fn master_eq_stages(eq: &MasterEqSettings, sample_rate: f32) -> [Biquad; 3] {
+pub fn db_to_amp(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// Tone EQ の 3 段 ([`ToneEqBand::ALL`] と同順)。
+///
+/// 周波数は固定、ゲインだけが動く。EQ と同じ [`Biquad`] を使う。
+#[must_use]
+pub fn tone_eq_stages(eq: &ToneEqSettings, sample_rate: f32) -> [Biquad; 3] {
     let mut out = [Biquad::IDENTITY; 3];
-    if !eq.on {
-        return out;
-    }
-    for (slot, band) in out.iter_mut().zip(MasterEqBand::ALL) {
+    for (slot, band) in out.iter_mut().zip(ToneEqBand::ALL) {
         let gain = eq.gain_db(band);
         let f = band.freq_hz();
         *slot = match band.bell_q() {
             Some(q) => Biquad::peaking(sample_rate, f, q, gain),
-            None if band == MasterEqBand::Low => {
+            None if band == ToneEqBand::Low => {
                 Biquad::low_shelf(sample_rate, f, EQ_SHELF_Q, gain)
             }
             None => Biquad::high_shelf(sample_rate, f, EQ_SHELF_Q, gain),
@@ -344,24 +345,24 @@ pub fn master_eq_stages(eq: &MasterEqSettings, sample_rate: f32) -> [Biquad; 3] 
     out
 }
 
-/// マスタートーン EQ の振幅応答 (dB)。[`eq_magnitude_db`] の 3 段版。
+/// Tone EQ の振幅応答 (dB)。[`eq_magnitude_db`] の 3 段版。
 #[must_use]
-pub fn master_eq_magnitude_db(stages: &[Biquad; 3], sample_rate: f32, freq_hz: f32) -> f32 {
+pub fn tone_eq_magnitude_db(stages: &[Biquad; 3], sample_rate: f32, freq_hz: f32) -> f32 {
     stages.iter().map(|s| s.magnitude_db(sample_rate, freq_hz)).sum()
 }
 
-/// `Auto` リリースの時定数 (ms)。
+/// Bus Comp の `Auto` リリースの時定数 (ms)。
 ///
 /// program-adaptive: **深く潰れ続けた後ほど遅く、瞬間的なピークの後ほど速く**戻る
 /// (Reason の Master Bus Compressor と同じ考え方)。`sustained_gr_db` は
 /// 「最近どれくらい潰れ続けているか」の平均 (0 以下の dB) で、呼び出し側が
-/// [`MASTER_AUTO_RELEASE_TRACK_MS`] の時定数で均した値を渡す。
+/// [`crate::model::BUS_COMP_AUTO_RELEASE_TRACK_MS`] の時定数で均した値を渡す。
 #[must_use]
-pub fn master_auto_release_ms(sustained_gr_db: f32) -> f32 {
+pub fn bus_comp_auto_release_ms(sustained_gr_db: f32) -> f32 {
     // 0dB → 下端 / -12dB 以上潰れ続けていれば上端、その間は線形。
     const FULL_SLOW_GR_DB: f32 = 12.0;
     let t = (-sustained_gr_db / FULL_SLOW_GR_DB).clamp(0.0, 1.0);
-    MASTER_AUTO_RELEASE_MIN_MS + t * (MASTER_AUTO_RELEASE_MAX_MS - MASTER_AUTO_RELEASE_MIN_MS)
+    BUS_COMP_AUTO_RELEASE_MIN_MS + t * (BUS_COMP_AUTO_RELEASE_MAX_MS - BUS_COMP_AUTO_RELEASE_MIN_MS)
 }
 
 /// リミッターの静的カーブ: 入力ピーク (dBFS) → 必要なゲイン変化量 (dB、0 以下)。
@@ -380,8 +381,8 @@ mod tests {
     const SR: f32 = 48_000.0;
 
     #[test]
-    fn バイパス中の_eq_は全帯域でフラット() {
-        let eq = EqSettings { on: false, ..Default::default() };
+    fn 既定の_eq_は全帯域でフラット() {
+        let eq = EqSettings::default();
         let stages = eq_stages(&eq, SR);
         for f in [30.0, 200.0, 1_000.0, 8_000.0, 16_000.0] {
             assert!(eq_magnitude_db(&stages, SR, f).abs() < 1e-4, "{f}Hz");
@@ -390,7 +391,7 @@ mod tests {
 
     #[test]
     fn ハイパスは下を落として上を通す() {
-        let mut eq = EqSettings { on: true, ..Default::default() };
+        let mut eq = EqSettings::default();
         eq.hp = EqBandSettings { on: true, freq_hz: 200.0, ..eq.hp };
         let stages = eq_stages(&eq, SR);
         // カットオフで -3dB 付近、1 オクターブ下は約 -12dB、上は素通し。
@@ -404,7 +405,7 @@ mod tests {
 
     #[test]
     fn ベルは中心で指定ゲインになる() {
-        let mut eq = EqSettings { on: true, ..Default::default() };
+        let mut eq = EqSettings::default();
         eq.hmf.gain_db = 6.0;
         eq.hmf.q = 2.0;
         let stages = eq_stages(&eq, SR);
@@ -416,7 +417,7 @@ mod tests {
 
     #[test]
     fn シェルフは帯域端で指定ゲインへ漸近する() {
-        let mut eq = EqSettings { on: true, ..Default::default() };
+        let mut eq = EqSettings::default();
         eq.lf.gain_db = -9.0;
         eq.lf.freq_hz = 200.0;
         let stages = eq_stages(&eq, SR);
@@ -481,7 +482,7 @@ mod tests {
     fn ゲイン範囲の両端でも係数が発散しない() {
         for gain in [-EqParam::Gain.range(EqBand::Hf).display_range().1 as f32, 15.0] {
             for band in EqBand::GAIN_BANDS {
-                let mut eq = EqSettings { on: true, ..Default::default() };
+                let mut eq = EqSettings::default();
                 eq.band_mut(band).gain_db = gain;
                 let stages = eq_stages(&eq, SR);
                 for f in [20.0, 1_000.0, 20_000.0] {

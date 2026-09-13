@@ -30,6 +30,10 @@ pub const MAX_MOD_SOURCES: usize = 64;
 /// ([`AudioBridge::projects`]) は shmem なのでここで固定する。
 pub const MAX_PROJECTS: usize = 32;
 
+/// r.md #129: GR を publish できる内蔵 device (Comp / Bus Comp) の上限。組み込みを優先して
+/// 割り当てる (組み込み Comp は最大 `MAX_TRACKS + 1` 個なので Mixer 帯とマスターパネルの GR は必ず出る)。
+pub const MAX_NATIVE_METERS: usize = 256;
+
 /// [`ProjectTelemetry::read_mod_plane`] が seqlock の読み直しを諦めるまでの回数。
 /// 書き手は 1 buffer に 1 回しか面を触らないので、30Hz の読み手が 8 回連続で
 /// 書き込み中に当たることは実質ない (当たったら「今回は更新なし」に倒す)。
@@ -131,18 +135,17 @@ pub struct ProjectTelemetry {
     /// Written by **daw_audio** after summing each track into the project bus
     /// (`engine.rs` の `set_track_peak`); read by daw_gui on its UI tick。
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
-    /// Per-track のゲインリダクション (dB、0 以下、`f32::to_bits`)。
-    /// 内蔵チャンネルストリップのコンプが buffer ごとに書き、mixer strip の
-    /// GR メーターが読む (`docs/plan_channel_strip.md` §9)。
-    /// ストリップを持たない / バイパス中の track は常に `0.0`。
-    pub track_gr_db: [AtomicU32; MAX_TRACKS],
-    /// マスターストリップのゲインリダクション `[0] = バスコンプ / [1] = リミッター`
-    /// (dB、0 以下、`f32::to_bits`)。`docs/plan_master_strip.md` §6。
-    ///
-    /// master の他のメーターは daw_gui 側の `MasterAnalyzer` が波形から導くが、
-    /// **GR は波形からは導けない** (どれだけ下げたかは処理した側しか知らない) ので、
-    /// per-track の GR と同じスカラー面に載せる。
-    pub master_gr_db: [AtomicU32; 2],
+    /// r.md #129: GR を出す内蔵 device (Comp / Bus Comp) の device id。`0` = 空き。
+    /// slot の並びは engine の compile 順だが、読み手は並びではなくこの id で引く (不変条件 1)。
+    /// master の他のメーターは daw_gui の `MasterAnalyzer` が波形から導くが、**GR は波形から
+    /// 導けない** (どれだけ下げたかは処理した側しか知らない) のでスカラー面に載せる。
+    pub native_meter_ids: [AtomicU64; MAX_NATIVE_METERS],
+    /// `native_meter_ids[i]` の GR (dB、0 以下、`f32::to_bits`)。
+    pub native_meter_gr: [AtomicU32; MAX_NATIVE_METERS],
+    /// id 表と GR 面を**組で**読むための seqlock 世代 (奇数 = 書き込み中、mod plane と同じ作り)。
+    pub native_meter_generation: AtomicU64,
+    /// master のフェーダー後 Limiter の GR (dB、0 以下、`f32::to_bits`)。
+    pub master_limiter_gr_db: AtomicU32,
     /// docs/plan_modulation.md §4.2: per-`ModSource` modulator scalar
     /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer,
     /// polled by the GUI at ~30Hz alongside `track_peaks` and applied to
@@ -282,7 +285,7 @@ impl ProjectTelemetry {
     /// off-RT (recv loop) で呼ぶ。`project_key` は触らない。
     fn reset(&self) {
         self.playhead_samples.store(PLAYHEAD_UNSET, Ordering::Release);
-        self.clear_track_meters();
+        self.clear_meters();
         self.publish_mod_plane(&ModPlane::default());
         self.preroll_remaining_samples.store(0, Ordering::Release);
         self.playing.store(0, Ordering::Release);
@@ -314,43 +317,75 @@ impl ProjectTelemetry {
         slot[1].store(r.to_bits(), Ordering::Release);
     }
 
-    /// マスターストリップの GR を publish する (`[0] = コンプ / [1] = リミッター`、
-    /// dB、0 以下)。audio thread が毎 buffer 呼ぶ。
-    pub fn set_master_gr_db(&self, comp_db: f32, limiter_db: f32) {
-        let slot = &self.master_gr_db;
-        slot[0].store(comp_db.to_bits(), Ordering::Release);
-        slot[1].store(limiter_db.to_bits(), Ordering::Release);
+    /// master のフェーダー後 Limiter の GR を publish する (dB、0 以下)。audio thread が毎 buffer 呼ぶ。
+    pub fn set_master_limiter_gr_db(&self, db: f32) {
+        self.master_limiter_gr_db.store(db.to_bits(), Ordering::Release);
     }
 
-    /// マスターストリップの GR `(コンプ, リミッター)` を読む (GUI の UI tick)。
+    /// master Limiter の GR を読む (GUI の UI tick)。
     #[must_use]
-    pub fn master_gr_db(&self) -> (f32, f32) {
-        let slot = &self.master_gr_db;
-        (
-            f32::from_bits(slot[0].load(Ordering::Acquire)),
-            f32::from_bits(slot[1].load(Ordering::Acquire)),
-        )
+    pub fn master_limiter_gr_db(&self) -> f32 {
+        f32::from_bits(self.master_limiter_gr_db.load(Ordering::Acquire))
     }
 
-    /// 全 track のメーター面 (peak + GR) を 0 に落とす。
+    /// メーター面 (track peak + native GR + Limiter GR) を 0 / 空きに落とす。
     ///
     /// park (= 再生も録音もしていないので publish を止める) の直前に呼ぶ。
     /// これが無いと GUI は最後の値を読み続け、**止まったメーターが点いたまま
-    /// 凍る**。peak と GR を別々に消すと片方だけ残るので 1 本にまとめてある。
-    pub fn clear_track_meters(&self) {
+    /// 凍る**。面を別々に消すと片方だけ残るので 1 本にまとめてある。
+    pub fn clear_meters(&self) {
         for i in 0..MAX_TRACKS {
             self.set_track_peak(i, 0.0, 0.0);
-            self.set_track_gr_db(i, 0.0);
         }
-        self.set_master_gr_db(0.0, 0.0);
+        self.publish_native_meters(std::iter::empty());
+        self.set_master_limiter_gr_db(0.0);
     }
 
-    /// Publishes one track's gain reduction (dB, 0 以下)。範囲外の index は捨てる。
-    pub fn set_track_gr_db(&self, track: usize, gr_db: f32) {
-        let Some(slot) = self.track_gr_db.get(track) else {
-            return;
-        };
-        slot.store(gr_db.to_bits(), Ordering::Release);
+    /// r.md #129: 内蔵 device の GR 面 (id 表 + 値) を**丸ごと** publish する (seqlock の書き手)。
+    /// audio thread が毎 buffer 1 回だけ呼ぶ。`MAX_NATIVE_METERS` を超えるぶんは捨て、残りの slot は
+    /// `id = 0` (空き) で潰す (処理していない device の GR が前の値のまま残らない)。
+    ///
+    /// RT 安全: atomic store のみ (確保・ロック・I/O なし)。
+    pub fn publish_native_meters(&self, it: impl Iterator<Item = (u64, f32)>) {
+        let g = self.native_meter_generation.load(Ordering::Relaxed);
+        self.native_meter_generation.store(g.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        let mut n = 0usize;
+        for (id, gr) in it.take(MAX_NATIVE_METERS) {
+            self.native_meter_ids[n].store(id, Ordering::Relaxed);
+            self.native_meter_gr[n].store(gr.to_bits(), Ordering::Relaxed);
+            n += 1;
+        }
+        for i in n..MAX_NATIVE_METERS {
+            self.native_meter_ids[i].store(0, Ordering::Relaxed);
+            self.native_meter_gr[i].store(0f32.to_bits(), Ordering::Relaxed);
+        }
+        self.native_meter_generation.store(g.wrapping_add(2), Ordering::Release);
+    }
+
+    /// r.md #129: GR 面を seqlock で読む (GUI の 30Hz poller)。`(device id, GR dB)` を `out` に積み直す。
+    /// 書き込み中に当たったら読み直し、[`MOD_PLANE_READ_RETRIES`] 回とも破れたら `false`
+    /// (`out` は空になるので呼び側は前回値を保つ)。`out` は使い回すので確保は起きない。
+    pub fn read_native_meters(&self, out: &mut Vec<(u64, f32)>) -> bool {
+        for _ in 0..MOD_PLANE_READ_RETRIES {
+            let g0 = self.native_meter_generation.load(Ordering::Acquire);
+            if g0 & 1 != 0 {
+                continue;
+            }
+            out.clear();
+            for i in 0..MAX_NATIVE_METERS {
+                let id = self.native_meter_ids[i].load(Ordering::Relaxed);
+                if id != 0 {
+                    out.push((id, f32::from_bits(self.native_meter_gr[i].load(Ordering::Relaxed))));
+                }
+            }
+            fence(Ordering::Acquire);
+            if self.native_meter_generation.load(Ordering::Relaxed) == g0 {
+                return true;
+            }
+        }
+        out.clear();
+        false
     }
 
     pub fn track_peak(&self, track: usize) -> (f32, f32) {
@@ -394,18 +429,14 @@ impl ProjectTelemetry {
         self.recording_live.load(Ordering::Acquire) != 0
     }
 
-    /// Fills `out` with `(peak L, peak R, gain reduction dB)` for every track slot.
-    ///
-    /// メーター 3 値を **1 回の走査で**取る (peak と GR を別々に読むと、同じ
-    /// buffer の値かどうかの保証が無いまま 2 面を混ぜることになる)。
-    pub fn track_meters(&self, out: &mut Vec<(f32, f32, f32)>) {
+    /// Fills `out` with `(peak L, peak R)` for every track slot.
+    pub fn track_meters(&self, out: &mut Vec<(f32, f32)>) {
         out.clear();
         for i in 0..MAX_TRACKS {
             let slot = &self.track_peaks[i];
             let l = f32::from_bits(slot[0].load(Ordering::Acquire));
             let r = f32::from_bits(slot[1].load(Ordering::Acquire));
-            let gr = f32::from_bits(self.track_gr_db[i].load(Ordering::Acquire));
-            out.push((l, r, gr));
+            out.push((l, r));
         }
     }
 

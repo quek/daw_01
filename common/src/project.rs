@@ -9,6 +9,12 @@ use crate::model::{
     Song, ViewState,
 };
 
+mod native_migration;
+
+/// v39 (r.md #129): 旧 strip を持つトラック 1 本 (JSON) を組み込み native へ移す
+/// (クリップボードの旧形式 `TracksCopy` も使う)。
+pub use native_migration::migrate_strips_in_track_value;
+
 /// Result of `load_project`: the normalized song plus the optional GUI view
 /// state. `view` is `None` for legacy files / files saved without
 /// view state — callers fall back to their default (fit-to-content) behavior.
@@ -515,6 +521,8 @@ pub fn migrate_legacy_song(song: &mut serde_json::Value) {
     migrate_legacy_clip_content(song);
     migrate_flat_media_to_pools(song);
     migrate_flat_ids_to_allocators(song);
+    // v39 (r.md #129): strip / master_strip → 組み込み native device。`ids` を読むので最後。
+    native_migration::migrate_strips_to_native(song);
 }
 
 /// deserialize 前に旧 .daw のフラットな media source マップ (`audio_sources` / `video_sources` /
@@ -670,7 +678,9 @@ fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
             .iter()
             .any(|c| text_content_ids.contains(&c.content_id));
         if has_text_clip && !track.has_subtitle_device() {
-            track.devices.push(crate::model::Device::Plugin(crate::model::PluginInstance::with_ports(
+            // r.md #129 Q6: 組み込み Comp / EQ より上に入れる。
+            let at = crate::model::default_insert_index_in(&track.devices, false);
+            track.devices.insert(at, crate::model::Device::Plugin(crate::model::PluginInstance::with_ports(
                 crate::plugin_db::SUBTITLE_ID.to_string(),
                 crate::plugin_format::PluginFormat::Builtin,
                 crate::port_config::PortConfig {
@@ -992,6 +1002,10 @@ mod tests {
             launcher_scene_col_w: 96.0,
             launcher_scroll_scene: 2.5,
             collapsed_parallel_nodes: vec![11],
+            open_rack_panels: vec![
+                crate::model::RackPanelKey::Device(7),
+                crate::model::RackPanelKey::MasterLimiter,
+            ],
         }
     }
 

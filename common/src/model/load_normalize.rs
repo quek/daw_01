@@ -57,6 +57,13 @@ impl Song {
             for_each_parallel_mut(&mut t.devices, &mut fix_parallel);
         }
         for_each_parallel_mut(&mut self.master_fx_chain, &mut fix_parallel);
+        // r.md #129: 内蔵 device と master Limiter の値も RT がそのまま使う (LoadSong は素通し)。
+        // **値の clamp だけ**で構造 (builtin / 番号 / 配線) には触らない — daw_audio の LoadSong でも走る。
+        for t in &mut self.tracks {
+            for_each_native_mut(&mut t.devices, &mut NativeDevice::sanitize);
+        }
+        for_each_native_mut(&mut self.master_fx_chain, &mut NativeDevice::sanitize);
+        self.master_limiter.sanitize();
         // r.md #116 / #117: LFO の Shape / Jitter / Smooth / Delay / Fade In と ADSR の時定数も RT が
         // そのまま使う (GUI の編集は clamp 済だが LoadSong は素通し)。
         for m in &mut self.mod_sources {
@@ -99,9 +106,9 @@ impl Song {
         self.ensure_image_source_ids();
         self.ensure_ids();
         self.ensure_midi_binding_inputs();
-        // r.md #89: クロス変調の dangling を掃除する。id 採番の後 (routing id が
-        // 確定してから ModRoutingDepth を解決する) でなければならない。
-        self.prune_dangling_mod_targets();
+        // r.md #89 / #129: dangling な lane / routing / MIDI binding を掃除する。id 採番と組み込みの
+        // 正規化の後 (routing id / device id が確定してから解決する) でなければならない。
+        self.prune_dangling_param_targets();
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
@@ -215,7 +222,9 @@ impl Song {
             let has_transform =
                 any_plugin(&track.devices, &mut |d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
             if track.group_transform.is_some() && !has_transform {
-                track.devices.push(Device::Plugin(PluginInstance::with_ports(
+                // r.md #129 Q6: 組み込み Comp / EQ より上 (末尾に push すると EQ の後ろに入る)。
+                let at = default_insert_index_in(&track.devices, false);
+                track.devices.insert(at, Device::Plugin(PluginInstance::with_ports(
                     crate::video_fx::TRANSFORM_ID.to_string(),
                     crate::plugin_format::PluginFormat::Builtin,
                     crate::port_config::PortConfig {
@@ -317,7 +326,16 @@ impl Song {
         // だけ (他 allocator と同 idiom)。 r.md #110: Parallel / chain の id も同じ空間で
         // 同じ規則 (`for_each_node_id_mut` が plugin / parallel / chain を全部訪問する)。
         {
-            let mut next = self.ids.next_device_id;
+            // 0 に採番する前に「既存の最大 id + 1」まで押し上げる。counter が遅れているファイルで、
+            // 先に訪問した 0 へ振った id が後ろの実在 device と衝突すると、そちらが「重複」として
+            // 振り直され、その device を指す PluginParam レーンが外れる。
+            let mut max_id = 0u64;
+            let mut see = |id: u64| max_id = max_id.max(id);
+            for track in &self.tracks {
+                for_each_node_id(&track.devices, &mut see);
+            }
+            for_each_node_id(&self.master_fx_chain, &mut see);
+            let mut next = self.ids.next_device_id.max(max_id.saturating_add(1));
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             let mut alloc = |id: &mut u64| {
                 // 0 (未採番) と **既出 id** は必ず新採番する。 r.md #71
@@ -404,6 +422,9 @@ impl Song {
         }
 
         self.patch_remapped_track_refs(&id_remap);
+        // r.md #129 (K4): 組み込み native の補充 / 降格 / 番号の修復。id 採番の後 (補う組み込みの
+        // id が既存と衝突しない) に置く。script 経路 (`migrate_legacy_song` + `ensure_ids`) でも揃う。
+        self.normalize_native_devices();
     }
 
     /// [`Self::ensure_ids`] の Pass 2。
@@ -439,25 +460,30 @@ impl Song {
             // aux_inputs tap の source_track / aux_outputs の dest_track を
             // 1 ループで remap する (パラアウト dest も sentinel→新 id に追従)。
         }
-        // 各 device の aux_inputs tap の source track / aux_outputs の dest_track を remap
-        // する (パラアウト dest も sentinel→新 id に追従)。 r.md #110: Parallel の中の plugin も
-        // `for_each_plugin_mut` が辿る。 master fx が他 track を sidechain source /
-        // パラアウト先に取るケースも同じ経路。
-        let mut remap_routes = |p: &mut PluginInstance| {
-            for route in p.aux_inputs.iter_mut().flatten() {
-                if let TapSource::Track(src) = &mut route.tap.source
-                    && let Some(&new_id) = id_remap.get(src)
-                {
-                    *src = new_id;
-                }
+        // 各 device の aux 入力 (plugin の aux_inputs / native の SC) の source track と、plugin の
+        // aux_outputs の dest_track を remap する (パラアウト dest も sentinel→新 id に追従)。
+        // r.md #110: Parallel の中も辿る。master fx が他 track を sidechain source / パラアウト先に
+        // 取るケースも同じ経路。
+        let mut remap_input = |_: u64, _: u8, slot: &mut Option<AuxInputRoute>| {
+            if let Some(route) = slot
+                && let TapSource::Track(src) = &mut route.tap.source
+                && let Some(&new_id) = id_remap.get(src)
+            {
+                *src = new_id;
             }
+        };
+        for t in &mut self.tracks {
+            for_each_aux_slot_mut(&mut t.devices, &mut remap_input);
+        }
+        for_each_aux_slot_mut(&mut self.master_fx_chain, &mut remap_input);
+        let mut remap_outputs = |p: &mut PluginInstance| {
             for route in p.aux_outputs.iter_mut().flatten() {
                 if let Some(&new_id) = id_remap.get(&route.dest_track) {
                     route.dest_track = new_id;
                 }
             }
         };
-        self.for_each_plugin_mut(&mut remap_routes);
+        self.for_each_plugin_mut(&mut remap_outputs);
 
         // docs/plan_modulation.md §8: mod_source の tap も track id remap に追従する
         // (mod_source.id は track id ではないので不変、 tap の source track のみ)。

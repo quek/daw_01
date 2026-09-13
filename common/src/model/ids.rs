@@ -51,4 +51,12 @@ impl IdAllocators {
         self.next_content_id = id.saturating_add(1);
         id
     }
+
+    /// 新しい device / chain id を採番する (採番規則の SSoT)。`Song` 全体を可変借用せずに
+    /// 呼べるので、正規化が `tracks` / `master_fx_chain` を可変で歩きながら組み込みを補える。
+    pub fn alloc_device_id(&mut self) -> u64 {
+        let id = self.next_device_id.max(1);
+        self.next_device_id = id.saturating_add(1);
+        id
+    }
 }

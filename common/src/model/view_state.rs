@@ -125,6 +125,20 @@ pub struct ViewState {
     /// 「見方の都合」 なので dirty は立てないが保存する。 save 時に sort、消えた id は落とす。
     #[serde(default)]
     pub collapsed_parallel_nodes: Vec<u64>,
+    /// r.md #129 Q18: 開いている Rack Par (plugin / 映像 FX / VOICEVOX / 字幕 / Transform / Native /
+    /// Limiter)。「見方の都合」なので dirty は立てないが保存する。save 時に sort、存在しない device は落とす。
+    #[serde(default)]
+    pub open_rack_panels: Vec<RackPanelKey>,
+}
+
+/// Rack の Par パネル 1 枚の鍵 (r.md #129 Q18)。serde 専用で IPC を渡らない。
+/// widget id の鍵にもこれを使う (同じ形の enum を増やさない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RackPanelKey {
+    /// device (plugin / native / Parallel) の Par。
+    Device(u64),
+    /// master のフェーダー後 Limiter の Par (device ではない)。
+    MasterLimiter,
 }
 
 /// `ViewState.bottom_panel` の serde 既定値 (フィールドが無い旧ファイル = Mixer を開く)。
