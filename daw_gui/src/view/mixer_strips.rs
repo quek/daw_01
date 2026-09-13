@@ -683,25 +683,9 @@ fn draw_strip(
             0.0,
             pan_desc.format,
             &readout_style,
-            move |v| {
-                // 範囲は widget が `style.range` で clamp 済だが、 表示レンジの SSoT
-                // (`AutomationValueDisplay`) を通してから model 単位へ落とす。
-                #[allow(clippy::cast_possible_truncation)]
-                let pan = pan_desc.clamp_plain(v) as f32;
-                Edit::mutate(move |app: &mut AppData| {
-                    // 数値欄はドラッグが閾値を越えた **そのフレームに** 最初の値を出す (下の申告は
-                    // widget の後に積まれる)。値より先にジェスチャーを開いておかないと、最初の値だけが
-                    // gesture の外で 1 undo step 積まれて 1 ドラッグが 2 step に割れる。所有者が既に
-                    // いれば Begin は何もしない。text 確定 / ダブルクリックは次のフレームの申告
-                    // (非ドラッグ) が閉じるので 1 step のまま。
-                    app.handle_event(AppEvent::ParamGestureBegin {
-                        surface: ParamSurface::MixerStrip,
-                        track_id: track_idx_for_pan,
-                        target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-                    });
-                    app.handle_event(AppEvent::SetTrackPan { track: track_idx_for_pan, pan })
-                })
-            },
+            // 範囲は widget が `style.range` で clamp 済だが、 表示レンジの SSoT
+            // (`AutomationValueDisplay`) を通してから model 単位へ落とす。
+            move |v| pan_readout_edit(track_idx_for_pan, pan_desc.clamp_plain(v) as f32),
             None,
             // modulation の表示・depth ドラッグ面は **ノブ 1 つに集約** する
             // (同じ param の変調を 2 箇所で編集できる状態を作らない)。
@@ -709,8 +693,8 @@ fn draw_strip(
         );
         // gesture (= undo 1 step + オートメーション記録) は **ノブと数値欄で 1 本**。
         // 同じ `(track, Pan)` を key にするので、 どちらの drag でも Begin / End は
-        // 1 回ずつになるよう OR を取ってから edge 検知に渡す。 text 打ち込みは 1 回の
-        // `SetTrackPan` で完結する (= それ自体が 1 undo step) ので gesture にしない。
+        // 1 回ずつになるよう OR を取ってから edge 検知に渡す。 text 打ち込みの確定は値の Edit が
+        // 開いた gesture を次のフレームのここ (非ドラッグ) が閉じるので、 それ自体が 1 undo step。
         push_param_gesture(
             ui,
             app,
@@ -801,6 +785,23 @@ fn draw_strip(
         );
         push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &vol_target, resp.mod_dragging);
     }
+}
+
+/// Pan 数値欄の値の Edit。
+///
+/// 数値欄はドラッグが閾値を越えた **そのフレームに** 最初の値を出す (`push_param_gesture` の申告は
+/// widget の後に積まれる)。値より先にジェスチャーを開いておかないと、最初の値だけが gesture の外で
+/// 1 undo step 積まれて 1 ドラッグが 2 step に割れる。所有者が既にいれば Begin は何もしない。
+/// text 確定 / ダブルクリックは次のフレームの申告 (非ドラッグ) が閉じるので 1 step のまま。
+fn pan_readout_edit(track: u32, pan: f32) -> Edit<AppData> {
+    Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::ParamGestureBegin {
+            surface: ParamSurface::MixerStrip,
+            track_id: track,
+            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+        });
+        app.handle_event(AppEvent::SetTrackPan { track, pan });
+    })
 }
 
 /// strip 下部に確保する Sends セクション band の高さ (px)。 send 行数 +
