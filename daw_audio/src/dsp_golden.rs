@@ -102,7 +102,7 @@ impl Stimulus {
             }
             Self::Impulses => {
                 for i in (0..LEN).step_by(IMPULSE_PERIOD) {
-                    l[i] = if (i / IMPULSE_PERIOD) % 2 == 0 { 1.0 } else { 0.25 };
+                    l[i] = if (i / IMPULSE_PERIOD).is_multiple_of(2) { 1.0 } else { 0.25 };
                     if let Some(s) = r.get_mut(i + 1_200) {
                         *s = -0.5;
                     }
@@ -155,7 +155,7 @@ pub fn run_blocks(
     block: usize,
     mut process: impl FnMut(&mut [f32], &mut [f32]) -> BlockGr,
 ) -> Vec<WindowStats> {
-    assert!(block > 0 && WINDOW % block == 0, "block {block} は WINDOW {WINDOW} を割り切らない");
+    assert!(block > 0 && WINDOW.is_multiple_of(block), "block {block} は WINDOW {WINDOW} を割り切らない");
     let (mut l, mut r) = (input.l.clone(), input.r.clone());
     let mut grs = vec![BlockGr::default(); window_count()];
     for start in (0..LEN).step_by(block) {
@@ -343,7 +343,7 @@ mod tests {
             assert!(names.insert(s.name.as_str()), "シナリオ名が重複: {}", s.name);
             assert!(s.meta("stimulus").and_then(Stimulus::from_name).is_some(), "{}: stimulus", s.name);
             let block: usize = s.meta("block").and_then(|b| b.parse().ok()).expect("block");
-            assert!(block > 0 && WINDOW % block == 0, "{}: block {block}", s.name);
+            assert!(block > 0 && WINDOW.is_multiple_of(block), "{}: block {block}", s.name);
             assert!(s.meta("input_gain_db").and_then(|g| g.parse::<f64>().ok()).is_some(), "{}", s.name);
             assert_eq!(s.windows.len(), window_count(), "{}: 窓の数", s.name);
             for (i, w) in s.windows.iter().enumerate() {

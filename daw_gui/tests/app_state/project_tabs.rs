@@ -569,7 +569,7 @@ fn sc_listen_is_resent_per_tab_after_audio_respawn_before_load_song() {
     app.flush_song_sync();
     let sent = drain(&mut audio_rx);
     for (key, comp) in [(a, comp_a), (b, comp_b)] {
-        let pos = |pred: &dyn Fn(&AudioCommand) -> bool| sent.iter().position(|c| pred(c));
+        let pos = |pred: &dyn Fn(&AudioCommand) -> bool| sent.iter().position(pred);
         let open = pos(&|c| matches!(c, AudioCommand::OpenProject { project } if *project == key)).expect("OpenProject");
         let listen = pos(&|c| {
             matches!(c, AudioCommand::SetScListen { project, device_id } if *project == key && *device_id == Some(comp))

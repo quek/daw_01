@@ -178,9 +178,11 @@ pub(super) fn bake_snapshot_needs(song: &Song, built: &mut [BuiltProgram]) {
 /// - plugin: 配線のある port ごとに `NodeOp::SidechainTap`。
 /// - native: 次の 4 条件を満たすときだけ `NodeOp::NativeSidechainTap` を積み、同じ場所で
 ///   `natives[slot]` を `Staged` にして受け皿を確保する (off-RT)。
-///   1. SC を受ける種類 (`aux_consumers` が保証) 2. source が自トラックではない
-///   3. source を `BufRef` に解決できる 4. op が出ている (`native_slots` に id がある —
-///   bypass 中の Parallel の中の native には op が無い)。
+///   1. SC を受ける種類 (`aux_consumers` が保証)
+///   2. source が自トラックではない
+///   3. source を `BufRef` に解決できる
+///   4. op が出ている (`native_slots` に id がある — bypass 中の Parallel の中の native には
+///      op が無い)
 ///
 /// 自トラックの Pre-FX は program が同じ pass の snapshot を直接載せる (plugin の
 /// `own_prefx_ports` / native の `ScMode::OwnPreFx`)。自トラックの他の tap 点は出力の下流

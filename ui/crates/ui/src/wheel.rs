@@ -73,6 +73,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use std::cell::Cell;
 

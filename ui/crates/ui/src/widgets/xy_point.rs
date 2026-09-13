@@ -180,8 +180,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.claim_press(wid);
         }
         if let Some(p) = emit {
-            let edit = on_change(p);
-            self.push_edit(edit);
+            self.push_edit(on_change(p));
         }
 
         // ---- wheel ----
@@ -224,6 +223,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use std::cell::Cell;
 
@@ -320,7 +320,7 @@ mod tests {
             let mut scene = Scene::new();
             let out = Cell::new(None);
             let mut model = ();
-            host.frame(&mut model, &mut scene, SCREEN, input, |_, ui| {
+            host.frame(&mut model, &mut scene, SCREEN, input, |(), ui| {
                 let resp = ui.drag_list("rows", Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 }, &rows, &slots, None, &style, |_, _| true, |ui, i, r, _, _| {
                     if i == 0 {
                         let s = XyPointStyle::from_palette(&Palette::dark());
