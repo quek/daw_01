@@ -7,6 +7,7 @@ use daw_ui_core::{ColorPickerStyle, Edit, Ui};
 use daw_ui_renderer::Color;
 
 use crate::app::{AppData, AppEvent, ColorPickerTarget};
+use crate::event_device::DeviceEvent;
 use crate::view::track_color;
 
 /// v18 (`docs/plan_track_clip_color.md`, gui_01 #058): `color_picker_target` が
@@ -109,10 +110,10 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
                 ));
             }
             ColorPickerTarget::ParallelChain(chain_id) => {
-                app.handle_event(AppEvent::SetParallelChainColor { chain_id, color: Some(rgb) });
+                app.handle_event(AppEvent::Device(DeviceEvent::SetParallelChainColor { chain_id, color: Some(rgb) }));
             }
             ColorPickerTarget::Parallel(parallel_id) => {
-                app.handle_event(AppEvent::SetParallelColor { parallel_id, color: Some(rgb) });
+                app.handle_event(AppEvent::Device(DeviceEvent::SetParallelColor { parallel_id, color: Some(rgb) }));
             }
         }));
     }

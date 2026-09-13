@@ -150,8 +150,9 @@ fn delete_tracks_handles_group_and_its_child_selected_together() {
 
     // ids[1] を ids[0] の子にする (= ids[0] が group として振る舞う)。
     app.handle_event(AppEvent::SetTrackParent {
-        track_id: ids[1],
+        track_ids: vec![ids[1]],
         parent_id: Some(ids[0]),
+        anchor_after: Some(ids[0]),
     });
     assert!(app.is_group_track(ids[0]), "親が group になっている");
 

@@ -90,7 +90,7 @@ pub use crate::event::{
 };
 
 pub use crate::state::{
-    AppData, DeviceParamKey, EditScope, IpcState, MediaState, RecordingState, ScrubGesture,
+    AppData, DeviceParamKey, EditScope, IpcState, MediaState, ParamSurface, RecordingState, ScrubGesture,
     SelectionState, SongDoc, StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
 };
 
@@ -132,10 +132,7 @@ impl AppData {
                 "recovery candidates found at startup"
             );
         }
-        let plugin_picker_entries = plugin_db
-            .as_ref()
-            .map(|db| PluginPickEntry::build_all(db))
-            .unwrap_or_default();
+        let plugin_picker_entries = PluginPickEntry::build_all(plugin_db.as_deref());
 
         // プロジェクト非依存のアプリ設定は **1 回だけ** 読む (旧実装はフィールドごとに
         // 同じ JSON を 3 回 load していた)。 `app_dirs == None` (テスト) では既定値。
@@ -419,6 +416,7 @@ impl AppData {
             // r.md #87: ランチャー操作は 1 arm で受けて専用 dispatcher へ。
             AppEvent::Launcher(ev) => self.handle_launcher_event(ev),
             AppEvent::Tab(ev) => self.handle_tab_event(ev),
+            AppEvent::Device(ev) => self.handle_device_event(ev),
             // r.md #61: 全終了経路の合流点。
             AppEvent::Quit(req) => self.request_quit(req),
             // `docs/plan_project_tabs.md` §5.2: New / Open は現在のタブを破棄しない
@@ -855,16 +853,12 @@ impl AppData {
             AppEvent::SetCountInBars(bars) => {
                 self.cur.recording.count_in_bars = bars.min(2);
             }
-            AppEvent::ParamGestureBegin {
-                track_id,
-                target,
-                display_name,
-            } => {
+            AppEvent::ParamGestureBegin { surface, track_id, target } => {
                 // 1 drag = 1 undo step の bracket と touch の記録 (`handler/param_gesture.rs`)。
-                self.begin_param_gesture(track_id, target, display_name);
+                self.begin_param_gesture(surface, track_id, target);
             }
-            AppEvent::ParamGestureEnd { track_id, target } => {
-                self.end_param_gesture(track_id, target);
+            AppEvent::ParamGestureEnd { surface, track_id, target } => {
+                self.end_param_gesture(surface, track_id, target);
             }
             AppEvent::CreateAutomationClip {
                 lane,
@@ -874,8 +868,8 @@ impl AppData {
             AppEvent::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks(&track_ids);
             }
-            AppEvent::SetTrackParent { track_id, parent_id } => {
-                self.action_set_track_parent(track_id, parent_id);
+            AppEvent::SetTrackParent { track_ids, parent_id, anchor_after } => {
+                self.action_move_tracks(&track_ids, parent_id, anchor_after);
             }
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
             AppEvent::DeleteTracks(track_ids) => self.delete_tracks(track_ids),
@@ -1199,55 +1193,11 @@ impl AppData {
             AppEvent::SelectPluginFromDb { id, keep_open, open_gui } => {
                 self.select_plugin_from_db(id, keep_open, open_gui);
             }
-            AppEvent::ToggleSlotGui { device_id } => {
-                self.toggle_slot_gui(device_id);
-            }
             // r.md #55: 閉じた 1 枚ごとに `SlotGuiClosed` が返ってくるので、
             // `ipc.open_plugin_guis` の掃除は ✕ を押したときと同じ経路 (on_gui_closed)
             // に任せる。ここで先回りして帳簿を clear しない (二重管理を作らない)。
             AppEvent::CloseAllPluginEditors => {
                 self.send_plugin(PluginCommand::CloseAllSlotGuis);
-            }
-            AppEvent::SetVideoFxParam { device_id, param_id, value_real } => {
-                self.set_video_fx_param(device_id, param_id, value_real);
-            }
-            AppEvent::SetPluginParam { device_id, param_id, value_real } => {
-                self.set_plugin_param(device_id, param_id, value_real);
-            }
-            AppEvent::RemoveDevices { device_ids } => {
-                self.remove_devices(device_ids);
-            }
-            AppEvent::RelocateDevices(req) => {
-                self.relocate_devices(req);
-            }
-            AppEvent::SelectDevice { device_id, modifier } => {
-                self.apply_select_device(device_id, modifier);
-            }
-            AppEvent::ReloadDevice { device_id } => {
-                self.reload_device(device_id);
-            }
-            AppEvent::ExplodeParallelOut { device_id } => {
-                self.explode_parallel_out(device_id);
-            }
-            AppEvent::SetParallelOutputRoute {
-                device_id,
-                port,
-                dest,
-            } => {
-                self.set_parallel_output_route(device_id, port, dest);
-            }
-            AppEvent::SetSidechainSource {
-                device_id,
-                port,
-                source,
-            } => {
-                self.set_sidechain_source(device_id, port, source);
-            }
-            AppEvent::SetPluginSendAllKeys { device_id, enabled } => {
-                self.set_plugin_send_all_keys(device_id, enabled);
-            }
-            AppEvent::SetDevicesBypassed { device_ids, bypassed } => {
-                self.set_devices_bypassed(&device_ids, bypassed);
             }
             AppEvent::AddModSource { kind } => self.add_mod_source(kind),
             AppEvent::EditModSource { id, edit } => self.edit_mod_source(id, edit),
@@ -1298,40 +1248,8 @@ impl AppData {
                 self.set_mod_source_tap_point(id, tap_point)
             }
             AppEvent::SetArmedModSource(id) => self.cur.peph.armed_mod_source = id,
-            AppEvent::SetAuxInputTapPoint {
-                device_id,
-                port,
-                tap_point,
-            } => self.set_aux_input_tap_point(device_id, port, tap_point),
-            // ---- r.md #110 Parallel ----
-            AppEvent::AddParallel { chain, index } => self.add_parallel(chain, index),
-            AppEvent::GroupDevices { device_ids } => self.group_devices(device_ids),
-            AppEvent::UngroupParallel { parallel_id } => self.ungroup_parallel(parallel_id),
-            AppEvent::AddParallelChain { parallel_id } => self.add_parallel_chain(parallel_id),
-            AppEvent::DuplicateParallelChain { chain_id } => self.duplicate_parallel_chain(chain_id),
-            AppEvent::RenameParallelChain { chain_id, name } => self.rename_parallel_chain(chain_id, name),
-            AppEvent::RenameParallel { parallel_id, name } => self.rename_parallel(parallel_id, name),
-            AppEvent::SetParallelChainColor { chain_id, color } => {
-                self.set_parallel_chain_color(chain_id, color)
-            }
-            AppEvent::SetParallelColor { parallel_id, color } => self.set_parallel_color(parallel_id, color),
-            AppEvent::SetChainMixer { chain_id, edit } => self.set_chain_mixer(chain_id, edit),
-            AppEvent::SetParallelMixer { parallel_id, edit } => self.set_parallel_mixer(parallel_id, edit),
-            AppEvent::SetParallelSplit { parallel_id, split } => self.set_parallel_split(parallel_id, split),
-            AppEvent::ToggleParallelNodeCollapsed { id } => self.toggle_parallel_node_collapsed(id),
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
-            }
-            // マスターフェーダーの drag を 1 undo step に束ねる。これが無いと
-            // per-frame の `SetMasterGain` が各々 snapshot を積み、1 回の drag で
-            // undo 履歴が埋まる (group transform / inspector scrub と同じ罠)。
-            AppEvent::BeginMasterGainDrag => {
-                self.cur.peph.master_gain_dragging = true;
-                self.cur.song_doc.begin_gesture();
-            }
-            AppEvent::EndMasterGainDrag => {
-                self.cur.peph.master_gain_dragging = false;
-                self.cur.song_doc.end_gesture();
             }
             AppEvent::Tick { project, samples, preroll, playing, recording_live } => {
                 self.on_transport_tick(project, samples, preroll, playing, recording_live);
@@ -1358,20 +1276,20 @@ impl AppData {
             AppEvent::ToggleTrackArmed(track) => {
                 self.toggle_track_armed(track);
             }
-            AppEvent::StripEdit { track, edit } => {
-                self.apply_strip_edit(track, &edit);
-            }
-            AppEvent::MasterStripEdit { param, value } => {
-                self.apply_master_strip_edit(param, value);
-            }
             AppEvent::ToggleStripSection(section) => {
                 self.toggle_strip_section(section);
             }
             // メーター / 走行状態 / 変調値面はアクティブなタブの slot だけ読む。届いた
             // 時点で切り替わっていたら (1 tick の窓) 捨てる — 別タブの値を混ぜない。
-            AppEvent::TrackPeaksTick { project, tracks, master_gr } => {
+            AppEvent::TrackPeaksTick { project, tracks, native_gr, master_limiter_gr_db } => {
                 if project == self.cur.key {
-                    self.on_track_peaks_tick(&tracks, master_gr);
+                    self.on_track_peaks_tick(&tracks, native_gr.as_deref(), master_limiter_gr_db);
+                }
+            }
+            AppEvent::DeviceSpectrumTick { project, spectra, visual_digest } => {
+                if project == self.cur.key {
+                    self.cur.transport.device_spectra = spectra.into_iter().collect();
+                    self.cur.transport.device_spectra_digest = visual_digest;
                 }
             }
             AppEvent::LauncherRowsTick { project, rows } => {

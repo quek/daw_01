@@ -27,11 +27,20 @@ pub enum ScrubGesture {
     /// アレンジャーのオートメーションレーン見出しの「既定値」欄。
     LaneDefault(common::model::AutomationLaneKey),
     /// ツマミ / フェーダーの **変調深さ** ドラッグ (`docs/plan_modulation.md`)。
-    ModDepth { track_id: u32, target: common::model::AutomationTarget },
+    /// r.md #129: 所有者に**面**を含める — 同じ `(track, target)` を別の面が描いていても、
+    /// ドラッグしていない面の非アクティブな申告が bracket を閉じて ◉ を解除しない。
+    ModDepth {
+        surface: crate::state::ParamSurface,
+        track_id: u32,
+        target: common::model::AutomationTarget,
+    },
     /// 変調ラックの数値欄 (ラック内で同時にドラッグできる欄は 1 つなので集約 1 本)。
     ModRack,
-    /// 立ち絵グループ変換 (`docs/plan_tachie_group_transform.md`)。
-    GroupTransform(common::model::GroupTransformParam),
+    /// 立ち絵グループ変換 (`docs/plan_tachie_group_transform.md`)。r.md #129: Par は device ごとに
+    /// 独立して開くので、どの Transform device の欄かを鍵に含める。
+    GroupTransform { device_id: u64, param: common::model::GroupTransformParam },
+    /// マスターパネルのフェーダー (`Song.master_gain`)。描く面はマスターパネル 1 つだけ。
+    MasterGain,
 }
 
 /// r.md #115: 変調ラックでポインタが乗っているもの (`Q` のバイパス対象)。 住所は安定 id。
@@ -72,8 +81,7 @@ pub struct UiEphemeral {
     ///
     /// この値の確定は **曲全体の再合成 + app_config.json への書き込み**を意味するので、
     /// drag の per-frame 値では確定させない (掴んで振っている間ずっと engine を叩き、
-    /// 毎フレーム設定ファイルを書くことになる)。マスターフェーダーの undo bracket
-    /// (`master_gain_dragging`) と同じ edge 検出の流儀。
+    /// 毎フレーム設定ファイルを書くことになる)。
     pub voicevox_chunk_editing: bool,
     /// Global Sampler の「長さ (秒)」欄をドラッグ / 入力中か (立ち下がりで確定)。
     pub sampler_secs_editing: bool,

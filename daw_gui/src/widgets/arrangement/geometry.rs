@@ -753,6 +753,11 @@ pub(super) struct ReorderDrop {
     /// 探すため、 anchor が source だと見つからず末尾 append してしまう罠を回避)。 gap の full-Vec
     /// 挿入位置 (= below の full index、 なければ末尾) の直前にある最初の非 source track。
     pub(super) anchor_after: Option<u32>,
+    /// この gap に**落とせる深さがある**か。 `false` は合法深さ区間のどの深さでも依存 (親子 / サイドチェイン /
+    /// send) が循環する gap (例: group の先頭の子の直前 = 子にしかなれない位置で、 その group が source に
+    /// 依存している)。 プレビューは指標線と group 行の強調を出さず、 確定は `(parent, anchor_after)` を
+    /// そのまま出して handler (`Song::move_tracks`) が同じ規則で拒否し status を出す (= Song は変わらない)。
+    pub(super) droppable: bool,
 }
 
 /// M14 Phase 101 (daw_01 #072): reorder drag の描画プレビューに必要な geometry (すべて screen px、
@@ -761,16 +766,25 @@ pub(super) struct ReorderDrop {
 /// 解決結果**から導出されるので「プレビューと実結果がズレる」 ことが構造的に起きない。
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReorderOverlay {
-    /// drop indicator 横線の Y (= gap の screen top、 `press_tops[gap]`)。
-    pub(super) indicator_y: f32,
-    /// indicator 線の **左端 X** (= `header_left + depth * indent_px`)。 線の indent 量が深さ
-    /// プレビューそのもの (flush-left = top-level、 1 段右 = その group の子)。
-    pub(super) indent_x: f32,
+    /// drop indicator 横線。 落とせる深さが無い gap (`ReorderDrop::droppable == false`) では `None`
+    /// (= 指標線を出さない。 ghost row は出す)。
+    pub(super) drop: Option<DropIndicator>,
     /// drag 中の半透明 ghost row の中心 Y (= `last_mouse_y`)。
     pub(super) drag_center_y: f32,
     /// reparent 先 parent が group のとき、 hilight する group header の row rect (Cubase の
-    /// 緑矢印に相当する肯定フィードバック)。 top-level drop (`parent == None`) では `None`。
+    /// 緑矢印に相当する肯定フィードバック)。 top-level drop (`parent == None`) と、 落とせる深さが無い gap では
+    /// `None`。
     pub(super) highlight_row: Option<Rect>,
+}
+
+/// reorder drop indicator 横線の位置 (screen px)。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DropIndicator {
+    /// 横線の Y (= gap の screen top、 `press_tops[gap]`)。
+    pub(super) y: f32,
+    /// 横線の **左端 X** (= `header_left + depth * indent_px`)。 線の indent 量が深さ
+    /// プレビューそのもの (flush-left = top-level、 1 段右 = その group の子)。
+    pub(super) indent_x: f32,
 }
 
 /// M14 Phase 101 (daw_01 #072): `mouse_y` を visible 行間の **gap index** (`0..=N`) に写像する。
@@ -827,6 +841,8 @@ pub(super) fn ancestor_at_depth(
 /// - `source`: drag 中の track id slice (anchor_after / parent 計算で除外)。 通常 1〜数件なので
 ///   slice の線形 `contains` で十分 (drag 中毎フレーム呼ぶため HashSet を alloc しない)。
 /// - `indent_px`: 深さ 1 段の幅 (X→深さ写像の単位)。
+/// - `parent_cycles`: source を親 `parent` の子にすると依存が循環するか (`Song::reparent_check` の判定を
+///   caller が渡す。 確定の `Song::move_tracks` と同じ規則 = プレビューと確定で規則を二重にしない)。
 /// - `mouse_y` / `mouse_x`: drag 中の最終 pointer。 `anchor_mouse_x`: 掴んだ瞬間の x (深さ基準列)。
 ///   深さは `mouse_x - anchor_mouse_x` の **相対** 列量で決める (絶対 x や header 左端には依存しない
 ///   = どこを掴んでも「右へ動かすと nest」 が成立する)。
@@ -840,6 +856,7 @@ pub(super) fn resolve_track_drop(
     tops: &[f32],
     is_group_set: &HashSet<u32>,
     source: &[u32],
+    parent_cycles: &dyn Fn(Option<u32>) -> bool,
     indent_px: f32,
     mouse_y: f32,
     mouse_x: f32,
@@ -865,29 +882,36 @@ pub(super) fn resolve_track_drop(
     let indent_unit = indent_px.max(1.0);
     #[allow(clippy::cast_possible_truncation)]
     let col_offset = ((mouse_x - anchor_mouse_x) / indent_unit).round() as i32;
-    let depth = (i32::from(min_d) + col_offset)
+    let requested = (i32::from(min_d) + col_offset)
         .clamp(i32::from(min_d), i32::from(max_d))
         .max(0) as u8;
 
-    // parent = above の depth-1 祖先 (depth==0 → top-level None)。
-    let parent = if depth == 0 {
-        None
-    } else {
-        above.and_then(|a| ancestor_at_depth(a, depth - 1, tracks))
-    };
-    // **parent が source 自身になる cycle を防ぐ** (= 自分を自分の子にする / multi-select で moving 中の
-    // 祖先を親にする)。 例: expanded group G を G ヘッダ直下の gap へ drag すると above=G・唯一の合法深さ
-    // depth(G)+1 で parent=G=source になる。 daw_01 の SetTrackParent 直接適用は cycle 検証を通らない
-    // (parent_group_id を直書きする) ので widget 側で source を親にしない不変を保証する。 source に当たったら
-    // 最近接の **非 source 祖先** へ繰り上げる (全祖先が source なら top-level)。
-    let mut parent = parent;
-    while let Some(pid) = parent {
-        if source.contains(&pid) {
-            parent = tracks.iter().find(|t| t.id == pid).and_then(|t| t.parent_id);
-        } else {
-            break;
+    // 深さ d の親 = above の d-1 祖先 (d==0 → top-level None)。
+    // **親が source 自身になる drop は最近接の非 source 祖先へ繰り上げる** (= 自分を自分の子にする /
+    // multi-select で moving 中の祖先を親にする)。 例: expanded group G を G ヘッダ直下の gap へ drag すると
+    // above=G・唯一の合法深さ depth(G)+1 で parent=G=source になるが、 ユーザーの意図は「G の位置のまま」
+    // なので G の親へ繰り上げる (全祖先が source なら top-level)。
+    let parent_at = |d: u8| {
+        let mut parent = if d == 0 { None } else { above.and_then(|a| ancestor_at_depth(a, d - 1, tracks)) };
+        while let Some(pid) = parent {
+            if source.contains(&pid) {
+                parent = tracks.iter().find(|t| t.id == pid).and_then(|t| t.parent_id);
+            } else {
+                break;
+            }
         }
-    }
+        parent
+    };
+    // **落とせる深さだけに狭める** (preview = commit、 拒否は起きない)。 依存が循環する親の子孫を親にしても必ず
+    // 循環する (`Song::reparent_check` の doc) ので、 落とせる深さは浅い側から連続した区間になる。 求めた深さが
+    // 循環するなら浅い側の落とせる深さへ寄せる (念のため深い側も見る)。 どれも循環するなら求めた深さのまま
+    // `droppable = false` (プレビューは指標を出さず、 確定は handler が同じ規則で拒否して status を出す)。
+    let droppable_depth = (min_d..=requested)
+        .rev()
+        .chain(requested.saturating_add(1)..=max_d)
+        .find(|&d| !parent_cycles(parent_at(d)));
+    let depth = droppable_depth.unwrap_or(requested);
+    let parent = parent_at(depth);
 
     // anchor_after = gap の full-Vec 挿入位置 ins の直前にある最初の非 source track (None = 先頭)。
     // ins: below の full index (= below の直前に挿入)。 below 無し (末尾 gap) は tracks.len()。
@@ -905,7 +929,7 @@ pub(super) fn resolve_track_drop(
         .find(|t| !source.contains(&t.id))
         .map(|t| t.id);
 
-    ReorderDrop { gap, depth, parent, anchor_after }
+    ReorderDrop { gap, depth, parent, anchor_after, droppable: droppable_depth.is_some() }
 }
 
 /// track header 1 行内のレイアウト (Name button + 3 small buttons + 任意の volume band + lane disclosure)。

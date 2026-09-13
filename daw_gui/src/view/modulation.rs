@@ -68,17 +68,18 @@ impl ModBuild {
     }
 }
 
-/// `track_id` 上の `target` のコントロール (表示 `display_base`、ドメイン `domain`)
-/// の per-control modulation データを組み立てる。`track_id` は routing の帰属
-/// トラック (inspector = cursor track、mixer strip = その strip のトラック)。
+/// `owner` が持つ `target` のコントロール (表示 `display_base`、ドメイン `domain`)
+/// の per-control modulation データを組み立てる。`owner` は target の lane / routing の持ち主
+/// (r.md #129 §7.7) を **面を描き始めるときに 1 回だけ** 解決したもの (Rack / Mixer 帯 / マスターパネルは
+/// つまみの `NativeKnobSpec::owner`、それ以外は描いている面が知っている持ち主の id から `ParamOwner::resolve`)。
 pub(crate) fn build_mod(
     app: &AppData,
     target: AutomationTarget,
     display_base: f64,
     domain: ModControlDomain,
-    track_id: u32,
+    owner: crate::view::native_device::ParamOwner<'_>,
 ) -> ModBuild {
-    let d = app.inspector_mod_data(&target, display_base, domain, track_id);
+    let d = app.inspector_mod_data(&target, display_base, domain, owner);
     let to_color = |c: [f32; 3]| Color { r: c[0], g: c[1], b: c[2], a: 1.0 };
     let entries = d
         .entries
@@ -142,18 +143,20 @@ pub(crate) fn build_mod(
 pub(crate) fn push_mod_depth_bracket(
     ui: &mut Ui<'_, AppData>,
     app: &AppData,
+    surface: crate::app::ParamSurface,
     track_id: u32,
     target: &AutomationTarget,
     mod_dragging: bool,
 ) {
-    // 所有者は **(track_id, target)**。ミキサーは同じ target (例
+    // 所有者は **(面, track_id, target)**。ミキサーは同じ target (例
     // `TrackBuiltin(Pan)`) を全ストリップに描くので、target だけを鍵にすると
     // 全部が 1 本の bracket を取り合い、どれか 1 つを drag しただけで他ストリップの
-    // 欄が「非 active」として閉じてしまう。
+    // 欄が「非 active」として閉じてしまう。r.md #129: 同じ param を別の面 (Mixer 帯と Rack Par)
+    // が描いても、ドラッグしていない面の申告が ◉ を解除しないよう面も含める。
     crate::view::scrub_gesture::push(
         ui,
         app,
-        crate::app::ScrubGesture::ModDepth { track_id, target: target.clone() },
+        crate::app::ScrubGesture::ModDepth { surface, track_id, target: target.clone() },
         mod_dragging,
     );
 }
@@ -177,17 +180,17 @@ pub(crate) fn scrub_field_mod(
         F::ImageH => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::H), false),
         F::ImageOpacity => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity), false),
         F::ImageRotation => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation), true),
-        F::Text(TextNumField::X) => (AutomationTarget::TextBuiltin(TextBuiltinParam::X), false),
-        F::Text(TextNumField::Y) => (AutomationTarget::TextBuiltin(TextBuiltinParam::Y), false),
-        F::Text(TextNumField::W) => (AutomationTarget::TextBuiltin(TextBuiltinParam::W), false),
-        F::Text(TextNumField::H) => (AutomationTarget::TextBuiltin(TextBuiltinParam::H), false),
-        F::Text(TextNumField::Opacity) => {
+        F::Text { field: TextNumField::X, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::X), false),
+        F::Text { field: TextNumField::Y, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::Y), false),
+        F::Text { field: TextNumField::W, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::W), false),
+        F::Text { field: TextNumField::H, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::H), false),
+        F::Text { field: TextNumField::Opacity, .. } => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::Opacity), false)
         }
-        F::Text(TextNumField::Rotation) => {
+        F::Text { field: TextNumField::Rotation, .. } => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::Rotation), true)
         }
-        F::Text(TextNumField::FontSize) => {
+        F::Text { field: TextNumField::FontSize, .. } => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::FontSize), false)
         }
         _ => return None,

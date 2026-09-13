@@ -206,7 +206,9 @@ Plugin Host → プラグイン本体) の順で切り分ける。個別関数�
    `edit_song()` チョークポイントが無条件で担う。手動 `push_undo_snapshot`・whitelist・
    view からの song 直接可変参照を追加しない。
 6. **live と export は同じ render 関数** (`render_master_buffer`): master fx / master gain を
-   含む「1 buffer を描く」処理を二重実装しない。
+   含む「1 buffer を描く」処理を二重実装しない。聴き方・見方の状態 (SC Listen / device scope) は
+   Song に載せず `NativeIo` 引数で渡し、export は `NativeIo::default()` を使う (書き出しに試聴が
+   焼き込まれない)。
 7. **fingerprint handshake**: wire を渡る型を新ファイルへ切り出したら `common/build.rs` の
    `WIRE_SOURCES` に必ず追加する (protocol 変更の検出網に穴が開く)。
 8. **daw-ui core はドメイン知識を持たない**: DAW 固有 widget (arrangement / piano_roll) は

@@ -19,14 +19,26 @@ const WIRE_SOURCES: &[&str] = &[
     "src/wire.rs",
     "src/protocol.rs",
     "src/model.rs",
+    // model.rs から切り出した `Section` (Song.sections として LoadSong の wire を渡る)。
+    // 帯を動かすロジック (section_ops.rs) は wire に載らないので登録しない。
+    "src/model/sections.rs",
+    // model.rs から切り出した `PluginInstance` と blob を除外する手書き bincode
+    // (Track.devices / master_fx_chain の要素として LoadSong の wire を渡る)。
+    "src/model/plugin_instance.rs",
     "src/model/track.rs",
     // r.md #110: Device / Parallel / ParallelChain (Track.devices / master_fx_chain の要素として
     // LoadSong の wire を渡る)。
     "src/model/device.rs",
-    // 内蔵チャンネルストリップ (Track.strip として LoadSong / SetTrackStrip の wire を渡る)。
-    "src/model/track/channel_strip.rs",
-    // マスターストリップ (Song.master_strip として LoadSong / SetMasterStrip の wire を渡る)。
-    "src/model/master_strip.rs",
+    // r.md #129: 内蔵 device (Device::Native として LoadSong、値は SetNativeDevice の wire を渡る)。
+    // 規則だけのファイル (native/chain_rules.rs / param_range.rs / param_address.rs) は登録しない。
+    "src/model/native.rs",
+    "src/model/native/comp.rs",
+    "src/model/native/eq.rs",
+    "src/model/native/bus_comp.rs",
+    "src/model/native/tone_eq.rs",
+    "src/model/native_param.rs",
+    // master のフェーダー後 Limiter (Song.master_limiter / SetMasterLimiter)。
+    "src/model/master_limiter.rs",
     "src/model/modulation.rs",
     "src/model/content.rs",
     "src/model/automation.rs",
@@ -48,6 +60,8 @@ const WIRE_SOURCES: &[&str] = &[
     "src/audio_bridge.rs",
     "src/metrics_bridge.rs",
     "src/scope_bridge.rs",
+    // r.md #129: device 単位のサンプルリング (EQ Par のスペクトラム、repr(C) の shmem)。
+    "src/device_scope_bridge.rs",
     // Global Sampler の音声リング (docs/plan_global_sampler.md §3.1)。
     "src/sampler_ring.rs",
     "src/worker_bridge.rs",

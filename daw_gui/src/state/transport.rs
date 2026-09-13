@@ -18,6 +18,66 @@ pub enum PlayFrom {
     Continue,
 }
 
+/// r.md #129 (§11.1): GR を出す内蔵 device の GR 表示値 (**正の減衰量 dB**)。
+///
+/// 読み手 (Rack 行 / Par / Mixer 帯 / マスターパネル) は device id で引く。engine の GR 面は
+/// compile 順の slot だが、ポーラが id 昇順に並べて送り、ここも id 昇順で持って二分探索する
+/// (位置で引かない、不変条件 1)。
+#[derive(Debug, Default)]
+pub struct NativeGrDisplay {
+    /// `(device id, 減衰量 dB)`、id 昇順。
+    entries: Vec<(u64, f32)>,
+}
+
+impl NativeGrDisplay {
+    /// `id` の減衰量 (dB、無ければ 0)。
+    #[must_use]
+    pub fn get(&self, id: u64) -> f32 {
+        self.entries.binary_search_by_key(&id, |e| e.0).map_or(0.0, |i| self.entries[i].1)
+    }
+
+    /// GR 面の 1 tick (`(device id, GR dB (0 以下))`、**id 昇順**) を取り込む。面にある id は peak と同じ
+    /// release 弾道で更新 (新しい id はその値で追加) し、面に無い id は 0 へ減衰させて表示解像度で 0 に
+    /// なったら捨てる (処理されなくなった device の値が残らない)。どちらも id 昇順なので 1 回のマージ走査。
+    pub fn update(&mut self, plane: &[(u64, f32)], release: f32) {
+        debug_assert!(plane.windows(2).all(|w| w[0].0 < w[1].0), "GR 面は id 昇順で渡す (ポーラが並べる)");
+        let steps = crate::handler::activity::METER_STEPS;
+        let settled = |v: f32| crate::handler::activity::quantize(v / common::model::GR_METER_RANGE_DB, steps) == 0;
+        let reduction = |gr_db: f32| (-gr_db).max(0.0);
+        let old = std::mem::take(&mut self.entries);
+        let mut merged = Vec::with_capacity(old.len().max(plane.len()));
+        let (mut i, mut j) = (0, 0);
+        loop {
+            match (old.get(i).copied(), plane.get(j).copied()) {
+                (Some((id, v)), Some((pid, gr_db))) if id == pid => {
+                    merged.push((id, common::meter::update_peak(v, reduction(gr_db), release)));
+                    i += 1;
+                    j += 1;
+                }
+                (Some((id, v)), p) if p.is_none_or(|(pid, _)| id < pid) => {
+                    let v = common::meter::update_peak(v, 0.0, release);
+                    if !settled(v) {
+                        merged.push((id, v));
+                    }
+                    i += 1;
+                }
+                (_, Some((pid, gr_db))) => {
+                    merged.push((pid, reduction(gr_db)));
+                    j += 1;
+                }
+                // 両方を読み切った (`(Some, None)` は 2 本目の腕が取る)。
+                (_, None) => break,
+            }
+        }
+        self.entries = merged;
+    }
+
+    /// `(device id, 減衰量 dB)` を id 昇順に。
+    pub fn iter(&self) -> impl Iterator<Item = (u64, f32)> + '_ {
+        self.entries.iter().copied()
+    }
+}
+
 pub struct TransportState {
     /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の
     /// toggle button で切り替え、 `AppEvent::SetMetronomeEnabled(bool)` で
@@ -81,14 +141,18 @@ pub struct TransportState {
     pub master_meter: crate::master_meter::MasterMeterSnapshot,
 
     // -------- Mixer --------
-    /// mixer strip のメーター表示値 `(peak L, peak R, ゲインリダクション dB)`。
-    /// GR は **正の減衰量** (0 = 掛かっていない) で持ち、peak と同じ release
-    /// 弾道で 0 へ戻る。書き手は `on_track_peaks_tick` の 1 か所。
-    pub track_peak_display: Vec<(f32, f32, f32)>,
-    /// マスターストリップのゲインリダクション表示値 `(バスコンプ, リミッター)`。
-    /// per-track と同じく **正の減衰量 dB** で持ち、同じ release 弾道で 0 へ戻る
-    /// (`docs/plan_master_strip.md` §6)。
-    pub master_strip_gr: (f32, f32),
+    /// mixer strip のメーター表示値 `(peak L, peak R)`。書き手は `on_track_peaks_tick` の 1 か所。
+    pub track_peak_display: Vec<(f32, f32)>,
+    /// r.md #129 (§11.1): GR を出す内蔵 device (Comp / Bus Comp) の GR 表示値 (device id キー)。
+    pub native_gr: NativeGrDisplay,
+    /// master のフェーダー後 Limiter の GR 表示値 (**正の減衰量 dB**、peak と同じ release 弾道)。
+    pub master_limiter_gr: f32,
+    /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
+    /// アクティブなタブの `DeviceSpectrumTick` だけが書く。session-only。
+    pub device_spectra: std::collections::HashMap<u64, std::sync::Arc<[f32]>>,
+    /// `device_spectra` の中身を表示解像度で量子化したダイジェスト (ポーラが作る)。`device_spectra` と
+    /// 同じ tick で書き、tick の再描画判定の指紋 (`tick_visual_fingerprint`) に混ぜる。
+    pub device_spectra_digest: u64,
     /// docs/plan_modulation.md §4.2 / r.md #89: audio engine が publish した
     /// 変調値面 (**`ModSource::id` キー** — SSoT は `common/src/mod_plane.rs`)。
     /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が
@@ -148,8 +212,8 @@ pub struct TransportState {
 
 impl TransportState {
     /// 起動時の状態 (停止中、 ループ無し、 メーターは track 数ぶんの無音)。
-    /// `track_peak_display` は曲の track 数に揃えた `(peak_l, peak_r, hold)` の列。
-    pub fn new(track_peak_display: Vec<(f32, f32, f32)>) -> Self {
+    /// `track_peak_display` は曲の track 数に揃えた `(peak_l, peak_r)` の列。
+    pub fn new(track_peak_display: Vec<(f32, f32)>) -> Self {
         Self {
             metronome_enabled: false,
             is_playing: false,
@@ -161,7 +225,10 @@ impl TransportState {
             panic_release_pending: false,
             master_meter: crate::master_meter::MasterMeterSnapshot::default(),
             track_peak_display,
-            master_strip_gr: (0.0, 0.0),
+            native_gr: NativeGrDisplay::default(),
+            master_limiter_gr: 0.0,
+            device_spectra: std::collections::HashMap::new(),
+            device_spectra_digest: 0,
             mod_plane: common::mod_plane::ModPlane::default(),
             track_voices: Vec::new(),
             pending_play: None,
@@ -175,5 +242,50 @@ impl TransportState {
             pending_video_export_dims: None,
             pending_export: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeGrDisplay;
+
+    /// r.md #49: `DeviceSpectrumTick` は tick 扱い (中身が変わらなければ再描画しない) なので、スペクトラムの
+    /// 表示の変化は指紋に入っていなければならない (入っていないと動いているスペクトラムが凍る)。別タブの tick は
+    /// 取り込まないので指紋も動かない。
+    #[test]
+    fn device_spectrum_ticks_move_the_redraw_fingerprint_only_when_the_display_changes() {
+        use crate::app::AppEvent;
+        let mut app = crate::test_support::headless_app();
+        let project = app.cur.key;
+        let tick = |app: &mut crate::app::AppData, project, visual_digest| {
+            let spectra = vec![(7, std::sync::Arc::from(vec![-20.0_f32; 4]))];
+            app.handle_event(AppEvent::DeviceSpectrumTick { project, spectra, visual_digest });
+            app.tick_visual_fingerprint()
+        };
+        let first = tick(&mut app, project, 1);
+        assert_eq!(tick(&mut app, project, 1), first, "同じ表示の tick は指紋を動かさない");
+        assert_ne!(tick(&mut app, project, 2), first, "表示が変われば再描画する");
+        let now = app.tick_visual_fingerprint();
+        let other = common::protocol::ProjectKey(project.0.wrapping_add(1));
+        assert_eq!(tick(&mut app, other, 3), now, "別タブの tick は取り込まない");
+    }
+
+    /// 1 tick で「面にある id の更新 / 間に挟まる新しい id の追加 / 面から消えた id の減衰と破棄」が混ざっても、
+    /// id 昇順のまま正しい id に効く (マージ走査の取り違えが無い)。
+    #[test]
+    fn gr_display_merges_a_sorted_plane_into_sorted_entries() {
+        let mut d = NativeGrDisplay::default();
+        d.update(&[(10, -6.0), (30, -3.0)], 0.5);
+        d.update(&[(20, -4.0), (30, -9.0), (40, -1.0)], 0.5);
+        let ids: Vec<u64> = d.iter().map(|e| e.0).collect();
+        assert_eq!(ids, [10, 20, 30, 40], "減衰中の 10 は残り、20 / 40 が順序どおりに入る");
+        assert!(d.get(10) > 0.0 && d.get(10) < 6.0, "面から消えた 10 は減衰する: {}", d.get(10));
+        assert_eq!(d.get(20), 4.0, "新しい id はその値");
+        assert!(d.get(30) >= 9.0, "深くなった 30 は即座に追従する: {}", d.get(30));
+        assert_eq!(d.get(40), 1.0);
+        for _ in 0..200 {
+            d.update(&[(30, 0.0)], 0.5);
+        }
+        assert_eq!(d.iter().map(|e| e.0).collect::<Vec<_>>(), [30], "0 に収束した id は捨て、面にある id は残す");
     }
 }

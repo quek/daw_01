@@ -38,6 +38,7 @@ pub mod tab_view;
 pub mod text_input;
 pub mod toggle_button;
 pub mod waveform;
+pub mod xy_point;
 
 use std::any::Any;
 

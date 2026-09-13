@@ -171,14 +171,17 @@ fn reopening_project_whose_saved_ports_differ_from_the_db_stays_clean() {
         has_audio_output: true,
         ..PortConfig::default()
     };
-    let device_index = app
+    // `flat_index` はチェーン上の位置 (組み込み native の後ろ)、`plugin_index` は
+    // `fake_plugin_loaded` が使う `plugins()` 基準の位置。
+    let (flat_index, plugin_index) = app
         .edit_song(|song| {
             let devices = &mut song.tracks[0].devices;
             devices.push(Device::Plugin(PluginInstance {
                 id: 5001,
                 ..PluginInstance::with_ports("test.fx".into(), PluginFormat::Clap, saved_ports)
             }));
-            (devices.len() - 1) as u32
+            let plugins = common::model::plugins(devices).count();
+            (devices.len() - 1, (plugins - 1) as u32)
         })
         .expect("edit_song");
     common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
@@ -189,10 +192,34 @@ fn reopening_project_whose_saved_ports_differ_from_the_db_stays_clean() {
 
     // track id は load の `ensure_ids()` で採番されるので、開いた後に読む。
     let track_id = app.cur.song_doc.song().tracks[0].id;
-    fake_plugin_loaded(&mut app, track_id, device_index, "test.fx");
+    fake_plugin_loaded(&mut app, track_id, plugin_index, "test.fx");
     assert_eq!(
-        app.cur.song_doc.song().tracks[0].devices[device_index as usize].as_plugin().unwrap().ports, saved_ports,
+        app.cur.song_doc.song().tracks[0].devices[flat_index].as_plugin().unwrap().ports, saved_ports,
         "保存済みの port 構成は DB に上書きされない"
     );
     assert!(!app.cur.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");
+}
+
+/// r.md #129 F-G3: v38 (内蔵ストリップ時代) の曲を開いた直後も clean。migration が組み込み native を
+/// 補い、レーンの住所を実 id に書き換えるのは **読み込みの一部** で、編集ではない。新規タブも同じ。
+#[test]
+fn opening_a_v38_strip_project_stays_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("v38_strips.daw");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../common/tests/fixtures/v38_strips.daw");
+    std::fs::copy(&fixture, &proj).expect("copy v38 fixture");
+
+    let (mut app, _audio_rx, _plugin_rx, _dispatcher) = support::build_app();
+    app.handle_event(AppEvent::OpenRecent(proj.clone()));
+    assert_eq!(app.cur.song_doc.file_path.as_ref(), Some(&proj), "開けている");
+    let song = app.cur.song_doc.song();
+    assert!(
+        song.tracks.iter().all(|t| t.devices.iter().filter_map(|d| d.as_native()).filter(|n| n.builtin).count() == 2),
+        "全トラックに組み込み Comp / EQ"
+    );
+    assert!(!app.cur.song_doc.is_dirty(), "v38 を開いた直後に '*' が付いてはいけない");
+    assert!(!app.cur.song_doc.can_undo(), "読み込みの migration は undo 履歴を作らない");
+
+    app.handle_event(AppEvent::Tab(daw_gui::event_tabs::TabEvent::New));
+    assert!(!app.cur.song_doc.is_dirty(), "新規タブも clean");
 }

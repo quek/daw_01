@@ -16,6 +16,7 @@
 //! - press → 4px 未満で release → text input mode (`editing_text = true`)、 内部 `text_input_at_focused`
 //!   が IME / 選択 / Esc rollback / Enter commit を担う
 //! - text input mode Enter → committed_text を `format` で parse + range clamp + `on_change(parsed)`
+//!   (書式がラベルで名指しする値 = [`ScrubableNumberFormat::labeled_value`] は clamp しない)
 //! - text input mode Esc / focus loss → 静かに rollback (= 元 value 表示に戻る)
 
 use std::hash::Hash;
@@ -54,6 +55,18 @@ pub enum ScrubableNumberFormat {
     /// 下端が `"0.00"` に潰れ、 下端に合わせれば上端が欄からはみ出す。 有効数字なら
     /// **どこを掴んでも同じ桁数の情報**が出て、 幅もほぼ一定に収まる。
     Significant { digits: u8 },
+    /// [`Self::Significant`] と同じ表記で、 **値 0 だけ** `zero` のラベルで表す。
+    ///
+    /// 「0 = 無効」 を下端に持つ欄 (左へ回し切ると OFF になるフィルタ周波数など) のための書式。
+    /// 数値の `"0"` のままだと「0 Hz で効いている」 のか「効いていない」 のかが読めない。
+    /// 入力は `zero` ラベル (前後空白を除き ASCII 大文字小文字を無視) を 0 として受け、 それ以外は
+    /// 素の数字。 ラベル文字列は caller が渡す (UI ライブラリは何が OFF なのかを知らない)。
+    SignificantZeroLabeled {
+        /// 有効数字の桁数 ([`Self::Significant`] と同じ)。
+        digits: u8,
+        /// 値 0 のラベル (例: `"OFF"`)。
+        zero: &'static str,
+    },
     /// 1-based **小節.拍** 表記。 内部値は 4 分音符 beat、 `beats_per_bar` は 1 小節
     /// の beat 数 (4/4 → 4)。 表示は末尾の不要な 0 / 小数点を落とす (例 `8.0` beat →
     /// `"3.1"`、 `9.5` beat → `"3.2.5"`)。 入力は最初の `.` で小節と拍を分割し、
@@ -82,6 +95,18 @@ pub enum ScrubableNumberFormat {
         /// 表示数字 = `|値| × scale` の倍率 (pan の `-1..1` → `0..100` なら `100.0`)。
         scale: f64,
     },
+    /// **段 index ↔ caller が渡したラベル** (`labels[i]` が段 `i` の表記)。 段階式の値
+    /// (`"2:1"` / `"4:1"` / `"10:1"`、 `"0.1s"` … `"Auto"`) を段の番号でなく表記そのもので出す。
+    ///
+    /// 表示は `labels[round(値).clamp(0, len - 1)]` (非有限値は先頭)。 入力は表示と同じ土俵
+    /// (WYSIWYG) で受ける: 前後空白を除き ASCII 大文字小文字を無視した完全一致、 無ければ
+    /// **先頭の数字部分が等しいラベル** (`"3"` → `"3ms"`、 `"10"` → `"10:1"`)。 どちらも無ければ
+    /// `None`。 ラベル配列は caller が渡す ([`Self::SignedLabeled`] と同じ作法で、 UI ライブラリは
+    /// 段が何を意味するかを知らない)。
+    Choices {
+        /// 段 `i` の表記。 空配列は表示が空文字列、 入力は常に `None`。
+        labels: &'static [&'static str],
+    },
 }
 
 impl ScrubableNumberFormat {
@@ -96,6 +121,37 @@ impl ScrubableNumberFormat {
     #[must_use]
     pub fn parse_value(self, text: &str) -> Option<f64> {
         parse_value(text, self)
+    }
+
+    /// 書式がラベルで名指しする値 ([`Self::SignificantZeroLabeled`] の 0)。 drag の range
+    /// ([`ScrubableNumberStyle::range`]) の外に置かれる値 (左へ回し切ると OFF の欄の 0) でも、
+    /// 欄が表示する表記そのものなので、 打って確定したらそのまま受ける (range へ clamp しない)。
+    #[must_use]
+    pub fn labeled_value(self) -> Option<f64> {
+        match self {
+            Self::SignificantZeroLabeled { .. } => Some(0.0),
+            Self::Integer
+            | Self::Decimal(_)
+            | Self::Significant { .. }
+            | Self::BarBeat { .. }
+            | Self::SignedLabeled { .. }
+            | Self::Choices { .. } => None,
+        }
+    }
+
+    /// `value` の表記の後ろに単位 ([`ScrubableNumberStyle::unit`]) を付けてよいか。 数値でなく
+    /// ラベルを出す値 ([`Self::SignificantZeroLabeled`] の 0) では付けない (`"OFF Hz"` にしない)。
+    #[must_use]
+    pub fn unit_applies(self, value: f64) -> bool {
+        match self {
+            Self::SignificantZeroLabeled { .. } => value.is_finite() && value != 0.0,
+            Self::Integer
+            | Self::Decimal(_)
+            | Self::Significant { .. }
+            | Self::BarBeat { .. }
+            | Self::SignedLabeled { .. }
+            | Self::Choices { .. } => true,
+        }
     }
 }
 
@@ -377,10 +433,19 @@ fn format_value(value: f64, format: ScrubableNumberFormat) -> String {
             format!("{:.*}", usize::from(n), value)
         }
         ScrubableNumberFormat::Significant { digits } => format_significant(value, digits),
+        ScrubableNumberFormat::SignificantZeroLabeled { digits, zero } => {
+            // 非有限値は `format_significant` と同じく 0 扱い (= ラベル)。
+            if !value.is_finite() || value == 0.0 {
+                zero.to_string()
+            } else {
+                format_significant(value, digits)
+            }
+        }
         ScrubableNumberFormat::BarBeat { beats_per_bar } => format_bar_beat(value, beats_per_bar),
         ScrubableNumberFormat::SignedLabeled { neg, pos, center, scale } => {
             format_signed_labeled(value, neg, pos, center, scale)
         }
+        ScrubableNumberFormat::Choices { labels } => format_choice(value, labels),
     }
 }
 
@@ -392,11 +457,53 @@ fn parse_value(text: &str, format: ScrubableNumberFormat) -> Option<f64> {
         ScrubableNumberFormat::Decimal(_) | ScrubableNumberFormat::Significant { .. } => {
             trimmed.parse::<f64>().ok()
         }
+        ScrubableNumberFormat::SignificantZeroLabeled { zero, .. } => {
+            if !zero.is_empty() && trimmed.eq_ignore_ascii_case(zero) {
+                Some(0.0)
+            } else {
+                trimmed.parse::<f64>().ok()
+            }
+        }
         ScrubableNumberFormat::BarBeat { beats_per_bar } => parse_bar_beat(trimmed, beats_per_bar),
         ScrubableNumberFormat::SignedLabeled { neg, pos, center, scale } => {
             parse_signed_labeled(trimmed, neg, pos, center, scale)
         }
+        ScrubableNumberFormat::Choices { labels } => parse_choice(trimmed, labels),
     }
+}
+
+/// 段 index → ラベル ([`ScrubableNumberFormat::Choices`])。 index は四捨五入して範囲へ丸め、
+/// 非有限値は先頭。 ラベルが無ければ空文字列。
+fn format_choice(value: f64, labels: &[&str]) -> String {
+    let Some(last) = labels.len().checked_sub(1) else {
+        return String::new();
+    };
+    let index = if value.is_finite() { value.round().clamp(0.0, last as f64) as usize } else { 0 };
+    labels[index.min(last)].to_string()
+}
+
+/// ラベル → 段 index ([`ScrubableNumberFormat::Choices`])。 完全一致 (ASCII 大文字小文字無視) を
+/// 先に、 無ければ先頭の数字部分が等しい最初のラベル。
+fn parse_choice(text: &str, labels: &[&str]) -> Option<f64> {
+    let t = text.trim();
+    if let Some(i) = labels.iter().position(|l| l.trim().eq_ignore_ascii_case(t)) {
+        return Some(i as f64);
+    }
+    let wanted = leading_number(t)?;
+    labels
+        .iter()
+        .position(|l| leading_number(l.trim()).is_some_and(|n| (n - wanted).abs() <= f64::EPSILON * wanted.abs().max(1.0)))
+        .map(|i| i as f64)
+}
+
+/// 文字列の先頭の数字部分 (`"0.3ms"` → `0.3`、 `"10:1"` → `10`)。 符号は先頭だけ許す。
+/// 数字で始まらなければ `None`。
+fn leading_number(s: &str) -> Option<f64> {
+    let end = s
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+'))))
+        .map_or(s.len(), |(i, _)| i);
+    s[..end].parse::<f64>().ok()
 }
 
 /// 確定テキストを parse する前に **末尾の単位表記を剥がす** ([`ScrubableNumberStyle::unit`])。
@@ -865,8 +972,12 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 && let Some(text) = &inner_resp.committed_text
                 && let Some(parsed) = parse_with_unit(text, format, style.unit)
             {
-                // clamp_opt と同じ防御 (反転 / 非有限 range で panic しない)。
-                let final_value = clamp_opt(parsed, style.range);
+                // 書式がラベルで名指しする値 ("OFF" = 0) は range の外でもそのまま受ける
+                // (`labeled_value`)。それ以外は clamp_opt (反転 / 非有限 range で panic しない)。
+                let final_value = match format.labeled_value() {
+                    Some(labeled) if (parsed - labeled).abs() <= f64::EPSILON => labeled,
+                    _ => clamp_opt(parsed, style.range),
+                };
                 if (final_value - value).abs() > f64::EPSILON {
                     self.push_edit(on_change(final_value));
                 }
@@ -904,7 +1015,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             };
             // 単位は **数値のとき** だけ。 placeholder (`"—"` = 値が割れている) の後ろに
             // 単位を出すと「割れているのに 1 つの量が確定している」 という嘘になる。
-            let unit = if show_placeholder.is_some() { "" } else { style.unit };
+            // 数値でなくラベルを出す値 (`SignificantZeroLabeled` の 0 = "OFF") も同じ理屈で付けない。
+            let unit =
+                if show_placeholder.is_some() || !format.unit_applies(displayed_value) { "" } else { style.unit };
             // input_hash で cache: 同じ表示値 / 同じ rect / 同じ bg なら再描画 skip。
             let input_hash = hash_inputs((
                 b"scrubable_number",
@@ -1425,6 +1538,89 @@ mod tests {
 
     fn pan_format() -> ScrubableNumberFormat {
         ScrubableNumberFormat::SignedLabeled { neg: "L", pos: "R", center: "C", scale: 100.0 }
+    }
+
+    /// `Choices`: 表示は段のラベル、入力はラベルの完全一致 (大文字小文字無視) → 先頭の数字部分の
+    /// 一致の順。どちらにも当たらなければ `None` (= 入力欄は値を変えない)。
+    #[test]
+    fn choices_format_and_parse_by_label() {
+        const TIMES: &[&str] = &["0.1ms", "0.3ms", "1ms", "3ms", "10ms", "30ms"];
+        const RELEASE: &[&str] = &["0.1s", "0.3s", "0.6s", "1.2s", "Auto"];
+        let times = ScrubableNumberFormat::Choices { labels: TIMES };
+        let release = ScrubableNumberFormat::Choices { labels: RELEASE };
+        assert_eq!(release.format_value(4.0), "Auto");
+        assert_eq!(times.format_value(2.6), "3ms", "段は四捨五入");
+        assert_eq!(times.format_value(99.0), "30ms", "範囲外は端の段");
+        assert_eq!(times.format_value(f64::NAN), "0.1ms");
+
+        assert_eq!(release.parse_value(" auto "), Some(4.0), "完全一致は大文字小文字を無視");
+        assert_eq!(times.parse_value("3"), Some(3.0), "先頭の数字部分が等しいラベル");
+        assert_eq!(times.parse_value("0.30"), Some(1.0));
+        assert_eq!(times.parse_value("5"), None, "どのラベルとも一致しない");
+        assert_eq!(times.parse_value("abc"), None);
+        assert_eq!(ScrubableNumberFormat::Choices { labels: &[] }.parse_value("1"), None);
+    }
+
+    /// `SignificantZeroLabeled`: 0 だけラベル、それ以外は有効数字。入力はラベルを 0 として受ける。
+    #[test]
+    fn significant_zero_labeled_names_only_zero() {
+        let f = ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" };
+        assert_eq!(f.format_value(0.0), "OFF");
+        assert_eq!(f.format_value(150.0), "150");
+        assert_eq!(f.format_value(0.5), "0.5");
+        assert_eq!(f.parse_value("off"), Some(0.0));
+        assert_eq!(f.parse_value("150"), Some(150.0));
+        assert_eq!(f.parse_value("of"), None);
+        assert!(!f.unit_applies(0.0) && f.unit_applies(150.0), "ラベルの後ろには単位を付けない");
+    }
+
+    /// 欄が表示するラベル (`"OFF"`) や、ラベルが表す値 (`"0"`) を打って確定すると、drag の range
+    /// (20..16000) の外でもその値になる (range の下端へ clamp して 20 に化けない)。range 内の数値は
+    /// 従来どおり clamp する。
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn typing_the_zero_label_commits_zero_outside_the_drag_range() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+        let key = |physical_key: PhysicalKey, text: Option<&str>| KeyEvent {
+            state: ElementState::Pressed,
+            text: text.map(Into::into),
+            physical_key,
+            repeat: false,
+        };
+        let format = ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" };
+        let style = ScrubableNumberStyle {
+            range: Some((20.0, 16_000.0)),
+            curve: ScrubCurve::Log,
+            unit: "Hz",
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
+        };
+        let commit = |typed: &str| -> f64 {
+            let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+            let mut model = BpmModel { bpm: 150.0 };
+            let center = (40.0_f32, 14.0_f32);
+            let frames = [
+                FrameInput { pointer: press_at(center, false), ..Default::default() },
+                FrameInput { pointer: release_at(center), ..Default::default() },
+                FrameInput::default(),
+                FrameInput { keyboard: vec![key(PhysicalKey::Char('X'), Some(typed))], ..Default::default() },
+                FrameInput { keyboard: vec![key(PhysicalKey::Enter, None)], ..Default::default() },
+            ];
+            for input in frames {
+                let value = model.bpm;
+                let edits = host.frame_to_edits(&model, &mut Scene::new(), PhysicalSize { width: 200, height: 100 }, input, |_, ui| {
+                    ui.scrubable_number_at("sc", rect_default(), value, 0.0, format, &style, |v| Edit::mutate(move |m: &mut BpmModel| m.bpm = v), None, None);
+                });
+                for e in edits {
+                    e.apply(&mut model);
+                }
+            }
+            model.bpm
+        };
+        assert_eq!(commit("OFF"), 0.0, "ラベルを打つと OFF (0)");
+        assert_eq!(commit("0"), 0.0, "ラベルが表す値を打っても OFF (0)");
+        assert_eq!(commit("-0"), 0.0);
+        assert_eq!(commit("5"), 20.0, "range の外の数値は従来どおり clamp");
+        assert_eq!(commit("300"), 300.0);
     }
 
     /// drag 上方向 (= dy negative) で値が増加、 sensitivity が units_per_pixel として効く。

@@ -1,40 +1,48 @@
-//! マスターパネル内のマスターストリップ UI (バスコンプ + トーン EQ + リミッター)。
+//! マスターパネル内の組み込みブロック (Bus Comp + Tone EQ + フェーダー後 Limiter)。
 //!
-//! 設計正本は [docs/plan_master_strip.md](../../../docs/plan_master_strip.md) §3。
+//! 設計正本は [docs/plan_rack_native_devices.md](../../../docs/plan_rack_native_devices.md) §10.9
+//! (r.md #129 Q17)。置き場と寸法は [docs/plan_master_strip.md](../../../docs/plan_master_strip.md) §3。
 //! MASTER セクションの **数値欄の列**を上下に割った上側に置く (LU バーとフェーダーは
 //! 全高のまま = コンプの GR とフェーダーが必ず並んで見える)。
 //!
 //! ```text
-//! | COMP    ( 針メーター )  |   ← 上から信号順
-//! | Thr Rat Atk Rel Gain   |
+//! | COMP    ( 針メーター )  |   ← Bus Comp と Tone EQ の上下は Rack での前後に合わせる
+//! | Thr Ratio Atk Rel Gain |
 //! |------------------------|
 //! | EQ    ~~ curve ~~      |
-//! | Lo   LoMid   Hi        |
+//! | Low  LoMid  High       |
 //! |------------------------|
-//! | LIM  ########   -1.0   |
+//! | LIM  ########   -1.0   |   ← Limiter はフェーダーの後なので常に一番下
 //! ```
 //!
-//! ON/OFF ボタンは置かない — カーソルを乗せて `Q` (通常 ch のストリップと同じ作法)。
+//! 値の持ち主は master の **組み込み Bus Comp / Tone EQ** (`Device::Native`) とフェーダー後の
+//! `Song::master_limiter`。つまみ / カーブ / GR は Mixer 帯・Rack Par と共有の
+//! [`crate::view::native_device`] で描く (再生中はレーン値に追従し、ジェスチャーと変調を持つ)。
+//! ON/OFF ボタンは置かない — カーソルを乗せて `Q` (通常 ch の帯と同じ作法)。
 
-use std::sync::Arc;
-
-use common::automation::{norm_to_plain, plain_to_norm};
-use common::channel_strip_dsp::{master_eq_magnitude_db, master_eq_stages};
 use common::model::{
-    AutomationTarget, MASTER_EQ_LIMIT_DB, MASTER_GR_METER_RANGE_DB, MasterEqBand, MasterStrip,
-    MasterStripParam,
+    AutomationTarget, BusCompParam, GR_METER_RANGE_DB, MASTER_TRACK_ID, NativeDevice, NativeKind, NativeParamId,
+    RackPanelKey, Song, ToneEqBand,
 };
-use daw_ui_core::{Edit, KnobStyle, NeedleMeterStyle, NeedleScale, Ui};
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_core::{NeedleMeterStyle, NeedleScale, Ui};
+use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent};
-use crate::automation_value::automation_value_display;
-use crate::event::MasterSection;
+use crate::app::{AppData, ParamSurface};
+use crate::handler::bypass_target::BypassTarget;
+use crate::handler::view_model::LiveParamScope;
+use crate::view::native_device::{
+    CurveLook, EqCurveSource, LIMITER_GR_SEGMENTS, NativeKnobSpec, ParamOwner, draw_eq_curve, draw_gr_segments,
+    limiter_knob, native_knob, wid,
+};
+use crate::view::strip_sections::hover_readout;
+
+/// このブロック群の描画面 (widget id とジェスチャー所有者の鍵)。
+const SURFACE: ParamSurface = ParamSurface::MasterPanel;
 
 /// 針式 GR メーターの高さ (px)。マスターで最初に見る物なので、ノブ 2 行ぶんより
 /// 大きく取る (文字盤の余白は widget 側で詰めてある)。
 const METER_H: f32 = 72.0;
-/// ノブ 1 個の直径 (px)。通常 ch のストリップと揃える。
+/// ノブ 1 個の直径 (px)。通常 ch の帯と揃える。
 const KNOB: f32 = 20.0;
 /// ノブ同士の間隔。
 const KNOB_GAP: f32 = 6.0;
@@ -49,6 +57,8 @@ const ROW_H: f32 = LABEL_H + KNOB + 3.0;
 const CURVE_H: f32 = 40.0;
 /// リミッターの GR セグメント行の高さ。
 const LIM_BAR_H: f32 = 10.0;
+/// Ceiling の数値欄の高さ (ノブと縦センタで揃える)。
+const VALUE_H: f32 = 16.0;
 /// ブロック間の隙間。
 const BLOCK_GAP: f32 = 4.0;
 
@@ -59,65 +69,131 @@ const EQ_H: f32 = CURVE_H + ROW_H;
 /// リミッターブロックの高さ (セグメント + ノブ 1 行)。
 const LIM_H: f32 = LIM_BAR_H + ROW_H;
 
-/// カーブの横軸 (Hz) と縦軸 (±dB)。トーン EQ は ±6dB なので縦軸もそれに合わせる。
-const CURVE_F_MIN: f32 = 20.0;
-/// [`CURVE_F_MIN`] の対。
-const CURVE_F_MAX: f32 = 20_000.0;
-/// カーブのサンプル点数。
-const CURVE_POINTS: usize = 64;
-/// カーブ描画に使うサンプリング周波数 (可聴域の形は実 SR に依らない)。
-const CURVE_SR: f32 = 48_000.0;
+/// Bus Comp のノブ 2 行と、触れていないときに出す行の名前。
+const BUS_COMP_ROWS: [(&[NativeParamId], &str); 2] = [
+    (
+        &[
+            NativeParamId::BusComp(BusCompParam::Threshold),
+            NativeParamId::BusComp(BusCompParam::Ratio),
+            NativeParamId::BusComp(BusCompParam::Attack),
+        ],
+        "Thr Ratio Atk",
+    ),
+    (&[NativeParamId::BusComp(BusCompParam::Release), NativeParamId::BusComp(BusCompParam::Makeup)], "Rel Makeup"),
+];
+/// Tone EQ のノブ 1 行。
+const TONE_EQ_PARAMS: [NativeParamId; 3] = [
+    NativeParamId::ToneEq(ToneEqBand::Low),
+    NativeParamId::ToneEq(ToneEqBand::LoMid),
+    NativeParamId::ToneEq(ToneEqBand::High),
+];
 
-/// リミッターの GR セグメント数 (1 セグメント = 1dB、Mixbus と同じ粒度)。
-const LIM_SEGMENTS: usize = 12;
-
-/// このストリップが要求する高さ (px)。`master_panel` がラウドネス数値欄との
-/// 上下分割に使う。
+/// このブロック群が要求する高さ (px)。`master_panel` がラウドネス数値欄との
+/// 上下分割に使う。並びが入れ替わっても総高は変わらない。
 #[must_use]
 pub fn desired_height() -> f32 {
     COMP_H + EQ_H + LIM_H + BLOCK_GAP * 2.0
 }
 
-/// マスターストリップを描く。`rect` は数値欄の列の上側 (高さは caller が決める)。
-///
-/// 高さが足りないときは **下のブロックから諦める** (Comp → EQ → LIM の優先順)。
-/// コンプの GR が最後まで残るのは、マスターで最初に見たいのがそれだから。
-pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
-    let strip = app.cur.song_doc.song().master_strip;
-    let mut y = rect.y;
-    let mut hovered: Option<MasterSection> = None;
-    let ptr = ui.pointer().pos;
-    let hit = |r: Rect, s: MasterSection, hovered: &mut Option<MasterSection>| {
-        if ptr.is_some_and(|(px, py)| r.contains(px, py)) {
-            *hovered = Some(s);
+/// マスターパネルの 1 ブロック。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    BusComp,
+    ToneEq,
+    Limiter,
+}
+
+impl Block {
+    fn height(self) -> f32 {
+        match self {
+            Self::BusComp => COMP_H,
+            Self::ToneEq => EQ_H,
+            Self::Limiter => LIM_H,
         }
+    }
+}
+
+/// 全ブロックが共有する引数の束。
+struct MasterCtx<'a> {
+    app: &'a AppData,
+    /// master の store (`song_lanes` / `song_mod_routings`)。
+    owner: ParamOwner<'a>,
+    scope: &'a LiveParamScope,
+    /// つまみが載っている面の色 (マスターパネルの地)。
+    bg: Color,
+}
+
+/// 組み込みブロックを描き、**カーソル直下のブロックの `Q` の宛先を返す** (書き込みは
+/// `master_panel` が 1 か所で行う。§18-AB)。`rect` は数値欄の列の上側 (高さは caller が決める)。
+///
+/// 高さが足りないときに何を描くかは優先度 (Bus Comp > Tone EQ > Limiter) で決め、描くと決めた
+/// ものを表示の並び (Bus Comp / Tone EQ はチェーン上の前後、Limiter は一番下) で積む。
+/// コンプの GR が最後まで残るのは、マスターで最初に見たいのがそれだから。
+pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) -> Option<BypassTarget> {
+    let song = app.cur.song_doc.song();
+    let (bus, tone, tone_first) = builtin_pair(song);
+    let scope = app.live_param_scope();
+    let ctx = MasterCtx { app, owner: ParamOwner::master(song), scope: &scope, bg: app.theme.core.panel_raised };
+    let ptr = ui.pointer().pos;
+    let mut hovered: Option<BypassTarget> = None;
+    let mut y = rect.y;
+    for block in visible_blocks(rect.h, tone_first).into_iter().flatten() {
+        let r = Rect { y, h: block.height(), ..rect };
+        // 組み込みが一時的に見つからなければ場所だけ確保し、描かず hover も出さない。
+        let target = match block {
+            Block::BusComp => bus.map(|d| {
+                draw_bus_comp(&ctx, ui, r, d);
+                BypassTarget::Device(d.id)
+            }),
+            Block::ToneEq => tone.map(|d| {
+                draw_tone_eq(&ctx, ui, r, d);
+                BypassTarget::Device(d.id)
+            }),
+            Block::Limiter => {
+                draw_limiter(&ctx, ui, r);
+                Some(BypassTarget::MasterLimiter)
+            }
+        };
+        if ptr.is_some_and(|(px, py)| r.contains(px, py)) && target.is_some() {
+            hovered = target;
+        }
+        y += block.height() + BLOCK_GAP;
+    }
+    hovered
+}
+
+/// master の組み込み Bus Comp / Tone EQ と、チェーン上で Tone EQ が Bus Comp より前か。
+fn builtin_pair(song: &Song) -> (Option<&NativeDevice>, Option<&NativeDevice>, bool) {
+    let (mut bus, mut tone, mut tone_first) = (None, None, false);
+    for dev in song.builtin_natives(MASTER_TRACK_ID) {
+        match dev.kind() {
+            NativeKind::BusComp if bus.is_none() => bus = Some(dev),
+            NativeKind::ToneEq if tone.is_none() => {
+                tone = Some(dev);
+                tone_first = bus.is_none();
+            }
+            _ => {}
+        }
+    }
+    (bus, tone, tone_first)
+}
+
+/// 高さ `h` に描くブロックを表示の並びで返す (描かないものは `None`)。
+fn visible_blocks(h: f32, tone_first: bool) -> [Option<Block>; 3] {
+    let mut used: Option<f32> = None;
+    let mut fits = |block: Block| {
+        let need = used.map_or(block.height(), |u| u + BLOCK_GAP + block.height());
+        let ok = need <= h;
+        if ok {
+            used = Some(need);
+        }
+        ok.then_some(block)
     };
-
-    if y + COMP_H <= rect.y + rect.h {
-        let block = Rect { y, h: COMP_H, ..rect };
-        draw_comp(app, ui, block, &strip);
-        hit(block, MasterSection::Comp, &mut hovered);
-        y += COMP_H + BLOCK_GAP;
-    }
-    if y + EQ_H <= rect.y + rect.h {
-        let block = Rect { y, h: EQ_H, ..rect };
-        draw_eq(app, ui, block, &strip);
-        hit(block, MasterSection::Eq, &mut hovered);
-        y += EQ_H + BLOCK_GAP;
-    }
-    if y + LIM_H <= rect.y + rect.h {
-        let block = Rect { y, h: LIM_H, ..rect };
-        draw_limiter(app, ui, block, &strip);
-        hit(block, MasterSection::Limiter, &mut hovered);
-    }
-
-    // Q キー (= 「カーソル直下のものを無効化」) の対象面。master パネルは毎フレーム
-    // 描かれるので、ここの値が古くなることはない。
-    if app.cur.peph.master_hovered_section != hovered {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.cur.peph.master_hovered_section = hovered;
-        }));
-    }
+    // 優先度の順に判定する。
+    let bus = fits(Block::BusComp);
+    let tone = fits(Block::ToneEq);
+    let limiter = fits(Block::Limiter);
+    if tone_first { [tone, bus, limiter] } else { [bus, tone, limiter] }
 }
 
 /// ブロックの「面」の色。**ON は窪んだ井戸 (`window_bg`) / OFF はパネルと同じ面
@@ -128,7 +204,7 @@ fn block_bg(app: &AppData, on: bool) -> Color {
     if on { p.window_bg } else { p.panel_raised }
 }
 
-/// OFF のブロックのノブ行を半透明のパネル色で覆って沈める (= バイパスされた
+/// OFF のブロックを半透明のパネル色で覆って沈める (= バイパスされた
 /// プラグインがグレーアウトする DAW の作法)。ノブは触れるまま — 触ると自動で ON
 /// になるので、沈んでいても操作の入口として残す。
 fn dim_if_off(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, on: bool) {
@@ -146,25 +222,25 @@ fn dim_if_off(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, on: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Comp
+// Bus Comp
 // ---------------------------------------------------------------------------
 
-fn draw_comp<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, strip: &MasterStrip) {
+fn draw_bus_comp(ctx: &MasterCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect, bus: &NativeDevice) {
+    let app = ctx.app;
     let p = &app.theme.core;
-    // ---- 針式 GR メーター ----
-    let meter = Rect { h: METER_H - 2.0, ..rect };
-    let gr = app.cur.transport.master_strip_gr.0;
+    let on = !bus.bypassed;
+    // ---- 針式 GR メーター (静的に OFF でも On レーンで効いていれば実際の GR を隠さない) ----
     let style = NeedleMeterStyle {
-        bg: block_bg(app, strip.comp.on),
-        needle: if strip.comp.on { app.theme.daw.strip_gr } else { p.text_dim },
+        bg: block_bg(app, on),
+        needle: if on { app.theme.daw.strip_gr } else { p.text_dim },
         ..NeedleMeterStyle::from_palette(p)
     };
     ui.needle_meter(
-        "master_comp_gr",
-        meter,
-        if strip.comp.on { gr } else { 0.0 },
+        wid(SURFACE, RackPanelKey::Device(bus.id), "needle", ()),
+        Rect { h: METER_H - 2.0, ..rect },
+        app.cur.transport.native_gr.get(bus.id),
         NeedleScale {
-            range: (0.0, MASTER_GR_METER_RANGE_DB),
+            range: (0.0, GR_METER_RANGE_DB),
             // Reason の文字盤と同じ刻み。
             ticks: &[(0.0, "0"), (2.0, "2"), (4.0, "4"), (8.0, "8"), (12.0, "12"), (20.0, "20")],
             // 単位ラベルは置かない (文字盤が小さく、数字と重なって読みにくい)。
@@ -174,137 +250,61 @@ fn draw_comp<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, strip: 
     );
 
     // ---- ノブ 2 行 ----
-    let rows: [(&[MasterStripParam], &str); 2] = [
-        (
-            &[
-                MasterStripParam::CompThreshold,
-                MasterStripParam::CompRatio,
-                MasterStripParam::CompAttack,
-            ],
-            "Thr Ratio Atk",
-        ),
-        (
-            &[MasterStripParam::CompRelease, MasterStripParam::CompMakeup],
-            "Rel Gain",
-        ),
-    ];
     let mut y = rect.y + METER_H;
-    for (i, (params, name)) in rows.into_iter().enumerate() {
+    for (i, (params, name)) in BUS_COMP_ROWS.into_iter().enumerate() {
         let row = Rect { y, h: ROW_H, ..rect };
-        let hover = knob_row(app, ui, ("master_comp_row", i), row, params);
-        row_label(app, ui, ("master_comp_label", i), row, name, hover);
+        let hover = knob_row(ctx, ui, row, bus, params);
+        row_label(app, ui, wid(SURFACE, RackPanelKey::Device(bus.id), "row_label", i), row, name, hover);
         y += ROW_H;
     }
-    dim_if_off(app, ui, Rect { y: rect.y + METER_H, h: ROW_H * 2.0, ..rect }, strip.comp.on);
+    dim_if_off(app, ui, Rect { y: rect.y + METER_H, h: ROW_H * 2.0, ..rect }, on);
 }
 
 // ---------------------------------------------------------------------------
-// EQ
+// Tone EQ
 // ---------------------------------------------------------------------------
 
-fn draw_eq<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, strip: &MasterStrip) {
-    let p = &app.theme.core;
+fn draw_tone_eq(ctx: &MasterCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect, tone: &NativeDevice) {
+    let app = ctx.app;
+    let on = !tone.bypassed;
+    let key = RackPanelKey::Device(tone.id);
+    // ---- カーブ (形はレーン値を重ねた live 値、OFF は形を保って薄く描く) ----
     let curve = Rect { h: CURVE_H - 2.0, ..rect };
-    ui.panel("master_eq_curve_bg", curve, block_bg(app, strip.eq.on), 2.0);
-
-    // 0dB 基準線。
-    let mid_y = curve.y + curve.h * 0.5;
-    ui.push_rect(RectCommand {
-        rect: Rect { x: curve.x, y: mid_y, w: curve.w, h: 1.0 },
-        fill: p.border,
-        border: Color::TRANSPARENT,
-        border_width: 0.0,
-        radius: [0.0; 4],
-        clip_rect: None,
-    });
-
-    // 応答は daw_audio と同じ関数から取る (画面と音を別実装にしない)。
-    let stages = master_eq_stages(&strip.eq, CURVE_SR);
-    let color = if strip.eq.on { app.theme.daw.strip_eq_curve } else { p.text_dim };
-    let ratio = CURVE_F_MAX / CURVE_F_MIN;
-    let mut segs: Vec<LineSegment> = Vec::with_capacity(CURVE_POINTS);
-    let mut prev: Option<[f32; 2]> = None;
-    for i in 0..=CURVE_POINTS {
-        #[allow(clippy::cast_precision_loss)]
-        let t = i as f32 / CURVE_POINTS as f32;
-        let f = CURVE_F_MIN * ratio.powf(t);
-        let db = master_eq_magnitude_db(&stages, CURVE_SR, f)
-            .clamp(-MASTER_EQ_LIMIT_DB, MASTER_EQ_LIMIT_DB);
-        let x = curve.x + curve.w * t;
-        let y = mid_y - (db / MASTER_EQ_LIMIT_DB) * (curve.h * 0.5 - 1.0);
-        if let Some(pp) = prev {
-            segs.push(LineSegment { a: pp, b: [x, y], color });
-        }
-        prev = Some([x, y]);
+    ui.panel(wid(SURFACE, key, "curve_bg", ()), curve, block_bg(app, on), 2.0);
+    let live = app.live_native_device(ctx.scope, ctx.owner, tone);
+    if let Some(src) = EqCurveSource::from_params(&live.params) {
+        draw_eq_curve(app, ui, curve, &src, &CurveLook { active: on, spectrum_db: None });
     }
-    ui.push_lines(LineBatch {
-        segments: Arc::from(segs),
-        line_width_px: 1.0,
-        clip_rect: Some(curve),
-    });
 
     let row = Rect { y: rect.y + CURVE_H, h: ROW_H, ..rect };
-    let params: Vec<MasterStripParam> =
-        MasterEqBand::ALL.into_iter().map(MasterStripParam::EqGain).collect();
-    let hover = knob_row(app, ui, ("master_eq_row", 0), row, &params);
-    row_label(app, ui, ("master_eq_label", 0), row, "Lo LoMid Hi", hover);
-    dim_if_off(app, ui, row, strip.eq.on);
+    let hover = knob_row(ctx, ui, row, tone, &TONE_EQ_PARAMS);
+    row_label(app, ui, wid(SURFACE, key, "row_label", 0), row, "Low LoMid High", hover);
+    dim_if_off(app, ui, row, on);
 }
 
 // ---------------------------------------------------------------------------
 // Limiter
 // ---------------------------------------------------------------------------
 
-fn draw_limiter<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, strip: &MasterStrip) {
+fn draw_limiter(ctx: &MasterCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    let app = ctx.app;
+    let on = app.cur.song_doc.song().master_limiter.on;
     // ---- GR セグメント (1 個 = 1dB) ----
     let bar = Rect { h: LIM_BAR_H - 2.0, ..rect };
-    ui.panel("master_lim_bar_bg", bar, block_bg(app, strip.limiter.on), 2.0);
-    let gr = if strip.limiter.on { app.cur.transport.master_strip_gr.1 } else { 0.0 };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let lit = (gr.max(0.0) as usize).min(LIM_SEGMENTS);
-    #[allow(clippy::cast_precision_loss)]
-    let seg_w = (bar.w - 2.0) / LIM_SEGMENTS as f32;
-    for i in 0..lit {
-        #[allow(clippy::cast_precision_loss)]
-        let x = bar.x + 1.0 + seg_w * i as f32;
-        ui.push_rect(RectCommand {
-            rect: Rect { x, y: bar.y + 1.0, w: seg_w - 1.0, h: bar.h - 2.0 },
-            fill: app.theme.daw.strip_gr,
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [1.0; 4],
-            clip_rect: None,
-        });
-    }
+    let gr_id = wid(SURFACE, RackPanelKey::MasterLimiter, "gr", ());
+    // OFF の見せ方 (溝と塗りを薄く) は共有部品が持つ (Rack の行・Par と同じ見え方)。
+    draw_gr_segments(app, ui, gr_id, bar, app.cur.transport.master_limiter_gr, on, LIMITER_GR_SEGMENTS);
 
-    // ---- ノブ 1 個 + 常時表示の値 ----
+    // ---- ノブ 1 個 + 常時表示の数値欄 ----
     // この行はノブが 1 個で右側が空くので、hover を待たずに値をノブの横へ常に出す
-    // (見出しは行名のまま固定)。
+    // (見出しは行名のまま固定)。数値欄はクリックで入力 / ダブルクリックで既定値。
     let row = Rect { y: rect.y + LIM_BAR_H, h: ROW_H, ..rect };
-    let knob = Rect {
-        x: row.x + (row.w - KNOB).max(0.0) * 0.5,
-        y: row.y + LABEL_H,
-        w: KNOB,
-        h: KNOB,
-    };
-    let readout = master_knob(
-        app,
-        ui,
-        ("master_lim_row", 0, 0),
-        knob,
-        MasterStripParam::LimiterCeiling,
-    );
-    let value_rect = Rect {
-        x: knob.x + KNOB + KNOB_GAP,
-        y: knob.y + (KNOB - LABEL_H) * 0.5,
-        w: (row.x + row.w - (knob.x + KNOB + KNOB_GAP)).max(0.0),
-        h: LABEL_H,
-    };
-    let p = &app.theme.core;
-    let color = if readout.active { p.text } else { p.text_dim };
-    ui.label_at_clipped(("master_lim_value", 0), &readout.value, value_rect, LABEL_FONT, color);
-    row_label(app, ui, ("master_lim_label", 0), row, "Limiter Ceiling", None);
-    dim_if_off(app, ui, row, strip.limiter.on);
+    let knob = Rect { x: row.x + (row.w - KNOB).max(0.0) * 0.5, y: row.y + LABEL_H, w: KNOB, h: KNOB };
+    let value_x = knob.x + KNOB + KNOB_GAP;
+    let value = Rect { x: value_x, y: knob.y + (KNOB - VALUE_H) * 0.5, w: (row.x + row.w - value_x).max(0.0), h: VALUE_H };
+    limiter_knob(app, ui, SURFACE, knob, ctx.bg, ctx.scope, Some(value));
+    row_label(app, ui, wid(SURFACE, RackPanelKey::MasterLimiter, "row_label", 0), row, "Limiter Ceiling", None);
+    dim_if_off(app, ui, row, on);
 }
 
 // ---------------------------------------------------------------------------
@@ -312,46 +312,40 @@ fn draw_limiter<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect, stri
 // ---------------------------------------------------------------------------
 
 /// ノブを 1 行ぶん中央寄せで描く。戻り値は hover / drag 中のノブの読み出し文字列。
-fn knob_row<'a>(
-    app: &'a AppData,
-    ui: &mut Ui<'a, AppData>,
-    id: (&'static str, usize),
+fn knob_row(
+    ctx: &MasterCtx<'_>,
+    ui: &mut Ui<'_, AppData>,
     row: Rect,
-    params: &[MasterStripParam],
+    device: &NativeDevice,
+    params: &[NativeParamId],
 ) -> Option<String> {
-    #[allow(clippy::cast_precision_loss)]
-    let total = KNOB * params.len() as f32 + KNOB_GAP * (params.len() as f32 - 1.0);
-    let start_x = row.x + (row.w - total).max(0.0) * 0.5;
+    let n = params.len() as f32;
+    let start_x = row.x + (row.w - (KNOB * n + KNOB_GAP * (n - 1.0))).max(0.0) * 0.5;
     let mut hover = None;
-    for (i, param) in params.iter().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
-        let x = start_x + (KNOB + KNOB_GAP) * i as f32;
-        let r = master_knob(
-            app,
-            ui,
-            (id.0, id.1, i),
-            Rect { x, y: row.y + LABEL_H, w: KNOB, h: KNOB },
-            *param,
-        );
-        if r.active {
-            hover = Some(format!("{} {}", param.label(), r.value));
-        }
+    for (i, &param) in params.iter().enumerate() {
+        let spec = NativeKnobSpec {
+            surface: SURFACE,
+            owner: ctx.owner,
+            device,
+            param,
+            rect: Rect { x: start_x + (KNOB + KNOB_GAP) * i as f32, y: row.y + LABEL_H, w: KNOB, h: KNOB },
+            surface_bg: ctx.bg,
+            dimmed: false,
+            external_drag: false,
+            scope: ctx.scope,
+        };
+        let resp = native_knob(ctx.app, ui, &spec);
+        let target = AutomationTarget::NativeParam { device_id: device.id, param };
+        hover = hover_readout(param.knob_label(), &target, resp).or(hover);
     }
     hover
 }
 
-/// [`master_knob`] の読み出し。`value` は現在 (drag 中は drag 中) の値の表示文字列、
-/// `active` は hover / drag 中か。
-struct KnobReadout {
-    value: String,
-    active: bool,
-}
-
 /// 行の見出し。ノブに触れていない間は行の名前、触れている間はその値。
-fn row_label<'a>(
-    app: &'a AppData,
-    ui: &mut Ui<'a, AppData>,
-    id: (&'static str, usize),
+fn row_label(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    id: impl std::hash::Hash,
     row: Rect,
     default_text: &str,
     hover: Option<String>,
@@ -362,71 +356,4 @@ fn row_label<'a>(
         None => (default_text, p.text_dim),
     };
     ui.label_at_clipped(id, text, Rect { h: LABEL_H, ..row }, LABEL_FONT, color);
-}
-
-/// マスターストリップのノブ 1 個。段階式パラメータは段へ丸まる
-/// (`MasterStrip::set_param`)。
-fn master_knob<'a>(
-    app: &'a AppData,
-    ui: &mut Ui<'a, AppData>,
-    id: (&'static str, usize, usize),
-    rect: Rect,
-    param: MasterStripParam,
-) -> KnobReadout {
-    let strip = app.cur.song_doc.song().master_strip;
-    let plain = strip.param(param);
-    let target = AutomationTarget::MasterStrip(param);
-    let norm = plain_to_norm(&target, f64::from(plain));
-    let default_norm =
-        plain_to_norm(&target, f64::from(MasterStrip::default().param(param)));
-    // ゲイン系 (0 が中央) だけ bipolar。
-    let base = if matches!(param, MasterStripParam::EqGain(_) | MasterStripParam::CompMakeup) {
-        KnobStyle::BIPOLAR
-    } else {
-        KnobStyle::UNIPOLAR
-    };
-    let resp = ui.knob_at(
-        id,
-        rect,
-        norm,
-        default_norm,
-        &KnobStyle { surface: Some(app.theme.core.panel), ..base },
-        {
-            let target = target.clone();
-            move |v| {
-                #[allow(clippy::cast_possible_truncation)]
-                let value = norm_to_plain(&target, v) as f32;
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::MasterStripEdit { param, value });
-                })
-            }
-        },
-        None,
-    );
-    let shown = norm_to_plain(&target, resp.displayed_value);
-    KnobReadout {
-        value: format_master_value(param, shown),
-        active: resp.hovered || resp.dragging,
-    }
-}
-
-/// 段階式は段のラベル (`4:1` / `30` / `Auto`)、連続は数値 + 単位。
-fn format_master_value(param: MasterStripParam, plain: f64) -> String {
-    use common::model::{MasterAttack, MasterRatio, MasterRelease, MasterStripParam as M};
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let idx = |len: usize| (plain.round().max(0.0) as usize).min(len - 1);
-    match param {
-        M::CompRatio => MasterRatio::ALL[idx(MasterRatio::ALL.len())].label().to_string(),
-        M::CompAttack => {
-            format!("{}ms", MasterAttack::ALL[idx(MasterAttack::ALL.len())].label())
-        }
-        M::CompRelease => {
-            let r = MasterRelease::ALL[idx(MasterRelease::ALL.len())];
-            if r == MasterRelease::Auto { "Auto".into() } else { format!("{}s", r.label()) }
-        }
-        _ => {
-            let desc = automation_value_display(&AutomationTarget::MasterStrip(param), None);
-            format!("{}{}", desc.format.format_value(plain), desc.unit)
-        }
-    }
 }

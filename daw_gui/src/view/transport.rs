@@ -16,7 +16,8 @@ use crate::app::{AppData, AppEvent};
 use crate::event_launcher::LauncherEvent;
 use crate::theme::Theme;
 use crate::view::checked;
-use crate::view::param_gesture::push_param_gesture_edges;
+use crate::app::ParamSurface;
+use crate::view::param_gesture::push_param_gesture;
 
 const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
 
@@ -366,7 +367,7 @@ fn draw_tempo_and_key(
         bpm_target.clone(),
         f64::from(app.cur.song_doc.song().bpm),
         crate::view::modulation::PLAIN_IDENT,
-        MASTER_TRACK_ID,
+        crate::view::native_device::ParamOwner::master(app.cur.song_doc.song()),
     );
     let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",
@@ -388,23 +389,19 @@ fn draw_tempo_and_key(
     crate::view::modulation::push_mod_depth_bracket(
         ui,
         app,
+        ParamSurface::Transport,
         MASTER_TRACK_ID,
         &bpm_target,
         bpm_resp.mod_dragging,
     );
-    // Phase 4 Step B 流 ParamGesture edge 検知: drag 開始 (= dragging
-    // false→true) で `ParamGestureBegin`、 終了で `ParamGestureEnd` を発火。
-    // target = SongTempo、 track_id = MASTER_TRACK_ID (= master row 配下の
-    // song-level lane を指す sentinel)。 mixer_strips と同 helper 使用。
-    let songtempo_was_dragging = app
-        .cur.recording.active_param_gestures
-        .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo));
-    push_param_gesture_edges(
+    // ParamGesture の申告 (drag 開始で Begin、 終了で End)。 target = SongTempo、
+    // track_id = MASTER_TRACK_ID (= master row 配下の song-level lane)。 mixer_strips と同 helper。
+    push_param_gesture(
         ui,
+        app,
+        ParamSurface::Transport,
         MASTER_TRACK_ID,
         AutomationTarget::SongTempo,
-        "Tempo",
-        songtempo_was_dragging,
         bpm_resp.dragging,
     );
     x += bpm_w + 12.0;
@@ -431,15 +428,12 @@ fn draw_tempo_and_key(
         None,
         None,
     );
-    let tsig_was_dragging = app
-        .cur.recording.active_param_gestures
-        .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTimeSigNumerator));
-    push_param_gesture_edges(
+    push_param_gesture(
         ui,
+        app,
+        ParamSurface::Transport,
         MASTER_TRACK_ID,
         AutomationTarget::SongTimeSigNumerator,
-        "TimeSig Num",
-        tsig_was_dragging,
         ts_resp.dragging,
     );
     x += ts_num_w + 4.0;
@@ -779,14 +773,21 @@ fn draw_recording_controls(
     let learn_active = app.cur.recording.midi_learn_target.is_some();
     let armed_track_for_learn = app.cur.selection.selected_track_ids.first().copied();
     // B2 (r.md #8): touch + learn。 直近に触った param が bind 可能なら
-    // (PluginParam / Volume / Pan) それを、 無ければ選択 track の Volume を learn。
+    // (PluginParam / 内蔵 device / master Limiter / Tempo / Volume / Pan) それを、 無ければ選択
+    // track の Volume を learn (判定は `midi_learn_binding_target` 1 本)。
     let learn_target = app.midi_learn_binding_target(armed_track_for_learn);
     let learn_label = if learn_active {
         "Learning..."
     } else {
         match learn_target {
-            Some(common::model::BindingTarget::PluginParam { .. }) => "Learn Param",
+            // r.md #129 (§7.9): 内蔵 device / master Limiter も plugin の param と同じ扱い。
+            Some(
+                common::model::BindingTarget::PluginParam { .. }
+                | common::model::BindingTarget::NativeParam { .. }
+                | common::model::BindingTarget::MasterLimiter(_),
+            ) => "Learn Param",
             Some(common::model::BindingTarget::TrackPan(_)) => "Learn Pan",
+            Some(common::model::BindingTarget::SongTempo) => "Learn Tempo",
             _ => "Learn Vol",
         }
     };

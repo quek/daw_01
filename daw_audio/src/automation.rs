@@ -14,7 +14,7 @@
 use common::automation::apply_modulation_with;
 use common::mod_plane::ModTickPlaneRef;
 use common::model::{
-    AutomationTarget, ChannelStrip, MasterStrip, Song, Track, TrackBuiltinParam,
+    AutomationLane, AutomationTarget, MasterLimiterSettings, ModRouting, NativeDevice, Song, TrackBuiltinParam,
 };
 use common::process_data::ProcessData;
 
@@ -186,133 +186,141 @@ pub fn fill_target_ramp(
     }
 }
 
-/// この buffer で実際に効く **チャンネルストリップ設定**を解決する
-/// (`docs/plan_channel_strip.md` §7)。
+/// この buffer で実際に効く **内蔵 device の値**を解決する (r.md #129 §7.3)。
 ///
-/// 出発点は `track.strip` の静的値。そこへ (1) 有効なオートメーションレーンの
-/// カーブ値、(2) `mod_routings` の変調 を順に重ねる。target ↔ フィールドの対応は
-/// `ChannelStrip::{target_value, set_target_value}` が SSoT なので、ここは
-/// 「どの target を、どの順で解決するか」だけを持つ。
+/// 出発点は `device` の静的値。そこへ (1) 有効かつ録音中でないオートメーションレーンの
+/// カーブ値、(2) 同じ target の変調 を順に重ねる。住所 ↔ フィールドの対応は
+/// `NativeDevice::{param, set_param}` が SSoT (`On` は `bypassed`、段階式は `set` が段へ丸める)。
 ///
-/// **block-rate (buffer 先頭で 1 回)**。EQ 係数とコンプの時定数は buffer ごとに
-/// 組み直すので、サンプル単位のランプは要らない (音量 / パンと違い、係数を
-/// サンプルごとに引き直す意味が無い)。
+/// `owner` はその device を持つトラック (master fx chain なら `MASTER_TRACK_ID`) で、store は
+/// `song.param_stores(owner)`、`rows` は owner の行。**block-rate (buffer 先頭で 1 回)**。
 ///
-/// RT 安全: 確保・ロックなし。`ChannelStrip` は `Copy` の値型。
-pub fn resolve_track_strip(
+/// RT 安全: 確保・ロックなし (`NativeDevice` は `Copy`)。
+pub fn resolve_native_device(
     song: &Song,
-    track: &Track,
+    device: &NativeDevice,
+    owner: u32,
     rows: TrackRows<'_>,
     playhead_beats: f64,
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
     mod_plane: ModTickPlaneRef<'_>,
-) -> ChannelStrip {
-    let mut strip = track.strip;
-    if track.automation_lanes.is_empty() && track.mod_routings.is_empty() {
-        return strip;
-    }
-
-    // (1) レーン: 有効かつ録音中でないものだけがカーブ値で上書きする
-    // (録音中は GUI のノブ操作を素通しさせる = fill_track_param_ramps と同じ規則)。
-    for (li, lane) in track.automation_lanes.iter().enumerate() {
-        let AutomationTarget::TrackBuiltin(param) = &lane.target else {
-            continue;
-        };
-        if !lane.enabled || strip.target_value(param).is_none() {
-            continue;
-        }
-        if recording_lanes.iter().any(|(t, tg)| *t == track.id && *tg == lane.target) {
-            continue;
-        }
-        let phase = phase_at_frame(rows.lane(li), 0);
-        let v = lane_value(lane, &song.clip_contents, phase, playhead_beats);
-        #[allow(clippy::cast_possible_truncation)]
-        strip.set_target_value(param, v as f32);
-    }
-
-    // (2) 変調: base は (1) まで解決済みの現在値。`apply_modulation_with` は
-    // 同じ target の routing を内部で全部畳むので、target ごとに 1 度だけ呼ぶ
-    // (同じ target の 2 本目以降は skip)。
-    for (i, routing) in track.mod_routings.iter().enumerate() {
-        let AutomationTarget::TrackBuiltin(param) = &routing.target else {
-            continue;
-        };
-        let Some(base) = strip.target_value(param) else {
-            continue;
-        };
-        if track.mod_routings[..i].iter().any(|q| q.target == routing.target) {
-            continue;
-        }
-        let v = apply_modulation_with(
-            &routing.target,
-            f64::from(base),
-            &track.mod_routings,
-            |id| mod_plane.scalar_at_frame_opt(id, 0),
-            |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        strip.set_target_value(param, v as f32);
-    }
-    strip
+) -> NativeDevice {
+    let Some(stores) = song.param_stores(owner) else {
+        return *device;
+    };
+    resolve_native_device_in(
+        &song.clip_contents,
+        stores,
+        device,
+        owner,
+        rows,
+        playhead_beats,
+        recording_lanes,
+        mod_plane,
+    )
 }
 
-/// この buffer で実際に効く **マスターストリップ設定**を解決する
-/// (`docs/plan_master_strip.md` §5)。
+/// [`resolve_native_device`] の store 解決済み版 (RT はプログラム実行ごとに 1 回だけ
+/// `param_stores` を引き、op ごとに track を探索しない)。
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_native_device_in(
+    clip_contents: &std::collections::HashMap<common::model::ContentId, common::model::ClipContent>,
+    stores: (&[AutomationLane], &[ModRouting]),
+    device: &NativeDevice,
+    owner: u32,
+    rows: TrackRows<'_>,
+    playhead_beats: f64,
+    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    mod_plane: ModTickPlaneRef<'_>,
+) -> NativeDevice {
+    let mut out = *device;
+    let (lanes, routings) = stores;
+    // (1) レーン: 有効かつ録音中でないものだけがカーブ値で上書きする
+    // (録音中は GUI のノブ操作を素通しさせる = fill_track_param_ramps と同じ規則)。
+    for (li, lane) in lanes.iter().enumerate() {
+        let AutomationTarget::NativeParam { device_id, param } = &lane.target else {
+            continue;
+        };
+        if *device_id != device.id || !lane.enabled || out.param(*param).is_none() {
+            continue;
+        }
+        if recording_lanes.iter().any(|(t, tg)| *t == owner && *tg == lane.target) {
+            continue;
+        }
+        let phase = phase_at_frame(rows.lane(li), 0);
+        let v = lane_value(lane, clip_contents, phase, playhead_beats);
+        #[allow(clippy::cast_possible_truncation)]
+        out.set_param(*param, v as f32);
+    }
+    // (2) 変調: base は (1) まで解決済みの現在値。`apply_modulation_with` は同じ target の routing を
+    // 内部で全部畳むので、target ごとに 1 度だけ呼ぶ (同じ target の 2 本目以降は skip)。
+    for (i, routing) in routings.iter().enumerate() {
+        let AutomationTarget::NativeParam { device_id, param } = &routing.target else {
+            continue;
+        };
+        if *device_id != device.id || routings[..i].iter().any(|q| q.target == routing.target) {
+            continue;
+        }
+        let Some(base) = out.param(*param) else {
+            continue;
+        };
+        let v = apply_modulation_with(
+            &routing.target,
+            f64::from(base),
+            routings,
+            |id| mod_plane.scalar_at_frame_opt(id, 0),
+            |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        out.set_param(*param, v as f32);
+    }
+    out
+}
+
+/// この buffer で実際に効く **master のフェーダー後 Limiter** を解決する (r.md #129 §7.3)。
+/// store は song 側 (`song_lanes` / `song_mod_routings`)、`rows` は master の行。
 ///
-/// master には `Track` が無いので、レーンは `song.song_lanes`、変調は
-/// `song.song_mod_routings` から引く (master fx の param automation と同じ store)。
-/// 構造は [`resolve_track_strip`] と同じ block-rate 解決で、段階式パラメータの
-/// 丸めは `MasterStrip::set_param` が担う。
-///
-/// RT 安全: 確保・ロックなし。`MasterStrip` は `Copy` の値型。
-pub fn resolve_master_strip(
+/// RT 安全: 確保・ロックなし (`MasterLimiterSettings` は `Copy`)。
+pub fn resolve_master_limiter(
     song: &Song,
     rows: TrackRows<'_>,
     playhead_beats: f64,
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
     mod_plane: ModTickPlaneRef<'_>,
-) -> MasterStrip {
-    let mut strip = song.master_strip;
-    if song.song_lanes.is_empty() && song.song_mod_routings.is_empty() {
-        return strip;
-    }
+) -> MasterLimiterSettings {
+    let mut out = song.master_limiter;
     let master = common::model::MASTER_TRACK_ID;
-
     for (li, lane) in song.song_lanes.iter().enumerate() {
-        let AutomationTarget::MasterStrip(param) = &lane.target else {
+        let AutomationTarget::MasterLimiter(param) = &lane.target else {
             continue;
         };
-        if !lane.enabled {
-            continue;
-        }
-        if recording_lanes.iter().any(|(t, tg)| *t == master && *tg == lane.target) {
+        if !lane.enabled || recording_lanes.iter().any(|(t, tg)| *t == master && *tg == lane.target) {
             continue;
         }
         let phase = phase_at_frame(rows.lane(li), 0);
         let v = lane_value(lane, &song.clip_contents, phase, playhead_beats);
         #[allow(clippy::cast_possible_truncation)]
-        strip.set_param(*param, v as f32);
+        out.set_param(*param, v as f32);
     }
-
-    for (i, routing) in song.song_mod_routings.iter().enumerate() {
-        let AutomationTarget::MasterStrip(param) = &routing.target else {
+    let routings = &song.song_mod_routings;
+    for (i, routing) in routings.iter().enumerate() {
+        let AutomationTarget::MasterLimiter(param) = &routing.target else {
             continue;
         };
-        if song.song_mod_routings[..i].iter().any(|q| q.target == routing.target) {
+        if routings[..i].iter().any(|q| q.target == routing.target) {
             continue;
         }
-        let base = strip.param(*param);
         let v = apply_modulation_with(
             &routing.target,
-            f64::from(base),
-            &song.song_mod_routings,
+            f64::from(out.param(*param)),
+            routings,
             |id| mod_plane.scalar_at_frame_opt(id, 0),
             |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
         );
         #[allow(clippy::cast_possible_truncation)]
-        strip.set_param(*param, v as f32);
+        out.set_param(*param, v as f32);
     }
-    strip
+    out
 }
 
 /// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
@@ -357,20 +365,10 @@ pub fn fill_pd_param_events(
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
-    // master fx (`MASTER_TRACK_ID`) は Track ではないので automation は `song_lanes`、
-    // 変調は `song_mod_routings` (Song 直下の song/master-level store) から引く。 それ
-    // 以外は通常 track。 `song_lanes` に混在する SongTempo/TimeSig lane は下の
-    // PluginParam フィルタで自然に skip される。 (r.md #8 再監査: master fx 自動化/変調)
-    let (lanes, mod_routings): (
-        &[common::model::AutomationLane],
-        &[common::model::ModRouting],
-    ) = if track_id == common::model::MASTER_TRACK_ID {
-        (&song.song_lanes, &song.song_mod_routings)
-    } else {
-        let Some(track) = song.tracks.iter().find(|t| t.id == track_id) else {
-            return;
-        };
-        (&track.automation_lanes, &track.mod_routings)
+    // 置き場 (master fx は song 側、それ以外は track) の解決は `Song::param_stores` 1 本。
+    // `song_lanes` に混在する SongTempo/TimeSig lane は下の PluginParam フィルタで skip される。
+    let Some((lanes, mod_routings)) = song.param_stores(track_id) else {
+        return;
     };
     let beats_per_frame = current_bpm / (60.0 * f64::from(sample_rate));
     if beats_per_frame <= 0.0 {
@@ -997,11 +995,10 @@ mod tests {
     /// レーンとノブ (静的値) の優先順位: 有効なレーンがあればカーブ値が勝ち、
     /// 録音中はノブが素通しになる (= `fill_track_param_ramps` と同じ規則)。
     #[test]
-    fn ストリップのレーンはカーブ値で上書きし録音中は素通しする() {
-        use common::model::{CompParam, EqBand, EqParam};
+    fn 内蔵デバイスのレーンはカーブ値で上書きし録音中は素通しする() {
+        use common::model::{CompParam, Device, EqBand, EqParam, NativeKind, NativeParamId, NativeParams};
 
-        let target =
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param: CompParam::Threshold });
+        let target = AutomationTarget::NativeParam { device_id: 5, param: NativeParamId::Comp(CompParam::Threshold) };
         let mut song = Song { bpm: 120.0, ..Song::default() };
         let cid = song.alloc_content_id();
         song.clip_contents.insert(
@@ -1031,43 +1028,31 @@ mod tests {
             next_clip_id: 2,
             ..AutomationLane::new(target.clone(), -30.0)
         };
+        let mut comp = NativeDevice::new_added(NativeKind::Comp, 5, 1);
+        comp.set_param(NativeParamId::Comp(CompParam::Threshold), -6.0);
+        let mut eq = NativeDevice::new_added(NativeKind::Eq, 6, 1);
+        eq.set_param(NativeParamId::Eq { band: EqBand::Hmf, param: EqParam::Gain }, 4.0);
         song.tracks.push(track(|t| {
             t.id = 1;
-            t.strip.comp.on = true;
-            t.strip.comp.threshold_db = -6.0;
-            // EQ の値はレーンが無いので静的値のまま残ること (巻き添え確認)。
-            t.strip.eq.hmf.gain_db = 4.0;
+            t.devices = vec![Device::Native(comp), Device::Native(eq)];
             t.automation_lanes = vec![lane];
             t.next_lane_id = 2;
         }));
 
         let empty = empty_recording_lanes();
-        let resolved = resolve_track_strip(
-            &song,
-            &song.tracks[0],
-            TrackRows::default(),
-            0.0,
-            &empty,
-            ModTickPlaneRef::default(),
-        );
-        assert!((resolved.comp.threshold_db - -30.0).abs() < 1e-4, "{}", resolved.comp.threshold_db);
-        assert!(
-            (resolved.eq.param(EqBand::Hmf, EqParam::Gain) - 4.0).abs() < 1e-6,
-            "レーンの無い param まで書き換わっている"
-        );
+        let resolve = |dev: &NativeDevice, rec| {
+            resolve_native_device(&song, dev, 1, TrackRows::default(), 0.0, rec, ModTickPlaneRef::default())
+        };
+        let thr = |d: NativeDevice| d.param(NativeParamId::Comp(CompParam::Threshold)).unwrap();
+        assert!((thr(resolve(&comp, &empty)) - -30.0).abs() < 1e-4);
+        // レーンは device id で絞る: 別の device (EQ) は静的値のまま残る (巻き添え確認)。
+        assert_eq!(resolve(&eq, &empty), eq, "レーンの無い device まで書き換わっている");
+        assert!(matches!(resolve(&eq, &empty).params, NativeParams::Eq(s) if s.hmf.gain_db == 4.0));
 
         // 録音中 (= ノブを掴んでいる) はカーブを評価せず静的値が残る。
         let mut recording = std::collections::HashSet::new();
         recording.insert((1_u32, target));
-        let touched = resolve_track_strip(
-            &song,
-            &song.tracks[0],
-            TrackRows::default(),
-            0.0,
-            &recording,
-            ModTickPlaneRef::default(),
-        );
-        assert!((touched.comp.threshold_db - -6.0).abs() < 1e-6, "{}", touched.comp.threshold_db);
+        assert!((thr(resolve(&comp, &recording)) - -6.0).abs() < 1e-6);
     }
 
     fn one_plugin_param_lane_song() -> Song {

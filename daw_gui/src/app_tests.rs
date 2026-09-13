@@ -945,7 +945,8 @@ mod master_fx_tests {
         // `PluginInstance::new` は id == 0 (未採番) を作るので、 assert 対象の
         // device_id を確定させるために採番を通す。
         song.ensure_ids();
-        let expected_id = song.master_fx_chain[0].id();
+        // `ensure_ids` は master の先頭に組み込み Bus Comp / Tone EQ を補うので、plugin を id で引く。
+        let expected_id = common::model::plugins(&song.master_fx_chain).next().expect("plugin").id;
         assert_ne!(expected_id, 0, "ensure_ids が安定 id を振る");
         let loaded = HashMap::new();
         let actions = compute_slot_reconcile_actions(&song, &loaded);

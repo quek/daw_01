@@ -5,9 +5,6 @@ use crate::state::*;
 use crate::app_types::*;
 
 impl AppData {
-    /// `A` キー shortcut の handler。`last_touched_param` の lane を
-    /// 該当 track に追加 (or 既存があれば visible = true で復活)。
-    /// 仕様: `docs/plan_automation.md` §7.3。
     /// Inspector の image event「📈」 ボタンから呼ばれる。 選択中 image
     /// clip の track に `AutomationTarget::ImageBuiltin(field)` lane を
     /// 追加する (= `docs/plan_image_automation.md` §4.1)。 既存 lane が
@@ -132,7 +129,7 @@ impl AppData {
     /// 「停止中でも image drag 中なら record を回す」 ために使う。
     pub(crate) fn image_pip_drag_active(&self) -> bool {
         self.cur.recording.active_param_gestures
-            .iter()
+            .keys()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::ImageBuiltin(_)))
     }
 
@@ -173,7 +170,12 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
+                // 所有者は preview 窓 (描画の存在ではなく drag end で閉じる、`ParamSurface::swept`)。
+                // 別の面が既に握っていれば奪わない。
+                self.cur.recording
+                    .active_param_gestures
+                    .entry((track_id, target.clone()))
+                    .or_insert(crate::state::ParamSurface::VideoPreview);
                 if matches!(
                     self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch
@@ -196,12 +198,14 @@ impl AppData {
     /// では latched は stop まで残す (= 既存 ParamGestureEnd と同 idiom)。
     pub(crate) fn end_image_pip_drag_recording(&mut self) {
         use common::model::AutomationTarget;
-        // image lane gesture だけを掃除 (audio / plugin gesture は残す)。
+        // preview 窓が握った image lane gesture だけを掃除 (audio / plugin / 他の面の gesture は残す)。
         let to_remove: Vec<(u32, AutomationTarget)> = self
             .cur.recording.active_param_gestures
             .iter()
-            .filter(|(_, t)| matches!(t, AutomationTarget::ImageBuiltin(_)))
-            .cloned()
+            .filter(|((_, t), s)| {
+                **s == crate::state::ParamSurface::VideoPreview && matches!(t, AutomationTarget::ImageBuiltin(_))
+            })
+            .map(|(k, _)| k.clone())
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
@@ -243,7 +247,10 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.cur.recording.active_param_gestures.insert((track_id, target.clone()));
+                self.cur.recording
+                    .active_param_gestures
+                    .entry((track_id, target.clone()))
+                    .or_insert(crate::state::ParamSurface::VideoPreview);
                 if matches!(
                     self.cur.recording.recording_mode,
                     common::model::RecordingMode::Latch
@@ -268,8 +275,10 @@ impl AppData {
         let to_remove: Vec<(u32, AutomationTarget)> = self
             .cur.recording.active_param_gestures
             .iter()
-            .filter(|(_, t)| matches!(t, AutomationTarget::TextBuiltin(_)))
-            .cloned()
+            .filter(|((_, t), s)| {
+                **s == crate::state::ParamSurface::VideoPreview && matches!(t, AutomationTarget::TextBuiltin(_))
+            })
+            .map(|(k, _)| k.clone())
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
@@ -290,7 +299,7 @@ impl AppData {
     /// 使う。
     pub(crate) fn text_pip_drag_active(&self) -> bool {
         self.cur.recording.active_param_gestures
-            .iter()
+            .keys()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::TextBuiltin(_)))
     }
 
@@ -468,15 +477,15 @@ impl AppData {
         crate::group_compose::group_has_visual_content(self.cur.song_doc.song(), group_track_id)
     }
 
-    /// group inspector 用 summary。cursor track が visual group なら、各 param に
-    /// `GroupTransform(param)` lane があるか（=「A」 トグル点灯）を返す。
+    /// group inspector 用 summary。Par を開いた `open_device` が cursor track の Transform 配置
+    /// device なら、各 param に `GroupTransform(param)` lane があるか（=「A」 トグル点灯）を返す。
     pub fn inspector_group_transform_summary(
         &self,
+        open_device: u64,
     ) -> Option<GroupTransformInspectorSummary> {
         // Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
         // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
         // ときだけ Group Transform セクションを出す。
-        let open_device = self.cur.peph.open_video_fx_params?;
         // r.md #71 (プラグインのコピー / 移動): パネルは device_id で開いたまま
         // にして、 **描画側で** 「いま表示しているチェーンの device か」 を gate する
         // (device を別トラックへ移してもパネルが自然に追従する)。
@@ -503,11 +512,9 @@ impl AppData {
         })
     }
 
-    /// 開いている映像 FX param パネル（`open_video_fx_params`）が cursor
-    /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
-    /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
-    pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
-        let device_id = self.cur.peph.open_video_fx_params?;
+    /// Par を開いた映像 FX `device_id` が cursor track に居るとき、その device の def + 各 param の
+    /// 現在実値を返す。inspector が scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
+    pub fn inspector_video_fx_params(&self, device_id: u64) -> Option<VideoFxParamsInspector> {
         let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
@@ -520,15 +527,7 @@ impl AppData {
         if def.params.is_empty() {
             return None; // Transform 等は専用セクションで編集。
         }
-        let empty: &[common::model::AutomationLane] = &[];
-        let lanes: &[common::model::AutomationLane] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.cur.song_doc.song().song_lanes
-            } else {
-                self.cur.song_doc.song()
-                    .track_by_id(track_id)
-                    .map_or(empty, |t| t.automation_lanes.as_slice())
-            };
+        let lanes = self.cur.song_doc.song().param_stores(track_id).map_or(&[][..], |(l, _)| l);
         let values: Vec<f32> = def
             .params
             .iter()
@@ -549,11 +548,46 @@ impl AppData {
         Some(VideoFxParamsInspector { track_id, device_id, def, values })
     }
 
+    /// 値保持用レーン (`default_value` だけを持つ) の値を `owner` (track か master) の store に書く
+    /// (plugin / 映像 FX の Par の値の SSoT)。無ければ作り、**隠した状態で始める** (触っただけで
+    /// アレンジに行が増えない。非表示は見方の都合なので Song ではなく view に持つ)。
+    /// 置き場の分岐は `Song::param_stores_mut` / `push_lane` 1 か所 (r.md #129)。
+    ///
+    /// r.md #129: 束縛先が解決しなければ Song を編集しない (積むと enforce が同じ編集の中で消し、中身の無い undo
+    /// step と `*` だけが残る)。値が変わらない書き込みも undo を積まない。
+    fn write_param_lane_default(&mut self, owner: u32, target: common::model::AutomationTarget, norm: f64) {
+        // 既にあるレーンは enforce を通って残っている = 解決済みなので、判定は作るときだけ (scrub の毎フレームで
+        // node 表を作り直さない)。
+        let song = self.cur.song_doc.song();
+        let Some((lanes, _)) = song.param_stores(owner) else {
+            return;
+        };
+        if !lanes.iter().any(|l| l.target == target) && !song.param_target_resolves(&target, owner) {
+            return;
+        }
+        let mut created = None;
+        self.edit_song_checked(|song| {
+            let Some((lanes, _)) = song.param_stores_mut(owner) else {
+                return false;
+            };
+            if let Some(lane) = lanes.iter_mut().find(|l| l.target == target) {
+                return std::mem::replace(&mut lane.default_value, norm) != norm;
+            }
+            created = song
+                .push_lane(owner, common::model::AutomationLane::new(target, norm))
+                .map(|lane| common::model::AutomationLaneKey { track: owner, lane });
+            created.is_some()
+        });
+        if let Some(key) = created {
+            self.cur.view.hidden_automation_lanes.insert(key);
+        }
+    }
+
     /// 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
     /// `PluginParam` lane の `default_value`（0..=1 norm、`video_fx` モジュール doc）。lane が
     /// 無ければ値保持用（`visible=false`・curve 無し）を作る。master は `song_lanes`。
     pub(crate) fn set_video_fx_param(&mut self, device_id: u64, param_id: u32, value_real: f32) {
-        use common::model::{AutomationLane, AutomationTarget};
+        use common::model::AutomationTarget;
         // lane の所有者 (track / master) は device_id から毎回引き直す
         // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。
         let song = self.cur.song_doc.song();
@@ -577,38 +611,7 @@ impl AppData {
             param_id,
             legacy_device_index: None,
         };
-        // 新規作成したレーンは **隠した状態** で始める (触っただけでアレンジに行が
-        // 増えない)。 非表示は見方の都合なので Song ではなく `ui_prefs` に持つ。
-        let created_hidden = self.edit_song(|song| {
-            if track_id == common::model::MASTER_TRACK_ID {
-                if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = song.alloc_song_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    song.song_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: common::model::MASTER_TRACK_ID, lane: id })
-                }
-            } else if let Some(track) = song.track_by_id_mut(track_id) {
-                if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = track.alloc_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    track.automation_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: track_id, lane: id })
-                }
-            } else {
-                None
-            }
-        });
-        if let Some(Some(key)) = created_hidden {
-            self.cur.view.hidden_automation_lanes.insert(key);
-        }
+        self.write_param_lane_default(track_id, target.clone(), norm);
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
         self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
@@ -619,31 +622,25 @@ impl AppData {
     }
 
     /// 汎用 plugin の「Par」インライン param パネルの read snapshot。
-    /// `open_plugin_params` が cursor track の device を指し、 host から param 一覧が
+    /// Par を開いた `device_id` が cursor track に居て、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
     /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
-    /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
+    /// Talk / Text Event) が自分の gate (Par を開いた device の種類) で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
-    pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
-        let device_id = self.cur.peph.open_plugin_params?;
+    pub fn inspector_plugin_params(&self, device_id: u64) -> Option<PluginParamsInspector> {
         let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
         let device = self.cur.song_doc.song().plugin_by_id(device_id)?;
+        if device.ports.is_video() && device.plugin_id != common::plugin_db::SUBTITLE_ID {
+            return None; // 映像 FX は専用セクション。
+        }
         let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
         // 実レンジへ。 HIDDEN は出さない。
-        let empty: &[common::model::AutomationLane] = &[];
-        let lanes: &[common::model::AutomationLane] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.cur.song_doc.song().song_lanes
-            } else {
-                self.cur.song_doc.song()
-                    .track_by_id(track_id)
-                    .map_or(empty, |t| t.automation_lanes.as_slice())
-            };
+        let lanes = self.cur.song_doc.song().param_stores(track_id).map_or(&[][..], |(l, _)| l);
         let params: Vec<PluginParamRow> = self
             .cur.pipc.plugin_params
             .get(&device_id)
@@ -701,29 +698,6 @@ impl AppData {
         })
     }
 
-    /// 「Par」パネルが開いている device の plugin_id (cursor track 上)。
-    /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
-    pub(crate) fn open_param_panel_plugin_id(&self) -> Option<&str> {
-        let device_id = self.cur.peph.open_plugin_params?;
-        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
-        if self.cursor_track_id() != Some(track_id) {
-            return None;
-        }
-        self.cur.song_doc.song().plugin_by_id(device_id).map(|d| d.plugin_id.as_str())
-    }
-
-    /// VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
-    /// Talk セクションを Par パネルとして描画する gate)。
-    pub fn voicevox_param_panel_open(&self) -> bool {
-        self.open_param_panel_plugin_id() == Some(common::plugin_db::BUILTIN_ID_VOICEVOX)
-    }
-
-    /// 字幕 builtin の「Par」パネルが開いているか (= Text Event
-    /// セクションを Par パネルとして描画する gate)。
-    pub fn subtitle_param_panel_open(&self) -> bool {
-        self.open_param_panel_plugin_id() == Some(common::plugin_db::SUBTITLE_ID)
-    }
-
     /// 汎用 plugin param を 1 つ編集 (「⚙」パネルの scrubable から)。 値の
     /// SSoT は `PluginParam` lane の `default_value` (0..=1 norm)。 実レンジ↔norm は
     /// host が送った `PluginParamInfo` の min/max。 lane が無ければ値保持用
@@ -734,7 +708,7 @@ impl AppData {
     /// 所有者 (track / master) の解決が `find_device_by_id` に移り、 wrapper 側の
     /// 存在理由 (cursor track の解決) が消えて中身まで同一になったため。
     pub(crate) fn set_plugin_param(&mut self, device_id: u64, param_id: u32, value_real: f64) {
-        use common::model::{AutomationLane, AutomationTarget};
+        use common::model::AutomationTarget;
         // device が消えていれば何もしない (削除済み device への stale binding /
         // stale event は正常系なので tracing は出さない)。
         let Some((track_id, _)) = find_device_by_id(self.cur.song_doc.song(), device_id) else {
@@ -759,38 +733,7 @@ impl AppData {
             param_id,
             legacy_device_index: None,
         };
-        // 新規作成したレーンは **隠した状態** で始める (触っただけでアレンジに行が
-        // 増えない)。 非表示は見方の都合なので Song ではなく `ui_prefs` に持つ。
-        let created_hidden = self.edit_song(|song| {
-            if track_id == common::model::MASTER_TRACK_ID {
-                if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = song.alloc_song_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    song.song_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: common::model::MASTER_TRACK_ID, lane: id })
-                }
-            } else if let Some(track) = song.track_by_id_mut(track_id) {
-                if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = track.alloc_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    track.automation_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: track_id, lane: id })
-                }
-            } else {
-                None
-            }
-        });
-        if let Some(Some(key)) = created_hidden {
-            self.cur.view.hidden_automation_lanes.insert(key);
-        }
+        self.write_param_lane_default(track_id, target.clone(), norm);
         // 表示名は `automation_target_label` 1 本に寄せる (r.md #72 / #78)。
         // かつてここだけ `format!("{module} {name}")` を手組みしていたため、
         // 同じ param が経路によって別名で出ていた。
@@ -1131,322 +1074,6 @@ impl AppData {
                     );
                     tracing::error!(error = %e, ?kind, "child respawn failed");
                 }
-            }
-        }
-    }
-
-    pub(crate) fn add_automation_from_last_touched(&mut self) {
-        let Some(touched) = self.cur.peph.last_touched_param.clone() else {
-            self.ui_ephemeral.status_message =
-                "No parameter touched yet — drag any knob first".into();
-            return;
-        };
-        // Phase 5 Step 5.1 (gui_01 #034): song-level target は master row の
-        // `song_lanes` に追加 (= track 紐付け無し)。 TrackBuiltin / PluginParam
-        // は従来通り該当 track の automation_lanes に追加。
-        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam も master row の
-        // `song_lanes` に置く (master は Track ではないので track_by_id で引けない)。
-        let is_song_level = matches!(
-            touched.target,
-            common::model::AutomationTarget::SongTempo
-                | common::model::AutomationTarget::SongTimeSigNumerator
-        ) || touched.track_id == common::model::MASTER_TRACK_ID;
-        // song-level でない場合のみ touched track が削除済か検査。
-        if !is_song_level && self.cur.song_doc.song().track_by_id(touched.track_id).is_none() {
-            self.cur.peph.last_touched_param = None;
-            self.ui_ephemeral.status_message =
-                "Last-touched parameter's track was removed".into();
-            return;
-        }
-        // 既存 lane を find (target 一致)。 master か track かで lookup 経路が分岐。
-        let existing_lane_id: Option<u32> = if is_song_level {
-            self.cur.song_doc.song()
-                .song_lanes
-                .iter()
-                .find(|l| l.target == touched.target)
-                .map(|l| l.id)
-        } else {
-            self.cur.song_doc.song()
-                .track_by_id(touched.track_id)
-                .and_then(|t| {
-                    t.automation_lanes
-                        .iter()
-                        .find(|l| l.target == touched.target)
-                        .map(|l| l.id)
-                })
-        };
-        if let Some(lane_id) = existing_lane_id {
-            // 既存 lane を visible / enabled = true に戻して expand。
-            let lookup_track_id = if is_song_level {
-                common::model::MASTER_TRACK_ID
-            } else {
-                touched.track_id
-            };
-            self.cur.view
-                .hidden_automation_lanes
-                .remove(&common::model::AutomationLaneKey { track: lookup_track_id, lane: lane_id });
-            self.edit_song_checked(|song| {
-                if let Some(lane) = song.automation_lane_by_key_mut(lookup_track_id, lane_id)
-                    && !lane.enabled
-                {
-                    lane.enabled = true;
-                    true
-                } else {
-                    false
-                }
-            });
-            if is_song_level {
-                self.cur.view.master_row_automation_expanded = true;
-            } else {
-                self.cur.view.expanded_automation_tracks.insert(touched.track_id);
-            }
-            self.ui_ephemeral.status_message = format!(
-                "Automation lane '{}' は既に存在します",
-                touched.display_name
-            );
-            return;
-        }
-        // 新規 lane を作成。default_value は target に応じて現在値を引く。
-        let default_value = self.lane_default_for_target(&touched);
-        if is_song_level {
-            self.edit_song(|song| {
-                let lane_id = song.alloc_song_lane_id();
-                let new_lane = common::model::AutomationLane {
-                    id: lane_id,
-                    ..common::model::AutomationLane::new(touched.target.clone(), default_value)
-                };
-                song.song_lanes.push(new_lane);
-            });
-            self.cur.view.master_row_automation_expanded = true;
-        } else {
-            let __applied = self.edit_song_checked(|song| {
-                let Some(track) = song.track_by_id_mut(touched.track_id) else {
-                    return false;
-                };
-                let lane_id = track.alloc_lane_id();
-                let new_lane = common::model::AutomationLane {
-                    id: lane_id,
-                    ..common::model::AutomationLane::new(touched.target.clone(), default_value)
-                };
-                track.automation_lanes.push(new_lane);
-                true
-            });
-            if !__applied {
-                return;
-            }
-            self.cur.view.expanded_automation_tracks.insert(touched.track_id);
-        }
-        self.ui_ephemeral.status_message = format!(
-            "Added automation lane: {}",
-            touched.display_name
-        );
-    }
-
-    /// track-builtin target の現在値 (plain)。`lane_default_for_target` から
-    /// 切り出したのは、内側の match がネスト段数の予算 (不変条件 9) を
-    /// 押し上げるため — 値の取り出しはこの 1 段で完結する。
-    fn track_builtin_plain_value(
-        &self,
-        track_id: u32,
-        param: &common::model::TrackBuiltinParam,
-    ) -> f64 {
-        use common::model::TrackBuiltinParam as P;
-        let Some(track) = self.cur.song_doc.song().track_by_id(track_id) else {
-            return 0.0;
-        };
-        match param {
-            P::Volume => f64::from(track.volume),
-            P::Pan => f64::from(track.pan),
-            P::Mute => f64::from(u8::from(track.muted)),
-            // A6 (r.md #8): send gain の現在値は model にある。
-            // v29: 安定 send id 一致で引く。
-            P::SendGain { send_id, .. } => track
-                .sends
-                .iter()
-                .find(|s| s.id == *send_id)
-                .map_or(0.0, |s| f64::from(s.gain)),
-            // r.md #110: Parallel chain の gain / pan (安定 chain id で引く)。
-            P::ChainGain { chain_id } => self
-                .cur.song_doc
-                .song()
-                .chain_by_id(*chain_id)
-                .map_or(1.0, |(_, c)| f64::from(c.gain)),
-            P::ChainPan { chain_id } => self
-                .cur.song_doc
-                .song()
-                .chain_by_id(*chain_id)
-                .map_or(0.0, |(_, c)| f64::from(c.pan)),
-            P::ParallelOutGain { parallel_id } => self
-                .cur.song_doc
-                .song()
-                .parallel_by_id(*parallel_id)
-                .map_or(1.0, |r| f64::from(r.out_gain)),
-            // r.md #112: 分割が off の Parallel (dangling lane) は既定値を出す。
-            P::ParallelSplitFreq { parallel_id, edge } => self
-                .cur.song_doc
-                .song()
-                .parallel_by_id(*parallel_id)
-                .and_then(|r| r.split.freq(*edge))
-                .or_else(|| common::model::Split::DEFAULT_FREQUENCY3.freq(*edge))
-                .map_or(0.0, f64::from),
-            // r.md #114: アクティブ chain の中央の位置 (Selector でなければ中央 0.5)。
-            P::ParallelSelect { parallel_id } => self
-                .cur.song_doc
-                .song()
-                .parallel_by_id(*parallel_id)
-                .map_or(0.5, |r| f64::from(r.select_pos())),
-            // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
-            // `ChannelStrip::target_value` が SSoT (ここで写さない)。
-            P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {
-                track.strip.target_value(param).map_or(0.0, f64::from)
-            }
-        }
-    }
-
-    /// `AddAutomationFromLastTouched` の補助。target の現在値を plain
-    /// 単位で取得 (lane.default_value 初期化用)。 track-builtin は track の strip 値、
-    /// send gain は `track.sends[idx].gain`、 plugin param は `current_plain_value`
-    /// の cache (A6 r.md #8)、 song-level は `song.bpm` / `song.time_sig.0`。
-    pub(crate) fn lane_default_for_target(&self, touched: &TouchedParam) -> f64 {
-        use common::model::AutomationTarget;
-        match &touched.target {
-            AutomationTarget::TrackBuiltin(param) => {
-                self.track_builtin_plain_value(touched.track_id, param)
-            }
-            // A6 (r.md #8): plugin param は GUI の現在値 cache を引く
-            // (`current_plain_value` が `plugin_param_values` から解決)。
-            AutomationTarget::PluginParam { .. } => self
-                .current_plain_value(touched.track_id, &touched.target)
-                .unwrap_or(0.0),
-            // r.md #89: モジュレーター自身のツマミ / 変調 1 本の深さ。値の SSoT は
-            // `common::mod_graph::param_plain` (ラックのツマミもここを引く)。
-            AutomationTarget::ModSourceParam { source_id, param } => {
-                self.mod_param_plain_value(*source_id, *param)
-            }
-            AutomationTarget::ModRoutingDepth { routing_id } => self
-                .cur.song_doc
-                .song()
-                .all_mod_routings()
-                .find(|r| r.id == *routing_id)
-                .map_or(0.0, |r| f64::from(r.depth)),
-            // マスターストリップ: target ↔ フィールドの対応は
-            // `MasterStrip::param` が SSoT (ここで写さない)。
-            AutomationTarget::MasterStrip(param) => {
-                f64::from(self.cur.song_doc.song().master_strip.param(*param))
-            }
-            AutomationTarget::SongTempo => f64::from(self.cur.song_doc.song().bpm),
-            AutomationTarget::SongTimeSigNumerator => f64::from(self.cur.song_doc.song().time_sig.0),
-            // Image PiP default: 同 track の最初の image clip の first
-            // event 値を初期値に使う。 1 つも image clip が無い (= lane
-            // を空 image track で先行追加するケース) は 0.0 fallback。
-            AutomationTarget::ImageBuiltin(field) => {
-                use common::model::{ClipContent, ImageBuiltinParam};
-                let Some(track) = self.cur.song_doc.song().track_by_id(touched.track_id) else {
-                    return 0.0;
-                };
-                let event = track.all_clips().find_map(|c| {
-                    self.cur.song_doc.song()
-                        .clip_contents
-                        .get(&c.content_id)
-                        .and_then(|content| match content {
-                            ClipContent::Image(img) => img.events.first(),
-                            _ => None,
-                        })
-                });
-                let Some(ev) = event else { return 0.0 };
-                f64::from(match field {
-                    ImageBuiltinParam::X => ev.x,
-                    ImageBuiltinParam::Y => ev.y,
-                    ImageBuiltinParam::W => ev.w,
-                    ImageBuiltinParam::H => ev.h,
-                    ImageBuiltinParam::Opacity => ev.opacity,
-                    ImageBuiltinParam::Rotation => ev.rotation_radians,
-                })
-            }
-            // Text default: 同 track の first text event (セル込み) の field 値。
-            // text clip が無い (= lane を空 track で先行追加) は field
-            // ごとの常識値 (色 RGBA は (1,1,1,1) や (0,0,0,1) 等)。
-            AutomationTarget::TextBuiltin(field) => {
-                use common::model::{ClipContent, TextBuiltinParam as T};
-                let Some(track) = self.cur.song_doc.song().track_by_id(touched.track_id) else {
-                    return 0.0;
-                };
-                let event = track.all_clips().find_map(|c| {
-                    self.cur.song_doc.song()
-                        .clip_contents
-                        .get(&c.content_id)
-                        .and_then(|content| match content {
-                            ClipContent::Text(t) => t.events.first(),
-                            _ => None,
-                        })
-                });
-                let Some(ev) = event else {
-                    // text clip 無し → default 値 (= TextEvent::default
-                    // の常識値と整合させる)。
-                    return match field {
-                        T::X => 0.0,
-                        T::Y => 0.4,
-                        T::W => 1.0,
-                        T::H => 0.2,
-                        T::Opacity => 1.0,
-                        T::Rotation => 0.0,
-                        T::FontSize => 64.0,
-                        T::FillR | T::FillG | T::FillB | T::FillA => 1.0,
-                        T::OutlineR | T::OutlineG | T::OutlineB => 0.0,
-                        T::OutlineA => 1.0,
-                        T::OutlineWidth => 0.0,
-                        T::ShadowR | T::ShadowG | T::ShadowB => 0.0,
-                        T::ShadowA => 0.5,
-                        T::ShadowOffsetX | T::ShadowOffsetY => 0.0,
-                        T::ShadowBlur => 0.0,
-                    };
-                };
-                f64::from(match field {
-                    T::X => ev.x,
-                    T::Y => ev.y,
-                    T::W => ev.w,
-                    T::H => ev.h,
-                    T::Opacity => ev.opacity,
-                    T::Rotation => ev.rotation_radians,
-                    T::FontSize => ev.font_size_px,
-                    T::FillR => ev.fill_color[0],
-                    T::FillG => ev.fill_color[1],
-                    T::FillB => ev.fill_color[2],
-                    T::FillA => ev.fill_color[3],
-                    T::OutlineR => ev.outline_color[0],
-                    T::OutlineG => ev.outline_color[1],
-                    T::OutlineB => ev.outline_color[2],
-                    T::OutlineA => ev.outline_color[3],
-                    T::OutlineWidth => ev.outline_width_px,
-                    T::ShadowR => ev.shadow_color[0],
-                    T::ShadowG => ev.shadow_color[1],
-                    T::ShadowB => ev.shadow_color[2],
-                    T::ShadowA => ev.shadow_color[3],
-                    T::ShadowOffsetX => ev.shadow_offset_px.0,
-                    T::ShadowOffsetY => ev.shadow_offset_px.1,
-                    T::ShadowBlur => ev.shadow_blur_px,
-                })
-            }
-            // Group transform default: 同 track の group_transform (無ければ
-            // GroupTransform::default) の該当 field。 group は表示 clip を持たない
-            // ので image/text のような clip 探索は不要。
-            AutomationTarget::GroupTransform(param) => {
-                use common::model::GroupTransformParam as G;
-                let gt = self
-                    .cur.song_doc.song()
-                    .track_by_id(touched.track_id)
-                    .and_then(|t| t.group_transform)
-                    .unwrap_or_default();
-                f64::from(match param {
-                    G::X => gt.x,
-                    G::Y => gt.y,
-                    G::Rotation => gt.rotation_radians,
-                    G::ScaleX => gt.scale_x,
-                    G::ScaleY => gt.scale_y,
-                    G::AnchorX => gt.anchor_x,
-                    G::AnchorY => gt.anchor_y,
-                    G::Opacity => gt.opacity,
-                })
             }
         }
     }

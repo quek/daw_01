@@ -2398,3 +2398,95 @@ fn セルのダブルクリックは編集面を開く意図を出す() {
         r.launcher.intents
     );
 }
+
+// ============================================================
+// r.md #129: ヘッダ drop の深さは依存 (親子 / サイドチェイン / send) が循環しない深さだけ
+// ============================================================
+
+/// `[C, G, D(G の子)]` で、C の組み込み Comp が G をサイドチェインに読んでいる曲 (C を G に入れると循環)。
+fn app_with_sidechained_outsider() -> AppData {
+    let (mut app, _a, _p) = build_app_with_header(HEADER_W);
+    app.edit_song(|song| {
+        song.tracks.clear();
+        song.tracks.push(track_with(|t| t.id = 3));
+        song.tracks.push(track_with(|t| t.id = 1));
+        song.tracks.push(track_with(|t| {
+            t.id = 2;
+            t.parent_group_id = Some(1);
+        }));
+    });
+    let comp = app.cur.song_doc.song().builtin_native(3, common::model::NativeKind::Comp).expect("C の Comp").id;
+    assert!(app.edit_song_checked(|song| song.set_aux_input(comp, 0, Some(common::model::TapSource::Track(1)))));
+    app
+}
+
+fn track_order(app: &AppData) -> Vec<(u32, Option<u32>)> {
+    app.cur.song_doc.song().tracks.iter().map(|t| (t.id, t.parent_group_id)).collect()
+}
+
+/// reorder の指標線 (`reorder_drop_indicator` 色の横線) の左端 x と、group 行の強調の有無。
+fn reorder_marks(app: &AppData, scene: &Scene) -> (Option<f32>, bool) {
+    let style = daw_gui::widgets::arrangement::ArrangementStyle::from_theme(&app.theme);
+    let same = |a: Color, b: Color| a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+    let mut line = None;
+    let mut highlight = false;
+    for p in &scene.primitives {
+        if let Primitive::Rect(c) = p {
+            if same(c.fill, style.reorder_drop_indicator) && (c.rect.h - style.reorder_drop_indicator_h).abs() < 0.01 {
+                line = Some(c.rect.x);
+            }
+            highlight |= same(c.fill, style.reorder_group_highlight);
+        }
+    }
+    (line, highlight)
+}
+
+/// C のヘッダを掴む (C 行の上部、名前帯 / ボタンを避けた位置)。
+const DRAG_X: f32 = -12.0 + HEADER_W - 8.0;
+
+/// 右へ動かして G の中へ入れようとしても、指標は循環しない一番深い位置 (top-level = 左端) に出て、離すとそこに
+/// 落ちる (プレビュー = 確定、拒否は起きない)。
+#[test]
+fn reorder_drop_narrows_nesting_to_depths_without_dependency_cycles() {
+    let mut app = app_with_sidechained_outsider();
+    let mut host = UiHost::no_redraw();
+    // 行: master [38,88) / C [88,138) / G [138,188) / D [188,238)。末尾の gap (D の下) は深さ 0..=1。
+    let (x, y) = (DRAG_X, 98.0);
+    let (to_x, to_y) = (x + 48.0, 250.0);
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, hold(to_x, to_y, no_mods()));
+    let scene = drive_scene(&mut host, &mut app, hold(to_x, to_y, no_mods()));
+    let (line, highlight) = reorder_marks(&app, &scene);
+    let line = line.expect("落とせる深さがあるので指標線が出る");
+    assert!((line - WIDGET_RECT.x).abs() < 0.5, "G の子 (1 段右) ではなく top-level (左端) に出る: {line}");
+    assert!(!highlight, "G の行は強調しない");
+
+    drive(&mut host, &mut app, release(to_x, to_y, no_mods()));
+    assert_eq!(track_order(&app), [(1, None), (2, Some(1)), (3, None)], "見えていた位置 (末尾の top-level) に落ちる");
+}
+
+/// 落とせる深さが 1 つも無い gap (G の先頭の子の直前 = G の子にしかなれない) では、指標線も G 行の強調も出さず
+/// (半透明の行は出す)、離しても曲は変わらず status に理由が出る。
+#[test]
+fn reorder_drop_without_any_droppable_depth_shows_no_indicator_and_changes_nothing() {
+    let mut app = app_with_sidechained_outsider();
+    let before = track_order(&app);
+    let depth = app.cur.song_doc.undo_depth();
+    let mut host = UiHost::no_redraw();
+    let (x, y) = (DRAG_X, 98.0);
+    let to_y = 170.0; // G 行の下半分 = G と D の間の gap。
+    drive(&mut host, &mut app, press(x, y, no_mods()));
+    drive(&mut host, &mut app, hold(x, to_y, no_mods()));
+    let scene = drive_scene(&mut host, &mut app, hold(x, to_y, no_mods()));
+    let style = daw_gui::widgets::arrangement::ArrangementStyle::from_theme(&app.theme);
+    assert_eq!(reorder_marks(&app, &scene), (None, false), "指標線も G 行の強調も出さない");
+    let ghost = scene.primitives.iter().any(|p| {
+        matches!(p, Primitive::Rect(c) if (c.fill.a - style.reorder_drag_alpha).abs() < 0.01 && (c.rect.h - ROW_H).abs() < 0.5)
+    });
+    assert!(ghost, "ドラッグ中の半透明の行は出す");
+
+    drive(&mut host, &mut app, release(x, to_y, no_mods()));
+    assert_eq!(track_order(&app), before, "曲は変わらない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    assert!(app.ui_ephemeral.status_message.contains("循環"), "{}", app.ui_ephemeral.status_message);
+}

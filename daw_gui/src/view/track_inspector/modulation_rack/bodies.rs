@@ -108,13 +108,9 @@ pub(super) fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: 
         .mod_source_owner(f.sid)
         .unwrap_or(common::model::MASTER_TRACK_ID);
     let target = AutomationTarget::ModSourceParam { source_id: f.sid, param: f.param };
-    let mb = crate::view::modulation::build_mod(
-        cx.app,
-        target.clone(),
-        base,
-        crate::view::modulation::PLAIN_IDENT,
-        track_id,
-    );
+    let mb = crate::view::native_device::ParamOwner::resolve(cx.app.cur.song_doc.song(), track_id).map(|owner| {
+        crate::view::modulation::build_mod(cx.app, target.clone(), base, crate::view::modulation::PLAIN_IDENT, owner)
+    });
     let resp = ui.scrubable_number_at(
         ("inspector_mod_param", f.sid, f.param),
         f.rect,
@@ -124,7 +120,7 @@ pub(super) fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: 
         &style,
         f.on_change,
         None,
-        Some(mb.modulation()),
+        mb.as_ref().map(crate::view::modulation::ModBuild::modulation),
     );
     // 深さドラッグの立ち下がりが **◉ を解除する唯一の口** (`ScrubGesture::ModDepth` →
     // `connect_armed_mod_source_to`)。 他の全 per-control 呼び出し元と同じ idiom。
@@ -136,6 +132,7 @@ pub(super) fn mod_param_field(ui: &mut Ui<'_, AppData>, cx: &ModBodyCtx<'_>, f: 
     crate::view::modulation::push_mod_depth_bracket(
         ui,
         cx.app,
+        crate::app::ParamSurface::Rack,
         track_id,
         &target,
         resp.mod_dragging,

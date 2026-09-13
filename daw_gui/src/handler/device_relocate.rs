@@ -13,8 +13,9 @@
 //! 落とし先は [`ChainRef`] (top-level か Parallel 内 chain)。 Parallel を自分の中の chain へ
 //! 落とすのは循環なので拒む。
 use crate::app_types::*;
+use crate::handler::device_guard::{self, DeviceOp};
 use crate::state::*;
-use common::model::{ChainRef, Device, InstrumentSource, plugins};
+use common::model::{ChainRef, Device, InstrumentSource, OrdinalPolicy, plugins};
 
 impl AppData {
     // -------- r.md #71: device の運搬 (移動 / コピー) ----------------------
@@ -27,9 +28,13 @@ impl AppData {
     /// - コピー: 落とし先 device の `initial_state` が「いまのツマミ」になる。
     /// - 移動: instance は作り直さないが、undo snapshot が最新 state を捕まえる。
     pub(crate) fn relocate_devices(&mut self, req: RelocateDevices) {
-        if req.device_ids.is_empty() {
+        // r.md #129 (Q5): 組み込みは普通のドラッグでは所属トラックの最上位の中でしか動かせない
+        // (Ctrl のコピーはどこへでも)。 運べるものが無ければ round-trip も積まない。
+        let device_ids = self.permit_or_explain(&req.device_ids, DeviceOp::Relocate { dest: req.dest, copy: req.copy });
+        if device_ids.is_empty() {
             return;
         }
+        let req = RelocateDevices { device_ids, ..req };
         if !self.song_has_plugin() {
             self.relocate_devices_inner(&req);
             return;
@@ -47,7 +52,11 @@ impl AppData {
             return;
         };
         let Some(outcome) = self
-            .edit_song(move |song| relocate_in_song(song, &device_ids, dest, dest_index, copy))
+            .edit_song(move |song| {
+                // `Default` はここ (実行時の Song) で解決する — deferred 実行でも古くならない。
+                let dest_index = u32::try_from(dest_index.resolve(song, dest)?).ok()?;
+                relocate_in_song(song, &device_ids, dest, dest_index, copy)
+            })
             .flatten()
         else {
             return;
@@ -111,6 +120,10 @@ impl AppData {
         if !outcome.moved_devices.is_empty() {
             self.sync_recording_lanes_with_audio();
         }
+        // r.md #129 (Q18): 移動した行は Par を閉じた状態から始める (同じトラック内の並べ替えも)。
+        // コピーは新 id なので最初から閉じている。
+        self.close_rack_panels_of(&outcome.moved_nodes);
+        self.note_dropped_cyclic_routes(outcome.dropped_routes);
 
         // コピーで作った device を host に実体化する。 **finalize を先に積む**
         // (load 応答が先に届いたときに取りこぼさないため)。 `OpenPluginShmem` は
@@ -156,8 +169,10 @@ impl AppData {
         ));
     }
 
-    /// Ctrl+X (device 面)。copy → 削除を 1 undo step。
-    pub(crate) fn cut_devices(&mut self, device_ids: Vec<u64>) {
+    /// Ctrl+X (device 面)。copy → 削除を 1 undo step。 組み込み内蔵 device は切り取れない
+    /// (クリップボードにも載せない、 Q5)。
+    pub fn cut_devices(&mut self, device_ids: Vec<u64>) {
+        let device_ids = self.permit_or_explain(&device_ids, DeviceOp::Cut);
         if device_ids.is_empty() {
             return;
         }
@@ -179,8 +194,13 @@ impl AppData {
     /// cut 本体。serialize → `pending_clipboard_write` → 削除。呼び出し側で
     /// undo snapshot 済み (deferred 経由 or 即時 fallback)。
     pub(crate) fn cut_devices_inner(&mut self, device_ids: &[u64]) {
-        self.write_devices_to_clipboard(device_ids, "カット");
-        self.remove_devices_inner(device_ids);
+        // deferred 実行でも実行時の Song で組み込みを落とし直す (書き込みと削除は同じ id 列)。
+        let ids = device_guard::permitted_ids(self.cur.song_doc.song(), device_ids, DeviceOp::Cut);
+        if ids.is_empty() {
+            return;
+        }
+        self.write_devices_to_clipboard(&ids, "カット");
+        self.remove_devices_inner(&ids);
     }
 
     /// copy / cut 共通: serialize して `pending_clipboard_write` に積み、
@@ -268,7 +288,7 @@ impl AppData {
 
     /// Ctrl+V (device 面)。貼り先は「いまインスペクタに出ているチェーン」で、
     /// 挿入位置は **選んでいる device の直前** (その device が居る chain へ)、選択が
-    /// 無ければ top-level 末尾 (Ableton 流)。 戻り値は貼り付けた件数。
+    /// 無ければ top-level の既定位置 (Q6: 組み込みの手前)。 戻り値は貼り付けた件数。
     pub fn paste_devices(
         &mut self,
         devices: Vec<crate::clipboard::DeviceCopy>,
@@ -287,19 +307,18 @@ impl AppData {
             .live_device_ids()
             .first()
             .and_then(|&id| song.find_device(id))
-            .map(|(chain, i)| (chain, i as u32))
-            .unwrap_or_else(|| {
-                let len = song.fx_chain_by_track_id(dest_track).map_or(0, <[_]>::len);
-                (ChainRef::Track(dest_track), len as u32)
+            .map_or((ChainRef::Track(dest_track), InsertAt::Default), |(chain, i)| {
+                (chain, InsertAt::Index(i as u32))
             });
 
         let mut ordered = devices;
         ordered.sort_by_key(|d| d.order);
         let created = self.edit_song(move |song| {
+            // 挿入位置は貼る前の Song で解決する (`Default` は組み込みの手前)。
+            let at = dest_index.resolve(song, dest).unwrap_or(0);
             let mut created: Vec<Device> = Vec::new();
             for dc in &ordered {
                 let mut dev = dc.device.clone();
-                assign_fresh_ids(song, std::slice::from_mut(&mut dev));
                 let from_other_track = dc.source_track != dest_track;
                 common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                     // 別トラックへ運んだ ARA アーカイブは復元できない (persistent_id が
@@ -307,20 +326,24 @@ impl AppData {
                     if from_other_track {
                         inst.ara_archive = None;
                     }
-                    resolve_aux_refs_after_paste(song, inst);
                 });
+                resolve_aux_refs_after_paste(song, &mut dev);
                 created.push(dev);
             }
-            let at = (dest_index as usize).min(song.chain_devices(dest).map_or(0, Vec::len));
+            // 新 id・内蔵は追加分・番号 (`Fresh`) は一括で 1 回 (r.md #129 §5.7)。
+            song.prepare_device_copies(dest_track, &mut created);
             if let Some(chain) = song.chain_devices_mut(dest) {
                 chain.splice(at..at, created.iter().cloned());
             }
+            // 持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。
+            let dropped = song.drop_cyclic_aux_routes(&node_ids_of(&created));
             apply_dest_side_effects(song, dest_track, &created);
-            created
+            (created, dropped)
         });
-        let Some(created) = created else {
+        let Some((created, dropped)) = created else {
             return 0;
         };
+        self.note_dropped_cyclic_routes(dropped);
         let created_plugins: Vec<common::model::PluginInstance> =
             plugins(&created).cloned().collect();
         for inst in &created_plugins {
@@ -335,6 +358,15 @@ impl AppData {
         let n = created.len();
         self.set_device_selection(created.iter().map(Device::id).collect());
         n
+    }
+
+    /// 貼り付け / コピー / 運搬で持ち込んだサイドチェインのうち、依存が循環するので落とした本数を status に出す
+    /// (黙って消すと、後で Comp を ON にしたときに初めて配線が無いことに気付く)。0 本なら何もしない。
+    pub(crate) fn note_dropped_cyclic_routes(&mut self, dropped: usize) {
+        if dropped > 0 {
+            self.ui_ephemeral.status_message =
+                format!("依存が循環するサイドチェイン配線を {dropped} 本外しました");
+        }
     }
 
     // -------- r.md #71: device 選択 ----------------------------------------
@@ -375,35 +407,6 @@ impl AppData {
             self.cur.selection.last_edit_select = Some(EditSurface::Devices);
         }
     }
-
-    /// device が消える経路 (削除 / track 削除 / project 切替 / undo-redo) の後始末。
-    /// 実在しない id を落とし、 空になったらタグを降ろす。
-    ///
-    /// **正しさの担保ではない** — それは読む側の [`Self::live_device_ids`] が持つ。
-    /// ここは保持した集合が無限に育たないようにするだけ。
-    pub(crate) fn prune_device_selection(&mut self) {
-        let song = self.cur.song_doc.song();
-        let alive: Vec<u64> = self
-            .cur.selection
-            .selected_device_ids
-            .iter()
-            .copied()
-            .filter(|&id| song.device_by_id(id).is_some() || song.chain_by_id(id).is_some())
-            .collect();
-        if alive.len() != self.cur.selection.selected_device_ids.len() {
-            self.set_device_selection(alive);
-        }
-        if self
-            .cur.selection
-            .device_anchor
-            .is_some_and(|id| {
-                let song = self.cur.song_doc.song();
-                song.device_by_id(id).is_none() && song.chain_by_id(id).is_none()
-            })
-        {
-            self.cur.selection.device_anchor = None;
-        }
-    }
 }
 
 /// [`AppData::relocate_devices_inner`] が `edit_song` の中で組み立てる結果。
@@ -412,30 +415,24 @@ struct RelocateOutcome {
     result_ids: Vec<u64>,
     /// 移送した automation lane の再キー表 `(src_track, old_lane, dest_track, new_lane)`。
     lane_remap: Vec<(u32, u32, u32, u32)>,
-    /// **トラックを跨いで**移した plugin `(src_track, dest_track, device_id)`。
+    /// **トラックを跨いで**移した node (plugin / native / Parallel / chain) `(src_track, dest_track, id)`。
     /// recording gesture の再キーに使う (gesture の鍵は `(track_id, target)` で、
     /// lane が無くても gesture だけ立っていることがあるので、 lane 由来ではなく
     /// device 由来で洗う)。
     moved_devices: Vec<(u32, u32, u64)>,
+    /// 移動した node 全部 (同じトラック内の並べ替えを含む)。Par を閉じる対象 (Q18)。
+    moved_nodes: Vec<u64>,
     /// コピーで新規に作った device (中の plugin を host へ実体化する対象)。
     created: Vec<Device>,
+    /// 依存が循環するので落としたサイドチェイン配線の本数 (status に出す)。
+    dropped_routes: usize,
 }
 
-/// `devices` 以下の plugin / Parallel / chain 全部に新しい id を振る (コピー / 貼り付け)。
-fn assign_fresh_ids(song: &mut common::model::Song, devices: &mut [Device]) {
-    common::model::for_each_node_id_mut(devices, &mut |id| *id = song.alloc_device_id());
-}
-
-/// `dest` が `device_id` (Parallel) の **中** の chain か (= 自分の中へ落とす循環)。
-fn dest_inside_device(song: &common::model::Song, device_id: u64, dest: ChainRef) -> bool {
-    let ChainRef::Chain(cid) = dest else {
-        return false;
-    };
-    song.parallel_by_id(device_id).is_some_and(|r| {
-        r.chains
-            .iter()
-            .any(|c| c.id == cid || common::model::chain_devices_in(&c.devices, cid).is_some())
-    })
+/// `devices` 以下の node id 全部 (plugin / native / Parallel / chain)。
+fn node_ids_of(devices: &[Device]) -> Vec<u64> {
+    let mut ids = Vec::new();
+    common::model::for_each_node_id(devices, &mut |id| ids.push(id));
+    ids
 }
 
 /// 運搬の Song 側処理 (純関数)。 `None` = 落とし先チェーンが無い / 対象ゼロ。
@@ -448,13 +445,17 @@ fn relocate_in_song(
 ) -> Option<RelocateOutcome> {
     let dest_track = song.chain_owner_track(dest)?;
     // 解決できない id は捨てる (削除済み device への stale 要求は正常系)。
-    // Parallel を自分の中の chain へ落とすのは循環なので、その id も落とす。
+    // 運べない id (Parallel を自分の中の chain へ / 組み込みを所属トラックの最上位の外へ) も落とす
+    // — 規則は `Song::can_relocate` 1 本 (Rack の drop slot の判定と同じ)。
     let targets: Vec<(u64, u32, ChainRef, usize)> = device_ids
         .iter()
         .filter_map(|&id| {
+            if !song.can_relocate(id, dest, copy) {
+                return None;
+            }
             let (chain, index) = song.find_device(id)?;
             let owner = song.chain_owner_track(chain)?;
-            (!dest_inside_device(song, id, dest)).then_some((id, owner, chain, index))
+            Some((id, owner, chain, index))
         })
         .collect();
     if targets.is_empty() {
@@ -467,7 +468,9 @@ fn relocate_in_song(
         result_ids: Vec::new(),
         lane_remap: Vec::new(),
         moved_devices: Vec::new(),
+        moved_nodes: Vec::new(),
         created: Vec::new(),
+        dropped_routes: 0,
     };
 
     if copy {
@@ -477,7 +480,6 @@ fn relocate_in_song(
                 continue;
             };
             let mut dev = src.clone();
-            assign_fresh_ids(song, std::slice::from_mut(&mut dev));
             let cross = src_track != dest_track;
             common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                 // `state` (= いまのツマミ) は引き継ぐ (`Arc` の clone なのでコストゼロ)。
@@ -485,14 +487,18 @@ fn relocate_in_song(
                 if cross {
                     inst.ara_archive = None;
                 }
-                retarget_self_track_aux(inst, src_track, dest_track);
             });
+            retarget_self_track_aux(&mut dev, src_track, dest_track);
             copies.push(dev);
         }
+        // 新 id・内蔵は追加分 (組み込みのコピーも「Comp 2」)・番号 (`Fresh`) は一括で 1 回 (§5.7)。
+        song.prepare_device_copies(dest_track, &mut copies);
         let at = (dest_index as usize).min(song.chain_devices(dest)?.len());
         if let Some(chain) = song.chain_devices_mut(dest) {
             chain.splice(at..at, copies.iter().cloned());
         }
+        // 持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。
+        outcome.dropped_routes = song.drop_cyclic_aux_routes(&node_ids_of(&copies));
         // 副作用は **dest 側だけ** (src はそのまま残るので降ろさない)。
         apply_dest_side_effects(song, dest_track, &copies);
         outcome.result_ids = copies.iter().map(Device::id).collect();
@@ -507,6 +513,7 @@ fn relocate_in_song(
         .iter()
         .filter(|&&(_, _, chain, i)| chain == dest && (i as u32) < dest_index)
         .count();
+    let ordinals = cross_track_ordinals(song, &targets, dest_track);
     // 指定順 (= チェーン表示順) に抜く。 id で抜くので index のずれは起きない。
     let mut taken: Vec<(Device, u32)> = Vec::new();
     for &(id, src_track, _, _) in &targets {
@@ -521,7 +528,13 @@ fn relocate_in_song(
     let mut left_by_track: std::collections::HashMap<u32, Vec<String>> =
         std::collections::HashMap::new();
     for (mut dev, src_track) in taken {
+        common::model::for_each_node_id(std::slice::from_ref(&dev), &mut |id| outcome.moved_nodes.push(id));
         if src_track != dest_track {
+            common::model::for_each_native_mut(std::slice::from_mut(&mut dev), &mut |n| {
+                if let Some(&o) = ordinals.get(&n.id) {
+                    n.ordinal = o;
+                }
+            });
             move_device_bindings(song, &dev, src_track, dest_track, &mut outcome);
             common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                 left_by_track
@@ -531,8 +544,8 @@ fn relocate_in_song(
                 // ARA アーカイブは元トラックのクリップを指す persistent_id で作られて
                 // いるので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
                 inst.ara_archive = None;
-                retarget_self_track_aux(inst, src_track, dest_track);
             });
+            retarget_self_track_aux(&mut dev, src_track, dest_track);
         }
         moved.push(dev);
     }
@@ -543,6 +556,13 @@ fn relocate_in_song(
     if let Some(chain) = song.chain_devices_mut(dest) {
         chain.splice(at..at, moved.iter().cloned());
     }
+    if !outcome.moved_devices.is_empty() {
+        // トラックを跨いで持ち込んだサイドチェインと、運んだ Parallel の chain を他トラックから読む配線
+        // (chain の持ち主が変わって辺が変わる) のうち、依存が循環するものを落とす (§5.9)。同じトラック内の
+        // 並べ替えは辺を変えないので判定しない。
+        let crossed: Vec<u64> = outcome.moved_devices.iter().map(|&(_, _, id)| id).collect();
+        outcome.dropped_routes = song.drop_cyclic_aux_routes(&crossed);
+    }
     // 副作用の対称化: src 側は「他に残っていなければ降ろす」、 dest 側は立てる。
     for (src_track, left) in left_by_track {
         apply_src_side_effects(song, src_track, &left);
@@ -551,10 +571,35 @@ fn relocate_in_song(
     Some(outcome)
 }
 
-/// track を跨いで運ぶ device (Parallel なら中の plugin / chain 全部) の automation lane /
-/// mod routing を `src_track` から `dest_track` へ移す。 lane を元トラックに置いたまま
-/// device だけ移すと、 その lane は永久に効かない (`daw_audio/src/automation.rs` が
-/// track から lane を引いてから device_id で絞るため)。
+/// トラックを跨いで運ぶ内蔵 device の番号 (K9: 空いていれば保つ、 衝突すれば空き番号)。
+///
+/// 使用中の番号は **dest の木 (同じトラックから一緒に動かすものを含む)** なので、 抜く前の Song で
+/// 決める (抜いた後に決めると、 並べ替え中の同トラックの番号と衝突しうる)。 戻り値は native id → 番号。
+fn cross_track_ordinals(
+    song: &common::model::Song,
+    targets: &[(u64, u32, ChainRef, usize)],
+    dest_track: u32,
+) -> std::collections::HashMap<u64, u16> {
+    let mut cross: Vec<Device> = targets
+        .iter()
+        .filter(|t| t.1 != dest_track)
+        .filter_map(|t| song.device_by_id(t.0).cloned())
+        .collect();
+    song.assign_native_ordinals(dest_track, &mut cross, OrdinalPolicy::KeepIfFree);
+    let mut out = std::collections::HashMap::new();
+    common::model::for_each_native(&cross, &mut |n| {
+        out.insert(n.id, n.ordinal);
+    });
+    out
+}
+
+/// track を跨いで運ぶ device (Parallel なら中の plugin / native / chain 全部) の automation
+/// lane / mod routing を `src_track` から `dest_track` へ移す。 lane を元トラックに置いたまま
+/// device だけ移すと、 その lane は永久に効かない (engine は持ち主の store から lane を引く)
+/// うえに、 SongDoc の `enforce_edit_invariants` が dangling として消す。
+///
+/// 対象は **運ぶ device 以下の node id 全部** に `bound_node_id` で束縛された住所 (住所の種類を
+/// ここで列挙しない)。 lane の置き場の分岐は `Song::param_stores_mut` / `push_lane` 1 か所。
 fn move_device_bindings(
     song: &mut common::model::Song,
     dev: &Device,
@@ -562,140 +607,54 @@ fn move_device_bindings(
     dest_track: u32,
     outcome: &mut RelocateOutcome,
 ) {
-    let mut move_lanes = |song: &mut common::model::Song, lanes: Vec<common::model::AutomationLane>| {
-        for lane in lanes {
-            let old_id = lane.id;
-            let new_id = push_lane_to(song, dest_track, lane);
+    let mut node_ids: Vec<u64> = Vec::new();
+    common::model::for_each_node_id(std::slice::from_ref(dev), &mut |id| node_ids.push(id));
+    let (lanes, mut routings) = extract_bindings(song, src_track, |target| {
+        target.bound_node_id().is_some_and(|id| node_ids.contains(&id))
+    });
+    move_lanes(song, lanes, src_track, dest_track, outcome);
+    // r.md #89: 移した変調の **深さ** を指すレーン / 変調も一緒に運ぶ。深さの深さ (= 連鎖) も
+    // あり得るので、抜き取るものが無くなるまで回す (src の routing 数は毎周必ず減るので必ず止まる)。
+    while !routings.is_empty() {
+        // `ModRouting.source_id` は `Song.mod_sources` の song-global id なのでそのまま生きる
+        // (再キー不要)。`ModRouting.id` も Song-global なので移送で変えない
+        // (`ModRoutingDepth` の参照が切れる)。
+        let moved_ids: Vec<u32> = routings.iter().map(|r| r.id).filter(|&id| id != 0).collect();
+        if let Some((_, dest)) = song.param_stores_mut(dest_track) {
+            dest.append(&mut routings);
+        }
+        let (dep_lanes, dep_routings) = extract_bindings(song, src_track, |target| {
+            matches!(
+                target,
+                common::model::AutomationTarget::ModRoutingDepth { routing_id } if moved_ids.contains(routing_id)
+            )
+        });
+        move_lanes(song, dep_lanes, src_track, dest_track, outcome);
+        routings = dep_routings;
+    }
+    outcome.moved_devices.extend(node_ids.into_iter().map(|id| (src_track, dest_track, id)));
+}
+
+/// 抜き取った lane を `dest_track` の store へ積み、 再キー表に記録する。 **lane id は必ず
+/// 再採番する** (`push_lane`) — 据え置くと dest 側の既存 lane と衝突し、 選択や行高 override が
+/// silent に別 lane へ付け替わる。
+fn move_lanes(
+    song: &mut common::model::Song,
+    lanes: Vec<common::model::AutomationLane>,
+    src_track: u32,
+    dest_track: u32,
+    outcome: &mut RelocateOutcome,
+) {
+    for lane in lanes {
+        let old_id = lane.id;
+        if let Some(new_id) = song.push_lane(dest_track, lane) {
             outcome.lane_remap.push((src_track, old_id, dest_track, new_id));
         }
-    };
-    let plugin_ids: Vec<u64> = plugins(std::slice::from_ref(dev)).map(|p| p.id).collect();
-    for pid in plugin_ids {
-        let (lanes, mut routings) = extract_device_bindings(song, src_track, pid);
-        move_lanes(song, lanes);
-        // r.md #89: 移した変調の **深さ** を指すレーン / 変調も一緒に運ぶ。深さの
-        // 深さ (= 連鎖) もあり得るので、抜き取るものが無くなるまで回す (src の
-        // routing 数は毎周必ず減るので必ず止まる)。
-        while !routings.is_empty() {
-            let mut moved_ids: Vec<u32> = Vec::new();
-            for routing in routings {
-                // `ModRouting.source_id` は `Song.mod_sources` の song-global id
-                // なのでそのまま生きる (再キー不要)。`ModRouting.id` も Song-global
-                // なので移送で変えない (`ModRoutingDepth` の参照が切れる)。
-                if routing.id != 0 {
-                    moved_ids.push(routing.id);
-                }
-                push_routing_to(song, dest_track, routing);
-            }
-            let (dep_lanes, dep_routings) = extract_depth_bindings(song, src_track, &moved_ids);
-            move_lanes(song, dep_lanes);
-            routings = dep_routings;
-        }
-        outcome.moved_devices.push((src_track, dest_track, pid));
-    }
-    // r.md #110: chain の gain / pan のレーン / 変調も所有 track を移る。
-    let mut chain_ids: Vec<u64> = Vec::new();
-    common::model::for_each_chain(std::slice::from_ref(dev), &mut |_, c| chain_ids.push(c.id));
-    // Parallel の出力 trim のレーン / 変調も (住所は Parallel id)。
-    let mut parallel_ids: Vec<u64> = Vec::new();
-    common::model::for_each_parallel(std::slice::from_ref(dev), &mut |r| parallel_ids.push(r.id));
-    for pid in parallel_ids {
-        let (lanes, routings) = extract_parallel_bindings(song, src_track, pid);
-        move_lanes(song, lanes);
-        for routing in routings {
-            push_routing_to(song, dest_track, routing);
-        }
-    }
-    for cid in chain_ids {
-        let (lanes, routings) = extract_chain_bindings(song, src_track, cid);
-        move_lanes(song, lanes);
-        for routing in routings {
-            push_routing_to(song, dest_track, routing);
-        }
     }
 }
 
-/// この device を指す automation lane / mod routing を所有者から **抜き取る**
+/// `hits` が真になる target を持つ lane / routing を `track_id` の store から抜き取る
 /// (retain ではなく取り出し — 移送先へ渡すため)。
-fn extract_device_bindings(
-    song: &mut common::model::Song,
-    track_id: u32,
-    device_id: u64,
-) -> (
-    Vec<common::model::AutomationLane>,
-    Vec<common::model::ModRouting>,
-) {
-    extract_bindings(song, track_id, |target| {
-        matches!(
-            target,
-            common::model::AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id
-        )
-    })
-}
-
-/// r.md #110: Parallel の出力 trim を指す lane / routing を抜き取る。
-fn extract_parallel_bindings(
-    song: &mut common::model::Song,
-    track_id: u32,
-    parallel_id: u64,
-) -> (
-    Vec<common::model::AutomationLane>,
-    Vec<common::model::ModRouting>,
-) {
-    use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
-    extract_bindings(song, track_id, |target| {
-        matches!(
-            target,
-            T::TrackBuiltin(
-                P::ParallelOutGain { parallel_id: p }
-                    | P::ParallelSplitFreq { parallel_id: p, .. }
-                    | P::ParallelSelect { parallel_id: p }
-            ) if *p == parallel_id
-        )
-    })
-}
-
-/// r.md #110: chain の gain / pan を指す lane / routing を抜き取る。
-fn extract_chain_bindings(
-    song: &mut common::model::Song,
-    track_id: u32,
-    chain_id: u64,
-) -> (
-    Vec<common::model::AutomationLane>,
-    Vec<common::model::ModRouting>,
-) {
-    use common::model::{AutomationTarget as T, TrackBuiltinParam as P};
-    extract_bindings(song, track_id, |target| {
-        matches!(
-            target,
-            T::TrackBuiltin(P::ChainGain { chain_id: c } | P::ChainPan { chain_id: c }) if *c == chain_id
-        )
-    })
-}
-
-/// r.md #89: `routing_ids` の変調の **深さ** を指す automation lane / mod routing を
-/// 所有者から抜き取る。深さの置き場はその変調が置かれているトラック
-/// (`Song::mod_routing_owner`) なので、変調だけ移して深さを元トラックに残すと、
-/// そのレーン / 変調は **二度と評価されない** (engine はトラックから lane を引く)。
-fn extract_depth_bindings(
-    song: &mut common::model::Song,
-    track_id: u32,
-    routing_ids: &[u32],
-) -> (
-    Vec<common::model::AutomationLane>,
-    Vec<common::model::ModRouting>,
-) {
-    extract_bindings(song, track_id, |target| {
-        matches!(
-            target,
-            common::model::AutomationTarget::ModRoutingDepth { routing_id }
-                if routing_ids.contains(routing_id)
-        )
-    })
-}
-
-/// `hits` が真になる target を持つ lane / routing を `track_id`
-/// (`MASTER_TRACK_ID` なら song 側) から抜き取る。
 fn extract_bindings(
     song: &mut common::model::Song,
     track_id: u32,
@@ -704,107 +663,50 @@ fn extract_bindings(
     Vec<common::model::AutomationLane>,
     Vec<common::model::ModRouting>,
 ) {
-    let (lanes_src, routings_src): (
-        &mut Vec<common::model::AutomationLane>,
-        &mut Vec<common::model::ModRouting>,
-    ) = if track_id == common::model::MASTER_TRACK_ID {
-        (&mut song.song_lanes, &mut song.song_mod_routings)
-    } else {
-        match song.tracks.iter_mut().find(|t| t.id == track_id) {
-            Some(t) => (&mut t.automation_lanes, &mut t.mod_routings),
-            None => return (Vec::new(), Vec::new()),
-        }
+    let Some((lanes_src, routings_src)) = song.param_stores_mut(track_id) else {
+        return (Vec::new(), Vec::new());
     };
-    let mut lanes = Vec::new();
-    let mut i = 0;
-    while i < lanes_src.len() {
-        if hits(&lanes_src[i].target) {
-            lanes.push(lanes_src.remove(i));
-        } else {
-            i += 1;
-        }
-    }
-    let mut routings = Vec::new();
-    let mut i = 0;
-    while i < routings_src.len() {
-        if hits(&routings_src[i].target) {
-            routings.push(routings_src.remove(i));
-        } else {
-            i += 1;
-        }
-    }
+    let (lanes, kept): (Vec<_>, Vec<_>) = std::mem::take(lanes_src).into_iter().partition(|l| hits(&l.target));
+    *lanes_src = kept;
+    let (routings, kept): (Vec<_>, Vec<_>) =
+        std::mem::take(routings_src).into_iter().partition(|r| hits(&r.target));
+    *routings_src = kept;
     (lanes, routings)
-}
-
-/// 移送した lane を新しい所有者へ push する。 **lane id は必ず再採番する** —
-/// 据え置くと dest 側の既存 lane と衝突し、 選択や行高 override が silent に
-/// 別 lane へ付け替わる。 戻り値は新 lane id。
-fn push_lane_to(
-    song: &mut common::model::Song,
-    dest_track: u32,
-    mut lane: common::model::AutomationLane,
-) -> u32 {
-    if dest_track == common::model::MASTER_TRACK_ID {
-        let id = song.alloc_song_lane_id();
-        lane.id = id;
-        song.song_lanes.push(lane);
-        id
-    } else if let Some(t) = song.tracks.iter_mut().find(|t| t.id == dest_track) {
-        let id = t.alloc_lane_id();
-        lane.id = id;
-        t.automation_lanes.push(lane);
-        id
-    } else {
-        lane.id
-    }
-}
-
-fn push_routing_to(
-    song: &mut common::model::Song,
-    dest_track: u32,
-    routing: common::model::ModRouting,
-) {
-    if dest_track == common::model::MASTER_TRACK_ID {
-        song.song_mod_routings.push(routing);
-    } else if let Some(t) = song.tracks.iter_mut().find(|t| t.id == dest_track) {
-        t.mod_routings.push(routing);
-    }
 }
 
 /// 自トラックを指していた aux 参照を移動先へ貼り替える。 他トラックを指すものは
 /// 触らない (= その配線はユーザーが意図して張ったもの)。 chain source (同 track の
 /// Parallel 内 chain) は運搬で chain が同 track に残るとは限らないが、 id は不変なので
 /// そのまま (dangling なら compile が黙って落とす)。
-fn retarget_self_track_aux(
-    inst: &mut common::model::PluginInstance,
-    src_track: u32,
-    dest_track: u32,
-) {
-    for slot in &mut inst.aux_inputs {
+///
+/// 対象は `dev` 以下の全 device (Parallel なら中身全部)。aux 入力は plugin と内蔵 Comp / Bus Comp
+/// 共通の slot (`for_each_aux_slot_mut`)、aux 出力は plugin だけ。
+fn retarget_self_track_aux(dev: &mut Device, src_track: u32, dest_track: u32) {
+    common::model::for_each_aux_slot_mut(std::slice::from_mut(dev), &mut |_, _, slot| {
         if let Some(route) = slot
             && let common::model::TapSource::Track(t) = &mut route.tap.source
             && *t == src_track
         {
             *t = dest_track;
         }
-    }
-    for slot in &mut inst.aux_outputs {
-        if let Some(route) = slot
-            && route.dest_track == src_track
-        {
-            route.dest_track = dest_track;
+    });
+    common::model::for_each_plugin_mut(std::slice::from_mut(dev), &mut |inst| {
+        for slot in &mut inst.aux_outputs {
+            if let Some(route) = slot
+                && route.dest_track == src_track
+            {
+                route.dest_track = dest_track;
+            }
         }
-    }
+    });
 }
 
 /// 貼り付け (別プロジェクト由来もありうる) の aux 参照解決。 実在しない track /
 /// chain を指す route は落とす。 **`aux_outputs` も見る** — `build_pasted_tracks` は
 /// `aux_inputs` しか見ていないが、それは取りこぼしなので真似しない。
-fn resolve_aux_refs_after_paste(
-    song: &common::model::Song,
-    inst: &mut common::model::PluginInstance,
-) {
-    for slot in &mut inst.aux_inputs {
+/// 対象は `dev` 以下の全 device (aux 入力は内蔵 Comp / Bus Comp の SC も含む)。
+fn resolve_aux_refs_after_paste(song: &common::model::Song, dev: &mut Device) {
+    common::model::for_each_aux_slot_mut(std::slice::from_mut(dev), &mut |_, _, slot| {
         if let Some(route) = slot {
             let alive = match route.tap.source {
                 common::model::TapSource::Track(t) => song.track_by_id(t).is_some(),
@@ -814,14 +716,16 @@ fn resolve_aux_refs_after_paste(
                 *slot = None;
             }
         }
-    }
-    for slot in &mut inst.aux_outputs {
-        if let Some(route) = slot
-            && song.track_by_id(route.dest_track).is_none()
-        {
-            *slot = None;
+    });
+    common::model::for_each_plugin_mut(std::slice::from_mut(dev), &mut |inst| {
+        for slot in &mut inst.aux_outputs {
+            if let Some(route) = slot
+                && song.track_by_id(route.dest_track).is_none()
+            {
+                *slot = None;
+            }
         }
-    }
+    });
 }
 
 /// 落とし先の副作用: VOICEVOX builtin が入ったら vocal track 化、 Transform が
@@ -881,23 +785,20 @@ fn rekey_param_gestures(
     device_id: u64,
 ) {
     let owns = |key: &(u32, common::model::AutomationTarget)| {
-        key.0 == src_track
-            && matches!(
-                &key.1,
-                common::model::AutomationTarget::PluginParam { device_id: d, .. }
-                    if *d == device_id
-            )
+        key.0 == src_track && key.1.bound_node_id() == Some(device_id)
     };
-    let rekey_set =
-        |set: &mut std::collections::HashSet<(u32, common::model::AutomationTarget)>| {
-            let hits: Vec<_> = set.iter().filter(|k| owns(k)).cloned().collect();
-            for k in hits {
-                set.remove(&k);
-                set.insert((dst_track, k.1));
-            }
-        };
-    rekey_set(&mut recording.active_param_gestures);
-    rekey_set(&mut recording.latched_param_gestures);
+    // 所有者の面は保ったまま鍵だけ付け替える (付け替えた面が引き続き End を出せる)。
+    let hits: Vec<_> = recording.active_param_gestures.keys().filter(|k| owns(k)).cloned().collect();
+    for k in hits {
+        if let Some(surface) = recording.active_param_gestures.remove(&k) {
+            recording.active_param_gestures.insert((dst_track, k.1), surface);
+        }
+    }
+    let hits: Vec<_> = recording.latched_param_gestures.iter().filter(|k| owns(k)).cloned().collect();
+    for k in hits {
+        recording.latched_param_gestures.remove(&k);
+        recording.latched_param_gestures.insert((dst_track, k.1));
+    }
     let hits: Vec<_> = recording.recording_last_beat.keys().filter(|k| owns(k)).cloned().collect();
     for k in hits {
         if let Some(beat) = recording.recording_last_beat.remove(&k) {

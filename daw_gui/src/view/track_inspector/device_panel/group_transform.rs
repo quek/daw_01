@@ -1,44 +1,41 @@
 //! 立ち絵グループの 2D affine + opacity (`docs/plan_tachie_group_transform.md` §5.5)。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::PanelCtx;
 
-pub(super) fn draw_group_transform(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-) -> f32 {
+pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
+    let mut y = ctx.y;
+    let device_id = ctx.device_id;
     // ---- Group Transform section (`docs/plan_tachie_group_transform.md` §5.5) --
     // cursor track が visual group のとき、立ち絵全体の 2D affine + opacity を
     // 数値編集 + per-param「A」automate トグルで expose。image inspector と同
     // idiom。group は表示 clip を持たないので clip 選択ではなく track 選択が
     // トリガ（§5.5）。純 audio バスには出ない（§5.6 group_has_visual_content）。
-    if let Some(summary) = app.inspector_group_transform_summary() {
+    if let Some(summary) = app.inspector_group_transform_summary(device_id) {
         ui.label_at(
-            "inspector_group_transform_label",
+            ("inspector_group_transform_label", device_id),
             "Group Transform",
-            area.x + pad,
+            ctx.x,
             y,
             12.0,
             p.text,
         );
         y += 18.0;
 
-        let row_w = area.w - pad * 2.0;
+        let row_w = ctx.w;
         let input_h = 22.0;
         let label_w = 64.0;
         let auto_btn_w = 22.0;
         let auto_btn_gap = 4.0;
-        let input_x = area.x + pad + label_w;
+        let input_x = ctx.x + label_w;
         let input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
         let auto_btn_x = input_x + input_w + auto_btn_gap;
         let track_id = summary.track_id;
         let gt = summary.transform;
+        // 変調の持ち主 (このグループのトラック) はパネルにつき 1 回だけ解決する。
+        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
 
         for param in crate::app::GROUP_PARAMS {
             use common::model::GroupTransformParam as G;
@@ -107,7 +104,7 @@ pub(super) fn draw_group_transform(
                     "Opacity",
                 ),
             };
-            ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, p.text);
+            ui.label_at((device_id, param, "group_label"), label, ctx.x, y + 5.0, 11.0, p.text);
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range, ..scrub_style(&app.theme) };
             // per-control modulation (docs/plan_modulation_routing_redesign.md §6):
@@ -119,10 +116,10 @@ pub(super) fn draw_group_transform(
             } else {
                 mod_widget::PLAIN_IDENT
             };
-            let g_mod_build = build_mod(app, g_target.clone(), value, g_domain, track_id);
-            let g_modulation = Some(g_mod_build.modulation());
+            let g_mod_build = owner.map(|o| build_mod(app, g_target.clone(), value, g_domain, o));
+            let g_modulation = g_mod_build.as_ref().map(|m| m.modulation());
             let resp = ui.scrubable_number_at(
-                (param, "group_scrub"),
+                (device_id, param, "group_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
                 value,
                 default,
@@ -134,18 +131,25 @@ pub(super) fn draw_group_transform(
             );
             // modulation depth ドラッグの falling edge で host 再同期 (audio target の
             // depth 反映用。visual group transform は compose が即読みするので視覚は即時)。
-            mod_widget::push_mod_depth_bracket(ui, app, track_id, &g_target, resp.mod_dragging);
+            mod_widget::push_mod_depth_bracket(
+                ui,
+                app,
+                crate::app::ParamSurface::Rack,
+                track_id,
+                &g_target,
+                resp.mod_dragging,
+            );
             // drag / text 編集を undo 1 step に bracket
-            // (`view::scrub_gesture` が寿命ごと持つ 1 本)。
+            // (`view::scrub_gesture` が寿命ごと持つ 1 本、所有者は Transform device の Par)。
             crate::view::scrub_gesture::push(
                 ui,
                 app,
-                crate::app::ScrubGesture::GroupTransform(param),
+                crate::app::ScrubGesture::GroupTransform { device_id, param },
                 resp.dragging || resp.editing_text,
             );
             let auto_on = summary.automated[idx];
             ui.toggle_button_at(
-                (param, "group_auto"),
+                (device_id, param, "group_auto"),
                 "A",
                 Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
                 auto_on,

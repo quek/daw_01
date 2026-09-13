@@ -18,6 +18,7 @@ use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+use crate::event_device::DeviceEvent;
 
 /// 「読み込み失敗」 section — plugin_host での load に失敗した device を
 /// **可視化し、 明示的に再 load できる** ようにする。
@@ -94,7 +95,7 @@ pub(super) fn draw_failed_load_section(
             Rect { x: btn_x, y: y + NAME_H, w: BTN_W, h: ROW_H },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ReloadDevice { device_id });
+                    app.handle_event(AppEvent::Device(DeviceEvent::ReloadDevice { device_id }));
                 })
             },
         );
@@ -156,7 +157,7 @@ pub(super) fn draw_parallel_out_section(
             Rect { x: btn_x, y, w: btn_w, h: row_h },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::ExplodeParallelOut { device_id });
+                    app.handle_event(AppEvent::Device(DeviceEvent::ExplodeParallelOut { device_id }));
                 })
             },
         );
@@ -190,11 +191,11 @@ pub(super) fn draw_parallel_out_section(
                 let dest = choice.1;
                 let p = port as u8;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetParallelOutputRoute {
+                    app.handle_event(AppEvent::Device(DeviceEvent::SetParallelOutputRoute {
                         device_id,
                         port: p,
                         dest,
-                    });
+                    }));
                 }));
             }
             y += row_h + row_gap;

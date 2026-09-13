@@ -2369,6 +2369,7 @@ mod tests {
             shmem_id: String::new(),
             metrics_shmem_id: String::new(),
             scope_shmem_id: String::new(),
+            device_scope_shmem_id: String::new(),
             sample_rate: 48_000,
             max_frames: 256,
             channels: 2,

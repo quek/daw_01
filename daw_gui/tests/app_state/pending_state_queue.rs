@@ -14,6 +14,7 @@ use common::protocol::{PluginCommand, PluginEvent};
 
 use daw_gui::shutdown::QuitRequest;
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
+use daw_gui::event_device::DeviceEvent;
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 
@@ -71,9 +72,9 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 
     // 1 回目の RemoveDevices (bitcrush) → queue.len == 1、
     // RequestAllStates が 1 発送られる。
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![bitcrush_dev],
-    });
+    }));
     assert_eq!(
         app.cur.pipc.pending_state_queue.len(),
         1,
@@ -100,9 +101,9 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // device_id** なので、 1 件目の削除で index が詰まっても指す device は
     // 変わらない (旧: positional index を運んでいたので、 実行時の index を
     // 呼び出し側が読み替える必要があった)。
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![delay_dev],
-    });
+    }));
     assert_eq!(
         app.cur.pipc.pending_state_queue.len(),
         2,
@@ -231,9 +232,9 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     // 送信。 live はまだ [synth, bitcrush, delay] (削除は deferred)。
     let bitcrush_dev =
         daw_gui::app::device_id_at(app.cur.song_doc.song(), track_id, 1).expect("bitcrush device id");
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![bitcrush_dev],
-    });
+    }));
     assert_eq!(app.cur.pipc.pending_state_queue.len(), 1, "RemoveDevices enqueues Deferred");
     let _ = drain(&mut plugin_rx);
 
@@ -276,7 +277,8 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     // live は削除を反映している (= [synth, delay]、 bitcrush が抜けて delay が
     // index 1 へ shift)。
     let live_track = app.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id).unwrap();
-    assert_eq!(live_track.devices.len(), 2, "live: bitcrush removed");
+    // 組み込み native (Comp / EQ) はチェーン末尾に居るので plugin だけを数える。
+    assert_eq!(live_track.plugins().count(), 2, "live: bitcrush removed");
     assert_eq!(live_track.devices[0].as_plugin().unwrap().plugin_id, "test.synth");
     assert_eq!(live_track.devices[1].as_plugin().unwrap().plugin_id, "test.delay");
 
@@ -290,7 +292,7 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
                 .expect("snapshot is frozen once the Save reaches the front of the queue");
             let st = snap.tracks.iter().find(|t| t.id == track_id).unwrap();
             assert_eq!(
-                st.devices.len(),
+                st.plugins().count(),
                 2,
                 "snapshot must reflect the post-removal layout (co-temporal with its states)"
             );

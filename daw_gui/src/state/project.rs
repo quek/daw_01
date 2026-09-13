@@ -115,7 +115,7 @@ pub struct ProjectIpc {
     /// device は plugin_host に instance が無い (= そのセッション中ずっと
     /// 無音) 状態で song には残る。 ここに残すことでインスペクタが
     /// 「未ロード」として可視化し、 ユーザーが明示的に再 load できる
-    /// (`AppEvent::ReloadDevice`)。 自動リトライはしない — plugin 側の
+    /// (`DeviceEvent::ReloadDevice`)。 自動リトライはしない — plugin 側の
     /// 恒常的な失敗で無限ループになるため。
     ///
     /// entry の寿命: `track_pending_load` (= 新しい load 要求を送る唯一の
@@ -220,12 +220,16 @@ pub struct ProjectView {
     /// session-only: プロジェクト load / New で clear、 track 削除 / ungroup /
     /// undo-redo 後の照合で生存 id へ prune。 save / Undo 対象外。
     pub collapsed_groups: std::collections::HashSet<u32>,
-    /// mixer strip の Comp セクションを開いているか (**全 ch 一括**、
+    /// Mixer 帯の組み込み Comp のセクションを開いているか (**全 ch 一括**、
     /// `docs/plan_channel_strip.md` §4)。既定は折り畳み。
     /// session-only: 保存 / Undo 対象外 (見方の都合)。
     pub strip_comp_open: bool,
-    /// mixer strip の EQ セクションを開いているか (同上)。
+    /// Mixer 帯の組み込み EQ のセクションを開いているか (同上)。
     pub strip_eq_open: bool,
+    /// r.md #129 Q11 / Q18: 開いている Rack Par (plugin / 映像 FX / VOICEVOX / 字幕 / Transform /
+    /// Native / Limiter)。Par は行ごとに独立して何枚でも開ける。「見方の都合」なので dirty は
+    /// 立てないが `ViewState.open_rack_panels` で保存する (存在しない device は保存時に落とす)。
+    pub open_rack_panels: std::collections::BTreeSet<common::model::RackPanelKey>,
     /// gui_01 #028 (M14 Phase 63n-1): automation lane 群を **展開中** の
     /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
     /// `automation_lanes_collapsed = true` を widget へ渡す。 `+` / `-` click
@@ -449,30 +453,35 @@ pub struct ProjectEphemeral {
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
     /// strip は solo を持たないので None 扱い。
     pub mixer_hovered_track: Option<u32>,
-    /// mixer strip の内蔵チャンネルストリップ帯で、いまカーソルが乗っている
-    /// `(track_id, セクション)` (`docs/plan_channel_strip.md`)。常設帯 (GR / カーブ) と
-    /// 開いているセクションの両方が対象。`Q` (mute) がこれを見て、トラックの mute
-    /// ではなく **そのセクションのバイパス**を切り替える。
-    /// 算出は `view::strip_sections` の 1 か所 (SSoT)、strip 外は `None`。
-    pub mixer_hovered_strip_section: Option<(u32, crate::event::StripSection)>,
-    /// r.md #105: インスペクタのチェーンで、いまカーソルが乗っている行の device id。
-    /// `track_inspector` が毎フレーム更新 (`mixer_hovered_track` と同 idiom)。`Q` が
-    /// これを見て「選択 device があればそれら、無ければこの行」を bypass 切替する。
+    /// r.md #129: Mixer 帯の組み込み Comp / EQ のセクションで、いまカーソルが乗っている device id
+    /// (常設帯 (GR / カーブ) と開いているセクションの両方)。`Q` がこれを見て、トラックの mute
+    /// ではなく **その device の bypass** を切り替える (`handler::bypass_target`)。
+    /// 算出は `view::strip_sections` の 1 か所、帯の外は `None`。
+    pub mixer_hovered_native: Option<u64>,
+    /// r.md #105 / #129: インスペクタ (Rack) で、いまカーソルが乗っている行の Q の宛先。
+    /// `track_inspector` が毎フレーム更新。`Q` がこれを見て「選択 device があればそれら、
+    /// 無ければこの行」を bypass 切替する (master の Limiter 行は Limiter の ON/OFF)。
     /// チェーン外 / インスペクタ非表示は `None`。
-    pub inspector_hovered_device: Option<u64>,
+    pub inspector_hovered_row: Option<crate::handler::bypass_target::BypassTarget>,
     /// r.md #115: インスペクタの変調ラックで、 いまカーソルが乗っているモジュレーター
     /// (ヘッダ行 / 展開した本体) または routing 行。 `modulation_rack` が毎フレーム更新
     /// (`inspector_hovered_device` と同 idiom)。 `Q` がこれを見てバイパスを切り替える。
     pub inspector_hovered_mod: Option<ModRackHover>,
-    /// マスターストリップで、いまカーソルが乗っているブロック
-    /// (`docs/plan_master_strip.md` §3)。`Q` がこれを見てそのセクションの
-    /// バイパスを切り替える。算出は `view::master_strip_ui` の 1 か所。
-    pub master_hovered_section: Option<crate::event::MasterSection>,
-    /// マスターフェーダーを掴んでいるか (undo gesture の edge 検出用)。
-    /// `Song.master_gain` を編集するようになったので、drag 全体を 1 undo step に
-    /// bracket しないと per-frame の編集が履歴を埋める (group transform /
-    /// inspector scrub と同じ罠)。session-only。
-    pub master_gain_dragging: bool,
+    /// r.md #129: マスターパネルで、いまカーソルが乗っているブロックの Q の宛先
+    /// (組み込み Bus Comp / Tone EQ の device か Limiter)。`Q` がこれを見て切り替える。
+    /// publish は `view::master_panel::draw` の 1 か所 (パネルを閉じても残らない)。
+    pub master_panel_hovered: Option<crate::handler::bypass_target::BypassTarget>,
+    /// r.md #129 (§10.14): SC Listen 中の Comp の device id。Option 1 個なので「プロジェクト内で
+    /// 同時に 1 つ」が型で保証される。**聴き方の都合**で Song に書かず、保存も undo もしない。
+    /// 書き込みと `AudioCommand::SetScListen` の送信は `handler::sc_listen::set_sc_listen` だけ。
+    pub sc_listen_device: Option<u64>,
+    /// r.md #129 (§11.2): 直近 `AudioCommand::SetDeviceScopes` で engine に送った device id
+    /// (差分送信用)。respawn で clear し、次のフレームで再送する。session-only。
+    pub device_scopes_sent: Vec<u64>,
+    /// r.md #129 (§7.6): パラメーターのジェスチャーの**在席印**。所有者の面がこのフレームも
+    /// 同じ param を描いたら入る。フレーム末の `view::param_gesture::sweep_param_gestures` が
+    /// 見て、入っていない (= 描かれなくなった) gesture を閉じる (`scrub_gesture_seen` と同じ作り)。
+    pub param_gesture_seen: std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
@@ -523,12 +532,6 @@ pub struct ProjectEphemeral {
     /// 使う。 `None` = clip 領域 / lane 外。 1 フレーム遅延だが pointer は
     /// 瞬間移動しないので実用上問題なし (= `arrange_hover_content` と同 idiom)。
     pub arrange_hovered_automation_lane: Option<common::model::AutomationLaneKey>,
-    /// arrangement ヘッダのトラック音量スライダを drag 中のトラック id
-    /// (`ArrangementResponse.dragging_track_volume` を前フレーム値として mirror)。
-    /// None↔Some の edge で `ParamGestureBegin`/`End` を発火し、 mixer フェーダーと
-    /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
-    /// session-only (`arrange_hover_content` と同 idiom)。
-    pub arrange_dragging_track_volume: Option<u32>,
     /// piano_roll widget が歌詞 inline 編集 (gui_01 #017、 note 上の L キー編集) の
     /// text_input overlay を出している間 `true`。 widget 内部状態 (`PianoRollState`) の
     /// session-only ミラーで、 `piano_roll` widget が毎フレーム `resp.lyric_editing`
@@ -588,11 +591,11 @@ pub struct ProjectEphemeral {
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
     /// session-only (save / Undo 対象外)。
     pub inspector_body_h: f32,
-    /// チェーン行アコーディオンで開いているデバイスの param パネル実高さ
-    /// (px、 前フレーム測定値)。 `reorderable_list_expandable` の `row_extra_h` に渡して
-    /// 開いた行の直下に確保する展開高に使う (lag-by-one、 `inspector_body_h` と同 idiom)。
-    /// session-only。
-    pub inspector_device_panel_h: f32,
+    /// r.md #129: Rack の Par パネルの実測高 (px、前フレーム測定値、`RackPanelKey` ごと)。
+    /// `reorderable_list_expandable` の `row_extra_h` に渡して開いた行の直下に確保する展開高に
+    /// 使う (lag-by-one)。plugin / 映像 FX / VOICEVOX / 字幕 / Transform の Par だけが入る
+    /// (native と Limiter の Par は式で決まる)。実測値 `0.0` もそのまま保持する。session-only。
+    pub rack_panel_heights: std::collections::HashMap<common::model::RackPanelKey, f32>,
     /// auto-fit (`X` キー / `Fit` ボタン / SelectClip 経由) で参照する piano_roll
     /// grid 領域サイズ (px)。`view::root` / `view::bottom_panel` が piano_roll タブ
     /// 描画時に毎フレーム書き込む。0 は「未測定」フラグ扱い (auto-fit を skip)。
@@ -619,19 +622,6 @@ pub struct ProjectEphemeral {
     pub open_sidechain_panel: Option<u64>,
     /// r.md #110: 名前を編集中の chain / Parallel (id) とその編集バッファ。
     pub renaming_chain: Option<(u64, String)>,
-    /// 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
-    /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some(device_id)`
-    /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。
-    ///
-    /// r.md #71 (プラグインのコピー / 移動): cursor track 以外の device を指して
-    /// いたら **閉じるのではなく描画側 gate が非表示にする**。 こうすると device を
-    /// 別トラックへ移してもパネルが自然に追従する。 `None` に落とすのは device が
-    /// song から消えたときだけ。
-    pub open_video_fx_params: Option<u64>,
-    /// 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
-    /// CLAP・VST3) の「⚙」ボタンで開くインライン param パネル。
-    /// `open_video_fx_params` と同 idiom。
-    pub open_plugin_params: Option<u64>,
     /// rename 中の track の **安定 ID** (positional index ではない)。 index で持つと
     /// track の reorder / delete で別 track に rename がすり替わる SSoT 違反になる
     /// (2026-06-09 の「最上段だけ rename できない / フリーズ」バグの原因)。 None で非 rename。
@@ -812,7 +802,7 @@ impl ProjectState {
     /// `song` を中身にした新しい project 状態 (view / 帳簿は空)。
     #[must_use]
     pub fn from_song(key: ProjectKey, song: Song) -> Self {
-        let initial_peak_display = vec![(0.0, 0.0, 0.0); song.tracks.len()];
+        let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
         let initial_bpm = song.bpm;
         let initial_time_sig_num = song.time_sig.0;
         Self {
@@ -859,7 +849,7 @@ impl ProjectState {
                 monitor_notes: std::collections::HashSet::new(),
                 metronome_enabled_pre_recording: None,
                 midi_learn_target: None,
-                active_param_gestures: std::collections::HashSet::new(),
+                active_param_gestures: std::collections::HashMap::new(),
                 latched_param_gestures: std::collections::HashSet::new(),
                 recording_last_beat: std::collections::HashMap::new(),
                 last_sent_recording_lanes: std::collections::HashSet::new(),
@@ -905,6 +895,7 @@ impl ProjectState {
                 collapsed_groups: std::collections::HashSet::new(),
                 strip_comp_open: false,
                 strip_eq_open: false,
+                open_rack_panels: std::collections::BTreeSet::new(),
                 expanded_automation_tracks: std::collections::HashSet::new(),
                 collapsed_parallel_nodes: std::collections::HashSet::new(),
                 master_row_automation_expanded: false,
@@ -956,11 +947,13 @@ impl ProjectState {
                 launcher_pane_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 launcher_grid_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 mixer_hovered_track: None,
-                mixer_hovered_strip_section: None,
-                inspector_hovered_device: None,
+                mixer_hovered_native: None,
+                inspector_hovered_row: None,
                 inspector_hovered_mod: None,
-                master_hovered_section: None,
-                master_gain_dragging: false,
+                master_panel_hovered: None,
+                sc_listen_device: None,
+                device_scopes_sent: Vec::new(),
+                param_gesture_seen: std::collections::HashSet::new(),
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
@@ -971,7 +964,6 @@ impl ProjectState {
                 home_toggle_at_first: false,
                 arrange_hover_content: None,
                 arrange_hovered_automation_lane: None,
-                arrange_dragging_track_volume: None,
                 piano_roll_lyric_editing: false,
                 pianoroll_viewport: None,
                 audio_editor_clip: None,
@@ -981,15 +973,13 @@ impl ProjectState {
                 arrange_zoom_anchor: None,
                 zoom_lane_fill: None,
                 inspector_body_h: 800.0,
-                inspector_device_panel_h: 0.0,
+                rack_panel_heights: std::collections::HashMap::new(),
                 last_pianoroll_grid_size: (0.0, 0.0),
                 pending_pianoroll_fit: false,
                 last_arrange_lanes_size: (0.0, 0.0),
                 last_arrange_rows: Vec::new(),
                 open_sidechain_panel: None,
                 renaming_chain: None,
-                open_video_fx_params: None,
-                open_plugin_params: None,
                 track_rename_id: None,
                 track_rename_text: String::new(),
                 clip_rename: None,

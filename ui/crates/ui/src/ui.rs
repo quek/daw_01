@@ -201,9 +201,11 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// r.md #71 (プラグインのコピー / 移動): widget / view をまたぐ drag の payload
     /// (同時に 1 本)。 詳細と寿命は [`crate::drag_drop`]。
     drag_payload: Option<crate::drag_drop::DragPayload>,
-    /// daw_01 r.md #122: 直近の primary press の所有者 (press〜release の間だけ `Some`)。
+    /// daw_01 r.md #122 / #129: 直近の primary press の所有者と、近さで取り合う当たり判定の勝者。
     /// 詳細は [`crate::click`]。
-    press_owner: Option<WidgetId>,
+    pointer_claims: crate::click::PointerClaims,
+    /// daw_01 r.md #129: ホイールを自分で使う矩形 (`[前フレーム, 今フレーム]`)。詳細は [`crate::wheel`]。
+    wheel_claims: [Vec<Rect>; 2],
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -279,7 +281,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             text_metrics: TextMetrics::new(),
             owned_font_system: None,
             drag_payload: None,
-            press_owner: None,
+            pointer_claims: crate::click::PointerClaims::default(),
+            wheel_claims: [Vec::new(), Vec::new()],
             _m: PhantomData,
         }
     }
@@ -474,7 +477,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// `f` は `(&model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
     /// 内部動作:
     /// 1. scene を積みつつ edits を収集 (build クロージャは古い model 値で 1 度だけ実行)
-    /// 2. 収集した edits を `&mut model` に apply (forward mutation のみ)
+    /// 2. 収集した edits を `&mut model` に apply (forward mutation のみ)。順は prelude
+    ///    ([`Ui::push_prelude_edit`](crate::edit)) → 通常 ([`Ui::push_edit`])、それぞれ push 順
     /// 3. **M8**: clipboard write / file dialog 同期実行 / dialog 結果クリーンアップ
     /// 4. edits / focus 変化があった場合は `redraw_request` を呼ぶ
     ///    → 次フレームで apply 後の値で再描画される (immediate-mode + Edit queue の必然対処)
@@ -592,6 +596,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
     ///
     /// 挙動の特徴:
     /// - 戻り値の `Vec<Edit<M>>` は **apply されていない**。 caller が `apply` を呼ぶ責任を負う。
+    ///   並びがそのまま適用順: prelude ([`Ui::push_prelude_edit`](crate::edit)、push 順) → 通常
+    ///   ([`Ui::push_edit`]、push 順)。 caller は並べ替えずに先頭から apply すること。
     /// - **自動 `request_redraw` は呼ばれない**。 caller が edits 検出時に手動で
     ///   `WindowBackend::request_redraw` を呼ぶ責任を負う。
     /// - undo/redo / clipboard write / dialog 同期実行 など `Edit` 以外の副作用は
@@ -652,12 +658,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
             self.drag_payload = None;
         }
         // daw_01 r.md #124: **ドラッグ中は他の widget の hover を消す。** 前フレームまでに
-        // どこかの widget が press を掴んでいて (`press_owner`)、ボタンがまだ押されていれば
+        // どこかの widget が press を掴んでいて (`pointer_claims`)、ボタンがまだ押されていれば
         // ポインタはそのドラッグのもの — 通り道の部品が光るのは「そこも押せる」と読める誤情報。
         // press フレーム自身は所有者が空 (上で取り直す) なので block しない。
         // 札を運ぶ drag (`drag_payload`) は例外 — 落とし先が光るのはその drag の一部。
         let hover_blocked =
-            pointer.primary_pressed && self.press_owner.is_some() && self.drag_payload.is_none();
+            pointer.primary_pressed && self.pointer_claims.press_held() && self.drag_payload.is_none();
 
         // r.md #71 (プラグインのコピー / 移動): 運搬中の payload の修飾キーを
         // 「**ボタンが押されていた最後のフレーム**」に保つ。 release フレームは
@@ -668,11 +674,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
         {
             p.modifiers = pointer.modifiers;
         }
-        // daw_01 r.md #122: 新しい press は所有者を取り直す (前の gesture の所有者が
-        // release を取りこぼして残っていても引き継がない)。
-        if pointer.primary_just_pressed {
-            self.press_owner = None;
-        }
+        // daw_01 r.md #122 / #129: 新しい press は所有者を取り直し、近さの勝者は今フレーム分を空で
+        // 始める ([`crate::click::PointerClaims::begin_frame`])。
+        self.pointer_claims.begin_frame(pointer.primary_just_pressed);
+        // daw_01 r.md #129: 前フレームのホイール claim だけを残し、今フレームの分を空で始める。
+        self.wheel_claims.swap(0, 1);
+        self.wheel_claims[1].clear();
 
         // M15: OS text store (TSF) がこのフレームに加えた編集 (まぜ書き変換 / 再変換 /
         // composition 確定) を drain し、`ImeEvent` に変換して ime_events 先頭へ置く
@@ -868,6 +875,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             state: &mut self.state,
             scene,
             edits: &mut edits,
+            prelude_len: 0,
             pointer: effective_pointer,
             pointer_raw: pointer,
             modal_capturing,
@@ -914,7 +922,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_double_click_press: &mut pending_double_click_press,
             pending_secondary_click: &mut pending_secondary_click,
             drag_payload: &mut self.drag_payload,
-            press_owner: &mut self.press_owner,
+            pointer_claims: &mut self.pointer_claims,
+            wheel_claims: &mut self.wheel_claims,
             drag_cancel,
             hover_blocked,
             _m: PhantomData,
@@ -1001,7 +1010,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         if pointer.primary_just_released {
             self.drag_payload = None;
             // daw_01 r.md #122: press の所有者は release で終わる ([`crate::click`])。
-            self.press_owner = None;
+            self.pointer_claims.end_press();
         }
         edits
     }
@@ -1030,7 +1039,11 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     control_font_size: f32,
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
-    edits: &'a mut Vec<Edit<M>>,
+    /// このフレームに積まれた Edit。先頭 [`Self::prelude_len`] 個が prelude
+    /// ([`Ui::push_prelude_edit`](crate::edit))、残りが通常 ([`Ui::push_edit`]) で、この並びが適用順。
+    pub(crate) edits: &'a mut Vec<Edit<M>>,
+    /// `edits` の先頭にある prelude の個数 (prelude は通常の Edit より先に適用される)。
+    pub(crate) prelude_len: usize,
     /// widget が読む pointer。`modal_capturing` 中の background 描画 (`drawing_in_popup ==
     /// false`) では `masked_pointer` に差し替わり (pos = None / 全 button false / scroll 0)、
     /// `popup_layer` の body 内 (`drawing_in_popup == true`) では `pointer_raw` に戻る。
@@ -1170,8 +1183,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `Ui` は `&mut UiHost` を持たずフィールドごとに借用する構造なので、 この 1 本を
     /// 通さないと [`crate::drag_drop`] の `impl Ui` から payload に触れない。
     pub(crate) drag_payload: &'a mut Option<crate::drag_drop::DragPayload>,
-    /// daw_01 r.md #122: primary press の所有者 ([`crate::click`])。
-    pub(crate) press_owner: &'a mut Option<WidgetId>,
+    /// daw_01 r.md #122 / #129: primary press の所有者と近さの勝者 ([`crate::click`])。
+    pub(crate) pointer_claims: &'a mut crate::click::PointerClaims,
+    /// daw_01 r.md #129: ホイール claim `[前フレーム, 今フレーム]` ([`crate::wheel`])。
+    pub(crate) wheel_claims: &'a mut [Vec<Rect>; 2],
     /// daw_01 r.md #127: このフレームに「ボタンを押したまま Esc」 が来た
     /// ([`Ui::drag_cancel_requested`])。
     pub(crate) drag_cancel: bool,
@@ -1664,6 +1679,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// エディットを Scene に積む (外部 widget extension で利用可能)。
+    /// 同じフレームの [`Ui::push_prelude_edit`](crate::edit) の Edit より後に適用される。
     pub fn push_edit(&mut self, edit: Edit<M>) {
         self.edits.push(edit);
     }

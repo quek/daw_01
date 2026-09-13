@@ -521,17 +521,19 @@ pub enum AppEvent {
     /// (= 既存 `TouchParam` の subsume)。 audio thread は Step C で
     /// `recording_mode != Read` 時に該当 lane の curve eval を bypass する。
     /// session-only / Undo 対象外 (= mutation は全て session field)。
+    /// r.md #129 (§7.6): 所有者は面つき。名前は handler が `automation_target_label` で作る。
     ParamGestureBegin {
+        surface: crate::state::ParamSurface,
         track_id: u32,
         target: common::model::AutomationTarget,
-        display_name: String,
     },
     /// Phase 4 Step B: parameter knob の drag が **終了** した瞬間に発火。
     /// `active_param_gestures` から remove。 Touch mode では これで該当
     /// lane の recording が止まる (Latch / Write mode は別の latched set
     /// が transport stop まで持続するので、 本イベントだけでは止まらない)。
-    /// session-only / Undo 対象外。
+    /// session-only / Undo 対象外。所有者が `surface` のときだけ閉じる。
     ParamGestureEnd {
+        surface: crate::state::ParamSurface,
         track_id: u32,
         target: common::model::AutomationTarget,
     },
@@ -553,13 +555,13 @@ pub enum AppEvent {
     UngroupTracks {
         track_ids: Vec<u32>,
     },
-    /// Reparent a track. `track_id` becomes a child of `parent_id` (or
-    /// a top-level track when `parent_id == None`). The graph compiler
-    /// rejects the edit (silently keeping the old parent) if it would
-    /// produce a cycle.
+    /// トラック群の親を `parent_id` (None = top-level) にし、`anchor_after` の直後 (None = 先頭) へ
+    /// 並べ替える (アレンジのヘッダ drop)。依存 (親子 / サイドチェイン / send) が循環する付け替えは
+    /// `Song::move_tracks` が拒否し、何も変えずに status で理由を出す。
     SetTrackParent {
-        track_id: u32,
+        track_ids: Vec<u32>,
         parent_id: Option<u32>,
+        anchor_after: Option<u32>,
     },
     RemoveLastTrack,
     /// 選択トラック群の削除 (r.md #43)。 引数は **安定 `Track::id`** の集合
@@ -826,84 +828,14 @@ pub enum AppEvent {
     /// load_overlay に「プラグイン走査中 done/total」を出す。
     RescanProgress { done: usize, total: usize },
 
-    /// r.md #71 (プラグインのコピー / 移動): device を運ぶイベントは **すべて
-    /// 安定 `device_id`** でアドレスする。 positional index だと、 イベント発行と
-    /// 消費の間にチェーンが変わりうる (移動 / 削除) 場面で別 device に効く。
-    ToggleSlotGui { device_id: u64 },
+    /// チェーン上のデバイス (plugin / 映像 FX / Parallel / chain) の操作。 同じく
+    /// 「1 arm = 1 サブ enum」 (`crate::event_device`)。
+    Device(crate::event_device::DeviceEvent),
     /// r.md #55: 開いているプラグインエディタ窓を全部閉じる
     /// (`Ctrl+Shift+W` / View メニュー)。どれが開いているかを知っているのは
     /// 窓の所有者である plugin_host なので、daw_gui は broadcast を 1 通投げるだけ。
     /// Song は触らないので Undo / dirty 対象外。
     CloseAllPluginEditors,
-    /// 内蔵映像 FX の param 調整パネルから 1 param を編集。
-    /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
-    SetVideoFxParam { device_id: u64, param_id: u32, value_real: f32 },
-    /// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルで
-    /// param を 1 つ編集。 `value_real` は表示の実レンジ値 → host が送った
-    /// `PluginParamInfo` の min/max で lane `default_value` (0..=1) へ逆写像。
-    /// scrubable の per-frame 発火なので **非 undoable** (`BeginInspectorScrub`
-    /// で 1 undo step に bracket)。
-    SetPluginParam { device_id: u64, param_id: u32, value_real: f64 },
-    /// inspector の x ボタン / Delete / 右クリックメニュー: 選んだ device を
-    /// chain から削除する。 複数選択を **1 件にまとめて** 運ぶ (id ごとに送ると
-    /// undo が N ステップに割れる)。
-    RemoveDevices { device_ids: Vec<u64> },
-    /// r.md #71 (プラグインのコピー / 移動): 選んだ device を別のチェーンへ運ぶ。
-    /// 既定は移動 (instance を作り直さない = 音が切れない)、 `copy` で複製。
-    RelocateDevices(crate::app_types::RelocateDevices),
-    /// r.md #71: インスペクタのチェーン行を選択する (無修飾 / Ctrl / Shift)。
-    SelectDevice {
-        device_id: u64,
-        modifier: crate::widgets::select_modifier::SelectModifier,
-    },
-    /// inspector 「読み込み失敗」 セクションの「再読込」 ボタン: ロードに
-    /// 失敗した device を、 保存済み state 込みで plugin_host に load し直す。
-    /// 自動リトライはしない (恒常的失敗で無限ループになる) ので、 再試行の
-    /// トリガーは常にこのユーザー操作。 Song は変えない (= 非 undoable)。
-    ReloadDevice { device_id: u64 },
-    /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
-    /// aux input port. `device_id` identifies the plugin instance;
-    /// `port` selects the aux input port on that plugin
-    /// (0 = first sidechain bus); `source` is `Some(track_id)` to wire
-    /// from a track, or `None` to disconnect.
-    SetSidechainSource {
-        device_id: u64,
-        port: u8,
-        /// r.md #110: 他 track か同 track の Parallel 内 chain。 `None` = 切断。
-        source: Option<common::model::TapSource>,
-    },
-    /// r.md #36: このプラグインのエディタ窓で **キーを一切横取りしない** (= REAPER の
-    /// 「Send all keyboard input to plug-in」)。 消化の有無を外に出さない自前描画 GUI
-    /// (Dear ImGui / GLFW 系) 用の逃げ道。 値は project に保存される。
-    SetPluginSendAllKeys {
-        device_id: u64,
-        enabled: bool,
-    },
-    /// r.md #105: device 群を **信号経路から外す / 戻す** (Live の device off)。
-    /// engine は bypass 中の device を dispatch せず音声も MIDI も素通し、 映像 FX は
-    /// 解決から外れる。 `Q` (選択 device or カーソル直下のチェーン行) と チェーン行の
-    /// 右クリックメニュー「無効化 / 有効化」 から。 値は project に保存され undo 対象。
-    SetDevicesBypassed {
-        device_ids: Vec<u64>,
-        bypassed: bool,
-    },
-    /// パラアウト (docs/plan_paraout.md): one-click "explode" — auto-create a
-    /// child track per `is_main=false` output port of the plugin `device_id`,
-    /// group them under the source track, and wire
-    /// each aux output to its new child. The source track becomes a
-    /// group-with-instrument bus (its own main + the children sum through its
-    /// FX/fader). Idempotent: ports already routed to a live track are kept.
-    ExplodeParallelOut {
-        device_id: u64,
-    },
-    /// パラアウト: route a single aux output port to a destination track (or
-    /// `None` = unrouted = silent). Used by the inspector's per-port dropdown
-    /// for re-adjustment after (or instead of) explode.
-    SetParallelOutputRoute {
-        device_id: u64,
-        port: u8,
-        dest: Option<u32>,
-    },
     /// docs/plan_modulation.md §9: create a project-level `ModSource`
     /// of the given kind, owned by the cursor track. follower は cursor track を tap。
     AddModSource { kind: ModSourceKindTag },
@@ -973,40 +905,9 @@ pub enum AppEvent {
     /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
     /// disarms. While armed, inspector param controls enter depth-drag edit mode.
     SetArmedModSource(Option<u32>),
-    /// flip an aux-input route's tap point (sidechain plugin input).
-    SetAuxInputTapPoint {
-        device_id: u64,
-        port: u8,
-        tap_point: common::model::TapPoint,
-    },
-    // -------- r.md #110 Parallel (`docs/plan_parallel.md` §6.3) ------------------
-    /// 空の Parallel (chain 1 本) を `chain` の `index` に挿す。
-    AddParallel { chain: common::model::ChainRef, index: u32 },
-    /// Group (Live の Ctrl+G): 選んだ device を 1 本の chain に入れた Parallel で包む。
-    GroupDevices { device_ids: Vec<u64> },
-    /// Ungroup: Parallel を全 chain の device の直列連結に置換。
-    UngroupParallel { parallel_id: u64 },
-    AddParallelChain { parallel_id: u64 },
-    DuplicateParallelChain { chain_id: u64 },
-    RenameParallelChain { chain_id: u64, name: String },
-    RenameParallel { parallel_id: u64, name: String },
-    SetParallelChainColor { chain_id: u64, color: Option<[f32; 3]> },
-    /// Parallel 自体の色 (括弧の帯)。
-    SetParallelColor { parallel_id: u64, color: Option<[f32; 3]> },
-    /// chain の gain / pan / mute / solo (Song 書き換え + 値のみ IPC)。
-    SetChainMixer { chain_id: u64, edit: crate::handler::parallel::ChainMixerEdit },
-    /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC)。
-    SetParallelMixer { parallel_id: u64, edit: crate::handler::parallel::ParallelMixerEdit },
-    /// r.md #112: Parallel の入力の配り方 (帯域分割など) を切り替える (構造変更、 chain を補完)。
-    SetParallelSplit { parallel_id: u64, split: common::model::Split },
-    /// 見方の都合: Parallel / chain の中身の開閉 (undo 対象外)。 `id` は Parallel か chain。
-    ToggleParallelNodeCollapsed { id: u64 },
+    /// マスターフェーダーの値。drag 全体の undo 1 step は `ScrubGesture::MasterGain` が束ねる
+    /// (`view::scrub_gesture`)。
     SetMasterGain(f32),
-    /// マスターフェーダーの drag 全体を 1 undo step に bracket する
-    /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
-    /// `master_gain` が `Song` に入って undo 対象になったので必要になった。
-    BeginMasterGainDrag,
-    EndMasterGainDrag,
 
     // -------- IPC events from plugin_host ---------------------------------
     /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。
@@ -1118,17 +1019,8 @@ pub enum AppEvent {
     ResetTrackClipColors { track: u32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
-    /// 内蔵チャンネルストリップ (コンプ + EQ) の編集
-    /// (`docs/plan_channel_strip.md`)。**中身はサブ enum 側**が持つ
-    /// ([`StripEdit`]) — ノブ 1 個ごとに variant を並べると、ここの巨大 match が
-    /// さらに 20 行伸びる。Undo 対象 (= 曲の中身が変わる)。
-    StripEdit { track: u32, edit: StripEdit },
-    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) の 1 パラメータ変更
-    /// (`docs/plan_master_strip.md`)。段階式は `MasterStrip::set_param` が段へ丸める。
-    /// Undo 対象 (= 曲の中身が変わる)。
-    MasterStripEdit { param: common::model::MasterStripParam, value: f32 },
-    /// EQ / Comp セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
-    /// 見方の都合なので `UiPrefs` (session-only) に持ち、dirty を立てず Undo にも
+    /// Mixer 帯の組み込み Comp / EQ セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
+    /// 見方の都合なので `ProjectView` (session-only) に持ち、dirty を立てず Undo にも
     /// 積まない (`collapsed_groups` と同じ扱い)。
     ToggleStripSection(StripSection),
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
@@ -1136,17 +1028,27 @@ pub enum AppEvent {
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
-    /// メーター面の 1 tick。`tracks` は per-track の
-    /// `(peak L, peak R, ゲインリダクション dB)`、`master_gr` は
-    /// マスターストリップの `(バスコンプ, リミッター)` の GR (dB、0 以下)。
+    /// メーター面の 1 tick。`tracks` は per-track の `(peak L, peak R)`、`native_gr` は GR を出す
+    /// 内蔵 device の `(device id, GR dB (0 以下))`、id 昇順 (`None` = seqlock が読めなかった = 前回値を保つ)、
+    /// `master_limiter_gr_db` は master Limiter の GR (dB、0 以下)。
     ///
     /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ
     /// 組だから — 別イベントに割ると「同じ buffer の値かどうか」の保証が消える。
     TrackPeaksTick {
         /// アクティブなタブの slot から読んだもの。届いた時点で `cur` が別タブなら捨てる。
         project: common::protocol::ProjectKey,
-        tracks: Vec<(f32, f32, f32)>,
-        master_gr: (f32, f32),
+        tracks: Vec<(f32, f32)>,
+        native_gr: Option<Vec<(u64, f32)>>,
+        master_limiter_gr_db: f32,
+    },
+    /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
+    /// テレメトリポーラが `DeviceScopeReader` + `SpectrumAnalyzer` で作り、**表示が変わった tick だけ**
+    /// 送る (`master_meter::device_spectrum`)。tick の project が現タブのときだけ取り込む。
+    DeviceSpectrumTick {
+        project: common::protocol::ProjectKey,
+        spectra: Vec<(u64, std::sync::Arc<[f32]>)>,
+        /// 表示解像度で量子化した中身のダイジェスト (tick の再描画判定の指紋に混ぜる、r.md #49)。
+        visual_digest: u64,
     },
     /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
     /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`
@@ -1958,15 +1860,6 @@ impl AppEvent {
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",
             E::SetTrackPan { .. } => "パン変更",
-            E::StripEdit { edit, .. } => edit.undo_label(),
-            E::MasterStripEdit { param, .. } => {
-                use common::model::MasterStripParam as M;
-                match param {
-                    M::EqOn | M::EqGain(_) => "マスター EQ 変更",
-                    M::LimiterOn | M::LimiterCeiling => "マスターリミッター変更",
-                    _ => "マスターコンプ変更",
-                }
-            }
             E::ToggleTrackMute(..) => "ミュート切替",
             E::ToggleTrackSolo(..) => "ソロ切替",
             E::SetMasterGain(..) => "マスターゲイン変更",
@@ -1978,40 +1871,8 @@ impl AppEvent {
 
             // ---- デバイス / プラグイン ----
             E::SelectPluginFromDb { .. } => "プラグイン追加",
-            E::RemoveDevices { .. } => "デバイス削除",
-            E::RelocateDevices(req) => {
-                if req.copy {
-                    "デバイスコピー"
-                } else {
-                    "デバイス移動"
-                }
-            }
-            E::AddParallel { .. } => "Parallel 追加",
-            E::GroupDevices { .. } => "Parallel にまとめる",
-            E::UngroupParallel { .. } => "Parallel を解除",
-            E::AddParallelChain { .. } => "chain 追加",
-            E::DuplicateParallelChain { .. } => "chain 複製",
-            E::RenameParallelChain { .. } | E::RenameParallel { .. } => "名前変更",
-            E::SetParallelChainColor { .. } => "chain の色",
-            E::SetParallelColor { .. } => "Parallel の色",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Gain(_), .. } => "chain gain",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Pan(_), .. } => "chain pan",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Muted(_), .. } => "chain mute",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Solo(_), .. } => "chain solo",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::OutGain(_), .. } => "Parallel 出力",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::GainMatch(_), .. } => "Parallel gain match",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SplitFreq { .. }, .. } => "クロスオーバー周波数",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::ActiveChain(_), .. } => "Selector のアクティブ chain",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SelectorFade(_), .. } => "Selector のフェード時間",
-            E::SetParallelSplit { .. } => "Parallel の分割",
-            E::SetVideoFxParam { .. } => "映像FX変更",
-            E::SetPluginParam { .. } => "プラグインパラメータ変更",
-            E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
-            E::SetPluginSendAllKeys { .. } => "プラグインへのキー送出設定",
-            E::SetDevicesBypassed { bypassed: true, .. } => "プラグインを無効化",
-            E::SetDevicesBypassed { bypassed: false, .. } => "プラグインを有効化",
-            E::ExplodeParallelOut { .. } => "パラアウト展開",
-            E::SetParallelOutputRoute { .. } => "パラアウト経路変更",
+            // ラベルの SSoT はサブ enum 側 (`Launcher` と同じ)。
+            E::Device(ev) => ev.undo_label(),
 
             // ---- モジュレーション ----
             E::AddModSource { .. } => "モジュレーション追加",
@@ -2104,83 +1965,7 @@ impl AppEvent {
     }
 }
 
-/// 内蔵チャンネルストリップの 1 操作 ([`AppEvent::StripEdit`] の中身)。
-///
-/// 連続パラメータは `TrackBuiltinParam` をそのまま住所に使う — オートメーション
-/// / 変調の target と同じ型なので、「ノブが動かす値」と「レーンが動かす値」が
-/// 構造的に一致する (対応表を 2 つ持たない)。
-#[derive(Debug, Clone, PartialEq)]
-pub enum StripEdit {
-    /// 連続パラメータ (EQ の Freq/Gain/Q、Comp の Thr/Ratio/Atk/Rel/Gain/SC) と
-    /// セクションのバイパス。値は plain 単位で、可動範囲へは model 側がクランプする。
-    Param { param: common::model::TrackBuiltinParam, value: f32 },
-    /// オートメーションに載せないスイッチ (バンドの ON、シェルフ/ベル、SC Listen)。
-    Switch { switch: StripSwitch, on: bool },
-    /// コンプの動作モード (Leveler / Compressor / Limiter)。
-    CompMode(common::model::CompMode),
-}
-
-impl StripEdit {
-    /// この操作が「どちらのセクションの中身を触ったか」。
-    ///
-    /// 触られたセクションは handler が自動で ON にする (バイパス中にノブを回して
-    /// 無音のままだと、操作が効かなかったようにしか見えない)。**バイパス
-    /// トグルそのもの** (`StripEqOn` / `StripCompOn`) は明示指定なので `None`。
-    #[must_use]
-    pub fn section_touched(&self) -> Option<StripSection> {
-        match self {
-            Self::Param { param, .. } => match param {
-                common::model::TrackBuiltinParam::StripEq { .. } => Some(StripSection::Eq),
-                common::model::TrackBuiltinParam::StripComp { .. } => Some(StripSection::Comp),
-                _ => None,
-            },
-            Self::Switch { switch, .. } => match switch {
-                StripSwitch::BandOn(_) | StripSwitch::Bell(_) => Some(StripSection::Eq),
-                // 検出信号の試聴はコンプが動いていないと意味がない。
-                StripSwitch::ScListen => Some(StripSection::Comp),
-            },
-            Self::CompMode(_) => Some(StripSection::Comp),
-        }
-    }
-
-    #[must_use]
-    pub fn undo_label(&self) -> &'static str {
-        match self {
-            Self::Param { param, .. } => match param {
-                common::model::TrackBuiltinParam::StripCompOn
-                | common::model::TrackBuiltinParam::StripComp { .. } => "コンプ変更",
-                _ => "EQ 変更",
-            },
-            Self::Switch { switch, .. } => match switch {
-                StripSwitch::ScListen => "検出信号の試聴",
-                StripSwitch::BandOn(_) | StripSwitch::Bell(_) => "EQ 変更",
-            },
-            Self::CompMode(_) => "コンプ変更",
-        }
-    }
-}
-
-/// オートメーション対象にしないストリップのスイッチ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StripSwitch {
-    /// EQ 1 バンドの ON/OFF (HP / LP は既定 OFF)。
-    BandOn(common::model::EqBand),
-    /// 両端バンドのシェルフ ⇄ ベル切替。
-    Bell(common::model::EqBand),
-    /// 検出信号そのものをモニタへ出す。**同時に 1 トラックだけ** (solo と同じ)。
-    ScListen,
-}
-
-/// マスターストリップのブロック (`docs/plan_master_strip.md`)。
-/// `Q` キーの対象を「カーソルが乗っているブロック」で決めるのに使う。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MasterSection {
-    Comp,
-    Eq,
-    Limiter,
-}
-
-/// mixer strip で開閉するセクション (全 ch 一括)。
+/// Mixer 帯で開閉するセクション (全 ch 一括)。r.md #129: 中身は組み込み Comp / EQ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripSection {
     Comp,

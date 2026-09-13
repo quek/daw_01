@@ -20,19 +20,22 @@
 //!   バスを置換した」ときだけ merged に寄与する。
 //! - `ParallelEnd`: バス := sum。MIDI := 置換した chain があれば merged (time 順)、無ければ
 //!   parallel 入力の素通し。
+//! - `Native` (r.md #129): 内蔵 device をバスへその場で適用する (audio 置換・MIDI 素通し、
+//!   `graph::native::run_native`)。bypass 中でも op は出ていて、実効の ON/OFF は block 頭で解決する。
 //!
-//! RT 規約: 確保・ロック・I/O なし。scratch は compile 時に Parallel / chain ごとに
+//! RT 規約: 確保・ロック・I/O なし。scratch は compile 時に Parallel / chain / 内蔵 device ごとに
 //! 1 slot ずつ確保済み。
 
 use std::ops::Range;
 
-use common::model::{AutomationTarget, LoopRegion, Song, SplitEdge, TrackBuiltinParam};
+use common::model::{AutomationLane, AutomationTarget, Device, LoopRegion, ModRouting, Song, SplitEdge, TrackBuiltinParam};
 use common::port_config::PortConfig;
 use common::process_data::EventKind;
 
 use crate::engine::{PluginRefs, SyncSlot};
 use crate::graph::DelayLine;
 use crate::graph::band_split::Splitter;
+use crate::graph::native::{NativeIo, NativeScratch};
 use crate::graph::voices::VoiceTable;
 use crate::launcher::TrackRows;
 use crate::mixer::{MAX_EVENTS, MAX_FRAMES};
@@ -74,6 +77,10 @@ pub enum ChainOp {
     },
     /// `parallel_id`: 出力 trim / gain match を Song snapshot から live-read するためのキー。
     ParallelEnd { parallel_slot: u32, parallel_id: u64 },
+    /// r.md #129: 内蔵 DSP を現在のバスへその場で適用する (audio 置換・MIDI 素通し)。
+    /// bypass 中でも op は出す (実効 ON/OFF は block 頭で解決し、切り替えは crossfade)。
+    /// `native_slot` = `ChainProgram::natives` の index (状態は値型の op に持てないので scratch 側)。
+    Native { device_id: u64, native_slot: u32 },
 }
 
 /// Parallel 1 つぶんの RT scratch。
@@ -182,11 +189,26 @@ impl ChainScratch {
     }
 }
 
+/// pass 1 (`process_track_owned`) でこの track が何をするか。compile 時に配線トポロジから焼く
+/// (RT で Song を歩いて判定しない — plugin を列挙する判定は確保を伴う、r.md #129 §18-B と同じ理由)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pass1Role {
+    /// leaf: device チェーン全部 → PostFx 点 → フェーダー。
+    #[default]
+    Leaf,
+    /// group / return / パラアウト先: pass 1 では何もしない (合流と device は pass 2 の `ProcessGroupFx`)。
+    Bus,
+    /// パラアウトの楽器兼 group: 楽器の prefix `[..pass1_end]` だけ。残りとフェーダーは pass 2。
+    GroupWithInstrument,
+}
+
 /// 1 track (または master) の device ツリーを展開した命令列 + その scratch。
 /// `Schedule` が track index 順に 1 つずつ持つ (`track_programs`) + master 用 1 つ。
 pub struct ChainProgram {
     /// 所有 track (`MASTER_TRACK_ID` = master)。automation / 変調の store を引くキー。
     pub track_id: u32,
+    /// pass 1 の役割 (`compile_schedule` が Topology から設定する。master は使わない)。
+    pub pass1_role: Pass1Role,
     pub ops: Vec<ChainOp>,
     /// パラアウト (`docs/plan_paraout.md`): pass 1 で走らせる op の終端 (exclusive)。
     /// 通常は `ops.len()`。group-with-instrument では instrument prefix の終端で、
@@ -200,12 +222,25 @@ pub struct ChainProgram {
     pub delay_keys: Vec<u64>,
     /// r.md #117: plugin ごとのボイス表 (`ChainOp::Plugin::voice_slot`)。 device id で移送。
     pub voices: Vec<VoiceTable>,
+    /// r.md #129: 内蔵 device の scratch (`ChainOp::Native::native_slot`)。device id で移送。
+    pub natives: Vec<NativeScratch>,
+    /// crossfade 中の dry 退避。op は直列なので 1 組。`natives` が空なら確保しない。
+    pub native_dry_l: Vec<f32>,
+    pub native_dry_r: Vec<f32>,
+    /// この track の Pre-FX / PostFx (pre-fader) の snapshot を誰かが読むか。compile 時に焼く
+    /// (RT で Song を歩いて判定しない、§18-B)。PostFx は pre-fader send も含む。
+    pub snapshot_pre_fx: bool,
+    pub snapshot_post_fx: bool,
+    /// SC Listen: この buffer で検出信号を書いた Comp の slot。トラック出力 (PostFx 点) で消費する
+    /// (`graph::native::apply_listen_override`)。
+    pub listen_pending: Option<u32>,
 }
 
 impl ChainProgram {
     pub fn empty(track_id: u32) -> Self {
         Self {
             track_id,
+            pass1_role: Pass1Role::Leaf,
             ops: Vec::new(),
             pass1_end: 0,
             parallels: Vec::new(),
@@ -213,6 +248,12 @@ impl ChainProgram {
             delay_lines: Vec::new(),
             delay_keys: Vec::new(),
             voices: Vec::new(),
+            natives: Vec::new(),
+            native_dry_l: Vec::new(),
+            native_dry_r: Vec::new(),
+            snapshot_pre_fx: false,
+            snapshot_post_fx: false,
+            listen_pending: None,
         }
     }
 
@@ -252,8 +293,14 @@ impl ChainProgram {
                 vt.adopt_state_from(o);
             }
         }
+        // r.md #129: 内蔵 device の DSP 状態は device id で (同じ種類のときだけ)。つまみのドラッグ中は
+        // 編集のたびに再 compile されるので、ここで引き継がないとフィルタとコンプの平滑が毎回切れる。
+        for ns in &mut self.natives {
+            if let Some(o) = old.natives.iter_mut().find(|o| o.device_id == ns.device_id) {
+                ns.adopt_state_from(o);
+            }
+        }
     }
-
 }
 
 /// [`run_chain_program`] に渡す、buffer 全体で共通の文脈。
@@ -273,6 +320,13 @@ pub struct ProgramCtx<'a> {
     /// この pass で捕捉した所有 track の Pre-FX snapshot (`ChainOp::Plugin::own_prefx_ports`
     /// の key)。 捕捉していない pass (master / group-with-instrument の pass 1) は `None`。
     pub own_pre_fx: Option<(&'a [f32], &'a [f32])>,
+    /// r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+    pub native: NativeIo<'a>,
+    /// その program の持ち主の device 列 (内蔵 device の値を引く。op ごとに track を探索しない)。
+    pub owner_devices: &'a [Device],
+    /// その program の持ち主の lane / routing store (`Song::param_stores(track_id)` を program
+    /// 実行ごとに 1 回だけ解決したもの)。
+    pub owner_stores: (&'a [AutomationLane], &'a [ModRouting]),
 }
 
 /// `program.ops[range]` を現在のバス (`bus_l/r` + `midi_a/b`) に対して走らせる。
@@ -297,6 +351,10 @@ pub fn run_chain_program(
         chains,
         delay_lines,
         voices,
+        natives,
+        native_dry_l,
+        native_dry_r,
+        listen_pending,
         ..
     } = program;
     let track_id = *track_id;
@@ -442,6 +500,20 @@ pub fn run_chain_program(
                 // 外側の chain から見ると「この Parallel が MIDI を置換したか」。
                 midi_replaced = rs.any_midi_replaced;
             }
+            ChainOp::Native { native_slot, .. } => {
+                let Some(ns) = natives.get_mut(*native_slot as usize) else { continue };
+                super::native::run_native(
+                    ns,
+                    *native_slot,
+                    (native_dry_l.as_mut_slice(), native_dry_r.as_mut_slice()),
+                    listen_pending,
+                    track_id,
+                    bus_l,
+                    bus_r,
+                    n,
+                    ctx,
+                );
+            }
         }
     }
     midi_replaced
@@ -532,7 +604,7 @@ fn fill_parallel_ramp(
         buf[..n].fill(constant);
         return;
     };
-    let (lanes, routings) = track_stores(song, track_id);
+    let (lanes, routings) = ctx.owner_stores;
     crate::automation::fill_target_ramp(
         song,
         track_id,
@@ -551,21 +623,6 @@ fn fill_parallel_ramp(
     );
 }
 
-/// 所有 track の lane / routing store (master は song 側)。
-fn track_stores(
-    song: &Song,
-    track_id: u32,
-) -> (&[common::model::AutomationLane], &[common::model::ModRouting]) {
-    if track_id == common::model::MASTER_TRACK_ID {
-        (&song.song_lanes, &song.song_mod_routings)
-    } else {
-        match song.track_by_id(track_id) {
-            Some(t) => (&t.automation_lanes, &t.mod_routings),
-            None => (&[], &[]),
-        }
-    }
-}
-
 /// Parallel の出力 trim ramp を埋める (`fill_chain_ramps` と同じ経路)。
 fn fill_parallel_out_ramp(
     ctx: &ProgramCtx<'_>,
@@ -579,7 +636,7 @@ fn fill_parallel_out_ramp(
         rs.out_gain_ramp[..n].fill(out_gain);
         return;
     };
-    let (lanes, routings) = track_stores(song, track_id);
+    let (lanes, routings) = ctx.owner_stores;
     crate::automation::fill_target_ramp(
         song,
         track_id,
@@ -614,7 +671,7 @@ fn fill_chain_ramps(
         cs.pan_ramp[..n].fill(pan);
         return;
     };
-    let (lanes, routings) = track_stores(song, track_id);
+    let (lanes, routings) = ctx.owner_stores;
     crate::automation::fill_target_ramp(
         song,
         track_id,
@@ -873,6 +930,9 @@ mod tests {
             mod_plane: ModTickPlaneRef::default(),
             own_pre_fx: None,
             rows: TrackRows::default(),
+            native: NativeIo::default(),
+            owner_devices: &song.tracks[0].devices,
+            owner_stores: (&[], &[]),
         };
         let mut midi_b = Vec::with_capacity(MAX_EVENTS);
         let len = program.ops.len();
@@ -919,6 +979,9 @@ mod tests {
                 mod_plane: ModTickPlaneRef::default(),
                 own_pre_fx: None,
                 rows: TrackRows::default(),
+                native: NativeIo::default(),
+                owner_devices: &song.tracks[0].devices,
+                owner_stores: (&[], &[]),
             };
             let mut midi = Vec::with_capacity(MAX_EVENTS);
             let mut midi_b = Vec::with_capacity(MAX_EVENTS);
@@ -995,6 +1058,9 @@ mod tests {
                 mod_plane: ModTickPlaneRef::default(),
                 own_pre_fx: None,
                 rows: TrackRows::default(),
+                native: NativeIo::default(),
+                owner_devices: &song.tracks[0].devices,
+                owner_stores: (&[], &[]),
             }
         }
         let mut midi = Vec::with_capacity(MAX_EVENTS);
@@ -1057,6 +1123,9 @@ mod tests {
             mod_plane: ModTickPlaneRef::default(),
             rows: TrackRows::default(),
             own_pre_fx: None,
+            native: NativeIo::default(),
+            owner_devices: &song.tracks[0].devices,
+            owner_stores: (&[], &[]),
         };
         let mut last = 0.0f32;
         // 3 秒ぶん (時定数 0.5 s の 6 倍) 流す。
@@ -1181,6 +1250,9 @@ mod tests {
             mod_plane: ModTickPlaneRef::default(),
             own_pre_fx: None,
             rows: TrackRows::default(),
+            native: NativeIo::default(),
+            owner_devices: &song.tracks[0].devices,
+            owner_stores: (&[], &[]),
         };
         let mut l = vec![0.0; 8];
         l[0] = 1.0;

@@ -149,7 +149,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 .cur.transport
                 .track_peak_display
                 .get(track_idx)
-                .map_or((0.0, 0.0), |&(l, r, _gr)| (l, r)),
+                .copied()
+                .unwrap_or((0.0, 0.0)),
             clips: t
                 .clips
                 .iter()
@@ -210,7 +211,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 t,
                 lane_build_data,
                 &|tgt| app.plugin_param_range(tgt),
-                &|tgt| app.plugin_param_name(tgt),
+                &|tgt| app.lane_node_label(&labels, tgt),
             ),
             row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
@@ -306,7 +307,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         common::model::MASTER_TRACK_ID,
         lane_build_data,
         &|tgt| app.plugin_param_range(tgt),
-        &|tgt| app.plugin_param_name(tgt),
+        &|tgt| app.lane_node_label(&labels, tgt),
     );
     let master_row = ArrangementMasterRow {
         automation_lanes_collapsed: !app.cur.view.master_row_automation_expanded,
@@ -638,7 +639,7 @@ fn build_arrangement_automation_lanes(
     track: &common::model::Track,
     data: LaneBuildData<'_>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
-    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
+    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<Arc<str>>,
 ) -> Vec<ArrangementAutomationLane> {
     build_arrangement_lanes_from_slice(&track.automation_lanes, track.id, data, range_of, param_name_of)
 }
@@ -672,7 +673,7 @@ fn build_arrangement_lanes_from_slice(
     track_id: u32,
     data: LaneBuildData<'_>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
-    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
+    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<Arc<str>>,
 ) -> Vec<ArrangementAutomationLane> {
     let LaneBuildData {
         song,
@@ -687,7 +688,7 @@ fn build_arrangement_lanes_from_slice(
         .iter()
         .map(|lane| {
             let param_name = param_name_of(&lane.target);
-            let display = lane_target_display(&lane.target, param_name.as_deref());
+            let display = lane_target_display(&lane.target, param_name);
             let range = range_of(&lane.target);
             let default_value_norm =
                 common::automation::plain_to_norm_ranged(&lane.target, lane.default_value, range);
@@ -804,9 +805,25 @@ fn intern_send_label(send_id: u32) -> Arc<str> {
     })
 }
 
+/// 内蔵 device のレーン色 (Comp / Bus Comp / Limiter = 橙、EQ / Tone EQ = 青緑)。
+fn native_lane_color(kind: common::model::NativeKind) -> Color {
+    use common::model::NativeKind as K;
+    match kind {
+        K::Comp | K::BusComp => Color::rgb(0.95, 0.65, 0.35),
+        K::Eq | K::ToneEq => Color::rgb(0.40, 0.85, 0.80),
+    }
+}
+
+/// `device_param_name` (song を引いたノード名つきの名前、`AppData::lane_node_label`) の lane ラベル。
+/// 解決できない (song 無しで呼ばれた / ノードが消えた) ときは `fallback`。ノード名はユーザーが変えられる
+/// ので intern しない (世代キャッシュが持つ `Arc` をそのまま使う)。
+fn node_label(device_param_name: Option<Arc<str>>, fallback: impl FnOnce() -> Arc<str>) -> Arc<str> {
+    device_param_name.unwrap_or_else(fallback)
+}
+
 fn lane_target_display(
     target: &common::model::AutomationTarget,
-    plugin_param_name: Option<&str>,
+    device_param_name: Option<Arc<str>>,
 ) -> LaneDisplay {
     use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
@@ -818,27 +835,31 @@ fn lane_target_display(
             label: intern_label("Pan"),
             color: Color::rgb(0.55, 0.92, 0.55),
         },
-        // r.md #110: Parallel chain の gain / pan (Volume / Pan と同じ見た目)。
+        // r.md #110: Parallel chain の gain / pan (Volume / Pan と同じ見た目)。r.md #129 (§7.4):
+        // 同じトラックに Parallel が複数あっても見分けられるよう、ラベルは chain / Parallel の名前つき
+        // ("Chain 1: Gain")。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { .. }) => LaneDisplay {
-            label: intern_label("Chain Gain"),
+            label: node_label(device_param_name, || intern_label("Chain Gain")),
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => LaneDisplay {
-            label: intern_label("Chain Pan"),
+            label: node_label(device_param_name, || intern_label("Chain Pan")),
             color: Color::rgb(0.55, 0.92, 0.55),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { .. }) => LaneDisplay {
-            label: intern_label("Parallel Out"),
+            label: node_label(device_param_name, || intern_label("Parallel Out")),
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         // r.md #112: クロスオーバー周波数 (EQ と同じ青緑系 = 周波数の色)。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { edge, .. }) => LaneDisplay {
-            label: intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge))),
+            label: node_label(device_param_name, || {
+                intern_label(&format!("Split {}", crate::automation_label::split_edge_label(*edge)))
+            }),
             color: Color::rgb(0.40, 0.80, 0.75),
         },
         // r.md #114: Selector のアクティブ chain (切替 = 段階なので橙で他と分ける)。
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => LaneDisplay {
-            label: intern_label("Active"),
+            label: node_label(device_param_name, || intern_label("Active")),
             color: Color::rgb(0.95, 0.65, 0.35),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
@@ -849,50 +870,22 @@ fn lane_target_display(
             label: intern_send_label(*send_id),
             color: Color::rgb(0.85, 0.75, 0.40),
         },
-        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。EQ は青緑 /
-        // コンプは橙で、fx (紫) や volume (水色) と一目で分かれる色に置く。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEqOn) => LaneDisplay {
-            label: intern_label("EQ On"),
-            color: Color::rgb(0.40, 0.85, 0.80),
+        // r.md #129 (§7.4): 内蔵 device。EQ 系は青緑 / コンプ系は橙で、fx (紫) や volume (水色)
+        // と一目で分かれる色に置く。色は song を引かずに種類で決める (song 無しで呼ばれる)。
+        // ラベルは song を引ける側の device 名 ("Comp 2: Thr") があればそれ、無ければ
+        // song 非依存の SSoT (`automation_target_display_name`)。
+        AutomationTarget::NativeParam { param, .. } => LaneDisplay {
+            label: node_label(device_param_name, || {
+                intern_label(&crate::automation_label::automation_target_display_name(target))
+            }),
+            color: native_lane_color(param.kind()),
         },
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripCompOn) => LaneDisplay {
-            label: intern_label("Comp On"),
-            color: Color::rgb(0.95, 0.65, 0.35),
-        },
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
-        | AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { .. }) => {
-            let is_eq = matches!(
-                target,
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { .. })
-            );
-            LaneDisplay {
-                // ラベルの組み立ては song 非依存の SSoT
-                // (`crate::automation_label::automation_target_display_name`) を引く。
-                label: intern_label(&crate::automation_label::automation_target_display_name(
-                    target,
-                )),
-                color: if is_eq {
-                    Color::rgb(0.40, 0.85, 0.80)
-                } else {
-                    Color::rgb(0.95, 0.65, 0.35)
-                },
-            }
-        }
-        // マスターストリップ (docs/plan_master_strip.md)。通常 ch のストリップと
-        // 同系色にしつつ、ラベルで master と分かる (SSoT は automation_label)。
-        AutomationTarget::MasterStrip(param) => LaneDisplay {
+        AutomationTarget::MasterLimiter(_) => LaneDisplay {
             label: intern_label(&crate::automation_label::automation_target_display_name(target)),
-            color: match param {
-                common::model::MasterStripParam::EqOn
-                | common::model::MasterStripParam::EqGain(_) => Color::rgb(0.40, 0.85, 0.80),
-                _ => Color::rgb(0.95, 0.65, 0.35),
-            },
+            color: native_lane_color(common::model::NativeKind::Comp),
         },
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
-            label: match plugin_param_name {
-                Some(name) => intern_label(name),
-                None => intern_label(&format!("Param {param_id}")),
-            },
+            label: node_label(device_param_name, || intern_label(&format!("Param {param_id}"))),
             color: Color::rgb(0.78, 0.55, 0.92),
         },
         // r.md #89: モジュレーターのツマミ / 変調の深さ。ソース名まで入った表示は

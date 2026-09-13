@@ -10,10 +10,10 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::event::NudgeStep;
-use crate::state::ModRackHover;
+use crate::event_device::DeviceEvent;
 use crate::event_launcher::{LauncherCellKey, LauncherEvent};
 use crate::view::{
-    about, arrangement_view, bottom_panel, clipboard_ops, dirty_guard_modal, export_overlay,
+    about, arrangement_view, bottom_panel, bypass_toggle, clipboard_ops, dirty_guard_modal, export_overlay,
     export_range_modal,
     shutdown_overlay,
     font_picker, load_overlay, loudness_report, master_panel, menu_bar, mixer_strips, plugin_picker,
@@ -27,7 +27,8 @@ use crate::event_tabs::TabEvent;
 pub const MENU_H: f32 = 24.0;
 pub const TRANSPORT_H: f32 = 44.0;
 pub const STATUS_H: f32 = 24.0;
-pub const INSPECTOR_W: f32 = 280.0;
+/// インスペクタ (Rack) の固定幅 (r.md #129 Q1/Q2: ドラッグで変えない。 中身は `pad` 12 を除いた 336px)。
+pub const INSPECTOR_W: f32 = 360.0;
 
 /// arrangement (top) と bottom_panel (= piano_roll / mixer / audio_editor) の
 /// 初期分割比率。 上が `default_ratio`、 下が `1.0 - default_ratio`。 0.65 で
@@ -329,7 +330,7 @@ fn draw_device_drag_preview(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let Some((px, py)) = ui.pointer().pos else {
         return;
     };
-    let label = format!("プラグイン {}", p.device_ids.len());
+    let label = format!("デバイス {}", p.device_ids.len());
     let core = &app.theme.core;
     let chip = Rect { x: px + 12.0, y: py + 12.0, w: 120.0, h: 22.0 };
     ui.panel_with_border("device_drag_chip", chip, core.panel_raised, core.accent, 1.0, 3.0);
@@ -456,167 +457,6 @@ fn dispatch_note_nudge(ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
     }
 }
 
-/// `ShortcutMap` ルックアップで判定済みの shortcut name を pull して AppEvent / undo
-/// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
-/// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
-/// (mutation は `Ui::push_edit(Edit::mutate(...))` 経由)。
-///
-/// Q (= 「カーソル直下のものを無効化 / 有効化」) を内蔵チャンネルストリップに
-/// 割り当てる。カーソルが Comp / EQ のセクション本体か常設帯の上にあれば、
-/// そのセクションのバイパスを切り替えて `true`。対象が無ければ `false` で、
-/// 呼び出し側は従来どおり note / clip の mute へ進む。
-///
-/// 対象面の算出は `view::strip_sections` (`mixer_hovered_strip_section`) が SSoT。
-/// r.md #105: `Q` が bypass 切替する device = **カーソル直下のチェーン行だけ** (S キーの
-/// ソロと同じ「カーソルがある行」規則)。 device の選択集合は使わない — チェーン行の
-/// 選択は画面上で見分けにくく、 選択優先にすると「別の行を指して押したのに前に click
-/// した行が切り替わる」 (実機 2026-09-05)。 空 = device は対象外 (clip / note へ落とす)。
-fn q_device_targets(app: &AppData) -> Vec<u64> {
-    app.cur.peph.inspector_hovered_device.into_iter().collect()
-}
-
-/// Q の対象を文脈で決めて mute / bypass を切り替える (`dispatch_shortcuts` の Q 節、 内蔵
-/// ストリップのセクションを先取りした後)。 優先順: 変調ラック (r.md #115) → インスペクタの
-/// device → オートメーションレーン → ノート → クリップ / 時間範囲。
-fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_active: bool) {
-    let device_targets = q_device_targets(app);
-    if let Some(hover) = app.cur.peph.inspector_hovered_mod {
-        // r.md #115: ポインタ下のモジュレーター (ヘッダ / 本体) または routing 行を
-        // バイパス切替。 ラックにボタンは無く、 これが唯一の到達手段 (レーンと同じ)。
-        let song = app.cur.song_doc.song();
-        let event = match hover {
-            ModRackHover::Source(id) => {
-                let enabled = song.mod_sources.iter().find(|m| m.id == id).is_some_and(|m| m.enabled);
-                AppEvent::SetModSourceEnabled { id, enabled: !enabled }
-            }
-            ModRackHover::Routing(routing_id) => {
-                let enabled = song.mod_routing_by_id(routing_id).is_some_and(|r| r.enabled);
-                AppEvent::SetModRoutingEnabled { routing_id, enabled: !enabled }
-            }
-        };
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(event);
-        }));
-    } else if !device_targets.is_empty() {
-        let bypassed = !app.all_devices_bypassed(&device_targets);
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SetDevicesBypassed {
-                device_ids: device_targets,
-                bypassed,
-            });
-        }));
-    } else if let Some(lane) = app.cur.peph.arrange_hovered_automation_lane {
-        // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
-        // ヘッダにボタンは無く、これが唯一の到達手段。
-        let enabled = app
-            .cur.song_doc
-            .song()
-            .automation_lane_by_key(lane.track, lane.lane)
-            .is_some_and(|l| l.enabled);
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SetLaneEnabled {
-                track_id: lane.track,
-                lane_id: lane.lane,
-                enabled: !enabled,
-            });
-        }));
-    } else if is_pianoroll_active && app.cur.peph.audio_editor_clip.is_none() {
-        // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
-        // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
-        // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
-        let notes: Vec<u32> = if !app.selected_note_ids().is_empty() {
-            app.selected_note_ids()
-        } else {
-            app.cur.peph.pianoroll_hover_note.into_iter().collect()
-        };
-        if !notes.is_empty() {
-            let new_muted = !app.all_notes_muted(&notes);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetNotesMuted {
-                    notes,
-                    muted: new_muted,
-                });
-            }));
-        }
-    } else if !is_pianoroll_active && app.cur.selection.time.is_some() {
-        // 範囲が立っていれば **範囲操作** — 境界で分割して範囲部分だけをミュートする
-        // (Live §6.9 "deactivates a selection of material"、
-        // `docs/plan_range_selection.md` §8)。
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.apply_mute_time_selection();
-        }));
-    } else {
-        let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {
-            // audio waveform editor を開いている: その clip を mute。
-            app.cur.peph.audio_editor_clip.into_iter().collect()
-        } else {
-            app.cur.peph.arrangement_hover_clip.into_iter().collect()
-        };
-        if !targets.is_empty() {
-            let new_muted = !app.all_clips_muted(&targets);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipsMuted {
-                    targets,
-                    muted: new_muted,
-                });
-            }));
-        }
-    }
-}
-
-fn toggle_hovered_strip_section(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    mixer_active: bool,
-) -> bool {
-    use crate::event::{MasterSection, StripEdit, StripSection};
-    // マスターパネルは常時描かれるので hover が古くなることはない。ミキサーより
-    // 先に見る (パネルは mixer / arrangement のどちらの上にも無く、排他)。
-    if let Some(section) = app.cur.peph.master_hovered_section {
-        let param = match section {
-            MasterSection::Comp => common::model::MasterStripParam::CompOn,
-            MasterSection::Eq => common::model::MasterStripParam::EqOn,
-            MasterSection::Limiter => common::model::MasterStripParam::LimiterOn,
-        };
-        let on = app.cur.song_doc.song().master_strip.param(param) >= 0.5;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::MasterStripEdit {
-                param,
-                value: f32::from(u8::from(!on)),
-            });
-        }));
-        return true;
-    }
-    // hover 値は strip を描いた frame にしか更新されないので、Mixer タブから
-    // 離れた後も最後の値が残る。**タブと pointer 位置で毎回ゲートする**
-    // (`mixer_hovered_track` を使う S キーと同じ作法) — 無いと Piano Roll に
-    // 切り替えた後の Q がノート mute ではなくストリップ切替になる。
-    if !mixer_active {
-        return false;
-    }
-    let Some((track_id, section)) = app.cur.peph.mixer_hovered_strip_section else {
-        return false;
-    };
-    let param = match section {
-        StripSection::Comp => common::model::TrackBuiltinParam::StripCompOn,
-        StripSection::Eq => common::model::TrackBuiltinParam::StripEqOn,
-    };
-    let on = app
-        .cur.song_doc
-        .song()
-        .track_by_id(track_id)
-        .and_then(|t| t.strip.target_value(&param))
-        .unwrap_or(0.0)
-        >= 0.5;
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::StripEdit {
-            track: track_id,
-            edit: StripEdit::Param { param, value: f32::from(u8::from(!on)) },
-        });
-    }));
-    true
-}
-
 /// `f` キーが発火するイベント。カーソル直下の拍を現在の snap 設定で吸着し
 /// (`alt` = 一時 snap 解除)、どこで押したかで 2 通りに解決する:
 ///
@@ -658,6 +498,11 @@ fn play_from_cursor_event(app: &AppData, alt: bool, is_pianoroll_active: bool) -
     })
 }
 
+/// `ShortcutMap` ルックアップで判定済みの shortcut name を pull して AppEvent / undo
+/// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
+/// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
+/// (mutation は `Ui::push_edit(Edit::mutate(...))` 経由)。
+///
 /// `bottom_rect` は piano_roll active 判定用。マウスが bottom_panel 領域内 + Piano Roll
 /// タブが選択中なら G/X/1/2/3 を piano_roll 系に流す。それ以外は arrange 系。
 fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect) {
@@ -751,7 +596,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         let device_ids = app.live_device_ids();
         if surface == Some(crate::app_types::EditSurface::Devices) && !device_ids.is_empty() {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::GroupDevices { device_ids });
+                app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids }));
             }));
         } else {
             let track_ids = app.cur.selection.selected_track_ids.clone();
@@ -1089,10 +934,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // カーソルがチェーン行の上なら「選択 device があればそれら、無ければその行」、
     // チェーン外でも **最後に選んだ面が device** (last-wins、 `edit_surface` と同じ
     // タイブレーカ) なら選択 device。 どちらでもなければ clip / note へ落とす。
+    // 宛先の解決と発行は `view::bypass_toggle` が持つ。
     let mixer_active = app.cur.view.bottom_panel == Some(0) && pointer_in_bottom;
-    if ui.take_shortcut("daw.toggle_mute") && !toggle_hovered_strip_section(app, ui, mixer_active) {
-        dispatch_toggle_mute(app, ui, is_pianoroll_active);
-    }
+    bypass_toggle::dispatch(app, ui, mixer_active, is_pianoroll_active);
 
     // ----- r.md #87: ランチャーのキー操作 (Tab / 矢印 / Enter) -----
     // **note nudge より先に**呼ぶ (矢印の取り合いをここで決める)。 対象面が

@@ -537,3 +537,48 @@ fn dropping_back_into_the_source_tab_reuses_the_same_media_entry() {
     assert_eq!(song.media.audio_sources.len(), 1, "音源は 1 本のまま (二重登録しない)");
     assert_eq!(song.tracks[0].clips.len(), 2);
 }
+
+/// r.md #129 F-G7 (§10.14 / §10.18): SC Listen はタブごとの session state。audio を respawn したら
+/// タブごとに `OpenProject` → `SetScListen(Some)` の順で再送し、LoadSong (次の flush) より前に届く。
+#[test]
+fn sc_listen_is_resent_per_tab_after_audio_respawn_before_load_song() {
+    use common::model::{CompParam, NativeKind, NativeParamId};
+    use daw_gui::event_device::DeviceEvent;
+    use daw_gui::event_native::NativeEdit;
+
+    let (mut app, mut audio_rx, _plugin_rx, _d) = support::build_app();
+    let listen_on_first_comp = |app: &mut daw_gui::app::AppData| {
+        let track = app.cur.song_doc.song().tracks[0].id;
+        let comp = app.cur.song_doc.song().builtin_native(track, NativeKind::Comp).expect("組み込み Comp").id;
+        app.handle_event(AppEvent::Device(DeviceEvent::NativeEdit {
+            device_id: comp,
+            edit: NativeEdit::param(NativeParamId::Comp(CompParam::Threshold), -10.0),
+        }));
+        app.handle_event(AppEvent::Device(DeviceEvent::SetScListen { device_id: Some(comp) }));
+        comp
+    };
+    let a = app.pk();
+    let comp_a = listen_on_first_comp(&mut app);
+    app.handle_event(AppEvent::Tab(TabEvent::New));
+    let b = app.pk();
+    let comp_b = listen_on_first_comp(&mut app);
+    app.cur.peph.device_scopes_sent = vec![comp_b];
+    let _ = drain(&mut audio_rx);
+
+    app.restore_tabs_after_respawn(common::protocol::ChildKind::Audio);
+    app.flush_song_sync();
+    let sent = drain(&mut audio_rx);
+    for (key, comp) in [(a, comp_a), (b, comp_b)] {
+        let pos = |pred: &dyn Fn(&AudioCommand) -> bool| sent.iter().position(pred);
+        let open = pos(&|c| matches!(c, AudioCommand::OpenProject { project } if *project == key)).expect("OpenProject");
+        let listen = pos(&|c| {
+            matches!(c, AudioCommand::SetScListen { project, device_id } if *project == key && *device_id == Some(comp))
+        })
+        .expect("SetScListen の再送");
+        assert!(open < listen, "{key:?}: OpenProject の後に Listen: {sent:?}");
+        if let Some(load) = pos(&|c| matches!(c, AudioCommand::LoadSong { project, .. } if *project == key)) {
+            assert!(listen < load, "{key:?}: Listen は LoadSong より前: {sent:?}");
+        }
+    }
+    assert!(app.cur.peph.device_scopes_sent.is_empty(), "scope の送信記憶は捨てて次のフレームで再送する");
+}

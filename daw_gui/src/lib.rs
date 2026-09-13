@@ -13,6 +13,8 @@
 pub mod app;
 pub mod app_config;
 pub mod app_types;
+/// インスペクタの chain list の行モデル (`app_types` から切り出し)。
+pub mod chain_rows;
 /// 色編集の宛先 (`color_picker` overlay の対象、`app_types` から切り出し)。
 pub mod color_target;
 pub mod device_addr;
@@ -23,6 +25,10 @@ mod app_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod event;
+/// チェーン上のデバイス操作のイベント (`AppEvent::Device` の中身)。
+pub mod event_device;
+/// r.md #129: 内蔵 device / master Limiter の値編集 (`DeviceEvent::NativeEdit` の中身)。
+pub mod event_native;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
 pub mod event_sampler;

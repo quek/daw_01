@@ -9,7 +9,8 @@ use crate::widgets::arrangement::{live_clip_key, ArrangementResponse};
 use daw_ui_core::{Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget};
+use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget, InsertAt};
+use crate::event_device::DeviceEvent;
 use crate::theme::Theme;
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
@@ -130,18 +131,14 @@ fn device_drag_over_headers(
     else {
         return;
     };
+    // 挿す位置はトラックの既定位置 (r.md #129 Q6: 組み込みの手前)。実行時の Song で解決する。
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        let dest_index = app
-            .cur.song_doc
-            .song()
-            .fx_chain_by_track_id(hover_track)
-            .map_or(0, <[_]>::len) as u32;
-        app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
+        app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(crate::app::RelocateDevices {
             device_ids: payload.device_ids.clone(),
             dest: common::model::ChainRef::Track(hover_track),
-            dest_index,
+            dest_index: InsertAt::Default,
             copy,
-        }));
+        })));
     }));
 }
 
@@ -227,32 +224,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     // arrangement ヘッダのトラック音量スライダ drag を mixer フェーダーと
-    // 同じ gesture 経路に乗せ、 「1 drag = 1 undo step」 にする。 widget が返す
-    // `dragging_track_volume` (drag 中のトラック id) を前フレーム値と差分し、
-    // None→Some で `ParamGestureBegin` (gesture 先頭で 1 snapshot)、 Some→None で
-    // `ParamGestureEnd` を発火する (`push_param_gesture_edges` と同じ edge 検知を
-    // response field 経由で行う)。 これが無いとスライダ操作が undo に積まれず、
-    // mixer フェーダーと同じ「Undo がクリップ移動まで巻き戻る」 症状になる。
-    let drag_vol = resp.dragging_track_volume;
-    if drag_vol != app.cur.peph.arrange_dragging_track_volume {
-        let prev = app.cur.peph.arrange_dragging_track_volume;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            use common::model::{AutomationTarget, TrackBuiltinParam};
-            if let Some(t) = prev {
-                app.handle_event(AppEvent::ParamGestureEnd {
-                    track_id: t,
-                    target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                });
-            }
-            if let Some(t) = drag_vol {
-                app.handle_event(AppEvent::ParamGestureBegin {
-                    track_id: t,
-                    target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                    display_name: "Volume".to_string(),
-                });
-            }
-            app.cur.peph.arrange_dragging_track_volume = drag_vol;
-        }));
+    // 同じ gesture 経路に乗せ、 「1 drag = 1 undo step」 にする。 これが無いとスライダ操作が
+    // undo に積まれず、 mixer フェーダーと同じ「Undo がクリップ移動まで巻き戻る」 症状になる。
+    // r.md #129 (§7.6): 所有者は面つき。**ドラッグ中だけ**申告する — 離したフレームでは申告しない
+    // ので、そのフレーム末の sweep が End を出す (全トラックの非ドラッグを毎フレーム申告すると、
+    // Mixer フェーダーが握っている同じ Volume を閉じてしまう)。 widget は press のフレームに
+    // クリック位置へ飛ぶ値を既に積んでいるが、 申告 (Begin) は prelude キューで値より先に効く。
+    if let Some(t) = resp.dragging_track_volume {
+        crate::view::param_gesture::push_param_gesture(
+            ui,
+            app,
+            crate::app::ParamSurface::ArrangementHeader,
+            t,
+            common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume),
+            true,
+        );
     }
 
     // gui_01 #020 (M14 Phase 63f): clip 上の右クリックメニュー (Make Unique)。

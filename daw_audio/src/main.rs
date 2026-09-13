@@ -27,6 +27,10 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 mod audio_clip_renderer;
 mod audio_worker;
 mod automation;
+#[cfg(test)]
+// r.md #129: 内蔵 device DSP の golden (`native_dsp/golden_v38.txt`) の刺激・統計・形式。
+// 比較は `native_dsp::tests`。
+mod dsp_golden;
 mod engine;
 mod engine_shared;
 mod export;
@@ -36,6 +40,7 @@ mod metronome;
 mod mixer;
 mod mod_plan_publish;
 mod mod_tick;
+mod native_dsp;
 mod offline_jobs;
 mod project_ctl;
 mod sampler;
@@ -44,8 +49,8 @@ mod song_values;
 mod stretch_engine;
 
 use engine::{
-    DeviceBundle, DeviceRt, EngineCommand, EngineShared, PluginEntry, ProjectDelivery, ProjectRt,
-    SharedState, SyncSlot, WorkerRig,
+    DeviceBundle, DeviceRt, EngineCommand, EngineCommandSender, EngineShared, PluginEntry,
+    ProjectDelivery, ProjectRt, SharedState, SyncSlot, WorkerRig,
 };
 use mod_plan_publish::ModPhaseTableBuilder;
 use project_ctl::{DecodeJob, ProjectCtl};
@@ -104,6 +109,13 @@ async fn main() -> Result<()> {
             .context("failed to open scope shmem")?,
     );
     scope.set_sample_rate(session.sample_rate);
+    // r.md #129 §11.2: device 単位のサンプルリング (EQ Par のスペクトラム)。GUI が create したものを open し、
+    // scope project の対象 device の出力を毎バッファ書き込む。
+    let device_scope = Arc::new(
+        common::device_scope_bridge::DeviceScopeBridgeHandle::open(&session.device_scope_shmem_id)
+            .context("failed to open device scope shmem")?,
+    );
+    device_scope.set_sample_rate(session.sample_rate);
 
     let shared = Arc::new(SharedState::new());
     // Engine resources shared between the CPAL closure, the export thread and
@@ -111,9 +123,9 @@ async fn main() -> Result<()> {
     let engine_shared = Arc::new(EngineShared::new());
 
     // Preview / launcher channel: the receive loop pushes light commands here;
-    // the audio thread drains it at the top of every buffer. shmem / worker
-    // pool の重い扱いは bundle ring 経由 (plan §4)。
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<EngineCommand>();
+    // the audio thread drains it at the top of every buffer (rtrb、RT で確保も解放もしない)。
+    // shmem / worker pool の重い扱いは bundle ring 経由 (plan §4)。
+    let (cmd_tx, cmd_rx) = EngineCommandSender::channel();
 
     // plan §4 / `docs/plan_project_tabs.md` §3.2: wait-free SPSC pairs for RT
     // delivery. project slot は `ProjectDelivery` で開閉し、撤去した `ProjectRt` は
@@ -133,6 +145,7 @@ async fn main() -> Result<()> {
         Arc::clone(&bridge),
         Arc::clone(&metrics),
         Arc::clone(&scope),
+        Arc::clone(&device_scope),
         session.sample_rate,
         cmd_rx,
         project_rx,
@@ -524,7 +537,7 @@ struct RecvLoop {
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     session_sample_rate: u32,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    cmd_tx: EngineCommandSender,
     out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     decode_tx: std::sync::mpsc::Sender<DecodeJob>,
     project_tx: rtrb::Producer<ProjectDelivery>,
@@ -556,6 +569,8 @@ fn recv_loop_housekeeping(
         drop(old);
     }
     rl.device_publisher.flush();
+    // ring が満杯の間に溜めた EngineCommand を流す (次のコマンドが来なくても届く)。
+    rl.cmd_tx.flush();
     let mut finished = phase_tables.take_finished();
     for ctl in projects.values_mut() {
         let key = ctl.key();
@@ -697,7 +712,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
             cmd @ (AudioCommand::OpenSamplerRing { .. }
             | AudioCommand::SamplerPreview { .. }
             | AudioCommand::SamplerPreviewStop) => {
-                if sampler::handle_device_command(cmd, &rl.engine_shared, &rl.cmd_tx) {
+                if sampler::handle_device_command(cmd, &rl.engine_shared, &mut rl.cmd_tx) {
                     rl.device_publisher.publish(&rl.engine_shared);
                 }
             }
@@ -785,7 +800,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     cmd,
                     &rl.engine_shared,
                     rl.session_sample_rate,
-                    &rl.cmd_tx,
+                    &mut rl.cmd_tx,
                     &rl.decode_tx,
                     &phase_tables,
                 );
@@ -871,8 +886,9 @@ fn start_output_stream(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     scope: Arc<ScopeBridgeHandle>,
+    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
-    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    cmd_rx: rtrb::Consumer<EngineCommand>,
     project_rx: rtrb::Consumer<ProjectDelivery>,
     project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
     device_rx: rtrb::Consumer<DeviceBundle>,
@@ -925,6 +941,7 @@ fn start_output_stream(
         bridge,
         metrics,
         scope,
+        device_scope,
         session_sample_rate,
         local,
     )?;
@@ -941,6 +958,7 @@ fn build_stream(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     scope: Arc<ScopeBridgeHandle>,
+    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
     // `DeviceRt` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-project scratch — pre-allocated, never
@@ -1006,7 +1024,7 @@ fn build_stream(
                 let cb_start = std::time::Instant::now();
                 let frames = (data.len() / channels_usize).min(max_frames);
 
-                local.process_buffer(&shared, &bridge, &scope, session_sample_rate, frames);
+                local.process_buffer(&shared, &bridge, &scope, &device_scope, session_sample_rate, frames);
 
                 // consume the panic edge to (re)start the master
                 // declick envelope at sample 0 of this buffer.
@@ -1129,7 +1147,7 @@ fn build_stream(
                         // 「新しいフレームが来なかった経過時間ぶんの無音」を自分で
                         // 流し込んで落ちるので、書き手側の後始末が要らない。
                         for p in &local.projects {
-                            bridge.project(p.telemetry_slot).clear_track_meters();
+                            bridge.project(p.telemetry_slot).clear_meters();
                         }
                         dsp_load_ema = 0.0;
                         metrics.set_dsp_load_avg(0.0);

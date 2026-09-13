@@ -31,6 +31,7 @@ use common::port_config::PortConfig;
 
 use daw_gui::app::{AppData, AppEvent};
 use daw_gui::clipboard::{TrackCopy, TracksCopy};
+use daw_gui::event_device::DeviceEvent;
 
 use super::support::build_app;
 
@@ -200,7 +201,7 @@ fn removing_a_device_chains_cleanup_to_depth_refs() {
         "前提: 深さレーン 1 本 + 深さへの変調 1 本"
     );
 
-    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![DEVICE_A] });
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![DEVICE_A] }));
     // device があるので plugin state の round-trip 待ちに積まれる。応答を fake して
     // 実行させる (production の deferred と同じ経路)。
     app.handle_event(AppEvent::Plugin(
@@ -208,7 +209,7 @@ fn removing_a_device_chains_cleanup_to_depth_refs() {
     ));
 
     let t = &app.cur.song_doc.song().tracks[0];
-    assert!(t.devices.is_empty(), "前提: device が消えている");
+    assert!(t.plugins().next().is_none(), "前提: device が消えている (組み込み native は残る)");
     assert!(
         t.mod_routings.is_empty(),
         "消えた変調の深さを変調していた行も連鎖して消える: {:?}",

@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::model::Song;
+use common::model::{Song, StructureWatch};
 
 /// Undo 履歴の上限 (snapshot 方式)。
 const UNDO_LIMIT: usize = 200;
@@ -112,6 +112,11 @@ pub struct SongDoc {
     /// 「Song の中身が変わった」世代 (子プロセス sync が読む)。`edit_epoch` が進む
     /// ときは必ず進み、加えて [`SongDoc::edit_playback`] でも進む。
     sync_epoch: u64,
+    /// live の **id 構造** (トラック / device node / lane / 変調 / binding の id と束縛。範囲は
+    /// [`StructureWatch`] の doc) の観測。編集後の不変条件の回復は、これが変わった編集でだけ回す。
+    structure: StructureWatch,
+    /// id 構造が変わった世代 ([`SongDoc::structure_epoch`])。
+    structure_epoch: u64,
     /// 保存先 (.daw)。 未保存プロジェクトは `None`。
     pub file_path: Option<PathBuf>,
 
@@ -161,7 +166,11 @@ pub struct SongDoc {
 }
 
 impl SongDoc {
-    pub fn new(song: Song) -> Self {
+    pub fn new(mut song: Song) -> Self {
+        // r.md #129: 編集後の不変条件 (組み込みの補充 / dangling の掃除)。baseline 確定前なので
+        // `*` は立たない。
+        let mut structure = StructureWatch::default();
+        song.enforce_edit_invariants_watched(&mut structure);
         Self {
             song,
             edit_epoch: 1,
@@ -169,6 +178,8 @@ impl SongDoc {
             saved_state_id: 1,
             next_state_id: 2,
             sync_epoch: 1,
+            structure,
+            structure_epoch: 1,
             file_path: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -236,7 +247,10 @@ impl SongDoc {
                 state_id: self.state_id,
             });
         }
-        let (r, changed) = f(&mut self.song);
+        let (r, mut changed) = f(&mut self.song);
+        // r.md #129: 編集後の不変条件 (組み込みの正規化 + dangling な lane / routing / binding の
+        // 掃除) は **同じ undo step** で回復する。handler 側に prune を書かない。
+        changed |= self.enforce_invariants();
         if changed {
             self.state_id = self.alloc_state_id();
             // redo は「実際に編集が起きた」 ときだけ無効化する (no-op で
@@ -275,6 +289,7 @@ impl SongDoc {
             return None;
         }
         let r = f(&mut self.song);
+        self.enforce_invariants();
         self.state_id = self.alloc_state_id();
         self.bump_edit_epoch();
         Some(r)
@@ -296,12 +311,31 @@ impl SongDoc {
             self.rejection = Some("書き出し中は編集できません");
             return None;
         }
-        let changed = f(&mut self.song);
+        let changed = f(&mut self.song) | self.enforce_invariants();
         if changed {
             self.state_id = self.alloc_state_id();
             self.bump_edit_epoch();
         }
         Some(changed)
+    }
+
+    /// 編集後の不変条件を、id 構造が前回の回復から変わったときだけ回復する (値だけの編集で曲全体の
+    /// node 表を作り直さない)。構造が変わっていれば `structure_epoch` を進める。戻り値 = 回復で中身が変わったか。
+    fn enforce_invariants(&mut self) -> bool {
+        let outcome = self.song.enforce_edit_invariants_watched(&mut self.structure);
+        if outcome.structure_changed {
+            self.structure_epoch += 1;
+        }
+        outcome.changed
+    }
+
+    /// live の id 構造 (トラック / device node / lane / 変調 / MIDI binding の id と束縛、範囲は
+    /// [`StructureWatch`]) が変わった世代。単調増加。編集 / 正規化 / undo / redo / 履歴ジャンプで構造が
+    /// 実際に変わったときと、[`SongDoc::replace_song`] (同じ id が別の曲の物を指す) で進む。
+    /// id を鍵にした session 状態の後始末を、構造が変わったときだけ回すために使う。
+    /// clip / content / media source / section / scene の id と値の変化では進まない。
+    pub fn structure_epoch(&self) -> u64 {
+        self.structure_epoch
     }
 
     /// ランチャーの**再生状態** (`Track.launcher` / `AutomationLane.launcher` /
@@ -411,6 +445,8 @@ impl SongDoc {
         // 再生状態は履歴に属さない — 差し替えた Song に今の状態を持ち越す
         // (undo でセルが止まったり鳴り出したりしない)。
         self.song.carry_playback_state_from(&current);
+        // 採番の状態も履歴に属さない — 戻した物の id を別の新しい物に振らない (不変条件 1)。
+        self.song.carry_id_high_water_from(&current);
         self.redo_stack.push_back(HistoryEntry {
             song: current,
             label: self.current_label,
@@ -425,6 +461,7 @@ impl SongDoc {
         let next = self.redo_stack.pop_back().expect("caller guarantees non-empty");
         let current = std::mem::replace(&mut self.song, next.song);
         self.song.carry_playback_state_from(&current);
+        self.song.carry_id_high_water_from(&current);
         self.undo_stack.push_back(HistoryEntry {
             song: current,
             label: self.current_label,
@@ -492,6 +529,11 @@ impl SongDoc {
         // 派生キャッシュも作り直す)。 dirty は epoch ではなく `state_id` で見るので、
         // 保存時点の state に戻れば clean になる (r.md #102)。
         self.bump_edit_epoch();
+        // 差し替えた Song の構造を観測する。履歴の Song は回復済みのはずだが、それを前提にはしない
+        // (観測しただけの構造は次の編集で必ず回復を回す、`StructureWatch::observe`)。
+        if self.structure.observe(&self.song) {
+            self.structure_epoch += 1;
+        }
         // gesture squash chain は履歴 jump を跨がない (跨ぐと drag 再開時の
         // snapshot が skip され、 undo 1 回分の状態が履歴から欠落する)。
         self.last_gesture = None;
@@ -501,6 +543,11 @@ impl SongDoc {
     /// する。 (save は履歴を残したいので [`SongDoc::mark_saved`] を使う。)
     pub fn replace_song(&mut self, song: Song) {
         self.song = song;
+        // r.md #129: baseline 確定前に不変条件を回復する (load 経路は正規化済みなので no-op、
+        // script 経路はここで dangling の連鎖掃除まで揃う)。`*` は立たない。
+        self.enforce_invariants();
+        // 構造が同じでも、同じ id は別の曲の物を指す。
+        self.structure_epoch += 1;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.current_label = BASELINE_LABEL;
@@ -819,6 +866,87 @@ mod tests {
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "A", "C"]);
         assert_eq!(doc.history_current(), 2);
         assert!(!doc.can_redo());
+    }
+
+    /// 構造の世代: 値だけの編集では進まず、id 構造 (トラック / device / lane …) が変わった編集と、
+    /// それを戻す undo / redo で進む。New / Open (replace_song) は常に進む。構造を壊した編集は同じ
+    /// step の中で回復される (呼び出し側の宣言は要らない)。
+    #[test]
+    fn structure_epoch_tracks_id_structure_changes() {
+        use common::model::{AutomationLane, AutomationTarget, Track, TrackBuiltinParam};
+        let mut doc = SongDoc::new(Song::default());
+        let e0 = doc.structure_epoch();
+        doc.edit(EditScope::Discrete, |s| s.bpm = 133.0);
+        assert_eq!(doc.structure_epoch(), e0, "値だけの編集では進まない");
+
+        doc.edit(EditScope::Discrete, |s| {
+            let id = s.alloc_track_id();
+            s.tracks.push(Track { id, ..Track::default() });
+        });
+        let e1 = doc.structure_epoch();
+        assert!(e1 > e0, "トラックを足すと進む");
+        let t = doc.song().tracks.last().expect("track");
+        assert_eq!(t.devices.len(), 2, "組み込みは同じ step で補われる");
+        let tid = t.id;
+
+        doc.edit(EditScope::Discrete, |s| {
+            let lane = AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
+            s.push_lane(tid, lane);
+        });
+        let e2 = doc.structure_epoch();
+        assert!(e2 > e1, "lane を足すと進む");
+        doc.edit(EditScope::Discrete, |s| s.tracks.last_mut().expect("track").automation_lanes[0].default_value = 0.5);
+        assert_eq!(doc.structure_epoch(), e2, "lane の値では進まない");
+
+        assert!(doc.undo(), "lane の値を戻す");
+        assert_eq!(doc.structure_epoch(), e2, "値の undo では進まない");
+        assert!(doc.undo(), "lane の追加を戻す");
+        let e3 = doc.structure_epoch();
+        assert!(e3 > e2, "構造の undo で進む");
+        assert!(doc.redo());
+        assert!(doc.structure_epoch() > e3, "構造の redo で進む");
+
+        let e4 = doc.structure_epoch();
+        doc.replace_song(doc.song().clone());
+        assert!(doc.structure_epoch() > e4, "replace_song は同じ構造でも進む");
+    }
+
+    /// 不変条件 1: undo で採番の状態が巻き戻っても、undo した物の id を別の新しい物に振らない。
+    /// redo で戻る物は元の id のまま。undo / redo しても dirty の判定 (保存時点に戻れば clean) は変わらない。
+    #[test]
+    fn undo_does_not_let_ids_be_reused() {
+        use common::model::{ClipContent, MidiContent, Track};
+        let mut doc = SongDoc::new(Song::default());
+        let content = doc
+            .edit(EditScope::Discrete, |s| s.alloc_content(ClipContent::Midi(MidiContent::default()), String::new()))
+            .expect("edit");
+        doc.mark_saved();
+        // (track id, device id, 採番した note id)
+        let alloc = |doc: &mut SongDoc| {
+            doc.edit(EditScope::Discrete, |s| {
+                let tid = s.alloc_track_id();
+                s.tracks.push(Track { id: tid, ..Track::default() });
+                let device = s.alloc_device_id();
+                let note = match s.clip_contents.get_mut(&content) {
+                    Some(ClipContent::Midi(m)) => m.alloc_note_id(),
+                    _ => panic!("content"),
+                };
+                (tid, device, note)
+            })
+            .expect("edit")
+        };
+        let first = alloc(&mut doc);
+        let first_track = doc.song().tracks.last().cloned().expect("track");
+        assert!(doc.undo());
+        assert!(!doc.is_dirty(), "保存時点に戻れば clean (持ち越しは dirty にしない)");
+        assert!(doc.redo());
+        assert_eq!(doc.song().tracks.last(), Some(&first_track), "redo で元の物が同じ id で戻る");
+        assert!(doc.undo());
+        let second = alloc(&mut doc);
+        assert!(second.0 != first.0 && second.1 != first.1 && second.2 != first.2, "{first:?} → {second:?}");
+        let second_builtins: Vec<u64> = doc.song().tracks.last().expect("track").devices.iter().map(|d| d.id()).collect();
+        let first_builtins: Vec<u64> = first_track.devices.iter().map(|d| d.id()).collect();
+        assert!(second_builtins.iter().all(|id| !first_builtins.contains(id)), "{first_builtins:?} / {second_builtins:?}");
     }
 
     /// no-op 編集 (edit_checked が false) は履歴に step を足さない。

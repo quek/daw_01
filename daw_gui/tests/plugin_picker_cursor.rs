@@ -22,6 +22,10 @@ use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
 
+/// plugin DB と無関係に picker に常に並ぶ行: 内蔵 4 種 (Comp / EQ / Bus Comp / Tone EQ、r.md #129 Q8) +
+/// 「Parallel」 (r.md #110)。
+const BUILTIN_ENTRIES: usize = 5;
+
 fn make_plugin_db_with_n_instruments(n: usize) -> Arc<PluginDatabase> {
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
@@ -77,8 +81,8 @@ fn cursor_starts_at_zero_when_picker_opens() {
     let (mut app, _, _) = build_app(5);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
-    // r.md #110: 5 plugin + 「Parallel」。
-    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 6);
+    // r.md #129 (Q8): 先頭の内蔵 4 種 + 「Parallel」 (r.md #110) + 5 plugin。
+    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), BUILTIN_ENTRIES + 5);
 }
 
 #[test]
@@ -107,7 +111,7 @@ fn cursor_clamps_at_upper_bound() {
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(1));
     }
-    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 5); // visible.len() - 1 (5 plugin + Parallel)
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, BUILTIN_ENTRIES + 5 - 1); // visible.len() - 1
 }
 
 #[test]
@@ -137,8 +141,9 @@ fn cursor_resets_to_zero_when_picker_reopened() {
 fn move_is_noop_when_visible_is_empty() {
     let (mut app, _, _) = build_app(0);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
-    // r.md #110: plugin が 0 件でも 「Parallel」 は常に 1 件並ぶ。
-    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 1);
+    // 内蔵 4 種と 「Parallel」 は plugin が 0 件でも常に並ぶので、 何にも一致しないクエリで空にする。
+    app.handle_event(AppEvent::SetPluginPickerQuery("zzz-no-match".into()));
+    assert!(app.ui_ephemeral.plugin_picker_visible.is_empty());
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
@@ -148,7 +153,7 @@ fn large_delta_clamps_to_bounds() {
     let (mut app, _, _) = build_app(3);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::MovePluginPickerCursor(100));
-    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 3); // 3 plugin + Parallel
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, BUILTIN_ENTRIES + 3 - 1); // visible.len() - 1
 
     app.handle_event(AppEvent::MovePluginPickerCursor(-100));
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);

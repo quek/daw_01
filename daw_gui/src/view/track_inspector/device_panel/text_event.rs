@@ -1,18 +1,13 @@
 //! 字幕 (`builtin.video.subtitle`) デバイスの Text Event 編集欄。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::{PanelCtx, opened_plugin_is};
 
-pub(super) fn draw_text_event(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-) -> f32 {
+pub(super) fn draw_text_event(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
+    let mut y = ctx.y;
+    let device_id = ctx.device_id;
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
     // selected_clip が `ClipContent::Text` のとき、 first event の全 field
     // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)
@@ -32,7 +27,7 @@ pub(super) fn draw_text_event(
     // 字幕 device の「Par」を押したときだけ Text Event 欄を出す
     // (= 専用欄を常時表示せず Par パネルに集約)。
     if text_track_has_subtitle
-        && app.subtitle_param_panel_open()
+        && opened_plugin_is(app, device_id, common::plugin_db::SUBTITLE_ID)
         && let Some(summary) = app.inspector_text_event_summary()
     {
         if app.cur.peph.clip_edit_buffer_target != Some(summary.target) {
@@ -43,21 +38,21 @@ pub(super) fn draw_text_event(
         }
 
         ui.label_at(
-            "inspector_text_event_label",
+            ("inspector_text_event_label", device_id),
             "Text Event",
-            area.x + pad,
+            ctx.x,
             y,
             12.0,
             p.text,
         );
         y += 18.0;
 
-        let row_w = area.w - pad * 2.0;
+        let row_w = ctx.w;
         let input_h = 22.0;
         let label_w = 60.0;
         let auto_btn_w = 22.0;
         let auto_btn_gap = 4.0;
-        let input_x = area.x + pad + label_w;
+        let input_x = ctx.x + label_w;
         let numeric_input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
         let string_input_w = row_w - label_w;
         let auto_btn_x = input_x + numeric_input_w + auto_btn_gap;
@@ -66,9 +61,9 @@ pub(super) fn draw_text_event(
         let toggle_h = 24.0;
         let new_mute = !summary.muted;
         ui.toggle_button_at(
-            "inspector_text_mute",
+            ("inspector_text_mute", device_id),
             "Mute",
-            Rect { x: area.x + pad, y, w: row_w, h: toggle_h },
+            Rect { x: ctx.x, y, w: row_w, h: toggle_h },
             summary.muted,
             &toggle_audio_style(&app.theme),
             move |_| {
@@ -84,15 +79,15 @@ pub(super) fn draw_text_event(
 
         // Text content (single-line, Enter で commit)
         ui.label_at(
-            "inspector_text_content_label",
+            ("inspector_text_content_label", device_id),
             "Text",
-            area.x + pad,
+            ctx.x,
             y + 5.0,
             11.0,
             p.text,
         );
         let text_resp = ui.text_input_at(
-            "inspector_text_content_input",
+            ("inspector_text_content_input", device_id),
             Rect { x: input_x, y, w: string_input_w, h: input_h },
             &app.cur.peph.clip_text_content_edit_text,
             &ui.text_input_style(),
@@ -114,9 +109,9 @@ pub(super) fn draw_text_event(
         // フォント (空 = デフォルト)。検索付きモーダルで選び、 ↑↓ / ホバーで
         // キャンバスにライブプレビューされる。
         ui.label_at(
-            "inspector_text_font_label",
+            ("inspector_text_font_label", device_id),
             "Font",
-            area.x + pad,
+            ctx.x,
             y + 5.0,
             11.0,
             p.text,
@@ -127,7 +122,7 @@ pub(super) fn draw_text_event(
             app.cur.peph.clip_text_font_family_edit_text.clone()
         };
         if ui.button_at_clicked(
-            "inspector_text_font_button",
+            ("inspector_text_font_button", device_id),
             &font_btn_label,
             Rect { x: input_x, y, w: string_input_w, h: input_h },
         ) {
@@ -139,9 +134,9 @@ pub(super) fn draw_text_event(
 
         // Align dropdown (Left / Center / Right)
         ui.label_at(
-            "inspector_text_align_label",
+            ("inspector_text_align_label", device_id),
             "Align",
-            area.x + pad,
+            ctx.x,
             y + 5.0,
             11.0,
             p.text,
@@ -153,7 +148,7 @@ pub(super) fn draw_text_event(
             TextAlign::Right => 2,
         };
         if let Some(picked) = ui.dropdown(
-            "inspector_text_align_dropdown",
+            ("inspector_text_align_dropdown", device_id),
             Rect { x: input_x, y, w: string_input_w, h: input_h },
             ALIGN_LABELS,
             align_idx,
@@ -182,7 +177,8 @@ pub(super) fn draw_text_event(
             auto_btn_w,
             input_h,
             fade_max: summary.fade_max_beats.max(0.0),
-            area_x: area.x + pad,
+            area_x: ctx.x,
+            device_id,
         };
         emit_num_row(ui, app, &summary, &lay, "X", TextNumField::X, &mut y);
         emit_num_row(ui, app, &summary, &lay, "Y", TextNumField::Y, &mut y);
@@ -224,15 +220,15 @@ pub(super) fn draw_text_event(
             _ => FadeCurve::Linear,
         };
         ui.label_at(
-            "inspector_text_fade_in_curve_label",
+            ("inspector_text_fade_in_curve_label", device_id),
             "In Curve",
-            area.x + pad,
+            ctx.x,
             y + 5.0,
             11.0,
             p.text,
         );
         if let Some(picked) = ui.dropdown(
-            "inspector_text_fade_in_curve",
+            ("inspector_text_fade_in_curve", device_id),
             Rect { x: input_x, y, w: string_input_w, h: input_h },
             FADE_CURVE_LABELS,
             curve_to_idx(summary.fade_in_curve),
@@ -247,15 +243,15 @@ pub(super) fn draw_text_event(
         }
         y += input_h + 4.0;
         ui.label_at(
-            "inspector_text_fade_out_curve_label",
+            ("inspector_text_fade_out_curve_label", device_id),
             "Out Curve",
-            area.x + pad,
+            ctx.x,
             y + 5.0,
             11.0,
             p.text,
         );
         if let Some(picked) = ui.dropdown(
-            "inspector_text_fade_out_curve",
+            ("inspector_text_fade_out_curve", device_id),
             Rect { x: input_x, y, w: string_input_w, h: input_h },
             FADE_CURVE_LABELS,
             curve_to_idx(summary.fade_out_curve),
@@ -291,8 +287,10 @@ struct NumRowLayout {
     input_h: f32,
     /// fade beats 行の上限 (clip 長。 `summary.fade_max_beats`)。
     fade_max: f64,
-    /// 行の左端 (`area.x + pad`)。
+    /// 行の左端 (`PanelCtx::x`)。
     area_x: f32,
+    /// Par を開いた字幕 device (widget id と undo bracket の鍵)。
+    device_id: u64,
 }
 /// numeric 1 行分 (label + scrubable + automate 「A」 トグル)。
 ///
@@ -313,7 +311,7 @@ fn emit_num_row(
         // 実 advance 69.6px でここを溢れ、 後から描かれる数値ボックスの
         // 不透明背景に末尾が食われていた。
         ui.label_at_clipped(
-            (field, "label"),
+            (lay.device_id, field, "label"),
             label,
             Rect {
                 x: lay.area_x,
@@ -383,13 +381,13 @@ fn emit_num_row(
         scrub_field(
             ui,
             app,
-            (field, "input"),
+            (lay.device_id, field, "input"),
             Rect { x: lay.input_x, y: *row_y, w: lay.numeric_input_w, h: lay.input_h },
             app.inspector_text_num_folded(field),
             default,
             fmt,
             &style,
-            InspectorScrubField::Text(field),
+            InspectorScrubField::Text { device_id: lay.device_id, field },
             move |t, v| {
                 // Rotation のみ degree 入力 → radians に変換 (handler が wrap)。
                 let value = if matches!(field, TextNumField::Rotation) {
@@ -403,7 +401,7 @@ fn emit_num_row(
         if let Some(builtin) = text_num_to_builtin(field) {
             let auto_on = summary.automated.contains(&builtin);
             ui.toggle_button_at(
-                (field, "auto"),
+                (lay.device_id, field, "auto"),
                 "A",
                 Rect { x: lay.auto_btn_x, y: *row_y, w: lay.auto_btn_w, h: lay.input_h },
                 auto_on,

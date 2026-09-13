@@ -3,7 +3,11 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use common::model::Track;
+
+/// live 値を読む 1 フレーム分の文脈 (ランチャーの走行状態の表を 1 回だけ組んで配る)。
+pub struct LiveParamScope {
+    running: Vec<crate::launcher_time::RunningRow>,
+}
 
 impl AppData {
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
@@ -40,41 +44,19 @@ impl AppData {
     }
 
     /// 「＋ Send」 ピッカーに出す宛先候補 `(track_id, display_name)`。
-    /// `src_track_id` 自身は除外し、 加えて「その宛先が send 辺で
-    /// (直接 / 間接に) `src` に戻ってくる」 = ルーティング閉路を作る track
-    /// も除外する。 閉路判定は send グラフ上で `dest` から `src` への
-    /// 到達可能性を BFS で見る (= `dest` を起点に send を辿って `src` に
-    /// 着けば、 `src -> dest` を足すと閉路になる)。 schedule compiler 側も
-    /// 閉路を弾くが、 GUI で予め隠すことで誤操作を防ぐ。
+    /// `src_track_id` 自身と、 send を足すと依存が循環する track を除く (r.md #129 §10.13)。
+    /// 循環の判定は `Song::can_add_send` と同じ依存 graph (children / サイドチェイン / send、
+    /// Structural) — send 辺だけを見ると「子から親 group への send」 が候補に残り、 選ぶと
+    /// `add_send` に拒否される。 graph は候補ごとに組み直さず 1 回だけ組む。
     pub fn send_destination_candidates(&self, src_track_id: u32) -> Vec<(u32, String)> {
-        // dest を起点に send 辺を辿って src に到達するか。 到達するなら
-        // src -> dest は閉路を成すので候補から除く。
-        let creates_cycle = |dest: u32| -> bool {
-            if dest == src_track_id {
-                return true;
-            }
-            let mut stack = vec![dest];
-            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            while let Some(cur) = stack.pop() {
-                if cur == src_track_id {
-                    return true;
-                }
-                if !seen.insert(cur) {
-                    continue;
-                }
-                if let Some(t) = self.cur.song_doc.song().track_by_id(cur) {
-                    for s in &t.sends {
-                        stack.push(s.dest_track_id);
-                    }
-                }
-            }
-            false
-        };
-        self.cur.song_doc.song()
+        use common::routing_deps::{EdgeScope, TrackDeps};
+        let song = self.cur.song_doc.song();
+        let deps = TrackDeps::build(song, EdgeScope::Structural);
+        song
             .tracks
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.id != src_track_id && !creates_cycle(t.id))
+            .filter(|(_, t)| t.id != src_track_id && !deps.would_cycle(t.id, src_track_id))
             .map(|(i, t)| {
                 let name = if t.name.is_empty() {
                     format!("Track {}", i + 1)
@@ -105,71 +87,122 @@ impl AppData {
         depth
     }
 
-    /// `(track, target)` の built-in コントロールが mixer / arrangement で
-    /// **表示すべき値**を返す。 再生中に enabled かつ現在 recording 対象でない
-    /// automation lane があれば playhead 位置の curve 値 (= audio engine の
-    /// `fill_track_param_ramps` と同じ read-mode 解決)、 それ以外 (停止中 / lane 無し
-    /// / 当該 param を書き込み中) は静的な `fallback`。 これで:
+    /// live 値の 1 フレーム分の文脈 ([`LiveParamScope`]) を組む。
+    pub fn live_param_scope(&self) -> LiveParamScope {
+        LiveParamScope { running: self.launcher_running_rows() }
+    }
+
+    /// `(owner, target)` のコントロールが mixer / arrangement / Rack で **表示すべき値**
+    /// (r.md #129 §7.5 の唯一の口)。再生中に enabled かつ現在 recording 対象でない
+    /// automation lane があれば playhead 位置の curve 値 (= audio engine の read-mode 解決)、
+    /// それ以外 (停止中 / lane 無し / 当該 param を書き込み中) は静的な `fallback`。 これで:
     /// - 再生中はノブ / フェーダーがオートメーションに追従して audio と一致して動く、
     /// - 停止中はコントロールをそのまま手動操作でき、
     /// - 書き込み (Touch/Latch/Write) 中の drag はマウスに追従する
     ///   (audio engine の `recording_lanes` bypass と対称)。
     ///
-    /// 変調 (`Track.mod_routings`) は各ノブの per-control modulation overlay
-    /// (`view::modulation::build_mod` の live_display) が別途表示するので、 ここは
-    /// **lane 値のみ**返して二重適用を避ける。
+    /// `owner_id` は store の持ち主 (track id か `MASTER_TRACK_ID` → `song_lanes`)。
+    ///
+    /// 変調は各ノブの per-control modulation overlay (`view::modulation::build_mod` の
+    /// live_display) が別途表示するので、 ここは **lane 値のみ**返して二重適用を避ける。
+    pub(crate) fn live_param_value(
+        &self,
+        owner_id: u32,
+        target: &common::model::AutomationTarget,
+        fallback: f32,
+    ) -> f32 {
+        self.live_param_value_on(&self.live_param_scope(), owner_id, target, fallback)
+    }
+
+    /// 文脈を **呼び側が 1 回だけ組む**版 (トラックを並べる描画で毎回
+    /// `launcher_running_rows()` を組むと行数 × トラック数の O(N²) になる)。
+    pub(crate) fn live_param_value_on(
+        &self,
+        scope: &LiveParamScope,
+        owner_id: u32,
+        target: &common::model::AutomationTarget,
+        fallback: f32,
+    ) -> f32 {
+        match crate::view::native_device::ParamOwner::resolve(self.cur.song_doc.song(), owner_id) {
+            Some(owner) => self.live_lane_value(scope, owner, target, fallback),
+            None => fallback,
+        }
+    }
+
+    /// 本体。store を解決済みで受け取る。
     ///
     /// r.md #87: レーンの値は **行の主導権込み**で解く
     /// ([`crate::launcher_time::RowTimeline`]) — ランチャー主導のレーン行では
     /// engine が `lane.session_clips` のセルを、停止させた行ではレーン既定値 (Q11)
     /// を出すので、ここで `lane.clips` を song の playhead で読むと
-    /// 「聴こえている音量 ≠ フェーダーが指す値」になる。走行状態の表は
-    /// [`Self::launcher_running_rows`] が 1 回組んで配る。
-    pub(crate) fn live_param_value(
-        &self,
-        track: &Track,
-        target: &common::model::AutomationTarget,
-        fallback: f32,
-    ) -> f32 {
-        let running = self.launcher_running_rows();
-        self.live_param_value_on(&self.launcher_timeline(&running), track, target, fallback)
-    }
-
-    /// 走行状態の表を **呼び側が 1 回だけ組む**版 ([`Self::live_param_value`] の本体)。
-    /// `track_mix()` はトラックごとに 2 回呼ぶので、毎回 `launcher_running_rows()`
-    /// を組むと行数 × トラック数の O(N²) になる。
+    /// 「聴こえている音量 ≠ フェーダーが指す値」になる。
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn live_param_value_on(
+    pub(crate) fn live_lane_value(
         &self,
-        rows: &crate::launcher_time::RowTimeline<'_>,
-        track: &Track,
+        scope: &LiveParamScope,
+        owner: crate::view::native_device::ParamOwner<'_>,
         target: &common::model::AutomationTarget,
         fallback: f32,
     ) -> f32 {
-        if !self.cur.transport.is_playing {
+        if !self.cur.transport.is_playing || self.param_is_recording(owner.id, target) {
             return fallback;
         }
-        // `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を
-        // 書き込み中なら lane を読まず手動値を返す (audio thread に送る
-        // `recording_lanes` と同集合 = UI と audio が drift しない)。
-        let key = (track.id, target.clone());
-        let recording = self.cur.recording.recording_mode != common::model::RecordingMode::Read
-            && (self.cur.recording.active_param_gestures.contains(&key)
-                || (matches!(
-                    self.cur.recording.recording_mode,
-                    common::model::RecordingMode::Latch | common::model::RecordingMode::Write
-                ) && self.cur.recording.latched_param_gestures.contains(&key)));
-        if recording {
-            return fallback;
-        }
-        let Some(lane) = track
-            .automation_lanes
-            .iter()
-            .find(|l| l.enabled && l.target == *target)
-        else {
+        let Some(lane) = owner.lanes.iter().find(|l| l.enabled && l.target == *target) else {
             return fallback;
         };
-        rows.lane_value(track.id, lane, self.cur.song_doc.song()) as f32
+        self.launcher_timeline(&scope.running).lane_value(owner.id, lane, self.cur.song_doc.song()) as f32
+    }
+
+    /// 内蔵 device の 1 param の表示値 (plain)。静的な値は `dev` (On は `bypassed` の反転)。
+    pub fn live_native_param(
+        &self,
+        scope: &LiveParamScope,
+        owner: crate::view::native_device::ParamOwner<'_>,
+        dev: &common::model::NativeDevice,
+        p: common::model::NativeParamId,
+    ) -> f32 {
+        let target = common::model::AutomationTarget::NativeParam { device_id: dev.id, param: p };
+        self.live_lane_value(scope, owner, &target, dev.param(p).unwrap_or(0.0))
+    }
+
+    /// 行のミニ表示 / Par のカーブ用に、レーンの値を重ねた device (engine の
+    /// `resolve_native_device` の GUI 版。変調は `build_mod` が別途表示する)。
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn live_native_device(
+        &self,
+        scope: &LiveParamScope,
+        owner: crate::view::native_device::ParamOwner<'_>,
+        dev: &common::model::NativeDevice,
+    ) -> common::model::NativeDevice {
+        let mut out = *dev;
+        if !self.cur.transport.is_playing {
+            return out;
+        }
+        let timeline = self.launcher_timeline(&scope.running);
+        for lane in owner.lanes.iter().filter(|l| l.enabled) {
+            let common::model::AutomationTarget::NativeParam { device_id, param } = lane.target else {
+                continue;
+            };
+            if device_id != dev.id || self.param_is_recording(owner.id, &lane.target) {
+                continue;
+            }
+            out.set_param(param, timeline.lane_value(owner.id, lane, self.cur.song_doc.song()) as f32);
+        }
+        out
+    }
+
+    /// `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を書き込み中なら
+    /// lane を読まず手動値を返す (audio thread に送る `recording_lanes` と同集合 = UI と audio が
+    /// drift しない)。
+    fn param_is_recording(&self, owner_id: u32, target: &common::model::AutomationTarget) -> bool {
+        let rec = &self.cur.recording;
+        let key = (owner_id, target.clone());
+        rec.recording_mode != common::model::RecordingMode::Read
+            && (rec.active_param_gestures.contains_key(&key)
+                || (matches!(
+                    rec.recording_mode,
+                    common::model::RecordingMode::Latch | common::model::RecordingMode::Write
+                ) && rec.latched_param_gestures.contains(&key)))
     }
 
     /// いまの playhead と engine の走行状態から組んだ行解決器。
@@ -228,19 +261,17 @@ impl AppData {
         };
         // r.md #87: 行の主導権込みでレーン値を解く表は **1 フレームに 1 回**組む
         // (トラックごとに組むと行数 × トラック数の O(N²) になる)。
-        let running = self.launcher_running_rows();
-        let rows = self.launcher_timeline(&running);
+        let scope = self.live_param_scope();
         let live = |t: &common::model::Track, p: common::model::TrackBuiltinParam, fallback: f32| {
             let target = common::model::AutomationTarget::TrackBuiltin(p);
-            self.live_param_value_on(&rows, t, &target, fallback)
+            self.live_lane_value(&scope, crate::view::native_device::ParamOwner::of_track(t), &target, fallback)
         };
         self.cur.song_doc.song()
             .tracks
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let (l, r, gr) =
-                    self.cur.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                let (l, r) = self.cur.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0));
                 TrackMixEntry {
                     index: i as u32,
                     track_id: t.id,
@@ -258,7 +289,6 @@ impl AppData {
                     solo: t.solo,
                     peak_l_raw: l,
                     peak_r_raw: r,
-                    gain_reduction_db: gr,
                     is_group: is_group_set.contains(&t.id),
                     is_return: is_return_set.contains(&t.id),
                     depth: compute_depth(t.id),
@@ -506,34 +536,65 @@ impl AppData {
             .map_or_else(|| self.resolve_name(&inst.plugin_id), |def| def.name.to_string())
     }
 
-    /// `PluginParam` target の **完全修飾** param 名 (r.md #72 / #78)。
-    /// 形は `"<device 名>: <param 名>"`、 CLAP が `module` (= "/" 区切りの
-    /// グループパス) を報告していれば `"<device 名>: <module>/<param 名>"`。
+    /// **チェーン上のノード (device / chain / Parallel) で束縛する** target の、song を引いた
+    /// **完全修飾** 名 (r.md #72 / #78 / #129 §7.4)。形は `"<ノード名>: <param 名>"`:
     ///
-    /// device 名を必ず付けるのが要点で、 これが無いと MPhaser の "Dry/Wet" と
+    /// | target | 名前 |
+    /// |---|---|
+    /// | `PluginParam` | `"<device 名>: <param 名>"` (CLAP が `module` を報告していれば `"<device 名>: <module>/<param 名>"`) |
+    /// | `NativeParam` | `native_param_label(display_name, p)` = `"Comp 2: Thr"` |
+    /// | `ChainGain` / `ChainPan` | `"<chain 名>: Gain"` / `"<chain 名>: Pan"` |
+    /// | `ParallelOutGain` / `ParallelSplitFreq` / `ParallelSelect` | `"<Parallel 名>: Out"` / `"<Parallel 名>: Split Low\|Mid"` / `"<Parallel 名>: Active"` |
+    ///
+    /// ノード名を必ず付けるのが要点で、 これが無いと MPhaser の "Dry/Wet" と
     /// MSaturator の "Dry/Wet" が同一表示になる (r.md #72)。 modulation ラックの
     /// 接続行・ arrangement lane header・ status message が**同じこの 1 本**を
     /// 使うので、 名前の付け方はここだけを直せばよい。
     ///
     /// 内蔵映像 FX は host が `PluginParamList` を送らない (param 表は静的
-    /// マニフェスト) ので、 そちらから引く。 非 plugin target / device が消えて
-    /// いる / host 未送 / 空名 は `None` (caller が generic 名へ fallback)。
-    pub fn plugin_param_name(&self, target: &common::model::AutomationTarget) -> Option<String> {
-        let common::model::AutomationTarget::PluginParam { device_id, param_id, .. } = target
-        else {
-            return None;
+    /// マニフェスト) ので、 そちらから引く。 ノードで束縛しない target / ノードが消えて
+    /// いる / host 未送 / 空名 は `None` (caller が song 非依存の名前へ fallback)。
+    pub fn device_param_name(&self, target: &common::model::AutomationTarget) -> Option<String> {
+        use common::model::{AutomationTarget as T, TrackBuiltinParam as B};
+        let song = self.cur.song_doc.song();
+        let (device_id, param_id) = match target {
+            T::PluginParam { device_id, param_id, .. } => (*device_id, *param_id),
+            T::NativeParam { device_id, param } => {
+                return Some(common::model::native_param_label(&song.native_by_id(*device_id)?.display_name(), *param));
+            }
+            T::TrackBuiltin(B::ChainGain { chain_id }) => return Some(format!("{}: Gain", song.chain_by_id(*chain_id)?.1.name)),
+            T::TrackBuiltin(B::ChainPan { chain_id }) => return Some(format!("{}: Pan", song.chain_by_id(*chain_id)?.1.name)),
+            T::TrackBuiltin(B::ParallelOutGain { parallel_id }) => {
+                return Some(format!("{}: Out", song.parallel_by_id(*parallel_id)?.name));
+            }
+            T::TrackBuiltin(B::ParallelSplitFreq { parallel_id, edge }) => {
+                let edge = crate::automation_label::split_edge_label(*edge);
+                return Some(format!("{}: Split {edge}", song.parallel_by_id(*parallel_id)?.name));
+            }
+            T::TrackBuiltin(B::ParallelSelect { parallel_id }) => {
+                return Some(format!("{}: Active", song.parallel_by_id(*parallel_id)?.name));
+            }
+            T::TrackBuiltin(B::Volume | B::Pan | B::Mute | B::SendGain { .. })
+            | T::MasterLimiter(_)
+            | T::SongTempo
+            | T::SongTimeSigNumerator
+            | T::ImageBuiltin(_)
+            | T::TextBuiltin(_)
+            | T::GroupTransform(_)
+            | T::ModSourceParam { .. }
+            | T::ModRoutingDepth { .. } => return None,
         };
-        let inst = self.cur.song_doc.song().plugin_by_id(*device_id)?;
+        let inst = song.plugin_by_id(device_id)?;
         let device = self.device_label(inst);
         if let Some(def) = common::video_fx::def_by_id(&inst.plugin_id) {
-            let param = def.param(*param_id)?;
+            let param = def.param(param_id)?;
             return Some(format!("{device}: {}", param.name));
         }
         let info = self
             .cur.pipc.plugin_params
-            .get(device_id)?
+            .get(&device_id)?
             .iter()
-            .find(|p| p.id == *param_id)?;
+            .find(|p| p.id == param_id)?;
         if info.name.is_empty() {
             return None;
         }
@@ -545,8 +606,9 @@ impl AppData {
     }
 
     /// `automation_target_display_name` の song-aware 版 (B6 / r.md #8)。
-    /// `PluginParam` は完全修飾名 (`plugin_param_name`) を、 解決できなければ
-    /// generic「Param N」を返す。 status_message / clip 名 / mod routing 表示用。
+    /// ノードで束縛する target は完全修飾名 (`device_param_name`: "Comp 2: Thr" /
+    /// "Chain 1: Pan") を、 解決できなければ song 非依存の名前を返す。
+    /// status_message / last touched / clip 名 / mod routing 表示用。
     pub fn automation_target_label(&self, target: &common::model::AutomationTarget) -> String {
         // r.md #89: モジュレーターは song を引かないと種別も通し番号も出せない
         // (`automation_target_display_name` は song 非依存の pure label なので
@@ -554,7 +616,7 @@ impl AppData {
         if let Some(name) = self.mod_target_label(target) {
             return name;
         }
-        self.plugin_param_name(target)
+        self.device_param_name(target)
             .unwrap_or_else(|| automation_target_display_name(target))
     }
 
@@ -571,7 +633,7 @@ impl AppData {
                 let r = song.all_mod_routings().find(|r| r.id == *routing_id)?;
                 let src = self.mod_source_name(r.source_id)?;
                 // 深さの表示は「どのソースが何を変調しているか」が読めないと意味が無い。
-                let dest = self.plugin_param_name(&r.target).unwrap_or_else(|| {
+                let dest = self.device_param_name(&r.target).unwrap_or_else(|| {
                     self.mod_target_label(&r.target)
                         .unwrap_or_else(|| automation_target_display_name(&r.target))
                 });
@@ -595,22 +657,18 @@ impl AppData {
         Some(format!("{kind_label} {ordinal}"))
     }
 
+    /// `target` のコントロール 1 個ぶんの変調の表示データ。`owner` は target の lane / routing の持ち主
+    /// (r.md #129 §7.7) で、**面を描き始めるときに 1 回だけ解決した** ものを渡す (つまみごとに木を
+    /// 引き直さない、`ParamOwner` の doc)。描画中の Song は不変なので同じスナップショットから解決した
+    /// 持ち主で足り、Edit 側 (`AddModRouting` / `SetModRoutingDepth`) は実行時の Song で引き直す。
     pub fn inspector_mod_data(
         &self,
         target: &common::model::AutomationTarget,
         display_base: f64,
         domain: ModControlDomain,
-        track_id: u32,
+        owner: crate::view::native_device::ParamOwner<'_>,
     ) -> InspectorModData {
-        let routings: &[common::model::ModRouting] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.cur.song_doc.song().song_mod_routings
-            } else {
-                match self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id) {
-                    Some(t) => &t.mod_routings,
-                    None => return InspectorModData::default(),
-                }
-            };
+        let (track_id, routings) = (owner.id, owner.routings);
         let model_base = domain.to_model(target, display_base);
         // docs/plan_modulation_followups.md §2: plugin params normalize against
         // their real min/max (identity placeholder would saturate the overlay).
@@ -674,25 +732,6 @@ impl AppData {
     // ワンショット 1 本に統一し、 daw_gui が描くツマミは per-control ドラッグ、
     // プラグイン自身の窓の中のツマミは `PluginParamTouched` が拾う
     // (`handler/ipc.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
-
-    /// r.md #110: sidechain の source 候補 (「—」 + 他 track + 同 track の Parallel 内 chain)。
-    /// sidechain の source 候補 = 「—」 + **このトラックの入力 (Pre-FX)** + 他 track +
-    /// 同 track の Parallel 内 chain。 自 track は Pre-FX だけ (出力側は feedback)。
-    pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
-        let mut v = self.tap_source_choices(true);
-        if let Some(tid) = self.cursor_track_id()
-            && tid != common::model::MASTER_TRACK_ID
-        {
-            v.insert(
-                1,
-                SidechainSourceChoice {
-                    label: "このトラックの入力 (Pre-FX)".into(),
-                    source: Some(common::model::TapSource::Track(tid)),
-                },
-            );
-        }
-        v
-    }
 
     /// Audio event field の inspector 表示用ライト read snapshot。
     /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 中に少なくとも
@@ -1072,10 +1111,121 @@ impl AppData {
                         .content_names
                         .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
+                self.fill_lane_node_labels(&mut cache.lane_node_labels);
                 cache.epoch = self.cur.song_doc.edit_epoch();
             }
         }
         self.cur.peph.arr_label_cache.borrow()
     }
 
+    /// [`ArrLabelCache::lane_node_labels`] を今の Song で作り直す (全トラック + master のレーンのうち、名前が
+    /// Song だけから決まる target)。
+    fn fill_lane_node_labels(
+        &self,
+        labels: &mut std::collections::HashMap<common::model::AutomationTarget, std::sync::Arc<str>>,
+    ) {
+        labels.clear();
+        let song = self.cur.song_doc.song();
+        let lanes = song.tracks.iter().flat_map(|t| &t.automation_lanes).chain(&song.song_lanes);
+        for lane in lanes.filter(|l| name_is_song_derived(&l.target)) {
+            if !labels.contains_key(&lane.target)
+                && let Some(name) = self.device_param_name(&lane.target)
+            {
+                labels.insert(lane.target.clone(), std::sync::Arc::from(name));
+            }
+        }
+    }
+
+    /// アレンジのレーン見出しに出す、ノードで束縛する target の完全修飾名 ([`Self::device_param_name`] と
+    /// 同じ名前)。Song だけから決まる名前は `labels` (= [`Self::arrangement_labels`] の世代キャッシュ) から引き、
+    /// 毎フレームの木の走査と `format!` をしない。host の param 表に依存する `PluginParam` だけはその場で引く
+    /// (Song の世代では変化を検知できない)。
+    pub(crate) fn lane_node_label(
+        &self,
+        labels: &ArrLabelCache,
+        target: &common::model::AutomationTarget,
+    ) -> Option<std::sync::Arc<str>> {
+        if name_is_song_derived(target) {
+            labels.lane_node_labels.get(target).cloned()
+        } else {
+            self.device_param_name(target).map(std::sync::Arc::from)
+        }
+    }
+}
+
+/// [`AppData::device_param_name`] の名前が Song だけから決まるか (`PluginParam` は host が送る param 表と
+/// plugin DB にも依存する)。レーン名の世代キャッシュに載せてよいかの判定。
+fn name_is_song_derived(target: &common::model::AutomationTarget) -> bool {
+    !matches!(target, common::model::AutomationTarget::PluginParam { .. })
+}
+
+#[cfg(test)]
+mod live_value_tests {
+    use common::model::{
+        AutomationLane, AutomationTarget, BusCompParam, ChainRef, Device, MASTER_TRACK_ID, NativeKind, NativeParamId,
+        Parallel, TrackBuiltinParam,
+    };
+
+    use crate::view::native_device::ParamOwner;
+
+    /// F-G8 (§7.5): 再生中は store (master なら song 側) のレーン値、停止中は model 値。
+    #[test]
+    fn live_values_follow_lanes_in_the_owner_store_only_while_playing() {
+        let mut app = crate::test_support::headless_app();
+        let bus = app.cur.song_doc.song().builtin_native(MASTER_TRACK_ID, NativeKind::BusComp).expect("master Bus Comp").id;
+        let thr = NativeParamId::BusComp(BusCompParam::Threshold);
+        let mut parallel = Parallel::new();
+        parallel.id = 9_001;
+        parallel.chains[0].id = 9_002;
+        app.edit_song(|song| {
+            song.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(parallel));
+            song.push_lane(MASTER_TRACK_ID, AutomationLane::new(AutomationTarget::NativeParam { device_id: bus, param: thr }, -7.0));
+            song.push_lane(
+                MASTER_TRACK_ID,
+                AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 }), 0.3),
+            );
+        });
+        let chain_gain = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 });
+        let dev = *app.cur.song_doc.song().native_by_id(bus).expect("bus");
+        let model = dev.param(thr).expect("thr");
+        assert!((model - -7.0).abs() > 1e-3, "model 値はレーン値と違う");
+
+        let scope = app.live_param_scope();
+        let owner = || ParamOwner::master(app.cur.song_doc.song());
+        assert_eq!(app.live_native_param(&scope, owner(), &dev, thr), model, "停止中は model 値");
+        assert_eq!(app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0), 1.0);
+
+        app.cur.transport.is_playing = true;
+        let scope = app.live_param_scope();
+        let owner = ParamOwner::master(app.cur.song_doc.song());
+        assert!((app.live_native_param(&scope, owner, &dev, thr) - -7.0).abs() < 1e-6, "再生中はレーン値");
+        assert!(
+            (app.live_native_device(&scope, owner, &dev).param(thr).unwrap() - -7.0).abs() < 1e-6,
+            "device ごと解いても同じ"
+        );
+        assert!((app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0) - 0.3).abs() < 1e-6, "master の chain も追従");
+    }
+
+    /// レーン見出しの完全修飾名は世代キャッシュから引くが、ノードの名前を変える編集の後は必ず新しい名前になる
+    /// (キャッシュが古い名前を返さない)。
+    #[test]
+    fn lane_node_labels_follow_renames_through_the_generation_cache() {
+        let mut app = crate::test_support::headless_app();
+        let mut parallel = Parallel::new();
+        parallel.id = 9_001;
+        parallel.chains[0].id = 9_002;
+        let chain_gain = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 });
+        app.edit_song(|song| {
+            song.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(parallel));
+            song.push_lane(MASTER_TRACK_ID, AutomationLane::new(chain_gain.clone(), 0.3));
+        });
+        let label = |app: &crate::state::AppData| app.lane_node_label(&app.arrangement_labels(), &chain_gain);
+        let before = label(&app).expect("chain のレーンに名前が付く");
+        assert_eq!(Some(before.clone()), app.device_param_name(&chain_gain).map(std::sync::Arc::from), "device_param_name と同じ名前");
+
+        app.edit_song(|song| {
+            song.chain_by_id_mut(9_002).expect("chain").name = "Bass".into();
+        });
+        assert_eq!(label(&app).as_deref(), Some("Bass: Gain"), "改名は次の世代で反映される (旧 {before})");
+    }
 }

@@ -22,10 +22,11 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
+use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
 use common::model::Song;
 use common::plugin_ref::DISPATCH_TIMEOUT_MS;
 
@@ -36,7 +37,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::engine::{PluginRefs, SyncSlot};
-use crate::graph::{ChainProgram, process_track_owned};
+use crate::graph::{ChainProgram, DeviceScopeTap, NativeIo, process_track_owned};
 use crate::mixer::TrackScratch;
 
 /// `all_done` 待ちの上限 (plan §4)。 各 pair の dispatch は
@@ -76,7 +77,7 @@ pub struct DispatchShared {
     pub frames: AtomicU32,
     pub playing: AtomicU8,
     pub any_solo: AtomicU8,
-    /// 再生ループの状態 (= `SharedState::loop_region` の copy)。 master が dispatch
+    /// 再生ループの状態 (= `ProjectRt::loop_region` の copy)。 master が dispatch
     /// 直前に自分のスタック上の値を publish し、 workers が `process_track_owned` に
     /// 渡して plugin transport の `loop_*_beats` / `looping` / IS_LOOP_ACTIVE 判定に
     /// 使う。 ON/OFF と範囲を別々の atomic に割ると worker が食い違った組を読みうる
@@ -113,7 +114,7 @@ pub struct DispatchShared {
     /// r.md #89: buffer 頭から最初の刻み境界までの frame 数。
     pub mod_lead: AtomicU32,
     /// Phase 4 Step C-2: 「現在 recording 中の lane」 set への ptr
-    /// (= `SharedState.recording_lanes.load()` 結果)。 master が dispatch
+    /// (= `ProjectRt::recording_lanes`)。 master が dispatch
     /// 前に store、 workers + master が `fill_track_param_ramps` の引数に
     /// 渡して curve eval を bypass する判定に使う。 null → 空 set 相当。
     pub recording_lanes_ptr:
@@ -133,6 +134,13 @@ pub struct DispatchShared {
     /// 供給元」と「切り替え後の frame」のような食い違った組を読みうる。
     /// null = テーブルなし (= 全行アレンジ、従来の挙動)。
     pub row_sources_ptr: AtomicPtr<crate::launcher::RowSourceTable>,
+    /// r.md #129: SC Listen 中の Comp の device id (`NativeIo::sc_listen`、0 = 無し)。
+    pub sc_listen: AtomicU64,
+    /// r.md #129: device scope の書き先と各 slot の device id (`NativeIo::scopes`)。
+    /// **2 本とも非 null のときだけ** scope あり (master が dispatch 窓の間だけ生かすポインタ、
+    /// `recording_lanes_ptr` と同じ idiom)。
+    pub scope_bridge_ptr: AtomicPtr<DeviceScopeBridgeHandle>,
+    pub scope_watch_ptr: AtomicPtr<[u64; MAX_DEVICE_SCOPES]>,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -170,6 +178,9 @@ impl DispatchShared {
                 0.0_f64.to_bits(),
             ),
             row_sources_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            sc_listen: AtomicU64::new(0),
+            scope_bridge_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            scope_watch_ptr: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -285,6 +296,8 @@ impl AudioWorkerPool {
         loop_region: &common::model::LoopRegion,
         mod_plane: common::mod_plane::ModTickPlaneRef<'_>,
         rows: &crate::launcher::RowSourceTable,
+        // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
+        native_io: NativeIo<'_>,
     ) {
         // plan §4: stalled pool は二度と dispatch しない (worker thread の
         // 生死が不明なため)。 無音のまま CPAL callback は回り続ける。
@@ -351,6 +364,13 @@ impl AudioWorkerPool {
         self.shared
             .playhead_beats_bits
             .store(playhead_beats.to_bits(), Ordering::Release);
+        self.shared.sc_listen.store(native_io.sc_listen, Ordering::Release);
+        let (scope_bridge, scope_watch) = match native_io.scopes {
+            Some(tap) => (tap.bridge as *const _ as *mut _, tap.watch as *const _ as *mut _),
+            None => (std::ptr::null_mut(), std::ptr::null_mut()),
+        };
+        self.shared.scope_bridge_ptr.store(scope_bridge, Ordering::Release);
+        self.shared.scope_watch_ptr.store(scope_watch, Ordering::Release);
         // PR4.5: publish per-track input delay slice so workers can read
         // their track's value without locking. Empty slice (= no
         // sidechain wiring anywhere) → null pointer + len 0.
@@ -594,8 +614,8 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         if recording_lanes_ptr.is_null() {
             &empty_recording_lanes
         } else {
-            // SAFETY: master holds the ArcSwap Guard / Arc snapshot alive
-            // for the dispatch window via `dispatch_and_wait` 's local var.
+            // SAFETY: master holds the snapshot alive for the dispatch window
+            // (live: `ProjectRt::recording_lanes`、書き出し: export thread の local)。
             unsafe { &*recording_lanes_ptr }
         };
     // Phase 5 Step 5.2: master が当該 buffer の effective bpm を atomic で
@@ -627,6 +647,17 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         // dispatch window via `dispatch_and_wait`'s `&RowSourceTable` borrow.
         unsafe { &*row_sources_ptr }
     };
+    // r.md #129: 「聴き方・見方」を組み直す。scope は 2 本のポインタが揃っているときだけ。
+    let scope_bridge_ptr = shared.scope_bridge_ptr.load(Ordering::Acquire);
+    let scope_watch_ptr = shared.scope_watch_ptr.load(Ordering::Acquire);
+    let native_io = NativeIo {
+        sc_listen: shared.sc_listen.load(Ordering::Acquire),
+        scopes: (!scope_bridge_ptr.is_null() && !scope_watch_ptr.is_null()).then(|| {
+            // SAFETY: master holds the bridge handle and the watch table alive for the dispatch
+            // window via `dispatch_and_wait`'s `NativeIo` borrow (both are non-null here).
+            unsafe { DeviceScopeTap { bridge: &*scope_bridge_ptr, watch: &*scope_watch_ptr } }
+        }),
+    };
 
     if scratch_base.is_null() || plugin_refs_ptr.is_null() || slots_base.is_null() {
         return;
@@ -645,8 +676,8 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
         if audio_renderer_ptr.is_null() {
             None
         } else {
-            // SAFETY: master holds the AudioClipRenderer (Guard or
-            // ArcSwap snapshot) alive for the dispatch window.
+            // SAFETY: master holds the AudioClipRenderer alive for the dispatch
+            // window (live: `ProjectRt::audio_clip_renderer`、書き出し: export thread の Guard)。
             Some(unsafe { &*audio_renderer_ptr })
         };
     let slots = unsafe { std::slice::from_raw_parts(slots_base, n_slots as usize) };
@@ -712,6 +743,7 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
             loop_region,
             mod_plane,
             rows.track_rows(track_idx as usize),
+            native_io,
         );
     }
 }

@@ -59,6 +59,28 @@ pub fn device_id_at(
         .filter(|&id| id != 0)
 }
 
+/// device を chain へ挿す位置 ([`RelocateDevices::dest_index`] / `DeviceEvent::AddParallel`)。
+/// handler は Song を書き換える closure の中でこれを chain 内 index へ解決する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertAt {
+    /// chain 内の位置 (`0..=chain.len()`)。
+    Index(u32),
+    /// 新規デバイスの既定位置 (Q6: 組み込みの手前)。**実行時の Song** から
+    /// `Song::default_insert_index` で解決する (deferred 実行でも古くならない)。
+    Default,
+}
+
+impl InsertAt {
+    /// `song` の `chain` 内 index へ解決する (`None` = chain が無い)。`Index` は chain 長で頭打ち。
+    #[must_use]
+    pub fn resolve(self, song: &common::model::Song, chain: ChainRef) -> Option<usize> {
+        match self {
+            Self::Index(i) => song.chain_devices(chain).map(|d| (i as usize).min(d.len())),
+            Self::Default => song.default_insert_index(chain),
+        }
+    }
+}
+
 /// r.md #71 (プラグインのコピー / 移動): device の運搬要求 1 件分。 表示順は
 /// `device_ids` の並びが決める (呼び出し側がチェーン表示順に整えて渡す)。
 /// r.md #110: 落とし先は [`ChainRef`] (top-level か Parallel 内 chain か) + その chain 内位置。
@@ -68,8 +90,8 @@ pub struct RelocateDevices {
     pub device_ids: Vec<u64>,
     /// 落とし先チェーン。
     pub dest: ChainRef,
-    /// 落とし先チェーン内の挿入位置 (`0..=chain.len()`)。
-    pub dest_index: u32,
+    /// 落とし先チェーン内の挿入位置。
+    pub dest_index: InsertAt,
     /// `true` = コピー (新 device id を採番)、`false` = 移動 (id 据え置き = 音を切らない)。
     pub copy: bool,
 }

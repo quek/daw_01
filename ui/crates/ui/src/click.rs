@@ -20,11 +20,61 @@
 //!
 //! 「rect 内で `primary_just_released`」 を click として直接読む widget を新しく書かないこと。
 //! release だけ見る判定は全部この口を通す。
+//!
+//! ## 当たり判定が重なる点は近さで取り合う (daw_01 r.md #129)
+//!
+//! 矩形の中をドラッグする点 (EQ カーブの点) は当たり円が見た目より大きく、隣の点と重なる。
+//! 「後勝ち」 だけだと重なりを押したとき先に名乗った点も session を始めてしまい、1 回の press で
+//! 複数の点が動く。そこで点は [`Ui::claim_press_at`] で **近さを添えて** 名乗り、今の所有者より
+//! 近いときだけ所有者になる (同じ距離なら後に描いた = 手前)。先に名乗って奪われた点は
+//! continuation フレームに [`Ui::press_taken_from`] を見て session を捨てる。
+//!
+//! 押す前の hover の強調とホイールも同じ点へ向けるため、当たり判定の中にいる点は毎フレーム
+//! [`Ui::nearest_under_pointer`] で近さを申告し、**前フレームに最も近かった点** だけが勝者になる
+//! (描画順の後ろにいる点の近さは同じフレームでは分からないので 1 フレーム遅れ、
+//! [`Ui::claim_wheel_in_rect`] と同じ)。
 
 use daw_ui_renderer::Rect;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
+
+/// press の所有者と、近さで取り合う当たり判定の勝者。`UiHost` がフレームを跨いで 1 つだけ持つ。
+#[derive(Debug, Default)]
+pub(crate) struct PointerClaims {
+    /// 直近の primary press の所有者 (press〜release の間だけ `Some`)。
+    press: Option<PressClaim>,
+    /// [`Ui::nearest_under_pointer`] の `[前フレームの勝者, 今フレームの暫定勝者]` (id と距離)。
+    nearest: [Option<(WidgetId, f32)>; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PressClaim {
+    wid: WidgetId,
+    /// [`Ui::claim_press_at`] で名乗ったときの近さ (px)。`None` = 近さを持たない名乗り。
+    distance: Option<f32>,
+}
+
+impl PointerClaims {
+    /// フレームの頭。新しい press は所有者を取り直し (前の gesture の所有者が release を取りこぼして
+    /// 残っていても引き継がない)、近さの勝者は今フレームの分を空で始める。
+    pub(crate) fn begin_frame(&mut self, primary_just_pressed: bool) {
+        if primary_just_pressed {
+            self.press = None;
+        }
+        self.nearest = [self.nearest[1], None];
+    }
+
+    /// release フレームの末尾。press の所有者は release で終わる。
+    pub(crate) fn end_press(&mut self) {
+        self.press = None;
+    }
+
+    /// どこかの widget が press を掴んでいるか。
+    pub(crate) fn press_held(&self) -> bool {
+        self.press.is_some()
+    }
+}
 
 /// [`Ui::primary_click`] の結果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,9 +94,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn primary_click(&mut self, wid: WidgetId, inside: bool) -> ClickState {
         let pointer = self.pointer;
         if pointer.primary_just_pressed && inside {
-            *self.press_owner = Some(wid);
+            self.claim_press(wid);
         }
-        let owned = *self.press_owner == Some(wid);
+        let owned = self.press_owner() == Some(wid);
         ClickState {
             clicked: pointer.primary_just_released && inside && owned,
             held: owned && inside && pointer.primary_pressed,
@@ -57,12 +107,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 呼ばないと同じ場所に重なる click widget (行の背景など) が release で click になる。
     /// press フレームで、 掴んだと決めた直後に呼ぶ。
     pub fn claim_press(&mut self, wid: WidgetId) {
-        *self.press_owner = Some(wid);
+        self.pointer_claims.press = Some(PressClaim { wid, distance: None });
+    }
+
+    /// 当たり判定が重なりうる widget (ドラッグする点 / ハンドル) が、press を **近さで** 取り合って名乗る
+    /// (module doc)。press フレームに当たり判定の中にいる widget がそれぞれ `distance` (判定の中心からの
+    /// px) を添えて呼び、今の所有者より近い (同じ距離なら後に描いた = 手前) ときだけ所有者になって
+    /// `true` を返す。`false` の widget は session を始めない。近さを持たない所有者 ([`Self::claim_press`] /
+    /// [`Self::primary_click`] = 行の背景など) からは従来どおり後勝ちで奪う。
+    pub fn claim_press_at(&mut self, wid: WidgetId, distance: f32) -> bool {
+        let beaten = self.pointer_claims.press.is_some_and(|c| c.distance.is_some_and(|d| d < distance));
+        if !beaten {
+            self.pointer_claims.press = Some(PressClaim { wid, distance: Some(distance) });
+        }
+        !beaten
+    }
+
+    /// 当たり判定が重なりうる widget の hover / ホイールの勝者か (module doc)。pointer が当たり判定の
+    /// 中にある間 **毎フレーム** `distance` を添えて呼ぶ。勝者は **前フレームに最も近かった** widget
+    /// (同じ距離なら後に描いた方)。前フレームに誰も申告していなければ、申告した全員を勝者とする。
+    pub fn nearest_under_pointer(&mut self, wid: WidgetId, distance: f32) -> bool {
+        let claims = &mut *self.pointer_claims;
+        if claims.nearest[1].is_none_or(|(_, d)| distance <= d) {
+            claims.nearest[1] = Some((wid, distance));
+        }
+        claims.nearest[0].is_none_or(|(w, _)| w == wid)
     }
 
     /// 現在の press 所有者 (press〜release の間だけ `Some`)。
     pub fn press_owner(&self) -> Option<WidgetId> {
-        *self.press_owner
+        self.pointer_claims.press.map(|c| c.wid)
     }
 
     /// `wid` が press を掴んでいたが、 **同じ press を後から別の widget が名乗った**
@@ -71,7 +145,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// でないと「行の中の数値欄をドラッグしたら行まで動く」 (daw_01 r.md #124)。
     /// 所有者不在 (背景で始まった press) は「奪われた」 とはみなさない。
     pub fn press_taken_from(&self, wid: WidgetId) -> bool {
-        self.press_owner.is_some_and(|o| o != wid)
+        self.press_owner().is_some_and(|o| o != wid)
     }
 
     /// daw_01 r.md #127: このフレームに「ボタンを押したまま Esc」 が来た。 drag session を

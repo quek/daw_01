@@ -4,43 +4,60 @@ use std::path::PathBuf;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use crate::plugin_format::PluginFormat;
 use crate::scale::ScaleChange;
 
 // arch-refactor #9 (god-file budget): model.rs を型群ごとにサブモジュールへ分割
 // (pure code movement — 挙動・serialize 形式は不変)。各サブモジュールは `use super::*`
-// で相互の型を参照し、ここで全て re-export するので外部の `common::model::Clip` 等の
-// 絶対パスは不変。wire 型を含むため common/build.rs の WIRE_SOURCES にも 4 ファイルを
-// 登録している (invariant #7: fingerprint handshake の検出網に穴を開けない)。
+// で相互の型を参照し、ここで re-export するので外部の `common::model::Clip` 等の
+// 絶対パスは不変。wire を渡る型を持つファイルは common/build.rs の WIRE_SOURCES に登録する
+// (invariant #7: fingerprint handshake の検出網に穴を開けない)。wire に載らない `Song` の
+// ロジックを切り出したファイル (section_ops / load_normalize / source_pools 等) は登録しない
+// (ロジックの変更で fingerprint を動かさない、build.rs 冒頭)。
 mod automation;
 mod clip_window;
-mod master_strip;
+mod master_limiter;
 mod media_manifest;
 mod content;
 mod content_split;
 mod device;
 mod ids;
+mod load_normalize;
 mod midi_bind;
 mod modulation;
+mod native;
+mod native_param;
+mod param_address;
+mod param_range;
+mod plugin_instance;
+mod section_ops;
+mod sections;
 mod session;
+mod source_pools;
 mod time_ops;
 mod time_selection;
 mod view_state;
 mod track;
 pub use automation::*;
 pub use clip_window::*;
-pub use master_strip::*;
+pub use master_limiter::*;
 pub use media_manifest::*;
 pub use content::*;
 pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;
 pub use modulation::*;
+pub use native::*;
+pub use native_param::*;
+pub use param_range::*;
+pub use plugin_instance::*;
+pub use section_ops::*;
+pub use sections::*;
 pub use session::*;
+pub use source_pools::*;
 pub use time_ops::*;
 pub use time_selection::*;
 pub use track::*;
-pub use view_state::ViewState;
+pub use view_state::{RackPanelKey, ViewState};
 
 /// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。
 /// ズーム / スクロール / 行高 / スナップ設定等の表示状態を `Song` の **兄弟**として
@@ -263,7 +280,15 @@ pub use view_state::ViewState;
 /// Smooth / Delay / Fade In、 `ModSource.enabled` / `ModRouting.enabled` を追加。 旧ファイルは
 /// `#[serde(default)]` で読める (migration 不要)。 新ファイルを旧ビルドで開くと unknown
 /// variant で落ちるので version を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 38;
+///
+/// v39 (r.md #129 Rack 内蔵デバイス、`docs/plan_rack_native_devices.md`): `Track.strip` /
+/// `Song.master_strip` を撤去し、組み込み Comp / EQ (master は Bus Comp / Tone EQ) をチェーン上の
+/// [`Device::Native`] (`{"Native": {..}}`) にした。master の Limiter は [`Song::master_limiter`]。
+/// オートメーション住所の `TrackBuiltin(Strip*)` / `MasterStrip(..)` は
+/// [`AutomationTarget::NativeParam`] / [`AutomationTarget::MasterLimiter`] (実 device id) に変わる。
+/// 旧ファイルは `project::migrate_legacy_song` の末尾 (`native_migration::migrate_strips_to_native`) が
+/// 版に依存せず deserialize 前に移す (旧形と新形は重ならないので冪等)。
+pub const CURRENT_VERSION: u32 = 39;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -451,54 +476,6 @@ impl LoopRegion {
     }
 }
 
-/// タイムライン ripple 1 回分 — 「`from_beat` 以降の全ての時間位置を `delta` ずらす」。
-///
-/// セクションの移動 / 複製 / 範囲削除は Song 内の時間位置をこの規則でずらす
-/// ([`Song::ripple_timeline`])。 ループ範囲のように **`Song` の外に住む時間位置**
-/// を同じ規則で追従させるため、 ripple を行う `Song` メソッドは適用した ripple 列を
-/// 返す (呼び出し側が幾何を再計算する「補償コード」 を書かせない)。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Ripple {
-    pub from_beat: f64,
-    pub delta: f64,
-}
-
-impl Ripple {
-    /// 1 つの拍位置に適用する。 結果は `0.0` 以上に clamp。
-    pub fn shift(&self, beat: &mut f64) {
-        if *beat >= self.from_beat {
-            *beat = (*beat + self.delta).max(0.0);
-        }
-    }
-}
-
-/// Arranger セクション (曲のパート =
-/// Intro / Aメロ / サビ …)。全トラックを縦断する時間レンジ + 名前 + 色で、`Song.sections`
-/// に保持する。位置 (`start_beat`) が並び順の SSoT (別途 order index は持たない)。
-/// `start_beat` 昇順・互いに非交差 (重複なし、隙間は許容) を `Song::normalize_sections`
-/// で保つ。帯を動かす / 並べ替えると範囲内の全 clip + automation + tempo + 拍子 + key が
-/// 一緒に動く破壊的アレンジャー (Studio One モデル) の位置メタデータ。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
-pub struct Section {
-    /// Song 内で安定な id (`Song::alloc_section_id` で採番、`0` は sentinel)。
-    pub id: u32,
-    /// 表示名 (Intro / Aメロ / サビ …)。自動命名 + 自由 rename。
-    pub name: String,
-    /// 帯の塗り色 (RGB、`0.0..=1.0`)。
-    pub color: [f32; 3],
-    /// 開始拍 (song-absolute)。
-    pub start_beat: f64,
-    /// 長さ (拍)。`end = start_beat + len_beats`。
-    pub len_beats: f64,
-}
-
-impl Section {
-    /// 終端拍 (= `start_beat + len_beats`)。
-    pub fn end_beat(&self) -> f64 {
-        self.start_beat + self.len_beats
-    }
-}
-
 /// Song の imported media source プール (audio / video / image)。§10 bullet 4 で Song の
 /// フラットな 3 マップをここへ集約した (god-struct 縮退)。nested `"media": {...}` として save / wire し、
 /// 旧 .daw のフラット形式 (`audio_sources` 等を Song 直下) は load 時の JSON 前処理
@@ -621,13 +598,11 @@ pub struct Song {
     /// forward-migrate する (= 旧ファイルの聞こえ方は変わらない)。
     #[serde(default = "default_master_gain")]
     pub master_gain: f32,
-    /// マスターバス専用のストリップ (バスコンプ + トーン EQ + リミッター)。
-    /// 設計正本は `docs/plan_master_strip.md`。信号順は
-    /// `合算 → Comp → EQ → master_fx_chain → master_gain → リミッター`
-    /// (通常トラックと違い **内蔵が先・insert が後**。理由は同文書 §7)。
-    /// 旧 file は `#[serde(default)]` で全バイパスに forward-migrate する。
+    /// v39 (r.md #129): master のフェーダー後に固定で掛かる Limiter。信号順は
+    /// `合算 → master_fx_chain (組み込み Bus Comp / Tone EQ を含む) → master_gain → Limiter`。
+    /// チェーン上の device ではない (動かせず消せない)。旧 file は `master_strip.limiter` から移す。
     #[serde(default)]
-    pub master_strip: MasterStrip,
+    pub master_limiter: MasterLimiterSettings,
     /// v24: プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
     /// クリップボード round-trip で「同一プロジェクト由来か」を判定し、clip/track paste の
     /// リンク共有 (同一) / 独立コピー (別) を分岐する。`0` は未採番 sentinel —
@@ -737,7 +712,7 @@ impl Default for Song {
             video_framerate: default_video_framerate(),
             master_fx_chain: Vec::new(),
             master_gain: default_master_gain(),
-            master_strip: MasterStrip::default(),
+            master_limiter: MasterLimiterSettings::default(),
             project_id: 0,
             sections: Vec::new(),
             mod_sources: Vec::new(),
@@ -747,89 +722,6 @@ impl Default for Song {
             last_launched_scene_id: 0,
         }
     }
-}
-
-/// r.md #71: セクション帯を `desired_start` (= **移動後の座標系** = ドラッグ中に画面で
-/// 見えている開始拍) へ落とすときに、**実際に着地する開始拍**を返す。
-///
-/// [`Song::move_section`] は帯の範囲 `[a,b)` を ripple-close で詰め、落とし先に
-/// ripple-open で空けて置き直す。 open は「落とし先以降」 を右へ逃がすので、
-/// 帯と重なりうるのは **落とし先より前から始まる帯** だけ。 そこへ食い込む位置を
-/// 指していたら、近い方の境界へ寄せる (Studio One の insert-before / replace 相当)。
-/// 重ならなければ `desired_start` をそのまま返す = 通常のドラッグの感触は変わらない。
-///
-/// **preview (widget の ghost) と commit がこの 1 本を共有する**のが要件。 片方だけ
-/// 解決すると「見えていた位置と違う所に落ちる」 という別のバグになる。 また合法な位置は
-/// 素通しなので **冪等** で、 preview 側で解決済みの値を `move_section` に渡しても
-/// 二重補正にならない。
-///
-/// `others` は **移動する帯を除いた** 現在の帯の `(start_beat, len_beats)` 列
-/// (現在の座標系のまま渡す。 close 後の位置はこの関数が内部で導出する)。
-/// 帯は非重複なので食い込む相手は高々 1 つ。
-///
-/// 参考: Studio One の Arranger Track はタイムライン上の位置へドラッグして落とし、
-/// ripple が隙間を詰める。落とし先の帯を「置き換える / 前後に挿入する」 のどれになるかは
-/// ポインタ位置で決まり、タグで予告される
-/// (<https://www.soundonsound.com/techniques/studio-one-making-arrangements>)。
-#[must_use]
-pub fn resolve_section_move_dest<I>(
-    others: I,
-    moved_start: f64,
-    moved_len: f64,
-    desired_start: f64,
-) -> f64
-where
-    I: IntoIterator<Item = (f64, f64)>,
-{
-    if moved_len <= 0.0 {
-        return desired_start.max(0.0);
-    }
-    // close で帯を抜いたぶん、`b` 以降の帯は左へ詰まる。 それが drop 時点の配置。
-    let b = moved_start + moved_len;
-    resolve_section_drop_start(
-        others.into_iter().map(|(start, len)| {
-            (if start >= b { start - moved_len } else { start }, len)
-        }),
-        desired_start,
-    )
-}
-
-/// r.md #71: 帯を `desired_start` へ落とすときに、**実際に着地する開始拍**を返す core。
-///
-/// `existing` は **drop 時点で存在する帯**の `(start_beat, len_beats)` 列。
-/// ripple-open は「落とし先以降」 を右へ逃がすので、置いた帯と重なりうるのは
-/// **落とし先より前から始まる帯**だけ。 そこへ食い込む位置を指していたら近い方の
-/// 境界へ寄せる。 重ならなければ `desired_start` をそのまま返す (= 素通し・冪等)。
-///
-/// 移動 ([`resolve_section_move_dest`]) と複製 ([`Song::duplicate_section`]) の違いは
-/// **`existing` の中身だけ**: 移動は「自分を除き、close で詰まった位置」、
-/// 複製は「全帯を現在位置のまま」 (close しないので元帯も障害物になる)。
-#[must_use]
-pub fn resolve_section_drop_start<I>(existing: I, desired_start: f64) -> f64
-where
-    I: IntoIterator<Item = (f64, f64)>,
-{
-    let dest = desired_start.max(0.0);
-    for (start, len) in existing {
-        if start < dest && start + len > dest {
-            // dest がこの帯の内側 = そのままでは重なる。近い方の端へ寄せる。
-            let (lo, hi) = (start, start + len);
-            return if dest - lo <= hi - dest { lo } else { hi };
-        }
-    }
-    dest
-}
-
-/// r.md #71: 「帯が動いた / 動かなかった」 を判定する拍スケールの許容差。
-/// 落とし先は算術で導かれるので、元位置へ寄せ戻された場合でも bit 一致しない。
-const SECTION_MOVE_EPS_BEATS: f64 = 1e-9;
-
-/// [`Song::live_source_ids`] の戻り値: 到達可能な media source id。
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct LiveSourceIds {
-    pub audio: std::collections::HashSet<AudioSourceId>,
-    pub video: std::collections::HashSet<VideoSourceId>,
-    pub image: std::collections::HashSet<ImageSourceId>,
 }
 
 impl Song {
@@ -844,12 +736,20 @@ impl Song {
         id
     }
 
-    /// v29: 新規 device (`PluginInstance`) 用の Song-global 安定 id を採番
-    /// する。 track devices / master_fx_chain 共用。
+    /// v29: 新規 device (plugin / native / Parallel / chain) 用の Song-global 安定 id を採番
+    /// する。 track devices / master_fx_chain 共用。実体は [`IdAllocators::alloc_device_id`]。
     pub fn alloc_device_id(&mut self) -> u64 {
-        let id = self.ids.next_device_id.max(1);
-        self.ids.next_device_id = id.saturating_add(1);
-        id
+        self.ids.alloc_device_id()
+    }
+
+    /// master Limiter の先読み遅延を compile 時に焼くか: 静的 ON、または song 側に enabled な
+    /// `MasterLimiter(On)` レーン / 変調がある。PDC と DSP 遅延の SSoT。
+    #[must_use]
+    pub fn master_limiter_latency_active(&self) -> bool {
+        let on = AutomationTarget::MasterLimiter(MasterLimiterParam::On);
+        self.master_limiter.on
+            || self.song_lanes.iter().any(|l| l.enabled && l.target == on)
+            || self.song_mod_routings.iter().any(|r| r.enabled && r.target == on)
     }
 
     /// Phase 5: allocate a new song-level automation lane id (`song_lanes`)。
@@ -936,402 +836,6 @@ impl Song {
         })
     }
 
-    /// `sections` の invariant を回復する: `start_beat` 昇順、互いに非交差
-    /// (重複なし、隙間は許容)、`len_beats > 0`。セクションを追加 / 移動 / リサイズした
-    /// あとに呼ぶ。重複は「先に始まる方を優先」 (= 後発の `start_beat` を直前 section の
-    /// `end_beat` までクランプして隙間化) して解消し、長さが `0` 以下になった section は
-    /// 破棄する。idempotent。
-    pub fn normalize_sections(&mut self) {
-        self.sections.sort_by(|a, b| {
-            a.start_beat
-                .partial_cmp(&b.start_beat)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut prev_end = f64::NEG_INFINITY;
-        for s in &mut self.sections {
-            if s.start_beat < prev_end {
-                let end = s.end_beat();
-                s.start_beat = prev_end;
-                s.len_beats = (end - prev_end).max(0.0);
-            }
-            prev_end = s.end_beat();
-        }
-        self.sections.retain(|s| s.len_beats > f64::EPSILON);
-    }
-
-    /// タイムライン全体の ripple シフト。
-    /// `from_beat` 以降の全ての時間位置を `delta` だけずらす (結果は `0.0` 以上に clamp)。
-    /// 破壊的セクション移動の close (`delta < 0` = 範囲を詰める) / open (`delta > 0` =
-    /// 範囲を空ける) プリミティブ。 対象は全トラックの clip 位置、各トラックと `song_lanes`
-    /// の automation clip 位置、`scale_changes`、`sections`、`length_beats`。
-    /// clip 内の note / event / point は clip-local なので動かさない (clip 位置だけずらせば
-    /// 中身は付いてくる = 歌声キャッシュ key 不変、再合成不要)。 シフト後に scale / sections
-    /// の invariant を復元する。
-    ///
-    /// 戻り値は適用した [`Ripple`]。 ループ範囲のように **`Song` の外に住む時間位置**
-    /// (session state + `ViewState`) を同じ規則で追従させるために返す。
-    pub fn ripple_timeline(&mut self, from_beat: f64, delta: f64) -> Ripple {
-        self.ripple_timeline_with(from_beat, delta, true)
-    }
-
-    /// [`Song::ripple_timeline`] の本体。`shift_sections = false` で **セクション帯だけ
-    /// 動かさない** — 範囲削除 ([`Song::delete_time_range`]) は帯を「重なりぶん縮める」
-    /// 規則で先に計算し終えているので、その上から始点だけずらすと二重に動く。
-    pub(crate) fn ripple_timeline_with(
-        &mut self,
-        from_beat: f64,
-        delta: f64,
-        shift_sections: bool,
-    ) -> Ripple {
-        let r = Ripple { from_beat, delta };
-        for t in &mut self.tracks {
-            for c in &mut t.clips {
-                r.shift(&mut c.start_beat);
-            }
-            for lane in &mut t.automation_lanes {
-                for c in &mut lane.clips {
-                    r.shift(&mut c.start_beat);
-                }
-            }
-        }
-        for lane in &mut self.song_lanes {
-            for c in &mut lane.clips {
-                r.shift(&mut c.start_beat);
-            }
-        }
-        for sc in &mut self.scale_changes {
-            r.shift(&mut sc.beat);
-        }
-        if shift_sections {
-            for s in &mut self.sections {
-                r.shift(&mut s.start_beat);
-            }
-        }
-        if self.length_beats >= from_beat {
-            self.length_beats = (self.length_beats + delta).max(0.0);
-        }
-        self.ensure_scale_changes_sorted();
-        self.normalize_sections();
-        r
-    }
-
-    /// セクション帯を `dest_start` へ
-    /// 破壊的に移動し、 曲構成を組み替える (Studio One 流の能動アレンジャー)。 帯の範囲
-    /// `[a, b)` 内の全トラック clip + automation + `song_lanes` automation + `scale_changes`
-    /// を帯と一緒に取り出し、 `[a,b)` を ripple-close で詰め、 落とし先に ripple-open で
-    /// 空けて落とし直す。 他セクション / 他 clip は ripple で前後に流れる。
-    ///
-    /// # `dest_start` の意味 (r.md #71 で契約を変更)
-    ///
-    /// **`dest_start` は「移動後の帯の開始拍」** = ドラッグ中に画面で見えている位置。
-    /// 帯が置けない位置 (他帯に食い込む) を指していたら
-    /// [`resolve_section_move_dest`] が近い方の境界へ寄せるので、
-    /// **実際の着地位置は `resolve_section_move_dest(..)` の戻り値** になる。
-    /// preview 側も同じ関数を通すことで overlay == commit が構造的に保たれる。
-    ///
-    /// 旧契約は「`[a,b)` を close した **中間座標系** の絶対拍」 で、 前へ動かすときだけ
-    /// `dest_start - len` の逆算を呼び出し側に強いていた。 その結果
-    /// 「1 つ先の帯まで引っ張らないと届かない / 隣へ落とすと元に戻る」 という
-    /// **1 セクションぶんのズレ**になっていた (r.md #71 のユーザー報告そのもの)。
-    /// 中間座標系はこの関数の内部事情であって、 ユーザーが指しているものではない。
-    ///
-    /// 戻り値は適用した [`Ripple`] 列 (**空 = 移動しなかった**)。 呼び出し側は Song の外に
-    /// 住む時間位置 (session state のループ範囲) をこれで追従させる。
-    ///
-    /// 境界をまたぐ clip は移動前に `split_clips_at(a)` / `split_clips_at(b)` で分割するので、
-    /// 帯範囲ぴったりの content だけが追従する (Studio One の split-at-boundary)。 残りの
-    /// content / 他セクションは ripple で前後に流れる。
-    pub fn move_section(&mut self, section_id: u32, dest_start: f64) -> Vec<Ripple> {
-        let Some(sec) = self.sections.iter().find(|s| s.id == section_id).cloned() else {
-            return Vec::new();
-        };
-        let (a, len) = (sec.start_beat, sec.len_beats);
-        let b = a + len;
-        // r.md #71: 落とし先は「移動後の帯の開始拍」。 置けない位置は境界へ寄せる。
-        // preview (widget) も同じ関数を通すので、 見えていた位置に落ちる。
-        // 既に解決済みの値を渡されても冪等 (合法な位置は素通し) なので二重補正にならない。
-        let dest_start = resolve_section_move_dest(
-            self.sections.iter().filter(|s| s.id != section_id).map(|s| (s.start_beat, s.len_beats)),
-            a,
-            len,
-            dest_start,
-        );
-        // 「動かなかった」 判定は **拍スケールの許容差**で見る。 解決後の落とし先は
-        // `start - moved_len` 等の算術で導くので、 元位置へ寄せ戻された場合でも `a` と
-        // bit 一致するとは限らない (小数拍の帯だと 1e-15 ずれる)。 `f64::EPSILON` だと
-        // それをすり抜け、 見た目 no-op の drag で clip 分割 + undo + dirty が走る。
-        if len <= 0.0 || (dest_start - a).abs() < SECTION_MOVE_EPS_BEATS {
-            return Vec::new();
-        }
-        let in_range = |start: f64| start >= a && start < b;
-
-        // 0. 境界をまたぐ clip を a / b で分割し、 以降の membership 抽出を正確にする。
-        self.split_clips_at(a);
-        self.split_clips_at(b);
-
-        // 1. 範囲内の content を取り出し、 帯先頭 (a) 基準のローカル位置に正規化。
-        let mut taken_clips: Vec<(u32, Clip)> = Vec::new();
-        for t in &mut self.tracks {
-            let mut i = 0;
-            while i < t.clips.len() {
-                if in_range(t.clips[i].start_beat) {
-                    let mut c = t.clips.remove(i);
-                    c.start_beat -= a;
-                    taken_clips.push((t.id, c));
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        let mut taken_auto: Vec<(u32, u32, AutomationClip)> = Vec::new();
-        for t in &mut self.tracks {
-            let tid = t.id;
-            for lane in &mut t.automation_lanes {
-                let lid = lane.id;
-                let mut i = 0;
-                while i < lane.clips.len() {
-                    if in_range(lane.clips[i].start_beat) {
-                        let mut c = lane.clips.remove(i);
-                        c.start_beat -= a;
-                        taken_auto.push((tid, lid, c));
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-        }
-        let mut taken_song_auto: Vec<(u32, AutomationClip)> = Vec::new();
-        for lane in &mut self.song_lanes {
-            let lid = lane.id;
-            let mut i = 0;
-            while i < lane.clips.len() {
-                if in_range(lane.clips[i].start_beat) {
-                    let mut c = lane.clips.remove(i);
-                    c.start_beat -= a;
-                    taken_song_auto.push((lid, c));
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        let mut taken_scales: Vec<ScaleChange> = Vec::new();
-        self.scale_changes.retain(|sc| {
-            if in_range(sc.beat) {
-                let mut s = *sc;
-                s.beat -= a;
-                taken_scales.push(s);
-                false
-            } else {
-                true
-            }
-        });
-        // 帯自身も取り出す (ripple では動かさず、 後で dest に置き直す)。
-        self.sections.retain(|s| s.id != section_id);
-
-        // 2. `[a,b)` を詰める (close)。
-        let close = self.ripple_timeline(b, -len);
-        // 3. 落とし先。 r.md #71: **そのまま使う**。 close は「帯を抜いた」 だけで、
-        //    残りの帯の並びは変わらない。 続く open が `dest_start` 以降を右へ逃がすので、
-        //    帯を `dest_start` に置けば最終的な開始拍はちょうど `dest_start` になる
-        //    (= ドラッグ中に見えていた位置)。
-        //
-        //    旧実装はここで `dest_start - len` / `a` の逆算をしていた。 それは
-        //    「close 後の中間座標系での位置」 を呼び出し側に指定させる契約であり、
-        //    前へ動かすときに 1 セクションぶんズレる原因だった (r.md #71)。
-        let dest2 = dest_start;
-        // 4. 落とし先に `len` ぶん空ける (open)。
-        let open = self.ripple_timeline(dest2, len);
-
-        // 5. 取り出した content を `dest2` 基準で戻す。
-        for (tid, mut c) in taken_clips {
-            c.start_beat += dest2;
-            if let Some(t) = self.tracks.iter_mut().find(|t| t.id == tid) {
-                // 非重なり不変条件はここも通す (帯は ripple で空けた所へ戻すので
-                // 実際には削られないが、規則の適用点を 1 つに保つ)。
-                t.place_clip(c);
-            }
-        }
-        for (tid, lid, mut c) in taken_auto {
-            c.start_beat += dest2;
-            if let Some(l) = self
-                .tracks
-                .iter_mut()
-                .find(|t| t.id == tid)
-                .and_then(|t| t.automation_lanes.iter_mut().find(|l| l.id == lid))
-            {
-                l.clips.push(c);
-            }
-        }
-        for (lid, mut c) in taken_song_auto {
-            c.start_beat += dest2;
-            if let Some(l) = self.song_lanes.iter_mut().find(|l| l.id == lid) {
-                l.clips.push(c);
-            }
-        }
-        for mut s in taken_scales {
-            s.beat += dest2;
-            self.scale_changes.push(s);
-        }
-        // 6. 帯を dest2 に置き直す。
-        self.sections.push(Section {
-            id: sec.id,
-            name: sec.name,
-            color: sec.color,
-            start_beat: dest2,
-            len_beats: len,
-        });
-
-        self.ensure_scale_changes_sorted();
-        self.ensure_automation_points_sorted();
-        self.normalize_sections();
-        vec![close, open]
-    }
-
-    /// セクション帯を `dest_start` に複製
-    /// 挿入する (Ctrl+drag、 ripple-insert)。 範囲 `[a,b)` 内の clip / automation を **linked**
-    /// (= `content_id` 共有、 REAPER pooled idiom) で複製し、 clip id だけ新規採番。 `dest_start`
-    /// 以降を `len` ぶん右へ ripple して空けてから複製を落とす。 元の content は残す。 新しい
-    /// セクション id と適用した [`Ripple`] を返す (`None` = 複製しなかった)。 ripple は
-    /// `move_section` と同じく Song の外に住む時間位置 (ループ範囲) の追従用。
-    /// `move_section` / `delete_section_range`
-    /// と同じく境界 `a` / `b` で `split_clips_at` してから `start_beat ∈ [a,b)` membership で複製する
-    /// ので、 境界をまたぐ clip も範囲内ぶんだけ正しく複製される。
-    pub fn duplicate_section(
-        &mut self,
-        section_id: u32,
-        dest_start: f64,
-    ) -> Option<(u32, Ripple)> {
-        let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
-        let (a, len) = (sec.start_beat, sec.len_beats);
-        let b = a + len;
-        if len <= 0.0 {
-            return None;
-        }
-        // r.md #71 同件: 複製も「置けない位置」 (他帯に食い込む) を指されたら境界へ寄せる。
-        // 寄せないと `normalize_sections` が重なりを潰し、**複製だけ短くなる**
-        // (ゴーストは満寸で見えているのに、落とすと切り詰められる)。
-        // 移動と違って close しないので、障害物は **全帯を現在位置のまま** (元帯も含む)。
-        let dest_start = resolve_section_drop_start(
-            self.sections.iter().map(|s| (s.start_beat, s.len_beats)),
-            dest_start,
-        );
-        // 中身の写しと時間ごとの貼り付けは時間範囲操作と同じ 1 本
-        // ([`Song::copy_time_range`] / [`Song::paste_time_range`])。 帯そのもの (`[a,b)` に
-        // 完全に入る唯一のセクション) も写しに含まれ、 貼り先で新 id を得る。
-        let copy = self.copy_time_range(a, b)?;
-        let pasted = self.paste_time_range(dest_start, &copy, true)?;
-        let new_id = pasted.section_ids.first().copied()?;
-        Some((new_id, pasted.ripple))
-    }
-
-    /// セクション帯だけ削除する (内容は温存、 Studio One の Backspace 相当)。
-    /// 削除できたら `true`。
-    pub fn delete_section(&mut self, section_id: u32) -> bool {
-        let before = self.sections.len();
-        self.sections.retain(|s| s.id != section_id);
-        self.sections.len() != before
-    }
-
-    /// セクションの**時間範囲ごと**削除して
-    /// 詰める (Studio One の "Delete Range" 相当、 破壊的)。 境界を分割してから範囲内の全
-    /// content を消し、 `[a,b)` を ripple-close で詰める。 削除できたら適用した
-    /// [`Ripple`] を返す (`None` = 何もしなかった)。 ripple は Song の外に住む時間位置
-    /// (ループ範囲) の追従用。
-    pub fn delete_section_range(&mut self, section_id: u32) -> Option<Ripple> {
-        let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
-        // 時間を消す規則は [`Song::delete_time_range`] 1 本 (帯は範囲に完全に入るので消える)。
-        self.delete_time_range(sec.start_beat, sec.start_beat + sec.len_beats)
-    }
-
-    /// 全トラック clip / track automation clip /
-    /// `song_lanes` clip のうち `beat` を**厳密にまたぐ** (`start < beat < start+len`) ものを
-    /// 2 つに分割する。 **content は一切触らず、窓 (`start_beat` / `length_beats` /
-    /// `content_offset_beats`) を 2 つに割るだけ** — 左断片は長さを `beat` まで詰め、
-    /// 右断片は `content_offset_beats` を `cut = beat - start` ぶん進める。 両断片は同じ
-    /// `content_id` を共有した 2 つの窓になるので、 linked clip の関係も、 窓の外に隠れて
-    /// いた素材も壊れない (窓モデル、 `docs/plan_clip_content_window.md`)。 セクション移動の
-    /// 前にこれを境界 `a` / `b` で呼ぶと、 以降の「`start_beat ∈ [a,b)`」 membership 抽出が
-    /// 境界跨ぎ clip でも正確になる。 歌声 clip も MIDI として分割され、 右断片は note 集合が
-    /// 変わるのでキャッシュ key が変化し自動で再合成される。
-    pub fn split_clips_at(&mut self, beat: f64) {
-        for ti in 0..self.tracks.len() {
-            let mut i = 0;
-            while i < self.tracks[ti].clips.len() {
-                let (start, len, cid, off) = {
-                    let c = &self.tracks[ti].clips[i];
-                    (c.start_beat, c.length_beats, c.content_id, c.content_offset_beats)
-                };
-                if start < beat && beat < start + len {
-                    let cut = beat - start;
-                    // 跨ぐ note / event は content 側で切る (共有されていれば CoW)。
-                    // その上で窓を 2 つに割る — 両断片は同じ content を別の窓で見る。
-                    let cid = self.split_content_at(cid, off + cut);
-                    let right_id = self.tracks[ti].alloc_clip_id();
-                    let mut right = self.tracks[ti].clips[i].clone();
-                    right.id = right_id;
-                    right.content_id = cid;
-                    right.start_beat = beat;
-                    right.length_beats = len - cut;
-                    right.content_offset_beats = off + cut;
-                    self.tracks[ti].clips[i].content_id = cid;
-                    self.tracks[ti].clips[i].length_beats = cut;
-                    self.tracks[ti].clips.insert(i + 1, right);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            for li in 0..self.tracks[ti].automation_lanes.len() {
-                let mut j = 0;
-                while j < self.tracks[ti].automation_lanes[li].clips.len() {
-                    let (start, len, off) = {
-                        let c = &self.tracks[ti].automation_lanes[li].clips[j];
-                        (c.start_beat, c.length_beats, c.content_offset_beats)
-                    };
-                    if start < beat && beat < start + len {
-                        let cut = beat - start;
-                        let lane = &mut self.tracks[ti].automation_lanes[li];
-                        let right_id = lane.alloc_clip_id();
-                        let mut right = lane.clips[j].clone();
-                        right.id = right_id;
-                        right.start_beat = beat;
-                        right.length_beats = len - cut;
-                        right.content_offset_beats = off + cut;
-                        lane.clips[j].length_beats = cut;
-                        lane.clips.insert(j + 1, right);
-                        j += 2;
-                    } else {
-                        j += 1;
-                    }
-                }
-            }
-        }
-        for li in 0..self.song_lanes.len() {
-            let mut j = 0;
-            while j < self.song_lanes[li].clips.len() {
-                let (start, len, off) = {
-                    let c = &self.song_lanes[li].clips[j];
-                    (c.start_beat, c.length_beats, c.content_offset_beats)
-                };
-                if start < beat && beat < start + len {
-                    let cut = beat - start;
-                    let lane = &mut self.song_lanes[li];
-                    let right_id = lane.alloc_clip_id();
-                    let mut right = lane.clips[j].clone();
-                    right.id = right_id;
-                    right.start_beat = beat;
-                    right.length_beats = len - cut;
-                    right.content_offset_beats = off + cut;
-                    lane.clips[j].length_beats = cut;
-                    lane.clips.insert(j + 1, right);
-                    j += 2;
-                } else {
-                    j += 1;
-                }
-            }
-        }
-    }
-
     /// Phase 7 B5 (`docs/plan_scale.html`): 指定 beat における active な
     /// `ScaleChange` を返す。 該当 event が無ければ `None` (= Scale 機能 OFF /
     /// chromatic 扱い)。 `scale_changes` は beat 昇順 invariant 前提で、
@@ -1368,67 +872,6 @@ impl Song {
         }
     }
 
-    /// Clamp persisted scalar fields into valid ranges. The persistence
-    /// layer is the trust boundary where data crosses back in from disk /
-    /// IPC, so this is the single place that defends every downstream
-    /// divisor (`samples_per_beat = sr*60/bpm`, `tsig_denom`, ...) against
-    /// `0` / negative / `NaN` values from a corrupt or hand-edited file.
-    /// `NaN` slips past naive `x <= 0.0` guards (`NaN <= 0.0` is `false`),
-    /// so every check is written as `!is_finite() || out_of_range`.
-    /// Idempotent.
-    pub fn sanitize_ranges(&mut self) {
-        if !self.bpm.is_finite() {
-            self.bpm = 120.0;
-        } else {
-            self.bpm = self.bpm.clamp(1.0, 1000.0);
-        }
-        // Numerator 1..=32, denominator must be a power-of-two beat unit.
-        self.time_sig.0 = self.time_sig.0.clamp(1, 32);
-        if !matches!(self.time_sig.1, 1 | 2 | 4 | 8 | 16) {
-            self.time_sig.1 = 4;
-        }
-        if !(self.length_beats.is_finite() && self.length_beats >= 0.0) {
-            self.length_beats = 0.0;
-        }
-        if !(self.video_framerate.is_finite() && self.video_framerate > 0.0) {
-            self.video_framerate = default_video_framerate();
-        }
-        if self.video_resolution.0 == 0 || self.video_resolution.1 == 0 {
-            self.video_resolution = default_video_resolution();
-        }
-        // r.md #110: Parallel chain の gain / pan は RT が snapshot からそのまま掛ける
-        // (IPC の `SetChain*` は境界で clamp するが、LoadSong は素通し) ので、
-        // ここで値域に収める。
-        let mut fix_chain = |c: &mut ParallelChain| {
-            c.gain = if c.gain.is_finite() { c.gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
-            c.pan = if c.pan.is_finite() { c.pan.clamp(-1.0, 1.0) } else { 0.0 };
-        };
-        for t in &mut self.tracks {
-            for_each_chain_mut(&mut t.devices, &mut fix_chain);
-        }
-        for_each_chain_mut(&mut self.master_fx_chain, &mut fix_chain);
-        let mut fix_parallel = |r: &mut Parallel| {
-            r.out_gain = if r.out_gain.is_finite() { r.out_gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
-            // r.md #112: クロスオーバーも RT がそのまま係数に使う。
-            r.split.sanitize();
-            // r.md #114: Selector のアクティブ chain を実在する id に揃える。
-            r.normalize_selector();
-        };
-        for t in &mut self.tracks {
-            for_each_parallel_mut(&mut t.devices, &mut fix_parallel);
-        }
-        for_each_parallel_mut(&mut self.master_fx_chain, &mut fix_parallel);
-        // r.md #116 / #117: LFO の Shape / Jitter / Smooth / Delay / Fade In と ADSR の時定数も RT が
-        // そのまま使う (GUI の編集は clamp 済だが LoadSong は素通し)。
-        for m in &mut self.mod_sources {
-            match &mut m.kind {
-                ModSourceKind::Lfo(c) => c.sanitize(),
-                ModSourceKind::Adsr(c) => c.sanitize(),
-                _ => {}
-            }
-        }
-    }
-
     /// Single entry point for all pre-save normalization. GC orphan
     /// content / source-pool entries so the on-disk file stays tidy and
     /// every persisted `content_id` / source id is still referenced. Call
@@ -1438,146 +881,6 @@ impl Song {
         self.gc_audio_sources();
         self.gc_video_sources();
         self.gc_image_sources();
-    }
-
-    /// Single entry point for all post-load normalization. Re-establishes
-    /// every invariant the rest of the codebase assumes about a freshly
-    /// loaded song — value-range sanity, content / source migration, stable
-    /// ids, and sort order — so `project::load`'s return value is always
-    /// self-consistent regardless of how the file was produced. Idempotent.
-    /// v24: `project_id == 0` (未採番 / 旧 file / `Song::default`) なら
-    /// 新規採番する。既に非 0 なら触らない (idempotent) ので、New で採番済みの song に
-    /// `normalize_after_load` を再走させても上書きしない。uuid v4 の下位 64bit を使う
-    /// (別起動・別マシンでも衝突しない。`0` sentinel は引き直す)。
-    pub fn ensure_project_id(&mut self) {
-        if self.project_id == 0 {
-            self.project_id = uuid::Uuid::new_v4().as_u128() as u64;
-            if self.project_id == 0 {
-                self.project_id = 1;
-            }
-        }
-    }
-
-    /// 返り値は **クリップの重なりを解消したか** (= 開いた時点で `*` を立てるべきか)。
-    /// それ以外の正規化はすべて冪等な no-op になるよう作られているので、
-    /// 「開いただけで `*`」 が立つ理由はここ 1 つに絞られる。
-    pub fn normalize_after_load(&mut self) -> bool {
-        self.ensure_project_id();
-        self.sanitize_ranges();
-        self.ensure_clip_contents();
-        self.ensure_audio_source_ids();
-        self.ensure_video_source_ids();
-        self.ensure_image_source_ids();
-        self.ensure_ids();
-        self.ensure_midi_binding_inputs();
-        // r.md #89: クロス変調の dangling を掃除する。id 採番の後 (routing id が
-        // 確定してから ModRoutingDepth を解決する) でなければならない。
-        self.prune_dangling_mod_targets();
-        self.normalize_session();
-        self.ensure_scale_changes_sorted();
-        self.ensure_automation_points_sorted();
-        // 重なり解消は id 採番の後 (分割断片に id を振るため)、 overlay の
-        // カバレッジ補完の前 (窓を縮めてから覆う長さを決めるため)。
-        let resolved = self.resolve_clip_overlaps();
-        self.ensure_overlay_event_coverage();
-        resolved
-    }
-
-    /// r.md #89: クロス変調の **dangling 参照を固定点まで掃除**する。 **冪等** —
-    /// 2 回目は `false` を返す (派生データ load collapse の契約、r.md #9)。
-    ///
-    /// 消すのは 3 種類:
-    /// 1. `source_id` が実在しない `ModRouting` (既存の掃除)。
-    /// 2. `target` が `ModSourceParam { source_id }` で、そのソースが実在しないもの。
-    /// 3. `target` が `ModRoutingDepth { routing_id }` で、その変調が実在しないもの。
-    ///
-    /// 2 と 3 は **連鎖する** — 変調を 1 本消すと、その深さを指していた別の変調が
-    /// dangling になる。だから変化が無くなるまで回す。automation lane 側も同じ判定で
-    /// 落とす (残すと「保存はされるのに永久に効かないレーン」になる)。
-    ///
-    /// `ModParam` が種別に存在しない組み合わせ (LFO に `RandomSmooth` 等) は
-    /// **消さない** — 種別を戻せば復活する。評価と UI が
-    /// [`ModParam::exists_on`] で無視するだけ。
-    pub fn prune_dangling_mod_targets(&mut self) -> bool {
-        let mut changed_any = false;
-        loop {
-            let live_sources: std::collections::HashSet<u32> =
-                self.mod_sources.iter().map(|m| m.id).collect();
-            let live_routings: std::collections::HashSet<u32> =
-                self.all_mod_routings().map(|r| r.id).collect();
-            let dangling = |t: &AutomationTarget| match t {
-                AutomationTarget::ModSourceParam { source_id, .. } => {
-                    !live_sources.contains(source_id)
-                }
-                AutomationTarget::ModRoutingDepth { routing_id } => {
-                    !live_routings.contains(routing_id)
-                }
-                _ => false,
-            };
-            let mut changed = false;
-            let mut sweep = |routings: &mut Vec<ModRouting>, lanes: &mut Vec<AutomationLane>| {
-                let before = routings.len();
-                routings.retain(|r| live_sources.contains(&r.source_id) && !dangling(&r.target));
-                let lanes_before = lanes.len();
-                lanes.retain(|l| !dangling(&l.target));
-                if routings.len() != before || lanes.len() != lanes_before {
-                    changed = true;
-                }
-            };
-            for t in &mut self.tracks {
-                sweep(&mut t.mod_routings, &mut t.automation_lanes);
-            }
-            sweep(&mut self.song_mod_routings, &mut self.song_lanes);
-            if !changed {
-                return changed_any;
-            }
-            changed_any = true;
-        }
-    }
-
-    /// 全トラックのクリップの重なりを上書き規則で解消する
-    /// ([`Track::resolve_clip_overlaps`])。 **冪等** — 2 回目は `false` を返す。
-    pub fn resolve_clip_overlaps(&mut self) -> bool {
-        let mut changed = false;
-        for track in &mut self.tracks {
-            if track.resolve_clip_overlaps() {
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// overlay clip (image / video / text) は「clip 長 = 表示長」が
-    /// 不変条件。 単一 (または末尾) の event がその clip 長に届かないと、 clip
-    /// 範囲内でも event 範囲を抜けて途中で消える (= clip を伸ばしたが event が
-    /// 追従していない既存 .daw を自動修復する)。
-    ///
-    /// 各 content を、 それを参照する **最長** clip の長さまで届くよう
-    /// extend-only で覆う ([`ClipContent::ensure_event_covers_clip`])。 linked
-    /// clip でより短い clip があっても、 その clip は自分の clip 範囲 gate で
-    /// clamp されるので安全。 idempotent。 Audio / Midi / Automation は no-op。
-    pub fn ensure_overlay_event_coverage(&mut self) {
-        // content ごとに、 それを参照する clip の **窓の末尾** (content-local) の
-        // 最大値を集める (r.md #44: 左端 trim した clip は content の先の方を見せる)。
-        let mut max_len: HashMap<ContentId, f64> = HashMap::new();
-        for track in &self.tracks {
-            // v35 (r.md #87): **`all_clips` を通す** — ランチャーのセル
-            // (`session_clips`) も同じ content を指すので、セルの窓のほうが長いと
-            // event が届かず「撃った直後だけ絵が出て残りは真っ暗」になる
-            // (`content` を数えるものは `all_clips` を通す、`Track::all_clips` の契約)。
-            for clip in track.all_clips() {
-                let e = max_len.entry(clip.content_id).or_insert(0.0);
-                let win_end = clip.content_offset_beats + clip.length_beats;
-                if win_end > *e {
-                    *e = win_end;
-                }
-            }
-        }
-        for (cid, len) in max_len {
-            if let Some(content) = self.clip_contents.get_mut(&cid) {
-                content.ensure_event_covers_clip(len);
-            }
-        }
     }
 
     /// Phase 5: find a song-level lane (mutable) by id。 Track の
@@ -1596,23 +899,6 @@ impl Song {
     /// (= multi-lane で同 target に複数置く意味がない、 Bitwig も 1 lane)。
     pub fn song_lane_by_target(&self, target: &AutomationTarget) -> Option<&AutomationLane> {
         self.song_lanes.iter().find(|l| &l.target == target)
-    }
-
-    /// Phase 5 Step 5.1 (`docs/plan_automation.md` §10、 gui_01 #034): track と
-    /// master row を統一的に走査する mut accessor。 `track_id == MASTER_TRACK_ID`
-    /// なら `song_lanes` を、 そうでなければ該当 track の `automation_lanes`
-    /// を引く。 全 automation EditRequest handler から呼ばれる。
-    pub fn automation_lane_by_key_mut(
-        &mut self,
-        track_id: u32,
-        lane_id: u32,
-    ) -> Option<&mut AutomationLane> {
-        if track_id == MASTER_TRACK_ID {
-            self.song_lane_by_id_mut(lane_id)
-        } else {
-            self.track_by_id_mut(track_id)
-                .and_then(|t| t.lane_by_id_mut(lane_id))
-        }
     }
 
     /// ランチャーが主導権を握っている行 (トラック / オートメーションレーン / song lane) が
@@ -1647,19 +933,6 @@ impl Song {
             .chain(self.song_lanes.iter_mut())
     }
 
-    /// Phase 5 Step 5.1: read-only counterpart of `automation_lane_by_key_mut`。
-    pub fn automation_lane_by_key(
-        &self,
-        track_id: u32,
-        lane_id: u32,
-    ) -> Option<&AutomationLane> {
-        if track_id == MASTER_TRACK_ID {
-            self.song_lane_by_id(lane_id)
-        } else {
-            self.track_by_id(track_id).and_then(|t| t.lane_by_id(lane_id))
-        }
-    }
-
     /// track と master row を統一的に走査する device chain accessor。
     /// `track_id == MASTER_TRACK_ID` なら `master_fx_chain` を、 そうでなければ
     /// 該当 track の単一 `devices` chain を引く。 `automation_lane_by_key` と同
@@ -1684,314 +957,6 @@ impl Song {
         } else {
             self.track_by_id_mut(track_id).map(|t| &mut t.devices)
         }
-    }
-
-    /// Re-assign stable ids to all tracks / clips after loading an older
-    /// project file (or any save predating the id schema). Idempotent:
-    /// records that already have non-zero ids are left untouched, and
-    /// `next_*_id` counters are bumped above the highest seen id.
-    ///
-    /// PR4.5 sidechain regression fix: when a track's id changes here,
-    /// every reference to the old id (= other tracks' `parent_group_id`
-    /// and per-plugin `aux_inputs` tap sources) is remapped to the new
-    /// id. Without this remap, a saved project that used `id == 0` as a
-    /// sentinel for the first track would, on load, lose all its sidechain
-    /// wiring (the references would dangle, `compile_schedule` silently
-    /// skips dangling refs, and the user sees no sidechain signal).
-    /// v29 migration: `AutomationTarget` 内の旧 positional 参照
-    /// (`legacy_device_index` / `legacy_send_idx`) を安定 id (`device_id` /
-    /// `send_id`) へ写像する。 新形式 (legacy = None) は no-op、 範囲外
-    /// index は sentinel (0) のまま残す (= 「解決不能な参照」 として
-    /// 消費側が無視できる)。
-    fn remap_target_ids(target: &mut AutomationTarget, device_ids: &[u64], send_ids: &[u32]) {
-        match target {
-            AutomationTarget::PluginParam {
-                device_id,
-                legacy_device_index,
-                ..
-            } => {
-                if let Some(idx) = legacy_device_index.take()
-                    && *device_id == 0
-                    && let Some(&id) = device_ids.get(idx as usize)
-                {
-                    *device_id = id;
-                }
-            }
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
-                send_id,
-                legacy_send_idx,
-            }) => {
-                if let Some(idx) = legacy_send_idx.take()
-                    && *send_id == 0
-                    && let Some(&id) = send_ids.get(idx as usize)
-                {
-                    *send_id = id;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn ensure_ids(&mut self) {
-        // 旧 3-split device chain (midi_fx_chain / instrument / fx_chain) の `devices` への
-        // 平坦化、および automation lane / midi_binding の旧 `slot: PluginSlot` →
-        // positional `device_index` 解決は、load 時の JSON 前処理
-        // (`project::migrate_legacy_device_chains`、§10) が担う。ここでは前処理が残した
-        // positional `legacy_device_index` / `legacy_send_idx` を安定 device_id / send_id へ
-        // 写像する (下記 remap pass。新形式 = legacy = None は no-op)。
-
-        // (v25): 旧 `group_transform` を持つトラックにチェーン上の
-        // Transform 配置 device を補う。これで「動かす変形」がチェーンの 1 device
-        // として現れ、`resolve_track_transform` の device-gate で効く（device を抜けば
-        // 変換が無効）。値・automation・変調は GroupTransform 系のまま（破壊的な値
-        // migration は不要）。idempotent（device 既存 / group_transform 無しは no-op）。
-        for track in &mut self.tracks {
-            let has_transform =
-                any_plugin(&track.devices, &mut |d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
-            if track.group_transform.is_some() && !has_transform {
-                track.devices.push(Device::Plugin(PluginInstance::with_ports(
-                    crate::video_fx::TRANSFORM_ID.to_string(),
-                    crate::plugin_format::PluginFormat::Builtin,
-                    crate::port_config::PortConfig {
-                        has_video_input: true,
-                        has_video_output: true,
-                        ..Default::default()
-                    },
-                )));
-            }
-        }
-
-        // Pass 1: assign fresh ids to sentinel tracks, recording the
-        // (old_id → new_id) remap so refs can be patched in pass 2.
-        let mut id_remap: std::collections::HashMap<u32, u32> =
-            std::collections::HashMap::new();
-        for track in &mut self.tracks {
-            if track.id == 0 {
-                let new_id = self.ids.next_track_id.max(1);
-                self.ids.next_track_id = new_id + 1;
-                id_remap.insert(0, new_id);
-                track.id = new_id;
-            } else if track.id >= self.ids.next_track_id {
-                self.ids.next_track_id = track.id + 1;
-            }
-            track.ensure_clip_ids();
-            track.ensure_lane_ids();
-        }
-        if self.ids.next_track_id == 0 {
-            self.ids.next_track_id = 1;
-        }
-
-        // Phase 5: song-level lane の id も同様に採番。 sentinel (0) のみ
-        // 上書き、 既存非 0 id は触らず counter を bump するだけ。
-        // (review) id_remap guard より **前** に置く — sentinel track が無い通常
-        // ロードでも lane / mod_source の採番・counter 正規化は必要。
-        for lane in &mut self.song_lanes {
-            if lane.id == 0 {
-                let new_id = self.ids.next_song_lane_id.max(1);
-                self.ids.next_song_lane_id = new_id + 1;
-                lane.id = new_id;
-            } else if lane.id >= self.ids.next_song_lane_id {
-                self.ids.next_song_lane_id = lane.id + 1;
-            }
-            // lane 内 clip ids も担保。**`AutomationLane::ensure_clip_ids` を通す** —
-            // ベタ書きすると `clips` しか見ず、ランチャーのセル (`session_clips`) が
-            // 採番・重複解消・`next_clip_id` の bump から漏れる (同じ id のセルが
-            // 2 つできると `RowPlayback` がどちらを指すか決まらない)。
-            lane.ensure_clip_ids();
-        }
-        if self.ids.next_song_lane_id == 0 {
-            self.ids.next_song_lane_id = 1;
-        }
-
-        // docs/plan_modulation.md §8: mod_source id も song_lanes と同様に採番。
-        // sentinel (0) のみ上書き、 既存非 0 id は触らず counter を bump する。
-        for ms in &mut self.mod_sources {
-            if ms.id == 0 {
-                let new_id = self.ids.next_mod_source_id.max(1);
-                self.ids.next_mod_source_id = new_id + 1;
-                ms.id = new_id;
-            } else if ms.id >= self.ids.next_mod_source_id {
-                self.ids.next_mod_source_id = ms.id + 1;
-            }
-        }
-        if self.ids.next_mod_source_id == 0 {
-            self.ids.next_mod_source_id = 1;
-        }
-
-        // r.md #89: ModRouting id も同 idiom で採番する。sentinel (0) と **重複 id** を
-        // 上書きする — 重複を放置すると `ModRoutingDepth { routing_id }` がどちらの
-        // 変調を指すか決まらない (device id と同じ理由)。
-        {
-            let mut next = self.ids.next_mod_routing_id;
-            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            let mut assign = |r: &mut ModRouting| {
-                if r.id == 0 || !seen.insert(r.id) {
-                    let new_id = next.max(1);
-                    next = new_id + 1;
-                    r.id = new_id;
-                    seen.insert(r.id);
-                } else if r.id >= next {
-                    next = r.id + 1;
-                }
-            };
-            for track in &mut self.tracks {
-                for r in &mut track.mod_routings {
-                    assign(r);
-                }
-            }
-            for r in &mut self.song_mod_routings {
-                assign(r);
-            }
-            self.ids.next_mod_routing_id = next.max(1);
-        }
-
-        // v29: device 安定 id (`PluginInstance::id`) を採番する。 track devices
-        // と master_fx_chain が Song-global の `next_device_id` を共有。
-        // sentinel (0) と **重複 id** を上書きし、 それ以外は counter を bump する
-        // だけ (他 allocator と同 idiom)。 r.md #110: Parallel / chain の id も同じ空間で
-        // 同じ規則 (`for_each_node_id_mut` が plugin / parallel / chain を全部訪問する)。
-        {
-            let mut next = self.ids.next_device_id;
-            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut alloc = |id: &mut u64| {
-                // 0 (未採番) と **既出 id** は必ず新採番する。 r.md #71
-                // (プラグインのコピー / 移動): 重複を放置すると plugin host の
-                // dedup (同 device_id + 同 plugin_id) が 2 device を 1 instance へ
-                // silent に merge する (音は出るので気付けない)。
-                if *id == 0 || !seen.insert(*id) {
-                    let new_id = next.max(1);
-                    next = new_id + 1;
-                    *id = new_id;
-                    seen.insert(*id);
-                } else if *id >= next {
-                    next = *id + 1;
-                }
-            };
-            for track in &mut self.tracks {
-                for_each_node_id_mut(&mut track.devices, &mut alloc);
-            }
-            for_each_node_id_mut(&mut self.master_fx_chain, &mut alloc);
-            self.ids.next_device_id = next.max(1);
-        }
-
-        // v29: send 安定 id (`Send::id`) を per-track 採番する。
-        for track in &mut self.tracks {
-            track.ensure_send_ids();
-        }
-
-        // v29: content 内要素 (note / audio event / automation point) の
-        // 安定 id を採番する (選択・undo 後の選択復元を positional index
-        // でなく id でアドレスするため)。
-        for content in self.clip_contents.values_mut() {
-            content.ensure_element_ids();
-        }
-
-        // v29: 旧 positional addressing (`PluginParam.device_index` /
-        // `SendGain.send_idx`) を安定 id へ写像する。 device_index は
-        // 「同 track の devices chain 内 index」、 song_lanes /
-        // song_mod_routings の PluginParam は master_fx_chain の index。
-        {
-            let master_ids: Vec<u64> = plugins(&self.master_fx_chain).map(|p| p.id).collect();
-            for track in &mut self.tracks {
-                let dev_ids: Vec<u64> = plugins(&track.devices).map(|p| p.id).collect();
-                let send_ids: Vec<u32> = track.sends.iter().map(|s| s.id).collect();
-                for lane in &mut track.automation_lanes {
-                    Self::remap_target_ids(&mut lane.target, &dev_ids, &send_ids);
-                }
-                for routing in &mut track.mod_routings {
-                    Self::remap_target_ids(&mut routing.target, &dev_ids, &send_ids);
-                }
-            }
-            for lane in &mut self.song_lanes {
-                Self::remap_target_ids(&mut lane.target, &master_ids, &[]);
-            }
-            for routing in &mut self.song_mod_routings {
-                Self::remap_target_ids(&mut routing.target, &master_ids, &[]);
-            }
-            // MIDI binding は任意 track の device を指せるので per-binding で
-            // track を解決してから写像する。
-            let track_devs: std::collections::HashMap<u32, Vec<u64>> = self
-                .tracks
-                .iter()
-                .map(|t| (t.id, plugins(&t.devices).map(|p| p.id).collect()))
-                .collect();
-            for binding in &mut self.midi_bindings {
-                if let BindingTarget::PluginParam {
-                    device_id,
-                    legacy_device_index,
-                    legacy_track,
-                    ..
-                } = &mut binding.target
-                {
-                    // v33 以前の positional 参照は **必ず** 消費する (どちらも
-                    // deserialize 専用。 解決に使えなかった残りかすを持ち回らない)。
-                    let legacy = legacy_device_index.take().zip(legacy_track.take());
-                    if *device_id == 0
-                        && let Some((idx, track)) = legacy
-                        && let Some(ids) = track_devs.get(&track)
-                        && let Some(&id) = ids.get(idx as usize)
-                    {
-                        *device_id = id;
-                    }
-                }
-            }
-        }
-
-        // Pass 2: patch every reference to a remapped id. Multi-sentinel
-        // cases (= more than one track started with id 0) collapse to the
-        // *last* remap entry inserted for key 0 above, which is fine for
-        // the typical "one sentinel for the first track" case. Anything
-        // else was already malformed before save.
-        if id_remap.is_empty() {
-            return;
-        }
-        for track in &mut self.tracks {
-            if let Some(pid) = track.parent_group_id
-                && let Some(&new_pid) = id_remap.get(&pid)
-            {
-                track.parent_group_id = Some(new_pid);
-            }
-            for send in &mut track.sends {
-                if let Some(&new_dest) = id_remap.get(&send.dest_track_id) {
-                    send.dest_track_id = new_dest;
-                }
-            }
-            // v23: 役割別 3 chain は単一 `devices` に統合済み。各 device の
-            // aux_inputs tap の source_track / aux_outputs の dest_track を
-            // 1 ループで remap する (パラアウト dest も sentinel→新 id に追従)。
-        }
-        // 各 device の aux_inputs tap の source track / aux_outputs の dest_track を remap
-        // する (パラアウト dest も sentinel→新 id に追従)。 r.md #110: Parallel の中の plugin も
-        // `for_each_plugin_mut` が辿る。 master fx が他 track を sidechain source /
-        // パラアウト先に取るケースも同じ経路。
-        let mut remap_routes = |p: &mut PluginInstance| {
-            for route in p.aux_inputs.iter_mut().flatten() {
-                if let TapSource::Track(src) = &mut route.tap.source
-                    && let Some(&new_id) = id_remap.get(src)
-                {
-                    *src = new_id;
-                }
-            }
-            for route in p.aux_outputs.iter_mut().flatten() {
-                if let Some(&new_id) = id_remap.get(&route.dest_track) {
-                    route.dest_track = new_id;
-                }
-            }
-        };
-        self.for_each_plugin_mut(&mut remap_routes);
-
-        // docs/plan_modulation.md §8: mod_source の tap も track id remap に追従する
-        // (mod_source.id は track id ではないので不変、 tap の source track のみ)。
-        for ms in self.mod_sources.iter_mut() {
-            // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ remap。
-            if let Some(tap) = ms.follower_tap_mut()
-                && let TapSource::Track(src) = &mut tap.source
-                && let Some(&new_id) = id_remap.get(src)
-            {
-                *src = new_id;
-            }
-        }
-
     }
 
     pub fn track_index_by_id(&self, track_id: u32) -> Option<usize> {
@@ -2132,22 +1097,6 @@ impl Song {
         self.tracks
             .iter()
             .any(|t| t.sends.iter().any(|s| s.dest_track_id == track_id))
-    }
-
-    /// パラアウト (`docs/plan_paraout.md`): true if any plugin (on any track or
-    /// the master fx chain) routes one of its aux outputs to `track_id` (= it
-    /// acts as a parallel-out destination bus). RT-safe scan, no alloc. Such a
-    /// track is summed + FX'd in pass 2 (`run_group_fx_chain`), so the audio
-    /// engine skips its own device chain in pass 1 (like a group / return) to
-    /// avoid double-processing stateful FX.
-    pub fn track_receives_paraout(&self, track_id: u32) -> bool {
-        self.all_plugins()
-            .any(|p| {
-                p.aux_outputs
-                    .iter()
-                    .flatten()
-                    .any(|r| r.dest_track == track_id)
-            })
     }
 
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
@@ -2437,10 +1386,9 @@ impl Song {
     ///
     /// **ここが落とすのはこの send を狙う 1 段だけ。** r.md #89 で変調が安定 id を
     /// 持ったので、落とした変調の **深さ**を指していた別の変調 / レーンが dangling に
-    /// なる。その連鎖掃除 ([`Self::prune_dangling_mod_targets`]) は song 全体を固定点
-    /// まで回す別種の操作なので、他の呼び出し箇所と同じく**編集の口**が担う
-    /// (`daw_gui/src/handler/mixer.rs` の `remove_send`)。呼び出し元を増やすなら
-    /// そこでも通すこと。
+    /// なる。その連鎖掃除 ([`Self::prune_dangling_param_targets`]) は song 全体を固定点
+    /// まで回す別種の操作なので、daw_gui の SongDoc の口 (`enforce_edit_invariants`) が
+    /// 編集のたびに無条件で担う。
     pub fn remove_track_send(&mut self, track_id: u32, send_id: u32) -> bool {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
             return false;
@@ -2511,407 +1459,6 @@ impl Song {
         }
         live
     }
-
-    /// 生きている content (= [`Song::live_content_ids`]) の event と、 track の口パク
-    /// `mouth_map` から到達できる media source id。 `gc_*_sources` (保存時の pool 整理)
-    /// と `daw_gui::media_bundle` (保存時の bundle 掃除) が同じ判定を使う — ここが
-    /// ずれると、 pool から落ちた source のファイルが「未参照」 としてゴミ箱へ行く。
-    ///
-    /// 到達可能性で数える (pool の存在ではなく) のは、 in-memory の pool は Undo 用に
-    /// 参照ゼロの entry を保持し続けるため。 `mouth_map` の slot は event を経由しない
-    /// 直接参照なので別途足す (未割当 = `0` は除く)。
-    pub fn live_source_ids(&self) -> LiveSourceIds {
-        let contents = self.live_content_ids();
-        let mut live = LiveSourceIds::default();
-        for (id, content) in &self.clip_contents {
-            if !contents.contains(id) {
-                continue;
-            }
-            match content {
-                ClipContent::Audio(a) => live.audio.extend(a.events.iter().map(|ev| ev.source_id)),
-                ClipContent::Video(v) => live.video.extend(v.events.iter().map(|ev| ev.source_id)),
-                ClipContent::Image(i) => live.image.extend(i.events.iter().map(|ev| ev.source_id)),
-                ClipContent::Midi(_) | ClipContent::Automation(_) | ClipContent::Text(_) => {}
-            }
-        }
-        for map in self.tracks.iter().filter_map(|t| t.mouth_map.as_ref()) {
-            live.image.extend(map.all_ids().filter(|id| *id != 0));
-        }
-        live
-    }
-
-    /// Allocate a fresh `AudioSourceId`, bumping the song-level counter.
-    pub fn alloc_audio_source_id(&mut self) -> AudioSourceId {
-        let id = self.ids.next_audio_source_id.max(1);
-        self.ids.next_audio_source_id = id.saturating_add(1);
-        id
-    }
-
-    /// Refcount of an `AudioSourceId` = total `AudioEvent.source_id`
-    /// references across every audio `ClipContent` in the song. Used by
-    /// `gc_audio_sources` and Inspector display. `Video` clips do not
-    /// reference AudioSource directly — the auto-extracted WAV is wired
-    /// via the paired audio track's `AudioEvent`, which is counted here
-    /// like any other audio reference.
-    pub fn audio_source_refcount(&self, source_id: AudioSourceId) -> usize {
-        self.clip_contents
-            .values()
-            .filter_map(|c| match c {
-                ClipContent::Audio(a) => Some(a.events.iter()),
-                ClipContent::Midi(_)
-                | ClipContent::Automation(_)
-                | ClipContent::Video(_)
-                | ClipContent::Image(_)
-                | ClipContent::Text(_) => None,
-            })
-            .flatten()
-            .filter(|ev| ev.source_id == source_id)
-            .count()
-    }
-
-    /// Drop `audio_sources` entries nothing reachable references
-    /// ([`Song::live_source_ids`]). Called before save so the on-disk pool
-    /// stays tidy. In-memory entries with refcount=0 are kept so Undo can
-    /// restore them.
-    pub fn gc_audio_sources(&mut self) {
-        let live = self.live_source_ids().audio;
-        self.media.audio_sources.retain(|id, _| live.contains(id));
-    }
-
-    /// Re-assign fresh `AudioSourceId` to any source whose id is the
-    /// `0` sentinel (and bump `next_audio_source_id` above the highest
-    /// seen). Idempotent — sources with non-zero ids are left untouched.
-    /// Mirrors `ensure_clip_contents` semantics.
-    pub fn ensure_audio_source_ids(&mut self) {
-        let mut max_seen: AudioSourceId = 0;
-        for id in self.media.audio_sources.keys() {
-            if *id != 0 {
-                max_seen = max_seen.max(*id);
-            }
-        }
-        if self.ids.next_audio_source_id <= max_seen {
-            self.ids.next_audio_source_id = max_seen + 1;
-        }
-        if self.ids.next_audio_source_id == 0 {
-            self.ids.next_audio_source_id = 1;
-        }
-        // Re-key any AudioSource currently held under id 0. AudioEvent
-        // references to id 0 are NOT remapped — those remain dangling
-        // (= "missing source") which is the correct UX for unresolved
-        // imports. Callers that mint a fresh AudioSource should always
-        // go through `alloc_audio_source_id` and avoid sentinel 0.
-        if let Some(orphan) = self.media.audio_sources.remove(&0) {
-            let new_id = self.alloc_audio_source_id();
-            self.media.audio_sources.insert(new_id, orphan);
-        }
-    }
-
-    /// v12 (`docs/plan_video.md` §2.4): allocate a fresh
-    /// `VideoSourceId`, bumping the song-level counter. Mirrors
-    /// `alloc_audio_source_id`.
-    pub fn alloc_video_source_id(&mut self) -> VideoSourceId {
-        let id = self.ids.next_video_source_id.max(1);
-        self.ids.next_video_source_id = id.saturating_add(1);
-        id
-    }
-
-    /// v12: refcount of a `VideoSourceId` = total `VideoEvent.source_id`
-    /// references across every `Video` `ClipContent` in the song. Used
-    /// by `gc_video_sources` and (future) inspector display.
-    pub fn video_source_refcount(&self, source_id: VideoSourceId) -> usize {
-        self.clip_contents
-            .values()
-            .filter_map(|c| match c {
-                ClipContent::Video(v) => Some(v.events.iter()),
-                ClipContent::Midi(_)
-                | ClipContent::Audio(_)
-                | ClipContent::Automation(_)
-                | ClipContent::Image(_)
-                | ClipContent::Text(_) => None,
-            })
-            .flatten()
-            .filter(|ev| ev.source_id == source_id)
-            .count()
-    }
-
-    /// v12: drop `video_sources` entries nothing reachable references
-    /// ([`Song::live_source_ids`]). Mirrors `gc_audio_sources`.
-    pub fn gc_video_sources(&mut self) {
-        let live = self.live_source_ids().video;
-        self.media.video_sources.retain(|id, _| live.contains(id));
-    }
-
-    /// v12: re-assign fresh `VideoSourceId` to any source whose id is
-    /// the `0` sentinel and bump `next_video_source_id` above the
-    /// highest seen. Mirrors `ensure_audio_source_ids` semantics; v11
-    /// files load with all-default fields so this only matters once
-    /// v12 sources start being saved with sentinel ids (= shouldn't
-    /// happen in practice, but the invariant is cheap to enforce).
-    pub fn ensure_video_source_ids(&mut self) {
-        let mut max_seen: VideoSourceId = 0;
-        for id in self.media.video_sources.keys() {
-            if *id != 0 {
-                max_seen = max_seen.max(*id);
-            }
-        }
-        if self.ids.next_video_source_id <= max_seen {
-            self.ids.next_video_source_id = max_seen + 1;
-        }
-        if self.ids.next_video_source_id == 0 {
-            self.ids.next_video_source_id = 1;
-        }
-        if let Some(orphan) = self.media.video_sources.remove(&0) {
-            let new_id = self.alloc_video_source_id();
-            self.media.video_sources.insert(new_id, orphan);
-        }
-    }
-
-    /// v13 (`docs/plan_image_overlay.md` §2.4): allocate a fresh
-    /// `ImageSourceId`, bumping the song-level counter. Mirrors
-    /// `alloc_video_source_id`.
-    pub fn alloc_image_source_id(&mut self) -> ImageSourceId {
-        let id = self.ids.next_image_source_id.max(1);
-        self.ids.next_image_source_id = id.saturating_add(1);
-        id
-    }
-
-    /// v13: refcount of an `ImageSourceId` = total `ImageEvent.source_id`
-    /// references across every `Image` `ClipContent` in the song. Used
-    /// by `gc_image_sources` and (future) inspector display.
-    pub fn image_source_refcount(&self, source_id: ImageSourceId) -> usize {
-        self.clip_contents
-            .values()
-            .filter_map(|c| match c {
-                ClipContent::Image(i) => Some(i.events.iter()),
-                ClipContent::Midi(_)
-                | ClipContent::Audio(_)
-                | ClipContent::Automation(_)
-                | ClipContent::Video(_)
-                | ClipContent::Text(_) => None,
-            })
-            .flatten()
-            .filter(|ev| ev.source_id == source_id)
-            .count()
-    }
-
-    /// v13: drop `image_sources` entries nothing reachable references
-    /// ([`Song::live_source_ids`]) — `ImageEvent` に加えて track の `mouth_map`
-    /// (口パク slot) も参照に数える。 event に出ていない口形状の画像が save のたびに
-    /// pool から落ち、 次回 load で mapping が空を指していた。
-    pub fn gc_image_sources(&mut self) {
-        let live = self.live_source_ids().image;
-        self.media.image_sources.retain(|id, _| live.contains(id));
-    }
-
-    /// v13: re-assign fresh `ImageSourceId` to any source whose id is
-    /// the `0` sentinel and bump `next_image_source_id` above the
-    /// highest seen. Mirrors `ensure_video_source_ids` semantics.
-    pub fn ensure_image_source_ids(&mut self) {
-        let mut max_seen: ImageSourceId = 0;
-        for id in self.media.image_sources.keys() {
-            if *id != 0 {
-                max_seen = max_seen.max(*id);
-            }
-        }
-        if self.ids.next_image_source_id <= max_seen {
-            self.ids.next_image_source_id = max_seen + 1;
-        }
-        if self.ids.next_image_source_id == 0 {
-            self.ids.next_image_source_id = 1;
-        }
-        if let Some(orphan) = self.media.image_sources.remove(&0) {
-            let new_id = self.alloc_image_source_id();
-            self.media.image_sources.insert(new_id, orphan);
-        }
-    }
-}
-
-
-
-/// Reference to a plugin loaded on a track, with the opaque state blob the
-/// plugin itself produced (CLAP `clap_plugin_state.save` or VST3
-/// `IComponent::getState`). Paths are NOT stored — `(format, plugin_id)`
-/// is resolved through `plugin_db::PluginDatabase` at load time, keeping
-/// projects portable across machines.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginInstance {
-    /// v29: Song-global の安定 device id (`Song.next_device_id` 採番、`0` =
-    /// 未採番 sentinel)。IPC / automation / plugin host bookkeeping / shmem 名
-    /// / worker dispatch のアドレスはすべてこの id。chain 内 index は表示順序
-    /// のみ (`docs/plan_arch_refactor.md` §1)。
-    #[serde(default)]
-    pub id: u64,
-    /// CLAP stable id (reverse-DNS) or VST3 class UUID rendered as hex.
-    pub plugin_id: String,
-    /// Which backend created this plugin. Defaults to CLAP for projects
-    /// saved before VST3 support existed.
-    #[serde(default)]
-    pub format: PluginFormat,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "base64_opt"
-    )]
-    /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (= `Song::clone`
-    /// が plugin state を毎回コピーしない)。 plugin が serialize した不透明 state で
-    /// undo の編集対象ではないので共有して安全。
-    pub state: Option<std::sync::Arc<[u8]>>,
-    /// Consumer A (旧 sidechain、 docs/plan_modulation.md §1): aux 入力ポート
-    /// ごとのルート。 各 entry は plugin の `is_main=false` aux input port
-    /// index → `AudioTap`。 `None` (or 不足 index) はそのポートを無音に。
-    /// `Vec` 長 = user が配線した aux port 数 (plugin の実 port 数より短くて
-    /// よい — 末尾は無音)。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aux_inputs: Vec<Option<AuxInputRoute>>,
-    /// Consumer B (パラアウト、 docs/plan_paraout.md): aux **出力**ポートごとの
-    /// ルート。 各 entry は plugin の `is_main=false` aux output port index →
-    /// `AuxOutputRoute { dest_track }`。 `None` (or 不足 index) はそのポートを
-    /// どこにも流さない (= 業界標準: 未振分け aux 出力は無音)。 `Vec` 長 = user が
-    /// 配線した aux port 数 (plugin の実 port 数より短くてよい)。 旧 file には
-    /// 無いので `#[serde(default)]` で forward-migrate (空)。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aux_outputs: Vec<Option<AuxOutputRoute>>,
-    /// パラアウト (docs/plan_paraout.md): how many `is_main=false` audio output
-    /// ports this plugin actually declares (reported by the plugin host at load
-    /// via `SlotPluginLoaded`, cached here so it survives reorder and is known
-    /// on project reopen). The GUI uses it to know how many child tracks to
-    /// create on "explode" and how many routing rows to show. `0` = the common
-    /// single-output plugin. Distinct from `aux_outputs.len()` (= how many
-    /// ports the user has wired). daw_audio ignores it (it routes via
-    /// `aux_outputs` + the plugin host's `aux_out_active`).
-    #[serde(default)]
-    pub aux_output_count: u8,
-    /// r.md #110: `is_main=false` な audio **入力** port の数 (`aux_output_count` と対称、
-    /// host が `SlotPluginLoaded` で報告)。 inspector はこれが 1 以上の device にだけ
-    /// sidechain (SC) 制御を出す。 engine は `aux_inputs` の配線だけを見る。
-    #[serde(default)]
-    pub aux_input_count: u8,
-    /// v23: この device の port 構成。役割導出の入力。
-    #[serde(default)]
-    pub ports: crate::port_config::PortConfig,
-    /// (r.md #5 ARA2) ARA ドキュメントアーカイブ = プラグインがシリアライズした
-    /// 編集状態 (Melodyne のピッチ修正等)。ホストが instance ごとに保持し、
-    /// プロジェクトには base64 で保存、ロード時にプラグインへ送り返して編集を
-    /// 復元する。`state` (CLAP/VST3 own state) とは独立。
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_opt")]
-    /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (Melodyne 等の
-    /// ARA アーカイブは MB 級で undo の編集対象でないため)。
-    pub ara_archive: Option<std::sync::Arc<[u8]>>,
-    /// r.md #36: このプラグインのエディタ窓では **キーを一切横取りしない**
-    /// (= REAPER の 「Send all keyboard input to plug-in」)。
-    ///
-    /// 既定 `false` = 自動判定に任せる。 通常はプラグイン側が 「消化しなかった」
-    /// と表明したキーだけをホストが取るので Space での再生 / 停止とプラグインの
-    /// 文字入力が両立する。 ただし Dear ImGui / GLFW / 自前 OpenGL 系のエディタは
-    /// 消化の有無を外に一切出さないため、 そういうプラグインではここを `true` にして
-    /// 手動で全キーを譲る。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub send_all_keys_to_plugin: bool,
-    /// r.md #105: この device を **信号経路から外す** (Live の device off / Bitwig の
-    /// power ボタン / REAPER の bypass)。`true` の間、 engine はこの device を dispatch
-    /// せず、 音声も MIDI も手前の状態のまま次の device へ流れる (= pass-through)。
-    /// 報告 latency も 0 扱いで PDC から外れる。 映像 FX も同じフラグで解決から外れる。
-    /// プラグイン instance 自体は host に生きたまま (GUI は開ける、 state も保つ)。
-    /// project に保存し undo 対象 (= 「作った中身」)。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub bypassed: bool,
-}
-
-impl PluginInstance {
-    pub fn new(plugin_id: String, format: PluginFormat) -> Self {
-        Self {
-            id: 0,
-            plugin_id,
-            format,
-            state: None,
-            aux_inputs: Vec::new(),
-            aux_outputs: Vec::new(),
-            aux_output_count: 0,
-            aux_input_count: 0,
-            ports: crate::port_config::PortConfig::default(),
-            ara_archive: None,
-            send_all_keys_to_plugin: false,
-            bypassed: false,
-        }
-    }
-
-    pub fn with_ports(
-        plugin_id: String,
-        format: PluginFormat,
-        ports: crate::port_config::PortConfig,
-    ) -> Self {
-        Self {
-            id: 0,
-            plugin_id,
-            format,
-            state: None,
-            aux_inputs: Vec::new(),
-            aux_outputs: Vec::new(),
-            aux_output_count: 0,
-            aux_input_count: 0,
-            ports,
-            ara_archive: None,
-            send_all_keys_to_plugin: false,
-            bypassed: false,
-        }
-    }
-
-}
-
-/// wire (bincode / IPC) 表現は手書きで、`state` / `ara_archive` の MB 級 blob を
-/// **構造的に除外**する (`docs/plan_arch_refactor.md` §2)。ドキュメント
-/// (serde / JSON 保存) は両フィールドを base64 で保持し、blob が必要な IPC
-/// 操作は専用メッセージ (`SetSlotPlugin.initial_state` /
-/// `SetupAraDocument.archive` / `AllPluginStates`) が個別に運ぶ。これで
-/// `LoadSong` は plugin state / ARA アーカイブの肥大に依らず常に小さく、
-/// 16MB wire 上限に構造的に到達しない。encode / decode の field 順は一致
-/// させること (id → plugin_id → format → aux_inputs → aux_outputs →
-/// aux_output_count → ports → send_all_keys_to_plugin → bypassed → aux_input_count)。
-impl bincode::Encode for PluginInstance {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> Result<(), bincode::error::EncodeError> {
-        self.id.encode(encoder)?;
-        self.plugin_id.encode(encoder)?;
-        self.format.encode(encoder)?;
-        self.aux_inputs.encode(encoder)?;
-        self.aux_outputs.encode(encoder)?;
-        self.aux_output_count.encode(encoder)?;
-        self.ports.encode(encoder)?;
-        self.send_all_keys_to_plugin.encode(encoder)?;
-        self.bypassed.encode(encoder)?;
-        self.aux_input_count.encode(encoder)
-    }
-}
-
-impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
-    fn decode<D: bincode::de::Decoder<Context = Ctx>>(
-        decoder: &mut D,
-    ) -> Result<Self, bincode::error::DecodeError> {
-        Ok(Self {
-            id: bincode::Decode::decode(decoder)?,
-            plugin_id: bincode::Decode::decode(decoder)?,
-            format: bincode::Decode::decode(decoder)?,
-            state: None,
-            aux_inputs: bincode::Decode::decode(decoder)?,
-            aux_outputs: bincode::Decode::decode(decoder)?,
-            aux_output_count: bincode::Decode::decode(decoder)?,
-            ports: bincode::Decode::decode(decoder)?,
-            ara_archive: None,
-            send_all_keys_to_plugin: bincode::Decode::decode(decoder)?,
-            bypassed: bincode::Decode::decode(decoder)?,
-            aux_input_count: bincode::Decode::decode(decoder)?,
-        })
-    }
-}
-
-impl<'de, Ctx> bincode::BorrowDecode<'de, Ctx> for PluginInstance {
-    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Ctx>>(
-        decoder: &mut D,
-    ) -> Result<Self, bincode::error::DecodeError> {
-        <Self as bincode::Decode<Ctx>>::decode(decoder)
-    }
 }
 
 /// serde `skip_serializing_if` 用: `u32` が 0 か。`Clip::speaker_id`
@@ -2961,3 +1508,5 @@ impl Default for TalkParams {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod native_tests;

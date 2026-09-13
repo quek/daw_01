@@ -20,7 +20,7 @@
 //! サンプルループに入れない)。 状態は再 compile を跨いで `adopt_state_from` で移送する
 //! (捨てると編集のたびにクリックが乗る)。 RT 規約: 確保・ロック・I/O なし。
 
-use common::channel_strip_dsp::{Biquad, BiquadState};
+use common::dsp::{Biquad, BiquadState};
 use common::model::{SPLIT_FREQ_RANGE, Split, SplitBand};
 
 use crate::graph::selector_split::SelectorSplit;

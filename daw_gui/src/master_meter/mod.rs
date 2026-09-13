@@ -10,6 +10,8 @@
 //! (メトロノームやパニック declick は含まない)。設計は
 //! `docs/plan_master_meters.md`。
 
+/// r.md #129: EQ Par の device ごとのスペクトラム (同じ解析器を device ごとに回す)。
+pub mod device_spectrum;
 pub mod scope;
 pub mod settings;
 pub mod spectrum;
@@ -47,8 +49,8 @@ const MAX_SILENCE_SECS: f32 = 0.5;
 const DIGEST_GONIO_POINTS: usize = 128;
 
 /// 無音がこの回数続き、かつ表示が変化しなくなったら解析を休む
-/// ([`MasterAnalyzer::tick`] の settle 判定)。2 回見るのは「最後の 1 ティックで
-/// まだ動いていた」を取りこぼさないため。
+/// ([`MasterAnalyzer::tick`] / [`device_spectrum::DeviceSpectrumPoller::tick`] の settle 判定)。
+/// 2 回見るのは「最後の 1 ティックでまだ動いていた」を取りこぼさないため。
 const SETTLE_TICKS: u32 = 2;
 
 fn amp_to_db(v: f32) -> f32 {
@@ -527,10 +529,10 @@ fn compute_digest(s: &MasterMeterSnapshot) -> u64 {
     }
     mix(q(st.balance_db, 0.05));
     for v in &s.spectrum_db {
-        mix(q(*v, 0.25));
+        mix(q(*v, spectrum::DISPLAY_STEP_DB));
     }
     for v in &s.spectrum_hold_db {
-        mix(q(*v, 0.25));
+        mix(q(*v, spectrum::DISPLAY_STEP_DB));
     }
     for col in &s.scope {
         for v in col {

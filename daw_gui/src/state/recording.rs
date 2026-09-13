@@ -1,6 +1,31 @@
 //! S3b-1: AppData state group (RecordingState)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 
+/// r.md #129 (§7.6): パラメーターのジェスチャーを**開いた面**。
+///
+/// 同じ `(track, target)` を 2 つの面が描く (Mixer 帯と Rack Par の同じつまみ / アレンジの
+/// ヘッダ音量と Mixer フェーダー) とき、所有者に面が無いと、ドラッグしていない面が毎フレーム
+/// End を出して undo が 2 フレームごとに 1 step 積まれ、録音も途切れる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParamSurface {
+    MixerStrip,
+    Rack,
+    MasterPanel,
+    Transport,
+    ArrangementHeader,
+    PluginWindow,
+    VideoPreview,
+}
+
+impl ParamSurface {
+    /// 描画の存在で寿命を回収するか (`view::param_gesture::sweep_param_gestures`)。
+    /// PluginWindow (IPC の End) と VideoPreview (preview 窓の drag end) は描画と無関係に閉じるので false。
+    #[must_use]
+    pub fn swept(self) -> bool {
+        !matches!(self, Self::PluginWindow | Self::VideoPreview)
+    }
+}
+
 pub struct RecordingState {
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode。
     /// transport bar の 4 way toggle (Read / Touch / Latch / Write) で切替。
@@ -70,8 +95,11 @@ pub struct RecordingState {
     /// を bypass する。 `latched_param_gestures` (= Latch mode 用に保持する
     /// "1 度触れた parameter") と組み合わせて、 Read/Touch/Latch/Write の
     /// 4 mode の挙動差を audio thread 側で実現する。
+    ///
+    /// r.md #129 (§7.6): 値は **その gesture を開いた面**。閉じられるのは同じ面だけで、
+    /// 別の面の「非ドラッグ」は所有者を奪わない。
     pub active_param_gestures:
-        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+        std::collections::HashMap<(u32, common::model::AutomationTarget), ParamSurface>,
     /// Phase 4 Step C (`docs/plan_automation.md` §6): `Latch` / `Write` mode
     /// で「再生中に 1 度でも触れた parameter」 を transport stop まで保持する
     /// set。 `ParamGestureBegin` が `is_playing == true` 中に発火すると

@@ -25,7 +25,8 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, ScrubGesture};
+use crate::handler::bypass_target::BypassTarget;
 use crate::view::master_strip_ui;
 use crate::handler::master_panel::{
     MASTER_PANEL_MAX_W, MASTER_PANEL_MIN_W, MASTER_SECTION_MIN_H, section_heights, section_ratios,
@@ -95,14 +96,33 @@ const MENU_IDS: [&str; 5] = [
     "master_panel_menu_gonio",
 ];
 
+/// パネルを描き、組み込みブロックの hover (`Q` の宛先) を **ここ 1 か所で** 反映する。
+///
+/// hover を描画の途中で書くと、パネルを閉じた / 列が狭い / 低いといった早期 return の
+/// フレームで誰も消さず、描かれていないブロックが `Q` の宛先として残る (§18-AB)。描画は
+/// 宛先を返すだけにして、どの経路で抜けても毎フレーム必ずここを通す。
 pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
+    let hovered = draw_panel(app, ui, rect);
+    publish_master_panel_hover(app, ui, hovered);
+}
+
+/// `master_panel_hovered` を差分があるときだけ書く。
+fn publish_master_panel_hover(app: &AppData, ui: &mut Ui<'_, AppData>, hovered: Option<BypassTarget>) {
+    if app.cur.peph.master_panel_hovered != hovered {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.cur.peph.master_panel_hovered = hovered;
+        }));
+    }
+}
+
+fn draw_panel<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) -> Option<BypassTarget> {
     if !app.ui_prefs.master_panel_open || rect.w < 1.0 {
         // パネルを閉じたら、開いたままのメニューも一緒に畳む
         // (描かれない popup が残ると不可視の入力デッドゾーンになる)。
         for id in MENU_IDS {
             ui.close_popup(id);
         }
-        return;
+        return None;
     }
     let p = &app.theme.core;
     ui.panel("master_panel_bg", rect, p.panel_raised, 0.0);
@@ -151,27 +171,31 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
     let total: f32 = heights.iter().sum::<f32>() + SECTION_HANDLE_H * 3.0;
     if total > content.h + 0.5 {
         // 画面が低すぎて最低高が入らない: 縦スクロールで全部見せる。
+        let mut hovered = None;
         ui.scroll_area(
             "master_panel_scroll",
             content,
             (content.w, total),
             |ui, offset| {
                 let inner = Rect { y: content.y - offset.1, h: total, ..content };
-                draw_sections(app, ui, inner, heights, avail);
+                hovered = draw_sections(app, ui, inner, heights, avail);
             },
         );
+        hovered
     } else {
-        draw_sections(app, ui, content, heights, avail);
+        draw_sections(app, ui, content, heights, avail)
     }
 }
 
+/// 4 セクションを描く。戻り値は MASTER セクションの組み込みブロックの hover。
 fn draw_sections<'a>(
     app: &'a AppData,
     ui: &mut Ui<'a, AppData>,
     content: Rect,
     heights: [f32; 4],
     avail: f32,
-) {
+) -> Option<BypassTarget> {
+    let mut hovered = None;
     let mut y = content.y;
     for i in 0..4 {
         let sect = Rect { x: content.x, y, w: content.w, h: heights[i] };
@@ -183,7 +207,7 @@ fn draw_sections<'a>(
             h: (sect.h - HEADER_H - 2.0).max(1.0),
         };
         match i {
-            0 => draw_master_section(app, ui, body),
+            0 => hovered = draw_master_section(app, ui, body),
             1 => draw_spectrum_section(app, ui, body),
             2 => draw_scope_section(app, ui, body),
             _ => draw_stereo_section(app, ui, body),
@@ -194,6 +218,7 @@ fn draw_sections<'a>(
             y += SECTION_HANDLE_H;
         }
     }
+    hovered
 }
 
 fn draw_section_header<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, sect: Rect, i: usize) {
@@ -293,7 +318,8 @@ fn draw_section_handle<'a>(
 // MASTER (フェーダー + メーター + ラウドネス)
 // =====================================================================
 
-fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rect) {
+/// 戻り値は組み込みブロック (Bus Comp / Tone EQ / Limiter) の hover。描かなかったフレームは `None`。
+fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rect) -> Option<BypassTarget> {
     let m = &app.cur.transport.master_meter;
     let p = &app.theme.core;
     let settings = app.ui_prefs.meter_settings;
@@ -343,20 +369,10 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
         },
         None,
     );
-    // drag の立ち上がり / 立ち下がりで undo gesture を開閉する。`master_gain` は
-    // `Song` に入って undo 対象になったので、これが無いと 1 回のドラッグで
-    // per-frame の編集が undo 履歴を埋める。was_dragging は 1 frame 遅れで
-    // 追従する (param_gesture と同じ edge 検出の連鎖)。
-    if resp.fader.dragging != app.cur.peph.master_gain_dragging {
-        let started = resp.fader.dragging;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(if started {
-                AppEvent::BeginMasterGainDrag
-            } else {
-                AppEvent::EndMasterGainDrag
-            });
-        }));
-    }
+    // `master_gain` は `Song` の値 (undo 対象) なので、1 回のドラッグを undo 1 step に束ねる。
+    // 束ねる口は `scrub_gesture::push` 1 本 (同じフレームの値より先に開く / 描かれなくなったら閉じる)。
+    // 描いた毎フレーム呼ぶ (ドラッグしていないフレームも)。
+    crate::view::scrub_gesture::push(ui, app, ScrubGesture::MasterGain, resp.fader.dragging);
     if resp.peak_reset {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ResetMasterPeakHold);
@@ -374,7 +390,7 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
     let rest_x = body.x + FADER_GROUP_W + FADER_METER_GAP;
     let rest_w = (body.x + body.w - rest_x).max(0.0);
     if rest_w < READOUT_MIN_W {
-        return;
+        return None;
     }
     let (bar_w, read_x, read_w) = if rest_w >= lu_col_w + LU_READOUT_GAP + READOUT_MIN_W {
         (
@@ -402,22 +418,21 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
             &style,
         );
     }
-    // ---- マスターストリップ + ラウドネス数値 (数値欄の列を上下に割る) ----
+    // ---- 組み込みブロック + ラウドネス数値 (数値欄の列を上下に割る) ----
     // docs/plan_master_strip.md §3: LU バーとフェーダーは全高のまま、**数値欄の列
-    // だけ**を割ってその上にストリップを積む。ストリップは必要高を取り、残りが
-    // 数値欄。列が低いときはストリップ側が下のブロックから諦める。
+    // だけ**を割ってその上にブロックを積む。ブロックは必要高を取り、残りが
+    // 数値欄。列が低いときはブロック側が優先度の低いものから諦める。
     let read_rect = Rect { x: read_x, y: body.y, w: read_w, h: body.h };
     let readout_min = READ_LINE_H * 5.0 + RESET_BTN_H + 4.0;
     let strip_h = master_strip_ui::desired_height().min((body.h - readout_min).max(0.0));
-    if strip_h > 0.0 {
-        master_strip_ui::draw(app, ui, Rect { h: strip_h, ..read_rect });
-    }
+    let hovered = if strip_h > 0.0 { master_strip_ui::draw(app, ui, Rect { h: strip_h, ..read_rect }) } else { None };
     draw_loudness_readout(
         app,
         ui,
         Rect { y: read_rect.y + strip_h, h: (read_rect.h - strip_h).max(0.0), ..read_rect },
     );
     loudness_context_menu(ui, loudness_rect, settings);
+    hovered
 }
 
 /// M / S / I / LRA / TP の数値 + クリップ表示 + Reset。

@@ -105,16 +105,16 @@ impl AppData {
     /// (bounce = `docs/plan_audio_clip.md` §3.8 / Glue の焼き込み =
     /// `docs/plan_glue_bake.md`)。
     ///
-    /// 他トラック・`master_fx_chain`・master 音量・**マスターストリップ (バスコンプ /
-    /// リミッター) とそのオートメーション / 変調**・group/send/sidechain 参照を全て落とすので、
-    /// engine の offline render はそのトラック単独の音だけを焼く (= isolate、 他トラックが
-    /// 混ざらない)。元トラックの mute / solo も解除する (= with-FX bounce で mute 済みでも
-    /// isolate render は鳴らす)。
+    /// 他トラック・`master_fx_chain` (master の組み込み Bus Comp / Tone EQ を含む)・master 音量・
+    /// **master のフェーダー後 Limiter とそのオートメーション / 変調**・group/send/sidechain 参照を
+    /// 全て落とすので、engine の offline render はそのトラック単独の音だけを焼く (= isolate、
+    /// 他トラックが混ざらない)。元トラックの mute / solo も解除する (= with-FX bounce で mute 済み
+    /// でも isolate render は鳴らす)。
     ///
-    /// r.md #92: マスターストリップを残したまま焼くと、コンプ / リミッターの GR が WAV に
-    /// 焼き込まれ、再生時にもう一度マスターを通って**二重に**掛かる (実測: comp ON +
-    /// limiter ON の曲で Glue した Kick が全ヒット -4.5 dB、peak は ceiling の -1 dB に揃う)。
-    /// master 音量 / `master_fx_chain` を外すのと同じ理由で、ストリップも素通しにする。
+    /// r.md #92: master のコンプ / リミッターを残したまま焼くと、GR が WAV に焼き込まれ、再生時に
+    /// もう一度マスターを通って**二重に**掛かる (実測: comp ON + limiter ON の曲で Glue した Kick が
+    /// 全ヒット -4.5 dB、peak は ceiling の -1 dB に揃う)。master 音量 / `master_fx_chain` を外すのと
+    /// 同じ理由で、Limiter も明示的に OFF にする (既定値が変わっても壊れないよう値で書く)。
     ///
     /// **ランチャーの主導権は必ずアレンジへ戻す**: 行が [`RowPlayback::Launcher`] /
     /// `LauncherStopped` のままだと、offline 走査は「今のセッションの状態」を再現する
@@ -122,9 +122,12 @@ impl AppData {
     ///
     /// `pre_fx == true` (Bounce In Place / Glue) は「素材の素の音」だけを焼く:
     /// - insert FX device (= `ports.has_audio_input`) を `PortConfig::default()` で中和。
-    ///   **device は削除しない** — engine は plugin を安定 `device_id` で解決するので、
+    ///   **plugin は削除しない** — engine は plugin を安定 `device_id` で解決するので、
     ///   消すと host 側 instance との対応が切れる。並びを保ったまま ports を空にして
     ///   dispatch を無害化する。
+    /// - 内蔵 device (組み込みの Comp / EQ を含む) は host に instance を持たないので **取り除く**
+    ///   (K28)。それを指すレーン / 変調は最後の `prune_dangling_param_targets` が機械的に消す
+    ///   (残すと再生時にもう一度同じ Comp / EQ を通って二重に掛かる)。
     /// - **フェーダー / pan とそのオートメーションを外す**。焼き込むと、再生時に同じ
     ///   フェーダーが**もう一度**掛かって二重に効く (master 音量を外すのと同じ理由)。
     ///
@@ -133,18 +136,19 @@ impl AppData {
     pub(crate) fn isolated_track_song(&self, track_id: u32, pre_fx: bool) -> Option<Song> {
         let track = self.cur.song_doc.song().track_by_id(track_id)?;
         let mut isolated = self.cur.song_doc.song().clone();
+        // master の組み込み (Bus Comp / Tone EQ) も消える。engine は組み込みの有無を前提にしない。
         isolated.master_fx_chain.clear();
         isolated.master_gain = 1.0;
-        // r.md #92: ストリップ本体 (全 OFF = `is_bypassed`) に加え、ON に戻し得る
-        // song-level のレーン / 変調も落とす (lane が無くても `song_mod_routings` は
-        // per-sample に値を動かす — track 側の `mod_routings` を外すのと同じ理由)。
-        isolated.master_strip = common::model::MasterStrip::default();
+        // r.md #92: Limiter 本体に加え、ON に戻し得る song-level のレーン / 変調も落とす (lane が
+        // 無くても `song_mod_routings` は値を動かす — track 側の `mod_routings` を外すのと同じ理由)。
+        isolated.master_limiter =
+            common::model::MasterLimiterSettings { on: false, ..common::model::MasterLimiterSettings::default() };
         isolated
             .song_lanes
-            .retain(|l| !matches!(l.target, common::model::AutomationTarget::MasterStrip(_)));
+            .retain(|l| !matches!(l.target, common::model::AutomationTarget::MasterLimiter(_)));
         isolated
             .song_mod_routings
-            .retain(|r| !matches!(r.target, common::model::AutomationTarget::MasterStrip(_)));
+            .retain(|r| !matches!(r.target, common::model::AutomationTarget::MasterLimiter(_)));
         let mut kept = track.clone();
         kept.parent_group_id = None;
         kept.sends.clear();
@@ -155,12 +159,14 @@ impl AppData {
             lane.launcher = common::model::RowPlayback::Arranger;
         }
         common::model::for_each_plugin_mut(&mut kept.devices, &mut |d| {
-            d.aux_inputs.clear();
             if pre_fx && d.ports.has_audio_input {
                 d.ports = common::port_config::PortConfig::default();
             }
         });
+        // sidechain の配線は他トラック (= 焼く Song に居ない) を指すので全部外す (plugin も内蔵も)。
+        common::model::for_each_aux_slot_mut(&mut kept.devices, &mut |_, _, slot| *slot = None);
         if pre_fx {
+            common::model::remove_natives_in(&mut kept.devices);
             // pan は中央、音量は **strip を打ち消す値**。 equal-power の pan 則は
             // 中央でも -3dB 掛かる (`common::audio_render::pan_gains`) ので、
             // `volume = 1.0` にすると -3dB 焼き込まれた音を再生時にもう一度
@@ -176,10 +182,11 @@ impl AppData {
             kept.mod_routings.retain(|r| !is_fader_lane(&r.target));
         }
         isolated.tracks = vec![kept];
-        // r.md #89 (同件): 外した変調の **深さ**を指していた変調 / レーンと、他トラック
-        // ごと落ちた変調への参照を連鎖して掃除する。render 用の使い捨て Song でも、
-        // dangling を残すと engine が「効かない行」を schedule に載せる。
-        isolated.prune_dangling_mod_targets();
+        // r.md #89 (同件): 外した変調の **深さ**を指していた変調 / レーン、取り除いた内蔵 device と
+        // 他トラックごと落ちた node への参照を連鎖して掃除する。render 用の使い捨て Song でも、
+        // dangling を残すと engine が「効かない行」を schedule に載せる。**ここは `SongDoc` を
+        // 通らない** ので明示的に呼ぶ。
+        isolated.prune_dangling_param_targets();
         Some(isolated)
     }
 
@@ -719,5 +726,75 @@ fn move_track_automation(
             c.start_beat += delta;
             lane.clips.push(c);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::model::{
+        AudioTap, AuxInputRoute, AutomationLane, AutomationTarget, CompParam, Device, MasterLimiterParam, ModRouting, ModSource, ModSourceKind, NativeDevice, NativeKind, NativeParamId,
+        Polarity, TapPoint, TapSource,
+    };
+
+    fn routing(id: u32, target: AutomationTarget) -> ModRouting {
+        ModRouting { id, target, source_id: 1, depth: 0.5, polarity: Polarity::Unipolar, enabled: true }
+    }
+
+    /// F-G6 (§10.15): 焼く Song から「再生時にもう一度掛かる」経路が消える。
+    #[test]
+    fn isolated_track_song_neutralizes_native_devices_and_master_limiter() {
+        let mut app = crate::test_support::headless_app();
+        app.ensure_first_track();
+        let song = app.cur.song_doc.song();
+        let tid = song.tracks[0].id;
+        let comp = song.builtin_native(tid, NativeKind::Comp).expect("組み込み Comp").id;
+        app.edit_song(|song| {
+            let side = song.alloc_track_id();
+            song.tracks.push(crate::app_types::track_with(|t| t.id = side));
+            let added = song.alloc_device_id();
+            let mut dev = NativeDevice::new_added(NativeKind::Comp, added, 2);
+            dev.bypassed = false;
+            dev.aux_input = Some(AuxInputRoute { tap: AudioTap::new(TapSource::Track(side), TapPoint::PostFader) });
+            song.insert_device(common::model::ChainRef::Track(tid), 0, Device::Native(dev));
+            song.mod_sources.push(ModSource {
+                id: 1,
+                owner_track_id: tid,
+                color: [1.0; 3],
+                kind: ModSourceKind::default(),
+                enabled: true,
+            });
+            let thr = AutomationTarget::NativeParam { device_id: comp, param: NativeParamId::Comp(CompParam::Threshold) };
+            let track = song.track_by_id_mut(tid).expect("track");
+            track.automation_lanes.push(AutomationLane::new(thr.clone(), -20.0));
+            track.mod_routings.push(routing(900, thr));
+            song.master_limiter.on = true;
+            song.song_lanes.push(AutomationLane::new(AutomationTarget::MasterLimiter(MasterLimiterParam::On), 1.0));
+            song.song_mod_routings.push(routing(901, AutomationTarget::MasterLimiter(MasterLimiterParam::Ceiling)));
+        });
+        let original = app.cur.song_doc.song().track_by_id(tid).expect("track").clone();
+
+        let pre = app.isolated_track_song(tid, true).expect("pre-FX");
+        let kept = &pre.tracks[0];
+        let mut natives = 0;
+        common::model::for_each_native(&kept.devices, &mut |_| natives += 1);
+        assert_eq!(natives, 0, "pre-FX は内蔵 device を取り除く");
+        let is_native = |t: &AutomationTarget| matches!(t, AutomationTarget::NativeParam { .. });
+        assert!(!kept.automation_lanes.iter().any(|l| is_native(&l.target)));
+        assert!(!kept.mod_routings.iter().any(|r| is_native(&r.target)));
+        assert!(!pre.master_limiter.on);
+        let song_side = |t: &AutomationTarget| matches!(t, AutomationTarget::MasterLimiter(_) | AutomationTarget::NativeParam { .. });
+        assert!(!pre.song_lanes.iter().any(|l| song_side(&l.target)));
+        assert!(!pre.song_mod_routings.iter().any(|r| song_side(&r.target)));
+        assert!(pre.master_fx_chain.is_empty());
+
+        let with_fx = app.isolated_track_song(tid, false).expect("with FX");
+        let kept = &with_fx.tracks[0];
+        let mut pairs = Vec::new();
+        common::model::for_each_native(&kept.devices, &mut |n| pairs.push(*n));
+        let mut expected = Vec::new();
+        common::model::for_each_native(&original.devices, &mut |n| expected.push(NativeDevice { aux_input: None, ..*n }));
+        assert_eq!(expected.len(), 3, "組み込み Comp / EQ と追加の Comp");
+        assert_eq!(pairs, expected, "with FX は params / bypassed をそのまま焼き、SC 配線だけ外す");
+        assert!(!with_fx.master_limiter.on);
     }
 }
