@@ -12,43 +12,41 @@
 //! 「掴める行 / 運ぶブロック長 / 落とせるスロット」 を渡して結果を `RelocateDevices` へ
 //! 写像する。 Sidechain は旧 独立セクションを撤去し、 aux 入力 port を持つ plugin 行の
 //! `SC` で行直下に展開する (source は他 track + 同 track の Parallel 内 chain)。
+//!
+//! 行の種類ごとの中身は別ファイル (サイズ budget、 不変条件 9): plugin 行と展開は
+//! `plugin_row.rs`、 chain 行と操作行は `chain_row.rs`、 Parallel のヘッダ行は
+//! `parallel_header.rs`、 右クリックメニューは `row_menu.rs`。 ここに残るのは list 全体
+//! (行高 / slot / drop / hover / click) と、 行の背景・色帯。
 
-use daw_ui_core::{
-    DragListRow, DragListSlot, DragListStyle, Edit, KnobStyle, ToggleButtonStyle, Ui, WidgetId,
-};
+use daw_ui_core::{DragListRow, DragListSlot, DragListStyle, Edit, ToggleButtonStyle, Ui, WidgetId};
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{
-    AppData, AppEvent, ChainEntry, ChainRow, ChainRowKind, ColorPickerTarget, DeviceDragPayload,
+    AppData, AppEvent, ChainRow, ChainRowKind, ColorPickerTarget, DeviceDragPayload, InsertAt,
     RelocateDevices,
 };
-use crate::handler::parallel::ChainMixerEdit;
-use crate::view::disclosure::{RevealAxis, disclosure_glyph};
-use crate::view::param_gesture::push_param_gesture_edges;
+use crate::event_device::DeviceEvent;
 use crate::widgets::select_modifier::SelectModifier;
-use common::model::{AutomationTarget, ChainRef, TapPoint, TapSource, TrackBuiltinParam};
+use common::model::ChainRef;
 
-use super::{device_panel, toggle_audio_style};
+use super::chain_row::{draw_add_chain_row, draw_add_plugin_row, draw_chain_row};
+use super::plugin_row::{SC_PAD, SC_PORT_H, draw_plugin_expansions, draw_plugin_row};
+use super::row_menu::{carried_device_ids, draw_context_menus};
+use super::toggle_audio_style;
 
 /// 行高 (plugin / Parallel 開始 / chain 行)。
 pub(super) const ROW_H: f32 = 26.0;
 /// 操作行 (`+ chain` / `+ Plugin`) と終了行の高さ。
 const OP_ROW_H: f32 = 22.0;
 const END_ROW_H: f32 = 10.0;
-const ROW_GAP: f32 = 3.0;
+pub(super) const ROW_GAP: f32 = 3.0;
 /// 深さ 1 段ぶんの色帯の幅 (= インデント)。
-const BAR_W: f32 = 4.0;
+pub(super) const BAR_W: f32 = 4.0;
 /// Parallel の括弧 (`「` / `L`) の横棒の長さ (開閉 disclosure の手前まで)。
 const BRACKET_STUB_W: f32 = 10.0;
-/// chain 行の mixer: ミニ knob と M / S。
-pub(super) const CHAIN_KNOB: f32 = 18.0;
-pub(super) const CHAIN_BTN_W: f32 = 18.0;
-/// SC パネル 1 port 行の高さ。
-const SC_PORT_H: f32 = 24.0;
-const SC_PAD: f32 = 6.0;
 
 /// 展開状態と行の種類から「この行の高さ」を決める。
-fn base_row_h(kind: &ChainRowKind) -> f32 {
+pub(super) fn base_row_h(kind: &ChainRowKind) -> f32 {
     match kind {
         ChainRowKind::Plugin(_)
         | ChainRowKind::ParallelBegin { .. }
@@ -174,7 +172,7 @@ pub(super) fn draw_chain_list(
         let m = resp.clicked_modifiers;
         let modifier = SelectModifier::from_modifiers(m.shift, m.ctrl);
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SelectDevice { device_id: id, modifier });
+            app.handle_event(AppEvent::Device(DeviceEvent::SelectDevice { device_id: id, modifier }));
         }));
     }
     // 内部 drop = 移動 (Ctrl でコピー)。
@@ -186,12 +184,12 @@ pub(super) fn draw_chain_list(
         let (dest, dest_index) = slot_targets[slot];
         let copy = ui.pointer().modifiers.ctrl;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+            app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
                 device_ids: device_ids.clone(),
                 dest,
-                dest_index,
+                dest_index: InsertAt::Index(dest_index),
                 copy,
-            }));
+            })));
         }));
     }
     // 横へ出た = トラック跨ぎの運搬を始める。
@@ -215,66 +213,17 @@ pub(super) fn draw_chain_list(
     {
         let (dest, dest_index) = slot_targets[slot];
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
+            app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
                 device_ids: pl.device_ids.clone(),
                 dest,
-                dest_index,
+                dest_index: InsertAt::Index(dest_index),
                 copy,
-            }));
+            })));
         }));
     }
     draw_context_menus(app, ui, &rows, &resp.row_rects);
 
     list_rect.y + list_rect.h + 8.0
-}
-
-/// 右クリックメニュー (widget の外で重ねる idiom)。 plugin / Parallel / chain 行だけ。
-fn draw_context_menus(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    rows: &[ChainRow],
-    row_rects: &[(usize, Rect)],
-) {
-    for (i, row_rect) in row_rects {
-        let Some(r) = rows.get(*i) else { continue };
-        let base = Rect { x: row_rect.x, y: row_rect.y, w: row_rect.w, h: base_row_h(&r.kind) };
-        match &r.kind {
-            ChainRowKind::Plugin(e) => {
-                let device_id = e.device_id;
-                let bypass_label = if app.all_devices_bypassed(&carried_device_ids(app, rows, device_id)) {
-                    "有効化"
-                } else {
-                    "無効化"
-                };
-                let labels = [bypass_label, "Parallel にまとめる", "コピー", "切り取り", "貼り付け", "複製", "削除"];
-                context_menu(ui, base, &labels, move |app, idx| apply_device_menu(app, idx, device_id));
-            }
-            ChainRowKind::ParallelBegin { parallel_id, bypassed, .. } => {
-                let parallel_id = *parallel_id;
-                let bypass_label = if *bypassed { "有効化" } else { "無効化" };
-                let labels = [bypass_label, "Parallel を解除", "名前変更", "色...", "コピー", "切り取り", "複製", "削除"];
-                context_menu(ui, base, &labels, move |app, idx| apply_parallel_menu(app, idx, parallel_id, base));
-            }
-            ChainRowKind::Chain { parallel_id, chain_id, .. } => {
-                let (parallel_id, chain_id) = (*parallel_id, *chain_id);
-                let labels = ["名前変更", "色...", "複製", "chain 追加", "削除"];
-                context_menu(ui, base, &labels, move |app, idx| apply_chain_menu(app, idx, parallel_id, chain_id, base));
-            }
-            _ => {}
-        }
-    }
-}
-
-/// 行 `base` の右クリックメニュー。 選ばれた項目 `idx` を `apply` で model に反映する。
-fn context_menu(
-    ui: &mut Ui<'_, AppData>,
-    base: Rect,
-    labels: &[&str],
-    apply: impl Fn(&mut AppData, usize) + Copy + Send + 'static,
-) {
-    ui.context_menu_for(base, labels, move |idx, ui| {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| apply(app, idx)));
-    });
 }
 
 /// drag_list の入力: 行ごとの高さ (展開込み) / 掴めるか / ブロック長と、落とせるスロット
@@ -419,549 +368,23 @@ fn draw_row_bg(
     ui.panel_with_border(("inspector_chain_row_bg", i), rect, fill, border, if selected { 1.0 } else { 0.0 }, 3.0);
 }
 
-/// plugin 行の直下の展開 (SC パネル / param パネル)。
-fn draw_plugin_expansions(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    ctx: &RowCtx<'_>,
-    device_id: u64,
-    content: Rect,
-) {
-    let mut ey = content.y + ROW_H;
-    if ctx.sc_open == Some(device_id) && ctx.sc_panel_h > 0.0 {
-        let rect = Rect { x: content.x, y: ey, w: content.w, h: ctx.sc_panel_h };
-        draw_sidechain_panel(app, ui, device_id, ctx.sc_ports, rect);
-        ey += ctx.sc_panel_h;
-    }
-    if ctx.open_dev == Some(device_id) {
-        let exp_rect = Rect { x: content.x, y: ey, w: content.w, h: ctx.panel_h };
-        let measured =
-            (device_panel::draw_device_panel(app, ui, ctx.area, ctx.pad, exp_rect) - exp_rect.y).max(0.0);
-        // 展開部の実消費高を測って次フレームの行高に使う (lag-by-one)。
-        if (app.cur.peph.inspector_device_panel_h - measured).abs() > 0.5 {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.cur.peph.inspector_device_panel_h = measured;
-            }));
-        }
-    }
-}
-
-/// plugin 行: 名前 + [SC▾] [⌨] [Par|GUI] [x]。
-#[allow(clippy::too_many_arguments)]
-fn draw_plugin_row(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    i: usize,
-    entry: &ChainEntry,
-    row: Rect,
-    popup_open: bool,
-    keys_style: &ToggleButtonStyle,
-) {
-    let p = &app.theme.core;
-    let device_id = entry.device_id;
-    let btn_gui_w = 44.0;
-    let btn_x_w = 26.0;
-    let btn_keys_w = 26.0;
-    let btn_sc_w = 34.0;
-    let btn_h = ROW_H - 4.0;
-    let by = row.y + 2.0;
-    let mut right = row.x + row.w - btn_x_w;
-    // [x]
-    ui.button_at(
-        ("inspector_row_remove", i),
-        "x",
-        Rect { x: right, y: by, w: btn_x_w, h: btn_h },
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![device_id] });
-                }
-            })
-        },
-    );
-    // [Par | GUI]
-    if entry.shows_button() {
-        right -= btn_gui_w + 2.0;
-        let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
-        ui.button_at(
-            ("inspector_row_gui", i),
-            label,
-            Rect { x: right, y: by, w: btn_gui_w, h: btn_h },
-            move || {
-                Edit::mutate(move |app: &mut AppData| {
-                    if !popup_open {
-                        app.handle_event(AppEvent::ToggleSlotGui { device_id });
-                    }
-                })
-            },
-        );
-    }
-    // [⌨] (埋め込みエディタ窓を開く device だけ)
-    if entry.has_embedded_gui && !entry.shows_param_panel() {
-        right -= btn_keys_w + 2.0;
-        let next = !entry.send_all_keys;
-        ui.toggle_button_at(
-            ("inspector_row_keys", i),
-            "\u{2328}",
-            Rect { x: right, y: by, w: btn_keys_w, h: btn_h },
-            entry.send_all_keys,
-            keys_style,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    if !popup_open {
-                        app.handle_event(AppEvent::SetPluginSendAllKeys { device_id, enabled: next });
-                    }
-                })
-            },
-        );
-    }
-    // [SC] (aux 入力 port を持つ plugin だけ)。 配線済みは ON 色。
-    if entry.aux_input_count > 0 {
-        right -= btn_sc_w + 2.0;
-        let open = app.cur.peph.open_sidechain_panel == Some(device_id);
-        ui.toggle_button_at(
-            ("inspector_row_sc", i),
-            if open { "SC\u{25B4}" } else { "SC\u{25BE}" },
-            Rect { x: right, y: by, w: btn_sc_w, h: btn_h },
-            entry.sc_wired || open,
-            keys_style,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    if popup_open {
-                        return;
-                    }
-                    app.cur.peph.open_sidechain_panel =
-                        if app.cur.peph.open_sidechain_panel == Some(device_id) { None } else { Some(device_id) };
-                })
-            },
-        );
-    }
-    // 名前 (ボタンの手前で打ち切る)。
-    let failed = entry.load_error.is_some();
-    let display_name: std::borrow::Cow<'_, str> = if failed {
-        format!("[未ロード] {}", entry.plugin_name).into()
-    } else {
-        entry.plugin_name.as_str().into()
-    };
-    let name_x = row.x + 8.0;
-    ui.label_at_clipped(
-        ("inspector_row_name", i),
-        &display_name,
-        Rect { x: name_x, y: row.y + 8.0, w: (right - 6.0 - name_x).max(1.0), h: 11.0 * 1.2 },
-        11.0,
-        if failed {
-            p.text_error
-        } else if entry.bypassed {
-            p.text_faint
-        } else {
-            p.text
-        },
-    );
-}
-
-/// chain 行: [色] ▶ 名前 / preview 四角 / gain knob / pan knob / M / S / x。
-#[allow(clippy::too_many_arguments)]
-fn draw_chain_row(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    i: usize,
-    parallel_id: u64,
-    chain_id: u64,
-    name: &str,
-    color: Option<[f32; 3]>,
-    gain: f32,
-    pan: f32,
-    muted: bool,
-    solo: bool,
-    open: bool,
-    n_devices: usize,
-    inactive: bool,
-    row: Rect,
-    popup_open: bool,
-) {
-    let p = &app.theme.core;
-    let by = row.y + (ROW_H - CHAIN_BTN_W) * 0.5;
-    // 右から: x, S, M, pan, gain。
-    let mut right = row.x + row.w - 4.0;
-    let toggle_style = toggle_audio_style(&app.theme);
-    right -= CHAIN_BTN_W;
-    ui.button_at(
-        ("inspector_chain_remove", i),
-        "x",
-        Rect { x: right, y: by, w: CHAIN_BTN_W, h: CHAIN_BTN_W },
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::RemoveDevices { device_ids: vec![chain_id] });
-                }
-            })
-        },
-    );
-    right -= CHAIN_BTN_W + 2.0;
-    ui.toggle_button_at(
-        ("inspector_chain_solo", i),
-        "S",
-        Rect { x: right, y: by, w: CHAIN_BTN_W, h: CHAIN_BTN_W },
-        solo,
-        &toggle_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::SetChainMixer { chain_id, edit: ChainMixerEdit::Solo(v) });
-                }
-            })
-        },
-    );
-    right -= CHAIN_BTN_W + 2.0;
-    ui.toggle_button_at(
-        ("inspector_chain_mute", i),
-        "M",
-        Rect { x: right, y: by, w: CHAIN_BTN_W, h: CHAIN_BTN_W },
-        muted,
-        &toggle_style,
-        move |v| {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::SetChainMixer { chain_id, edit: ChainMixerEdit::Muted(v) });
-                }
-            })
-        },
-    );
-    // knob は automation gesture idiom (mixer の send knob と同じ)。
-    let Some(track_id) = app.cursor_track_id() else { return };
-    let track = app.cur.song_doc.song().track_by_id(track_id);
-    let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { chain_id });
-    let gain_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id });
-    let live_pan = track.map_or(pan, |t| app.live_param_value(t, &pan_target, pan));
-    let live_gain = track.map_or(gain, |t| app.live_param_value(t, &gain_target, gain));
-    right -= CHAIN_KNOB + 4.0;
-    let was_pan = app.cur.recording.active_param_gestures.contains(&(track_id, pan_target.clone()));
-    let pan_resp = ui.knob_at(
-        ("inspector_chain_pan", i),
-        Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
-        ((live_pan + 1.0) * 0.5).clamp(0.0, 1.0),
-        0.5,
-        &KnobStyle { surface: Some(p.panel_raised), ..KnobStyle::BIPOLAR },
-        move |v| {
-            let pan = v * 2.0 - 1.0;
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetChainMixer { chain_id, edit: ChainMixerEdit::Pan(pan) });
-            })
-        },
-        None,
-    );
-    push_param_gesture_edges(ui, track_id, pan_target, "Chain Pan", was_pan, pan_resp.dragging);
-    right -= CHAIN_KNOB + 2.0;
-    let was_gain = app.cur.recording.active_param_gestures.contains(&(track_id, gain_target.clone()));
-    let gain_resp = ui.knob_at(
-        ("inspector_chain_gain", i),
-        Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
-        (live_gain * 0.5).clamp(0.0, 1.0),
-        0.5,
-        &KnobStyle { surface: Some(p.panel_raised), ..KnobStyle::UNIPOLAR },
-        move |v| {
-            let gain = v * 2.0;
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetChainMixer { chain_id, edit: ChainMixerEdit::Gain(gain) });
-            })
-        },
-        None,
-    );
-    push_param_gesture_edges(ui, track_id, gain_target, "Chain Gain", was_gain, gain_resp.dragging);
-    // preview 四角 (Bitwig の chain preview: device 数ぶんの小さい四角)。
-    let sq = 6.0;
-    let n_sq = n_devices.min(6);
-    right -= n_sq as f32 * (sq + 2.0) + 4.0;
-    for k in 0..n_sq {
-        ui.panel(
-            ("inspector_chain_preview", i, k),
-            Rect { x: right + k as f32 * (sq + 2.0), y: row.y + (ROW_H - sq) * 0.5, w: sq, h: sq },
-            p.text_dim,
-            1.0,
-        );
-    }
-    // 左: 色帯 (この chain の device 行の帯と同じ x / 幅で、 展開中は下の帯へ繋がる。
-    // click で picker、 hit は帯より少し広く) + 開閉 disclosure + 名前。
-    let swatch = Rect {
-        x: row.x,
-        y: row.y,
-        w: BAR_W - 1.0,
-        h: if open { row.h + ROW_GAP } else { row.h },
-    };
-    let swatch_hit = Rect { x: row.x, y: row.y, w: 10.0, h: row.h };
-    let pointer = ui.pointer();
-    let swatch_inside = pointer.pos.is_some_and(|(px, py)| swatch_hit.contains(px, py));
-    let swatch_clicked = ui
-        .primary_click(WidgetId::ROOT.child((b"inspector_chain_swatch", chain_id)), swatch_inside)
-        .clicked;
-    let fill = color
-        .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
-        .unwrap_or(p.text_dim);
-    ui.panel(("inspector_chain_swatch_fill", i), swatch, fill, 0.0);
-    if swatch_clicked && !popup_open {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.open_color_picker(ColorPickerTarget::ParallelChain(chain_id), swatch);
-        }));
-    }
-    let name_x = row.x + 14.0;
-    draw_disclosure(ui, ("inspector_chain_disclosure", i), chain_id, open, name_x, row, popup_open, p);
-    let name_rect = Rect { x: name_x + 11.0, y: row.y + 3.0, w: (right - 6.0 - name_x - 11.0).max(1.0), h: ROW_H - 6.0 };
-    if let Some((id, buf)) = &app.cur.peph.renaming_chain
-        && *id == chain_id
-    {
-        draw_rename_input(app, ui, ("inspector_chain_rename", i), name_rect, buf, move |app, text| {
-            app.handle_event(AppEvent::RenameParallelChain { chain_id, name: text });
-        });
-    } else {
-        // r.md #114: Selector の非アクティブ chain は薄く (アクティブなら展開に依らず明色 =
-        // 「今鳴っている chain」 が一目で分かる)。
-        let color = match (inactive, open) {
-            (true, _) => p.text_faint,
-            (false, true) => p.text,
-            (false, false) => p.text_dim,
-        };
-        ui.label_at_clipped(
-            ("inspector_chain_name", i),
-            name,
-            Rect { x: name_rect.x, y: row.y + 8.0, w: name_rect.w, h: 11.0 * 1.2 },
-            11.0,
-            color,
-        );
-    }
-    let _ = parallel_id;
-}
-
-/// Parallel / chain 行の開閉 disclosure (▶ / ▼、`view::disclosure` の規則)。 click で
-/// `ToggleParallelNodeCollapsed { id }`。
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_disclosure(
-    ui: &mut Ui<'_, AppData>,
-    key: (&'static str, usize),
-    id: u64,
-    open: bool,
-    x: f32,
-    row: Rect,
-    popup_open: bool,
-    p: &daw_ui_core::Palette,
-) {
-    // 枠も背景も無い glyph だけ (arrangement の group disclosure と同じ): release の hit test。
-    let hit = Rect { x: x - 2.0, y: row.y + 4.0, w: 13.0, h: ROW_H - 8.0 };
-    let pointer = ui.pointer();
-    let inside = !popup_open && pointer.pos.is_some_and(|(px, py)| hit.contains(px, py));
-    if ui.primary_click(WidgetId::ROOT.child((b"inspector_disclosure", id)), inside).clicked {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::ToggleParallelNodeCollapsed { id });
-        }));
-    }
-    ui.label_at(
-        key,
-        disclosure_glyph(!open, RevealAxis::Block),
-        x,
-        row.y + 8.0,
-        9.0,
-        if open { p.accent } else { p.text_dim },
-    );
-}
-
 pub(super) fn rgb_or(color: Option<[f32; 3]>, fallback: Color) -> Color {
     color.map_or(fallback, |rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
 }
 
-/// 改名 text_input (初回 show で focus + 全選択)。 Enter / blur で確定、 Esc で取消。
-pub(super) fn draw_rename_input(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    id: (&'static str, usize),
-    rect: Rect,
-    buf: &str,
-    commit: impl Fn(&mut AppData, String) + Send + Sync + 'static,
-) {
-    let style = ui.text_input_style();
-    let resp = ui.text_input_at_focused(id, rect, buf, &style, |text| {
-        Edit::mutate(move |app: &mut AppData| {
-            if let Some((_, b)) = app.cur.peph.renaming_chain.as_mut() {
-                *b = text;
-            }
-        })
-    });
-    let _ = app;
-    if resp.committed || resp.blurred {
-        let text = resp.committed_text.clone().unwrap_or_else(|| buf.to_string());
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.cur.peph.renaming_chain = None;
-            if !text.trim().is_empty() {
-                commit(app, text);
-            }
-        }));
-    } else if !resp.focused {
-        // Esc 等で focus が外れた = 取消。
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.cur.peph.renaming_chain = None;
-        }));
-    }
-}
-
-/// SC パネル: port ごとに `In N: [source ▾] [tap ▾]`。
-fn draw_sidechain_panel(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    device_id: u64,
-    ports: &[crate::app_types::SidechainPort],
-    rect: Rect,
-) {
-    let p = &app.theme.core;
-    let choices = app.sidechain_source_choices();
-    let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
-    const TAP_POINTS: [TapPoint; 3] = [TapPoint::PreFx, TapPoint::PostFx, TapPoint::PostFader];
-    let tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];
-    let label_w = 34.0;
-    let tap_w = 84.0;
-    let x0 = rect.x + 8.0;
-    let src_x = x0 + label_w;
-    let src_w = (rect.w - 8.0 - label_w - tap_w - 10.0).max(40.0);
-    let tap_x = src_x + src_w + 4.0;
-    for (k, port) in ports.iter().enumerate() {
-        let y = rect.y + SC_PAD * 0.5 + k as f32 * SC_PORT_H;
-        ui.label_at(("inspector_sc_in", device_id as usize, k), &format!("In {}", port.port + 1), x0, y + 6.0, 11.0, p.text_dim);
-        let sel = choices
-            .iter()
-            .position(|c| c.source == port.source)
-            .unwrap_or(0);
-        if let Some(picked) = ui.dropdown(
-            ("inspector_sc_src", device_id as usize, k),
-            Rect { x: src_x, y, w: src_w, h: SC_PORT_H - 2.0 },
-            &labels,
-            sel,
-        ) && let Some(choice) = choices.get(picked)
-        {
-            let source: Option<TapSource> = choice.source;
-            let port_no = port.port;
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetSidechainSource { device_id, port: port_no, source });
-            }));
-        }
-        // 自 track の入力を key にする port は Pre-FX 固定 (dropdown を出さない)。
-        if port.source == app.cursor_track_id().map(TapSource::Track) {
-            ui.label_at(("inspector_sc_tap_fixed", device_id as usize, k), "Pre-FX", tap_x + 6.0, y + 6.0, 11.0, p.text_dim);
-            continue;
-        }
-        let tap_sel = TAP_POINTS.iter().position(|t| *t == port.tap_point).unwrap_or(2);
-        if let Some(picked) = ui.dropdown(
-            ("inspector_sc_tap", device_id as usize, k),
-            Rect { x: tap_x, y, w: tap_w, h: SC_PORT_H - 2.0 },
-            &tap_labels,
-            tap_sel,
-        ) && let Some(&tp) = TAP_POINTS.get(picked)
-        {
-            let port_no = port.port;
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetAuxInputTapPoint { device_id, port: port_no, tap_point: tp });
-            }));
-        }
-    }
-}
-
-/// 掴んだ / 右クリックした行が選択に含まれていれば選択全体、 含まれていなければその行だけ
-/// (トラックヘッダの右クリックメニューと同じ規則)。 順序は表示順。 chain id は運べないので
-/// 除く。
-fn carried_device_ids(app: &AppData, rows: &[ChainRow], device_id: u64) -> Vec<u64> {
-    if app.cur.selection.selected_device_ids.contains(&device_id) {
-        rows.iter()
-            .filter_map(ChainRow::drag_id)
-            .filter(|id| app.cur.selection.selected_device_ids.contains(id))
-            .collect()
-    } else {
-        vec![device_id]
-    }
-}
-
-fn apply_device_menu(app: &mut AppData, idx: usize, device_id: u64) {
-    let rows = app.chain_rows();
-    let ids = carried_device_ids(app, &rows, device_id);
-    match idx {
-        0 => {
-            let bypassed = !app.all_devices_bypassed(&ids);
-            app.handle_event(AppEvent::SetDevicesBypassed { device_ids: ids, bypassed });
-        }
-        1 => app.handle_event(AppEvent::GroupDevices { device_ids: ids }),
-        2 => app.copy_devices(ids),
-        3 => app.cut_devices(ids),
-        // 貼り付け位置は「この device の直前」。 選択をこの device 1 本にしてから
-        // **Ctrl+V と同じ経路** を起こす。
-        4 => {
-            app.set_device_selection(vec![device_id]);
-            app.ui_ephemeral.pending_shortcut_injections.push("paste");
-        }
-        5 => duplicate_after(app, ids, device_id),
-        _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
-    }
-}
-
-fn apply_parallel_menu(app: &mut AppData, idx: usize, parallel_id: u64, anchor: Rect) {
-    let rows = app.chain_rows();
-    let ids = carried_device_ids(app, &rows, parallel_id);
-    match idx {
-        0 => {
-            let bypassed = !app.all_devices_bypassed(&ids);
-            app.handle_event(AppEvent::SetDevicesBypassed { device_ids: ids, bypassed });
-        }
-        1 => app.handle_event(AppEvent::UngroupParallel { parallel_id }),
-        2 => {
-            let name = app.cur.song_doc.song().parallel_by_id(parallel_id).map(|r| r.name.clone()).unwrap_or_default();
-            app.cur.peph.renaming_chain = Some((parallel_id, name));
-        }
-        3 => app.open_color_picker(ColorPickerTarget::Parallel(parallel_id), anchor),
-        4 => app.copy_devices(ids),
-        5 => app.cut_devices(ids),
-        6 => duplicate_after(app, ids, parallel_id),
-        _ => app.handle_event(AppEvent::RemoveDevices { device_ids: ids }),
-    }
-}
-
-fn apply_chain_menu(app: &mut AppData, idx: usize, parallel_id: u64, chain_id: u64, anchor: Rect) {
-    match idx {
-        0 => {
-            let name = app
-                .cur.song_doc
-                .song()
-                .chain_by_id(chain_id)
-                .map(|(_, c)| c.name.clone())
-                .unwrap_or_default();
-            app.cur.peph.renaming_chain = Some((chain_id, name));
-        }
-        1 => app.open_color_picker(ColorPickerTarget::ParallelChain(chain_id), anchor),
-        2 => app.handle_event(AppEvent::DuplicateParallelChain { chain_id }),
-        3 => app.handle_event(AppEvent::AddParallelChain { parallel_id }),
-        _ => app.handle_event(AppEvent::RemoveDevices { device_ids: vec![chain_id] }),
-    }
-}
-
-/// `device_id` の直後に `ids` のコピーを挿す (メニューの「複製」)。
-fn duplicate_after(app: &mut AppData, ids: Vec<u64>, device_id: u64) {
-    let Some((dest, index)) = app.cur.song_doc.song().find_device(device_id) else {
-        return;
-    };
-    app.handle_event(AppEvent::RelocateDevices(RelocateDevices {
-        device_ids: ids,
-        dest,
-        dest_index: index as u32 + 1,
-        copy: true,
-    }));
-}
-
 /// 1 行ぶんの描画に要る、buffer 全体で共通の文脈 (drag_list の row closure から呼ぶ)。
-struct RowCtx<'a> {
-    rows: &'a [ChainRow],
-    popup_open: bool,
-    cursor_tid: Option<u32>,
-    open_dev: Option<u64>,
-    panel_h: f32,
-    sc_open: Option<u64>,
-    sc_ports: &'a [crate::app_types::SidechainPort],
-    sc_panel_h: f32,
-    area: Rect,
-    pad: f32,
-    keys_style: ToggleButtonStyle,
+pub(super) struct RowCtx<'a> {
+    pub(super) rows: &'a [ChainRow],
+    pub(super) popup_open: bool,
+    pub(super) cursor_tid: Option<u32>,
+    pub(super) open_dev: Option<u64>,
+    pub(super) panel_h: f32,
+    pub(super) sc_open: Option<u64>,
+    pub(super) sc_ports: &'a [crate::app_types::SidechainPort],
+    pub(super) sc_panel_h: f32,
+    pub(super) area: Rect,
+    pub(super) pad: f32,
+    pub(super) keys_style: ToggleButtonStyle,
 }
 
 /// 行 `i` を描く (背景 / 色帯 / 種類ごとの中身 / 展開)。
@@ -1029,44 +452,4 @@ fn draw_row(
         // 終了行は `draw_parallel_band` の `L` だけ。
         ChainRowKind::ParallelEnd { .. } => {}
     }
-}
-
-/// `+ chain` 行 (Parallel の chain 列の末尾)。
-fn draw_add_chain_row(ui: &mut Ui<'_, AppData>, i: usize, parallel_id: u64, content: Rect, popup_open: bool) {
-    ui.button_at_sized(
-        ("inspector_add_chain", i),
-        "+ chain",
-        Rect { x: content.x + 8.0, y: content.y + 1.0, w: 80.0, h: content.h - 2.0 },
-        11.0,
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::AddParallelChain { parallel_id });
-                }
-            })
-        },
-    );
-}
-
-/// `+ Plugin` (master では `+ FX`) 行 — その chain の末尾に picker を開く。
-fn draw_add_plugin_row(
-    ui: &mut Ui<'_, AppData>,
-    i: usize,
-    chain: ChainRef,
-    is_master: bool,
-    content: Rect,
-    popup_open: bool,
-) {
-    ui.button_at(
-        ("inspector_add_plugin", i),
-        if is_master { "+ FX" } else { "+ Plugin" },
-        Rect { x: content.x, y: content.y + 1.0, w: content.w, h: content.h - 2.0 },
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::OpenPluginPicker { chain: Some(chain) });
-                }
-            })
-        },
-    );
 }

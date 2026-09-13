@@ -10,6 +10,7 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::event::NudgeStep;
+use crate::event_device::DeviceEvent;
 use crate::state::ModRackHover;
 use crate::event_launcher::{LauncherCellKey, LauncherEvent};
 use crate::view::{
@@ -500,10 +501,10 @@ fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_ac
     } else if !device_targets.is_empty() {
         let bypassed = !app.all_devices_bypassed(&device_targets);
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::SetDevicesBypassed {
+            app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed {
                 device_ids: device_targets,
                 bypassed,
-            });
+            }));
         }));
     } else if let Some(lane) = app.cur.peph.arrange_hovered_automation_lane {
         // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
@@ -751,7 +752,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         let device_ids = app.live_device_ids();
         if surface == Some(crate::app_types::EditSurface::Devices) && !device_ids.is_empty() {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::GroupDevices { device_ids });
+                app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids }));
             }));
         } else {
             let track_ids = app.cur.selection.selected_track_ids.clone();

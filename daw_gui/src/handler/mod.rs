@@ -10,6 +10,8 @@ pub mod clip_events;
 pub mod clipboard_media;
 pub mod clips;
 pub mod colors;
+/// `AppEvent::Device(..)` の dispatcher (`DeviceEvent` の振り分け)。
+pub mod device_event;
 pub mod device_relocate;
 pub mod devices;
 pub mod export;

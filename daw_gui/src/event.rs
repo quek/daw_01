@@ -826,84 +826,14 @@ pub enum AppEvent {
     /// load_overlay に「プラグイン走査中 done/total」を出す。
     RescanProgress { done: usize, total: usize },
 
-    /// r.md #71 (プラグインのコピー / 移動): device を運ぶイベントは **すべて
-    /// 安定 `device_id`** でアドレスする。 positional index だと、 イベント発行と
-    /// 消費の間にチェーンが変わりうる (移動 / 削除) 場面で別 device に効く。
-    ToggleSlotGui { device_id: u64 },
+    /// チェーン上のデバイス (plugin / 映像 FX / Parallel / chain) の操作。 同じく
+    /// 「1 arm = 1 サブ enum」 (`crate::event_device`)。
+    Device(crate::event_device::DeviceEvent),
     /// r.md #55: 開いているプラグインエディタ窓を全部閉じる
     /// (`Ctrl+Shift+W` / View メニュー)。どれが開いているかを知っているのは
     /// 窓の所有者である plugin_host なので、daw_gui は broadcast を 1 通投げるだけ。
     /// Song は触らないので Undo / dirty 対象外。
     CloseAllPluginEditors,
-    /// 内蔵映像 FX の param 調整パネルから 1 param を編集。
-    /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
-    SetVideoFxParam { device_id: u64, param_id: u32, value_real: f32 },
-    /// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルで
-    /// param を 1 つ編集。 `value_real` は表示の実レンジ値 → host が送った
-    /// `PluginParamInfo` の min/max で lane `default_value` (0..=1) へ逆写像。
-    /// scrubable の per-frame 発火なので **非 undoable** (`BeginInspectorScrub`
-    /// で 1 undo step に bracket)。
-    SetPluginParam { device_id: u64, param_id: u32, value_real: f64 },
-    /// inspector の x ボタン / Delete / 右クリックメニュー: 選んだ device を
-    /// chain から削除する。 複数選択を **1 件にまとめて** 運ぶ (id ごとに送ると
-    /// undo が N ステップに割れる)。
-    RemoveDevices { device_ids: Vec<u64> },
-    /// r.md #71 (プラグインのコピー / 移動): 選んだ device を別のチェーンへ運ぶ。
-    /// 既定は移動 (instance を作り直さない = 音が切れない)、 `copy` で複製。
-    RelocateDevices(crate::app_types::RelocateDevices),
-    /// r.md #71: インスペクタのチェーン行を選択する (無修飾 / Ctrl / Shift)。
-    SelectDevice {
-        device_id: u64,
-        modifier: crate::widgets::select_modifier::SelectModifier,
-    },
-    /// inspector 「読み込み失敗」 セクションの「再読込」 ボタン: ロードに
-    /// 失敗した device を、 保存済み state 込みで plugin_host に load し直す。
-    /// 自動リトライはしない (恒常的失敗で無限ループになる) ので、 再試行の
-    /// トリガーは常にこのユーザー操作。 Song は変えない (= 非 undoable)。
-    ReloadDevice { device_id: u64 },
-    /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
-    /// aux input port. `device_id` identifies the plugin instance;
-    /// `port` selects the aux input port on that plugin
-    /// (0 = first sidechain bus); `source` is `Some(track_id)` to wire
-    /// from a track, or `None` to disconnect.
-    SetSidechainSource {
-        device_id: u64,
-        port: u8,
-        /// r.md #110: 他 track か同 track の Parallel 内 chain。 `None` = 切断。
-        source: Option<common::model::TapSource>,
-    },
-    /// r.md #36: このプラグインのエディタ窓で **キーを一切横取りしない** (= REAPER の
-    /// 「Send all keyboard input to plug-in」)。 消化の有無を外に出さない自前描画 GUI
-    /// (Dear ImGui / GLFW 系) 用の逃げ道。 値は project に保存される。
-    SetPluginSendAllKeys {
-        device_id: u64,
-        enabled: bool,
-    },
-    /// r.md #105: device 群を **信号経路から外す / 戻す** (Live の device off)。
-    /// engine は bypass 中の device を dispatch せず音声も MIDI も素通し、 映像 FX は
-    /// 解決から外れる。 `Q` (選択 device or カーソル直下のチェーン行) と チェーン行の
-    /// 右クリックメニュー「無効化 / 有効化」 から。 値は project に保存され undo 対象。
-    SetDevicesBypassed {
-        device_ids: Vec<u64>,
-        bypassed: bool,
-    },
-    /// パラアウト (docs/plan_paraout.md): one-click "explode" — auto-create a
-    /// child track per `is_main=false` output port of the plugin `device_id`,
-    /// group them under the source track, and wire
-    /// each aux output to its new child. The source track becomes a
-    /// group-with-instrument bus (its own main + the children sum through its
-    /// FX/fader). Idempotent: ports already routed to a live track are kept.
-    ExplodeParallelOut {
-        device_id: u64,
-    },
-    /// パラアウト: route a single aux output port to a destination track (or
-    /// `None` = unrouted = silent). Used by the inspector's per-port dropdown
-    /// for re-adjustment after (or instead of) explode.
-    SetParallelOutputRoute {
-        device_id: u64,
-        port: u8,
-        dest: Option<u32>,
-    },
     /// docs/plan_modulation.md §9: create a project-level `ModSource`
     /// of the given kind, owned by the cursor track. follower は cursor track を tap。
     AddModSource { kind: ModSourceKindTag },
@@ -973,34 +903,6 @@ pub enum AppEvent {
     /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
     /// disarms. While armed, inspector param controls enter depth-drag edit mode.
     SetArmedModSource(Option<u32>),
-    /// flip an aux-input route's tap point (sidechain plugin input).
-    SetAuxInputTapPoint {
-        device_id: u64,
-        port: u8,
-        tap_point: common::model::TapPoint,
-    },
-    // -------- r.md #110 Parallel (`docs/plan_parallel.md` §6.3) ------------------
-    /// 空の Parallel (chain 1 本) を `chain` の `index` に挿す。
-    AddParallel { chain: common::model::ChainRef, index: u32 },
-    /// Group (Live の Ctrl+G): 選んだ device を 1 本の chain に入れた Parallel で包む。
-    GroupDevices { device_ids: Vec<u64> },
-    /// Ungroup: Parallel を全 chain の device の直列連結に置換。
-    UngroupParallel { parallel_id: u64 },
-    AddParallelChain { parallel_id: u64 },
-    DuplicateParallelChain { chain_id: u64 },
-    RenameParallelChain { chain_id: u64, name: String },
-    RenameParallel { parallel_id: u64, name: String },
-    SetParallelChainColor { chain_id: u64, color: Option<[f32; 3]> },
-    /// Parallel 自体の色 (括弧の帯)。
-    SetParallelColor { parallel_id: u64, color: Option<[f32; 3]> },
-    /// chain の gain / pan / mute / solo (Song 書き換え + 値のみ IPC)。
-    SetChainMixer { chain_id: u64, edit: crate::handler::parallel::ChainMixerEdit },
-    /// Parallel の出力 trim / gain match (Song 書き換え + 値のみ IPC)。
-    SetParallelMixer { parallel_id: u64, edit: crate::handler::parallel::ParallelMixerEdit },
-    /// r.md #112: Parallel の入力の配り方 (帯域分割など) を切り替える (構造変更、 chain を補完)。
-    SetParallelSplit { parallel_id: u64, split: common::model::Split },
-    /// 見方の都合: Parallel / chain の中身の開閉 (undo 対象外)。 `id` は Parallel か chain。
-    ToggleParallelNodeCollapsed { id: u64 },
     SetMasterGain(f32),
     /// マスターフェーダーの drag 全体を 1 undo step に bracket する
     /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
@@ -1978,40 +1880,8 @@ impl AppEvent {
 
             // ---- デバイス / プラグイン ----
             E::SelectPluginFromDb { .. } => "プラグイン追加",
-            E::RemoveDevices { .. } => "デバイス削除",
-            E::RelocateDevices(req) => {
-                if req.copy {
-                    "デバイスコピー"
-                } else {
-                    "デバイス移動"
-                }
-            }
-            E::AddParallel { .. } => "Parallel 追加",
-            E::GroupDevices { .. } => "Parallel にまとめる",
-            E::UngroupParallel { .. } => "Parallel を解除",
-            E::AddParallelChain { .. } => "chain 追加",
-            E::DuplicateParallelChain { .. } => "chain 複製",
-            E::RenameParallelChain { .. } | E::RenameParallel { .. } => "名前変更",
-            E::SetParallelChainColor { .. } => "chain の色",
-            E::SetParallelColor { .. } => "Parallel の色",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Gain(_), .. } => "chain gain",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Pan(_), .. } => "chain pan",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Muted(_), .. } => "chain mute",
-            E::SetChainMixer { edit: crate::handler::parallel::ChainMixerEdit::Solo(_), .. } => "chain solo",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::OutGain(_), .. } => "Parallel 出力",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::GainMatch(_), .. } => "Parallel gain match",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SplitFreq { .. }, .. } => "クロスオーバー周波数",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::ActiveChain(_), .. } => "Selector のアクティブ chain",
-            E::SetParallelMixer { edit: crate::handler::parallel::ParallelMixerEdit::SelectorFade(_), .. } => "Selector のフェード時間",
-            E::SetParallelSplit { .. } => "Parallel の分割",
-            E::SetVideoFxParam { .. } => "映像FX変更",
-            E::SetPluginParam { .. } => "プラグインパラメータ変更",
-            E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
-            E::SetPluginSendAllKeys { .. } => "プラグインへのキー送出設定",
-            E::SetDevicesBypassed { bypassed: true, .. } => "プラグインを無効化",
-            E::SetDevicesBypassed { bypassed: false, .. } => "プラグインを有効化",
-            E::ExplodeParallelOut { .. } => "パラアウト展開",
-            E::SetParallelOutputRoute { .. } => "パラアウト経路変更",
+            // ラベルの SSoT はサブ enum 側 (`Launcher` と同じ)。
+            E::Device(ev) => ev.undo_label(),
 
             // ---- モジュレーション ----
             E::AddModSource { .. } => "モジュレーション追加",

@@ -1297,7 +1297,7 @@ fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
             .relocate_devices_inner(&crate::app::RelocateDevices {
                 device_ids,
                 dest: common::model::ChainRef::Track(dest_track),
-                dest_index,
+                dest_index: crate::app::InsertAt::Index(dest_index),
                 copy,
             });
         Ok(())

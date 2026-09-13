@@ -10,7 +10,8 @@
 //! ノートをコピーする」 類のズレが構造的に起きない。
 use daw_ui_core::{Edit, Ui};
 
-use crate::app::{AppData, AppEvent, EditSurface};
+use crate::app::{AppData, AppEvent, EditSurface, InsertAt};
+use crate::event_device::DeviceEvent;
 
 /// Ctrl+C: 対象面の選択を clipboard envelope にして OS clipboard へ。トラックだけは
 /// plugin state 収集が非同期なので `AppData::copy_tracks` 経由 (結果は
@@ -376,12 +377,12 @@ pub(crate) fn duplicate_devices(app: &AppData, ui: &mut Ui<'_, AppData>) {
         return;
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::RelocateDevices(crate::app::RelocateDevices {
+        app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(crate::app::RelocateDevices {
             device_ids: ids,
             dest,
-            dest_index,
+            dest_index: InsertAt::Index(dest_index),
             copy: true,
-        }));
+        })));
     }));
 }
 

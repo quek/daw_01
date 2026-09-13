@@ -4,6 +4,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::AppEvent;
+use crate::event_device::DeviceEvent;
 use crate::event_launcher::LauncherEvent;
 use common::model::Note;
 
@@ -188,9 +189,9 @@ impl AppData {
             // r.md #71 (プラグインのコピー / 移動): チェーンで選んだプラグインを
             // 1 undo step で削除する。 対象 id は正規化を通す (= いま表示している
             // チェーンに実在するものだけ)。
-            EditSurface::Devices => AppEvent::RemoveDevices {
+            EditSurface::Devices => AppEvent::Device(DeviceEvent::RemoveDevices {
                 device_ids: self.live_device_ids(),
-            },
+            }),
         };
         self.handle_event(event);
     }

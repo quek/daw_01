@@ -14,6 +14,7 @@ use common::protocol::{PluginCommand, PluginEvent};
 
 use daw_gui::shutdown::QuitRequest;
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
+use daw_gui::event_device::DeviceEvent;
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 
@@ -71,9 +72,9 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 
     // 1 回目の RemoveDevices (bitcrush) → queue.len == 1、
     // RequestAllStates が 1 発送られる。
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![bitcrush_dev],
-    });
+    }));
     assert_eq!(
         app.cur.pipc.pending_state_queue.len(),
         1,
@@ -100,9 +101,9 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // device_id** なので、 1 件目の削除で index が詰まっても指す device は
     // 変わらない (旧: positional index を運んでいたので、 実行時の index を
     // 呼び出し側が読み替える必要があった)。
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![delay_dev],
-    });
+    }));
     assert_eq!(
         app.cur.pipc.pending_state_queue.len(),
         2,
@@ -231,9 +232,9 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     // 送信。 live はまだ [synth, bitcrush, delay] (削除は deferred)。
     let bitcrush_dev =
         daw_gui::app::device_id_at(app.cur.song_doc.song(), track_id, 1).expect("bitcrush device id");
-    app.handle_event(AppEvent::RemoveDevices {
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices {
         device_ids: vec![bitcrush_dev],
-    });
+    }));
     assert_eq!(app.cur.pipc.pending_state_queue.len(), 1, "RemoveDevices enqueues Deferred");
     let _ = drain(&mut plugin_rx);
 

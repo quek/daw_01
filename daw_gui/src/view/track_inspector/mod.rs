@@ -5,11 +5,17 @@
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
 mod chain_list;
+/// chain list の chain 行 / 操作行と、 Parallel ヘッダ行と共有する disclosure / 改名欄。
+mod chain_row;
 mod chain_sections;
 mod device_panel;
 /// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
 mod launch_section;
 mod parallel_header;
+/// chain list の plugin 行と、 その直下の展開 (SC パネル / param パネル)。
+mod plugin_row;
+/// chain list の行の右クリックメニュー (項目は型で持つ)。
+mod row_menu;
 mod modulation_rack;
 
 use daw_ui_core::{Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui};

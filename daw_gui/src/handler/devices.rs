@@ -333,7 +333,7 @@ impl AppData {
         self.cur.pipc.pending_plugin_loads.remove(&device_id);
         // 失敗を「そのセッション中ずっと無音」で終わらせない: device を
         // 「未ロード」としてインスペクタに出し、 明示的な再 load
-        // (`AppEvent::ReloadDevice`) の対象にする。 自動リトライはしない
+        // (`DeviceEvent::ReloadDevice`) の対象にする。 自動リトライはしない
         // (plugin 側の恒常的な失敗で無限ループになる)。
         self.cur.pipc.failed_plugin_loads.insert(device_id, reason.clone());
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
@@ -855,7 +855,7 @@ impl AppData {
         self.resize_track_peak_display();
     }
 
-    /// `AppEvent::RemoveDevices` の dispatcher。 削除する plugin の最新
+    /// `DeviceEvent::RemoveDevices` の dispatcher。 削除する plugin の最新
     /// state を取ってから Undo snapshot + 削除を行う。
     ///
     /// r.md #71 (プラグインのコピー / 移動): 複数選択を **1 件にまとめて** 積む

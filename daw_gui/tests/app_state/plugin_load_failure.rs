@@ -10,6 +10,7 @@ use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{device_id_at, AppData, AppEvent};
+use daw_gui::event_device::DeviceEvent;
 
 use super::support::{self, drain, select_track_single};
 
@@ -195,7 +196,7 @@ fn load_failure_keeps_other_pending_unaffected() {
 }
 
 /// 失敗した device が「未ロード」としてインスペクタに出続け、明示的な再読込
-/// (`AppEvent::ReloadDevice`) で表示が畳まれて `SetSlotPlugin` が再送されること。
+/// (`DeviceEvent::ReloadDevice`) で表示が畳まれて `SetSlotPlugin` が再送されること。
 ///
 /// これが無いと、一度 load に失敗した device はそのセッション中ずっと無音のまま
 /// (復旧手段が「project を開き直す」だけ) になる。entry の寿命は
@@ -239,9 +240,9 @@ fn failed_load_is_visible_in_chain_and_reload_retries() {
     );
 
     // 再読込 → SetSlotPlugin が再送され、pending に戻り、「未ロード」表示は畳まれる。
-    app.handle_event(AppEvent::ReloadDevice {
+    app.handle_event(AppEvent::Device(DeviceEvent::ReloadDevice {
         device_id: synth_dev,
-    });
+    }));
     let msgs = drain(&mut plugin_rx);
     assert!(
         msgs.iter().any(|m| matches!(

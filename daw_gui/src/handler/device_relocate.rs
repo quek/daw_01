@@ -47,7 +47,10 @@ impl AppData {
             return;
         };
         let Some(outcome) = self
-            .edit_song(move |song| relocate_in_song(song, &device_ids, dest, dest_index, copy))
+            .edit_song(move |song| {
+                let InsertAt::Index(dest_index) = dest_index;
+                relocate_in_song(song, &device_ids, dest, dest_index, copy)
+            })
             .flatten()
         else {
             return;

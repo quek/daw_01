@@ -115,7 +115,7 @@ pub struct ProjectIpc {
     /// device は plugin_host に instance が無い (= そのセッション中ずっと
     /// 無音) 状態で song には残る。 ここに残すことでインスペクタが
     /// 「未ロード」として可視化し、 ユーザーが明示的に再 load できる
-    /// (`AppEvent::ReloadDevice`)。 自動リトライはしない — plugin 側の
+    /// (`DeviceEvent::ReloadDevice`)。 自動リトライはしない — plugin 側の
     /// 恒常的な失敗で無限ループになるため。
     ///
     /// entry の寿命: `track_pending_load` (= 新しい load 要求を送る唯一の
