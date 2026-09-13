@@ -186,12 +186,13 @@ impl AppData {
     /// [`SongDoc::edit`] を呼ぶ。 1 event 内の複数呼び出しは 1 undo step に
     /// squash され、 Begin*/End* gesture 中は drag 全体が 1 step になる。
     /// export 中は `None` (編集拒否 + status message 予約)。
-    /// 編集の後に、消えた id を指す session 状態を掃除する (`reconcile_song_refs`)。
+    /// id 構造が変わった編集の後は、消えた id を指す session 状態を掃除する (`reconcile_song_refs_after`)。
     pub fn edit_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
         self.sync_export_lock();
         let scope = self.cur.song_doc.event_scope();
+        let structure = self.cur.song_doc.structure_epoch();
         let r = self.cur.song_doc.edit(scope, f);
-        self.reconcile_song_refs();
+        self.reconcile_song_refs_after(structure);
         r
     }
 
@@ -203,10 +204,9 @@ impl AppData {
     ) -> bool {
         self.sync_export_lock();
         let scope = self.cur.song_doc.event_scope();
+        let structure = self.cur.song_doc.structure_epoch();
         let changed = self.cur.song_doc.edit_checked(scope, f) == Some(true);
-        if changed {
-            self.reconcile_song_refs();
-        }
+        self.reconcile_song_refs_after(structure);
         changed
     }
 
@@ -256,8 +256,9 @@ impl AppData {
     /// 壊す (song mutation の遮断は edit / normalize 双方でこの同期に依存する)。
     pub fn normalize_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
         self.sync_export_lock();
+        let structure = self.cur.song_doc.structure_epoch();
         let r = self.cur.song_doc.normalize(f);
-        self.reconcile_song_refs();
+        self.reconcile_song_refs_after(structure);
         r
     }
 
@@ -272,10 +273,9 @@ impl AppData {
         f: impl FnOnce(&mut common::model::Song) -> bool,
     ) -> Option<bool> {
         self.sync_export_lock();
+        let structure = self.cur.song_doc.structure_epoch();
         let changed = self.cur.song_doc.normalize_checked(f);
-        if changed == Some(true) {
-            self.reconcile_song_refs();
-        }
+        self.reconcile_song_refs_after(structure);
         changed
     }
 

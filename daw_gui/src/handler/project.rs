@@ -351,10 +351,21 @@ impl AppData {
         );
         self.resync_song_edit_texts();    }
 
+    /// Song 編集の口 (`edit_song` / `edit_song_checked` / `normalize_song(_checked)`) の後始末: 編集の前に
+    /// 読んだ `structure_epoch` から id 構造が変わっていれば [`Self::reconcile_song_refs`] を回す。掃除対象は
+    /// すべて id 構造 (`StructureWatch`) に含まれる id を指すので、値だけの編集 (ドラッグ中の毎フレーム) では
+    /// 何もしない。
+    pub(crate) fn reconcile_song_refs_after(&mut self, structure_epoch: u64) {
+        if self.cur.song_doc.structure_epoch() != structure_epoch {
+            self.reconcile_song_refs();
+        }
+    }
+
     /// Song の id を指す session 状態のうち、指す先が居なくなったものを外す。**Song を変える AppData の口
-    /// (`edit_song` / `edit_song_checked` / `normalize_song(_checked)` と、undo / redo / 履歴ジャンプの
-    /// `after_undo_redo`) の直後に必ず呼ばれる** ので、トラックや device が消える経路 (削除 / 切り取り /
-    /// Parallel 解除 / トラック削除 / グループ解除 / 末尾トラック削除 …) ごとに掃除を書かない。冪等。
+    /// (`edit_song` 系は id 構造が変わったときに [`Self::reconcile_song_refs_after`] から、undo / redo /
+    /// 履歴ジャンプは `after_undo_redo` から) の直後に必ず呼ばれる** ので、トラックや device が消える経路
+    /// (削除 / 切り取り / Parallel 解除 / トラック削除 / グループ解除 / 末尾トラック削除 …) ごとに掃除を
+    /// 書かない。冪等。
     ///
     /// - device 選択 / anchor: 実在しない id を落とす (空になったらタグを降ろす)。正しさは読む側の
     ///   [`Self::live_device_ids`] が持ち、ここは保持した集合が育たないようにするだけ。
