@@ -887,19 +887,22 @@ fn render_arrangement_heavy(
             if let Some(hl) = ov.highlight_row {
                 push_filled_rect(hctx, hl, f.style.reorder_group_highlight);
             }
-            // (2) 深さ連動 drop indicator 横線。 左端 = indent 列、 右端 = header + lanes。
-            let line_right = f.content_below_ruler.x + f.content_below_ruler.w;
-            let line_x = ov.indent_x.min(line_right - 1.0);
-            push_filled_rect(
-                hctx,
-                Rect {
-                    x: line_x,
-                    y: ov.indicator_y - f.style.reorder_drop_indicator_h * 0.5,
-                    w: (line_right - line_x).max(1.0),
-                    h: f.style.reorder_drop_indicator_h,
-                },
-                f.style.reorder_drop_indicator,
-            );
+            // (2) 深さ連動 drop indicator 横線。 左端 = indent 列、 右端 = header + lanes。 落とせる深さが無い
+            // gap (依存が循環する) では出さない。
+            if let Some(drop) = ov.drop {
+                let line_right = f.content_below_ruler.x + f.content_below_ruler.w;
+                let line_x = drop.indent_x.min(line_right - 1.0);
+                push_filled_rect(
+                    hctx,
+                    Rect {
+                        x: line_x,
+                        y: drop.y - f.style.reorder_drop_indicator_h * 0.5,
+                        w: (line_right - line_x).max(1.0),
+                        h: f.style.reorder_drop_indicator_h,
+                    },
+                    f.style.reorder_drop_indicator,
+                );
+            }
             // (3) dragging row 半透明複製 (header_pane 領域、last_mouse_y 中心)。
             let row_h = f.view.track_row_h;
             let drag_y = (ov.drag_center_y - row_h * 0.5)

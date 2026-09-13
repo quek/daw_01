@@ -32,9 +32,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     drag::advance(ui, &f);
     launcher::drag::advance(ui, &f);
     // 4. session の overlay 用スナップショットと release take。
-    let (live, released) = sessions::take(ui, &f, &mut response);
+    let (live, released) = sessions::take(ui, app, &f, &mut response);
     let launcher_sessions = launcher::drag::take(ui, &f);
-    let overlays = sessions::overlays(&f, &live, &released);
+    let overlays = sessions::overlays(app, &f, &live, &released);
     // 5. hover 判定 → cursor 決定 (cursor は hover が書いた response を読む)。
     cursor::hover(&f, &live, &mut response);
     // 端オートスクロールの対象ドラッグが生きているか。判定は `arrangement_edge_scroll_axes`
