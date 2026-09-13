@@ -16,7 +16,9 @@ use daw_ui_core::{
 use common::automation::{norm_to_plain, plain_to_norm};
 
 use crate::automation_value::automation_value_display;
+use crate::handler::view_model::LiveParamScope;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
+use crate::view::native_device::ParamOwner;
 use crate::view::modulation::{build_mod, push_mod_depth_bracket};
 use crate::app::ParamSurface;
 use crate::view::param_gesture::push_param_gesture;
@@ -225,6 +227,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ので release-frame の modifier race が無い (arrangement の press_modifiers と同狙い)。
     let visible_order: Vec<u32> = normals.iter().chain(returns.iter()).map(|e| e.track_id).collect();
     let select_press = std::cell::Cell::new(None::<u32>);
+    // live 値 (再生中はレーン値) の文脈は **1 フレームに 1 回**だけ組み、全 strip へ借用で配る
+    // (strip ごとに組むと行数 × トラック数の O(N²) になる)。
+    let scope = app.live_param_scope();
 
     // ----- 右端から固定配置: returns 帯 → 「＋ Return」 -----
     // r.md #50: MASTER ストリップは画面右端の常駐マスターパネル
@@ -273,7 +278,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             {
                 select_press.set(Some(entry.track_id));
             }
-            draw_track_strip(app, ui, entry, strip_rect);
+            draw_track_strip(app, ui, entry, strip_rect, &scope);
         }
     });
 
@@ -319,7 +324,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             {
                 select_press.set(Some(entry.track_id));
             }
-            draw_return_strip(app, ui, entry, strip_rect);
+            draw_return_strip(app, ui, entry, strip_rect, &scope);
         }
     }
 
@@ -355,6 +360,7 @@ fn draw_track_strip(
     ui: &mut Ui<'_, AppData>,
     entry: &crate::app::TrackMixEntry,
     rect: Rect,
+    scope: &LiveParamScope,
 ) {
     // グループ強調の色ハイライト (旧 COLOR_GROUP_BG 青 tint) は撤去。
     // グループ識別は構造手掛かり ("↳" depth prefix + 折り畳み) だけで担い、
@@ -381,7 +387,7 @@ fn draw_track_strip(
     // send 2 本以上でフェーダー / メーターと Sends セクションが重なって描かれ、
     // 重なり領域では先に描かれるフェーダーが press を consume して × / send knob が
     // クリック不能になっていた。
-    // 内蔵チャンネルストリップ帯 (docs/plan_channel_strip.md) が上端を食うので、
+    // 組み込み Comp / EQ の帯 (`strip_sections`) が上端を食うので、
     // Sends band に残る余地もその分だけ減る。
     let sends_band_h =
         sends_band_height_fitted(n_sends, rect.h - strip_sections::head_height(app));
@@ -403,9 +409,10 @@ fn draw_track_strip(
         false,
         group_collapsed,
         sends_band_h,
+        scope,
     );
     // Sends セクションは draw_strip の fader 下端より下の band に描画する。
-    draw_sends_section(app, ui, track_id, rect, bg, sends_band_h);
+    draw_sends_section(app, ui, track_id, rect, bg, sends_band_h, scope);
 }
 
 /// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint
@@ -416,6 +423,7 @@ fn draw_return_strip(
     ui: &mut Ui<'_, AppData>,
     entry: &crate::app::TrackMixEntry,
     rect: Rect,
+    scope: &LiveParamScope,
 ) {
     let track_id = entry.track_id;
     draw_strip(
@@ -436,6 +444,7 @@ fn draw_return_strip(
         false,
         None, // group_collapsed: return strip は disclosure 無し
         0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
+        scope,
     );
 }
 
@@ -468,6 +477,8 @@ fn draw_strip(
     // は 0。 fader 下端をこの分だけ持ち上げて領域を空ける。 Sends セクション
     // 本体の描画は caller (`draw_track_strip`) が `draw_sends_section` で行う。
     sends_band_h: f32,
+    // フレームで 1 回だけ組んだ live 値の文脈 (`draw` が持つ)。
+    scope: &LiveParamScope,
 ) {
     let p = &app.theme.core;
     ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
@@ -503,10 +514,13 @@ fn draw_strip(
 
     let pad = STRIP_PAD;
 
-    // 内蔵チャンネルストリップ帯 (Comp / EQ / 常設サムネイル) を strip 上端に積む。
-    // **既存 strip の中身は変えず、その上に足すだけ** (docs/plan_channel_strip.md §2)。
+    // 組み込み Comp / EQ の帯 (セクション + 常設サムネイル) を strip 上端に積む。
+    // **既存 strip の中身は変えず、その上に足すだけ** (docs/plan_rack_native_devices.md §10.8)。
+    // 高さは track の有無に依らず確保する (fader の上端が全 strip で揃う)。
     let head_h = strip_sections::head_height(app);
-    strip_sections::draw_head(app, ui, track_idx, Rect { h: head_h, ..rect }, pad, bg);
+    if let Some(owner) = ParamOwner::resolve(app.cur.song_doc.song(), track_idx) {
+        strip_sections::draw_head(app, ui, owner, Rect { h: head_h, ..rect }, pad, bg, scope);
+    }
     let mut y = rect.y + head_h + pad;
 
     // 名前 (group strip は左に折り畳み disclosure を置く)。 mixer は strip が
@@ -838,6 +852,7 @@ fn draw_sends_section(
     // (`KnobStyle::surface`)。 strip 本体と同じ面の上に描かれるので同値。
     bg: Color,
     band_h: f32,
+    scope: &LiveParamScope,
 ) {
     let pad = SEND_PAD;
     let band_top = rect.y + rect.h - pad - band_h;
@@ -876,6 +891,7 @@ fn draw_sends_section(
                 bg,
                 band_top - scroll_off.1,
                 scrollbar_w,
+                scope,
             );
         },
     );
@@ -894,6 +910,7 @@ fn draw_sends_rows(
     bg: Color,
     top: f32,
     scrollbar_w: f32,
+    scope: &LiveParamScope,
 ) {
     let pad = SEND_PAD;
     let mut y = top + 4.0;
@@ -958,7 +975,7 @@ fn draw_sends_rows(
         });
         // 再生中は SendGain オートメーションの playhead 値に追従させる
         // (volume / pan と同 idiom)。 停止中・非 automation・書き込み中は send.gain。
-        let live_gain = app.live_param_value(src_track.id, &send_gain_target, send.gain);
+        let live_gain = app.live_lane_value(scope, ParamOwner::of_track(src_track), &send_gain_target, send.gain);
         let knob_resp = ui.knob_at(
             ("mixer_send_knob", track_id as usize, send_idx),
             knob_rect,

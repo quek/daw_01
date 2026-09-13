@@ -14,10 +14,10 @@ pub const MASTER_PANEL_MAX_W: f32 = 640.0;
 /// 各セクションの最低高 [px] (MASTER / スペクトラム / オシロ / ゴニオ)。
 /// これを割り込むと配分ではなくパネル内スクロールで見せる。
 ///
-/// MASTER が大きいのは、フェーダー / ラウドネスに加えて**マスターストリップ**
-/// (バスコンプ + トーン EQ + リミッター、`docs/plan_master_strip.md` §3) を
-/// 内側に積むため。ここを割り込むと、ストリップが下のブロック (リミッター →
-/// EQ) から順に描かれなくなる。
+/// MASTER が大きいのは、フェーダー / ラウドネスに加えて master の**組み込みブロック**
+/// (Bus Comp + Tone EQ + フェーダー後 Limiter、`docs/plan_rack_native_devices.md` §10.9) を
+/// 内側に積むため。ここを割り込むと、ブロックが優先度の低いもの (Limiter → Tone EQ)
+/// から順に描かれなくなる。
 pub const MASTER_SECTION_MIN_H: [f32; 4] = [340.0, 90.0, 70.0, 120.0];
 
 impl AppData {
