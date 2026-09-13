@@ -3523,7 +3523,7 @@ fn v38_plugin_instance(id: u64, plugin_id: &str, effect: bool) -> PluginInstance
         has_audio_output: true,
         ..Default::default()
     };
-    PluginInstance { id, ..PluginInstance::with_ports(plugin_id.into(), PluginFormat::Clap, ports) }
+    PluginInstance { id, ..PluginInstance::with_ports(plugin_id.into(), crate::plugin_format::PluginFormat::Clap, ports) }
 }
 
 fn v38_plugin(id: u64, plugin_id: &str, effect: bool) -> Device {
