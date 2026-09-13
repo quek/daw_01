@@ -905,12 +905,9 @@ pub enum AppEvent {
     /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
     /// disarms. While armed, inspector param controls enter depth-drag edit mode.
     SetArmedModSource(Option<u32>),
+    /// マスターフェーダーの値。drag 全体の undo 1 step は `ScrubGesture::MasterGain` が束ねる
+    /// (`view::scrub_gesture`)。
     SetMasterGain(f32),
-    /// マスターフェーダーの drag 全体を 1 undo step に bracket する
-    /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
-    /// `master_gain` が `Song` に入って undo 対象になったので必要になった。
-    BeginMasterGainDrag,
-    EndMasterGainDrag,
 
     // -------- IPC events from plugin_host ---------------------------------
     /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。

@@ -1251,17 +1251,6 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            // マスターフェーダーの drag を 1 undo step に束ねる。これが無いと
-            // per-frame の `SetMasterGain` が各々 snapshot を積み、1 回の drag で
-            // undo 履歴が埋まる (group transform / inspector scrub と同じ罠)。
-            AppEvent::BeginMasterGainDrag => {
-                self.cur.peph.master_gain_dragging = true;
-                self.cur.song_doc.begin_gesture();
-            }
-            AppEvent::EndMasterGainDrag => {
-                self.cur.peph.master_gain_dragging = false;
-                self.cur.song_doc.end_gesture();
-            }
             AppEvent::Tick { project, samples, preroll, playing, recording_live } => {
                 self.on_transport_tick(project, samples, preroll, playing, recording_live);
             }

@@ -1,7 +1,7 @@
 //! スクラブ / ドラッグの **undo bracket の唯一の出入口** ([`ScrubGesture`])。
 //!
 //! インスペクタの数値欄・レーン見出しの既定値欄・ツマミの変調深さドラッグ・
-//! 変調ラック・グループ変換は、どれも `Song` を毎フレーム書く。束ねないと
+//! 変調ラック・グループ変換・マスターフェーダーは、どれも `Song` を毎フレーム書く。束ねないと
 //! 1 ドラッグで数十 undo step が積まれ `UNDO_LIMIT` (200) を溢れさせ、
 //! **それ以前の実編集履歴を捨てる**。
 //!
@@ -114,7 +114,7 @@ pub(crate) fn close(app: &mut AppData) {
             // drag 中に作られているので、ここは解除と通知だけ (`view::modulation`)。
             app.connect_armed_mod_source_to(track_id, target);
         }
-        ScrubGesture::Inspector(_) | ScrubGesture::LaneDefault(_) => {
+        ScrubGesture::Inspector(_) | ScrubGesture::LaneDefault(_) | ScrubGesture::MasterGain => {
             app.handle_event(AppEvent::EndInspectorScrub);
         }
     }
