@@ -115,11 +115,15 @@ event 名は **generation** 込みで mint され、旧世代の stale signal �
   (`DelayKey` = track_id) と follower env (`ModSource.id`) を旧 schedule から
   install 時 `mem::swap` で移送 (alloc/free 0) — fader drag 中に補償パスが
   ミュートされたり follower が段差を出したりしない。
-- PDC は plugin 報告 latency + **leaf 宛 sidechain tap の 1-buffer lag** を
-  `input_delay_per_track` に算入して全経路の位相を揃える。
+- PDC は plugin 報告 latency + sidechain の staging lag (consumer が走る pass で決まる: pass 1 は
+  1 buffer、pass 2 は 0) を算入して全経路の位相を揃える。pass 1 の consumer は
+  `input_delay_per_track`、pass 2 (bus) の consumer は `ApplyDelay(BusScAlign)` で main を揃える
+  ([plan_rack_native_devices.md](docs/plan_rack_native_devices.md) §8.3.3)。
 - モジュール: `engine.rs` (状態 + transport 駆動) / `graph/{compile,schedule,execute,
-  delay_line,port_buffer,follower}.rs` / `mixer.rs` (strip 適用) / `metronome.rs` /
-  `sequencer.rs` / `export.rs` / `audio_worker.rs` / `audio_clip_renderer.rs`。
+  delay_line,port_buffer,follower}.rs` / `native_dsp/` と `graph/native.rs` (内蔵 device の DSP と
+  チェーン op、[plan_rack_native_devices.md](docs/plan_rack_native_devices.md) §8) / `mixer.rs`
+  (track scratch と volume / pan) / `metronome.rs` / `sequencer.rs` / `export.rs` / `audio_worker.rs` /
+  `audio_clip_renderer.rs`。
 - Song は `RtBundle` (song + tempo_map + schedule) として単一経路で publish され、
   RT は schedule と同一の song snapshot を読む。playhead は audio thread 単独 writer。
   WAV decode は専用 `audio-decode` スレッド (RT はディスクに触れない)。

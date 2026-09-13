@@ -8,16 +8,18 @@
 //!
 //! RT 規約: 全関数が audio callback / worker / export freewheel から呼ばれる。
 //! ヒープ確保・ロック・I/O を行わない (`has_soloed_contributor` の BFS も
-//! スタック上の固定長配列で回す)。
+//! スタック上の固定長配列で回す)。「どの track の snapshot を取るか」の判定は Song を
+//! 歩くので RT には置かず、compile 時に `ChainProgram::snapshot_*` へ焼く (r.md #129 §18-B)。
 
 use common::model::{Song, Track};
 
 use crate::engine::MAX_TRACKS;
+use crate::graph::BufRef;
+use crate::graph::program::{ChainProgram, ChainScratch, ParallelScratch};
 use crate::graph::schedule::MASTER_OWNER;
-use crate::graph::{BufRef, ChainProgram};
 use crate::mixer::TrackScratch;
 
-/// Resolve a tap `BufRef` (PostFader / PostFx / PreFx) to the source track's
+/// Resolve a tap `BufRef` (PostFader / PostFx / PreFx / chain / Parallel) to its
 /// `(L, R)` buffers. Returns `None` for a non-tap `BufRef` or out-of-range
 /// track. docs/plan_modulation_followups.md §1. RT-safe (pure slicing).
 pub(super) fn resolve_tap_buffers<'a>(
@@ -27,13 +29,33 @@ pub(super) fn resolve_tap_buffers<'a>(
     master_program: &'a ChainProgram,
     src: BufRef,
 ) -> Option<(&'a [f32], &'a [f32])> {
-    let program_of = |owner: u32| -> Option<&'a ChainProgram> {
-        if owner == MASTER_OWNER {
-            Some(master_program)
-        } else {
-            programs.get(owner as usize)
+    match program_tap_owner(src) {
+        None => resolve_scratch_tap(scratch, src),
+        Some(owner) => {
+            let p = if owner == MASTER_OWNER { master_program } else { programs.get(owner as usize)? };
+            resolve_program_tap(&p.chains, &p.parallels, src)
         }
-    };
+    }
+}
+
+/// tap の読み元が program の scratch (chain / Parallel) なら、その program の持ち主
+/// (song-track index か [`MASTER_OWNER`])。scratch 系 / tap でない `BufRef` は `None`。
+pub(super) fn program_tap_owner(src: BufRef) -> Option<u32> {
+    match src {
+        BufRef::ChainPostFx { owner, .. }
+        | BufRef::ChainPostFader { owner, .. }
+        | BufRef::ParallelInput { owner, .. }
+        | BufRef::ParallelOutput { owner, .. } => Some(owner),
+        BufRef::TrackScratch(_)
+        | BufRef::PreFaderScratch(_)
+        | BufRef::PreFxScratch(_)
+        | BufRef::Master
+        | BufRef::Pooled(_) => None,
+    }
+}
+
+/// track scratch 系の tap (PostFader / PostFx / PreFx)。
+pub(super) fn resolve_scratch_tap(scratch: &[TrackScratch], src: BufRef) -> Option<(&[f32], &[f32])> {
     Some(match src {
         BufRef::TrackScratch(i) => {
             let s = scratch.get(i as usize)?;
@@ -47,56 +69,37 @@ pub(super) fn resolve_tap_buffers<'a>(
             let s = scratch.get(i as usize)?;
             (s.pre_fx_l.as_slice(), s.pre_fx_r.as_slice())
         }
-        BufRef::ChainPostFx { owner, slot } => {
-            let c = program_of(owner)?.chains.get(slot as usize)?;
-            (c.post_fx_l.as_slice(), c.post_fx_r.as_slice())
-        }
-        BufRef::ChainPostFader { owner, slot } => {
-            let c = program_of(owner)?.chains.get(slot as usize)?;
-            (c.post_fader_l.as_slice(), c.post_fader_r.as_slice())
-        }
-        BufRef::ParallelInput { owner, slot } => {
-            let r = program_of(owner)?.parallels.get(slot as usize)?;
-            (r.in_l.as_slice(), r.in_r.as_slice())
-        }
-        BufRef::ParallelOutput { owner, slot, output } => {
-            let r = program_of(owner)?.parallels.get(slot as usize)?;
-            r.split.as_ref()?.output(output)?
-        }
         _ => return None,
     })
 }
 
-/// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: does any
-/// aux-input route or mod source tap `track_id` exactly at `want`? Read-only
-/// scan, no alloc — RT-safe.
-pub(super) fn any_tap_at(song: &Song, track_id: u32, want: common::model::TapPoint) -> bool {
-    let hit = |t: &common::model::AudioTap| {
-        t.source_track() == Some(track_id) && t.tap_point == want
-    };
-    // r.md #110: Parallel の中の plugin も `all_plugins` が辿る (chain source の tap は
-    // program 側の snapshot flag で解決するのでここでは track source だけ)。
-    song.all_plugins()
-        .flat_map(|p| p.aux_inputs.iter().flatten())
-        .any(|r| hit(&r.tap))
-        // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ走査。
-        || song
-            .mod_sources
-            .iter()
-            .filter_map(|m| m.follower())
-            .any(|(tap, _)| hit(tap))
-}
-
-/// A `PostFx` tap reads the track's `pre_fader_l/r` snapshot (post-fx,
-/// pre-strip), so the per-track render must capture it.
-pub(super) fn track_needs_prefader_snapshot(song: &Song, track_id: u32) -> bool {
-    any_tap_at(song, track_id, common::model::TapPoint::PostFx)
-}
-
-/// A `PreFx` tap reads the track's `pre_fx_l/r` snapshot (the raw signal
-/// before the device chain), so the per-track render must capture it.
-pub(super) fn track_needs_prefx_snapshot(song: &Song, track_id: u32) -> bool {
-    any_tap_at(song, track_id, common::model::TapPoint::PreFx)
+/// program の scratch 系の tap (chain の PostFx / PostFader、Parallel の入力 / 分割出力)。
+/// `owner` は見ない (呼び側がその program の `chains` / `parallels` を渡す — 同じ program の
+/// `natives` へ書くときにフィールドで借用を分けるため)。
+pub(super) fn resolve_program_tap<'a>(
+    chains: &'a [ChainScratch],
+    parallels: &'a [ParallelScratch],
+    src: BufRef,
+) -> Option<(&'a [f32], &'a [f32])> {
+    Some(match src {
+        BufRef::ChainPostFx { slot, .. } => {
+            let c = chains.get(slot as usize)?;
+            (c.post_fx_l.as_slice(), c.post_fx_r.as_slice())
+        }
+        BufRef::ChainPostFader { slot, .. } => {
+            let c = chains.get(slot as usize)?;
+            (c.post_fader_l.as_slice(), c.post_fader_r.as_slice())
+        }
+        BufRef::ParallelInput { slot, .. } => {
+            let r = parallels.get(slot as usize)?;
+            (r.in_l.as_slice(), r.in_r.as_slice())
+        }
+        BufRef::ParallelOutput { slot, output, .. } => {
+            let r = parallels.get(slot as usize)?;
+            r.split.as_ref()?.output(output)?
+        }
+        _ => return None,
+    })
 }
 
 /// Sum the listed source scratches into `scratch[target_idx]` (used to

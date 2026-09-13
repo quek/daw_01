@@ -87,25 +87,27 @@ pub struct TrackScratch {
     /// Range `-1.0..=1.0` (left..right). Default constant fill is
     /// `track.pan`.
     pub pan_per_sample: Vec<f32>,
-    /// Post-fx, **pre-fader** snapshot of this track's signal (taken
+    /// Post-fx, **pre-fader** snapshot of this track's signal (taken after the
+    /// whole device chain in its order — r.md #129: 組み込みの Comp / EQ も含む — and
     /// before the volume / pan strip overwrites `track_l/r` in place).
     /// Written by `process_track_owned` / `run_group_fx_chain` only when
-    /// the track has a pre-fader aux send, and read by a `MixSend` whose
-    /// send `mode == PreFader`. `MAX_FRAMES` long, allocated once.
+    /// something reads it (pre-fader aux send / `PostFx` tap / mod source:
+    /// `ChainProgram::snapshot_post_fx`). `MAX_FRAMES` long, allocated once.
     pub pre_fader_l: Vec<f32>,
     pub pre_fader_r: Vec<f32>,
     /// **Pre-FX** snapshot of this track's signal (the raw audio clip /
     /// input *before* the device chain runs). Written by
     /// `process_track_owned` / `run_group_fx_chain` only when a
     /// `TapPoint::PreFx` tap / mod source reads this track
-    /// (`track_needs_prefx_snapshot`), and read by a `SidechainTap` /
-    /// `EnvelopeFollow` resolving `BufRef::PreFxScratch`. `MAX_FRAMES` long,
+    /// (`ChainProgram::snapshot_pre_fx`), and read by a `SidechainTap` /
+    /// `NativeSidechainTap` / `EnvelopeFollow` resolving `BufRef::PreFxScratch`
+    /// (自トラック Pre-FX を読む device は同じ pass の snapshot を直接読む)。 `MAX_FRAMES` long,
     /// allocated once. docs/plan_modulation_followups.md §1.
     pub pre_fx_l: Vec<f32>,
     pub pre_fx_r: Vec<f32>,
     /// Global Sampler (`docs/plan_global_sampler.md` §3.2): 録音源がこの track の
     /// PreFx / PostFx tap のとき engine が buffer ごとに立てる。`Song` に無い tap
-    /// なので `track_needs_*_snapshot` (= `any_tap_at`) では拾えない。
+    /// なので compile 時に焼く `ChainProgram::snapshot_*` では拾えない。
     pub force_prefx_snapshot: bool,
     pub force_prefader_snapshot: bool,
 }

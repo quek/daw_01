@@ -36,13 +36,15 @@ mod tests;
 
 use std::collections::HashMap;
 
+use common::audio_bridge::{MAX_NATIVE_METERS, MAX_TRACKS};
 use common::model::{AudioTap, Song, TapPoint, TapSource};
 
-use super::program_build::{ChainLatency, build_program};
+use super::program::Pass1Role;
+use super::program_build::{BuiltProgram, ChainLatency, build_program};
 use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule};
 use deps::Topology;
 use pdc::master_output_latency;
-use sidechain::{TapCtx, collect_chain_taps, compute_input_delays};
+use sidechain::{TapCtx, bake_snapshot_needs, collect_chain_taps, compute_sc_delays};
 
 /// r.md #110: chain id → その chain が居る program と slot (sidechain / follower の
 /// `TapSource::Chain` を `BufRef` へ解決する表)。`owner` = song-track index、master 所有
@@ -89,11 +91,11 @@ fn tap_bufref_for(tap: &AudioTap, id_to_idx: &HashMap<u32, u32>, chains: &ChainM
 
 /// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: resolve a
 /// tap point to the source scratch buffer. `PostFader` = the track's final
-/// output (`TrackScratch`); `PostFx` = after the device chain but before the
-/// volume/pan strip (`PreFaderScratch`, snapshot guarded in the engine);
-/// `PreFx` = the raw signal before the device chain (`PreFxScratch`, snapshot
-/// guarded in the engine). All three snapshots are captured only when a tap
-/// actually needs them.
+/// output (`TrackScratch`); `PostFx` = after the **whole device chain in its
+/// order** (r.md #129: 組み込みの Comp / EQ も device) but before the volume/pan
+/// fader (`PreFaderScratch`); `PreFx` = the raw signal before the device chain
+/// (`PreFxScratch`). The snapshots are captured only when a tap actually needs
+/// them (`ChainProgram::snapshot_*`, baked at compile time).
 fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
     use common::model::TapPoint;
     match tap_point {
@@ -147,16 +149,19 @@ pub fn compile_schedule(
     buffer_frames: u32,
 ) -> Result<Schedule, GraphError> {
     let n = song.tracks.len();
+    // r.md #129 §8.3.4: Limiter の先読み遅延は compile 時に焼く (PDC の会計と DSP が同じ値を見る)。
+    let master_limiter_latency = song.master_limiter_latency_active();
     // r.md #110: device ツリーを program に展開する (`docs/plan_parallel.md` §4.1)。
     // 並列 chain の PDC と chain tap の snapshot flag はここで焼き込む。
-    let (master_built, built, chain_map) = build_all_programs(song, device_latencies);
+    let (mut master_built, mut built, chain_map) = build_all_programs(song, device_latencies);
     if n == 0 {
         return Ok(Schedule {
             nodes: vec![NodeOp::Mix {
                 srcs: Vec::new(),
                 dst: BufRef::Master,
             }],
-            master_latency_samples: master_output_latency(song, device_latencies, 0, sample_rate),
+            master_latency_samples: master_output_latency(song, device_latencies, 0, sample_rate, master_limiter_latency),
+            master_limiter_latency,
             master_program: master_built.program,
             ..Schedule::empty()
         });
@@ -164,31 +169,35 @@ pub fn compile_schedule(
 
     // ---- 配線トポロジ: 親参照の検査 → group / send / パラアウトの入力表 → bus 判定 ----
     let topo = Topology::build(song)?;
+    // pass 1 の役割を program に焼く (RT の `process_track_owned` が Song を歩かない)。
+    for (b, (&bus, gwi)) in built.iter_mut().zip(topo.bus_flags.iter().zip(&topo.gwi_split)) {
+        b.program.pass1_role = match (gwi, bus) {
+            (Some(_), _) => Pass1Role::GroupWithInstrument,
+            (None, true) => Pass1Role::Bus,
+            (None, false) => Pass1Role::Leaf,
+        };
+    }
     let taps = TapCtx {
         id_to_idx: &topo.id_to_idx,
         chains: &chain_map,
+        bus_flags: &topo.bus_flags,
+        gwi_split: &topo.gwi_split,
+        buffer_frames,
     };
     // ---- path latency の依存辺の post-order = 実行順 (循環はここで弾く) ----
-    let order = deps::execution_order(song, &topo, &taps)?;
+    let order = deps::execution_order(song)?;
     // ---- 実行順に op を積む (producer は必ず consumer より前に並ぶ) ----
-    let nodes = emit::emit_track_ops(song, &topo, &order, &built, &chain_map);
+    let nodes = emit::emit_track_ops(song, &topo, &order, &mut built, &mut master_built, &taps);
 
     // ---- PR3: Plugin Delay Compensation ----
     let track_chain_latency: Vec<u32> = built.iter().map(|b| b.latency).collect();
-    let path_latency = pdc::path_latencies(song, &topo, &taps, &track_chain_latency, buffer_frames);
-    let mut compensated = pdc::insert_delay_compensation(song, nodes, &path_latency);
-
-    // PR4.5 sidechain plugin-internal alignment: per-track input delay
-    // (leaf 宛は path latency の sidechain fan-in と同じ staging lag を足す)。
-    let input_delay_per_track = compute_input_delays(
-        song,
-        &topo.bus_flags,
-        buffer_frames,
-        &topo.id_to_idx,
-        &chain_map,
-        &path_latency,
-        &track_chain_latency,
-    );
+    let path_latency = pdc::path_latencies(song, &topo, &taps, &track_chain_latency);
+    // PR4.5 / r.md #129 §8.3.3: consumer の入力で main をサイドチェインに揃える遅延。pass 1 の
+    // consumer 宛ては track の input delay、pass 2 の consumer 宛ては `BusScAlign`。
+    let non_sc_input = pdc::non_sc_input_latencies(song, &topo, &path_latency);
+    let (input_delay_per_track, bus_sc_delay) =
+        compute_sc_delays(song, &taps, &path_latency, &track_chain_latency, &non_sc_input);
+    let mut compensated = pdc::insert_delay_compensation(song, nodes, &path_latency, &bus_sc_delay);
 
     // docs/plan_modulation.md §3/§5: per-`ModSource` envelope follower (末尾に emit)。
     let (follower_slots, follower_keys, mod_kinds) =
@@ -216,31 +225,36 @@ pub fn compile_schedule(
             device_latencies,
             compensated.master_mix_latency,
             sample_rate,
+            master_limiter_latency,
         ),
+        master_limiter_latency,
     })
 }
 
 /// r.md #110: 全 track + master の device ツリーを program に展開し、chain id → 置き場
 /// (`ChainMap`) を組む。`compile_schedule` の冒頭から切り出した (関数 budget)。
+///
+/// r.md #129 §8.3.2: 展開した program に、内蔵 device の GR メーターの割り当てと track の
+/// snapshot 要求を焼く。ここに置くので `n == 0` の早期 return にも効く。
 fn build_all_programs(
     song: &Song,
     device_latencies: &DeviceLatencies,
-) -> (super::program_build::BuiltProgram, Vec<super::program_build::BuiltProgram>, ChainMap) {
+) -> (BuiltProgram, Vec<BuiltProgram>, ChainMap) {
     let chain_taps = collect_chain_taps(song);
-    let master_built = build_program(
+    let mut master_built = build_program(
         &song.master_fx_chain,
         common::model::MASTER_TRACK_ID,
         None,
         device_latencies,
         &chain_taps,
     );
-    let built: Vec<_> = song
+    let mut built: Vec<_> = song
         .tracks
         .iter()
         .map(|t| build_program(&t.devices, t.id, t.paraout_split_device(), device_latencies, &chain_taps))
         .collect();
     let mut chain_map: ChainMap = HashMap::new();
-    let mut register = |b: &super::program_build::BuiltProgram, owner: u32| {
+    let mut register = |b: &BuiltProgram, owner: u32| {
         for (&cid, &super::program_build::ChainSlot { chain_slot, parallel_slot, output }) in &b.chain_slots {
             chain_map.insert(
                 cid,
@@ -258,7 +272,33 @@ fn build_all_programs(
         register(b, idx as u32);
     }
     register(&master_built, MASTER_OWNER);
+    assign_native_meters(&mut built, &mut master_built);
+    bake_snapshot_needs(song, &mut built);
     (master_built, built, chain_map)
+}
+
+/// GR を出す内蔵 device (Comp / Bus Comp) に、GR 面 (`MAX_NATIVE_METERS` 枠) の publish 権を割り当てる。
+/// 順は組み込み (track 順 → master) → 追加分 (同じ順) で、枠を超えた分は publish しない。
+/// pass 1 が処理する track は先頭 `MAX_TRACKS` 本までなので、それより後ろの track には割り当てない
+/// (組み込み Comp は最大 `MAX_TRACKS + 1` 個 = Mixer 帯とマスターパネルの GR は必ず出る)。
+fn assign_native_meters(built: &mut [BuiltProgram], master_built: &mut BuiltProgram) {
+    let mut left = MAX_NATIVE_METERS;
+    for builtin in [true, false] {
+        let programs = built
+            .iter_mut()
+            .take(MAX_TRACKS)
+            .chain(std::iter::once(&mut *master_built))
+            .map(|b| &mut b.program);
+        for p in programs {
+            for ns in p.natives.iter_mut().filter(|ns| ns.builtin == builtin) {
+                let wants = ns.dsp.kind().has_gain_reduction();
+                ns.meter = wants && left > 0;
+                if ns.meter {
+                    left -= 1;
+                }
+            }
+        }
+    }
 }
 
 /// テスト用: 「どの device も latency を報告していない」 前提で compile する短縮形。

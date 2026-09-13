@@ -138,7 +138,7 @@ impl SamplerRt {
     }
 
     /// 録音源の track に pre-fx / pre-fader snapshot を要求する flag を立てる
-    /// (`Song` に無い tap なので `any_tap_at` では拾えない)。render の前に呼ぶ。
+    /// (`Song` に無い tap なので compile 時に焼く `ChainProgram::snapshot_*` では拾えない)。render の前に呼ぶ。
     pub fn arm_snapshot_flags(
         &mut self,
         rig: Option<&SamplerRig>,
