@@ -549,7 +549,8 @@ fn mix_chain_into_sum(
     rs: &mut ParallelScratch,
 ) {
     for i in 0..n {
-        let (pl, pr) = chain_pan_gains(cs.pan_ramp[i]);
+        // pan 則はトラックと同じ (中央 0 dB の等パワー則。空 chain 1 本の Parallel は素通しと同じ音量)。
+        let (pl, pr) = common::audio_render::pan_gains(cs.pan_ramp[i]);
         let g = cs.gain_ramp[i];
         let (l, r) = if effective_mute { (0.0, 0.0) } else { (bus_l[i] * pl * g, bus_r[i] * pr * g) };
         if snapshot_post_fader {
@@ -587,15 +588,6 @@ fn apply_parallel_out(
     }
 }
 
-/// chain の pan 則 (SSoT)。**中央 = unity** の balance 則: 空 chain 1 本の Parallel が
-/// 素通しと同じ音量になることを保証する。track の pan 則 (`common::audio_render::pan_gains`) も
-/// 中央は unity だが、振った側を +3 dB まで持ち上げる。chain は並列合算でクリップしないよう
-/// boost を持たず、片側へ振ると反対側だけ減衰する。
-#[inline]
-pub fn chain_pan_gains(pan: f32) -> (f32, f32) {
-    let p = pan.clamp(-1.0, 1.0);
-    if p > 0.0 { (1.0 - p, 1.0) } else { (1.0, 1.0 + p) }
-}
 
 /// `dst := src` (容量の範囲で。RT 確保なし — 両者とも `MAX_EVENTS` 容量で確保済み)。
 fn copy_midi(dst: &mut Vec<TimedNoteEvent>, src: &[TimedNoteEvent]) {
@@ -1308,8 +1300,8 @@ mod tests {
         let mut bus = (vec![1.0; 4], vec![1.0; 4]);
         let mut midi = Vec::with_capacity(MAX_EVENTS);
         run(&song, 4, &mut bus, &mut midi);
-        let (pl, pr) = chain_pan_gains(-1.0);
-        // c1: 0.5 (中央 = unity) / c2: 0 / c3: pan hard L (L=1, R=0)。
+        let (pl, pr) = common::audio_render::pan_gains(-1.0);
+        // c1: 0.5 (中央 = unity) / c2: 0 / c3: pan hard L (L=√2 = +3 dB, R=0)。
         let want_l = 0.5 + pl;
         let want_r = 0.5 + pr;
         for i in 0..4 {

@@ -47,7 +47,8 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
 /// - 片側いっぱいで、振った側 √2 (+3.01 dB)、反対側 0。
 /// - 左² + 右² は常に 2 (パワー一定)。
 ///
-/// audio event の pan (`daw_audio::audio_clip_renderer`) も同じ式なので、ここを呼ぶ。
+/// Parallel の chain の pan (`daw_audio::graph::program`) と audio event の pan
+/// (`daw_audio::audio_clip_renderer`) も同じ式なので、ここを呼ぶ (Live も chain の pan は同じ則)。
 ///
 /// **これが pan 則の SSoT** (掛けるのは `daw_audio::mixer::apply_strip` だけ)。焼き込み (Bounce / Glue) は
 /// フェーダーの段そのものを通さない (`RenderScope::Sources` / `PostFx`、`daw_audio::mixer::pass_strip`) ので、
@@ -57,8 +58,12 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
 #[inline]
 #[must_use]
 pub fn pan_gains(pan: f32) -> (f32, f32) {
-    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-    (angle.cos() * std::f32::consts::SQRT_2, angle.sin() * std::f32::consts::SQRT_2)
+    // √2·cos(π/4 + a) = cos a − sin a、√2·sin(π/4 + a) = cos a + sin a (a = pan·π/4)。
+    // 加法定理で展開した形にしておくと、中央 (a = 0) が丸め無しで厳密に 1.0 になる
+    // (√2·cos(π/4) を f32 で計算すると 0.99999994 になり、素通しがビット一致しない)。
+    let a = pan.clamp(-1.0, 1.0) * std::f32::consts::FRAC_PI_4;
+    let (c, s) = (a.cos(), a.sin());
+    (c - s, c + s)
 }
 
 /// Fade カーブそのもの: 正規化した進度 `progress` (0 = fade 開始 = 無音、
@@ -910,8 +915,8 @@ mod tests {
     #[test]
     fn pan_law_is_unity_at_center_and_plus_3db_at_the_extremes() {
         let db = |g: f32| 20.0 * g.log10();
-        let (l, r) = pan_gains(0.0);
-        assert!((l - 1.0).abs() < 1e-6 && (r - 1.0).abs() < 1e-6, "center = ({l}, {r})");
+        // 中央はビット単位で素通し (空 chain の Parallel / group の段が音を 1 bit も変えない)。
+        assert_eq!(pan_gains(0.0), (1.0, 1.0));
         let (l, r) = pan_gains(1.0);
         assert!(l.abs() < 1e-6 && (db(r) - 3.0103).abs() < 1e-3, "hard right = ({l}, {r})");
         let (l, r) = pan_gains(-1.0);
