@@ -17,6 +17,10 @@ mod image_event_section;
 mod launch_section;
 /// 口パク出力先トラックの「口形状 → 画像」 セクション。
 mod mouth_map_section;
+/// r.md #129: 内蔵 device の Par パネル (格子の寸法 `layout` はテストが座標を求めるのに使う)。
+pub mod native_panel;
+/// r.md #129: chain list の内蔵 device の行と展開、 master の末尾 (Post-Fader / Limiter)。
+mod native_row;
 mod parallel_header;
 /// chain list の plugin 行と、 その直下の展開 (SC パネル / param パネル)。
 mod plugin_row;

@@ -16,7 +16,7 @@ pub use crate::device_addr::{
 };
 /// インスペクタの chain list の行モデルは [`crate::chain_rows`] が持つ (同じく不変条件 9 で
 /// 切り出した)。
-pub use crate::chain_rows::{ChainEntry, ChainRow, ChainRowKind, SidechainPort};
+pub use crate::chain_rows::{ChainEntry, ChainRow, ChainRowKind, NativeRowEntry, SidechainPort};
 /// ノート集合のピュアな編集ロジックは [`crate::note_ops`] が持つ (同じく不変条件 9 で切り出した)。
 pub(crate) use crate::note_ops::{copy_notes_into, duplicate_notes_into, remap_indices, resolve_note_overlaps};
 /// 色編集の宛先は [`crate::color_target`] が持つ (同じく不変条件 9 で切り出した)。
@@ -116,6 +116,10 @@ pub enum PluginCategory {
     /// 内蔵 GPU 映像効果 (`builtin.video.*`、feature `video-effect`)。
     /// GUI 描画パスで処理する device。チェーンに刺さるが audio バスは素通り。
     Video,
+    /// r.md #129 (Q8): daw_audio が in-process で処理する内蔵 device (Comp / EQ / Bus Comp / Tone EQ)。
+    /// DB に載らず、picker の先頭に固定順でまとまって出る。種別フィルタでは FX として扱う
+    /// ([`Self::matches_filter`])。
+    Native,
 }
 
 impl PluginCategory {
@@ -141,7 +145,14 @@ impl PluginCategory {
             Self::Fx => "FX",
             Self::MidiFx => "MIDI",
             Self::Video => "映像",
+            Self::Native => "内蔵",
         }
+    }
+
+    /// 種別フィルタ (`f ` 等の接頭辞) `filter` に一致するか。内蔵 device は audio FX なので `Fx` にも一致する。
+    #[must_use]
+    pub fn matches_filter(self, filter: Self) -> bool {
+        self == filter || (self == Self::Native && filter == Self::Fx)
     }
 }
 
@@ -176,13 +187,28 @@ pub fn track_with(f: impl FnOnce(&mut Track)) -> Track {
 }
 
 impl PluginPickEntry {
-    /// r.md #110: ピッカーの全項目 = DB の plugin + 「Parallel」。 名前順。 起動時と DB 再走査の
-    /// 両方がこれを通る (SSoT)。
-    pub(crate) fn build_all(db: &common::plugin_db::PluginDatabase) -> Vec<Self> {
-        let mut v: Vec<Self> = db.entries.iter().map(Self::from_db_entry).collect();
-        v.push(Self::parallel_entry());
-        v.sort_by_key(|e| e.name.to_lowercase());
+    /// r.md #110 / #129 (Q8): ピッカーの全項目 = 内蔵 4 種 (`NativeKind::ALL` の固定順で先頭) +
+    /// 「Parallel」と DB の plugin (名前順)。 起動時と DB 再走査の両方がこれを通る (SSoT)。
+    /// DB が無い環境 (`None`) でも内蔵と Parallel は出る (追加は DB を引かない)。
+    pub(crate) fn build_all(db: Option<&common::plugin_db::PluginDatabase>) -> Vec<Self> {
+        let mut rest: Vec<Self> = db.map(|db| db.entries.iter().map(Self::from_db_entry).collect()).unwrap_or_default();
+        rest.push(Self::parallel_entry());
+        rest.sort_by_key(|e| e.name.to_lowercase());
+        let mut v: Vec<Self> = common::model::NativeKind::ALL.into_iter().map(Self::native_entry).collect();
+        v.append(&mut rest);
         v
+    }
+
+    /// 内蔵 device 1 種 (`NativeKind::picker_id`)。
+    pub(crate) fn native_entry(kind: common::model::NativeKind) -> Self {
+        Self {
+            id: kind.picker_id().to_string(),
+            name: kind.label().to_string(),
+            vendor: "daw_01".to_string(),
+            features: vec!["audio-effect".to_string(), "native".to_string()],
+            format_label: "builtin".to_string(),
+            category: PluginCategory::Native,
+        }
     }
 
     /// 「Parallel」 (`common::plugin_db::PARALLEL_PICKER_ID`): 並列 chain の container。 audio FX 扱い

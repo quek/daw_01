@@ -355,12 +355,46 @@ impl ClipboardEnvelope {
 
     /// OS clipboard から取った text を envelope として decode。magic 不一致 /
     /// decode 失敗 (= 他アプリの text) は `None` で no-op。
+    ///
+    /// r.md #129 (§6.6): 版は上げない方針 (上の [`CLIPBOARD_MAGIC`] の doc) なので、旧ビルドで
+    /// コピーしたトラック (`Track.strip` / `TrackBuiltin(Strip*)` のレーン) がそのまま来る。型へ
+    /// decode する前に JSON のまま組み込み native へ移す — 移さないと strip の設定が黙って消えるか、
+    /// 旧 target のレーンで decode に失敗して貼り付けが no-op になる。移行はプロジェクトの load と
+    /// 同じ関数 (`common::project::migrate_strips_in_track_value`、新形式のトラックには何もしない)。
     pub fn from_json(text: &str) -> Option<Self> {
-        let env: ClipboardEnvelope = serde_json::from_str(text).ok()?;
-        if env.magic != CLIPBOARD_MAGIC {
+        let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+        if value.get("magic").and_then(serde_json::Value::as_str) != Some(CLIPBOARD_MAGIC) {
             return None;
         }
-        Some(env)
+        migrate_legacy_tracks(&mut value);
+        serde_json::from_value(value).ok()
+    }
+}
+
+/// `Tracks` payload の各トラックの旧 strip を組み込み native へ移す (§6.6)。組み込みに振る id は
+/// payload 内のどの `id` よりも大きい値から (貼り付けで振り直すまでの間、payload の中で衝突しない)。
+fn migrate_legacy_tracks(envelope: &mut serde_json::Value) {
+    let Some(tracks) = envelope.pointer_mut("/payload/Tracks/tracks").and_then(serde_json::Value::as_array_mut) else {
+        return;
+    };
+    let mut next_id = tracks.iter().map(max_id_in).max().unwrap_or(0).saturating_add(1);
+    for copy in tracks {
+        if let Some(track) = copy.get_mut("track") {
+            common::project::migrate_strips_in_track_value(track, &mut next_id);
+        }
+    }
+}
+
+/// JSON の木にある `id` フィールドの最大値 (種類を問わない上界)。
+fn max_id_in(v: &serde_json::Value) -> u64 {
+    match v {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, child)| if k == "id" { child.as_u64().unwrap_or(0) } else { max_id_in(child) })
+            .max()
+            .unwrap_or(0),
+        serde_json::Value::Array(items) => items.iter().map(max_id_in).max().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -752,6 +786,70 @@ mod tests {
         let p = out[0].device.as_plugin().unwrap();
         assert_eq!(p.aux_inputs.len(), 64);
         assert_eq!(p.aux_outputs.len(), 64);
+    }
+
+    /// R-13 (§6.6): 旧ビルドでコピーしたトラック (strip + `StripComp` のレーン) は組み込み native に
+    /// 移り、レーンがその id を指す。新形式のトラックの組み込みは値も bypass も変わらない。
+    #[test]
+    fn legacy_track_copy_strips_become_builtin_natives_and_new_tracks_are_untouched() {
+        use common::model::{
+            AutomationLane, AutomationTarget, CompParam, Device, NativeDevice, NativeKind, NativeParamId, NativeParams,
+            TrackBuiltinParam,
+        };
+        let copy_of = |track: common::model::Track| {
+            ClipboardEnvelope::new(
+                3,
+                ClipboardPayload::Tracks(TracksCopy { tracks: vec![TrackCopy { order: 0, track, contents: Vec::new() }], scenes: Vec::new() }),
+            )
+        };
+        let natives = |env: &ClipboardEnvelope| -> Vec<NativeDevice> {
+            let ClipboardPayload::Tracks(t) = &env.payload else { panic!("tracks") };
+            let mut out = Vec::new();
+            common::model::for_each_native(&t.tracks[0].track.devices, &mut |n| out.push(*n));
+            out
+        };
+
+        // ---- 旧形式 ----
+        let old = crate::app_types::track_with(|t| {
+            t.id = 7;
+            t.automation_lanes.push(AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 0.5));
+        });
+        let mut v = serde_json::to_value(copy_of(old)).unwrap();
+        let t = &mut v["payload"]["Tracks"]["tracks"][0]["track"];
+        t.as_object_mut().unwrap().remove("devices");
+        t["strip"] = serde_json::json!({
+            "comp": {"on": true, "threshold_db": -20.0, "ratio": 4.0, "sc_listen": true},
+            "eq": {"on": false}
+        });
+        t["automation_lanes"][0]["target"] = serde_json::json!({"TrackBuiltin": {"StripComp": {"param": "Threshold"}}});
+        let env = ClipboardEnvelope::from_json(&v.to_string()).expect("旧形式のトラックも decode できる");
+        let n = natives(&env);
+        assert_eq!(n.iter().map(|d| (d.kind(), d.builtin, d.bypassed)).collect::<Vec<_>>(), vec![
+            (NativeKind::Comp, true, false),
+            (NativeKind::Eq, true, true),
+        ]);
+        let NativeParams::Comp(c) = n[0].params else { panic!("comp") };
+        assert_eq!((c.threshold_db, c.ratio), (-20.0, 4.0), "strip の値を保つ");
+        assert!(n[0].id != 0 && n[0].id != n[1].id);
+        let ClipboardPayload::Tracks(tracks) = &env.payload else { panic!("tracks") };
+        assert_eq!(
+            tracks.tracks[0].track.automation_lanes[0].target,
+            AutomationTarget::NativeParam { device_id: n[0].id, param: NativeParamId::Comp(CompParam::Threshold) },
+            "レーンは移した組み込み Comp の id を指す"
+        );
+
+        // ---- 新形式 (組み込みの値を上書きしない) ----
+        let mut comp = NativeDevice::new_builtin(NativeKind::Comp, 11);
+        comp.bypassed = false;
+        assert!(comp.set_param(NativeParamId::Comp(CompParam::Threshold), -30.0));
+        let new = crate::app_types::track_with(|t| {
+            t.id = 8;
+            t.devices = vec![Device::Native(comp), Device::Native(NativeDevice::new_builtin(NativeKind::Eq, 12))];
+        });
+        let env = ClipboardEnvelope::from_json(&copy_of(new).to_json().unwrap()).expect("decode");
+        let n = natives(&env);
+        assert_eq!(n[0], comp, "新形式の組み込みは値も bypass も id も変わらない");
+        assert_eq!(n.len(), 2);
     }
 
     #[test]

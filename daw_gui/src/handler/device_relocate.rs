@@ -13,8 +13,9 @@
 //! 落とし先は [`ChainRef`] (top-level か Parallel 内 chain)。 Parallel を自分の中の chain へ
 //! 落とすのは循環なので拒む。
 use crate::app_types::*;
+use crate::handler::device_guard::{self, DeviceOp};
 use crate::state::*;
-use common::model::{ChainRef, Device, InstrumentSource, plugins};
+use common::model::{ChainRef, Device, InstrumentSource, OrdinalPolicy, plugins};
 
 impl AppData {
     // -------- r.md #71: device の運搬 (移動 / コピー) ----------------------
@@ -27,9 +28,13 @@ impl AppData {
     /// - コピー: 落とし先 device の `initial_state` が「いまのツマミ」になる。
     /// - 移動: instance は作り直さないが、undo snapshot が最新 state を捕まえる。
     pub(crate) fn relocate_devices(&mut self, req: RelocateDevices) {
-        if req.device_ids.is_empty() {
+        // r.md #129 (Q5): 組み込みは普通のドラッグでは所属トラックの最上位の中でしか動かせない
+        // (Ctrl のコピーはどこへでも)。 運べるものが無ければ round-trip も積まない。
+        let device_ids = self.permit_or_explain(&req.device_ids, DeviceOp::Relocate { dest: req.dest, copy: req.copy });
+        if device_ids.is_empty() {
             return;
         }
+        let req = RelocateDevices { device_ids, ..req };
         if !self.song_has_plugin() {
             self.relocate_devices_inner(&req);
             return;
@@ -115,6 +120,9 @@ impl AppData {
         if !outcome.moved_devices.is_empty() {
             self.sync_recording_lanes_with_audio();
         }
+        // r.md #129 (Q18): 移動した行は Par を閉じた状態から始める (同じトラック内の並べ替えも)。
+        // コピーは新 id なので最初から閉じている。
+        self.close_rack_panels_of(&outcome.moved_nodes);
 
         // コピーで作った device を host に実体化する。 **finalize を先に積む**
         // (load 応答が先に届いたときに取りこぼさないため)。 `OpenPluginShmem` は
@@ -160,8 +168,10 @@ impl AppData {
         ));
     }
 
-    /// Ctrl+X (device 面)。copy → 削除を 1 undo step。
+    /// Ctrl+X (device 面)。copy → 削除を 1 undo step。 組み込み内蔵 device は切り取れない
+    /// (クリップボードにも載せない、 Q5)。
     pub(crate) fn cut_devices(&mut self, device_ids: Vec<u64>) {
+        let device_ids = self.permit_or_explain(&device_ids, DeviceOp::Cut);
         if device_ids.is_empty() {
             return;
         }
@@ -183,8 +193,13 @@ impl AppData {
     /// cut 本体。serialize → `pending_clipboard_write` → 削除。呼び出し側で
     /// undo snapshot 済み (deferred 経由 or 即時 fallback)。
     pub(crate) fn cut_devices_inner(&mut self, device_ids: &[u64]) {
-        self.write_devices_to_clipboard(device_ids, "カット");
-        self.remove_devices_inner(device_ids);
+        // deferred 実行でも実行時の Song で組み込みを落とし直す (書き込みと削除は同じ id 列)。
+        let ids = device_guard::permitted_ids(self.cur.song_doc.song(), device_ids, DeviceOp::Cut);
+        if ids.is_empty() {
+            return;
+        }
+        self.write_devices_to_clipboard(&ids, "カット");
+        self.remove_devices_inner(&ids);
     }
 
     /// copy / cut 共通: serialize して `pending_clipboard_write` に積み、
@@ -303,7 +318,6 @@ impl AppData {
             let mut created: Vec<Device> = Vec::new();
             for dc in &ordered {
                 let mut dev = dc.device.clone();
-                assign_fresh_ids(song, std::slice::from_mut(&mut dev));
                 let from_other_track = dc.source_track != dest_track;
                 common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                     // 別トラックへ運んだ ARA アーカイブは復元できない (persistent_id が
@@ -315,9 +329,13 @@ impl AppData {
                 resolve_aux_refs_after_paste(song, &mut dev);
                 created.push(dev);
             }
+            // 新 id・内蔵は追加分・番号 (`Fresh`) は一括で 1 回 (r.md #129 §5.7)。
+            song.prepare_device_copies(dest_track, &mut created);
             if let Some(chain) = song.chain_devices_mut(dest) {
                 chain.splice(at..at, created.iter().cloned());
             }
+            // 持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。
+            song.drop_cyclic_aux_routes(&[dest_track]);
             apply_dest_side_effects(song, dest_track, &created);
             created
         });
@@ -422,25 +440,10 @@ struct RelocateOutcome {
     /// lane が無くても gesture だけ立っていることがあるので、 lane 由来ではなく
     /// device 由来で洗う)。
     moved_devices: Vec<(u32, u32, u64)>,
+    /// 移動した node 全部 (同じトラック内の並べ替えを含む)。Par を閉じる対象 (Q18)。
+    moved_nodes: Vec<u64>,
     /// コピーで新規に作った device (中の plugin を host へ実体化する対象)。
     created: Vec<Device>,
-}
-
-/// `devices` 以下の plugin / Parallel / chain 全部に新しい id を振る (コピー / 貼り付け)。
-fn assign_fresh_ids(song: &mut common::model::Song, devices: &mut [Device]) {
-    common::model::for_each_node_id_mut(devices, &mut |id| *id = song.alloc_device_id());
-}
-
-/// `dest` が `device_id` (Parallel) の **中** の chain か (= 自分の中へ落とす循環)。
-fn dest_inside_device(song: &common::model::Song, device_id: u64, dest: ChainRef) -> bool {
-    let ChainRef::Chain(cid) = dest else {
-        return false;
-    };
-    song.parallel_by_id(device_id).is_some_and(|r| {
-        r.chains
-            .iter()
-            .any(|c| c.id == cid || common::model::chain_devices_in(&c.devices, cid).is_some())
-    })
 }
 
 /// 運搬の Song 側処理 (純関数)。 `None` = 落とし先チェーンが無い / 対象ゼロ。
@@ -453,13 +456,17 @@ fn relocate_in_song(
 ) -> Option<RelocateOutcome> {
     let dest_track = song.chain_owner_track(dest)?;
     // 解決できない id は捨てる (削除済み device への stale 要求は正常系)。
-    // Parallel を自分の中の chain へ落とすのは循環なので、その id も落とす。
+    // 運べない id (Parallel を自分の中の chain へ / 組み込みを所属トラックの最上位の外へ) も落とす
+    // — 規則は `Song::can_relocate` 1 本 (Rack の drop slot の判定と同じ)。
     let targets: Vec<(u64, u32, ChainRef, usize)> = device_ids
         .iter()
         .filter_map(|&id| {
+            if !song.can_relocate(id, dest, copy) {
+                return None;
+            }
             let (chain, index) = song.find_device(id)?;
             let owner = song.chain_owner_track(chain)?;
-            (!dest_inside_device(song, id, dest)).then_some((id, owner, chain, index))
+            Some((id, owner, chain, index))
         })
         .collect();
     if targets.is_empty() {
@@ -472,6 +479,7 @@ fn relocate_in_song(
         result_ids: Vec::new(),
         lane_remap: Vec::new(),
         moved_devices: Vec::new(),
+        moved_nodes: Vec::new(),
         created: Vec::new(),
     };
 
@@ -482,7 +490,6 @@ fn relocate_in_song(
                 continue;
             };
             let mut dev = src.clone();
-            assign_fresh_ids(song, std::slice::from_mut(&mut dev));
             let cross = src_track != dest_track;
             common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                 // `state` (= いまのツマミ) は引き継ぐ (`Arc` の clone なのでコストゼロ)。
@@ -494,10 +501,14 @@ fn relocate_in_song(
             retarget_self_track_aux(&mut dev, src_track, dest_track);
             copies.push(dev);
         }
+        // 新 id・内蔵は追加分 (組み込みのコピーも「Comp 2」)・番号 (`Fresh`) は一括で 1 回 (§5.7)。
+        song.prepare_device_copies(dest_track, &mut copies);
         let at = (dest_index as usize).min(song.chain_devices(dest)?.len());
         if let Some(chain) = song.chain_devices_mut(dest) {
             chain.splice(at..at, copies.iter().cloned());
         }
+        // 持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。
+        song.drop_cyclic_aux_routes(&[dest_track]);
         // 副作用は **dest 側だけ** (src はそのまま残るので降ろさない)。
         apply_dest_side_effects(song, dest_track, &copies);
         outcome.result_ids = copies.iter().map(Device::id).collect();
@@ -512,6 +523,7 @@ fn relocate_in_song(
         .iter()
         .filter(|&&(_, _, chain, i)| chain == dest && (i as u32) < dest_index)
         .count();
+    let ordinals = cross_track_ordinals(song, &targets, dest_track);
     // 指定順 (= チェーン表示順) に抜く。 id で抜くので index のずれは起きない。
     let mut taken: Vec<(Device, u32)> = Vec::new();
     for &(id, src_track, _, _) in &targets {
@@ -526,7 +538,13 @@ fn relocate_in_song(
     let mut left_by_track: std::collections::HashMap<u32, Vec<String>> =
         std::collections::HashMap::new();
     for (mut dev, src_track) in taken {
+        common::model::for_each_node_id(std::slice::from_ref(&dev), &mut |id| outcome.moved_nodes.push(id));
         if src_track != dest_track {
+            common::model::for_each_native_mut(std::slice::from_mut(&mut dev), &mut |n| {
+                if let Some(&o) = ordinals.get(&n.id) {
+                    n.ordinal = o;
+                }
+            });
             move_device_bindings(song, &dev, src_track, dest_track, &mut outcome);
             common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                 left_by_track
@@ -548,12 +566,42 @@ fn relocate_in_song(
     if let Some(chain) = song.chain_devices_mut(dest) {
         chain.splice(at..at, moved.iter().cloned());
     }
+    if !outcome.moved_devices.is_empty() {
+        // トラックを跨いで持ち込んだサイドチェインのうち依存が循環するものは落とす (§5.9)。 先に
+        // dest 上の配線 (持ち込んだもの) を判定し、 残った循環 (運んだ Parallel の chain を他トラックが
+        // 読んでいる) だけを他トラック側で落とす。
+        song.drop_cyclic_aux_routes(&[dest_track]);
+        let all: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
+        song.drop_cyclic_aux_routes(&all);
+    }
     // 副作用の対称化: src 側は「他に残っていなければ降ろす」、 dest 側は立てる。
     for (src_track, left) in left_by_track {
         apply_src_side_effects(song, src_track, &left);
     }
     apply_dest_side_effects(song, dest_track, &moved);
     Some(outcome)
+}
+
+/// トラックを跨いで運ぶ内蔵 device の番号 (K9: 空いていれば保つ、 衝突すれば空き番号)。
+///
+/// 使用中の番号は **dest の木 (同じトラックから一緒に動かすものを含む)** なので、 抜く前の Song で
+/// 決める (抜いた後に決めると、 並べ替え中の同トラックの番号と衝突しうる)。 戻り値は native id → 番号。
+fn cross_track_ordinals(
+    song: &common::model::Song,
+    targets: &[(u64, u32, ChainRef, usize)],
+    dest_track: u32,
+) -> std::collections::HashMap<u64, u16> {
+    let mut cross: Vec<Device> = targets
+        .iter()
+        .filter(|t| t.1 != dest_track)
+        .filter_map(|t| song.device_by_id(t.0).cloned())
+        .collect();
+    song.assign_native_ordinals(dest_track, &mut cross, OrdinalPolicy::KeepIfFree);
+    let mut out = std::collections::HashMap::new();
+    common::model::for_each_native(&cross, &mut |n| {
+        out.insert(n.id, n.ordinal);
+    });
+    out
 }
 
 /// track を跨いで運ぶ device (Parallel なら中の plugin / native / chain 全部) の automation

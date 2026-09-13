@@ -230,6 +230,9 @@ impl AppData {
             for (off, (_, t)) in built.into_iter().enumerate() {
                 song.tracks.insert((insert_idx + off).min(song.tracks.len()), t);
             }
+            // r.md #129 (§5.9): 貼った先の group の下で依存が循環するサイドチェイン (子から親を読む等) は
+            // 落とす (循環すると engine が空の schedule にして master が無音になる)。
+            song.drop_cyclic_aux_routes(&new_ids);
             // 行の不変条件 (孤児セル / 消えたセルを指す主導権 / 死んだ列への Jump) は
             // model が持つ。貼り付けた行にも同じ規則を通す (冪等なので既存行は不変)。
             song.normalize_session();

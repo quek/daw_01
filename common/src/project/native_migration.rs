@@ -42,7 +42,14 @@ pub(crate) fn migrate_strips_to_native(song: &mut Value) {
 
 /// トラック 1 本分 (`devices` の組み込み補充 + track store の target 書き換え)。クリップボードの
 /// 旧形式 (`TracksCopy`) でも使う。`next_id` は衝突しない device id の次の値。
+///
+/// 旧形の印が無いトラック (新形式 / strip 導入前) には何もしない — `strip` キーの不在を
+/// 「既定値の strip」と読むと、新形式の組み込みの値を既定値 + bypass で上書きしてしまう。
+/// 組み込みの補充はその場合 `normalize_native_devices` が担う。
 pub fn migrate_strips_in_track_value(track: &mut Value, next_id: &mut u64) {
+    if !track_has_legacy_strips(track) {
+        return;
+    }
     let Some(t) = track.as_object_mut() else { return };
     let strip = t.remove("strip").unwrap_or(Value::Null);
     let (comp, comp_bypassed) = take_section_on(strip.get("comp"));
@@ -74,12 +81,21 @@ fn migrate_master_strip(song: &mut Map<String, Value>, next: &mut u64) {
     }
 }
 
-/// 旧形の印が 1 つでもあるか。
+/// song に旧形の印が 1 つでもあるか。
 fn has_legacy_strips(song: &Value) -> bool {
     let tracks = song.get("tracks").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    if song.get("master_strip").is_some() || tracks.iter().any(|t| t.get("strip").is_some()) {
-        return true;
-    }
+    song.get("master_strip").is_some()
+        || tracks.iter().any(track_has_legacy_strips)
+        || has_legacy_targets([song.get("song_lanes"), song.get("song_mod_routings")])
+}
+
+/// トラック 1 本に旧形の印 (`strip` キー / 旧形の target) があるか。
+fn track_has_legacy_strips(track: &Value) -> bool {
+    track.get("strip").is_some() || has_legacy_targets([track.get("automation_lanes"), track.get("mod_routings")])
+}
+
+/// lane / routing の配列に旧形の target (`TrackBuiltin(Strip*)` / `MasterStrip(..)`) があるか。
+fn has_legacy_targets<'a>(lists: impl IntoIterator<Item = Option<&'a Value>>) -> bool {
     let is_legacy = |target: &Value| {
         target.get("MasterStrip").is_some()
             || target.get("TrackBuiltin").is_some_and(|b| {
@@ -87,11 +103,7 @@ fn has_legacy_strips(song: &Value) -> bool {
                 matches!(name, Some("StripEqOn" | "StripCompOn" | "StripEq" | "StripComp"))
             })
     };
-    let lists = tracks
-        .iter()
-        .flat_map(|t| [t.get("automation_lanes"), t.get("mod_routings")])
-        .chain([song.get("song_lanes"), song.get("song_mod_routings")]);
-    lists.flatten().filter_map(Value::as_array).flatten().filter_map(|e| e.get("target")).any(is_legacy)
+    lists.into_iter().flatten().filter_map(Value::as_array).flatten().filter_map(|e| e.get("target")).any(is_legacy)
 }
 
 /// 全トラックの `devices` と `master_fx_chain` にある node id (plugin / native / Parallel / chain) の最大。

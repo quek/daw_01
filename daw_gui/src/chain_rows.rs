@@ -40,11 +40,43 @@ pub struct ChainEntry {
     pub sc_wired: bool,
 }
 
+/// r.md #129 (`docs/plan_rack_native_devices.md` §10.5): 内蔵 device (`Device::Native`) の行の表示情報。
+/// 値 (params) は持たない — 行ミニ表示と Par は描画時に Song から live 値を引く (複製しない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRowEntry {
+    pub device_id: u64,
+    pub kind: common::model::NativeKind,
+    /// 組み込み (× を出さない / Parallel に入れない / 普通のドラッグで他トラックへ運べない)。
+    pub builtin: bool,
+    /// 行の名前 (`NativeDevice::display_name`: 「Comp」 / 「Comp 2」)。
+    pub name: std::borrow::Cow<'static, str>,
+    /// OFF (`NativeDevice::bypassed`)。 名前と小表示を薄く描く。
+    pub bypassed: bool,
+    /// 外部サイドチェインが配線済み (`SC▾` の強調)。 SC を受けない種類は常に `false`。
+    pub sc_wired: bool,
+}
+
+impl NativeRowEntry {
+    #[must_use]
+    pub fn of(n: &common::model::NativeDevice) -> Self {
+        Self {
+            device_id: n.id,
+            kind: n.kind(),
+            builtin: n.builtin,
+            name: n.display_name(),
+            bypassed: n.bypassed,
+            sc_wired: n.sidechain_input().is_some(),
+        }
+    }
+}
+
 /// r.md #110 (`docs/plan_parallel.md` §6.1): インスペクタの chain list の 1 行の種類。
 /// device ツリーを「縦回転 Live 型」に flatten したもの。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChainRowKind {
     Plugin(ChainEntry),
+    /// r.md #129: 内蔵 device (組み込み / 追加分)。
+    Native(NativeRowEntry),
     /// `╭ Parallel名` (開始行)。 `open` = 中身 (chain 行 〜 終了行) を出しているか。
     ParallelBegin {
         parallel_id: u64,
@@ -108,10 +140,11 @@ pub struct ChainRow {
 }
 
 impl ChainRow {
-    /// 選択集合 (`selected_device_ids`) に入る id (plugin / Parallel / chain)。 操作行は `None`。
+    /// 選択集合 (`selected_device_ids`) に入る id (plugin / 内蔵 / Parallel / chain)。 操作行は `None`。
     pub fn select_id(&self) -> Option<u64> {
         match &self.kind {
             ChainRowKind::Plugin(e) => Some(e.device_id),
+            ChainRowKind::Native(n) => Some(n.device_id),
             ChainRowKind::ParallelBegin { parallel_id, .. } => Some(*parallel_id),
             ChainRowKind::Chain { chain_id, .. } => Some(*chain_id),
             _ => None,
@@ -119,10 +152,32 @@ impl ChainRow {
     }
 
     /// この行を掴んだときに一緒に運ぶ device の id (Parallel 行は Parallel 1 つ = 中身ごと)。
+    /// 組み込みも掴める (並べ替えは自由、 運べる先は `handler::device_guard` が絞る)。
     pub fn drag_id(&self) -> Option<u64> {
         match &self.kind {
             ChainRowKind::Plugin(e) => Some(e.device_id),
+            ChainRowKind::Native(n) => Some(n.device_id),
             ChainRowKind::ParallelBegin { parallel_id, .. } => Some(*parallel_id),
+            _ => None,
+        }
+    }
+
+    /// この行の直下に開く Par の鍵 (Par を持たない行は `None`)。
+    pub fn panel_key(&self) -> Option<common::model::RackPanelKey> {
+        match &self.kind {
+            ChainRowKind::Plugin(e) if e.shows_param_panel() => Some(common::model::RackPanelKey::Device(e.device_id)),
+            ChainRowKind::Native(n) => Some(common::model::RackPanelKey::Device(n.device_id)),
+            _ => None,
+        }
+    }
+
+    /// この行に hover して `Q` を押したときの宛先 (plugin / 内蔵 / Parallel)。
+    pub fn bypass_target(&self) -> Option<crate::handler::bypass_target::BypassTarget> {
+        use crate::handler::bypass_target::BypassTarget;
+        match &self.kind {
+            ChainRowKind::Plugin(e) => Some(BypassTarget::Device(e.device_id)),
+            ChainRowKind::Native(n) => Some(BypassTarget::Device(n.device_id)),
+            ChainRowKind::ParallelBegin { parallel_id, .. } => Some(BypassTarget::Device(*parallel_id)),
             _ => None,
         }
     }

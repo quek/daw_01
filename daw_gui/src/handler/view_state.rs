@@ -159,6 +159,8 @@ impl AppData {
         self.cur.view.audio_editor_views.clear();
         // r.md #65: 別プロジェクトの窓位置が漏れないよう per-clip view と同様に先にクリア。
         self.cur.view.plugin_editor_windows.clear();
+        // r.md #129 (Q18): 開いている Par も同じ (`view = None` の旧ファイルでも前プロジェクトを持ち越さない)。
+        self.cur.view.open_rack_panels.clear();
         self.set_loop_region(loop_region);
         // 消えたレーンのキーは捨てる (`automation_lane_row_overrides` と同じ)。
         self.cur.view.hidden_automation_lanes = hidden_automation_lanes
@@ -188,8 +190,15 @@ impl AppData {
             .collect();
         self.cur.view.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
         self.cur.view.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
-        // r.md #129 (Q18): 開いている Par。存在しない id は描画も保存もされないので、そのまま入れる。
-        self.cur.view.open_rack_panels = v.open_rack_panels.into_iter().collect();
+        // r.md #129 (Q18): 開いている Par。現存する device の分だけ入れる (Limiter は常に居る)。
+        self.cur.view.open_rack_panels = v
+            .open_rack_panels
+            .into_iter()
+            .filter(|k| match k {
+                common::model::RackPanelKey::Device(id) => self.cur.song_doc.song().device_by_id(*id).is_some(),
+                common::model::RackPanelKey::MasterLimiter => true,
+            })
+            .collect();
         // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
         // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
         self.cur.view.automation_lane_row_overrides = v

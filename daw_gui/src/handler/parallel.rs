@@ -5,6 +5,7 @@
 //! solo は `SetChain*` の値のみ IPC で即時に engine へも流す (track の M/S と同じ:
 //! LoadSong の再 compile を待たずに効く)。
 use crate::app_types::*;
+use crate::handler::device_guard::DeviceOp;
 use crate::state::*;
 use common::model::{ChainRef, Device, MASTER_TRACK_ID, Parallel, ParallelChain, Split};
 use common::protocol::AudioCommand;
@@ -30,7 +31,9 @@ impl AppData {
 
     /// Group (Live の Ctrl+G): 選んだ device を順に抜き、 先頭の位置に Parallel (chain 1 本に
     /// 格納) を挿す。 選択に Parallel が混ざっていれば中身ごと入れ子になる。
+    /// 組み込み内蔵 device は Parallel に入れない (Q5): 選択から落とし、 組み込みしか無ければ何もしない。
     pub(crate) fn group_devices(&mut self, device_ids: Vec<u64>) {
+        let device_ids = self.permit_or_explain(&device_ids, DeviceOp::Group);
         if device_ids.is_empty() {
             return;
         }
@@ -117,16 +120,19 @@ impl AppData {
         let _ = added;
     }
 
-    /// chain を複製 (中身ごと、 id は新採番)。 直後に挿す。
+    /// chain を複製 (中身ごと、 id は新採番、 内蔵は追加分として番号を振り直す)。 直後に挿す。
     pub(crate) fn duplicate_parallel_chain(&mut self, chain_id: u64) {
         self.edit_song_checked(move |song| {
+            let Some(owner) = song.chain_owner_track(ChainRef::Chain(chain_id)) else {
+                return false;
+            };
             let Some((parallel, chain)) = song.chain_by_id(chain_id) else {
                 return false;
             };
             let parallel_id = parallel.id;
             let mut copy = chain.clone();
             copy.name = format!("{} copy", chain.name);
-            common::model::for_each_node_id_mut(&mut copy.devices, &mut |id| *id = song.alloc_device_id());
+            song.prepare_device_copies(owner, &mut copy.devices);
             copy.id = song.alloc_device_id();
             let ancestors = ancestor_colors(song, ChainRef::Chain(0), Some(parallel_id));
             let Some(parallel) = song.parallel_by_id_mut(parallel_id) else {
@@ -412,9 +418,15 @@ impl AppData {
                     parallel_band: None,
                 }),
                 Device::Parallel(r) => self.push_parallel_rows(r, chain, i as u32, depth, bars, rows),
-                // r.md #129: 内蔵 device は Rack に行を持たない (編集面は Mixer 帯 / マスターパネル)。
-                // `index` はチェーン内の位置なので、行を出さなくても drop 位置は正しく解ける。
-                Device::Native(_) => {}
+                // r.md #129: 内蔵 device も plugin と同じ 1 行 (名前 + 小表示 + [Par])。
+                Device::Native(n) => rows.push(ChainRow {
+                    kind: ChainRowKind::Native(NativeRowEntry::of(n)),
+                    chain,
+                    index: i as u32,
+                    depth,
+                    bars: bars.to_vec(),
+                    parallel_band: None,
+                }),
             }
         }
     }
@@ -550,6 +562,43 @@ impl AppData {
                 }
             })
             .collect()
+    }
+
+    /// `device_id` の sidechain (aux 入力) の source 候補 = 「—」 + **このトラックの入力 (Pre-FX)** +
+    /// 他 track + 同 track の Parallel 内 chain。 自 track は Pre-FX だけ (出力側は feedback)。
+    ///
+    /// r.md #129 (§10.13): 配線すると依存が循環する行き先 (例: 子トラックの Comp から親 group) は
+    /// 出さない。 判定は `Song::set_aux_input` の拒否と同じ Structural の依存 graph (1 回だけ組む)。
+    /// follower の候補 ([`Self::tap_source_choices`]) は依存辺を作らないので絞らない。
+    pub fn sidechain_source_choices(&self, device_id: u64) -> Vec<SidechainSourceChoice> {
+        use common::model::TapSource;
+        use common::routing_deps::{EdgeScope, TrackDeps};
+        let song = self.cur.song_doc.song();
+        let mut v = self.tap_source_choices(true);
+        if let Some(tid) = self.cursor_track_id()
+            && tid != MASTER_TRACK_ID
+        {
+            v.insert(
+                1,
+                SidechainSourceChoice {
+                    label: "このトラックの入力 (Pre-FX)".into(),
+                    source: Some(TapSource::Track(tid)),
+                },
+            );
+        }
+        let Some(owner) = song.device_owner_track(device_id) else {
+            return v;
+        };
+        let deps = TrackDeps::build(song, EdgeScope::Structural);
+        v.retain(|c| {
+            let producer = match c.source {
+                None => return true,
+                Some(TapSource::Track(t)) => Some(t),
+                Some(TapSource::Chain(cid)) => song.chain_owner_track(ChainRef::Chain(cid)),
+            };
+            producer.is_none_or(|p| p == owner || !deps.would_cycle(owner, p))
+        });
+        v
     }
 
     /// sidechain / follower の source 候補: 「—」 + 他 track + 同 track の Parallel 内 chain

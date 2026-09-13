@@ -93,6 +93,7 @@ fn chain_rows_put_each_open_chains_devices_under_its_row() {
         .iter()
         .map(|r| match &r.kind {
             ChainRowKind::Plugin(e) => format!("P{}", e.device_id),
+            ChainRowKind::Native(n) => format!("N{}", n.name),
             ChainRowKind::ParallelBegin { parallel_id, .. } => format!("RB{parallel_id}"),
             ChainRowKind::SplitParams { parallel_id, .. } => format!("S{parallel_id}"),
             ChainRowKind::Chain { chain_id, open, .. } => {
@@ -119,6 +120,9 @@ fn chain_rows_put_each_open_chains_devices_under_its_row() {
             "+c".to_string(),
             "RE".to_string(),
             format!("P{delay}"),
+            // r.md #129: 組み込みの Comp / EQ も行を持つ (picker で足した device はその手前)。
+            "NComp".to_string(),
+            "NEQ".to_string(),
             "+pT".to_string(),
         ],
     );
@@ -227,7 +231,7 @@ fn sidechain_source_can_be_a_chain_of_the_same_track() {
     let parallel_id = app.cur.song_doc.song().tracks[0].devices[1].id();
     let chain_a = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap().chains[0].id;
     // 候補に 「Parallel / Chain 1」 が出る。
-    let choices = app.sidechain_source_choices();
+    let choices = app.sidechain_source_choices(delay);
     assert!(
         choices.iter().any(|c| c.source == Some(TapSource::Chain(chain_a))),
         "chain が source 候補に並ぶ: {choices:?}"
