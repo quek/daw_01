@@ -27,6 +27,8 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 mod audio_clip_renderer;
 mod audio_worker;
 mod automation;
+#[cfg(test)]
+mod dsp_golden;
 mod engine;
 mod engine_shared;
 mod export;
