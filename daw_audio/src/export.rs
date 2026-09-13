@@ -1122,8 +1122,7 @@ mod tests {
         };
         let content_id =
             song.alloc_content(ClipContent::Audio(AudioContent { events: vec![event], next_event_id: 2 }), "src".into());
-        let mut track = Track::default();
-        track.id = song.alloc_track_id();
+        let mut track = Track { id: song.alloc_track_id(), ..Track::default() };
         (track.volume, track.pan) = (volume, pan);
         track.place_clip(Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Clip::default() });
         let comp_id = song.alloc_device_id();

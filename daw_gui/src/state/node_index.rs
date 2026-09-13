@@ -89,8 +89,8 @@ impl NodeIndex {
         let path = &self.steps[loc.start..loc.start + loc.len];
         let (last, chain_steps) = path.split_last().ok_or(StaleIndex)?;
         let mut devices = store_devices(song, loc.store).ok_or(StaleIndex)?;
-        for pair in chain_steps.chunks_exact(2) {
-            devices = &chain_at(devices, pair[0], pair[1]).ok_or(StaleIndex)?.1.devices;
+        for &[parallel_idx, chain_idx] in chain_steps.as_chunks::<2>().0 {
+            devices = &chain_at(devices, parallel_idx, chain_idx).ok_or(StaleIndex)?.1.devices;
         }
         match devices.get(*last) {
             Some(d) if d.id() == id => Ok(Some((d, loc.owner))),
@@ -104,8 +104,8 @@ impl NodeIndex {
         let path = &self.steps[loc.start..loc.start + loc.len];
         let mut devices = store_devices(song, loc.store).ok_or(StaleIndex)?;
         let mut found = None;
-        for pair in path.chunks_exact(2) {
-            let (parallel, chain) = chain_at(devices, pair[0], pair[1]).ok_or(StaleIndex)?;
+        for &[parallel_idx, chain_idx] in path.as_chunks::<2>().0 {
+            let (parallel, chain) = chain_at(devices, parallel_idx, chain_idx).ok_or(StaleIndex)?;
             devices = &chain.devices;
             found = Some((parallel, chain));
         }
