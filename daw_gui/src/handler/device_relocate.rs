@@ -170,7 +170,7 @@ impl AppData {
 
     /// Ctrl+X (device 面)。copy → 削除を 1 undo step。 組み込み内蔵 device は切り取れない
     /// (クリップボードにも載せない、 Q5)。
-    pub(crate) fn cut_devices(&mut self, device_ids: Vec<u64>) {
+    pub fn cut_devices(&mut self, device_ids: Vec<u64>) {
         let device_ids = self.permit_or_explain(&device_ids, DeviceOp::Cut);
         if device_ids.is_empty() {
             return;

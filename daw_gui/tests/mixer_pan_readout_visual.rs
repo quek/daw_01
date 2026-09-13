@@ -29,7 +29,8 @@ use daw_ui_core::{FrameInput, UiHost};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{OffscreenRenderer, Scene};
 
-const W: u32 = 960;
+/// 画面幅。インスペクタの右に 680px の Mixer が残るように、インスペクタ幅に追従させる。
+const W: u32 = 680 + daw_gui::view::root::INSPECTOR_W as u32;
 const H: u32 = 900;
 
 /// `mixer_strips.rs` の layout 定数 (private なのでテスト側に写す)。 ここがズレたら

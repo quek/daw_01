@@ -26,6 +26,7 @@ mod modulation_bypass;
 mod modulation_follower_edit;
 mod modulation_id_hygiene;
 mod native_edit;
+mod native_rack;
 mod open_stays_clean;
 mod pending_state_queue;
 mod plugin_load_failure;
