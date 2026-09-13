@@ -292,54 +292,33 @@ impl AppData {
         tracing::info!(?groups_to_ungroup, "ungrouped tracks");
     }
 
-    /// Reparent `track_id` to `parent_id` (or detach to the master bus
-    /// when `parent_id` is None). Any track is allowed as a parent
-    /// (the "group" role is implicit — a track that has children).
-    /// Validates the new parent chain doesn't contain `track_id`
-    /// itself so the schedule compiler never sees a cyclic state.
-    pub(crate) fn action_set_track_parent(&mut self, track_id: u32, parent_id: Option<u32>) {
-        if Some(track_id) == parent_id {
-            tracing::warn!(track_id, "ignored self-parent edit");
-            return;
-        }
-        if let Some(pid) = parent_id {
-            if self.cur.song_doc.song().track_by_id(pid).is_none() {
-                tracing::warn!(track_id, parent_id = pid, "ignored: parent track not found");
-                return;
+    /// `AppEvent::SetTrackParent` (アレンジのヘッダ drop)。トラック群を `parent_id` の子にして
+    /// `anchor_after` の直後へ並べる。親のどれでもよい (group は「子を持つトラック」の暗黙の役割)。
+    ///
+    /// 規則 (実在 / 依存の循環 / 変化の有無) は `Song::move_tracks` 1 本が持つ。循環するなら Song も undo も
+    /// 変えずに理由を status に出す (循環した graph は engine が空の schedule にして master が無音になる)。
+    pub(crate) fn action_move_tracks(
+        &mut self,
+        track_ids: &[u32],
+        parent_id: Option<u32>,
+        anchor_after: Option<u32>,
+    ) {
+        let mut rejected = false;
+        let moved = self.edit_song_checked(|song| match song.move_tracks(track_ids, parent_id, anchor_after) {
+            Ok(changed) => changed,
+            Err(common::routing_deps::DependencyCycle) => {
+                rejected = true;
+                false
             }
-            // Walk the parent's chain upward looking for `track_id`. If
-            // we find it, the edit would create a cycle.
-            let mut cursor = Some(pid);
-            let mut hops = 0u32;
-            while let Some(c) = cursor {
-                if c == track_id {
-                    tracing::warn!(track_id, parent_id = pid, "ignored: would create a cycle");
-                    return;
-                }
-                hops += 1;
-                if hops > self.cur.song_doc.song().tracks.len() as u32 + 1 {
-                    // Existing graph already has a cycle; abort to avoid an infinite loop.
-                    tracing::error!("existing parent chain is cyclic; aborting reparent");
-                    return;
-                }
-                cursor = self
-                    .cur.song_doc.song()
-                    .track_by_id(c)
-                    .and_then(|t| t.parent_group_id);
-            }
-        }
-        let found = self.edit_song_checked(|song| {
-            let Some(track) = song.track_by_id_mut(track_id) else {
-                return false;
-            };
-            track.parent_group_id = parent_id;
-            true
         });
-        if !found {
-            tracing::warn!(track_id, "ignored: track not found");
+        if rejected {
+            self.ui_ephemeral.status_message =
+                "親子 / サイドチェイン / send の依存が循環するため、その位置へは移動できません".into();
             return;
         }
-        tracing::info!(track_id, ?parent_id, "track reparented");
+        if moved {
+            tracing::info!(?track_ids, ?parent_id, ?anchor_after, "tracks moved");
+        }
     }
 
     pub(crate) fn action_remove_last_track(&mut self) {

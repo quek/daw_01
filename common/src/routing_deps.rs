@@ -300,34 +300,103 @@ impl Song {
         true
     }
 
-    /// `track_ids` のトラック上の aux 配線のうち、Structural で循環するものを 1 本ずつ判定して落とす
-    /// (貼り付け / トラックを跨ぐ運搬で持ち込んだ配線用)。戻り値 = 1 本でも落としたか。
-    pub fn drop_cyclic_aux_routes(&mut self, track_ids: &[u32]) -> bool {
-        let mut changed = false;
-        for &owner in track_ids {
-            let Some(devices) = self.fx_chain_by_track_id(owner) else { continue };
-            let mut slots: Vec<(u64, u8)> = Vec::new();
-            crate::model::for_each_aux_input(devices, &mut |id, port, _| slots.push((id, port)));
-            for (id, port) in slots {
-                let Some(route) = self.device_by_id(id).and_then(|d| d.aux_input(port)).copied() else {
-                    continue;
-                };
-                let Some(producer) = self.tap_producer(route.tap.source) else { continue };
-                if producer == owner {
-                    continue;
-                }
-                let Some(slot) = self.device_by_id_mut(id).and_then(|d| d.aux_input_slot_mut(port)) else {
-                    continue;
-                };
-                *slot = None;
-                if TrackDeps::build(self, EdgeScope::Structural).would_cycle(owner, producer) {
-                    changed = true;
-                } else if let Some(slot) = self.device_by_id_mut(id).and_then(|d| d.aux_input_slot_mut(port)) {
-                    *slot = Some(route);
+    /// 編集が持ち込んだ aux 配線のうち、Structural で循環するものを 1 本ずつ判定して落とす
+    /// (device の貼り付け / コピー / 運搬、トラックの貼り付けの後に呼ぶ)。
+    ///
+    /// `brought` はその編集で置いた node の id 全部 (Parallel なら中身と chain も)。判定するのは次の 2 種だけで、
+    /// 無関係な既存の配線 (読み込んだファイルに元からある循環を含む) は触らない。
+    /// 1. `brought` の device 自身の配線 (持ち込んだもの。先に判定する)
+    /// 2. `brought` の chain を source に読む他の device の配線 (運んだ chain の持ち主が変わって辺が変わる)
+    ///
+    /// 戻り値 = 落とした本数。
+    pub fn drop_cyclic_aux_routes(&mut self, brought: &[u64]) -> usize {
+        let mut own: Vec<(u32, u64, u8)> = Vec::new();
+        let mut reading: Vec<(u32, u64, u8)> = Vec::new();
+        for (owner, c) in self.all_aux_consumers() {
+            for (port, route) in c.routes.iter().enumerate() {
+                let (Some(route), Ok(port)) = (route, u8::try_from(port)) else { continue };
+                if brought.contains(&c.device_id) {
+                    own.push((owner, c.device_id, port));
+                } else if matches!(route.tap.source, TapSource::Chain(chain) if brought.contains(&chain)) {
+                    reading.push((owner, c.device_id, port));
                 }
             }
         }
-        changed
+        own.into_iter().chain(reading).filter(|&(owner, id, port)| self.drop_aux_route_if_cyclic(owner, id, port)).count()
+    }
+
+    /// `owner` 上の device `id` の aux 入力 `port` を外した graph で、その配線が循環を作るなら外したままにする。
+    /// 自トラックを読む配線 (Pre-FX) は辺にならないので判定しない。戻り値 = 外したか。
+    fn drop_aux_route_if_cyclic(&mut self, owner: u32, id: u64, port: u8) -> bool {
+        let Some(route) = self.device_by_id(id).and_then(|d| d.aux_input(port)).copied() else {
+            return false;
+        };
+        let Some(producer) = self.tap_producer(route.tap.source) else { return false };
+        if producer == owner {
+            return false;
+        }
+        let Some(slot) = self.device_by_id_mut(id).and_then(|d| d.aux_input_slot_mut(port)) else {
+            return false;
+        };
+        *slot = None;
+        if TrackDeps::build(self, EdgeScope::Structural).would_cycle(owner, producer) {
+            return true;
+        }
+        if let Some(slot) = self.device_by_id_mut(id).and_then(|d| d.aux_input_slot_mut(port)) {
+            *slot = Some(route);
+        }
+        false
+    }
+
+    /// トラック群の親を `parent` (None = top-level) にし、`anchor_after` の直後 (None = 先頭、見つからなければ
+    /// 末尾) へ並べ替える。**親の付け替え (children 辺) の唯一の口** — アレンジのヘッダ drop と
+    /// `SetTrackParent` が通る (SC の [`Self::set_aux_input`]、send の [`Self::can_add_send`] と対)。
+    ///
+    /// 親が変わるトラック t ごとに、書き換える前の graph で `would_cycle(parent, t)` を判定し、1 本でも
+    /// 循環すれば何も書かずに `Err`。足す辺はすべて `parent` から出るので、新しい循環は `parent` を途中に
+    /// 含まない t → … → parent の道を持ち、その道は書き換える前の graph にもある (= この判定で過不足ない)。
+    /// 自分の子孫を親にするのも同じ判定に入る。読み込んだファイルに元からある循環は拒否の理由にしない
+    /// (親が変わらない並べ替えは判定しない)。
+    ///
+    /// 実在しない id は無視し、`parent` が実在しなければ何もしない。戻り値 = 並びか親が実際に変わったか。
+    pub fn move_tracks(
+        &mut self,
+        track_ids: &[u32],
+        parent: Option<u32>,
+        anchor_after: Option<u32>,
+    ) -> Result<bool, DependencyCycle> {
+        if let Some(p) = parent {
+            if self.track_by_id(p).is_none() {
+                return Ok(false);
+            }
+            let deps = TrackDeps::build(self, EdgeScope::Structural);
+            let cyclic = track_ids
+                .iter()
+                .copied()
+                .filter(|&t| self.track_by_id(t).is_some_and(|track| track.parent_group_id != parent))
+                .any(|t| deps.would_cycle(p, t));
+            if cyclic {
+                return Err(DependencyCycle);
+            }
+        }
+        let before: Vec<(u32, Option<u32>)> = self.tracks.iter().map(|t| (t.id, t.parent_group_id)).collect();
+        let mut moved: Vec<crate::model::Track> = Vec::with_capacity(track_ids.len());
+        for id in track_ids {
+            if let Some(pos) = self.tracks.iter().position(|t| t.id == *id) {
+                moved.push(self.tracks.remove(pos));
+            }
+        }
+        if moved.is_empty() {
+            return Ok(false);
+        }
+        for t in &mut moved {
+            t.parent_group_id = parent;
+        }
+        let at = anchor_after.map_or(0, |after| {
+            self.tracks.iter().position(|t| t.id == after).map_or(self.tracks.len(), |i| i + 1)
+        });
+        self.tracks.splice(at..at, moved);
+        Ok(!self.tracks.iter().map(|t| (t.id, t.parent_group_id)).eq(before))
     }
 }
 
@@ -388,7 +457,8 @@ mod tests {
         assert!(TrackDeps::build(&s, EdgeScope::Active).dependency_order().is_ok());
         assert_eq!(TrackDeps::build(&s, EdgeScope::Structural).dependency_order(), Err(DependencyCycle));
         let mut s2 = s.clone();
-        assert!(s2.drop_cyclic_aux_routes(&[2]));
+        assert_eq!(s2.drop_cyclic_aux_routes(&[99]), 0, "持ち込んでいない配線は判定しない");
+        assert_eq!(s2.drop_cyclic_aux_routes(&[21]), 1, "持ち込んだ配線は判定して落とす");
         assert!(TrackDeps::build(&s2, EdgeScope::Structural).dependency_order().is_ok());
 
         // 自分の chain を source にする tap は辺にしない (前 buffer の snapshot = 循環ではない)。
@@ -406,5 +476,62 @@ mod tests {
         let mut looped = s.clone();
         looped.tracks[0].sends.push(Send { id: 1, dest_track_id: 2, gain: 1.0, mode: SendMode::PostFader, enabled: true });
         assert_eq!(TrackDeps::build(&looped, EdgeScope::Active).dependency_order(), Err(DependencyCycle));
+    }
+
+    /// 運んだ Parallel の chain を他トラックが読んでいると、chain の持ち主が変わって辺が変わるので判定に入る。
+    /// 同じ device の別 port の無関係な配線は触らない。
+    #[test]
+    fn drop_cyclic_aux_routes_judges_routes_reading_carried_chains() {
+        // B (G の子) の plugin が A の Parallel の chain 51 を port 0 で、独立トラック 4 を port 1 で読む。
+        let mut s = song(vec![]);
+        s.tracks[2].parent_group_id = Some(1);
+        s.tracks.push(Track { id: 4, name: "C".into(), ..Track::default() });
+        let mut reader = sc_plugin(40, TapSource::Chain(51), false);
+        if let Device::Plugin(p) = &mut reader {
+            p.aux_inputs.push(Some(AuxInputRoute { tap: AudioTap::new(TapSource::Track(4), TapPoint::PostFader) }));
+        }
+        s.tracks[2].devices.push(reader);
+        // Parallel を G へ運ぶと、B が G を読む辺と G←B (子) で循環する。
+        let parallel = s.remove_device(50).expect("parallel");
+        s.tracks[0].devices.push(parallel);
+        assert_eq!(s.drop_cyclic_aux_routes(&[50, 51]), 1);
+        let p = s.plugin_by_id(40).expect("reader");
+        assert_eq!(p.aux_inputs[0], None, "運んだ chain を読む配線は落ちる");
+        assert!(p.aux_inputs[1].is_some(), "無関係な配線は残る");
+    }
+
+    /// `move_tracks`: 付け替えで足す children 辺が SC / send / 親子の鎖と循環するなら何も書かずに拒否する。
+    /// 親が変わらない並べ替えと、元からある循環に無関係な付け替えは通る。
+    #[test]
+    fn move_tracks_rejects_only_new_dependency_cycles() {
+        // B の Comp が G を読む (G は B に依存しないので配線できる) → B を G の子にすると G←B←G。
+        let mut s = song(vec![]);
+        assert!(s.set_aux_input(30, 0, Some(TapSource::Track(1))));
+        let before = s.clone();
+        assert_eq!(s.move_tracks(&[3], Some(1), Some(2)), Err(DependencyCycle));
+        assert_eq!(s, before, "拒否したら何も書かない");
+        // G → B の send も同じ。
+        let mut s = song(vec![]);
+        s.tracks[0].sends.push(Send { id: 1, dest_track_id: 3, gain: 1.0, mode: SendMode::PostFader, enabled: true });
+        assert_eq!(s.move_tracks(&[3], Some(1), Some(2)), Err(DependencyCycle));
+        // 自分の子孫を親にする。
+        let mut s = song(vec![]);
+        assert_eq!(s.move_tracks(&[1], Some(2), None), Err(DependencyCycle));
+        assert_eq!(s.move_tracks(&[1], Some(1), None), Err(DependencyCycle), "自分自身");
+
+        // 循環しない付け替え + 並べ替え。
+        let ids = |s: &Song| s.tracks.iter().map(|t| (t.id, t.parent_group_id)).collect::<Vec<_>>();
+        assert_eq!(s.move_tracks(&[3], Some(1), Some(2)), Ok(true));
+        assert_eq!(ids(&s), [(1, None), (2, Some(1)), (3, Some(1))]);
+        assert_eq!(s.move_tracks(&[3], Some(1), Some(2)), Ok(false), "同じ位置と親は変化なし");
+        assert_eq!(s.move_tracks(&[3], None, None), Ok(true));
+        assert_eq!(ids(&s), [(3, None), (1, None), (2, Some(1))], "None は先頭");
+        assert_eq!(s.move_tracks(&[3], Some(99), None), Ok(false), "実在しない親");
+        assert_eq!(s.move_tracks(&[99], None, None), Ok(false), "実在しない id");
+
+        // 元からある循環 (A の bypass 中の plugin が親 G を読む) は、無関係な編集を拒否する理由にしない。
+        let mut s = song(vec![sc_plugin(21, TapSource::Track(1), true)]);
+        assert_eq!(s.move_tracks(&[2], Some(1), None), Ok(true), "親が変わらない並べ替え");
+        assert_eq!(s.move_tracks(&[3], Some(1), Some(2)), Ok(true), "循環に無関係な付け替え");
     }
 }

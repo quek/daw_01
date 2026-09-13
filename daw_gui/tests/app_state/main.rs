@@ -37,4 +37,5 @@ mod shutdown_sequence;
 mod state_roundtrip_watchdog;
 mod sync_flush;
 mod track_delete;
+mod track_reparent;
 mod transform_edit_regress;

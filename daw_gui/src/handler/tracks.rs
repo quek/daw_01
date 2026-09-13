@@ -208,7 +208,7 @@ impl AppData {
         tracks.sort_by_key(|t| t.order);
         // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
         let audio_editor_key = self.audio_editor_target_key();
-        let Some(new_ids) = self.edit_song(|song| {
+        let Some((new_ids, dropped)) = self.edit_song(|song| {
             let same_project = src_pid == song.project_id;
             // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
             let media_remap = if same_project {
@@ -231,18 +231,24 @@ impl AppData {
                 song.tracks.insert((insert_idx + off).min(song.tracks.len()), t);
             }
             // r.md #129 (§5.9): 貼った先の group の下で依存が循環するサイドチェイン (子から親を読む等) は
-            // 落とす (循環すると engine が空の schedule にして master が無音になる)。
-            song.drop_cyclic_aux_routes(&new_ids);
+            // 落とす (循環すると engine が空の schedule にして master が無音になる)。判定するのは貼った
+            // トラックの device の配線だけ。
+            let mut brought: Vec<u64> = Vec::new();
+            for t in song.tracks.iter().filter(|t| new_ids.contains(&t.id)) {
+                common::model::for_each_node_id(&t.devices, &mut |id| brought.push(id));
+            }
+            let dropped = song.drop_cyclic_aux_routes(&brought);
             // 行の不変条件 (孤児セル / 消えたセルを指す主導権 / 死んだ列への Jump) は
             // model が持つ。貼り付けた行にも同じ規則を通す (冪等なので既存行は不変)。
             song.normalize_session();
             // r.md #89: `rehome_pasted_modulation` が落とした変調の **深さ**を指していた
             // 変調 / レーンの連鎖掃除は、SongDoc の `enforce_edit_invariants` が同じ undo step で
             // 担う (r.md #129、固定点の SSoT は `Song::prune_dangling_param_targets`)。
-            new_ids
+            (new_ids, dropped)
         }) else {
             return 0;
         };
+        self.note_dropped_cyclic_routes(dropped);
         // 選択を新 track 群に + plugin host へ各 device を SetSlotPlugin で実体化
         // (flush_song_sync = LoadSong は audio 専属で plugin host では no-op なので、
         //  plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。

@@ -611,6 +611,74 @@ fn paste_devices_inserts_before_selection() {
     assert_eq!(after[3], c, "末尾に足されるので c の位置は変わらない");
 }
 
+/// r.md #129 (§5.9): 運搬 / コピー / 貼り付けの循環判定は、**運び込んだ配線**と**運んだ node を読む配線**
+/// だけに掛ける。無関係な既存の SC 配線 (main でビルドした .daw にある、bypass 中の Comp が親 group を読む
+/// = Structural だけの循環) は黙って消さない。
+#[test]
+fn carrying_devices_keeps_unrelated_existing_sidechain_routes() {
+    use common::model::{AudioTap, AuxInputRoute, ChainRef, NativeKind, TapPoint, TapSource};
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let g = app.cur.song_doc.song().tracks[0].id;
+    let c = add_empty_track(&mut app);
+    let x = add_empty_track(&mut app);
+    let y = add_empty_track(&mut app);
+    let comp = app.cur.song_doc.song().builtin_native(c, NativeKind::Comp).expect("comp").id;
+    let old_route = AuxInputRoute { tap: AudioTap::new(TapSource::Track(g), TapPoint::PostFader) };
+    app.edit_song(|song| {
+        song.track_by_id_mut(c).expect("c").parent_group_id = Some(g);
+        song.native_by_id_mut(comp).expect("comp").aux_input = Some(old_route);
+    });
+    let route = |app: &AppData| app.cur.song_doc.song().native_by_id(comp).expect("comp").aux_input;
+
+    // X に足した Comp 2 を Y へ運ぶ (トラックを跨ぐ移動)。
+    app.handle_event(AppEvent::Device(DeviceEvent::AddNative { chain: ChainRef::Track(x), kind: NativeKind::Comp, open_panel: false }));
+    let added = app.cur.selection.selected_device_ids[0];
+    let relocate = |app: &mut AppData, dest: u32, copy: bool| {
+        app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
+            device_ids: vec![added],
+            dest: ChainRef::Track(dest),
+            dest_index: InsertAt::Default,
+            copy,
+        })));
+    };
+    relocate(&mut app, y, false);
+    assert_eq!(app.cur.song_doc.song().device_owner_track(added), Some(y));
+    assert_eq!(route(&app), Some(old_route), "無関係な移動で既存の配線を消さない");
+
+    // C へのコピーも、C に元からある配線を判定しない。
+    relocate(&mut app, c, true);
+    assert_eq!(route(&app), Some(old_route), "コピー先に元からある配線を消さない");
+    assert!(!app.ui_ephemeral.status_message.contains("外しました"), "{}", app.ui_ephemeral.status_message);
+}
+
+/// 運び込んだ配線が循環するときは落とし、落とした本数を status に出す。
+#[test]
+fn carrying_a_cyclic_sidechain_route_drops_it_with_a_status() {
+    use common::model::{ChainRef, NativeKind, TapSource};
+    let (mut app, _audio_rx, _plugin_rx, _proxy) = build_app();
+    let g = app.cur.song_doc.song().tracks[0].id;
+    let child = add_empty_track(&mut app);
+    let x = add_empty_track(&mut app);
+    app.edit_song(|song| song.track_by_id_mut(child).expect("child").parent_group_id = Some(g));
+    // X の Comp 2 は G を読む (X は G に依存しないので配線できる)。
+    app.handle_event(AppEvent::Device(DeviceEvent::AddNative { chain: ChainRef::Track(x), kind: NativeKind::Comp, open_panel: false }));
+    let added = app.cur.selection.selected_device_ids[0];
+    app.handle_event(AppEvent::Device(DeviceEvent::SetSidechainSource { device_id: added, port: 0, source: Some(TapSource::Track(g)) }));
+    assert!(app.cur.song_doc.song().native_by_id(added).expect("added").aux_input.is_some());
+
+    // G の子へ運ぶと G←child←G で循環するので、運び込んだ配線だけ落ちる。
+    app.handle_event(AppEvent::Device(DeviceEvent::RelocateDevices(RelocateDevices {
+        device_ids: vec![added],
+        dest: ChainRef::Track(child),
+        dest_index: InsertAt::Default,
+        copy: false,
+    })));
+    assert_eq!(app.cur.song_doc.song().device_owner_track(added), Some(child));
+    assert_eq!(app.cur.song_doc.song().native_by_id(added).expect("added").aux_input, None);
+    assert!(app.ui_ephemeral.status_message.contains('1'), "{}", app.ui_ephemeral.status_message);
+    assert!(app.ui_ephemeral.status_message.contains("外しました"), "{}", app.ui_ephemeral.status_message);
+}
+
 /// device 選択は「いま表示しているチェーン」にスコープされる。
 /// cursor track が動いた時点で元トラックの id は stale になり、
 /// **読む側の正規化** で落ちる (= 掃除を全 writer に挿す補償コードを持たない)。
