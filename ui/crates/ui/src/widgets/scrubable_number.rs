@@ -16,6 +16,7 @@
 //! - press → 4px 未満で release → text input mode (`editing_text = true`)、 内部 `text_input_at_focused`
 //!   が IME / 選択 / Esc rollback / Enter commit を担う
 //! - text input mode Enter → committed_text を `format` で parse + range clamp + `on_change(parsed)`
+//!   (書式がラベルで名指しする値 = [`ScrubableNumberFormat::labeled_value`] は clamp しない)
 //! - text input mode Esc / focus loss → 静かに rollback (= 元 value 表示に戻る)
 
 use std::hash::Hash;
@@ -120,6 +121,22 @@ impl ScrubableNumberFormat {
     #[must_use]
     pub fn parse_value(self, text: &str) -> Option<f64> {
         parse_value(text, self)
+    }
+
+    /// 書式がラベルで名指しする値 ([`Self::SignificantZeroLabeled`] の 0)。 drag の range
+    /// ([`ScrubableNumberStyle::range`]) の外に置かれる値 (左へ回し切ると OFF の欄の 0) でも、
+    /// 欄が表示する表記そのものなので、 打って確定したらそのまま受ける (range へ clamp しない)。
+    #[must_use]
+    pub fn labeled_value(self) -> Option<f64> {
+        match self {
+            Self::SignificantZeroLabeled { .. } => Some(0.0),
+            Self::Integer
+            | Self::Decimal(_)
+            | Self::Significant { .. }
+            | Self::BarBeat { .. }
+            | Self::SignedLabeled { .. }
+            | Self::Choices { .. } => None,
+        }
     }
 
     /// `value` の表記の後ろに単位 ([`ScrubableNumberStyle::unit`]) を付けてよいか。 数値でなく
@@ -955,8 +972,12 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 && let Some(text) = &inner_resp.committed_text
                 && let Some(parsed) = parse_with_unit(text, format, style.unit)
             {
-                // clamp_opt と同じ防御 (反転 / 非有限 range で panic しない)。
-                let final_value = clamp_opt(parsed, style.range);
+                // 書式がラベルで名指しする値 ("OFF" = 0) は range の外でもそのまま受ける
+                // (`labeled_value`)。それ以外は clamp_opt (反転 / 非有限 range で panic しない)。
+                let final_value = match format.labeled_value() {
+                    Some(labeled) if (parsed - labeled).abs() <= f64::EPSILON => labeled,
+                    _ => clamp_opt(parsed, style.range),
+                };
                 if (final_value - value).abs() > f64::EPSILON {
                     self.push_edit(on_change(final_value));
                 }
@@ -1551,6 +1572,55 @@ mod tests {
         assert_eq!(f.parse_value("150"), Some(150.0));
         assert_eq!(f.parse_value("of"), None);
         assert!(!f.unit_applies(0.0) && f.unit_applies(150.0), "ラベルの後ろには単位を付けない");
+    }
+
+    /// 欄が表示するラベル (`"OFF"`) や、ラベルが表す値 (`"0"`) を打って確定すると、drag の range
+    /// (20..16000) の外でもその値になる (range の下端へ clamp して 20 に化けない)。range 内の数値は
+    /// 従来どおり clamp する。
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn typing_the_zero_label_commits_zero_outside_the_drag_range() {
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+        let key = |physical_key: PhysicalKey, text: Option<&str>| KeyEvent {
+            state: ElementState::Pressed,
+            text: text.map(Into::into),
+            physical_key,
+            repeat: false,
+        };
+        let format = ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" };
+        let style = ScrubableNumberStyle {
+            range: Some((20.0, 16_000.0)),
+            curve: ScrubCurve::Log,
+            unit: "Hz",
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
+        };
+        let commit = |typed: &str| -> f64 {
+            let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+            let mut model = BpmModel { bpm: 150.0 };
+            let center = (40.0_f32, 14.0_f32);
+            let frames = [
+                FrameInput { pointer: press_at(center, false), ..Default::default() },
+                FrameInput { pointer: release_at(center), ..Default::default() },
+                FrameInput::default(),
+                FrameInput { keyboard: vec![key(PhysicalKey::Char('X'), Some(typed))], ..Default::default() },
+                FrameInput { keyboard: vec![key(PhysicalKey::Enter, None)], ..Default::default() },
+            ];
+            for input in frames {
+                let value = model.bpm;
+                let edits = host.frame_to_edits(&model, &mut Scene::new(), PhysicalSize { width: 200, height: 100 }, input, |_, ui| {
+                    ui.scrubable_number_at("sc", rect_default(), value, 0.0, format, &style, |v| Edit::mutate(move |m: &mut BpmModel| m.bpm = v), None, None);
+                });
+                for e in edits {
+                    e.apply(&mut model);
+                }
+            }
+            model.bpm
+        };
+        assert_eq!(commit("OFF"), 0.0, "ラベルを打つと OFF (0)");
+        assert_eq!(commit("0"), 0.0, "ラベルが表す値を打っても OFF (0)");
+        assert_eq!(commit("-0"), 0.0);
+        assert_eq!(commit("5"), 20.0, "range の外の数値は従来どおり clamp");
+        assert_eq!(commit("300"), 300.0);
     }
 
     /// drag 上方向 (= dy negative) で値が増加、 sensitivity が units_per_pixel として効く。

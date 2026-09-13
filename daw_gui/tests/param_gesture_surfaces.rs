@@ -10,6 +10,7 @@
 //!    ヘッダ音量、ドラッグが閾値を越えたフレームに最初の値を出す数値欄 (Mixer の Pan / Rack Par /
 //!    Limiter Ceiling / インスペクタ)、変調深さのドラッグ、EQ 点のホイール Q — のどれも undo +1。
 //! 3. Latch で再生中にマスターパネルの Bus Comp Thr を動かす → master の `song_lanes` にレーンと点。
+//! 4. マスターパネルのフェーダー (`ScrubGesture::MasterGain`) も undo +1 で、掴んだままパネルが消えたら閉じる。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -313,6 +314,45 @@ fn マスターパネルの_limiter_ceiling_数値欄をドラッグしても_un
     let ceiling = app.cur.song_doc.song().master_limiter.ceiling_db;
     assert!(ceiling < -1.5, "左へ引いたので Ceiling が下がる: {ceiling}");
     assert_eq!(app.cur.song_doc.undo_depth(), depth + 1, "1 ドラッグ = 1 undo step");
+}
+
+/// マスターパネルのフェーダー (つまみ = 高さ 10・幅 28 の面) の中心。
+fn master_fader_thumb(app: &AppData, scene: &Scene) -> (f32, f32) {
+    let left = W as f32 - daw_gui::view::master_panel::panel_width(app);
+    let r = scene
+        .iter_rects()
+        .find(|r| r.rect.x >= left && (r.rect.h - 10.0).abs() < 0.01 && (r.rect.w - 28.0).abs() < 0.01)
+        .expect("マスターフェーダーのつまみ")
+        .rect;
+    (r.x + r.w * 0.5, r.y + r.h * 0.5)
+}
+
+/// X3: マスターパネルのフェーダーも ScrubGesture の口 (同じフレームの値より先に開く / 描かれなくなったら
+/// sweep が閉じる) を通る。1 ドラッグ = undo 1 step で、ドラッグ中にパネルを閉じても bracket が開いたまま
+/// 残らない (残ると以降の編集が全部 1 step に束ねられる)。
+#[test]
+fn マスターパネルのフェーダーをドラッグしても_undo_は_1_step_で_パネルが消えたら閉じる() {
+    let mut app = build_app();
+    let mut host = UiHost::no_redraw();
+    let scene = settle(&mut host, &mut app);
+    let at = master_fader_thumb(&app, &scene);
+
+    let depth = app.cur.song_doc.undo_depth();
+    drag(&mut host, &mut app, at, (0.0, STEP), None, |_| {});
+    let gain = app.cur.song_doc.song().master_gain;
+    assert!(gain < 1.0, "下へ引いたので master gain が下がる: {gain}");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth + 1, "1 ドラッグ = 1 undo step");
+    assert!(!app.cur.song_doc.gesture_active(), "離したら閉じる");
+
+    // 掴んだままパネルを閉じる → 描かれなくなったフレームで閉じる。
+    let scene = settle(&mut host, &mut app);
+    let at = master_fader_thumb(&app, &scene);
+    run(&mut host, &mut app, press(at));
+    run(&mut host, &mut app, hold((at.0, at.1 + STEP)));
+    assert!(app.cur.song_doc.gesture_active(), "前提: ドラッグ中は開いている");
+    app.handle_event(AppEvent::ToggleMasterPanel);
+    run(&mut host, &mut app, hold((at.0, at.1 + STEP * 2.0)));
+    assert!(!app.cur.song_doc.gesture_active(), "フェーダーが描かれなくなったら bracket を閉じる");
 }
 
 /// 変調深さのドラッグ: ◉ で待受にしたソースを、つまみの縦ドラッグで割り当てて深さを決める。

@@ -518,7 +518,10 @@ fn draw_strip(
     // **既存 strip の中身は変えず、その上に足すだけ** (docs/plan_rack_native_devices.md §10.8)。
     // 高さは track の有無に依らず確保する (fader の上端が全 strip で揃う)。
     let head_h = strip_sections::head_height(app);
-    if let Some(owner) = ParamOwner::resolve(app.cur.song_doc.song(), track_idx) {
+    // lane / routing の持ち主 (この strip のトラック) は strip につき 1 回だけ解決し、帯のつまみと Pan / Volume の
+    // 変調で使い回す (つまみごとに引き直さない)。
+    let owner = ParamOwner::resolve(app.cur.song_doc.song(), track_idx);
+    if let Some(owner) = owner {
         strip_sections::draw_head(app, ui, owner, Rect { h: head_h, ..rect }, pad, bg, scope);
     }
     let mut y = rect.y + head_h + pad;
@@ -610,7 +613,7 @@ fn draw_strip(
         let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
         let knob_value = plain_to_norm(&pan_target, f64::from(pan));
         let pan_mod =
-            build_mod(app, pan_target.clone(), f64::from(knob_value), ModControlDomain::Norm, track_idx);
+            owner.map(|o| build_mod(app, pan_target.clone(), f64::from(knob_value), ModControlDomain::Norm, o));
         let pan_resp = ui.knob_at(
             ("mixer_strip_pan", layout_idx),
             Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
@@ -637,7 +640,7 @@ fn draw_strip(
                     })
                 }
             },
-            Some(pan_mod.modulation()),
+            pan_mod.as_ref().map(|m| m.modulation()),
         );
         push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &pan_target, pan_resp.mod_dragging);
 
@@ -748,12 +751,10 @@ fn draw_strip(
     // 渡し、`ModControlDomain::FaderDb` が volume(amp) ↔ frac を解決する。master の
     // 出力ゲインは `TrackBuiltin(Volume)` ではないので変調対象外。
     let vol_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
-    let vol_mod = if is_master {
-        None
-    } else {
+    let vol_mod = owner.filter(|_| !is_master).map(|o| {
         let base_frac = f64::from(vol_scale.db_to_frac(fader_db));
-        Some(build_mod(app, vol_target.clone(), base_frac, ModControlDomain::FaderDb(vol_scale), track_idx))
-    };
+        build_mod(app, vol_target.clone(), base_frac, ModControlDomain::FaderDb(vol_scale), o)
+    });
     let resp = ui.channel_fader_meter(
         ("mixer_strip_fader", layout_idx),
         Rect { x: group_x, y: fader_top, w: group_w, h: fader_h },

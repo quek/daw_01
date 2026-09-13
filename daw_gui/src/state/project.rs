@@ -482,11 +482,6 @@ pub struct ProjectEphemeral {
     /// 同じ param を描いたら入る。フレーム末の `view::param_gesture::sweep_param_gestures` が
     /// 見て、入っていない (= 描かれなくなった) gesture を閉じる (`scrub_gesture_seen` と同じ作り)。
     pub param_gesture_seen: std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    /// マスターフェーダーを掴んでいるか (undo gesture の edge 検出用)。
-    /// `Song.master_gain` を編集するようになったので、drag 全体を 1 undo step に
-    /// bracket しないと per-frame の編集が履歴を埋める (group transform /
-    /// inspector scrub と同じ罠)。session-only。
-    pub master_gain_dragging: bool,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
@@ -959,7 +954,6 @@ impl ProjectState {
                 sc_listen_device: None,
                 device_scopes_sent: Vec::new(),
                 param_gesture_seen: std::collections::HashSet::new(),
-                master_gain_dragging: false,
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,

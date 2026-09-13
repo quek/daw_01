@@ -25,7 +25,7 @@ use daw_ui_core::{
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, ScrubGesture};
 use crate::handler::bypass_target::BypassTarget;
 use crate::view::master_strip_ui;
 use crate::handler::master_panel::{
@@ -369,20 +369,10 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
         },
         None,
     );
-    // drag の立ち上がり / 立ち下がりで undo gesture を開閉する。`master_gain` は
-    // `Song` に入って undo 対象になったので、これが無いと 1 回のドラッグで
-    // per-frame の編集が undo 履歴を埋める。was_dragging は 1 frame 遅れで
-    // 追従する (param_gesture と同じ edge 検出の連鎖)。
-    if resp.fader.dragging != app.cur.peph.master_gain_dragging {
-        let started = resp.fader.dragging;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(if started {
-                AppEvent::BeginMasterGainDrag
-            } else {
-                AppEvent::EndMasterGainDrag
-            });
-        }));
-    }
+    // `master_gain` は `Song` の値 (undo 対象) なので、1 回のドラッグを undo 1 step に束ねる。
+    // 束ねる口は `scrub_gesture::push` 1 本 (同じフレームの値より先に開く / 描かれなくなったら閉じる)。
+    // 描いた毎フレーム呼ぶ (ドラッグしていないフレームも)。
+    crate::view::scrub_gesture::push(ui, app, ScrubGesture::MasterGain, resp.fader.dragging);
     if resp.peak_reset {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ResetMasterPeakHold);

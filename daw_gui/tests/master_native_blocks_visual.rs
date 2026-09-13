@@ -6,6 +6,7 @@
 //! 1. Bus Comp と Tone EQ の上下は **master チェーン上の前後** に合わせ、Limiter は常に一番下 (Q17)
 //! 2. ブロックの hover は `Q` の宛先になり、パネルを閉じた / 列が狭くてブロックを描かないフレームでは
 //!    **必ず消える** (hover の publish が 1 か所、§18-AB)。低い画面 (パネル内スクロール) でも hover が届く
+//! 3. OFF の Limiter の GR セグメントは両テーマで薄く、形は残る (Q9)
 
 use std::sync::Arc;
 
@@ -16,9 +17,10 @@ use daw_gui::app::{AppData, AppEvent, InsertAt, RelocateDevices};
 use daw_gui::dispatcher::{BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher};
 use daw_gui::event_device::DeviceEvent;
 use daw_gui::handler::bypass_target::BypassTarget;
-use daw_ui_core::{FrameInput, PointerFrame, UiHost};
+use daw_ui_core::color::composite_over;
+use daw_ui_core::{FrameInput, PointerFrame, UiHost, contrast_ratio};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Rect, Scene};
+use daw_ui_renderer::{Primitive, Rect, Scene};
 
 /// 全ブロックが描ける広さ (MASTER セクションの本体が必要高 + ラウドネス数値欄を取れる)。
 const TALL: (u32, u32) = (960, 1000);
@@ -96,6 +98,39 @@ fn center(r: Rect) -> (f32, f32) {
     (r.x + r.w * 0.5, r.y + r.h * 0.5)
 }
 
+/// Limiter の GR セグメントの溝 (見出し「Limiter Ceiling」の行の直上、高さ 8 の面) の、背後の不透明な面に
+/// 対するコントラスト (溝の塗りを背後に重ねた実効色で測る)。
+fn limiter_slot_contrast(scene: &Scene, left: f32) -> f32 {
+    let (_, label_y) = ceiling_label(scene, left).expect("Limiter 行が描かれる");
+    let (idx, slot) = scene
+        .primitives
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| match p {
+            Primitive::Rect(r)
+                if r.rect.x >= left
+                    && (r.rect.h - 8.0).abs() < 0.01
+                    && r.rect.w > 50.0
+                    && r.rect.y + r.rect.h <= label_y
+                    && r.rect.y + r.rect.h >= label_y - 20.0 =>
+            {
+                Some((i, *r))
+            }
+            _ => None,
+        })
+        .expect("Limiter の GR セグメントの溝");
+    let c = center(slot.rect);
+    let bg = scene.primitives[..idx]
+        .iter()
+        .rev()
+        .find_map(|p| match p {
+            Primitive::Rect(r) if r.fill.a >= 0.999 && r.rect.w >= 2.0 && r.rect.h >= 2.0 && r.rect.contains(c.0, c.1) => Some(r.fill),
+            _ => None,
+        })
+        .expect("溝の背後の面");
+    contrast_ratio(composite_over(slot.fill, bg), bg)
+}
+
 #[test]
 fn bus_comp_と_tone_eq_の上下はチェーン順で_limiter_は常に最下() {
     let mut app = build_app();
@@ -127,6 +162,27 @@ fn bus_comp_と_tone_eq_の上下はチェーン順で_limiter_は常に最下()
     let ceiling = ceiling_label(&scene, left).expect("Limiter 行が描かれる");
     assert!(curve.y < needle.y, "Tone EQ を前へ: カーブ y={} < 針 y={}", curve.y, needle.y);
     assert!(ceiling.1 > needle.y.max(curve.y), "並べ替えても Limiter は一番下: Ceiling y={}", ceiling.1);
+}
+
+/// Q9: OFF の Limiter の GR セグメントの溝は、ダーク / ライトの両方で ON より薄く、しかも消えない
+/// (OFF の見せ方は共有部品 `native_device::gr` が持つ。呼び出し側で覆いを重ねて二重に沈めない)。
+#[test]
+fn off_の_limiter_の_gr_セグメントは両テーマで薄く_形は残る() {
+    for theme in ["dark", "light"] {
+        let mut app = build_app();
+        app.handle_event(AppEvent::SetTheme(theme.to_string()));
+        let mut host = UiHost::no_redraw();
+        if host.set_palette(app.theme.core.clone()) {
+            host.invalidate_scene_cache();
+        }
+        let left = panel_left(&app, TALL);
+        assert!(!app.cur.song_doc.song().master_limiter.on, "前提: Limiter は既定で OFF");
+        let off = limiter_slot_contrast(&run(&mut host, &mut app, TALL, None), left);
+        app.handle_event(AppEvent::Device(DeviceEvent::MasterLimiterEdit(daw_gui::event_native::MasterLimiterEdit::On(true))));
+        let on = limiter_slot_contrast(&run(&mut host, &mut app, TALL, None), left);
+        assert!(off <= on - 0.05, "{theme}: OFF の溝 {off:.3} が ON {on:.3} より薄くない");
+        assert!(off >= 1.04, "{theme}: OFF の溝 {off:.3} が消えている (ON {on:.3})");
+    }
 }
 
 #[test]

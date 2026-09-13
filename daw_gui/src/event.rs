@@ -905,12 +905,9 @@ pub enum AppEvent {
     /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
     /// disarms. While armed, inspector param controls enter depth-drag edit mode.
     SetArmedModSource(Option<u32>),
+    /// マスターフェーダーの値。drag 全体の undo 1 step は `ScrubGesture::MasterGain` が束ねる
+    /// (`view::scrub_gesture`)。
     SetMasterGain(f32),
-    /// マスターフェーダーの drag 全体を 1 undo step に bracket する
-    /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
-    /// `master_gain` が `Song` に入って undo 対象になったので必要になった。
-    BeginMasterGainDrag,
-    EndMasterGainDrag,
 
     // -------- IPC events from plugin_host ---------------------------------
     /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。
@@ -1032,7 +1029,7 @@ pub enum AppEvent {
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
     /// メーター面の 1 tick。`tracks` は per-track の `(peak L, peak R)`、`native_gr` は GR を出す
-    /// 内蔵 device の `(device id, GR dB (0 以下))` (`None` = seqlock が読めなかった = 前回値を保つ)、
+    /// 内蔵 device の `(device id, GR dB (0 以下))`、id 昇順 (`None` = seqlock が読めなかった = 前回値を保つ)、
     /// `master_limiter_gr_db` は master Limiter の GR (dB、0 以下)。
     ///
     /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ
@@ -1045,11 +1042,13 @@ pub enum AppEvent {
         master_limiter_gr_db: f32,
     },
     /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
-    /// テレメトリポーラが `DeviceScopeReader` + `SpectrumAnalyzer` で作る。tick の project が
-    /// 現タブのときだけ取り込む。
+    /// テレメトリポーラが `DeviceScopeReader` + `SpectrumAnalyzer` で作り、**表示が変わった tick だけ**
+    /// 送る (`master_meter::device_spectrum`)。tick の project が現タブのときだけ取り込む。
     DeviceSpectrumTick {
         project: common::protocol::ProjectKey,
         spectra: Vec<(u64, std::sync::Arc<[f32]>)>,
+        /// 表示解像度で量子化した中身のダイジェスト (tick の再描画判定の指紋に混ぜる、r.md #49)。
+        visual_digest: u64,
     },
     /// r.md #87: ランチャーの**走行状態** (`(row_key, snapshot)`、`row_key` は
     /// `(track_id << 32) | lane_id`)。poller が `AudioBridge::launcher_row_snapshots`

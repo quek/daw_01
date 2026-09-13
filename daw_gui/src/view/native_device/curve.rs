@@ -13,6 +13,7 @@ use common::model::{EqBand, EqSettings, NativeParams, TONE_EQ_LIMIT_DB, ToneEqBa
 use daw_ui_core::{SpectrumStyle, Ui};
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
+use super::INACTIVE_ALPHA;
 use crate::app::AppData;
 use crate::master_meter::spectrum::{F_MAX, F_MIN};
 
@@ -21,8 +22,6 @@ const CHANNEL_DB_RANGE: f32 = 18.0;
 /// 応答を評価するサンプリング周波数。**音の実 SR ではない** — 描くのは 20Hz〜20kHz の形で、
 /// 係数の bilinear warping の差が出るのは Nyquist 付近だけ。
 const CURVE_SR: f32 = 48_000.0;
-/// OFF (bypass) のカーブとスペクトラムの不透明度の倍率。形は変えずに薄くする。
-const INACTIVE_ALPHA: f32 = 0.45;
 /// 背後のスペクトラム (その EQ を通った後の音、Q14) の塗りの不透明度。
 const SPECTRUM_ALPHA: f32 = 0.15;
 /// 縦の目盛り線を引く周波数。

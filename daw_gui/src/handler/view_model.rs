@@ -657,22 +657,18 @@ impl AppData {
         Some(format!("{kind_label} {ordinal}"))
     }
 
+    /// `target` のコントロール 1 個ぶんの変調の表示データ。`owner` は target の lane / routing の持ち主
+    /// (r.md #129 §7.7) で、**面を描き始めるときに 1 回だけ解決した** ものを渡す (つまみごとに木を
+    /// 引き直さない、`ParamOwner` の doc)。描画中の Song は不変なので同じスナップショットから解決した
+    /// 持ち主で足り、Edit 側 (`AddModRouting` / `SetModRoutingDepth`) は実行時の Song で引き直す。
     pub fn inspector_mod_data(
         &self,
         target: &common::model::AutomationTarget,
         display_base: f64,
         domain: ModControlDomain,
-        track_id: u32,
+        owner: crate::view::native_device::ParamOwner<'_>,
     ) -> InspectorModData {
-        // r.md #129 (§7.7): routing の store は target の持ち主 (view が渡す track id は
-        // Volume / Pan のように target だけでは持ち主が決まらない住所のためだけに使う)。
-        let song = self.cur.song_doc.song();
-        let Some(track_id) = crate::handler::param_value::param_owner(song, target, track_id) else {
-            return InspectorModData::default();
-        };
-        let Some((_, routings)) = song.param_stores(track_id) else {
-            return InspectorModData::default();
-        };
+        let (track_id, routings) = (owner.id, owner.routings);
         let model_base = domain.to_model(target, display_base);
         // docs/plan_modulation_followups.md §2: plugin params normalize against
         // their real min/max (identity placeholder would saturate the overlay).
@@ -1115,12 +1111,52 @@ impl AppData {
                         .content_names
                         .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
+                self.fill_lane_node_labels(&mut cache.lane_node_labels);
                 cache.epoch = self.cur.song_doc.edit_epoch();
             }
         }
         self.cur.peph.arr_label_cache.borrow()
     }
 
+    /// [`ArrLabelCache::lane_node_labels`] を今の Song で作り直す (全トラック + master のレーンのうち、名前が
+    /// Song だけから決まる target)。
+    fn fill_lane_node_labels(
+        &self,
+        labels: &mut std::collections::HashMap<common::model::AutomationTarget, std::sync::Arc<str>>,
+    ) {
+        labels.clear();
+        let song = self.cur.song_doc.song();
+        let lanes = song.tracks.iter().flat_map(|t| &t.automation_lanes).chain(&song.song_lanes);
+        for lane in lanes.filter(|l| name_is_song_derived(&l.target)) {
+            if !labels.contains_key(&lane.target)
+                && let Some(name) = self.device_param_name(&lane.target)
+            {
+                labels.insert(lane.target.clone(), std::sync::Arc::from(name));
+            }
+        }
+    }
+
+    /// アレンジのレーン見出しに出す、ノードで束縛する target の完全修飾名 ([`Self::device_param_name`] と
+    /// 同じ名前)。Song だけから決まる名前は `labels` (= [`Self::arrangement_labels`] の世代キャッシュ) から引き、
+    /// 毎フレームの木の走査と `format!` をしない。host の param 表に依存する `PluginParam` だけはその場で引く
+    /// (Song の世代では変化を検知できない)。
+    pub(crate) fn lane_node_label(
+        &self,
+        labels: &ArrLabelCache,
+        target: &common::model::AutomationTarget,
+    ) -> Option<std::sync::Arc<str>> {
+        if name_is_song_derived(target) {
+            labels.lane_node_labels.get(target).cloned()
+        } else {
+            self.device_param_name(target).map(std::sync::Arc::from)
+        }
+    }
+}
+
+/// [`AppData::device_param_name`] の名前が Song だけから決まるか (`PluginParam` は host が送る param 表と
+/// plugin DB にも依存する)。レーン名の世代キャッシュに載せてよいかの判定。
+fn name_is_song_derived(target: &common::model::AutomationTarget) -> bool {
+    !matches!(target, common::model::AutomationTarget::PluginParam { .. })
 }
 
 #[cfg(test)]
@@ -1168,5 +1204,28 @@ mod live_value_tests {
             "device ごと解いても同じ"
         );
         assert!((app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0) - 0.3).abs() < 1e-6, "master の chain も追従");
+    }
+
+    /// レーン見出しの完全修飾名は世代キャッシュから引くが、ノードの名前を変える編集の後は必ず新しい名前になる
+    /// (キャッシュが古い名前を返さない)。
+    #[test]
+    fn lane_node_labels_follow_renames_through_the_generation_cache() {
+        let mut app = crate::test_support::headless_app();
+        let mut parallel = Parallel::new();
+        parallel.id = 9_001;
+        parallel.chains[0].id = 9_002;
+        let chain_gain = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 });
+        app.edit_song(|song| {
+            song.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(parallel));
+            song.push_lane(MASTER_TRACK_ID, AutomationLane::new(chain_gain.clone(), 0.3));
+        });
+        let label = |app: &crate::state::AppData| app.lane_node_label(&app.arrangement_labels(), &chain_gain);
+        let before = label(&app).expect("chain のレーンに名前が付く");
+        assert_eq!(Some(before.clone()), app.device_param_name(&chain_gain).map(std::sync::Arc::from), "device_param_name と同じ名前");
+
+        app.edit_song(|song| {
+            song.chain_by_id_mut(9_002).expect("chain").name = "Bass".into();
+        });
+        assert_eq!(label(&app).as_deref(), Some("Bass: Gain"), "改名は次の世代で反映される (旧 {before})");
     }
 }

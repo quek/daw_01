@@ -591,7 +591,12 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
             // capacity ごと move out するので次 tick で確保し直す = per-tick の
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             // r.md #129: 内蔵 device の GR 面は seqlock が破れた tick は None (GUI は前回値を保つ)。
-            let native_gr = active.read_native_meters(&mut native_buf).then(|| native_buf.clone());
+            // 面は engine の compile 順なので id 昇順に並べて送る (GUI は表示値と 1 回のマージで突き合わせる、
+            // `NativeGrDisplay::update`)。
+            let native_gr = active.read_native_meters(&mut native_buf).then(|| {
+                native_buf.sort_unstable_by_key(|e| e.0);
+                native_buf.clone()
+            });
             if proxy
                 .send_event(AppEvent::TrackPeaksTick {
                     project: active_key,
@@ -607,9 +612,14 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
             }
             // r.md #129 (Q14): EQ Par のスペクトラム。解析はマスターのスペクトラムと同じ設定で回す。
             let spectrum_settings = meter_control.lock().map(|c| c.settings).unwrap_or_default();
-            if let Some(spectra) = device_spectra.tick(&device_scope, active_key, &spectrum_settings)
+            // 表示が変わらない tick (停止中の無音) は送らない (r.md #49、`DeviceSpectrumPoller::tick`)。
+            if let Some(t) = device_spectra.tick(&device_scope, active_key, &spectrum_settings)
                 && proxy
-                    .send_event(AppEvent::DeviceSpectrumTick { project: active_key, spectra })
+                    .send_event(AppEvent::DeviceSpectrumTick {
+                        project: active_key,
+                        spectra: t.spectra,
+                        visual_digest: t.visual_digest,
+                    })
                     .is_err()
             {
                 break;
