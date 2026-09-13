@@ -39,8 +39,15 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
     fade_curve_at((t as f32) / (fade_len as f32), curve)
 }
 
-/// トラック / バスの **pan 則 (equal-power)** — `pan` (`-1.0`..=`1.0`) に対する
-/// `(左ゲイン, 右ゲイン)`。中央 (`0.0`) は両チャンネル `cos(π/4) ≈ 0.707` (= -3dB)。
+/// トラック / バスの **pan 則** — 中央を 0 dB に正規化した等パワー則 (Ableton Live と同じ:
+/// "Output is 0 dB at the center position and signals panned fully left or right will be
+/// increased by +3 dB", https://www.ableton.com/en/manual/audio-fact-sheet/)。
+/// `pan` (`-1.0`..=`1.0`) に対する `(左ゲイン, 右ゲイン)` = `√2 · (cos θ, sin θ)`、`θ = (pan + 1)·π/4`。
+/// - 中央 (`0.0`) は両チャンネル 1.0 = 素通し。group / return に入れて段を重ねても音量が変わらない。
+/// - 片側いっぱいで、振った側 √2 (+3.01 dB)、反対側 0。
+/// - 左² + 右² は常に 2 (パワー一定)。
+///
+/// audio event の pan (`daw_audio::audio_clip_renderer`) も同じ式なので、ここを呼ぶ。
 ///
 /// **これが pan 則の SSoT** (掛けるのは `daw_audio::mixer::apply_strip` だけ)。焼き込み (Bounce / Glue) は
 /// フェーダーの段そのものを通さない (`RenderScope::Sources` / `PostFx`、`daw_audio::mixer::pass_strip`) ので、
@@ -51,7 +58,7 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
 #[must_use]
 pub fn pan_gains(pan: f32) -> (f32, f32) {
     let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-    (angle.cos(), angle.sin())
+    (angle.cos() * std::f32::consts::SQRT_2, angle.sin() * std::f32::consts::SQRT_2)
 }
 
 /// Fade カーブそのもの: 正規化した進度 `progress` (0 = fade 開始 = 無音、
@@ -897,6 +904,22 @@ mod tests {
 
     fn bm(source_frame: u64, locked_beat: f64) -> BeatMarker {
         BeatMarker { source_frame, locked_beat }
+    }
+
+    /// pan 則の契約: 中央は素通し (group に入れて段を重ねても音量が変わらない)、振り切りで +3 dB / 無音。
+    #[test]
+    fn pan_law_is_unity_at_center_and_plus_3db_at_the_extremes() {
+        let db = |g: f32| 20.0 * g.log10();
+        let (l, r) = pan_gains(0.0);
+        assert!((l - 1.0).abs() < 1e-6 && (r - 1.0).abs() < 1e-6, "center = ({l}, {r})");
+        let (l, r) = pan_gains(1.0);
+        assert!(l.abs() < 1e-6 && (db(r) - 3.0103).abs() < 1e-3, "hard right = ({l}, {r})");
+        let (l, r) = pan_gains(-1.0);
+        assert!(r.abs() < 1e-6 && (db(l) - 3.0103).abs() < 1e-3, "hard left = ({l}, {r})");
+        for p in [-0.7_f32, -0.2, 0.35, 0.9] {
+            let (l, r) = pan_gains(p);
+            assert!((l * l + r * r - 2.0).abs() < 1e-5, "power at {p} = {}", l * l + r * r);
+        }
     }
 
     // ---- event_wave_spans (波形描画と再生の一致、 r.md #41) ----

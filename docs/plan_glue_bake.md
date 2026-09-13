@@ -37,7 +37,7 @@ Bounce In Place との役割の重なりは許容する — Bounce は 1 クリ�
   素材の音だけを描く形 (分割と chain の gain / pan / mute / solo・出力 trim を通さない) にする
 - **トラックのフェーダーの段 (volume / pan / mute / solo) を通さない** (`mixer::pass_strip`) —
   オートメーションレーンと `mod_routings` (LFO 等の変調) も段ごと通らない。焼き込むと再生時に
-  同じものがもう一度掛かって二重に効く (pan 則は中央でも -3dB)
+  同じものがもう一度掛かって二重に効く (pan を振ったトラック・volume ≠ 1 のトラックで音量が変わる)
 - master の段 (fx chain / 音量 / Limiter) を通さない
 - 他のトラックを落とし、それを指す参照 (send / SC / パラアウト / follower / レーン / 変調) は
   編集後の不変条件と同じ掃除 (`Song::prune_dangling_refs`) が外す。自トラックを読む配線は残る

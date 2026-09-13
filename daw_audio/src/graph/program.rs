@@ -588,8 +588,9 @@ fn apply_parallel_out(
 }
 
 /// chain の pan 則 (SSoT)。**中央 = unity** の balance 則: 空 chain 1 本の Parallel が
-/// 素通しと同じ音量になることを保証する (track の等パワー則は中央 -3dB なので使わない)。
-/// 片側へ振ると反対側だけ減衰し、boost は無い (並列合算でクリップしない)。
+/// 素通しと同じ音量になることを保証する。track の pan 則 (`common::audio_render::pan_gains`) も
+/// 中央は unity だが、振った側を +3 dB まで持ち上げる。chain は並列合算でクリップしないよう
+/// boost を持たず、片側へ振ると反対側だけ減衰する。
 #[inline]
 pub fn chain_pan_gains(pan: f32) -> (f32, f32) {
     let p = pan.clamp(-1.0, 1.0);

@@ -1140,7 +1140,7 @@ mod tests {
     /// Bounce with FX は元と同じ音で鳴る (r.md #129): 元トラックを鳴らした mix と、そのクリップを焼いて
     /// (`Song::isolated_track` → engine の書き出し) 新しいトラックに置いた (`Song::place_bounce_with_fx`) 後の mix を
     /// 同じ区間で描き、L / R それぞれのピークと RMS が一致する。焼く段がフェーダーを含むと、写したフェーダーで
-    /// もう一度掛かる (pan 中央で -3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
+    /// もう一度掛かる (pan を振ると振った側が最大 +3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
     #[test]
     fn bounce_with_fx_sounds_like_the_original_track() {
         let db = |x: f32| 20.0 * x.max(1e-9).log10();

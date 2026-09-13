@@ -159,8 +159,8 @@ impl Default for TrackScratch {
     }
 }
 
-/// mixer strip を scratch に in-place 適用する: per-sample の equal-power
-/// pan と volume ramp (`volume_per_sample` / `pan_per_sample`、 事前に
+/// mixer strip を scratch に in-place 適用する: per-sample の pan (中央 0 dB の等パワー則、
+/// `common::audio_render::pan_gains`) と volume ramp (`volume_per_sample` / `pan_per_sample`、 事前に
 /// `fill_track_param_ramps` が埋めた値) を `track_l/r` に掛け、 peak meter を
 /// 更新する。 leaf (`process_track_owned`) と bus (`run_group_fx_chain`) の
 /// 2 箇所にほぼ同文でインライン展開されていた処理の単一実装
@@ -184,8 +184,7 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
     let mut peak_l = 0.0_f32;
     let mut peak_r = 0.0_f32;
     for i in 0..n {
-        // pan 則の SSoT は `common::audio_render::pan_gains` (焼き込み側が
-        // これを打ち消すので、式を 2 か所に持たない)。
+        // pan 則の SSoT は `common::audio_render::pan_gains` (audio event の pan も同じ式)。
         let (pan_l, pan_r) = common::audio_render::pan_gains(scratch.pan_per_sample[i]);
         let vol = scratch.volume_per_sample[i];
         let gain_l = pan_l * vol;
