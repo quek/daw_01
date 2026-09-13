@@ -301,6 +301,13 @@ impl Song {
         self.with_prune_ctx(|ctx| ctx.keep_binding(target))
     }
 
+    /// `owner` の store に置く「`source_id` のモジュレーターで `target` を変調する」routing が残るか
+    /// (prune の routing の retain と同じ式: ソースが実在し、`target` がその store で解決する)。
+    #[must_use]
+    pub fn mod_routing_resolves(&self, target: &AutomationTarget, source_id: u32, owner: u32) -> bool {
+        self.with_prune_ctx(|ctx| ctx.live_sources.contains(&source_id) && ctx.keep_target(target, owner))
+    }
+
     fn with_prune_ctx<R>(&self, f: impl FnOnce(&PruneCtx<'_>) -> R) -> R {
         let nodes = self.node_table();
         let live_sources: HashSet<u32> = self.mod_sources.iter().map(|m| m.id).collect();

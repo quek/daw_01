@@ -349,10 +349,10 @@ impl AppData {
         self.cur.peph.armed_mod_source = None;
         // 既に繋がっていた param を再ドラッグしただけのときに「割り当てました」と
         // 出すと、 何が起きたかを取り違える。 起きた事実をそのまま出す。
-        self.ui_ephemeral.status_message = if added {
-            format!("変調を割り当てました → {label}")
-        } else {
-            format!("変調の深さを更新しました → {label}")
+        self.ui_ephemeral.status_message = match added {
+            Some(true) => format!("変調を割り当てました → {label}"),
+            Some(false) => format!("変調の深さを更新しました → {label}"),
+            None => format!("変調を割り当てられません (対象かモジュレーターが削除されました) → {label}"),
         };
     }
 
@@ -426,25 +426,37 @@ impl AppData {
         }
     }
 
-    /// `target` への変調 routing が載る store を `f` に渡す (Song 編集は `edit_song` 経由)。
+    /// `target` への**既存の**変調 routing が載る store を `f` に渡す (解除 / 深さ / 極性。足すのは
+    /// [`Self::add_mod_routing`] だけ)。`f` は `(戻り値, 実際に変えたか)` を返し、変えていなければ undo も `*` も
+    /// 積まない (`edit_song_checked`)。既存の routing は enforce を通って残っている = 解決済みなので、ここでは
+    /// 解決を判定しない (深さのドラッグの毎フレームで node 表を作り直さない)。
     ///
     /// r.md #129 (§7.7): store の持ち主は **実行時の Song** から
     /// [`param_owner`](crate::handler::param_value::param_owner) で引き直す — view が渡す
     /// `track_id` は target だけでは持ち主が決まらない住所 (Volume / Pan …) のためだけに使う
     /// (同じフレームで device を他トラックへ運んだ後だと、view の track id は古い)。
-    /// 束縛先が居なければ何もせず `None`。
+    /// 束縛先が居なければ Song を編集せず `None`。
     pub(crate) fn edit_mod_routings<R>(
         &mut self,
         track_id: u32,
         target: &common::model::AutomationTarget,
-        f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> R,
+        f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> (R, bool),
     ) -> Option<R> {
         let owner = crate::handler::param_value::param_owner(self.cur.song_doc.song(), target, track_id)?;
-        self.edit_song(move |song| Some(f(song.param_stores_mut(owner)?.1)))
-            .flatten()
+        let mut out = None;
+        self.edit_song_checked(|song| {
+            let Some((_, routings)) = song.param_stores_mut(owner) else {
+                return false;
+            };
+            let (r, changed) = f(routings);
+            out = Some(r);
+            changed
+        });
+        out
     }
 
-    /// 戻り値は **実際に足したか** (既に同じ (target, source) があれば `false`)。
+    /// 戻り値: `Some(true)` = 足した / `Some(false)` = 既に同じ (target, source) がある /
+    /// `None` = target かモジュレーターが解決しない (Song を編集しない)。
     /// per-control の depth ドラッグは毎フレームここを通るので、 呼び出し側が
     /// 「今つないだ」 と「もう繋がっていた」 を区別できるようにしている。
     /// 載せる store は [`Self::edit_mod_routings`] と同じく target の持ち主。
@@ -453,24 +465,25 @@ impl AppData {
         track_id: u32,
         target: common::model::AutomationTarget,
         source_id: u32,
-    ) -> bool {
+    ) -> Option<bool> {
         // 実際に追加したときだけ recompile (per-control depth ドラッグは毎フレーム
         // AddModRouting を呼ぶので、no-op add で sync すると LoadSong 連発になる)。
         //
         // r.md #89: id は **足すこの 1 箇所**で採番する (`AutomationTarget::ModRoutingDepth`
         // が 1 本の変調を指すので、後から `ensure_ids` 任せにすると採番前の一瞬だけ
         // 深さを変調先にできない窓ができる)。
-        let Some(owner) = crate::handler::param_value::param_owner(self.cur.song_doc.song(), &target, track_id)
-        else {
-            return false;
-        };
-        self.edit_song(move |song| {
-            let Some((_, routings)) = song.param_stores(owner) else {
-                return false;
-            };
-            if routings.iter().any(|r| r.source_id == source_id && r.target == target) {
-                return false;
-            }
+        let song = self.cur.song_doc.song();
+        let owner = crate::handler::param_value::param_owner(song, &target, track_id)?;
+        let (_, routings) = song.param_stores(owner)?;
+        if routings.iter().any(|r| r.source_id == source_id && r.target == target) {
+            return Some(false);
+        }
+        // r.md #129: 解決しない routing (消えたモジュレーター / 種類違いの住所) を積むと enforce が同じ編集の中で
+        // 消し、中身の無い undo step と `*` だけが残る。規則は prune の routing の retain と同じ。
+        if !song.mod_routing_resolves(&target, source_id, owner) {
+            return None;
+        }
+        let added = self.edit_song_checked(move |song| {
             let id = song.alloc_mod_routing_id();
             let Some((_, routings)) = song.param_stores_mut(owner) else {
                 return false;
@@ -484,8 +497,8 @@ impl AppData {
                 enabled: true,
             });
             true
-        })
-        .unwrap_or(false)
+        });
+        Some(added)
     }
 
     pub(crate) fn remove_mod_routing(
@@ -497,7 +510,9 @@ impl AppData {
         // r.md #89: 消した変調の **深さ** を指していた変調の連鎖掃除は、SongDoc の
         // `enforce_edit_invariants` が同じ undo step で担う (r.md #129)。
         self.edit_mod_routings(track_id, &target, |routings| {
+            let before = routings.len();
             routings.retain(|r| !(r.source_id == source_id && r.target == target));
+            ((), routings.len() != before)
         });
     }
 
@@ -512,11 +527,13 @@ impl AppData {
         // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる
         // (= edit_song が epoch を bump)。
         let touched = self.edit_mod_routings(track_id, &target, |routings| {
-            let r = routings
-                .iter_mut()
-                .find(|r| r.source_id == source_id && r.target == target)?;
-            r.depth = depth.clamp(-1.0, 1.0);
-            Some(r.id)
+            let Some(r) = routings.iter_mut().find(|r| r.source_id == source_id && r.target == target) else {
+                return (None, false);
+            };
+            let depth = depth.clamp(-1.0, 1.0);
+            let changed = r.depth != depth;
+            r.depth = depth;
+            (Some(r.id), changed)
         });
         // r.md #89: 深さ自体も変調先 / オートメーション先なので、触ったことを記録する。
         if let Some(Some(routing_id)) = touched {
@@ -561,17 +578,12 @@ impl AppData {
         source_id: u32,
         bipolar: bool,
     ) {
+        let polarity = if bipolar { common::model::Polarity::Bipolar } else { common::model::Polarity::Unipolar };
         self.edit_mod_routings(track_id, &target, |routings| {
-            if let Some(r) = routings
-                .iter_mut()
-                .find(|r| r.source_id == source_id && r.target == target)
-            {
-                r.polarity = if bipolar {
-                    common::model::Polarity::Bipolar
-                } else {
-                    common::model::Polarity::Unipolar
-                };
-            }
+            let Some(r) = routings.iter_mut().find(|r| r.source_id == source_id && r.target == target) else {
+                return ((), false);
+            };
+            ((), std::mem::replace(&mut r.polarity, polarity) != polarity)
         });
     }
 
