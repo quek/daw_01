@@ -281,9 +281,8 @@ fn text_block(
     };
     let content_h = lines.len() as f32 * LINE_H;
     ui.scroll_area(id, inner, (inner.w, content_h), |ui, offset| {
-        let first = (offset.1 / LINE_H).floor().max(0.0) as usize;
-        let visible = (inner.h / LINE_H).ceil() as usize + 2;
-        for (i, line) in lines.iter().enumerate().skip(first).take(visible) {
+        let visible = ui.visible_rows(inner.y - offset.1, LINE_H, lines.len());
+        for (i, line) in lines.iter().enumerate().take(visible.end).skip(visible.start) {
             if line.is_empty() {
                 continue;
             }

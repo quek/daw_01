@@ -244,12 +244,7 @@ fn draw_list(
     let clicked = Cell::new(None::<usize>);
     let pointer = ui.pointer();
     ui.scroll_area(SCROLL_ID, list_rect, (list_rect.w, content_h), |ui, offset| {
-        if n == 0 {
-            return;
-        }
-        let r_start = (offset.1 / row_total).floor().max(0.0) as usize;
-        let r_end = (((offset.1 + list_rect.h) / row_total).ceil() as usize).min(n);
-        for r in r_start..r_end {
+        for r in ui.visible_rows(list_rect.y - offset.1, row_total, n) {
             let idx = n - 1 - r; // 表示行 → 履歴 index (newest-first)。
             let label = labels[idx];
             let row_y = list_rect.y - offset.1 + r as f32 * row_total;

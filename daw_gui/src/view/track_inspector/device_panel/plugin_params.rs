@@ -33,7 +33,16 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
         let label_w = 96.0;
         let input_x = ctx.x + label_w;
         let input_w = (row_w - label_w).max(40.0);
-        for (i, row) in view.params.iter().enumerate() {
+        // 行は param 表の全 param ぶんある (数万の実例)。**見えている行だけ** 描き、高さは全行ぶん消費する
+        // (Rack の行高 / インスペクタの content 高は変わらない、`Ui::visible_rows`)。
+        let pitch = input_h + 4.0;
+        let rows_top = y;
+        let visible = ui.visible_rows(rows_top, pitch, view.params.len());
+        #[allow(clippy::cast_precision_loss)]
+        let rows_end = rows_top + view.params.len() as f32 * pitch;
+        for (i, row) in view.params.iter().enumerate().take(visible.end).skip(visible.start) {
+            #[allow(clippy::cast_precision_loss)]
+            let y = rows_top + i as f32 * pitch;
             // param 名はプラグイン由来で長さ上限が無い。 label_w(96) を超えると
             // 後続の値ボックス (不透明 bg) に覆われて途中で消えるので rect で切る。
             ui.label_at_clipped(
@@ -58,7 +67,6 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
                     11.0,
                     p.text,
                 );
-                y += input_h + 4.0;
                 continue;
             }
             let (min, max) = (row.min, row.max);
@@ -114,9 +122,8 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
                 &target,
                 resp.mod_dragging,
             );
-            y += input_h + 4.0;
         }
-        y += 8.0;
+        y = rows_end + 8.0;
     }
     y
 }

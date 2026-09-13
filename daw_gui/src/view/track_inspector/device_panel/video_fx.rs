@@ -23,7 +23,15 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
         let track_id = view.track_id;
         // 変調の持ち主 (device を持つトラック) はパネルにつき 1 回だけ解決し、全行で使い回す。
         let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
-        for (i, param) in view.def.params.iter().enumerate() {
+        // 見えている行だけ描き、高さは全行ぶん消費する (plugin の Par と同じ、`Ui::visible_rows`)。
+        let pitch = input_h + 4.0;
+        let rows_top = y;
+        let visible = ui.visible_rows(rows_top, pitch, view.def.params.len());
+        #[allow(clippy::cast_precision_loss)]
+        let rows_end = rows_top + view.def.params.len() as f32 * pitch;
+        for (i, param) in view.def.params.iter().enumerate().take(visible.end).skip(visible.start) {
+            #[allow(clippy::cast_precision_loss)]
+            let y = rows_top + i as f32 * pitch;
             let value = f64::from(view.values[i]);
             let (min, max) = param.kind.range();
             let (min, max) = (f64::from(min), f64::from(max));
@@ -85,9 +93,8 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                 &target,
                 resp.mod_dragging,
             );
-            y += input_h + 4.0;
         }
-        y += 8.0;
+        y = rows_end + 8.0;
     }
     y
 }

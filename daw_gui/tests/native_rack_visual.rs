@@ -563,3 +563,57 @@ fn comp_mode_buttons_switch_the_mode() {
     }
     assert!(!h.native(comp).bypassed, "モード切り替えも触れば ON");
 }
+
+/// Par パネルは見えている行だけを描く: param 1000 個の plugin の Par を開いても、描く行 (名前の glyph) は
+/// インスペクタの可視範囲に入る分だけ。スクロールすると描く範囲が付いてきて、最後の param まで届く
+/// (パネルの高さは全行ぶんのまま)。
+#[test]
+fn plugin_param_panel_draws_only_the_visible_rows() {
+    const N: u32 = 1000;
+    // 画面の高さに入る行数の上限 (行の間隔 26px、上下の端でかかる 1 行ずつを足す)。
+    let max_rows = H as usize / 26 + 2;
+    let mut h = Harness::new("dark");
+    let t0 = h.track(0);
+    let mut device_id = 0;
+    h.app.edit_song(|song| {
+        let mut inst =
+            common::model::PluginInstance::new("com.example.big".into(), common::plugin_format::PluginFormat::Clap);
+        inst.id = song.alloc_device_id();
+        device_id = inst.id;
+        song.insert_device(common::model::ChainRef::Track(t0), 0, common::model::Device::Plugin(inst));
+    });
+    let infos = (0..N)
+        .map(|i| common::protocol::PluginParamInfo {
+            id: i,
+            name: format!("pp-{i:04}"),
+            module: String::new(),
+            min_value: 0.0,
+            max_value: 1.0,
+            default_value: 0.5,
+            flags: 0,
+        })
+        .collect();
+    h.app.cur.pipc.plugin_params.insert(device_id, infos);
+    h.dev(DeviceEvent::ToggleRackPanel(RackPanelKey::Device(device_id)));
+    let rows = |scene: &Scene| {
+        let mut v: Vec<Glyph> = inspector_glyphs(scene).into_iter().filter(|g| g.text.starts_with("pp-")).collect();
+        v.sort_by(|a, b| a.top.partial_cmp(&b.top).unwrap());
+        v
+    };
+
+    let drawn = rows(&h.settle());
+    assert_eq!(drawn.first().map(|g| g.text.as_str()), Some("pp-0000"), "Par の先頭の行は見えている");
+    assert!(drawn.len() <= max_rows, "描く行は可視範囲の分だけ: {} 行", drawn.len());
+    assert!(drawn.iter().all(|g| g.top > -26.0 && g.top < H as f32), "描いた行は画面の中: {drawn:?}");
+
+    // インスペクタの本文を一番下までスクロールする (param の数値欄ではなく名前の列の上でホイール)。
+    let (x, y) = (PAD + 20.0, H as f32 / 2.0);
+    let _ = h.frame(hover(x, y));
+    for _ in 0..3 {
+        let _ = h.frame(PointerFrame { scroll_delta: (0.0, -1.0e7), ..hover(x, y) });
+    }
+    let drawn = rows(&h.settle());
+    assert!(drawn.len() <= max_rows, "スクロールしても描く行は可視範囲の分だけ: {} 行", drawn.len());
+    assert!(!drawn.iter().any(|g| g.text == "pp-0000"), "先頭の行はもう描かない");
+    assert_eq!(drawn.last().map(|g| g.text.as_str()), Some("pp-0999"), "最後の param まで届く (パネルは全行ぶんの高さ)");
+}

@@ -360,13 +360,11 @@ fn draw_theme_list(app: &AppData, ui: &mut Ui<'_, AppData>, list_rect: Rect) {
     let clicked = Cell::new(None::<usize>);
     let pointer = ui.pointer();
     ui.scroll_area(SCROLL_ID, list_rect, (list_rect.w, content_h), |ui, offset| {
-        for (i, theme) in themes.iter().enumerate() {
+        // scroll 範囲外は描かない (行数は高々数十だが list_rect の外へはみ出させない、`Ui::visible_rows`)。
+        let visible = ui.visible_rows(list_rect.y - offset.1, row_total, n);
+        for (i, theme) in themes.iter().enumerate().take(visible.end).skip(visible.start) {
             let row_y = list_rect.y - offset.1 + i as f32 * row_total;
             let row_rect = Rect { x: list_rect.x, y: row_y, w: row_w, h: ROW_H };
-            // scroll 範囲外は描かない (行数は高々数十だが list_rect の外へはみ出させない)。
-            if row_rect.y + ROW_H < list_rect.y || row_rect.y > list_rect.y + list_rect.h {
-                continue;
-            }
             let inside = pointer.pos.is_some_and(|(px, py)| row_rect.contains(px, py));
             let is_current = theme.id == app.theme.id;
             let bg = if is_current {
