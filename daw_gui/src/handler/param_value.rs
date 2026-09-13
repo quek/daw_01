@@ -6,6 +6,14 @@
 use crate::app_types::*;
 use crate::state::*;
 
+/// id (device / chain / Parallel / 変調ソース / 変調) で束縛する住所か。`bound_owner_track` が
+/// `None` を返したとき、束縛先が居ない (= 削除された) のか、呼び出し側の track が持ち主の
+/// 住所なのかを分ける。
+fn target_is_id_bound(target: &common::model::AutomationTarget) -> bool {
+    use common::model::AutomationTarget as T;
+    target.bound_node_id().is_some() || matches!(target, T::ModSourceParam { .. } | T::ModRoutingDepth { .. })
+}
+
 impl AppData {
     /// `A` キー shortcut の handler。`last_touched_param` の lane を
     /// 該当 track に追加 (or 既存があれば visible = true で復活)。
@@ -16,52 +24,31 @@ impl AppData {
                 "No parameter touched yet — drag any knob first".into();
             return;
         };
-        // Phase 5 Step 5.1 (gui_01 #034): song-level target は master row の
-        // `song_lanes` に追加 (= track 紐付け無し)。 TrackBuiltin / PluginParam
-        // は従来通り該当 track の automation_lanes に追加。
-        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam も master row の
-        // `song_lanes` に置く (master は Track ではないので track_by_id で引けない)。
-        let is_song_level = matches!(
-            touched.target,
-            common::model::AutomationTarget::SongTempo
-                | common::model::AutomationTarget::SongTimeSigNumerator
-        ) || touched.track_id == common::model::MASTER_TRACK_ID;
-        // song-level でない場合のみ touched track が削除済か検査。
-        if !is_song_level && self.cur.song_doc.song().track_by_id(touched.track_id).is_none() {
+        // r.md #129 (§7.7): 持ち主は target の束縛先が決める (device を他トラックへ運んだ後でも、
+        // master fx chain の device でも正しい store に積む)。置き場の分岐は `param_stores` 1 か所。
+        let song = self.cur.song_doc.song();
+        let owner = match song.bound_owner_track(&touched.target) {
+            Some(owner) => owner,
+            None if target_is_id_bound(&touched.target) => {
+                self.cur.peph.last_touched_param = None;
+                self.ui_ephemeral.status_message = "Last-touched parameter was removed".into();
+                return;
+            }
+            None => touched.track_id,
+        };
+        let Some((lanes, _)) = song.param_stores(owner) else {
             self.cur.peph.last_touched_param = None;
             self.ui_ephemeral.status_message =
                 "Last-touched parameter's track was removed".into();
             return;
-        }
-        // 既存 lane を find (target 一致)。 master か track かで lookup 経路が分岐。
-        let existing_lane_id: Option<u32> = if is_song_level {
-            self.cur.song_doc.song()
-                .song_lanes
-                .iter()
-                .find(|l| l.target == touched.target)
-                .map(|l| l.id)
-        } else {
-            self.cur.song_doc.song()
-                .track_by_id(touched.track_id)
-                .and_then(|t| {
-                    t.automation_lanes
-                        .iter()
-                        .find(|l| l.target == touched.target)
-                        .map(|l| l.id)
-                })
         };
-        if let Some(lane_id) = existing_lane_id {
+        if let Some(lane_id) = lanes.iter().find(|l| l.target == touched.target).map(|l| l.id) {
             // 既存 lane を visible / enabled = true に戻して expand。
-            let lookup_track_id = if is_song_level {
-                common::model::MASTER_TRACK_ID
-            } else {
-                touched.track_id
-            };
             self.cur.view
                 .hidden_automation_lanes
-                .remove(&common::model::AutomationLaneKey { track: lookup_track_id, lane: lane_id });
+                .remove(&common::model::AutomationLaneKey { track: owner, lane: lane_id });
             self.edit_song_checked(|song| {
-                if let Some(lane) = song.automation_lane_by_key_mut(lookup_track_id, lane_id)
+                if let Some(lane) = song.automation_lane_by_key_mut(owner, lane_id)
                     && !lane.enabled
                 {
                     lane.enabled = true;
@@ -70,51 +57,56 @@ impl AppData {
                     false
                 }
             });
-            if is_song_level {
-                self.cur.view.master_row_automation_expanded = true;
-            } else {
-                self.cur.view.expanded_automation_tracks.insert(touched.track_id);
-            }
+            self.expand_automation_of(owner);
             self.ui_ephemeral.status_message = format!(
                 "Automation lane '{}' は既に存在します",
                 touched.display_name
             );
             return;
         }
-        // 新規 lane を作成。default_value は target に応じて現在値を引く。
+        // 新規 lane を作成。default_value は target に応じて現在値を引く。native の値は
+        // `params` にあるので、PluginParam 式の隠しレーンは作らない。
         let default_value = self.lane_default_for_target(&touched);
-        if is_song_level {
-            self.edit_song(|song| {
-                let lane_id = song.alloc_song_lane_id();
-                let new_lane = common::model::AutomationLane {
-                    id: lane_id,
-                    ..common::model::AutomationLane::new(touched.target.clone(), default_value)
-                };
-                song.song_lanes.push(new_lane);
-            });
-            self.cur.view.master_row_automation_expanded = true;
-        } else {
-            let __applied = self.edit_song_checked(|song| {
-                let Some(track) = song.track_by_id_mut(touched.track_id) else {
-                    return false;
-                };
-                let lane_id = track.alloc_lane_id();
-                let new_lane = common::model::AutomationLane {
-                    id: lane_id,
-                    ..common::model::AutomationLane::new(touched.target.clone(), default_value)
-                };
-                track.automation_lanes.push(new_lane);
-                true
-            });
-            if !__applied {
-                return;
-            }
-            self.cur.view.expanded_automation_tracks.insert(touched.track_id);
+        let lane = common::model::AutomationLane::new(touched.target.clone(), default_value);
+        if !self.edit_song_checked(|song| song.push_lane(owner, lane).is_some()) {
+            return;
         }
+        self.expand_automation_of(owner);
         self.ui_ephemeral.status_message = format!(
             "Added automation lane: {}",
             touched.display_name
         );
+    }
+
+    /// `owner` (track id か `MASTER_TRACK_ID`) のオートメーション行を開く。
+    fn expand_automation_of(&mut self, owner: u32) {
+        if owner == common::model::MASTER_TRACK_ID {
+            self.cur.view.master_row_automation_expanded = true;
+        } else {
+            self.cur.view.expanded_automation_tracks.insert(owner);
+        }
+    }
+
+    /// 「最後に触ったパラメーター」を記録する唯一の口 (`A` キー / MIDI Learn の的)。
+    /// 値を触る経路 (native の値編集 / 単体 native の bypass / Limiter / 変調のツマミと深さ) は
+    /// **必ずここを呼ぶ** (呼ばないとその param だけ `A` でレーンを作れない)。
+    ///
+    /// 持ち主は `bound_owner_track` (id で束縛する住所の store の持ち主)、target だけでは
+    /// 決まらない住所 (Volume / Pan など) は `fallback_owner`。id で束縛する住所の束縛先が
+    /// 居なければ記録しない。名前は `automation_target_label`。
+    pub(crate) fn note_touched_target(&mut self, target: common::model::AutomationTarget, fallback_owner: u32) {
+        let track_id = match self.cur.song_doc.song().bound_owner_track(&target) {
+            Some(owner) => owner,
+            None if target_is_id_bound(&target) => return,
+            None => fallback_owner,
+        };
+        let display_name = self.automation_target_label(&target);
+        self.cur.peph.last_touched_param = Some(TouchedParam {
+            track_id,
+            target,
+            display_name,
+            touched_at: std::time::Instant::now(),
+        });
     }
 
     /// track-builtin target の現在値 (plain)。`lane_default_for_target` から
@@ -170,11 +162,6 @@ impl AppData {
                 .song()
                 .parallel_by_id(*parallel_id)
                 .map_or(0.5, |r| f64::from(r.select_pos())),
-            // 内蔵チャンネルストリップ: target ↔ フィールドの対応は
-            // `ChannelStrip::target_value` が SSoT (ここで写さない)。
-            P::StripEqOn | P::StripCompOn | P::StripEq { .. } | P::StripComp { .. } => {
-                track.strip.target_value(param).map_or(0.0, f64::from)
-            }
         }
     }
 
@@ -204,10 +191,19 @@ impl AppData {
                 .all_mod_routings()
                 .find(|r| r.id == *routing_id)
                 .map_or(0.0, |r| f64::from(r.depth)),
-            // マスターストリップ: target ↔ フィールドの対応は
-            // `MasterStrip::param` が SSoT (ここで写さない)。
-            AutomationTarget::MasterStrip(param) => {
-                f64::from(self.cur.song_doc.song().master_strip.param(*param))
+            // r.md #129: 内蔵 device は id で引く (`NativeDevice::param` が住所 ↔ 値の SSoT)。
+            // 束縛先が居なければ住所の既定値。
+            AutomationTarget::NativeParam { device_id, param } => f64::from(
+                self.cur
+                    .song_doc
+                    .song()
+                    .native_by_id(*device_id)
+                    .and_then(|d| d.param(*param))
+                    .or_else(|| param.default_plain())
+                    .unwrap_or(0.0),
+            ),
+            AutomationTarget::MasterLimiter(param) => {
+                f64::from(self.cur.song_doc.song().master_limiter.param(*param))
             }
             AutomationTarget::SongTempo => f64::from(self.cur.song_doc.song().bpm),
             AutomationTarget::SongTimeSigNumerator => f64::from(self.cur.song_doc.song().time_sig.0),

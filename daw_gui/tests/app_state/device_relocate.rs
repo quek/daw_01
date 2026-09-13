@@ -52,7 +52,8 @@ fn add_plugin(app: &mut AppData, track_id: u32, plugin_id: &str) -> u64 {
         .position(|t| t.id == track_id)
         .expect("track exists");
     select_track_single(app, idx);
-    let at = app.cur.song_doc.song().tracks[idx].devices.len() as u32;
+    // `fake_plugin_loaded` の index は `plugins()` 基準 (組み込み native を数えない)。
+    let at = app.cur.song_doc.song().tracks[idx].plugins().count() as u32;
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: plugin_id.into(),
@@ -87,13 +88,12 @@ fn add_plugin_param_lane(app: &mut AppData, track_id: u32, device_id: u64) -> u3
     .expect("edit_song")
 }
 
+/// `track_id` (`MASTER_TRACK_ID` なら master fx chain) の plugin id 列 (組み込み native は数えない)。
 fn track_devices(app: &AppData, track_id: u32) -> Vec<u64> {
     app.cur.song_doc
         .song()
-        .tracks
-        .iter()
-        .find(|t| t.id == track_id)
-        .map(|t| t.plugins().map(|d| d.id).collect())
+        .fx_chain_by_track_id(track_id)
+        .map(|devices| common::model::plugins(devices).map(|d| d.id).collect())
         .unwrap_or_default()
 }
 
@@ -472,7 +472,7 @@ fn removing_one_of_two_voicevox_keeps_vocal_marker() {
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     let src = app.cur.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
-    assert_eq!(src.devices.len(), 1, "1 本だけ消える");
+    assert_eq!(src.plugins().count(), 1, "1 本だけ消える (組み込み native は数えない)");
     assert_eq!(
         src.source,
         InstrumentSource::Vocal,
@@ -540,9 +540,9 @@ fn master_chain_round_trip() {
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
     assert_eq!(
-        app.cur.song_doc.song().master_fx_chain.iter().map(|d| d.id()).collect::<Vec<_>>(),
+        track_devices(&app, master),
         vec![dev],
-        "master へ移る"
+        "master へ移る (組み込み Bus Comp / Tone EQ は数えない)"
     );
     assert_eq!(
         app.cur.song_doc.song().song_lanes.len(),
@@ -559,7 +559,7 @@ fn master_chain_round_trip() {
     app.handle_event(AppEvent::Plugin(
         common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
     ));
-    assert!(app.cur.song_doc.song().master_fx_chain.is_empty(), "master から戻る");
+    assert!(track_devices(&app, master).is_empty(), "master から戻る");
     assert!(app.cur.song_doc.song().song_lanes.is_empty(), "lane も戻る");
     assert_eq!(track_devices(&app, t0), vec![dev], "device_id は往復しても不変");
     assert_eq!(

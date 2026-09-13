@@ -81,6 +81,21 @@ impl AppData {
             .map(|(id, g)| (*id, *g))
             .collect();
         plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
+        // r.md #129 (Q18): 開いている Par。現存する device の分だけ (Limiter は常に居る)、キー順
+        // (`BTreeSet` の順) で save 差分を安定させる。
+        let open_rack_panels: Vec<common::model::RackPanelKey> = self
+            .cur
+            .view
+            .open_rack_panels
+            .iter()
+            .filter(|k| match k {
+                common::model::RackPanelKey::Device(id) => {
+                    self.cur.song_doc.song().device_by_id(*id).is_some()
+                }
+                common::model::RackPanelKey::MasterLimiter => true,
+            })
+            .copied()
+            .collect();
         common::model::ViewState {
             arrange_zoom_x: self.cur.view.arrange_zoom_x,
             arrangement_split_ratio: self.cur.view.arrangement_split_ratio,
@@ -115,6 +130,7 @@ impl AppData {
             launcher_width: self.cur.view.launcher_width,
             launcher_scene_col_w: self.cur.view.launcher_scene_col_w,
             launcher_scroll_scene: self.cur.view.launcher_scroll_scene,
+            open_rack_panels,
         }
     }
 
@@ -172,6 +188,8 @@ impl AppData {
             .collect();
         self.cur.view.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
         self.cur.view.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
+        // r.md #129 (Q18): 開いている Par。存在しない id は描画も保存もされないので、そのまま入れる。
+        self.cur.view.open_rack_panels = v.open_rack_panels.into_iter().collect();
         // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
         // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
         self.cur.view.automation_lane_row_overrides = v

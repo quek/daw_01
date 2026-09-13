@@ -7,12 +7,11 @@
 use daw_ui_core::{Edit, Ui};
 
 use crate::app::{AppData, AppEvent};
-use crate::event_device::DeviceEvent;
 use crate::state::ModRackHover;
 
 /// `daw.toggle_mute` を消費し、 文脈で決まる対象の mute / bypass を切り替える。
-/// 内蔵チャンネルストリップ (docs/plan_channel_strip.md) が Q を先取りする:
-/// カーソルが Comp / EQ の上にあればそのセクションのバイパスを切り替え、
+/// マスターパネル / Mixer 帯の内蔵 device (r.md #129) が Q を先取りする:
+/// カーソルがその上にあればその device (または master Limiter) の ON/OFF を切り替え、
 /// 下の clip / note の mute へは落とさない。
 ///
 /// `mixer_active` = Mixer タブが選ばれていて pointer が下部パネル内、
@@ -23,24 +22,28 @@ pub(super) fn dispatch(
     mixer_active: bool,
     is_pianoroll_active: bool,
 ) {
-    if ui.take_shortcut("daw.toggle_mute") && !toggle_hovered_strip_section(app, ui, mixer_active) {
-        dispatch_toggle_mute(app, ui, is_pianoroll_active);
+    if !ui.take_shortcut("daw.toggle_mute") {
+        return;
+    }
+    match app.hovered_bypass_target(mixer_active) {
+        Some(target) => {
+            let event = app.bypass_toggle_event(target);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(event);
+            }));
+        }
+        None => dispatch_toggle_mute(app, ui, is_pianoroll_active),
     }
 }
 
-/// r.md #105: `Q` が bypass 切替する device = **カーソル直下のチェーン行だけ** (S キーの
-/// ソロと同じ「カーソルがある行」規則)。 device の選択集合は使わない — チェーン行の
-/// 選択は画面上で見分けにくく、 選択優先にすると「別の行を指して押したのに前に click
-/// した行が切り替わる」 (実機 2026-09-05)。 空 = device は対象外 (clip / note へ落とす)。
-fn q_device_targets(app: &AppData) -> Vec<u64> {
-    app.cur.peph.inspector_hovered_device.into_iter().collect()
-}
-
-/// Q の対象を文脈で決めて mute / bypass を切り替える (`dispatch_shortcuts` の Q 節、 内蔵
-/// ストリップのセクションを先取りした後)。 優先順: 変調ラック (r.md #115) → インスペクタの
-/// device → オートメーションレーン → ノート → クリップ / 時間範囲。
+/// Q の対象を文脈で決めて mute / bypass を切り替える (`dispatch_shortcuts` の Q 節、 マスター
+/// パネル / Mixer 帯を先取りした後)。 優先順: 変調ラック (r.md #115) → インスペクタの
+/// 行 → オートメーションレーン → ノート → クリップ / 時間範囲。
 fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_active: bool) {
-    let device_targets = q_device_targets(app);
+    // r.md #105: `Q` が bypass 切替する device = **カーソル直下のチェーン行だけ** (S キーの
+    // ソロと同じ「カーソルがある行」規則)。 device の選択集合は使わない — チェーン行の
+    // 選択は画面上で見分けにくく、 選択優先にすると「別の行を指して押したのに前に click
+    // した行が切り替わる」 (実機 2026-09-05)。
     if let Some(hover) = app.cur.peph.inspector_hovered_mod {
         // r.md #115: ポインタ下のモジュレーター (ヘッダ / 本体) または routing 行を
         // バイパス切替。 ラックにボタンは無く、 これが唯一の到達手段 (レーンと同じ)。
@@ -58,13 +61,11 @@ fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_ac
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(event);
         }));
-    } else if !device_targets.is_empty() {
-        let bypassed = !app.all_devices_bypassed(&device_targets);
+    } else if let Some(row) = app.cur.peph.inspector_hovered_row {
+        // Rack の行 (Par パネル込みの高さ) → その device / master Limiter の ON/OFF。
+        let event = app.bypass_toggle_event(row);
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed {
-                device_ids: device_targets,
-                bypassed,
-            }));
+            app.handle_event(event);
         }));
     } else if let Some(lane) = app.cur.peph.arrange_hovered_automation_lane {
         // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
@@ -123,62 +124,4 @@ fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_ac
             }));
         }
     }
-}
-
-/// Q を内蔵チャンネルストリップに割り当てる。カーソルが Comp / EQ のセクション本体か
-/// 常設帯の上にあれば、そのセクションのバイパスを切り替えて `true`。対象が無ければ
-/// `false` で、呼び出し側は従来どおり note / clip の mute へ進む。
-///
-/// 対象面の算出は `view::strip_sections` (`mixer_hovered_strip_section`) が SSoT。
-fn toggle_hovered_strip_section(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    mixer_active: bool,
-) -> bool {
-    use crate::event::{MasterSection, StripEdit, StripSection};
-    // マスターパネルは常時描かれるので hover が古くなることはない。ミキサーより
-    // 先に見る (パネルは mixer / arrangement のどちらの上にも無く、排他)。
-    if let Some(section) = app.cur.peph.master_hovered_section {
-        let param = match section {
-            MasterSection::Comp => common::model::MasterStripParam::CompOn,
-            MasterSection::Eq => common::model::MasterStripParam::EqOn,
-            MasterSection::Limiter => common::model::MasterStripParam::LimiterOn,
-        };
-        let on = app.cur.song_doc.song().master_strip.param(param) >= 0.5;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::MasterStripEdit {
-                param,
-                value: f32::from(u8::from(!on)),
-            });
-        }));
-        return true;
-    }
-    // hover 値は strip を描いた frame にしか更新されないので、Mixer タブから
-    // 離れた後も最後の値が残る。**タブと pointer 位置で毎回ゲートする**
-    // (`mixer_hovered_track` を使う S キーと同じ作法) — 無いと Piano Roll に
-    // 切り替えた後の Q がノート mute ではなくストリップ切替になる。
-    if !mixer_active {
-        return false;
-    }
-    let Some((track_id, section)) = app.cur.peph.mixer_hovered_strip_section else {
-        return false;
-    };
-    let param = match section {
-        StripSection::Comp => common::model::TrackBuiltinParam::StripCompOn,
-        StripSection::Eq => common::model::TrackBuiltinParam::StripEqOn,
-    };
-    let on = app
-        .cur.song_doc
-        .song()
-        .track_by_id(track_id)
-        .and_then(|t| t.strip.target_value(&param))
-        .unwrap_or(0.0)
-        >= 0.5;
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::StripEdit {
-            track: track_id,
-            edit: StripEdit::Param { param, value: f32::from(u8::from(!on)) },
-        });
-    }));
-    true
 }

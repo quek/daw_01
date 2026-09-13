@@ -486,13 +486,9 @@ fn audio_dependency(
 
 /// `owner_track_id` の置き場に `target` の automation lane があるか。
 fn song_has_lane(song: &Song, owner_track_id: u32, target: &AutomationTarget) -> bool {
-    if owner_track_id == 0 || owner_track_id == MASTER_TRACK_ID {
-        return song.song_lanes.iter().any(|l| &l.target == target);
-    }
-    song.tracks
-        .iter()
-        .find(|t| t.id == owner_track_id)
-        .is_some_and(|t| t.automation_lanes.iter().any(|l| &l.target == target))
+    // legacy の `owner_track_id == 0` は master (`Song::mod_source_owner` と同じ読み)。
+    let owner = if owner_track_id == 0 { MASTER_TRACK_ID } else { owner_track_id };
+    song.param_stores(owner).is_some_and(|(lanes, _)| lanes.iter().any(|l| &l.target == target))
 }
 
 /// **`ModParam` の「今の値」(plain) を読む唯一の口。** ラックのツマミ / オートメーション
@@ -1643,8 +1639,8 @@ mod tests {
         );
         // ソース #1 を消す → routing#1 が消える → それを指す routing#2 も消える。
         song.mod_sources.retain(|m| m.id != 1);
-        assert!(song.prune_dangling_mod_targets(), "1 回目は変化する");
+        assert!(song.prune_dangling_param_targets(), "1 回目は変化する");
         assert!(song.tracks[0].mod_routings.is_empty(), "連鎖して全部消える");
-        assert!(!song.prune_dangling_mod_targets(), "2 回目は変化しない (冪等)");
+        assert!(!song.prune_dangling_param_targets(), "2 回目は変化しない (冪等)");
     }
 }

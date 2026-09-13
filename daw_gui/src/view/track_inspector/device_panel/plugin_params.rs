@@ -12,6 +12,7 @@ pub(super) fn draw_plugin_params(
     area: Rect,
     pad: f32,
     mut y: f32,
+    open_device: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // ---- Plugin param panel -----------------------------------
@@ -19,7 +20,7 @@ pub(super) fn draw_plugin_params(
     // チェーン行「Par」ボタンで開閉。 VOICEVOX は device 既定の声 (キャラ→スタイル)
     // を、 汎用 plugin は param を scrubable_number で実レンジ編集する。 値の SSoT は
     // PluginParam lane の default_value (= `set_plugin_param`、 映像 FX と同 idiom)。
-    if let Some(view) = app.inspector_plugin_params() {
+    if let Some(view) = app.inspector_plugin_params(open_device) {
         let device_id = view.device_id;
         let track_id = view.track_id;
         ui.label_at_clipped(
@@ -110,7 +111,14 @@ pub(super) fn draw_plugin_params(
                 resp.dragging || resp.editing_text,
             );
             // 変調 depth ドラッグの falling edge で host 再同期。
-            mod_widget::push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
+            mod_widget::push_mod_depth_bracket(
+                ui,
+                app,
+                crate::app::ParamSurface::Rack,
+                track_id,
+                &target,
+                resp.mod_dragging,
+            );
             y += input_h + 4.0;
         }
         y += 8.0;

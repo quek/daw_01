@@ -28,6 +28,9 @@ mod audio_clip_renderer;
 mod audio_worker;
 mod automation;
 #[cfg(test)]
+// r.md #129: 記録器 (旧 strip DSP の tests) は strip 型と一緒に消えた。刺激と統計の API は
+// 内蔵 device DSP の golden 比較が使う (それまでは読み戻しの自己検査だけが使う)。
+#[allow(dead_code)]
 mod dsp_golden;
 mod engine;
 mod engine_shared;
@@ -1131,7 +1134,7 @@ fn build_stream(
                         // 「新しいフレームが来なかった経過時間ぶんの無音」を自分で
                         // 流し込んで落ちるので、書き手側の後始末が要らない。
                         for p in &local.projects {
-                            bridge.project(p.telemetry_slot).clear_track_meters();
+                            bridge.project(p.telemetry_slot).clear_meters();
                         }
                         dsp_load_ema = 0.0;
                         metrics.set_dsp_load_avg(0.0);

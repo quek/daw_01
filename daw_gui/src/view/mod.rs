@@ -32,6 +32,8 @@ pub mod master_strip_ui;
 pub mod menu_bar;
 pub mod mixer_strips;
 pub mod modulation;
+/// r.md #129: 内蔵 device の共有描画部品 (Rack / Mixer 帯 / マスターパネル)。
+pub mod native_device;
 pub mod param_gesture;
 pub mod plugin_picker;
 pub mod preview_window;

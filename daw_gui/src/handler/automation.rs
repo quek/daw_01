@@ -291,25 +291,18 @@ impl AppData {
     }
 
     pub(crate) fn delete_lane(&mut self, track_id: u32, lane_id: u32) {
-        // gui_01 #034 (Phase 63n-10): master row sentinel 対応。 song_lanes
-        // の方にあれば該当 idx を探して remove、 通常 track なら従来通り。
+        // gui_01 #034 (Phase 63n-10): master row sentinel (`MASTER_TRACK_ID` → song_lanes) も
+        // 置き場の分岐は `param_stores_mut` 1 か所 (r.md #129)。共有先のなくなった clip_contents は
+        // 次の save / GC で自動回収。
         self.edit_song_checked(|song| {
-            if track_id == common::model::MASTER_TRACK_ID {
-                if let Some(idx) = song.song_lanes.iter().position(|l| l.id == lane_id) {
-                    song.song_lanes.remove(idx);
-                    return true;
-                }
-                false
-            } else if let Some(track) = song.track_by_id_mut(track_id)
-                && let Some(idx) = track.lane_index_by_id(lane_id)
-            {
-                track.automation_lanes.remove(idx);
-                // 共有先のなくなった clip_contents は次の save / GC で
-                // 自動回収。
-                true
-            } else {
-                false
-            }
+            let Some((lanes, _)) = song.param_stores_mut(track_id) else {
+                return false;
+            };
+            let Some(idx) = lanes.iter().position(|l| l.id == lane_id) else {
+                return false;
+            };
+            lanes.remove(idx);
+            true
         });
     }
 

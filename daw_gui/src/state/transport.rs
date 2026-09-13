@@ -18,6 +18,51 @@ pub enum PlayFrom {
     Continue,
 }
 
+/// r.md #129 (§11.1): GR を出す内蔵 device の GR 表示値 (**正の減衰量 dB**)。
+///
+/// 読み手 (Rack 行 / Par / Mixer 帯 / マスターパネル) は device id で引く。engine の GR 面は
+/// compile 順の slot だが、ここは id 昇順に並べ替えて二分探索する (位置で引かない、不変条件 1)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NativeGrDisplay {
+    /// `(device id, 減衰量 dB)`、id 昇順。
+    entries: Vec<(u64, f32)>,
+}
+
+impl NativeGrDisplay {
+    /// `id` の減衰量 (dB、無ければ 0)。
+    #[must_use]
+    pub fn get(&self, id: u64) -> f32 {
+        self.entries.binary_search_by_key(&id, |e| e.0).map_or(0.0, |i| self.entries[i].1)
+    }
+
+    /// GR 面の 1 tick を取り込む。面にある id は peak と同じ release 弾道で更新し、面に無い id は
+    /// 0 へ減衰させて表示解像度で 0 になったら捨てる (処理されなくなった device の値が残らない)。
+    pub fn update(&mut self, plane: &[(u64, f32)], release: f32) {
+        for e in &mut self.entries {
+            if !plane.iter().any(|(id, _)| *id == e.0) {
+                e.1 = common::meter::update_peak(e.1, 0.0, release);
+            }
+        }
+        for &(id, gr_db) in plane {
+            let amount = (-gr_db).max(0.0);
+            match self.entries.binary_search_by_key(&id, |e| e.0) {
+                Ok(i) => self.entries[i].1 = common::meter::update_peak(self.entries[i].1, amount, release),
+                Err(i) => self.entries.insert(i, (id, amount)),
+            }
+        }
+        let steps = crate::handler::activity::METER_STEPS;
+        self.entries.retain(|&(id, v)| {
+            plane.iter().any(|(p, _)| *p == id)
+                || crate::handler::activity::quantize(v / common::model::GR_METER_RANGE_DB, steps) != 0
+        });
+    }
+
+    /// `(device id, 減衰量 dB)` を id 昇順に。
+    pub fn iter(&self) -> impl Iterator<Item = (u64, f32)> + '_ {
+        self.entries.iter().copied()
+    }
+}
+
 pub struct TransportState {
     /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の
     /// toggle button で切り替え、 `AppEvent::SetMetronomeEnabled(bool)` で
@@ -81,14 +126,15 @@ pub struct TransportState {
     pub master_meter: crate::master_meter::MasterMeterSnapshot,
 
     // -------- Mixer --------
-    /// mixer strip のメーター表示値 `(peak L, peak R, ゲインリダクション dB)`。
-    /// GR は **正の減衰量** (0 = 掛かっていない) で持ち、peak と同じ release
-    /// 弾道で 0 へ戻る。書き手は `on_track_peaks_tick` の 1 か所。
-    pub track_peak_display: Vec<(f32, f32, f32)>,
-    /// マスターストリップのゲインリダクション表示値 `(バスコンプ, リミッター)`。
-    /// per-track と同じく **正の減衰量 dB** で持ち、同じ release 弾道で 0 へ戻る
-    /// (`docs/plan_master_strip.md` §6)。
-    pub master_strip_gr: (f32, f32),
+    /// mixer strip のメーター表示値 `(peak L, peak R)`。書き手は `on_track_peaks_tick` の 1 か所。
+    pub track_peak_display: Vec<(f32, f32)>,
+    /// r.md #129 (§11.1): GR を出す内蔵 device (Comp / Bus Comp) の GR 表示値 (device id キー)。
+    pub native_gr: NativeGrDisplay,
+    /// master のフェーダー後 Limiter の GR 表示値 (**正の減衰量 dB**、peak と同じ release 弾道)。
+    pub master_limiter_gr: f32,
+    /// r.md #129 (§11.2): EQ Par の背後に描くスペクトラム (device id → 768 帯の `display_db`)。
+    /// アクティブなタブの `DeviceSpectrumTick` だけが書く。session-only。
+    pub device_spectra: std::collections::HashMap<u64, std::sync::Arc<[f32]>>,
     /// docs/plan_modulation.md §4.2 / r.md #89: audio engine が publish した
     /// 変調値面 (**`ModSource::id` キー** — SSoT は `common/src/mod_plane.rs`)。
     /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が
@@ -148,8 +194,8 @@ pub struct TransportState {
 
 impl TransportState {
     /// 起動時の状態 (停止中、 ループ無し、 メーターは track 数ぶんの無音)。
-    /// `track_peak_display` は曲の track 数に揃えた `(peak_l, peak_r, hold)` の列。
-    pub fn new(track_peak_display: Vec<(f32, f32, f32)>) -> Self {
+    /// `track_peak_display` は曲の track 数に揃えた `(peak_l, peak_r)` の列。
+    pub fn new(track_peak_display: Vec<(f32, f32)>) -> Self {
         Self {
             metronome_enabled: false,
             is_playing: false,
@@ -161,7 +207,9 @@ impl TransportState {
             panic_release_pending: false,
             master_meter: crate::master_meter::MasterMeterSnapshot::default(),
             track_peak_display,
-            master_strip_gr: (0.0, 0.0),
+            native_gr: NativeGrDisplay::default(),
+            master_limiter_gr: 0.0,
+            device_spectra: std::collections::HashMap::new(),
             mod_plane: common::mod_plane::ModPlane::default(),
             track_voices: Vec::new(),
             pending_play: None,

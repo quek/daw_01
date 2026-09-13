@@ -7,9 +7,9 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ChainEntry};
 use crate::event_device::DeviceEvent;
-use common::model::{TapPoint, TapSource};
+use common::model::{RackPanelKey, TapPoint, TapSource};
 
-use super::chain_list::{ROW_H, RowCtx};
+use super::chain_list::{ROW_H, RowCtx, panel_height};
 use super::device_panel;
 
 /// SC パネル 1 port 行の高さ。
@@ -30,14 +30,15 @@ pub(super) fn draw_plugin_expansions(
         draw_sidechain_panel(app, ui, device_id, ctx.sc_ports, rect);
         ey += ctx.sc_panel_h;
     }
-    if ctx.open_dev == Some(device_id) {
-        let exp_rect = Rect { x: content.x, y: ey, w: content.w, h: ctx.panel_h };
+    let key = RackPanelKey::Device(device_id);
+    if app.rack_panel_open(key) {
+        let exp_rect = Rect { x: content.x, y: ey, w: content.w, h: panel_height(app, device_id) };
         let measured =
-            (device_panel::draw_device_panel(app, ui, ctx.area, ctx.pad, exp_rect) - exp_rect.y).max(0.0);
-        // 展開部の実消費高を測って次フレームの行高に使う (lag-by-one)。
-        if (app.cur.peph.inspector_device_panel_h - measured).abs() > 0.5 {
+            (device_panel::draw_device_panel(app, ui, ctx.area, ctx.pad, exp_rect, device_id) - exp_rect.y).max(0.0);
+        // 展開部の実消費高を device ごとに測って次フレームの行高に使う (lag-by-one)。
+        if app.cur.peph.rack_panel_heights.get(&key).is_none_or(|h| (h - measured).abs() > 0.5) {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.cur.peph.inspector_device_panel_h = measured;
+                app.cur.peph.rack_panel_heights.insert(key, measured);
             }));
         }
     }

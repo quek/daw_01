@@ -155,6 +155,11 @@ impl AppData {
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => {
                     return Some(BindingTarget::TrackPan(tp.track_id));
                 }
+                // r.md #129 (§7.9): 内蔵 device と master Limiter も plugin と同じ正式な的。
+                AutomationTarget::NativeParam { device_id, param } => {
+                    return Some(BindingTarget::NativeParam { device_id, param });
+                }
+                AutomationTarget::MasterLimiter(p) => return Some(BindingTarget::MasterLimiter(p)),
                 _ => {}
             }
         }
@@ -290,6 +295,28 @@ impl AppData {
                 // set_plugin_param が edit_song で epoch を bump するので、
                 // 毎 CC の full LoadSong flood は runner の frame flush (flush_song_sync)
                 // が 1 frame 1 回へ構造的に coalesce する (旧 pending_host_sync 置換)。
+            }
+            // r.md #129 (§7.9): ノブと同じ口 (自動 ON と値 IPC) を通す。On は 64 で切り替える。
+            common::model::BindingTarget::NativeParam { device_id, param } => {
+                if let common::model::NativeParamId::On(_) = param {
+                    self.set_devices_bypassed(&[device_id], value < 64);
+                } else {
+                    let target = common::model::AutomationTarget::NativeParam { device_id, param };
+                    #[allow(clippy::cast_possible_truncation)]
+                    let plain = common::automation::target_range(&target, None).from_norm(f64::from(v_norm)) as f32;
+                    self.apply_native_edit(device_id, &crate::event_native::NativeEdit::param(param, plain));
+                }
+            }
+            common::model::BindingTarget::MasterLimiter(p) => {
+                use crate::event_native::MasterLimiterEdit;
+                let edit = match p {
+                    common::model::MasterLimiterParam::On => MasterLimiterEdit::On(value >= 64),
+                    #[allow(clippy::cast_possible_truncation)]
+                    common::model::MasterLimiterParam::Ceiling => {
+                        MasterLimiterEdit::Ceiling(p.range().from_norm(f64::from(v_norm)) as f32)
+                    }
+                };
+                self.apply_master_limiter_edit(edit);
             }
             // r.md #87: ランチャー宛は冒頭の `is_launcher()` で弾いてある
             // (押した / 離したで効くので連続値の経路には来ない)。

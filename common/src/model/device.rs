@@ -1,8 +1,8 @@
 //! Parallel (r.md #110, `docs/plan_parallel.md`): ネスト可能な並列 device chain。
 //!
-//! `Track.devices` / `Song.master_fx_chain` の要素は [`Device`] = plugin か Parallel。
+//! `Track.devices` / `Song.master_fx_chain` の要素は [`Device`] = plugin / 内蔵 native / Parallel。
 //! Parallel は並列 [`ParallelChain`] の列で、各 chain がまた `Vec<Device>` を持つ (無限ネスト)。
-//! plugin / parallel / chain の id は **1 つの id 空間** (`Song.ids.next_device_id`) で採番し、
+//! plugin / native / parallel / chain の id は **1 つの id 空間** (`Song.ids.next_device_id`) で採番し、
 //! IPC / automation / 選択 / AudioTap はすべてその id でアドレスする (不変条件 1)。
 //! 位置 (chain 内 index) は表示順と挿入位置にしか使わない。
 
@@ -13,14 +13,16 @@ use super::*;
 
 /// device chain の 1 要素。
 ///
-/// serde: `Parallel` は externally tagged (`{"Parallel": {..}}`)、`Plugin` だけが untagged の
-/// **fallback** (= 旧 `.daw` の plugin 配列がそのまま読める)。 全 variant untagged の
-/// 「field 集合の pairwise 非交差」 には依存しない — 判別は `Parallel` タグの有無 1 点だけで、
-/// variant を足すときはタグ付きにすればよい。
+/// serde: `Parallel` / `Native` は externally tagged (`{"Parallel": {..}}` / `{"Native": {..}}`)、
+/// `Plugin` だけが untagged の **fallback** (= 旧 `.daw` の plugin 配列がそのまま読める)。 全 variant
+/// untagged の「field 集合の pairwise 非交差」 には依存しない — 判別はタグの有無だけで、
+/// variant を足すときはタグ付きにすればよい (untagged は末尾に置く必要がある)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum Device {
     Parallel(Parallel),
-    #[serde(untagged)] // arch-lint: allow-untagged (fallback variant 1 本、判別は Parallel タグ)
+    /// r.md #129: daw_audio が in-process で処理する内蔵 device。
+    Native(NativeDevice),
+    #[serde(untagged)] // arch-lint: allow-untagged (fallback variant 1 本、判別は Parallel / Native タグ)
     Plugin(PluginInstance),
 }
 
@@ -437,10 +439,11 @@ impl ParallelChain {
 }
 
 impl Device {
-    /// plugin / parallel どちらでも安定 id。
+    /// plugin / native / parallel どれでも安定 id。
     pub fn id(&self) -> u64 {
         match self {
             Device::Plugin(p) => p.id,
+            Device::Native(n) => n.id,
             Device::Parallel(r) => r.id,
         }
     }
@@ -448,6 +451,7 @@ impl Device {
     pub fn bypassed(&self) -> bool {
         match self {
             Device::Plugin(p) => p.bypassed,
+            Device::Native(n) => n.bypassed,
             Device::Parallel(r) => r.bypassed,
         }
     }
@@ -455,6 +459,7 @@ impl Device {
     pub fn set_bypassed(&mut self, bypassed: bool) {
         match self {
             Device::Plugin(p) => p.bypassed = bypassed,
+            Device::Native(n) => n.bypassed = bypassed,
             Device::Parallel(r) => r.bypassed = bypassed,
         }
     }
@@ -462,33 +467,85 @@ impl Device {
     pub fn as_plugin(&self) -> Option<&PluginInstance> {
         match self {
             Device::Plugin(p) => Some(p),
-            Device::Parallel(_) => None,
+            Device::Native(_) | Device::Parallel(_) => None,
         }
     }
 
     pub fn as_plugin_mut(&mut self) -> Option<&mut PluginInstance> {
         match self {
             Device::Plugin(p) => Some(p),
-            Device::Parallel(_) => None,
+            Device::Native(_) | Device::Parallel(_) => None,
         }
     }
 
     pub fn as_parallel(&self) -> Option<&Parallel> {
         match self {
             Device::Parallel(r) => Some(r),
-            Device::Plugin(_) => None,
+            Device::Plugin(_) | Device::Native(_) => None,
         }
     }
 
     pub fn as_parallel_mut(&mut self) -> Option<&mut Parallel> {
         match self {
             Device::Parallel(r) => Some(r),
-            Device::Plugin(_) => None,
+            Device::Plugin(_) | Device::Native(_) => None,
+        }
+    }
+
+    pub fn as_native(&self) -> Option<&NativeDevice> {
+        match self {
+            Device::Native(n) => Some(n),
+            Device::Plugin(_) | Device::Parallel(_) => None,
+        }
+    }
+
+    pub fn as_native_mut(&mut self) -> Option<&mut NativeDevice> {
+        match self {
+            Device::Native(n) => Some(n),
+            Device::Plugin(_) | Device::Parallel(_) => None,
+        }
+    }
+
+    /// 組み込み native (削除できない) か。
+    pub fn is_builtin_native(&self) -> bool {
+        matches!(self, Device::Native(n) if n.builtin)
+    }
+
+    /// aux 入力 `port` の配線。plugin は `aux_inputs[port]`、native は SC を受ける種類の port 0 だけ。
+    pub fn aux_input(&self, port: u8) -> Option<&AuxInputRoute> {
+        match self {
+            Device::Plugin(p) => p.aux_inputs.get(usize::from(port)).and_then(Option::as_ref),
+            Device::Native(n) => (port == 0).then(|| n.sidechain_input()).flatten(),
+            Device::Parallel(_) => None,
+        }
+    }
+
+    /// aux 入力 `port` の slot (plugin は `port + 1` まで伸ばす)。受けない device / port は `None`。
+    pub fn aux_input_slot_mut(&mut self, port: u8) -> Option<&mut Option<AuxInputRoute>> {
+        match self {
+            Device::Plugin(p) => {
+                let i = usize::from(port);
+                if p.aux_inputs.len() <= i {
+                    p.aux_inputs.resize(i + 1, None);
+                }
+                p.aux_inputs.get_mut(i)
+            }
+            Device::Native(n) => (port == 0 && n.kind().accepts_sidechain()).then_some(&mut n.aux_input),
+            Device::Parallel(_) => None,
+        }
+    }
+
+    /// UI に出す aux 入力の port 数。plugin は host 報告値 (`MAX_AUX_IN` で cap)、SC を受ける native は 1。
+    pub fn aux_input_port_count(&self) -> u8 {
+        match self {
+            Device::Plugin(p) => p.aux_input_count.min(crate::process_data::MAX_AUX_IN as u8),
+            Device::Native(n) => u8::from(n.kind().accepts_sidechain()),
+            Device::Parallel(_) => 0,
         }
     }
 
     /// この device (Parallel なら中身全部) に routed aux 出力を持つ plugin が居るか
-    /// (パラアウト `docs/plan_paraout.md` の split 判定)。
+    /// (パラアウト `docs/plan_paraout.md` の split 判定)。native は aux 出力を持たない。
     pub fn routes_any_aux_output(&self) -> bool {
         any_plugin(std::slice::from_ref(self), &mut |p| p.aux_outputs.iter().any(Option::is_some))
     }
@@ -497,6 +554,12 @@ impl Device {
 impl From<PluginInstance> for Device {
     fn from(p: PluginInstance) -> Self {
         Device::Plugin(p)
+    }
+}
+
+impl From<NativeDevice> for Device {
+    fn from(n: NativeDevice) -> Self {
+        Device::Native(n)
     }
 }
 
@@ -520,8 +583,141 @@ pub enum ChainRef {
 pub fn any_plugin(devices: &[Device], pred: &mut impl FnMut(&PluginInstance) -> bool) -> bool {
     devices.iter().any(|d| match d {
         Device::Plugin(p) => pred(p),
+        Device::Native(_) => false,
         Device::Parallel(r) => r.chains.iter().any(|c| any_plugin(&c.devices, pred)),
     })
+}
+
+/// `devices` 以下に `pred` を満たす native が居るか (pre-order、Parallel の中も辿る)。確保なし (RT 可)。
+pub fn any_native(devices: &[Device], pred: &mut impl FnMut(&NativeDevice) -> bool) -> bool {
+    devices.iter().any(|d| match d {
+        Device::Native(n) => pred(n),
+        Device::Plugin(_) => false,
+        Device::Parallel(r) => r.chains.iter().any(|c| any_native(&c.devices, pred)),
+    })
+}
+
+/// `devices` 以下の全 native を訪問する (pre-order)。確保なし (RT 可)。
+pub fn for_each_native<'a>(devices: &'a [Device], f: &mut impl FnMut(&'a NativeDevice)) {
+    for d in devices {
+        match d {
+            Device::Native(n) => f(n),
+            Device::Plugin(_) => {}
+            Device::Parallel(r) => {
+                for c in &r.chains {
+                    for_each_native(&c.devices, f);
+                }
+            }
+        }
+    }
+}
+
+/// [`for_each_native`] の可変版。
+pub fn for_each_native_mut(devices: &mut [Device], f: &mut impl FnMut(&mut NativeDevice)) {
+    for d in devices {
+        match d {
+            Device::Native(n) => f(n),
+            Device::Plugin(_) => {}
+            Device::Parallel(r) => {
+                for c in &mut r.chains {
+                    for_each_native_mut(&mut c.devices, f);
+                }
+            }
+        }
+    }
+}
+
+/// `devices` 以下で id が `id` の native。確保なし (RT 可)。
+pub fn native_in(devices: &[Device], id: u64) -> Option<&NativeDevice> {
+    for d in devices {
+        match d {
+            Device::Native(n) if n.id == id => return Some(n),
+            Device::Parallel(r) => {
+                for c in &r.chains {
+                    if let Some(found) = native_in(&c.devices, id) {
+                        return Some(found);
+                    }
+                }
+            }
+            Device::Native(_) | Device::Plugin(_) => {}
+        }
+    }
+    None
+}
+
+/// [`native_in`] の可変版。
+pub fn native_in_mut(devices: &mut [Device], id: u64) -> Option<&mut NativeDevice> {
+    for d in devices {
+        match d {
+            Device::Native(n) if n.id == id => return Some(n),
+            Device::Parallel(r) => {
+                for c in &mut r.chains {
+                    if let Some(found) = native_in_mut(&mut c.devices, id) {
+                        return Some(found);
+                    }
+                }
+            }
+            Device::Native(_) | Device::Plugin(_) => {}
+        }
+    }
+    None
+}
+
+/// `devices` 以下の aux 入力の配線を plugin / native 共通で訪問する (`f(device_id, port, route)`)。
+pub fn for_each_aux_input(devices: &[Device], f: &mut impl FnMut(u64, u8, &AuxInputRoute)) {
+    for d in devices {
+        match d {
+            Device::Plugin(p) => {
+                for (port, route) in p.aux_inputs.iter().enumerate() {
+                    if let Some(route) = route {
+                        f(p.id, port as u8, route);
+                    }
+                }
+            }
+            Device::Native(n) => {
+                if let Some(route) = n.sidechain_input() {
+                    f(n.id, 0, route);
+                }
+            }
+            Device::Parallel(r) => {
+                for c in &r.chains {
+                    for_each_aux_input(&c.devices, f);
+                }
+            }
+        }
+    }
+}
+
+/// `devices` 以下の aux 入力の slot を plugin / native 共通で可変訪問する
+/// (`f(device_id, port, slot)`、空の slot も渡す)。
+pub fn for_each_aux_slot_mut(devices: &mut [Device], f: &mut impl FnMut(u64, u8, &mut Option<AuxInputRoute>)) {
+    for d in devices {
+        match d {
+            Device::Plugin(p) => {
+                for (port, slot) in p.aux_inputs.iter_mut().enumerate() {
+                    f(p.id, port as u8, slot);
+                }
+            }
+            Device::Native(n) => f(n.id, 0, &mut n.aux_input),
+            Device::Parallel(r) => {
+                for c in &mut r.chains {
+                    for_each_aux_slot_mut(&mut c.devices, f);
+                }
+            }
+        }
+    }
+}
+
+/// `devices` 以下 (Parallel の中を含む) から native を取り除く (Bounce In Place の pre-FX 焼き込み専用)。
+pub fn remove_natives_in(devices: &mut Vec<Device>) {
+    devices.retain(|d| !matches!(d, Device::Native(_)));
+    for d in devices {
+        if let Device::Parallel(r) = d {
+            for c in &mut r.chains {
+                remove_natives_in(&mut c.devices);
+            }
+        }
+    }
 }
 
 /// `devices` 以下の全 plugin を **pre-order (= 信号順)** で辿る iterator。Parallel の中は
@@ -548,6 +744,7 @@ impl<'a> Iterator for PluginIter<'a> {
                     self.stack.pop();
                 }
                 Some(Device::Plugin(p)) => return Some(p),
+                Some(Device::Native(_)) => {}
                 Some(Device::Parallel(r)) => {
                     // 逆順に積むと pop 順が chain 順になる。
                     for c in r.chains.iter().rev() {
@@ -564,6 +761,7 @@ pub fn for_each_plugin_mut(devices: &mut [Device], f: &mut impl FnMut(&mut Plugi
     for d in devices {
         match d {
             Device::Plugin(p) => f(p),
+            Device::Native(_) => {}
             Device::Parallel(r) => {
                 for c in &mut r.chains {
                     for_each_plugin_mut(&mut c.devices, f);
@@ -622,16 +820,34 @@ pub fn for_each_parallel<'a>(devices: &'a [Device], f: &mut impl FnMut(&'a Paral
     }
 }
 
-/// plugin / parallel / chain の **id を全部** 可変で訪問する (`Song::ensure_ids` の採番用)。
+/// plugin / native / parallel / chain の **id を全部** 可変で訪問する (`Song::ensure_ids` の採番用)。
 pub fn for_each_node_id_mut(devices: &mut [Device], f: &mut impl FnMut(&mut u64)) {
     for d in devices {
         match d {
             Device::Plugin(p) => f(&mut p.id),
+            Device::Native(n) => f(&mut n.id),
             Device::Parallel(r) => {
                 f(&mut r.id);
                 for c in &mut r.chains {
                     f(&mut c.id);
                     for_each_node_id_mut(&mut c.devices, f);
+                }
+            }
+        }
+    }
+}
+
+/// [`for_each_node_id_mut`] の不変版 (運ぶサブツリーの id を集める)。
+pub fn for_each_node_id(devices: &[Device], f: &mut impl FnMut(u64)) {
+    for d in devices {
+        match d {
+            Device::Plugin(p) => f(p.id),
+            Device::Native(n) => f(n.id),
+            Device::Parallel(r) => {
+                f(r.id);
+                for c in &r.chains {
+                    f(c.id);
+                    for_each_node_id(&c.devices, f);
                 }
             }
         }
@@ -871,6 +1087,27 @@ impl Song {
 
     pub fn parallel_by_id_mut(&mut self, id: u64) -> Option<&mut Parallel> {
         self.device_by_id_mut(id).and_then(Device::as_parallel_mut)
+    }
+
+    pub fn native_by_id(&self, id: u64) -> Option<&NativeDevice> {
+        self.device_by_id(id).and_then(Device::as_native)
+    }
+
+    pub fn native_by_id_mut(&mut self, id: u64) -> Option<&mut NativeDevice> {
+        self.device_by_id_mut(id).and_then(Device::as_native_mut)
+    }
+
+    /// `owner` (track id か `MASTER_TRACK_ID`) の最上位にある `kind` の組み込み (先に見つかった方)。
+    pub fn builtin_native(&self, owner: u32, kind: NativeKind) -> Option<&NativeDevice> {
+        self.builtin_natives(owner).find(|n| n.kind() == kind)
+    }
+
+    /// `owner` の最上位にある組み込み native (チェーン順)。
+    pub fn builtin_natives(&self, owner: u32) -> impl Iterator<Item = &NativeDevice> {
+        self.fx_chain_by_track_id(owner)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|d| d.as_native().filter(|n| n.builtin))
     }
 
     /// `chain_id` の chain (親 Parallel と一緒に)。

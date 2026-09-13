@@ -1260,19 +1260,13 @@ fn for_each_launcher_row(song: &Song, mut f: impl FnMut(RowKey, RowCells<'_>)) {
 /// (テンポ / 拍子レーン、確定済み設計判断 1) の門番もここに置く。`None` を返せば
 /// 発火要求も seed も `Arranger` に倒れる。
 fn row_of(song: &Song, key: RowKey) -> Option<(RowCells<'_>, RowPlayback)> {
-    if key.track_id == common::model::MASTER_TRACK_ID {
-        // マスター行はトラックを持たない (`Song.song_lanes` が実体)。
-        let lane = song.song_lanes.iter().find(|l| l.id == key.lane_id)?;
-        return lane
-            .target
-            .accepts_launcher_cells()
-            .then(|| (RowCells::Lane(&lane.session_clips), lane.launcher));
-    }
-    let track: &Track = song.tracks.iter().find(|t| t.id == key.track_id)?;
-    if key.lane_id == 0 {
+    // トラック行 (`lane_id == 0`)。マスター行はトラックを持たないのでレーン行だけ。
+    if key.lane_id == 0 && key.track_id != common::model::MASTER_TRACK_ID {
+        let track: &Track = song.tracks.iter().find(|t| t.id == key.track_id)?;
         return Some((RowCells::Track(&track.session_clips), track.launcher));
     }
-    let lane: &AutomationLane = track.automation_lanes.iter().find(|l| l.id == key.lane_id)?;
+    // レーン行の置き場 (track か song か) は `automation_lane_by_key` 1 本。
+    let lane: &AutomationLane = song.automation_lane_by_key(key.track_id, key.lane_id)?;
     lane.target
         .accepts_launcher_cells()
         .then(|| (RowCells::Lane(&lane.session_clips), lane.launcher))

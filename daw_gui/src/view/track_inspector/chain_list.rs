@@ -27,7 +27,7 @@ use crate::app::{
 };
 use crate::event_device::DeviceEvent;
 use crate::widgets::select_modifier::SelectModifier;
-use common::model::ChainRef;
+use common::model::{ChainRef, RackPanelKey};
 
 use super::chain_row::{draw_add_chain_row, draw_add_plugin_row, draw_chain_row};
 use super::plugin_row::{SC_PAD, SC_PORT_H, draw_plugin_expansions, draw_plugin_row};
@@ -72,7 +72,8 @@ pub(super) fn draw_chain_list(
     // (`[[feedback_popup_click_leaks_to_background]]`)。
     let popup_open = ui.has_open_popups();
 
-    // 展開中の param パネル / SC パネル (表示中の chain に居るものだけ)。
+    // 展開中の SC パネル (表示中の chain に居るものだけ)。 Par パネルは device ごとに独立して
+    // 開く (`open_rack_panels`)。
     let plugin_ids: Vec<u64> = rows
         .iter()
         .filter_map(|r| match &r.kind {
@@ -80,20 +81,10 @@ pub(super) fn draw_chain_list(
             _ => None,
         })
         .collect();
-    let open_dev: Option<u64> = app
-        .cur.peph
-        .open_plugin_params
-        .or(app.cur.peph.open_video_fx_params)
-        .filter(|id| plugin_ids.contains(id));
     let sc_open: Option<u64> = app
         .cur.peph
         .open_sidechain_panel
         .filter(|id| plugin_ids.contains(id));
-    let panel_h = if app.cur.peph.inspector_device_panel_h > 1.0 {
-        app.cur.peph.inspector_device_panel_h
-    } else {
-        280.0 // 初回 bootstrap: expansion を 1 度描かせて実測させる
-    };
     let sc_ports = sc_open.map(|id| app.sidechain_ports(id)).unwrap_or_default();
     let sc_panel_h = if sc_ports.is_empty() {
         0.0
@@ -101,8 +92,7 @@ pub(super) fn draw_chain_list(
         sc_ports.len() as f32 * SC_PORT_H + SC_PAD
     };
 
-    let (list_rows, slots, slot_targets) =
-        build_list_rows(&rows, open_dev, panel_h, sc_open, sc_panel_h);
+    let (list_rows, slots, slot_targets) = build_list_rows(app, &rows, sc_open, sc_panel_h);
     let content_h: f32 = list_rows.iter().map(|r| r.height + ROW_GAP).sum::<f32>() + 4.0;
 
     ui.label_at("inspector_rack_label", "Rack", area.x + pad, y, 12.0, p.text);
@@ -130,8 +120,6 @@ pub(super) fn draw_chain_list(
         rows: &rows,
         popup_open,
         cursor_tid,
-        open_dev,
-        panel_h,
         sc_open,
         sc_ports: &sc_ports,
         sc_panel_h,
@@ -154,13 +142,14 @@ pub(super) fn draw_chain_list(
 
     // ---- 応答 ----
     // hover 行 (Q / ショートカットの対象)。 plugin / Parallel のみ。
-    let hovered_device = resp
+    let hovered_row = resp
         .hovered
         .and_then(|i| rows.get(i))
-        .and_then(ChainRow::drag_id);
-    if app.cur.peph.inspector_hovered_device != hovered_device {
+        .and_then(ChainRow::drag_id)
+        .map(crate::handler::bypass_target::BypassTarget::Device);
+    if app.cur.peph.inspector_hovered_row != hovered_row {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.cur.peph.inspector_hovered_device = hovered_device;
+            app.cur.peph.inspector_hovered_row = hovered_row;
         }));
     }
     // click = 選択 (無修飾 / Ctrl / Shift)。 Parallel / chain の開閉は行左端の disclosure。
@@ -226,12 +215,22 @@ pub(super) fn draw_chain_list(
     list_rect.y + list_rect.h + 8.0
 }
 
+/// plugin の Par パネルの高さ。前フレームの実測 (lag-by-one)、まだ測っていなければ 1 度描かせて
+/// 実測させるための仮の高さ。
+pub(super) fn panel_height(app: &AppData, device_id: u64) -> f32 {
+    app.cur
+        .peph
+        .rack_panel_heights
+        .get(&RackPanelKey::Device(device_id))
+        .copied()
+        .unwrap_or(280.0)
+}
+
 /// drag_list の入力: 行ごとの高さ (展開込み) / 掴めるか / ブロック長と、落とせるスロット
 /// (`slots[i]` の落とし先が `slot_targets[i] = (chain, index)`)。
 fn build_list_rows(
+    app: &AppData,
     rows: &[ChainRow],
-    open_dev: Option<u64>,
-    panel_h: f32,
     sc_open: Option<u64>,
     sc_panel_h: f32,
 ) -> (Vec<DragListRow>, Vec<DragListSlot>, Vec<(ChainRef, u32)>) {
@@ -246,8 +245,8 @@ fn build_list_rows(
         match &r.kind {
             ChainRowKind::Plugin(e) => {
                 draggable = true;
-                if open_dev == Some(e.device_id) {
-                    h += panel_h;
+                if app.rack_panel_open(RackPanelKey::Device(e.device_id)) {
+                    h += panel_height(app, e.device_id);
                 }
                 if sc_open == Some(e.device_id) {
                     h += sc_panel_h;
@@ -377,8 +376,6 @@ pub(super) struct RowCtx<'a> {
     pub(super) rows: &'a [ChainRow],
     pub(super) popup_open: bool,
     pub(super) cursor_tid: Option<u32>,
-    pub(super) open_dev: Option<u64>,
-    pub(super) panel_h: f32,
     pub(super) sc_open: Option<u64>,
     pub(super) sc_ports: &'a [crate::app_types::SidechainPort],
     pub(super) sc_panel_h: f32,

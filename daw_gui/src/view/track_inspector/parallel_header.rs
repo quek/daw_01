@@ -11,11 +11,11 @@
 use daw_ui_core::{Edit, KnobStyle, ScrubCurve, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 use daw_ui_renderer::Rect;
 
-use crate::app::{AppData, AppEvent, InspectorScrubField, ModControlDomain};
+use crate::app::{AppData, AppEvent, InspectorScrubField, ModControlDomain, ParamSurface};
 use crate::event_device::DeviceEvent;
 use crate::handler::parallel::ParallelMixerEdit;
 use crate::view::modulation::{PLAIN_IDENT, build_mod, push_mod_depth_bracket};
-use crate::view::param_gesture::push_param_gesture_edges;
+use crate::view::param_gesture::push_param_gesture;
 use common::model::{AutomationTarget, SELECTOR_FADE_RANGE, SPLIT_FREQ_RANGE, Split, SplitEdge, TrackBuiltinParam};
 
 use super::chain_list::ROW_H;
@@ -138,18 +138,18 @@ fn draw_active_field(
     rect: Rect,
     popup_open: bool,
 ) {
-    let Some(track_id) = app.cursor_track_id() else { return };
     let song = app.cur.song_doc.song();
+    // レーン / 変調の置き場は Parallel の持ち主 (master の Parallel なら song 側)。
+    let Some(track_id) = song.device_owner_track(parallel_id) else { return };
     let Some(parallel) = song.parallel_by_id(parallel_id) else { return };
     let n = parallel.chains.len();
     if n == 0 {
         return;
     }
     let chain_ids: Vec<u64> = parallel.chains.iter().map(|c| c.id).collect();
-    let track = song.track_by_id(track_id);
     let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { parallel_id });
     let base_pos = parallel.select_pos();
-    let live_pos = track.map_or(base_pos, |t| app.live_param_value(t, &target, base_pos));
+    let live_pos = app.live_param_value(track_id, &target, base_pos);
     let display = (Split::select_index(live_pos, n) + 1) as f64;
     let domain = ModControlDomain::Ranged { min: 0.5, max: n as f64 + 0.5, log: false };
     let style = ScrubableNumberStyle {
@@ -160,7 +160,6 @@ fn draw_active_field(
         ..scrub_style(&app.theme)
     };
     let m = build_mod(app, target.clone(), display, domain, track_id);
-    let was = app.cur.recording.active_param_gestures.contains(&(track_id, target.clone()));
     let resp = ui.scrubable_number_at(
         ("inspector_select_active", i),
         rect,
@@ -183,9 +182,9 @@ fn draw_active_field(
         None,
         Some(m.modulation()),
     );
-    push_param_gesture_edges(ui, track_id, target.clone(), "Selector Active", was, resp.dragging);
+    push_param_gesture(ui, app, ParamSurface::Rack, track_id, target.clone(), resp.dragging);
     push_scrub_bracket(ui, app, InspectorScrubField::ParallelSelect { parallel_id }, resp.dragging || resp.editing_text);
-    push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
+    push_mod_depth_bracket(ui, app, ParamSurface::Rack, track_id, &target, resp.mod_dragging);
 }
 
 /// r.md #114: Selector のクロスフェード時間 (ms)。 値のみ IPC (`SetParallelSelectorFade`)、
@@ -248,10 +247,10 @@ fn draw_freq_field(
     rect: Rect,
     popup_open: bool,
 ) {
-    let Some(track_id) = app.cursor_track_id() else { return };
-    let track = app.cur.song_doc.song().track_by_id(track_id);
+    // レーン / 変調の置き場は Parallel の持ち主 (master の Parallel なら song 側)。
+    let Some(track_id) = app.cur.song_doc.song().device_owner_track(parallel_id) else { return };
     let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge });
-    let live = track.map_or(hz, |t| app.live_param_value(t, &target, hz));
+    let live = app.live_param_value(track_id, &target, hz);
     let default = match edge {
         SplitEdge::LowMid => Split::DEFAULT_FREQS.0,
         SplitEdge::MidHigh => Split::DEFAULT_FREQS.1,
@@ -264,7 +263,6 @@ fn draw_freq_field(
         ..scrub_style(&app.theme)
     };
     let m = build_mod(app, target.clone(), f64::from(live), PLAIN_IDENT, track_id);
-    let was = app.cur.recording.active_param_gestures.contains(&(track_id, target.clone()));
     let key = match edge {
         SplitEdge::LowMid => "inspector_split_low",
         SplitEdge::MidHigh => "inspector_split_high",
@@ -289,18 +287,14 @@ fn draw_freq_field(
         None,
         Some(m.modulation()),
     );
-    let name = match edge {
-        SplitEdge::LowMid => "Split Low|Mid",
-        SplitEdge::MidHigh => "Split Mid|High",
-    };
-    push_param_gesture_edges(ui, track_id, target.clone(), name, was, resp.dragging);
+    push_param_gesture(ui, app, ParamSurface::Rack, track_id, target.clone(), resp.dragging);
     push_scrub_bracket(
         ui,
         app,
         InspectorScrubField::ParallelSplit { parallel_id, edge },
         resp.dragging || resp.editing_text,
     );
-    push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
+    push_mod_depth_bracket(ui, app, ParamSurface::Rack, track_id, &target, resp.mod_dragging);
 }
 
 /// Parallel ヘッダ行の表示情報 (`ChainRowKind::ParallelBegin` の中身)。
@@ -358,12 +352,11 @@ pub(super) fn draw_parallel_begin_row(
             })
         },
     );
-    if let Some(track_id) = app.cursor_track_id() {
-        let track = app.cur.song_doc.song().track_by_id(track_id);
+    // レーンの置き場は Parallel の持ち主 (master の Parallel なら song 側)。
+    if let Some(track_id) = app.cur.song_doc.song().device_owner_track(parallel_id) {
         let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelOutGain { parallel_id });
-        let live = track.map_or(out_gain, |t| app.live_param_value(t, &target, out_gain));
+        let live = app.live_param_value(track_id, &target, out_gain);
         right -= CHAIN_KNOB + 4.0;
-        let was = app.cur.recording.active_param_gestures.contains(&(track_id, target.clone()));
         let resp = ui.knob_at(
             ("inspector_parallel_out", i),
             Rect { x: right, y: row.y + (ROW_H - CHAIN_KNOB) * 0.5, w: CHAIN_KNOB, h: CHAIN_KNOB },
@@ -378,7 +371,7 @@ pub(super) fn draw_parallel_begin_row(
             },
             None,
         );
-        push_param_gesture_edges(ui, track_id, target, "Parallel Out", was, resp.dragging);
+        push_param_gesture(ui, app, ParamSurface::Rack, track_id, target, resp.dragging);
     }
     // r.md #112: 入力の配り方 (No split / 3 bands …)。
     right -= SPLIT_DROPDOWN_W + 4.0;

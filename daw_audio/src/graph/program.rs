@@ -532,7 +532,7 @@ fn fill_parallel_ramp(
         buf[..n].fill(constant);
         return;
     };
-    let (lanes, routings) = track_stores(song, track_id);
+    let (lanes, routings) = song.param_stores(track_id).unwrap_or((&[], &[]));
     crate::automation::fill_target_ramp(
         song,
         track_id,
@@ -551,21 +551,6 @@ fn fill_parallel_ramp(
     );
 }
 
-/// 所有 track の lane / routing store (master は song 側)。
-fn track_stores(
-    song: &Song,
-    track_id: u32,
-) -> (&[common::model::AutomationLane], &[common::model::ModRouting]) {
-    if track_id == common::model::MASTER_TRACK_ID {
-        (&song.song_lanes, &song.song_mod_routings)
-    } else {
-        match song.track_by_id(track_id) {
-            Some(t) => (&t.automation_lanes, &t.mod_routings),
-            None => (&[], &[]),
-        }
-    }
-}
-
 /// Parallel の出力 trim ramp を埋める (`fill_chain_ramps` と同じ経路)。
 fn fill_parallel_out_ramp(
     ctx: &ProgramCtx<'_>,
@@ -579,7 +564,7 @@ fn fill_parallel_out_ramp(
         rs.out_gain_ramp[..n].fill(out_gain);
         return;
     };
-    let (lanes, routings) = track_stores(song, track_id);
+    let (lanes, routings) = song.param_stores(track_id).unwrap_or((&[], &[]));
     crate::automation::fill_target_ramp(
         song,
         track_id,
@@ -614,7 +599,7 @@ fn fill_chain_ramps(
         cs.pan_ramp[..n].fill(pan);
         return;
     };
-    let (lanes, routings) = track_stores(song, track_id);
+    let (lanes, routings) = song.param_stores(track_id).unwrap_or((&[], &[]));
     crate::automation::fill_target_ramp(
         song,
         track_id,

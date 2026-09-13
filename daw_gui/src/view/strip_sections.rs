@@ -11,30 +11,34 @@
 //! | Name ... |  ← ここから下が既存 strip
 //! ```
 //!
-//! 上から下が信号順 (`inserts → Comp → EQ → Pan → Fader`)。開閉は **全 ch 一括**
-//! (`UiPrefs::strip_comp_open` / `strip_eq_open`) で、サムネイル帯の GR バー /
+//! 値の持ち主はそのトラックの **組み込み Comp / EQ** (`Device::Native`、r.md #129)。帯は
+//! その device を読み書きするだけで、ON/OFF は device の `bypassed`、編集は
+//! `DeviceEvent::NativeEdit` (自動 ON と値 IPC の唯一の口) を通す。開閉は **全 ch 一括**
+//! (`ProjectView::strip_comp_open` / `strip_eq_open`) で、サムネイル帯の GR バー /
 //! カーブのクリックがそのトグルを兼ねる。
 //!
-//! EQ カーブは [`common::channel_strip_dsp`] の振幅応答をそのまま描く — 音を出す
-//! daw_audio と同じ関数なので、画面の線と実際の音が食い違わない。
+//! EQ カーブは [`common::dsp`] の振幅応答をそのまま描く — 音を出す daw_audio と同じ関数
+//! なので、画面の線と実際の音が食い違わない。
 
 use std::sync::Arc;
 
 use common::automation::{norm_to_plain, plain_to_norm};
-use common::channel_strip_dsp::{eq_magnitude_db, eq_stages};
+use common::dsp::{eq_magnitude_db, eq_stages};
 use common::model::{
-    AutomationTarget, ChannelStrip, CompMode, CompParam, EqBand, EqParam, GR_METER_RANGE_DB,
-    TrackBuiltinParam,
+    AutomationTarget, CompMode, CompParam, EqBand, EqParam, GR_METER_RANGE_DB, NativeDevice, NativeKind,
+    NativeParamId, NativeParams,
 };
 use daw_ui_core::{Edit, KnobStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent, ModControlDomain};
+use crate::app::{AppData, AppEvent, ModControlDomain, ParamSurface};
 use crate::automation_value::automation_value_display;
-use crate::event::{StripEdit, StripSection, StripSwitch};
+use crate::event::StripSection;
+use crate::event_device::DeviceEvent;
+use crate::event_native::NativeEdit;
 use crate::theme::Theme;
 use crate::view::modulation::{build_mod, push_mod_depth_bracket};
-use crate::view::param_gesture::push_param_gesture_edges;
+use crate::view::param_gesture::push_param_gesture;
 
 /// 常設サムネイル帯の高さ (px)。折り畳んでいてもここだけは必ず出る。
 pub const THUMB_H: f32 = 28.0;
@@ -87,14 +91,26 @@ const CURVE_SR: f32 = 48_000.0;
 /// セクション / 行 / ノブへ同じものを配り歩くので、束ねて渡す。
 struct StripCtx<'a> {
     app: &'a AppData,
-    /// 住所であり、widget id の分離キーでもある (安定 id、不変条件 1)。
+    /// 住所の持ち主であり、widget id の分離キーでもある (安定 id、不変条件 1)。
     track_id: u32,
-    /// 描画時点の設定値 (`Song` から 1 度だけ読む)。
-    strip: ChannelStrip,
+    /// 組み込み Comp / EQ (描画時点の値を `Song` から 1 度だけ読む)。正規化が必ず補うので
+    /// 通常は `Some`。
+    comp: Option<NativeDevice>,
+    eq: Option<NativeDevice>,
     /// この strip の背景色 (= ノブが「載っている面」の色)。
     bg: Color,
-    /// 正の減衰量 dB (0 = 掛かっていない)。
+    /// Comp の正の減衰量 dB (0 = 掛かっていない)。
     gain_reduction_db: f32,
+}
+
+impl StripCtx<'_> {
+    fn comp_on(&self) -> bool {
+        self.comp.is_some_and(|d| !d.bypassed)
+    }
+
+    fn eq_on(&self) -> bool {
+        self.eq.is_some_and(|d| !d.bypassed)
+    }
 }
 
 /// この strip 上端に積む帯の総高 (px)。`mixer_strips` が既存 strip の開始 y を
@@ -107,24 +123,19 @@ pub fn head_height(app: &AppData) -> f32 {
 }
 
 /// 帯を描く。`rect` は strip 全体の矩形で、上端から [`head_height`] 分を使う。
-pub fn draw_head(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    track_id: u32,
-    rect: Rect,
-    pad: f32,
-    bg: Color,
-    gain_reduction_db: f32,
-) {
-    let Some(track) = app.cur.song_doc.song().track_by_id(track_id) else {
+pub fn draw_head(app: &AppData, ui: &mut Ui<'_, AppData>, track_id: u32, rect: Rect, pad: f32, bg: Color) {
+    let song = app.cur.song_doc.song();
+    if song.track_by_id(track_id).is_none() {
         return;
-    };
+    }
+    let comp = song.builtin_native(track_id, NativeKind::Comp).copied();
     let ctx = StripCtx {
         app,
         track_id,
-        strip: track.strip,
+        comp,
+        eq: song.builtin_native(track_id, NativeKind::Eq).copied(),
         bg,
-        gain_reduction_db,
+        gain_reduction_db: comp.map_or(0.0, |c| app.cur.transport.native_gr.get(c.id)),
     };
     let inner = Rect {
         x: rect.x + pad,
@@ -134,56 +145,52 @@ pub fn draw_head(
     };
     let mut y = rect.y;
 
-    // Q キー (= 「カーソル直下のものを無効化」) の対象面。セクション本体と
+    // Q キー (= 「カーソル直下のものを無効化」) の対象 device。セクション本体と
     // 常設帯の両方が対象で、算出はここ 1 か所 (`mixer_hovered_track` と同 idiom)。
     let ptr = ui.pointer().pos;
-    let mut hovered: Option<StripSection> = None;
-    let hit = |r: Rect, sec: StripSection, hovered: &mut Option<StripSection>| {
-        if ptr.is_some_and(|(px, py)| r.contains(px, py)) {
-            *hovered = Some(sec);
+    let mut hovered: Option<u64> = None;
+    let hit = |r: Rect, dev: Option<NativeDevice>, hovered: &mut Option<u64>| {
+        if ptr.is_some_and(|(px, py)| r.contains(px, py))
+            && let Some(d) = dev
+        {
+            *hovered = Some(d.id);
         }
     };
 
     if app.cur.view.strip_comp_open {
         let sect = Rect { y, h: COMP_H, ..inner };
         draw_comp_section(&ctx, ui, sect);
-        hit(sect, StripSection::Comp, &mut hovered);
+        hit(sect, ctx.comp, &mut hovered);
         y += COMP_H;
         separator(ui, app, rect, y);
     }
     if app.cur.view.strip_eq_open {
         let sect = Rect { y, h: EQ_H, ..inner };
         draw_eq_section(&ctx, ui, sect);
-        hit(sect, StripSection::Eq, &mut hovered);
+        hit(sect, ctx.eq, &mut hovered);
         y += EQ_H;
         separator(ui, app, rect, y);
     }
     let thumb = Rect { y, h: THUMB_H, ..inner };
     let (gr_hit, eq_hit) = draw_thumbnail(&ctx, ui, thumb);
-    hit(gr_hit, StripSection::Comp, &mut hovered);
-    hit(eq_hit, StripSection::Eq, &mut hovered);
+    hit(gr_hit, ctx.comp, &mut hovered);
+    hit(eq_hit, ctx.eq, &mut hovered);
 
-    publish_hover(app, ui, track_id, hovered);
+    publish_hover(&ctx, ui, hovered);
 }
 
-/// カーソル直下のセクションを `AppData` へ反映する (変化時のみ)。
+/// カーソル直下の device を `AppData` へ反映する (変化時のみ)。
 ///
 /// 自分の strip から外れたときは、**自分が最後に立てた値だったときだけ** 消す
 /// (他の strip が立てた値を横から消さない)。
-fn publish_hover(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    track_id: u32,
-    hovered: Option<StripSection>,
-) {
-    let current = app.cur.peph.mixer_hovered_strip_section;
-    let next = hovered.map(|s| (track_id, s));
-    let mine = current.is_some_and(|(t, _)| t == track_id);
-    if next == current || (next.is_none() && !mine) {
+fn publish_hover(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, hovered: Option<u64>) {
+    let current = ctx.app.cur.peph.mixer_hovered_native;
+    let mine = current.is_some_and(|id| [ctx.comp, ctx.eq].iter().flatten().any(|d| d.id == id));
+    if hovered == current || (hovered.is_none() && !mine) {
         return;
     }
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.cur.peph.mixer_hovered_strip_section = next;
+        app.cur.peph.mixer_hovered_native = hovered;
     }));
 }
 
@@ -218,7 +225,7 @@ fn draw_thumbnail(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) -> (
     // ---- EQ カーブ (帯の全幅) ----
     ui.push_rect(RectCommand {
         rect: body,
-        fill: band_bg(ctx, ctx.strip.eq.on),
+        fill: band_bg(ctx, ctx.eq_on()),
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [2.0; 4],
@@ -255,8 +262,8 @@ fn section_toggle_click(ui: &mut Ui<'_, AppData>, rect: Rect, section: StripSect
 /// GR メーター (縦)。上から下へ、減衰量ぶん伸びる。
 fn draw_gr_bar(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     // カーブの上に重なるので、面は必ず自分で塗る (下のカーブを透かさない)。
-    ui.panel(("strip_gr_bg", ctx.track_id), rect, band_bg(ctx, ctx.strip.comp.on), 2.0);
-    if !ctx.strip.comp.on {
+    ui.panel(("strip_gr_bg", ctx.track_id), rect, band_bg(ctx, ctx.comp_on()), 2.0);
+    if !ctx.comp_on() {
         return;
     }
     let frac = (ctx.gain_reduction_db / GR_METER_RANGE_DB).clamp(0.0, 1.0);
@@ -275,12 +282,15 @@ fn draw_gr_bar(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
 
 /// EQ の合成レスポンスを 1 本の折れ線で描く (HP/LP 含む)。
 ///
-/// 応答値は daw_audio と同じ [`eq_magnitude_db`] から取る。バイパス中も
+/// 応答値は daw_audio と同じ [`eq_magnitude_db`] から取る。バイパス中は
 /// 「フラットな線」を沈んだ色で描く (何も描かないと帯が壊れて見える)。
 fn draw_eq_curve(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     let p = &ctx.app.theme.core;
-    let stages = eq_stages(&ctx.strip.eq, CURVE_SR);
-    let color = if ctx.strip.eq.on { ctx.app.theme.daw.strip_eq_curve } else { p.text_dim };
+    let active = match ctx.eq {
+        Some(NativeDevice { bypassed: false, params: NativeParams::Eq(eq), .. }) => Some(eq_stages(&eq, CURVE_SR)),
+        _ => None,
+    };
+    let color = if active.is_some() { ctx.app.theme.daw.strip_eq_curve } else { p.text_dim };
 
     // 0dB の基準線 (カーブが上下どちらへ振れているかを読む物差し)。
     let mid_y = rect.y + rect.h * 0.5;
@@ -300,7 +310,10 @@ fn draw_eq_curve(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
         #[allow(clippy::cast_precision_loss)]
         let t = i as f32 / CURVE_POINTS as f32;
         let f = CURVE_F_MIN * ratio.powf(t);
-        let db = eq_magnitude_db(&stages, CURVE_SR, f).clamp(-CURVE_DB_RANGE, CURVE_DB_RANGE);
+        let db = active
+            .as_ref()
+            .map_or(0.0, |stages| eq_magnitude_db(stages, CURVE_SR, f))
+            .clamp(-CURVE_DB_RANGE, CURVE_DB_RANGE);
         let x = rect.x + rect.w * t;
         let y = mid_y - (db / CURVE_DB_RANGE) * (rect.h * 0.5 - 1.0);
         if let Some((px, py)) = prev {
@@ -320,8 +333,10 @@ fn draw_eq_curve(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_comp_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    let Some(comp) = ctx.comp else { return };
+    let NativeParams::Comp(settings) = comp.params else { return };
     let p = &ctx.app.theme.core;
-    let track_id = ctx.track_id;
+    let device_id = comp.id;
     let mut y = rect.y + SECTION_PAD;
 
     // ---- モード切替 (3 択) ----
@@ -340,16 +355,9 @@ fn draw_comp_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
             ("strip_comp_mode", ctx.track_id, i),
             mode.label(),
             Rect { x, y, w, h: MODE_ROW_H },
-            ctx.strip.comp.mode == mode,
+            settings.mode == mode,
             &style,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::StripEdit {
-                        track: track_id,
-                        edit: StripEdit::CompMode(mode),
-                    })
-                })
-            },
+            move |_| native_edit(device_id, NativeEdit::CompMode(mode)),
         );
     }
     y += MODE_ROW_H + 2.0;
@@ -376,16 +384,17 @@ fn draw_comp_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
                 ui,
                 ("strip_comp_knob", ctx.track_id, row_idx, i),
                 Rect { x, y: row.y + LABEL_H, w: KNOB, h: KNOB },
-                TrackBuiltinParam::StripComp { param: *param },
+                &comp,
+                NativeParamId::Comp(*param),
                 param.label(),
-                ctx.strip.comp.mode.overrides(*param),
+                settings.mode.overrides(*param),
             );
             if readout.is_some() {
                 hover = readout;
             }
         }
         if with_listen {
-            draw_sc_listen(ctx, ui, row);
+            draw_sc_listen(ctx, ui, &comp, row);
         }
         row_label(ctx, ui, ("strip_comp_row_label", ctx.track_id, row_idx), row, row_name, hover);
         y += ROW_H;
@@ -395,8 +404,9 @@ fn draw_comp_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     draw_gr_readout(ctx, ui, Rect { x: rect.x, y, w: rect.w, h: GR_ROW_H });
 }
 
-/// 検出信号の試聴トグル。**同時に 1 トラックだけ** (排他は handler が担保)。
-fn draw_sc_listen(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, row: Rect) {
+/// 検出信号の試聴トグル。**プロジェクトで同時に 1 つだけ** (`sc_listen_device` が Option 1 個)。
+/// 点灯は「この Comp を Listen 中で、かつ ON」。bypass 中に押すと有効化してから聴く。
+fn draw_sc_listen(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, comp: &NativeDevice, row: Rect) {
     let p = &ctx.app.theme.core;
     let style = ToggleButtonStyle {
         on_color: p.accent,
@@ -405,8 +415,8 @@ fn draw_sc_listen(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, row: Rect) {
         font_size: SWITCH_FONT,
         ..ToggleButtonStyle::from_palette(p)
     };
-    let on = ctx.strip.comp.sc_listen;
-    let track_id = ctx.track_id;
+    let device_id = comp.id;
+    let on = ctx.app.cur.peph.sc_listen_device == Some(device_id) && !comp.bypassed;
     ui.toggle_button_at(
         ("strip_sc_listen", ctx.track_id),
         "\u{25b6}",
@@ -415,10 +425,9 @@ fn draw_sc_listen(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, row: Rect) {
         &style,
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::StripEdit {
-                    track: track_id,
-                    edit: StripEdit::Switch { switch: StripSwitch::ScListen, on: !on },
-                })
+                app.handle_event(AppEvent::Device(DeviceEvent::SetScListen {
+                    device_id: (!on).then_some(device_id),
+                }))
             })
         },
     );
@@ -430,7 +439,7 @@ fn draw_gr_readout(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     let p = &ctx.app.theme.core;
     let bar = Rect { w: (rect.w - VALUE_W - 2.0).max(1.0), h: 6.0, y: rect.y + 3.0, ..rect };
     ui.panel(("strip_gr_row_bg", ctx.track_id), bar, p.window_bg, 2.0);
-    let frac = if ctx.strip.comp.on {
+    let frac = if ctx.comp_on() {
         (ctx.gain_reduction_db / GR_METER_RANGE_DB).clamp(0.0, 1.0)
     } else {
         0.0
@@ -447,7 +456,7 @@ fn draw_gr_readout(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     }
     // 減衰量は常に負方向なので符号は書かない (`-` を出しても情報が増えない)。
     // 代わりに小数第 1 位まで出す — 数 dB の掛かり具合はここで読む。
-    let text = if ctx.strip.comp.on {
+    let text = if ctx.comp_on() {
         format!("{:.1}", ctx.gain_reduction_db)
     } else {
         "0.0".to_string()
@@ -467,6 +476,8 @@ fn draw_gr_readout(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_eq_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    let Some(eq) = ctx.eq else { return };
+    let NativeParams::Eq(settings) = eq.params else { return };
     let mut y = rect.y + SECTION_PAD;
 
     // ---- フィルタ行: HP と LP を 1 行ずつ ----
@@ -475,14 +486,16 @@ fn draw_eq_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
     for (i, band) in [EqBand::Hp, EqBand::Lp].into_iter().enumerate() {
         let row = Rect { y, h: ROW_H, ..rect };
         let start_x = row_start_x(row, 1, SWITCH_W + 2.0);
+        let band_on = settings.band(band).on;
         let hover = strip_knob(
             ctx,
             ui,
             ("strip_eq_filter_knob", ctx.track_id, i),
             Rect { x: start_x, y: row.y + LABEL_H, w: KNOB, h: KNOB },
-            TrackBuiltinParam::StripEq { band, param: EqParam::Freq },
+            &eq,
+            NativeParamId::Eq { band, param: EqParam::Freq },
             band.label(),
-            !ctx.strip.eq.band(band).on,
+            !band_on,
         );
         band_switch(
             ctx,
@@ -492,8 +505,9 @@ fn draw_eq_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
             // 14px 角に入る 1 文字。ON/OFF は背景色が示すので、字は
             // 「これは点いたり消えたりする物」の目印で足りる。
             "\u{25cf}",
-            StripSwitch::BandOn(band),
-            ctx.strip.eq.band(band).on,
+            eq.id,
+            NativeEdit::EqBandOn { band, on: !band_on },
+            band_on,
         );
         row_label(ctx, ui, ("strip_eq_filter_label", ctx.track_id, i), row, band.label(), hover);
         y += ROW_H;
@@ -518,7 +532,8 @@ fn draw_eq_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
                 ui,
                 ("strip_eq_knob", ctx.track_id, row_idx, i),
                 Rect { x, y: row.y + LABEL_H, w: KNOB, h: KNOB },
-                TrackBuiltinParam::StripEq { band, param: *param },
+                &eq,
+                NativeParamId::Eq { band, param: *param },
                 eq_param_label(*param),
                 false,
             );
@@ -527,6 +542,7 @@ fn draw_eq_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
             }
         }
         if band.has_bell_switch() {
+            let bell = settings.band(band).bell;
             band_switch(
                 ctx,
                 ui,
@@ -534,8 +550,9 @@ fn draw_eq_section(ctx: &StripCtx<'_>, ui: &mut Ui<'_, AppData>, rect: Rect) {
                 switch_rect(row),
                 // ベル (山) ⇄ シェルフ (棚) の切替。ON = ベル。
                 "B",
-                StripSwitch::Bell(band),
-                ctx.strip.eq.band(band).bell,
+                eq.id,
+                NativeEdit::EqBell { band, bell: !bell },
+                bell,
             );
         }
         row_label(
@@ -559,25 +576,26 @@ fn eq_param_label(param: EqParam) -> &'static str {
 }
 
 /// バンドの ON / ベル切替のような、オートメーションに載せない小スイッチ。
+#[allow(clippy::too_many_arguments)]
 fn band_switch(
     ctx: &StripCtx<'_>,
     ui: &mut Ui<'_, AppData>,
     id: (&'static str, usize),
     rect: Rect,
     text: &str,
-    switch: StripSwitch,
+    device_id: u64,
+    edit: NativeEdit,
     on: bool,
 ) {
     let style = eq_switch_style(&ctx.app.theme);
-    let track_id = ctx.track_id;
-    ui.toggle_button_at((id, ctx.track_id), text, rect, on, &style, move |_| {
-        Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::StripEdit {
-                track: track_id,
-                edit: StripEdit::Switch { switch, on: !on },
-            })
-        })
-    });
+    ui.toggle_button_at((id, ctx.track_id), text, rect, on, &style, move |_| native_edit(device_id, edit.clone()));
+}
+
+/// 組み込み device への値編集イベント (自動 ON と値 IPC は handler の `NativeEdit::apply` が持つ)。
+fn native_edit(device_id: u64, edit: NativeEdit) -> Edit<AppData> {
+    Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::Device(DeviceEvent::NativeEdit { device_id, edit }))
+    })
 }
 
 /// 行右端の小スイッチ共通 style。ON は accent で「点いた」と分かる強さにする
@@ -637,30 +655,32 @@ fn row_label(
 
 /// ストリップのノブ 1 個。
 ///
-/// 値の住所は `TrackBuiltinParam` そのもの = オートメーション / 変調の target と
-/// 同じなので、`plain_to_norm` / `build_mod` / `push_param_gesture_edges` の既存
-/// 経路がそのまま乗る (ノブ専用の値配管を作らない)。
+/// 値の住所は `NativeParam { device_id, param }` = オートメーション / 変調の target と
+/// 同じなので、`plain_to_norm` / `build_mod` / `push_param_gesture` の既存経路がそのまま
+/// 乗る (ノブ専用の値配管を作らない)。
 ///
 /// 戻り値は hover / drag 中なら `"Freq 2500Hz"` のような読み出し文字列。
+#[allow(clippy::too_many_arguments)]
 fn strip_knob(
     ctx: &StripCtx<'_>,
     ui: &mut Ui<'_, AppData>,
     id: impl std::hash::Hash + Copy,
     rect: Rect,
-    param: TrackBuiltinParam,
+    device: &NativeDevice,
+    param: NativeParamId,
     label: &'static str,
     dimmed: bool,
 ) -> Option<String> {
     let app = ctx.app;
     let track_id = ctx.track_id;
-    let plain = ctx.strip.target_value(&param)?;
-    let target = AutomationTarget::TrackBuiltin(param);
+    let device_id = device.id;
+    let plain = device.param(param)?;
+    let target = AutomationTarget::NativeParam { device_id, param };
     let norm = plain_to_norm(&target, f64::from(plain));
-    let default_plain = ChannelStrip::default().target_value(&param).unwrap_or(0.0);
-    let default_norm = plain_to_norm(&target, f64::from(default_plain));
+    let default_norm = plain_to_norm(&target, f64::from(param.default_plain().unwrap_or(plain)));
 
     // ゲイン (0 が中央) だけ bipolar、それ以外は 7 時起点。
-    let base = if matches!(param, TrackBuiltinParam::StripEq { param: EqParam::Gain, .. }) {
+    let base = if matches!(param, NativeParamId::Eq { param: EqParam::Gain, .. }) {
         KnobStyle::BIPOLAR
     } else {
         KnobStyle::UNIPOLAR
@@ -668,10 +688,6 @@ fn strip_knob(
     let style = KnobStyle { surface: Some(ctx.bg), ..base };
 
     let m = build_mod(app, target.clone(), f64::from(norm), ModControlDomain::Norm, track_id);
-    let was_dragging = app
-        .cur.recording
-        .active_param_gestures
-        .contains(&(track_id, target.clone()));
     let resp = ui.knob_at(
         id,
         rect,
@@ -683,18 +699,13 @@ fn strip_knob(
             move |v| {
                 #[allow(clippy::cast_possible_truncation)]
                 let value = norm_to_plain(&target, v) as f32;
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::StripEdit {
-                        track: track_id,
-                        edit: StripEdit::Param { param, value },
-                    })
-                })
+                native_edit(device_id, NativeEdit::param(param, value))
             }
         },
         Some(m.modulation()),
     );
-    push_param_gesture_edges(ui, track_id, target.clone(), label, was_dragging, resp.dragging);
-    push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
+    push_param_gesture(ui, app, ParamSurface::MixerStrip, track_id, target.clone(), resp.dragging);
+    push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_id, &target, resp.mod_dragging);
 
     // モードに上書きされているノブは沈めて「回しても今は音が変わらない」を示す。
     if dimmed {

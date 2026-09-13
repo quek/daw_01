@@ -155,6 +155,10 @@ pub struct AudioSession {
     /// の shmem os_id。daw_audio がこれで `ScopeBridgeHandle::open` し、
     /// `render_master_buffer` の出力を毎バッファ書き込む。daw_plugin_host は使わない。
     pub scope_shmem_id: String,
+    /// r.md #129: device 単位のサンプルリング (`device_scope_bridge::device_scope_shmem_id(pid)`)
+    /// の shmem os_id。daw_audio がこれで `DeviceScopeBridgeHandle::open` し、scope 対象の EQ の
+    /// 出力を書き込む。daw_plugin_host は使わない。
+    pub device_scope_shmem_id: String,
     pub sample_rate: u32,
     pub max_frames: u32,
     pub channels: u16,
@@ -413,17 +417,22 @@ pub enum AudioCommand {
     SetTrackPan { project: ProjectKey, track: u32, pan: f32 },
     SetTrackMuted { project: ProjectKey, track: u32, muted: bool },
     SetTrackSolo { project: ProjectKey, track: u32, solo: bool },
-    /// 内蔵チャンネルストリップ (コンプ + EQ) の設定を丸ごと差し替える
-    /// (`docs/plan_channel_strip.md`)。値のみの更新 — graph は再 compile しない。
+    /// r.md #129: 内蔵 device (`Device::Native`) の値 (ON/OFF + パラメーター) を丸ごと差し替える。
+    /// 値のみの即時更新で、構造 (配線 / 位置) はフレーム末の `LoadSong` が運ぶ。
     ///
-    /// パラメータ 1 個ごとの variant を並べず **構造体 1 個**を送る:
-    /// `ChannelStrip` は 20 個ほどの数値だけの `Copy` 型 (数十バイト) なので
-    /// bulk には当たらず (不変条件 2)、「どのフィールドを送ったか」を送信側と
-    /// 受信側の 2 か所で数え合わせる必要も無くなる。
-    SetTrackStrip { project: ProjectKey, track: u32, strip: crate::model::ChannelStrip },
-    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) を丸ごと差し替える
-    /// (`docs/plan_master_strip.md`)。`SetTrackStrip` と同じく値のみの更新。
-    SetMasterStrip { project: ProjectKey, strip: crate::model::MasterStrip },
+    /// パラメーター 1 個ごとの variant を並べず **値 1 組**を送る: `NativeParams` は数値だけの
+    /// `Copy` 型 (約 100 byte) なので bulk には当たらない (不変条件 2)。`device_id` は song 全体で
+    /// 一意なので track を持たない (前例 `SetChainGain`)。種類違いの値は受信側が捨てる。
+    SetNativeDevice { project: ProjectKey, device_id: u64, bypassed: bool, params: crate::model::NativeParams },
+    /// r.md #129: master のフェーダー後 Limiter の値。先読み遅延の有無は `LoadSong` の compile が焼く。
+    SetMasterLimiter { project: ProjectKey, limiter: crate::model::MasterLimiterSettings },
+    /// r.md #129: SC Listen する Comp の device id (`None` = 解除)。**聴き方の都合**で Song には書かない。
+    /// engine は `SetScListen` と `CloseProject` 以外で値を変えない (LoadSong / project 切替でも解除しない)。
+    /// Comp 以外の id は engine が無視する。
+    SetScListen { project: ProjectKey, device_id: Option<u64> },
+    /// r.md #129: スペクトラムを計算する device (EQ Par が開いているもの) の id。
+    /// `MAX_DEVICE_SCOPES` 以下 (engine も切り詰め・重複除去する)。サンプルは shmem で運ぶ。
+    SetDeviceScopes { project: ProjectKey, device_ids: Vec<u64> },
     /// Realtime aux-send level update。 `track` = source の `Track::id`、
     /// `send_id` = その track の `sends` 内 stable `Send::id` (v29)。
     /// 値のみの更新 — graph は再 compile されない。
@@ -645,8 +654,10 @@ impl AudioCommand {
             | SetTrackPan { project, .. }
             | SetTrackMuted { project, .. }
             | SetTrackSolo { project, .. }
-            | SetTrackStrip { project, .. }
-            | SetMasterStrip { project, .. }
+            | SetNativeDevice { project, .. }
+            | SetMasterLimiter { project, .. }
+            | SetScListen { project, .. }
+            | SetDeviceScopes { project, .. }
             | SetSendGain { project, .. }
             | SetSendEnabled { project, .. }
             | SetChainGain { project, .. }

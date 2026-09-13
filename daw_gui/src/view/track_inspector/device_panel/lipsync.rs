@@ -11,6 +11,7 @@ pub(super) fn draw_lipsync_target(
     area: Rect,
     pad: f32,
     mut y: f32,
+    device_id: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // カーソルトラックの index。 None なら描かない (track 0 を誤対象にしない)。
@@ -28,7 +29,7 @@ pub(super) fn draw_lipsync_target(
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
     // VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
     // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
-    if app.voicevox_param_panel_open()
+    if app.voicevox_param_panel_open(device_id)
         && let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i))
         && track.is_voicevox_vocal()
     {

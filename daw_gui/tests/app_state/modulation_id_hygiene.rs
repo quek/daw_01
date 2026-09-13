@@ -209,7 +209,7 @@ fn removing_a_device_chains_cleanup_to_depth_refs() {
     ));
 
     let t = &app.cur.song_doc.song().tracks[0];
-    assert!(t.devices.is_empty(), "前提: device が消えている");
+    assert!(t.plugins().next().is_none(), "前提: device が消えている (組み込み native は残る)");
     assert!(
         t.mod_routings.is_empty(),
         "消えた変調の深さを変調していた行も連鎖して消える: {:?}",

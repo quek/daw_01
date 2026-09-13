@@ -27,11 +27,18 @@ pub enum ScrubGesture {
     /// アレンジャーのオートメーションレーン見出しの「既定値」欄。
     LaneDefault(common::model::AutomationLaneKey),
     /// ツマミ / フェーダーの **変調深さ** ドラッグ (`docs/plan_modulation.md`)。
-    ModDepth { track_id: u32, target: common::model::AutomationTarget },
+    /// r.md #129: 所有者に**面**を含める — 同じ `(track, target)` を別の面が描いていても、
+    /// ドラッグしていない面の非アクティブな申告が bracket を閉じて ◉ を解除しない。
+    ModDepth {
+        surface: crate::state::ParamSurface,
+        track_id: u32,
+        target: common::model::AutomationTarget,
+    },
     /// 変調ラックの数値欄 (ラック内で同時にドラッグできる欄は 1 つなので集約 1 本)。
     ModRack,
-    /// 立ち絵グループ変換 (`docs/plan_tachie_group_transform.md`)。
-    GroupTransform(common::model::GroupTransformParam),
+    /// 立ち絵グループ変換 (`docs/plan_tachie_group_transform.md`)。r.md #129: Par は device ごとに
+    /// 独立して開くので、どの Transform device の欄かを鍵に含める。
+    GroupTransform { device_id: u64, param: common::model::GroupTransformParam },
 }
 
 /// r.md #115: 変調ラックでポインタが乗っているもの (`Q` のバイパス対象)。 住所は安定 id。

@@ -3,7 +3,11 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use common::model::Track;
+
+/// live 値を読む 1 フレーム分の文脈 (ランチャーの走行状態の表を 1 回だけ組んで配る)。
+pub struct LiveParamScope {
+    running: Vec<crate::launcher_time::RunningRow>,
+}
 
 impl AppData {
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
@@ -105,71 +109,122 @@ impl AppData {
         depth
     }
 
-    /// `(track, target)` の built-in コントロールが mixer / arrangement で
-    /// **表示すべき値**を返す。 再生中に enabled かつ現在 recording 対象でない
-    /// automation lane があれば playhead 位置の curve 値 (= audio engine の
-    /// `fill_track_param_ramps` と同じ read-mode 解決)、 それ以外 (停止中 / lane 無し
-    /// / 当該 param を書き込み中) は静的な `fallback`。 これで:
+    /// live 値の 1 フレーム分の文脈 ([`LiveParamScope`]) を組む。
+    pub fn live_param_scope(&self) -> LiveParamScope {
+        LiveParamScope { running: self.launcher_running_rows() }
+    }
+
+    /// `(owner, target)` のコントロールが mixer / arrangement / Rack で **表示すべき値**
+    /// (r.md #129 §7.5 の唯一の口)。再生中に enabled かつ現在 recording 対象でない
+    /// automation lane があれば playhead 位置の curve 値 (= audio engine の read-mode 解決)、
+    /// それ以外 (停止中 / lane 無し / 当該 param を書き込み中) は静的な `fallback`。 これで:
     /// - 再生中はノブ / フェーダーがオートメーションに追従して audio と一致して動く、
     /// - 停止中はコントロールをそのまま手動操作でき、
     /// - 書き込み (Touch/Latch/Write) 中の drag はマウスに追従する
     ///   (audio engine の `recording_lanes` bypass と対称)。
     ///
-    /// 変調 (`Track.mod_routings`) は各ノブの per-control modulation overlay
-    /// (`view::modulation::build_mod` の live_display) が別途表示するので、 ここは
-    /// **lane 値のみ**返して二重適用を避ける。
+    /// `owner_id` は store の持ち主 (track id か `MASTER_TRACK_ID` → `song_lanes`)。
+    ///
+    /// 変調は各ノブの per-control modulation overlay (`view::modulation::build_mod` の
+    /// live_display) が別途表示するので、 ここは **lane 値のみ**返して二重適用を避ける。
+    pub(crate) fn live_param_value(
+        &self,
+        owner_id: u32,
+        target: &common::model::AutomationTarget,
+        fallback: f32,
+    ) -> f32 {
+        self.live_param_value_on(&self.live_param_scope(), owner_id, target, fallback)
+    }
+
+    /// 文脈を **呼び側が 1 回だけ組む**版 (トラックを並べる描画で毎回
+    /// `launcher_running_rows()` を組むと行数 × トラック数の O(N²) になる)。
+    pub(crate) fn live_param_value_on(
+        &self,
+        scope: &LiveParamScope,
+        owner_id: u32,
+        target: &common::model::AutomationTarget,
+        fallback: f32,
+    ) -> f32 {
+        match crate::view::native_device::ParamOwner::resolve(self.cur.song_doc.song(), owner_id) {
+            Some(owner) => self.live_lane_value(scope, owner, target, fallback),
+            None => fallback,
+        }
+    }
+
+    /// 本体。store を解決済みで受け取る。
     ///
     /// r.md #87: レーンの値は **行の主導権込み**で解く
     /// ([`crate::launcher_time::RowTimeline`]) — ランチャー主導のレーン行では
     /// engine が `lane.session_clips` のセルを、停止させた行ではレーン既定値 (Q11)
     /// を出すので、ここで `lane.clips` を song の playhead で読むと
-    /// 「聴こえている音量 ≠ フェーダーが指す値」になる。走行状態の表は
-    /// [`Self::launcher_running_rows`] が 1 回組んで配る。
-    pub(crate) fn live_param_value(
-        &self,
-        track: &Track,
-        target: &common::model::AutomationTarget,
-        fallback: f32,
-    ) -> f32 {
-        let running = self.launcher_running_rows();
-        self.live_param_value_on(&self.launcher_timeline(&running), track, target, fallback)
-    }
-
-    /// 走行状態の表を **呼び側が 1 回だけ組む**版 ([`Self::live_param_value`] の本体)。
-    /// `track_mix()` はトラックごとに 2 回呼ぶので、毎回 `launcher_running_rows()`
-    /// を組むと行数 × トラック数の O(N²) になる。
+    /// 「聴こえている音量 ≠ フェーダーが指す値」になる。
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn live_param_value_on(
+    pub(crate) fn live_lane_value(
         &self,
-        rows: &crate::launcher_time::RowTimeline<'_>,
-        track: &Track,
+        scope: &LiveParamScope,
+        owner: crate::view::native_device::ParamOwner<'_>,
         target: &common::model::AutomationTarget,
         fallback: f32,
     ) -> f32 {
-        if !self.cur.transport.is_playing {
+        if !self.cur.transport.is_playing || self.param_is_recording(owner.id, target) {
             return fallback;
         }
-        // `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を
-        // 書き込み中なら lane を読まず手動値を返す (audio thread に送る
-        // `recording_lanes` と同集合 = UI と audio が drift しない)。
-        let key = (track.id, target.clone());
-        let recording = self.cur.recording.recording_mode != common::model::RecordingMode::Read
-            && (self.cur.recording.active_param_gestures.contains(&key)
-                || (matches!(
-                    self.cur.recording.recording_mode,
-                    common::model::RecordingMode::Latch | common::model::RecordingMode::Write
-                ) && self.cur.recording.latched_param_gestures.contains(&key)));
-        if recording {
-            return fallback;
-        }
-        let Some(lane) = track
-            .automation_lanes
-            .iter()
-            .find(|l| l.enabled && l.target == *target)
-        else {
+        let Some(lane) = owner.lanes.iter().find(|l| l.enabled && l.target == *target) else {
             return fallback;
         };
-        rows.lane_value(track.id, lane, self.cur.song_doc.song()) as f32
+        self.launcher_timeline(&scope.running).lane_value(owner.id, lane, self.cur.song_doc.song()) as f32
+    }
+
+    /// 内蔵 device の 1 param の表示値 (plain)。静的な値は `dev` (On は `bypassed` の反転)。
+    pub fn live_native_param(
+        &self,
+        scope: &LiveParamScope,
+        owner: crate::view::native_device::ParamOwner<'_>,
+        dev: &common::model::NativeDevice,
+        p: common::model::NativeParamId,
+    ) -> f32 {
+        let target = common::model::AutomationTarget::NativeParam { device_id: dev.id, param: p };
+        self.live_lane_value(scope, owner, &target, dev.param(p).unwrap_or(0.0))
+    }
+
+    /// 行のミニ表示 / Par のカーブ用に、レーンの値を重ねた device (engine の
+    /// `resolve_native_device` の GUI 版。変調は `build_mod` が別途表示する)。
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn live_native_device(
+        &self,
+        scope: &LiveParamScope,
+        owner: crate::view::native_device::ParamOwner<'_>,
+        dev: &common::model::NativeDevice,
+    ) -> common::model::NativeDevice {
+        let mut out = *dev;
+        if !self.cur.transport.is_playing {
+            return out;
+        }
+        let timeline = self.launcher_timeline(&scope.running);
+        for lane in owner.lanes.iter().filter(|l| l.enabled) {
+            let common::model::AutomationTarget::NativeParam { device_id, param } = lane.target else {
+                continue;
+            };
+            if device_id != dev.id || self.param_is_recording(owner.id, &lane.target) {
+                continue;
+            }
+            out.set_param(param, timeline.lane_value(owner.id, lane, self.cur.song_doc.song()) as f32);
+        }
+        out
+    }
+
+    /// `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を書き込み中なら
+    /// lane を読まず手動値を返す (audio thread に送る `recording_lanes` と同集合 = UI と audio が
+    /// drift しない)。
+    fn param_is_recording(&self, owner_id: u32, target: &common::model::AutomationTarget) -> bool {
+        let rec = &self.cur.recording;
+        let key = (owner_id, target.clone());
+        rec.recording_mode != common::model::RecordingMode::Read
+            && (rec.active_param_gestures.contains_key(&key)
+                || (matches!(
+                    rec.recording_mode,
+                    common::model::RecordingMode::Latch | common::model::RecordingMode::Write
+                ) && rec.latched_param_gestures.contains(&key)))
     }
 
     /// いまの playhead と engine の走行状態から組んだ行解決器。
@@ -228,19 +283,17 @@ impl AppData {
         };
         // r.md #87: 行の主導権込みでレーン値を解く表は **1 フレームに 1 回**組む
         // (トラックごとに組むと行数 × トラック数の O(N²) になる)。
-        let running = self.launcher_running_rows();
-        let rows = self.launcher_timeline(&running);
+        let scope = self.live_param_scope();
         let live = |t: &common::model::Track, p: common::model::TrackBuiltinParam, fallback: f32| {
             let target = common::model::AutomationTarget::TrackBuiltin(p);
-            self.live_param_value_on(&rows, t, &target, fallback)
+            self.live_lane_value(&scope, crate::view::native_device::ParamOwner::of_track(t), &target, fallback)
         };
         self.cur.song_doc.song()
             .tracks
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let (l, r, gr) =
-                    self.cur.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
+                let (l, r) = self.cur.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0));
                 TrackMixEntry {
                     index: i as u32,
                     track_id: t.id,
@@ -258,7 +311,6 @@ impl AppData {
                     solo: t.solo,
                     peak_l_raw: l,
                     peak_r_raw: r,
-                    gain_reduction_db: gr,
                     is_group: is_group_set.contains(&t.id),
                     is_return: is_return_set.contains(&t.id),
                     depth: compute_depth(t.id),
@@ -602,15 +654,9 @@ impl AppData {
         domain: ModControlDomain,
         track_id: u32,
     ) -> InspectorModData {
-        let routings: &[common::model::ModRouting] =
-            if track_id == common::model::MASTER_TRACK_ID {
-                &self.cur.song_doc.song().song_mod_routings
-            } else {
-                match self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id) {
-                    Some(t) => &t.mod_routings,
-                    None => return InspectorModData::default(),
-                }
-            };
+        let Some((_, routings)) = self.cur.song_doc.song().param_stores(track_id) else {
+            return InspectorModData::default();
+        };
         let model_base = domain.to_model(target, display_base);
         // docs/plan_modulation_followups.md §2: plugin params normalize against
         // their real min/max (identity placeholder would saturate the overlay).
@@ -1078,4 +1124,52 @@ impl AppData {
         self.cur.peph.arr_label_cache.borrow()
     }
 
+}
+
+#[cfg(test)]
+mod live_value_tests {
+    use common::model::{
+        AutomationLane, AutomationTarget, BusCompParam, ChainRef, Device, MASTER_TRACK_ID, NativeKind, NativeParamId,
+        Parallel, TrackBuiltinParam,
+    };
+
+    use crate::view::native_device::ParamOwner;
+
+    /// F-G8 (§7.5): 再生中は store (master なら song 側) のレーン値、停止中は model 値。
+    #[test]
+    fn live_values_follow_lanes_in_the_owner_store_only_while_playing() {
+        let mut app = crate::test_support::headless_app();
+        let bus = app.cur.song_doc.song().builtin_native(MASTER_TRACK_ID, NativeKind::BusComp).expect("master Bus Comp").id;
+        let thr = NativeParamId::BusComp(BusCompParam::Threshold);
+        let mut parallel = Parallel::new();
+        parallel.id = 9_001;
+        parallel.chains[0].id = 9_002;
+        app.edit_song(|song| {
+            song.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(parallel));
+            song.push_lane(MASTER_TRACK_ID, AutomationLane::new(AutomationTarget::NativeParam { device_id: bus, param: thr }, -7.0));
+            song.push_lane(
+                MASTER_TRACK_ID,
+                AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 }), 0.3),
+            );
+        });
+        let chain_gain = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 });
+        let dev = *app.cur.song_doc.song().native_by_id(bus).expect("bus");
+        let model = dev.param(thr).expect("thr");
+        assert!((model - -7.0).abs() > 1e-3, "model 値はレーン値と違う");
+
+        let scope = app.live_param_scope();
+        let owner = || ParamOwner::master(app.cur.song_doc.song());
+        assert_eq!(app.live_native_param(&scope, owner(), &dev, thr), model, "停止中は model 値");
+        assert_eq!(app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0), 1.0);
+
+        app.cur.transport.is_playing = true;
+        let scope = app.live_param_scope();
+        let owner = ParamOwner::master(app.cur.song_doc.song());
+        assert!((app.live_native_param(&scope, owner, &dev, thr) - -7.0).abs() < 1e-6, "再生中はレーン値");
+        assert!(
+            (app.live_native_device(&scope, owner, &dev).param(thr).unwrap() - -7.0).abs() < 1e-6,
+            "device ごと解いても同じ"
+        );
+        assert!((app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0) - 0.3).abs() < 1e-6, "master の chain も追従");
+    }
 }

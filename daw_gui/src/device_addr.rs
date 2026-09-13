@@ -65,6 +65,20 @@ pub fn device_id_at(
 pub enum InsertAt {
     /// chain 内の位置 (`0..=chain.len()`)。
     Index(u32),
+    /// 新規デバイスの既定位置 (Q6: 組み込みの手前)。**実行時の Song** から
+    /// `Song::default_insert_index` で解決する (deferred 実行でも古くならない)。
+    Default,
+}
+
+impl InsertAt {
+    /// `song` の `chain` 内 index へ解決する (`None` = chain が無い)。`Index` は chain 長で頭打ち。
+    #[must_use]
+    pub fn resolve(self, song: &common::model::Song, chain: ChainRef) -> Option<usize> {
+        match self {
+            Self::Index(i) => song.chain_devices(chain).map(|d| (i as usize).min(d.len())),
+            Self::Default => song.default_insert_index(chain),
+        }
+    }
 }
 
 /// r.md #71 (プラグインのコピー / 移動): device の運搬要求 1 件分。 表示順は

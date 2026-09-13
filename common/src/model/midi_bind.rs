@@ -104,6 +104,10 @@ pub enum BindingTarget {
         #[serde(default, rename = "track", skip_serializing)]
         legacy_track: Option<u32>,
     },
+    /// r.md #129: 内蔵 device のパラメーター (`AutomationTarget::NativeParam` と同じ住所)。
+    NativeParam { device_id: u64, param: super::NativeParamId },
+    /// r.md #129: master のフェーダー後 Limiter。
+    MasterLimiter(super::MasterLimiterParam),
     // ---- v35 (r.md #87 クリップランチャー): パッドから撃つ操作 ----------------
     // どれも「値」ではなく「押した / 離した」で効く (連続値を持たない)。
     // 宛先は安定 id。**セルは `clip.id` ではなく `(track_id, scene_id)`** で指す —

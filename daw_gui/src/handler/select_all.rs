@@ -53,24 +53,15 @@ impl AppData {
     /// 覆う範囲。 `MASTER_TRACK_ID` は song lane 行だけ。 クリップが 1 つも無ければ `None`。
     fn all_in_track_selection(&self, track_id: u32) -> Option<common::model::TimeSelection> {
         let song = self.cur.song_doc.song();
+        // レーンの置き場は `param_stores` (master は song lane)。トラック行は master には無い。
+        let (automation, _) = song.param_stores(track_id)?;
         let mut lanes = Vec::new();
-        if track_id == common::model::MASTER_TRACK_ID {
-            lanes.extend(song.song_lanes.iter().map(|l| {
-                common::model::LaneRef::Automation(common::model::AutomationLaneKey {
-                    track: track_id,
-                    lane: l.id,
-                })
-            }));
-        } else {
-            let track = song.track_by_id(track_id)?;
+        if track_id != common::model::MASTER_TRACK_ID {
             lanes.push(common::model::LaneRef::Track(track_id));
-            lanes.extend(track.automation_lanes.iter().map(|l| {
-                common::model::LaneRef::Automation(common::model::AutomationLaneKey {
-                    track: track_id,
-                    lane: l.id,
-                })
-            }));
         }
+        lanes.extend(automation.iter().map(|l| {
+            common::model::LaneRef::Automation(common::model::AutomationLaneKey { track: track_id, lane: l.id })
+        }));
         self.arrangement_lanes_extent(lanes)
     }
 

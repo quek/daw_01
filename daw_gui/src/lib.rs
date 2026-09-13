@@ -27,6 +27,8 @@ pub(crate) mod test_support;
 pub mod event;
 /// チェーン上のデバイス操作のイベント (`AppEvent::Device` の中身)。
 pub mod event_device;
+/// r.md #129: 内蔵 device / master Limiter の値編集 (`DeviceEvent::NativeEdit` の中身)。
+pub mod event_native;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
 pub mod event_sampler;

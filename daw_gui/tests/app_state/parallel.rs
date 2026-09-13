@@ -29,6 +29,15 @@ fn flush_states(app: &mut AppData) {
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
 }
 
+/// track 0 の最上位の device id (組み込み native はチェーン末尾に必ず居るので除く)。
+fn top_level_user_ids(app: &AppData) -> Vec<u64> {
+    app.cur.song_doc.song().tracks[0].devices.iter().filter(|d| !d.is_builtin_native()).map(Device::id).collect()
+}
+
+fn top_level_user_devices(app: &AppData) -> usize {
+    top_level_user_ids(app).len()
+}
+
 fn plugin_ids_in_order(app: &AppData) -> Vec<String> {
     app.cur.song_doc.song().tracks[0]
         .plugins()
@@ -44,7 +53,7 @@ fn group_wraps_selected_devices_into_a_parallel_and_ungroup_restores_them() {
     app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: vec![bitcrush, delay] }));
     let song = app.cur.song_doc.song();
     let devices = &song.tracks[0].devices;
-    assert_eq!(devices.len(), 2, "synth + Parallel");
+    assert_eq!(top_level_user_devices(&app), 2, "synth + Parallel");
     assert_eq!(devices[0].id(), synth);
     let parallel = devices[1].as_parallel().expect("2 つ目は Parallel");
     assert_eq!(parallel.chains.len(), 1);
@@ -60,9 +69,8 @@ fn group_wraps_selected_devices_into_a_parallel_and_ungroup_restores_them() {
 
     let parallel_id = parallel.id;
     app.handle_event(AppEvent::Device(DeviceEvent::UngroupParallel { parallel_id }));
-    let devices = &app.cur.song_doc.song().tracks[0].devices;
     assert_eq!(
-        devices.iter().map(Device::id).collect::<Vec<_>>(),
+        top_level_user_ids(&app),
         vec![synth, bitcrush, delay],
         "Ungroup で直列に戻る (id は据え置き)"
     );
@@ -157,7 +165,7 @@ fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
     })));
     flush_states(&mut app);
     let song = app.cur.song_doc.song();
-    assert_eq!(song.tracks[0].devices.len(), 2, "top-level は synth + Parallel");
+    assert_eq!(top_level_user_devices(&app), 2, "top-level は synth + Parallel");
     let chain = song.chain_by_id(chain_id).unwrap().1;
     assert_eq!(chain.devices.iter().map(Device::id).collect::<Vec<_>>(), vec![bitcrush, delay]);
     assert_eq!(song.find_device(delay), Some((ChainRef::Chain(chain_id), 1)));
@@ -170,8 +178,7 @@ fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
         copy: false,
     })));
     flush_states(&mut app);
-    let ids: Vec<u64> = app.cur.song_doc.song().tracks[0].devices.iter().map(Device::id).collect();
-    assert_eq!(ids, vec![parallel_id, synth]);
+    assert_eq!(top_level_user_ids(&app), vec![parallel_id, synth]);
     assert_eq!(plugin_ids_in_order(&app), vec!["test.bitcrush", "test.delay", "test.synth"]);
 
     // Parallel を自分の中の chain へは落とせない (循環)。
@@ -182,8 +189,7 @@ fn relocate_moves_a_device_into_a_parallel_chain_and_back() {
         copy: false,
     })));
     flush_states(&mut app);
-    let ids: Vec<u64> = app.cur.song_doc.song().tracks[0].devices.iter().map(Device::id).collect();
-    assert_eq!(ids, vec![parallel_id, synth], "自分の中への移動は無視される");
+    assert_eq!(top_level_user_ids(&app), vec![parallel_id, synth], "自分の中への移動は無視される");
 }
 
 #[test]

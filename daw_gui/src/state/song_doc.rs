@@ -161,7 +161,10 @@ pub struct SongDoc {
 }
 
 impl SongDoc {
-    pub fn new(song: Song) -> Self {
+    pub fn new(mut song: Song) -> Self {
+        // r.md #129: 編集後の不変条件 (組み込みの補充 / dangling の掃除)。baseline 確定前なので
+        // `*` は立たない。
+        song.enforce_edit_invariants();
         Self {
             song,
             edit_epoch: 1,
@@ -236,7 +239,10 @@ impl SongDoc {
                 state_id: self.state_id,
             });
         }
-        let (r, changed) = f(&mut self.song);
+        let (r, mut changed) = f(&mut self.song);
+        // r.md #129: 編集後の不変条件 (組み込みの正規化 + dangling な lane / routing / binding の
+        // 掃除) は **同じ undo step** で無条件に回復する。handler 側に prune を書かない。
+        changed |= self.song.enforce_edit_invariants();
         if changed {
             self.state_id = self.alloc_state_id();
             // redo は「実際に編集が起きた」 ときだけ無効化する (no-op で
@@ -275,6 +281,7 @@ impl SongDoc {
             return None;
         }
         let r = f(&mut self.song);
+        self.song.enforce_edit_invariants();
         self.state_id = self.alloc_state_id();
         self.bump_edit_epoch();
         Some(r)
@@ -296,7 +303,7 @@ impl SongDoc {
             self.rejection = Some("書き出し中は編集できません");
             return None;
         }
-        let changed = f(&mut self.song);
+        let changed = f(&mut self.song) | self.song.enforce_edit_invariants();
         if changed {
             self.state_id = self.alloc_state_id();
             self.bump_edit_epoch();
@@ -501,6 +508,9 @@ impl SongDoc {
     /// する。 (save は履歴を残したいので [`SongDoc::mark_saved`] を使う。)
     pub fn replace_song(&mut self, song: Song) {
         self.song = song;
+        // r.md #129: baseline 確定前に不変条件を回復する (load 経路は正規化済みなので no-op、
+        // script 経路はここで dangling の連鎖掃除まで揃う)。`*` は立たない。
+        self.song.enforce_edit_invariants();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.current_label = BASELINE_LABEL;

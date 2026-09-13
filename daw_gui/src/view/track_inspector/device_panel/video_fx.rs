@@ -12,12 +12,13 @@ pub(super) fn draw_video_fx_params(
     area: Rect,
     pad: f32,
     mut y: f32,
+    open_device: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // 内蔵映像 FX のパラメータ調整パネル（チェーン行の "GUI" ボタンで開閉）。
     // 各 param を scrubable_number で実レンジ表示 + per-control 変調（Ranged domain で kick→効果）。
     // 値の SSoT は PluginParam lane の default_value（`SetVideoFxParam` が格納）。
-    if let Some(view) = app.inspector_video_fx_params() {
+    if let Some(view) = app.inspector_video_fx_params(open_device) {
         ui.label_at("inspector_vfx_label", view.def.name, area.x + pad, y, 12.0, p.text);
         y += 18.0;
         let row_w = area.w - pad * 2.0;
@@ -81,7 +82,14 @@ pub(super) fn draw_video_fx_params(
                 resp.dragging || resp.editing_text,
             );
             // 変調 depth ドラッグの falling edge で host 再同期（音声 target の depth 反映用）。
-            mod_widget::push_mod_depth_bracket(ui, app, track_id, &target, resp.mod_dragging);
+            mod_widget::push_mod_depth_bracket(
+                ui,
+                app,
+                crate::app::ParamSurface::Rack,
+                track_id,
+                &target,
+                resp.mod_dragging,
+            );
             y += input_h + 4.0;
         }
         y += 8.0;

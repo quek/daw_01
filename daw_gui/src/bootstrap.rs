@@ -105,6 +105,9 @@ pub struct Bootstrap {
     /// r.md #50 のマスター出力サンプルリング。daw_audio が `render_master_buffer`
     /// の出力を毎バッファ書き、テレメトリポーラの `MasterAnalyzer` が読む。
     pub scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
+    /// r.md #129 (§11.2): EQ Par のスペクトラム用 device ごとのサンプルリング。daw_audio が
+    /// watch 中の device の出力を書き、テレメトリポーラが読む。
+    pub device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     /// 取りこぼした子プロセス (crash / hang / VOICEVOX engine) を回収する
     /// **backstop** の Job Object。正常終了の主経路ではない ([`JobHandle`] の doc)。
     pub job: Arc<JobHandle>,
@@ -578,6 +581,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         shmem_id: shmem_id(pid),
         metrics_shmem_id: metrics_shmem_id(pid),
         scope_shmem_id: common::scope_bridge::scope_shmem_id(pid),
+        device_scope_shmem_id: common::device_scope_bridge::device_scope_shmem_id(pid),
         sample_rate: DEFAULT_SAMPLE_RATE,
         max_frames: MAX_FRAMES,
         channels: CHANNELS as u16,
@@ -597,6 +601,11 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     let scope = Arc::new(
         common::scope_bridge::ScopeBridgeHandle::create(&session.scope_shmem_id)
             .context("failed to create scope shmem")?,
+    );
+    // r.md #129: EQ Par のスペクトラム用 (device ごとのリング)。同じく daw_gui が create する。
+    let device_scope = Arc::new(
+        common::device_scope_bridge::DeviceScopeBridgeHandle::create(&session.device_scope_shmem_id)
+            .context("failed to create device scope shmem")?,
     );
     tracing::info!(?session, "created audio session handles");
 
@@ -673,6 +682,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         sample_rate: session.sample_rate,
         metrics,
         scope,
+        device_scope,
         job,
         plugin_db,
         rt,
@@ -717,6 +727,7 @@ impl Bootstrap {
             bridge,
             metrics,
             scope,
+            device_scope,
             job,
             plugin_db,
             rt,
@@ -762,6 +773,7 @@ impl Bootstrap {
         drop(bridge);
         drop(metrics);
         drop(scope);
+        drop(device_scope);
         drop(plugin_db);
         drop(_worker_bridge);
         drop(rt);

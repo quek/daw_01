@@ -10,9 +10,9 @@
 //! **baseline へ逃がさずセクション軸で割った** (「超過したら分割してから足す」)。
 //!
 //! 各セクションの contract は `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。**gate は各セクションが自分で持つ**
-//! (`voicevox_param_panel_open()` 等) ので、ここは順に呼ぶだけ = 並び順が
-//! そのまま画面の上下順になる。
+//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」に、Par を開いた device の id を足したもの。
+//! **gate は各セクションが自分で持つ** (`voicevox_param_panel_open(device_id)` 等) ので、
+//! ここは順に呼ぶだけ = 並び順がそのまま画面の上下順になる。
 
 mod clip_voice;
 mod group_transform;
@@ -24,7 +24,7 @@ mod video_fx;
 
 use super::*;
 
-/// 開いたデバイスの param パネルを描き、消費後の `y` を返す。
+/// Par を開いた `device_id` の param パネルを描き、消費後の `y` を返す。
 ///
 /// **この順序が画面の上下順**。 セクションはそれぞれ自分の gate で「出す / 出さない」を
 /// 決めるので、 出ないセクションは `y` を素通しする。
@@ -34,13 +34,14 @@ pub(super) fn draw_device_panel(
     area: Rect,
     pad: f32,
     exp_rect: Rect,
+    device_id: u64,
 ) -> f32 {
     let mut y = exp_rect.y;
-    y = group_transform::draw_group_transform(app, ui, area, pad, y);
-    y = video_fx::draw_video_fx_params(app, ui, area, pad, y);
-    y = plugin_params::draw_plugin_params(app, ui, area, pad, y);
-    y = text_event::draw_text_event(app, ui, area, pad, y);
-    y = clip_voice::draw_clip_voice(app, ui, area, pad, y);
-    y = talk::draw_talk(app, ui, area, pad, y);
-    lipsync::draw_lipsync_target(app, ui, area, pad, y)
+    y = group_transform::draw_group_transform(app, ui, area, pad, y, device_id);
+    y = video_fx::draw_video_fx_params(app, ui, area, pad, y, device_id);
+    y = plugin_params::draw_plugin_params(app, ui, area, pad, y, device_id);
+    y = text_event::draw_text_event(app, ui, area, pad, y, device_id);
+    y = clip_voice::draw_clip_voice(app, ui, area, pad, y, device_id);
+    y = talk::draw_talk(app, ui, area, pad, y, device_id);
+    lipsync::draw_lipsync_target(app, ui, area, pad, y, device_id)
 }

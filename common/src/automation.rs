@@ -16,7 +16,7 @@
 use crate::mod_plane::ModPlaneRef;
 use crate::model::{
     AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationTarget,
-    ClipContent, ContentId, ModParam, ModRouting, Polarity, Song, TrackBuiltinParam,
+    ClipContent, ContentId, ModParam, ModRouting, ParamRange, Polarity, Song, TrackBuiltinParam,
 };
 use std::collections::HashMap;
 
@@ -51,101 +51,88 @@ pub fn plain_to_norm_ranged(
     plain: f64,
     plugin_range: Option<(f64, f64)>,
 ) -> f32 {
-    if let AutomationTarget::PluginParam { .. } = target
-        && let Some((min, max)) = plugin_range
-        && max > min
-    {
-        return (((plain - min) / (max - min)) as f32).clamp(0.0, 1.0);
+    target_range(target, plugin_range).to_norm(plain) as f32
+}
+
+/// target の plain 値域と写像の種類。**正規化の唯一の表** — plain ↔ norm の変換、曲線を直線で
+/// 描いてよいか ([`norm_mapping_is_affine`])、逆写像を持つか ([`norm_mapping_is_invertible`]) は
+/// すべてここを引く。`_` を書かない網羅 match (target を足したらここが必ず落ちる)。
+///
+/// `plugin_range` は `PluginParam` の実 min/max (daw_gui の `plugin_params` cache が渡す)。
+/// 無ければ (audio engine 経路) `0..=1` の恒等。
+#[must_use]
+pub fn target_range(target: &AutomationTarget, plugin_range: Option<(f64, f64)>) -> ParamRange {
+    use crate::model::{GroupTransformParam as G, ImageBuiltinParam as I, TextBuiltinParam as X};
+    use TrackBuiltinParam as B;
+    const UNIT: ParamRange = ParamRange::Linear { lo: 0.0, hi: 1.0 };
+    const GAIN: ParamRange = ParamRange::Linear { lo: 0.0, hi: crate::model::MAX_TRACK_GAIN as f64 };
+    const BIPOLAR: ParamRange = ParamRange::Linear { lo: -1.0, hi: 1.0 };
+    const ROTATION: ParamRange = ParamRange::Linear { lo: -std::f64::consts::PI, hi: std::f64::consts::PI };
+    match target {
+        AutomationTarget::TrackBuiltin(b) => match b {
+            // r.md #110: Parallel chain の gain / pan は track volume / pan と同じ値域。
+            B::Volume | B::SendGain { .. } | B::ChainGain { .. } | B::ParallelOutGain { .. } => GAIN,
+            B::Pan | B::ChainPan { .. } => BIPOLAR,
+            B::Mute => ParamRange::Toggle,
+            // r.md #112: クロスオーバー周波数は対数 (値域の SSoT は `SPLIT_FREQ_RANGE`)。
+            B::ParallelSplitFreq { .. } => crate::model::SPLIT_FREQ_RANGE,
+            // r.md #114: Selector の位置は plain == norm (chain 数に依らず全域を等分)。
+            B::ParallelSelect { .. } => UNIT,
+        },
+        AutomationTarget::PluginParam { .. } => match plugin_range {
+            Some((lo, hi)) if hi > lo => ParamRange::Linear { lo, hi },
+            _ => UNIT,
+        },
+        // r.md #129: 値域の SSoT は `NativeParamId::range` / `MasterLimiterParam::range`。
+        AutomationTarget::NativeParam { param, .. } => param.range(),
+        AutomationTarget::MasterLimiter(p) => p.range(),
+        // control の表示レンジ (transport.rs SCRUB_STYLE_BPM / SCRUB_STYLE_TSIG_NUM)。
+        AutomationTarget::SongTempo => ParamRange::Linear { lo: 1.0, hi: 400.0 },
+        AutomationTarget::SongTimeSigNumerator => ParamRange::Linear { lo: 1.0, hi: 32.0 },
+        AutomationTarget::ImageBuiltin(p) => match p {
+            I::Rotation => ROTATION,
+            I::X | I::Y | I::W | I::H | I::Opacity => UNIT,
+        },
+        // FontSize は px。control レンジ (1..=4096)。色 / 位置 / 形は 0..=1。
+        // outline width / shadow offset / blur は px だが lane の値域は plain 直接 (§18.2-3)。
+        AutomationTarget::TextBuiltin(p) => match p {
+            X::Rotation => ROTATION,
+            X::FontSize => ParamRange::Linear { lo: 1.0, hi: 4096.0 },
+            X::X
+            | X::Y
+            | X::W
+            | X::H
+            | X::Opacity
+            | X::FillR
+            | X::FillG
+            | X::FillB
+            | X::FillA
+            | X::OutlineR
+            | X::OutlineG
+            | X::OutlineB
+            | X::OutlineA
+            | X::OutlineWidth
+            | X::ShadowR
+            | X::ShadowG
+            | X::ShadowB
+            | X::ShadowA
+            | X::ShadowOffsetX
+            | X::ShadowOffsetY
+            | X::ShadowBlur => UNIT,
+        },
+        // Group transform (§4.4): ScaleX/ScaleY は 0.1..=10 の log space。X/Y は「アンカー基準
+        // オフセット」で負 / >1 を取りうるが、正規化は画面内 0..1 の範囲でのみ正確。
+        AutomationTarget::GroupTransform(p) => match p {
+            G::Rotation => ROTATION,
+            G::ScaleX | G::ScaleY => ParamRange::Log { lo: 0.1, hi: 10.0 },
+            G::X | G::Y | G::AnchorX | G::AnchorY | G::Opacity => UNIT,
+        },
+        // r.md #89: モジュレーター自身のツマミ。log か恒等かの SSoT は [`mod_param_range`]。
+        AutomationTarget::ModSourceParam { param, .. } => {
+            mod_param_range(*param).map_or(UNIT, |(lo, hi)| ParamRange::Log { lo, hi })
+        }
+        AutomationTarget::ModRoutingDepth { .. } => BIPOLAR,
     }
-    let v = match target {
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => plain / 2.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => (plain + 1.0) / 2.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => {
-            if plain >= 0.5 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
-        // r.md #110: Parallel chain の gain / pan は track volume / pan と同じ値域。
-        AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::ChainGain { .. } | TrackBuiltinParam::ParallelOutGain { .. },
-        ) => plain / 2.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => (plain + 1.0) / 2.0,
-        // r.md #112: クロスオーバー周波数は対数 (レンジの SSoT は `SPLIT_FREQ_RANGE`)。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => {
-            crate::model::SPLIT_FREQ_RANGE.to_norm(plain)
-        }
-        // r.md #114: Selector の位置は plain == norm (`0..=1`、 chain 数に依らず全域を等分)。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => plain.clamp(0.0, 1.0),
-        // 内蔵チャンネルストリップ: レンジの SSoT は `EqParam::range` /
-        // `CompParam::range` (`common::model::channel_strip`)。ここで式を持たない。
-        AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
-        ) => {
-            if plain >= 0.5 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
-            param.range(*band).to_norm(plain)
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
-            param.range().to_norm(plain)
-        }
-        // マスターストリップ: レンジの SSoT は `MasterStripParam::range`
-        // (段階式は段 index のドメイン)。
-        AutomationTarget::MasterStrip(param) => param.range().to_norm(plain),
-        AutomationTarget::PluginParam { .. } => plain,
-        // Song-level: 旧 placeholder (常に 0) は tempo automation / 変調の値域を
-        // 失わせていた。control の表示レンジ (transport.rs SCRUB_STYLE_BPM /
-        // SCRUB_STYLE_TSIG_NUM) に揃えて affine 正規化する。
-        AutomationTarget::SongTempo => (plain - 1.0) / 399.0,
-        AutomationTarget::SongTimeSigNumerator => (plain - 1.0) / 31.0,
-        // Image PiP field: x/y/w/h/opacity は既に 0..=1 (恒等)、 Rotation
-        // のみ Pan と同 idiom で `(plain + π) / (2π)` mapping。
-        AutomationTarget::ImageBuiltin(crate::model::ImageBuiltinParam::Rotation) => {
-            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
-        }
-        AutomationTarget::ImageBuiltin(_) => plain,
-        // Text Builtin: image と同じく Rotation のみ Pan idiom、 残りは
-        // plain と norm が同単位 (= color/x/y/w/h は 0..=1、 font_size /
-        // outline_width / shadow_offset / shadow_blur は px だが
-        // automation lane の値域は plain 直接、 UI 側で範囲を整える)。
-        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::Rotation) => {
-            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
-        }
-        // FontSize は px。control レンジ (1..=4096) に揃えた affine 正規化
-        // (旧 identity placeholder では 48px などが norm 1 に飽和していた)。
-        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::FontSize) => {
-            (plain - 1.0) / 4095.0
-        }
-        AutomationTarget::TextBuiltin(_) => plain,
-        // Group transform (§4.4): 位置/アンカー (X/Y/AnchorX/AnchorY) と Opacity は
-        // 0..=1 恒等、 Rotation は Pan idiom、 ScaleX/ScaleY は 0.1..=10 の log space。
-        // ScaleX/Y は round-trip が norm_to_plain と厳密逆 (0.1·100^n)。
-        AutomationTarget::GroupTransform(crate::model::GroupTransformParam::Rotation) => {
-            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
-        }
-        AutomationTarget::GroupTransform(
-            crate::model::GroupTransformParam::ScaleX | crate::model::GroupTransformParam::ScaleY,
-        ) => (plain.clamp(0.1, 10.0) / 0.1).ln() / 100.0_f64.ln(),
-        // X/Y/AnchorX/AnchorY は恒等。注意: X/Y は「アンカー基準オフセット」で
-        // 負 / >1 を取りうる (model.rs)。下の clamp(0,1) で base が [0,1] 外だと
-        // base_norm が端に飽和し、per-control modulation の depth ドラッグが片側に
-        // 潰れる (画面内 0..1 の範囲でのみ正確)。将来 X/Y に実座標レンジを与えて
-        // affine 化する余地あり (今回スコープ外)。
-        AutomationTarget::GroupTransform(_) => plain,
-        // r.md #89: モジュレーター自身のツマミ。値域の SSoT は [`mod_param_range`]
-        // (log か恒等かも含めてここ 1 箇所)。
-        AutomationTarget::ModSourceParam { param, .. } => mod_param_norm(*param, plain),
-        // 深さは -1..=1 (Pan と同 idiom)。
-        AutomationTarget::ModRoutingDepth { .. } => (plain + 1.0) / 2.0,
-    };
-    v.clamp(0.0, 1.0) as f32
 }
 
 /// [`ModParam`] の plain 値域。`Some((min, max))` は **log 正規化** (min > 0 が前提)、
@@ -218,57 +205,21 @@ pub fn mod_param_plain(param: ModParam, norm: f64) -> f64 {
 /// 端点が窓の内側であることを別途確かめること
 /// (`daw_gui/src/widgets/arrangement/curve.rs::segment_is_straight_on_screen`)。
 ///
-/// 窓の内側でも非 affine なのは `GroupTransform::ScaleX` / `ScaleY` (log 空間)、
-/// `TrackBuiltin::Mute` (0.5 閾値の階段)、そして log 値域を持つ
-/// [`AutomationTarget::ModSourceParam`] (r.md #89)。
+/// 判定は [`target_range`] の `ParamRange::is_affine` (Linear だけ)。log 空間 (周波数 /
+/// ScaleX・Y / log 値域の ModSourceParam)、階段 (Mute / On / 段階式)、OFF 帯は非 affine。
 #[must_use]
 pub fn norm_mapping_is_affine(target: &AutomationTarget) -> bool {
-    match target {
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute)
-        | AutomationTarget::GroupTransform(
-            crate::model::GroupTransformParam::ScaleX
-            | crate::model::GroupTransformParam::ScaleY,
-        ) => false,
-        // log 値域を持つ param だけ非 affine。0..=1 恒等の param は affine。
-        AutomationTarget::ModSourceParam { param, .. } => mod_param_range(*param).is_none(),
-        // 内蔵ストリップ: 判定は `ParamRange` 自身が持つ (周波数 / 時定数 /
-        // レシオ / Q は log、ゲイン / スレッショルドは線形)。
-        AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
-        ) => false,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
-            param.range(*band).is_affine()
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
-            param.range().is_affine()
-        }
-        // マスターストリップ: 段階式 (Ratio / Attack / Release / 各 On) は段なので
-        // 直線ではない。連続パラメータは線形レンジなので affine。
-        AutomationTarget::MasterStrip(param) => !param.is_stepped(),
-        _ => true,
-    }
+    target_range(target, None).is_affine()
 }
 
 /// `plain_to_norm_ranged` が **狭義単調 (= 逆写像 `norm_to_plain_ranged` を持つ)** か。
 ///
-/// 階段の `TrackBuiltin::Mute` だけが false。 画面上の点を掴んで値を逆算する
-/// 直接操作 (r.md #73 の Alt+ドラッグ) は、これが true の lane でしか成立しない
-/// (Mute lane の曲線は必ず 0 / 1 の段なので、指に追従させる連続解が無い)。
+/// 画面上の点を掴んで値を逆算する直接操作 (r.md #73 の Alt+ドラッグ) は、これが true の lane
+/// でしか成立しない。判定は [`target_range`] の `ParamRange::is_invertible` (平らな帯を持つ
+/// Toggle / Stepped / LogWithOff は false)。
 #[must_use]
 pub fn norm_mapping_is_invertible(target: &AutomationTarget) -> bool {
-    match target {
-        AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::Mute | TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
-        ) => false,
-        // 検出フィルタ周波数は左端に OFF の平らな帯があるので狭義単調でない。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
-            param.range().is_invertible()
-        }
-        // 段階式は同じ段の中で値が動かないので狭義単調でない (曲線を掴んで
-        // 値を逆算する直接操作が成立しない)。
-        AutomationTarget::MasterStrip(param) => !param.is_stepped(),
-        _ => true,
-    }
+    target_range(target, None).is_invertible()
 }
 
 /// Normalized 0..=1 → plain (target's native unit)。`plain_to_norm` の
@@ -285,79 +236,8 @@ pub fn norm_to_plain_ranged(
     norm: f32,
     plugin_range: Option<(f64, f64)>,
 ) -> f64 {
-    let n = norm.clamp(0.0, 1.0) as f64;
-    if let AutomationTarget::PluginParam { .. } = target
-        && let Some((min, max)) = plugin_range
-        && max > min
-    {
-        return min + n * (max - min);
-    }
-    match target {
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => n * 2.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => n * 2.0 - 1.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => {
-            if n >= 0.5 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => n * 2.0,
-        AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::ChainGain { .. } | TrackBuiltinParam::ParallelOutGain { .. },
-        ) => n * 2.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainPan { .. }) => n * 2.0 - 1.0,
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq { .. }) => {
-            crate::model::SPLIT_FREQ_RANGE.from_norm(n)
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => n.clamp(0.0, 1.0),
-        // `plain_to_norm_ranged` の厳密逆 (レンジは channel_strip 側が SSoT)。
-        AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::StripEqOn | TrackBuiltinParam::StripCompOn,
-        ) => {
-            if n >= 0.5 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripEq { band, param }) => {
-            param.range(*band).from_norm(n)
-        }
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::StripComp { param }) => {
-            param.range().from_norm(n)
-        }
-        // `plain_to_norm_ranged` の厳密逆。段階式の丸めは値を書く側
-        // (`MasterStrip::set_param`) が行うので、ここは連続のまま返す。
-        AutomationTarget::MasterStrip(param) => param.range().from_norm(n),
-        AutomationTarget::PluginParam { .. } => n,
-        // plain_to_norm の厳密逆 (control 表示レンジ)。
-        AutomationTarget::SongTempo => 1.0 + n * 399.0,
-        AutomationTarget::SongTimeSigNumerator => 1.0 + n * 31.0,
-        // Image PiP field: x/y/w/h/opacity は normalize と plain が同単位、
-        // Rotation のみ `n * 2π - π` で -π..=π に展開。
-        AutomationTarget::ImageBuiltin(crate::model::ImageBuiltinParam::Rotation) => {
-            n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
-        }
-        AutomationTarget::ImageBuiltin(_) => n,
-        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::Rotation) => {
-            n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
-        }
-        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::FontSize) => 1.0 + n * 4095.0,
-        AutomationTarget::TextBuiltin(_) => n,
-        // Group transform (§4.4): plain_to_norm の厳密逆。X/Y/AnchorX/AnchorY/
-        // Opacity は恒等、 Rotation は `n·2π - π`、 ScaleX/ScaleY は `0.1·100^n`。
-        AutomationTarget::GroupTransform(crate::model::GroupTransformParam::Rotation) => {
-            n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
-        }
-        AutomationTarget::GroupTransform(
-            crate::model::GroupTransformParam::ScaleX | crate::model::GroupTransformParam::ScaleY,
-        ) => 0.1 * 100.0_f64.powf(n),
-        AutomationTarget::GroupTransform(_) => n,
-        // r.md #89: `plain_to_norm_ranged` の厳密逆 (値域の SSoT は `mod_param_range`)。
-        AutomationTarget::ModSourceParam { param, .. } => mod_param_plain(*param, n),
-        AutomationTarget::ModRoutingDepth { .. } => n * 2.0 - 1.0,
-    }
+    // 段階式の丸めは値を書く側 (`NativeParams::set`) が行うので、ここは連続のまま返す。
+    target_range(target, plugin_range).from_norm(f64::from(norm))
 }
 
 /// Evaluate the curve value at `t` (clip-local beats) inside an
@@ -1420,76 +1300,108 @@ mod tests {
         assert!(c.next_point_id > *ids.iter().max().unwrap(), "allocator が進んでいない");
     }
 
-    /// r.md #73: 2 述語は `AutomationTarget` の全 variant を明示的に覆う。
-    /// 新しい target を足したときにここが落ちるようにしておく (曲線の直接操作は
-    /// 「その lane で逆写像が取れるか」に依存するので、既定値で通してはいけない)。
+    /// 全 `AutomationTarget` (NativeParam は 4 種の全住所、MasterLimiter を含む)。variant を足したら
+    /// `cover` の網羅 match が落ちるので、ここへの追加を忘れない。
+    fn every_target() -> Vec<AutomationTarget> {
+        use crate::model::{
+            GroupTransformParam as G, ImageBuiltinParam as I, MasterLimiterParam, NativeKind, NativeParamId,
+            SplitEdge, TextBuiltinParam as X,
+        };
+        fn cover(t: &AutomationTarget) {
+            match t {
+                AutomationTarget::TrackBuiltin(_)
+                | AutomationTarget::PluginParam { .. }
+                | AutomationTarget::NativeParam { .. }
+                | AutomationTarget::MasterLimiter(_)
+                | AutomationTarget::SongTempo
+                | AutomationTarget::SongTimeSigNumerator
+                | AutomationTarget::ImageBuiltin(_)
+                | AutomationTarget::TextBuiltin(_)
+                | AutomationTarget::GroupTransform(_)
+                | AutomationTarget::ModSourceParam { .. }
+                | AutomationTarget::ModRoutingDepth { .. } => {}
+            }
+        }
+        use TrackBuiltinParam as B;
+        let mut v: Vec<AutomationTarget> = [
+            B::Volume,
+            B::Pan,
+            B::Mute,
+            B::SendGain { send_id: 1, legacy_send_idx: None },
+            B::ChainGain { chain_id: 1 },
+            B::ChainPan { chain_id: 1 },
+            B::ParallelOutGain { parallel_id: 1 },
+            B::ParallelSplitFreq { parallel_id: 1, edge: SplitEdge::LowMid },
+            B::ParallelSplitFreq { parallel_id: 1, edge: SplitEdge::MidHigh },
+            B::ParallelSelect { parallel_id: 1 },
+        ]
+        .into_iter()
+        .map(AutomationTarget::TrackBuiltin)
+        .collect();
+        v.push(AutomationTarget::PluginParam { device_id: 1, param_id: 2, legacy_device_index: None });
+        for kind in NativeKind::ALL {
+            v.extend(NativeParamId::all_of(kind).iter().map(|&param| AutomationTarget::NativeParam { device_id: 1, param }));
+        }
+        v.extend([MasterLimiterParam::On, MasterLimiterParam::Ceiling].map(AutomationTarget::MasterLimiter));
+        v.extend([AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator]);
+        v.extend([I::X, I::Y, I::W, I::H, I::Opacity, I::Rotation].map(AutomationTarget::ImageBuiltin));
+        v.extend(
+            [
+                X::X, X::Y, X::W, X::H, X::Opacity, X::Rotation, X::FontSize, X::FillR, X::FillG, X::FillB,
+                X::FillA, X::OutlineR, X::OutlineG, X::OutlineB, X::OutlineA, X::OutlineWidth, X::ShadowR,
+                X::ShadowG, X::ShadowB, X::ShadowA, X::ShadowOffsetX, X::ShadowOffsetY, X::ShadowBlur,
+            ]
+            .map(AutomationTarget::TextBuiltin),
+        );
+        v.extend(
+            [G::X, G::Y, G::Rotation, G::ScaleX, G::ScaleY, G::AnchorX, G::AnchorY, G::Opacity]
+                .map(AutomationTarget::GroupTransform),
+        );
+        v.extend(ModParam::ALL.map(|param| AutomationTarget::ModSourceParam { source_id: 1, param }));
+        v.push(AutomationTarget::ModRoutingDepth { routing_id: 1 });
+        v.iter().for_each(cover);
+        v
+    }
+
+    /// F-C7 (r.md #129): 正規化の単一の表 `target_range` と 2 述語の整合を全 target で確かめる。
+    /// invertible なら往復が 1e-9 で戻り、norm は plain に対して単調非減少。affine なら中点が一致し、
+    /// Log / LogWithOff / Toggle には中点が一致しない例がある。ParallelSplitFreq は affine でない。
     #[test]
-    fn norm_mapping_predicates_cover_every_target() {
-        use crate::model::{GroupTransformParam, ImageBuiltinParam, TextBuiltinParam};
-        // affine でない = ScaleX / ScaleY (log) と Mute (階段) の 3 つだけ。
-        let non_affine = [
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute),
-            AutomationTarget::GroupTransform(GroupTransformParam::ScaleX),
-            AutomationTarget::GroupTransform(GroupTransformParam::ScaleY),
-        ];
-        for t in &non_affine {
-            assert!(!norm_mapping_is_affine(t), "{t:?} は非 affine のはず");
+    fn target_range_is_consistent_for_every_target() {
+        let targets = every_target();
+        assert!(targets.len() > 90, "列挙が欠けている: {}", targets.len());
+        for t in &targets {
+            let r = target_range(t, None);
+            let (lo, hi) = r.display_range();
+            let plains: Vec<f64> = (0..=20).map(|i| lo + (hi - lo) * f64::from(i) / 20.0).collect();
+            let norms: Vec<f64> = plains.iter().map(|&p| r.to_norm(p)).collect();
+            assert!(norms.windows(2).all(|w| w[1] >= w[0] - 1e-12), "{t:?}: norm が単調でない {norms:?}");
+            assert_eq!(norm_mapping_is_invertible(t), r.is_invertible(), "{t:?}");
+            assert_eq!(norm_mapping_is_affine(t), r.is_affine(), "{t:?}");
+            if r.is_invertible() {
+                for n in [0.1, 0.5, 0.9] {
+                    assert!((r.to_norm(r.from_norm(n)) - n).abs() < 1e-9, "{t:?}: {n} が往復しない");
+                }
+            }
+            let mid_matches = plains.windows(3).all(|w| (r.to_norm(w[1]) - (r.to_norm(w[0]) + r.to_norm(w[2])) / 2.0).abs() < 1e-9);
+            if r.is_affine() {
+                assert!(mid_matches, "{t:?}: affine なのに中点が一致しない");
+            }
+            if matches!(r, ParamRange::Log { .. } | ParamRange::LogWithOff { .. } | ParamRange::Toggle) {
+                assert!(!mid_matches, "{t:?}: 非 affine なのに中点が全部一致した");
+            }
         }
-        // 逆写像を持たない = Mute だけ。
-        assert!(!norm_mapping_is_invertible(&AutomationTarget::TrackBuiltin(
-            TrackBuiltinParam::Mute
-        )));
-        // 残りは全部 affine かつ invertible。 **全 variant を列挙する** (`_ =>` を書かない)。
-        let affine: Vec<AutomationTarget> = vec![
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
-                send_id: 1,
-                legacy_send_idx: None,
-            }),
-            AutomationTarget::PluginParam { device_id: 1, param_id: 2, legacy_device_index: None },
-            AutomationTarget::SongTempo,
-            AutomationTarget::SongTimeSigNumerator,
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::X),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::W),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::H),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity),
-            AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::X),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::Y),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::W),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::H),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::Opacity),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::Rotation),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FontSize),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillR),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillG),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillB),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::FillA),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineR),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineG),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineB),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineA),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::OutlineWidth),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowR),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowG),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowB),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowA),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowOffsetX),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowOffsetY),
-            AutomationTarget::TextBuiltin(TextBuiltinParam::ShadowBlur),
-            AutomationTarget::GroupTransform(GroupTransformParam::X),
-            AutomationTarget::GroupTransform(GroupTransformParam::Y),
-            AutomationTarget::GroupTransform(GroupTransformParam::Rotation),
-            AutomationTarget::GroupTransform(GroupTransformParam::AnchorX),
-            AutomationTarget::GroupTransform(GroupTransformParam::AnchorY),
-            AutomationTarget::GroupTransform(GroupTransformParam::Opacity),
-        ];
-        for t in &affine {
-            assert!(norm_mapping_is_affine(t), "{t:?} は affine のはず");
-            assert!(norm_mapping_is_invertible(t), "{t:?} は逆写像を持つはず");
-        }
+        let split = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSplitFreq {
+            parallel_id: 1,
+            edge: crate::model::SplitEdge::LowMid,
+        });
+        assert!(!norm_mapping_is_affine(&split), "旧 `_ => true` の誤判定");
+        // Stepped は旧 Linear{0,count-1} と to_norm が同じ。
+        let ratio = AutomationTarget::NativeParam {
+            device_id: 1,
+            param: crate::model::NativeParamId::BusComp(crate::model::BusCompParam::Ratio),
+        };
+        assert!((plain_to_norm(&ratio, 1.0) - 0.5).abs() < 1e-6);
     }
 
     /// r.md #73: `apply_curve` は a / b に対して **affine 同変**。

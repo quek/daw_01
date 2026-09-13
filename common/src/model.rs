@@ -15,7 +15,7 @@ use crate::scale::ScaleChange;
 // (ロジックの変更で fingerprint を動かさない、build.rs 冒頭)。
 mod automation;
 mod clip_window;
-mod master_strip;
+mod master_limiter;
 mod media_manifest;
 mod content;
 mod content_split;
@@ -24,6 +24,10 @@ mod ids;
 mod load_normalize;
 mod midi_bind;
 mod modulation;
+mod native;
+mod native_param;
+mod param_address;
+mod param_range;
 mod plugin_instance;
 mod section_ops;
 mod sections;
@@ -35,13 +39,16 @@ mod view_state;
 mod track;
 pub use automation::*;
 pub use clip_window::*;
-pub use master_strip::*;
+pub use master_limiter::*;
 pub use media_manifest::*;
 pub use content::*;
 pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;
 pub use modulation::*;
+pub use native::*;
+pub use native_param::*;
+pub use param_range::*;
 pub use plugin_instance::*;
 pub use section_ops::*;
 pub use sections::*;
@@ -50,7 +57,7 @@ pub use source_pools::*;
 pub use time_ops::*;
 pub use time_selection::*;
 pub use track::*;
-pub use view_state::ViewState;
+pub use view_state::{RackPanelKey, ViewState};
 
 /// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。
 /// ズーム / スクロール / 行高 / スナップ設定等の表示状態を `Song` の **兄弟**として
@@ -273,7 +280,15 @@ pub use view_state::ViewState;
 /// Smooth / Delay / Fade In、 `ModSource.enabled` / `ModRouting.enabled` を追加。 旧ファイルは
 /// `#[serde(default)]` で読める (migration 不要)。 新ファイルを旧ビルドで開くと unknown
 /// variant で落ちるので version を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 38;
+///
+/// v39 (r.md #129 Rack 内蔵デバイス、`docs/plan_rack_native_devices.md`): `Track.strip` /
+/// `Song.master_strip` を撤去し、組み込み Comp / EQ (master は Bus Comp / Tone EQ) をチェーン上の
+/// [`Device::Native`] (`{"Native": {..}}`) にした。master の Limiter は [`Song::master_limiter`]。
+/// オートメーション住所の `TrackBuiltin(Strip*)` / `MasterStrip(..)` は
+/// [`AutomationTarget::NativeParam`] / [`AutomationTarget::MasterLimiter`] (実 device id) に変わる。
+/// 旧ファイルは `project::migrate_legacy_song` の末尾 (`native_migration::migrate_strips_to_native`) が
+/// 版に依存せず deserialize 前に移す (旧形と新形は重ならないので冪等)。
+pub const CURRENT_VERSION: u32 = 39;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -583,13 +598,11 @@ pub struct Song {
     /// forward-migrate する (= 旧ファイルの聞こえ方は変わらない)。
     #[serde(default = "default_master_gain")]
     pub master_gain: f32,
-    /// マスターバス専用のストリップ (バスコンプ + トーン EQ + リミッター)。
-    /// 設計正本は `docs/plan_master_strip.md`。信号順は
-    /// `合算 → Comp → EQ → master_fx_chain → master_gain → リミッター`
-    /// (通常トラックと違い **内蔵が先・insert が後**。理由は同文書 §7)。
-    /// 旧 file は `#[serde(default)]` で全バイパスに forward-migrate する。
+    /// v39 (r.md #129): master のフェーダー後に固定で掛かる Limiter。信号順は
+    /// `合算 → master_fx_chain (組み込み Bus Comp / Tone EQ を含む) → master_gain → Limiter`。
+    /// チェーン上の device ではない (動かせず消せない)。旧 file は `master_strip.limiter` から移す。
     #[serde(default)]
-    pub master_strip: MasterStrip,
+    pub master_limiter: MasterLimiterSettings,
     /// v24: プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
     /// クリップボード round-trip で「同一プロジェクト由来か」を判定し、clip/track paste の
     /// リンク共有 (同一) / 独立コピー (別) を分岐する。`0` は未採番 sentinel —
@@ -699,7 +712,7 @@ impl Default for Song {
             video_framerate: default_video_framerate(),
             master_fx_chain: Vec::new(),
             master_gain: default_master_gain(),
-            master_strip: MasterStrip::default(),
+            master_limiter: MasterLimiterSettings::default(),
             project_id: 0,
             sections: Vec::new(),
             mod_sources: Vec::new(),
@@ -723,12 +736,20 @@ impl Song {
         id
     }
 
-    /// v29: 新規 device (`PluginInstance`) 用の Song-global 安定 id を採番
-    /// する。 track devices / master_fx_chain 共用。
+    /// v29: 新規 device (plugin / native / Parallel / chain) 用の Song-global 安定 id を採番
+    /// する。 track devices / master_fx_chain 共用。実体は [`IdAllocators::alloc_device_id`]。
     pub fn alloc_device_id(&mut self) -> u64 {
-        let id = self.ids.next_device_id.max(1);
-        self.ids.next_device_id = id.saturating_add(1);
-        id
+        self.ids.alloc_device_id()
+    }
+
+    /// master Limiter の先読み遅延を compile 時に焼くか: 静的 ON、または song 側に enabled な
+    /// `MasterLimiter(On)` レーン / 変調がある。PDC と DSP 遅延の SSoT。
+    #[must_use]
+    pub fn master_limiter_latency_active(&self) -> bool {
+        let on = AutomationTarget::MasterLimiter(MasterLimiterParam::On);
+        self.master_limiter.on
+            || self.song_lanes.iter().any(|l| l.enabled && l.target == on)
+            || self.song_mod_routings.iter().any(|r| r.enabled && r.target == on)
     }
 
     /// Phase 5: allocate a new song-level automation lane id (`song_lanes`)。
@@ -862,58 +883,6 @@ impl Song {
         self.gc_image_sources();
     }
 
-    /// r.md #89: クロス変調の **dangling 参照を固定点まで掃除**する。 **冪等** —
-    /// 2 回目は `false` を返す (派生データ load collapse の契約、r.md #9)。
-    ///
-    /// 消すのは 3 種類:
-    /// 1. `source_id` が実在しない `ModRouting` (既存の掃除)。
-    /// 2. `target` が `ModSourceParam { source_id }` で、そのソースが実在しないもの。
-    /// 3. `target` が `ModRoutingDepth { routing_id }` で、その変調が実在しないもの。
-    ///
-    /// 2 と 3 は **連鎖する** — 変調を 1 本消すと、その深さを指していた別の変調が
-    /// dangling になる。だから変化が無くなるまで回す。automation lane 側も同じ判定で
-    /// 落とす (残すと「保存はされるのに永久に効かないレーン」になる)。
-    ///
-    /// `ModParam` が種別に存在しない組み合わせ (LFO に `RandomSmooth` 等) は
-    /// **消さない** — 種別を戻せば復活する。評価と UI が
-    /// [`ModParam::exists_on`] で無視するだけ。
-    pub fn prune_dangling_mod_targets(&mut self) -> bool {
-        let mut changed_any = false;
-        loop {
-            let live_sources: std::collections::HashSet<u32> =
-                self.mod_sources.iter().map(|m| m.id).collect();
-            let live_routings: std::collections::HashSet<u32> =
-                self.all_mod_routings().map(|r| r.id).collect();
-            let dangling = |t: &AutomationTarget| match t {
-                AutomationTarget::ModSourceParam { source_id, .. } => {
-                    !live_sources.contains(source_id)
-                }
-                AutomationTarget::ModRoutingDepth { routing_id } => {
-                    !live_routings.contains(routing_id)
-                }
-                _ => false,
-            };
-            let mut changed = false;
-            let mut sweep = |routings: &mut Vec<ModRouting>, lanes: &mut Vec<AutomationLane>| {
-                let before = routings.len();
-                routings.retain(|r| live_sources.contains(&r.source_id) && !dangling(&r.target));
-                let lanes_before = lanes.len();
-                lanes.retain(|l| !dangling(&l.target));
-                if routings.len() != before || lanes.len() != lanes_before {
-                    changed = true;
-                }
-            };
-            for t in &mut self.tracks {
-                sweep(&mut t.mod_routings, &mut t.automation_lanes);
-            }
-            sweep(&mut self.song_mod_routings, &mut self.song_lanes);
-            if !changed {
-                return changed_any;
-            }
-            changed_any = true;
-        }
-    }
-
     /// Phase 5: find a song-level lane (mutable) by id。 Track の
     /// `lane_by_id_mut` と同 idiom。
     pub fn song_lane_by_id_mut(&mut self, lane_id: u32) -> Option<&mut AutomationLane> {
@@ -930,23 +899,6 @@ impl Song {
     /// (= multi-lane で同 target に複数置く意味がない、 Bitwig も 1 lane)。
     pub fn song_lane_by_target(&self, target: &AutomationTarget) -> Option<&AutomationLane> {
         self.song_lanes.iter().find(|l| &l.target == target)
-    }
-
-    /// Phase 5 Step 5.1 (`docs/plan_automation.md` §10、 gui_01 #034): track と
-    /// master row を統一的に走査する mut accessor。 `track_id == MASTER_TRACK_ID`
-    /// なら `song_lanes` を、 そうでなければ該当 track の `automation_lanes`
-    /// を引く。 全 automation EditRequest handler から呼ばれる。
-    pub fn automation_lane_by_key_mut(
-        &mut self,
-        track_id: u32,
-        lane_id: u32,
-    ) -> Option<&mut AutomationLane> {
-        if track_id == MASTER_TRACK_ID {
-            self.song_lane_by_id_mut(lane_id)
-        } else {
-            self.track_by_id_mut(track_id)
-                .and_then(|t| t.lane_by_id_mut(lane_id))
-        }
     }
 
     /// ランチャーが主導権を握っている行 (トラック / オートメーションレーン / song lane) が
@@ -979,19 +931,6 @@ impl Song {
             .iter_mut()
             .flat_map(|t| t.automation_lanes.iter_mut())
             .chain(self.song_lanes.iter_mut())
-    }
-
-    /// Phase 5 Step 5.1: read-only counterpart of `automation_lane_by_key_mut`。
-    pub fn automation_lane_by_key(
-        &self,
-        track_id: u32,
-        lane_id: u32,
-    ) -> Option<&AutomationLane> {
-        if track_id == MASTER_TRACK_ID {
-            self.song_lane_by_id(lane_id)
-        } else {
-            self.track_by_id(track_id).and_then(|t| t.lane_by_id(lane_id))
-        }
     }
 
     /// track と master row を統一的に走査する device chain accessor。
@@ -1463,10 +1402,9 @@ impl Song {
     ///
     /// **ここが落とすのはこの send を狙う 1 段だけ。** r.md #89 で変調が安定 id を
     /// 持ったので、落とした変調の **深さ**を指していた別の変調 / レーンが dangling に
-    /// なる。その連鎖掃除 ([`Self::prune_dangling_mod_targets`]) は song 全体を固定点
-    /// まで回す別種の操作なので、他の呼び出し箇所と同じく**編集の口**が担う
-    /// (`daw_gui/src/handler/mixer.rs` の `remove_send`)。呼び出し元を増やすなら
-    /// そこでも通すこと。
+    /// なる。その連鎖掃除 ([`Self::prune_dangling_param_targets`]) は song 全体を固定点
+    /// まで回す別種の操作なので、daw_gui の SongDoc の口 (`enforce_edit_invariants`) が
+    /// 編集のたびに無条件で担う。
     pub fn remove_track_send(&mut self, track_id: u32, send_id: u32) -> bool {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
             return false;
@@ -1586,3 +1524,5 @@ impl Default for TalkParams {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod native_tests;

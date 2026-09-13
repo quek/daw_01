@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use common::model::{EqBand, EqParam, TrackBuiltinParam};
+use common::model::{EqBand, EqParam, NativeKind, NativeParamId};
 use common::protocol::PluginCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -19,7 +19,9 @@ use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
-use daw_gui::event::{StripEdit, StripSection};
+use daw_gui::event::StripSection;
+use daw_gui::event_device::DeviceEvent;
+use daw_gui::event_native::NativeEdit;
 use daw_ui_core::{FrameInput, UiHost};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{OffscreenRenderer, Scene};
@@ -49,28 +51,19 @@ fn build_app(theme: &str) -> AppData {
     app
 }
 
-/// 1 トラック目の EQ を「はっきり曲がる」設定にする (HMF を +15dB / 狭い Q)。
+/// 1 トラック目の組み込み EQ を「はっきり曲がる」設定にする (HMF を +15dB / 狭い Q)。
+/// 値に触れると device は自動で ON になる (`NativeEdit::apply`)。
 fn app_with_curved_eq(theme: &str) -> AppData {
     let mut app = build_app(theme);
     let track = app.cur.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::StripEdit {
-        track,
-        edit: StripEdit::Param { param: TrackBuiltinParam::StripEqOn, value: 1.0 },
-    });
-    app.handle_event(AppEvent::StripEdit {
-        track,
-        edit: StripEdit::Param {
-            param: TrackBuiltinParam::StripEq { band: EqBand::Hmf, param: EqParam::Gain },
-            value: 15.0,
-        },
-    });
-    app.handle_event(AppEvent::StripEdit {
-        track,
-        edit: StripEdit::Param {
-            param: TrackBuiltinParam::StripEq { band: EqBand::Hmf, param: EqParam::Q },
-            value: 3.0,
-        },
-    });
+    let device_id = app.cur.song_doc.song().builtin_native(track, NativeKind::Eq).expect("組み込み EQ").id;
+    app.handle_event(AppEvent::Device(DeviceEvent::NativeEdit {
+        device_id,
+        edit: NativeEdit::Params(vec![
+            (NativeParamId::Eq { band: EqBand::Hmf, param: EqParam::Gain }, 15.0),
+            (NativeParamId::Eq { band: EqBand::Hmf, param: EqParam::Q }, 3.0),
+        ]),
+    }));
     app
 }
 

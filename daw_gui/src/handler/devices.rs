@@ -475,27 +475,26 @@ impl AppData {
         // cursor track に依存しないので、 表示チェーンが切り替わっても
         // 「どの device のボタンを押したか」 が変わらない。
         let song = self.cur.song_doc.song();
+        // r.md #129: 内蔵 device は窓を持たず、 Rack の Par パネルを開閉する。
+        if song.native_by_id(device_id).is_some() {
+            self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
+            return;
+        }
         let device = song.plugin_by_id(device_id);
         // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
         // (`builtin.video.subtitle`) は video device だが video_fx def を持たず、
         // 専用パラメータは Text Event セクション (= Par パネルで描画) なので、 ここで
-        // 弾いて下の open_plugin_params 経路へ流す。
+        // 弾いて下の汎用 param パネル経路へ流す。 Par は device ごとに独立して開く (Q18)。
         if let Some(d) = device
             && d.ports.is_video()
             && d.plugin_id != common::plugin_db::SUBTITLE_ID
         {
-            self.cur.peph.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
-            self.cur.peph.open_video_fx_params =
-                if self.cur.peph.open_video_fx_params == Some(device_id) {
-                    None
-                } else {
-                    Some(device_id)
-                };
+            self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
             return; // 映像 device は plugin window を持たない。
         }
         // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
         // CLAP・VST3) は editor window を開けない。 代わりにインスペクタ内の汎用
-        // param パネル (`open_plugin_params`) をトグルする。 builtin は format から
+        // param パネル (Par) をトグルする。 builtin は format から
         // 即断 (PluginParamList 到着前でも正しく分岐)、 外部 plugin は host の
         // `PluginParamList`(has_embedded_gui=false) 通知に従う。
         let is_builtin = device.is_some_and(|d| d.format == PluginFormat::Builtin);
@@ -506,13 +505,7 @@ impl AppData {
                 .copied()
                 .unwrap_or(true);
         if !has_embedded_gui {
-            self.cur.peph.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
-            self.cur.peph.open_plugin_params =
-                if self.cur.peph.open_plugin_params == Some(device_id) {
-                    None
-                } else {
-                    Some(device_id)
-                };
+            self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
             return;
         }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
@@ -693,6 +686,17 @@ impl AppData {
             }
             changed
         });
+        // r.md #129 (K20): 内蔵 device 1 台の ON/OFF は `A` キーで On のレーンを作れるようにする。
+        // 値 IPC は送らない (bypass は構造として LoadSong で届く)。
+        if let [id] = *device_ids
+            && let Some(owner) = self.cur.song_doc.song().device_owner_track(id)
+            && let Some(kind) = self.cur.song_doc.song().native_by_id(id).map(common::model::NativeDevice::kind)
+        {
+            self.note_touched_target(
+                common::model::AutomationTarget::NativeParam { device_id: id, param: common::model::NativeParamId::On(kind) },
+                owner,
+            );
+        }
     }
 
     /// r.md #105: `device_ids` が全部 bypass 中か (`Q` の toggle 方向。 clip / note の
@@ -715,33 +719,15 @@ impl AppData {
 
     /// r.md #110: `source` は他 track か同 track の Parallel 内 chain (`TapSource`)。
     /// tap point は既存 route のものを保ち、 未設定なら `PostFader` 既定。
+    /// r.md #129: plugin と内蔵 Comp / Bus Comp (port 0) 共通。 規則 (自トラックは Pre-FX 固定 /
+    /// 依存が循環する配線の拒否) は `Song::set_aux_input` が持つ。
     pub(crate) fn set_sidechain_source(
         &mut self,
         device_id: u64,
         port: u8,
         source: Option<common::model::TapSource>,
     ) {
-        self.edit_song_checked(|song| {
-            let owner = song.device_owner_track(device_id).unwrap_or(common::model::MASTER_TRACK_ID);
-            let Some(inst) = song.plugin_by_id_mut(device_id) else {
-                return false;
-            };
-            let port_idx = port as usize;
-            if inst.aux_inputs.len() <= port_idx {
-                inst.aux_inputs.resize(port_idx + 1, None);
-            }
-            let mut tap_point = inst.aux_inputs[port_idx]
-                .map(|r| r.tap.tap_point)
-                .unwrap_or_default();
-            // 自 track を source にできるのは Pre-FX (device chain の入力) だけ。
-            if source == Some(common::model::TapSource::Track(owner)) {
-                tap_point = common::model::TapPoint::PreFx;
-            }
-            inst.aux_inputs[port_idx] = source.map(|src| common::model::AuxInputRoute {
-                tap: common::model::AudioTap::new(src, tap_point),
-            });
-            true
-        });
+        self.edit_song_checked(|song| song.set_aux_input(device_id, port, source));
     }
 
     /// パラアウト (docs/plan_paraout.md): route one aux output `port` of device
@@ -897,12 +883,23 @@ impl AppData {
             return;
         }
         let mut plugin_ids: Vec<u64> = Vec::new();
+        let mut node_ids: Vec<u64> = Vec::new();
         for &(id, _) in &targets {
             if let Some(dev) = song.device_by_id(id) {
                 plugin_ids.extend(common::model::plugins(std::slice::from_ref(dev)).map(|p| p.id));
+                common::model::for_each_node_id(std::slice::from_ref(dev), &mut |n| node_ids.push(n));
             } else if let Some((_, chain)) = song.chain_by_id(id) {
                 plugin_ids.extend(common::model::plugins(&chain.devices).map(|p| p.id));
+                node_ids.push(id);
+                common::model::for_each_node_id(&chain.devices, &mut |n| node_ids.push(n));
             }
+        }
+        // 消す node の Par は閉じる (別 device を指しているなら触らない — id keyed なので
+        // 「同トラックだから」で巻き込む必要が無い)。
+        for id in node_ids {
+            let key = common::model::RackPanelKey::Device(id);
+            self.cur.view.open_rack_panels.remove(&key);
+            self.cur.peph.rack_panel_heights.remove(&key);
         }
         for device_id in plugin_ids {
             // **GUI lifecycle**: close the editor BEFORE removing the plugin.
@@ -910,15 +907,6 @@ impl AppData {
             // editor window down. RemoveSlotPlugin also closes the editor by
             // stable device id as a backstop (idempotent)。
             self.cleanup_slot_gui(device_id);
-            // 開いているインライン param パネルが **消す device を指していたら**
-            // 閉じる (別 device を指しているなら触らない — id keyed なので
-            // 「同トラックだから」で巻き込む必要が無い)。
-            if self.cur.peph.open_video_fx_params == Some(device_id) {
-                self.cur.peph.open_video_fx_params = None;
-            }
-            if self.cur.peph.open_plugin_params == Some(device_id) {
-                self.cur.peph.open_plugin_params = None;
-            }
             // video device 等 host に居ないものは host 側が no-op で無視する。
             self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
             // load に失敗した device は plugin_host に instance が無く
@@ -970,66 +958,15 @@ impl AppData {
             }
             removed
         });
-        let Some(removed) = removed else {
+        if removed.is_none() {
             return;
-        };
-        // (review) 削除 device を指す参照 (automation lane / mod routing /
-        // MIDI binding) を落とす。 v29: 参照は安定 device_id なので「詰め」は
-        // 不要になり、 dangling id の除去だけ行う。
-        for (track_id, inst) in &removed {
-            self.remap_device_refs_after_remove(*track_id, inst.id);
         }
+        // 削除 node を指す参照 (automation lane / mod routing / MIDI binding) と、 それを深さに
+        // 持つ変調の連鎖は、 上の edit の中で SongDoc の `enforce_edit_invariants` が同じ undo
+        // step で掃除済み (r.md #129)。
         // 選択集合からも消えた id を落とし、 空になったら last-wins タグを降ろす
-        // (正しさは `live_device_ids()` の正規化が担保する。 これは後始末)。
-        self.prune_device_selection();
-    }
-
-    /// device を `Vec::remove` した後、 削除 device (安定 id =
-    /// `removed_device_id`) を指す automation lane / mod routing /
-    /// MIDI binding を丸ごと削除する。 v29 で参照が id 化されたので、 旧
-    /// positional 版が行っていた「後続 index の詰め」 は不要になった。
-    /// point / clip 選択は stable な lane_id 参照なので、 lane 削除後は
-    /// dangling 解決 (= None) で無害に落ちる。
-    pub(crate) fn remap_device_refs_after_remove(&mut self, track_id: u32, removed_device_id: u64) {
-        if removed_device_id == 0 {
-            return; // 未採番 device (来ないはず) — 誤って全 lane を消さない
-        }
-        // 戻り値 = 残すか。
-        fn keeps(
-            target: &common::model::AutomationTarget,
-            removed_device_id: u64,
-        ) -> bool {
-            !matches!(
-                target,
-                common::model::AutomationTarget::PluginParam { device_id, .. }
-                    if *device_id == removed_device_id
-            )
-        }
-        self.edit_song(move |song| {
-            if track_id == common::model::MASTER_TRACK_ID {
-                song.song_lanes
-                    .retain(|l| keeps(&l.target, removed_device_id));
-                song.song_mod_routings
-                    .retain(|r| keeps(&r.target, removed_device_id));
-            } else if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
-                t.automation_lanes
-                    .retain(|l| keeps(&l.target, removed_device_id));
-                t.mod_routings
-                    .retain(|r| keeps(&r.target, removed_device_id));
-            }
-            song.midi_bindings.retain(|b| {
-                !matches!(
-                    &b.target,
-                    common::model::BindingTarget::PluginParam { device_id, .. }
-                        if *device_id == removed_device_id
-                )
-            });
-            // r.md #89: 上で落とした変調の **深さ**を指していた変調 / レーンを連鎖して
-            // 掃除する。device_id 一致だけで retain すると、`Mod #N depth` という
-            // **何も動かさないレーン行**が残って保存され、次に開くと `normalize_after_load`
-            // が無言で捨てる (dirty も立たないので消えたことに気付けない)。
-            song.prune_dangling_mod_targets();
-        });
+        // (正しさは `live_device_ids()` の正規化が担保する。 これは後始末)。Listen も解除する。
+        self.prune_device_session_refs();
     }
 
     /// この device のプラグイン GUI が開いていれば閉じる。 実 window は

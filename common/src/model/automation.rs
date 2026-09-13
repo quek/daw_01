@@ -39,10 +39,12 @@ pub enum AutomationTarget {
         #[serde(default, rename = "device_index", skip_serializing)]
         legacy_device_index: Option<u32>,
     },
-    /// マスターストリップ (バスコンプ / トーン EQ / リミッター) のパラメータ
-    /// (`docs/plan_master_strip.md` §5)。master には `Track` が無いので、
-    /// insert プラグインの param と同じ **song-level レーン** (`MASTER_TRACK_ID`) に載る。
-    MasterStrip(super::MasterStripParam),
+    /// r.md #129: 内蔵 device ([`super::NativeDevice`]) のパラメーター。`device_id` は安定 device id
+    /// (`serde(default)` を付けない — 型付き model に未解決参照を作らない)。置き場は plugin と同じ
+    /// (その device を持つトラック、master fx chain なら song 側、`Song::param_stores`)。
+    NativeParam { device_id: u64, param: super::NativeParamId },
+    /// r.md #129: master のフェーダー後 Limiter。置き場は song 側 (`MASTER_TRACK_ID`)。
+    MasterLimiter(super::MasterLimiterParam),
     /// Song-wide parameters. Lanes targeting these only make sense on
     /// a designated "master" track. M5 scope.
     SongTempo,
@@ -142,15 +144,6 @@ pub enum TrackBuiltinParam {
     /// `Parallel::select_pos` (アクティブ chain の中央)。 `Split::Selector` でない Parallel に
     /// 残った lane は何にも効かない (dangling、削除で消える)。
     ParallelSelect { parallel_id: u64 },
-    /// 内蔵チャンネルストリップの EQ セクション ON/OFF (`Mute` と同じ 0.5 閾値の階段)。
-    StripEqOn,
-    /// 内蔵チャンネルストリップの Comp セクション ON/OFF。
-    StripCompOn,
-    /// 内蔵 EQ の連続パラメータ。**住所はバンドの enum** (配列 index ではない、
-    /// 不変条件 1)。レンジは `EqParam::range(band)` が SSoT。
-    StripEq { band: super::EqBand, param: super::EqParam },
-    /// 内蔵コンプの連続パラメータ。レンジは `CompParam::range()` が SSoT。
-    StripComp { param: super::CompParam },
 }
 
 /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field

@@ -11,6 +11,7 @@ pub(super) fn draw_talk(
     area: Rect,
     pad: f32,
     mut y: f32,
+    device_id: u64,
 ) -> f32 {
     let p = &app.theme.core;
     // (talk) Text Clip 読み上げ編集 (`docs/plan_voicevox_talk.md` §4)。選択中 clip が
@@ -19,7 +20,7 @@ pub(super) fn draw_talk(
     // を talk style として流用 (SetClipVoice で焼き込み)。スケールは `Clip::talk`。
     // 対象外は **早期 return** で抜ける。 `if let` チェーンで囲むと本文 270 行が
     // まるごと 1 段深くなり、 内側の widget コールバックが nesting budget を割る。
-    if !app.voicevox_param_panel_open() {
+    if !app.voicevox_param_panel_open(device_id) {
         return y;
     }
     let Some(r) = app.selected_clip_ref() else { return y };
