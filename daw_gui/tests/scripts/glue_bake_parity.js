@@ -244,54 +244,90 @@ if (path1 === path2) {
   fail("2 トラックの焼き込み WAV が同じファイル (後の render が前を上書きする): " + path1);
 }
 
-// ---- 7. マスターストリップが ON でも音が変わらないこと (r.md #92) ------------
-// 焼き込みはトラック単独の isolate render だが、`master_strip` (バスコンプ / リミッター) を
+// 範囲 0..4 拍のトラック 1 を Glue し、クリップが 1 本になるまで待つ。
+function glueTrack1AndWait(label) {
+  daw.setTimeSelection(0.0, 4.0, JSON.stringify([1]));
+  daw.dispatchGlue();
+  let snapshot = null;
+  let elapsed = 0;
+  while (elapsed < 30000) {
+    snapshot = JSON.parse(daw.inspectSongJson());
+    if (snapshot.tracks[0].clips.length === 1) break;
+    daw.sleepMs(200);
+    elapsed += 200;
+  }
+  expectEq(snapshot.tracks[0].clips.length, 1, label + " で Glue 後のクリップ数");
+  return snapshot;
+}
+
+// 保存形の内蔵 device (`{"Native": {...}}`) で `kind` の組み込みを探す (r.md #129)。
+function builtinNative(devices, kind) {
+  const hit = (devices || []).find((d) => d.Native && d.Native.builtin && d.Native.params[kind]);
+  if (!hit) fail("組み込み " + kind + " が居ない: " + JSON.stringify(devices));
+  return hit.Native;
+}
+
+function expectSameLoudness(before, after, label, hint) {
+  if (after.integrated_lufs === null) fail(label + " の Glue 結果が無音");
+  const d = Math.abs(after.integrated_lufs - before.integrated_lufs);
+  if (d > 0.5) {
+    fail(
+      label + " で結合の前後のラウドネスが変わった: before=" + before.integrated_lufs +
+        " after=" + after.integrated_lufs + " (差 " + d.toFixed(2) + " LU)。" + hint,
+    );
+  }
+}
+
+// ---- 7. master の組み込み Bus Comp と Limiter が ON でも音が変わらないこと (r.md #92) ----
+// 焼き込みはトラック単独の isolate render だが、master の Bus Comp / フェーダー後 Limiter を
 // 外し忘れると GR が WAV に焼き込まれ、再生時にもう一度マスターを通って二重に掛かる
 // (実機: comp + limiter ON の曲で Glue した Kick が -4.5 dB)。強めの設定で差を露出させる。
+// r.md #129: master の Bus Comp は `master_fx_chain` の組み込み device、Limiter は `master_limiter`。
 const withMaster = JSON.parse(JSON.stringify(song));
-withMaster.master_strip = {
-  comp: {
-    on: true,
-    threshold_db: -30.0,
-    ratio: "R10",
-    attack: "A3",
-    release: "R300",
-    makeup_db: 0.0,
+withMaster.master_fx_chain = [
+  {
+    Native: {
+      builtin: true,
+      params: {
+        BusComp: { threshold_db: -30.0, ratio: "R10", attack: "A3", release: "R300", makeup_db: 0.0 },
+      },
+    },
   },
-  eq: { on: false, low_db: 0.0, lomid_db: 0.0, high_db: 0.0 },
-  limiter: { on: true, ceiling_db: -20.0 },
-};
+];
+withMaster.master_limiter = { on: true, ceiling_db: -20.0 };
 daw.appLoadSongJson(JSON.stringify(withMaster));
 daw.sleepMs(300);
 const masterBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
-if (masterBefore.integrated_lufs === null) fail("master strip ON の song が無音");
+if (masterBefore.integrated_lufs === null) fail("master の Bus Comp / Limiter ON の song が無音");
 
-daw.setTimeSelection(0.0, 4.0, JSON.stringify([1]));
-daw.dispatchGlue();
+s = glueTrack1AndWait("master の Bus Comp / Limiter ON");
+// device は song 側に残っている (焼き込みが外すのは render 用の使い捨て Song だけ)。
+expectEq(builtinNative(s.master_fx_chain, "BusComp").bypassed === true, false, "master Bus Comp kept ON");
+expectEq(s.master_limiter.on, true, "master limiter kept");
+expectSameLoudness(
+  masterBefore,
+  JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000)),
+  "master の Bus Comp / Limiter ON",
+  "焼き込みが master の組み込み device / Limiter を通している (二重適用) を疑う",
+);
 
-waited = 0;
-while (waited < 30000) {
-  s = JSON.parse(daw.inspectSongJson());
-  if (s.tracks[0].clips.length === 1) break;
-  daw.sleepMs(200);
-  waited += 200;
-}
-expectEq(s.tracks[0].clips.length, 1, "master strip ON で Glue 後のクリップ数");
-// ストリップは song 側に残っている (焼き込みが外すのは render 用の使い捨て Song だけ)。
-expectEq(s.master_strip.comp.on, true, "master comp kept");
-expectEq(s.master_strip.limiter.on, true, "master limiter kept");
+// ---- 8. トラックの組み込み Comp が ON でも音が変わらないこと (r.md #129 §10.15) ----
+// Glue は pre-FX の焼き込み (素材の素の音)。トラックの組み込み Comp を render 用の Song から外し忘れると、
+// 圧縮済みの音が焼かれ、再生時にもう一度 Comp を通って二重に掛かる。
+const withComp = JSON.parse(JSON.stringify(song));
+withComp.tracks[0].devices = [
+  { Native: { builtin: true, params: { Comp: { threshold_db: -30.0, ratio: 10.0 } } } },
+];
+daw.appLoadSongJson(JSON.stringify(withComp));
+daw.sleepMs(300);
+const compBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
+if (compBefore.integrated_lufs === null) fail("トラックの組み込み Comp ON の song が無音");
 
-const masterAfter = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
-if (masterAfter.integrated_lufs === null) fail("master strip ON の Glue 結果が無音");
-const masterDelta = Math.abs(masterAfter.integrated_lufs - masterBefore.integrated_lufs);
-if (masterDelta > 0.5) {
-  fail(
-    "マスターストリップ ON で結合の前後のラウドネスが変わった: before=" +
-      masterBefore.integrated_lufs +
-      " after=" +
-      masterAfter.integrated_lufs +
-      " (差 " +
-      masterDelta.toFixed(2) +
-      " LU)。焼き込みが master_strip を通している (二重適用) を疑う",
-  );
-}
+s = glueTrack1AndWait("トラックの組み込み Comp ON");
+expectEq(builtinNative(s.tracks[0].devices, "Comp").bypassed === true, false, "track Comp kept ON");
+expectSameLoudness(
+  compBefore,
+  JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000)),
+  "トラックの組み込み Comp ON",
+  "焼き込みがトラックの組み込み Comp を通している (二重適用) を疑う",
+);
