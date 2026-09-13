@@ -1,5 +1,10 @@
 # チャンネルストリップ (内蔵 EQ + コンプ) UI 設計
 
+> **r.md #129 で一部を置き換えた。** 組み込み Comp / EQ はチェーン上の device (`Device::Native`) になり、
+> 並べ替え・追加・オートメーション住所・テレメトリは [docs/plan_rack_native_devices.md](plan_rack_native_devices.md)
+> が正本。本書に残るのは Mixer 帯の見せ方 (寸法 / 開閉 / サムネイル / パラメータの範囲) だけ。
+> 置き換えた決定は各節の冒頭に 1 行で示す。
+
 Harrison Mixbus / Reason の SSL ミキサーに倣い、**全チャンネルに最初から在って消せない
 EQ とコンプ**をミキサーに持たせる。折り畳んだ状態でも EQ カーブとゲインリダクションが
 見え、必要なときだけ全 ch 一括でノブを開く。
@@ -20,27 +25,20 @@ EQ とコンプ**をミキサーに持たせる。折り畳んだ状態でも EQ
 
 ## 1. 信号経路
 
-```
-clips / instrument → devices (inserts) → Comp → EQ → Pan → Fader → 親 (group / master)
-```
+**廃止 (r.md #129)**: 「固定順で並べ替えできない」「挿したプラグインは必ずコンプより前」。組み込み Comp / EQ は
+チェーン上の device で D&D で並べ替えられ (Q4)、新しい device の既定の挿入位置は Q6 — [plan_rack_native_devices.md](plan_rack_native_devices.md) §2。
+既存曲を開いたときの並びは今と同じ音になる `devices → Comp → EQ`。
 
-**固定順で、並べ替えはできない。** Comp が先なのは、検出フィルタ (§5.3) が Comp 自身に
-あって EQ に検出を頼らないため。EQ が後段なので「EQ でブーストした帯域がコンプに押し戻
-される」ことが無く、音作りがそのまま残る。
-
-帰結として **挿したプラグインは必ずコンプより前**になり、コンプの後に処理を置く手段は
-send / bus しかない (Mixbus が並べ替えを許しているのはここ)。承知のうえでの固定。
-
-DSP の実行場所は daw_audio の `mixer.rs`、`apply_strip` の直前。プラグインチェーン
-(plugin_host への dispatch) が終わった後、volume/pan/mute の前に挿す。RT 規約どおり
-係数は事前計算、per-track のフィルタ状態は `TrackScratch` に持つ (確保・ロック・I/O なし)。
+**廃止 (r.md #129)**: 実行場所 `mixer.rs` の `apply_strip` 直前 / 状態は `TrackScratch`。チェーン上の op
+`ChainOp::Native`、状態は device id で引き継ぐ `ChainProgram.natives` — [plan_rack_native_devices.md](plan_rack_native_devices.md) §8。
 
 ## 2. Mixer strip の構成
 
 **既存の strip (名前 / M・S / Pan / Fader+Meter / Sends) は一切変えない。上に足すだけ。**
 
-**セクションの縦の並びは信号順** — 上から Comp → EQ → (既存 strip の Pan / Fader)。
-上から下へ読むと実際の経路と一致する。
+**変更 (r.md #129)**: セクションの縦の並びは Rack での組み込み Comp / EQ の前後に合わせて入れ替わる。帯に出るのは
+組み込みだけで、追加分 (「Comp 2」) は Rack にだけ出る (Q16) — [plan_rack_native_devices.md](plan_rack_native_devices.md) §10.8。
+下の図は既定 (Comp → EQ) の並び。
 
 ```
 +----------+   Comp セクション (開いているときだけ)    132px
@@ -74,13 +72,13 @@ DSP の実行場所は daw_audio の `mixer.rs`、`apply_strip` の直前。プ�
 
 80px 幅にノブ 3 個ぶんの数値欄は入らないので、**各行の見出し行が hover 読み出しを
 兼ねる** — 何も触っていなければ行の名前 (`HMF` / `Thr Rat`)、ノブに触れている間は
-その 1 個の値 (`Freq 2500Hz`) を出す。
+その 1 個の値 (`Freq 2500 Hz`) を出す。
 
 ## 3. 常設サムネイル帯 (28px)
 
 折り畳んでいる間もここだけは全 ch に必ず出る。**この帯が本設計の中心**。
 
-帯の中も左から信号順に `Comp → EQ` で並べる。**バイパス専用のボタンは置かない** —
+帯の中は左端に Comp の GR、残りが EQ カーブ (セクションの並びが入れ替わっても固定)。**バイパス専用のボタンは置かない** —
 80px の strip でボタンに幅を割くより、面そのものを広く取って状態は色で読ませる。
 
 ```
@@ -88,21 +86,18 @@ DSP の実行場所は daw_audio の `mixer.rs`、`apply_strip` の直前。プ�
   8  3      57        (px)
 ```
 
-- **GR バー** (8px 幅) — 左端に縦、上から下へ伸びる。レンジ 0〜-20dB。
-- **EQ カーブ** (残り幅 ≒57px) — HP/LP を含む合成レスポンスを 1 本の線で描く。
+- **GR バー** (8px 幅) — 左端に縦、上から下へ伸びる。レンジ 0〜-20dB。**並びが入れ替わっても左端に固定**
+  (全 ch で GR の位置が揃う)。
+- **EQ カーブ** (帯の全幅) — HP/LP を含む合成レスポンスを 1 本の線で描く。
   横軸 20Hz〜20kHz 対数、縦軸 ±18dB。**スペクトラム重畳はしない**
-  (68px 幅では 1 オクターブ 6.8px にしかならず読めないため)。
+  (68px 幅では 1 オクターブ 6.8px にしかならず読めないため。Rack の Par は重ねる、Q14)。
+  OFF のカーブは形を保って薄く描く (plan_rack_native_devices.md §20-8)。
 - **シングルクリック** = そのセクションの開閉 (全 ch 一括)。
   GR バーなら Comp、カーブなら EQ。
-- **ダブルクリック** = そのセクションのバイパス ON/OFF。**折り畳んだままでも切れる**。
-  OFF のときはカーブと GR をグレーに落とす (= 状態表示はこの色だけ)。
-  ダブルクリックの 1 回目の press でシングル (開閉) が先に発火しているので、
-  実装側でその開閉を打ち消す — ダブルクリックは「バイパスだけが変わる」操作になる。
-- **セクションの中身を触ったら、そのセクションは自動で ON になる**。バイパス中の
-  ノブを回して何も起きないのは、操作の取りこぼしにしか見えないため。
-  **HP / LP の周波数ノブを回したら、そのバンド自身も ON になる** (既定 OFF の
-  バンドなので、セクションだけ ON でフィルタが掛からない状態を作らない)。
-  `Q` による明示的な ON/OFF はこの自動 ON の対象外。
+- **訂正 (r.md #129)**: 「ダブルクリック = バイパス」は実装されていない (1 回目の press で開閉が先に見えるため)。
+  ON/OFF は `Q` (カーソル直下) と Rack の小表示ダブルクリック / 右クリック (Q15) — [plan_rack_native_devices.md](plan_rack_native_devices.md) §10.12。
+- **一般化 (r.md #129)**: 「触ったら自動で ON」は 4 種 (Comp / EQ / Bus Comp / Tone EQ) 共通で、SSoT は
+  `NativeEdit::apply` — [plan_rack_native_devices.md](plan_rack_native_devices.md) §10.1。
 
 ## 4. 開閉の規則
 
@@ -141,8 +136,8 @@ DSP の実行場所は daw_audio の `mixer.rs`、`apply_strip` の直前。プ�
 | LMF | Freq / Gain / Q | 60Hz–2kHz, ±15dB, Q 0.3–3.0 |
 | LF | Freq / Gain / `BELL` 切替 | 20–600Hz, ±15dB, 既定シェルビング |
 
-カーブは表示専用。**カーブ上のノードをドラッグする編集は持たない**し、
-Reason の Spectrum EQ に相当する大きい編集窓も**持たない**。編集はノブだけ。
+Mixer 帯のカーブは表示専用 (ノードのドラッグは持たない)。**廃止 (r.md #129、Rack の Par について)**: Rack の EQ Par は
+カーブ上の点をドラッグで操作する (Q13) — [plan_rack_native_devices.md](plan_rack_native_devices.md) §10.7。
 
 ### 5.3 検出フィルタ (SC Freq)
 
@@ -168,55 +163,37 @@ Mixbus の `Emph` (高域だけ強調) を置き換えて、**検出信号をバ
 
 ## 6. 対象
 
-**通常 track / group / return** に付く。
+**通常 track / group / return** の組み込みは Comp + EQ。
 
-**master は対象外**。Reason も Mixbus もマスターバスには他 ch と別物の
-(バス専用の) コンプ / EQ を置いており、同じチャンネルストリップを流用していない。
-master 用は [docs/plan_master_strip.md](plan_master_strip.md) (バスコンプ + トーン EQ +
-リミッター、信号順は逆で **内蔵が先・insert が後**)。
+**master の組み込みは別物** (Bus Comp + Tone EQ + フェーダー後 Limiter)。Reason も Mixbus もマスターバスには他 ch と
+別物の (バス専用の) コンプ / EQ を置いている — [docs/plan_master_strip.md](plan_master_strip.md)。
+r.md #129 以降、**追加分は 4 種ともどのトラックにも足せる** (Q7)。
 
 ## 7. オートメーションと変調
 
-全パラメータが対象。`AutomationTarget::TrackBuiltin` に足す:
-
-```rust
-// common/src/model/automation.rs
-pub enum TrackBuiltinParam {
-    Volume, Pan, Mute, SendGain { .. },
-    StripEqOn, StripCompOn,
-    StripEq  { band: EqBand,  param: EqParam },   // band/param は固定 enum
-    StripComp{ param: CompParam },
-}
-```
-
-band は `Hp / Lp / Lf / Lmf / Hmf / Hf` の固定 enum で、positional index を使わない
-(不変条件 1)。ノブの右クリックで「オートメーション」、◉ アームで変調ルート、という
-既存の作法がそのまま効く。
+全パラメータが対象。**変更 (r.md #129)**: 住所は `TrackBuiltin(Strip*)` ではなく device id で束縛する
+`AutomationTarget::NativeParam { device_id, param: NativeParamId }` — [plan_rack_native_devices.md](plan_rack_native_devices.md) §5.3。
+ノブの右クリックで「オートメーション」、◉ アームで変調ルート、という既存の作法がそのまま効く。
 
 ## 8. データモデルと永続
 
-- `Track` に `strip: ChannelStrip` を追加 (`#[serde(default)]`、bincode `Encode/Decode`)。
-  group / return も実 track なので同じ型を持つ (master は `Song` 側なので持たない)。
-  値の変更は `edit_song()` チョークポイントを通す
-  (undo / dirty / 子プロセス sync は既存の口が担う)。
+- **廃止 (r.md #129)**: `Track.strip: ChannelStrip`。値は `Device::Native` の `params`、ON/OFF の SSoT は `bypassed`
+  — [plan_rack_native_devices.md](plan_rack_native_devices.md) §5。値の変更は `edit_song()` チョークポイントを通す。
 - 値は `Song` に保存し `*` (dirty) を立てる = 「作った中身が変わる」側。
-- **帯の開閉と一括トグルは `UiPrefs` に持ち、dirty を立てない** = 「見方の都合」側
-  (`collapsed_groups` と同じ扱い、session-only)。
+- **訂正 (r.md #129)**: 帯の開閉と一括トグルは `UiPrefs` ではなく `ProjectView::strip_comp_open` / `strip_eq_open`
+  (dirty を立てない「見方の都合」側)。
 - 新規トラックの既定は EQ・Comp とも **バイパス**、値はフラット / 無圧縮。
 
 ## 9. テレメトリ
 
-- **GR** — daw_audio が per-track の GR (dB) を `AudioBridge` に書く。
-  `MAX_TRACKS = 32` の既存スロットに f32 を 1 本足すだけ (128B)。
-- **EQ カーブ** — GUI 側でパラメータから係数を起こして描く。テレメトリ不要。
-- スペクトラムは送らない (§3)。
+- **廃止 (r.md #129)**: per-track の GR スロットと「スペクトラムは送らない」。GR は device id キーの面、Rack の EQ Par の
+  スペクトラムは device scope — [plan_rack_native_devices.md](plan_rack_native_devices.md) §11。
+- **EQ カーブ** — GUI 側でパラメータから係数を起こして描く (daw_audio と同じ `common::dsp`)。
 
 ## 10. 非対象 (意図的に持たないもの)
 
 - 大きい EQ カーブ編集窓 (Reason の Spectrum EQ 相当)
-- カーブ上のノードのドラッグ編集
-- サムネイルへのスペクトラム重畳
+- Mixer 帯のカーブ上のノードのドラッグ編集 (Rack の Par は持つ)
+- サムネイルへのスペクトラム重畳 (Rack の Par は重ねる)
 - ゲート / エキスパンダー
-- master バスの EQ / コンプ (§6 — 将来バス専用の別物として作る)
 - プリセット、ch 間の Copy / Paste / Reset
-- EQ / Comp / inserts の順序入れ替え (§1)

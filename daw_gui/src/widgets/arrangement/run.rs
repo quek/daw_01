@@ -28,8 +28,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     // 2c. `docs/plan_project_tabs.md` §5.6: タブ帯の上に留まる / Ctrl+Tab → 運んでいる
     //     クリップ / トラックを別タブへの持ち込み (drag payload) に昇格して切り替える。
     xfer::promote(app, ui, &f);
-    // 3. drag 継続 + 端オートスクロール + per-frame live 発火。
-    drag::advance(ui, &f);
+    // 3. drag 継続 + 端オートスクロール + per-frame live 発火 (ジェスチャーの申告は値より先)。
+    drag::advance(app, ui, &f);
     launcher::drag::advance(ui, &f);
     // 4. session の overlay 用スナップショットと release take。
     let (live, released) = sessions::take(ui, &f, &mut response);
