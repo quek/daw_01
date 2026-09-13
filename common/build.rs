@@ -19,6 +19,12 @@ const WIRE_SOURCES: &[&str] = &[
     "src/wire.rs",
     "src/protocol.rs",
     "src/model.rs",
+    // model.rs から切り出した `Section` (Song.sections として LoadSong の wire を渡る)。
+    // 帯を動かすロジック (section_ops.rs) は wire に載らないので登録しない。
+    "src/model/sections.rs",
+    // model.rs から切り出した `PluginInstance` と blob を除外する手書き bincode
+    // (Track.devices / master_fx_chain の要素として LoadSong の wire を渡る)。
+    "src/model/plugin_instance.rs",
     "src/model/track.rs",
     // r.md #110: Device / Parallel / ParallelChain (Track.devices / master_fx_chain の要素として
     // LoadSong の wire を渡る)。
