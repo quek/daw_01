@@ -42,8 +42,8 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
 /// トラック / バスの **pan 則 (equal-power)** — `pan` (`-1.0`..=`1.0`) に対する
 /// `(左ゲイン, 右ゲイン)`。中央 (`0.0`) は両チャンネル `cos(π/4) ≈ 0.707` (= -3dB)。
 ///
-/// **これが pan 則の SSoT** (掛けるのは `daw_audio::mixer::apply_strip` だけ)。pre-FX の焼き込みは
-/// フェーダーの段そのものを通さない (`RenderScope::Sources`、`daw_audio::mixer::pass_strip`) ので、
+/// **これが pan 則の SSoT** (掛けるのは `daw_audio::mixer::apply_strip` だけ)。焼き込み (Bounce / Glue) は
+/// フェーダーの段そのものを通さない (`RenderScope::Sources` / `PostFx`、`daw_audio::mixer::pass_strip`) ので、
 /// この式を打ち消す側は無い。
 ///
 /// RT path (per-sample) から呼ばれるので確保・分岐なし。

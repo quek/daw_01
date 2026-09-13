@@ -7,6 +7,7 @@
 //   2. 0..4 拍のラウドネスを測る (結合前)。
 //   3. 範囲を選んで J → 焼き込み完了 (1 clip / 1 event) を待つ。
 //   4. 同じ範囲をもう一度測り、一致することを確かめる。
+//   (以降の節で master / トラックの内蔵 device・Parallel 付きの Glue と、Bounce (with FX) も同じく測る)
 
 function fail(msg) {
   throw new Error("glue_bake_parity: " + msg);
@@ -352,3 +353,48 @@ expectSameLoudness(
   "Parallel 付きトラック",
   "焼き込みが Parallel の分配 / 混ぜ (chain の和・pan・出力 trim) を通している (二重適用) を疑う",
 );
+
+// ---- 10. Bounce (with FX) が元と同じ音で鳴ること (r.md #129) ----
+// With FX は device チェーン (内蔵 Comp を含む) までを焼いて新しいトラックに置き、元トラックを mute する。フェーダー
+// (volume / pan) は焼かずに新しいトラックへ写す (`Song::place_bounce_with_fx`)。焼く段がフェーダーを含むと、写した
+// フェーダーでもう一度掛かる (pan 中央で -3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
+function bounceWithFxAndWait(label) {
+  daw.dispatchBounceWithFx(JSON.stringify({ track_id: 1, clip_id: 1 }));
+  let snapshot = null;
+  let elapsed = 0;
+  while (elapsed < 30000) {
+    snapshot = JSON.parse(daw.inspectSongJson());
+    if (snapshot.tracks.length === 2) break;
+    daw.sleepMs(200);
+    elapsed += 200;
+  }
+  expectEq(snapshot.tracks.length, 2, label + " で Bounce 後のトラック数");
+  return snapshot;
+}
+
+for (const [volume, pan] of [[1.0, 0.0], [1.0, -0.6], [0.5, 0.0]]) {
+  const label = "Bounce (with FX) volume " + volume + " / pan " + pan;
+  const withFx = JSON.parse(JSON.stringify(withComp));
+  withFx.tracks[0].volume = volume;
+  withFx.tracks[0].pan = pan;
+  daw.appLoadSongJson(JSON.stringify(withFx));
+  daw.sleepMs(300);
+  // 焼くのはクリップ 1 (0..2 拍) だけ。元トラックはトラックごと mute されるので、同じ区間で比べる。
+  const fxBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 2.0, 60000));
+  if (fxBefore.integrated_lufs === null) fail(label + ": 元の song が無音");
+
+  s = bounceWithFxAndWait(label);
+  expectEq(s.tracks[0].muted, true, label + ": 元トラックは mute");
+  const bounced = s.tracks[1];
+  expectEq(bounced.clips.length, 1, label + ": 焼いたクリップ");
+  if (Math.abs(bounced.volume - volume) > 1e-6 || Math.abs(bounced.pan - pan) > 1e-6) {
+    fail(label + ": フェーダーを写していない: volume=" + bounced.volume + " pan=" + bounced.pan);
+  }
+  const fxAfter = JSON.parse(daw.analyzeLoudnessJson(0.0, 2.0, 60000));
+  const hint = "焼く段がフェーダーを含む (二重適用) / device チェーンを焼いていない を疑う";
+  expectSameLoudness(fxBefore, fxAfter, label, hint);
+  const fxPeakDelta = Math.abs(fxAfter.sample_peak_dbfs - fxBefore.sample_peak_dbfs);
+  if (fxPeakDelta > 0.5) {
+    fail(label + ": ピークが変わった: before=" + fxBefore.sample_peak_dbfs + " after=" + fxAfter.sample_peak_dbfs + "。" + hint);
+  }
+}

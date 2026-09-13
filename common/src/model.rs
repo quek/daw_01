@@ -14,6 +14,7 @@ use crate::scale::ScaleChange;
 // ロジックを切り出したファイル (section_ops / load_normalize / source_pools 等) は登録しない
 // (ロジックの変更で fingerprint を動かさない、build.rs 冒頭)。
 mod automation;
+mod bounce_ops;
 mod clip_window;
 mod master_limiter;
 mod media_manifest;
@@ -38,6 +39,7 @@ mod time_selection;
 mod view_state;
 mod track;
 pub use automation::*;
+pub use bounce_ops::*;
 pub use clip_window::*;
 pub use master_limiter::*;
 pub use media_manifest::*;

@@ -592,8 +592,8 @@ fn master_limiter_latency_is_baked_from_the_static_on_or_an_on_lane() {
 }
 
 /// `RenderScope` の段の有無は schedule の形に焼く: `Mix` だけが master の段 (fx chain / Limiter の遅延) を持ち、
-/// `Sources` だけがトラックのフェーダーと fx を外す。master の段を通さない scope は master fx と Limiter の遅延を
-/// 出力遅延に数えない (bounce の書き出し窓がずれない)。
+/// トラックのフェーダーを持ち、`Sources` だけがトラックの fx を外す。master の段を通さない scope は master fx と
+/// Limiter の遅延を出力遅延に数えない (bounce の書き出し窓がずれない)。
 #[test]
 fn render_scope_shapes_the_master_stage_and_track_faders() {
     let mut lat = DeviceLatencies::new();
@@ -612,7 +612,7 @@ fn render_scope_shapes_the_master_stage_and_track_faders() {
         (s.master_stage, s.master_program.ops.len(), s.master_limiter_latency, s.master_latency_samples, s.track_programs[0].fader)
     };
     assert_eq!(shape(RenderScope::Mix), (true, 1, true, 512 + 2048 + look, true));
-    assert_eq!(shape(RenderScope::TrackOutput), (false, 0, false, 512, true), "トラックの出力まで (fx は数える)");
+    assert_eq!(shape(RenderScope::PostFx), (false, 0, false, 512, false), "PostFx 点まで (fx は数え、フェーダーは掛けない)");
     assert_eq!(shape(RenderScope::Sources), (false, 0, false, 0, false), "音声入力を持つ fx も数えない");
 }
 

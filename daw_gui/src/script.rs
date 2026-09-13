@@ -407,6 +407,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("setHoverBeat", daw_set_hover_beat, 1),
     ("dispatchSplit", daw_dispatch_split, 1),
     ("dispatchGlue", daw_dispatch_glue, 0),
+    ("dispatchBounceWithFx", daw_dispatch_bounce_with_fx, 1),
     ("dispatchRenameClip", daw_dispatch_rename_clip, 2),
     // ----- Phase 7 B5 Scale & Root API ------------------------------
     ("setScaleAtPlayhead", editing::daw_set_scale_at_playhead, 2),
@@ -1280,6 +1281,22 @@ fn daw_dispatch_glue(
 ) -> JsResult<JsValue> {
     with_host(|host| {
         host.app.handle_event(AppEvent::GlueSelectedClips);
+    });
+    Ok(JsValue::undefined())
+}
+
+// Bounce (with FX): production のクリップ右クリック "Bounce (with FX)" と同じ AppEvent。
+// 完了 (新トラックの追加) は非同期なので、呼び手が `inspectSongJson` で待つ。
+fn daw_dispatch_bounce_with_fx(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let ref_json = arg_to_string(args, 0, ctx)?;
+    let target: ClipKey = serde_json::from_str(&ref_json)
+        .map_err(|e| js_native(format!("dispatchBounceWithFx: parse: {e}")))?;
+    with_host(|host| {
+        host.app.handle_event(AppEvent::BounceClipWithFx(target));
     });
     Ok(JsValue::undefined())
 }

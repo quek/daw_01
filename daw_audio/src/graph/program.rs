@@ -241,7 +241,7 @@ pub struct ChainProgram {
     /// (RT で Song を歩いて判定しない、§18-B)。PostFx は pre-fader send も含む。
     pub snapshot_pre_fx: bool,
     pub snapshot_post_fx: bool,
-    /// device 列の後にトラックのフェーダー (volume / pan / mute) を掛けるか (`RenderScope::fader`、compile 時に
+    /// device 列の後にトラックのフェーダー (volume / pan / mute / solo) を掛けるか (`RenderScope::fader`、compile 時に
     /// 焼く)。`false` はフェーダーを素通しする (`process_track_owned` / `run_group_fx_chain`)。master は使わない。
     pub fader: bool,
     /// SC Listen: この buffer で検出信号を書いた Comp の slot。トラック出力 (PostFx 点) で消費する

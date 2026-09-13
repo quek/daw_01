@@ -146,8 +146,11 @@ pub enum RenderScope {
     /// ラウドネス解析。
     #[default]
     Mix,
-    /// トラックの出力まで: master の fx / 音量 / Limiter を通さない。Bounce (with FX)。
-    TrackOutput,
+    /// トラックの PostFx 点まで: device チェーン (内蔵 device / Parallel の混ぜを含む) を通し、フェーダー
+    /// (volume / pan / mute / solo) と master を通さない。Bounce (with FX) — 焼いた音は新しいトラックに置き、
+    /// フェーダーとそこから先 (send / 親 group) は元トラックから写す (`Song::place_bounce_with_fx`) ので、
+    /// 焼く側で通すと写したフェーダーでもう一度掛かる。
+    PostFx,
     /// 素材の音だけ (pre-FX): クリップの音と音源 (音声入力を持たない device) の出力。音声入力を持つ
     /// device / 内蔵 device / Parallel の分割と混ぜ (chain の gain / pan / mute / solo・出力 trim・
     /// gain match) / フェーダー / master を通さない。Bounce In Place / Glue — 焼いた音は元のトラックへ
@@ -162,10 +165,10 @@ impl RenderScope {
         !matches!(self, Self::Sources)
     }
 
-    /// トラックのフェーダー (volume / pan / mute) を掛けるか。
+    /// トラックのフェーダー (volume / pan / mute / solo) を掛けるか。
     #[must_use]
     pub fn fader(self) -> bool {
-        !matches!(self, Self::Sources)
+        matches!(self, Self::Mix)
     }
 
     /// master の fx chain / 音量 / Limiter を通すか。
@@ -425,7 +428,7 @@ pub enum AudioCommand {
     /// (`Bounce`, `docs/plan_audio_clip.md` §3.8 / `J` Glue の焼き込み、
     /// `docs/plan_glue_bake.md`)。 送り手が先に `LoadSong` で対象トラックだけを
     /// 残した song を積み、どの処理段を通すかは `scope` が決める (Bounce with FX =
-    /// `TrackOutput`、Bounce In Place / Glue = `Sources`)。 Replies with `AudioEvent::BounceClipFxComplete`。
+    /// `PostFx`、Bounce In Place / Glue = `Sources`)。 Replies with `AudioEvent::BounceClipFxComplete`。
     /// 範囲は拍 (`ExportWav` と同じく換算は engine 側 SSoT)。
     ///
     /// `warm` = 曲頭から走査するか。 plugin chain を通す bounce は tail /

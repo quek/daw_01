@@ -5,7 +5,6 @@ use crate::state::*;
 use crate::app_types::*;
 use std::path::{PathBuf};
 use std::sync::{Arc};
-use common::model::{AudioEvent, Song};
 use common::protocol::{AudioCommand, PluginCommand, RenderScope};
 use crate::import_audio;
 
@@ -90,38 +89,6 @@ impl AppData {
         self.select_new_clips(&keys);
     }
 
-    /// offline render 用に「そのトラックだけ」を描く Song を組む
-    /// (bounce = `docs/plan_audio_clip.md` §3.8 / Glue の焼き込み =
-    /// `docs/plan_glue_bake.md`)。**決めるのはどのトラックを描くかだけ** — どの処理段を通すか
-    /// (master の fx / 音量 / Limiter、トラックの fx / 内蔵 device / Parallel の混ぜ / フェーダー) は
-    /// `BounceClipFxOnline::scope` ([`RenderScope`]) が engine の compile で program の形に焼く。
-    /// Song を書き換えて処理を消すと、書き換えで表せない組み合わせ (音源を含む Parallel に音が入る等) が
-    /// 正確に焼けない。
-    ///
-    /// - 他のトラックを落とし、親 group から外す。それらを指していた参照 (send / SC / パラアウト /
-    ///   follower / MIDI binding / レーン / 変調) は編集後の不変条件と同じ掃除
-    ///   ([`Song::prune_dangling_refs`]) が外す — 自トラックを読む配線 (自トラック Pre-FX の SC 等) は残る。
-    ///   **ここは `SongDoc` を通らない** ので明示的に呼ぶ。
-    /// - 元トラックの mute / solo を解除する (mute 済みのトラックでも焼く)。
-    /// - **ランチャーの主導権は必ずアレンジへ戻す**: 行が [`RowPlayback::Launcher`] /
-    ///   `LauncherStopped` のままだと、offline 走査は「今のセッションの状態」を再現する
-    ///   (= セルの音が鳴り、アレンジのクリップは鳴らない) ので、焼く対象が丸ごと入れ替わる。
-    pub(crate) fn isolated_track_song(&self, track_id: u32) -> Option<Song> {
-        let track = self.cur.song_doc.song().track_by_id(track_id)?;
-        let mut isolated = self.cur.song_doc.song().clone();
-        let mut kept = track.clone();
-        kept.parent_group_id = None;
-        kept.muted = false;
-        kept.solo = false;
-        kept.launcher = common::model::RowPlayback::Arranger;
-        for lane in &mut kept.automation_lanes {
-            lane.launcher = common::model::RowPlayback::Arranger;
-        }
-        isolated.tracks = vec![kept];
-        isolated.prune_dangling_refs();
-        Some(isolated)
-    }
-
     /// render 出力 WAV の path と `AudioSourcePath` を決める。保存済み
     /// project は `<dir>/bounce/<name><infix>_<ts>.wav`、未保存は bounce_cache (save 時に
     /// `finish_save` が project へ移動 + ProjectRelative 化)。
@@ -204,54 +171,12 @@ impl AppData {
         }
     }
 
-    /// 焼いた WAV を指す **単一 audio event** を組む (bounce / `J` Glue 共通の SSoT)。
-    ///
-    /// - `window` = 焼いた song 絶対拍の範囲 `[start, end)`。
-    /// - `event_start_in_clip_beats` = content 内でこの event を置く位置 (窓の起点)。
-    /// - `file_frames` = 実際に書かれた WAV の長さ。
-    ///
-    /// **`source_end_frames` は「書き出し窓ちょうど」に切る。** render は減衰 tail の
-    /// ぶん窓より長く書く (`RenderWindow::resolve` の `TAIL_MAX_SECONDS`、無音でも
-    /// 最低 0.5 秒) ので、ファイル長をそのまま載せると伸縮比
-    /// (= source 秒 / event 秒、`stretch_ratio_for`) が 1.0 を超え、**置換後のクリップが
-    /// 速く鳴る** (120BPM の 4 拍で実測 +25%)。拍→サンプル換算は engine が窓を
-    /// 決めたのと同じ SSoT (`beats_to_samples` = tempo automation の積分) を通す。
-    ///
-    /// **`stretch_mode` は `Raw`。** 焼いた音は「そのときの tempo で描いた実時間の
-    /// 波形」なので、拍に対して線形に読み直す `Stretch` を通すと、テンポカーブのある曲で
-    /// 中身が内部でずれる (両端だけ合って中盤が数百 ms 動く)。定テンポでも `Stretch` は
-    /// 位相ボコーダを必ず通るのでトランジェントがにじむ。テンポ追従させたければ
-    /// 焼いたあとに inspector で切り替えられる (`AudioSource.original_bpm` は入れてある)。
-    pub(crate) fn baked_audio_event(
-        &self,
-        source_id: common::model::AudioSourceId,
-        window: (f64, f64),
-        event_start_in_clip_beats: f64,
-        file_frames: u64,
-    ) -> AudioEvent {
-        let sr = self.ipc.sample_rate;
-        let song = self.cur.song_doc.song();
-        let window_frames = common::automation::beats_to_samples(song, sr, window.1)
-            .saturating_sub(common::automation::beats_to_samples(song, sr, window.0));
-        AudioEvent {
-            // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
-            id: 1,
-            source_id,
-            event_start_in_clip_beats,
-            event_length_beats: window.1 - window.0,
-            source_start_frames: 0,
-            source_end_frames: window_frames.min(file_frames).max(1),
-            stretch_mode: common::model::StretchMode::Raw,
-            ..AudioEvent::default()
-        }
-    }
-
     /// bounce のトリガ共通処理。対象クリップ 1 トラックだけを isolate した
-    /// song を engine に LoadSong し、offline render を要求する。In Place は insert FX を
-    /// バイパス (port 中和)、With FX は insert FX を通す。結果は完了通知 handler
-    /// (`handle_bounce_clip_fx_complete`) が mode に応じて「同位置置換」/「新トラック +
-    /// 元ミュート」する。Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し
-    /// 「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
+    /// song ([`common::model::Song::isolated_track`]) を engine に LoadSong し、offline render を要求する。
+    /// In Place は素材の音 (`RenderScope::Sources`)、With FX は device チェーンまで (`RenderScope::PostFx`) を焼く。
+    /// 結果は完了通知 handler (`handle_bounce_clip_fx_complete`) が mode に応じて「同位置置換」/
+    /// 「新トラック + 元ミュート」([`common::model::Song::place_bounce_with_fx`]) する。
+    /// Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
     pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
         // Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
@@ -292,15 +217,16 @@ impl AppData {
         let Some((out_path, source_path)) = self.bounce_output_path(&clip_name, infix) else {
             return;
         };
-        let Some(isolated) = self.isolated_track_song(target.track_id) else {
+        let Some(isolated) = self.cur.song_doc.song().isolated_track(target.track_id) else {
             return;
         };
         // In Place は元のクリップを置き換える = 焼いた音が再生時にトラックの fx / フェーダーをもう一度通るので、
-        // 素材の音だけを焼く。With FX は別トラックに置いて元をミュートするので、トラックの出力 (フェーダーまで)。
-        // どちらも master の段は通さない (再生時に master をもう一度通る)。
+        // 素材の音だけを焼く。With FX は別トラックに置いて元をミュートし、フェーダーとそこから先は元トラックから
+        // 写すので、device チェーンまで (`common::model::bounce_ops`)。どちらも master の段は通さない
+        // (再生時に master をもう一度通る)。
         let scope = match mode {
             BounceMode::InPlace => RenderScope::Sources,
-            BounceMode::WithFx => RenderScope::TrackOutput,
+            BounceMode::WithFx => RenderScope::PostFx,
         };
         self.cur.pipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
             mode,
@@ -413,9 +339,10 @@ impl AppData {
     /// IPC 経由で freewheel render 完了通知待ち)。 完了通知の handler
     /// (`handle_bounce_clip_fx_complete`) 内で Undo snapshot を 1 回だけ
     /// 取る。 既に bounce 進行中なら重複 request を拒否。
-    /// With FX = 音源/synth + そのトラックの insert FX を engine offline
-    /// render で焼き、**新トラックに複製** + 元トラック自動ミュート (非破壊・二重再生
-    /// 回避、async)。対象クリップ 1 トラックだけを isolate するので他トラックは混ざらない
+    /// With FX = 音源/synth + そのトラックの device チェーン (内蔵 device 含む) を engine offline
+    /// render で焼き、**新トラックに置いてフェーダー / send / 行き先を写す** + 元トラック自動ミュート
+    /// (非破壊・二重再生回避、async、規則は [`common::model::Song::place_bounce_with_fx`])。対象クリップ 1 トラックだけを
+    /// isolate するので他トラックは混ざらない
     /// (旧実装は時間範囲の全ミックスを焼くバグがあった)。歌唱の合成待ちは `request_bounce` 経由。
     pub(crate) fn bounce_clip_with_fx(&mut self, target: ClipKey) {
         self.request_bounce(target, BounceMode::WithFx);
@@ -435,8 +362,8 @@ impl AppData {
     }
 
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
-    /// で bookend 解除、 success なら新 audio source + 新 track + 新
-    /// audio clip を配置 + Undo snapshot。 失敗時は pending クリア + 残骸
+    /// で bookend 解除、 success なら新 audio source を登録し、In Place は content を置換、
+    /// With FX は新 track + 新 audio clip を配置 (1 Undo step)。 失敗時は pending クリア + 残骸
     /// ファイル削除 + full song 再 LoadSong (= engine の isolated song を復元)。
     pub(crate) fn handle_bounce_clip_fx_complete(
         &mut self,
@@ -490,36 +417,51 @@ impl AppData {
             self.restore_engine_song_after_bounce();
             return;
         }
-        // InPlace の置換対象 content が bounce 中の編集で消えていたら結果を破棄
-        // (index でなく stable id で判定。 別クリップを誤置換しない)。
-        if pending.mode == BounceMode::InPlace
-            && !self.cur.song_doc.song().clip_contents.contains_key(&pending.source_content_id)
-        {
-            self.ui_ephemeral.status_message =
-                "Bounce In Place: 対象クリップが消えたため結果を破棄しました".into();
+        // 置き先が bounce 中の編集で消えていたら結果を破棄する (index でなく stable id で判定):
+        // In Place は置換対象の content (別クリップを誤置換しない)、With FX は元トラック
+        // (写すフェーダーと配線の持ち主、mute する相手が居ない)。
+        let song = self.cur.song_doc.song();
+        let gone = match pending.mode {
+            BounceMode::InPlace => (!song.clip_contents.contains_key(&pending.source_content_id)).then_some("対象クリップ"),
+            BounceMode::WithFx => song.track_by_id(pending.source_track_id).is_none().then_some("元トラック"),
+        };
+        if let Some(what) = gone {
+            self.ui_ephemeral.status_message = format!("{label}: {what}が消えたため結果を破棄しました");
             let _ = std::fs::remove_file(&path);
             self.restore_engine_song_after_bounce();
             return;
         }
 
-        // 1 完了 = 1 Undo step として snapshot を取る。
-
-        let engine_sr = self.ipc.sample_rate;
-        // 採番した new_source_id を `audio_sources` に登録。 path は
-        // `pending.source_path` (= ProjectRelative or Absolute、 確定済)。
-        let new_source = common::model::AudioSource {
-            path: pending.source_path,
-            sample_rate: engine_sr,
-            channels: 2,
-            frames,
-            original_bpm: Some(self.cur.song_doc.song().bpm),
-            root_key: None,
-        };
-        let Some(new_source_id) = self.edit_song(move |song| {
-            let new_source_id = song.alloc_audio_source_id();
-            song.media.audio_sources.insert(new_source_id, new_source);
-            new_source_id
-        }) else {
+        // 1 完了 = 1 Undo step。path は `pending.source_path` (= ProjectRelative or Absolute、確定済)。
+        // r.md #44: event は元 clip の窓の起点に置く (In Place 置換で窓と一致させる)。
+        // With FX の新 clip は窓 offset をそのまま引き継ぐ。
+        let wav = common::model::BakedWav { path: pending.source_path.clone(), sample_rate: self.ipc.sample_rate, frames };
+        let window = (pending.start_beat, pending.start_beat + pending.clip_length_beats);
+        let (mode, offset, length) = (pending.mode, pending.content_offset_beats, pending.clip_length_beats);
+        let (source_track_id, source_content_id) = (pending.source_track_id, pending.source_content_id);
+        let track_name = format!("{} (FX)", pending.clip_name);
+        let (content_name, new_track_name) = (format!("{} (bounced FX)", pending.clip_name), track_name.clone());
+        let placed = self.edit_song(move |song| {
+            let (source_id, content) = song.add_baked_audio(wav, window, offset);
+            let content = common::model::ClipContent::Audio(content);
+            match mode {
+                BounceMode::WithFx => {
+                    let content_id = song.alloc_content(content, content_name);
+                    let clip = common::model::Clip {
+                        start_beat: window.0,
+                        length_beats: length,
+                        content_id,
+                        content_offset_beats: offset,
+                        ..Default::default()
+                    };
+                    song.place_bounce_with_fx(source_track_id, new_track_name, clip)?;
+                }
+                // 元クリップの content を置換 (= flat 化)。同 content_id を共有する linked clip も追従する。
+                BounceMode::InPlace => *song.clip_contents.get_mut(&source_content_id)? = content,
+            }
+            Some(source_id)
+        });
+        let Some(Some(source_id)) = placed else {
             return;
         };
 
@@ -527,102 +469,24 @@ impl AppData {
         // できるよう)。 失敗しても tracker 表示等は問題ないので warn だけ。
         match crate::import_audio::decode_audio(&path) {
             Ok(buffer) => {
-                self.cur.media.audio_source_cache.insert(new_source_id, Arc::new(buffer));
+                self.cur.media.audio_source_cache.insert(source_id, Arc::new(buffer));
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     path = %path.display(),
-                    "Bounce (with FX): WAV decode for cache failed (track is created; will reload on next save/load)"
+                    label,
+                    "bounce WAV decode for cache failed (will reload on next save/load)"
                 );
             }
         }
-
-        // 新 Clip / 置換に使う共通 audio event (single-event = bounce 結果は flat な audio)。
-        // r.md #44: 元 clip の窓の起点に置く (In Place 置換で窓と一致させる)。
-        // With FX の新 clip は窓 offset をそのまま引き継ぐ。
-        let new_event = self.baked_audio_event(
-            new_source_id,
-            (pending.start_beat, pending.start_beat + pending.clip_length_beats),
-            pending.content_offset_beats,
-            frames,
-        );
-
-        match pending.mode {
+        self.ui_ephemeral.status_message = match mode {
             BounceMode::WithFx => {
-                // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
-                let Some(new_track_id) = self.edit_song(|song| song.alloc_track_id()) else {
-                    return;
-                };
-                let new_track_name = format!("{} (FX)", pending.clip_name);
-                let new_track = track_with(|t| {
-                    t.id = new_track_id;
-                    t.name = new_track_name.clone();
-                    t.clips = Vec::new();
-                });
-                self.edit_song(|song| song.tracks.push(new_track));
-                let new_track_idx = self.cur.song_doc.song().tracks.len() - 1;
-
-                let bounced_content_name = format!("{} (bounced FX)", pending.clip_name);
-                let Some(new_content_id) = self.edit_song(move |song| {
-                    song.alloc_content(
-                        common::model::ClipContent::Audio(common::model::AudioContent {
-                            events: vec![new_event],
-                            next_event_id: 2,
-                        }),
-                        bounced_content_name,
-                    )
-                }) else {
-                    return;
-                };
-
-                self.edit_song(|song| {
-                    let new_track_mut = &mut song.tracks[new_track_idx];
-                    new_track_mut.place_clip(common::model::Clip {
-                        id: 0,
-                        start_beat: pending.start_beat,
-                        length_beats: pending.clip_length_beats,
-                        content_id: new_content_id,
-                        content_offset_beats: pending.content_offset_beats,
-                        color: None,
-                        auto_lipsync: false,
-                        ..Default::default()
-                    });
-
-                    // 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
-                    // 不要 (下の flush_song_sync が muted=true 込みの full song を LoadSong)。
-                    // index は bounce 中の編集で stale になり得るので stable id で解決する
-                    // (削除済みなら skip = 二重再生の危険自体が無い)。
-                    if let Some(src) =
-                        song.tracks.iter_mut().find(|t| t.id == pending.source_track_id)
-                    {
-                        src.muted = true;
-                    }
-                });
-
                 self.resize_track_peak_display();
-                self.ui_ephemeral.status_message = format!(
-                    "Bounce (with FX) 完了: 新トラック '{new_track_name}' を追加 (元トラックはミュート)",
-                );
+                format!("Bounce (with FX) 完了: 新トラック '{track_name}' を追加 (元トラックはミュート)")
             }
-            BounceMode::InPlace => {
-                // 元クリップの content を bounce 結果 (single audio event) に
-                // 置換 (= flat 化)。 同 content_id を共有する linked clip も追従する。
-                // 対象は bounce 開始時に捕捉した stable な content id (index 経由の
-                // 再解決は bounce 中の編集でずれる)。 存在は上で検証済み。
-                self.edit_song(move |song| {
-                    if let Some(content) =
-                        song.clip_contents.get_mut(&pending.source_content_id)
-                    {
-                        *content = common::model::ClipContent::Audio(common::model::AudioContent {
-                            events: vec![new_event],
-                            next_event_id: 2,
-                        });
-                    }
-                });
-                self.ui_ephemeral.status_message = format!("Bounce In Place 完了: '{}'", pending.clip_name);
-            }
-        }
+            BounceMode::InPlace => format!("Bounce In Place 完了: '{}'", pending.clip_name),
+        };
     }
 
 }
@@ -665,66 +529,5 @@ fn move_track_automation(
             c.start_beat += delta;
             lane.clips.push(c);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use common::model::{
-        AudioTap, AuxInputRoute, Device, MasterLimiterParam, AutomationLane, AutomationTarget, ModSource, ModSourceKind,
-        NativeDevice, NativeKind, RowPlayback, Send, SendMode, TapPoint, TapSource,
-    };
-
-    /// `isolated_track_song` が決めるのは「どのトラックを描くか」だけ: 他トラックと、それを指す参照 (SC / send /
-    /// follower) は外れ、自トラックの device (内蔵を含む) / 自トラックを読む SC / master の段はそのまま残る
-    /// (どの段を通すかは `RenderScope` が engine の compile で決める)。
-    #[test]
-    fn isolated_track_song_keeps_only_the_track_and_leaves_processing_to_the_scope() {
-        let mut app = crate::test_support::headless_app();
-        app.ensure_first_track();
-        let tid = app.cur.song_doc.song().tracks[0].id;
-        let (mut side_sc, mut own_sc) = (0, 0);
-        app.edit_song(|song| {
-            let side = song.alloc_track_id();
-            song.tracks.push(crate::app_types::track_with(|t| t.id = side));
-            let reads = |song: &mut common::model::Song, source: TapSource, point: TapPoint| {
-                let id = song.alloc_device_id();
-                let mut dev = NativeDevice::new_added(NativeKind::Comp, id, 2);
-                dev.aux_input = Some(AuxInputRoute { tap: AudioTap::new(source, point) });
-                song.insert_device(common::model::ChainRef::Track(tid), 0, Device::Native(dev));
-                id
-            };
-            side_sc = reads(song, TapSource::Track(side), TapPoint::PostFader);
-            own_sc = reads(song, TapSource::Track(tid), TapPoint::PreFx);
-            let follower_tap = Some(AudioTap::post_fader(side));
-            let kind = ModSourceKind::EnvelopeFollower { tap: follower_tap, follower: Default::default() };
-            song.mod_sources.push(ModSource { id: 1, owner_track_id: tid, color: [1.0; 3], kind, enabled: true });
-            let track = song.track_by_id_mut(tid).expect("track");
-            track.sends.push(Send { id: 1, dest_track_id: side, gain: 1.0, mode: SendMode::PostFader, enabled: true });
-            track.muted = true;
-            track.launcher = RowPlayback::LauncherStopped;
-            song.master_limiter.on = true;
-            song.song_lanes.push(AutomationLane::new(AutomationTarget::MasterLimiter(MasterLimiterParam::On), 1.0));
-        });
-        let song = app.cur.song_doc.song();
-        let isolated = app.isolated_track_song(tid).expect("isolated");
-
-        assert_eq!(isolated.tracks.len(), 1, "描くのはそのトラックだけ");
-        let kept = &isolated.tracks[0];
-        let sc = |id| isolated.native_by_id(id).expect("内蔵 device は残る").aux_input.map(|r| r.tap.source);
-        assert_eq!(sc(side_sc), None, "他トラックを読む SC は外れる");
-        assert_eq!(sc(own_sc), Some(TapSource::Track(tid)), "自トラックを読む SC は残る");
-        let natives = |t: &common::model::Track| {
-            let mut v = Vec::new();
-            common::model::for_each_native(&t.devices, &mut |n| v.push(n.id));
-            v
-        };
-        assert_eq!(natives(kept), natives(song.track_by_id(tid).expect("track")), "内蔵 device は Song から消さない");
-        assert!(kept.sends.is_empty(), "他トラック宛ての send は外れる");
-        assert_eq!(isolated.mod_sources[0].follower().and_then(|(tap, _)| tap), None, "他トラックを聴く follower は入力なし");
-        assert!(!kept.muted && kept.launcher == RowPlayback::Arranger, "mute を解き、アレンジを描く");
-        assert!(isolated.master_limiter.on, "master の段は Song に残し、scope が通さない");
-        assert_eq!(isolated.song_lanes.len(), song.song_lanes.len());
-        assert_eq!(isolated.master_fx_chain, song.master_fx_chain);
     }
 }

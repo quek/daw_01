@@ -393,7 +393,7 @@ pub fn process_track_owned(
     }
 
     // ---- Mixer strip + peak meter ----
-    // 素材の音だけを描く program (`RenderScope::Sources`) はフェーダーの段を通さない。
+    // 焼き込みの program (`RenderScope::Sources` / `PostFx`) はフェーダーの段を通さない。
     if !program.fader {
         pass_strip(scratch, n);
         return;
@@ -882,7 +882,7 @@ fn run_group_fx_chain(
         scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
 
-    // 素材の音だけを描く program (`RenderScope::Sources`) はフェーダーの段を通さない (leaf と同じ)。
+    // 焼き込みの program (`RenderScope::Sources` / `PostFx`) はフェーダーの段を通さない (leaf と同じ)。
     if !program.fader {
         pass_strip(scratch, n);
         return;
@@ -1105,7 +1105,7 @@ pub fn render_master_buffer(
         native_io,
     );
 
-    // bounce (`RenderScope::TrackOutput` / `Sources`) は master の段を通さない = 合流をそのまま出力する
+    // bounce (`RenderScope::PostFx` / `Sources`) は master の段を通さない = 合流をそのまま出力する
     // (compile 時に焼いた値。master の fx chain の op も Limiter の遅延も焼いていない)。
     if !schedule.master_stage {
         return;

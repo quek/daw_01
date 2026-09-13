@@ -213,7 +213,7 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
     }
 }
 
-/// フェーダーを掛けない strip (`ChainProgram::fader == false` = `RenderScope::Sources`): 音はそのまま残し、
+/// フェーダーを掛けない strip (`ChainProgram::fader == false` = 焼き込みの `RenderScope::Sources` / `PostFx`): 音はそのまま残し、
 /// peak だけを測る。volume / pan / mute / solo はフェーダーの段なので掛けない。
 ///
 /// RT-safe: in-place 読み取りのみ、確保・ロックなし。
