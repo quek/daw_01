@@ -1821,8 +1821,8 @@ fn apply(app: &mut AppData, item: DeviceMenuItem, row_id: u64, anchor: Rect);
 - **どの段を通すかは `RenderScope`**（`common/src/protocol.rs`）が compile で program の形に焼く: In Place / Glue は
   `Sources`（音源の出力まで。内蔵 device・音声入力を持つ device・Parallel の混ぜ・フェーダー・master を通さない）、
   With FX は `PostFx`（device チェーンまで。フェーダーと master を通さない）。
-- With FX は焼いた音を新しいトラックに置き、PostFx 点から後ろ（フェーダーとそのレーン / 変調・send・親 group・
-  PostFader を読む配線）を元トラックから写して元トラックを mute する（規則の正本は `Song::place_bounce_with_fx` の doc）。
+- With FX は焼いた音を新しいトラックに置き、PostFx 点から後ろ（フェーダーとそのレーン / 変調・send・親 group）を
+  元トラックから写して、焼いた元クリップだけを mute する（規則の正本は `Song::place_bounce_with_fx` の doc）。
 - 検証: `common` の `model::bounce_ops::tests`、`daw_audio` の `export::tests::bounce_with_fx_sounds_like_the_original_track`
   （元と Bounce 後の mix のピーク / RMS が pan 中央・偏り・volume ≠ 1 で一致）、`daw_gui/tests/scripts/glue_bake_parity.js`。
 
@@ -2326,7 +2326,7 @@ state/project.rs:462, :595, :630, :634, :960, :984, :991, :992 / handler/devices
 | F-G3 | `tests/app_state/open_stays_clean.rs` | v38 fixture を開いた直後 `!is_dirty()`、新規タブも同じ |
 | F-G4 | `view/param_gesture.rs` / `scrub_gesture.rs` cfg(test)（scrub_gesture.rs:114-186 と同形） | Begin(Rack) → End(MixerStrip) は no-op / End(Rack) で外れる / Begin 直後の同じフレームの sweep では閉じない / 在席印の無い sweep で閉じる / PluginWindow・VideoPreview は sweep で消えない / `ModDepth{Rack}` は MixerStrip の非アクティブな push で閉じず、◉ も残る |
 | F-G5 | `handler/bypass_target.rs` cfg(test) | master hover `Device(id)` → `SetDevicesBypassed{[id], !cur}`、`MasterLimiter` → `On(!on)` / Mixer hover があっても `mixer_active=false` なら None |
-| F-G6 | `common/src/model/bounce_ops.rs` cfg(test)（実装後に移設・改訂、§10.15） | `isolated_track`: 他トラックを読む SC / send / follower は外れ、自トラックを読む SC・内蔵 device・master の段は残る / `place_bounce_with_fx`: フェーダー・send・親 group・PostFader を読む配線が新しいトラックへ移り、元トラックは mute だけ |
+| F-G6 | `common/src/model/bounce_ops.rs` cfg(test)（実装後に移設・改訂、§10.15） | `isolated_track`: 他トラックを読む SC / send / follower は外れ、自トラックを読む SC・内蔵 device・master の段は残る / `place_bounce_with_fx`: フェーダー・send・親 group が新しいトラックへ写り、元トラックは焼いたクリップの mute だけ |
 | F-G7 | `tests/app_state/project_tabs.rs` | 2 タブで Listen → audio を respawn → 送信列が `OpenProject` → `SetScListen(Some)` の順で、LoadSong より前 |
 | F-G8 | `handler/view_model.rs` cfg(test) | 再生中で song_lanes に NativeParam レーン → `live_native_param` がレーン値、停止中は model 値 / master chain の ChainGain も追従 |
 

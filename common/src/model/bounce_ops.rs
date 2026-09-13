@@ -4,7 +4,7 @@
 //!
 //! - Bounce In Place / Glue: `RenderScope::Sources` (素材の音) を元のトラックのクリップへ戻す。再生時に
 //!   トラックの device / フェーダー / master をもう一度通る。
-//! - Bounce with FX: `RenderScope::PostFx` (device チェーンを通した音) を新しいトラックに置き、元トラックを
+//! - Bounce with FX: `RenderScope::PostFx` (device チェーンを通した音) を新しいトラックに置き、焼いた元クリップを
 //!   mute する ([`Song::place_bounce_with_fx`])。PostFx 点から後ろ (フェーダーと、そこから先の配線) は
 //!   焼かずに元トラックから写す。
 //!
@@ -49,10 +49,33 @@ impl Song {
         for lane in &mut kept.automation_lanes {
             lane.launcher = RowPlayback::Arranger;
         }
+        // 入力を受けるバスは自分のクリップを鳴らさない。入力を落とすと leaf に変わってクリップが鳴り出すので、
+        // 元どおり鳴らさない。
+        if !self.track_sounds_own_clips(track_id) {
+            kept.clips.clear();
+        }
         let mut isolated = self.clone();
         isolated.tracks = vec![kept];
         isolated.prune_dangling_refs();
         Some(isolated)
+    }
+
+    /// このトラックが自分のクリップを鳴らすか。入力を受けるバス (子を持つ group / send を受ける return /
+    /// パラアウトの宛先) は入力の合流だけを描き、自分のクリップを鳴らさない — 楽器兼バスの group
+    /// (`Track::paraout_split_device` を持つ) だけは自分の楽器を鳴らす。engine の bus / leaf 分類
+    /// (`daw_audio::graph::compile::deps` の `bus_flags` / `gwi_split`) と同じ規則。
+    #[must_use]
+    pub fn track_sounds_own_clips(&self, track_id: u32) -> bool {
+        let is_group = self.tracks.iter().any(|t| t.parent_group_id == Some(track_id));
+        let receives_send = self.tracks.iter().any(|t| t.sends.iter().any(|s| s.dest_track_id == track_id));
+        let mut receives_paraout = false;
+        for devices in self.tracks.iter().map(|t| t.devices.as_slice()).chain(std::iter::once(self.master_fx_chain.as_slice())) {
+            for p in plugins(devices) {
+                receives_paraout |= p.aux_outputs.iter().flatten().any(|r| r.dest_track == track_id);
+            }
+        }
+        let instrument_bus = is_group && self.track_by_id(track_id).is_some_and(|t| t.paraout_split_device().is_some());
+        !(is_group || receives_send || receives_paraout) || instrument_bus
     }
 
     /// 焼いた WAV を `media.audio_sources` に登録し、`window` を鳴らす **単一 audio event** の content を返す
@@ -106,27 +129,27 @@ impl Song {
         (source_id, AudioContent { events: vec![event], next_event_id: 2 })
     }
 
-    /// Bounce with FX の結果 (`clip` = 焼いた content を指すクリップ) を新しいトラックに置き、元トラックを
-    /// mute する。新しいトラックの id を返す (元トラックが無ければ `None`)。
+    /// Bounce with FX の結果 (`clip` = 焼いた content を指すクリップ) を新しいトラックに置き、焼いた元クリップ
+    /// (`source`) を mute する。新しいトラックの id を返す (元クリップが無ければ `None`)。
+    ///
+    /// **元トラックは mute しない** — 他のクリップも、group の子 / send / パラアウトから流れてくる音もそのまま
+    /// 鳴り、焼いたクリップの音だけが新しいトラックへ移る (どのトラックでも同じ規則)。
     ///
     /// 焼いた音は元トラックの PostFx 点 (`RenderScope::PostFx`) なので、**PostFx 点から後ろで元トラックの音に
     /// 効いていたものを新しいトラックへ写す** — 元と同じ音量・定位・送り・行き先で鳴り、後からフェーダーを
-    /// 動かせる (Live の Freeze and Flatten / Bitwig の Bounce と同じ分け方):
+    /// 動かせる:
     ///
     /// - フェーダー: volume / pan / mute / solo と、それを指すレーン (Volume / Pan / Mute / SendGain) と変調を
     ///   複製する。レーンの中身は独立に複製し (`fork_content`)、変調は新しい id で同じ変調ソースを指す
     ///   (トラック複製と同じ規則)。複製した変調の深さを指すレーン / 変調も連れていく。
     /// - send: 同じ id のまま複製する。pre-fader の send は PostFx 点 = 焼いた音を読むので同じ量が出る。
-    ///   元トラックの send は mute で黙る (engine の明示 mute の規則)。
     /// - 行き先: 同じ親 group の、元トラックの subtree の直後に置く。
-    /// - 元トラックの PostFader を読む配線 (SC / follower): 新しいトラックの PostFader へ付け替える
-    ///   (mute した元トラックの PostFader は無音)。PreFx / PostFx を読む配線は元トラックのまま
-    ///   (mute しても device チェーンは走るので同じ音)。
-    ///
-    /// 元トラックは mute するだけで、ほかは触らない (mute を戻せば焼く前の音に戻る)。
-    pub fn place_bounce_with_fx(&mut self, source_track_id: u32, name: String, clip: Clip) -> Option<u32> {
-        let src_idx = self.track_index_by_id(source_track_id)?;
-        let insert_at = self.subtree_end(source_track_id).unwrap_or(src_idx) + 1;
+    /// - 元トラックを読む配線 (SC / follower) は付け替えない — 元トラックは鳴り続けるので、付け替えると残りの音を
+    ///   失う。
+    pub fn place_bounce_with_fx(&mut self, source: ClipKey, name: String, clip: Clip) -> Option<u32> {
+        let src_idx = self.track_index_by_id(source.track_id)?;
+        self.tracks[src_idx].clip_by_id_mut(source.clip_id)?.muted = true;
+        let insert_at = self.subtree_end(source.track_id).unwrap_or(src_idx) + 1;
         let id = self.alloc_track_id();
         let (automation_lanes, mod_routings) = self.copy_fader_stage(src_idx);
         let src = &self.tracks[src_idx];
@@ -146,8 +169,6 @@ impl Song {
             ..Track::default()
         };
         track.place_clip(clip);
-        self.retarget_post_fader_taps(source_track_id, id);
-        self.tracks[src_idx].muted = true;
         self.tracks.insert(insert_at.min(self.tracks.len()), track);
         Some(id)
     }
@@ -205,28 +226,6 @@ impl Song {
             }
         }
         (lanes, routings)
-    }
-
-    /// `from` の PostFader を読む aux 入力 (plugin / 内蔵 device) と follower を `to` の PostFader へ付け替える。
-    fn retarget_post_fader_taps(&mut self, from: u32, to: u32) {
-        let (old, new) = (AudioTap::post_fader(from), AudioTap::post_fader(to));
-        let Song { tracks, master_fx_chain, mod_sources, .. } = self;
-        for devices in tracks.iter_mut().map(|t| &mut t.devices).chain(std::iter::once(master_fx_chain)) {
-            for_each_aux_slot_mut(devices, &mut |_, _, slot| {
-                if let Some(route) = slot
-                    && route.tap == old
-                {
-                    route.tap = new;
-                }
-            });
-        }
-        for m in mod_sources.iter_mut() {
-            if let Some(Some(tap)) = m.follower_tap_mut()
-                && *tap == old
-            {
-                *tap = new;
-            }
-        }
     }
 
     /// `root` とその子孫のうち、トラック列で最後に居るものの index。
@@ -302,8 +301,8 @@ mod tests {
     }
 
     /// Bounce with FX の置き方 = PostFx 点から後ろを写す規則: フェーダー (値 / レーン / 変調とその深さ) / send /
-    /// 親 group / PostFader を読む配線が新しいトラックへ移り、PostFx を読む配線と元トラックの中身は残る
-    /// (元トラックは mute だけ)。写したものは編集後の不変条件でも消えない (= dangling を作らない)。
+    /// 親 group が新しいトラックへ写り、元トラックは焼いたクリップの mute だけ (他のクリップ・中身・読む配線は
+    /// そのまま)。写したものは編集後の不変条件でも消えない (= dangling を作らない)。
     #[test]
     fn bounce_with_fx_moves_what_follows_the_post_fx_point_to_the_new_track() {
         use TrackBuiltinParam as B;
@@ -334,7 +333,10 @@ mod tests {
         let (pan_routing, depth_routing, device_routing) =
             (song.alloc_mod_routing_id(), song.alloc_mod_routing_id(), song.alloc_mod_routing_id());
         let routing = |id, target| ModRouting { id, target, source_id: lfo, depth: 0.5, polarity: Polarity::default(), enabled: true };
+        let source_content = song.alloc_content(ClipContent::Audio(AudioContent::default()), "src".into());
         let t = song.track_by_id_mut(src).expect("src");
+        let source_clip = t.place_clip(Clip { start_beat: 1.0, length_beats: 2.0, content_id: source_content, ..Clip::default() });
+        let other_clip = t.place_clip(Clip { start_beat: 4.0, length_beats: 2.0, content_id: source_content, ..Clip::default() });
         (t.volume, t.pan, t.solo) = (0.5, -0.4, true);
         t.sends.push(Send { id: 3, dest_track_id: ret, gain: 0.7, mode: SendMode::PreFader, enabled: true });
         t.next_send_id = 4;
@@ -355,7 +357,7 @@ mod tests {
 
         let content_id = song.alloc_content(ClipContent::Audio(AudioContent::default()), "baked".into());
         let clip = Clip { start_beat: 1.0, length_beats: 2.0, content_id, ..Clip::default() };
-        let id = song.place_bounce_with_fx(src, "FX".into(), clip).expect("placed");
+        let id = song.place_bounce_with_fx(ClipKey { track_id: src, clip_id: source_clip }, "FX".into(), clip).expect("placed");
         song.enforce_edit_invariants();
 
         let order: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
@@ -376,11 +378,12 @@ mod tests {
         assert_eq!(depth.target, AutomationTarget::ModRoutingDepth { routing_id: pan.id }, "深さは複製した変調を指し直す");
 
         let old = song.track_by_id(src).expect("src");
-        assert!(old.muted, "元トラックは mute する");
+        let muted = |clip| old.clip_by_id(clip).expect("clip").muted;
+        assert!(!old.muted && muted(source_clip) && !muted(other_clip), "元トラックは鳴り続け、焼いたクリップだけを mute する");
         assert_eq!((old.automation_lanes.clone(), old.mod_routings.clone(), old.sends.clone(), old.solo), (before.automation_lanes, before.mod_routings, before.sends, before.solo), "元トラックの中身は触らない");
         let tap = |dev| song.native_by_id(dev).and_then(|n| n.aux_input).map(|r| r.tap);
-        assert_eq!(tap(post_fader_sc), Some(AudioTap::post_fader(id)), "PostFader を読む SC は新しいトラックへ");
-        assert_eq!(tap(post_fx_sc), Some(AudioTap::new(TapSource::Track(src), TapPoint::PostFx)), "PostFx を読む SC は元トラックのまま");
-        assert_eq!(song.mod_sources[0].follower().and_then(|(t, _)| t.copied()), Some(AudioTap::post_fader(id)), "follower も付け替える");
+        assert_eq!(tap(post_fader_sc), Some(AudioTap::post_fader(src)), "元トラックは鳴り続けるので SC は付け替えない");
+        assert_eq!(tap(post_fx_sc), Some(AudioTap::new(TapSource::Track(src), TapPoint::PostFx)));
+        assert_eq!(song.mod_sources[0].follower().and_then(|(t, _)| t.copied()), Some(AudioTap::post_fader(src)));
     }
 }
