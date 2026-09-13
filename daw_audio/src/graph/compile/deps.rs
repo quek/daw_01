@@ -2,15 +2,17 @@
 //!
 //! [`Topology`] は track id → index / 親参照の検査 / group の子・send・パラアウトの入力表 /
 //! bus 判定を 1 回だけ組み、op の emit と PDC が共有する。[`execution_order`] は
-//! path latency の依存辺 (children / sidechain source / send source) を DFS し、循環を
-//! `GraphError::Cycle` で弾いて post-order (= 実行順) を返す。
+//! path latency の依存辺 (children / sidechain source / send source) の post-order (= 実行順) を
+//! 返し、循環は `GraphError::Cycle` で弾く。辺の定義は `common::routing_deps::TrackDeps` が唯一の
+//! 実装で、GUI の配線ガード (Structural) と engine の実行順 (Active) が同じ辺を数える
+//! (`docs/plan_rack_native_devices.md` §5.9)。
 
 use std::collections::{HashMap, HashSet};
 
 use common::model::{SendMode, Song, plugins};
+use common::routing_deps::{EdgeScope, TrackDeps};
 
 use super::GraphError;
-use super::sidechain::{TapCtx, sidechain_dep_edges};
 
 /// `compile_schedule` の各段が共有する配線の表 (song-track index は `song.tracks` の並び)。
 pub(super) struct Topology {
@@ -26,6 +28,9 @@ pub(super) struct Topology {
     pub(super) incoming_paraout: HashMap<u32, Vec<(u32, u64, u8)>>,
     /// song-track index → bus か。
     pub(super) bus_flags: Vec<bool>,
+    /// song-track index → group-with-instrument (パラアウトの楽器兼 group) の top-level 分割点。
+    /// それ以外の track は `None`。`[..split]` が pass 1、残りが pass 2 (`ProcessGroupFx`)。
+    pub(super) gwi_split: Vec<Option<u32>>,
 }
 
 impl Topology {
@@ -84,6 +89,11 @@ impl Topology {
                     || incoming_paraout.contains_key(&t.id)
             })
             .collect();
+        let gwi_split: Vec<Option<u32>> = song
+            .tracks
+            .iter()
+            .map(|t| if is_group.contains(&t.id) { t.paraout_split_device() } else { None })
+            .collect();
 
         Ok(Self {
             id_to_idx,
@@ -92,6 +102,7 @@ impl Topology {
             incoming_sends,
             incoming_paraout,
             bus_flags,
+            gwi_split,
         })
     }
 }
@@ -164,85 +175,15 @@ fn gather_incoming_paraout(
     incoming_paraout
 }
 
-/// Detect cycles in the path_latency dependency graph and return its post-order.
+/// path latency の依存 graph の post-order (= 実行順、song-track index) を返す。
 ///
-/// `compute_path_latency` recurses through:
-///   1. children of a group track (group depends on every child's path_latency)
-///   2. sidechain sources of plugins on the track (track depends on each
-///      sidechain source's path_latency)
-///   3. send sources of a return / bus
-///
-/// Cycle in this dep-graph ⇒ infinite recursion in path_latency ⇒ must
-/// reject up front. Iterative 3-color DFS over the dep edges ([`dep_edges`]).
-///
-/// PR4: this subsumes the old parent-chain-only detector — children-of
-/// edges cover all parent cycles, sidechain-source edges cover all
-/// sidechain feedback (incl. self-feedback A → A and A→B→A).
-///
-/// Post-order of the dependency DFS = a valid execution order: a node
-/// is appended only after all its dependencies (children + sidechain
-/// sources + send sources) are done, so producers always precede
-/// consumers. Replaces the old parent-only depth sort, which couldn't
-/// order send / sidechain edges between same-depth tracks.
-pub(super) fn execution_order(
-    song: &Song,
-    topo: &Topology,
-    taps: &TapCtx<'_>,
-) -> Result<Vec<u32>, GraphError> {
-    let n = song.tracks.len();
-    let mut state = vec![0u8; n]; // 0=unvisited, 1=on current path, 2=done
-    let mut order: Vec<u32> = Vec::with_capacity(n);
-    for start in 0..n {
-        if state[start] != 0 {
-            continue;
-        }
-        // Stack carries (node, next-edge-index-to-explore).
-        let mut stack: Vec<(u32, usize)> = vec![(start as u32, 0)];
-        state[start] = 1;
-        while let Some(&(node, edge_i)) = stack.last() {
-            let deps = dep_edges(song, topo, taps, node);
-            if edge_i >= deps.len() {
-                state[node as usize] = 2;
-                order.push(node);
-                stack.pop();
-                continue;
-            }
-            // Advance the edge cursor on the current frame before we
-            // possibly push a new one.
-            if let Some(top) = stack.last_mut() {
-                top.1 += 1;
-            }
-            let target = deps[edge_i];
-            match state[target as usize] {
-                0 => {
-                    state[target as usize] = 1;
-                    stack.push((target, 0));
-                }
-                1 => return Err(GraphError::Cycle),
-                _ => {}
-            }
-        }
-    }
-    Ok(order)
-}
-
-/// track `idx` が path latency で依存する track の index (children → sidechain source →
-/// send source の順。DFS の訪問順 = 実行順を決めるので並びも仕様)。
-fn dep_edges(song: &Song, topo: &Topology, taps: &TapCtx<'_>, idx: u32) -> Vec<u32> {
-    let track = &song.tracks[idx as usize];
-    let mut out: Vec<u32> = Vec::new();
-    if let Some(kids) = topo.children_of.get(&track.id) {
-        out.extend(kids.iter().copied());
-    }
-    sidechain_dep_edges(idx, &track.devices, taps, &mut out);
-    // send edges: this track (the destination / return) depends on
-    // every track that sends into it — the source must run before the
-    // send is mixed in. Covers send feedback (A→B→A, self-send) for
-    // cycle detection.
-    if let Some(edges) = topo.incoming_sends.get(&track.id) {
-        for &(src_idx, _, _) in edges {
-            out.push(src_idx);
-        }
-    }
-    out
+/// `compute_path_latency` は children / sidechain source / send source を再帰で辿るので、
+/// この graph の循環は無限再帰 = compile の前に弾く必要がある (children 辺が親の循環を、
+/// sidechain 辺がフィードバック (A → A、A → B → A) を、send 辺が send のループを覆う)。
+/// 辺の定義と 3 色 DFS は `TrackDeps` (`EdgeScope::Active` = 処理しうる consumer だけ)。
+/// post-order なので producer は必ず consumer より前に並ぶ。
+pub(super) fn execution_order(song: &Song) -> Result<Vec<u32>, GraphError> {
+    TrackDeps::build(song, EdgeScope::Active)
+        .dependency_order()
+        .map_err(|_| GraphError::Cycle)
 }

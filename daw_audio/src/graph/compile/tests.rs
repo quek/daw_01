@@ -1,4 +1,5 @@
 use super::*;
+use crate::graph::DelayKey;
 use common::model::{Device, PluginInstance, Song, Track};
 use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
@@ -116,6 +117,56 @@ fn instrument_ports() -> PortConfig {
         has_video_input: false,
         has_video_output: false,
     }
+}
+
+/// r.md #129 §15.3 T4: サイドチェインを読む consumer の種類。SC の会計 (tap の emit / 依存辺 /
+/// input delay / path latency / 循環) は plugin の aux 入力と内蔵 device の SC で同じ規則なので、
+/// SC のテストは両方で回す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScConsumer {
+    Plugin,
+    Native,
+}
+
+const SC_CONSUMERS: [ScConsumer; 2] = [ScConsumer::Plugin, ScConsumer::Native];
+
+/// id `id` の consumer (plugin は audio FX、native は追加の Comp)。`source` track の PostFader を読む。
+fn sc_consumer(kind: ScConsumer, id: u64, source: u32) -> Device {
+    let route = common::model::AuxInputRoute::post_fader(source);
+    match kind {
+        ScConsumer::Plugin => Device::Plugin(PluginInstance {
+            id,
+            aux_inputs: vec![Some(route)],
+            ..PluginInstance::with_ports("test.compressor".into(), PluginFormat::Vst3, audio_fx_ports())
+        }),
+        ScConsumer::Native => Device::Native(common::model::NativeDevice {
+            aux_input: Some(route),
+            ..common::model::NativeDevice::new_added(common::model::NativeKind::Comp, id, 1)
+        }),
+    }
+}
+
+/// consumer `id` への tap の位置 (nodes の index)。native は owner の program の受け皿が
+/// `Staged` で確保済みであることまで確かめる (= tap を出した場所で受け皿を用意した)。
+fn sc_tap_position(sched: &Schedule, kind: ScConsumer, src: BufRef, id: u64, owner: u32) -> Option<usize> {
+    sched.nodes.iter().position(|op| match (kind, op) {
+        (ScConsumer::Plugin, NodeOp::SidechainTap { src: s, device_id, aux_in_port: 0 }) => {
+            *s == src && *device_id == id
+        }
+        (ScConsumer::Native, NodeOp::NativeSidechainTap { src: s, owner: o, native_slot }) => {
+            let p = if owner == MASTER_OWNER { &sched.master_program } else { &sched.track_programs[owner as usize] };
+            *s == src
+                && *o == owner
+                && p.natives.get(*native_slot as usize).is_some_and(|ns| {
+                    ns.device_id == id && ns.sc_mode == crate::graph::native::ScMode::Staged && ns.sc.is_some()
+                })
+        }
+        _ => false,
+    })
+}
+
+fn any_sc_tap(sched: &Schedule) -> bool {
+    sched.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. } | NodeOp::NativeSidechainTap { .. }))
 }
 
 #[test]
@@ -488,8 +539,8 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         512
     );
 
-    // docs/plan_master_strip.md §2: マスターリミッター ON はルックアヘッド (5ms =
-    // 48kHz で 240) を出力遅延として足す。OFF (既定 = 上の全ケース) は足さない。
+    // マスターリミッター ON はルックアヘッド (5ms = 48kHz で 240) を出力遅延として足す。
+    // OFF (既定 = 上の全ケース) は足さない。
     let mut limited = Song {
         tracks: vec![track(|t| t.id = 1)],
         ..Song::default()
@@ -501,6 +552,43 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         "リミッター ON のルックアヘッドは master 出力の遅延"
     );
     assert_eq!(common::model::limiter_lookahead_samples(48_000), 240);
+}
+
+/// r.md #129 §15.3 T8: Limiter の遅延は compile 時に焼く。静的に OFF でも On のレーン (や変調) があれば
+/// 遅延を焼き、PDC の会計 (`master_latency_samples`) と DSP (`master_limiter_latency`) が同じ値を見る
+/// (以前は On をオートメーションすると遅延と会計が食い違った = §18-G)。track が 0 本の早期 return でも同じ。
+#[test]
+fn master_limiter_latency_is_baked_from_the_static_on_or_an_on_lane() {
+    use common::model::{AutomationLane, AutomationTarget, MasterLimiterParam, ModRouting, Polarity};
+    let on = AutomationTarget::MasterLimiter(MasterLimiterParam::On);
+    let look = common::model::limiter_lookahead_samples(48_000);
+    for tracks in [vec![track(|t| t.id = 1)], vec![]] {
+        let plain = Song { tracks: tracks.clone(), ..Song::default() };
+        let sched = compile_schedule_for_test(&plain, 48_000, 0).unwrap();
+        assert_eq!((sched.master_limiter_latency, sched.master_latency_samples), (false, 0), "静的 OFF・レーン無し");
+
+        let laned = Song { tracks: tracks.clone(), song_lanes: vec![AutomationLane::new(on.clone(), 0.0)], ..Song::default() };
+        let sched = compile_schedule_for_test(&laned, 48_000, 0).unwrap();
+        assert_eq!((sched.master_limiter_latency, sched.master_latency_samples), (true, look), "On レーンで遅延を焼く");
+
+        let mut disabled = laned.clone();
+        disabled.song_lanes[0].enabled = false;
+        assert!(!compile_schedule_for_test(&disabled, 48_000, 0).unwrap().master_limiter_latency, "無効なレーンは数えない");
+
+        let routed = Song {
+            tracks,
+            song_mod_routings: vec![ModRouting {
+                id: 1,
+                target: on.clone(),
+                source_id: 3,
+                depth: 1.0,
+                polarity: Polarity::Unipolar,
+                enabled: true,
+            }],
+            ..Song::default()
+        };
+        assert!(compile_schedule_for_test(&routed, 48_000, 0).unwrap().master_limiter_latency, "On への変調でも焼く");
+    }
 }
 
 /// r.md #39: `master_latency_samples` は master **出力** の遅延量なので、
@@ -776,6 +864,7 @@ fn pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin() {
             }
             NodeOp::ProcessGroupFx { .. }
             | NodeOp::SidechainTap { .. }
+            | NodeOp::NativeSidechainTap { .. }
             | NodeOp::MixSend { .. }
             | NodeOp::MixAdditive { .. }
             | NodeOp::ParallelOutTap { .. } => {
@@ -954,12 +1043,16 @@ impl LatencyPlugin {
 /// Track 2 の plugin が process() を呼ばれる **前** に挿入される。
 /// engine 側はこの op を見て plugin の `pd.buffer_aux_in[0]` に
 /// Track 1 の signal を copy してから plugin.process() を dispatch する。
-/// v29: 宛先 plugin は安定 device id で焼き込まれる。
+/// v29: 宛先 plugin は安定 device id で焼き込まれる。r.md #129 T4: 宛先が内蔵 Comp でも同じ位置に
+/// `NativeSidechainTap` が出て、その場で受け皿が `Staged` になる。
 #[test]
 fn sidechain_emits_tap_before_destination_process_track() {
-    use common::model::PluginInstance;
-    use common::plugin_format::PluginFormat;
+    for kind in SC_CONSUMERS {
+        sidechain_emits_tap_before_destination_process_track_for(kind);
+    }
+}
 
+fn sidechain_emits_tap_before_destination_process_track_for(kind: ScConsumer) {
     let song = Song {
         tracks: vec![
             track(|t| {
@@ -969,43 +1062,18 @@ fn sidechain_emits_tap_before_destination_process_track() {
             track(|t| {
                 t.id = 2;
                 t.name = "Dest".into();
-                t.devices = vec![Device::Plugin(PluginInstance {
-                    id: 77,
-                    // aux input port 0 ← Track 1's output
-                    aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-                    ..PluginInstance::with_ports(
-                        "test.compressor".into(),
-                        PluginFormat::Vst3,
-                        audio_fx_ports(),
-                    )
-                })];
+                // aux input port 0 ← Track 1's output
+                t.devices = vec![sc_consumer(kind, 77, 1)];
             }),
         ],
         ..Song::default()
     };
     let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
-    // (a) SidechainTap が emit されている (安定 device id で addressing)。
-    let tap_idx = sched
-        .nodes
-        .iter()
-        .position(|op| {
-            matches!(
-                op,
-                NodeOp::SidechainTap {
-                    src: BufRef::TrackScratch(0),
-                    device_id: 77,
-                    aux_in_port: 0,
-                }
-            )
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "expected SidechainTap (src=TrackScratch(0), device_id=77, port=0); \
-                 nodes={:?}",
-                sched.nodes
-            )
-        });
+    // (a) tap が emit されている (安定 device id で addressing)。
+    let tap_idx = sc_tap_position(&sched, kind, BufRef::TrackScratch(0), 77, 1).unwrap_or_else(|| {
+        panic!("{kind:?}: expected tap (src=TrackScratch(0), device 77); nodes={:?}", sched.nodes)
+    });
 
     // (b) source track の ProcessTrack が tap より前 (= source scratch
     //     が埋まってから tap で copy される)。
@@ -1034,49 +1102,27 @@ fn sidechain_emits_tap_before_destination_process_track() {
 
 #[test]
 fn master_fx_sidechain_emits_tap_after_master_mix() {
-    use common::model::PluginInstance;
-    use common::plugin_format::PluginFormat;
+    for kind in SC_CONSUMERS {
+        master_fx_sidechain_emits_tap_after_master_mix_for(kind);
+    }
+}
 
-    // Track 1 → master bus fx[0] の aux input。 master fx の SidechainTap は
+fn master_fx_sidechain_emits_tap_after_master_mix_for(kind: ScConsumer) {
+    // Track 1 → master bus fx[0] の aux input。 master fx の tap は
     // master Mix の **後** (source scratch 確定後) に emit される。
     let song = Song {
         tracks: vec![track(|t| {
             t.id = 1;
             t.name = "Source".into();
         })],
-        master_fx_chain: vec![Device::Plugin(PluginInstance {
-            id: 900,
-            aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-            ..PluginInstance::with_ports(
-                "test.bus_comp".into(),
-                PluginFormat::Vst3,
-                audio_fx_ports(),
-            )
-        })],
+        master_fx_chain: vec![sc_consumer(kind, 900, 1)],
         ..Song::default()
     };
     let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
-    let tap_idx = sched
-        .nodes
-        .iter()
-        .position(|op| {
-            matches!(
-                op,
-                NodeOp::SidechainTap {
-                    src: BufRef::TrackScratch(0),
-                    device_id: 900,
-                    aux_in_port: 0,
-                }
-            )
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "expected master SidechainTap (src=TrackScratch(0), device_id=900); \
-                 nodes={:?}",
-                sched.nodes
-            )
-        });
+    let tap_idx = sc_tap_position(&sched, kind, BufRef::TrackScratch(0), 900, MASTER_OWNER).unwrap_or_else(|| {
+        panic!("{kind:?}: expected master tap (src=TrackScratch(0), device 900); nodes={:?}", sched.nodes)
+    });
 
     // master Mix が tap より前 (= 全 track mix 後に source scratch から copy)。
     let master_mix_idx = sched
@@ -1123,11 +1169,13 @@ fn master_fx_sidechain_emits_tap_after_master_mix() {
 /// 入れて対応。
 #[test]
 fn pdc_sidechain_source_path_latency_propagates_to_dest() {
-    use common::model::PluginInstance;
-    use common::plugin_format::PluginFormat;
+    for kind in SC_CONSUMERS {
+        pdc_sidechain_source_path_latency_propagates_to_dest_for(kind);
+    }
+}
 
+fn pdc_sidechain_source_path_latency_propagates_to_dest_for(kind: ScConsumer) {
     let mut lat = DeviceLatencies::new();
-    lat.insert(20, 50);
     let song = Song {
         tracks: vec![
             track(|t| {
@@ -1138,15 +1186,9 @@ fn pdc_sidechain_source_path_latency_propagates_to_dest() {
             track(|t| {
                 t.id = 2;
                 t.name = "Dest".into();
-                t.devices = vec![Device::Plugin(PluginInstance {
-                    id: 20,
-                    aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-                    ..PluginInstance::with_ports(
-                        "test.compressor".into(),
-                        PluginFormat::Vst3,
-                        audio_fx_ports(),
-                    )
-                })];
+                // consumer + 50 sample の device (内蔵 device は遅延 0 なので、chain の遅延は別 device で持つ)。
+                t.devices = vec![sc_consumer(kind, 20, 1)];
+                t.devices.extend(latency_chain(&mut lat, 25, 50));
             }),
         ],
         ..Song::default()
@@ -1227,11 +1269,13 @@ fn pdc_sidechain_source_path_latency_propagates_to_dest() {
 /// sidechain alignment は MIDI event 側も遅延させる必要があり、 別 PR)。
 #[test]
 fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track() {
-    use common::model::PluginInstance;
-    use common::plugin_format::PluginFormat;
+    for kind in SC_CONSUMERS {
+        pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track_for(kind);
+    }
+}
 
+fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track_for(kind: ScConsumer) {
     let mut lat = DeviceLatencies::new();
-    lat.insert(20, 50);
     let song = Song {
         tracks: vec![
             track(|t| {
@@ -1242,15 +1286,8 @@ fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track() {
             track(|t| {
                 t.id = 2;
                 t.name = "Dest".into();
-                t.devices = vec![Device::Plugin(PluginInstance {
-                    id: 20,
-                    aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-                    ..PluginInstance::with_ports(
-                        "test.compressor".into(),
-                        PluginFormat::Vst3,
-                        audio_fx_ports(),
-                    )
-                })];
+                t.devices = vec![sc_consumer(kind, 20, 1)];
+                t.devices.extend(latency_chain(&mut lat, 25, 50));
             }),
             track(|t| {
                 t.id = 3;
@@ -1284,22 +1321,21 @@ fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track() {
 /// §5 (arch refactor): **leaf** 宛の sidechain tap は staging (post-
 /// dispatch) と消費 (次 buffer の pass-1 process) が 1 buffer ずれるので、
 /// `buffer_frames` が入力遅延と path latency の両方に加算される。bus 宛
-/// (return の ProcessGroupFx) は同 buffer 消費なので加算されない。
+/// (return の ProcessGroupFx) は同 buffer 消費なので加算されず、track の入力遅延ではなく
+/// `ProcessGroupFx` の直前の `BusScAlign` で揃える (r.md #129 §8.3.3)。ここでは return の入力
+/// (send 元) が SC 元と同じ track なので、揃える量は 0 = 遅延を積まない。
 #[test]
 fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag() {
-    use common::model::{PluginInstance, Send, SendMode};
-    use common::plugin_format::PluginFormat;
+    for kind in SC_CONSUMERS {
+        pdc_leaf_sidechain_tap_adds_one_buffer_of_lag_for(kind);
+    }
+}
+
+fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag_for(kind: ScConsumer) {
+    use common::model::{Send, SendMode};
 
     const BUF: u32 = 512;
-    let sc_device = |id: u64| PluginInstance {
-        id,
-        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-        ..PluginInstance::with_ports(
-            "test.compressor".into(),
-            PluginFormat::Vst3,
-            audio_fx_ports(),
-        )
-    };
+    let sc_device = |id: u64| sc_consumer(kind, id, 1);
     let mut lat = DeviceLatencies::new();
     let song = Song {
         tracks: vec![
@@ -1319,12 +1355,12 @@ fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag() {
             track(|t| {
                 t.id = 2;
                 t.name = "LeafDest".into();
-                t.devices = vec![sc_device(20).into()];
+                t.devices = vec![sc_device(20)];
             }),
             track(|t| {
                 t.id = 3;
                 t.name = "BusDest".into();
-                t.devices = vec![sc_device(30).into()];
+                t.devices = vec![sc_device(30)];
             }),
         ],
         ..Song::default()
@@ -1337,13 +1373,12 @@ fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag() {
         100 + BUF,
         "leaf-destined tap must include the 1-buffer staging lag"
     );
-    // bus 宛 (return): 同 buffer 消費なので lag 加算なし。入力遅延自体
-    // bus では未使用 (ProcessGroupFx は input_delay を適用しない) だが、
-    // 規則の対称性を検証する。
-    assert_eq!(
-        sched.input_delay_per_track[2],
-        100,
-        "bus-destined tap is consumed in the same buffer (no extra lag)"
+    // bus 宛 (return): pass 2 の consumer なので track の入力遅延は持たない。
+    assert_eq!(sched.input_delay_per_track[2], 0, "pass-2 consumer は input delay を使わない");
+    assert!(
+        !sched.delay_keys.iter().any(|k| matches!(k, DelayKey::BusScAlign { .. })),
+        "send 元 (= SC 元) で入力が既に 100 遅れているので BusScAlign は積まない: {:?}",
+        sched.delay_keys
     );
 }
 
@@ -1399,41 +1434,59 @@ fn pdc_sidechain_instrument_input_delay_skipped_in_mvp() {
 /// 検出しないと `compute_path_latency` が無限再帰する。
 #[test]
 fn sidechain_cycle_between_two_tracks_is_rejected() {
-    use common::model::PluginInstance;
-    use common::plugin_format::PluginFormat;
+    for kind in SC_CONSUMERS {
+        // A(id=1) の consumer が B(id=2) からの sidechain を、
+        // B(id=2) の consumer が A(id=1) からの sidechain を要求 → cycle。
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.name = "A".into();
+                    t.devices = vec![sc_consumer(kind, 11, 2)];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "B".into();
+                    t.devices = vec![sc_consumer(kind, 12, 1)];
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(compile_schedule_for_test(&song, 48_000, 0).err(), Some(GraphError::Cycle), "{kind:?}");
+    }
+}
 
-    // A(id=1) の plugin が B(id=2) からの sidechain を、
-    // B(id=2) の plugin が A(id=1) からの sidechain を要求 → cycle。
-    let song = Song {
-        tracks: vec![
-            track(|t| {
-                t.id = 1;
-                t.name = "A".into();
-                t.devices = vec![Device::Plugin(PluginInstance {
-                    aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(2))],
-                    ..PluginInstance::with_ports(
-                        "test.compressor".into(),
-                        PluginFormat::Vst3,
-                        audio_fx_ports(),
-                    )
-                })];
-            }),
-            track(|t| {
-                t.id = 2;
-                t.name = "B".into();
-                t.devices = vec![Device::Plugin(PluginInstance {
-                    aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-                    ..PluginInstance::with_ports(
-                        "test.compressor".into(),
-                        PluginFormat::Vst3,
-                        audio_fx_ports(),
-                    )
-                })];
-            }),
-        ],
-        ..Song::default()
+/// r.md #129 T4: native の consumer が「処理しうるか」は `can_activate` (静的に ON、または On のレーン /
+/// 変調がある)。bypass 中で On レーンの無い Comp は依存辺にも tap にも数えない = 循環しない。On レーンが
+/// あれば処理しうるので数える (レーンで ON になった瞬間から外部 SC で検出する)。
+#[test]
+fn a_bypassed_native_consumer_counts_only_when_it_can_activate() {
+    use common::model::{AutomationLane, AutomationTarget, NativeKind, NativeParamId};
+    let song_with = |on_lane: bool| {
+        let mut b = sc_consumer(ScConsumer::Native, 12, 1);
+        b.set_bypassed(true);
+        Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.devices = vec![sc_consumer(ScConsumer::Native, 11, 2)];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.devices = vec![b];
+                    if on_lane {
+                        let on = AutomationTarget::NativeParam { device_id: 12, param: NativeParamId::On(NativeKind::Comp) };
+                        t.automation_lanes = vec![AutomationLane::new(on, 1.0)];
+                    }
+                }),
+            ],
+            ..Song::default()
+        }
     };
-    assert_eq!(compile_schedule_for_test(&song, 48_000, 0).err(), Some(GraphError::Cycle));
+    let sched = compile_schedule_for_test(&song_with(false), 48_000, 0).expect("bypass 中の配線は循環しない");
+    assert!(sc_tap_position(&sched, ScConsumer::Native, BufRef::TrackScratch(0), 12, 1).is_none());
+    assert!(sc_tap_position(&sched, ScConsumer::Native, BufRef::TrackScratch(1), 11, 0).is_some());
+    assert_eq!(compile_schedule_for_test(&song_with(true), 48_000, 0).err(), Some(GraphError::Cycle));
 }
 
 /// 同じく compile-level test: `sidechain_sources` の対象 track が
@@ -1443,34 +1496,23 @@ fn sidechain_cycle_between_two_tracks_is_rejected() {
 /// 寛容に扱う。
 #[test]
 fn sidechain_with_dangling_source_track_is_skipped() {
-    use common::model::PluginInstance;
-    use common::plugin_format::PluginFormat;
-
-    let song = Song {
-        tracks: vec![track(|t| {
-            t.id = 1;
-            t.name = "Lone".into();
-            t.devices = vec![Device::Plugin(PluginInstance {
+    for kind in SC_CONSUMERS {
+        let song = Song {
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.name = "Lone".into();
                 // 存在しない track を指す → dangling、 Tap は emit されない
-                aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(99))],
-                ..PluginInstance::with_ports(
-                    "test.compressor".into(),
-                    PluginFormat::Vst3,
-                    audio_fx_ports(),
-                )
-            })];
-        })],
-        ..Song::default()
-    };
-    let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
-    assert!(
-        !sched
-            .nodes
-            .iter()
-            .any(|op| matches!(op, NodeOp::SidechainTap { .. })),
-        "dangling sidechain source must not emit SidechainTap; nodes={:?}",
-        sched.nodes
-    );
+                t.devices = vec![sc_consumer(kind, 11, 99)];
+            })],
+            ..Song::default()
+        };
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
+        assert!(!any_sc_tap(&sched), "{kind:?}: dangling sidechain source must not emit a tap; nodes={:?}", sched.nodes);
+        let p = &sched.track_programs[0];
+        if kind == ScConsumer::Native {
+            assert_eq!(p.natives[0].sc_mode, crate::graph::native::ScMode::None, "解決できない配線は自分の入力で検出");
+        }
+    }
 }
 
 // ---- PR4 aux send / return ----
@@ -2258,4 +2300,260 @@ fn sidechain_from_another_tracks_chain_orders_the_owner_first() {
     assert!(owner_idx < tap_idx, "chain の所有 track が先に走る");
     // leaf 宛の tap は 1 buffer 遅れの補償が入る (track source と同じ規則)。
     assert_eq!(sched.input_delay_per_track[0], 256);
+}
+
+// ---- r.md #129: 内蔵 device (§15.3 T13 / T14 / T15) ----
+
+fn op_labels(p: &crate::graph::ChainProgram) -> Vec<String> {
+    use crate::graph::ChainOp;
+    p.ops
+        .iter()
+        .map(|op| match op {
+            ChainOp::Plugin { device_id, .. } => format!("P{device_id}"),
+            ChainOp::Native { native_slot, .. } => {
+                let ns = &p.natives[*native_slot as usize];
+                format!("N({:?}{})", ns.dsp.kind(), if ns.builtin { ",b" } else { "" })
+            }
+            ChainOp::ParallelBegin { .. } => "RB".into(),
+            ChainOp::ChainBegin { .. } => "CB".into(),
+            ChainOp::ChainEnd { .. } => "CE".into(),
+            ChainOp::ParallelEnd { .. } => "RE".into(),
+        })
+        .collect()
+}
+
+/// pass 2 を 1 buffer 走らせる (pass 1 の出力は呼び側が scratch に置く)。
+fn run_post_dispatch(
+    sched: &mut Schedule,
+    scratch: &mut [crate::mixer::TrackScratch],
+    song: &Song,
+    n: usize,
+    io: crate::graph::NativeIo<'_>,
+) {
+    let refs: crate::engine::PluginRefs = std::collections::HashMap::new();
+    let (mut ml, mut mr) = (vec![0.0; n], vec![0.0; n]);
+    crate::graph::execute_schedule_post_dispatch(
+        sched,
+        scratch,
+        &mut ml,
+        &mut mr,
+        n,
+        song,
+        &refs,
+        None,
+        48_000,
+        n as u32,
+        true,
+        false,
+        &std::collections::HashSet::new(),
+        120.0,
+        0.0,
+        common::model::LoopRegion::default(),
+        common::mod_plane::ModTickPlaneRef::default(),
+        crate::mod_tick::FollowerDrive::default(),
+        &crate::launcher::RowSourceTable::default(),
+        io,
+    );
+}
+
+fn native_sc(kind: common::model::NativeKind, id: u64, source: u32, point: common::model::TapPoint) -> Device {
+    let mut d = common::model::NativeDevice::new_added(kind, id, 1);
+    d.aux_input = Some(common::model::AuxInputRoute {
+        tap: common::model::AudioTap::new(common::model::TapSource::Track(source), point),
+    });
+    Device::Native(d)
+}
+
+/// T13: v38 の strip を持つ旧形式の fixture を読み込むと、組み込みが旧 strip と同じ位置の op になる。
+/// 通常トラックは `[P…, N(comp), N(eq)]`、GWI の組み込みは `pass1_end` より後 (= 旧 strip と同じ pass 2)、
+/// master は `[N(bus), N(tone), P…]`。Limiter の遅延を焼くかは旧 `limiter.on` と一致する。
+#[test]
+fn v38_fixture_compiles_builtins_where_the_old_strip_ran() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../common/tests/fixtures/v38_strips.daw");
+    let song = common::project::load_project(&path).expect("v38 fixture").song;
+    let sched = compile_schedule_for_test(&song, 48_000, 256).expect("compile");
+    for (i, t) in song.tracks.iter().enumerate() {
+        let p = &sched.track_programs[i];
+        let labels = op_labels(p);
+        assert_eq!(p.natives.len(), 2, "track {}: {labels:?}", t.name);
+        assert_eq!(labels[labels.len() - 2..], ["N(Comp,b)", "N(Eq,b)"], "track {} の末尾: {labels:?}", t.name);
+    }
+    let gwi = song.tracks.iter().position(|t| t.name == "GWI").expect("GWI track");
+    let p = &sched.track_programs[gwi];
+    assert_eq!(p.pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument);
+    let first_native = p.ops.iter().position(|op| matches!(op, crate::graph::ChainOp::Native { .. })).unwrap();
+    assert!(p.pass1_end <= first_native, "GWI の組み込みは pass 2: pass1_end={} ops={:?}", p.pass1_end, op_labels(p));
+    let master = op_labels(&sched.master_program);
+    assert_eq!(master[..2], ["N(BusComp,b)", "N(ToneEq,b)"], "master の先頭: {master:?}");
+    assert!(master.len() > 2 && master[2].starts_with('P'), "組み込みの後ろに旧 fx chain: {master:?}");
+    assert!(song.master_limiter.on, "fixture の旧 master strip は limiter ON");
+    assert!(sched.master_limiter_latency);
+    assert_eq!(sched.master_latency_samples, common::model::limiter_lookahead_samples(48_000));
+}
+
+/// T14: return R の Comp が latency L の track S を SC に読み、R への send 元 A は latency 0。
+/// R の consumer は pass 2 なので、track の入力遅延ではなく `ProcessGroupFx(R)` の直前の
+/// `ApplyDelay(BusScAlign)` で入力を L 遅らせ、master 合流では A に L の補償が入る。実行すると S と A に
+/// 同じ曲位置のインパルスを入れて、R の検出信号 (Listen で聴く) と R の main が同じサンプルに揃う。
+#[test]
+fn a_return_native_comp_aligns_its_bus_input_to_the_sidechain_with_bus_sc_align() {
+    use common::model::{NativeKind, Send, SendMode, TapPoint};
+    const L: u32 = 100;
+    let mut lat = DeviceLatencies::new();
+    let song = Song {
+        tracks: vec![
+            track(|t| {
+                t.id = 1;
+                t.devices = latency_chain(&mut lat, 10, L);
+            }),
+            track(|t| {
+                t.id = 2;
+                t.sends = vec![Send { id: 1, dest_track_id: 4, gain: 1.0, mode: SendMode::PostFader, enabled: true }];
+            }),
+            track(|t| {
+                t.id = 4;
+                t.devices = vec![native_sc(NativeKind::Comp, 40, 1, TapPoint::PostFader)];
+            }),
+        ],
+        ..Song::default()
+    };
+    let n = 256usize;
+    let render = |listen: bool| {
+        let mut sched = compile_schedule(&song, &lat, 48_000, n as u32).unwrap();
+        let fx = sched.nodes.iter().position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 2, .. })).unwrap();
+        assert!(
+            matches!(sched.nodes[fx - 1], NodeOp::ApplyDelay { buf: BufRef::TrackScratch(2), frames: L, .. }),
+            "ProcessGroupFx(R) の直前に L の BusScAlign: {:?}",
+            sched.nodes
+        );
+        assert!(sched.delay_keys.contains(&DelayKey::BusScAlign { track_id: 4 }));
+        let master = sched.nodes.iter().position(|op| matches!(op, NodeOp::Mix { dst: BufRef::Master, .. })).unwrap();
+        assert!(sched.nodes[..master]
+            .iter()
+            .any(|op| matches!(op, NodeOp::ApplyDelay { buf: BufRef::TrackScratch(1), frames: L, .. })));
+        assert_eq!(sched.input_delay_per_track[2], 0, "pass 2 の consumer は input delay を使わない");
+        // pass 1 の結果を置く: S は自分の latency ぶん遅れて出る、A は遅れない。
+        let mut scratch: Vec<crate::mixer::TrackScratch> = (0..3).map(|_| crate::mixer::TrackScratch::new()).collect();
+        scratch[0].track_l[L as usize] = 1.0;
+        scratch[0].track_r[L as usize] = 1.0;
+        scratch[1].track_l[0] = 1.0;
+        scratch[1].track_r[0] = 1.0;
+        let io = crate::graph::NativeIo { sc_listen: if listen { 40 } else { 0 }, scopes: None };
+        run_post_dispatch(&mut sched, &mut scratch, &song, n, io);
+        let out = &scratch[2].track_l[..n];
+        (0..n).max_by(|&a, &b| out[a].abs().total_cmp(&out[b].abs())).unwrap()
+    };
+    assert_eq!(render(true), L as usize, "R の検出信号 (S) は L に居る");
+    assert_eq!(render(false), L as usize, "R の main (A の send) も L に揃う");
+}
+
+/// T14 (続き): group-with-instrument の prefix (pass 1) に居る consumer は次の buffer で消費するので
+/// `input_delay = L + buffer_frames` (以前は bus 扱いで lag を 0 と数えていた、§18-L)。suffix (pass 2) の
+/// consumer が居なければ `BusScAlign` は積まない。
+#[test]
+fn a_group_with_instrument_prefix_consumer_takes_the_pass_one_lag() {
+    use common::model::{AuxOutputRoute, NativeKind, TapPoint};
+    const L: u32 = 100;
+    const BUF: u32 = 256;
+    let mut lat = DeviceLatencies::new();
+    let drum = Device::Plugin(PluginInstance {
+        id: 7,
+        aux_outputs: vec![None, Some(AuxOutputRoute { dest_track: 3 })],
+        ..PluginInstance::with_ports("test.drum".into(), PluginFormat::Clap, instrument_ports())
+    });
+    let song = Song {
+        tracks: vec![
+            track(|t| {
+                t.id = 1;
+                t.devices = latency_chain(&mut lat, 10, L);
+            }),
+            track(|t| {
+                t.id = 2;
+                t.devices = vec![native_sc(NativeKind::Comp, 40, 1, TapPoint::PostFader), drum];
+            }),
+            track(|t| {
+                t.id = 3;
+                t.parent_group_id = Some(2);
+            }),
+        ],
+        ..Song::default()
+    };
+    let sched = compile_schedule(&song, &lat, 48_000, BUF).unwrap();
+    assert_eq!(sched.track_programs[1].pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument);
+    assert_eq!(sched.input_delay_per_track[1], L + BUF);
+    assert!(!sched.delay_keys.iter().any(|k| matches!(k, DelayKey::BusScAlign { .. })), "{:?}", sched.delay_keys);
+}
+
+/// T15: pre-fader send の無い group でも、PostFx を source にした SC は「今の buffer のチェーン後の信号」を
+/// 読む (group の pre-fader snapshot の条件が leaf と同じになった、§18-C)。
+#[test]
+fn a_post_fx_tap_on_a_group_reads_this_buffers_chain_output() {
+    use common::model::{EqBand, EqParam, NativeDevice, NativeKind, NativeParamId, TapPoint};
+    let mut eq = NativeDevice::new_added(NativeKind::Eq, 11, 1);
+    eq.set_param(NativeParamId::Eq { band: EqBand::Hmf, param: EqParam::Gain }, 9.0);
+    let song = Song {
+        tracks: vec![
+            track(|t| {
+                t.id = 2;
+                t.devices = vec![Device::Native(eq)];
+            }),
+            track(|t| {
+                t.id = 3;
+                t.parent_group_id = Some(2);
+            }),
+            track(|t| {
+                t.id = 1;
+                t.devices = vec![native_sc(NativeKind::Comp, 40, 2, TapPoint::PostFx)];
+            }),
+        ],
+        ..Song::default()
+    };
+    let n = 128usize;
+    let mut sched = compile_schedule_for_test(&song, 48_000, n as u32).unwrap();
+    assert!(sched.track_programs[0].snapshot_post_fx, "PostFx の tap があれば group も snapshot を取る");
+    assert!(!sched.track_programs[1].snapshot_post_fx);
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 0.5).collect();
+    let mut scratch: Vec<crate::mixer::TrackScratch> = (0..3).map(|_| crate::mixer::TrackScratch::new()).collect();
+    scratch[1].track_l[..n].copy_from_slice(&x);
+    scratch[1].track_r[..n].copy_from_slice(&x);
+    run_post_dispatch(&mut sched, &mut scratch, &song, n, crate::graph::NativeIo::default());
+
+    // 期待値 = 同じ EQ を単独で通した音 (新品の状態から)。
+    let alone = sched_free_eq_output(&song, &x);
+    let p = &sched.track_programs[2];
+    let sc = p.natives[0].sc.as_ref().expect("Staged");
+    assert_ne!(alone, x, "EQ が効いている");
+    assert_eq!(&scratch[0].pre_fader_l[..n], &alone[..], "group の PostFx snapshot = この buffer のチェーン出力");
+    assert_eq!(sc.signal(n).0, &alone[..], "leaf の SC は同じ buffer の group のチェーン出力を staging する");
+}
+
+/// `song.tracks[0]` の device 列を単独の program で通した L チャンネル。
+fn sched_free_eq_output(song: &Song, x: &[f32]) -> Vec<f32> {
+    let devices = &song.tracks[0].devices;
+    let mut alone = crate::graph::build_program(devices, 2, None, &DeviceLatencies::new(), &Default::default()).program;
+    let (mut l, mut r) = (x.to_vec(), x.to_vec());
+    let refs: crate::engine::PluginRefs = std::collections::HashMap::new();
+    let rec = std::collections::HashSet::new();
+    let ctx = crate::graph::ProgramCtx {
+        song: Some(song),
+        plugin_refs: &refs,
+        worker_sync: None,
+        sample_rate: 48_000,
+        frames: x.len() as u32,
+        playing: true,
+        current_bpm: 120.0,
+        playhead_beats: 0.0,
+        loop_region: common::model::LoopRegion::default(),
+        recording_lanes: &rec,
+        mod_plane: common::mod_plane::ModTickPlaneRef::default(),
+        rows: crate::launcher::TrackRows::default(),
+        own_pre_fx: None,
+        native: crate::graph::NativeIo::default(),
+        owner_devices: devices,
+        owner_stores: (&[], &[]),
+    };
+    let (mut a, mut b) = (Vec::with_capacity(8), Vec::with_capacity(8));
+    let len = alone.ops.len();
+    crate::graph::run_chain_program(&mut alone, 0..len, &mut l, &mut r, &mut a, &mut b, &ctx);
+    l
 }

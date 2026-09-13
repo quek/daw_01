@@ -29,14 +29,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::audio_bridge::{AudioBridgeHandle, ProjectTelemetry};
+use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
 use common::model::Song;
 use common::protocol::{ProjectKey, SamplerSource};
 use common::timing::{effective_loop_bounds, song_ended};
 
 use crate::audio_clip_renderer::AudioClipRenderer;
-use crate::graph::{DelayLine, Schedule, render_master_buffer};
+use crate::graph::{DelayLine, DeviceScopeTap, NativeIo, Schedule, render_master_buffer};
 use crate::metronome::{ClickVoice, render_metronome};
 use crate::mixer::TrackScratch;
+use crate::native_dsp::MasterLimiterState;
 use crate::sampler::{SamplerRig, SamplerRt};
 use crate::sequencer::NoteTransition;
 
@@ -334,6 +336,10 @@ pub struct ProjectRt {
     /// (`ModTickRunner::build_follower_env_map`)。刻みごとの線形探索を避けるため
     /// plan / schedule の差し替え時に 1 度だけ作る。
     pub follower_env_of_slot: Vec<u16>,
+    /// r.md #129: master のフェーダー後 Limiter の状態 (先読みリングは `new` で 1 回だけ確保)。
+    /// live 用の 1 個 — 書き出しは `export` が毎回新品を作る。同じタブで別ファイルを開いたら
+    /// `refresh_bundle` が reset する (§18-M)。
+    pub master_limiter: MasterLimiterState,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -355,8 +361,17 @@ pub struct DeviceCtx<'a> {
     pub sampler_rt: &'a mut SamplerRt,
     /// この project が scope (マスターメーター) の対象のときだけ `Some`。
     pub scope: Option<&'a common::scope_bridge::ScopeBridgeHandle>,
+    /// r.md #129: device scope (EQ Par のスペクトラム) の書き先。scope の対象の project だけ `Some`。
+    pub device_scope: Option<DeviceScopeCtx<'a>>,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
+}
+
+/// r.md #129 §11.2: device scope の書き先と、slot の見出し表 (`DeviceRt` が持つ)。見出しの書き手は
+/// scope project の render だけなので、`(project, device id)` が表と違う slot だけを書き換える。
+pub struct DeviceScopeCtx<'a> {
+    pub bridge: &'a DeviceScopeBridgeHandle,
+    pub headers: &'a mut [(ProjectKey, u64); MAX_DEVICE_SCOPES],
 }
 
 impl ProjectRt {
@@ -397,6 +412,7 @@ impl ProjectRt {
             mod_tick: crate::mod_tick::ModTickRunner::new(),
             follower_cols: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             follower_env_of_slot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
+            master_limiter: MasterLimiterState::new(),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -457,8 +473,8 @@ impl ProjectRt {
             .and_then(|t| self.mod_tick.set_table(Some(t)));
 
         // per-track scratch の成長便。**song と同じ便で届く**ので、この install の
-        // 直後に走る render は必ず足りた状態で始まる。走行状態 (PDC リング / strip の
-        // フィルタ / 鳴っているノート) を保つため、既存の行は要素ごと swap で移す
+        // 直後に走る render は必ず足りた状態で始まる。走行状態 (入力遅延のリング / stretch
+        // engine / 鳴っているノート) を保つため、既存の行は要素ごと swap で移す
         // (move だけ = RT で確保も解放もしない)。押し出した古い Vec は bundle に
         // 載せ替えて recycle ring へ (drop は off-thread)。
         if let Some(mut fresh) = new.scratch_growth.take() {
@@ -504,6 +520,9 @@ impl ProjectRt {
                     // (添字は track 内 schedule 順 = 位置キー)。
                     s.repitch_accum.fill((u64::MAX, 0.0));
                 }
+                // r.md #129 §18-M: master Limiter の先読みリングも前 project の音を持っている
+                // (schedule の外で生き続ける)。192kHz 換算のリングを 0 で埋めるだけで確保しない。
+                self.master_limiter.reset();
             } else {
                 // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
                 sched.adopt_state_from(&mut self.cached_schedule);
@@ -571,13 +590,29 @@ impl ProjectRt {
         }
     }
 
-    /// track ごとの表示用テレメトリ (peak / GR / 鳴っているボイス) を `AudioBridge` へ publish
-    /// する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store のみ (RT 安全)。
+    /// 表示用のメーター面 (track peak / 鳴っているボイス / 内蔵 device の GR / master Limiter の GR) を
+    /// `AudioBridge` へ publish する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store
+    /// のみ (RT 安全)。
     ///
     /// ボイス (r.md #117、 変調ラックの per-voice カーソル用) は chain の **最初の** plugin の
     /// ボイス表 = この track の MIDI 入力 (Selector で別 chain に居ても同じ MIDI を受ける)。
     /// plugin が無ければ空。
-    fn publish_track_telemetry(&self, slot: &ProjectTelemetry, n_tracks: usize) {
+    ///
+    /// GR (r.md #129 §11.1) は **この buffer で処理した program** (`track_programs[..n_tracks]` と master)
+    /// の `meter` 付き内蔵 device だけから出す = 処理していない program の GR が前の値のまま残らない。
+    /// slot の並びは compile 順で、読み手は device id で引く (不変条件 1)。
+    fn publish_meters(&self, slot: &ProjectTelemetry, n_tracks: usize) {
+        let programs = &self.cached_schedule;
+        let gr = programs
+            .track_programs
+            .iter()
+            .take(n_tracks)
+            .chain(std::iter::once(&programs.master_program))
+            .flat_map(|p| p.natives.iter())
+            .filter(|ns| ns.meter)
+            .map(|ns| (ns.device_id, ns.gr_db));
+        slot.publish_native_meters(gr);
+        slot.set_master_limiter_gr_db(self.master_limiter.gain_reduction_db());
         for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
             slot.set_track_peak(i, tr.peak_l, tr.peak_r);
             let voices = self
@@ -981,8 +1016,18 @@ impl ProjectRt {
                 n,
             );
 
+            // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope)。scope の対象の
+            // project だけが見出しを同期して scope へ書く。
+            let watch_g = ctx.device_scope.is_some().then(|| self.shared.device_scope_watch.load());
+            let native_io = native_io_for_buffer(
+                self.key,
+                self.shared.sc_listen_device.load(Ordering::Acquire),
+                ctx.device_scope,
+                watch_g.as_deref().map(|w| &**w),
+            );
+
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
-            // master fx → master gain。
+            // master fx → master gain → master limiter。
             let master_gain = f32::from_bits(self.shared.master_gain.load(Ordering::Relaxed));
             render_master_buffer(
                 song,
@@ -1004,6 +1049,8 @@ impl ProjectRt {
                 self.mod_tick.follower_drive(&self.follower_cols, playhead),
                 self.launcher.rows(),
                 master_gain,
+                &mut self.master_limiter,
+                native_io,
             );
 
             // 走行状態の GUI への publish は **transport を進めた後** (この関数の末尾)。
@@ -1071,10 +1118,10 @@ impl ProjectRt {
                 );
             }
 
-            // Publish per-track peak meters into the shared AudioBridge
-            // so the GUI mixer strips animate. Atomic stores, RT-safe.
+            // Publish per-track peak meters / native GR / limiter GR into the shared
+            // AudioBridge so the GUI mixer strips animate. Atomic stores, RT-safe.
             // Tracks with effective_mute already have peak_l/r == 0.
-            self.publish_track_telemetry(slot, n_tracks);
+            self.publish_meters(slot, n_tracks);
 
             // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。
             // 刻みが解いた buffer 頭の値をそのまま出す (GUI は 30Hz なので
@@ -1217,6 +1264,30 @@ impl ProjectRt {
     }
 }
 
+/// r.md #129: この buffer の [`NativeIo`] を組む。`device_scope` と `watch` が揃う (= scope project の
+/// live 描画) ときだけ scope を持ち、見出し表と違う slot の見出しを `(key, device id)` に書き換える
+/// (見出しの書き手は scope project の render だけ)。確保・ロックなし (atomic store のみ)。
+fn native_io_for_buffer<'a>(
+    key: ProjectKey,
+    sc_listen: u64,
+    device_scope: Option<DeviceScopeCtx<'a>>,
+    watch: Option<&'a [u64; MAX_DEVICE_SCOPES]>,
+) -> NativeIo<'a> {
+    let scopes = match (device_scope, watch) {
+        (Some(ds), Some(watch)) => {
+            for (k, (header, &id)) in ds.headers.iter_mut().zip(watch.iter()).enumerate() {
+                if *header != (key, id) {
+                    ds.bridge.set_slot(k, key, id);
+                    *header = (key, id);
+                }
+            }
+            Some(DeviceScopeTap { bridge: ds.bridge, watch })
+        }
+        _ => None,
+    };
+    NativeIo { sc_listen, scopes }
+}
+
 /// CPAL クロージャ専有の状態 (`docs/plan_project_tabs.md` §3.1)。開いている
 /// [`ProjectRt`] の列とデバイス最終ミックス。project の追加 / 撤去は
 /// [`ProjectDelivery`] で off-thread から届く (RT で確保しない)。
@@ -1252,6 +1323,9 @@ pub struct DeviceRt {
     pub sampler_rt: SamplerRt,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
+    /// r.md #129 §11.2: device scope の slot ごとに、最後に書いた見出し `(project, device id)`。
+    /// 表と違う slot だけ見出しを書き換える (毎 buffer 16 slot の atomic を読み書きしない)。
+    pub scope_headers: [(ProjectKey, u64); MAX_DEVICE_SCOPES],
 }
 
 impl DeviceRt {
@@ -1278,6 +1352,7 @@ impl DeviceRt {
             sampler: None,
             sampler_rt: SamplerRt::new(),
             frames_rendered: 0,
+            scope_headers: [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES],
         }
     }
 
@@ -1409,6 +1484,7 @@ impl DeviceRt {
         shared: &SharedState,
         bridge: &AudioBridgeHandle,
         scope: &common::scope_bridge::ScopeBridgeHandle,
+        device_scope: &DeviceScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
     ) {
@@ -1482,6 +1558,8 @@ impl DeviceRt {
                 sampler: if is_sampler { self.sampler.as_deref() } else { None },
                 sampler_rt: &mut self.sampler_rt,
                 scope: is_scope.then_some(scope),
+                device_scope: is_scope
+                    .then_some(DeviceScopeCtx { bridge: device_scope, headers: &mut self.scope_headers }),
                 frames_rendered,
             };
             let slot = bridge.project(p.telemetry_slot);
@@ -1952,6 +2030,138 @@ mod bundle_install_tests {
             local.refresh_bundle();
         });
     }
+
+    /// 組み込み Comp / EQ を持つ 2 track + 組み込み Bus Comp / Tone EQ の master。track 1 には追加の Comp も。
+    fn native_song(added_comps: u64) -> Arc<Song> {
+        use common::model::{Device, NativeDevice, NativeKind};
+        let mut s = Song::default();
+        let mut t1 = track(1);
+        t1.devices = (0..added_comps)
+            .map(|k| Device::Native(NativeDevice::new_added(NativeKind::Comp, 1000 + k, 2)))
+            .chain([
+                Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 11)),
+                Device::Native(NativeDevice::new_builtin(NativeKind::Eq, 12)),
+            ])
+            .collect();
+        let mut t2 = track(2);
+        t2.devices = vec![Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 21))];
+        s.tracks = vec![t1, t2];
+        s.master_fx_chain = vec![
+            Device::Native(NativeDevice::new_builtin(NativeKind::BusComp, 31)),
+            Device::Native(NativeDevice::new_builtin(NativeKind::ToneEq, 32)),
+        ];
+        Arc::new(s)
+    }
+
+    fn telemetry(tag: &str) -> (AudioBridgeHandle, usize) {
+        let bridge = AudioBridgeHandle::create(&format!("daw01_test_native_gr_{tag}_{}", std::process::id())).unwrap();
+        let slot = bridge.claim_project_slot(ProjectKey(1)).unwrap();
+        (bridge, slot)
+    }
+
+    /// r.md #129 §11.1: GR 面は「この buffer で処理した program」の `meter` 付き device だけから出る
+    /// (EQ 系は出ない / 処理していない track の GR は残らない)。枠は組み込みを優先して割り当てる。
+    #[test]
+    fn native_gr_is_published_by_id_from_processed_programs_only() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        bundle_tx.push(make_bundle(&native_song(1))).unwrap();
+        local.refresh_bundle();
+        let sched = &mut local.cached_schedule;
+        for p in sched.track_programs.iter_mut().chain(std::iter::once(&mut sched.master_program)) {
+            for ns in &mut p.natives {
+                ns.gr_db = -(ns.device_id as f32);
+            }
+        }
+        let (bridge, slot) = telemetry("processed");
+        let t = bridge.project(slot);
+        let mut out = Vec::new();
+        local.publish_meters(t, 2);
+        assert!(t.read_native_meters(&mut out));
+        out.sort_by_key(|(id, _)| *id);
+        assert_eq!(out, vec![(11, -11.0), (21, -21.0), (31, -31.0), (1000, -1000.0)]);
+        local.publish_meters(t, 1);
+        assert!(t.read_native_meters(&mut out));
+        assert!(!out.iter().any(|(id, _)| *id == 21), "処理していない track 2 の GR は残らない: {out:?}");
+
+        // 枠 (MAX_NATIVE_METERS) を超える追加分があっても、組み込みは必ず出る。
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        let many = common::audio_bridge::MAX_NATIVE_METERS as u64 + 8;
+        bundle_tx.push(make_bundle(&native_song(many))).unwrap();
+        local.refresh_bundle();
+        local.publish_meters(t, 2);
+        assert!(t.read_native_meters(&mut out));
+        assert_eq!(out.len(), common::audio_bridge::MAX_NATIVE_METERS);
+        for id in [11, 21, 31] {
+            assert!(out.iter().any(|(i, _)| *i == id), "組み込み {id} が枠から漏れた");
+        }
+    }
+
+    /// r.md #129 §11.2: scope project の buffer は見出し表と違う slot だけ見出しを書き換え、読み手は
+    /// `(project, device id)` を見る。見出しが同じなら書き換えない (世代が進まない)。
+    #[test]
+    fn device_scope_headers_follow_the_watch_table() {
+        let scope =
+            DeviceScopeBridgeHandle::create(&format!("daw01_test_native_scope_{}", std::process::id())).unwrap();
+        let mut headers = [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES];
+        let mut watch = [0u64; MAX_DEVICE_SCOPES];
+        watch[2] = 77;
+        let io = native_io_for_buffer(
+            ProjectKey(5),
+            9,
+            Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
+            Some(&watch),
+        );
+        assert_eq!(io.sc_listen, 9);
+        assert!(io.scopes.is_some());
+        assert_eq!(headers[2], (ProjectKey(5), 77));
+        assert_eq!(headers[0], (ProjectKey(5), 0));
+        let mut reader = common::device_scope_bridge::DeviceScopeReader::default();
+        let mut frames = Vec::new();
+        assert_eq!(reader.read(&scope, 2, &mut frames).map(|(p, d, _)| (p, d)), Some((ProjectKey(5), 77)));
+        scope.write_block(2, &[0.25; 4], &[0.25; 4]);
+        assert_eq!(reader.read(&scope, 2, &mut frames).map(|(_, _, o)| o.frames), Some(4));
+        // 同じ watch でもう一度 → 見出しは変わらないので読み手のカーソルも続く。
+        native_io_for_buffer(
+            ProjectKey(5),
+            0,
+            Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
+            Some(&watch),
+        );
+        scope.write_block(2, &[0.5; 3], &[0.5; 3]);
+        assert_eq!(reader.read(&scope, 2, &mut frames).map(|(_, _, o)| o.frames), Some(3));
+        // scope project でなければ scope を持たない。
+        assert!(native_io_for_buffer(ProjectKey(5), 0, None, None).scopes.is_none());
+    }
+
+    /// T12: GR 面の publish と device scope の見出し同期は RT で確保しない。
+    #[cfg(feature = "rt-assert")]
+    #[test]
+    fn native_meter_publish_and_scope_header_sync_do_not_allocate() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        bundle_tx.push(make_bundle(&native_song(3))).unwrap();
+        local.refresh_bundle();
+        let (bridge, slot) = telemetry("rt");
+        let t = bridge.project(slot);
+        let scope = DeviceScopeBridgeHandle::create(&format!("daw01_test_native_rt_scope_{}", std::process::id())).unwrap();
+        let mut headers = [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES];
+        let (mut a, mut b) = ([0u64; MAX_DEVICE_SCOPES], [0u64; MAX_DEVICE_SCOPES]);
+        a[0] = 12;
+        b[0] = 32;
+        b[5] = 12;
+        assert_no_alloc::assert_no_alloc(|| {
+            for i in 0..8 {
+                local.publish_meters(t, 2);
+                let watch = if i % 2 == 0 { &a } else { &b };
+                let io = native_io_for_buffer(
+                    ProjectKey(1),
+                    11,
+                    Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
+                    Some(watch),
+                );
+                assert!(io.scopes.is_some());
+            }
+        });
+    }
 }
 
 /// `docs/plan_project_tabs.md` §3.5: 複数 project の transport 独立性とミックス、
@@ -1976,6 +2186,7 @@ mod multi_project_tests {
         _device_recycle_rx: rtrb::Consumer<DeviceBundle>,
         bridge: AudioBridgeHandle,
         scope: common::scope_bridge::ScopeBridgeHandle,
+        device_scope: DeviceScopeBridgeHandle,
         shared: Arc<SharedState>,
         engine: Arc<EngineShared>,
     }
@@ -2002,6 +2213,7 @@ mod multi_project_tests {
             "daw01_test_mp_scope_{tag}_{pid}"
         ))
         .unwrap();
+        let device_scope = DeviceScopeBridgeHandle::create(&format!("daw01_test_mp_dscope_{tag}_{pid}")).unwrap();
         Rig {
             dev,
             project_tx,
@@ -2010,6 +2222,7 @@ mod multi_project_tests {
             _device_recycle_rx: device_recycle_rx,
             bridge,
             scope,
+            device_scope,
             shared: Arc::new(SharedState::new()),
             engine,
         }
@@ -2068,7 +2281,7 @@ mod multi_project_tests {
 
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
-            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, 48_000, 256);
+            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, 256);
         }
     }
 
