@@ -372,6 +372,7 @@ impl ProjectCtl {
                     &self.shared.device_latencies.load(),
                     sample_rate,
                     buffer_frames,
+                    common::protocol::RenderScope::Mix,
                 ) {
                     Ok(sc) => sc,
                     Err(e) => {

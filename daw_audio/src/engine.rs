@@ -1754,7 +1754,9 @@ mod bundle_install_tests {
         RtBundle {
             song: Some(Arc::clone(song)),
             tempo_map: common::tempo_map::TempoMap::from_song(song),
-            schedule: Some(compile_schedule(song, &test_latencies(), 48_000, 0).unwrap()),
+            schedule: Some(
+                compile_schedule(song, &test_latencies(), 48_000, 0, common::protocol::RenderScope::Mix).unwrap(),
+            ),
             reset_song_scoped_state: reset,
             input_delay_replacements: Vec::new(),
             // 本番 (`project_ctl::publish_bundle`) と同じで、song と同じ便で
@@ -2381,7 +2383,8 @@ mod multi_project_tests {
             song: Some(Arc::clone(song)),
             tempo_map: common::tempo_map::TempoMap::from_song(song),
             schedule: Some(
-                crate::graph::compile_schedule(song, &HashMap::new(), 48_000, 256).unwrap(),
+                crate::graph::compile_schedule(song, &HashMap::new(), 48_000, 256, common::protocol::RenderScope::Mix)
+                    .unwrap(),
             ),
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),

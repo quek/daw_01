@@ -213,6 +213,17 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
     }
 }
 
+/// フェーダーを掛けない strip (`ChainProgram::fader == false` = `RenderScope::Sources`): 音はそのまま残し、
+/// peak だけを測る。volume / pan / mute / solo はフェーダーの段なので掛けない。
+///
+/// RT-safe: in-place 読み取りのみ、確保・ロックなし。
+pub fn pass_strip(scratch: &mut TrackScratch, n: usize) {
+    let n = n.min(scratch.track_l.len()).min(scratch.track_r.len());
+    scratch.effective_mute = false;
+    scratch.peak_l = scratch.track_l[..n].iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+    scratch.peak_r = scratch.track_r[..n].iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+}
+
 /// 鳴っている全 note を「次の drain (= 各 track の process 冒頭、frame 0)」で出す
 /// NoteOff として予約し、追跡集合を空にする。
 ///

@@ -127,7 +127,9 @@ fn render(s: &Scenario) -> Vec<WindowStats> {
     let latency_active = song.master_limiter_latency_active();
     song.master_fx_chain = Vec::new();
     let track_id = if master { MASTER_TRACK_ID } else { 1 };
-    let mut program = build_program(&devices, track_id, None, &DeviceLatencies::new(), &HashSet::new()).program;
+    let mut program =
+        build_program(&devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix)
+            .program;
     let mut limiter_state = MasterLimiterState::new();
     let refs: PluginRefs = HashMap::new();
     let recording = HashSet::new();

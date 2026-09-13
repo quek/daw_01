@@ -361,9 +361,9 @@ impl AppData {
         if end_beat <= start_beat {
             return false;
         }
-        // pre_fx = true: insert FX / フェーダー / pan を外した「素材の素の音」だけを焼く
-        // (`docs/plan_glue_bake.md` §3)。
-        let Some(isolated) = self.isolated_track_song(track_id, true) else {
+        // 素材の音だけを焼く (`RenderScope::Sources`、`docs/plan_glue_bake.md` §3): 焼いた音は元のトラックへ
+        // 戻り、再生時にトラックの fx / フェーダーと master をもう一度通る。
+        let Some(isolated) = self.isolated_track_song(track_id) else {
             return false;
         };
         if let Some(p) = self.cur.pipc.pending_glue_bake.as_mut() {
@@ -385,6 +385,7 @@ impl AppData {
             end_beat,
             // 素材だけの render なので曲頭から積み上げる意味が無い (= 範囲頭から cold)。
             warm: false,
+            scope: common::protocol::RenderScope::Sources,
         });
         true
     }

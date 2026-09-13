@@ -134,6 +134,7 @@ pub fn export_wav(
                 sample_rate,
                 common::process_data::MAX_FRAMES,
                 span,
+                common::protocol::RenderScope::Mix,
                 write_mod_sidecar,
                 on_progress,
             );
@@ -265,6 +266,7 @@ pub fn bounce_clip_fx(
     start_beat: f64,
     end_beat: f64,
     warm: bool,
+    scope: common::protocol::RenderScope,
 ) {
     let key: ProjectKey = project.key;
     let failed = |path: std::path::PathBuf, error: String| AudioEvent::BounceClipFxComplete {
@@ -312,6 +314,7 @@ pub fn bounce_clip_fx(
                 sample_rate,
                 common::process_data::MAX_FRAMES,
                 span,
+                scope,
                 false,
                 // Clip-range bounce has no progress overlay (it
                 // completes quickly and replaces the clip in place).

@@ -766,6 +766,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                 start_beat,
                 end_beat,
                 warm,
+                scope,
             } => {
                 let Some(ctl) = projects.get(&project) else {
                     tracing::warn!(project = project.0, "BounceClipFxOnline for an unknown project; ignored");
@@ -782,6 +783,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     start_beat,
                     end_beat,
                     warm,
+                    scope,
                 );
             }
             // それ以外は全部 project 宛 (`AudioCommand::project` が SSoT)。閉じた

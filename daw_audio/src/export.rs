@@ -33,6 +33,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use common::loudness_report::{LoudnessCollector, LoudnessReport};
 use common::model::Song;
+use common::protocol::RenderScope;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
 use crate::engine::{EngineShared, MAX_TRACKS, ProjectShared};
@@ -166,6 +167,9 @@ pub struct LoudnessOutcome {
 /// (via `AudioCommand::CancelExport`), the loop breaks, the partial WAV is
 /// deleted, and the function returns `Ok(ExportOutcome { cancelled: true, .. })`
 /// (a cancel is not an error).
+///
+/// `scope` = どの処理段を通すか (WAV 書き出しは `RenderScope::Mix`、クリップ bounce は
+/// `TrackOutput` / `Sources`)。走査 / 描く関数は scope に依らず同じで、compile する program の形だけが変わる。
 #[allow(clippy::too_many_arguments)]
 pub fn run_export(
     path: PathBuf,
@@ -175,6 +179,7 @@ pub fn run_export(
     sample_rate: u32,
     max_frames: usize,
     span: RenderSpan,
+    scope: RenderScope,
     write_video_sidecars: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
@@ -221,6 +226,7 @@ pub fn run_export(
             &engine_shared,
             &project,
             &song,
+            scope,
             sample_rate,
             max_frames,
             total_samples,
@@ -412,6 +418,8 @@ pub fn run_loudness_analysis(
         &engine_shared,
         &project,
         &song,
+        // 解析するのは書き出す音と同じ「曲そのまま」。
+        RenderScope::Mix,
         sample_rate,
         max_frames,
         win.total_samples,
@@ -477,6 +485,7 @@ fn render_loop(
     engine_shared: &EngineShared,
     project: &ProjectShared,
     song: &Song,
+    scope: RenderScope,
     sample_rate: u32,
     max_frames: usize,
     total_samples: u64,
@@ -574,6 +583,7 @@ fn render_loop(
         &project.device_latencies.load(),
         sample_rate,
         max_frames as u32,
+        scope,
     )
     .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
@@ -936,6 +946,7 @@ mod tests {
                 &engine,
                 &project,
                 &song,
+                RenderScope::Mix,
                 48_000,
                 common::process_data::MAX_FRAMES,
                 win.total_samples,

@@ -42,10 +42,9 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
 /// トラック / バスの **pan 則 (equal-power)** — `pan` (`-1.0`..=`1.0`) に対する
 /// `(左ゲイン, 右ゲイン)`。中央 (`0.0`) は両チャンネル `cos(π/4) ≈ 0.707` (= -3dB)。
 ///
-/// **これが pan 則の SSoT**。掛ける側 (`daw_audio::mixer::apply_strip`) と、
-/// **打ち消したい側** (pre-FX の焼き込み = `AppData::isolated_track_song`。 strip を
-/// 通った音を焼くと、再生時にもう一度掛かって二重になる) が同じ式を見る必要がある
-/// — 式を 2 か所に書くと、pan 則を変えた日に焼き込みだけ静かに 3dB ずれる。
+/// **これが pan 則の SSoT** (掛けるのは `daw_audio::mixer::apply_strip` だけ)。pre-FX の焼き込みは
+/// フェーダーの段そのものを通さない (`RenderScope::Sources`、`daw_audio::mixer::pass_strip`) ので、
+/// この式を打ち消す側は無い。
 ///
 /// RT path (per-sample) から呼ばれるので確保・分岐なし。
 #[inline]

@@ -279,8 +279,8 @@ function expectSameLoudness(before, after, label, hint) {
 }
 
 // ---- 7. master の組み込み Bus Comp と Limiter が ON でも音が変わらないこと (r.md #92) ----
-// 焼き込みはトラック単独の isolate render だが、master の Bus Comp / フェーダー後 Limiter を
-// 外し忘れると GR が WAV に焼き込まれ、再生時にもう一度マスターを通って二重に掛かる
+// 焼き込みはトラック単独の render で、master の段は render の scope (`RenderScope::Sources`) が通さない。
+// 通してしまうと GR が WAV に焼き込まれ、再生時にもう一度マスターを通って二重に掛かる
 // (実機: comp + limiter ON の曲で Glue した Kick が -4.5 dB)。強めの設定で差を露出させる。
 // r.md #129: master の Bus Comp は `master_fx_chain` の組み込み device、Limiter は `master_limiter`。
 const withMaster = JSON.parse(JSON.stringify(song));
@@ -301,7 +301,7 @@ const masterBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
 if (masterBefore.integrated_lufs === null) fail("master の Bus Comp / Limiter ON の song が無音");
 
 s = glueTrack1AndWait("master の Bus Comp / Limiter ON");
-// device は song 側に残っている (焼き込みが外すのは render 用の使い捨て Song だけ)。
+// device は song 側に残っている (焼き込みは Song から処理を消さず、描く段を scope で選ぶ)。
 expectEq(builtinNative(s.master_fx_chain, "BusComp").bypassed === true, false, "master Bus Comp kept ON");
 expectEq(s.master_limiter.on, true, "master limiter kept");
 expectSameLoudness(
@@ -312,7 +312,7 @@ expectSameLoudness(
 );
 
 // ---- 8. トラックの組み込み Comp が ON でも音が変わらないこと (r.md #129 §10.15) ----
-// Glue は pre-FX の焼き込み (素材の素の音)。トラックの組み込み Comp を render 用の Song から外し忘れると、
+// Glue は pre-FX の焼き込み (素材の素の音)。render の scope がトラックの内蔵 device を通してしまうと、
 // 圧縮済みの音が焼かれ、再生時にもう一度 Comp を通って二重に掛かる。
 const withComp = JSON.parse(JSON.stringify(song));
 withComp.tracks[0].devices = [
@@ -330,4 +330,25 @@ expectSameLoudness(
   JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000)),
   "トラックの組み込み Comp ON",
   "焼き込みがトラックの組み込み Comp を通している (二重適用) を疑う",
+);
+
+// ---- 9. トラックに Parallel があっても音が変わらないこと (設計書 §18.2-2) ----
+// Parallel は再生時にも入ってくる音を chain に配って足す。空 chain 2 本の Parallel は入力を 2 回足す (+6 dB) ので、
+// 焼き込みがこれを通すと +6 dB 焼かれ、再生時にもう一度 +6 dB 掛かる。chain の pan / 出力 trim も同じ。
+const withParallel = JSON.parse(JSON.stringify(song));
+withParallel.tracks[0].devices = [
+  { Parallel: { out_gain: 0.8, chains: [{ name: "A" }, { name: "B", pan: -0.5 }] } },
+];
+daw.appLoadSongJson(JSON.stringify(withParallel));
+daw.sleepMs(300);
+const parallelBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000));
+if (parallelBefore.integrated_lufs === null) fail("Parallel 付きトラックの song が無音");
+
+s = glueTrack1AndWait("Parallel 付きトラック");
+expectEq((s.tracks[0].devices || []).filter((d) => d.Parallel).length, 1, "Parallel kept");
+expectSameLoudness(
+  parallelBefore,
+  JSON.parse(daw.analyzeLoudnessJson(0.0, 4.0, 60000)),
+  "Parallel 付きトラック",
+  "焼き込みが Parallel の分配 / 混ぜ (chain の和・pan・出力 trim) を通している (二重適用) を疑う",
 );

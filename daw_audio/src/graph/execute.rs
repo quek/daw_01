@@ -35,7 +35,7 @@ use crate::graph::{BufRef, ChainProgram, NodeOp, ProgramCtx, Schedule, run_chain
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
 use crate::mod_tick::FollowerDrive;
-use crate::mixer::{TrackScratch, apply_strip};
+use crate::mixer::{TrackScratch, apply_strip, pass_strip};
 use crate::native_dsp::MasterLimiterState;
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
 
@@ -393,6 +393,11 @@ pub fn process_track_owned(
     }
 
     // ---- Mixer strip + peak meter ----
+    // 素材の音だけを描く program (`RenderScope::Sources`) はフェーダーの段を通さない。
+    if !program.fader {
+        pass_strip(scratch, n);
+        return;
+    }
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Folder solo: グループを solo したらその子も鳴る (Ableton / Reaper 準拠)。
@@ -533,6 +538,7 @@ pub fn execute_schedule_post_dispatch(
         mod_kinds: _,
         master_latency_samples: _,
         master_limiter_latency: _,
+        master_stage: _,
         track_programs,
         master_program,
         master_midi_a: _,
@@ -876,6 +882,11 @@ fn run_group_fx_chain(
         scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
 
+    // 素材の音だけを描く program (`RenderScope::Sources`) はフェーダーの段を通さない (leaf と同じ)。
+    if !program.fader {
+        pass_strip(scratch, n);
+        return;
+    }
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Live 互換: 子 / send 元のいずれかが solo されていれば、 この bus 自身は
@@ -1093,6 +1104,12 @@ pub fn render_master_buffer(
         rows,
         native_io,
     );
+
+    // bounce (`RenderScope::TrackOutput` / `Sources`) は master の段を通さない = 合流をそのまま出力する
+    // (compile 時に焼いた値。master の fx chain の op も Limiter の遅延も焼いていない)。
+    if !schedule.master_stage {
+        return;
+    }
 
     // ---- master fx chain ----
     // 全 track mix 後に直列 process。 live/export 両経路で通るので、 master に
