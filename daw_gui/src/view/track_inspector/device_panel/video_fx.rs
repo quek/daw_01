@@ -1,33 +1,26 @@
-//! 内蔵映像 FX のパラメータ調整パネル (チェーン行の "GUI" ボタンで開閉)。
+//! 内蔵映像 FX のパラメータ調整パネル (チェーン行の "Par" ボタンで開閉)。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::PanelCtx;
 use crate::event_device::DeviceEvent;
 
-pub(super) fn draw_video_fx_params(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-    open_device: u64,
-) -> f32 {
+pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
-    // 内蔵映像 FX のパラメータ調整パネル（チェーン行の "GUI" ボタンで開閉）。
+    let mut y = ctx.y;
+    // 内蔵映像 FX のパラメータ調整パネル（チェーン行の "Par" ボタンで開閉）。
     // 各 param を scrubable_number で実レンジ表示 + per-control 変調（Ranged domain で kick→効果）。
     // 値の SSoT は PluginParam lane の default_value（`SetVideoFxParam` が格納）。
-    if let Some(view) = app.inspector_video_fx_params(open_device) {
-        ui.label_at("inspector_vfx_label", view.def.name, area.x + pad, y, 12.0, p.text);
+    if let Some(view) = app.inspector_video_fx_params(ctx.device_id) {
+        let device_id = view.device_id;
+        ui.label_at(("inspector_vfx_label", device_id), view.def.name, ctx.x, y, 12.0, p.text);
         y += 18.0;
-        let row_w = area.w - pad * 2.0;
+        let row_w = ctx.w;
         let input_h = 22.0;
         let label_w = 88.0;
-        let input_x = area.x + pad + label_w;
+        let input_x = ctx.x + label_w;
         let input_w = (row_w - label_w).max(40.0);
         let track_id = view.track_id;
-        let device_id = view.device_id;
         for (i, param) in view.def.params.iter().enumerate() {
             let value = f64::from(view.values[i]);
             let (min, max) = param.kind.range();
@@ -36,10 +29,10 @@ pub(super) fn draw_video_fx_params(
             #[allow(clippy::cast_possible_truncation)]
             let sens = (((max - min) / 220.0).max(0.0001)) as f32;
             ui.label_at_clipped(
-                (i, "vfx_label"),
+                (device_id, i, "vfx_label"),
                 param.name,
                 Rect {
-                    x: area.x + pad,
+                    x: ctx.x,
                     y: y + 5.0,
                     w: (label_w - 4.0).max(1.0),
                     h: 11.0 * 1.2,
@@ -62,7 +55,7 @@ pub(super) fn draw_video_fx_params(
             let modulation = Some(mod_build.modulation());
             let param_id = param.id;
             let resp = ui.scrubable_number_at(
-                (i, "vfx_scrub"),
+                (device_id, i, "vfx_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
                 value,
                 default_real,

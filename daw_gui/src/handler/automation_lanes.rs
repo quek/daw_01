@@ -611,7 +611,7 @@ impl AppData {
     /// Par を開いた `device_id` が cursor track に居て、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
     /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
-    /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
+    /// Talk / Text Event) が自分の gate (Par を開いた device の種類) で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
     pub fn inspector_plugin_params(&self, device_id: u64) -> Option<PluginParamsInspector> {
         let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
@@ -682,31 +682,6 @@ impl AppData {
             plugin_name,
             params,
         })
-    }
-
-    /// 「Par」パネルが開いている `device_id` の plugin_id (cursor track 上)。
-    /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
-    pub(crate) fn open_param_panel_plugin_id(&self, device_id: u64) -> Option<&str> {
-        if !self.rack_panel_open(common::model::RackPanelKey::Device(device_id)) {
-            return None;
-        }
-        let (track_id, _) = find_device_by_id(self.cur.song_doc.song(), device_id)?;
-        if self.cursor_track_id() != Some(track_id) {
-            return None;
-        }
-        self.cur.song_doc.song().plugin_by_id(device_id).map(|d| d.plugin_id.as_str())
-    }
-
-    /// VOICEVOX builtin `device_id` の「Par」パネルが開いているか (= Clip Voice /
-    /// Talk セクションを Par パネルとして描画する gate)。
-    pub fn voicevox_param_panel_open(&self, device_id: u64) -> bool {
-        self.open_param_panel_plugin_id(device_id) == Some(common::plugin_db::BUILTIN_ID_VOICEVOX)
-    }
-
-    /// 字幕 builtin `device_id` の「Par」パネルが開いているか (= Text Event
-    /// セクションを Par パネルとして描画する gate)。
-    pub fn subtitle_param_panel_open(&self, device_id: u64) -> bool {
-        self.open_param_panel_plugin_id(device_id) == Some(common::plugin_db::SUBTITLE_ID)
     }
 
     /// 汎用 plugin param を 1 つ編集 (「⚙」パネルの scrubable から)。 値の

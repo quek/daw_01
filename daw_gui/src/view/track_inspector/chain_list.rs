@@ -150,8 +150,6 @@ pub(super) fn draw_chain_list(
         sc_open,
         sc_ports: &sc_ports,
         sc_panel_h,
-        area,
-        pad,
         keys_style: toggle_audio_style(&app.theme),
         scope: &scope,
         owner: cursor_tid.and_then(|tid| ParamOwner::resolve(song, tid)),
@@ -424,8 +422,6 @@ pub(super) struct RowCtx<'a> {
     pub(super) sc_open: Option<u64>,
     pub(super) sc_ports: &'a [crate::app_types::SidechainPort],
     pub(super) sc_panel_h: f32,
-    pub(super) area: Rect,
-    pub(super) pad: f32,
     pub(super) keys_style: ToggleButtonStyle,
     /// フレームで 1 回だけ組む live 値の文脈 (内蔵の小表示 / Par のつまみ)。
     pub(super) scope: &'a LiveParamScope,

@@ -410,14 +410,16 @@ pub enum InspectorScrubField {
     ImageRotation,
     ImageFadeIn,
     ImageFadeOut,
-    Text(TextNumField),
+    /// 字幕 device の Par の Text Event 数値欄 (device_id 単位: 同じ種類の Par を 2 枚開いても
+    /// 片方のドラッグがもう片方の bracket を閉じない、r.md #129 §18-AA)。
+    Text { device_id: u64, field: TextNumField },
     /// 内蔵映像 FX param scrub（device_id, param_id 単位で
     /// drag stroke を undo 1 step に bracket する）。
     VideoFx { device_id: u64, param_id: u32 },
     /// 汎用 plugin param scrub (「⚙」パネル、device_id, param_id 単位)。
     PluginParam { device_id: u64, param_id: u32 },
-    /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub。
-    Talk(TalkParamKind),
+    /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub (VOICEVOX device の Par、device_id 単位)。
+    Talk { device_id: u64, kind: TalkParamKind },
     /// r.md #112: Parallel の帯域分割クロスオーバー周波数の欄 (Parallel id + 境界)。
     ParallelSplit { parallel_id: u64, edge: common::model::SplitEdge },
     /// r.md #114: Selector のアクティブ chain 欄 (`Active`)。

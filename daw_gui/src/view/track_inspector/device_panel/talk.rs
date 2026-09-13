@@ -1,26 +1,20 @@
 //! (talk) Text クリップの読み上げ話者 + 読み上げスケール 4 つ。
 //!
-//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ。 contract は
-//! `chain_sections.rs` / `modulation_rack.rs` と同じ
-//! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。
+//! `device_panel/mod.rs` が順に呼ぶセクションの 1 つ (contract は同 mod の doc)。
 use super::super::*;
+use super::{PanelCtx, opened_plugin_is};
 
-pub(super) fn draw_talk(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-    device_id: u64,
-) -> f32 {
+pub(super) fn draw_talk(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
     let p = &app.theme.core;
+    let mut y = ctx.y;
+    let device_id = ctx.device_id;
     // (talk) Text Clip 読み上げ編集 (`docs/plan_voicevox_talk.md` §4)。選択中 clip が
     // VOICEVOX デバイス付きトラック上の Text clip のとき、talk 話者 (キャラ→talk style)
     // + 読み上げスケール 4 つ (話速/音高/抑揚/音量) を編集する。声は `Clip::speaker_id`
     // を talk style として流用 (SetClipVoice で焼き込み)。スケールは `Clip::talk`。
     // 対象外は **早期 return** で抜ける。 `if let` チェーンで囲むと本文 270 行が
     // まるごと 1 段深くなり、 内側の widget コールバックが nesting budget を割る。
-    if !app.voicevox_param_panel_open(device_id) {
+    if !opened_plugin_is(app, device_id, common::plugin_db::BUILTIN_ID_VOICEVOX) {
         return y;
     }
     let Some(r) = app.selected_clip_ref() else { return y };
@@ -62,9 +56,9 @@ pub(super) fn draw_talk(
     };
 
     ui.label_at(
-        "inspector_talk_label",
+        ("inspector_talk_label", device_id),
         "読み上げ (Talk)",
-        area.x + pad,
+        ctx.x,
         y,
         12.0,
         p.text,
@@ -74,13 +68,13 @@ pub(super) fn draw_talk(
     // 字幕デバイス未挿入 = 画面非表示。ワンクリック追加ヘルパ (Q10)。
     if !has_subtitle {
         let warn_rect = Rect {
-            x: area.x + pad,
+            x: ctx.x,
             y,
-            w: area.w - pad * 2.0,
+            w: ctx.w,
             h: 22.0,
         };
         if ui.button_at_clicked(
-            "inspector_talk_add_subtitle",
+            ("inspector_talk_add_subtitle", device_id),
             "+ 字幕デバイス (画面に表示)",
             warn_rect,
         ) {
@@ -105,19 +99,19 @@ pub(super) fn draw_talk(
             }));
         }
         ui.label_at(
-            "inspector_talk_text_label",
+            ("inspector_talk_text_label", device_id),
             "セリフ",
-            area.x + pad,
+            ctx.x,
             y + 5.0,
             11.0,
             p.text,
         );
         let resp = ui.text_input_at(
-            "inspector_talk_text_input",
+            ("inspector_talk_text_input", device_id),
             Rect {
-                x: area.x + pad + 48.0,
+                x: ctx.x + 48.0,
                 y,
-                w: area.w - pad * 2.0 - 48.0,
+                w: ctx.w - 48.0,
                 h: 22.0,
             },
             &app.cur.peph.clip_text_content_edit_text,
@@ -145,9 +139,9 @@ pub(super) fn draw_talk(
             format!("{cur_char} - {cur_style}  (一覧取得中…)")
         };
         ui.label_at(
-            "inspector_talk_voice_current",
+            ("inspector_talk_voice_current", device_id),
             &txt,
-            area.x + pad + 4.0,
+            ctx.x + 4.0,
             y + 6.0,
             11.0,
             p.text,
@@ -167,13 +161,13 @@ pub(super) fn draw_talk(
             })
             .unwrap_or(0);
         let char_rect = Rect {
-            x: area.x + pad,
+            x: ctx.x,
             y,
-            w: area.w - pad * 2.0,
+            w: ctx.w,
             h: 24.0,
         };
         let picked_char =
-            ui.dropdown("inspector_talk_char", char_rect, &char_labels, cur_char_idx);
+            ui.dropdown(("inspector_talk_char", device_id), char_rect, &char_labels, cur_char_idx);
         y += 28.0;
 
         let char_idx = picked_char
@@ -188,13 +182,13 @@ pub(super) fn draw_talk(
             .position(|st| st.id == cur_speaker)
             .unwrap_or(0);
         let style_rect = Rect {
-            x: area.x + pad,
+            x: ctx.x,
             y,
-            w: area.w - pad * 2.0,
+            w: ctx.w,
             h: 24.0,
         };
         let picked_style = ui.dropdown(
-            "inspector_talk_style",
+            ("inspector_talk_style", device_id),
             style_rect,
             &style_labels,
             cur_style_idx,
@@ -227,13 +221,13 @@ pub(super) fn draw_talk(
         }
 
         let refetch_rect = Rect {
-            x: area.x + pad,
+            x: ctx.x,
             y,
-            w: area.w - pad * 2.0,
+            w: ctx.w,
             h: 22.0,
         };
         if ui.button_at_clicked(
-            "inspector_talk_refetch",
+            ("inspector_talk_refetch", device_id),
             "talk 声一覧を再取得",
             refetch_rect,
         ) {
@@ -258,21 +252,21 @@ pub(super) fn draw_talk(
     ];
     for (label, kind, val, default) in scales {
         ui.label_at(
-            ("inspector_talk_scale_label", label),
+            ("inspector_talk_scale_label", device_id, label),
             label,
-            area.x + pad,
+            ctx.x,
             y + 4.0,
             11.0,
             p.text,
         );
         let input_rect = Rect {
-            x: area.x + pad + 48.0,
+            x: ctx.x + 48.0,
             y,
-            w: area.w - pad * 2.0 - 48.0,
+            w: ctx.w - 48.0,
             h: 20.0,
         };
         let resp = ui.scrubable_number_at(
-            ("inspector_talk_scale", label),
+            ("inspector_talk_scale", device_id, label),
             input_rect,
             val,
             default,
@@ -293,7 +287,7 @@ pub(super) fn draw_talk(
         // 他の inspector 数値 field (`scrub_field`) と同じ Begin/End bracket
         // で 1 drag = 1 undo step にする — これが無いと talk 4 項目だけ
         // Ctrl+Z で戻せない (review)。
-        let scrub_key = crate::app::InspectorScrubField::Talk(kind);
+        let scrub_key = crate::app::InspectorScrubField::Talk { device_id, kind };
         super::super::push_scrub_bracket(ui, app, scrub_key, resp.dragging || resp.editing_text);
         y += 24.0;
     }
