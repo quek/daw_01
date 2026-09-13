@@ -31,7 +31,7 @@ use crate::graph::{BufRef, ChainProgram, NodeOp, ProgramCtx, Schedule, run_chain
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
 use crate::mod_tick::FollowerDrive;
-use crate::mixer::{TrackScratch, apply_channel_strip, apply_strip};
+use crate::mixer::{TrackScratch, apply_strip};
 use crate::sequencer::{NoteTransition, TimedNoteEvent};
 
 /// この device / pair が dispatch 可能かどうか (quarantine / poison gate)。
@@ -373,23 +373,6 @@ pub fn process_track_owned(
         }
         return;
     }
-
-    // ---- 内蔵チャンネルストリップ (Comp → EQ) ----
-    // docs/plan_channel_strip.md §1: 信号順は inserts → Comp → EQ → Pan →
-    // Fader。**pre-fader tap より前**に置く — 「pre-fader」 は業界標準では
-    // 「チャンネル処理の後・フェーダーの前」を指すので、send / sidechain には
-    // EQ とコンプを通った音が流れる。
-    apply_channel_strip(
-        scratch,
-        song,
-        song_track,
-        rows,
-        sample_rate,
-        playhead_beats,
-        n,
-        recording_lanes,
-        mod_plane,
-    );
 
     // ---- Pre-fader send tap ----
     // A pre-fader send reads the post-fx, pre-strip signal. Snapshot it
@@ -849,21 +832,6 @@ fn run_group_fx_chain(
         &ctx,
     );
 
-    // ---- 内蔵チャンネルストリップ (Comp → EQ) ----
-    // leaf 経路 (`process_track_owned`) と同じ位置 = pre-fader tap の前。
-    apply_channel_strip(
-        scratch,
-        Some(song),
-        song_track,
-        rows,
-        sample_rate,
-        playhead_beats,
-        n,
-        recording_lanes,
-        // group/master bus の変調は follow-up (volume/pan と同じ扱い)。
-        ModTickPlaneRef::default(),
-    );
-
     // ---- Pre-fader send tap (bus / return source) ----
     // A pre-fader send from this bus reads its post-fx, pre-strip signal.
     if scratch.force_prefader_snapshot
@@ -982,10 +950,6 @@ pub fn render_master_buffer(
     // なので、両方がここへ同じ形で渡す。空なら全部アレンジ = 従来の挙動。
     rows: &RowSourceTable,
     master_gain: f32,
-    // マスターストリップ (バスコンプ + トーン EQ + リミッター) の状態
-    // (`docs/plan_master_strip.md`)。live は engine、書き出しは `export` が
-    // 1 個ずつ所有する (書き出しは毎回新品 = 決定論的)。
-    master_strip: &mut crate::mixer::master_strip::MasterStripState,
 ) {
     let n = (frames as usize).min(master_l.len()).min(master_r.len());
     let frames = n as u32;
@@ -1089,30 +1053,6 @@ pub fn render_master_buffer(
         rows,
     );
 
-    // ---- マスターストリップ 前段 (バスコンプ → トーン EQ) ----
-    // docs/plan_master_strip.md §1: master は通常トラックと逆で **内蔵が先・
-    // insert が後**。マキシマイザー等を insert に挿したとき、それが (リミッターを
-    // 除いて) 最後に来るようにするため (Reason のマスターセクションと同じ既定)。
-    //
-    // オートメーション / 変調は buffer 頭で 1 度だけ解決し、前段とリミッターで
-    // **同じ値**を使う (buffer の途中で設定が食い違わない)。
-    let master_settings = crate::automation::resolve_master_strip(
-        song,
-        rows.master_rows(),
-        playhead_beats,
-        recording_lanes,
-        mod_plane,
-    );
-    #[allow(clippy::cast_precision_loss)]
-    let sr_f32 = sample_rate as f32;
-    master_strip.process_pre(
-        &master_settings,
-        &mut master_l[..n],
-        &mut master_r[..n],
-        n,
-        sr_f32,
-    );
-
     // ---- master fx chain ----
     // 全 track mix 後に直列 process。 live/export 両経路で通るので、 master に
     // 挿した limiter / EQ が WAV にも乗る (旧 export は素通りだった)。
@@ -1145,18 +1085,6 @@ pub fn render_master_buffer(
             master_r[i] *= master_gain;
         }
     }
-
-    // ---- マスターリミッター (最終段) ----
-    // **フェーダーの後**が唯一正しい位置 — 前に置くとフェーダーを上げた瞬間に
-    // 「出力を超えさせない」保証が破れる。OFF でもルックアヘッドぶんの遅延は
-    // 通す (切り替えで出力が飛ばないように、同 §2)。
-    master_strip.process_limiter(
-        &master_settings,
-        &mut master_l[..n],
-        &mut master_r[..n],
-        n,
-        sr_f32,
-    );
 }
 
 /// テスト用 `PluginRefs` helper (shmem を立てずに heap の `ProcessData` を
@@ -1695,7 +1623,6 @@ mod render_master_tests {
             FollowerDrive::default(),
             &RowSourceTable::default(),
             0.5,
-            &mut crate::mixer::master_strip::MasterStripState::new(),
         );
         assert!(master_l.iter().all(|&v| v == 0.0), "master must be cleared+silent");
         assert!(master_r.iter().all(|&v| v == 0.0));

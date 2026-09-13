@@ -361,7 +361,7 @@ pub(super) fn master_output_latency(
     master_mix_latency: u32,
     sample_rate: u32,
 ) -> u32 {
-    let limiter = if song.master_strip.limiter.on {
+    let limiter = if song.master_limiter.on {
         common::model::limiter_lookahead_samples(sample_rate)
     } else {
         0

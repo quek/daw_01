@@ -494,7 +494,7 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         tracks: vec![track(|t| t.id = 1)],
         ..Song::default()
     };
-    limited.master_strip.limiter.on = true;
+    limited.master_limiter.on = true;
     assert_eq!(
         compile_schedule_for_test(&limited, 48_000, 0).unwrap().master_latency_samples,
         common::model::limiter_lookahead_samples(48_000),

@@ -1,4 +1,4 @@
-//! 値のみの `Song` 更新 (mixer strip / send / record-arm / bpm / 拍子)。
+//! 値のみの `Song` 更新 (mixer / 内蔵 device / send / record-arm / bpm / 拍子)。
 //!
 //! どれも `Song` の 1 フィールドを書き換えて **値のみ bundle** で publish するだけで、
 //! routing schedule の再 compile を伴わない (`docs/plan_arch_refactor.md` §5 D)。
@@ -32,15 +32,18 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         AudioCommand::SetTrackSolo { track, solo, .. } => {
             with_track(song, track, |t| t.solo = solo);
         }
-        // 内蔵チャンネルストリップ (docs/plan_channel_strip.md)。IPC は信頼境界
-        // なので、各パラメータを可動範囲へ丸めてから載せる。丸め方の SSoT は
-        // `common::model::channel_strip` の `ParamRange`。
-        AudioCommand::SetTrackStrip { track, strip, .. } => {
-            with_track(song, track, |t| t.strip = sanitize_strip(strip));
+        // r.md #129: 内蔵 device の値。IPC は信頼境界なので `replace_values` がフィールド単位で
+        // 丸めてから載せる (種類違いの値は捨てる)。device id は song 全体で一意なので track で
+        // 引かない (master fx chain の device にも同じ口で届く)。
+        AudioCommand::SetNativeDevice { device_id, bypassed, params, .. } => {
+            if let Some(d) = song.native_by_id_mut(device_id) {
+                d.replace_values(bypassed, params);
+            }
         }
-        // マスターストリップ (docs/plan_master_strip.md)。同じく IPC 境界で丸める。
-        AudioCommand::SetMasterStrip { strip, .. } => {
-            song.master_strip = sanitize_master_strip(strip);
+        // master のフェーダー後 Limiter。**シーリングが壊れると出力が丸ごと消える**ので境界で丸める。
+        AudioCommand::SetMasterLimiter { mut limiter, .. } => {
+            limiter.sanitize();
+            song.master_limiter = limiter;
         }
         AudioCommand::SetTrackArmed { track, armed, .. } => {
             with_track(song, track, |t| t.armed = armed);
@@ -95,52 +98,6 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         _ => return false,
     }
     true
-}
-
-/// マスターストリップの IPC 境界クランプ ([`sanitize_strip`] の master 版)。
-///
-/// 段階式パラメータ (Ratio / Attack / Release) は enum なので壊れようがなく、
-/// 連続値だけを可動範囲へ丸める。**シーリングが壊れると出力が丸ごと消える**ので、
-/// ここが最後の砦。
-fn sanitize_master_strip(mut strip: common::model::MasterStrip) -> common::model::MasterStrip {
-    use common::model::{MasterEqBand, MasterStripParam as P};
-    let mut fix = |p: P| {
-        let v = strip.param(p);
-        strip.set_param(p, if v.is_finite() { v } else { 0.0 });
-    };
-    fix(P::CompThreshold);
-    fix(P::CompMakeup);
-    fix(P::LimiterCeiling);
-    for band in MasterEqBand::ALL {
-        fix(P::EqGain(band));
-    }
-    strip
-}
-
-/// IPC 境界のクランプ: 各パラメータを可動範囲へ丸める。
-///
-/// 範囲外の周波数や負の時定数がそのまま係数計算に入ると、フィルタが発散して
-/// **NaN が master バスまで伝播する** (一度混ざると停止するまで無音)。
-fn sanitize_strip(mut strip: common::model::ChannelStrip) -> common::model::ChannelStrip {
-    use common::model::{CompParam, EqBand, EqParam};
-    for band in EqBand::ALL {
-        for param in [EqParam::Freq, EqParam::Gain, EqParam::Q] {
-            let v = strip.eq.param(band, param);
-            strip.eq.set_param(band, param, if v.is_finite() { v } else { 0.0 });
-        }
-    }
-    for param in [
-        CompParam::Threshold,
-        CompParam::Ratio,
-        CompParam::Attack,
-        CompParam::Release,
-        CompParam::Makeup,
-        CompParam::ScFreq,
-    ] {
-        let v = strip.comp.param(param);
-        strip.comp.set_param(param, if v.is_finite() { v } else { 0.0 });
-    }
-    strip
 }
 
 /// 安定 `Track::id` で引いて適用する (見つからなければ何もしない)。
@@ -222,24 +179,49 @@ mod tests {
 
     /// IPC は信頼境界。壊れた値 (NaN / 範囲外) が係数計算へ入るとフィルタが発散し、
     /// **NaN が master まで伝播して停止するまで無音**になる。ここで必ず潰す。
+    /// 種類違いの値は捨て、master fx chain の device にも届く。
     #[test]
-    fn ストリップの値は_ipc_境界で丸められる() {
-        use common::model::{ChannelStrip, EqBand, EqParam};
-
+    fn 内蔵デバイスの値は_ipc_境界で丸められる() {
+        use common::model::{
+            CompSettings, Device, EqSettings, MasterLimiterSettings, NativeDevice, NativeKind, NativeParams,
+        };
+        let pk = common::protocol::ProjectKey(1);
         let mut song = Song::default();
-        song.tracks.push(Track { id: 7, ..Track::default() });
+        song.tracks.push(Track {
+            id: 7,
+            devices: vec![
+                Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 11)),
+                Device::Native(NativeDevice::new_builtin(NativeKind::Eq, 12)),
+            ],
+            ..Track::default()
+        });
+        song.master_fx_chain = vec![Device::Native(NativeDevice::new_builtin(NativeKind::ToneEq, 21))];
 
-        let mut strip = ChannelStrip::default();
-        strip.eq.hmf.freq_hz = f32::NAN;
-        strip.eq.hmf.gain_db = 999.0;
-        strip.comp.attack_ms = -5.0;
-        strip.comp.sc_freq_hz = 1.0; // 20Hz 未満は OFF へ
+        let mut eq = EqSettings::default();
+        eq.hmf.freq_hz = f32::NAN;
+        eq.hmf.gain_db = 999.0;
+        let cmd = AudioCommand::SetNativeDevice { project: pk, device_id: 12, bypassed: false, params: NativeParams::Eq(eq) };
+        assert!(apply(&cmd, &mut song));
+        let got = *song.native_by_id(12).unwrap();
+        let NativeParams::Eq(e) = got.params else { panic!("eq") };
+        assert!(e.hmf.freq_hz.is_finite() && (e.hmf.gain_db - 15.0).abs() < 1e-6, "{e:?}");
+        assert!(!got.bypassed);
 
-        assert!(apply(&AudioCommand::SetTrackStrip { project: common::protocol::ProjectKey(1), track: 7, strip }, &mut song));
-        let got = song.tracks[0].strip;
-        assert!(got.eq.param(EqBand::Hmf, EqParam::Freq).is_finite());
-        assert!((got.eq.param(EqBand::Hmf, EqParam::Gain) - 15.0).abs() < 1e-6);
-        assert!((got.comp.attack_ms - 0.1).abs() < 1e-6, "{}", got.comp.attack_ms);
-        assert_eq!(got.comp.sc_freq_hz, 0.0);
+        let comp = CompSettings { attack_ms: -5.0, sc_freq_hz: 1.0, ..CompSettings::default() };
+        let wrong_kind = AudioCommand::SetNativeDevice { project: pk, device_id: 12, bypassed: true, params: NativeParams::Comp(comp) };
+        assert!(apply(&wrong_kind, &mut song));
+        assert_eq!(*song.native_by_id(12).unwrap(), got, "種類違いの値は何もしない");
+        let cmd = AudioCommand::SetNativeDevice { project: pk, device_id: 11, bypassed: false, params: NativeParams::Comp(comp) };
+        assert!(apply(&cmd, &mut song));
+        let NativeParams::Comp(c) = song.native_by_id(11).unwrap().params else { panic!("comp") };
+        assert!((c.attack_ms - 0.1).abs() < 1e-6 && c.sc_freq_hz == 0.0, "{c:?}");
+
+        let tone = NativeParams::default_of(NativeKind::ToneEq);
+        assert!(apply(&AudioCommand::SetNativeDevice { project: pk, device_id: 21, bypassed: false, params: tone }, &mut song));
+        assert!(!song.native_by_id(21).unwrap().bypassed, "master fx chain の device にも届く");
+
+        let limiter = MasterLimiterSettings { on: true, ceiling_db: f32::NAN };
+        assert!(apply(&AudioCommand::SetMasterLimiter { project: pk, limiter }, &mut song));
+        assert!(song.master_limiter.on && song.master_limiter.ceiling_db == -1.0);
     }
 }

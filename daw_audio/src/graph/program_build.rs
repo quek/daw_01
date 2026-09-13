@@ -51,6 +51,8 @@ pub fn program_latency(devices: &[Device], latencies: &DeviceLatencies) -> u32 {
                 acc.saturating_add(latencies.get(&p.id).copied().unwrap_or(0))
             }
         }
+        // r.md #129: 内蔵 device の遅延は 0。
+        Device::Native(_) => acc,
         Device::Parallel(r) => {
             if r.bypassed {
                 acc
@@ -140,6 +142,9 @@ impl Builder<'_> {
                 });
                 self.latencies.get(&p.id).copied().unwrap_or(0)
             }
+            // r.md #129: 内蔵 device の op (`ChainOp::Native`) は engine 側の実装 (§8.3.1) で出す。
+            // それまでは素通し (op を出さない) で、遅延は 0。
+            Device::Native(_) => 0,
             Device::Parallel(r) => {
                 // chain を全部消した Parallel は Live / Bitwig と同じく素通し (op を出さない =
                 // 何も無いのと同じ)。 bypass も同じ。

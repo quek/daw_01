@@ -675,8 +675,8 @@ pub fn handle_project_command(
         | AudioCommand::SetTrackPan { .. }
         | AudioCommand::SetTrackMuted { .. }
         | AudioCommand::SetTrackSolo { .. }
-        | AudioCommand::SetTrackStrip { .. }
-        | AudioCommand::SetMasterStrip { .. }
+        | AudioCommand::SetNativeDevice { .. }
+        | AudioCommand::SetMasterLimiter { .. }
         | AudioCommand::SetTrackArmed { .. }
         | AudioCommand::SetSendGain { .. }
         | AudioCommand::SetSendEnabled { .. }
@@ -767,6 +767,10 @@ pub fn handle_project_command(
             shared.project_dir.store(dir.as_ref().map(|p| Arc::new(p.clone())));
             tracing::info!(project = key.0, ?dir, "project_dir updated");
         }
+        // r.md #129: SC Listen / device scope は「聴き方・見方の都合」で Song に載らない。
+        // この版の engine は Listen の置換も scope の書き込みも持たないので、受理して捨てる
+        // (`docs/plan_rack_native_devices.md` §8.7 / §11.2 が保持と RT への受け渡しを定める)。
+        AudioCommand::SetScListen { .. } | AudioCommand::SetDeviceScopes { .. } => {}
         // MIDI Capture の試聴 (`docs/plan_global_sampler.md`)。
         cmd @ (AudioCommand::PreviewSequence { .. } | AudioCommand::PreviewSequenceStop { .. }) => {
             if sampler::handle_project_command(cmd, &shared, &mut ctl.preview_seq_generation) {

@@ -266,10 +266,6 @@ pub struct ProjectRt {
     /// デバイス最終ミックスへは [`DeviceRt::process_buffer`] が**加算**する。
     pub bus_l: Vec<f32>,
     pub bus_r: Vec<f32>,
-    /// マスターストリップ (バスコンプ + トーン EQ + リミッター) の状態
-    /// (`docs/plan_master_strip.md`)。live 用の 1 個 — 書き出しは `export` が
-    /// 別に新品を持つので、書き出しの結果が直前の再生状態に影響されない。
-    pub master_strip: crate::mixer::master_strip::MasterStripState,
     /// Whether the transport was rolling on the previous buffer. Used to
     /// detect Play/Stop transitions and reset the playhead / queue
     /// note-offs cleanly.
@@ -384,7 +380,6 @@ impl ProjectRt {
             scratch,
             bus_l: vec![0.0; max_frames],
             bus_r: vec![0.0; max_frames],
-            master_strip: crate::mixer::master_strip::MasterStripState::new(),
             playing: false,
             was_playing: false,
             playhead_beats: 0.0,
@@ -585,8 +580,6 @@ impl ProjectRt {
     fn publish_track_telemetry(&self, slot: &ProjectTelemetry, n_tracks: usize) {
         for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
             slot.set_track_peak(i, tr.peak_l, tr.peak_r);
-            // 内蔵チャンネルストリップの GR (docs/plan_channel_strip.md §9)。
-            slot.set_track_gr_db(i, tr.strip_gr_db);
             let voices = self
                 .cached_schedule
                 .track_programs
@@ -1011,7 +1004,6 @@ impl ProjectRt {
                 self.mod_tick.follower_drive(&self.follower_cols, playhead),
                 self.launcher.rows(),
                 master_gain,
-                &mut self.master_strip,
             );
 
             // 走行状態の GUI への publish は **transport を進めた後** (この関数の末尾)。
@@ -1083,10 +1075,6 @@ impl ProjectRt {
             // so the GUI mixer strips animate. Atomic stores, RT-safe.
             // Tracks with effective_mute already have peak_l/r == 0.
             self.publish_track_telemetry(slot, n_tracks);
-            // マスターストリップの GR (docs/plan_master_strip.md §6)。波形からは
-            // 導けない値なので、per-track の GR と同じスカラー面で publish する。
-            let (comp_gr, limiter_gr) = self.master_strip.gain_reduction_db();
-            slot.set_master_gr_db(comp_gr, limiter_gr);
 
             // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。
             // 刻みが解いた buffer 頭の値をそのまま出す (GUI は 30Hz なので
