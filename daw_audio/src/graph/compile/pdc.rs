@@ -21,13 +21,11 @@
 //!   `frames = max_path - this_path` の `ApplyDelay` を **Mix の直前に**
 //!   挿入する。 こうすると合流点で全 src の累積 latency が揃う。
 
-use std::collections::{HashMap, HashSet};
-
 use common::model::Song;
 
 use super::DeviceLatencies;
 use super::deps::Topology;
-use super::sidechain::{TapCtx, sidechain_input_latency, sidechain_tap_lag};
+use super::sidechain::{TapCtx, sidechain_input_latency};
 use crate::graph::delay_line::DelayLine;
 use crate::graph::program_build::program_latency;
 use crate::graph::schedule::{BufRef, DelayKey, NodeOp};
@@ -39,26 +37,31 @@ pub(super) fn path_latencies(
     topo: &Topology,
     taps: &TapCtx<'_>,
     track_chain_latency: &[u32],
-    buffer_frames: u32,
 ) -> Vec<u32> {
     let n = song.tracks.len();
     let mut path_latency = vec![u32::MAX; n];
     for i in 0..n {
-        compute_path_latency(
-            i as u32,
-            &song.tracks,
-            track_chain_latency,
-            &topo.is_group,
-            &topo.children_of,
-            taps,
-            &topo.incoming_sends,
-            &topo.bus_flags,
-            buffer_frames,
-            &mut path_latency,
-        );
+        compute_path_latency(i as u32, song, track_chain_latency, topo, taps, &mut path_latency);
     }
     fan_in_paraout_latency(song, topo, track_chain_latency, &mut path_latency);
     path_latency
+}
+
+/// track `idx` の「サイドチェイン以外の入力」の latency = `max(group_input, send_input)`
+/// (子の合流と send の合流が揃う位置)。pass 2 の consumer 宛ての `BusScAlign` の基準。
+pub(super) fn non_sc_input_latencies(song: &Song, topo: &Topology, path_latency: &[u32]) -> Vec<u32> {
+    let path = |i: u32| path_latency.get(i as usize).copied().unwrap_or(0);
+    song.tracks
+        .iter()
+        .map(|t| {
+            let group = topo.children_of.get(&t.id).map_or(0, |kids| kids.iter().map(|&c| path(c)).max().unwrap_or(0));
+            let send = topo
+                .incoming_sends
+                .get(&t.id)
+                .map_or(0, |edges| edges.iter().map(|&(s, _, _)| path(s)).max().unwrap_or(0));
+            group.max(send)
+        })
+        .collect()
 }
 
 /// `path_latency[idx]` を計算してキャッシュする。 既に値があれば即返却
@@ -91,46 +94,28 @@ pub(super) fn path_latencies(
 ///
 /// dangling reference (= sidechain source が song に存在しない) は wrap せず
 /// 0 として扱う (compile error にしない方針、 編集中の中間状態を許容)。
-/// §5 (arch refactor): sidechain edge の実効 latency には、**leaf** 宛のとき
-/// `buffer_frames` (tap staging→消費の 1-buffer 遅延) が加算される。bus
-/// (group / return / paraout dest) 宛は同 buffer 内消費なので 0
-/// ([`sidechain_tap_lag`])。
-#[allow(clippy::too_many_arguments)]
+/// §5 (arch refactor) / r.md #129 §8.3.3: sidechain edge の実効 latency には、その consumer が
+/// **pass 1** で走るとき `buffer_frames` (tap staging→消費の 1-buffer 遅延) が加算される。
+/// pass 2 (bus の `ProcessGroupFx`) は同 buffer 内消費なので 0 ([`TapCtx::lag`])。
 fn compute_path_latency(
     idx: u32,
-    tracks: &[common::model::Track],
-    // `tracks` と同順の「その track の device chain が報告する latency の合計」。
+    song: &Song,
+    // `song.tracks` と同順の「その track の device chain が報告する latency の合計」。
     track_chain_latency: &[u32],
-    is_group: &HashSet<u32>,
-    children_of: &HashMap<u32, Vec<u32>>,
+    topo: &Topology,
     taps: &TapCtx<'_>,
-    incoming_sends: &HashMap<u32, Vec<(u32, u32, common::model::SendMode)>>,
-    bus_flags: &[bool],
-    buffer_frames: u32,
     cache: &mut [u32],
 ) -> u32 {
     if cache[idx as usize] != u32::MAX {
         return cache[idx as usize];
     }
-    let track = &tracks[idx as usize];
+    let track = &song.tracks[idx as usize];
     // 依存先 track の path latency (未計算なら再帰で求めて `cache` に入れる)。
-    let path_of = |i: u32, cache: &mut [u32]| {
-        compute_path_latency(
-            i,
-            tracks,
-            track_chain_latency,
-            is_group,
-            children_of,
-            taps,
-            incoming_sends,
-            bus_flags,
-            buffer_frames,
-            cache,
-        )
-    };
+    let path_of =
+        |i: u32, cache: &mut [u32]| compute_path_latency(i, song, track_chain_latency, topo, taps, cache);
 
-    let group_input: u32 = if is_group.contains(&track.id) {
-        children_of
+    let group_input: u32 = if topo.is_group.contains(&track.id) {
+        topo.children_of
             .get(&track.id)
             .map(|kids| kids.iter().map(|&c| path_of(c, cache)).max().unwrap_or(0))
             .unwrap_or(0)
@@ -138,16 +123,14 @@ fn compute_path_latency(
         0
     };
 
-    let tap_lag = sidechain_tap_lag(bus_flags[idx as usize], buffer_frames);
-    let sidechain_input =
-        sidechain_input_latency(idx, &track.devices, taps, track_chain_latency, tap_lag, cache, path_of);
+    let sidechain_input = sidechain_input_latency(idx, track, taps, track_chain_latency, cache, path_of);
 
     // Aux-send fan-in: a return / bus depends on every track that sends
     // into it, so its input latency must also cover those sources. This
     // keeps the wet return time-aligned with the dry signal at the master
     // mix (the source's post-fader latency is carried by the send copy).
     let mut send_input: u32 = 0;
-    if let Some(edges) = incoming_sends.get(&track.id) {
+    if let Some(edges) = topo.incoming_sends.get(&track.id) {
         for &(src_idx, _, _) in edges {
             let l = path_of(src_idx, cache);
             if l > send_input {
@@ -223,10 +206,15 @@ pub(super) struct Compensated {
 /// の方が境界条件が単純なので、 一度別 Vec に組み直す。
 /// §5 D: 各 DelayLine には stable key (`DelayKey`) を平行 Vec で持たせ、
 /// 再 compile 時に `Schedule::adopt_state_from` が ring の内容を移送する。
+///
+/// r.md #129 §8.3.3: `ProcessGroupFx` の直前には、pass 2 の consumer が読むサイドチェインに bus の
+/// 入力を揃える `ApplyDelay(BusScAlign)` を積む (`bus_sc_delay`、song-track index 順)。
+/// `run_group_fx_chain` の pre-FX snapshot はその後に取られるので、自トラック Pre-FX の SC も揃う。
 pub(super) fn insert_delay_compensation(
     song: &Song,
     nodes: Vec<NodeOp>,
     path_latency: &[u32],
+    bus_sc_delay: &[u32],
 ) -> Compensated {
     let mut delay_lines: Vec<DelayLine> = Vec::new();
     let mut delay_keys: Vec<DelayKey> = Vec::new();
@@ -276,6 +264,15 @@ pub(super) fn insert_delay_compensation(
             }
             NodeOp::MixAdditive { .. } => {
                 // MixAdditive の dst は compile が常に TrackScratch で emit する。
+            }
+            NodeOp::ProcessGroupFx { track_idx, .. } => {
+                let frames = bus_sc_delay.get(*track_idx as usize).copied().unwrap_or(0);
+                if frames > 0 {
+                    let track_id = track_ids.get(*track_idx as usize).copied().unwrap_or(0);
+                    let buf = BufRef::TrackScratch(*track_idx);
+                    let key = DelayKey::BusScAlign { track_id };
+                    push_delay(buf, frames, key, &mut delay_lines, &mut delay_keys, &mut out);
+                }
             }
             _ => {}
         }
@@ -349,23 +346,20 @@ fn push_delay(
 /// master **出力**の遅延量 (`Schedule::master_latency_samples`)。
 ///
 /// = master 合流点の path latency + master fx chain の報告 latency +
-/// マスターリミッターのルックアヘッド (ON のときだけ)。click の参照位置と書き出しの
-/// 窓ずらしはどちらもこの 1 値を引くので、遅延源を足すときは必ずここに足す
-/// (r.md #39 / docs/plan_master_strip.md §2)。
+/// マスターリミッターのルックアヘッド (遅延を焼いたときだけ)。click の参照位置と書き出しの
+/// 窓ずらしはどちらもこの 1 値を引くので、遅延源を足すときは必ずここに足す (r.md #39)。
 ///
-/// リミッターの遅延は OFF なら素通し (0) で、ON/OFF は `edit_song` 経由 = LoadSong で
-/// 再 compile されるため、この値は切り替えに即追従する。
+/// `limiter_latency` = `Schedule::master_limiter_latency` (= `Song::master_limiter_latency_active`:
+/// 静的 ON または On レーン / 変調)。DSP (`MasterLimiterState::process`) も同じ値で遅延を通すかを
+/// 決めるので、On をオートメーションしても会計と実際の遅延が食い違わない (r.md #129 §18-G)。
 pub(super) fn master_output_latency(
     song: &Song,
     device_latencies: &DeviceLatencies,
     master_mix_latency: u32,
     sample_rate: u32,
+    limiter_latency: bool,
 ) -> u32 {
-    let limiter = if song.master_limiter.on {
-        common::model::limiter_lookahead_samples(sample_rate)
-    } else {
-        0
-    };
+    let limiter = if limiter_latency { common::model::limiter_lookahead_samples(sample_rate) } else { 0 };
     master_mix_latency
         .saturating_add(program_latency(&song.master_fx_chain, device_latencies))
         .saturating_add(limiter)

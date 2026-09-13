@@ -1,31 +1,82 @@
-//! Sidechain の会計 — sidechain を読む consumer を走査する処理はすべてここに置く。
+//! Sidechain の会計 — サイドチェインを読む consumer を走査する処理はすべてここに置く
+//! (`docs/plan_rack_native_devices.md` §8.3.3)。
 //!
-//! consumer = device chain 上 (Parallel の中も `plugins` が辿る) の plugin の
-//! `aux_inputs`。走査は次の 5 つ:
+//! consumer = plugin の `aux_inputs` と、内蔵 device (Comp / Bus Comp) の SC。列挙は common の
+//! [`aux_consumers`] 1 本で、plugin と native を同じ形 (`AuxConsumer`) で信号順に出す。
+//! `inactive` なもの (plugin は bypassed、native は `!can_activate`) は dispatch / 処理されないので、
+//! その配線は snapshot 要求 / 依存辺 / tap / latency のどれにも数えない (r.md #105)。
+//! 走査は次の 5 つ:
 //! - [`collect_chain_taps`] — chain の snapshot flag を焼く入力 (`build_all_programs`)
-//! - [`sidechain_dep_edges`] — path latency の依存辺 (`deps::execution_order`)
-//! - [`emit_aux_input_taps`] — `NodeOp::SidechainTap` の emit (`emit::emit_track_ops`)
+//! - 依存辺 — `common::routing_deps::TrackDeps` (`deps::execution_order`)。辺の定義を 2 本持たない
+//! - [`emit_sidechain_taps`] — `NodeOp::SidechainTap` / `NodeOp::NativeSidechainTap` の emit
 //! - [`sidechain_input_latency`] — path latency への fan-in (`pdc::compute_path_latency`)
-//! - [`compute_input_delays`] — plugin 入力で main を aux に揃える input delay
+//! - [`compute_sc_delays`] — pass 1 の input delay と、pass 2 の `BusScAlign` の遅延量
 //!
-//! 5 つとも r.md #105 の規則を共有する: bypass 中の device は dispatch されないので、
-//! その配線は snapshot 要求 / 依存辺 / tap / latency のどれにも数えない。leaf 宛の
-//! tap の staging lag は [`sidechain_tap_lag`] の 1 か所で決める。
+//! **lag は consumer が走る pass で決める** ([`TapCtx::lag`])。post-dispatch で staging した音を
+//! pass 1 (leaf / group-with-instrument の prefix) は次の buffer で消費する = `buffer_frames` 遅れ、
+//! pass 2 (bus の `ProcessGroupFx` / master fx) は同じ buffer で消費する = 0。track 単位で決めて
+//! いた頃は、GWI の prefix 宛ての lag を 0 と数え、bus 宛ての SC で main 側に遅延を掛けていなかった
+//! (§18-L)。
 
 use std::collections::{HashMap, HashSet};
 
-use common::model::{AudioTap, Device, Song, TapPoint, TapSource, plugins};
+use common::model::{AudioTap, AutomationLane, Device, ModRouting, Song, TapPoint, TapSource, Track};
+use common::routing_deps::aux_consumers;
 
 use super::{ChainMap, tap_bufref_for};
+use crate::graph::native::{ScMode, ScStage};
+use crate::graph::program_build::BuiltProgram;
 use crate::graph::schedule::{MASTER_OWNER, NodeOp};
 
-/// tap の source を解決するのに使う表の束 (`compute_path_latency` / 依存辺)。
+/// consumer が走る pass。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScPass {
+    /// worker が dispatch する pass (leaf の全 device / group-with-instrument の prefix)。
+    Pass1,
+    /// post-dispatch の `ProcessGroupFx` (group / return / パラアウト先 / GWI の suffix)。
+    Pass2,
+}
+
+/// consumer が走る pass。`split` は group-with-instrument のときだけ `Some` (top-level の分割点)。
+pub(super) fn consumer_pass(bus: bool, split: Option<u32>, top_index: u32) -> ScPass {
+    // leaf は全部 pass 1。group-with-instrument は prefix (top_index < split) が pass 1。
+    // それ以外の bus (group / return / パラアウト先 / GWI の suffix) は pass 2。
+    if !bus || split.is_some_and(|s| top_index < s) { ScPass::Pass1 } else { ScPass::Pass2 }
+}
+
+/// tap の source を解決し、consumer の pass を決めるのに使う表の束。
 pub(super) struct TapCtx<'a> {
     pub(super) id_to_idx: &'a HashMap<u32, u32>,
     pub(super) chains: &'a ChainMap,
+    /// song-track index → bus か (`Topology::bus_flags`)。
+    pub(super) bus_flags: &'a [bool],
+    /// song-track index → group-with-instrument の top-level 分割点 (`Topology::gwi_split`)。
+    pub(super) gwi_split: &'a [Option<u32>],
+    /// engine が 1 buffer で処理するフレーム数 (pass 1 の staging lag)。
+    pub(super) buffer_frames: u32,
 }
 
-/// tap の source が属する **song-track index** (依存辺 / path latency 用)。
+impl TapCtx<'_> {
+    /// track `idx` の最上位 `top_index` 番目の device (の中) にある consumer が走る pass。
+    pub(super) fn pass(&self, idx: u32, top_index: u32) -> ScPass {
+        let i = idx as usize;
+        consumer_pass(
+            self.bus_flags.get(i).copied().unwrap_or(false),
+            self.gwi_split.get(i).copied().flatten(),
+            top_index,
+        )
+    }
+
+    /// その consumer の staging lag (pass 1 → `buffer_frames`、pass 2 → 0)。
+    pub(super) fn lag(&self, idx: u32, top_index: u32) -> u32 {
+        match self.pass(idx, top_index) {
+            ScPass::Pass1 => self.buffer_frames,
+            ScPass::Pass2 => 0,
+        }
+    }
+}
+
+/// tap の source が属する **song-track index** (path latency 用)。
 /// master 所有の chain と dangling は `None`。
 fn tap_owner_idx(tap: &AudioTap, id_to_idx: &HashMap<u32, u32>, chains: &ChainMap) -> Option<u32> {
     match tap.source {
@@ -68,16 +119,6 @@ fn tap_source_latency(
     }
 }
 
-/// leaf 宛の tap の staging lag: leaf の device は pass 1 で process 済みなので、
-/// post-dispatch で staging した source は次 buffer の process で消費される =
-/// `buffer_frames` 遅れる。bus (group / return / paraout dest) の device は pass 2 で
-/// 同 buffer 内に消費するので 0。path latency の fan-in と input delay は必ずこの値を
-/// 使う (食い違うと plugin 入力での main/aux 揃えと master 合流の sibling alignment が
-/// ズレる)。
-pub(super) fn sidechain_tap_lag(is_bus: bool, buffer_frames: u32) -> u32 {
-    if is_bus { 0 } else { buffer_frames }
-}
-
 /// `(chain_id, tap_point)` を誰かが読むか (chain の snapshot flag を焼く入力)。
 pub(super) fn collect_chain_taps(song: &Song) -> HashSet<(u64, TapPoint)> {
     let mut set = HashSet::new();
@@ -86,8 +127,8 @@ pub(super) fn collect_chain_taps(song: &Song) -> HashSet<(u64, TapPoint)> {
             set.insert((c, tap.tap_point));
         }
     };
-    for p in song.all_plugins().filter(|p| !p.bypassed) {
-        for route in p.aux_inputs.iter().flatten() {
+    for (_, c) in song.all_aux_consumers().filter(|(_, c)| !c.inactive) {
+        for route in c.routes.iter().flatten() {
             add(&route.tap);
         }
     }
@@ -99,101 +140,104 @@ pub(super) fn collect_chain_taps(song: &Song) -> HashSet<(u64, TapPoint)> {
     set
 }
 
-/// 依存辺のうち sidechain の分: track `idx` の `devices` 上の consumer が読む tap の
-/// source track を `out` へ積む。
-///
-/// v23 single-chain: sidechain wiring lives on every device's
-/// `aux_inputs` regardless of its derived role, so a single walk over
-/// `devices` covers what the old per-section walks did.
-/// r.md #110: 同 track の chain を source にする tap は自己辺にしない
-/// (前 buffer の snapshot を読む = 1 buffer 遅れ、cycle ではない)。
-pub(super) fn sidechain_dep_edges(idx: u32, devices: &[Device], taps: &TapCtx<'_>, out: &mut Vec<u32>) {
-    for p in plugins(devices).filter(|p| !p.bypassed) {
-        for route in p.aux_inputs.iter().flatten() {
-            if let Some(src_idx) = tap_owner_idx(&route.tap, taps.id_to_idx, taps.chains)
-                && src_idx != idx
-            {
-                out.push(src_idx);
+/// track の Pre-FX / PostFx (pre-fader) snapshot を誰かが読むかを、各 program に焼く
+/// (§8.3.2、旧 RT の `track_needs_*_snapshot` → `any_tap_at` は毎 buffer Song を歩いて確保していた
+/// = §18-B)。snapshot は bypass と無関係に取るので、処理しえない consumer の配線も数える。
+/// PostFx には pre-fader send を含める (leaf と group で条件を揃える、§18-C)。
+pub(super) fn bake_snapshot_needs(song: &Song, built: &mut [BuiltProgram]) {
+    let mut wanted: HashSet<(u32, TapPoint)> = HashSet::new();
+    {
+        let mut add = |tap: &AudioTap| {
+            if let Some(t) = tap.source_track() {
+                wanted.insert((t, tap.tap_point));
+            }
+        };
+        for (_, c) in song.all_aux_consumers() {
+            for route in c.routes.iter().flatten() {
+                add(&route.tap);
+            }
+        }
+        for ms in &song.mod_sources {
+            if let Some((tap, _)) = ms.follower() {
+                add(tap);
             }
         }
     }
+    for (track, b) in song.tracks.iter().zip(built.iter_mut()) {
+        b.program.snapshot_pre_fx = wanted.contains(&(track.id, TapPoint::PreFx));
+        b.program.snapshot_post_fx = wanted.contains(&(track.id, TapPoint::PostFx))
+            || track.sends.iter().any(|s| s.mode == common::model::SendMode::PreFader);
+    }
 }
 
-/// docs/plan_modulation.md §5: walk a device `chain` (a track's `devices` or
-/// the master `master_fx_chain`) and emit `NodeOp::SidechainTap` for every
-/// plugin `aux_inputs` route whose source track exists. The single helper
-/// replaces the former per-track `emit_sidechain_taps` + the inlined
-/// master-bus loop (critique #1: there were two emit sites). `owner_track_id` is
-/// the destination plugin's owning track id (`MASTER_TRACK_ID` for master
-/// fx). dangling references are skipped (no compile error). `ProcessTrack` of
-/// the source runs earlier, so its scratch is settled by the time the tap copies it.
-pub(super) fn emit_aux_input_taps(
-    chain: &[common::model::Device],
+/// device `chain` (track の `devices` か `master_fx_chain`) 上の consumer の tap を emit する
+/// (track 経路と master 経路の唯一の emit site)。`owner_track_id` = 持ち主の track id
+/// (master は `MASTER_TRACK_ID`)、`owner_idx` = song-track index (master は [`MASTER_OWNER`])、
+/// `stores` = 持ち主の lane / routing (native の `can_activate`)、`program` = 持ち主の program。
+///
+/// - plugin: 配線のある port ごとに `NodeOp::SidechainTap`。
+/// - native: 次の 4 条件を満たすときだけ `NodeOp::NativeSidechainTap` を積み、同じ場所で
+///   `natives[slot]` を `Staged` にして受け皿を確保する (off-RT)。
+///   1. SC を受ける種類 (`aux_consumers` が保証) 2. source が自トラックではない
+///   3. source を `BufRef` に解決できる 4. op が出ている (`native_slots` に id がある —
+///   bypass 中の Parallel の中の native には op が無い)。
+///
+/// 自トラックの Pre-FX は program が同じ pass の snapshot を直接載せる (plugin の
+/// `own_prefx_ports` / native の `ScMode::OwnPreFx`)。自トラックの他の tap 点は出力の下流
+/// (= feedback) なので staging しない。dangling な source は黙って飛ばす。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_sidechain_taps(
+    chain: &[Device],
     owner_track_id: u32,
-    id_to_idx: &HashMap<u32, u32>,
-    chains: &ChainMap,
+    owner_idx: u32,
+    stores: (&[AutomationLane], &[ModRouting]),
+    program: &mut BuiltProgram,
+    taps: &TapCtx<'_>,
     nodes: &mut Vec<NodeOp>,
 ) {
-    // r.md #105: bypass 中の device は process されないので tap も staging しない。
-    // r.md #110: Parallel の中の plugin も `plugins` が辿る。
-    for inst in plugins(chain).filter(|p| !p.bypassed) {
-        // aux port は engine が `MAX_AUX_IN` までしか staging しないので
-        // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
-        // `as u8` の wrap を防ぐ。
-        for (port_idx, route_opt) in inst
-            .aux_inputs
-            .iter()
-            .take(common::process_data::MAX_AUX_IN)
-            .enumerate()
-        {
-            let Some(route) = route_opt else {
-                continue;
-            };
-            // 自 track の Pre-FX は program が同じ pass の snapshot を直接載せる
-            // (`ChainOp::Plugin::own_prefx_ports`)。 自 track の他の tap 点は出力の
-            // 下流 (= feedback) なので staging しない。
+    for c in aux_consumers(chain, stores.0, stores.1).filter(|c| !c.inactive) {
+        // aux port は engine が `MAX_AUX_IN` までしか staging しないので `take` で
+        // `port < MAX_AUX_IN` を構造的に保証し、`as u8` の wrap を防ぐ。
+        for (port, route) in c.routes.iter().take(common::process_data::MAX_AUX_IN).enumerate() {
+            let Some(route) = route else { continue };
             if route.tap.source == TapSource::Track(owner_track_id) {
                 continue;
             }
-            let Some(src) = tap_bufref_for(&route.tap, id_to_idx, chains) else {
-                // dangling reference: silently skip
+            let Some(src) = tap_bufref_for(&route.tap, taps.id_to_idx, taps.chains) else {
                 continue;
             };
-            // v29: 宛先 plugin は安定 device id で焼き込む。id 未採番 (0) の
-            // instance は engine 側 lookup が必ず外れる (= 旧来の「lookup miss
-            // で skip」と同じ寛容さ) なのでここでは弾かない。
-            nodes.push(NodeOp::SidechainTap {
-                src,
-                device_id: inst.id,
-                aux_in_port: port_idx as u8,
-            });
+            if !c.native {
+                // v29: 宛先 plugin は安定 device id で焼き込む (未採番 0 は engine 側の lookup が外れる)。
+                nodes.push(NodeOp::SidechainTap { src, device_id: c.device_id, aux_in_port: port as u8 });
+                continue;
+            }
+            let Some(&native_slot) = program.native_slots.get(&c.device_id) else { continue };
+            let Some(ns) = program.program.natives.get_mut(native_slot as usize) else { continue };
+            ns.sc_mode = ScMode::Staged;
+            ns.sc.get_or_insert_with(ScStage::new);
+            nodes.push(NodeOp::NativeSidechainTap { src, owner: owner_idx, native_slot });
         }
     }
 }
 
-/// path latency の sidechain fan-in: track `idx` の `devices` 上の consumer が読む tap
-/// について、source 側の latency ([`tap_source_latency`]) + `tap_lag` の最大 (無ければ 0)。
+/// path latency の sidechain fan-in: track `idx` の consumer が読む tap について、
+/// source 側の latency ([`tap_source_latency`]) + **その consumer の pass の lag** の最大 (無ければ 0)。
 /// `path_of(src, cache)` は source track の path latency を `cache` に確定させる
-/// (`compute_path_latency` の memoize + 再帰)。
-///
-/// v23 single-chain: latency propagation cares about every device's
-/// sidechain source regardless of role (a sidechain edge from any device
-/// raises this track's input latency), so a single walk over `devices`
-/// replaces the old per-section walks. r.md #110: Parallel の中も `plugins` が辿る。
-/// chain source は所有 track の入力 latency + chain までの相対 latency。同 track の
-/// chain (自己参照) は数えない (main の下流なので揃えようが無い)。
+/// (`compute_path_latency` の memoize + 再帰)。同じ track を source にする tap
+/// (自己参照 / 自分の chain) は数えない (main の下流なので揃えようが無い)。
 pub(super) fn sidechain_input_latency(
     idx: u32,
-    devices: &[Device],
+    track: &Track,
     taps: &TapCtx<'_>,
     track_chain_latency: &[u32],
-    tap_lag: u32,
     cache: &mut [u32],
     path_of: impl Fn(u32, &mut [u32]) -> u32,
 ) -> u32 {
     let mut sidechain_input: u32 = 0;
-    for p in plugins(devices).filter(|p| !p.bypassed) {
-        for route in p.aux_inputs.iter().flatten() {
+    let consumers = aux_consumers(&track.devices, &track.automation_lanes, &track.mod_routings);
+    for c in consumers.filter(|c| !c.inactive) {
+        let lag = taps.lag(idx, c.top_index);
+        for route in c.routes.iter().flatten() {
             let Some(src_idx) = tap_owner_idx(&route.tap, taps.id_to_idx, taps.chains) else {
                 continue;
             };
@@ -202,53 +246,54 @@ pub(super) fn sidechain_input_latency(
             }
             path_of(src_idx, cache);
             let l = tap_source_latency(&route.tap, src_idx, cache, track_chain_latency, taps.chains)
-                .saturating_add(tap_lag);
+                .saturating_add(lag);
             sidechain_input = sidechain_input.max(l);
         }
     }
     sidechain_input
 }
 
-/// PR4.5 sidechain plugin-internal alignment: per-track input delay.
-/// The delay is applied to the track's main signal so it lines up with any
-/// sidechain a device reads. Only audio-processing devices (= has both an
-/// audio input and an audio output) can read a sidechain, so only those
-/// contribute (a pure source / MIDI device has no main-in to delay against).
-/// v23 single-chain: a direct port predicate, no role derivation. Edit-time.
-/// §5 (arch refactor): leaf 宛の tap は staging→消費が 1 buffer ずれるので
-/// `buffer_frames` を加算して plugin 入力での main vs aux を位相一致させる
-/// (compute_path_latency の sidechain edge と同じ規則 — [`sidechain_tap_lag`])。
-/// r.md #110: 同 track の chain source は main と揃えようが無い (chain 出力は main の
-/// 下流) ので数えない。
-#[allow(clippy::too_many_arguments)]
-pub(super) fn compute_input_delays(
+/// consumer の入力で main をサイドチェインに揃える遅延 (track ごと、song-track index 順)。
+///
+/// - `input_delay`: pass 1 の consumer 宛て。`src_latency + buffer_frames` の最大。
+///   `process_track_owned` が device チェーンに入る前の main に掛ける (PR4.5)。
+/// - `bus_sc_delay`: pass 2 の consumer 宛て。`max(0, src_latency の最大 − non_sc_input)`。
+///   `ProcessGroupFx` の直前の `ApplyDelay(BusScAlign)` が bus の入力に掛ける。2 つの遅延を掛けた後の
+///   実際の入力 latency は `max(non_sc, sc)` になり、path latency の申告値と揃う。
+///
+/// main を持つ consumer (audio in + out) だけが対象。自トラックの source は数えない (main の下流)。
+pub(super) fn compute_sc_delays(
     song: &Song,
-    bus_flags: &[bool],
-    buffer_frames: u32,
-    id_to_idx: &HashMap<u32, u32>,
-    chain_map: &ChainMap,
+    taps: &TapCtx<'_>,
     path_latency: &[u32],
     track_chain_latency: &[u32],
-) -> Vec<u32> {
-    let mut out = vec![0u32; song.tracks.len()];
+    non_sc_input: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let n = song.tracks.len();
+    let mut input_delay = vec![0u32; n];
+    let mut bus_sc_delay = vec![0u32; n];
     for (i, track) in song.tracks.iter().enumerate() {
-        let tap_lag = sidechain_tap_lag(bus_flags[i], buffer_frames);
-        let mut max_sc: u32 = 0;
-        let routes = plugins(&track.devices)
-            .filter(|p| !p.bypassed && p.ports.has_audio_input && p.ports.has_audio_output)
-            .flat_map(|p| p.aux_inputs.iter().flatten());
-        for route in routes {
-            let Some(src_idx) = tap_owner_idx(&route.tap, id_to_idx, chain_map) else {
-                continue;
-            };
-            if src_idx as usize == i {
-                continue;
+        let idx = i as u32;
+        let (mut pass1, mut pass2) = (0u32, 0u32);
+        let consumers = aux_consumers(&track.devices, &track.automation_lanes, &track.mod_routings);
+        for c in consumers.filter(|c| !c.inactive && c.audio_io) {
+            let pass = taps.pass(idx, c.top_index);
+            for route in c.routes.iter().flatten() {
+                let Some(src_idx) = tap_owner_idx(&route.tap, taps.id_to_idx, taps.chains) else {
+                    continue;
+                };
+                if src_idx == idx {
+                    continue;
+                }
+                let l = tap_source_latency(&route.tap, src_idx, path_latency, track_chain_latency, taps.chains);
+                match pass {
+                    ScPass::Pass1 => pass1 = pass1.max(l.saturating_add(taps.buffer_frames)),
+                    ScPass::Pass2 => pass2 = pass2.max(l),
+                }
             }
-            let l = tap_source_latency(&route.tap, src_idx, path_latency, track_chain_latency, chain_map)
-                .saturating_add(tap_lag);
-            max_sc = max_sc.max(l);
         }
-        out[i] = max_sc;
+        input_delay[i] = pass1;
+        bus_sc_delay[i] = pass2.saturating_sub(non_sc_input.get(i).copied().unwrap_or(0));
     }
-    out
+    (input_delay, bus_sc_delay)
 }

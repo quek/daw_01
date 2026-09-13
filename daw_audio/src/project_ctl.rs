@@ -768,9 +768,14 @@ pub fn handle_project_command(
             tracing::info!(project = key.0, ?dir, "project_dir updated");
         }
         // r.md #129: SC Listen / device scope は「聴き方・見方の都合」で Song に載らない。
-        // この版の engine は Listen の置換も scope の書き込みも持たないので、受理して捨てる
-        // (`docs/plan_rack_native_devices.md` §8.7 / §11.2 が保持と RT への受け渡しを定める)。
-        AudioCommand::SetScListen { .. } | AudioCommand::SetDeviceScopes { .. } => {}
+        // 共有面に置くだけで、RT が buffer 頭で読んで `NativeIo` に組む (§8.7 / §11.2)。
+        // Comp 以外の id は RT の op が一致しないので効かない。
+        AudioCommand::SetScListen { device_id, .. } => {
+            shared.sc_listen_device.store(device_id.unwrap_or(0), Ordering::Release);
+        }
+        AudioCommand::SetDeviceScopes { device_ids, .. } => {
+            shared.set_device_scopes(&device_ids);
+        }
         // MIDI Capture の試聴 (`docs/plan_global_sampler.md`)。
         cmd @ (AudioCommand::PreviewSequence { .. } | AudioCommand::PreviewSequenceStop { .. }) => {
             if sampler::handle_project_command(cmd, &shared, &mut ctl.preview_seq_generation) {

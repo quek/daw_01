@@ -10,21 +10,24 @@ use std::collections::HashMap;
 use common::model::{SendMode, Song, Track};
 
 use super::deps::Topology;
-use super::sidechain::emit_aux_input_taps;
+use super::sidechain::{TapCtx, emit_sidechain_taps};
 use super::{ChainMap, tap_bufref_for};
-use crate::graph::program::ChainProgram;
 use crate::graph::program_build::BuiltProgram;
-use crate::graph::schedule::{BufRef, NodeOp};
+use crate::graph::schedule::{BufRef, MASTER_OWNER, NodeOp};
 
 /// Emit ops in dependency post-order. `order` already lists every node after all
 /// of its dependencies, so children precede their group, sidechain sources precede
 /// their sink, and send sources precede their return.
+///
+/// `built` / `master_built` は可変: 内蔵 device の SC を staging にするか (`ScMode::Staged`) は
+/// tap を解決できた emit の時点でしか決まらないので、ここで program の scratch に書く。
 pub(super) fn emit_track_ops(
     song: &Song,
     topo: &Topology,
     order: &[u32],
-    built: &[BuiltProgram],
-    chain_map: &ChainMap,
+    built: &mut [BuiltProgram],
+    master_built: &mut BuiltProgram,
+    taps: &TapCtx<'_>,
 ) -> Vec<NodeOp> {
     let mut nodes = Vec::with_capacity(song.tracks.len() * 2 + 1);
     let mut master_srcs: Vec<(BufRef, f32)> = Vec::new();
@@ -32,20 +35,18 @@ pub(super) fn emit_track_ops(
     for &i in order {
         let track = &song.tracks[i as usize];
         let track_idx = i;
-        // PR4 sidechain: emit `SidechainTap` for every plugin on this
-        // track with an `aux_inputs` route pointing at a valid
-        // source track. The tap must run **before** the plugin's own
-        // `process()` (i.e. before ProcessTrack / ProcessGroupFx for
-        // this track) so the engine can stage the source signal in the
-        // plugin's `pd.buffer_aux_in[port]` shmem region.
-        emit_aux_input_taps(&track.devices, track.id, &topo.id_to_idx, chain_map, &mut nodes);
+        // PR4 sidechain: the tap must run **before** this track's devices process
+        // (i.e. before ProcessTrack / ProcessGroupFx) so the engine can stage the
+        // source signal (plugin: `pd.buffer_aux_in[port]`、native: `NativeScratch::sc`)。
+        let stores = (track.automation_lanes.as_slice(), track.mod_routings.as_slice());
+        emit_sidechain_taps(&track.devices, track.id, track_idx, stores, &mut built[i as usize], taps, &mut nodes);
 
         // A bus sums its inputs into its own scratch and runs its fx chain +
         // strip via ProcessGroupFx, rather than rendering its own clips /
         // instrument as a leaf (Ableton return-track semantics). A track that
         // is not a bus is a plain leaf. (classification: `Topology::bus_flags`)
         if topo.bus_flags[i as usize] {
-            emit_bus_ops(track, track_idx, topo, &built[i as usize].program, &mut nodes);
+            emit_bus_ops(track, track_idx, topo, built[i as usize].program.pass1_end, &mut nodes);
         } else {
             // Leaf track: full chain handled by ProcessTrack op.
             nodes.push(NodeOp::ProcessTrack { track_idx });
@@ -62,30 +63,29 @@ pub(super) fn emit_track_ops(
         dst: BufRef::Master,
     });
 
-    // master bus fx chain の sidechain。 master Mix の **後** に SidechainTap を
-    // 積む (= source track の scratch は dispatch_and_wait で確定済み)。
-    // `execute_schedule_post_dispatch` がこの tap を処理して source scratch を
-    // master fx plugin の `pd.buffer_aux_in[port]` に staging し、 直後の
-    // `process_master_fx_chain` が plugin process でそれを読む。 dst_track は
-    // `MASTER_TRACK_ID` (master は audio fx のみ)。 track 経路と同じ
-    // `emit_aux_input_taps` を使う (critique #1: emit site の単一化)。
-    emit_aux_input_taps(
+    // master bus fx chain の sidechain。 master Mix の **後** に tap を積む (= source track の
+    // scratch は dispatch_and_wait で確定済み)。 `execute_schedule_post_dispatch` がこの tap を
+    // 処理して staging し、 直後の `process_master_fx_chain` がそれを読む。 track 経路と同じ
+    // `emit_sidechain_taps` を使う (critique #1: emit site の単一化)。
+    emit_sidechain_taps(
         &song.master_fx_chain,
         common::model::MASTER_TRACK_ID,
-        &topo.id_to_idx,
-        chain_map,
+        MASTER_OWNER,
+        (song.song_lanes.as_slice(), song.song_mod_routings.as_slice()),
+        master_built,
+        taps,
         &mut nodes,
     );
     nodes
 }
 
 /// bus track (group / return / パラアウト先) の入力を自分の scratch へ合流し、
-/// `ProcessGroupFx` を積む。`program` はこの track の展開済み device program。
+/// `ProcessGroupFx` を積む。`pass1_end` はこの track の展開済み program の pass 1 終端。
 fn emit_bus_ops(
     track: &Track,
     track_idx: u32,
     topo: &Topology,
-    program: &ChainProgram,
+    pass1_end: usize,
     nodes: &mut Vec<NodeOp>,
 ) {
     // パラアウト (docs/plan_paraout.md): a group track whose own device
@@ -101,11 +101,10 @@ fn emit_bus_ops(
     //    the kick) in scratch and sums children on top via `MixAdditive`.
     // A pure group / return / paraout-dest bus (no instrument) clears +
     // sums the whole chain (`start_device = 0`).
-    let split = track.paraout_split_device();
-    let group_with_instrument = topo.is_group.contains(&track.id) && split.is_some();
+    let group_with_instrument = topo.gwi_split[track_idx as usize].is_some();
     // r.md #110: split は展開後の op 列上の位置 (`ChainProgram::pass1_end`)。
     let start_op = if group_with_instrument {
-        program.pass1_end as u32
+        pass1_end as u32
     } else {
         0
     };

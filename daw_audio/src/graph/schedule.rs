@@ -116,6 +116,16 @@ pub enum NodeOp {
         aux_in_port: u8,
     },
 
+    /// r.md #129: 内蔵 device (Comp / Bus Comp) の外部サイドチェイン。`src` の音を `owner`
+    /// (song-track index、master は [`MASTER_OWNER`]) の program の `natives[native_slot]` の
+    /// 受け皿へ写す (`graph::native::stage_native_sidechain`)。積む位置は plugin の `SidechainTap`
+    /// と同じ (track は process の前、master は master `Mix` の後)。
+    NativeSidechainTap {
+        src: BufRef,
+        owner: u32,
+        native_slot: u32,
+    },
+
     /// PR4 aux send: accumulate `src` (the source track's post- or
     /// pre-fader buffer) into `dst` (the destination return / bus track's
     /// scratch) scaled by the **live, per-sample-ramped** send gain of
@@ -169,6 +179,9 @@ pub enum DelayKey {
     /// パラアウト `MixAdditive` で dst 自身 (instrument main) を子の最大
     /// latency に揃える補償。
     MixDst { track_id: u32 },
+    /// r.md #129: pass 2 で走る bus の consumer が読むサイドチェインに、bus の入力 (子 / send の
+    /// 合流) を揃える補償。`ProcessGroupFx` の直前に積む (§8.3.3)。
+    BusScAlign { track_id: u32 },
 }
 
 /// Compiled, immutable execution plan. Compiled **off the RT thread**
@@ -194,11 +207,13 @@ pub struct Schedule {
     /// time.
     ///
     /// Indexed by song track index (parallel to `song.tracks`). Entry `i`
-    /// is `max(path_latency(src) [+ buffer_frames for a leaf dst] for src
-    /// in devices[*].aux_inputs[*].tap)`, or 0 if the track has no
-    /// sidechain wiring. leaf dst の `+ buffer_frames` は「tap の staging が
-    /// post-dispatch = 消費が次 buffer」という 1-buffer 遅延の補償
-    /// (`docs/plan_arch_refactor.md` §5)。
+    /// is `max(source latency + buffer_frames)` over the track's **pass-1**
+    /// sidechain consumers (leaf の全 device / group-with-instrument の prefix、
+    /// plugin の aux 入力と内蔵 device の SC)、or 0 if there are none.
+    /// `+ buffer_frames` は「tap の staging が post-dispatch = 消費が次 buffer」という
+    /// 1-buffer 遅延の補償 (`docs/plan_arch_refactor.md` §5)。pass 2 (bus の
+    /// `ProcessGroupFx`) の consumer はここではなく `ApplyDelay(BusScAlign)` で揃える
+    /// (`docs/plan_rack_native_devices.md` §8.3.3)。
     ///
     /// MVP scope: only audio-in+out devices' sidechain is reflected here.
     /// Instrument sidechain alignment requires delaying MIDI events too
@@ -234,6 +249,11 @@ pub struct Schedule {
     /// - WAV 書き出しはこの値だけ書き始めを後ろへずらす (= 先頭の遅延ぶんを捨てる)。
     ///   でないと書き出した wav が丸ごと後ろへずれ、stem を貼り戻すとダブる。
     pub master_latency_samples: u32,
+    /// r.md #129: master のフェーダー後 Limiter の先読み遅延を焼いたか
+    /// (= `Song::master_limiter_latency_active`: 静的 ON または On レーン / 変調)。
+    /// `MasterLimiterState::process` はこの値で遅延を通すかを決めるので、PDC の会計
+    /// (`master_latency_samples` の limiter 項) と実際の遅延が食い違わない (§18-G)。
+    pub master_limiter_latency: bool,
     /// r.md #110 Parallel: track index 順の展開済み device 列 (`docs/plan_parallel.md` §4.1)。
     /// pass 1 (worker) / pass 2 (`ProcessGroupFx`) の両方がこれを走らせる。
     /// scratch (Parallel / chain slot、並列 PDC の delay line) も program が所有する。
@@ -258,6 +278,7 @@ impl Schedule {
             follower_keys: Vec::new(),
             mod_kinds: Vec::new(),
             master_latency_samples: 0,
+            master_limiter_latency: false,
             track_programs: Vec::new(),
             master_program: ChainProgram::empty(common::model::MASTER_TRACK_ID),
             master_midi_a: Vec::with_capacity(crate::mixer::MAX_EVENTS),

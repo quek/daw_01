@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use common::device_scope_bridge::MAX_DEVICE_SCOPES;
 use common::model::Song;
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::protocol::{InstanceToken, ProjectKey};
@@ -402,6 +403,16 @@ pub struct ProjectShared {
     pub device_latencies: ArcSwap<crate::graph::DeviceLatencies>,
     /// `AudioBridge` の telemetry slot (claim 時に確定、RT はこの index で書く)。
     pub telemetry_slot: usize,
+    /// r.md #129 §8.7: SC Listen する Comp の device id (`0` = 無し)。IPC スレッドが
+    /// `AudioCommand::SetScListen` で書き、RT が buffer 頭で 1 回読む。**「聴き方」なので Song に
+    /// 載せない** — engine は `SetScListen` と `CloseProject` 以外で値を変えない (LoadSong / project
+    /// 切替でも解除しない: respawn 後の GUI の再送を無効にしないため)。Song に無い id もそのまま
+    /// 保持し、compile 後に一致する op があれば効く。
+    pub sc_listen_device: AtomicU64,
+    /// r.md #129 §11.2: device scope (EQ Par のスペクトラム) の対象 device id を slot 順に
+    /// (`0` = 空き)。IPC スレッドが `SetDeviceScopes` で切り詰め・重複除去して差し替え、scope
+    /// project の RT が buffer 頭で `load` する。
+    pub device_scope_watch: ArcSwap<[u64; MAX_DEVICE_SCOPES]>,
 }
 
 impl ProjectShared {
@@ -452,7 +463,26 @@ impl ProjectShared {
             master_gain: AtomicU32::new(1.0_f32.to_bits()),
             device_latencies: ArcSwap::from_pointee(HashMap::new()),
             telemetry_slot,
+            sc_listen_device: AtomicU64::new(0),
+            device_scope_watch: ArcSwap::from_pointee([0; MAX_DEVICE_SCOPES]),
         }
+    }
+
+    /// `SetDeviceScopes` の受け口: 0 と重複を除いて先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰め、
+    /// slot 表として差し替える (off-RT)。
+    pub fn set_device_scopes(&self, device_ids: &[u64]) {
+        let mut watch = [0u64; MAX_DEVICE_SCOPES];
+        let mut n = 0;
+        for &id in device_ids {
+            if n == MAX_DEVICE_SCOPES {
+                break;
+            }
+            if id != 0 && !watch[..n].contains(&id) {
+                watch[n] = id;
+                n += 1;
+            }
+        }
+        self.device_scope_watch.store(Arc::new(watch));
     }
 }
 
