@@ -311,8 +311,8 @@ impl AppData {
                     if from_other_track {
                         inst.ara_archive = None;
                     }
-                    resolve_aux_refs_after_paste(song, inst);
                 });
+                resolve_aux_refs_after_paste(song, &mut dev);
                 created.push(dev);
             }
             if let Some(chain) = song.chain_devices_mut(dest) {
@@ -490,8 +490,8 @@ fn relocate_in_song(
                 if cross {
                     inst.ara_archive = None;
                 }
-                retarget_self_track_aux(inst, src_track, dest_track);
             });
+            retarget_self_track_aux(&mut dev, src_track, dest_track);
             copies.push(dev);
         }
         let at = (dest_index as usize).min(song.chain_devices(dest)?.len());
@@ -536,8 +536,8 @@ fn relocate_in_song(
                 // ARA アーカイブは元トラックのクリップを指す persistent_id で作られて
                 // いるので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
                 inst.ara_archive = None;
-                retarget_self_track_aux(inst, src_track, dest_track);
             });
+            retarget_self_track_aux(&mut dev, src_track, dest_track);
         }
         moved.push(dev);
     }
@@ -641,36 +641,35 @@ fn extract_bindings(
 /// 触らない (= その配線はユーザーが意図して張ったもの)。 chain source (同 track の
 /// Parallel 内 chain) は運搬で chain が同 track に残るとは限らないが、 id は不変なので
 /// そのまま (dangling なら compile が黙って落とす)。
-fn retarget_self_track_aux(
-    inst: &mut common::model::PluginInstance,
-    src_track: u32,
-    dest_track: u32,
-) {
-    for slot in &mut inst.aux_inputs {
+///
+/// 対象は `dev` 以下の全 device (Parallel なら中身全部)。aux 入力は plugin と内蔵 Comp / Bus Comp
+/// 共通の slot (`for_each_aux_slot_mut`)、aux 出力は plugin だけ。
+fn retarget_self_track_aux(dev: &mut Device, src_track: u32, dest_track: u32) {
+    common::model::for_each_aux_slot_mut(std::slice::from_mut(dev), &mut |_, _, slot| {
         if let Some(route) = slot
             && let common::model::TapSource::Track(t) = &mut route.tap.source
             && *t == src_track
         {
             *t = dest_track;
         }
-    }
-    for slot in &mut inst.aux_outputs {
-        if let Some(route) = slot
-            && route.dest_track == src_track
-        {
-            route.dest_track = dest_track;
+    });
+    common::model::for_each_plugin_mut(std::slice::from_mut(dev), &mut |inst| {
+        for slot in &mut inst.aux_outputs {
+            if let Some(route) = slot
+                && route.dest_track == src_track
+            {
+                route.dest_track = dest_track;
+            }
         }
-    }
+    });
 }
 
 /// 貼り付け (別プロジェクト由来もありうる) の aux 参照解決。 実在しない track /
 /// chain を指す route は落とす。 **`aux_outputs` も見る** — `build_pasted_tracks` は
 /// `aux_inputs` しか見ていないが、それは取りこぼしなので真似しない。
-fn resolve_aux_refs_after_paste(
-    song: &common::model::Song,
-    inst: &mut common::model::PluginInstance,
-) {
-    for slot in &mut inst.aux_inputs {
+/// 対象は `dev` 以下の全 device (aux 入力は内蔵 Comp / Bus Comp の SC も含む)。
+fn resolve_aux_refs_after_paste(song: &common::model::Song, dev: &mut Device) {
+    common::model::for_each_aux_slot_mut(std::slice::from_mut(dev), &mut |_, _, slot| {
         if let Some(route) = slot {
             let alive = match route.tap.source {
                 common::model::TapSource::Track(t) => song.track_by_id(t).is_some(),
@@ -680,14 +679,16 @@ fn resolve_aux_refs_after_paste(
                 *slot = None;
             }
         }
-    }
-    for slot in &mut inst.aux_outputs {
-        if let Some(route) = slot
-            && song.track_by_id(route.dest_track).is_none()
-        {
-            *slot = None;
+    });
+    common::model::for_each_plugin_mut(std::slice::from_mut(dev), &mut |inst| {
+        for slot in &mut inst.aux_outputs {
+            if let Some(route) = slot
+                && song.track_by_id(route.dest_track).is_none()
+            {
+                *slot = None;
+            }
         }
-    }
+    });
 }
 
 /// 落とし先の副作用: VOICEVOX builtin が入ったら vocal track 化、 Transform が

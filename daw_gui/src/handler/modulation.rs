@@ -659,13 +659,11 @@ impl AppData {
         port: u8,
         tap_point: common::model::TapPoint,
     ) {
+        // r.md #129: plugin と内蔵 Comp / Bus Comp (port 0) 共通の slot。
         self.edit_song(|song| {
             let owner = song.device_owner_track(device_id);
-            if let Some(inst) = song.plugin_by_id_mut(device_id)
-                && let Some(route) = inst
-                    .aux_inputs
-                    .get_mut(port as usize)
-                    .and_then(|o| o.as_mut())
+            if let Some(dev) = song.device_by_id_mut(device_id)
+                && let Some(route) = dev.aux_input_slot_mut(port).and_then(|o| o.as_mut())
                 // 自 track を source にする route は Pre-FX 固定 (他は feedback)。
                 && !(matches!(route.tap.source, common::model::TapSource::Track(t) if Some(t) == owner)
                     && tap_point != common::model::TapPoint::PreFx)

@@ -548,11 +548,32 @@ impl AppData {
         Some(VideoFxParamsInspector { track_id, device_id, def, values })
     }
 
+    /// 値保持用レーン (`default_value` だけを持つ) の値を `owner` (track か master) の store に書く
+    /// (plugin / 映像 FX の Par の値の SSoT)。無ければ作り、**隠した状態で始める** (触っただけで
+    /// アレンジに行が増えない。非表示は見方の都合なので Song ではなく view に持つ)。
+    /// 置き場の分岐は `Song::param_stores_mut` / `push_lane` 1 か所 (r.md #129)。
+    fn write_param_lane_default(&mut self, owner: u32, target: common::model::AutomationTarget, norm: f64) {
+        let created = self
+            .edit_song(|song| {
+                let (lanes, _) = song.param_stores_mut(owner)?;
+                if let Some(lane) = lanes.iter_mut().find(|l| l.target == target) {
+                    lane.default_value = norm;
+                    return None;
+                }
+                let lane = song.push_lane(owner, common::model::AutomationLane::new(target, norm))?;
+                Some(common::model::AutomationLaneKey { track: owner, lane })
+            })
+            .flatten();
+        if let Some(key) = created {
+            self.cur.view.hidden_automation_lanes.insert(key);
+        }
+    }
+
     /// 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
     /// `PluginParam` lane の `default_value`（0..=1 norm、`video_fx` モジュール doc）。lane が
     /// 無ければ値保持用（`visible=false`・curve 無し）を作る。master は `song_lanes`。
     pub(crate) fn set_video_fx_param(&mut self, device_id: u64, param_id: u32, value_real: f32) {
-        use common::model::{AutomationLane, AutomationTarget};
+        use common::model::AutomationTarget;
         // lane の所有者 (track / master) は device_id から毎回引き直す
         // (r.md #71 プラグインのコピー / 移動: cursor track に依存しない)。
         let song = self.cur.song_doc.song();
@@ -576,38 +597,7 @@ impl AppData {
             param_id,
             legacy_device_index: None,
         };
-        // 新規作成したレーンは **隠した状態** で始める (触っただけでアレンジに行が
-        // 増えない)。 非表示は見方の都合なので Song ではなく `ui_prefs` に持つ。
-        let created_hidden = self.edit_song(|song| {
-            if track_id == common::model::MASTER_TRACK_ID {
-                if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = song.alloc_song_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    song.song_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: common::model::MASTER_TRACK_ID, lane: id })
-                }
-            } else if let Some(track) = song.track_by_id_mut(track_id) {
-                if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = track.alloc_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    track.automation_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: track_id, lane: id })
-                }
-            } else {
-                None
-            }
-        });
-        if let Some(Some(key)) = created_hidden {
-            self.cur.view.hidden_automation_lanes.insert(key);
-        }
+        self.write_param_lane_default(track_id, target.clone(), norm);
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
         self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,
@@ -729,7 +719,7 @@ impl AppData {
     /// 所有者 (track / master) の解決が `find_device_by_id` に移り、 wrapper 側の
     /// 存在理由 (cursor track の解決) が消えて中身まで同一になったため。
     pub(crate) fn set_plugin_param(&mut self, device_id: u64, param_id: u32, value_real: f64) {
-        use common::model::{AutomationLane, AutomationTarget};
+        use common::model::AutomationTarget;
         // device が消えていれば何もしない (削除済み device への stale binding /
         // stale event は正常系なので tracing は出さない)。
         let Some((track_id, _)) = find_device_by_id(self.cur.song_doc.song(), device_id) else {
@@ -754,38 +744,7 @@ impl AppData {
             param_id,
             legacy_device_index: None,
         };
-        // 新規作成したレーンは **隠した状態** で始める (触っただけでアレンジに行が
-        // 増えない)。 非表示は見方の都合なので Song ではなく `ui_prefs` に持つ。
-        let created_hidden = self.edit_song(|song| {
-            if track_id == common::model::MASTER_TRACK_ID {
-                if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = song.alloc_song_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    song.song_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: common::model::MASTER_TRACK_ID, lane: id })
-                }
-            } else if let Some(track) = song.track_by_id_mut(track_id) {
-                if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
-                    lane.default_value = norm;
-                    None
-                } else {
-                    let id = track.alloc_lane_id();
-                    let mut lane = AutomationLane::new(target.clone(), norm);
-                    lane.id = id;
-                    track.automation_lanes.push(lane);
-                    Some(common::model::AutomationLaneKey { track: track_id, lane: id })
-                }
-            } else {
-                None
-            }
-        });
-        if let Some(Some(key)) = created_hidden {
-            self.cur.view.hidden_automation_lanes.insert(key);
-        }
+        self.write_param_lane_default(track_id, target.clone(), norm);
         // 表示名は `automation_target_label` 1 本に寄せる (r.md #72 / #78)。
         // かつてここだけ `format!("{module} {name}")` を手組みしていたため、
         // 同じ param が経路によって別名で出ていた。

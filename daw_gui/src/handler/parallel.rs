@@ -536,15 +536,15 @@ impl AppData {
     /// 行数 = host が報告した port 数 (`aux_input_count`、engine が staging できる
     /// `MAX_AUX_IN` で cap)。
     pub fn sidechain_ports(&self, device_id: u64) -> Vec<SidechainPort> {
-        let Some(p) = self.cur.song_doc.song().plugin_by_id(device_id) else {
+        // r.md #129: plugin (host が報告した port 数) と内蔵 Comp / Bus Comp (port 0 の 1 本) 共通。
+        let Some(dev) = self.cur.song_doc.song().device_by_id(device_id) else {
             return Vec::new();
         };
-        let n = (p.aux_input_count as usize).min(common::process_data::MAX_AUX_IN);
-        (0..n)
+        (0..dev.aux_input_port_count())
             .map(|port| {
-                let route = p.aux_inputs.get(port).and_then(|o| o.as_ref());
+                let route = dev.aux_input(port);
                 SidechainPort {
-                    port: port as u8,
+                    port,
                     source: route.map(|r| r.tap.source),
                     tap_point: route.map(|r| r.tap.tap_point).unwrap_or_default(),
                 }
