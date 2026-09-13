@@ -1125,3 +1125,51 @@ impl AppData {
     }
 
 }
+
+#[cfg(test)]
+mod live_value_tests {
+    use common::model::{
+        AutomationLane, AutomationTarget, BusCompParam, ChainRef, Device, MASTER_TRACK_ID, NativeKind, NativeParamId,
+        Parallel, TrackBuiltinParam,
+    };
+
+    use crate::view::native_device::ParamOwner;
+
+    /// F-G8 (§7.5): 再生中は store (master なら song 側) のレーン値、停止中は model 値。
+    #[test]
+    fn live_values_follow_lanes_in_the_owner_store_only_while_playing() {
+        let mut app = crate::test_support::headless_app();
+        let bus = app.cur.song_doc.song().builtin_native(MASTER_TRACK_ID, NativeKind::BusComp).expect("master Bus Comp").id;
+        let thr = NativeParamId::BusComp(BusCompParam::Threshold);
+        let mut parallel = Parallel::new();
+        parallel.id = 9_001;
+        parallel.chains[0].id = 9_002;
+        app.edit_song(|song| {
+            song.insert_device(ChainRef::Track(MASTER_TRACK_ID), 0, Device::Parallel(parallel));
+            song.push_lane(MASTER_TRACK_ID, AutomationLane::new(AutomationTarget::NativeParam { device_id: bus, param: thr }, -7.0));
+            song.push_lane(
+                MASTER_TRACK_ID,
+                AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 }), 0.3),
+            );
+        });
+        let chain_gain = AutomationTarget::TrackBuiltin(TrackBuiltinParam::ChainGain { chain_id: 9_002 });
+        let dev = *app.cur.song_doc.song().native_by_id(bus).expect("bus");
+        let model = dev.param(thr).expect("thr");
+        assert!((model - -7.0).abs() > 1e-3, "model 値はレーン値と違う");
+
+        let scope = app.live_param_scope();
+        let owner = || ParamOwner::master(app.cur.song_doc.song());
+        assert_eq!(app.live_native_param(&scope, owner(), &dev, thr), model, "停止中は model 値");
+        assert_eq!(app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0), 1.0);
+
+        app.cur.transport.is_playing = true;
+        let scope = app.live_param_scope();
+        let owner = ParamOwner::master(app.cur.song_doc.song());
+        assert!((app.live_native_param(&scope, owner, &dev, thr) - -7.0).abs() < 1e-6, "再生中はレーン値");
+        assert!(
+            (app.live_native_device(&scope, owner, &dev).param(thr).unwrap() - -7.0).abs() < 1e-6,
+            "device ごと解いても同じ"
+        );
+        assert!((app.live_param_value(MASTER_TRACK_ID, &chain_gain, 1.0) - 0.3).abs() < 1e-6, "master の chain も追従");
+    }
+}

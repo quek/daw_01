@@ -184,9 +184,9 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         app.cur.song_doc.song().tracks
             .iter()
             .find(|t| t.id == group_id)
-            .map(|t| t.devices.len()),
+            .map(|t| t.plugins().count()),
         Some(2),
-        "group devices has 2 entries"
+        "group devices has 2 plugin entries (組み込み native は数えない)"
     );
 
     // Step 6: Bitcrush (device 0) を削除。
@@ -221,9 +221,9 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         app.cur.song_doc.song().tracks
             .iter()
             .find(|t| t.id == group_id)
-            .map(|t| t.devices.len()),
+            .map(|t| t.plugins().count()),
         Some(1),
-        "after Bitcrush remove: group devices has 1 entry"
+        "after Bitcrush remove: group devices has 1 plugin entry"
     );
 
     // Step 7: ungroup。 use-after-free 防止: audio 側に `ClosePluginShmem(delay)` を

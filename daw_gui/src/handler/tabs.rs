@@ -276,7 +276,7 @@ impl AppData {
 
     /// 子プロセスの respawn 後 (`handle_child_disconnected`): 新しいプロセスはどのタブも
     /// 知らないので、全タブの engine slot / plugin instance / session state を作り直す。
-    pub(crate) fn restore_tabs_after_respawn(&mut self, kind: common::protocol::ChildKind) {
+    pub fn restore_tabs_after_respawn(&mut self, kind: common::protocol::ChildKind) {
         use common::protocol::ChildKind;
         let active = self.cur.key;
         for key in self.tabs.order.clone() {

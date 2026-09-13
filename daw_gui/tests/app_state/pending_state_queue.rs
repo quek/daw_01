@@ -277,7 +277,8 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     // live は削除を反映している (= [synth, delay]、 bitcrush が抜けて delay が
     // index 1 へ shift)。
     let live_track = app.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id).unwrap();
-    assert_eq!(live_track.devices.len(), 2, "live: bitcrush removed");
+    // 組み込み native (Comp / EQ) はチェーン末尾に居るので plugin だけを数える。
+    assert_eq!(live_track.plugins().count(), 2, "live: bitcrush removed");
     assert_eq!(live_track.devices[0].as_plugin().unwrap().plugin_id, "test.synth");
     assert_eq!(live_track.devices[1].as_plugin().unwrap().plugin_id, "test.delay");
 
@@ -291,7 +292,7 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
                 .expect("snapshot is frozen once the Save reaches the front of the queue");
             let st = snap.tracks.iter().find(|t| t.id == track_id).unwrap();
             assert_eq!(
-                st.devices.len(),
+                st.plugins().count(),
                 2,
                 "snapshot must reflect the post-removal layout (co-temporal with its states)"
             );

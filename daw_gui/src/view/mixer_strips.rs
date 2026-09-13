@@ -1057,9 +1057,8 @@ fn draw_sends_rows(
     );
 }
 
-// Phase 4 Step B の `push_param_gesture_edges` は共通 helper として
-// `view::param_gesture` に抽出 (Phase 5 follow-up review、 transport.rs と
-// 重複していたため)。
+// ジェスチャーの申告は共通 helper `view::param_gesture::push_param_gesture` (面つき所有者、
+// r.md #129) に一本化している (transport.rs / Rack と重複させない)。
 
 #[cfg(test)]
 mod tests {
