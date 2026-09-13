@@ -16,6 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
+mod editing;
+mod native_device;
+mod tabs;
+
+use boa_engine::native_function::NativeFunctionPointer;
 use boa_engine::property::Attribute;
 use boa_engine::value::TryFromJs;
 use boa_engine::{
@@ -357,219 +362,79 @@ where
 // `daw.*` global の登録
 // ---------------------------------------------------------------------------
 
+/// `daw.*` に並べる関数の表 `(JS 名, 実装, 引数の数)`。**binding はここ 1 か所に並べる**
+/// (どの API があるかを 1 画面で見渡せるように)。実装は分野ごとに `script/*.rs` へ置いてよい。
+const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
+    ("loadSongFromObject", daw_load_song_from_object, 1),
+    ("setSlotPlugin", daw_set_slot_plugin, 6),
+    ("waitForPluginLoaded", daw_wait_for_plugin_loaded, 4),
+    ("setGeneratedAudio", daw_set_generated_audio, 3),
+    ("exportWav", daw_export_wav, 2),
+    // ----- headless export-range test harness ----------------
+    ("loadSongFile", daw_load_song_file, 1),
+    ("play", daw_play, 0),
+    ("stop", daw_stop, 0),
+    ("startRecording", daw_start_recording, 1),
+    ("stopRecording", daw_stop_recording, 0),
+    ("transportState", daw_transport_state, 0),
+    ("sleepMs", daw_sleep_ms, 1),
+    ("reinitForExport", daw_reinit_for_export, 1),
+    ("exportWavRange", daw_export_wav_range, 4),
+    ("analyzeLoudnessJson", daw_analyze_loudness, 3),
+    ("setDeviceLatency", daw_set_device_latency, 2),
+    ("takePluginLoadEventsJson", daw_take_plugin_load_events, 0),
+    // ----- `docs/plan_project_tabs.md` §5.4: プロジェクトタブ -----
+    ("newTab", tabs::daw_new_tab, 0),
+    ("closeTab", tabs::daw_close_tab, 0),
+    ("switchTab", tabs::daw_switch_tab, 1),
+    ("tabsJson", tabs::daw_tabs_json, 0),
+    ("metricsJson", tabs::daw_metrics_json, 0),
+    ("pendingPluginLoadsJson", daw_pending_plugin_loads, 0),
+    // ----- PR7 follow-up (JS test infra) ----------------------------
+    // app.* の API は ScriptHost::app (= AppData) を直接 mutate して
+    // production と同じ AppEvent handler を回す。 IPC は AppData の
+    // 内部 send_audio / send_plugin から bootstrap の channel に
+    // 流れる。 production GUI mode と挙動を一致させる。
+    ("appLoadSongJson", daw_app_load_song_json, 1),
+    ("inspectSongJson", daw_inspect_song_json, 0),
+    ("clipDisplayLabel", daw_clip_display_label, 1),
+    ("deviceChain", daw_device_chain, 1),
+    ("relocateDevices", daw_relocate_devices, 5),
+    ("setSelection", daw_set_selection, 1),
+    ("setTimeSelection", daw_set_time_selection, 3),
+    ("duplicateTracks", daw_duplicate_tracks, 2),
+    ("setHoverClip", daw_set_hover_clip, 1),
+    ("setHoverBeat", daw_set_hover_beat, 1),
+    ("dispatchSplit", daw_dispatch_split, 1),
+    ("dispatchGlue", daw_dispatch_glue, 0),
+    ("dispatchRenameClip", daw_dispatch_rename_clip, 2),
+    // ----- Phase 7 B5 Scale & Root API ------------------------------
+    ("setScaleAtPlayhead", editing::daw_set_scale_at_playhead, 2),
+    ("clearScaleChanges", editing::daw_clear_scale_changes, 0),
+    ("toggleSnapOnDraw", editing::daw_toggle_snap_on_draw, 0),
+    ("toggleSnapLiveInput", editing::daw_toggle_snap_live_input, 0),
+    ("toggleVirtualKeyboard", editing::daw_toggle_virtual_keyboard, 0),
+    ("virtualKeyboardKey", editing::daw_virtual_keyboard_key, 3),
+    ("toggleFoldToScale", editing::daw_toggle_fold_to_scale, 0),
+    ("quantizePitchesToScale", editing::daw_quantize_pitches_to_scale, 1),
+    ("addNote", editing::daw_add_note, 5),
+    ("setNotePositionsJson", editing::daw_set_note_positions_json, 1),
+    // ----- r.md #129 内蔵 device (`docs/plan_rack_native_devices.md` §10.19) -----
+    ("nativeDevices", native_device::daw_native_devices, 1),
+    ("nativeEdit", native_device::daw_native_edit, 2),
+    ("nativeGainReduction", native_device::daw_native_gain_reduction, 1),
+    ("masterLimiterGainReduction", native_device::daw_master_limiter_gain_reduction, 0),
+    ("setDevicesBypassed", native_device::daw_set_devices_bypassed, 2),
+    ("setScListen", native_device::daw_set_sc_listen, 1),
+    ("masterPeakDbfs", native_device::daw_master_peak_dbfs, 1),
+];
+
 fn register_daw_globals(ctx: &mut Context) -> Result<()> {
-    let daw = boa_engine::object::ObjectInitializer::new(ctx)
-        .function(
-            NativeFunction::from_fn_ptr(daw_load_song_from_object),
-            js_string!("loadSongFromObject"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_slot_plugin),
-            js_string!("setSlotPlugin"),
-            6,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_wait_for_plugin_loaded),
-            js_string!("waitForPluginLoaded"),
-            4,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_generated_audio),
-            js_string!("setGeneratedAudio"),
-            3,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_export_wav),
-            js_string!("exportWav"),
-            2,
-        )
-        // ----- headless export-range test harness ----------------
-        .function(
-            NativeFunction::from_fn_ptr(daw_load_song_file),
-            js_string!("loadSongFile"),
-            1,
-        )
-        .function(NativeFunction::from_fn_ptr(daw_play), js_string!("play"), 0)
-        .function(NativeFunction::from_fn_ptr(daw_stop), js_string!("stop"), 0)
-        .function(
-            NativeFunction::from_fn_ptr(daw_start_recording),
-            js_string!("startRecording"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_stop_recording),
-            js_string!("stopRecording"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_transport_state),
-            js_string!("transportState"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_sleep_ms),
-            js_string!("sleepMs"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_reinit_for_export),
-            js_string!("reinitForExport"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_export_wav_range),
-            js_string!("exportWavRange"),
-            4,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_analyze_loudness),
-            js_string!("analyzeLoudnessJson"),
-            3,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_device_latency),
-            js_string!("setDeviceLatency"),
-            2,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_take_plugin_load_events),
-            js_string!("takePluginLoadEventsJson"),
-            0,
-        )
-        // ----- `docs/plan_project_tabs.md` §5.4: プロジェクトタブ -----
-        .function(NativeFunction::from_fn_ptr(daw_new_tab), js_string!("newTab"), 0)
-        .function(NativeFunction::from_fn_ptr(daw_close_tab), js_string!("closeTab"), 0)
-        .function(NativeFunction::from_fn_ptr(daw_switch_tab), js_string!("switchTab"), 1)
-        .function(NativeFunction::from_fn_ptr(daw_tabs_json), js_string!("tabsJson"), 0)
-        .function(NativeFunction::from_fn_ptr(daw_metrics_json), js_string!("metricsJson"), 0)
-        .function(
-            NativeFunction::from_fn_ptr(daw_pending_plugin_loads),
-            js_string!("pendingPluginLoadsJson"),
-            0,
-        )
-        // ----- PR7 follow-up (JS test infra) ----------------------------
-        // app.* の API は ScriptHost::app (= AppData) を直接 mutate して
-        // production と同じ AppEvent handler を回す。 IPC は AppData の
-        // 内部 send_audio / send_plugin から bootstrap の channel に
-        // 流れる。 production GUI mode と挙動を一致させる。
-        .function(
-            NativeFunction::from_fn_ptr(daw_app_load_song_json),
-            js_string!("appLoadSongJson"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_inspect_song_json),
-            js_string!("inspectSongJson"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_clip_display_label),
-            js_string!("clipDisplayLabel"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_device_chain),
-            js_string!("deviceChain"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_relocate_devices),
-            js_string!("relocateDevices"),
-            5,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_selection),
-            js_string!("setSelection"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_time_selection),
-            js_string!("setTimeSelection"),
-            3,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_duplicate_tracks),
-            js_string!("duplicateTracks"),
-            2,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_hover_clip),
-            js_string!("setHoverClip"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_hover_beat),
-            js_string!("setHoverBeat"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_dispatch_split),
-            js_string!("dispatchSplit"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_dispatch_glue),
-            js_string!("dispatchGlue"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_dispatch_rename_clip),
-            js_string!("dispatchRenameClip"),
-            2,
-        )
-        // ----- Phase 7 B5 Scale & Root API ------------------------------
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_scale_at_playhead),
-            js_string!("setScaleAtPlayhead"),
-            2,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_clear_scale_changes),
-            js_string!("clearScaleChanges"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_toggle_snap_on_draw),
-            js_string!("toggleSnapOnDraw"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_toggle_snap_live_input),
-            js_string!("toggleSnapLiveInput"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_toggle_virtual_keyboard),
-            js_string!("toggleVirtualKeyboard"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_virtual_keyboard_key),
-            js_string!("virtualKeyboardKey"),
-            3,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_toggle_fold_to_scale),
-            js_string!("toggleFoldToScale"),
-            0,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_quantize_pitches_to_scale),
-            js_string!("quantizePitchesToScale"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_add_note),
-            js_string!("addNote"),
-            5,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(daw_set_note_positions_json),
-            js_string!("setNotePositionsJson"),
-            1,
-        )
-        .build();
+    let mut init = boa_engine::object::ObjectInitializer::new(ctx);
+    for &(name, function, length) in DAW_API {
+        init.function(NativeFunction::from_fn_ptr(function), JsString::from(name), length);
+    }
+    let daw = init.build();
 
     // `daw.scriptArgs` = { output: <CLI で指定された --output or null>,
     //                      <extra key>: <extra value>, ... }
@@ -1439,317 +1304,5 @@ fn daw_dispatch_rename_clip(
     Ok(JsValue::undefined())
 }
 
-// ============================================================================
-// Phase 7 B5 (`docs/plan_scale.html`): Scale & Root の JS smoke test API
-// ============================================================================
-//
-// production GUI mode の Transport bar / piano_roll toggle と同じ AppEvent を
-// 発火する。 JS smoke test (`tests/scripts/scale_smoke.js`) で
-// scale_changes の編集 / snap apply / quantize / fold mode の挙動を verify。
 
-fn scale_from_name(name: &str) -> Option<common::scale::Scale> {
-    use common::scale::Scale;
-    match name {
-        "Major" => Some(Scale::Major),
-        "NaturalMinor" | "Minor" => Some(Scale::NaturalMinor),
-        "Dorian" => Some(Scale::Dorian),
-        "Phrygian" => Some(Scale::Phrygian),
-        "Lydian" => Some(Scale::Lydian),
-        "Mixolydian" => Some(Scale::Mixolydian),
-        "Locrian" => Some(Scale::Locrian),
-        "HarmonicMinor" => Some(Scale::HarmonicMinor),
-        "MelodicMinor" => Some(Scale::MelodicMinor),
-        "MajorPentatonic" => Some(Scale::MajorPentatonic),
-        "MinorPentatonic" => Some(Scale::MinorPentatonic),
-        "Blues" => Some(Scale::Blues),
-        "WholeTone" => Some(Scale::WholeTone),
-        "Diminished" => Some(Scale::Diminished),
-        "HalfWholeDim" => Some(Scale::HalfWholeDim),
-        "Chromatic" => Some(Scale::Chromatic),
-        "HarmonicMajor" => Some(Scale::HarmonicMajor),
-        "DoubleHarmonic" => Some(Scale::DoubleHarmonic),
-        "LydianDominant" => Some(Scale::LydianDominant),
-        "PhrygianDominant" => Some(Scale::PhrygianDominant),
-        "HungarianMinor" => Some(Scale::HungarianMinor),
-        "Japanese" => Some(Scale::Japanese),
-        _ => None,
-    }
-}
 
-fn daw_set_scale_at_playhead(
-    _this: &JsValue,
-    args: &[JsValue],
-    ctx: &mut Context,
-) -> JsResult<JsValue> {
-    let root = args.get_or_undefined(0).to_number(ctx)? as u8;
-    let scale_name = args
-        .get_or_undefined(1)
-        .to_string(ctx)?
-        .to_std_string()
-        .map_err(|e| JsNativeError::typ().with_message(format!("scale name not utf8: {e}")))?;
-    let scale = scale_from_name(&scale_name).ok_or_else(|| {
-        JsNativeError::typ().with_message(format!("unknown scale name: {scale_name}"))
-    })?;
-    with_host(|host| {
-        host.app
-            .handle_event(AppEvent::SetScaleAtPlayhead { root, scale });
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_clear_scale_changes(
-    _this: &JsValue,
-    _args: &[JsValue],
-    _ctx: &mut Context,
-) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ClearScaleChanges);
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_toggle_snap_on_draw(
-    _this: &JsValue,
-    _args: &[JsValue],
-    _ctx: &mut Context,
-) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ToggleSnapOnDraw);
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_toggle_snap_live_input(
-    _this: &JsValue,
-    _args: &[JsValue],
-    _ctx: &mut Context,
-) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ToggleSnapLiveInput);
-    });
-    Ok(JsValue::undefined())
-}
-
-/// r.md #113: 仮想鍵盤 window の開閉 (= `K`)。
-fn daw_toggle_virtual_keyboard(
-    _this: &JsValue,
-    _args: &[JsValue],
-    _ctx: &mut Context,
-) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::VirtualKeyboard(
-            crate::event_virtual_keyboard::VirtualKeyboardEvent::Toggle,
-        ));
-    });
-    Ok(JsValue::undefined())
-}
-
-/// r.md #113: `virtualKeyboardKey(key, pressed, shift?)` — key grab が横取りした PC キーを
-/// 1 件模す (`key` は US 配列の刻印 1 文字: `"Z"` / `"2"` / `"["` 等)。 window が開いて
-/// いるかは問わない (headless では runner の宣言経路が無いので handler を直接叩く)。
-fn daw_virtual_keyboard_key(
-    _this: &JsValue,
-    args: &[JsValue],
-    ctx: &mut Context,
-) -> JsResult<JsValue> {
-    let key = args
-        .get_or_undefined(0)
-        .to_string(ctx)?
-        .to_std_string()
-        .map_err(|e| JsNativeError::typ().with_message(format!("key not utf8: {e}")))?;
-    let pressed = args.get_or_undefined(1).to_boolean();
-    let shift = args.get_or_undefined(2).to_boolean();
-    let mut chars = key.chars();
-    let physical = match (chars.next(), chars.next()) {
-        (Some(c), None) if c.is_ascii_digit() => {
-            daw_ui_platform::PhysicalKey::Digit(u8::try_from(c as u32 - '0' as u32).unwrap_or(0))
-        }
-        (Some(c), None) => daw_ui_platform::PhysicalKey::Char(c.to_ascii_uppercase()),
-        _ => {
-            return Err(JsNativeError::typ()
-                .with_message(format!("virtualKeyboardKey: 1 文字のキー刻印を渡す (got {key:?})"))
-                .into());
-        }
-    };
-    with_host(|host| {
-        host.app.handle_event(AppEvent::VirtualKeyboard(
-            crate::event_virtual_keyboard::VirtualKeyboardEvent::Key(daw_ui_core::GrabbedKey {
-                key: physical,
-                pressed,
-                repeat: false,
-                shift,
-            }),
-        ));
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_toggle_fold_to_scale(
-    _this: &JsValue,
-    _args: &[JsValue],
-    _ctx: &mut Context,
-) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ToggleFoldToScale);
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_quantize_pitches_to_scale(
-    _this: &JsValue,
-    args: &[JsValue],
-    ctx: &mut Context,
-) -> JsResult<JsValue> {
-    use crate::app::QuantizePitchTarget;
-    let target_name = args
-        .get_or_undefined(0)
-        .to_string(ctx)?
-        .to_std_string()
-        .map_err(|e| JsNativeError::typ().with_message(format!("target name not utf8: {e}")))?;
-    let target = match target_name.as_str() {
-        "selected_notes" => QuantizePitchTarget::SelectedNotes,
-        "selected_clip_all_notes" => QuantizePitchTarget::SelectedClipAllNotes,
-        other => {
-            return Err(JsNativeError::typ()
-                .with_message(format!("unknown quantize target: {other}"))
-                .into());
-        }
-    };
-    with_host(|host| {
-        host.app
-            .handle_event(AppEvent::QuantizePitchesToScale(target));
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_add_note(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    // 住所は **安定 id** (`Track.id` / `Clip.id`)。index ではない。
-    let track_id = args.get_or_undefined(0).to_number(ctx)? as u32;
-    let clip_id = args.get_or_undefined(1).to_number(ctx)? as u32;
-    let start_beat = args.get_or_undefined(2).to_number(ctx)?;
-    let duration = args.get_or_undefined(3).to_number(ctx)?;
-    let pitch = args.get_or_undefined(4).to_number(ctx)? as u8;
-    with_host(|host| {
-        host.app.handle_event(AppEvent::AddNote {
-            key: ClipKey { track_id, clip_id },
-            start_beat,
-            duration,
-            pitch,
-        });
-    });
-    Ok(JsValue::undefined())
-}
-
-fn daw_set_note_positions_json(
-    _this: &JsValue,
-    args: &[JsValue],
-    ctx: &mut Context,
-) -> JsResult<JsValue> {
-    let json = args
-        .get_or_undefined(0)
-        .to_string(ctx)?
-        .to_std_string()
-        .map_err(|e| JsNativeError::typ().with_message(format!("entries JSON not utf8: {e}")))?;
-    let entries: Vec<(u32, f64, u8)> = serde_json::from_str(&json).map_err(|e| {
-        JsNativeError::typ().with_message(format!("entries JSON decode: {e}"))
-    })?;
-    with_host(|host| {
-        host.app.handle_event(AppEvent::SetNotePositions(entries));
-    });
-    Ok(JsValue::undefined())
-}
-
-// ---------------------------------------------------------------------------
-// `docs/plan_project_tabs.md` §5.4: プロジェクトタブ (`daw.newTab` / `closeTab` /
-// `switchTab(index)` / `tabsJson`)。既存の API はすべてアクティブなタブに効く。
-// ---------------------------------------------------------------------------
-
-/// `daw.newTab()` — 空の Untitled を新しいタブに開いてアクティブにする。
-fn daw_new_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    let ok = with_host(|h| {
-        let ok = h.app.new_tab().is_some();
-        h.app.flush_all_song_sync();
-        ok
-    });
-    if !ok {
-        return Err(js_native("newTab: tab limit reached"));
-    }
-    Ok(JsValue::undefined())
-}
-
-/// `daw.closeTab()` — アクティブなタブを閉じる (未保存でも確認せず捨てる = headless)。
-fn daw_close_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    with_host(|h| {
-        let key = h.app.pk();
-        h.app.close_tab_now(key);
-        h.app.flush_all_song_sync();
-    });
-    Ok(JsValue::undefined())
-}
-
-/// `daw.switchTab(index)` — 表示順 `index` のタブをアクティブにする。
-fn daw_switch_tab(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let index = usize::try_from_js(args.get_or_undefined(0), ctx)?;
-    let ok = with_host(|h| {
-        let Some(key) = h.app.tabs.order.get(index).copied() else {
-            return false;
-        };
-        h.app.switch_tab(key);
-        true
-    });
-    if !ok {
-        return Err(js_native(format!("switchTab: no tab at index {index}")));
-    }
-    Ok(JsValue::undefined())
-}
-
-/// `daw.tabsJson()` — `[{index, key, path, dirty, playing, active}]`。
-fn daw_tabs_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    let json = with_host(|h| {
-        let rows: Vec<serde_json::Value> = h
-            .app
-            .tabs
-            .order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, key)| {
-                let ps = h.app.tab(*key)?;
-                // 走行状態は engine の telemetry (GUI の Tick と同じ面) から読む。
-                let playing = h
-                    .bootstrap
-                    .bridge
-                    .find_project(*key)
-                    .is_some_and(|b| b.playing());
-                Some(serde_json::json!({
-                    "index": index,
-                    "key": key.0,
-                    "path": ps.song_doc.file_path.as_ref().map(|p| p.display().to_string()),
-                    "dirty": ps.song_doc.is_dirty(),
-                    "playing": playing,
-                    "active": *key == h.app.pk(),
-                }))
-            })
-            .collect();
-        serde_json::to_string(&rows)
-    })
-    .map_err(|e| js_native(format!("tabsJson: serialize: {e}")))?;
-    Ok(JsString::from(json.as_str()).into())
-}
-
-/// `daw.metricsJson()` — engine の負荷 (`MetricsBridge`、resource monitor と同じ面):
-/// `{dspLoadAvg, xrunCount, bufferFrames, sampleRate}`。`docs/plan_project_tabs.md` §7 の
-/// 「1 タブのコストは変更前と同等」を headless で実測するための口。
-fn daw_metrics_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    let json = with_host(|h| {
-        let m = &h.bootstrap.metrics;
-        let (buffer_frames, sample_rate) = m.buffer_info();
-        serde_json::to_string(&serde_json::json!({
-            "dspLoadAvg": m.dsp_load_avg(),
-            "xrunCount": m.xrun_count(),
-            "bufferFrames": buffer_frames,
-            "sampleRate": sample_rate,
-        }))
-    })
-    .map_err(|e| js_native(format!("metricsJson: serialize: {e}")))?;
-    Ok(JsString::from(json.as_str()).into())
-}
