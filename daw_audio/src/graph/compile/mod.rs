@@ -91,11 +91,11 @@ fn tap_bufref_for(tap: &AudioTap, id_to_idx: &HashMap<u32, u32>, chains: &ChainM
 
 /// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: resolve a
 /// tap point to the source scratch buffer. `PostFader` = the track's final
-/// output (`TrackScratch`); `PostFx` = after the device chain but before the
-/// volume/pan strip (`PreFaderScratch`, snapshot guarded in the engine);
-/// `PreFx` = the raw signal before the device chain (`PreFxScratch`, snapshot
-/// guarded in the engine). All three snapshots are captured only when a tap
-/// actually needs them.
+/// output (`TrackScratch`); `PostFx` = after the **whole device chain in its
+/// order** (r.md #129: 組み込みの Comp / EQ も device) but before the volume/pan
+/// fader (`PreFaderScratch`); `PreFx` = the raw signal before the device chain
+/// (`PreFxScratch`). The snapshots are captured only when a tap actually needs
+/// them (`ChainProgram::snapshot_*`, baked at compile time).
 fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
     use common::model::TapPoint;
     match tap_point {
