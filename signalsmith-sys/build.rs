@@ -30,14 +30,31 @@ fn main() {
         build.define("DAW01_SMS_COUNT_ALLOCS", None);
     }
 
+    // CPU の要求水準は Rust 側と同じ (`.cargo/config.toml` の `target-cpu`、cargo が有効な機能を
+    // `CARGO_CFG_TARGET_FEATURE` で渡す)。演算順は変えない — MSVC は VS2022 以降 `/fp:precise` (既定) で
+    // FMA 合成を作らない、gcc / clang は既定で合成するので `-ffp-contract=off` で止める。
+    let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let avx2 = features.split(',').any(|f| f == "avx2");
+    let fma = features.split(',').any(|f| f == "fma");
+
     // The vendored headers are third-party; their warnings are noise in our
     // build log and must never fail the build.
     if build.get_compiler().is_like_msvc() {
         // /EHsc: the shim never lets an exception cross the C ABI, but the STL
         // containers inside the engine need the standard unwinding model.
         build.flag("/EHsc").flag("/W0");
+        if avx2 {
+            build.flag("/arch:AVX2");
+        }
     } else {
         build.flag("-w");
+        if avx2 {
+            build.flag("-mavx2");
+        }
+        if fma {
+            build.flag("-mfma");
+        }
+        build.flag("-ffp-contract=off");
     }
 
     build.compile("signalsmith_stretch_shim");

@@ -35,3 +35,10 @@ FFMPEG_BINDING_PATH = { value = "daw_gui/ffmpeg/binding_ffmpeg_7.1.rs", relative
 # ref: https://github.com/bevyengine/bevy/blob/main/.cargo/config_fast_builds.toml
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+
+# CPU の要求水準 = x86-64-v3 (AVX2 / FMA / BMI2、Intel Haswell・AMD Excavator 以降)。古い CPU では起動しない。
+# コンパイラの自動ベクトル化が AVX2 を使える。浮動小数点の演算順は変えない (Rust は掛け算と足し算を FMA に
+# まとめない) ので出力は同じ。C++ (signalsmith-sys) は build.rs が `CARGO_CFG_TARGET_FEATURE` から同じ水準を
+# 引き継ぐ (水準の SSoT はここ)。
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

@@ -48,7 +48,8 @@ make audit          # 依存の脆弱性 / 供給網攻撃の検査 (network 要
 (`scripts/preflight_no_running_app.sh`)。テストの一部が daw_gui 本体を subprocess として
 起動して audio device を開くので、DAW を開いたまま回すと再生が壊れるため。
 
-現状 Windows (x86_64-pc-windows-msvc) が対象。動画デコード / エンコードは vendored な
+現状 Windows (x86_64-pc-windows-msvc) が対象。CPU は x86-64-v3 (AVX2、Intel Haswell / AMD Excavator 以降) が
+必要 (`.cargo/config.toml` の `target-cpu`、それより古い CPU では起動しない)。動画デコード / エンコードは vendored な
 FFmpeg 共有ライブラリに依存する。
 
 VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**しておく
