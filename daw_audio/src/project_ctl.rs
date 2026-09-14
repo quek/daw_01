@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
-use common::audio_bridge::AudioBridgeHandle;
+use common::audio_bridge::{AudioBridgeHandle, PlaneCapacity, TelemetryPlane};
 use common::device_scope_bridge::MAX_DEVICE_SCOPES;
 use common::protocol::{AudioCommand, ProjectKey};
 
@@ -21,8 +21,15 @@ use crate::engine::{
     ProjectShared, RecordingLanes, RtBundle,
 };
 use crate::graph::{DelayLine, Schedule, compile_schedule};
+use crate::launcher::LauncherGrowth;
 use crate::mod_plan_publish::{ModPhaseTableBuilder, ModPlanPublisher};
+use crate::mod_tick::FollowerMaps;
 use crate::{audio_clip_renderer, launcher, mixer, sampler, song_values, stretch_engine};
+
+/// 伸びる telemetry 面の世代 (このプロセス内で単調増加 = 同じ名前を二度作らない、`crate::shmem` の命名契約)。
+static PLANE_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 面の作成を世代を変えて試す回数 (名前の衝突を避ける。`BundlePublisher::plane`)。
+const PLANE_CREATE_ATTEMPTS: usize = 4;
 
 /// project ごとの forward ring の深さ (RT が 1 buffer 遅れても人の編集速度では溢れない)。
 const BUNDLE_RING_CAP: usize = 8;
@@ -130,12 +137,9 @@ fn deliver_stretch_engines(
     if tx.is_abandoned() {
         return;
     }
+    // 1 回の publish = 1 便 (`StretchPoolDelivery` の doc)。配送済みの帳簿は push できてから進める。
+    let mut per_track: Vec<(usize, Vec<stretch_engine::StretchEngine>)> = Vec::new();
     for (track_idx, &needed) in renderer.engines_per_track.iter().enumerate() {
-        // `MAX_TRACKS` を超える track は render されない (`render_master_buffer` が
-        // `min(MAX_TRACKS)` で切る) ので、エンジンを作っても無駄。
-        if track_idx >= common::audio_bridge::MAX_TRACKS {
-            break;
-        }
         // `TrackScratch::stretch_engines` の予約容量が上限。 これを超えて配送すると
         // RT 側が取り込めず、「配送済み」 だけが進んで永久に足りない状態になる
         // (`assign_engine_slots` が同じ上限で彩色するので通常は届かない)。
@@ -157,20 +161,23 @@ fn deliver_stretch_engines(
             };
             engines.push(engine);
         }
-        if engines.is_empty() {
-            continue;
+        if !engines.is_empty() {
+            per_track.push((track_idx, engines));
         }
-        let added = u16::try_from(engines.len()).unwrap_or(u16::MAX);
-        if tx
-            .push(engine::StretchPoolDelivery { track_idx, engines })
-            .is_err()
-        {
-            // ring 満杯 = RT が drain していない (停止中 / 起動前)。 次の publish で
-            // 再送されるよう配送済みカウントは進めない。
-            tracing::warn!(track_idx, "stretch engine pool ring full; 次の publish で再送");
-            continue;
-        }
-        delivered[track_idx] = have.saturating_add(added);
+    }
+    if per_track.is_empty() {
+        return;
+    }
+    let added: Vec<(usize, u16)> =
+        per_track.iter().map(|(i, e)| (*i, u16::try_from(e.len()).unwrap_or(u16::MAX))).collect();
+    if tx.push(engine::StretchPoolDelivery { per_track }).is_err() {
+        // ring 満杯 = RT が drain していない (停止中 / 起動前)。 次の publish で
+        // 再送されるよう配送済みカウントは進めない。
+        tracing::warn!("stretch engine pool ring full; 次の publish で再送");
+        return;
+    }
+    for (track_idx, n) in added {
+        delivered[track_idx] = delivered[track_idx].saturating_add(n);
     }
 }
 
@@ -185,6 +192,17 @@ pub struct BundlePublisher {
     /// これまでに配送した per-track scratch の本数 (`RtBundle::scratch_growth`)。
     /// 増える方向にだけ動かす — 減らしても走行状態の移送が要るだけで得が無い。
     delivered_scratch: usize,
+    /// これまでに配送したランチャーの器の容量 `(行数, 行群数)` (`RtBundle::launcher_growth`)。増える方向だけ。
+    delivered_launcher: (usize, usize),
+    /// 伸びる telemetry 面の名前の起点 (`AudioBridge` の os_id) と、今 RT へ渡してある面。
+    plane_base: String,
+    plane: Option<Arc<TelemetryPlane>>,
+    /// 作れなかった面の要求 (同じ要求では作り直さない、[`Self::plane`])。
+    plane_failed_for: Option<PlaneCapacity>,
+    /// 直近の schedule compile で GR を publish する内蔵 device の数 (面の容量の要求)。
+    native_meters: u32,
+    /// 直近の schedule compile の `follower_keys` (`FollowerMaps` を plan の差し替えに合わせて作り直す)。
+    follower_keys: Vec<u32>,
     /// 直近の便に載せた audio clip renderer (ミラーの差し替えを検出する印。`Weak` なので中身は
     /// 延命しないが、確保は残るのでアドレスが別の renderer に再利用されることもない)。
     published_renderer: Weak<crate::audio_clip_renderer::AudioClipRenderer>,
@@ -197,15 +215,74 @@ pub struct BundlePublisher {
 }
 
 impl BundlePublisher {
-    pub fn new(tx: rtrb::Producer<RtBundle>) -> Self {
+    /// `plane_base` = 伸びる telemetry 面の名前の起点 (`AudioBridgeHandle::os_id`)。
+    pub fn new(tx: rtrb::Producer<RtBundle>, plane_base: &str) -> Self {
         Self {
             tx,
             delivered_scratch: 0,
+            delivered_launcher: (0, 0),
+            plane_base: plane_base.to_owned(),
+            plane: None,
+            plane_failed_for: None,
+            native_meters: 0,
+            follower_keys: Vec::new(),
             published_renderer: Weak::new(),
             parked: None,
             mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
         }
+    }
+
+    /// 成長便: per-track scratch の **追加分の行** (`RtBundle::scratch_growth`)。
+    fn scratch_growth(&mut self, tracks: usize) -> Option<mixer::ScratchGrowth> {
+        if tracks <= self.delivered_scratch {
+            return None;
+        }
+        let growth = mixer::ScratchGrowth::new(self.delivered_scratch, tracks);
+        self.delivered_scratch = tracks;
+        Some(growth)
+    }
+
+    /// 成長便: ランチャーの行の器 (行数か行群数が増えたときだけ、`RtBundle::launcher_growth`)。
+    fn launcher_growth(&mut self, song: &common::model::Song) -> Option<LauncherGrowth> {
+        let (rows, groups) = launcher::row_capacity(song);
+        let (have_rows, have_groups) = self.delivered_launcher;
+        if rows <= have_rows && groups <= have_groups {
+            return None;
+        }
+        self.delivered_launcher = (rows.max(have_rows), groups.max(have_groups));
+        Some(LauncherGrowth::with_capacity(self.delivered_launcher.0, self.delivered_launcher.1))
+    }
+
+    /// 差し替え便: 今の telemetry 面が `need` を収められなければ、2 冪に切り上げた容量で作り直す
+    /// (`RtBundle::plane`)。作れなければ (shmem の作成失敗) 旧面のまま = 溢れた分が表示されないだけで
+    /// 音には影響しない。
+    ///
+    /// 名前の衝突 (死んだ同じ pid の daw_audio が作った面を GUI がまだ開いている — 世代はプロセスごとに
+    /// 1 から数える) は次の世代で作り直して避ける。それでも作れなかった要求は、同じ要求のまま作り直さない
+    /// (publish は値だけの更新でも来るので、フェーダーを動かすたびに失敗を積まない)。
+    fn plane(&mut self, need: PlaneCapacity) -> Option<Arc<TelemetryPlane>> {
+        let have = self.plane.as_deref().map_or_else(PlaneCapacity::default, TelemetryPlane::capacity);
+        if (self.plane.is_some() && have.covers(&need)) || self.plane_failed_for == Some(need) {
+            return None;
+        }
+        let mut last_error = None;
+        for _ in 0..PLANE_CREATE_ATTEMPTS {
+            let generation = PLANE_GENERATION.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
+            let id = common::audio_bridge::plane_id(std::process::id(), generation);
+            match TelemetryPlane::create(&self.plane_base, id, have.grown_for(&need)) {
+                Ok(plane) => {
+                    let plane = Arc::new(plane);
+                    self.plane = Some(Arc::clone(&plane));
+                    self.plane_failed_for = None;
+                    return Some(plane);
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        tracing::error!(error = ?last_error, ?need, "telemetry plane の作成に失敗 (メーター等が溢れた分は表示されない)");
+        self.plane_failed_for = Some(need);
+        None
     }
 
     /// parked bundle があれば ring へ再 push を試みる。
@@ -217,17 +294,19 @@ impl BundlePublisher {
         }
     }
 
-    pub fn send(&mut self, bundle: RtBundle) {
+    pub fn send(&mut self, mut bundle: RtBundle) {
         self.flush();
-        if let Err(rtrb::PushError::Full(mut newest)) = self.tx.push(bundle) {
-            // ring full。 旧 parked は superseded だが、 `schedule` は snapshot
-            // ではなく delta なので、 捨てる前に `supersede` で newest へ
-            // 畳み込む (RT 側 `refresh_bundle` の coalescing と同じ規約 —
-            // 畳み込まないと topology 更新がここで失われる)。 畳み込み後の
-            // 残骸だけを drop する — off-thread。
-            if let Some(older) = self.parked.take() {
-                drop(newest.supersede(older));
-            }
+        // 旧 parked が ring に入れなかったら、newest を ring へ入れずに畳み込んで park し直す。flush の失敗と
+        // newest の push の間に RT が drain すると **newest が旧 parked より先に** RT へ届き、delta
+        // (`schedule` / 成長便の並び `ScratchGrowth::base`) の順序が逆転して、成長便の間が抜けたまま戻らない。
+        // `schedule` は snapshot ではなく delta なので、捨てる前に `supersede` で newest へ畳み込む
+        // (RT 側 `refresh_bundle` の coalescing と同じ規約)。畳み込み後の残骸だけを drop する — off-thread。
+        if let Some(older) = self.parked.take() {
+            drop(bundle.supersede(older));
+            self.parked = Some(bundle);
+            return;
+        }
+        if let Err(rtrb::PushError::Full(newest)) = self.tx.push(bundle) {
             self.parked = Some(newest);
         }
     }
@@ -246,25 +325,19 @@ pub fn resolve_buffer_frames(engine_shared: &EngineShared, sample_rate: u32) -> 
     }
 }
 
-/// `input_delay_per_track` が `TrackScratch` の prealloc (1s) を超える病的
-/// ケース用の置換 DelayLine を off-thread で確保する (install 時に RT が
-/// swap するだけで済むように)。 全 track が prealloc 内なら空 Vec。
-fn build_input_delay_replacements(schedule: &Schedule) -> Vec<Option<DelayLine>> {
-    let mut any = false;
-    let repl: Vec<Option<DelayLine>> = schedule
+/// `schedule` が要求する track ごとの入力遅延線を off-thread で確保する (install 時に RT が容量の
+/// 足りない行だけ swap する)。`TrackScratch` は遅延線を先に確保しない
+/// (`docs/plan_unbounded_tracks.md` §2.2) ので、遅延が 1 つでもあれば **その全部**を載せる
+/// (畳み込みで古い便の遅延線に頼らない)。遅延が無ければ空 Vec。
+pub(crate) fn build_input_delay_replacements(schedule: &Schedule) -> Vec<Option<DelayLine>> {
+    if schedule.input_delay_per_track.iter().all(|&d| d == 0) {
+        return Vec::new();
+    }
+    schedule
         .input_delay_per_track
         .iter()
-        .map(|&d| {
-            let need = d as usize + 1;
-            if d > 0 && need > mixer::INPUT_DELAY_PREALLOC_SAMPLES {
-                any = true;
-                Some(DelayLine::with_capacity(need))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if any { repl } else { Vec::new() }
+        .map(|&d| (d > 0).then(|| DelayLine::with_capacity(d as usize + 1)))
+        .collect()
 }
 
 /// `publish_bundle` の topology 引数。 呼び出し側が意図を名前で述べる。
@@ -339,6 +412,9 @@ impl ProjectCtl {
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
             scratch_growth: None,
+            launcher_growth: None,
+            plane: None,
+            follower_maps: None,
             plugin_refs: self.shared.plugin_refs.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
             preview_sequence: self.shared.preview_sequence.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
             loop_region: self.loop_region,
@@ -383,6 +459,8 @@ impl ProjectCtl {
                 None => Schedule::empty(),
             };
             let repl = build_input_delay_replacements(&sched);
+            self.publisher.native_meters = u32::try_from(sched.native_meter_count()).unwrap_or(u32::MAX);
+            self.publisher.follower_keys.clone_from(&sched.follower_keys);
             (Some(sched), repl)
         } else {
             (None, Vec::new())
@@ -396,23 +474,34 @@ impl ProjectCtl {
             .and_then(|sg| self.publisher.mod_plans.build(sg, sample_rate));
         // 位相表は曲長ぶんの刻みループなので **必ず off-thread**。構築中は旧表 +
         // 閉形式シードで凌ぎ、完成したら housekeeping が次の便で載せる。
-        if let (Some((plan, _)), Some(sg)) = (mod_plan.as_ref(), song.as_ref()) {
-            phase_tables.request(self.shared.key, Arc::clone(plan), sg, sample_rate);
+        if let (Some(d), Some(sg)) = (mod_plan.as_ref(), song.as_ref()) {
+            phase_tables.request(self.shared.key, Arc::clone(&d.plan), sg, sample_rate);
         }
-        // per-track scratch は **曲が要る本数だけ** off-thread で確保して、song と
-        // 同じ便で届ける (`RtBundle::scratch_growth` の doc — 無条件 `MAX_TRACKS` は
-        // タブ 1 枚あたり ~14 MB になる)。
-        let needed = song
-            .as_deref()
-            .map_or(0, |s| s.tracks.len().min(common::audio_bridge::MAX_TRACKS));
-        let scratch_growth = if needed > self.publisher.delivered_scratch {
-            self.publisher.delivered_scratch = needed;
-            Some((0..needed).map(|_| mixer::TrackScratch::new()).collect())
-        } else {
-            None
+        // follower の対応表は plan か schedule を載せる便に必ず同梱する (最新の組から作る)。
+        let follower_maps = (schedule.is_some() || mod_plan.is_some()).then(|| {
+            let fallback = common::mod_graph::ModPlan::default();
+            let plan = self.publisher.mod_plans.latest().map_or(&fallback, |p| &**p);
+            FollowerMaps::build(plan, &self.publisher.follower_keys)
+        });
+        // 器は **曲が要る分だけ** off-thread で確保して、song と同じ便で届ける
+        // (`docs/plan_unbounded_tracks.md` §2 / §3 — 固定長の器に溢れた分を捨てない)。
+        let (scratch_growth, launcher_growth, plane) = match song.as_deref() {
+            Some(s) => {
+                let need = PlaneCapacity {
+                    tracks: u32::try_from(s.tracks.len()).unwrap_or(u32::MAX),
+                    native_meters: self.publisher.native_meters,
+                    mod_sources: u32::try_from(s.mod_sources.len()).unwrap_or(u32::MAX),
+                    launcher_rows: u32::try_from(launcher::row_capacity(s).0).unwrap_or(u32::MAX),
+                };
+                (self.publisher.scratch_growth(s.tracks.len()), self.publisher.launcher_growth(s), self.publisher.plane(need))
+            }
+            None => (None, None, self.publisher.plane(PlaneCapacity::default())),
         };
         let bundle = RtBundle {
             scratch_growth,
+            launcher_growth,
+            plane,
+            follower_maps,
             schedule,
             mod_plan,
             reset_song_scoped_state: matches!(
@@ -560,7 +649,7 @@ pub fn open_project(
     let mut map = (**engine_shared.projects.load()).clone(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     map.insert(key, Arc::clone(&shared));
     engine_shared.projects.store(Arc::new(map));
-    let mut publisher = BundlePublisher::new(bundle_tx);
+    let mut publisher = BundlePublisher::new(bundle_tx, bridge.os_id());
     // RT は最初からミラーと同じ renderer を持っている (`ProjectRt::new`)。
     publisher.published_renderer = Arc::downgrade(&rt_renderer);
     projects.insert(
@@ -617,16 +706,12 @@ pub fn reap_closed_projects(
 }
 
 /// 鍵盤プレビューの note-on/off を送る対象 track の Vec index を、 その project の
-/// 現 song snapshot から track id で引く。 song 未ロード / id 不在 / `MAX_TRACKS`
-/// 超過は `None` (= プレビュー drop)。 id ベースなので GUI 側の track 並べ替えと
-/// race しない (= `SetTrackVolume` 等と同じ方針)。
+/// 現 song snapshot から track id で引く。 song 未ロード / id 不在は `None` (= プレビュー drop)。
+/// id ベースなので GUI 側の track 並べ替えと race しない (= `SetTrackVolume` 等と同じ方針)。
 pub(crate) fn preview_track_index(project: &ProjectShared, track_id: u32) -> Option<usize> {
     let snapshot = project.song.load(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let song = snapshot.as_deref()?;
-    song.tracks
-        .iter()
-        .position(|t| t.id == track_id)
-        .filter(|&i| i < engine::MAX_TRACKS)
+    song.tracks.iter().position(|t| t.id == track_id)
 }
 
 /// project 宛 `AudioCommand` の処理 (`main.rs::recv_loop` が宛先を解いてから呼ぶ)。
@@ -1024,6 +1109,9 @@ mod tests {
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
             scratch_growth: None,
+            launcher_growth: None,
+            plane: None,
+            follower_maps: None,
             plugin_refs: Arc::new(std::collections::HashMap::new()),
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
@@ -1092,7 +1180,7 @@ mod tests {
     #[test]
     fn bundle_publisher_parks_newest_on_full_ring() {
         let (tx, mut rx) = rtrb::RingBuffer::<RtBundle>::new(1);
-        let mut publisher = BundlePublisher::new(tx);
+        let mut publisher = BundlePublisher::new(tx, &format!("daw01_test_parks_{}", std::process::id()));
         publisher.send(empty_bundle()); // fills the 1-slot ring
         publisher.send(empty_bundle()); // full → parked
         publisher.send(empty_bundle()); // full → parked (previous parked dropped here)

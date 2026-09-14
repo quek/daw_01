@@ -659,7 +659,7 @@ mod tests {
         let _ = scene2;
 
         let render_once = || {
-            let mut rt = LauncherRuntime::new();
+            let mut rt = LauncherRuntime::for_song(&song);
             let mut trace: Vec<(usize, u32, u8, bool)> = Vec::new();
             let mut out = Vec::with_capacity(256);
             let mut active = Vec::with_capacity(256);
@@ -771,7 +771,8 @@ mod rt_assert_tests {
     #[test]
     fn ランチャーの_rt_経路は確保しない() {
         let song = rt_song();
-        let mut rt = LauncherRuntime::new();
+        // 器は曲が要る分を off-RT で確保する (live では song と同じ便で届く)。
+        let mut rt = LauncherRuntime::for_song(&song);
         // 事前確保は off-RT (live では publish 側 / export では walk の頭)。
         let mut out = Vec::with_capacity(4096);
         let mut active = Vec::with_capacity(1024);
@@ -784,12 +785,15 @@ mod rt_assert_tests {
         let mut r = vec![0.0f32; 512];
         let mut render_seq = 0u64;
         let name = format!("daw01-rt-launcher-{}", std::process::id());
-        let bridge = common::audio_bridge::AudioBridgeHandle::create(&name).expect("bridge");
-        // `docs/plan_project_tabs.md` §3: telemetry は project ごとの slot に書く。
-        let slot = bridge
-            .claim_project_slot(common::protocol::ProjectKey(1))
-            .expect("project slot");
-        let telemetry = bridge.project(slot);
+        // ランチャー行は project ごとの伸びる telemetry 面に書く (`docs/plan_unbounded_tracks.md` §3)。
+        let rows = u32::try_from(crate::launcher::row_capacity(&song).0).expect("rows");
+        let telemetry = common::audio_bridge::TelemetryPlane::create(
+            &name,
+            common::audio_bridge::plane_id(std::process::id(), 1),
+            common::audio_bridge::PlaneCapacity { launcher_rows: rows, ..Default::default() },
+        )
+        .expect("plane");
+        let telemetry = &telemetry;
 
         // 1 buffer 目は行の生成 (`Vec::push`) を含むので検査の外で回す。
         rt.update(&song, BufferSpan::new(0.0, 120.0, 48_000, 512), LaunchQuantize::Off, true);

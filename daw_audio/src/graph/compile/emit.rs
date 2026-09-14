@@ -185,12 +185,7 @@ pub(super) fn emit_followers(
     let mut follower_slots: Vec<crate::graph::follower::FollowerSlot> = Vec::new();
     let mut follower_keys: Vec<u32> = Vec::new();
     let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();
-    for (slot, ms) in song
-        .mod_sources
-        .iter()
-        .take(common::audio_bridge::MAX_MOD_SOURCES)
-        .enumerate()
-    {
+    for (slot, ms) in song.mod_sources.iter().enumerate() {
         mod_kinds.push(ms.kind.clone());
         // §5 D: 状態移送キー = ModSource の安定 id (0 = 未採番、移送対象外)。
         follower_keys.push(ms.id);

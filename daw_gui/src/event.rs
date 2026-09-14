@@ -1028,16 +1028,17 @@ pub enum AppEvent {
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
-    /// メーター面の 1 tick。`tracks` は per-track の `(peak L, peak R)`、`native_gr` は GR を出す
-    /// 内蔵 device の `(device id, GR dB (0 以下))`、id 昇順 (`None` = seqlock が読めなかった = 前回値を保つ)、
-    /// `master_limiter_gr_db` は master Limiter の GR (dB、0 以下)。
+    /// メーター面の 1 tick。`tracks` は per-track の `(track id, peak L, peak R)` (`None` = seqlock が読めなかった
+    /// = 前回値を保つ)、`native_gr` は GR を出す内蔵 device の `(device id, GR dB (0 以下))`、id 昇順
+    /// (`None` = 同上)、`master_limiter_gr_db` は master Limiter の GR (dB、0 以下)。**トラックは id で引く**
+    /// (並べ替えが engine に届く前の数フレームも正しいトラックに出る、不変条件 1)。
     ///
     /// **1 イベントにまとめてある**のは、shmem のメーター面を 1 回の走査で読んだ
     /// 組だから — 別イベントに割ると「同じ buffer の値かどうか」の保証が消える。
     TrackPeaksTick {
         /// アクティブなタブの slot から読んだもの。届いた時点で `cur` が別タブなら捨てる。
         project: common::protocol::ProjectKey,
-        tracks: Vec<(f32, f32)>,
+        tracks: Option<Vec<(u32, f32, f32)>>,
         native_gr: Option<Vec<(u64, f32)>>,
         master_limiter_gr_db: f32,
     },
@@ -1069,20 +1070,22 @@ pub enum AppEvent {
         project: common::protocol::ProjectKey,
         plane: common::mod_plane::ModPlane,
     },
-    /// r.md #117: track ごとの鳴っているボイス `(track index, voice)`、 同じ poller が
+    /// r.md #117: track ごとの鳴っているボイス `(track id, voice)`、 同じ poller が
     /// 30Hz で読む。 変調ラックが `Note` 起点ソースのカーソルをボイスごとに描く。
     TrackVoicesTick {
         project: common::protocol::ProjectKey,
-        voices: Vec<(usize, common::audio_bridge::VoiceSnapshot)>,
+        voices: Vec<(u32, common::audio_bridge::VoiceSnapshot)>,
     },
     /// resource monitor (r.md #3): poller が ~30Hz で読む全体メトリクス
-    /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate)。
+    /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate) と、per-plugin の直近 `process()` 時間
+    /// (`(instance token, μs)`、plugin host の計測面から読んだもの)。
     MetricsTick {
         dsp_load_peak: f32,
         dsp_load_avg: f32,
         xrun_count: u64,
         buffer_frames: u32,
         sample_rate: u32,
+        plugin_us: Vec<(common::protocol::InstanceToken, u32)>,
     },
     /// resource monitor (r.md #3): sysinfo スレッドが ~1Hz で読む system 指標
     /// (daw_01 3 プロセス合計の CPU% と常駐メモリ MB)。

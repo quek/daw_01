@@ -41,6 +41,13 @@ impl SceneRun {
 }
 
 impl LauncherRuntime {
+    /// 列のフォローアクションの走行状態を捨てる。
+    ///
+    /// **「全行の走行状態をリセットする操作」と同じ寿命**にする — プロジェクト
+    /// 切替 / 再生開始 (reseed) / 全停止 / 全行アレンジ復帰。1 行だけの停止・
+    /// アレンジ復帰では捨てない (他の行はまだその列を鳴らしているので、列の
+    /// 連鎖はまだ生きている)。残したまま全停止すると、止めたはずの全行が
+    /// `scene.at` に到達した瞬間に勝手に鳴り出す。
     pub(super) fn disarm_scene(&mut self) {
         self.scene = SceneRun::NONE;
     }
@@ -139,7 +146,7 @@ impl LauncherRuntime {
         let n = song.scenes.len().min(MAX_SCENES);
         let occ = &mut self.occupied[..n];
         occ.fill(false);
-        for_each_launcher_row(song, |_, cells| {
+        for_each_launcher_row(song, |_, cells, _| {
             cells.for_each_scene_id(|id| {
                 if let Some(i) = song.scenes[..n].iter().position(|sc| sc.id == id) {
                     occ[i] = true;
@@ -157,7 +164,7 @@ impl LauncherRuntime {
 /// 再生開始 (reseed) でも使うために切り出してある。
 pub(super) fn scene_longest(song: &Song, scene_id: u32) -> f64 {
     let mut longest = 0.0_f64;
-    for_each_launcher_row(song, |_, cells| {
+    for_each_launcher_row(song, |_, cells, _| {
         if let Some(c) = cells.find_by_scene(scene_id) {
             longest = longest.max(c.length_beats);
         }

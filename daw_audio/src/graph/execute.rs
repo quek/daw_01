@@ -24,9 +24,9 @@ use common::plugin_ref::{DISPATCH_TIMEOUT_MS, DispatchOutcome};
 use common::process_data::EventKind;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
-use crate::engine::{MAX_TRACKS, PluginEntry, PluginRefs, SyncSlot, WorkerRig};
+use crate::engine::{PluginEntry, PluginRefs, SyncSlot, WorkerRig};
 use crate::graph::mix::{
-    has_soloed_contributor, mix_into_master, mix_into_track_scratch, mix_send_into_track_scratch,
+    any_soloed, mix_into_master, mix_into_track_scratch, mix_send_into_track_scratch,
     resolve_tap_buffers,
 };
 use crate::graph::native::{NativeIo, apply_listen_override, stage_native_sidechain};
@@ -401,9 +401,9 @@ pub fn process_track_owned(
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Folder solo: グループを solo したらその子も鳴る (Ableton / Reaper 準拠)。
-    // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる。
-    let ancestor_soloed = song.is_some_and(|s| s.ancestor_soloed(song_track.id));
-    let effective_mute = muted || (any_solo && !solo && !ancestor_soloed);
+    // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる (祖先は compile 時に焼いた表)。
+    let effective_mute =
+        muted || (any_solo && !solo && !song.is_some_and(|s| any_soloed(s, &program.solo_ancestors)));
 
     // strip は常に適用する — excluded track でも `track_l/r` に post-fader
     // signal を残す (solo された return への send / sidechain tap が読める、
@@ -759,6 +759,7 @@ pub fn execute_schedule_post_dispatch(
                     recording_lanes,
                     n,
                     rows.track_rows(*src_track_idx as usize),
+                    track_programs.get(*src_track_idx as usize).map_or(&[], |p| p.solo_contributors.as_slice()),
                 );
             }
 
@@ -890,13 +891,13 @@ fn run_group_fx_chain(
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Live 互換: 子 / send 元のいずれかが solo されていれば、 この bus 自身は
-    // solo フラグが無くても透過させる (has_soloed_contributor)。 さらに folder
-    // solo: 祖先 group が solo なら、 このネストした group bus 自身も透過させる。
+    // solo フラグが無くても透過させる (`solo_contributors`)。 さらに folder
+    // solo: 祖先 group が solo なら、 このネストした group bus 自身も透過させる (`solo_ancestors`)。
     let effective_mute = muted
         || (any_solo
             && !solo
-            && !song.ancestor_soloed(song_track.id)
-            && !has_soloed_contributor(song, song_track.id));
+            && !any_soloed(song, &program.solo_ancestors)
+            && !any_soloed(song, &program.solo_contributors));
 
     // strip は常に適用 (mirrors process_track_owned) — mute 意味論は
     // `apply_strip` の doc 参照。
@@ -1006,7 +1007,7 @@ pub fn render_master_buffer(
     master_r[..n].fill(0.0);
 
     let any_solo = song.tracks.iter().any(|t| t.solo);
-    let n_tracks = song.tracks.len().min(MAX_TRACKS).min(scratch.len());
+    let n_tracks = song.tracks.len().min(scratch.len());
 
     // ---- pass 1: per-track render (worker pool fan-out / serial fallback) --
     let pool = worker.and_then(|rig| rig.pool.as_ref());
@@ -1266,8 +1267,7 @@ mod sidechain_tests {
         assert!(schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
 
         const FRAMES: usize = 64;
-        let mut scratch: Vec<TrackScratch> =
-            (0..common::audio_bridge::MAX_TRACKS).map(|_| TrackScratch::new()).collect();
+        let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
         for i in 0..FRAMES {
             scratch[0].track_l[i] = (i as f32) * 0.1;
             scratch[0].track_r[i] = -(i as f32) * 0.1;
@@ -1345,8 +1345,7 @@ mod sidechain_tests {
         let mut schedule = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         const FRAMES: usize = 16;
-        let mut scratch: Vec<TrackScratch> =
-            (0..common::audio_bridge::MAX_TRACKS).map(|_| TrackScratch::new()).collect();
+        let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
         scratch[0].track_l[0] = 1.0;
         let mut master_l = vec![0.0f32; FRAMES];
         let mut master_r = vec![0.0f32; FRAMES];
@@ -1447,6 +1446,7 @@ mod send_tests {
             &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
             crate::launcher::TrackRows::default(),
+            &[],
         );
         for i in 0..FRAMES {
             let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
@@ -1470,6 +1470,7 @@ mod send_tests {
             &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
             crate::launcher::TrackRows::default(),
+            &[],
         );
         for i in 0..FRAMES {
             assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
@@ -1491,6 +1492,7 @@ mod send_tests {
             &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
             crate::launcher::TrackRows::default(),
+            &[],
         );
         for i in 0..FRAMES {
             assert_eq!(
@@ -1518,6 +1520,7 @@ mod send_tests {
                 &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, true, &empty,
                 FRAMES,
                 crate::launcher::TrackRows::default(),
+            &[],
             );
             scratch[1].track_l[0]
         };
@@ -1558,6 +1561,7 @@ mod send_tests {
             &mut scratch, 1, 0, true, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
             FRAMES,
             crate::launcher::TrackRows::default(),
+            &[],
         );
         for i in 0..FRAMES {
             assert!(
@@ -1580,6 +1584,7 @@ mod send_tests {
         mix_send_into_track_scratch(
             &mut scratch, 1, 0, false, &song, 0, 999, 48_000, 120.0, 0.0, false, &empty, FRAMES,
             crate::launcher::TrackRows::default(),
+            &[],
         );
         assert_eq!(scratch[1].track_l[0], 3.0, "unknown send id must be a no-op");
     }
@@ -1593,15 +1598,17 @@ mod send_tests {
     fn soloed_send_source_keeps_return_solo_safe() {
         // song_with_send: Vocal (id 1) post-fader sends to Reverb (id 2).
         let mut song = song_with_send(1.0, SendMode::PostFader, true);
+        let sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
+        let reverb = &sched.track_programs[1].solo_contributors;
         song.tracks[0].solo = true; // solo the send SOURCE (Vocal)
         assert!(
-            has_soloed_contributor(&song, 2),
+            any_soloed(&song, reverb),
             "Reverb return must be solo-safe when its send source is soloed"
         );
         // Nothing soloed → the return has no soloed contributor.
         song.tracks[0].solo = false;
         assert!(
-            !has_soloed_contributor(&song, 2),
+            !any_soloed(&song, reverb),
             "with nothing soloed, the return has no soloed contributor"
         );
     }
@@ -1609,12 +1616,12 @@ mod send_tests {
     /// Folder solo: soloing a GROUP must keep its children audible (Ableton /
     /// Reaper folder behavior). The leaf strip rule excludes a non-soloed
     /// track under solo only when no ancestor group is soloed, so a child of
-    /// a soloed group is NOT effective-muted. Guards the `ancestor_soloed`
-    /// condition added to the effective-mute formula.
+    /// a soloed group is NOT effective-muted. Guards the `solo_ancestors`
+    /// condition in the effective-mute formula.
     #[test]
     fn soloed_group_keeps_children_audible() {
         // id 10 = group, id 11 = child of 10, id 12 = unrelated.
-        let song = Song {
+        let mut song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 10;
@@ -1629,17 +1636,15 @@ mod send_tests {
             ..Default::default()
         };
 
-        let any_solo = song.tracks.iter().any(|t| t.solo);
-        assert!(any_solo);
+        let sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
+        let ancestors = |i: usize| sched.track_programs[i].solo_ancestors.as_slice();
+        assert_eq!(ancestors(1), [0], "child の祖先は group (song-track index)");
         // child: not soloed itself, but its ancestor group is → audible.
-        assert!(song.ancestor_soloed(11), "child sees the soloed ancestor group");
-        let child = &song.tracks[1];
-        let child_excluded = any_solo && !child.solo && !song.ancestor_soloed(child.id);
-        assert!(!child_excluded, "child of a soloed group must not be solo-excluded");
+        assert!(any_soloed(&song, ancestors(1)), "child sees the soloed ancestor group");
         // unrelated track: no soloed ancestor → excluded (silent) under solo.
-        let other = &song.tracks[2];
-        let other_excluded = any_solo && !other.solo && !song.ancestor_soloed(other.id);
-        assert!(other_excluded, "unrelated track is silenced while a group is soloed");
+        assert!(!any_soloed(&song, ancestors(2)), "unrelated track is silenced while a group is soloed");
+        song.tracks[0].solo = false;
+        assert!(!any_soloed(&song, ancestors(1)), "group の solo を外せば child は透過しない");
     }
 }
 
@@ -1672,7 +1677,7 @@ mod render_master_tests {
             ..Song::default()
         };
         let mut schedule = compile_schedule_for_test(&song, 48_000, 0).unwrap();
-        let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
+        let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
         let mut master_l = vec![7.0f32; 64]; // 前 buffer の残骸 — clear されるべき
         let mut master_r = vec![7.0f32; 64];
         let plugin_refs: PluginRefs = HashMap::new();

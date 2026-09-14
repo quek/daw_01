@@ -247,6 +247,13 @@ pub struct ChainProgram {
     /// SC Listen: この buffer で検出信号を書いた Comp の slot。トラック出力 (PostFx 点) で消費する
     /// (`graph::native::apply_listen_override`)。
     pub listen_pending: Option<u32>,
+    /// この track へ **流れ込む** track (子 → group、send 元 → return) の推移閉包 (song-track index)。
+    /// solo の「子 / send 元が solo なら bus 自身も透過」判定 (`mix::any_soloed`) が
+    /// RT で Song の配線を歩かないよう compile 時に焼く (`docs/plan_unbounded_tracks.md` §2.3)。master は空。
+    pub solo_contributors: Vec<u32>,
+    /// この track の祖先 group (`parent_group_id` を辿った song-track index、近い順)。folder solo
+    /// (「group を solo したら子も鳴る」) の判定を `solo_contributors` と同じく表の参照だけにする。master は空。
+    pub solo_ancestors: Vec<u32>,
 }
 
 impl ChainProgram {
@@ -268,6 +275,8 @@ impl ChainProgram {
             snapshot_post_fx: false,
             fader: true,
             listen_pending: None,
+            solo_contributors: Vec::new(),
+            solo_ancestors: Vec::new(),
         }
     }
 

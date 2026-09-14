@@ -29,10 +29,11 @@ pub struct IpcState {
     /// (DSP/xrun/buffer) / sysinfo スレッド (CPU/mem) / runner (fps) が別々に
     /// 更新し、 status bar 常駐メーターと詳細パネルが読む。
     pub metrics: common::metrics_bridge::ResourceMetrics,
-    /// MetricsBridge ハンドル (per-plugin CPU の直接読み出し用)。 GUI mode のみ
-    /// `Some`、 script / test は `None`。 詳細パネルが Song の各 device (かつ
-    /// `loaded_devices` に居るもの) について `plugin_dsp_us` を直接読む。
+    /// MetricsBridge ハンドル (xrun カウンタのクリア用)。 GUI mode のみ `Some`、 script / test は `None`。
     pub metrics_bridge: Option<Arc<common::metrics_bridge::MetricsBridgeHandle>>,
+    /// per-plugin の直近 `process()` 時間 (μs、instance token キー)。poller が plugin host の計測面から読んで
+    /// `MetricsTick` で届ける (枠の割り当て / 解放は plugin host の仕事で、GUI は読むだけ)。
+    pub plugin_us: std::collections::HashMap<common::protocol::InstanceToken, u32>,
 
     // -------- Plugin database / picker --------
     pub plugin_db: Option<Arc<PluginDatabase>>,

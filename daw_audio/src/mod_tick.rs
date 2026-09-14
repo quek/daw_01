@@ -38,20 +38,12 @@ pub use common::mod_graph::MOD_TICK_FRAMES;
 use common::mod_plane::{ModPlane, ModTickPlane, ModTickPlaneRef};
 use common::model::{AutomationTarget, MASTER_TRACK_ID, ModParam, Song};
 
+use crate::mod_plan_publish::ModPlanDelivery;
+
 /// 1 buffer で踏みうる刻みの上限 (`MAX_FRAMES / MOD_TICK_FRAMES` + 前後の端数 2)。
 /// 行 / mark の器はこの数で事前確保して RT で伸ばさない。
 pub const MAX_TICKS_PER_BUFFER: usize =
     common::process_data::MAX_FRAMES / MOD_TICK_FRAMES as usize + 2;
-
-/// 値面に載せるソース数の上限。
-///
-/// **`mod_graph::build_plan` は `Song::mod_sources` を切らない** (グラフの
-/// 正しさに上限は要らないので)。一方 RT 側の器はここで事前確保するので、
-/// 切らずに回すと 64 を超える曲で **audio thread が再確保する**。
-/// `compile_schedule` の `follower_slots` と `AudioBridge::mod_scalars` が
-/// 既に同じ上限で切っているので、値面もそこに合わせる
-/// (= 65 個目以降のソースは値を publish しない、という既存の契約)。
-const MAX_SLOTS: usize = common::audio_bridge::MAX_MOD_SOURCES;
 
 /// フォロワー係数のうち変調できるもの (刻みごとに引き直す)。
 pub const FOLLOWER_PARAMS: [ModParam; 5] = [
@@ -81,6 +73,93 @@ pub struct TickSpan {
     pub frame: u32,
     /// この区間の frame 数。
     pub frames: u32,
+}
+
+/// plan の大きさで確保した RT の器。**off-thread で作って plan と一緒に届ける**
+/// ([`crate::mod_plan_publish::ModPlanDelivery`])。ソース数に上限を置かない
+/// (`docs/plan_unbounded_tracks.md` §2.7) ので、器は曲が要る大きさで plan ごとに作り直す
+/// — RT で伸ばすと再確保になる。
+#[derive(Debug, Default)]
+pub struct ModTickBuffers {
+    plane: ModTickPlane,
+    row: Vec<f32>,
+    depth_row: Vec<f32>,
+    depth_ids: Vec<u32>,
+    follower_eff: Vec<FollowerEff>,
+    follower_cols: Vec<u16>,
+    publish: ModPlane,
+}
+
+impl ModTickBuffers {
+    /// `plan` を走らせるのに要る器 (off-thread)。plan から決まる列 (動くフォロワー / 動く深さ) もここで解く
+    /// — ソース数に比例する走査を RT の install に持ち込まない。
+    #[must_use]
+    pub fn for_plan(plan: &ModPlan) -> Self {
+        let (n, d) = (plan.nodes.len(), plan.depth_groups.len());
+        let mut follower_cols = Vec::with_capacity(n);
+        follower_cols.extend(moving_followers(plan));
+        Self {
+            plane: ModTickPlane::with_capacity(n, d, MAX_TICKS_PER_BUFFER),
+            row: Vec::with_capacity(n),
+            depth_row: Vec::with_capacity(d),
+            depth_ids: plan.depth_groups.iter().map(|g| g.routing_id).collect(),
+            follower_eff: Vec::with_capacity(n * MAX_TICKS_PER_BUFFER),
+            follower_cols,
+            publish: ModPlane::with_capacity(n, d),
+        }
+    }
+}
+
+/// 係数が **動く** フォロワーの plan slot (plan 順)。動かす経路は変調の辺と automation lane の
+/// 2 つ (r.md #89 Q4)。lane を数えないと「レーンで Attack を描いたのに compile 時の係数のまま
+/// 鳴る」になる。
+fn moving_followers(plan: &ModPlan) -> impl Iterator<Item = u16> + '_ {
+    plan.nodes.iter().enumerate().filter_map(|(slot, node)| {
+        let s = u16::try_from(slot).ok()?;
+        let by_edge = node.in_edges.iter().any(|e| FOLLOWER_PARAMS.contains(&e.param));
+        let by_lane = plan.lane_params.iter().any(|(ls, p)| *ls == s && FOLLOWER_PARAMS.contains(p));
+        (by_edge || by_lane).then_some(s)
+    })
+}
+
+/// [`Schedule::follower_keys`](crate::graph::Schedule) と plan の対応表 (off-thread で作り、plan か
+/// schedule を載せる便に同梱する。RT は差し替えるだけ)。
+#[derive(Debug, Default)]
+pub struct FollowerMaps {
+    /// schedule slot → 係数表の列 ([`FollowerDrive::col_of_slot`])。変調されていないフォロワーは `u16::MAX`。
+    pub cols: Vec<u16>,
+    /// plan slot → schedule の follower index。`u16::MAX` = 対応なし。`mod_graph::tick` は envelope
+    /// follower の値を `ModRuntime::set_follower` 経由でしか受け取らない (slot 取り違えを型で防ぐ設計)
+    /// ので、engine は毎刻みこの写像で `Schedule::follower_slots[i].env` を引く。
+    pub env_of_slot: Vec<u16>,
+}
+
+impl FollowerMaps {
+    /// `plan` と `follower_keys` (schedule slot → `ModSource::id`) から作る。**plan / schedule の
+    /// どちらかが変わったら作り直す** (毎刻み線形探索しないための表)。
+    #[must_use]
+    pub fn build(plan: &ModPlan, follower_keys: &[u32]) -> Self {
+        let moving: Vec<u16> = moving_followers(plan).collect();
+        let cols = follower_keys
+            .iter()
+            .map(|id| {
+                plan.slot_of(*id)
+                    .and_then(|s| moving.iter().position(|c| *c == s))
+                    .and_then(|c| u16::try_from(c).ok())
+                    .unwrap_or(u16::MAX)
+            })
+            .collect();
+        let mut env_of_slot = vec![u16::MAX; plan.nodes.len()];
+        for (i, id) in follower_keys.iter().enumerate() {
+            if let Some(slot) = plan.slot_of(*id)
+                && let Ok(idx) = u16::try_from(i)
+                && let Some(cell) = env_of_slot.get_mut(usize::from(slot))
+            {
+                *cell = idx;
+            }
+        }
+        Self { cols, env_of_slot }
+    }
 }
 
 /// 制御グリッドを走る本体。engine (`LocalState`) と export (`render_loop`) が
@@ -124,22 +203,24 @@ pub struct ModTickRunner {
 impl ModTickRunner {
     #[must_use]
     pub fn new() -> Self {
-        let n = common::audio_bridge::MAX_MOD_SOURCES;
+        // 器は空の plan の大きさ (= 0)。実際の器は plan と一緒に届く ([`Self::install`])。
+        let plan = Arc::new(ModPlan::default());
+        let ModTickBuffers { plane, row, depth_row, depth_ids, follower_eff, follower_cols, publish } =
+            ModTickBuffers::for_plan(&plan);
         Self {
-            plan: Arc::new(ModPlan::default()),
+            plan,
             table: None,
             rt: ModRuntime::default(),
             first_tick: i64::MIN,
             marks: Vec::with_capacity(MAX_TICKS_PER_BUFFER),
             next_mark: PhaseMark::default(),
-            plane: ModTickPlane::with_capacity(n, MAX_TICKS_PER_BUFFER),
-            row: Vec::with_capacity(n),
-            // 深さが動く変調はソース数より多くなり得ないので同じ器で足りる。
-            depth_row: Vec::with_capacity(n),
-            depth_ids: Vec::with_capacity(n),
-            follower_eff: Vec::with_capacity(n * MAX_TICKS_PER_BUFFER),
-            follower_cols: Vec::with_capacity(n),
-            publish: ModPlane::with_capacity(n),
+            plane,
+            row,
+            depth_row,
+            depth_ids,
+            follower_eff,
+            follower_cols,
+            publish,
             spans: Vec::with_capacity(MAX_TICKS_PER_BUFFER),
         }
     }
@@ -169,51 +250,37 @@ impl ModTickRunner {
         Some(mark.beat + rem / f64::from(sample_rate.max(1)) * mark.bpm / 60.0)
     }
 
-    /// 値面に載せる slot 数 (`MAX_SLOTS` で切った plan の node 数)。
+    /// 値面に載せる slot 数 (= plan の node 数)。
     #[must_use]
     #[inline]
     fn n_slots(&self) -> usize {
-        self.plan.nodes.len().min(MAX_SLOTS)
+        self.plan.nodes.len()
     }
 
-    /// 新しい plan と、それに合わせて **off-thread で `install` 済み**の RT 状態を
+    /// 新しい plan と、それに合わせて **off-thread で `install` 済み**の RT 状態と器を
     /// 差し込む (`ModRuntime::install` は `Vec::resize` するので RT では走らせない)。
     /// 走行状態は捨てて次の buffer で張り直す。
     ///
-    /// 戻り値は **旧 plan と旧 RT 状態** — どちらも `Vec` を抱えるので、
+    /// 戻り値は **旧 plan と旧 RT 状態と旧器** — どれも `Vec` を抱えるので、
     /// audio thread で drop させず呼び出し側が recycle 経路へ渡すこと
     /// (`self.plan = plan` の代入で旧 `Arc` を落とすと、最後の参照だったときに
     /// `Vec<ModNode>` / 各 `in_edges` / MSEG の `points` が RT で free される)。
-    pub fn install(&mut self, plan: Arc<ModPlan>, rt: ModRuntime) -> (Arc<ModPlan>, ModRuntime) {
-        self.follower_cols.clear();
-        for (slot, node) in plan.nodes.iter().enumerate().take(MAX_SLOTS) {
-            let Ok(s) = u16::try_from(slot) else { continue };
-            // 係数が **動く** フォロワーだけ刻みごとに引き直す。動かす経路は
-            // 変調の辺と automation lane の 2 つ (r.md #89 Q4)。lane を数えないと
-            // 「レーンで Attack を描いたのに compile 時の係数のまま鳴る」になる。
-            let by_edge = node
-                .in_edges
-                .iter()
-                .any(|e| FOLLOWER_PARAMS.contains(&e.param));
-            let by_lane = plan
-                .lane_params
-                .iter()
-                .any(|(ls, p)| *ls == s && FOLLOWER_PARAMS.contains(p));
-            if by_edge || by_lane {
-                self.follower_cols.push(s);
-            }
-        }
+    pub fn install(&mut self, delivery: ModPlanDelivery) -> ModPlanDelivery {
+        let ModPlanDelivery { plan, rt, mut bufs } = delivery;
+        std::mem::swap(&mut self.plane, &mut bufs.plane);
+        std::mem::swap(&mut self.row, &mut bufs.row);
+        std::mem::swap(&mut self.depth_row, &mut bufs.depth_row);
+        std::mem::swap(&mut self.depth_ids, &mut bufs.depth_ids);
+        std::mem::swap(&mut self.follower_eff, &mut bufs.follower_eff);
+        std::mem::swap(&mut self.follower_cols, &mut bufs.follower_cols);
+        std::mem::swap(&mut self.publish, &mut bufs.publish);
+        // `follower_cols` / `depth_ids` は `ModTickBuffers::for_plan` が plan から解いて届けた列。
         let old_plan = std::mem::replace(&mut self.plan, plan);
-        // 深さが動く変調も slot と同じ `MAX_SLOTS` で切る (`depth_row` / `depth_ids` /
-        // `publish` の器がその大きさ)。溢れた群は「深さが動かない」扱いに degrade する
-        // (= モデルの深さのまま鳴る)。ここは RT なので、切らずに extend すると再確保になる。
-        self.depth_ids.clear();
-        self.depth_ids
-            .extend(self.plan.depth_groups.iter().take(MAX_SLOTS).map(|g| g.routing_id));
         self.marks.clear();
         self.plane.reset(&[], &[], MOD_TICK_FRAMES);
+        self.follower_eff.clear();
         self.first_tick = i64::MIN;
-        (old_plan, std::mem::replace(&mut self.rt, rt))
+        ModPlanDelivery { plan: old_plan, rt: std::mem::replace(&mut self.rt, rt), bufs }
     }
 
     /// 位相表を差し替える (旧表を返す — 呼び出し側が recycle する)。
@@ -394,7 +461,7 @@ impl ModTickRunner {
         }
         // r.md #89 Q9: 深さも刻みごとに動く (深さを動かしていなければ空 = ゼロコスト)。
         self.depth_row.clear();
-        for g in self.plan.depth_groups.iter().take(MAX_SLOTS) {
+        for g in &self.plan.depth_groups {
             self.depth_row
                 .push(self.rt.depth_for(&self.plan, g.routing_id).unwrap_or(g.base_depth));
         }
@@ -470,53 +537,17 @@ impl ModTickRunner {
         }
     }
 
-    /// `Schedule::follower_keys` (schedule slot → `ModSource::id`) から
-    /// 「plan slot → schedule の follower index」を作る。`u16::MAX` = 対応なし。
-    ///
-    /// `mod_graph::tick` は envelope follower の値を `ModRuntime::set_follower`
-    /// 経由でしか受け取らない (slot 取り違えを型で防ぐ設計) ので、engine は毎刻み
-    /// この写像で `Schedule::follower_slots[i].env` を引く。**毎刻み線形探索しない**
-    /// ために plan / schedule の差し替え時に 1 度だけ作る。
-    pub fn build_follower_env_map(&self, follower_keys: &[u32], out: &mut Vec<u16>) {
-        out.clear();
-        out.resize(self.plan.nodes.len().min(MAX_SLOTS), u16::MAX);
-        for (i, id) in follower_keys.iter().enumerate() {
-            if let Some(slot) = self.plan.slot_of(*id)
-                && let Ok(idx) = u16::try_from(i)
-                && let Some(cell) = out.get_mut(usize::from(slot))
-            {
-                *cell = idx;
-            }
-        }
-    }
-
-    /// `Schedule::follower_keys` (schedule slot → `ModSource::id`) から
-    /// 「schedule slot → 係数表の列」を作る。**plan / schedule のどちらかが
-    /// 変わったら engine が作り直す。** 変調されていないフォロワーは `u16::MAX`。
-    pub fn build_follower_cols(&self, follower_keys: &[u32], out: &mut Vec<u16>) {
-        out.clear();
-        for id in follower_keys {
-            let col = self
-                .plan
-                .slot_of(*id)
-                .and_then(|s| self.follower_cols.iter().position(|c| *c == s))
-                .and_then(|c| u16::try_from(c).ok())
-                .unwrap_or(u16::MAX);
-            out.push(col);
-        }
-    }
-
     /// GUI / sidecar へ出す 1 点の面 (buffer 頭の値)。
     pub fn publish_plane(&mut self) -> &ModPlane {
         self.publish.clear();
         let row = self.plane.as_ref().row(0);
-        for (i, id) in self.plan.slot_ids.iter().enumerate().take(MAX_SLOTS) {
+        for (i, id) in self.plan.slot_ids.iter().enumerate() {
             self.publish
                 .push(*id, row.values.get(i).copied().unwrap_or(0.0));
         }
         // r.md #89 Q9: 深さの実効値も一緒に出す — GUI の深さリング / 到達値表示が
         // 「動いている深さ」を見られないと、ラックの表示と音が食い違う。
-        for (i, g) in self.plan.depth_groups.iter().enumerate().take(MAX_SLOTS) {
+        for (i, g) in self.plan.depth_groups.iter().enumerate() {
             self.publish.push_depth(
                 g.routing_id,
                 row.depths.get(i).copied().unwrap_or(g.base_depth),
@@ -699,11 +730,9 @@ mod tests {
         let sr = 48_000u32;
         let run = |chunks: &[u32]| -> Vec<(u64, f32)> {
             let plan = Arc::new(common::mod_graph::build_plan(&song, 1, |_| 0.0));
-            let mut rt = ModRuntime::default();
-            rt.install(&plan);
             let table = Arc::new(common::mod_graph::ModPhaseTable::build(&plan, &song, sr, 4.0));
             let mut r = ModTickRunner::new();
-            r.install(plan, rt);
+            r.install(ModPlanDelivery::new(plan));
             r.set_table(Some(table));
             r.locate(&song, 0, 0.0, sr);
             let mut out = Vec::new();
@@ -727,19 +756,15 @@ mod tests {
         // `locate` し直しても拍軸が 1 buffer 遅れない (再生中の編集で音が遅れる退行の回帰)。
         {
             let plan = Arc::new(common::mod_graph::build_plan(&song, 1, |_| 0.0));
-            let mut rt = ModRuntime::default();
-            rt.install(&plan);
             let mut r = ModTickRunner::new();
-            r.install(plan.clone(), rt);
+            r.install(ModPlanDelivery::new(Arc::clone(&plan)));
             r.locate(&song, 0, 0.0, sr);
             let _ = r.run_buffer(&song, 0, 480, sr, |_, _| 0.0, |_| None);
             let end_beat = r.beat_at_sample(480, sr).expect("buffer 末は評価済み");
             let head2 = r.run_buffer(&song, 480, 544, sr, |_, _| 0.0, |_| None);
             assert!((end_beat - head2.beat).abs() < 1e-9, "{end_beat} vs {}", head2.beat);
             // plan 差し替え → buffer 末の拍で locate → 次の頭も同じ拍。
-            let mut rt2 = ModRuntime::default();
-            rt2.install(&plan);
-            r.install(plan, rt2);
+            r.install(ModPlanDelivery::new(plan));
             let end2 = end_beat + 544.0 / f64::from(sr) * 120.0 / 60.0;
             r.locate(&song, 1024, end2, sr);
             let head3 = r.run_buffer(&song, 1024, 512, sr, |_, _| 0.0, |_| None);

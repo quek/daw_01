@@ -7,13 +7,11 @@
 //! `execute.rs` に残る。
 //!
 //! RT 規約: 全関数が audio callback / worker / export freewheel から呼ばれる。
-//! ヒープ確保・ロック・I/O を行わない (`has_soloed_contributor` の BFS も
-//! スタック上の固定長配列で回す)。「どの track の snapshot を取るか」の判定は Song を
-//! 歩くので RT には置かず、compile 時に `ChainProgram::snapshot_*` へ焼く (r.md #129 §18-B)。
+//! ヒープ確保・ロック・I/O を行わない。Song の配線を歩く判定は RT には置かず、compile 時に
+//! program へ焼く (`ChainProgram::snapshot_*` r.md #129 §18-B / `ChainProgram::solo_contributors`)。
 
 use common::model::{Song, Track};
 
-use crate::engine::MAX_TRACKS;
 use crate::graph::BufRef;
 use crate::graph::program::{ChainProgram, ChainScratch, ParallelScratch};
 use crate::graph::schedule::MASTER_OWNER;
@@ -213,6 +211,8 @@ pub(super) fn mix_send_into_track_scratch(
     // 撃っていたら、アレンジのカーブではなく **セルのカーブ**を使う
     // (Volume / Pan / PluginParam は既にそうなっていて、ここだけ抜けていた)。
     rows: crate::launcher::TrackRows<'_>,
+    // 送り元トラックへ流れ込む track の表 (`ChainProgram::solo_contributors`)。
+    src_contributors: &[u32],
 ) {
     use common::model::{AutomationTarget, TrackBuiltinParam};
 
@@ -243,7 +243,7 @@ pub(super) fn mix_send_into_track_scratch(
     // process_track_owned), so the soloed-return audition still works.
     if any_solo {
         let dest_soloed = song.tracks.get(dst_idx).is_some_and(|d| d.solo);
-        if !dest_soloed && !track.solo && !has_soloed_contributor(song, track.id) {
+        if !dest_soloed && !track.solo && !any_soloed(song, src_contributors) {
             return;
         }
     }
@@ -321,56 +321,16 @@ pub(super) fn mix_send_into_track_scratch(
     }
 }
 
-/// `track_id` に流れ込む (= contribute する) track のいずれかが
-/// `solo == true` なら true。 寄与エッジは「子 (`parent_group_id == node`、
-/// group の soloed-via-children)」 と「`node` 宛ての aux send を持つ track
-/// (= send 元、 return の solo-safe)」 の 2 種。 これで「あるトラックを
-/// solo すると、 そのトラックが送っている reverb / delay の **リターン** も
-/// 生かす」 Ableton 準拠の挙動になる (リターンを solo-safe にしないと、
-/// ソロしたトラックの send 先が solo 規則で無音化され、 ソロ中はセンド
-/// エフェクトが聞こえない)。 routing graph は DAG (`compile_schedule` が
-/// cycle を弾く) なので BFS は停止する。 `hops` 上限は child + send の
-/// fan-in を見込んで広めに取る。
-pub(super) fn has_soloed_contributor(song: &Song, track_id: u32) -> bool {
-    // RT-safe non-allocating BFS: this runs on the audio dispatch path, so
-    // the frontier and the visited set must live on the stack rather than
-    // heap-allocated `Vec`s. `MAX_TRACKS` (= 32) caps the number of distinct
-    // nodes; the stack is sized to comfortably hold them. Track ids are not
-    // dense indices, so the visited set stores ids directly.
-    let mut frontier = [0u32; MAX_TRACKS * 2];
-    let mut frontier_len = 0usize;
-    let mut visited = [0u32; MAX_TRACKS];
-    let mut visited_len = 0usize;
-
-    // Seed with the starting node, marked visited so it is never re-pushed.
-    frontier[frontier_len] = track_id;
-    frontier_len += 1;
-    visited[visited_len] = track_id;
-    visited_len += 1;
-
-    while frontier_len > 0 {
-        frontier_len -= 1;
-        let node = frontier[frontier_len];
-        for t in &song.tracks {
-            let feeds_node = t.parent_group_id == Some(node)
-                || t.sends.iter().any(|s| s.dest_track_id == node);
-            if feeds_node {
-                if t.solo {
-                    return true;
-                }
-                // Skip already-visited nodes so the fixed-length frontier
-                // can never overflow (each distinct node is pushed once).
-                if visited[..visited_len].contains(&t.id) {
-                    continue;
-                }
-                if visited_len < visited.len() && frontier_len < frontier.len() {
-                    visited[visited_len] = t.id;
-                    visited_len += 1;
-                    frontier[frontier_len] = t.id;
-                    frontier_len += 1;
-                }
-            }
-        }
-    }
-    false
+/// `tracks` (song-track index) のいずれかが `solo == true` なら true。表は compile 時に焼いた配線の閉包で、
+/// solo の透過規則の 2 つがこれを引く:
+///
+/// - [`ChainProgram::solo_contributors`] — その track に流れ込む track (子 → group、send 元 → return)。
+///   「あるトラックを solo すると、そのトラックが送っている reverb / delay の **リターン** も生かす」
+///   Ableton 準拠の挙動 (リターンを solo-safe にしないと、ソロ中はセンドエフェクトが聞こえない)。
+/// - [`ChainProgram::solo_ancestors`] — 祖先 group (folder solo: group を solo したら子も鳴る)。
+///
+/// 配線は topology なので再 compile と同じ便で変わり、solo は値のみ更新なので song から毎 buffer 読む。
+/// RT-safe: 表の走査のみ (確保なし、トラック数に上限なし、RT で Song の配線を歩かない)。
+pub(super) fn any_soloed(song: &Song, tracks: &[u32]) -> bool {
+    tracks.iter().any(|&i| song.tracks.get(i as usize).is_some_and(|t| t.solo))
 }

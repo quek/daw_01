@@ -153,23 +153,16 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         0.0
     };
     let load_of = |us: u32| if period_us > 0.0 { us as f32 / period_us } else { 0.0 };
-    // L1: per-plugin 計測は device_id (u64) を **値** で保持する slot に格納される
-    // (index 化しないので id が MAX_PLUGINS を超えても drop しない)。 read 前に
-    // 現在 live な device 集合で stale slot (unload 済み device) を解放し、 slot
-    // 枯渇を防ぐ (unload 済み device の worker は既に store しないので安全)。
-    if let Some(mb) = app.ipc.metrics_bridge.as_ref() {
-        // 全タブの live instance (token)。閉じたタブの分は既に帳簿から消えている。
-        let live: std::collections::HashSet<common::protocol::InstanceToken> = app
-            .all_loaded_tokens()
-            .collect();
-        mb.reclaim_plugin_metric_slots(&live);
-    }
+    // per-plugin 計測は instance token キー (poller が plugin host の計測面から読んで届ける。枠の割り当て /
+    // 解放は plugin host が instance の寿命で行うので、GUI は読むだけ)。
     let plugin_us = |pid: u64| {
-        let token = app.cur.pipc.loaded_devices.get(&pid).map(|d| d.token);
-        match (app.ipc.metrics_bridge.as_ref(), token) {
-            (Some(mb), Some(token)) => mb.plugin_dsp_us(token),
-            _ => 0,
-        }
+        app.cur
+            .pipc
+            .loaded_devices
+            .get(&pid)
+            .and_then(|d| app.ipc.plugin_us.get(&d.token))
+            .copied()
+            .unwrap_or(0)
     };
 
     // パネル背景 + タイトルバー。

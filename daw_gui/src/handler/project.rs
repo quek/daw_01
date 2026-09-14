@@ -1032,21 +1032,6 @@ impl AppData {
         // 知らず、旧 Song はもう無い)。 帳簿にも Song にも依存しない
         // 「全部捨てろ」でしか塞げない (protocol.rs の UnloadAllPlugins doc 参照)。
         self.send_plugin(PluginCommand::UnloadProject { project: self.pk() });
-        // 計測 slot (token keyed) も project スコープ。解放は
-        // これまでリソースモニタを描画しているフレームでしか走らず、モニタを
-        // 開かずに project を開き続けると 512 slot が stale で埋まって以後
-        // どの plugin も 0 μs になっていた。instance を全部落とした直後の
-        // ここが、このタブの live 集合が空だと確実に言える唯一の地点。
-        // 他のタブ (`tabs.parked`) の instance は生きているので残す。
-        if let Some(bridge) = self.ipc.metrics_bridge.as_ref() {
-            let live: std::collections::HashSet<common::protocol::InstanceToken> = self
-                .tabs
-                .parked
-                .iter()
-                .flat_map(|p| p.pipc.loaded_devices.values().map(|d| d.token))
-                .collect();
-            bridge.reclaim_plugin_metric_slots(&live);
-        }
         self.cur.pipc.loaded_devices.clear();
         self.cur.pipc.open_plugin_guis.clear();
         self.cur.pipc.plugin_params.clear();

@@ -13,14 +13,6 @@ use crate::sequencer::{PerTrackState, TimedNoteEvent};
 pub const MAX_FRAMES: usize = common::process_data::MAX_FRAMES;
 pub const MAX_EVENTS: usize = common::process_data::MAX_EVENTS;
 
-/// Pre-allocated capacity (samples per channel) for each track's input delay
-/// line, so PDC / sidechain alignment never reallocates on the audio thread
-/// (D1 / PR3). 48000 = 1 s at 48 kHz — comfortably above any real plugin's
-/// reported latency. これを超える (病的な) 補償量は publish 側 (off-thread)
-/// が replacement line を pre-alloc して bundle で配送する
-/// (`RtBundle::input_delay_replacements`)。
-pub(crate) const INPUT_DELAY_PREALLOC_SAMPLES: usize = 48_000;
-
 /// E5 (r.md #8): 1 track が同時に持てる tape 位置 accumulator の数 (= track 内
 /// audio event の最大 index)。 これを超える index の event は積分無し (= 毎回
 /// `event_local × ratio` で再計算) に degrade する。 1 track に数百 clip は実用上
@@ -126,12 +118,10 @@ impl TrackScratch {
             peak_l: 0.0,
             peak_r: 0.0,
             effective_mute: false,
-            // D1 / PR3: pre-allocate the sidechain/PDC input delay ring so the
-            // `refresh_schedule` alignment step never reallocates on the audio
-            // thread. `INPUT_DELAY_PREALLOC_SAMPLES` (1 s @ 48 kHz) is above any
-            // real plugin's reported latency; the refresh path still grows it
-            // for the pathological >1 s case (which no real plugin hits).
-            input_delay_line: DelayLine::with_capacity(INPUT_DELAY_PREALLOC_SAMPLES),
+            // 遅延が要る track の線は schedule と同じ便で off-thread 確保して届く
+            // (`RtBundle::input_delay_replacements`)。全 track に先回りで 1 秒ぶん持たせない
+            // (`docs/plan_unbounded_tracks.md` §2.2)。
+            input_delay_line: DelayLine::with_capacity(0),
             repitch_accum: vec![(u64::MAX, 0.0); MAX_TAPE_EVENTS_PER_TRACK],
             // 実体 (= 高価なエンジン) は off-thread で作って配送される。 ここでは
             // 容量だけ予約しておき、RT の `push` が再確保しないことを保証する。
@@ -156,6 +146,70 @@ impl TrackScratch {
 impl Default for TrackScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// per-track scratch の **成長便** (`RtBundle::scratch_growth`、`docs/plan_unbounded_tracks.md` §2.1)。
+///
+/// `rows` = index `base..base + rows.len()` の行 (off-thread で確保)。容量は `base + rows.len()` 以上
+/// (= 伸ばした後の総本数) で、RT はその容量の中で既存の行を並べ直して差し込む。**全本数ぶんを毎回
+/// 作り直さない** — 200 本の曲で 1 本足すたびに 200 本ぶん確保しないため。
+pub struct ScratchGrowth {
+    pub base: usize,
+    pub rows: Vec<TrackScratch>,
+}
+
+impl ScratchGrowth {
+    /// index `base..total` の行を持つ便 (off-thread)。
+    #[must_use]
+    pub fn new(base: usize, total: usize) -> Self {
+        let mut rows = Vec::with_capacity(total);
+        rows.extend((base..total).map(|_| TrackScratch::new()));
+        Self { base, rows }
+    }
+
+    fn end(&self) -> usize {
+        self.base + self.rows.len()
+    }
+
+    /// audio thread: `scratch` を `end()` 本まで伸ばす。既存の行 (走行状態: 入力遅延のリング / stretch
+    /// engine / 鳴っているノート) は要素ごと move で保ち、便の行のうち既存と重なる分は捨てる側へ回す。
+    /// 戻り値 = 押し出した Vec (空か、重なって要らなくなった行。recycle で off-thread に落とす)。
+    ///
+    /// RT 安全: swap / 容量内の extend / rotate だけ (確保・解放なし)。便の base が既存の本数より
+    /// 先にある (= 間の便が失われた) ときだけは差し込めないので、便をそのまま返す。
+    pub fn install_into(mut self, scratch: &mut Vec<TrackScratch>) -> Vec<TrackScratch> {
+        let (s, base, len) = (scratch.len(), self.base, self.rows.len());
+        if s >= base + len || s < base || self.rows.capacity() < base + len {
+            debug_assert!(s >= base, "成長便の間が抜けている (base {base} > 既存 {s})");
+            return self.rows;
+        }
+        // 既存と重なる行 (`base..s`) は既存の走行状態を便の側へ移し、便の新品を既存の側へ退避する。
+        for j in 0..s - base {
+            std::mem::swap(&mut scratch[base + j], &mut self.rows[j]);
+        }
+        let head = base;
+        self.rows.extend(scratch.drain(..head));
+        self.rows.rotate_left(len);
+        std::mem::swap(scratch, &mut self.rows);
+        self.rows
+    }
+
+    /// `self` (新しい便) が `older` (古い便) を畳み込む (`RtBundle::supersede`、RT 上で呼ばれる)。
+    /// publish 側は本数を順に配送するので `older` の行の直後が `self` の行 — 連結して `base` を古い便に
+    /// 揃える (容量は伸ばした後の総本数なので確保は起きない)。`older` には空の Vec が残る。
+    pub fn absorb_older(&mut self, older: &mut ScratchGrowth) {
+        if self.base <= older.base {
+            return; // 新しい便が古い便の範囲を含む (テストの全本数便)。古い便は捨てる。
+        }
+        if older.end() != self.base || self.rows.capacity() < older.base + older.rows.len() + self.rows.len() {
+            debug_assert!(false, "成長便の並びが連続していない (古い便 {}..{} / 新しい便 base {})", older.base, older.end(), self.base);
+            return;
+        }
+        let n = self.rows.len();
+        self.rows.append(&mut older.rows);
+        self.rows.rotate_left(n);
+        self.base = older.base;
     }
 }
 
@@ -240,5 +294,62 @@ pub fn queue_all_notes_off(scratch: &mut [TrackScratch]) {
             s.state.pending_offs.push(note);
         }
         s.state.active_notes.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 行の同一性の目印に `clip_render_seq` を使う (走行状態を持つ行が入れ替わっていないかを見る)。
+    fn tag(rows: &mut [TrackScratch], from: u64) {
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.clip_render_seq = from + i as u64;
+        }
+    }
+
+    fn tags(rows: &[TrackScratch]) -> Vec<u64> {
+        rows.iter().map(|r| r.clip_render_seq).collect()
+    }
+
+    fn existing(n: usize) -> Vec<TrackScratch> {
+        let mut rows: Vec<TrackScratch> = (0..n).map(|_| TrackScratch::new()).collect();
+        tag(&mut rows, 1);
+        rows
+    }
+
+    #[test]
+    fn 成長便は既存の行を動かさずに後ろへ足す() {
+        let mut scratch = existing(2);
+        let mut g = ScratchGrowth::new(2, 5);
+        tag(&mut g.rows, 30);
+        let retired = g.install_into(&mut scratch);
+        assert_eq!(tags(&scratch), [1, 2, 30, 31, 32]);
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn 既存と重なる便の行は捨て側へ回して既存の行を残す() {
+        let mut scratch = existing(3);
+        let mut g = ScratchGrowth::new(0, 4);
+        tag(&mut g.rows, 10);
+        let retired = g.install_into(&mut scratch);
+        assert_eq!(tags(&scratch), [1, 2, 3, 13]);
+        assert_eq!(tags(&retired), [10, 11, 12]);
+    }
+
+    #[test]
+    fn 畳み込んだ便は古い便の行から順に並ぶ() {
+        let mut older = ScratchGrowth::new(1, 3);
+        tag(&mut older.rows, 11);
+        let mut newer = ScratchGrowth::new(3, 4);
+        tag(&mut newer.rows, 13);
+        newer.absorb_older(&mut older);
+        assert!(older.rows.is_empty());
+
+        let mut scratch = existing(1);
+        let retired = newer.install_into(&mut scratch);
+        assert_eq!(tags(&scratch), [1, 11, 12, 13]);
+        assert!(retired.is_empty());
     }
 }

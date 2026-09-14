@@ -15,35 +15,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::Result;
 
-use crate::protocol::InstanceToken;
 use crate::shmem::NamedShmem;
 
-/// per-plugin メトリクススロットのハードキャップ (= 同時に CPU 計測できる
-/// instance 数)。 slot は [`InstanceToken`] (u64、 plugin_host 採番・単調増加・非再利用)
-/// を **値** で保持し、 空き slot を claim して使う (§7.5 `PluginMetricSlot`)。 これにより
-/// id を配列 index にする旧実装 (id が 512 を超えると計測が silently
-/// drop する) を根治する。 同時 live instance 数がこの上限を超えたときだけ drop。
-///
-/// `device_id` ではなく token なのは、複数プロジェクト (`docs/plan_project_tabs.md` §1.3)
-/// で `device_id` が project をまたいで衝突するため。
-pub const MAX_PLUGINS: usize = 512;
+pub mod plugins;
+
+pub use plugins::{PluginMetricsPlane, PluginSlotAllocator, plugin_plane_shmem_id};
 
 /// DSP load を `warn`(黄) 表示に切り替える閾値 (= 期限の 70%)。
 pub const LOAD_WARN: f32 = 0.7;
 /// DSP load を `danger`(赤) 表示に切り替える閾値 (= 期限の 90%)。
 pub const LOAD_DANGER: f32 = 0.9;
-
-/// per-plugin CPU 計測の 1 slot (§7.5)。 `token` は「この slot が誰の計測か」
-/// を示す [`InstanceToken`] (`0` = 空き)。 plugin-host worker が load 後に空き slot を claim
-/// (`token` を CAS 占有)、 RT では小さい slot index へ `us` を store、 daw_gui は
-/// `token` で線形 scan して読む。 全 atomic なので lock-free。
-#[repr(C)]
-pub struct PluginMetricSlot {
-    /// この slot を占有する instance の token (`InstanceToken.0`)。 `0` = 空き。
-    pub token: AtomicU64,
-    /// 直近 `process()` 時間 (μs)。
-    pub us: AtomicU32,
-}
 
 #[repr(C)]
 pub struct MetricsBridge {
@@ -63,10 +44,10 @@ pub struct MetricsBridge {
     pub buffer_frames: AtomicU32,
     /// 現在の sample rate (Hz)。 daw_audio が起動時に publish (静的)。
     pub sample_rate: AtomicU32,
-    /// per-plugin の直近 `process()` 時間 (μs)。 token 値を保持する slot
-    /// 配列 (§7.5)。 index ではなく `token` で claim / read するので、 値が
-    /// `MAX_PLUGINS` を超えても計測が drop しない。
-    pub plugin_metrics: [PluginMetricSlot; MAX_PLUGINS],
+    /// per-plugin の直近 `process()` 時間を載せた [`PluginMetricsPlane`] の id
+    /// (`pid << 32 | 世代`、`0` = 面なし)。書き手 daw_plugin_host が作り直すたびに差し替え、読み手は
+    /// 変わったら開き直す (`docs/plan_unbounded_tracks.md` §4)。
+    pub plugin_plane_id: AtomicU64,
 }
 
 impl MetricsBridge {
@@ -76,20 +57,28 @@ impl MetricsBridge {
 /// Owning handle to the metrics shared memory region.
 pub struct MetricsBridgeHandle {
     shmem: NamedShmem,
+    /// この region の os_id ([`PluginMetricsPlane`] の名前の起点)。
+    os_id: String,
 }
 
 impl MetricsBridgeHandle {
     pub fn create(os_id: &str) -> Result<Self> {
         let shmem = NamedShmem::create(os_id, MetricsBridge::SIZE)?;
-        // Zero-initialise: every atomic starts at 0 (= 0.0 load, 0 xrun, idle
-        // plugins) before any reader polls.
+        // Zero-initialise: every atomic starts at 0 (= 0.0 load, 0 xrun, no plugin plane)
+        // before any reader polls.
         unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, MetricsBridge::SIZE) };
-        Ok(Self { shmem })
+        Ok(Self { shmem, os_id: os_id.to_owned() })
     }
 
     pub fn open(os_id: &str) -> Result<Self> {
         let shmem = NamedShmem::open(os_id, MetricsBridge::SIZE)?;
-        Ok(Self { shmem })
+        Ok(Self { shmem, os_id: os_id.to_owned() })
+    }
+
+    /// この region の os_id ([`PluginMetricsPlane`] の名前の起点)。
+    #[must_use]
+    pub fn os_id(&self) -> &str {
+        &self.os_id
     }
 
     fn bridge(&self) -> &MetricsBridge {
@@ -157,64 +146,16 @@ impl MetricsBridgeHandle {
         )
     }
 
-    /// plugin-host worker (RT): `token` の計測 slot を取得する。 既存 slot が
-    /// あればその index、 無ければ空き slot を CAS 占有して claim する。 満杯 /
-    /// CAS 競合時は `None` (呼び元は次 buffer で再試行)。 worker は返り値を entry に
-    /// キャッシュするので、 この線形 scan は plugin ごと事実上 1 回だけ走る。
-    pub fn claim_plugin_metric_slot(&self, token: InstanceToken) -> Option<usize> {
-        debug_assert_ne!(token, InstanceToken::NONE, "token 0 は sentinel、 claim 不可");
-        let slots = &self.bridge().plugin_metrics;
-        let mut free: Option<usize> = None;
-        for (i, s) in slots.iter().enumerate() {
-            let d = s.token.load(Ordering::Acquire);
-            if d == token.0 {
-                return Some(i); // 既に自分の slot
-            }
-            if d == 0 && free.is_none() {
-                free = Some(i);
-            }
-        }
-        let i = free?;
-        // 空き slot を占有 (他 worker と競合したら諦め = 次回再試行)。
-        match slots[i].token.compare_exchange(
-            0,
-            token.0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Some(i),
-            Err(_) => None,
-        }
+    /// daw_plugin_host (plugin-main): [`PluginMetricsPlane`] を作り直したら、live な instance を新しい面で
+    /// registry に publish した**後で**呼ぶ。
+    pub fn set_plugin_plane_id(&self, id: u64) {
+        self.bridge().plugin_plane_id.store(id, Ordering::Release);
     }
 
-    /// plugin-host worker (RT): claim 済み slot index へ μs を store。
-    pub fn set_plugin_dsp_us_slot(&self, slot: usize, us: u32) {
-        if let Some(s) = self.bridge().plugin_metrics.get(slot) {
-            s.us.store(us, Ordering::Release);
-        }
-    }
-
-    /// daw_gui: `token` の直近 `process()` μs。 未計測 / 未 claim は 0。
-    pub fn plugin_dsp_us(&self, token: InstanceToken) -> u32 {
-        for s in self.bridge().plugin_metrics.iter() {
-            if s.token.load(Ordering::Acquire) == token.0 {
-                return s.us.load(Ordering::Acquire);
-            }
-        }
-        0
-    }
-
-    /// daw_gui: 現在 live でない instance が占有する slot を解放する
-    /// (unload された plugin の entry は既に消えて worker が store しないので安全)。
-    /// per-plugin パネルの read 前に呼び、 slot 枯渇を防ぐ。 `live` は全タブの token。
-    pub fn reclaim_plugin_metric_slots(&self, live: &std::collections::HashSet<InstanceToken>) {
-        for s in self.bridge().plugin_metrics.iter() {
-            let d = s.token.load(Ordering::Acquire);
-            if d != 0 && !live.contains(&InstanceToken(d)) {
-                s.us.store(0, Ordering::Release);
-                s.token.store(0, Ordering::Release);
-            }
-        }
+    /// daw_gui: 今の [`PluginMetricsPlane`] の id (`0` = 面なし)。変わったら開き直す。
+    #[must_use]
+    pub fn plugin_plane_id(&self) -> u64 {
+        self.bridge().plugin_plane_id.load(Ordering::Acquire)
     }
 }
 
@@ -260,8 +201,8 @@ pub fn fps_from_dt(dt_ema_s: f32) -> f32 {
 /// daw_gui が UI に表示する集計済みリソース指標のスナップショット。 poller
 /// (DSP load / xrun / buffer)、 sysinfo スレッド (system CPU / memory)、 runner
 /// (fps) が別々のソースから埋め、 status bar の常駐メーターと詳細パネルが読む。
-/// per-plugin CPU はサイズ可変なのでここには含めず、 詳細パネルが
-/// `MetricsBridgeHandle::plugin_dsp_us` を track 構成に沿って直接読む。
+/// per-plugin CPU はサイズ可変なのでここには含めず、 poller が [`PluginMetricsPlane`] から
+/// `token → μs` を読み出して別に流す。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResourceMetrics {
     /// DSP load の直近窓ピーク (RT / worst-case)、 0.0..=1.0+ (1.0 = 期限ぴったり)。

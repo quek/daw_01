@@ -270,6 +270,18 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    /// GR を publish する内蔵 device の数 (track の program + master)。telemetry 面の容量の要求
+    /// (`docs/plan_unbounded_tracks.md` §3)。
+    #[must_use]
+    pub fn native_meter_count(&self) -> usize {
+        self.track_programs
+            .iter()
+            .chain(std::iter::once(&self.master_program))
+            .flat_map(|p| p.natives.iter())
+            .filter(|ns| ns.meter)
+            .count()
+    }
+
     pub fn empty() -> Self {
         Self {
             nodes: Vec::new(),
@@ -299,33 +311,46 @@ impl Schedule {
     /// 時)。live の走行状態 (ring の音声履歴 / env) は RT だけが持つので、
     /// off-thread では移送できない — ここで行う操作は `Vec` の `mem::swap`
     /// (ポインタ交換) と f32 コピーだけで、alloc / free / lock は無い。
-    /// 探索は小さい Vec の線形走査 (delay lines ≤ track 数、followers ≤
-    /// MAX_MOD_SOURCES)。
+    /// 突き合わせは [`find_near`] (本数に上限が無いので二乗にしない — 並びは再 compile を跨いでほぼ保たれる)。
     pub fn adopt_state_from(&mut self, old: &mut Schedule) {
+        let mut hint = 0;
         for (i, key) in self.delay_keys.iter().enumerate() {
-            if let Some(j) = old.delay_keys.iter().position(|k| k == key) {
+            if let Some(j) = find_near(&old.delay_keys, hint, |k| k == key) {
                 // capacity 不一致 (= 補償 delay 長が変わった) なら false =
                 // リセットのまま。
                 let _ = self.delay_lines[i].try_adopt(&mut old.delay_lines[j]);
+                hint = j + 1;
             }
         }
+        hint = 0;
         for (i, key) in self.follower_keys.iter().enumerate() {
             if *key == 0 {
                 continue; // 未採番 sentinel は identity にならない
             }
-            if let Some(j) = old.follower_keys.iter().position(|k| k == key) {
+            if let Some(j) = find_near(&old.follower_keys, hint, |k| k == key) {
                 self.follower_slots[i].adopt_state_from(&old.follower_slots[j]);
+                hint = j + 1;
             }
         }
         // r.md #110: Parallel の並列 PDC ring と chain の tap snapshot は所有 track id →
         // chain id で移送する (`ChainProgram::adopt_state_from`)。
+        hint = 0;
         for p in &mut self.track_programs {
-            if let Some(o) = old.track_programs.iter_mut().find(|o| o.track_id == p.track_id) {
-                p.adopt_state_from(o);
+            if let Some(j) = find_near(&old.track_programs, hint, |o| o.track_id == p.track_id) {
+                p.adopt_state_from(&mut old.track_programs[j]);
+                hint = j + 1;
             }
         }
         self.master_program.adopt_state_from(&mut old.master_program);
     }
+}
+
+/// `items` から `pred` に合う最初の要素を、`hint` から後ろ → 先頭から `hint` の手前の順に探す。
+/// 新旧の並びがほぼ同じ突き合わせ (前回の一致位置の次を `hint` に渡す) は、並びが保たれている間
+/// 要素ごとに 1 回の比較で済む。確保なし (RT 安全)。
+fn find_near<T>(items: &[T], hint: usize, pred: impl Fn(&T) -> bool) -> Option<usize> {
+    let hint = hint.min(items.len());
+    items[hint..].iter().position(&pred).map(|p| hint + p).or_else(|| items[..hint].iter().position(pred))
 }
 
 impl Default for Schedule {

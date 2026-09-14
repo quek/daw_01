@@ -58,7 +58,11 @@ const WIRE_SOURCES: &[&str] = &[
     "src/port_config.rs",
     "src/process_data.rs",
     "src/audio_bridge.rs",
+    // 伸びる telemetry 面 (repr(C) の shmem、docs/plan_unbounded_tracks.md §3)。
+    "src/audio_bridge/plane.rs",
     "src/metrics_bridge.rs",
+    // per-plugin 計測の伸びる面 (repr(C) の shmem、docs/plan_unbounded_tracks.md §4)。
+    "src/metrics_bridge/plugins.rs",
     "src/scope_bridge.rs",
     // r.md #129: device 単位のサンプルリング (EQ Par のスペクトラム、repr(C) の shmem)。
     "src/device_scope_bridge.rs",

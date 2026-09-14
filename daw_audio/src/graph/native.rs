@@ -123,7 +123,6 @@ impl Default for ListenBuf {
 pub struct NativeScratch {
     /// 再 compile を跨ぐ状態移送のキー (= `NativeDevice::id`)。
     pub device_id: u64,
-    pub builtin: bool,
     pub dsp: NativeDsp,
     pub fade: BypassFade,
     pub sc_mode: ScMode,
@@ -133,7 +132,7 @@ pub struct NativeScratch {
     pub listen: Option<ListenBuf>,
     /// 直前 buffer の GR (dB、0 以下)。処理していなければ 0。
     pub gr_db: f32,
-    /// GR 面へ publish するか (compile 時に `MAX_NATIVE_METERS` まで割り当てる)。
+    /// GR 面へ publish するか (= GR を持つ種類。面の容量は曲が要る数から決まるので枠は無い)。
     pub meter: bool,
 }
 
@@ -149,14 +148,13 @@ impl NativeScratch {
             .is_some_and(|r| r.tap.source == TapSource::Track(track_id) && r.tap.tap_point == TapPoint::PreFx);
         Self {
             device_id: nd.id,
-            builtin: nd.builtin,
             dsp: NativeDsp::new(kind),
             fade: BypassFade::new(!nd.bypassed),
             sc_mode: if own_prefx { ScMode::OwnPreFx } else { ScMode::None },
             sc: None,
             listen: kind.accepts_listen().then(ListenBuf::new),
             gr_db: 0.0,
-            meter: false,
+            meter: kind.has_gain_reduction(),
         }
     }
 

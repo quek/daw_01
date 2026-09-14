@@ -158,10 +158,10 @@ pub struct TransportState {
     /// ~30Hz の `ModScalarsTick` ごとに差し替わり、compose 経路が
     /// `ModPlane::scalar(id)` で引く。
     pub mod_plane: common::mod_plane::ModPlane,
-    /// r.md #117: engine が publish した track ごとの鳴っているボイス `(track index, voice)`。
+    /// r.md #117: engine が publish した track ごとの鳴っているボイス `(track id, voice)`。
     /// ~30Hz の `TrackVoicesTick` ごとに差し替わり、 変調ラックが `Note` 起点ソースの
     /// カーソルをボイスごとに描くのに使う。
-    pub track_voices: Vec<(usize, common::audio_bridge::VoiceSnapshot)>,
+    pub track_voices: Vec<(u32, common::audio_bridge::VoiceSnapshot)>,
     /// `start_transport` が読み込み待ち (`pending_plugin_loads` / asset decode) で queue した
     /// 再生要求。 `Some(どこから)` の間は最後の load 完了で `fire_pending_play` が再発火する。
     pub pending_play: Option<PlayFrom>,

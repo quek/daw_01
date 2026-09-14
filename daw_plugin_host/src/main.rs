@@ -55,8 +55,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
 use crate::process_server::{
-    METRIC_SLOT_UNCLAIMED, PluginEntry, PluginRegistry, registry_insert, registry_remove,
-    registry_take_all,
+    METRIC_SLOT_UNASSIGNED, PluginEntry, PluginRegistry, registry_insert, registry_release_metric_slot,
+    registry_remove, registry_take_all,
 };
 
 /// Custom Win32 message id used to wake the plugin-main thread's `GetMessage`
@@ -1316,7 +1316,7 @@ impl PluginHost {
                 audio,
                 process_data: pd_ptr,
                 err_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                metric_slot: Arc::new(std::sync::atomic::AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
+                metric_slot: METRIC_SLOT_UNASSIGNED,
                 transport_pinned_to_song,
             },
         );
@@ -1371,6 +1371,8 @@ impl PluginHost {
         {
             pool.quiesce();
         }
+        // worker が触れなくなった後で per-plugin 計測の枠を空ける (detach 中に壊された instance も含む)。
+        registry_release_metric_slot(&self.registry, rec.token);
         // (3) editor を先に取り出しておく (drop は plugin teardown の後)。
         let editor = rec.editor.take();
         // r.md #36: キー横取りフックの索引から外す (窓は (5) で壊す)。

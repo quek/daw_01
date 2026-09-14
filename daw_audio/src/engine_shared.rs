@@ -25,7 +25,7 @@ use common::worker_bridge::WorkerBridgeHandle;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::audio_worker::AudioWorkerPool;
-use crate::engine::{MAX_TRACKS, PlaybackCommand};
+use crate::engine::PlaybackCommand;
 use crate::sampler::SamplerRig;
 
 /// `pending_seek` の sentinel = 「seek 要求なし」。playhead はサンプル単位で、
@@ -258,17 +258,25 @@ pub struct WorkerRig {
 }
 
 /// r.md #40: off-thread で確保した stretch engine を RT の `TrackScratch` へ
-/// 渡す配送便。 RT は `engines` を `pop` して
+/// 渡す配送便。**1 回の publish = 1 便** (track ごとに分けない — 便の数がトラック数に比例すると
+/// ring の深さに上限が要る)。RT は各 track の `engines` を `pop` して
 /// `TrackScratch::stretch_engines` へ `push` し (予約済み容量内なので再確保なし)、
 /// 空になった本体を recycle ring へ返す (`Vec` の解放を off-thread に追い出す)。
 pub struct StretchPoolDelivery {
-    pub track_idx: usize,
-    pub engines: Vec<crate::stretch_engine::StretchEngine>,
+    /// `(track index, その track へ足すエンジン)`。
+    pub per_track: Vec<(usize, Vec<crate::stretch_engine::StretchEngine>)>,
 }
 
-/// 配送 ring の深さ。1 回の publish で最大 `MAX_TRACKS` 便が積まれるので、
-/// RT が 1 buffer 遅れても溢れないよう 2 倍取る。
-const STRETCH_POOL_RING_CAP: usize = MAX_TRACKS * 2;
+impl StretchPoolDelivery {
+    /// この便が触る最大の track index (空なら `None`)。RT は scratch がそこまで伸びてから取り込む。
+    #[must_use]
+    pub fn max_track_idx(&self) -> Option<usize> {
+        self.per_track.iter().map(|(i, _)| *i).max()
+    }
+}
+
+/// 配送 ring の深さ。1 回の publish で 1 便なので、RT が数 buffer 遅れても溢れない深さでよい。
+const STRETCH_POOL_RING_CAP: usize = 16;
 
 /// 録音中の lane の集合 (`(track_id, AutomationTarget)`、GUI の `SetRecordingLanes`)。
 pub type RecordingLanes = std::collections::HashSet<(u32, common::model::AutomationTarget)>;

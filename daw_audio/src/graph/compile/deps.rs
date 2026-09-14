@@ -105,6 +105,56 @@ impl Topology {
             gwi_split,
         })
     }
+
+    /// 各 track (song 順) へ **流れ込む** track の推移閉包 (song-track index、昇順)。寄与辺は
+    /// 「子 → group」と「send 元 → send 先」(有効 / 無効を問わない)。`ChainProgram::solo_contributors`
+    /// に焼き、RT の solo 判定は表の track の `solo` を見るだけにする (`docs/plan_unbounded_tracks.md` §2.3 —
+    /// 旧実装は RT で Song の配線を固定長のスタック配列で BFS していて、32 本を超えると判定が壊れた)。
+    pub(super) fn solo_contributors(&self, song: &Song) -> Vec<Vec<u32>> {
+        let mut seen = vec![false; song.tracks.len()];
+        let mut stack: Vec<u32> = Vec::new();
+        (0..song.tracks.len()).map(|i| self.contributors_of(song, i, &mut seen, &mut stack)).collect()
+    }
+
+    /// 各 track (song 順) の祖先 group (`parent_group_id` を辿った song-track index、近い順)。
+    /// `ChainProgram::solo_ancestors` に焼く (folder solo)。親参照は `build` で検査済み、循環に備えて
+    /// 本数で打ち切る。
+    pub(super) fn solo_ancestors(&self, song: &Song) -> Vec<Vec<u32>> {
+        let n = song.tracks.len();
+        song.tracks
+            .iter()
+            .map(|t| {
+                let mut out = Vec::new();
+                let mut cur = t.parent_group_id.and_then(|pid| self.id_to_idx.get(&pid).copied());
+                while let Some(idx) = cur.filter(|_| out.len() < n) {
+                    out.push(idx);
+                    cur = song.tracks[idx as usize].parent_group_id.and_then(|pid| self.id_to_idx.get(&pid).copied());
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// `solo_contributors` の 1 行ぶん (`seen` / `stack` は呼び側が使い回す作業領域)。
+    fn contributors_of(&self, song: &Song, i: usize, seen: &mut [bool], stack: &mut Vec<u32>) -> Vec<u32> {
+        seen.fill(false);
+        seen[i] = true;
+        stack.clear();
+        stack.push(song.tracks[i].id);
+        let mut out = Vec::new();
+        while let Some(node) = stack.pop() {
+            let children = self.children_of.get(&node).into_iter().flatten().copied();
+            let senders = self.incoming_sends.get(&node).into_iter().flatten().map(|&(src, _, _)| src);
+            for idx in children.chain(senders) {
+                if seen.get_mut(idx as usize).is_some_and(|flag| !std::mem::replace(flag, true)) {
+                    out.push(idx);
+                    stack.push(song.tracks[idx as usize].id);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
 }
 
 /// Gather incoming aux sends per destination (return / bus).

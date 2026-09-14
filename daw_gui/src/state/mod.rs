@@ -104,21 +104,6 @@ impl AppData {
         common::protocol::DeviceAddr::new(self.cur.key, device_id)
     }
 
-    /// 全タブの load 済み instance の token (resource monitor の metrics slot 回収用)。
-    pub fn all_loaded_tokens(&self) -> impl Iterator<Item = common::protocol::InstanceToken> + '_ {
-        self.cur
-            .pipc
-            .loaded_devices
-            .values()
-            .map(|d| d.token)
-            .chain(
-                self.tabs
-                    .parked
-                    .iter()
-                    .flat_map(|p| p.pipc.loaded_devices.values().map(|d| d.token)),
-            )
-    }
-
     /// `key` のタブを一時的に `cur` へ swap して `f` を回し、戻す
     /// (`docs/plan_project_tabs.md` §5.1 — 背景タブ宛の IPC event / autosave / 終了時の
     /// 保存確認など、「アクティブでないタブ」に既存 handler をそのまま効かせる唯一の口)。

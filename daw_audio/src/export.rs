@@ -36,7 +36,7 @@ use common::model::Song;
 use common::protocol::RenderScope;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
-use crate::engine::{EngineShared, MAX_TRACKS, ProjectShared};
+use crate::engine::{EngineShared, ProjectShared};
 use crate::graph::{compile_schedule, render_master_buffer};
 use crate::mixer::TrackScratch;
 
@@ -190,7 +190,7 @@ pub fn run_export(
     // before `path` is moved into the WAV writer below.
     let sidecar_path = common::mod_sidecar::ModEnvSidecar::sidecar_path(&path);
     let launcher_sidecar_path = common::launcher_sidecar::LauncherSidecar::sidecar_path(&path);
-    let n_tracks = song.tracks.len().min(MAX_TRACKS);
+    let n_tracks = song.tracks.len();
     let song_length_samples = win.song_length_samples;
 
     tracing::info!(
@@ -496,8 +496,8 @@ fn render_loop(
     sink: &mut dyn RenderSink,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<RenderOutcome> {
-    // heap 確保はここで一度だけ (この走査は off-RT)。
-    let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
+    // heap 確保はここで一度だけ (この走査は off-RT)。器は曲が要る分だけ (上限を置かない)。
+    let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
     let mut master_l: Vec<f32> = vec![0.0; max_frames];
     let mut master_r: Vec<f32> = vec![0.0; max_frames];
     // r.md #129: master Limiter の状態は **書き出しごとに新品** (= 決定論的)。内蔵 device の状態も
@@ -586,6 +586,13 @@ fn render_loop(
         scope,
     )
     .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
+    // 入力遅延線は live と同じく schedule が要る分だけ確保する (`TrackScratch` は先に確保しない、
+    // `docs/plan_unbounded_tracks.md` §2.2)。
+    for (s, line) in scratch.iter_mut().zip(crate::project_ctl::build_input_delay_replacements(&schedule)) {
+        if let Some(line) = line {
+            s.input_delay_line = line;
+        }
+    }
 
     // r.md #39: PDC 遅延ぶん書き出し窓を後ろへずらす (下の helper に理由を集約)。
     let (write_start, write_end, total_samples) = shift_window_for_master_latency(
@@ -609,13 +616,10 @@ fn render_loop(
     // アーキ不変条件 6) を通すので、刻みの割り方も transport の進め方も
     // buffer 長 (export 1024 固定 / live は device 実測長) に依存しない。
     let mut mod_tick = crate::mod_tick::ModTickRunner::new();
+    let plan = std::sync::Arc::new(common::mod_graph::build_plan(song, 1, |beat| {
+        common::automation::beats_to_samples(song, sample_rate, beat) as f64 / f64::from(sample_rate.max(1))
+    }));
     {
-        let plan = std::sync::Arc::new(common::mod_graph::build_plan(song, 1, |beat| {
-            common::automation::beats_to_samples(song, sample_rate, beat) as f64
-                / f64::from(sample_rate.max(1))
-        }));
-        let mut rt = common::mod_graph::ModRuntime::default();
-        rt.install(&plan);
         let length_secs = common::automation::beats_to_samples(song, sample_rate, song.length_beats)
             as f64
             / f64::from(sample_rate.max(1));
@@ -625,7 +629,7 @@ fn render_loop(
             sample_rate,
             length_secs,
         ));
-        let _ = mod_tick.install(plan, rt);
+        let _ = mod_tick.install(crate::mod_plan_publish::ModPlanDelivery::new(std::sync::Arc::clone(&plan)));
         mod_tick.set_table(Some(table));
     }
     // r.md #89: 列のキーは `ModSource::id`。**値を出す面そのものから取る** —
@@ -637,12 +641,9 @@ fn render_loop(
     } else {
         Vec::new()
     });
-    // `Schedule` の follower slot → 係数表の列 (刻みごとにフォロワー係数を引く)。
-    let mut follower_cols: Vec<u16> = Vec::new();
-    mod_tick.build_follower_cols(&schedule.follower_keys, &mut follower_cols);
-    // plan slot → `Schedule::follower_slots` の index (刻みごとの線形探索を避ける)。
-    let mut follower_env_of_slot: Vec<u16> = Vec::new();
-    mod_tick.build_follower_env_map(&schedule.follower_keys, &mut follower_env_of_slot);
+    // `Schedule` の follower slot ↔ plan slot の対応表 (live と同じ `FollowerMaps`)。
+    let crate::mod_tick::FollowerMaps { cols: follower_cols, env_of_slot: follower_env_of_slot } =
+        crate::mod_tick::FollowerMaps::build(&plan, &schedule.follower_keys);
 
     // Phase 4 Step C-2: offline export 中は recording lane なし
     // (= GUI が active gesture を持たない、 transport が freewheel)。
@@ -673,7 +674,7 @@ fn render_loop(
     // (乱数は `f(seed, 発火拍)` の純ハッシュ) ので、同じプロジェクトなら
     // 何度書き出しても同じファイルになる。走行位置を `Song` に保存しないのが
     // その前提 (§1.4)。
-    let mut launcher = crate::launcher::LauncherRuntime::new();
+    let mut launcher = crate::launcher::LauncherRuntime::for_song(song);
     launcher.arm_reseed();
     // グローバルローンチ量子化は engine と同じ値を使う (セルの `Global` の解決先)。
     // r.md #87: 生成と同じく `Song` が SSoT (engine.rs の同名変数と同じ理由)。
@@ -1061,13 +1062,17 @@ mod tests {
 
     /// 曲の mix (`RenderScope::Mix`) を `[start, end)` 拍だけ描く (clip bounce と同じく曲頭から温める)。
     fn render_mix(song: &Song, start_beat: f64, end_beat: f64) -> StereoCapture {
-        let engine = EngineShared::new();
+        render_mix_on(&EngineShared::new(), song, start_beat, end_beat)
+    }
+
+    /// `engine` の worker rig (無ければ直列経路) で書き出す。
+    fn render_mix_on(engine: &EngineShared, song: &Song, start_beat: f64, end_beat: f64) -> StereoCapture {
         let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
         let span = RenderSpan::RangeWarm { start_beat, end_beat };
         let win = RenderWindow::resolve(song, BOUNCE_SR, span, false).expect("window");
         let mut sink = StereoCapture::default();
         let outcome = render_loop(
-            &engine,
+            engine,
             &project,
             song,
             RenderScope::Mix,
@@ -1249,5 +1254,186 @@ mod tests {
         let (ws, we, total) =
             shift_window_for_master_latency(u32::MAX, u64::MAX, u64::MAX, u64::MAX);
         assert_eq!((ws, we, total), (u64::MAX, u64::MAX, u64::MAX));
+    }
+
+    // ---- docs/plan_unbounded_tracks.md §5: トラック数に上限を置かない ----
+
+    fn peak(capture: &StereoCapture) -> f32 {
+        capture.l.iter().chain(&capture.r).fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    /// 音源 (2 秒のサイン波 WAV) だけを持つ空の曲と、その音源を鳴らす content。トラックは呼び側が積む。
+    fn source_only_song(dir: &std::path::Path) -> (Song, common::model::ContentId) {
+        let (mut song, key) = bounce_source_song(dir, 1.0, 0.0, false);
+        let content_id = song.clip_by_key(key).expect("source clip").content_id;
+        song.tracks.clear();
+        (song, content_id)
+    }
+
+    /// `n` 本の空トラックを積み、`with_clip` の index のトラックにだけ 0..2 拍のクリップを置く。
+    fn push_tracks(song: &mut Song, n: usize, content_id: common::model::ContentId, with_clip: &[usize]) {
+        use common::model::{Clip, Track};
+        for i in 0..n {
+            let mut t = Track { id: song.alloc_track_id(), ..Track::default() };
+            if with_clip.contains(&i) {
+                t.place_clip(Clip { start_beat: 0.0, length_beats: 2.0, content_id, ..Clip::default() });
+            }
+            song.tracks.push(t);
+        }
+    }
+
+    /// 旧実装は描画が先頭 32 本までで、33 本目以降のクリップは無音だった (40 本中 33 / 40 本目 = ピーク 0)。
+    #[test]
+    fn 三十三本目以降のトラックも鳴る() {
+        let dir = bounce_temp_dir("unbounded_tracks");
+        for k in [32usize, 39] {
+            let (mut song, content) = source_only_song(&dir);
+            push_tracks(&mut song, 40, content, &[k]);
+            song.enforce_edit_invariants();
+            let got = peak(&render_mix(&song, 0.0, 2.0));
+            assert!(got > 0.3, "{} 本目のクリップが鳴らない: peak {got}", k + 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// solo の「子が solo なら group も透過」は配線の推移閉包で決まる。旧実装は RT で固定長 (32) の BFS を
+    /// 回していて、40 段入れ子の group の底で solo したクリップは上の group で黙って mute されていた。
+    #[test]
+    fn 深く入れ子の_group_の底で_solo_しても鳴る() {
+        let dir = bounce_temp_dir("deep_solo");
+        let (mut song, content) = source_only_song(&dir);
+        push_tracks(&mut song, 40, content, &[39]);
+        for i in 1..40 {
+            song.tracks[i].parent_group_id = Some(song.tracks[i - 1].id);
+        }
+        song.tracks[39].solo = true;
+        song.enforce_edit_invariants();
+        let got = peak(&render_mix(&song, 0.0, 2.0));
+        assert!(got > 0.3, "40 段下の solo が上の group で mute された: peak {got}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ランチャーの行の器は曲の行数ぶん届く。旧実装は行群表の容量が 32 + 2 で、33 本目以降のトラックの
+    /// セルは撃っても鳴らなかった (アレンジに倒れる)。
+    #[test]
+    fn 四十本目のトラックのセルを撃つと鳴る() {
+        use common::model::{Clip, LaunchSettings, RowPlayback, SessionClip};
+        let dir = bounce_temp_dir("unbounded_launcher");
+        let (mut song, content) = source_only_song(&dir);
+        push_tracks(&mut song, 40, content, &[]);
+        let scene_id = song.push_scene();
+        let last = song.tracks.last_mut().expect("40 本目");
+        let clip_id = last.next_clip_id.max(1);
+        last.next_clip_id = clip_id + 1;
+        last.session_clips.push(SessionClip {
+            scene_id,
+            clip: Clip { id: clip_id, start_beat: 0.0, length_beats: 2.0, content_id: content, ..Clip::default() },
+            launch: LaunchSettings::default(),
+        });
+        last.launcher = RowPlayback::Launcher { clip_id };
+        song.enforce_edit_invariants();
+        let got = peak(&render_mix(&song, 0.0, 2.0));
+        assert!(got > 0.3, "40 本目のトラックのセルが鳴らない: peak {got}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 変調ソースの数に上限を置かない。旧実装は 65 個目以降のソースを compile / 値面から落としていたので、
+    /// 100 個目の LFO で volume を揺らしても音が変わらなかった。
+    #[test]
+    fn 百個目の変調ソースも効く() {
+        use common::model::{
+            AutomationTarget, LfoConfig, LfoShape, ModRate, ModRateMode, ModRouting, ModSource, ModSourceKind, Polarity,
+            RetriggerMode, TrackBuiltinParam,
+        };
+        let dir = bounce_temp_dir("unbounded_mod");
+        let render = |depth: f32| {
+            let (mut song, content) = source_only_song(&dir);
+            push_tracks(&mut song, 1, content, &[0]);
+            let owner = song.tracks[0].id;
+            let lfo = |id: u32| ModSource {
+                id,
+                owner_track_id: owner,
+                color: [0.0; 3],
+                kind: ModSourceKind::Lfo(LfoConfig {
+                    shape: LfoShape::SawUp,
+                    rate: ModRate { mode: ModRateMode::Free, hz: 3.0, ..ModRate::default() },
+                    retrigger: RetriggerMode::FreeRun,
+                    ..LfoConfig::default()
+                }),
+                enabled: true,
+            };
+            song.mod_sources = (1..=100).map(lfo).collect();
+            song.tracks[0].mod_routings = vec![ModRouting {
+                id: 1,
+                source_id: 100,
+                target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                depth,
+                polarity: Polarity::Bipolar,
+                enabled: true,
+            }];
+            song.enforce_edit_invariants();
+            render_mix(&song, 0.0, 2.0)
+        };
+        let (still, moved) = (render(0.0), render(1.0));
+        let diff = still.l.iter().zip(&moved.l).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(peak(&still) > 0.3, "前提: 鳴っている");
+        assert!(diff > 0.1, "100 個目のソースの変調が音に効いていない: 最大差 {diff}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// worker pool 経路も直列経路と同じ音になる。以前は pool 経路でだけ worker が変調の刻み面を id 表と値から
+    /// 組み直していて、id 索引 / 動く深さ (r.md #89 Q9) / buffer 先頭のサンプル位置が落ちていた。
+    #[test]
+    fn pool_経路でも動く深さの変調が直列と同じ音になる() {
+        use common::model::{
+            AutomationTarget, LfoConfig, LfoShape, ModRate, ModRateMode, ModRouting, ModSource, ModSourceKind, Polarity,
+            RetriggerMode, TrackBuiltinParam,
+        };
+        let dir = bounce_temp_dir("pool_moving_depth");
+        let (mut song, content) = source_only_song(&dir);
+        push_tracks(&mut song, 3, content, &[0, 1, 2]);
+        let owner = song.tracks[0].id;
+        let lfo = |id: u32, hz: f32| ModSource {
+            id,
+            owner_track_id: owner,
+            color: [0.0; 3],
+            kind: ModSourceKind::Lfo(LfoConfig {
+                shape: LfoShape::SawUp,
+                rate: ModRate { mode: ModRateMode::Free, hz, ..ModRate::default() },
+                retrigger: RetriggerMode::FreeRun,
+                ..LfoConfig::default()
+            }),
+            enabled: true,
+        };
+        song.mod_sources = vec![lfo(1, 3.0), lfo(2, 0.7)];
+        let routing = |id: u32, source_id: u32, target: AutomationTarget, polarity: Polarity| ModRouting {
+            id,
+            source_id,
+            target,
+            depth: 0.8,
+            polarity,
+            enabled: true,
+        };
+        let volume = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
+        song.tracks[0].mod_routings = vec![
+            routing(1, 1, volume, Polarity::Bipolar),
+            routing(2, 2, AutomationTarget::ModRoutingDepth { routing_id: 1 }, Polarity::Unipolar),
+        ];
+        song.enforce_edit_invariants();
+
+        let serial = render_mix(&song, 0.0, 2.0);
+        let engine = EngineShared::new();
+        engine.worker.store(Some(Arc::new(crate::engine_shared::WorkerRig {
+            pool: Some(crate::audio_worker::AudioWorkerPool::new(3).expect("pool")),
+            slots: Vec::new(),
+            bridge: common::worker_bridge::WorkerBridgeHandle::create(&format!("daw01_test_wb_{}", std::process::id()))
+                .expect("worker bridge"),
+            stall_notified: std::sync::atomic::AtomicBool::new(false),
+        })));
+        let pooled = render_mix_on(&engine, &song, 0.0, 2.0);
+        assert!(peak(&serial) > 0.1, "前提: 鳴っている");
+        let first_diff = serial.l.iter().chain(&serial.r).zip(pooled.l.iter().chain(&pooled.r)).position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!((serial.l.len(), first_diff), (pooled.l.len(), None), "pool 経路の音が直列と違う");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

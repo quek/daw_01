@@ -322,15 +322,12 @@ pub(super) fn owner_track_voices<'a>(
     cx: &'a ModBodyCtx<'_>,
     sid: u32,
 ) -> impl Iterator<Item = common::audio_bridge::VoiceSnapshot> + 'a {
-    let song = cx.app.cur.song_doc.song();
-    let track_idx = song
-        .mod_source_owner(sid)
-        .and_then(|owner| song.tracks.iter().position(|t| t.id == owner));
+    let owner = cx.app.cur.song_doc.song().mod_source_owner(sid);
     cx.app
         .cur.transport
         .track_voices
         .iter()
-        .filter(move |(t, _)| Some(*t) == track_idx)
+        .filter(move |(t, _)| Some(*t) == owner)
         .map(|(_, v)| *v)
 }
 

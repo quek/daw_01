@@ -1149,7 +1149,7 @@ fn build_stream(
                         // 「新しいフレームが来なかった経過時間ぶんの無音」を自分で
                         // 流し込んで落ちるので、書き手側の後始末が要らない。
                         for p in &local.projects {
-                            bridge.project(p.telemetry_slot).clear_meters();
+                            p.clear_meters(bridge.project(p.telemetry_slot));
                         }
                         dsp_load_ema = 0.0;
                         metrics.set_dsp_load_avg(0.0);

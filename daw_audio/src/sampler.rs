@@ -443,10 +443,7 @@ fn push_off(song: Option<&Song>, scratch: &mut [TrackScratch], track_id: u32, pi
 }
 
 fn track_index(song: &Song, track_id: u32) -> Option<usize> {
-    song.tracks
-        .iter()
-        .position(|t| t.id == track_id)
-        .filter(|&i| i < crate::engine::MAX_TRACKS)
+    song.tracks.iter().position(|t| t.id == track_id)
 }
 
 fn write_silence(ring: &SamplerRingHandle, n: usize) {

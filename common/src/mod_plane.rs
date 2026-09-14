@@ -16,9 +16,8 @@
 
 /// 所有型の値面。`ids[i]` と `values[i]` が対。
 ///
-/// slot の並びは engine の compile 順 (= `Song::mod_sources` を
-/// `MAX_MOD_SOURCES` で切ったもの) だが、**読み手は並びに依存してはいけない** —
-/// 引くのは常に [`ModPlane::scalar`] (id 引き)。
+/// slot の並びは engine の compile 順 (= `Song::mod_sources` の評価順) だが、
+/// **読み手は並びに依存してはいけない** — 引くのは常に [`ModPlane::scalar`] (id 引き)。
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ModPlane {
     ids: Vec<u32>,
@@ -30,13 +29,14 @@ pub struct ModPlane {
 }
 
 impl ModPlane {
+    /// `sources` 本の値と `depth_cols` 本の深さを確保なしで積める面。
     #[must_use]
-    pub fn with_capacity(n: usize) -> Self {
+    pub fn with_capacity(sources: usize, depth_cols: usize) -> Self {
         Self {
-            ids: Vec::with_capacity(n),
-            values: Vec::with_capacity(n),
-            depth_ids: Vec::with_capacity(n),
-            depths: Vec::with_capacity(n),
+            ids: Vec::with_capacity(sources),
+            values: Vec::with_capacity(sources),
+            depth_ids: Vec::with_capacity(depth_cols),
+            depths: Vec::with_capacity(depth_cols),
         }
     }
 
@@ -175,10 +175,8 @@ impl<'a> ModPlaneRef<'a> {
 
     /// `source_id` のスカラー。未知の id は `0.0` (= 変調なし)。
     ///
-    /// `ids` は最大 `MAX_MOD_SOURCES` (= 64) 要素の連続した `u32` なので、
-    /// 線形走査でも 1 cache line 数本ぶん。`Song::mod_sources` (名前 `String` と
-    /// `Vec` を抱えた太い struct) を走査していた旧 `source_scalar` と違い、
-    /// per-sample 経路に乗せてよい形。
+    /// 線形走査 (GUI / sidecar の 1 フレーム 1 回の引き用)。RT の per-sample 経路は
+    /// id 索引を持つ [`ModTickPlaneRef::scalar_at_frame_opt`] を使う。
     #[must_use]
     #[inline]
     pub fn scalar(&self, source_id: u32) -> f32 {
@@ -221,6 +219,27 @@ mod tests {
         assert_eq!(a.scalar(999), 0.0);
         assert_eq!(a.scalar(0), 0.0);
     }
+
+    /// 刻み面は id 索引で列を引く: ソースが何百あっても、並びがばらばらでも、索引なしの線形引きと同じ値を返す。
+    #[test]
+    fn 刻み面は索引で引いても線形引きと同じ値() {
+        let ids: Vec<u32> = (1..=300u32).rev().map(|i| i * 7).collect();
+        let mut plane = ModTickPlane::with_capacity(ids.len(), 0, 4);
+        plane.reset(&ids, &[], crate::mod_graph::MOD_TICK_FRAMES);
+        let row0: Vec<f32> = (0..ids.len()).map(|c| c as f32).collect();
+        let row1: Vec<f32> = (0..ids.len()).map(|c| c as f32 + 1.0).collect();
+        plane.push_row(&row0, &[]);
+        plane.push_row(&row1, &[]);
+        let indexed = plane.as_ref();
+        let linear = ModTickPlaneRef::new(indexed.ids, indexed.values, indexed.lead);
+        for &id in &[7u32, 1050, 2100, 999_999, 0] {
+            for frame in [0, 16, 63] {
+                assert_eq!(indexed.scalar_at_frame_opt(id, frame), linear.scalar_at_frame_opt(id, frame), "id={id} frame={frame}");
+            }
+        }
+        assert_eq!(indexed.scalar_at_frame_opt(2100, 0), Some(0.0), "id 2100 は列 0 (並びの先頭)");
+        assert!(indexed.scalar_at_frame_opt(0, 0).is_none(), "未採番 sentinel は引けない");
+    }
 }
 
 /// buffer 1 個ぶんの **刻みごとの**値面 (r.md #89 §2.2)。
@@ -235,6 +254,9 @@ mod tests {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ModTickPlane {
     ids: Vec<u32>,
+    /// `(id, 列)` を id 昇順に並べた索引。per-sample 経路が id から列を引くのに使う
+    /// (ソース数に上限が無いので線形走査にしない — `docs/plan_unbounded_tracks.md` §2.7)。
+    col_of: Vec<(u32, u32)>,
     /// `rows * ids.len()` の row-major。
     values: Vec<f32>,
     /// r.md #89 Q9: 深さが動く変調の `ModRouting::id` (列)。
@@ -251,21 +273,27 @@ pub struct ModTickPlane {
 
 impl ModTickPlane {
     #[must_use]
-    pub fn with_capacity(sources: usize, ticks: usize) -> Self {
+    pub fn with_capacity(sources: usize, depth_cols: usize, ticks: usize) -> Self {
         Self {
             ids: Vec::with_capacity(sources),
+            col_of: Vec::with_capacity(sources),
             values: Vec::with_capacity(sources * ticks),
-            depth_ids: Vec::with_capacity(sources),
-            depths: Vec::with_capacity(sources * ticks),
+            depth_ids: Vec::with_capacity(depth_cols),
+            depths: Vec::with_capacity(depth_cols * ticks),
             lead: crate::mod_graph::MOD_TICK_FRAMES,
             first_sample: 0,
         }
     }
 
-    /// 列 (= slot の id 表) を張り直し、行を空にする。確保は起きない。
+    /// 列 (= slot の id 表) を張り直し、行を空にする。容量内なら確保は起きない
+    /// (索引の並べ替えは in-place)。
     pub fn reset(&mut self, ids: &[u32], depth_ids: &[u32], lead: u32) {
         self.ids.clear();
         self.ids.extend_from_slice(ids);
+        self.col_of.clear();
+        #[allow(clippy::cast_possible_truncation)]
+        self.col_of.extend(ids.iter().enumerate().map(|(col, &id)| (id, col as u32)));
+        self.col_of.sort_unstable_by_key(|&(id, _)| id);
         self.values.clear();
         self.depth_ids.clear();
         self.depth_ids.extend_from_slice(depth_ids);
@@ -325,6 +353,7 @@ impl ModTickPlane {
     pub fn as_ref(&self) -> ModTickPlaneRef<'_> {
         ModTickPlaneRef {
             ids: &self.ids,
+            col_of: &self.col_of,
             values: &self.values,
             depth_ids: &self.depth_ids,
             depths: &self.depths,
@@ -343,6 +372,8 @@ impl ModTickPlane {
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct ModTickPlaneRef<'a> {
     pub ids: &'a [u32],
+    /// `(id, 列)` を id 昇順に並べた索引 ([`ModTickPlane`] の同名 field)。空なら `ids` を線形に引く。
+    pub col_of: &'a [(u32, u32)],
     pub values: &'a [f32],
     /// r.md #89 Q9: 深さが動く変調の id と、行ごとの実効深さ。
     pub depth_ids: &'a [u32],
@@ -357,7 +388,27 @@ pub struct ModTickPlaneRef<'a> {
 impl<'a> ModTickPlaneRef<'a> {
     #[must_use]
     pub const fn new(ids: &'a [u32], values: &'a [f32], lead: u32) -> Self {
-        Self { ids, values, depth_ids: &[], depths: &[], lead, first_sample: 0 }
+        Self { ids, col_of: &[], values, depth_ids: &[], depths: &[], lead, first_sample: 0 }
+    }
+
+    /// id → 列の索引 ([`ModTickPlane`] が持つ `(id, 列)` の id 昇順) を付けたビュー。
+    #[must_use]
+    pub const fn with_index(self, col_of: &'a [(u32, u32)]) -> Self {
+        Self { col_of, ..self }
+    }
+
+    /// `source_id` の列。未採番 sentinel (`0`) と面に無い id は `None`。
+    #[must_use]
+    #[inline]
+    fn column(&self, source_id: u32) -> Option<usize> {
+        if source_id == 0 {
+            return None;
+        }
+        if self.col_of.is_empty() {
+            return self.ids.iter().position(|&id| id == source_id);
+        }
+        let i = self.col_of.binary_search_by_key(&source_id, |&(id, _)| id).ok()?;
+        Some(self.col_of[i].1 as usize)
     }
 
     /// r.md #117: buffer 先頭の絶対 song サンプル位置。
@@ -375,7 +426,7 @@ impl<'a> ModTickPlaneRef<'a> {
         depths: &'a [f32],
         lead: u32,
     ) -> Self {
-        Self { ids, values, depth_ids, depths, lead, first_sample: 0 }
+        Self { ids, col_of: &[], values, depth_ids, depths, lead, first_sample: 0 }
     }
 
     #[must_use]
@@ -461,12 +512,15 @@ impl<'a> ModTickPlaneRef<'a> {
         if rows == 0 {
             return None;
         }
+        // 列は 1 回だけ引く (per-sample 経路。ソース数に比例する走査をしない)。
+        let col = self.column(source_id)?;
+        let cols = self.ids.len();
         let (a, b, t) = self.segment(frame);
-        let va = self.row(a.min(rows - 1)).scalar_opt(source_id)?;
+        let va = *self.values.get(a.min(rows - 1) * cols + col)?;
         if b >= rows {
             return Some(va);
         }
-        let vb = self.row(b).scalar_opt(source_id).unwrap_or(va);
+        let vb = self.values.get(b * cols + col).copied().unwrap_or(va);
         Some(va + (vb - va) * t)
     }
 

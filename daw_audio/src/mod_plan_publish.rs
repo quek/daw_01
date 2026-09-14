@@ -19,10 +19,30 @@ use common::mod_graph::{ModPhaseTable, ModPlan, ModRuntime, build_plan};
 use common::model::Song;
 use common::protocol::ProjectKey;
 
-/// RT へ配送する 1 組 (評価計画と、それに合わせて確保済みの RT 状態)。
+use crate::mod_tick::ModTickBuffers;
+
+/// RT へ配送する 1 組 (評価計画と、それに合わせて確保済みの RT 状態と器)。
 ///
-/// `ModRuntime::install` は `Vec::resize` するので **必ず off-thread で**通す。
-pub type ModPlanDelivery = (Arc<ModPlan>, ModRuntime);
+/// `ModRuntime::install` は `Vec::resize` し、器 ([`ModTickBuffers`]) は plan の大きさで確保するので
+/// **必ず off-thread で**作る ([`Self::new`])。RT の差し替え ([`crate::mod_tick::ModTickRunner::install`])
+/// は旧い 1 組を同じ型で返す (recycle で off-thread に落とす)。
+#[derive(Debug)]
+pub struct ModPlanDelivery {
+    pub plan: Arc<ModPlan>,
+    pub rt: ModRuntime,
+    pub bufs: ModTickBuffers,
+}
+
+impl ModPlanDelivery {
+    /// `plan` を走らせる RT 状態と器を確保する (off-thread)。
+    #[must_use]
+    pub fn new(plan: Arc<ModPlan>) -> Self {
+        let mut rt = ModRuntime::default();
+        rt.install(&plan);
+        let bufs = ModTickBuffers::for_plan(&plan);
+        Self { plan, rt, bufs }
+    }
+}
 
 /// 評価計画を作り、前回と違うときだけ配送物を返す。
 #[derive(Debug, Default)]
@@ -49,10 +69,15 @@ impl ModPlanPublisher {
         }
         self.generation += 1;
         let plan = Arc::new(plan);
-        let mut rt = ModRuntime::default();
-        rt.install(&plan);
         self.last = Some(Arc::clone(&plan));
-        Some((plan, rt))
+        Some(ModPlanDelivery::new(plan))
+    }
+
+    /// 直近に配送した評価計画 (まだ無ければ `None`)。[`crate::mod_tick::FollowerMaps`] を
+    /// schedule の差し替えに合わせて作り直すときに使う。
+    #[must_use]
+    pub fn latest(&self) -> Option<&Arc<ModPlan>> {
+        self.last.as_ref()
     }
 }
 

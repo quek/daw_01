@@ -663,9 +663,12 @@ impl AppData {
     /// GR は engine が「buffer 内で最も深かった量」を **0 以下の dB** で publish するので、
     /// ここで正の減衰量へ反転してから peak と同じ release で 0 へ戻す (メーターが 1 buffer だけ
     /// 跳ねて消えるのを防ぐ)。`native` が `None` (seqlock が読めなかった) なら GR は前回値を保つ。
+    /// `peaks` は engine が publish した `(track id, L, R)` (`None` = 読めなかった tick = 前回値を保つ)。
+    /// 表示 (`track_peak_display`) は GUI の曲の並びなので、id で突き合わせて積む — engine は曲の順に
+    /// 並べるので通常は同じ位置で一致し、並べ替えが engine に届く前の数フレームだけ id で引き直す。
     pub(crate) fn on_track_peaks_tick(
         &mut self,
-        peaks: &[(f32, f32)],
+        peaks: Option<&[(u32, f32, f32)]>,
         native: Option<&[(u64, f32)]>,
         limiter_gr_db: f32,
     ) {
@@ -675,13 +678,18 @@ impl AppData {
         if let Some(plane) = native {
             t.native_gr.update(plane, RELEASE);
         }
-        let n = self.cur.song_doc.song().tracks.len();
+        let Some(peaks) = peaks else { return };
+        let song = self.cur.song_doc.song();
         let t = &mut self.cur.transport;
-        if t.track_peak_display.len() != n {
-            t.track_peak_display.resize(n, (0.0, 0.0));
+        if t.track_peak_display.len() != song.tracks.len() {
+            t.track_peak_display.resize(song.tracks.len(), (0.0, 0.0));
         }
-        for (i, d) in t.track_peak_display.iter_mut().enumerate() {
-            let (l, r) = peaks.get(i).copied().unwrap_or((0.0, 0.0));
+        for (i, (track, d)) in song.tracks.iter().zip(t.track_peak_display.iter_mut()).enumerate() {
+            let hit = match peaks.get(i) {
+                Some(&(id, l, r)) if id == track.id => Some((l, r)),
+                _ => peaks.iter().find(|p| p.0 == track.id).map(|&(_, l, r)| (l, r)),
+            };
+            let (l, r) = hit.unwrap_or((0.0, 0.0));
             d.0 = common::meter::update_peak(d.0, l, RELEASE);
             d.1 = common::meter::update_peak(d.1, r, RELEASE);
         }

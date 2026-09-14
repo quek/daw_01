@@ -2336,8 +2336,7 @@ fn op_labels(p: &crate::graph::ChainProgram) -> Vec<String> {
         .map(|op| match op {
             ChainOp::Plugin { device_id, .. } => format!("P{device_id}"),
             ChainOp::Native { native_slot, .. } => {
-                let ns = &p.natives[*native_slot as usize];
-                format!("N({:?}{})", ns.dsp.kind(), if ns.builtin { ",b" } else { "" })
+                format!("N({:?})", p.natives[*native_slot as usize].dsp.kind())
             }
             ChainOp::ParallelBegin { .. } => "RB".into(),
             ChainOp::ChainBegin { .. } => "CB".into(),
@@ -2397,11 +2396,17 @@ fn v38_fixture_compiles_builtins_where_the_old_strip_ran() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../common/tests/fixtures/v38_strips.daw");
     let song = common::project::load_project(&path).expect("v38 fixture").song;
     let sched = compile_schedule_for_test(&song, 48_000, 256).expect("compile");
+    // program の内蔵 device が song の **組み込み** device そのもの (device id で突き合わせる)。
+    let builtin_ids = |devices: &[common::model::Device]| -> Vec<u64> {
+        devices.iter().filter_map(|d| d.as_native().filter(|n| n.builtin).map(|n| n.id)).collect()
+    };
+    let native_ids = |p: &crate::graph::ChainProgram| -> Vec<u64> { p.natives.iter().map(|ns| ns.device_id).collect() };
     for (i, t) in song.tracks.iter().enumerate() {
         let p = &sched.track_programs[i];
         let labels = op_labels(p);
         assert_eq!(p.natives.len(), 2, "track {}: {labels:?}", t.name);
-        assert_eq!(labels[labels.len() - 2..], ["N(Comp,b)", "N(Eq,b)"], "track {} の末尾: {labels:?}", t.name);
+        assert_eq!(labels[labels.len() - 2..], ["N(Comp)", "N(Eq)"], "track {} の末尾: {labels:?}", t.name);
+        assert_eq!(native_ids(p), builtin_ids(&t.devices), "track {} の内蔵 device は組み込み", t.name);
     }
     let gwi = song.tracks.iter().position(|t| t.name == "GWI").expect("GWI track");
     let p = &sched.track_programs[gwi];
@@ -2409,7 +2414,8 @@ fn v38_fixture_compiles_builtins_where_the_old_strip_ran() {
     let first_native = p.ops.iter().position(|op| matches!(op, crate::graph::ChainOp::Native { .. })).unwrap();
     assert!(p.pass1_end <= first_native, "GWI の組み込みは pass 2: pass1_end={} ops={:?}", p.pass1_end, op_labels(p));
     let master = op_labels(&sched.master_program);
-    assert_eq!(master[..2], ["N(BusComp,b)", "N(ToneEq,b)"], "master の先頭: {master:?}");
+    assert_eq!(master[..2], ["N(BusComp)", "N(ToneEq)"], "master の先頭: {master:?}");
+    assert_eq!(native_ids(&sched.master_program), builtin_ids(&song.master_fx_chain), "master の内蔵 device は組み込み");
     assert!(master.len() > 2 && master[2].starts_with('P'), "組み込みの後ろに旧 fx chain: {master:?}");
     assert!(song.master_limiter.on, "fixture の旧 master strip は limiter ON");
     assert!(sched.master_limiter_latency);

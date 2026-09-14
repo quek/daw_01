@@ -90,14 +90,19 @@ fn decode<T: serde::de::DeserializeOwned>(tag: &str, v: Value) -> Result<T, Stri
 pub(super) fn daw_native_gain_reduction(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let device_id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
     let amount = with_host(|h| {
-        let Some(slot) = h.bootstrap.bridge.find_project(h.app.pk()) else {
+        let bridge = &h.bootstrap.bridge;
+        let Some(slot) = bridge.find_project(h.app.pk()) else {
             return 0.0;
         };
-        let mut plane = Vec::new();
-        if !slot.read_native_meters(&mut plane) {
+        // GR は伸びる telemetry 面にある (`docs/plan_unbounded_tracks.md` §3)。今の面を開いて読む。
+        let Ok(plane) = common::audio_bridge::TelemetryPlane::open(bridge.os_id(), slot.plane_id()) else {
+            return 0.0;
+        };
+        let mut meters = Vec::new();
+        if !plane.read_native_meters(&mut meters) {
             return 0.0;
         }
-        plane.iter().find(|(id, _)| *id == device_id).map_or(0.0, |&(_, gr_db)| (-gr_db).max(0.0))
+        meters.iter().find(|(id, _)| *id == device_id).map_or(0.0, |&(_, gr_db)| (-gr_db).max(0.0))
     });
     Ok(JsValue::from(f64::from(amount)))
 }

@@ -47,16 +47,21 @@ pub mod render;
 pub mod runtime;
 pub mod sidecar;
 
-pub use runtime::{LaunchRequest, LauncherRuntime};
+pub use runtime::{LaunchRequest, LauncherGrowth, LauncherRuntime};
 
 // 発火拍 / ループ端の丸め誤差を吸収する幅 (拍)。**GUI と engine で同じ値を使う**
 // ため定数の SSoT は `common::model` 側 1 本 — 以前はここと
 // `daw_gui::launcher_time` に別々の値 (1e-5 / 1e-9) が居て 4 桁食い違っていた。
 use common::model::LAUNCH_EPSILON_BEATS;
 
-/// 走行状態を持てる行数の上限。`common::audio_bridge::MAX_LAUNCHER_ROWS` と
-/// 揃える (publish できない行を engine だけが持っても表示できない)。
-pub const MAX_ROWS: usize = common::audio_bridge::MAX_LAUNCHER_ROWS;
+/// `song` の行の器に要る大きさ `(行数, 行群数)`。行 = トラック行 + 全トラックのレーン行 + master の
+/// レーン行、行群 = トラック + master + 番兵 ([`RowSourceTable`] の `offsets`)。**上限は置かない**
+/// (`docs/plan_unbounded_tracks.md` §2.5) — 器はこの大きさで off-thread に確保して song と同じ便で届ける。
+#[must_use]
+pub fn row_capacity(song: &common::model::Song) -> (usize, usize) {
+    let lanes: usize = song.tracks.iter().map(|t| t.automation_lanes.len()).sum();
+    (song.tracks.len() + lanes + song.song_lanes.len(), song.tracks.len() + 2)
+}
 
 /// 拍数 / 長さとして使える値か (有限かつ正)。
 ///
@@ -335,15 +340,21 @@ pub struct RowSourceTable {
 }
 
 impl RowSourceTable {
-    /// 事前確保。容量を超えた行は `Arranger` に倒れる (= 従来の挙動)。
+    /// `rows` 行 / `groups` 行群ぶんを事前確保する ([`row_capacity`])。容量を超えた行は RT で
+    /// 再確保せず `Arranger` に倒れる (器は曲から数えて届くので通常は溢れない)。
     #[must_use]
-    pub fn new() -> Self {
+    pub fn with_capacity(rows: usize, groups: usize) -> Self {
         Self {
-            sources: Vec::with_capacity(MAX_ROWS),
-            // +2 = マスター行のグループと番兵。
-            offsets: Vec::with_capacity(crate::engine::MAX_TRACKS + 2),
+            sources: Vec::with_capacity(rows),
+            offsets: Vec::with_capacity(groups),
             master_group: None,
         }
+    }
+
+    /// 容量 `(行数, 行群数)`。
+    #[must_use]
+    pub fn capacity(&self) -> (usize, usize) {
+        (self.sources.capacity(), self.offsets.capacity())
     }
 
     pub fn clear(&mut self) {
@@ -579,7 +590,7 @@ mod tests {
 
     #[test]
     fn テーブルは行が無いトラックを_arranger_に倒す() {
-        let mut t = RowSourceTable::new();
+        let mut t = RowSourceTable::with_capacity(8, 4);
         t.begin_track();
         t.push(RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent));
         t.push(RowTimeSource::uniform(RowKey::lane(1, 3), RowPhase::Arranger));
@@ -604,7 +615,7 @@ mod tests {
     #[test]
     fn マスター行のレーンは添字がずれない() {
         const M: u32 = common::model::MASTER_TRACK_ID;
-        let mut t = RowSourceTable::new();
+        let mut t = RowSourceTable::with_capacity(8, 4);
         t.begin_track();
         t.push(RowTimeSource::uniform(RowKey::track(1), RowPhase::Arranger));
         t.begin_master();
@@ -627,7 +638,7 @@ mod tests {
 
     #[test]
     fn マスター行を積んでいなければ全部アレンジ() {
-        let mut t = RowSourceTable::new();
+        let mut t = RowSourceTable::with_capacity(8, 4);
         t.begin_track();
         t.push(RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent));
         assert_eq!(t.master_rows().lane(0), RowTimeSource::default());

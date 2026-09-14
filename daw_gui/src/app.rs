@@ -156,6 +156,7 @@ impl AppData {
                 sample_rate,
                 metrics: common::metrics_bridge::ResourceMetrics::default(),
                 metrics_bridge: None,
+                plugin_us: std::collections::HashMap::new(),
                 plugin_db,
                 audio_tx: Some(audio_tx),
                 plugin_tx: Some(plugin_tx),
@@ -1283,7 +1284,7 @@ impl AppData {
             // 時点で切り替わっていたら (1 tick の窓) 捨てる — 別タブの値を混ぜない。
             AppEvent::TrackPeaksTick { project, tracks, native_gr, master_limiter_gr_db } => {
                 if project == self.cur.key {
-                    self.on_track_peaks_tick(&tracks, native_gr.as_deref(), master_limiter_gr_db);
+                    self.on_track_peaks_tick(tracks.as_deref(), native_gr.as_deref(), master_limiter_gr_db);
                 }
             }
             AppEvent::DeviceSpectrumTick { project, spectra, visual_digest } => {
@@ -1303,12 +1304,15 @@ impl AppData {
                 xrun_count,
                 buffer_frames,
                 sample_rate,
+                plugin_us,
             } => {
                 self.ipc.metrics.dsp_load_peak = dsp_load_peak;
                 self.ipc.metrics.dsp_load_avg = dsp_load_avg;
                 self.ipc.metrics.xrun_count = xrun_count;
                 self.ipc.metrics.buffer_frames = buffer_frames;
                 self.ipc.metrics.sample_rate = sample_rate;
+                self.ipc.plugin_us.clear();
+                self.ipc.plugin_us.extend(plugin_us);
             }
             AppEvent::SystemMetricsTick { cpu, mem_mb } => {
                 self.ipc.metrics.system_cpu = cpu;

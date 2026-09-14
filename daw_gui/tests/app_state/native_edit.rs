@@ -190,12 +190,12 @@ fn native_gain_reduction_display_follows_the_plane() {
     let (mut app, _a, _p, _d) = support::build_app();
     let track = app.cur.song_doc.song().tracks[0].id;
     let comp = builtin(&app, track, NativeKind::Comp);
-    let peaks = vec![(0.0, 0.0); app.cur.song_doc.song().tracks.len()];
+    let peaks: Vec<(u32, f32, f32)> = app.cur.song_doc.song().tracks.iter().map(|t| (t.id, 0.0, 0.0)).collect();
     let tick = |app: &mut AppData, native: Option<Vec<(u64, f32)>>| {
         let project = app.pk();
         app.handle_event(AppEvent::TrackPeaksTick {
             project,
-            tracks: peaks.clone(),
+            tracks: Some(peaks.clone()),
             native_gr: native,
             master_limiter_gr_db: 0.0,
         });

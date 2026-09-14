@@ -36,7 +36,6 @@ mod tests;
 
 use std::collections::HashMap;
 
-use common::audio_bridge::{MAX_NATIVE_METERS, MAX_TRACKS};
 use common::model::{AudioTap, Song, TapPoint, TapSource};
 use common::protocol::RenderScope;
 
@@ -188,6 +187,13 @@ pub fn compile_schedule(
             (None, false) => Pass1Role::Leaf,
         };
     }
+    // solo の透過規則の表 (「子 / send 元が solo なら bus も透過」と folder solo。RT で配線を歩かない)。
+    for (b, (contributors, ancestors)) in
+        built.iter_mut().zip(topo.solo_contributors(song).into_iter().zip(topo.solo_ancestors(song)))
+    {
+        b.program.solo_contributors = contributors;
+        b.program.solo_ancestors = ancestors;
+    }
     let taps = TapCtx {
         id_to_idx: &topo.id_to_idx,
         chains: &chain_map,
@@ -245,15 +251,16 @@ fn master_chain(song: &Song, scope: RenderScope) -> &[common::model::Device] {
 /// r.md #110: 全 track + master の device ツリーを program に展開し、chain id → 置き場
 /// (`ChainMap`) を組む。`compile_schedule` の冒頭から切り出した (関数 budget)。
 ///
-/// r.md #129 §8.3.2: 展開した program に、内蔵 device の GR メーターの割り当てと track の
-/// snapshot 要求を焼く。ここに置くので `n == 0` の早期 return にも効く。
+/// r.md #129 §8.3.2: 展開した program に track の snapshot 要求を焼く。ここに置くので `n == 0` の
+/// 早期 return にも効く (GR メーターは device ごとの `NativeSlot::meter` で、面の容量は曲から数える —
+/// `docs/plan_unbounded_tracks.md` §3)。
 fn build_all_programs(
     song: &Song,
     device_latencies: &DeviceLatencies,
     scope: RenderScope,
 ) -> (BuiltProgram, Vec<BuiltProgram>, ChainMap) {
     let chain_taps = collect_chain_taps(song);
-    let mut master_built = build_program(
+    let master_built = build_program(
         master_chain(song, scope),
         common::model::MASTER_TRACK_ID,
         None,
@@ -285,33 +292,8 @@ fn build_all_programs(
         register(b, idx as u32);
     }
     register(&master_built, MASTER_OWNER);
-    assign_native_meters(&mut built, &mut master_built);
     bake_snapshot_needs(song, &mut built);
     (master_built, built, chain_map)
-}
-
-/// GR を出す内蔵 device (Comp / Bus Comp) に、GR 面 (`MAX_NATIVE_METERS` 枠) の publish 権を割り当てる。
-/// 順は組み込み (track 順 → master) → 追加分 (同じ順) で、枠を超えた分は publish しない。
-/// pass 1 が処理する track は先頭 `MAX_TRACKS` 本までなので、それより後ろの track には割り当てない
-/// (組み込み Comp は最大 `MAX_TRACKS + 1` 個 = Mixer 帯とマスターパネルの GR は必ず出る)。
-fn assign_native_meters(built: &mut [BuiltProgram], master_built: &mut BuiltProgram) {
-    let mut left = MAX_NATIVE_METERS;
-    for builtin in [true, false] {
-        let programs = built
-            .iter_mut()
-            .take(MAX_TRACKS)
-            .chain(std::iter::once(&mut *master_built))
-            .map(|b| &mut b.program);
-        for p in programs {
-            for ns in p.natives.iter_mut().filter(|ns| ns.builtin == builtin) {
-                let wants = ns.dsp.kind().has_gain_reduction();
-                ns.meter = wants && left > 0;
-                if ns.meter {
-                    left -= 1;
-                }
-            }
-        }
-    }
 }
 
 /// テスト用: 「どの device も latency を報告していない」 前提で compile する短縮形。

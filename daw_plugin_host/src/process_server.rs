@@ -49,11 +49,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
-use common::metrics_bridge::MetricsBridgeHandle;
+use common::metrics_bridge::{MetricsBridgeHandle, PluginMetricsPlane, PluginSlotAllocator};
 use common::protocol::{DeviceAddr, InstanceToken};
 use common::plugin_ref::open_named_event;
 use common::process_data::{Event, EventKind};
@@ -79,10 +79,11 @@ pub struct PluginEntry {
     /// log する (TIME_CRITICAL thread での毎 buffer format+log を排除)。
     /// republish (再 SetSlotPlugin / reinit) で新 entry になりリセット。
     pub err_logged: Arc<AtomicBool>,
-    /// L1: この device が claim した metrics slot index のキャッシュ
-    /// (`u32::MAX` = 未 claim)。 worker が初回 `process()` で
-    /// `MetricsBridge::claim_plugin_metric_slot` を呼んで確定し、 以後 O(1) store。
-    pub metric_slot: Arc<AtomicU32>,
+    /// per-plugin 計測面 ([`PluginMetricsPlane`]) の枠番号。**registry に入れるとき plugin-main が決める**
+    /// (`registry_insert` が token ごとの帳簿で上書きする。作る側は [`METRIC_SLOT_UNASSIGNED`] を入れる)。
+    /// worker は store するだけ — RT で空き枠を探さない (`docs/plan_unbounded_tracks.md` §4)。detach /
+    /// republish / reinit を跨いで同じ枠を使い、instance を壊すときに [`registry_release_metric_slot`] で空ける。
+    pub metric_slot: u32,
     /// r.md #87: この instance へ渡す musical timeline を **曲全体の位置に固定**
     /// するか。既定 (`false`) は行の時間軸 = ランチャーで撃った行の plugin は
     /// セルの拍で動く。`true` になるのは **ARA を bind した instance だけ** —
@@ -92,8 +93,8 @@ pub struct PluginEntry {
     pub transport_pinned_to_song: bool,
 }
 
-/// `PluginEntry::metric_slot` の未 claim sentinel。
-pub const METRIC_SLOT_UNCLAIMED: u32 = u32::MAX;
+/// `PluginEntry::metric_slot` の「まだ枠を割り当てていない」sentinel。
+pub const METRIC_SLOT_UNASSIGNED: u32 = u32::MAX;
 
 impl Clone for PluginEntry {
     fn clone(&self) -> Self {
@@ -102,7 +103,7 @@ impl Clone for PluginEntry {
             audio: Arc::clone(&self.audio),
             process_data: self.process_data,
             err_logged: Arc::clone(&self.err_logged),
-            metric_slot: Arc::clone(&self.metric_slot),
+            metric_slot: self.metric_slot,
             transport_pinned_to_song: self.transport_pinned_to_song,
         }
     }
@@ -114,17 +115,41 @@ unsafe impl Sync for PluginEntry {}
 /// registry 1 世代の中身 ([`InstanceToken`] → [`PluginEntry`])。
 pub type RegistryMap = HashMap<InstanceToken, PluginEntry>;
 
+/// worker へ渡す registry の 1 世代: entry 表と、その世代の per-plugin 計測面。計測面を作り直したら
+/// 新しい世代として置き直すので、worker が採用した entry と計測面は必ず同じ世代の組になる。
+pub struct RegistrySnapshot {
+    entries: RegistryMap,
+    metrics: Option<Arc<PluginMetricsPlane>>,
+}
+
+impl std::ops::Deref for RegistrySnapshot {
+    type Target = RegistryMap;
+    fn deref(&self) -> &RegistryMap {
+        &self.entries
+    }
+}
+
+/// per-plugin 計測面の書き手 (plugin-main)。`WorkerPool::open` が固定 shmem を開いて繋ぐ。
+struct MetricsWriter {
+    bridge: MetricsBridgeHandle,
+    plane: Option<Arc<PluginMetricsPlane>>,
+    generation: u32,
+}
+
 /// worker が差し替えた旧 snapshot を plugin-main へ返す ring の容量。plugin-main は snapshot を置く
 /// **前に** 必ず回収するので、1 回の回収から次の回収までに 1 本の worker が返すのは「回収と同時に
 /// 採用していた 1 本」+「その回収の後に置かれた 1 本」の高々 2 本。余裕を持たせた値で、満杯には
 /// 到達しない ([`RegistryInbox::adopt_latest`] は満杯でも worker 上で解放しない)。
 const RETIRED_RING_CAP: usize = 8;
 
+/// per-plugin 計測面の作成を世代を変えて試す回数 (名前の衝突を避ける。`ensure_metrics_capacity`)。
+const METRICS_PLANE_CREATE_ATTEMPTS: usize = 4;
+
 /// 単一 slot の最新 snapshot の受け渡し口 (worker 1 本ぶん)。所有権を `AtomicPtr` で移すので、
 /// 置く側 (plugin-main) と取る側 (worker) のどちらも相手の保持中の値を解放しない。
 /// 置く / 取るは `SeqCst` (`DispatchCounter` との全順序、module doc の quiesce の論証)。
 struct SnapshotMailbox {
-    slot: std::sync::atomic::AtomicPtr<RegistryMap>,
+    slot: std::sync::atomic::AtomicPtr<RegistrySnapshot>,
 }
 
 impl SnapshotMailbox {
@@ -133,14 +158,14 @@ impl SnapshotMailbox {
     }
 
     /// plugin-main (非 RT): `snap` を置き、worker がまだ取っていなかった前の値を返す (解放は呼び出し側)。
-    fn post(&self, snap: Arc<RegistryMap>) -> Option<Arc<RegistryMap>> {
+    fn post(&self, snap: Arc<RegistrySnapshot>) -> Option<Arc<RegistrySnapshot>> {
         let prev = self.slot.swap(Arc::into_raw(snap).cast_mut(), Ordering::SeqCst);
         // SAFETY: slot に入るのは `post` の `Arc::into_raw` だけで、取り出した側が所有権を 1 回だけ戻す。
         (!prev.is_null()).then(|| unsafe { Arc::from_raw(prev) })
     }
 
     /// worker (RT): 置かれていれば取る。swap 1 回だけ (確保・解放なし)。
-    fn take(&self) -> Option<Arc<RegistryMap>> {
+    fn take(&self) -> Option<Arc<RegistrySnapshot>> {
         let p = self.slot.swap(std::ptr::null_mut(), Ordering::SeqCst);
         // SAFETY: `post` と同じ。
         (!p.is_null()).then(|| unsafe { Arc::from_raw(p) })
@@ -156,17 +181,17 @@ impl Drop for SnapshotMailbox {
 /// plugin-main 側の送り口 (worker 1 本ぶん)。
 struct RegistryFeed {
     mailbox: Arc<SnapshotMailbox>,
-    retired: rtrb::Consumer<Arc<RegistryMap>>,
+    retired: rtrb::Consumer<Arc<RegistrySnapshot>>,
 }
 
 /// worker thread 側の受け口。worker が所有し、dispatch-critical section の頭で
 /// [`Self::adopt_latest`] を呼ぶ。
 pub struct RegistryInbox {
     mailbox: Arc<SnapshotMailbox>,
-    retired: rtrb::Producer<Arc<RegistryMap>>,
-    current: Arc<RegistryMap>,
+    retired: rtrb::Producer<Arc<RegistrySnapshot>>,
+    current: Arc<RegistrySnapshot>,
     /// recycle ring が満杯だったときに返しそびれた旧 snapshot (次の採用で先に返す)。
-    stash: Option<Arc<RegistryMap>>,
+    stash: Option<Arc<RegistrySnapshot>>,
 }
 
 impl RegistryInbox {
@@ -174,7 +199,7 @@ impl RegistryInbox {
     /// 差し替えた旧 snapshot は recycle ring で plugin-main へ返す。ring は `RETIRED_RING_CAP` の doc の上限に
     /// より満杯にならない。満杯なら手元に 1 本保って次の採用で先に返す (2 本目も溢れるのは上限の数倍の
     /// 未回収で、そこだけは worker 上で解放される)。
-    fn adopt_latest(&mut self) -> &RegistryMap {
+    fn adopt_latest(&mut self) -> &RegistrySnapshot {
         if let Some(stashed) = self.stash.take()
             && let Err(rtrb::PushError::Full(back)) = self.retired.push(stashed)
         {
@@ -191,15 +216,21 @@ impl RegistryInbox {
 }
 
 struct RegistryState {
-    current: Arc<RegistryMap>,
+    current: Arc<RegistrySnapshot>,
     feeds: Vec<RegistryFeed>,
+    /// per-plugin 計測面の枠の帳簿 (面が繋がる前から割り当てる)。
+    slots: PluginSlotAllocator,
+    /// instance → 割り当て済みの枠。registry から外しても (detach) 残り、instance を壊したときに空ける。
+    assigned: HashMap<InstanceToken, u32>,
+    metrics: Option<MetricsWriter>,
 }
 
 impl RegistryState {
     /// 新しい中身を正本にして全 worker の受け口に置く。置く前に、worker が返した旧 snapshot と
     /// まだ取られていなかった前の snapshot を回収して **ここ (plugin-main) で** drop する。
     fn publish(&mut self, next: RegistryMap) {
-        let next = Arc::new(next);
+        let metrics = self.metrics.as_ref().and_then(|m| m.plane.clone());
+        let next = Arc::new(RegistrySnapshot { entries: next, metrics });
         for feed in &mut self.feeds {
             while let Ok(old) = feed.retired.pop() {
                 drop(old);
@@ -207,6 +238,61 @@ impl RegistryState {
             drop(feed.mailbox.post(Arc::clone(&next)));
         }
         self.current = next;
+    }
+
+    /// 計測面が `capacity` 枠を持つよう (足りなければ 2 冪で) 作り直し、`entries` の instance を同じ枠番号で
+    /// 載せ直す。**publish の前**に呼ぶ (新しい面は次の snapshot と一緒に worker へ届く)。面を作れなければ
+    /// (shmem の作成失敗) 旧面のまま = 溢れた instance の CPU 表示が出ないだけ。
+    fn ensure_metrics_capacity(&mut self, capacity: u32, entries: &RegistryMap) {
+        let Some(m) = self.metrics.as_mut() else { return };
+        let have = m.plane.as_ref().map_or(0, |p| p.capacity());
+        if m.plane.is_some() && capacity <= have {
+            return;
+        }
+        let cap = common::metrics_bridge::plugins::plugin_plane_capacity(capacity);
+        // 名前の衝突 (死んだ同じ pid の host が作った面を GUI がまだ開いている — 世代はプロセスごとに 1 から
+        // 数える) は次の世代で作り直して避ける。
+        let mut last_error = None;
+        for _ in 0..METRICS_PLANE_CREATE_ATTEMPTS {
+            m.generation = m.generation.wrapping_add(1).max(1);
+            let id = common::audio_bridge::plane_id(std::process::id(), m.generation);
+            match PluginMetricsPlane::create(m.bridge.os_id(), id, cap) {
+                Ok(next) => {
+                    for (token, e) in entries {
+                        next.assign(e.metric_slot, *token, m.plane.as_ref().map_or(0, |p| p.us(e.metric_slot)));
+                    }
+                    m.plane = Some(Arc::new(next));
+                    return;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        tracing::error!(error = ?last_error, capacity, "plugin metrics plane の作成に失敗");
+    }
+
+    /// 計測面の id を GUI へ知らせる (publish の後 = worker が新しい面を採用できる状態になってから)。
+    fn announce_metrics(&self) {
+        if let Some(m) = &self.metrics {
+            m.bridge.set_plugin_plane_id(m.plane.as_ref().map_or(0, |p| p.id()));
+        }
+    }
+
+    /// `next` を正本にして publish する。計測面が `next` の枠を持たなければ作り直し (全 instance を載せ直す)、
+    /// 今の正本に居ない instance (新規 / detach からの republish) を面の枠に載せてから publish する
+    /// (worker は RT で枠を探さない)。作り直したら publish の後に GUI へ知らせる。
+    fn publish_with_metrics(&mut self, next: RegistryMap) {
+        let capacity = self.metrics.as_ref().and_then(|m| m.plane.as_ref()).map_or(0, |p| p.capacity());
+        let need = next.values().map(|e| e.metric_slot.saturating_add(1)).max().unwrap_or(0);
+        self.ensure_metrics_capacity(need, &next);
+        if let Some(plane) = self.metrics.as_ref().and_then(|m| m.plane.as_ref()) {
+            for (token, e) in next.iter().filter(|(token, _)| !self.current.contains_key(token)) {
+                plane.assign(e.metric_slot, *token, plane.us(e.metric_slot));
+            }
+        }
+        self.publish(next);
+        if need > capacity {
+            self.announce_metrics();
+        }
     }
 }
 
@@ -218,7 +304,15 @@ pub struct PluginRegistry {
 
 impl Default for PluginRegistry {
     fn default() -> Self {
-        Self { state: std::sync::Mutex::new(RegistryState { current: Arc::new(HashMap::new()), feeds: Vec::new() }) }
+        Self {
+            state: std::sync::Mutex::new(RegistryState {
+                current: Arc::new(RegistrySnapshot { entries: HashMap::new(), metrics: None }),
+                feeds: Vec::new(),
+                slots: PluginSlotAllocator::default(),
+                assigned: HashMap::new(),
+                metrics: None,
+            }),
+        }
     }
 }
 
@@ -229,8 +323,24 @@ impl PluginRegistry {
     }
 
     /// 今の中身 (plugin-main / テスト用の読み取り)。
-    pub fn snapshot(&self) -> Arc<RegistryMap> {
+    pub fn snapshot(&self) -> Arc<RegistrySnapshot> {
         Arc::clone(&self.lock().current)
+    }
+
+    /// per-plugin 計測の固定 shmem (`metrics_shmem_id`) に繋ぎ、今の instance を全部載せた計測面を作って
+    /// publish する (`WorkerPool::open`)。同じ shmem に繋ぎ直すときは既存の面を使い続ける。
+    fn attach_metrics(&self, metrics_shmem_id: &str) -> Result<()> {
+        let mut state = self.lock();
+        if state.metrics.as_ref().is_none_or(|m| m.bridge.os_id() != metrics_shmem_id) {
+            let bridge = MetricsBridgeHandle::open(metrics_shmem_id)?;
+            state.metrics = Some(MetricsWriter { bridge, plane: None, generation: 0 });
+        }
+        let current = Arc::clone(&state.current);
+        let need = current.values().map(|e| e.metric_slot.saturating_add(1)).max().unwrap_or(0);
+        state.ensure_metrics_capacity(need, &current.entries);
+        state.publish(current.entries.clone());
+        state.announce_metrics();
+        Ok(())
     }
 
     /// `n` 本の worker の受け口を作り、以前の送り口と置き換える (`WorkerPool::open`)。受け口は今の中身から始まる。
@@ -252,37 +362,58 @@ impl PluginRegistry {
     }
 }
 
-/// Publish (insert or replace) one registry entry.
-pub fn registry_insert(registry: &PluginRegistry, token: InstanceToken, entry: PluginEntry) {
+/// Publish (insert or replace) one registry entry. `token` の計測枠をここで決め (初めてなら割り当て、
+/// detach → republish は同じ枠)、計測面が足りなければ作り直してから publish する (worker は RT で枠を探さない)。
+pub fn registry_insert(registry: &PluginRegistry, token: InstanceToken, mut entry: PluginEntry) {
     let mut state = registry.lock();
-    let mut next = (*state.current).clone();
+    entry.metric_slot = match state.assigned.get(&token) {
+        Some(&slot) => slot,
+        None => {
+            let slot = state.slots.allocate();
+            state.assigned.insert(token, slot);
+            slot
+        }
+    };
+    let mut next = state.current.entries.clone();
     next.insert(token, entry);
-    state.publish(next);
+    state.publish_with_metrics(next);
 }
 
-/// Remove one registry entry, returning it if present.
+/// Remove one registry entry, returning it if present. 計測枠は空けない (detach → republish で同じ枠を使う)。
+/// instance を壊すときは quiesce の後に [`registry_release_metric_slot`] を呼ぶ。
 pub fn registry_remove(registry: &PluginRegistry, token: InstanceToken) -> Option<PluginEntry> {
     let mut state = registry.lock();
     if !state.current.contains_key(&token) {
         return None;
     }
-    let mut next = (*state.current).clone();
+    let mut next = state.current.entries.clone();
     let removed = next.remove(&token);
     state.publish(next);
     removed
 }
 
+/// instance を壊した (registry から外して quiesce 済み) ときに `token` の計測枠を空ける。以後この枠は別の
+/// instance が使う。枠を持っていなければ何もしない。
+pub fn registry_release_metric_slot(registry: &PluginRegistry, token: InstanceToken) {
+    let mut state = registry.lock();
+    let Some(slot) = state.assigned.remove(&token) else { return };
+    if let Some(plane) = state.metrics.as_ref().and_then(|m| m.plane.as_ref()) {
+        plane.release(slot);
+    }
+    state.slots.release(slot);
+}
+
 /// Snapshot every entry and clear the registry (ReinitAllPlugins 用)。
 pub fn registry_take_all(registry: &PluginRegistry) -> RegistryMap {
     let mut state = registry.lock();
-    let all = (*state.current).clone();
+    let all = state.current.entries.clone();
     state.publish(HashMap::new());
     all
 }
 
 /// Re-publish a set of entries at once (ReinitAllPlugins の republish)。
 pub fn registry_restore_all(registry: &PluginRegistry, entries: RegistryMap) {
-    registry.lock().publish(entries);
+    registry.lock().publish_with_metrics(entries);
 }
 
 /// `HANDLE` is `*mut c_void` and therefore `!Send`. We only ever wait on
@@ -549,9 +680,9 @@ impl WorkerPool {
         );
 
         let bridge = Arc::new(WorkerBridgeHandle::open(worker_bridge_shmem_id)?);
-        // resource monitor: per-plugin の process() 時間を publish する共有
-        // メモリ。
-        let metrics = Arc::new(MetricsBridgeHandle::open(metrics_shmem_id)?);
+        // resource monitor: per-plugin の process() 時間を載せる計測面に繋ぐ (worker は registry の
+        // snapshot 経由で面を受け取る)。
+        registry.attach_metrics(metrics_shmem_id)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let dispatch = Arc::new(DispatchCounter::new());
         let mut workers = Vec::with_capacity(n_workers as usize);
@@ -566,7 +697,6 @@ impl WorkerPool {
             wake_events.push(wake);
 
             let bridge_w = Arc::clone(&bridge);
-            let metrics_w = Arc::clone(&metrics);
             let shutdown_w = Arc::clone(&shutdown);
             let dispatch_w = Arc::clone(&dispatch);
             let idx = i as u32;
@@ -577,7 +707,7 @@ impl WorkerPool {
             let handle = std::thread::Builder::new()
                 .name(format!("plugin-worker-{i}"))
                 .spawn(move || {
-                    run_worker(idx, bridge_w, metrics_w, shutdown_w, inbox, dispatch_w, wake_s, done_s, ring)
+                    run_worker(idx, bridge_w, shutdown_w, inbox, dispatch_w, wake_s, done_s, ring)
                 })?;
             workers.push(handle);
         }
@@ -665,7 +795,6 @@ impl Drop for WorkerPool {
 fn run_worker(
     idx: u32,
     bridge: Arc<WorkerBridgeHandle>,
-    metrics: Arc<MetricsBridgeHandle>,
     shutdown: Arc<AtomicBool>,
     mut registry: RegistryInbox,
     dispatch: Arc<DispatchCounter>,
@@ -876,20 +1005,11 @@ fn run_worker(
                 false
             }
         };
-        // resource monitor: per-plugin の process() 時間 (μs) を publish。
-        // L1: token (u64、 非有界) を配列 index にせず、 token を値で保持する
-        // slot を claim する。 slot index は entry にキャッシュされるので線形 scan は
-        // plugin ごと初回だけ。 満杯 / 競合で未 claim なら次 buffer で再試行。
+        // resource monitor: per-plugin の process() 時間 (μs) を、plugin-main が registry に入れるときに
+        // 割り当てた枠へ store する (同じ snapshot の計測面 = entry と面は必ず同じ世代の組)。
         let proc_us = u32::try_from(proc_start.elapsed().as_micros()).unwrap_or(u32::MAX);
-        let mut slot = entry.metric_slot.load(Ordering::Relaxed);
-        if slot == METRIC_SLOT_UNCLAIMED
-            && let Some(i) = metrics.claim_plugin_metric_slot(token)
-        {
-            entry.metric_slot.store(i as u32, Ordering::Relaxed);
-            slot = i as u32;
-        }
-        if slot != METRIC_SLOT_UNCLAIMED {
-            metrics.set_plugin_dsp_us_slot(slot as usize, proc_us);
+        if let Some(plane) = snapshot.metrics.as_deref() {
+            plane.set_us(entry.metric_slot, proc_us);
         }
         if process_ok {
             // Copy output audio into the shmem.
@@ -1214,9 +1334,48 @@ mod tests {
             audio: AudioHalf::new(Box::new(NullHalf)),
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
-            metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
+            metric_slot: METRIC_SLOT_UNASSIGNED,
             transport_pinned_to_song: false,
         }
+    }
+
+    /// `docs/plan_unbounded_tracks.md` §4: 旧実装の枠 (512) を超える 600 instance が全部計測枠を持ち、
+    /// 読み手は面の id を開き直して token で引ける。worker は snapshot の面へ store するだけ。
+    /// detach → republish は同じ枠、壊した instance の枠は空いて再利用される。
+    #[test]
+    fn 容量を超える_instance_も計測枠を持ち壊すと枠が空く() {
+        let name = format!("daw01_test_ps_metrics_{}", std::process::id());
+        let gui = MetricsBridgeHandle::create(&name).expect("metrics bridge");
+        let registry = PluginRegistry::default();
+        let mut inbox = registry.attach_workers(1).pop().expect("inbox");
+        registry.attach_metrics(&name).expect("attach");
+        for id in 1..=600u64 {
+            registry_insert(&registry, InstanceToken(id), null_entry(id));
+        }
+        // worker 相当: 採用した snapshot の面へ、その entry の枠で store する。
+        let snap = inbox.adopt_latest();
+        let plane = snap.metrics.as_deref().expect("計測面");
+        for (token, e) in snap.iter() {
+            plane.set_us(e.metric_slot, u32::try_from(token.0).unwrap());
+        }
+        let reader = PluginMetricsPlane::open(gui.os_id(), gui.plugin_plane_id()).expect("GUI が面を開ける");
+        let mut out = Vec::new();
+        reader.read(&mut out);
+        assert_eq!(out.len(), 600, "600 個とも枠を持つ");
+        assert!(out.contains(&(InstanceToken(600), 600)));
+
+        let slot_of = |t: u64| registry.snapshot().get(&InstanceToken(t)).expect("entry").metric_slot;
+        let slot_7 = slot_of(7);
+        let detached = registry_remove(&registry, InstanceToken(7)).expect("detach");
+        registry_insert(&registry, InstanceToken(7), detached);
+        assert_eq!(slot_of(7), slot_7, "detach → republish は同じ枠");
+
+        assert!(registry_remove(&registry, InstanceToken(7)).is_some(), "teardown");
+        registry_release_metric_slot(&registry, InstanceToken(7));
+        reader.read(&mut out);
+        assert!(!out.iter().any(|(t, _)| *t == InstanceToken(7)), "壊した instance は読まれない");
+        registry_insert(&registry, InstanceToken(601), null_entry(601));
+        assert_eq!(slot_of(601), slot_7, "空いた枠を再利用する");
     }
 
     /// registry の insert / remove / take_all round-trip (token keyed)。

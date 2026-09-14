@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use common::audio_bridge::{AudioBridgeHandle, ProjectTelemetry};
+use common::audio_bridge::{AudioBridgeHandle, ProjectTelemetry, TelemetryPlane};
 use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
 use common::model::Song;
 use common::protocol::{ProjectKey, SamplerSource};
@@ -36,18 +36,20 @@ use common::timing::{effective_loop_bounds, song_ended};
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::graph::{DelayLine, DeviceScopeTap, NativeIo, Schedule, render_master_buffer};
+use crate::launcher::LauncherGrowth;
 use crate::metronome::{ClickVoice, render_metronome};
 use crate::mixer::TrackScratch;
+use crate::mod_plan_publish::ModPlanDelivery;
+use crate::mod_tick::FollowerMaps;
 use crate::native_dsp::MasterLimiterState;
 use crate::sampler::{SamplerRig, SamplerRt};
 use crate::sequencer::NoteTransition;
 
 pub use crate::engine_shared::*;
 
-/// Hard cap on tracks the audio engine can render in a single buffer.
-/// Picked to match `audio_bridge::MAX_TRACKS` so the per-track peak
-/// meter doesn't fall off the GUI side.
-pub const MAX_TRACKS: usize = 32;
+/// Debug-only の heartbeat ログに載せる track / device の数 (診断用。容量内でだけ積み、RT で伸ばさない)。
+#[cfg(debug_assertions)]
+const HEARTBEAT_LOG_ITEMS: usize = 32;
 
 /// 同時に開けるプロジェクト数 (`audio_bridge::MAX_PROJECTS` と同じ SSoT)。
 /// [`DeviceRt::projects`] はこの容量で事前確保し、RT で伸びない。
@@ -192,8 +194,9 @@ pub enum ProjectDelivery {
 /// - **snapshot** field (`song` / `tempo_map` / `plugin_refs` / `preview_sequence` / `loop_region` /
 ///   `recording_lanes` / `audio_clip_renderer` / `device_scope_watch`) は
 ///   最新値が過去を包含する ⇒ そのまま最新で上書きしてよい。
-/// - **delta** field (`schedule` と、それと対の `input_delay_replacements`)
-///   は「無い = 変更なし」を意味する ⇒ **中間 bundle を捨てるときに
+/// - **delta** field (`schedule` と、それと対の `input_delay_replacements` / `follower_maps`、
+///   器の成長便 `scratch_growth` / `launcher_growth` / `plane`、`mod_plan`) は
+///   「無い = 変更なし」を意味する ⇒ **中間 bundle を捨てるときに
 ///   [`RtBundle::supersede`] で畳み込まないと変更が永久に失われる**。
 ///   schedule が delta なのは本質的で、schedule は RT だけが持つ走行状態
 ///   (PDC ring / follower env) を内包するため off-thread では snapshot を
@@ -215,21 +218,26 @@ pub struct RtBundle {
     /// project を跨ぐと別物同士が一致してしまう。引き継ぐと前 project の PDC
     /// リングに残った音声や follower の envelope が新 project の頭に混ざる。
     pub reset_song_scoped_state: bool,
-    /// `input_delay_per_track` が `TrackScratch::input_delay_line` の
-    /// prealloc (1s) を超える病的ケース用の off-thread pre-alloc 置換 line
-    /// (index = track index)。install 時に必要なら swap され、旧 line が
-    /// この Vec に残って recycle で off-thread drop される。通常は全 `None`
-    /// (schedule が `None` のときは常に空)。
+    /// schedule が要求する **track ごとの入力遅延線** (index = track index、遅延 0 の track は `None`)。
+    /// `TrackScratch` は遅延線を先に確保しない (`docs/plan_unbounded_tracks.md` §2.2) ので、schedule を
+    /// 載せる便は自分が要る遅延線を必ず全部持つ。install 時に容量が足りない行だけ swap し、旧 line は
+    /// この Vec に残って recycle で off-thread drop される (schedule が `None` のときは常に空)。
     pub input_delay_replacements: Vec<Option<DelayLine>>,
-    /// **成長便**: この project の per-track scratch を `song.tracks.len()` ぶんまで
-    /// 増やす置換 Vec (`None` = 据え置き)。install 時に既存の行を要素ごと swap して
-    /// 移し、押し出された古い Vec をこの field に残して off-thread で drop する。
+    /// **成長便**: この project の per-track scratch の **追加分の行だけ** (`None` = 据え置き、
+    /// [`crate::mixer::ScratchGrowth`])。既存の行の走行状態 (入力遅延リング / stretch engine / 鳴っている
+    /// ノート) を保ったまま、RT で確保せずに伸びる。押し出された Vec は off-thread で drop する。
     ///
-    /// `TrackScratch` は 1 本 ~450 KB (PDC リング 1 秒 ぶんが大半) なので、
-    /// `MAX_TRACKS` を無条件に確保すると **タブ 1 枚につき ~14 MB** を、使うかどうかに
-    /// 関わらず先に取る (`docs/plan_project_tabs.md` §3.1)。曲が要る本数だけ、song と
-    /// **同じ便で** 届ける (別便にすると song だけ先に着いた buffer が無音になる)。
-    pub scratch_growth: Option<Vec<TrackScratch>>,
+    /// 曲が要る本数だけ、song と **同じ便で** 届ける (別便にすると song だけ先に着いた buffer が
+    /// 無音になる)。
+    pub scratch_growth: Option<crate::mixer::ScratchGrowth>,
+    /// **成長便**: ランチャーの行の器 (行数が増えたときだけ)。
+    pub launcher_growth: Option<LauncherGrowth>,
+    /// **差し替え便**: 伸びる telemetry 面 (容量が足りなくなって作り直したときだけ)。install した瞬間に
+    /// `ProjectTelemetry::plane_id` を差し替える (`docs/plan_unbounded_tracks.md` §3)。
+    pub plane: Option<Arc<TelemetryPlane>>,
+    /// **delta**: `Schedule::follower_keys` と plan の対応表。plan か schedule を載せる便は必ず同梱する
+    /// (publish 側が最新の plan と schedule から作る)。
+    pub follower_maps: Option<FollowerMaps>,
     /// device_id → entry (Arc clone — recv loop のミラーと同一 entry)。
     pub plugin_refs: Arc<PluginRefs>,
     /// MIDI Capture の試聴シーケンス (Arc clone)。`None` = 停止。snapshot field。
@@ -252,7 +260,7 @@ pub struct RtBundle {
     /// `ModRuntime::install` は `Vec::resize` するので RT では走らせない。
     /// 走行状態 (位相) は install で捨たれるが、次の buffer で `locate` が
     /// 位相表から張り直すので聴感上の段差にはならない。
-    pub mod_plan: Option<(Arc<common::mod_graph::ModPlan>, common::mod_graph::ModRuntime)>,
+    pub mod_plan: Option<ModPlanDelivery>,
     /// **delta**: 積分 tier の位相表 (off-thread build)。`None` = 据え置き。
     /// plan とは別便で届く — 表の構築は曲長ぶんの刻みループなので、plan の
     /// 配送を待たせない (構築中は旧表 + 閉形式シードで凌ぐ)。
@@ -289,14 +297,23 @@ impl RtBundle {
                 &mut older.input_delay_replacements,
             );
         }
-        // scratch は **大きいほうが勝つ** (小さい便で縮めない)。採らなかった側は
-        // `older` に載せて返す = off-thread drop。
-        let (mine, theirs) = (
-            self.scratch_growth.as_ref().map_or(0, Vec::len),
-            older.scratch_growth.as_ref().map_or(0, Vec::len),
-        );
-        if theirs > mine {
-            std::mem::swap(&mut self.scratch_growth, &mut older.scratch_growth);
+        // scratch の成長便は **追加分の連結** (`ScratchGrowth::absorb_older`)。空になった古い便は `older` に残す。
+        match (self.scratch_growth.as_mut(), older.scratch_growth.as_mut()) {
+            (Some(mine), Some(theirs)) => mine.absorb_older(theirs),
+            (None, Some(_)) => std::mem::swap(&mut self.scratch_growth, &mut older.scratch_growth),
+            _ => {}
+        }
+        // ランチャーの器 / telemetry 面は publish 側が単調に大きくするので、新しい便が持っていれば
+        // それが勝つ。持っていなければ古い便のものを引き継ぐ。
+        if self.launcher_growth.is_none() {
+            self.launcher_growth = older.launcher_growth.take();
+        }
+        if self.plane.is_none() {
+            self.plane = older.plane.take();
+        }
+        // follower の対応表は plan / schedule と同じ便で作られる。新しい便が持っていれば最新の組。
+        if self.follower_maps.is_none() {
+            self.follower_maps = older.follower_maps.take();
         }
         // r.md #89: plan / 位相表も delta (`None` = 据え置き)。新しい便が
         // 持っていなければ古い便のものを引き継ぐ — 落とすと「plan を差し替えた
@@ -322,7 +339,9 @@ pub struct ProjectRt {
     pub shared: Arc<ProjectShared>,
     /// `AudioBridge` の slot index (claim 時に確定)。
     pub telemetry_slot: usize,
-    /// Pre-allocated scratch buffers (MAX_TRACKS entries). The audio
+    /// 今書いている伸びる telemetry 面 (bundle 由来。まだ届いていなければ `None` = publish しない)。
+    pub plane: Option<Arc<TelemetryPlane>>,
+    /// per-track scratch (曲の本数ぶん、`RtBundle::scratch_growth` で伸びる)。The audio
     /// loop indexes into this with the current Song's track index — no
     /// resize, no allocation in the RT path.
     pub scratch: Vec<TrackScratch>,
@@ -399,13 +418,9 @@ pub struct ProjectRt {
     /// 渡して volume / pan / plugin param の `mod_routings` を変調する。
     /// buffer をまたいで再利用する (warm 後は確保が起きない)。
     pub mod_tick: crate::mod_tick::ModTickRunner,
-    /// r.md #89: `Schedule` の follower slot → 係数表の列。plan / schedule の
-    /// どちらかが変わったら作り直す (`ModTickRunner::build_follower_cols`)。
-    pub follower_cols: Vec<u16>,
-    /// r.md #89: plan slot → `Schedule::follower_slots` の index
-    /// (`ModTickRunner::build_follower_env_map`)。刻みごとの線形探索を避けるため
-    /// plan / schedule の差し替え時に 1 度だけ作る。
-    pub follower_env_of_slot: Vec<u16>,
+    /// r.md #89: `Schedule` と plan の対応表 (bundle 由来、`FollowerMaps`)。plan / schedule の
+    /// どちらかが変わった便に同梱されて届く (刻みごとの線形探索を避けるための表)。
+    pub follower_maps: FollowerMaps,
     /// r.md #129: master のフェーダー後 Limiter の状態 (先読みリングは `new` で 1 回だけ確保)。
     /// live 用の 1 個 — 書き出しは `export` が毎回新品を作る。同じタブで別ファイルを開いたら
     /// `refresh_bundle` が reset する (§18-M)。
@@ -416,7 +431,7 @@ pub struct ProjectRt {
     pub last_heartbeat_playhead: u64,
     /// Debug-only: pre-allocated scratch for the heartbeat log so the RT
     /// path doesn't allocate when the throttle window opens. Cleared and
-    /// re-extended on each emit; capacity is sized at construction.
+    /// re-extended on each emit **within its fixed capacity** (診断ログなので先頭の数本だけ出す)。
     #[cfg(debug_assertions)]
     pub heartbeat_track_peaks: Vec<(f32, f32, bool)>,
     #[cfg(debug_assertions)]
@@ -453,14 +468,15 @@ impl ProjectRt {
         stretch_pool_rx: rtrb::Consumer<StretchPoolDelivery>,
         stretch_pool_recycle_tx: rtrb::Producer<StretchPoolDelivery>,
     ) -> Self {
-        // **空から始める** — 実際に要る本数は song と同じ便 (`RtBundle::scratch_growth`)
-        // で届く。容量だけ予約しておき、成長便の install が再確保しないようにする。
-        let scratch = Vec::with_capacity(MAX_TRACKS);
+        // **空から始める** — 実際に要る本数は song と同じ便 (`RtBundle::scratch_growth`) で、
+        // 伸ばした後の総本数ぶんの容量を持った Vec ごと届く。
+        let scratch = Vec::new();
         // off-thread で作るので共有面のミラーを読んでよい (RT に来てからは load しない)。
         let audio_clip_renderer = shared.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: RT へ渡す前に組む)
         Self {
             key: shared.key,
             telemetry_slot: shared.telemetry_slot,
+            plane: None,
             shared,
             stretch_pool_rx,
             stretch_pool_recycle_tx,
@@ -486,17 +502,14 @@ impl ProjectRt {
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             launcher: crate::launcher::LauncherRuntime::new(),
             mod_tick: crate::mod_tick::ModTickRunner::new(),
-            follower_cols: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
-            follower_env_of_slot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
+            follower_maps: FollowerMaps::default(),
             master_limiter: MasterLimiterState::new(),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
-            heartbeat_track_peaks: Vec::with_capacity(MAX_TRACKS),
-            // 上限は実態に合わせた hint。超えても Vec が伸びるだけだが、
-            // steady-state で MAX_TRACKS * 4 device を超えるケースは稀。
+            heartbeat_track_peaks: Vec::with_capacity(HEARTBEAT_LOG_ITEMS),
             #[cfg(debug_assertions)]
-            heartbeat_device_ids: Vec::with_capacity(MAX_TRACKS * 4),
+            heartbeat_device_ids: Vec::with_capacity(HEARTBEAT_LOG_ITEMS),
         }
     }
 
@@ -537,35 +550,24 @@ impl ProjectRt {
         self.loop_region = new.loop_region;
         self.device_scope_watch = new.device_scope_watch;
 
-        // r.md #89: plan / 位相表の差し替え。旧 RT 状態と旧表は recycle bundle に
-        // 載せて off-thread で drop する (`ModRuntime` は `Vec` を 6 本持つ)。
-        let mut retired_plan: Option<(
-            Arc<common::mod_graph::ModPlan>,
-            common::mod_graph::ModRuntime,
-        )> = None;
-        let mut plan_or_schedule_changed = false;
-        if let Some((plan, rt)) = new.mod_plan.take() {
-            retired_plan = Some(self.mod_tick.install(plan, rt));
-            plan_or_schedule_changed = true;
-        }
+        // r.md #89: plan / 位相表の差し替え。旧 RT 状態・旧器と旧表は recycle bundle に
+        // 載せて off-thread で drop する (`ModRuntime` / `ModTickBuffers` は `Vec` を抱える)。
+        let retired_plan = new.mod_plan.take().map(|d| self.mod_tick.install(d));
         let retired_table = new
             .mod_phase_table
             .take()
             .and_then(|t| self.mod_tick.set_table(Some(t)));
+        // follower の対応表は plan / schedule を載せた便に同梱されている。旧表は recycle へ。
+        let retired_maps = new.follower_maps.take().map(|m| std::mem::replace(&mut self.follower_maps, m));
 
-        // per-track scratch の成長便。**song と同じ便で届く**ので、この install の
-        // 直後に走る render は必ず足りた状態で始まる。走行状態 (入力遅延のリング / stretch
-        // engine / 鳴っているノート) を保つため、既存の行は要素ごと swap で移す
-        // (move だけ = RT で確保も解放もしない)。押し出した古い Vec は bundle に
-        // 載せ替えて recycle ring へ (drop は off-thread)。
-        if let Some(mut fresh) = new.scratch_growth.take() {
-            if fresh.len() > self.scratch.len() {
-                for (dst, src) in fresh.iter_mut().zip(self.scratch.iter_mut()) {
-                    std::mem::swap(dst, src);
-                }
-                fresh = std::mem::replace(&mut self.scratch, fresh);
-            }
-            new.scratch_growth = Some(fresh);
+        // per-track scratch の成長便。**song と同じ便で届く**ので、この install の直後に走る render は
+        // 必ず足りた状態で始まる。既存の行の走行状態を保ち、RT で確保も解放もしない
+        // (`ScratchGrowth::install_into`)。押し出した Vec は recycle へ (drop は off-thread)。
+        let retired_scratch = new.scratch_growth.take().map(|g| g.install_into(&mut self.scratch));
+        // ランチャーの行の器 / 伸びる telemetry 面。旧器・旧面は recycle へ。
+        new.launcher_growth = new.launcher_growth.take().map(|g| self.launcher.install_growth(g));
+        if let Some(plane) = new.plane.take() {
+            new.plane = self.plane.replace(plane);
         }
 
         let mut old_schedule: Option<Schedule> = None;
@@ -579,7 +581,7 @@ impl ProjectRt {
                 // 移送を **やらない** ことがそのままリセットになる。
                 //
                 // schedule 外で生き続ける per-track の input delay line は
-                // 明示的にゼロ化する。全 track を舐めると 32 × 384 KB の memset に
+                // 明示的にゼロ化する。遅延線を持つ全 track を舐めると無駄な memset に
                 // なるので、実際に補償が効く (= 遅延サンプルを読み出す) track
                 // だけに絞る。alloc / free は無い。
                 for (i, &d) in sched.input_delay_per_track.iter().enumerate() {
@@ -610,9 +612,9 @@ impl ProjectRt {
             }
             old_schedule = Some(std::mem::replace(&mut self.cached_schedule, sched));
 
-            // per-track input delay line: prealloc (1s) を超える補償が要る
-            // track には off-thread pre-alloc された置換 line が載っている。
-            // swap して旧 line を bundle 側に残す (off-thread drop)。
+            // per-track input delay line: 遅延が要る track には off-thread で確保した line が
+            // 載っている。容量が足りない行だけ swap して旧 line を bundle 側に残す (off-thread drop)。
+            // 足りている行は走行中のリングをそのまま使う。
             for (i, repl) in new.input_delay_replacements.iter_mut().enumerate() {
                 if i >= self.scratch.len() {
                     break;
@@ -624,17 +626,6 @@ impl ProjectRt {
                 }
             }
             retired_lines = std::mem::take(&mut new.input_delay_replacements);
-            plan_or_schedule_changed = true;
-        }
-        // r.md #89: 「schedule の follower slot」と「plan の slot」の写像は
-        // どちらが変わっても張り直す (刻みごとの線形探索を避けるための表)。
-        if plan_or_schedule_changed {
-            self.mod_tick
-                .build_follower_cols(&self.cached_schedule.follower_keys, &mut self.follower_cols);
-            self.mod_tick.build_follower_env_map(
-                &self.cached_schedule.follower_keys,
-                &mut self.follower_env_of_slot,
-            );
         }
 
         // Recycle the superseded snapshot off the audio thread. The very first
@@ -650,7 +641,10 @@ impl ProjectRt {
             schedule: old_schedule,
             reset_song_scoped_state: false,
             input_delay_replacements: retired_lines,
-            scratch_growth: new.scratch_growth.take(),
+            scratch_growth: retired_scratch.map(|rows| crate::mixer::ScratchGrowth { base: 0, rows }),
+            launcher_growth: new.launcher_growth.take(),
+            plane: new.plane.take(),
+            follower_maps: retired_maps,
             plugin_refs: old_refs,
             preview_sequence: old_preview_sequence,
             loop_region: new.loop_region,
@@ -676,8 +670,9 @@ impl ProjectRt {
     }
 
     /// 表示用のメーター面 (track peak / 鳴っているボイス / 内蔵 device の GR / master Limiter の GR) を
-    /// `AudioBridge` へ publish する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store
-    /// のみ (RT 安全)。
+    /// publish する。 同じ走査で出す = 同じ buffer の値だと保証される。 Atomic store のみ (RT 安全)。
+    ///
+    /// トラックは **track id を添えて** 曲の順に並べる (読み手は id で引く、不変条件 1)。
     ///
     /// ボイス (r.md #117、 変調ラックの per-voice カーソル用) は chain の **最初の** plugin の
     /// ボイス表 = この track の MIDI 入力 (Selector で別 chain に居ても同じ MIDI を受ける)。
@@ -686,7 +681,11 @@ impl ProjectRt {
     /// GR (r.md #129 §11.1) は **この buffer で処理した program** (`track_programs[..n_tracks]` と master)
     /// の `meter` 付き内蔵 device だけから出す = 処理していない program の GR が前の値のまま残らない。
     /// slot の並びは compile 順で、読み手は device id で引く (不変条件 1)。
-    fn publish_meters(&self, slot: &ProjectTelemetry, n_tracks: usize) {
+    fn publish_meters(&self, slot: &ProjectTelemetry, song: &Song, n_tracks: usize) {
+        slot.set_master_limiter_gr_db(self.master_limiter.gain_reduction_db());
+        let Some(plane) = self.plane.as_deref() else {
+            return;
+        };
         let programs = &self.cached_schedule;
         let gr = programs
             .track_programs
@@ -696,12 +695,9 @@ impl ProjectRt {
             .flat_map(|p| p.natives.iter())
             .filter(|ns| ns.meter)
             .map(|ns| (ns.device_id, ns.gr_db));
-        slot.publish_native_meters(gr);
-        slot.set_master_limiter_gr_db(self.master_limiter.gain_reduction_db());
-        for (i, tr) in self.scratch.iter().take(n_tracks).enumerate() {
-            slot.set_track_peak(i, tr.peak_l, tr.peak_r);
-            let voices = self
-                .cached_schedule
+        plane.publish_native_meters(gr);
+        let tracks = song.tracks.iter().zip(&self.scratch).take(n_tracks).enumerate().map(|(i, (t, tr))| {
+            let voices = programs
                 .track_programs
                 .get(i)
                 .and_then(|p| p.voices.first())
@@ -712,7 +708,17 @@ impl ProjectRt {
                     on_secs: v.on_secs,
                     off_secs: v.off_secs,
                 });
-            slot.publish_track_voices(i, voices);
+            (t.id, tr.peak_l, tr.peak_r, voices)
+        });
+        plane.publish_tracks(tracks);
+    }
+
+    /// メーター面を空にする (park の直前 = 再生も録音もしていないので publish を止める)。無いと GUI は
+    /// 最後の値を読み続け、止まったメーターが点いたまま凍る。
+    pub fn clear_meters(&self, slot: &ProjectTelemetry) {
+        slot.set_master_limiter_gr_db(0.0);
+        if let Some(plane) = self.plane.as_deref() {
+            plane.clear_meters();
         }
     }
 
@@ -720,7 +726,7 @@ impl ProjectRt {
     ///
     /// envelope follower の値は `ModRuntime::set_follower` 経由でしか `tick` に
     /// 渡らない (plan の slot 順と `Song::mod_sources` の位置順の取り違えを型で
-    /// 防ぐ設計) ので、`follower_env_of_slot` の写像で引いて渡す。
+    /// 防ぐ設計) ので、`follower_maps.env_of_slot` の写像で引いて渡す。
     ///
     /// 戻り値は buffer 頭の transport (`beat` / `bpm`)。
     fn run_mod_ticks(
@@ -737,7 +743,7 @@ impl ProjectRt {
                 .locate(song, playhead, self.playhead_beats, sample_rate);
         }
         let sched = &self.cached_schedule;
-        let env_of = &self.follower_env_of_slot;
+        let env_of = &self.follower_maps.env_of_slot;
         let follower_env = |plan_slot: u16, tick: i64| {
             match env_of.get(usize::from(plan_slot)).copied() {
                 Some(i) if i != u16::MAX => sched
@@ -775,13 +781,14 @@ impl ProjectRt {
             // ある。pop してから捨てると publish 側の「配送済み」だけが進み、その
             // track のストレッチが二度と揃わない (`delivered_engines_per_track`)。
             match self.stretch_pool_rx.peek() {
-                Ok(d) if d.track_idx < self.scratch.len() => {}
+                Ok(d) if d.max_track_idx().is_none_or(|i| i < self.scratch.len()) => {}
                 _ => break,
             }
             let Ok(mut delivery) = self.stretch_pool_rx.pop() else { break };
-            if let Some(scratch) = self.scratch.get_mut(delivery.track_idx) {
+            for (track_idx, engines) in &mut delivery.per_track {
+                let Some(scratch) = self.scratch.get_mut(*track_idx) else { continue };
                 while scratch.stretch_engines.len() < scratch.stretch_engines.capacity() {
-                    let Some(engine) = delivery.engines.pop() else {
+                    let Some(engine) = engines.pop() else {
                         break;
                     };
                     scratch.stretch_engines.push(engine);
@@ -1063,7 +1070,8 @@ impl ProjectRt {
         };
 
         if let Some(song) = song_ref {
-            let n_tracks = song.tracks.len().min(MAX_TRACKS);
+            // scratch は song と同じ便で本数ぶん届く (`RtBundle::scratch_growth`)。`min` は防御。
+            let n_tracks = song.tracks.len().min(self.scratch.len());
 
             // PR6: audio clip renderer snapshot for this buffer (bundle 由来)。`self` が
             // 持ち続けるので、worker が dispatch の間ポインタで読んでも生きている。
@@ -1124,7 +1132,7 @@ impl ProjectRt {
                 current_bpm,
                 self.playhead_beats,
                 self.mod_tick.plane(),
-                self.mod_tick.follower_drive(&self.follower_cols, playhead),
+                self.mod_tick.follower_drive(&self.follower_maps.cols, playhead),
                 self.launcher.rows(),
                 master_gain,
                 &mut self.master_limiter,
@@ -1199,13 +1207,15 @@ impl ProjectRt {
             // Publish per-track peak meters / native GR / limiter GR into the shared
             // AudioBridge so the GUI mixer strips animate. Atomic stores, RT-safe.
             // Tracks with effective_mute already have peak_l/r == 0.
-            self.publish_meters(slot, n_tracks);
+            self.publish_meters(slot, song, n_tracks);
 
             // docs/plan_modulation.md §4.2 / r.md #89: 変調値面を GUI へ publish する。
             // 刻みが解いた buffer 頭の値をそのまま出す (GUI は 30Hz なので
             // 刻みの粒度は要らない)。値と id を組で書く seqlock なので、
             // GUI が「新しい id と古い値」を掴むことはない。Atomic store のみ。
-            slot.publish_mod_plane(self.mod_tick.publish_plane());
+            if let Some(plane) = self.plane.as_deref() {
+                plane.publish_mod_plane(self.mod_tick.publish_plane());
+            }
 
             // Debug-only heartbeat. RT 規約上 audio thread での tracing は
             // 望ましくないが、開発時に engine 状態を可視化できる利点が
@@ -1223,16 +1233,17 @@ impl ProjectRt {
                         .iter()
                         .chain(self.bus_r[..n].iter())
                         .fold(0.0_f32, |a, &b| a.max(b.abs()));
+                    // 容量 (`HEARTBEAT_LOG_ITEMS`) ぶんだけ積む — 本数に比例して RT で伸ばさない。
                     self.heartbeat_track_peaks.clear();
                     self.heartbeat_track_peaks.extend(
                         self.scratch
                             .iter()
-                            .take(n_tracks)
+                            .take(n_tracks.min(HEARTBEAT_LOG_ITEMS))
                             .map(|s| (s.peak_l, s.peak_r, s.effective_mute)),
                     );
                     self.heartbeat_device_ids.clear();
                     self.heartbeat_device_ids
-                        .extend(self.plugin_refs.keys().copied());
+                        .extend(self.plugin_refs.keys().copied().take(HEARTBEAT_LOG_ITEMS));
                     // r.md #16: 再生中 1 行/秒でログを埋める。 debug へ降格し
                     // (RUST_LOG=debug で復活)、 既定 (info) の dev ログには出さない。
                     tracing::debug!(
@@ -1336,8 +1347,18 @@ impl ProjectRt {
         // ループ端の 1 buffer は必ず「playhead はループ先頭 / launch_beat は
         // 巻き戻し前の絶対拍」の組になっていた (30Hz の poll で数周に 1 回、
         // そのまま画面に出る)。
-        if song_snapshot.is_some() {
-            self.launcher.publish(slot, self.playhead_beats);
+        if song_snapshot.is_some()
+            && let Some(plane) = self.plane.as_deref()
+        {
+            self.launcher.publish(plane, self.playhead_beats);
+        }
+
+        // 伸びる telemetry 面を差し替えたら、**その面へ一式 publish し終えたここで** GUI へ id を知らせる。
+        // install した瞬間に出すと、GUI はまだ 0 の面を「空の曲」として読み、変調値が 0 に跳ねランチャーの
+        // 行が 1 フレーム消える。publish しない buffer (count-in / 書き出し中) の間は旧面の最後の値が見える。
+        let plane_id = self.plane.as_deref().map_or(0, TelemetryPlane::id);
+        if slot.plane_id() != plane_id {
+            slot.set_plane_id(plane_id);
         }
     }
 }
@@ -1751,19 +1772,19 @@ mod bundle_install_tests {
 
     /// `reset_song_scoped_state` を明示する版 (project 切替相当)。
     fn make_bundle_with_reset(song: &Arc<Song>, reset: bool) -> RtBundle {
+        let schedule = compile_schedule(song, &test_latencies(), 48_000, 0, common::protocol::RenderScope::Mix).unwrap();
         RtBundle {
             song: Some(Arc::clone(song)),
             tempo_map: common::tempo_map::TempoMap::from_song(song),
-            schedule: Some(
-                compile_schedule(song, &test_latencies(), 48_000, 0, common::protocol::RenderScope::Mix).unwrap(),
-            ),
+            input_delay_replacements: crate::project_ctl::build_input_delay_replacements(&schedule),
+            schedule: Some(schedule),
             reset_song_scoped_state: reset,
-            input_delay_replacements: Vec::new(),
             // 本番 (`project_ctl::publish_bundle`) と同じで、song と同じ便で
-            // その曲が要る本数の scratch を運ぶ。
-            scratch_growth: Some(
-                (0..song.tracks.len().min(MAX_TRACKS)).map(|_| TrackScratch::new()).collect(),
-            ),
+            // その曲が要る本数の scratch を運ぶ (テストは毎回全本数 = base 0、重なる行は RT が捨てる)。
+            scratch_growth: Some(crate::mixer::ScratchGrowth::new(0, song.tracks.len())),
+            launcher_growth: Some(crate::launcher::LauncherGrowth::for_song(song)),
+            plane: None,
+            follower_maps: None,
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
@@ -1784,6 +1805,9 @@ mod bundle_install_tests {
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
             scratch_growth: None,
+            launcher_growth: None,
+            plane: None,
+            follower_maps: None,
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
@@ -2035,6 +2059,29 @@ mod bundle_install_tests {
         assert_eq!(l[2], 2.0);
     }
 
+    /// per-track の入力遅延線は先回りで確保しない (`docs/plan_unbounded_tracks.md` §2.2)。sidechain の
+    /// 補償が要る track の線だけが schedule と同じ便で届き、補償量ぶん遅らせられる容量で据わる。
+    #[test]
+    fn sidechain_input_delay_line_arrives_with_the_schedule() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        let mut s = Song::default();
+        s.tracks.push(latent_track(1));
+        let mut dest = track(2);
+        dest.devices = vec![common::model::Device::Native(common::model::NativeDevice {
+            aux_input: Some(common::model::AuxInputRoute::post_fader(1)),
+            ..common::model::NativeDevice::new_added(common::model::NativeKind::Comp, 20, 1)
+        })];
+        s.tracks.push(dest);
+        s.tracks.push(track(3));
+        let s = Arc::new(s);
+        bundle_tx.push(make_bundle(&s)).unwrap();
+        local.refresh_bundle();
+
+        assert_eq!(local.cached_schedule.input_delay_per_track, vec![0, LATENT_SAMPLES, 0]);
+        let caps: Vec<usize> = local.scratch.iter().map(|t| t.input_delay_line.capacity()).collect();
+        assert_eq!(caps, vec![0, LATENT_SAMPLES as usize + 1, 0]);
+    }
+
     /// 別プロジェクトの読み込み (`reset_song_scoped_state`) では走行状態を
     /// **引き継がない**。移送キー (`DelayKey::MixSrc{track_id}` /
     /// `ModSource::id`) は Song スコープの名前なので、project を跨ぐと別物
@@ -2059,15 +2106,6 @@ mod bundle_install_tests {
             let mut r = [4.0f32, 5.0, 6.0];
             line.step_in_place(&mut l, &mut r, 4);
         }
-        // per-track input delay line にも痕跡を残す (schedule の外で生き続ける)。
-        {
-            let mut l = [7.0f32, 8.0, 9.0];
-            let mut r = [7.0f32, 8.0, 9.0];
-            local.scratch[1]
-                .input_delay_line
-                .step_in_place(&mut l, &mut r, 4);
-        }
-
         // 別 project の LoadSong 相当。
         bundle_tx.push(make_bundle_with_reset(&s1, true)).unwrap();
         local.refresh_bundle();
@@ -2172,18 +2210,33 @@ mod bundle_install_tests {
         Arc::new(s)
     }
 
-    fn telemetry(tag: &str) -> (AudioBridgeHandle, usize) {
+    /// telemetry の固定面と、`song` の GR を持つ内蔵 device を全部載せられる伸びる面 (本番の publish と同じ容量の決め方)。
+    fn telemetry(tag: &str, song: &Song, sched: &Schedule) -> (AudioBridgeHandle, usize, Arc<TelemetryPlane>) {
         let bridge = AudioBridgeHandle::create(&format!("daw01_test_native_gr_{tag}_{}", std::process::id())).unwrap();
         let slot = bridge.claim_project_slot(ProjectKey(1)).unwrap();
-        (bridge, slot)
+        let need = common::audio_bridge::PlaneCapacity {
+            tracks: song.tracks.len() as u32,
+            native_meters: sched.native_meter_count() as u32,
+            mod_sources: 0,
+            launcher_rows: 0,
+        };
+        let plane = TelemetryPlane::create(
+            bridge.os_id(),
+            common::audio_bridge::plane_id(std::process::id(), 1),
+            common::audio_bridge::PlaneCapacity::default().grown_for(&need),
+        )
+        .unwrap();
+        (bridge, slot, Arc::new(plane))
     }
 
     /// r.md #129 §11.1: GR 面は「この buffer で処理した program」の `meter` 付き device だけから出る
-    /// (EQ 系は出ない / 処理していない track の GR は残らない)。枠は組み込みを優先して割り当てる。
+    /// (EQ 系は出ない / 処理していない track の GR は残らない)。**数に枠は無い** — 追加の Comp が何百あっても
+    /// 全部 id 付きで届く (`docs/plan_unbounded_tracks.md` §2.6)。
     #[test]
     fn native_gr_is_published_by_id_from_processed_programs_only() {
         let (mut local, mut bundle_tx, _recycle_rx) = harness();
-        bundle_tx.push(make_bundle(&native_song(1))).unwrap();
+        let song = native_song(1);
+        bundle_tx.push(make_bundle(&song)).unwrap();
         local.refresh_bundle();
         let sched = &mut local.cached_schedule;
         for p in sched.track_programs.iter_mut().chain(std::iter::once(&mut sched.master_program)) {
@@ -2191,28 +2244,28 @@ mod bundle_install_tests {
                 ns.gr_db = -(ns.device_id as f32);
             }
         }
-        let (bridge, slot) = telemetry("processed");
+        let (bridge, slot, plane) = telemetry("processed", &song, &local.cached_schedule);
+        local.plane = Some(Arc::clone(&plane));
         let t = bridge.project(slot);
         let mut out = Vec::new();
-        local.publish_meters(t, 2);
-        assert!(t.read_native_meters(&mut out));
+        local.publish_meters(t, &song, 2);
+        assert!(plane.read_native_meters(&mut out));
         out.sort_by_key(|(id, _)| *id);
         assert_eq!(out, vec![(11, -11.0), (21, -21.0), (31, -31.0), (1000, -1000.0)]);
-        local.publish_meters(t, 1);
-        assert!(t.read_native_meters(&mut out));
+        local.publish_meters(t, &song, 1);
+        assert!(plane.read_native_meters(&mut out));
         assert!(!out.iter().any(|(id, _)| *id == 21), "処理していない track 2 の GR は残らない: {out:?}");
 
-        // 枠 (MAX_NATIVE_METERS) を超える追加分があっても、組み込みは必ず出る。
+        // 旧実装の枠 (256) を超える追加分があっても、全部届く。
         let (mut local, mut bundle_tx, _recycle_rx) = harness();
-        let many = common::audio_bridge::MAX_NATIVE_METERS as u64 + 8;
-        bundle_tx.push(make_bundle(&native_song(many))).unwrap();
+        let many = native_song(300);
+        bundle_tx.push(make_bundle(&many)).unwrap();
         local.refresh_bundle();
-        local.publish_meters(t, 2);
-        assert!(t.read_native_meters(&mut out));
-        assert_eq!(out.len(), common::audio_bridge::MAX_NATIVE_METERS);
-        for id in [11, 21, 31] {
-            assert!(out.iter().any(|(i, _)| *i == id), "組み込み {id} が枠から漏れた");
-        }
+        let (bridge, slot, plane) = telemetry("many", &many, &local.cached_schedule);
+        local.plane = Some(Arc::clone(&plane));
+        local.publish_meters(bridge.project(slot), &many, 2);
+        assert!(plane.read_native_meters(&mut out));
+        assert_eq!(out.len(), 300 + 3, "追加 300 + 組み込み (11 / 21 / 31)");
     }
 
     /// r.md #129 §11.2: scope project の buffer は見出し表と違う slot だけ見出しを書き換え、読み手は
@@ -2257,9 +2310,11 @@ mod bundle_install_tests {
     #[test]
     fn native_meter_publish_and_scope_header_sync_do_not_allocate() {
         let (mut local, mut bundle_tx, _recycle_rx) = harness();
-        bundle_tx.push(make_bundle(&native_song(3))).unwrap();
+        let song = native_song(3);
+        bundle_tx.push(make_bundle(&song)).unwrap();
         local.refresh_bundle();
-        let (bridge, slot) = telemetry("rt");
+        let (bridge, slot, plane) = telemetry("rt", &song, &local.cached_schedule);
+        local.plane = Some(plane);
         let t = bridge.project(slot);
         let scope = DeviceScopeBridgeHandle::create(&format!("daw01_test_native_rt_scope_{}", std::process::id())).unwrap();
         let mut headers = [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES];
@@ -2269,7 +2324,7 @@ mod bundle_install_tests {
         b[5] = 12;
         assert_no_alloc::assert_no_alloc(|| {
             for i in 0..8 {
-                local.publish_meters(t, 2);
+                local.publish_meters(t, &song, 2);
                 let watch = if i % 2 == 0 { &a } else { &b };
                 let io = native_io_for_buffer(
                     ProjectKey(1),
@@ -2389,9 +2444,10 @@ mod multi_project_tests {
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
             // 本番 (`project_ctl::publish_bundle`) と同じく song と同じ便で運ぶ。
-            scratch_growth: Some(
-                (0..song.tracks.len().min(MAX_TRACKS)).map(|_| TrackScratch::new()).collect(),
-            ),
+            scratch_growth: Some(crate::mixer::ScratchGrowth::new(0, song.tracks.len())),
+            launcher_growth: Some(crate::launcher::LauncherGrowth::for_song(song)),
+            plane: None,
+            follower_maps: None,
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),

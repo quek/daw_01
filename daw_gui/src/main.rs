@@ -438,6 +438,69 @@ struct PollerHandles {
     active_project: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// 数が曲で決まる面 (トラック / GR / 変調値 / ランチャー行) から読んで流す tick 群と、その使い回しバッファ。
+/// 面は engine が作り直す伸びる面 (`docs/plan_unbounded_tracks.md` §3) なので、アクティブなタブの面の
+/// id が変わったら開き直す。
+#[derive(Default)]
+struct PlaneTicks {
+    plane: Option<common::audio_bridge::TelemetryPlane>,
+    peaks: Vec<(u32, f32, f32)>,
+    voices: Vec<(u32, common::audio_bridge::VoiceSnapshot)>,
+    native: Vec<(u64, f32)>,
+    mods: common::mod_plane::ModPlane,
+    launcher: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>,
+}
+
+impl PlaneTicks {
+    /// `false` = event loop が閉じた。面が開けない tick (engine がまだ作っていない / 開けない) は面の値を
+    /// 送らない (GUI は前回値を保つ) — 面に依らない tick を巻き添えで止めない。
+    fn send(
+        &mut self,
+        bridge: &AudioBridgeHandle,
+        project: common::protocol::ProjectKey,
+        active: &common::audio_bridge::ProjectTelemetry,
+        proxy: &EventLoopProxy<AppEvent>,
+    ) -> bool {
+        let send = |event| proxy.send_event(event).is_ok();
+        let plane_id = active.plane_id();
+        if self.plane.as_ref().map_or(0, common::audio_bridge::TelemetryPlane::id) != plane_id {
+            self.plane = (plane_id != 0)
+                .then(|| common::audio_bridge::TelemetryPlane::open(bridge.os_id(), plane_id).ok())
+                .flatten();
+        }
+        // master の Limiter の GR は面の外 (per-track のメーターと同じ tick で送る)。
+        let master_limiter_gr_db = active.master_limiter_gr_db();
+        let Some(p) = self.plane.as_ref() else {
+            return send(AppEvent::TrackPeaksTick { project, tracks: None, native_gr: None, master_limiter_gr_db });
+        };
+        // docs/plan_modulation.md §4.2 / r.md #89: 変調値面は id 表と値の組なので seqlock で読む。破れた tick は
+        // **送らない** (破れた組を送ると 1 フレームだけ別のソースの値で絵が動く)。
+        if p.read_mod_plane(&mut self.mods) && !send(AppEvent::ModScalarsTick { project, plane: std::mem::take(&mut self.mods) }) {
+            return false;
+        }
+        // トラック面 (post-fader ピークと、変調ラックの per-voice カーソル r.md #117)。破れた tick はピークを
+        // `None` で送り (GUI は前回値を保つ)、ボイスは送らない。
+        let tracks_ok = p.read_tracks(&mut self.peaks, &mut self.voices);
+        if tracks_ok && !send(AppEvent::TrackVoicesTick { project, voices: std::mem::take(&mut self.voices) }) {
+            return false;
+        }
+        // r.md #129: 内蔵 device の GR 面は engine の compile 順なので id 昇順に並べて送る (GUI は表示値と
+        // 1 回のマージで突き合わせる、`NativeGrDisplay::update`)。
+        let native_gr = p.read_native_meters(&mut self.native).then(|| {
+            self.native.sort_unstable_by_key(|e| e.0);
+            self.native.clone()
+        });
+        let tracks = tracks_ok.then(|| std::mem::take(&mut self.peaks));
+        if !send(AppEvent::TrackPeaksTick { project, tracks, native_gr, master_limiter_gr_db }) {
+            return false;
+        }
+        // r.md #87: ランチャーの走行状態。**`Song` には入らない表示専用データ** (計画書 §1.4) で、フォロー
+        // アクションで移った先はここにしか出ない。
+        p.launcher_row_snapshots(&mut self.launcher);
+        send(AppEvent::LauncherRowsTick { project, rows: std::mem::take(&mut self.launcher) })
+    }
+}
+
 fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>) {
     let PollerHandles {
         bridge,
@@ -453,21 +516,9 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
         // Global Sampler (`docs/plan_global_sampler.md` §3.3): 現世代のリングを
         // 読み進めて波形バケツを作る。世代が変わったら reader を作り直す。
         let mut sampler_builder: Option<daw_gui::state::sampler::OverviewBuilder> = None;
-        let mut peaks_buf: Vec<(f32, f32)> =
-            Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
-        // r.md #129: 内蔵 device の GR 面 (id と値の組、seqlock で読む)。
-        let mut native_buf: Vec<(u64, f32)> =
-            Vec::with_capacity(common::audio_bridge::MAX_NATIVE_METERS);
+        let mut plane_ticks = PlaneTicks::default();
+        let mut plugin_plane: Option<common::metrics_bridge::PluginMetricsPlane> = None;
         let mut device_spectra = daw_gui::master_meter::device_spectrum::DeviceSpectrumPoller::default();
-        let mut mod_buf = common::mod_plane::ModPlane::with_capacity(
-            common::audio_bridge::MAX_MOD_SOURCES,
-        );
-        // r.md #87: ランチャーの走行状態 (行数ぶん)。peaks / mod と同じく使い回す。
-        let mut launcher_buf: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)> =
-            Vec::with_capacity(common::audio_bridge::MAX_LAUNCHER_ROWS);
-        let mut voices_buf: Vec<(usize, common::audio_bridge::VoiceSnapshot)> = Vec::with_capacity(
-            common::audio_bridge::MAX_TRACKS * common::audio_bridge::MAX_PUBLISHED_VOICES,
-        );
         // r.md #50: マスター出力サンプルのリング読み手と、そこから全メーターを
         // 導く解析器。ここが唯一の読み手 (単一 reader 前提のカーソル)。
         let mut scope_reader = scope.reader();
@@ -556,58 +607,7 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
                     break;
                 }
             }
-            // docs/plan_modulation.md §4.2: poll the modulation scalars on the
-            // same ~30Hz tick as peaks and stream them to the model so visual
-            // modulation (image / group / video fx) can apply per frame.
-            // r.md #89: 値面は id 表と値の組なので seqlock で読む。書き込み中に
-            // 当たって読めなかった tick は **送らない** (GUI 側の前回値が残る) —
-            // 破れた組を送ると 1 フレームだけ別のソースの値で絵が動く。
-            if active.read_mod_plane(&mut mod_buf)
-                && proxy
-                    .send_event(AppEvent::ModScalarsTick {
-                        project: active_key,
-                        plane: std::mem::take(&mut mod_buf),
-                    })
-                    .is_err()
-            {
-                break;
-            }
-            // r.md #117: 鳴っているボイス (変調ラックの per-voice カーソル)。 peaks と同じ
-            // 観測面で 30Hz。
-            active.track_voices(&mut voices_buf);
-            if proxy
-                .send_event(AppEvent::TrackVoicesTick {
-                    project: active_key,
-                    voices: std::mem::take(&mut voices_buf),
-                })
-                .is_err()
-            {
-                break;
-            }
-            active.track_meters(&mut peaks_buf);
-            // `peaks_buf` を毎 tick clone せず move でイベントに渡す。 次 tick の
-            // `track_peaks` が `out.clear()` + push で再充填するので、 take 後に
-            // 空になっても問題ない。 clone の memcpy を省く効果のみ (take は
-            // capacity ごと move out するので次 tick で確保し直す = per-tick の
-            // alloc 回数自体は不変。 30Hz の background thread なので無害)。
-            // r.md #129: 内蔵 device の GR 面は seqlock が破れた tick は None (GUI は前回値を保つ)。
-            // 面は engine の compile 順なので id 昇順に並べて送る (GUI は表示値と 1 回のマージで突き合わせる、
-            // `NativeGrDisplay::update`)。
-            let native_gr = active.read_native_meters(&mut native_buf).then(|| {
-                native_buf.sort_unstable_by_key(|e| e.0);
-                native_buf.clone()
-            });
-            if proxy
-                .send_event(AppEvent::TrackPeaksTick {
-                    project: active_key,
-                    tracks: std::mem::take(&mut peaks_buf),
-                    native_gr,
-                    // master の Limiter の GR も同じ tick で読む (per-track の
-                    // メーターと同じ buffer の値であることを保つ)。
-                    master_limiter_gr_db: active.master_limiter_gr_db(),
-                })
-                .is_err()
-            {
+            if !plane_ticks.send(&bridge, active_key, active, &proxy) {
                 break;
             }
             // r.md #129 (Q14): EQ Par のスペクトラム。解析はマスターのスペクトラムと同じ設定で回す。
@@ -621,20 +621,6 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
                         visual_digest: t.visual_digest,
                     })
                     .is_err()
-            {
-                break;
-            }
-            // r.md #87: ランチャーの走行状態 (いま鳴っているセル / 予約 / 進捗)。
-            // **`Song` には入らない表示専用データ** (計画書 §1.4) なので、peaks と
-            // 同じ観測面で 30Hz で流す。フォローアクションで移った先はここにしか
-            // 出ないため、これが無いとグリッドと映像だけ前のセルに取り残される。
-            active.launcher_row_snapshots(&mut launcher_buf);
-            if proxy
-                .send_event(AppEvent::LauncherRowsTick {
-                    project: active_key,
-                    rows: std::mem::take(&mut launcher_buf),
-                })
-                .is_err()
             {
                 break;
             }
@@ -663,6 +649,17 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
                 continue;
             }
             let (buffer_frames, sample_rate) = metrics.buffer_info();
+            // per-plugin の直近 `process()` 時間は plugin host が作り直す計測面にある (§4)。id が変わったら開き直す。
+            let plugin_plane_id = metrics.plugin_plane_id();
+            if plugin_plane.as_ref().map_or(0, common::metrics_bridge::PluginMetricsPlane::id) != plugin_plane_id {
+                plugin_plane = (plugin_plane_id != 0)
+                    .then(|| common::metrics_bridge::PluginMetricsPlane::open(metrics.os_id(), plugin_plane_id).ok())
+                    .flatten();
+            }
+            let mut plugin_us = Vec::new();
+            if let Some(pp) = plugin_plane.as_ref() {
+                pp.read(&mut plugin_us);
+            }
             if proxy
                 .send_event(AppEvent::MetricsTick {
                     dsp_load_peak: metrics.take_dsp_load_peak(),
@@ -670,6 +667,7 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
                     xrun_count: metrics.xrun_count(),
                     buffer_frames,
                     sample_rate,
+                    plugin_us,
                 })
                 .is_err()
             {

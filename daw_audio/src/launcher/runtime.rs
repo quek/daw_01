@@ -15,7 +15,7 @@ use common::model::{
 
 use super::follow::{self, FollowOutcome};
 use super::quantize;
-use super::{MAX_ROWS, RowKey, RowPhase, RowSourceTable, RowTimeSource, is_positive};
+use super::{RowKey, RowPhase, RowSourceTable, RowTimeSource, is_positive, row_capacity};
 
 // 列 (シーン) のフォローアクション: 走行状態 `SceneRun` と張り / 張り直し / 発火。
 // 行のそれ (`RowRuntime` / `arm_timers` / `apply_follow`) と対の、独立した寿命。
@@ -25,6 +25,14 @@ use scene_follow::{SceneRun, scene_longest};
 // 行のセル列 / 発火判断用のセル (`RowCells` / `CellRef`)。
 mod cells;
 pub use cells::{CellRef, RowCells};
+
+// 行の器の成長便 (`LauncherGrowth` / `install_growth`)。
+mod growth;
+pub use growth::LauncherGrowth;
+
+// 行の集合 (`for_each_launcher_row` / `row_of`) と、走行状態の行との突き合わせ (`sync_rows`)。
+mod rows;
+use rows::{for_each_launcher_row, row_of};
 
 /// グループ判定 ([`common::model::launch_group`]) の作業領域の大きさ =
 /// フォローアクションが見る列数の上限。これを超える列にあるセルは
@@ -107,8 +115,6 @@ struct RowRuntime {
     held_clip_id: u32,
     /// [`LaunchMode::Repeat`] で押しっぱなし。
     repeating: bool,
-    /// この buffer の song snapshot に実在した。
-    alive: bool,
     /// **直近の `Song` snapshot でこの行に書かれていた主導権。**
     ///
     /// `Song` 側の値が変わったこと ([`LauncherRuntime::sync_saved_rows`]) を
@@ -129,7 +135,6 @@ impl RowRuntime {
             end_at: f64::INFINITY,
             held_clip_id: 0,
             repeating: false,
-            alive: true,
             // 新しく現れた行は「アレンジだった」ところから差分を取る (= `Song` が
             // ランチャー主導なら、その行は現れた瞬間に撃ち直される)。
             seeded: RowPlayback::Arranger,
@@ -268,12 +273,23 @@ impl Default for LauncherRuntime {
 }
 
 impl LauncherRuntime {
+    /// 器は空。実際の器は song と同じ便で届く ([`Self::install_growth`])。
     #[must_use]
     pub fn new() -> Self {
+        Self::with_growth(LauncherGrowth::default())
+    }
+
+    /// `song` の行を全部持てる器で作る (書き出しの走査スレッド = off-RT 用)。
+    #[must_use]
+    pub fn for_song(song: &Song) -> Self {
+        Self::with_growth(LauncherGrowth::for_song(song))
+    }
+
+    fn with_growth(growth: LauncherGrowth) -> Self {
         Self {
-            rows: Vec::with_capacity(MAX_ROWS),
+            rows: growth.rows,
             inbox: Vec::with_capacity(INBOX_CAP),
-            table: RowSourceTable::new(),
+            table: growth.table,
             occupied: vec![false; MAX_SCENES],
             scene: SceneRun::NONE,
             seeded_scene: 0,
@@ -430,7 +446,7 @@ impl LauncherRuntime {
     /// **ランチャー行の映像 / 画像 / 字幕とピアノロールの再生線がまるごと消える**
     /// (ループ巻き戻し直後の buffer で実際に起きていた)。呼び側は transport の
     /// advance / 巻き戻しを済ませてからここへ来る。
-    pub fn publish(&self, bridge: &common::audio_bridge::ProjectTelemetry, beat: f64) {
+    pub fn publish(&self, bridge: &common::audio_bridge::TelemetryPlane, beat: f64) {
         use common::audio_bridge as ab;
         for (slot, row) in self.rows.iter().enumerate() {
             let (state, clip_id, progress, launch_beat) = row_display(row.phase, beat);
@@ -460,18 +476,6 @@ impl LauncherRuntime {
 
     // ---- 内部 ---------------------------------------------------------------
 
-    /// `Song` にある行と走行状態を突き合わせる (増えた行を作り、消えた行を落とす)。
-    fn sync_rows(&mut self, song: &Song) {
-        for row in &mut self.rows {
-            row.alive = false;
-        }
-        // 行の集合の定義は [`for_each_launcher_row`] 1 本 (マスター行を含む /
-        // テンポ・拍子レーンを含まない)。ここで自前に走査を書くと、列の占有判定や
-        // 長さの数え上げと静かに食い違う。
-        for_each_launcher_row(song, |key, _| self.touch(key));
-        self.rows.retain(|r| r.alive);
-    }
-
     /// 鳴っているセルを **`Song` の現在値へ合わせ直す** (毎 buffer)。
     ///
     /// 走行状態が持つのは位相の原点 (`launch_beat`) だけで、セルの長さ /
@@ -488,12 +492,9 @@ impl LauncherRuntime {
     ///
     /// RT 安全: 線形走査のみ (確保・ロック・I/O なし)。
     fn resync_cells(&mut self, song: &Song, now: f64) {
-        for row in &mut self.rows {
+        self.for_each_row(song, |row, cells, saved| {
             let RowPhase::Cell { clip_id, launch_beat, .. } = row.phase else {
-                continue;
-            };
-            let Some((cells, saved)) = row_of(song, row.key) else {
-                continue;
+                return;
             };
             if let Some(cell) = cells.find_by_clip(clip_id) {
                 let want = cell.phase_at(launch_beat, None);
@@ -511,7 +512,7 @@ impl LauncherRuntime {
                 if cell.follow != row.armed_follow {
                     rearm_follow(row, &cell, now);
                 }
-                continue;
+                return;
             }
             if let RowPlayback::Launcher { clip_id: want } = saved
                 && let Some(cell) = cells.find_by_clip(want)
@@ -529,7 +530,7 @@ impl LauncherRuntime {
                     q.target = QueueTarget::Cell(want);
                 }
                 arm_timers(row, &cells);
-                continue;
+                return;
             }
             // 本当に消えた。停止 (`Silent`) へ落とし、その行の予定も全部捨てる。
             row.phase = RowPhase::Silent;
@@ -537,22 +538,7 @@ impl LauncherRuntime {
             row.held_clip_id = 0;
             row.repeating = false;
             arm_timers(row, &cells);
-        }
-    }
-
-    /// 列のフォローアクションの走行状態を捨てる。
-    ///
-    /// **「全行の走行状態をリセットする操作」と同じ寿命**にする — プロジェクト
-    /// 切替 / 再生開始 (reseed) / 全停止 / 全行アレンジ復帰。1 行だけの停止・
-    /// アレンジ復帰では捨てない (他の行はまだその列を鳴らしているので、列の
-    /// 連鎖はまだ生きている)。残したまま全停止すると、止めたはずの全行が
-    /// `scene.at` に到達した瞬間に勝手に鳴り出す。
-    fn touch(&mut self, key: RowKey) {
-        if let Some(row) = self.rows.iter_mut().find(|r| r.key == key) {
-            row.alive = true;
-        } else if self.rows.len() < self.rows.capacity() {
-            self.rows.push(RowRuntime::new(key));
-        }
+        });
     }
 
     /// `Song` の [`RowPlayback`] から撃ち直す。**セルが引けない行は無音**に落とす —
@@ -568,25 +554,15 @@ impl LauncherRuntime {
         // `first` と同じ規則。`now` にすると、小節の途中から再生したとき連鎖だけ
         // 量子化待ちのぶん早く回る)。
         let mut first = f64::INFINITY;
-        for row in &mut self.rows {
-            let fired = match row_of(song, row.key) {
-                Some((cells, saved)) => seed_row(row, &cells, saved, now, global_q, song.time_sig),
-                // ランチャーが握れない行 (テンポ / 拍子レーン) と、消えた行。
-                None => seed_row(
-                    row,
-                    &RowCells::Track(&[]),
-                    RowPlayback::Arranger,
-                    now,
-                    global_q,
-                    song.time_sig,
-                ),
-            };
-            if let Some((at, scene)) = fired
+        let time_sig = song.time_sig;
+        // 走行状態の行は `sync_rows` が `Song` の行に揃えた後なので、全行が `Song` に居る。
+        self.for_each_row(song, |row, cells, saved| {
+            if let Some((at, scene)) = seed_row(row, &cells, saved, now, global_q, time_sig)
                 && scene == scene_id
             {
                 first = first.min(at);
             }
-        }
+        });
         // 列の連鎖の起点は `Song.last_launched_scene_id` (= ユーザーが最後に撃った列)。
         // **行の起点 (`RowPlayback`) と対**で、これを読まないと停止 → 再生や
         // 書き出しでシーンのフォローアクションが一度も動かない (§1.4 / Q9)。
@@ -622,21 +598,17 @@ impl LauncherRuntime {
     ///
     /// RT 安全: 線形走査のみ (確保・ロック・I/O なし)。
     fn sync_saved_rows(&mut self, song: &Song, now: f64, global_q: LaunchQuantize) {
-        for idx in 0..self.rows.len() {
-            let key = self.rows[idx].key;
-            let Some((cells, saved)) = row_of(song, key) else {
-                self.rows[idx].seeded = RowPlayback::Arranger;
-                continue;
-            };
-            if self.rows[idx].seeded == saved {
-                continue;
+        let time_sig = song.time_sig;
+        self.for_each_row(song, |row, cells, saved| {
+            if row.seeded == saved {
+                return;
             }
-            self.rows[idx].seeded = saved;
-            if self.rows[idx].queued.is_some() || realizes(self.rows[idx].phase, saved) {
-                continue;
+            row.seeded = saved;
+            if row.queued.is_some() || realizes(row.phase, saved) {
+                return;
             }
-            seed_row(&mut self.rows[idx], &cells, saved, now, global_q, song.time_sig);
-        }
+            seed_row(row, &cells, saved, now, global_q, time_sig);
+        });
         // 列の連鎖の起点も同じ規則で追う (行と対の SSoT)。既にその列を走らせて
         // いるなら「反響」なので張り直さない。
         if song.last_launched_scene_id == self.seeded_scene {
@@ -807,34 +779,25 @@ impl LauncherRuntime {
         let user_press = fire.chain_beat().is_none();
         let mut longest = 0.0_f64;
         let mut first = f64::INFINITY;
-        for i in 0..self.rows.len() {
-            let key = self.rows[i].key;
-            let Some((cells, _)) = row_of(song, key) else { continue };
-            match cells.find_by_scene(scene_id) {
+        let time_sig = song.time_sig;
+        self.for_each_row(song, |row, cells, _| {
+            // **列の ▶ もセルの ▶ と同じく「押している」。** 掴んだセルを記録しないと、離しの解釈
+            // (`Gate` は停止 / `Repeat` は撃ち直しを止める) が `release_cell` の held 照合で弾かれ、
+            // 同じセルが撃ち方によって挙動を変える。
+            let (target, at, legato, held) = match cells.find_by_scene(scene_id) {
                 Some(cell) => {
-                    let at = fire.beat(cell.quantize, song.time_sig);
                     longest = longest.max(cell.length_beats);
-                    first = first.min(at);
-                    self.queue(key, QueueTarget::Cell(cell.clip_id), at, cell.legato, false);
-                    // **列の ▶ もセルの ▶ と同じく「押している」。** 掴んだセルを
-                    // 記録しないと、離しの解釈 (`Gate` は停止 / `Repeat` は撃ち直しを
-                    // 止める) が `release_cell` の held 照合で弾かれ、同じセルが
-                    // 撃ち方によって挙動を変える。
-                    if user_press {
-                        self.rows[i].held_clip_id = cell.clip_id;
-                        self.rows[i].repeating = cell.mode == LaunchMode::Repeat;
-                    }
+                    let held = (cell.clip_id, cell.mode == LaunchMode::Repeat);
+                    (QueueTarget::Cell(cell.clip_id), fire.beat(cell.quantize, time_sig), cell.legato, held)
                 }
-                None => {
-                    first = first.min(stop_at);
-                    self.queue(key, QueueTarget::Stop, stop_at, false, false);
-                    if user_press {
-                        self.rows[i].held_clip_id = 0;
-                        self.rows[i].repeating = false;
-                    }
-                }
+                None => (QueueTarget::Stop, stop_at, false, (0, false)),
+            };
+            first = first.min(at);
+            row.queued = Some(Queued { target, at_beat: at, legato, from_repeat: false, start_phase: 0.0 });
+            if user_press {
+                (row.held_clip_id, row.repeating) = held;
             }
-        }
+        });
         // 連鎖は **予定された拍そのもの**を起点にする (各行の量子化で丸めた最小値だと
         // 粒度と buffer 位置に依存してずれが積もる)。ユーザー操作では「最初に
         // 鳴り出す拍」= 列が始まった拍。
@@ -959,13 +922,20 @@ impl LauncherRuntime {
     /// 席だけは要る。`solve` は登録されていない行を `Arranger` に倒すので、
     /// 席は自然に埋まる。
     fn build_table(&mut self, song: &Song, span: BufferSpan, global_q: LaunchQuantize) {
+        fn lane_cells(lane: &AutomationLane) -> Option<RowCells<'_>> {
+            lane.target.accepts_launcher_cells().then_some(RowCells::Lane(&lane.session_clips))
+        }
         self.table.clear();
+        // 走行状態の行は `Song` の行と同じ並び (`sync_rows`) なので、先頭から進むカーソルで引く。
+        let mut cursor = 0;
         for track in &song.tracks {
             self.table.begin_track();
-            let src = self.solve(song, span, global_q, RowKey::track(track.id));
+            let cells = Some(RowCells::Track(&track.session_clips));
+            let src = self.solve(song, span, global_q, RowKey::track(track.id), cells, &mut cursor);
             self.table.push(src);
             for lane in &track.automation_lanes {
-                let src = self.solve(song, span, global_q, RowKey::lane(track.id, lane.id));
+                let key = RowKey::lane(track.id, lane.id);
+                let src = self.solve(song, span, global_q, key, lane_cells(lane), &mut cursor);
                 self.table.push(src);
             }
         }
@@ -974,7 +944,7 @@ impl LauncherRuntime {
         self.table.begin_master();
         for lane in &song.song_lanes {
             let key = RowKey::lane(common::model::MASTER_TRACK_ID, lane.id);
-            let src = self.solve(song, span, global_q, key);
+            let src = self.solve(song, span, global_q, key, lane_cells(lane), &mut cursor);
             self.table.push(src);
         }
         // `row_at` が「次のトラックの先頭」で範囲外を判定できるよう番兵を置く。
@@ -986,17 +956,20 @@ impl LauncherRuntime {
     /// 走行状態と `Song` の突き合わせ (消えたセル / 差し替わったセル / 長さの変更) は
     /// [`Self::resync_cells`] が buffer の頭で済ませているので、ここは出来事の
     /// 適用だけを見る。
+    /// `cells` = その行のセル列 (ランチャーが握れない行は `None`)、`cursor` = [`Self::take_row`] のカーソル。
     fn solve(
         &mut self,
         song: &Song,
         span: BufferSpan,
         global_q: LaunchQuantize,
         key: RowKey,
+        cells: Option<RowCells<'_>>,
+        cursor: &mut usize,
     ) -> RowTimeSource {
-        let Some(idx) = self.rows.iter().position(|r| r.key == key) else {
+        let Some(idx) = self.take_row(key, cursor) else {
             return RowTimeSource::uniform(key, RowPhase::Arranger);
         };
-        let Some((cells, _)) = row_of(song, key) else {
+        let Some(cells) = cells else {
             return RowTimeSource::uniform(key, self.rows[idx].phase);
         };
         let head = self.rows[idx].phase;
@@ -1227,51 +1200,6 @@ fn row_display(phase: RowPhase, beat: f64) -> (u32, u32, f32, f64) {
     }
 }
 
-/// **ランチャーの行を 1 本の規則で数え上げる。**
-///
-/// 行の登録 ([`LauncherRuntime::sync_rows`])・列の占有判定
-/// ([`LauncherRuntime::fill_scene_occupancy`])・列の長さ ([`scene_longest`]) が
-/// 同じ集合を見るように、走査はここだけが持つ。集合は計画書 Q4 のとおり
-/// 「通常トラック行 + 展開したオートメーションレーン行 + マスター行
-/// (`Song.song_lanes`)」で、テンポ / 拍子レーンだけが外れる
-/// ([`common::model::AutomationTarget::accepts_launcher_cells`] が SSoT)。
-///
-/// RT 安全: 線形走査のみ (確保・ロック・I/O なし)。
-fn for_each_launcher_row(song: &Song, mut f: impl FnMut(RowKey, RowCells<'_>)) {
-    for track in &song.tracks {
-        f(RowKey::track(track.id), RowCells::Track(&track.session_clips));
-        for lane in &track.automation_lanes {
-            if lane.target.accepts_launcher_cells() {
-                f(RowKey::lane(track.id, lane.id), RowCells::Lane(&lane.session_clips));
-            }
-        }
-    }
-    for lane in &song.song_lanes {
-        if lane.target.accepts_launcher_cells() {
-            let key = RowKey::lane(common::model::MASTER_TRACK_ID, lane.id);
-            f(key, RowCells::Lane(&lane.session_clips));
-        }
-    }
-}
-
-/// 行のセル列と、保存されている主導権。
-///
-/// **RowKey → セルの解決はここが唯一の口**なので、ランチャーが握れない行
-/// (テンポ / 拍子レーン、確定済み設計判断 1) の門番もここに置く。`None` を返せば
-/// 発火要求も seed も `Arranger` に倒れる。
-fn row_of(song: &Song, key: RowKey) -> Option<(RowCells<'_>, RowPlayback)> {
-    // トラック行 (`lane_id == 0`)。マスター行はトラックを持たないのでレーン行だけ。
-    if key.lane_id == 0 && key.track_id != common::model::MASTER_TRACK_ID {
-        let track: &Track = song.tracks.iter().find(|t| t.id == key.track_id)?;
-        return Some((RowCells::Track(&track.session_clips), track.launcher));
-    }
-    // レーン行の置き場 (track か song か) は `automation_lane_by_key` 1 本。
-    let lane: &AutomationLane = song.automation_lane_by_key(key.track_id, key.lane_id)?;
-    lane.target
-        .accepts_launcher_cells()
-        .then(|| (RowCells::Lane(&lane.session_clips), lane.launcher))
-}
-
 /// 「この行がその列にセルを持つか」を作業領域へ埋め、有効長を返す。
 fn fill_row_occupancy(occupied: &mut [bool], song: &Song, cells: &RowCells<'_>) -> usize {
     let n = song.scenes.len().min(occupied.len());
@@ -1494,7 +1422,7 @@ mod tests {
     #[test]
     fn セルを途中から撃つと起点が位相ぶん過去に置かれる() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
 
         press_from(&mut rt, 1, 10, 1.5);
@@ -1516,7 +1444,7 @@ mod tests {
     fn 途中から撃つのは_toggle_で鳴っているセルを止めない() {
         let mut song = two_rows();
         song.tracks[0].session_clips[0].launch.mode = LaunchMode::Toggle;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.0);
@@ -1534,7 +1462,7 @@ mod tests {
     #[test]
     fn 鳴っている全行を同じ拍へ揃える() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         press(&mut rt, 2, 20, true);
@@ -1575,10 +1503,10 @@ mod tests {
         song
     }
 
-    /// `export.rs` の走査と同じ起点 (`LauncherRuntime::new()` + `arm_reseed()`) で
+    /// `export.rs` の走査と同じ起点 (`LauncherRuntime::for_song(&song)` + `arm_reseed()`) で
     /// 0..12 拍を刻み、各 buffer の 2 行の供給元を記録する。
     fn export_walk(song: &Song) -> Vec<(Option<u32>, Option<u32>, bool)> {
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(song);
         rt.arm_reseed();
         let mut out = Vec::new();
         let mut beat = 0.0_f64;
@@ -1655,7 +1583,7 @@ mod tests {
         let mut song = two_rows();
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
         song.tracks[1].launcher = RowPlayback::Launcher { clip_id: 20 };
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
         let row2 = rt.rows().track_row(1).tail;
@@ -1679,13 +1607,36 @@ mod tests {
         assert_eq!(rt.rows().track_row(0).tail, RowPhase::Silent);
     }
 
+    /// 行の器は曲の行数ぶんしか無い (`row_capacity`)。器が満杯の曲で「行を消して別の行を足す」が同じ
+    /// `Song` で届いても、足した行はその buffer から鳴り、残った行は並びが変わっても走行状態を保つ
+    /// (消えた行を落としてから足す)。
+    #[test]
+    fn 満杯の器で行の削除と追加が同時に届いても足した行がすぐ鳴る() {
+        let mut song = two_rows();
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
+        song.tracks[1].launcher = RowPlayback::Launcher { clip_id: 20 };
+        let mut rt = LauncherRuntime::for_song(&song);
+        step(&mut rt, &song, 0.0);
+        let kept = rt.rows().track_row(1).tail;
+        assert_eq!(kept.cell_clip_id(), Some(20));
+
+        song.tracks.remove(0);
+        let mut t3 = Track { id: 3, next_clip_id: 100, ..Track::default() };
+        t3.session_clips.push(cell(30, 1, 4.0));
+        t3.launcher = RowPlayback::Launcher { clip_id: 30 };
+        song.tracks.push(t3);
+        step(&mut rt, &song, 1.0);
+        assert_eq!(rt.rows().track_row(0).tail, kept, "残った行の走行状態が変わった");
+        assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(30), "足した行が同じ buffer で鳴らない");
+    }
+
     /// **発火の反響 (`LaunchCell` の直後に届く `LoadSong`) で位相が飛ばない。**
     /// GUI は操作を先に撃ってから `Song` を書くので、差分だけを見て撃ち直すと
     /// セルを撃つたびに必ず 1 回頭出しし直してしまう。
     #[test]
     fn 撃った直後の_load_song_は撃ち直しにならない() {
         let mut song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.5);
@@ -1710,7 +1661,7 @@ mod tests {
     #[test]
     fn 同じ_buffer_に届いた操作と反響は量子化境界で_1_回だけ切り替わる() {
         let mut song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         rt.update(&song, span_at(0.0), LaunchQuantize::Bars(1), true);
 
         // 拍 1.0: 押下と、その反響 (`Song` 側が既に列 2 を撃った状態) が同時に届く。
@@ -1753,7 +1704,7 @@ mod tests {
     #[test]
     fn 走行中に付けたフォローアクションは次の周期で発火する() {
         let mut song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         // 列 1 のセル 10 (4 拍、フォローなし) を拍 0 で撃つ。
         press(&mut rt, 1, 10, true);
@@ -1780,7 +1731,7 @@ mod tests {
     #[test]
     fn 走行中に付けたフォローアクションは過去の拍に暴発しない() {
         let mut song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.0);
@@ -1803,7 +1754,7 @@ mod tests {
     #[test]
     fn 走行中に付けた列のフォローアクションは次の周期で発火する() {
         let mut song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
@@ -1829,7 +1780,7 @@ mod tests {
     #[test]
     fn 空セルの列を撃つと行は停止する() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
 
         rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true, immediate: false });
@@ -1847,7 +1798,7 @@ mod tests {
     #[test]
     fn 撃ったセルは周回してもループし続ける() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.0);
@@ -1876,7 +1827,7 @@ mod tests {
     #[test]
     fn 撃つと量子化境界まで待ってから切り替わる() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         rt.update(&song, span_at(0.0), LaunchQuantize::Bars(1), true);
 
         // 拍 1.0 で押す → 1 小節量子化 (4/4 = 4 拍) なので発火は拍 4.0。
@@ -1902,7 +1853,7 @@ mod tests {
     fn legato_は前のセルの位相を引き継ぐ() {
         let mut song = two_rows();
         song.tracks[0].session_clips[1].launch.legato = true;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
 
         // セル 10 を拍 0 で撃つ。
@@ -1919,7 +1870,7 @@ mod tests {
 
         // legato でなければ頭から鳴り直す。
         song.tracks[0].session_clips[1].launch.legato = false;
-        let mut rt2 = LauncherRuntime::new();
+        let mut rt2 = LauncherRuntime::for_song(&song);
         step(&mut rt2, &song, 0.0);
         press(&mut rt2, 1, 10, true);
         step(&mut rt2, &song, 0.0);
@@ -1932,7 +1883,7 @@ mod tests {
     fn ワンショットはセル終端で止まる() {
         let mut song = two_rows();
         song.tracks[0].session_clips[0].launch.looping = false;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.0);
@@ -1951,7 +1902,7 @@ mod tests {
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 11 };
         song.tracks[1].launcher = RowPlayback::LauncherStopped;
 
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(11));
         assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent);
@@ -1972,7 +1923,7 @@ mod tests {
         let mut song = two_rows();
         // 実在しない clip_id (= GUI 側で消されたセル)。engine は信頼境界。
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 999 };
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         assert_eq!(
             rt.rows().track_row(0).tail,
@@ -1984,7 +1935,7 @@ mod tests {
     #[test]
     fn アレンジへ返すと主導権が戻る() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.0);
@@ -2001,7 +1952,7 @@ mod tests {
         let mut song = two_rows();
         song.tracks[0].session_clips[0].launch.mode = LaunchMode::Gate;
         song.tracks[1].session_clips[0].launch.mode = LaunchMode::Toggle;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
 
         press(&mut rt, 1, 10, true);
@@ -2033,7 +1984,7 @@ mod tests {
     fn 停止中の_toggle_は止めずに撃ち直す() {
         let mut song = two_rows();
         song.tracks[1].session_clips[0].launch.mode = LaunchMode::Toggle;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 2, 20, true);
         step(&mut rt, &song, 0.0);
@@ -2053,7 +2004,7 @@ mod tests {
     fn 停止中に撃っても量子化境界まで待つ() {
         let song = two_rows();
         let q = LaunchQuantize::Bars(1);
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         rt.update(&song, span_at(1.0), q, false);
         // 小節の途中 (1.0 拍) で止まった状態で撃つ = 同じ buffer で Play が始まる。
         press(&mut rt, 1, 10, true);
@@ -2075,7 +2026,7 @@ mod tests {
         let mut song = two_rows();
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
         let q = LaunchQuantize::Bars(1);
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         rt.update(&song, span_at(1.0), q, true);
         assert_eq!(rt.rows().track_row(0).tail, RowPhase::Silent, "小節の途中で鳴った");
         rt.update(&song, span_at(4.0), q, true);
@@ -2085,7 +2036,7 @@ mod tests {
         assert!((launch_beat - 4.0).abs() < 1e-9, "原点が小節頭でない: {launch_beat}");
 
         // 小節頭から再生すればその buffer で鳴る (待たない)。
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         rt.update(&song, span_at(8.0), q, true);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
     }
@@ -2109,7 +2060,7 @@ mod tests {
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
 
         let run = || {
-            let mut rt = LauncherRuntime::new();
+            let mut rt = LauncherRuntime::for_song(&song);
             let mut trace = Vec::new();
             let mut beat = 0.0;
             for _ in 0..2000 {
@@ -2139,7 +2090,7 @@ mod tests {
             ..FollowAction::default()
         };
         song.tracks[1].launcher = RowPlayback::Launcher { clip_id: 20 };
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(20));
         // 4 拍セルなので拍 4.0 でフォローアクションが発火する。
@@ -2170,7 +2121,7 @@ mod tests {
         };
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
 
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
 
@@ -2200,7 +2151,7 @@ mod tests {
             chance_a: 100,
             ..FollowAction::default()
         };
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
@@ -2242,7 +2193,7 @@ mod tests {
             ..FollowAction::default()
         };
 
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
@@ -2271,7 +2222,7 @@ mod tests {
             ..FollowAction::default()
         };
         for req in [LaunchRequest::StopAll { immediate: false }, LaunchRequest::AllToArranger] {
-            let mut rt = LauncherRuntime::new();
+            let mut rt = LauncherRuntime::for_song(&song);
             step(&mut rt, &song, 0.0);
             rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
             step(&mut rt, &song, 0.0);
@@ -2302,7 +2253,7 @@ mod tests {
             chance_a: 100,
             ..FollowAction::default()
         };
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0);
@@ -2335,7 +2286,7 @@ mod tests {
         song.tracks[1].launcher = RowPlayback::Launcher { clip_id: 20 };
 
         // (a) 未発火 (`0`) なら、前の再生で armed だった連鎖は持ち越さない。
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
         step(&mut rt, &song, 0.0); // scene.at = 4.0
@@ -2350,7 +2301,7 @@ mod tests {
 
         // (b) 撃った列が保存されていれば、reseed 拍を起点に同じ連鎖を辿る。
         song.last_launched_scene_id = 1;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         step(&mut rt, &song, 3.99);
         assert_eq!(
@@ -2381,7 +2332,7 @@ mod tests {
         };
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
 
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         // 拍 2.0 でワンショットが終端 → 無音。
         step(&mut rt, &song, 1.99);
@@ -2405,7 +2356,7 @@ mod tests {
         c.launch.mode = LaunchMode::Repeat;
         c.launch.quantize = LaunchQuantize::Note { div: 16, triplet: false }; // 0.25 拍
 
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
 
@@ -2458,7 +2409,7 @@ mod tests {
             lane.launcher = RowPlayback::Launcher { clip_id: 60 + i as u32 };
             song.song_lanes.push(lane);
         }
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         // 列を撃っても、保存された主導権があってもアレンジのまま。
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
@@ -2478,7 +2429,7 @@ mod tests {
     fn 列の離しもセルの離しと同じに解釈される() {
         let mut song = two_rows();
         song.tracks[0].session_clips[0].launch.mode = LaunchMode::Gate;
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
 
         rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
@@ -2510,7 +2461,7 @@ mod tests {
             ..FollowAction::default()
         };
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         step(&mut rt, &song, 5.0);
         let before = rt.rows().track_row(0).tail.effective_beat(5.0).expect("鳴っている");
@@ -2533,7 +2484,7 @@ mod tests {
     #[test]
     fn プロジェクトが変わると走行状態を捨てる() {
         let song = two_rows();
-        let mut rt = LauncherRuntime::new();
+        let mut rt = LauncherRuntime::for_song(&song);
         step(&mut rt, &song, 0.0);
         press(&mut rt, 1, 10, true);
         step(&mut rt, &song, 0.0);

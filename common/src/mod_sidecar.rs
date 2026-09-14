@@ -22,7 +22,6 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::audio_bridge::MAX_MOD_SOURCES;
 use crate::mod_plane::ModPlane;
 
 const MAGIC: u32 = 0x4d4f_4432; // "MOD2"
@@ -128,20 +127,16 @@ impl ModEnvSidecar {
         c.read_exact(&mut b4)?;
         let n_buffers = u32::from_le_bytes(b4) as usize;
         // ヘッダの数だけ信じて `with_capacity` すると、壊れた / 悪意ある
-        // sidecar の 4G 行で OOM する。実ファイル長で先に弾く
+        // sidecar の 4G 行で OOM する。ソース数に上限は置かず (曲の変調ソース数で決まる)、
+        // ヘッダが宣言した本体の長さを checked 算術で求めて実ファイル長で先に弾く
         // (`tempo_map.rs` の `MAX_TABLE_BEATS` と同じ理由)。
-        if n_sources > MAX_MOD_SOURCES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "modenv: n_sources が上限を超えている",
-            ));
-        }
-        let need = 12
-            + n_sources
-                .saturating_mul(4)
-                .saturating_add(n_buffers.saturating_mul(4))
-                .saturating_add(n_buffers.saturating_mul(n_sources).saturating_mul(4));
-        if bytes.len() < need {
+        let need = n_buffers
+            .checked_mul(n_sources)
+            .and_then(|cells| cells.checked_add(n_sources))
+            .and_then(|n| n.checked_add(n_buffers))
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_add(12));
+        if need.is_none_or(|need| bytes.len() < need) {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "modenv: ヘッダが宣言した長さに本体が足りない",

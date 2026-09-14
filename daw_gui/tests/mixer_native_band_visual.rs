@@ -273,7 +273,7 @@ fn 追加の_comp_は帯に出ず_gr_も組み込みの_id_でだけ引く() {
     // GR は「Comp 2」にだけ入れる。
     app.handle_event(AppEvent::TrackPeaksTick {
         project: app.pk(),
-        tracks: Vec::new(),
+        tracks: Some(Vec::new()),
         native_gr: Some(vec![(comp2, -6.0)]),
         master_limiter_gr_db: 0.0,
     });
